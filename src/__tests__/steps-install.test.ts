@@ -12,6 +12,9 @@ vi.mock("node:fs", () => ({
   default: {
     existsSync: vi.fn(),
     readFileSync: vi.fn(),
+    mkdtempSync: vi.fn(),
+    writeFileSync: vi.fn(),
+    rmSync: vi.fn(),
   },
 }));
 
@@ -363,5 +366,131 @@ describe("installStep", () => {
     expect(spawnOptions?.env).not.toHaveProperty("ANTHROPIC_API_KEY");
     expect(spawnOptions?.env).not.toHaveProperty("CLAUDE_CODE_OAUTH_TOKEN");
     expect(spawnOptions?.env?.PATH).toBeDefined();
+  });
+
+  describe("npm auth from env", () => {
+    const REGISTRY = "https://registry.example.test/artifactory/api/npm/npm/";
+    const TMP_DIR = "/tmp/ai-implement-npmrc-abc123";
+    const USERCONFIG = `${TMP_DIR}/.npmrc`;
+
+    function spawnEnv(): NodeJS.ProcessEnv {
+      const options = vi.mocked(spawn).mock.calls[0]?.[2] as { env?: NodeJS.ProcessEnv } | undefined;
+      return options?.env ?? {};
+    }
+
+    beforeEach(() => {
+      vi.stubEnv("NPM_TOKEN", "");
+      vi.stubEnv("AI_IMPLEMENT_NPM_REGISTRY", "");
+      vi.stubEnv("AI_IMPLEMENT_NPM_SCOPE", "");
+      vi.mocked(fs.mkdtempSync).mockReturnValue(TMP_DIR);
+    });
+
+    it("does nothing when neither token nor registry is set", async () => {
+      mockRootPackageJson();
+
+      await installStep.run(makeContext(), { workspaceDir: "/tmp/test" }, new NoopStepReporter());
+
+      expect(fs.writeFileSync).not.toHaveBeenCalled();
+      expect(spawnEnv()).not.toHaveProperty("NPM_CONFIG_USERCONFIG");
+    });
+
+    it("does nothing when only the token is set", async () => {
+      mockRootPackageJson();
+      vi.stubEnv("NPM_TOKEN", "secret-token");
+
+      await installStep.run(makeContext(), { workspaceDir: "/tmp/test" }, new NoopStepReporter());
+
+      expect(fs.writeFileSync).not.toHaveBeenCalled();
+      expect(spawnEnv()).not.toHaveProperty("NPM_CONFIG_USERCONFIG");
+    });
+
+    it("writes an _authToken line to a temp user config when token + registry are set", async () => {
+      mockRootPackageJson();
+      vi.stubEnv("NPM_TOKEN", "secret-token");
+      vi.stubEnv("AI_IMPLEMENT_NPM_REGISTRY", REGISTRY);
+
+      await installStep.run(makeContext(), { workspaceDir: "/tmp/test" }, new NoopStepReporter());
+
+      expect(fs.writeFileSync).toHaveBeenCalledWith(
+        USERCONFIG,
+        "//registry.example.test/artifactory/api/npm/npm/:_authToken=secret-token\n",
+        { mode: 0o600 },
+      );
+      expect(spawnEnv().NPM_CONFIG_USERCONFIG).toBe(USERCONFIG);
+    });
+
+    it("also writes scoped registry mappings when AI_IMPLEMENT_NPM_SCOPE is set", async () => {
+      mockRootPackageJson();
+      vi.stubEnv("NPM_TOKEN", "secret-token");
+      vi.stubEnv("AI_IMPLEMENT_NPM_REGISTRY", REGISTRY);
+      vi.stubEnv("AI_IMPLEMENT_NPM_SCOPE", "@cs, other");
+
+      await installStep.run(makeContext(), { workspaceDir: "/tmp/test" }, new NoopStepReporter());
+
+      expect(fs.writeFileSync).toHaveBeenCalledWith(
+        USERCONFIG,
+        [
+          "//registry.example.test/artifactory/api/npm/npm/:_authToken=secret-token",
+          "@cs:registry=https://registry.example.test/artifactory/api/npm/npm/",
+          "@other:registry=https://registry.example.test/artifactory/api/npm/npm/",
+          "",
+        ].join("\n"),
+        { mode: 0o600 },
+      );
+    });
+
+    it("carries an existing ~/.npmrc forward instead of shadowing it", async () => {
+      mockRootPackageJson((p) => p.endsWith("/.npmrc"));
+      vi.mocked(fs.readFileSync).mockReturnValue("always-auth=true");
+      vi.stubEnv("NPM_TOKEN", "secret-token");
+      vi.stubEnv("AI_IMPLEMENT_NPM_REGISTRY", REGISTRY);
+
+      await installStep.run(makeContext(), { workspaceDir: "/tmp/test" }, new NoopStepReporter());
+
+      expect(fs.writeFileSync).toHaveBeenCalledWith(
+        USERCONFIG,
+        "always-auth=true\n//registry.example.test/artifactory/api/npm/npm/:_authToken=secret-token\n",
+        { mode: 0o600 },
+      );
+    });
+
+    it("removes the temp user config after install, including when install fails", async () => {
+      mockRootPackageJson();
+      vi.stubEnv("NPM_TOKEN", "secret-token");
+      vi.stubEnv("AI_IMPLEMENT_NPM_REGISTRY", REGISTRY);
+      vi.mocked(spawn).mockImplementation(() => {
+        const emitter = new EventEmitter() as ReturnType<typeof spawn>;
+        setImmediate(() => emitter.emit("close", 1));
+        return emitter;
+      });
+
+      await expect(
+        installStep.run(makeContext(), { workspaceDir: "/tmp/test" }, new NoopStepReporter()),
+      ).rejects.toThrow("npm ci exited with code 1");
+
+      expect(fs.rmSync).toHaveBeenCalledWith(TMP_DIR, { recursive: true, force: true });
+    });
+
+    it("never writes the token to ~/.npmrc", async () => {
+      mockRootPackageJson();
+      vi.stubEnv("NPM_TOKEN", "secret-token");
+      vi.stubEnv("AI_IMPLEMENT_NPM_REGISTRY", REGISTRY);
+
+      await installStep.run(makeContext(), { workspaceDir: "/tmp/test" }, new NoopStepReporter());
+
+      const writtenPaths = vi.mocked(fs.writeFileSync).mock.calls.map((c) => String(c[0]));
+      expect(writtenPaths).toEqual([USERCONFIG]);
+      expect(writtenPaths.some((p) => p.endsWith("/.npmrc") && !p.startsWith(TMP_DIR))).toBe(false);
+    });
+
+    it("skips configuring npm auth when there is no package.json to install", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(false);
+      vi.stubEnv("NPM_TOKEN", "secret-token");
+      vi.stubEnv("AI_IMPLEMENT_NPM_REGISTRY", REGISTRY);
+
+      await installStep.run(makeContext(), { workspaceDir: "/tmp/test" }, new NoopStepReporter());
+
+      expect(fs.writeFileSync).not.toHaveBeenCalled();
+    });
   });
 });

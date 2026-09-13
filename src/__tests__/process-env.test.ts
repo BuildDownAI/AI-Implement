@@ -30,6 +30,7 @@ beforeEach(() => {
   saveAndSet("RUN_PUBLICATION_TOKEN", undefined);
   saveAndSet("RUN_TOKEN", undefined);
   saveAndSet("GITHUB_TOKEN", undefined);
+  saveAndSet("NPM_TOKEN", undefined);
 });
 
 afterEach(() => {
@@ -58,6 +59,14 @@ describe("repoProcessEnv", () => {
     process.env.ANTHROPIC_API_KEY = "sentinel-api-key";
     repoProcessEnv();
     expect(process.env.ANTHROPIC_API_KEY).toBe("sentinel-api-key");
+  });
+});
+
+describe("repoProcessEnv install credentials", () => {
+  it("keeps NPM_TOKEN for the install step and hooks", () => {
+    process.env.NPM_TOKEN = "sentinel-npm-token";
+    const env = repoProcessEnv();
+    expect(env.NPM_TOKEN).toBe("sentinel-npm-token");
   });
 });
 
@@ -106,6 +115,12 @@ describe("modelProcessEnv", () => {
     process.env.RUN_TOKEN = "sentinel-run-token";
     const env = modelProcessEnv(false);
     expect(env).not.toHaveProperty("RUN_TOKEN");
+  });
+
+  it("strips NPM_TOKEN even when it is not a forwarded secret", () => {
+    process.env.NPM_TOKEN = "sentinel-npm-token";
+    const env = modelProcessEnv(true);
+    expect(env).not.toHaveProperty("NPM_TOKEN");
   });
 
   it("modelProcessEnv(false) strips GITHUB_TOKEN", () => {

@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { parse as parseYaml } from "yaml";
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
@@ -86,6 +87,63 @@ function readAiImplementConfig(workspaceDir: string): AiImplementConfig {
   }
 }
 
+interface NpmAuthConfig {
+  /** Temp directory holding the per-run user config; removed after install. */
+  dir: string;
+  /** Path handed to the install process as NPM_CONFIG_USERCONFIG. */
+  userconfigPath: string;
+}
+
+/**
+ * Private-registry auth for the install step.
+ *
+ * The token is read from NPM_TOKEN, which reaches the runner through the
+ * forwarded-secrets rail (AI_IMPLEMENT_FORWARDED_ENV on GHA, a team-prefixed
+ * secret on Fly) and is therefore stripped from the model process by
+ * modelProcessEnv(). The registry and optional scope(s) are plain Actions
+ * variables. This lives in the install step rather than a setup hook because
+ * install runs BEFORE setup, so a hook cannot supply credentials in time.
+ *
+ * The credentials are written to a temporary user config selected via
+ * NPM_CONFIG_USERCONFIG for the install process only — never to ~/.npmrc —
+ * and the file is removed once install finishes, so the token is not left on
+ * disk for the model process to read.
+ */
+function configureNpmAuth(): NpmAuthConfig | undefined {
+  const token = process.env.NPM_TOKEN;
+  const registry = process.env.AI_IMPLEMENT_NPM_REGISTRY;
+  if (!token || !registry) return undefined;
+
+  const normalizedRegistry = registry.endsWith("/") ? registry : `${registry}/`;
+  const authHost = normalizedRegistry.replace(/^https?:/, "");
+  const lines = [`${authHost}:_authToken=${token}`];
+
+  const scopes = (process.env.AI_IMPLEMENT_NPM_SCOPE ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  for (const scope of scopes) {
+    const name = scope.startsWith("@") ? scope : `@${scope}`;
+    lines.push(`${name}:registry=${normalizedRegistry}`);
+  }
+
+  // NPM_CONFIG_USERCONFIG replaces ~/.npmrc rather than layering on it, so
+  // carry any existing user config forward instead of shadowing it.
+  const homeNpmrc = path.join(os.homedir(), ".npmrc");
+  const existing = fs.existsSync(homeNpmrc) ? fs.readFileSync(homeNpmrc, "utf-8") : "";
+  const prefix = existing && !existing.endsWith("\n") ? `${existing}\n` : existing;
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ai-implement-npmrc-"));
+  const userconfigPath = path.join(dir, ".npmrc");
+  fs.writeFileSync(userconfigPath, `${prefix}${lines.join("\n")}\n`, { mode: 0o600 });
+  return { dir, userconfigPath };
+}
+
+function removeNpmAuth(auth: NpmAuthConfig | undefined): void {
+  if (!auth) return;
+  fs.rmSync(auth.dir, { recursive: true, force: true });
+}
+
 function detectPackageManager(workspaceDir: string): string {
   if (fs.existsSync(path.join(workspaceDir, "yarn.lock"))) return "yarn";
   if (fs.existsSync(path.join(workspaceDir, "pnpm-lock.yaml"))) return "pnpm";
@@ -137,20 +195,28 @@ export const installStep: StepModule<InstallInputs, InstallOutputs> = {
     const packageManager = config.packageManager ?? detectPackageManager(workspaceDir);
     const installMethod = buildInstallCommand(packageManager);
 
+    const npmAuth = configureNpmAuth();
+    const env = repoProcessEnv();
+    if (npmAuth) env.NPM_CONFIG_USERCONFIG = npmAuth.userconfigPath;
+
     const start = Date.now();
     const [cmd, ...cmdArgs] = installMethod.split(/\s+/);
-    await new Promise<void>((resolve, reject) => {
-      const proc = spawn(cmd!, cmdArgs, {
-        cwd: workspaceDir,
-        stdio: "inherit",
-        env: repoProcessEnv(),
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const proc = spawn(cmd!, cmdArgs, {
+          cwd: workspaceDir,
+          stdio: "inherit",
+          env,
+        });
+        proc.on("close", (code) => {
+          if (code === 0) resolve();
+          else reject(new Error(`${installMethod} exited with code ${code ?? "unknown"}`));
+        });
+        proc.on("error", reject);
       });
-      proc.on("close", (code) => {
-        if (code === 0) resolve();
-        else reject(new Error(`${installMethod} exited with code ${code ?? "unknown"}`));
-      });
-      proc.on("error", reject);
-    });
+    } finally {
+      removeNpmAuth(npmAuth);
+    }
     const durationMs = Date.now() - start;
 
     return {

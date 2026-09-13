@@ -22,6 +22,7 @@ Two tiers, distinguished by what a file *is* rather than what it covers.
 | [issueless-runs.md](issueless-runs.md) | The pattern for run kinds dispatched without a tracker issue: envelope shape, jobs-store tracking row, credential flow, state machine lifecycle, reaper reconciliation, operator cancel, observability, and a checklist for adding a new issueless run kind |
 | [runner-context.md](runner-context.md) | Per-project settings that provision something into a run: the shared mapping-to-effect shape, which run phases apply each one, and what enabling each costs |
 | [runner-callbacks.md](runner-callbacks.md) | The run tokens and callback endpoints: who mints, carries, reads, verifies, and consumes each credential; the process boundary inside the runner; the blast radius of one stray use |
+| [private-npm-registry.md](private-npm-registry.md) | Private npm registry auth for the built-in `install` step: the three values, why the token rides the forwarded-secrets rail as `NPM_TOKEN`, the per-run `NPM_CONFIG_USERCONFIG` file, and where the token does and does not exist during a run |
 
 Two references live outside this directory because they are consumed directly rather than read: `.env.example` is the canonical list of orchestrator environment variables, and `CLAUDE.md` is the index that points at everything here.
 

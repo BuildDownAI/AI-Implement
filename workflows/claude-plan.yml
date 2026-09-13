@@ -18,6 +18,14 @@
 #                                gates every dispatch behind manual approval (AII-502).
 #                                Values reach hooks only; the runner strips them from the model process.
 #
+# Optional variables (private npm registry, read by the built-in install step):
+#   AI_IMPLEMENT_NPM_REGISTRY  - Registry URL, e.g. https://your.registry.example/path/
+#   AI_IMPLEMENT_NPM_SCOPE     - Optional comma-separated npm scope(s) mapped to that registry, e.g. "@acme".
+#   The registry token is NOT a separate secret: put an NPM_TOKEN=<token> line in
+#   AI_IMPLEMENT_FORWARDED_ENV above. When NPM_TOKEN and the registry are both present the
+#   runner writes a per-run npm user config for the install command only, then removes it —
+#   no target-repo .npmrc needed, and the token never reaches the model process.
+#
 # Optional repository or organization variables:
 #   AI_IMPLEMENT_RUNNER_IMAGE                    - Default runner image for this repo/org.
 #   AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES   - Extra image prefixes allowed in addition to ghcr.io/builddownai/ and the repo owner's own ghcr.io/<owner>/ namespace (auto-trusted).
@@ -293,4 +301,6 @@ jobs:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           RUN_TOKEN: ${{ inputs.run_token }}
           RUN_PROGRESS_TOKEN: ${{ inputs.run_progress_token }}
+          AI_IMPLEMENT_NPM_REGISTRY: ${{ vars.AI_IMPLEMENT_NPM_REGISTRY }}
+          AI_IMPLEMENT_NPM_SCOPE: ${{ vars.AI_IMPLEMENT_NPM_SCOPE }}
         run: /opt/ai-implement/entrypoint.sh
