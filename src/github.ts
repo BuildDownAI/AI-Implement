@@ -417,11 +417,9 @@ export async function setCommitStatus(
 }
 
 /**
- * Lists the file paths changed by a PR (first 100 — sufficient for the guard-path
- * match; a KG PR touching more than 100 files would already be dispatch-worthy on
- * its first page of matches). Throws on a non-2xx response so a transient GitHub
- * failure is distinguishable from a PR that genuinely touches no files — a caller
- * that treated `[]` as "no guard-relevant files" could not tell the two apart.
+ * Lists the changed file paths of a PR, following `Link: rel="next"` across pages (AII-639)
+ * so a guard-relevant path past the first 100 files is still seen. Throws on a non-OK page so
+ * the webhook can report `files_fetch_failed` rather than treating it as "no change".
  */
 export async function listPullRequestFiles(
   token: string,
@@ -429,14 +427,21 @@ export async function listPullRequestFiles(
   repo: string,
   prNumber: number,
 ): Promise<string[]> {
-  const url = `https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}/files?per_page=100`;
-  const res = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`listPullRequestFiles failed: HTTP ${res.status}: ${text}`);
+  // Follows `Link: rel="next"` like listPrComments (AII-639): a guard-relevant file past the
+  // first 100 must not be treated as "no guard-relevant change".
+  const files: string[] = [];
+  let url: string | null = `https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}/files?per_page=100`;
+  while (url) {
+    const res: Response = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`listPullRequestFiles failed: HTTP ${res.status}: ${text}`);
+    }
+    const data = (await res.json()) as Array<{ filename?: string }>;
+    files.push(...data.map((f) => f.filename).filter((f): f is string => typeof f === "string"));
+    url = parseLinkNext(res.headers.get("link"));
   }
-  const data = (await res.json()) as Array<{ filename?: string }>;
-  return data.map((f) => f.filename).filter((f): f is string => typeof f === "string");
+  return files;
 }
 
 /**

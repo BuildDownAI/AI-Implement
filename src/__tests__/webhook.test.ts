@@ -592,6 +592,7 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
       return Promise.resolve(new Response("", { status: 404 }));
     });
 
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     const { req, res } = makeRequest(
       SECRET,
       "pull_request",
@@ -601,7 +602,11 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
     await res.done;
 
     expect(trigger).not.toHaveBeenCalled();
-    expect(JSON.parse(res.body)).toEqual({ ignored: true, reason: "files_fetch_failed" });
+    // AII-639: on `synchronize` the KG check never owns the response — the normal
+    // pull_request handling answers — so the distinct reason is in the log instead.
+    expect(JSON.parse(res.body)).toEqual({ ignored: true, reason: "no matching dispatch" });
+    expect(logSpy.mock.calls.some((c) => String(c[0]).includes("files fetch failed"))).toBe(true);
+    logSpy.mockRestore();
   });
 
   it("a branch-pattern match still dispatches when the files fetch fails, since the branch alone is guard-relevant", async () => {
@@ -618,7 +623,8 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
     await res.done;
 
     expect(trigger).toHaveBeenCalledTimes(1);
-    expect(res.statusCode).toBe(202);
+    // AII-639: the dispatch is asserted on `trigger`; the response belongs to the normal handling.
+    expect(JSON.parse(res.body).reason).toBe("no matching dispatch");
   });
 
   it("ignores a redelivery carrying the same head sha and does not re-trigger", async () => {
@@ -642,7 +648,62 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
     await second.res.done;
 
     expect(trigger).toHaveBeenCalledTimes(1);
-    expect(JSON.parse(second.res.body)).toEqual({ ignored: true, reason: "duplicate_sha" });
+    // AII-639: the duplicate is logged; both deliveries are answered by the normal handling.
+    expect(JSON.parse(second.res.body).reason).toBe("no matching dispatch");
+  });
+
+  it("a guard-relevant synchronize on the KG source repo runs both rails: the dry-run dispatches and the normal pull_request handling answers (AII-639)", async () => {
+    const trigger = vi.fn().mockResolvedValue({ status: 202, body: {} });
+    const kgPrCheck = makeKgPrCheck({ trigger });
+    mockPrFiles(["kg_ingest/tracker.py"]);
+
+    const { req, res } = makeRequest(
+      SECRET,
+      "pull_request",
+      prPayload({ action: "synchronize", number: 70, ref: "feature/kgb-x", sha: "sha-70", repo: KG_SOURCE_REPO }),
+    );
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
+    await res.done;
+
+    expect(trigger).toHaveBeenCalledTimes(1);
+    expect(trigger.mock.calls[0][0]).toMatchObject({ dryRun: true, ref: "feature/kgb-x" });
+    // The KG repos are ordinary onboarded projects too: gap-fill matching still ran.
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ ignored: true, reason: "no matching dispatch" });
+  });
+
+  it("a synchronize on the KG source repo touching only docs does not dispatch and still reaches the normal pull_request handling (AII-639)", async () => {
+    const trigger = vi.fn().mockResolvedValue({ status: 202, body: {} });
+    const kgPrCheck = makeKgPrCheck({ trigger });
+    mockPrFiles(["docs/README.md"]);
+
+    const { req, res } = makeRequest(
+      SECRET,
+      "pull_request",
+      prPayload({ action: "synchronize", number: 71, ref: "docs/tweak", sha: "sha-71", repo: KG_SOURCE_REPO }),
+    );
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
+    await res.done;
+
+    expect(trigger).not.toHaveBeenCalled();
+    expect(JSON.parse(res.body)).toEqual({ ignored: true, reason: "no matching dispatch" });
+  });
+
+  it("an opened event on the KG source repo is still answered by the KG check (nothing else handles opened)", async () => {
+    const trigger = vi.fn().mockResolvedValue({ status: 202, body: {} });
+    const kgPrCheck = makeKgPrCheck({ trigger });
+    mockPrFiles(["docs/README.md"]);
+
+    const { req, res } = makeRequest(
+      SECRET,
+      "pull_request",
+      prPayload({ action: "opened", number: 72, ref: "docs/tweak", sha: "sha-72", repo: KG_SOURCE_REPO }),
+    );
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
+    await res.done;
+
+    expect(trigger).not.toHaveBeenCalled();
+    expect(JSON.parse(res.body)).toEqual({ ignored: true, reason: "no_guard_relevant_change" });
   });
 
   it("falls through to the existing pull_request handling for a repo that is neither the KG source nor base repo", async () => {
@@ -685,7 +746,7 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
     );
     webhook.handleGitHubWebhook(first.req as never, first.res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
     await first.res.done;
-    expect(first.res.statusCode).toBe(202);
+    expect(first.res.statusCode).toBe(200); // AII-639: answered by the normal pull_request handling
 
     const second = makeRequest(
       SECRET,
@@ -695,8 +756,8 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
     webhook.handleGitHubWebhook(second.req as never, second.res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
     await second.res.done;
 
-    expect(second.res.statusCode).toBe(202);
-    expect(JSON.parse(second.res.body)).toEqual({ queued: true });
+    expect(second.res.statusCode).toBe(200); // AII-639: `queued` is logged; the queue is proven by the dispatch on settle below
+    expect(JSON.parse(second.res.body).reason).toBe("no matching dispatch");
     expect(trigger).toHaveBeenCalledTimes(2);
     expect(settledCb).toBeTypeOf("function");
 
@@ -749,9 +810,10 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
       responses.push(res);
     }
 
-    expect(responses[0]!.statusCode).toBe(202);
-    expect(JSON.parse(responses[1]!.body)).toEqual({ queued: true });
-    expect(JSON.parse(responses[2]!.body)).toEqual({ queued: true });
+    expect(responses[0]!.statusCode).toBe(200); // AII-639
+    // AII-639: synchronize responses come from the normal handling; queuing is proven by the dispatch below.
+    expect(JSON.parse(responses[1]!.body).reason).toBe("no matching dispatch");
+    expect(JSON.parse(responses[2]!.body).reason).toBe("no matching dispatch");
     expect(trigger).toHaveBeenCalledTimes(3);
     expect(settledCbs.length).toBe(2);
 
@@ -798,8 +860,8 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
     );
     webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
     await res.done;
-    expect(res.statusCode).toBe(202);
-    expect(JSON.parse(res.body)).toEqual({ queued: true });
+    expect(res.statusCode).toBe(200); // AII-639: answered by the normal pull_request handling
+    expect(JSON.parse(res.body).reason).toBe("no matching dispatch");
     expect(dispatchRun).toHaveBeenCalledTimes(1); // still only the real refresh
 
     // The real refresh settles (successfully or not — here it fails cleanly, since
