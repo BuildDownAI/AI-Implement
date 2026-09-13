@@ -324,3 +324,65 @@ describe("refreshRunnerGithubToken", () => {
     expect(process.env.GH_TOKEN).toBe("fresh-token");
   });
 });
+
+describe("refreshRunnerGithubToken — fail-closed retry (publication exchange)", () => {
+  const publicationInputs = {
+    currentToken: "boot-token",
+    callbackUrl: "https://orchestrator.example",
+    publicationToken: "one-use",
+    owner: "acme",
+  };
+
+  it("retries a transport failure and succeeds on a later attempt", async () => {
+    const fetchImpl = vi.fn()
+      .mockRejectedValueOnce(new Error("connect ETIMEDOUT"))
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ token: "fresh" }) } as Response);
+
+    const token = await refreshRunnerGithubToken({ ...publicationInputs, fetchImpl });
+
+    expect(token).toBe("fresh");
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it("retries a 502 (the request may never have reached the orchestrator)", async () => {
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce({ ok: false, status: 502 } as Response)
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ token: "fresh" }) } as Response);
+
+    const token = await refreshRunnerGithubToken({ ...publicationInputs, fetchImpl });
+
+    expect(token).toBe("fresh");
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it("throws after exhausting the bounded retries", async () => {
+    const fetchImpl = vi.fn().mockRejectedValue(new Error("connection refused"));
+
+    await expect(refreshRunnerGithubToken({ ...publicationInputs, fetchImpl }))
+      .rejects.toThrow(/Token refresh unavailable/);
+    expect(fetchImpl).toHaveBeenCalledTimes(3); // initial + [250, 1000]ms backoff attempts
+  });
+
+  it("never retries a 403 — the single-use credential is consumed before the mint", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue({ ok: false, status: 403 } as Response);
+
+    await expect(refreshRunnerGithubToken({ ...publicationInputs, fetchImpl }))
+      .rejects.toThrow(/HTTP 403/);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the machine-nonce path single-attempt (best-effort fallback exists)", async () => {
+    const fetchImpl = vi.fn().mockRejectedValue(new Error("connection refused"));
+
+    const token = await refreshRunnerGithubToken({
+      currentToken: "boot-token",
+      orchestratorUrl: "https://orchestrator.example",
+      machineNonce: "nonce",
+      owner: "acme",
+      fetchImpl,
+    });
+
+    expect(token).toBe("boot-token");
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+});

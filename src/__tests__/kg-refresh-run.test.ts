@@ -2308,6 +2308,64 @@ describe("runKgRefresh", () => {
     expect(capturedResults.some((r) => r.failureCode === "KG_SNAPSHOT_TRACKER_REGRESSION")).toBe(true);
   });
 
+  it("reports guardVerdict: 'refused' and the part table for a real (non-dry-run) KgSnapshotTrackerRegressionError (AII-638)", async () => {
+    process.env.RUNNER_CALLBACK_URL = "http://orch";
+    process.env.RUN_TOKEN = "run-tok";
+    const capturedResults: Array<{ failureCode?: string; guardVerdict?: string; partTable?: Array<{ part: string; prev: string; new: string }> }> = [];
+    const result = await runKgRefresh({
+      workspaceDir: tmpDir,
+      stepsOverride: {
+        clone: makeStepModule({ workspaceDir: tmpDir, repoOwner: "org", repoRepo: "repo", githubToken: "tok", clonedRef: "abc" }),
+        kgIngest: makeStepModule({ statsFile: null }),
+        kgSnapshotPush: makeStepModule(
+          {},
+          new KgSnapshotTrackerRegressionError(
+            "content regression detected — comment.nt: shrank from 9995 to 3793 lines (below 50% threshold)",
+            [{ part: "comment.nt", prev: "9995", new: "3793" }],
+          ),
+        ),
+      },
+      reporter: { report: async () => undefined },
+      fetchImpl: async (_url, init) => {
+        const body = init?.body ? JSON.parse(init.body as string) as Record<string, unknown> : {};
+        capturedResults.push(body as { failureCode?: string; guardVerdict?: string; partTable?: Array<{ part: string; prev: string; new: string }> });
+        return new Response(JSON.stringify({ acknowledged: true }), { status: 200 });
+      },
+    });
+    delete process.env.RUNNER_CALLBACK_URL;
+    delete process.env.RUN_TOKEN;
+    expect(result.exitCode).toBe(1);
+    const failureResult = capturedResults.find((r) => r.failureCode === "KG_SNAPSHOT_TRACKER_REGRESSION");
+    expect(failureResult?.guardVerdict).toBe("refused");
+    expect(failureResult?.partTable).toEqual([{ part: "comment.nt", prev: "9995", new: "3793" }]);
+  });
+
+  it("omits guardVerdict and partTable for a real (non-dry-run) failure that is not a tracker regression", async () => {
+    process.env.RUNNER_CALLBACK_URL = "http://orch";
+    process.env.RUN_TOKEN = "run-tok";
+    const capturedResults: Array<{ failureCode?: string; guardVerdict?: string; partTable?: unknown }> = [];
+    const result = await runKgRefresh({
+      workspaceDir: tmpDir,
+      stepsOverride: {
+        clone: makeStepModule({ workspaceDir: tmpDir, repoOwner: "org", repoRepo: "repo", githubToken: "tok", clonedRef: "abc" }),
+        kgIngest: makeStepModule({ statsFile: null }),
+        kgSnapshotPush: makeStepModule({}, new KgSnapshotMissingError("no parts")),
+      },
+      reporter: { report: async () => undefined },
+      fetchImpl: async (_url, init) => {
+        const body = init?.body ? JSON.parse(init.body as string) as Record<string, unknown> : {};
+        capturedResults.push(body as { failureCode?: string; guardVerdict?: string; partTable?: unknown });
+        return new Response(JSON.stringify({ acknowledged: true }), { status: 200 });
+      },
+    });
+    delete process.env.RUNNER_CALLBACK_URL;
+    delete process.env.RUN_TOKEN;
+    expect(result.exitCode).toBe(1);
+    const failureResult = capturedResults.find((r) => r.failureCode === "KG_SNAPSHOT_MISSING");
+    expect(failureResult?.guardVerdict).toBeUndefined();
+    expect(failureResult?.partTable).toBeUndefined();
+  });
+
   it("returns exitCode 1 when kgTrackerData throws KgTrackerDataFetchError", async () => {
     const result = await runKgRefresh({
       workspaceDir: tmpDir,

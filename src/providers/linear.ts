@@ -744,9 +744,10 @@ export class LinearProvider implements TicketingProvider {
     await this.addLabelToIssue(issueId, labelId);
   }
 
-  async markPlanningFailed(issueId: string, _scopeKey: string, reason: string): Promise<void> {
+  async markPlanningFailed(issueId: string, _scopeKey: string, reason: string): Promise<boolean> {
     await this.removeLabelByName(issueId, "AI-Planning");
     await this.postComment(issueId, `⚠️ Planning failed: ${reason}`);
+    return true;
   }
 
   async markImplementing(issueId: string, _scopeKey: string): Promise<void> {
@@ -761,7 +762,7 @@ export class LinearProvider implements TicketingProvider {
     await this.transitionToInProgressIfMovable(issueId, teamKey);
   }
 
-  async markPrReady(issueId: string, _scopeKey: string, prUrl: string): Promise<void> {
+  async markPrReady(issueId: string, _scopeKey: string, prUrl: string): Promise<boolean> {
     const readyLabelId = await this.ensureWorkspaceReadyForReviewLabel();
 
     // Atomic label swap: remove AI-Working, add Ready for Review in a single
@@ -794,6 +795,9 @@ export class LinearProvider implements TicketingProvider {
     );
 
     await this.postComment(issueId, `AI implementation PR: ${prUrl}`);
+    // Label swaps have no Merged-regression hazard (Done is a state, not a label),
+    // so the transition is always applied here.
+    return true;
   }
 
   async markMerged(issueId: string, _scopeKey: string): Promise<void> {
@@ -830,14 +834,16 @@ export class LinearProvider implements TicketingProvider {
     );
   }
 
-  async markImplementationFailed(issueId: string, _scopeKey: string, reason: string): Promise<void> {
+  async markImplementationFailed(issueId: string, _scopeKey: string, reason: string): Promise<boolean> {
     await this.removeLabelByName(issueId, "AI-Working");
     await this.postComment(issueId, `⚠️ Implementation failed: ${reason}`);
+    return true;
   }
 
-  async clearWorkingState(issueId: string, _scopeKey: string): Promise<void> {
+  async clearWorkingState(issueId: string, _scopeKey: string): Promise<boolean> {
     await this.removeLabelByName(issueId, "AI-Working");
     await this.removeLabelByName(issueId, "AI-Planning");
+    return true;
   }
   async postComment(issueId: string, body: string): Promise<void> {
     const query = `

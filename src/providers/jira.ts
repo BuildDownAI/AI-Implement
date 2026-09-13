@@ -172,18 +172,41 @@ interface JiraIssueLink {
  * issue whose status category is not terminal). Mirrors the Linear provider's
  * inverse-relation "blocks" skip. A blocker in the `done` category never blocks.
  *
+ * The embedded link payload carries only the blocker's NATIVE status, but the
+ * orchestrator's done-on-merge path (markMerged) sets only the AI-Implement Status
+ * custom field and never transitions native status — the same asymmetry the
+ * feature-node gates already handle with an explicit OR (`childTerminal`). Without
+ * that OR here, an orchestrator-merged blocker holds its dependents forever. The
+ * caller resolves which blockers carry `AI-Implement Status = Merged` (one batched
+ * query per poll) and passes them as `mergedBlockerKeys`.
+ *
  * NOTE: the link type is matched on the default name "Blocks". A Jira instance that
  * renames this link type will fail open here (the issue dispatches as if unblocked).
  * Making the name per-mapping configurable is the follow-up if that becomes a need.
  */
-function isBlockedByIncomplete(issuelinks: unknown): boolean {
+function isBlockedByIncomplete(issuelinks: unknown, mergedBlockerKeys: ReadonlySet<string> = new Set()): boolean {
   if (!Array.isArray(issuelinks)) return false;
   return (issuelinks as JiraIssueLink[]).some(
     (l) =>
       l.type?.name === "Blocks" &&
       l.inwardIssue != null &&
-      l.inwardIssue.fields?.status?.statusCategory?.key !== "done",
+      l.inwardIssue.fields?.status?.statusCategory?.key !== "done" &&
+      !(l.inwardIssue.key != null && mergedBlockerKeys.has(l.inwardIssue.key)),
   );
+}
+
+/** The inward "Blocks" blockers of an issue whose native status is not yet done —
+ *  the keys isBlockedByIncomplete would block on, pending the Merged-field check. */
+function incompleteBlockerKeys(issuelinks: unknown): string[] {
+  if (!Array.isArray(issuelinks)) return [];
+  return (issuelinks as JiraIssueLink[])
+    .filter(
+      (l) =>
+        l.type?.name === "Blocks" &&
+        l.inwardIssue?.key != null &&
+        l.inwardIssue.fields?.status?.statusCategory?.key !== "done",
+    )
+    .map((l) => (l.inwardIssue as { key: string }).key);
 }
 
 export interface JiraProviderConstructor {
@@ -241,9 +264,36 @@ export class JiraProvider implements TicketingProvider {
     });
   }
 
-  private async setStatus(issueId: string, scopeKey: string, value: string): Promise<void> {
+  /** Writes the AI-Implement Status field. Merged is terminal: a run can outlive its
+   *  own PR (the PR merges — auto-merge or a fast human — while the job is still in
+   *  post-push review), so late callbacks and reaper resets must never regress an
+   *  already-Merged issue; that un-terminates it, re-blocks its Blocks-link
+   *  dependents, and stalls the feature-branch cascade. Guarding here rather than
+   *  per-setter covers every regression path at once, at the deliberate cost of one
+   *  extra Jira GET per status write — including writes that cannot regress (an issue
+   *  drawn from the Ready bucket is never Merged); trim to the at-risk setters if
+   *  rate limits ever bite. Returns whether the write happened; the pre-read failing
+   *  keeps the pre-guard behaviour (write proceeds). */
+  private async setStatus(issueId: string, scopeKey: string, value: string): Promise<boolean> {
     const ids = await this.fields(scopeKey);
+    if (value !== STATUS_VALUES.MERGED) {
+      try {
+        const raw = await this.client.getIssue(issueId, [ids.statusFieldId]);
+        if (readStatusValue(raw.fields, ids.statusFieldId) === STATUS_VALUES.MERGED) {
+          console.log(
+            `[jira] Refusing to regress ${issueId} from Merged to ${value} (run or reset outlived its PR)`,
+          );
+          return false;
+        }
+      } catch (err) {
+        console.warn(
+          `[jira] Could not read current status for ${issueId}; proceeding without Merged guard:`,
+          err,
+        );
+      }
+    }
     await this.client.setField(issueId, ids.statusFieldId, { value });
+    return true;
   }
 
   async fetchAIImplementSnapshot(): Promise<AIImplementSnapshot> {
@@ -266,6 +316,7 @@ export class JiraProvider implements TicketingProvider {
         "description",
         "issuelinks",
         "parent",
+        "assignee",
         fieldIds.statusFieldId,
         fieldIds.repoFieldId,
         ...(fieldIds.epicLinkFieldId ? [fieldIds.epicLinkFieldId] : []),
@@ -283,8 +334,9 @@ export class JiraProvider implements TicketingProvider {
       const bucketJql = `(${cfg.jql}) AND ${statusJqlField} in (Ready, "Plan Approved")`;
       const bucketIssues = await this.client.searchJql(bucketJql, fieldsToFetch);
 
-      // Filter pass: drop repo-mismatches and blocked issues (unchanged behavior).
-      const candidates = bucketIssues.filter((raw) => {
+      // Repo pass first, so the merged-blocker lookup below only carries keys from
+      // issues this mapping can actually dispatch.
+      const repoMatched = bucketIssues.filter((raw) => {
         const actualRepo = readRepoFieldValue(raw.fields[fieldIds.repoFieldId]);
         if (actualRepo !== cfg.repoFieldValue) {
           const mismatchKey = `${scopeKey}::${raw.key}`;
@@ -294,7 +346,19 @@ export class JiraProvider implements TicketingProvider {
           }
           return false;
         }
-        if (isBlockedByIncomplete(raw.fields.issuelinks)) {
+        return true;
+      });
+
+      // The blocks-gate below sees only each blocker's NATIVE status, but markMerged
+      // completes issues by setting the AI-Implement Status field alone. Resolve which
+      // natively-unfinished blockers are actually Merged (batched, only when something
+      // is gated) so they release their dependents. On error, resolve to what was
+      // confirmed so far: the gate then keeps its pre-existing behaviour (blocked
+      // until native done) for anything unconfirmed.
+      const mergedBlockerKeys = await this.fetchMergedBlockerKeys(repoMatched, fieldIds);
+
+      const candidates = repoMatched.filter((raw) => {
+        if (isBlockedByIncomplete(raw.fields.issuelinks, mergedBlockerKeys)) {
           console.log(`[jira] Skipping ${raw.key}: blocked by an incomplete issue`);
           return false;
         }
@@ -330,6 +394,50 @@ export class JiraProvider implements TicketingProvider {
     return { needsPlanning, readyForImplementation, inProgressCountsByScope, parentsToFinalize };
   }
 
+  /** Of the natively-unfinished inward blockers across all bucket issues, which carry
+   *  `AI-Implement Status = Merged`? Chunked `key in (...)` queries (50 keys each),
+   *  run only when something is gated. A failed chunk resolves to what the other
+   *  chunks confirmed — a partial set, never a throw — so unconfirmed blockers keep
+   *  the gate's pre-lookup behaviour (blocked until native done), which stalls
+   *  (recoverable next poll) rather than dispatching an issue whose blocker may
+   *  genuinely be unfinished. */
+  private async fetchMergedBlockerKeys(
+    issues: import("./jira-client.js").JiraIssue[],
+    fieldIds: ResolvedFieldIds,
+  ): Promise<Set<string>> {
+    const keys = new Set<string>();
+    for (const raw of issues) {
+      for (const k of incompleteBlockerKeys(raw.fields.issuelinks)) keys.add(k);
+    }
+    if (keys.size === 0) return keys;
+    // Chunked so a large wave of blocked issues cannot push the JQL past Jira's
+    // query-length limit. The try sits INSIDE the loop: the plausible failure is a
+    // per-chunk-deterministic JQL 400 (a deleted/unbrowsable blocker key), and one
+    // bad key must cost its own chunk, not every chunk after it. An unconfirmed
+    // blocker keeps the gate's old blocked-until-native-done behaviour.
+    const CHUNK = 50;
+    const all = [...keys];
+    const merged = new Set<string>();
+    for (let i = 0; i < all.length; i += CHUNK) {
+      const chunk = all.slice(i, i + CHUNK);
+      try {
+        const rows = await this.client.searchJql(
+          `key in (${chunk.map((k) => JSON.stringify(k)).join(",")})`,
+          [fieldIds.statusFieldId],
+        );
+        for (const r of rows) {
+          if (readStatusValue(r.fields, fieldIds.statusFieldId) === STATUS_VALUES.MERGED) merged.add(r.key);
+        }
+      } catch (err) {
+        console.warn(
+          `[jira] merged-blocker lookup failed for ${chunk.length} key(s); those blockers gate on native status only this poll:`,
+          err,
+        );
+      }
+    }
+    return merged;
+  }
+
   private toTicketIssue(
     raw: import("./jira-client.js").JiraIssue,
     scopeKey: string,
@@ -343,6 +451,7 @@ export class JiraProvider implements TicketingProvider {
     const baseBranch = fieldIds.baseBranchFieldId
       ? readBaseBranchValue(raw.fields[fieldIds.baseBranchFieldId])
       : undefined;
+    const assigneeName = (raw.fields.assignee as { displayName?: string } | null)?.displayName?.trim() || undefined;
     return {
       id: raw.id,
       identifier: raw.key,
@@ -352,6 +461,7 @@ export class JiraProvider implements TicketingProvider {
       nativeStatus: statusOption?.value ?? "",
       ...(profiles.length > 0 ? { profiles } : {}),
       ...(baseBranch ? { baseBranch } : {}),
+      ...(assigneeName ? { assigneeName } : {}),
     };
   }
   /**
@@ -621,23 +731,39 @@ export class JiraProvider implements TicketingProvider {
   async markPlanComplete(issueId: string, scopeKey: string): Promise<void> {
     await this.setStatus(issueId, scopeKey, STATUS_VALUES.APPROVED);
   }
-  async markPlanningFailed(issueId: string, scopeKey: string, reason: string): Promise<void> {
-    await this.setStatus(issueId, scopeKey, STATUS_VALUES.PLANNING_FAILED);
+  async markPlanningFailed(issueId: string, scopeKey: string, reason: string): Promise<boolean> {
+    // Same misleading-late-comment rule as the implementation setters: when the write
+    // is refused (issue already Merged), do not post "Planning failed" over it.
+    if (!(await this.setStatus(issueId, scopeKey, STATUS_VALUES.PLANNING_FAILED))) return false;
     await this.postComment(issueId, `⚠️ Planning failed: ${reason}`);
+    return true;
   }
   async markImplementing(issueId: string, scopeKey: string): Promise<void> {
     await this.setStatus(issueId, scopeKey, STATUS_VALUES.IMPLEMENTING);
   }
-  async markPrReady(issueId: string, scopeKey: string, prUrl: string): Promise<void> {
-    await this.setStatus(issueId, scopeKey, STATUS_VALUES.PR_READY);
+  async markPrReady(issueId: string, scopeKey: string, prUrl: string): Promise<boolean> {
+    // setStatus refuses the write when the issue is already Merged (late success
+    // callback after a fast merge); a "PR ready" comment on a merged issue is noise,
+    // so the report is deliberately dropped rather than preserved.
+    if (!(await this.setStatus(issueId, scopeKey, STATUS_VALUES.PR_READY))) return false;
     await this.postComment(issueId, `🚀 PR ready for review: ${prUrl}`);
+    return true;
   }
-  async markImplementationFailed(issueId: string, scopeKey: string, reason: string): Promise<void> {
-    await this.setStatus(issueId, scopeKey, STATUS_VALUES.IMPLEMENTATION_FAILED);
+  async markImplementationFailed(issueId: string, scopeKey: string, reason: string): Promise<boolean> {
+    // Unlike markPrReady, a refused failure write keeps its report: a failure on a
+    // merged issue may still describe real problems worth a human's glance.
+    if (!(await this.setStatus(issueId, scopeKey, STATUS_VALUES.IMPLEMENTATION_FAILED))) {
+      await this.postComment(
+        issueId,
+        `⚠️ A run reported a failure after this issue's PR had already merged; status left at Merged. Late report: ${reason}`,
+      );
+      return true;
+    }
     await this.postComment(issueId, `⚠️ Implementation failed: ${reason}`);
+    return true;
   }
-  async clearWorkingState(issueId: string, scopeKey: string): Promise<void> {
-    await this.setStatus(issueId, scopeKey, STATUS_VALUES.APPROVED);
+  async clearWorkingState(issueId: string, scopeKey: string): Promise<boolean> {
+    return this.setStatus(issueId, scopeKey, STATUS_VALUES.APPROVED);
   }
   async markMerged(issueId: string, scopeKey: string): Promise<void> {
     await this.setStatus(issueId, scopeKey, STATUS_VALUES.MERGED);

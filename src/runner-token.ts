@@ -2,6 +2,8 @@ import { spawnSync } from "node:child_process";
 import { clearPublicationCredential } from "./publication-credential.js";
 
 const DEFAULT_TOKEN_REQUEST_TIMEOUT_MS = 5_000;
+/** Backoff for the fail-closed exchange, mirroring push.ts's LS_REMOTE_RETRY_DELAYS_MS. */
+const TOKEN_REQUEST_RETRY_DELAYS_MS = [250, 1_000];
 
 interface RefreshRunnerGithubTokenInputs {
   currentToken: string;
@@ -50,22 +52,48 @@ export async function refreshRunnerGithubToken(
   const fetchImpl = inputs.fetchImpl ?? fetch;
   const timeoutMs = inputs.timeoutMs ?? DEFAULT_TOKEN_REQUEST_TIMEOUT_MS;
 
-  let response: Response;
-  try {
-    response = canUseMachineNonce
-      ? await fetchImpl(`${orchestratorUrl!.replace(/\/$/, "")}/api/token`, {
+  const requestOnce = (): Promise<Response> =>
+    canUseMachineNonce
+      ? fetchImpl(`${orchestratorUrl!.replace(/\/$/, "")}/api/token`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ nonce: machineNonce, owner: inputs.owner }),
           signal: AbortSignal.timeout(timeoutMs),
         })
-      : await fetchImpl(`${callbackUrl!.replace(/\/$/, "")}/api/runner/publication-token`, {
+      : fetchImpl(`${callbackUrl!.replace(/\/$/, "")}/api/runner/publication-token`, {
           method: "POST",
           headers: { Authorization: `Bearer ${publicationToken}` },
           signal: AbortSignal.timeout(timeoutMs),
         });
-  } catch (err) {
-    const reason = err instanceof Error ? err.message : String(err);
+
+  // The fail-closed exchange is the one request in a run that no later poll can
+  // retry, and failing it discards the whole completed run — so it gets a bounded
+  // retry. Retry ONLY transport failures (connect/timeout: the request may never
+  // have reached the server) and 5xx/429 responses; never any other 4xx. The
+  // publication credential is consumed BEFORE the mint, so a processed request
+  // must not be replayed into `already_consumed` — and if a retried 5xx does land
+  // there, the resulting 403 falls through to the normal rejection path.
+  // The best-effort machine-nonce path keeps its single attempt: it has a
+  // fallback (the boot token), and stacked timeouts would just delay it.
+  const retryDelaysMs = failClosed ? TOKEN_REQUEST_RETRY_DELAYS_MS : [];
+  let response: Response | undefined;
+  let transportError: unknown;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      transportError = undefined;
+      response = await requestOnce();
+    } catch (err) {
+      transportError = err;
+      response = undefined;
+    }
+    const retryable = response === undefined || response.status === 429 || response.status >= 500;
+    if (!retryable || attempt >= retryDelaysMs.length) break;
+    const cause = response ? `HTTP ${response.status}` : (transportError instanceof Error ? transportError.message : String(transportError));
+    console.warn(`[runner-token] Token refresh attempt ${attempt + 1} failed (${cause}); retrying in ${retryDelaysMs[attempt]}ms`);
+    await new Promise((resolve) => setTimeout(resolve, retryDelaysMs[attempt]));
+  }
+  if (response === undefined) {
+    const reason = transportError instanceof Error ? transportError.message : String(transportError);
     if (failClosed) {
       throw new Error(`[runner-token] Token refresh unavailable (${reason})`);
     }
@@ -126,7 +154,12 @@ export async function refreshRunnerGithubCredentials(
   const token = await refreshRunnerGithubToken(inputs);
   if (!canVend) return token;
 
-  if (inputs.publicationToken?.trim() && token !== inputs.currentToken) {
+  // Only clear the single-use publication credential when it was the path
+  // actually exchanged: requestOnce prefers the machine nonce whenever one is
+  // available, and a caller supplying both must not burn an unused credential.
+  const usedPublicationToken =
+    Boolean(inputs.publicationToken?.trim()) && !(inputs.orchestratorUrl?.trim() && inputs.machineNonce?.trim());
+  if (usedPublicationToken && token !== inputs.currentToken) {
     clearPublicationCredential();
   }
 

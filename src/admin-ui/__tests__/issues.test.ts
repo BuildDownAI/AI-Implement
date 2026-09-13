@@ -23,6 +23,11 @@ describe("issues page", () => {
     expect(stripped).not.toMatch(/\besc\(/);
   });
 
+  it("links issues through the provider-resolved issueUrl, never a hardcoded tracker host", () => {
+    expect(issuesScript).toContain("window.safeUrl(issue.issueUrl)");
+    expect(issuesScript).not.toContain("linear.app");
+  });
+
   it("uses const/let, not var", () => {
     expect(issuesScript).not.toMatch(/\bvar\s+\w/);
   });

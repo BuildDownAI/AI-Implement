@@ -1019,11 +1019,12 @@ describe("LinearProvider.markPlanningFailed", () => {
     } as Response);
 
     const p = new LinearProvider({});
-    await p.markPlanningFailed("issue-1", "team-a", "GraphQL exploded");
+    const commented = await p.markPlanningFailed("issue-1", "team-a", "GraphQL exploded");
 
     const lastCall = vi.mocked(fetch).mock.calls.at(-1)!;
     const body = JSON.parse(lastCall[1]?.body as string);
     expect(body.variables.body).toContain("Planning failed: GraphQL exploded");
+    expect(commented).toBe(true);
   });
 });
 
@@ -1046,11 +1047,12 @@ describe("LinearProvider.markImplementationFailed", () => {
     } as Response);
 
     const p = new LinearProvider({});
-    await p.markImplementationFailed("issue-1", "team-a", "tests timed out");
+    const commented = await p.markImplementationFailed("issue-1", "team-a", "tests timed out");
 
     const lastCall = vi.mocked(fetch).mock.calls.at(-1)!;
     const body = JSON.parse(lastCall[1]?.body as string);
     expect(body.variables.body).toContain("Implementation failed: tests timed out");
+    expect(commented).toBe(true);
   });
 });
 

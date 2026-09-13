@@ -130,10 +130,6 @@ function buildImplementPrompt(
   return basePrompt;
 }
 
-function exceededConfiguredMaxTurns(telemetry: RunTelemetry | undefined, maxTurns: number): boolean {
-  return typeof telemetry?.numTurns === "number" && telemetry.numTurns > maxTurns;
-}
-
 /**
  * Pathspecs excluded from the review diff. Generated artifacts (relay
  * `__generated__`, codegen `generated/` dirs) and lockfiles can each be
@@ -464,10 +460,15 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
       // Hard max_turns: the pass ran out of budget mid-work. Reviewing or
       // re-implementing an over-scoped task just burns more passes — stop,
       // post-mortem where the turns went, and let the pipeline open a draft PR.
-      if (
-        implementTelemetry &&
-        (implementTelemetry.outcome === "max_turns" || exceededConfiguredMaxTurns(implementTelemetry, effectiveMaxTurns))
-      ) {
+      //
+      // The CLI's error_max_turns subtype (outcome === "max_turns") is the ONLY
+      // authoritative signal. Do NOT also compare telemetry.numTurns against the
+      // configured cap: result.num_turns counts conversation MESSAGES, not the
+      // agent turns --max-turns bounds — this repo's own telemetry fixture pins a
+      // real production run reporting subtype "success" at num_turns 104 under
+      // the default 50-turn cap (7b74bf6). A numTurns comparison falsely fails
+      // successful passes: review skipped, draft PR, MAX_TURNS_EXHAUSTED.
+      if (implementTelemetry && implementTelemetry.outcome === "max_turns") {
         terminationReason = "max_turns";
         feedback = `Implementation hit the ${effectiveMaxTurns}-turn cap before completing (${implementTelemetry.numTurns ?? "?"} turns used).`;
         postMortem =
