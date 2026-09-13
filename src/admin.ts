@@ -451,7 +451,7 @@ export function handleAdminRequest(
               const parsed = JSON.parse(raw) as { dryRun?: unknown };
               dryRun = parsed.dryRun === true;
             } catch {
-              json(res, 400, { error: "invalid JSON body" });
+              json(res, 400, { error: "Invalid JSON body" });
               return;
             }
           }

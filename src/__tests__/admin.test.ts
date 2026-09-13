@@ -1622,7 +1622,7 @@ describe("admin kg refresh dry-run (AII-635)", () => {
     const token = await login("secret");
     const res = await kgRequest("/api/kg/refresh", "POST", token, undefined, "{not json");
     expect(res.statusCode).toBe(400);
-    expect(JSON.parse(res.body).error).toBe("invalid JSON body");
+    expect(JSON.parse(res.body).error).toBe("Invalid JSON body");
     expect(kgRefreshDeps.trigger).not.toHaveBeenCalled();
   });
 
