@@ -121,7 +121,7 @@ const DIAG_TOOL_NAMES = new Set(DIAG_TOOLS.map((t) => t.name));
 // declaration names the role required to call it. See docs/adr/015-mcp-reads-open-writes-declared.md.
 
 interface WriteToolContext {
-  triggerKgRefresh?: () => Promise<{ status: number; body: Record<string, unknown> }>;
+  triggerKgRefresh?: (dryRun?: boolean) => Promise<{ status: number; body: Record<string, unknown> }>;
   setRunnerMode?: (patch: { mode?: string }) => { status: number; body: Record<string, unknown> };
   pauseProject?: (teamKey: string, paused: boolean) => { status: number; body: Record<string, unknown> };
   addProject?: (body: Record<string, unknown>) => { status: number; body: Record<string, unknown> };
@@ -151,14 +151,19 @@ export const WRITE_TOOLS: WriteTool[] = [
   {
     name: "trigger_kg_refresh",
     description:
-      "Trigger the KG refresh rail (admin role). Same handler as POST /api/kg/refresh: runs the credential preflight, then dispatches the refresh. Poll get_kg_status afterwards.",
-    inputSchema: { type: "object", properties: {} },
+      "Trigger the KG refresh rail (admin role). Same handler as POST /api/kg/refresh: runs the credential preflight, then dispatches the refresh. Poll get_kg_status afterwards. dryRun=true runs the same runner job with kg-snapshot-push's push skipped — all guards run and the guard verdict plus per-part table are reported via get_kg_status, but nothing is pushed, no PR opens, and the served graph never changes.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        dryRun: { type: "boolean", description: "Run the rail without pushing the snapshot or touching the served graph; reports the guard table via get_kg_status." },
+      },
+    },
     role: "admin",
-    run: async (_args, context) => {
+    run: async (args, context) => {
       if (!context.triggerKgRefresh) {
         throw new Error("KG refresh is not configured");
       }
-      return context.triggerKgRefresh();
+      return context.triggerKgRefresh(args.dryRun === true);
     },
   },
   {
@@ -484,7 +489,7 @@ export async function handleMcpRequest(
   defaultRunnerImage?: string,
   runKgRefreshPreflight?: () => Promise<PreflightCheckResult>,
   getKgStatus?: () => Promise<KgRefreshStatus>,
-  triggerKgRefresh?: () => Promise<{ status: number; body: Record<string, unknown> }>,
+  triggerKgRefresh?: (dryRun?: boolean) => Promise<{ status: number; body: Record<string, unknown> }>,
   setRunnerMode?: (patch: { mode?: string }) => { status: number; body: Record<string, unknown> },
   pauseProject?: (teamKey: string, paused: boolean) => { status: number; body: Record<string, unknown> },
   addProject?: (body: Record<string, unknown>) => { status: number; body: Record<string, unknown> },

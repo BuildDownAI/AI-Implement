@@ -77,6 +77,10 @@ export interface RefreshOutcome {
   detail: string;
   stampBefore: string | null;
   stampAfter: string | null;
+  /** True for a dry-run outcome (AII-632): the local rail never ran and `stage` was restored, not advanced. */
+  dryRun?: boolean;
+  /** Per-part {part, prev, new} rows from the push guard. Present on a dry-run outcome when the runner reported one. */
+  partTable?: Array<{ part: string; prev: string; new: string }>;
 }
 
 /** One probe result from the credential preflight. `hint` is set only when `ok` is false. */
@@ -148,17 +152,29 @@ export interface KgRefreshStatus {
 }
 
 export interface KgRefreshHandle {
-  /** POST /api/kg/refresh behind admin auth. Returns the HTTP status + body to send. */
-  trigger(): Promise<{ status: number; body: Record<string, unknown> }>;
+  /**
+   * POST /api/kg/refresh behind admin auth, and the `trigger_kg_refresh` MCP tool.
+   * Returns the HTTP status + body to send. opts.dryRun (AII-632) carries through to
+   * the dispatched runner's envelope so kg-snapshot-push runs its guards without
+   * pushing; the local rail (fetch/stage/swap/canary) never runs for a dry-run trigger.
+   */
+  trigger(opts?: { dryRun?: boolean }): Promise<{ status: number; body: Record<string, unknown> }>;
   /** GET /api/kg/status behind admin auth. */
   status(): Promise<KgRefreshStatus>;
   /**
    * Called by handleRunnerResult when a kg-refresh runner job completes.
    * Verifies the snapshot commit landed, then triggers the local staging rail.
+   * For a dry-run dispatch, records the guard verdict/part table and restores
+   * `stage` to whatever it held before the dispatch instead.
    */
   onRunnerComplete(
     outcome: "success" | "failure",
-    data: { snapshotCommit?: string; snapshotPr?: number; snapshotBranch?: string; failureCode?: string; failureReason?: string },
+    data: {
+      snapshotCommit?: string; snapshotPr?: number; snapshotBranch?: string;
+      failureCode?: string; failureReason?: string;
+      guardVerdict?: "clean" | "refused";
+      partTable?: Array<{ part: string; prev: string; new: string }>;
+    },
   ): void;
   /**
    * Called by the reaper when the runner machine is found absent from the registry.
@@ -625,6 +641,10 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
   let currentDispatchId: string | null = null;
   /** dispatch_log jobId for the active kg-refresh run; null when no row is tracked. */
   let currentJobId: number | null = null;
+  /** True when the in-flight dispatch was triggered with opts.dryRun (AII-632); cleared on every terminal outcome. */
+  let currentDispatchIsDryRun = false;
+  /** `stage` as it stood immediately before the in-flight dispatch — restored on a dry-run completion instead of advancing to serving/reverted. */
+  let stageBeforeCurrentDispatch: KgRefreshStage = "idle";
   /** Timer re-armed on boot when an ingest-running run is re-adopted; null otherwise. */
   let ttlWatchdogTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -969,7 +989,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
   }
 
   return {
-    async trigger() {
+    async trigger(opts?: { dryRun?: boolean }) {
       // Self-heal: if a dispatched runner never reported back and the TTL has elapsed
       // in the live process, expire the lock so the operator can trigger a new refresh.
       if (running && stage === "ingest-running" && ingestStartedAt !== null &&
@@ -1069,6 +1089,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
         }
       }
 
+      const stageBeforeThisTrigger = stage;
       running = true;
       stage = "checking";
 
@@ -1114,6 +1135,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
               kgSourceRepo: input.kgSourceRepo ?? undefined,
               runnerCallbackUrl,
               ...(kgDependencyTokenScope != null ? { dependencyTokenScope: kgDependencyTokenScope } : {}),
+              ...(opts?.dryRun ? { kgDryRun: true as const } : {}),
             };
 
             // Write the row before starting the machine so waitForQuiet cannot
@@ -1140,6 +1162,8 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
               });
             }
             currentDispatchId = dispatchId;
+            currentDispatchIsDryRun = opts?.dryRun === true;
+            stageBeforeCurrentDispatch = stageBeforeThisTrigger;
             stage = "ingest-running";
             ingestStartedAt = Date.now();
             persistStageFn("ingest-running", ingestStartedAt, { dispatchId: currentDispatchId, jobId: currentJobId });
@@ -1215,6 +1239,44 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
         // Orchestrator may have restarted between dispatch and callback.
         // Re-enter the critical section to process the result.
         running = true;
+      }
+
+      if (currentDispatchIsDryRun) {
+        // Dry-run (AII-632): never touch current/ or servedStamp. Report the guard
+        // verdict and part table, then restore `stage` to whatever it held before
+        // this dispatch rather than advancing to serving/reverted/failed.
+        const restoreStage = stageBeforeCurrentDispatch;
+        const savedJobId = currentJobId;
+        currentJobId = null;
+        const savedId = currentDispatchId;
+        currentDispatchId = null;
+        currentDispatchIsDryRun = false;
+
+        const ok = runnerOutcome === "success";
+        const detail = ok
+          ? "dry-run: guard passed: no shrink"
+          : `dry-run: guard refused: ${(data.failureReason ?? data.failureCode ?? "refused").split("\n")[0]}`;
+
+        lastRefresh = {
+          ok,
+          at: Date.now(),
+          detail,
+          stampBefore: null,
+          stampAfter: null,
+          dryRun: true,
+          ...(data.partTable ? { partTable: data.partTable } : {}),
+        };
+        persistLastRefreshFn(lastRefresh);
+        running = false;
+        stage = restoreStage;
+        persistStageFn(stage, Date.now());
+        console.log(`[kg-refresh] ${detail}`);
+        void input.onOutcome?.(ok ? "success" : "failure", {
+          failureReason: ok ? undefined : detail,
+          dispatchId: savedId ?? undefined,
+        });
+        if (savedJobId !== null) input.closeJobLog?.(savedJobId, ok ? "completed" : "failed");
+        return;
       }
 
       if (runnerOutcome === "failure") {

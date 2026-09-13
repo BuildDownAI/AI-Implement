@@ -841,6 +841,99 @@ describe("kg-refresh", () => {
       expect(second.body.error).toBe("refresh-in-progress");
     });
 
+    describe("dry-run trigger (AII-632)", () => {
+      it("runConfig envelope carries kgDryRun: true when trigger({ dryRun: true }) is called", async () => {
+        buildDispatch();
+        await handle.trigger({ dryRun: true });
+        await waitForStage("ingest-running");
+        const call = dispatchRun.mock.calls[0][0] as { runConfig: string };
+        const decoded = JSON.parse(Buffer.from(call.runConfig, "base64").toString("utf-8")) as Record<string, unknown>;
+        expect(decoded.kgDryRun).toBe(true);
+      });
+
+      it("runConfig envelope omits kgDryRun for a plain trigger() call", async () => {
+        buildDispatch();
+        await handle.trigger();
+        await waitForStage("ingest-running");
+        const call = dispatchRun.mock.calls[0][0] as { runConfig: string };
+        const decoded = JSON.parse(Buffer.from(call.runConfig, "base64").toString("utf-8")) as Record<string, unknown>;
+        expect(decoded).not.toHaveProperty("kgDryRun");
+      });
+
+      it("runConfig envelope omits kgDryRun for trigger({ dryRun: false })", async () => {
+        buildDispatch();
+        await handle.trigger({ dryRun: false });
+        await waitForStage("ingest-running");
+        const call = dispatchRun.mock.calls[0][0] as { runConfig: string };
+        const decoded = JSON.parse(Buffer.from(call.runConfig, "base64").toString("utf-8")) as Record<string, unknown>;
+        expect(decoded).not.toHaveProperty("kgDryRun");
+      });
+
+      it("a dry-run success callback restores the pre-dispatch stage, sets partTable, and never restarts the sidecar", async () => {
+        buildDispatch();
+        // Pre-dispatch stage is idle (fresh handle) — the dry-run completion must
+        // restore to it rather than advance to "serving".
+        await handle.trigger({ dryRun: true });
+        await waitForStage("ingest-running");
+        handle.onRunnerComplete("success", {
+          guardVerdict: "clean",
+          partTable: [{ part: "comment.nt", prev: "9995", new: "9995" }],
+        });
+        await waitDone();
+        expect(restart).not.toHaveBeenCalled();
+        const s = await handle.status();
+        expect(s.stage).toBe("idle");
+        expect(s.running).toBe(false);
+        expect(s.lastRefresh?.ok).toBe(true);
+        expect(s.lastRefresh?.dryRun).toBe(true);
+        expect(s.lastRefresh?.detail).toBe("dry-run: guard passed: no shrink");
+        expect(s.lastRefresh?.partTable).toEqual([{ part: "comment.nt", prev: "9995", new: "9995" }]);
+        expect(s.servedStamp).toBeNull();
+      });
+
+      it("a dry-run refusal callback restores the pre-dispatch stage and reports the guard's first refusal line", async () => {
+        buildDispatch();
+        await handle.trigger({ dryRun: true });
+        await waitForStage("ingest-running");
+        handle.onRunnerComplete("failure", {
+          failureCode: "KG_SNAPSHOT_TRACKER_REGRESSION",
+          failureReason: "content regression detected — comment.nt: shrank from 9995 to 3793 lines\nmore detail",
+          guardVerdict: "refused",
+          partTable: [{ part: "comment.nt", prev: "9995", new: "3793" }],
+        });
+        await waitDone();
+        expect(restart).not.toHaveBeenCalled();
+        const s = await handle.status();
+        expect(s.stage).toBe("idle");
+        expect(s.running).toBe(false);
+        expect(s.lastRefresh?.ok).toBe(false);
+        expect(s.lastRefresh?.dryRun).toBe(true);
+        expect(s.lastRefresh?.detail).toBe(
+          "dry-run: guard refused: content regression detected — comment.nt: shrank from 9995 to 3793 lines",
+        );
+        expect(s.lastRefresh?.partTable).toEqual([{ part: "comment.nt", prev: "9995", new: "3793" }]);
+      });
+
+      it("a dry-run completion restores the stage held before dispatch, not a hardcoded idle", async () => {
+        // Dispatch twice: first a normal dispatch that fails (→ "failed"), then a
+        // dry-run dispatch from that stage — the dry-run completion must restore
+        // "failed", not fall back to "idle". Force both triggers down the dispatch
+        // path (matching the pattern used by the "closeJobLog ... TTL" test above).
+        buildDispatch({ fetchSnapshotCommitSha: vi.fn().mockResolvedValue(SNAPSHOT_SHA) });
+        await handle.trigger();
+        await waitForStage("ingest-running");
+        handle.onRunnerComplete("failure", { failureCode: "TIMEOUT", failureReason: "job timed out" });
+        await waitDone();
+        expect((await handle.status()).stage).toBe("failed");
+
+        await handle.trigger({ dryRun: true });
+        await waitForStage("ingest-running");
+        handle.onRunnerComplete("success", { guardVerdict: "clean", partTable: [] });
+        await waitDone();
+        expect((await handle.status()).stage).toBe("failed");
+      });
+    });
+
     it("onRunnerComplete failure sets stage to failed and clears running", async () => {
       buildDispatch();
       await handle.trigger();

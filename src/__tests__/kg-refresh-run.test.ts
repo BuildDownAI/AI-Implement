@@ -4713,6 +4713,25 @@ describe("kgSnapshotPushStep — dryRun flag", () => {
     ).rejects.toBeInstanceOf(KgSnapshotMissingError);
   });
 
+  it("returns guardVerdict: 'clean' and a populated partTable when a previous snapshot exists (AII-632)", async () => {
+    initGitRepo(tmpDir);
+    mkdirSync(join(tmpDir, "snapshot", "parts"), { recursive: true });
+    writeFileSync(join(tmpDir, "snapshot", "parts", "docs.nt"), "<s> <p> <o> .\n".repeat(100));
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.npz"), "binary");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.stamp"), "2026-01-01T00:00:00Z");
+    execSync("git add snapshot/", { cwd: tmpDir, stdio: "ignore" });
+    execSync("git commit -m 'prev snapshot'", { cwd: tmpDir, stdio: "ignore" });
+    const clonedRef = resolveHead(tmpDir);
+
+    writeFileSync(join(tmpDir, "snapshot", "parts", "docs.nt"), "<s> <p> <o> .\n".repeat(105));
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.stamp"), "2026-09-03T10:00:00Z");
+
+    const ctx = makeContext();
+    const result = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef, dryRun: true }), noopReporter);
+    expect(result.guardVerdict).toBe("clean");
+    expect(result.partTable).toEqual([{ part: "docs.nt", prev: "100", new: "105" }]);
+  });
+
   it("still throws KgSnapshotTrackerRegressionError when dryRun=true", async () => {
     initGitRepo(tmpDir);
     mkdirSync(join(tmpDir, "snapshot", "parts"), { recursive: true });
@@ -4730,6 +4749,32 @@ describe("kgSnapshotPushStep — dryRun flag", () => {
     await expect(
       kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef, dryRun: true }), noopReporter),
     ).rejects.toBeInstanceOf(KgSnapshotTrackerRegressionError);
+  });
+
+  it("a content-regression refusal carries the per-part table on the thrown error, dryRun or not (AII-632)", async () => {
+    initGitRepo(tmpDir);
+    mkdirSync(join(tmpDir, "snapshot", "parts"), { recursive: true });
+    writeFileSync(join(tmpDir, "snapshot", "parts", "comment.nt"), "<s> <p> <o> .\n".repeat(9995));
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.npz"), "binary");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.stamp"), "2026-01-01T00:00:00Z");
+    execSync("git add snapshot/", { cwd: tmpDir, stdio: "ignore" });
+    execSync("git commit -m 'prev snapshot with tracker parts'", { cwd: tmpDir, stdio: "ignore" });
+    const clonedRef = resolveHead(tmpDir);
+
+    // Shrinks below the zero-shrink rule for a non-empty tracker part.
+    writeFileSync(join(tmpDir, "snapshot", "parts", "comment.nt"), "<s> <p> <o> .\n".repeat(3793));
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.stamp"), "2026-09-12T00:00:00Z");
+
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 5 });
+
+    const err = await kgSnapshotPushStep
+      .run(ctx, makeInputs({ clonedRef, dryRun: true }), noopReporter)
+      .catch((e) => e);
+    expect(err).toBeInstanceOf(KgSnapshotTrackerRegressionError);
+    expect((err as KgSnapshotTrackerRegressionError).partTable).toEqual([
+      { part: "comment.nt", prev: "9995", new: "3793" },
+    ]);
   });
 });
 
@@ -5455,6 +5500,62 @@ describe("runKgRefresh — dev-harness dep-token-override", () => {
     });
 
     expect(capturedKgDryRun).toBe(true);
+  });
+
+  it("propagates kgDryRun=true from the run_config envelope even when AI_IMPLEMENT_KG_DRY_RUN is unset (AII-632)", async () => {
+    const encoded = encodeRunConfig({
+      v: 1,
+      issue: { id: "kg-refresh", identifier: "KG-REFRESH", title: "KG ingest", description: "" },
+      runnerPhase: "kg-refresh",
+      kgDryRun: true,
+    });
+    process.env.AI_IMPLEMENT_RUN_CONFIG = encoded;
+
+    let capturedKgDryRun: unknown;
+    const capturingKgSnapshotPush: StepModule = {
+      run: async (ctx) => {
+        capturedKgDryRun = ctx.data.kgDryRun;
+        return { snapshotPushed: false, commitSha: null };
+      },
+    };
+
+    await runKgRefresh({
+      workspaceDir: tmpDir,
+      stepsOverride: {
+        clone: makeStepModule({ workspaceDir: tmpDir, repoOwner: "org", repoRepo: "repo", githubToken: "tok", clonedRef: "abc" }),
+        kgTrackerData: makeStepModule({ fetched: false, issueCount: 0 }),
+        kgIngest: makeStepModule({ statsFile: null }),
+        feedbackLoop: makeStepModule({ approved: false }),
+        kgSnapshotPush: capturingKgSnapshotPush,
+      },
+      reporter: { report: async () => undefined },
+    });
+
+    expect(capturedKgDryRun).toBe(true);
+  });
+
+  it("kgDryRun resolves false when neither the envelope nor AI_IMPLEMENT_KG_DRY_RUN is set", async () => {
+    let capturedKgDryRun: unknown;
+    const capturingKgSnapshotPush: StepModule = {
+      run: async (ctx) => {
+        capturedKgDryRun = ctx.data.kgDryRun;
+        return { snapshotPushed: true, commitSha: "sha" };
+      },
+    };
+
+    await runKgRefresh({
+      workspaceDir: tmpDir,
+      stepsOverride: {
+        clone: makeStepModule({ workspaceDir: tmpDir, repoOwner: "org", repoRepo: "repo", githubToken: "tok", clonedRef: "abc" }),
+        kgTrackerData: makeStepModule({ fetched: false, issueCount: 0 }),
+        kgIngest: makeStepModule({ statsFile: null }),
+        feedbackLoop: makeStepModule({ approved: false }),
+        kgSnapshotPush: capturingKgSnapshotPush,
+      },
+      reporter: { report: async () => undefined },
+    });
+
+    expect(capturedKgDryRun).toBe(false);
   });
 });
 

@@ -160,6 +160,7 @@ function resolveKgRefreshInputs(env: NodeJS.ProcessEnv): {
   provider: string;
   maxTurns: number | undefined;
   dependencyTokenScope: "installation" | undefined;
+  kgDryRun: boolean;
 } {
   const rawConfig = env.AI_IMPLEMENT_RUN_CONFIG;
   let issueId = "";
@@ -169,6 +170,7 @@ function resolveKgRefreshInputs(env: NodeJS.ProcessEnv): {
   let callbackUrl: string | null = null;
   let maxTurns: number | undefined;
   let dependencyTokenScope: "installation" | undefined;
+  let kgDryRun = false;
 
   if (rawConfig) {
     try {
@@ -182,6 +184,7 @@ function resolveKgRefreshInputs(env: NodeJS.ProcessEnv): {
         maxTurns = cfg.maxTurns;
       }
       dependencyTokenScope = cfg.dependencyTokenScope;
+      kgDryRun = cfg.kgDryRun === true;
     } catch (err) {
       console.warn("[kg-refresh] Could not decode run_config envelope; using env fallbacks:", err);
     }
@@ -209,6 +212,7 @@ function resolveKgRefreshInputs(env: NodeJS.ProcessEnv): {
     provider,
     maxTurns,
     dependencyTokenScope,
+    kgDryRun,
   };
 }
 
@@ -229,9 +233,12 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
     provider,
     maxTurns,
     dependencyTokenScope,
+    kgDryRun: kgDryRunFromConfig,
   } = resolveKgRefreshInputs(process.env);
 
-  const kgDryRun = process.env.AI_IMPLEMENT_KG_DRY_RUN === "true";
+  // The env var stays as the dev-harness path (AII-586); the envelope field is the
+  // real dispatch path (AII-632). Either one flips dry-run on.
+  const kgDryRun = kgDryRunFromConfig || process.env.AI_IMPLEMENT_KG_DRY_RUN === "true";
   const depTokenOverride = process.env.AI_IMPLEMENT_DEP_TOKEN_OVERRIDE?.trim() || null;
   const nonce = process.env.MACHINE_NONCE ?? "";
   const orchestratorUrl = process.env.ORCHESTRATOR_URL ?? "";
@@ -308,12 +315,18 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
               : undefined;
     const failureReason = err instanceof Error ? err.message : String(err);
     console.error(`[kg-refresh] run failed: ${failureCode ?? "unknown"} — ${failureReason}`);
+    // A guard refusal from kg-snapshot-push carries its per-part table on the error
+    // itself (AII-632) so a dry-run refusal still reports the table via get_kg_status.
+    const guardPartTable = isTrackerRegression
+      ? (err as KgSnapshotTrackerRegressionError).partTable
+      : undefined;
     await postRunnerResult({
       phase: "kg-refresh",
       workspaceDir,
       outcome: "failure",
       failureReason: failureReason.slice(-4000),
       ...(failureCode ? { failureCode } : {}),
+      ...(kgDryRun && guardPartTable ? { guardVerdict: "refused" as const, partTable: guardPartTable } : {}),
       callbackUrl,
       fetchImpl: opts.fetchImpl,
     });
@@ -328,6 +341,9 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
     snapshotCommit: typeof snapshotPushOutputs.commitSha === "string" ? snapshotPushOutputs.commitSha : undefined,
     snapshotPr: typeof snapshotPushOutputs.prNumber === "number" ? snapshotPushOutputs.prNumber : undefined,
     snapshotBranch: typeof snapshotPushOutputs.branchName === "string" ? snapshotPushOutputs.branchName : undefined,
+    ...(kgDryRun && snapshotPushOutputs.guardVerdict === "clean"
+      ? { guardVerdict: "clean" as const, partTable: snapshotPushOutputs.partTable as Array<{ part: string; prev: string; new: string }> | undefined }
+      : {}),
     callbackUrl,
     fetchImpl: opts.fetchImpl,
   });

@@ -146,6 +146,40 @@ describe("postRunnerResult", () => {
     expect(body).not.toHaveProperty("referenceRepoResults");
   });
 
+  it("includes guardVerdict and partTable in body when present (AII-632)", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+
+    await postRunnerResult({
+      workspaceDir: "/tmp",
+      phase: "kg-refresh",
+      outcome: "success",
+      guardVerdict: "clean",
+      partTable: [{ part: "comment.nt", prev: "9995", new: "9995" }],
+      callbackUrl: "https://cb",
+      fetchImpl,
+    });
+
+    const body = JSON.parse(vi.mocked(fetchImpl).mock.calls[0][1]!.body as string);
+    expect(body.guardVerdict).toBe("clean");
+    expect(body.partTable).toEqual([{ part: "comment.nt", prev: "9995", new: "9995" }]);
+  });
+
+  it("omits guardVerdict and partTable from body when not provided", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+
+    await postRunnerResult({
+      workspaceDir: "/tmp",
+      phase: "kg-refresh",
+      outcome: "success",
+      callbackUrl: "https://cb",
+      fetchImpl,
+    });
+
+    const body = JSON.parse(vi.mocked(fetchImpl).mock.calls[0][1]!.body as string);
+    expect(body).not.toHaveProperty("guardVerdict");
+    expect(body).not.toHaveProperty("partTable");
+  });
+
   it("logs the status and does not claim success when the post is refused", async () => {
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});

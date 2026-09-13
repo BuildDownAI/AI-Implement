@@ -245,7 +245,7 @@ async function callMcp(
   providerDiagnostic?: string | null,
   runKgRefreshPreflight?: () => Promise<PreflightCheckResult>,
   getKgStatus?: () => Promise<KgRefreshStatus>,
-  triggerKgRefresh?: () => Promise<{ status: number; body: Record<string, unknown> }>,
+  triggerKgRefresh?: (dryRun?: boolean) => Promise<{ status: number; body: Record<string, unknown> }>,
   writeContext?: McpWriteContext,
 ): Promise<{ statusCode: number; body: string; responseHeaders: Record<string, string> }> {
   (mcpOauth.verifyMcpToken as ReturnType<typeof vi.fn>).mockReturnValue(
@@ -1388,6 +1388,87 @@ describe("handleMcpRequest", () => {
         BASE_URL,
         "POST",
         JSON.stringify({ jsonrpc: "2.0", id: 42, method: "tools/call", params: { name: "trigger_kg_refresh", arguments: {} } }),
+        undefined,
+        undefined,
+        undefined,
+        triggerMock,
+      );
+
+      expect(result.statusCode).toBe(200);
+      const parsed = JSON.parse(result.body);
+      expect(parsed.result.isError).toBe(true);
+      expect(parsed.result.content[0].text).toBe("forbidden: trigger_kg_refresh requires the admin role");
+      expect(triggerMock).not.toHaveBeenCalled();
+    });
+
+    it("trigger_kg_refresh's inputSchema declares an optional dryRun boolean", async () => {
+      mockRole("admin");
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}',
+      );
+      const tool = JSON.parse(result.body).result.tools.find((t: { name: string }) => t.name === "trigger_kg_refresh");
+      expect(tool.inputSchema.properties.dryRun.type).toBe("boolean");
+    });
+
+    it("as admin, dryRun:true is passed through to triggerKgRefresh (AII-632)", async () => {
+      mockRole("admin");
+      const triggerMock = vi.fn(async () => ({ status: 202, body: { accepted: true } }));
+
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 45, method: "tools/call", params: { name: "trigger_kg_refresh", arguments: { dryRun: true } } }),
+        undefined,
+        undefined,
+        undefined,
+        triggerMock,
+      );
+
+      expect(result.statusCode).toBe(200);
+      const parsed = JSON.parse(result.body);
+      expect(parsed.result.isError).not.toBe(true);
+      expect(triggerMock).toHaveBeenCalledWith(true);
+    });
+
+    it("as admin, omitting dryRun passes false through to triggerKgRefresh", async () => {
+      mockRole("admin");
+      const triggerMock = vi.fn(async () => ({ status: 202, body: { accepted: true } }));
+
+      await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 46, method: "tools/call", params: { name: "trigger_kg_refresh", arguments: {} } }),
+        undefined,
+        undefined,
+        undefined,
+        triggerMock,
+      );
+
+      expect(triggerMock).toHaveBeenCalledWith(false);
+    });
+
+    it("as user, dryRun:true is still refused and triggerKgRefresh is never called (AII-632)", async () => {
+      mockRole("user");
+      const triggerMock = vi.fn(async () => ({ status: 202, body: { accepted: true } }));
+
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 47, method: "tools/call", params: { name: "trigger_kg_refresh", arguments: { dryRun: true } } }),
         undefined,
         undefined,
         undefined,

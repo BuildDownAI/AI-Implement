@@ -57,6 +57,10 @@ export async function postRunnerResult(params: {
   snapshotPr?: number | null;
   /** The `kg-refresh/<stamp>` branch the snapshot was pushed to; the orchestrator deletes it after merge or close. */
   snapshotBranch?: string | null;
+  /** Guard verdict from kg-snapshot-push, present only for a kg-refresh dry-run (AII-632). */
+  guardVerdict?: "clean" | "refused";
+  /** Per-part {part, prev, new} table from kg-snapshot-push, present only for a kg-refresh dry-run (AII-632). */
+  partTable?: Array<{ part: string; prev: string; new: string }>;
   /**
    * Resolved callback URL, e.g. from resolveRunnerInputs()/the envelope's runnerCallbackUrl.
    * Falls back to the legacy RUNNER_CALLBACK_URL env var (never set in GHA envelope mode,
@@ -85,6 +89,8 @@ export async function postRunnerResult(params: {
   if (params.snapshotCommit) body.snapshotCommit = params.snapshotCommit;
   if (params.snapshotPr) body.snapshotPr = params.snapshotPr;
   if (params.snapshotBranch) body.snapshotBranch = params.snapshotBranch;
+  if (params.guardVerdict) body.guardVerdict = params.guardVerdict;
+  if (params.partTable) body.partTable = params.partTable;
   const fetchFn = params.fetchImpl ?? fetch;
   try {
     const res = await fetchFn(`${callbackUrl.replace(/\/$/, "")}/runner/result`, {
