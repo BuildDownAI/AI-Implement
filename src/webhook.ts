@@ -47,6 +47,8 @@ interface PullRequestPayload {
     merge_commit_sha?: string;
     labels?: Array<{ name?: string }>;
   };
+  /** The single label added or removed by a `labeled`/`unlabeled` action — distinct from `pull_request.labels`, the cumulative list. */
+  label?: { name?: string };
   repository?: {
     full_name?: string;
   };
@@ -78,10 +80,12 @@ export interface KgPrCheckConfig {
   }) => Promise<{ status: number; body: Record<string, unknown> }>;
   reportDryRun: (report: KgDryRunReportTarget) => Promise<void>;
   /**
-   * Registers a listener for the next kg-refresh dry-run completion (`KgRefreshHandle.onDryRunSettled`).
-   * Used to dispatch a superseding head queued while a dry-run was already in flight (AII-633).
+   * Registers a listener fired whenever a kg-refresh dispatch settles for any reason —
+   * a dry-run completion, a real refresh completion, a failure, or a deploy hold
+   * clearing (`KgRefreshHandle.onRefreshSettled`, AII-636). Used to dispatch a
+   * superseding head queued while some refresh was already in flight (AII-633).
    */
-  onDryRunSettled?: (cb: () => void) => () => void;
+  onRefreshSettled?: (cb: () => void) => () => void;
 }
 
 /** Paths whose change on a KG repo PR proves the dry-run rail before merge (AII-633). */
@@ -123,8 +127,8 @@ const kgDryRunPending = new Map<string, KgDryRunPendingEntry>();
  */
 function queueKgDryRun(kgPrCheck: KgPrCheckConfig, key: string, entry: KgDryRunPendingEntry): void {
   kgDryRunPending.set(key, entry);
-  if (!kgPrCheck.onDryRunSettled) return;
-  const unregister = kgPrCheck.onDryRunSettled(() => {
+  if (!kgPrCheck.onRefreshSettled) return;
+  const unregister = kgPrCheck.onRefreshSettled(() => {
     unregister();
     void dispatchPendingKgDryRun(kgPrCheck, key);
   });
@@ -175,8 +179,17 @@ async function handleKgPrCheckWebhook(
   const headRef = payload.pull_request?.head?.ref;
 
   if (payload.action === "labeled") {
-    // Re-report the last computed verdict (e.g. accept-baseline was just applied) —
-    // never re-runs the rail.
+    // Only the accept-baseline label re-reports anything — any other label on any
+    // other PR must never touch the check (AII-636: a stray label on an unrelated
+    // PR previously re-posted whatever the process had last computed, for any PR).
+    if (payload.label?.name !== KG_ACCEPT_BASELINE_LABEL) {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ignored: true, reason: "not_accept_baseline_label" }));
+      return true;
+    }
+    // Re-report the last computed verdict for this PR — never re-runs the rail.
+    // reportDryRun() itself is scoped to (and no-ops outside of) this PR's own
+    // stored outcome, so this can never surface another PR's verdict.
     await kgPrCheck.reportDryRun({
       repo: repoFullName,
       prNumber,
@@ -211,12 +224,20 @@ async function handleKgPrCheckWebhook(
   const owner = repoFullName.slice(0, slashIdx);
   const repo = repoFullName.slice(slashIdx + 1);
 
+  // A branch-pattern match (upstream merge) is guard-relevant regardless of which
+  // files it touches, so it never needs the files fetch — a transient failure of
+  // that fetch must not cost it the dispatch it would otherwise unconditionally get.
   let files: string[] = [];
-  try {
-    const token = await getInstallationToken(kgPrCheck.githubAppId, kgPrCheck.githubAppPrivateKey, owner);
-    files = await listPullRequestFiles(token, owner, repo, prNumber);
-  } catch (err) {
-    console.error(`[webhook] kg-refresh dry-run: failed to fetch changed files for ${repoFullName}#${prNumber}:`, err);
+  if (!KG_GUARD_BRANCH_PATTERNS.some((re) => re.test(headRef))) {
+    try {
+      const token = await getInstallationToken(kgPrCheck.githubAppId, kgPrCheck.githubAppPrivateKey, owner);
+      files = await listPullRequestFiles(token, owner, repo, prNumber);
+    } catch (err) {
+      console.warn(`[webhook] kg-refresh dry-run: failed to fetch changed files for ${repoFullName}#${prNumber}:`, err);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ignored: true, reason: "files_fetch_failed" }));
+      return true;
+    }
   }
 
   if (!matchesKgGuard(files, headRef)) {

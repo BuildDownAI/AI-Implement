@@ -64,6 +64,9 @@ const KG_SNAPSHOT_SHA_SETTINGS_KEY = "kg_refresh_snapshot_sha";
 /** DB settings key for persisting the last terminal refresh outcome across restarts. */
 const KG_LAST_REFRESH_SETTINGS_KEY = "kg_refresh_last_refresh";
 
+/** Default bound on the per-PR dry-run outcome cache (AII-636); overridable via KgRefreshInput.dryRunOutcomeCap for tests. */
+const DRY_RUN_OUTCOME_CAP = 200;
+
 /**
  * Gates evaluated during refresh. `"staging"` fires before any swap; `"ingest-needed"` fires
  * before staging when the source snapshot is not newer than the served stamp (informational,
@@ -224,21 +227,33 @@ export interface KgRefreshHandle {
    */
   onMachineLost(opts?: { failureCode?: string; detail?: string }): void;
   /**
-   * Re-posts the last dry-run outcome's comment/status to `report` without triggering
-   * a new run (AII-633). Called on a `labeled` PR event (e.g. `accept-baseline` applied
-   * after the fact) so the report's wording updates without spending another dispatch.
-   * A no-op when `lastRefresh` is absent or is not a dry-run outcome.
+   * Re-posts a dry-run outcome's comment/status to `report` without triggering a new
+   * run (AII-633). Looks up the outcome stored for `report.repo`#`report.prNumber`
+   * (AII-636) and posts only that PR's own outcome — never another PR's — and only
+   * when it ran against `report.sha`; otherwise a no-op (with a debug log line).
+   * Called on a `labeled` PR event (e.g. `accept-baseline` applied after the fact) so
+   * the report's wording updates without spending another dispatch.
    */
   reportDryRun(report: KgDryRunReportTarget): Promise<void>;
   /**
-   * Registers a listener fired once, every time a dry-run dispatch (AII-632's
-   * `trigger({ dryRun: true })`) reaches a terminal outcome inside onRunnerComplete.
-   * Used by the webhook module's PR-triggered supersession queue (AII-633): a
-   * `synchronize` that finds `trigger()` returning 409 (a refresh already running)
-   * queues its head and waits for this signal to dispatch it. Returns an unregister
-   * function; the webhook module self-unregisters after each fire (one-shot per queue).
+   * Registers a listener fired whenever an in-flight kg-refresh dispatch settles, for
+   * any reason — a dry-run completion, a real refresh completion, a failure, a revert,
+   * or TTL expiry (AII-636; previously fired only for a dry-run). Used by the webhook
+   * module's PR-triggered supersession queue (AII-633): a `synchronize` that finds
+   * `trigger()` returning 409 (a refresh already running) queues its head and waits
+   * for this signal to dispatch it. Returns an unregister function; the webhook module
+   * self-unregisters after each fire (one-shot per queue).
    */
-  onDryRunSettled(cb: () => void): () => void;
+  onRefreshSettled(cb: () => void): () => void;
+  /**
+   * Fires every registered onRefreshSettled listener immediately, with no completed
+   * run (AII-636). trigger()'s `deployHeld()` check answers 409 before `running` is
+   * ever set, so a deploy hold clearing is not a `running` transition and nothing
+   * inside onRunnerComplete's terminal paths would otherwise wake a webhook head
+   * queued behind that refusal — the caller (index.ts, wired to deploy-hold.ts's
+   * onDeployHoldCleared) invokes this once the hold actually clears.
+   */
+  fireRefreshSettled(): void;
 }
 
 interface KgRefreshInput {
@@ -276,6 +291,8 @@ interface KgRefreshInput {
   mcpToolCall?: (url: string, tool: string, args: Record<string, unknown>) => Promise<unknown>;
   canaryDeadlineMs?: number;
   canaryRetryMs?: number;
+  /** Bound on the per-PR dry-run outcome cache. Injectable for tests; defaults to 200 (AII-636). */
+  dryRunOutcomeCap?: number;
 
   // ---- Dispatch-path deps (AII-495) ----
 
@@ -753,8 +770,41 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
   let currentReport: KgDryRunReportTarget | null = null;
   /** Timer re-armed on boot when an ingest-running run is re-adopted; null otherwise. */
   let ttlWatchdogTimer: ReturnType<typeof setTimeout> | null = null;
-  /** Listeners registered via onDryRunSettled(), fired when a dry-run dispatch settles (AII-633). */
-  const dryRunSettledListeners: Array<() => void> = [];
+  /** Listeners registered via onRefreshSettled(), fired whenever `running` clears for any reason (AII-636). */
+  const refreshSettledListeners: Array<() => void> = [];
+  /** Bound on dryRunOutcomesByPr — oldest entry evicted first past this many distinct PRs (AII-636). */
+  const dryRunOutcomeCap = input.dryRunOutcomeCap ?? DRY_RUN_OUTCOME_CAP;
+  /**
+   * Dry-run outcomes keyed by `repo#prNumber` (AII-636), so a `labeled` webhook event
+   * can only ever re-post the verdict computed for that same PR — never another PR's.
+   * Each entry pins the head `sha` the outcome ran against, so a label applied after a
+   * new push (which supersedes the stored outcome) is a no-op rather than a stale
+   * re-post. Bounded to dryRunOutcomeCap entries, oldest evicted first; a PR-scoped
+   * cache has no other natural expiry.
+   */
+  const dryRunOutcomesByPr = new Map<string, { sha: string; outcome: RefreshOutcome }>();
+
+  /** Records `outcome` as the current dry-run verdict for `report`'s PR, evicting the oldest entry past the cap. */
+  function recordDryRunOutcome(report: KgDryRunReportTarget, outcome: RefreshOutcome): void {
+    const key = `${report.repo}#${report.prNumber}`;
+    dryRunOutcomesByPr.delete(key);
+    dryRunOutcomesByPr.set(key, { sha: report.sha, outcome });
+    if (dryRunOutcomesByPr.size > dryRunOutcomeCap) {
+      const oldestKey = dryRunOutcomesByPr.keys().next().value;
+      if (oldestKey !== undefined) dryRunOutcomesByPr.delete(oldestKey);
+    }
+  }
+
+  /** Fires every registered onRefreshSettled listener; a listener's own error never stops the others. */
+  function notifyRefreshSettled(): void {
+    for (const cb of [...refreshSettledListeners]) {
+      try {
+        cb();
+      } catch (err) {
+        console.error("[kg-refresh] onRefreshSettled listener failed:", err);
+      }
+    }
+  }
 
   // Restore persisted state on construction (crash recovery).
   lastRefresh = loadLastRefreshFn();
@@ -1032,6 +1082,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
       void input.onOutcome?.("failure", { failureReason: outcome.detail, dispatchId: savedId ?? undefined });
     }
     if (savedJobId !== null) input.closeJobLog?.(savedJobId, outcome.ok ? "completed" : "failed");
+    notifyRefreshSettled();
   }
 
   /** Merges the runner-opened snapshot PR with the "merge" method — never squash/rebase, so `sha` (snapshotCommit) is verifiable as an ancestor of the resulting default-branch head. */
@@ -1172,6 +1223,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
       failureCode,
     });
     if (savedJobId !== null) input.closeJobLog?.(savedJobId, "timed_out");
+    notifyRefreshSettled();
   }
 
   return {
@@ -1378,6 +1430,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
             } else {
               void input.onOutcome?.("failure", { failureReason: outcome.detail });
             }
+            notifyRefreshSettled();
           }
         } catch (err) {
           lastRefresh = {
@@ -1398,6 +1451,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
           currentDispatchId = null;
           void input.onOutcome?.("failure", { failureReason: String(err), dispatchId: savedId ?? undefined });
           if (savedJobId !== null) input.closeJobLog?.(savedJobId, "failed");
+          notifyRefreshSettled();
         }
       })();
 
@@ -1472,19 +1526,16 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
         stage = restoreStage;
         persistStageFn(stage, Date.now());
         console.log(`[kg-refresh] ${detail}`);
-        if (savedReport) void postDryRunReport(savedReport, lastRefresh);
+        if (savedReport) {
+          recordDryRunOutcome(savedReport, lastRefresh);
+          void postDryRunReport(savedReport, lastRefresh);
+        }
         void input.onOutcome?.(ok ? "success" : "failure", {
           failureReason: ok ? undefined : detail,
           dispatchId: savedId ?? undefined,
         });
         if (savedJobId !== null) input.closeJobLog?.(savedJobId, ok ? "completed" : "failed");
-        for (const settledCb of [...dryRunSettledListeners]) {
-          try {
-            settledCb();
-          } catch (err) {
-            console.error("[kg-refresh] onDryRunSettled listener failed:", err);
-          }
-        }
+        notifyRefreshSettled();
         return;
       }
 
@@ -1511,6 +1562,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
           currentDispatchId = null;
           void input.onOutcome?.("no-new-data", { failureCode: "KG_SNAPSHOT_STALE", dispatchId: savedId ?? undefined });
           if (savedJobIdS !== null) input.closeJobLog?.(savedJobIdS, "completed");
+          notifyRefreshSettled();
           return;
         }
 
@@ -1548,6 +1600,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
           dispatchId: savedIdF ?? undefined,
         });
         if (savedJobIdF !== null) input.closeJobLog?.(savedJobIdF, "failed");
+        notifyRefreshSettled();
         return;
       }
 
@@ -1577,6 +1630,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
           dispatchId: savedIdN ?? undefined,
         });
         if (savedJobIdN !== null) input.closeJobLog?.(savedJobIdN, "failed");
+        notifyRefreshSettled();
         return;
       }
 
@@ -1600,6 +1654,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
         currentDispatchId = null;
         void input.onOutcome?.("failure", { failureReason: detail, dispatchId: savedId ?? undefined });
         if (savedJobId !== null) input.closeJobLog?.(savedJobId, "failed");
+        notifyRefreshSettled();
       };
 
       void (async () => {
@@ -1664,6 +1719,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
               dispatchId: savedIdV ?? undefined,
             });
             if (savedJobIdV !== null) input.closeJobLog?.(savedJobIdV, "failed");
+            notifyRefreshSettled();
             return;
           }
         }
@@ -1698,16 +1754,25 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
     },
 
     async reportDryRun(report: KgDryRunReportTarget): Promise<void> {
-      if (!lastRefresh || lastRefresh.dryRun !== true) return;
-      await postDryRunReport(report, lastRefresh);
+      const key = `${report.repo}#${report.prNumber}`;
+      const stored = dryRunOutcomesByPr.get(key);
+      if (!stored || stored.sha !== report.sha) {
+        console.debug(`[kg-refresh] dry-run report skipped: no outcome for ${report.repo}#${report.prNumber}`);
+        return;
+      }
+      await postDryRunReport(report, stored.outcome);
     },
 
-    onDryRunSettled(cb: () => void): () => void {
-      dryRunSettledListeners.push(cb);
+    onRefreshSettled(cb: () => void): () => void {
+      refreshSettledListeners.push(cb);
       return () => {
-        const idx = dryRunSettledListeners.indexOf(cb);
-        if (idx !== -1) dryRunSettledListeners.splice(idx, 1);
+        const idx = refreshSettledListeners.indexOf(cb);
+        if (idx !== -1) refreshSettledListeners.splice(idx, 1);
       };
+    },
+
+    fireRefreshSettled(): void {
+      notifyRefreshSettled();
     },
   };
 }
