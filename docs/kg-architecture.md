@@ -242,6 +242,19 @@ blocking all future refreshes for the remainder of the 4-hour ingest TTL. A live
 dispatched a runner and received no callback within the TTL self-heals at the next `POST
 /api/kg/refresh` call.
 
+### Dry run (AII-632)
+
+`trigger_kg_refresh { dryRun: true }` (the MCP tool, admin role) dispatches the same runner job
+as a normal trigger, with the push skipped: every guard in `kg-snapshot-push` still runs against
+the freshly ingested snapshot, but nothing is committed or pushed. The verdict and the per-part
+line-count table land on `get_kg_status` as `lastRefresh.dryRun`, `lastRefresh.detail`
+(`"dry-run: guard passed: ..."` / `"dry-run: guard refused: ..."` / `"dry-run: failed: ..."`), and
+`lastRefresh.partTable`. `servedStamp` and `current/` never change, and `stage` is restored to
+whatever it held before the dispatch rather than advancing through `staging`/`serving`/`reverted`.
+A dry-run and a real run of the same KG head print the same part table. The REST body
+(`POST /api/kg/refresh { dryRun: true }`) and the Deployments-page button that trigger it through
+the admin UI follow in AII-635; today, `dryRun` is reachable only via the MCP tool.
+
 **Redeploy remains the path for code, not data** — a change that touches the sidecar's code rather
 than its data ships by deploy, and the image build reads whatever snapshot is on the KG repo's default
 branch at that moment (the rail keeps it current):
@@ -362,6 +375,28 @@ the control is disabled and the write comes back `409`, same as the `RUNNER_MODE
 `FLY_PROCESS_LEVEL_SECRETS` pattern on the Runners page. The toggle only affects the *next*
 refresh, not whatever the sidecar is currently serving — `GET /api/kg/status` and the `get_kg_status`
 MCP tool both report the resolved setting as `materialize: "rdflib" | "direct"` for observability.
+
+### Dry-run plumbing (AII-632)
+
+The dry-run flag travels the same envelope path as every other kg-refresh setting: `trigger(opts)`
+sets `kgDryRun: true` on the `RunConfigV1` it builds (the pattern `kgSourceRepo` already follows),
+and `kg-refresh-run.ts`'s `resolveKgRefreshInputs` decodes it, OR'd with the existing
+`AI_IMPLEMENT_KG_DRY_RUN` env var so the dev harness's `--phase kg-refresh` path (which sets the
+env var directly, with no envelope) keeps working unchanged. `kg-snapshot-push.ts` returns
+`guardVerdict` and `partTable` in its step output on both the success path and, via
+`KgSnapshotTrackerRegressionError.partTable`, on a guard refusal — the guard still throws on
+refusal; dry-run only adds structured reporting on top of the existing throw-based contract. The
+runner's callback body carries both fields back to the orchestrator (`RunnerResultBody.guardVerdict`
+/ `.partTable`), and `handleRunnerResult` forwards them verbatim into
+`onKgRefreshRunnerComplete`. `onRunnerComplete` in `src/kg-refresh.ts` branches on a dispatch-time
+dry-run flag: it skips `runRefreshAndSettle()` entirely, restores `stage` to the value captured
+before the dispatch, and builds `lastRefresh.detail` from `data.guardVerdict` — `"refused"` yields
+`"dry-run: guard refused: ..."`, a clean success yields `"dry-run: guard passed: no shrink"`, and a
+runner failure that never reached the guard (clone, ingest, callback) yields
+`"dry-run: failed: ..."` rather than being mislabeled as a guard refusal. The dry-run flag and the
+pre-dispatch stage are written into the same persisted stage envelope as `dispatchId`/`jobId` (not
+kept only in memory), so a callback arriving after an orchestrator restart mid-`ingest-running` is
+still recognized and handled as a dry run instead of falling through to the real staging rail.
 
 ### The `index.ts` budget
 

@@ -48,7 +48,7 @@ Writes, declared:
 
 | Tool | Role | Does |
 | -- | -- | -- |
-| `trigger_kg_refresh` | admin | Same as `POST /api/kg/refresh`: preflight, then dispatch the refresh rail. Answers accepted (202), already-running (409), or the named preflight refusal (422). |
+| `trigger_kg_refresh` | admin | Same as `POST /api/kg/refresh`: preflight, then dispatch the refresh rail. Answers accepted (202), already-running (409), or the named preflight refusal (422). Optional `dryRun` boolean argument (AII-632): dispatches the same runner job with `kg-snapshot-push`'s push skipped — every guard still runs, and the verdict plus per-part line-count table are reported on `get_kg_status` as `lastRefresh.dryRun` / `.detail` / `.partTable`. `current/` and `servedStamp` are never touched, and `stage` is restored to whatever it held before the trigger. A REST body and the Deployments-page button follow in AII-635. |
 | `set_runner_mode` | admin | Same as `POST /api/runner-mode`'s mode update: forces (or restores) the global execution path. Accepts every value of `VALID_RUNNER_MODES` (`default`, `gha`, `fly`, `shadow`, `local`), validated by the action, not the tool; `local` is a developer-machine mode the admin UI's buttons do not offer. |
 | `pause_project` | admin | Same as the `paused` update of `PATCH /api/mappings/<teamKey>`. |
 | `add_project` | admin | Same as `POST /api/mappings`: create or update a project mapping, the upsert behind the admin UI's New project stepper. |
