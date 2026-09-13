@@ -1587,7 +1587,12 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
           return;
         }
 
-        const detail = data.failureCode ?? data.failureReason ?? "runner reported failure";
+        // A tracker-regression refusal carries a part-naming message on failureReason
+        // (AII-638) — prefer its first line over the bare code so the ticket/status
+        // names the part and sizes, mirroring the dry-run branch above.
+        const detail = data.failureCode === "KG_SNAPSHOT_TRACKER_REGRESSION"
+          ? (data.failureReason ?? data.failureCode ?? "runner reported failure").split("\n")[0]
+          : (data.failureCode ?? data.failureReason ?? "runner reported failure");
         lastRefresh = {
           ok: false,
           at: Date.now(),
@@ -1595,6 +1600,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
           detail: `ingest runner failed: ${detail}`,
           stampBefore: null,
           stampAfter: null,
+          ...(data.failureCode === "KG_SNAPSHOT_TRACKER_REGRESSION" && data.partTable ? { partTable: data.partTable } : {}),
         };
         persistLastRefreshFn(lastRefresh);
         running = false;

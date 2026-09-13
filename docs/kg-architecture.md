@@ -256,7 +256,10 @@ reachable from the admin REST route, `POST /api/kg/refresh` with body `{ "dryRun
 response echoes `dryRun` beside the trigger's fields; no body is the unchanged real refresh), and
 from the Deployments page's **Dry-run refresh** button beside **Refresh graph now** (AII-635). When
 the last terminal outcome was a dry-run, the Knowledge graph card shows its verdict and the
-per-part table (`part | previous | new | delta`).
+per-part table (`part | previous | new | delta`). A guard refusal carries the same
+`lastRefresh.partTable` and a part-naming `detail` on `get_kg_status` whether it came from a
+dry-run or a real (non-dry-run) refresh (AII-638) — only a real success omits `guardVerdict`/
+`partTable`, since it reports a snapshot commit instead.
 
 **Redeploy remains the path for code, not data** — a change that touches the sidecar's code rather
 than its data ships by deploy, and the image build reads whatever snapshot is on the KG repo's default
