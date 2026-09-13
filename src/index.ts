@@ -3610,6 +3610,7 @@ function startServer(config: AppConfig, registry: ProviderRegistry, sidecar: KgS
         githubAppPrivateKey: config.githubAppPrivateKey,
         trigger: (opts) => kgRefresh.trigger(opts),
         reportDryRun: (report) => kgRefresh.reportDryRun(report),
+        onDryRunSettled: (cb) => kgRefresh.onDryRunSettled(cb),
       }).catch((err) => {
         console.error("[webhook] Unhandled error:", err);
         if (!res.headersSent) {

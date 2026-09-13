@@ -77,6 +77,11 @@ export interface KgPrCheckConfig {
     report?: KgDryRunReportTarget;
   }) => Promise<{ status: number; body: Record<string, unknown> }>;
   reportDryRun: (report: KgDryRunReportTarget) => Promise<void>;
+  /**
+   * Registers a listener for the next kg-refresh dry-run completion (`KgRefreshHandle.onDryRunSettled`).
+   * Used to dispatch a superseding head queued while a dry-run was already in flight (AII-633).
+   */
+  onDryRunSettled?: (cb: () => void) => () => void;
 }
 
 /** Paths whose change on a KG repo PR proves the dry-run rail before merge (AII-633). */
@@ -96,6 +101,55 @@ function hasAcceptBaselineLabel(payload: PullRequestPayload): boolean {
 
 /** Tracks the last sha a dry-run was dispatched for, per PR, so a redelivered/duplicate webhook does not re-dispatch. */
 const kgDryRunLastSha = new Map<string, string>();
+
+interface KgDryRunPendingEntry {
+  ref: string;
+  report: KgDryRunReportTarget;
+}
+
+/**
+ * Heads queued while a dry-run was already in flight for the same PR, keyed by
+ * `repo#prNumber` (AII-633). At most one entry per PR — a newer head replaces the
+ * pending one rather than queuing alongside it, so only the latest ever dispatches.
+ */
+const kgDryRunPending = new Map<string, KgDryRunPendingEntry>();
+
+/**
+ * Queues `entry` as the pending dispatch for `key`, replacing any earlier pending
+ * head, and arms a one-shot listener that dispatches it on the next dry-run
+ * completion. Called both when a fresh webhook delivery collides with an in-flight
+ * dry-run (trigger() → 409) and when a queued dispatch itself races into another
+ * in-flight run.
+ */
+function queueKgDryRun(kgPrCheck: KgPrCheckConfig, key: string, entry: KgDryRunPendingEntry): void {
+  kgDryRunPending.set(key, entry);
+  if (!kgPrCheck.onDryRunSettled) return;
+  const unregister = kgPrCheck.onDryRunSettled(() => {
+    unregister();
+    void dispatchPendingKgDryRun(kgPrCheck, key);
+  });
+}
+
+/** Dispatches the pending head for `key`, if any, once the in-flight dry-run has settled. */
+async function dispatchPendingKgDryRun(kgPrCheck: KgPrCheckConfig, key: string): Promise<void> {
+  const entry = kgDryRunPending.get(key);
+  if (!entry) return;
+  kgDryRunPending.delete(key);
+
+  const result = await kgPrCheck.trigger({ dryRun: true, ref: entry.ref, report: entry.report }).catch((err) => {
+    console.error(`[webhook] kg-refresh dry-run: failed to dispatch queued head for ${key}:`, err);
+    return { status: 500, body: {} as Record<string, unknown> };
+  });
+
+  if (result.status === 409) {
+    // Still busy — another dispatch raced in ahead of this one. Re-queue and wait
+    // for the next completion rather than dropping the superseding head.
+    queueKgDryRun(kgPrCheck, key, entry);
+    return;
+  }
+
+  console.log(`[kg-refresh] dry-run for ${entry.report.repo}@${entry.report.sha} (queued dispatch)`);
+}
 
 /**
  * Handles a `pull_request` event against the KG PR-triggered dry-run rail (AII-633).
@@ -175,17 +229,29 @@ async function handleKgPrCheckWebhook(
   // while the trigger call is in flight still collapses to one dispatch.
   kgDryRunLastSha.set(key, sha);
 
-  const result = await kgPrCheck.trigger({
-    dryRun: true,
-    ref: headRef,
-    report: { repo: repoFullName, prNumber, sha, acceptBaseline: hasAcceptBaselineLabel(payload) },
-  }).catch((err) => {
+  const report: KgDryRunReportTarget = {
+    repo: repoFullName,
+    prNumber,
+    sha,
+    acceptBaseline: hasAcceptBaselineLabel(payload),
+  };
+
+  const result = await kgPrCheck.trigger({ dryRun: true, ref: headRef, report }).catch((err) => {
     console.error(`[webhook] kg-refresh dry-run trigger failed for ${repoFullName}#${prNumber}:`, err);
     return { status: 500, body: {} as Record<string, unknown> };
   });
 
+  if (result.status === 409) {
+    // A refresh is already running — supersede any previously queued head for this
+    // PR with this one and dispatch it once the in-flight dry-run completes.
+    queueKgDryRun(kgPrCheck, key, { ref: headRef, report });
+    res.writeHead(202, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ queued: true }));
+    return true;
+  }
+
   console.log(`[kg-refresh] dry-run for ${repoFullName}@${sha}`);
-  res.writeHead(200, { "Content-Type": "application/json" });
+  res.writeHead(result.status === 202 ? 202 : 200, { "Content-Type": "application/json" });
   res.end(JSON.stringify({ triggered: result.status === 202, status: result.status }));
   return true;
 }

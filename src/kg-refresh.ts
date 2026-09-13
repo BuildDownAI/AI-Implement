@@ -220,6 +220,15 @@ export interface KgRefreshHandle {
    * A no-op when `lastRefresh` is absent or is not a dry-run outcome.
    */
   reportDryRun(report: KgDryRunReportTarget): Promise<void>;
+  /**
+   * Registers a listener fired once, every time a dry-run dispatch (AII-632's
+   * `trigger({ dryRun: true })`) reaches a terminal outcome inside onRunnerComplete.
+   * Used by the webhook module's PR-triggered supersession queue (AII-633): a
+   * `synchronize` that finds `trigger()` returning 409 (a refresh already running)
+   * queues its head and waits for this signal to dispatch it. Returns an unregister
+   * function; the webhook module self-unregisters after each fire (one-shot per queue).
+   */
+  onDryRunSettled(cb: () => void): () => void;
 }
 
 interface KgRefreshInput {
@@ -725,6 +734,8 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
   let currentReport: KgDryRunReportTarget | null = null;
   /** Timer re-armed on boot when an ingest-running run is re-adopted; null otherwise. */
   let ttlWatchdogTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Listeners registered via onDryRunSettled(), fired when a dry-run dispatch settles (AII-633). */
+  const dryRunSettledListeners: Array<() => void> = [];
 
   // Restore persisted state on construction (crash recovery).
   lastRefresh = loadLastRefreshFn();
@@ -1447,6 +1458,13 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
           dispatchId: savedId ?? undefined,
         });
         if (savedJobId !== null) input.closeJobLog?.(savedJobId, ok ? "completed" : "failed");
+        for (const settledCb of [...dryRunSettledListeners]) {
+          try {
+            settledCb();
+          } catch (err) {
+            console.error("[kg-refresh] onDryRunSettled listener failed:", err);
+          }
+        }
         return;
       }
 
@@ -1662,6 +1680,14 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
     async reportDryRun(report: KgDryRunReportTarget): Promise<void> {
       if (!lastRefresh || lastRefresh.dryRun !== true) return;
       await postDryRunReport(report, lastRefresh);
+    },
+
+    onDryRunSettled(cb: () => void): () => void {
+      dryRunSettledListeners.push(cb);
+      return () => {
+        const idx = dryRunSettledListeners.indexOf(cb);
+        if (idx !== -1) dryRunSettledListeners.splice(idx, 1);
+      };
     },
   };
 }
