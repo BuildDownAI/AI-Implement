@@ -1,7 +1,21 @@
 import { getDb } from "./dedup.js";
+import type { FailureCategory } from "./pipeline/failure-classification.js";
 
 function threshold(): number {
   return Number(process.env.DISPATCH_BREAKER_THRESHOLD ?? 3);
+}
+
+/**
+ * Whether a terminal job's classified failure should count against the breaker.
+ * A `transient` failure (provider overload, rate limiting, transport errors) is
+ * the provider's outage, not the ticket's — counting it toward the threshold
+ * would park an issue for three unlucky retries against a flaky provider
+ * (BAC-27134). Every other category still counts: those are the ticket's own
+ * problem (bad config, invalid output, a real crash) and the breaker exists to
+ * stop dispatching it.
+ */
+export function shouldCountFailure(record: { category: FailureCategory }): boolean {
+  return record.category !== "transient";
 }
 
 export function initDispatchBreakerTable(): void {

@@ -432,6 +432,15 @@ describe("reviewStep", () => {
     expect(call.retry).toBeUndefined();
   });
 
+  it("invokes the executor with no maxTurns — the in-loop reviewer is uncapped", async () => {
+    const executor = makeExecutor(APPROVED_VERDICT);
+
+    await reviewStep.run(makeContext(executor), {}, new NoopStepReporter());
+
+    const call = vi.mocked(executor.invoke).mock.calls[0][0];
+    expect(call.maxTurns).toBeUndefined();
+  });
+
   it("returns tokensUsed from executor", async () => {
     const executor = makeExecutor(APPROVED_VERDICT, 0, 200);
     const outputs = await reviewStep.run(makeContext(executor), {}, new NoopStepReporter());

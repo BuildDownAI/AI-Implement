@@ -1,6 +1,9 @@
 import type { LLMResult } from "./types.js";
 
 export const UNAPPROVED_TITLE_PREFIX = "[NEEDS REVIEW — unapproved] ";
+// A provider outage is not a rejection — the 422 non-draft fallback title must say so rather
+// than reusing UNAPPROVED_TITLE_PREFIX's "unapproved" wording (BAC-27201).
+export const PROVIDER_OUTAGE_TITLE_PREFIX = "[INTERRUPTED — provider outage] ";
 
 export interface OpenOrFindPullRequestInputs {
   repoOwner: string;
@@ -11,6 +14,10 @@ export interface OpenOrFindPullRequestInputs {
   baseBranch: string;
   prBody: string;
   draft: boolean;
+  /** True when the run ended on a provider outage rather than a review rejection — selects
+   *  PROVIDER_OUTAGE_TITLE_PREFIX instead of UNAPPROVED_TITLE_PREFIX for the 422 non-draft
+   *  fallback title (BAC-27201). */
+  providerUnavailable?: boolean;
 }
 
 /**
@@ -21,7 +28,7 @@ export interface OpenOrFindPullRequestInputs {
 export async function openOrFindPullRequest(
   inputs: OpenOrFindPullRequestInputs,
 ): Promise<{ url: string; number: number; draft: boolean }> {
-  const { repoOwner, repoRepo, githubToken, prTitle, branchName, baseBranch, prBody, draft } = inputs;
+  const { repoOwner, repoRepo, githubToken, prTitle, branchName, baseBranch, prBody, draft, providerUnavailable } = inputs;
 
   const create = async (title: string, asDraft: boolean): Promise<Response> =>
     fetch(`https://api.github.com/repos/${repoOwner}/${repoRepo}/pulls`, {
@@ -62,7 +69,8 @@ export async function openOrFindPullRequest(
       }
     }
     if (draft) {
-      const retryRes = await create(`${UNAPPROVED_TITLE_PREFIX}${prTitle}`, false);
+      const titlePrefix = providerUnavailable ? PROVIDER_OUTAGE_TITLE_PREFIX : UNAPPROVED_TITLE_PREFIX;
+      const retryRes = await create(`${titlePrefix}${prTitle}`, false);
       if (retryRes.ok) return parseCreated(retryRes, false);
       const retryBody = await retryRes.text().catch(() => "");
       throw new Error(`Draft PR rejected (422) and non-draft fallback failed with HTTP ${retryRes.status}: ${retryBody}`);

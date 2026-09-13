@@ -1319,6 +1319,284 @@ describe("runAutonomous", () => {
     expect(body.failureReason).toContain("ran out of turns");
   });
 
+  it("uses PROVIDER_UNAVAILABLE with the classified failure when the in-loop review stage is exhausted by a transient outage (BAC-27134)", async () => {
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    const providerFailure = {
+      category: "transient" as const,
+      code: "PROVIDER_UNAVAILABLE",
+      stage: "review",
+      attempt: 2,
+      retryable: false,
+      message: "upstream returned 529 overloaded_error",
+      evidence: { truncated: false },
+    };
+    const postPushReviewRun = vi.fn().mockRejectedValue(new Error("skipped step must not run"));
+    const { pipeline, runner } = makeStepsPipeline([
+      [
+        "feedback-loop",
+        {
+          run: vi.fn().mockResolvedValue({
+            approved: false,
+            iterations: 1,
+            finalFeedback: "Model provider was unavailable during review after 2 attempt(s).",
+            terminationReason: "provider_unavailable",
+            passes: [],
+            failure: providerFailure,
+          }),
+        },
+      ],
+      [
+        "push",
+        {
+          run: vi.fn().mockResolvedValue({
+            prUrl: "https://github.com/o/r/pull/12",
+            prNumber: 12,
+            branchPushed: true,
+            draft: true,
+          }),
+        },
+      ],
+      ["post-push-review", { run: postPushReviewRun }],
+    ]);
+    pipeline.steps[2].skip = () => true;
+
+    const result = await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+      fetchImpl: mockFetch,
+    });
+
+    expect(result.exitCode).toBe(0);
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
+      failureCode: string;
+      failureReason: string;
+      failure?: typeof providerFailure;
+    };
+    expect(postPushReviewRun).not.toHaveBeenCalled();
+    expect(body.failureCode).toBe("PROVIDER_UNAVAILABLE");
+    expect(body.failureReason).not.toContain("did not approve");
+    expect(body.failure).toEqual(providerFailure);
+  });
+
+  it("uses REVIEWER_TURNS_EXHAUSTED with the classified failure when the post-push reviewer exhausts its turn cap", async () => {
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    const reviewerFailure = {
+      category: "invalid_output" as const,
+      code: "REVIEWER_TURNS_EXHAUSTED",
+      stage: "post-push-review/review-1",
+      attempt: 1,
+      retryable: false,
+      message: "The runner reported no detail.",
+      evidence: { truncated: false },
+    };
+    const { pipeline, runner } = makeStepsPipeline([
+      [
+        "feedback-loop",
+        { run: vi.fn().mockResolvedValue({ approved: true, iterations: 1, terminationReason: "approved", passes: [] }) },
+      ],
+      [
+        "push",
+        {
+          run: vi.fn().mockResolvedValue({
+            prUrl: "https://github.com/o/r/pull/11",
+            prNumber: 11,
+            branchPushed: true,
+            draft: true,
+          }),
+        },
+      ],
+      [
+        "post-push-review",
+        {
+          run: vi.fn().mockResolvedValue({
+            approved: false,
+            iterations: 1,
+            finalFeedback: "Post-push reviewer ran out of turns at the configured cap (30).",
+            terminationReason: "reviewer_turns_exhausted",
+            forcePushedRevisions: 0,
+            failure: reviewerFailure,
+          }),
+        },
+      ],
+    ]);
+
+    const result = await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+      fetchImpl: mockFetch,
+    });
+
+    expect(result.exitCode).toBe(0);
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
+      failureCode: string;
+      failureReason: string;
+      failure?: typeof reviewerFailure;
+    };
+    expect(body.failureCode).toBe("REVIEWER_TURNS_EXHAUSTED");
+    expect(body.failureReason).toContain("ran out of turns");
+    expect(body.failureReason).toContain("The in-loop reviewer approved.");
+    expect(body.failure).toEqual(reviewerFailure);
+  });
+
+  it("iteration >= 2 turn exhaustion says 'the latest revision was not reviewed' (not 'the code was not reviewed'), and both the disposition and the ::warning:: name the iteration count", async () => {
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    const reviewerFailure = {
+      category: "invalid_output" as const,
+      code: "REVIEWER_TURNS_EXHAUSTED",
+      stage: "post-push-review/review-2",
+      attempt: 1,
+      retryable: false,
+      message: "The runner reported no detail.",
+      evidence: { truncated: false },
+    };
+    const { pipeline, runner } = makeStepsPipeline([
+      [
+        "feedback-loop",
+        { run: vi.fn().mockResolvedValue({ approved: true, iterations: 1, terminationReason: "approved", passes: [] }) },
+      ],
+      [
+        "push",
+        {
+          run: vi.fn().mockResolvedValue({
+            prUrl: "https://github.com/o/r/pull/12",
+            prNumber: 12,
+            branchPushed: true,
+            draft: true,
+          }),
+        },
+      ],
+      [
+        "post-push-review",
+        {
+          run: vi.fn().mockResolvedValue({
+            approved: false,
+            iterations: 2,
+            finalFeedback:
+              "0 automated fix revision(s) were pushed and not re-reviewed.\n\nBlocking issues from the previous review:\n1. **Some finding**",
+            terminationReason: "reviewer_turns_exhausted",
+            forcePushedRevisions: 0,
+            failure: reviewerFailure,
+          }),
+        },
+      ],
+    ]);
+
+    let result: { exitCode: number };
+    try {
+      result = await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeMockExecutor(0),
+        fetchImpl: mockFetch,
+      });
+    } finally {
+      const summary = error.mock.calls.map((call) => call.join(" ")).join("\n");
+      const warnings = warn.mock.calls.map((call) => call.join(" ")).join("\n");
+      error.mockRestore();
+      warn.mockRestore();
+      // disposition
+      expect(summary).toContain("reviewer ran out of turns at the cap after 2 iteration(s) (reviewer_turns_exhausted)");
+      // ::warning:: text
+      expect(warnings).toContain(
+        "::warning::AI-Implement: post-push reviewer ran out of turns at the cap after 2 iteration(s) (reviewer_turns_exhausted)",
+      );
+      expect(warnings).toContain("draft PR opened: https://github.com/o/r/pull/12");
+    }
+
+    expect(result!.exitCode).toBe(0);
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as { failureReason: string };
+    expect(body.failureReason).toContain("the latest revision was not reviewed");
+    expect(body.failureReason).not.toContain("the code was not reviewed");
+  });
+
+  it("falls back to DEFAULT_RETRY_POLICY.reviewMaxTurns (30) in the ticket comment when run_config.retryPolicy is missing reviewMaxTurns", async () => {
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+    vi.stubEnv(
+      "AI_IMPLEMENT_RUN_CONFIG",
+      encodeRunConfig({
+        v: 1,
+        issue: { id: "issue-abc", identifier: "AII-1", title: "Test issue", description: "Issue description" },
+        // A partial retryPolicy, as could arrive over the envelope (decodeRunConfig does not
+        // validate it) — missing reviewMaxTurns entirely.
+        retryPolicy: { pushRetries: 3 } as unknown as import("../pipeline/retry-backoff.js").RetryPolicy,
+      }),
+    );
+
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    const { pipeline, runner } = makeStepsPipeline([
+      [
+        "feedback-loop",
+        { run: vi.fn().mockResolvedValue({ approved: true, iterations: 1, terminationReason: "approved", passes: [] }) },
+      ],
+      [
+        "push",
+        {
+          run: vi.fn().mockResolvedValue({
+            prUrl: "https://github.com/o/r/pull/13",
+            prNumber: 13,
+            branchPushed: true,
+            draft: true,
+          }),
+        },
+      ],
+      [
+        "post-push-review",
+        {
+          run: vi.fn().mockResolvedValue({
+            approved: false,
+            iterations: 1,
+            finalFeedback: "Post-push reviewer ran out of turns.",
+            terminationReason: "reviewer_turns_exhausted",
+            forcePushedRevisions: 0,
+            failure: {
+              category: "invalid_output" as const,
+              code: "REVIEWER_TURNS_EXHAUSTED",
+              stage: "post-push-review/review-1",
+              attempt: 1,
+              retryable: false,
+              message: "The runner reported no detail.",
+              evidence: { truncated: false },
+            },
+          }),
+        },
+      ],
+    ]);
+
+    await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+      fetchImpl: mockFetch,
+    });
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as { failureReason: string };
+    // DEFAULT_RETRY_POLICY.reviewMaxTurns is 30 — the value normalizeRetryPolicy substitutes
+    // for the missing field, which this fallback then reads back out.
+    expect(body.failureReason).toContain("configured cap (30)");
+  });
+
   it("writes the autopsy comment file on unapproved runs", async () => {
     const { pipeline, runner } = makeStepsPipeline([
       [
@@ -1378,6 +1656,45 @@ describe("runAutonomous", () => {
     expect(body.outcome).toBe("success");
     expect(body.prUrl).toBe("https://github.com/o/r/pull/11");
     expect(body.failureCode).toBeUndefined();
+  });
+
+  it("writes a ticket-facing Total cost that includes feedback-loop's extraCostUsd and the post-push reviewer's costUsd (BAC-27201)", async () => {
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    const { pipeline, runner } = makeStepsPipeline([
+      ["feedback-loop", { run: vi.fn().mockResolvedValue({
+        approved: true,
+        iterations: 1,
+        terminationReason: "approved",
+        passes: [{ iteration: 1, implementTurns: 5, implementOutcome: "success", costUsd: 0.20, reviewCostUsd: 0.05, reviewApproved: true }],
+        // A superseded implement/review retry attempt's cost (BAC-27201) — never in `passes`.
+        extraCostUsd: 0.10,
+      }) }],
+      ["push", { run: vi.fn().mockResolvedValue({ prUrl: "https://github.com/o/r/pull/20", prNumber: 20, branchPushed: true, draft: false }) }],
+      ["post-push-review", { run: vi.fn().mockResolvedValue({
+        approved: true,
+        iterations: 1,
+        terminationReason: "approved",
+        // The post-push reviewer's own review+fix invocation cost (BAC-27201).
+        costUsd: 0.45,
+      }) }],
+    ]);
+
+    const result = await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+      fetchImpl: mockFetch,
+    });
+
+    expect(result.exitCode).toBe(0);
+    const stats = readFileSync(join(workspaceDir, "ai-output", "comments", "95-run-stats.md"), "utf-8");
+    // 0.20 + 0.05 (pass) + 0.10 (feedback-loop retries) + 0.45 (post-push review + fix)
+    expect(stats).toContain("**Total cost:** $0.80");
   });
 
   it("does not report success when the post-push review rejects an internally approved PR", async () => {
@@ -2155,6 +2472,34 @@ describe("runAutonomousLocally", () => {
     expect(result.tokenSummary!.tokensOut).toBeNull();
     expect(result.tokenSummary!.cacheReadTokens).toBeNull();
     expect(result.tokenSummary!.cacheCreationTokens).toBeNull();
+  });
+
+  it("sums reviewCostUsd into the completion payload's costUsd, not implement cost alone (BAC-27201)", async () => {
+    const passes = [
+      { iteration: 1, implementTurns: 5, implementOutcome: "ok", costUsd: 0.05, reviewCostUsd: 0.02, reviewApproved: true },
+      { iteration: 2, implementTurns: 3, implementOutcome: "ok", costUsd: 0.03, reviewCostUsd: null, reviewApproved: true },
+    ];
+    const { pipeline, runner } = makeFeedbackLoopPipeline({
+      run: vi.fn().mockResolvedValue({
+        approved: true,
+        iterations: 2,
+        terminationReason: "approved",
+        passes,
+        finalFeedback: "",
+      }),
+    });
+
+    const result = await runAutonomousLocally({
+      workspaceDir,
+      issueIdentifier: "TEST-1",
+      issueTitle: "Test",
+      issueDescription: "Desc",
+      pipeline,
+      runner,
+    });
+
+    expect(result.tokenSummary).not.toBeNull();
+    expect(result.tokenSummary!.costUsd).toBeCloseTo(0.10);
   });
 
   it("returns tokenSummary null when no passes ran", async () => {

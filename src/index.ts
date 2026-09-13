@@ -32,7 +32,7 @@ import {
   type AdminConfig,
 } from "./admin.js";
 import { initLogTable, appendLog, countPriorDispatches, completeOrphanedPlanningJobs, attachJobRunIdIfMissing, updateJobRunId, updateJobStatus, updateJobPrUrl, updateJobMachineDetails, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobById, getJobByMachineId, resetStuckAttempts, getRecentFailedRunUrls } from "./log.js";
-import { isParked, recordDispatchFailure, recordDispatchSuccess, initDispatchBreakerTable } from "./dispatch-breaker.js";
+import { isParked, recordDispatchFailure, recordDispatchSuccess, shouldCountFailure, initDispatchBreakerTable } from "./dispatch-breaker.js";
 import type { Job, JobStatus } from "./log.js";
 import { getInstallationToken, getAppSlug } from "./github-app-auth.js";
 import { configureLinearAuth } from "./linear-app-auth.js";
@@ -2616,9 +2616,15 @@ async function reportJobCompletion(config: AppConfig, registry: ProviderRegistry
             const breakerConclusion = job.conclusion ?? job.status;
             // stuck_giveup already fires notifyStuckGiveUp — don't double-fire.
             const isStuck = job.conclusion === "stuck_giveup" || job.conclusion === "stuck_requeued";
-            const br = recordDispatchFailure(job.issueId, breakerPhase, breakerConclusion);
-            if (br.tripped && !isStuck) {
-              pendingBreakerTrip = { phase: breakerPhase, failures: br.failures, conclusion: breakerConclusion };
+            // A classified transient failure (provider overload) is the provider's outage, not
+            // the ticket's — don't count it toward the breaker, or three unlucky retries against
+            // a flaky provider parks the issue (BAC-27134). Jobs with no classified failure at
+            // all (pre-BAC-27112, or a synthetic dispatch-error conclusion) count as before.
+            if (!job.failure || shouldCountFailure(job.failure)) {
+              const br = recordDispatchFailure(job.issueId, breakerPhase, breakerConclusion);
+              if (br.tripped && !isStuck) {
+                pendingBreakerTrip = { phase: breakerPhase, failures: br.failures, conclusion: breakerConclusion };
+              }
             }
           }
         }
