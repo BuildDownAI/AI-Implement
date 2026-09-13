@@ -90,7 +90,7 @@ export interface RefreshOutcome {
   stampAfter: string | null;
   /** True for a dry-run outcome (AII-632): the local rail never ran and `stage` was restored, not advanced. */
   dryRun?: boolean;
-  /** Per-part {part, prev, new} rows from the push guard. Present on a dry-run outcome when the runner reported one. */
+  /** Per-part {part, prev, new} rows from the push guard. Present on a dry-run outcome or a real `KG_SNAPSHOT_TRACKER_REGRESSION` refusal (AII-638) when the runner reported one. */
   partTable?: Array<{ part: string; prev: string; new: string }>;
 }
 
