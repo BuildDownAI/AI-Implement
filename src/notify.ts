@@ -140,17 +140,51 @@ export async function notify(type: string, webhookUrl: string, n: Notification):
   }
 }
 
+/** `detail` can carry a FailureRecord's evidence excerpt (fenced code block and all) —
+ *  capped here, once, before either provider payload is built, rather than in each. */
+const COMPLETION_DETAIL_MAX_CHARS = 1500;
+
+/**
+ * A plain `slice(0, max)` can land inside the ``` fence that wraps a FailureRecord's
+ * evidence excerpt (`classificationForFailure` in completion-classification.ts), leaving
+ * an unterminated code block that swallows whatever the caller appends after `detail`
+ * (remediation line, docsUrl link). `neutralizeFences` already neutralises any *line-anchored*
+ * ``` (`/^\s*```/`) that originates from the evidence text itself, so a line-anchored ```
+ * remaining in `detail` is one of the two fence delimiters the caller added — counting only
+ * those (the same `/^\s*```/m` test `neutralizeFences` uses, not a bare `/```/g`) tells us
+ * whether the cut landed inside the fence, and if so we close it before the trailing ellipsis.
+ * A bare `/```/g` count would also catch a mid-line ``` that isn't line-anchored (so
+ * `neutralizeFences` left it untouched) and miscount the real delimiters' parity.
+ *
+ * The cut point is also nudged back one position when it would otherwise land between a
+ * UTF-16 surrogate pair — same hazard `capChars` (completion-classification.ts) guards
+ * against — so a multi-byte character (emoji, non-Latin evidence text) at the boundary
+ * doesn't split into an unpaired surrogate.
+ */
+function capDetailForWebhook(detail: string, max: number): string {
+  if (detail.length <= max) return detail;
+  let cut = max;
+  if (cut > 0 && detail.charCodeAt(cut - 1) >= 0xd800 && detail.charCodeAt(cut - 1) <= 0xdbff) cut -= 1;
+  const truncated = detail.slice(0, cut);
+  const openFence = (truncated.match(/^\s*```/gm) || []).length % 2 === 1;
+  return openFence ? `${truncated}\n\`\`\`\n…` : `${truncated}…`;
+}
+
 export async function notifyCompletion(
   type: string,
   webhookUrl: string,
   n: CompletionNotification,
 ): Promise<void> {
+  const capped: CompletionNotification =
+    n.detail && n.detail.length > COMPLETION_DETAIL_MAX_CHARS
+      ? { ...n, detail: capDetailForWebhook(n.detail, COMPLETION_DETAIL_MAX_CHARS) }
+      : n;
   switch (type.toLowerCase()) {
     case "teams":
-      return notifyCompletionTeams(webhookUrl, n);
+      return notifyCompletionTeams(webhookUrl, capped);
     case "slack":
     default:
-      return notifyCompletionSlack(webhookUrl, n);
+      return notifyCompletionSlack(webhookUrl, capped);
   }
 }
 

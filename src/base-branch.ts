@@ -128,7 +128,7 @@ export async function validateIssueBaseBranch(opts: {
   owner: string;
   repo: string;
   issue: { id: string; scopeKey: string; baseBranch?: string; featureBranchChain?: FeatureBranchChainEntry[] };
-  markFailed: (issueId: string, scopeKey: string, reason: string) => Promise<void>;
+  markFailed: (issueId: string, scopeKey: string, reason: string) => Promise<boolean>;
   getBranchShaImpl?: typeof getBranchSha;
 }): Promise<ValidateIssueBaseBranchResult> {
   const { ghToken, owner, repo, issue, markFailed, getBranchShaImpl } = opts;

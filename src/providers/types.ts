@@ -109,10 +109,15 @@ export interface TicketingProvider {
   // pick the right mapping without a fragile repo-field read-back.
   markPlanningStarted(issueId: string, scopeKey: string): Promise<void>;
   markPlanComplete(issueId: string, scopeKey: string): Promise<void>;
-  markPlanningFailed(issueId: string, scopeKey: string, reason: string): Promise<void>;
+  /** Returns whether a failure comment was actually posted — false when the status write
+   *  was refused (issue already Merged) and no comment follows it. Callers must stamp
+   *  their own "did we already comment" bookkeeping only on true, or a refusal silently
+   *  suppresses the monitor's backstop comment for a ticket that was never told. */
+  markPlanningFailed(issueId: string, scopeKey: string, reason: string): Promise<boolean>;
   markImplementing(issueId: string, scopeKey: string): Promise<void>;
   markPrReady(issueId: string, scopeKey: string, prUrl: string): Promise<void>;
-  markImplementationFailed(issueId: string, scopeKey: string, reason: string): Promise<void>;
+  /** Returns whether a failure comment was actually posted — see `markPlanningFailed`. */
+  markImplementationFailed(issueId: string, scopeKey: string, reason: string): Promise<boolean>;
   clearWorkingState(issueId: string, scopeKey: string): Promise<void>;
   /** Move the issue to a completed state after its PR merged. Idempotent:
    *  no-op when the issue is already completed/cancelled. */

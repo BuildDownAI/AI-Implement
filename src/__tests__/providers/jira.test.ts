@@ -218,7 +218,8 @@ describe("JiraProvider lifecycle status setters", () => {
       .mockResolvedValueOnce(okEmpty()) // setField PUT
       .mockResolvedValueOnce({ ok: true, json: async () => ({ id: "c1" }) } as Response); // comment POST
     const p = makeProvider({ cacheScope: "c3", mappings: { "acme/x": jiraMapping() } });
-    await p.markPlanningFailed("10001", "acme/x", "boom");
+    const commented = await p.markPlanningFailed("10001", "acme/x", "boom");
+    expect(commented).toBe(true);
 
     const calls = vi.mocked(fetch).mock.calls;
     expectStatusBody(calls[1], "Planning Failed");
@@ -259,7 +260,8 @@ describe("JiraProvider lifecycle status setters", () => {
       .mockResolvedValueOnce(okEmpty())
       .mockResolvedValueOnce({ ok: true, json: async () => ({ id: "c1" }) } as Response);
     const p = makeProvider({ cacheScope: "c6", mappings: { "acme/x": jiraMapping() } });
-    await p.markImplementationFailed("10001", "acme/x", "kaboom");
+    const commented = await p.markImplementationFailed("10001", "acme/x", "kaboom");
+    expect(commented).toBe(true);
 
     const calls = vi.mocked(fetch).mock.calls;
     expectStatusBody(calls[1], "Implementation Failed");
@@ -363,7 +365,7 @@ describe("JiraProvider.fetchAIImplementSnapshot", () => {
       profilesFieldOverride: "customfield_10200", baseBranchFieldOverride: "customfield_10300",
     }) } });
     const snap = await p.fetchAIImplementSnapshot();
-    const markFailed = vi.fn(async () => {});
+    const markFailed = vi.fn(async () => true);
     const lookup = vi.fn(async () => null);
     const result = await validateIssueBaseBranch({
       ghToken: "test", owner: "acme", repo: "x", issue: snap.needsPlanning[0],

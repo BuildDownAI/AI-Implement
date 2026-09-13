@@ -621,9 +621,10 @@ export class JiraProvider implements TicketingProvider {
   async markPlanComplete(issueId: string, scopeKey: string): Promise<void> {
     await this.setStatus(issueId, scopeKey, STATUS_VALUES.APPROVED);
   }
-  async markPlanningFailed(issueId: string, scopeKey: string, reason: string): Promise<void> {
+  async markPlanningFailed(issueId: string, scopeKey: string, reason: string): Promise<boolean> {
     await this.setStatus(issueId, scopeKey, STATUS_VALUES.PLANNING_FAILED);
     await this.postComment(issueId, `⚠️ Planning failed: ${reason}`);
+    return true;
   }
   async markImplementing(issueId: string, scopeKey: string): Promise<void> {
     await this.setStatus(issueId, scopeKey, STATUS_VALUES.IMPLEMENTING);
@@ -632,9 +633,10 @@ export class JiraProvider implements TicketingProvider {
     await this.setStatus(issueId, scopeKey, STATUS_VALUES.PR_READY);
     await this.postComment(issueId, `🚀 PR ready for review: ${prUrl}`);
   }
-  async markImplementationFailed(issueId: string, scopeKey: string, reason: string): Promise<void> {
+  async markImplementationFailed(issueId: string, scopeKey: string, reason: string): Promise<boolean> {
     await this.setStatus(issueId, scopeKey, STATUS_VALUES.IMPLEMENTATION_FAILED);
     await this.postComment(issueId, `⚠️ Implementation failed: ${reason}`);
+    return true;
   }
   async clearWorkingState(issueId: string, scopeKey: string): Promise<void> {
     await this.setStatus(issueId, scopeKey, STATUS_VALUES.APPROVED);

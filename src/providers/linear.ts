@@ -744,9 +744,10 @@ export class LinearProvider implements TicketingProvider {
     await this.addLabelToIssue(issueId, labelId);
   }
 
-  async markPlanningFailed(issueId: string, _scopeKey: string, reason: string): Promise<void> {
+  async markPlanningFailed(issueId: string, _scopeKey: string, reason: string): Promise<boolean> {
     await this.removeLabelByName(issueId, "AI-Planning");
     await this.postComment(issueId, `⚠️ Planning failed: ${reason}`);
+    return true;
   }
 
   async markImplementing(issueId: string, _scopeKey: string): Promise<void> {
@@ -830,9 +831,10 @@ export class LinearProvider implements TicketingProvider {
     );
   }
 
-  async markImplementationFailed(issueId: string, _scopeKey: string, reason: string): Promise<void> {
+  async markImplementationFailed(issueId: string, _scopeKey: string, reason: string): Promise<boolean> {
     await this.removeLabelByName(issueId, "AI-Working");
     await this.postComment(issueId, `⚠️ Implementation failed: ${reason}`);
+    return true;
   }
 
   async clearWorkingState(issueId: string, _scopeKey: string): Promise<void> {
