@@ -81,6 +81,12 @@ describe("job drawer", () => {
     expect(drawerScript).toContain("job.repo.includes('/')");
   });
 
+  it("links the issue through the server-resolved issueUrl instead of guessing the tracker host", () => {
+    expect(drawerScript).toContain("window.safeUrl(job.issueUrl)");
+    expect(drawerScript).not.toContain("linear.app");
+    expect(drawerScript).not.toContain("jiraSiteUrl");
+  });
+
   it("has a global hidden rule that wins over button display styles", () => {
     expect(componentsCss).toContain("[hidden] { display: none !important; }");
   });

@@ -932,7 +932,6 @@ export const projectsScript = `
       const res = await window.api('/api/admin/config-status');
       if (!res.ok) return;
       const status = await res.json();
-      if (status.jiraSiteUrl) window.jiraSiteUrl = status.jiraSiteUrl;
       const select = document.getElementById('md-ticketing-provider');
       for (const opt of Array.from(select.options)) {
         if (opt.value === 'linear' && !status.linear) {

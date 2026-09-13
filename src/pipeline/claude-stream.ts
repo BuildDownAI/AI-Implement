@@ -43,6 +43,50 @@ export function finalStructuredOutput(events: StreamEvent[]): unknown {
   return lastResult(events)?.structured_output;
 }
 
+/**
+ * Whether any `assistant` event in this attempt carried a `tool_use` block.
+ * A re-spawn is a fresh session with no memory of the first attempt, so once
+ * a tool has run the agent may have already edited the workspace — retrying
+ * from scratch on a dirty tree could duplicate or undo that work. This is the
+ * sole gate that makes a request-level retry safe.
+ */
+export function sawToolUse(events: StreamEvent[]): boolean {
+  for (const e of events) {
+    if (e.type !== "assistant") continue;
+    const msg = e.message as { content?: unknown } | undefined;
+    const content = msg?.content;
+    if (!Array.isArray(content)) continue;
+    if (content.some((block) => (block as { type?: string } | null)?.type === "tool_use")) return true;
+  }
+  return false;
+}
+
+/**
+ * Whether any `assistant` event in this attempt carried a `tool_use` block
+ * whose tool name starts with "Bash" — including review's allowed
+ * `Bash(curl *)`, which despite being nominally read-only can still write
+ * files or POST data. Used to gate a request-level retry even for a
+ * `toolUseIsSafe` (review) session, where an ordinary Read/Glob/Grep tool use
+ * is safe to retry past but a Bash invocation is not.
+ */
+export function sawUnsafeToolUse(events: StreamEvent[]): boolean {
+  for (const e of events) {
+    if (e.type !== "assistant") continue;
+    const msg = e.message as { content?: unknown } | undefined;
+    const content = msg?.content;
+    if (!Array.isArray(content)) continue;
+    if (
+      content.some((block) => {
+        const b = block as { type?: string; name?: string } | null;
+        return b?.type === "tool_use" && typeof b.name === "string" && b.name.startsWith("Bash");
+      })
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function num(v: unknown): number | null {
   return typeof v === "number" ? v : null;
 }

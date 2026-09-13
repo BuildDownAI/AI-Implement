@@ -189,14 +189,22 @@ describe("JiraProvider lifecycle status setters", () => {
     vi.restoreAllMocks();
   });
 
-  function expectStatusBody(call: [string | URL | Request, RequestInit | undefined], expected: string) {
+  function expectStatusBody(call: [input: string | URL | Request, init?: RequestInit], expected: string) {
     const body = JSON.parse(call[1]?.body as string);
     expect(body.fields.customfield_10100).toEqual({ value: expected });
   }
 
+  // setStatus pre-reads the current status before every non-Merged write (the
+  // never-regress-Merged guard); this is that read's response for a normal issue.
+  const notMergedRead = () => ({
+    ok: true,
+    json: async () => ({ id: "10001", key: "P-1", fields: { customfield_10100: { value: "Implementing" } } }),
+  }) as Response;
+
   it("markPlanningStarted sets status to Planning", async () => {
     vi.mocked(fetch)
       .mockResolvedValueOnce(FIELDS_RESPONSE)
+      .mockResolvedValueOnce(notMergedRead())
       .mockResolvedValueOnce(okEmpty());
     const p = makeProvider({ cacheScope: "c1", mappings: { "acme/x": jiraMapping() } });
     await p.markPlanningStarted("10001", "acme/x");
@@ -206,6 +214,7 @@ describe("JiraProvider lifecycle status setters", () => {
   it("markPlanComplete sets status to Plan Approved (single-mapping shortcut)", async () => {
     vi.mocked(fetch)
       .mockResolvedValueOnce(FIELDS_RESPONSE)
+      .mockResolvedValueOnce(notMergedRead())
       .mockResolvedValueOnce(okEmpty());
     const p = makeProvider({ cacheScope: "c2", mappings: { "acme/x": jiraMapping() } });
     await p.markPlanComplete("10001", "acme/x");
@@ -215,6 +224,7 @@ describe("JiraProvider lifecycle status setters", () => {
   it("markPlanningFailed sets Planning Failed and posts a comment", async () => {
     vi.mocked(fetch)
       .mockResolvedValueOnce(FIELDS_RESPONSE)
+      .mockResolvedValueOnce(notMergedRead())
       .mockResolvedValueOnce(okEmpty()) // setField PUT
       .mockResolvedValueOnce({ ok: true, json: async () => ({ id: "c1" }) } as Response); // comment POST
     const p = makeProvider({ cacheScope: "c3", mappings: { "acme/x": jiraMapping() } });
@@ -222,8 +232,8 @@ describe("JiraProvider lifecycle status setters", () => {
     expect(commented).toBe(true);
 
     const calls = vi.mocked(fetch).mock.calls;
-    expectStatusBody(calls[1], "Planning Failed");
-    const commentCall = calls[2];
+    expectStatusBody(calls[2], "Planning Failed");
+    const commentCall = calls[3];
     expect(commentCall[0]).toEqual(expect.stringMatching(/\/comment$/));
     const commentBody = JSON.parse(commentCall[1]?.body as string);
     expect(commentBody.body.content[0].content[0].text).toContain("boom");
@@ -232,6 +242,7 @@ describe("JiraProvider lifecycle status setters", () => {
   it("markImplementing sets status to Implementing", async () => {
     vi.mocked(fetch)
       .mockResolvedValueOnce(FIELDS_RESPONSE)
+      .mockResolvedValueOnce(notMergedRead())
       .mockResolvedValueOnce(okEmpty());
     const p = makeProvider({ cacheScope: "c4", mappings: { "acme/x": jiraMapping() } });
     await p.markImplementing("10001", "acme/x");
@@ -241,37 +252,125 @@ describe("JiraProvider lifecycle status setters", () => {
   it("markPrReady sets PR Ready and posts a comment with the PR URL", async () => {
     vi.mocked(fetch)
       .mockResolvedValueOnce(FIELDS_RESPONSE)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ id: "10001", key: "P-1", fields: { customfield_10100: { value: "Implementing" } } }),
+      } as Response) // current-status pre-read (Merged guard)
       .mockResolvedValueOnce(okEmpty())
       .mockResolvedValueOnce({ ok: true, json: async () => ({ id: "c1" }) } as Response);
     const p = makeProvider({ cacheScope: "c5", mappings: { "acme/x": jiraMapping() } });
     await p.markPrReady("10001", "acme/x", "https://github.com/acme/x/pull/42");
 
     const calls = vi.mocked(fetch).mock.calls;
-    expectStatusBody(calls[1], "PR Ready");
-    const commentBody = JSON.parse(calls[2][1]?.body as string);
+    expectStatusBody(calls[2], "PR Ready");
+    const commentBody = JSON.parse(calls[3][1]?.body as string);
     expect(commentBody.body.content[0].content[0].text).toContain(
       "https://github.com/acme/x/pull/42",
     );
   });
 
+  it("markPlanningFailed skips its failure comment when the issue is already Merged", async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(FIELDS_RESPONSE)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ id: "10001", key: "P-1", fields: { customfield_10100: { value: "Merged" } } }),
+      } as Response); // guard pre-read
+    const p = makeProvider({ cacheScope: "c3-merged", mappings: { "acme/x": jiraMapping() } });
+    await p.markPlanningFailed("10001", "acme/x", "late boom");
+
+    // Pre-read is the last call: no setField PUT, no "Planning failed" comment.
+    expect(vi.mocked(fetch)).toHaveBeenCalledTimes(2);
+  });
+
+  it("clearWorkingState refuses to reset an already-Merged issue (reaper max-age sweep)", async () => {
+    // The reaper's resetTicket path also clears dedup; with the status write refused
+    // the issue stays out of the Ready/"Plan Approved" dispatch bucket, so cleared
+    // dedup cannot re-dispatch already-merged work.
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(FIELDS_RESPONSE)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ id: "10001", key: "P-1", fields: { customfield_10100: { value: "Merged" } } }),
+      } as Response); // guard pre-read
+    const p = makeProvider({ cacheScope: "c7-merged", mappings: { "acme/x": jiraMapping() } });
+    await p.clearWorkingState("10001", "acme/x");
+    // Pre-read is the last call: no setField PUT happened.
+    expect(vi.mocked(fetch)).toHaveBeenCalledTimes(2);
+  });
+
+  it("markPrReady leaves an already-Merged issue at Merged (late success report)", async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(FIELDS_RESPONSE)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ id: "10001", key: "P-1", fields: { customfield_10100: { value: "Merged" } } }),
+      } as Response); // current-status pre-read
+    const p = makeProvider({ cacheScope: "c5-merged", mappings: { "acme/x": jiraMapping() } });
+    await p.markPrReady("10001", "acme/x", "https://github.com/acme/x/pull/42");
+
+    // No status write, no comment: the pre-read is the last call.
+    expect(vi.mocked(fetch)).toHaveBeenCalledTimes(2);
+  });
+
   it("markImplementationFailed sets Implementation Failed and posts a comment", async () => {
     vi.mocked(fetch)
       .mockResolvedValueOnce(FIELDS_RESPONSE)
-      .mockResolvedValueOnce(okEmpty())
-      .mockResolvedValueOnce({ ok: true, json: async () => ({ id: "c1" }) } as Response);
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ id: "10001", key: "P-1", fields: { customfield_10100: { value: "Implementing" } } }),
+      } as Response) // current-status pre-read (Merged guard)
+      .mockResolvedValueOnce(okEmpty()) // setField PUT
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ id: "c1" }) } as Response); // comment POST
     const p = makeProvider({ cacheScope: "c6", mappings: { "acme/x": jiraMapping() } });
     const commented = await p.markImplementationFailed("10001", "acme/x", "kaboom");
     expect(commented).toBe(true);
 
     const calls = vi.mocked(fetch).mock.calls;
-    expectStatusBody(calls[1], "Implementation Failed");
-    const commentBody = JSON.parse(calls[2][1]?.body as string);
+    expectStatusBody(calls[2], "Implementation Failed");
+    const commentBody = JSON.parse(calls[3][1]?.body as string);
     expect(commentBody.body.content[0].content[0].text).toContain("kaboom");
+  });
+
+  it("markImplementationFailed leaves an already-Merged issue at Merged (late failure report)", async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(FIELDS_RESPONSE)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ id: "10001", key: "P-1", fields: { customfield_10100: { value: "Merged" } } }),
+      } as Response) // current-status pre-read
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ id: "c1" }) } as Response); // comment POST
+    const p = makeProvider({ cacheScope: "c6-merged", mappings: { "acme/x": jiraMapping() } });
+    await p.markImplementationFailed("10001", "acme/x", "late kaboom");
+
+    const calls = vi.mocked(fetch).mock.calls;
+    // No setField PUT: fetch #2 (index 2) must be the comment, and no call carries a status write.
+    expect(calls).toHaveLength(3);
+    for (const call of calls) {
+      const body = call[1]?.body ? JSON.parse(call[1].body as string) : {};
+      expect(body?.fields?.customfield_10100).toBeUndefined();
+    }
+    const commentBody = JSON.parse(calls[2][1]?.body as string);
+    expect(commentBody.body.content[0].content[0].text).toContain("already merged");
+    expect(commentBody.body.content[0].content[0].text).toContain("late kaboom");
+  });
+
+  it("markImplementationFailed proceeds to mark failed when the status pre-read errors", async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(FIELDS_RESPONSE)
+      .mockResolvedValueOnce({ ok: false, status: 500, text: async () => "boom" } as Response) // pre-read fails
+      .mockResolvedValueOnce(okEmpty()) // setField PUT
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ id: "c1" }) } as Response); // comment POST
+    const p = makeProvider({ cacheScope: "c6-readfail", mappings: { "acme/x": jiraMapping() } });
+    await p.markImplementationFailed("10001", "acme/x", "kaboom");
+
+    expectStatusBody(vi.mocked(fetch).mock.calls[2], "Implementation Failed");
   });
 
   it("clearWorkingState resets status to Plan Approved", async () => {
     vi.mocked(fetch)
       .mockResolvedValueOnce(FIELDS_RESPONSE)
+      .mockResolvedValueOnce(notMergedRead())
       .mockResolvedValueOnce(okEmpty());
     const p = makeProvider({ cacheScope: "c7", mappings: { "acme/x": jiraMapping() } });
     await p.clearWorkingState("10001", "acme/x");
@@ -289,11 +388,13 @@ describe("JiraProvider lifecycle status setters", () => {
   });
 
   it("multi-mapping markPlanComplete uses the supplied scopeKey directly (no repo-field read-back)", async () => {
-    // Only the field-resolution fetch and the setField PUT should happen — the
-    // provider must NOT fetch the issue to re-derive its scope. Supplying a
-    // getIssue mock would go unused; omitting it proves no read-back occurs.
+    // The provider must NOT fetch the issue to re-derive its scope. The one issue
+    // read that DOES happen is setStatus's never-regress-Merged pre-read — a GET of
+    // the status field only, requesting no repo field. Exactly three fetches: field
+    // resolution, the guard pre-read, and the setField PUT.
     vi.mocked(fetch)
-      .mockResolvedValueOnce(FIELDS_RESPONSE) // listFields (resolve field ids for "acme/y")
+      .mockResolvedValueOnce(FIELDS_RESPONSE)
+      .mockResolvedValueOnce(notMergedRead()) // guard pre-read
       .mockResolvedValueOnce(okEmpty()); // setField
     const p = makeProvider({
       cacheScope: "c8",
@@ -304,8 +405,9 @@ describe("JiraProvider lifecycle status setters", () => {
     });
     await p.markPlanComplete("10001", "acme/y");
     const calls = vi.mocked(fetch).mock.calls;
-    // Exactly two fetches: field resolution + setField. No getIssue read-back.
-    expect(calls.length).toBe(2);
+    expect(calls.length).toBe(3);
+    // The guard pre-read asks for the status field only — no repo-field read-back.
+    expect(String(calls[1][0])).not.toContain("customfield_10101");
     const lastCall = calls.at(-1)!;
     expect(String(lastCall[0])).toMatch(/\/issue\/10001/);
     expectStatusBody(lastCall, "Plan Approved");
@@ -318,6 +420,7 @@ describe("JiraProvider lifecycle status setters", () => {
     // through end-to-end, the read-back is gone and the call just succeeds.
     vi.mocked(fetch)
       .mockResolvedValueOnce(FIELDS_RESPONSE)
+      .mockResolvedValueOnce(notMergedRead())
       .mockResolvedValueOnce(okEmpty());
     const p = makeProvider({
       cacheScope: "c-empty-field",
@@ -592,6 +695,7 @@ describe("JiraProvider.fetchAIImplementSnapshot", () => {
         withLinks(issue("50001", "P-40", "Ready", "acme/x"), [blockedByLink("indeterminate")]),
         issue("50002", "P-41", "Ready", "acme/x"),
       ]))
+      .mockResolvedValueOnce(searchOk([issue("60001", "BLK-1", "Implementing", "acme/x")])) // merged-blocker lookup
       .mockResolvedValueOnce(searchOk([])) // parent in (...) children query
       .mockResolvedValueOnce(searchOk([]));
 
@@ -622,6 +726,9 @@ describe("JiraProvider.fetchAIImplementSnapshot", () => {
     const snap = await p.fetchAIImplementSnapshot();
 
     expect(snap.needsPlanning.map((i) => i.identifier)).toEqual(["P-42"]);
+    // Nothing is gated (the only blocker is natively done), so the merged-blocker
+    // lookup must not run: fields, bucket, children, capacity — exactly four fetches.
+    expect(vi.mocked(fetch)).toHaveBeenCalledTimes(4);
   });
 
   it("includes an issue that blocks others but is not itself blocked", async () => {
@@ -669,11 +776,56 @@ describe("JiraProvider.fetchAIImplementSnapshot", () => {
           blockedByLink("indeterminate"),
         ]),
       ]))
+      .mockResolvedValueOnce(searchOk([])) // merged-blocker lookup (BLK-1 not found → not merged)
       .mockResolvedValueOnce(searchOk([]));
 
     const p = new JiraProvider({
       client: new JiraClient({ token: "t", cloudId: "c-blk-mix" }),
       cacheScope: "c-blk-mix", siteUrl: "https://x",
+      getMappings: () => ({ "acme/x": jiraMapping() }),
+    });
+    const snap = await p.fetchAIImplementSnapshot();
+
+    expect(snap.needsPlanning).toEqual([]);
+  });
+
+  it("dispatches an issue whose blocker is natively unfinished but has AI-Implement Status = Merged", async () => {
+    // markMerged sets only the custom field; the blocker's native status stays To Do.
+    // The gate must treat such a blocker as complete or the cascade stalls forever.
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(FIELDS_RESPONSE)
+      .mockResolvedValueOnce(searchOk([
+        withLinks(issue("50007", "P-46", "Ready", "acme/x"), [blockedByLink("new")]),
+      ]))
+      .mockResolvedValueOnce(searchOk([issue("60002", "BLK-1", "Merged", "acme/x")])) // merged-blocker lookup
+      .mockResolvedValueOnce(searchOk([])) // parent in (...) children query
+      .mockResolvedValueOnce(searchOk([]));
+
+    const p = new JiraProvider({
+      client: new JiraClient({ token: "t", cloudId: "c-blk-merged" }),
+      cacheScope: "c-blk-merged", siteUrl: "https://x",
+      getMappings: () => ({ "acme/x": jiraMapping() }),
+    });
+    const snap = await p.fetchAIImplementSnapshot();
+
+    expect(snap.needsPlanning.map((i) => i.identifier)).toEqual(["P-46"]);
+    // The lookup queried exactly the natively-unfinished blocker keys.
+    const lookupBody = JSON.parse(vi.mocked(fetch).mock.calls[2][1]?.body as string);
+    expect(lookupBody.jql).toBe('key in ("BLK-1")');
+  });
+
+  it("keeps blocking when the merged-blocker lookup fails", async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(FIELDS_RESPONSE)
+      .mockResolvedValueOnce(searchOk([
+        withLinks(issue("50008", "P-47", "Ready", "acme/x"), [blockedByLink("new")]),
+      ]))
+      .mockResolvedValueOnce({ ok: false, status: 500, text: async () => "boom" } as Response) // lookup fails
+      .mockResolvedValueOnce(searchOk([])); // capacity query (no candidates → no children query)
+
+    const p = new JiraProvider({
+      client: new JiraClient({ token: "t", cloudId: "c-blk-lookup-fail" }),
+      cacheScope: "c-blk-lookup-fail", siteUrl: "https://x",
       getMappings: () => ({ "acme/x": jiraMapping() }),
     });
     const snap = await p.fetchAIImplementSnapshot();
@@ -1537,6 +1689,60 @@ describe("JiraProvider.fetchAIImplementSnapshot — profiles field", () => {
     // 3 fetches total: bucket search + children query + capacity search (no listFields call)
     expect(vi.mocked(fetch).mock.calls).toHaveLength(3);
     expect(snap.needsPlanning[0].profiles).toEqual(["mobile"]);
+  });
+});
+
+describe("JiraProvider.fetchAIImplementSnapshot — assignee field", () => {
+  beforeEach(() => {
+    vi.stubGlobal("fetch", vi.fn());
+    clearFieldCache();
+  });
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  const searchOk = (issues: unknown[]): Response =>
+    ({ ok: true, json: async () => ({ issues }) }) as Response;
+
+  const assigneeIssue = (assignee: unknown) => ({
+    id: "10001", key: "P-1",
+    fields: {
+      summary: "P-1",
+      description: null,
+      customfield_10100: { value: "Ready" },
+      customfield_10101: { value: "acme/x" },
+      assignee,
+    },
+  });
+
+  it("maps the assignee displayName to issue.assigneeName", async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(FIELDS_RESPONSE)
+      .mockResolvedValueOnce(searchOk([assigneeIssue({ displayName: "Paz" })]))
+      .mockResolvedValueOnce(searchOk([]))
+      .mockResolvedValueOnce(searchOk([]));
+
+    const p = new JiraProvider({
+      client: new JiraClient({ token: "t", cloudId: "c-assignee" }),
+      cacheScope: "c-assignee", siteUrl: "https://x",
+      getMappings: () => ({ "acme/x": jiraMapping() }),
+    });
+    const snap = await p.fetchAIImplementSnapshot();
+    expect(snap.needsPlanning[0].assigneeName).toBe("Paz");
+  });
+
+  it("leaves assigneeName absent when the issue is unassigned", async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(FIELDS_RESPONSE)
+      .mockResolvedValueOnce(searchOk([assigneeIssue(null)]))
+      .mockResolvedValueOnce(searchOk([]))
+      .mockResolvedValueOnce(searchOk([]));
+
+    const p = new JiraProvider({
+      client: new JiraClient({ token: "t", cloudId: "c-assignee-null" }),
+      cacheScope: "c-assignee-null", siteUrl: "https://x",
+      getMappings: () => ({ "acme/x": jiraMapping() }),
+    });
+    const snap = await p.fetchAIImplementSnapshot();
+    expect(snap.needsPlanning[0].assigneeName).toBeUndefined();
   });
 });
 

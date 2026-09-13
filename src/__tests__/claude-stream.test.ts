@@ -6,6 +6,8 @@ import {
   extractToolTrace,
   formatEvent,
   summaryLine,
+  sawToolUse,
+  sawUnsafeToolUse,
   type StreamEvent,
 } from "../pipeline/claude-stream.js";
 
@@ -240,5 +242,49 @@ describe("extractTelemetry toolTrace", () => {
       { type: "result", subtype: "success", num_turns: 3 },
     ];
     expect(extractTelemetry(events).toolTrace).toEqual(["Read /a"]);
+  });
+});
+
+describe("sawToolUse", () => {
+  it("returns true when an assistant event carries a tool_use block", () => {
+    expect(sawToolUse([initEvent, toolEvent])).toBe(true);
+  });
+
+  it("returns false for text-only assistant events", () => {
+    expect(sawToolUse([initEvent, textEvent])).toBe(false);
+  });
+
+  it("returns false for a user event echoing a tool_result (not an assistant tool_use)", () => {
+    const userToolResult: StreamEvent = {
+      type: "user",
+      message: { content: [{ type: "tool_result", tool_use_id: "t1", content: "ok" }] },
+    };
+    expect(sawToolUse([initEvent, userToolResult])).toBe(false);
+  });
+
+  it("returns false for an empty event list", () => {
+    expect(sawToolUse([])).toBe(false);
+  });
+});
+
+describe("sawUnsafeToolUse", () => {
+  it("returns true for a Bash tool_use (e.g. review's allowed Bash(curl *), which can still write files or POST)", () => {
+    expect(sawUnsafeToolUse([initEvent, toolEvent])).toBe(true);
+  });
+
+  it("returns false for a non-Bash tool_use (e.g. Read/Glob/Grep)", () => {
+    const readEvent: StreamEvent = {
+      type: "assistant",
+      message: { content: [{ type: "tool_use", name: "Read", input: { file_path: "/tmp/x" } }] },
+    };
+    expect(sawUnsafeToolUse([initEvent, readEvent])).toBe(false);
+  });
+
+  it("returns false for text-only assistant events", () => {
+    expect(sawUnsafeToolUse([initEvent, textEvent])).toBe(false);
+  });
+
+  it("returns false for an empty event list", () => {
+    expect(sawUnsafeToolUse([])).toBe(false);
   });
 });

@@ -582,6 +582,21 @@ export function getLatestDispatchForPr(owner: string, repo: string, prNumber: nu
   return mapRows([row])[0];
 }
 
+/** Latest dispatch for an issue in a repo, matched case-insensitively on the tracker
+ *  identifier. Recovery path for PRs the orchestrator opened WITHOUT a dispatch —
+ *  a grouping roll-up PR encodes its feature-node parent's key in the head branch,
+ *  and that parent's own past dispatches carry the tracker identity the comment
+ *  gap-fill rail needs. */
+export function getLatestDispatchForIssueIdentifier(owner: string, repo: string, identifier: string): Job | null {
+  const row = getDb()
+    .prepare(
+      "SELECT * FROM dispatch_log WHERE repo = ? AND issue_identifier = ? COLLATE NOCASE ORDER BY dispatched_at DESC LIMIT 1",
+    )
+    .get(`${owner}/${repo}`, identifier) as RawRow | undefined;
+  if (!row) return null;
+  return mapRows([row])[0];
+}
+
 /**
  * Returns the latest identifier, title, and repo recorded in dispatch_log for a
  * given issue+phase, or null fields when no log entry exists. Used to enrich

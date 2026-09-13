@@ -3,12 +3,23 @@ import { pushStep } from "../pipeline/steps/push.js";
 import { DefaultPipelineContext } from "../pipeline/context.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
 import { __resetPublicationCredentialForTests } from "../publication-credential.js";
+import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
+import type { FailureRecord } from "../pipeline/failure-classification.js";
 
 vi.mock("node:child_process", () => ({
   spawnSync: vi.fn(),
 }));
 
+vi.mock("../pipeline/retry-backoff.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../pipeline/retry-backoff.js")>();
+  // Wraps the real implementation (so backoff math and every other test's timing-
+  // insensitive behavior is unchanged) purely so a test can assert what it was called
+  // with, rather than inferring timing from NODE_ENV=test's sleepSync no-op.
+  return { ...actual, computeBackoffMs: vi.fn(actual.computeBackoffMs) };
+});
+
 import { spawnSync } from "node:child_process";
+import { computeBackoffMs } from "../pipeline/retry-backoff.js";
 
 function makeContext(overrides: Record<string, unknown> = {}): DefaultPipelineContext {
   return new DefaultPipelineContext({
@@ -231,6 +242,7 @@ describe("pushStep", () => {
       branchPushed: true,
       commitSha: "abc123",
       draft: false,
+      pushAttempts: 1,
     });
     expect(fetch).toHaveBeenCalledTimes(1);
     expect(spawnSync).toHaveBeenCalledWith(
@@ -1412,6 +1424,1449 @@ describe("pushStep — hardening (review findings)", () => {
   });
 });
 
+describe("pushStep — push failure classification and retry (BAC-27116)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.stubGlobal("fetch", vi.fn());
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it("treats a push failure as landed when ls-remote shows the local commit already on the remote", async () => {
+    let lsRemoteCalls = 0;
+    let pushCalls = 0;
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n");
+      if (gitArgs[0] === "rev-parse") return spawnResult(0, "abc123\n");
+      if (gitArgs[0] === "show") return spawnResult(0, "M\tsrc/app.ts\n");
+      if (gitArgs[0] === "ls-remote") {
+        lsRemoteCalls++;
+        // 1st call: pre-push lease lookup. 2nd call: post-failure inspection —
+        // the remote is already at local HEAD (the commit landed despite the error).
+        return lsRemoteCalls === 1
+          ? spawnResult(0, `beadfeed\t${gitArgs.at(-1)}\n`)
+          : spawnResult(0, `abc123\t${gitArgs.at(-1)}\n`);
+      }
+      if (gitArgs[0] === "push") {
+        pushCalls++;
+        return spawnResult(128, "", "remote: fatal error in commit_refs");
+      }
+      return spawnResult(0);
+    });
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/50", number: 50 }),
+      text: async () => "",
+    } as Response);
+
+    const outputs = await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+
+    expect(pushCalls).toBe(1);
+    expect(lsRemoteCalls).toBe(2);
+    expect(outputs.prNumber).toBe(50);
+    expect(outputs.landedDespiteError).toBe(true);
+    expect(outputs.pushAttempts).toBe(1);
+  });
+
+  it("retries a transient push failure once when the remote is unchanged, then succeeds", async () => {
+    let lsRemoteCalls = 0;
+    let pushCalls = 0;
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n");
+      if (gitArgs[0] === "rev-parse") return spawnResult(0, "abc123\n");
+      if (gitArgs[0] === "show") return spawnResult(0, "M\tsrc/app.ts\n");
+      if (gitArgs[0] === "ls-remote") {
+        lsRemoteCalls++;
+        return spawnResult(0, `beadfeed\t${gitArgs.at(-1)}\n`);
+      }
+      if (gitArgs[0] === "push") {
+        pushCalls++;
+        if (pushCalls === 1) return spawnResult(128, "", "fatal: internal server error");
+        return spawnResult(0);
+      }
+      return spawnResult(0);
+    });
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/51", number: 51 }),
+      text: async () => "",
+    } as Response);
+
+    const outputs = await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+
+    expect(pushCalls).toBe(2);
+    // One lease lookup before the first attempt, one remote inspection after the failure.
+    expect(lsRemoteCalls).toBe(2);
+    expect(outputs.prNumber).toBe(51);
+    expect(outputs.pushAttempts).toBe(2);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("stops without retrying when the remote has advanced to a foreign SHA", async () => {
+    let lsRemoteCalls = 0;
+    let pushCalls = 0;
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n");
+      if (gitArgs[0] === "rev-parse") return spawnResult(0, "abc123\n");
+      if (gitArgs[0] === "show") return spawnResult(0, "M\tsrc/app.ts\n");
+      if (gitArgs[0] === "diff" && gitArgs.includes("--stat")) {
+        return spawnResult(0, " src/app.ts | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n");
+      }
+      if (gitArgs[0] === "ls-remote") {
+        lsRemoteCalls++;
+        return lsRemoteCalls === 1
+          ? spawnResult(0, `beadfeed\t${gitArgs.at(-1)}\n`)
+          : spawnResult(0, `someone-elses-sha\t${gitArgs.at(-1)}\n`);
+      }
+      if (gitArgs[0] === "push") {
+        pushCalls++;
+        return spawnResult(128, "", "remote: fatal error in commit_refs");
+      }
+      return spawnResult(0);
+    });
+
+    let caught: (Error & { failure?: FailureRecord }) | undefined;
+    try {
+      await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+    } catch (err) {
+      caught = err as typeof caught;
+    }
+
+    expect(pushCalls).toBe(1);
+    expect(caught?.failure?.category).toBe("conflict");
+    expect(caught?.failure?.code).toBe("GIT_REMOTE_ADVANCED");
+    // No git-bundle artifact exists for unpublished commits — the thrown message
+    // must carry the local commit SHA and a diff --stat so the evidence names
+    // what would be lost.
+    expect(caught?.message).toContain("Unpublished local commit: abc123");
+    expect(caught?.message).toContain("1 file changed, 1 insertion(+), 1 deletion(-)");
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("never retries an authentication failure", async () => {
+    let pushCalls = 0;
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n");
+      if (gitArgs[0] === "rev-parse") return spawnResult(0, "abc123\n");
+      if (gitArgs[0] === "diff" && gitArgs.includes("--stat")) {
+        return spawnResult(0, " src/app.ts | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n");
+      }
+      if (gitArgs[0] === "ls-remote") return spawnResult(0, `beadfeed\t${gitArgs.at(-1)}\n`);
+      if (gitArgs[0] === "push") {
+        pushCalls++;
+        return spawnResult(128, "", "fatal: Authentication failed for 'https://github.com/acme/app.git/'");
+      }
+      return spawnResult(0);
+    });
+
+    let caught: (Error & { failure?: FailureRecord }) | undefined;
+    try {
+      await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+    } catch (err) {
+      caught = err as typeof caught;
+    }
+
+    expect(pushCalls).toBe(1);
+    expect(caught?.failure?.category).toBe("auth");
+    expect(caught?.message).toContain("Unpublished local commit: abc123");
+    expect(caught?.message).toContain("1 file changed, 1 insertion(+), 1 deletion(-)");
+  });
+
+  it("exhausts retries on a transient failure that never resolves, preserving the original stderr text", async () => {
+    let pushCalls = 0;
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n");
+      if (gitArgs[0] === "rev-parse") return spawnResult(0, "abc123\n");
+      if (gitArgs[0] === "show") return spawnResult(0, "M\tsrc/app.ts\n");
+      if (gitArgs[0] === "diff" && gitArgs.includes("--stat")) {
+        return spawnResult(0, " src/app.ts | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n");
+      }
+      // The remote never moves: every post-failure inspection matches the lease still.
+      if (gitArgs[0] === "ls-remote") return spawnResult(0, `beadfeed\t${gitArgs.at(-1)}\n`);
+      if (gitArgs[0] === "push") {
+        pushCalls++;
+        return spawnResult(128, "", "remote: fatal error in commit_refs");
+      }
+      return spawnResult(0);
+    });
+
+    let caught: (Error & { failure?: FailureRecord }) | undefined;
+    try {
+      await pushStep.run(
+        makeContext({ retryPolicy: { ...DEFAULT_RETRY_POLICY, pushRetries: 2 } }),
+        BASE_INPUTS,
+        new NoopStepReporter(),
+      );
+    } catch (err) {
+      caught = err as typeof caught;
+    }
+
+    expect(pushCalls).toBe(3);
+    expect(caught?.failure?.category).toBe("transient");
+    expect(caught?.failure?.attempt).toBe(3);
+    // Exhaustion gets its own code and is never retryable — an orchestrator rail
+    // keying off `retryable` must not re-dispatch a run that already spent its budget.
+    expect(caught?.failure?.code).toBe("GIT_PUSH_RETRIES_EXHAUSTED");
+    expect(caught?.failure?.retryable).toBe(false);
+    expect(caught?.failure?.message).toContain("exhausted after 3 attempts");
+    // The BAC-27048 fixture's real cause is unestablished — the original git text
+    // must survive classification even though the category is a best-effort guess.
+    expect(caught?.failure?.message).toContain("commit_refs");
+    // Retries-exhausted also names the local commit and diff --stat, since this is
+    // a terminal throw with no git-bundle artifact backing it.
+    expect(caught?.message).toContain("Unpublished local commit: abc123");
+    expect(caught?.message).toContain("1 file changed, 1 insertion(+), 1 deletion(-)");
+    // err.message backs the tracker comment and failure_json is persisted from
+    // err.failure — both must agree that retries ran out, not just that the last
+    // push attempt failed.
+    expect(caught?.message).toContain("exhausted after 3 attempts");
+  });
+
+  it("a retried gap-fill push still returns the existing PR number and never creates a PR", async () => {
+    vi.stubEnv("RUN_PUBLICATION_TOKEN", "one-use-publication-token");
+    let pushCalls = 0;
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n");
+      if (gitArgs[0] === "rev-parse") return spawnResult(0, "abc123\n");
+      if (gitArgs[0] === "show") return spawnResult(0, "M\tsrc/app.ts\n");
+      if (gitArgs[0] === "ls-remote") return spawnResult(0, `beadfeed\t${gitArgs.at(-1)}\n`);
+      if (gitArgs[0] === "push") {
+        pushCalls++;
+        if (pushCalls === 1) return spawnResult(128, "", "fatal: internal server error");
+        return spawnResult(0);
+      }
+      return spawnResult(0);
+    });
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({ token: "fresh-token", expires_at: "2030-01-01T00:00:00Z" }),
+    } as Response);
+
+    const outputs = await pushStep.run(
+      makeContext({ callbackUrl: "https://orchestrator.example", prNumber: "42" }),
+      {
+        ...BASE_INPUTS,
+        branchName: "feature/existing-pr",
+        baseBranch: "feature/existing-pr",
+        baseRef: "beadfeed",
+        existingPrNumber: "42",
+        callbackUrl: "https://orchestrator.example",
+      },
+      new NoopStepReporter(),
+    );
+
+    expect(pushCalls).toBe(2);
+    expect(outputs.prNumber).toBe(42);
+    expect(outputs.prUrl).toBeNull();
+    expect(outputs.pushAttempts).toBe(2);
+    // Only the one-time token exchange — the retry's credential refresh must not
+    // re-spend the already-consumed publication credential, and no PR create call.
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("rethrows the original push failure record when ls-remote fails after a push failure", async () => {
+    let lsRemoteCalls = 0;
+    let pushCalls = 0;
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n");
+      if (gitArgs[0] === "rev-parse") return spawnResult(0, "abc123\n");
+      if (gitArgs[0] === "show") return spawnResult(0, "M\tsrc/app.ts\n");
+      if (gitArgs[0] === "diff" && gitArgs.includes("--stat")) {
+        return spawnResult(0, " src/app.ts | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n");
+      }
+      if (gitArgs[0] === "ls-remote") {
+        lsRemoteCalls++;
+        if (lsRemoteCalls === 1) return spawnResult(0, `beadfeed\t${gitArgs.at(-1)}\n`);
+        return spawnResult(128, "", "fatal: unable to access remote");
+      }
+      if (gitArgs[0] === "push") {
+        pushCalls++;
+        return spawnResult(128, "", "remote: fatal error in commit_refs");
+      }
+      return spawnResult(0);
+    });
+
+    let caught: (Error & { failure?: FailureRecord }) | undefined;
+    try {
+      await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+    } catch (err) {
+      caught = err as typeof caught;
+    }
+
+    expect(pushCalls).toBe(1);
+    expect(caught?.failure?.category).toBe("transient");
+    expect(caught?.message).toContain("git push failed");
+    expect(caught?.message).toContain("remote could not be inspected");
+    // The push record is what carries the evidence here too — the local commit
+    // and diff --stat must survive even though the inspection itself failed.
+    expect(caught?.message).toContain("Unpublished local commit: abc123");
+    expect(caught?.message).toContain("1 file changed, 1 insertion(+), 1 deletion(-)");
+  });
+});
+
+describe("pushStep — conflict-on-retry re-inspection (BAC-27116 follow-up)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.stubGlobal("fetch", vi.fn());
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it("keeps the immediate throw for a conflict on the first attempt (never re-inspects the remote)", async () => {
+    let pushCalls = 0;
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n");
+      if (gitArgs[0] === "rev-parse") return spawnResult(0, "abc123\n");
+      if (gitArgs[0] === "show") return spawnResult(0, "M\tsrc/app.ts\n");
+      if (gitArgs[0] === "diff" && gitArgs.includes("--stat")) {
+        return spawnResult(0, " src/app.ts | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n");
+      }
+      if (gitArgs[0] === "ls-remote") return spawnResult(0, `beadfeed\t${gitArgs.at(-1)}\n`);
+      if (gitArgs[0] === "push") {
+        pushCalls++;
+        return spawnResult(
+          128,
+          "",
+          "! [rejected] ai-implement/eng-42-feature -> ai-implement/eng-42-feature (stale info)",
+        );
+      }
+      return spawnResult(0);
+    });
+
+    let caught: (Error & { failure?: FailureRecord }) | undefined;
+    try {
+      await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+    } catch (err) {
+      caught = err as typeof caught;
+    }
+
+    expect(pushCalls).toBe(1);
+    expect(caught?.failure?.category).toBe("conflict");
+    expect(caught?.failure?.code).toBe("GIT_LEASE_REJECTED");
+    const lsRemoteCalls = vi.mocked(spawnSync).mock.calls.filter((c) => (c[1] as string[])[0] === "ls-remote");
+    expect(lsRemoteCalls).toHaveLength(1); // only the pre-push lease lookup
+  });
+
+  it("treats a conflict on the second attempt as landed when the remote now holds our own commit", async () => {
+    let lsRemoteCalls = 0;
+    let pushCalls = 0;
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n");
+      if (gitArgs[0] === "rev-parse") return spawnResult(0, "abc123\n");
+      if (gitArgs[0] === "show") return spawnResult(0, "M\tsrc/app.ts\n");
+      if (gitArgs[0] === "ls-remote") {
+        lsRemoteCalls++;
+        // 1: pre-push lease lookup. 2: post-attempt-1 transient-failure inspection
+        // (unchanged, so it retries). 3: post-attempt-2 conflict inspection — a lagging
+        // ls-remote replica read the stale lease on the retry's pre-push lookup, but the
+        // attempt-1 commit actually landed, so this rejection is against our own commit.
+        if (lsRemoteCalls === 3) return spawnResult(0, `abc123\t${gitArgs.at(-1)}\n`);
+        return spawnResult(0, `beadfeed\t${gitArgs.at(-1)}\n`);
+      }
+      if (gitArgs[0] === "push") {
+        pushCalls++;
+        if (pushCalls === 1) return spawnResult(128, "", "fatal: internal server error");
+        return spawnResult(
+          128,
+          "",
+          "! [rejected] ai-implement/eng-42-feature -> ai-implement/eng-42-feature (stale info)",
+        );
+      }
+      return spawnResult(0);
+    });
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/70", number: 70 }),
+      text: async () => "",
+    } as Response);
+
+    const outputs = await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+
+    expect(pushCalls).toBe(2);
+    expect(lsRemoteCalls).toBe(3);
+    expect(outputs.prNumber).toBe(70);
+    expect(outputs.landedDespiteError).toBe(true);
+    expect(outputs.pushAttempts).toBe(2);
+  });
+
+  it("treats an unclassified (\"unknown\") failure on the second attempt as landed when the remote now holds our own commit, mirroring the conflict case", async () => {
+    let lsRemoteCalls = 0;
+    let pushCalls = 0;
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n");
+      if (gitArgs[0] === "rev-parse") return spawnResult(0, "abc123\n");
+      if (gitArgs[0] === "show") return spawnResult(0, "M\tsrc/app.ts\n");
+      if (gitArgs[0] === "ls-remote") {
+        lsRemoteCalls++;
+        // 1: pre-push lease lookup. 2: post-attempt-1 transient-failure inspection
+        // (unchanged, so it retries). 3: post-attempt-2 unknown-failure inspection —
+        // the attempt-1 commit actually landed, so this rejection is against our own
+        // commit even though the classifier could not recognize attempt 2's git text
+        // at all (category "unknown", not "conflict").
+        if (lsRemoteCalls === 3) return spawnResult(0, `abc123\t${gitArgs.at(-1)}\n`);
+        return spawnResult(0, `beadfeed\t${gitArgs.at(-1)}\n`);
+      }
+      if (gitArgs[0] === "push") {
+        pushCalls++;
+        if (pushCalls === 1) return spawnResult(128, "", "fatal: internal server error");
+        // Matches no GIT_SIGNATURES row — classifies as category "unknown".
+        return spawnResult(128, "", "fatal: something completely unrecognized happened");
+      }
+      return spawnResult(0);
+    });
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/71", number: 71 }),
+      text: async () => "",
+    } as Response);
+
+    const outputs = await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+
+    expect(pushCalls).toBe(2);
+    expect(lsRemoteCalls).toBe(3);
+    expect(outputs.prNumber).toBe(71);
+    expect(outputs.landedDespiteError).toBe(true);
+    expect(outputs.pushAttempts).toBe(2);
+  });
+
+  it("throws GIT_REMOTE_ADVANCED for a conflict on the second attempt against a foreign SHA", async () => {
+    let lsRemoteCalls = 0;
+    let pushCalls = 0;
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n");
+      if (gitArgs[0] === "rev-parse") return spawnResult(0, "abc123\n");
+      if (gitArgs[0] === "show") return spawnResult(0, "M\tsrc/app.ts\n");
+      if (gitArgs[0] === "diff" && gitArgs.includes("--stat")) {
+        return spawnResult(0, " src/app.ts | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n");
+      }
+      if (gitArgs[0] === "ls-remote") {
+        lsRemoteCalls++;
+        if (lsRemoteCalls === 3) return spawnResult(0, `someone-elses-sha\t${gitArgs.at(-1)}\n`);
+        return spawnResult(0, `beadfeed\t${gitArgs.at(-1)}\n`);
+      }
+      if (gitArgs[0] === "push") {
+        pushCalls++;
+        if (pushCalls === 1) return spawnResult(128, "", "fatal: internal server error");
+        return spawnResult(
+          128,
+          "",
+          "! [rejected] ai-implement/eng-42-feature -> ai-implement/eng-42-feature (stale info)",
+        );
+      }
+      return spawnResult(0);
+    });
+
+    let caught: (Error & { failure?: FailureRecord }) | undefined;
+    try {
+      await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+    } catch (err) {
+      caught = err as typeof caught;
+    }
+
+    expect(pushCalls).toBe(2);
+    expect(caught?.failure?.category).toBe("conflict");
+    expect(caught?.failure?.code).toBe("GIT_REMOTE_ADVANCED");
+    expect(caught?.failure?.retryable).toBe(false);
+    expect(caught?.failure?.message).toContain("beadfeed");
+    expect(caught?.failure?.message).toContain("someone-elses-sha");
+    expect(caught?.message).toContain("Unpublished local commit: abc123");
+    expect(caught?.message).toContain("1 file changed, 1 insertion(+), 1 deletion(-)");
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("keeps the original unknown category and message (not GIT_REMOTE_ADVANCED) when a retried unknown failure finds the remote advanced to a foreign SHA", async () => {
+    let lsRemoteCalls = 0;
+    let pushCalls = 0;
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n");
+      if (gitArgs[0] === "rev-parse") return spawnResult(0, "abc123\n");
+      if (gitArgs[0] === "show") return spawnResult(0, "M\tsrc/app.ts\n");
+      if (gitArgs[0] === "diff" && gitArgs.includes("--stat")) {
+        return spawnResult(0, " src/app.ts | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n");
+      }
+      if (gitArgs[0] === "ls-remote") {
+        lsRemoteCalls++;
+        if (lsRemoteCalls === 3) return spawnResult(0, `someone-elses-sha\t${gitArgs.at(-1)}\n`);
+        return spawnResult(0, `beadfeed\t${gitArgs.at(-1)}\n`);
+      }
+      if (gitArgs[0] === "push") {
+        pushCalls++;
+        if (pushCalls === 1) return spawnResult(128, "", "fatal: internal server error");
+        // Matches no GIT_SIGNATURES row — classifies as category "unknown".
+        return spawnResult(128, "", "fatal: something completely unrecognized happened");
+      }
+      return spawnResult(0);
+    });
+
+    let caught: (Error & { failure?: FailureRecord }) | undefined;
+    try {
+      await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+    } catch (err) {
+      caught = err as typeof caught;
+    }
+
+    expect(pushCalls).toBe(2);
+    // An incoming "unknown" failure is never reclassified as GIT_REMOTE_ADVANCED — only a
+    // genuine conflict is. The real (if unrecognized) git error is preserved, with a note
+    // appended that the remote advanced past the lease SHA during this attempt.
+    expect(caught?.failure?.category).toBe("unknown");
+    expect(caught?.failure?.code).not.toBe("GIT_REMOTE_ADVANCED");
+    expect(caught?.failure?.message).toContain("fatal: something completely unrecognized happened");
+    expect(caught?.failure?.message).toContain("Remote ai-implement/eng-42-feature advanced past the lease SHA during this attempt.");
+    expect(caught?.message).toContain("Unpublished local commit: abc123");
+  });
+
+  it("throws the original transient record instead of concluding GIT_REMOTE_ADVANCED when the local commit SHA is unknown", async () => {
+    let lsRemoteCalls = 0;
+    let pushCalls = 0;
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n");
+      // resolveCommitSha fails: commitSha stays null.
+      if (gitArgs[0] === "rev-parse") return spawnResult(128, "", "fatal: not a valid object name HEAD");
+      if (gitArgs[0] === "show") return spawnResult(0, "M\tsrc/app.ts\n");
+      if (gitArgs[0] === "diff" && gitArgs.includes("--stat")) return spawnResult(0, "(no diff)\n");
+      if (gitArgs[0] === "ls-remote") {
+        lsRemoteCalls++;
+        // 1st call: pre-push lease lookup (the leased/expected SHA). 2nd call:
+        // post-failure inspection — the remote has genuinely moved to a foreign SHA.
+        // This would read as GIT_REMOTE_ADVANCED if commitSha weren't null.
+        return lsRemoteCalls === 1
+          ? spawnResult(0, `beadfeed\t${gitArgs.at(-1)}\n`)
+          : spawnResult(0, `someone-elses-sha\t${gitArgs.at(-1)}\n`);
+      }
+      if (gitArgs[0] === "push") {
+        pushCalls++;
+        return spawnResult(128, "", "remote: fatal error in commit_refs");
+      }
+      return spawnResult(0);
+    });
+
+    let caught: (Error & { failure?: FailureRecord }) | undefined;
+    try {
+      await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+    } catch (err) {
+      caught = err as typeof caught;
+    }
+
+    expect(pushCalls).toBe(1);
+    expect(caught?.failure?.category).toBe("transient");
+    expect(caught?.failure?.code).not.toBe("GIT_REMOTE_ADVANCED");
+    expect(caught?.message).toContain("Unpublished local commit: unknown");
+    expect(caught?.message).toContain("landed check was skipped");
+  });
+
+  it("throws the original conflict record, not GIT_REMOTE_ADVANCED, when a retried conflict finds the remote still at the lease", async () => {
+    let pushCalls = 0;
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n");
+      if (gitArgs[0] === "rev-parse") return spawnResult(0, "abc123\n");
+      if (gitArgs[0] === "show") return spawnResult(0, "M\tsrc/app.ts\n");
+      if (gitArgs[0] === "diff" && gitArgs.includes("--stat")) {
+        return spawnResult(0, " src/app.ts | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n");
+      }
+      // The remote never moves off the leased SHA on any lookup — a conflict here
+      // is a genuine lease rejection, not our own attempt-1 push landing elsewhere.
+      if (gitArgs[0] === "ls-remote") return spawnResult(0, `beadfeed\t${gitArgs.at(-1)}\n`);
+      if (gitArgs[0] === "push") {
+        pushCalls++;
+        if (pushCalls === 1) return spawnResult(128, "", "fatal: internal server error");
+        return spawnResult(
+          128,
+          "",
+          "! [rejected] ai-implement/eng-42-feature -> ai-implement/eng-42-feature (stale info)",
+        );
+      }
+      return spawnResult(0);
+    });
+
+    let caught: (Error & { failure?: FailureRecord }) | undefined;
+    try {
+      await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+    } catch (err) {
+      caught = err as typeof caught;
+    }
+
+    expect(pushCalls).toBe(2);
+    expect(caught?.failure?.category).toBe("conflict");
+    expect(caught?.failure?.code).toBe("GIT_LEASE_REJECTED");
+    expect(caught?.failure?.retryable).toBe(false);
+    expect(caught?.message).not.toContain("advanced to");
+  });
+});
+
+describe("pushStep — retry resilience and guards (BAC-27116 follow-up)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.stubGlobal("fetch", vi.fn());
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it("uses the new token from the environment when the mid-retry credential refresh throws applying it", async () => {
+    let pushCalls = 0;
+    let setUrlCalls = 0;
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n");
+      if (gitArgs[0] === "rev-parse") return spawnResult(0, "abc123\n");
+      if (gitArgs[0] === "show") return spawnResult(0, "M\tsrc/app.ts\n");
+      if (gitArgs[0] === "ls-remote") return spawnResult(0, `beadfeed\t${gitArgs.at(-1)}\n`);
+      if (gitArgs[0] === "remote" && gitArgs[1] === "set-url") {
+        setUrlCalls++;
+        // 1st call: the pre-push exchange — must succeed so the run reaches the push loop.
+        // 2nd call: the mid-retry refresh — fails, exercising the wrapping try/catch. By
+        // this point refreshRunnerGithubCredentials has already written the new token to
+        // process.env.GITHUB_TOKEN, so the retry must use it despite this failure.
+        if (setUrlCalls === 1) return spawnResult(0);
+        return spawnResult(128, "", "fatal: not a git repository");
+      }
+      if (gitArgs[0] === "push") {
+        pushCalls++;
+        if (pushCalls === 1) return spawnResult(128, "", "fatal: internal server error");
+        return spawnResult(0);
+      }
+      return spawnResult(0);
+    });
+    vi.mocked(fetch)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ token: "fresh-token", expires_at: "2030-01-01T00:00:00Z" }),
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ token: "fresher-token", expires_at: "2030-01-01T00:00:00Z" }),
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 201,
+        json: async () => ({ html_url: "https://github.com/acme/app/pull/71", number: 71 }),
+        text: async () => "",
+      } as Response);
+
+    const outputs = await pushStep.run(
+      makeContext(),
+      { ...BASE_INPUTS, orchestratorUrl: "https://orchestrator.example", machineNonce: "machine-nonce" },
+      new NoopStepReporter(),
+    );
+
+    expect(pushCalls).toBe(2);
+    expect(outputs.prNumber).toBe(71);
+    // The mid-retry refresh's token fetch succeeded and updated process.env.GITHUB_TOKEN
+    // before the subsequent git remote set-url failed — the retry must use that new
+    // token rather than the stale pre-refresh one, and must not throw or lose the
+    // classified push failure that triggered the retry.
+    const pushCallArgs = vi.mocked(spawnSync).mock.calls.filter((c) => (c[1] as string[])[0] === "push");
+    expect(pushCallArgs).toHaveLength(2);
+    expect((pushCallArgs[1][1] as string[]).join(" ")).toContain("fresher-token");
+    expect((pushCallArgs[1][1] as string[]).join(" ")).not.toContain("fresh-token");
+  });
+
+  it("redacts unpublished-work evidence against the current token, not the original dispatch token", async () => {
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n");
+      if (gitArgs[0] === "rev-parse") return spawnResult(0, "abc123\n");
+      if (gitArgs[0] === "show") return spawnResult(0, "M\tsrc/app.ts\n");
+      if (gitArgs[0] === "diff" && gitArgs.includes("--stat")) {
+        // Simulates git error text that happens to embed the tokenized remote URL —
+        // this must be redacted against the CURRENT (refreshed) token.
+        return spawnResult(
+          128,
+          "",
+          "fatal: unable to access 'https://x-access-token:fresh-token@github.com/acme/app.git/'",
+        );
+      }
+      if (gitArgs[0] === "ls-remote") return spawnResult(0, `beadfeed\t${gitArgs.at(-1)}\n`);
+      if (gitArgs[0] === "push") {
+        return spawnResult(128, "", "fatal: Authentication failed for 'https://github.com/acme/app.git/'");
+      }
+      return spawnResult(0);
+    });
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({ token: "fresh-token", expires_at: "2030-01-01T00:00:00Z" }),
+    } as Response);
+
+    let caught: (Error & { failure?: FailureRecord }) | undefined;
+    try {
+      await pushStep.run(
+        makeContext(),
+        { ...BASE_INPUTS, orchestratorUrl: "https://orchestrator.example", machineNonce: "machine-nonce" },
+        new NoopStepReporter(),
+      );
+    } catch (err) {
+      caught = err as typeof caught;
+    }
+
+    expect(caught?.message).not.toContain("fresh-token");
+    expect(caught?.message).toContain("***");
+  });
+
+  it("falls back to the default pushRetries when the value is undefined, instead of retrying forever", async () => {
+    let pushCalls = 0;
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n");
+      if (gitArgs[0] === "rev-parse") return spawnResult(0, "abc123\n");
+      if (gitArgs[0] === "show") return spawnResult(0, "M\tsrc/app.ts\n");
+      if (gitArgs[0] === "diff" && gitArgs.includes("--stat")) {
+        return spawnResult(0, " src/app.ts | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n");
+      }
+      if (gitArgs[0] === "ls-remote") return spawnResult(0, `beadfeed\t${gitArgs.at(-1)}\n`);
+      if (gitArgs[0] === "push") {
+        pushCalls++;
+        return spawnResult(128, "", "remote: fatal error in commit_refs");
+      }
+      return spawnResult(0);
+    });
+
+    let caught: (Error & { failure?: FailureRecord }) | undefined;
+    try {
+      await pushStep.run(
+        makeContext({
+          retryPolicy: { ...DEFAULT_RETRY_POLICY, pushRetries: undefined as unknown as number },
+        }),
+        BASE_INPUTS,
+        new NoopStepReporter(),
+      );
+    } catch (err) {
+      caught = err as typeof caught;
+    }
+
+    expect(pushCalls).toBe(1 + DEFAULT_RETRY_POLICY.pushRetries);
+    expect(caught?.failure?.code).toBe("GIT_PUSH_RETRIES_EXHAUSTED");
+    expect(caught?.failure?.retryable).toBe(false);
+  });
+
+  it("falls back to the default pushRetries when the value is a numeric string, instead of retrying forever", async () => {
+    let pushCalls = 0;
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n");
+      if (gitArgs[0] === "rev-parse") return spawnResult(0, "abc123\n");
+      if (gitArgs[0] === "show") return spawnResult(0, "M\tsrc/app.ts\n");
+      if (gitArgs[0] === "diff" && gitArgs.includes("--stat")) {
+        return spawnResult(0, " src/app.ts | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n");
+      }
+      if (gitArgs[0] === "ls-remote") return spawnResult(0, `beadfeed\t${gitArgs.at(-1)}\n`);
+      if (gitArgs[0] === "push") {
+        pushCalls++;
+        return spawnResult(128, "", "remote: fatal error in commit_refs");
+      }
+      return spawnResult(0);
+    });
+
+    let caught: (Error & { failure?: FailureRecord }) | undefined;
+    try {
+      await pushStep.run(
+        makeContext({
+          retryPolicy: { ...DEFAULT_RETRY_POLICY, pushRetries: "3" as unknown as number },
+        }),
+        BASE_INPUTS,
+        new NoopStepReporter(),
+      );
+    } catch (err) {
+      caught = err as typeof caught;
+    }
+
+    expect(pushCalls).toBe(1 + DEFAULT_RETRY_POLICY.pushRetries);
+    expect(caught?.failure?.code).toBe("GIT_PUSH_RETRIES_EXHAUSTED");
+  });
+
+  it("attempts exactly once when pushRetries is 0", async () => {
+    let pushCalls = 0;
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n");
+      if (gitArgs[0] === "rev-parse") return spawnResult(0, "abc123\n");
+      if (gitArgs[0] === "show") return spawnResult(0, "M\tsrc/app.ts\n");
+      if (gitArgs[0] === "diff" && gitArgs.includes("--stat")) {
+        return spawnResult(0, " src/app.ts | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n");
+      }
+      if (gitArgs[0] === "ls-remote") return spawnResult(0, `beadfeed\t${gitArgs.at(-1)}\n`);
+      if (gitArgs[0] === "push") {
+        pushCalls++;
+        return spawnResult(128, "", "remote: fatal error in commit_refs");
+      }
+      return spawnResult(0);
+    });
+
+    let caught: (Error & { failure?: FailureRecord }) | undefined;
+    try {
+      await pushStep.run(
+        makeContext({ retryPolicy: { ...DEFAULT_RETRY_POLICY, pushRetries: 0 } }),
+        BASE_INPUTS,
+        new NoopStepReporter(),
+      );
+    } catch (err) {
+      caught = err as typeof caught;
+    }
+
+    expect(pushCalls).toBe(1);
+    expect(caught?.failure?.category).toBe("transient");
+    expect(caught?.failure?.code).toBe("GIT_PUSH_RETRIES_EXHAUSTED");
+    expect(caught?.failure?.retryable).toBe(false);
+    expect(caught?.failure?.attempt).toBe(1);
+  });
+
+  it("carries a mid-retry credential-refresh-failure note through to the exhausted-retries terminal record", async () => {
+    let pushCalls = 0;
+    let setUrlCalls = 0;
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n");
+      if (gitArgs[0] === "rev-parse") return spawnResult(0, "abc123\n");
+      if (gitArgs[0] === "show") return spawnResult(0, "M\tsrc/app.ts\n");
+      if (gitArgs[0] === "diff" && gitArgs.includes("--stat")) {
+        return spawnResult(0, " src/app.ts | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n");
+      }
+      // The remote never moves: every push attempt stays genuinely transient.
+      if (gitArgs[0] === "ls-remote") return spawnResult(0, `beadfeed\t${gitArgs.at(-1)}\n`);
+      if (gitArgs[0] === "remote" && gitArgs[1] === "set-url") {
+        setUrlCalls++;
+        // 1st call: the pre-push exchange — must succeed to reach the push loop.
+        // 2nd call: the mid-retry refresh before the final attempt — fails, and that
+        // failure's note must still be attached to the terminal exhausted-retries record.
+        if (setUrlCalls === 1) return spawnResult(0);
+        return spawnResult(128, "", "fatal: not a git repository");
+      }
+      if (gitArgs[0] === "push") {
+        pushCalls++;
+        return spawnResult(128, "", "remote: fatal error in commit_refs");
+      }
+      return spawnResult(0);
+    });
+    vi.mocked(fetch)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ token: "fresh-token", expires_at: "2030-01-01T00:00:00Z" }),
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ token: "fresher-token", expires_at: "2030-01-01T00:00:00Z" }),
+      } as Response);
+
+    let caught: (Error & { failure?: FailureRecord }) | undefined;
+    try {
+      await pushStep.run(
+        makeContext({
+          orchestratorUrl: "https://orchestrator.example",
+          retryPolicy: { ...DEFAULT_RETRY_POLICY, pushRetries: 1 },
+        }),
+        { ...BASE_INPUTS, orchestratorUrl: "https://orchestrator.example", machineNonce: "machine-nonce" },
+        new NoopStepReporter(),
+      );
+    } catch (err) {
+      caught = err as typeof caught;
+    }
+
+    expect(pushCalls).toBe(2);
+    expect(caught?.failure?.code).toBe("GIT_PUSH_RETRIES_EXHAUSTED");
+    // failure_json (persisted from err.failure) and the tracker comment (built from
+    // err.message) must not disagree — the credential-refresh note lands on both.
+    expect(caught?.failure?.message).toContain("credential refresh before retry failed");
+    expect(caught?.failure?.message).toContain("git remote set-url failed");
+  });
+
+  it("collapses an identical mid-retry credential-refresh-failure note recurring across attempts into one copy with a count", async () => {
+    let pushCalls = 0;
+    let setUrlCalls = 0;
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n");
+      if (gitArgs[0] === "rev-parse") return spawnResult(0, "abc123\n");
+      if (gitArgs[0] === "show") return spawnResult(0, "M\tsrc/app.ts\n");
+      if (gitArgs[0] === "diff" && gitArgs.includes("--stat")) {
+        return spawnResult(0, " src/app.ts | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n");
+      }
+      // The remote never moves: every push attempt stays genuinely transient.
+      if (gitArgs[0] === "ls-remote") return spawnResult(0, `beadfeed\t${gitArgs.at(-1)}\n`);
+      if (gitArgs[0] === "remote" && gitArgs[1] === "set-url") {
+        setUrlCalls++;
+        // 1st call: the pre-push exchange — must succeed to reach the push loop.
+        // 2nd and 3rd calls: the two mid-retry refreshes — both fail with the exact
+        // same reason, which must collapse to one note with a count rather than
+        // repeating the identical text twice.
+        if (setUrlCalls === 1) return spawnResult(0);
+        return spawnResult(128, "", "fatal: not a git repository");
+      }
+      if (gitArgs[0] === "push") {
+        pushCalls++;
+        return spawnResult(128, "", "remote: fatal error in commit_refs");
+      }
+      return spawnResult(0);
+    });
+    vi.mocked(fetch)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ token: "fresh-token", expires_at: "2030-01-01T00:00:00Z" }),
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ token: "fresher-token", expires_at: "2030-01-01T00:00:00Z" }),
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ token: "freshest-token", expires_at: "2030-01-01T00:00:00Z" }),
+      } as Response);
+
+    let caught: (Error & { failure?: FailureRecord }) | undefined;
+    try {
+      await pushStep.run(
+        makeContext({
+          orchestratorUrl: "https://orchestrator.example",
+          retryPolicy: { ...DEFAULT_RETRY_POLICY, pushRetries: 2 },
+        }),
+        { ...BASE_INPUTS, orchestratorUrl: "https://orchestrator.example", machineNonce: "machine-nonce" },
+        new NoopStepReporter(),
+      );
+    } catch (err) {
+      caught = err as typeof caught;
+    }
+
+    expect(pushCalls).toBe(3);
+    expect(caught?.failure?.code).toBe("GIT_PUSH_RETRIES_EXHAUSTED");
+    const note = "credential refresh before retry failed: git remote set-url failed (exit 128): fatal: not a git repository";
+    const occurrences = caught?.failure?.message?.split(note).length ?? 1;
+    // Exactly one copy of the note text, not one per retry.
+    expect(occurrences - 1).toBe(1);
+    expect(caught?.failure?.message).toContain(`${note} (×2)`);
+  });
+
+  it("redacts and one-lines an ls-remote inspection-failure reason before appending it to the message", async () => {
+    vi.stubEnv("AI_IMPLEMENT_SIDE_CHANNEL_TOKEN", "leaked-secret-value-1234567890");
+    let lsRemoteCalls = 0;
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n");
+      if (gitArgs[0] === "rev-parse") return spawnResult(0, "abc123\n");
+      if (gitArgs[0] === "show") return spawnResult(0, "M\tsrc/app.ts\n");
+      if (gitArgs[0] === "diff" && gitArgs.includes("--stat")) {
+        return spawnResult(0, " src/app.ts | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n");
+      }
+      if (gitArgs[0] === "ls-remote") {
+        lsRemoteCalls++;
+        // 1st call: the pre-push lookup — must succeed to reach the push loop.
+        if (lsRemoteCalls === 1) return spawnResult(0, `beadfeed\t${gitArgs.at(-1)}\n`);
+        // Every post-failure inspection attempt fails, carrying a secret that only
+        // envSecrets() (not the push token redaction) would ever catch.
+        return spawnResult(
+          128,
+          "",
+          `fatal: unable to access remote: leaked-secret-value-1234567890 ${"x".repeat(600)}`,
+        );
+      }
+      if (gitArgs[0] === "push") {
+        return spawnResult(128, "", "remote: fatal error in commit_refs");
+      }
+      return spawnResult(0);
+    });
+
+    let caught: (Error & { failure?: FailureRecord }) | undefined;
+    try {
+      await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+    } catch (err) {
+      caught = err as typeof caught;
+    }
+
+    expect(caught?.message).toContain("remote could not be inspected");
+    // The env secret is redacted via the same envSecrets()/oneLinerMessage contract
+    // FailureRecord.message itself is held to, not spliced in raw.
+    expect(caught?.message).not.toContain("leaked-secret-value-1234567890");
+    expect(caught?.message).toContain("***");
+    // Only the first line is kept, and it is capped at 500 chars (plus the "…"
+    // truncation marker) — the 600-char second line must not appear in full.
+    expect(caught?.message).not.toContain("x".repeat(600));
+  });
+
+  it("appends nothing to failure.message when an ls-remote inspection failure carries only a whitespace reason", async () => {
+    let lsRemoteCalls = 0;
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n");
+      if (gitArgs[0] === "rev-parse") return spawnResult(0, "abc123\n");
+      if (gitArgs[0] === "show") return spawnResult(0, "M\tsrc/app.ts\n");
+      if (gitArgs[0] === "diff" && gitArgs.includes("--stat")) {
+        return spawnResult(0, " src/app.ts | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n");
+      }
+      if (gitArgs[0] === "ls-remote") {
+        lsRemoteCalls++;
+        // 1st call: the pre-push lookup — must succeed to reach the push loop.
+        if (lsRemoteCalls === 1) return spawnResult(0, `beadfeed\t${gitArgs.at(-1)}\n`);
+        // Every post-failure inspection attempt throws synchronously with a
+        // whitespace-only message. Distinct from resolveRemoteBranchSha's own
+        // "git ls-remote failed after N attempts" wrapper (used when spawnSync merely
+        // returns a non-zero status): that wrapper always carries a non-blank literal
+        // prefix and so can never itself produce a genuinely blank reason.
+        throw new Error("   ");
+      }
+      if (gitArgs[0] === "push") {
+        return spawnResult(128, "", "remote: fatal error in commit_refs");
+      }
+      return spawnResult(0);
+    });
+
+    let caught: (Error & { failure?: FailureRecord }) | undefined;
+    try {
+      await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+    } catch (err) {
+      caught = err as typeof caught;
+    }
+
+    expect(caught?.failure).toBeDefined();
+    // The whole "(remote could not be inspected: ...)" parenthetical is skipped, not
+    // rendered with an empty reason inside it.
+    expect(caught?.failure?.message).not.toContain("remote could not be inspected");
+    expect(caught?.message).not.toContain("remote could not be inspected");
+  });
+
+  it("collapses ten identical mid-retry credential-refresh-failure notes into one copy with a count of 10", async () => {
+    let pushCalls = 0;
+    let setUrlCalls = 0;
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n");
+      if (gitArgs[0] === "rev-parse") return spawnResult(0, "abc123\n");
+      if (gitArgs[0] === "show") return spawnResult(0, "M\tsrc/app.ts\n");
+      if (gitArgs[0] === "diff" && gitArgs.includes("--stat")) {
+        return spawnResult(0, " src/app.ts | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n");
+      }
+      // The remote never moves: every push attempt stays genuinely transient.
+      if (gitArgs[0] === "ls-remote") return spawnResult(0, `beadfeed\t${gitArgs.at(-1)}\n`);
+      if (gitArgs[0] === "remote" && gitArgs[1] === "set-url") {
+        setUrlCalls++;
+        // 1st call: the pre-push exchange — must succeed to reach the push loop.
+        // Every mid-retry refresh after it fails with the exact same reason.
+        if (setUrlCalls === 1) return spawnResult(0);
+        return spawnResult(128, "", "fatal: not a git repository");
+      }
+      if (gitArgs[0] === "push") {
+        pushCalls++;
+        return spawnResult(128, "", "remote: fatal error in commit_refs");
+      }
+      return spawnResult(0);
+    });
+    vi.mocked(fetch).mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ token: "fresh-token", expires_at: "2030-01-01T00:00:00Z" }),
+    } as Response);
+
+    let caught: (Error & { failure?: FailureRecord }) | undefined;
+    try {
+      await pushStep.run(
+        makeContext({
+          orchestratorUrl: "https://orchestrator.example",
+          retryPolicy: { ...DEFAULT_RETRY_POLICY, pushRetries: 10 },
+        }),
+        { ...BASE_INPUTS, orchestratorUrl: "https://orchestrator.example", machineNonce: "machine-nonce" },
+        new NoopStepReporter(),
+      );
+    } catch (err) {
+      caught = err as typeof caught;
+    }
+
+    expect(pushCalls).toBe(11); // 1 + pushRetries(10)
+    expect(caught?.failure?.code).toBe("GIT_PUSH_RETRIES_EXHAUSTED");
+    const note = "credential refresh before retry failed: git remote set-url failed (exit 128): fatal: not a git repository";
+    const occurrences = caught?.failure?.message?.split(note).length ?? 1;
+    // Exactly one copy of the note text, not one per retry.
+    expect(occurrences - 1).toBe(1);
+    expect(caught?.failure?.message).toContain(`${note} (×10)`);
+  });
+
+  it("caps the joined credential-refresh-failure note suffix at 1000 characters even when the underlying notes total far more", async () => {
+    let pushCalls = 0;
+    let setUrlCalls = 0;
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n");
+      if (gitArgs[0] === "rev-parse") return spawnResult(0, "abc123\n");
+      if (gitArgs[0] === "show") return spawnResult(0, "M\tsrc/app.ts\n");
+      if (gitArgs[0] === "diff" && gitArgs.includes("--stat")) {
+        return spawnResult(0, " src/app.ts | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n");
+      }
+      if (gitArgs[0] === "ls-remote") return spawnResult(0, `beadfeed\t${gitArgs.at(-1)}\n`);
+      if (gitArgs[0] === "remote" && gitArgs[1] === "set-url") {
+        setUrlCalls++;
+        if (setUrlCalls === 1) return spawnResult(0);
+        // Each retry's refresh fails with a DISTINCT reason (a per-call marker), so
+        // dedupeNotes cannot collapse them — the raw joined text across 10 retries
+        // comfortably exceeds 3 000 characters.
+        return spawnResult(128, "", `fatal: distinct failure marker ${"x".repeat(280)} #${setUrlCalls}`);
+      }
+      if (gitArgs[0] === "push") {
+        pushCalls++;
+        return spawnResult(128, "", "remote: fatal error in commit_refs");
+      }
+      return spawnResult(0);
+    });
+    vi.mocked(fetch).mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ token: "fresh-token", expires_at: "2030-01-01T00:00:00Z" }),
+    } as Response);
+
+    let caught: (Error & { failure?: FailureRecord }) | undefined;
+    try {
+      await pushStep.run(
+        makeContext({
+          orchestratorUrl: "https://orchestrator.example",
+          retryPolicy: { ...DEFAULT_RETRY_POLICY, pushRetries: 10 },
+        }),
+        { ...BASE_INPUTS, orchestratorUrl: "https://orchestrator.example", machineNonce: "machine-nonce" },
+        new NoopStepReporter(),
+      );
+    } catch (err) {
+      caught = err as typeof caught;
+    }
+
+    expect(pushCalls).toBe(11);
+    expect(caught?.failure?.code).toBe("GIT_PUSH_RETRIES_EXHAUSTED");
+    const message = caught?.failure?.message ?? "";
+    expect(message).toContain("…");
+    // Not all ten distinct markers can fit under the 1 000-character cap.
+    const markerCount = (message.match(/distinct failure marker/g) ?? []).length;
+    expect(markerCount).toBeGreaterThan(0);
+    expect(markerCount).toBeLessThan(10);
+  });
+
+  it("calls computeBackoffMs with the retry policy and the failing attempt's number before sleeping", async () => {
+    let pushCalls = 0;
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n");
+      if (gitArgs[0] === "rev-parse") return spawnResult(0, "abc123\n");
+      if (gitArgs[0] === "show") return spawnResult(0, "M\tsrc/app.ts\n");
+      if (gitArgs[0] === "ls-remote") return spawnResult(0, `beadfeed\t${gitArgs.at(-1)}\n`);
+      if (gitArgs[0] === "push") {
+        pushCalls++;
+        if (pushCalls === 1) return spawnResult(128, "", "fatal: internal server error");
+        return spawnResult(0);
+      }
+      return spawnResult(0);
+    });
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/60", number: 60 }),
+      text: async () => "",
+    } as Response);
+
+    await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+
+    expect(pushCalls).toBe(2);
+    expect(computeBackoffMs).toHaveBeenCalledWith(1, DEFAULT_RETRY_POLICY);
+  });
+
+  it("falls back to the default backoffInitialMs when the value is out of range", async () => {
+    let pushCalls = 0;
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n");
+      if (gitArgs[0] === "rev-parse") return spawnResult(0, "abc123\n");
+      if (gitArgs[0] === "show") return spawnResult(0, "M\tsrc/app.ts\n");
+      if (gitArgs[0] === "ls-remote") return spawnResult(0, `beadfeed\t${gitArgs.at(-1)}\n`);
+      if (gitArgs[0] === "push") {
+        pushCalls++;
+        if (pushCalls === 1) return spawnResult(128, "", "fatal: internal server error");
+        return spawnResult(0);
+      }
+      return spawnResult(0);
+    });
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/61", number: 61 }),
+      text: async () => "",
+    } as Response);
+
+    await pushStep.run(
+      makeContext({ retryPolicy: { ...DEFAULT_RETRY_POLICY, backoffInitialMs: 500 } }),
+      BASE_INPUTS,
+      new NoopStepReporter(),
+    );
+
+    expect(pushCalls).toBe(2);
+    expect(computeBackoffMs).toHaveBeenCalledWith(
+      1,
+      expect.objectContaining({ backoffInitialMs: DEFAULT_RETRY_POLICY.backoffInitialMs }),
+    );
+  });
+
+  it("falls back to the default backoffMaxMs when the value is out of range", async () => {
+    let pushCalls = 0;
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n");
+      if (gitArgs[0] === "rev-parse") return spawnResult(0, "abc123\n");
+      if (gitArgs[0] === "show") return spawnResult(0, "M\tsrc/app.ts\n");
+      if (gitArgs[0] === "ls-remote") return spawnResult(0, `beadfeed\t${gitArgs.at(-1)}\n`);
+      if (gitArgs[0] === "push") {
+        pushCalls++;
+        if (pushCalls === 1) return spawnResult(128, "", "fatal: internal server error");
+        return spawnResult(0);
+      }
+      return spawnResult(0);
+    });
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/62", number: 62 }),
+      text: async () => "",
+    } as Response);
+
+    await pushStep.run(
+      makeContext({ retryPolicy: { ...DEFAULT_RETRY_POLICY, backoffMaxMs: 700_000 } }),
+      BASE_INPUTS,
+      new NoopStepReporter(),
+    );
+
+    expect(pushCalls).toBe(2);
+    expect(computeBackoffMs).toHaveBeenCalledWith(
+      1,
+      expect.objectContaining({ backoffMaxMs: DEFAULT_RETRY_POLICY.backoffMaxMs }),
+    );
+  });
+
+  it("falls back to the default backoffJitter when the value is out of range", async () => {
+    let pushCalls = 0;
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n");
+      if (gitArgs[0] === "rev-parse") return spawnResult(0, "abc123\n");
+      if (gitArgs[0] === "show") return spawnResult(0, "M\tsrc/app.ts\n");
+      if (gitArgs[0] === "ls-remote") return spawnResult(0, `beadfeed\t${gitArgs.at(-1)}\n`);
+      if (gitArgs[0] === "push") {
+        pushCalls++;
+        if (pushCalls === 1) return spawnResult(128, "", "fatal: internal server error");
+        return spawnResult(0);
+      }
+      return spawnResult(0);
+    });
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/63", number: 63 }),
+      text: async () => "",
+    } as Response);
+
+    await pushStep.run(
+      makeContext({ retryPolicy: { ...DEFAULT_RETRY_POLICY, backoffJitter: 2 } }),
+      BASE_INPUTS,
+      new NoopStepReporter(),
+    );
+
+    expect(pushCalls).toBe(2);
+    expect(computeBackoffMs).toHaveBeenCalledWith(
+      1,
+      expect.objectContaining({ backoffJitter: DEFAULT_RETRY_POLICY.backoffJitter }),
+    );
+  });
+
+  it("raises a backoffMaxMs below backoffInitialMs up to backoffInitialMs instead of inverting the backoff", async () => {
+    let pushCalls = 0;
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n");
+      if (gitArgs[0] === "rev-parse") return spawnResult(0, "abc123\n");
+      if (gitArgs[0] === "show") return spawnResult(0, "M\tsrc/app.ts\n");
+      if (gitArgs[0] === "ls-remote") return spawnResult(0, `beadfeed\t${gitArgs.at(-1)}\n`);
+      if (gitArgs[0] === "push") {
+        pushCalls++;
+        if (pushCalls === 1) return spawnResult(128, "", "fatal: internal server error");
+        return spawnResult(0);
+      }
+      return spawnResult(0);
+    });
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/64", number: 64 }),
+      text: async () => "",
+    } as Response);
+
+    // Individually in range ([1_000, 600_000]) but incoherent as a pair: a max
+    // below the initial delay would make backoff shrink instead of grow.
+    await pushStep.run(
+      makeContext({
+        retryPolicy: { ...DEFAULT_RETRY_POLICY, backoffInitialMs: 600_000, backoffMaxMs: 1_000 },
+      }),
+      BASE_INPUTS,
+      new NoopStepReporter(),
+    );
+
+    expect(pushCalls).toBe(2);
+    expect(computeBackoffMs).toHaveBeenCalledWith(
+      1,
+      expect.objectContaining({ backoffInitialMs: 600_000, backoffMaxMs: 600_000 }),
+    );
+  });
+
+  it("retries a transient push failure past a null commitSha when the remote is unchanged", async () => {
+    let pushCalls = 0;
+    let lsRemoteCalls = 0;
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n");
+      // resolveCommitSha fails: commitSha stays null throughout.
+      if (gitArgs[0] === "rev-parse") return spawnResult(128, "", "fatal: not a valid object name HEAD");
+      if (gitArgs[0] === "show") return spawnResult(0, "M\tsrc/app.ts\n");
+      if (gitArgs[0] === "ls-remote") {
+        lsRemoteCalls++;
+        // The remote never moves off the leased SHA on any lookup.
+        return spawnResult(0, `beadfeed\t${gitArgs.at(-1)}\n`);
+      }
+      if (gitArgs[0] === "push") {
+        pushCalls++;
+        if (pushCalls === 1) return spawnResult(128, "", "remote: fatal error in commit_refs");
+        return spawnResult(0);
+      }
+      return spawnResult(0);
+    });
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/65", number: 65 }),
+      text: async () => "",
+    } as Response);
+
+    const outputs = await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+
+    expect(pushCalls).toBe(2);
+    expect(lsRemoteCalls).toBeGreaterThanOrEqual(2);
+    expect(outputs.prNumber).toBe(65);
+    expect(outputs.commitSha).toBeNull();
+  });
+
+  it("keeps the current token when the mid-retry refresh throws before ever writing it to the environment", async () => {
+    let pushCalls = 0;
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n");
+      if (gitArgs[0] === "rev-parse") return spawnResult(0, "abc123\n");
+      if (gitArgs[0] === "show") return spawnResult(0, "M\tsrc/app.ts\n");
+      if (gitArgs[0] === "diff" && gitArgs.includes("--stat")) {
+        return spawnResult(0, " src/app.ts | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n");
+      }
+      if (gitArgs[0] === "ls-remote") return spawnResult(0, `beadfeed\t${gitArgs.at(-1)}\n`);
+      if (gitArgs[0] === "remote" && gitArgs[1] === "set-url") return spawnResult(0);
+      if (gitArgs[0] === "push") {
+        pushCalls++;
+        return spawnResult(128, "", "remote: fatal error in commit_refs");
+      }
+      return spawnResult(0);
+    });
+    vi.stubEnv("RUN_PUBLICATION_TOKEN", "pub-token");
+    vi.mocked(fetch)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        // Same token as BASE_INPUTS.githubToken ("gh-token"): the single-use
+        // publication credential is only cleared when the vended token differs
+        // from the current one, so it stays available for the mid-retry call below.
+        json: async () => ({ token: "gh-token", expires_at: "2030-01-01T00:00:00Z" }),
+      } as Response)
+      .mockResolvedValueOnce({
+        // A non-retryable rejection: the fail-closed publication exchange throws
+        // immediately, before ever writing process.env.GITHUB_TOKEN.
+        ok: false,
+        status: 400,
+        json: async () => ({}),
+      } as Response);
+
+    let caught: (Error & { failure?: FailureRecord }) | undefined;
+    try {
+      await pushStep.run(
+        makeContext({
+          retryPolicy: { ...DEFAULT_RETRY_POLICY, pushRetries: 1 },
+          callbackUrl: "https://orchestrator.example",
+        }),
+        { ...BASE_INPUTS, callbackUrl: "https://orchestrator.example" },
+        new NoopStepReporter(),
+      );
+    } catch (err) {
+      caught = err as typeof caught;
+    }
+
+    expect(pushCalls).toBe(2);
+    expect(caught?.failure?.code).toBe("GIT_PUSH_RETRIES_EXHAUSTED");
+    expect(caught?.failure?.message).toContain("credential refresh before retry failed");
+    const pushCallArgs = vi.mocked(spawnSync).mock.calls.filter((c) => (c[1] as string[])[0] === "push");
+    expect(pushCallArgs).toHaveLength(2);
+    // The token that failed to refresh must still be the one used on the retry.
+    expect((pushCallArgs[1][1] as string[]).join(" ")).toContain("gh-token");
+  });
+
+  it("labels the unpublished-work diff stat with the ref actually used when the primary ref fails and falls back to baseRef", async () => {
+    let diffStatCalls = 0;
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n");
+      if (gitArgs[0] === "rev-parse") return spawnResult(0, "abc123\n");
+      if (gitArgs[0] === "show") return spawnResult(0, "M\tsrc/app.ts\n");
+      if (gitArgs[0] === "ls-remote") return spawnResult(0, `remote-lease-sha\t${gitArgs.at(-1)}\n`);
+      if (gitArgs[0] === "diff" && gitArgs.includes("--stat")) {
+        diffStatCalls++;
+        // 1st attempt: against the lease SHA, never fetched locally — unknown revision.
+        if (diffStatCalls === 1) {
+          return spawnResult(128, "", "fatal: unknown revision or path not in the working tree: remote-lease-sha");
+        }
+        // 2nd attempt: falls back to the immutable base ref, which IS present locally.
+        return spawnResult(0, " src/app.ts | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n");
+      }
+      if (gitArgs[0] === "push") {
+        return spawnResult(128, "", "fatal: Authentication failed for 'https://github.com/acme/app.git/'");
+      }
+      return spawnResult(0);
+    });
+
+    let caught: (Error & { failure?: FailureRecord }) | undefined;
+    try {
+      await pushStep.run(makeContext(), { ...BASE_INPUTS, baseRef: "base-ref-sha" }, new NoopStepReporter());
+    } catch (err) {
+      caught = err as typeof caught;
+    }
+
+    expect(diffStatCalls).toBe(2);
+    expect(caught?.failure?.category).toBe("auth");
+    expect(caught?.message).toContain("git diff --stat base-ref-sha..HEAD:");
+    expect(caught?.message).not.toContain("git diff --stat remote-lease-sha..HEAD:");
+  });
+});
 describe("pushStep — mounted workspace never pushes", () => {
   beforeEach(() => {
     vi.clearAllMocks();

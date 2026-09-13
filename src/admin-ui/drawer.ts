@@ -330,17 +330,11 @@ export const drawerScript = `
     const repoParts = repoPartsForJob(job, mapping);
 
     if (job.issueIdentifier) {
-      const ticketingProvider = mapping ? mapping.ticketingProvider : 'linear';
-      const jiraSiteUrl = (window.jiraSiteUrl || '');
-      let valueHtml;
-      if (ticketingProvider === 'jira' && jiraSiteUrl) {
-        valueHtml = '<a class="text-accent" href="' + window.safeUrl(jiraSiteUrl) + '/browse/' + window.escAttr(job.issueIdentifier) + '" target="_blank">' + window.esc(job.issueIdentifier) + ' &#8599;</a>';
-      } else if (ticketingProvider === 'jira') {
-        // Jira but we don't know the site URL — show plain text.
-        valueHtml = window.esc(job.issueIdentifier);
-      } else {
-        valueHtml = '<a class="text-accent" href="https://linear.app/issue/' + window.escAttr(job.issueIdentifier) + '" target="_blank">' + window.esc(job.issueIdentifier) + ' &#8599;</a>';
-      }
+      // The server resolves issueUrl through the mapping's ticketing provider, so the
+      // drawer never has to know which tracker (or which Jira site) a project uses.
+      const valueHtml = job.issueUrl
+        ? '<a class="text-accent" href="' + window.safeUrl(job.issueUrl) + '" target="_blank">' + window.esc(job.issueIdentifier) + ' &#8599;</a>'
+        : window.esc(job.issueIdentifier);
       fields.push({ label: 'Issue', value: valueHtml });
     }
 

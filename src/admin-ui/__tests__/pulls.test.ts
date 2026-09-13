@@ -20,6 +20,11 @@ describe("pulls page", () => {
     expect(stripped).not.toMatch(/\bapi\(/);
     expect(stripped).not.toMatch(/\besc\(/);
   });
+  it("links issues through the provider-resolved issueUrl, never a hardcoded tracker host", () => {
+    expect(pullsScript).toContain("window.safeUrl(issueUrl)");
+    expect(pullsScript).not.toContain("linear.app");
+  });
+
   it("uses const/let, not var", () => {
     expect(pullsScript).not.toMatch(/\bvar\s+\w/);
   });

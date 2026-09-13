@@ -25,7 +25,7 @@ import { reviewStep } from "../pipeline/steps/review.js";
 import { feedbackLoopStep } from "../pipeline/steps/feedback-loop.js";
 import { DefaultPipelineContext } from "../pipeline/context.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
-import type { Step, StepReporter } from "../pipeline/types.js";
+import type { LLMExecutor, Step, StepReporter } from "../pipeline/types.js";
 
 const APPROVED_REVIEW = {
   approved: true,
@@ -34,6 +34,7 @@ const APPROVED_REVIEW = {
   progressDelta: 100,
   feedback: "Looks good",
   tokensUsed: 0,
+  attempts: 1,
 };
 
 const REJECTED_REVIEW = {
@@ -43,6 +44,7 @@ const REJECTED_REVIEW = {
   progressDelta: 50,
   feedback: "Needs improvement",
   tokensUsed: 0,
+  attempts: 1,
 };
 
 const IMPLEMENT_OUTPUTS = {
@@ -50,6 +52,7 @@ const IMPLEMENT_OUTPUTS = {
   tokensUsed: 100,
   exitCode: 0,
   subagentCount: 0,
+  attempts: 1,
 };
 
 function makeContext(overrides: Record<string, unknown> = {}): DefaultPipelineContext {
@@ -284,6 +287,77 @@ describe("feedbackLoopStep", () => {
     expect((thrown as Error & { failure?: { stage?: string } }).failure?.stage).toBe(
       "feedback-loop/implement-1",
     );
+  });
+
+  it("carries telemetry stamped on a rejected implement error onto the failed sub-step report (BAC-27136)", async () => {
+    // The executor (a spawn-level rejection where every attempt fails) and
+    // implement.ts (a settled-but-failing LLMResult) both stamp `err.telemetry`
+    // now — feedback-loop must surface it on the failed implement sub-step's
+    // outputs, not just the failure record, or the tokens/cost that attempt
+    // burned are lost from the run's evidence.
+    const telemetry = {
+      outcome: "unknown" as const,
+      numTurns: 3,
+      durationMs: 1500,
+      costUsd: 0.05,
+      tokensIn: 60,
+      tokensOut: 6,
+    };
+    const err = Object.assign(new Error("LLM invocation failed with exit code 1"), {
+      failure: {
+        category: "crash" as const,
+        code: "PROCESS_EXIT_NONZERO",
+        stage: "implement",
+        attempt: 3,
+        retryable: false,
+        message: "boom",
+        evidence: { truncated: false },
+      },
+      telemetry,
+    });
+    vi.mocked(implementStep.run).mockRejectedValueOnce(err);
+
+    const reportedSteps: Step[] = [];
+    const reporter: StepReporter = {
+      report: vi.fn(async (step) => {
+        reportedSteps.push({ ...step });
+      }),
+    };
+
+    await feedbackLoopStep.run(makeContext(), BASE_INPUTS, reporter).catch((e: unknown) => e);
+
+    const failedStep = reportedSteps.find((s) => s.status === "failed" && s.type === "implement");
+    expect(failedStep).toBeDefined();
+    expect((failedStep?.outputs as { telemetry?: typeof telemetry }).telemetry).toEqual(telemetry);
+  });
+
+  it("carries telemetry stamped on a rejected review error onto the failed sub-step report (BAC-27136)", async () => {
+    // Mirrors the implement-side test above: the executor stamps `err.telemetry`
+    // on every give-up rejection, including a review call — feedback-loop must
+    // surface it on the failed review sub-step's outputs too.
+    const telemetry = {
+      outcome: "unknown" as const,
+      numTurns: 2,
+      durationMs: 900,
+      costUsd: 0.02,
+      tokensIn: 30,
+      tokensOut: 4,
+    };
+    const err = Object.assign(new Error("Prompt is too long"), { telemetry });
+    vi.mocked(reviewStep.run).mockRejectedValueOnce(err);
+
+    const reportedSteps: Step[] = [];
+    const reporter: StepReporter = {
+      report: vi.fn(async (step) => {
+        reportedSteps.push({ ...step });
+      }),
+    };
+
+    await feedbackLoopStep.run(makeContext(), BASE_INPUTS, reporter);
+
+    const failedStep = reportedSteps.find((s) => s.status === "failed" && s.type === "review");
+    expect(failedStep).toBeDefined();
+    expect((failedStep?.outputs as { telemetry?: typeof telemetry }).telemetry).toEqual(telemetry);
   });
 
   it("does not throw when the review step fails, so the pipeline can still push", async () => {
@@ -563,7 +637,7 @@ const MAX_TURNS_TELEMETRY = {
   toolTrace: ["Bash npm test", "Read /src/app.ts"],
 };
 
-function makeContextWithExecutor(invoke: ReturnType<typeof vi.fn>): DefaultPipelineContext {
+function makeContextWithExecutor(invoke: LLMExecutor["invoke"]): DefaultPipelineContext {
   return new DefaultPipelineContext(
     {
       jobId: 1, issueId: "issue-1", issueIdentifier: "ENG-1", issueTitle: "Test",
@@ -591,7 +665,10 @@ describe("feedbackLoopStep termination reasons", () => {
 
     expect(outputs.terminationReason).toBe("approved");
     expect(outputs.passes).toEqual([
-      { iteration: 1, implementTurns: 12, implementOutcome: "success", costUsd: 0.3, reviewApproved: true, tokensIn: 1, tokensOut: 1, cacheReadTokens: null, cacheCreationTokens: null },
+      {
+        iteration: 1, implementTurns: 12, implementOutcome: "success", costUsd: 0.3, reviewApproved: true,
+        tokensIn: 1, tokensOut: 1, cacheReadTokens: null, cacheCreationTokens: null, attempts: 1, reviewAttempts: 1,
+      },
     ]);
   });
 
@@ -634,25 +711,26 @@ describe("feedbackLoopStep termination reasons", () => {
     expect(call.prompt).toContain("Bash npm test"); // tool trace embedded
   });
 
-  it("treats success telemetry above maxTurns as max_turns and skips review", async () => {
+  it("proceeds to review when a SUCCESSFUL pass reports numTurns above the configured cap", async () => {
+    // result.num_turns counts conversation messages, not the agent turns
+    // --max-turns bounds — a real production run reported subtype "success" at
+    // num_turns 104 under the default 50 cap (7b74bf6). Success above the cap is
+    // a normal completed pass and must reach review, not fail as max_turns.
     vi.mocked(implementStep.run).mockResolvedValue({
       ...IMPLEMENT_OUTPUTS,
-      telemetry: { ...MAX_TURNS_TELEMETRY, outcome: "success", numTurns: 51 },
+      telemetry: { ...MAX_TURNS_TELEMETRY, outcome: "success", numTurns: 104 },
     });
-    const invoke = vi.fn().mockResolvedValue({ stdout: "## Post-mortem\nExceeded configured turns.", exitCode: 0, tokensUsed: 10 });
+    vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
 
     const outputs = await feedbackLoopStep.run(
-      makeContextWithExecutor(invoke),
+      makeContextWithExecutor(vi.fn()),
       { ...BASE_INPUTS, maxTurns: 50, maxIterations: 3 },
       new NoopStepReporter(),
     );
 
-    expect(outputs.approved).toBe(false);
-    expect(outputs.terminationReason).toBe("max_turns");
-    expect(outputs.iterations).toBe(1);
-    expect(reviewStep.run).not.toHaveBeenCalled();
-    expect(implementStep.run).toHaveBeenCalledTimes(1);
-    expect(outputs.finalFeedback).toContain("51 turns used");
+    expect(reviewStep.run).toHaveBeenCalledTimes(1);
+    expect(outputs.terminationReason).not.toBe("max_turns");
+    expect(outputs.approved).toBe(true);
   });
 
   it("post-mortem failure is non-fatal", async () => {

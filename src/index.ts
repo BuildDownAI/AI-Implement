@@ -8,7 +8,7 @@ import {
 } from "./config.js";
 import type { RepoMapping } from "./config.js";
 import { isAlreadyDispatched, markDispatched, closeDb, getDispatchedIds, deleteDispatched } from "./dedup.js";
-import { dispatchWorkflow, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, getPullRequestState, buildEnvelopeDispatchInputs, postPrComment, defaultFetchSignal, getRepoDefaultBranch, buildKgRefreshGhaDispatchBody, pollForKgWorkflowRunId } from "./github.js";
+import { dispatchWorkflow, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, getPullRequestState, buildEnvelopeDispatchInputs, postPrComment, defaultFetchSignal, getRepoDefaultBranch, buildKgRefreshGhaDispatchBody, pollForKgWorkflowRunId } from "./github.js";
 import { resolveWorkflowCapabilities, resolveWorkflowContract } from "./workflow-probe.js";
 import { surfaceDispatchFailure } from "./dispatch-failure.js";
 import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
@@ -1694,7 +1694,7 @@ async function dispatchFlyMachine(
         tenantId: config.tenantId ?? undefined,
         expectedTtlSeconds: Math.round(SWEEP_MACHINE_MAX_AGE_MS / 1000),
         extraEnv: (() => {
-          const merged = { ...mapping.extraEnv, ...capRunnerEnv(mapping), ...branchPrefixRunnerEnv(mapping), ...skillsRepoRunnerEnv(mapping), ...profilesRunnerEnv(issue), AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(implRunConfig) };
+          const merged = { ...mapping.extraEnv, ...capRunnerEnv(mapping), ...branchPrefixRunnerEnv(mapping), ...skillsRepoRunnerEnv(mapping), ...profilesRunnerEnv(issue), ...assigneeRunnerEnv(issue), AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(implRunConfig) };
           return Object.keys(merged).length > 0 ? merged : undefined;
         })(),
       });
@@ -1786,7 +1786,7 @@ async function dispatchLocalDocker(
         runnerCallbackUrl: runnerCallbackUrl || undefined,
         runToken: runToken || undefined,
         extraEnv: (() => {
-          const merged = { ...mapping.extraEnv, ...capRunnerEnv(mapping), ...branchPrefixRunnerEnv(mapping), ...skillsRepoRunnerEnv(mapping), ...profilesRunnerEnv(issue), AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(localImplRunConfig) };
+          const merged = { ...mapping.extraEnv, ...capRunnerEnv(mapping), ...branchPrefixRunnerEnv(mapping), ...skillsRepoRunnerEnv(mapping), ...profilesRunnerEnv(issue), ...assigneeRunnerEnv(issue), AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(localImplRunConfig) };
           return Object.keys(merged).length > 0 ? merged : undefined;
         })(),
       });
@@ -2565,9 +2565,13 @@ async function markReadyForReview(provider: TicketingProvider, job: Job, prUrl: 
     return;
   }
   try {
-    await provider.markPrReady(job.issueId, job.teamKey, prUrl);
+    const applied = await provider.markPrReady(job.issueId, job.teamKey, prUrl);
     resetStuckAttempts(job.issueId);
-    console.log(`[monitor] Marked ${job.issueIdentifier} as Ready for Review (PR: ${prUrl})`);
+    if (applied) {
+      console.log(`[monitor] Marked ${job.issueIdentifier} as Ready for Review (PR: ${prUrl})`);
+    } else {
+      console.log(`[monitor] ${job.issueIdentifier} already Merged — Ready for Review suppressed (PR: ${prUrl})`);
+    }
   } catch (err) {
     console.error(`[monitor] Failed to mark ${job.issueIdentifier} as Ready for Review:`, err);
   }
@@ -2582,12 +2586,18 @@ async function resetTicket(provider: TicketingProvider, job: Job): Promise<void>
     return;
   }
   try {
-    await provider.clearWorkingState(job.issueId, job.teamKey);
+    const applied = await provider.clearWorkingState(job.issueId, job.teamKey);
 
-    // Clear the dedup entry so the issue can be re-dispatched
+    // Clear the dedup entry so the issue can be re-dispatched. Safe even when the
+    // reset was refused (issue already Merged): the dispatch bucket only selects
+    // Ready/"Plan Approved", so a Merged issue cannot re-dispatch.
     deleteDispatched(job.issueId);
 
-    console.log(`[monitor] Reset ticket ${job.issueIdentifier}: cleared working state and dedup`);
+    if (applied) {
+      console.log(`[monitor] Reset ticket ${job.issueIdentifier}: cleared working state and dedup`);
+    } else {
+      console.log(`[monitor] ${job.issueIdentifier} already Merged — reset suppressed, dedup cleared`);
+    }
   } catch (err) {
     console.error(`[monitor] Failed to reset Linear issue ${job.issueIdentifier}:`, err);
   }
