@@ -51,6 +51,9 @@ export interface TicketIssue {
    *  field, the field is unset, or the field has an unexpected shape. Nonblank strings
    *  remain present until dispatch validation can refuse invalid refs. */
   baseBranch?: string;
+  /** Assignee display name, used to attribute the opened PR's title. Jira-only; absent for
+   *  Linear issues and for Jira issues with no assignee set. */
+  assigneeName?: string;
 }
 
 export interface AIImplementSnapshot {
@@ -109,11 +112,20 @@ export interface TicketingProvider {
   // pick the right mapping without a fragile repo-field read-back.
   markPlanningStarted(issueId: string, scopeKey: string): Promise<void>;
   markPlanComplete(issueId: string, scopeKey: string): Promise<void>;
-  markPlanningFailed(issueId: string, scopeKey: string, reason: string): Promise<void>;
+  /** Returns whether a failure comment was actually posted — false when the status write
+   *  was refused (issue already Merged) and no comment follows it. Callers must stamp
+   *  their own "did we already comment" bookkeeping only on true, or a refusal silently
+   *  suppresses the monitor's backstop comment for a ticket that was never told. */
+  markPlanningFailed(issueId: string, scopeKey: string, reason: string): Promise<boolean>;
   markImplementing(issueId: string, scopeKey: string): Promise<void>;
-  markPrReady(issueId: string, scopeKey: string, prUrl: string): Promise<void>;
-  markImplementationFailed(issueId: string, scopeKey: string, reason: string): Promise<void>;
-  clearWorkingState(issueId: string, scopeKey: string): Promise<void>;
+  /** Returns whether the transition was applied. False means the provider refused it
+   *  because the issue already reached a terminal Merged state (a late report from a
+   *  run whose PR merged first) — callers should not log the transition as done. */
+  markPrReady(issueId: string, scopeKey: string, prUrl: string): Promise<boolean>;
+  /** Returns whether a failure comment was actually posted — see `markPlanningFailed`. */
+  markImplementationFailed(issueId: string, scopeKey: string, reason: string): Promise<boolean>;
+  /** Returns whether the reset was applied; false when refused (issue already Merged). */
+  clearWorkingState(issueId: string, scopeKey: string): Promise<boolean>;
   /** Move the issue to a completed state after its PR merged. Idempotent:
    *  no-op when the issue is already completed/cancelled. */
   markMerged(issueId: string, scopeKey: string): Promise<void>;

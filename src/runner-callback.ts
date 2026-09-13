@@ -86,9 +86,9 @@ export interface RunnerResultBody {
   snapshotPr?: number;
   /** The `kg-refresh/<stamp>` branch behind snapshotPr; deleted by the orchestrator after merge or close. */
   snapshotBranch?: string;
-  /** Guard verdict from kg-snapshot-push, present only for a kg-refresh dry-run (AII-632). */
+  /** Guard verdict from kg-snapshot-push, present for a kg-refresh dry-run (AII-632) or a real `KG_SNAPSHOT_TRACKER_REGRESSION` refusal (AII-638). */
   guardVerdict?: "clean" | "refused";
-  /** Per-part {part, prev, new} table from kg-snapshot-push, present only for a kg-refresh dry-run (AII-632). */
+  /** Per-part {part, prev, new} table from kg-snapshot-push, present for a kg-refresh dry-run (AII-632) or a real `KG_SNAPSHOT_TRACKER_REGRESSION` refusal (AII-638). */
   partTable?: Array<{ part: string; prev: string; new: string }>;
   /** Reference repository clone outcomes, present only when the run declared entries. */
   referenceRepoResults?: ReferenceRepoResult[];

@@ -548,9 +548,48 @@ export async function handleMcpRequest(
     }
   }
 
+  // The JSON-RPC handshake (initialize/ping/notifications-initialized) is answered by the
+  // orchestrator itself, never proxied: orchestrator-native tools exist regardless of the
+  // sidecar, so a real MCP client (not just curl against tools/list) must be able to connect
+  // on a sidecar-less boot. Only kg_* tool calls stay gated on `provider` below (AII-641).
+  if (rpc?.method === "initialize") {
+    json(res, 200, {
+      jsonrpc: "2.0",
+      id: rpc.id ?? null,
+      result: {
+        protocolVersion: (rpc.params?.protocolVersion as string) ?? "2025-03-26",
+        serverInfo: { name: "ai-implement", version: "1.0.0" },
+        capabilities: { tools: {} },
+      },
+    });
+    return;
+  }
+
+  if (rpc?.method === "ping") {
+    json(res, 200, { jsonrpc: "2.0", id: rpc.id ?? null, result: {} });
+    return;
+  }
+
+  if (rpc?.method === "notifications/initialized") {
+    // A notification per the JSON-RPC spec (no `id`, no result body expected) — the
+    // streamable-HTTP transport acks with an empty 202 rather than a JSON-RPC envelope.
+    res.writeHead(202, { "Content-Type": "application/json" });
+    res.end();
+    return;
+  }
+
   if (rpc?.method === "tools/list") {
     // Merge native diagnostic tools with kg_* tools from the provider. Hiding a write tool the
     // caller's role cannot use is a courtesy — the check in tools/call below is the boundary.
+    //
+    // kg_* tools are omitted here entirely when there is no provider, rather than listed with
+    // an isError response on tools/call: unlike get_tenant_health's `kgDegraded` flag — which
+    // surfaces a *partially* working KG (search still answers, just lexical-only) so a client
+    // knows the capability exists but is degraded — an unset KG_SIDECAR_URL means the capability
+    // doesn't exist at all for this session. Listing tools a client can never successfully call
+    // would be misleading; omitting them lets tools/list reflect what's actually usable, while
+    // the 503 below still carries the "no memory provider is configured" detail for a client
+    // that calls one anyway (e.g. from a stale tool list) (AII-641).
     const kgTools = provider ? await provider.listTools(body, req.headers) : [];
     json(res, 200, {
       jsonrpc: "2.0",

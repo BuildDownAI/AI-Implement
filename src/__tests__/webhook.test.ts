@@ -583,6 +583,64 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
     expect(JSON.parse(res.body)).toEqual({ ignored: true, reason: "not_accept_baseline_label" });
   });
 
+  it("removing the accept-baseline label re-reports with acceptBaseline:false, reverting the wording (AII-640)", async () => {
+    const trigger = vi.fn().mockResolvedValue({ status: 202, body: {} });
+    const reportDryRun = vi.fn().mockResolvedValue(true);
+    const kgPrCheck = makeKgPrCheck({ trigger, reportDryRun });
+
+    const { req, res } = makeRequest(
+      SECRET,
+      "pull_request",
+      prPayload({
+        action: "unlabeled",
+        number: 8,
+        ref: "feature/y",
+        sha: "sha-8",
+        repo: KG_SOURCE_REPO,
+        labels: [],
+        label: "accept-baseline",
+      }),
+    );
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
+    await res.done;
+
+    expect(trigger).not.toHaveBeenCalled();
+    expect(reportDryRun).toHaveBeenCalledTimes(1);
+    expect(reportDryRun).toHaveBeenCalledWith({
+      repo: KG_SOURCE_REPO,
+      prNumber: 8,
+      sha: "sha-8",
+      acceptBaseline: false,
+    });
+    expect(JSON.parse(res.body)).toEqual({ reported: true });
+  });
+
+  it("an unlabeled event for a label other than accept-baseline is ignored", async () => {
+    const trigger = vi.fn().mockResolvedValue({ status: 202, body: {} });
+    const reportDryRun = vi.fn().mockResolvedValue(true);
+    const kgPrCheck = makeKgPrCheck({ trigger, reportDryRun });
+
+    const { req, res } = makeRequest(
+      SECRET,
+      "pull_request",
+      prPayload({
+        action: "unlabeled",
+        number: 12,
+        ref: "feature/z",
+        sha: "sha-12",
+        repo: KG_SOURCE_REPO,
+        labels: [],
+        label: "bug",
+      }),
+    );
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
+    await res.done;
+
+    expect(trigger).not.toHaveBeenCalled();
+    expect(reportDryRun).not.toHaveBeenCalled();
+    expect(JSON.parse(res.body)).toEqual({ ignored: true, reason: "not_accept_baseline_label" });
+  });
+
   it("a transient listPullRequestFiles failure is reported distinctly from a genuine no-guard-relevant-change ignore", async () => {
     const trigger = vi.fn().mockResolvedValue({ status: 202, body: {} });
     const kgPrCheck = makeKgPrCheck({ trigger });
@@ -670,6 +728,31 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
     // The KG repos are ordinary onboarded projects too: gap-fill matching still ran.
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body)).toEqual({ ignored: true, reason: "no matching dispatch" });
+  });
+
+  it("a KG-repo PR with a live dispatch_log match gets both the dry-run trigger and the gap-fill acknowledgement (AII-639/AII-640)", async () => {
+    const trigger = vi.fn().mockResolvedValue({ status: 202, body: {} });
+    const kgPrCheck = makeKgPrCheck({ trigger });
+    mockPrFiles(["kg_ingest/tracker.py"]);
+
+    const jobId = log.appendLog({ issueId: "issue-kg-1", issueIdentifier: "AII-900", repo: KG_SOURCE_REPO });
+    log.updateJobStatus(jobId, "running", null, `https://github.com/${KG_SOURCE_REPO}/pull/80`);
+
+    const { req, res } = makeRequest(
+      SECRET,
+      "pull_request",
+      prPayload({ action: "synchronize", number: 80, ref: "feature/kgb-y", sha: "sha-80", repo: KG_SOURCE_REPO }),
+    );
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
+    await res.done;
+
+    // The dry-run side effect still fires...
+    expect(trigger).toHaveBeenCalledTimes(1);
+    expect(trigger.mock.calls[0][0]).toMatchObject({ dryRun: true, ref: "feature/kgb-y" });
+    // ...and the normal pull_request handling still owns the response, finding the
+    // real dispatch_log row rather than falling back to "no matching dispatch".
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ acknowledged: true, reason: "awaiting_gap_analysis_result" });
   });
 
   it("a synchronize on the KG source repo touching only docs does not dispatch and still reaches the normal pull_request handling (AII-639)", async () => {

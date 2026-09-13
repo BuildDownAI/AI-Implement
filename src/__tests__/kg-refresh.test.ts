@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, rmSync
 import { execSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { makeKgRefresh, runKgRefreshPreflight, materializeArgs, type KgRefreshHandle, type KgRefreshStage, type RefreshOutcome, type RefreshGate } from "../kg-refresh.js";
+import { makeKgRefresh, runKgRefreshPreflight, materializeArgs, type KgRefreshHandle, type KgRefreshStage, type RefreshOutcome, type RefreshGate, type DryRunOutcomeEntry } from "../kg-refresh.js";
 import { COMPLETION_MARKER } from "../kg-sidecar.js";
 import * as runnerMode from "../runner-mode.js";
 
@@ -1237,6 +1237,74 @@ describe("kg-refresh", () => {
         await handle.reportDryRun(REPORT);
         expect(postOrUpdateStickyCommentFn).not.toHaveBeenCalled();
       });
+
+      it("reportDryRun({ acceptBaseline: false }) reports plain-refusal wording, even for a PR the label was previously applied to (AII-640)", async () => {
+        buildDispatch();
+        await handle.trigger({ dryRun: true, ref: "pr-head-branch", report: { ...REPORT, acceptBaseline: true } });
+        await waitForStage("ingest-running");
+        handle.onRunnerComplete("failure", {
+          failureCode: "KG_SNAPSHOT_TRACKER_REGRESSION",
+          failureReason: "content regression detected — comment.nt: shrank from 9995 to 3793 lines",
+          guardVerdict: "refused",
+          partTable: [{ part: "comment.nt", prev: "9995", new: "3793" }],
+        });
+        await waitDone();
+        postOrUpdateStickyCommentFn.mockClear();
+        setCommitStatusFn.mockClear();
+
+        // Simulates the webhook's `unlabeled` branch: it always forces acceptBaseline:false.
+        await handle.reportDryRun({ ...REPORT, acceptBaseline: false });
+
+        expect(postOrUpdateStickyCommentFn).toHaveBeenCalledTimes(1);
+        const body = postOrUpdateStickyCommentFn.mock.calls[0]![5] as string;
+        expect(body).toContain("guard refused");
+        expect(body).not.toContain("accepted by label");
+        const statusCall = setCommitStatusFn.mock.calls[0] as [string, string, string, string, { state: string }];
+        expect(statusCall[4].state).toBe("failure");
+      });
+
+      describe("dry-run outcome persistence across a restart (AII-640)", () => {
+        it("a fresh handle answers reportDryRun() using an outcome recorded by a prior, now-discarded handle", async () => {
+          let sharedOutcomes: DryRunOutcomeEntry[] | null = null;
+          const persistDryRunOutcomes = vi.fn((entries: DryRunOutcomeEntry[]) => {
+            sharedOutcomes = entries;
+          });
+          const loadDryRunOutcomes = vi.fn((): DryRunOutcomeEntry[] | null => sharedOutcomes);
+
+          // Instance A: completes a dry-run, recording (and persisting) its outcome.
+          buildDispatch({ persistDryRunOutcomes, loadDryRunOutcomes });
+          await handle.trigger({ dryRun: true, ref: "pr-head-branch", report: REPORT });
+          await waitForStage("ingest-running");
+          handle.onRunnerComplete("success", { guardVerdict: "clean", partTable: [] });
+          await waitDone();
+
+          expect(persistDryRunOutcomes).toHaveBeenCalled();
+          expect(sharedOutcomes).not.toBeNull();
+
+          // Instance B: simulated restart — a fresh handle sharing only the persisted
+          // store; instance A's in-memory dryRunOutcomesByPr is gone.
+          buildDispatch({ persistDryRunOutcomes, loadDryRunOutcomes });
+
+          await expect(handle.reportDryRun(REPORT)).resolves.toBe(true);
+          expect(postOrUpdateStickyCommentFn).toHaveBeenCalledTimes(1);
+        });
+
+        it("a fresh handle with nothing persisted still boots cleanly and reportDryRun() no-ops", async () => {
+          const loadDryRunOutcomes = vi.fn((): DryRunOutcomeEntry[] | null => null);
+          buildDispatch({ persistDryRunOutcomes: vi.fn(), loadDryRunOutcomes });
+
+          await expect(handle.reportDryRun(REPORT)).resolves.toBe(false);
+          expect(postOrUpdateStickyCommentFn).not.toHaveBeenCalled();
+        });
+
+        it("a wrong-shaped persisted blob (valid JSON, not an entry list) is ignored at boot instead of throwing", async () => {
+          const loadDryRunOutcomes = vi.fn((): DryRunOutcomeEntry[] | null => ({ not: "an array" }) as never);
+          expect(() => buildDispatch({ persistDryRunOutcomes: vi.fn(), loadDryRunOutcomes })).not.toThrow();
+
+          await expect(handle.reportDryRun(REPORT)).resolves.toBe(false);
+          expect(postOrUpdateStickyCommentFn).not.toHaveBeenCalled();
+        });
+      });
     });
 
     describe("onRefreshSettled (AII-636)", () => {
@@ -1366,6 +1434,53 @@ describe("kg-refresh", () => {
       const s = await handle.status();
       expect(s.stage).toBe("failed");
       expect(s.running).toBe(false);
+    });
+
+    it("a real (non-dry-run) KG_SNAPSHOT_TRACKER_REGRESSION failure sets partTable and a detail naming the part and sizes (AII-638)", async () => {
+      buildDispatch();
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      handle.onRunnerComplete("failure", {
+        failureCode: "KG_SNAPSHOT_TRACKER_REGRESSION",
+        failureReason: "KG_SNAPSHOT_TRACKER_REGRESSION: content regression detected — comment.nt: shrank from 9995 to 3793 lines (below 50% threshold)",
+        partTable: [{ part: "comment.nt", prev: "9995", new: "3793" }],
+      });
+      await waitDone();
+      const s = await handle.status();
+      expect(s.stage).toBe("failed");
+      expect(s.running).toBe(false);
+      expect(s.lastRefresh?.ok).toBe(false);
+      expect(s.lastRefresh?.partTable).toEqual([{ part: "comment.nt", prev: "9995", new: "3793" }]);
+      expect(s.lastRefresh?.detail).toContain("comment.nt");
+      expect(s.lastRefresh?.detail).toContain("9995");
+      expect(s.lastRefresh?.detail).toContain("3793");
+      expect(s.lastRefresh?.detail).toMatch(/^ingest runner failed: /);
+    });
+
+    it("a real failure with a different failure code keeps the bare-code detail and does not set partTable", async () => {
+      buildDispatch();
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      handle.onRunnerComplete("failure", { failureCode: "KG_SNAPSHOT_MISSING", failureReason: "no parts found" });
+      await waitDone();
+      const s = await handle.status();
+      expect(s.stage).toBe("failed");
+      expect(s.lastRefresh?.partTable).toBeUndefined();
+      expect(s.lastRefresh?.detail).toBe("ingest runner failed: KG_SNAPSHOT_MISSING");
+    });
+
+    it("a real KG_SNAPSHOT_TRACKER_REGRESSION failure with no partTable does not throw and leaves partTable unset", async () => {
+      buildDispatch();
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      handle.onRunnerComplete("failure", {
+        failureCode: "KG_SNAPSHOT_TRACKER_REGRESSION",
+        failureReason: "KG_SNAPSHOT_TRACKER_REGRESSION: content regression detected — comment.nt: missing (was 9995 lines)",
+      });
+      await waitDone();
+      const s = await handle.status();
+      expect(s.stage).toBe("failed");
+      expect(s.lastRefresh?.partTable).toBeUndefined();
     });
 
     it("onRunnerComplete success with snapshotCommit verifies commit then runs rail", async () => {

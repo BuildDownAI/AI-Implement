@@ -354,6 +354,8 @@ The in-flight dispatch envelope is stored under the same `kg_refresh_stage` sett
 
 `lastRefresh` is persisted under a separate `kg_refresh_last_refresh` settings key on every terminal outcome (success, no-new-data, failure) and loaded on boot. It survives restarts independently of the in-flight state.
 
+The per-PR dry-run outcome cache behind the KG PR check (AII-633/636) is persisted under a third key, `kg_refresh_dry_run_outcomes`, as one JSON blob (same bounded shape as the in-memory map, insertion order kept for eviction) written on every record and eviction and loaded on boot beside the stage envelope (AII-640). A restart between a dry run finishing and a later `accept-baseline` `labeled`/`unlabeled` event therefore re-reports that PR's own verdict instead of answering `no_dry_run_outcome`.
+
 **Token validation survives restarts** because `verifyAndConsumeRunToken` and `verifyRunToken` are DB-only — they read `runner_tokens` rows written at dispatch time. The 401 seen in run 34006075078 was caused by the progress token not being minted (AII-544, now fixed), not by in-memory state loss.
 
 **SQLite volume must persist across deploys.** An orchestrator that redeploys with a fresh volume loses both the `runner_tokens` rows and the persisted stage — token validation returns `reason: "malformed"` (row absent) and `GET /api/kg/status` shows `lastRefresh: null`.

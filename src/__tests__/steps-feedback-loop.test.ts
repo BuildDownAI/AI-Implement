@@ -711,25 +711,26 @@ describe("feedbackLoopStep termination reasons", () => {
     expect(call.prompt).toContain("Bash npm test"); // tool trace embedded
   });
 
-  it("treats success telemetry above maxTurns as max_turns and skips review", async () => {
+  it("proceeds to review when a SUCCESSFUL pass reports numTurns above the configured cap", async () => {
+    // result.num_turns counts conversation messages, not the agent turns
+    // --max-turns bounds — a real production run reported subtype "success" at
+    // num_turns 104 under the default 50 cap (7b74bf6). Success above the cap is
+    // a normal completed pass and must reach review, not fail as max_turns.
     vi.mocked(implementStep.run).mockResolvedValue({
       ...IMPLEMENT_OUTPUTS,
-      telemetry: { ...MAX_TURNS_TELEMETRY, outcome: "success", numTurns: 51 },
+      telemetry: { ...MAX_TURNS_TELEMETRY, outcome: "success", numTurns: 104 },
     });
-    const invoke = vi.fn().mockResolvedValue({ stdout: "## Post-mortem\nExceeded configured turns.", exitCode: 0, tokensUsed: 10 });
+    vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
 
     const outputs = await feedbackLoopStep.run(
-      makeContextWithExecutor(invoke),
+      makeContextWithExecutor(vi.fn()),
       { ...BASE_INPUTS, maxTurns: 50, maxIterations: 3 },
       new NoopStepReporter(),
     );
 
-    expect(outputs.approved).toBe(false);
-    expect(outputs.terminationReason).toBe("max_turns");
-    expect(outputs.iterations).toBe(1);
-    expect(reviewStep.run).not.toHaveBeenCalled();
-    expect(implementStep.run).toHaveBeenCalledTimes(1);
-    expect(outputs.finalFeedback).toContain("51 turns used");
+    expect(reviewStep.run).toHaveBeenCalledTimes(1);
+    expect(outputs.terminationReason).not.toBe("max_turns");
+    expect(outputs.approved).toBe(true);
   });
 
   it("post-mortem failure is non-fatal", async () => {

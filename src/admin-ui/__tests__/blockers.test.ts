@@ -19,6 +19,11 @@ describe("blockers page", () => {
     expect(stripped).not.toMatch(/\bapi\(/);
     expect(stripped).not.toMatch(/\besc\(/);
   });
+  it("links issues through the provider-resolved issueUrl, never a hardcoded tracker host", () => {
+    expect(blockersScript).toContain("window.safeUrl(b.issueUrl)");
+    expect(blockersScript).not.toContain("linear.app");
+  });
+
   it("uses const/let, not var", () => {
     expect(blockersScript).not.toMatch(/\bvar\s+\w/);
   });

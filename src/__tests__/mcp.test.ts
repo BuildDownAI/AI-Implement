@@ -340,6 +340,81 @@ describe("handleMcpRequest", () => {
     });
   });
 
+  describe("initialize / ping / notifications/initialized", () => {
+    it("answers initialize without a memory provider", async () => {
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}',
+      );
+      expect(result.statusCode).toBe(200);
+      const parsed = JSON.parse(result.body);
+      expect(parsed.id).toBe(1);
+      expect(parsed.result.protocolVersion).toBe("2025-03-26");
+      expect(parsed.result.serverInfo.name).toBeTruthy();
+      expect(parsed.result.serverInfo.version).toBeTruthy();
+      expect(mockHttpRequest).not.toHaveBeenCalled();
+    });
+
+    it("answers initialize the same way when a provider is configured, never proxying it", async () => {
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        DEFAULT_PROVIDER,
+        BASE_URL,
+        "POST",
+        '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}',
+      );
+      expect(result.statusCode).toBe(200);
+      const parsed = JSON.parse(result.body);
+      expect(parsed.result.serverInfo).toBeDefined();
+      expect(mockHttpRequest).not.toHaveBeenCalled();
+    });
+
+    it("still requires auth for initialize", async () => {
+      const result = await callMcp(
+        { authorization: "Bearer invalid" },
+        false,
+        null,
+        BASE_URL,
+        "POST",
+        '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}',
+      );
+      expect(result.statusCode).toBe(401);
+    });
+
+    it("answers ping without a memory provider", async () => {
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        '{"jsonrpc":"2.0","id":2,"method":"ping","params":{}}',
+      );
+      expect(result.statusCode).toBe(200);
+      const parsed = JSON.parse(result.body);
+      expect(parsed.id).toBe(2);
+      expect(parsed.result).toEqual({});
+    });
+
+    it("acknowledges notifications/initialized without a provider call", async () => {
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}',
+      );
+      expect(result.statusCode).toBe(202);
+      expect(mockHttpRequest).not.toHaveBeenCalled();
+    });
+  });
+
   describe("tools/list", () => {
     it("returns diagnostic tools when sidecar is not configured", async () => {
       const result = await callMcp(
@@ -2280,6 +2355,79 @@ describe("handleMcpRequest", () => {
 
       expect(result.statusCode).toBe(200);
       expect(mockHttpRequest).not.toHaveBeenCalled();
+    });
+
+    it("degrades a kg_* tools/call with the existing 503 wording when no provider is configured, rather than failing the whole request", async () => {
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 10, method: "tools/call", params: { name: "kg_hybrid_search", arguments: { query: "test" } } }),
+        "sidecar: KG_SIDECAR_URL unset",
+      );
+
+      expect(result.statusCode).toBe(503);
+      expect(JSON.parse(result.body).error).toBe("no memory provider is configured (sidecar: KG_SIDECAR_URL unset)");
+      expect(mockHttpRequest).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("full handshake sequence without a memory provider", () => {
+    it("connects, lists orchestrator tools, and only degrades the kg_* call", async () => {
+      const init = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}',
+      );
+      expect(init.statusCode).toBe(200);
+
+      const notified = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}',
+      );
+      expect(notified.statusCode).toBe(202);
+
+      const list = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}',
+      );
+      expect(list.statusCode).toBe(200);
+      const names = JSON.parse(list.body).result.tools.map((t: { name: string }) => t.name);
+      expect(names).toContain("get_runner_mode");
+      expect(names.some((n: string) => n.startsWith("kg_"))).toBe(false);
+
+      const diagCall = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_runner_mode","arguments":{}}}',
+      );
+      expect(diagCall.statusCode).toBe(200);
+
+      const kgCall = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"kg_search","arguments":{}}}',
+      );
+      expect(kgCall.statusCode).toBe(503);
     });
   });
 

@@ -368,6 +368,57 @@ describe("resolveRunnerInputs", () => {
     });
   });
 
+  describe("(h) assigneeName preference", () => {
+    it("prefers envelope assigneeName over AI_IMPLEMENT_ASSIGNEE_NAME env var", () => {
+      const env = {
+        AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig({
+          v: 1,
+          issue: { id: "e", identifier: "AII-9", title: "t", description: "d" },
+          assigneeName: "Paz",
+        }),
+        AI_IMPLEMENT_ASSIGNEE_NAME: "Someone Else",
+        ...BASE_ENV,
+      };
+      const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
+      expect(inputs.assigneeName).toBe("Paz");
+    });
+
+    it("falls back to AI_IMPLEMENT_ASSIGNEE_NAME when envelope omits assigneeName", () => {
+      const env = {
+        AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig({
+          v: 1,
+          issue: { id: "e", identifier: "AII-9", title: "t", description: "d" },
+        }),
+        AI_IMPLEMENT_ASSIGNEE_NAME: "Paz",
+        ...BASE_ENV,
+      };
+      const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
+      expect(inputs.assigneeName).toBe("Paz");
+    });
+
+    it("is undefined when neither envelope nor env var supply it", () => {
+      const env = {
+        AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig({
+          v: 1,
+          issue: { id: "e", identifier: "AII-9", title: "t", description: "d" },
+        }),
+        ...BASE_ENV,
+      };
+      const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
+      expect(inputs.assigneeName).toBeUndefined();
+    });
+
+    it("parses AI_IMPLEMENT_ASSIGNEE_NAME in legacy-env mode", () => {
+      const env = {
+        ISSUE_ID: "i", ISSUE_IDENTIFIER: "AII-1", ISSUE_TITLE: "t", ISSUE_DESCRIPTION: "d",
+        AI_IMPLEMENT_ASSIGNEE_NAME: " Paz ",
+        ...BASE_ENV,
+      };
+      const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
+      expect(inputs.assigneeName).toBe("Paz");
+    });
+  });
+
   describe("(i) retryPolicy", () => {
     it("uses the envelope's retryPolicy when present", () => {
       const env = {

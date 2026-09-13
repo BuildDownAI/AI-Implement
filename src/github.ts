@@ -197,6 +197,19 @@ export function profilesRunnerEnv(issue: { profiles?: string[] }): Record<string
     : {};
 }
 
+/**
+ * Assignee-name env var for the runner process (Fly/local execution modes),
+ * where the value arrives via container env rather than a workflow input.
+ * Envelope-only otherwise: `assignee` has never existed as a workflow_dispatch
+ * input in any synced version of claude-implement.yml (unlike `profiles`, which
+ * predates the envelope), so there is no legacy-contract dispatch field for it —
+ * adding one would 422 every legacy-contract dispatch for an assigned ticket,
+ * which is the common case.
+ */
+export function assigneeRunnerEnv(issue: { assigneeName?: string }): Record<string, string> {
+  return issue.assigneeName ? { AI_IMPLEMENT_ASSIGNEE_NAME: issue.assigneeName } : {};
+}
+
 export interface EnvelopeDispatchOpts {
   runnerPhase: "implementation" | "gap-analysis" | "planning" | "kg-refresh";
   baseBranch?: string;
@@ -233,7 +246,7 @@ export interface EnvelopeDispatchOpts {
  */
 export function buildEnvelopeDispatchInputs(
   mapping: RepoMapping,
-  issue: { id: string; identifier: string; title: string; description?: string | null; profiles?: string[] },
+  issue: { id: string; identifier: string; title: string; description?: string | null; profiles?: string[]; assigneeName?: string },
   opts: EnvelopeDispatchOpts,
 ): DispatchInputs {
   const runConfig: RunConfigV1 = {
@@ -259,6 +272,7 @@ export function buildEnvelopeDispatchInputs(
     ...(mapping.dependencyTokenScope != null && opts.runnerPhase !== "planning" ? { dependencyTokenScope: mapping.dependencyTokenScope } : {}),
     ...(mapping.referenceRepos != null && opts.runnerPhase !== "planning" && opts.runnerPhase !== "kg-refresh" ? { referenceRepos: mapping.referenceRepos } : {}),
     ...(issue.profiles && issue.profiles.length > 0 ? { profiles: issue.profiles } : {}),
+    ...(issue.assigneeName ? { assigneeName: issue.assigneeName } : {}),
     ...(opts.planningContext ? { planningContext: opts.planningContext } : {}),
     ...(opts.groupingParent ? { groupingParent: true } : {}),
     ...(opts.runnerPhase !== "planning" && opts.runnerPhase !== "kg-refresh"
@@ -725,14 +739,15 @@ export async function getPullRequestState(
   owner: string,
   repo: string,
   prNumber: number,
-): Promise<{ merged: boolean; state: "open" | "closed" } | null> {
+): Promise<{ merged: boolean; state: "open" | "closed"; headRef: string | null } | null> {
   const url = `https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}`;
   const res = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
   if (!res.ok) return null;
-  const data = (await res.json()) as { merged?: boolean; state?: string };
+  const data = (await res.json()) as { merged?: boolean; state?: string; head?: { ref?: string } };
   return {
     merged: data.merged === true,
     state: data.state === "open" ? "open" : "closed",
+    headRef: typeof data.head?.ref === "string" ? data.head.ref : null,
   };
 }
 
@@ -804,7 +819,7 @@ export async function findPullRequestByBranches(
   repo: string,
   head: string,
   base: string,
-): Promise<{ number: number; url: string; state: "open" | "closed"; merged: boolean } | null> {
+): Promise<{ number: number; url: string; state: "open" | "closed"; merged: boolean; headSha: string } | null> {
   const url =
     `https://api.github.com/repos/${owner}/${repo}/pulls` +
     `?head=${encodeURIComponent(`${owner}:${head}`)}&base=${encodeURIComponent(base)}` +
@@ -817,6 +832,7 @@ export async function findPullRequestByBranches(
     state: string;
     merged_at: string | null;
     updated_at: string;
+    head: { sha: string };
   }>;
   if (prs.length === 0) return null;
   const pr =
@@ -828,6 +844,7 @@ export async function findPullRequestByBranches(
     url: pr.html_url,
     state: pr.state === "open" ? "open" : "closed",
     merged: pr.merged_at !== null,
+    headSha: pr.head.sha,
   };
 }
 

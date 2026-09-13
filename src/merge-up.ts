@@ -3,7 +3,7 @@ import type { FeatureNodeRollUp } from "./providers/types.js";
 import { getDb } from "./dedup.js";
 import { getInstallationToken } from "./github-app-auth.js";
 import { buildGroupingBranchName } from "./pipeline/branch-name.js";
-import { compareBranches, createPullRequest, deleteBranch, findPullRequestByBranches, mergeBranch } from "./github.js";
+import { compareBranches, createPullRequest, deleteBranch, findPullRequestByBranches, getBranchSha, mergeBranch } from "./github.js";
 
 /**
  * Feature-branch roll-up (the merge-up half of feature-branch grouping).
@@ -144,18 +144,38 @@ async function rollUpOne(rollUp: FeatureNodeRollUp, deps: MergeUpDeps): Promise<
   // Check PR state first — robust to squash/rebase merge where git
   // ancestry alone falsely shows the feature branch as "ahead" of base.
   const pr = await findPullRequestByBranches(ghToken, owner, repo, branch, target);
+  let ahead: number | null = null;
+  let mergedRollUpNumber: number | null = null;
+
   if (pr?.merged) {
-    await deleteBranch(ghToken, owner, repo, branch);
+    // A merged PR alone doesn't mean the branch is safe to delete: late commits can land
+    // on it after the roll-up merged (AII-642). SHA equality against the PR's recorded head
+    // is the strategy-agnostic check — it holds regardless of merge method. `ahead === 0` is
+    // kept only as a secondary signal (a real merge-commit strategy, or a since-deleted
+    // branch) — NOT as the primary squash/rebase safety net, since git ancestry alone can
+    // falsely report a squash/rebase-merged branch as still "ahead" of base (the bug AII-188
+    // fixed for the no-PR-yet path applies here too).
+    const tip = await getBranchSha(ghToken, owner, repo, branch);
+    const tipMatchesHead = tip !== null && tip === pr.headSha;
+    ahead = tipMatchesHead ? 0 : await compareBranches(ghToken, owner, repo, target, branch);
+    if (tipMatchesHead || ahead === null || ahead === 0) {
+      await deleteBranch(ghToken, owner, repo, branch);
+      await deps.finalizeMerged(rollUp.issueId, rollUp.scopeKey);
+      markRollUpHandled(owner, repo, branch);
+      console.log(`[merge-up] ${branch} merged; deleted branch + finalized ${rollUp.identifier}`);
+      return;
+    }
+    // Branch has commits beyond this merged roll-up — keep it. The roll-up that already
+    // merged did complete, so finalize it (idempotent), but do not mark the roll-up handled:
+    // that would permanently blind future polls to the still-outstanding commits (AII-286).
     await deps.finalizeMerged(rollUp.issueId, rollUp.scopeKey);
-    markRollUpHandled(owner, repo, branch);
-    console.log(`[merge-up] ${branch} merged; deleted branch + finalized ${rollUp.identifier}`);
-    return;
-  }
-  if (pr?.state === "open") return; // awaiting human merge
-  // A human may have closed the PR without merging (a deliberate veto). Respect that
-  // decision — do not re-open on every poll cycle while the branch stays ahead. The veto
-  // is permanent, so log it once per process, not once per poll forever.
-  if (pr && pr.state === "closed" && !pr.merged) {
+    mergedRollUpNumber = pr.number;
+  } else if (pr?.state === "open") {
+    return; // awaiting human merge
+  } else if (pr && pr.state === "closed" && !pr.merged) {
+    // A human may have closed the PR without merging (a deliberate veto). Respect that
+    // decision — do not re-open on every poll cycle while the branch stays ahead. The veto
+    // is permanent, so log it once per process, not once per poll forever.
     const vetoKey = `${rollUp.identifier}#${pr.number}`;
     if (!closedVetoLogged.has(vetoKey)) {
       closedVetoLogged.add(vetoKey);
@@ -164,10 +184,11 @@ async function rollUpOne(rollUp: FeatureNodeRollUp, deps: MergeUpDeps): Promise<
       );
     }
     return;
+  } else {
+    // No PR yet — open one if the branch has commits not yet in the base.
+    ahead = await compareBranches(ghToken, owner, repo, target, branch);
   }
 
-  // No PR yet — open one if the branch has commits not yet in the base.
-  const ahead = await compareBranches(ghToken, owner, repo, target, branch);
   if (ahead === null || ahead === 0) return; // branch missing or fully merged by ancestry
   const grouped = rollUp.childIdentifiers.length
     ? `\n\nGrouped issues: ${rollUp.childIdentifiers.join(", ")}`
@@ -181,5 +202,10 @@ async function rollUpOne(rollUp: FeatureNodeRollUp, deps: MergeUpDeps): Promise<
       "to merge into the base branch. Opened for human review." +
       grouped,
   });
+  if (mergedRollUpNumber !== null) {
+    console.log(
+      `[merge-up] ${branch} is ${ahead} commits ahead of its merged roll-up #${mergedRollUpNumber}; opened a new roll-up instead of deleting`,
+    );
+  }
   console.log(`[merge-up] Opened feature→base PR ${newPr.url} for ${rollUp.identifier} (awaiting human merge)`);
 }

@@ -64,9 +64,9 @@ export async function postRunnerResult(params: {
   snapshotPr?: number | null;
   /** The `kg-refresh/<stamp>` branch the snapshot was pushed to; the orchestrator deletes it after merge or close. */
   snapshotBranch?: string | null;
-  /** Guard verdict from kg-snapshot-push, present only for a kg-refresh dry-run (AII-632). */
+  /** Guard verdict from kg-snapshot-push, present for a kg-refresh dry-run (AII-632) or a real `KG_SNAPSHOT_TRACKER_REGRESSION` refusal (AII-638). */
   guardVerdict?: "clean" | "refused";
-  /** Per-part {part, prev, new} table from kg-snapshot-push, present only for a kg-refresh dry-run (AII-632). */
+  /** Per-part {part, prev, new} table from kg-snapshot-push, present for a kg-refresh dry-run (AII-632) or a real `KG_SNAPSHOT_TRACKER_REGRESSION` refusal (AII-638). */
   partTable?: Array<{ part: string; prev: string; new: string }>;
   /**
    * Resolved callback URL, e.g. from resolveRunnerInputs()/the envelope's runnerCallbackUrl.
