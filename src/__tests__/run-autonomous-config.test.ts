@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { encodeRunConfig } from "../run-config.js";
 import { resolveRunnerInputs } from "../run-autonomous.js";
+import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
 
 const BASE_ENV = {
   GITHUB_OWNER: "o",
@@ -415,6 +416,69 @@ describe("resolveRunnerInputs", () => {
       };
       const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
       expect(inputs.assigneeName).toBe("Paz");
+    });
+  });
+
+  describe("(i) retryPolicy", () => {
+    it("uses the envelope's retryPolicy when present", () => {
+      const env = {
+        AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig({
+          v: 1,
+          issue: { id: "e", identifier: "AII-9", title: "t", description: "d" },
+          retryPolicy: { ...DEFAULT_RETRY_POLICY, reviewMaxTurns: 60 },
+        }),
+        ...BASE_ENV,
+      };
+      const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
+      expect(inputs.retryPolicy).toEqual({ ...DEFAULT_RETRY_POLICY, reviewMaxTurns: 60 });
+    });
+
+    it("falls back to DEFAULT_RETRY_POLICY when the envelope omits it", () => {
+      const env = {
+        AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig({
+          v: 1,
+          issue: { id: "e", identifier: "AII-9", title: "t", description: "d" },
+        }),
+        ...BASE_ENV,
+      };
+      const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
+      expect(inputs.retryPolicy).toEqual(DEFAULT_RETRY_POLICY);
+    });
+
+    it("falls back to DEFAULT_RETRY_POLICY in legacy-env mode", () => {
+      const env = {
+        ISSUE_ID: "i", ISSUE_IDENTIFIER: "AII-1", ISSUE_TITLE: "t", ISSUE_DESCRIPTION: "d",
+        ...BASE_ENV,
+      };
+      const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
+      expect(inputs.retryPolicy).toEqual(DEFAULT_RETRY_POLICY);
+    });
+
+    it("normalizes an unvalidated envelope retryPolicy — defaults an invalid field and drops an unknown one", () => {
+      const env = {
+        AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig({
+          v: 1,
+          issue: { id: "e", identifier: "AII-9", title: "t", description: "d" },
+          retryPolicy: { reviewMaxTurns: "abc", junk: 1 } as never,
+        }),
+        ...BASE_ENV,
+      };
+      const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
+      expect(inputs.retryPolicy).toEqual(DEFAULT_RETRY_POLICY);
+    });
+
+    it("normalizes a partially valid envelope retryPolicy field-by-field rather than resetting the whole policy", () => {
+      const env = {
+        AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig({
+          v: 1,
+          issue: { id: "e", identifier: "AII-9", title: "t", description: "d" },
+          retryPolicy: { ...DEFAULT_RETRY_POLICY, requestRetries: 999, stageRetries: 4 },
+        }),
+        ...BASE_ENV,
+      };
+      const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
+      expect(inputs.retryPolicy.requestRetries).toBe(DEFAULT_RETRY_POLICY.requestRetries);
+      expect(inputs.retryPolicy.stageRetries).toBe(4);
     });
   });
 });

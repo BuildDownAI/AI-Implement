@@ -4,6 +4,7 @@ import type { TicketingProvider } from "./providers/types.js";
 import { mintRunToken, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
 import { buildEnvelopeDispatchInputs, dispatchWorkflow, providerDispatchFields } from "./github.js";
 import { resolveWorkflowCapabilities } from "./workflow-probe.js";
+import { getRetryPolicy } from "./orchestrator-settings.js";
 
 export interface GapFillTriggerBody {
   issueKey?: unknown;
@@ -179,6 +180,7 @@ export async function handleGapFillTrigger(
         runToken,
         runProgressToken,
         runPublicationToken,
+        retryPolicy: getRetryPolicy(),
       })
     : {
         issue_id: owningIssueId,

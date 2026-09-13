@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import type { PipelineContext, StepModule, StepReporter, RunTelemetry } from "../types.js";
 import { formatLlmResultDetail } from "../step-utils.js";
+import { classifyLlmResult, type FailureRecord } from "../failure-classification.js";
 import { describeReferenceRepoCause, type ReferenceRepoResult } from "../../reference-repos.js";
 
 interface ImplementInputs extends Record<string, unknown> {
@@ -78,7 +79,16 @@ export const implementStep: StepModule<ImplementInputs, ImplementOutputs> = {
     // failure: the feedback loop needs the partial work + telemetry to run its
     // post-mortem and open a draft PR, so don't discard it by throwing.
     if (result.exitCode !== 0 && result.telemetry?.outcome !== "max_turns") {
-      throw new Error(`LLM invocation failed with exit code ${result.exitCode}${formatLlmResultDetail(result)}`);
+      const err = new Error(
+        `LLM invocation failed with exit code ${result.exitCode}${formatLlmResultDetail(result)}`,
+      ) as Error & { failure?: FailureRecord };
+      err.failure = classifyLlmResult(result, {
+        stage: "implement",
+        attempt: 1,
+        expectsStructuredOutput: false,
+        elapsedMs: result.telemetry?.durationMs ?? undefined,
+      });
+      throw err;
     }
 
     return {

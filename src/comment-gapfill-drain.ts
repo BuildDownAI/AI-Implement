@@ -6,6 +6,7 @@ import { resolveExecutionPath, getFlySecretsMinVersion, getFlyProcessLevelSecret
 import { mintRunToken, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
 import { buildEnvelopeDispatchInputs, providerDispatchFields, capDispatchFields, skillsRepoDispatchFields, capRunnerEnv, branchPrefixRunnerEnv, skillsRepoRunnerEnv, getPullRequestState } from "./github.js";
 import { encodeRunConfig, type RunConfigV1 } from "./run-config.js";
+import { getRetryPolicy } from "./orchestrator-settings.js";
 import { createMachine, listAppSecrets, generateSessionToken, generateMachineNonce, buildSessionMachineConfig } from "./fly-machines.js";
 import { resolveSessionImage } from "./repo-image.js";
 import type { WorkflowCapabilities, WorkflowContract } from "./workflow-probe.js";
@@ -237,6 +238,7 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
             ? { sensitiveFiles: { add: mapping.sensitiveAddPatterns ?? undefined, allow: mapping.sensitiveAllowPatterns ?? undefined } }
             : {}),
           ...(item.instruction ? { commentInstruction: item.instruction } : {}),
+          retryPolicy: getRetryPolicy(),
         };
 
         const machineConfig = buildSessionMachineConfig({
@@ -341,6 +343,7 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
               runProgressToken,
               runPublicationToken,
               runnerImage,
+              retryPolicy: getRetryPolicy(),
             })
           : {
               issue_id: prLog.issueId,

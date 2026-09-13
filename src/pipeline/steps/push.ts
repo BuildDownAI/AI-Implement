@@ -5,6 +5,7 @@ import { span } from "../timing.js";
 import { findSensitiveFiles, SensitiveFilesError } from "../sensitive-files.js";
 import { refreshRunnerGithubCredentials } from "../../runner-token.js";
 import { getPublicationCredential } from "../../publication-credential.js";
+import { classifyGitFailure, type FailureRecord } from "../failure-classification.js";
 
 const LS_REMOTE_MAX_ATTEMPTS = 3;
 const LS_REMOTE_RETRY_DELAYS_MS = [250, 1000];
@@ -239,7 +240,11 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
     }
     if (pushResult.status !== 0) {
       const stderr = (pushResult.stderr?.toString() ?? "").replaceAll(activeGithubToken, "***");
-      throw new Error(`git push failed (exit ${pushResult.status ?? "null"}): ${stderr}`);
+      const err = new Error(`git push failed (exit ${pushResult.status ?? "null"}): ${stderr}`) as Error & {
+        failure?: FailureRecord;
+      };
+      err.failure = classifyGitFailure(stderr, pushResult.status ?? null, { stage: "push", attempt: 1 });
+      throw err;
     }
 
     if (existingPrNumber) {

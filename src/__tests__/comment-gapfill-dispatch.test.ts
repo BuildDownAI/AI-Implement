@@ -30,7 +30,17 @@ beforeEach(async () => {
   log.initLogTable();
 });
 
-afterEach(() => {
+afterEach(async () => {
+  // A test that calls setRetryPolicy() writes to the shared `settings` row; reset
+  // it explicitly rather than relying on dbPath rotation to isolate it. Most tests
+  // in this file never initialize the settings table, so a missing-table error
+  // here is expected and not a cleanup failure.
+  const { setRetryPolicy } = await import("../orchestrator-settings.js");
+  try {
+    setRetryPolicy(null);
+  } catch {
+    /* settings table not initialized in this test */
+  }
   dedup.closeDb();
   try {
     fs.unlinkSync(dbPath);
@@ -489,6 +499,37 @@ describe("drainCommentGapfillQueue", () => {
     const decoded = decodeRunConfig(inputs.run_config);
     expect(decoded.maxTurns).toBe(20);
     expect(decoded.maxIterations).toBe(2);
+  });
+
+  it("carries the effective retry policy into run_config on the /ai-implement gap-fill drain (BAC-27113)", async () => {
+    const { decodeRunConfig } = await import("../run-config.js");
+    const { setRetryPolicy } = await import("../orchestrator-settings.js");
+    const { initSettingsTable } = await import("../runner-mode.js");
+    initSettingsTable();
+    setRetryPolicy({ reviewMaxTurns: 77 });
+
+    const mapping = makeMapping({ owner: "acme", repo: "billing" });
+
+    queue.enqueueCommentGapfill({
+      owner: "acme",
+      repo: "billing",
+      prNumber: 42,
+      commentId: 9001,
+      commenter: "priya",
+      instruction: "",
+    });
+    seedDispatchLog("issue-9", "AII-107", "Retry policy test", "acme", "billing", 42);
+
+    const dispatchSpy = vi.fn(async () => ({ success: true, status: 204 }));
+
+    await drain.drainCommentGapfillQueue(makeBaseDrainOpts({
+      getMappings: () => ({ TEAM: mapping }),
+      dispatch: dispatchSpy,
+    }));
+
+    const [, , inputs] = dispatchSpy.mock.calls[0];
+    const decoded = decodeRunConfig(inputs.run_config);
+    expect(decoded.retryPolicy?.reviewMaxTurns).toBe(77);
   });
 });
 

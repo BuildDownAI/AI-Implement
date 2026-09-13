@@ -57,7 +57,14 @@ import type { TicketIssue, AIImplementSnapshot } from "./providers/types.js";
 import type { ProviderRegistry } from "./providers/registry.js";
 import { resolveInFlightSiblings, selectBlockers, selectFileOverlapDeferrals, getOrFetchPlanningContexts } from "./poll-selection.js";
 import { adminHtml } from "./admin-html.js";
-import { getOrchestratorSettings, setOrchestratorSetting } from "./orchestrator-settings.js";
+import {
+  getOrchestratorSettings,
+  setOrchestratorSetting,
+  getRetryPolicy,
+  setRetryPolicy,
+  DEFAULT_RETRY_POLICY,
+  type RetryPolicy,
+} from "./orchestrator-settings.js";
 import { getInstallationToken, mintSourceTokenOrJwt, getScopedInstallationToken } from "./github-app-auth.js";
 import { GitHubApiError } from "./github-errors.js";
 import { listRepoBranchesAndTags, getRepoDefaultBranch, cancelWorkflowRun, fetchRepoTarball } from "./github.js";
@@ -1744,6 +1751,8 @@ function handleGetSettings(
     kgBaseRepo: {
       value: dbSettings.kgBaseRepo,
     },
+    retryPolicy: getRetryPolicy(),
+    retryPolicyDefaults: DEFAULT_RETRY_POLICY,
   });
 }
 
@@ -1752,7 +1761,13 @@ async function handlePostSettings(
   res: http.ServerResponse,
   config: AdminConfig,
 ): Promise<void> {
-  let body: { flySessionsApp?: string | null; flySessionsRegion?: string | null; kgRefreshReportIssue?: string | null; kgBaseRepo?: string | null };
+  let body: {
+    flySessionsApp?: string | null;
+    flySessionsRegion?: string | null;
+    kgRefreshReportIssue?: string | null;
+    kgBaseRepo?: string | null;
+    retryPolicy?: Partial<RetryPolicy> | null;
+  };
   try {
     const parsed = JSON.parse(await readBody(req));
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
@@ -1763,6 +1778,19 @@ async function handlePostSettings(
   } catch {
     json(res, 400, { error: "Invalid request body" });
     return;
+  }
+
+  if ("retryPolicy" in body) {
+    if (body.retryPolicy !== null && (typeof body.retryPolicy !== "object" || Array.isArray(body.retryPolicy))) {
+      json(res, 400, { error: "retryPolicy must be an object or null" });
+      return;
+    }
+    try {
+      setRetryPolicy(body.retryPolicy ?? null);
+    } catch (err) {
+      json(res, 400, { error: err instanceof Error ? err.message : String(err) });
+      return;
+    }
   }
 
   if ("flySessionsApp" in body) {
@@ -1817,6 +1845,8 @@ async function handlePostSettings(
     kgBaseRepo: {
       value: dbSettings.kgBaseRepo,
     },
+    retryPolicy: getRetryPolicy(),
+    retryPolicyDefaults: DEFAULT_RETRY_POLICY,
     restartRequired,
   });
 }

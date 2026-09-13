@@ -1,4 +1,6 @@
 import type { ReferenceRepo } from "./reference-repos.js";
+import type { RetryPolicy } from "./pipeline/retry-backoff.js";
+import type { RepoMapping } from "./config.js";
 
 /**
  * Versioned orchestrator→runner config envelope. Travels as ONE
@@ -42,6 +44,8 @@ export interface RunConfigV1 {
   dependencyTokenScope?: "installation";
   /** Reference repositories cloned read-only into the workspace. Absent on planning and kg-refresh dispatches. */
   referenceRepos?: ReferenceRepo[];
+  /** Global retry/backoff policy and reviewer turn cap. Absent = runner uses DEFAULT_RETRY_POLICY. */
+  retryPolicy?: RetryPolicy;
 }
 
 const MAX_DESCRIPTION_CHARS = 40_000;
@@ -105,11 +109,52 @@ export function runConfigFromTaskDocument(params: TaskDocumentParams, issueId: s
   return config;
 }
 
+export interface ImplRunConfigInput {
+  issue: { id: string; identifier: string; title: string; description?: string | null };
+  mapping: RepoMapping;
+  baseBranch: string;
+  runnerCallbackUrl?: string;
+  groupingParent?: boolean;
+  retryPolicy: RetryPolicy;
+}
+
+/**
+ * Builds the RunConfigV1 envelope for a Fly Machines or local Docker implementation
+ * dispatch (mirroring buildEnvelopeDispatchInputs in github.ts for the GHA path) so
+ * the envelope's shape is unit-testable without mocking the Fly API / Docker CLI
+ * calls that surround it at the call site. Shared by both backends since the shape
+ * is otherwise identical between them.
+ */
+export function buildImplRunConfig(input: ImplRunConfigInput): RunConfigV1 {
+  const { issue, mapping, baseBranch, runnerCallbackUrl, groupingParent, retryPolicy } = input;
+  return {
+    v: 1,
+    issue: {
+      id: issue.id,
+      identifier: issue.identifier,
+      title: issue.title,
+      description: issue.description || issue.title,
+    },
+    runnerPhase: "implementation",
+    ...(baseBranch !== mapping.defaultBranch ? { baseBranch } : {}),
+    ...(mapping.branchPrefix ? { branchPrefix: mapping.branchPrefix } : {}),
+    ...(mapping.skillsRepo ? { skillsRepo: mapping.skillsRepo } : {}),
+    ...(mapping.referenceRepos != null ? { referenceRepos: mapping.referenceRepos } : {}),
+    ...(runnerCallbackUrl ? { runnerCallbackUrl } : {}),
+    ...(mapping.maxTurns != null ? { maxTurns: mapping.maxTurns } : {}),
+    ...(mapping.maxIterations != null ? { maxIterations: mapping.maxIterations } : {}),
+    ...(groupingParent ? { groupingParent: true } : {}),
+    ...(mapping.dependencyTokenScope != null ? { dependencyTokenScope: mapping.dependencyTokenScope } : {}),
+    retryPolicy,
+  };
+}
+
 function pickKnownKeys(cfg: RunConfigV1): RunConfigV1 {
   const { v, issue, prNumber, baseBranch, runnerPhase, branchPrefix, skillsRepo,
     runnerCallbackUrl, maxTurns, maxIterations, commentInstruction, sensitiveFiles,
     profiles, assigneeName, planningContext, groupingParent, dependencyTokenScope, kgSourceRepo,
-    kgDryRun, kgSourceRef, kgAcceptNewBaseline, kgBaselineActor, referenceRepos } = cfg;
+    kgDryRun, kgSourceRef, kgAcceptNewBaseline, kgBaselineActor, referenceRepos,
+    retryPolicy } = cfg;
   const out: RunConfigV1 = { v, issue };
   if (prNumber !== undefined) out.prNumber = prNumber;
   if (baseBranch !== undefined) out.baseBranch = baseBranch;
@@ -132,5 +177,6 @@ function pickKnownKeys(cfg: RunConfigV1): RunConfigV1 {
   if (kgAcceptNewBaseline !== undefined) out.kgAcceptNewBaseline = kgAcceptNewBaseline;
   if (kgBaselineActor !== undefined) out.kgBaselineActor = kgBaselineActor;
   if (referenceRepos !== undefined) out.referenceRepos = referenceRepos;
+  if (retryPolicy !== undefined) out.retryPolicy = retryPolicy;
   return out;
 }

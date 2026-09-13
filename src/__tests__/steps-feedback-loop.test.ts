@@ -246,6 +246,46 @@ describe("feedbackLoopStep", () => {
     expect(failedStep?.type).toBe("implement");
   });
 
+  it("re-stamps the iteration-qualified stage on an already-classified implement failure", async () => {
+    // implementStep (the real module, not this mock) attaches err.failure with
+    // stage "implement". Passed through feedback-loop's classifyThrown as-is,
+    // that stage would never become the iteration-qualified
+    // "feedback-loop/implement-1" — this asserts the sub-step output and the
+    // rethrown error both carry the qualified stage instead.
+    const err = Object.assign(new Error("LLM invocation failed with exit code 1"), {
+      failure: {
+        category: "crash" as const,
+        code: "PROCESS_EXIT_NONZERO",
+        stage: "implement",
+        attempt: 1,
+        retryable: false,
+        message: "boom",
+        evidence: { truncated: false },
+      },
+    });
+    vi.mocked(implementStep.run).mockRejectedValueOnce(err);
+
+    const reportedSteps: Step[] = [];
+    const reporter: StepReporter = {
+      report: vi.fn(async (step) => {
+        reportedSteps.push({ ...step });
+      }),
+    };
+
+    const thrown = await feedbackLoopStep
+      .run(makeContext(), BASE_INPUTS, reporter)
+      .catch((e: unknown) => e);
+
+    const failedStep = reportedSteps.find((s) => s.status === "failed" && s.type === "implement");
+    expect(failedStep).toBeDefined();
+    expect((failedStep?.outputs as { failure?: { stage?: string } }).failure?.stage).toBe(
+      "feedback-loop/implement-1",
+    );
+    expect((thrown as Error & { failure?: { stage?: string } }).failure?.stage).toBe(
+      "feedback-loop/implement-1",
+    );
+  });
+
   it("does not throw when the review step fails, so the pipeline can still push", async () => {
     vi.mocked(reviewStep.run).mockRejectedValueOnce(new Error("Prompt is too long"));
 

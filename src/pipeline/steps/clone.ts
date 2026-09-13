@@ -4,6 +4,7 @@ import path from "node:path";
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
 import { prepareScratchExclusion } from "../scratch-exclude.js";
 import { refreshRunnerGithubCredentials } from "../../runner-token.js";
+import { classifyGitFailure, type FailureRecord } from "../failure-classification.js";
 
 interface CloneInputs extends Record<string, unknown> {
   repoOwner: string;
@@ -202,7 +203,11 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
             );
             if (unshallowResult.status !== 0) {
               const stderr = unshallowResult.stderr?.toString() ?? "";
-              throw new Error(`git fetch --unshallow failed (exit ${unshallowResult.status ?? "null"}): ${stderr}`);
+              throw attachGitFailure(
+                new Error(`git fetch --unshallow failed (exit ${unshallowResult.status ?? "null"}): ${stderr}`),
+                stderr,
+                unshallowResult.status ?? null,
+              );
             }
           }
           const fetchResult = spawnSync(
@@ -212,7 +217,11 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
           );
           if (fetchResult.status !== 0) {
             const stderr = fetchResult.stderr?.toString() ?? "";
-            throw new Error(`git fetch failed (exit ${fetchResult.status ?? "null"}): ${stderr}`);
+            throw attachGitFailure(
+              new Error(`git fetch failed (exit ${fetchResult.status ?? "null"}): ${stderr}`),
+              stderr,
+              fetchResult.status ?? null,
+            );
           }
         } else {
           const depthVal = depth !== undefined ? String(depth) : "1";
@@ -223,7 +232,11 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
           );
           if (fetchResult.status !== 0) {
             const stderr = fetchResult.stderr?.toString() ?? "";
-            throw new Error(`git fetch failed (exit ${fetchResult.status ?? "null"}): ${stderr}`);
+            throw attachGitFailure(
+              new Error(`git fetch failed (exit ${fetchResult.status ?? "null"}): ${stderr}`),
+              stderr,
+              fetchResult.status ?? null,
+            );
           }
         }
 
@@ -236,7 +249,11 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
         );
         if (resetResult.status !== 0) {
           const stderr = resetResult.stderr?.toString() ?? "";
-          throw new Error(`git reset failed (exit ${resetResult.status ?? "null"}): ${stderr}`);
+          throw attachGitFailure(
+            new Error(`git reset failed (exit ${resetResult.status ?? "null"}): ${stderr}`),
+            stderr,
+            resetResult.status ?? null,
+          );
         }
         cloneMethod = "incremental";
       } else {
@@ -249,7 +266,11 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
         );
         if (cloneResult.status !== 0) {
           const stderr = cloneResult.stderr?.toString() ?? "";
-          throw new Error(`git clone failed (exit ${cloneResult.status ?? "null"}): ${stderr}`);
+          throw attachGitFailure(
+            new Error(`git clone failed (exit ${cloneResult.status ?? "null"}): ${stderr}`),
+            stderr,
+            cloneResult.status ?? null,
+          );
         }
         cloneMethod = "fresh";
       }
@@ -260,7 +281,11 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
       });
       if (revResult.status !== 0) {
         const stderr = revResult.stderr?.toString() ?? "";
-        throw new Error(`git rev-parse HEAD failed (exit ${revResult.status ?? "null"}): ${stderr}`);
+        throw attachGitFailure(
+          new Error(`git rev-parse HEAD failed (exit ${revResult.status ?? "null"}): ${stderr}`),
+          stderr,
+          revResult.status ?? null,
+        );
       }
       const clonedRef = revResult.stdout.toString().trim();
 
@@ -301,7 +326,11 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
           );
           if (unshallowResult.status !== 0) {
             const stderr = (unshallowResult.stderr?.toString() ?? "").replace(githubToken, "***");
-            throw new Error(`git fetch --unshallow failed (exit ${unshallowResult.status ?? "null"}): ${stderr}`);
+            throw attachGitFailure(
+              new Error(`git fetch --unshallow failed (exit ${unshallowResult.status ?? "null"}): ${stderr}`),
+              stderr,
+              unshallowResult.status ?? null,
+            );
           }
         }
         const fetchResult = spawnSync(
@@ -311,7 +340,11 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
         );
         if (fetchResult.status !== 0) {
           const stderr = (fetchResult.stderr?.toString() ?? "").replace(githubToken, "***");
-          throw new Error(`git fetch failed (exit ${fetchResult.status ?? "null"}): ${stderr}`);
+          throw attachGitFailure(
+            new Error(`git fetch failed (exit ${fetchResult.status ?? "null"}): ${stderr}`),
+            stderr,
+            fetchResult.status ?? null,
+          );
         }
       } else {
         const fetchResult = spawnSync(
@@ -321,7 +354,11 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
         );
         if (fetchResult.status !== 0) {
           const stderr = (fetchResult.stderr?.toString() ?? "").replace(githubToken, "***");
-          throw new Error(`git fetch failed (exit ${fetchResult.status ?? "null"}): ${stderr}`);
+          throw attachGitFailure(
+            new Error(`git fetch failed (exit ${fetchResult.status ?? "null"}): ${stderr}`),
+            stderr,
+            fetchResult.status ?? null,
+          );
         }
       }
 
@@ -332,7 +369,11 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
       );
       if (resetResult.status !== 0) {
         const stderr = resetResult.stderr?.toString() ?? "";
-        throw new Error(`git reset failed (exit ${resetResult.status ?? "null"}): ${stderr}`);
+        throw attachGitFailure(
+          new Error(`git reset failed (exit ${resetResult.status ?? "null"}): ${stderr}`),
+          stderr,
+          resetResult.status ?? null,
+        );
       }
 
       cloneMethod = "incremental";
@@ -346,7 +387,11 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
       );
       if (cloneResult.status !== 0) {
         const stderr = (cloneResult.stderr?.toString() ?? "").replace(githubToken, "***");
-        throw new Error(`git clone failed (exit ${cloneResult.status ?? "null"}): ${stderr}`);
+        throw attachGitFailure(
+          new Error(`git clone failed (exit ${cloneResult.status ?? "null"}): ${stderr}`),
+          stderr,
+          cloneResult.status ?? null,
+        );
       }
 
       cloneMethod = "fresh";
@@ -416,7 +461,11 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
     });
     if (revResult.status !== 0) {
       const stderr = revResult.stderr?.toString() ?? "";
-      throw new Error(`git rev-parse HEAD failed (exit ${revResult.status ?? "null"}): ${stderr}`);
+      throw attachGitFailure(
+        new Error(`git rev-parse HEAD failed (exit ${revResult.status ?? "null"}): ${stderr}`),
+        stderr,
+        revResult.status ?? null,
+      );
     }
     const clonedRef = revResult.stdout.toString().trim();
 
@@ -434,3 +483,12 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
     return { workspaceDir, clonedRef, cloneMethod, repoOwner, repoRepo, branch, githubToken: activeGithubToken };
   },
 };
+
+/** Attaches a classified FailureRecord to a git-invocation error, mirroring push.ts's pattern. */
+function attachGitFailure(err: Error, stderr: string, exitStatus: number | null): Error & { failure?: FailureRecord } {
+  (err as Error & { failure?: FailureRecord }).failure = classifyGitFailure(stderr, exitStatus, {
+    stage: "clone",
+    attempt: 1,
+  });
+  return err;
+}

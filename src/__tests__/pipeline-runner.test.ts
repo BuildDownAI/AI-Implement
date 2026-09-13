@@ -224,6 +224,32 @@ describe("PipelineRunner", () => {
       expect(failedReport?.outputs.error).toMatch("clone failed");
     });
 
+    it("attaches the classified failure record (with the failing step's id as stage) onto the rethrown error", async () => {
+      // A bare Error thrown by a step has no pre-attached failure. Without
+      // re-attaching the classified record here, the top-level catch in
+      // run-autonomous.ts has nothing to read and re-derives a record with
+      // stage "pipeline" — losing which step actually failed.
+      const errorMod: StepModule = {
+        run: vi.fn().mockRejectedValue(new Error("setup hook failed")),
+      };
+
+      const pipeline: PipelineDefinition = {
+        id: "test",
+        steps: [{ id: "setup", type: "custom", moduleId: "setup" }],
+      };
+
+      const runner = new PipelineRunner().register("setup", errorMod);
+
+      const thrown = await runner
+        .run(pipeline, makeContext(), new NoopStepReporter())
+        .catch((e: unknown) => e);
+
+      expect(thrown).toBeInstanceOf(Error);
+      const failure = (thrown as Error & { failure?: { stage?: string; category?: string } }).failure;
+      expect(failure?.stage).toBe("setup");
+      expect(failure?.category).toBe("unknown");
+    });
+
     it("stops pipeline on first failure without running subsequent steps", async () => {
       const installMod = makeModule({});
 

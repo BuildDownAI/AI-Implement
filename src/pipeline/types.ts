@@ -1,5 +1,8 @@
 import type { ReferenceRepo } from "../reference-repos.js";
 
+import type { RetryPolicy } from "./retry-backoff.js";
+import type { FailureRecord } from "./failure-classification.js";
+
 export type StepStatus = "running" | "passed" | "failed" | "skipped" | "cancelled";
 
 export type StepType =
@@ -88,6 +91,10 @@ export interface PipelineContextData {
   dependencyToken?: string;
   /** Autonomous runner: expiry timestamp for the dependency token (ISO 8601). */
   dependencyTokenExpiresAt?: string;
+  /** Autonomous runner: retry/backoff policy and reviewer turn cap, from the run_config
+   *  envelope's retryPolicy or DEFAULT_RETRY_POLICY when absent. No retry rail consumes
+   *  this yet (BAC-27113 only stores and transports it; BAC-27115 consumes it). */
+  retryPolicy?: RetryPolicy;
   /** kg-refresh dev-harness: when true, kg-snapshot-push prints the guard table but skips commit and push. */
   kgDryRun?: boolean;
   /** kg-refresh: when true, kg-snapshot-push downgrades the zero-shrink/50% guards to warnings and pushes anyway (AII-628). */
@@ -149,6 +156,10 @@ export interface LLMResult {
   telemetry?: RunTelemetry;
   structuredOutput?: unknown;
   terminalStatus?: LLMTerminalStatus;
+  /** Termination signal from the CLI process's close event (e.g. SIGTERM), null when it exited normally. */
+  signal?: string | null;
+  /** Set on any classified failure of the final attempt (retryable or not) — the last attempt's classified record. */
+  failure?: FailureRecord;
 }
 
 export interface LLMExecutor {

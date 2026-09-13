@@ -11,6 +11,7 @@ import {
   profilesDispatchFields,
 } from "../github.js";
 import { decodeRunConfig } from "../run-config.js";
+import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
 import { surfaceDispatchFailure } from "../dispatch-failure.js";
 import { notify } from "../notify.js";
 import type { RepoMapping } from "../config.js";
@@ -68,6 +69,7 @@ describe("buildEnvelopeDispatchInputs — envelope shape (case a)", () => {
   it("contains run_config + run_token + run_progress_token and no legacy fields", () => {
     const mapping = makeMapping();
     const inputs = buildEnvelopeDispatchInputs(mapping, baseIssue, {
+      retryPolicy: null,
       runnerPhase: "implementation",
       runToken: "tok-abc",
       runProgressToken: "prog-xyz",
@@ -100,6 +102,7 @@ describe("buildEnvelopeDispatchInputs — envelope shape (case a)", () => {
 
   it("includes a dedicated publication token only when explicitly provided", () => {
     const inputs = buildEnvelopeDispatchInputs(makeMapping(), baseIssue, {
+      retryPolicy: null,
       runnerPhase: "implementation",
       runToken: "result-token",
       runProgressToken: "progress-token",
@@ -112,6 +115,7 @@ describe("buildEnvelopeDispatchInputs — envelope shape (case a)", () => {
   it("decodes run_config back to original issue fields and runnerPhase", () => {
     const mapping = makeMapping();
     const inputs = buildEnvelopeDispatchInputs(mapping, baseIssue, {
+      retryPolicy: null,
       runnerPhase: "implementation",
       runToken: "tok-abc",
       runProgressToken: "prog-xyz",
@@ -136,6 +140,7 @@ describe("buildEnvelopeDispatchInputs — envelope shape (case a)", () => {
       skillsRepo: "org/skills",
     });
     const inputs = buildEnvelopeDispatchInputs(mapping, baseIssue, {
+      retryPolicy: null,
       runnerPhase: "implementation",
       runToken: "",
       runProgressToken: "",
@@ -161,6 +166,7 @@ describe("buildEnvelopeDispatchInputs — envelope shape (case a)", () => {
   it("puts baseBranch inside run_config (not as base_branch top-level input)", () => {
     const mapping = makeMapping();
     const inputs = buildEnvelopeDispatchInputs(mapping, baseIssue, {
+      retryPolicy: null,
       runnerPhase: "implementation",
       baseBranch: "ai-implement/feature/eng-42",
       runToken: "",
@@ -175,6 +181,7 @@ describe("buildEnvelopeDispatchInputs — envelope shape (case a)", () => {
   it("includes provider + aws_region for bedrock mappings", () => {
     const mapping = makeMapping({ provider: "bedrock", awsRegion: "us-east-1" });
     const inputs = buildEnvelopeDispatchInputs(mapping, baseIssue, {
+      retryPolicy: null,
       runnerPhase: "implementation",
       runToken: "",
       runProgressToken: "",
@@ -187,6 +194,7 @@ describe("buildEnvelopeDispatchInputs — envelope shape (case a)", () => {
   it("includes runner_image when provided", () => {
     const mapping = makeMapping();
     const inputs = buildEnvelopeDispatchInputs(mapping, baseIssue, {
+      retryPolicy: null,
       runnerPhase: "implementation",
       runToken: "",
       runProgressToken: "",
@@ -199,6 +207,7 @@ describe("buildEnvelopeDispatchInputs — envelope shape (case a)", () => {
   it("omits runner_image when not provided", () => {
     const mapping = makeMapping();
     const inputs = buildEnvelopeDispatchInputs(mapping, baseIssue, {
+      retryPolicy: null,
       runnerPhase: "implementation",
       runToken: "",
       runProgressToken: "",
@@ -210,6 +219,7 @@ describe("buildEnvelopeDispatchInputs — envelope shape (case a)", () => {
   it("includes prNumber inside run_config when provided", () => {
     const mapping = makeMapping();
     const inputs = buildEnvelopeDispatchInputs(mapping, baseIssue, {
+      retryPolicy: null,
       runnerPhase: "gap-analysis",
       prNumber: "42",
       runToken: "",
@@ -337,6 +347,7 @@ describe("buildEnvelopeDispatchInputs — planning phase (case c)", () => {
   it("sets runnerPhase to planning inside run_config", () => {
     const mapping = makeMapping();
     const inputs = buildEnvelopeDispatchInputs(mapping, baseIssue, {
+      retryPolicy: null,
       runnerPhase: "planning",
       runToken: "plan-tok",
     });
@@ -348,6 +359,7 @@ describe("buildEnvelopeDispatchInputs — planning phase (case c)", () => {
   it("does not include run_progress_token (planning has no progress token)", () => {
     const mapping = makeMapping();
     const inputs = buildEnvelopeDispatchInputs(mapping, baseIssue, {
+      retryPolicy: null,
       runnerPhase: "planning",
       runToken: "plan-tok",
       // runProgressToken deliberately omitted
@@ -358,6 +370,7 @@ describe("buildEnvelopeDispatchInputs — planning phase (case c)", () => {
 
   it("never includes a publication token for planning", () => {
     const inputs = buildEnvelopeDispatchInputs(makeMapping(), baseIssue, {
+      retryPolicy: null,
       runnerPhase: "planning",
       runToken: "plan-token",
       runPublicationToken: "must-not-leak",
@@ -369,6 +382,7 @@ describe("buildEnvelopeDispatchInputs — planning phase (case c)", () => {
   it("still includes run_token for callback auth", () => {
     const mapping = makeMapping();
     const inputs = buildEnvelopeDispatchInputs(mapping, baseIssue, {
+      retryPolicy: null,
       runnerPhase: "planning",
       runToken: "plan-tok",
     });
@@ -383,6 +397,7 @@ describe("buildEnvelopeDispatchInputs — dependencyTokenScope stamping", () => 
   it("stamps dependencyTokenScope in run_config when mapping enables it", () => {
     const mapping = makeMapping({ dependencyTokenScope: "installation" });
     const inputs = buildEnvelopeDispatchInputs(mapping, baseIssue, {
+      retryPolicy: null,
       runnerPhase: "implementation",
       runToken: "",
       runProgressToken: "",
@@ -395,6 +410,7 @@ describe("buildEnvelopeDispatchInputs — dependencyTokenScope stamping", () => 
   it("omits dependencyTokenScope from run_config when mapping has null", () => {
     const mapping = makeMapping({ dependencyTokenScope: null });
     const inputs = buildEnvelopeDispatchInputs(mapping, baseIssue, {
+      retryPolicy: null,
       runnerPhase: "implementation",
       runToken: "",
       runProgressToken: "",
@@ -408,6 +424,7 @@ describe("buildEnvelopeDispatchInputs — dependencyTokenScope stamping", () => 
   it("does not stamp dependencyTokenScope for planning dispatch", () => {
     const mapping = makeMapping({ dependencyTokenScope: "installation" });
     const inputs = buildEnvelopeDispatchInputs(mapping, baseIssue, {
+      retryPolicy: null,
       runnerPhase: "planning",
       runToken: "plan-tok",
     });
@@ -420,6 +437,7 @@ describe("buildEnvelopeDispatchInputs — dependencyTokenScope stamping", () => 
   it("stamps dependencyTokenScope for gap-analysis dispatch", () => {
     const mapping = makeMapping({ dependencyTokenScope: "installation" });
     const inputs = buildEnvelopeDispatchInputs(mapping, baseIssue, {
+      retryPolicy: null,
       runnerPhase: "gap-analysis",
       prNumber: "99",
       runToken: "",
@@ -428,6 +446,98 @@ describe("buildEnvelopeDispatchInputs — dependencyTokenScope stamping", () => 
 
     const decoded = decodeRunConfig(inputs.run_config!);
     expect(decoded.dependencyTokenScope).toBe("installation");
+  });
+});
+
+// ---------- Case (c3): retryPolicy dispatch stamping (BAC-27113) ----------
+
+describe("buildEnvelopeDispatchInputs — retryPolicy stamping", () => {
+  it("stamps retryPolicy in run_config when the caller passes it (GHA path)", () => {
+    const mapping = makeMapping();
+    const retryPolicy = {
+      requestRetries: 2,
+      stageRetries: 1,
+      pushRetries: 2,
+      backoffInitialMs: 30_000,
+      backoffMaxMs: 300_000,
+      backoffJitter: 0.2,
+      reviewMaxTurns: 30,
+    };
+    const inputs = buildEnvelopeDispatchInputs(mapping, baseIssue, {
+      runnerPhase: "implementation",
+      runToken: "",
+      runProgressToken: "",
+      retryPolicy,
+    });
+
+    const decoded = decodeRunConfig(inputs.run_config!);
+    expect(decoded.retryPolicy).toEqual(retryPolicy);
+  });
+
+  it("falls back to DEFAULT_RETRY_POLICY when the caller passes null (implementation/gap-analysis always carry it)", () => {
+    const mapping = makeMapping();
+    const inputs = buildEnvelopeDispatchInputs(mapping, baseIssue, {
+      retryPolicy: null,
+      runnerPhase: "implementation",
+      runToken: "",
+      runProgressToken: "",
+    });
+
+    const decoded = decodeRunConfig(inputs.run_config!);
+    expect(decoded.retryPolicy).toEqual(DEFAULT_RETRY_POLICY);
+  });
+
+  it("stamps DEFAULT_RETRY_POLICY for gap-analysis when the caller passes null", () => {
+    const mapping = makeMapping();
+    const inputs = buildEnvelopeDispatchInputs(mapping, baseIssue, {
+      retryPolicy: null,
+      runnerPhase: "gap-analysis",
+      prNumber: "99",
+      runToken: "",
+      runProgressToken: "",
+    });
+
+    const decoded = decodeRunConfig(inputs.run_config!);
+    expect(decoded.retryPolicy).toEqual(DEFAULT_RETRY_POLICY);
+  });
+
+  it("stamps a custom retryPolicy for the review-fix re-dispatch shape (gap-analysis + prNumber, BAC-27135)", () => {
+    const mapping = makeMapping();
+    const retryPolicy = { ...DEFAULT_RETRY_POLICY, reviewMaxTurns: 77 };
+    const inputs = buildEnvelopeDispatchInputs(mapping, baseIssue, {
+      runnerPhase: "gap-analysis",
+      prNumber: "42",
+      runToken: "",
+      runProgressToken: "",
+      retryPolicy,
+    });
+
+    const decoded = decodeRunConfig(inputs.run_config!);
+    expect(decoded.retryPolicy).toEqual(retryPolicy);
+  });
+
+  it("never stamps retryPolicy for planning (no retry loop)", () => {
+    const inputs = buildEnvelopeDispatchInputs(makeMapping(), baseIssue, {
+      retryPolicy: null,
+      runnerPhase: "planning",
+      runToken: "plan-tok",
+    });
+
+    const decoded = decodeRunConfig(inputs.run_config!);
+    expect(decoded.retryPolicy).toBeUndefined();
+    expect("retryPolicy" in decoded).toBe(false);
+  });
+
+  it("never stamps retryPolicy for kg-refresh, even when a policy is passed (no retry loop)", () => {
+    const inputs = buildEnvelopeDispatchInputs(makeMapping(), baseIssue, {
+      retryPolicy: { ...DEFAULT_RETRY_POLICY, reviewMaxTurns: 77 },
+      runnerPhase: "kg-refresh",
+      runToken: "kg-tok",
+    });
+
+    const decoded = decodeRunConfig(inputs.run_config!);
+    expect(decoded.retryPolicy).toBeUndefined();
+    expect("retryPolicy" in decoded).toBe(false);
   });
 });
 

@@ -194,6 +194,47 @@ describe("reviewStep", () => {
     ).rejects.toThrow("exit code 1");
   });
 
+  it("classifies a terminal-error result (exit 0, terminalStatus.isError) as invalid_output/LLM_TERMINAL_ERROR", async () => {
+    const executor: LLMExecutor = {
+      invoke: vi.fn().mockResolvedValue({
+        stdout: "",
+        exitCode: 0,
+        tokensUsed: 0,
+        structuredOutput: undefined,
+        terminalStatus: { subtype: "error_during_execution", isError: true },
+      } satisfies LLMResult),
+    };
+
+    const err = await reviewStep
+      .run(makeContext(executor), {}, new NoopStepReporter())
+      .catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(Error);
+    const failure = (err as Error & { failure?: { category?: string; code?: string } }).failure;
+    expect(failure?.category).toBe("invalid_output");
+    expect(failure?.code).toBe("LLM_TERMINAL_ERROR");
+  });
+
+  it("populates the failure record's elapsedMs from the executor's telemetry.durationMs", async () => {
+    const executor: LLMExecutor = {
+      invoke: vi.fn().mockResolvedValue({
+        stdout: "",
+        exitCode: 0,
+        tokensUsed: 0,
+        structuredOutput: undefined,
+        terminalStatus: { subtype: "error_during_execution", isError: true },
+        telemetry: { outcome: "error", numTurns: 1, durationMs: 7500, costUsd: null, tokensIn: null, tokensOut: null },
+      } satisfies LLMResult),
+    };
+
+    const err = await reviewStep
+      .run(makeContext(executor), {}, new NoopStepReporter())
+      .catch((e: unknown) => e);
+
+    const failure = (err as Error & { failure?: { elapsedMs?: number } }).failure;
+    expect(failure?.elapsedMs).toBe(7500);
+  });
+
   it("returns tokensUsed from executor", async () => {
     const executor = makeExecutor(APPROVED_VERDICT, 0, 200);
     const outputs = await reviewStep.run(makeContext(executor), {}, new NoopStepReporter());

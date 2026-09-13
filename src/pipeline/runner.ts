@@ -12,6 +12,7 @@ import type {
   StepReporter,
   StepType,
 } from "./types.js";
+import { classifyThrown } from "./failure-classification.js";
 
 // runner.ts lives in src/pipeline/, which contains the steps/ subdirectory.
 // Used as builtinRoot so resolveModule('steps/<key>.js') resolves to src/pipeline/steps/<key>.js.
@@ -127,9 +128,21 @@ export class PipelineRunner {
       } catch (err) {
         step.status = "failed";
         step.ended_at = new Date().toISOString();
-        step.outputs = { error: String(err) };
+        const failure = classifyThrown(err, { stage: definition.id, attempt: 1 });
+        step.outputs = { error: String(err), failure };
         context.setOutputs(definition.id, step.outputs);
         await reporter.report(step);
+        // Attach the classified record to the rethrown error so the top-level
+        // catch (run-autonomous.ts) sees this step's id as `stage` instead of
+        // re-deriving from scratch with no step context (`stage: "pipeline"`).
+        if (typeof err === "object" && err !== null) {
+          try {
+            (err as Record<string, unknown>).failure = failure;
+          } catch {
+            // err may be frozen/non-extensible — losing the attached record here
+            // must not turn this catch path itself into a thrown TypeError.
+          }
+        }
         throw err;
       }
 

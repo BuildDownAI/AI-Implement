@@ -57,6 +57,15 @@ interface RunConfigV1 {
   groupingParent?: boolean;
   dependencyTokenScope?: "installation";
   referenceRepos?: Array<{ repo: string; path: string; ref?: string }>;
+  retryPolicy?: {
+    requestRetries: number;
+    stageRetries: number;
+    pushRetries: number;
+    backoffInitialMs: number;
+    backoffMaxMs: number;
+    backoffJitter: number;
+    reviewMaxTurns: number;
+  };
 }
 ```
 
@@ -76,6 +85,7 @@ Field notes:
 | `groupingParent` | True when this dispatch is a grouping parent's own closing-work run |
 | `dependencyTokenScope` | `"installation"` enables the dependency token step in the runner; absent or null disables it. The runner fetches a read-only token covering all App-installation repos and injects it as a git credential helper and `COMPOSER_AUTH`. Requires a publicly reachable orchestrator (`RUNNER_CALLBACK_BASE_URL` + `RUNNER_TOKEN_SECRET`). |
 | `referenceRepos` | Repositories to clone read-only into the workspace before the implement loop. Each entry carries `repo` (normalized `https://github.com/owner/repo`), `path` (workspace-relative directory), and an optional `ref` (branch, tag, or commit hash; absent means the default branch). **Absent on planning dispatches** — the planning runner reads no such field. **Absent on kg-refresh dispatches** — the kg-refresh pipeline clones a knowledge-graph source repository as its workspace and has no pipeline step that would consume reference repos. Envelope-only: no dispatch input and no environment variable carry this field, so a target repo on the legacy workflow contract does not receive it. |
+| `retryPolicy` | Global retry/backoff policy and reviewer turn cap, edited on the admin Settings page and stored in the orchestrator's `settings` table (never an env var). Absent means the runner uses `DEFAULT_RETRY_POLICY` (`src/pipeline/retry-backoff.ts`). Populated by `getRetryPolicy()` on every implementation-phase and gap-analysis-phase dispatch across all three execution modes — the initial dispatch, the `/ai-implement` comment gap-fill drain, the PR-comment gap-fill trigger, and the review-fix re-dispatch — because `pushRetries` and `reviewMaxTurns` apply to those re-dispatches exactly as to initial runs. Never sent on planning or kg-refresh dispatches, which have no retry loop. On the GHA path, `buildEnvelopeDispatchInputs`'s `retryPolicy` option is required (nullable), not optional — a caller can no longer omit it silently, it must state intent: planning passes `null` explicitly, implementation/gap-analysis pass the real policy from `getRetryPolicy()`. The function itself only stamps the field into `run_config` when `runnerPhase` is neither `planning` nor `kg-refresh`, substituting `DEFAULT_RETRY_POLICY` only if the passed value is `null`, so all three backends agree that every implementation/gap-analysis dispatch carries this field. The runner runs the decoded value through `normalizeRetryPolicy` (an out-of-range or malformed field degrades to the default for that field alone; an unknown key is dropped). No built-in step consumes the policy yet — it is stored and transported so the retry rails built on top of it read one source of truth. |
 
 ---
 

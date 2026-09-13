@@ -3,9 +3,12 @@ import {
   encodeRunConfig,
   decodeRunConfig,
   runConfigFromTaskDocument,
+  buildImplRunConfig,
   type RunConfigV1,
   type TaskDocumentParams,
 } from "../run-config.js";
+import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
+import type { RepoMapping } from "../config.js";
 
 const full: RunConfigV1 = {
   v: 1,
@@ -23,6 +26,7 @@ const full: RunConfigV1 = {
   profiles: ["backend", "webapp"],
   planningContext: { parent: "- AII-0: parent", siblings: "None", dependencies: "- [related] AII-2: dep" },
   dependencyTokenScope: "installation",
+  retryPolicy: { ...DEFAULT_RETRY_POLICY, stageRetries: 0 },
 };
 
 describe("run-config envelope", () => {
@@ -128,6 +132,129 @@ describe("run-config envelope", () => {
     const decoded = decodeRunConfig(b64);
     expect(decoded.dependencyTokenScope).toBe("installation");
     expect((decoded as Record<string, unknown>).bogusKey).toBeUndefined();
+  });
+
+  it("round-trips retryPolicy", () => {
+    const cfg: RunConfigV1 = {
+      v: 1,
+      issue: { id: "i", identifier: "AII-5", title: "t", description: "" },
+      retryPolicy: { ...DEFAULT_RETRY_POLICY, reviewMaxTurns: 60 },
+    };
+    expect(decodeRunConfig(encodeRunConfig(cfg)).retryPolicy).toEqual({
+      ...DEFAULT_RETRY_POLICY,
+      reviewMaxTurns: 60,
+    });
+  });
+
+  it("absent retryPolicy decodes as undefined (no key materialized)", () => {
+    const min: RunConfigV1 = { v: 1, issue: { id: "i", identifier: "AII-6", title: "t", description: "" } };
+    const decoded = decodeRunConfig(encodeRunConfig(min));
+    expect(decoded.retryPolicy).toBeUndefined();
+    expect("retryPolicy" in decoded).toBe(false);
+  });
+});
+
+function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
+  return {
+    owner: "test-org",
+    repo: "test-repo",
+    workflowFile: "claude-implement.yml",
+    defaultBranch: "main",
+    maxInProgressAiIssues: 3,
+    executionMode: "fly-machines",
+    sessionMode: "autonomous",
+    machineCpus: 2,
+    machineMemoryMb: 4096,
+    planningEnabled: false,
+    planningWorkflowFile: "",
+    autoApprovePlans: true,
+    extraEnv: {},
+    provider: "anthropic",
+    ticketingProvider: "linear",
+    ticketingConfig: { kind: "linear" },
+    awsRegion: null,
+    paused: false,
+    maxTurns: null,
+    maxIterations: null,
+    maxJobMinutes: null,
+    branchPrefix: null,
+    skillsRepo: null,
+    sensitiveAddPatterns: null,
+    sensitiveAllowPatterns: null,
+    autoMerge: false,
+    dependencyTokenScope: null,
+    ...overrides,
+  };
+}
+
+const implBaseIssue = {
+  id: "issue-uuid",
+  identifier: "ENG-42",
+  title: "Add feature X",
+  description: "Implement the feature",
+};
+
+// buildImplRunConfig backs both the Fly Machines and local Docker implementation
+// dispatch paths (BAC-27113) — a single shared builder, tested once here.
+describe("buildImplRunConfig", () => {
+  it("stamps the caller-supplied retryPolicy into the envelope", () => {
+    const mapping = makeMapping();
+    const retryPolicy = {
+      requestRetries: 3,
+      stageRetries: 2,
+      pushRetries: 1,
+      backoffInitialMs: 45_000,
+      backoffMaxMs: 250_000,
+      backoffJitter: 0.1,
+      reviewMaxTurns: 45,
+    };
+
+    const runConfig = buildImplRunConfig({
+      issue: implBaseIssue,
+      mapping,
+      baseBranch: mapping.defaultBranch,
+      retryPolicy,
+    });
+
+    const decoded = decodeRunConfig(encodeRunConfig(runConfig));
+    expect(decoded.retryPolicy).toEqual(retryPolicy);
+  });
+
+  it("carries DEFAULT_RETRY_POLICY through when the caller passes it explicitly", () => {
+    const mapping = makeMapping();
+
+    const runConfig = buildImplRunConfig({
+      issue: implBaseIssue,
+      mapping,
+      baseBranch: mapping.defaultBranch,
+      retryPolicy: DEFAULT_RETRY_POLICY,
+    });
+
+    const decoded = decodeRunConfig(encodeRunConfig(runConfig));
+    expect(decoded.retryPolicy).toEqual(DEFAULT_RETRY_POLICY);
+    expect(decoded.runnerPhase).toBe("implementation");
+    expect(decoded.issue.identifier).toBe("ENG-42");
+  });
+
+  it("carries the mapping's referenceRepos and dependencyTokenScope like the inline builders it replaced", () => {
+    const repos = [{ repo: "https://github.com/acme/shared", path: "vendor/shared" }];
+    const mapping = makeMapping({ referenceRepos: repos, dependencyTokenScope: "installation" });
+
+    const runConfig = buildImplRunConfig({
+      issue: implBaseIssue,
+      mapping,
+      baseBranch: "release",
+      runnerCallbackUrl: "https://orch.example/api/runner",
+      groupingParent: true,
+      retryPolicy: DEFAULT_RETRY_POLICY,
+    });
+
+    const decoded = decodeRunConfig(encodeRunConfig(runConfig));
+    expect(decoded.referenceRepos).toEqual(repos);
+    expect(decoded.dependencyTokenScope).toBe("installation");
+    expect(decoded.baseBranch).toBe("release");
+    expect(decoded.runnerCallbackUrl).toBe("https://orch.example/api/runner");
+    expect(decoded.groupingParent).toBe(true);
   });
 
   it("round-trips kgDryRun: true", () => {

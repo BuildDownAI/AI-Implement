@@ -426,6 +426,34 @@ describe("pushStep", () => {
     ).rejects.toThrow(/git push failed/);
   });
 
+  it("attaches a classified failure record to the git push error", async () => {
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n");
+      if (gitArgs[0] === "rev-parse") return spawnResult(0, "sha\n");
+      if (gitArgs[0] === "ls-remote") {
+        return spawnResult(0, "beadfeed\trefs/heads/ai-implement/eng-42-feature\n");
+      }
+      if (gitArgs[0] === "push") {
+        return spawnResult(128, "", "fatal: gh-token authentication failed");
+      }
+      return spawnResult(0);
+    });
+
+    let caught: (Error & { failure?: import("../pipeline/failure-classification.js").FailureRecord }) | undefined;
+    try {
+      await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+    } catch (err) {
+      caught = err as typeof caught;
+    }
+
+    expect(caught?.failure).toBeDefined();
+    expect(caught?.failure?.category).toBe("auth");
+    expect(caught?.failure?.code).toBe("GIT_AUTH");
+    // The token was already redacted by push.ts before classifyGitFailure ran.
+    expect(caught?.failure?.message).not.toContain("gh-token");
+  });
+
   it("throws on non-200 non-422 PR creation", async () => {
     mockGitSuccess();
     vi.mocked(fetch).mockResolvedValueOnce({

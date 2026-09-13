@@ -1,6 +1,7 @@
 import type { RepoMapping } from "./config.js";
 import { GitHubApiError } from "./github-errors.js";
 import { type RunConfigV1, encodeRunConfig } from "./run-config.js";
+import { DEFAULT_RETRY_POLICY, type RetryPolicy } from "./pipeline/retry-backoff.js";
 
 interface DispatchInputs {
   /** Legacy mode: per-field issue data. */
@@ -226,6 +227,14 @@ export interface EnvelopeDispatchOpts {
   /** True when this is a grouping parent's own closing-work dispatch. Threads into the runner
    *  so push.ts can finalize cleanly when the agent produces no changes (Case B). */
   groupingParent?: boolean;
+  /** Global retry/backoff policy and reviewer turn cap. Passed explicitly by the caller
+   *  (getRetryPolicy()) rather than fetched here, so this function stays free of a
+   *  database import. Required (nullable) so every call site states its intent
+   *  rather than silently omitting it: planning and kg-refresh pass `null` and get
+   *  nothing stamped (neither has a retry loop); implementation/gap-analysis pass the
+   *  policy, falling back to DEFAULT_RETRY_POLICY only if that itself is null — the
+   *  GHA path agrees with Fly and local, which both require this field. */
+  retryPolicy: RetryPolicy | null;
 }
 
 /**
@@ -266,6 +275,9 @@ export function buildEnvelopeDispatchInputs(
     ...(issue.assigneeName ? { assigneeName: issue.assigneeName } : {}),
     ...(opts.planningContext ? { planningContext: opts.planningContext } : {}),
     ...(opts.groupingParent ? { groupingParent: true } : {}),
+    ...(opts.runnerPhase !== "planning" && opts.runnerPhase !== "kg-refresh"
+      ? { retryPolicy: opts.retryPolicy ?? DEFAULT_RETRY_POLICY }
+      : {}),
   };
 
   return {

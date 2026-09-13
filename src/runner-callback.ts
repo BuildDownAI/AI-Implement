@@ -1,4 +1,4 @@
-import { claimJobRunId, getJobByDispatchId, stampJobApproved, updateJobPrUrl, updateJobStatus } from "./log.js";
+import { claimJobRunId, getJobByDispatchId, stampJobApproved, updateJobFailure, updateJobPrUrl, updateJobStatus } from "./log.js";
 import type { Step } from "./pipeline/types.js";
 import { describeReferenceRepoCause, type ReferenceRepoResult } from "./reference-repos.js";
 import type { TicketingProvider } from "./providers/types.js";
@@ -9,6 +9,7 @@ import { getReviewFixDispatchSnapshot } from "./review-fix-queue.js";
 import { markReviewFindingsResolvedByIds, markReviewFindingsResolvedForPrSeenBefore } from "./review-ledger-store.js";
 import { renderClassification, TROUBLESHOOTING_URL, type Classification } from "./completion-classification.js";
 import { isLinearAuthConfigured, withLinearToken } from "./linear-app-auth.js";
+import { isFailureRecord, projectFailureRecord, type FailureRecord } from "./pipeline/failure-classification.js";
 
 export type RunnerPhase = "planning" | "implementation" | "gap-analysis" | "kg-refresh";
 
@@ -57,8 +58,14 @@ export interface RunnerResultBody {
   phase: RunnerPhase;
   outcome: "success" | "failure";
   failureReason?: string;
-  /** Machine-readable error code set when a known guardrail trips (e.g. "SENSITIVE_FILES_BLOCKED"). */
+  /**
+   * Machine-readable error code. Set either when a known guardrail trips
+   * (e.g. "SENSITIVE_FILES_BLOCKED") or, for a classified terminal failure,
+   * to `failure.code` — it is not guardrail-only.
+   */
   failureCode?: string;
+  /** Structured terminal failure classified by src/pipeline/failure-classification.ts. Shape-validated below. */
+  failure?: FailureRecord;
   comments: Array<{ body: string }>;
   prUrl?: string;
   /** True when a grouping-parent implementation run produced no changes (Case B).
@@ -133,6 +140,20 @@ export interface HandleRunnerPlanningContextInput {
 
 function bad(status: number, error: string): HandleRunnerResultOutput {
   return { status, body: { error } };
+}
+
+const STATUS_TEXT_MAX_LEN = 200;
+
+/**
+ * Bounds a status string to its first line, capped at `STATUS_TEXT_MAX_LEN`
+ * characters, before it flows into the stuck-watchdog's markdown table cell
+ * (`stuck-watchdog.ts`) and the Slack "Last status" field (`notify.ts`) —
+ * both single-line contexts that a multi-line or oversized `failureReason`
+ * (e.g. SENSITIVE_FILES_BLOCKED, REVIEW_UNAPPROVED) would otherwise break.
+ */
+export function boundStatusText(text: string): string {
+  const firstLine = text.split("\n")[0] ?? "";
+  return firstLine.length > STATUS_TEXT_MAX_LEN ? `${firstLine.slice(0, STATUS_TEXT_MAX_LEN)}…` : firstLine;
 }
 
 /**
@@ -223,6 +244,7 @@ export async function handleRunnerResult(
     phase?: unknown;
     outcome?: unknown;
     comments?: unknown;
+    failure?: unknown;
   } | null | undefined;
   if (!body || typeof body !== "object") return bad(400, "invalid_body");
   if (
@@ -279,6 +301,19 @@ export async function handleRunnerResult(
         `token=${claims.phase} body=${input.body.phase}`,
     );
     return bad(400, "phase_mismatch");
+  }
+
+  // Shape-validated, but a malformed record is dropped rather than rejected: the
+  // token above is already consumed, and postRunnerResult never retries, so
+  // failing the whole callback here would discard the comments, the tracker
+  // transition, and remediation over a field the orchestrator only ever displays.
+  // A newer runner reporting a FailureCategory this orchestrator doesn't yet know
+  // about must not stall the ticket.
+  const failure = isFailureRecord(body.failure) ? projectFailureRecord(body.failure) : undefined;
+  if (body.failure !== undefined && !failure) {
+    console.warn(
+      `[runner-callback] dropping malformed failure record for dispatchId=${claims.dispatchId}`,
+    );
   }
 
   // kg-refresh runs have no mapping and no tracker issue to update.
@@ -350,6 +385,10 @@ export async function handleRunnerResult(
   }
 
   if (input.body.outcome === "failure") {
+    if (failure) {
+      const failedJob = getJobByDispatchId(claims.dispatchId);
+      if (failedJob) updateJobFailure(failedJob.id, failure);
+    }
     if (input.body.phase === "planning") {
       try {
         await provider.markPlanningFailed(
@@ -406,7 +445,7 @@ export async function handleRunnerResult(
               input.watchdogConfig,
               provider,
               job,
-              input.body.failureCode ?? input.body.failureReason ?? "failure",
+              boundStatusText(input.body.failureReason ?? input.body.failureCode ?? "failure"),
             );
           }
         }

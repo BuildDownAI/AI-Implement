@@ -26,7 +26,17 @@ beforeEach(async () => {
   dedup.getDb();
 });
 
-afterEach(() => {
+afterEach(async () => {
+  // A test that calls setRetryPolicy() writes to the shared `settings` row; reset
+  // it explicitly rather than relying on dbPath rotation to isolate it. Most tests
+  // in this file never initialize the settings table, so a missing-table error
+  // here is expected and not a cleanup failure.
+  const { setRetryPolicy } = await import("../orchestrator-settings.js");
+  try {
+    setRetryPolicy(null);
+  } catch {
+    /* settings table not initialized in this test */
+  }
   dedup.closeDb();
   try {
     fs.unlinkSync(dbPath);
@@ -257,6 +267,36 @@ describe("handleGapFillTrigger", () => {
     expect(decoded.prNumber).toBe("42");
     expect(decoded.runnerPhase).toBe("gap-analysis");
     expect(decoded.runnerCallbackUrl).toBe(CALLBACK_URL);
+    // BAC-27113: the PR-comment gap-fill trigger carries the effective retry policy too.
+    expect(decoded.retryPolicy).toBeDefined();
+  });
+
+  it("carries the effective retry policy into run_config on the PR-comment gap-fill trigger (BAC-27113)", async () => {
+    const { decodeRunConfig } = await import("../run-config.js");
+    const { setRetryPolicy } = await import("../orchestrator-settings.js");
+    const { initSettingsTable } = await import("../runner-mode.js");
+    initSettingsTable();
+    setRetryPolicy({ reviewMaxTurns: 88 });
+
+    const mapping = makeMapping({ owner: "acme", repo: "billing" });
+    const issue = makeIssue({ id: "issue-uuid-1", identifier: "ACME-123", scopeKey: "ACME" });
+    const provider = new FakeProvider({ initialIssues: [issue] });
+    const dispatchSpy = vi.fn(async () => ({ success: true, status: 204 }));
+
+    const res = await handleGapFillTrigger(
+      makeInput({
+        body: { issueKey: "ACME-123", prNumber: 42 },
+        getMappings: () => ({ ACME: mapping }),
+        resolveProvider: async () => provider,
+        dispatchWorkflow: dispatchSpy,
+        resolveWorkflowCapabilities: vi.fn(async () => ({ contract: "envelope" as const, supportsRunPublicationToken: false })),
+      }),
+    );
+
+    expect(res.status).toBe(200);
+    const [, , inputs] = dispatchSpy.mock.calls[0];
+    const decoded = decodeRunConfig(inputs.run_config);
+    expect(decoded.retryPolicy?.reviewMaxTurns).toBe(88);
   });
 
   it("does not add a publication token for envelope workflows without the new input", async () => {

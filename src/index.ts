@@ -56,7 +56,7 @@ import { enqueueReconciliation, hasReconciliationForPr, initReconciliationTable 
 import { runReconciliations } from "./reconcile-merged.js";
 import { resolveSessionImage, resolveDefaultRunnerImage, resolveRunnerImageForDispatch, type SessionImageStatus } from "./repo-image.js";
 import { getStepRecord, initStepLogTable } from "./step-log.js";
-import { getOrchestratorSettings, seedKgBaseRepoFromEnv } from "./orchestrator-settings.js";
+import { getOrchestratorSettings, seedKgBaseRepoFromEnv, getRetryPolicy } from "./orchestrator-settings.js";
 import { handleRunnerPlanningContext, handleRunnerProgress, handleRunnerResult, handleKgTrackerDataRequest, handleKgScopeRequest, planningDispatchBlockReason } from "./runner-callback.js";
 import type { RunnerProgressBody, RunnerResultBody } from "./runner-callback.js";
 import { mintRunToken, PLANNING_TTL_SECONDS, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
@@ -85,7 +85,7 @@ import {
 import { clearPrNotFoundGrace, decideCleanExitOutcome, shouldSkipCompletionNotice, workflowFileForJob } from "./monitor-status.js";
 import type { RunPrCandidate, RunPrMatch } from "./monitor-status.js";
 import { pickPrForRun } from "./monitor-status.js";
-import { type RunConfigV1, encodeRunConfig, decodeRunConfig } from "./run-config.js";
+import { type RunConfigV1, encodeRunConfig, decodeRunConfig, buildImplRunConfig } from "./run-config.js";
 import { resolveBaseBranch, findOpenRollUpPr } from "./feature-branch.js";
 import { validateIssueBaseBranch, postBranchComment } from "./base-branch.js";
 import { runMergeUps, clearRollUpHandledMarkersByIdentifier } from "./merge-up.js";
@@ -934,6 +934,7 @@ async function dispatchGitHubActions(
         runPublicationToken,
         runnerImage,
         groupingParent: isGroupingParentDispatch(issue) || undefined,
+        retryPolicy: getRetryPolicy(),
       })
     : {
         issue_id: issue.id,
@@ -1355,6 +1356,9 @@ async function dispatchPlanning(
         // No runProgressToken: planning dispatches don't mint progress tokens.
         runnerImage,
         planningContext: planningContextInputs,
+        // Planning has no retry loop, so nothing is stamped — but retryPolicy is
+        // required on EnvelopeDispatchOpts, so every call site must say so explicitly.
+        retryPolicy: null,
       })
     : {
         issue_id: issue.id,
@@ -1648,25 +1652,14 @@ async function dispatchFlyMachine(
         defaultImage: config.sessionImage,
       });
 
-      const implRunConfig: RunConfigV1 = {
-        v: 1,
-        issue: {
-          id: issue.id,
-          identifier: issue.identifier,
-          title: issue.title,
-          description: issue.description || issue.title,
-        },
-        runnerPhase: "implementation",
-        ...(baseBranch !== mapping.defaultBranch ? { baseBranch } : {}),
-        ...(mapping.branchPrefix ? { branchPrefix: mapping.branchPrefix } : {}),
-        ...(mapping.skillsRepo ? { skillsRepo: mapping.skillsRepo } : {}),
-        ...(mapping.referenceRepos != null ? { referenceRepos: mapping.referenceRepos } : {}),
-        ...(runnerCallbackUrl ? { runnerCallbackUrl } : {}),
-        ...(mapping.maxTurns != null ? { maxTurns: mapping.maxTurns } : {}),
-        ...(mapping.maxIterations != null ? { maxIterations: mapping.maxIterations } : {}),
-        ...(isGroupingParentDispatch(issue) ? { groupingParent: true } : {}),
-        ...(mapping.dependencyTokenScope != null ? { dependencyTokenScope: mapping.dependencyTokenScope } : {}),
-      };
+      const implRunConfig: RunConfigV1 = buildImplRunConfig({
+        issue,
+        mapping,
+        baseBranch,
+        runnerCallbackUrl,
+        groupingParent: isGroupingParentDispatch(issue),
+        retryPolicy: getRetryPolicy(),
+      });
 
       const machineConfig = buildSessionMachineConfig({
         image: resolvedImage,
@@ -1762,25 +1755,14 @@ async function dispatchLocalDocker(
 
       const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
 
-      const localImplRunConfig: RunConfigV1 = {
-        v: 1,
-        issue: {
-          id: issue.id,
-          identifier: issue.identifier,
-          title: issue.title,
-          description: issue.description || issue.title,
-        },
-        runnerPhase: "implementation",
-        ...(baseBranch !== mapping.defaultBranch ? { baseBranch } : {}),
-        ...(mapping.branchPrefix ? { branchPrefix: mapping.branchPrefix } : {}),
-        ...(mapping.skillsRepo ? { skillsRepo: mapping.skillsRepo } : {}),
-        ...(mapping.referenceRepos != null ? { referenceRepos: mapping.referenceRepos } : {}),
-        ...(runnerCallbackUrl ? { runnerCallbackUrl } : {}),
-        ...(mapping.maxTurns != null ? { maxTurns: mapping.maxTurns } : {}),
-        ...(mapping.maxIterations != null ? { maxIterations: mapping.maxIterations } : {}),
-        ...(isGroupingParentDispatch(issue) ? { groupingParent: true } : {}),
-        ...(mapping.dependencyTokenScope != null ? { dependencyTokenScope: mapping.dependencyTokenScope } : {}),
-      };
+      const localImplRunConfig: RunConfigV1 = buildImplRunConfig({
+        issue,
+        mapping,
+        baseBranch,
+        runnerCallbackUrl,
+        groupingParent: isGroupingParentDispatch(issue),
+        retryPolicy: getRetryPolicy(),
+      });
 
       const container = await startLocalRunnerContainer({
         image: config.localRunnerImage,
@@ -3005,6 +2987,7 @@ async function processReviewFixQueue(config: AppConfig): Promise<void> {
             runProgressToken,
             runPublicationToken,
             runnerImage,
+            retryPolicy: getRetryPolicy(),
           })
         : {
             issue_id: fix.issueId,

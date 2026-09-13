@@ -140,6 +140,53 @@ Only these `type` values are accepted: `clone`, `install`, `implement`, `review`
 
 Both the pipeline definition and the step modules resolve **before the clone step runs** — the definition at module import time, the modules eagerly in `createDefaultRunner()`. Overrides therefore have to be baked into the runner image; a `custom/` directory that only exists in the target repo's checkout arrives too late to be honored for these two extension points.
 
+## Failure record
+
+Every failed step's outputs carry a `failure: FailureRecord` alongside the existing `error: string` (`src/pipeline/failure-classification.ts`). `error` is kept as-is — it is what the admin UI and the existing test suite already read — `failure` adds a structured classification on top:
+
+```typescript
+export type FailureCategory =
+  | "transient" | "auth" | "config" | "conflict"
+  | "invalid_output" | "cancelled" | "crash" | "unknown";
+
+export interface FailureRecord {
+  category: FailureCategory;
+  code: string;           // open-ended machine code, e.g. PROVIDER_OVERLOADED
+  stage: string;          // step id or sub-step id
+  attempt: number;        // always 1 today — nothing retries yet
+  retryable: boolean;     // category === "transient"
+  exitCode?: number | null;
+  signal?: string | null;
+  message: string;        // redacted one-liner
+  evidence: {
+    stdoutTail?: string;  // redacted, <= EVIDENCE_TAIL_BYTES (8 KiB)
+    stderrTail?: string;
+    truncated: boolean;
+    llmSubtype?: string | null;
+    llmIsError?: boolean | null;
+    llmOutcome?: RunTelemetry["outcome"] | null;
+    /** Set only when evidence capture itself failed (best-effort). */
+    captureError?: string;
+  };
+}
+```
+
+`classifyLlmResult`'s `ctx.expectsStructuredOutput` gates the terminal-event, missing-structured-output, and outcome-mismatch branches: review sets it `true` (it always requests a JSON verdict), implement leaves it `false` (it never requests structured output, so a plain crash there isn't misclassified as `invalid_output`). Checks run structural-first: a non-null `result.signal` is checked ahead of everything else and always classifies `cancelled`/`PROCESS_SIGNALLED`; then, for `exitCode === 0`, the structural branches run in order — a missing terminal event (`LLM_NO_TERMINAL_EVENT`), a failing terminal event (`LLM_TERMINAL_ERROR`), a `telemetry.outcome` that disagrees with a nominally-successful terminal status (`LLM_OUTCOME_MISMATCH`), then missing structured output (`LLM_NO_STRUCTURED_OUTPUT`) — before falling back to `unknown`. `PROVIDER_SIGNATURES` (the text-based table) is consulted **only when `exitCode !== 0`**: once the exit is clean, the model's own final text is part of the match input, so a dropped verdict that happens to discuss a transport error in its prose must classify by its actual structural defect, not by a lexical coincidence in stdout.
+
+**`category` is closed, `code` is open.** The retry rails this record is the foundation for switch on `category`; an open string there would let a new call site invent a category the retry policy silently never matches. `code` has no such constraint — a new step can add a code without touching this module. **`unknown`/`UNKNOWN` is a first-class result, not a fallback that guesses.** A classifier that cannot match a signature returns it rather than picking the closest-looking category — retaining that uncertainty is the point, not a gap to be filled in later.
+
+Three classifiers build a record from three different failure shapes: `classifyLlmResult` (a completed-but-failing or structurally invalid `LLMResult`), `classifyGitFailure` (a failed git invocation's stderr and exit status), and `classifyThrown` (an arbitrary thrown error — the generic fallback used by `PipelineRunner`'s own catch). `classifyThrown` passes through an already-attached `err.failure` unchanged rather than re-deriving a classification from the stringified message, so `implement.ts`/`review.ts`/`push.ts`/`clone.ts` attaching a record at the throw site is authoritative over any later generic reclassification. Failing that, `classifyThrown` runs `GIT_SIGNATURES` ahead of `PROVIDER_SIGNATURES` when the message looks like git's own output (a `fatal:`/`remote:` line, a "failed to push", or a `git `-prefixed label) — otherwise a git-side 403 collides with `PROVIDER_SIGNATURES`' own 401/403 pattern and reports `PROVIDER_AUTH` instead of `GIT_AUTH`.
+
+The feedback loop's per-iteration sub-steps (`feedback-loop.ts`) re-stamp `stage` to the iteration-qualified id (e.g. `feedback-loop/implement-2`) on a record `classifyThrown` merely passed through unchanged from an inner classifier — otherwise the sub-step's own iteration context would never make it onto the record.
+
+Evidence capture (tailing and redaction) is best-effort: if it throws, the classify function still returns a record — `category: "unknown"`, `evidence.truncated: true`, `evidence.captureError` set, and `message` holding the original, unclassified error text. A failure inside the classifier must never replace the failure it was classifying.
+
+The completion callback (`src/run-autonomous.ts` → `src/runner-callback.ts`) carries the terminal record as `failure` alongside the existing `failureReason`/`failureCode`, persisted on the job as `failure_json`. The orchestrator validates only the record's shape and never trusts `code` for anything but display — the closed `category` union is what any future retry logic is allowed to depend on. An unrecognised `failure` shape (e.g. a `category` this orchestrator predates) is **dropped with a warning, not rejected** — the rest of the callback (comments, the tracker transition, remediation) still runs, since the callback's token is already consumed by this point and the runner has no retry path. `listLog` strips the evidence tails from list rows (and forces `evidence.truncated: true` on them); a single-job read keeps the full record. Nothing renders the record yet — no tracker comment or admin view reads it — this is deliberately just the shared taxonomy and evidence record the retry rails and the failure comment build on next.
+
+## Retry policy
+
+`RetryPolicy` and `DEFAULT_RETRY_POLICY` live in `src/pipeline/retry-backoff.ts` — runner-safe, no database import — alongside `computeBackoffMs` (exponential backoff, one-directional jitter below the cap so `backoffMaxMs` is a true ceiling) and `normalizeRetryPolicy`. The orchestrator stores an operator-edited policy under the `retry_policy` settings row (`getRetryPolicy`/`setRetryPolicy` in `src/orchestrator-settings.ts`, the Retry Policy card on the admin Settings page) and stamps it into the envelope's `retryPolicy` on every implementation and gap-analysis dispatch; the runner resolves it into `context.data.retryPolicy`. `decodeRunConfig` type-asserts the envelope's shape but validates nothing at runtime, so `normalizeRetryPolicy` is the runner-side guard: an out-of-range or malformed field degrades silently to `DEFAULT_RETRY_POLICY`'s value for that field alone, never the whole policy, and an unknown key is dropped rather than thrown. `getRetryPolicy` runs the stored row through the same guard, so a hand-edited row can never reach the admin form or a dispatch out of range. **No built-in step consumes the policy yet** — `context.data.retryPolicy` is the contract surface the request-level, stage-level and push retry rails read once they exist.
+
 ## Execution semantics
 
 `PipelineRunner.run` iterates steps in order. A step that throws is reported as `failed`, has its error stored in its outputs, and the exception propagates — the pipeline stops there. A skipped step is reported as `skipped` and its outputs are set to `{}`, so downstream `getOutputs` calls return an empty object rather than undefined.

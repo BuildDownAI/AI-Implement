@@ -3,6 +3,7 @@ import { formatLlmResultDetail, terminalResultFailureMessage } from "../step-uti
 import { REVIEW_VERDICT_JSON_SCHEMA, parseReviewVerdict, plainIssueText } from "../review-verdict.js";
 import { wrapWithPlanningGuard } from "../../planning-context-assembly.js";
 import { READ_ONLY_ALLOWED_TOOLS } from "./read-only-tools.js";
+import { classifyLlmResult, type FailureRecord } from "../failure-classification.js";
 
 interface ReviewInputs extends Record<string, unknown> {
   model?: string;
@@ -98,13 +99,27 @@ export const reviewStep: StepModule<ReviewInputs, ReviewOutputs> = {
       jsonSchema: REVIEW_VERDICT_JSON_SCHEMA,
     });
 
+    const attachReviewFailure = (err: Error): Error & { failure?: FailureRecord } => {
+      (err as Error & { failure?: FailureRecord }).failure = classifyLlmResult(result, {
+        stage: "review",
+        attempt: 1,
+        expectsStructuredOutput: true,
+        elapsedMs: result.telemetry?.durationMs ?? undefined,
+      });
+      return err;
+    };
+
     if (result.exitCode !== 0) {
-      throw new Error(`Review LLM invocation failed with exit code ${result.exitCode}${formatLlmResultDetail(result)}`);
+      throw attachReviewFailure(
+        new Error(`Review LLM invocation failed with exit code ${result.exitCode}${formatLlmResultDetail(result)}`),
+      );
     }
     const terminalFailure = terminalResultFailureMessage(result, "Review LLM invocation");
-    if (terminalFailure) throw new Error(terminalFailure);
+    if (terminalFailure) throw attachReviewFailure(new Error(terminalFailure));
     if (result.structuredOutput === undefined) {
-      throw new Error(`Review LLM invocation did not return structured_output${formatLlmResultDetail(result)}`);
+      throw attachReviewFailure(
+        new Error(`Review LLM invocation did not return structured_output${formatLlmResultDetail(result)}`),
+      );
     }
 
     const verdict = parseReviewVerdict(result.structuredOutput);
