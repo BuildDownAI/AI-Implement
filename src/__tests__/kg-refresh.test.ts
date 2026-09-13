@@ -933,6 +933,25 @@ describe("kg-refresh", () => {
         expect(s.lastRefresh?.detail).toBe("dry-run: failed: CLONE_FAILED");
       });
 
+      it("a dry-run callback with KG_SNAPSHOT_STALE is reported as benign, not a guard failure", async () => {
+        const closeJobLog = vi.fn();
+        const appendJobLog = vi.fn(() => 77);
+        buildDispatch({ appendJobLog, closeJobLog });
+        await handle.trigger({ dryRun: true });
+        await waitForStage("ingest-running");
+        handle.onRunnerComplete("failure", { failureCode: "KG_SNAPSHOT_STALE" });
+        await waitDone();
+        expect(restart).not.toHaveBeenCalled();
+        const s = await handle.status();
+        expect(s.stage).toBe("idle");
+        expect(s.running).toBe(false);
+        expect(s.lastRefresh?.ok).toBe(true);
+        expect(s.lastRefresh?.dryRun).toBe(true);
+        expect(s.lastRefresh?.detail).toBe("dry-run: graph is current — no new data to check");
+        expect(s.lastRefresh?.partTable).toBeUndefined();
+        expect(closeJobLog).toHaveBeenCalledWith(77, "completed");
+      });
+
       it("a dry-run completion restores the stage held before dispatch, not a hardcoded idle", async () => {
         // Dispatch twice: first a normal dispatch that fails (→ "failed"), then a
         // dry-run dispatch from that stage — the dry-run completion must restore

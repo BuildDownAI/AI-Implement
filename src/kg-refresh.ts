@@ -1252,12 +1252,14 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
         currentDispatchId = null;
         currentDispatchIsDryRun = false;
 
-        const ok = runnerOutcome === "success";
-        const detail = ok
+        const ok = runnerOutcome === "success" || data.failureCode === "KG_SNAPSHOT_STALE";
+        const detail = runnerOutcome === "success"
           ? "dry-run: guard passed: no shrink"
-          : data.guardVerdict === "refused"
-            ? `dry-run: guard refused: ${(data.failureReason ?? data.failureCode ?? "refused").split("\n")[0]}`
-            : `dry-run: failed: ${data.failureCode ?? (data.failureReason ?? "unknown").split("\n")[0]}`;
+          : data.failureCode === "KG_SNAPSHOT_STALE"
+            ? "dry-run: graph is current — no new data to check"
+            : data.guardVerdict === "refused"
+              ? `dry-run: guard refused: ${(data.failureReason ?? data.failureCode ?? "refused").split("\n")[0]}`
+              : `dry-run: failed: ${data.failureCode ?? (data.failureReason ?? "unknown").split("\n")[0]}`;
 
         lastRefresh = {
           ok,
