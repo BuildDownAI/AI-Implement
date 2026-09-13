@@ -1560,6 +1560,82 @@ describe("admin kg materialize-mode", () => {
   });
 });
 
+describe("admin kg refresh dry-run (AII-635)", () => {
+  const kgRefreshDeps = {
+    trigger: vi.fn(async (_opts?: { dryRun?: boolean }) => ({ status: 202, body: { accepted: true } })),
+    status: vi.fn(),
+    onMachineLost: vi.fn(),
+  };
+
+  beforeEach(() => {
+    kgRefreshDeps.trigger.mockClear();
+  });
+
+  async function kgRequest(
+    url: string,
+    method: string,
+    token: string,
+    body?: unknown,
+    rawBody?: string,
+  ): Promise<{ statusCode: number; body: string }> {
+    const payload = rawBody !== undefined ? rawBody : body === undefined ? undefined : JSON.stringify(body);
+    const req = new MockRequest(url, method, { authorization: `Bearer ${token}` }, payload);
+    const res = new MockResponse();
+    admin.handleAdminRequest(
+      req as never,
+      res as never,
+      adminConfig("secret"),
+      makeFakeRegistry(provider),
+      { kgRefresh: kgRefreshDeps },
+    );
+    await res.done;
+    return { statusCode: res.statusCode, body: res.body };
+  }
+
+  it("POST /api/kg/refresh with { dryRun: true } reaches the trigger with dryRun and echoes it", async () => {
+    const token = await login("secret");
+    const res = await kgRequest("/api/kg/refresh", "POST", token, { dryRun: true });
+    expect(res.statusCode).toBe(202);
+    expect(kgRefreshDeps.trigger).toHaveBeenCalledTimes(1);
+    expect(kgRefreshDeps.trigger).toHaveBeenCalledWith({ dryRun: true });
+    expect(JSON.parse(res.body)).toMatchObject({ accepted: true, dryRun: true });
+  });
+
+  it("POST /api/kg/refresh with no body reaches the trigger with no option — the unchanged real refresh", async () => {
+    const token = await login("secret");
+    const res = await kgRequest("/api/kg/refresh", "POST", token);
+    expect(res.statusCode).toBe(202);
+    expect(kgRefreshDeps.trigger).toHaveBeenCalledTimes(1);
+    expect(kgRefreshDeps.trigger.mock.calls[0]).toHaveLength(0);
+    expect(JSON.parse(res.body)).toMatchObject({ accepted: true, dryRun: false });
+  });
+
+  it("POST /api/kg/refresh with { dryRun: false } is the real refresh", async () => {
+    const token = await login("secret");
+    const res = await kgRequest("/api/kg/refresh", "POST", token, { dryRun: false });
+    expect(res.statusCode).toBe(202);
+    expect(kgRefreshDeps.trigger.mock.calls[0]).toHaveLength(0);
+    expect(JSON.parse(res.body).dryRun).toBe(false);
+  });
+
+  it("POST /api/kg/refresh with an invalid JSON body returns 400 and does not trigger", async () => {
+    const token = await login("secret");
+    const res = await kgRequest("/api/kg/refresh", "POST", token, undefined, "{not json");
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toBe("Invalid JSON body");
+    expect(kgRefreshDeps.trigger).not.toHaveBeenCalled();
+  });
+
+  it("the Deployments page carries the Dry-run refresh button and the last-dry-run block", async () => {
+    const page = await import("../admin-ui/pages/deployments.js");
+    expect(page.deploymentsHtml).toContain('id="kg-dry-run-btn"');
+    expect(page.deploymentsHtml).toContain("window.triggerKgRefresh(true)");
+    expect(page.deploymentsHtml).toContain('id="kg-dry-run-last"');
+    expect(page.deploymentsScript).toContain("JSON.stringify({ dryRun: true })");
+    expect(page.deploymentsScript).toContain("function renderKgDryRun(");
+  });
+});
+
 describe("admin secrets", () => {
   beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
   afterEach(() => { vi.restoreAllMocks(); });

@@ -251,9 +251,12 @@ line-count table land on `get_kg_status` as `lastRefresh.dryRun`, `lastRefresh.d
 (`"dry-run: guard passed: ..."` / `"dry-run: guard refused: ..."` / `"dry-run: failed: ..."`), and
 `lastRefresh.partTable`. `servedStamp` and `current/` never change, and `stage` is restored to
 whatever it held before the dispatch rather than advancing through `staging`/`serving`/`reverted`.
-A dry-run and a real run of the same KG head print the same part table. The REST body
-(`POST /api/kg/refresh { dryRun: true }`) and the Deployments-page button that trigger it through
-the admin UI follow in AII-635; today, `dryRun` is reachable only via the MCP tool.
+A dry-run and a real run of the same KG head print the same part table. The same dry-run is
+reachable from the admin REST route, `POST /api/kg/refresh` with body `{ "dryRun": true }` (the
+response echoes `dryRun` beside the trigger's fields; no body is the unchanged real refresh), and
+from the Deployments page's **Dry-run refresh** button beside **Refresh graph now** (AII-635). When
+the last terminal outcome was a dry-run, the Knowledge graph card shows its verdict and the
+per-part table (`part | previous | new | delta`).
 
 **Redeploy remains the path for code, not data** — a change that touches the sidecar's code rather
 than its data ships by deploy, and the image build reads whatever snapshot is on the KG repo's default
