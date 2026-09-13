@@ -534,6 +534,18 @@ export function updateJobPrUrl(jobId: number, prUrl: string): void {
  * Returns the most recent dispatch log entry for a given PR.
  * Used to recover issue metadata for orchestrator-mediated comment gap-fills.
  */
+export function getLatestDispatchForPr(owner: string, repo: string, prNumber: number): Job | null {
+  const fullRepo = `${owner}/${repo}`;
+  const prUrl = `https://github.com/${owner}/${repo}/pull/${prNumber}`;
+  const row = getDb()
+    .prepare(
+      "SELECT * FROM dispatch_log WHERE repo = ? AND pr_url = ? ORDER BY dispatched_at DESC LIMIT 1",
+    )
+    .get(fullRepo, prUrl) as RawRow | undefined;
+  if (!row) return null;
+  return mapRows([row])[0];
+}
+
 /** Latest dispatch for an issue in a repo, matched case-insensitively on the tracker
  *  identifier. Recovery path for PRs the orchestrator opened WITHOUT a dispatch —
  *  a grouping roll-up PR encodes its feature-node parent's key in the head branch,
@@ -545,18 +557,6 @@ export function getLatestDispatchForIssueIdentifier(owner: string, repo: string,
       "SELECT * FROM dispatch_log WHERE repo = ? AND issue_identifier = ? COLLATE NOCASE ORDER BY dispatched_at DESC LIMIT 1",
     )
     .get(`${owner}/${repo}`, identifier) as RawRow | undefined;
-  if (!row) return null;
-  return mapRows([row])[0];
-}
-
-export function getLatestDispatchForPr(owner: string, repo: string, prNumber: number): Job | null {
-  const fullRepo = `${owner}/${repo}`;
-  const prUrl = `https://github.com/${owner}/${repo}/pull/${prNumber}`;
-  const row = getDb()
-    .prepare(
-      "SELECT * FROM dispatch_log WHERE repo = ? AND pr_url = ? ORDER BY dispatched_at DESC LIMIT 1",
-    )
-    .get(fullRepo, prUrl) as RawRow | undefined;
   if (!row) return null;
   return mapRows([row])[0];
 }
