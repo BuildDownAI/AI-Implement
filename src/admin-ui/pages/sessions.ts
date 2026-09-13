@@ -74,9 +74,14 @@ export const sessionsScript = `
         const issueLabel = s.issueIdentifier
           ? (s.issueTitle ? s.issueIdentifier + ': ' + s.issueTitle : s.issueIdentifier)
           : '—';
-        const issueHtml = s.issueIdentifier
-          ? '<a href="https://linear.app/issue/' + window.escAttr(s.issueIdentifier) + '" target="_blank">' + window.esc(issueLabel) + '</a>'
-          : '<span class="mono">—</span>';
+        let issueHtml;
+        if (s.issueIdentifier && s.issueUrl) {
+          issueHtml = '<a href="' + window.safeUrl(s.issueUrl) + '" target="_blank">' + window.esc(issueLabel) + '</a>';
+        } else if (s.issueIdentifier) {
+          issueHtml = window.esc(issueLabel);
+        } else {
+          issueHtml = '<span class="mono">—</span>';
+        }
         tr.innerHTML = '<td>' + issueHtml + '</td>'
           + '<td class="mono">' + window.esc(s.teamKey || '—') + '</td>'
           + '<td class="mono">' + window.esc(s.repo || '—') + '</td>'

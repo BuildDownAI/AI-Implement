@@ -25,10 +25,12 @@ vi.mock("../notify.js", async (importOriginal) => ({
 
 const fetchMachineLogsMock = vi.hoisted(() => vi.fn<() => Promise<string>>());
 const destroyMachineMock = vi.hoisted(() => vi.fn(async () => {}));
+const listMachinesMock = vi.hoisted(() => vi.fn<() => Promise<import("../fly-machines.js").Machine[]>>(async () => []));
 vi.mock("../fly-machines.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../fly-machines.js")>()),
   fetchMachineLogs: fetchMachineLogsMock,
   destroyMachine: destroyMachineMock,
+  listMachines: listMachinesMock,
 }));
 
 vi.mock("../workflow-sync.js", () => ({
@@ -209,6 +211,19 @@ async function requestRaw(url: string, method: string, accessCode: string | null
   const req = new MockRequest(url, method, token ? { authorization: `Bearer ${token}` } : {}, body === undefined ? undefined : JSON.stringify(body));
   const res = new MockResponse();
   admin.handleAdminRequest(req as never, res as never, adminConfig(accessCode), makeFakeRegistry(provider));
+  await res.done;
+  return { statusCode: res.statusCode, body: res.body };
+}
+
+async function requestWithConfig(
+  url: string,
+  method: string,
+  token: string,
+  cfg: Parameters<typeof admin.handleAdminRequest>[2],
+): Promise<{ statusCode: number; body: string }> {
+  const req = new MockRequest(url, method, { authorization: `Bearer ${token}` });
+  const res = new MockResponse();
+  admin.handleAdminRequest(req as never, res as never, cfg, makeFakeRegistry(provider));
   await res.done;
   return { statusCode: res.statusCode, body: res.body };
 }
@@ -2111,6 +2126,28 @@ describe("admin sessions", () => {
     expect(JSON.parse(res.body)).toEqual([]);
   });
 
+  it("links each session's issue through the mapping's ticketing provider (issueUrl)", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", { teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml" }, token);
+    log.appendLog({ issueId: "issue-s1", issueIdentifier: "ENG-7", issueTitle: "Mapped", teamKey: "ENG", repo: "org/repo", machineId: "machine-mapped" });
+    log.appendLog({ issueId: "issue-s2", issueIdentifier: "ZZZ-1", issueTitle: "Unmapped", teamKey: "ZZZ", repo: "org/other", machineId: "machine-unmapped" });
+    const machine = (id: string) => ({ id, name: id, state: "started", region: "iad", created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z", config: {} as never });
+    listMachinesMock.mockResolvedValueOnce([machine("machine-mapped"), machine("machine-unmapped"), machine("machine-orphan")]);
+
+    const res = await requestWithConfig("/api/sessions", "GET", token, {
+      ...adminConfig("secret"),
+      flySessionsToken: "fly-token",
+      flySessionsApp: "test-sessions-app",
+    });
+    expect(res.statusCode).toBe(200);
+    const sessions = JSON.parse(res.body) as Array<{ machineId: string; issueIdentifier: string | null; issueUrl: string | null }>;
+    expect(sessions.map((s) => [s.machineId, s.issueIdentifier, s.issueUrl])).toEqual([
+      ["machine-mapped", "ENG-7", "https://fake/issue/ENG-7"],
+      ["machine-unmapped", "ZZZ-1", null],
+      ["machine-orphan", null, null],
+    ]);
+  });
+
   it("returns 503 on destroy when Fly config is not set", async () => {
     const token = await login("secret");
     const res = await request("/api/sessions/machine-abc", "DELETE", "secret", undefined, token);
@@ -2217,6 +2254,23 @@ describe("admin job-detail endpoint", () => {
     expect(body.job.id).toBe(id);
     expect(Array.isArray(body.steps)).toBe(true);
   });
+
+  it("resolves the job's issueUrl through the mapping's ticketing provider", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", { teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml" }, token);
+    const id = log.appendLog({ issueId: "issue-url", issueIdentifier: "ENG-42", issueTitle: "Linked", teamKey: "ENG", repo: "org/repo" });
+    const res = await request(`/api/jobs/${id}/steps`, "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body).job.issueUrl).toBe("https://fake/issue/ENG-42");
+  });
+
+  it("returns a null issueUrl when the job's team has no mapping", async () => {
+    const token = await login("secret");
+    const id = log.appendLog({ issueId: "issue-nourl", issueIdentifier: "ZZZ-1", issueTitle: "Unmapped", teamKey: "ZZZ", repo: "org/repo" });
+    const res = await request(`/api/jobs/${id}/steps`, "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body).job.issueUrl).toBeNull();
+  });
 });
 
 describe("admin dedup", () => {
@@ -2296,6 +2350,25 @@ describe("admin issues endpoint", () => {
     expect(body.issues[1].identifier).toBe("CORE-50");
     expect(body.issues[1].bucket).toBe("needs-planning");
   });
+
+  it("resolves issueUrl through the team's ticketing provider, null for unmapped teams", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", { teamKey: "CORE", owner: "org", repo: "core", planningWorkflowFile: "claude-plan.yml" }, token);
+    const mapped: TicketIssue = { id: "issue-1", identifier: "CORE-100", title: "Mapped", description: null, scopeKey: "CORE", nativeStatus: "Todo" };
+    const unmapped: TicketIssue = { id: "issue-2", identifier: "ZZZ-1", title: "Unmapped", description: null, scopeKey: "ZZZ", nativeStatus: "Todo" };
+    vi.spyOn(provider, "fetchAIImplementSnapshot").mockResolvedValueOnce({
+      readyForImplementation: [mapped],
+      needsPlanning: [unmapped],
+      inProgressCountsByScope: {},
+    });
+    const res = await request("/api/issues", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.issues.map((i: { identifier: string; issueUrl: string | null }) => [i.identifier, i.issueUrl])).toEqual([
+      ["CORE-100", "https://fake/issue/CORE-100"],
+      ["ZZZ-1", null],
+    ]);
+  });
 });
 
 describe("admin pulls endpoint", () => {
@@ -2340,6 +2413,23 @@ describe("admin pulls endpoint", () => {
     expect(body.pulls).toHaveLength(1);
     expect(body.pulls[0].prUrl).toBe("https://github.com/org/repo/pull/55");
     expect(body.pulls[0].prNumber).toBe(55);
+  });
+
+  it("resolves issueUrl through the team's ticketing provider, null for unmapped teams", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", { teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml" }, token);
+
+    const mapped = log.appendLog({ issueId: "issue-pull-m", issueIdentifier: "ENG-1", repo: "org/repo", teamKey: "ENG", dispatchNumber: 1 });
+    log.updateJobStatus(mapped, "completed", "success", "https://github.com/org/repo/pull/1");
+    const unmapped = log.appendLog({ issueId: "issue-pull-u", issueIdentifier: "ZZZ-1", repo: "org/other", teamKey: "ZZZ", dispatchNumber: 1 });
+    log.updateJobStatus(unmapped, "completed", "success", "https://github.com/org/other/pull/2");
+
+    const res = await request("/api/pulls", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    const byIssue = Object.fromEntries(
+      (JSON.parse(res.body).pulls as Array<{ issueIdentifier: string; issueUrl: string | null }>).map((p) => [p.issueIdentifier, p.issueUrl]),
+    );
+    expect(byIssue).toEqual({ "ENG-1": "https://fake/issue/ENG-1", "ZZZ-1": null });
   });
 });
 
@@ -2387,6 +2477,26 @@ describe("admin blockers endpoint", () => {
     expect(body.blockers[0].reason).toBe("no-mapping");
     expect(body.totals.byReason["no-mapping"]).toBe(1);
     expect(body.totals.issues).toBe(1);
+  });
+
+  it("resolves issueUrl through the team's ticketing provider; a no-mapping blocker has none", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", { teamKey: "CORE", owner: "org", repo: "core", planningWorkflowFile: "claude-plan.yml" }, token);
+    const dedupBlocked: TicketIssue = { id: "issue-1", identifier: "CORE-100", title: "Already dispatched", description: null, scopeKey: "CORE", nativeStatus: "Todo" };
+    const unmapped: TicketIssue = { id: "issue-2", identifier: "ZZZ-1", title: "No mapping", description: null, scopeKey: "ZZZ", nativeStatus: "Todo" };
+    dedup.markDispatched("issue-1", "CORE-100", "Already dispatched");
+    vi.spyOn(provider, "fetchAIImplementSnapshot").mockResolvedValueOnce({
+      readyForImplementation: [dedupBlocked, unmapped],
+      needsPlanning: [],
+      inProgressCountsByScope: {},
+    });
+    const res = await request("/api/blockers", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.blockers.map((b: { reason: string; issueIdentifier: string; issueUrl: string | null }) => [b.reason, b.issueIdentifier, b.issueUrl])).toEqual([
+      ["dedup", "CORE-100", "https://fake/issue/CORE-100"],
+      ["no-mapping", "ZZZ-1", null],
+    ]);
   });
 });
 

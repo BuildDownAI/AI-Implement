@@ -72,7 +72,7 @@ export const issuesScript = `
         + '<td><span class="mono">' + window.esc(issue.teamKey) + '</span></td>'
         + '<td><span class="badge ' + stateKind + '"><span class="dot"></span>' + window.esc(issue.stateName) + '</span></td>'
         + '<td>' + planBadge + '</td>'
-        + '<td><a class="text-accent" href="https://linear.app/issue/' + window.escAttr(issue.identifier) + '" target="_blank">Open ↗</a></td>';
+        + '<td>' + (issue.issueUrl ? '<a class="text-accent" href="' + window.safeUrl(issue.issueUrl) + '" target="_blank">Open \u2197</a>' : '<span class="text-tertiary">\u2014</span>') + '</td>';
       tbody.appendChild(tr);
     }
   }

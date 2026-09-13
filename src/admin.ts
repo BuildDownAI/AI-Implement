@@ -677,16 +677,14 @@ export function handleAdminRequest(
     }
 
     if (url === "/api/pulls" && method === "GET") {
-      json(res, 200, { pulls: getPulls() });
+      handleListPulls(res, registry);
       return true;
     }
 
     const jobStepsMatch = url.match(/^\/api\/jobs\/(\d+)\/steps$/);
     if (jobStepsMatch && method === "GET") {
       const jobId = Number.parseInt(jobStepsMatch[1], 10);
-      const job = getJobById(jobId);
-      if (!job) { json(res, 404, { error: "job not found" }); return true; }
-      json(res, 200, { job, steps: getStepsByJobId(jobId) });
+      handleGetJobSteps(res, registry, jobId);
       return true;
     }
 
@@ -782,7 +780,7 @@ export function handleAdminRequest(
     }
 
     if (url === "/api/sessions" && method === "GET") {
-      handleListSessions(req, res, config);
+      handleListSessions(req, res, config, registry);
       return true;
     }
 
@@ -956,6 +954,51 @@ async function fetchMergedSnapshot(registry: ProviderRegistry): Promise<AIImplem
   };
 }
 
+async function resolveIssueUrl(
+  registry: ProviderRegistry,
+  teamKey: string | null,
+  identifier: string | null,
+): Promise<string | null> {
+  if (!teamKey || !identifier) return null;
+  const mapping = getMappings()[teamKey];
+  if (!mapping) return null;
+  try {
+    const provider = await registry.forMapping(mapping);
+    return provider.issueUrl({ identifier } as TicketIssue);
+  } catch {
+    return null;
+  }
+}
+
+async function handleListPulls(
+  res: http.ServerResponse,
+  registry: ProviderRegistry,
+): Promise<void> {
+  try {
+    const pulls = getPulls();
+    const enriched = await Promise.all(
+      pulls.map(async (pull) => ({
+        ...pull,
+        issueUrl: await resolveIssueUrl(registry, pull.teamKey, pull.issueIdentifier),
+      })),
+    );
+    json(res, 200, { pulls: enriched });
+  } catch (err) {
+    json(res, 500, { error: err instanceof Error ? err.message : String(err) });
+  }
+}
+
+async function handleGetJobSteps(
+  res: http.ServerResponse,
+  registry: ProviderRegistry,
+  jobId: number,
+): Promise<void> {
+  const job = getJobById(jobId);
+  if (!job) { json(res, 404, { error: "job not found" }); return; }
+  const issueUrl = await resolveIssueUrl(registry, job.teamKey, job.issueIdentifier);
+  json(res, 200, { job: { ...job, issueUrl }, steps: getStepsByJobId(jobId) });
+}
+
 async function handleListBlockers(
   res: http.ServerResponse,
   registry: ProviderRegistry,
@@ -984,11 +1027,17 @@ async function handleListBlockers(
       registry,
     );
     const fileOverlapBlockers = selectFileOverlapDeferrals(fileOverlapCandidates, inFlightSiblings, planningContexts);
-    const blockers = [...baseBlockers, ...fileOverlapBlockers].sort(
+    const sorted = [...baseBlockers, ...fileOverlapBlockers].sort(
       (a, b) =>
         a.reason.localeCompare(b.reason) ||
         a.teamKey.localeCompare(b.teamKey) ||
         a.issueIdentifier.localeCompare(b.issueIdentifier),
+    );
+    const blockers = await Promise.all(
+      sorted.map(async (b) => ({
+        ...b,
+        issueUrl: await resolveIssueUrl(registry, b.teamKey, b.issueIdentifier),
+      })),
     );
     const teams = new Set(blockers.map((b) => b.teamKey));
     const byReason: Record<string, number> = {};
@@ -1008,10 +1057,17 @@ async function handleListIssues(
 ): Promise<void> {
   try {
     const snapshot = await fetchMergedSnapshot(registry);
-    const issues = [
-      ...snapshot.readyForImplementation.map((i) => shapeIssue(i, "ready")),
-      ...snapshot.needsPlanning.map((i) => shapeIssue(i, "needs-planning")),
-    ].sort((a, b) => a.identifier.localeCompare(b.identifier));
+    const allIssues: { issue: TicketIssue; bucket: "ready" | "needs-planning" }[] = [
+      ...snapshot.readyForImplementation.map((i) => ({ issue: i, bucket: "ready" as const })),
+      ...snapshot.needsPlanning.map((i) => ({ issue: i, bucket: "needs-planning" as const })),
+    ];
+    const issues = await Promise.all(
+      allIssues.map(async ({ issue, bucket }) => ({
+        ...shapeIssue(issue, bucket),
+        issueUrl: await resolveIssueUrl(registry, issue.scopeKey, issue.identifier),
+      })),
+    );
+    issues.sort((a, b) => a.identifier.localeCompare(b.identifier));
     json(res, 200, {
       issues,
       inProgressCountsByTeam: snapshot.inProgressCountsByScope,
@@ -1141,6 +1197,7 @@ async function handleListSessions(
   _req: http.IncomingMessage,
   res: http.ServerResponse,
   config: AdminConfig,
+  registry: ProviderRegistry,
 ): Promise<void> {
   if (!config.flySessionsToken || !config.flySessionsApp) {
     json(res, 200, []);
@@ -1157,7 +1214,7 @@ async function handleListSessions(
     const jobs = getInFlightJobs();
     const byMachineId = new Map(jobs.filter((j) => j.machineId).map((j) => [j.machineId, j]));
 
-    const sessions = active.map((m) => {
+    const sessions = await Promise.all(active.map(async (m) => {
       const job = byMachineId.get(m.id);
       return {
         machineId: m.id,
@@ -1168,11 +1225,12 @@ async function handleListSessions(
         issueId: job?.issueId ?? null,
         issueIdentifier: job?.issueIdentifier ?? null,
         issueTitle: job?.issueTitle ?? null,
+        issueUrl: await resolveIssueUrl(registry, job?.teamKey ?? null, job?.issueIdentifier ?? null),
         teamKey: job?.teamKey ?? null,
         repo: job?.repo ?? null,
         dispatchedAt: job?.dispatchedAt ?? null,
       };
-    });
+    }));
 
     json(res, 200, sessions);
   } catch (err) {
