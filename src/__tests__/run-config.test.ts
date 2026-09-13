@@ -129,6 +129,31 @@ describe("run-config envelope", () => {
     expect(decoded.dependencyTokenScope).toBe("installation");
     expect((decoded as Record<string, unknown>).bogusKey).toBeUndefined();
   });
+
+  it("round-trips kgDryRun: true", () => {
+    const cfg: RunConfigV1 = {
+      v: 1,
+      issue: { id: "i", identifier: "AII-632", title: "t", description: "" },
+      kgDryRun: true,
+    };
+    expect(decodeRunConfig(encodeRunConfig(cfg)).kgDryRun).toBe(true);
+  });
+
+  it("absent kgDryRun decodes as undefined (no key materialized, never serialized as false)", () => {
+    const min: RunConfigV1 = { v: 1, issue: { id: "i", identifier: "AII-632", title: "t", description: "" } };
+    const decoded = decodeRunConfig(encodeRunConfig(min));
+    expect(decoded.kgDryRun).toBeUndefined();
+    expect("kgDryRun" in decoded).toBe(false);
+  });
+
+  it("pickKnownKeys preserves kgDryRun alongside kgSourceRepo", () => {
+    const withKg = { ...full, kgSourceRepo: "org/kg", kgDryRun: true as const, bogusKey: "dropped" };
+    const b64 = Buffer.from(JSON.stringify(withKg), "utf-8").toString("base64");
+    const decoded = decodeRunConfig(b64);
+    expect(decoded.kgSourceRepo).toBe("org/kg");
+    expect(decoded.kgDryRun).toBe(true);
+    expect((decoded as Record<string, unknown>).bogusKey).toBeUndefined();
+  });
 });
 
 describe("runConfigFromTaskDocument", () => {

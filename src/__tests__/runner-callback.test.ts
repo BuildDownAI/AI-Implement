@@ -141,6 +141,67 @@ describe("handleRunnerResult — validation", () => {
   });
 });
 
+describe("handleRunnerResult — kg-refresh forwarding (AII-632)", () => {
+  it("forwards guardVerdict and partTable to onKgRefreshRunnerComplete intact", async () => {
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "kg-refresh",
+      mappingTeamKey: "KGA",
+      phase: "kg-refresh",
+      ttlSeconds: 4 * 60 * 60,
+      secret: SECRET,
+    });
+    const onKgRefreshRunnerComplete = vi.fn();
+    const partTable = [
+      { part: "issue.nt", prev: "100", new: "40" },
+      { part: "comment.nt", prev: "200", new: "199" },
+    ];
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "kg-refresh",
+        outcome: "failure",
+        comments: [],
+        failureCode: "KG_SNAPSHOT_TRACKER_REGRESSION",
+        failureReason: "content regression detected",
+        guardVerdict: "refused",
+        partTable,
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider()),
+      onKgRefreshRunnerComplete,
+    });
+    expect(res.status).toBe(200);
+    expect(onKgRefreshRunnerComplete).toHaveBeenCalledTimes(1);
+    expect(onKgRefreshRunnerComplete).toHaveBeenCalledWith(
+      "failure",
+      expect.objectContaining({ guardVerdict: "refused", partTable }),
+    );
+  });
+
+  it("forwards guardVerdict and partTable as undefined when the body omits them", async () => {
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "kg-refresh",
+      mappingTeamKey: "KGA",
+      phase: "kg-refresh",
+      ttlSeconds: 4 * 60 * 60,
+      secret: SECRET,
+    });
+    const onKgRefreshRunnerComplete = vi.fn();
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: { phase: "kg-refresh", outcome: "success", comments: [] },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider()),
+      onKgRefreshRunnerComplete,
+    });
+    expect(res.status).toBe(200);
+    expect(onKgRefreshRunnerComplete).toHaveBeenCalledTimes(1);
+    const [, data] = onKgRefreshRunnerComplete.mock.calls[0];
+    expect(data.guardVerdict).toBeUndefined();
+    expect(data.partTable).toBeUndefined();
+  });
+});
+
 describe("handleRunnerResult — mapping resolution", () => {
   it("returns 200 with mapping_deleted warning when provider resolution returns null", async () => {
     const { token } = runnerTokens.mintRunToken({

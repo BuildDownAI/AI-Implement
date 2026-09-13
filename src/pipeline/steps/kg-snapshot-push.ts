@@ -30,8 +30,11 @@ export class KgSnapshotStaleError extends Error {
  */
 export class KgSnapshotTrackerRegressionError extends Error {
   readonly code = "KG_SNAPSHOT_TRACKER_REGRESSION";
-  constructor(detail: string) {
+  /** Per-part {part, prev, new} rows computed before the refusal (AII-632); empty when the guard fired before any part was read. */
+  readonly partTable: Array<{ part: string; prev: string; new: string }>;
+  constructor(detail: string, partTable: Array<{ part: string; prev: string; new: string }> = []) {
     super(`KG_SNAPSHOT_TRACKER_REGRESSION: ${detail}`);
+    this.partTable = partTable;
   }
 }
 
@@ -79,6 +82,10 @@ interface KgSnapshotPushOutputs extends Record<string, unknown> {
   prNumber: number | null;
   /** The per-refresh branch (`kg-refresh/<stamp>`) the snapshot was pushed to. Null when nothing was pushed. */
   branchName: string | null;
+  /** Set only in dry-run mode (AII-632): "clean" once every guard above has passed. */
+  guardVerdict?: "clean";
+  /** Set only in dry-run mode (AII-632): the per-part {part, prev, new} rows from the report table. */
+  partTable?: Array<{ part: string; prev: string; new: string }>;
 }
 
 interface KgStats {
@@ -529,6 +536,7 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
         if (regressions.length > 0) {
           throw new KgSnapshotTrackerRegressionError(
             `content regression detected — ${regressions.join("; ")}`,
+            partRows.map((row) => ({ part: row.part, prev: row.prev, new: row.next })),
           );
         }
       }
@@ -628,7 +636,14 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
     if (dryRun) {
       console.log("[kg-snapshot-push] dry-run: all guards passed; skipping commit, push, and PR");
       console.log(reportBody);
-      return { snapshotPushed: false, commitSha: null, prNumber: null, branchName: null };
+      return {
+        snapshotPushed: false,
+        commitSha: null,
+        prNumber: null,
+        branchName: null,
+        guardVerdict: "clean",
+        partTable: partRows.map((row) => ({ part: row.part, prev: row.prev, new: row.next })),
+      };
     }
 
     // ── 5. Commit snapshot/ ──────────────────────────────────────────────────
