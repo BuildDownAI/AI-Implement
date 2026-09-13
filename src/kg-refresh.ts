@@ -64,6 +64,9 @@ const KG_SNAPSHOT_SHA_SETTINGS_KEY = "kg_refresh_snapshot_sha";
 /** DB settings key for persisting the last terminal refresh outcome across restarts. */
 const KG_LAST_REFRESH_SETTINGS_KEY = "kg_refresh_last_refresh";
 
+/** DB settings key for persisting per-PR dry-run outcomes across restarts (AII-640). */
+const KG_DRY_RUN_OUTCOMES_SETTINGS_KEY = "kg_refresh_dry_run_outcomes";
+
 /**
  * Default bound on the per-PR caches tracking KG PR-check state — this module's
  * `dryRunOutcomesByPr` and webhook.ts's `kgDryRunLastSha`/`kgDryRunPending` (AII-636).
@@ -106,6 +109,9 @@ export interface KgDryRunReportTarget {
   sha: string;
   acceptBaseline?: boolean;
 }
+
+/** One entry of the persisted `dryRunOutcomesByPr` cache — `[repo#prNumber, {sha, outcome}]` (AII-640). */
+export type DryRunOutcomeEntry = [string, { sha: string; outcome: RefreshOutcome }];
 
 /** Heading prefix used to find and update the sticky dry-run PR comment across pushes (AII-633). */
 export const KG_DRY_RUN_COMMENT_MARKER = "## kg-refresh dry-run";
@@ -397,6 +403,14 @@ interface KgRefreshInput {
   persistLastRefresh?: (outcome: RefreshOutcome) => void;
   /** Load the last persisted terminal refresh outcome. Injectable for tests; returns null when absent. */
   loadLastRefresh?: () => RefreshOutcome | null;
+  /**
+   * Persist the per-PR dry-run outcome cache across restarts (AII-640). Injectable for
+   * tests. Called with the full, already-capped entry list on every record/evict so the
+   * persisted blob never lags `dryRunOutcomesByPr`. Default: writes to the DB settings table.
+   */
+  persistDryRunOutcomes?: (entries: DryRunOutcomeEntry[]) => void;
+  /** Load the persisted per-PR dry-run outcome cache. Injectable for tests; returns null when absent. */
+  loadDryRunOutcomes?: () => DryRunOutcomeEntry[] | null;
 
   /** Probe a (token, slug, grant) for the credential preflight. Injectable for tests; defaults to GitHub REST calls. */
   probeRepo?: (token: string, slug: string, grant: "contents" | "pull_requests") => Promise<{ ok: boolean; status: number }>;
@@ -768,6 +782,8 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
   const loadStageFn = input.loadStage ?? defaultLoadStage;
   const persistLastRefreshFn = input.persistLastRefresh ?? defaultPersistLastRefresh;
   const loadLastRefreshFn = input.loadLastRefresh ?? defaultLoadLastRefresh;
+  const persistDryRunOutcomesFn = input.persistDryRunOutcomes ?? defaultPersistDryRunOutcomes;
+  const loadDryRunOutcomesFn = input.loadDryRunOutcomes ?? defaultLoadDryRunOutcomes;
   const fetchWorkflowFile = input.fetchWorkflowFile ?? defaultFetchWorkflowFile;
   const fetchCompare = input.fetchCompare ?? defaultFetchCompare;
 
@@ -811,6 +827,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
       const oldestKey = dryRunOutcomesByPr.keys().next().value;
       if (oldestKey !== undefined) dryRunOutcomesByPr.delete(oldestKey);
     }
+    persistDryRunOutcomesFn(Array.from(dryRunOutcomesByPr.entries()));
   }
 
   /** Fires every registered onRefreshSettled listener; a listener's own error never stops the others. */
@@ -826,6 +843,10 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
 
   // Restore persisted state on construction (crash recovery).
   lastRefresh = loadLastRefreshFn();
+  const persistedDryRunOutcomes = loadDryRunOutcomesFn();
+  if (persistedDryRunOutcomes) {
+    for (const [key, value] of persistedDryRunOutcomes) dryRunOutcomesByPr.set(key, value);
+  }
   const persisted = loadStageFn();
   if (persisted && persisted.stage === "ingest-running") {
     const ageMs = Date.now() - persisted.startedAt;
@@ -1793,6 +1814,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
 
     forgetPr(repo: string, prNumber: number): void {
       dryRunOutcomesByPr.delete(`${repo}#${prNumber}`);
+      persistDryRunOutcomesFn(Array.from(dryRunOutcomesByPr.entries()));
     },
 
     onRefreshSettled(cb: () => void): () => void {
@@ -1950,6 +1972,28 @@ function defaultLoadLastRefresh(): RefreshOutcome | null {
       .get(KG_LAST_REFRESH_SETTINGS_KEY) as { value: string } | undefined;
     if (!row) return null;
     return JSON.parse(row.value) as RefreshOutcome;
+  } catch {
+    return null;
+  }
+}
+
+function defaultPersistDryRunOutcomes(entries: DryRunOutcomeEntry[]): void {
+  try {
+    getDb()
+      .prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)")
+      .run(KG_DRY_RUN_OUTCOMES_SETTINGS_KEY, JSON.stringify(entries));
+  } catch {
+    // DB unavailable — the dry-run outcome cache will be lost on restart, which is acceptable.
+  }
+}
+
+function defaultLoadDryRunOutcomes(): DryRunOutcomeEntry[] | null {
+  try {
+    const row = getDb()
+      .prepare("SELECT value FROM settings WHERE key = ?")
+      .get(KG_DRY_RUN_OUTCOMES_SETTINGS_KEY) as { value: string } | undefined;
+    if (!row) return null;
+    return JSON.parse(row.value) as DryRunOutcomeEntry[];
   } catch {
     return null;
   }
