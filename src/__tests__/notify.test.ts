@@ -210,6 +210,60 @@ describe("notifyCompletion", () => {
         notifyCompletion("slack", "https://hook.example.com", { ...completionBase, status: "completed" }),
       ).rejects.toThrow("500");
     });
+
+    it("caps an oversized detail at 1500 characters before it enters the payload (BAC-27112 follow-up)", async () => {
+      vi.mocked(fetch).mockResolvedValueOnce({ ok: true, status: 200 } as Response);
+      const detail = "x".repeat(2000);
+      await notifyCompletion("slack", "https://webhook.example.com/slack", {
+        ...completionBase, status: "failed", conclusion: "exit_1", prUrl: null,
+        summary: "Implementation failed.",
+        detail,
+      });
+      const text = JSON.parse((vi.mocked(fetch).mock.calls[0][1] as RequestInit).body as string).blocks[0].text.text;
+      expect(text).not.toContain(detail);
+      expect(text).toContain(`${"x".repeat(1500)}…`);
+    });
+
+    it("does not split a UTF-16 surrogate pair straddling the 1500-char cap (BAC-27112 follow-up)", async () => {
+      vi.mocked(fetch).mockResolvedValueOnce({ ok: true, status: 200 } as Response);
+      const emoji = "\u{1F600}"; // surrogate pair (U+D83D U+DE00) straddling index 1499/1500
+      const detail = `${"x".repeat(1499)}${emoji}${"y".repeat(50)}`;
+      await notifyCompletion("slack", "https://webhook.example.com/slack", {
+        ...completionBase, status: "failed", conclusion: "exit_1", prUrl: null,
+        summary: "Implementation failed.",
+        detail,
+      });
+      const text = JSON.parse((vi.mocked(fetch).mock.calls[0][1] as RequestInit).body as string).blocks[0].text.text;
+      // A naive slice(0, 1500) would keep the emoji's lone high surrogate and drop its
+      // low surrogate — the cut must instead drop the whole emoji.
+      expect(text).not.toContain("\ud83d");
+      expect(text).toContain(`${"x".repeat(1499)}…`);
+    });
+
+    it("closes a code fence the 1500-char cap would otherwise cut through (BAC-27112 gap-fill)", async () => {
+      vi.mocked(fetch).mockResolvedValueOnce({ ok: true, status: 200 } as Response);
+      // Mirrors classificationForFailure's shape: status line + PR line + a fenced evidence
+      // excerpt long enough that the flat 1500-char cap lands inside the fence, not after it.
+      const evidence = "error output line\n".repeat(120);
+      const detail =
+        "Failing stage ran for 12m 34s. Last successful stage: `install`.\n\n" +
+        "No PR was opened.\n\n" +
+        `\`\`\`\n${evidence}\`\`\``;
+      expect(detail.length).toBeGreaterThan(1500);
+
+      await notifyCompletion("slack", "https://webhook.example.com/slack", {
+        ...completionBase, status: "failed", conclusion: "exit_1", prUrl: null,
+        summary: "Implementation failed.",
+        detail,
+        remediation: "Check the run logs, then re-dispatch once fixed.",
+        docsUrl: "https://docs.builddown.ai/reference/troubleshooting",
+      });
+      const text = JSON.parse((vi.mocked(fetch).mock.calls[0][1] as RequestInit).body as string).blocks[0].text.text;
+
+      expect((text.match(/```/g) || []).length % 2).toBe(0);
+      expect(text).toContain("*Next step:* Check the run logs, then re-dispatch once fixed.");
+      expect(text).toContain("<https://docs.builddown.ai/reference/troubleshooting|Troubleshooting guide>");
+    });
   });
 
   describe("teams", () => {
@@ -272,6 +326,46 @@ describe("notifyCompletion", () => {
       await expect(
         notifyCompletion("teams", "https://hook.example.com", { ...completionBase, status: "completed" }),
       ).rejects.toThrow("500");
+    });
+
+    it("caps an oversized detail at 1500 characters before it enters the payload (BAC-27112 follow-up)", async () => {
+      vi.mocked(fetch).mockResolvedValueOnce({ ok: true, status: 200 } as Response);
+      const detail = "x".repeat(2000);
+      await notifyCompletion("teams", "https://webhook.example.com/teams", {
+        ...completionBase, status: "failed", conclusion: "exit_1", prUrl: null,
+        summary: "Implementation failed.",
+        detail,
+      });
+      const card = JSON.parse((vi.mocked(fetch).mock.calls[0][1] as RequestInit).body as string).attachments[0].content;
+      const textBlocks = card.body.filter((b: { type: string }) => b.type === "TextBlock");
+      const classification = textBlocks[textBlocks.length - 1].text;
+      expect(classification).not.toContain(detail);
+      expect(classification).toContain(`${"x".repeat(1500)}…`);
+    });
+
+    it("closes a code fence the 1500-char cap would otherwise cut through (BAC-27112 gap-fill)", async () => {
+      vi.mocked(fetch).mockResolvedValueOnce({ ok: true, status: 200 } as Response);
+      const evidence = "error output line\n".repeat(120);
+      const detail =
+        "Failing stage ran for 12m 34s. Last successful stage: `install`.\n\n" +
+        "No PR was opened.\n\n" +
+        `\`\`\`\n${evidence}\`\`\``;
+      expect(detail.length).toBeGreaterThan(1500);
+
+      await notifyCompletion("teams", "https://webhook.example.com/teams", {
+        ...completionBase, status: "failed", conclusion: "exit_1", prUrl: null,
+        summary: "Implementation failed.",
+        detail,
+        remediation: "Check the run logs, then re-dispatch once fixed.",
+        docsUrl: "https://docs.builddown.ai/reference/troubleshooting",
+      });
+      const card = JSON.parse((vi.mocked(fetch).mock.calls[0][1] as RequestInit).body as string).attachments[0].content;
+      const textBlocks = card.body.filter((b: { type: string }) => b.type === "TextBlock");
+      const classification = textBlocks[textBlocks.length - 1].text;
+
+      expect((classification.match(/```/g) || []).length % 2).toBe(0);
+      expect(classification).toContain("**Next step:** Check the run logs, then re-dispatch once fixed.");
+      expect(classification).toContain("[Troubleshooting guide](https://docs.builddown.ai/reference/troubleshooting)");
     });
   });
 });

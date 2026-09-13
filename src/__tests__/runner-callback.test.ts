@@ -16,6 +16,8 @@ import { STUCK_JOB_MAX_ATTEMPTS } from "../stuck-watchdog.js";
 import type { TicketingProvider } from "../providers/types.js";
 import type { Step } from "../pipeline/types.js";
 import type { ReferenceRepoResult } from "../reference-repos.js";
+import type { FailureRecord } from "../pipeline/failure-classification.js";
+import { shouldPostMonitorClassificationComment } from "../completion-classification.js";
 
 const SECRET = "test-secret-with-enough-entropy-for-hmac";
 
@@ -319,6 +321,154 @@ describe("handleRunnerResult — planning", () => {
       "ENG",
       "boom",
     ]);
+  });
+
+  it("stamps failureCommentedAt once markPlanningFailed has posted (BAC-27112 follow-up)", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "planning",
+      ttlSeconds: runnerTokens.PLANNING_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({
+      issueId: "i",
+      issueIdentifier: "ENG-1",
+      issueTitle: "Plan it",
+      teamKey: "ENG",
+      repo: "o/r",
+      dispatchId,
+      executionMode: "github-actions",
+      phase: "planning",
+    });
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: { phase: "planning", outcome: "failure", failureReason: "boom", comments: [] },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider({ recordCalls: true })),
+    });
+    expect(res.status).toBe(200);
+    expect(log.getJobById(jobId)?.failureCommentedAt).not.toBeNull();
+  });
+
+  it("leaves failureCommentedAt unset when markPlanningFailed itself throws, so the monitor backstop still fires (BAC-27112 follow-up)", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "planning",
+      ttlSeconds: runnerTokens.PLANNING_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({
+      issueId: "i",
+      issueIdentifier: "ENG-1",
+      issueTitle: "Plan it",
+      teamKey: "ENG",
+      repo: "o/r",
+      dispatchId,
+      executionMode: "github-actions",
+      phase: "planning",
+    });
+    const fake = new FakeProvider();
+    fake.markPlanningFailed = async () => {
+      throw new Error("provider down");
+    };
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: { phase: "planning", outcome: "failure", failureReason: "boom", comments: [] },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+    });
+    expect(res.status).toBe(200);
+    expect(log.getJobById(jobId)?.failureCommentedAt).toBeNull();
+  });
+
+  it("leaves failureCommentedAt unset when markPlanningFailed returns false (status write refused, no comment posted), so the monitor still posts (BAC-27112 follow-up)", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "planning",
+      ttlSeconds: runnerTokens.PLANNING_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({
+      issueId: "i",
+      issueIdentifier: "ENG-1",
+      issueTitle: "Plan it",
+      teamKey: "ENG",
+      repo: "o/r",
+      dispatchId,
+      executionMode: "github-actions",
+      phase: "planning",
+    });
+    const fake = new FakeProvider();
+    // Mirrors jira.ts's real refused-status path: returns normally, without throwing,
+    // and without having posted a comment.
+    fake.markPlanningFailed = async () => false;
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: { phase: "planning", outcome: "failure", failureReason: "boom", comments: [] },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+    });
+    expect(res.status).toBe(200);
+    const job = log.getJobById(jobId);
+    expect(job?.failureCommentedAt).toBeNull();
+    // No stamp means shouldPostMonitorClassificationComment still says yes.
+    expect(shouldPostMonitorClassificationComment({ failureCommentedAt: job?.failureCommentedAt ?? null })).toBe(true);
+  });
+
+  it("renders a structured failure record on the planning callback path too, matching the implementation rendering (BAC-27112 follow-up)", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "planning",
+      ttlSeconds: runnerTokens.PLANNING_TTL_SECONDS,
+      secret: SECRET,
+    });
+    log.appendLog({
+      issueId: "i",
+      issueIdentifier: "ENG-1",
+      issueTitle: "Plan it",
+      teamKey: "ENG",
+      repo: "o/r",
+      dispatchId,
+      executionMode: "github-actions",
+      phase: "planning",
+    });
+    const fake = new FakeProvider({ recordCalls: true });
+    const planningFailure = {
+      category: "config",
+      code: "PROVIDER_CONFIG",
+      stage: "setup",
+      attempt: 1,
+      retryable: false,
+      message: "bad model id",
+      evidence: { truncated: false },
+    };
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "planning",
+        outcome: "failure",
+        failureReason: "bad model id",
+        comments: [],
+        failure: planningFailure,
+      } as unknown as RunnerCallbackModule.RunnerResultBody,
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+    });
+
+    expect(res.status).toBe(200);
+    const reason = fake.recordedCalls().find((c) => c.method === "markPlanningFailed")?.args[2] as string;
+    expect(reason).toContain("Failed at stage `setup`");
+    expect(reason).toContain("config/PROVIDER_CONFIG");
+    expect(reason).toContain("```");
+    expect(reason).toContain("No PR was opened.");
   });
 });
 
@@ -691,6 +841,238 @@ describe("handleRunnerResult — implementation", () => {
     expect(res.status).toBe(200);
     expect(log.getJobById(jobId)?.conclusion).not.toBe("runner_approved");
   });
+
+  it("renders the last successful stage from the job's step log in the failure comment (BAC-27112)", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({
+      issueId: "i",
+      issueIdentifier: "ENG-1",
+      issueTitle: "Implement it",
+      teamKey: "ENG",
+      repo: "o/r",
+      dispatchId,
+      executionMode: "github-actions",
+    });
+    stepLog.upsertStepRecord(jobId, {
+      ...STEP,
+      id: "clone",
+      type: "clone",
+      status: "passed",
+      ended_at: "2026-05-27T00:00:01.000Z",
+      parent_step_id: null,
+    });
+    stepLog.upsertStepRecord(jobId, {
+      ...STEP,
+      id: "install",
+      type: "custom",
+      status: "passed",
+      ended_at: "2026-05-27T00:00:02.000Z",
+      parent_step_id: null,
+    });
+    stepLog.upsertStepRecord(jobId, {
+      ...STEP,
+      id: "push",
+      type: "push",
+      status: "failed",
+      ended_at: "2026-05-27T00:00:03.000Z",
+      parent_step_id: null,
+    });
+    const fake = new FakeProvider({ recordCalls: true });
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "failure",
+        failureReason: "lease rejected",
+        comments: [],
+        failure: { ...VALID_FAILURE, stage: "push" },
+      } as unknown as RunnerCallbackModule.RunnerResultBody,
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+    });
+
+    expect(res.status).toBe(200);
+    const call = fake.recordedCalls().find((c) => c.method === "markImplementationFailed");
+    expect(call?.args[2]).toContain("Last successful stage: `install`.");
+  });
+
+  it("stamps failureCommentedAt once markImplementationFailed has posted, so the monitor skips its own comment (BAC-27112 follow-up)", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({
+      issueId: "i",
+      issueIdentifier: "ENG-1",
+      issueTitle: "Implement it",
+      teamKey: "ENG",
+      repo: "o/r",
+      dispatchId,
+      executionMode: "github-actions",
+    });
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "failure",
+        failureReason: "tests fail",
+        comments: [],
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider({ recordCalls: true })),
+    });
+    expect(res.status).toBe(200);
+    expect(log.getJobById(jobId)?.failureCommentedAt).not.toBeNull();
+  });
+
+  it("leaves failureCommentedAt unset when markImplementationFailed itself throws, so the monitor backstop still fires (BAC-27112 follow-up)", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({
+      issueId: "i",
+      issueIdentifier: "ENG-1",
+      issueTitle: "Implement it",
+      teamKey: "ENG",
+      repo: "o/r",
+      dispatchId,
+      executionMode: "github-actions",
+    });
+    const fake = new FakeProvider();
+    fake.markImplementationFailed = async () => {
+      throw new Error("provider down");
+    };
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "failure",
+        failureReason: "tests fail",
+        comments: [],
+        failure: VALID_FAILURE,
+      } as unknown as RunnerCallbackModule.RunnerResultBody,
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+    });
+    expect(res.status).toBe(200);
+    const job = log.getJobById(jobId);
+    expect(job?.failure).not.toBeNull();
+    expect(job?.failureCommentedAt).toBeNull();
+  });
+
+  it("leaves failureCommentedAt unset when markImplementationFailed returns false (no comment posted), so the monitor still posts (BAC-27112 follow-up)", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({
+      issueId: "i",
+      issueIdentifier: "ENG-1",
+      issueTitle: "Implement it",
+      teamKey: "ENG",
+      repo: "o/r",
+      dispatchId,
+      executionMode: "github-actions",
+    });
+    const fake = new FakeProvider();
+    fake.markImplementationFailed = async () => false;
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "failure",
+        failureReason: "tests fail",
+        comments: [],
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+    });
+    expect(res.status).toBe(200);
+    expect(log.getJobById(jobId)?.failureCommentedAt).toBeNull();
+  });
+
+  it("never stamps failureCommentedAt before the provider call resolves — a process death mid-call must leave the stamp unset so the monitor backstop still fires, not a silent no-comment (BAC-27112 round-seven revert)", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({
+      issueId: "i",
+      issueIdentifier: "ENG-1",
+      issueTitle: "Implement it",
+      teamKey: "ENG",
+      repo: "o/r",
+      dispatchId,
+      executionMode: "github-actions",
+    });
+
+    // Simulates the orchestrator process dying mid-call: the provider promise is issued
+    // but never settles, standing in for a crash after the network call went out but
+    // before a response came back. The callback's token is one-time-use with no retry, so
+    // if failureCommentedAt were pre-claimed before this point, the job would be left with
+    // no ticket comment at all and no way to recover one.
+    const fake = new FakeProvider();
+    let markImplementationFailedCalls = 0;
+    // This test's whole point is that the provider WAS reached but never settled — replacing
+    // markImplementationFailed with a function that is never invoked would make the
+    // assertions below pass vacuously (failureCommentedAt stays null either way), so the call
+    // itself must be independently verified, not just its absence of an effect.
+    fake.markImplementationFailed = () => {
+      markImplementationFailedCalls++;
+      return new Promise<boolean>(() => {});
+    };
+
+    const resultPromise = runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "failure",
+        failureReason: "tests fail",
+        comments: [],
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+    });
+    void resultPromise; // deliberately never awaited — it never resolves
+
+    // Drain the microtask queue so everything up to the awaited provider call has run.
+    for (let i = 0; i < 50; i++) await Promise.resolve();
+
+    expect(log.getJobById(jobId)?.failureCommentedAt).toBeNull();
+    // The monitor backstop must still consider this job unclaimed while the provider call
+    // is (forever) in flight.
+    expect(
+      shouldPostMonitorClassificationComment({
+        failureCommentedAt: log.getJobById(jobId)?.failureCommentedAt ?? null,
+      }),
+    ).toBe(true);
+    // Proves the provider was actually reached — without this, the assertions above would
+    // pass identically if markImplementationFailed were never called at all.
+    expect(markImplementationFailedCalls).toBe(1);
+  });
 });
 
 describe("handleRunnerResult — reference repositories", () => {
@@ -921,6 +1303,7 @@ describe("handleRunnerResult — reference repositories", () => {
       (res.body.warnings as string[]).some((w) => w.includes("missing-reference-repos")),
     ).toBe(true);
   });
+
 });
 
 describe("handleRunnerProgress", () => {
@@ -963,7 +1346,7 @@ describe("handleRunnerProgress", () => {
     });
     const second = await runnerCallback.handleRunnerProgress({
       authorization: `Bearer ${token}`,
-      body: { step: { ...STEP, status: "completed", ended_at: "2026-05-27T00:01:00.000Z" } },
+      body: { step: { ...STEP, status: "passed", ended_at: "2026-05-27T00:01:00.000Z" } },
       secret: SECRET,
     });
 
@@ -973,7 +1356,7 @@ describe("handleRunnerProgress", () => {
       {
         stepId: "implement.1",
         stepType: "implement",
-        status: "completed",
+        status: "passed",
         endedAt: "2026-05-27T00:01:00.000Z",
       },
     ]);
@@ -1439,6 +1822,48 @@ describe("handleRunnerResult — gap-analysis", () => {
     expect(job?.conclusion).toBe("runner_approved");
     expect(job?.approved).toBe(true);
   });
+
+  it("persists a failure record but never stamps failureCommentedAt — the callback doesn't comment for gap-analysis, so the monitor backstop must still fire (BAC-27112 follow-up)", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "gap-analysis",
+      ttlSeconds: runnerTokens.GAP_ANALYSIS_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({
+      issueId: "i",
+      repo: "org/repo",
+      dispatchId,
+      phase: "gap-analysis",
+    });
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "gap-analysis",
+        outcome: "failure",
+        failureReason: "review-fix run crashed",
+        comments: [],
+        failure: {
+          category: "crash",
+          code: "PROCESS_EXIT_NONZERO",
+          stage: "feedback-loop/implement-1",
+          attempt: 1,
+          retryable: false,
+          message: "exit 1",
+          evidence: { truncated: false },
+        },
+      } as unknown as RunnerCallbackModule.RunnerResultBody,
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider()),
+    });
+
+    expect(res.status).toBe(200);
+    const job = log.getJobById(jobId);
+    expect(job?.failure).not.toBeNull();
+    expect(job?.failureCommentedAt).toBeNull();
+  });
 });
 
 describe("handleRunnerResult — provider errors", () => {
@@ -1600,11 +2025,18 @@ describe("formatFailureComment", () => {
     expect(formatFailureComment(undefined, undefined)).toBe("Unspecified failure.");
   });
 
-  it("formats SENSITIVE_FILES_BLOCKED with a structured comment", () => {
+  it("formats SENSITIVE_FILES_BLOCKED with a structured comment, redacted and capped like a persisted FailureRecord's message, keeping the flagged-file list fenced (BAC-27112 follow-up)", () => {
     const msg = formatFailureComment("SENSITIVE_FILES_BLOCKED", "Push blocked: 1 sensitive file(s):\n  .env  (.env file)");
     expect(msg).toContain("🔒");
     expect(msg).toContain("Blocked by security guardrail");
-    expect(msg).toContain(".env");
+    expect(msg).toContain("Push blocked: 1 sensitive file(s):");
+    // The flagged-file list survives redactAndCap — matches classifyThrown's own
+    // redaction/cap of a persisted FailureRecord's message for the same code, which no
+    // longer collapses it to a single line.
+    expect(msg).toContain(".env file");
+    // Fenced (round-seven follow-up): markdownToAdf otherwise joins the multi-line list
+    // into one paragraph, so the file name must appear inside a ``` code block.
+    expect(msg).toMatch(/```\nPush blocked: 1 sensitive file\(s\):\n {2}\.env {2}\(\.env file\)\n```/);
     expect(msg).toContain(".gitignore");
     expect(msg).toContain("troubleshooting"); // remediation now links the docs
   });
@@ -1617,6 +2049,175 @@ describe("formatFailureComment", () => {
 
   it("passes unknown failure codes through as raw reason", () => {
     expect(formatFailureComment("SOME_OTHER_CODE", "some error")).toBe("some error");
+  });
+});
+
+// ── formatFailureComment — structured FailureRecord (BAC-27112) ────────────────
+
+const TRANSIENT_FAILURE: FailureRecord = {
+  category: "transient",
+  code: "PROVIDER_OVERLOADED",
+  stage: "feedback-loop/review-1",
+  attempt: 3,
+  retryable: true,
+  message: "overloaded_error",
+  evidence: {
+    stderrTail: "line one\nline two\nline three",
+    truncated: false,
+  },
+};
+
+describe("formatFailureComment — structured failure record", () => {
+  it("renders the headline, attempt count, a fenced evidence block, and the transient next step", () => {
+    const msg = formatFailureComment(undefined, "x", { failure: TRANSIENT_FAILURE });
+    expect(msg).toContain("feedback-loop/review-1");
+    expect(msg).toContain("transient/PROVIDER_OVERLOADED");
+    expect(msg).toContain("after 3 attempt(s)");
+    expect(msg).toContain("```");
+    expect(msg).toContain("**Next step:** The provider or remote was unavailable");
+    expect(msg).toContain("No PR was opened.");
+    // The provider's own prefix ("⚠️ Implementation failed: ...") supplies the phase —
+    // this rendering must not restate it, or the posted comment doubles it (BAC-27112 follow-up).
+    expect(msg).not.toContain("Implementation failed");
+    expect(msg).not.toContain("Planning failed");
+  });
+
+  it("never includes more than 12 lines of evidence even for an 8 KB stderrTail", () => {
+    const bigTail = Array.from({ length: 500 }, (_, i) => `line ${i}`).join("\n");
+    const failure: FailureRecord = {
+      ...TRANSIENT_FAILURE,
+      evidence: { stderrTail: bigTail, truncated: true },
+    };
+    const msg = formatFailureComment(undefined, "x", { failure });
+    const fenceMatch = msg.match(/```\n([\s\S]*?)\n```/);
+    expect(fenceMatch).toBeTruthy();
+    const evidenceLines = fenceMatch![1].split("\n");
+    expect(evidenceLines.length).toBeLessThanOrEqual(12);
+    expect(evidenceLines[evidenceLines.length - 1]).toBe("line 499");
+  });
+
+  it("caps the evidence excerpt at 1200 characters total, ellipsis included, even for a single huge line", () => {
+    const hugeLine = "x".repeat(2000);
+    const failure: FailureRecord = {
+      ...TRANSIENT_FAILURE,
+      evidence: { stderrTail: hugeLine, truncated: true },
+    };
+    const msg = formatFailureComment(undefined, "x", { failure });
+    const fenceMatch = msg.match(/```\n([\s\S]*?)\n```/);
+    expect(fenceMatch).toBeTruthy();
+    const excerpt = fenceMatch![1];
+    expect(excerpt.length).toBe(1200); // total cap, including the leading ellipsis
+    expect(excerpt.startsWith("…")).toBe(true);
+    expect(excerpt.endsWith("x")).toBe(true);
+  });
+
+  it("falls back to a character-boundary cut when the next line boundary is past the search window, rather than skipping most of the budget to reach it (BAC-27112 follow-up)", () => {
+    // The only newline is 1194 characters after the raw cut point — far outside the
+    // 200-character search window — so snapping to it would discard almost the entire
+    // 1200-character budget down to a 5-character "tail". The cut must stay put instead.
+    const firstLine = "a".repeat(1300);
+    const failure: FailureRecord = {
+      ...TRANSIENT_FAILURE,
+      evidence: { stderrTail: `${firstLine}\ntail`, truncated: false },
+    };
+    const msg = formatFailureComment(undefined, "x", { failure });
+    const fenceMatch = msg.match(/```\n([\s\S]*?)\n```/);
+    expect(fenceMatch).toBeTruthy();
+    const excerpt = fenceMatch![1];
+    expect(excerpt.length).toBe(1200);
+    expect(excerpt.startsWith("…a")).toBe(true);
+    expect(excerpt.endsWith("\ntail")).toBe(true);
+  });
+
+  it("still snaps to a line boundary when the next newline falls within the search window (BAC-27112 follow-up)", () => {
+    const failure: FailureRecord = {
+      ...TRANSIENT_FAILURE,
+      evidence: { stderrTail: `${"A".repeat(250)}\n${"B".repeat(1000)}`, truncated: false },
+    };
+    const msg = formatFailureComment(undefined, "x", { failure });
+    const fenceMatch = msg.match(/```\n([\s\S]*?)\n```/);
+    expect(fenceMatch).toBeTruthy();
+    // The raw cut point (length - 1199 = 52) lands inside the "A" line, 198 characters
+    // before its newline — within the search window — so the excerpt starts clean at
+    // "B".repeat(1000) rather than with a partial run of "A"s.
+    expect(fenceMatch![1]).toBe("…" + "B".repeat(1000));
+  });
+
+  it("never leaves a lone surrogate at the cut point (BAC-27112 follow-up)", () => {
+    const prefix = "x".repeat(1198);
+    const pair = "😀"; // 😀 split across two UTF-16 code units
+    const suffix = "y".repeat(1199);
+    // Length 2399 puts the raw cut (length - 1200 = 1199) exactly on the low surrogate.
+    const text = prefix + pair + suffix;
+    const failure: FailureRecord = {
+      ...TRANSIENT_FAILURE,
+      evidence: { stderrTail: text, truncated: false },
+    };
+    const msg = formatFailureComment(undefined, "x", { failure });
+    const fenceMatch = msg.match(/```\n([\s\S]*?)\n```/);
+    expect(fenceMatch).toBeTruthy();
+    const excerpt = fenceMatch![1];
+    expect(excerpt.charCodeAt(1)).toBeLessThan(0xdc00);
+    expect(excerpt.startsWith("…y")).toBe(true);
+  });
+
+  it("neutralises a bare fenced code block inside the excerpt so it can't close the wrapping fence (BAC-27112 follow-up)", () => {
+    const failure: FailureRecord = {
+      ...TRANSIENT_FAILURE,
+      evidence: {
+        stdoutTail: "before\n```\nfenced content\n```\nafter",
+        truncated: false,
+      },
+    };
+    const msg = formatFailureComment(undefined, "x", { failure });
+    // Exactly one fence pair: the outer wrapper. The excerpt's own ``` lines must be
+    // neutralised, or markdownToAdf would close the outer code block early and leave
+    // "fenced content"/"after" rendered as loose paragraphs in the Jira comment.
+    expect(msg.match(/```/g)?.length).toBe(2);
+    expect(msg).toContain("fenced content");
+    expect(msg).toContain("'''");
+  });
+
+  it("renders the unknown next step without inventing a cause", () => {
+    const failure: FailureRecord = {
+      ...TRANSIENT_FAILURE,
+      category: "unknown",
+      code: "UNKNOWN",
+      attempt: 1,
+    };
+    const msg = formatFailureComment(undefined, "x", { failure });
+    expect(msg).toContain("**Next step:** The failure could not be classified. Check the run logs.");
+    expect(msg).not.toContain("after 1 attempt(s)");
+  });
+
+  it("falls back to stdoutTail, then message, when stderrTail is absent", () => {
+    const stdoutOnly: FailureRecord = {
+      ...TRANSIENT_FAILURE,
+      evidence: { stdoutTail: "from stdout", truncated: false },
+    };
+    expect(formatFailureComment(undefined, "x", { failure: stdoutOnly })).toContain("from stdout");
+
+    const messageOnly: FailureRecord = {
+      ...TRANSIENT_FAILURE,
+      evidence: { truncated: false },
+    };
+    expect(formatFailureComment(undefined, "x", { failure: messageOnly })).toContain("overloaded_error");
+  });
+
+  it("still prefers the SENSITIVE_FILES_BLOCKED wording over a supplied failure record", () => {
+    const msg = formatFailureComment("SENSITIVE_FILES_BLOCKED", "blocked", { failure: TRANSIENT_FAILURE });
+    expect(msg).toContain("Blocked by security guardrail");
+    expect(msg).not.toContain("transient/PROVIDER_OVERLOADED");
+  });
+
+  it("says the work is preserved in a draft PR for an initial run, and that the existing PR is unchanged for a gap-fill/re-dispatch", () => {
+    const withPr = { failure: TRANSIENT_FAILURE, prUrl: "https://github.com/o/r/pull/9" };
+    expect(formatFailureComment(undefined, "x", withPr)).toContain(
+      "The work so far is preserved in a draft PR: https://github.com/o/r/pull/9",
+    );
+    expect(formatFailureComment(undefined, "x", { ...withPr, isInitialRun: false })).toContain(
+      "The existing PR is unchanged by this run.",
+    );
   });
 });
 
@@ -1650,7 +2251,7 @@ describe("handleRunnerResult — SENSITIVE_FILES_BLOCKED failure code", () => {
     expect(scopeKey).toBe("ENG");
     expect(comment).toContain("🔒");
     expect(comment).toContain("Blocked by security guardrail");
-    expect(comment).toContain(".env");
+    expect(comment).toContain("Push blocked: 1 sensitive file(s) would be committed:");
   });
 
   it("does not use the security guardrail format for other failures without failureCode", async () => {
@@ -1685,7 +2286,7 @@ describe("unapproved-run failure codes", () => {
     const comment = formatFailureComment(
       "REVIEW_UNAPPROVED",
       "Automated review did not approve (iterations_exhausted after 3 iteration(s)). Missing tests.",
-      "https://github.com/o/r/pull/9",
+      { prUrl: "https://github.com/o/r/pull/9" },
     );
     expect(comment).toContain("without review approval");
     expect(comment).toContain("https://github.com/o/r/pull/9");
@@ -1693,14 +2294,23 @@ describe("unapproved-run failure codes", () => {
     expect(comment).toContain("**Next step:**");
   });
 
+  it("formatFailureComment renders REVIEW_UNAPPROVED's PR line as 'existing PR unchanged' for a gap-fill/re-dispatch", () => {
+    const comment = formatFailureComment("REVIEW_UNAPPROVED", "nope", {
+      prUrl: "https://github.com/o/r/pull/9",
+      isInitialRun: false,
+    });
+    expect(comment).toContain("The existing PR is unchanged by this run.");
+    expect(comment).not.toContain("preserved in a draft PR");
+  });
+
   it("formatFailureComment renders MAX_TURNS_EXHAUSTED distinctly", () => {
-    const comment = formatFailureComment("MAX_TURNS_EXHAUSTED", "hit the cap", undefined);
+    const comment = formatFailureComment("MAX_TURNS_EXHAUSTED", "hit the cap");
     expect(comment).toContain("turn cap");
     expect(comment).toContain("No PR could be opened");
   });
 
   it("unknown failureCode still falls through to the generic summary", () => {
-    expect(formatFailureComment("SOMETHING_NEW", "boom", undefined)).toContain("boom");
+    expect(formatFailureComment("SOMETHING_NEW", "boom")).toContain("boom");
   });
 
   it("records the draft PR url on the job for an implementation failure", async () => {

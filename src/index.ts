@@ -1,3 +1,6 @@
+import { realpathSync } from "node:fs";
+import { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import http from "node:http";
 import {
   getMappings,
@@ -32,7 +35,7 @@ import {
   type AdminConfig,
 } from "./admin.js";
 import { initLogTable, appendLog, countPriorDispatches, completeOrphanedPlanningJobs, attachJobRunIdIfMissing, updateJobRunId, updateJobStatus, updateJobPrUrl, updateJobMachineDetails, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobById, getJobByMachineId, resetStuckAttempts, getRecentFailedRunUrls } from "./log.js";
-import { isParked, recordDispatchFailure, recordDispatchSuccess, initDispatchBreakerTable } from "./dispatch-breaker.js";
+import { isParked, recordDispatchFailure, recordDispatchSuccess, shouldCountFailure, initDispatchBreakerTable } from "./dispatch-breaker.js";
 import type { Job, JobStatus } from "./log.js";
 import { getInstallationToken, getAppSlug } from "./github-app-auth.js";
 import { configureLinearAuth } from "./linear-app-auth.js";
@@ -47,7 +50,7 @@ import { handlePublicationTokenRequest } from "./publication-token-vending.js";
 import { handleReferenceTokenRequest } from "./reference-token-vending.js";
 import { handleStatusUpdate, handleStepReport } from "./session-api.js";
 import { postStatusComment } from "./status-events.js";
-import { classifyCompletion, renderClassification } from "./completion-classification.js";
+import { buildRunUrl, classifyCompletion, deriveLastSuccessfulStage, monitorFailureCommentPrefix, renderClassification, shouldPostMonitorClassificationComment } from "./completion-classification.js";
 import { createMachine, getMachine, listMachines, destroyMachine, generateSessionToken, generateMachineNonce, buildSessionMachineConfig, listAppSecrets, fetchMachineLogs, updateMachineMetadata, readMachineExitCode } from "./fly-machines.js";
 import { safeDestroyMachine, sweepOrphanedMachines, SWEEP_MACHINE_MAX_AGE_MS } from "./reaper.js";
 import { getRunnerMode, getFlySecretsMinVersion, getFlyProcessLevelSecrets, initSettingsTable, resolveExecutionPath, resolvePlanningExecutionPath, resolveRunnerCallbackBaseUrl, checkForcedPathEligibility } from "./runner-mode.js";
@@ -55,7 +58,7 @@ import { handleGitHubWebhook } from "./webhook.js";
 import { enqueueReconciliation, hasReconciliationForPr, initReconciliationTable } from "./reconciliation.js";
 import { runReconciliations } from "./reconcile-merged.js";
 import { resolveSessionImage, resolveDefaultRunnerImage, resolveRunnerImageForDispatch, type SessionImageStatus } from "./repo-image.js";
-import { getStepRecord, initStepLogTable } from "./step-log.js";
+import { getStepRecord, getStepsByJobId, initStepLogTable } from "./step-log.js";
 import { getOrchestratorSettings, seedKgBaseRepoFromEnv, getRetryPolicy } from "./orchestrator-settings.js";
 import { handleRunnerPlanningContext, handleRunnerProgress, handleRunnerResult, handleKgTrackerDataRequest, handleKgScopeRequest, planningDispatchBlockReason } from "./runner-callback.js";
 import type { RunnerProgressBody, RunnerResultBody } from "./runner-callback.js";
@@ -108,7 +111,7 @@ let activeKgRefresh: KgRefreshHandle | null = null;
 
 // ---------- Configuration ----------
 
-interface AppConfig {
+export interface AppConfig {
   githubAppId: string;
   githubAppPrivateKey: string;
   notifyWebhookUrl: string | null;
@@ -2602,7 +2605,7 @@ async function resetTicket(provider: TicketingProvider, job: Job): Promise<void>
 
 // ---------- Completion notifications ----------
 
-async function reportJobCompletion(config: AppConfig, registry: ProviderRegistry): Promise<void> {
+export async function reportJobCompletion(config: AppConfig, registry: ProviderRegistry): Promise<void> {
   const terminalJobs = getUnnotifiedTerminalJobs();
   const mappings = getMappings();
   for (const job of terminalJobs) {
@@ -2626,9 +2629,15 @@ async function reportJobCompletion(config: AppConfig, registry: ProviderRegistry
             const breakerConclusion = job.conclusion ?? job.status;
             // stuck_giveup already fires notifyStuckGiveUp — don't double-fire.
             const isStuck = job.conclusion === "stuck_giveup" || job.conclusion === "stuck_requeued";
-            const br = recordDispatchFailure(job.issueId, breakerPhase, breakerConclusion);
-            if (br.tripped && !isStuck) {
-              pendingBreakerTrip = { phase: breakerPhase, failures: br.failures, conclusion: breakerConclusion };
+            // A classified transient failure (provider overload) is the provider's outage, not
+            // the ticket's — don't count it toward the breaker, or three unlucky retries against
+            // a flaky provider parks the issue (BAC-27134). Jobs with no classified failure at
+            // all (pre-BAC-27112, or a synthetic dispatch-error conclusion) count as before.
+            if (!job.failure || shouldCountFailure(job.failure)) {
+              const br = recordDispatchFailure(job.issueId, breakerPhase, breakerConclusion);
+              if (br.tripped && !isStuck) {
+                pendingBreakerTrip = { phase: breakerPhase, failures: br.failures, conclusion: breakerConclusion };
+              }
             }
           }
         }
@@ -2669,15 +2678,8 @@ async function reportJobCompletion(config: AppConfig, registry: ProviderRegistry
       }
 
       const repoFullName = job.repo || "unknown";
-      const [owner, repo] = (job.repo || "").split("/");
 
-      // Build run/machine URL
-      let runUrl: string | null = null;
-      if (job.executionMode === "fly-machines" && job.machineId) {
-        runUrl = null; // No public URL for Fly machines yet
-      } else if (job.runId && owner && repo) {
-        runUrl = `https://github.com/${owner}/${repo}/actions/runs/${job.runId}`;
-      }
+      const runUrl = buildRunUrl(job);
 
       const durationMs =
         job.completedAt != null ? job.completedAt - job.dispatchedAt : null;
@@ -2720,10 +2722,27 @@ async function reportJobCompletion(config: AppConfig, registry: ProviderRegistry
 
       // Tracker comment — ALWAYS, independent of the Slack/Teams webhook (failures only)
       // classifyCompletion returns null on a clean success, so successes stay quiet everywhere
-      const classification = classifyCompletion(job);
-      if (classification && provider) {
+      const willPostMonitorComment = Boolean(provider) && shouldPostMonitorClassificationComment(job);
+      // getStepsByJobId is a step_log query — worth skipping when nothing downstream will
+      // render the "last successful stage" line: not the monitor comment (already posted by
+      // the callback) and not the webhook notification below (unconfigured).
+      const lastSuccessfulStage =
+        job.failure && (willPostMonitorComment || config.notifyWebhookUrl)
+          ? deriveLastSuccessfulStage(getStepsByJobId(job.id), job.failure.stage)
+          : null;
+      const classification = classifyCompletion(job, lastSuccessfulStage);
+      if (classification && provider && willPostMonitorComment) {
         try {
-          await provider.postComment(job.issueId, renderClassification(classification));
+          // The phase-naming prefix mirrors markImplementationFailed/markPlanningFailed's own
+          // comment, so it must only apply where those would have posted the same-shaped
+          // comment: an actual failure (job.status === "failed", including a gap-analysis
+          // failure — the only phase the callback never comments for at all). review_failed
+          // and timed_out are not failures — the run completed and (for review_failed) opened
+          // a PR the ticket already got a "ready for review" comment about — so prepending
+          // "Implementation failed:" there would contradict the run's own outcome.
+          const rendered = renderClassification(classification);
+          const body = job.status === "failed" ? monitorFailureCommentPrefix(job.phase) + rendered : rendered;
+          await provider.postComment(job.issueId, body);
         } catch (err) {
           console.warn(`[monitor] Failed to post classification comment for job ${job.id}:`, err);
         }
@@ -4132,7 +4151,30 @@ async function main(): Promise<void> {
   process.on("SIGINT", () => { void shutdown("SIGINT"); });
 }
 
-main().catch((err) => {
-  console.error("[main] Fatal startup error:", err);
-  process.exit(1);
-});
+// True only when this file is the process entrypoint (`tsx src/index.ts`, `node dist/index.js`).
+// Lets vitest import the module (e.g. to exercise reportJobCompletion directly) without
+// booting the server and poll loop — the same convention as run-autonomous.ts and
+// refresh-runner-github-credentials.ts, rather than a test-runner env var that would
+// silently skip startup on any host that happened to carry it.
+// realpath both sides: Node resolves the entry module through symlinks before it becomes
+// import.meta.url, so a symlinked dist/ or node_modules/.bin shim must not read as "not main".
+function entryModuleHref(): string | null {
+  const arg = process.argv[1];
+  if (!arg) return null;
+  try {
+    return pathToFileURL(realpathSync(resolve(arg))).href;
+  } catch {
+    return pathToFileURL(resolve(arg)).href;
+  }
+}
+const invokedAsMain = entryModuleHref() === import.meta.url;
+if (invokedAsMain) {
+  main().catch((err) => {
+    console.error("[main] Fatal startup error:", err);
+    process.exit(1);
+  });
+} else {
+  // Never silent: an orchestrator that exits 0 without booting looks like a restart loop on
+  // Fly/ECS. Say why the server and poll loop were not started.
+  console.log(`[main] index.ts imported as a module (entry ${entryModuleHref() ?? "unknown"}); server and poll loop not started`);
+}

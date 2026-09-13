@@ -288,6 +288,27 @@ describe("review_failed conclusion behavior", () => {
   });
 });
 
+describe("shouldCountFailure (BAC-27134)", () => {
+  it("is false for a transient failure — an overloaded provider must not park the ticket", () => {
+    expect(breaker.shouldCountFailure({ category: "transient" })).toBe(false);
+  });
+
+  it("is true for every other failure category", () => {
+    const nonTransientCategories = [
+      "auth",
+      "config",
+      "conflict",
+      "invalid_output",
+      "cancelled",
+      "crash",
+      "unknown",
+    ] as const;
+    for (const category of nonTransientCategories) {
+      expect(breaker.shouldCountFailure({ category })).toBe(true);
+    }
+  });
+});
+
 describe("initDispatchBreakerTable idempotency", () => {
   it("can be called multiple times without error", () => {
     expect(() => breaker.initDispatchBreakerTable()).not.toThrow();
