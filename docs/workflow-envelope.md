@@ -12,9 +12,9 @@ The envelope consolidates all YAML-safe data into a single base64-encoded JSON b
 
 ---
 
-## 8-Input Implementation Contract
+## 10-Input Implementation Contract
 
-`claude-implement.yml` (post-envelope generation) exposes exactly these eight `workflow_dispatch` inputs:
+`claude-implement.yml` (post-envelope generation) exposes exactly these ten `workflow_dispatch` inputs:
 
 | Input | Required | Type | Notes |
 |-------|----------|------|-------|
@@ -26,11 +26,16 @@ The envelope consolidates all YAML-safe data into a single base64-encoded JSON b
 | `run_token` | No | string | HMAC bearer token for result callback to the orchestrator; empty skips callback. **Masked by the workflow before the runner starts.** |
 | `run_progress_token` | No | string | HMAC bearer token for in-progress callbacks; empty skips progress posts. **Masked.** |
 | `run_publication_token` | No | string | Dedicated, single-use bearer token that may be exchanged immediately before repository publication for a fresh repo-scoped GitHub credential. **Masked. Implementation and gap-analysis only.** |
+| `runner_callback_url` | No | string | Base URL the runner posts results to; empty = not passed (Fly sets it in the machine env) |
+| `runner_phase` | No | string | Pipeline phase; default `implementation`, `kg-refresh` for KG ingest dispatches |
 
 The three runner tokens stay outside the envelope specifically so the workflow can `::add-mask::` them before the runner container starts — secret values inside base64 blobs cannot be masked by GHA. The publication token is exposed only to the pipeline process, never to model child processes or persisted step inputs. Token inputs are wired through `env:` on the mask step and never interpolated directly into script text, because GHA prints a step's script in the `##[group]Run …` header before the step executes.
 
 These are live credentials in the runner's environment; `src/__tests__/setup/clear-runner-credentials.ts` (registered as a Vitest `setupFile`) deletes all five credential variables before every test so no suite can burn a single-use token against the live orchestrator. A test that needs a credential value may set it in the test body — the global `beforeEach` ensures it is cleared again before the next test. Tests that exercise callback or fetch paths should inject a mock `fetchImpl` (or equivalent dependency-injection point) rather than letting code reach a live URL.
 
+Headroom note: GitHub caps `workflow_dispatch` at 10 inputs, and this contract uses all 10. That ceiling is part of why the envelope exists; a new field must ride inside `run_config` unless the workflow itself has to read it before the runner starts (masking, routing), in which case an existing input has to make room. `claude-plan.yml` declares seven of these (no `run_publication_token`, `runner_callback_url`, or `runner_phase`).
+
+The first step of the container job prints every input (`[dispatch-inputs] …`), with the three tokens reduced to `<redacted>`/`(empty)` and `run_config` base64-decoded through `jq`, so a run's log opens with the exact envelope it was dispatched with. `provider` and `aws_region` are also forwarded into the entrypoint env as `PROVIDER`/`AWS_REGION`: the runner reads the provider from env, not from the envelope, so a template that drops them silently downgrades Bedrock repos to the anthropic provider.
 ---
 
 ## `RunConfigV1` Schema
