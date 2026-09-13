@@ -4,6 +4,52 @@ How an orchestrator instance gets deployed, how a new client instance is stood u
 
 Reference for `src/deploy.ts`, `scripts/provision-client.sh`, `clients/`, `.github/workflows/deploy-clients.yml`, and the Bedrock path in the synced workflows. `CLAUDE.md` carries the summary and points here.
 
+## GitHub App permissions (install prerequisite)
+
+The orchestrator authenticates to GitHub as a GitHub App and mints short-lived installation
+tokens scoped to exactly the permission a feature needs. The App must therefore **hold** every
+permission below, and its installation must cover every repository the orchestrator serves
+(the KG source repo, the base template repo, and each onboarded project). A missing grant does
+not fail boot; it fails the feature that needs it, late and quietly (a 4xx inside a run, or a
+`hint` on a `get_tenant_health` preflight row).
+
+| Repository permission | Level | Needed by |
+|---|---|---|
+| Contents | Read and write | cloning repos and dependency tokens (read); pushing `kg-refresh/<stamp>` snapshot branches and the publication token (write) |
+| Pull requests | Read and write | reading PRs for gap-fill matching and dependency tokens (read); opening the refresh PR, roll-up PRs and posting PR comments (write) |
+| Workflows | Read and write | the publication token used to push workflow-carrying commits from a run |
+| Commit statuses | Read and write | the `kg-refresh/dry-run` commit status set by the PR-triggered KG dry-run check (AII-633); without it the check is comment-only |
+| Actions | Read and write | `workflow_dispatch` of the planning/implementation/kg-refresh workflows on the GitHub Actions runner path, and reading run status |
+| Checks | Read-only | reading check runs on a PR head (`…/commits/{sha}/check-runs`) for the post-push review's external-review wait gate and the roll-up gate |
+| Issues | Read and write | PR comments go through GitHub's issue-comment endpoints: `postPrComment` / `updatePrComment` / `postOrUpdateStickyComment` (gap analysis, refresh PR, review verdicts, KG dry-run comment) and `addCommentReaction` on the `/ai-implement` comment rail — for every provider, on every envelope repo |
+| Metadata | Read-only | granted to every App automatically |
+
+Plus whatever the runner's own GitHub Actions workflows need on each project repo (those are
+declared in the workflow files, not here). The list above is the set of `permissions: {…}`
+scopes requested in `src/` plus the grants the per-run installation token relies on (it carries the
+App's full permission set scoped to one repository); a change that mints a token for a new permission must add a row
+here and grant it on the App before the feature is switched on (tracked for automation in
+AII-645: one declared table, probed on `get_tenant_health`, shown on the admin page, and an
+App manifest for new installs).
+
+**Granting or widening a permission is two steps by an org owner, not a per-repository
+setting.** GitHub App permissions live on the App; each installation then has to accept the
+change:
+
+1. App settings → *Permissions & events* (for an org-owned App:
+   `https://github.com/organizations/<org>/settings/apps/<app-slug>/permissions`) → set the
+   repository permission → **Save changes**.
+2. The installation (`https://github.com/organizations/<org>/settings/installations/<id>`; ids
+   from `gh api orgs/<org>/installations`) shows a review banner → **Review request** →
+   **Accept new permissions**.
+3. Verify: `gh api orgs/<org>/installations --jq '.installations[] | select(.app_slug=="<app-slug>") | .permissions'`
+   lists the new level, and `get_tenant_health` shows the matching preflight row with
+   `status: 200` and no `hint`.
+
+The App is created once per orchestrator (`GITHUB_APP_ID` / `GITHUB_APP_PRIVATE_KEY` secrets);
+its webhook must point at the orchestrator's `/api/github/webhook` with the
+`GITHUB_WEBHOOK_SECRET`.
+
 ## Deploy paths
 
 Every path below ships the orchestrator **and** the knowledge graph as one image: a data refresh is a code deploy, and a code deploy re-materializes the graph from the KG repository's default branch. [kg-architecture.md](kg-architecture.md#the-monolith) covers what that couples.
