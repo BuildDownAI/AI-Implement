@@ -530,6 +530,20 @@ describe("kg refresh card", () => {
     expect(deploymentsScript).toContain("window.triggerKgRefresh");
   });
 
+  it("declares the dry-run element ids (AII-635)", () => {
+    for (const id of ["kg-dry-run-btn", "kg-dry-run-last"]) {
+      expect(deploymentsHtml).toContain(`id="${id}"`);
+    }
+    expect(deploymentsHtml).toContain('onclick="window.triggerKgRefresh(true)"');
+  });
+
+  it("posts { dryRun: true } for the dry-run trigger and renders the part table (AII-635)", () => {
+    expect(deploymentsScript).toContain("window.api('/api/kg/refresh', { method: 'POST', body: JSON.stringify({ dryRun: true }) })");
+    expect(deploymentsScript).toContain("function renderKgDryRun(");
+    expect(deploymentsScript).toContain("['part', 'previous', 'new', 'delta']");
+    expect(deploymentsScript).toContain("document.getElementById('kg-dry-run-btn').disabled = busy");
+  });
+
   it("posts to /api/kg/refresh for the refresh trigger", () => {
     expect(deploymentsScript).toContain("window.api('/api/kg/refresh', { method: 'POST' })");
   });

@@ -703,9 +703,9 @@ export const deploymentsScript = `
     btn.disabled = true;
     dryBtn.disabled = true;
     try {
-      const res = await window.api('/api/kg/refresh', dryRun
-        ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ dryRun: true }) }
-        : { method: 'POST' });
+      const res = dryRun
+        ? await window.api('/api/kg/refresh', { method: 'POST', body: JSON.stringify({ dryRun: true }) })
+        : await window.api('/api/kg/refresh', { method: 'POST' });
       if (!res.ok) {
         const body = await res.json().catch(function () { return {}; });
         if (res.status === 422 && body.precondition === 'callback-unconfigured') {
