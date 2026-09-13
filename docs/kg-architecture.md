@@ -319,14 +319,31 @@ settings key on every record and eviction, so a restart between a dry run and a 
 `onRefreshSettled` on every `running → false` transition, not only a dry-run's — a real refresh, a
 failure, a revert, TTL expiry, or a deploy hold clearing all wake it.
 
-**Manual step — granting the status.** The GitHub App needs `statuses: write` granted on the KG
-source repo and on the base template repo for the commit status to appear — this is not requestable
-through code, and there is no way to detect the gap from inside the PR itself. Grant it via the
-GitHub App's permissions page for each repo's installation. Until granted, the sticky comment is the
-only signal; nothing errors or blocks in the meantime. The preflight's `statuses:write` rows probe
-this grant against the same two repos the webhook actually posts to — the KG source repo, and
-whichever repo is configured as "Base template repo" (see the note on the two "base repo" notions
-below), not sources.yml's `base_repo:`.
+**Manual step — granting the status.** The commit status needs the GitHub App to hold the
+**Commit statuses: Read and write** repository permission. GitHub App permissions live on the App
+itself, not on individual repositories, and a permission change takes effect only after the
+installation accepts it — so this is two clicks by an org owner, not a per-repo grant:
+
+1. Open the App's permissions page (for an org-owned App:
+   `https://github.com/organizations/<org>/settings/apps/<app-slug>/permissions`; for the testing
+   orchestrator that is `ai-implement-orchestrator-bot` under `BuildDownAI`). Under *Repository
+   permissions* set **Commit statuses** to **Read and write** and save.
+2. Open the installation (`https://github.com/organizations/<org>/settings/installations/<id>`,
+   listed by `gh api orgs/<org>/installations`) and accept the requested permission update.
+3. Confirm both KG repos are covered by the installation's repository selection ("All
+   repositories", or both selected), then check `get_tenant_health`: the two `statuses:write`
+   preflight rows read `status: 200` with no `hint`. From a shell:
+   `gh api orgs/<org>/installations --jq '.installations[] | select(.app_slug=="<app-slug>") | .permissions.statuses'`
+   prints `write`.
+
+This is not requestable through code, and there is no way to detect the gap from inside the PR
+itself. Until granted, the sticky comment is the only signal; nothing errors or blocks in the
+meantime. The preflight's `statuses:write` rows probe this grant against the same two repos the
+webhook actually posts to — the KG source repo, and whichever repo is configured as "Base template
+repo" (see the note on the two "base repo" notions below), not sources.yml's `base_repo:`. The
+"Base template repo" field is seeded once from `KG_BASE_REPO` on first boot; a deployment that
+never set that variable has an empty field and must set it by hand under Settings → KG Refresh
+(the preflight then falls back to sources.yml's `base_repo:` for its probe until it is set).
 
 **Manual step — making the check required.** Setting `statuses: write` only lets the status *appear*;
 by itself it is advisory and a PR can be merged straight through it regardless of the guard's verdict.
