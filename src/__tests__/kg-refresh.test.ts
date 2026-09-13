@@ -1211,6 +1211,32 @@ describe("kg-refresh", () => {
         await handle.reportDryRun(reports[2]!);
         expect(postOrUpdateStickyCommentFn).toHaveBeenCalledTimes(2);
       });
+
+      it("reportDryRun() resolves true when it posts and false on a no-op (AII-636)", async () => {
+        buildDispatch();
+        await handle.trigger({ dryRun: true, ref: "pr-head-branch", report: REPORT });
+        await waitForStage("ingest-running");
+        handle.onRunnerComplete("success", { guardVerdict: "clean", partTable: [] });
+        await waitDone();
+        postOrUpdateStickyCommentFn.mockClear();
+
+        await expect(handle.reportDryRun(REPORT)).resolves.toBe(true);
+        await expect(handle.reportDryRun({ repo: REPORT.repo, prNumber: 999, sha: "nope" })).resolves.toBe(false);
+      });
+
+      it("forgetPr() evicts a PR's stored outcome, so a later reportDryRun() for it is a no-op (AII-636)", async () => {
+        buildDispatch();
+        await handle.trigger({ dryRun: true, ref: "pr-head-branch", report: REPORT });
+        await waitForStage("ingest-running");
+        handle.onRunnerComplete("success", { guardVerdict: "clean", partTable: [] });
+        await waitDone();
+        postOrUpdateStickyCommentFn.mockClear();
+
+        handle.forgetPr(REPORT.repo, REPORT.prNumber);
+
+        await handle.reportDryRun(REPORT);
+        expect(postOrUpdateStickyCommentFn).not.toHaveBeenCalled();
+      });
     });
 
     describe("onRefreshSettled (AII-636)", () => {

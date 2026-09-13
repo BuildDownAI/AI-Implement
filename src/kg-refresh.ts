@@ -64,8 +64,13 @@ const KG_SNAPSHOT_SHA_SETTINGS_KEY = "kg_refresh_snapshot_sha";
 /** DB settings key for persisting the last terminal refresh outcome across restarts. */
 const KG_LAST_REFRESH_SETTINGS_KEY = "kg_refresh_last_refresh";
 
-/** Default bound on the per-PR dry-run outcome cache (AII-636); overridable via KgRefreshInput.dryRunOutcomeCap for tests. */
-const DRY_RUN_OUTCOME_CAP = 200;
+/**
+ * Default bound on the per-PR caches tracking KG PR-check state — this module's
+ * `dryRunOutcomesByPr` and webhook.ts's `kgDryRunLastSha`/`kgDryRunPending` (AII-636).
+ * Overridable via KgRefreshInput.dryRunOutcomeCap for tests. Exported so webhook.ts's
+ * caches, which have no natural expiry either, share the same bound.
+ */
+export const MAX_TRACKED_PRS = 200;
 
 /**
  * Gates evaluated during refresh. `"staging"` fires before any swap; `"ingest-needed"` fires
@@ -232,9 +237,17 @@ export interface KgRefreshHandle {
    * (AII-636) and posts only that PR's own outcome — never another PR's — and only
    * when it ran against `report.sha`; otherwise a no-op (with a debug log line).
    * Called on a `labeled` PR event (e.g. `accept-baseline` applied after the fact) so
-   * the report's wording updates without spending another dispatch.
+   * the report's wording updates without spending another dispatch. Returns whether
+   * it actually posted, so a caller can distinguish a real re-report from a silent
+   * no-op (AII-636) instead of always answering as if something was posted.
    */
-  reportDryRun(report: KgDryRunReportTarget): Promise<void>;
+  reportDryRun(report: KgDryRunReportTarget): Promise<boolean>;
+  /**
+   * Evicts any stored dry-run outcome for `repo`#`prNumber` (AII-636), called when the
+   * webhook observes that PR close — a closed PR's outcome can never be legitimately
+   * re-reported, so there is no reason to hold it until the cap evicts it naturally.
+   */
+  forgetPr(repo: string, prNumber: number): void;
   /**
    * Registers a listener fired whenever an in-flight kg-refresh dispatch settles, for
    * any reason — a dry-run completion, a real refresh completion, a failure, a revert,
@@ -773,7 +786,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
   /** Listeners registered via onRefreshSettled(), fired whenever `running` clears for any reason (AII-636). */
   const refreshSettledListeners: Array<() => void> = [];
   /** Bound on dryRunOutcomesByPr — oldest entry evicted first past this many distinct PRs (AII-636). */
-  const dryRunOutcomeCap = input.dryRunOutcomeCap ?? DRY_RUN_OUTCOME_CAP;
+  const dryRunOutcomeCap = input.dryRunOutcomeCap ?? MAX_TRACKED_PRS;
   /**
    * Dry-run outcomes keyed by `repo#prNumber` (AII-636), so a `labeled` webhook event
    * can only ever re-post the verdict computed for that same PR — never another PR's.
@@ -1753,14 +1766,19 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
       failIngestRunner(opts?.detail ?? "ingest runner machine absent — closed by reaper sweep", opts?.failureCode);
     },
 
-    async reportDryRun(report: KgDryRunReportTarget): Promise<void> {
+    async reportDryRun(report: KgDryRunReportTarget): Promise<boolean> {
       const key = `${report.repo}#${report.prNumber}`;
       const stored = dryRunOutcomesByPr.get(key);
       if (!stored || stored.sha !== report.sha) {
         console.debug(`[kg-refresh] dry-run report skipped: no outcome for ${report.repo}#${report.prNumber}`);
-        return;
+        return false;
       }
       await postDryRunReport(report, stored.outcome);
+      return true;
+    },
+
+    forgetPr(repo: string, prNumber: number): void {
+      dryRunOutcomesByPr.delete(`${repo}#${prNumber}`);
     },
 
     onRefreshSettled(cb: () => void): () => void {

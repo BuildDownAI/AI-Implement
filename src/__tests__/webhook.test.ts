@@ -13,7 +13,7 @@ import type * as ReviewLedgerStoreModule from "../review-ledger-store.js";
 import type * as ReviewFixQueueModule from "../review-fix-queue.js";
 import type * as CommentGapfillQueueModule from "../comment-gapfill-queue.js";
 import type { RepoMapping } from "../config.js";
-import type { KgPrCheckConfig } from "../webhook.js";
+import type { KgPrCheckConfig, KgDryRunReportTarget } from "../webhook.js";
 import { makeKgRefresh, type KgRefreshHandle } from "../kg-refresh.js";
 
 // ---------- Hoisted mocks for /ai-implement path ----------
@@ -311,7 +311,7 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
       githubAppId: "app-id",
       githubAppPrivateKey: "app-key",
       trigger: vi.fn().mockResolvedValue({ status: 202, body: {} }),
-      reportDryRun: vi.fn().mockResolvedValue(undefined),
+      reportDryRun: vi.fn().mockResolvedValue(true),
       ...overrides,
     };
   }
@@ -501,7 +501,7 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
 
   it("re-reports without re-triggering when the accept-baseline label is applied", async () => {
     const trigger = vi.fn().mockResolvedValue({ status: 202, body: {} });
-    const reportDryRun = vi.fn().mockResolvedValue(undefined);
+    const reportDryRun = vi.fn().mockResolvedValue(true);
     const kgPrCheck = makeKgPrCheck({ trigger, reportDryRun });
 
     const { req, res } = makeRequest(
@@ -529,6 +529,32 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
       acceptBaseline: true,
     });
     expect(JSON.parse(res.body)).toEqual({ reported: true });
+  });
+
+  it("an accept-baseline label on a PR with no stored dry-run outcome answers ignored, not reported (AII-636)", async () => {
+    const trigger = vi.fn().mockResolvedValue({ status: 202, body: {} });
+    const reportDryRun = vi.fn().mockResolvedValue(false);
+    const kgPrCheck = makeKgPrCheck({ trigger, reportDryRun });
+
+    const { req, res } = makeRequest(
+      SECRET,
+      "pull_request",
+      prPayload({
+        action: "labeled",
+        number: 9,
+        ref: "feature/never-ran",
+        sha: "sha-9",
+        repo: KG_SOURCE_REPO,
+        labels: ["accept-baseline"],
+        label: "accept-baseline",
+      }),
+    );
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
+    await res.done;
+
+    expect(trigger).not.toHaveBeenCalled();
+    expect(reportDryRun).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(res.body)).toEqual({ ignored: true, reason: "no_dry_run_outcome" });
   });
 
   it("a non-accept-baseline label is ignored, even on a PR that never ran a dry-run (AII-636)", async () => {
@@ -788,6 +814,57 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
     await vi.waitFor(() => {
       expect(dispatchRun).toHaveBeenCalledTimes(2);
     });
+  });
+
+  it("a closed event evicts this PR's stored dry-run state, so a later accept-baseline label finds nothing to re-report (AII-636)", async () => {
+    const outcomeStore = new Set<string>();
+    const storeKey = (repo: string, prNumber: number) => `${repo}#${prNumber}`;
+    outcomeStore.add(storeKey(KG_SOURCE_REPO, 55));
+
+    const trigger = vi.fn().mockResolvedValue({ status: 202, body: {} });
+    const forgetKgPr = vi.fn((repo: string, prNumber: number) => {
+      outcomeStore.delete(storeKey(repo, prNumber));
+    });
+    const reportDryRun = vi.fn((report: KgDryRunReportTarget) =>
+      Promise.resolve(outcomeStore.has(storeKey(report.repo, report.prNumber))),
+    );
+    const kgPrCheck = makeKgPrCheck({ trigger, forgetKgPr, reportDryRun });
+
+    const closed = makeRequest(SECRET, "pull_request", {
+      action: "closed",
+      pull_request: {
+        number: 55,
+        merged: false,
+        html_url: `https://github.com/${KG_SOURCE_REPO}/pull/55`,
+        head: { ref: "feature/a" },
+        merge_commit_sha: null,
+      },
+      repository: { full_name: KG_SOURCE_REPO },
+    });
+    webhook.handleGitHubWebhook(closed.req as never, closed.res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
+    await closed.res.done;
+
+    expect(forgetKgPr).toHaveBeenCalledWith(KG_SOURCE_REPO, 55);
+    expect(outcomeStore.has(storeKey(KG_SOURCE_REPO, 55))).toBe(false);
+
+    const labeled = makeRequest(
+      SECRET,
+      "pull_request",
+      prPayload({
+        action: "labeled",
+        number: 55,
+        ref: "feature/a",
+        sha: "sha-55",
+        repo: KG_SOURCE_REPO,
+        labels: ["accept-baseline"],
+        label: "accept-baseline",
+      }),
+    );
+    webhook.handleGitHubWebhook(labeled.req as never, labeled.res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
+    await labeled.res.done;
+
+    expect(reportDryRun).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(labeled.res.body)).toEqual({ ignored: true, reason: "no_dry_run_outcome" });
   });
 });
 

@@ -3616,6 +3616,7 @@ function startServer(config: AppConfig, registry: ProviderRegistry, sidecar: KgS
         trigger: (opts) => kgRefresh.trigger(opts),
         reportDryRun: (report) => kgRefresh.reportDryRun(report),
         onRefreshSettled: (cb) => kgRefresh.onRefreshSettled(cb),
+        forgetKgPr: (repo, prNumber) => kgRefresh.forgetPr(repo, prNumber),
       }).catch((err) => {
         console.error("[webhook] Unhandled error:", err);
         if (!res.headersSent) {
