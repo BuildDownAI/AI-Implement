@@ -427,22 +427,6 @@ export async function listPullRequestFiles(
 }
 
 /**
- * Returns the labels on a PR/issue (unified GitHub label API).
- */
-export async function listPrLabels(
-  token: string,
-  owner: string,
-  repo: string,
-  prNumber: number,
-): Promise<string[]> {
-  const url = `https://api.github.com/repos/${owner}/${repo}/issues/${prNumber}/labels?per_page=100`;
-  const res = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
-  if (!res.ok) return [];
-  const data = (await res.json()) as Array<{ name?: string }>;
-  return data.map((l) => l.name).filter((n): n is string => typeof n === "string");
-}
-
-/**
  * Returns the commit SHA a branch points at, or null if the branch does not exist.
  */
 export async function getBranchSha(

@@ -2654,6 +2654,55 @@ describe("kg-refresh", () => {
       expect(result.ok).toBe(true);
     });
 
+    it("kgBaseRepo set — statuses:write 'base repo' row probes the webhook's base repo, not sources.yml's base_repo (AII-633)", async () => {
+      const result = await runKgRefreshPreflight({
+        githubAppId: "1",
+        githubAppPrivateKey: "key",
+        kgSourceRepo: "TestOrg/test-kg",
+        kgBaseRepo: "TestOrg/webhook-base",
+        mintToken: mintTokenPf as never,
+        fetchTarball: vi.fn(async () => preflightTarball) as never,
+        fetchDefaultBranch: vi.fn(async () => "main") as never,
+        probeRepo: probeRepo as never,
+        fetchWorkflowFile: fetchWorkflowFile as never,
+        fetchCompare: fetchCompare as never,
+      });
+      const byGrant = (repo: string, grant: string) => result.results.find((r) => r.repo === repo && r.grant === grant);
+      expect(byGrant("TestOrg/webhook-base", "statuses:write")).toMatchObject({ ok: true, status: 200 });
+      expect(byGrant("BuildDownAI/bd-knowledge-graph-base", "statuses:write")).toBeUndefined();
+      // base:drift is unrelated to the webhook's target and still checks sources.yml's base_repo.
+      expect(byGrant("BuildDownAI/bd-knowledge-graph-base", "base:drift")).toMatchObject({ ok: true, status: 200 });
+    });
+
+    it("kgBaseRepo absent — statuses:write 'base repo' row falls back to sources.yml's base_repo (pre-AII-633 behaviour)", async () => {
+      const result = await runKgRefreshPreflight({
+        githubAppId: "1",
+        githubAppPrivateKey: "key",
+        kgSourceRepo: "TestOrg/test-kg",
+        mintToken: mintTokenPf as never,
+        fetchTarball: vi.fn(async () => preflightTarball) as never,
+        fetchDefaultBranch: vi.fn(async () => "main") as never,
+        probeRepo: probeRepo as never,
+        fetchWorkflowFile: fetchWorkflowFile as never,
+        fetchCompare: fetchCompare as never,
+      });
+      const byGrant = (repo: string, grant: string) => result.results.find((r) => r.repo === repo && r.grant === grant);
+      expect(byGrant("BuildDownAI/bd-knowledge-graph-base", "statuses:write")).toMatchObject({ ok: true, status: 200 });
+    });
+
+    it("KgRefreshInput.getKgBaseRepo threads into trigger()'s internal preflight call (AII-633)", async () => {
+      buildPreflight({ getKgBaseRepo: () => "TestOrg/webhook-base" });
+      const r = await handle.trigger();
+      expect(r.status).toBe(202);
+      const baseRepoStatusesMintCall = mintTokenPf.mock.calls.find((call) => {
+        const [, , owner, opts] = call as [string, string, string, Record<string, unknown>];
+        const permissions = opts?.permissions as Record<string, string> | undefined;
+        const repositories = opts?.repositories as string[] | undefined;
+        return permissions?.statuses === "write" && owner === "TestOrg" && repositories?.includes("webhook-base");
+      });
+      expect(baseRepoStatusesMintCall).toBeDefined();
+    });
+
     it("statuses:write denied does not block dispatch", async () => {
       buildPreflight({
         mintToken: vi.fn(async (_id: string, _key: string, _owner: string, opts: Record<string, unknown>) => {

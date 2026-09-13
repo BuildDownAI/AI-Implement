@@ -3346,6 +3346,7 @@ function startServer(config: AppConfig, registry: ProviderRegistry, sidecar: KgS
     githubAppId: config.githubAppId,
     githubAppPrivateKey: config.githubAppPrivateKey,
     kgSourceRepo: config.kgSourceRepo,
+    getKgBaseRepo: () => getOrchestratorSettings().kgBaseRepo,
     runnerCallbackBaseUrl: config.runnerCallbackBaseUrl,
     runnerTokenSecret: config.runnerTokenSecret,
     resolveMappingTeamKey: (ownerRepo) => {
@@ -3862,7 +3863,12 @@ function startServer(config: AppConfig, registry: ProviderRegistry, sidecar: KgS
     // MCP endpoint — OAuth bearer token authenticated
     if (pathname === "/mcp") {
       const kgPreflightFn = config.kgSourceRepo
-        ? () => runKgRefreshPreflight({ githubAppId: config.githubAppId, githubAppPrivateKey: config.githubAppPrivateKey, kgSourceRepo: config.kgSourceRepo! })
+        ? () => runKgRefreshPreflight({
+            githubAppId: config.githubAppId,
+            githubAppPrivateKey: config.githubAppPrivateKey,
+            kgSourceRepo: config.kgSourceRepo!,
+            kgBaseRepo: getOrchestratorSettings().kgBaseRepo,
+          })
         : undefined;
       const getKgStatusFn = () => kgRefresh.status();
       const triggerKgRefreshFn = (dryRun?: boolean) => kgRefresh.trigger({ dryRun });

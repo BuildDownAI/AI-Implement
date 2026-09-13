@@ -121,6 +121,16 @@ export interface KgPreflightInput {
   githubAppId: string;
   githubAppPrivateKey: string;
   kgSourceRepo: string;
+  /**
+   * Orchestrator setting (Settings → KG Refresh · "Base template repo", AII-633) — the
+   * repo the PR-triggered dry-run webhook actually posts its sticky comment/commit status
+   * to when a PR lands there. Distinct from sources.yml's `base_repo:` (used below for the
+   * `base:drift` row): the two are read from different places and can diverge. When set,
+   * the `statuses:write` "base repo" row probes this repo instead of sources.yml's, so the
+   * preflight reflects the grant the webhook's commit status actually needs. Absent falls
+   * back to sources.yml's `base_repo:`, matching pre-AII-633 behaviour.
+   */
+  kgBaseRepo?: string | null;
   mintToken?: typeof getScopedInstallationToken;
   fetchTarball?: typeof fetchRepoTarball;
   fetchDefaultBranch?: (token: string, owner: string, repo: string) => Promise<string>;
@@ -238,6 +248,14 @@ interface KgRefreshInput {
   githubAppPrivateKey: string;
   /** owner/repo of the KG source (config.kgSourceRepo — never hard-code the slug). */
   kgSourceRepo: string | null;
+  /**
+   * Reads the orchestrator's current "Base template repo" setting (AII-633) at preflight
+   * time — a getter rather than a static value because it is admin-editable at runtime.
+   * Forwarded to runKgRefreshPreflight's `kgBaseRepo` so the internal preflight probes the
+   * same repo the PR-triggered webhook posts its commit status to. Absent/null preserves
+   * the pre-AII-633 fallback to sources.yml's `base_repo:`.
+   */
+  getKgBaseRepo?: () => string | null;
   /** Overrides for tests. */
   dataRoot?: string;
   kgDir?: string;
@@ -621,15 +639,16 @@ export async function runKgRefreshPreflight(input: KgPreflightInput): Promise<Pr
   } catch {
     results.push({ repo: kgRepoSlug, grant: "statuses:write", ok: true, status: 0, hint: STATUSES_WRITE_HINT });
   }
+  const statusesBaseRepoSlug = input.kgBaseRepo && input.kgBaseRepo.trim() ? input.kgBaseRepo.trim() : baseRepoSlug;
   try {
-    const [baseOwner, baseRepoName] = baseRepoSlug.split("/");
+    const [baseOwner, baseRepoName] = statusesBaseRepoSlug.split("/");
     await mintTokenFn(input.githubAppId, input.githubAppPrivateKey, baseOwner, {
       permissions: { statuses: "write" },
       repositories: [baseRepoName],
     });
-    results.push({ repo: baseRepoSlug, grant: "statuses:write", ok: true, status: 200 });
+    results.push({ repo: statusesBaseRepoSlug, grant: "statuses:write", ok: true, status: 200 });
   } catch {
-    results.push({ repo: baseRepoSlug, grant: "statuses:write", ok: true, status: 0, hint: STATUSES_WRITE_HINT });
+    results.push({ repo: statusesBaseRepoSlug, grant: "statuses:write", ok: true, status: 0, hint: STATUSES_WRITE_HINT });
   }
 
   // Probe the installation-wide dependency token against each code/secondary repo slug.
@@ -1224,6 +1243,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
           githubAppId: input.githubAppId,
           githubAppPrivateKey: input.githubAppPrivateKey,
           kgSourceRepo: input.kgSourceRepo,
+          kgBaseRepo: input.getKgBaseRepo?.() ?? null,
           mintToken,
           fetchTarball,
           fetchDefaultBranch,

@@ -300,11 +300,31 @@ is a distinct mechanism from an admin accepting a new baseline at refresh time (
 refresh against that same source still refuses the shrink unless that refresh-time acceptance has
 happened. Treat the label as "we've seen this and it's expected," not as a bypass.
 
-**Manual step.** The GitHub App needs `statuses: write` granted on the KG source repo and on the
-base template repo for the commit status to appear — this is not requestable through code, and there
-is no way to detect the gap from inside the PR itself. Grant it via the GitHub App's permissions page
-for each repo's installation. Until granted, the sticky comment is the only signal; nothing errors or
-blocks in the meantime.
+**Manual step — granting the status.** The GitHub App needs `statuses: write` granted on the KG
+source repo and on the base template repo for the commit status to appear — this is not requestable
+through code, and there is no way to detect the gap from inside the PR itself. Grant it via the
+GitHub App's permissions page for each repo's installation. Until granted, the sticky comment is the
+only signal; nothing errors or blocks in the meantime. The preflight's `statuses:write` rows probe
+this grant against the same two repos the webhook actually posts to — the KG source repo, and
+whichever repo is configured as "Base template repo" (see the note on the two "base repo" notions
+below), not sources.yml's `base_repo:`.
+
+**Manual step — making the check required.** Setting `statuses: write` only lets the status *appear*;
+by itself it is advisory and a PR can be merged straight through it regardless of the guard's verdict.
+The ticket's "required check" only exists once a repo admin adds `kg-refresh/dry-run` as a required
+context in that repo's branch protection settings (Settings → Branches → Branch protection rule →
+"Require status checks to pass" → add `kg-refresh/dry-run`), on both the KG source repo and the base
+template repo. Nothing in this codebase calls GitHub's branch-protection API to do this automatically
+— it stays a one-time, per-repo manual step alongside granting `statuses: write`. Until that step is
+done on a given repo, `kg-refresh/dry-run` is informational only there, no matter how the guard votes.
+
+**Two notions of "base repo."** The "Base template repo" Settings field (`kgBaseRepo`, seeded once
+from `KG_BASE_REPO`) is what this webhook check uses to decide whether an incoming PR's repository
+should be treated as a base-template PR — a global, admin-configured value. It is a distinct thing
+from sources.yml's own `base_repo:` field, which the advisory `base:drift` preflight row (AII-598)
+reads to compare a derivative KG repo against its template. The two should normally agree, but they
+are read from different places and are not reconciled automatically; a `statuses:write` preflight row
+for the base repo reflects the Settings value, while `base:drift` reflects sources.yml's.
 
 ### Scope contract
 
