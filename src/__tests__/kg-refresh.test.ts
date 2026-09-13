@@ -914,6 +914,25 @@ describe("kg-refresh", () => {
         expect(s.lastRefresh?.partTable).toEqual([{ part: "comment.nt", prev: "9995", new: "3793" }]);
       });
 
+      it("a dry-run runner failure with no guardVerdict is reported as a plain failure, not a guard refusal", async () => {
+        buildDispatch();
+        await handle.trigger({ dryRun: true });
+        await waitForStage("ingest-running");
+        handle.onRunnerComplete("failure", {
+          failureCode: "CLONE_FAILED",
+          failureReason: "git clone exited 128\nfatal: could not read Username",
+        });
+        await waitDone();
+        expect(restart).not.toHaveBeenCalled();
+        const s = await handle.status();
+        expect(s.stage).toBe("idle");
+        expect(s.running).toBe(false);
+        expect(s.lastRefresh?.ok).toBe(false);
+        expect(s.lastRefresh?.dryRun).toBe(true);
+        expect(s.lastRefresh?.partTable).toBeUndefined();
+        expect(s.lastRefresh?.detail).toBe("dry-run: failed: CLONE_FAILED");
+      });
+
       it("a dry-run completion restores the stage held before dispatch, not a hardcoded idle", async () => {
         // Dispatch twice: first a normal dispatch that fails (→ "failed"), then a
         // dry-run dispatch from that stage — the dry-run completion must restore

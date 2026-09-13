@@ -1255,7 +1255,9 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
         const ok = runnerOutcome === "success";
         const detail = ok
           ? "dry-run: guard passed: no shrink"
-          : `dry-run: guard refused: ${(data.failureReason ?? data.failureCode ?? "refused").split("\n")[0]}`;
+          : data.guardVerdict === "refused"
+            ? `dry-run: guard refused: ${(data.failureReason ?? data.failureCode ?? "refused").split("\n")[0]}`
+            : `dry-run: failed: ${data.failureCode ?? (data.failureReason ?? "unknown").split("\n")[0]}`;
 
         lastRefresh = {
           ok,
