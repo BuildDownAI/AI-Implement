@@ -73,12 +73,15 @@ export const pullsScript = `
     }
     tbody.innerHTML = '';
     for (const pull of pulls) {
-      const { prUrl, prNumber, issueIdentifier, issueTitle, repo, jobStatus, dispatchNumber, lastDispatchedAt } = pull;
+      const { prUrl, prNumber, issueIdentifier, issueTitle, issueUrl, repo, jobStatus, dispatchNumber, lastDispatchedAt } = pull;
       const kind = statusBadgeKind(jobStatus);
       const prCell = '<a class="text-accent mono" href="' + window.safeUrl(prUrl) + '" target="_blank">#' + (prNumber != null ? prNumber : '?') + '</a>';
       let issueCell;
       if (issueIdentifier) {
-        issueCell = '<a class="text-accent" href="https://linear.app/issue/' + window.escAttr(issueIdentifier) + '" target="_blank"><span class="mono text-secondary">' + window.esc(issueIdentifier) + '</span> <span>' + window.esc(issueTitle || '') + '</span></a>';
+        const issueLabel = '<span class="mono text-secondary">' + window.esc(issueIdentifier) + '</span> <span>' + window.esc(issueTitle || '') + '</span>';
+        issueCell = issueUrl
+          ? '<a class="text-accent" href="' + window.safeUrl(issueUrl) + '" target="_blank">' + issueLabel + '</a>'
+          : issueLabel;
       } else {
         issueCell = '<span class="text-tertiary">&mdash;</span>';
       }

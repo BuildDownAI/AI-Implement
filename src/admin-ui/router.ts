@@ -44,17 +44,5 @@ export const routerJs = `
 
   /** Called by auth.js once the session identity has resolved, and not before. */
   window.startRouting = function () { routing = true; show(readHash()); };
-
-  document.addEventListener('DOMContentLoaded', () => {
-    // One-time fetch so any page (drawer, etc.) can build provider-aware URLs.
-    if (window.api) {
-      window.api('/api/admin/config-status').then(function (res) {
-        if (!res.ok) return res.json().catch(function () { return {}; }).then(function () {});
-        return res.json().then(function (status) {
-          if (status && status.jiraSiteUrl) window.jiraSiteUrl = status.jiraSiteUrl;
-        });
-      }).catch(function () {});
-    }
-  });
 })();
 `;
