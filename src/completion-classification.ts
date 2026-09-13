@@ -203,30 +203,6 @@ export function redactedGuardrailReason(reason: string | undefined): string | un
   return reason?.trim() ? redactAndCap(reason, GUARDRAIL_REASON_MAX_CHARS) : undefined;
 }
 
-/**
- * Builds the Classification for a structured terminal FailureRecord (BAC-27111).
- * Shared by `classifyCompletion` (monitor-detected terminal jobs) and
- * `formatFailureComment` (runner-callback) so both render byte-identical
- * comments for the same record — factored here rather than duplicated.
- *
- * The summary deliberately says "Failed at stage", not "{phase} failed at stage":
- * both callers wrap this in a phase-naming prefix of their own (`markImplementationFailed`
- * / `markPlanningFailed` post "⚠️ Implementation failed: ${reason}"), so restating the
- * phase here doubled it in the rendered ticket comment.
- *
- * `isInitialRun` distinguishes the three things a truthy `prUrl` can mean: a fresh draft PR
- * this failing run just opened (initial run — `undefined`/`true`), a PR that already existed
- * before this run was dispatched and is untouched by the failure (gap-fill or re-dispatch —
- * `false`), or — `null` — that which of those two is true cannot be determined at all. The
- * monitor path (`classifyCompletion`) always passes `null`, for every phase and every terminal
- * status it renders: it reconstructs this classification entirely after the fact from the job
- * row, with no dispatch-time record of whether the PR predates the run, so it must not guess
- * either sentence — it states only the bare fact that a PR exists, regardless of what the
- * callback would have said about the same job. The implementation callback path
- * (`formatFailureComment`) knows which case it is from the dispatch itself and passes a real
- * boolean; the planning callback never passes it at all, which is safe only because planning
- * never has a `prUrl` for the ambiguity to apply to.
- */
 /** Shared by every branch of `classificationForFailure` below. */
 function statusLineFor(failure: FailureRecord, lastSuccessfulStage?: string | null): string {
   return [
@@ -304,6 +280,30 @@ function reviewerTurnsExhaustedClassification(
   };
 }
 
+/**
+ * Builds the Classification for a structured terminal FailureRecord (BAC-27111).
+ * Shared by `classifyCompletion` (monitor-detected terminal jobs) and
+ * `formatFailureComment` (runner-callback) so both render byte-identical
+ * comments for the same record — factored here rather than duplicated.
+ *
+ * The summary deliberately says "Failed at stage", not "{phase} failed at stage":
+ * both callers wrap this in a phase-naming prefix of their own (`markImplementationFailed`
+ * / `markPlanningFailed` post "⚠️ Implementation failed: ${reason}"), so restating the
+ * phase here doubled it in the rendered ticket comment.
+ *
+ * `isInitialRun` distinguishes the three things a truthy `prUrl` can mean: a fresh draft PR
+ * this failing run just opened (initial run — `undefined`/`true`), a PR that already existed
+ * before this run was dispatched and is untouched by the failure (gap-fill or re-dispatch —
+ * `false`), or — `null` — that which of those two is true cannot be determined at all. The
+ * monitor path (`classifyCompletion`) always passes `null`, for every phase and every terminal
+ * status it renders: it reconstructs this classification entirely after the fact from the job
+ * row, with no dispatch-time record of whether the PR predates the run, so it must not guess
+ * either sentence — it states only the bare fact that a PR exists, regardless of what the
+ * callback would have said about the same job. The implementation callback path
+ * (`formatFailureComment`) knows which case it is from the dispatch itself and passes a real
+ * boolean; the planning callback never passes it at all, which is safe only because planning
+ * never has a `prUrl` for the ambiguity to apply to.
+ */
 export function classificationForFailure(
   failure: FailureRecord,
   prUrl?: string,
