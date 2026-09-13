@@ -34,9 +34,13 @@ async function boundedCleanup(
   if (attempts <= STUCK_JOB_MAX_ATTEMPTS) {
     if (provider) {
       try {
-        await provider.clearWorkingState(job.issueId!, job.teamKey ?? "");
+        const applied = await provider.clearWorkingState(job.issueId!, job.teamKey ?? "");
         deleteDispatched(job.issueId!);
-        console.log(`[monitor] Reset ticket ${job.issueIdentifier} for requeue`);
+        console.log(
+          applied
+            ? `[monitor] Reset ticket ${job.issueIdentifier} for requeue`
+            : `[monitor] ${job.issueIdentifier} already Merged — requeue reset suppressed`,
+        );
       } catch (err) {
         console.error(`[monitor] Failed to reset ticket ${job.issueIdentifier}:`, err);
       }

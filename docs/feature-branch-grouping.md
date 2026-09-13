@@ -275,8 +275,18 @@ Feature-branch grouping is supported on **both providers**:
   Repo field matches the mapping. Roll-up discovery treats a node as completed when its
   native status category is Done **or** its AI-Implement Status field is `Merged` — the
   orchestrator's done-on-merge path only sets the custom field, never the native status,
-  so without the OR the cascade would stall waiting for a manual status move. The gating
-  children query fails **closed** (candidates are deferred for the poll rather than
+  so without the OR the cascade would stall waiting for a manual status move. The same OR
+  applies to the "blocks" gate: the embedded link payload carries only a blocker's native
+  status, so each poll resolves which natively-unfinished blockers carry
+  `AI-Implement Status = Merged` (one chunked `key in (...)` query, run only when something
+  is gated) and releases their dependents; a failed chunk leaves its blockers gating on
+  native status for that poll. `Merged` is also terminal for the status field itself: a run
+  can outlive its own PR (auto-merge or a fast human merge while post-push review is still
+  running), so every non-`Merged` status write pre-reads the field and is refused when the
+  issue is already `Merged` — a late failure report is kept as a comment, a late "PR ready"
+  is dropped, and the reaper's reset leaves the issue out of the dispatch bucket. The
+  setters report whether the write was applied so callers log the suppressed case. The
+  gating children query fails **closed** (candidates are deferred for the poll rather than
   dispatched prematurely). Jira's provider-side ancestor discovery still fails open
   when it cannot discover a chain; once a non-empty chain is attached, remote branch
   materialization fails closed and leaves the issue queued rather than targeting base.

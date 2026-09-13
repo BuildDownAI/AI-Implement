@@ -97,28 +97,32 @@ export class FakeProvider implements TicketingProvider {
     await this.tick("markPlanComplete", [issueId, scopeKey]);
     this.transition(issueId, "plan_complete");
   }
-  async markPlanningFailed(issueId: string, scopeKey: string, reason: string): Promise<void> {
+  async markPlanningFailed(issueId: string, scopeKey: string, reason: string): Promise<boolean> {
     await this.tick("markPlanningFailed", [issueId, scopeKey, reason]);
     this.transition(issueId, "needs_planning");
     this.appendComment(issueId, `Planning failed: ${reason}`);
+    return true;
   }
   async markImplementing(issueId: string, scopeKey: string): Promise<void> {
     await this.tick("markImplementing", [issueId, scopeKey]);
     this.transition(issueId, "implementing");
   }
-  async markPrReady(issueId: string, scopeKey: string, prUrl: string): Promise<void> {
+  async markPrReady(issueId: string, scopeKey: string, prUrl: string): Promise<boolean> {
     await this.tick("markPrReady", [issueId, scopeKey, prUrl]);
     this.transition(issueId, "pr_ready");
     this.appendComment(issueId, `PR ready: ${prUrl}`);
+    return true;
   }
-  async markImplementationFailed(issueId: string, scopeKey: string, reason: string): Promise<void> {
+  async markImplementationFailed(issueId: string, scopeKey: string, reason: string): Promise<boolean> {
     await this.tick("markImplementationFailed", [issueId, scopeKey, reason]);
     this.transition(issueId, "plan_complete");
     this.appendComment(issueId, `Implementation failed: ${reason}`);
+    return true;
   }
-  async clearWorkingState(issueId: string, scopeKey: string): Promise<void> {
+  async clearWorkingState(issueId: string, scopeKey: string): Promise<boolean> {
     await this.tick("clearWorkingState", [issueId, scopeKey]);
     this.transition(issueId, "cleared");
+    return true;
   }
   async postComment(issueId: string, body: string): Promise<void> {
     await this.tick("postComment", [issueId, body]);
