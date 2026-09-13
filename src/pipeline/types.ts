@@ -87,6 +87,10 @@ export interface PipelineContextData {
   dependencyTokenExpiresAt?: string;
   /** kg-refresh dev-harness: when true, kg-snapshot-push prints the guard table but skips commit and push. */
   kgDryRun?: boolean;
+  /** kg-refresh: when true, kg-snapshot-push downgrades the zero-shrink/50% guards to warnings and pushes anyway (AII-628). */
+  kgAcceptNewBaseline?: boolean;
+  /** kg-refresh: email of the admin who set kgAcceptNewBaseline, for the guard-override log line and the refresh PR's ### Baseline section. */
+  kgBaselineActor?: string;
 }
 
 export interface PipelineContext {

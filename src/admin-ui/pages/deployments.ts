@@ -101,7 +101,8 @@ export const deploymentsHtml = `
         <div style="margin-top: 12px">
           <button class="btn btn-sm" id="kg-refresh-btn" onclick="window.triggerKgRefresh()">Refresh graph now</button>
           <button class="btn btn-sm" id="kg-dry-run-btn" onclick="window.triggerKgRefresh(true)">Dry-run refresh</button>
-          <span class="kpi-trend text-secondary" style="margin-left: 8px">Refresh fetches the KG source repo's committed snapshot and restarts the sidecar — no deploy, no dispatch pause. Dry-run runs the same job with the push skipped and reports the guard table below; the served graph never changes.</span>
+          <button class="btn btn-sm" id="kg-accept-baseline-btn" onclick="window.triggerKgAcceptBaseline()">Accept new baseline &amp; refresh</button>
+          <span class="kpi-trend text-secondary" style="margin-left: 8px">Refresh fetches the KG source repo's committed snapshot and restarts the sidecar — no deploy, no dispatch pause. Dry-run runs the same job with the push skipped and reports the guard table below; the served graph never changes. Accept new baseline pushes even if the guard table above shows a shrink — review it first.</span>
         </div>
         <div class="kpi-trend text-secondary" id="kg-dry-run-last" style="margin-top: 8px" hidden></div>
         <div id="kg-materialize-env-warning" class="warning hidden">&#x26A0; KG_MATERIALIZE_DIRECT env var is set &#x2014; UI toggle has no effect until it is unset.</div>
@@ -655,6 +656,7 @@ export const deploymentsScript = `
       const busy = !!data.running || !!data.deployHeld;
       document.getElementById('kg-refresh-btn').disabled = busy;
       document.getElementById('kg-dry-run-btn').disabled = busy;
+      document.getElementById('kg-accept-baseline-btn').disabled = busy;
     } catch (e) { card.hidden = true; }
   }
 
@@ -717,6 +719,25 @@ export const deploymentsScript = `
         } else {
           showMessage('warning', 'Refresh refused \u2014 ' + (body.error || String(res.status)));
         }
+      }
+    } catch (err) { showMessage('warning', 'Refresh failed \u2014 ' + String(err)); }
+    setTimeout(loadKgStatus, 1000);
+  };
+
+  // AII-628: a one-shot override of the zero-shrink/50% push guards, gated by the same
+  // native confirm() this page uses for every other consequential action (see "Deploy now").
+  // A separate button/function from triggerKgRefresh rather than a third argument there,
+  // so an operator reads the shrink table first and opts in deliberately.
+  window.triggerKgAcceptBaseline = async function () {
+    if (!confirm('Accept the new baseline? This pushes the snapshot even though a tracked part (issue.nt/comment.nt) shrank, overriding the zero-shrink/50% guard for this one refresh. Review the guard table above first.')) return;
+    document.getElementById('kg-refresh-btn').disabled = true;
+    document.getElementById('kg-dry-run-btn').disabled = true;
+    document.getElementById('kg-accept-baseline-btn').disabled = true;
+    try {
+      const res = await window.api('/api/kg/refresh', { method: 'POST', body: JSON.stringify({ acceptNewBaseline: true }) });
+      if (!res.ok) {
+        const body = await res.json().catch(function () { return {}; });
+        showMessage('warning', 'Refresh refused \u2014 ' + (body.error || String(res.status)));
       }
     } catch (err) { showMessage('warning', 'Refresh failed \u2014 ' + String(err)); }
     setTimeout(loadKgStatus, 1000);
