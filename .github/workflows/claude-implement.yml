@@ -182,6 +182,7 @@ jobs:
           fi
 
           echo "runner_image=$runner_image" >> "$GITHUB_OUTPUT"
+          echo "[dispatch-inputs] resolved runner_image: $runner_image"
 
   implement:
     needs: validate-runner-image
@@ -200,6 +201,38 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
+      - name: Print dispatch inputs
+        env:
+          RUN_CONFIG: ${{ inputs.run_config }}
+          PROVIDER: ${{ inputs.provider }}
+          AWS_REGION: ${{ inputs.aws_region }}
+          JOB_TIMEOUT_MINUTES: ${{ inputs.job_timeout_minutes }}
+          RUNNER_IMAGE: ${{ inputs.runner_image }}
+          RUNNER_CALLBACK_URL: ${{ inputs.runner_callback_url }}
+          RUNNER_PHASE: ${{ inputs.runner_phase }}
+          HAS_RUN_TOKEN: "${{ inputs.run_token != '' }}"
+          HAS_RUN_PROGRESS_TOKEN: "${{ inputs.run_progress_token != '' }}"
+          HAS_PUBLICATION_TOKEN: "${{ inputs.run_publication_token != '' }}"
+        run: |
+          echo "[dispatch-inputs] provider: $PROVIDER"
+          echo "[dispatch-inputs] aws_region: $AWS_REGION"
+          echo "[dispatch-inputs] job_timeout_minutes: $JOB_TIMEOUT_MINUTES"
+          echo "[dispatch-inputs] runner_image: $RUNNER_IMAGE"
+          echo "[dispatch-inputs] runner_callback_url: $RUNNER_CALLBACK_URL"
+          echo "[dispatch-inputs] runner_phase: $RUNNER_PHASE"
+          echo "[dispatch-inputs] run_token: $( [ "$HAS_RUN_TOKEN" = "true" ] && echo "<redacted>" || echo "(empty)" )"
+          echo "[dispatch-inputs] run_progress_token: $( [ "$HAS_RUN_PROGRESS_TOKEN" = "true" ] && echo "<redacted>" || echo "(empty)" )"
+          echo "[dispatch-inputs] run_publication_token: $( [ "$HAS_PUBLICATION_TOKEN" = "true" ] && echo "<redacted>" || echo "(empty)" )"
+          # The run_config envelope is documented secret-free: the runner tokens
+          # deliberately stay top-level inputs so this workflow can ::add-mask::
+          # them before the runner starts (src/run-config.ts and
+          # docs/workflow-envelope.md), so decoding it here cannot leak a credential.
+          # jq quotes and indents every value, so no decoded line can begin with
+          # "::" and forge a workflow command.
+          echo "[dispatch-inputs] run_config:"
+          printf '%s' "$RUN_CONFIG" | base64 -d | jq . \
+            || echo "[dispatch-inputs] run_config could not be decoded"
+
       - name: Generate GitHub App token
         id: app-token
         uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349
@@ -307,6 +340,12 @@ jobs:
       - name: Run pipeline
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          # provider/aws_region stayed TOP-LEVEL inputs under the envelope (they gate the
+          # OIDC credentials step, which runs before run_config is decoded), so the runner
+          # still reads them from env: run-autonomous.ts does `env.PROVIDER || "anthropic"`,
+          # which means a missing PROVIDER silently downgrades every Bedrock repo.
+          PROVIDER: ${{ inputs.provider }}
+          AWS_REGION: ${{ inputs.aws_region }}
           AI_IMPLEMENT_RUN_CONFIG: ${{ inputs.run_config }}
           AI_IMPLEMENT_LOG_LEVEL: ${{ vars.AI_IMPLEMENT_LOG_LEVEL }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}

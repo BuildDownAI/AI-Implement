@@ -144,6 +144,7 @@ jobs:
           fi
 
           echo "runner_image=$runner_image" >> "$GITHUB_OUTPUT"
+          echo "[dispatch-inputs] resolved runner_image: $runner_image"
 
   plan:
     needs: validate-runner-image
@@ -159,6 +160,32 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
+      - name: Print dispatch inputs
+        env:
+          RUN_CONFIG: ${{ inputs.run_config }}
+          PROVIDER: ${{ inputs.provider }}
+          AWS_REGION: ${{ inputs.aws_region }}
+          JOB_TIMEOUT_MINUTES: ${{ inputs.job_timeout_minutes }}
+          RUNNER_IMAGE: ${{ inputs.runner_image }}
+          HAS_RUN_TOKEN: "${{ inputs.run_token != '' }}"
+          HAS_RUN_PROGRESS_TOKEN: "${{ inputs.run_progress_token != '' }}"
+        run: |
+          echo "[dispatch-inputs] provider: $PROVIDER"
+          echo "[dispatch-inputs] aws_region: $AWS_REGION"
+          echo "[dispatch-inputs] job_timeout_minutes: $JOB_TIMEOUT_MINUTES"
+          echo "[dispatch-inputs] runner_image: $RUNNER_IMAGE"
+          echo "[dispatch-inputs] run_token: $( [ "$HAS_RUN_TOKEN" = "true" ] && echo "<redacted>" || echo "(empty)" )"
+          echo "[dispatch-inputs] run_progress_token: $( [ "$HAS_RUN_PROGRESS_TOKEN" = "true" ] && echo "<redacted>" || echo "(empty)" )"
+          # The run_config envelope is documented secret-free: run_token and
+          # run_progress_token deliberately stay top-level inputs so this workflow
+          # can ::add-mask:: them before the runner starts (src/run-config.ts and
+          # docs/workflow-envelope.md), so decoding it here cannot leak a credential.
+          # jq quotes and indents every value, so no decoded line can begin with
+          # "::" and forge a workflow command.
+          echo "[dispatch-inputs] run_config:"
+          printf '%s' "$RUN_CONFIG" | base64 -d | jq . \
+            || echo "[dispatch-inputs] run_config could not be decoded"
+
       - name: Generate GitHub App token
         id: app-token
         uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349
@@ -254,6 +281,11 @@ jobs:
       - name: Run planning
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          # See the equivalent comment in claude-implement.yml: provider/aws_region remain
+          # top-level inputs and the runner reads them from env, so dropping them here
+          # silently downgrades Bedrock repos to the anthropic provider.
+          PROVIDER: ${{ inputs.provider }}
+          AWS_REGION: ${{ inputs.aws_region }}
           RUNNER_PHASE: planning
           AI_IMPLEMENT_RUN_CONFIG: ${{ inputs.run_config }}
           AI_IMPLEMENT_LOG_LEVEL: ${{ vars.AI_IMPLEMENT_LOG_LEVEL }}

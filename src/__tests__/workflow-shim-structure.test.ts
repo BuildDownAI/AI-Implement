@@ -477,4 +477,59 @@ describe("GHA workflow shims", () => {
       expect(yaml).toMatch(/role-session-duration:\s*14400/);
     });
   }
+
+  // Print dispatch inputs step tests (BAC-25597)
+  for (const f of IMPLEMENT_WORKFLOWS) {
+    it(`${f} has Print dispatch inputs as the first step of the implement job`, () => {
+      const doc = parse(readFileSync(f, "utf-8")) as any;
+      expect(doc.jobs.implement.steps[0].name).toBe("Print dispatch inputs");
+    });
+
+    it(`${f} Print dispatch inputs never passes run_token or run_progress_token as raw expressions`, () => {
+      const doc = parse(readFileSync(f, "utf-8")) as any;
+      const printStep = doc.jobs.implement.steps[0];
+      expect(printStep.name).toBe("Print dispatch inputs");
+      const stepStr = JSON.stringify(printStep);
+      expect(stepStr).not.toContain("inputs.run_token }}");
+      expect(stepStr).not.toContain("inputs.run_progress_token }}");
+      expect(stepStr).not.toContain("inputs.run_publication_token }}");
+    });
+  }
+
+  for (const f of PLANNING_WORKFLOWS) {
+    it(`${f} has Print dispatch inputs as the first step of the plan job`, () => {
+      const doc = parse(readFileSync(f, "utf-8")) as any;
+      expect(doc.jobs.plan.steps[0].name).toBe("Print dispatch inputs");
+    });
+
+    it(`${f} Print dispatch inputs never passes run_token as a raw expression`, () => {
+      const doc = parse(readFileSync(f, "utf-8")) as any;
+      const printStep = doc.jobs.plan.steps[0];
+      expect(printStep.name).toBe("Print dispatch inputs");
+      const stepStr = JSON.stringify(printStep);
+      expect(stepStr).not.toContain("inputs.run_token }}");
+    });
+  }
+
+  for (const f of SYNCED_WORKFLOW_FILES) {
+    it(`${f} image-resolution step echoes the resolved runner_image on success`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      expect(yaml).toContain("[dispatch-inputs] resolved runner_image: $runner_image");
+    });
+
+    // provider/aws_region are top-level inputs (they gate the OIDC step before run_config
+    // is decoded) and the runner reads them from env — run-autonomous.ts does
+    // `env.PROVIDER || "anthropic"` — so a template that drops them from the entrypoint
+    // env silently downgrades every Bedrock repo to the anthropic provider.
+    it(`${f} forwards provider and aws_region to the entrypoint env`, () => {
+      const doc = parse(readFileSync(f, "utf-8")) as any;
+      const jobs = Object.values(doc.jobs) as any[];
+      const containerJob = jobs.find((j: any) => j.container);
+      const pipelineStep = containerJob.steps.find(
+        (s: any) => s.name === "Run pipeline" || s.name === "Run planning",
+      );
+      expect(pipelineStep.env.PROVIDER).toBe("${{ inputs.provider }}");
+      expect(pipelineStep.env.AWS_REGION).toBe("${{ inputs.aws_region }}");
+    });
+  }
 });
