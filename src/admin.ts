@@ -339,7 +339,7 @@ export interface AdminDeps {
   selfDeployTarget?: SelfDeployTarget | null;
   /** The KG refresh rail (AII-426). Absent when no KG source repo is configured. */
   kgRefresh?: {
-    trigger(): Promise<{ status: number; body: Record<string, unknown> }>;
+    trigger(opts?: { dryRun?: boolean }): Promise<{ status: number; body: Record<string, unknown> }>;
     status(): Promise<KgRefreshStatus>;
     /** Called by the operator-cancel path to close the ingest chain cleanly. */
     onMachineLost(opts?: { failureCode?: string }): void;
@@ -438,8 +438,29 @@ export function handleAdminRequest(
         json(res, 501, { error: "KG refresh is not configured" });
         return true;
       }
-      deps.kgRefresh.trigger().then(
-        (r) => json(res, r.status, r.body),
+      // AII-635: an optional JSON body `{ dryRun?: boolean }` selects the dry-run mode
+      // (AII-632): same runner job, push skipped, guard table on the status. No body,
+      // or `dryRun: false`, is the unchanged real refresh. The response echoes `dryRun`
+      // beside the trigger's own fields so the caller can tell which mode ran.
+      const kgRefresh = deps.kgRefresh;
+      readBody(req).then(
+        (raw) => {
+          let dryRun = false;
+          if (raw.trim()) {
+            try {
+              const parsed = JSON.parse(raw) as { dryRun?: unknown };
+              dryRun = parsed.dryRun === true;
+            } catch {
+              json(res, 400, { error: "invalid JSON body" });
+              return;
+            }
+          }
+          const pending = dryRun ? kgRefresh.trigger({ dryRun: true }) : kgRefresh.trigger();
+          return pending.then(
+            (r) => json(res, r.status, { ...r.body, dryRun }),
+            (err) => json(res, 500, { error: String(err) }),
+          );
+        },
         (err) => json(res, 500, { error: String(err) }),
       );
       return true;

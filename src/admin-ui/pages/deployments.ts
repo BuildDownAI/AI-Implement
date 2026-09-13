@@ -100,8 +100,10 @@ export const deploymentsHtml = `
         <div class="kpi-trend text-secondary" id="kg-refresh-last"></div>
         <div style="margin-top: 12px">
           <button class="btn btn-sm" id="kg-refresh-btn" onclick="window.triggerKgRefresh()">Refresh graph now</button>
-          <span class="kpi-trend text-secondary" style="margin-left: 8px">Fetches the KG source repo's committed snapshot and restarts the sidecar — no deploy, no dispatch pause.</span>
+          <button class="btn btn-sm" id="kg-dry-run-btn" onclick="window.triggerKgRefresh(true)">Dry-run refresh</button>
+          <span class="kpi-trend text-secondary" style="margin-left: 8px">Refresh fetches the KG source repo's committed snapshot and restarts the sidecar — no deploy, no dispatch pause. Dry-run runs the same job with the push skipped and reports the guard table below; the served graph never changes.</span>
         </div>
+        <div class="kpi-trend text-secondary" id="kg-dry-run-last" style="margin-top: 8px" hidden></div>
         <div id="kg-materialize-env-warning" class="warning hidden">&#x26A0; KG_MATERIALIZE_DIRECT env var is set &#x2014; UI toggle has no effect until it is unset.</div>
         <div style="margin-top: 12px; display:flex; align-items:center; gap:12px; flex-wrap:wrap">
           <span class="kpi-trend text-secondary">Materialize:</span>
@@ -643,19 +645,67 @@ export const deploymentsScript = `
       const last = data.lastRefresh;
       const lastText = !last
         ? 'No refresh has run since boot.'
+        : last.dryRun
+        ? 'Last dry-run: ' + last.detail
         : last.gate === 'ingest-needed'
         ? 'Last refresh: ' + last.detail
         : 'Last refresh: ' + (last.ok ? 'ok' : 'failed at gate "' + (last.gate || '?') + '"') + ' \u2014 ' + last.detail;
       document.getElementById('kg-refresh-last').textContent = progressText || lastText;
-      document.getElementById('kg-refresh-btn').disabled = !!data.running || !!data.deployHeld;
+      renderKgDryRun(document.getElementById('kg-dry-run-last'), last);
+      const busy = !!data.running || !!data.deployHeld;
+      document.getElementById('kg-refresh-btn').disabled = busy;
+      document.getElementById('kg-dry-run-btn').disabled = busy;
     } catch (e) { card.hidden = true; }
   }
 
-  window.triggerKgRefresh = async function () {
+  // AII-635: the last dry-run's verdict and per-part table, shown only when the last
+  // terminal outcome was a dry-run (AII-632 sets lastRefresh.dryRun). Cells are set with
+  // textContent, never innerHTML.
+  function renderKgDryRun(el, last) {
+    el.textContent = '';
+    if (!last || !last.dryRun) { el.hidden = true; return; }
+    el.hidden = false;
+    const head = document.createElement('div');
+    head.textContent = 'Last dry-run (' + new Date(last.at).toLocaleString() + '): ' + last.detail;
+    el.appendChild(head);
+    const rows = Array.isArray(last.partTable) ? last.partTable : [];
+    if (!rows.length) return;
+    const table = document.createElement('table');
+    table.className = 'table';
+    table.style.marginTop = '6px';
+    const thead = document.createElement('thead');
+    const hr = document.createElement('tr');
+    ['part', 'previous', 'new', 'delta'].forEach(function (h) {
+      const th = document.createElement('th'); th.textContent = h; hr.appendChild(th);
+    });
+    thead.appendChild(hr);
+    table.appendChild(thead);
+    const tbody = document.createElement('tbody');
+    rows.forEach(function (r) {
+      const tr = document.createElement('tr');
+      const prev = parseInt(r.prev, 10);
+      const next = parseInt(r.new, 10);
+      const delta = (isNaN(prev) || isNaN(next)) ? '' : ((next - prev >= 0 ? '+' : '') + String(next - prev));
+      [r.part, r.prev, r.new, delta].forEach(function (v) {
+        const td = document.createElement('td'); td.textContent = v == null ? '' : String(v); tr.appendChild(td);
+      });
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    el.appendChild(table);
+  }
+
+  // AII-635: dryRun=true posts { dryRun: true } so the rail runs with the push skipped
+  // and reports the guard table on the card instead of changing the served graph.
+  window.triggerKgRefresh = async function (dryRun) {
     const btn = document.getElementById('kg-refresh-btn');
+    const dryBtn = document.getElementById('kg-dry-run-btn');
     btn.disabled = true;
+    dryBtn.disabled = true;
     try {
-      const res = await window.api('/api/kg/refresh', { method: 'POST' });
+      const res = await window.api('/api/kg/refresh', dryRun
+        ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ dryRun: true }) }
+        : { method: 'POST' });
       if (!res.ok) {
         const body = await res.json().catch(function () { return {}; });
         if (res.status === 422 && body.precondition === 'callback-unconfigured') {
