@@ -713,14 +713,15 @@ export async function getPullRequestState(
   owner: string,
   repo: string,
   prNumber: number,
-): Promise<{ merged: boolean; state: "open" | "closed" } | null> {
+): Promise<{ merged: boolean; state: "open" | "closed"; headRef: string | null } | null> {
   const url = `https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}`;
   const res = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
   if (!res.ok) return null;
-  const data = (await res.json()) as { merged?: boolean; state?: string };
+  const data = (await res.json()) as { merged?: boolean; state?: string; head?: { ref?: string } };
   return {
     merged: data.merged === true,
     state: data.state === "open" ? "open" : "closed",
+    headRef: typeof data.head?.ref === "string" ? data.head.ref : null,
   };
 }
 

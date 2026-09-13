@@ -209,6 +209,17 @@ Idempotency is handled differently per path:
 - **Internal level:** `compareBranches` returning 0 (branch already merged into parent) or `null` (branch missing) causes an early return.
 - **Top of the tree:** `findPullRequestByBranches` is checked first. If the `feature → base` PR is **merged** — by any method (merge-commit, squash, or rebase) — the orchestrator deletes the feature branch (`deleteBranch`) and calls `markMerged` to idempotently finalize the parent node in the tracker. If the PR is still open, the step returns and awaits the human. Only when no PR exists is a new one opened (guarded by an ahead-check so a missing branch exits early). This replaces the old git-ancestry heuristic (`compareBranches` alone at the top-of-tree path), which misread squash/rebase merges as "still ahead" and re-opened the PR on each poll tick ([AII-188](https://linear.app/eudoxus/issue/AII-188)).
 
+**`/ai-implement` on the roll-up PR.** Merge-up opens the top-of-tree PR directly, never
+through a dispatch, so it has no `dispatch_log` row of its own and the comment-gapfill drain's
+`getLatestDispatchForPr` lookup finds nothing. Rather than refuse with "AI-Implement has no
+record of this PR", the drain falls back to the PR's head branch: `ai-implement/<mode>/<key-slug>`
+encodes the feature-node parent's key (`parseGroupingBranchIdentifier`), and the parent's own
+latest dispatch (`getLatestDispatchForIssueIdentifier`, case-insensitive) supplies the tracker
+identity. The gap-fill then runs against the roll-up branch with `prNumber` = the roll-up PR
+and reports against the parent issue. The fallback is best-effort — a failed PR lookup or a
+parent with no dispatch in the log degrades to the existing refusal — and hand-created PRs
+are still refused, since nothing on them names a tracker issue to report against.
+
 > ⚠️ **Auto-roll-up needs the runner callback.** A feature node only completes when its
 > closing-work PR merges and Linear marks it Done; the roll-up keys off that completed
 > state. Planning's `Plan-Complete` transition is delivered by the runner callback

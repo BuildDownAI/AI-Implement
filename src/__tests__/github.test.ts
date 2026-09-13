@@ -305,11 +305,11 @@ describe("getPullRequestState", () => {
   afterEach(() => vi.unstubAllGlobals());
   it("returns merged=true for a merged PR", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => ({ merged: true, state: "closed" }) })));
-    expect(await getPullRequestState("t", "o", "r", 7)).toEqual({ merged: true, state: "closed" });
+    expect(await getPullRequestState("t", "o", "r", 7)).toEqual({ merged: true, state: "closed", headRef: null });
   });
   it("returns merged=false for a closed-unmerged PR", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => ({ merged: false, state: "closed" }) })));
-    expect(await getPullRequestState("t", "o", "r", 7)).toEqual({ merged: false, state: "closed" });
+    expect(await getPullRequestState("t", "o", "r", 7)).toEqual({ merged: false, state: "closed", headRef: null });
   });
   it("returns null on a non-OK response", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => ({ ok: false, status: 404 })));
