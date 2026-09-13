@@ -792,7 +792,7 @@ export async function findPullRequestByBranches(
   repo: string,
   head: string,
   base: string,
-): Promise<{ number: number; url: string; state: "open" | "closed"; merged: boolean } | null> {
+): Promise<{ number: number; url: string; state: "open" | "closed"; merged: boolean; headSha: string } | null> {
   const url =
     `https://api.github.com/repos/${owner}/${repo}/pulls` +
     `?head=${encodeURIComponent(`${owner}:${head}`)}&base=${encodeURIComponent(base)}` +
@@ -805,6 +805,7 @@ export async function findPullRequestByBranches(
     state: string;
     merged_at: string | null;
     updated_at: string;
+    head: { sha: string };
   }>;
   if (prs.length === 0) return null;
   const pr =
@@ -816,6 +817,7 @@ export async function findPullRequestByBranches(
     url: pr.html_url,
     state: pr.state === "open" ? "open" : "closed",
     merged: pr.merged_at !== null,
+    headSha: pr.head.sha,
   };
 }
 
