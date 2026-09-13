@@ -303,6 +303,13 @@ is a distinct mechanism from an admin accepting a new baseline at refresh time (
 refresh against that same source still refuses the shrink unless that refresh-time acceptance has
 happened. Treat the label as "we've seen this and it's expected," not as a bypass.
 
+Outcomes are stored per PR, keyed by `repo#prNumber` and pinned to the head sha they ran against
+(AII-636), so a `labeled` re-report can only ever surface that PR's own verdict — never another PR's
+— and is a no-op once a new push supersedes the stored sha. The cache is bounded (`MAX_TRACKED_PRS`)
+and evicted immediately on PR close. A webhook head queued behind a 409 is woken by
+`onRefreshSettled` on every `running → false` transition, not only a dry-run's — a real refresh, a
+failure, a revert, TTL expiry, or a deploy hold clearing all wake it.
+
 **Manual step — granting the status.** The GitHub App needs `statuses: write` granted on the KG
 source repo and on the base template repo for the commit status to appear — this is not requestable
 through code, and there is no way to detect the gap from inside the PR itself. Grant it via the

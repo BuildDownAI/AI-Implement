@@ -317,8 +317,11 @@ export async function postPrComment(
 }
 
 /**
- * Lists the comments on a PR/issue (unified GitHub comment API), newest-API-page-order.
- * Used to find a previously-posted sticky comment to update in place.
+ * Lists all comments on a PR/issue (unified GitHub comment API), paginated to
+ * completion via the response's `Link: rel="next"` header — a PR with more than
+ * 100 comments before the sticky one must still be found, or `postOrUpdateStickyComment`
+ * duplicates it instead of updating it in place. Used to find a previously-posted
+ * sticky comment to update in place.
  */
 export async function listPrComments(
   token: string,
@@ -326,11 +329,16 @@ export async function listPrComments(
   repo: string,
   prNumber: number,
 ): Promise<Array<{ id: number; body: string }>> {
-  const url = `https://api.github.com/repos/${owner}/${repo}/issues/${prNumber}/comments?per_page=100`;
-  const res = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
-  if (!res.ok) return [];
-  const data = (await res.json()) as Array<{ id: number; body?: string }>;
-  return data.map((c) => ({ id: c.id, body: c.body ?? "" }));
+  const comments: Array<{ id: number; body: string }> = [];
+  let url: string | null = `https://api.github.com/repos/${owner}/${repo}/issues/${prNumber}/comments?per_page=100`;
+  while (url) {
+    const res: Response = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
+    if (!res.ok) break;
+    const data = (await res.json()) as Array<{ id: number; body?: string }>;
+    comments.push(...data.map((c) => ({ id: c.id, body: c.body ?? "" })));
+    url = parseLinkNext(res.headers.get("link"));
+  }
+  return comments;
 }
 
 /**
@@ -411,7 +419,9 @@ export async function setCommitStatus(
 /**
  * Lists the file paths changed by a PR (first 100 — sufficient for the guard-path
  * match; a KG PR touching more than 100 files would already be dispatch-worthy on
- * its first page of matches).
+ * its first page of matches). Throws on a non-2xx response so a transient GitHub
+ * failure is distinguishable from a PR that genuinely touches no files — a caller
+ * that treated `[]` as "no guard-relevant files" could not tell the two apart.
  */
 export async function listPullRequestFiles(
   token: string,
@@ -421,7 +431,10 @@ export async function listPullRequestFiles(
 ): Promise<string[]> {
   const url = `https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}/files?per_page=100`;
   const res = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
-  if (!res.ok) return [];
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`listPullRequestFiles failed: HTTP ${res.status}: ${text}`);
+  }
   const data = (await res.json()) as Array<{ filename?: string }>;
   return data.map((f) => f.filename).filter((f): f is string => typeof f === "string");
 }
