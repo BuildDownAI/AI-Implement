@@ -351,7 +351,7 @@ The ticket's "required check" only exists once a repo admin adds `kg-refresh/dry
 context in that repo's branch protection settings (Settings → Branches → Branch protection rule →
 "Require status checks to pass" → add `kg-refresh/dry-run`), on both the KG source repo and the base
 template repo. Nothing in this codebase calls GitHub's branch-protection API to do this automatically
-— it stays a one-time, per-repo manual step alongside granting `statuses: write`. Until that step is
+— it stays a one-time, per-repo manual step alongside the App's **Commit statuses: Read and write** permission (`statuses: write` in API terms) described above. Until that step is
 done on a given repo, `kg-refresh/dry-run` is informational only there, no matter how the guard votes.
 
 **Two notions of "base repo."** The "Base template repo" Settings field (`kgBaseRepo`, seeded once
