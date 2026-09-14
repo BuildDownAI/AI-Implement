@@ -57,8 +57,10 @@ after someone selects it. A branch can add a reviewer. A branch cannot grant one
 gate, and cannot remove a gating reviewer.
 
 A config-declared reviewer carries **data only** — no code — so it resolves after the clone
-step. A `custom/reviewers/<id>.ts` module carries code and stays image-baked, resolved by
-`resolveModuleImport` before the clone, exactly as `custom/steps/<id>.ts` does today.
+step. A `custom/reviewers/<id>.ts` module carries code and stays image-baked. Selected
+reviewer code resolves through the trusted reviewer resolver, whose custom root is derived
+from the runner package's `import.meta.url`, never from the checked-out repository's cwd.
+`custom/steps/<id>.ts` keeps the normal workspace-first `resolveModuleImport` behavior.
 
 ## Alternatives considered
 

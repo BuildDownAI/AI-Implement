@@ -1,3 +1,5 @@
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { resolveModuleImport, type ImportModuleOptions } from "../resolve-module.js";
 import codeReviewReviewer from "./code-review.js";
 import gapAnalysisReviewer from "./gap-analysis.js";
@@ -56,6 +58,10 @@ export interface ReviewerDefinition {
   maxTurns?: number;
 }
 
+// Three levels up from src/pipeline/reviewers/ reaches the package root where image-baked custom/ lives.
+// In the compiled runner this lands on /app, so reviewer code never resolves through process.cwd().
+const TRUSTED_REVIEWER_ROOT = join(fileURLToPath(new URL(".", import.meta.url)), "..", "..", "..");
+
 /** Built-in reviewers, keyed by stable reviewer id. */
 const BUILT_IN_REVIEWERS: Record<string, ReviewerDefinition> = {
   [gapAnalysisReviewer.id]: gapAnalysisReviewer,
@@ -65,6 +71,8 @@ const BUILT_IN_REVIEWERS: Record<string, ReviewerDefinition> = {
 export interface ResolveReviewerOptions extends ImportModuleOptions {
   /** Injectable built-in registry for testing. Defaults to the module's built-in registry. */
   builtins?: Record<string, ReviewerDefinition>;
+  /** Suppresses the missing-id warning for callers that aggregate and report unresolved ids themselves. */
+  quietMissing?: boolean;
 }
 
 /**
@@ -89,8 +97,50 @@ export async function resolveReviewer(
   const builtin = Object.hasOwn(builtins, id) ? builtins[id] : undefined;
   const resolved = custom ?? builtin;
   if (!resolved) {
-    console.warn(`resolveReviewer: no reviewer registered for id "${id}"`);
+    if (!options?.quietMissing) {
+      console.warn(`resolveReviewer: no reviewer registered for id "${id}"`);
+    }
     return undefined;
   }
   return resolved;
+}
+
+function isTrustedReviewerPathId(id: string): boolean {
+  return id.length > 0 && id !== "." && id !== ".." && !id.includes("/") && !id.includes("\\");
+}
+
+export type ResolveTrustedReviewerOptions = Omit<ResolveReviewerOptions, "customRoot" | "bakedRoot"> & {
+  /** Injectable trusted package root for tests. Defaults to the image/package root derived from import.meta.url. */
+  trustedRoot?: string;
+};
+
+/** Returns the package root used for trusted image-baked reviewer modules. */
+export function trustedReviewerRoot(): string {
+  return TRUSTED_REVIEWER_ROOT;
+}
+
+/**
+ * Resolves selected reviewer code only from the trusted runner package root.
+ * Unlike resolveReviewer(), this never defaults through process.cwd() or
+ * AI_IMPLEMENT_CUSTOM_ROOT, so a checked-out repository cannot supply executable
+ * reviewer code that then gates its own merge.
+ */
+export async function resolveTrustedReviewer(
+  id: string,
+  options?: ResolveTrustedReviewerOptions,
+): Promise<ReviewerDefinition | undefined> {
+  if (!isTrustedReviewerPathId(id)) {
+    if (!options?.quietMissing) {
+      console.warn(`resolveTrustedReviewer: invalid reviewer id path segment "${id}"`);
+    }
+    return undefined;
+  }
+  const trustedRoot = options?.trustedRoot ?? TRUSTED_REVIEWER_ROOT;
+  const { trustedRoot: _trustedRoot, ...resolverOptions } = options ?? {};
+  void _trustedRoot;
+  return resolveReviewer(id, {
+    ...resolverOptions,
+    customRoot: trustedRoot,
+    bakedRoot: trustedRoot,
+  });
 }

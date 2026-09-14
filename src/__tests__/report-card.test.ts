@@ -637,6 +637,20 @@ describe("getFleetReport", () => {
     expect(r!.avgPasses).toBeCloseTo(1);
   });
 
+  it("uses the final post-push aggregate row for approval while pricing per-reviewer rows once", () => {
+    const jobId = insertDispatch({
+      issueId: "issue-ppr-reviewers", issueIdentifier: "AII-PPR-REVIEWERS", repo: "org/rpprreviewers", status: "completed",
+    });
+    insertSubStep(jobId, "post-push-review.1.gap-analysis", "custom", { approved: true, telemetry: { costUsd: 0.10 } });
+    insertSubStep(jobId, "post-push-review.1.code-review", "custom", { approved: false, telemetry: { costUsd: 0.20 } });
+    insertSubStep(jobId, "post-push-review.1", "custom", { approved: true });
+
+    const report = rc.getFleetReport({ days: 365 });
+    const r = report.byRepo.find((x) => x.repo === "org/rpprreviewers");
+    expect(r!.costUsd).toBeCloseTo(0.30);
+    expect(report.eventualPct).toBeCloseTo(1.0);
+  });
+
   it("counts a job with only post-push-review sub-steps (no feedback-loop or implement/review rows at all) toward the fleet cost total (BAC-27201)", () => {
     const jobId = insertDispatch({
       issueId: "issue-ppr-only", issueIdentifier: "AII-PPR-ONLY", repo: "org/rppronly", status: "completed",

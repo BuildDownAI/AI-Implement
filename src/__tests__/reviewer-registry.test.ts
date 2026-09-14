@@ -1,6 +1,10 @@
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
   resolveReviewer,
+  resolveTrustedReviewer,
+  trustedReviewerRoot,
   type ReviewerDefinition,
 } from "../pipeline/reviewers/registry.js";
 
@@ -19,6 +23,96 @@ function makeReviewer(id: string): ReviewerDefinition {
 // baked root pass bakedRoot explicitly, which takes precedence over the env var.
 beforeEach(() => {
   vi.stubEnv("AI_IMPLEMENT_CUSTOM_ROOT", "");
+});
+
+
+describe("resolveTrustedReviewer", () => {
+  it("derives the package root used as the image-baked reviewer root", () => {
+    expect(existsSync(join(trustedReviewerRoot(), "package.json"))).toBe(true);
+  });
+
+  it("searches only the trusted package root for custom reviewer code", async () => {
+    const checkedPaths: string[] = [];
+    const trusted = makeReviewer("trusted-only");
+    const workspace = makeReviewer("trusted-only");
+
+    const result = await resolveTrustedReviewer("trusted-only", {
+      trustedRoot: "/trusted-package",
+      existsSyncImpl: (p) => {
+        const normalized = p.replace(/\\/g, "/");
+        checkedPaths.push(normalized);
+        if (normalized.startsWith("/workspace/")) return true;
+        return normalized === "/trusted-package/custom/reviewers/trusted-only.ts";
+      },
+      importFn: async (url) => ({
+        default: url.includes("/trusted-package/") ? trusted : workspace,
+      }),
+    });
+
+    expect(result).toBe(trusted);
+    expect(result).not.toBe(workspace);
+    expect(checkedPaths.length).toBeGreaterThan(0);
+    expect(checkedPaths.every((p) => p.startsWith("/trusted-package/"))).toBe(true);
+  });
+
+  it("keeps trusted image-baked custom reviewers ahead of built-ins", async () => {
+    const builtin = makeReviewer("shadowed");
+    const custom = makeReviewer("shadowed");
+
+    const result = await resolveTrustedReviewer("shadowed", {
+      trustedRoot: "/runner",
+      existsSyncImpl: (p) => p.replace(/\\/g, "/") === "/runner/custom/reviewers/shadowed.ts",
+      importFn: async () => ({ default: custom }),
+      builtins: { shadowed: builtin },
+    });
+
+    expect(result).toBe(custom);
+  });
+
+  it("rejects traversal ids before probing the filesystem or importer", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      for (const id of ["../evil", "nested/evil", "nested\\evil", "/abs/evil", ".", ".."]) {
+        const existsSyncImpl = vi.fn(() => true);
+        const importFn = vi.fn(async () => ({ default: makeReviewer(id) }));
+        await expect(
+          resolveTrustedReviewer(id, { trustedRoot: "/trusted-package", existsSyncImpl, importFn }),
+        ).resolves.toBeUndefined();
+        expect(existsSyncImpl).not.toHaveBeenCalled();
+        expect(importFn).not.toHaveBeenCalled();
+      }
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("never falls through to AI_IMPLEMENT_CUSTOM_ROOT", async () => {
+    vi.stubEnv("AI_IMPLEMENT_CUSTOM_ROOT", "/env-baked-root");
+    const checkedPaths: string[] = [];
+
+    await resolveTrustedReviewer("missing", {
+      trustedRoot: "/trusted-package",
+      existsSyncImpl: (p) => {
+        checkedPaths.push(p.replace(/\\/g, "/"));
+        return false;
+      },
+      builtins: {},
+    });
+
+    expect(checkedPaths.every((p) => p.startsWith("/trusted-package/"))).toBe(true);
+    expect(checkedPaths.some((p) => p.startsWith("/env-baked-root/"))).toBe(false);
+  });
+
+  it("can suppress trusted missing-id warnings for config probes", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await expect(resolveTrustedReviewer("missing", { trustedRoot: "/trusted-package", existsSyncImpl: () => false, builtins: {}, quietMissing: true })).resolves.toBeUndefined();
+      await expect(resolveTrustedReviewer("../evil", { trustedRoot: "/trusted-package", existsSyncImpl: () => true, quietMissing: true })).resolves.toBeUndefined();
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
 });
 
 afterEach(() => {
