@@ -20,6 +20,8 @@ export interface ReviewLedgerFinding {
   url?: string;
   /** Internal reviewer id when source is ai-implement-internal. */
   reviewerId?: string;
+  /** Host-assigned provenance for config-backed internal reviewers. */
+  reviewerProvenance?: "trusted" | "branch";
 }
 
 export interface GhResult {
@@ -555,7 +557,10 @@ export function formatReviewLedgerForPrompt(findings: ReviewLedgerFinding[]): st
   return findings
     .map((finding, index) => {
       const location = formatLocation(finding);
-      const header = [`[external-${index + 1}]`, finding.source, finding.severity, location]
+      const provenance = finding.source === "ai-implement-internal" && finding.reviewerProvenance
+        ? finding.reviewerProvenance
+        : undefined;
+      const header = [`[external-${index + 1}]`, finding.source, provenance, finding.severity, location]
         .filter(Boolean)
         .join(" ");
       return [header, finding.body, finding.url ? `URL: ${finding.url}` : undefined].filter(Boolean).join("\n");

@@ -32,6 +32,8 @@ interface PostPushReviewInputs extends Record<string, unknown> {
   reviewers?: ReviewerSelection[];
   /** Selected image-baked reviewer code resolved before workspace reviewer config is consulted. */
   trustedReviewerDefinitions?: ReadonlyMap<string, ReviewerDefinition>;
+  /** Prompt-only reviewer definitions parsed from the trusted default branch config. */
+  trustedConfigReviewerDefinitions?: ReviewerDefinition[];
   /** Prompt-only reviewer definitions parsed from the checked-out repository config. */
   reviewerDefinitions?: ReviewerDefinition[];
   /** Poll interval while waiting for the external review check to finish. */
@@ -365,22 +367,34 @@ function claudeReviewSummaryGates(reviewers: ReviewerSelection[] | undefined): b
   return reviewers?.some((reviewer) => reviewer.id === CLAUDE_REVIEW_SUMMARY_ID && reviewer.gates === true) ?? false;
 }
 
-function internalReviewerGates(reviewerId: string | undefined, reviewers: ReviewerSelection[] | undefined): boolean {
+type InternalReviewerProvenance = "trusted" | "branch";
+
+function internalReviewerGates(
+  reviewerId: string | undefined,
+  reviewers: ReviewerSelection[] | undefined,
+  reviewerProvenance?: InternalReviewerProvenance,
+): boolean {
+  if (reviewerProvenance === "branch") return false;
   if (!reviewerId) return true;
   if (!reviewers) return true;
   return reviewers.find((reviewer) => reviewer.id === reviewerId)?.gates ?? false;
 }
 
 export function isReviewLedgerFindingGating(
-  finding: Pick<ReviewLedgerFinding, "source" | "reviewerId">,
+  finding: Pick<ReviewLedgerFinding, "source" | "reviewerId" | "reviewerProvenance">,
   reviewers?: ReviewerSelection[],
 ): boolean {
-  return isReviewLedgerSourceGating(finding.source, reviewers, finding.reviewerId);
+  return isReviewLedgerSourceGating(finding.source, reviewers, finding.reviewerId, finding.reviewerProvenance);
 }
 
-function isReviewLedgerSourceGating(source: ReviewLedgerSource, reviewers?: ReviewerSelection[], reviewerId?: string): boolean {
+function isReviewLedgerSourceGating(
+  source: ReviewLedgerSource,
+  reviewers?: ReviewerSelection[],
+  reviewerId?: string,
+  reviewerProvenance?: InternalReviewerProvenance,
+): boolean {
   if (source === "claude-review-summary") return claudeReviewSummaryGates(reviewers);
-  if (source === "ai-implement-internal") return internalReviewerGates(reviewerId, reviewers);
+  if (source === "ai-implement-internal") return internalReviewerGates(reviewerId, reviewers, reviewerProvenance);
   return true;
 }
 
@@ -959,10 +973,12 @@ interface SelectedReviewer {
   definition: ReviewerDefinition;
   legacy?: boolean;
   optional?: boolean;
+  provenance?: InternalReviewerProvenance;
 }
 
 interface ConfigReviewerResolution {
-  definitions: ReviewerDefinition[];
+  trustedDefinitions: ReviewerDefinition[];
+  branchDefinitions: ReviewerDefinition[];
 }
 
 interface SelectedReviewerPassResult {
@@ -1035,16 +1051,41 @@ Output ONLY valid JSON: {"approved": boolean, "findings": [{"severity": "blockin
   };
 }
 
-async function resolveConfigReviewerDefinitions(
-  definitions: readonly ReviewerDefinition[] | undefined,
+function configReviewerDefinitionById(definitions: readonly ReviewerDefinition[]): Map<string, ReviewerDefinition> {
+  return new Map(definitions.map((definition) => [definition.id, definition]));
+}
+
+async function resolveTrustedCodeReviewer(
+  id: string,
   trustedDefinitions: ReadonlyMap<string, ReviewerDefinition> | undefined,
+): Promise<ReviewerDefinition | undefined> {
+  return trustedDefinitions?.get(id) ?? await resolveTrustedReviewer(id, { quietMissing: true });
+}
+
+function configReviewerFingerprint(definition: ReviewerDefinition): string {
+  const prompt = definition.buildPrompt({
+    issueIdentifier: "",
+    issueTitle: "",
+    issueDescription: "",
+    prNumber: "",
+    diff: "",
+    previousFindings: "",
+  });
+  return JSON.stringify({ prompt, model: definition.model ?? null });
+}
+
+async function resolveConfigReviewerDefinitions(
+  branchDefinitions: readonly ReviewerDefinition[] | undefined,
+  trustedDefinitions: ReadonlyMap<string, ReviewerDefinition> | undefined,
+  trustedConfigDefinitions: readonly ReviewerDefinition[] | undefined,
 ): Promise<ConfigReviewerResolution> {
-  const resolved: ReviewerDefinition[] = [];
+  const trustedResolved = (trustedConfigDefinitions ?? []).map(wrapConfigReviewerDefinition);
+  const branchResolved: ReviewerDefinition[] = [];
   const shadowed = new Set<string>();
-  for (const definition of definitions ?? []) {
+  for (const definition of branchDefinitions ?? []) {
     const trustedDefinition = isReservedConfigReviewerId(definition.id)
       ? undefined
-      : trustedDefinitions?.get(definition.id) ?? await resolveTrustedReviewer(definition.id, { quietMissing: true });
+      : await resolveTrustedCodeReviewer(definition.id, trustedDefinitions);
     if (trustedDefinition || isReservedConfigReviewerId(definition.id)) {
       if (!shadowed.has(definition.id)) {
         console.warn(`[post-push-review] Ignoring config-declared reviewer "${definition.id}" because a trusted or reserved reviewer id already owns that name`);
@@ -1052,29 +1093,46 @@ async function resolveConfigReviewerDefinitions(
       }
       continue;
     }
-    resolved.push(wrapConfigReviewerDefinition(definition));
+    branchResolved.push(wrapConfigReviewerDefinition(definition));
   }
-  return { definitions: resolved };
+  return { trustedDefinitions: trustedResolved, branchDefinitions: branchResolved };
 }
 
 async function resolveSelectedInternalReviewers(
   selections: readonly ReviewerSelection[],
   trustedDefinitions: ReadonlyMap<string, ReviewerDefinition> | undefined,
-  configDefinitions: readonly ReviewerDefinition[],
+  trustedConfigDefinitions: readonly ReviewerDefinition[],
+  branchConfigDefinitions: readonly ReviewerDefinition[],
 ): Promise<{ reviewers: SelectedReviewer[]; unresolvedIds: string[] }> {
   const reviewers: SelectedReviewer[] = [];
   const unresolvedIds: string[] = [];
-  const configById = new Map(configDefinitions.map((definition) => [definition.id, definition]));
+  const trustedConfigById = configReviewerDefinitionById(trustedConfigDefinitions);
+  const branchConfigById = configReviewerDefinitionById(branchConfigDefinitions);
   for (const selection of orderedReviewerSelections(selections)) {
     if (isExternalReviewerPolicy(selection.id)) continue;
-    const definition = trustedDefinitions?.get(selection.id)
-      ?? await resolveTrustedReviewer(selection.id, { quietMissing: true })
-      ?? configById.get(selection.id);
-    if (!definition) {
-      unresolvedIds.push(selection.id);
+    const trustedCodeDefinition = await resolveTrustedCodeReviewer(selection.id, trustedDefinitions);
+    if (trustedCodeDefinition) {
+      reviewers.push({ selection, definition: trustedCodeDefinition, provenance: "trusted" });
       continue;
     }
-    reviewers.push({ selection, definition });
+
+    if (selection.gates) {
+      const definition = trustedConfigById.get(selection.id);
+      if (!definition) {
+        unresolvedIds.push(selection.id);
+        continue;
+      }
+      reviewers.push({ selection, definition, provenance: "trusted" });
+      continue;
+    }
+
+    const branchDefinition = branchConfigById.get(selection.id);
+    if (branchDefinition) {
+      reviewers.push({ selection: { ...selection, gates: false }, definition: branchDefinition, provenance: "branch", optional: true });
+      continue;
+    }
+
+    unresolvedIds.push(selection.id);
   }
   return { reviewers, unresolvedIds };
 }
@@ -1083,10 +1141,19 @@ function configAdvisoryReviewers(
   definitions: readonly ReviewerDefinition[],
   selectedInternalReviewers: readonly SelectedReviewer[] | null,
 ): SelectedReviewer[] {
-  const selectedIds = new Set((selectedInternalReviewers ?? []).map((reviewer) => reviewer.selection.id));
-  return definitions
-    .filter((definition) => !selectedIds.has(definition.id))
-    .map((definition) => ({ selection: { id: definition.id, gates: false }, definition, optional: true }));
+  const selectedById = new Map((selectedInternalReviewers ?? []).map((reviewer) => [reviewer.selection.id, reviewer]));
+  return definitions.flatMap((definition) => {
+    const selectedReviewer = selectedById.get(definition.id);
+    if (selectedReviewer && configReviewerFingerprint(selectedReviewer.definition) === configReviewerFingerprint(definition)) {
+      return [];
+    }
+    return [{
+      selection: { id: definition.id, gates: false },
+      definition,
+      optional: true,
+      provenance: "branch" as const,
+    }];
+  });
 }
 
 function parseReviewerDefinitionVerdict(value: unknown): ReviewerVerdict {
@@ -1123,10 +1190,15 @@ function parseReviewerDefinitionVerdict(value: unknown): ReviewerVerdict {
   return { approved: raw.approved && findings.length === 0, findings };
 }
 
-function reviewerFindingToLedgerFinding(reviewerId: string, finding: ReviewerFinding): PostPushReviewLedgerFinding {
+function reviewerFindingToLedgerFinding(
+  reviewerId: string,
+  finding: ReviewerFinding,
+  reviewerProvenance?: InternalReviewerProvenance,
+): PostPushReviewLedgerFinding {
   return {
     source: "ai-implement-internal",
     reviewerId,
+    ...(reviewerProvenance ? { reviewerProvenance } : {}),
     severity: finding.severity,
     body: finding.body,
     ...(finding.path ? { path: finding.path } : {}),
@@ -1137,7 +1209,7 @@ function reviewerFindingToLedgerFinding(reviewerId: string, finding: ReviewerFin
 function selectionFailureMessage(kind: "empty-selection" | "empty-internal" | "unresolved", ids?: string[]): string {
   if (kind === "empty-selection") return "Project reviewer selection is empty; automated review is incomplete.";
   if (kind === "empty-internal") return "Project reviewer selection contains no internal reviewers; automated review is incomplete.";
-  return `Selected reviewer(s) did not resolve: ${(ids ?? []).join(", ")}. Automated review is incomplete.`;
+  return `Selected reviewer(s) did not resolve from trusted code or default-branch config definitions: ${(ids ?? []).join(", ")}. Automated review is incomplete.`;
 }
 
 async function reportReviewerSelectionFailure(
@@ -1172,6 +1244,26 @@ ${feedback}
   return { approved: false, iterations: 0, finalFeedback: feedback, forcePushedRevisions: 0, terminationReason: "invalid_review", costUsd: null };
 }
 
+function reviewerReportId(iteration: number, reviewerIndex: number, reviewer: SelectedReviewer): string {
+  if (reviewer.legacy) return `post-push-review.${iteration}`;
+  const id = reviewer.selection.id.replace(/[^A-Za-z0-9_-]+/g, "-").slice(0, 80) || "reviewer";
+  if (reviewer.provenance === "branch") return `post-push-review.${iteration}.branch-advisory.${reviewerIndex}.${id}`;
+  return `post-push-review.${iteration}.${reviewer.selection.id}`;
+}
+
+function reviewerStage(iteration: number, reviewerIndex: number, reviewer: SelectedReviewer): string {
+  if (reviewer.legacy) return `post-push-review/review-${iteration}`;
+  const id = reviewer.selection.id.replace(/[^A-Za-z0-9_-]+/g, "-").slice(0, 80) || "reviewer";
+  if (reviewer.provenance === "branch") {
+    return `post-push-review/branch-advisory-${reviewerIndex}-${id}-review-${iteration}`;
+  }
+  return `post-push-review/${id}-review-${iteration}`;
+}
+
+function reviewerFeedbackLabel(reviewerId: string, provenance?: InternalReviewerProvenance): string {
+  return provenance === "branch" ? `${reviewerId} (branch advisory)` : reviewerId;
+}
+
 async function runSelectedInternalReviewers(params: {
   context: PipelineContext;
   reporter: StepReporter;
@@ -1190,22 +1282,25 @@ async function runSelectedInternalReviewers(params: {
   let aggregateTelemetry: RunTelemetry | undefined;
   let costUsd: number | null = null;
 
-  for (const { selection, definition, legacy, optional } of params.reviewers) {
+  for (const [reviewerIndex, reviewer] of params.reviewers.entries()) {
+    const { selection, definition, legacy, optional, provenance } = reviewer;
     const reviewerId = selection.id;
-    const reportId = legacy ? `post-push-review.${params.iteration}` : `post-push-review.${params.iteration}.${reviewerId}`;
-    const stage = legacy ? `post-push-review/review-${params.iteration}` : `post-push-review/${reviewerId}-review-${params.iteration}`;
+    const label = reviewerFeedbackLabel(reviewerId, provenance);
+    const reportId = reviewerReportId(params.iteration, reviewerIndex, reviewer);
+    const stage = reviewerStage(params.iteration, reviewerIndex, reviewer);
     const reportInputs = legacy
       ? { iteration: params.iteration, prNumber: params.prNumber }
-      : { iteration: params.iteration, prNumber: params.prNumber, reviewerId };
+      : { iteration: params.iteration, prNumber: params.prNumber, reviewerId, reviewerProvenance: provenance ?? "trusted" };
     const maxTurns = definition.maxTurns ?? params.retryPolicy.reviewMaxTurns;
     const reportOptionalFailure = async (feedback: string, telemetry?: RunTelemetry, extraOutputs: Record<string, unknown> = {}) => {
       findings.push({
         source: "ai-implement-internal",
         reviewerId,
+        ...(provenance ? { reviewerProvenance: provenance } : {}),
         severity: "blocking",
         body: feedback,
       });
-      feedbackParts.push(`${reviewerId}: advisory reviewer did not complete`);
+      feedbackParts.push(`${label}: advisory reviewer did not complete`);
       await params.reporter.report({
         id: reportId,
         type: "custom",
@@ -1277,7 +1372,7 @@ async function runSelectedInternalReviewers(params: {
     if (reviewStageClassified && reviewStageClassified.category === "transient") {
       const failure = { ...reviewStageClassified, stage: "post-push-review", code: "PROVIDER_UNAVAILABLE" as const, retryable: false };
       const telemetryPart = reviewResult.telemetry ? summaryLine(reviewResult.telemetry) : "no telemetry reported";
-      const feedback = compactErrorMessage(`Reviewer ${reviewerId} could not run because the model provider was unavailable after ${reviewStageAttempt} attempt(s) (${telemetryPart}).`);
+      const feedback = compactErrorMessage(`Reviewer ${label} could not run because the model provider was unavailable after ${reviewStageAttempt} attempt(s) (${telemetryPart}).`);
       if (optional) {
         await reportOptionalFailure(feedback, reviewResult.telemetry, { failure });
         continue;
@@ -1304,7 +1399,7 @@ async function runSelectedInternalReviewers(params: {
         retryable: false,
         reviewMaxTurns: maxTurns,
       };
-      const feedback = `${reviewerId} ran out of turns at the configured cap (${maxTurns}). ${summaryLine(reviewResult.telemetry)}`;
+      const feedback = `${label} ran out of turns at the configured cap (${maxTurns}). ${summaryLine(reviewResult.telemetry)}`;
       if (optional) {
         await reportOptionalFailure(feedback, reviewResult.telemetry, { failure });
         continue;
@@ -1327,7 +1422,7 @@ async function runSelectedInternalReviewers(params: {
     if (reviewFailure) {
       const failure = classifyLlmResult(reviewResult, { stage, attempt: reviewResult.attempts ?? 1, expectsStructuredOutput: true, elapsedMs: reviewResult.telemetry?.durationMs ?? undefined });
       const telemetryPart = reviewResult.telemetry ? summaryLine(reviewResult.telemetry) : "no telemetry reported";
-      const feedback = compactErrorMessage(`Reviewer ${reviewerId} failed: ${reviewFailure} (${telemetryPart}; ${failure.category}/${failure.code})`);
+      const feedback = compactErrorMessage(`Reviewer ${label} failed: ${reviewFailure} (${telemetryPart}; ${failure.category}/${failure.code})`);
       if (optional) {
         await reportOptionalFailure(feedback, reviewResult.telemetry);
         continue;
@@ -1349,7 +1444,7 @@ async function runSelectedInternalReviewers(params: {
     if (reviewResult.structuredOutput === undefined) {
       const feedback = compactErrorMessage(legacy
         ? `Reviewer returned no structured_output: ${reviewResult.stdout || "(empty stdout)"}`
-        : `Reviewer ${reviewerId} returned no structured_output: ${reviewResult.stdout || "(empty stdout)"}`);
+        : `Reviewer ${label} returned no structured_output: ${reviewResult.stdout || "(empty stdout)"}`);
       if (optional) {
         await reportOptionalFailure(feedback, reviewResult.telemetry);
         continue;
@@ -1369,6 +1464,7 @@ async function runSelectedInternalReviewers(params: {
           return {
             source: "ai-implement-internal" as const,
             reviewerId,
+            ...(provenance ? { reviewerProvenance: provenance } : {}),
             severity: "blocking" as const,
             body: postPushIssueText(reviewIssue),
             issue: reviewIssue,
@@ -1386,7 +1482,7 @@ async function runSelectedInternalReviewers(params: {
       const reason = err instanceof Error ? err.message : String(err);
       const feedback = compactErrorMessage(legacy
         ? `Reviewer returned invalid structured review output: ${reason}.`
-        : `Reviewer ${reviewerId} returned invalid structured review output: ${reason}.`);
+        : `Reviewer ${label} returned invalid structured review output: ${reason}.`);
       if (optional) {
         await reportOptionalFailure(feedback, reviewResult.telemetry);
         continue;
@@ -1396,7 +1492,7 @@ async function runSelectedInternalReviewers(params: {
     }
 
     if (!legacy && verdict.findings.length === 0 && verdict.approved === false) {
-      const feedback = `Reviewer ${reviewerId} returned approved=false without findings[].`;
+      const feedback = `Reviewer ${label} returned approved=false without findings[].`;
       if (optional) {
         await reportOptionalFailure(feedback, reviewResult.telemetry);
         continue;
@@ -1405,12 +1501,12 @@ async function runSelectedInternalReviewers(params: {
       return { stopped: true, terminationReason: "invalid_review", feedback, costUsd };
     }
 
-    const reviewerFindings = legacy ? [] : verdict.findings.map((finding) => reviewerFindingToLedgerFinding(reviewerId, finding));
+    const reviewerFindings = legacy ? [] : verdict.findings.map((finding) => reviewerFindingToLedgerFinding(reviewerId, finding, provenance));
     findings.push(...reviewerFindings);
-    if (selection.gates) {
+    if (selection.gates && provenance !== "branch") {
       approved = approved && verdict.approved && (legacy ? verdict.findings.length === 0 : reviewerFindings.length === 0);
     }
-    feedbackParts.push(legacy && reviewerFeedback ? reviewerFeedback : `${reviewerId}: ${reviewerFindings.length === 0 ? "approved" : `${reviewerFindings.length} finding(s)`}`);
+    feedbackParts.push(legacy && reviewerFeedback ? reviewerFeedback : `${label}: ${reviewerFindings.length === 0 ? "approved" : `${reviewerFindings.length} finding(s)`}`);
     if (!legacy) {
       await params.reporter.report({
         id: reportId,
@@ -1498,13 +1594,18 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
       startMarker,
     );
 
-    const configReviewerResolution = await resolveConfigReviewerDefinitions(inputs.reviewerDefinitions, inputs.trustedReviewerDefinitions);
+    const configReviewerResolution = await resolveConfigReviewerDefinitions(
+      inputs.reviewerDefinitions,
+      inputs.trustedReviewerDefinitions,
+      inputs.trustedConfigReviewerDefinitions,
+    );
     const configuredReviewerSelection = inputs.reviewers;
     const selectedReviewerResolution = configuredReviewerSelection !== undefined
       ? await resolveSelectedInternalReviewers(
           configuredReviewerSelection,
           inputs.trustedReviewerDefinitions,
-          configReviewerResolution.definitions,
+          configReviewerResolution.trustedDefinitions,
+          configReviewerResolution.branchDefinitions,
         )
       : null;
     if (configuredReviewerSelection?.length === 0) {
@@ -1594,7 +1695,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         },
         legacy: true,
       }];
-      const advisoryConfigReviewers = configAdvisoryReviewers(configReviewerResolution.definitions, selectedInternalReviewers);
+      const advisoryConfigReviewers = configAdvisoryReviewers(configReviewerResolution.branchDefinitions, selectedInternalReviewers);
       const activeInternalReviewers: SelectedReviewer[] = [
         ...primaryInternalReviewers,
         ...advisoryConfigReviewers,
