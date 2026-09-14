@@ -148,7 +148,7 @@ Only these `type` values are accepted: `clone`, `install`, `implement`, `review`
 
 ### Timing
 
-The pipeline definition and step modules resolve before untrusted repository code can affect them — the pipeline definition at module import time and step modules eagerly in `createDefaultRunner()`. Selected reviewer modules use the trusted reviewer resolver rather than the general workspace-first resolver: the custom root is the runner package/image root derived from `import.meta.url`, never `process.cwd()`, so a `custom/` directory that only exists in the target repo's checkout cannot supply executable reviewer code.
+The pipeline definition resolves at module import time and step modules resolve eagerly in `createDefaultRunner()`. The session entrypoint may already have checked out the target PR before Node starts, so timing alone does not establish a trusted source. Selected reviewer modules use the trusted reviewer resolver rather than the general workspace-first resolver: the custom root is the runner package/image root derived from `import.meta.url`, never `process.cwd()`, so a `custom/` directory that only exists in the target repo's checkout cannot supply executable reviewer code.
 
 ## Failure record
 
