@@ -702,7 +702,7 @@ After both fixes landed, the review of the implementation also identified an arc
 
 | Component | Shared / existing path | kg-refresh-only path | Status |
 |---|---|---|---|
-| GHA workflow | `workflows/claude-implement.yml` with `runner_phase: "kg-refresh"` | `workflows/claude-kg-refresh.yml` | removed by AII-556 ✓ |
+| GHA workflow | `workflows/claude-implement.yml`; phase from `run_config.runnerPhase` | `workflows/claude-kg-refresh.yml` | removed by AII-556 ✓ |
 | Runner-side pipeline | *(step sequence in `WORKFLOW.md`)* | `pipelines/kg-refresh.yml` | present |
 | Session image resolution | `src/repo-image.ts` `resolveRunnerImageForDispatch` | `src/repo-image.ts` `resolveKgRefreshSessionImage` | removed by AII-557 ✓ |
 | Orchestrator state machine | — | `src/kg-refresh.ts` | present |
