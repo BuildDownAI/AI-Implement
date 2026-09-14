@@ -157,7 +157,7 @@ describe("resolveReviewer", () => {
     expect(workspaceIndex).toBeLessThan(bakedIndex);
   });
 
-  it("resolves an arbitrary id to undefined when the built-in registry is empty (no hidden defaults)", async () => {
+  it("resolves an arbitrary id to undefined when no built-in or custom reviewer matches", async () => {
     vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
       const result = await resolveReviewer("anything", {
