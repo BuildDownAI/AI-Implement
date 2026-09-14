@@ -487,6 +487,29 @@ describe("extractReviewFindingsBlock", () => {
     });
   });
 
+  it("parses a finding body containing a literal triple-backtick snippet without truncating the JSON", () => {
+    const block = JSON.stringify({
+      schema: "review-findings/v1",
+      verdict: "changes_requested",
+      findings: [{ severity: "blocking", body: "Use:\n```js\nfoo()\n```\ninstead.", path: "src/x.ts", line: 12 }],
+    });
+    const body = ["```json review-findings", block, "```"].join("\n");
+
+    expect(extractReviewFindingsBlock(body)).toEqual({
+      findings: [
+        {
+          source: "review-contract",
+          severity: "blocking",
+          body: "Use:\n```js\nfoo()\n```\ninstead.",
+          path: "src/x.ts",
+          line: 12,
+        },
+      ],
+      verdict: "changes_requested",
+      findingsUnavailable: false,
+    });
+  });
+
   describe("legacy <!-- claude-review-verdict --> marker (deprecated, read for one release)", () => {
     it("parses blocking and minor items as objects with body/path/line", () => {
       const body = '<!-- claude-review-verdict {"blocking":[{"body":"Fix null check","path":"src/app.ts","line":42}],"minor":[{"body":"Rename variable","path":"src/util.ts"}]} -->';

@@ -80,7 +80,11 @@ export interface ReviewFindingsBlockResult {
 }
 
 const REVIEW_FINDINGS_SCHEMA = "review-findings/v1";
-const REVIEW_FINDINGS_FENCE_RE = /```json[ \t]+review-findings[ \t]*\r?\n([\s\S]*?)```/g;
+// The closing fence must stand alone on its own line (only whitespace before/after the
+// backticks). A lazy match to the *first* ``` anywhere would truncate the JSON early when a
+// finding's `body` legitimately contains an inline triple-backtick snippet (e.g. `` "Use:\n```js\nfoo()\n```" ``)
+// -- that inner sequence never starts a line by itself, so this pattern skips past it.
+const REVIEW_FINDINGS_FENCE_RE = /```json[ \t]+review-findings[ \t]*\r?\n([\s\S]*?)\r?\n```[ \t]*(?=\r?\n|$)/g;
 
 const REVIEW_FINDINGS_VERDICTS = new Set(["approve", "changes_requested", "incomplete"]);
 
