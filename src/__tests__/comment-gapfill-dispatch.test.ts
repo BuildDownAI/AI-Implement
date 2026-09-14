@@ -7,6 +7,30 @@ import type * as QueueModule from "../comment-gapfill-queue.js";
 import type * as LogModule from "../log.js";
 import type * as DrainModule from "../comment-gapfill-drain.js";
 import type { RepoMapping } from "../config.js";
+import type { CreateMachineOpts, Machine } from "../fly-machines.js";
+
+const flyMocks = vi.hoisted(() => ({
+  createMachine: vi.fn(),
+  listAppSecrets: vi.fn(),
+  resolveSessionImage: vi.fn(),
+}));
+
+vi.mock("../fly-machines.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../fly-machines.js")>();
+  return {
+    ...actual,
+    createMachine: flyMocks.createMachine,
+    listAppSecrets: flyMocks.listAppSecrets,
+  };
+});
+
+vi.mock("../repo-image.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../repo-image.js")>();
+  return {
+    ...actual,
+    resolveSessionImage: flyMocks.resolveSessionImage,
+  };
+});
 
 let dbPath: string;
 let dedup: typeof DedupModule;
@@ -25,6 +49,9 @@ beforeEach(async () => {
   queue = await import("../comment-gapfill-queue.js");
   log = await import("../log.js");
   drain = await import("../comment-gapfill-drain.js");
+  flyMocks.createMachine.mockResolvedValue({ id: "fly-machine-1" } as Machine);
+  flyMocks.listAppSecrets.mockResolvedValue([]);
+  flyMocks.resolveSessionImage.mockResolvedValue({ image: "ghcr.io/builddownai/ai-implement-runner:latest", source: "default" });
   // Initialize tables
   dedup.getDb();
   log.initLogTable();
@@ -49,6 +76,9 @@ afterEach(async () => {
   }
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
+  flyMocks.createMachine.mockReset();
+  flyMocks.listAppSecrets.mockReset();
+  flyMocks.resolveSessionImage.mockReset();
 });
 
 /** Stub the GitHub PR lookup the roll-up fallback performs (drain calls
@@ -129,6 +159,39 @@ function seedDispatchLog(issueId: string, issueIdentifier: string, issueTitle: s
   });
   log.updateJobPrUrl(jobId, `https://github.com/${owner}/${repo}/pull/${prNumber}`);
   return jobId;
+}
+
+async function dispatchFlyGapfillAndDecodeReviewers(reviewers: RepoMapping["reviewers"]) {
+  const { decodeRunConfig } = await import("../run-config.js");
+  const mapping = makeMapping({
+    owner: "acme",
+    repo: "billing",
+    executionMode: "fly-machines",
+    reviewers,
+  });
+
+  queue.enqueueCommentGapfill({
+    owner: "acme",
+    repo: "billing",
+    prNumber: 42,
+    commentId: 9100,
+    commenter: "sam",
+    instruction: "please address reviewer feedback",
+  });
+  seedDispatchLog("issue-10", "AII-673", "Fly reviewer settings", "acme", "billing", 42);
+
+  await drain.drainCommentGapfillQueue(makeBaseDrainOpts({
+    getMappings: () => ({ TEAM: mapping }),
+    flySessionsToken: "fly-token",
+    flySessionsApp: "fly-app",
+    anthropicApiKey: "anthropic-key",
+  }));
+
+  expect(flyMocks.createMachine).toHaveBeenCalledTimes(1);
+  const machineConfig = flyMocks.createMachine.mock.calls[0][2] as CreateMachineOpts;
+  const encoded = machineConfig.config.env?.AI_IMPLEMENT_RUN_CONFIG;
+  expect(encoded).toBeDefined();
+  return decodeRunConfig(encoded!);
 }
 
 describe("drainCommentGapfillQueue", () => {
@@ -530,6 +593,31 @@ describe("drainCommentGapfillQueue", () => {
     const [, , inputs] = dispatchSpy.mock.calls[0];
     const decoded = decodeRunConfig(inputs.run_config);
     expect(decoded.retryPolicy?.reviewMaxTurns).toBe(77);
+  });
+
+  it("carries custom reviewer selection into Fly Machines gap-fill run_config", async () => {
+    const reviewers = [
+      { id: "claude-review-summary", gates: false },
+      { id: "repo-specific-reviewer", gates: true },
+    ];
+
+    const decoded = await dispatchFlyGapfillAndDecodeReviewers(reviewers);
+
+    expect(decoded.runnerPhase).toBe("gap-analysis");
+    expect(decoded.prNumber).toBe("42");
+    expect(decoded.reviewers).toEqual(reviewers);
+  });
+
+  it("carries an explicit empty reviewer selection into Fly Machines gap-fill run_config", async () => {
+    const decoded = await dispatchFlyGapfillAndDecodeReviewers([]);
+
+    expect(decoded.reviewers).toEqual([]);
+  });
+
+  it("omits reviewers from Fly Machines gap-fill run_config when mapping reviewers are null", async () => {
+    const decoded = await dispatchFlyGapfillAndDecodeReviewers(null);
+
+    expect(decoded.reviewers).toBeUndefined();
   });
 });
 
