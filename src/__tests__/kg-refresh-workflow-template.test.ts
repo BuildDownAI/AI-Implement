@@ -21,8 +21,8 @@ function getMaskStep(): any {
 }
 
 function getEntrypointCaseArms(): string[] {
-  const sh = readFileSync("session/entrypoint.sh", "utf-8");
-  return [...sh.matchAll(/^\s+([a-z][a-z-]*)\)\s+RUNNER_ENTRY=/gm)].map((m) => m[1]);
+  const sh = readFileSync("session/lib.sh", "utf-8");
+  return [...sh.matchAll(/^\s+([a-z][a-z-]*)\)\s+echo\s+"/gm)].map((m) => m[1]);
 }
 
 describe("claude-implement.yml template — runner_phase and runner_callback_url inputs", () => {
@@ -83,7 +83,7 @@ describe("claude-implement.yml template — runner_phase and runner_callback_url
     expect(step.env.AI_IMPLEMENT_LOG_LEVEL).toBe("${{ vars.AI_IMPLEMENT_LOG_LEVEL }}");
   });
 
-  it("'kg-refresh' case arm exists in session/entrypoint.sh", () => {
+  it("'kg-refresh' case arm exists in session/lib.sh's select_runner_entry", () => {
     const arms = getEntrypointCaseArms();
     expect(arms.length).toBeGreaterThan(0);
     expect(arms).toContain("kg-refresh");
