@@ -406,7 +406,7 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
       fetchDefaultBranch: vi.fn(async () => "main") as never,
       fetchWorkflowFile: vi.fn(async () => ({
         status: 200,
-        content: "on:\n  workflow_dispatch:\n    inputs:\n      runner_phase:\n        required: false\n",
+        content: "on:\n  workflow_dispatch:\n    inputs:\n      run_config:\n        required: true\n      runner_phase:\n        required: false\n",
       })) as never,
       fetchSnapshotCommitSha: fetchSnapshotCommitSha as never,
       persistSnapshotSha: vi.fn() as never,

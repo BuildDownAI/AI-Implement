@@ -85,7 +85,7 @@ describe("kg-refresh callback-URL contract", () => {
       fetchDefaultBranch: vi.fn(async () => "main") as never,
       fetchWorkflowFile: vi.fn(async () => ({
         status: 200,
-        content: "on:\n  workflow_dispatch:\n    inputs:\n      runner_phase:\n        required: false\n",
+        content: "on:\n  workflow_dispatch:\n    inputs:\n      run_config:\n        required: true\n      runner_phase:\n        required: false\n",
       })) as never,
       // First call returns same SHA as recorded (→ ingest-needed → dispatch fires).
       fetchSnapshotCommitSha: vi.fn()

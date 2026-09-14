@@ -52,8 +52,8 @@ const KG_REFRESH_TTL_MS = 4 * 60 * 60 * 1000;
 /** Delay between snapshot-commit visibility retries (git-cache lag). */
 const SNAPSHOT_COMMIT_RETRY_MS = 5_000;
 
-/** Advisory hint attached to a failing `workflow:runner_phase` preflight row (AII-594). */
-const WORKFLOW_RUNNER_PHASE_SYNC_HINT =
+/** Advisory hint attached to a failing `workflow:envelope` preflight row (AII-594, AII-654). */
+const WORKFLOW_ENVELOPE_SYNC_HINT =
   "re-run workflow sync for the KG repo mapping (POST /api/mappings/<team>/sync-workflows)";
 
 /** DB settings key for persisting ingest stage across restarts. */
@@ -523,13 +523,15 @@ async function defaultFetchCompare(
 }
 
 /**
- * True when a `claude-implement.yml` body declares `runner_phase` under
- * `on.workflow_dispatch.inputs`. GitHub Actions YAML is looser than a plain config
- * file — `workflow_dispatch` may be null/absent (no inputs at all is legal), and a
- * parse failure or unexpected shape must never throw. Any of those resolve to false,
+ * True when a `claude-implement.yml` body declares `run_config` under
+ * `on.workflow_dispatch.inputs` — i.e. the target repo is on the envelope contract, where
+ * the entrypoint reads the kg-refresh phase and callback URL from `run_config` (AII-653)
+ * rather than needing the `runner_phase` top-level input. GitHub Actions YAML is looser than
+ * a plain config file — `workflow_dispatch` may be null/absent (no inputs at all is legal),
+ * and a parse failure or unexpected shape must never throw. Any of those resolve to false,
  * same "unexpected shape → treat as absent" convention as `readCodeRepoFromSourcesYml`.
  */
-function workflowAcceptsRunnerPhase(yamlText: string): boolean {
+function workflowAcceptsEnvelope(yamlText: string): boolean {
   try {
     const doc = parseYaml(yamlText) as unknown;
     if (doc === null || typeof doc !== "object" || Array.isArray(doc)) return false;
@@ -539,7 +541,7 @@ function workflowAcceptsRunnerPhase(yamlText: string): boolean {
     if (workflowDispatch === null || typeof workflowDispatch !== "object" || Array.isArray(workflowDispatch)) return false;
     const inputs = (workflowDispatch as Record<string, unknown>).inputs;
     if (inputs === null || typeof inputs !== "object" || Array.isArray(inputs)) return false;
-    return Object.prototype.hasOwnProperty.call(inputs, "runner_phase");
+    return Object.prototype.hasOwnProperty.call(inputs, "run_config");
   } catch {
     return false;
   }
@@ -596,9 +598,12 @@ export async function runKgRefreshPreflight(input: KgPreflightInput): Promise<Pr
     await rm(tmpDir, { recursive: true, force: true }).catch(() => {});
   }
 
-  // Probe whether the KG repo's claude-implement.yml accepts runner_phase (AII-594): the rail
-  // dispatches with runner_phase=kg-refresh, and a repo whose synced copy predates that input
-  // 422s at dispatch. Reuses the read token/branch minted above when available.
+  // Probe whether the KG repo's claude-implement.yml is on the envelope contract (AII-594,
+  // AII-654): the rail's phase and callback URL only ride the top-level runner_phase/
+  // runner_callback_url inputs on the legacy contract, and any envelope template — which
+  // declares run_config and reads the phase from it (AII-653) — works regardless of whether
+  // it still declares those two optional inputs (dispatchKgRefreshRun strips them on a 422).
+  // Reuses the read token/branch minted above when available.
   try {
     const token = sourcesReadToken ?? (await mintTokenFn(input.githubAppId, input.githubAppPrivateKey, repo.owner, {
       permissions: { contents: "read" },
@@ -606,14 +611,14 @@ export async function runKgRefreshPreflight(input: KgPreflightInput): Promise<Pr
     })).token;
     const branch = defaultBranch ?? (await fetchDefaultBranchFn(token, repo.owner, repo.repo));
     const file = await fetchWorkflowFileFn(token, repo.owner, repo.repo, branch);
-    const ok = file.status === 200 && file.content !== null && workflowAcceptsRunnerPhase(file.content);
+    const ok = file.status === 200 && file.content !== null && workflowAcceptsEnvelope(file.content);
     results.push(
       ok
-        ? { repo: kgRepoSlug, grant: "workflow:runner_phase", ok: true, status: file.status }
-        : { repo: kgRepoSlug, grant: "workflow:runner_phase", ok: false, status: file.status, hint: WORKFLOW_RUNNER_PHASE_SYNC_HINT },
+        ? { repo: kgRepoSlug, grant: "workflow:envelope", ok: true, status: file.status }
+        : { repo: kgRepoSlug, grant: "workflow:envelope", ok: false, status: file.status, hint: WORKFLOW_ENVELOPE_SYNC_HINT },
     );
   } catch {
-    results.push({ repo: kgRepoSlug, grant: "workflow:runner_phase", ok: false, status: 0, hint: WORKFLOW_RUNNER_PHASE_SYNC_HINT });
+    results.push({ repo: kgRepoSlug, grant: "workflow:envelope", ok: false, status: 0, hint: WORKFLOW_ENVELOPE_SYNC_HINT });
   }
 
   // Advisory base-template drift row (AII-598): how many commits the derivative KG repo is

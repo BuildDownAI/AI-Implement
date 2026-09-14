@@ -744,7 +744,7 @@ describe("kg-refresh", () => {
         fetchDefaultBranch: vi.fn(async () => "main") as never,
         fetchWorkflowFile: vi.fn(async () => ({
           status: 200,
-          content: "on:\n  workflow_dispatch:\n    inputs:\n      runner_phase:\n        required: false\n",
+          content: "on:\n  workflow_dispatch:\n    inputs:\n      run_config:\n        required: true\n      runner_phase:\n        required: false\n",
         })) as never,
         fetchSnapshotCommitSha: makeSnapshotShaMock() as never,
         persistSnapshotSha: vi.fn() as never,
@@ -2656,12 +2656,29 @@ describe("kg-refresh", () => {
     let fetchCompare: ReturnType<typeof vi.fn>;
     let preflightTarball: Buffer;
 
-    // A claude-implement.yml body that declares runner_phase — the happy path.
+    // A claude-implement.yml body that declares run_config — the envelope contract, the happy
+    // path (AII-654). Also declares runner_phase, matching every currently-synced template.
     const WORKFLOW_WITH_RUNNER_PHASE = [
       "on:",
       "  workflow_dispatch:",
       "    inputs:",
       "      run_config:",
+      "        required: true",
+      "      runner_phase:",
+      "        required: false",
+      "jobs:",
+      "  implement:",
+      "    runs-on: ubuntu-latest",
+      "    steps: []",
+    ].join("\n");
+
+    // A claude-implement.yml body on the legacy contract: declares runner_phase but not
+    // run_config — the shape the AII-654 preflight rename must now refuse.
+    const WORKFLOW_WITHOUT_RUN_CONFIG = [
+      "on:",
+      "  workflow_dispatch:",
+      "    inputs:",
+      "      issue_id:",
       "        required: true",
       "      runner_phase:",
       "        required: false",
@@ -2858,9 +2875,9 @@ describe("kg-refresh", () => {
       expect(dispatchRun).not.toHaveBeenCalled();
     });
 
-    // ---- AII-594: workflow:runner_phase row ----------------------------------------
+    // ---- AII-594 / AII-654: workflow:envelope row -----------------------------------
 
-    it("workflow file declares runner_phase — row ok, dispatch proceeds", async () => {
+    it("workflow file declares run_config (and runner_phase) — row ok, dispatch proceeds", async () => {
       buildPreflight();
       const r = await handle.trigger();
       expect(r.status).toBe(202);
@@ -2872,12 +2889,26 @@ describe("kg-refresh", () => {
       expect(fetchWorkflowFile).toHaveBeenCalled();
     });
 
-    it("workflow file present but missing runner_phase input — gate=preflight, detail carries sync hint", async () => {
+    it("workflow file declares run_config only (no runner_phase) — row ok, dispatch proceeds", async () => {
       buildPreflight({
         fetchWorkflowFile: vi.fn(async () => ({
           status: 200,
           content: ["on:", "  workflow_dispatch:", "    inputs:", "      run_config:", "        required: true"].join("\n"),
         })) as never,
+      });
+
+      const r = await handle.trigger();
+      expect(r.status).toBe(202);
+      for (let i = 0; i < 200; i++) {
+        if (dispatchRun.mock.calls.length > 0) break;
+        await new Promise((res2) => setTimeout(res2, 10));
+      }
+      expect(dispatchRun).toHaveBeenCalledOnce();
+    });
+
+    it("workflow file present but missing run_config input — gate=preflight, detail carries sync hint", async () => {
+      buildPreflight({
+        fetchWorkflowFile: vi.fn(async () => ({ status: 200, content: WORKFLOW_WITHOUT_RUN_CONFIG })) as never,
       });
 
       const r = await handle.trigger();
@@ -2887,7 +2918,7 @@ describe("kg-refresh", () => {
       );
       const s = await handle.status();
       expect((s.lastRefresh?.gate as RefreshGate)).toBe("preflight");
-      expect(s.lastRefresh?.detail).toContain("workflow:runner_phase");
+      expect(s.lastRefresh?.detail).toContain("workflow:envelope");
       expect(s.lastRefresh?.detail).toContain(
         "re-run workflow sync for the KG repo mapping (POST /api/mappings/<team>/sync-workflows)",
       );
@@ -2902,7 +2933,7 @@ describe("kg-refresh", () => {
       const r = await handle.trigger();
       expect(r.status).toBe(422);
       const s = await handle.status();
-      expect(s.lastRefresh?.detail).toContain("workflow:runner_phase");
+      expect(s.lastRefresh?.detail).toContain("workflow:envelope");
       expect(s.lastRefresh?.detail).toContain("re-run workflow sync");
       expect(dispatchRun).not.toHaveBeenCalled();
     });
@@ -2915,7 +2946,7 @@ describe("kg-refresh", () => {
       const r = await handle.trigger();
       expect(r.status).toBe(422);
       const s = await handle.status();
-      expect(s.lastRefresh?.detail).toContain("workflow:runner_phase");
+      expect(s.lastRefresh?.detail).toContain("workflow:envelope");
       expect(dispatchRun).not.toHaveBeenCalled();
     });
 
@@ -2930,7 +2961,7 @@ describe("kg-refresh", () => {
       const r = await handle.trigger();
       expect(r.status).toBe(422);
       const s = await handle.status();
-      expect(s.lastRefresh?.detail).toContain("workflow:runner_phase");
+      expect(s.lastRefresh?.detail).toContain("workflow:envelope");
       expect(dispatchRun).not.toHaveBeenCalled();
     });
 
@@ -2942,7 +2973,7 @@ describe("kg-refresh", () => {
       const r = await handle.trigger();
       expect(r.status).toBe(422);
       const s = await handle.status();
-      expect(s.lastRefresh?.detail).toContain("workflow:runner_phase");
+      expect(s.lastRefresh?.detail).toContain("workflow:envelope");
       expect(s.lastRefresh?.detail).toContain("HTTP 0");
       expect(s.lastRefresh?.detail).toContain("re-run workflow sync");
       expect(dispatchRun).not.toHaveBeenCalled();
@@ -2968,7 +2999,7 @@ describe("kg-refresh", () => {
       expect(byGrant("TestOrg/test-kg", "contents:write")).toMatchObject({ ok: true, status: 200 });
       expect(byGrant("TestOrg/main-repo", "contents:read")).toMatchObject({ ok: true, status: 200 });
       expect(byGrant("TestOrg/secondary-repo", "pull_requests:read")).toMatchObject({ ok: true, status: 200 });
-      expect(byGrant("TestOrg/test-kg", "workflow:runner_phase")).toMatchObject({ ok: false, status: 404 });
+      expect(byGrant("TestOrg/test-kg", "workflow:envelope")).toMatchObject({ ok: false, status: 404 });
       expect(byGrant("BuildDownAI/bd-knowledge-graph-base", "base:drift")).toMatchObject({ ok: true, status: 200 });
     });
 
@@ -3257,7 +3288,7 @@ describe("kg-refresh", () => {
       expect(byGrant("TestOrg/test-kg", "contents:write")).toMatchObject({ ok: true, status: 200 });
       expect(byGrant("TestOrg/main-repo", "contents:read")).toMatchObject({ ok: true, status: 200 });
       expect(byGrant("TestOrg/secondary-repo", "pull_requests:read")).toMatchObject({ ok: true, status: 200 });
-      expect(byGrant("TestOrg/test-kg", "workflow:runner_phase")).toMatchObject({ ok: true, status: 200 });
+      expect(byGrant("TestOrg/test-kg", "workflow:envelope")).toMatchObject({ ok: true, status: 200 });
       expect(byGrant("BuildDownAI/bd-knowledge-graph-base", "base:drift")).toMatchObject({ ok: true, status: 404, hint: "base drift unknown" });
     });
   });
