@@ -181,6 +181,12 @@ export class SidecarMemoryProvider implements MemoryProvider {
    * sidecar is stateless and none is needed.
    */
   private sessionId: string | null = null;
+  /**
+   * Shared by concurrent maybeReprobe() callers so a burst of simultaneous listTools/proxyCall
+   * failures (the exact incident this feature targets) triggers at most one real probe rather
+   * than one per failing caller (AII-648).
+   */
+  private inFlightReprobe: Promise<void> | null = null;
 
   constructor(
     private readonly kgSidecarUrl: string,
@@ -445,23 +451,43 @@ export class SidecarMemoryProvider implements MemoryProvider {
    * fired-and-forgotten: a detached probe would still reach the sidecar after its
    * triggering call returns, on a timer no caller controls, which is worse than the
    * small added latency of waiting for it here.
+   *
+   * `sidecarHealth.checkedAt` is only stamped once a probe finishes, so a throttle check
+   * against it alone is racy: several calls that fail concurrently would all read the same
+   * stale timestamp and each start its own real probe. The in-flight guard below closes that
+   * window — once a probe is running, every concurrent caller awaits that same probe instead
+   * of starting a new one.
    */
   private async maybeReprobe(): Promise<void> {
+    if (this.inFlightReprobe) {
+      await this.inFlightReprobe;
+      return;
+    }
     const last = sidecarHealth.checkedAt;
     if (last !== null && Date.now() - last < PROBE_THROTTLE_MS) return;
+
+    const run = async (): Promise<void> => {
+      try {
+        await this.probe();
+      } catch (err) {
+        // probe() itself never throws in practice (every internal failure resolves to a
+        // recorded health rather than a rejection) — this is a last-resort backstop so an
+        // unexpected exception still stamps checkedAt, rather than defeating the throttle
+        // and re-attempting on every single subsequent failure.
+        console.error("[mcp] KG sidecar re-probe failed:", err);
+        recordSidecarHealth({
+          reachable: false,
+          toolsListed: false,
+          lastError: err instanceof Error ? err.message : String(err),
+        });
+      }
+    };
+
+    this.inFlightReprobe = run();
     try {
-      await this.probe();
-    } catch (err) {
-      // probe() itself never throws in practice (every internal failure resolves to a
-      // recorded health rather than a rejection) — this is a last-resort backstop so an
-      // unexpected exception still stamps checkedAt, rather than defeating the throttle
-      // and re-attempting on every single subsequent failure.
-      console.error("[mcp] KG sidecar re-probe failed:", err);
-      recordSidecarHealth({
-        reachable: false,
-        toolsListed: false,
-        lastError: err instanceof Error ? err.message : String(err),
-      });
+      await this.inFlightReprobe;
+    } finally {
+      this.inFlightReprobe = null;
     }
   }
 

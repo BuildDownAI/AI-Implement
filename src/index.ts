@@ -4051,22 +4051,12 @@ async function main(): Promise<void> {
   const config = loadConfig();
   if (!config.kgSourceRepo) console.log("[kg] KG_SOURCE_REPO not set — knowledge graph disabled");
 
-  // Resolved once here (rather than inside startServer) so its boot-time liveness probe can
-  // run, and complete, before postBootNotice below decides the deploy outcome (AII-648). The
-  // same instance is then passed into startServer so /mcp reuses it rather than negotiating a
-  // second, independent MCP session.
+  // Resolved once here (rather than inside startServer) so the same instance can be passed
+  // into startServer (so /mcp reuses it rather than negotiating a second, independent MCP
+  // session) and into the boot-time liveness probe below. Both calls are synchronous — no I/O
+  // — so resolving them here does not delay server.listen().
   const memoryProvider = resolveMemoryProvider(config.kgSidecarUrl, config.memoryProviderId);
   const memoryProviderDiagnostic = providerUnconfiguredReason(config.kgSidecarUrl, config.memoryProviderId);
-  let sidecarProbeError: string | null = null;
-  if (memoryProvider instanceof SidecarMemoryProvider) {
-    const health = await memoryProvider.probe();
-    if (health.lastError) {
-      sidecarProbeError = health.lastError;
-      console.error(`[kg] sidecar probe FAILED: ${health.lastError}`);
-    } else {
-      console.error(`[kg] sidecar probe: ok (${Object.keys(KG_TOOL_CAPABILITY).length} tools)`);
-    }
-  }
 
   // Phase 2: per-mapping provider resolution. The registry caches one
   // TicketingProvider per provider id (linear, jira) and resolves on demand
@@ -4114,13 +4104,28 @@ async function main(): Promise<void> {
 
   const server = startServer(config, registry, sidecar, memoryProvider, memoryProviderDiagnostic);
 
-  // Fire-and-forget: a hanging webhook must not delay reconciliation or the first poll.
+  // Fire-and-forget: a hung sidecar probe or a hanging webhook must not delay server.listen()
+  // (already called above), reconciliation, or the first poll (AII-648). A misbehaving sidecar
+  // that accepted its readiness poll but hangs on real MCP traffic must degrade only the KG
+  // feature and the recorded deploy outcome, not overall orchestrator availability — the health
+  // check, admin UI, webhook receiver, and poll loop all come up independently of this.
   // Every write postBootNotice makes — LAST_IMAGE_REF_KEY, LAST_SHUTDOWN_AT_KEY and
-  // DEPLOY_OUTCOME_KEY — happens synchronously before its first await, so nothing is lost
-  // if the webhook never answers. Keep it that way: a write moved below an await here stops
-  // persisting silently and misclassifies every later boot. The sidecar probe above has
-  // already resolved by this point, so the recorded outcome reflects it rather than racing it.
-  void postBootNotice(config, { holdWasSet, sidecarProbeError });
+  // DEPLOY_OUTCOME_KEY — happens synchronously before its first internal await, so nothing is
+  // lost if the webhook never answers. Keep it that way: a write moved below an await there
+  // stops persisting silently and misclassifies every later boot.
+  void (async () => {
+    let sidecarProbeError: string | null = null;
+    if (memoryProvider instanceof SidecarMemoryProvider) {
+      const health = await memoryProvider.probe();
+      if (health.lastError) {
+        sidecarProbeError = health.lastError;
+        console.error(`[kg] sidecar probe FAILED: ${health.lastError}`);
+      } else {
+        console.error(`[kg] sidecar probe: ok (${Object.keys(KG_TOOL_CAPABILITY).length} tools)`);
+      }
+    }
+    await postBootNotice(config, { holdWasSet, sidecarProbeError });
+  })();
 
   // Reconcile machines from any previous run before starting the poll loop
   await startupReconciliation(config, registry);

@@ -837,6 +837,21 @@ describe("SidecarMemoryProvider probe", () => {
       expect(sidecarHealth.checkedAt).toBe(checkedAtAfterFirst);
     });
 
+    it("concurrent listTools failures share a single in-flight re-probe rather than each starting their own", async () => {
+      queueConnectionError("ECONNREFUSED"); // first listTools attempt
+      queueConnectionError("ECONNREFUSED"); // second, concurrent listTools attempt
+      queueConnectionError("ECONNREFUSED"); // the one shared re-probe
+
+      const p = makeProvider();
+      const [first, second] = await Promise.all([p.listTools(Buffer.from("{}"), {}), p.listTools(Buffer.from("{}"), {})]);
+
+      expect(first).toEqual([]);
+      expect(second).toEqual([]);
+      // 2 listTools attempts + 1 shared re-probe, not 2 listTools attempts + 2 re-probes.
+      expect(mockHttpRequest).toHaveBeenCalledTimes(3);
+      expect(sidecarHealth.checkedAt).not.toBeNull();
+    });
+
     it("a failed proxyCall re-probes exactly once, respecting the same throttle", async () => {
       queueConnectionError("ECONNREFUSED"); // the proxyCall attempt itself
       queueConnectionError("ECONNREFUSED"); // the triggered re-probe
