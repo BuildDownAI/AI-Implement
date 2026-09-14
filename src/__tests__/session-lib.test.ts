@@ -51,6 +51,108 @@ describe.skipIf(isWindows)("session/lib.sh", () => {
   });
 });
 
+describe.skipIf(isWindows)("resolve_envelope_field / select_runner_entry", () => {
+  function encodeEnvelope(fields: Record<string, unknown> = {}): string {
+    const payload = {
+      v: 1,
+      issue: { id: "1", identifier: "AII-1", title: "t", description: "d" },
+      ...fields,
+    };
+    return Buffer.from(JSON.stringify(payload), "utf-8").toString("base64");
+  }
+
+  // Deterministically malformed: valid base64, but the decoded text isn't JSON.
+  const MALFORMED_ENVELOPE = Buffer.from("not json at all", "utf-8").toString("base64");
+
+  // log() writes its "[session] ..." lines to stdout, so a script that both
+  // logs and echoes a result must be read by its last line.
+  function lastLine(stdout: string): string {
+    return stdout.trim().split("\n").at(-1) ?? "";
+  }
+
+  it("env wins over the envelope (dev-harness guard: RUNNER_PHASE=full survives runnerPhase:implementation)", () => {
+    const envelope = encodeEnvelope({ runnerPhase: "implementation" });
+    const result = runBash(
+      `source session/lib.sh; RUNNER_PHASE=full; AI_IMPLEMENT_RUN_CONFIG='${envelope}'; resolve_envelope_field RUNNER_PHASE runnerPhase; select_runner_entry "$RUNNER_PHASE"`,
+    );
+    expect(result.status).toBe(0);
+    expect(lastLine(result.stdout)).toBe("run-local-full-loop.js");
+    expect(result.stdout).not.toContain("envelope.runnerPhase");
+  });
+
+  it("envelope fills empty RUNNER_PHASE (integration case: kg-refresh)", () => {
+    const envelope = encodeEnvelope({ runnerPhase: "kg-refresh" });
+    const result = runBash(
+      `unset RUNNER_PHASE; source session/lib.sh; AI_IMPLEMENT_RUN_CONFIG='${envelope}'; resolve_envelope_field RUNNER_PHASE runnerPhase; select_runner_entry "$RUNNER_PHASE"`,
+    );
+    expect(result.status).toBe(0);
+    expect(lastLine(result.stdout)).toBe("pipeline/kg-refresh-run.js");
+    expect(result.stdout).toContain("envelope.runnerPhase=kg-refresh");
+  });
+
+  it("defaults to implementation when the envelope has no runnerPhase", () => {
+    const envelope = encodeEnvelope({});
+    const result = runBash(
+      `unset RUNNER_PHASE; source session/lib.sh; AI_IMPLEMENT_RUN_CONFIG='${envelope}'; resolve_envelope_field RUNNER_PHASE runnerPhase; RUNNER_PHASE="\${RUNNER_PHASE:-implementation}"; echo "$RUNNER_PHASE"`,
+    );
+    expect(result.status).toBe(0);
+    expect(lastLine(result.stdout)).toBe("implementation");
+    expect(result.stdout).not.toContain("envelope.runnerPhase");
+    expect(result.stderr).not.toMatch(/WARNING/);
+  });
+
+  it("defaults to implementation and logs a warning when the envelope is malformed", () => {
+    const result = runBash(
+      `unset RUNNER_PHASE; source session/lib.sh; AI_IMPLEMENT_RUN_CONFIG='${MALFORMED_ENVELOPE}'; resolve_envelope_field RUNNER_PHASE runnerPhase; RUNNER_PHASE="\${RUNNER_PHASE:-implementation}"; echo "$RUNNER_PHASE"`,
+    );
+    expect(result.status).toBe(0);
+    expect(lastLine(result.stdout)).toBe("implementation");
+    expect(result.stdout).toMatch(/WARNING/);
+  });
+
+  it("defaults to implementation when there is no envelope at all", () => {
+    const result = runBash(
+      `unset RUNNER_PHASE AI_IMPLEMENT_RUN_CONFIG; source session/lib.sh; resolve_envelope_field RUNNER_PHASE runnerPhase; RUNNER_PHASE="\${RUNNER_PHASE:-implementation}"; echo "$RUNNER_PHASE"`,
+    );
+    expect(result.status).toBe(0);
+    expect(lastLine(result.stdout)).toBe("implementation");
+    expect(result.stdout).not.toMatch(/WARNING/);
+  });
+
+  it("fills RUNNER_CALLBACK_URL from the envelope when env is empty", () => {
+    const envelope = encodeEnvelope({ runnerCallbackUrl: "https://example.test/callback" });
+    const result = runBash(
+      `unset RUNNER_CALLBACK_URL; source session/lib.sh; AI_IMPLEMENT_RUN_CONFIG='${envelope}'; resolve_envelope_field RUNNER_CALLBACK_URL runnerCallbackUrl; echo "$RUNNER_CALLBACK_URL"`,
+    );
+    expect(result.status).toBe(0);
+    expect(lastLine(result.stdout)).toBe("https://example.test/callback");
+  });
+
+  it("leaves RUNNER_CALLBACK_URL unchanged when env is already set", () => {
+    const envelope = encodeEnvelope({ runnerCallbackUrl: "https://example.test/from-envelope" });
+    const result = runBash(
+      `source session/lib.sh; RUNNER_CALLBACK_URL='https://example.test/from-env'; AI_IMPLEMENT_RUN_CONFIG='${envelope}'; resolve_envelope_field RUNNER_CALLBACK_URL runnerCallbackUrl; echo "$RUNNER_CALLBACK_URL"`,
+    );
+    expect(result.status).toBe(0);
+    expect(lastLine(result.stdout)).toBe("https://example.test/from-env");
+    expect(result.stdout).not.toContain("envelope.runnerCallbackUrl");
+  });
+
+  it("select_runner_entry reproduces all five arms", () => {
+    const cases: Array<[string, string]> = [
+      ["planning", "run-planning.js"],
+      ["local-planning", "run-local-planning.js"],
+      ["full", "run-local-full-loop.js"],
+      ["kg-refresh", "pipeline/kg-refresh-run.js"],
+      ["implementation", "run-autonomous.js"],
+    ];
+    for (const [phase, entry] of cases) {
+      const result = runBash(`source session/lib.sh; select_runner_entry "${phase}"`);
+      expect(result.stdout.trim()).toBe(entry);
+    }
+  });
+});
+
 describe.skipIf(isWindows)("verify_workspace_writable", () => {
   const cleanupDirs: string[] = [];
 

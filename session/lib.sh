@@ -72,6 +72,53 @@ verify_workspace_writable() {
   fail "Cannot write to bind-mounted workspace $workspace_dir (owner $ws_uid:$ws_gid, coder UID $coder_uid GID $coder_gid). Verify AI_IMPLEMENT_HOST_UID/AI_IMPLEMENT_HOST_GID match the host directory owner. On macOS Docker Desktop, confirm file sharing is enabled — the mount may be read-only."
 }
 
+# Resolve VAR from the AI_IMPLEMENT_RUN_CONFIG envelope when the env is empty.
+# Usage: resolve_envelope_field VAR_NAME ENVELOPE_KEY
+#
+# Env wins: if VAR is already non-empty, this is a no-op. Otherwise, decode
+# the envelope with node -e (same base64-JSON style as the other envelope
+# reads in entrypoint.sh) and read the string value of ENVELOPE_KEY. A
+# non-empty value is assigned to VAR and exported, logging one
+# "envelope.<KEY>=<value>" line. An absent envelope or an absent/empty key
+# leaves VAR unchanged with no log line. A malformed envelope also leaves VAR
+# unchanged but logs one warning line — the errors are swallowed the same way
+# the other envelope reads swallow them, so a bad envelope surfaces as the
+# runner's own decode error rather than a shell exit with no callback.
+resolve_envelope_field() {
+  local var_name="$1" key="$2" out status val
+  [ -n "${!var_name:-}" ] && return 0
+  [ -z "${AI_IMPLEMENT_RUN_CONFIG:-}" ] && return 0
+  # The value comes first and the status marker last, since command
+  # substitution strips trailing newlines — putting the (possibly empty)
+  # value last would make it indistinguishable from a value that never had
+  # a separator.
+  out="$(node -e "try{const c=JSON.parse(Buffer.from(process.env.AI_IMPLEMENT_RUN_CONFIG,'base64').toString());const v=c['$key'];process.stdout.write((typeof v==='string'?v:'')+'\nok')}catch(e){process.stdout.write('\nerr')}" 2>/dev/null || echo $'\nerr')"
+  status="${out##*$'\n'}"
+  val="${out%$'\n'*}"
+  if [ "$status" != "ok" ]; then
+    log "WARNING: Could not decode AI_IMPLEMENT_RUN_CONFIG while resolving ${key}; leaving ${var_name} unset"
+    return 0
+  fi
+  if [ -n "$val" ]; then
+    export "${var_name}=${val}"
+    log "envelope.${key}=${val}"
+  fi
+}
+
+# Echoes the runner entry file for a given RUNNER_PHASE. Same five arms used
+# by every execution mode; kept here so lib.sh is the one place that maps
+# phase -> entry file.
+select_runner_entry() {
+  local phase="$1"
+  case "$phase" in
+    planning) echo "run-planning.js" ;;
+    local-planning) echo "run-local-planning.js" ;;
+    full) echo "run-local-full-loop.js" ;;
+    kg-refresh) echo "pipeline/kg-refresh-run.js" ;;
+    *) echo "run-autonomous.js" ;;
+  esac
+}
+
 # Returns 0 (true) if the bare secret name would overwrite an orchestrator-
 # owned environment variable and must not be exported by remap_team_secrets.
 # Matches all GITHUB_*, ISSUE_*, and AI_IMPLEMENT_* prefixes plus the exact

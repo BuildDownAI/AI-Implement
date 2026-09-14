@@ -231,10 +231,14 @@ describe("session/entrypoint.sh", () => {
 
   it("exec's the phase-selected TS runner as the final step", () => {
     const content = readFileSync("session/entrypoint.sh", "utf-8");
-    expect(content).toContain('RUNNER_ENTRY="run-planning.js"');
-    expect(content).toContain('RUNNER_ENTRY="run-local-planning.js"');
-    expect(content).toContain('RUNNER_ENTRY="run-local-full-loop.js"');
-    expect(content).toContain('RUNNER_ENTRY="run-autonomous.js"');
+    const lib = readFileSync("session/lib.sh", "utf-8");
+    // The phase -> entry-file mapping lives in select_runner_entry (session/lib.sh);
+    // entrypoint.sh only calls it and execs the result.
+    expect(lib).toContain('planning) echo "run-planning.js"');
+    expect(lib).toContain('local-planning) echo "run-local-planning.js"');
+    expect(lib).toContain('full) echo "run-local-full-loop.js"');
+    expect(lib).toContain('*) echo "run-autonomous.js"');
+    expect(content).toContain('RUNNER_ENTRY="$(select_runner_entry "$RUNNER_PHASE")"');
     expect(content).toContain('exec dbus-run-session -- su -p coder -c "HOME=/home/coder exec node /app/dist/$RUNNER_ENTRY"');
   });
 

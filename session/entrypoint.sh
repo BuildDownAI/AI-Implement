@@ -102,15 +102,15 @@ remap_team_secrets
 
 # ── 6. Invoke TS pipeline ────────────────────────────────────────────────────
 export WORKSPACE_DIR
+RUNNER_PHASE_SOURCE="env"
+[ -z "${RUNNER_PHASE:-}" ] && RUNNER_PHASE_SOURCE="default"
+resolve_envelope_field RUNNER_PHASE runnerPhase
+[ "$RUNNER_PHASE_SOURCE" = "default" ] && [ -n "${RUNNER_PHASE:-}" ] && RUNNER_PHASE_SOURCE="envelope"
+resolve_envelope_field RUNNER_CALLBACK_URL runnerCallbackUrl
 RUNNER_PHASE="${RUNNER_PHASE:-implementation}"
 export RUNNER_PHASE
 # Managed gap-analysis is an implementation run with PR_NUMBER set, so it uses the default entry.
-case "$RUNNER_PHASE" in
-  planning) RUNNER_ENTRY="run-planning.js" ;;
-  local-planning) RUNNER_ENTRY="run-local-planning.js" ;;
-  full) RUNNER_ENTRY="run-local-full-loop.js" ;;
-  kg-refresh) RUNNER_ENTRY="pipeline/kg-refresh-run.js"; export RUNNER_CALLBACK_URL RUN_PROGRESS_TOKEN ;;
-  *) RUNNER_ENTRY="run-autonomous.js" ;;
-esac
-log "Invoking TS pipeline (node /app/dist/$RUNNER_ENTRY, phase=$RUNNER_PHASE)..."
+RUNNER_ENTRY="$(select_runner_entry "$RUNNER_PHASE")"
+[ "$RUNNER_PHASE" = "kg-refresh" ] && export RUNNER_CALLBACK_URL RUN_PROGRESS_TOKEN
+log "Invoking TS pipeline (node /app/dist/$RUNNER_ENTRY, phase=$RUNNER_PHASE, source=$RUNNER_PHASE_SOURCE)..."
 exec dbus-run-session -- su -p coder -c "HOME=/home/coder exec node /app/dist/$RUNNER_ENTRY"
