@@ -433,6 +433,14 @@ describe("extractReviewFindingsBlock", () => {
     });
   });
 
+  it("marks findings unavailable when the opening review-findings fence is the final line with no trailing newline", () => {
+    expect(extractReviewFindingsBlock("```json review-findings")).toEqual({
+      findings: [],
+      verdict: "incomplete",
+      findingsUnavailable: true,
+    });
+  });
+
   it("marks findings unavailable when the JSON parses but is missing the required verdict field", () => {
     const body = ["```json review-findings", '{"schema":"review-findings/v1","findings":[]}', "```"].join("\n");
 
@@ -521,6 +529,21 @@ describe("extractReviewFindingsBlock", () => {
         findings: [{ severity: "blocking", body: "This newer attempt is unfinished" }],
       }),
     ].join("\n");
+
+    expect(extractReviewFindingsBlock(body)).toEqual({
+      findings: [],
+      verdict: "incomplete",
+      findingsUnavailable: true,
+    });
+  });
+
+  it("treats an EOF opening fence as the controlling attempt after an earlier valid approve block", () => {
+    const firstBlock = JSON.stringify({
+      schema: "review-findings/v1",
+      verdict: "approve",
+      findings: [],
+    });
+    const body = ["```json review-findings", firstBlock, "```", "", "```json review-findings"].join("\n");
 
     expect(extractReviewFindingsBlock(body)).toEqual({
       findings: [],

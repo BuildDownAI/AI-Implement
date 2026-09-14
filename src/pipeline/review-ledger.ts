@@ -85,7 +85,7 @@ const REVIEW_FINDINGS_SCHEMA = "review-findings/v1";
 // finding's `body` legitimately contains an inline triple-backtick snippet (e.g. `` "Use:\n```js\nfoo()\n```" ``)
 // -- that inner sequence never starts a line by itself, so this pattern skips past it.
 const REVIEW_FINDINGS_FENCE_RE = /^[ \t]*```json[ \t]+review-findings[ \t]*\r?\n([\s\S]*?)^[ \t]*```[ \t]*(?=\r?\n|$)/gm;
-const REVIEW_FINDINGS_OPENING_FENCE_RE = /^[ \t]*```json[ \t]+review-findings[ \t]*\r?\n/gm;
+const REVIEW_FINDINGS_OPENING_FENCE_RE = /^[ \t]*```json[ \t]+review-findings[ \t]*(?:\r?\n|$)/gm;
 
 const REVIEW_FINDINGS_VERDICTS = new Set(["approve", "changes_requested", "incomplete"]);
 
