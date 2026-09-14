@@ -468,7 +468,7 @@ describe("postPushReviewStep", () => {
       if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
       return { stdout: "", exitCode: 0 };
     });
-    const invoke = vi.fn(async () => structuredReviewResult({ approved: true, findings: [] }));
+    const invoke = vi.fn(async () => structuredReviewResult({ approved: true, findings: [], summary: "Checked the change.", checks: [{ check: "Scope", result: "passed", evidence: "The diff matches the requested scope." }] }));
 
     const out = await postPushReviewStep.run(
       makeCtx(invoke, { retryPolicy: { ...DEFAULT_RETRY_POLICY, reviewMaxTurns: 45 } }),
@@ -721,7 +721,7 @@ describe("postPushReviewStep", () => {
   it("ignores config reviewers that shadow built-in, image-baked, or reserved external reviewer ids", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
-      const invoke = vi.fn(async () => structuredReviewResult({ approved: true, findings: [] }));
+      const invoke = vi.fn(async () => structuredReviewResult({ approved: true, findings: [], summary: "Checked the change.", checks: [{ check: "Scope", result: "passed", evidence: "The diff matches the requested scope." }] }));
       const trustedDefinitions = reviewerMap([selectedReviewerDefinition("image-review", { buildPrompt: () => "trusted image prompt" })]);
 
       const out = await postPushReviewStep.run(

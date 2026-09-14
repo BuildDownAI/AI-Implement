@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url";
 import { resolveModuleImport, type ImportModuleOptions } from "../resolve-module.js";
 import codeReviewReviewer from "./code-review.js";
 import gapAnalysisReviewer from "./gap-analysis.js";
-export { REVIEWER_VERDICT_SCHEMA } from "./schema.js";
+export { BUILTIN_REVIEWER_VERDICT_SCHEMA, REVIEWER_VERDICT_SCHEMA } from "./schema.js";
 
 export type ReviewerFindingSeverity = "blocking" | "medium" | "minor";
 

@@ -130,10 +130,14 @@ examined, its result (`passed`, `failed`, `not_verified`, or `not_applicable`),
 and concrete evidence. Gap analysis maps acceptance criteria to implementation;
 code review describes relevant behavior, risks, and validation. Reading a test
 is distinguished from running it, and checks that were not performed are named
-explicitly. These reports appear in the GitHub review and status comment and
-are saved in each reviewer step's outputs.
+explicitly. These reports appear in the GitHub review and are saved in each
+reviewer step's outputs. The final status comment links to that review instead
+of repeating the checklist. If review publication fails or returns no usable
+link, the status comment retains the full report.
 
-The report fields are optional for compatibility with existing custom reviewers.
+Built-in reviewers must return both report fields; a checklist embedded in the
+summary does not satisfy the structured contract. The report fields remain
+optional for compatibility with existing custom reviewers.
 They explain the verdict; actionable defects must still be in `findings` and
 cannot be replaced by report prose. A `not_verified` check records a limitation,
 not an automatic blocker; a required fix or validation gap belongs in findings.

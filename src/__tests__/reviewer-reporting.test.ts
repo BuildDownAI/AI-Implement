@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { postPushReviewStep } from "../pipeline/steps/post-push-review.js";
 import type { PipelineContext } from "../pipeline/types.js";
+import { readFileSync } from "node:fs";
 
 const checks = [{
   check: "Pulse speed matches the requested behavior",
@@ -13,9 +14,12 @@ const checks = [{
 }];
 const summary = "The requested animation change is implemented in the shared pulse setting.";
 
-async function runReview(verdict: Record<string, unknown>, externalPending = false, maxIterations = 1) {
+async function runReview(verdict: Record<string, unknown>, externalPending = false, maxIterations = 1, options: { strictReport?: boolean; reviewUrl?: string; reviewFailure?: boolean } = {}) {
   const ghSpawn = vi.fn((args: string[]) => {
     if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+    if (args.includes("repos/:owner/:repo/pulls/42/reviews") && args.includes("POST")) {
+      return { stdout: JSON.stringify({ html_url: options.reviewUrl }), exitCode: options.reviewFailure ? 1 : 0 };
+    }
     if (args.includes("repos/:owner/:repo/pulls/42")) {
       return { stdout: JSON.stringify({ state: "open", head: { sha: "head123" } }), exitCode: 0 };
     }
@@ -39,7 +43,7 @@ async function runReview(verdict: Record<string, unknown>, externalPending = fal
     reviewProviders: externalPending ? ["github-claude-code-review"] : [],
     sleep: async () => {}, reviewWaitPollMs: 1, reviewWaitTimeoutMs: 2,
     reviewers: [{ id: "code-review", gates: true }],
-    trustedReviewerDefinitions: new Map([["code-review", { id: "code-review", buildPrompt: () => "Review", outputSchema: { type: "object" } }]]),
+    trustedReviewerDefinitions: new Map([["code-review", { id: "code-review", buildPrompt: () => "Review", outputSchema: { type: "object", ...(options.strictReport ? { required: ["approved", "findings", "summary", "checks"] } : {}) } }]]),
   }, { report });
   const nativeBodies = ghSpawn.mock.calls.filter(([args]) => args.includes("event=COMMENT"))
     .map(([args]) => args.find(arg => arg.startsWith("body=")) || "");
@@ -49,6 +53,36 @@ async function runReview(verdict: Record<string, unknown>, externalPending = fal
 }
 
 describe("reviewer evidence reports", () => {
+  it("rejects the actual PR8 built-in response with its checklist embedded in summary", async () => {
+    const malformed = JSON.parse(readFileSync(new URL("./fixtures/pr8-malformed-review-report.json", import.meta.url), "utf8"));
+    const { result, nativeBodies } = await runReview(malformed, false, 1, { strictReport: true });
+    expect(result.approved).toBe(false);
+    expect(result.terminationReason).toBe("invalid_review");
+    expect(nativeBodies.join("\n")).not.toContain("approved this PR");
+  });
+
+  it("renders markup in report text visibly rather than letting GitHub interpret it", async () => {
+    const { nativeBodies } = await runReview({ approved: true, findings: [], summary: "Inspected <canvas> rendering", checks: [{ check: "<parameter>", result: "passed", evidence: "Found <summary> in the template" }] });
+    expect(nativeBodies.join("\n")).toContain("&lt;canvas&gt;");
+    expect(nativeBodies.join("\n")).toContain("&lt;parameter&gt;");
+    expect(nativeBodies.join("\n")).toContain("&lt;summary&gt;");
+  });
+
+  it("links the status comment to the published review instead of repeating the report", async () => {
+    const reviewUrl = "https://github.com/test/repo/pull/42#pullrequestreview-123";
+    const { nativeBodies, comments } = await runReview({ approved: true, findings: [], summary, checks }, false, 1, { reviewUrl });
+    expect(nativeBodies.join("\n")).toContain(summary);
+    expect(comments.join("\n")).toContain(reviewUrl);
+    expect(comments.join("\n")).not.toContain(summary);
+    expect(comments.join("\n")).not.toContain(checks[0].evidence);
+  });
+
+  it("keeps the report in the status comment if publishing the native review fails", async () => {
+    const { comments } = await runReview({ approved: true, findings: [], summary, checks }, false, 1, { reviewFailure: true });
+    expect(comments.join("\n")).toContain(summary);
+    expect(comments.join("\n")).toContain(checks[0].evidence);
+  });
+
   it("publishes and persists checked behavior and limitations on approval", async () => {
     const { result, report, nativeBodies, comments } = await runReview({ approved: true, findings: [], summary, checks });
     expect(result.approved).toBe(true);

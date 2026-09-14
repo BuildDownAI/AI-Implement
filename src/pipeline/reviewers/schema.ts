@@ -41,3 +41,8 @@ export const REVIEWER_VERDICT_SCHEMA: ReviewerOutputSchema = {
     },
   },
 };
+
+export const BUILTIN_REVIEWER_VERDICT_SCHEMA: ReviewerOutputSchema = {
+  ...REVIEWER_VERDICT_SCHEMA,
+  required: ["approved", "findings", "summary", "checks"],
+};

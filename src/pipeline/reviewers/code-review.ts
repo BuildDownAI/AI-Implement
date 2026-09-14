@@ -1,5 +1,5 @@
 import type { ReviewerDefinition, ReviewerPromptInput } from "./registry.js";
-import { REVIEWER_VERDICT_SCHEMA } from "./schema.js";
+import { BUILTIN_REVIEWER_VERDICT_SCHEMA } from "./schema.js";
 
 function buildPrompt(input: ReviewerPromptInput): string {
   return `You are reviewing the diff for PR #${input.prNumber} against issue ${input.issueIdentifier}: ${input.issueTitle}.
@@ -31,7 +31,7 @@ the entire updated diff again for newly introduced or newly visible blockers.
 If a previous issue remains unresolved, keep it in findings[] with the current
 reason it is still blocking.
 
-Also return a concise summary and a checks[] list even when approved and findings[] is empty.
+Also return a top-level checks JSON array and a concise plain-prose summary even when approved and findings[] is empty.
 Checks should cover the concrete areas you actually inspected, such as changed
 behavior, edge cases, contracts, security, and tests. Cite specific files,
 symbols, diff hunks, or commands visible in the review context. Use
@@ -40,7 +40,8 @@ for checks that matter but were not executable or not present in the diff, and
 say what remains unverified. Distinguish inspecting test source from executing
 tests. Do not claim runtime tests, browser checks, or security validation ran
 unless the review context includes that evidence. Keep this section to concise
-observations and evidence. Findings remain the only actionable gating channel.
+observations and evidence. Do not put tool XML, a serialized checklist, or
+checks content in summary; checks must be top-level JSON array items. Findings remain the only actionable gating channel.
 
 Issue description:
 ${input.issueDescription}
@@ -59,7 +60,7 @@ Output ONLY valid JSON: {"approved": bool, "findings": [{"severity": "blocking|m
 const codeReviewReviewer: ReviewerDefinition = {
   id: "code-review",
   buildPrompt,
-  outputSchema: REVIEWER_VERDICT_SCHEMA,
+  outputSchema: BUILTIN_REVIEWER_VERDICT_SCHEMA,
 };
 
 export default codeReviewReviewer;

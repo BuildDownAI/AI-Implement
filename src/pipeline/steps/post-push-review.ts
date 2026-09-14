@@ -921,7 +921,7 @@ function submitPrReview(
   ghSpawn: (args: string[]) => SpawnResult,
   prNumber: string,
   body: string,
-): void {
+): string | undefined {
   assertPrWritable(ghSpawn, prNumber);
   // The reviewing identity is the same GitHub App installation that authored
   // the PR, and GitHub rejects APPROVE/REQUEST_CHANGES on your own PR (422).
@@ -943,7 +943,19 @@ function submitPrReview(
     console.warn(`[post-push-review] Failed to submit ${event} review for PR #${prNumber}: ${resultDiagnostics(result)}`);
     console.warn(`[post-push-review] Native review request: endpoint=${endpoint} event=${event} bodyChars=${body.length} bodyPreview=${compactLogValue(body, 260)}`);
     logReviewFailureDiagnostics(ghSpawn, prNumber);
+    return undefined;
   }
+  try {
+    const url = new URL(stringProp(asRecord(JSON.parse(result.stdout)), "html_url"));
+    if (url.protocol === "https:" || url.protocol === "http:") {
+      return url.href.replace(/[<>\s()]/g, encodeURIComponent);
+    }
+  } catch { /* Keep the full status report when the review response has no usable link. */ }
+  return undefined;
+}
+
+function reviewReportForComment(reviewUrl: string | undefined, feedback: string): string {
+  return reviewUrl ? `[Full reviewer report](${reviewUrl})` : feedback;
 }
 
 function failedReviewOutputs(feedback: string) {
@@ -1163,11 +1175,16 @@ function configAdvisoryReviewers(
   });
 }
 
-function parseReviewerDefinitionVerdict(value: unknown): ReviewerVerdict {
+function parseReviewerDefinitionVerdict(value: unknown, schema: ReviewerDefinition["outputSchema"]): ReviewerVerdict {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("expected structured reviewer output to be an object");
   }
   const raw = value as { approved?: unknown; findings?: unknown; summary?: unknown; checks?: unknown };
+  for (const field of ["summary", "checks"] as const) {
+    if (Array.isArray(schema.required) && schema.required.includes(field) && raw[field] === undefined) {
+      throw new Error(`expected required report field ${field}`);
+    }
+  }
   if (typeof raw.approved !== "boolean") throw new Error("expected approved to be a boolean");
   if (!Array.isArray(raw.findings)) throw new Error("expected findings to be an array");
   const findings: ReviewerFinding[] = raw.findings.map((finding, index) => {
@@ -1224,15 +1241,19 @@ function parseReviewerDefinitionVerdict(value: unknown): ReviewerVerdict {
   };
 }
 
+function escapeReportHtml(text: string): string {
+  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
 function reviewerEvidenceReport(label: string, verdict: ReviewerVerdict): string {
   const status = verdict.findings.length === 0 ? "approved" : `${verdict.findings.length} finding(s)`;
   const heading = `${label}: ${status}`;
   const parts = [verdict.summary || verdict.checks?.length ? `**${heading}**` : heading];
-  if (verdict.summary) parts.push(verdict.summary);
+  if (verdict.summary) parts.push(escapeReportHtml(verdict.summary));
   if (verdict.checks?.length) {
     const resultLabels = { passed: "Passed", failed: "Failed", not_verified: "Not verified", not_applicable: "Not applicable" };
     parts.push("Checks:\n\n" + verdict.checks.map(check =>
-      `- **${check.check} - ${resultLabels[check.result]}:** ${check.evidence}`,
+      `- **${escapeReportHtml(check.check)} — ${resultLabels[check.result]}:** ${escapeReportHtml(check.evidence)}`,
     ).join("\n"));
   }
   return parts.join("\n\n");
@@ -1533,7 +1554,7 @@ async function runSelectedInternalReviewers(params: {
         };
         findings.push(...legacyFindings);
       } else {
-        verdict = parseReviewerDefinitionVerdict(reviewResult.structuredOutput);
+        verdict = parseReviewerDefinitionVerdict(reviewResult.structuredOutput, definition.outputSchema);
       }
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
@@ -1933,7 +1954,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
           logs_url: null,
         });
         const marker = `<!-- ai-implement post-push iter=${iteration} external-pending -->`;
-        submitPrReview(
+        const reviewUrl = submitPrReview(
           ghSpawn,
           prNumber,
           `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement internal review passed, but the external review did not complete within the wait budget. Manual review required.${internalReviewSummaryBlock(verdict.feedback)}`,
@@ -1941,7 +1962,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         postPrComment(
           ghSpawn,
           prNumber,
-          `${marker}\n⚠️ Internal review passed, but the external review did not complete within the wait budget. Not auto-approving.${internalReviewSummaryBlock(verdict.feedback)}\n\n**Merge readiness:** Manual review required; external review did not complete.`,
+          `${marker}\n⚠️ Internal review passed, but the external review did not complete within the wait budget. Not auto-approving.${internalReviewSummaryBlock(reviewReportForComment(reviewUrl, verdict.feedback))}\n\n**Merge readiness:** Manual review required; external review did not complete.`,
           marker,
         );
         break;
@@ -1964,7 +1985,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
           logs_url: null,
         });
         const marker = `<!-- ai-implement post-push iter=${iteration} invalid-external-review -->`;
-        submitPrReview(
+        const reviewUrl = submitPrReview(
           ghSpawn,
           prNumber,
           `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement internal review passed, but the external review verdict was unavailable or incomplete. Manual review required.${internalReviewSummaryBlock(verdict.feedback)}`,
@@ -1972,7 +1993,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         postPrComment(
           ghSpawn,
           prNumber,
-          `${marker}\n⚠️ Internal review passed, but the external review verdict was unavailable or incomplete. Not auto-approving.${internalReviewSummaryBlock(verdict.feedback)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${findingsUnavailableBlock(findingsUnavailable)}\n\n**Merge readiness:** Manual review required; external review verdict unavailable.`,
+          `${marker}\n⚠️ Internal review passed, but the external review verdict was unavailable or incomplete. Not auto-approving.${internalReviewSummaryBlock(reviewReportForComment(reviewUrl, verdict.feedback))}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${findingsUnavailableBlock(findingsUnavailable)}\n\n**Merge readiness:** Manual review required; external review verdict unavailable.`,
           marker,
         );
         break;
@@ -1996,11 +2017,11 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       if (approved) {
         terminationReason = "approved";
         const marker = `<!-- ai-implement post-push iter=${iteration} -->`;
-        submitPrReview(ghSpawn, prNumber, `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement post-push review approved this PR.${internalReviewSummaryBlock(verdict.feedback)}`);
+        const reviewUrl = submitPrReview(ghSpawn, prNumber, `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement post-push review approved this PR.${internalReviewSummaryBlock(verdict.feedback)}`);
         postPrComment(
           ghSpawn,
           prNumber,
-          `${marker}\n✅ Approved (${iteration} iteration${iteration > 1 ? "s" : ""}).\n\n${feedback}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${findingsUnavailableBlock(findingsUnavailable)}\n\n**Merge readiness:** Ready to merge.`,
+          `${marker}\n✅ Approved (${iteration} iteration${iteration > 1 ? "s" : ""}).\n\n${reviewReportForComment(reviewUrl, feedback)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${findingsUnavailableBlock(findingsUnavailable)}\n\n**Merge readiness:** Ready to merge.`,
           marker,
         );
         break;
@@ -2009,7 +2030,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       if (iteration >= maxIterations) {
         terminationReason = "iterations_exhausted";
         const marker = `<!-- ai-implement post-push iter=${iteration} -->`;
-        submitPrReview(
+        const reviewUrl = submitPrReview(
           ghSpawn,
           prNumber,
           `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement post-push review found unresolved blockers.\n\n${formatIssueList(issues)}${reviewFindingsCommentBlock(gatingExternalFindings)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${internalReviewSummaryBlock(verdict.feedback)}`,
@@ -2017,7 +2038,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         postPrComment(
           ghSpawn,
           prNumber,
-          `${marker}\n⚠️ Reached review cap (${maxIterations} iterations) without approval.${blockingIssuesBlock(issues)}${reviewFindingsCommentBlock(gatingExternalFindings)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${findingsUnavailableBlock(findingsUnavailable)}${reviewerSummaryBlock(feedback, issues)}\n\n**Merge readiness:** Not ready to merge.`,
+          `${marker}\n⚠️ Reached review cap (${maxIterations} iterations) without approval.${blockingIssuesBlock(issues)}${reviewFindingsCommentBlock(gatingExternalFindings)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${findingsUnavailableBlock(findingsUnavailable)}${reviewerSummaryBlock(reviewReportForComment(reviewUrl, feedback), issues)}\n\n**Merge readiness:** Not ready to merge.`,
           marker,
         );
         break;
@@ -2125,7 +2146,7 @@ ${requiredReviewFindingsBlock(gatingExternalFindings)}
       if (!status.stdout.trim()) {
         terminationReason = "no_changes";
         const marker = `<!-- ai-implement post-push iter=${iteration} no-changes -->`;
-        submitPrReview(
+        const reviewUrl = submitPrReview(
           ghSpawn,
           prNumber,
           `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement fix pass made no changes; blockers remain.${blockingIssuesBlock(issues, { heading: "Unresolved blocking issues:" })}${reviewFindingsCommentBlock(gatingExternalFindings)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${internalReviewSummaryBlock(verdict.feedback)}`,
@@ -2133,7 +2154,7 @@ ${requiredReviewFindingsBlock(gatingExternalFindings)}
         postPrComment(
           ghSpawn,
           prNumber,
-          `${marker}\n⚠️ Fix pass ${fixPassLabel(iteration, maxIterations)} completed with no file changes; stopping the post-push review loop.${blockingIssuesBlock(issues, { heading: "Unresolved blocking issues:" })}${reviewFindingsCommentBlock(gatingExternalFindings)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${reviewerSummaryBlock(feedback, issues)}\n\n**Merge readiness:** Not ready to merge.`,
+          `${marker}\n⚠️ Fix pass ${fixPassLabel(iteration, maxIterations)} completed with no file changes; stopping the post-push review loop.${blockingIssuesBlock(issues, { heading: "Unresolved blocking issues:" })}${reviewFindingsCommentBlock(gatingExternalFindings)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${reviewerSummaryBlock(reviewReportForComment(reviewUrl, feedback), issues)}\n\n**Merge readiness:** Not ready to merge.`,
           marker,
         );
         break;
