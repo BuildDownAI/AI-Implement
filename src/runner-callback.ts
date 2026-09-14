@@ -181,9 +181,11 @@ export function boundStatusText(text: string): string {
  * SENSITIVE_FILES_BLOCKED, REVIEW_UNAPPROVED and MAX_TURNS_EXHAUSTED are not part of the
  * BAC-27111 failure taxonomy (they are guardrail/policy outcomes, not classified failures),
  * so they are checked first and keep their existing wording regardless of `failure`.
- * Further coded outcomes that need wording of their own (the stage-retry rail's
- * REVIEWER_TURNS_EXHAUSTED and PROVIDER_UNAVAILABLE) slot in as additional `else if`
- * branches here, ahead of the structured-record fallthrough below.
+ * The stage-retry rail's REVIEWER_TURNS_EXHAUSTED and PROVIDER_UNAVAILABLE codes, by
+ * contrast, always arrive with a real `FailureRecord` carrying that exact `code` — their
+ * bespoke wording lives inside `classificationForFailure` itself (keyed on `failure.code`,
+ * checked ahead of its generic rendering), not as an `else if` branch here, so both this
+ * callback path and the monitor path pick it up through the one shared call below.
  * Otherwise, a structured `failure` record (BAC-27112) renders the full evidence comment;
  * `classifyCompletion` builds the identical body for a monitor-detected terminal job via
  * the same `classificationForFailure` helper.

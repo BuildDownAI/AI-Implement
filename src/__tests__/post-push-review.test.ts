@@ -464,6 +464,9 @@ describe("postPushReviewStep", () => {
       category: "invalid_output",
       code: "REVIEWER_TURNS_EXHAUSTED",
       retryable: false,
+      // Stamped from the resolved retryPolicy.reviewMaxTurns (AII-647) so the ticket-facing
+      // classification names the actual cap rather than always guessing DEFAULT_RETRY_POLICY's.
+      reviewMaxTurns: DEFAULT_RETRY_POLICY.reviewMaxTurns,
     }));
     expect(invoke).toHaveBeenCalledTimes(1);
     expect(report).toHaveBeenCalledWith(expect.objectContaining({
@@ -474,6 +477,22 @@ describe("postPushReviewStep", () => {
       }),
     }));
     expect(ghComments.some((c) => c.includes("reviewer-turns-exhausted") && c.includes("ran out of turns") && c.includes("(30)"))).toBe(true);
+  });
+
+  it("stamps a non-default reviewMaxTurns onto the REVIEWER_TURNS_EXHAUSTED record (AII-647)", async () => {
+    const invoke = vi.fn(async () => ({
+      ...structuredReviewResult({ approved: true, blocking_issues: [], score: 90, progress_delta: 100, feedback: "ok" }),
+      terminalStatus: { subtype: "error_max_turns", isError: true },
+      telemetry: { outcome: "max_turns" as const, numTurns: 45, durationMs: 60_000, costUsd: null, tokensIn: 10, tokensOut: 20 },
+    }));
+    const ctx = makeCtx(invoke, { retryPolicy: { ...DEFAULT_RETRY_POLICY, reviewMaxTurns: 45 } });
+
+    const out = await postPushReviewStep.run(ctx, {
+      prNumber: "42", workspaceDir: "/tmp", maxIterations: 3, reviewProviders: [],
+      ghSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
+    }, { report: vi.fn(async () => undefined) });
+
+    expect(out.failure).toEqual(expect.objectContaining({ code: "REVIEWER_TURNS_EXHAUSTED", reviewMaxTurns: 45 }));
   });
   it("routes a success-subtype max_turns telemetry outcome to REVIEWER_TURNS_EXHAUSTED, not LLM_OUTCOME_MISMATCH", async () => {
     const report = vi.fn(async () => undefined);

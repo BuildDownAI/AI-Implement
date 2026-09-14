@@ -910,6 +910,50 @@ describe("isFailureRecord", () => {
     ).toBe(false);
   });
 
+  it("accepts a record with reviewMaxTurns omitted", () => {
+    expect(
+      isFailureRecord({
+        category: "invalid_output",
+        code: "REVIEWER_TURNS_EXHAUSTED",
+        stage: "s",
+        attempt: 1,
+        retryable: false,
+        message: "m",
+        evidence: { truncated: false },
+      }),
+    ).toBe(true);
+  });
+
+  it("accepts a record whose reviewMaxTurns is a number", () => {
+    expect(
+      isFailureRecord({
+        category: "invalid_output",
+        code: "REVIEWER_TURNS_EXHAUSTED",
+        stage: "s",
+        attempt: 1,
+        retryable: false,
+        message: "m",
+        reviewMaxTurns: 45,
+        evidence: { truncated: false },
+      }),
+    ).toBe(true);
+  });
+
+  it("rejects a non-number reviewMaxTurns", () => {
+    expect(
+      isFailureRecord({
+        category: "invalid_output",
+        code: "REVIEWER_TURNS_EXHAUSTED",
+        stage: "s",
+        attempt: 1,
+        retryable: false,
+        message: "m",
+        reviewMaxTurns: "45",
+        evidence: { truncated: false },
+      }),
+    ).toBe(false);
+  });
+
   it("rejects a non-string captureError", () => {
     expect(
       isFailureRecord({
@@ -1011,5 +1055,47 @@ describe("projectFailureRecord", () => {
       evidence: { truncated: false },
     };
     expect(projectFailureRecord(record)).toEqual(record);
+  });
+
+  it("carries reviewMaxTurns through projection when set on a REVIEWER_TURNS_EXHAUSTED record (AII-647)", () => {
+    const record: FailureRecord = {
+      category: "invalid_output",
+      code: "REVIEWER_TURNS_EXHAUSTED",
+      stage: "post-push-review/review-1",
+      attempt: 1,
+      retryable: false,
+      message: "max_turns",
+      reviewMaxTurns: 45,
+      evidence: { truncated: false },
+    };
+    expect(projectFailureRecord(record)).toEqual(record);
+  });
+
+  it("still drops unrecognised keys when reviewMaxTurns is also present, rather than letting it smuggle other extras through", () => {
+    const withExtras = {
+      category: "invalid_output",
+      code: "REVIEWER_TURNS_EXHAUSTED",
+      stage: "s",
+      attempt: 1,
+      retryable: false,
+      message: "m",
+      reviewMaxTurns: 45,
+      evidence: { truncated: false },
+      alsoSneaky: "nope",
+    } as unknown as FailureRecord;
+
+    const projected = projectFailureRecord(withExtras);
+
+    expect(projected).toEqual({
+      category: "invalid_output",
+      code: "REVIEWER_TURNS_EXHAUSTED",
+      stage: "s",
+      attempt: 1,
+      retryable: false,
+      message: "m",
+      reviewMaxTurns: 45,
+      evidence: { truncated: false },
+    });
+    expect(projected).not.toHaveProperty("alsoSneaky");
   });
 });
