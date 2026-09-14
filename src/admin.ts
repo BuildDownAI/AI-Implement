@@ -2284,6 +2284,9 @@ export function upsertMappingAction(
   if (body.reviewers === undefined) {
     // Preserve stored value on omit — a PATCH-style save must not silently strip a project's reviewer list.
     reviewers = existingMapping?.reviewers ?? null;
+  } else if (body.reviewers === null) {
+    // Explicit null resets to the NULL default, mirroring dependencyTokenScope above.
+    reviewers = null;
   } else {
     try {
       reviewers = normalizeReviewers(body.reviewers);

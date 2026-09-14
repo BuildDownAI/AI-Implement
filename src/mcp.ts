@@ -265,7 +265,7 @@ export const WRITE_TOOLS: WriteTool[] = [
         dependencyTokenScope: { type: "string", enum: ["installation"] },
         reviewers: {
           type: "array",
-          description: "Which reviewers run on this project's PRs. Omit to keep the stored value; null/absent stored value means the default (gap-analysis and code-review, both gating).",
+          description: "Which reviewers run on this project's PRs. Omit to keep the stored value; pass null to reset to the default (gap-analysis and code-review, both gating).",
         },
       },
       required: ["teamKey", "owner", "repo", "defaultBranch"],

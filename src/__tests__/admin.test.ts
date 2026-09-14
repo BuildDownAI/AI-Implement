@@ -1413,6 +1413,21 @@ describe("admin mappings", () => {
     expect(JSON.parse(update.body).reviewers).toEqual([{ id: "gap-analysis", gates: true }]);
   });
 
+  it("resets reviewers to the null default via an explicit null", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", {
+      teamKey: "REV4", owner: "org", repo: "app",
+      reviewers: [{ id: "gap-analysis", gates: true }],
+    }, token);
+
+    const reset = await request("/api/mappings", "POST", "secret", {
+      teamKey: "REV4", owner: "org", repo: "app",
+      reviewers: null,
+    }, token);
+    expect(reset.statusCode).toBe(202);
+    expect(JSON.parse(reset.body).reviewers).toBeNull();
+  });
+
   it("rejects a non-array reviewers value with 400 naming reviewers", async () => {
     const token = await login("secret");
     const res = await request("/api/mappings", "POST", "secret", {
