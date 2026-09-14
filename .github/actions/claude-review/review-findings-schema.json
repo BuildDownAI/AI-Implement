@@ -1,0 +1,45 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "summary", "findings"],
+  "properties": {
+    "verdict": {
+      "type": "string",
+      "enum": ["approve", "changes_requested", "incomplete"],
+      "description": "Overall merge-readiness verdict. Use changes_requested when the PR should not merge yet; use incomplete when no trustworthy verdict can be reached."
+    },
+    "summary": {
+      "type": "string",
+      "description": "Free-text reviewer summary. Presentation only — carried into the posted comment verbatim, never parsed by the gate."
+    },
+    "findings": {
+      "type": "array",
+      "description": "Every issue worth surfacing, blocking or not. Empty when the diff looks fine.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["severity", "body"],
+        "properties": {
+          "severity": {
+            "type": "string",
+            "enum": ["blocking", "minor"],
+            "description": "Human-facing severity label. Consumer policy decides how findings affect gating."
+          },
+          "path": {
+            "type": "string",
+            "description": "File path when the finding is localised to a file in the diff. Omit when not applicable."
+          },
+          "line": {
+            "type": "integer",
+            "description": "One-based line number when the finding is localised to a line in the diff. Omit when not applicable."
+          },
+          "body": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Full, self-contained description of the issue. Never a bare '```' line on its own — that would close the comment's fenced sections early."
+          }
+        }
+      }
+    }
+  }
+}

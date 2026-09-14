@@ -70,52 +70,36 @@ jobs:
       # runs its own `git fetch` internally and needs the credential helper set
       # up by actions/checkout. We never run install/build/test steps on this
       # checkout, so the diff-reading flow doesn't execute untrusted code.
+      #
+      # This MUST run before the trusted-actions checkout below. actions/checkout
+      # defaults to `clean: true`, which runs `git clean -ffdx` in its target
+      # directory before fetching. Since this checkout targets the workspace
+      # root ('.'), and a later-added trusted-actions/ nested git checkout would
+      # be untracked from root's point of view, that clean would force-delete it
+      # (the double `-f` removes nested .git dirs too). Checking out the PR head
+      # into an empty root first, then adding trusted-actions/ afterward, avoids
+      # this — the trusted-actions checkout's own default clean only touches its
+      # own (empty) subdirectory.
       - uses: actions/checkout@v4
         with:
           ref: ${{ steps.pr.outputs.sha }}
           fetch-depth: 0
 
-      - name: Run Claude review
-        # Pinned to v1.0.217 (last known-good): floating @v1 moved to a build (0d0e0876) that broke the native binary install, failing every review within ~15s from 2026-09-08 22:20Z; upstream issue #1817 is still open and unresolved on later builds.
-        uses: anthropics/claude-code-action@9c5ddab2e6d17b83ea679153b31f1d5f023cf636  # v1.0.217
+      # Load the composite action from the repo's own trusted ref, not from the PR-head
+      # checkout above. `actions/checkout` with no `ref:` under pull_request_target checks
+      # out the BASE branch (the ref that triggered the workflow), never the PR head — so a
+      # fork PR (reachable here via the maintainer `/claude-review` comment path) cannot
+      # rewrite the composite action to run arbitrary steps with this job's secrets by
+      # editing .github/actions/claude-review in its own diff. Keep this checkout at a
+      # distinct path from the PR-head checkout above, and after it (see note above).
+      - name: Checkout trusted composite action
+        uses: actions/checkout@v4
         with:
-          allowed_bots: "*"
+          path: trusted-actions
+
+      - name: Run Claude review
+        uses: ./trusted-actions/.github/actions/claude-review
+        with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          trigger_phrase: "/claude-review"
-          track_progress: true
-          prompt: |
-            REPO: ${{ github.repository }}
-            PR NUMBER: ${{ steps.pr.outputs.number }}
-
-            Review the diff for this PR. Focus on:
-            - Correctness, edge cases, and likely bugs
-            - Security issues (especially around the GitHub Actions / secrets surface,
-              SQLite usage, GraphQL inputs, and shell escaping)
-            - Style consistency with the rest of the codebase (see CLAUDE.md)
-            - Test coverage gaps
-
-            Post a single sticky top-level comment with your review. Use inline
-            comments only for specific code-line issues. Be concise — skip praise
-            unless something is genuinely well-done. If the diff looks fine, say so
-            briefly.
-
-            At the very end of your top-level sticky comment, append a machine-readable
-            verdict block on a single line, EXACTLY in this format (no extra whitespace
-            inside the markers):
-            <!-- claude-review-verdict {"blocking":[{"body":"...","path":"src/x.ts","line":12}],"minor":[{"body":"..."}]} -->
-
-            Rules for the verdict block:
-            - blocking[]: issues that must be fixed before merge (bugs, security, missing
-              requirements, data-loss risks). These gate approval and trigger a fix cycle.
-            - minor[]: everything else (style, cosmetic, future-task suggestions). These
-              are surfaced to the human merging but never trigger an automated fix cycle.
-            - Each entry: {"body":"full self-contained description","path":"file/path","line":42}
-              — path and line are optional; body is required and must be self-contained.
-            - Shorthand: bare strings also accepted, e.g. {"blocking":["full description"]}
-            - If nothing blocking or minor, use empty arrays: {"blocking":[],"minor":[]}
-            - Do NOT omit the verdict block even if you have nothing to report.
-            - NEVER use the sequence --> inside a finding body — it terminates the HTML
-              comment in rendered Markdown and will corrupt the verdict block.
-          claude_args: |
-            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
+          pr_number: ${{ steps.pr.outputs.number }}
