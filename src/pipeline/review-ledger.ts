@@ -508,13 +508,15 @@ export function extractGithubActionsClaudeReviewFindings(body: string, url?: str
       continue;
     }
     if (boldHeading) {
-      flush();
-      severity = null;
       const trailingText = boldHeading[2].trim();
       const nextLine = nextMeaningfulLine(lines, index + 1);
-      if (isBoldFindingSectionLabel(boldHeading[1], trailingText, nextLine)) {
-        severity = classifyClaudeFindingHeading(boldHeading[1]);
+      if (!isBoldFindingSectionLabel(boldHeading[1], trailingText, nextLine)) {
+        if (severity) sectionLines.push(line);
+        continue;
       }
+
+      flush();
+      severity = classifyClaudeFindingHeading(boldHeading[1]);
       if (severity) {
         recognizedSections += 1;
         if (trailingText) sectionLines.push(trailingText);

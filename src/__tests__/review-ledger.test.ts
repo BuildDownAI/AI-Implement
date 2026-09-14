@@ -260,6 +260,35 @@ describe("extractGithubActionsClaudeReviewFindings", () => {
     });
   });
 
+  it("keeps a bold finding sentence as content inside an active blocking section", () => {
+    const body = [
+      "**Claude finished the review**",
+      "",
+      "### Review: PR #302",
+      "",
+      "### Blocking",
+      "",
+      "**Missing regression test for the actual vulnerability that was fixed.**",
+      "The existing test would pass under the vulnerable implementation.",
+      "",
+      "### Everything else",
+      "",
+      "No other changes are required.",
+    ].join("\n");
+
+    expect(extractGithubActionsClaudeReviewFindings(body, "https://example.com/review")).toEqual({
+      findings: [
+        {
+          source: "claude-review-summary",
+          severity: "blocking",
+          body: "Missing regression test for the actual vulnerability that was fixed. The existing test would pass under the vulnerable implementation.",
+          url: "https://example.com/review",
+        },
+      ],
+      findingsUnavailable: false,
+    });
+  });
+
   it("extracts a genuine defect bullet under a Must fix bold section label", () => {
     const body = [
       "**Claude finished the review**",
