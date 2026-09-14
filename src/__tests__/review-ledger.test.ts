@@ -1795,6 +1795,69 @@ describe("collectExternalReviewFindingsFromGh", () => {
     });
   });
 
+  it("keeps prose verdict provenance distinct from structured authority", () => {
+    const ghSpawn: GhSpawn = (args) => ({
+      exitCode: 0,
+      stdout: isIssueCommentsRequest(args)
+        ? JSON.stringify([{ user: { login: "github-actions[bot]", type: "Bot" }, body: PR557_THIRD_CLAUDE_ACTION_REVIEW }])
+        : "[]",
+    });
+    expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toMatchObject({
+      verdict: "approve",
+      verdictSource: "claude-review-summary",
+    });
+  });
+
+  it("returns the structured review contract verdict with review-contract provenance", () => {
+    const ghSpawn: GhSpawn = (args) => {
+      if (isPullReviewsRequest(args)) {
+        return { exitCode: 0, stdout: "[]" };
+      }
+
+      if (isIssueCommentsRequest(args)) {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify([
+            {
+              user: { login: "github-actions[bot]", type: "Bot" },
+              body: [
+                "```json review-findings",
+                JSON.stringify({
+                  schema: "review-findings/v1",
+                  verdict: "changes_requested",
+                  findings: [{ severity: "minor", body: "Contract nit" }],
+                }),
+                "```",
+              ].join("\n"),
+              html_url: "https://example.com/contract",
+            },
+          ]),
+        };
+      }
+
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({
+          data: { repository: { pullRequest: { reviewThreads: { nodes: [] } } } },
+        }),
+      };
+    };
+
+    expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual({
+      findings: [
+        {
+          source: "review-contract",
+          severity: "minor",
+          body: "Contract nit",
+          url: "https://example.com/contract",
+        },
+      ],
+      findingsUnavailable: false,
+      verdict: "changes_requested",
+      verdictSource: "review-contract",
+    });
+  });
+
   it("does not fall back to heading extraction when a trusted author's review-findings block is broken", () => {
     const ghSpawn: GhSpawn = (args) => {
       if (isPullReviewsRequest(args)) {
@@ -1837,6 +1900,8 @@ describe("collectExternalReviewFindingsFromGh", () => {
     expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual({
       findings: [],
       findingsUnavailable: true,
+      verdict: "incomplete",
+      verdictSource: "review-contract",
     });
   });
 

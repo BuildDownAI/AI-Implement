@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import type { ReviewerSelection } from "../../config.js";
 import { OperatorCancelledError, PrMergedError } from "../operator-cancelled.js";
 import type { LLMResult, PipelineContext, RunTelemetry, StepModule, StepReporter } from "../types.js";
 import { formatGitNameStatusSummary, terminalResultFailureMessage } from "../step-utils.js";
@@ -14,6 +15,7 @@ import {
   collectExternalReviewFindingsFromGh,
   formatReviewLedgerForPrompt,
   type ReviewLedgerFinding,
+  type ReviewLedgerSource,
 } from "../review-ledger.js";
 import { READ_ONLY_ALLOWED_TOOLS } from "./read-only-tools.js";
 
@@ -25,6 +27,8 @@ interface PostPushReviewInputs extends Record<string, unknown> {
   reviewProviders?: string[];
   /** Check-run names that identify the external review provider. Defaults to the Claude Code Review check. */
   reviewCheckNames?: string[];
+  /** Project reviewer selections. A later wiring issue passes this from the resolved mapping. */
+  reviewers?: ReviewerSelection[];
   /** Poll interval while waiting for the external review check to finish. */
   reviewWaitPollMs?: number;
   /** Total time to wait for an in-flight external review check before failing closed. */
@@ -132,6 +136,10 @@ interface ReviewIssue {
   problem: string;
   requiredFix: string;
   rawText?: string;
+}
+
+interface PostPushReviewLedgerFinding extends ReviewLedgerFinding {
+  issue?: ReviewIssue;
 }
 
 interface FixSummary {
@@ -304,20 +312,29 @@ ${finding.feedback || "(none)"}`;
   }).join("\n\n");
 }
 
-function externalReviewFindingsBlock(findings: ReviewLedgerFinding[]): string {
+function requiredReviewFindingsBlock(findings: ReviewLedgerFinding[]): string {
   if (findings.length === 0) return "";
   return `\n\nRequired external review findings:\n${formatReviewLedgerForPrompt(findings)}`;
 }
 
-function externalReviewFindingsCommentBlock(findings: ReviewLedgerFinding[]): string {
+function reviewFindingToIssue(finding: PostPushReviewLedgerFinding): ReviewIssue {
+  if (finding.issue) return finding.issue;
+  const location = finding.path
+    ? `${finding.path}${typeof finding.line === "number" ? `:${finding.line}` : ""}: `
+    : "";
+  return issueFromString(`${location}${finding.body}`);
+}
+
+function formatReviewFindingsAsIssueList(findings: PostPushReviewLedgerFinding[]): string {
+  return formatIssueList(findings.map(reviewFindingToIssue));
+}
+
+function reviewFindingsCommentBlock(findings: PostPushReviewLedgerFinding[], options?: { advisory?: boolean }): string {
   if (findings.length === 0) return "";
-  const issues = findings.map((finding) => {
-    const location = finding.path
-      ? `${finding.path}${typeof finding.line === "number" ? `:${finding.line}` : ""}: `
-      : "";
-    return issueFromString(`${location}${finding.body}`);
-  });
-  return `\n\nUnresolved external review findings:\n${formatIssueList(issues)}`;
+  const heading = options?.advisory
+    ? "Advisory external review findings (do not block merge):"
+    : "Unresolved external review findings:";
+  return `\n\n${heading}\n${formatReviewFindingsAsIssueList(findings)}`;
 }
 
 function extractCommentIdWithMarker(stdout: string, marker: string): number | null {
@@ -341,23 +358,71 @@ function extractCommentIdWithMarker(stdout: string, marker: string): number | nu
   return null;
 }
 
-function dedupeIssuesAgainstExternalFindings(
-  issues: ReviewIssue[],
+function claudeReviewSummaryGates(reviewers: ReviewerSelection[] | undefined): boolean {
+  return reviewers?.some((reviewer) => reviewer.id === "claude-review-summary" && reviewer.gates === true) ?? false;
+}
+
+export function isReviewLedgerFindingGating(
+  finding: Pick<ReviewLedgerFinding, "source">,
+  reviewers?: ReviewerSelection[],
+): boolean {
+  return isReviewLedgerSourceGating(finding.source, reviewers);
+}
+
+function isReviewLedgerSourceGating(source: ReviewLedgerSource, reviewers?: ReviewerSelection[]): boolean {
+  if (source === "claude-review-summary") return claudeReviewSummaryGates(reviewers);
+  return true;
+}
+
+function reviewIssueToLedgerFinding(issue: ReviewIssue): PostPushReviewLedgerFinding {
+  return {
+    source: "ai-implement-internal",
+    severity: "blocking",
+    body: postPushIssueText(issue),
+    issue,
+  };
+}
+
+function reviewLedgerFindingKeys(finding: PostPushReviewLedgerFinding): string[] {
+  const rawKeys = finding.issue
+    ? [finding.body, finding.issue.problem, finding.issue.rawText ?? ""]
+    : [finding.body];
+  return rawKeys.map(normalizeForComparison).filter(Boolean);
+}
+
+function buildReviewLedger(
+  internalIssues: ReviewIssue[],
   externalFindings: ReviewLedgerFinding[],
-): ReviewIssue[] {
-  const externalBodies = new Set(externalFindings.map((finding) => normalizeForComparison(finding.body)));
-  const seen = new Set<string>();
-  return issues.filter((issue) => {
-    const normalized = normalizeForComparison(postPushIssueText(issue));
-    const issueParts = [
-      normalized,
-      normalizeForComparison(issue.problem),
-      normalizeForComparison(issue.rawText ?? ""),
-    ].filter(Boolean);
-    if (!normalized || issueParts.some((part) => externalBodies.has(part)) || seen.has(normalized)) return false;
-    seen.add(normalized);
-    return true;
-  });
+  reviewers?: ReviewerSelection[],
+): PostPushReviewLedgerFinding[] {
+  const ledger: PostPushReviewLedgerFinding[] = [];
+  const indexByKey = new Map<string, number>();
+
+  for (const finding of [...internalIssues.map(reviewIssueToLedgerFinding), ...externalFindings]) {
+    const keys = reviewLedgerFindingKeys(finding);
+    if (keys.length === 0) continue;
+
+    const existingIndex = keys.map((key) => indexByKey.get(key)).find((index) => index !== undefined);
+    if (existingIndex !== undefined) {
+      const existing = ledger[existingIndex];
+      if (!isReviewLedgerFindingGating(existing, reviewers) && isReviewLedgerFindingGating(finding, reviewers)) {
+        ledger[existingIndex] = finding;
+      }
+      continue;
+    }
+
+    ledger.push(finding);
+    const index = ledger.length - 1;
+    for (const key of keys) indexByKey.set(key, index);
+  }
+
+  return ledger;
+}
+
+function internalIssuesFromReviewLedger(findings: PostPushReviewLedgerFinding[]): ReviewIssue[] {
+  return findings
+    .filter((finding) => finding.source === "ai-implement-internal")
+    .map(reviewFindingToIssue);
 }
 
 function suppressDuplicateExternalFeedback(feedback: string, externalFindings: ReviewLedgerFinding[]): string {
@@ -1243,9 +1308,6 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         : collectExternalReviewFindingsFromGh(ghSpawn, prNumber);
       const externalFindings = externalFindingsResult.findings;
       const findingsUnavailable = externalFindingsResult.findingsUnavailable;
-      // Approval is a zero-findings invariant. Severity controls presentation and
-      // prioritisation, not whether a reported Claude finding may be silently escaped.
-      const hasExternalFindings = externalFindings.length > 0;
 
       // CI gate: collect failing non-review checks so a red build can never produce
       // "Ready to merge". Uses the head SHA already resolved by waitForExternalReviewCompletion.
@@ -1253,23 +1315,33 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         ? findFailingCiChecks(ghSpawn, externalReviewResult.headSha, inputs.reviewCheckNames)
         : [];
 
-      feedback = suppressDuplicateExternalFeedback(verdict.feedback, externalFindings);
-      let issues = verdict.blockingIssues.map(issueFromVerdictIssue);
-      issues = dedupeIssuesAgainstExternalFindings(issues, externalFindings);
-      if (issues.length === 0 && verdict.approved === false && !hasExternalFindings) {
-        terminationReason = "invalid_review";
-        feedback = "Reviewer returned invalid structured review output: approved=false requires at least one blocking_issues[] entry.";
-        await reportInvalidStructuredReview(reporter, ghSpawn, prNumber, iteration, feedback, reviewResult.telemetry);
-        break;
-      }
-
-      // Inject failing CI checks as blocking issues so they appear in comments and fix prompts.
+      const internalIssues = verdict.blockingIssues.map(issueFromVerdictIssue);
       for (const checkName of failingCiChecks) {
-        issues.push({
+        internalIssues.push({
           title: "CI check failing",
           problem: `CI check '${checkName}' is failing on the current head`,
           requiredFix: `Fix the underlying defect causing '${checkName}' to fail`,
         });
+      }
+
+      const reviewLedger = buildReviewLedger(internalIssues, externalFindings, inputs.reviewers);
+      const gatingReviewFindings = reviewLedger.filter((finding) => isReviewLedgerFindingGating(finding, inputs.reviewers));
+      const advisoryReviewFindings = reviewLedger.filter((finding) => !isReviewLedgerFindingGating(finding, inputs.reviewers));
+      const gatingExternalFindings = gatingReviewFindings.filter((finding) => finding.source !== "ai-implement-internal");
+      const advisoryExternalFindings = advisoryReviewFindings.filter((finding) => finding.source !== "ai-implement-internal");
+      let issues = internalIssuesFromReviewLedger(gatingReviewFindings);
+      const externalReviewVerdictBlocks = externalFindingsResult.verdictSource === "review-contract"
+        && (externalFindingsResult.verdict === "changes_requested" || externalFindingsResult.verdict === "incomplete");
+      console.log(
+        `[post-push-review] Review ledger findings: gating=${gatingReviewFindings.length} advisory=${advisoryReviewFindings.length}`,
+      );
+
+      feedback = suppressDuplicateExternalFeedback(verdict.feedback, externalFindings);
+      if (issues.length === 0 && verdict.approved === false && gatingExternalFindings.length === 0 && !findingsUnavailable && !externalReviewVerdictBlocks) {
+        terminationReason = "invalid_review";
+        feedback = "Reviewer returned invalid structured review output: approved=false requires at least one blocking_issues[] entry.";
+        await reportInvalidStructuredReview(reporter, ghSpawn, prNumber, iteration, feedback, reviewResult.telemetry);
+        break;
       }
 
       // A close that lands while the reviewer call is in flight must not become an approved or
@@ -1279,8 +1351,9 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       // Fail closed: the internal verdict is clean and no blockers are visible, but the
       // external review check did not finish within the wait budget. Do not auto-approve
       // against a reviewer that is still in flight — defer to a human.
-      const internalApprovable = verdict.approved === true && issues.length === 0 && !hasExternalFindings;
-      if (internalApprovable && externalReviewPending) {
+      const cleanInternalNoGatingFindings = verdict.approved === true && issues.length === 0 && gatingExternalFindings.length === 0;
+      const internalApprovable = cleanInternalNoGatingFindings && !findingsUnavailable && !externalReviewVerdictBlocks;
+      if (cleanInternalNoGatingFindings && externalReviewPending) {
         terminationReason = "external_review_pending";
         feedback = "External review did not complete within the wait budget; not auto-approving.";
         await reporter.report({
@@ -1299,6 +1372,32 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
           ghSpawn,
           prNumber,
           `${marker}\n⚠️ Internal review passed, but the external review did not complete within the wait budget. Not auto-approving.\n\n**Merge readiness:** Manual review required; external review did not complete.`,
+          marker,
+        );
+        break;
+      }
+
+      if (cleanInternalNoGatingFindings && (findingsUnavailable || externalReviewVerdictBlocks)) {
+        terminationReason = "invalid_review";
+        feedback = externalReviewVerdictBlocks
+          ? "External review returned a structured verdict that blocks merge without machine-readable findings; not auto-approving."
+          : "External review findings could not be parsed; not auto-approving.";
+        await reporter.report({
+          id: `post-push-review.${iteration}`,
+          type: "custom",
+          status: "passed",
+          started_at: new Date().toISOString(),
+          ended_at: new Date().toISOString(),
+          parent_step_id: "post-push-review",
+          inputs: { iteration, prNumber },
+          outputs: { approved: false, feedback, issues: [], blockingIssues: [], telemetry: reviewResult.telemetry },
+          logs_url: null,
+        });
+        const marker = `<!-- ai-implement post-push iter=${iteration} invalid-external-review -->`;
+        postPrComment(
+          ghSpawn,
+          prNumber,
+          `${marker}\n⚠️ Internal review passed, but the external review verdict was unavailable or incomplete. Not auto-approving.${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${findingsUnavailableBlock(findingsUnavailable)}\n\n**Merge readiness:** Manual review required; external review verdict unavailable.`,
           marker,
         );
         break;
@@ -1326,7 +1425,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         postPrComment(
           ghSpawn,
           prNumber,
-          `${marker}\n✅ Approved (${iteration} iteration${iteration > 1 ? "s" : ""}).\n\n${feedback}${findingsUnavailableBlock(findingsUnavailable)}\n\n**Merge readiness:** Ready to merge.`,
+          `${marker}\n✅ Approved (${iteration} iteration${iteration > 1 ? "s" : ""}).\n\n${feedback}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${findingsUnavailableBlock(findingsUnavailable)}\n\n**Merge readiness:** Ready to merge.`,
           marker,
         );
         break;
@@ -1338,12 +1437,12 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         submitPrReview(
           ghSpawn,
           prNumber,
-          `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement post-push review found unresolved blockers.\n\n${formatIssueList(issues)}${externalReviewFindingsCommentBlock(externalFindings)}`,
+          `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement post-push review found unresolved blockers.\n\n${formatIssueList(issues)}${reviewFindingsCommentBlock(gatingExternalFindings)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}`,
         );
         postPrComment(
           ghSpawn,
           prNumber,
-          `${marker}\n⚠️ Reached review cap (${maxIterations} iterations) without approval.${blockingIssuesBlock(issues)}${externalReviewFindingsCommentBlock(externalFindings)}${findingsUnavailableBlock(findingsUnavailable)}${reviewerSummaryBlock(feedback, issues)}\n\n**Merge readiness:** Not ready to merge.`,
+          `${marker}\n⚠️ Reached review cap (${maxIterations} iterations) without approval.${blockingIssuesBlock(issues)}${reviewFindingsCommentBlock(gatingExternalFindings)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${findingsUnavailableBlock(findingsUnavailable)}${reviewerSummaryBlock(feedback, issues)}\n\n**Merge readiness:** Not ready to merge.`,
           marker,
         );
         break;
@@ -1353,7 +1452,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       postPrComment(
         ghSpawn,
         prNumber,
-        `${feedbackMarker}\n⚠️ Reviewer found issues — starting fix pass ${fixPassLabel(iteration, maxIterations)}...${blockingIssuesBlock(issues)}${externalReviewFindingsCommentBlock(externalFindings)}${findingsUnavailableBlock(findingsUnavailable)}${reviewerSummaryBlock(feedback, issues)}\n\n**Merge readiness:** Not ready to merge.`,
+        `${feedbackMarker}\n⚠️ Reviewer found issues — starting fix pass ${fixPassLabel(iteration, maxIterations)}...${blockingIssuesBlock(issues)}${reviewFindingsCommentBlock(gatingExternalFindings)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${findingsUnavailableBlock(findingsUnavailable)}${reviewerSummaryBlock(feedback, issues)}\n\n**Merge readiness:** Not ready to merge.`,
         feedbackMarker,
       );
 
@@ -1391,7 +1490,7 @@ ${issueList}
 
 Summary:
 ${feedback}
-${externalReviewFindingsBlock(externalFindings)}
+${requiredReviewFindingsBlock(gatingExternalFindings)}
 </reviewer_feedback>`;
 
       const fixResult = await context.llmExecutor.invoke({
@@ -1454,12 +1553,12 @@ ${externalReviewFindingsBlock(externalFindings)}
         submitPrReview(
           ghSpawn,
           prNumber,
-          `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement fix pass made no changes; blockers remain.${blockingIssuesBlock(issues, { heading: "Unresolved blocking issues:" })}${externalReviewFindingsCommentBlock(externalFindings)}`,
+          `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement fix pass made no changes; blockers remain.${blockingIssuesBlock(issues, { heading: "Unresolved blocking issues:" })}${reviewFindingsCommentBlock(gatingExternalFindings)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}`,
         );
         postPrComment(
           ghSpawn,
           prNumber,
-          `${marker}\n⚠️ Fix pass ${fixPassLabel(iteration, maxIterations)} completed with no file changes; stopping the post-push review loop.${blockingIssuesBlock(issues, { heading: "Unresolved blocking issues:" })}${externalReviewFindingsCommentBlock(externalFindings)}${reviewerSummaryBlock(feedback, issues)}\n\n**Merge readiness:** Not ready to merge.`,
+          `${marker}\n⚠️ Fix pass ${fixPassLabel(iteration, maxIterations)} completed with no file changes; stopping the post-push review loop.${blockingIssuesBlock(issues, { heading: "Unresolved blocking issues:" })}${reviewFindingsCommentBlock(gatingExternalFindings)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${reviewerSummaryBlock(feedback, issues)}\n\n**Merge readiness:** Not ready to merge.`,
           marker,
         );
         break;

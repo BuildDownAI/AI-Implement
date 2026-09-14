@@ -1,4 +1,5 @@
 import type { ReferenceRepo } from "../reference-repos.js";
+import type { ReviewerSelection } from "../config.js";
 
 import type { RetryPolicy } from "./retry-backoff.js";
 import type { FailureRecord } from "./failure-classification.js";
@@ -87,6 +88,8 @@ export interface PipelineContextData {
   referenceRepos?: ReferenceRepo[];
   /** Autonomous runner: optional reviewer rubric appended to the review prompt (e.g. kg-refresh-specific approval criteria). */
   reviewRubric?: string;
+  /** Autonomous runner: resolved project reviewer selection used by post-push review gating. */
+  reviewers?: ReviewerSelection[];
   /** Autonomous runner: short-lived read token minted by the dependency-auth step; set on context rather than returned as a step output so it is never persisted to the step log. */
   dependencyToken?: string;
   /** Autonomous runner: expiry timestamp for the dependency token (ISO 8601). */
