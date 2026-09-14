@@ -132,6 +132,12 @@ The lookup tries `.ts`, then `.js`, then `.mjs`, so the same override works unde
 
 Two resolvers exist and their extension orders differ, which matters only if you are reading the code. Overrides of a **registered** step — every built-in — go through `resolveModuleImport` in `src/pipeline/resolve-module.ts`, the `.ts`-first order above. `PipelineRunner.loadModule` uses `.js` first and has no `.mjs`, but it is only reached for a step id absent from the registry, so it never handles a built-in override.
 
+### Replacing a reviewer
+
+Place `custom/reviewers/<id>.ts` exporting a `ReviewerDefinition` (`src/pipeline/reviewers/registry.ts`) as its **default export**. It replaces the built-in reviewer registered under that id, resolved via the same `resolveModuleImport`, the same two custom roots, and the same `.ts`-then-`.js`-then-`.mjs` order as a step override. A file that exists but has no default export logs a warning and falls back to the built-in, exactly like a malformed step override.
+
+A reviewer definition supplies only a prompt builder, an output schema, and optional model/turn overrides — invocation, retry, verdict parsing, the findings ledger, and reporting stay with the post-push-review step. It has no `gates` field: whether a reviewer's verdict blocks a merge is a project setting on the mapping, not something a reviewer can grant itself.
+
 ### Replacing the pipeline
 
 Place `custom/pipelines/autonomous.yml`. It replaces the built-in definition wholesale. `applyWiring` still runs against it, so step ids that match built-in ids keep their standard wiring — and ids that do not match get nothing, per the footgun above.
