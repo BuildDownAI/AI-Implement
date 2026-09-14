@@ -25,6 +25,10 @@ everything from the repository makes a reviewer testable on the branch that writ
 lets a pull request delete `gap-analysis` and `code-review` from its own config and merge
 ungated — an outcome an agent told to get a PR green can reach by accident.
 
+Selection by id alone also leaves a gap: a later PR can rewrite the prompt of an already
+selected config reviewer to approve itself. Gating authority therefore needs a trusted
+definition as well as a trusted selection.
+
 ## Decision
 
 **One review step runs a list of reviewers. A reviewer is a definition, not a step.**
@@ -49,12 +53,24 @@ only when it has a trusted external reviewer that emits the contract of ADR 020.
 | Concern | Home | Reason |
 |---|---|---|
 | Which reviewers run, and which gate | Project settings, carried in `RunConfigV1` | Orchestrator-side. A pull request cannot reach it. |
-| Reviewer definitions — id, prompt, model, schema | `.ai-implement/config.yml` on the current branch | Version-controlled, reviewable in the pull request, testable on the branch that writes it. |
+| Gating config definitions — id, prompt, optional model | `.ai-implement/config.yml` from the repository's default branch, fetched through the forge API | A PR cannot rewrite the definition used to judge itself. The runner supplies the fixed output schema. |
+| Advisory config definitions — id, prompt, optional model | `.ai-implement/config.yml` on the current branch | Version-controlled, reviewable in the pull request, testable on the branch that writes it. |
 
 A reviewer defined on a branch but not selected in project settings still runs, as advisory.
-An author pushes a reviewer, opens a pull request, reads its findings there, and it gates only
-after someone selects it. A branch can add a reviewer. A branch cannot grant one the power to
-gate, and cannot remove a gating reviewer.
+A selected config reviewer with `gates: true` uses a snapshot of its default-branch definition
+for the run. Missing or unreadable trusted definitions fail closed; the branch definition is
+never a fallback for the gate. The snapshot is fetched independently of the workspace and
+survives deletion or modification of that reviewer's branch declaration.
+
+When a PR changes a selected gating reviewer's prompt or model, both versions run: the trusted
+default-branch version gates, and the changed branch version is an advisory preview. Identical
+definitions run once. Preview findings and failures remain advisory even though they share
+the selected reviewer's logical id, and their reports identify which version ran. A selected
+reviewer with `gates: false` uses the branch definition without an additional gating run.
+
+After a reviewer edit merges into the default branch, subsequent runs use the updated
+definition for gating. A new reviewer is testable as advisory before it is merged and selected.
+A branch can neither grant gating authority nor replace or remove the definition of its gate.
 
 A config-declared reviewer carries **data only** — no code — so it resolves after the clone
 step. A `custom/reviewers/<id>.ts` module carries code and stays image-baked. Selected
@@ -69,7 +85,10 @@ from the runner package's `import.meta.url`, never from the checked-out reposito
 - **Read reviewer selection from the branch.** Rejected: a pull request could delete its own
   gating reviewers. The failure is silent — the PR merges and the gate simply did not run.
 - **Read reviewer definitions from the default branch only.** Rejected: a new reviewer could
-  not be tested until it was merged, which is the same trap as the seed-once templates.
+  not be tested until it was merged. Default-branch definitions supply gating runs while
+  current-branch definitions remain testable as advisory previews.
+- **Use current-branch definitions after selecting their ids.** Rejected: selection protects
+  the name, but a PR can replace the selected prompt with instructions to approve itself.
 - **Select reviewers with Jira `run_config.profiles`.** Deferred. Profiles remain unused. Project
   settings already reach every tracker; profiles reach only Jira.
 - **Replace the in-loop reviewer too.** Deferred. It is uncapped and runs inside the feedback
@@ -82,10 +101,11 @@ from the runner package's `import.meta.url`, never from the checked-out reposito
   reviewer fails closed. The external check wait remains unchanged; the default internal
   selection supplies review coverage even when no external review workflow is present.
 - Reviewer cost is now per reviewer. Each carries its own `reviewMaxTurns`; one shared cap would
-  let a long code review starve a short gap analysis.
+  let a long code review starve a short gap analysis. Changed config definitions can add one
+  advisory preview invocation per reviewer; identical definitions do not duplicate the cost.
 - A fix pass addresses the whole findings ledger at once, ordered gap-analysis first, because a
   missing requirement changes the diff the code review then judges.
-- The two-home split is a new rule a reader will not guess. It is the reason a reviewer edit in
-  a pull request appears to do nothing to the gate.
+- The trusted/current-branch split lets authors inspect new review behavior without changing
+  the gate evaluating that PR. Reports distinguish the gating run from its advisory preview.
 - AII-361 asks for delegation in `custom/` rather than whole-module replacement. A reviewer
   definition is that shape, on one surface.

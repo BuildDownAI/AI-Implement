@@ -100,6 +100,8 @@ A benign terminal is an end of a run that is not a failure of the run: the PR wa
 
 A reviewer is one named definition that asks one question about a PR. It supplies an id, a prompt, an output schema, and optional model and turn-cap overrides. Project selection determines whether it gates. The review step runs it; the reviewer owns no machinery of its own.
 
+A gating config reviewer uses its trusted default-branch definition. A changed branch definition runs separately as an advisory preview; identical definitions run once. Preview findings cannot inherit gating authority merely by sharing the selected reviewer's id.
+
 **Not to be confused with:** The review step, which invokes every selected reviewer and owns retry, parsing, and reporting. Also not a person reviewing on the forge.
 
 ## Review finding
