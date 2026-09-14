@@ -392,20 +392,21 @@ describe("GHA workflow shims", () => {
       expect(yaml).toMatch(/GITHUB_REPOSITORY_OWNER is empty/);
     });
 
-    it(`${f} masks runner progress tokens via env: before the container step uses them`, () => {
+    it(`${f} masks runner progress tokens from the event file before consumers use them`, () => {
       const yaml = readFileSync(f, "utf-8");
       const doc = parse(yaml) as any;
       const jobs = Object.values(doc.jobs) as any[];
       const containerJob = jobs.find((j: any) => j.container);
       const maskStep = containerJob.steps.find((s: any) => s.name === "Mask runner callback tokens");
       expect(maskStep).toBeDefined();
-      expect(maskStep.env?.RUN_PROGRESS_TOKEN).toBe("${{ inputs.run_progress_token }}");
-      expect(maskStep.run).toContain("::add-mask::$RUN_PROGRESS_TOKEN");
+      expect(maskStep.env).toBeUndefined();
+      expect(maskStep.run).toContain(".run_progress_token");
+      expect(maskStep.run).toContain("GITHUB_EVENT_PATH");
       expect(maskStep.run).not.toContain("inputs.run_progress_token");
       expect(yaml.indexOf("Mask runner callback tokens")).toBeLessThan(yaml.indexOf("Run pipeline"));
     });
 
-    it(`${f} accepts and masks a dedicated publication token via env:, exposed only to mask and pipeline steps`, () => {
+    it(`${f} masks the publication token from the event file and exposes it only to the pipeline`, () => {
       const yaml = readFileSync(f, "utf-8");
       const doc = parse(yaml) as any;
       expect(doc.on.workflow_dispatch.inputs.run_publication_token).toBeDefined();
@@ -415,14 +416,14 @@ describe("GHA workflow shims", () => {
       const jobs = Object.values(doc.jobs) as any[];
       const containerJob = jobs.find((j: any) => j.container);
       const maskStep = containerJob.steps.find((s: any) => s.name === "Mask runner callback tokens");
-      expect(maskStep.env?.RUN_PUBLICATION_TOKEN).toBe("${{ inputs.run_publication_token }}");
-      expect(maskStep.run).toContain("::add-mask::$RUN_PUBLICATION_TOKEN");
+      expect(maskStep.env).toBeUndefined();
+      expect(maskStep.run).toContain(".run_publication_token");
       expect(maskStep.run).not.toContain("inputs.run_publication_token");
 
       const pipelineStep = doc.jobs.implement.steps.find((step: any) => step.name === "Run pipeline");
       expect(pipelineStep.env.RUN_PUBLICATION_TOKEN).toBe("${{ inputs.run_publication_token }}");
       const otherSteps = doc.jobs.implement.steps.filter(
-        (step: any) => step.name !== "Run pipeline" && step.name !== "Mask runner callback tokens",
+        (step: any) => step.name !== "Run pipeline",
       );
       expect(JSON.stringify(otherSteps)).not.toContain("RUN_PUBLICATION_TOKEN");
     });
@@ -577,14 +578,15 @@ describe("GHA workflow shims", () => {
 
   // Print dispatch inputs step tests (BAC-25597)
   for (const f of IMPLEMENT_WORKFLOWS) {
-    it(`${f} has Print dispatch inputs as the first step of the implement job`, () => {
+    it(`${f} masks tokens before Print dispatch inputs in the implement job`, () => {
       const doc = parse(readFileSync(f, "utf-8")) as any;
-      expect(doc.jobs.implement.steps[0].name).toBe("Print dispatch inputs");
+      expect(doc.jobs.implement.steps[0].name).toBe("Mask runner callback tokens");
+      expect(doc.jobs.implement.steps[1].name).toBe("Print dispatch inputs");
     });
 
     it(`${f} Print dispatch inputs never passes run_token or run_progress_token as raw expressions`, () => {
       const doc = parse(readFileSync(f, "utf-8")) as any;
-      const printStep = doc.jobs.implement.steps[0];
+      const printStep = doc.jobs.implement.steps.find((step: any) => step.name === "Print dispatch inputs");
       expect(printStep.name).toBe("Print dispatch inputs");
       const stepStr = JSON.stringify(printStep);
       expect(stepStr).not.toContain("inputs.run_token }}");
@@ -594,14 +596,15 @@ describe("GHA workflow shims", () => {
   }
 
   for (const f of PLANNING_WORKFLOWS) {
-    it(`${f} has Print dispatch inputs as the first step of the plan job`, () => {
+    it(`${f} masks tokens before Print dispatch inputs in the plan job`, () => {
       const doc = parse(readFileSync(f, "utf-8")) as any;
-      expect(doc.jobs.plan.steps[0].name).toBe("Print dispatch inputs");
+      expect(doc.jobs.plan.steps[0].name).toBe("Mask runner callback tokens");
+      expect(doc.jobs.plan.steps[1].name).toBe("Print dispatch inputs");
     });
 
     it(`${f} Print dispatch inputs never passes run_token as a raw expression`, () => {
       const doc = parse(readFileSync(f, "utf-8")) as any;
-      const printStep = doc.jobs.plan.steps[0];
+      const printStep = doc.jobs.plan.steps.find((step: any) => step.name === "Print dispatch inputs");
       expect(printStep.name).toBe("Print dispatch inputs");
       const stepStr = JSON.stringify(printStep);
       expect(stepStr).not.toContain("inputs.run_token }}");

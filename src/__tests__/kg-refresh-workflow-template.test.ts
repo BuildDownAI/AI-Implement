@@ -74,8 +74,9 @@ describe("claude-implement.yml template — runner_phase and runner_callback_url
   it("masks run_progress_token in the Mask runner callback tokens step (regression guard)", () => {
     const step = getMaskStep();
     expect(step).toBeDefined();
-    expect(step.env?.RUN_PROGRESS_TOKEN).toContain("run_progress_token");
-    expect(step.run).toContain("::add-mask::$RUN_PROGRESS_TOKEN");
+    expect(step.env).toBeUndefined();
+    expect(step.run).toContain(".run_progress_token");
+    expect(step.run).toContain("GITHUB_EVENT_PATH");
     expect(step.run).not.toContain("inputs.run_progress_token");
   });
 
