@@ -36,12 +36,11 @@ function contentsApiResponse(fileBody: string): Record<string, unknown> {
   };
 }
 
-function mockContentsFetch(status: number, body: Record<string, unknown> | null): ReturnType<typeof vi.fn> {
-  return vi.fn().mockResolvedValue({
-    ok: status >= 200 && status < 300,
-    status,
-    json: async () => body,
-  });
+function mockContentsFetch(status: number, body?: unknown): ReturnType<typeof vi.fn<typeof fetch>> {
+  return vi.fn<typeof fetch>(async () => new Response(
+    body === undefined ? "" : JSON.stringify(body),
+    { status },
+  ));
 }
 
 afterEach(() => {
@@ -209,10 +208,12 @@ describe("installStep reviewers output", () => {
     );
 
     expect(fetchImpl).toHaveBeenCalledOnce();
-    const [url, options] = fetchImpl.mock.calls[0];
-    expect(url).toBe("https://api.github.com/repos/acme/app/contents/.ai-implement/config.yml");
-    expect(String(url)).not.toContain("ref=");
-    expect(options.headers.Authorization).toBe("Bearer ghs_secret");
+    const firstCall = fetchImpl.mock.calls[0]!;
+    expect(firstCall[0]).toBe("https://api.github.com/repos/acme/app/contents/.ai-implement/config.yml");
+    expect(String(firstCall[0])).not.toContain("ref=");
+    expect(firstCall[1]).toEqual(expect.objectContaining({
+      headers: expect.objectContaining({ Authorization: "Bearer ghs_secret" }),
+    }));
     expect(reviewerPrompt(outputs.reviewers![0]!)).toBe("malicious PR prompt");
     expect(outputs.trustedConfigReviewers.map((reviewer) => ({ id: reviewer.id, model: reviewer.model }))).toEqual([
       { id: "domain-review", model: "claude-sonnet-5" },
@@ -241,9 +242,11 @@ describe("installStep reviewers output", () => {
       {} as never,
     );
 
-    const [url, options] = fetchImpl.mock.calls[0];
-    expect(url).toBe("https://api.github.com/repos/acme/app/contents/.ai-implement/config.yml");
-    expect(options.headers.Authorization).toBe("Bearer fresh-token");
+    const firstCall = fetchImpl.mock.calls[0]!;
+    expect(firstCall[0]).toBe("https://api.github.com/repos/acme/app/contents/.ai-implement/config.yml");
+    expect(firstCall[1]).toEqual(expect.objectContaining({
+      headers: expect.objectContaining({ Authorization: "Bearer fresh-token" }),
+    }));
   });
 
   it("fetches trusted config even when the PR branch deletes the local config entry", async () => {
@@ -322,10 +325,10 @@ describe("installStep reviewers output", () => {
   it.each([
     ["missing GitHub context", {}, undefined],
     ["transport error", { githubOwner: "acme", githubRepo: "app", githubToken: "ghs_secret" }, vi.fn().mockRejectedValue(new Error("offline"))],
-    ["missing default config", { githubOwner: "acme", githubRepo: "app", githubToken: "ghs_secret" }, mockContentsFetch(404, null)],
-    ["HTTP error", { githubOwner: "acme", githubRepo: "app", githubToken: "ghs_secret" }, mockContentsFetch(500, null)],
-    ["missing JSON body", { githubOwner: "acme", githubRepo: "app", githubToken: "ghs_secret" }, mockContentsFetch(200, null)],
-    ["array JSON body", { githubOwner: "acme", githubRepo: "app", githubToken: "ghs_secret" }, mockContentsFetch(200, [] as unknown as Record<string, unknown>)],
+    ["missing default config", { githubOwner: "acme", githubRepo: "app", githubToken: "ghs_secret" }, mockContentsFetch(404)],
+    ["HTTP error", { githubOwner: "acme", githubRepo: "app", githubToken: "ghs_secret" }, mockContentsFetch(500)],
+    ["null JSON body", { githubOwner: "acme", githubRepo: "app", githubToken: "ghs_secret" }, mockContentsFetch(200, null)],
+    ["array JSON body", { githubOwner: "acme", githubRepo: "app", githubToken: "ghs_secret" }, mockContentsFetch(200, [])],
     ["malformed contents response", { githubOwner: "acme", githubRepo: "app", githubToken: "ghs_secret" }, mockContentsFetch(200, { type: "dir", encoding: "base64", content: "" })],
     ["malformed YAML", { githubOwner: "acme", githubRepo: "app", githubToken: "ghs_secret" }, mockContentsFetch(200, contentsApiResponse("reviewers: ["))],
     ["missing selected reviewer", { githubOwner: "acme", githubRepo: "app", githubToken: "ghs_secret" }, mockContentsFetch(200, contentsApiResponse("reviewers:\n  - id: other-review\n    prompt: other\n"))],
