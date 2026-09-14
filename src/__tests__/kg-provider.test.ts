@@ -220,6 +220,287 @@ describe("SidecarMemoryProvider", () => {
   });
 });
 
+// ---- SidecarMemoryProvider: MCP session handling (AII-649) ----
+
+describe("SidecarMemoryProvider session handling", () => {
+  let mockHttpRequest: ReturnType<typeof vi.fn>;
+  let consoleErrorSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    mockHttpRequest = vi.fn();
+    vi.spyOn(http, "request").mockImplementation(mockHttpRequest as never);
+    consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  /** Queues the next `http.request` call to resolve with the given status/body/headers. */
+  function queueResponse(status: number, body: string, headers: Record<string, string> = {}): PassThrough {
+    const proxyReq = new PassThrough();
+    const proxyRes = new PassThrough();
+    Object.assign(proxyRes, { statusCode: status, headers: { "content-type": "application/json", ...headers } });
+    mockHttpRequest.mockImplementationOnce((_opts: unknown, cb: (res: unknown) => void) => {
+      process.nextTick(() => {
+        cb(proxyRes);
+        proxyRes.push(body);
+        proxyRes.push(null);
+      });
+      return proxyReq;
+    });
+    return proxyReq;
+  }
+
+  /** Queues the next `http.request` call to fail at the connection level. */
+  function queueConnectionError(code: string): void {
+    const proxyReq = new PassThrough();
+    mockHttpRequest.mockImplementationOnce(() => {
+      process.nextTick(() => {
+        proxyReq.emit("error", Object.assign(new Error(code), { code }));
+      });
+      return proxyReq;
+    });
+  }
+
+  function fakeReq(headers: http.IncomingHttpHeaders = {}, method = "POST"): http.IncomingMessage {
+    return { headers, method } as unknown as http.IncomingMessage;
+  }
+
+  interface FakeRes {
+    headersSent: boolean;
+    statusCode?: number;
+    headers?: http.OutgoingHttpHeaders;
+    body?: Buffer;
+  }
+
+  function fakeRes(): http.ServerResponse & FakeRes {
+    const res: FakeRes & { writeHead: unknown; end: unknown; destroy: unknown } = {
+      headersSent: false,
+      writeHead(status: number, headers: http.OutgoingHttpHeaders) {
+        res.headersSent = true;
+        res.statusCode = status;
+        res.headers = headers;
+      },
+      end(chunk?: Buffer) {
+        res.body = chunk;
+      },
+      destroy() {
+        // no-op
+      },
+    };
+    return res as unknown as http.ServerResponse & FakeRes;
+  }
+
+  async function waitUntil(cond: () => boolean, timeoutMs = 1000): Promise<void> {
+    const start = Date.now();
+    while (!cond()) {
+      if (Date.now() - start > timeoutMs) throw new Error("waitUntil timed out");
+      await new Promise((r) => setTimeout(r, 0));
+    }
+  }
+
+  const MISSING_SESSION_BODY = JSON.stringify({
+    jsonrpc: "2.0",
+    id: 1,
+    error: { code: -32600, message: "Bad Request: Missing session ID" },
+  });
+
+  const toolsResult = (tools: unknown[]) => JSON.stringify({ jsonrpc: "2.0", id: 1, result: { tools } });
+
+  // (a) stateless sidecar → one POST, no initialize
+  it("stateless sidecar: listTools makes exactly one request and never negotiates a session", async () => {
+    queueResponse(200, toolsResult([{ name: "kg_search" }]));
+    const p = new SidecarMemoryProvider("http://127.0.0.1:8765/mcp");
+    const result = await p.listTools(Buffer.from("{}"), {});
+    expect(result).toEqual([{ name: "kg_search" }]);
+    expect(mockHttpRequest).toHaveBeenCalledTimes(1);
+    expect(consoleErrorSpy).not.toHaveBeenCalled();
+  });
+
+  it("stateless sidecar: proxyCall forwards the response in a single request", async () => {
+    queueResponse(200, JSON.stringify({ jsonrpc: "2.0", id: 1, result: { content: [] } }));
+    const p = new SidecarMemoryProvider("http://127.0.0.1:8765/mcp");
+    const req = fakeReq();
+    const res = fakeRes();
+    p.proxyCall(req, res, Buffer.from("{}"));
+    await waitUntil(() => res.headersSent);
+    expect(mockHttpRequest).toHaveBeenCalledTimes(1);
+    expect(res.statusCode).toBe(200);
+    expect(res.body?.toString()).toContain('"content":[]');
+  });
+
+  // (b) 400 Missing session ID → initialize → retry with header → 200 tools listed
+  it("listTools: 400 Missing session ID triggers initialize, then retries with the session header", async () => {
+    queueResponse(400, MISSING_SESSION_BODY);
+    queueResponse(200, JSON.stringify({ jsonrpc: "2.0", id: 1, result: {} }), { "mcp-session-id": "sess-1" });
+    queueResponse(200, JSON.stringify({ jsonrpc: "2.0", result: {} }));
+    queueResponse(200, toolsResult([{ name: "kg_search" }, { name: "kg_hybrid_search" }]));
+
+    const p = new SidecarMemoryProvider("http://127.0.0.1:8765/mcp");
+    const result = await p.listTools(Buffer.from("{}"), {});
+
+    expect(result).toEqual([{ name: "kg_search" }, { name: "kg_hybrid_search" }]);
+    expect(mockHttpRequest).toHaveBeenCalledTimes(4);
+    const retryOpts = mockHttpRequest.mock.calls[3][0] as { headers: Record<string, unknown> };
+    expect(retryOpts.headers["mcp-session-id"]).toBe("sess-1");
+    expect(consoleErrorSpy).toHaveBeenCalledWith(
+      expect.stringContaining("KG sidecar demanded a session; initialized (id sess-1) and retried"),
+    );
+  });
+
+  it("listTools: strips authorization from the initialize and notifications/initialized requests", async () => {
+    queueResponse(400, MISSING_SESSION_BODY);
+    queueResponse(200, JSON.stringify({ jsonrpc: "2.0", id: 1, result: {} }), { "mcp-session-id": "sess-9" });
+    queueResponse(200, JSON.stringify({ jsonrpc: "2.0", result: {} }));
+    queueResponse(200, toolsResult([]));
+
+    const p = new SidecarMemoryProvider("http://127.0.0.1:8765/mcp");
+    await p.listTools(Buffer.from("{}"), { authorization: "Bearer secret" });
+
+    const initOpts = mockHttpRequest.mock.calls[1][0] as { headers: Record<string, unknown> };
+    const notifyOpts = mockHttpRequest.mock.calls[2][0] as { headers: Record<string, unknown> };
+    expect(initOpts.headers.authorization).toBeUndefined();
+    expect(notifyOpts.headers.authorization).toBeUndefined();
+  });
+
+  it("proxyCall: strips authorization and cookie from the initialize request", async () => {
+    queueResponse(400, MISSING_SESSION_BODY);
+    queueResponse(200, JSON.stringify({ jsonrpc: "2.0", id: 1, result: {} }), { "mcp-session-id": "sess-10" });
+    queueResponse(200, JSON.stringify({ jsonrpc: "2.0", result: {} }));
+    queueResponse(200, JSON.stringify({ jsonrpc: "2.0", id: 2, result: { content: [] } }));
+
+    const p = new SidecarMemoryProvider("http://127.0.0.1:8765/mcp");
+    const req = fakeReq({ authorization: "Bearer secret", cookie: "sid=abc" });
+    const res = fakeRes();
+    p.proxyCall(req, res, Buffer.from("{}"));
+    await waitUntil(() => res.headersSent);
+
+    const initOpts = mockHttpRequest.mock.calls[1][0] as { headers: Record<string, unknown> };
+    expect(initOpts.headers.authorization).toBeUndefined();
+    expect(initOpts.headers.cookie).toBeUndefined();
+  });
+
+  // (c) proxyCall reuses the stored session id
+  it("proxyCall reuses a session id already stored on the provider (no initialize)", async () => {
+    const p = new SidecarMemoryProvider("http://127.0.0.1:8765/mcp");
+    (p as unknown as { sessionId: string | null }).sessionId = "existing-session";
+
+    queueResponse(200, JSON.stringify({ jsonrpc: "2.0", id: 1, result: { content: [] } }));
+    const req = fakeReq();
+    const res = fakeRes();
+    p.proxyCall(req, res, Buffer.from("{}"));
+    await waitUntil(() => res.headersSent);
+
+    expect(mockHttpRequest).toHaveBeenCalledTimes(1);
+    const opts = mockHttpRequest.mock.calls[0][0] as { headers: Record<string, unknown> };
+    expect(opts.headers["mcp-session-id"]).toBe("existing-session");
+  });
+
+  it("a session established via listTools is reused by a subsequent proxyCall", async () => {
+    queueResponse(400, MISSING_SESSION_BODY);
+    queueResponse(200, JSON.stringify({ jsonrpc: "2.0", id: 1, result: {} }), { "mcp-session-id": "sess-2" });
+    queueResponse(200, JSON.stringify({ jsonrpc: "2.0", result: {} }));
+    queueResponse(200, toolsResult([{ name: "kg_search" }]));
+
+    const p = new SidecarMemoryProvider("http://127.0.0.1:8765/mcp");
+    await p.listTools(Buffer.from("{}"), {});
+    expect(mockHttpRequest).toHaveBeenCalledTimes(4);
+
+    queueResponse(200, JSON.stringify({ jsonrpc: "2.0", id: 2, result: { content: [] } }));
+    const req = fakeReq();
+    const res = fakeRes();
+    p.proxyCall(req, res, Buffer.from("{}"));
+    await waitUntil(() => res.headersSent);
+
+    expect(mockHttpRequest).toHaveBeenCalledTimes(5);
+    const opts = mockHttpRequest.mock.calls[4][0] as { headers: Record<string, unknown> };
+    expect(opts.headers["mcp-session-id"]).toBe("sess-2");
+  });
+
+  it("a session established via proxyCall is reused by a subsequent listTools call", async () => {
+    queueResponse(400, MISSING_SESSION_BODY);
+    queueResponse(200, JSON.stringify({ jsonrpc: "2.0", id: 1, result: {} }), { "mcp-session-id": "sess-3" });
+    queueResponse(200, JSON.stringify({ jsonrpc: "2.0", result: {} }));
+    queueResponse(200, JSON.stringify({ jsonrpc: "2.0", id: 2, result: { content: [] } }));
+
+    const p = new SidecarMemoryProvider("http://127.0.0.1:8765/mcp");
+    const req = fakeReq();
+    const res = fakeRes();
+    p.proxyCall(req, res, Buffer.from("{}"));
+    await waitUntil(() => res.headersSent);
+    expect(mockHttpRequest).toHaveBeenCalledTimes(4);
+
+    queueResponse(200, toolsResult([{ name: "kg_search" }]));
+    const result = await p.listTools(Buffer.from("{}"), {});
+    expect(result).toEqual([{ name: "kg_search" }]);
+    expect(mockHttpRequest).toHaveBeenCalledTimes(5);
+    const opts = mockHttpRequest.mock.calls[4][0] as { headers: Record<string, unknown> };
+    expect(opts.headers["mcp-session-id"]).toBe("sess-3");
+  });
+
+  // (d) 404 on a stale session → one re-initialize → success
+  it("listTools: 404 on a stale session re-initializes once and succeeds", async () => {
+    const p = new SidecarMemoryProvider("http://127.0.0.1:8765/mcp");
+    (p as unknown as { sessionId: string | null }).sessionId = "stale-id";
+
+    queueResponse(404, JSON.stringify({ jsonrpc: "2.0", id: 1, error: { code: -32001, message: "session not found" } }));
+    queueResponse(200, JSON.stringify({ jsonrpc: "2.0", id: 1, result: {} }), { "mcp-session-id": "fresh-id" });
+    queueResponse(200, JSON.stringify({ jsonrpc: "2.0", result: {} }));
+    queueResponse(200, toolsResult([{ name: "kg_search" }]));
+
+    const result = await p.listTools(Buffer.from("{}"), {});
+
+    expect(result).toEqual([{ name: "kg_search" }]);
+    expect(mockHttpRequest).toHaveBeenCalledTimes(4);
+    expect((p as unknown as { sessionId: string | null }).sessionId).toBe("fresh-id");
+
+    const firstOpts = mockHttpRequest.mock.calls[0][0] as { headers: Record<string, unknown> };
+    expect(firstOpts.headers["mcp-session-id"]).toBe("stale-id");
+    const retryOpts = mockHttpRequest.mock.calls[3][0] as { headers: Record<string, unknown> };
+    expect(retryOpts.headers["mcp-session-id"]).toBe("fresh-id");
+  });
+
+  // (e) initialize itself fails → the original error is surfaced once, no loop
+  it("listTools: a failed initialize resolves to [] with no third attempt", async () => {
+    queueResponse(400, MISSING_SESSION_BODY);
+    queueConnectionError("ECONNREFUSED");
+
+    const p = new SidecarMemoryProvider("http://127.0.0.1:8765/mcp");
+    const result = await p.listTools(Buffer.from("{}"), {});
+    expect(result).toEqual([]);
+    expect(mockHttpRequest).toHaveBeenCalledTimes(2);
+  });
+
+  it("proxyCall: a failed initialize writes a 502 with no third attempt", async () => {
+    queueResponse(400, MISSING_SESSION_BODY);
+    queueConnectionError("ECONNREFUSED");
+
+    const p = new SidecarMemoryProvider("http://127.0.0.1:8765/mcp");
+    const req = fakeReq();
+    const res = fakeRes();
+    p.proxyCall(req, res, Buffer.from("{}"));
+    await waitUntil(() => res.headersSent);
+
+    expect(mockHttpRequest).toHaveBeenCalledTimes(2);
+    expect(res.statusCode).toBe(502);
+  });
+
+  // Defensive: a pathological sidecar that still rejects after the handshake must not loop
+  it("listTools: a session error on the retry itself does not trigger a second initialize", async () => {
+    queueResponse(400, MISSING_SESSION_BODY);
+    queueResponse(200, JSON.stringify({ jsonrpc: "2.0", id: 1, result: {} }), { "mcp-session-id": "sess-4" });
+    queueResponse(200, JSON.stringify({ jsonrpc: "2.0", result: {} }));
+    queueResponse(400, MISSING_SESSION_BODY);
+
+    const p = new SidecarMemoryProvider("http://127.0.0.1:8765/mcp");
+    const result = await p.listTools(Buffer.from("{}"), {});
+
+    expect(result).toEqual([]);
+    expect(mockHttpRequest).toHaveBeenCalledTimes(4);
+  });
+});
+
 // ---- Stub second provider (contract test) ----
 
 class StubMemoryProvider implements MemoryProvider {

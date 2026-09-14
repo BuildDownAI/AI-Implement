@@ -79,6 +79,33 @@ function writeJson(res: http.ServerResponse, status: number, data: unknown): voi
   res.end(JSON.stringify(data));
 }
 
+type SidecarHeaders = Record<string, string | string[] | undefined>;
+
+type SidecarPostResult =
+  | { ok: true; status: number; headers: http.IncomingHttpHeaders; raw: Buffer }
+  | { ok: false; error: NodeJS.ErrnoException };
+
+/**
+ * Classifies a sidecar rejection so the caller knows whether an MCP session
+ * handshake would help. `needs-session` covers a sidecar that has never seen
+ * this client; `stale-session` covers one that used to recognise `sentSessionId`
+ * but no longer does. Anything else passes through unchanged.
+ */
+function classifySessionError(
+  status: number,
+  parsed: SidecarRpcResponse | null,
+  sentSessionId: string | null,
+): "needs-session" | "stale-session" | null {
+  const err = parsed?.error as { code?: number; message?: string } | undefined;
+  if (status === 400 && err?.code === -32600 && typeof err.message === "string" && err.message.includes("Missing session ID")) {
+    return "needs-session";
+  }
+  if (status === 404 && sentSessionId) {
+    return "stale-session";
+  }
+  return null;
+}
+
 /** Wraps the existing KG sidecar at `kgSidecarUrl` as the default provider. */
 export class SidecarMemoryProvider implements MemoryProvider {
   readonly id = "sidecar";
@@ -90,91 +117,150 @@ export class SidecarMemoryProvider implements MemoryProvider {
     stalenessStamp: true,
   };
 
+  /**
+   * MCP session id negotiated with a stateful sidecar, cached for the life of
+   * the process. Null means either no handshake has happened yet, or the
+   * sidecar is stateless and none is needed.
+   */
+  private sessionId: string | null = null;
+
   constructor(private readonly kgSidecarUrl: string) {}
 
-  listTools(body: Buffer, headers: http.IncomingHttpHeaders): Promise<unknown[]> {
+  /** POSTs `body` to the sidecar and buffers the full response. Never throws. */
+  private sendToSidecar(target: URL, transport: typeof http | typeof https, method: string, headers: SidecarHeaders, body: Buffer): Promise<SidecarPostResult> {
     return new Promise((resolve) => {
-      const target = new URL(this.kgSidecarUrl);
-      const transport = target.protocol === "https:" ? https : http;
-      const forwardHeaders = { ...headers };
-      delete forwardHeaders.authorization;
-      delete forwardHeaders.host;
-      delete forwardHeaders["transfer-encoding"];
       const options: http.RequestOptions = {
         hostname: target.hostname,
         port: target.port || (target.protocol === "https:" ? "443" : "80"),
         path: target.pathname + target.search,
-        method: "POST",
-        headers: { ...forwardHeaders, host: target.host, "content-length": String(body.length) },
+        method,
+        headers: { ...headers, host: target.host },
       };
       const proxyReq = transport.request(options, (proxyRes) => {
         const chunks: Buffer[] = [];
         proxyRes.on("data", (chunk: Buffer) => chunks.push(chunk));
         proxyRes.on("end", () => {
-          const raw = Buffer.concat(chunks).toString();
-          const parsed = parseSidecarRpcResponse(raw, proxyRes.headers["content-type"]);
-          if (!parsed) {
-            console.error(
-              `[mcp] KG sidecar tools/list unparseable (status ${proxyRes.statusCode}, content-type ${proxyRes.headers["content-type"]}): ${raw.slice(0, 200)}`,
-            );
-          } else if (!parsed.result) {
-            console.error(
-              `[mcp] KG sidecar tools/list returned no result (status ${proxyRes.statusCode}): ${JSON.stringify(parsed.error ?? parsed).slice(0, 200)}`,
-            );
-          }
-          resolve(parsed?.result?.tools ?? []);
+          resolve({ ok: true, status: proxyRes.statusCode ?? 0, headers: proxyRes.headers, raw: Buffer.concat(chunks) });
         });
-        proxyRes.on("error", () => resolve([]));
+        proxyRes.on("error", (err) => resolve({ ok: false, error: err as NodeJS.ErrnoException }));
       });
-      proxyReq.on("error", () => resolve([]));
-      proxyReq.write(body);
+      proxyReq.on("error", (err: NodeJS.ErrnoException) => resolve({ ok: false, error: err }));
+      if (body.length > 0) proxyReq.write(body);
       proxyReq.end();
     });
+  }
+
+  /**
+   * Performs the MCP `initialize` → `notifications/initialized` handshake
+   * against the sidecar and returns the negotiated `mcp-session-id`. Throws
+   * when the sidecar doesn't answer with a session header, so callers can
+   * surface the original rejection instead of retrying into a second failure.
+   */
+  private async initializeSession(target: URL, transport: typeof http | typeof https, forwardHeaders: SidecarHeaders): Promise<string> {
+    const initBody = Buffer.from(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2025-03-26",
+          capabilities: {},
+          clientInfo: { name: "ai-implement-orchestrator", version: "1.0" },
+        },
+      }),
+    );
+    const initResult = await this.sendToSidecar(target, transport, "POST", { ...forwardHeaders, "content-length": String(initBody.length) }, initBody);
+    const sessionHeader = initResult.ok ? initResult.headers["mcp-session-id"] : undefined;
+    if (!initResult.ok || !sessionHeader || Array.isArray(sessionHeader)) {
+      const reason = initResult.ok ? `status ${initResult.status}` : initResult.error.message;
+      throw new Error(`KG sidecar initialize failed (${reason})`);
+    }
+
+    const notifyBody = Buffer.from(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }));
+    await this.sendToSidecar(
+      target,
+      transport,
+      "POST",
+      { ...forwardHeaders, "mcp-session-id": sessionHeader, "content-length": String(notifyBody.length) },
+      notifyBody,
+    );
+
+    return sessionHeader;
+  }
+
+  async listTools(body: Buffer, headers: http.IncomingHttpHeaders): Promise<unknown[]> {
+    const target = new URL(this.kgSidecarUrl);
+    const transport = target.protocol === "https:" ? https : http;
+    const forwardHeaders: SidecarHeaders = { ...headers };
+    delete forwardHeaders.authorization;
+    delete forwardHeaders.host;
+    delete forwardHeaders["transfer-encoding"];
+
+    const send = (sessionId: string | null) => {
+      const reqHeaders: SidecarHeaders = { ...forwardHeaders, "content-length": String(body.length) };
+      if (sessionId) reqHeaders["mcp-session-id"] = sessionId;
+      return this.sendToSidecar(target, transport, "POST", reqHeaders, body);
+    };
+
+    const first = await send(this.sessionId);
+    if (!first.ok) return [];
+    let okResult = first;
+
+    let parsed = parseSidecarRpcResponse(okResult.raw.toString(), okResult.headers["content-type"]);
+    const kind = classifySessionError(okResult.status, parsed, this.sessionId);
+    if (kind) {
+      if (kind === "stale-session") this.sessionId = null;
+      try {
+        const sessionId = await this.initializeSession(target, transport, forwardHeaders);
+        this.sessionId = sessionId;
+        console.error(`[mcp] KG sidecar demanded a session; initialized (id ${sessionId}) and retried`);
+        const retry = await send(sessionId);
+        if (!retry.ok) return [];
+        okResult = retry;
+        parsed = parseSidecarRpcResponse(okResult.raw.toString(), okResult.headers["content-type"]);
+      } catch {
+        // Handshake itself failed — fall through and report the original rejection below.
+      }
+    }
+
+    if (!parsed) {
+      console.error(
+        `[mcp] KG sidecar tools/list unparseable (status ${okResult.status}, content-type ${okResult.headers["content-type"]}): ${okResult.raw.toString().slice(0, 200)}`,
+      );
+    } else if (!parsed.result) {
+      console.error(
+        `[mcp] KG sidecar tools/list returned no result (status ${okResult.status}): ${JSON.stringify(parsed.error ?? parsed).slice(0, 200)}`,
+      );
+    }
+    return parsed?.result?.tools ?? [];
   }
 
   proxyCall(req: http.IncomingMessage, res: http.ServerResponse, body: Buffer): void {
     const target = new URL(this.kgSidecarUrl);
     const transport = target.protocol === "https:" ? https : http;
 
-    const forwardHeaders = { ...req.headers };
+    const forwardHeaders: SidecarHeaders = { ...req.headers };
     delete forwardHeaders.authorization;
     delete forwardHeaders.host;
     delete forwardHeaders.cookie;
     delete forwardHeaders["transfer-encoding"];
 
-    const headers: Record<string, string | string[] | undefined> = {
-      ...forwardHeaders,
-      host: target.host,
-    };
-    if (body.length > 0) {
-      headers["content-length"] = String(body.length);
-    } else {
-      delete headers["content-length"];
-    }
-
-    const options: http.RequestOptions = {
-      hostname: target.hostname,
-      port: target.port || (target.protocol === "https:" ? "443" : "80"),
-      path: target.pathname + target.search,
-      method: req.method,
-      headers,
+    const send = (sessionId: string | null) => {
+      const reqHeaders: SidecarHeaders = { ...forwardHeaders };
+      if (sessionId) reqHeaders["mcp-session-id"] = sessionId;
+      if (body.length > 0) {
+        reqHeaders["content-length"] = String(body.length);
+      } else {
+        delete reqHeaders["content-length"];
+      }
+      return this.sendToSidecar(target, transport, req.method ?? "POST", reqHeaders, body);
     };
 
-    const proxyReq = transport.request(options, (proxyRes) => {
-      res.writeHead(proxyRes.statusCode ?? 502, proxyRes.headers as http.OutgoingHttpHeaders);
-      proxyRes.on("error", (err) => {
-        console.error("[mcp] KG sidecar response error:", err);
-        if (!res.headersSent) {
-          writeJson(res, 502, { error: "KG sidecar error" });
-        } else {
-          res.destroy(err);
-        }
-      });
-      proxyRes.pipe(res);
-    });
-
-    proxyReq.on("error", (err: NodeJS.ErrnoException) => {
-      if (res.headersSent) return;
+    const writeConnectionError = (err: NodeJS.ErrnoException) => {
+      if (res.headersSent) {
+        res.destroy(err);
+        return;
+      }
       if (err.code === "ECONNREFUSED") {
         console.error(`[mcp] KG sidecar connection refused at ${this.kgSidecarUrl}`);
         writeJson(res, 502, { error: "KG sidecar unavailable: connection refused" });
@@ -182,10 +268,46 @@ export class SidecarMemoryProvider implements MemoryProvider {
         console.error("[mcp] KG sidecar error:", err);
         writeJson(res, 502, { error: "KG sidecar error" });
       }
-    });
+    };
 
-    if (body.length > 0) proxyReq.write(body);
-    proxyReq.end();
+    const forward = (result: Extract<SidecarPostResult, { ok: true }>) => {
+      const outHeaders = { ...result.headers } as http.OutgoingHttpHeaders;
+      delete outHeaders["transfer-encoding"];
+      outHeaders["content-length"] = String(result.raw.length);
+      res.writeHead(result.status, outHeaders);
+      res.end(result.raw);
+    };
+
+    void (async () => {
+      let result = await send(this.sessionId);
+      if (!result.ok) {
+        writeConnectionError(result.error);
+        return;
+      }
+
+      const parsed = parseSidecarRpcResponse(result.raw.toString(), result.headers["content-type"]);
+      const kind = classifySessionError(result.status, parsed, this.sessionId);
+      if (kind) {
+        if (kind === "stale-session") this.sessionId = null;
+        try {
+          const sessionId = await this.initializeSession(target, transport, forwardHeaders);
+          this.sessionId = sessionId;
+          console.error(`[mcp] KG sidecar demanded a session; initialized (id ${sessionId}) and retried`);
+          const retryResult = await send(sessionId);
+          if (!retryResult.ok) {
+            writeConnectionError(retryResult.error);
+            return;
+          }
+          result = retryResult;
+        } catch (err) {
+          console.error("[mcp] KG sidecar session initialize failed:", err);
+          writeJson(res, 502, { error: "KG sidecar error" });
+          return;
+        }
+      }
+
+      forward(result);
+    })();
   }
 }
 
