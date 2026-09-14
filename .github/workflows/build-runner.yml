@@ -209,9 +209,11 @@ jobs:
           cat "$requests_log" || true
           echo "---"
 
-          # Assertion 1: entrypoint reached the pipeline dispatch point
-          printf '%s\n' "$container_logs" | grep -qF \
-            "Invoking TS pipeline (node /app/dist/pipeline/kg-refresh-run.js, phase=kg-refresh)" || {
+          # Assertion 1: entrypoint reached the pipeline dispatch point.
+          # AII-653 adds the source; this gate explicitly supplies the phase env.
+          # Accept the prior format too so the gate can land before that change.
+          printf '%s\n' "$container_logs" | grep -qE \
+            "Invoking TS pipeline \(node /app/dist/pipeline/kg-refresh-run\.js, phase=kg-refresh(, source=env)?\)" || {
             echo "FAIL: Assertion 1 — expected log line not found in container output"
             exit 1
           }
