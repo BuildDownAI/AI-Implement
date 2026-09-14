@@ -520,6 +520,17 @@ describe("SidecarMemoryProvider session handling", () => {
     expect(res.body?.toString()).toContain("Missing session ID");
   });
 
+  it("proxyCall: a 400 that is not a session signal is forwarded once, with no handshake", async () => {
+    queueResponse(400, JSON.stringify({ jsonrpc: "2.0", id: 1, error: { code: -32600, message: "Bad Request: invalid params" } }));
+    const p = new SidecarMemoryProvider("http://127.0.0.1:8765/mcp");
+    const res = fakeRes();
+    p.proxyCall(fakeReq(), res, Buffer.from("{}"));
+    await waitUntil(() => res.headersSent);
+    expect(mockHttpRequest).toHaveBeenCalledTimes(1);
+    expect(res.statusCode).toBe(400);
+    expect(res.body?.toString()).toContain("invalid params");
+  });
+
   // (e) initialize itself fails → the original error is surfaced once, no loop
   it("listTools: a failed initialize resolves to [] with no third attempt", async () => {
     queueResponse(400, MISSING_SESSION_BODY);

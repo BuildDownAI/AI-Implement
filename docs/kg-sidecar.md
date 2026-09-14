@@ -199,7 +199,9 @@ interface MemoryProvider {
 - `listTools` — return the MCP tool-definition objects (same shape as a JSON-RPC `tools/list` result) that this provider can serve. Only tools whose capability flag is `true` should appear here; the orchestrator will not enforce a second filter.
 - `proxyCall` — write an MCP response to `res` for the given request and body. Called only for tools that cleared the capability check. The request has already been auth-checked; strip the `Authorization` header before forwarding to a backing service.
 
-### Session handling Only a 400 or 404 from the sidecar is buffered (to classify it as a session signal); every other response is relayed to the client as it arrives, so long or SSE responses are neither held in memory nor delayed until the sidecar closes the stream.
+### Session handling
+
+Only a 400 or 404 from the sidecar is buffered (to classify it as a session signal); every other response is relayed to the client as it arrives, so long or SSE responses are neither held in memory nor delayed until the sidecar closes the stream.
 
 The bundled `SidecarMemoryProvider` prefers a stateless sidecar: `listTools` and `proxyCall` each send a single POST with no MCP session, and that request count never grows when the sidecar answers straight away. A stateful sidecar — the Python MCP SDK's streamable-HTTP transport defaults to this — is tolerated rather than fatal: on a `400` "Missing session ID" rejection, the provider performs a lazy `initialize` → `notifications/initialized` handshake against the same sidecar URL, caches the returned `mcp-session-id` on the provider instance, and retries the original call once with that header attached. The cached id is negotiated once per process lifetime and reused by both `listTools` and `proxyCall`, not renegotiated per request. A `404` on a previously-used session clears the cached id and re-initializes exactly once. At most one handshake and one retry happen per inbound call — if the handshake itself fails, the original rejection is surfaced rather than retried again.
 

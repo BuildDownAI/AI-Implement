@@ -106,11 +106,11 @@ function classifySessionError(
   return null;
 }
 
-/** Wraps the existing KG sidecar at `kgSidecarUrl` as the default provider. */
 /** A proxyCall outcome whose response was relayed to the client as it arrived. */
 type StreamedOutcome = { ok: true; streamed: true };
 type SendOutcome = SidecarPostResult | StreamedOutcome;
 
+/** Wraps the existing KG sidecar at `kgSidecarUrl` as the default provider. */
 export class SidecarMemoryProvider implements MemoryProvider {
   readonly id = "sidecar";
   readonly capabilities: MemoryProviderCapabilities = {
