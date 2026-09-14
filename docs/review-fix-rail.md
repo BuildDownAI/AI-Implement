@@ -124,6 +124,20 @@ The trust boundary is unchanged: only a comment from an already-trusted Claude a
 
 The last step of the pipeline. It runs only when the feedback loop approved, something was actually pushed, and a PR number exists.
 
+Built-in reviewers return a short `summary` and a `checks` list alongside their
+verdict and findings, including when they approve. Each check names what was
+examined, its result (`passed`, `failed`, `not_verified`, or `not_applicable`),
+and concrete evidence. Gap analysis maps acceptance criteria to implementation;
+code review describes relevant behavior, risks, and validation. Reading a test
+is distinguished from running it, and checks that were not performed are named
+explicitly. These reports appear in the GitHub review and status comment and
+are saved in each reviewer step's outputs.
+
+The report fields are optional for compatibility with existing custom reviewers.
+They explain the verdict; actionable defects must still be in `findings` and
+cannot be replaced by report prose. A `not_verified` check records a limitation,
+not an automatic blocker; a required fix or validation gap belongs in findings.
+
 It runs its own LLM review, then **waits for the external review check** on the PR's current head SHA to reach a terminal state — polling every 5 seconds up to a 5-minute budget — before deciding merge readiness. The wait exists because the external review starts at roughly the same moment; reading findings immediately would read an empty snapshot.
 
 **It fails closed.** If the internal review is clean but the external check has not finished within the budget, the step does *not* auto-approve. It posts a comment saying manual review is required and stops. The same applies when the reviewer returns structurally invalid output. The internal reviewer itself runs under the retry policy's `reviewMaxTurns` cap (default 30, Settings-configurable; the in-loop reviewer is uncapped): a reviewer that runs out of turns is reported once as `reviewer_turns_exhausted` / `REVIEWER_TURNS_EXHAUSTED` — "the reviewer ran out of turns", never "did not approve" — and a reviewer that fails transiently is retried up to `stageRetries` times before being reported as `provider_unavailable` (see [pipeline-architecture.md](pipeline-architecture.md), "Reviewer turn cap" and "Stage-level retry and provider outages").

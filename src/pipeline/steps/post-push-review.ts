@@ -1167,7 +1167,7 @@ function parseReviewerDefinitionVerdict(value: unknown): ReviewerVerdict {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("expected structured reviewer output to be an object");
   }
-  const raw = value as { approved?: unknown; findings?: unknown };
+  const raw = value as { approved?: unknown; findings?: unknown; summary?: unknown; checks?: unknown };
   if (typeof raw.approved !== "boolean") throw new Error("expected approved to be a boolean");
   if (!Array.isArray(raw.findings)) throw new Error("expected findings to be an array");
   const findings: ReviewerFinding[] = raw.findings.map((finding, index) => {
@@ -1194,7 +1194,48 @@ function parseReviewerDefinitionVerdict(value: unknown): ReviewerVerdict {
       ...(typeof item.line === "number" ? { line: item.line } : {}),
     };
   });
-  return { approved: raw.approved && findings.length === 0, findings };
+  if (raw.summary !== undefined && (typeof raw.summary !== "string" || !raw.summary.trim())) {
+    throw new Error("expected summary to be a non-empty string when present");
+  }
+  let checks: ReviewerVerdict["checks"];
+  if (raw.checks !== undefined) {
+    if (!Array.isArray(raw.checks) || raw.checks.length === 0) {
+      throw new Error("expected checks to be a non-empty array when present");
+    }
+    checks = raw.checks.map((check, index) => {
+      if (!check || typeof check !== "object" || Array.isArray(check)) {
+        throw new Error(`expected checks[${index}] to be an object`);
+      }
+      const item = check as { check?: unknown; result?: unknown; evidence?: unknown };
+      if (typeof item.check !== "string" || !item.check.trim() || typeof item.evidence !== "string" || !item.evidence.trim()) {
+        throw new Error(`expected checks[${index}] to include non-empty check and evidence strings`);
+      }
+      if (item.result !== "passed" && item.result !== "failed" && item.result !== "not_verified" && item.result !== "not_applicable") {
+        throw new Error(`expected checks[${index}].result to be passed, failed, not_verified, or not_applicable`);
+      }
+      return { check: item.check.trim(), result: item.result, evidence: item.evidence.trim() };
+    });
+  }
+  return {
+    approved: raw.approved && findings.length === 0,
+    findings,
+    ...(typeof raw.summary === "string" ? { summary: raw.summary.trim() } : {}),
+    ...(checks ? { checks } : {}),
+  };
+}
+
+function reviewerEvidenceReport(label: string, verdict: ReviewerVerdict): string {
+  const status = verdict.findings.length === 0 ? "approved" : `${verdict.findings.length} finding(s)`;
+  const heading = `${label}: ${status}`;
+  const parts = [verdict.summary || verdict.checks?.length ? `**${heading}**` : heading];
+  if (verdict.summary) parts.push(verdict.summary);
+  if (verdict.checks?.length) {
+    const resultLabels = { passed: "Passed", failed: "Failed", not_verified: "Not verified", not_applicable: "Not applicable" };
+    parts.push("Checks:\n\n" + verdict.checks.map(check =>
+      `- **${check.check} - ${resultLabels[check.result]}:** ${check.evidence}`,
+    ).join("\n"));
+  }
+  return parts.join("\n\n");
 }
 
 function reviewerFindingToLedgerFinding(
@@ -1522,7 +1563,7 @@ async function runSelectedInternalReviewers(params: {
     if (selection.gates && provenance !== "branch") {
       approved = approved && verdict.approved && (legacy ? verdict.findings.length === 0 : reviewerFindings.length === 0);
     }
-    feedbackParts.push(legacy && reviewerFeedback ? reviewerFeedback : `${label}: ${reviewerFindings.length === 0 ? "approved" : `${reviewerFindings.length} finding(s)`}`);
+    feedbackParts.push(legacy && reviewerFeedback ? reviewerFeedback : reviewerEvidenceReport(label, verdict));
     if (!legacy) {
       await params.reporter.report({
         id: reportId,
@@ -1532,13 +1573,13 @@ async function runSelectedInternalReviewers(params: {
         ended_at: reviewEndedAt,
         parent_step_id: "post-push-review",
         inputs: reportInputs,
-        outputs: { approved: verdict.approved, findings: reviewerFindings, telemetry: reviewResult.telemetry },
+        outputs: { approved: verdict.approved, findings: reviewerFindings, summary: verdict.summary, checks: verdict.checks, telemetry: reviewResult.telemetry },
         logs_url: null,
       });
     }
   }
 
-  return { approved, feedback: feedbackParts.join("\n"), findings, telemetry: aggregateTelemetry, costUsd };
+  return { approved, feedback: feedbackParts.join("\n\n"), findings, telemetry: aggregateTelemetry, costUsd };
 }
 
 async function reportInvalidStructuredReview(
@@ -1955,7 +1996,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       if (approved) {
         terminationReason = "approved";
         const marker = `<!-- ai-implement post-push iter=${iteration} -->`;
-        submitPrReview(ghSpawn, prNumber, `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement post-push review approved this PR.`);
+        submitPrReview(ghSpawn, prNumber, `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement post-push review approved this PR.${internalReviewSummaryBlock(verdict.feedback)}`);
         postPrComment(
           ghSpawn,
           prNumber,
@@ -1971,7 +2012,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         submitPrReview(
           ghSpawn,
           prNumber,
-          `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement post-push review found unresolved blockers.\n\n${formatIssueList(issues)}${reviewFindingsCommentBlock(gatingExternalFindings)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}`,
+          `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement post-push review found unresolved blockers.\n\n${formatIssueList(issues)}${reviewFindingsCommentBlock(gatingExternalFindings)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${internalReviewSummaryBlock(verdict.feedback)}`,
         );
         postPrComment(
           ghSpawn,
@@ -2087,7 +2128,7 @@ ${requiredReviewFindingsBlock(gatingExternalFindings)}
         submitPrReview(
           ghSpawn,
           prNumber,
-          `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement fix pass made no changes; blockers remain.${blockingIssuesBlock(issues, { heading: "Unresolved blocking issues:" })}${reviewFindingsCommentBlock(gatingExternalFindings)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}`,
+          `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement fix pass made no changes; blockers remain.${blockingIssuesBlock(issues, { heading: "Unresolved blocking issues:" })}${reviewFindingsCommentBlock(gatingExternalFindings)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${internalReviewSummaryBlock(verdict.feedback)}`,
         );
         postPrComment(
           ghSpawn,

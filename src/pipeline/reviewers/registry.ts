@@ -17,6 +17,18 @@ export interface ReviewerFinding {
 export interface ReviewerVerdict {
   approved: boolean;
   findings: ReviewerFinding[];
+  /** Short human-readable review summary. Informational only; findings[] remains the gating channel. */
+  summary?: string;
+  /** Concrete checks the reviewer applied, with evidence and honest limits. Informational only. */
+  checks?: ReviewerCheck[];
+}
+
+export type ReviewerCheckResult = "passed" | "failed" | "not_verified" | "not_applicable";
+
+export interface ReviewerCheck {
+  check: string;
+  result: ReviewerCheckResult;
+  evidence: string;
 }
 
 /**

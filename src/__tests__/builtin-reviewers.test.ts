@@ -38,6 +38,8 @@ describe("built-in reviewers", () => {
       properties: {
         approved: { type: "boolean" },
         findings: { type: "array" },
+        summary: { type: "string", minLength: 1 },
+        checks: { type: "array", minItems: 1 },
       },
     });
   });
@@ -70,6 +72,13 @@ describe("built-in reviewers", () => {
     expect(prompt).toContain("requirement from the issue acceptance criteria that has no implementation");
     expect(prompt).toContain("unrequested scope");
     expect(prompt).toContain("Do not report style problems, code defects, security issues, test gaps");
+    expect(prompt).toContain("return a concise summary and a checks[] list even when approved");
+    expect(prompt).toContain("Each acceptance criterion should have a checks[] item");
+    expect(prompt).toContain("include one scope check");
+    expect(prompt).toContain("concrete acceptance criterion");
+    expect(prompt).toContain("Use result=\"not_verified\"");
+    expect(prompt).toContain("Distinguish inspecting test");
+    expect(prompt).toContain("Do not claim tests were executed or runtime behavior was checked");
     expect(prompt).toContain(input.issueDescription);
     expect(prompt).toContain(input.diff);
   });
@@ -86,6 +95,13 @@ describe("built-in reviewers", () => {
     expect(prompt).toContain("Do not put praise, overall status, or optional/future cleanup");
     expect(prompt).toContain("On follow-up reviews, first verify every previous issue is fixed");
     expect(prompt).toContain("changed API/data contracts, error handling");
+    expect(prompt).toContain("return a concise summary and a checks[] list even when approved");
+    expect(prompt).toContain("such as changed");
+    expect(prompt).toContain("behavior, edge cases, contracts, security, and tests");
+    expect(prompt).toContain("Use result=\"not_verified\"");
+    expect(prompt).toContain("Distinguish inspecting test source from executing");
+    expect(prompt).toContain("Do not claim runtime tests, browser checks, or");
+    expect(prompt).toContain("Findings remain");
     expect(prompt).not.toContain("missing requirement");
     expect(prompt).not.toContain("check requirements coverage");
     expect(prompt).not.toContain("acceptance criteria");
