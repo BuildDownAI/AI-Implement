@@ -76,10 +76,60 @@ export interface DispatchResult {
  * kg-refresh GHA dispatch (`dispatchKgRefreshRun` in `src/index.ts`) still sends these two
  * top-level — every other dispatch site already builds inputs via `buildEnvelopeDispatchInputs`,
  * which never sets them. `postWorkflowDispatch` strips whichever of these a 422 names and
- * retries once, so the orchestrator can serve both template generations until every target repo
- * has re-synced. The next issue in this chain appends `issue_identifier` to this list.
+ * retries — **at most once**, regardless of what the retry's own response says — so the
+ * orchestrator can serve both template generations until every target repo has re-synced. The
+ * next issue in this chain appends `issue_identifier` to this list.
  */
 export const ENVELOPE_OPTIONAL_INPUTS = ["runner_phase", "runner_callback_url"] as const;
+
+/**
+ * Extracts the quoted input names from a GitHub "unexpected inputs" rejection so the caller can
+ * match them exactly — never by substring — against `ENVELOPE_OPTIONAL_INPUTS`. GitHub returns
+ * either the bare text `Unexpected inputs provided: ["runner_phase"]` or a JSON envelope
+ * `{"message":"Unexpected inputs provided: [\"runner_phase\"]","documentation_url":"..."}`; in
+ * the JSON case the message's escaped quotes must be decoded before scanning for quoted tokens,
+ * or every extracted name would carry a trailing backslash and never match. `JSON.parse` handles
+ * that decoding; the raw-text case is left as-is when parsing fails (it isn't JSON to begin with).
+ */
+function extractUnexpectedInputNames(body: string): Set<string> {
+  let text = body;
+  try {
+    const parsed = JSON.parse(body) as { message?: unknown };
+    if (typeof parsed.message === "string") text = parsed.message;
+  } catch {
+    // Not a JSON body — use the raw text as-is.
+  }
+  const names = new Set<string>();
+  for (const match of text.matchAll(/"([^"]*)"/g)) {
+    names.add(match[1]);
+  }
+  return names;
+}
+
+async function postDispatchOnce(
+  token: string,
+  owner: string,
+  repo: string,
+  workflowFile: string,
+  ref: string,
+  inputs: DispatchInputs,
+): Promise<DispatchResult> {
+  const url = `https://api.github.com/repos/${owner}/${repo}/actions/workflows/${workflowFile}/dispatches`;
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: ghHeaders(token),
+    body: JSON.stringify({ ref, inputs }),
+    signal: defaultFetchSignal(),
+  });
+
+  if (res.status === 204 || res.status === 200) {
+    return { success: true, status: res.status };
+  }
+
+  const body = await res.text();
+  return { success: false, status: res.status, error: body };
+}
 
 const GH_HEADERS = {
   Accept: "application/vnd.github+json",
@@ -309,14 +359,25 @@ export function buildEnvelopeDispatchInputs(
 }
 
 /**
- * Posts a `workflow_dispatch`. On a 422 whose body matches `/unexpected inputs/i` and names at
- * least one `ENVELOPE_OPTIONAL_INPUTS` member that is present in `inputs` — and only when
- * `inputs.run_config` is set — strips exactly the named members and retries once. The
- * `run_config` guard matters: on the legacy contract `runner_phase`/`runner_callback_url` are
- * authoritative issue data, not compatibility duplicates, so stripping them there would run a
- * gap-fill as an implementation. The retry cannot loop — the second payload no longer carries
- * the stripped names, so the guard's "present in inputs" check fails by construction on the
- * second pass. Every other 422, and every other status, returns unchanged.
+ * Posts a `workflow_dispatch`, with a bounded strip-and-retry for older templates: **at most
+ * two requests, ever.** On a 422 whose body matches `/unexpected inputs/i` and names — by exact
+ * match, never substring — at least one `ENVELOPE_OPTIONAL_INPUTS` member that is present in
+ * `inputs`, and only when `inputs.run_config` is a non-empty string, it strips exactly the named
+ * members and posts once more. Whatever that second request returns — success, a different 422,
+ * the same 422 again — is returned as-is; there is no third request. A target repo whose 422
+ * keeps naming a *different* declared-but-unhandled input across requests would otherwise chain
+ * indefinitely, since each response only proves what the target rejected on that specific
+ * payload, not what it will accept next.
+ *
+ * The `run_config` guard matters: on the legacy contract `runner_phase`/`runner_callback_url`
+ * are authoritative issue data, not compatibility duplicates, so stripping them there would run
+ * a gap-fill as an implementation. The guard requires a non-empty string — `run_config: ""`
+ * must not count as "envelope present" and authorize a strip.
+ *
+ * Name matching is exact against the quoted tokens in the rejection body (via
+ * `extractUnexpectedInputNames`), not `body.includes(name)` — a rejection naming
+ * `runner_phase_extra` or `extra_runner_callback_url` must not be mistaken for a match on
+ * `runner_phase` or `runner_callback_url`.
  */
 export async function postWorkflowDispatch(opts: {
   token: string;
@@ -326,39 +387,23 @@ export async function postWorkflowDispatch(opts: {
   ref: string;
   inputs: DispatchInputs;
 }): Promise<DispatchResult> {
-  const url = `https://api.github.com/repos/${opts.owner}/${opts.repo}/actions/workflows/${opts.workflowFile}/dispatches`;
+  const first = await postDispatchOnce(opts.token, opts.owner, opts.repo, opts.workflowFile, opts.ref, opts.inputs);
+  if (first.success) return first;
+  if (first.status !== 422 || !/unexpected inputs/i.test(first.error ?? "")) return first;
+  if (!opts.inputs.run_config) return first;
 
-  const res = await fetch(url, {
-    method: "POST",
-    headers: ghHeaders(opts.token),
-    body: JSON.stringify({
-      ref: opts.ref,
-      inputs: opts.inputs,
-    }),
-    signal: defaultFetchSignal(),
-  });
+  const rejectedNames = extractUnexpectedInputNames(first.error ?? "");
+  const namesToStrip = ENVELOPE_OPTIONAL_INPUTS.filter(
+    (name) => opts.inputs[name] !== undefined && rejectedNames.has(name),
+  );
+  if (namesToStrip.length === 0) return first;
 
-  if (res.status === 204 || res.status === 200) {
-    return { success: true, status: res.status };
-  }
-
-  const body = await res.text();
-
-  if (res.status === 422 && /unexpected inputs/i.test(body) && opts.inputs.run_config !== undefined) {
-    const namesToStrip = ENVELOPE_OPTIONAL_INPUTS.filter(
-      (name) => opts.inputs[name] !== undefined && body.includes(name),
-    );
-    if (namesToStrip.length > 0) {
-      const strippedInputs: DispatchInputs = { ...opts.inputs };
-      for (const name of namesToStrip) delete strippedInputs[name];
-      console.log(
-        `[dispatch] ${opts.owner}/${opts.repo}/${opts.workflowFile} does not declare ${namesToStrip.join(", ")} (re-sync workflows); retrying without`,
-      );
-      return postWorkflowDispatch({ ...opts, inputs: strippedInputs });
-    }
-  }
-
-  return { success: false, status: res.status, error: body };
+  const strippedInputs: DispatchInputs = { ...opts.inputs };
+  for (const name of namesToStrip) delete strippedInputs[name];
+  console.log(
+    `[dispatch] ${opts.owner}/${opts.repo}/${opts.workflowFile} does not declare ${namesToStrip.join(", ")} (re-sync workflows); retrying without`,
+  );
+  return postDispatchOnce(opts.token, opts.owner, opts.repo, opts.workflowFile, opts.ref, strippedInputs);
 }
 
 export async function dispatchWorkflow(

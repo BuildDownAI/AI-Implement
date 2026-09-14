@@ -868,6 +868,177 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
     expect(result.status).toBe(422);
   });
 
+  it("a second 422 naming a *different* optional input still returns failure with exactly 2 fetches (no third request)", async () => {
+    // Reproduces the bug the "repeats the already-removed name" test above cannot catch:
+    // the first 422 names runner_phase, the retry's own 422 names the *other* optional input,
+    // runner_callback_url (still present in the stripped payload). The retry must be returned
+    // as failure unconditionally rather than triggering a third request.
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(textResponse(422, 'Unexpected inputs provided: ["runner_phase"]'))
+      .mockResolvedValueOnce(textResponse(422, 'Unexpected inputs provided: ["runner_callback_url"]'));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await postWorkflowDispatch({
+      token: "tok",
+      owner: "acme",
+      repo: "kg-repo",
+      workflowFile: "claude-implement.yml",
+      ref: "main",
+      inputs: {
+        run_config: "cfg",
+        run_token: "rt",
+        runner_phase: "kg-refresh",
+        runner_callback_url: "https://orch.example",
+      },
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const secondBody = JSON.parse(String((fetchMock.mock.calls[1][1] as RequestInit).body));
+    expect("runner_phase" in secondBody.inputs).toBe(false);
+    expect("runner_callback_url" in secondBody.inputs).toBe(true);
+    expect(result).toEqual({
+      success: false,
+      status: 422,
+      error: 'Unexpected inputs provided: ["runner_callback_url"]',
+    });
+  });
+
+  it("does not strip on a prefix collision (rejected name is a superstring of an optional input)", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(textResponse(422, 'Unexpected inputs provided: ["runner_phase_extra"]'));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await postWorkflowDispatch({
+      token: "tok",
+      owner: "acme",
+      repo: "kg-repo",
+      workflowFile: "claude-implement.yml",
+      ref: "main",
+      inputs: { run_config: "cfg", run_token: "rt", runner_phase: "kg-refresh" },
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({ success: false, status: 422, error: 'Unexpected inputs provided: ["runner_phase_extra"]' });
+  });
+
+  it("does not strip on a suffix collision (rejected name is a superstring of an optional input)", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(textResponse(422, 'Unexpected inputs provided: ["extra_runner_callback_url"]'));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await postWorkflowDispatch({
+      token: "tok",
+      owner: "acme",
+      repo: "kg-repo",
+      workflowFile: "claude-implement.yml",
+      ref: "main",
+      inputs: {
+        run_config: "cfg",
+        run_token: "rt",
+        runner_callback_url: "https://orch.example",
+      },
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({
+      success: false,
+      status: 422,
+      error: 'Unexpected inputs provided: ["extra_runner_callback_url"]',
+    });
+  });
+
+  it("still matches a fully-qualified input name inside a rejection naming several other inputs", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(textResponse(422, 'Unexpected inputs provided: ["base_branch", "runner_phase", "issue_identifier"]'))
+      .mockResolvedValueOnce(textResponse(204, null));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await postWorkflowDispatch({
+      token: "tok",
+      owner: "acme",
+      repo: "kg-repo",
+      workflowFile: "claude-implement.yml",
+      ref: "main",
+      inputs: { run_config: "cfg", run_token: "rt", runner_phase: "kg-refresh" },
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const secondBody = JSON.parse(String((fetchMock.mock.calls[1][1] as RequestInit).body));
+    expect("runner_phase" in secondBody.inputs).toBe(false);
+    expect(result.success).toBe(true);
+  });
+
+  it("parses GitHub's actual JSON error response (escaped quotes in the message field)", async () => {
+    const ghJsonBody = JSON.stringify({
+      message: 'Unexpected inputs provided: ["runner_phase", "runner_callback_url"]',
+      documentation_url: "https://docs.github.com/rest/actions/workflows#create-a-workflow-dispatch-event",
+    });
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(textResponse(422, ghJsonBody))
+      .mockResolvedValueOnce(textResponse(204, null));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await postWorkflowDispatch({
+      token: "tok",
+      owner: "acme",
+      repo: "kg-repo",
+      workflowFile: "claude-implement.yml",
+      ref: "main",
+      inputs: {
+        run_config: "cfg",
+        run_token: "rt",
+        runner_phase: "kg-refresh",
+        runner_callback_url: "https://orch.example",
+      },
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const secondBody = JSON.parse(String((fetchMock.mock.calls[1][1] as RequestInit).body));
+    expect("runner_phase" in secondBody.inputs).toBe(false);
+    expect("runner_callback_url" in secondBody.inputs).toBe(false);
+    expect(result).toEqual({ success: true, status: 204 });
+  });
+
+  it("matches the unexpected-inputs marker case-insensitively", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(textResponse(422, 'UNEXPECTED INPUTS PROVIDED: ["runner_phase"]'))
+      .mockResolvedValueOnce(textResponse(204, null));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await postWorkflowDispatch({
+      token: "tok",
+      owner: "acme",
+      repo: "kg-repo",
+      workflowFile: "claude-implement.yml",
+      ref: "main",
+      inputs: { run_config: "cfg", run_token: "rt", runner_phase: "kg-refresh" },
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(result.success).toBe(true);
+  });
+
+  it("does not retry when run_config is an empty string (legacy-shaped envelope guard)", async () => {
+    // run_config: "" must not satisfy the envelope guard — an empty string is falsy data,
+    // not evidence the caller is on the envelope contract, and runner_phase must stay
+    // authoritative for whatever contract actually sent an empty run_config.
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(textResponse(422, 'Unexpected inputs provided: ["runner_phase"]'));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await postWorkflowDispatch({
+      token: "tok",
+      owner: "acme",
+      repo: "legacy-ish-repo",
+      workflowFile: "claude-implement.yml",
+      ref: "main",
+      inputs: { run_config: "", run_token: "rt", runner_phase: "implementation" },
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(result.success).toBe(false);
+  });
+
   it("does not retry on a non-422 failure", async () => {
     const fetchMock = vi.fn().mockResolvedValueOnce(textResponse(500, "Internal Server Error"));
     vi.stubGlobal("fetch", fetchMock);
