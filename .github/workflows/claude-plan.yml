@@ -175,6 +175,21 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
+      # Read the event file without exposing token-valued env/script metadata: GitHub
+      # prints those headers before executing the first add-mask command (AII-676).
+      - name: Mask runner callback tokens
+        run: |
+          set +x
+          jq -r '
+            .inputs // {}
+            | [.run_token, .run_progress_token]
+            | if all(.[]; . == null or type == "string") then .[]
+              else error("Callback tokens must be strings") end
+            | select(. != null and . != "")
+            | gsub("%"; "%25") | gsub("\r"; "%0D") | gsub("\n"; "%0A")
+            | "::add-mask::" + .
+          ' "$GITHUB_EVENT_PATH"
+
       - name: Print dispatch inputs
         env:
           RUN_CONFIG: ${{ inputs.run_config }}
@@ -232,14 +247,6 @@ jobs:
           role-to-assume: ${{ secrets.AWS_BEDROCK_ROLE_ARN }}
           aws-region: ${{ inputs.aws_region }}
           role-session-duration: 14400
-
-      - name: Mask runner callback tokens
-        env:
-          RUN_TOKEN: ${{ inputs.run_token }}
-          RUN_PROGRESS_TOKEN: ${{ inputs.run_progress_token }}
-        run: |
-          if [ -n "$RUN_TOKEN" ]; then echo "::add-mask::$RUN_TOKEN"; fi
-          if [ -n "$RUN_PROGRESS_TOKEN" ]; then echo "::add-mask::$RUN_PROGRESS_TOKEN"; fi
 
       # Container jobs default to sh -e; this step uses bash syntax and requires shell: bash.
       # Reads ONE literal repository secret. Never serialize the whole secrets context: that
