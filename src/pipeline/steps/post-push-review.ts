@@ -490,12 +490,13 @@ function findFailingCiChecks(
   ghSpawn: (args: string[]) => SpawnResult,
   headSha: string,
   configuredCheckNames: string[] | undefined,
+  excludeExternalReviewChecks = true,
 ): string[] {
   if (!headSha) return [];
   const res = ghSpawn(["api", `repos/:owner/:repo/commits/${headSha}/check-runs?per_page=100`]);
   if (res.exitCode !== 0) return [];
   return parseCheckRuns(res.stdout)
-    .filter((run) => run.conclusion === "failure" && !isExternalReviewCheckName(run.name, configuredCheckNames))
+    .filter((run) => run.conclusion === "failure" && (!excludeExternalReviewChecks || !isExternalReviewCheckName(run.name, configuredCheckNames)))
     .map((run) => run.name);
 }
 
@@ -1806,14 +1807,23 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       // on the PR's current head SHA to reach a terminal state, then read its findings,
       // so merge readiness is decided against the real external verdict rather than the
       // empty snapshot that exists when both reviews start.
-      const externalReviewResult = shouldCollectExternalReviewFindings(inputs.reviewProviders)
+      // Filesystem test projects have no implicit external review provider. Explicit
+      // provider/check configuration or the external summary selection still opts in.
+      const filesystemWithoutExternalReviewer = context.data.issueId?.startsWith("filesystem:")
+        && inputs.reviewProviders === undefined
+        && !inputs.reviewCheckNames?.length
+        && !configuredReviewerSelection?.some((reviewer) => reviewer.id === CLAUDE_REVIEW_SUMMARY_ID);
+      const externalReviewResult = !filesystemWithoutExternalReviewer && shouldCollectExternalReviewFindings(inputs.reviewProviders)
         ? await waitForExternalReviewCompletion(ghSpawn, prNumber, {
             sleep,
             pollMs: reviewWaitPollMs,
             timeoutMs: reviewWaitTimeoutMs,
             configuredCheckNames: inputs.reviewCheckNames,
           })
-        : { state: "skipped" as ExternalReviewState, headSha: "" };
+        : {
+            state: "skipped" as ExternalReviewState,
+            headSha: filesystemWithoutExternalReviewer ? (resolvePrHeadSha(ghSpawn, prNumber) ?? "") : "",
+          };
       const externalReviewState = externalReviewResult.state;
       const externalReviewPending = externalReviewState === "running";
       const externalFindingsResult = externalReviewState === "skipped"
@@ -1823,9 +1833,10 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       const findingsUnavailable = externalFindingsResult.findingsUnavailable;
 
       // CI gate: collect failing non-review checks so a red build can never produce
-      // "Ready to merge". Uses the head SHA already resolved by waitForExternalReviewCompletion.
-      const failingCiChecks = (externalReviewState !== "skipped" && externalReviewResult.headSha)
-        ? findFailingCiChecks(ghSpawn, externalReviewResult.headSha, inputs.reviewCheckNames)
+      // "Ready to merge". Filesystem projects still check CI when external review is
+      // unconfigured, including CI jobs whose names happen to resemble review checks.
+      const failingCiChecks = ((externalReviewState !== "skipped" || filesystemWithoutExternalReviewer) && externalReviewResult.headSha)
+        ? findFailingCiChecks(ghSpawn, externalReviewResult.headSha, inputs.reviewCheckNames, !filesystemWithoutExternalReviewer)
         : [];
 
       const internalIssues = verdict.blockingIssues.map(issueFromVerdictIssue);

@@ -40,6 +40,15 @@ The filesystem provider is only available in local runner mode. It does not
 require a Fly app or a published runner image. Your test repository still needs
 the checks and external review workflow you intend to exercise.
 
+Filesystem runs use the selected internal reviewers without waiting for an
+external review by default. To exercise an external reviewer, select
+`claude-review-summary` in the project or configure `reviewProviders` or
+`reviewCheckNames` in the target repository's `.ai-implement/config.yml`.
+For example, `reviewProviders: [github-claude-code-review]` enables the external
+review wait; `reviewCheckNames: [my-review-job]` pins its check name. An explicit
+`reviewProviders: []` disables external collection. Failed CI checks still block
+an otherwise approved filesystem run when no external reviewer is configured.
+
 ## Write a ticket
 
 Save `REVIEW-001.md` in the configured directory:
