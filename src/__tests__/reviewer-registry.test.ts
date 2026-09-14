@@ -82,6 +82,21 @@ describe("resolveReviewer", () => {
     }
   });
 
+  it("does not resolve inherited object properties as built-in reviewer ids", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const result = await resolveReviewer("toString", {
+        customRoot: "/workspace",
+        existsSyncImpl: () => false,
+      });
+      expect(result).toBeUndefined();
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("toString"));
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it("does not throw when a custom override has no default export and no built-in exists", async () => {
     vi.spyOn(console, "warn").mockImplementation(() => {});
     try {

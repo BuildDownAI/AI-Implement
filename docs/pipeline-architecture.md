@@ -146,7 +146,7 @@ Only these `type` values are accepted: `clone`, `install`, `implement`, `review`
 
 ### Timing
 
-Both the pipeline definition and the step modules resolve **before the clone step runs** — the definition at module import time, the modules eagerly in `createDefaultRunner()`. Overrides therefore have to be baked into the runner image; a `custom/` directory that only exists in the target repo's checkout arrives too late to be honored for these two extension points.
+The pipeline definition, step modules, and reviewer modules resolve **before the clone step runs** — the definition at module import time, the modules eagerly in `createDefaultRunner()` and reviewer resolution. Overrides therefore have to be baked into the runner image; a `custom/` directory that only exists in the target repo's checkout arrives too late to be honored for these extension points.
 
 ## Failure record
 

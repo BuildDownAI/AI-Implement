@@ -35,7 +35,7 @@ export interface ReviewerPromptInput {
 /**
  * A reviewer supplies what differs between reviewers; the post-push-review
  * step keeps ownership of invocation, retry, verdict parsing, the findings
- * ledger, and reporting (ADR 018).
+ * ledger, and reporting (ADR 021).
  *
  * Deliberately has no `gates` field: gating a merge is a project setting on
  * the mapping, not something a reviewer definition can grant itself.
@@ -84,7 +84,8 @@ export async function resolveReviewer(
 ): Promise<ReviewerDefinition | undefined> {
   const custom = await resolveModuleImport<ReviewerDefinition>(`reviewers/${id}`, options);
   const builtins = options?.builtins ?? BUILT_IN_REVIEWERS;
-  const resolved = custom ?? builtins[id];
+  const builtin = Object.hasOwn(builtins, id) ? builtins[id] : undefined;
+  const resolved = custom ?? builtin;
   if (!resolved) {
     console.warn(`resolveReviewer: no reviewer registered for id "${id}"`);
     return undefined;
