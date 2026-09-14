@@ -96,13 +96,11 @@ describe("GHA workflow shims", () => {
     const workflow = readFileSync("workflows/WORKFLOW.md", "utf-8");
     const gapFill = workflow.split("## Gap-fill instructions")[1]?.split("## Issue")[0] ?? "";
 
-    // Agent must not push — pipeline owns the final push
-    expect(gapFill).toContain("Do NOT run `git push`");
-    // Local commits (including merge commits) are explicitly allowed
-    expect(gapFill).toContain("Local commits");
-    // Pipeline still commits+pushes uncommitted changes at the end
-    expect(gapFill).toContain("Leave any remaining file");
-    expect(gapFill).toContain("pipeline will commit and");
+    // Match the authoritative Git instructions appended by run-autonomous.ts.
+    expect(gapFill).toContain("Do NOT commit, push, or open a pull request.");
+    expect(gapFill).toContain("Leave your file changes unstaged and uncommitted.");
+    expect(gapFill).toContain("pipeline will commit and push");
+    expect(gapFill).not.toContain("Local commits");
     expect(gapFill).not.toContain("Commit your changes to the current\nbranch and push");
   });
 

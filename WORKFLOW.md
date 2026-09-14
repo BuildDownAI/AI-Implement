@@ -72,3 +72,10 @@ Batch independent file reads and searches. Prefer Read, Grep, and Glob for
 inspection, and sequence calls only when an earlier result is needed. If the
 turn cap approaches, preserve the work and state exactly what remains in the
 summary. Finish with the changes uncommitted and the appropriate summary written.
+
+Before reporting completion:
+
+- [ ] Acceptance criteria are met, or unmet criteria and blockers are named.
+- [ ] Required checks pass; commands and outcomes are recorded.
+- [ ] No temporary debugging code or unrelated edits remain.
+- [ ] The matching summary file is written and changes remain uncommitted.
