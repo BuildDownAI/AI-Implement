@@ -1079,7 +1079,7 @@ async function resolveConfigReviewerDefinitions(
   trustedDefinitions: ReadonlyMap<string, ReviewerDefinition> | undefined,
   trustedConfigDefinitions: readonly ReviewerDefinition[] | undefined,
 ): Promise<ConfigReviewerResolution> {
-  const trustedResolved = (trustedConfigDefinitions ?? []).map(wrapConfigReviewerDefinition);
+  const trustedResolved = (trustedConfigDefinitions ?? []).filter((definition) => !isReservedConfigReviewerId(definition.id)).map(wrapConfigReviewerDefinition);
   const branchResolved: ReviewerDefinition[] = [];
   const shadowed = new Set<string>();
   for (const definition of branchDefinitions ?? []) {
@@ -1247,8 +1247,7 @@ ${feedback}
 function reviewerReportId(iteration: number, reviewerIndex: number, reviewer: SelectedReviewer): string {
   if (reviewer.legacy) return `post-push-review.${iteration}`;
   const id = reviewer.selection.id.replace(/[^A-Za-z0-9_-]+/g, "-").slice(0, 80) || "reviewer";
-  if (reviewer.provenance === "branch") return `post-push-review.${iteration}.branch-advisory.${reviewerIndex}.${id}`;
-  return `post-push-review.${iteration}.${reviewer.selection.id}`;
+  return `post-push-review.${iteration}.reviewer.${reviewerIndex}.${reviewer.provenance ?? "trusted"}.${id}`;
 }
 
 function reviewerStage(iteration: number, reviewerIndex: number, reviewer: SelectedReviewer): string {
