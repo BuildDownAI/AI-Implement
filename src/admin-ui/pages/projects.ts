@@ -279,6 +279,15 @@ export const projectsHtml = `
             <input class="input" id="md-max-iter" type="number" min="1" step="1" placeholder="3">
             <div class="field-hint">Implement/review cycles. Blank = 2 on bedrock, 3 on anthropic.</div>
           </div>
+          <div class="field" style="grid-column:1 / -1">
+            <label class="field-label">Reviewers</label>
+            <div id="md-reviewer-list"></div>
+            <div style="display:flex;gap:8px;align-items:flex-end;margin-top:8px">
+              <input class="input mono" id="md-reviewer-id" placeholder="reviewer id" style="flex:1;min-width:0">
+              <button class="btn btn-sm" type="button" onclick="addProjectReviewer()">Add reviewer</button>
+            </div>
+            <div class="field-hint">Blank = gap-analysis and code-review both run and gate. Uncheck Runs to leave a reviewer out; uncheck Gates to run it without blocking merge.</div>
+          </div>
           <div class="field">
             <label class="field-label">Job Timeout (min)</label>
             <input class="input" id="md-max-job-min" type="number" min="1" step="1" placeholder="90">
@@ -358,6 +367,8 @@ export const projectsScript = `
   let currentSecretsTeam = null;
   let pendingJiraRepoFieldValue = '';
   let jiraFieldsLoaded = false;
+  let reviewerDraft = [];
+  let reviewerDefaultUntouched = true;
 
   async function loadMappings() {
     const res = await window.api('/api/mappings');
@@ -476,6 +487,107 @@ export const projectsScript = `
 
   function renderRefRepos() {
     document.getElementById('md-refrepo-list').innerHTML = refRepoRowsHtml(refRepoDraft, 'removeRefRepo');
+  }
+
+  const BUILT_IN_REVIEWERS = ['gap-analysis', 'code-review'];
+
+  function defaultReviewerDraft() {
+    return BUILT_IN_REVIEWERS.map(function (id) {
+      return { id: id, runs: true, gates: true, builtin: true };
+    });
+  }
+
+  function reviewerRowsFromSelection(selection) {
+    if (!Array.isArray(selection)) return defaultReviewerDraft();
+    var rows = BUILT_IN_REVIEWERS.map(function (id) {
+      return { id: id, runs: false, gates: true, builtin: true };
+    });
+    for (var i = 0; i < selection.length; i++) {
+      var entry = selection[i] || {};
+      if (typeof entry.id !== 'string' || !entry.id) continue;
+      var existing = rows.find(function (row) { return row.id === entry.id; });
+      if (existing) {
+        existing.runs = true;
+        existing.gates = entry.gates === true;
+      } else {
+        rows.push({ id: entry.id, runs: true, gates: entry.gates === true, builtin: false });
+      }
+    }
+    return rows;
+  }
+
+  function renderProjectReviewers() {
+    var list = document.getElementById('md-reviewer-list');
+    var rowStyle = 'display:grid;grid-template-columns:minmax(0,1fr)92px 92px 34px;gap:8px;align-items:center;padding:7px 0;font-size:12.5px;border-top:1px solid var(--border-subtle)';
+    list.innerHTML = reviewerDraft.map(function (reviewer, i) {
+      var remove = reviewer.builtin
+        ? '<span></span>'
+        : '<button class="btn btn-icon btn-danger" type="button" onclick="removeProjectReviewer(' + i + ')" title="Remove reviewer">&times;</button>';
+      return '<div style="' + rowStyle + '">'
+        + '<span class="mono" style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + window.escAttr(reviewer.id) + '">' + window.esc(reviewer.id) + '</span>'
+        + '<label class="checkbox-row" style="margin:0"><input type="checkbox" aria-label="Runs ' + window.escAttr(reviewer.id) + '" onchange="setProjectReviewerRuns(' + i + ', this.checked)"' + (reviewer.runs ? ' checked' : '') + '> Runs</label>'
+        + '<label class="checkbox-row" style="margin:0"><input type="checkbox" aria-label="Gates ' + window.escAttr(reviewer.id) + '" onchange="setProjectReviewerGates(' + i + ', this.checked)"' + (reviewer.gates ? ' checked' : '') + '> Gates</label>'
+        + remove
+        + '</div>';
+    }).join('');
+  }
+
+  function markProjectReviewersTouched() {
+    reviewerDefaultUntouched = false;
+  }
+
+  function setProjectReviewerRuns(i, checked) {
+    if (!reviewerDraft[i]) return;
+    reviewerDraft[i].runs = checked;
+    markProjectReviewersTouched();
+  }
+  window.setProjectReviewerRuns = setProjectReviewerRuns;
+
+  function setProjectReviewerGates(i, checked) {
+    if (!reviewerDraft[i]) return;
+    reviewerDraft[i].gates = checked;
+    markProjectReviewersTouched();
+  }
+  window.setProjectReviewerGates = setProjectReviewerGates;
+
+  function stageProjectReviewer() {
+    var input = document.getElementById('md-reviewer-id');
+    var id = input.value.trim();
+    if (!id) return 'Reviewer id is required.';
+    if (reviewerDraft.some(function (reviewer) { return reviewer.id === id; })) {
+      return 'Reviewer ' + id + ' is already listed.';
+    }
+    reviewerDraft.push({ id: id, runs: true, gates: true, builtin: false });
+    input.value = '';
+    markProjectReviewersTouched();
+    renderProjectReviewers();
+    return null;
+  }
+
+  function addProjectReviewer() {
+    var problem = stageProjectReviewer();
+    if (problem) showMappingError(problem, 'capacity');
+    else document.getElementById('md-error').classList.add('hidden');
+  }
+  window.addProjectReviewer = addProjectReviewer;
+
+  function removeProjectReviewer(i) {
+    if (!reviewerDraft[i] || reviewerDraft[i].builtin) return;
+    reviewerDraft.splice(i, 1);
+    markProjectReviewersTouched();
+    renderProjectReviewers();
+  }
+  window.removeProjectReviewer = removeProjectReviewer;
+
+  function pendingProjectReviewer() {
+    return document.getElementById('md-reviewer-id').value.trim() !== '';
+  }
+
+  function reviewerValue() {
+    if (reviewerDefaultUntouched) return null;
+    return reviewerDraft
+      .filter(function (reviewer) { return reviewer.runs; })
+      .map(function (reviewer) { return { id: reviewer.id, gates: reviewer.gates === true }; });
   }
 
   // A looser echo of the server's rules, so a mistyped entry fails at the row rather than
@@ -602,6 +714,10 @@ export const projectsScript = `
     document.getElementById('md-max-turns').value = m.maxTurns == null ? '' : String(m.maxTurns);
     document.getElementById('md-max-iter').value = m.maxIterations == null ? '' : String(m.maxIterations);
     document.getElementById('md-max-job-min').value = m.maxJobMinutes == null ? '' : String(m.maxJobMinutes);
+    reviewerDraft = reviewerRowsFromSelection(m.reviewers);
+    reviewerDefaultUntouched = !Array.isArray(m.reviewers);
+    document.getElementById('md-reviewer-id').value = '';
+    renderProjectReviewers();
     document.getElementById('md-branch-prefix').value = m.branchPrefix || '';
     document.getElementById('md-skills-repo').value = m.skillsRepo || '';
     document.getElementById('md-sensitive-add').value = (m.sensitiveAddPatterns || []).join('\\n');
@@ -972,6 +1088,10 @@ export const projectsScript = `
       showMappingError(staleRefRepo + ' Remove the entry and add it again.', 'context');
       return;
     }
+    if (pendingProjectReviewer()) {
+      const pending = stageProjectReviewer();
+      if (pending) { showMappingError(pending, 'capacity'); return; }
+    }
 
     const body = {
       teamKey,
@@ -1000,6 +1120,7 @@ export const projectsScript = `
       sensitiveAllowPatterns: (function(){ var v = document.getElementById('md-sensitive-allow').value.trim(); return v === '' ? null : v; })(),
       dependencyTokenScope: (function(){ var v = document.getElementById('md-dep-token-scope').value; return v === '' ? null : v; })(),
       referenceRepos: refRepoValue(),
+      reviewers: reviewerValue(),
     };
 
     const ticketingProvider = document.getElementById('md-ticketing-provider').value;
