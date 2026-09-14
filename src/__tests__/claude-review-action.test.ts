@@ -1,12 +1,20 @@
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parse } from "yaml";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
+import { extractReviewFindingsBlock } from "../pipeline/review-ledger.js";
 
 const action = parse(readFileSync(".github/actions/claude-review/action.yml", "utf8"));
 const steps = action.runs.steps as Array<{ name: string; id?: string; run?: string; with?: { claude_args?: string } }>;
+const tempRoots: string[] = [];
+
+afterEach(() => {
+  for (const root of tempRoots.splice(0)) {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 function getStep(name: string) {
   const step = steps.find((candidate) => candidate.name === name);
@@ -16,6 +24,7 @@ function getStep(name: string) {
 
 function runRenderStep(structuredOutput: string) {
   const tempRoot = mkdtempSync(join(tmpdir(), "claude-review-action-"));
+  tempRoots.push(tempRoot);
   const binDir = join(tempRoot, "bin");
   const runnerTemp = join(tempRoot, "runner");
   const scriptPath = join(tempRoot, "render.sh");
@@ -76,13 +85,6 @@ function tryRead(path: string) {
   }
 }
 
-function parseReviewFindingsBlock(body: string) {
-  const matches = [...body.matchAll(/```json[ \t]+review-findings[ \t]*\r?\n([\s\S]*?)\r?\n```[ \t]*(?=\r?\n|$)/g)];
-  const json = matches.at(-1)?.[1];
-  if (json === undefined) throw new Error("Missing review-findings block");
-  return JSON.parse(json);
-}
-
 describe("Claude review action", () => {
   it("passes Claude a compact schema JSON literal instead of a file path", () => {
     const prepareSchema = getStep("Prepare review findings schema");
@@ -106,9 +108,9 @@ describe("Claude review action", () => {
     expect(result.ghArgs).toContain("pr comment 123 --body-file");
     expect(result.postedBody).toContain("**Verdict:** approve");
     expect(result.postedBody).toContain("No findings reported.");
-    expect(parseReviewFindingsBlock(result.postedBody ?? "")).toEqual({
-      schema: "review-findings/v1",
+    expect(extractReviewFindingsBlock(result.postedBody ?? "")).toEqual({
       verdict: "approve",
+      findingsUnavailable: false,
       findings: [],
     });
   });
@@ -125,10 +127,29 @@ describe("Claude review action", () => {
 
     expect(result.status).toBe(0);
     expect(result.postedBody).toContain("- **[blocking]** (src/review.ts:42): Use the existing `parseJson` helper");
-    expect(parseReviewFindingsBlock(result.postedBody ?? "")).toEqual({
-      schema: "review-findings/v1",
+    expect(extractReviewFindingsBlock(result.postedBody ?? "")).toEqual({
       verdict: "changes_requested",
-      findings: [{ severity: "blocking", path: "src/review.ts", line: 42, body }],
+      findingsUnavailable: false,
+      findings: [{ source: "review-contract", severity: "blocking", path: "src/review.ts", line: 42, body }],
+    });
+  });
+
+  it("round-trips finding bodies that contain nested markdown fences through the production parser", () => {
+    const body = ["The generated example should not appear as its own contract:", "```ts", "const verdict = true;", "```"].join("\n");
+    const result = runRenderStep(
+      JSON.stringify({
+        verdict: "changes_requested",
+        summary: "A fenced example appears in the finding body.",
+        findings: [{ severity: "minor", path: "src/review.ts", body }],
+      }),
+    );
+
+    expect(result.status).toBe(0);
+    expect(result.postedBody).toContain("```ts");
+    expect(extractReviewFindingsBlock(result.postedBody ?? "")).toEqual({
+      verdict: "changes_requested",
+      findingsUnavailable: false,
+      findings: [{ source: "review-contract", severity: "minor", path: "src/review.ts", body }],
     });
   });
 
@@ -142,9 +163,9 @@ describe("Claude review action", () => {
     );
 
     expect(result.status).toBe(0);
-    expect(parseReviewFindingsBlock(result.postedBody ?? "")).toEqual({
-      schema: "review-findings/v1",
+    expect(extractReviewFindingsBlock(result.postedBody ?? "")).toEqual({
       verdict: "incomplete",
+      findingsUnavailable: false,
       findings: [],
     });
   });
@@ -164,6 +185,21 @@ describe("Claude review action", () => {
         verdict: "request_changes",
         summary: "Old verdict spelling should not pass.",
         findings: [{ severity: "blocking", title: "Old shape", location: "src/x.ts:1", body: "Wrong finding keys." }],
+      }),
+    );
+
+    expect(result.status).not.toBe(0);
+    expect(result.stdout).toContain("structured_output did not match review-findings/v1");
+    expect(result.ghArgs).toBeUndefined();
+    expect(result.postedBody).toBeUndefined();
+  });
+
+  it("fails before posting when a finding body is only whitespace", () => {
+    const result = runRenderStep(
+      JSON.stringify({
+        verdict: "changes_requested",
+        summary: "Whitespace-only body should not pass.",
+        findings: [{ severity: "blocking", path: "src/x.ts", body: " \n\t " }],
       }),
     );
 

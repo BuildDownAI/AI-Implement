@@ -1,7 +1,7 @@
 name: Claude review (review-findings/v1)
 description: >
   Runs a Claude Code review against a pull request and posts a single comment
-  ending in a review-findings/v1 fenced block (ADR 017). The block is posted
+  ending in a review-findings/v1 fenced block (ADR 020). The block is posted
   by this action's own gh pr comment step, never by the underlying action's
   comment tool, and --json-schema makes a run that returns no schema-valid
   verdict fail the check rather than pass silently.
@@ -118,7 +118,7 @@ runs:
             type == "object"
             and ((keys_unsorted - ["severity", "body", "path", "line"]) | length == 0)
             and ((.severity == "blocking") or (.severity == "minor"))
-            and (.body | type == "string" and length > 0)
+            and (.body | type == "string" and (gsub("[[:space:]]"; "") | length > 0))
             and ((has("path") | not) or (.path | type == "string"))
             and ((has("line") | not) or (.line | type == "number" and floor == .))
           ] | all)
