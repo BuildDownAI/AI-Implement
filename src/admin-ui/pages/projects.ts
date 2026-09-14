@@ -309,7 +309,7 @@ export const projectsHtml = `
               <input class="input mono" id="md-reviewer-id" placeholder="reviewer id" style="flex:1;min-width:0">
               <button class="btn btn-sm" type="button" onclick="addProjectReviewer()">Add reviewer</button>
             </div>
-            <div class="field-hint">Blank = gap-analysis and code-review both run and gate. Uncheck Runs to leave a reviewer out; uncheck Gates to run it without blocking merge.</div>
+            <div class="field-hint">Blank = gap-analysis and code-review both run and gate. Reviewer Max turns blank = inherit the reviewer default or global limit.</div>
           </div>
           <div class="field">
             <label class="field-label">Job Timeout (min)</label>
@@ -516,24 +516,26 @@ export const projectsScript = `
 
   function defaultReviewerDraft() {
     return BUILT_IN_REVIEWERS.map(function (id) {
-      return { id: id, runs: true, gates: true, builtin: true };
+      return { id: id, runs: true, gates: true, maxTurns: '', builtin: true };
     });
   }
 
   function reviewerRowsFromSelection(selection) {
     if (!Array.isArray(selection)) return defaultReviewerDraft();
     var rows = BUILT_IN_REVIEWERS.map(function (id) {
-      return { id: id, runs: false, gates: true, builtin: true };
+      return { id: id, runs: false, gates: true, maxTurns: '', builtin: true };
     });
     for (var i = 0; i < selection.length; i++) {
       var entry = selection[i] || {};
       if (typeof entry.id !== 'string' || !entry.id) continue;
       var existing = rows.find(function (row) { return row.id === entry.id; });
+      var maxTurns = Number.isInteger(entry.maxTurns) ? String(entry.maxTurns) : '';
       if (existing) {
         existing.runs = true;
         existing.gates = entry.gates === true;
+        existing.maxTurns = maxTurns;
       } else {
-        rows.push({ id: entry.id, runs: true, gates: entry.gates === true, builtin: false });
+        rows.push({ id: entry.id, runs: true, gates: entry.gates === true, maxTurns: maxTurns, builtin: false });
       }
     }
     return rows;
@@ -541,7 +543,7 @@ export const projectsScript = `
 
   function renderProjectReviewers() {
     var list = document.getElementById('md-reviewer-list');
-    var rowStyle = 'display:grid;grid-template-columns:minmax(0,1fr)92px 92px 34px;gap:8px;align-items:center;padding:7px 0;font-size:12.5px;border-top:1px solid var(--border-subtle)';
+    var rowStyle = 'display:grid;grid-template-columns:minmax(0,1fr)92px 92px minmax(120px,150px)34px;gap:8px;align-items:center;padding:7px 0;font-size:12.5px;border-top:1px solid var(--border-subtle)';
     list.innerHTML = reviewerDraft.map(function (reviewer, i) {
       var remove = reviewer.builtin
         ? '<span></span>'
@@ -550,6 +552,7 @@ export const projectsScript = `
         + '<span class="mono" style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + window.escAttr(reviewer.id) + '">' + window.esc(reviewer.id) + '</span>'
         + '<label class="checkbox-row" style="margin:0"><input type="checkbox" aria-label="Runs ' + window.escAttr(reviewer.id) + '" onchange="setProjectReviewerRuns(' + i + ', this.checked)"' + (reviewer.runs ? ' checked' : '') + '> Runs</label>'
         + '<label class="checkbox-row" style="margin:0"><input type="checkbox" aria-label="Gates ' + window.escAttr(reviewer.id) + '" onchange="setProjectReviewerGates(' + i + ', this.checked)"' + (reviewer.gates ? ' checked' : '') + '> Gates</label>'
+        + '<label style="display:grid;gap:2px;margin:0;font-size:11px;color:var(--fg-tertiary)">Max turns<input class="input" type="number" min="1" max="200" step="1" placeholder="inherit" aria-label="Max turns for ' + window.escAttr(reviewer.id) + ', blank inherits reviewer default or global limit" value="' + window.escAttr(reviewer.maxTurns || '') + '" onchange="setProjectReviewerMaxTurns(' + i + ', this.value)" style="height:30px;padding:4px 8px"></label>'
         + remove
         + '</div>';
     }).join('');
@@ -573,6 +576,13 @@ export const projectsScript = `
   }
   window.setProjectReviewerGates = setProjectReviewerGates;
 
+  function setProjectReviewerMaxTurns(i, value) {
+    if (!reviewerDraft[i]) return;
+    reviewerDraft[i].maxTurns = String(value || '').trim();
+    markProjectReviewersTouched();
+  }
+  window.setProjectReviewerMaxTurns = setProjectReviewerMaxTurns;
+
   function stageProjectReviewer() {
     var input = document.getElementById('md-reviewer-id');
     var id = input.value.trim();
@@ -580,7 +590,7 @@ export const projectsScript = `
     if (reviewerDraft.some(function (reviewer) { return reviewer.id === id; })) {
       return 'Reviewer ' + id + ' is already listed.';
     }
-    reviewerDraft.push({ id: id, runs: true, gates: true, builtin: false });
+    reviewerDraft.push({ id: id, runs: true, gates: true, maxTurns: '', builtin: false });
     input.value = '';
     markProjectReviewersTouched();
     renderProjectReviewers();
@@ -610,7 +620,26 @@ export const projectsScript = `
     if (reviewerDefaultUntouched) return null;
     return reviewerDraft
       .filter(function (reviewer) { return reviewer.runs; })
-      .map(function (reviewer) { return { id: reviewer.id, gates: reviewer.gates === true }; });
+      .map(function (reviewer) {
+        var value = { id: reviewer.id, gates: reviewer.gates === true };
+        var maxTurnsText = String(reviewer.maxTurns || '').trim();
+        if (maxTurnsText !== '') value.maxTurns = Number(maxTurnsText);
+        return value;
+      });
+  }
+
+  function projectReviewerProblem() {
+    for (var i = 0; i < reviewerDraft.length; i++) {
+      var reviewer = reviewerDraft[i];
+      if (!reviewer || !reviewer.runs) continue;
+      var maxTurnsText = String(reviewer.maxTurns || '').trim();
+      if (maxTurnsText === '') continue;
+      var maxTurns = Number(maxTurnsText);
+      if (!Number.isInteger(maxTurns) || maxTurns < 1 || maxTurns > 200) {
+        return 'Reviewer ' + reviewer.id + ' Max turns must be blank or an integer from 1 to 200.';
+      }
+    }
+    return null;
   }
 
   // A looser echo of the server's rules, so a mistyped entry fails at the row rather than
@@ -1133,6 +1162,11 @@ export const projectsScript = `
     if (pendingProjectReviewer()) {
       const pending = stageProjectReviewer();
       if (pending) { showMappingError(pending, 'capacity'); return; }
+    }
+    const reviewerProblem = projectReviewerProblem();
+    if (reviewerProblem) {
+      showMappingError(reviewerProblem, 'capacity');
+      return;
     }
 
     const body = {

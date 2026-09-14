@@ -8,6 +8,7 @@ import {
 } from "./config.js";
 import type { RepoMapping } from "./config.js";
 import { isAlreadyDispatched, markDispatched, closeDb, getDispatchedIds, deleteDispatched } from "./dedup.js";
+import { reconcileFilesystemFailures } from "./filesystem-ticket-lifecycle.js";
 import { dispatchWorkflow, postWorkflowDispatch, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, getPullRequestState, buildEnvelopeDispatchInputs, postPrComment, defaultFetchSignal, getRepoDefaultBranch, buildKgRefreshGhaDispatchBody, pollForKgWorkflowRunId } from "./github.js";
 import { resolveWorkflowCapabilities, resolveWorkflowContract } from "./workflow-probe.js";
 import { surfaceDispatchFailure } from "./dispatch-failure.js";
@@ -1971,7 +1972,10 @@ async function providerForJob(
 
 async function monitorJobs(config: AppConfig, registry: ProviderRegistry): Promise<void> {
   const inFlightJobs = getInFlightJobs();
-  if (inFlightJobs.length === 0 && getUnnotifiedTerminalJobs().length === 0) return;
+  if (inFlightJobs.length === 0 && getUnnotifiedTerminalJobs().length === 0) {
+    await reconcileFilesystemFailures(registry);
+    return;
+  }
 
   console.log(`[monitor] Checking ${inFlightJobs.length} in-flight jobs`);
 
@@ -2004,6 +2008,7 @@ async function monitorJobs(config: AppConfig, registry: ProviderRegistry): Promi
 
   // Send notifications + post comments for newly terminal jobs
   await reportJobCompletion(config, registry);
+  await reconcileFilesystemFailures(registry);
 }
 
 async function monitorGitHubActionsJob(

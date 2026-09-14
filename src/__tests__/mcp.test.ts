@@ -1541,6 +1541,25 @@ describe("handleMcpRequest", () => {
       expect(tool.inputSchema.properties.dryRun.type).toBe("boolean");
     });
 
+    it("add_project's inputSchema declares optional per-reviewer maxTurns", async () => {
+      mockRole("admin");
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}',
+      );
+      const tool = JSON.parse(result.body).result.tools.find((t: { name: string }) => t.name === "add_project");
+      expect(tool.inputSchema.properties.reviewers.items.required).toEqual(["id", "gates"]);
+      expect(tool.inputSchema.properties.reviewers.items.properties.maxTurns).toMatchObject({
+        type: "integer",
+        minimum: 1,
+        maximum: 200,
+      });
+    });
+
     it("as admin, dryRun:true is passed through to triggerKgRefresh (AII-632)", async () => {
       mockRole("admin");
       const triggerMock = vi.fn(async () => ({ status: 202, body: { accepted: true } }));

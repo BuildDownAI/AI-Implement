@@ -57,7 +57,7 @@ export const settingsHtml = `
     <div class="card">
       <div class="card-header"><h2 class="card-title">Retry Policy</h2></div>
       <div class="card-body">
-        <p class="text-secondary" style="margin-bottom:12px">Global retry/backoff policy and reviewer turn cap, applied to every implementation run. Blank fields fall back to the default shown as a placeholder.</p>
+        <p class="text-secondary" style="margin-bottom:12px">Global retry/backoff policy and post-push reviewer turn cap. Blank fields fall back to the default shown as a placeholder.</p>
         <div class="field">
           <label>Request Retries <span class="text-tertiary">(re-spawns of one Claude invocation)</span></label>
           <input class="input" id="rp-requestRetries" type="number" min="0" max="10" step="1">
@@ -83,7 +83,7 @@ export const settingsHtml = `
           <input class="input" id="rp-backoffJitter" type="number" min="0" max="1" step="0.05">
         </div>
         <div class="field">
-          <label>Review Max Turns <span class="text-tertiary">(in-loop and post-push reviewer)</span></label>
+          <label>Review Max Turns <span class="text-tertiary">(post-push reviewer)</span></label>
           <input class="input" id="rp-reviewMaxTurns" type="number" min="5" max="200" step="1">
         </div>
         <div style="display:flex;gap:6px;margin-top:8px">

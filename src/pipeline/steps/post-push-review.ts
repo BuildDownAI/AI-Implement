@@ -1004,23 +1004,12 @@ interface SelectedReviewerPassResult {
   approved: boolean;
   feedback: string;
   findings: PostPushReviewLedgerFinding[];
+  incompleteReviews: IncompleteReviewerResult[];
   telemetry?: RunTelemetry;
   costUsd: number | null;
-}
-
-interface SelectedReviewerStopResult {
-  stopped: true;
-  terminationReason: PostPushReviewTerminationReason;
-  feedback: string;
   failure?: FailureRecord;
-  costUsd: number | null;
+  terminationReason?: PostPushReviewTerminationReason;
   priorLlmFailure?: boolean;
-}
-
-type SelectedReviewerResult = SelectedReviewerPassResult | SelectedReviewerStopResult;
-
-function isSelectedReviewerStop(result: SelectedReviewerResult): result is SelectedReviewerStopResult {
-  return "stopped" in result;
 }
 
 function reviewerSortRank(id: string): number {
@@ -1245,8 +1234,8 @@ function escapeReportHtml(text: string): string {
   return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-function reviewerEvidenceReport(label: string, verdict: ReviewerVerdict): string {
-  const status = verdict.findings.length === 0 ? "approved" : `${verdict.findings.length} finding(s)`;
+function reviewerEvidenceReport(label: string, verdict: ReviewerVerdict, incomplete = false): string {
+  const status = incomplete ? "incomplete; no approval" : verdict.findings.length === 0 ? "approved" : `${verdict.findings.length} finding(s)`;
   const heading = `${label}: ${status}`;
   const parts = [verdict.summary || verdict.checks?.length ? `**${heading}**` : heading];
   if (verdict.summary) parts.push(escapeReportHtml(verdict.summary));
@@ -1254,6 +1243,11 @@ function reviewerEvidenceReport(label: string, verdict: ReviewerVerdict): string
     const resultLabels = { passed: "Passed", failed: "Failed", not_verified: "Not verified", not_applicable: "Not applicable" };
     parts.push("Checks:\n\n" + verdict.checks.map(check =>
       `- **${escapeReportHtml(check.check)} — ${resultLabels[check.result]}:** ${escapeReportHtml(check.evidence)}`,
+    ).join("\n"));
+  }
+  if (incomplete && verdict.findings.length) {
+    parts.push("Findings observed before interruption:\n\n" + verdict.findings.map(finding =>
+      `- ${escapeReportHtml(finding.body)}${finding.path ? ` (${escapeReportHtml(finding.path)})` : ""}`,
     ).join("\n"));
   }
   return parts.join("\n\n");
@@ -1332,6 +1326,48 @@ function reviewerFeedbackLabel(reviewerId: string, provenance?: InternalReviewer
   return provenance === "branch" ? `${reviewerId} (branch advisory)` : reviewerId;
 }
 
+interface IncompleteReviewerResult {
+  reviewerId: string;
+  label: string;
+  gates: boolean;
+  feedback: string;
+  failure?: FailureRecord;
+  telemetry?: RunTelemetry;
+}
+
+function selectionMaxTurns(selection: ReviewerSelection): number | undefined {
+  const value = selection.maxTurns;
+  return typeof value === "number" && Number.isInteger(value) && value > 0 && value <= 200 ? value : undefined;
+}
+
+function reviewerGates(selection: ReviewerSelection, provenance?: InternalReviewerProvenance): boolean {
+  return selection.gates === true && provenance !== "branch";
+}
+
+function parsePartialReviewerVerdict(
+  legacy: boolean | undefined,
+  value: unknown,
+  schema: ReviewerDefinition["outputSchema"],
+): ReviewerVerdict | null {
+  if (value === undefined) return null;
+  try {
+    if (legacy) {
+      const legacyVerdict = parseReviewVerdict(value);
+      return {
+        approved: false,
+        findings: legacyVerdict.blockingIssues.map((issue) => {
+          const reviewIssue = issueFromVerdictIssue(issue);
+          return { severity: "blocking", body: postPushIssueText(reviewIssue) };
+        }),
+        summary: legacyVerdict.feedback || "Partial legacy reviewer output was returned before the review completed.",
+      };
+    }
+    return { ...parseReviewerDefinitionVerdict(value, schema), approved: false };
+  } catch {
+    return null;
+  }
+}
+
 async function runSelectedInternalReviewers(params: {
   context: PipelineContext;
   reporter: StepReporter;
@@ -1343,38 +1379,50 @@ async function runSelectedInternalReviewers(params: {
   previousFindings: string;
   model: string;
   sleep: (ms: number) => Promise<void>;
-}): Promise<SelectedReviewerResult> {
+}): Promise<SelectedReviewerPassResult> {
   const findings: PostPushReviewLedgerFinding[] = [];
   const feedbackParts: string[] = [];
   let approved = true;
   let aggregateTelemetry: RunTelemetry | undefined;
   let costUsd: number | null = null;
+  const incompleteReviews: IncompleteReviewerResult[] = [];
+  let firstGatingFailure: FailureRecord | undefined;
+  let firstTerminationReason: PostPushReviewTerminationReason | undefined;
+  let priorLlmFailure = false;
 
   for (const [reviewerIndex, reviewer] of params.reviewers.entries()) {
-    const { selection, definition, legacy, optional, provenance } = reviewer;
+    const { selection, definition, legacy, provenance } = reviewer;
     const reviewerId = selection.id;
     const label = reviewerFeedbackLabel(reviewerId, provenance);
     const reportId = reviewerReportId(params.iteration, reviewerIndex, reviewer);
     const stage = reviewerStage(params.iteration, reviewerIndex, reviewer);
+    const maxTurns = selectionMaxTurns(selection) ?? definition.maxTurns ?? params.retryPolicy.reviewMaxTurns;
     const reportInputs = legacy
-      ? { iteration: params.iteration, prNumber: params.prNumber }
-      : { iteration: params.iteration, prNumber: params.prNumber, reviewerId, reviewerProvenance: provenance ?? "trusted" };
-    const maxTurns = definition.maxTurns ?? params.retryPolicy.reviewMaxTurns;
-    const reportOptionalFailure = async (
+      ? { iteration: params.iteration, prNumber: params.prNumber, maxTurns }
+      : { iteration: params.iteration, prNumber: params.prNumber, reviewerId, reviewerProvenance: provenance ?? "trusted", gates: reviewerGates(selection, provenance), maxTurns };
+    const reportIncompleteFailure = async (
       feedback: string,
       telemetry?: RunTelemetry,
       extraOutputs: Record<string, unknown> = {},
       startedAt = new Date().toISOString(),
       endedAt = new Date().toISOString(),
     ) => {
-      findings.push({
-        source: "ai-implement-internal",
+      const gates = reviewerGates(selection, provenance);
+      incompleteReviews.push({
         reviewerId,
-        ...(provenance ? { reviewerProvenance: provenance } : {}),
-        severity: "blocking",
-        body: feedback,
+        label,
+        gates,
+        feedback,
+        ...(extraOutputs.failure && typeof extraOutputs.failure === "object" ? { failure: extraOutputs.failure as FailureRecord } : {}),
+        ...(telemetry ? { telemetry } : {}),
       });
-      feedbackParts.push(`${label}: advisory reviewer did not complete`);
+      if (gates) {
+        approved = false;
+        if (incompleteReviews.filter(review => review.gates).length === 1 && extraOutputs.failure && typeof extraOutputs.failure === "object") {
+          firstGatingFailure = extraOutputs.failure as FailureRecord;
+        }
+      }
+      feedbackParts.push(`**${escapeReportHtml(label)}: review incomplete (${gates ? "required" : "advisory"})**\n\n${feedback}`);
       await params.reporter.report({
         id: reportId,
         type: "custom",
@@ -1383,21 +1431,31 @@ async function runSelectedInternalReviewers(params: {
         ended_at: endedAt,
         parent_step_id: "post-push-review",
         inputs: reportInputs,
-        outputs: { ...failedReviewOutputs(feedback), ...extraOutputs, ...(telemetry ? { telemetry } : {}) },
+        outputs: { approved: false, complete: false, feedback, issues: [], blockingIssues: [], maxTurns, ...extraOutputs, ...(telemetry ? { telemetry } : {}) },
         logs_url: null,
       });
     };
-    const prompt = definition.buildPrompt({
-      issueIdentifier: params.context.data.issueIdentifier,
-      issueTitle: params.context.data.issueTitle,
-      issueDescription: params.context.data.issueDescription,
-      prNumber: params.prNumber,
-      diff: params.diff,
-      previousFindings: params.previousFindings,
-    });
+    let prompt: string;
+    try {
+      prompt = definition.buildPrompt({
+        issueIdentifier: params.context.data.issueIdentifier,
+        issueTitle: params.context.data.issueTitle,
+        issueDescription: params.context.data.issueDescription,
+        prNumber: params.prNumber,
+        diff: params.diff,
+        previousFindings: params.previousFindings,
+      });
+      prompt += `\n\nYou have a maximum of ${maxTurns} turns for this review. Reserve your final turn for the structured report. Prioritize the required checks, and identify any unverified areas honestly in checks[].`;
+    } catch (err) {
+      if (err instanceof OperatorCancelledError || err instanceof PrMergedError) throw err;
+      const feedback = compactErrorMessage(`Reviewer ${label} could not build its prompt: ${err instanceof Error ? err.message : String(err)}`);
+      if (reviewerGates(selection, provenance) && !firstTerminationReason) firstTerminationReason = "invalid_review";
+      await reportIncompleteFailure(feedback);
+      continue;
+    }
 
     let reviewStartedAt = new Date().toISOString();
-    let reviewResult = await params.context.llmExecutor.invoke({
+    const invokeReviewer = () => params.context.llmExecutor.invoke({
       prompt,
       model: definition.model ?? params.model,
       maxTurns,
@@ -1406,9 +1464,21 @@ async function runSelectedInternalReviewers(params: {
       stage,
       expectsStructuredOutput: true,
     });
+    let reviewResult: LLMResult;
+    try {
+      reviewResult = await invokeReviewer();
+    } catch (err) {
+      if (err instanceof OperatorCancelledError || err instanceof PrMergedError) throw err;
+      const feedback = compactErrorMessage(`Reviewer ${label} invocation threw before returning a result: ${err instanceof Error ? err.message : String(err)}`);
+      if (reviewerGates(selection, provenance) && !firstTerminationReason) firstTerminationReason = "review_failed";
+      priorLlmFailure ||= reviewerGates(selection, provenance);
+      await reportIncompleteFailure(feedback, undefined, {}, reviewStartedAt);
+      continue;
+    }
     let reviewEndedAt = new Date().toISOString();
     let reviewStageAttempt = 1;
     let reviewStageClassified: FailureRecord | undefined;
+    let invocationThrew = false;
     while (reviewResult.telemetry?.outcome !== "max_turns" && reviewFailureMessage(reviewResult) !== null) {
       reviewStageClassified = classifyLlmResult(reviewResult, {
         stage,
@@ -1425,25 +1495,29 @@ async function runSelectedInternalReviewers(params: {
         ended_at: reviewEndedAt,
         parent_step_id: "post-push-review",
         inputs: reportInputs,
-        outputs: { failure: reviewStageClassified, telemetry: reviewResult.telemetry },
+        outputs: { failure: reviewStageClassified, maxTurns, telemetry: reviewResult.telemetry },
         logs_url: null,
       });
       costUsd = addExtraCost(costUsd, reviewResult.telemetry?.costUsd);
       await params.sleep(computeBackoffMs(reviewStageAttempt, params.retryPolicy));
       reviewStageAttempt++;
       reviewStartedAt = new Date().toISOString();
-      reviewResult = await params.context.llmExecutor.invoke({
-        prompt,
-        model: definition.model ?? params.model,
-        maxTurns,
-        tools: READ_ONLY_ALLOWED_TOOLS,
-        jsonSchema: definition.outputSchema,
-        stage,
-        expectsStructuredOutput: true,
-      });
+      try {
+        reviewResult = await invokeReviewer();
+      } catch (err) {
+        if (err instanceof OperatorCancelledError || err instanceof PrMergedError) throw err;
+        const feedback = compactErrorMessage(`Reviewer ${label} retry threw before returning a result: ${err instanceof Error ? err.message : String(err)}`);
+        if (reviewerGates(selection, provenance) && !firstTerminationReason) firstTerminationReason = "review_failed";
+        priorLlmFailure ||= reviewerGates(selection, provenance);
+        await reportIncompleteFailure(feedback, undefined, {}, reviewStartedAt);
+        reviewStageClassified = undefined;
+        invocationThrew = true;
+        break;
+      }
       reviewEndedAt = new Date().toISOString();
       reviewStageClassified = undefined;
     }
+    if (invocationThrew) continue;
     costUsd = addExtraCost(costUsd, reviewResult.telemetry?.costUsd);
     if (legacy) aggregateTelemetry = reviewResult.telemetry;
 
@@ -1451,22 +1525,10 @@ async function runSelectedInternalReviewers(params: {
       const failure = { ...reviewStageClassified, stage: "post-push-review", code: "PROVIDER_UNAVAILABLE" as const, retryable: false };
       const telemetryPart = reviewResult.telemetry ? summaryLine(reviewResult.telemetry) : "no telemetry reported";
       const feedback = compactErrorMessage(`Reviewer ${label} could not run because the model provider was unavailable after ${reviewStageAttempt} attempt(s) (${telemetryPart}).`);
-      if (optional) {
-        await reportOptionalFailure(feedback, reviewResult.telemetry, { failure }, reviewStartedAt, reviewEndedAt);
-        continue;
-      }
-      await params.reporter.report({
-        id: reportId,
-        type: "custom",
-        status: "failed",
-        started_at: reviewStartedAt,
-        ended_at: reviewEndedAt,
-        parent_step_id: "post-push-review",
-        inputs: reportInputs,
-        outputs: { approved: false, feedback, issues: [], blockingIssues: [], failure, telemetry: reviewResult.telemetry },
-        logs_url: null,
-      });
-      return { stopped: true, terminationReason: "provider_unavailable", feedback, failure, costUsd, priorLlmFailure: true };
+      if (reviewerGates(selection, provenance) && !firstTerminationReason) firstTerminationReason = "provider_unavailable";
+      priorLlmFailure ||= reviewerGates(selection, provenance);
+      await reportIncompleteFailure(feedback, reviewResult.telemetry, { failure }, reviewStartedAt, reviewEndedAt);
+      continue;
     }
 
     if (reviewResult.telemetry?.outcome === "max_turns") {
@@ -1477,23 +1539,20 @@ async function runSelectedInternalReviewers(params: {
         retryable: false,
         reviewMaxTurns: maxTurns,
       };
-      const feedback = `${label} ran out of turns at the configured cap (${maxTurns}). ${summaryLine(reviewResult.telemetry)}`;
-      if (optional) {
-        await reportOptionalFailure(feedback, reviewResult.telemetry, { failure }, reviewStartedAt, reviewEndedAt);
-        continue;
-      }
-      await params.reporter.report({
-        id: reportId,
-        type: "custom",
-        status: "failed",
-        started_at: reviewStartedAt,
-        ended_at: reviewEndedAt,
-        parent_step_id: "post-push-review",
-        inputs: reportInputs,
-        outputs: { approved: false, feedback, issues: [], blockingIssues: [], failure, telemetry: reviewResult.telemetry },
-        logs_url: null,
-      });
-      return { stopped: true, terminationReason: "reviewer_turns_exhausted", feedback, failure, costUsd };
+      const partialVerdict = parsePartialReviewerVerdict(legacy, reviewResult.structuredOutput, definition.outputSchema);
+      const partialReport = partialVerdict
+        ? `\n\n${reviewerEvidenceReport(label, partialVerdict, true)}`
+        : "\n\nNo usable partial structured review evidence was returned before the cap.";
+      const feedback = `${label} ran out of turns at the configured cap (${maxTurns}). ${summaryLine(reviewResult.telemetry)}${partialReport}`;
+      if (reviewerGates(selection, provenance) && !firstTerminationReason) firstTerminationReason = "reviewer_turns_exhausted";
+      await reportIncompleteFailure(
+        feedback,
+        reviewResult.telemetry,
+        { failure, partial: partialVerdict ? { findings: partialVerdict.findings, summary: partialVerdict.summary, checks: partialVerdict.checks } : null },
+        reviewStartedAt,
+        reviewEndedAt,
+      );
+      continue;
     }
 
     const reviewFailure = reviewFailureMessage(reviewResult);
@@ -1501,34 +1560,19 @@ async function runSelectedInternalReviewers(params: {
       const failure = classifyLlmResult(reviewResult, { stage, attempt: reviewResult.attempts ?? 1, expectsStructuredOutput: true, elapsedMs: reviewResult.telemetry?.durationMs ?? undefined });
       const telemetryPart = reviewResult.telemetry ? summaryLine(reviewResult.telemetry) : "no telemetry reported";
       const feedback = compactErrorMessage(`Reviewer ${label} failed: ${reviewFailure} (${telemetryPart}; ${failure.category}/${failure.code})`);
-      if (optional) {
-        await reportOptionalFailure(feedback, reviewResult.telemetry, {}, reviewStartedAt, reviewEndedAt);
-        continue;
-      }
-      await params.reporter.report({
-        id: reportId,
-        type: "custom",
-        status: "failed",
-        started_at: reviewStartedAt,
-        ended_at: reviewEndedAt,
-        parent_step_id: "post-push-review",
-        inputs: reportInputs,
-        outputs: { ...failedReviewOutputs(feedback), telemetry: reviewResult.telemetry },
-        logs_url: null,
-      });
-      return { stopped: true, terminationReason: "review_failed", feedback, costUsd, priorLlmFailure: true };
+      if (reviewerGates(selection, provenance) && !firstTerminationReason) firstTerminationReason = "review_failed";
+      priorLlmFailure ||= reviewerGates(selection, provenance);
+      await reportIncompleteFailure(feedback, reviewResult.telemetry, { failure }, reviewStartedAt, reviewEndedAt);
+      continue;
     }
 
     if (reviewResult.structuredOutput === undefined) {
       const feedback = compactErrorMessage(legacy
         ? `Reviewer returned no structured_output: ${reviewResult.stdout || "(empty stdout)"}`
         : `Reviewer ${label} returned no structured_output: ${reviewResult.stdout || "(empty stdout)"}`);
-      if (optional) {
-        await reportOptionalFailure(feedback, reviewResult.telemetry, {}, reviewStartedAt, reviewEndedAt);
-        continue;
-      }
-      await params.reporter.report({ id: reportId, type: "custom", status: "failed", started_at: reviewStartedAt, ended_at: reviewEndedAt, parent_step_id: "post-push-review", inputs: reportInputs, outputs: { ...failedReviewOutputs(feedback), telemetry: reviewResult.telemetry }, logs_url: null });
-      return { stopped: true, terminationReason: "invalid_review", feedback, costUsd };
+      if (reviewerGates(selection, provenance) && !firstTerminationReason) firstTerminationReason = "invalid_review";
+      await reportIncompleteFailure(feedback, reviewResult.telemetry, {}, reviewStartedAt, reviewEndedAt);
+      continue;
     }
 
     let verdict: ReviewerVerdict;
@@ -1561,22 +1605,16 @@ async function runSelectedInternalReviewers(params: {
       const feedback = compactErrorMessage(legacy
         ? `Reviewer returned invalid structured review output: ${reason}.`
         : `Reviewer ${label} returned invalid structured review output: ${reason}.`);
-      if (optional) {
-        await reportOptionalFailure(feedback, reviewResult.telemetry, {}, reviewStartedAt, reviewEndedAt);
-        continue;
-      }
-      await params.reporter.report({ id: reportId, type: "custom", status: "failed", started_at: reviewStartedAt, ended_at: reviewEndedAt, parent_step_id: "post-push-review", inputs: reportInputs, outputs: { ...failedReviewOutputs(feedback), telemetry: reviewResult.telemetry }, logs_url: null });
-      return { stopped: true, terminationReason: "invalid_review", feedback, costUsd };
+      if (reviewerGates(selection, provenance) && !firstTerminationReason) firstTerminationReason = "invalid_review";
+      await reportIncompleteFailure(feedback, reviewResult.telemetry, {}, reviewStartedAt, reviewEndedAt);
+      continue;
     }
 
     if (!legacy && verdict.findings.length === 0 && verdict.approved === false) {
       const feedback = `Reviewer ${label} returned approved=false without findings[].`;
-      if (optional) {
-        await reportOptionalFailure(feedback, reviewResult.telemetry, {}, reviewStartedAt, reviewEndedAt);
-        continue;
-      }
-      await params.reporter.report({ id: reportId, type: "custom", status: "failed", started_at: reviewStartedAt, ended_at: reviewEndedAt, parent_step_id: "post-push-review", inputs: reportInputs, outputs: { ...failedReviewOutputs(feedback), telemetry: reviewResult.telemetry }, logs_url: null });
-      return { stopped: true, terminationReason: "invalid_review", feedback, costUsd };
+      if (reviewerGates(selection, provenance) && !firstTerminationReason) firstTerminationReason = "invalid_review";
+      await reportIncompleteFailure(feedback, reviewResult.telemetry, {}, reviewStartedAt, reviewEndedAt);
+      continue;
     }
 
     const reviewerFindings = legacy ? [] : verdict.findings.map((finding) => reviewerFindingToLedgerFinding(reviewerId, finding, provenance));
@@ -1594,13 +1632,23 @@ async function runSelectedInternalReviewers(params: {
         ended_at: reviewEndedAt,
         parent_step_id: "post-push-review",
         inputs: reportInputs,
-        outputs: { approved: verdict.approved, findings: reviewerFindings, summary: verdict.summary, checks: verdict.checks, telemetry: reviewResult.telemetry },
+        outputs: { approved: verdict.approved, findings: reviewerFindings, summary: verdict.summary, checks: verdict.checks, maxTurns, telemetry: reviewResult.telemetry },
         logs_url: null,
       });
     }
   }
 
-  return { approved, feedback: feedbackParts.join("\n\n"), findings, telemetry: aggregateTelemetry, costUsd };
+  return {
+    approved,
+    feedback: feedbackParts.join("\n\n"),
+    findings,
+    incompleteReviews,
+    telemetry: aggregateTelemetry,
+    costUsd,
+    ...(firstGatingFailure ? { failure: firstGatingFailure } : {}),
+    ...(firstTerminationReason ? { terminationReason: firstTerminationReason } : {}),
+    ...(priorLlmFailure ? { priorLlmFailure } : {}),
+  };
 }
 
 async function reportInvalidStructuredReview(
@@ -1795,62 +1843,9 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         sleep,
       });
       costUsd = addExtraCost(costUsd, selectedReviewerResult.costUsd);
-      if (isSelectedReviewerStop(selectedReviewerResult)) {
-        terminationReason = selectedReviewerResult.terminationReason;
-        feedback = selectedReviewerResult.feedback;
-        if (selectedReviewerResult.failure) reviewerFailure = selectedReviewerResult.failure;
-        if (selectedReviewerResult.priorLlmFailure) priorLlmFailure = true;
-
-        const lastFinding = reviewHistory.length > 0 ? reviewHistory[reviewHistory.length - 1] : null;
-        const carriedContextBlock = lastFinding
-          ? capPreservingLines(
-              blockingIssuesBlock(lastFinding.issues, { heading: "Blocking issues from the previous review:" }),
-              CARRIED_BLOCKERS_MAX_CHARS,
-            )
-          : "";
-        const forcePushedLine = forcePushed > 0
-          ? `\n\n${forcePushed} automated fix revision(s) were pushed and not re-reviewed.`
-          : "";
-        const notReviewedPhrase = iteration >= 2 ? "the latest revision was not reviewed" : "the code was not reviewed";
-
-        if (terminationReason === "reviewer_turns_exhausted") {
-          feedback = `${feedback}${forcePushedLine}${carriedContextBlock}`;
-          const marker = `<!-- ai-implement post-push iter=${iteration} reviewer-turns-exhausted -->`;
-          postPrComment(
-            ghSpawn,
-            prNumber,
-            `${marker}\n🟠 The post-push reviewer ran out of turns at the configured cap (${reviewerFailure?.reviewMaxTurns ?? "unknown"}); ${notReviewedPhrase}.${forcePushedLine}${carriedContextBlock}\n\n**Merge readiness:** Manual review required; the reviewer did not finish.`,
-            marker,
-          );
-        } else if (terminationReason === "provider_unavailable") {
-          feedback = `${feedback}${forcePushedLine}${carriedContextBlock}`;
-          const marker = `<!-- ai-implement post-push iter=${iteration} provider-unavailable -->`;
-          postPrComment(
-            ghSpawn,
-            prNumber,
-            `${marker}\n🟠 The model provider was unavailable during review; ${notReviewedPhrase}.\n\n${feedback}\n\nThe implementation PR is still available. This is usually transient — re-dispatch once the provider recovers.\n\n**Merge readiness:** Manual review required; automated review did not complete.`,
-            marker,
-          );
-        } else if (terminationReason === "invalid_review") {
-          const marker = `<!-- ai-implement post-push iter=${iteration} review-invalid -->`;
-          postPrComment(
-            ghSpawn,
-            prNumber,
-            `${marker}\n⚠️ Post-push review returned invalid output.\n\n${feedback}\n\nThe implementation PR is still available, but this automated review pass did not finish. No actionable code feedback was produced by this review attempt.\n\n**Merge readiness:** Manual review required; automated review did not complete.`,
-            marker,
-          );
-        } else {
-          const marker = `<!-- ai-implement post-push iter=${iteration} review-failed -->`;
-          postPrComment(
-            ghSpawn,
-            prNumber,
-            `${marker}\n⚠️ Post-push review could not complete.\n\n${feedback}\n\nThe implementation PR is still available, but this automated review pass did not finish. No actionable code feedback was produced by this review attempt.\n\n**Merge readiness:** Manual review required; automated review did not complete.`,
-            marker,
-          );
-        }
-        break;
-      }
-
+      if (selectedReviewerResult.failure) reviewerFailure = selectedReviewerResult.failure;
+      if (selectedReviewerResult.priorLlmFailure) priorLlmFailure = true;
+      const gatingIncompleteReviews = selectedReviewerResult.incompleteReviews.filter(review => review.gates);
       const selectedInternalFindings = selectedReviewerResult.findings;
       const verdict = {
         approved: selectedReviewerResult.approved,
@@ -1875,7 +1870,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         && inputs.reviewProviders === undefined
         && !inputs.reviewCheckNames?.length
         && !configuredReviewerSelection?.some((reviewer) => reviewer.id === CLAUDE_REVIEW_SUMMARY_ID);
-      const externalReviewResult = !filesystemWithoutExternalReviewer && shouldCollectExternalReviewFindings(inputs.reviewProviders)
+      const externalReviewResult = gatingIncompleteReviews.length === 0 && !filesystemWithoutExternalReviewer && shouldCollectExternalReviewFindings(inputs.reviewProviders)
         ? await waitForExternalReviewCompletion(ghSpawn, prNumber, {
             sleep,
             pollMs: reviewWaitPollMs,
@@ -1923,7 +1918,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       );
 
       feedback = suppressDuplicateExternalFeedback(verdict.feedback, externalFindings);
-      if (issues.length === 0 && verdict.approved === false && gatingExternalFindings.length === 0 && !findingsUnavailable && !externalReviewVerdictBlocks) {
+      if (gatingIncompleteReviews.length === 0 && issues.length === 0 && verdict.approved === false && gatingExternalFindings.length === 0 && !findingsUnavailable && !externalReviewVerdictBlocks) {
         terminationReason = "invalid_review";
         feedback = "Reviewer returned invalid structured review output: approved=false requires at least one blocking_issues[] entry.";
         await reportInvalidStructuredReview(reporter, ghSpawn, prNumber, iteration, feedback, reviewResult.telemetry);
@@ -1939,6 +1934,53 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       // against a reviewer that is still in flight — defer to a human.
       const cleanInternalNoGatingFindings = verdict.approved === true && issues.length === 0 && gatingExternalFindings.length === 0;
       const internalApprovable = cleanInternalNoGatingFindings && !findingsUnavailable && !externalReviewVerdictBlocks;
+      if (gatingIncompleteReviews.length > 0) {
+        terminationReason = selectedReviewerResult.terminationReason ?? "invalid_review";
+        const lastFinding = reviewHistory.at(-1);
+        const carriedContext = lastFinding
+          ? capPreservingLines(blockingIssuesBlock(lastFinding.issues, { heading: "Blocking issues from the previous review:" }), CARRIED_BLOCKERS_MAX_CHARS)
+          : "";
+        const revisionContext = forcePushed > 0
+          ? `\n\n${forcePushed} automated fix revision(s) were pushed and not fully re-reviewed.`
+          : "";
+        feedback = `${feedback}${revisionContext}${carriedContext}`;
+        await reporter.report({
+          id: `post-push-review.${iteration}`,
+          type: "custom",
+          status: "failed",
+          started_at: new Date().toISOString(),
+          ended_at: new Date().toISOString(),
+          parent_step_id: "post-push-review",
+          inputs: { iteration, prNumber },
+          outputs: {
+            approved: false,
+            feedback,
+            issues: issues.map(postPushIssueText),
+            blockingIssues: issues,
+            terminationReason,
+            incompleteReviews: selectedReviewerResult.incompleteReviews,
+            ...(reviewerFailure ? { failure: reviewerFailure } : {}),
+            telemetry: reviewResult.telemetry,
+          },
+          logs_url: null,
+        });
+        const markerReason = terminationReason === "reviewer_turns_exhausted" ? "reviewer-turns-exhausted"
+          : terminationReason === "provider_unavailable" ? "provider-unavailable"
+          : terminationReason === "invalid_review" ? "review-invalid" : "review-failed";
+        const marker = `<!-- ai-implement post-push iter=${iteration} ${markerReason} -->`;
+        const reviewUrl = submitPrReview(
+          ghSpawn,
+          prNumber,
+          `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement post-push review did not complete for every required reviewer. Manual review required.${blockingIssuesBlock(issues)}${internalReviewSummaryBlock(feedback)}`,
+        );
+        postPrComment(
+          ghSpawn,
+          prNumber,
+          `${marker}\n🟠 Required automated review is incomplete; at least one reviewer did not finish.\n\n${reviewReportForComment(reviewUrl, feedback)}${blockingIssuesBlock(issues)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${findingsUnavailableBlock(findingsUnavailable)}\n\n**Merge readiness:** Manual review required; automated review did not complete.`,
+          marker,
+        );
+        break;
+      }
       if (cleanInternalNoGatingFindings && externalReviewPending) {
         terminationReason = "external_review_pending";
         feedback = "External review did not complete within the wait budget; not auto-approving.";
@@ -2010,7 +2052,14 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         ended_at: new Date().toISOString(),
         parent_step_id: "post-push-review",
         inputs: { iteration, prNumber },
-        outputs: { approved, feedback, issues: issues.map(postPushIssueText), blockingIssues: issues, telemetry: reviewResult.telemetry },
+        outputs: {
+          approved,
+          feedback,
+          issues: issues.map(postPushIssueText),
+          blockingIssues: issues,
+          incompleteReviews: selectedReviewerResult.incompleteReviews,
+          telemetry: reviewResult.telemetry,
+        },
         logs_url: null,
       });
 

@@ -1445,12 +1445,12 @@ describe("runAutonomous", () => {
       failure?: typeof reviewerFailure;
     };
     expect(body.failureCode).toBe("REVIEWER_TURNS_EXHAUSTED");
-    expect(body.failureReason).toContain("ran out of turns");
-    expect(body.failureReason).toContain("The in-loop reviewer approved.");
+    expect(body.failureReason).toContain("reached its turn limit");
+    expect(body.failureReason).toContain("completed reviewer reports");
     expect(body.failure).toEqual(reviewerFailure);
   });
 
-  it("iteration >= 2 turn exhaustion says 'the latest revision was not reviewed' (not 'the code was not reviewed'), and both the disposition and the ::warning:: name the iteration count", async () => {
+  it("turn exhaustion describes incomplete review and includes iteration count in disposition and warning", async () => {
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
     vi.stubEnv("RUN_TOKEN", "run-token");
 
@@ -1524,7 +1524,7 @@ describe("runAutonomous", () => {
 
     expect(result!.exitCode).toBe(0);
     const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as { failureReason: string };
-    expect(body.failureReason).toContain("the latest revision was not reviewed");
+    expect(body.failureReason).toContain("required review is incomplete");
     expect(body.failureReason).not.toContain("the code was not reviewed");
   });
 
@@ -1594,7 +1594,7 @@ describe("runAutonomous", () => {
     const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as { failureReason: string };
     // DEFAULT_RETRY_POLICY.reviewMaxTurns is 30 — the value normalizeRetryPolicy substitutes
     // for the missing field, which this fallback then reads back out.
-    expect(body.failureReason).toContain("configured cap (30)");
+    expect(body.failureReason).toContain("turn limit (30)");
   });
 
   it("uses the reviewer-specific exhausted turn cap in the ticket comment and autopsy", async () => {

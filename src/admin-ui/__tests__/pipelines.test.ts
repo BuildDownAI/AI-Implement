@@ -71,10 +71,10 @@ describe("pipelines page — kg-refresh row actions (AII-521)", () => {
 
 // Evaluate the actual badge function so the warning/failure distinction is behavioral.
 describe("stuck job badge", () => {
-  const start = pipelinesScript.indexOf("function statusBadge(");
+  const start = pipelinesScript.indexOf("function isReviewIncomplete(");
   const end = pipelinesScript.indexOf("function execBadge(", start);
   const badge = new Function("statusClass", "makeBadge", pipelinesScript.slice(start, end) + "; return statusBadge;")(
-    { timed_out: "warn", completed: "success" },
+    { timed_out: "warn", completed: "success", review_failed: "warn" },
     (cls: string, label: string) => ({ cls, label }),
   );
   it("shows needs-human only for the give-up conclusion", () => {
@@ -82,9 +82,15 @@ describe("stuck job badge", () => {
     expect(badge("timed_out", "stuck_requeued")).toEqual({ cls: "warn", label: "timed_out" });
     expect(badge("completed", "stuck_giveup")).toEqual({ cls: "success", label: "completed" });
   });
+  it("distinguishes incomplete review infrastructure from code rejection", () => {
+    expect(badge("review_failed", "REVIEWER_TURNS_EXHAUSTED", { code: "REVIEWER_TURNS_EXHAUSTED", stage: "post-push-review" })).toEqual({ cls: "warn", label: "review incomplete" });
+    expect(badge("review_failed", "PROVIDER_UNAVAILABLE", { code: "PROVIDER_UNAVAILABLE", stage: "post-push-review" })).toEqual({ cls: "warn", label: "review incomplete" });
+    expect(badge("review_failed", "invalid_review", null)).toEqual({ cls: "warn", label: "review incomplete" });
+    expect(badge("review_failed", "REVIEW_UNAPPROVED", { code: "REVIEW_UNAPPROVED", stage: "post-push-review" })).toEqual({ cls: "warn", label: "review failed" });
+  });
   it("keeps grouped plan completion inference and passes each conclusion", () => {
-    expect(pipelinesScript).toContain("statusBadge(planStatus, plan.conclusion)");
-    expect(pipelinesScript).toContain("statusBadge(impl.status, impl.conclusion)");
-    expect(pipelinesScript).toContain("statusBadge(entry.status, entry.conclusion)");
+    expect(pipelinesScript).toContain("statusBadge(planStatus, plan.conclusion, plan.failure)");
+    expect(pipelinesScript).toContain("statusBadge(impl.status, impl.conclusion, impl.failure)");
+    expect(pipelinesScript).toContain("statusBadge(entry.status, entry.conclusion, entry.failure)");
   });
 });

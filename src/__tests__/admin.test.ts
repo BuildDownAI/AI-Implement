@@ -238,8 +238,9 @@ async function requestWithRegistry(
   method: string,
   token: string | undefined,
   registry: ProviderRegistry,
+  body?: unknown,
 ): Promise<{ statusCode: number; body: string }> {
-  const req = new MockRequest(url, method, token ? { authorization: `Bearer ${token}` } : {});
+  const req = new MockRequest(url, method, token ? { authorization: `Bearer ${token}` } : {}, body === undefined ? undefined : JSON.stringify(body));
   const res = new MockResponse();
   admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), registry);
   await res.done;
@@ -1428,7 +1429,7 @@ describe("admin mappings", () => {
   it("round-trips a reviewers array, including an empty one", async () => {
     const token = await login("secret");
     const selection = [
-      { id: "gap-analysis", gates: false },
+      { id: "gap-analysis", gates: false, maxTurns: 45 },
       { id: "custom", gates: true },
     ];
     const res = await request("/api/mappings", "POST", "secret", {
@@ -1537,6 +1538,18 @@ describe("admin mappings", () => {
       }, token);
       expect(res.statusCode).toBe(400);
       expect(JSON.parse(res.body).error).toContain("gates");
+    }
+  });
+
+  it("rejects malformed reviewer maxTurns with 400", async () => {
+    const token = await login("secret");
+    for (const badMaxTurns of [0, 201, 1.5, "45", null]) {
+      const res = await request("/api/mappings", "POST", "secret", {
+        teamKey: "REVBAD7", owner: "org", repo: "app",
+        reviewers: [{ id: "gap-analysis", gates: true, maxTurns: badMaxTurns }],
+      }, token);
+      expect(res.statusCode).toBe(400);
+      expect(JSON.parse(res.body).error).toContain("maxTurns");
     }
   });
 
@@ -2551,6 +2564,8 @@ describe("admin filesystem issue detail endpoint", () => {
         ticketingConfig: { kind: "filesystem", directory: dir },
       }, token);
       const { FilesystemProvider } = await import("../providers/filesystem.js");
+      const { initDispatchBreakerTable } = await import("../dispatch-breaker.js");
+      initDispatchBreakerTable();
       const fsProvider = new FilesystemProvider(() => config.getMappings());
       const registry = {
         forMapping: async () => fsProvider,
@@ -2568,6 +2583,54 @@ describe("admin filesystem issue detail endpoint", () => {
   it("requires auth", async () => {
     const res = await request("/api/filesystem-issue?issueId=filesystem%3ASAN2%3ASAN2-001", "GET", "secret");
     expect(res.statusCode).toBe(401);
+  });
+
+  it("requires auth to retry", async () => {
+    const res = await request("/api/filesystem-issue/retry", "POST", "secret", { issueId: "filesystem:SAN2:SAN2-001" });
+    expect(res.statusCode).toBe(401);
+  });
+
+  it("restores an archived failure once and retains the issue history", async () => {
+    await withFilesystemProject(async ({ dir, registry, token }) => {
+      const issueId = "filesystem:SAN2:SAN2-001";
+      fs.mkdirSync(path.join(dir, "failed"));
+      fs.writeFileSync(path.join(dir, "failed", "SAN2-001.md"), "---\ntitle: Retry me\n---\n\nKeep the plan.");
+      fs.mkdirSync(path.join(dir, ".state", "SAN2"), { recursive: true });
+      const comments = [{ body: "Saved plan", createdAt: "2026-09-14T20:00:00.000Z" }];
+      fs.writeFileSync(path.join(dir, ".state", "SAN2", "SAN2-001.json"), JSON.stringify({
+        version: 1, status: "failed", failurePhase: "implementation", comments, prUrls: [], updatedAt: "2026-09-14T20:01:00.000Z",
+      }));
+      const detailUrl = `/api/filesystem-issue?issueId=${encodeURIComponent(issueId)}`;
+      const before = await requestWithRegistry(detailUrl, "GET", token, registry);
+      expect(JSON.parse(before.body)).toMatchObject({ location: "failed", ticketPath: "failed/SAN2-001.md", retryEligible: true });
+      const retry = await requestWithRegistry("/api/filesystem-issue/retry", "POST", token, registry, { issueId });
+      expect(retry.statusCode).toBe(200);
+      expect(JSON.parse(retry.body)).toEqual({ retried: true });
+      expect(fs.existsSync(path.join(dir, "SAN2-001.md"))).toBe(true);
+      expect(fs.existsSync(path.join(dir, "failed", "SAN2-001.md"))).toBe(false);
+      const after = await requestWithRegistry(detailUrl, "GET", token, registry);
+      expect(JSON.parse(after.body)).toMatchObject({ location: "active", retryEligible: false, state: { status: "plan-approved", comments } });
+      const duplicate = await requestWithRegistry("/api/filesystem-issue/retry", "POST", token, registry, { issueId });
+      expect(duplicate.statusCode).toBe(409);
+    });
+  });
+
+  it("rejects retry of invalid ids or a failed ticket with an existing PR", async () => {
+    await withFilesystemProject(async ({ dir, registry, token }) => {
+      const invalid = await requestWithRegistry("/api/filesystem-issue/retry", "POST", token, registry, { issueId: "../SAN2-001" });
+      expect(invalid.statusCode).toBe(400);
+      fs.mkdirSync(path.join(dir, "failed"));
+      fs.writeFileSync(path.join(dir, "failed", "SAN2-001.md"), "---\ntitle: Existing PR\n---\n\nTask.");
+      fs.mkdirSync(path.join(dir, ".state", "SAN2"), { recursive: true });
+      fs.writeFileSync(path.join(dir, ".state", "SAN2", "SAN2-001.json"), JSON.stringify({
+        version: 1, status: "failed", failurePhase: "implementation", comments: [],
+        prUrls: ["https://github.com/example/repo/pull/1"], updatedAt: "2026-09-14T20:01:00.000Z",
+      }));
+      const res = await requestWithRegistry("/api/filesystem-issue/retry", "POST", token, registry, { issueId: "filesystem:SAN2:SAN2-001" });
+      expect(res.statusCode).toBe(409);
+      expect(JSON.parse(res.body).error).toMatch(/pull request/);
+      expect(fs.existsSync(path.join(dir, "failed", "SAN2-001.md"))).toBe(true);
+    });
   });
 
   it("returns the parsed issue, raw markdown, relative state path, and persisted state", async () => {

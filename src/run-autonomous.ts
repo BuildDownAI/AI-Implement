@@ -285,6 +285,25 @@ async function resolveTrustedReviewerDefinitions(
   return definitions;
 }
 
+function validReviewerSelectionArray(value: unknown): value is ReviewerSelection[] {
+  if (!Array.isArray(value)) return false;
+  const seen = new Set<string>();
+  for (const entry of value) {
+    if (entry === null || typeof entry !== "object" || Array.isArray(entry)) return false;
+    const { id, gates, maxTurns } = entry as { id?: unknown; gates?: unknown; maxTurns?: unknown };
+    if (typeof id !== "string" || id.length === 0) return false;
+    if (typeof gates !== "boolean") return false;
+    if (maxTurns !== undefined && !validReviewerMaxTurns(maxTurns)) return false;
+    if (seen.has(id)) return false;
+    seen.add(id);
+  }
+  return true;
+}
+
+function validReviewerMaxTurns(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 200;
+}
+
 function inputsFromConfig(cfg: RunConfigV1, env: NodeJS.ProcessEnv): ResolvedRunnerInputs {
   const githubOwner = env.GITHUB_OWNER;
   if (!githubOwner) throw new Error("Missing required env var: GITHUB_OWNER");
@@ -310,7 +329,7 @@ function inputsFromConfig(cfg: RunConfigV1, env: NodeJS.ProcessEnv): ResolvedRun
     sensitiveFiles: cfg.sensitiveFiles,
     dependencyTokenScope: cfg.dependencyTokenScope,
     referenceRepos: cfg.referenceRepos,
-    reviewers: cfg.reviewers ?? DEFAULT_REVIEWER_SELECTION,
+    reviewers: validReviewerSelectionArray(cfg.reviewers) ? cfg.reviewers : DEFAULT_REVIEWER_SELECTION,
     baseBranch: cfg.baseBranch,
     profiles: cfg.profiles
       ? cfg.profiles
@@ -701,13 +720,8 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
           ? "MAX_TURNS_EXHAUSTED"
           : "REVIEW_UNAPPROVED";
     const reviewMaxTurns = reviewerFailure?.reviewMaxTurns ?? retryPolicy.reviewMaxTurns ?? DEFAULT_RETRY_POLICY.reviewMaxTurns;
-    // Iteration 1 never carried forward blockers from a prior review, so "the code was not
-    // reviewed" is accurate; iteration >= 2 means a previous review DID run and a fix pass
-    // acted on it — only the latest revision went unreviewed. Matches the PR comment's own
-    // iteration-aware phrase (post-push-review.ts).
-    const notReviewedPhrase = iterations >= 2 ? "the latest revision was not reviewed" : "the code was not reviewed";
     const failureReason = reviewerTurnsExhausted
-      ? `🟠 The post-push reviewer ran out of turns at the configured cap (${reviewMaxTurns}); ${notReviewedPhrase}.\n\n${finalFeedback.slice(0, 500)}\n\nThe in-loop reviewer approved.`
+      ? `🟠 A post-push reviewer reached its turn limit (${reviewMaxTurns}); required review is incomplete.\n\n${finalFeedback.slice(0, 500)}\n\nSee the PR for completed reviewer reports and remaining review work.`
       : providerUnavailable
         ? finalFeedback || "The model provider was unavailable and the run could not complete."
         : `Automated review did not approve (${terminationReason} after ${iterations} iteration(s)). ` +

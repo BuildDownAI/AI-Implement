@@ -182,10 +182,27 @@ export const overviewScript = `
       + '</div>';
   }
 
-  function statusBadge(status) {
+  function isReviewIncomplete(e) {
+    if (!e || e.status !== 'review_failed') return false;
+    const failure = e.failure;
+    const code = failure && typeof failure.code === 'string' ? failure.code : e.conclusion;
+    const stage = failure && typeof failure.stage === 'string' ? failure.stage : '';
+    return code === 'REVIEWER_TURNS_EXHAUSTED'
+      || code === 'invalid_review'
+      || code === 'review_invalid'
+      || (code === 'PROVIDER_UNAVAILABLE' && (!stage || stage.includes('review')));
+  }
+
+  function statusBadge(status, entry) {
     const map = { running: 'running', review_failed: 'warn', timed_out: 'warn', failed: 'fail', 'dispatch-failed': 'fail', completed: 'success' };
     const kind = map[status] || 'neutral';
-    const label = status === 'review_failed' ? 'review failed' : status === 'dispatch-failed' ? 'dispatch failed' : status;
+    const label = isReviewIncomplete(entry)
+      ? 'review incomplete'
+      : status === 'review_failed'
+        ? 'review failed'
+        : status === 'dispatch-failed'
+          ? 'dispatch failed'
+          : status;
     return '<span class="badge ' + kind + '">' + window.esc(label) + '</span>';
   }
 
@@ -279,7 +296,7 @@ export const overviewScript = `
         + '<div style="font-size:11px;color:var(--fg-tertiary);margin-top:2px">'
         + window.esc(e.teamKey || '—') + ' &middot; ' + window.esc(e.repo || '—')
         + '</div></td>'
-        + '<td>' + statusBadge(e.status) + '</td>'
+        + '<td>' + statusBadge(e.status, e) + '</td>'
         + '<td style="text-align:right" class="mono text-secondary">' + duration + '</td>';
       tbody.appendChild(tr);
     });
@@ -340,7 +357,8 @@ export const overviewScript = `
       const failedAt = e.dispatchedAt ? new Date(e.dispatchedAt).toLocaleString() : '—';
       const when = e.dispatchedAt ? fmtAgo(e.dispatchedAt) : '—';
       tr.innerHTML = '<td class="col-grow"><span class="mono text-secondary">' + window.esc(issueLabel) + '</span>'
-        + (e.issueTitle ? ' <span>' + window.esc(e.issueTitle) + '</span>' : '') + '</td>'
+        + (e.issueTitle ? ' <span>' + window.esc(e.issueTitle) + '</span>' : '')
+        + ' <span style="margin-left:6px">' + statusBadge(e.status, e) + '</span></td>'
         + '<td class="mono text-tertiary" style="white-space:nowrap">' + failedAt + '</td>'
         + '<td style="text-align:right" class="mono text-tertiary">' + when + '</td>';
       tbody.appendChild(tr);

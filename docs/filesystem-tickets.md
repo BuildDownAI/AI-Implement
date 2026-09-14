@@ -92,7 +92,8 @@ Click the filesystem issue link in the job's **Context** section to open its
 local issue viewer. **Ticket Markdown** shows the original task file, including
 front matter. **State JSON** shows the saved status, planning comments, and PR
 links from `.state/`. Use **Refresh** to reload both files as the run progresses.
-The viewer is read-only and requires an authenticated admin session.
+The viewer requires an authenticated admin session. Failed tickets without an
+existing PR or active run have a **Retry** action.
 
 Local Docker jobs also have a **View local logs** button in the job panel.
 It shows recent container output with a refresh action. Recent output is saved
@@ -105,6 +106,34 @@ local database between runs; use a new ticket identifier for an independent test
 Malformed tickets, duplicate IDs within a project, and corrupt state are excluded
 from dispatch and reported in the orchestrator log. Correct the affected file
 before retrying; corrupt state is never treated as a new ticket.
+
+## Completed tickets and retries
+
+The provider organizes ticket Markdown files under the configured directory:
+
+- The top level contains active work, including tickets with an open PR.
+- `completed/` contains tickets whose PR merged (or whose run finished with no
+  work required). An approved review by itself does not complete a ticket.
+- `failed/` contains terminal failures that need intervention, after automatic
+  retries are exhausted or a phase fails without an automatic retry.
+
+Status, plans, comments, and PR history stay at the original
+`.state/<project-key>/<ticket-id>.json` path. Archived tickets remain accessible
+through issue links, and late PR events can still update them. Existing completed
+tickets are archived during discovery; failure reconciliation runs during job
+monitoring. Temporary failures being retried stay active.
+
+For a failed ticket, open its issue viewer and choose **Retry**. This restores its
+Markdown file to the top level, clears retry counters and dispatch guards, and
+queues it for the next eligible poll. Planning failures restart planning;
+implementation failures retain their plan and restart implementation. A paused
+project stays paused. Moving the file manually does not reset its failed status.
+
+Retry is refused while a run is active or any PR is recorded for the ticket;
+continue work through that PR instead. Archive and restore operations refuse
+collisions and symlink destinations. Give each project its own ticket directory:
+automatic moves are refused when another mapping shares the same physical root.
+No ticket contents or history are deleted by archiving or retrying.
 
 For follow-up comments, GitHub must be able to reach the local orchestrator's
 `/api/github/webhook` endpoint through your development tunnel or webhook
@@ -124,3 +153,24 @@ For the trusted-versus-advisory reviewer test, define and select a custom review
 on the test repository's default branch. Have a ticket change its prompt on the
 PR branch. Confirm the default-branch reviewer still gates and the changed
 reviewer appears as an advisory preview. Test both directions of disagreement.
+
+## Review limits and incomplete reviews
+
+In **Projects**, edit the project's reviewer settings to set **Max turns** for
+each internal reviewer. A blank value inherits the reviewer's own default, or
+the global **Review Max Turns** under **Settings**. Both built-in reviewers
+inherit that global limit (30 by default). These limits are separate from the
+implementation's Max Turns.
+
+If a reviewer reaches its limit or cannot return a valid report, the remaining
+reviewers still run. The PR retains their reports and identifies the incomplete
+reviewer, the reason, and any usable partial evidence. Partial evidence never
+counts as approval. A required incomplete review blocks merge readiness;
+an advisory review stays advisory. Review infrastructure failures do not trigger
+an implementation pass to "fix" code.
+
+Complete the missing review before merging. You can raise the reviewer's limit
+for subsequent runs. There is currently no review-only retry action: the normal
+PR iteration path also runs implementation, so it should be used only when you
+intend to request work on the PR. The filesystem ticket's **Retry** action remains
+for failed tickets without an existing PR.

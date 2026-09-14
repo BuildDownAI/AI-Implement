@@ -612,6 +612,19 @@ describe("getJobById", () => {
 });
 
 describe("getPulls", () => {
+  it("carries reviewer failure classification without raw log tails", () => {
+    const id = log.appendLog({ issueId: "review-incomplete", issueIdentifier: "ENG-9" });
+    log.updateJobStatus(id, "review_failed", "REVIEWER_TURNS_EXHAUSTED", "https://github.com/org/repo/pull/9");
+    log.updateJobFailure(id, {
+      category: "invalid_output", code: "REVIEWER_TURNS_EXHAUSTED", stage: "post-push-review", attempt: 1,
+      retryable: false, reviewMaxTurns: 30, message: "Turn limit reached", evidence: { stderrTail: "private logs", truncated: false },
+    });
+    const [pull] = log.getPulls();
+    expect(pull.conclusion).toBe("REVIEWER_TURNS_EXHAUSTED");
+    expect(pull.failure).toMatchObject({ code: "REVIEWER_TURNS_EXHAUSTED", reviewMaxTurns: 30 });
+    expect(pull.failure?.evidence.stderrTail).toBeUndefined();
+  });
+
   it("returns one entry per unique prUrl, latest wins", () => {
     const id1 = log.appendLog({
       issueId: "issue-pr-1",

@@ -48,6 +48,9 @@ describe("overview page", () => {
     expect(overviewScript).toContain("review_failed: 'warn'");
     expect(overviewScript).toContain("status === 'review_failed'");
     expect(overviewScript).toContain("review failed");
+    expect(overviewScript).toContain("review incomplete");
+    expect(overviewScript).toContain("REVIEWER_TURNS_EXHAUSTED");
+    expect(overviewScript).toContain("PROVIDER_UNAVAILABLE");
   });
 
   it("includes stuck_giveup in the attention KPI filter", () => {

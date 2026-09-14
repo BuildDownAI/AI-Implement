@@ -157,13 +157,18 @@ function isReviewerSelectionArray(value: unknown): value is ReviewerSelection[] 
   const seen = new Set<string>();
   for (const entry of value) {
     if (entry === null || typeof entry !== "object" || Array.isArray(entry)) return false;
-    const { id, gates } = entry as { id?: unknown; gates?: unknown };
+    const { id, gates, maxTurns } = entry as { id?: unknown; gates?: unknown; maxTurns?: unknown };
     if (typeof id !== "string" || id.length === 0) return false;
     if (typeof gates !== "boolean") return false;
+    if (maxTurns !== undefined && !validReviewerMaxTurns(maxTurns)) return false;
     if (seen.has(id)) return false;
     seen.add(id);
   }
   return true;
+}
+
+function validReviewerMaxTurns(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 200;
 }
 
 function pickKnownKeys(cfg: RunConfigV1): RunConfigV1 {

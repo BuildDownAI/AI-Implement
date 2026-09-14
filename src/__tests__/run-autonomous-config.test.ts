@@ -485,7 +485,7 @@ describe("resolveRunnerInputs", () => {
 
   describe("(j) reviewers", () => {
     it("uses reviewers from the envelope when present", () => {
-      const reviewers = [{ id: "gap-analysis", gates: false }];
+      const reviewers = [{ id: "gap-analysis", gates: false, maxTurns: 45 }];
       const env = {
         AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig({
           v: 1,
@@ -517,6 +517,27 @@ describe("resolveRunnerInputs", () => {
           v: 1,
           issue: { id: "e", identifier: "AII-9", title: "t", description: "d" },
           reviewers: [{ id: "gap-analysis", gates: "true" }],
+        };
+        const env = {
+          AI_IMPLEMENT_RUN_CONFIG: Buffer.from(JSON.stringify(raw), "utf-8").toString("base64"),
+          ...BASE_ENV,
+        };
+        const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
+        expect(inputs.reviewers).toEqual(DEFAULT_REVIEWER_SELECTION);
+        expect(warnSpy).toHaveBeenCalledTimes(1);
+        expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("reviewers"));
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    it("falls back to DEFAULT_REVIEWER_SELECTION when reviewer maxTurns is malformed", () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const raw = {
+          v: 1,
+          issue: { id: "e", identifier: "AII-9", title: "t", description: "d" },
+          reviewers: [{ id: "gap-analysis", gates: true, maxTurns: 201 }],
         };
         const env = {
           AI_IMPLEMENT_RUN_CONFIG: Buffer.from(JSON.stringify(raw), "utf-8").toString("base64"),

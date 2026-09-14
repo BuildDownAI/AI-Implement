@@ -90,8 +90,10 @@ describe("projects page reviewer control", () => {
   it("declares the reviewer controls and uses escAttr for reviewer attribute contexts", () => {
     expect(projectsHtml).toContain('id="md-reviewer-list"');
     expect(projectsHtml).toContain('id="md-reviewer-id"');
+    expect(projectsHtml).toContain("Reviewer Max turns blank = inherit");
     expect(projectsScript).toContain('title="\' + window.escAttr(reviewer.id) + \'"');
     expect(projectsScript).toContain('aria-label="Runs \' + window.escAttr(reviewer.id) + \'"');
+    expect(projectsScript).toContain('aria-label="Max turns for \' + window.escAttr(reviewer.id) + \', blank inherits reviewer default or global limit"');
     expect(projectsScript).toContain("+ window.esc(reviewer.id) +");
   });
 
@@ -143,6 +145,49 @@ describe("projects page reviewer control", () => {
     expect(posts[0]).toMatchObject({ reviewers: [{ id: "code-review", gates: false }] });
   });
 
+  it("round-trips reviewer maxTurns and omits blank inherited caps", async () => {
+    const { win, doc, posts } = mountProjects(baseMapping({
+      reviewers: [
+        { id: "gap-analysis", gates: true, maxTurns: 45 },
+        { id: "code-review", gates: false },
+      ],
+    }));
+    await win.loadMappings();
+    win.openMappingDialog("AII");
+
+    const rows = reviewerRows(doc);
+    expect(rows[0].querySelector<HTMLInputElement>('input[type="number"]')?.value).toBe("45");
+    expect(rows[1].querySelector<HTMLInputElement>('input[type="number"]')?.value).toBe("");
+    const codeMaxTurns = rows[1].querySelector<HTMLInputElement>('input[type="number"]')!;
+    codeMaxTurns.value = "60";
+    codeMaxTurns.dispatchEvent(new doc.defaultView!.Event("change", { bubbles: true }));
+    const gapMaxTurns = rows[0].querySelector<HTMLInputElement>('input[type="number"]')!;
+    gapMaxTurns.value = "";
+    gapMaxTurns.dispatchEvent(new doc.defaultView!.Event("change", { bubbles: true }));
+
+    await save(win);
+    expect(posts[0]).toMatchObject({
+      reviewers: [
+        { id: "gap-analysis", gates: true },
+        { id: "code-review", gates: false, maxTurns: 60 },
+      ],
+    });
+  });
+
+  it("blocks reviewer maxTurns outside 1 through 200 before posting", async () => {
+    const { win, doc, posts } = mountProjects(baseMapping({ reviewers: null }));
+    await win.loadMappings();
+    win.openMappingDialog("AII");
+
+    const maxTurns = reviewerRows(doc)[0].querySelector<HTMLInputElement>('input[type="number"]')!;
+    maxTurns.value = "201";
+    maxTurns.dispatchEvent(new doc.defaultView!.Event("change", { bubbles: true }));
+
+    await save(win);
+    expect(posts).toEqual([]);
+    expect(doc.getElementById("md-error")?.textContent).toContain("Max turns");
+  });
+
   it("adds custom reviewer ids and escapes them as text rather than markup", async () => {
     const dangerousId = 'repo-review"><script>alert(1)</script>';
     const { win, doc, posts } = mountProjects(baseMapping({ reviewers: null }));
@@ -170,7 +215,7 @@ describe("projects page reviewer control", () => {
   it("loads and preserves a stored custom selection when nothing else changes", async () => {
     const custom = 'custom "quoted" reviewer';
     const { win, doc, posts } = mountProjects(baseMapping({
-      reviewers: [{ id: custom, gates: false }],
+      reviewers: [{ id: custom, gates: false, maxTurns: 33 }],
     }));
     await win.loadMappings();
     win.openMappingDialog("AII");
@@ -182,6 +227,6 @@ describe("projects page reviewer control", () => {
     ]);
 
     await save(win);
-    expect(posts[0]).toMatchObject({ reviewers: [{ id: custom, gates: false }] });
+    expect(posts[0]).toMatchObject({ reviewers: [{ id: custom, gates: false, maxTurns: 33 }] });
   });
 });

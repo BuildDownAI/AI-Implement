@@ -37,9 +37,8 @@ describe("formatRunAutopsy", () => {
       terminationReason: "reviewer_turns_exhausted",
       reviewMaxTurns: 30,
     });
-    // AUTOPSY.iterations is 3 (>= 2): a previous review DID run and a fix pass acted on it,
-    // so only the latest revision went unreviewed.
-    expect(md).toContain("The post-push reviewer ran out of turns at the configured cap (30) after 3 iteration(s); the latest revision was not reviewed.");
+    expect(md).toContain("A post-push reviewer reached its configured cap (30) after 3 iteration(s); required review is incomplete.");
+    expect(md).toContain("Other reviewer results are preserved below.");
     expect(md).toContain("The PR is open and ready for human review: https://github.com/acme/app/pull/9");
     expect(md).not.toContain("preserved in a draft PR");
     // Heading reflects that this is carried telemetry/context, not a completed review.
@@ -47,14 +46,15 @@ describe("formatRunAutopsy", () => {
     expect(md).not.toContain("Reviewer's final feedback:");
   });
 
-  it("says 'the code was not reviewed' on iteration 1 (no prior review to carry blockers from)", () => {
+  it("describes incomplete review without claiming no other reviewer ran on iteration 1", () => {
     const md = formatRunAutopsy({
       ...AUTOPSY,
       terminationReason: "reviewer_turns_exhausted",
       reviewMaxTurns: 30,
       iterations: 1,
     });
-    expect(md).toContain("the code was not reviewed.");
+    expect(md).toContain("required review is incomplete.");
+    expect(md).not.toContain("the code was not reviewed");
     expect(md).not.toContain("the latest revision was not reviewed");
   });
 

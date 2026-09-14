@@ -138,11 +138,24 @@ export const pipelinesScript = `
       function makeBadge(cls, text) {
         return '<span class="badge tight ' + cls + '">' + window.esc(text) + '</span>';
       }
-      function statusBadge(status, conclusion) {
+      function isReviewIncomplete(status, conclusion, failure) {
+        if (status !== 'review_failed') return false;
+        const code = failure && typeof failure.code === 'string' ? failure.code : conclusion;
+        const stage = failure && typeof failure.stage === 'string' ? failure.stage : '';
+        return code === 'REVIEWER_TURNS_EXHAUSTED'
+          || code === 'invalid_review'
+          || code === 'review_invalid'
+          || (code === 'PROVIDER_UNAVAILABLE' && (!stage || stage.includes('review')));
+      }
+      function statusBadge(status, conclusion, failure) {
         if (status === 'timed_out' && conclusion === 'stuck_giveup') {
           return makeBadge('fail', 'Needs human');
         }
-        const label = status === 'review_failed' ? 'review failed' : (status || 'dispatched');
+        const label = isReviewIncomplete(status, conclusion, failure)
+          ? 'review incomplete'
+          : status === 'review_failed'
+            ? 'review failed'
+            : (status || 'dispatched');
         return makeBadge(statusClass[status] || 'neutral', label);
       }
       function execBadge(mode, runnerMode) {
@@ -216,7 +229,7 @@ export const pipelinesScript = `
           // status (e.g. 'unknown' after an orchestrator restart) is known-completed.
           const planStatus = (plan.status === 'unknown' || plan.status === 'dispatched' || plan.status === 'running')
             ? 'completed' : plan.status;
-          const combinedStatus = statusBadge(planStatus, plan.conclusion) + ' <span style="color:#aaa;font-size:0.8em">→</span> ' + statusBadge(impl.status, impl.conclusion);
+          const combinedStatus = statusBadge(planStatus, plan.conclusion, plan.failure) + ' <span style="color:#aaa;font-size:0.8em">→</span> ' + statusBadge(impl.status, impl.conclusion, impl.failure);
           const prLink = impl.prUrl ? '<a href="' + window.safeUrl(impl.prUrl) + '" target="_blank">View</a>' : '—';
           const logs = logsButton(impl);
           tr.innerHTML = '<td style="white-space:nowrap">' + dt + '</td>'
@@ -265,7 +278,7 @@ export const pipelinesScript = `
             + '<td class="mono">' + window.esc(entry.repo || '—') + '</td>'
             + '<td>' + runnerCell + '</td>'
             + imageCell
-            + '<td>' + statusBadge(entry.status, entry.conclusion) + '</td>'
+            + '<td>' + statusBadge(entry.status, entry.conclusion, entry.failure) + '</td>'
             + '<td>' + logCell + cancelCell + '</td>';
         }
         tbody.appendChild(tr);

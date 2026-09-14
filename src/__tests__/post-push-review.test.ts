@@ -487,7 +487,7 @@ describe("postPushReviewStep", () => {
     ]);
     expect(calls[0][0].prompt).toContain("spec-coverage review only");
     expect(calls[1][0].prompt).toContain("complete merge-readiness review");
-    expect(calls.map((call) => call[0].maxTurns)).toEqual([3, 45]);
+    expect(calls.map((call) => call[0].maxTurns)).toEqual([45, 45]);
   });
 
   it("feeds selected gating reviewer findings into one fix ledger in gap-analysis-first order", async () => {
@@ -1377,7 +1377,7 @@ describe("postPushReviewStep", () => {
     expect(out.approved).toBe(false);
     expect(out.terminationReason).toBe("invalid_review");
     expect(invoke).toHaveBeenCalledTimes(1);
-    expect(ghComments.find((comment) => comment.includes("automated review pass did not finish"))).toContain("Reviewer domain-review returned no structured_output");
+    expect(ghComments.find((comment) => comment.includes("automated review is incomplete"))).toContain("Reviewer domain-review returned no structured_output");
   });
 
   it("fails closed when a selected reviewer returns invalid structured output", async () => {
@@ -1619,7 +1619,7 @@ describe("postPushReviewStep", () => {
     expect(out.iterations).toBe(2);
     expect(out.forcePushedRevisions).toBe(1);
     expect(out.finalFeedback).toContain("Missing null check");
-    expect(out.finalFeedback).toContain("1 automated fix revision(s) were pushed and not re-reviewed.");
+    expect(out.finalFeedback).toContain("1 automated fix revision(s) were pushed and not fully re-reviewed.");
     // The fix-revision line comes BEFORE the (potentially long) carried-blockers block, so
     // it survives run-autonomous.ts's 500-character slice of this same finalFeedback text
     // regardless of how many blockers are carried forward.
@@ -1631,12 +1631,12 @@ describe("postPushReviewStep", () => {
     expect(out.finalFeedback).toContain("Blocking issues from the previous review:");
 
     const exhaustedComment = ghComments.find((c) => c.includes("reviewer-turns-exhausted"));
-    expect(exhaustedComment).toContain("the latest revision was not reviewed");
+    expect(exhaustedComment).toContain("automated review is incomplete");
     expect(exhaustedComment).toContain("Blocking issues from the previous review:");
     expect(exhaustedComment).toContain("Missing null check");
     expect(exhaustedComment).toContain("Unhandled promise rejection");
     expect(exhaustedComment).toContain("Off-by-one in loop");
-    expect(exhaustedComment).toContain("1 automated fix revision(s) were pushed and not re-reviewed.");
+    expect(exhaustedComment).toContain("1 automated fix revision(s) were pushed and not fully re-reviewed.");
     expect(exhaustedComment!.indexOf("1 automated fix revision(s)")).toBeLessThan(
       exhaustedComment!.indexOf("Missing null check"),
     );
@@ -1721,7 +1721,7 @@ describe("postPushReviewStep", () => {
     expect(out.failure).toEqual(expect.objectContaining({ code: "PROVIDER_UNAVAILABLE", stage: "post-push-review" }));
     // 1 initial + 1 retry (stageRetries=1), then exhausted.
     expect(invoke).toHaveBeenCalledTimes(2);
-    expect(ghComments.some((c) => c.includes("provider was unavailable during review") && c.includes("not reviewed"))).toBe(true);
+    expect(ghComments.some((c) => c.includes("provider was unavailable") && c.includes("review is incomplete"))).toBe(true);
     expect(ghComments.every((c) => !c.includes("did not approve"))).toBe(true);
   });
   it("carries the prior iteration's blockers and fix-revision count forward when the provider is unavailable on iteration >= 2 (BAC-27134)", async () => {
@@ -1779,13 +1779,13 @@ describe("postPushReviewStep", () => {
     expect(out.terminationReason).toBe("provider_unavailable");
     expect(out.iterations).toBe(2);
     expect(out.forcePushedRevisions).toBe(1);
-    expect(out.finalFeedback).toContain("1 automated fix revision(s) were pushed and not re-reviewed.");
+    expect(out.finalFeedback).toContain("1 automated fix revision(s) were pushed and not fully re-reviewed.");
     expect(out.finalFeedback).toContain("Blocking issues from the previous review:");
     expect(out.finalFeedback).toContain("Missing null check");
 
     const providerComment = ghComments.find((c) => c.includes("provider-unavailable"));
-    expect(providerComment).toContain("the latest revision was not reviewed");
-    expect(providerComment).toContain("1 automated fix revision(s) were pushed and not re-reviewed.");
+    expect(providerComment).toContain("automated review is incomplete");
+    expect(providerComment).toContain("1 automated fix revision(s) were pushed and not fully re-reviewed.");
     expect(providerComment).toContain("Blocking issues from the previous review:");
     expect(providerComment).toContain("Missing null check");
   });
@@ -2825,19 +2825,18 @@ describe("postPushReviewStep", () => {
       id: "post-push-review.1",
       status: "failed",
       outputs: expect.objectContaining({
-        issues: [expect.stringContaining("claude auth temporarily unavailable")],
-        blockingIssues: [expect.objectContaining({
-          rawText: expect.stringContaining("claude auth temporarily unavailable"),
-        })],
+        feedback: expect.stringContaining("claude auth temporarily unavailable"),
+        issues: [],
+        blockingIssues: [],
       }),
     }));
     expect(ghComments.some((comment) => comment.includes("review-failed"))).toBe(true);
-    expect(ghComments.some((comment) => comment.includes("No actionable code feedback was produced"))).toBe(true);
+    expect(ghComments.some((comment) => comment.includes("review is incomplete"))).toBe(true);
     expect(ghComments.some((comment) => comment.includes("Manual review required; automated review did not complete"))).toBe(true);
     expect(ghComments.some((comment) => comment.includes("Not ready to merge until manually reviewed"))).toBe(false);
   });
 
-  it("reports missing structured reviewer output with structured blocking issue outputs", async () => {
+  it("reports missing structured output as incomplete review without inventing code blockers", async () => {
     const ghComments: string[] = [];
     const ghSpawn = vi.fn((args: string[]) => {
       if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
@@ -2862,10 +2861,9 @@ describe("postPushReviewStep", () => {
       id: "post-push-review.1",
       status: "failed",
       outputs: expect.objectContaining({
-        issues: [expect.stringContaining("Reviewer returned no structured_output")],
-        blockingIssues: [expect.objectContaining({
-          rawText: expect.stringContaining("Reviewer returned no structured_output"),
-        })],
+        feedback: expect.stringContaining("Reviewer returned no structured_output"),
+        issues: [],
+        blockingIssues: [],
       }),
     }));
     expect(ghComments.some((comment) => comment.includes("review-invalid"))).toBe(true);
@@ -5306,5 +5304,89 @@ describe("post-push-review structural invariants", () => {
     //                 submitPrReview first-stmt, step entry, before git push
     const occurrences = (source.match(/assertPrWritable\(/g) ?? []).length;
     expect(occurrences).toBe(7);
+  });
+});
+
+describe("independent incomplete reviewer results", () => {
+  it.each([
+    ["turns", true], ["turns", false],
+    ["invalid", true], ["invalid", false],
+    ["provider", true], ["provider", false],
+    ["throws", true], ["throws", false],
+  ] as const)("continues after %s failure (gates=%s) and publishes the completed review", async (kind, gates) => {
+    const reviews: string[] = [];
+    const comments: string[] = [];
+    const report = vi.fn(async (_step: any) => undefined);
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "api" && args[1].endsWith("/reviews")) {
+        reviews.push(args.find(arg => arg.startsWith("body="))!.slice(5));
+        return { stdout: JSON.stringify({ html_url: "https://github.com/o/r/pull/9#review-1" }), exitCode: 0 };
+      }
+      if (args[0] === "pr" && args[1] === "comment") comments.push(args[args.indexOf("--body") + 1]);
+      return { stdout: "", exitCode: 0 };
+    });
+    const partial = {
+      approved: true, findings: [], summary: "Checked acceptance criterion one in src/a.ts.",
+      checks: [{ check: "Criterion two", result: "not_verified", evidence: "Review interrupted before checking src/b.ts." }],
+    };
+    const invoke = vi.fn(async (params: any) => {
+      if (params.stage.includes("gap-analysis")) {
+        if (kind === "throws") throw new Error("review transport disconnected");
+        if (kind === "provider") return { stdout: "", stderr: "upstream returned 529 overloaded_error", exitCode: 1, tokensUsed: 0 };
+        if (kind === "invalid") return structuredReviewResult({ approved: "maybe" });
+        return { ...structuredReviewResult(partial), telemetry: { ...structuredReviewResult(partial).telemetry, outcome: "max_turns", numTurns: 12 } };
+      }
+      return structuredReviewResult({ approved: true, findings: [], summary: "Checked error handling in src/api.ts.", checks: [{ check: "Error handling", result: "passed", evidence: "src/api.ts handles a missing response." }] });
+    });
+    const out = await postPushReviewStep.run(makeCtx(invoke, { retryPolicy: { ...DEFAULT_RETRY_POLICY, stageRetries: 0 } }), {
+      prNumber: "9", workspaceDir: "/tmp", maxIterations: 3, reviewProviders: [], ghSpawn,
+      gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
+      reviewers: [{ id: "gap-analysis", gates, maxTurns: 12 }, { id: "code-review", gates: true }],
+      trustedReviewerDefinitions: reviewerMap([selectedReviewerDefinition("gap-analysis", { maxTurns: 3 }), selectedReviewerDefinition("code-review")]),
+    }, { report });
+    expect(invoke.mock.calls.map(([params]) => params.stage)).toEqual(["post-push-review/gap-analysis-review-1", "post-push-review/code-review-review-1"]);
+    expect(invoke.mock.calls[0][0].maxTurns).toBe(12);
+    expect(invoke.mock.calls[0][0].prompt).toContain("Reserve your final turn");
+    expect(out.approved).toBe(!gates);
+    if (gates) expect(out.terminationReason).toBe(({ turns: "reviewer_turns_exhausted", invalid: "invalid_review", provider: "provider_unavailable", throws: "review_failed" })[kind]);
+    expect(reviews).toHaveLength(1);
+    expect(reviews[0]).toContain("code-review: approved");
+    expect(reviews[0]).toContain("Checked error handling in src/api.ts.");
+    expect(reviews[0]).toContain("gap-analysis: review incomplete");
+    expect(reviews[0]).not.toContain("gap-analysis: approved");
+    expect(comments.join("\n").includes("Ready to merge")).toBe(!gates);
+    const aggregate = report.mock.calls.map(([step]) => step).find(step => step.id === "post-push-review.1");
+    expect(aggregate.outputs.issues).toEqual([]);
+    expect(aggregate.outputs.incompleteReviews[0]).toMatchObject({ reviewerId: "gap-analysis", gates });
+    if (kind === "turns") {
+      expect(reviews[0]).toContain("Criterion two");
+      expect(reviews[0]).toContain("src/b.ts");
+      expect(reviews[0]).toContain("incomplete; no approval");
+      const gapRow = report.mock.calls.map(([step]) => step).find(step => step.inputs.reviewerId === "gap-analysis");
+      expect(gapRow.outputs).toMatchObject({ approved: false, maxTurns: 12, partial: { checks: partial.checks } });
+    }
+  });
+
+  it("publishes actual code findings when another required reviewer is incomplete without starting a fix pass", async () => {
+    const reviews: string[] = [];
+    const invoke = vi.fn(async (params: any) => params.stage.includes("gap-analysis")
+      ? { ...structuredReviewResult(undefined), telemetry: { ...structuredReviewResult(undefined).telemetry, outcome: "max_turns" } }
+      : structuredReviewResult({ approved: false, findings: [{ severity: "blocking", body: "Null response crashes src/api.ts." }], summary: "Found missing null handling." }));
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "api" && args[1].endsWith("/reviews")) reviews.push(args.find(arg => arg.startsWith("body="))!.slice(5));
+      return { stdout: "", exitCode: 0 };
+    });
+    const out = await postPushReviewStep.run(makeCtx(invoke), {
+      prNumber: "9", workspaceDir: "/tmp", maxIterations: 3, reviewProviders: [], ghSpawn,
+      gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
+      reviewers: [{ id: "gap-analysis", gates: true }, { id: "code-review", gates: true }],
+      trustedReviewerDefinitions: reviewerMap([selectedReviewerDefinition("gap-analysis"), selectedReviewerDefinition("code-review")]),
+    }, { report: vi.fn(async () => undefined) });
+    expect(out.approved).toBe(false);
+    expect(invoke).toHaveBeenCalledTimes(2);
+    expect(reviews[0]).toContain("Null response crashes src/api.ts.");
+    expect(reviews[0]).toContain("No usable partial structured review evidence");
   });
 });

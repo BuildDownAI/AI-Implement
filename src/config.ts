@@ -90,6 +90,8 @@ export interface ReviewerSelection {
   id: string;
   /** false runs the reviewer and shows its findings without ever blocking a merge. */
   gates: boolean;
+  /** Optional per-reviewer turn cap. Omitted means inherit the global reviewer limit. */
+  maxTurns?: number;
 }
 
 /**

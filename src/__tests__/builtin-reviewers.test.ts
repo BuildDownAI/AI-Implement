@@ -53,17 +53,17 @@ describe("built-in reviewers", () => {
     const gap = await resolveReviewer("gap-analysis", { customRoot: "/workspace", existsSyncImpl: () => false });
     const code = await resolveReviewer("code-review", { customRoot: "/workspace", existsSyncImpl: () => false });
 
-    expect(keys(gap!)).toEqual(["buildPrompt", "id", "maxTurns", "outputSchema"]);
+    expect(keys(gap!)).toEqual(["buildPrompt", "id", "outputSchema"]);
     expect(keys(code!)).toEqual(["buildPrompt", "id", "outputSchema"]);
     expect("gates" in gap!).toBe(false);
     expect("gates" in code!).toBe(false);
   });
 
-  it("caps gap-analysis turns and leaves code-review uncapped for the retry policy default", async () => {
+  it("leaves built-in turn caps to the retry policy default", async () => {
     const gap = await resolveReviewer("gap-analysis", { customRoot: "/workspace", existsSyncImpl: () => false });
     const code = await resolveReviewer("code-review", { customRoot: "/workspace", existsSyncImpl: () => false });
 
-    expect(gap?.maxTurns).toBeGreaterThan(0);
+    expect(gap?.maxTurns).toBeUndefined();
     expect(code?.maxTurns).toBeUndefined();
   });
 

@@ -1,15 +1,21 @@
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { link, lstat, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { RepoMapping } from "../../config.js";
 import { FilesystemProvider } from "../../providers/filesystem.js";
+
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return { ...actual, link: vi.fn(actual.link) };
+});
 
 const tempDirs: string[] = [];
 
 afterEach(async () => {
   await Promise.all(tempDirs.map((dir) => rm(dir, { recursive: true, force: true })));
   tempDirs.length = 0;
+  vi.mocked(link).mockClear();
 });
 
 function mapping(overrides: Partial<RepoMapping> & { directory: string; planningEnabled?: boolean }): RepoMapping {
@@ -280,5 +286,315 @@ describe("FilesystemProvider", () => {
     await Promise.all([first.postComment(id, "first"), second.postComment(id, "second")]);
     const state = JSON.parse(await readFile(join(dir, ".state", "LOCAL", "LOCAL-3.json"), "utf8"));
     expect(state.comments.map((comment: { body: string }) => comment.body)).toEqual(["first", "second"]);
+  });
+
+  it("archives completed tickets after merge while keeping details lifecycle and key lookup available", async () => {
+    const dir = await tempTicketDir();
+    await writeTask(dir, "LOCAL-4.md", "---\ntitle: Completed archive\n---\nDone.");
+    const p = provider({ LOCAL: mapping({ directory: dir }) });
+    const id = "filesystem:LOCAL:LOCAL-4";
+
+    await p.markMerged(id, "LOCAL");
+
+    await expect(lstat(join(dir, "LOCAL-4.md"))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(join(dir, "completed", "LOCAL-4.md"), "utf8")).resolves.toContain("Completed archive");
+    await expect(p.fetchAIImplementSnapshot()).resolves.toMatchObject({
+      needsPlanning: [],
+      readyForImplementation: [],
+    });
+    await expect(p.fetchLifecycleStates([id])).resolves.toEqual(new Map([[id, "completed"]]));
+    await expect(p.findByKey("LOCAL-4")).resolves.toMatchObject({ id });
+    await expect(p.readIssueDetails(id)).resolves.toMatchObject({
+      location: "completed",
+      ticketPath: "completed/LOCAL-4.md",
+      statePath: ".state/LOCAL/LOCAL-4.json",
+    });
+  });
+
+  it("reconciles preexisting completed root files during snapshot polling", async () => {
+    const dir = await tempTicketDir();
+    const id = "filesystem:LOCAL:LOCAL-5";
+    await writeTask(dir, "LOCAL-5.md", "---\ntitle: Preexisting completed\n---\nDone.");
+    await mkdir(join(dir, ".state", "LOCAL"), { recursive: true });
+    await writeFile(join(dir, ".state", "LOCAL", "LOCAL-5.json"), JSON.stringify({
+      version: 1,
+      status: "completed",
+      comments: [],
+      prUrls: [],
+      updatedAt: "2026-09-14T00:00:00.000Z",
+    }), "utf8");
+
+    const snap = await provider({ LOCAL: mapping({ directory: dir }) }).fetchAIImplementSnapshot();
+
+    expect(snap.needsPlanning).toEqual([]);
+    await expect(readFile(join(dir, "completed", "LOCAL-5.md"), "utf8")).resolves.toContain("Preexisting completed");
+    await expect(provider({ LOCAL: mapping({ directory: dir }) }).readIssueDetails(id)).resolves.toMatchObject({
+      location: "completed",
+      ticketPath: "completed/LOCAL-5.md",
+    });
+  });
+
+  it("explicitly archives failed tickets and retries them without dropping history", async () => {
+    const dir = await tempTicketDir();
+    const id = "filesystem:LOCAL:LOCAL-6";
+    const p = provider({ LOCAL: mapping({ directory: dir }) });
+    await writeTask(dir, "retry-me.md", "---\ntitle: Retry me\nid: LOCAL-6\n---\nTry again.");
+
+    await expect(p.markPlanningFailed(id, "LOCAL", "needs a human")).resolves.toBe(true);
+    await expect(p.archiveFailed(id, "LOCAL", "planning")).resolves.toBe(true);
+    await expect(readFile(join(dir, "failed", "retry-me.md"), "utf8")).resolves.toContain("Try again");
+    await expect(p.fetchAIImplementSnapshot()).resolves.toMatchObject({
+      needsPlanning: [],
+      readyForImplementation: [],
+    });
+
+    await expect(p.retryFailed(id, "LOCAL")).resolves.toBe(true);
+    await expect(readFile(join(dir, "retry-me.md"), "utf8")).resolves.toContain("Try again");
+    await expect(lstat(join(dir, "failed", "retry-me.md"))).rejects.toMatchObject({ code: "ENOENT" });
+    const state = JSON.parse(await readFile(join(dir, ".state", "LOCAL", "LOCAL-6.json"), "utf8"));
+    expect(state.status).toBe("ready");
+    expect(state.failurePhase).toBeUndefined();
+    expect(state.comments.map((comment: { body: string }) => comment.body)).toEqual(["⚠️ Planning failed: needs a human"]);
+    expect((await p.fetchAIImplementSnapshot()).needsPlanning.map((issue) => issue.id)).toEqual([id]);
+  });
+
+  it("archives exhausted active tickets after watchdog reset by stamping failed state before moving", async () => {
+    const dir = await tempTicketDir();
+    const planningId = "filesystem:LOCAL:LOCAL-17";
+    const implementationId = "filesystem:LOCAL:LOCAL-18";
+    const terminalId = "filesystem:LOCAL:LOCAL-19";
+    const p = provider({ LOCAL: mapping({ directory: dir }) });
+    await writeTask(dir, "LOCAL-17.md", "---\ntitle: Parked planning\n---\nArchive after reset.");
+    await writeTask(dir, "LOCAL-18.md", "---\ntitle: Parked implementation\n---\nArchive after reset.");
+    await writeTask(dir, "LOCAL-19.md", "---\ntitle: Has PR\n---\nDo not archive.");
+
+    await p.markPlanningStarted(planningId, "LOCAL");
+    await expect(p.clearWorkingState(planningId, "LOCAL")).resolves.toBe(true);
+    await p.markImplementing(implementationId, "LOCAL");
+    await expect(p.clearWorkingState(implementationId, "LOCAL")).resolves.toBe(true);
+    await p.markPrReady(terminalId, "LOCAL", "https://github.com/acme/widgets/pull/19");
+
+    await expect(p.archiveFailed(planningId, "LOCAL", "planning")).resolves.toBe(true);
+    await expect(p.archiveFailed(implementationId, "LOCAL", "implementation")).resolves.toBe(true);
+    await expect(p.archiveFailed(terminalId, "LOCAL", "implementation")).resolves.toBe(false);
+
+    await expect(p.readIssueDetails(planningId)).resolves.toMatchObject({
+      location: "failed",
+      ticketPath: "failed/LOCAL-17.md",
+      state: { status: "failed", failurePhase: "planning" },
+    });
+    await expect(p.readIssueDetails(implementationId)).resolves.toMatchObject({
+      location: "failed",
+      ticketPath: "failed/LOCAL-18.md",
+      state: { status: "failed", failurePhase: "implementation" },
+    });
+    await expect(readFile(join(dir, "LOCAL-19.md"), "utf8")).resolves.toContain("Has PR");
+  });
+
+  it("recovers retry when a previous restore moved the file but failed before state reset", async () => {
+    const dir = await tempTicketDir();
+    const id = "filesystem:LOCAL:LOCAL-20";
+    const p = provider({ LOCAL: mapping({ directory: dir }) });
+    await writeTask(dir, "LOCAL-20.md", "---\ntitle: Root failed retry\n---\nRetry recovery.");
+    await p.markPlanningFailed(id, "LOCAL", "write failed after move");
+
+    expect((await p.fetchAIImplementSnapshot()).needsPlanning).toEqual([]);
+    await expect(p.retryFailed(id, "LOCAL")).resolves.toBe(true);
+    expect((await p.fetchAIImplementSnapshot()).needsPlanning.map((issue) => issue.id)).toEqual([id]);
+    const state = JSON.parse(await readFile(join(dir, ".state", "LOCAL", "LOCAL-20.json"), "utf8"));
+    expect(state.status).toBe("ready");
+    expect(state.failurePhase).toBeUndefined();
+  });
+
+  it("archives exhausted dispatch failures before a runner created state", async () => {
+    const dir = await tempTicketDir();
+    const id = "filesystem:LOCAL:LOCAL-22";
+    const p = provider({ LOCAL: mapping({ directory: dir }) });
+    await writeTask(dir, "LOCAL-22.md", "---\ntitle: Never started\n---\nRunner unavailable.");
+    await expect(p.archiveFailed(id, "LOCAL", "implementation")).resolves.toBe(true);
+    expect(await p.readIssueDetails(id)).toMatchObject({ location: "failed", state: { status: "failed", failurePhase: "implementation" } });
+    expect((await p.fetchAIImplementSnapshot()).needsPlanning).toEqual([]);
+  });
+
+  it("retries implementation failures to plan-approved and refuses known PR histories", async () => {
+    const dir = await tempTicketDir();
+    const id = "filesystem:LOCAL:LOCAL-7";
+    const p = provider({ LOCAL: mapping({ directory: dir }) });
+    await writeTask(dir, "LOCAL-7.md", "---\ntitle: Retry implementation\n---\nTry implementation again.");
+
+    await p.markImplementing(id, "LOCAL");
+    await expect(p.markImplementationFailed(id, "LOCAL", "tests failed")).resolves.toBe(true);
+    await expect(p.archiveFailed(id, "LOCAL", "implementation")).resolves.toBe(true);
+    await expect(p.markPrReady(id, "LOCAL", "https://github.com/acme/widgets/pull/7")).resolves.toBe(false);
+    await expect(p.retryFailed(id, "LOCAL")).resolves.toBe(true);
+    expect((await p.fetchAIImplementSnapshot()).readyForImplementation.map((issue) => issue.id)).toEqual([id]);
+
+    await p.markPrReady(id, "LOCAL", "https://github.com/acme/widgets/pull/7");
+    await expect(p.markImplementationFailed(id, "LOCAL", "late")).resolves.toBe(false);
+    await expect(p.archiveFailed(id, "LOCAL", "implementation")).resolves.toBe(false);
+  });
+
+  it("does not dispatch archived failed tickets or manual root moves without retry reset", async () => {
+    const dir = await tempTicketDir();
+    const id = "filesystem:LOCAL:LOCAL-8";
+    const p = provider({ LOCAL: mapping({ directory: dir }) });
+    await writeTask(dir, "LOCAL-8.md", "---\ntitle: Manual restore\n---\nKeep failed.");
+
+    await p.markPlanningFailed(id, "LOCAL", "manual");
+    await p.archiveFailed(id, "LOCAL", "planning");
+    await rename(join(dir, "failed", "LOCAL-8.md"), join(dir, "LOCAL-8.md"));
+
+    const snap = await p.fetchAIImplementSnapshot();
+    expect(snap.needsPlanning).toEqual([]);
+    expect(snap.readyForImplementation).toEqual([]);
+    await expect(p.readIssueDetails(id)).resolves.toMatchObject({
+      location: "active",
+      ticketPath: "LOCAL-8.md",
+      state: { status: "failed", failurePhase: "planning" },
+    });
+  });
+
+  it("ignores stale callbacks for archived failures but accepts comments and late merges", async () => {
+    const dir = await tempTicketDir();
+    const id = "filesystem:LOCAL:LOCAL-16";
+    const p = provider({ LOCAL: mapping({ directory: dir }) });
+    await writeTask(dir, "LOCAL-16.md", "---\ntitle: Late callbacks\n---\nCallbacks.");
+
+    await p.markPlanningFailed(id, "LOCAL", "manual");
+    await p.archiveFailed(id, "LOCAL", "planning");
+    await p.markPlanningStarted(id, "LOCAL");
+    await p.markPlanComplete(id, "LOCAL");
+    await p.markImplementing(id, "LOCAL");
+    await expect(p.clearWorkingState(id, "LOCAL")).resolves.toBe(false);
+    await p.postComment(id, "late comment");
+    await expect(p.readIssueDetails(id)).resolves.toMatchObject({
+      location: "failed",
+      state: { status: "failed" },
+    });
+
+    await p.markMerged(id, "LOCAL");
+    await expect(p.readIssueDetails(id)).resolves.toMatchObject({
+      location: "completed",
+      ticketPath: "completed/LOCAL-16.md",
+      state: { status: "completed" },
+    });
+    const state = JSON.parse(await readFile(join(dir, ".state", "LOCAL", "LOCAL-16.json"), "utf8"));
+    expect(state.comments.map((comment: { body: string }) => comment.body)).toEqual([
+      "⚠️ Planning failed: manual",
+      "late comment",
+    ]);
+  });
+
+  it("refuses duplicate ids across active completed and failed locations", async () => {
+    const dir = await tempTicketDir();
+    await mkdir(join(dir, "completed"));
+    await mkdir(join(dir, "failed"));
+    await writeTask(dir, "LOCAL-9.md", "---\ntitle: Active\n---\nA.");
+    await writeTask(dir, "completed-copy.md", "---\ntitle: Done\nid: LOCAL-9\n---\nB.");
+    await rename(join(dir, "completed-copy.md"), join(dir, "completed", "completed-copy.md"));
+    await writeTask(dir, "failed-copy.md", "---\ntitle: Failed\nid: LOCAL-10\n---\nC.");
+    await writeTask(dir, "active-copy.md", "---\ntitle: Also failed\nid: LOCAL-10\n---\nD.");
+    await rename(join(dir, "failed-copy.md"), join(dir, "failed", "failed-copy.md"));
+    const p = provider({ LOCAL: mapping({ directory: dir }) });
+
+    expect(await p.findByKey("LOCAL-9")).toBeNull();
+    expect(await p.findByKey("LOCAL-10")).toBeNull();
+    await expect(p.readIssueDetails("filesystem:LOCAL:LOCAL-9")).resolves.toBeNull();
+    expect((await p.fetchAIImplementSnapshot()).needsPlanning).toEqual([]);
+  });
+
+  it("refuses archive and restore collisions without overwriting files", async () => {
+    const dir = await tempTicketDir();
+    const id = "filesystem:LOCAL:LOCAL-11";
+    const p = provider({ LOCAL: mapping({ directory: dir }) });
+    await writeTask(dir, "LOCAL-11.md", "---\ntitle: Collide\n---\nOriginal.");
+    await mkdir(join(dir, "failed"));
+    await writeTask(join(dir, "failed"), "LOCAL-11.md", "---\ntitle: Existing\nid: LOCAL-99\n---\nExisting.");
+
+    await p.markPlanningFailed(id, "LOCAL", "manual");
+    await expect(p.archiveFailed(id, "LOCAL", "planning")).resolves.toBe(false);
+    await expect(readFile(join(dir, "LOCAL-11.md"), "utf8")).resolves.toContain("Original");
+
+    await writeTask(dir, "restore-collision.md", "---\ntitle: Active collision\nid: LOCAL-98\n---\nActive.");
+    await mkdir(join(dir, ".state", "LOCAL"), { recursive: true });
+    await writeFile(join(dir, ".state", "LOCAL", "LOCAL-12.json"), JSON.stringify({
+      version: 1,
+      status: "failed",
+      comments: [],
+      prUrls: [],
+      failurePhase: "planning",
+      updatedAt: "2026-09-14T00:00:00.000Z",
+    }), "utf8");
+    await writeTask(join(dir, "failed"), "restore-collision.md", "---\ntitle: Restore collision\nid: LOCAL-12\n---\nFailed.");
+    await expect(p.retryFailed("filesystem:LOCAL:LOCAL-12", "LOCAL")).resolves.toBe(false);
+    await expect(readFile(join(dir, "restore-collision.md"), "utf8")).resolves.toContain("Active");
+  });
+
+  it.each(["archive", "restore"])("refuses a destination created concurrently during %s", async (operation) => {
+    const dir = await tempTicketDir();
+    const id = "filesystem:LOCAL:LOCAL-21";
+    const p = provider({ LOCAL: mapping({ directory: dir }) });
+    await writeTask(dir, "LOCAL-21.md", "---\ntitle: Original\n---\nOriginal contents.");
+    await p.markPlanningFailed(id, "LOCAL", "manual");
+    if (operation === "restore") await p.archiveFailed(id, "LOCAL", "planning");
+    const source = join(dir, ...(operation === "archive" ? [] : ["failed"]), "LOCAL-21.md");
+    const target = join(dir, ...(operation === "archive" ? ["failed"] : []), "LOCAL-21.md");
+    const realFs = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+    vi.mocked(link).mockImplementationOnce(async (from, to) => {
+      await writeFile(to, "Concurrent ticket: must survive.", { flag: "wx" });
+      return realFs.link(from, to);
+    });
+    const result = operation === "archive"
+      ? await p.archiveFailed(id, "LOCAL", "planning")
+      : await p.retryFailed(id, "LOCAL");
+    expect(result).toBe(false);
+    expect(await readFile(source, "utf8")).toContain("Original contents");
+    expect(await readFile(target, "utf8")).toBe("Concurrent ticket: must survive.");
+  });
+
+  it("skips symlink archive directories and shared-root archival", async () => {
+    const dir = await tempTicketDir();
+    const outside = await tempTicketDir();
+    await symlink(outside, join(dir, "failed"));
+    const id = "filesystem:LOCAL:LOCAL-13";
+    const p = provider({ LOCAL: mapping({ directory: dir }) });
+    await writeTask(dir, "LOCAL-13.md", "---\ntitle: Symlink archive\n---\nDo not move out.");
+
+    await p.markPlanningFailed(id, "LOCAL", "manual");
+    await expect(p.archiveFailed(id, "LOCAL", "planning")).resolves.toBe(false);
+    await expect(readFile(join(dir, "LOCAL-13.md"), "utf8")).resolves.toContain("Symlink archive");
+    await expect(readFile(join(outside, "LOCAL-13.md"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+
+    const sharedId = "filesystem:ONE:ONE-1";
+    await writeTask(dir, "ONE-1.md", "---\ntitle: Shared\n---\nShared root.");
+    const shared = provider({
+      ONE: mapping({ directory: dir }),
+      TWO: mapping({ directory: dir }),
+    });
+    await shared.markMerged(sharedId, "ONE");
+    await expect(readFile(join(dir, "ONE-1.md"), "utf8")).resolves.toContain("Shared root");
+    await expect(shared.readIssueDetails(sharedId)).resolves.toMatchObject({
+      location: "active",
+      state: { status: "completed" },
+    });
+  });
+
+  it("keeps active clearWorkingState retry behavior unchanged", async () => {
+    const dir = await tempTicketDir();
+    const p = provider({ LOCAL: mapping({ directory: dir }) });
+    const planningId = "filesystem:LOCAL:LOCAL-14";
+    const implementationId = "filesystem:LOCAL:LOCAL-15";
+    await writeTask(dir, "LOCAL-14.md", "---\ntitle: Planning retry\n---\nPlan again.");
+    await writeTask(dir, "LOCAL-15.md", "---\ntitle: Implementation retry\n---\nImplement again.");
+
+    await p.markPlanningFailed(planningId, "LOCAL", "temporary");
+    await expect(p.clearWorkingState(planningId, "LOCAL")).resolves.toBe(true);
+    await p.markImplementing(implementationId, "LOCAL");
+    await p.markImplementationFailed(implementationId, "LOCAL", "temporary");
+    await expect(p.clearWorkingState(implementationId, "LOCAL")).resolves.toBe(true);
+
+    const snap = await p.fetchAIImplementSnapshot();
+    expect(snap.needsPlanning.map((issue) => issue.id)).toEqual([planningId]);
+    expect(snap.readyForImplementation.map((issue) => issue.id)).toEqual([implementationId]);
   });
 });

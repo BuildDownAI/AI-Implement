@@ -1,8 +1,6 @@
 import type { ReviewerDefinition, ReviewerPromptInput } from "./registry.js";
 import { BUILTIN_REVIEWER_VERDICT_SCHEMA } from "./schema.js";
 
-const GAP_ANALYSIS_MAX_TURNS = 3;
-
 function buildPrompt(input: ReviewerPromptInput): string {
   return `You are reviewing the diff for PR #${input.prNumber} against issue ${input.issueIdentifier}: ${input.issueTitle}.
 
@@ -45,7 +43,6 @@ const gapAnalysisReviewer: ReviewerDefinition = {
   id: "gap-analysis",
   buildPrompt,
   outputSchema: BUILTIN_REVIEWER_VERDICT_SCHEMA,
-  maxTurns: GAP_ANALYSIS_MAX_TURNS,
 };
 
 export default gapAnalysisReviewer;

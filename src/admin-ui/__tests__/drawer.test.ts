@@ -63,7 +63,8 @@ describe("job drawer", () => {
 
   it("shows review_failed jobs as review attention instead of completed", () => {
     expect(drawerScript).toContain("s === 'review_failed'");
-    expect(drawerScript).toContain("Review needs attention");
+    expect(drawerScript).toContain("Review failed");
+    expect(drawerScript).toContain("Review incomplete");
     expect(drawerScript).toContain("post-push review needs attention");
   });
 
@@ -219,6 +220,76 @@ describe("job drawer failure evidence", () => {
     expect(summary).toContain("transient/PROVIDER_OVERLOADED");
     expect(summary).toContain("attempt 2");
     expect(details[0].textContent).toContain("evidence truncated");
+    win.closeJobDrawer();
+  });
+
+  it("shows reviewer-turn exhaustion as review incomplete with reviewer cause, limit, and step evidence", async () => {
+    const reviewJob = {
+      ...BASE_JOB,
+      status: "review_failed",
+      conclusion: "REVIEWER_TURNS_EXHAUSTED",
+      prUrl: "https://github.com/org/repo/pull/42",
+      failure: {
+        category: "invalid_output",
+        code: "REVIEWER_TURNS_EXHAUSTED",
+        stage: "post-push-review.1.reviewer.0.trusted.code-review",
+        attempt: 1,
+        retryable: false,
+        reviewMaxTurns: 45,
+        message: "code-review ran out of turns",
+        evidence: { truncated: true },
+      },
+    };
+    const reviewStep = {
+      ...FAILED_STEP,
+      stepId: "post-push-review.1.reviewer.0.trusted.code-review",
+      stepType: "custom",
+      inputsJson: JSON.stringify({ reviewerId: "code-review", gates: true }),
+      outputsJson: JSON.stringify({ failure: reviewJob.failure, partial: { summary: "Checked API validation before interruption." } }),
+    };
+    const { win, doc } = mountDrawer(reviewJob, [reviewStep, PASSED_STEP]);
+    await win.openJobDrawer(1);
+
+    expect(doc.getElementById("drawer-issue-row")!.textContent).toContain("review incomplete");
+    expect(doc.getElementById("drawer-failure-alert")!.textContent).toContain("Review incomplete");
+    expect(doc.getElementById("drawer-failure-alert")!.textContent).toContain("Cause: reviewer turn limit");
+    expect(doc.getElementById("drawer-failure-alert")!.textContent).toContain("Limit: 45 turns");
+    expect(doc.getElementById("drawer-failure-alert")!.textContent).toContain("code-review");
+    expect(doc.getElementById("drawer-failure-alert")!.textContent).toContain("Checked API validation before interruption.");
+    expect(doc.getElementById("drawer-timeline")!.textContent).toContain("post-push review incomplete");
+    const details = doc.querySelector("#drawer-steps details.failure-evidence")!;
+    expect(details.textContent).toContain("Review status: incomplete");
+    expect(details.textContent).toContain("limit 45 turns");
+    win.closeJobDrawer();
+  });
+
+  it("keeps ordinary code rejection labeled review failed", async () => {
+    const reviewJob = {
+      ...BASE_JOB,
+      status: "review_failed",
+      conclusion: "REVIEW_UNAPPROVED",
+      prUrl: "https://github.com/org/repo/pull/43",
+      failure: {
+        category: "invalid_output",
+        code: "REVIEW_UNAPPROVED",
+        stage: "post-push-review",
+        attempt: 1,
+        retryable: false,
+        message: "blocking issue found",
+        evidence: { truncated: true },
+      },
+    };
+    const advisoryFailure = {
+      ...FAILED_STEP,
+      stepId: "post-push-review.1.reviewer.0.branch.preview",
+      inputsJson: JSON.stringify({ reviewerId: "preview", gates: false, reviewerProvenance: "branch" }),
+      outputsJson: JSON.stringify({ failure: { code: "REVIEWER_TURNS_EXHAUSTED", reviewMaxTurns: 30, stage: "post-push-review" } }),
+    };
+    const { win, doc } = mountDrawer(reviewJob, [advisoryFailure, PASSED_STEP]);
+    await win.openJobDrawer(1);
+    expect(doc.getElementById("drawer-issue-row")!.textContent).toContain("review failed");
+    expect(doc.getElementById("drawer-issue-row")!.textContent).not.toContain("review incomplete");
+    expect(doc.getElementById("drawer-failure-alert")!.textContent).toContain("Review failed");
     win.closeJobDrawer();
   });
 
