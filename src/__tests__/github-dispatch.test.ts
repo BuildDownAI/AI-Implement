@@ -24,7 +24,7 @@ vi.mock("../notify.js", () => ({
 }));
 
 function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
-  return {
+  const base: RepoMapping = {
     owner: "test-org",
     repo: "test-repo",
     workflowFile: "claude-implement.yml",
@@ -48,11 +48,19 @@ function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
     maxJobMinutes: null,
     branchPrefix: null,
     skillsRepo: null,
+    referenceRepos: null,
     sensitiveAddPatterns: null,
     sensitiveAllowPatterns: null,
     autoMerge: false,
     dependencyTokenScope: null,
+    memoryProviderId: null,
+    reviewers: null,
+  };
+  return {
+    ...base,
     ...overrides,
+    referenceRepos: overrides.referenceRepos === undefined ? base.referenceRepos : overrides.referenceRepos,
+    reviewers: overrides.reviewers === undefined ? base.reviewers : overrides.reviewers,
   };
 }
 
@@ -229,6 +237,22 @@ describe("buildEnvelopeDispatchInputs — envelope shape (case a)", () => {
     const decoded = decodeRunConfig(inputs.run_config!);
     expect(decoded.prNumber).toBe("42");
     expect("pr_number" in inputs).toBe(false);
+  });
+
+  it("carries mapping reviewers inside run_config when set", () => {
+    const reviewers = [
+      { id: "gap-analysis", gates: true },
+      { id: "code-review", gates: false },
+    ];
+    const mapping = makeMapping({ reviewers });
+    const inputs = buildEnvelopeDispatchInputs(mapping, baseIssue, {
+      retryPolicy: null,
+      runnerPhase: "implementation",
+      runToken: "",
+      runProgressToken: "",
+    });
+
+    expect(decodeRunConfig(inputs.run_config!).reviewers).toEqual(reviewers);
   });
 });
 

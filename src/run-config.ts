@@ -1,6 +1,6 @@
 import type { ReferenceRepo } from "./reference-repos.js";
 import type { RetryPolicy } from "./pipeline/retry-backoff.js";
-import type { RepoMapping } from "./config.js";
+import type { RepoMapping, ReviewerSelection } from "./config.js";
 
 /**
  * Versioned orchestrator→runner config envelope. Travels as ONE
@@ -44,6 +44,8 @@ export interface RunConfigV1 {
   dependencyTokenScope?: "installation";
   /** Reference repositories cloned read-only into the workspace. Absent on planning and kg-refresh dispatches. */
   referenceRepos?: ReferenceRepo[];
+  /** Which reviewers run on this project's PRs. Absent = runner uses DEFAULT_REVIEWER_SELECTION. */
+  reviewers?: ReviewerSelection[];
   /** Global retry/backoff policy and reviewer turn cap. Absent = runner uses DEFAULT_RETRY_POLICY. */
   retryPolicy?: RetryPolicy;
 }
@@ -145,8 +147,23 @@ export function buildImplRunConfig(input: ImplRunConfigInput): RunConfigV1 {
     ...(mapping.maxIterations != null ? { maxIterations: mapping.maxIterations } : {}),
     ...(groupingParent ? { groupingParent: true } : {}),
     ...(mapping.dependencyTokenScope != null ? { dependencyTokenScope: mapping.dependencyTokenScope } : {}),
+    ...(mapping.reviewers != null ? { reviewers: mapping.reviewers } : {}),
     retryPolicy,
   };
+}
+
+function isReviewerSelectionArray(value: unknown): value is ReviewerSelection[] {
+  if (!Array.isArray(value)) return false;
+  const seen = new Set<string>();
+  for (const entry of value) {
+    if (entry === null || typeof entry !== "object" || Array.isArray(entry)) return false;
+    const { id, gates } = entry as { id?: unknown; gates?: unknown };
+    if (typeof id !== "string" || id.length === 0) return false;
+    if (typeof gates !== "boolean") return false;
+    if (seen.has(id)) return false;
+    seen.add(id);
+  }
+  return true;
 }
 
 function pickKnownKeys(cfg: RunConfigV1): RunConfigV1 {
@@ -154,7 +171,7 @@ function pickKnownKeys(cfg: RunConfigV1): RunConfigV1 {
     runnerCallbackUrl, maxTurns, maxIterations, commentInstruction, sensitiveFiles,
     profiles, assigneeName, planningContext, groupingParent, dependencyTokenScope, kgSourceRepo,
     kgDryRun, kgSourceRef, kgAcceptNewBaseline, kgBaselineActor, referenceRepos,
-    retryPolicy } = cfg;
+    reviewers, retryPolicy } = cfg;
   const out: RunConfigV1 = { v, issue };
   if (prNumber !== undefined) out.prNumber = prNumber;
   if (baseBranch !== undefined) out.baseBranch = baseBranch;
@@ -177,6 +194,13 @@ function pickKnownKeys(cfg: RunConfigV1): RunConfigV1 {
   if (kgAcceptNewBaseline !== undefined) out.kgAcceptNewBaseline = kgAcceptNewBaseline;
   if (kgBaselineActor !== undefined) out.kgBaselineActor = kgBaselineActor;
   if (referenceRepos !== undefined) out.referenceRepos = referenceRepos;
+  if (reviewers !== undefined) {
+    if (isReviewerSelectionArray(reviewers)) {
+      out.reviewers = reviewers;
+    } else {
+      console.warn("[run-config] Ignoring invalid reviewers field; using default reviewer selection");
+    }
+  }
   if (retryPolicy !== undefined) out.retryPolicy = retryPolicy;
   return out;
 }
