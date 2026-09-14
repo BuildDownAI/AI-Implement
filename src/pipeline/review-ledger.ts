@@ -2,9 +2,12 @@ export type ReviewLedgerSource =
   | "claude-review-summary"
   | "github-review"
   | "github-review-thread"
-  | "ai-implement-internal";
+  | "ai-implement-internal"
+  | "review-contract";
 
 export type ReviewLedgerSeverity = "blocking" | "medium" | "minor";
+
+export type ReviewFindingsVerdict = "approve" | "changes_requested" | "incomplete";
 
 export const AI_IMPLEMENT_NATIVE_REVIEW_MARKER = "<!-- ai-implement native-review -->";
 
@@ -37,7 +40,10 @@ const GITHUB_ACTIONS_REVIEW_AUTHOR = "github-actions";
 
 export function collectExternalReviewFindingsFromGh(ghSpawn: GhSpawn, prNumber: string): { findings: ReviewLedgerFinding[]; findingsUnavailable: boolean } {
   const findings: ReviewLedgerFinding[] = [];
-  const out = { findingsUnavailable: false };
+  // `verdict` is captured for a later issue that will derive gating from it; nothing
+  // downstream of this function reads it yet, so it is deliberately not part of the
+  // public return shape below.
+  const out: { findingsUnavailable: boolean; verdict?: ReviewFindingsVerdict } = { findingsUnavailable: false };
 
   // A reviewer's latest formal verdict is authoritative: only reviewers currently in
   // CHANGES_REQUESTED state contribute blocking inline threads. Leftover nit threads from
@@ -67,17 +73,104 @@ function parseVerdictItem(item: unknown): { body: string; path?: string; line?: 
   return { body, ...(path ? { path } : {}), ...(line !== undefined ? { line } : {}) };
 }
 
+export interface ReviewFindingsBlockResult {
+  findings: ReviewLedgerFinding[];
+  verdict?: ReviewFindingsVerdict;
+  findingsUnavailable: boolean;
+}
+
+const REVIEW_FINDINGS_SCHEMA = "review-findings/v1";
+// The closing fence must stand alone on its own line (only whitespace before/after the
+// backticks). A lazy match to the *first* ``` anywhere would truncate the JSON early when a
+// finding's `body` legitimately contains an inline triple-backtick snippet (e.g. `` "Use:\n```js\nfoo()\n```" ``)
+// -- that inner sequence never starts a line by itself, so this pattern skips past it.
+const REVIEW_FINDINGS_FENCE_RE = /^[ \t]*```json[ \t]+review-findings[ \t]*\r?\n([\s\S]*?)^[ \t]*```[ \t]*(?=\r?\n|$)/gm;
+const REVIEW_FINDINGS_OPENING_FENCE_RE = /^[ \t]*```json[ \t]+review-findings[ \t]*(?:\r?\n|$)/gm;
+
+const REVIEW_FINDINGS_VERDICTS = new Set(["approve", "changes_requested", "incomplete"]);
+
+function isReviewFindingsVerdict(value: unknown): value is ReviewFindingsVerdict {
+  return typeof value === "string" && REVIEW_FINDINGS_VERDICTS.has(value);
+}
+
+function parseReviewFindingsBlockItem(item: unknown): ReviewLedgerFinding | null {
+  if (!isRecord(item)) return null;
+  if (item.severity !== "blocking" && item.severity !== "minor") return null;
+  const body = typeof item.body === "string" ? item.body.trim() : "";
+  if (!body) return null;
+  if (item.path !== undefined && typeof item.path !== "string") return null;
+  if (item.line !== undefined && typeof item.line !== "number") return null;
+  return {
+    source: "review-contract",
+    severity: item.severity,
+    body,
+    ...(typeof item.path === "string" && item.path ? { path: item.path } : {}),
+    ...(typeof item.line === "number" ? { line: item.line } : {}),
+  };
+}
+
+const INCOMPLETE_REVIEW_FINDINGS_RESULT: ReviewFindingsBlockResult = {
+  findings: [],
+  verdict: "incomplete",
+  findingsUnavailable: true,
+};
+
+/** Parses one already-extracted fenced block body. Any schema violation rejects the whole block. */
+function parseReviewFindingsBlockJson(candidate: string, url?: string): ReviewFindingsBlockResult {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(candidate);
+  } catch {
+    return INCOMPLETE_REVIEW_FINDINGS_RESULT;
+  }
+  if (!isRecord(parsed)) return INCOMPLETE_REVIEW_FINDINGS_RESULT;
+
+  if (parsed.schema !== REVIEW_FINDINGS_SCHEMA) {
+    if (typeof parsed.schema === "string" && parsed.schema) {
+      console.warn(`[review-ledger] Rejected review-findings block with unsupported schema "${parsed.schema}"`);
+    }
+    return INCOMPLETE_REVIEW_FINDINGS_RESULT;
+  }
+
+  if (!isReviewFindingsVerdict(parsed.verdict)) return INCOMPLETE_REVIEW_FINDINGS_RESULT;
+
+  const rawFindings = parsed.findings;
+  if (rawFindings !== undefined && !Array.isArray(rawFindings)) return INCOMPLETE_REVIEW_FINDINGS_RESULT;
+
+  const findings: ReviewLedgerFinding[] = [];
+  for (const item of Array.isArray(rawFindings) ? rawFindings : []) {
+    const finding = parseReviewFindingsBlockItem(item);
+    if (!finding) return INCOMPLETE_REVIEW_FINDINGS_RESULT;
+    findings.push({ ...finding, ...(url ? { url } : {}) });
+  }
+
+  return { findings, verdict: parsed.verdict, findingsUnavailable: false };
+}
+
+let legacyVerdictMarkerDeprecationLogged = false;
+
 /**
  * Extracts findings from a `<!-- claude-review-verdict {...} -->` marker embedded in a
- * comment body. Returns null when the marker is absent or the JSON is malformed (caller
- * should fall back to heading-based extraction). Returns an empty array when the marker
- * is present and valid but both blocking[] and minor[] are empty.
+ * comment body. This delimiter is stripped by anthropics/claude-code-action's own
+ * sanitizer before the comment is ever created, so it is kept only for one release to
+ * avoid silently dropping a reviewer mid-migration. Returns null when the marker is
+ * absent or the JSON is malformed (caller should fall back to heading-based extraction).
  */
-export function extractVerdictMarkerFindings(body: string, url?: string): ReviewLedgerFinding[] | null {
+function extractLegacyVerdictMarkerFindings(body: string, url?: string): ReviewFindingsBlockResult | null {
   const markerPrefix = "<!-- claude-review-verdict ";
   const markerSuffix = " -->";
   const startIdx = body.indexOf(markerPrefix);
   if (startIdx === -1) return null;
+
+  if (!legacyVerdictMarkerDeprecationLogged) {
+    legacyVerdictMarkerDeprecationLogged = true;
+    console.warn(
+      "[review-ledger] Comment uses the deprecated <!-- claude-review-verdict --> HTML marker; " +
+        "it is stripped by the reviewer action's own sanitizer and will stop being read. " +
+        "Migrate to a fenced ```json review-findings block.",
+    );
+  }
+
   const jsonStart = startIdx + markerPrefix.length;
   let parsed: unknown;
   let endIdx = body.indexOf(markerSuffix, jsonStart);
@@ -124,7 +217,37 @@ export function extractVerdictMarkerFindings(body: string, url?: string): Review
       });
     }
   }
-  return findings;
+  return { findings, findingsUnavailable: false };
+}
+
+/**
+ * Extracts the machine-readable review-findings contract from a comment body: a fenced
+ * ` ```json review-findings ` code block, which survives the reviewer action's HTML-comment
+ * stripping (unlike the predecessor marker below). Precedence and early-return shape mirror
+ * the pattern this replaces: null means "no contract present, caller falls back to prose
+ * extraction"; a non-null result — even with empty findings — means the caller must stop,
+ * because a present-but-broken block is a broken reviewer, not a prose one.
+ *
+ * When more than one block appears in a single comment, the last one wins.
+ */
+export function extractReviewFindingsBlock(body: string, url?: string): ReviewFindingsBlockResult | null {
+  const fenceMatches = [...body.matchAll(REVIEW_FINDINGS_FENCE_RE)];
+  const openingFenceMatches = [...body.matchAll(REVIEW_FINDINGS_OPENING_FENCE_RE)];
+
+  if (openingFenceMatches.length > 0) {
+    const lastOpeningMatch = openingFenceMatches[openingFenceMatches.length - 1];
+    const lastCompleteMatch = fenceMatches[fenceMatches.length - 1];
+    if (!lastCompleteMatch || lastOpeningMatch.index !== lastCompleteMatch.index) {
+      return INCOMPLETE_REVIEW_FINDINGS_RESULT;
+    }
+  }
+
+  if (fenceMatches.length > 0) {
+    const lastMatch = fenceMatches[fenceMatches.length - 1];
+    return parseReviewFindingsBlockJson(lastMatch[1].trim(), url);
+  }
+
+  return extractLegacyVerdictMarkerFindings(body, url);
 }
 
 export function extractClaudeSummaryFindings(body: string, url?: string): ReviewLedgerFinding[] {
@@ -430,7 +553,12 @@ function collectChangesRequestedReviews(ghSpawn: GhSpawn, prNumber: string, find
   return blockingReviewerLogins;
 }
 
-function collectClaudeIssueComments(ghSpawn: GhSpawn, prNumber: string, findings: ReviewLedgerFinding[], out: { findingsUnavailable: boolean }): void {
+function collectClaudeIssueComments(
+  ghSpawn: GhSpawn,
+  prNumber: string,
+  findings: ReviewLedgerFinding[],
+  out: { findingsUnavailable: boolean; verdict?: ReviewFindingsVerdict },
+): void {
   const result = safeGhSpawn(ghSpawn, [
     "api",
     "--paginate",
@@ -457,9 +585,11 @@ function collectClaudeIssueComments(ghSpawn: GhSpawn, prNumber: string, findings
     // already-trusted Claude author. Other integrations must not be able to
     // supersede the latest Claude review by emitting a lookalike marker.
     if (isVerdictEligibleAuthor(comment)) {
-      const verdictFindings = extractVerdictMarkerFindings(comment.body, url);
-      if (verdictFindings !== null) {
-        findings.push(...verdictFindings);
+      const result = extractReviewFindingsBlock(comment.body, url);
+      if (result !== null) {
+        findings.push(...result.findings);
+        if (result.findingsUnavailable) out.findingsUnavailable = true;
+        if (result.verdict !== undefined) out.verdict = result.verdict;
         return;
       }
     }
