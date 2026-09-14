@@ -307,6 +307,7 @@ describe("installStep reviewers output", () => {
           { id: "gap-analysis", gates: true },
           { id: "image-review", gates: true },
           { id: "claude-review-summary", gates: true },
+          { id: "legacy-post-push-review", gates: true },
           { id: "domain-review", gates: false },
         ],
         trustedReviewerDefinitions: new Map([

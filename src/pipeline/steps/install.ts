@@ -48,7 +48,7 @@ interface InstallOutputs extends Record<string, unknown> {
 }
 
 const KNOWN_REVIEW_PROVIDERS = new Set(["github-claude-code-review"]);
-const RESERVED_EXTERNAL_REVIEWER_IDS = new Set(["claude-review-summary"]);
+const RESERVED_CONFIG_REVIEWER_IDS = new Set(["claude-review-summary", "legacy-post-push-review"]);
 const CONFIG_PATH = ".ai-implement/config.yml";
 const TRUSTED_CONFIG_FETCH_TIMEOUT_MS = 15_000;
 
@@ -163,7 +163,7 @@ async function selectedGatingConfigReviewerIds(input: TrustedConfigReviewersInpu
   const seen = new Set<string>();
   for (const selection of input.reviewers ?? []) {
     if (!selection.gates) continue;
-    if (RESERVED_EXTERNAL_REVIEWER_IDS.has(selection.id)) continue;
+    if (RESERVED_CONFIG_REVIEWER_IDS.has(selection.id)) continue;
     if (trustedIds.has(selection.id)) continue;
     if (seen.has(selection.id)) continue;
     const trustedReviewer = await resolveTrustedReviewer(selection.id, { quietMissing: true });
