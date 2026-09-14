@@ -71,6 +71,8 @@ const BUILT_IN_REVIEWERS: Record<string, ReviewerDefinition> = {
 export interface ResolveReviewerOptions extends ImportModuleOptions {
   /** Injectable built-in registry for testing. Defaults to the module's built-in registry. */
   builtins?: Record<string, ReviewerDefinition>;
+  /** Suppresses the missing-id warning for callers that aggregate and report unresolved ids themselves. */
+  quietMissing?: boolean;
 }
 
 /**
@@ -95,7 +97,9 @@ export async function resolveReviewer(
   const builtin = Object.hasOwn(builtins, id) ? builtins[id] : undefined;
   const resolved = custom ?? builtin;
   if (!resolved) {
-    console.warn(`resolveReviewer: no reviewer registered for id "${id}"`);
+    if (!options?.quietMissing) {
+      console.warn(`resolveReviewer: no reviewer registered for id "${id}"`);
+    }
     return undefined;
   }
   return resolved;
@@ -126,7 +130,9 @@ export async function resolveTrustedReviewer(
   options?: ResolveTrustedReviewerOptions,
 ): Promise<ReviewerDefinition | undefined> {
   if (!isTrustedReviewerPathId(id)) {
-    console.warn(`resolveTrustedReviewer: invalid reviewer id path segment "${id}"`);
+    if (!options?.quietMissing) {
+      console.warn(`resolveTrustedReviewer: invalid reviewer id path segment "${id}"`);
+    }
     return undefined;
   }
   const trustedRoot = options?.trustedRoot ?? TRUSTED_REVIEWER_ROOT;

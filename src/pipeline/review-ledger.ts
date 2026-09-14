@@ -18,6 +18,8 @@ export interface ReviewLedgerFinding {
   path?: string;
   line?: number;
   url?: string;
+  /** Internal reviewer id when source is ai-implement-internal. */
+  reviewerId?: string;
 }
 
 export interface GhResult {

@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { postPushReviewStep } from "../pipeline/steps/post-push-review.js";
 import { OperatorCancelledError, PrMergedError } from "../pipeline/operator-cancelled.js";
 import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
+import type { ReviewerDefinition } from "../pipeline/reviewers/registry.js";
 
 function makeCtx(execMock: any, dataOverrides: Record<string, unknown> = {}) {
   return {
@@ -35,6 +36,19 @@ function invokeArg(invoke: ReturnType<typeof vi.fn>, index: number): any {
 
 function invokePrompt(invoke: ReturnType<typeof vi.fn>, index: number): string {
   return invokeArg(invoke, index).prompt as string;
+}
+
+function selectedReviewerDefinition(id: string, overrides: Partial<ReviewerDefinition> = {}): ReviewerDefinition {
+  return {
+    id,
+    buildPrompt: ({ previousFindings, diff }) => `${id} prompt\nPrevious:${previousFindings}\nDiff:${diff}`,
+    outputSchema: { type: "object" },
+    ...overrides,
+  };
+}
+
+function reviewerMap(definitions: ReviewerDefinition[]): ReadonlyMap<string, ReviewerDefinition> {
+  return new Map(definitions.map((definition) => [definition.id, definition]));
 }
 
 describe("postPushReviewStep", () => {
@@ -354,6 +368,264 @@ describe("postPushReviewStep", () => {
       jsonSchema: expect.objectContaining({ required: ["approved", "blocking_issues", "score", "progress_delta", "feedback"] }),
       model: "claude-sonnet-4-6",
     }));
+  });
+
+
+  it("runs selected internal reviewers in reviewer order with per-reviewer caps and aggregate row", async () => {
+    const report = vi.fn(async () => undefined);
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => structuredReviewResult({ approved: true, findings: [] }));
+    const trustedReviewerDefinitions = reviewerMap([
+      selectedReviewerDefinition("custom-review", { maxTurns: 7, model: "custom-model" }),
+      selectedReviewerDefinition("code-review"),
+      selectedReviewerDefinition("gap-analysis", { maxTurns: 3 }),
+      selectedReviewerDefinition("unselected-review"),
+    ]);
+
+    const out = await postPushReviewStep.run(
+      makeCtx(invoke, { retryPolicy: { ...DEFAULT_RETRY_POLICY, reviewMaxTurns: 45 } }),
+      {
+        prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [],
+        reviewers: [
+          { id: "custom-review", gates: true },
+          { id: "code-review", gates: true },
+          { id: "gap-analysis", gates: true },
+        ],
+        trustedReviewerDefinitions,
+      },
+      { report },
+    );
+
+    expect(out.approved).toBe(true);
+    const invokeCalls = invoke.mock.calls as any[][];
+    const reportCalls = report.mock.calls as any[][];
+    expect(invokeCalls.map((call) => call[0].stage)).toEqual([
+      "post-push-review/gap-analysis-review-1",
+      "post-push-review/code-review-review-1",
+      "post-push-review/custom-review-review-1",
+    ]);
+    expect(invokeCalls.map((call) => call[0].maxTurns)).toEqual([3, 45, 7]);
+    expect(invokeCalls.map((call) => call[0].model)).toEqual(["claude-sonnet-4-6", "claude-sonnet-4-6", "custom-model"]);
+    expect(invokeCalls.map((call) => call[0].prompt).join("\n")).not.toContain("unselected-review prompt");
+    expect(reportCalls.map((call) => call[0].id)).toEqual([
+      "post-push-review.1.gap-analysis",
+      "post-push-review.1.code-review",
+      "post-push-review.1.custom-review",
+      "post-push-review.1",
+    ]);
+    const aggregate = reportCalls.map((call) => call[0]).find((step) => step.id === "post-push-review.1");
+    expect(aggregate.outputs.approved).toBe(true);
+    expect(aggregate.outputs.telemetry).toBeUndefined();
+  });
+
+  it("uses the actual default built-in reviewer selection and trusted resolver fallback", async () => {
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => structuredReviewResult({ approved: true, findings: [] }));
+
+    const out = await postPushReviewStep.run(
+      makeCtx(invoke, { retryPolicy: { ...DEFAULT_RETRY_POLICY, reviewMaxTurns: 45 } }),
+      {
+        prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [],
+        reviewers: [{ id: "gap-analysis", gates: true }, { id: "code-review", gates: true }],
+      },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(true);
+    const calls = invoke.mock.calls as any[][];
+    expect(calls.map((call) => call[0].stage)).toEqual([
+      "post-push-review/gap-analysis-review-1",
+      "post-push-review/code-review-review-1",
+    ]);
+    expect(calls[0][0].prompt).toContain("spec-coverage review only");
+    expect(calls[1][0].prompt).toContain("complete merge-readiness review");
+    expect(calls.map((call) => call[0].maxTurns)).toEqual([3, 45]);
+  });
+
+  it("feeds selected gating reviewer findings into one fix ledger in gap-analysis-first order", async () => {
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "status") return { stdout: "", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const ghComments: string[] = [];
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") ghComments.push(args[args.indexOf("--body") + 1]);
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async (params) => {
+      if (params.stage === "post-push-review/gap-analysis-review-1") {
+        return structuredReviewResult({ approved: false, findings: [{ severity: "blocking", body: "Missing acceptance criterion" }] });
+      }
+      if (params.stage === "post-push-review/code-review-review-1") {
+        return structuredReviewResult({ approved: false, findings: [{ severity: "blocking", body: "Null dereference in handler" }] });
+      }
+      return { stdout: '{"fixed":[],"testing":[],"notes":""}', exitCode: 0, tokensUsed: 1 };
+    });
+
+    const out = await postPushReviewStep.run(
+      makeCtx(invoke),
+      {
+        prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn, reviewProviders: [],
+        reviewers: [{ id: "code-review", gates: true }, { id: "gap-analysis", gates: true }],
+        trustedReviewerDefinitions: reviewerMap([selectedReviewerDefinition("code-review"), selectedReviewerDefinition("gap-analysis")]),
+      },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(false);
+    expect(invoke).toHaveBeenCalledTimes(3);
+    const fixPrompt = invokePrompt(invoke, 2);
+    expect(fixPrompt.indexOf("Missing acceptance criterion")).toBeLessThan(fixPrompt.indexOf("Null dereference in handler"));
+    expect(ghComments.find((comment) => comment.includes("Reviewer found issues"))).toContain("Missing acceptance criterion");
+  });
+
+  it("keeps selected gates:false internal findings advisory and visible without starting a fix pass", async () => {
+    const ghComments: string[] = [];
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") ghComments.push(args[args.indexOf("--body") + 1]);
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => structuredReviewResult({ approved: false, findings: [{ severity: "blocking", body: "Advisory custom concern" }] }));
+
+    const out = await postPushReviewStep.run(
+      makeCtx(invoke),
+      {
+        prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [],
+        reviewers: [{ id: "custom-review", gates: false }],
+        trustedReviewerDefinitions: reviewerMap([selectedReviewerDefinition("custom-review")]),
+      },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(true);
+    expect(invoke).toHaveBeenCalledTimes(1);
+    const approvalComment = ghComments.find((comment) => comment.includes("Ready to merge"));
+    expect(approvalComment).toContain("Advisory custom concern");
+    expect(approvalComment).toContain("Advisory external review findings");
+  });
+
+  it("lets a gating selected reviewer win a same-body collision with an advisory reviewer", async () => {
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "status") return { stdout: "", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => structuredReviewResult({ approved: false, findings: [{ severity: "blocking", body: "Same defect" }] }));
+
+    const out = await postPushReviewStep.run(
+      makeCtx(invoke),
+      {
+        prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn, reviewProviders: [],
+        reviewers: [{ id: "custom-review", gates: false }, { id: "code-review", gates: true }],
+        trustedReviewerDefinitions: reviewerMap([selectedReviewerDefinition("custom-review"), selectedReviewerDefinition("code-review")]),
+      },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(false);
+    expect(invoke).toHaveBeenCalledTimes(3);
+    expect(invokePrompt(invoke, 2)).toContain("Same defect");
+  });
+
+  it("reports a selected reviewer's own maxTurns when that reviewer exhausts", async () => {
+    const ghComments: string[] = [];
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") ghComments.push(args[args.indexOf("--body") + 1]);
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => ({
+      ...structuredReviewResult({ approved: true, findings: [] }),
+      terminalStatus: { subtype: "error_max_turns", isError: true },
+      telemetry: { outcome: "max_turns" as const, numTurns: 7, durationMs: 60_000, costUsd: null, tokensIn: 10, tokensOut: 20 },
+    }));
+
+    const out = await postPushReviewStep.run(
+      makeCtx(invoke),
+      {
+        prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [],
+        reviewers: [{ id: "custom-review", gates: true }],
+        trustedReviewerDefinitions: reviewerMap([selectedReviewerDefinition("custom-review", { maxTurns: 7 })]),
+      },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.terminationReason).toBe("reviewer_turns_exhausted");
+    expect(out.failure).toEqual(expect.objectContaining({ reviewMaxTurns: 7 }));
+    expect(ghComments.some((comment) => comment.includes("(7)"))).toBe(true);
+  });
+
+  it("fails closed and names unresolved selected reviewers before running review", async () => {
+    const ghComments: string[] = [];
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "comment") ghComments.push(args[args.indexOf("--body") + 1]);
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const out = await postPushReviewStep.run(
+        makeCtx(invoke),
+        { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [], reviewers: [{ id: "missing-review", gates: true }], trustedReviewerDefinitions: new Map() },
+        { report: vi.fn(async () => undefined) },
+      );
+      expect(out.approved).toBe(false);
+      expect(out.terminationReason).toBe("invalid_review");
+      expect(invoke).not.toHaveBeenCalled();
+      expect(ghComments.some((comment) => comment.includes("missing-review") && comment.includes("Manual review required"))).toBe(true);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("missing-review"));
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("fails closed for an empty reviewer selection and for an external-only selection", async () => {
+    for (const reviewers of [[], [{ id: "claude-review-summary", gates: true }]]) {
+      const ghComments: string[] = [];
+      const ghSpawn = vi.fn((args: string[]) => {
+        if (args[0] === "pr" && args[1] === "comment") ghComments.push(args[args.indexOf("--body") + 1]);
+        return { stdout: "", exitCode: 0 };
+      });
+      const out = await postPushReviewStep.run(
+        makeCtx(vi.fn()),
+        { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [], reviewers, trustedReviewerDefinitions: new Map() },
+        { report: vi.fn(async () => undefined) },
+      );
+      expect(out.approved).toBe(false);
+      expect(ghComments.some((comment) => comment.includes("automated review is incomplete"))).toBe(true);
+    }
+  });
+
+  it("fails closed when a selected reviewer returns invalid structured output", async () => {
+    const ghComments: string[] = [];
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") ghComments.push(args[args.indexOf("--body") + 1]);
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => structuredReviewResult({ approved: false, findings: [] }));
+
+    const out = await postPushReviewStep.run(
+      makeCtx(invoke),
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [], reviewers: [{ id: "code-review", gates: true }], trustedReviewerDefinitions: reviewerMap([selectedReviewerDefinition("code-review")]) },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(false);
+    expect(out.terminationReason).toBe("invalid_review");
+    expect(ghComments.some((comment) => comment.includes("approved=false without findings"))).toBe(true);
   });
 
   it("fails closed when the reviewer returns text but no structured_output", async () => {
@@ -1120,13 +1392,12 @@ describe("postPushReviewStep", () => {
   });
 
   it("runs a fix pass when project reviewer settings opt prose summary findings into gating", async () => {
-    const reviewerOutput = {
-      approved: true,
-      blocking_issues: [],
-      feedback: "Internal reviewer approves.",
-      score: 9,
-      progress_delta: 0,
-    };
+    const reviewerOutput = { approved: true, findings: [] };
+    const trustedReviewerDefinitions = new Map([["code-review", {
+      id: "code-review",
+      buildPrompt: () => "selected code-review prompt",
+      outputSchema: { type: "object" },
+    }]]);
     const gitSpawn = vi.fn((args: string[]) => {
       if (args[0] === "status") return { stdout: "", exitCode: 0 };
       return { stdout: "", exitCode: 0 };
@@ -1165,7 +1436,8 @@ describe("postPushReviewStep", () => {
         maxIterations: 2,
         ghSpawn,
         gitSpawn,
-        reviewers: [{ id: "claude-review-summary", gates: true }],
+        reviewers: [{ id: "code-review", gates: true }, { id: "claude-review-summary", gates: true }],
+        trustedReviewerDefinitions,
       },
       { report: vi.fn(async () => undefined) },
     );
@@ -1245,13 +1517,12 @@ describe("postPushReviewStep", () => {
   });
 
   it("blocks on the same GitHub Actions prose shape when project settings opt prose into gating", async () => {
-    const reviewerOutput = {
-      approved: true,
-      blocking_issues: [],
-      feedback: "Internal reviewer approves.",
-      score: 9,
-      progress_delta: 0,
-    };
+    const reviewerOutput = { approved: true, findings: [] };
+    const trustedReviewerDefinitions = new Map([["code-review", {
+      id: "code-review",
+      buildPrompt: () => "selected code-review prompt",
+      outputSchema: { type: "object" },
+    }]]);
     const gitSpawn = vi.fn((args: string[]) => {
       if (args[0] === "status") return { stdout: "", exitCode: 0 };
       return { stdout: "", exitCode: 0 };
@@ -1296,7 +1567,8 @@ describe("postPushReviewStep", () => {
         maxIterations: 2,
         ghSpawn,
         gitSpawn,
-        reviewers: [{ id: "claude-review-summary", gates: true }],
+        reviewers: [{ id: "code-review", gates: true }, { id: "claude-review-summary", gates: true }],
+        trustedReviewerDefinitions,
       },
       { report: vi.fn(async () => undefined) },
     );

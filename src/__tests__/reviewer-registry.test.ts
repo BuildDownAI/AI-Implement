@@ -102,6 +102,17 @@ describe("resolveTrustedReviewer", () => {
     expect(checkedPaths.every((p) => p.startsWith("/trusted-package/"))).toBe(true);
     expect(checkedPaths.some((p) => p.startsWith("/env-baked-root/"))).toBe(false);
   });
+
+  it("can suppress trusted missing-id warnings for config probes", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await expect(resolveTrustedReviewer("missing", { trustedRoot: "/trusted-package", existsSyncImpl: () => false, builtins: {}, quietMissing: true })).resolves.toBeUndefined();
+      await expect(resolveTrustedReviewer("../evil", { trustedRoot: "/trusted-package", existsSyncImpl: () => true, quietMissing: true })).resolves.toBeUndefined();
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
 });
 
 afterEach(() => {
