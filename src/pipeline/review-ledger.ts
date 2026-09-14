@@ -318,10 +318,51 @@ export function extractClaudeSummaryFindings(body: string, url?: string): Review
 
 function classifyClaudeFindingHeading(value: string): ReviewLedgerSeverity | null {
   const normalized = normalizeText(value).replace(/:$/, "");
+  if (/\b(?:fixed|resolved|verified|ready to merge|holds up)\b/i.test(normalized)) return null;
+  // Check minor/non-blocking before blocking so "non-blocking" cannot escalate.
+  if (/\b(?:minor|non-blocking|cosmetic|notes?)\b/i.test(normalized)) return "minor";
   if (/\b(?:blocking|changes requested|must fix|required fixes?)\b/i.test(normalized)) return "blocking";
-  if (/\b(?:minor|non-blocking|notes?)\b/i.test(normalized)) return "minor";
   if (/\b(?:findings?|issues?|concerns?|problems?)\b/i.test(normalized)) return "medium";
   return null;
+}
+
+function isListItemLine(value: string): boolean {
+  return /^\s*(?:[-*+]|\d+[.)])\s+/.test(value);
+}
+
+function nextMeaningfulLine(lines: string[], startIndex: number): string | undefined {
+  for (let index = startIndex; index < lines.length; index++) {
+    const line = lines[index];
+    if (line.trim()) return line;
+  }
+  return undefined;
+}
+
+function isBoldFindingSectionLabel(
+  label: string,
+  trailingText: string,
+  nextLine: string | undefined,
+): boolean {
+  const normalized = normalizeText(label).replace(/:$/, "");
+  if (normalized.length === 0 || normalized.length > 80) return false;
+  if (/[.!?]$/.test(normalized)) return false;
+  if (trailingText.trim() && !isListItemLine(trailingText)) return false;
+  return !trailingText.trim() || (nextLine !== undefined && isListItemLine(nextLine));
+}
+
+function parseProseReviewVerdict(body: string): ReviewFindingsVerdict | undefined {
+  for (const line of body.split(/\r?\n/)) {
+    const normalized = normalizeText(line).replace(/^\*\*|\*\*$/g, "");
+    const mergeReadiness = normalized.match(/^Merge readiness:\s*(.+)$/i);
+    if (mergeReadiness) {
+      const verdictText = mergeReadiness[1];
+      if (/\bnot\s+ready\s+to\s+merge\b|\bchanges?\s+requested\b/i.test(verdictText)) {
+        return "changes_requested";
+      }
+      if (/\bready\s+to\s+merge\b|\bapproved?\b/i.test(verdictText)) return "approve";
+    }
+  }
+  return undefined;
 }
 
 function stripClaudeActionNoise(lines: string[]): string {
@@ -410,9 +451,10 @@ function parseSectionBullets(lines: string[]): string[] {
  * into structured findings, the caller is signalled via findingsUnavailable rather than
  * fabricating a synthetic block.
  */
-export function extractGithubActionsClaudeReviewFindings(body: string, url?: string): { findings: ReviewLedgerFinding[]; findingsUnavailable: boolean } {
+export function extractGithubActionsClaudeReviewFindings(body: string, url?: string): ReviewFindingsBlockResult {
   const findings: ReviewLedgerFinding[] = [];
   const lines = body.split(/\r?\n/);
+  const verdict = parseProseReviewVerdict(body);
   let severity: ReviewLedgerSeverity | null = null;
   let sectionLines: string[] = [];
   let recognizedSections = 0;
@@ -456,7 +498,7 @@ export function extractGithubActionsClaudeReviewFindings(body: string, url?: str
     sectionLines = [];
   };
 
-  for (const line of lines) {
+  for (const [index, line] of lines.entries()) {
     const markdownHeading = line.match(/^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$/);
     const boldHeading = line.match(/^\s*\*\*(.+?)\*\*\s*(.*)$/);
     if (markdownHeading) {
@@ -466,26 +508,32 @@ export function extractGithubActionsClaudeReviewFindings(body: string, url?: str
       continue;
     }
     if (boldHeading) {
-      const boldSeverity = classifyClaudeFindingHeading(boldHeading[1]);
-      if (boldSeverity) {
-        flush();
-        severity = boldSeverity;
-        recognizedSections += 1;
-        const trailingText = boldHeading[2].trim();
-        if (trailingText) sectionLines.push(trailingText);
+      const trailingText = boldHeading[2].trim();
+      const nextLine = nextMeaningfulLine(lines, index + 1);
+      if (!isBoldFindingSectionLabel(boldHeading[1], trailingText, nextLine)) {
+        if (severity) sectionLines.push(line);
         continue;
       }
+
+      flush();
+      severity = classifyClaudeFindingHeading(boldHeading[1]);
+      if (severity) {
+        recognizedSections += 1;
+        if (trailingText) sectionLines.push(trailingText);
+      }
+      continue;
     }
     if (severity) sectionLines.push(line);
   }
   flush();
 
-  if (findings.length > 0) return { findings, findingsUnavailable: false };
-  if (recognizedSections > 0 && explicitlyEmptySections === recognizedSections) return { findings: [], findingsUnavailable: false };
-  if (hasExplicitCleanVerdict(body) && !hasFindingSignal(body)) return { findings: [], findingsUnavailable: false };
+  if (findings.length > 0) return { findings, ...(verdict ? { verdict } : {}), findingsUnavailable: false };
+  if (verdict === "approve") return { findings: [], verdict, findingsUnavailable: false };
+  if (recognizedSections > 0 && explicitlyEmptySections === recognizedSections) return { findings: [], ...(verdict ? { verdict } : {}), findingsUnavailable: false };
+  if (hasExplicitCleanVerdict(body) && !hasFindingSignal(body)) return { findings: [], ...(verdict ? { verdict } : {}), findingsUnavailable: false };
 
   console.warn("[review-ledger] External review comment could not be parsed — treating findings as unavailable");
-  return { findings: [], findingsUnavailable: true };
+  return { findings: [], ...(verdict ? { verdict } : {}), findingsUnavailable: true };
 }
 
 export function formatReviewLedgerForPrompt(findings: ReviewLedgerFinding[]): string {
@@ -605,6 +653,7 @@ function collectClaudeIssueComments(
       const ghResult = extractGithubActionsClaudeReviewFindings(comment.body, url);
       findings.push(...ghResult.findings);
       if (ghResult.findingsUnavailable) out.findingsUnavailable = true;
+      if (ghResult.verdict !== undefined) out.verdict = ghResult.verdict;
       return;
     }
   }

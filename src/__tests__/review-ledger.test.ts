@@ -127,8 +127,140 @@ Late reviews are not persisted.
   });
 });
 
+const PR557_FIRST_CLAUDE_ACTION_REVIEW = "**Claude finished @ai-implement-orchestrator-bot[bot]'s task in 2m 50s** —— [View job](https://github.com/BuildDownAI/AI-Implement/actions/runs/34786750140)\n\n---\n### Claude finished the review\n\n- [x] Gather context (diff, CLAUDE.md, changed files)\n- [x] Understand the request (code review of PR #557)\n- [x] Review correctness/edge cases\n- [x] Review security issues\n- [x] Review style consistency\n- [x] Review test coverage\n- [x] Post final review with verdict block\n\n### Review\n\nClean, well-documented change overall. One correctness bug found in the new `PROVIDER_UNAVAILABLE` rendering.\n\n**Bug: wrong PR-state wording when `PROVIDER_UNAVAILABLE` happens during `post-push-review`**\n\n`providerUnavailableClassification` (`src/completion-classification.ts:248-268`) always renders the PR line as:\n\n```\ndetailParts.push(prUrl ? `The work so far is preserved in a draft PR: ${prUrl}` : \"No PR was opened.\");\n```\n\nregardless of `failure.stage`. But per `docs/pipeline-architecture.md`'s own description of this code path (and the pre-existing `formatRunAutopsy` in `src/run-autopsy.ts:57-60`), a `PROVIDER_UNAVAILABLE` failure at the `post-push-review` stage occurs against an **already-open PR** — nothing was \"preserved\" by the failing run, since post-push review runs after the PR already exists and there is no draft to push (as the docs for this exact PR state: *\"unlike the in-loop cases there is no draft to push (the PR exists already)\"*).\n\n`run-autopsy.ts` already handles this correctly:\n```js\na.prUrl\n  ? reviewerTurnsExhausted || (providerUnavailable && a.failure?.stage === \"post-push-review\")\n    ? `The PR is open and ready for human review: ${a.prUrl}`\n    : `The work so far is preserved in a draft PR: ${a.prUrl}`\n```\nand the new sibling function `reviewerTurnsExhaustedClassification` in this same PR correctly uses \"The PR is open and ready for human review\" for its own (always post-push) case — but `providerUnavailableClassification` was not given the same `stage === \"post-push-review\"` branch, so it incorrectly claims the PR is a \"draft\" that \"was preserved\" by this run.\n\nThis means the ticket-facing failure comment (both `formatFailureComment` and the monitor path, since they share this function) will misstate an already-open, previously-approved-track PR as a fresh draft when the outage happens during post-push review — inconsistent with the run autopsy comment for the identical event, and with the PR's own stated goal of surfacing accurate PROVIDER_UNAVAILABLE detail.\n\nThe test at `src/__tests__/completion-classification.test.ts:388-392` (\"reads as not reviewed for the post-push-review stage...\") only asserts on `summary`, not `detail`, so this gap isn't caught. Worth asserting `c.detail` there too once fixed.\n\nSuggested fix: mirror `run-autopsy.ts`'s condition, e.g.\n```js\nconst prLine = prUrl\n  ? failure.stage === \"post-push-review\"\n    ? `The PR is open and ready for human review: ${prUrl}`\n    : `The work so far is preserved in a draft PR: ${prUrl}`\n  : \"No PR was opened.\";\n```\n\n[Fix this →](https://claude.ai/code?q=In%20src%2Fcompletion-classification.ts%2C%20fix%20providerUnavailableClassification()%20(around%20line%20258)%3A%20when%20failure.stage%20%3D%3D%3D%20%22post-push-review%22%20and%20prUrl%20is%20present%2C%20render%20%22The%20PR%20is%20open%20and%20ready%20for%20human%20review%3A%20%24%7BprUrl%7D%22%20instead%20of%20%22The%20work%20so%20far%20is%20preserved%20in%20a%20draft%20PR%3A%20%24%7BprUrl%7D%22%2C%20matching%20run-autopsy.ts%27s%20existing%20%28providerUnavailable%20%26%26%20failure.stage%20%3D%3D%3D%20%22post-push-review%22%29%20condition.%20Add%20a%20detail-line%20assertion%20to%20the%20existing%20%22reads%20as%20not%20reviewed%20for%20the%20post-push-review%20stage%22%20test%20in%20src%2F__tests__%2Fcompletion-classification.test.ts.&repo=BuildDownAI/AI-Implement)\n\nEverything else — the `reviewMaxTurns` plumbing through `FailureRecord`/`isFailureRecord`/`projectFailureRecord`, the `post-push-review.ts` stamping, and the shared `statusLineFor` extraction — is correct and well-tested (including validation/projection edge cases for the new field). No security or shell-escaping concerns; this is pure text rendering.\n · branch `ai-implement/aii-647-render-provider-unavailable-and-reviewer-turns-e`";
+
+const PR557_SECOND_CLAUDE_ACTION_REVIEW = "**Claude finished @ai-implement-orchestrator-bot[bot]'s task in 57s** —— [View job](https://github.com/BuildDownAI/AI-Implement/actions/runs/34787040091)\n\n---\n### Review of PR #557\n\n- [x] Gather context (diff, CLAUDE.md, changed files)\n- [x] Understand the request (code review of PR #557)\n- [x] Review correctness/edge cases\n- [x] Review security issues\n- [x] Review style consistency\n- [x] Review test coverage\n- [x] Post final review with verdict block\n\n### Review\n\nThis re-review covers the full diff against `origin/testing`, including fix-pass commit `ac4af63` that addressed the earlier blocking finding.\n\n**Previous blocking issue is fixed correctly.** `providerUnavailableClassification` (`src/completion-classification.ts:258-263`) now mirrors `run-autopsy.ts`'s stage-aware PR line: `failure.stage === \"post-push-review\"` renders \"The PR is open and ready for human review\", other stages keep \"preserved in a draft PR\". A detail-text assertion was added (`src/__tests__/completion-classification.test.ts:394-398`) as requested.\n\nRest of the diff:\n- `statusLineFor` extraction is a clean, behavior-preserving refactor shared by all three branches.\n- `reviewMaxTurns` is threaded correctly end-to-end: stamped in `post-push-review.ts:1128` from the same local `retryPolicy.reviewMaxTurns` already used in that step's own PR comment, validated in `isFailureRecord`, preserved (and non-recognized keys still stripped) in `projectFailureRecord`, and defaulted via `DEFAULT_RETRY_POLICY.reviewMaxTurns` in the classifier for pre-existing records.\n- Callback path (`formatFailureComment`) and monitor path (`classifyCompletion`) are verified byte-identical for both new codes via dedicated tests.\n- `docs/pipeline-architecture.md` updates accurately describe the new code paths.\n- No security or shell-escaping concerns — this is pure text rendering, no new external input surface.\n\nTest coverage is thorough: stage/PR-presence matrix for `PROVIDER_UNAVAILABLE`, cap-present/absent for `REVIEWER_TURNS_EXHAUSTED`, validation/projection edge cases for the new field, and callback/monitor parity tests.\n\nNothing further to flag. Note: I could not run `npm run typecheck` / `npm test` locally in this session (tool permissions blocked `npm run ...`), so I relied on static review — the PR description reports both passing, consistent with what the code shows.\n\n\n · branch `ai-implement/aii-647-render-provider-unavailable-and-reviewer-turns-e`";
+
+const PR557_THIRD_CLAUDE_ACTION_REVIEW = "**Claude finished @ai-implement-orchestrator-bot[bot]'s task in 2m 28s** —— [View job](https://github.com/BuildDownAI/AI-Implement/actions/runs/34787254108)\n\n---\n### Reviewing PR #557\n\n- [x] Gather context (diff, CLAUDE.md, changed files)\n- [x] Understand the request (review latest push, commit `0659208`, on top of the two prior fix passes)\n- [x] Review correctness/edge cases\n- [x] Review security issues\n- [x] Review style consistency\n- [x] Review test coverage\n- [x] Post final review with verdict block\n\n### Review\n\nThis re-review covers the full diff (`origin/testing...HEAD`), including fix-pass commit `0659208` (iter 2) on top of `ac4af63` (iter 1).\n\n**Both prior blocking/minor findings are resolved:**\n- The stage-aware PR line in `providerUnavailableClassification` (`src/completion-classification.ts:236-241`) correctly renders \"The PR is open and ready for human review\" for `failure.stage === \"post-push-review\"` and \"preserved in a draft PR\" otherwise, mirroring `run-autopsy.ts`'s existing condition. A dedicated test now asserts the `detail` text for this case (`src/__tests__/completion-classification.test.ts:388-392`), not just `summary`.\n- The pre-existing `isInitialRun`/`prUrl` doc comment (`src/completion-classification.ts:284+`) is back directly above `classificationForFailure`, no longer floating over the unrelated `statusLineFor` helper.\n\n**Verified the rest of the diff holds up:**\n- `providerUnavailablePhrase` (`src/pipeline/failure-classification.ts:666`) is genuinely pre-existing and shared — confirmed it's unchanged in `origin/testing` and used identically by both `run-autopsy.ts` and the new `providerUnavailableClassification`, not duplicated.\n- `reviewMaxTurns` threading is correct end-to-end: stamped in `post-push-review.ts:1128` from the same local `retryPolicy.reviewMaxTurns` (line 901) already used in that step's own PR comment, validated in `isFailureRecord`, preserved by `projectFailureRecord` (with unrelated extra keys still stripped — see the new test at `failure-classification.test.ts`), and defaulted via `DEFAULT_RETRY_POLICY.reviewMaxTurns` in the classifier for records predating the field.\n- `formatFailureComment` (`runner-callback.ts`) and `classifyCompletion` both key off `failure.code` inside the shared `classificationForFailure`, verified byte-identical via the new dedicated tests for both codes.\n- `docs/pipeline-architecture.md` updates accurately describe the new code paths and stay consistent with the code.\n- No security or shell-escaping concerns — pure text rendering, no new external input surface.\n\n**Minor/cosmetic (non-blocking):** in `src/__tests__/post-push-review.test.ts`, the new `it(\"stamps a non-default reviewMaxTurns...\")` block (lines 482-495) has no blank line separating it from the following `it(\"routes a success-subtype...\")` block, inconsistent with the blank-line-between-tests style used everywhere else in the file.\n\nI was unable to run `npm run typecheck` / `npm test` in this session (tool permissions blocked `npm run ...`), so this is a static review — the PR's own reporting (75/75 and full-suite 5591 passing) is consistent with what the code and tests show.\n\n**Merge readiness:** Ready to merge — no blocking issues found.\n\n\n · branch `ai-implement/aii-647-render-provider-unavailable-and-reviewer-turns-e`";
+
 describe("extractGithubActionsClaudeReviewFindings", () => {
+
+  it("does not treat a bold resolved-blocker sentence as a findings heading", () => {
+    const body = [
+      "**Claude finished the review**",
+      "",
+      "### Review",
+      "",
+      "**Previous blocking issue is fixed correctly.** The implementation now mirrors the expected behavior.",
+      "",
+      "Rest of the diff:",
+      "- No security or shell-escaping concerns — pure text rendering, no new external input surface.",
+    ].join("\n");
+
+    const result = extractGithubActionsClaudeReviewFindings(body);
+    expect(result.findings).toEqual([]);
+  });
+
+  it("classifies a genuine non-blocking bold findings heading as minor", () => {
+    const body = [
+      "**Claude finished the review**",
+      "",
+      "### Review",
+      "",
+      "**Minor/cosmetic (non-blocking):**",
+      "- Add a blank line between adjacent tests.",
+    ].join("\n");
+
+    expect(extractGithubActionsClaudeReviewFindings(body, "https://example.com/review")).toEqual({
+      findings: [
+        {
+          source: "claude-review-summary",
+          severity: "minor",
+          body: "Add a blank line between adjacent tests.",
+          url: "https://example.com/review",
+        },
+      ],
+      findingsUnavailable: false,
+    });
+  });
+
+  it("closes an open findings section on an unrecognized bold heading", () => {
+    const body = [
+      "**Claude finished the review**",
+      "",
+      "**Blocking issues:**",
+      "- Missing null check on the return value from getUser().",
+      "",
+      "**Verified the rest of the diff holds up:**",
+      "- The tests cover the changed behavior.",
+      "- No security concerns.",
+    ].join("\n");
+
+    expect(extractGithubActionsClaudeReviewFindings(body)).toEqual({
+      findings: [
+        {
+          source: "claude-review-summary",
+          severity: "blocking",
+          body: "Missing null check on the return value from getUser().",
+        },
+      ],
+      findingsUnavailable: false,
+    });
+  });
+
+  it("parses a Merge readiness line as the prose review verdict", () => {
+    const body = [
+      "**Claude finished the review**",
+      "",
+      "### Review",
+      "",
+      "No blocking issues found.",
+      "",
+      "**Merge readiness:** Ready to merge — no blocking issues found.",
+    ].join("\n");
+
+    expect(extractGithubActionsClaudeReviewFindings(body)).toEqual({
+      findings: [],
+      verdict: "approve",
+      findingsUnavailable: false,
+    });
+  });
+
+  it.each([
+    ["first", PR557_FIRST_CLAUDE_ACTION_REVIEW],
+    ["second", PR557_SECOND_CLAUDE_ACTION_REVIEW],
+    ["third", PR557_THIRD_CLAUDE_ACTION_REVIEW],
+  ])("keeps the real PR #557 %s Claude Actions review from producing blocking findings", (_label, body) => {
+    const result = extractGithubActionsClaudeReviewFindings(body, "https://example.com/pr557");
+    expect(result.findings.filter((finding) => finding.severity === "blocking")).toEqual([]);
+  });
+
+  it("returns the PR #557 final Merge readiness line as an approving verdict", () => {
+    expect(extractGithubActionsClaudeReviewFindings(PR557_THIRD_CLAUDE_ACTION_REVIEW)).toMatchObject({
+      verdict: "approve",
+      findingsUnavailable: false,
+    });
+  });
+
   it("extracts prose under the live Claude Actions blocking heading", () => {
+    const body = [
+      "**Claude finished the review**",
+      "",
+      "### Review: PR #302",
+      "",
+      "### Blocking",
+      "",
+      "- Missing regression test for the actual vulnerability that was fixed. The existing test would pass under the vulnerable implementation.",
+      "",
+      "### Everything else",
+      "",
+      "No other changes are required.",
+    ].join("\n");
+
+    expect(extractGithubActionsClaudeReviewFindings(body, "https://example.com/review")).toEqual({
+      findings: [
+        {
+          source: "claude-review-summary",
+          severity: "blocking",
+          body: "Missing regression test for the actual vulnerability that was fixed. The existing test would pass under the vulnerable implementation.",
+          url: "https://example.com/review",
+        },
+      ],
+      findingsUnavailable: false,
+    });
+  });
+
+  it("keeps a bold finding sentence as content inside an active blocking section", () => {
     const body = [
       "**Claude finished the review**",
       "",
@@ -151,6 +283,26 @@ describe("extractGithubActionsClaudeReviewFindings", () => {
           severity: "blocking",
           body: "Missing regression test for the actual vulnerability that was fixed. The existing test would pass under the vulnerable implementation.",
           url: "https://example.com/review",
+        },
+      ],
+      findingsUnavailable: false,
+    });
+  });
+
+  it("extracts a genuine defect bullet under a Must fix bold section label", () => {
+    const body = [
+      "**Claude finished the review**",
+      "",
+      "**Must fix:**",
+      "- Reject missing repository names before calling the GitHub API.",
+    ].join("\n");
+
+    expect(extractGithubActionsClaudeReviewFindings(body)).toEqual({
+      findings: [
+        {
+          source: "claude-review-summary",
+          severity: "blocking",
+          body: "Reject missing repository names before calling the GitHub API.",
         },
       ],
       findingsUnavailable: false,
