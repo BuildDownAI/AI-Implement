@@ -1,0 +1,46 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "summary", "findings"],
+  "properties": {
+    "verdict": {
+      "type": "string",
+      "enum": ["approve", "request_changes"],
+      "description": "Overall merge-readiness verdict. Use request_changes whenever findings[] contains any entry with severity=blocking."
+    },
+    "summary": {
+      "type": "string",
+      "description": "Free-text reviewer summary. Presentation only — carried into the posted comment verbatim, never parsed by the gate."
+    },
+    "findings": {
+      "type": "array",
+      "description": "Every issue worth surfacing, blocking or not. Empty when the diff looks fine.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["severity", "title", "body"],
+        "properties": {
+          "severity": {
+            "type": "string",
+            "enum": ["blocking", "minor"],
+            "description": "blocking: must be fixed before merge. minor: worth surfacing but does not gate approval."
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Short label for the finding."
+          },
+          "location": {
+            "type": "string",
+            "description": "File path, and line or function, when known. Omit when the finding is not localised to a spot in the diff."
+          },
+          "body": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Full, self-contained description of the issue. Never a bare '```' line on its own — that would close the comment's fenced sections early."
+          }
+        }
+      }
+    }
+  }
+}
