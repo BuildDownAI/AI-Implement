@@ -23,22 +23,34 @@ AII-555 lane moved its dispatch onto the standard workflow.
 We adopt Restate one run kind at a time and make the run-ledger program contingent on
 evidence:
 
-1. Integration testing first (green field, fail-soft switches; failure costs nothing).
-2. kg-refresh second, only after the integration-testing spike passes its written criteria
-   ("Plan, Part 2" §5).
-3. Each migration flips **its own** callback branch to verify-only: the token is validated,
+1. kg-refresh first (operator decision, 2026-09-14): its lifecycle glue is the buggiest
+   of its kind — the reaper rules alone needed two fix rounds — and the run kind is
+   nearly standard since AII-583 and AII-555. The Restate harness and the deployed
+   server land inside this case; the consequence, accepted, is that the first case is
+   not deployment-free.
+2. The feedback-loop test surface second (CI only, no deployment): the implement/review
+   loop extracted behind an injected executor and tested as a workflow with
+   testcontainers. This case is the seam the multi-agent work (AII-440, Codex and
+   OpenCode) builds on.
+3. Integration testing after that (the AII-441 tree), building on the proven harness
+   and server, judged against its written criteria ("Plan, Part 2" §5).
+4. Each migration flips **its own** callback branch to verify-only: the token is validated,
    never consumed, and a duplicate report is a no-op by the workflow handler rule. This is
    a per-path slice of the AII-611 idea, carried inside each migration.
-4. SQLite stays the system of record. Every migrated run kind writes its dispatch row, run
+5. SQLite stays the system of record. Every migrated run kind writes its dispatch row, run
    record, and conclusion to SQLite from journaled steps. Restate holds workflow position
    only. Admin surfaces and the KG ingest are unchanged.
-5. After the second migration, a written evaluation gate decides: the main pipeline
+6. After the second migration, a written evaluation gate decides: the main pipeline
    migrates the same way and AII-611 is cancelled or narrowed, or AII-611 proceeds first.
    The decision lands on AII-611, and ADRs 015, 016, 017, and this one move to Accepted or
    Rejected.
 
 ## Alternatives considered
 
+- **Green-field first (integration testing before kg-refresh)** — the order this ADR
+  first recorded. Rejected by the operator on 2026-09-14: it defers value on the
+  buggiest live glue, and the deployment risk exists in the first case either way,
+  because the SDK dependency enters the image with the harness.
 - **Ledger first (the original sequence)** — rejected for now: it changes every live
   report path before any migration exists to justify it, and its blast radius is the
   instability the operator flagged.
