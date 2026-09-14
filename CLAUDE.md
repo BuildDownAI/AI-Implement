@@ -261,7 +261,7 @@ Optional, in the target repo. Parsed with a real YAML parser; a missing file, ma
 | `models.implement` / `models.review` | Per-phase models |
 | `reviewProviders` | External review sources; `github-claude-code-review` is the only recognised value |
 | `reviewCheckNames` | Check-run names that identify the external review gate. Defaults to `review`, `code-review-plugin`, `claude-review`, `claude code review`, `claude-code-review`, plus any name containing both `claude` and `review`. A target repo with an unrelated CI job named `review` should set this to avoid that job becoming the review gate |
-| `reviewers` | Advisory prompt-only reviewer definitions read from the checked-out workspace. Each entry needs `id` and `prompt`; `model` is optional. Definitions carry no `gates` field, so selecting/gating reviewers stays in project settings and the run envelope |
+| `reviewers` | Advisory prompt-only reviewer definitions read from the checked-out workspace. Each entry needs `id` and `prompt`; `model` is optional. Definitions carry no `gates` field, so selecting/gating reviewers stays in project settings and the run envelope. Once wired into review execution, built-in and image-baked reviewer definitions take precedence over matching config ids |
 
 **This is where per-phase model selection lives.** Both keys take precedence over `WORKFLOW.md`'s `model:` — the chain is `config.yml` → front matter → built-in default. Pairing a strong implement model with a cheap review model is the supported way to hold down review cost.
 

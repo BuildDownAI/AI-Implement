@@ -67,11 +67,16 @@ function parseReviewProvidersConfig(value: unknown): string[] | undefined {
   return providers;
 }
 
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+/**
+ * `.ai-implement/config.yml` is read from the PR workspace, so reviewer declarations
+ * are prompt data only: they never carry gates, a schema, or an executable override.
+ * Built-in and image-baked reviewer definitions must win during integration; otherwise
+ * a PR could replace `gap-analysis` with a prompt that approves itself.
+ */
 export function parseReviewersConfig(value: unknown): ReviewerDefinition[] | undefined {
   if (value === undefined) return undefined;
   if (!Array.isArray(value)) {
