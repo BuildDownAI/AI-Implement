@@ -1,51 +1,48 @@
 ---
-# Model for implementation and review passes. Passed to `claude --model`
-# verbatim, so any ID this repo's provider accepts works. This repo's mapping
-# runs on the Anthropic provider; replace with a Bedrock model ID if that changes.
 model: claude-sonnet-5
 ---
 
 <!--
-  AI-Implement's OWN implementation prompt, used when the orchestrator dispatches a runner at this repository. The template distributed to target repos is a separate file — workflows/WORKFLOW.md — and edits here do not propagate to it.
-
-  The runner strips this front matter and these comments, substitutes ${ISSUE_ID}, ${ISSUE_IDENTIFIER}, ${ISSUE_TITLE}, ${ISSUE_DESCRIPTION} and ${PR_NUMBER}, then sends the rest as the prompt. Any other ${UPPER_SNAKE} token is replaced with an empty string, so don't write shell examples containing one. CLAUDE.md is also loaded automatically on every invocation, so the pointer below is deliberate redundancy: that behaviour is documented but implicit, and an instruction resting on it fails silently if it ever changes. Repo conventions belong in CLAUDE.md, not here.
+  This repo's implementation prompt is separate from workflows/WORKFLOW.md,
+  which seeds target repositories. The runner strips front matter and HTML
+  comments, then substitutes issue fields and PR_NUMBER. Planning context is
+  appended by the pipeline; keep it out of this template's substitutions.
 -->
 
-Read `CLAUDE.md` before you begin. It carries this repository's architecture, the conventions that differ from tool defaults, and the pitfalls worth knowing before you touch the pipeline.
+Read `CLAUDE.md` for repository conventions and pitfalls.
 
-This run is a **gap-fill** if a pull-request number appears between these quotes: "${PR_NUMBER}". If it is empty, this is a **new implementation**. Follow only the matching section below.
+Implement the issue in the current checkout. The pipeline owns publication for
+both new implementations and gap-fill runs: leave changes unstaged and
+uncommitted. Do not create or switch branches, commit, push, or open a PR.
 
----
+This is a **gap-fill** when a PR number appears between these quotes:
+"${PR_NUMBER}". Otherwise, it is a **new implementation**.
 
 ## New implementation
 
-Implement the issue in the current checkout. Do not create or switch branches, and do not commit, push, or open a pull request — leave your changes unstaged and uncommitted. The pipeline makes the commit, pushes an issue-scoped branch, and opens the pull request once the review pass approves the work.
+Implement the issue's acceptance criteria using existing code patterns and the
+supplied planning context. Keep the change focused on the requested behavior
+and its tests and documentation. Follow the issue's requirements if a planning
+suggestion would expand the scope; report any material conflict in the summary.
 
-Then write an implementation summary to `ai-output/comments/01-summary.md`. The orchestrator posts that file to the ticket verbatim, and it is the only account of your reasoning the issue ever receives — without it the ticket gets a bare pull-request link and nothing else. Cover what you changed and why, the judgement calls you made and what you rejected, and how you satisfied each acceptance criterion. Do not post to Linear yourself; the orchestrator owns every ticket write.
+Write a brief summary to `ai-output/comments/01-summary.md`: what changed,
+material decisions, verification commands and results, and any unmet acceptance
+criterion. A short paragraph and checklist are enough for a routine change.
 
-Anything under `ai-output/` is excluded from commits, so writing there never affects the pull request.
+## Gap-fill
 
----
+For existing PR #${PR_NUMBER}, address the supplied gap-analysis or review
+feedback. Read the relevant PR discussion when needed to understand the finding.
+Verify the fix and check for regressions caused by the change. Record unrelated
+improvements as follow-up observations rather than expanding this repair.
 
-## Gap-fill instructions
+Write the findings addressed, verification results, and any remaining blocker
+to `ai-output/comments/01-gap-fill-summary.md`.
 
-You are adding missing work to existing pull request #${PR_NUMBER}. Do not create a new branch or pull request. Commit to the branch already checked out and push it yourself — this is the one path where the pipeline does not handle git for you. Read the review feedback on the pull request to see what is outstanding.
-
-Write what you addressed to `ai-output/comments/01-gap-fill-summary.md`.
-
----
-
-## Working efficiently
-
-Each pass has a turn cap, and exploration is where caps are usually spent.
-
-**Batch independent tool calls into a single message.** Reading three files and grepping for a symbol do not depend on each other — issue them together rather than one per turn. Surveying a change here typically means reading two to four source files plus their tests: one turn batched, five or more sequentially. Only sequence when one call's input genuinely depends on another's output.
-
-**Prefer `Read`, `Grep`, and `Glob` over their shell equivalents.** A `Bash` pipeline ending in `head` or `tail` silently truncates its own output, and absence of a match in truncated output is not evidence of absence — that is how a confident wrong conclusion gets reached. Use `Grep` to locate and `Read` to read the surrounding context.
-
-If you approach the cap before finishing, say what remains rather than quietly narrowing scope.
-
----
+Follow only the matching run section. The orchestrator posts the summary to the
+issue; do not post to Linear yourself. Files under `ai-output/` are excluded from
+commits. The pipeline commits and pushes the reviewed changes to the appropriate
+branch and opens the PR for a new implementation.
 
 ## Issue
 
@@ -54,33 +51,24 @@ If you approach the cap before finishing, say what remains rather than quietly n
 
 ${ISSUE_DESCRIPTION}
 
----
+## Verification and completion
 
-## Verifying your work
-
-Run both before you consider the work finished:
+Use Node 24. Run targeted checks while editing, then run both before finishing:
 
 ```bash
-npm run typecheck   # tsc --noEmit
-npm test            # vitest run
+npm run typecheck
+npm test
 ```
 
-The pipeline runs these again after the review pass, but **only records the result — it does not block the pull request on it.** A failure you don't catch ships anyway, so treat these as yours to pass, not as a safety net.
+Both must pass before reporting the implementation complete. Fix failures caused
+by the change; if verification is blocked, name the blocker in the summary.
 
-There is no lint script in this repository. Do not invent one or add a linter.
+`tsconfig.json` excludes `src/__tests__`, so type-check new test files explicitly.
+There is no lint script; use the repository's existing checks. Report the commands
+actually run and their outcomes, including any validation gap. Preflight records
+check results but does not replace your verification.
 
-Two things make a green pair misleading:
-
-- `tsconfig.json` excludes `src/__tests__`, so type errors in a test file are caught by neither command. Type-check any new test file explicitly.
-- `noUnusedLocals` and `noUnusedParameters` are enabled, so a leftover import or an unused parameter fails `typecheck` even when the logic is correct.
-
----
-
-## Before you finish
-
-- [ ] `npm run typecheck` and `npm test` both pass
-- [ ] Any new test file type-checks despite being outside `typecheck`'s scope
-- [ ] Every acceptance criterion is met, or the summary says why it is not
-- [ ] No debug output, `console.log`, or commented-out code left behind
-- [ ] No unrelated files changed
-- [ ] `ai-output/comments/01-summary.md` written (or the gap-fill equivalent)
+Batch independent file reads and searches. Prefer Read, Grep, and Glob for
+inspection, and sequence calls only when an earlier result is needed. If the
+turn cap approaches, preserve the work and state exactly what remains in the
+summary. Finish with the changes uncommitted and the appropriate summary written.
