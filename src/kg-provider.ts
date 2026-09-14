@@ -165,6 +165,14 @@ type StreamedOutcome = { ok: true; streamed: true };
 type SendOutcome = SidecarPostResult | StreamedOutcome;
 
 /** Wraps the existing KG sidecar at `kgSidecarUrl` as the default provider. */
+/**
+ * Headers every probe request carries. The Python MCP SDK's streamable-HTTP transport
+ * answers 406 ("Client must accept application/json" / "... and text/event-stream") when
+ * the Accept header is missing — found live on the first probe smoke against a healthy
+ * stateless sidecar, which the probe then reported as unavailable.
+ */
+const PROBE_HEADERS: SidecarHeaders = { "content-type": "application/json", accept: "application/json, text/event-stream" };
+
 export class SidecarMemoryProvider implements MemoryProvider {
   readonly id = "sidecar";
   readonly capabilities: MemoryProviderCapabilities = {
@@ -386,11 +394,11 @@ export class SidecarMemoryProvider implements MemoryProvider {
   async probe(): Promise<SidecarHealth> {
     const target = new URL(this.kgSidecarUrl);
     const transport = target.protocol === "https:" ? https : http;
-    const forwardHeaders: SidecarHeaders = {};
+    const forwardHeaders: SidecarHeaders = { ...PROBE_HEADERS };
 
     const listBody = Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: "probe-tools-list", method: "tools/list", params: {} }));
     const sendList = (sessionId: string | null) => {
-      const reqHeaders: SidecarHeaders = { "content-type": "application/json", "content-length": String(listBody.length) };
+      const reqHeaders: SidecarHeaders = { ...PROBE_HEADERS, "content-length": String(listBody.length) };
       if (sessionId) reqHeaders["mcp-session-id"] = sessionId;
       return this.sendToSidecar(target, transport, "POST", reqHeaders, listBody);
     };
@@ -428,7 +436,7 @@ export class SidecarMemoryProvider implements MemoryProvider {
       }),
     );
     const sendCall = (sessionId: string | null) => {
-      const reqHeaders: SidecarHeaders = { "content-type": "application/json", "content-length": String(callBody.length) };
+      const reqHeaders: SidecarHeaders = { ...PROBE_HEADERS, "content-length": String(callBody.length) };
       if (sessionId) reqHeaders["mcp-session-id"] = sessionId;
       return this.sendToSidecar(target, transport, "POST", reqHeaders, callBody);
     };

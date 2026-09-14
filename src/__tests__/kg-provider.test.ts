@@ -652,6 +652,31 @@ describe("SidecarMemoryProvider probe", () => {
     return new SidecarMemoryProvider("http://127.0.0.1:8765/mcp", async () => namespace);
   }
 
+  it("probe requests carry Accept: application/json, text/event-stream (the transport answers 406 without it)", async () => {
+
+    queueResponse(200, toolsResult(Object.keys(KG_TOOL_CAPABILITY).map((name) => ({ name }))));
+
+    queueResponse(200, JSON.stringify({ jsonrpc: "2.0", id: "probe-kg-neighbors", result: { content: [] } }));
+
+    const p = new SidecarMemoryProvider("http://127.0.0.1:8765/mcp", async () => "https://kg.example.test/");
+
+    const health = await p.probe();
+
+    expect(health.lastError).toBeNull();
+
+    for (const call of mockHttpRequest.mock.calls) {
+
+      const opts = call[0] as { headers: Record<string, unknown> };
+
+      expect(opts.headers.accept).toBe("application/json, text/event-stream");
+
+      expect(opts.headers["content-type"]).toBe("application/json");
+
+    }
+
+  });
+
+
   it("succeeds when tools/list returns all six kg_* tools and kg_neighbors returns a result", async () => {
     queueResponse(200, toolsListResult(ALL_SIX_TOOLS));
     const callReq = queueResponse(200, neighborsOk());
