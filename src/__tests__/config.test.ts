@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import type * as ConfigModule from "../config.js";
 import type * as DedupModule from "../dedup.js";
-import type { RepoMapping } from "../config.js";
+import type { RepoMapping, ReviewerSelection } from "../config.js";
 
 let dbPath: string;
 let config: typeof ConfigModule;
@@ -41,6 +41,7 @@ function mapping(overrides: Partial<RepoMapping> & Pick<RepoMapping, "owner" | "
     dependencyTokenScope: null,
     memoryProviderId: null,
     referenceRepos: null,
+    reviewers: null,
     ...overrides,
   };
 }
@@ -744,5 +745,76 @@ describe("config", () => {
     config.initMappingsTable();
     const m = config.getMappings().BAD;
     expect(m.extraEnv).toEqual({});
+  });
+
+  it("round-trips reviewers, preserving order, including an empty array", () => {
+    config.initMappingsTable();
+    const selection: ReviewerSelection[] = [
+      { id: "gap-analysis", gates: false },
+      { id: "custom", gates: true },
+    ];
+    config.upsertMapping("REV", mapping({ owner: "org", repo: "repo", reviewers: selection }));
+    config.upsertMapping("REV_NULL", mapping({ owner: "org", repo: "repo", reviewers: null }));
+    config.upsertMapping("REV_EMPTY", mapping({ owner: "org", repo: "repo", reviewers: [] }));
+
+    const all = config.getMappings();
+    expect(all.REV.reviewers).toEqual(selection);
+    expect(all.REV_NULL.reviewers).toBeNull();
+    // [] is a deliberate "run no reviewers" choice, distinct from NULL's default — it
+    // must not be coerced to null the way referenceRepos coerces an empty list.
+    expect(all.REV_EMPTY.reviewers).toEqual([]);
+  });
+
+  it("reads reviewers as null when the stored JSON is malformed", () => {
+    config.initMappingsTable();
+    config.upsertMapping("REV_BAD", mapping({ owner: "org", repo: "repo" }));
+
+    const db = new Database(dbPath);
+    db.prepare("UPDATE mappings SET reviewers = ? WHERE team_key = ?").run("{not json", "REV_BAD");
+    db.close();
+
+    expect(config.getMappings().REV_BAD.reviewers).toBeNull();
+    expect(config.getMappings().REV_BAD.owner).toBe("org");
+  });
+
+  it("migrates a pre-existing mappings table to include the reviewers column (default null)", () => {
+    const db = new Database(dbPath);
+    db.exec(`
+      CREATE TABLE mappings (
+        team_key TEXT PRIMARY KEY,
+        owner TEXT NOT NULL,
+        repo TEXT NOT NULL,
+        workflow_file TEXT NOT NULL,
+        default_branch TEXT NOT NULL
+      )
+    `);
+    db.prepare("INSERT INTO mappings (team_key, owner, repo, workflow_file, default_branch) VALUES (?, ?, ?, ?, ?)")
+      .run("LEG_REV", "org", "legacy", "claude-implement.yml", "main");
+    db.close();
+
+    config.initMappingsTable();
+    expect(config.getMappings().LEG_REV.reviewers).toBeNull();
+
+    const reopened = new Database(dbPath);
+    const info = reopened.prepare("PRAGMA table_info(mappings)").all() as Array<{ name: string }>;
+    reopened.close();
+    expect(info.map((c) => c.name)).toContain("reviewers");
+  });
+
+  it("resolveReviewerSelection resolves NULL to the gating default, never an empty list", () => {
+    expect(config.resolveReviewerSelection({ reviewers: null })).toEqual(config.DEFAULT_REVIEWER_SELECTION);
+    const resolved = config.resolveReviewerSelection({ reviewers: null });
+    expect(resolved.length).toBeGreaterThan(0);
+    expect(resolved).toEqual([
+      { id: "gap-analysis", gates: true },
+      { id: "code-review", gates: true },
+    ]);
+    expect(resolved.every((r) => r.gates === true)).toBe(true);
+  });
+
+  it("resolveReviewerSelection passes through a stored non-null selection, including an empty array", () => {
+    const selection: ReviewerSelection[] = [{ id: "gap-analysis", gates: false }];
+    expect(config.resolveReviewerSelection({ reviewers: selection })).toBe(selection);
+    expect(config.resolveReviewerSelection({ reviewers: [] })).toEqual([]);
   });
 });

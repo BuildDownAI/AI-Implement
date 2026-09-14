@@ -1363,6 +1363,134 @@ describe("admin mappings", () => {
       expect(JSON.parse(res.body).error).toContain("dependencyTokenScope");
     }
   });
+
+  it("round-trips a reviewers array, including an empty one", async () => {
+    const token = await login("secret");
+    const selection = [
+      { id: "gap-analysis", gates: false },
+      { id: "custom", gates: true },
+    ];
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "REV1", owner: "org", repo: "app",
+      reviewers: selection,
+    }, token);
+    expect(res.statusCode).toBe(202);
+    expect(JSON.parse(res.body).reviewers).toEqual(selection);
+
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    expect(JSON.parse(list.body).REV1.reviewers).toEqual(selection);
+
+    const empty = await request("/api/mappings", "POST", "secret", {
+      teamKey: "REV1", owner: "org", repo: "app",
+      reviewers: [],
+    }, token);
+    expect(empty.statusCode).toBe(202);
+    // [] is a deliberate "run no reviewers" choice, distinct from the NULL default —
+    // it must persist as [] rather than being coerced to null.
+    expect(JSON.parse(empty.body).reviewers).toEqual([]);
+  });
+
+  it("treats absent reviewers as null on a new mapping", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "REV2", owner: "org", repo: "app",
+    }, token);
+    expect(res.statusCode).toBe(202);
+    expect(JSON.parse(res.body).reviewers).toBeNull();
+  });
+
+  it("preserves existing reviewers when omitted from update", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", {
+      teamKey: "REV3", owner: "org", repo: "app",
+      reviewers: [{ id: "gap-analysis", gates: true }],
+    }, token);
+
+    const update = await request("/api/mappings", "POST", "secret", {
+      teamKey: "REV3", owner: "org", repo: "app-updated",
+    }, token);
+    expect(update.statusCode).toBe(202);
+    expect(JSON.parse(update.body).reviewers).toEqual([{ id: "gap-analysis", gates: true }]);
+  });
+
+  it("resets reviewers to the null default via an explicit null", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", {
+      teamKey: "REV4", owner: "org", repo: "app",
+      reviewers: [{ id: "gap-analysis", gates: true }],
+    }, token);
+
+    const reset = await request("/api/mappings", "POST", "secret", {
+      teamKey: "REV4", owner: "org", repo: "app",
+      reviewers: null,
+    }, token);
+    expect(reset.statusCode).toBe(202);
+    expect(JSON.parse(reset.body).reviewers).toBeNull();
+  });
+
+  it("rejects a non-array reviewers value with 400 naming reviewers", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "REVBAD1", owner: "org", repo: "app",
+      reviewers: { id: "gap-analysis", gates: true },
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toContain("reviewers");
+  });
+
+  it("rejects a reviewers entry missing id or gates with 400 naming the entry", async () => {
+    const token = await login("secret");
+    const missingId = await request("/api/mappings", "POST", "secret", {
+      teamKey: "REVBAD2", owner: "org", repo: "app",
+      reviewers: [{ gates: true }],
+    }, token);
+    expect(missingId.statusCode).toBe(400);
+    expect(JSON.parse(missingId.body).error).toContain("reviewers[0]");
+
+    const missingGates = await request("/api/mappings", "POST", "secret", {
+      teamKey: "REVBAD3", owner: "org", repo: "app",
+      reviewers: [{ id: "gap-analysis" }],
+    }, token);
+    expect(missingGates.statusCode).toBe(400);
+    expect(JSON.parse(missingGates.body).error).toContain("reviewers[0]");
+  });
+
+  it("rejects a non-string id with 400", async () => {
+    const token = await login("secret");
+    for (const badId of ["", 1, null]) {
+      const res = await request("/api/mappings", "POST", "secret", {
+        teamKey: "REVBAD4", owner: "org", repo: "app",
+        reviewers: [{ id: badId, gates: true }],
+      }, token);
+      expect(res.statusCode).toBe(400);
+      expect(JSON.parse(res.body).error).toContain("id");
+    }
+  });
+
+  it("rejects a non-boolean gates with 400", async () => {
+    const token = await login("secret");
+    for (const badGates of ["true", 1, undefined]) {
+      const res = await request("/api/mappings", "POST", "secret", {
+        teamKey: "REVBAD5", owner: "org", repo: "app",
+        reviewers: [{ id: "gap-analysis", gates: badGates }],
+      }, token);
+      expect(res.statusCode).toBe(400);
+      expect(JSON.parse(res.body).error).toContain("gates");
+    }
+  });
+
+  it("rejects a duplicate id with 400 naming the id", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "REVBAD6", owner: "org", repo: "app",
+      reviewers: [
+        { id: "gap-analysis", gates: true },
+        { id: "gap-analysis", gates: false },
+      ],
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toContain("gap-analysis");
+  });
 });
 
 describe("admin runner-mode", () => {

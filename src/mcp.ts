@@ -263,6 +263,10 @@ export const WRITE_TOOLS: WriteTool[] = [
           description: "String or array of glob strings",
         },
         dependencyTokenScope: { type: "string", enum: ["installation"] },
+        reviewers: {
+          type: "array",
+          description: "Which reviewers run on this project's PRs. Omit to keep the stored value; pass null to reset to the default (gap-analysis and code-review, both gating).",
+        },
       },
       required: ["teamKey", "owner", "repo", "defaultBranch"],
     },
@@ -396,6 +400,7 @@ async function callDiagnosticTool(
         awsRegion: m.awsRegion,
         planningWorkflowFile: m.planningWorkflowFile,
         autoApprovePlans: m.autoApprovePlans,
+        reviewers: m.reviewers,
       }));
     }
 
