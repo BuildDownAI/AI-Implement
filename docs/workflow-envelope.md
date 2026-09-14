@@ -36,6 +36,27 @@ These are live credentials in the runner's environment; `src/__tests__/setup/cle
 Headroom note: GitHub caps `workflow_dispatch` at 10 inputs, and this contract uses all 10. That ceiling is part of why the envelope exists; a new field must ride inside `run_config` unless the workflow itself has to read it before the runner starts (masking, routing), in which case an existing input has to make room. `claude-plan.yml` declares seven of these (no `run_publication_token`, `runner_callback_url`, or `runner_phase`).
 
 The first step of the container job prints every input (`[dispatch-inputs] …`), with the three tokens reduced to `<redacted>`/`(empty)` and `run_config` base64-decoded through `jq`, so a run's log opens with the exact envelope it was dispatched with. `provider` and `aws_region` are also forwarded into the entrypoint env as `PROVIDER`/`AWS_REGION`: the runner reads the provider from env, not from the envelope, so a template that drops them silently downgrades Bedrock repos to the anthropic provider.
+
+---
+
+## Compatibility with older templates
+
+Every current dispatch site builds inputs through `buildEnvelopeDispatchInputs`, which never sets `runner_phase` or `runner_callback_url` — both values ride inside `run_config` instead. The one exception is the kg-refresh GHA dispatch (`dispatchKgRefreshRun` in `src/index.ts`, via `buildKgRefreshGhaDispatchBody` in `src/github.ts`), which still sends both top-level, because the AII-556-era template defaults `runner_phase` to `implementation` when the input is omitted — an omitted input on that template would run a KG refresh as an implementation.
+
+GitHub rejects a `workflow_dispatch` naming an input the target workflow doesn't declare (422 `Unexpected inputs provided: [...]`). A target repo adopts a new template shape only when it merges a sync PR, so the orchestrator cannot assume every repo has re-synced. `src/github.ts` declares:
+
+```typescript
+const ENVELOPE_OPTIONAL_INPUTS = ["runner_phase", "runner_callback_url"] as const;
+```
+
+— inputs an older template declares and a newer one does not, because a newer template reads their values from `run_config` (AII-653). The shared poster, `postWorkflowDispatch`, strips-and-retries on a 422: when the response is HTTP 422, the body matches `/unexpected inputs/i`, and names at least one `ENVELOPE_OPTIONAL_INPUTS` member that is present in the dispatch's `inputs` — **and only when `inputs.run_config` is set** — it strips exactly the named members and posts once more, logging `[dispatch] <owner>/<repo>/<file> does not declare <names> (re-sync workflows); retrying without`.
+
+The `run_config` guard matters: on the legacy (non-envelope) contract, `runner_phase` and `runner_callback_url` are authoritative issue data, not compatibility duplicates — the legacy `dispatchWorkflow` callers in `src/index.ts` never set `run_config`, so they are excluded from the strip without a separate flag. Stripping them there would run a gap-fill as an implementation.
+
+The retry is **single-shot by construction**: the second payload no longer carries the stripped input names, so on a second 422 the "present in inputs" check fails and no further retry is attempted — there is no loop. Both `dispatchWorkflow` (the thin wrapper most dispatch sites use) and the kg-refresh dispatch path go through `postWorkflowDispatch`.
+
+A future issue in this chain appends `issue_identifier` to `ENVELOPE_OPTIONAL_INPUTS` (run titles carry the ticket key from the envelope instead).
+
 ---
 
 ## `RunConfigV1` Schema

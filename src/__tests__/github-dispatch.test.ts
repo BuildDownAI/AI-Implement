@@ -9,6 +9,9 @@ import {
   branchPrefixDispatchFields,
   skillsRepoDispatchFields,
   profilesDispatchFields,
+  postWorkflowDispatch,
+  buildKgRefreshGhaDispatchBody,
+  ENVELOPE_OPTIONAL_INPUTS,
 } from "../github.js";
 import { decodeRunConfig } from "../run-config.js";
 import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
@@ -732,5 +735,187 @@ describe("appendLog with status and contract fields", () => {
     expect(() => initLogTable()).not.toThrow();
     const id = appendLog({ issueId: "i5", contract: "envelope" });
     expect(getJobById(id)?.contract).toBe("envelope");
+  });
+});
+
+// ---------- Case (e): postWorkflowDispatch — 422 strip-and-retry (AII-654) ----------
+// Pattern anchor: Cloudshare fork commits 31f3979 and dfb461d (dispatchWorkflow 422 retry
+// for issue_identifier); the existing base_branch 422 attribution in src/index.ts:985-996.
+
+describe("postWorkflowDispatch — 422 strip-and-retry", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function textResponse(status: number, body: string | null): Response {
+    return new Response(body, { status });
+  }
+
+  it("exposes exactly runner_phase and runner_callback_url as the optional-input list", () => {
+    expect(ENVELOPE_OPTIONAL_INPUTS).toEqual(["runner_phase", "runner_callback_url"]);
+  });
+
+  it("strips a single optional input named in the 422 body and retries once", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(textResponse(422, 'Unexpected inputs provided: ["runner_phase"]'))
+      .mockResolvedValueOnce(textResponse(204, null));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await postWorkflowDispatch({
+      token: "tok",
+      owner: "acme",
+      repo: "kg-repo",
+      workflowFile: "claude-implement.yml",
+      ref: "main",
+      inputs: { run_config: "cfg", run_token: "rt", runner_phase: "kg-refresh" },
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const secondBody = JSON.parse(String((fetchMock.mock.calls[1][1] as RequestInit).body));
+    expect("runner_phase" in secondBody.inputs).toBe(false);
+    expect(secondBody.inputs.run_config).toBe("cfg");
+    expect(result).toEqual({ success: true, status: 204 });
+  });
+
+  it("strips both runner_phase and runner_callback_url when the 422 names both", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(textResponse(422, 'Unexpected inputs provided: ["runner_phase", "runner_callback_url"]'))
+      .mockResolvedValueOnce(textResponse(204, null));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await postWorkflowDispatch({
+      token: "tok",
+      owner: "acme",
+      repo: "kg-repo",
+      workflowFile: "claude-implement.yml",
+      ref: "main",
+      inputs: {
+        run_config: "cfg",
+        run_token: "rt",
+        runner_phase: "kg-refresh",
+        runner_callback_url: "https://orch.example",
+      },
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const secondBody = JSON.parse(String((fetchMock.mock.calls[1][1] as RequestInit).body));
+    expect("runner_phase" in secondBody.inputs).toBe(false);
+    expect("runner_callback_url" in secondBody.inputs).toBe(false);
+    expect(result.success).toBe(true);
+  });
+
+  it("does not retry when the 422 names an input outside ENVELOPE_OPTIONAL_INPUTS", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(textResponse(422, 'Unexpected inputs provided: ["base_branch"]'));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await postWorkflowDispatch({
+      token: "tok",
+      owner: "acme",
+      repo: "kg-repo",
+      workflowFile: "claude-implement.yml",
+      ref: "main",
+      inputs: { run_config: "cfg", run_token: "rt", base_branch: "main" },
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({ success: false, status: 422, error: 'Unexpected inputs provided: ["base_branch"]' });
+  });
+
+  it("does not retry on the legacy contract (no run_config), even when the 422 names runner_phase", async () => {
+    // Mirrors src/index.ts:985-996's guard: runner_phase is authoritative issue data on the
+    // legacy contract, not a compatibility duplicate, so stripping it there must not happen.
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(textResponse(422, 'Unexpected inputs provided: ["runner_phase"]'));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await postWorkflowDispatch({
+      token: "tok",
+      owner: "acme",
+      repo: "legacy-repo",
+      workflowFile: "claude-implement.yml",
+      ref: "main",
+      inputs: {
+        issue_id: "1",
+        issue_identifier: "AII-1",
+        issue_title: "t",
+        issue_description: "d",
+        runner_phase: "implementation",
+      },
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(result.success).toBe(false);
+  });
+
+  it("a retry that 422s again returns failure with exactly 2 fetches (no loop)", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(textResponse(422, 'Unexpected inputs provided: ["runner_phase"]'))
+      .mockResolvedValueOnce(textResponse(422, 'Unexpected inputs provided: ["runner_phase"]'));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await postWorkflowDispatch({
+      token: "tok",
+      owner: "acme",
+      repo: "kg-repo",
+      workflowFile: "claude-implement.yml",
+      ref: "main",
+      inputs: { run_config: "cfg", run_token: "rt", runner_phase: "kg-refresh" },
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(result.success).toBe(false);
+    expect(result.status).toBe(422);
+  });
+
+  it("does not retry on a non-422 failure", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(textResponse(500, "Internal Server Error"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await postWorkflowDispatch({
+      token: "tok",
+      owner: "acme",
+      repo: "kg-repo",
+      workflowFile: "claude-implement.yml",
+      ref: "main",
+      inputs: { run_config: "cfg", run_token: "rt", runner_phase: "kg-refresh" },
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({ success: false, status: 500, error: "Internal Server Error" });
+  });
+
+  it("the kg-refresh dispatch path (buildKgRefreshGhaDispatchBody + postWorkflowDispatch) retries on 422", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(textResponse(422, 'Unexpected inputs provided: ["runner_phase", "runner_callback_url"]'))
+      .mockResolvedValueOnce(textResponse(204, null));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const inputs = buildKgRefreshGhaDispatchBody({
+      runConfig: "b64cfg",
+      runToken: "run-tok",
+      runProgressToken: "prog-tok",
+      runnerImage: undefined,
+      runnerCallbackUrl: "https://orch.example",
+      runnerPhase: "kg-refresh",
+      jobTimeoutMinutes: "240",
+    });
+
+    const result = await postWorkflowDispatch({
+      token: "gh-tok",
+      owner: "acme",
+      repo: "kg-repo",
+      workflowFile: "claude-implement.yml",
+      ref: "main",
+      inputs,
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const secondBody = JSON.parse(String((fetchMock.mock.calls[1][1] as RequestInit).body));
+    expect("runner_phase" in secondBody.inputs).toBe(false);
+    expect("runner_callback_url" in secondBody.inputs).toBe(false);
+    expect(secondBody.inputs.run_config).toBe("b64cfg");
+    expect(secondBody.inputs.job_timeout_minutes).toBe("240");
+    expect(result).toEqual({ success: true, status: 204 });
   });
 });

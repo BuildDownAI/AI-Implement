@@ -3,7 +3,7 @@ import { GitHubApiError } from "./github-errors.js";
 import { type RunConfigV1, encodeRunConfig } from "./run-config.js";
 import { DEFAULT_RETRY_POLICY, type RetryPolicy } from "./pipeline/retry-backoff.js";
 
-interface DispatchInputs {
+export interface DispatchInputs {
   /** Legacy mode: per-field issue data. */
   issue_id?: string;
   issue_identifier?: string;
@@ -23,8 +23,12 @@ interface DispatchInputs {
    * In envelope mode this rides inside run_config.baseBranch instead.
    */
   base_branch?: string;
-  /** Explicit callback phase reported by the runner. In envelope mode rides inside run_config. */
-  runner_phase?: "implementation" | "gap-analysis";
+  /**
+   * Explicit callback phase reported by the runner. In envelope mode rides inside run_config.
+   * `"kg-refresh"` is the GHA-backed kg-refresh dispatch (src/index.ts `dispatchKgRefreshRun`),
+   * the one dispatch site that still sends this input top-level under the envelope contract.
+   */
+  runner_phase?: "implementation" | "gap-analysis" | "kg-refresh";
   /** Claude provider: 'anthropic' (default) or 'bedrock'. Only forwarded when set. */
   provider?: string;
   /** AWS region for Bedrock. Only forwarded when provider='bedrock'. */
@@ -60,11 +64,22 @@ interface DispatchInputs {
   comment_instruction?: string;
 }
 
-interface DispatchResult {
+export interface DispatchResult {
   success: boolean;
   status: number;
   error?: string;
 }
+
+/**
+ * `workflow_dispatch` inputs that an older synced `claude-implement.yml` still declares but a
+ * newer template drops, because their values now ride inside `run_config` instead. Only the
+ * kg-refresh GHA dispatch (`dispatchKgRefreshRun` in `src/index.ts`) still sends these two
+ * top-level — every other dispatch site already builds inputs via `buildEnvelopeDispatchInputs`,
+ * which never sets them. `postWorkflowDispatch` strips whichever of these a 422 names and
+ * retries once, so the orchestrator can serve both template generations until every target repo
+ * has re-synced. The next issue in this chain appends `issue_identifier` to this list.
+ */
+export const ENVELOPE_OPTIONAL_INPUTS = ["runner_phase", "runner_callback_url"] as const;
 
 const GH_HEADERS = {
   Accept: "application/vnd.github+json",
@@ -293,19 +308,32 @@ export function buildEnvelopeDispatchInputs(
   };
 }
 
-export async function dispatchWorkflow(
-  token: string,
-  mapping: RepoMapping,
-  inputs: DispatchInputs,
-): Promise<DispatchResult> {
-  const url = `https://api.github.com/repos/${mapping.owner}/${mapping.repo}/actions/workflows/${mapping.workflowFile}/dispatches`;
+/**
+ * Posts a `workflow_dispatch`. On a 422 whose body matches `/unexpected inputs/i` and names at
+ * least one `ENVELOPE_OPTIONAL_INPUTS` member that is present in `inputs` — and only when
+ * `inputs.run_config` is set — strips exactly the named members and retries once. The
+ * `run_config` guard matters: on the legacy contract `runner_phase`/`runner_callback_url` are
+ * authoritative issue data, not compatibility duplicates, so stripping them there would run a
+ * gap-fill as an implementation. The retry cannot loop — the second payload no longer carries
+ * the stripped names, so the guard's "present in inputs" check fails by construction on the
+ * second pass. Every other 422, and every other status, returns unchanged.
+ */
+export async function postWorkflowDispatch(opts: {
+  token: string;
+  owner: string;
+  repo: string;
+  workflowFile: string;
+  ref: string;
+  inputs: DispatchInputs;
+}): Promise<DispatchResult> {
+  const url = `https://api.github.com/repos/${opts.owner}/${opts.repo}/actions/workflows/${opts.workflowFile}/dispatches`;
 
   const res = await fetch(url, {
     method: "POST",
-    headers: ghHeaders(token),
+    headers: ghHeaders(opts.token),
     body: JSON.stringify({
-      ref: mapping.defaultBranch,
-      inputs,
+      ref: opts.ref,
+      inputs: opts.inputs,
     }),
     signal: defaultFetchSignal(),
   });
@@ -315,7 +343,37 @@ export async function dispatchWorkflow(
   }
 
   const body = await res.text();
+
+  if (res.status === 422 && /unexpected inputs/i.test(body) && opts.inputs.run_config !== undefined) {
+    const namesToStrip = ENVELOPE_OPTIONAL_INPUTS.filter(
+      (name) => opts.inputs[name] !== undefined && body.includes(name),
+    );
+    if (namesToStrip.length > 0) {
+      const strippedInputs: DispatchInputs = { ...opts.inputs };
+      for (const name of namesToStrip) delete strippedInputs[name];
+      console.log(
+        `[dispatch] ${opts.owner}/${opts.repo}/${opts.workflowFile} does not declare ${namesToStrip.join(", ")} (re-sync workflows); retrying without`,
+      );
+      return postWorkflowDispatch({ ...opts, inputs: strippedInputs });
+    }
+  }
+
   return { success: false, status: res.status, error: body };
+}
+
+export async function dispatchWorkflow(
+  token: string,
+  mapping: RepoMapping,
+  inputs: DispatchInputs,
+): Promise<DispatchResult> {
+  return postWorkflowDispatch({
+    token,
+    owner: mapping.owner,
+    repo: mapping.repo,
+    workflowFile: mapping.workflowFile,
+    ref: mapping.defaultBranch,
+    inputs,
+  });
 }
 
 /**
@@ -602,32 +660,30 @@ export const KG_GHA_POLL_DELAYS_MS: readonly number[] = [5_000, 10_000, 20_000, 
  * Injectable findRunId and pollDelaysMs for testability.
  */
 /**
- * Body for a GHA-backed kg-refresh `workflow_dispatch`. The envelope's
- * `runnerCallbackUrl` is the bare base URL (AII-548); `runner_phase` selects the
- * kg-refresh entry in the shared claude-implement.yml template (AII-556).
+ * Builds the `workflow_dispatch` inputs for a GHA-backed kg-refresh run, for use with
+ * `postWorkflowDispatch`. The envelope's `runnerCallbackUrl` is the bare base URL (AII-548);
+ * `runner_phase` selects the kg-refresh entry in the shared claude-implement.yml template
+ * (AII-556) — it, and `runner_callback_url`, are members of `ENVELOPE_OPTIONAL_INPUTS` and are
+ * stripped by the poster on a 422 from a target repo that no longer declares them.
  */
 export function buildKgRefreshGhaDispatchBody(opts: {
-  ref: string;
   runConfig: string;
   runToken: string;
   runProgressToken: string;
   runnerImage: string | undefined;
   runnerCallbackUrl?: string | undefined;
-  runnerPhase?: string;
+  runnerPhase?: DispatchInputs["runner_phase"];
   jobTimeoutMinutes?: string;
-}): string {
-  return JSON.stringify({
-    ref: opts.ref,
-    inputs: {
-      run_config: opts.runConfig,
-      run_token: opts.runToken,
-      run_progress_token: opts.runProgressToken,
-      ...(opts.runnerPhase ? { runner_phase: opts.runnerPhase } : {}),
-      ...(opts.jobTimeoutMinutes ? { job_timeout_minutes: opts.jobTimeoutMinutes } : {}),
-      ...(opts.runnerImage ? { runner_image: opts.runnerImage } : {}),
-      ...(opts.runnerCallbackUrl ? { runner_callback_url: opts.runnerCallbackUrl } : {}),
-    },
-  });
+}): DispatchInputs {
+  return {
+    run_config: opts.runConfig,
+    run_token: opts.runToken,
+    run_progress_token: opts.runProgressToken,
+    ...(opts.runnerPhase ? { runner_phase: opts.runnerPhase } : {}),
+    ...(opts.jobTimeoutMinutes ? { job_timeout_minutes: opts.jobTimeoutMinutes } : {}),
+    ...(opts.runnerImage ? { runner_image: opts.runnerImage } : {}),
+    ...(opts.runnerCallbackUrl ? { runner_callback_url: opts.runnerCallbackUrl } : {}),
+  };
 }
 
 export async function pollForKgWorkflowRunId(opts: {
