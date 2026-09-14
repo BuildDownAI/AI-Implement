@@ -4,6 +4,7 @@ import { postPushReviewStep } from "../pipeline/steps/post-push-review.js";
 import { OperatorCancelledError, PrMergedError } from "../pipeline/operator-cancelled.js";
 import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
 import type { ReviewerDefinition } from "../pipeline/reviewers/registry.js";
+import { REVIEWER_VERDICT_SCHEMA } from "../pipeline/reviewers/schema.js";
 
 function makeCtx(execMock: any, dataOverrides: Record<string, unknown> = {}) {
   return {
@@ -36,6 +37,15 @@ function invokeArg(invoke: ReturnType<typeof vi.fn>, index: number): any {
 
 function invokePrompt(invoke: ReturnType<typeof vi.fn>, index: number): string {
   return invokeArg(invoke, index).prompt as string;
+}
+
+function configReviewerDefinition(id: string, prompt = `${id} declared prompt`, overrides: Partial<ReviewerDefinition> = {}): ReviewerDefinition {
+  return {
+    id,
+    buildPrompt: () => prompt,
+    outputSchema: { type: "object", properties: { injected: { type: "string" } } },
+    ...overrides,
+  };
 }
 
 function selectedReviewerDefinition(id: string, overrides: Partial<ReviewerDefinition> = {}): ReviewerDefinition {
@@ -674,6 +684,249 @@ describe("postPushReviewStep", () => {
       expect(out.approved).toBe(false);
       expect(ghComments.some((comment) => comment.includes("automated review is incomplete"))).toBe(true);
     }
+  });
+
+  it("ignores config reviewers that shadow built-in, image-baked, or reserved external reviewer ids", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const invoke = vi.fn(async () => structuredReviewResult({ approved: true, findings: [] }));
+      const trustedDefinitions = reviewerMap([selectedReviewerDefinition("image-review", { buildPrompt: () => "trusted image prompt" })]);
+
+      const out = await postPushReviewStep.run(
+        makeCtx(invoke),
+        {
+          prNumber: "42",
+          workspaceDir: "/tmp",
+          maxIterations: 1,
+          ghSpawn: vi.fn((args: string[]) => args[0] === "pr" && args[1] === "diff" ? { stdout: "diff", exitCode: 0 } : { stdout: "", exitCode: 0 }),
+          gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
+          reviewProviders: [],
+          reviewers: [
+            { id: "gap-analysis", gates: true },
+            { id: "image-review", gates: true },
+            { id: "claude-review-summary", gates: true },
+          ],
+          trustedReviewerDefinitions: trustedDefinitions,
+          reviewerDefinitions: [
+            configReviewerDefinition("gap-analysis", "malicious gap prompt"),
+            configReviewerDefinition("gap-analysis", "duplicate malicious gap prompt"),
+            configReviewerDefinition("image-review", "malicious image prompt"),
+            configReviewerDefinition("claude-review-summary", "malicious prose prompt"),
+          ],
+        },
+        { report: vi.fn(async () => undefined) },
+      );
+
+      expect(out.approved).toBe(true);
+      expect(invoke).toHaveBeenCalledTimes(2);
+      const prompts = [invokePrompt(invoke, 0), invokePrompt(invoke, 1)];
+      expect(prompts.join("\n")).not.toContain("malicious");
+      expect(prompts[0]).toContain("spec-coverage review only");
+      expect(prompts[1]).toContain("trusted image prompt");
+      expect(warn.mock.calls.map((call) => String(call[0]))).toEqual([
+        expect.stringContaining('"gap-analysis"'),
+        expect.stringContaining('"image-review"'),
+        expect.stringContaining('"claude-review-summary"'),
+      ]);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("runs an unselected config reviewer as advisory, visible feedback without a fix pass", async () => {
+    const ghComments: string[] = [];
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "actual diff body", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") ghComments.push(args[args.indexOf("--body") + 1]);
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async (params) => {
+      if (params.stage === "post-push-review/review-1") {
+        return structuredReviewResult({ approved: true, blocking_issues: [], score: 95, progress_delta: 0, feedback: "legacy clean" });
+      }
+      if (params.stage === "post-push-review/domain-review-review-1") {
+        expect(params.prompt).toContain("Domain declared prompt");
+        expect(params.prompt).toContain("Issue AII-200: X");
+        expect(params.prompt).toContain("actual diff body");
+        expect(params.model).toBe("run-review-model");
+        expect(params.jsonSchema).toBe(REVIEWER_VERDICT_SCHEMA);
+        expect(params.maxTurns).toBe(DEFAULT_RETRY_POLICY.reviewMaxTurns);
+        return structuredReviewResult({ approved: false, findings: [{ severity: "blocking", body: "Advisory domain concern" }] });
+      }
+      throw new Error(`unexpected stage ${params.stage}`);
+    });
+
+    const out = await postPushReviewStep.run(
+      makeCtx(invoke, { model: "run-review-model" }),
+      {
+        prNumber: "42",
+        workspaceDir: "/tmp",
+        maxIterations: 2,
+        ghSpawn,
+        gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
+        reviewProviders: [],
+        reviewerDefinitions: [configReviewerDefinition("domain-review", "Domain declared prompt", { maxTurns: 1 })],
+      },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(true);
+    expect(invoke.mock.calls.map((call) => call[0].stage)).toEqual([
+      "post-push-review/review-1",
+      "post-push-review/domain-review-review-1",
+    ]);
+    const approvalComment = ghComments.find((comment) => comment.includes("Ready to merge"));
+    expect(approvalComment).toContain("Advisory domain concern");
+    expect(approvalComment).toContain("Advisory external review findings");
+  });
+
+  it("lets a selected config reviewer gate only through the envelope selection", async () => {
+    const ghComments: string[] = [];
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "selected diff", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") ghComments.push(args[args.indexOf("--body") + 1]);
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async (params) => {
+      if (params.stage === "post-push-review/domain-review-review-1") {
+        expect(params.prompt).toContain("Selected declared prompt");
+        expect(params.prompt).toContain("selected diff");
+        return structuredReviewResult({ approved: false, findings: [{ severity: "blocking", body: "Selected config blocker" }] });
+      }
+      if (params.stage === "post-push-review/fix-1") {
+        expect(params.prompt).toContain("Selected config blocker");
+        return { stdout: '{"fixed":[],"testing":[],"notes":"no changes"}', exitCode: 0, tokensUsed: 1 };
+      }
+      throw new Error(`unexpected stage ${params.stage}`);
+    });
+
+    const out = await postPushReviewStep.run(
+      makeCtx(invoke),
+      {
+        prNumber: "42",
+        workspaceDir: "/tmp",
+        maxIterations: 2,
+        ghSpawn,
+        gitSpawn: vi.fn((args: string[]) => args[0] === "status" ? { stdout: "", exitCode: 0 } : { stdout: "", exitCode: 0 }),
+        reviewProviders: [],
+        reviewers: [{ id: "domain-review", gates: true }],
+        reviewerDefinitions: [configReviewerDefinition("domain-review", "Selected declared prompt")],
+      },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(false);
+    expect(invoke.mock.calls.map((call) => call[0].stage)).toContain("post-push-review/fix-1");
+    expect(ghComments.find((comment) => comment.includes("Reviewer found issues"))).toContain("Selected config blocker");
+  });
+
+  it("keeps unselected config invalid output advisory and preserves legacy aggregate telemetry", async () => {
+    const ghComments: string[] = [];
+    const reports: any[] = [];
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") ghComments.push(args[args.indexOf("--body") + 1]);
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async (params) => {
+      if (params.stage === "post-push-review/review-1") {
+        return {
+          ...structuredReviewResult({ approved: true, blocking_issues: [], score: 95, progress_delta: 0, feedback: "legacy clean" }),
+          telemetry: { outcome: "success" as const, numTurns: 1, durationMs: 10, costUsd: 0.4, tokensIn: 1, tokensOut: 1 },
+        };
+      }
+      if (params.stage === "post-push-review/domain-review-review-1") {
+        return {
+          stdout: "not json",
+          exitCode: 0,
+          tokensUsed: 1,
+          structuredOutput: undefined,
+          terminalStatus: { subtype: "success", isError: false },
+          telemetry: { outcome: "success" as const, numTurns: 1, durationMs: 10, costUsd: 0.9, tokensIn: 1, tokensOut: 1 },
+        };
+      }
+      throw new Error(`unexpected stage ${params.stage}`);
+    });
+
+    const out = await postPushReviewStep.run(
+      makeCtx(invoke),
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [], reviewerDefinitions: [configReviewerDefinition("domain-review", "Domain prompt")] },
+      { report: vi.fn(async (record) => { reports.push(record); }) },
+    );
+
+    expect(out.approved).toBe(true);
+    expect(out.terminationReason).toBe("approved");
+    expect(out.costUsd).toBeCloseTo(1.3);
+    expect(invoke.mock.calls.map((call) => call[0].stage)).toEqual([
+      "post-push-review/review-1",
+      "post-push-review/domain-review-review-1",
+    ]);
+    expect(reports.find((report) => report.id === "post-push-review.1.domain-review")?.status).toBe("failed");
+    expect(reports.find((report) => report.id === "post-push-review.1")?.outputs.telemetry.costUsd).toBe(0.4);
+    expect(ghComments.find((comment) => comment.includes("Ready to merge"))).toContain("Reviewer domain-review returned no structured_output");
+  });
+
+  it("keeps unselected config turn exhaustion advisory without running a fix pass", async () => {
+    const ghComments: string[] = [];
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") ghComments.push(args[args.indexOf("--body") + 1]);
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async (params) => {
+      if (params.stage === "post-push-review/review-1") {
+        return structuredReviewResult({ approved: true, blocking_issues: [], score: 95, progress_delta: 0, feedback: "legacy clean" });
+      }
+      if (params.stage === "post-push-review/domain-review-review-1") {
+        return {
+          ...structuredReviewResult({ approved: true, findings: [] }),
+          terminalStatus: { subtype: "error_max_turns", isError: true },
+          telemetry: { outcome: "max_turns" as const, numTurns: 45, durationMs: 10, costUsd: 0.2, tokensIn: 1, tokensOut: 1 },
+        };
+      }
+      throw new Error(`unexpected stage ${params.stage}`);
+    });
+
+    const out = await postPushReviewStep.run(
+      makeCtx(invoke),
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [], reviewerDefinitions: [configReviewerDefinition("domain-review", "Domain prompt")] },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(true);
+    expect(invoke.mock.calls.map((call) => call[0].stage)).toEqual([
+      "post-push-review/review-1",
+      "post-push-review/domain-review-review-1",
+    ]);
+    expect(ghComments.find((comment) => comment.includes("Ready to merge"))).toContain("domain-review ran out of turns");
+  });
+
+  it("fails closed when a selected config reviewer returns invalid output", async () => {
+    const ghComments: string[] = [];
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") ghComments.push(args[args.indexOf("--body") + 1]);
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => ({
+      stdout: "not json",
+      exitCode: 0,
+      tokensUsed: 1,
+      structuredOutput: undefined,
+      terminalStatus: { subtype: "success", isError: false },
+      telemetry: { outcome: "success" as const, numTurns: 1, durationMs: 10, costUsd: null, tokensIn: 1, tokensOut: 1 },
+    }));
+
+    const out = await postPushReviewStep.run(
+      makeCtx(invoke),
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [], reviewers: [{ id: "domain-review", gates: true }], reviewerDefinitions: [configReviewerDefinition("domain-review", "Domain prompt")] },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(false);
+    expect(out.terminationReason).toBe("invalid_review");
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(ghComments.find((comment) => comment.includes("automated review pass did not finish"))).toContain("Reviewer domain-review returned no structured_output");
   });
 
   it("fails closed when a selected reviewer returns invalid structured output", async () => {
