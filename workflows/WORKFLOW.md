@@ -1,6 +1,6 @@
 ---
 # Claude model used for implementation. Passed through verbatim to
-# `claude-code --model`, so any ID your configured provider accepts is fine.
+# `claude --model`, so any ID your configured provider accepts is fine.
 # Examples:
 #   Anthropic API / OAuth: claude-sonnet-5, claude-opus-4-7, claude-haiku-4-5-20251001
 #   AWS Bedrock:           anthropic.claude-sonnet-4-6-20250805-v1:0
@@ -104,98 +104,75 @@ model: claude-sonnet-5
 
   HOW TO CUSTOMISE THIS FILE
   ---------------------------
-  1. Fill in the "Repo context" section with your stack, test commands, conventions.
+  1. Add repository-specific context, validation commands, and conventions.
   2. Adjust the quality checklist to match your standards.
   3. Add any repo-specific constraints (e.g. "never modify migration files directly").
   4. Change the model in the front matter if this repo needs more (opus) or less (haiku).
   5. Remove these HTML comments once you're done — Claude won't see them anyway.
 
-  CLIENT-SPECIFIC CODE: USE custom/
-  -----------------------------------
-  This repo uses a path-precedence extension mechanism. When implementing
-  client-specific behaviour, place new files under custom/ rather than
-  modifying built-in modules:
-
-    custom/steps/<id>.ts       — override a built-in pipeline step
-    custom/pipelines/<name>.yml — override a built-in pipeline definition
-    custom/providers/<id>.ts   — override a built-in provider module
-
-  Files in custom/ are never overwritten by upstream syncs, so they survive
-  upgrades. Editing built-in modules directly causes merge conflicts on every
-  upstream update. See CLAUDE.md §"Custom extensions" for the full contract.
 -->
 
-Read CLAUDE.md if it exists for repo-specific context and conventions.
+Read `CLAUDE.md` if present and the repository's contribution guidance for
+conventions, runtime requirements, and validation commands.
 
----
+This is a **gap-fill** when a PR number appears between these quotes:
+"${PR_NUMBER}". Otherwise, it is a **new implementation**. Follow only the
+matching run section below.
 
 ## New implementation
 
-Implement the feature described in the issue below in the current checkout.
+Implement the issue's acceptance criteria in the current checkout using existing
+patterns and any supplied planning context. Keep changes focused on the requested
+behavior, its tests, and necessary documentation. Report material conflicts
+between the plan and issue rather than silently expanding scope.
+
 Do NOT create or switch branches. Do NOT commit, push, or open a pull request.
-Leave your file changes unstaged and uncommitted. The AI-Implement pipeline
-will create the implementation commit, push an issue-scoped branch, and open
-the PR after review passes. The generated PR body includes
-`Fixes ${ISSUE_IDENTIFIER}` so the ticketing system automatically closes the
-issue when the PR is merged (Linear behaviour; Jira ignores it harmlessly).
+Leave your file changes unstaged and uncommitted. The AI-Implement pipeline will
+commit the reviewed changes, push an issue-scoped branch, and open the PR.
 
-After making the code changes, write a brief implementation summary to
-`ai-output/comments/01-summary.md` (e.g. a paragraph describing what
-changed plus a checklist of what was tested). The orchestrator reads this
-file and posts it back to the ticketing issue via the configured provider.
-Do NOT post comments directly to Linear or Jira from this workflow —
-that pathway is handled by the orchestrator's runner-callback.
+Write a brief summary to `ai-output/comments/01-summary.md`: what changed,
+material decisions, validation commands and results, and any unmet acceptance
+criterion. A short paragraph and checklist are enough for a routine change.
 
----
+## Gap-fill instructions
 
-## Gap-fill instructions _(only when PR_NUMBER is set)_
+For existing PR #${PR_NUMBER}, address the supplied gap-analysis or review
+feedback. Read the relevant PR discussion when needed to understand a finding.
+Verify each fix and check for regressions it could introduce. Keep unrelated
+improvements as follow-up observations rather than expanding this repair.
 
-You are adding missing work to existing PR #${PR_NUMBER}.
-**Do NOT create a new branch or PR. Do NOT run `git push`.** Review the gap
-analysis comment on the PR to understand what is still missing. Local commits
-— including a merge commit when resolving conflicts with the base branch — are
-fine; the pipeline pushes when the agent is done. Leave any remaining file
-changes unstaged and uncommitted — the AI-Implement pipeline will commit and
-push them to the existing PR branch after review passes.
+Do NOT create or switch branches. Do NOT commit, push, or open a pull request.
+Leave your file changes unstaged and uncommitted.
+The AI-Implement pipeline will commit and push the reviewed changes to the existing PR branch.
 
-After making the changes, write a short note about what you addressed to
-`ai-output/comments/01-gap-fill-summary.md`. The orchestrator reads this
-file and posts it back to the ticketing issue.
-
-External review tools should communicate findings through native GitHub
-review surfaces: submit `CHANGES_REQUESTED` for blocking feedback, use inline
-PR review comments for file-specific issues, or post a structured PR review
-summary comment. Do not ask Copilot or another bot to fix the PR in comments;
-AI-Implement ingests GitHub review events and dispatches its own gap-fill run.
-
----
+Write the findings addressed, validation results, and any remaining blocker to
+`ai-output/comments/01-gap-fill-summary.md`.
 
 ## Issue
 
 **Identifier:** ${ISSUE_IDENTIFIER}
 **Title:** ${ISSUE_TITLE}
-**Description:**
+
 ${ISSUE_DESCRIPTION}
 
----
+## Validation and completion
 
-## Repo context
+Use the repository's documented runtime and existing validation commands. Run
+targeted checks while editing, then the required tests, typecheck, lint, and build
+where those checks exist. Do not invent scripts or add tooling just to satisfy
+this checklist. Fix failures caused by the change; if validation is blocked,
+record the exact command, failure, and remaining uncertainty in the summary.
 
-<!-- Customise this section for your repo -->
+Batch independent reads and searches. Capture complete validation output once
+and inspect that output instead of rerunning an unchanged expensive check.
+If the turn cap approaches, preserve the work and state what remains.
 
-- **Stack:** _e.g. Node.js 20, TypeScript, PostgreSQL, Vitest_
-- **Run tests:** _e.g. `npm test`_
-- **Run linting / formatting:** _e.g. `npm run lint`_
-- **Key conventions:** _e.g. follow patterns in existing files; no new dependencies without good reason_
+The orchestrator posts the summary to the configured issue tracker. Do not post
+to Linear or Jira yourself. Files under `ai-output/` are excluded from commits.
 
----
+Before reporting completion:
 
-## Quality checklist
-
-Before you finish, verify:
-
-- [ ] Tests pass
-- [ ] No lint errors. Build completes successfully
-- [ ] No debug output, `console.log`, or commented-out code left in
-- [ ] PR description explains the approach, not just the what
-- [ ] No unrelated files changed
+- [ ] Acceptance criteria are met, or unmet criteria and blockers are named.
+- [ ] Required repository checks pass; commands and outcomes are recorded.
+- [ ] No temporary debugging code or unrelated edits remain.
+- [ ] The matching summary file is written and changes remain uncommitted.

@@ -1,162 +1,93 @@
 ---
-# Claude model used for planning. Passed through verbatim to
-# `claude-code --model`, so any ID your configured provider accepts is fine.
-# Examples:
-#   Anthropic API / OAuth: claude-sonnet-5, claude-opus-4-7, claude-haiku-4-5-20251001
-#   AWS Bedrock:           anthropic.claude-sonnet-4-6-20250805-v1:0
-#                          or an inference-profile ARN (arn:aws:bedrock:...)
-# The default below works for the Anthropic provider. If this repo's mapping
-# is switched to provider=bedrock in the orchestrator admin UI, replace this
-# with a Bedrock model ID — the workflow will hard-fail otherwise, since
-# Bedrock IDs are account- and region-specific and have no safe default.
 model: claude-sonnet-5
 ---
 
 <!--
-  PLANNING.md — Claude AI Planning prompt template
-  =================================================
-  This file is seeded into your repo by the ai-implement sync workflow.
-  It is YOURS to customise — future syncs will never overwrite it.
+  This repo's planning prompt overrides the built-in prompt. Keep its output
+  filenames and headers aligned with workflows/PLANNING.md: the runner splits
+  the map and acceptance bar for their respective consumers.
 
-  When claude-plan.yml runs, it renders this file as the prompt sent to Claude.
-  The YAML front matter block (between the --- lines) is stripped before Claude
-  sees it. The rest of the file is passed through envsubst, which substitutes:
-
-    ${ISSUE_IDENTIFIER}   Linear identifier, e.g. ENG-42
-    ${ISSUE_TITLE}        Issue title
-    ${ISSUE_DESCRIPTION}  Full issue description (Markdown)
-    ${ISSUE_ID}           Linear UUID (used in curl commands to post comments)
-    ${PARENT}             Parent issue as "- IDENTIFIER: Title" (or "None")
-    ${SIBLINGS}           Sibling stories (other children of the parent), newline-separated
-    ${DEPENDENCIES}       Related issues as "- [type] IDENTIFIER: Title", newline-separated
-
-  FRONT MATTER (the --- block at the top)
-  ----------------------------------------
-  Stripped before sending to Claude. Supported keys:
-
-    model      Model ID for planning (see above). Required; no default for bedrock.
-
-  COMMENT FORMAT
-  ---------------
-  Claude posts up to 4 structured comments to Linear. Headers are parseable
-  so the implementation workflow can locate them later:
-
-    ## 🏗️ AI Planning: Architecture Analysis
-    ## 🧪 AI Planning: Test Plan
-    ## 🔧 AI Planning: Work Units
-    ## 🔗 AI Planning: Cross-Story Context   ← only when dependencies exist
-
-  HOW TO CUSTOMISE THIS FILE
-  ---------------------------
-  1. Fill in the "Repo context" section with your stack and conventions.
-  2. Add repo-specific analysis prompts (e.g. "check the migrations directory").
-  3. Adjust the cross-story threshold (default: only post when deps are non-None).
-  4. Change the model in the front matter if needed.
-  5. Remove these HTML comments once you're done — Claude won't see them anyway.
+  The runner strips HTML comments, then substitutes issue and related-context
+  tokens. The machine-block delimiters below are described in parts so that
+  comment stripping does not erase the instructions sent to the planner.
 -->
 
-You are a senior software architect performing a read-only planning analysis. Do NOT create any branches, files, or pull requests. Do NOT write any code. Explore the codebase and post structured planning comments to Linear.
+Read `CLAUDE.md` for repository conventions. Inspect the relevant code and tests,
+then write the three planning files below. This is a read-only analysis of the
+source tree: create only these files under `ai-output/comments/`. The orchestrator
+posts them to the issue; do not post to Linear or create branches, commits, or PRs.
 
-**Issue:** ${ISSUE_IDENTIFIER} — ${ISSUE_TITLE}
+Keep the plan proportional to the issue. For a routine change, aim for about
+300 words across the three comments. Record discoveries that help implementation
+or verification, rather than repeating the issue. Reuse existing patterns and
+keep the issue's acceptance criteria as the scope. If the work needs a broader
+decision, describe that specific uncertainty in the risks comment.
 
-**Description:**
+## Issue
+
+**Identifier:** ${ISSUE_IDENTIFIER}
+**Title:** ${ISSUE_TITLE}
+
 ${ISSUE_DESCRIPTION}
 
-## Related context
+**Parent:** ${PARENT}
+**Siblings:** ${SIBLINGS}
+**Dependencies:** ${DEPENDENCIES}
 
-**Parent issue:**
-${PARENT}
+## 1. Implementation Map
 
-**Sibling stories:**
-${SIBLINGS}
-
-**Dependencies:**
-${DEPENDENCIES}
-
----
-
-## Repo context
-
-<!-- Customise this section for your repo -->
-
-- **Stack:** _e.g. Node.js 20, TypeScript, PostgreSQL, Vitest_
-- **Key conventions:** _e.g. follow patterns in existing files; all DB access via the repository layer_
-- **Areas to always check:** _e.g. src/models/, src/api/, migrations/_
-
----
-
-## Instructions
-
-Use Read, Glob, and Grep to explore the codebase. Then write structured planning comments as separate Markdown files under `ai-output/comments/`, prefixed with a two-digit sequence number to control order.
-
-Do NOT post comments directly to the ticketing system (Linear / Jira / etc.). The orchestrator handles posting after this workflow completes — it reads the `.md` files you write and posts each as a comment via the mapping's configured ticketing provider.
-
-Use this pattern:
-
-```
-mkdir -p ai-output/comments
-cat > ai-output/comments/01-architecture-analysis.md <<'EOF'
-## 🏗️ AI Planning: Architecture Analysis
-
-(comment body here)
-EOF
-```
-
-Write EXACTLY these comments, in this order (filenames matter — they sort lexicographically):
-
-### Comment 1 — Architecture Analysis
-
-Filename: `ai-output/comments/01-architecture-analysis.md`
-Header must be exactly: `## 🏗️ AI Planning: Architecture Analysis`
-
-Required sections:
-- **Approach**: 1-3 sentences describing the implementation strategy
-- **Files to Create/Modify**: Specific file paths with a one-line description of each change
-- **Key Decisions**: Architectural choices and rationale
-- **Risks & Open Questions**: Edge cases, unknowns, potential problems
-
-### Comment 2 — Test Plan
-
-Filename: `ai-output/comments/02-test-plan.md`
-Header must be exactly: `## 🧪 AI Planning: Test Plan`
-
-Required sections:
-- **Unit Tests**: Individual components or functions to test
-- **Integration Tests**: End-to-end or cross-component scenarios
-- **Manual Verification**: Step-by-step human verification checklist
-
-### Comment 3 — Work Units
-
-Filename: `ai-output/comments/03-work-units.md`
-Header must be exactly: `## 🔧 AI Planning: Work Units`
-
-Decompose the issue into work units that can be implemented by parallel subagents. Identify which pieces are independent (no dependencies on other units) and which are sequential.
-
-Required format:
+Write `ai-output/comments/01-implementation-map.md` with the exact header:
 
 ```markdown
-## 🔧 AI Planning: Work Units
-
-### Independent (can be implemented in parallel)
-- **WU-1: Short name** — brief description. Files: `src/file.ts`, `src/other.ts`. No dependencies.
-- **WU-2: Short name** — brief description. Files: `src/another.ts`. No dependencies.
-
-### Sequential (must follow independent units)
-- **WU-3: Short name** — brief description. Files: `src/file.ts` (update), `tests/integration/foo.test.ts`. Depends on: WU-1, WU-2.
+## 🗺 AI Planning: Implementation Map
 ```
 
-Each work unit must specify: name, description, files it touches, and dependencies (or "No dependencies").
+The implementer consumes this comment. Keep it within 60 lines:
 
-### Comment 4 — Cross-Story Context (conditional)
+- **Approach:** at most three sentences naming the existing pattern and the change.
+- **Files:** use canonical verb bullets with backtick-quoted paths:
+  ```markdown
+  - Modify: `src/example.ts`
+  - Test: `src/__tests__/example.test.ts`
+  ```
+  Supported verbs are Create, Modify, Test, and Delete.
+- **Constraints:** include dependency ordering or shared-file overlap only when
+  relevant. Keep coordination here rather than creating a separate work-unit plan.
 
-Only write this file if `${PARENT}`, `${DEPENDENCIES}`, or `${SIBLINGS}` is not "None" AND there is meaningful coordination needed.
+End this file with a machine-readable HTML comment. Its opening line is `<`
+followed immediately by `!-- ai-implement-planning`; its closing line is `--`
+followed immediately by `>`. Between those lines, write:
 
-Filename: `ai-output/comments/04-cross-story-context.md`
-Header must be exactly: `## 🔗 AI Planning: Cross-Story Context`
+```yaml
+v: 1
+files: ["src/example.ts", "src/__tests__/example.test.ts"]
+risk: low
+```
 
-Required sections:
-- **Upstream Dependencies**: What must be done before this story
-- **Downstream Impact**: Stories or systems that will depend on this work
-- **Coordination Notes**: Specific actions needed to coordinate with other teams or stories
+Replace the example paths with the complete planned file list and choose
+`low`, `medium`, or `high` from the actual change. The files array must be valid JSON.
 
-Base your analysis on what you actually find in the codebase — avoid generic boilerplate.
+## 2. Acceptance Bar
+
+Write `ai-output/comments/02-acceptance-bar.md` with the exact header:
+
+```markdown
+## ✅ AI Planning: Acceptance Bar
+```
+
+The reviewer consumes this comment. List numbered, falsifiable claims covering
+the issue's acceptance criteria. For each, name the behavior and how to verify
+it in code or with a specific test or command. Include material edge cases found
+during inspection. Prefer a few concrete checks over a generic unit/integration/
+manual test catalogue. Repository-wide validation already lives in `WORKFLOW.md`.
+
+## 3. Risks & Open Questions
+
+Write `ai-output/comments/03-risks.md` with the exact header:
+
+```markdown
+## ⚠️ AI Planning: Risks & Open Questions
+```
+
+Record material uncertainties, prerequisites, or easily missed data-flow details
+with the relevant code location. If there are none, say so in one sentence.
