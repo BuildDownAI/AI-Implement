@@ -654,7 +654,7 @@ describe("SidecarMemoryProvider probe", () => {
 
   it("probe requests carry Accept: application/json, text/event-stream (the transport answers 406 without it)", async () => {
 
-    queueResponse(200, toolsResult(Object.keys(KG_TOOL_CAPABILITY).map((name) => ({ name }))));
+    queueResponse(200, JSON.stringify({ jsonrpc: "2.0", id: "probe-tools-list", result: { tools: Object.keys(KG_TOOL_CAPABILITY).map((name) => ({ name })) } }));
 
     queueResponse(200, JSON.stringify({ jsonrpc: "2.0", id: "probe-kg-neighbors", result: { content: [] } }));
 

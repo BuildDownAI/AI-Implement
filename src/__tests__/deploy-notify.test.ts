@@ -169,7 +169,7 @@ describe("decideDeployOutcome", () => {
       kind: "deployed-not-serving",
       commit: "abc1234",
       timestamp: 1_700_000_000_000,
-      detail: "KG sidecar rejected tools/list: tools/list is missing: kg_neighbors",
+      detail: "KG sidecar liveness probe failed: tools/list is missing: kg_neighbors",
     });
   });
 
@@ -334,7 +334,7 @@ describe("postBootNotice", () => {
 
     const outcome = deployNotify.getDeployOutcome();
     expect(outcome?.kind).toBe("deployed-not-serving");
-    expect(outcome?.detail).toBe("KG sidecar rejected tools/list: tools/list rejected: 400");
+    expect(outcome?.detail).toBe("KG sidecar liveness probe failed: tools/list rejected: 400");
   });
 
   it("records deployed-ok when the sidecar URL is set and no probe error is passed", async () => {

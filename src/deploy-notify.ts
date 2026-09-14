@@ -105,7 +105,7 @@ export function decideDeployOutcome(input: DeployOutcomeInput): DeployOutcome | 
     return { kind: "deployed-not-serving", commit, timestamp: now, detail: "KG sidecar did not start" };
   }
   if (sidecarProbeError) {
-    return { kind: "deployed-not-serving", commit, timestamp: now, detail: `KG sidecar rejected tools/list: ${sidecarProbeError}` };
+    return { kind: "deployed-not-serving", commit, timestamp: now, detail: `KG sidecar liveness probe failed: ${sidecarProbeError}` };
   }
   return { kind: "deployed-ok", commit, timestamp: now };
 }
