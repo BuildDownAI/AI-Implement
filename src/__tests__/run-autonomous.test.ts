@@ -1597,6 +1597,75 @@ describe("runAutonomous", () => {
     expect(body.failureReason).toContain("configured cap (30)");
   });
 
+  it("uses the reviewer-specific exhausted turn cap in the ticket comment and autopsy", async () => {
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+    vi.stubEnv(
+      "AI_IMPLEMENT_RUN_CONFIG",
+      encodeRunConfig({
+        v: 1,
+        issue: { id: "issue-abc", identifier: "AII-1", title: "Test issue", description: "Issue description" },
+      }),
+    );
+
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    const { pipeline, runner } = makeStepsPipeline([
+      [
+        "feedback-loop",
+        { run: vi.fn().mockResolvedValue({ approved: true, iterations: 1, terminationReason: "approved", passes: [] }) },
+      ],
+      [
+        "push",
+        {
+          run: vi.fn().mockResolvedValue({
+            prUrl: "https://github.com/o/r/pull/14",
+            prNumber: 14,
+            branchPushed: true,
+            draft: true,
+          }),
+        },
+      ],
+      [
+        "post-push-review",
+        {
+          run: vi.fn().mockResolvedValue({
+            approved: false,
+            iterations: 1,
+            finalFeedback: "gap-analysis ran out of turns at the configured cap (3).",
+            terminationReason: "reviewer_turns_exhausted",
+            forcePushedRevisions: 0,
+            failure: {
+              category: "invalid_output" as const,
+              code: "REVIEWER_TURNS_EXHAUSTED",
+              stage: "post-push-review/gap-analysis-review-1",
+              attempt: 1,
+              retryable: false,
+              reviewMaxTurns: 3,
+              message: "The runner reported no detail.",
+              evidence: { truncated: false },
+            },
+          }),
+        },
+      ],
+    ]);
+
+    await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+      fetchImpl: mockFetch,
+    });
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as { failureReason: string };
+    expect(body.failureReason).toContain("configured cap (3)");
+    expect(body.failureReason).not.toContain("configured cap (30)");
+    const autopsy = readFileSync(join(workspaceDir, "ai-output", "comments", "90-run-autopsy.md"), "utf-8");
+    expect(autopsy).toContain("configured cap (3)");
+    expect(autopsy).not.toContain("configured cap (30)");
+  });
+
   it("writes the autopsy comment file on unapproved runs", async () => {
     const { pipeline, runner } = makeStepsPipeline([
       [

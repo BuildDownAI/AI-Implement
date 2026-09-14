@@ -700,7 +700,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
         : terminationReason === "max_turns"
           ? "MAX_TURNS_EXHAUSTED"
           : "REVIEW_UNAPPROVED";
-    const reviewMaxTurns = retryPolicy.reviewMaxTurns ?? DEFAULT_RETRY_POLICY.reviewMaxTurns;
+    const reviewMaxTurns = reviewerFailure?.reviewMaxTurns ?? retryPolicy.reviewMaxTurns ?? DEFAULT_RETRY_POLICY.reviewMaxTurns;
     // Iteration 1 never carried forward blockers from a prior review, so "the code was not
     // reviewed" is accurate; iteration >= 2 means a previous review DID run and a fix pass
     // acted on it — only the latest revision went unreviewed. Matches the PR comment's own
