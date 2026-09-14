@@ -5,8 +5,8 @@
   "properties": {
     "verdict": {
       "type": "string",
-      "enum": ["approve", "request_changes"],
-      "description": "Overall merge-readiness verdict. Use request_changes whenever findings[] contains any entry with severity=blocking."
+      "enum": ["approve", "changes_requested", "incomplete"],
+      "description": "Overall merge-readiness verdict. Use changes_requested when the PR should not merge yet; use incomplete when no trustworthy verdict can be reached."
     },
     "summary": {
       "type": "string",
@@ -18,21 +18,20 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["severity", "title", "body"],
+        "required": ["severity", "body"],
         "properties": {
           "severity": {
             "type": "string",
             "enum": ["blocking", "minor"],
-            "description": "blocking: must be fixed before merge. minor: worth surfacing but does not gate approval."
+            "description": "Human-facing severity label. Consumer policy decides how findings affect gating."
           },
-          "title": {
+          "path": {
             "type": "string",
-            "minLength": 1,
-            "description": "Short label for the finding."
+            "description": "File path when the finding is localised to a file in the diff. Omit when not applicable."
           },
-          "location": {
-            "type": "string",
-            "description": "File path, and line or function, when known. Omit when the finding is not localised to a spot in the diff."
+          "line": {
+            "type": "integer",
+            "description": "One-based line number when the finding is localised to a line in the diff. Omit when not applicable."
           },
           "body": {
             "type": "string",

@@ -19,7 +19,7 @@ The comment ends with a fenced code block using the info string
 
 ````
 ```json review-findings
-{"schema":"review-findings/v1","verdict":"request_changes","findings":[{"severity":"blocking","title":"...","location":"src/x.ts:42","body":"..."}]}
+{"schema":"review-findings/v1","verdict":"changes_requested","findings":[{"severity":"blocking","path":"src/x.ts","line":42,"body":"..."}]}
 ```
 ````
 
@@ -34,35 +34,35 @@ The comment ends with a fenced code block using the info string
   later change to this contract can be *detected* — a consumer that doesn't
   recognise the value should refuse to parse the block rather than guess.
 
-## Schema
+## Wire Schema
 
-The full JSON Schema, also vendored at
-[`.github/actions/claude-review/review-findings-schema.json`](../.github/actions/claude-review/review-findings-schema.json)
-for use as an `--json-schema` argument:
+This is the schema for the fenced block that consumers parse from a PR
+comment:
 
 ```json
 {
   "type": "object",
   "additionalProperties": false,
-  "required": ["verdict", "summary", "findings"],
+  "required": ["schema", "verdict", "findings"],
   "properties": {
+    "schema": {
+      "type": "string",
+      "const": "review-findings/v1"
+    },
     "verdict": {
       "type": "string",
-      "enum": ["approve", "request_changes"]
-    },
-    "summary": {
-      "type": "string"
+      "enum": ["approve", "changes_requested", "incomplete"]
     },
     "findings": {
       "type": "array",
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["severity", "title", "body"],
+        "required": ["severity", "body"],
         "properties": {
           "severity": { "type": "string", "enum": ["blocking", "minor"] },
-          "title": { "type": "string", "minLength": 1 },
-          "location": { "type": "string" },
+          "path": { "type": "string" },
+          "line": { "type": "integer" },
           "body": { "type": "string", "minLength": 1 }
         }
       }
@@ -75,41 +75,39 @@ Field meanings:
 
 | Field | Meaning |
 |---|---|
-| `verdict` | Overall merge-readiness call. `request_changes` whenever `findings[]` contains any `severity: "blocking"` entry; `approve` only when it doesn't. |
-| `summary` | The reviewer's own free-text summary. Presentation only — carried verbatim into the human-readable part of the comment, never parsed by a gate. |
+| `schema` | Literal version tag. Consumers reject any value other than `review-findings/v1`. |
+| `verdict` | Overall merge-readiness call: `approve`, `changes_requested`, or `incomplete`. |
 | `findings[]` | Every issue worth surfacing, blocking or not. Empty when the diff looks fine. |
-| `findings[].severity` | `blocking` gates approval; `minor` is surfaced to the human merging but never gates. |
-| `findings[].title` | Short label for the finding. |
-| `findings[].location` | File, and line or function, when the finding is localised to a spot in the diff. Omitted otherwise. |
+| `findings[].severity` | Human-facing severity label. Consumer project policy decides how findings affect gating. |
+| `findings[].path` | File path when the finding is localised to a file in the diff. Omitted otherwise. |
+| `findings[].line` | One-based line number when the finding is localised to a line in the diff. Omitted otherwise. |
 | `findings[].body` | Full, self-contained description — a reader must be able to act on it without reading the reviewer's prose above. |
 
-`schema` is not a field the reviewer produces — the emitter stamps it onto
-the block itself when it renders the comment, so the version tag can't be
-misremembered or omitted by the model or script writing the finding data.
-Note that `verdict` and `findings[].severity` are the same shape as
-`approved`/`blocking_issues` in `src/pipeline/review-verdict.ts`, which this
-repo's *internal* implement-review loop uses — that internal schema is a
-separate contract for a separate consumer (the pipeline's own review step,
-which reads structured output directly rather than a posted comment) and is
-not required to track this one, but the two are intentionally close in shape.
+`.github/actions/claude-review` asks Claude for a nearby but different
+structured output shape: it includes `summary`, which is used only for the
+human-readable prose above the fenced block, and it omits `schema`, which the
+trusted render step stamps onto the block. That model-facing schema is vendored
+at
+[`.github/actions/claude-review/review-findings-schema.json`](../.github/actions/claude-review/review-findings-schema.json)
+and passed to Claude as a compact JSON literal via `--json-schema`.
 
 ## Full example comment
 
 ````markdown
 ## Claude review
 
-**Verdict:** request_changes
+**Verdict:** changes_requested
 
 The retry loop looks solid, but the new cache key collides with the existing
 per-tenant key when `tenantId` is empty, and there's no test for that path.
 
 ### Findings
 
-- **[blocking] Cache key collision on empty tenantId** (src/cache.ts:88): `buildCacheKey` joins `tenantId` and `resourceId` with `:` but doesn't guard against `tenantId === ""`, so a request with no tenant produces the same key as a request for tenant `""` on the same resource — a real value if `tenantId` is ever optional upstream. Reject or namespace the empty case explicitly.
-- **[minor] `retryDelayMs` could use the existing backoff helper**: `src/retry.ts` already exports `exponentialBackoff`; this PR reimplements the same formula inline in `fetchWithRetry`. Not blocking, but worth consolidating next time this file is touched.
+- **[blocking]** (src/cache.ts:88): `buildCacheKey` joins `tenantId` and `resourceId` with `:` but doesn't guard against `tenantId === ""`, so a request with no tenant produces the same key as a request for tenant `""` on the same resource — a real value if `tenantId` is ever optional upstream. Reject or namespace the empty case explicitly.
+- **[minor]**: `src/retry.ts` already exports `exponentialBackoff`; this PR reimplements the same formula inline in `fetchWithRetry`.
 
 ```json review-findings
-{"schema":"review-findings/v1","verdict":"request_changes","findings":[{"severity":"blocking","title":"Cache key collision on empty tenantId","location":"src/cache.ts:88","body":"buildCacheKey joins tenantId and resourceId with ':' but doesn't guard against tenantId === \"\", so a request with no tenant produces the same key as a request for tenant \"\" on the same resource. Reject or namespace the empty case explicitly."},{"severity":"minor","title":"retryDelayMs could use the existing backoff helper","body":"src/retry.ts already exports exponentialBackoff; this PR reimplements the same formula inline in fetchWithRetry."}]}
+{"schema":"review-findings/v1","verdict":"changes_requested","findings":[{"severity":"blocking","path":"src/cache.ts","line":88,"body":"buildCacheKey joins tenantId and resourceId with ':' but doesn't guard against tenantId === \"\", so a request with no tenant produces the same key as a request for tenant \"\" on the same resource. Reject or namespace the empty case explicitly."},{"severity":"minor","body":"src/retry.ts already exports exponentialBackoff; this PR reimplements the same formula inline in fetchWithRetry."}]}
 ```
 ````
 

@@ -33,6 +33,17 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Prepare review findings schema
+      id: prepare-schema
+      shell: bash
+      run: |
+        set -euo pipefail
+        {
+          echo "json<<EOF"
+          jq -c 'del(.. | .description?)' "${{ github.action_path }}/review-findings-schema.json"
+          echo "EOF"
+        } >> "$GITHUB_OUTPUT"
+
     - name: Run Claude review
       id: review
       # Pinned to v1.0.217 (last known-good): floating @v1 moved to a build (0d0e0876) that broke
@@ -62,9 +73,11 @@ runs:
           Do not post any comment yourself — a later workflow step renders and posts the
           review from your structured output. Respond only with the JSON object the
           supplied schema requires: `summary` (your free-text review, carried into the
-          posted comment verbatim), `verdict` (`approve` or `request_changes`), and
-          `findings[]` (empty when the diff looks fine). Set verdict to request_changes
-          whenever any finding has severity "blocking".
+          posted comment verbatim), `verdict` (`approve`, `changes_requested`, or
+          `incomplete`), and
+          `findings[]` (empty when the diff looks fine). Set verdict to changes_requested
+          whenever any finding should block merge. Set verdict to incomplete when you
+          cannot reach a trustworthy review verdict for this diff.
 
           Never write a line consisting of three backticks alone inside a finding's
           `body` or inside `summary` — the posted comment wraps them in fenced sections,
@@ -73,7 +86,7 @@ runs:
 
           ${{ inputs.prompt_extra }}
         claude_args: |
-          --json-schema "${{ github.action_path }}/review-findings-schema.json"
+          --json-schema '${{ steps.prepare-schema.outputs.json }}'
           --allowedTools "Bash(gh pr diff:*),Bash(gh pr view:*)"
 
     # The action above enforces the schema: base-action/src/run-claude-sdk.ts calls
@@ -95,30 +108,63 @@ runs:
           exit 1
         fi
 
-        findings_count=$(jq -r '(.findings // []) | length' <<<"$STRUCTURED_OUTPUT")
+        if ! jq -e '
+          type == "object"
+          and ((keys_unsorted - ["verdict", "summary", "findings"]) | length == 0)
+          and ((.verdict == "approve") or (.verdict == "changes_requested") or (.verdict == "incomplete"))
+          and (.summary | type == "string")
+          and (.findings | type == "array")
+          and ([.findings[] |
+            type == "object"
+            and ((keys_unsorted - ["severity", "body", "path", "line"]) | length == 0)
+            and ((.severity == "blocking") or (.severity == "minor"))
+            and (.body | type == "string" and length > 0)
+            and ((has("path") | not) or (.path | type == "string"))
+            and ((has("line") | not) or (.line | type == "number" and floor == .))
+          ] | all)
+        ' >/dev/null <<<"$STRUCTURED_OUTPUT"; then
+          echo "::error::claude-review: structured_output did not match review-findings/v1"
+          exit 1
+        fi
+
+        findings_count=$(jq -r '.findings | length' <<<"$STRUCTURED_OUTPUT")
 
         {
           echo "## Claude review"
           echo
-          echo "**Verdict:** $(jq -r '.verdict // "unknown"' <<<"$STRUCTURED_OUTPUT")"
+          echo "**Verdict:** $(jq -r '.verdict' <<<"$STRUCTURED_OUTPUT")"
           echo
-          jq -r '.summary // ""' <<<"$STRUCTURED_OUTPUT"
+          jq -r '.summary' <<<"$STRUCTURED_OUTPUT"
           echo
           if [ "$findings_count" -gt 0 ]; then
             echo "### Findings"
             echo
             jq -r '
-              (.findings // [])[] |
-              "- **[" + (.severity // "unspecified") + "] " + (.title // "(untitled finding)") + "**"
-                + (if (.location // "") != "" then " (" + .location + ")" else "" end)
-                + (if (.body // "") != "" then ": " + .body else "" end)
+              def location:
+                if has("path") and has("line") then .path + ":" + (.line | tostring)
+                elif has("path") then .path
+                else ""
+                end;
+              .findings[] |
+              "- **[" + .severity + "]**"
+                + (if location != "" then " (" + location + ")" else "" end)
+                + ": " + .body
             ' <<<"$STRUCTURED_OUTPUT"
           else
             echo "No findings reported."
           fi
           echo
           echo '```json review-findings'
-          jq -c '{schema: "review-findings/v1", verdict: (.verdict // "unknown"), findings: (.findings // [])}' <<<"$STRUCTURED_OUTPUT"
+          jq -c '{
+            schema: "review-findings/v1",
+            verdict,
+            findings: [
+              .findings[] |
+              {severity, body}
+              + (if has("path") then {path} else {} end)
+              + (if has("line") then {line} else {} end)
+            ]
+          }' <<<"$STRUCTURED_OUTPUT"
           echo '```'
         } > "$RUNNER_TEMP/claude-review-comment-body.md"
 
