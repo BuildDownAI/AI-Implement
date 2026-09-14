@@ -107,6 +107,10 @@ function classifySessionError(
 }
 
 /** Wraps the existing KG sidecar at `kgSidecarUrl` as the default provider. */
+/** A proxyCall outcome whose response was relayed to the client as it arrived. */
+type StreamedOutcome = { ok: true; streamed: true };
+type SendOutcome = SidecarPostResult | StreamedOutcome;
+
 export class SidecarMemoryProvider implements MemoryProvider {
   readonly id = "sidecar";
   readonly capabilities: MemoryProviderCapabilities = {
@@ -151,6 +155,53 @@ export class SidecarMemoryProvider implements MemoryProvider {
   }
 
   /**
+   * proxyCall's sender. A 400 or 404 from the sidecar may be a session signal, so those
+   * small JSON bodies are buffered and returned for classification. Any other status is
+   * relayed as it arrives — headers first, then each chunk — so a long or SSE response is
+   * never held in memory and never waits for the sidecar to close the stream (review of
+   * AII-649: the first version buffered every response, which would have stalled a GET
+   * event stream proxied through the "everything else" path in src/mcp.ts).
+   */
+  private sendOrStream(
+    target: URL,
+    transport: typeof http | typeof https,
+    method: string,
+    headers: SidecarHeaders,
+    body: Buffer,
+    res: http.ServerResponse,
+  ): Promise<SendOutcome> {
+    return new Promise((resolve) => {
+      const options: http.RequestOptions = {
+        hostname: target.hostname,
+        port: target.port || (target.protocol === "https:" ? "443" : "80"),
+        path: target.pathname + target.search,
+        method,
+        headers: { ...headers, host: target.host },
+      };
+      const proxyReq = transport.request(options, (proxyRes) => {
+        const status = proxyRes.statusCode ?? 0;
+        if (status === 400 || status === 404) {
+          const chunks: Buffer[] = [];
+          proxyRes.on("data", (chunk: Buffer) => chunks.push(chunk));
+          proxyRes.on("end", () => resolve({ ok: true, status, headers: proxyRes.headers, raw: Buffer.concat(chunks) }));
+          proxyRes.on("error", (err) => resolve({ ok: false, error: err as NodeJS.ErrnoException }));
+          return;
+        }
+        const outHeaders = { ...proxyRes.headers } as http.OutgoingHttpHeaders;
+        delete outHeaders["transfer-encoding"];
+        res.writeHead(status, outHeaders);
+        proxyRes.on("data", (chunk: Buffer) => res.write(chunk));
+        proxyRes.on("end", () => res.end());
+        proxyRes.on("error", (err) => res.destroy(err));
+        resolve({ ok: true, streamed: true });
+      });
+      proxyReq.on("error", (err: NodeJS.ErrnoException) => resolve({ ok: false, error: err }));
+      if (body.length > 0) proxyReq.write(body);
+      proxyReq.end();
+    });
+  }
+
+  /**
    * Performs the MCP `initialize` → `notifications/initialized` handshake
    * against the sidecar and returns the negotiated `mcp-session-id`. Throws
    * when the sidecar doesn't answer with a session header, so callers can
@@ -177,13 +228,18 @@ export class SidecarMemoryProvider implements MemoryProvider {
     }
 
     const notifyBody = Buffer.from(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }));
-    await this.sendToSidecar(
+    const notified = await this.sendToSidecar(
       target,
       transport,
       "POST",
       { ...forwardHeaders, "mcp-session-id": sessionHeader, "content-length": String(notifyBody.length) },
       notifyBody,
     );
+    if (!notified.ok || notified.status >= 400) {
+      console.error(
+        `[mcp] KG sidecar notifications/initialized was not accepted (${notified.ok ? `status ${notified.status}` : notified.error.code ?? notified.error.message}); continuing with the session`,
+      );
+    }
 
     return sessionHeader;
   }
@@ -204,12 +260,12 @@ export class SidecarMemoryProvider implements MemoryProvider {
     target: URL,
     transport: typeof http | typeof https,
     forwardHeaders: SidecarHeaders,
-    send: (sessionId: string | null) => Promise<SidecarPostResult>,
-  ): Promise<{ result: SidecarPostResult; parsed: SidecarRpcResponse | null; handshakeError?: unknown }> {
+    send: (sessionId: string | null) => Promise<SendOutcome>,
+  ): Promise<{ result: SendOutcome; parsed: SidecarRpcResponse | null; handshakeError?: unknown }> {
     const first = await send(this.sessionId);
-    if (!first.ok) return { result: first, parsed: null };
+    if (!first.ok || "streamed" in first) return { result: first, parsed: null };
 
-    let result: SidecarPostResult = first;
+    let result: SendOutcome = first;
     let parsed = parseSidecarRpcResponse(first.raw.toString(), first.headers["content-type"]);
     const kind = classifySessionError(first.status, parsed, this.sessionId);
     if (kind) {
@@ -220,7 +276,7 @@ export class SidecarMemoryProvider implements MemoryProvider {
         console.error(`[mcp] KG sidecar demanded a session; initialized (id ${sessionId}) and retried`);
         const retry = await send(sessionId);
         result = retry;
-        parsed = retry.ok ? parseSidecarRpcResponse(retry.raw.toString(), retry.headers["content-type"]) : null;
+        parsed = retry.ok && !("streamed" in retry) ? parseSidecarRpcResponse(retry.raw.toString(), retry.headers["content-type"]) : null;
       } catch (err) {
         return { result, parsed, handshakeError: err };
       }
@@ -243,7 +299,7 @@ export class SidecarMemoryProvider implements MemoryProvider {
     };
 
     const { result, parsed } = await this.sendWithSessionRetry(target, transport, forwardHeaders, send);
-    if (!result.ok) return [];
+    if (!result.ok || "streamed" in result) return [];
 
     if (!parsed) {
       console.error(
@@ -275,7 +331,7 @@ export class SidecarMemoryProvider implements MemoryProvider {
       } else {
         delete reqHeaders["content-length"];
       }
-      return this.sendToSidecar(target, transport, req.method ?? "POST", reqHeaders, body);
+      return this.sendOrStream(target, transport, req.method ?? "POST", reqHeaders, body, res);
     };
 
     const writeConnectionError = (err: NodeJS.ErrnoException) => {
@@ -294,14 +350,15 @@ export class SidecarMemoryProvider implements MemoryProvider {
 
     void (async () => {
       const { result, handshakeError } = await this.sendWithSessionRetry(target, transport, forwardHeaders, send);
-      if (handshakeError) {
-        console.error("[mcp] KG sidecar session initialize failed:", handshakeError);
-        writeJson(res, 502, { error: "KG sidecar error" });
-        return;
-      }
       if (!result.ok) {
         writeConnectionError(result.error);
         return;
+      }
+      if ("streamed" in result) return; // relayed to the client as it arrived
+      if (handshakeError) {
+        // Surface the sidecar's own rejection (status + JSON-RPC error body) rather than a
+        // synthetic 502 — parity with listTools and with docs/kg-sidecar.md.
+        console.error("[mcp] KG sidecar session initialize failed; forwarding the original rejection:", handshakeError);
       }
 
       const outHeaders = { ...result.headers } as http.OutgoingHttpHeaders;

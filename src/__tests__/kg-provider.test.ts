@@ -282,8 +282,12 @@ describe("SidecarMemoryProvider session handling", () => {
         res.statusCode = status;
         res.headers = headers;
       },
+      write(chunk: Buffer) {
+        res.body = res.body ? Buffer.concat([res.body, chunk]) : Buffer.from(chunk);
+        return true;
+      },
       end(chunk?: Buffer) {
-        res.body = chunk;
+        if (chunk) res.body = res.body ? Buffer.concat([res.body, chunk]) : Buffer.from(chunk);
       },
       destroy() {
         // no-op
@@ -461,6 +465,61 @@ describe("SidecarMemoryProvider session handling", () => {
     expect(retryOpts.headers["mcp-session-id"]).toBe("fresh-id");
   });
 
+  it("proxyCall: 404 on a stale session re-initializes once and relays the retried response", async () => {
+    const p = new SidecarMemoryProvider("http://127.0.0.1:8765/mcp");
+    (p as unknown as { sessionId: string | null }).sessionId = "stale-id";
+    queueResponse(404, JSON.stringify({ jsonrpc: "2.0", id: 1, error: { code: -32001, message: "session not found" } }));
+    queueResponse(200, JSON.stringify({ jsonrpc: "2.0", id: 1, result: {} }), { "mcp-session-id": "fresh-id" });
+    queueResponse(200, JSON.stringify({ jsonrpc: "2.0", result: {} }));
+    queueResponse(200, JSON.stringify({ jsonrpc: "2.0", id: 2, result: { content: [{ type: "text", text: "ok" }] } }));
+
+    const res = fakeRes();
+    p.proxyCall(fakeReq(), res, Buffer.from("{}"));
+    await waitUntil(() => res.body !== undefined && res.body.length > 0);
+
+    expect(mockHttpRequest).toHaveBeenCalledTimes(4);
+    expect((p as unknown as { sessionId: string | null }).sessionId).toBe("fresh-id");
+    expect(res.statusCode).toBe(200);
+    expect(res.body?.toString()).toContain('"text":"ok"');
+    const retryOpts = mockHttpRequest.mock.calls[3][0] as { headers: Record<string, unknown> };
+    expect(retryOpts.headers["mcp-session-id"]).toBe("fresh-id");
+  });
+
+  it("proxyCall streams a success response chunk by chunk instead of buffering it", async () => {
+    const proxyReq = new PassThrough();
+    const proxyRes = new PassThrough();
+    Object.assign(proxyRes, { statusCode: 200, headers: { "content-type": "text/event-stream" } });
+    mockHttpRequest.mockImplementationOnce((_opts: unknown, cb: (r: unknown) => void) => {
+      process.nextTick(() => cb(proxyRes));
+      return proxyReq;
+    });
+    const p = new SidecarMemoryProvider("http://127.0.0.1:8765/mcp");
+    const res = fakeRes();
+    p.proxyCall(fakeReq({}, "GET"), res, Buffer.alloc(0));
+
+    await waitUntil(() => res.headersSent);
+    expect(res.statusCode).toBe(200); // headers relayed before the body ends
+    proxyRes.push("event: message\ndata: {\"a\":1}\n\n");
+    await waitUntil(() => (res.body?.length ?? 0) > 0);
+    expect(res.body?.toString()).toContain('"a":1');
+    proxyRes.push("event: message\ndata: {\"b\":2}\n\n");
+    proxyRes.push(null);
+    await waitUntil(() => (res.body?.toString() ?? "").includes('"b":2'));
+    expect(mockHttpRequest).toHaveBeenCalledTimes(1);
+  });
+
+  it("proxyCall: when the handshake fails, the sidecar's original rejection is forwarded, not a synthetic 502", async () => {
+    queueResponse(400, MISSING_SESSION_BODY);
+    queueConnectionError("ECONNREFUSED");
+    const p = new SidecarMemoryProvider("http://127.0.0.1:8765/mcp");
+    const res = fakeRes();
+    p.proxyCall(fakeReq(), res, Buffer.from("{}"));
+    await waitUntil(() => res.headersSent);
+    expect(mockHttpRequest).toHaveBeenCalledTimes(2);
+    expect(res.statusCode).toBe(400);
+    expect(res.body?.toString()).toContain("Missing session ID");
+  });
+
   // (e) initialize itself fails → the original error is surfaced once, no loop
   it("listTools: a failed initialize resolves to [] with no third attempt", async () => {
     queueResponse(400, MISSING_SESSION_BODY);
@@ -472,7 +531,7 @@ describe("SidecarMemoryProvider session handling", () => {
     expect(mockHttpRequest).toHaveBeenCalledTimes(2);
   });
 
-  it("proxyCall: a failed initialize writes a 502 with no third attempt", async () => {
+  it("proxyCall: a failed initialize forwards the original rejection with no third attempt", async () => {
     queueResponse(400, MISSING_SESSION_BODY);
     queueConnectionError("ECONNREFUSED");
 
@@ -483,7 +542,8 @@ describe("SidecarMemoryProvider session handling", () => {
     await waitUntil(() => res.headersSent);
 
     expect(mockHttpRequest).toHaveBeenCalledTimes(2);
-    expect(res.statusCode).toBe(502);
+    expect(res.statusCode).toBe(400);
+    expect(res.body?.toString()).toContain("Missing session ID");
   });
 
   // Defensive: a pathological sidecar that still rejects after the handshake must not loop
