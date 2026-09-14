@@ -3,9 +3,14 @@ import { GitHubApiError } from "./github-errors.js";
 import { type RunConfigV1, encodeRunConfig } from "./run-config.js";
 import { DEFAULT_RETRY_POLICY, type RetryPolicy } from "./pipeline/retry-backoff.js";
 
-interface DispatchInputs {
+export interface DispatchInputs {
   /** Legacy mode: per-field issue data. */
   issue_id?: string;
+  /**
+   * Legacy mode: authoritative issue identifier. Envelope mode: display-only duplicate of
+   * run_config.issue.identifier, read solely by the workflow's `run-name:` expression (which
+   * cannot decode run_config) to title the Actions run with the ticket key.
+   */
   issue_identifier?: string;
   issue_title?: string;
   issue_description?: string;
@@ -23,8 +28,12 @@ interface DispatchInputs {
    * In envelope mode this rides inside run_config.baseBranch instead.
    */
   base_branch?: string;
-  /** Explicit callback phase reported by the runner. In envelope mode rides inside run_config. */
-  runner_phase?: "implementation" | "gap-analysis";
+  /**
+   * Explicit callback phase reported by the runner. In envelope mode rides inside run_config.
+   * `"kg-refresh"` is the GHA-backed kg-refresh dispatch (src/index.ts `dispatchKgRefreshRun`),
+   * the one dispatch site that still sends this input top-level under the envelope contract.
+   */
+  runner_phase?: "implementation" | "gap-analysis" | "kg-refresh";
   /** Claude provider: 'anthropic' (default) or 'bedrock'. Only forwarded when set. */
   provider?: string;
   /** AWS region for Bedrock. Only forwarded when provider='bedrock'. */
@@ -60,10 +69,74 @@ interface DispatchInputs {
   comment_instruction?: string;
 }
 
-interface DispatchResult {
+export interface DispatchResult {
   success: boolean;
   status: number;
   error?: string;
+}
+
+/**
+ * `workflow_dispatch` inputs that an older synced `claude-implement.yml` still declares but a
+ * newer template drops, because their values now ride inside `run_config` instead. Only the
+ * kg-refresh GHA dispatch (`dispatchKgRefreshRun` in `src/index.ts`) still sends these
+ * top-level — every other dispatch site already builds inputs via `buildEnvelopeDispatchInputs`,
+ * which never sets them. `postWorkflowDispatch` strips whichever of these a 422 names and
+ * retries — **at most once**, regardless of what the retry's own response says — so the
+ * orchestrator can serve both template generations until every target repo has re-synced.
+ * `issue_identifier` joined this list for the same reason (AII-656): on the envelope contract
+ * it is a display-only duplicate of `run_config.issue.identifier`, so a target repo that hasn't
+ * re-synced can drop it without losing anything; the `run_config` guard below keeps it
+ * authoritative on the legacy contract, where no duplicate exists.
+ */
+export const ENVELOPE_OPTIONAL_INPUTS = ["runner_phase", "runner_callback_url", "issue_identifier"] as const;
+
+/**
+ * Extracts the quoted input names from a GitHub "unexpected inputs" rejection so the caller can
+ * match them exactly — never by substring — against `ENVELOPE_OPTIONAL_INPUTS`. GitHub returns
+ * either the bare text `Unexpected inputs provided: ["runner_phase"]` or a JSON envelope
+ * `{"message":"Unexpected inputs provided: [\"runner_phase\"]","documentation_url":"..."}`; in
+ * the JSON case the message's escaped quotes must be decoded before scanning for quoted tokens,
+ * or every extracted name would carry a trailing backslash and never match. `JSON.parse` handles
+ * that decoding; the raw-text case is left as-is when parsing fails (it isn't JSON to begin with).
+ */
+function extractUnexpectedInputNames(body: string): Set<string> {
+  let text = body;
+  try {
+    const parsed = JSON.parse(body) as { message?: unknown };
+    if (typeof parsed.message === "string") text = parsed.message;
+  } catch {
+    // Not a JSON body — use the raw text as-is.
+  }
+  const names = new Set<string>();
+  for (const match of text.matchAll(/"([^"]*)"/g)) {
+    names.add(match[1]);
+  }
+  return names;
+}
+
+async function postDispatchOnce(
+  token: string,
+  owner: string,
+  repo: string,
+  workflowFile: string,
+  ref: string,
+  inputs: DispatchInputs,
+): Promise<DispatchResult> {
+  const url = `https://api.github.com/repos/${owner}/${repo}/actions/workflows/${workflowFile}/dispatches`;
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: ghHeaders(token),
+    body: JSON.stringify({ ref, inputs }),
+    signal: defaultFetchSignal(),
+  });
+
+  if (res.status === 204 || res.status === 200) {
+    return { success: true, status: res.status };
+  }
+
+  const body = await res.text();
+  return { success: false, status: res.status, error: body };
 }
 
 const GH_HEADERS = {
@@ -283,6 +356,10 @@ export function buildEnvelopeDispatchInputs(
 
   return {
     run_config: encodeRunConfig(runConfig),
+    // Display-only duplicate: run-name: is evaluated before any step runs, so it cannot
+    // decode run_config. The shared 422 retry (ENVELOPE_OPTIONAL_INPUTS) strips this on a
+    // template that predates the declaration.
+    issue_identifier: issue.identifier,
     run_token: opts.runToken ?? "",
     ...(opts.runProgressToken !== undefined ? { run_progress_token: opts.runProgressToken } : {}),
     ...(opts.runnerPhase !== "planning" && opts.runnerPhase !== "kg-refresh" && opts.runPublicationToken !== undefined
@@ -294,29 +371,67 @@ export function buildEnvelopeDispatchInputs(
   };
 }
 
+/**
+ * Posts a `workflow_dispatch`, with a bounded strip-and-retry for older templates: **at most
+ * two requests, ever.** On a 422 whose body matches `/unexpected inputs/i` and names — by exact
+ * match, never substring — at least one `ENVELOPE_OPTIONAL_INPUTS` member that is present in
+ * `inputs`, and only when `inputs.run_config` is a non-empty string, it strips exactly the named
+ * members and posts once more. Whatever that second request returns — success, a different 422,
+ * the same 422 again — is returned as-is; there is no third request. A target repo whose 422
+ * keeps naming a *different* declared-but-unhandled input across requests would otherwise chain
+ * indefinitely, since each response only proves what the target rejected on that specific
+ * payload, not what it will accept next.
+ *
+ * The `run_config` guard matters: on the legacy contract `runner_phase`/`runner_callback_url`
+ * are authoritative issue data, not compatibility duplicates, so stripping them there would run
+ * a gap-fill as an implementation. The guard requires a non-empty string — `run_config: ""`
+ * must not count as "envelope present" and authorize a strip.
+ *
+ * Name matching is exact against the quoted tokens in the rejection body (via
+ * `extractUnexpectedInputNames`), not `body.includes(name)` — a rejection naming
+ * `runner_phase_extra` or `extra_runner_callback_url` must not be mistaken for a match on
+ * `runner_phase` or `runner_callback_url`.
+ */
+export async function postWorkflowDispatch(opts: {
+  token: string;
+  owner: string;
+  repo: string;
+  workflowFile: string;
+  ref: string;
+  inputs: DispatchInputs;
+}): Promise<DispatchResult> {
+  const first = await postDispatchOnce(opts.token, opts.owner, opts.repo, opts.workflowFile, opts.ref, opts.inputs);
+  if (first.success) return first;
+  if (first.status !== 422 || !/unexpected inputs/i.test(first.error ?? "")) return first;
+  if (!opts.inputs.run_config) return first;
+
+  const rejectedNames = extractUnexpectedInputNames(first.error ?? "");
+  const namesToStrip = ENVELOPE_OPTIONAL_INPUTS.filter(
+    (name) => opts.inputs[name] !== undefined && rejectedNames.has(name),
+  );
+  if (namesToStrip.length === 0) return first;
+
+  const strippedInputs: DispatchInputs = { ...opts.inputs };
+  for (const name of namesToStrip) delete strippedInputs[name];
+  console.log(
+    `[dispatch] ${opts.owner}/${opts.repo}/${opts.workflowFile} does not declare ${namesToStrip.join(", ")} (re-sync workflows); retrying without`,
+  );
+  return postDispatchOnce(opts.token, opts.owner, opts.repo, opts.workflowFile, opts.ref, strippedInputs);
+}
+
 export async function dispatchWorkflow(
   token: string,
   mapping: RepoMapping,
   inputs: DispatchInputs,
 ): Promise<DispatchResult> {
-  const url = `https://api.github.com/repos/${mapping.owner}/${mapping.repo}/actions/workflows/${mapping.workflowFile}/dispatches`;
-
-  const res = await fetch(url, {
-    method: "POST",
-    headers: ghHeaders(token),
-    body: JSON.stringify({
-      ref: mapping.defaultBranch,
-      inputs,
-    }),
-    signal: defaultFetchSignal(),
+  return postWorkflowDispatch({
+    token,
+    owner: mapping.owner,
+    repo: mapping.repo,
+    workflowFile: mapping.workflowFile,
+    ref: mapping.defaultBranch,
+    inputs,
   });
-
-  if (res.status === 204 || res.status === 200) {
-    return { success: true, status: res.status };
-  }
-
-  const body = await res.text();
-  return { success: false, status: res.status, error: body };
 }
 
 /**
@@ -603,32 +718,35 @@ export const KG_GHA_POLL_DELAYS_MS: readonly number[] = [5_000, 10_000, 20_000, 
  * Injectable findRunId and pollDelaysMs for testability.
  */
 /**
- * Body for a GHA-backed kg-refresh `workflow_dispatch`. The envelope's
- * `runnerCallbackUrl` is the bare base URL (AII-548); `runner_phase` selects the
- * kg-refresh entry in the shared claude-implement.yml template (AII-556).
+ * Builds the `workflow_dispatch` inputs for a GHA-backed kg-refresh run, for use with
+ * `postWorkflowDispatch`. The envelope's `runnerCallbackUrl` is the bare base URL (AII-548);
+ * `runner_phase` selects the kg-refresh entry in the shared claude-implement.yml template
+ * (AII-556) — it, `runner_callback_url`, and `issue_identifier` are members of
+ * `ENVELOPE_OPTIONAL_INPUTS` and are stripped by the poster on a 422 from a target repo that no
+ * longer declares them. `issueIdentifier` is the decoded run_config's `issue.identifier` — the
+ * caller (`dispatchKgRefreshRun` in `src/index.ts`) already decodes run_config once for
+ * `kgSourceRef` and threads the same decode through here rather than decoding twice.
  */
 export function buildKgRefreshGhaDispatchBody(opts: {
-  ref: string;
   runConfig: string;
   runToken: string;
   runProgressToken: string;
   runnerImage: string | undefined;
   runnerCallbackUrl?: string | undefined;
-  runnerPhase?: string;
+  runnerPhase?: DispatchInputs["runner_phase"];
   jobTimeoutMinutes?: string;
-}): string {
-  return JSON.stringify({
-    ref: opts.ref,
-    inputs: {
-      run_config: opts.runConfig,
-      run_token: opts.runToken,
-      run_progress_token: opts.runProgressToken,
-      ...(opts.runnerPhase ? { runner_phase: opts.runnerPhase } : {}),
-      ...(opts.jobTimeoutMinutes ? { job_timeout_minutes: opts.jobTimeoutMinutes } : {}),
-      ...(opts.runnerImage ? { runner_image: opts.runnerImage } : {}),
-      ...(opts.runnerCallbackUrl ? { runner_callback_url: opts.runnerCallbackUrl } : {}),
-    },
-  });
+  issueIdentifier?: string;
+}): DispatchInputs {
+  return {
+    run_config: opts.runConfig,
+    run_token: opts.runToken,
+    run_progress_token: opts.runProgressToken,
+    ...(opts.runnerPhase ? { runner_phase: opts.runnerPhase } : {}),
+    ...(opts.jobTimeoutMinutes ? { job_timeout_minutes: opts.jobTimeoutMinutes } : {}),
+    ...(opts.runnerImage ? { runner_image: opts.runnerImage } : {}),
+    ...(opts.runnerCallbackUrl ? { runner_callback_url: opts.runnerCallbackUrl } : {}),
+    ...(opts.issueIdentifier ? { issue_identifier: opts.issueIdentifier } : {}),
+  };
 }
 
 export async function pollForKgWorkflowRunId(opts: {

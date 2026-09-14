@@ -39,6 +39,8 @@
 # images are only usable in this GitHub Actions execution mode.
 
 name: Claude AI Planning
+# Display-only: the ticket key also rides inside run_config, which run-name expressions cannot decode.
+run-name: ${{ inputs.issue_identifier && format('Claude AI Planning — {0}', inputs.issue_identifier) || 'Claude AI Planning' }}
 
 on:
   workflow_dispatch:
@@ -47,6 +49,11 @@ on:
         description: "base64 JSON RunConfig envelope — see docs/workflow-envelope.md"
         required: true
         type: string
+      issue_identifier:
+        description: "Ticket key for the run title; display only — run_config is authoritative"
+        required: false
+        type: string
+        default: ""
       runner_image:
         description: "Override the runner image for this run (must match ghcr.io/builddownai/*, the repo owner's ghcr.io/<owner>/*, or AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES)"
         required: false

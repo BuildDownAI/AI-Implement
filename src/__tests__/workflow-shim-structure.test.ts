@@ -105,17 +105,91 @@ describe("GHA workflow shims", () => {
     expect(promoteStep.run).toContain('"$head_date_tag"');
   });
 
-  it("keeps the canonical and synced dispatch workflows byte-for-byte identical", () => {
-    expect(readFileSync(".github/workflows/claude-implement.yml", "utf-8")).toBe(
-      readFileSync("workflows/claude-implement.yml", "utf-8"),
-    );
+  // Tests the dual-copy invariant generically rather than relying on someone
+  // remembering to update a hardcoded per-file assertion.
+  it("keeps every workflows/*.yml template byte-identical to its .github/workflows/ synced copy", () => {
+    const canonicals = [...IMPLEMENT_WORKFLOWS, ...PLANNING_WORKFLOWS].filter((f) => f.startsWith("workflows/"));
+    expect(canonicals.length).toBeGreaterThan(0);
+    for (const canonical of canonicals) {
+      const synced = canonical.replace("workflows/", ".github/workflows/");
+      expect(readFileSync(synced, "utf-8")).toBe(readFileSync(canonical, "utf-8"));
+    }
   });
 
-  it("keeps the canonical and synced planning workflows byte-for-byte identical", () => {
-    expect(readFileSync(".github/workflows/claude-plan.yml", "utf-8")).toBe(
-      readFileSync("workflows/claude-plan.yml", "utf-8"),
-    );
-  });
+  for (const f of IMPLEMENT_WORKFLOWS) {
+    it(`${f} declares exactly the 9 envelope inputs, in order`, () => {
+      const doc = parse(readFileSync(f, "utf-8")) as any;
+      expect(Object.keys(doc.on.workflow_dispatch.inputs)).toEqual([
+        "run_config",
+        "issue_identifier",
+        "runner_image",
+        "job_timeout_minutes",
+        "provider",
+        "aws_region",
+        "run_token",
+        "run_progress_token",
+        "run_publication_token",
+      ]);
+    });
+
+    it(`${f} declares issue_identifier as an optional, display-only string input`, () => {
+      const doc = parse(readFileSync(f, "utf-8")) as any;
+      const input = doc.on.workflow_dispatch.inputs.issue_identifier;
+      expect(input.required).toBe(false);
+      expect(input.type).toBe("string");
+      expect(input.default).toBe("");
+    });
+
+    it(`${f} titles the run with the ticket key via run-name:`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      expect(yaml).toContain(
+        "run-name: ${{ inputs.issue_identifier && format('Claude AI Implementation — {0}', inputs.issue_identifier) || 'Claude AI Implementation' }}",
+      );
+    });
+  }
+
+  for (const f of PLANNING_WORKFLOWS) {
+    it(`${f} declares exactly the 8 envelope inputs, in order`, () => {
+      const doc = parse(readFileSync(f, "utf-8")) as any;
+      expect(Object.keys(doc.on.workflow_dispatch.inputs)).toEqual([
+        "run_config",
+        "issue_identifier",
+        "runner_image",
+        "job_timeout_minutes",
+        "provider",
+        "aws_region",
+        "run_token",
+        "run_progress_token",
+      ]);
+    });
+
+    it(`${f} declares issue_identifier as an optional, display-only string input`, () => {
+      const doc = parse(readFileSync(f, "utf-8")) as any;
+      const input = doc.on.workflow_dispatch.inputs.issue_identifier;
+      expect(input.required).toBe(false);
+      expect(input.type).toBe("string");
+      expect(input.default).toBe("");
+    });
+
+    it(`${f} titles the run with the ticket key via run-name:`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      expect(yaml).toContain(
+        "run-name: ${{ inputs.issue_identifier && format('Claude AI Planning — {0}', inputs.issue_identifier) || 'Claude AI Planning' }}",
+      );
+    });
+  }
+
+  for (const f of SYNCED_WORKFLOW_FILES) {
+    it(`${f} never references inputs.issue_identifier from a step (display-only)`, () => {
+      const doc = parse(readFileSync(f, "utf-8")) as any;
+      const jobs = Object.values(doc.jobs) as any[];
+      for (const job of jobs) {
+        for (const step of job.steps ?? []) {
+          expect(JSON.stringify(step)).not.toContain("inputs.issue_identifier");
+        }
+      }
+    });
+  }
 
   it("keeps seeded gap-fill Git writes under pipeline control", () => {
     const workflow = readFileSync("workflows/WORKFLOW.md", "utf-8");

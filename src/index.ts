@@ -8,7 +8,7 @@ import {
 } from "./config.js";
 import type { RepoMapping } from "./config.js";
 import { isAlreadyDispatched, markDispatched, closeDb, getDispatchedIds, deleteDispatched } from "./dedup.js";
-import { dispatchWorkflow, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, getPullRequestState, buildEnvelopeDispatchInputs, postPrComment, defaultFetchSignal, getRepoDefaultBranch, buildKgRefreshGhaDispatchBody, pollForKgWorkflowRunId } from "./github.js";
+import { dispatchWorkflow, postWorkflowDispatch, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, getPullRequestState, buildEnvelopeDispatchInputs, postPrComment, defaultFetchSignal, getRepoDefaultBranch, buildKgRefreshGhaDispatchBody, pollForKgWorkflowRunId } from "./github.js";
 import { resolveWorkflowCapabilities, resolveWorkflowContract } from "./workflow-probe.js";
 import { surfaceDispatchFailure } from "./dispatch-failure.js";
 import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
@@ -3195,9 +3195,10 @@ async function dispatchKgRefreshRun(
   const repo = parseKgSourceRepo(config.kgSourceRepo);
   const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, repo.owner);
   const defaultBranch = (await getRepoDefaultBranch(ghToken, repo.owner, repo.repo)) ?? "main";
+  const decodedConfig = decodeRunConfig(opts.runConfig);
   // A PR-triggered dry-run (AII-633) carries kgSourceRef — the PR's head branch — so the
   // GHA dispatch runs against that ref instead of the default branch. Absent = unchanged.
-  const dispatchRef = decodeRunConfig(opts.runConfig).kgSourceRef ?? defaultBranch;
+  const dispatchRef = decodedConfig.kgSourceRef ?? defaultBranch;
 
   // Use the execution path resolved once by resolveExecutionMode in trigger() when
   // available. Falling back to an independent resolution is only a safety net for
@@ -3212,7 +3213,6 @@ async function dispatchKgRefreshRun(
 
   if (executionPath === "github-actions") {
     // Dispatch to claude-implement.yml in the KG source repo with runner_phase=kg-refresh.
-    const dispatchUrl = `https://api.github.com/repos/${repo.owner}/${repo.repo}/actions/workflows/claude-implement.yml/dispatches`;
     const runnerImage = await resolveRunnerImageForDispatch({
       owner: repo.owner,
       repo: repo.repo,
@@ -3221,26 +3221,27 @@ async function dispatchKgRefreshRun(
       runnerImageExplicit: config.runnerImageExplicit,
     });
     const runnerCallbackUrl = config.runnerCallbackBaseUrl ?? undefined;
-    const dispatchBody = buildKgRefreshGhaDispatchBody({ ref: dispatchRef, runConfig: opts.runConfig, runToken: opts.runToken, runProgressToken: opts.runProgressToken, runnerImage, runnerCallbackUrl, runnerPhase: "kg-refresh", jobTimeoutMinutes: "240" });
+    const dispatchInputs = buildKgRefreshGhaDispatchBody({ runConfig: opts.runConfig, runToken: opts.runToken, runProgressToken: opts.runProgressToken, runnerImage, runnerCallbackUrl, runnerPhase: "kg-refresh", jobTimeoutMinutes: "240", issueIdentifier: decodedConfig.issue.identifier });
     const dispatchedAt = Date.now();
-    const dispatchRes = await fetch(dispatchUrl, {
-      method: "POST",
-      signal: defaultFetchSignal(),
-      headers: { Authorization: `Bearer ${ghToken}`, Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", "Content-Type": "application/json" },
-      body: dispatchBody,
+    const dispatchResult = await postWorkflowDispatch({
+      token: ghToken,
+      owner: repo.owner,
+      repo: repo.repo,
+      workflowFile: KG_REFRESH_WORKFLOW_FILE,
+      ref: dispatchRef,
+      inputs: dispatchInputs,
     });
 
-    if (!dispatchRes.ok) {
-      const errorBody = await dispatchRes.text().catch(() => "");
-      if (dispatchRes.status === 422) {
+    if (!dispatchResult.success) {
+      if (dispatchResult.status === 422) {
         throw new Error(
           `[kg-refresh] GHA dispatch failed (HTTP 422): claude-implement.yml not found in ` +
           `${repo.owner}/${repo.repo} — re-run workflow sync for the KG source repo mapping. ` +
-          `Body: ${errorBody}`,
+          `Body: ${dispatchResult.error ?? ""}`,
         );
       }
       throw new Error(
-        `[kg-refresh] GHA dispatch failed (HTTP ${dispatchRes.status}): ${errorBody}`,
+        `[kg-refresh] GHA dispatch failed (HTTP ${dispatchResult.status}): ${dispatchResult.error ?? ""}`,
       );
     }
 

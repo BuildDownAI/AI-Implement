@@ -747,7 +747,7 @@ describe("handleMcpRequest", () => {
           { repo: "org/code-repo", grant: "contents:read", ok: false, status: 404 },
           {
             repo: "org/kg-repo",
-            grant: "workflow:runner_phase",
+            grant: "workflow:envelope",
             ok: false,
             status: 200,
             hint: "re-run workflow sync for the KG repo mapping (POST /api/mappings/<team>/sync-workflows)",

@@ -47,14 +47,24 @@
 #   runner image is only usable in this GitHub Actions execution mode.
 
 name: Claude AI Implementation
+# Display-only: the ticket key also rides inside run_config, which run-name expressions cannot decode.
+run-name: ${{ inputs.issue_identifier && format('Claude AI Implementation — {0}', inputs.issue_identifier) || 'Claude AI Implementation' }}
 
 on:
   workflow_dispatch:
+    # A top-level input is only for a value GitHub must evaluate before any step
+    # runs (routing, image selection, timeout) or a secret this workflow masks.
+    # Everything else rides inside run_config — see docs/workflow-envelope.md.
     inputs:
       run_config:
         description: "base64 JSON RunConfig envelope — see docs/workflow-envelope.md"
         required: true
         type: string
+      issue_identifier:
+        description: "Ticket key for the run title; display only — run_config is authoritative"
+        required: false
+        type: string
+        default: ""
       runner_image:
         description: "Override the runner image for this run (must match ghcr.io/builddownai/*, the repo owner's ghcr.io/<owner>/*, or AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES)"
         required: false
@@ -90,16 +100,6 @@ on:
         required: false
         type: string
         default: ""
-      runner_callback_url:
-        description: "Base URL the runner posts results to; empty = not passed (Fly sets it in the machine env)"
-        required: false
-        type: string
-        default: ""
-      runner_phase:
-        description: "Pipeline phase; default 'implementation'. Set to 'kg-refresh' for KG ingest dispatches."
-        required: false
-        type: string
-        default: "implementation"
 
 permissions:
   contents: write
@@ -216,8 +216,6 @@ jobs:
           AWS_REGION: ${{ inputs.aws_region }}
           JOB_TIMEOUT_MINUTES: ${{ inputs.job_timeout_minutes }}
           RUNNER_IMAGE: ${{ inputs.runner_image }}
-          RUNNER_CALLBACK_URL: ${{ inputs.runner_callback_url }}
-          RUNNER_PHASE: ${{ inputs.runner_phase }}
           HAS_RUN_TOKEN: "${{ inputs.run_token != '' }}"
           HAS_RUN_PROGRESS_TOKEN: "${{ inputs.run_progress_token != '' }}"
           HAS_PUBLICATION_TOKEN: "${{ inputs.run_publication_token != '' }}"
@@ -226,8 +224,6 @@ jobs:
           echo "[dispatch-inputs] aws_region: $AWS_REGION"
           echo "[dispatch-inputs] job_timeout_minutes: $JOB_TIMEOUT_MINUTES"
           echo "[dispatch-inputs] runner_image: $RUNNER_IMAGE"
-          echo "[dispatch-inputs] runner_callback_url: $RUNNER_CALLBACK_URL"
-          echo "[dispatch-inputs] runner_phase: $RUNNER_PHASE"
           echo "[dispatch-inputs] run_token: $( [ "$HAS_RUN_TOKEN" = "true" ] && echo "<redacted>" || echo "(empty)" )"
           echo "[dispatch-inputs] run_progress_token: $( [ "$HAS_RUN_PROGRESS_TOKEN" = "true" ] && echo "<redacted>" || echo "(empty)" )"
           echo "[dispatch-inputs] run_publication_token: $( [ "$HAS_PUBLICATION_TOKEN" = "true" ] && echo "<redacted>" || echo "(empty)" )"
@@ -361,8 +357,6 @@ jobs:
           RUN_TOKEN: ${{ inputs.run_token }}
           RUN_PROGRESS_TOKEN: ${{ inputs.run_progress_token }}
           RUN_PUBLICATION_TOKEN: ${{ inputs.run_publication_token }}
-          RUNNER_CALLBACK_URL: ${{ inputs.runner_callback_url }}
-          RUNNER_PHASE: ${{ inputs.runner_phase }}
           AI_IMPLEMENT_NPM_REGISTRY: ${{ vars.AI_IMPLEMENT_NPM_REGISTRY }}
           AI_IMPLEMENT_NPM_SCOPE: ${{ vars.AI_IMPLEMENT_NPM_SCOPE }}
         run: /opt/ai-implement/entrypoint.sh

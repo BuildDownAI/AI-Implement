@@ -30,31 +30,32 @@ describe("claude-implement.yml template — runner_phase and runner_callback_url
     expect(getPipelineStep()).toBeDefined();
   });
 
-  it("declares runner_phase as an optional workflow_dispatch input with default 'implementation'", () => {
+  it("does not declare runner_phase as a workflow_dispatch input", () => {
     const doc = getParsedTemplate();
     const inputs = doc.on.workflow_dispatch.inputs;
-    expect(inputs).toHaveProperty("runner_phase");
-    expect(inputs.runner_phase.required).toBe(false);
-    expect(inputs.runner_phase.default).toBe("implementation");
+    expect(inputs).not.toHaveProperty("runner_phase");
   });
 
-  it("declares runner_callback_url as an optional workflow_dispatch input", () => {
+  it("does not declare runner_callback_url as a workflow_dispatch input", () => {
     const doc = getParsedTemplate();
     const inputs = doc.on.workflow_dispatch.inputs;
-    expect(inputs).toHaveProperty("runner_callback_url");
-    expect(inputs.runner_callback_url.required).toBe(false);
+    expect(inputs).not.toHaveProperty("runner_callback_url");
   });
 
-  it("exports RUNNER_PHASE referencing inputs.runner_phase in the Run pipeline step env", () => {
+  it("does not export RUNNER_PHASE in the Run pipeline step env", () => {
     const step = getPipelineStep();
-    expect(step.env).toHaveProperty("RUNNER_PHASE");
-    expect(step.env.RUNNER_PHASE).toContain("runner_phase");
+    expect(step.env).not.toHaveProperty("RUNNER_PHASE");
   });
 
-  it("exports RUNNER_CALLBACK_URL referencing inputs.runner_callback_url in the Run pipeline step env", () => {
+  it("does not export RUNNER_CALLBACK_URL in the Run pipeline step env", () => {
     const step = getPipelineStep();
-    expect(step.env).toHaveProperty("RUNNER_CALLBACK_URL");
-    expect(step.env.RUNNER_CALLBACK_URL).toContain("runner_callback_url");
+    expect(step.env).not.toHaveProperty("RUNNER_CALLBACK_URL");
+  });
+
+  it("no template line references inputs.runner_phase or inputs.runner_callback_url", () => {
+    const raw = readFileSync(TEMPLATE, "utf-8");
+    expect(raw).not.toContain("inputs.runner_phase");
+    expect(raw).not.toContain("inputs.runner_callback_url");
   });
 
   it("declares run_progress_token as a workflow_dispatch input (regression guard)", () => {
