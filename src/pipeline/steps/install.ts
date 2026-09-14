@@ -5,6 +5,8 @@ import path from "node:path";
 import { parse as parseYaml } from "yaml";
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
 import { repoProcessEnv } from "../process-env.js";
+import type { ReviewerDefinition } from "../reviewers/registry.js";
+import { REVIEWER_VERDICT_SCHEMA } from "../reviewers/schema.js";
 
 interface RepoModels {
   implement?: string;
@@ -16,6 +18,7 @@ interface AiImplementConfig {
   models?: RepoModels;
   reviewProviders?: string[];
   reviewCheckNames?: string[];
+  reviewers?: ReviewerDefinition[];
 }
 
 interface InstallInputs extends Record<string, unknown> {
@@ -29,6 +32,7 @@ interface InstallOutputs extends Record<string, unknown> {
   repoModels: RepoModels;
   reviewProviders?: string[];
   reviewCheckNames?: string[];
+  reviewers?: ReviewerDefinition[];
 }
 
 const KNOWN_REVIEW_PROVIDERS = new Set(["github-claude-code-review"]);
@@ -63,6 +67,50 @@ function parseReviewProvidersConfig(value: unknown): string[] | undefined {
   return providers;
 }
 
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+export function parseReviewersConfig(value: unknown): ReviewerDefinition[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) {
+    console.warn("[install] Ignoring invalid reviewers config; expected an array");
+    return undefined;
+  }
+
+  const reviewers: ReviewerDefinition[] = [];
+  const seen = new Set<string>();
+  for (const [index, entry] of value.entries()) {
+    if (!isRecord(entry)) {
+      console.warn(`[install] Ignoring invalid reviewers[${index}] config; expected an object`);
+      continue;
+    }
+
+    const id = typeof entry.id === "string" ? entry.id.trim() : "";
+    const prompt = typeof entry.prompt === "string" ? entry.prompt : "";
+    if (!id || !prompt.trim()) {
+      console.warn(`[install] Ignoring invalid reviewers[${index}] config; id and prompt are required`);
+      continue;
+    }
+    if (seen.has(id)) {
+      console.warn(`[install] Ignoring invalid reviewers[${index}] config; duplicate id "${id}"`);
+      continue;
+    }
+    seen.add(id);
+
+    const model = typeof entry.model === "string" && entry.model.trim() ? entry.model.trim() : undefined;
+    reviewers.push({
+      id,
+      buildPrompt: () => prompt,
+      outputSchema: REVIEWER_VERDICT_SCHEMA,
+      ...(model ? { model } : {}),
+    });
+  }
+
+  return reviewers.length > 0 ? reviewers : undefined;
+}
+
 function readAiImplementConfig(workspaceDir: string): AiImplementConfig {
   const configPath = path.join(workspaceDir, ".ai-implement", "config.yml");
   if (!fs.existsSync(configPath)) return {};
@@ -74,6 +122,7 @@ function readAiImplementConfig(workspaceDir: string): AiImplementConfig {
     const models = parseModelsConfig(doc.models);
     const reviewProviders = parseReviewProvidersConfig(doc.reviewProviders);
     const reviewCheckNames = parseReviewCheckNamesConfig(doc.reviewCheckNames);
+    const reviewers = parseReviewersConfig(doc.reviewers);
     const config: AiImplementConfig = {};
     if (typeof doc.packageManager === "string" && doc.packageManager.trim()) {
       config.packageManager = doc.packageManager.trim();
@@ -81,6 +130,7 @@ function readAiImplementConfig(workspaceDir: string): AiImplementConfig {
     if (models.implement || models.review) config.models = models;
     if (reviewProviders !== undefined) config.reviewProviders = reviewProviders;
     if (reviewCheckNames !== undefined) config.reviewCheckNames = reviewCheckNames;
+    if (reviewers !== undefined) config.reviewers = reviewers;
     return config;
   } catch {
     return {};
@@ -178,6 +228,7 @@ export const installStep: StepModule<InstallInputs, InstallOutputs> = {
         repoModels: config.models ?? {},
         reviewProviders: config.reviewProviders,
         reviewCheckNames: config.reviewCheckNames,
+        reviewers: config.reviewers,
       };
     }
 
@@ -189,6 +240,7 @@ export const installStep: StepModule<InstallInputs, InstallOutputs> = {
         repoModels: config.models ?? {},
         reviewProviders: config.reviewProviders,
         reviewCheckNames: config.reviewCheckNames,
+        reviewers: config.reviewers,
       };
     }
 
@@ -226,6 +278,7 @@ export const installStep: StepModule<InstallInputs, InstallOutputs> = {
       repoModels: config.models ?? {},
       reviewProviders: config.reviewProviders,
       reviewCheckNames: config.reviewCheckNames,
+      reviewers: config.reviewers,
     };
   },
 };
