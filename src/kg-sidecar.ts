@@ -1,5 +1,6 @@
 import http from "node:http";
 import { existsSync, accessSync, constants } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
@@ -17,6 +18,27 @@ export const COMPLETION_MARKER = ".kg-complete";
 const RUNTIME_DATA_DIR = "/data/kg/current";
 const SIDECAR_PORT = 8765;
 const SIDECAR_URL = `http://127.0.0.1:${SIDECAR_PORT}/mcp`;
+
+/**
+ * Reads the IRI namespace of whatever graph is actually being served: the runtime
+ * overlay when one has been staged, else the baked image — the same selection
+ * kg-refresh.ts's status() uses to read servedStamp. Used to build the spine IRI
+ * for the sidecar liveness probe's kg_neighbors call (AII-648). Best-effort: a
+ * missing or malformed sources.yml resolves to null rather than throwing.
+ */
+export async function getServedNamespace(
+  kgDir: string = KG_DIR,
+  runtimeDataDir: string = RUNTIME_DATA_DIR,
+): Promise<string | null> {
+  const servedDir = existsSync(join(runtimeDataDir, "sources.yml")) ? runtimeDataDir : kgDir;
+  try {
+    const raw = await readFile(join(servedDir, "sources.yml"), "utf8");
+    const match = raw.match(/^namespace:\s*(\S+)\s*$/m);
+    return match ? match[1] : null;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Returns true when the baked KG embeddings are missing or flagged as failed.

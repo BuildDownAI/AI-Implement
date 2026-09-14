@@ -120,11 +120,12 @@ describe("recordShutdown", () => {
 });
 
 describe("decideDeployOutcome", () => {
-  const base = {
+  const base: DeployNotifyModule.DeployOutcomeInput = {
     holdWasSet: true,
     prevImageRef: IMAGE_A,
     currentImageRef: IMAGE_B,
     kgSidecarUrl: SIDECAR,
+    sidecarProbeError: null,
     commit: "abc1234",
     now: 1_700_000_000_000,
   };
@@ -141,7 +142,7 @@ describe("decideDeployOutcome", () => {
     expect(deployNotify.decideDeployOutcome({ ...base, currentImageRef: IMAGE_A })).toBeNull();
   });
 
-  it("is deployed-ok when the sidecar URL is present", () => {
+  it("is deployed-ok when the sidecar URL is present and the probe succeeded", () => {
     expect(deployNotify.decideDeployOutcome(base)).toEqual({
       kind: "deployed-ok",
       commit: "abc1234",
@@ -155,6 +156,28 @@ describe("decideDeployOutcome", () => {
     const outcome = deployNotify.decideDeployOutcome({ ...base, kgSidecarUrl: null });
     expect(outcome).toMatchObject({ kind: "deployed-not-serving", commit: "abc1234" });
     expect(outcome?.detail).toContain("sidecar");
+  });
+
+  // AII-648: the sidecar can come up (KG_SIDECAR_URL set) and still not serve — the
+  // liveness probe is what tells the difference the URL alone cannot.
+  it("is deployed-not-serving when the sidecar URL is present but the liveness probe failed", () => {
+    const outcome = deployNotify.decideDeployOutcome({
+      ...base,
+      sidecarProbeError: "tools/list is missing: kg_neighbors",
+    });
+    expect(outcome).toEqual({
+      kind: "deployed-not-serving",
+      commit: "abc1234",
+      timestamp: 1_700_000_000_000,
+      detail: "KG sidecar liveness probe failed: tools/list is missing: kg_neighbors",
+    });
+  });
+
+  it("does not confuse a probe failure's detail with the sidecar-absent detail", () => {
+    const probeFailed = deployNotify.decideDeployOutcome({ ...base, sidecarProbeError: "connection refused" });
+    const absent = deployNotify.decideDeployOutcome({ ...base, kgSidecarUrl: null });
+    expect(probeFailed?.detail).not.toEqual(absent?.detail);
+    expect(absent?.detail).toBe("KG sidecar did not start");
   });
 
   it("carries a null commit through rather than inventing one", () => {
@@ -298,6 +321,29 @@ describe("postBootNotice", () => {
     await deployNotify.postBootNotice({ ...config, kgSidecarUrl: null }, { holdWasSet: true });
 
     expect(deployNotify.getDeployOutcome()?.kind).toBe("deployed-not-serving");
+  });
+
+  // AII-648: the sidecar liveness probe result reaches decideDeployOutcome through opts,
+  // not through config — postBootNotice must thread it through rather than defaulting
+  // to "ok" whenever the caller doesn't pass it.
+  it("records deployed-not-serving when the sidecar URL is set but the probe failed", async () => {
+    writeKey(LAST_IMAGE_REF_KEY, IMAGE_A);
+    onFly(IMAGE_B);
+
+    await deployNotify.postBootNotice(config, { holdWasSet: true, sidecarProbeError: "tools/list rejected: 400" });
+
+    const outcome = deployNotify.getDeployOutcome();
+    expect(outcome?.kind).toBe("deployed-not-serving");
+    expect(outcome?.detail).toBe("KG sidecar liveness probe failed: tools/list rejected: 400");
+  });
+
+  it("records deployed-ok when the sidecar URL is set and no probe error is passed", async () => {
+    writeKey(LAST_IMAGE_REF_KEY, IMAGE_A);
+    onFly(IMAGE_B);
+
+    await deployNotify.postBootNotice(config, { holdWasSet: true });
+
+    expect(deployNotify.getDeployOutcome()?.kind).toBe("deployed-ok");
   });
 
   it("records nothing when no hold was set", async () => {

@@ -65,7 +65,8 @@ import type { RunnerProgressBody, RunnerResultBody } from "./runner-callback.js"
 import { mintRunToken, PLANNING_TTL_SECONDS, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
 import { handleGapFillTrigger } from "./gap-fill-trigger.js";
 import { handleMcpRequest } from "./mcp.js";
-import { resolveMemoryProvider, providerUnconfiguredReason } from "./kg-provider.js";
+import { resolveMemoryProvider, providerUnconfiguredReason, SidecarMemoryProvider, KG_TOOL_CAPABILITY } from "./kg-provider.js";
+import type { MemoryProvider } from "./kg-provider.js";
 import { withRequestErrorBoundary } from "./http-server.js";
 import {
   initMcpOAuthTables,
@@ -3351,7 +3352,13 @@ async function dispatchKgRefreshRun(
   }
 }
 
-function startServer(config: AppConfig, registry: ProviderRegistry, sidecar: KgSidecar): http.Server {
+function startServer(
+  config: AppConfig,
+  registry: ProviderRegistry,
+  sidecar: KgSidecar,
+  memoryProvider: MemoryProvider | null,
+  memoryProviderDiagnostic: string | null,
+): http.Server {
   const startDeploy = makeStartDeploy({ ...config, onBuildFailure: onDeployBuildFailure });
   const kgRefresh: KgRefreshHandle = makeKgRefresh({
     sidecar,
@@ -3408,8 +3415,6 @@ function startServer(config: AppConfig, registry: ProviderRegistry, sidecar: KgS
   // deployHeld() check answers 409 before running is ever set) — wake any webhook head
   // queued behind that refusal explicitly (AII-636).
   onDeployHoldCleared(() => activeKgRefresh?.fireRefreshSettled());
-  const memoryProvider = resolveMemoryProvider(config.kgSidecarUrl, config.memoryProviderId);
-  const memoryProviderDiagnostic = providerUnconfiguredReason(config.kgSidecarUrl, config.memoryProviderId);
 
   const handleRequest: http.RequestListener = (req, res) => {
     const url = req.url || "/";
@@ -4046,6 +4051,23 @@ async function main(): Promise<void> {
   const config = loadConfig();
   if (!config.kgSourceRepo) console.log("[kg] KG_SOURCE_REPO not set — knowledge graph disabled");
 
+  // Resolved once here (rather than inside startServer) so its boot-time liveness probe can
+  // run, and complete, before postBootNotice below decides the deploy outcome (AII-648). The
+  // same instance is then passed into startServer so /mcp reuses it rather than negotiating a
+  // second, independent MCP session.
+  const memoryProvider = resolveMemoryProvider(config.kgSidecarUrl, config.memoryProviderId);
+  const memoryProviderDiagnostic = providerUnconfiguredReason(config.kgSidecarUrl, config.memoryProviderId);
+  let sidecarProbeError: string | null = null;
+  if (memoryProvider instanceof SidecarMemoryProvider) {
+    const health = await memoryProvider.probe();
+    if (health.lastError) {
+      sidecarProbeError = health.lastError;
+      console.error(`[kg] sidecar probe FAILED: ${health.lastError}`);
+    } else {
+      console.error(`[kg] sidecar probe: ok (${Object.keys(KG_TOOL_CAPABILITY).length} tools)`);
+    }
+  }
+
   // Phase 2: per-mapping provider resolution. The registry caches one
   // TicketingProvider per provider id (linear, jira) and resolves on demand
   // for each mapping. Snapshot polling iterates unique providers; verb calls
@@ -4090,14 +4112,15 @@ async function main(): Promise<void> {
     }
   }
 
-  const server = startServer(config, registry, sidecar);
+  const server = startServer(config, registry, sidecar, memoryProvider, memoryProviderDiagnostic);
 
   // Fire-and-forget: a hanging webhook must not delay reconciliation or the first poll.
   // Every write postBootNotice makes — LAST_IMAGE_REF_KEY, LAST_SHUTDOWN_AT_KEY and
   // DEPLOY_OUTCOME_KEY — happens synchronously before its first await, so nothing is lost
   // if the webhook never answers. Keep it that way: a write moved below an await here stops
-  // persisting silently and misclassifies every later boot.
-  void postBootNotice(config, { holdWasSet });
+  // persisting silently and misclassifies every later boot. The sidecar probe above has
+  // already resolved by this point, so the recorded outcome reflects it rather than racing it.
+  void postBootNotice(config, { holdWasSet, sidecarProbeError });
 
   // Reconcile machines from any previous run before starting the poll loop
   await startupReconciliation(config, registry);

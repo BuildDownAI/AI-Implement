@@ -33,6 +33,12 @@ export interface DeployOutcomeInput {
   currentImageRef: string;
   /** Absent means the sidecar never came up — see decideDeployOutcome. */
   kgSidecarUrl: string | null;
+  /**
+   * The sidecar liveness probe's `lastError` (AII-648) when `kgSidecarUrl` is set — null
+   * means the probe succeeded. Required rather than optional so a caller cannot silently
+   * report deployed-ok by omitting it.
+   */
+  sidecarProbeError: string | null;
   commit: string | null;
   now: number;
 }
@@ -80,20 +86,28 @@ export function decideBootNotification(input: BootStateInput): BootDecision | nu
  * Whether this boot is the far side of a self-deploy, and whether that release serves.
  *
  * docker-entrypoint.sh exports KG_SIDECAR_URL only after the sidecar answers its readiness
- * check, so an absent value here is the sidecar-less signal. Probing /mcp cannot substitute:
- * its 401 gate sits above the sidecar check, so an unauthenticated caller sees 401 either way.
+ * check, so an absent value here is the sidecar-less signal. An unauthenticated probe of /mcp
+ * cannot substitute for either check: its 401 gate sits above the sidecar check, so an
+ * unauthenticated caller sees 401 either way. What settles it is the in-process liveness probe
+ * (AII-648, `SidecarMemoryProvider.probe()`) run against the sidecar right after boot — its
+ * result arrives here as `sidecarProbeError`, and the deploy record is written after that
+ * probe resolves, not before.
  */
 export function decideDeployOutcome(input: DeployOutcomeInput): DeployOutcome | null {
-  const { holdWasSet, prevImageRef, currentImageRef, kgSidecarUrl, commit, now } = input;
+  const { holdWasSet, prevImageRef, currentImageRef, kgSidecarUrl, sidecarProbeError, commit, now } = input;
 
   // No hold means no deploy was in flight. A null or unchanged ref means this process
   // was not replaced by one — a fresh volume, or a restart on the same version.
   if (!holdWasSet) return null;
   if (prevImageRef === null || prevImageRef === currentImageRef) return null;
 
-  return kgSidecarUrl
-    ? { kind: "deployed-ok", commit, timestamp: now }
-    : { kind: "deployed-not-serving", commit, timestamp: now, detail: "KG sidecar did not start" };
+  if (!kgSidecarUrl) {
+    return { kind: "deployed-not-serving", commit, timestamp: now, detail: "KG sidecar did not start" };
+  }
+  if (sidecarProbeError) {
+    return { kind: "deployed-not-serving", commit, timestamp: now, detail: `KG sidecar liveness probe failed: ${sidecarProbeError}` };
+  }
+  return { kind: "deployed-ok", commit, timestamp: now };
 }
 
 /** Present only inside a Fly Machine, so it doubles as the "this is a real deployment" gate. */
@@ -156,7 +170,7 @@ export async function postShutdownNotice(config: DeployNotifyConfig): Promise<vo
 
 export async function postBootNotice(
   config: DeployNotifyConfig,
-  opts: { holdWasSet?: boolean } = {},
+  opts: { holdWasSet?: boolean; sidecarProbeError?: string | null } = {},
 ): Promise<void> {
   const imageRef = flyImageRef();
   if (!imageRef) return;
@@ -175,6 +189,7 @@ export async function postBootNotice(
     prevImageRef,
     currentImageRef: imageRef,
     kgSidecarUrl: config.kgSidecarUrl,
+    sidecarProbeError: opts.sidecarProbeError ?? null,
     commit: process.env.AI_IMPLEMENT_SOURCE_COMMIT || null,
     now: Date.now(),
   });

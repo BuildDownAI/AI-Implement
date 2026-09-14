@@ -5,9 +5,11 @@ import {
   KG_TOOL_CAPABILITY,
   SidecarMemoryProvider,
   UnknownMemoryProviderError,
+  isKgUnavailable,
   parseSidecarRpcResponse,
   providerUnconfiguredReason,
   resolveMemoryProvider,
+  sidecarHealth,
 } from "../kg-provider.js";
 import type { MemoryProvider, MemoryProviderCapabilities } from "../kg-provider.js";
 
@@ -569,6 +571,324 @@ describe("SidecarMemoryProvider session handling", () => {
 
     expect(result).toEqual([]);
     expect(mockHttpRequest).toHaveBeenCalledTimes(4);
+  });
+});
+
+// ---- SidecarMemoryProvider.probe() and sidecarHealth (AII-648) ----
+
+describe("SidecarMemoryProvider probe", () => {
+  let mockHttpRequest: ReturnType<typeof vi.fn>;
+  let consoleErrorSpy: ReturnType<typeof vi.spyOn>;
+
+  const NAMESPACE = "http://example.org/kg/";
+  const SPINE_IRI = "http://example.org/kg/resource/graph/spine";
+  const ALL_SIX_TOOLS = Object.keys(KG_TOOL_CAPABILITY).map((name) => ({ name }));
+
+  function resetHealth(): void {
+    sidecarHealth.reachable = false;
+    sidecarHealth.toolsListed = false;
+    sidecarHealth.lastError = null;
+    sidecarHealth.checkedAt = null;
+  }
+
+  beforeEach(() => {
+    mockHttpRequest = vi.fn();
+    vi.spyOn(http, "request").mockImplementation(mockHttpRequest as never);
+    consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    resetHealth();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    resetHealth();
+  });
+
+  /** Queues the next `http.request` call to resolve with the given status/body, returning the fake request for write-capture. */
+  function queueResponse(status: number, body: string, headers: Record<string, string> = {}): PassThrough {
+    const proxyReq = new PassThrough();
+    const proxyRes = new PassThrough();
+    Object.assign(proxyRes, { statusCode: status, headers: { "content-type": "application/json", ...headers } });
+    mockHttpRequest.mockImplementationOnce((_opts: unknown, cb: (res: unknown) => void) => {
+      process.nextTick(() => {
+        cb(proxyRes);
+        proxyRes.push(body);
+        proxyRes.push(null);
+      });
+      return proxyReq;
+    });
+    return proxyReq;
+  }
+
+  function queueConnectionError(code: string): void {
+    const proxyReq = new PassThrough();
+    mockHttpRequest.mockImplementationOnce(() => {
+      process.nextTick(() => {
+        proxyReq.emit("error", Object.assign(new Error(code), { code }));
+      });
+      return proxyReq;
+    });
+  }
+
+  /** Simulates a sidecar that accepts the connection but never answers — cb() is never called. */
+  function queueHang(): PassThrough {
+    const proxyReq = new PassThrough();
+    mockHttpRequest.mockImplementationOnce(() => {
+      process.nextTick(() => proxyReq.emit("timeout"));
+      return proxyReq;
+    });
+    return proxyReq;
+  }
+
+  const toolsListResult = (tools: unknown[]) => JSON.stringify({ jsonrpc: "2.0", id: "probe-tools-list", result: { tools } });
+  const neighborsOk = () => JSON.stringify({ jsonrpc: "2.0", id: "probe-kg-neighbors", result: { edges: [] } });
+
+  const MISSING_SESSION_BODY = JSON.stringify({
+    jsonrpc: "2.0",
+    id: 1,
+    error: { code: -32600, message: "Bad Request: Missing session ID" },
+  });
+
+  function makeProvider(namespace: string | null = NAMESPACE): SidecarMemoryProvider {
+    return new SidecarMemoryProvider("http://127.0.0.1:8765/mcp", async () => namespace);
+  }
+
+  it("probe requests carry Accept: application/json, text/event-stream (the transport answers 406 without it)", async () => {
+
+    queueResponse(200, JSON.stringify({ jsonrpc: "2.0", id: "probe-tools-list", result: { tools: Object.keys(KG_TOOL_CAPABILITY).map((name) => ({ name })) } }));
+
+    queueResponse(200, JSON.stringify({ jsonrpc: "2.0", id: "probe-kg-neighbors", result: { content: [] } }));
+
+    const p = new SidecarMemoryProvider("http://127.0.0.1:8765/mcp", async () => "https://kg.example.test/");
+
+    const health = await p.probe();
+
+    expect(health.lastError).toBeNull();
+
+    for (const call of mockHttpRequest.mock.calls) {
+
+      const opts = call[0] as { headers: Record<string, unknown> };
+
+      expect(opts.headers.accept).toBe("application/json, text/event-stream");
+
+      expect(opts.headers["content-type"]).toBe("application/json");
+
+    }
+
+  });
+
+
+  it("succeeds when tools/list returns all six kg_* tools and kg_neighbors returns a result", async () => {
+    queueResponse(200, toolsListResult(ALL_SIX_TOOLS));
+    const callReq = queueResponse(200, neighborsOk());
+    const writeSpy = vi.spyOn(callReq, "write");
+
+    const health = await makeProvider().probe();
+
+    expect(health).toEqual({ reachable: true, toolsListed: true, lastError: null, checkedAt: expect.any(Number) });
+    expect(isKgUnavailable()).toBe(false);
+    expect(mockHttpRequest).toHaveBeenCalledTimes(2);
+    const sentBody = (writeSpy.mock.calls[0][0] as Buffer).toString();
+    expect(sentBody).toContain(SPINE_IRI);
+    expect(sentBody).toContain("kg_neighbors");
+  });
+
+  it("fails when tools/list is missing a required tool", async () => {
+    const missingProvenance = ALL_SIX_TOOLS.filter((t) => t.name !== "kg_provenance");
+    queueResponse(200, toolsListResult(missingProvenance));
+
+    const health = await makeProvider().probe();
+
+    expect(health.reachable).toBe(true);
+    expect(health.toolsListed).toBe(false);
+    expect(health.lastError).toContain("kg_provenance");
+    expect(isKgUnavailable()).toBe(true);
+    expect(mockHttpRequest).toHaveBeenCalledTimes(1); // never reaches the kg_neighbors call
+  });
+
+  it("fails when tools/list itself errors after the session handshake retry (KGB-28 shape)", async () => {
+    queueResponse(400, MISSING_SESSION_BODY); // tools/list, rejected — needs a session
+    queueResponse(200, JSON.stringify({ jsonrpc: "2.0", id: 1, result: {} }), { "mcp-session-id": "probe-session-2" });
+    queueResponse(200, JSON.stringify({ jsonrpc: "2.0", result: {} })); // notifications/initialized
+    queueResponse(400, MISSING_SESSION_BODY); // retried tools/list still rejected
+
+    const health = await makeProvider().probe();
+
+    expect(health.reachable).toBe(false);
+    expect(health.toolsListed).toBe(false);
+    expect(health.lastError).toBeTruthy();
+    // handshake attempted exactly once: initial tools/list, initialize, notify, retried tools/list
+    expect(mockHttpRequest).toHaveBeenCalledTimes(4);
+  });
+
+  it("reuses the session handshake path: a session-demanding sidecar still completes a successful probe", async () => {
+    queueResponse(400, MISSING_SESSION_BODY); // tools/list, rejected — needs a session
+    queueResponse(200, JSON.stringify({ jsonrpc: "2.0", id: 1, result: {} }), { "mcp-session-id": "probe-session-1" });
+    queueResponse(200, JSON.stringify({ jsonrpc: "2.0", result: {} })); // notifications/initialized
+    queueResponse(200, toolsListResult(ALL_SIX_TOOLS)); // tools/list retried with the session
+    queueResponse(200, neighborsOk());
+
+    const health = await makeProvider().probe();
+
+    expect(health).toEqual({ reachable: true, toolsListed: true, lastError: null, checkedAt: expect.any(Number) });
+    expect(mockHttpRequest).toHaveBeenCalledTimes(5);
+    expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining("KG sidecar demanded a session"));
+    const lastOpts = mockHttpRequest.mock.calls[4][0] as { headers: Record<string, unknown> };
+    expect(lastOpts.headers["mcp-session-id"]).toBe("probe-session-1");
+  });
+
+  it("fails when the kg_neighbors call returns a JSON-RPC error", async () => {
+    queueResponse(200, toolsListResult(ALL_SIX_TOOLS));
+    queueResponse(200, JSON.stringify({ jsonrpc: "2.0", id: "probe-kg-neighbors", error: { code: -32000, message: "boom" } }));
+
+    const health = await makeProvider().probe();
+
+    expect(health.reachable).toBe(true);
+    expect(health.toolsListed).toBe(true);
+    expect(health.lastError).toContain("boom");
+    expect(isKgUnavailable()).toBe(true);
+  });
+
+  it("fails on a connection-level failure reaching tools/list", async () => {
+    queueConnectionError("ECONNREFUSED");
+
+    const health = await makeProvider().probe();
+
+    expect(health.reachable).toBe(false);
+    expect(health.lastError).toContain("ECONNREFUSED");
+    expect(isKgUnavailable()).toBe(true);
+  });
+
+  it("resolves within a bounded time — never hangs — when the sidecar accepts the connection but never answers", async () => {
+    const hungReq = queueHang();
+    const destroySpy = vi.spyOn(hungReq, "destroy");
+
+    const health = await makeProvider().probe();
+
+    expect(health.reachable).toBe(false);
+    expect(health.lastError).toContain("timed out");
+    expect(isKgUnavailable()).toBe(true);
+    expect(destroySpy).toHaveBeenCalled();
+    expect(mockHttpRequest).toHaveBeenCalledTimes(1); // never reaches kg_neighbors
+  });
+
+  it("bounds every sendToSidecar request with a request timeout option", async () => {
+    queueResponse(200, toolsListResult(ALL_SIX_TOOLS));
+    queueResponse(200, neighborsOk());
+
+    await makeProvider().probe();
+
+    for (const call of mockHttpRequest.mock.calls) {
+      const opts = call[0] as { timeout?: number };
+      expect(typeof opts.timeout).toBe("number");
+      expect(opts.timeout).toBeGreaterThan(0);
+      expect(opts.timeout).toBeLessThanOrEqual(30_000);
+    }
+  });
+
+  it("fails when the served namespace cannot be determined, without calling kg_neighbors", async () => {
+    queueResponse(200, toolsListResult(ALL_SIX_TOOLS));
+
+    const health = await makeProvider(null).probe();
+
+    expect(health.reachable).toBe(true);
+    expect(health.toolsListed).toBe(true);
+    expect(health.lastError).toContain("namespace");
+    expect(mockHttpRequest).toHaveBeenCalledTimes(1); // never attempts kg_neighbors
+  });
+
+  it("probe() is never throttled, even immediately after a just-completed check", async () => {
+    sidecarHealth.checkedAt = Date.now();
+    sidecarHealth.reachable = true;
+    sidecarHealth.toolsListed = true;
+
+    queueResponse(200, toolsListResult(ALL_SIX_TOOLS));
+    queueResponse(200, neighborsOk());
+    await makeProvider().probe();
+
+    expect(mockHttpRequest).toHaveBeenCalledTimes(2);
+  });
+
+  describe("isKgUnavailable", () => {
+    it("is false when no probe has ever run", () => {
+      expect(isKgUnavailable()).toBe(false);
+    });
+
+    it("is true immediately after a failed probe", async () => {
+      queueConnectionError("ECONNREFUSED");
+      await makeProvider().probe();
+      expect(isKgUnavailable()).toBe(true);
+    });
+
+    it("is false after a subsequent successful probe", async () => {
+      queueConnectionError("ECONNREFUSED");
+      await makeProvider().probe();
+      expect(isKgUnavailable()).toBe(true);
+
+      queueResponse(200, toolsListResult(ALL_SIX_TOOLS));
+      queueResponse(200, neighborsOk());
+      await makeProvider().probe();
+      expect(isKgUnavailable()).toBe(false);
+    });
+  });
+
+  describe("re-probe throttle on listTools/proxyCall failure", () => {
+    it("a failed listTools call re-probes exactly once, and updates sidecarHealth", async () => {
+      queueConnectionError("ECONNREFUSED"); // the listTools attempt itself
+      queueConnectionError("ECONNREFUSED"); // the triggered re-probe's tools/list attempt
+
+      const p = makeProvider();
+      const result = await p.listTools(Buffer.from("{}"), {});
+
+      expect(result).toEqual([]);
+      expect(mockHttpRequest).toHaveBeenCalledTimes(2);
+      expect(sidecarHealth.reachable).toBe(false);
+      expect(sidecarHealth.checkedAt).not.toBeNull();
+    });
+
+    it("a second failure within 60s of the last check does not trigger another real probe", async () => {
+      queueConnectionError("ECONNREFUSED"); // first listTools attempt
+      queueConnectionError("ECONNREFUSED"); // its re-probe
+
+      const p = makeProvider();
+      await p.listTools(Buffer.from("{}"), {});
+      expect(mockHttpRequest).toHaveBeenCalledTimes(2);
+      const checkedAtAfterFirst = sidecarHealth.checkedAt;
+
+      queueConnectionError("ECONNREFUSED"); // second listTools attempt only — no further re-probe call queued
+      const result = await p.listTools(Buffer.from("{}"), {});
+
+      expect(result).toEqual([]);
+      expect(mockHttpRequest).toHaveBeenCalledTimes(3);
+      expect(sidecarHealth.checkedAt).toBe(checkedAtAfterFirst);
+    });
+
+    it("a failed proxyCall re-probes exactly once, respecting the same throttle", async () => {
+      queueConnectionError("ECONNREFUSED"); // the proxyCall attempt itself
+      queueConnectionError("ECONNREFUSED"); // the triggered re-probe
+
+      const p = makeProvider();
+      const res = {
+        headersSent: false,
+        writeHead() {
+          res.headersSent = true;
+        },
+        end() {
+          /* no-op */
+        },
+        destroy() {
+          /* no-op */
+        },
+      } as unknown as http.ServerResponse & { headersSent: boolean };
+      const req = { headers: {}, method: "POST" } as unknown as http.IncomingMessage;
+
+      p.proxyCall(req, res, Buffer.from("{}"));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(mockHttpRequest).toHaveBeenCalledTimes(2);
+      expect(sidecarHealth.checkedAt).not.toBeNull();
+    });
   });
 });
 
