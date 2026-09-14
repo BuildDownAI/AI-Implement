@@ -92,9 +92,12 @@ describe("buildEnvelopeDispatchInputs — envelope shape (case a)", () => {
     expect(inputs.run_progress_token).toBe("prog-xyz");
     expect("run_publication_token" in inputs).toBe(false);
 
+    // issue_identifier is a display-only duplicate of run_config.issue.identifier,
+    // present on every envelope dispatch for run-name: to read (AII-656).
+    expect(inputs.issue_identifier).toBe(baseIssue.identifier);
+
     // Legacy per-field keys must be absent
     expect("issue_id" in inputs).toBe(false);
-    expect("issue_identifier" in inputs).toBe(false);
     expect("issue_title" in inputs).toBe(false);
     expect("issue_description" in inputs).toBe(false);
     expect("base_branch" in inputs).toBe(false);
@@ -109,6 +112,18 @@ describe("buildEnvelopeDispatchInputs — envelope shape (case a)", () => {
     // Provider not included for anthropic
     expect("provider" in inputs).toBe(false);
     expect("aws_region" in inputs).toBe(false);
+  });
+
+  it("carries issue_identifier for a gap-analysis dispatch", () => {
+    const inputs = buildEnvelopeDispatchInputs(makeMapping(), baseIssue, {
+      retryPolicy: null,
+      runnerPhase: "gap-analysis",
+      prNumber: "42",
+      runToken: "",
+      runProgressToken: "",
+    });
+
+    expect(inputs.issue_identifier).toBe(baseIssue.identifier);
   });
 
   it("includes a dedicated publication token only when explicitly provided", () => {
@@ -415,6 +430,17 @@ describe("buildEnvelopeDispatchInputs — planning phase (case c)", () => {
     });
 
     expect(inputs.run_token).toBe("plan-tok");
+  });
+
+  it("carries issue_identifier for a planning dispatch", () => {
+    const mapping = makeMapping();
+    const inputs = buildEnvelopeDispatchInputs(mapping, baseIssue, {
+      retryPolicy: null,
+      runnerPhase: "planning",
+      runToken: "plan-tok",
+    });
+
+    expect(inputs.issue_identifier).toBe(baseIssue.identifier);
   });
 });
 
@@ -775,8 +801,8 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
     return new Response(body, { status });
   }
 
-  it("exposes exactly runner_phase and runner_callback_url as the optional-input list", () => {
-    expect(ENVELOPE_OPTIONAL_INPUTS).toEqual(["runner_phase", "runner_callback_url"]);
+  it("exposes exactly runner_phase, runner_callback_url, and issue_identifier as the optional-input list", () => {
+    expect(ENVELOPE_OPTIONAL_INPUTS).toEqual(["runner_phase", "runner_callback_url", "issue_identifier"]);
   });
 
   it("strips a single optional input named in the 422 body and retries once", async () => {
@@ -799,6 +825,54 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
     expect("runner_phase" in secondBody.inputs).toBe(false);
     expect(secondBody.inputs.run_config).toBe("cfg");
     expect(result).toEqual({ success: true, status: 204 });
+  });
+
+  it("strips issue_identifier alone when the 422 names it on the envelope contract", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(textResponse(422, 'Unexpected inputs provided: ["issue_identifier"]'))
+      .mockResolvedValueOnce(textResponse(204, null));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await postWorkflowDispatch({
+      token: "tok",
+      owner: "acme",
+      repo: "impl-repo",
+      workflowFile: "claude-implement.yml",
+      ref: "main",
+      inputs: { run_config: "cfg", run_token: "rt", issue_identifier: "AII-656" },
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const secondBody = JSON.parse(String((fetchMock.mock.calls[1][1] as RequestInit).body));
+    expect("issue_identifier" in secondBody.inputs).toBe(false);
+    expect(secondBody.inputs.run_config).toBe("cfg");
+    expect(result).toEqual({ success: true, status: 204 });
+  });
+
+  it("does not retry on the legacy contract (no run_config) when the 422 names issue_identifier", async () => {
+    // issue_identifier is authoritative issue data on the legacy contract, not a
+    // compatibility duplicate, so stripping it there must not happen.
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(textResponse(422, 'Unexpected inputs provided: ["issue_identifier"]'));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await postWorkflowDispatch({
+      token: "tok",
+      owner: "acme",
+      repo: "legacy-repo",
+      workflowFile: "claude-implement.yml",
+      ref: "main",
+      inputs: {
+        issue_id: "1",
+        issue_identifier: "AII-1",
+        issue_title: "t",
+        issue_description: "d",
+        runner_phase: "implementation",
+      },
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(result.success).toBe(false);
   });
 
   it("strips both runner_phase and runner_callback_url when the 422 names both", async () => {
@@ -1094,7 +1168,10 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
       runnerCallbackUrl: "https://orch.example",
       runnerPhase: "kg-refresh",
       jobTimeoutMinutes: "240",
+      issueIdentifier: "AII-656",
     });
+
+    expect(inputs.issue_identifier).toBe("AII-656");
 
     const result = await postWorkflowDispatch({
       token: "gh-tok",
@@ -1111,6 +1188,7 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
     expect("runner_callback_url" in secondBody.inputs).toBe(false);
     expect(secondBody.inputs.run_config).toBe("b64cfg");
     expect(secondBody.inputs.job_timeout_minutes).toBe("240");
+    expect(secondBody.inputs.issue_identifier).toBe("AII-656");
     expect(result).toEqual({ success: true, status: 204 });
   });
 });
