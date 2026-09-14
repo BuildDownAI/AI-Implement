@@ -431,6 +431,38 @@ describe("postPushReviewStep", () => {
     expect(aggregate.outputs.telemetry).toBeUndefined();
   });
 
+  it("times selected reviewer child rows around the LLM invocation", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-14T20:00:00.000Z"));
+    const report = vi.fn(async () => undefined);
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => {
+      vi.setSystemTime(new Date("2026-09-14T20:00:05.000Z"));
+      return structuredReviewResult({ approved: true, findings: [] });
+    });
+
+    try {
+      await postPushReviewStep.run(
+        makeCtx(invoke),
+        {
+          prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [],
+          reviewers: [{ id: "code-review", gates: true }],
+          trustedReviewerDefinitions: reviewerMap([selectedReviewerDefinition("code-review")]),
+        },
+        { report },
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+
+    const reviewerRow = report.mock.calls.map((call) => call[0]).find((step) => step.id === "post-push-review.1.reviewer.0.trusted.code-review");
+    expect(reviewerRow.started_at).toBe("2026-09-14T20:00:00.000Z");
+    expect(reviewerRow.ended_at).toBe("2026-09-14T20:00:05.000Z");
+  });
+
   it("uses the actual default built-in reviewer selection and trusted resolver fallback", async () => {
     const ghSpawn = vi.fn((args: string[]) => {
       if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
@@ -3665,7 +3697,7 @@ describe("postPushReviewStep", () => {
   });
 
   it("does not auto-approve when the external review check never finishes (fail-closed)", async () => {
-    const reviewerOutput = { approved: true, blocking_issues: [], feedback: "Internal reviewer approves.", score: 9, progress_delta: 0 };
+    const reviewerOutput = { approved: true, findings: [] };
     const sleep = vi.fn(async () => undefined);
     const ghComments: string[] = [];
     const reviewCalls: string[][] = [];
@@ -3692,13 +3724,38 @@ describe("postPushReviewStep", () => {
 
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn, sleep, reviewWaitPollMs: 1000, reviewWaitTimeoutMs: 3000 },
+      {
+        prNumber: "42",
+        workspaceDir: "/tmp",
+        maxIterations: 2,
+        ghSpawn,
+        gitSpawn,
+        sleep,
+        reviewWaitPollMs: 1000,
+        reviewWaitTimeoutMs: 3000,
+        reviewers: [{ id: "gap-analysis", gates: true }, { id: "code-review", gates: true }],
+        trustedReviewerDefinitions: reviewerMap([selectedReviewerDefinition("gap-analysis"), selectedReviewerDefinition("code-review")]),
+      },
       { report: vi.fn(async () => undefined) },
     );
 
     expect(out.approved).toBe(false);
+    expect(invoke.mock.calls.map((call) => call[0].stage)).toEqual([
+      "post-push-review/gap-analysis-review-1",
+      "post-push-review/code-review-review-1",
+    ]);
     expect(reviewCalls.some((call) => call.some((arg) => arg.includes("approved this PR")))).toBe(false);
+    const submittedReviewBody = reviewCalls
+      .find((call) => call.includes("-X") && call.includes("POST"))
+      ?.find((arg) => arg.startsWith("body="));
+    expect(submittedReviewBody).toContain("<!-- ai-implement native-review -->");
+    expect(submittedReviewBody).toContain("AI-Implement internal review passed");
+    expect(submittedReviewBody).toContain("gap-analysis: approved");
+    expect(submittedReviewBody).toContain("code-review: approved");
     expect(ghComments.some((c) => c.includes("did not complete") && c.includes("Manual review required"))).toBe(true);
+    const statusComment = ghComments.find((c) => c.includes("did not complete") && c.includes("Manual review required"));
+    expect(statusComment).toContain("gap-analysis: approved");
+    expect(statusComment).toContain("code-review: approved");
   });
 
   it("recognizes 'review' and 'code-review-plugin' check names as the external review gate by default", async () => {

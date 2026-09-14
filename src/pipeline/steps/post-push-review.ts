@@ -480,6 +480,12 @@ function findingsUnavailableBlock(unavailable: boolean): string {
   return unavailable ? "\n\n⚠️ External review findings could not be parsed — verdict from reviewer summary only." : "";
 }
 
+function internalReviewSummaryBlock(feedback: string): string {
+  const summary = feedback.trim();
+  if (!summary) return "";
+  return `\n\nInternal review:\n${summary}`;
+}
+
 function findFailingCiChecks(
   ghSpawn: (args: string[]) => SpawnResult,
   headSha: string,
@@ -1291,7 +1297,13 @@ async function runSelectedInternalReviewers(params: {
       ? { iteration: params.iteration, prNumber: params.prNumber }
       : { iteration: params.iteration, prNumber: params.prNumber, reviewerId, reviewerProvenance: provenance ?? "trusted" };
     const maxTurns = definition.maxTurns ?? params.retryPolicy.reviewMaxTurns;
-    const reportOptionalFailure = async (feedback: string, telemetry?: RunTelemetry, extraOutputs: Record<string, unknown> = {}) => {
+    const reportOptionalFailure = async (
+      feedback: string,
+      telemetry?: RunTelemetry,
+      extraOutputs: Record<string, unknown> = {},
+      startedAt = new Date().toISOString(),
+      endedAt = new Date().toISOString(),
+    ) => {
       findings.push({
         source: "ai-implement-internal",
         reviewerId,
@@ -1304,8 +1316,8 @@ async function runSelectedInternalReviewers(params: {
         id: reportId,
         type: "custom",
         status: "failed",
-        started_at: new Date().toISOString(),
-        ended_at: new Date().toISOString(),
+        started_at: startedAt,
+        ended_at: endedAt,
         parent_step_id: "post-push-review",
         inputs: reportInputs,
         outputs: { ...failedReviewOutputs(feedback), ...extraOutputs, ...(telemetry ? { telemetry } : {}) },
@@ -1321,6 +1333,7 @@ async function runSelectedInternalReviewers(params: {
       previousFindings: params.previousFindings,
     });
 
+    let reviewStartedAt = new Date().toISOString();
     let reviewResult = await params.context.llmExecutor.invoke({
       prompt,
       model: definition.model ?? params.model,
@@ -1330,6 +1343,7 @@ async function runSelectedInternalReviewers(params: {
       stage,
       expectsStructuredOutput: true,
     });
+    let reviewEndedAt = new Date().toISOString();
     let reviewStageAttempt = 1;
     let reviewStageClassified: FailureRecord | undefined;
     while (reviewResult.telemetry?.outcome !== "max_turns" && reviewFailureMessage(reviewResult) !== null) {
@@ -1344,8 +1358,8 @@ async function runSelectedInternalReviewers(params: {
         id: `${reportId}.retry${reviewStageAttempt}`,
         type: "custom",
         status: "failed",
-        started_at: new Date().toISOString(),
-        ended_at: new Date().toISOString(),
+        started_at: reviewStartedAt,
+        ended_at: reviewEndedAt,
         parent_step_id: "post-push-review",
         inputs: reportInputs,
         outputs: { failure: reviewStageClassified, telemetry: reviewResult.telemetry },
@@ -1354,6 +1368,7 @@ async function runSelectedInternalReviewers(params: {
       costUsd = addExtraCost(costUsd, reviewResult.telemetry?.costUsd);
       await params.sleep(computeBackoffMs(reviewStageAttempt, params.retryPolicy));
       reviewStageAttempt++;
+      reviewStartedAt = new Date().toISOString();
       reviewResult = await params.context.llmExecutor.invoke({
         prompt,
         model: definition.model ?? params.model,
@@ -1363,6 +1378,7 @@ async function runSelectedInternalReviewers(params: {
         stage,
         expectsStructuredOutput: true,
       });
+      reviewEndedAt = new Date().toISOString();
       reviewStageClassified = undefined;
     }
     costUsd = addExtraCost(costUsd, reviewResult.telemetry?.costUsd);
@@ -1373,15 +1389,15 @@ async function runSelectedInternalReviewers(params: {
       const telemetryPart = reviewResult.telemetry ? summaryLine(reviewResult.telemetry) : "no telemetry reported";
       const feedback = compactErrorMessage(`Reviewer ${label} could not run because the model provider was unavailable after ${reviewStageAttempt} attempt(s) (${telemetryPart}).`);
       if (optional) {
-        await reportOptionalFailure(feedback, reviewResult.telemetry, { failure });
+        await reportOptionalFailure(feedback, reviewResult.telemetry, { failure }, reviewStartedAt, reviewEndedAt);
         continue;
       }
       await params.reporter.report({
         id: reportId,
         type: "custom",
         status: "failed",
-        started_at: new Date().toISOString(),
-        ended_at: new Date().toISOString(),
+        started_at: reviewStartedAt,
+        ended_at: reviewEndedAt,
         parent_step_id: "post-push-review",
         inputs: reportInputs,
         outputs: { approved: false, feedback, issues: [], blockingIssues: [], failure, telemetry: reviewResult.telemetry },
@@ -1400,15 +1416,15 @@ async function runSelectedInternalReviewers(params: {
       };
       const feedback = `${label} ran out of turns at the configured cap (${maxTurns}). ${summaryLine(reviewResult.telemetry)}`;
       if (optional) {
-        await reportOptionalFailure(feedback, reviewResult.telemetry, { failure });
+        await reportOptionalFailure(feedback, reviewResult.telemetry, { failure }, reviewStartedAt, reviewEndedAt);
         continue;
       }
       await params.reporter.report({
         id: reportId,
         type: "custom",
         status: "failed",
-        started_at: new Date().toISOString(),
-        ended_at: new Date().toISOString(),
+        started_at: reviewStartedAt,
+        ended_at: reviewEndedAt,
         parent_step_id: "post-push-review",
         inputs: reportInputs,
         outputs: { approved: false, feedback, issues: [], blockingIssues: [], failure, telemetry: reviewResult.telemetry },
@@ -1423,15 +1439,15 @@ async function runSelectedInternalReviewers(params: {
       const telemetryPart = reviewResult.telemetry ? summaryLine(reviewResult.telemetry) : "no telemetry reported";
       const feedback = compactErrorMessage(`Reviewer ${label} failed: ${reviewFailure} (${telemetryPart}; ${failure.category}/${failure.code})`);
       if (optional) {
-        await reportOptionalFailure(feedback, reviewResult.telemetry);
+        await reportOptionalFailure(feedback, reviewResult.telemetry, {}, reviewStartedAt, reviewEndedAt);
         continue;
       }
       await params.reporter.report({
         id: reportId,
         type: "custom",
         status: "failed",
-        started_at: new Date().toISOString(),
-        ended_at: new Date().toISOString(),
+        started_at: reviewStartedAt,
+        ended_at: reviewEndedAt,
         parent_step_id: "post-push-review",
         inputs: reportInputs,
         outputs: { ...failedReviewOutputs(feedback), telemetry: reviewResult.telemetry },
@@ -1445,10 +1461,10 @@ async function runSelectedInternalReviewers(params: {
         ? `Reviewer returned no structured_output: ${reviewResult.stdout || "(empty stdout)"}`
         : `Reviewer ${label} returned no structured_output: ${reviewResult.stdout || "(empty stdout)"}`);
       if (optional) {
-        await reportOptionalFailure(feedback, reviewResult.telemetry);
+        await reportOptionalFailure(feedback, reviewResult.telemetry, {}, reviewStartedAt, reviewEndedAt);
         continue;
       }
-      await params.reporter.report({ id: reportId, type: "custom", status: "failed", started_at: new Date().toISOString(), ended_at: new Date().toISOString(), parent_step_id: "post-push-review", inputs: reportInputs, outputs: { ...failedReviewOutputs(feedback), telemetry: reviewResult.telemetry }, logs_url: null });
+      await params.reporter.report({ id: reportId, type: "custom", status: "failed", started_at: reviewStartedAt, ended_at: reviewEndedAt, parent_step_id: "post-push-review", inputs: reportInputs, outputs: { ...failedReviewOutputs(feedback), telemetry: reviewResult.telemetry }, logs_url: null });
       return { stopped: true, terminationReason: "invalid_review", feedback, costUsd };
     }
 
@@ -1483,20 +1499,20 @@ async function runSelectedInternalReviewers(params: {
         ? `Reviewer returned invalid structured review output: ${reason}.`
         : `Reviewer ${label} returned invalid structured review output: ${reason}.`);
       if (optional) {
-        await reportOptionalFailure(feedback, reviewResult.telemetry);
+        await reportOptionalFailure(feedback, reviewResult.telemetry, {}, reviewStartedAt, reviewEndedAt);
         continue;
       }
-      await params.reporter.report({ id: reportId, type: "custom", status: "failed", started_at: new Date().toISOString(), ended_at: new Date().toISOString(), parent_step_id: "post-push-review", inputs: reportInputs, outputs: { ...failedReviewOutputs(feedback), telemetry: reviewResult.telemetry }, logs_url: null });
+      await params.reporter.report({ id: reportId, type: "custom", status: "failed", started_at: reviewStartedAt, ended_at: reviewEndedAt, parent_step_id: "post-push-review", inputs: reportInputs, outputs: { ...failedReviewOutputs(feedback), telemetry: reviewResult.telemetry }, logs_url: null });
       return { stopped: true, terminationReason: "invalid_review", feedback, costUsd };
     }
 
     if (!legacy && verdict.findings.length === 0 && verdict.approved === false) {
       const feedback = `Reviewer ${label} returned approved=false without findings[].`;
       if (optional) {
-        await reportOptionalFailure(feedback, reviewResult.telemetry);
+        await reportOptionalFailure(feedback, reviewResult.telemetry, {}, reviewStartedAt, reviewEndedAt);
         continue;
       }
-      await params.reporter.report({ id: reportId, type: "custom", status: "failed", started_at: new Date().toISOString(), ended_at: new Date().toISOString(), parent_step_id: "post-push-review", inputs: reportInputs, outputs: { ...failedReviewOutputs(feedback), telemetry: reviewResult.telemetry }, logs_url: null });
+      await params.reporter.report({ id: reportId, type: "custom", status: "failed", started_at: reviewStartedAt, ended_at: reviewEndedAt, parent_step_id: "post-push-review", inputs: reportInputs, outputs: { ...failedReviewOutputs(feedback), telemetry: reviewResult.telemetry }, logs_url: null });
       return { stopped: true, terminationReason: "invalid_review", feedback, costUsd };
     }
 
@@ -1511,8 +1527,8 @@ async function runSelectedInternalReviewers(params: {
         id: reportId,
         type: "custom",
         status: "passed",
-        started_at: new Date().toISOString(),
-        ended_at: new Date().toISOString(),
+        started_at: reviewStartedAt,
+        ended_at: reviewEndedAt,
         parent_step_id: "post-push-review",
         inputs: reportInputs,
         outputs: { approved: verdict.approved, findings: reviewerFindings, telemetry: reviewResult.telemetry },
@@ -1865,10 +1881,15 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
           logs_url: null,
         });
         const marker = `<!-- ai-implement post-push iter=${iteration} external-pending -->`;
+        submitPrReview(
+          ghSpawn,
+          prNumber,
+          `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement internal review passed, but the external review did not complete within the wait budget. Manual review required.${internalReviewSummaryBlock(verdict.feedback)}`,
+        );
         postPrComment(
           ghSpawn,
           prNumber,
-          `${marker}\n⚠️ Internal review passed, but the external review did not complete within the wait budget. Not auto-approving.\n\n**Merge readiness:** Manual review required; external review did not complete.`,
+          `${marker}\n⚠️ Internal review passed, but the external review did not complete within the wait budget. Not auto-approving.${internalReviewSummaryBlock(verdict.feedback)}\n\n**Merge readiness:** Manual review required; external review did not complete.`,
           marker,
         );
         break;
@@ -1891,10 +1912,15 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
           logs_url: null,
         });
         const marker = `<!-- ai-implement post-push iter=${iteration} invalid-external-review -->`;
+        submitPrReview(
+          ghSpawn,
+          prNumber,
+          `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement internal review passed, but the external review verdict was unavailable or incomplete. Manual review required.${internalReviewSummaryBlock(verdict.feedback)}`,
+        );
         postPrComment(
           ghSpawn,
           prNumber,
-          `${marker}\n⚠️ Internal review passed, but the external review verdict was unavailable or incomplete. Not auto-approving.${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${findingsUnavailableBlock(findingsUnavailable)}\n\n**Merge readiness:** Manual review required; external review verdict unavailable.`,
+          `${marker}\n⚠️ Internal review passed, but the external review verdict was unavailable or incomplete. Not auto-approving.${internalReviewSummaryBlock(verdict.feedback)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${findingsUnavailableBlock(findingsUnavailable)}\n\n**Merge readiness:** Manual review required; external review verdict unavailable.`,
           marker,
         );
         break;
