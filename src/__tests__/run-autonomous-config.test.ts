@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { encodeRunConfig } from "../run-config.js";
 import { resolveRunnerInputs } from "../run-autonomous.js";
 import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
+import { DEFAULT_REVIEWER_SELECTION } from "../config.js";
 
 const BASE_ENV = {
   GITHUB_OWNER: "o",
@@ -479,6 +480,64 @@ describe("resolveRunnerInputs", () => {
       const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
       expect(inputs.retryPolicy.requestRetries).toBe(DEFAULT_RETRY_POLICY.requestRetries);
       expect(inputs.retryPolicy.stageRetries).toBe(4);
+    });
+  });
+
+  describe("(j) reviewers", () => {
+    it("uses reviewers from the envelope when present", () => {
+      const reviewers = [{ id: "gap-analysis", gates: false }];
+      const env = {
+        AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig({
+          v: 1,
+          issue: { id: "e", identifier: "AII-9", title: "t", description: "d" },
+          reviewers,
+        }),
+        ...BASE_ENV,
+      };
+      const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
+      expect(inputs.reviewers).toEqual(reviewers);
+    });
+
+    it("falls back to DEFAULT_REVIEWER_SELECTION when the envelope omits reviewers", () => {
+      const env = {
+        AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig({
+          v: 1,
+          issue: { id: "e", identifier: "AII-9", title: "t", description: "d" },
+        }),
+        ...BASE_ENV,
+      };
+      const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
+      expect(inputs.reviewers).toEqual(DEFAULT_REVIEWER_SELECTION);
+    });
+
+    it("falls back to DEFAULT_REVIEWER_SELECTION when decode drops malformed reviewers", () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const raw = {
+          v: 1,
+          issue: { id: "e", identifier: "AII-9", title: "t", description: "d" },
+          reviewers: [{ id: "gap-analysis", gates: "true" }],
+        };
+        const env = {
+          AI_IMPLEMENT_RUN_CONFIG: Buffer.from(JSON.stringify(raw), "utf-8").toString("base64"),
+          ...BASE_ENV,
+        };
+        const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
+        expect(inputs.reviewers).toEqual(DEFAULT_REVIEWER_SELECTION);
+        expect(warnSpy).toHaveBeenCalledTimes(1);
+        expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("reviewers"));
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    it("falls back to DEFAULT_REVIEWER_SELECTION in legacy-env mode", () => {
+      const env = {
+        ISSUE_ID: "i", ISSUE_IDENTIFIER: "AII-1", ISSUE_TITLE: "t", ISSUE_DESCRIPTION: "d",
+        ...BASE_ENV,
+      };
+      const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
+      expect(inputs.reviewers).toEqual(DEFAULT_REVIEWER_SELECTION);
     });
   });
 });

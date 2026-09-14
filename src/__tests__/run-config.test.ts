@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   encodeRunConfig,
   decodeRunConfig,
@@ -8,7 +8,7 @@ import {
   type TaskDocumentParams,
 } from "../run-config.js";
 import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
-import type { RepoMapping } from "../config.js";
+import type { RepoMapping, ReviewerSelection } from "../config.js";
 
 const full: RunConfigV1 = {
   v: 1,
@@ -26,6 +26,10 @@ const full: RunConfigV1 = {
   profiles: ["backend", "webapp"],
   planningContext: { parent: "- AII-0: parent", siblings: "None", dependencies: "- [related] AII-2: dep" },
   dependencyTokenScope: "installation",
+  reviewers: [
+    { id: "gap-analysis", gates: true },
+    { id: "code-review", gates: false },
+  ],
   retryPolicy: { ...DEFAULT_RETRY_POLICY, stageRetries: 0 },
 };
 
@@ -89,7 +93,7 @@ describe("run-config envelope", () => {
     const decoded = decodeRunConfig(b64);
     expect(decoded.profiles).toEqual(["backend", "webapp"]);
     expect(decoded.planningContext).toEqual({ parent: "- AII-0: parent", siblings: "None", dependencies: "- [related] AII-2: dep" });
-    expect((decoded as Record<string, unknown>).futureField).toBeUndefined();
+    expect((decoded as unknown as Record<string, unknown>).futureField).toBeUndefined();
   });
 
   it("handles empty profiles array and absent planningContext", () => {
@@ -131,7 +135,7 @@ describe("run-config envelope", () => {
     const b64 = Buffer.from(JSON.stringify(withExtra), "utf-8").toString("base64");
     const decoded = decodeRunConfig(b64);
     expect(decoded.dependencyTokenScope).toBe("installation");
-    expect((decoded as Record<string, unknown>).bogusKey).toBeUndefined();
+    expect((decoded as unknown as Record<string, unknown>).bogusKey).toBeUndefined();
   });
 
   it("round-trips retryPolicy", () => {
@@ -152,10 +156,37 @@ describe("run-config envelope", () => {
     expect(decoded.retryPolicy).toBeUndefined();
     expect("retryPolicy" in decoded).toBe(false);
   });
+
+  it("round-trips reviewers through pickKnownKeys", () => {
+    const reviewers: ReviewerSelection[] = [
+      { id: "gap-analysis", gates: true },
+      { id: "custom", gates: false },
+    ];
+    const withExtra = { ...full, reviewers, bogusKey: "dropped" };
+    const b64 = Buffer.from(JSON.stringify(withExtra), "utf-8").toString("base64");
+    const decoded = decodeRunConfig(b64);
+    expect(decoded.reviewers).toEqual(reviewers);
+    expect((decoded as unknown as Record<string, unknown>).bogusKey).toBeUndefined();
+  });
+
+  it("drops malformed reviewers during decode instead of rejecting the envelope", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const withMalformedReviewers = { ...full, reviewers: [{ id: "gap-analysis", gates: "yes" }] };
+      const b64 = Buffer.from(JSON.stringify(withMalformedReviewers), "utf-8").toString("base64");
+      const decoded = decodeRunConfig(b64);
+      expect(decoded.issue.identifier).toBe("AII-1");
+      expect(decoded.reviewers).toBeUndefined();
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("reviewers"));
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
 });
 
 function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
-  return {
+  const base: RepoMapping = {
     owner: "test-org",
     repo: "test-repo",
     workflowFile: "claude-implement.yml",
@@ -179,11 +210,19 @@ function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
     maxJobMinutes: null,
     branchPrefix: null,
     skillsRepo: null,
+    referenceRepos: null,
     sensitiveAddPatterns: null,
     sensitiveAllowPatterns: null,
     autoMerge: false,
     dependencyTokenScope: null,
+    memoryProviderId: null,
+    reviewers: null,
+  };
+  return {
+    ...base,
     ...overrides,
+    referenceRepos: overrides.referenceRepos === undefined ? base.referenceRepos : overrides.referenceRepos,
+    reviewers: overrides.reviewers === undefined ? base.reviewers : overrides.reviewers,
   };
 }
 
@@ -257,6 +296,28 @@ describe("buildImplRunConfig", () => {
     expect(decoded.groupingParent).toBe(true);
   });
 
+  it("carries the mapping's reviewers when set, including an empty array", () => {
+    const reviewers: ReviewerSelection[] = [{ id: "gap-analysis", gates: false }];
+    const mapping = makeMapping({ reviewers });
+
+    const runConfig = buildImplRunConfig({
+      issue: implBaseIssue,
+      mapping,
+      baseBranch: mapping.defaultBranch,
+      retryPolicy: DEFAULT_RETRY_POLICY,
+    });
+
+    expect(decodeRunConfig(encodeRunConfig(runConfig)).reviewers).toEqual(reviewers);
+
+    const emptyConfig = buildImplRunConfig({
+      issue: implBaseIssue,
+      mapping: makeMapping({ reviewers: [] }),
+      baseBranch: mapping.defaultBranch,
+      retryPolicy: DEFAULT_RETRY_POLICY,
+    });
+    expect(decodeRunConfig(encodeRunConfig(emptyConfig)).reviewers).toEqual([]);
+  });
+
   it("round-trips kgDryRun: true", () => {
     const cfg: RunConfigV1 = {
       v: 1,
@@ -279,7 +340,7 @@ describe("buildImplRunConfig", () => {
     const decoded = decodeRunConfig(b64);
     expect(decoded.kgSourceRepo).toBe("org/kg");
     expect(decoded.kgDryRun).toBe(true);
-    expect((decoded as Record<string, unknown>).bogusKey).toBeUndefined();
+    expect((decoded as unknown as Record<string, unknown>).bogusKey).toBeUndefined();
   });
 
   it("round-trips kgSourceRef", () => {
@@ -305,7 +366,7 @@ describe("buildImplRunConfig", () => {
     expect(decoded.kgSourceRepo).toBe("org/kg");
     expect(decoded.kgDryRun).toBe(true);
     expect(decoded.kgSourceRef).toBe("feature/head");
-    expect((decoded as Record<string, unknown>).bogusKey).toBeUndefined();
+    expect((decoded as unknown as Record<string, unknown>).bogusKey).toBeUndefined();
   });
 });
 

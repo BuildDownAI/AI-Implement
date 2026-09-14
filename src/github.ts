@@ -271,6 +271,7 @@ export function buildEnvelopeDispatchInputs(
       : {}),
     ...(mapping.dependencyTokenScope != null && opts.runnerPhase !== "planning" ? { dependencyTokenScope: mapping.dependencyTokenScope } : {}),
     ...(mapping.referenceRepos != null && opts.runnerPhase !== "planning" && opts.runnerPhase !== "kg-refresh" ? { referenceRepos: mapping.referenceRepos } : {}),
+    ...(mapping.reviewers != null ? { reviewers: mapping.reviewers } : {}),
     ...(issue.profiles && issue.profiles.length > 0 ? { profiles: issue.profiles } : {}),
     ...(issue.assigneeName ? { assigneeName: issue.assigneeName } : {}),
     ...(opts.planningContext ? { planningContext: opts.planningContext } : {}),

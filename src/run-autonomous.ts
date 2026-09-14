@@ -23,6 +23,7 @@ import { parsePlanningBlock } from "./planning-block.js";
 import type { LocalRunTokenSummary } from "./local/run-result.js";
 import { prepareScratchExclusionIfGit } from "./pipeline/scratch-exclude.js";
 import type { ReferenceRepo, ReferenceRepoResult } from "./reference-repos.js";
+import { DEFAULT_REVIEWER_SELECTION, type ReviewerSelection } from "./config.js";
 
 type RunAutopsyPasses = Array<{
   iteration: number;
@@ -221,6 +222,7 @@ export interface ResolvedRunnerInputs {
   sensitiveFiles: { add?: string[]; allow?: string[] } | undefined;
   dependencyTokenScope: "installation" | undefined;
   referenceRepos: ReferenceRepo[] | undefined;
+  reviewers: ReviewerSelection[];
   baseBranch: string | undefined;
   profiles: string[];
   assigneeName: string | undefined;
@@ -292,6 +294,7 @@ function inputsFromConfig(cfg: RunConfigV1, env: NodeJS.ProcessEnv): ResolvedRun
     sensitiveFiles: cfg.sensitiveFiles,
     dependencyTokenScope: cfg.dependencyTokenScope,
     referenceRepos: cfg.referenceRepos,
+    reviewers: cfg.reviewers ?? DEFAULT_REVIEWER_SELECTION,
     baseBranch: cfg.baseBranch,
     profiles: cfg.profiles
       ? cfg.profiles
@@ -351,6 +354,7 @@ export function resolveRunnerInputs(env: NodeJS.ProcessEnv): ResolvedRunnerInput
   const skillsRepo = env.AI_IMPLEMENT_SKILLS_REPO?.trim() || undefined;
   const dependencyTokenScope = undefined;
   const referenceRepos = undefined;
+  const reviewers = DEFAULT_REVIEWER_SELECTION;
   const profiles = (env.AI_IMPLEMENT_PROFILES ?? "")
     .split(",")
     .map((p) => p.trim())
@@ -373,6 +377,7 @@ export function resolveRunnerInputs(env: NodeJS.ProcessEnv): ResolvedRunnerInput
     sensitiveFiles: undefined,
     dependencyTokenScope,
     referenceRepos,
+    reviewers,
     baseBranch: undefined,
     profiles,
     assigneeName,
