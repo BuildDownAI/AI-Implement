@@ -291,3 +291,13 @@ When the sidecar starts and the marker is present (or `out/embeddings.npz` is ab
 - The **`deployed` / `restarted` deploy notification** includes a warning line: _⚠️ KG embeddings missing — /mcp is lexical-only_.
 
 To repair a degraded image, re-deploy with `--no-cache` and a working `--build-secret kg_token`. A cached layer from a previous degraded build will reuse the bad output even when the underlying problem is fixed — `--no-cache` is not optional for this recovery.
+
+## KG sidecar health
+
+`kgDegraded` only says whether embeddings are present. A sidecar can also be up and still reject every call — on 2026-09-13 it answered `400 Missing session ID` to each proxied request while every health read stayed green (AII-648, KGB-28). The orchestrator now probes the sidecar after it reports ready (`tools/list` must list the six `kg_*` tools, then one `kg_neighbors` on the spine) and surfaces the result beside `kgDegraded` on every health read (AII-650):
+
+- **`GET /`**, **`GET /api/kg/status`** / `get_kg_status`, and `get_tenant_health` carry `kgUnavailable: boolean` and `sidecar: { reachable, toolsListed, lastError, checkedAt }`. `reachable` means a well-formed HTTP answer came back; `toolsListed` means the six tools were present; `checkedAt` is `null` until the first probe has run.
+- The **Deployments page** KG card shows _⚠️ KG sidecar not serving — <lastError>_ when `kgUnavailable` is true, and a one-line "KG sidecar: reachable" once a probe has succeeded.
+- The **`deployed` / `restarted` deploy notification** adds _⚠️ KG sidecar not serving — <lastError>_ next to the embeddings warning, and the deploy record reads `deployed-not-serving` instead of `deployed-ok` when the boot probe fails.
+
+A failed probe re-runs in the background (throttled) on the next proxied failure, so the fields recover on their own once the sidecar does. The boot probe has one overall deadline (30 s); a timeout is recorded as a failed probe.

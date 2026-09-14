@@ -1233,6 +1233,9 @@ describe("handleMcpRequest", () => {
         servedStamp: "2026-09-01T00:00:00Z",
         lastRefresh: { ok: true, at: 1735689600000, detail: "no diff", stampBefore: "a", stampAfter: "b" },
         stage: "ingest-running",
+        materialize: "direct",
+        kgUnavailable: false,
+        sidecar: { reachable: false, toolsListed: false, lastError: null, checkedAt: null },
       };
       const getKgStatusMock = vi.fn(async () => status);
 
