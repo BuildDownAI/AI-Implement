@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import type { ReviewerSelection } from "../../config.js";
 import { OperatorCancelledError, PrMergedError } from "../operator-cancelled.js";
 import type { LLMResult, PipelineContext, RunTelemetry, StepModule, StepReporter } from "../types.js";
 import { formatGitNameStatusSummary, terminalResultFailureMessage } from "../step-utils.js";
@@ -27,7 +28,7 @@ interface PostPushReviewInputs extends Record<string, unknown> {
   /** Check-run names that identify the external review provider. Defaults to the Claude Code Review check. */
   reviewCheckNames?: string[];
   /** Project reviewer selections. A later wiring issue passes this from the resolved mapping. */
-  reviewers?: ReviewGateSelection[];
+  reviewers?: ReviewerSelection[];
   /** Poll interval while waiting for the external review check to finish. */
   reviewWaitPollMs?: number;
   /** Total time to wait for an in-flight external review check before failing closed. */
@@ -37,11 +38,6 @@ interface PostPushReviewInputs extends Record<string, unknown> {
   sleep?: (ms: number) => Promise<void>;
   /** Injectable credential refresh for tests. */
   refreshCredentials?: () => Promise<void>;
-}
-
-interface ReviewGateSelection {
-  id?: string;
-  gates?: boolean;
 }
 
 type ExternalReviewState = "skipped" | "absent" | "running" | "completed";
@@ -362,18 +358,18 @@ function extractCommentIdWithMarker(stdout: string, marker: string): number | nu
   return null;
 }
 
-function claudeReviewSummaryGates(reviewers: ReviewGateSelection[] | undefined): boolean {
+function claudeReviewSummaryGates(reviewers: ReviewerSelection[] | undefined): boolean {
   return reviewers?.some((reviewer) => reviewer.id === "claude-review-summary" && reviewer.gates === true) ?? false;
 }
 
 export function isReviewLedgerFindingGating(
   finding: Pick<ReviewLedgerFinding, "source">,
-  reviewers?: ReviewGateSelection[],
+  reviewers?: ReviewerSelection[],
 ): boolean {
   return isReviewLedgerSourceGating(finding.source, reviewers);
 }
 
-function isReviewLedgerSourceGating(source: ReviewLedgerSource, reviewers?: ReviewGateSelection[]): boolean {
+function isReviewLedgerSourceGating(source: ReviewLedgerSource, reviewers?: ReviewerSelection[]): boolean {
   if (source === "claude-review-summary") return claudeReviewSummaryGates(reviewers);
   return true;
 }
@@ -397,7 +393,7 @@ function reviewLedgerFindingKeys(finding: PostPushReviewLedgerFinding): string[]
 function buildReviewLedger(
   internalIssues: ReviewIssue[],
   externalFindings: ReviewLedgerFinding[],
-  reviewers?: ReviewGateSelection[],
+  reviewers?: ReviewerSelection[],
 ): PostPushReviewLedgerFinding[] {
   const ledger: PostPushReviewLedgerFinding[] = [];
   const indexByKey = new Map<string, number>();

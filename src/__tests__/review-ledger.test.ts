@@ -1795,6 +1795,19 @@ describe("collectExternalReviewFindingsFromGh", () => {
     });
   });
 
+  it("keeps prose verdict provenance distinct from structured authority", () => {
+    const ghSpawn: GhSpawn = (args) => ({
+      exitCode: 0,
+      stdout: isIssueCommentsRequest(args)
+        ? JSON.stringify([{ user: { login: "github-actions[bot]", type: "Bot" }, body: PR557_THIRD_CLAUDE_ACTION_REVIEW }])
+        : "[]",
+    });
+    expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toMatchObject({
+      verdict: "approve",
+      verdictSource: "claude-review-summary",
+    });
+  });
+
   it("returns the structured review contract verdict with review-contract provenance", () => {
     const ghSpawn: GhSpawn = (args) => {
       if (isPullReviewsRequest(args)) {

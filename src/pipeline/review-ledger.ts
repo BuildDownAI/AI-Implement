@@ -665,7 +665,10 @@ function collectClaudeIssueComments(
       const ghResult = extractGithubActionsClaudeReviewFindings(comment.body, url);
       findings.push(...ghResult.findings);
       if (ghResult.findingsUnavailable) out.findingsUnavailable = true;
-      if (ghResult.verdict !== undefined) out.verdict = ghResult.verdict;
+      if (ghResult.verdict !== undefined) {
+        out.verdict = ghResult.verdict;
+        out.verdictSource = "claude-review-summary";
+      }
       return;
     }
   }
