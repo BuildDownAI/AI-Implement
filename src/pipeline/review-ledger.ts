@@ -84,7 +84,8 @@ const REVIEW_FINDINGS_SCHEMA = "review-findings/v1";
 // backticks). A lazy match to the *first* ``` anywhere would truncate the JSON early when a
 // finding's `body` legitimately contains an inline triple-backtick snippet (e.g. `` "Use:\n```js\nfoo()\n```" ``)
 // -- that inner sequence never starts a line by itself, so this pattern skips past it.
-const REVIEW_FINDINGS_FENCE_RE = /```json[ \t]+review-findings[ \t]*\r?\n([\s\S]*?)\r?\n```[ \t]*(?=\r?\n|$)/g;
+const REVIEW_FINDINGS_FENCE_RE = /^[ \t]*```json[ \t]+review-findings[ \t]*\r?\n([\s\S]*?)^[ \t]*```[ \t]*(?=\r?\n|$)/gm;
+const REVIEW_FINDINGS_OPENING_FENCE_RE = /^[ \t]*```json[ \t]+review-findings[ \t]*\r?\n/gm;
 
 const REVIEW_FINDINGS_VERDICTS = new Set(["approve", "changes_requested", "incomplete"]);
 
@@ -231,6 +232,16 @@ function extractLegacyVerdictMarkerFindings(body: string, url?: string): ReviewF
  */
 export function extractReviewFindingsBlock(body: string, url?: string): ReviewFindingsBlockResult | null {
   const fenceMatches = [...body.matchAll(REVIEW_FINDINGS_FENCE_RE)];
+  const openingFenceMatches = [...body.matchAll(REVIEW_FINDINGS_OPENING_FENCE_RE)];
+
+  if (openingFenceMatches.length > 0) {
+    const lastOpeningMatch = openingFenceMatches[openingFenceMatches.length - 1];
+    const lastCompleteMatch = fenceMatches[fenceMatches.length - 1];
+    if (!lastCompleteMatch || lastOpeningMatch.index !== lastCompleteMatch.index) {
+      return INCOMPLETE_REVIEW_FINDINGS_RESULT;
+    }
+  }
+
   if (fenceMatches.length > 0) {
     const lastMatch = fenceMatches[fenceMatches.length - 1];
     return parseReviewFindingsBlockJson(lastMatch[1].trim(), url);

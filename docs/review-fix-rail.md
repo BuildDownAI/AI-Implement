@@ -97,11 +97,12 @@ Every state the parser can be in, and its result:
 | No block present | none | `undefined` | `false` — falls back to prose extraction |
 | One valid block | its findings | its verdict | `false` |
 | Block present, JSON does not parse | none | `"incomplete"` | `true` |
+| Opening block fence present without a closing fence | none | `"incomplete"` | `true` |
 | Block present, JSON parses but fails the schema | none | `"incomplete"` | `true` |
 | `schema` is not `review-findings/v1` | none | `"incomplete"` | `true` |
 | More than one block in one comment | the last block's findings | the last block's verdict | `false` |
 
-A broken block sets `findingsUnavailable` and does **not** fall back to prose extraction — a reviewer that tried to emit the contract and failed is a broken reviewer, not a prose reviewer, and treating it as prose would hide the breakage.
+A broken block, including an opened `review-findings` fence with no closing fence, sets `findingsUnavailable` and does **not** fall back to prose extraction — a reviewer that tried to emit the contract and failed is a broken reviewer, not a prose reviewer, and treating it as prose would hide the breakage.
 
 The trust boundary is unchanged: only a comment from an already-trusted Claude author or the GitHub Actions bot (`isVerdictEligibleAuthor`) is even offered to this parser, so a lookalike block from another bot or a human commenter cannot supersede a real review.
 
