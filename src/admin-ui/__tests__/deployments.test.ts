@@ -517,9 +517,21 @@ describe("deployments page", () => {
 
 describe("kg refresh card", () => {
   it("declares the kg-refresh element ids", () => {
-    for (const id of ["kg-refresh-card", "kg-refresh-badge", "kg-refresh-stamp", "kg-refresh-last", "kg-refresh-btn"]) {
+    for (const id of ["kg-refresh-card", "kg-refresh-badge", "kg-refresh-stamp", "kg-refresh-last", "kg-refresh-btn", "kg-sidecar-status"]) {
       expect(deploymentsHtml).toContain(`id="${id}"`);
     }
+  });
+
+  it("renders the sidecar liveness state beside the stage badge and hides it before the first probe (AII-650)", () => {
+    // The element ships hidden; the script shows the warning with the probe's lastError when the
+    // sidecar is unavailable, a one-line "reachable" when a probe has run, and hides it otherwise.
+    expect(deploymentsHtml).toContain('id="kg-sidecar-status" hidden');
+    expect(deploymentsScript).toContain("const sidecarEl = document.getElementById('kg-sidecar-status')");
+    expect(deploymentsScript).toContain("if (data.kgUnavailable) {");
+    expect(deploymentsScript).toContain("'⚠️ KG sidecar not serving — ' + ((data.sidecar && data.sidecar.lastError) || 'unknown error')");
+    expect(deploymentsScript).toContain("} else if (data.sidecar && data.sidecar.checkedAt) {");
+    expect(deploymentsScript).toContain("sidecarEl.textContent = 'KG sidecar: reachable'");
+    expect(deploymentsScript).toContain("sidecarEl.hidden = true");
   });
 
   it("calls /api/kg/status for status", () => {

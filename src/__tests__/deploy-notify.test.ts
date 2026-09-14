@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as DedupModule from "../dedup.js";
 import type * as DeployNotifyModule from "../deploy-notify.js";
 import type * as NotifyModule from "../notify.js";
+import type * as KgProviderModule from "../kg-provider.js";
 
 // The formatters are covered by notify.test.ts; here we only care that the right
 // payload reaches them, so the whole notify module is replaced by a spy.
@@ -23,6 +24,7 @@ let dbPath: string;
 let dedup: typeof DedupModule;
 let deployNotify: typeof DeployNotifyModule;
 let notify: typeof NotifyModule;
+let kgProvider: typeof KgProviderModule;
 
 beforeEach(async () => {
   vi.resetModules();
@@ -33,6 +35,7 @@ beforeEach(async () => {
   runnerMode.initSettingsTable();
   deployNotify = await import("../deploy-notify.js");
   notify = await import("../notify.js");
+  kgProvider = await import("../kg-provider.js");
 });
 
 afterEach(() => {
@@ -405,6 +408,36 @@ describe("postBootNotice", () => {
 
     expect(vi.mocked(notify.notifyDeploy).mock.calls[0][2]).toMatchObject({ kgDegraded: false });
   });
+
+  // AII-650: kgUnavailable/sidecarError flow from kg-provider's sidecarHealth into the
+  // notification independently of kgDegraded (embeddings vs. sidecar liveness are separate flags).
+  it("propagates kgUnavailable=true and the sidecar error when the last probe failed", async () => {
+    writeKey(LAST_IMAGE_REF_KEY, IMAGE_A);
+    onFly(IMAGE_B);
+    kgProvider.sidecarHealth.reachable = false;
+    kgProvider.sidecarHealth.toolsListed = false;
+    kgProvider.sidecarHealth.lastError = "tools/list failed: ECONNREFUSED";
+    kgProvider.sidecarHealth.checkedAt = Date.now();
+
+    await deployNotify.postBootNotice(config);
+
+    expect(vi.mocked(notify.notifyDeploy).mock.calls[0][2]).toMatchObject({
+      kgUnavailable: true,
+      sidecarError: "tools/list failed: ECONNREFUSED",
+    });
+  });
+
+  it("propagates kgUnavailable=false when no probe has failed", async () => {
+    writeKey(LAST_IMAGE_REF_KEY, IMAGE_A);
+    onFly(IMAGE_B);
+
+    await deployNotify.postBootNotice(config);
+
+    expect(vi.mocked(notify.notifyDeploy).mock.calls[0][2]).toMatchObject({
+      kgUnavailable: false,
+      sidecarError: null,
+    });
+  });
 });
 
 // ---------- isKgDegraded — the same flag read by GET / health endpoint ----------
@@ -438,6 +471,40 @@ describe("GET / health endpoint kgDegraded", () => {
   it("kgDegraded is false in health JSON when KG_EMBEDDINGS_DEGRADED is unset", () => {
     const body = { status: "ok", polls: 0, kgDegraded: deployNotify.isKgDegraded() };
     expect(body.kgDegraded).toBe(false);
+  });
+});
+
+// ---------- GET / health endpoint — kgUnavailable + sidecar fields (AII-650) ----------
+// The handler spreads sidecarHealthFields() alongside kgDegraded: { kgUnavailable, sidecar }.
+
+describe("GET / health endpoint kgUnavailable", () => {
+  afterEach(() => {
+    kgProvider.sidecarHealth.reachable = false;
+    kgProvider.sidecarHealth.toolsListed = false;
+    kgProvider.sidecarHealth.lastError = null;
+    kgProvider.sidecarHealth.checkedAt = null;
+  });
+
+  it("kgUnavailable is false and sidecar.reachable is true in health JSON after a successful probe", () => {
+    kgProvider.sidecarHealth.reachable = true;
+    kgProvider.sidecarHealth.toolsListed = true;
+    kgProvider.sidecarHealth.lastError = null;
+    kgProvider.sidecarHealth.checkedAt = Date.now();
+
+    const body = { status: "ok", polls: 0, kgDegraded: deployNotify.isKgDegraded(), ...kgProvider.sidecarHealthFields() };
+    expect(body.kgUnavailable).toBe(false);
+    expect(body.sidecar.reachable).toBe(true);
+  });
+
+  it("kgUnavailable is true and sidecar carries the error in health JSON after a failed probe", () => {
+    kgProvider.sidecarHealth.reachable = false;
+    kgProvider.sidecarHealth.toolsListed = false;
+    kgProvider.sidecarHealth.lastError = "tools/list failed: ECONNREFUSED";
+    kgProvider.sidecarHealth.checkedAt = Date.now();
+
+    const body = { status: "ok", polls: 0, kgDegraded: deployNotify.isKgDegraded(), ...kgProvider.sidecarHealthFields() };
+    expect(body.kgUnavailable).toBe(true);
+    expect(body.sidecar.lastError).toBe("tools/list failed: ECONNREFUSED");
   });
 });
 

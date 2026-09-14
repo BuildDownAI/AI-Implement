@@ -8,7 +8,7 @@ import { getDb } from "./dedup.js";
 import { getIssueReportCard, getFleetReport } from "./report-card.js";
 import { isKgDegraded } from "./deploy-notify.js";
 import { recheckIdentity, type AccessRole } from "./access-entries.js";
-import { type MemoryProvider, KG_TOOL_CAPABILITY } from "./kg-provider.js";
+import { type MemoryProvider, KG_TOOL_CAPABILITY, sidecarHealthFields } from "./kg-provider.js";
 import { getDeployPosture } from "./deploy-posture.js";
 
 interface JsonRpcRequest {
@@ -352,7 +352,15 @@ async function callDiagnosticTool(
       const kgRefreshPreflight = context.runKgRefreshPreflight
         ? await context.runKgRefreshPreflight()
         : null;
-      return { runnerMode: { mode, source }, inFlightJobCount: inFlight.length, pendingGapfillCount, projectCount, kgDegraded: isKgDegraded(), kgRefreshPreflight };
+      return {
+        runnerMode: { mode, source },
+        inFlightJobCount: inFlight.length,
+        pendingGapfillCount,
+        projectCount,
+        kgDegraded: isKgDegraded(),
+        ...sidecarHealthFields(),
+        kgRefreshPreflight,
+      };
     }
 
     case "get_runner_mode": {

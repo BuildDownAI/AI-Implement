@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { makeKgRefresh, runKgRefreshPreflight, materializeArgs, type KgRefreshHandle, type KgRefreshStage, type RefreshOutcome, type RefreshGate, type DryRunOutcomeEntry } from "../kg-refresh.js";
 import { COMPLETION_MARKER } from "../kg-sidecar.js";
+import { sidecarHealth } from "../kg-provider.js";
 import * as runnerMode from "../runner-mode.js";
 
 const NAMESPACE = "https://kg.test.example/";
@@ -120,6 +121,10 @@ describe("kg-refresh", () => {
     rmSync(fixtureRepo, { recursive: true, force: true });
     delete process.env.KG_SIDECAR_URL;
     vi.clearAllMocks();
+    sidecarHealth.reachable = false;
+    sidecarHealth.toolsListed = false;
+    sidecarHealth.lastError = null;
+    sidecarHealth.checkedAt = null;
   });
 
   it("returns 202, refreshes, and records the stamp movement", async () => {
@@ -498,6 +503,28 @@ describe("kg-refresh", () => {
     const s = await handle.status();
     expect(s.running).toBe(false);
     expect(s.lastRefresh?.gate).toBe("ingest-needed");
+  });
+
+  it("status() includes kgUnavailable=false and a reachable sidecar record alongside kgDegraded (AII-650)", async () => {
+    sidecarHealth.reachable = true;
+    sidecarHealth.toolsListed = true;
+    sidecarHealth.lastError = null;
+    sidecarHealth.checkedAt = 1_700_000_000_000;
+
+    const s = await handle.status();
+    expect(s.kgUnavailable).toBe(false);
+    expect(s.sidecar).toEqual({ reachable: true, toolsListed: true, lastError: null, checkedAt: 1_700_000_000_000 });
+  });
+
+  it("status() reflects kgUnavailable=true and the sidecar error when the last probe failed (AII-650)", async () => {
+    sidecarHealth.reachable = false;
+    sidecarHealth.toolsListed = false;
+    sidecarHealth.lastError = "tools/list failed: ECONNREFUSED";
+    sidecarHealth.checkedAt = 1_700_000_001_000;
+
+    const s = await handle.status();
+    expect(s.kgUnavailable).toBe(true);
+    expect(s.sidecar.lastError).toBe("tools/list failed: ECONNREFUSED");
   });
 
   it("success path persists the snapshot SHA", async () => {

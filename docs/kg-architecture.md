@@ -142,6 +142,9 @@ Every soft failure that skips real work must leave a receipt. The embed step wri
 `/app/kg/.embeddings-failed`, which `docker-entrypoint.sh` turns into `KG_EMBEDDINGS_DEGRADED=1` at
 boot, surfaced as `kgDegraded` on `GET /`, in the deploy notification, and in `get_tenant_health`
 (AII-422). See [deployment.md](deployment.md#kg-embeddings-health).
+Liveness is a second, independent signal: the boot-time probe's result is surfaced as `kgUnavailable` and
+`sidecar` on the same three reads and in the Deployments card (AII-648, AII-650). See
+[deployment.md](deployment.md#kg-sidecar-health).
 
 ### Stage 4 — Serve
 

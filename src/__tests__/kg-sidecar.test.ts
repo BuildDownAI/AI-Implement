@@ -11,7 +11,7 @@ import {
 import { spawn as realSpawn } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { checkDegraded, COMPLETION_MARKER, KgSidecar } from "../kg-sidecar.js";
+import { checkDegraded, COMPLETION_MARKER, getServedNamespace, KgSidecar } from "../kg-sidecar.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -81,6 +81,56 @@ describe("checkDegraded", () => {
     const kgDir = makeKgDir();
     touch(join(kgDir, ".embeddings-failed"));
     expect(checkDegraded(kgDir)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// getServedNamespace (AII-650 refinement #5) — overlay-vs-baked selection, the
+// namespace: regex, and missing/malformed sources.yml.
+// ---------------------------------------------------------------------------
+
+describe("getServedNamespace", () => {
+  it("prefers the runtime overlay's namespace when a runtime sources.yml exists", async () => {
+    const kgDir = makeKgDir();
+    writeFileSync(join(kgDir, "sources.yml"), "namespace: http://baked.example/kg/\n");
+    const runtimeDir = makeTmpDir();
+    writeFileSync(join(runtimeDir, "sources.yml"), "namespace: http://overlay.example/kg/\n");
+
+    const ns = await getServedNamespace(kgDir, runtimeDir);
+    expect(ns).toBe("http://overlay.example/kg/");
+  });
+
+  it("falls back to the baked kgDir sources.yml when no runtime overlay is present", async () => {
+    const kgDir = makeKgDir();
+    writeFileSync(join(kgDir, "sources.yml"), "namespace: http://baked.example/kg/\n");
+    const runtimeDir = makeTmpDir(); // exists, but has no sources.yml of its own
+
+    const ns = await getServedNamespace(kgDir, runtimeDir);
+    expect(ns).toBe("http://baked.example/kg/");
+  });
+
+  it("parses the namespace: line even with trailing whitespace", async () => {
+    const kgDir = makeKgDir();
+    writeFileSync(join(kgDir, "sources.yml"), "namespace: http://baked.example/kg/   \n");
+    const runtimeDir = makeTmpDir();
+
+    const ns = await getServedNamespace(kgDir, runtimeDir);
+    expect(ns).toBe("http://baked.example/kg/");
+  });
+
+  it("returns null when sources.yml is missing from both locations", async () => {
+    const kgDir = makeKgDir();
+    const runtimeDir = makeTmpDir();
+
+    expect(await getServedNamespace(kgDir, runtimeDir)).toBeNull();
+  });
+
+  it("returns null for a malformed sources.yml with no namespace: line, rather than throwing", async () => {
+    const kgDir = makeKgDir();
+    writeFileSync(join(kgDir, "sources.yml"), "other: value\nunrelated content\n");
+    const runtimeDir = makeTmpDir();
+
+    expect(await getServedNamespace(kgDir, runtimeDir)).toBeNull();
   });
 });
 

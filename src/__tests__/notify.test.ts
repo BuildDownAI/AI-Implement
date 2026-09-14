@@ -501,6 +501,59 @@ describe("notifyDeploy", () => {
     });
   });
 
+  describe("kgUnavailable", () => {
+    it("slack / kgUnavailable=true shows the sidecar warning line with the error text", async () => {
+      await notifyDeploy("slack", "https://webhook.example.com/slack", {
+        ...deployBase, kgUnavailable: true, sidecarError: "tools/list failed: ECONNREFUSED",
+      });
+      expect(slackText()).toContain("⚠️ KG sidecar not serving — tools/list failed: ECONNREFUSED");
+    });
+
+    it("slack / kgUnavailable=true with no sidecarError falls back to 'unknown error'", async () => {
+      await notifyDeploy("slack", "https://webhook.example.com/slack", { ...deployBase, kgUnavailable: true });
+      expect(slackText()).toContain("⚠️ KG sidecar not serving — unknown error");
+    });
+
+    it("slack / kgUnavailable=false emits no sidecar warning", async () => {
+      await notifyDeploy("slack", "https://webhook.example.com/slack", { ...deployBase, kgUnavailable: false, sidecarError: null });
+      expect(slackText()).not.toContain("KG sidecar not serving");
+    });
+
+    it("slack / kgUnavailable absent emits no sidecar warning", async () => {
+      await notifyDeploy("slack", "https://webhook.example.com/slack", deployBase);
+      expect(slackText()).not.toContain("KG sidecar not serving");
+    });
+
+    // The two failure modes are independent — both warnings appear together when both are true.
+    it("slack / kgDegraded and kgUnavailable both true show both warning lines", async () => {
+      await notifyDeploy("slack", "https://webhook.example.com/slack", {
+        ...deployBase, kgDegraded: true, kgUnavailable: true, sidecarError: "boom",
+      });
+      expect(slackText()).toContain("⚠️ KG embeddings missing — /mcp is lexical-only");
+      expect(slackText()).toContain("⚠️ KG sidecar not serving — boom");
+    });
+
+    it("teams / kgUnavailable=true shows the sidecar warning TextBlock in card body", async () => {
+      await notifyDeploy("teams", "https://webhook.example.com/teams", {
+        ...deployBase, kgUnavailable: true, sidecarError: "tools/list failed: ECONNREFUSED",
+      });
+      const cardBody: Array<{ type: string; text?: string }> = sentBody().attachments[0].content.body;
+      expect(JSON.stringify(cardBody)).toContain("KG sidecar not serving — tools/list failed: ECONNREFUSED");
+    });
+
+    it("teams / kgUnavailable=false emits no sidecar warning in card body", async () => {
+      await notifyDeploy("teams", "https://webhook.example.com/teams", { ...deployBase, kgUnavailable: false });
+      const cardBody = sentBody().attachments[0].content.body;
+      expect(JSON.stringify(cardBody)).not.toContain("KG sidecar not serving");
+    });
+
+    it("teams / kgUnavailable absent emits no sidecar warning in card body", async () => {
+      await notifyDeploy("teams", "https://webhook.example.com/teams", deployBase);
+      const cardBody = sentBody().attachments[0].content.body;
+      expect(JSON.stringify(cardBody)).not.toContain("KG sidecar not serving");
+    });
+  });
+
   describe("kgDegraded", () => {
     it("slack / kgDegraded=true shows warning line on deployed", async () => {
       await notifyDeploy("slack", "https://webhook.example.com/slack", { ...deployBase, kgDegraded: true });

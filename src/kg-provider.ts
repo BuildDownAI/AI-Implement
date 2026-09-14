@@ -67,6 +67,16 @@ export function isKgUnavailable(): boolean {
   return sidecarHealth.lastError !== null;
 }
 
+/** The `kgUnavailable` + `sidecar` pair surfaced identically at every read site (AII-650). */
+export interface SidecarHealthFields {
+  kgUnavailable: boolean;
+  sidecar: SidecarHealth;
+}
+
+export function sidecarHealthFields(): SidecarHealthFields {
+  return { kgUnavailable: isKgUnavailable(), sidecar: { ...sidecarHealth } };
+}
+
 function recordSidecarHealth(patch: Omit<SidecarHealth, "checkedAt">): SidecarHealth {
   sidecarHealth.reachable = patch.reachable;
   sidecarHealth.toolsListed = patch.toolsListed;
@@ -404,7 +414,14 @@ export class SidecarMemoryProvider implements MemoryProvider {
     };
     const listOutcome = await this.sendWithSessionRetry(target, transport, forwardHeaders, sendList);
     const listError = this.describeSendFailure(listOutcome, "tools/list");
-    if (listError) return recordSidecarHealth({ reachable: false, toolsListed: false, lastError: listError });
+    if (listError) {
+      // `result.ok` is true whenever an HTTP response came back at all — including a 4xx
+      // carrying a JSON-RPC error, or one this class couldn't parse — so it alone answers
+      // "reachable"; only a transport-level failure (connection refused, timeout) leaves it
+      // false. Tightened per the AII-648 review: this used to hardcode `false` here, which
+      // misreported a sidecar that answered with an error as unreachable (AII-650 refinement #1).
+      return recordSidecarHealth({ reachable: listOutcome.result.ok, toolsListed: false, lastError: listError });
+    }
 
     const tools = (listOutcome.parsed?.result?.tools ?? []) as Array<{ name?: unknown }>;
     const names = new Set(tools.map((t) => t.name).filter((n): n is string => typeof n === "string"));
@@ -449,10 +466,12 @@ export class SidecarMemoryProvider implements MemoryProvider {
 
   /**
    * Re-probes when `listTools`/`proxyCall` hits a failure, throttled to one real
-   * sidecar round-trip per PROBE_THROTTLE_MS. Awaited by the caller rather than
-   * fired-and-forgotten: a detached probe would still reach the sidecar after its
-   * triggering call returns, on a timer no caller controls, which is worse than the
-   * small added latency of waiting for it here.
+   * sidecar round-trip per PROBE_THROTTLE_MS. Callers fire this and move on rather than
+   * awaiting it (AII-650 refinement #2): awaiting made the first failing call after an
+   * outage pay for a full extra probe (up to two more 10s-bounded sidecar round trips)
+   * before its own caller saw the original error. This method never throws — every
+   * internal failure resolves to a recorded health rather than a rejection — so a
+   * detached call cannot produce an unhandled rejection.
    */
   private async maybeReprobe(): Promise<void> {
     const last = sidecarHealth.checkedAt;
@@ -489,7 +508,7 @@ export class SidecarMemoryProvider implements MemoryProvider {
 
     const { result, parsed } = await this.sendWithSessionRetry(target, transport, forwardHeaders, send);
     if (!result.ok || "streamed" in result) {
-      await this.maybeReprobe();
+      void this.maybeReprobe();
       return [];
     }
 
@@ -497,12 +516,12 @@ export class SidecarMemoryProvider implements MemoryProvider {
       console.error(
         `[mcp] KG sidecar tools/list unparseable (status ${result.status}, content-type ${result.headers["content-type"]}): ${result.raw.toString().slice(0, 200)}`,
       );
-      await this.maybeReprobe();
+      void this.maybeReprobe();
     } else if (!parsed.result) {
       console.error(
         `[mcp] KG sidecar tools/list returned no result (status ${result.status}): ${JSON.stringify(parsed.error ?? parsed).slice(0, 200)}`,
       );
-      await this.maybeReprobe();
+      void this.maybeReprobe();
     }
     return parsed?.result?.tools ?? [];
   }
@@ -545,7 +564,7 @@ export class SidecarMemoryProvider implements MemoryProvider {
     void (async () => {
       const { result, handshakeError } = await this.sendWithSessionRetry(target, transport, forwardHeaders, send);
       if (!result.ok) {
-        await this.maybeReprobe();
+        void this.maybeReprobe();
         writeConnectionError(result.error);
         return;
       }
@@ -554,7 +573,7 @@ export class SidecarMemoryProvider implements MemoryProvider {
         // Surface the sidecar's own rejection (status + JSON-RPC error body) rather than a
         // synthetic 502 — parity with listTools and with docs/kg-sidecar.md.
         console.error("[mcp] KG sidecar session initialize failed; forwarding the original rejection:", handshakeError);
-        await this.maybeReprobe();
+        void this.maybeReprobe();
       }
 
       const outHeaders = { ...result.headers } as http.OutgoingHttpHeaders;
@@ -564,6 +583,54 @@ export class SidecarMemoryProvider implements MemoryProvider {
       res.end(result.raw);
     })();
   }
+}
+
+/**
+ * Caps the boot-time probe (AII-650 refinement #3): `main()`'s `await memoryProvider.probe()`
+ * had no overall deadline, so a slow-but-answering sidecar — each of probe()'s two sequential
+ * calls individually bounded by SIDECAR_REQUEST_TIMEOUT_MS, more once a session handshake is
+ * needed — could push boot well past that before startServer() ran. Matches KgSidecar's own
+ * pollTimeoutMs default (src/kg-sidecar.ts).
+ */
+export const BOOT_PROBE_TIMEOUT_MS = 30_000;
+
+/**
+ * Races `provider.probe()` against an overall cap, resolving to a recorded timeout failure if
+ * the cap wins. The real probe keeps running afterward and still updates the shared
+ * `sidecarHealth` record whenever it eventually finishes — this only stamps a failure in the
+ * meantime so a caller awaiting this doesn't hang.
+ *
+ * The timer is cleared as soon as the probe settles: a bare `Promise.race` would leave it armed,
+ * and 30 s after every healthy boot it would overwrite the good record with a fabricated timeout
+ * (caught by the PR #561 review).
+ */
+export function probeWithTimeout(
+  provider: SidecarMemoryProvider,
+  timeoutMs: number = BOOT_PROBE_TIMEOUT_MS,
+): Promise<SidecarHealth> {
+  return new Promise<SidecarHealth>((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      resolve(recordSidecarHealth({ reachable: false, toolsListed: false, lastError: `KG sidecar probe timed out after ${timeoutMs}ms` }));
+    }, timeoutMs);
+    timer.unref();
+    provider.probe().then(
+      (health) => {
+        clearTimeout(timer);
+        if (settled) return;
+        settled = true;
+        resolve(health);
+      },
+      (err: unknown) => {
+        clearTimeout(timer);
+        if (settled) return;
+        settled = true;
+        resolve(recordSidecarHealth({ reachable: false, toolsListed: false, lastError: `KG sidecar probe threw: ${err instanceof Error ? err.message : String(err)}` }));
+      },
+    );
+  });
 }
 
 export class UnknownMemoryProviderError extends Error {

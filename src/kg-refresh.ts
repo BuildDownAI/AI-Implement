@@ -15,7 +15,8 @@ import { extractSource, parseKgSourceRepo } from "./deploy.js";
 import { isDeployHeld } from "./deploy-hold.js";
 import { COMPLETION_MARKER, KG_DIR } from "./kg-sidecar.js";
 import { isKgDegraded } from "./deploy-notify.js";
-import { parseSidecarRpcResponse } from "./kg-provider.js";
+import { parseSidecarRpcResponse, sidecarHealthFields } from "./kg-provider.js";
+import type { SidecarHealth } from "./kg-provider.js";
 import { mintRunToken } from "./runner-tokens.js";
 import type { MintInput, MintOutput } from "./runner-tokens.js";
 import { encodeRunConfig } from "./run-config.js";
@@ -194,6 +195,9 @@ export interface KgRefreshStatus {
   running: boolean;
   deployHeld: boolean;
   kgDegraded: boolean;
+  /** True when the last sidecar liveness probe failed (AII-648/650). */
+  kgUnavailable: boolean;
+  sidecar: SidecarHealth;
   servedStamp: string | null;
   lastRefresh: RefreshOutcome | null;
   stage: KgRefreshStage;
@@ -1794,6 +1798,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
         running,
         deployHeld: deployHeld(),
         kgDegraded: isKgDegraded(),
+        ...sidecarHealthFields(),
         servedStamp: await readServedStamp(await readNamespace(servedDir)),
         lastRefresh,
         stage,
