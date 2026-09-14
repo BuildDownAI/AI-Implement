@@ -993,6 +993,43 @@ describe("probeWithTimeout", () => {
 
     expect(health).toEqual(fastHealth);
   });
+
+  it("clears the cap timer when the probe wins, so a healthy record is not overwritten 30 s later (PR #561 review)", async () => {
+    vi.useFakeTimers();
+    try {
+      sidecarHealth.reachable = true;
+      sidecarHealth.toolsListed = true;
+      sidecarHealth.lastError = null;
+      sidecarHealth.checkedAt = 1_700_000_000_000;
+      const fastHealth: SidecarHealth = { ...sidecarHealth };
+      const fastProvider = { probe: () => Promise.resolve(fastHealth) } as unknown as SidecarMemoryProvider;
+
+      await expect(probeWithTimeout(fastProvider, 30_000)).resolves.toEqual(fastHealth);
+      await vi.advanceTimersByTimeAsync(31_000);
+
+      expect(sidecarHealth).toEqual(fastHealth);
+      expect(isKgUnavailable()).toBe(false);
+    } finally {
+      vi.useRealTimers();
+      sidecarHealth.reachable = false;
+      sidecarHealth.toolsListed = false;
+      sidecarHealth.lastError = null;
+      sidecarHealth.checkedAt = null;
+    }
+  });
+
+  it("records a thrown probe as a failed probe instead of hanging", async () => {
+    const throwingProvider = { probe: () => Promise.reject(new Error("boom")) } as unknown as SidecarMemoryProvider;
+
+    const health = await probeWithTimeout(throwingProvider, 30_000);
+
+    expect(health.reachable).toBe(false);
+    expect(health.lastError).toContain("boom");
+    sidecarHealth.reachable = false;
+    sidecarHealth.toolsListed = false;
+    sidecarHealth.lastError = null;
+    sidecarHealth.checkedAt = null;
+  });
 });
 
 // ---- sidecarHealthFields (AII-650) ----

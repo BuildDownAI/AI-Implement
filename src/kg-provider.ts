@@ -599,21 +599,38 @@ export const BOOT_PROBE_TIMEOUT_MS = 30_000;
  * the cap wins. The real probe keeps running afterward and still updates the shared
  * `sidecarHealth` record whenever it eventually finishes — this only stamps a failure in the
  * meantime so a caller awaiting this doesn't hang.
+ *
+ * The timer is cleared as soon as the probe settles: a bare `Promise.race` would leave it armed,
+ * and 30 s after every healthy boot it would overwrite the good record with a fabricated timeout
+ * (caught by the PR #561 review).
  */
 export function probeWithTimeout(
   provider: SidecarMemoryProvider,
   timeoutMs: number = BOOT_PROBE_TIMEOUT_MS,
 ): Promise<SidecarHealth> {
-  return Promise.race([
-    provider.probe(),
-    new Promise<SidecarHealth>((resolve) => {
-      const timer = setTimeout(
-        () => resolve(recordSidecarHealth({ reachable: false, toolsListed: false, lastError: `KG sidecar probe timed out after ${timeoutMs}ms` })),
-        timeoutMs,
-      );
-      timer.unref();
-    }),
-  ]);
+  return new Promise<SidecarHealth>((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      resolve(recordSidecarHealth({ reachable: false, toolsListed: false, lastError: `KG sidecar probe timed out after ${timeoutMs}ms` }));
+    }, timeoutMs);
+    timer.unref();
+    provider.probe().then(
+      (health) => {
+        clearTimeout(timer);
+        if (settled) return;
+        settled = true;
+        resolve(health);
+      },
+      (err: unknown) => {
+        clearTimeout(timer);
+        if (settled) return;
+        settled = true;
+        resolve(recordSidecarHealth({ reachable: false, toolsListed: false, lastError: `KG sidecar probe threw: ${err instanceof Error ? err.message : String(err)}` }));
+      },
+    );
+  });
 }
 
 export class UnknownMemoryProviderError extends Error {
