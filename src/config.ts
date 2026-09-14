@@ -76,6 +76,38 @@ export interface RepoMapping {
   dependencyTokenScope: "installation" | null;
   /** Memory provider ID for this mapping. NULL means use the orchestrator default (sidecar). JSON-ready text column. */
   memoryProviderId: string | null;
+  /**
+   * Which reviewers run on this project's PRs. NULL means the default,
+   * and the default is not an empty list — see resolveReviewerSelection().
+   * An empty array is a distinct, deliberate choice to run no reviewers.
+   */
+  reviewers: ReviewerSelection[] | null;
+}
+
+/** Which reviewers run on this project's PRs, and which of them may hold a merge. */
+export interface ReviewerSelection {
+  /** Reviewer id. Built-ins are "gap-analysis" and "code-review". */
+  id: string;
+  /** false runs the reviewer and shows its findings without ever blocking a merge. */
+  gates: boolean;
+}
+
+/**
+ * The default reviewer selection used when a mapping's `reviewers` column is
+ * NULL. NULL means this default, never an empty list — resolving it to []
+ * would silently remove the review gate from every existing project on deploy.
+ */
+export const DEFAULT_REVIEWER_SELECTION: ReviewerSelection[] = [
+  { id: "gap-analysis", gates: true },
+  { id: "code-review", gates: true },
+];
+
+/**
+ * Resolves a mapping's stored reviewer selection, applying the NULL-means-default
+ * rule: NULL resolves to DEFAULT_REVIEWER_SELECTION, not an empty list.
+ */
+export function resolveReviewerSelection(mapping: Pick<RepoMapping, "reviewers">): ReviewerSelection[] {
+  return mapping.reviewers ?? DEFAULT_REVIEWER_SELECTION;
 }
 
 // Seed mappings are only applied on first run (empty DB).
@@ -171,6 +203,11 @@ function ensureMappingsColumns(): void {
   if (!names.has("memory_provider_id")) {
     db.exec(`ALTER TABLE mappings ADD COLUMN memory_provider_id TEXT`);
   }
+  if (!names.has("reviewers")) {
+    // NULL means the default selection (gap-analysis + code-review, both
+    // gating), not an empty list — see resolveReviewerSelection().
+    db.exec(`ALTER TABLE mappings ADD COLUMN reviewers TEXT`);
+  }
 }
 
 export function initMappingsTable(): void {
@@ -206,7 +243,10 @@ export function initMappingsTable(): void {
       sensitive_add_patterns TEXT,
       sensitive_allow_patterns TEXT,
       dependency_token_scope TEXT,
-      memory_provider_id TEXT
+      memory_provider_id TEXT,
+      -- NULL means the default selection (gap-analysis + code-review, both
+      -- gating), not an empty list — see resolveReviewerSelection().
+      reviewers TEXT
     )
   `);
   ensureMappingsColumns();
@@ -215,10 +255,10 @@ export function initMappingsTable(): void {
   const count = db.prepare("SELECT COUNT(*) as n FROM mappings").get() as { n: number };
   if (count.n === 0 && Object.keys(SEED_MAPPINGS).length > 0) {
     const insert = db.prepare(
-      "INSERT INTO mappings (team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, auto_merge, extra_env, provider, ticketing_provider, ticketing_config, aws_region, paused, max_turns, max_iterations, max_job_minutes, branch_prefix, skills_repo, reference_repos, sensitive_add_patterns, sensitive_allow_patterns, dependency_token_scope, memory_provider_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      "INSERT INTO mappings (team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, auto_merge, extra_env, provider, ticketing_provider, ticketing_config, aws_region, paused, max_turns, max_iterations, max_job_minutes, branch_prefix, skills_repo, reference_repos, sensitive_add_patterns, sensitive_allow_patterns, dependency_token_scope, memory_provider_id, reviewers) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     );
     for (const [key, m] of Object.entries(SEED_MAPPINGS)) {
-      insert.run(key, m.owner, m.repo, m.workflowFile, m.defaultBranch, m.maxInProgressAiIssues, m.executionMode, m.sessionMode, m.machineCpus, m.machineMemoryMb, m.planningEnabled ? 1 : 0, m.planningWorkflowFile, m.autoApprovePlans ? 1 : 0, m.autoMerge ? 1 : 0, Object.keys(m.extraEnv).length > 0 ? JSON.stringify(m.extraEnv) : null, m.provider, m.ticketingProvider, JSON.stringify(m.ticketingConfig), m.awsRegion, m.paused ? 1 : 0, m.maxTurns, m.maxIterations, m.maxJobMinutes, m.branchPrefix, m.skillsRepo, m.referenceRepos ? JSON.stringify(m.referenceRepos) : null, m.sensitiveAddPatterns ? JSON.stringify(m.sensitiveAddPatterns) : null, m.sensitiveAllowPatterns ? JSON.stringify(m.sensitiveAllowPatterns) : null, m.dependencyTokenScope, m.memoryProviderId);
+      insert.run(key, m.owner, m.repo, m.workflowFile, m.defaultBranch, m.maxInProgressAiIssues, m.executionMode, m.sessionMode, m.machineCpus, m.machineMemoryMb, m.planningEnabled ? 1 : 0, m.planningWorkflowFile, m.autoApprovePlans ? 1 : 0, m.autoMerge ? 1 : 0, Object.keys(m.extraEnv).length > 0 ? JSON.stringify(m.extraEnv) : null, m.provider, m.ticketingProvider, JSON.stringify(m.ticketingConfig), m.awsRegion, m.paused ? 1 : 0, m.maxTurns, m.maxIterations, m.maxJobMinutes, m.branchPrefix, m.skillsRepo, m.referenceRepos ? JSON.stringify(m.referenceRepos) : null, m.sensitiveAddPatterns ? JSON.stringify(m.sensitiveAddPatterns) : null, m.sensitiveAllowPatterns ? JSON.stringify(m.sensitiveAllowPatterns) : null, m.dependencyTokenScope, m.memoryProviderId, m.reviewers ? JSON.stringify(m.reviewers) : null);
     }
     console.log(`[config] Seeded ${Object.keys(SEED_MAPPINGS).length} default mappings`);
   }
@@ -227,7 +267,7 @@ export function initMappingsTable(): void {
 export function getMappings(): Record<string, RepoMapping> {
   const rows = getDb()
     .prepare(
-      "SELECT team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, auto_merge, extra_env, provider, ticketing_provider, ticketing_config, aws_region, paused, max_turns, max_iterations, max_job_minutes, branch_prefix, skills_repo, reference_repos, sensitive_add_patterns, sensitive_allow_patterns, dependency_token_scope, memory_provider_id FROM mappings",
+      "SELECT team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, auto_merge, extra_env, provider, ticketing_provider, ticketing_config, aws_region, paused, max_turns, max_iterations, max_job_minutes, branch_prefix, skills_repo, reference_repos, sensitive_add_patterns, sensitive_allow_patterns, dependency_token_scope, memory_provider_id, reviewers FROM mappings",
     )
     .all() as Array<{
       team_key: string;
@@ -260,6 +300,7 @@ export function getMappings(): Record<string, RepoMapping> {
       sensitive_allow_patterns: string | null;
       dependency_token_scope: string | null;
       memory_provider_id: string | null;
+      reviewers: string | null;
     }>;
 
   const result: Record<string, RepoMapping> = {};
@@ -304,6 +345,7 @@ export function getMappings(): Record<string, RepoMapping> {
       sensitiveAllowPatterns: (() => { try { return row.sensitive_allow_patterns ? JSON.parse(row.sensitive_allow_patterns) as string[] : null; } catch { return null; } })(),
       dependencyTokenScope: row.dependency_token_scope as "installation" | null,
       memoryProviderId: row.memory_provider_id ?? null,
+      reviewers: (() => { try { return row.reviewers ? JSON.parse(row.reviewers) as ReviewerSelection[] : null; } catch { return null; } })(),
     };
   }
   return result;
@@ -312,7 +354,7 @@ export function getMappings(): Record<string, RepoMapping> {
 export function upsertMapping(teamKey: string, mapping: RepoMapping): void {
   getDb()
     .prepare(
-      "INSERT OR REPLACE INTO mappings (team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, auto_merge, extra_env, provider, ticketing_provider, ticketing_config, aws_region, paused, max_turns, max_iterations, max_job_minutes, branch_prefix, skills_repo, reference_repos, sensitive_add_patterns, sensitive_allow_patterns, dependency_token_scope, memory_provider_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      "INSERT OR REPLACE INTO mappings (team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, auto_merge, extra_env, provider, ticketing_provider, ticketing_config, aws_region, paused, max_turns, max_iterations, max_job_minutes, branch_prefix, skills_repo, reference_repos, sensitive_add_patterns, sensitive_allow_patterns, dependency_token_scope, memory_provider_id, reviewers) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
     .run(
       teamKey,
@@ -345,6 +387,7 @@ export function upsertMapping(teamKey: string, mapping: RepoMapping): void {
       mapping.sensitiveAllowPatterns ? JSON.stringify(mapping.sensitiveAllowPatterns) : null,
       mapping.dependencyTokenScope,
       mapping.memoryProviderId,
+      mapping.reviewers ? JSON.stringify(mapping.reviewers) : null,
     );
 }
 

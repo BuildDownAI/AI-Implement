@@ -21,7 +21,7 @@ import {
   setMappingPaused,
   deleteMapping,
 } from "./config.js";
-import type { RepoMapping, ExecutionMode, SessionMode, ClaudeProvider } from "./config.js";
+import type { RepoMapping, ExecutionMode, SessionMode, ClaudeProvider, ReviewerSelection } from "./config.js";
 import {
   getRunnerMode,
   setRunnerMode,
@@ -123,6 +123,32 @@ function normalizeSensitiveGlobs(raw: unknown): string[] | null {
     }
   }
   return globs;
+}
+
+function normalizeReviewers(raw: unknown): ReviewerSelection[] {
+  if (!Array.isArray(raw)) {
+    throw new Error("reviewers must be an array");
+  }
+  const seen = new Set<string>();
+  const result: ReviewerSelection[] = [];
+  raw.forEach((entry, index) => {
+    if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+      throw new Error(`reviewers[${index}] must be an object with "id" and "gates"`);
+    }
+    const { id, gates } = entry as { id?: unknown; gates?: unknown };
+    if (typeof id !== "string" || id.length === 0) {
+      throw new Error(`reviewers[${index}].id must be a non-empty string`);
+    }
+    if (typeof gates !== "boolean") {
+      throw new Error(`reviewers[${index}] ("${id}").gates must be a boolean`);
+    }
+    if (seen.has(id)) {
+      throw new Error(`reviewers contains duplicate id "${id}"`);
+    }
+    seen.add(id);
+    result.push({ id, gates });
+  });
+  return result;
 }
 
 let _adminJiraClient: JiraClient | null = null;
@@ -2091,6 +2117,7 @@ export interface UpsertMappingBody {
   sensitiveAddPatterns?: string | string[] | null;
   sensitiveAllowPatterns?: string | string[] | null;
   dependencyTokenScope?: string | null;
+  reviewers?: unknown;
 }
 
 export function upsertMappingAction(
@@ -2253,6 +2280,18 @@ export function upsertMappingAction(
     return { status: 400, body: { error: `dependencyTokenScope invalid: must be null or "installation"` } };
   }
 
+  let reviewers: ReviewerSelection[] | null;
+  if (body.reviewers === undefined) {
+    // Preserve stored value on omit — a PATCH-style save must not silently strip a project's reviewer list.
+    reviewers = existingMapping?.reviewers ?? null;
+  } else {
+    try {
+      reviewers = normalizeReviewers(body.reviewers);
+    } catch (err) {
+      return { status: 400, body: { error: `reviewers invalid: ${err instanceof Error ? err.message : String(err)}` } };
+    }
+  }
+
   const mapping: RepoMapping = {
     owner: body.owner,
     repo: body.repo,
@@ -2287,6 +2326,7 @@ export function upsertMappingAction(
     sensitiveAllowPatterns,
     dependencyTokenScope,
     memoryProviderId: existingMapping?.memoryProviderId ?? null,
+    reviewers,
   };
 
   upsertMapping(body.teamKey, mapping);
