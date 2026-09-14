@@ -85,12 +85,14 @@ export const projectsHtml = `
               <select class="select" id="md-ticketing-provider" onchange="onTicketingProviderChange()">
                 <option value="linear">Linear</option>
                 <option value="jira">Jira</option>
+                <option value="filesystem">Filesystem / local</option>
               </select>
+              <div class="field-hint">Filesystem tickets are Markdown files on this machine. They run real GitHub PRs through local Docker and require RUNNER_MODE=local.</div>
             </div>
             <div class="field">
-              <label class="field-label">Team Key</label>
+              <label class="field-label">Mapping Key</label>
               <input class="input mono" id="md-team-key" placeholder="MY_TEAM">
-              <div class="field-hint">The tracker team this mapping serves, e.g. ENG. Cannot be changed after creation.</div>
+              <div class="field-hint">Identifies this project independently of its ticket directory. Cannot be changed after creation.</div>
             </div>
           </div>
           <div id="md-jira-fields" class="hidden" style="display:grid;gap:12px">
@@ -141,6 +143,20 @@ export const projectsHtml = `
                 <option value="">Select a Repo Field first</option>
               </select>
               <input class="input mono hidden" id="md-jira-repo-value-text" type="text" placeholder="owner/repo">
+            </div>
+          </div>
+          <div id="md-filesystem-fields" class="hidden" style="display:grid;gap:12px">
+            <div class="field">
+              <label class="field-label">Ticket Directory</label>
+              <input class="input mono" id="md-filesystem-directory" placeholder="/private/tmp/filesystem-local-tickets">
+              <div class="field-hint">Absolute host path containing Markdown tickets. The orchestrator writes local state there, while implementation still opens real GitHub PRs for review iteration.</div>
+            </div>
+            <div class="alert info">
+              <div class="alert-icon">&#8505;</div>
+              <div>
+                <div class="alert-title">Local Docker execution</div>
+                <div class="alert-desc">Use this with <span class="mono">RUNNER_MODE=local</span>. Local mode sends these tickets through the local Docker runner and the normal GitHub PR review loop.</div>
+              </div>
             </div>
           </div>
         </div>
@@ -226,6 +242,13 @@ export const projectsHtml = `
         <h3 style="font-size:13px;font-weight:600;margin:0 0 4px">Execution</h3>
         <p style="font-size:12px;color:var(--fg-tertiary);margin:0 0 18px">Where runs execute, and what the runner process receives.</p>
         <div style="display:grid;gap:12px">
+          <div id="md-local-docker-note" class="alert info hidden">
+            <div class="alert-icon">&#8505;</div>
+            <div>
+              <div class="alert-title">Filesystem tickets use local Docker</div>
+              <div class="alert-desc">With <span class="mono">RUNNER_MODE=local</span>, this project runs in the local Docker runner and still opens real GitHub PRs for review iteration. No Fly credentials are needed for this path.</div>
+            </div>
+          </div>
           <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
             <div class="field">
               <label class="field-label">Mode</label>
@@ -731,10 +754,13 @@ export const projectsScript = `
 
     // Ticketing provider + Jira config
     const tp = m.ticketingProvider || 'linear';
-    document.getElementById('md-ticketing-provider').value = tp;
+    const ticketingProviderEl = document.getElementById('md-ticketing-provider');
+    ticketingProviderEl.value = tp;
+    ticketingProviderEl.dataset.openedProvider = tp;
     const tc = (m.ticketingConfig && typeof m.ticketingConfig === 'object') ? m.ticketingConfig : {};
     document.getElementById('md-jira-mapping-id').value = (tp === 'jira' && tc.kind === 'jira') ? (key || '') : '';
     document.getElementById('md-jira-jql').value = (tp === 'jira' && tc.kind === 'jira' && tc.jql) ? tc.jql : '';
+    document.getElementById('md-filesystem-directory').value = (tp === 'filesystem' && tc.kind === 'filesystem' && tc.directory) ? tc.directory : '';
     const pendingStatus = (tp === 'jira' && tc.statusFieldOverride) ? tc.statusFieldOverride : '';
     const pendingRepoFld = (tp === 'jira' && tc.repoFieldOverride) ? tc.repoFieldOverride : '';
     const pendingProfilesFld = (tp === 'jira' && tc.profilesFieldOverride) ? tc.profilesFieldOverride : '';
@@ -835,14 +861,30 @@ export const projectsScript = `
   window.onPlanningChange = onPlanningChange;
 
   function onTicketingProviderChange() {
-    const provider = document.getElementById('md-ticketing-provider').value;
+    const providerEl = document.getElementById('md-ticketing-provider');
+    const provider = providerEl.value;
     const jiraFields = document.getElementById('md-jira-fields');
+    const filesystemFields = document.getElementById('md-filesystem-fields');
+    const localDockerNote = document.getElementById('md-local-docker-note');
     if (provider === 'jira') {
       jiraFields.classList.remove('hidden');
+      filesystemFields.classList.add('hidden');
+      localDockerNote.classList.add('hidden');
       loadJiraFields();
       preloadRepoFieldOptions();
+    } else if (provider === 'filesystem') {
+      jiraFields.classList.add('hidden');
+      filesystemFields.classList.remove('hidden');
+      localDockerNote.classList.remove('hidden');
+      if (providerEl.dataset.openedProvider !== 'filesystem') {
+        document.getElementById('md-exec-mode').value = 'github-actions';
+        document.getElementById('md-session-mode').value = 'autonomous';
+        onExecModeChange();
+      }
     } else {
       jiraFields.classList.add('hidden');
+      filesystemFields.classList.add('hidden');
+      localDockerNote.classList.add('hidden');
     }
   }
   window.onTicketingProviderChange = onTicketingProviderChange;
@@ -1070,7 +1112,7 @@ export const projectsScript = `
 
     const origKey = document.getElementById('md-team-key-orig').value;
     const isNew = !origKey;
-    const teamKey = isNew ? document.getElementById('md-team-key').value.trim() : origKey;
+    let teamKey = isNew ? document.getElementById('md-team-key').value.trim() : origKey;
     const defaultBranch = document.getElementById('md-branch').value.trim();
     if (!defaultBranch) {
       showMappingError('Default Branch is required.', 'source');
@@ -1145,11 +1187,29 @@ export const projectsScript = `
         profilesFieldOverride: profilesFieldOverride,
         baseBranchFieldOverride: baseBranchFieldOverride,
       };
+    } else if (ticketingProvider === 'filesystem') {
+      const directory = document.getElementById('md-filesystem-directory').value.trim();
+      body.ticketingConfig = { kind: 'filesystem', directory: directory };
+      if (isNew && !teamKey) {
+        teamKey = 'filesystem_' + body.owner + '_' + body.repo;
+        body.teamKey = teamKey;
+      }
     }
 
     if (!body.teamKey) {
-      showMappingError('Team Key is required.', 'ticketing');
+      showMappingError('Mapping Key is required.', 'ticketing');
       return;
+    }
+    if (ticketingProvider === 'filesystem') {
+      const directory = body.ticketingConfig && body.ticketingConfig.directory ? body.ticketingConfig.directory : '';
+      if (!directory) {
+        showMappingError('Ticket Directory is required for filesystem ticketing.', 'ticketing');
+        return;
+      }
+      if (directory.charAt(0) !== '/') {
+        showMappingError('Ticket Directory must be an absolute path.', 'ticketing');
+        return;
+      }
     }
     if (!body.owner || !body.repo) {
       showMappingError('Owner and Repo are required.', 'source');

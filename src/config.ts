@@ -48,7 +48,7 @@ export interface RepoMapping {
   extraEnv: Record<string, string>;
   /** Claude provider used by the dispatched workflow. Default 'anthropic'. */
   provider: ClaudeProvider;
-  /** Ticketing provider this mapping uses (Linear or Jira). Default 'linear'. */
+  /** Ticketing provider this mapping uses. Filesystem is available in local runner mode. Default 'linear'. */
   ticketingProvider: ProviderId;
   /** Per-mapping ticketing config (Linear is trivial; Jira carries jql, repoFieldValue, optional overrides). */
   ticketingConfig: TicketingMappingConfig;

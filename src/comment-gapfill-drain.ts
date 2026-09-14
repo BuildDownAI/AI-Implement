@@ -9,6 +9,7 @@ import { encodeRunConfig, type RunConfigV1 } from "./run-config.js";
 import { getRetryPolicy } from "./orchestrator-settings.js";
 import { createMachine, listAppSecrets, generateSessionToken, generateMachineNonce, buildSessionMachineConfig } from "./fly-machines.js";
 import { resolveSessionImage } from "./repo-image.js";
+import { dispatchLocalGapfill } from "./local-gapfill.js";
 import type { WorkflowCapabilities, WorkflowContract } from "./workflow-probe.js";
 
 type ContractProbeResult = WorkflowContract | WorkflowCapabilities;
@@ -35,6 +36,8 @@ export interface DrainCommentGapfillsInput {
   anthropicApiKey: string | null;
   claudeOAuthToken: string | null;
   sessionImage: string;
+  localRunnerImage?: string;
+  localRunnerOrchestratorUrl?: string | null;
 }
 
 /** Grouping branch → the feature-node parent's identifier slug, or null for any other
@@ -96,20 +99,12 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
     try {
       const fullRepo = `${item.owner}/${item.repo}`;
 
-      const mappingEntry = Object.entries(teamRepoMap).find(
+      const repoMappingEntries = Object.entries(teamRepoMap).filter(
         ([, mapping]) => `${mapping.owner}/${mapping.repo}` === fullRepo,
       );
 
-      if (!mappingEntry) {
+      if (repoMappingEntries.length === 0) {
         console.warn(`[comment-gapfill] No mapping found for repo ${fullRepo}, skipping item #${item.id}`);
-        markCommentGapfillProcessed(item.id, "skipped");
-        continue;
-      }
-
-      const [scopeKey, mapping] = mappingEntry;
-
-      if (mapping.paused) {
-        console.log(`[comment-gapfill] Project ${fullRepo} is paused, skipping item #${item.id}`);
         markCommentGapfillProcessed(item.id, "skipped");
         continue;
       }
@@ -134,13 +129,29 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
         continue;
       }
 
+      const mappingEntry = repoMappingEntries.find(([key]) => key === prLog.teamKey)
+        ?? (!prLog.teamKey && repoMappingEntries.length === 1 ? repoMappingEntries[0] : undefined);
+      if (!mappingEntry) {
+        console.warn(`[comment-gapfill] PR #${item.prNumber} in ${fullRepo} belongs to mapping ${prLog.teamKey}, but no matching mapping exists`);
+        markCommentGapfillProcessed(item.id, "failed");
+        continue;
+      }
+
+      const [scopeKey, mapping] = mappingEntry;
+
+      if (mapping.paused) {
+        console.log(`[comment-gapfill] Project ${fullRepo} is paused, skipping item #${item.id}`);
+        markCommentGapfillProcessed(item.id, "skipped");
+        continue;
+      }
+
+      if (mapping.ticketingProvider === "filesystem" && opts.runnerMode !== "local") {
+        console.warn(`[comment-gapfill] Filesystem mapping ${scopeKey} requires RUNNER_MODE=local; skipping item #${item.id}`);
+        markCommentGapfillProcessed(item.id, "skipped");
+        continue;
+      }
+
       const execPath = resolveExecutionPath(opts.runnerMode, mapping.executionMode);
-      // NOTE (AII-264 r3, documented asymmetry): this drain implements fly-machines and
-      // github-actions only — a resolved "local-docker" path falls through to the GHA
-      // branch below. Recovery/comment gap-fills on a local-docker mapping therefore
-      // dispatch via GitHub Actions. Deliberate: gap-fills target an existing remote PR
-      // branch, which the GHA runner reaches identically; a local-docker gap-fill path
-      // would add a third dispatch surface for no behavioral difference.
 
       let runnerCallbackUrl = "";
       let runToken = "";
@@ -179,7 +190,57 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
         description: prLog.issueTitle ?? prLog.issueId,
       };
 
-      if (execPath === "fly-machines") {
+      if (execPath === "local-docker") {
+        if (mapping.provider === "bedrock") {
+          console.error(`[comment-gapfill] Cannot dispatch ${gapFillIssue.identifier} via local Docker: provider=bedrock not supported`);
+          markCommentGapfillProcessed(item.id, "failed");
+          continue;
+        }
+        if (!opts.anthropicApiKey && !opts.claudeOAuthToken) {
+          console.error(`[comment-gapfill] Cannot dispatch ${gapFillIssue.identifier} via local Docker: no API key configured`);
+          markCommentGapfillProcessed(item.id, "failed");
+          continue;
+        }
+
+        const local = await dispatchLocalGapfill({
+          mapping,
+          issue: gapFillIssue,
+          prNumber: item.prNumber,
+          githubToken: ghToken,
+          image: opts.localRunnerImage ?? "ai-implement-runner:local",
+          anthropicApiKey: opts.anthropicApiKey ?? undefined,
+          claudeOAuthToken: opts.claudeOAuthToken ?? undefined,
+          orchestratorUrl: opts.localRunnerOrchestratorUrl ?? opts.runnerCallbackBaseUrl ?? "",
+          runnerCallbackUrl: runnerCallbackUrl || undefined,
+          runToken: runToken || undefined,
+          runProgressToken: runProgressToken || undefined,
+          commentInstruction: item.instruction || undefined,
+          retryPolicy: getRetryPolicy(),
+        });
+
+        const prior = countPriorDispatches(prLog.issueId, "gap-analysis");
+        const jobId = appendLog({
+          issueId: prLog.issueId,
+          issueIdentifier: prLog.issueIdentifier ?? undefined,
+          issueTitle: prLog.issueTitle ?? undefined,
+          teamKey: scopeKey,
+          repo: fullRepo,
+          dispatchId,
+          dispatchNumber: prior.count + 1,
+          executionMode: "local-docker",
+          machineNonce: local.machineNonce,
+          machineId: local.containerId,
+          runnerMode: opts.runnerMode,
+          sessionImage: opts.localRunnerImage,
+          phase: "gap-analysis",
+          trigger: "comment",
+        });
+        updateJobPrUrl(jobId, `https://github.com/${fullRepo}/pull/${item.prNumber}`);
+        suppressStaleNotifications(prLog.issueId, jobId);
+        markCommentGapfillProcessed(item.id, "dispatched");
+        console.log(`[comment-gapfill] Dispatched gap-fill for ${gapFillIssue.identifier} (PR #${item.prNumber} in ${fullRepo}, local-docker, container: ${local.containerId}, image: ${opts.localRunnerImage})`);
+
+      } else if (execPath === "fly-machines") {
         if (!opts.flySessionsToken || !opts.flySessionsApp) {
           console.error(`[comment-gapfill] Cannot dispatch ${gapFillIssue.identifier} via Fly Machines: FLY_SESSIONS_TOKEN or FLY_SESSIONS_APP not set`);
           markCommentGapfillProcessed(item.id, "failed");

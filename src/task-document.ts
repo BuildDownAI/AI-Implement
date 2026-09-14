@@ -64,7 +64,7 @@ const SCHEMA_EXAMPLE = [
  * The Markdown body becomes issue.description. Repository paths, credentials,
  * publication settings, and queue-dependency fields are explicitly rejected.
  */
-export function parseTaskDocument(content: string, issueId?: string): RunConfigV1 {
+export function parseTaskDocument(content: string, issueId?: string, fallbackIdentifier?: string): RunConfigV1 {
   const match = FRONT_MATTER_RE.exec(content);
   if (!match) {
     throw new Error(
@@ -182,7 +182,7 @@ export function parseTaskDocument(content: string, issueId?: string): RunConfigV
     {
       title: fm.title.trim(),
       description: body.trim(),
-      identifier: typeof fm.id === "string" ? fm.id.trim() : undefined,
+      identifier: typeof fm.id === "string" ? fm.id.trim() : fallbackIdentifier,
       baseBranch: typeof fm.base === "string" ? fm.base.trim() : undefined,
       profiles: trimmedProfiles,
       maxTurns,

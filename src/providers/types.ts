@@ -54,6 +54,9 @@ export interface TicketIssue {
   /** Assignee display name, used to attribute the opened PR's title. Jira-only; absent for
    *  Linear issues and for Jira issues with no assignee set. */
   assigneeName?: string;
+  /** Optional per-ticket run limits, supplied by filesystem task documents. */
+  maxTurns?: number;
+  maxIterations?: number;
 }
 
 export interface AIImplementSnapshot {

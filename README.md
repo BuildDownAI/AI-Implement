@@ -188,7 +188,7 @@ in the target checkout so you stay in control of what ships.
 
 ## Run the full orchestrator locally
 
-You'll need a Linear workspace or Jira project, a GitHub App you control, and an Anthropic API key (or AWS Bedrock access).
+You'll need a GitHub App you control and a model credential. Tickets can come from Linear, Jira, or a local directory of Markdown files when using local Docker runners.
 
 ```bash
 git clone https://github.com/BuildDownAI/AI-Implement.git
@@ -210,6 +210,16 @@ npm run dev:local          # rebuilds the runner image, then starts RUNNER_MODE=
 ```
 
 Docker must be running. Local mode still opens real GitHub PRs; it just avoids deploying the orchestrator or publishing a runner image while you test changes.
+
+### Local tickets with real pull requests
+
+Use **Filesystem** as the project's ticketing provider to run Markdown tickets
+through the orchestrator, including planning, PR creation, review, and follow-up
+iterations. No Linear or Jira credentials are needed. Unlike `dev:run`, this mode
+clones the GitHub repository into a runner container and publishes real PRs.
+
+See [Filesystem tickets](docs/filesystem-tickets.md) for setup, the task format,
+persisted ticket status, and testing the PR iteration loop.
 
 ### Getting an admin token
 

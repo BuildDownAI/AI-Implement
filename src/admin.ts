@@ -321,14 +321,17 @@ function shapeIssue(i: TicketIssue, bucket: "ready" | "needs-planning") {
 }
 
 interface ValidatedTicketing {
-  ticketingProvider: "linear" | "jira";
+  ticketingProvider: "linear" | "jira" | "filesystem";
   ticketingConfig: TicketingMappingConfig;
 }
 
 function validateTicketingMapping(body: { ticketingProvider?: unknown; ticketingConfig?: unknown }): ValidatedTicketing {
   const provider = body.ticketingProvider ?? "linear";
-  if (provider !== "linear" && provider !== "jira") {
-    throw new Error(`Invalid ticketingProvider: expected "linear" or "jira", got ${JSON.stringify(provider)}`);
+  if (provider !== "linear" && provider !== "jira" && provider !== "filesystem") {
+    throw new Error(`Invalid ticketingProvider: expected "linear", "jira", or "filesystem", got ${JSON.stringify(provider)}`);
+  }
+  if (provider === "filesystem" && getRunnerMode().mode !== "local") {
+    throw new Error("Filesystem tickets require local runner mode (RUNNER_MODE=local)");
   }
   const config = validateTicketingConfig(provider, body.ticketingConfig ?? null);
   if (config.kind === "jira") {
@@ -2208,6 +2211,14 @@ export function upsertMappingAction(
     ticketing = validateTicketingMapping(body);
   } catch (err) {
     return { status: 400, body: { error: err instanceof Error ? err.message : String(err) } };
+  }
+
+  if (ticketing.ticketingProvider === "filesystem" && provider !== "anthropic") {
+    return { status: 400, body: { error: "Filesystem tickets use local Docker, which requires provider 'anthropic'" } };
+  }
+  if (ticketing.ticketingProvider === "filesystem" &&
+      (!/^[A-Za-z0-9_.-]+$/.test(body.teamKey) || body.teamKey === "." || body.teamKey === "..")) {
+    return { status: 400, body: { error: "Filesystem project key must contain only letters, digits, underscores, dots, or hyphens" } };
   }
 
   const resolveCap = (

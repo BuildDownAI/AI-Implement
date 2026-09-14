@@ -1,6 +1,7 @@
 import { resolveModuleImport } from "../pipeline/resolve-module.js";
 import { LinearProvider } from "./linear.js";
 import { createJiraProviderFromConfig } from "./jira.js";
+import { FilesystemProvider } from "./filesystem.js";
 import type { RepoMapping } from "../config.js";
 import {
   type ProviderConfig,
@@ -22,6 +23,12 @@ const BUILT_IN: Record<string, (config: ProviderConfig, opts: ResolveOptions) =>
       throw new Error("resolveProvider for Jira requires opts.getMappings");
     }
     return createJiraProviderFromConfig(config, opts.getMappings);
+  },
+  filesystem: (_config, opts) => {
+    if (!opts.getMappings) {
+      throw new Error("resolveProvider for filesystem requires opts.getMappings");
+    }
+    return new FilesystemProvider(opts.getMappings);
   },
 };
 

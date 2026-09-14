@@ -901,6 +901,49 @@ describe("admin mappings", () => {
     });
   });
 
+  it("persists filesystem project settings and reviewer selection in local mode", async () => {
+    const previousMode = process.env.RUNNER_MODE;
+    process.env.RUNNER_MODE = "local";
+    try {
+      const token = await login("secret");
+      const reviewers = [{ id: "code-review", gates: true }];
+      const create = await request("/api/mappings", "POST", "secret", {
+        teamKey: "LOCAL", owner: "org", repo: "test-app",
+        ticketingProvider: "filesystem",
+        ticketingConfig: { kind: "filesystem", directory: "/tmp/local-tickets" },
+        reviewers,
+      }, token);
+      expect(create.statusCode).toBe(202);
+      const list = await request("/api/mappings", "GET", "secret", undefined, token);
+      expect(JSON.parse(list.body).LOCAL).toMatchObject({
+        ticketingProvider: "filesystem",
+        ticketingConfig: { kind: "filesystem", directory: "/tmp/local-tickets" },
+        reviewers,
+      });
+    } finally {
+      if (previousMode === undefined) delete process.env.RUNNER_MODE;
+      else process.env.RUNNER_MODE = previousMode;
+    }
+  });
+
+  it("rejects filesystem projects on a managed runner", async () => {
+    const previousMode = process.env.RUNNER_MODE;
+    process.env.RUNNER_MODE = "gha";
+    try {
+      const token = await login("secret");
+      const response = await request("/api/mappings", "POST", "secret", {
+        teamKey: "LOCAL", owner: "org", repo: "test-app",
+        ticketingProvider: "filesystem",
+        ticketingConfig: { kind: "filesystem", directory: "/tmp/local-tickets" },
+      }, token);
+      expect(response.statusCode).toBe(400);
+      expect(JSON.parse(response.body).error).toMatch(/local runner mode/);
+    } finally {
+      if (previousMode === undefined) delete process.env.RUNNER_MODE;
+      else process.env.RUNNER_MODE = previousMode;
+    }
+  });
+
   it("upsertMapping rejects Jira ticketingProvider with linear ticketingConfig", async () => {
     const token = await login("secret");
     const res = await request("/api/mappings", "POST", "secret", {
