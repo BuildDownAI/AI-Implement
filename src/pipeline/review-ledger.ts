@@ -28,6 +28,13 @@ export interface GhResult {
 
 export type GhSpawn = (args: string[]) => GhResult;
 
+export interface ExternalReviewFindingsResult {
+  findings: ReviewLedgerFinding[];
+  findingsUnavailable: boolean;
+  verdict?: ReviewFindingsVerdict;
+  verdictSource?: ReviewLedgerSource;
+}
+
 const TRUSTED_REVIEW_COMMENT_AUTHORS = new Set([
   "ai-implement",
   "ai-implement[bot]",
@@ -38,12 +45,9 @@ const TRUSTED_REVIEW_COMMENT_AUTHORS = new Set([
 
 const GITHUB_ACTIONS_REVIEW_AUTHOR = "github-actions";
 
-export function collectExternalReviewFindingsFromGh(ghSpawn: GhSpawn, prNumber: string): { findings: ReviewLedgerFinding[]; findingsUnavailable: boolean } {
+export function collectExternalReviewFindingsFromGh(ghSpawn: GhSpawn, prNumber: string): ExternalReviewFindingsResult {
   const findings: ReviewLedgerFinding[] = [];
-  // `verdict` is captured for a later issue that will derive gating from it; nothing
-  // downstream of this function reads it yet, so it is deliberately not part of the
-  // public return shape below.
-  const out: { findingsUnavailable: boolean; verdict?: ReviewFindingsVerdict } = { findingsUnavailable: false };
+  const out: { findingsUnavailable: boolean; verdict?: ReviewFindingsVerdict; verdictSource?: ReviewLedgerSource } = { findingsUnavailable: false };
 
   // A reviewer's latest formal verdict is authoritative: only reviewers currently in
   // CHANGES_REQUESTED state contribute blocking inline threads. Leftover nit threads from
@@ -52,7 +56,12 @@ export function collectExternalReviewFindingsFromGh(ghSpawn: GhSpawn, prNumber: 
   collectClaudeIssueComments(ghSpawn, prNumber, findings, out);
   collectUnresolvedReviewThreads(ghSpawn, prNumber, findings, blockingReviewerLogins);
 
-  return { findings: dedupeReviewFindings(findings), findingsUnavailable: out.findingsUnavailable };
+  return {
+    findings: dedupeReviewFindings(findings),
+    findingsUnavailable: out.findingsUnavailable,
+    ...(out.verdict !== undefined ? { verdict: out.verdict } : {}),
+    ...(out.verdictSource !== undefined ? { verdictSource: out.verdictSource } : {}),
+  };
 }
 
 /** Normalizes a GitHub login so REST (`claude[bot]`) and GraphQL (`claude`) forms compare equal. */
@@ -605,7 +614,7 @@ function collectClaudeIssueComments(
   ghSpawn: GhSpawn,
   prNumber: string,
   findings: ReviewLedgerFinding[],
-  out: { findingsUnavailable: boolean; verdict?: ReviewFindingsVerdict },
+  out: { findingsUnavailable: boolean; verdict?: ReviewFindingsVerdict; verdictSource?: ReviewLedgerSource },
 ): void {
   const result = safeGhSpawn(ghSpawn, [
     "api",
@@ -637,7 +646,10 @@ function collectClaudeIssueComments(
       if (result !== null) {
         findings.push(...result.findings);
         if (result.findingsUnavailable) out.findingsUnavailable = true;
-        if (result.verdict !== undefined) out.verdict = result.verdict;
+        if (result.verdict !== undefined) {
+          out.verdict = result.verdict;
+          out.verdictSource = "review-contract";
+        }
         return;
       }
     }

@@ -51,11 +51,23 @@ Collection additionally dedupes in memory by normalized body before anything is 
 
 The queue's one-row-per-PR grain is deliberate. Enqueuing coalesces: a second event for a PR already queued updates the existing row rather than adding another, and if the new reason differs from the stored one the reason becomes `multiple`. Three reviewers commenting in quick succession produce one fix run, not three. The `review_fix_events` table is what preserves the individual triggers, since the queue row itself is overwritten.
 
-## Severity, and why an inline comment does not block
+## Source, severity, and why an inline comment does not block
 
 Severity is `blocking`, `medium`, or `minor`, and the rule for deciding it is the subtlest part of the rail.
 
-**A reviewer's latest formal verdict is authoritative.** Only reviewers whose most recent actionable review is `CHANGES_REQUESTED` contribute blocking findings. Unresolved inline threads authored by someone who has since approved are recorded as `medium` — non-blocking context. Without that rule, a stale nit thread from an approving reviewer would keep the PR blocked forever.
+Merge gating is source-based, not severity-based:
+
+| Source | Gates a merge? |
+|---|---|
+| `review-contract` | Yes |
+| `github-review` | Yes |
+| `github-review-thread` | Yes, when collected from a reviewer whose latest formal verdict is `CHANGES_REQUESTED` |
+| `ai-implement-internal` | Yes |
+| `claude-review-summary` | No by default — advisory only, unless the project reviewer selection includes `{ id: "claude-review-summary", gates: true }` |
+
+A `minor` `review-contract` finding gates because it came from the structured contract. A `blocking` `claude-review-summary` finding is advisory by default because it came from scraped prose. PR comments split those lists: gating findings stay under "Unresolved external review findings", while prose-only findings are shown under an advisory heading that says they do not block the merge.
+
+**A reviewer's latest formal verdict is authoritative.** Only reviewers whose most recent actionable review is `CHANGES_REQUESTED` contribute blocking findings. Unresolved inline threads authored by someone who has since approved are recorded as `medium` advisory context unless their reviewer still has a changes-requested verdict. Without that rule, a stale nit thread from an approving reviewer would keep the PR blocked forever.
 
 The `pull_request_review_comment` webhook records `medium` for the same reason from the other direction: that event carries no parent review state, so an inline comment alone cannot be assumed to block. A genuine changes-requested verdict arrives separately via `pull_request_review` and records the blocking finding itself.
 
@@ -88,7 +100,7 @@ The contract is a fenced code block, not an HTML comment — `anthropics/claude-
 ```
 ````
 
-`schema` and `verdict` are required; `findings` defaults to `[]`. In a finding, `body` is required, `path` and `line` are optional. `schema` must be exactly `review-findings/v1` — any other value (including a plausible-looking future version) is rejected rather than parsed as v1, so a field whose meaning changes between versions is never read under today's semantics. Every finding from this parser is tagged `source: "review-contract"`; `ReviewLedgerFinding` gets no new field for it — a later change derives gating from `source` alone.
+`schema` and `verdict` are required; `findings` defaults to `[]`. In a finding, `body` is required, `path` and `line` are optional. `schema` must be exactly `review-findings/v1` — any other value (including a plausible-looking future version) is rejected rather than parsed as v1, so a field whose meaning changes between versions is never read under today's semantics. Every finding from this parser is tagged `source: "review-contract"`; `ReviewLedgerFinding` gets no new field for it. The collector returns the parsed `verdict` with `verdictSource: "review-contract"` so post-push review can fail closed on a structured non-approve verdict even when the block has no findings.
 
 Every state the parser can be in, and its result:
 
@@ -106,7 +118,7 @@ A broken block, including an opened `review-findings` fence with no closing fenc
 
 The trust boundary is unchanged: only a comment from an already-trusted Claude author or the GitHub Actions bot (`isVerdictEligibleAuthor`) is even offered to this parser, so a lookalike block from another bot or a human commenter cannot supersede a real review.
 
-**Migration overlap.** For one release, a comment with no fenced block falls back to scanning for the deprecated `<!-- claude-review-verdict {...} -->` marker, so a reviewer mid-migration is not silently dropped. The first comment seen using that legacy form logs a one-time deprecation warning (a module-level flag, not per-comment). The parsed `verdict` from the fenced-block path is threaded up to `collectClaudeIssueComments`'s internal state but not (yet) exposed from `collectExternalReviewFindingsFromGh`'s public return shape or read by `post-push-review.ts` — a later change wires gating off it.
+**Migration overlap.** For one release, a comment with no fenced block falls back to scanning for the deprecated `<!-- claude-review-verdict {...} -->` marker, so a reviewer mid-migration is not silently dropped. The first comment seen using that legacy form logs a one-time deprecation warning (a module-level flag, not per-comment). Legacy marker findings keep their old `claude-review-summary` source and are advisory by default.
 
 ## In-run: the post-push-review step
 
