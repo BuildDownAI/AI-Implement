@@ -1,4 +1,7 @@
 import { resolveModuleImport, type ImportModuleOptions } from "../resolve-module.js";
+import codeReviewReviewer from "./code-review.js";
+import gapAnalysisReviewer from "./gap-analysis.js";
+export { REVIEWER_VERDICT_SCHEMA } from "./schema.js";
 
 export type ReviewerFindingSeverity = "blocking" | "medium" | "minor";
 
@@ -53,12 +56,11 @@ export interface ReviewerDefinition {
   maxTurns?: number;
 }
 
-/**
- * Built-in reviewers, keyed by id. Empty until a later issue registers the
- * default reviewer(s) — this issue only creates the type and the resolution
- * path.
- */
-const BUILT_IN_REVIEWERS: Record<string, ReviewerDefinition> = {};
+/** Built-in reviewers, keyed by stable reviewer id. */
+const BUILT_IN_REVIEWERS: Record<string, ReviewerDefinition> = {
+  [gapAnalysisReviewer.id]: gapAnalysisReviewer,
+  [codeReviewReviewer.id]: codeReviewReviewer,
+};
 
 export interface ResolveReviewerOptions extends ImportModuleOptions {
   /** Injectable built-in registry for testing. Defaults to the module's built-in registry. */
