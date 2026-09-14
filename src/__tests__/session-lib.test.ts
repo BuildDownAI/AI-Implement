@@ -70,10 +70,20 @@ describe.skipIf(isWindows)("resolve_envelope_field / select_runner_entry", () =>
     return stdout.trim().split("\n").at(-1) ?? "";
   }
 
+  // Every case below unsets AI_IMPLEMENT_RUN_CONFIG, RUNNER_PHASE, and
+  // RUNNER_CALLBACK_URL before establishing its own fixture, so a value
+  // inherited from the invoking shell (e.g. an implementation container's
+  // own already-exported envelope) can never make an assertion pass by
+  // accident. Any fixture the case means resolve_envelope_field to decode
+  // is `export`ed, since the node child spawned by resolve_envelope_field
+  // only inherits exported variables — an unexported assignment is invisible
+  // to it even though it is visible to later commands in the same shell.
+  const RESET = "unset AI_IMPLEMENT_RUN_CONFIG RUNNER_PHASE RUNNER_CALLBACK_URL";
+
   it("env wins over the envelope (dev-harness guard: RUNNER_PHASE=full survives runnerPhase:implementation)", () => {
     const envelope = encodeEnvelope({ runnerPhase: "implementation" });
     const result = runBash(
-      `source session/lib.sh; RUNNER_PHASE=full; AI_IMPLEMENT_RUN_CONFIG='${envelope}'; resolve_envelope_field RUNNER_PHASE runnerPhase; select_runner_entry "$RUNNER_PHASE"`,
+      `${RESET}; source session/lib.sh; RUNNER_PHASE=full; export AI_IMPLEMENT_RUN_CONFIG='${envelope}'; resolve_envelope_field RUNNER_PHASE runnerPhase; select_runner_entry "$RUNNER_PHASE"`,
     );
     expect(result.status).toBe(0);
     expect(lastLine(result.stdout)).toBe("run-local-full-loop.js");
@@ -83,7 +93,7 @@ describe.skipIf(isWindows)("resolve_envelope_field / select_runner_entry", () =>
   it("envelope fills empty RUNNER_PHASE (integration case: kg-refresh)", () => {
     const envelope = encodeEnvelope({ runnerPhase: "kg-refresh" });
     const result = runBash(
-      `unset RUNNER_PHASE; source session/lib.sh; AI_IMPLEMENT_RUN_CONFIG='${envelope}'; resolve_envelope_field RUNNER_PHASE runnerPhase; select_runner_entry "$RUNNER_PHASE"`,
+      `${RESET}; source session/lib.sh; export AI_IMPLEMENT_RUN_CONFIG='${envelope}'; resolve_envelope_field RUNNER_PHASE runnerPhase; select_runner_entry "$RUNNER_PHASE"`,
     );
     expect(result.status).toBe(0);
     expect(lastLine(result.stdout)).toBe("pipeline/kg-refresh-run.js");
@@ -93,17 +103,17 @@ describe.skipIf(isWindows)("resolve_envelope_field / select_runner_entry", () =>
   it("defaults to implementation when the envelope has no runnerPhase", () => {
     const envelope = encodeEnvelope({});
     const result = runBash(
-      `unset RUNNER_PHASE; source session/lib.sh; AI_IMPLEMENT_RUN_CONFIG='${envelope}'; resolve_envelope_field RUNNER_PHASE runnerPhase; RUNNER_PHASE="\${RUNNER_PHASE:-implementation}"; echo "$RUNNER_PHASE"`,
+      `${RESET}; source session/lib.sh; export AI_IMPLEMENT_RUN_CONFIG='${envelope}'; resolve_envelope_field RUNNER_PHASE runnerPhase; RUNNER_PHASE="\${RUNNER_PHASE:-implementation}"; echo "$RUNNER_PHASE"`,
     );
     expect(result.status).toBe(0);
     expect(lastLine(result.stdout)).toBe("implementation");
     expect(result.stdout).not.toContain("envelope.runnerPhase");
-    expect(result.stderr).not.toMatch(/WARNING/);
+    expect(result.stdout).not.toMatch(/WARNING/);
   });
 
   it("defaults to implementation and logs a warning when the envelope is malformed", () => {
     const result = runBash(
-      `unset RUNNER_PHASE; source session/lib.sh; AI_IMPLEMENT_RUN_CONFIG='${MALFORMED_ENVELOPE}'; resolve_envelope_field RUNNER_PHASE runnerPhase; RUNNER_PHASE="\${RUNNER_PHASE:-implementation}"; echo "$RUNNER_PHASE"`,
+      `${RESET}; source session/lib.sh; export AI_IMPLEMENT_RUN_CONFIG='${MALFORMED_ENVELOPE}'; resolve_envelope_field RUNNER_PHASE runnerPhase; RUNNER_PHASE="\${RUNNER_PHASE:-implementation}"; echo "$RUNNER_PHASE"`,
     );
     expect(result.status).toBe(0);
     expect(lastLine(result.stdout)).toBe("implementation");
@@ -112,7 +122,7 @@ describe.skipIf(isWindows)("resolve_envelope_field / select_runner_entry", () =>
 
   it("defaults to implementation when there is no envelope at all", () => {
     const result = runBash(
-      `unset RUNNER_PHASE AI_IMPLEMENT_RUN_CONFIG; source session/lib.sh; resolve_envelope_field RUNNER_PHASE runnerPhase; RUNNER_PHASE="\${RUNNER_PHASE:-implementation}"; echo "$RUNNER_PHASE"`,
+      `${RESET}; source session/lib.sh; resolve_envelope_field RUNNER_PHASE runnerPhase; RUNNER_PHASE="\${RUNNER_PHASE:-implementation}"; echo "$RUNNER_PHASE"`,
     );
     expect(result.status).toBe(0);
     expect(lastLine(result.stdout)).toBe("implementation");
@@ -122,7 +132,7 @@ describe.skipIf(isWindows)("resolve_envelope_field / select_runner_entry", () =>
   it("fills RUNNER_CALLBACK_URL from the envelope when env is empty", () => {
     const envelope = encodeEnvelope({ runnerCallbackUrl: "https://example.test/callback" });
     const result = runBash(
-      `unset RUNNER_CALLBACK_URL; source session/lib.sh; AI_IMPLEMENT_RUN_CONFIG='${envelope}'; resolve_envelope_field RUNNER_CALLBACK_URL runnerCallbackUrl; echo "$RUNNER_CALLBACK_URL"`,
+      `${RESET}; source session/lib.sh; export AI_IMPLEMENT_RUN_CONFIG='${envelope}'; resolve_envelope_field RUNNER_CALLBACK_URL runnerCallbackUrl; echo "$RUNNER_CALLBACK_URL"`,
     );
     expect(result.status).toBe(0);
     expect(lastLine(result.stdout)).toBe("https://example.test/callback");
@@ -131,7 +141,7 @@ describe.skipIf(isWindows)("resolve_envelope_field / select_runner_entry", () =>
   it("leaves RUNNER_CALLBACK_URL unchanged when env is already set", () => {
     const envelope = encodeEnvelope({ runnerCallbackUrl: "https://example.test/from-envelope" });
     const result = runBash(
-      `source session/lib.sh; RUNNER_CALLBACK_URL='https://example.test/from-env'; AI_IMPLEMENT_RUN_CONFIG='${envelope}'; resolve_envelope_field RUNNER_CALLBACK_URL runnerCallbackUrl; echo "$RUNNER_CALLBACK_URL"`,
+      `${RESET}; source session/lib.sh; RUNNER_CALLBACK_URL='https://example.test/from-env'; export AI_IMPLEMENT_RUN_CONFIG='${envelope}'; resolve_envelope_field RUNNER_CALLBACK_URL runnerCallbackUrl; echo "$RUNNER_CALLBACK_URL"`,
     );
     expect(result.status).toBe(0);
     expect(lastLine(result.stdout)).toBe("https://example.test/from-env");
