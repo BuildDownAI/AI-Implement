@@ -97,10 +97,10 @@ export interface ReviewerSelection {
  * NULL. NULL means this default, never an empty list — resolving it to []
  * would silently remove the review gate from every existing project on deploy.
  */
-export const DEFAULT_REVIEWER_SELECTION: ReviewerSelection[] = [
-  { id: "gap-analysis", gates: true },
-  { id: "code-review", gates: true },
-];
+export const DEFAULT_REVIEWER_SELECTION: ReviewerSelection[] = Object.freeze([
+  Object.freeze({ id: "gap-analysis", gates: true }),
+  Object.freeze({ id: "code-review", gates: true }),
+]) as ReviewerSelection[];
 
 /**
  * Resolves a mapping's stored reviewer selection, applying the NULL-means-default
