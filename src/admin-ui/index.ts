@@ -24,6 +24,8 @@ import { deploymentsHtml, deploymentsScript } from "./pages/deployments.js";
 import { stubsHtml } from "./pages/stubs.js";
 import { noAccessHtml } from "./pages/no-access.js";
 import { drawerHtml, drawerScript } from "./drawer.js";
+import { filesystemIssueHtml, filesystemIssueScript } from "./filesystem-issue.js";
+import { localJobLogsHtml, localJobLogsScript } from "./local-job-logs.js";
 import { stepperScript } from "./stepper.js";
 
 const head = `<!DOCTYPE html>
@@ -98,6 +100,8 @@ const body = `<body>
 </div>
 ${shell}
 ${drawerHtml}
+${filesystemIssueHtml}
+${localJobLogsHtml}
 <script>${themeJs}</script>
 <script>${authJs}</script>
 <script>${routerJs}</script>
@@ -119,6 +123,8 @@ ${pageScript('reports', reportsScript)}
 ${pageScript('deployments', deploymentsScript)}
 ${pageScript('access', accessScript)}
 ${pageScript('drawer', drawerScript)}
+${pageScript('filesystem-issue', filesystemIssueScript)}
+${pageScript('local-job-logs', localJobLogsScript)}
 ${pageScript('stepper', stepperScript)}
 </body></html>`;
 

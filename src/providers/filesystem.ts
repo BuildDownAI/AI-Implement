@@ -11,7 +11,6 @@ import {
   unlink,
 } from "node:fs/promises";
 import { basename, dirname, extname, join, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
 import type { RepoMapping } from "../config.js";
 import { assemblePlanningContext } from "../planning-context-assembly.js";
 import { parseTaskDocument } from "../task-document.js";
@@ -23,7 +22,7 @@ import type {
   TicketingProvider,
 } from "./types.js";
 
-type FilesystemStatus =
+export type FilesystemStatus =
   | "ready"
   | "planning"
   | "plan-approved"
@@ -33,7 +32,7 @@ type FilesystemStatus =
   | "completed"
   | "cancelled";
 
-interface FilesystemState {
+export interface FilesystemState {
   version: 1;
   status: FilesystemStatus;
   comments: Array<{ body: string; createdAt: string }>;
@@ -46,7 +45,15 @@ interface FilesystemTask {
   issue: TicketIssue;
   taskPath: string;
   statePath: string;
+  markdown: string;
   state: FilesystemState | null;
+}
+
+export interface FilesystemIssueDetails {
+  issue: TicketIssue;
+  markdown: string;
+  state: FilesystemState | null;
+  statePath: string;
 }
 
 const IDENTIFIER_RE = /^[A-Z][A-Z0-9_]*-\d+$/;
@@ -66,7 +73,6 @@ const PLANNING_PREFIXES = [
 export class FilesystemProvider implements TicketingProvider {
   readonly id = "filesystem";
   private readonly getMappings: () => Record<string, RepoMapping>;
-  private taskPathsByIssueId = new Map<string, string>();
 
   constructor(getMappings: () => Record<string, RepoMapping>) {
     this.getMappings = getMappings;
@@ -205,8 +211,24 @@ export class FilesystemProvider implements TicketingProvider {
   }
 
   issueUrl(issue: TicketIssue): string {
-    const taskPath = this.taskPathsByIssueId.get(issue.id);
-    return taskPath ? pathToFileURL(taskPath).toString() : `filesystem:${encodeURIComponent(issue.identifier)}`;
+    const issueId = issue.id?.startsWith("filesystem:")
+      ? issue.id
+      : issue.scopeKey
+        ? `filesystem:${issue.scopeKey}:${issue.identifier}`
+        : null;
+    return issueId ? `/admin?filesystemIssue=${encodeURIComponent(issueId)}` : `/admin`;
+  }
+
+  async readIssueDetails(issueId: string): Promise<FilesystemIssueDetails | null> {
+    const parsed = parseFilesystemIssueId(issueId);
+    const task = (await this.scanTasks()).get(issueId);
+    if (!task) return null;
+    return {
+      issue: task.issue,
+      markdown: task.markdown,
+      state: task.state,
+      statePath: `.state/${parsed.scopeKey}/${parsed.identifier}.json`,
+    };
   }
 
   async findByKey(key: string): Promise<TicketIssue | null> {
@@ -285,6 +307,7 @@ export class FilesystemProvider implements TicketingProvider {
           tasks.push({
             taskPath,
             statePath,
+            markdown: content,
             state,
             issue: {
               id: `filesystem:${scopeKey}:${identifier}`,
@@ -315,7 +338,6 @@ export class FilesystemProvider implements TicketingProvider {
       byId.delete(id);
       console.warn(`[filesystem] Duplicate ticket id ${id}; refusing to dispatch either file`);
     }
-    this.taskPathsByIssueId = new Map([...byId.values()].map((task) => [task.issue.id, task.taskPath]));
     return byId;
   }
 
@@ -448,9 +470,20 @@ function validateSafeSegment(value: string, label: string): void {
 }
 
 function scopeFromIssueId(issueId: string): string {
-  const match = /^filesystem:([^:]+):/.exec(issueId);
+  const parsed = parseFilesystemIssueId(issueId);
+  if (!parsed) throw new Error(`Invalid filesystem issueId: ${JSON.stringify(issueId)}`);
+  return parsed.scopeKey;
+}
+
+function parseFilesystemIssueId(issueId: string): { scopeKey: string; identifier: string } {
+  const match = /^filesystem:([^:]+):([^:]+)$/.exec(issueId);
   if (!match) throw new Error(`Invalid filesystem issueId: ${JSON.stringify(issueId)}`);
-  return match[1];
+  const [, scopeKey, identifier] = match;
+  validateSafeSegment(scopeKey, "scopeKey");
+  if (!IDENTIFIER_RE.test(identifier)) {
+    throw new Error(`Invalid filesystem issue identifier: ${JSON.stringify(identifier)}`);
+  }
+  return { scopeKey, identifier };
 }
 
 function unique(values: string[]): string[] {

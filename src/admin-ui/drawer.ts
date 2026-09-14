@@ -25,6 +25,7 @@ export const drawerHtml = `
       <div></div>
       <div style="display:flex;gap:6px">
         <a id="drawer-logs-link" class="btn btn-sm" href="" target="_blank" hidden>View workflow logs ↗</a>
+        <button id="drawer-local-logs" type="button" class="btn btn-sm" hidden>View local logs</button>
         <button class="btn btn-primary btn-sm" onclick="closeJobDrawer()">Close</button>
       </div>
     </div>
@@ -375,6 +376,9 @@ export const drawerScript = `
   }
 
   function renderLogsLink(job, mappings) {
+    const localLogs = document.getElementById('drawer-local-logs');
+    localLogs.hidden = job.executionMode !== 'local-docker' || !job.machineId;
+    localLogs.onclick = localLogs.hidden ? null : function () { window.openLocalJobLogs(job.id, job.issueIdentifier); };
     const logsLink = document.getElementById('drawer-logs-link');
     const mapping = mappings && job.teamKey ? mappings[job.teamKey] : null;
     const repoParts = repoPartsForJob(job, mapping);
@@ -424,6 +428,8 @@ export const drawerScript = `
     document.getElementById('drawer-context').innerHTML = '';
     document.getElementById('drawer-logs-link').setAttribute('hidden', '');
     document.getElementById('drawer-logs-link').removeAttribute('href');
+    document.getElementById('drawer-local-logs').hidden = true;
+    document.getElementById('drawer-local-logs').onclick = null;
   }
 
   function stopDrawerAutoRefresh() {
@@ -505,7 +511,7 @@ export const drawerScript = `
   }
 
   document.addEventListener('keydown', function (e) {
-    if (e.key === 'Escape') {
+    if (e.key === 'Escape' && !document.querySelector('dialog[open]')) {
       const wrap = document.getElementById('job-drawer-wrap');
       if (wrap && !wrap.hasAttribute('hidden')) closeJobDrawer();
     }

@@ -191,6 +191,24 @@ function mountDrawer(job: unknown, steps: unknown[]): { win: any; doc: Document 
 }
 
 describe("job drawer failure evidence", () => {
+  it("opens local logs using the selected job and keeps the drawer open under a modal", async () => {
+    const { win, doc } = mountDrawer({ ...BASE_JOB, executionMode: "local-docker", machineId: "a".repeat(64), runId: null }, []);
+    win.openLocalJobLogs = vi.fn();
+    await win.openJobDrawer(1);
+    const button = doc.getElementById("drawer-local-logs")!;
+    expect(button.hidden).toBe(false);
+    button.click();
+    expect(win.openLocalJobLogs).toHaveBeenCalledWith(1, "ENG-1");
+    expect(doc.getElementById("drawer-logs-link")!.hidden).toBe(true);
+    const modal = doc.createElement("dialog");
+    modal.setAttribute("open", "");
+    doc.body.appendChild(modal);
+    doc.dispatchEvent(new win.KeyboardEvent("keydown", { key: "Escape" }));
+    expect(doc.getElementById("job-drawer-wrap")!.hidden).toBe(false);
+    win.closeJobDrawer();
+    win.close();
+  });
+
   it("shows a Failure evidence details block for a failed step with a record, and none for a passed step", async () => {
     const { win, doc } = mountDrawer(BASE_JOB, [FAILED_STEP, PASSED_STEP]);
     await win.openJobDrawer(1);

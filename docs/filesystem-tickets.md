@@ -79,6 +79,17 @@ Task Markdown remains unchanged. The provider writes status, comments, planning
 output, and PR links to `.state/<project-key>/<ticket-id>.json` in the ticket directory. The admin
 UI shows the ordinary jobs, steps, reviewer reports, and PR links.
 
+Click the filesystem issue link in the job's **Context** section to open its
+local issue viewer. **Ticket Markdown** shows the original task file, including
+front matter. **State JSON** shows the saved status, planning comments, and PR
+links from `.state/`. Use **Refresh** to reload both files as the run progresses.
+The viewer is read-only and requires an authenticated admin session.
+
+Local Docker jobs also have a **View local logs** button in the job panel.
+It shows recent container output with a refresh action. Recent output is saved
+before container cleanup so it remains available afterward. Containers removed
+before log saving was enabled may no longer have logs available.
+
 A ticket with an open PR is not dispatched again merely because the task file
 still exists. Completed status survives restarts. Preserve `.state/` and the
 local database between runs; use a new ticket identifier for an independent test.

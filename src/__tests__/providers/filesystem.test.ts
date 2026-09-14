@@ -114,6 +114,56 @@ describe("FilesystemProvider", () => {
     expect(state.prUrls).toEqual(["https://github.com/acme/widgets/pull/1"]);
   });
 
+  it("returns admin issue URLs for exact scoped filesystem issue ids", async () => {
+    const p = provider({});
+    expect(p.issueUrl({
+      id: "filesystem:SAN2:SAN2-001",
+      identifier: "SAN2-001",
+      title: "Make the jellyfish pulse less",
+      description: null,
+      scopeKey: "SAN2",
+      nativeStatus: "ready",
+    })).toBe("/admin?filesystemIssue=filesystem%3ASAN2%3ASAN2-001");
+  });
+
+  it("reads issue details without creating missing state", async () => {
+    const dir = await tempTicketDir();
+    await writeTask(dir, "SAN2-1.md", "---\ntitle: Local detail\n---\n\nShow me.");
+    const p = provider({ SAN2: mapping({ directory: dir }) });
+
+    const details = await p.readIssueDetails("filesystem:SAN2:SAN2-1");
+
+    expect(details?.issue).toMatchObject({
+      id: "filesystem:SAN2:SAN2-1",
+      identifier: "SAN2-1",
+      title: "Local detail",
+      scopeKey: "SAN2",
+    });
+    expect(details?.markdown).toContain("Show me.");
+    expect(details?.state).toBeNull();
+    expect(details?.statePath).toBe(".state/SAN2/SAN2-1.json");
+    await expect(readFile(join(dir, ".state", "SAN2", "SAN2-1.json"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("returns null details for corrupt state and duplicate scoped identifiers", async () => {
+    const dir = await tempTicketDir();
+    await writeTask(dir, "SAN2-2.md", "---\ntitle: Corrupt state\n---\n\nSkip.");
+    await writeTask(dir, "duplicate.md", "---\ntitle: Duplicate\nid: SAN2-3\n---\n\nFirst.");
+    await writeTask(dir, "SAN2-3.md", "---\ntitle: Duplicate\n---\n\nSecond.");
+    await mkdir(join(dir, ".state", "SAN2"), { recursive: true });
+    await writeFile(join(dir, ".state", "SAN2", "SAN2-2.json"), "{broken", "utf8");
+    const p = provider({ SAN2: mapping({ directory: dir }) });
+
+    await expect(p.readIssueDetails("filesystem:SAN2:SAN2-2")).resolves.toBeNull();
+    await expect(p.readIssueDetails("filesystem:SAN2:SAN2-3")).resolves.toBeNull();
+  });
+
+  it("rejects detail reads for invalid scoped issue ids before scanning", async () => {
+    const p = provider({});
+    await expect(p.readIssueDetails("linear-issue")).rejects.toThrow(/Invalid filesystem issueId/);
+    await expect(p.readIssueDetails("filesystem:../SAN2:SAN2-1")).rejects.toThrow(/Invalid filesystem/);
+  });
+
   it("puts new tasks directly in the implementation bucket when planning is disabled", async () => {
     const dir = await tempTicketDir();
     await writeTask(dir, "AII-2.md", "---\ntitle: No planning\n---\n\nImplement directly.");

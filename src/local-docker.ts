@@ -4,6 +4,7 @@ import { chmod, mkdir, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
+import { archiveLocalContainerLogsBestEffort } from "./local-job-logs.js";
 
 const execFile = promisify(nodeExecFile);
 const SECRET_ENV_KEYS = new Set([
@@ -163,7 +164,10 @@ export async function inspectLocalContainer(containerId: string): Promise<LocalC
 
 export async function fetchLocalContainerLogs(containerId: string, lastN = 100): Promise<string> {
   try {
-    const { stdout, stderr } = await execFile("docker", ["logs", "--tail", String(lastN), containerId]);
+    const { stdout, stderr } = await execFile("docker", ["logs", "--tail", String(lastN), containerId], {
+      timeout: 10_000,
+      maxBuffer: 512 * 1024,
+    });
     return [stdout, stderr].filter(Boolean).join("\n").trim();
   } catch (err) {
     throw new Error(`Failed to fetch local Docker logs for ${containerId}: ${errorMessage(err)}`);
@@ -244,6 +248,7 @@ export async function sweepExitedLocalContainers(inFlightMachineIds: string[]): 
 
 export async function removeLocalContainer(containerId: string): Promise<void> {
   try {
+    await archiveLocalContainerLogsBestEffort(containerId);
     await execFile("docker", ["rm", "-f", containerId]);
   } catch (err) {
     throw new Error(`Failed to remove local Docker runner ${containerId}: ${errorMessage(err)}`);
