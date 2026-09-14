@@ -23,7 +23,7 @@ The post-run half is **entirely webhook-driven**. Three GitHub event subscriptio
 |-------|------|-------------|
 | `pull_request_review` | `action=submitted` **and** `state=CHANGES_REQUESTED` | `github-review`, severity `blocking` |
 | `pull_request_review_comment` | `action=created` | `github-review-thread`, severity `medium` |
-| `issue_comment` | author's `user.type == "Bot"` **and** the body contains a `<!-- claude-review-verdict {...} -->` marker | `claude-review-summary`, severity `blocking` or `minor` |
+| `issue_comment` | author's `user.type == "Bot"` (or an already-trusted Claude author) **and** the body contains a fenced ` ```json review-findings ` block, or (for one release) the deprecated `<!-- claude-review-verdict {...} -->` marker | `review-contract` (fenced block) or `claude-review-summary` (legacy marker), severity per finding |
 
 `GITHUB_WEBHOOK_SECRET` must be set, and deliveries are rejected 401 on an invalid signature. Note that `pull_request` and `issue_comment` are already needed for merge reconciliation and `/ai-implement` handling respectively — the two review events are the ones easily missed.
 
@@ -69,6 +69,43 @@ Findings are collected from bot comments, and the rail itself posts bot comments
 - A review whose body carries the native-review marker, or begins with `AI-Implement post-push review`, is ignored at the webhook.
 
 Trusted comment authors are an explicit allowlist (`ai-implement`, `claude`, and their `[bot]` forms), so an arbitrary bot commenting on a PR cannot inject findings.
+
+## The review-findings contract
+
+`extractReviewFindingsBlock` (`src/pipeline/review-ledger.ts`) reads a machine-readable verdict from a reviewer comment. It has precedence over heading-based prose extraction and returns early when it finds a fenced block, so a comment that carries one is never also scanned for prose.
+
+The contract is a fenced code block, not an HTML comment — `anthropics/claude-code-action` strips HTML comments (`stripHtmlComments()`) from every comment it posts before the comment is created, which is why the predecessor `<!-- claude-review-verdict {...} -->` marker never once arrived across PRs 543–557. A fenced block survives that transform:
+
+````
+```json review-findings
+{
+  "schema": "review-findings/v1",
+  "verdict": "approve" | "changes_requested" | "incomplete",
+  "findings": [
+    { "severity": "blocking" | "minor", "body": "...", "path": "src/x.ts", "line": 12 }
+  ]
+}
+```
+````
+
+`schema` and `verdict` are required; `findings` defaults to `[]`. In a finding, `body` is required, `path` and `line` are optional. `schema` must be exactly `review-findings/v1` — any other value (including a plausible-looking future version) is rejected rather than parsed as v1, so a field whose meaning changes between versions is never read under today's semantics. Every finding from this parser is tagged `source: "review-contract"`; `ReviewLedgerFinding` gets no new field for it — a later change derives gating from `source` alone.
+
+Every state the parser can be in, and its result:
+
+| Comment state | Findings returned | `verdict` | `findingsUnavailable` |
+|---|---|---|---|
+| No block present | none | `undefined` | `false` — falls back to prose extraction |
+| One valid block | its findings | its verdict | `false` |
+| Block present, JSON does not parse | none | `"incomplete"` | `true` |
+| Block present, JSON parses but fails the schema | none | `"incomplete"` | `true` |
+| `schema` is not `review-findings/v1` | none | `"incomplete"` | `true` |
+| More than one block in one comment | the last block's findings | the last block's verdict | `false` |
+
+A broken block sets `findingsUnavailable` and does **not** fall back to prose extraction — a reviewer that tried to emit the contract and failed is a broken reviewer, not a prose reviewer, and treating it as prose would hide the breakage.
+
+The trust boundary is unchanged: only a comment from an already-trusted Claude author or the GitHub Actions bot (`isVerdictEligibleAuthor`) is even offered to this parser, so a lookalike block from another bot or a human commenter cannot supersede a real review.
+
+**Migration overlap.** For one release, a comment with no fenced block falls back to scanning for the deprecated `<!-- claude-review-verdict {...} -->` marker, so a reviewer mid-migration is not silently dropped. The first comment seen using that legacy form logs a one-time deprecation warning (a module-level flag, not per-comment). The parsed `verdict` from the fenced-block path is threaded up to `collectClaudeIssueComments`'s internal state but not (yet) exposed from `collectExternalReviewFindingsFromGh`'s public return shape or read by `post-push-review.ts` — a later change wires gating off it.
 
 ## In-run: the post-push-review step
 
