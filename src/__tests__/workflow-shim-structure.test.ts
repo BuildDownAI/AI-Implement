@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { parse } from "yaml";
 import { GITHUB_WRITE_CREDENTIAL_KEYS } from "../pipeline/process-env.js";
 
@@ -15,6 +16,30 @@ const FILES = [...IMPLEMENT_WORKFLOWS];
 const SYNCED_WORKFLOW_FILES = [...IMPLEMENT_WORKFLOWS, ...PLANNING_WORKFLOWS];
 
 describe("GHA workflow shims", () => {
+  it.each([
+    ["pipeline/kg-refresh-run.js, phase=kg-refresh", true],
+    ["pipeline/kg-refresh-run.js, phase=kg-refresh, source=env", true],
+    ["pipeline/kg-refresh-run.js, phase=kg-refresh, source=envelope", false],
+    ["pipeline/kg-refresh-run.js, phase=kg-refresh, source=default", false],
+    ["pipeline/kg-refresh-run.js, phase=implementation", false],
+    ["run-autonomous.js, phase=kg-refresh, source=env", false],
+  ])("runner handoff gate checks %s (accepted=%s)", (handoff, accepted) => {
+    const doc = parse(readFileSync(".github/workflows/build-runner.yml", "utf-8"));
+    const step = doc.jobs.build.steps.find((item: { name?: string }) => item.name?.startsWith("Entrypoint handoff"));
+    // Execute the workflow's actual matcher so a log-format change cannot
+    // pass unit tests while silently preventing runner channel promotion.
+    const matcher = step.run.match(/grep (-q[EF]) \\\n\s+"(Invoking TS pipeline[^"]+)"/);
+    expect(matcher).not.toBeNull();
+    expect(step.run).toContain("-e RUNNER_PHASE=kg-refresh");
+    expect(step.run).toContain('grep -q "POST /runner/result" "$requests_log"');
+    const result = spawnSync("grep", [matcher![1], matcher![2]], {
+      input: `[session] 2026-09-14T00:00:00Z Invoking TS pipeline (node /app/dist/${handoff})...\n`,
+      encoding: "utf-8",
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(accepted ? 0 : 1);
+  });
+
   it("ships workflow templates in the orchestrator image for admin-triggered syncs", () => {
     expect(readFileSync("Dockerfile", "utf-8")).toMatch(/COPY workflows\/ \.\/workflows\//);
   });
