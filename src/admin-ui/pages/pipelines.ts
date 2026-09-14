@@ -146,7 +146,7 @@ export const pipelinesScript = `
         return makeBadge(statusClass[status] || 'neutral', label);
       }
       function execBadge(mode, runnerMode) {
-        const short = mode === 'fly-machines' ? 'fly' : 'gha';
+        const short = mode === 'local-docker' ? 'docker' : mode === 'fly-machines' ? 'fly' : 'gha';
         const cls = short === 'fly' ? 'info' : 'neutral';
         return makeBadge(cls, short)
           + (runnerMode ? ' <span style="color:var(--fg-tertiary);font-size:0.85em">(' + window.esc(runnerMode) + ')</span>' : '');
@@ -155,6 +155,14 @@ export const pipelinesScript = `
         if (phase === 'planning') return makeBadge('info', 'plan');
         if (phase === 'kg-refresh') return makeBadge('info', 'kg');
         return makeBadge('neutral', 'impl');
+      }
+
+      function logsButton(entry) {
+        if (!entry.machineId) return '';
+        const target = entry.executionMode === 'local-docker'
+          ? 'data-local-job-id="' + window.escAttr(entry.id) + '" data-issue-identifier="' + window.escAttr(entry.issueIdentifier || entry.issueId) + '"'
+          : 'data-machine-id="' + window.escAttr(entry.machineId) + '"';
+        return '<button ' + target + ' style="background:none;border:none;cursor:pointer;padding:0;color:var(--accent);font:inherit">Logs</button>';
       }
 
       // Group planning + implement phases that belong to the same job:
@@ -210,6 +218,7 @@ export const pipelinesScript = `
             ? 'completed' : plan.status;
           const combinedStatus = statusBadge(planStatus, plan.conclusion) + ' <span style="color:#aaa;font-size:0.8em">→</span> ' + statusBadge(impl.status, impl.conclusion);
           const prLink = impl.prUrl ? '<a href="' + window.safeUrl(impl.prUrl) + '" target="_blank">View</a>' : '—';
+          const logs = logsButton(impl);
           tr.innerHTML = '<td style="white-space:nowrap">' + dt + '</td>'
             + '<td style="text-align:center">' + dnBadge + '</td>'
             + '<td class="mono">' + issueLabel + '</td>'
@@ -219,7 +228,7 @@ export const pipelinesScript = `
             + '<td>' + runnerCell + '</td>'
             + imageCell
             + '<td>' + combinedStatus + '</td>'
-            + '<td>' + prLink + '</td>';
+            + '<td>' + prLink + (logs ? ' ' + logs : '') + '</td>';
         } else {
           const entry = item.entry;
           const dt = new Date(entry.dispatchedAt).toLocaleString();
@@ -236,8 +245,7 @@ export const pipelinesScript = `
             : '<td style="color:#aaa">—</td>';
           let logCell;
           if (entry.machineId) {
-            const btnText = 'Logs';
-            logCell = '<button data-machine-id="' + window.escAttr(entry.machineId) + '" style="background:none;border:none;cursor:pointer;padding:0;color:var(--accent);font:inherit">' + btnText + '</button>';
+            logCell = logsButton(entry);
           } else if (entry.prUrl) {
             logCell = '<a href="' + window.safeUrl(entry.prUrl) + '" target="_blank">View</a>';
           } else {
@@ -308,6 +316,11 @@ export const pipelinesScript = `
     tbody.addEventListener('click', function (e) {
       const target = e.target;
       if (target.closest('a')) return;
+      const localLogsBtn = target.closest('[data-local-job-id]');
+      if (localLogsBtn) {
+        window.openLocalJobLogs(Number(localLogsBtn.getAttribute('data-local-job-id')), localLogsBtn.getAttribute('data-issue-identifier'));
+        return;
+      }
       const logsBtn = target.closest('[data-machine-id]');
       if (logsBtn) {
         viewMachineLogs(logsBtn.getAttribute('data-machine-id'));
