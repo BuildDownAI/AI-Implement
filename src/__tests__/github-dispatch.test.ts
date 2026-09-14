@@ -1,7 +1,4 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import os from "node:os";
-import path from "node:path";
-import fs from "node:fs";
 import {
   buildEnvelopeDispatchInputs,
   providerDispatchFields,
@@ -598,27 +595,19 @@ describe("buildEnvelopeDispatchInputs — retryPolicy stamping", () => {
 // Uses a real SQLite DB (dedup singleton) and a mocked notify so we can
 // assert on calls without making real HTTP requests.
 //
-// DB_PATH in dedup.ts is a module-level constant computed at import time, so
-// env-var changes per-test have no effect. All tests in this file write to the
-// same DB. We use a run-level random ID so issueIds are unique per execution
-// and filter-based assertions never see entries from previous runs.
+// Vitest sets an in-memory database before imports. Closing it between cases
+// provides a fresh database; changing DEDUP_DB_PATH after import would not.
 
 const SURF_RUN = Math.random().toString(36).slice(2, 10);
-
-let dbPath: string;
-
-function freshDb(label: string): string {
-  return path.join(
-    os.tmpdir(),
-    `gh-dispatch-${label}-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-  );
-}
 
 describe("surfaceDispatchFailure — 422 surfacing (case d)", () => {
   beforeEach(() => {
     vi.mocked(notify).mockClear();
+    closeDb();
     initLogTable();
   });
+
+  afterEach(() => closeDb());
 
   it("writes a dispatch-failed log entry with contract when dispatch returns 422", async () => {
     const issueId = `${SURF_RUN}-d1`;
@@ -743,15 +732,12 @@ describe("surfaceDispatchFailure — 422 surfacing (case d)", () => {
 
 describe("appendLog with status and contract fields", () => {
   beforeEach(() => {
-    closeDb(); // ensure previous connection closed before switching DB path
-    dbPath = freshDb("log");
-    process.env.DEDUP_DB_PATH = dbPath;
+    closeDb();
     initLogTable();
   });
 
   afterEach(() => {
     closeDb();
-    try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
   });
 
   it("stores status='dispatch-failed' and contract='legacy' when explicitly set", () => {
