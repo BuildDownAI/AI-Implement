@@ -340,6 +340,10 @@ describe("loadPipelineDefinition", () => {
     });
 
     const ctx = makeContext();
+    ctx.data.reviewers = [
+      { id: "github-claude-code-review", gates: true },
+      { id: "claude-review-summary", gates: false },
+    ];
     ctx.setOutputs("clone", { workspaceDir: "/tmp/repo" });
     ctx.setOutputs("install", { reviewProviders: ["github-claude-code-review"] });
     ctx.setOutputs("push", { prNumber: 42, branchPushed: true });
@@ -349,6 +353,27 @@ describe("loadPipelineDefinition", () => {
     expect(inputs.workspaceDir).toBe("/tmp/repo");
     expect(inputs.prNumber).toBe("42");
     expect(inputs.reviewProviders).toEqual(["github-claude-code-review"]);
+    expect(inputs.reviewers).toEqual([
+      { id: "github-claude-code-review", gates: true },
+      { id: "claude-review-summary", gates: false },
+    ]);
+  });
+
+  it("preserves an explicit empty reviewer selection for post-push-review", () => {
+    const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: (_path, _enc) => BUILTIN_PIPELINE_YAML,
+    });
+
+    const ctx = makeContext();
+    ctx.data.reviewers = [];
+    ctx.setOutputs("clone", { workspaceDir: "/tmp/repo" });
+    ctx.setOutputs("install", { reviewProviders: ["github-claude-code-review"] });
+    ctx.setOutputs("push", { prNumber: 42, branchPushed: true });
+
+    const step = pipeline.steps.find((s) => s.id === "post-push-review")!;
+    const inputs = ctx.resolveInputs(step.inputs);
+    expect(inputs.reviewers).toEqual([]);
   });
 
   it("applies post-push-review skip condition based on push output", () => {
