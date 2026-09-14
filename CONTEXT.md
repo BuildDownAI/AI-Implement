@@ -95,3 +95,33 @@ The approval mark is the conclusion the runner's result callback writes on the r
 A benign terminal is an end of a run that is not a failure of the run: the PR was merged, or an operator closed it. The runner reports it as its own outcome, and the orchestrator does not retry or alert.
 
 **Not to be confused with:** A review failure or a crash, which stay failures even when the PR is closed afterwards.
+
+## Reviewer
+
+A reviewer is one named definition that asks one question about a PR. It supplies an id, a prompt, an output schema, and optional model and turn-cap overrides. Project selection determines whether it gates. The review step runs it; the reviewer owns no machinery of its own.
+
+**Not to be confused with:** The review step, which invokes every selected reviewer and owns retry, parsing, and reporting. Also not a person reviewing on the forge.
+
+## Review finding
+
+A review finding is one defect or one missing requirement that a reviewer reports about a PR. It carries a source, a severity, a body, and an optional file and line.
+
+**Not to be confused with:** The reviewer's summary prose, which explains the findings and is never itself a finding.
+
+## Gating finding
+
+A gating finding is a review finding that holds the merge. Only a structured source produces one: the review-findings contract, a formal changes-requested review, or an internal reviewer.
+
+**Not to be confused with:** An advisory finding.
+
+## Advisory finding
+
+An advisory finding is a review finding that the run shows to people and never acts on. Prose parsed out of a comment body produces advisory findings.
+
+**Not to be confused with:** A gating finding. The difference is the source, never the severity.
+
+## Review verdict
+
+The review verdict is the conclusion one reviewer states about a PR: approve, changes requested, or incomplete.
+
+**Not to be confused with:** Merge readiness, which is the run's own decision over every reviewer's findings and verdicts together.
