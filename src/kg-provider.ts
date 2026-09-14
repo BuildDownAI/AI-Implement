@@ -1,5 +1,6 @@
 import http from "node:http";
 import https from "node:https";
+import { getServedNamespace } from "./kg-sidecar.js";
 
 export interface MemoryProviderCapabilities {
   hybridSearch: boolean;
@@ -36,6 +37,59 @@ interface SidecarRpcResponse {
   result?: { tools?: unknown[] };
   error?: unknown;
 }
+
+/**
+ * Result of the sidecar liveness probe (AII-648): a session-tolerant `tools/list`
+ * that must return the six `kg_*` tools, followed by one cheap `kg_neighbors`
+ * call that must return a JSON-RPC result rather than an error.
+ */
+export interface SidecarHealth {
+  reachable: boolean;
+  toolsListed: boolean;
+  lastError: string | null;
+  checkedAt: number | null;
+}
+
+/**
+ * Module-level record of the last probe outcome. Mutable and shared across every
+ * SidecarMemoryProvider instance in the process — there is only ever one sidecar.
+ * `checkedAt: null` means no probe has run yet, distinct from a failed probe.
+ */
+export const sidecarHealth: SidecarHealth = {
+  reachable: false,
+  toolsListed: false,
+  lastError: null,
+  checkedAt: null,
+};
+
+/** True when the last completed probe failed. A never-probed sidecar is not "unavailable". */
+export function isKgUnavailable(): boolean {
+  return sidecarHealth.lastError !== null;
+}
+
+function recordSidecarHealth(patch: Omit<SidecarHealth, "checkedAt">): SidecarHealth {
+  sidecarHealth.reachable = patch.reachable;
+  sidecarHealth.toolsListed = patch.toolsListed;
+  sidecarHealth.lastError = patch.lastError;
+  sidecarHealth.checkedAt = Date.now();
+  return { ...sidecarHealth };
+}
+
+/** Re-probes triggered by a failed listTools/proxyCall are throttled to this interval. */
+const PROBE_THROTTLE_MS = 60_000;
+
+/**
+ * Bounds every buffered `sendToSidecar` call (the session handshake, `listTools`, and
+ * both probe steps). Mirrors the 2s-timeout pattern `KgSidecar`'s own readiness poll
+ * uses in src/kg-sidecar.ts, scaled up because these calls run a real query rather than
+ * checking whether the port accepts connections. Without this bound, a sidecar that
+ * accepts the connection but never answers — e.g. `[kg] sidecar ready` already logged,
+ * then a deadlock or a cold-start query hang — leaves the boot-time probe in main()
+ * unresolved forever, which stalls startServer() and postBootNotice() along with it.
+ * Deliberately not applied to `sendOrStream` (proxyCall's real-traffic path): a
+ * legitimate hybrid-search or embedding query can run longer than this.
+ */
+const SIDECAR_REQUEST_TIMEOUT_MS = 10_000;
 
 /**
  * Extract the JSON-RPC response from a sidecar reply. The Python MCP SDK's
@@ -128,9 +182,16 @@ export class SidecarMemoryProvider implements MemoryProvider {
    */
   private sessionId: string | null = null;
 
-  constructor(private readonly kgSidecarUrl: string) {}
+  constructor(
+    private readonly kgSidecarUrl: string,
+    private readonly resolveServedNamespace: () => Promise<string | null> = getServedNamespace,
+  ) {}
 
-  /** POSTs `body` to the sidecar and buffers the full response. Never throws. */
+  /**
+   * POSTs `body` to the sidecar and buffers the full response. Never throws.
+   * Bounded by SIDECAR_REQUEST_TIMEOUT_MS: a connection that accepts but never answers
+   * resolves `ok: false` instead of hanging the caller (and, via probe(), boot) forever.
+   */
   private sendToSidecar(target: URL, transport: typeof http | typeof https, method: string, headers: SidecarHeaders, body: Buffer): Promise<SidecarPostResult> {
     return new Promise((resolve) => {
       const options: http.RequestOptions = {
@@ -139,6 +200,7 @@ export class SidecarMemoryProvider implements MemoryProvider {
         path: target.pathname + target.search,
         method,
         headers: { ...headers, host: target.host },
+        timeout: SIDECAR_REQUEST_TIMEOUT_MS,
       };
       const proxyReq = transport.request(options, (proxyRes) => {
         const chunks: Buffer[] = [];
@@ -149,6 +211,12 @@ export class SidecarMemoryProvider implements MemoryProvider {
         proxyRes.on("error", (err) => resolve({ ok: false, error: err as NodeJS.ErrnoException }));
       });
       proxyReq.on("error", (err: NodeJS.ErrnoException) => resolve({ ok: false, error: err }));
+      proxyReq.on("timeout", () => {
+        proxyReq.destroy();
+        const err = new Error(`KG sidecar request timed out after ${SIDECAR_REQUEST_TIMEOUT_MS}ms`) as NodeJS.ErrnoException;
+        err.code = "ETIMEDOUT";
+        resolve({ ok: false, error: err });
+      });
       if (body.length > 0) proxyReq.write(body);
       proxyReq.end();
     });
@@ -284,6 +352,119 @@ export class SidecarMemoryProvider implements MemoryProvider {
     return { result, parsed };
   }
 
+  /**
+   * Describes why a probe send failed, or null when it succeeded with a JSON-RPC
+   * result. Shared by both probe steps (tools/list and the kg_neighbors call).
+   */
+  private describeSendFailure(
+    outcome: { result: SendOutcome; parsed: SidecarRpcResponse | null; handshakeError?: unknown },
+    label: string,
+  ): string | null {
+    const { result, parsed, handshakeError } = outcome;
+    if (!result.ok) return `${label} failed: ${result.error.message}`;
+    if ("streamed" in result) return `${label} returned a streamed response instead of JSON`;
+    if (handshakeError) {
+      const msg = handshakeError instanceof Error ? handshakeError.message : String(handshakeError);
+      return `${label} session handshake failed: ${msg}`;
+    }
+    if (!parsed) {
+      return `${label} returned an unparseable response (status ${result.status})`;
+    }
+    if (parsed.error) return `${label} error: ${JSON.stringify(parsed.error).slice(0, 200)}`;
+    if (!parsed.result) return `${label} returned no result (status ${result.status})`;
+    return null;
+  }
+
+  /**
+   * Liveness probe (AII-648): a session-tolerant `tools/list` that must return the
+   * six `kg_*` tools, then one cheap `kg_neighbors` call on the served graph's spine
+   * IRI that must come back a JSON-RPC result rather than an error. Updates the
+   * module-level `sidecarHealth` record and always runs to completion — unlike
+   * `scheduleReprobe`, this method itself is never throttled, so the first boot-time
+   * call is never skipped.
+   */
+  async probe(): Promise<SidecarHealth> {
+    const target = new URL(this.kgSidecarUrl);
+    const transport = target.protocol === "https:" ? https : http;
+    const forwardHeaders: SidecarHeaders = {};
+
+    const listBody = Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: "probe-tools-list", method: "tools/list", params: {} }));
+    const sendList = (sessionId: string | null) => {
+      const reqHeaders: SidecarHeaders = { "content-type": "application/json", "content-length": String(listBody.length) };
+      if (sessionId) reqHeaders["mcp-session-id"] = sessionId;
+      return this.sendToSidecar(target, transport, "POST", reqHeaders, listBody);
+    };
+    const listOutcome = await this.sendWithSessionRetry(target, transport, forwardHeaders, sendList);
+    const listError = this.describeSendFailure(listOutcome, "tools/list");
+    if (listError) return recordSidecarHealth({ reachable: false, toolsListed: false, lastError: listError });
+
+    const tools = (listOutcome.parsed?.result?.tools ?? []) as Array<{ name?: unknown }>;
+    const names = new Set(tools.map((t) => t.name).filter((n): n is string => typeof n === "string"));
+    const missing = Object.keys(KG_TOOL_CAPABILITY).filter((name) => !names.has(name));
+    if (missing.length > 0) {
+      return recordSidecarHealth({
+        reachable: true,
+        toolsListed: false,
+        lastError: `tools/list is missing: ${missing.join(", ")}`,
+      });
+    }
+
+    const namespace = await this.resolveServedNamespace().catch(() => null);
+    if (!namespace) {
+      return recordSidecarHealth({
+        reachable: true,
+        toolsListed: true,
+        lastError: "cannot determine the served graph namespace for a kg_neighbors probe query",
+      });
+    }
+    const spineIri = `${namespace.replace(/\/?$/, "/")}resource/graph/spine`;
+
+    const callBody = Buffer.from(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: "probe-kg-neighbors",
+        method: "tools/call",
+        params: { name: "kg_neighbors", arguments: { iri: spineIri, limit: 1 } },
+      }),
+    );
+    const sendCall = (sessionId: string | null) => {
+      const reqHeaders: SidecarHeaders = { "content-type": "application/json", "content-length": String(callBody.length) };
+      if (sessionId) reqHeaders["mcp-session-id"] = sessionId;
+      return this.sendToSidecar(target, transport, "POST", reqHeaders, callBody);
+    };
+    const callOutcome = await this.sendWithSessionRetry(target, transport, forwardHeaders, sendCall);
+    const callError = this.describeSendFailure(callOutcome, "kg_neighbors probe call");
+    if (callError) return recordSidecarHealth({ reachable: true, toolsListed: true, lastError: callError });
+
+    return recordSidecarHealth({ reachable: true, toolsListed: true, lastError: null });
+  }
+
+  /**
+   * Re-probes when `listTools`/`proxyCall` hits a failure, throttled to one real
+   * sidecar round-trip per PROBE_THROTTLE_MS. Awaited by the caller rather than
+   * fired-and-forgotten: a detached probe would still reach the sidecar after its
+   * triggering call returns, on a timer no caller controls, which is worse than the
+   * small added latency of waiting for it here.
+   */
+  private async maybeReprobe(): Promise<void> {
+    const last = sidecarHealth.checkedAt;
+    if (last !== null && Date.now() - last < PROBE_THROTTLE_MS) return;
+    try {
+      await this.probe();
+    } catch (err) {
+      // probe() itself never throws in practice (every internal failure resolves to a
+      // recorded health rather than a rejection) — this is a last-resort backstop so an
+      // unexpected exception still stamps checkedAt, rather than defeating the throttle
+      // and re-attempting on every single subsequent failure.
+      console.error("[mcp] KG sidecar re-probe failed:", err);
+      recordSidecarHealth({
+        reachable: false,
+        toolsListed: false,
+        lastError: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
   async listTools(body: Buffer, headers: http.IncomingHttpHeaders): Promise<unknown[]> {
     const target = new URL(this.kgSidecarUrl);
     const transport = target.protocol === "https:" ? https : http;
@@ -299,16 +480,21 @@ export class SidecarMemoryProvider implements MemoryProvider {
     };
 
     const { result, parsed } = await this.sendWithSessionRetry(target, transport, forwardHeaders, send);
-    if (!result.ok || "streamed" in result) return [];
+    if (!result.ok || "streamed" in result) {
+      await this.maybeReprobe();
+      return [];
+    }
 
     if (!parsed) {
       console.error(
         `[mcp] KG sidecar tools/list unparseable (status ${result.status}, content-type ${result.headers["content-type"]}): ${result.raw.toString().slice(0, 200)}`,
       );
+      await this.maybeReprobe();
     } else if (!parsed.result) {
       console.error(
         `[mcp] KG sidecar tools/list returned no result (status ${result.status}): ${JSON.stringify(parsed.error ?? parsed).slice(0, 200)}`,
       );
+      await this.maybeReprobe();
     }
     return parsed?.result?.tools ?? [];
   }
@@ -351,6 +537,7 @@ export class SidecarMemoryProvider implements MemoryProvider {
     void (async () => {
       const { result, handshakeError } = await this.sendWithSessionRetry(target, transport, forwardHeaders, send);
       if (!result.ok) {
+        await this.maybeReprobe();
         writeConnectionError(result.error);
         return;
       }
@@ -359,6 +546,7 @@ export class SidecarMemoryProvider implements MemoryProvider {
         // Surface the sidecar's own rejection (status + JSON-RPC error body) rather than a
         // synthetic 502 — parity with listTools and with docs/kg-sidecar.md.
         console.error("[mcp] KG sidecar session initialize failed; forwarding the original rejection:", handshakeError);
+        await this.maybeReprobe();
       }
 
       const outHeaders = { ...result.headers } as http.OutgoingHttpHeaders;
