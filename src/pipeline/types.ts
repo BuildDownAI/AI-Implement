@@ -2,6 +2,7 @@ import type { ReferenceRepo } from "../reference-repos.js";
 import type { ReviewerSelection } from "../config.js";
 
 import type { RetryPolicy } from "./retry-backoff.js";
+import type { ReviewerDefinition } from "./reviewers/registry.js";
 import type { FailureRecord } from "./failure-classification.js";
 
 export type StepStatus = "running" | "passed" | "failed" | "skipped" | "cancelled";
@@ -86,10 +87,12 @@ export interface PipelineContextData {
   dependencyTokenScope?: "installation";
   /** Autonomous runner: reference repositories to clone read-only into the workspace (from run_config envelope). */
   referenceRepos?: ReferenceRepo[];
+  /** Autonomous runner: project reviewer selection from the trusted run_config envelope. */
+  reviewers?: ReviewerSelection[];
+  /** Autonomous runner: selected image-baked reviewer code resolved from the trusted package root, never the checked-out workspace. */
+  trustedReviewerDefinitions?: ReadonlyMap<string, ReviewerDefinition>;
   /** Autonomous runner: optional reviewer rubric appended to the review prompt (e.g. kg-refresh-specific approval criteria). */
   reviewRubric?: string;
-  /** Autonomous runner: resolved project reviewer selection used by post-push review gating. */
-  reviewers?: ReviewerSelection[];
   /** Autonomous runner: short-lived read token minted by the dependency-auth step; set on context rather than returned as a step output so it is never persisted to the step log. */
   dependencyToken?: string;
   /** Autonomous runner: expiry timestamp for the dependency token (ISO 8601). */

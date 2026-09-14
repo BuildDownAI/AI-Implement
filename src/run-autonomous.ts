@@ -24,6 +24,7 @@ import type { LocalRunTokenSummary } from "./local/run-result.js";
 import { prepareScratchExclusionIfGit } from "./pipeline/scratch-exclude.js";
 import type { ReferenceRepo, ReferenceRepoResult } from "./reference-repos.js";
 import { DEFAULT_REVIEWER_SELECTION, type ReviewerSelection } from "./config.js";
+import { resolveTrustedReviewer, type ReviewerDefinition } from "./pipeline/reviewers/registry.js";
 
 type RunAutopsyPasses = Array<{
   iteration: number;
@@ -269,6 +270,21 @@ function safeBranchPrefix(raw: string | undefined): string | undefined {
   }
 }
 
+
+const EXTERNAL_REVIEWER_POLICY_IDS = new Set(["claude-review-summary"]);
+
+async function resolveTrustedReviewerDefinitions(
+  reviewers: readonly ReviewerSelection[],
+): Promise<ReadonlyMap<string, ReviewerDefinition>> {
+  const definitions = new Map<string, ReviewerDefinition>();
+  for (const selection of reviewers) {
+    if (EXTERNAL_REVIEWER_POLICY_IDS.has(selection.id) || definitions.has(selection.id)) continue;
+    const definition = await resolveTrustedReviewer(selection.id, { quietMissing: true });
+    if (definition) definitions.set(selection.id, definition);
+  }
+  return definitions;
+}
+
 function inputsFromConfig(cfg: RunConfigV1, env: NodeJS.ProcessEnv): ResolvedRunnerInputs {
   const githubOwner = env.GITHUB_OWNER;
   if (!githubOwner) throw new Error("Missing required env var: GITHUB_OWNER");
@@ -430,6 +446,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     retryPolicy,
   } = resolveRunnerInputs(process.env);
   const branch = resolveBranch(workspaceDir, baseBranch, prNumber);
+  const trustedReviewerDefinitions = await resolveTrustedReviewerDefinitions(reviewers);
 
   // Planning context is fetched from the orchestrator's provider-agnostic
   // endpoint using the reusable progress token — the runner never calls the
@@ -524,6 +541,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       dependencyTokenScope,
       referenceRepos,
       reviewers,
+      trustedReviewerDefinitions,
       profiles,
       assigneeName,
       groupingParent,

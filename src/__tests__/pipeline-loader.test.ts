@@ -4,6 +4,7 @@ import { DefaultPipelineContext } from "../pipeline/context.js";
 import { PipelineRunner } from "../pipeline/runner.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
 import type { PipelineContextData, StepModule } from "../pipeline/types.js";
+import type { ReviewerDefinition } from "../pipeline/reviewers/registry.js";
 
 const CUSTOM_PIPELINE_YAML = `id: custom-loop
 steps:
@@ -340,12 +341,18 @@ describe("loadPipelineDefinition", () => {
     });
 
     const ctx = makeContext();
-    ctx.data.reviewers = [
-      { id: "github-claude-code-review", gates: true },
-      { id: "claude-review-summary", gates: false },
-    ];
     ctx.setOutputs("clone", { workspaceDir: "/tmp/repo" });
-    ctx.setOutputs("install", { reviewProviders: ["github-claude-code-review"] });
+    const trustedDefinitions = new Map<string, ReviewerDefinition>([
+      ["gap-analysis", { id: "gap-analysis", buildPrompt: () => "prompt", outputSchema: { type: "object" } }],
+    ]);
+    const selectedReviewers = [{ id: "gap-analysis", gates: true }];
+    const repoReviewerDefinitions = [{ id: "repo-reviewer" }];
+    ctx.data.reviewers = selectedReviewers;
+    ctx.data.trustedReviewerDefinitions = trustedDefinitions;
+    ctx.setOutputs("install", {
+      reviewProviders: ["github-claude-code-review"],
+      reviewers: repoReviewerDefinitions,
+    });
     ctx.setOutputs("push", { prNumber: 42, branchPushed: true });
 
     const step = pipeline.steps.find((s) => s.id === "post-push-review")!;
@@ -353,10 +360,9 @@ describe("loadPipelineDefinition", () => {
     expect(inputs.workspaceDir).toBe("/tmp/repo");
     expect(inputs.prNumber).toBe("42");
     expect(inputs.reviewProviders).toEqual(["github-claude-code-review"]);
-    expect(inputs.reviewers).toEqual([
-      { id: "github-claude-code-review", gates: true },
-      { id: "claude-review-summary", gates: false },
-    ]);
+    expect(inputs.reviewers).toBe(selectedReviewers);
+    expect(inputs.trustedReviewerDefinitions).toBe(trustedDefinitions);
+    expect(inputs.reviewerDefinitions).toBe(repoReviewerDefinitions);
   });
 
   it("preserves an explicit empty reviewer selection for post-push-review", () => {
