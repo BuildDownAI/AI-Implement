@@ -398,6 +398,24 @@ function reviewLedgerFindingKeys(finding: PostPushReviewLedgerFinding): string[]
   return rawKeys.map(normalizeForComparison).filter(Boolean);
 }
 
+function reviewLedgerOrderRank(finding: PostPushReviewLedgerFinding): number {
+  if (finding.source !== "ai-implement-internal") return 4;
+  if (finding.reviewerId === "gap-analysis") return 0;
+  if (finding.reviewerId === "code-review") return 1;
+  if (finding.reviewerId) return 2;
+  return 3;
+}
+
+function orderedReviewLedgerFindings(
+  internalIssues: ReviewIssue[],
+  externalFindings: ReviewLedgerFinding[],
+): PostPushReviewLedgerFinding[] {
+  return [...internalIssues.map(reviewIssueToLedgerFinding), ...externalFindings]
+    .map((finding, index) => ({ finding, index }))
+    .sort((a, b) => reviewLedgerOrderRank(a.finding) - reviewLedgerOrderRank(b.finding) || a.index - b.index)
+    .map(({ finding }) => finding);
+}
+
 function buildReviewLedger(
   internalIssues: ReviewIssue[],
   externalFindings: ReviewLedgerFinding[],
@@ -406,7 +424,7 @@ function buildReviewLedger(
   const ledger: PostPushReviewLedgerFinding[] = [];
   const indexByKey = new Map<string, number>();
 
-  for (const finding of [...internalIssues.map(reviewIssueToLedgerFinding), ...externalFindings]) {
+  for (const finding of orderedReviewLedgerFindings(internalIssues, externalFindings)) {
     const keys = reviewLedgerFindingKeys(finding);
     if (keys.length === 0) continue;
 

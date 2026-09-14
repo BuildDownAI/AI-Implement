@@ -486,6 +486,74 @@ describe("postPushReviewStep", () => {
     expect(ghComments.find((comment) => comment.includes("Reviewer found issues"))).toContain("Missing acceptance criterion");
   });
 
+  it("keeps gap-analysis and code-review findings before red CI in the fix prompt", async () => {
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "status") return { stdout: "", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const ghComments: string[] = [];
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") {
+        ghComments.push(args[args.indexOf("--body") + 1]);
+        return { stdout: "", exitCode: 0 };
+      }
+      if (args[0] === "api" && args.some((a) => a === "repos/:owner/:repo/pulls/42")) {
+        return { stdout: JSON.stringify({ head: { sha: "deadbeef" } }), exitCode: 0 };
+      }
+      if (args[0] === "api" && args.some((a) => a.includes("commits/deadbeef/check-runs"))) {
+        return {
+          stdout: JSON.stringify({
+            check_runs: [
+              { name: "claude-review", status: "completed", conclusion: "success" },
+              { name: "build", status: "completed", conclusion: "failure" },
+            ],
+          }),
+          exitCode: 0,
+        };
+      }
+      if (args[0] === "api" && args.some((a) => a.includes("repos/:owner/:repo/pulls/42/reviews?per_page=100"))) {
+        return { stdout: "[]", exitCode: 0 };
+      }
+      if (args[0] === "api" && args.some((a) => a.includes("repos/:owner/:repo/issues/42/comments?per_page=100"))) {
+        return { stdout: "[]", exitCode: 0 };
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async (params) => {
+      if (params.stage === "post-push-review/gap-analysis-review-1") {
+        return structuredReviewResult({ approved: false, findings: [{ severity: "blocking", body: "Gap acceptance blocker" }] });
+      }
+      if (params.stage === "post-push-review/code-review-review-1") {
+        return structuredReviewResult({ approved: false, findings: [{ severity: "blocking", body: "Code correctness blocker" }] });
+      }
+      return { stdout: '{"fixed":[],"testing":[],"notes":""}', exitCode: 0, tokensUsed: 1 };
+    });
+
+    const out = await postPushReviewStep.run(
+      makeCtx(invoke),
+      {
+        prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn,
+        reviewers: [{ id: "code-review", gates: true }, { id: "gap-analysis", gates: true }],
+        trustedReviewerDefinitions: reviewerMap([selectedReviewerDefinition("code-review"), selectedReviewerDefinition("gap-analysis")]),
+      },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(false);
+    expect(invoke).toHaveBeenCalledTimes(3);
+    const fixPrompt = invokePrompt(invoke, 2);
+    expect(fixPrompt).toContain("Gap acceptance blocker");
+    expect(fixPrompt).toContain("Code correctness blocker");
+    expect(fixPrompt).toContain("CI check 'build' is failing on the current head");
+    expect(fixPrompt.indexOf("Gap acceptance blocker")).toBeLessThan(fixPrompt.indexOf("Code correctness blocker"));
+    expect(fixPrompt.indexOf("Code correctness blocker")).toBeLessThan(fixPrompt.indexOf("CI check 'build' is failing on the current head"));
+    const reviewComment = ghComments.find((comment) => comment.includes("Reviewer found issues"));
+    expect(reviewComment).toContain("Gap acceptance blocker");
+    expect(reviewComment).toContain("Code correctness blocker");
+    expect(reviewComment).toContain("CI check 'build' is failing on the current head");
+  });
+
   it("keeps selected gates:false internal findings advisory and visible without starting a fix pass", async () => {
     const ghComments: string[] = [];
     const ghSpawn = vi.fn((args: string[]) => {
