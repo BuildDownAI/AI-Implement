@@ -110,13 +110,13 @@ A review finding is one defect or one missing requirement that a reviewer report
 
 ## Gating finding
 
-A gating finding is a review finding that holds the merge. Only a structured source produces one: the review-findings contract, a formal changes-requested review, or an internal reviewer.
+A gating finding is a review finding that holds the merge. By default, structured sources produce one: the review-findings contract, a formal changes-requested review, or an internal reviewer. Project settings may opt scraped-prose findings into gating.
 
 **Not to be confused with:** An advisory finding.
 
 ## Advisory finding
 
-An advisory finding is a review finding that the run shows to people and never acts on. Prose parsed out of a comment body produces advisory findings.
+An advisory finding is a review finding that the run shows to people and never acts on. Prose parsed out of a comment body produces advisory findings by default; project settings may instead opt that source into gating.
 
 **Not to be confused with:** A gating finding. The difference is the source, never the severity.
 

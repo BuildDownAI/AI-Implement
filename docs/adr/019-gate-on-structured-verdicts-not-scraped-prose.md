@@ -37,10 +37,10 @@ tuning one parser.
 
 ## Decision
 
-**A finding gates a merge only when its source is structured. Prose parsed out of a comment is
-advisory and never blocks.**
+**Structured findings gate by default. Prose parsed out of a comment is advisory unless
+project reviewer settings explicitly opt that source into gating.**
 
-Three sources gate:
+Three structured sources gate by default:
 
 1. A `review-findings/v1` block emitted by the reviewer (ADR 020).
 2. A formal review state of `CHANGES_REQUESTED`. This comes from the forge's own review API,
@@ -48,7 +48,7 @@ Three sources gate:
 3. An internal reviewer, whose output is schema-validated in-process.
 
 Prose scraped from a comment body is collected, shown on the PR, and recorded in the step log —
-but it cannot hold a merge. A repository may opt its scraped findings back into gating through
+but by default it cannot hold a merge. A repository may opt its scraped findings back into gating through
 its project settings, for a reviewer it trusts and cannot change.
 
 This supersedes AII-421's third acceptance criterion. Its other criteria stand, including
@@ -72,8 +72,8 @@ This supersedes AII-421's third acceptance criterion. Its other criteria stand, 
 ## Consequences
 
 - The PR #302 false approval becomes reachable again for a reviewer that posts comment prose
-  and no formal review. This is the accepted cost. It is bounded by the internal reviewers,
-  which always gate (ADR 021), and by CI checks, which are unaffected.
+  and no formal review. This is the accepted cost. It is bounded by the default internal reviewer selection,
+  explicit project gating settings (ADR 021), and CI checks, which are unaffected.
 - The current `claude-code-action` posts issue comments, not formal reviews, so it contributes
   nothing gating until it emits the contract. The reference emitter closes this gap.
 - AII-499 is resolved as a special case: a reviewer reporting that it could not run tests is

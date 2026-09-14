@@ -37,8 +37,8 @@ Two built-in reviewers replace the single prompt:
 
 | Reviewer | Question it asks | Default |
 |---|---|---|
-| `gap-analysis` | Does the diff implement every acceptance criterion in the issue? | Always on |
-| `code-review` | Does the diff contain defects, security faults, or test gaps? | On |
+| `gap-analysis` | Does the diff implement every acceptance criterion in the issue? | On and gating |
+| `code-review` | Does the diff contain defects, security faults, or test gaps? | On and gating |
 
 `gap-analysis` emits one kind of finding: a requirement in the issue with no implementation in
 the diff. It never reports style, defects, or test gaps. A repository turns `code-review` off
@@ -75,10 +75,10 @@ step. A `custom/reviewers/<id>.ts` module carries code and stays image-baked, re
 
 ## Consequences
 
-- Every run gets at least one gating reviewer. The fail-open path in `probeExternalReviewCheck`,
-  where no matching check meant approve, stops being reachable through an absent reviewer.
-  Repositories with no review workflow become gated, and pull requests that used to merge
-  unreviewed will block. This is intended and is stated in the release note.
+- The default selection runs both internal reviewers as gating reviewers. Project settings may
+  select advisory reviewers with `gates: false`. An empty selection or an unresolved selected
+  reviewer fails closed. The external check wait remains unchanged; the default internal
+  selection supplies review coverage even when no external review workflow is present.
 - Reviewer cost is now per reviewer. Each carries its own `reviewMaxTurns`; one shared cap would
   let a long code review starve a short gap analysis.
 - A fix pass addresses the whole findings ledger at once, ordered gap-analysis first, because a
