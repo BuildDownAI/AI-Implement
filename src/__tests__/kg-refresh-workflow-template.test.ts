@@ -52,6 +52,12 @@ describe("claude-implement.yml template — runner_phase and runner_callback_url
     expect(step.env).not.toHaveProperty("RUNNER_CALLBACK_URL");
   });
 
+  it("no template line references inputs.runner_phase or inputs.runner_callback_url", () => {
+    const raw = readFileSync(TEMPLATE, "utf-8");
+    expect(raw).not.toContain("inputs.runner_phase");
+    expect(raw).not.toContain("inputs.runner_callback_url");
+  });
+
   it("declares run_progress_token as a workflow_dispatch input (regression guard)", () => {
     const doc = getParsedTemplate();
     const inputs = doc.on.workflow_dispatch.inputs;
