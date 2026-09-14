@@ -188,6 +188,46 @@ export class SidecarMemoryProvider implements MemoryProvider {
     return sessionHeader;
   }
 
+  /**
+   * Sends via `send`, and if the sidecar reports a session error, runs the
+   * handshake once and retries `send` with the negotiated session id. Shared
+   * by `listTools` and `proxyCall`, which differ only in how they consume the
+   * result (parsed tool list vs. raw response forwarding).
+   *
+   * On success `handshakeError` is absent and `result`/`parsed` reflect the
+   * final attempt. If the handshake itself throws, `result`/`parsed` reflect
+   * the *original* rejection (before the handshake), and `handshakeError`
+   * carries the thrown error — callers decide whether to report the original
+   * rejection or the handshake failure.
+   */
+  private async sendWithSessionRetry(
+    target: URL,
+    transport: typeof http | typeof https,
+    forwardHeaders: SidecarHeaders,
+    send: (sessionId: string | null) => Promise<SidecarPostResult>,
+  ): Promise<{ result: SidecarPostResult; parsed: SidecarRpcResponse | null; handshakeError?: unknown }> {
+    const first = await send(this.sessionId);
+    if (!first.ok) return { result: first, parsed: null };
+
+    let result: SidecarPostResult = first;
+    let parsed = parseSidecarRpcResponse(first.raw.toString(), first.headers["content-type"]);
+    const kind = classifySessionError(first.status, parsed, this.sessionId);
+    if (kind) {
+      if (kind === "stale-session") this.sessionId = null;
+      try {
+        const sessionId = await this.initializeSession(target, transport, forwardHeaders);
+        this.sessionId = sessionId;
+        console.error(`[mcp] KG sidecar demanded a session; initialized (id ${sessionId}) and retried`);
+        const retry = await send(sessionId);
+        result = retry;
+        parsed = retry.ok ? parseSidecarRpcResponse(retry.raw.toString(), retry.headers["content-type"]) : null;
+      } catch (err) {
+        return { result, parsed, handshakeError: err };
+      }
+    }
+    return { result, parsed };
+  }
+
   async listTools(body: Buffer, headers: http.IncomingHttpHeaders): Promise<unknown[]> {
     const target = new URL(this.kgSidecarUrl);
     const transport = target.protocol === "https:" ? https : http;
@@ -202,34 +242,16 @@ export class SidecarMemoryProvider implements MemoryProvider {
       return this.sendToSidecar(target, transport, "POST", reqHeaders, body);
     };
 
-    const first = await send(this.sessionId);
-    if (!first.ok) return [];
-    let okResult = first;
-
-    let parsed = parseSidecarRpcResponse(okResult.raw.toString(), okResult.headers["content-type"]);
-    const kind = classifySessionError(okResult.status, parsed, this.sessionId);
-    if (kind) {
-      if (kind === "stale-session") this.sessionId = null;
-      try {
-        const sessionId = await this.initializeSession(target, transport, forwardHeaders);
-        this.sessionId = sessionId;
-        console.error(`[mcp] KG sidecar demanded a session; initialized (id ${sessionId}) and retried`);
-        const retry = await send(sessionId);
-        if (!retry.ok) return [];
-        okResult = retry;
-        parsed = parseSidecarRpcResponse(okResult.raw.toString(), okResult.headers["content-type"]);
-      } catch {
-        // Handshake itself failed — fall through and report the original rejection below.
-      }
-    }
+    const { result, parsed } = await this.sendWithSessionRetry(target, transport, forwardHeaders, send);
+    if (!result.ok) return [];
 
     if (!parsed) {
       console.error(
-        `[mcp] KG sidecar tools/list unparseable (status ${okResult.status}, content-type ${okResult.headers["content-type"]}): ${okResult.raw.toString().slice(0, 200)}`,
+        `[mcp] KG sidecar tools/list unparseable (status ${result.status}, content-type ${result.headers["content-type"]}): ${result.raw.toString().slice(0, 200)}`,
       );
     } else if (!parsed.result) {
       console.error(
-        `[mcp] KG sidecar tools/list returned no result (status ${okResult.status}): ${JSON.stringify(parsed.error ?? parsed).slice(0, 200)}`,
+        `[mcp] KG sidecar tools/list returned no result (status ${result.status}): ${JSON.stringify(parsed.error ?? parsed).slice(0, 200)}`,
       );
     }
     return parsed?.result?.tools ?? [];
@@ -270,43 +292,23 @@ export class SidecarMemoryProvider implements MemoryProvider {
       }
     };
 
-    const forward = (result: Extract<SidecarPostResult, { ok: true }>) => {
-      const outHeaders = { ...result.headers } as http.OutgoingHttpHeaders;
-      delete outHeaders["transfer-encoding"];
-      outHeaders["content-length"] = String(result.raw.length);
-      res.writeHead(result.status, outHeaders);
-      res.end(result.raw);
-    };
-
     void (async () => {
-      let result = await send(this.sessionId);
+      const { result, handshakeError } = await this.sendWithSessionRetry(target, transport, forwardHeaders, send);
+      if (handshakeError) {
+        console.error("[mcp] KG sidecar session initialize failed:", handshakeError);
+        writeJson(res, 502, { error: "KG sidecar error" });
+        return;
+      }
       if (!result.ok) {
         writeConnectionError(result.error);
         return;
       }
 
-      const parsed = parseSidecarRpcResponse(result.raw.toString(), result.headers["content-type"]);
-      const kind = classifySessionError(result.status, parsed, this.sessionId);
-      if (kind) {
-        if (kind === "stale-session") this.sessionId = null;
-        try {
-          const sessionId = await this.initializeSession(target, transport, forwardHeaders);
-          this.sessionId = sessionId;
-          console.error(`[mcp] KG sidecar demanded a session; initialized (id ${sessionId}) and retried`);
-          const retryResult = await send(sessionId);
-          if (!retryResult.ok) {
-            writeConnectionError(retryResult.error);
-            return;
-          }
-          result = retryResult;
-        } catch (err) {
-          console.error("[mcp] KG sidecar session initialize failed:", err);
-          writeJson(res, 502, { error: "KG sidecar error" });
-          return;
-        }
-      }
-
-      forward(result);
+      const outHeaders = { ...result.headers } as http.OutgoingHttpHeaders;
+      delete outHeaders["transfer-encoding"];
+      outHeaders["content-length"] = String(result.raw.length);
+      res.writeHead(result.status, outHeaders);
+      res.end(result.raw);
     })();
   }
 }
