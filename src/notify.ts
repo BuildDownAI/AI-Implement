@@ -53,6 +53,8 @@ export interface DeployNotification {
   downtimeMs?: number | null; // Gap between the shutdown notice and the boot that answered it, when both were observed.
   commit?: string | null; // Only the "available" kind — there is no image to reference yet.
   kgDegraded?: boolean; // True when embeddings were not built — /mcp serves lexical-only search.
+  kgUnavailable?: boolean; // True when the last sidecar liveness probe failed (AII-648/650).
+  sidecarError?: string | null; // The probe's lastError, shown alongside kgUnavailable.
 }
 
 // Human label for a run phase, reused across notification kinds (dispatch, completion, …).
@@ -493,6 +495,7 @@ async function notifyDeploySlack(webhookUrl: string, n: DeployNotification): Pro
 
   let text = `${event.slackEmoji} ${mention}*${event.title}* — ${event.summary}\n${details.join(" · ")}`;
   if (n.kgDegraded) text += "\n⚠️ KG embeddings missing — /mcp is lexical-only";
+  if (n.kgUnavailable) text += `\n⚠️ KG sidecar not serving — ${n.sidecarError ?? "unknown error"}`;
 
   const res = await fetch(webhookUrl, {
     method: "POST",
@@ -534,6 +537,9 @@ async function notifyDeployTeams(webhookUrl: string, n: DeployNotification): Pro
   ];
   if (n.kgDegraded) {
     cardBody.push({ type: "TextBlock", text: "⚠️ KG embeddings missing — /mcp is lexical-only", wrap: true });
+  }
+  if (n.kgUnavailable) {
+    cardBody.push({ type: "TextBlock", text: `⚠️ KG sidecar not serving — ${n.sidecarError ?? "unknown error"}`, wrap: true });
   }
 
   const card = {

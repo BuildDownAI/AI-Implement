@@ -2,7 +2,7 @@ import { PassThrough, Writable } from "node:stream";
 import http from "node:http";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { handleMcpRequest, WRITE_TOOLS } from "../mcp.js";
-import { SidecarMemoryProvider } from "../kg-provider.js";
+import { SidecarMemoryProvider, sidecarHealth } from "../kg-provider.js";
 import type { MemoryProvider } from "../kg-provider.js";
 import type { PreflightCheckResult, KgRefreshStatus } from "../kg-refresh.js";
 
@@ -120,6 +120,10 @@ beforeEach(async () => {
   deployNotifyMock = await import("../deploy-notify.js");
   deployPostureMock = await import("../deploy-posture.js");
   (deployNotifyMock.isKgDegraded as ReturnType<typeof vi.fn>).mockReturnValue(false);
+  sidecarHealth.reachable = false;
+  sidecarHealth.toolsListed = false;
+  sidecarHealth.lastError = null;
+  sidecarHealth.checkedAt = null;
   (deployPostureMock.getDeployPosture as ReturnType<typeof vi.fn>).mockResolvedValue({
     autoDeploy: true,
     watchedRepo: "BuildDownAI/AI-Implement",
@@ -672,6 +676,50 @@ describe("handleMcpRequest", () => {
       const parsed = JSON.parse(result.body);
       const data = JSON.parse(parsed.result.content[0].text);
       expect(data.kgDegraded).toBe(false);
+    });
+
+    it("get_tenant_health includes kgUnavailable=false and a reachable sidecar record when the last probe succeeded", async () => {
+      sidecarHealth.reachable = true;
+      sidecarHealth.toolsListed = true;
+      sidecarHealth.lastError = null;
+      sidecarHealth.checkedAt = 1_700_000_000_000;
+
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 20, method: "tools/call", params: { name: "get_tenant_health", arguments: {} } }),
+      );
+
+      expect(result.statusCode).toBe(200);
+      const parsed = JSON.parse(result.body);
+      const data = JSON.parse(parsed.result.content[0].text);
+      expect(data.kgUnavailable).toBe(false);
+      expect(data.sidecar).toEqual({ reachable: true, toolsListed: true, lastError: null, checkedAt: 1_700_000_000_000 });
+    });
+
+    it("get_tenant_health includes kgUnavailable=true and the sidecar error when the last probe failed", async () => {
+      sidecarHealth.reachable = false;
+      sidecarHealth.toolsListed = false;
+      sidecarHealth.lastError = "tools/list failed: ECONNREFUSED";
+      sidecarHealth.checkedAt = 1_700_000_001_000;
+
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 21, method: "tools/call", params: { name: "get_tenant_health", arguments: {} } }),
+      );
+
+      expect(result.statusCode).toBe(200);
+      const parsed = JSON.parse(result.body);
+      const data = JSON.parse(parsed.result.content[0].text);
+      expect(data.kgUnavailable).toBe(true);
+      expect(data.sidecar.lastError).toBe("tools/list failed: ECONNREFUSED");
     });
 
     it("get_tenant_health kgRefreshPreflight is null when runKgRefreshPreflight is not wired", async () => {

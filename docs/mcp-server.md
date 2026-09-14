@@ -34,8 +34,8 @@ Reads, orchestrator-native:
 | Tool | Returns |
 | -- | -- |
 | `get_session_identity` | The caller's email, provider, and role (`user`, `admin`, or `null` for an identity with no allowlist entry), as the allowlist resolves them now. Admin-only skills call this first. |
-| `get_tenant_health` | Runner mode, in-flight jobs, pending gap-fills, project count, KG degraded flag, and the kg-refresh credential preflight rows |
-| `get_kg_status` | KG refresh rail state: stage, served stamp, materialize path, last refresh outcome and gate |
+| `get_tenant_health` | Runner mode, in-flight jobs, pending gap-fills, project count, KG degraded flag, `kgUnavailable` + `sidecar` (the sidecar liveness probe's `reachable`/`toolsListed`/`lastError`/`checkedAt`, AII-650), and the kg-refresh credential preflight rows |
+| `get_kg_status` | KG refresh rail state: stage, served stamp, materialize path, last refresh outcome and gate, plus `kgUnavailable` + `sidecar` (same shape as `get_tenant_health`, AII-650) |
 | `get_runner_mode` | Global runner mode and its source |
 | `list_projects` | Every project mapping with its settings, minus `extraEnv` |
 | `list_in_flight_jobs` | Dispatching or running jobs with elapsed time |

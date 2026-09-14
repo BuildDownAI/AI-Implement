@@ -98,6 +98,7 @@ export const deploymentsHtml = `
       <div class="card-body">
         <div class="kpi-trend" id="kg-refresh-stamp">Served graph stamp: —</div>
         <div class="kpi-trend text-secondary" id="kg-refresh-last"></div>
+        <div class="kpi-trend text-secondary" id="kg-sidecar-status" hidden></div>
         <div style="margin-top: 12px">
           <button class="btn btn-sm" id="kg-refresh-btn" onclick="window.triggerKgRefresh()">Refresh graph now</button>
           <button class="btn btn-sm" id="kg-dry-run-btn" onclick="window.triggerKgRefresh(true)">Dry-run refresh</button>
@@ -652,6 +653,18 @@ export const deploymentsScript = `
         ? 'Last refresh: ' + last.detail
         : 'Last refresh: ' + (last.ok ? 'ok' : 'failed at gate "' + (last.gate || '?') + '"') + ' \u2014 ' + last.detail;
       document.getElementById('kg-refresh-last').textContent = progressText || lastText;
+      // AII-650: surface the sidecar liveness probe (AII-648) next to the stage-based badge —
+      // a sidecar can be "serving" per the stage above while the probe shows it rejecting calls.
+      const sidecarEl = document.getElementById('kg-sidecar-status');
+      if (data.kgUnavailable) {
+        sidecarEl.textContent = '⚠️ KG sidecar not serving — ' + ((data.sidecar && data.sidecar.lastError) || 'unknown error');
+        sidecarEl.hidden = false;
+      } else if (data.sidecar && data.sidecar.checkedAt) {
+        sidecarEl.textContent = 'KG sidecar: reachable';
+        sidecarEl.hidden = false;
+      } else {
+        sidecarEl.hidden = true;
+      }
       renderKgDryRun(document.getElementById('kg-dry-run-last'), last);
       const busy = !!data.running || !!data.deployHeld;
       document.getElementById('kg-refresh-btn').disabled = busy;

@@ -1,5 +1,6 @@
 import { getDb } from "./dedup.js";
 import { notifyDeploy, type DeployNotification } from "./notify.js";
+import { isKgUnavailable, sidecarHealth } from "./kg-provider.js";
 
 export interface BootStateInput {
   currentImageRef: string;
@@ -127,6 +128,8 @@ function describe(kind: DeployNotification["kind"], imageRef: string, downtimeMs
     imageRef,
     downtimeMs,
     kgDegraded: isKgDegraded(),
+    kgUnavailable: isKgUnavailable(),
+    sidecarError: sidecarHealth.lastError,
   };
 }
 

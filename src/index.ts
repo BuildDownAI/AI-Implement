@@ -65,7 +65,7 @@ import type { RunnerProgressBody, RunnerResultBody } from "./runner-callback.js"
 import { mintRunToken, PLANNING_TTL_SECONDS, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
 import { handleGapFillTrigger } from "./gap-fill-trigger.js";
 import { handleMcpRequest } from "./mcp.js";
-import { resolveMemoryProvider, providerUnconfiguredReason, SidecarMemoryProvider, KG_TOOL_CAPABILITY } from "./kg-provider.js";
+import { resolveMemoryProvider, providerUnconfiguredReason, SidecarMemoryProvider, KG_TOOL_CAPABILITY, probeWithTimeout, sidecarHealthFields } from "./kg-provider.js";
 import type { MemoryProvider } from "./kg-provider.js";
 import { withRequestErrorBoundary } from "./http-server.js";
 import {
@@ -3428,6 +3428,7 @@ function startServer(
         status: "ok",
         polls,
         kgDegraded: isKgDegraded(),
+        ...sidecarHealthFields(),
         lastPollStartedAt: lastPollStartedAt?.toISOString() ?? null,
         lastPollFinishedAt: lastPollFinishedAt?.toISOString() ?? null,
       }));
@@ -4059,7 +4060,7 @@ async function main(): Promise<void> {
   const memoryProviderDiagnostic = providerUnconfiguredReason(config.kgSidecarUrl, config.memoryProviderId);
   let sidecarProbeError: string | null = null;
   if (memoryProvider instanceof SidecarMemoryProvider) {
-    const health = await memoryProvider.probe();
+    const health = await probeWithTimeout(memoryProvider);
     if (health.lastError) {
       sidecarProbeError = health.lastError;
       console.error(`[kg] sidecar probe FAILED: ${health.lastError}`);

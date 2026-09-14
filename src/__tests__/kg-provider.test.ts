@@ -7,11 +7,13 @@ import {
   UnknownMemoryProviderError,
   isKgUnavailable,
   parseSidecarRpcResponse,
+  probeWithTimeout,
   providerUnconfiguredReason,
   resolveMemoryProvider,
   sidecarHealth,
+  sidecarHealthFields,
 } from "../kg-provider.js";
-import type { MemoryProvider, MemoryProviderCapabilities } from "../kg-provider.js";
+import type { MemoryProvider, MemoryProviderCapabilities, SidecarHealth } from "../kg-provider.js";
 
 // ---- parseSidecarRpcResponse ----
 
@@ -713,11 +715,26 @@ describe("SidecarMemoryProvider probe", () => {
 
     const health = await makeProvider().probe();
 
-    expect(health.reachable).toBe(false);
+    // AII-650 refinement #1: this is exactly the original KGB-28 incident shape — a sidecar
+    // that is up and answering (a well-formed HTTP 400 with a JSON-RPC error body) but unusable.
+    // `reachable` must read true here; `toolsListed`/`lastError` carry the actual failure.
+    expect(health.reachable).toBe(true);
     expect(health.toolsListed).toBe(false);
     expect(health.lastError).toBeTruthy();
     // handshake attempted exactly once: initial tools/list, initialize, notify, retried tools/list
     expect(mockHttpRequest).toHaveBeenCalledTimes(4);
+  });
+
+  it("records reachable: true when tools/list returns a well-formed JSON-RPC error unrelated to sessions", async () => {
+    queueResponse(200, JSON.stringify({ jsonrpc: "2.0", id: "probe-tools-list", error: { code: -32000, message: "internal error" } }));
+
+    const health = await makeProvider().probe();
+
+    expect(health.reachable).toBe(true);
+    expect(health.toolsListed).toBe(false);
+    expect(health.lastError).toContain("internal error");
+    expect(isKgUnavailable()).toBe(true);
+    expect(mockHttpRequest).toHaveBeenCalledTimes(1); // no session retry — status 200 is not a session signal
   });
 
   it("reuses the session handshake path: a session-demanding sidecar still completes a successful probe", async () => {
@@ -840,6 +857,11 @@ describe("SidecarMemoryProvider probe", () => {
       const result = await p.listTools(Buffer.from("{}"), {});
 
       expect(result).toEqual([]);
+      // maybeReprobe() is fired and forgotten (AII-650 refinement #2), so give it a few ticks
+      // to land before asserting on the shared sidecarHealth record it updates.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await new Promise((resolve) => setTimeout(resolve, 0));
       expect(mockHttpRequest).toHaveBeenCalledTimes(2);
       expect(sidecarHealth.reachable).toBe(false);
       expect(sidecarHealth.checkedAt).not.toBeNull();
@@ -851,11 +873,19 @@ describe("SidecarMemoryProvider probe", () => {
 
       const p = makeProvider();
       await p.listTools(Buffer.from("{}"), {});
+      // maybeReprobe() is fired and forgotten (AII-650 refinement #2) — wait for it to land
+      // before reading checkedAt/reachable off the shared sidecarHealth record.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await new Promise((resolve) => setTimeout(resolve, 0));
       expect(mockHttpRequest).toHaveBeenCalledTimes(2);
       const checkedAtAfterFirst = sidecarHealth.checkedAt;
 
       queueConnectionError("ECONNREFUSED"); // second listTools attempt only — no further re-probe call queued
       const result = await p.listTools(Buffer.from("{}"), {});
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await new Promise((resolve) => setTimeout(resolve, 0));
 
       expect(result).toEqual([]);
       expect(mockHttpRequest).toHaveBeenCalledTimes(3);
@@ -889,6 +919,121 @@ describe("SidecarMemoryProvider probe", () => {
       expect(mockHttpRequest).toHaveBeenCalledTimes(2);
       expect(sidecarHealth.checkedAt).not.toBeNull();
     });
+
+    // AII-650 refinement #2: maybeReprobe() must be fired and forgotten, not awaited — the
+    // triggering call should not pay for the re-probe's round trip before returning its own result.
+    it("listTools returns without waiting for the triggered re-probe to finish", async () => {
+      queueConnectionError("ECONNREFUSED"); // the listTools attempt itself
+      // Re-probe's tools/list request: mockHttpRequest resolves it, but nothing ever calls
+      // back or errors — if listTools awaited maybeReprobe(), this test would time out.
+      mockHttpRequest.mockImplementationOnce(() => new PassThrough());
+
+      const p = makeProvider();
+      const result = await p.listTools(Buffer.from("{}"), {});
+
+      expect(result).toEqual([]);
+      expect(mockHttpRequest).toHaveBeenCalledTimes(2); // the attempt itself, plus the kicked-off re-probe
+    });
+
+    it("proxyCall responds without waiting for the triggered re-probe to finish", async () => {
+      queueConnectionError("ECONNREFUSED"); // the proxyCall attempt itself
+      mockHttpRequest.mockImplementationOnce(() => new PassThrough()); // re-probe hangs forever
+
+      const p = makeProvider();
+      const res = {
+        headersSent: false,
+        writeHead() {
+          res.headersSent = true;
+        },
+        end() {
+          /* no-op */
+        },
+        destroy() {
+          /* no-op */
+        },
+      } as unknown as http.ServerResponse & { headersSent: boolean };
+      const req = { headers: {}, method: "POST" } as unknown as http.IncomingMessage;
+
+      p.proxyCall(req, res, Buffer.from("{}"));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(res.headersSent).toBe(true);
+      expect(mockHttpRequest).toHaveBeenCalledTimes(2);
+    });
+  });
+});
+
+// ---- probeWithTimeout (AII-650 refinement #3) ----
+
+describe("probeWithTimeout", () => {
+  it("resolves with a recorded timeout when probe() does not resolve within the cap", async () => {
+    const fastCheckedAt = Date.now();
+    const slowProvider = {
+      probe: () =>
+        new Promise<SidecarHealth>((resolve) =>
+          setTimeout(() => resolve({ reachable: true, toolsListed: true, lastError: null, checkedAt: fastCheckedAt }), 200),
+        ),
+    } as unknown as SidecarMemoryProvider;
+
+    const health = await probeWithTimeout(slowProvider, 20);
+
+    expect(health.reachable).toBe(false);
+    expect(health.toolsListed).toBe(false);
+    expect(health.lastError).toContain("timed out");
+    expect(isKgUnavailable()).toBe(true);
+  });
+
+  it("resolves with the real probe result when it completes before the cap", async () => {
+    const fastHealth: SidecarHealth = { reachable: true, toolsListed: true, lastError: null, checkedAt: Date.now() };
+    const fastProvider = { probe: () => Promise.resolve(fastHealth) } as unknown as SidecarMemoryProvider;
+
+    const health = await probeWithTimeout(fastProvider, 30_000);
+
+    expect(health).toEqual(fastHealth);
+  });
+});
+
+// ---- sidecarHealthFields (AII-650) ----
+
+describe("sidecarHealthFields", () => {
+  afterEach(() => {
+    sidecarHealth.reachable = false;
+    sidecarHealth.toolsListed = false;
+    sidecarHealth.lastError = null;
+    sidecarHealth.checkedAt = null;
+  });
+
+  it("reflects kgUnavailable=false and the sidecar record when no probe has failed", () => {
+    sidecarHealth.reachable = true;
+    sidecarHealth.toolsListed = true;
+    sidecarHealth.lastError = null;
+    sidecarHealth.checkedAt = 1_700_000_000_000;
+
+    expect(sidecarHealthFields()).toEqual({
+      kgUnavailable: false,
+      sidecar: { reachable: true, toolsListed: true, lastError: null, checkedAt: 1_700_000_000_000 },
+    });
+  });
+
+  it("reflects kgUnavailable=true and the error text after a failed probe", () => {
+    sidecarHealth.reachable = false;
+    sidecarHealth.toolsListed = false;
+    sidecarHealth.lastError = "tools/list failed: ECONNREFUSED";
+    sidecarHealth.checkedAt = 1_700_000_001_000;
+
+    expect(sidecarHealthFields()).toEqual({
+      kgUnavailable: true,
+      sidecar: { reachable: false, toolsListed: false, lastError: "tools/list failed: ECONNREFUSED", checkedAt: 1_700_000_001_000 },
+    });
+  });
+
+  it("returns a snapshot, not a live reference — mutating sidecarHealth afterward does not change the returned object", () => {
+    sidecarHealth.lastError = null;
+    const fields = sidecarHealthFields();
+    sidecarHealth.lastError = "boom";
+    expect(fields.sidecar.lastError).toBeNull();
   });
 });
 
