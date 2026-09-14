@@ -3195,9 +3195,10 @@ async function dispatchKgRefreshRun(
   const repo = parseKgSourceRepo(config.kgSourceRepo);
   const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, repo.owner);
   const defaultBranch = (await getRepoDefaultBranch(ghToken, repo.owner, repo.repo)) ?? "main";
+  const decodedConfig = decodeRunConfig(opts.runConfig);
   // A PR-triggered dry-run (AII-633) carries kgSourceRef — the PR's head branch — so the
   // GHA dispatch runs against that ref instead of the default branch. Absent = unchanged.
-  const dispatchRef = decodeRunConfig(opts.runConfig).kgSourceRef ?? defaultBranch;
+  const dispatchRef = decodedConfig.kgSourceRef ?? defaultBranch;
 
   // Use the execution path resolved once by resolveExecutionMode in trigger() when
   // available. Falling back to an independent resolution is only a safety net for
@@ -3220,7 +3221,7 @@ async function dispatchKgRefreshRun(
       runnerImageExplicit: config.runnerImageExplicit,
     });
     const runnerCallbackUrl = config.runnerCallbackBaseUrl ?? undefined;
-    const dispatchInputs = buildKgRefreshGhaDispatchBody({ runConfig: opts.runConfig, runToken: opts.runToken, runProgressToken: opts.runProgressToken, runnerImage, runnerCallbackUrl, runnerPhase: "kg-refresh", jobTimeoutMinutes: "240" });
+    const dispatchInputs = buildKgRefreshGhaDispatchBody({ runConfig: opts.runConfig, runToken: opts.runToken, runProgressToken: opts.runProgressToken, runnerImage, runnerCallbackUrl, runnerPhase: "kg-refresh", jobTimeoutMinutes: "240", issueIdentifier: decodedConfig.issue.identifier });
     const dispatchedAt = Date.now();
     const dispatchResult = await postWorkflowDispatch({
       token: ghToken,

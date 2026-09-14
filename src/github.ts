@@ -6,6 +6,11 @@ import { DEFAULT_RETRY_POLICY, type RetryPolicy } from "./pipeline/retry-backoff
 export interface DispatchInputs {
   /** Legacy mode: per-field issue data. */
   issue_id?: string;
+  /**
+   * Legacy mode: authoritative issue identifier. Envelope mode: display-only duplicate of
+   * run_config.issue.identifier, read solely by the workflow's `run-name:` expression (which
+   * cannot decode run_config) to title the Actions run with the ticket key.
+   */
   issue_identifier?: string;
   issue_title?: string;
   issue_description?: string;
@@ -73,14 +78,17 @@ export interface DispatchResult {
 /**
  * `workflow_dispatch` inputs that an older synced `claude-implement.yml` still declares but a
  * newer template drops, because their values now ride inside `run_config` instead. Only the
- * kg-refresh GHA dispatch (`dispatchKgRefreshRun` in `src/index.ts`) still sends these two
+ * kg-refresh GHA dispatch (`dispatchKgRefreshRun` in `src/index.ts`) still sends these
  * top-level — every other dispatch site already builds inputs via `buildEnvelopeDispatchInputs`,
  * which never sets them. `postWorkflowDispatch` strips whichever of these a 422 names and
  * retries — **at most once**, regardless of what the retry's own response says — so the
- * orchestrator can serve both template generations until every target repo has re-synced. The
- * next issue in this chain appends `issue_identifier` to this list.
+ * orchestrator can serve both template generations until every target repo has re-synced.
+ * `issue_identifier` joined this list for the same reason (AII-656): on the envelope contract
+ * it is a display-only duplicate of `run_config.issue.identifier`, so a target repo that hasn't
+ * re-synced can drop it without losing anything; the `run_config` guard below keeps it
+ * authoritative on the legacy contract, where no duplicate exists.
  */
-export const ENVELOPE_OPTIONAL_INPUTS = ["runner_phase", "runner_callback_url"] as const;
+export const ENVELOPE_OPTIONAL_INPUTS = ["runner_phase", "runner_callback_url", "issue_identifier"] as const;
 
 /**
  * Extracts the quoted input names from a GitHub "unexpected inputs" rejection so the caller can
@@ -348,6 +356,10 @@ export function buildEnvelopeDispatchInputs(
 
   return {
     run_config: encodeRunConfig(runConfig),
+    // Display-only duplicate: run-name: is evaluated before any step runs, so it cannot
+    // decode run_config. The shared 422 retry (ENVELOPE_OPTIONAL_INPUTS) strips this on a
+    // template that predates the declaration.
+    issue_identifier: issue.identifier,
     run_token: opts.runToken ?? "",
     ...(opts.runProgressToken !== undefined ? { run_progress_token: opts.runProgressToken } : {}),
     ...(opts.runnerPhase !== "planning" && opts.runnerPhase !== "kg-refresh" && opts.runPublicationToken !== undefined
@@ -709,8 +721,11 @@ export const KG_GHA_POLL_DELAYS_MS: readonly number[] = [5_000, 10_000, 20_000, 
  * Builds the `workflow_dispatch` inputs for a GHA-backed kg-refresh run, for use with
  * `postWorkflowDispatch`. The envelope's `runnerCallbackUrl` is the bare base URL (AII-548);
  * `runner_phase` selects the kg-refresh entry in the shared claude-implement.yml template
- * (AII-556) — it, and `runner_callback_url`, are members of `ENVELOPE_OPTIONAL_INPUTS` and are
- * stripped by the poster on a 422 from a target repo that no longer declares them.
+ * (AII-556) — it, `runner_callback_url`, and `issue_identifier` are members of
+ * `ENVELOPE_OPTIONAL_INPUTS` and are stripped by the poster on a 422 from a target repo that no
+ * longer declares them. `issueIdentifier` is the decoded run_config's `issue.identifier` — the
+ * caller (`dispatchKgRefreshRun` in `src/index.ts`) already decodes run_config once for
+ * `kgSourceRef` and threads the same decode through here rather than decoding twice.
  */
 export function buildKgRefreshGhaDispatchBody(opts: {
   runConfig: string;
@@ -720,6 +735,7 @@ export function buildKgRefreshGhaDispatchBody(opts: {
   runnerCallbackUrl?: string | undefined;
   runnerPhase?: DispatchInputs["runner_phase"];
   jobTimeoutMinutes?: string;
+  issueIdentifier?: string;
 }): DispatchInputs {
   return {
     run_config: opts.runConfig,
@@ -729,6 +745,7 @@ export function buildKgRefreshGhaDispatchBody(opts: {
     ...(opts.jobTimeoutMinutes ? { job_timeout_minutes: opts.jobTimeoutMinutes } : {}),
     ...(opts.runnerImage ? { runner_image: opts.runnerImage } : {}),
     ...(opts.runnerCallbackUrl ? { runner_callback_url: opts.runnerCallbackUrl } : {}),
+    ...(opts.issueIdentifier ? { issue_identifier: opts.issueIdentifier } : {}),
   };
 }
 

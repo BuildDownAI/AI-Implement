@@ -12,13 +12,14 @@ The envelope consolidates all YAML-safe data into a single base64-encoded JSON b
 
 ---
 
-## 8-Input Implementation Contract
+## 9-Input Implementation Contract
 
-A top-level `workflow_dispatch` input is reserved for a value GitHub must evaluate before any step runs (routing, image selection, timeout) or a secret this workflow has to mask; every other per-run value rides inside `run_config` instead of growing the input list. `claude-implement.yml` (post-envelope generation) exposes exactly these eight `workflow_dispatch` inputs:
+A top-level `workflow_dispatch` input is reserved for a value GitHub must evaluate before any step runs (routing, image selection, timeout) or a secret this workflow has to mask; every other per-run value rides inside `run_config` instead of growing the input list. `issue_identifier` is the one deliberate exception: it carries no data the runner needs — `run_config.issue.identifier` is authoritative — but `run-name:` is itself a value GitHub evaluates before any step runs, and a `run-name:` expression cannot decode `run_config`, so the ticket key has to duplicate onto a plain top-level input for the run list to show it. `claude-implement.yml` (post-envelope generation) exposes exactly these nine `workflow_dispatch` inputs:
 
 | Input | Required | Type | Notes |
 |-------|----------|------|-------|
 | `run_config` | **Yes** | string | Base64-encoded `RunConfigV1` JSON — all issue data and per-project config |
+| `issue_identifier` | No | string | Display-only duplicate of `run_config.issue.identifier`, read solely by `run-name:` to title the Actions run with the ticket key; no step reads it |
 | `runner_image` | No | string | Container image override; allowlist-validated against `ghcr.io/builddownai/`, the repo owner's namespace, and `AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES` |
 | `job_timeout_minutes` | No | string | GHA `timeout-minutes` for the implement job; empty defaults to 90 |
 | `provider` | No | string | `anthropic` (default) or `bedrock` — determines auth path before the runner starts |
@@ -31,7 +32,7 @@ The three runner tokens stay outside the envelope specifically so the workflow c
 
 These are live credentials in the runner's environment; `src/__tests__/setup/clear-runner-credentials.ts` (registered as a Vitest `setupFile`) deletes all five credential variables before every test so no suite can burn a single-use token against the live orchestrator. A test that needs a credential value may set it in the test body — the global `beforeEach` ensures it is cleared again before the next test. Tests that exercise callback or fetch paths should inject a mock `fetchImpl` (or equivalent dependency-injection point) rather than letting code reach a live URL.
 
-Headroom note: GitHub caps `workflow_dispatch` at 10 inputs; 8 of 10 used; `issue_identifier` (run titles) takes the ninth. That ceiling is part of why the envelope exists; a new field must ride inside `run_config` unless the workflow itself has to read it before the runner starts (masking, routing), in which case an existing input has to make room. `claude-plan.yml` declares seven of these (no `run_publication_token`).
+Headroom note: GitHub caps `workflow_dispatch` at 10 inputs; 9 of 10 used; one slot free. That ceiling is part of why the envelope exists; a new field must ride inside `run_config` unless the workflow itself has to read it before the runner starts (masking, routing), in which case an existing input has to make room. `claude-plan.yml` declares eight of these (no `run_publication_token`).
 
 The first step of the container job prints every input (`[dispatch-inputs] …`), with the three tokens reduced to `<redacted>`/`(empty)` and `run_config` base64-decoded through `jq`, so a run's log opens with the exact envelope it was dispatched with. `provider` and `aws_region` are also forwarded into the entrypoint env as `PROVIDER`/`AWS_REGION`: the runner reads the provider from env, not from the envelope, so a template that drops them silently downgrades Bedrock repos to the anthropic provider.
 
@@ -44,16 +45,14 @@ Every current dispatch site builds inputs through `buildEnvelopeDispatchInputs`,
 GitHub rejects a `workflow_dispatch` naming an input the target workflow doesn't declare (422 `Unexpected inputs provided: [...]`). A target repo adopts a new template shape only when it merges a sync PR, so the orchestrator cannot assume every repo has re-synced. `src/github.ts` declares:
 
 ```typescript
-const ENVELOPE_OPTIONAL_INPUTS = ["runner_phase", "runner_callback_url"] as const;
+const ENVELOPE_OPTIONAL_INPUTS = ["runner_phase", "runner_callback_url", "issue_identifier"] as const;
 ```
 
-— inputs an older template declares and a newer one does not, because a newer template reads their values from `run_config` (AII-653). The shared poster, `postWorkflowDispatch`, strips-and-retries on a 422: when the response is HTTP 422, the body matches `/unexpected inputs/i`, and names — by exact match against the rejection's quoted input list, never by substring — at least one `ENVELOPE_OPTIONAL_INPUTS` member that is present in the dispatch's `inputs` — **and only when `inputs.run_config` is a non-empty string** — it strips exactly the named members and posts once more, logging `[dispatch] <owner>/<repo>/<file> does not declare <names> (re-sync workflows); retrying without`. Exact matching matters because a rejection naming an unrelated input that happens to contain `runner_phase` as a substring (e.g. a hypothetical `runner_phase_extra`) must not be mistaken for a match; the poster parses the rejection's quoted tokens (handling both the bare-text and GitHub's escaped-JSON error shapes) and checks set membership, not `body.includes(name)`.
+— inputs an older template declares and a newer one does not, because a newer template reads their values from `run_config` (AII-653), or a value a newer template declares but an older one predates (`issue_identifier`, AII-656). The shared poster, `postWorkflowDispatch`, strips-and-retries on a 422: when the response is HTTP 422, the body matches `/unexpected inputs/i`, and names — by exact match against the rejection's quoted input list, never by substring — at least one `ENVELOPE_OPTIONAL_INPUTS` member that is present in the dispatch's `inputs` — **and only when `inputs.run_config` is a non-empty string** — it strips exactly the named members and posts once more, logging `[dispatch] <owner>/<repo>/<file> does not declare <names> (re-sync workflows); retrying without`. Exact matching matters because a rejection naming an unrelated input that happens to contain `runner_phase` as a substring (e.g. a hypothetical `runner_phase_extra`) must not be mistaken for a match; the poster parses the rejection's quoted tokens (handling both the bare-text and GitHub's escaped-JSON error shapes) and checks set membership, not `body.includes(name)`.
 
-The `run_config` guard matters: on the legacy (non-envelope) contract, `runner_phase` and `runner_callback_url` are authoritative issue data, not compatibility duplicates — the legacy `dispatchWorkflow` callers in `src/index.ts` never set `run_config`, so they are excluded from the strip without a separate flag. Stripping them there would run a gap-fill as an implementation. The guard requires *non-empty* — `run_config: ""` does not count as "the caller is on the envelope contract."
+The `run_config` guard matters: on the legacy (non-envelope) contract, `runner_phase`, `runner_callback_url`, and `issue_identifier` are authoritative issue data, not compatibility duplicates — the legacy `dispatchWorkflow` callers in `src/index.ts` never set `run_config`, so they are excluded from the strip without a separate flag. Stripping them there would run a gap-fill as an implementation (or drop the real ticket key). The guard requires *non-empty* — `run_config: ""` does not count as "the caller is on the envelope contract."
 
 The retry is **capped at exactly two requests, by construction, not just by the common case where removing a name works**: the poster sends the first request, and if that 422s in a strippable way it sends exactly one more — whatever that second response says (success, a different 422, the same 422 again) is returned unconditionally, with no further request. This matters because a target repo's second 422 can legitimately name a *different* still-present optional input than the first did (e.g. reject `runner_phase` first, then `runner_callback_url`); naively recursing on "does the response still match a strippable name" would chain a third request in that case. Both `dispatchWorkflow` (the thin wrapper most dispatch sites use) and the kg-refresh dispatch path go through `postWorkflowDispatch`.
-
-A future issue in this chain appends `issue_identifier` to `ENVELOPE_OPTIONAL_INPUTS` (run titles carry the ticket key from the envelope instead).
 
 ---
 
@@ -144,7 +143,7 @@ Results are cached in-process per `owner/repo/workflowFile` key for **5 minutes*
 1. **Open the orchestrator admin UI** at `/admin` → Projects.
 2. Find the repo row and click **Sync workflows**.
 3. The sync opens a PR in the target repo titled something like `chore: sync AI-Implement workflow templates`. Review and **merge it**.
-   - The PR replaces the existing `claude-implement.yml` with the 8-input envelope version.
+   - The PR replaces the existing `claude-implement.yml` with the 9-input envelope version.
    - It **removes** `.github/workflows/comment-trigger.yml` (if present) — `/ai-implement` comments are now handled by the orchestrator webhook.
    - `claude-plan.yml` is updated alongside.
    - `WORKFLOW.md` and `PLANNING.md` are left untouched if they already exist.

@@ -117,10 +117,11 @@ describe("GHA workflow shims", () => {
   });
 
   for (const f of IMPLEMENT_WORKFLOWS) {
-    it(`${f} declares exactly the 8 envelope inputs, in order`, () => {
+    it(`${f} declares exactly the 9 envelope inputs, in order`, () => {
       const doc = parse(readFileSync(f, "utf-8")) as any;
       expect(Object.keys(doc.on.workflow_dispatch.inputs)).toEqual([
         "run_config",
+        "issue_identifier",
         "runner_image",
         "job_timeout_minutes",
         "provider",
@@ -130,13 +131,29 @@ describe("GHA workflow shims", () => {
         "run_publication_token",
       ]);
     });
+
+    it(`${f} declares issue_identifier as an optional, display-only string input`, () => {
+      const doc = parse(readFileSync(f, "utf-8")) as any;
+      const input = doc.on.workflow_dispatch.inputs.issue_identifier;
+      expect(input.required).toBe(false);
+      expect(input.type).toBe("string");
+      expect(input.default).toBe("");
+    });
+
+    it(`${f} titles the run with the ticket key via run-name:`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      expect(yaml).toContain(
+        "run-name: ${{ inputs.issue_identifier && format('Claude AI Implementation — {0}', inputs.issue_identifier) || 'Claude AI Implementation' }}",
+      );
+    });
   }
 
   for (const f of PLANNING_WORKFLOWS) {
-    it(`${f} declares exactly the 7 envelope inputs, in order`, () => {
+    it(`${f} declares exactly the 8 envelope inputs, in order`, () => {
       const doc = parse(readFileSync(f, "utf-8")) as any;
       expect(Object.keys(doc.on.workflow_dispatch.inputs)).toEqual([
         "run_config",
+        "issue_identifier",
         "runner_image",
         "job_timeout_minutes",
         "provider",
@@ -144,6 +161,33 @@ describe("GHA workflow shims", () => {
         "run_token",
         "run_progress_token",
       ]);
+    });
+
+    it(`${f} declares issue_identifier as an optional, display-only string input`, () => {
+      const doc = parse(readFileSync(f, "utf-8")) as any;
+      const input = doc.on.workflow_dispatch.inputs.issue_identifier;
+      expect(input.required).toBe(false);
+      expect(input.type).toBe("string");
+      expect(input.default).toBe("");
+    });
+
+    it(`${f} titles the run with the ticket key via run-name:`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      expect(yaml).toContain(
+        "run-name: ${{ inputs.issue_identifier && format('Claude AI Planning — {0}', inputs.issue_identifier) || 'Claude AI Planning' }}",
+      );
+    });
+  }
+
+  for (const f of SYNCED_WORKFLOW_FILES) {
+    it(`${f} never references inputs.issue_identifier from a step (display-only)`, () => {
+      const doc = parse(readFileSync(f, "utf-8")) as any;
+      const jobs = Object.values(doc.jobs) as any[];
+      for (const job of jobs) {
+        for (const step of job.steps ?? []) {
+          expect(JSON.stringify(step)).not.toContain("inputs.issue_identifier");
+        }
+      }
     });
   }
 
