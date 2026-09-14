@@ -347,11 +347,13 @@ describe("loadPipelineDefinition", () => {
     ]);
     const selectedReviewers = [{ id: "gap-analysis", gates: true }];
     const repoReviewerDefinitions = [{ id: "repo-reviewer" }];
+    const trustedConfigReviewerDefinitions = [{ id: "domain-reviewer" }];
     ctx.data.reviewers = selectedReviewers;
     ctx.data.trustedReviewerDefinitions = trustedDefinitions;
     ctx.setOutputs("install", {
       reviewProviders: ["github-claude-code-review"],
       reviewers: repoReviewerDefinitions,
+      trustedConfigReviewers: trustedConfigReviewerDefinitions,
     });
     ctx.setOutputs("push", { prNumber: 42, branchPushed: true });
 
@@ -363,6 +365,7 @@ describe("loadPipelineDefinition", () => {
     expect(inputs.reviewers).toBe(selectedReviewers);
     expect(inputs.trustedReviewerDefinitions).toBe(trustedDefinitions);
     expect(inputs.reviewerDefinitions).toBe(repoReviewerDefinitions);
+    expect(inputs.trustedConfigReviewerDefinitions).toBe(trustedConfigReviewerDefinitions);
   });
 
   it("preserves an explicit empty reviewer selection for post-push-review", () => {

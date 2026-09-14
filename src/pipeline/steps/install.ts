@@ -4,8 +4,9 @@ import os from "node:os";
 import path from "node:path";
 import { parse as parseYaml } from "yaml";
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
+import type { ReviewerSelection } from "../../config.js";
 import { repoProcessEnv } from "../process-env.js";
-import type { ReviewerDefinition } from "../reviewers/registry.js";
+import { resolveTrustedReviewer, type ReviewerDefinition } from "../reviewers/registry.js";
 import { REVIEWER_VERDICT_SCHEMA } from "../reviewers/schema.js";
 
 interface RepoModels {
@@ -21,8 +22,18 @@ interface AiImplementConfig {
   reviewers?: ReviewerDefinition[];
 }
 
+interface TrustedConfigReviewersInput {
+  owner?: string;
+  repo?: string;
+  token?: string;
+  reviewers?: ReviewerSelection[];
+  trustedReviewerDefinitions?: ReadonlyMap<string, ReviewerDefinition>;
+  fetchImpl?: typeof fetch;
+}
+
 interface InstallInputs extends Record<string, unknown> {
   workspaceDir: string;
+  fetchImpl?: typeof fetch;
 }
 
 interface InstallOutputs extends Record<string, unknown> {
@@ -33,9 +44,13 @@ interface InstallOutputs extends Record<string, unknown> {
   reviewProviders?: string[];
   reviewCheckNames?: string[];
   reviewers?: ReviewerDefinition[];
+  trustedConfigReviewers: ReviewerDefinition[];
 }
 
 const KNOWN_REVIEW_PROVIDERS = new Set(["github-claude-code-review"]);
+const RESERVED_EXTERNAL_REVIEWER_IDS = new Set(["claude-review-summary"]);
+const CONFIG_PATH = ".ai-implement/config.yml";
+const TRUSTED_CONFIG_FETCH_TIMEOUT_MS = 15_000;
 
 function parseModelsConfig(value: unknown): RepoModels {
   const result: RepoModels = {};
@@ -142,6 +157,124 @@ function readAiImplementConfig(workspaceDir: string): AiImplementConfig {
   }
 }
 
+async function selectedGatingConfigReviewerIds(input: TrustedConfigReviewersInput): Promise<string[]> {
+  const trustedIds = new Set(input.trustedReviewerDefinitions?.keys() ?? []);
+  const ids: string[] = [];
+  const seen = new Set<string>();
+  for (const selection of input.reviewers ?? []) {
+    if (!selection.gates) continue;
+    if (RESERVED_EXTERNAL_REVIEWER_IDS.has(selection.id)) continue;
+    if (trustedIds.has(selection.id)) continue;
+    if (seen.has(selection.id)) continue;
+    const trustedReviewer = await resolveTrustedReviewer(selection.id, { quietMissing: true });
+    if (trustedReviewer) continue;
+    seen.add(selection.id);
+    ids.push(selection.id);
+  }
+  return ids;
+}
+
+function trustedConfigWarning(repoSlug: string, message: string): void {
+  console.warn(`[install] Trusted reviewer config unavailable for ${repoSlug}: ${message}`);
+}
+
+function optionalString(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed ? trimmed : undefined;
+}
+
+async function readGithubContentsText(input: {
+  owner: string;
+  repo: string;
+  token: string;
+  fetchImpl: typeof fetch;
+}): Promise<string | null> {
+  const { owner, repo, token, fetchImpl } = input;
+  const repoSlug = `${owner}/${repo}`;
+  const url = `https://api.github.com/repos/${owner}/${repo}/contents/${CONFIG_PATH}`;
+  let res: Response;
+  try {
+    res = await fetchImpl(url, {
+      headers: {
+        Accept: "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "ai-implement-runner",
+        Authorization: `Bearer ${token}`,
+      },
+      signal: AbortSignal.timeout(TRUSTED_CONFIG_FETCH_TIMEOUT_MS),
+    });
+  } catch (err) {
+    trustedConfigWarning(repoSlug, "fetch failed");
+    return null;
+  }
+
+  if (res.status === 404) {
+    trustedConfigWarning(repoSlug, `${CONFIG_PATH} not found on the default branch`);
+    return null;
+  }
+  if (!res.ok) {
+    trustedConfigWarning(repoSlug, `${CONFIG_PATH} lookup returned HTTP ${res.status}`);
+    return null;
+  }
+
+  let body: unknown;
+  try {
+    body = await res.json();
+  } catch {
+    trustedConfigWarning(repoSlug, `${CONFIG_PATH} response was not JSON`);
+    return null;
+  }
+
+  if (!isRecord(body) || body.type !== "file" || body.encoding !== "base64" || typeof body.content !== "string") {
+    trustedConfigWarning(repoSlug, `${CONFIG_PATH} was not a file blob`);
+    return null;
+  }
+
+  try {
+    return Buffer.from(body.content, "base64").toString("utf8");
+  } catch {
+    trustedConfigWarning(repoSlug, `${CONFIG_PATH} content was not valid base64`);
+    return null;
+  }
+}
+
+export async function fetchTrustedConfigReviewers(input: TrustedConfigReviewersInput): Promise<ReviewerDefinition[]> {
+  const selectedIds = await selectedGatingConfigReviewerIds(input);
+  if (selectedIds.length === 0) return [];
+
+  const { owner, repo, token } = input;
+  if (!owner || !repo || !token) {
+    trustedConfigWarning(`${owner || "unknown"}/${repo || "unknown"}`, `missing GitHub context for selected reviewer(s): ${selectedIds.join(", ")}`);
+    return [];
+  }
+
+  const text = await readGithubContentsText({ owner, repo, token, fetchImpl: input.fetchImpl ?? fetch });
+  if (text === null) return [];
+
+  let parsed: unknown;
+  try {
+    parsed = parseYaml(text) as unknown;
+  } catch {
+    trustedConfigWarning(`${owner}/${repo}`, `${CONFIG_PATH} was malformed YAML`);
+    return [];
+  }
+  if (!isRecord(parsed)) {
+    trustedConfigWarning(`${owner}/${repo}`, `${CONFIG_PATH} did not contain a config object`);
+    return [];
+  }
+
+  const definitions = parseReviewersConfig(parsed.reviewers) ?? [];
+  const byId = new Map(definitions.map((definition) => [definition.id, definition]));
+  const selectedSet = new Set(selectedIds);
+  const selectedDefinitions = definitions.filter((definition) => selectedSet.has(definition.id));
+  const missing = selectedIds.filter((id) => !byId.has(id));
+  if (missing.length > 0) {
+    trustedConfigWarning(`${owner}/${repo}`, `${CONFIG_PATH} lacks selected reviewer(s): ${missing.join(", ")}`);
+  }
+  return selectedDefinitions;
+}
+
 interface NpmAuthConfig {
   /** Temp directory holding the per-run user config; removed after install. */
   dir: string;
@@ -216,13 +349,22 @@ function buildInstallCommand(packageManager: string): string {
 
 export const installStep: StepModule<InstallInputs, InstallOutputs> = {
   async run(
-    _context: PipelineContext,
+    context: PipelineContext,
     inputs: InstallInputs,
     _reporter: StepReporter,
   ): Promise<InstallOutputs> {
     const { workspaceDir } = inputs;
 
     const config = readAiImplementConfig(workspaceDir);
+    const cloneOutputs = context.getOutputs("clone");
+    const trustedConfigReviewers = await fetchTrustedConfigReviewers({
+      owner: optionalString(cloneOutputs.repoOwner) ?? context.data.githubOwner,
+      repo: optionalString(cloneOutputs.repoRepo) ?? context.data.githubRepo,
+      token: optionalString(cloneOutputs.githubToken) ?? context.data.githubToken,
+      reviewers: context.data.reviewers,
+      trustedReviewerDefinitions: context.data.trustedReviewerDefinitions,
+      fetchImpl: inputs.fetchImpl,
+    });
     const hasPackageJson = fs.existsSync(path.join(workspaceDir, "package.json"));
 
     if (process.env.AI_IMPLEMENT_WORKSPACE_MODE === "mounted") {
@@ -234,6 +376,7 @@ export const installStep: StepModule<InstallInputs, InstallOutputs> = {
         reviewProviders: config.reviewProviders,
         reviewCheckNames: config.reviewCheckNames,
         reviewers: config.reviewers,
+        trustedConfigReviewers,
       };
     }
 
@@ -246,6 +389,7 @@ export const installStep: StepModule<InstallInputs, InstallOutputs> = {
         reviewProviders: config.reviewProviders,
         reviewCheckNames: config.reviewCheckNames,
         reviewers: config.reviewers,
+        trustedConfigReviewers,
       };
     }
 
@@ -284,6 +428,7 @@ export const installStep: StepModule<InstallInputs, InstallOutputs> = {
       reviewProviders: config.reviewProviders,
       reviewCheckNames: config.reviewCheckNames,
       reviewers: config.reviewers,
+      trustedConfigReviewers,
     };
   },
 };

@@ -288,6 +288,7 @@ function applyWiring(step: YamlStep): StepDefinition {
           reviewers: ctx.data.reviewers,
           trustedReviewerDefinitions: ctx.data.trustedReviewerDefinitions,
           reviewerDefinitions: ctx.getOutputs("install").reviewers,
+          trustedConfigReviewerDefinitions: ctx.getOutputs("install").trustedConfigReviewers,
         }),
         skip: (ctx: PipelineContext) => {
           // Gap-fill runs update an existing PR and retain their established

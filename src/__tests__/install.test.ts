@@ -1,9 +1,53 @@
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, it, expect, vi } from "vitest";
+import { afterEach, describe, it, expect, vi } from "vitest";
 import { installStep, parseReviewCheckNamesConfig, parseReviewersConfig } from "../pipeline/steps/install.js";
 import { REVIEWER_VERDICT_SCHEMA } from "../pipeline/reviewers/schema.js";
+
+const tempDirs: string[] = [];
+
+function makeWorkspace(prefix = "ai-implement-install-reviewers-"): string {
+  const dir = mkdtempSync(join(tmpdir(), prefix));
+  tempDirs.push(dir);
+  return dir;
+}
+
+function makeContext(data: Record<string, unknown> = {}, cloneOutputs: Record<string, unknown> = {}) {
+  return { data, getOutputs: (stepId: string) => stepId === "clone" ? cloneOutputs : {} } as never;
+}
+
+function reviewerPrompt(reviewer: { buildPrompt(input: { issueIdentifier: string; issueTitle: string; issueDescription: string; prNumber: string; diff: string; previousFindings: string }): string }): string {
+  return reviewer.buildPrompt({
+    issueIdentifier: "AII-1",
+    issueTitle: "Title",
+    issueDescription: "Description",
+    prNumber: "42",
+    diff: "diff",
+    previousFindings: "previous",
+  });
+}
+
+function contentsApiResponse(fileBody: string): Record<string, unknown> {
+  return {
+    type: "file",
+    encoding: "base64",
+    content: Buffer.from(fileBody, "utf8").toString("base64"),
+  };
+}
+
+function mockContentsFetch(status: number, body: Record<string, unknown> | null): ReturnType<typeof vi.fn> {
+  return vi.fn().mockResolvedValue({
+    ok: status >= 200 && status < 300,
+    status,
+    json: async () => body,
+  });
+}
+
+afterEach(() => {
+  for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  vi.restoreAllMocks();
+});
 
 describe("parseReviewCheckNamesConfig", () => {
   it("returns undefined for non-array values", () => {
@@ -39,20 +83,15 @@ describe("parseReviewCheckNamesConfig", () => {
   });
 });
 
-
 describe("parseReviewersConfig", () => {
   it("returns undefined for absent or malformed reviewers config", () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-    try {
-      expect(parseReviewersConfig(undefined)).toBeUndefined();
-      expect(parseReviewersConfig("review")).toBeUndefined();
-      expect(parseReviewersConfig({ reviewers: [] })).toBeUndefined();
-      expect(warnSpy).toHaveBeenCalledTimes(2);
-      expect(warnSpy).toHaveBeenNthCalledWith(1, expect.stringContaining("reviewers"));
-      expect(warnSpy).toHaveBeenNthCalledWith(2, expect.stringContaining("reviewers"));
-    } finally {
-      warnSpy.mockRestore();
-    }
+    expect(parseReviewersConfig(undefined)).toBeUndefined();
+    expect(parseReviewersConfig("review")).toBeUndefined();
+    expect(parseReviewersConfig({ reviewers: [] })).toBeUndefined();
+    expect(warnSpy).toHaveBeenCalledTimes(2);
+    expect(warnSpy).toHaveBeenNthCalledWith(1, expect.stringContaining("reviewers"));
+    expect(warnSpy).toHaveBeenNthCalledWith(2, expect.stringContaining("reviewers"));
   });
 
   it("builds data-only reviewer definitions with the shared verdict schema", () => {
@@ -68,14 +107,7 @@ describe("parseReviewersConfig", () => {
       buildPrompt: expect.any(Function),
       outputSchema: REVIEWER_VERDICT_SCHEMA,
     });
-    expect(reviewers?.[0]?.buildPrompt({
-      issueIdentifier: "AII-1",
-      issueTitle: "Title",
-      issueDescription: "Description",
-      prNumber: "42",
-      diff: "diff",
-      previousFindings: "previous",
-    })).toBe(" Review accessibility. ");
+    expect(reviewerPrompt(reviewers![0]!)).toBe(" Review accessibility. ");
     expect(reviewers?.[1]).toEqual({
       id: "architecture-review",
       buildPrompt: expect.any(Function),
@@ -86,27 +118,23 @@ describe("parseReviewersConfig", () => {
 
   it("drops malformed reviewer declarations with one warning per dropped entry", () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-    try {
-      const reviewers = parseReviewersConfig([
-        { id: "valid-review", prompt: "Review it." },
-        { prompt: "missing id" },
-        { id: "missing-prompt" },
-        42,
-        { id: "valid-review", prompt: "duplicate" },
-      ]);
+    const reviewers = parseReviewersConfig([
+      { id: "valid-review", prompt: "Review it." },
+      { prompt: "missing id" },
+      { id: "missing-prompt" },
+      42,
+      { id: "valid-review", prompt: "duplicate" },
+    ]);
 
-      expect(reviewers?.map((reviewer) => reviewer.id)).toEqual(["valid-review"]);
-      expect(warnSpy).toHaveBeenCalledTimes(4);
-      for (const call of warnSpy.mock.calls) expect(call[0]).toContain("reviewers[");
-    } finally {
-      warnSpy.mockRestore();
-    }
+    expect(reviewers?.map((reviewer) => reviewer.id)).toEqual(["valid-review"]);
+    expect(warnSpy).toHaveBeenCalledTimes(4);
+    for (const call of warnSpy.mock.calls) expect(call[0]).toContain("reviewers[");
   });
 });
 
 describe("installStep reviewers output", () => {
   it("exposes reviewers from .ai-implement/config.yml without running install when no package.json exists", async () => {
-    const workspaceDir = mkdtempSync(join(tmpdir(), "ai-implement-install-reviewers-"));
+    const workspaceDir = makeWorkspace();
     mkdirSync(join(workspaceDir, ".ai-implement"), { recursive: true });
     writeFileSync(join(workspaceDir, ".ai-implement", "config.yml"), [
       "reviewers:",
@@ -119,12 +147,13 @@ describe("installStep reviewers output", () => {
     ].join("\n"));
 
     const outputs = await installStep.run(
-      {} as never,
+      makeContext(),
       { workspaceDir },
       {} as never,
     );
 
     expect(outputs.installMethod).toBe("skipped: no package.json");
+    expect(outputs.trustedConfigReviewers).toEqual([]);
     expect(outputs.reviewers?.map((reviewer) => ({
       id: reviewer.id,
       model: reviewer.model,
@@ -145,5 +174,176 @@ describe("installStep reviewers output", () => {
       outputSchema: REVIEWER_VERDICT_SCHEMA,
       gates: undefined,
     }]);
+  });
+
+  it("fetches selected gating config reviewers from the trusted default-branch config without a ref", async () => {
+    const workspaceDir = makeWorkspace();
+    mkdirSync(join(workspaceDir, ".ai-implement"), { recursive: true });
+    writeFileSync(join(workspaceDir, ".ai-implement", "config.yml"), [
+      "reviewers:",
+      "  - id: domain-review",
+      "    model: claude-opus-5",
+      "    prompt: malicious PR prompt",
+      "",
+    ].join("\n"));
+    const fetchImpl = mockContentsFetch(200, contentsApiResponse([
+      "reviewers:",
+      "  - id: domain-review",
+      "    model: claude-sonnet-5",
+      "    prompt: trusted default prompt",
+      "  - id: unselected-review",
+      "    prompt: should not be fetched into outputs",
+      "",
+    ].join("\n")));
+
+    const outputs = await installStep.run(
+      makeContext({
+        githubOwner: "acme",
+        githubRepo: "app",
+        githubToken: "ghs_secret",
+        reviewers: [{ id: "domain-review", gates: true }],
+        trustedReviewerDefinitions: new Map(),
+      }),
+      { workspaceDir, fetchImpl },
+      {} as never,
+    );
+
+    expect(fetchImpl).toHaveBeenCalledOnce();
+    const [url, options] = fetchImpl.mock.calls[0];
+    expect(url).toBe("https://api.github.com/repos/acme/app/contents/.ai-implement/config.yml");
+    expect(String(url)).not.toContain("ref=");
+    expect(options.headers.Authorization).toBe("Bearer ghs_secret");
+    expect(reviewerPrompt(outputs.reviewers![0]!)).toBe("malicious PR prompt");
+    expect(outputs.trustedConfigReviewers.map((reviewer) => ({ id: reviewer.id, model: reviewer.model }))).toEqual([
+      { id: "domain-review", model: "claude-sonnet-5" },
+    ]);
+    expect(reviewerPrompt(outputs.trustedConfigReviewers[0]!)).toBe("trusted default prompt");
+  });
+
+  it("uses the current clone output credential without adding it to install inputs", async () => {
+    const workspaceDir = makeWorkspace();
+    const fetchImpl = mockContentsFetch(200, contentsApiResponse([
+      "reviewers:",
+      "  - id: domain-review",
+      "    prompt: trusted default prompt",
+      "",
+    ].join("\n")));
+
+    await installStep.run(
+      makeContext({
+        githubOwner: "stale-owner",
+        githubRepo: "stale-repo",
+        githubToken: "",
+        reviewers: [{ id: "domain-review", gates: true }],
+        trustedReviewerDefinitions: new Map(),
+      }, { repoOwner: "acme", repoRepo: "app", githubToken: "fresh-token" }),
+      { workspaceDir, fetchImpl },
+      {} as never,
+    );
+
+    const [url, options] = fetchImpl.mock.calls[0];
+    expect(url).toBe("https://api.github.com/repos/acme/app/contents/.ai-implement/config.yml");
+    expect(options.headers.Authorization).toBe("Bearer fresh-token");
+  });
+
+  it("fetches trusted config even when the PR branch deletes the local config entry", async () => {
+    const workspaceDir = makeWorkspace();
+    const fetchImpl = mockContentsFetch(200, contentsApiResponse([
+      "reviewers:",
+      "  - id: domain-review",
+      "    prompt: trusted default prompt",
+      "",
+    ].join("\n")));
+
+    const outputs = await installStep.run(
+      makeContext({
+        githubOwner: "acme",
+        githubRepo: "app",
+        githubToken: "ghs_secret",
+        reviewers: [{ id: "domain-review", gates: true }],
+        trustedReviewerDefinitions: new Map(),
+      }),
+      { workspaceDir, fetchImpl },
+      {} as never,
+    );
+
+    expect(fetchImpl).toHaveBeenCalledOnce();
+    expect(outputs.reviewers).toBeUndefined();
+    expect(outputs.trustedConfigReviewers.map((reviewer) => reviewer.id)).toEqual(["domain-review"]);
+  });
+
+  it("does not fetch trusted config for an actual built-in even without a precomputed trusted map", async () => {
+    const workspaceDir = makeWorkspace();
+    const fetchImpl = vi.fn();
+
+    const outputs = await installStep.run(
+      makeContext({
+        githubOwner: "acme",
+        githubRepo: "app",
+        githubToken: "ghs_secret",
+        reviewers: [{ id: "gap-analysis", gates: true }],
+      }),
+      { workspaceDir, fetchImpl },
+      {} as never,
+    );
+
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(outputs.trustedConfigReviewers).toEqual([]);
+  });
+
+  it("does not fetch trusted config for selected built-in, image-baked, external, or advisory-only reviewers", async () => {
+    const workspaceDir = makeWorkspace();
+    const fetchImpl = vi.fn();
+
+    const outputs = await installStep.run(
+      makeContext({
+        githubOwner: "acme",
+        githubRepo: "app",
+        githubToken: "ghs_secret",
+        reviewers: [
+          { id: "gap-analysis", gates: true },
+          { id: "image-review", gates: true },
+          { id: "claude-review-summary", gates: true },
+          { id: "domain-review", gates: false },
+        ],
+        trustedReviewerDefinitions: new Map([
+          ["gap-analysis", { id: "gap-analysis", buildPrompt: () => "gap", outputSchema: REVIEWER_VERDICT_SCHEMA }],
+          ["image-review", { id: "image-review", buildPrompt: () => "image", outputSchema: REVIEWER_VERDICT_SCHEMA }],
+        ]),
+      }),
+      { workspaceDir, fetchImpl },
+      {} as never,
+    );
+
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(outputs.trustedConfigReviewers).toEqual([]);
+  });
+
+  it.each([
+    ["missing GitHub context", {}, undefined],
+    ["transport error", { githubOwner: "acme", githubRepo: "app", githubToken: "ghs_secret" }, vi.fn().mockRejectedValue(new Error("offline"))],
+    ["missing default config", { githubOwner: "acme", githubRepo: "app", githubToken: "ghs_secret" }, mockContentsFetch(404, null)],
+    ["HTTP error", { githubOwner: "acme", githubRepo: "app", githubToken: "ghs_secret" }, mockContentsFetch(500, null)],
+    ["missing JSON body", { githubOwner: "acme", githubRepo: "app", githubToken: "ghs_secret" }, mockContentsFetch(200, null)],
+    ["array JSON body", { githubOwner: "acme", githubRepo: "app", githubToken: "ghs_secret" }, mockContentsFetch(200, [] as unknown as Record<string, unknown>)],
+    ["malformed contents response", { githubOwner: "acme", githubRepo: "app", githubToken: "ghs_secret" }, mockContentsFetch(200, { type: "dir", encoding: "base64", content: "" })],
+    ["malformed YAML", { githubOwner: "acme", githubRepo: "app", githubToken: "ghs_secret" }, mockContentsFetch(200, contentsApiResponse("reviewers: ["))],
+    ["missing selected reviewer", { githubOwner: "acme", githubRepo: "app", githubToken: "ghs_secret" }, mockContentsFetch(200, contentsApiResponse("reviewers:\n  - id: other-review\n    prompt: other\n"))],
+  ])("returns no trusted config reviewers on %s so downstream selection fails closed", async (_name, contextData, fetchImpl) => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const workspaceDir = makeWorkspace();
+
+    const outputs = await installStep.run(
+      makeContext({
+        ...contextData,
+        reviewers: [{ id: "domain-review", gates: true }],
+        trustedReviewerDefinitions: new Map(),
+      }),
+      { workspaceDir, ...(fetchImpl ? { fetchImpl } : {}) },
+      {} as never,
+    );
+
+    expect(outputs.trustedConfigReviewers).toEqual([]);
+    expect(warn).toHaveBeenCalled();
   });
 });
