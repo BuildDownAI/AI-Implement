@@ -7,11 +7,23 @@ import {
   updateReconciliationStatus,
 } from "./reconciliation.js";
 import { capturePrMerge } from "./merge-capture.js";
+import { getLatestDispatchForPr } from "./log.js";
+
+export function resolvePrMapping(mappings: Record<string, RepoMapping>, repo: string, prNumber: number):
+  { scopeKey: string; mapping: RepoMapping } | undefined {
+  const [owner, name] = repo.split("/");
+  const dispatch = getLatestDispatchForPr(owner, name, prNumber);
+  const candidates = Object.entries(mappings).filter(([, mapping]) => `${mapping.owner}/${mapping.repo}` === repo);
+  const entry = dispatch?.teamKey
+    ? candidates.find(([key]) => key === dispatch.teamKey)
+    : candidates.length === 1 ? candidates[0] : undefined;
+  return entry ? { scopeKey: entry[0], mapping: entry[1] } : undefined;
+}
 
 export interface ReconcileDeps {
   /** Resolve a repo to its mapping AND the scope/team key it is registered under —
    *  markMerged needs the authoritative scopeKey (Jira picks its mapping by it). */
-  mappingForRepo: (repo: string) => { scopeKey: string; mapping: RepoMapping } | undefined;
+  mappingForRepo: (repo: string, prNumber: number) => { scopeKey: string; mapping: RepoMapping } | undefined;
   resolveProvider: (mapping: RepoMapping) => Promise<TicketingProvider>;
   /** When provided, a merge-capture record is written after each successful markMerged. */
   tokenForOwner?: (owner: string) => Promise<string>;
@@ -32,7 +44,7 @@ export async function runReconciliations(deps: ReconcileDeps): Promise<void> {
   console.log(`[reconcile] Processing ${pending.length} pending reconciliation(s)`);
   for (const job of pending) {
     try {
-      const resolved = deps.mappingForRepo(job.repo);
+      const resolved = deps.mappingForRepo(job.repo, job.prNumber);
       if (!resolved) {
         console.warn(`[reconcile] No mapping for repo ${job.repo}, skipping #${job.id}`);
         updateReconciliationStatus(job.id, "skipped");

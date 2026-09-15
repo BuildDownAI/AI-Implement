@@ -1,4 +1,11 @@
 import type { ProviderId } from "./types.js";
+import { isAbsolute, normalize } from "node:path";
+
+export interface FilesystemMappingConfig {
+  kind: "filesystem";
+  /** Absolute directory on the local orchestrator host containing Markdown tickets. */
+  directory: string;
+}
 
 export interface LinearMappingConfig {
   kind: "linear";
@@ -20,7 +27,7 @@ export interface JiraMappingConfig {
   baseBranchFieldOverride?: string | null;
 }
 
-export type TicketingMappingConfig = LinearMappingConfig | JiraMappingConfig;
+export type TicketingMappingConfig = LinearMappingConfig | JiraMappingConfig | FilesystemMappingConfig;
 
 export const DEFAULT_TICKETING_CONFIG: LinearMappingConfig = { kind: "linear" };
 
@@ -64,6 +71,13 @@ export function validateTicketingConfig(provider: ProviderId, value: unknown): T
     throw new Error(`ticketingConfig.kind ("${obj.kind}") must match ticketingProvider ("${provider}")`);
   }
   if (provider === "linear") return { kind: "linear" };
+  if (provider === "filesystem") {
+    if (typeof obj.directory !== "string" || !obj.directory.trim() ||
+        !isAbsolute(obj.directory.trim()) || obj.directory.includes("\0")) {
+      throw new Error("Filesystem ticketingConfig requires an absolute directory on the local orchestrator host");
+    }
+    return { kind: "filesystem", directory: normalize(obj.directory.trim()) };
+  }
   if (provider === "jira") {
     if (typeof obj.jql !== "string" || obj.jql.trim() === "") {
       throw new Error("Jira ticketingConfig requires a non-empty jql string");

@@ -22,8 +22,9 @@ export const stepperHtml = `
           <select class="input" id="np-ticketing-provider" onchange="onStepperTicketingProviderChange()">
             <option value="linear">Linear</option>
             <option value="jira">Jira</option>
+            <option value="filesystem">Filesystem / local</option>
           </select>
-          <div class="field-hint">Jira requires JIRA_TOKEN + JIRA_SITE_URL, plus either JIRA_EMAIL (Basic auth) or JIRA_CLOUD_ID (OAuth) env vars on the orchestrator.</div>
+          <div class="field-hint">Filesystem tickets are Markdown files on this machine. They run real GitHub PRs through local Docker and require RUNNER_MODE=local.</div>
         </div>
       </div>
 
@@ -84,6 +85,21 @@ export const stepperHtml = `
             </select>
             <input class="input mono hidden" id="np-jira-repo-value-text" type="text" placeholder="owner/repo" oninput="updateStepperNextButton()">
             <div class="field-hint">The option-list value on the AI-Implement Repo field that matches issues for this mapping.</div>
+          </div>
+        </div>
+
+        <div id="np-filesystem-config" hidden>
+          <div class="field">
+            <label class="field-label">Ticket Directory</label>
+            <input class="input mono" id="np-filesystem-directory" placeholder="/private/tmp/filesystem-local-tickets" autocomplete="off" oninput="updateStepperNextButton()">
+            <div class="field-hint">Absolute host path containing Markdown tickets. The orchestrator writes local state there, while implementation still opens real GitHub PRs for review iteration.</div>
+          </div>
+          <div class="alert info">
+            <div class="alert-icon">&#8505;</div>
+            <div>
+              <div class="alert-title">Local Docker execution</div>
+              <div class="alert-desc">Use this with <span class="mono">RUNNER_MODE=local</span>. Local mode sends these tickets through the local Docker runner and the normal GitHub PR review loop.</div>
+            </div>
           </div>
         </div>
       </div>
@@ -196,7 +212,14 @@ export const stepperHtml = `
       <div data-step="4" hidden>
         <h3 style="font-size:13px;font-weight:600;margin:0 0 4px">Execution</h3>
         <p style="font-size:12px;color:var(--fg-tertiary);margin:0 0 20px">Choose where AI-Implement executes implementation runs.</p>
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:18px">
+        <div id="np-local-docker-note" class="alert info" hidden style="margin-bottom:18px">
+          <div class="alert-icon">&#8505;</div>
+          <div>
+            <div class="alert-title">Filesystem tickets use local Docker</div>
+            <div class="alert-desc">With <span class="mono">RUNNER_MODE=local</span>, this project runs in the local Docker runner and still opens real GitHub PRs for review iteration. No Fly credentials are needed for this path.</div>
+          </div>
+        </div>
+        <div id="np-hosted-runner-options" style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:18px">
           <div class="runner-card active" data-runner="github-actions" onclick="selectExecutionMode('github-actions')">
             <div style="font-size:13px;font-weight:600;margin-bottom:4px">GitHub Actions</div>
             <div style="font-size:12px;color:var(--fg-secondary)">Run Claude via GitHub-hosted or self-hosted runners. Zero infrastructure overhead.</div>
@@ -450,6 +473,7 @@ export const stepperScript = `
   const STEP_LABELS = ['Ticketing', 'Config', 'Source', 'Context', 'Execution', 'Provider', 'Capacity', 'Secrets', 'Review'];
   const data = {
     ticketingProvider: 'linear',
+    filesystemDirectory: '',
     jiraJql: '',
     jiraRepoFieldValue: '',
     jiraStatusFieldOverride: '',
@@ -470,6 +494,7 @@ export const stepperScript = `
     // Reset state
     step = 0;
     data.ticketingProvider = 'linear';
+    data.filesystemDirectory = '';
     data.jiraJql = '';
     data.jiraRepoFieldValue = '';
     data.jiraStatusFieldOverride = '';
@@ -502,7 +527,7 @@ export const stepperScript = `
     data.secrets = [];
 
     // Clear inputs. Not derived from the initializer above — a new field needs both.
-    const toClear = ['np-teamKey', 'np-owner', 'np-repo', 'np-defaultBranch', 'np-branch-prefix', 'np-skills-repo', 'np-refrepo-repo', 'np-refrepo-path', 'np-refrepo-ref', 'np-sensitive-add', 'np-sensitive-allow', 'np-awsRegion', 'np-maxTurns', 'np-maxIterations', 'np-maxJobMinutes'];
+    const toClear = ['np-teamKey', 'np-filesystem-directory', 'np-owner', 'np-repo', 'np-defaultBranch', 'np-branch-prefix', 'np-skills-repo', 'np-refrepo-repo', 'np-refrepo-path', 'np-refrepo-ref', 'np-sensitive-add', 'np-sensitive-allow', 'np-awsRegion', 'np-maxTurns', 'np-maxIterations', 'np-maxJobMinutes'];
     const depScopeEl = document.getElementById('np-dep-token-scope');
     if (depScopeEl) depScopeEl.value = '';
     for (const id of toClear) {
@@ -532,6 +557,8 @@ export const stepperScript = `
     }
     const flyFields = document.getElementById('np-fly-fields');
     if (flyFields) flyFields.setAttribute('hidden', '');
+    const localDockerNote = document.getElementById('np-local-docker-note');
+    if (localDockerNote) localDockerNote.setAttribute('hidden', '');
 
     // Reset provider cards
     for (const card of document.querySelectorAll('[data-provider]')) {
@@ -572,6 +599,8 @@ export const stepperScript = `
     if (linearCfg) linearCfg.setAttribute('hidden', '');
     const jiraCfg = document.getElementById('np-jira-config');
     if (jiraCfg) jiraCfg.setAttribute('hidden', '');
+    const filesystemCfg = document.getElementById('np-filesystem-config');
+    if (filesystemCfg) filesystemCfg.setAttribute('hidden', '');
 
     // Hide error
     const errEl = document.getElementById('np-error');
@@ -609,16 +638,24 @@ export const stepperScript = `
     const provider = provEl ? provEl.value : 'linear';
     const linearSection = document.getElementById('np-linear-config');
     const jiraSection = document.getElementById('np-jira-config');
+    const filesystemSection = document.getElementById('np-filesystem-config');
     const descEl = document.getElementById('np-ticketing-desc');
     if (provider === 'jira') {
       if (linearSection) linearSection.setAttribute('hidden', '');
       if (jiraSection) jiraSection.removeAttribute('hidden');
+      if (filesystemSection) filesystemSection.setAttribute('hidden', '');
       if (descEl) descEl.textContent = 'Configure the JQL scope and field mappings for this Jira mapping.';
       stepperLoadJiraFields();
       stepperPreloadRepoFieldOptions();
+    } else if (provider === 'filesystem') {
+      if (linearSection) linearSection.setAttribute('hidden', '');
+      if (jiraSection) jiraSection.setAttribute('hidden', '');
+      if (filesystemSection) filesystemSection.removeAttribute('hidden');
+      if (descEl) descEl.textContent = 'Configure the local Markdown ticket directory. The backend validates filesystem mappings only when the effective runner mode is local.';
     } else {
       if (linearSection) linearSection.removeAttribute('hidden');
       if (jiraSection) jiraSection.setAttribute('hidden', '');
+      if (filesystemSection) filesystemSection.setAttribute('hidden', '');
       if (descEl) descEl.textContent = 'Configure the Linear team this mapping operates on.';
     }
   }
@@ -665,6 +702,9 @@ export const stepperScript = `
         const txt = document.getElementById('np-jira-repo-value-text');
         const repoVal = (sel && !sel.classList.contains('hidden')) ? sel.value : (txt ? txt.value : '');
         if (!jql.trim() || !repoVal.trim()) ok = false;
+      } else if (provider === 'filesystem') {
+        const dir = (document.getElementById('np-filesystem-directory') || {}).value || '';
+        if (!dir.trim()) ok = false;
       } else {
         const tk = (document.getElementById('np-teamKey') || {}).value || '';
         if (!tk.trim()) ok = false;
@@ -831,6 +871,9 @@ export const stepperScript = `
         if (rf) data.jiraRepoFieldOverride = rf.value.trim();
         if (pf) data.jiraProfilesFieldOverride = pf.value.trim();
         if (bbf) data.jiraBaseBranchFieldOverride = bbf.value.trim();
+      } else if (data.ticketingProvider === 'filesystem') {
+        const dirEl = document.getElementById('np-filesystem-directory');
+        if (dirEl) data.filesystemDirectory = dirEl.value.trim();
       } else {
         const tkEl = document.getElementById('np-teamKey');
         if (tkEl) data.teamKey = tkEl.value.trim();
@@ -913,6 +956,9 @@ export const stepperScript = `
       if (data.ticketingProvider === 'jira') {
         if (!data.jiraJql.trim()) { showError('JQL is required for Jira.'); return false; }
         if (!data.jiraRepoFieldValue.trim()) { showError('Repo Field Value is required for Jira.'); return false; }
+      } else if (data.ticketingProvider === 'filesystem') {
+        if (!data.filesystemDirectory) { showError('Ticket Directory is required for filesystem ticketing.'); return false; }
+        if (data.filesystemDirectory.charAt(0) !== '/') { showError('Ticket Directory must be an absolute path.'); return false; }
       } else {
         if (!data.teamKey) { showError('Linear Team Key is required.'); return false; }
       }
@@ -953,6 +999,9 @@ export const stepperScript = `
     if (data.ticketingProvider === 'jira') {
       return (data.owner && data.repo) ? (data.owner + '/' + data.repo) : '';
     }
+    if (data.ticketingProvider === 'filesystem') {
+      return (data.owner && data.repo) ? ('filesystem_' + data.owner + '_' + data.repo) : '';
+    }
     return data.teamKey;
   }
 
@@ -977,6 +1026,8 @@ export const stepperScript = `
       if (data.jiraRepoFieldOverride) cfgText += ' &middot; repoField=' + window.esc(data.jiraRepoFieldOverride);
       if (data.jiraProfilesFieldOverride) cfgText += ' &middot; profilesField=' + window.esc(data.jiraProfilesFieldOverride);
       if (data.jiraBaseBranchFieldOverride) cfgText += ' &middot; baseBranchField=' + window.esc(data.jiraBaseBranchFieldOverride);
+    } else if (data.ticketingProvider === 'filesystem') {
+      cfgText = 'directory=' + monoOr(data.filesystemDirectory) + ' &middot; local Docker + real GitHub PRs';
     } else {
       cfgText = 'team=' + (window.esc(data.teamKey) || '&mdash;');
     }
@@ -996,8 +1047,10 @@ export const stepperScript = `
       : '&mdash;');
     set('dependencyTokenScope', data.dependencyTokenScope ? window.esc(data.dependencyTokenScope) : '&mdash;');
 
-    let runnerText = window.esc(data.executionMode);
-    if (data.executionMode === 'fly-machines') {
+    let runnerText = data.ticketingProvider === 'filesystem'
+      ? 'local Docker via RUNNER_MODE=local'
+      : window.esc(data.executionMode);
+    if (data.ticketingProvider !== 'filesystem' && data.executionMode === 'fly-machines') {
       runnerText += ' &middot; ' + data.machineCpus + 'cpu / ' + data.machineMemoryMb + ' MB';
     }
     set('runner', runnerText);
@@ -1028,7 +1081,10 @@ export const stepperScript = `
   }
 
   function selectExecutionMode(mode) {
+    if (data.ticketingProvider === 'filesystem') mode = 'github-actions';
     data.executionMode = mode;
+    const hostedOptions = document.getElementById('np-hosted-runner-options');
+    if (hostedOptions) hostedOptions.style.display = data.ticketingProvider === 'filesystem' ? 'none' : 'grid';
     for (const card of document.querySelectorAll('[data-runner]')) {
       card.classList.toggle('active', card.dataset.runner === mode);
     }
@@ -1036,6 +1092,11 @@ export const stepperScript = `
     if (flyFields) {
       if (mode === 'fly-machines') flyFields.removeAttribute('hidden');
       else flyFields.setAttribute('hidden', '');
+    }
+    const localDockerNote = document.getElementById('np-local-docker-note');
+    if (localDockerNote) {
+      if (data.ticketingProvider === 'filesystem') localDockerNote.removeAttribute('hidden');
+      else localDockerNote.setAttribute('hidden', '');
     }
     // Refresh bedrock+fly warning if on provider step
     const bedrockWarn = document.getElementById('np-bedrock-fly-warn');
@@ -1089,6 +1150,14 @@ export const stepperScript = `
     const provEl = document.getElementById('np-ticketing-provider');
     const provider = provEl ? provEl.value : 'linear';
     data.ticketingProvider = provider;
+    if (provider === 'filesystem') {
+      selectExecutionMode('github-actions');
+      data.sessionMode = 'autonomous';
+      const sessionEl = document.getElementById('np-sessionMode');
+      if (sessionEl) sessionEl.value = 'autonomous';
+    } else {
+      selectExecutionMode(data.executionMode);
+    }
     // If we're already on the Ticketing Config step, re-apply visibility immediately.
     if (step === 1) applyTicketingConfigStepVisibility();
     updateStepperNextButton();
@@ -1360,7 +1429,9 @@ export const stepperScript = `
             profilesFieldOverride: data.jiraProfilesFieldOverride || null,
             baseBranchFieldOverride: data.jiraBaseBranchFieldOverride || null,
           }
-        : { kind: 'linear' },
+        : data.ticketingProvider === 'filesystem'
+          ? { kind: 'filesystem', directory: data.filesystemDirectory }
+          : { kind: 'linear' },
     };
 
     const createBtn = document.getElementById('np-create');

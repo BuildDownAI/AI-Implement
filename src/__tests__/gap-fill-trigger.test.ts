@@ -103,6 +103,19 @@ function makeInput(overrides: Partial<Parameters<typeof handleGapFillTrigger>[0]
 }
 
 describe("handleGapFillTrigger", () => {
+  it("does not send filesystem ticket iterations to the legacy Actions dispatcher", async () => {
+    const mapping = makeMapping({ ticketingProvider: "filesystem",
+      ticketingConfig: { kind: "filesystem", directory: "/tmp/test-tickets" } });
+    const input = makeInput({ getMappings: () => ({ ACME: mapping }),
+      resolveProvider: async () => new FakeProvider({ initialIssues: [makeIssue()] }),
+      getInstallationToken: vi.fn(async () => "gh-token"),
+    });
+    const response = await handleGapFillTrigger(input);
+    expect(response.status).toBe(409);
+    expect(input.dispatchWorkflow).not.toHaveBeenCalled();
+    expect(input.getInstallationToken).not.toHaveBeenCalled();
+  });
+
   it("returns 501 when trigger secret is not configured", async () => {
     const res = await handleGapFillTrigger(makeInput({ triggerSecret: null }));
     expect(res.status).toBe(501);

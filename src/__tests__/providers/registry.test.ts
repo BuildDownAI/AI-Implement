@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { ProviderRegistry } from "../../providers/registry.js";
 import { configureLinearAuth } from "../../linear-app-auth.js";
 import type { RepoMapping } from "../../config.js";
@@ -37,8 +37,33 @@ const jiraMapping = makeMapping({
 beforeEach(() => {
   configureLinearAuth("client-id", "client-secret");
 });
+afterEach(() => vi.unstubAllEnvs());
 
 describe("ProviderRegistry", () => {
+  const filesystemMapping = makeMapping({
+    ticketingProvider: "filesystem",
+    ticketingConfig: { kind: "filesystem", directory: "/tmp/test-tickets" },
+  });
+
+  it("resolves and caches filesystem tickets locally without tracker credentials", async () => {
+    vi.stubEnv("RUNNER_MODE", "local");
+    const reg = new ProviderRegistry({}, () => ({ LOCAL: filesystemMapping }));
+    const first = await reg.forMapping(filesystemMapping);
+    expect(first.id).toBe("filesystem");
+    expect(await reg.forMapping(filesystemMapping)).toBe(first);
+    expect(await reg.forAllMappings([filesystemMapping, filesystemMapping])).toEqual([first]);
+    reg.invalidate();
+    expect(await reg.forMapping(filesystemMapping)).not.toBe(first);
+  });
+
+  it("refuses filesystem tickets outside local mode even after caching a provider", async () => {
+    vi.stubEnv("RUNNER_MODE", "local");
+    const reg = new ProviderRegistry({}, () => ({ LOCAL: filesystemMapping }));
+    await reg.forMapping(filesystemMapping);
+    vi.stubEnv("RUNNER_MODE", "gha");
+    await expect(reg.forMapping(filesystemMapping)).rejects.toThrow(/local runner mode/);
+  });
+
   it("returns a Linear provider for a Linear mapping", async () => {
     const reg = new ProviderRegistry({}, () => ({}));
     const p = await reg.forMapping(linearMapping);

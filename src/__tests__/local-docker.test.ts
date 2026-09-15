@@ -236,6 +236,16 @@ describe("splitLocalRunnerEnv", () => {
     expect(publicEnv.GITHUB_APP_PRIVATE_KEY).toBeUndefined();
     expect(secretEnv.GITHUB_APP_PRIVATE_KEY).toBeUndefined();
   });
+
+  it("keeps RUN_PROGRESS_TOKEN out of docker argv env", () => {
+    const { publicEnv, secretEnv } = splitLocalRunnerEnv(buildLocalRunnerEnv({
+      ...baseInput,
+      extraEnv: { RUN_PROGRESS_TOKEN: "progress-token" },
+    }));
+
+    expect(publicEnv.RUN_PROGRESS_TOKEN).toBeUndefined();
+    expect(secretEnv.RUN_PROGRESS_TOKEN).toBe("progress-token");
+  });
 });
 
 describe("buildDockerEnvFileContent", () => {

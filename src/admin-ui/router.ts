@@ -43,6 +43,10 @@ export const routerJs = `
   window.addEventListener('hashchange', () => { if (routing) show(readHash()); });
 
   /** Called by auth.js once the session identity has resolved, and not before. */
-  window.startRouting = function () { routing = true; show(readHash()); };
+  window.startRouting = function () {
+    routing = true;
+    show(readHash());
+    if (window.openFilesystemIssueFromLocation) window.openFilesystemIssueFromLocation();
+  };
 })();
 `;

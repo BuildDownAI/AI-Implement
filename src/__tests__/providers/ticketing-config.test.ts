@@ -6,6 +6,15 @@ import type { JiraMappingConfig } from "../../providers/ticketing-config.js";
 const jiraBase = { kind: "jira", jql: "project = ENG", repoFieldValue: "owner/repo" };
 
 describe("validateTicketingConfig", () => {
+  it("accepts and normalizes an absolute filesystem directory", () => {
+    expect(validateTicketingConfig("filesystem", { kind: "filesystem", directory: " /tmp/test-tickets/ " }))
+      .toEqual({ kind: "filesystem", directory: "/tmp/test-tickets/" });
+  });
+
+  it.each([undefined, "", "tickets", "~/tickets", "/tmp/\0tickets"])("rejects invalid filesystem directory %s", (directory) => {
+    expect(() => validateTicketingConfig("filesystem", { kind: "filesystem", directory })).toThrow(/absolute directory/);
+  });
+
   it("returns the linear default for a null config on the linear provider", () => {
     expect(validateTicketingConfig("linear", null)).toEqual(DEFAULT_TICKETING_CONFIG);
   });

@@ -25,6 +25,7 @@ export const drawerHtml = `
       <div></div>
       <div style="display:flex;gap:6px">
         <a id="drawer-logs-link" class="btn btn-sm" href="" target="_blank" hidden>View workflow logs ↗</a>
+        <button id="drawer-local-logs" type="button" class="btn btn-sm" hidden>View local logs</button>
         <button class="btn btn-primary btn-sm" onclick="closeJobDrawer()">Close</button>
       </div>
     </div>
@@ -70,22 +71,124 @@ export const drawerScript = `
     return m + 'm ' + s + 's';
   }
 
-  function badgeForStatus(s) {
+  function reviewStatusLabel(job, steps) {
+    if (job && job.status === 'review_failed' && reviewIncompleteInfo(job, steps)) return 'review incomplete';
+    return job && job.status === 'review_failed' ? 'review failed' : ((job && job.status) || 'unknown');
+  }
+
+  function badgeForJobStatus(job, steps) {
+    const s = job && job.status;
     let kind;
     if (s === 'running') kind = 'running';
     else if (s === 'failed' || s === 'timed_out') kind = 'fail';
     else if (s === 'review_failed') kind = 'warn';
     else if (s === 'completed') kind = 'success';
     else kind = 'neutral';
-    const label = s === 'review_failed' ? 'review failed' : (s || 'unknown');
+    const label = reviewStatusLabel(job, steps);
     return '<span class="badge ' + kind + '"><span class="dot"></span>' + window.esc(label) + '</span>';
   }
 
-  function renderIssueRow(job) {
+  function reviewIncompleteCauseFromFailure(failure) {
+    if (!failure || typeof failure.code !== 'string') return null;
+    if (failure.code === 'REVIEWER_TURNS_EXHAUSTED') {
+      return {
+        title: 'Review incomplete',
+        detail: 'The post-push reviewer ran out of turns before reaching a verdict.',
+        cause: 'reviewer turn limit',
+        limit: failure.reviewMaxTurns,
+        reviewer: reviewerNameFromFailure(failure),
+        failureDetails: failure.message || null,
+        reviewEvidence: null,
+      };
+    }
+    if (failure.code === 'PROVIDER_UNAVAILABLE' && (!failure.stage || String(failure.stage).includes('review'))) {
+      return {
+        title: 'Review incomplete',
+        detail: 'The model provider was unavailable during automated review.',
+        cause: 'provider unavailable',
+        limit: failure.reviewMaxTurns,
+        reviewer: reviewerNameFromFailure(failure),
+        failureDetails: failure.message || null,
+        reviewEvidence: null,
+      };
+    }
+    return null;
+  }
+
+  function reviewerNameFromFailure(failure) {
+    const stage = failure && typeof failure.stage === 'string' ? failure.stage : '';
+    const slashTail = stage.split('/').pop() || '';
+    const reviewMatch = slashTail.match(/^(.+?)-review-\\d+$/);
+    if (reviewMatch) return reviewMatch[1].replace(/-/g, ' ');
+    const dotParts = stage.split('.');
+    const dotTail = dotParts[dotParts.length - 1] || '';
+    return dotTail && dotTail !== stage ? dotTail.replace(/-/g, ' ') : null;
+  }
+
+  function parseStepInputs(step) {
+    try {
+      return JSON.parse(step.inputsJson || '{}');
+    } catch (e) {
+      return {};
+    }
+  }
+
+  function reviewEvidenceFromOutputs(outputs) {
+    if (!outputs) return null;
+    if (outputs.partial && typeof outputs.partial === 'object') return reviewEvidenceFromOutputs(outputs.partial);
+    if (typeof outputs.summary === 'string' && outputs.summary.trim()) return outputs.summary;
+    if (Array.isArray(outputs.checks) && outputs.checks.length > 0) {
+      return outputs.checks.map(function (check) {
+        return check && typeof check.check === 'string' ? check.check + ': ' + (check.evidence || '') : null;
+      }).filter(Boolean).join(', ');
+    }
+    return null;
+  }
+
+  function reviewIncompleteCauseFromStep(step) {
+    if (step.status !== 'failed') return null;
+    const inputs = parseStepInputs(step);
+    if (inputs.gates === false || inputs.reviewerProvenance === 'branch') return null;
+    const outputs = parseStepOutputs(step);
+    const failureCause = reviewIncompleteCauseFromFailure(outputs && outputs.failure);
+    if (failureCause) {
+      if (inputs && typeof inputs.reviewerId === 'string' && inputs.reviewerId) {
+        failureCause.reviewer = inputs.reviewerId;
+      }
+      failureCause.reviewEvidence = reviewEvidenceFromOutputs(outputs);
+      return failureCause;
+    }
+    if (outputs && outputs.terminationReason === 'invalid_review') {
+      return {
+        title: 'Review incomplete',
+        detail: 'Automated review returned invalid output before reaching a verdict.',
+        cause: 'invalid review output',
+        limit: null,
+        reviewer: null,
+        failureDetails: outputs.feedback || null,
+        reviewEvidence: reviewEvidenceFromOutputs(outputs),
+      };
+    }
+    return null;
+  }
+
+  function reviewIncompleteInfo(job, steps) {
+    if (!job || job.status !== 'review_failed') return null;
+    const jobCause = reviewIncompleteCauseFromFailure(job.failure);
+    const sourceSteps = Array.isArray(steps) ? steps : [];
+    for (const step of sourceSteps) {
+      if (!jobCause && parseStepInputs(step).gates !== true && !parseStepOutputs(step).terminationReason) continue;
+      const cause = reviewIncompleteCauseFromStep(step);
+      if (cause) return cause;
+    }
+    return jobCause;
+  }
+
+  function renderIssueRow(job, steps) {
     const issueRow = document.getElementById('drawer-issue-row');
     issueRow.innerHTML =
       '<span class="mono text-tertiary" style="font-size:12px">' + window.esc(job.issueIdentifier || '—') + '</span>'
-      + badgeForStatus(job.status);
+      + badgeForJobStatus(job, steps);
     if (job.dispatchNumber > 1) {
       issueRow.innerHTML += '<span class="badge warn"><span class="dot"></span>attempt ' + job.dispatchNumber + '</span>';
     }
@@ -126,12 +229,24 @@ export const drawerScript = `
     elapsedEl.textContent = fmtDuration(durationMs) + ' elapsed';
   }
 
-  function renderFailureAlert(job) {
+  function renderFailureAlert(job, steps) {
     const alertEl = document.getElementById('drawer-failure-alert');
+    const incomplete = reviewIncompleteInfo(job, steps);
     if (job.status === 'failed') {
       alertEl.innerHTML = '<div class="alert fail" style="margin-bottom:16px"><div class="alert-icon">&#9888;</div><div style="flex:1"><div class="alert-title">Job failed</div><div class="alert-desc">Failed during execution.</div></div></div>';
+    } else if (incomplete) {
+      const parts = [];
+      if (incomplete.reviewer) parts.push('Reviewer: ' + window.esc(incomplete.reviewer));
+      parts.push('Cause: ' + window.esc(incomplete.cause));
+      if (incomplete.limit != null) parts.push('Limit: ' + window.esc(String(incomplete.limit)) + ' turns');
+      alertEl.innerHTML = '<div class="alert warn" style="margin-bottom:16px"><div class="alert-icon">&#9888;</div><div style="flex:1"><div class="alert-title">Review incomplete</div><div class="alert-desc">'
+        + window.esc(incomplete.detail)
+        + '<div class="mono text-tertiary" style="margin-top:6px;font-size:11px">' + parts.join(' · ') + '</div>'
+        + (incomplete.failureDetails ? '<div style="margin-top:6px"><strong>Details:</strong> ' + window.esc(String(incomplete.failureDetails).slice(0, 300)) + '</div>' : '')
+        + (incomplete.reviewEvidence ? '<div style="margin-top:6px"><strong>Partial review evidence:</strong> ' + window.esc(String(incomplete.reviewEvidence).slice(0, 300)) + '</div>' : '')
+        + '</div></div></div>';
     } else if (job.status === 'review_failed') {
-      alertEl.innerHTML = '<div class="alert warn" style="margin-bottom:16px"><div class="alert-icon">&#9888;</div><div style="flex:1"><div class="alert-title">Review needs attention</div><div class="alert-desc">Implementation opened a PR, but post-push review did not approve it.</div></div></div>';
+      alertEl.innerHTML = '<div class="alert warn" style="margin-bottom:16px"><div class="alert-icon">&#9888;</div><div style="flex:1"><div class="alert-title">Review failed</div><div class="alert-desc">Implementation opened a PR, but automated review did not approve it.</div></div></div>';
     } else if (job.status === 'timed_out') {
       alertEl.innerHTML = '<div class="alert warn" style="margin-bottom:16px"><div class="alert-icon">&#9888;</div><div style="flex:1"><div class="alert-title">Job timed out</div><div class="alert-desc">Workflow exceeded timeout.</div></div></div>';
     } else {
@@ -145,7 +260,7 @@ export const drawerScript = `
       { label: 'Queued', detail: 'queued in ticketing system' },
       { label: 'Planning', detail: 'claude-plan.yml' },
       { label: 'Implementing', detail: job.executionMode ? window.esc(job.executionMode) + ' run' : 'implementation run' },
-      { label: 'Review', detail: job.status === 'review_failed' ? 'post-push review needs attention' : (latestRunningStep && latestRunningStep.stepId === 'post-push-review' ? 'post-push review running' : (job.prUrl ? 'PR opened: #' + window.esc(job.prUrl.split('/').pop() || '') : 'awaiting PR')) },
+      { label: 'Review', detail: reviewIncompleteInfo(job, steps) ? 'post-push review incomplete' : (job.status === 'review_failed' ? 'post-push review needs attention' : (latestRunningStep && latestRunningStep.stepId === 'post-push-review' ? 'post-push review running' : (job.prUrl ? 'PR opened: #' + window.esc(job.prUrl.split('/').pop() || '') : 'awaiting PR'))) },
       { label: 'Done', detail: 'merged' }
     ];
 
@@ -278,6 +393,7 @@ export const drawerScript = `
 
       const failure = parseStepOutputs(step).failure;
       if (step.status === 'failed' && failure && typeof failure.category === 'string') {
+        const incomplete = reviewIncompleteCauseFromFailure(failure);
         const summaryBits = window.esc(failure.category)
           + (failure.code ? '/' + window.esc(failure.code) : '')
           + (failure.attempt != null ? ' · attempt ' + window.esc(String(failure.attempt)) : '');
@@ -286,6 +402,7 @@ export const drawerScript = `
           + summaryBits
           + '</summary>'
           + '<div style="padding:8px 4px;font-size:12px">'
+          + (incomplete ? '<div><strong>Review status:</strong> incomplete · ' + window.esc(incomplete.cause) + (incomplete.limit != null ? ' · limit ' + window.esc(String(incomplete.limit)) + ' turns' : '') + '</div>' : '')
           + (failure.code === 'SENSITIVE_FILES_BLOCKED'
             ? '<div><strong>Message:</strong><pre class="mono" style="white-space:pre-wrap;font-size:11px;margin:4px 0 0;max-height:240px;overflow:auto">' + window.esc(failure.message || '') + '</pre></div>'
             : '<div><strong>Message:</strong> ' + window.esc(failure.message || '') + '</div>')
@@ -375,6 +492,9 @@ export const drawerScript = `
   }
 
   function renderLogsLink(job, mappings) {
+    const localLogs = document.getElementById('drawer-local-logs');
+    localLogs.hidden = job.executionMode !== 'local-docker' || !job.machineId;
+    localLogs.onclick = localLogs.hidden ? null : function () { window.openLocalJobLogs(job.id, job.issueIdentifier); };
     const logsLink = document.getElementById('drawer-logs-link');
     const mapping = mappings && job.teamKey ? mappings[job.teamKey] : null;
     const repoParts = repoPartsForJob(job, mapping);
@@ -401,11 +521,11 @@ export const drawerScript = `
   }
 
   function renderDrawer(job, steps, mappings) {
-    renderIssueRow(job);
+    renderIssueRow(job, steps);
     renderTitle(job);
     renderMeta(job);
     renderElapsed(job, steps);
-    renderFailureAlert(job);
+    renderFailureAlert(job, steps);
     renderTimeline(job, steps);
     renderSteps(steps);
     renderContext(job, mappings);
@@ -424,6 +544,8 @@ export const drawerScript = `
     document.getElementById('drawer-context').innerHTML = '';
     document.getElementById('drawer-logs-link').setAttribute('hidden', '');
     document.getElementById('drawer-logs-link').removeAttribute('href');
+    document.getElementById('drawer-local-logs').hidden = true;
+    document.getElementById('drawer-local-logs').onclick = null;
   }
 
   function stopDrawerAutoRefresh() {
@@ -505,7 +627,7 @@ export const drawerScript = `
   }
 
   document.addEventListener('keydown', function (e) {
-    if (e.key === 'Escape') {
+    if (e.key === 'Escape' && !document.querySelector('dialog[open]')) {
       const wrap = document.getElementById('job-drawer-wrap');
       if (wrap && !wrap.hasAttribute('hidden')) closeJobDrawer();
     }

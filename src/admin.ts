@@ -73,7 +73,10 @@ import { listCustomizations } from "./customizations.js";
 import { getFleetReport } from "./report-card.js";
 import { inspectPipelinesAndSteps } from "./inspect-pipeline-graph.js";
 import { validateTicketingConfig, type TicketingMappingConfig } from "./providers/ticketing-config.js";
+import { FilesystemProvider } from "./providers/filesystem.js";
+import { filesystemRetryEligibility, retryFilesystemTicket } from "./filesystem-ticket-lifecycle.js";
 import { JiraClient, JiraFieldNotSelectError } from "./providers/jira-client.js";
+import { readLocalJobLogs } from "./local-job-logs.js";
 import { enqueueWorkflowSync, runWorkflowSync, getWorkflowSyncById } from "./workflow-sync-queue.js";
 import type { KgRefreshStatus } from "./kg-refresh.js";
 import { normalizeBranchPrefix } from "./pipeline/branch-name.js";
@@ -135,20 +138,27 @@ function normalizeReviewers(raw: unknown): ReviewerSelection[] {
     if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
       throw new Error(`reviewers[${index}] must be an object with "id" and "gates"`);
     }
-    const { id, gates } = entry as { id?: unknown; gates?: unknown };
+    const { id, gates, maxTurns } = entry as { id?: unknown; gates?: unknown; maxTurns?: unknown };
     if (typeof id !== "string" || id.length === 0) {
       throw new Error(`reviewers[${index}].id must be a non-empty string`);
     }
     if (typeof gates !== "boolean") {
       throw new Error(`reviewers[${index}] ("${id}").gates must be a boolean`);
     }
+    if (maxTurns !== undefined && !validReviewerMaxTurns(maxTurns)) {
+      throw new Error(`reviewers[${index}] ("${id}").maxTurns must be an integer from 1 to 200`);
+    }
     if (seen.has(id)) {
       throw new Error(`reviewers contains duplicate id "${id}"`);
     }
     seen.add(id);
-    result.push({ id, gates });
+    result.push(maxTurns === undefined ? { id, gates } : { id, gates, maxTurns });
   });
   return result;
+}
+
+function validReviewerMaxTurns(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 200;
 }
 
 let _adminJiraClient: JiraClient | null = null;
@@ -321,14 +331,17 @@ function shapeIssue(i: TicketIssue, bucket: "ready" | "needs-planning") {
 }
 
 interface ValidatedTicketing {
-  ticketingProvider: "linear" | "jira";
+  ticketingProvider: "linear" | "jira" | "filesystem";
   ticketingConfig: TicketingMappingConfig;
 }
 
 function validateTicketingMapping(body: { ticketingProvider?: unknown; ticketingConfig?: unknown }): ValidatedTicketing {
   const provider = body.ticketingProvider ?? "linear";
-  if (provider !== "linear" && provider !== "jira") {
-    throw new Error(`Invalid ticketingProvider: expected "linear" or "jira", got ${JSON.stringify(provider)}`);
+  if (provider !== "linear" && provider !== "jira" && provider !== "filesystem") {
+    throw new Error(`Invalid ticketingProvider: expected "linear", "jira", or "filesystem", got ${JSON.stringify(provider)}`);
+  }
+  if (provider === "filesystem" && getRunnerMode().mode !== "local") {
+    throw new Error("Filesystem tickets require local runner mode (RUNNER_MODE=local)");
   }
   const config = validateTicketingConfig(provider, body.ticketingConfig ?? null);
   if (config.kind === "jira") {
@@ -714,6 +727,13 @@ export function handleAdminRequest(
       return true;
     }
 
+    const jobLogsMatch = url.match(/^\/api\/jobs\/(\d+)\/logs$/);
+    if (jobLogsMatch && method === "GET") {
+      const jobId = Number.parseInt(jobLogsMatch[1], 10);
+      handleGetLocalJobLogs(res, jobId);
+      return true;
+    }
+
     const jobStepsMatch = url.match(/^\/api\/jobs\/(\d+)\/steps$/);
     if (jobStepsMatch && method === "GET") {
       const jobId = Number.parseInt(jobStepsMatch[1], 10);
@@ -723,6 +743,16 @@ export function handleAdminRequest(
 
     if (url === "/api/issues" && method === "GET") {
       handleListIssues(res, registry);
+      return true;
+    }
+
+    if (url.split("?")[0] === "/api/filesystem-issue" && method === "GET") {
+      handleFilesystemIssueDetails(url, res, registry);
+      return true;
+    }
+
+    if (url === "/api/filesystem-issue/retry" && method === "POST") {
+      handleRetryFilesystemIssue(req, res, registry);
       return true;
     }
 
@@ -990,6 +1020,7 @@ async function fetchMergedSnapshot(registry: ProviderRegistry): Promise<AIImplem
 async function resolveIssueUrl(
   registry: ProviderRegistry,
   teamKey: string | null,
+  issueId: string | null,
   identifier: string | null,
 ): Promise<string | null> {
   if (!teamKey || !identifier) return null;
@@ -997,7 +1028,7 @@ async function resolveIssueUrl(
   if (!mapping) return null;
   try {
     const provider = await registry.forMapping(mapping);
-    return provider.issueUrl({ identifier } as TicketIssue);
+    return provider.issueUrl({ id: issueId ?? "", identifier, scopeKey: teamKey } as TicketIssue);
   } catch {
     return null;
   }
@@ -1012,7 +1043,7 @@ async function handleListPulls(
     const enriched = await Promise.all(
       pulls.map(async (pull) => ({
         ...pull,
-        issueUrl: await resolveIssueUrl(registry, pull.teamKey, pull.issueIdentifier),
+        issueUrl: await resolveIssueUrl(registry, pull.teamKey, null, pull.issueIdentifier),
       })),
     );
     json(res, 200, { pulls: enriched });
@@ -1028,8 +1059,42 @@ async function handleGetJobSteps(
 ): Promise<void> {
   const job = getJobById(jobId);
   if (!job) { json(res, 404, { error: "job not found" }); return; }
-  const issueUrl = await resolveIssueUrl(registry, job.teamKey, job.issueIdentifier);
+  const issueUrl = await resolveIssueUrl(registry, job.teamKey, job.issueId, job.issueIdentifier);
   json(res, 200, { job: { ...job, issueUrl }, steps: getStepsByJobId(jobId) });
+}
+
+async function handleGetLocalJobLogs(
+  res: http.ServerResponse,
+  jobId: number,
+): Promise<void> {
+  const job = getJobById(jobId);
+  if (!job) {
+    json(res, 404, { error: "job not found" });
+    return;
+  }
+  if (getRunnerMode().mode !== "local") {
+    json(res, 409, { error: "Local job logs require local runner mode" });
+    return;
+  }
+  if (job.executionMode !== "local-docker" || !job.machineId) {
+    json(res, 400, { error: "Job does not have a local Docker container" });
+    return;
+  }
+  if (!/^[a-f0-9]{12,64}$/i.test(job.machineId)) {
+    json(res, 400, { error: "Recorded local Docker container id is invalid" });
+    return;
+  }
+
+  try {
+    const result = await readLocalJobLogs(job.machineId);
+    if (!result) {
+      json(res, 404, { error: "Local job logs are not available" });
+      return;
+    }
+    json(res, 200, result);
+  } catch {
+    json(res, 503, { error: "Local job logs could not be read" });
+  }
 }
 
 async function handleListBlockers(
@@ -1069,7 +1134,7 @@ async function handleListBlockers(
     const blockers = await Promise.all(
       sorted.map(async (b) => ({
         ...b,
-        issueUrl: await resolveIssueUrl(registry, b.teamKey, b.issueIdentifier),
+        issueUrl: await resolveIssueUrl(registry, b.teamKey, null, b.issueIdentifier),
       })),
     );
     const teams = new Set(blockers.map((b) => b.teamKey));
@@ -1097,7 +1162,7 @@ async function handleListIssues(
     const issues = await Promise.all(
       allIssues.map(async ({ issue, bucket }) => ({
         ...shapeIssue(issue, bucket),
-        issueUrl: await resolveIssueUrl(registry, issue.scopeKey, issue.identifier),
+        issueUrl: await resolveIssueUrl(registry, issue.scopeKey, issue.id, issue.identifier),
       })),
     );
     issues.sort((a, b) => a.identifier.localeCompare(b.identifier));
@@ -1107,6 +1172,80 @@ async function handleListIssues(
     });
   } catch (err) {
     json(res, 502, { error: err instanceof Error ? err.message : String(err) });
+  }
+}
+
+async function handleFilesystemIssueDetails(
+  reqUrl: string,
+  res: http.ServerResponse,
+  registry: ProviderRegistry,
+): Promise<void> {
+  const params = new URLSearchParams(reqUrl.includes("?") ? reqUrl.slice(reqUrl.indexOf("?") + 1) : "");
+  const issueId = params.get("issueId");
+  if (!issueId) {
+    json(res, 400, { error: "issueId is required" });
+    return;
+  }
+  const match = /^filesystem:([^:]+):([^:]+)$/.exec(issueId);
+  if (!match) {
+    json(res, 400, { error: "issueId must be a filesystem issue id" });
+    return;
+  }
+
+  const [, scopeKey] = match;
+  const mapping = getMappings()[scopeKey];
+  if (!mapping || mapping.ticketingProvider !== "filesystem") {
+    json(res, 404, { error: "filesystem issue not found" });
+    return;
+  }
+
+  try {
+    const provider = await registry.forMapping(mapping);
+    if (!(provider instanceof FilesystemProvider)) {
+      json(res, 503, { error: "Filesystem provider is not available" });
+      return;
+    }
+    const details = await provider.readIssueDetails(issueId);
+    if (!details) {
+      json(res, 404, { error: "filesystem issue not found" });
+      return;
+    }
+    json(res, 200, { ...details, ...filesystemRetryEligibility(details) });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (message.includes("Invalid filesystem issue")) {
+      json(res, 400, { error: message });
+      return;
+    }
+    if (message.includes("local runner mode")) {
+      json(res, 503, { error: message });
+      return;
+    }
+    json(res, 502, { error: message });
+  }
+}
+
+async function handleRetryFilesystemIssue(req: http.IncomingMessage, res: http.ServerResponse, registry: ProviderRegistry): Promise<void> {
+  let issueId: unknown;
+  try {
+    issueId = JSON.parse(await readBody(req)).issueId;
+  } catch {
+    json(res, 400, { error: "Invalid request body" });
+    return;
+  }
+  const match = typeof issueId === "string" ? /^filesystem:([A-Za-z0-9_.-]+):([A-Z][A-Z0-9_]*-\d+)$/.exec(issueId) : null;
+  if (!match) { json(res, 400, { error: "issueId must be a filesystem issue id" }); return; }
+  if (getRunnerMode().mode !== "local") { json(res, 409, { error: "Filesystem retry requires local runner mode" }); return; }
+  const mapping = getMappings()[match[1]];
+  if (!mapping || mapping.ticketingProvider !== "filesystem") { json(res, 404, { error: "Filesystem ticket not found" }); return; }
+  try {
+    const provider = await registry.forMapping(mapping);
+    if (!(provider instanceof FilesystemProvider)) { json(res, 503, { error: "Filesystem provider is not available" }); return; }
+    const result = await retryFilesystemTicket(provider, issueId as string, match[1]);
+    json(res, result.retried ? 200 : 409, result);
+  } catch (err) {
+    console.warn("[filesystem] Retry could not be queued:", err);
+    json(res, 409, { error: "Retry could not be queued. Check for conflicting files or an unavailable ticket directory." });
   }
 }
 
@@ -1258,7 +1397,7 @@ async function handleListSessions(
         issueId: job?.issueId ?? null,
         issueIdentifier: job?.issueIdentifier ?? null,
         issueTitle: job?.issueTitle ?? null,
-        issueUrl: await resolveIssueUrl(registry, job?.teamKey ?? null, job?.issueIdentifier ?? null),
+        issueUrl: await resolveIssueUrl(registry, job?.teamKey ?? null, job?.issueId ?? null, job?.issueIdentifier ?? null),
         teamKey: job?.teamKey ?? null,
         repo: job?.repo ?? null,
         dispatchedAt: job?.dispatchedAt ?? null,
@@ -2208,6 +2347,14 @@ export function upsertMappingAction(
     ticketing = validateTicketingMapping(body);
   } catch (err) {
     return { status: 400, body: { error: err instanceof Error ? err.message : String(err) } };
+  }
+
+  if (ticketing.ticketingProvider === "filesystem" && provider !== "anthropic") {
+    return { status: 400, body: { error: "Filesystem tickets use local Docker, which requires provider 'anthropic'" } };
+  }
+  if (ticketing.ticketingProvider === "filesystem" &&
+      (!/^[A-Za-z0-9_.-]+$/.test(body.teamKey) || body.teamKey === "." || body.teamKey === "..")) {
+    return { status: 400, body: { error: "Filesystem project key must contain only letters, digits, underscores, dots, or hyphens" } };
   }
 
   const resolveCap = (

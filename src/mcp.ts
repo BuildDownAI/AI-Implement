@@ -265,6 +265,20 @@ export const WRITE_TOOLS: WriteTool[] = [
         dependencyTokenScope: { type: "string", enum: ["installation"] },
         reviewers: {
           type: "array",
+          items: {
+            type: "object",
+            properties: {
+              id: { type: "string" },
+              gates: { type: "boolean" },
+              maxTurns: {
+                type: "integer",
+                minimum: 1,
+                maximum: 200,
+                description: "Optional per-reviewer turn cap. Omit to inherit the reviewer default or global limit.",
+              },
+            },
+            required: ["id", "gates"],
+          },
           description: "Which reviewers run on this project's PRs. Omit to keep the stored value; pass null to reset to the default (gap-analysis and code-review, both gating).",
         },
       },

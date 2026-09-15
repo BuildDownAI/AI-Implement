@@ -101,6 +101,9 @@ export async function handleGapFillTrigger(
   if (owningMapping.paused) {
     return bad(423, "project_paused", { teamKey: owningScopeKey });
   }
+  if (owningMapping.ticketingProvider === "filesystem") {
+    return bad(409, "Filesystem PR iterations use the orchestrator GitHub webhook; the legacy gap-fill trigger dispatches GitHub Actions");
+  }
 
   let runnerCallbackUrl = "";
   let runToken = "";

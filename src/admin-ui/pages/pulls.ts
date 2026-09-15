@@ -59,6 +59,17 @@ export const pullsScript = `
     return 'neutral';
   }
 
+  function isReviewIncomplete(pull) {
+    if (!pull || pull.jobStatus !== 'review_failed') return false;
+    const failure = pull.failure;
+    const code = failure && typeof failure.code === 'string' ? failure.code : pull.conclusion;
+    const stage = failure && typeof failure.stage === 'string' ? failure.stage : '';
+    return code === 'REVIEWER_TURNS_EXHAUSTED'
+      || code === 'invalid_review'
+      || code === 'review_invalid'
+      || (code === 'PROVIDER_UNAVAILABLE' && (!stage || stage.includes('review')));
+  }
+
   function renderRows(pulls) {
     const countEl = document.getElementById('pulls-count');
     const emptyEl = document.getElementById('pulls-empty');
@@ -86,7 +97,7 @@ export const pullsScript = `
         issueCell = '<span class="text-tertiary">&mdash;</span>';
       }
       const repoCell = '<span class="mono">' + (repo ? window.esc(repo) : '&mdash;') + '</span>';
-      const statusLabel = jobStatus === 'review_failed' ? 'review failed' : jobStatus;
+      const statusLabel = isReviewIncomplete(pull) ? 'review incomplete' : jobStatus === 'review_failed' ? 'review failed' : jobStatus;
       const statusCell = '<span class="badge ' + kind + '"><span class="dot"></span>' + window.esc(statusLabel) + '</span>';
       const iterCell = '<span class="mono' + (dispatchNumber > 1 ? ' text-secondary' : '') + '">' + dispatchNumber + '</span>';
       const lastCell = '<td style="text-align:right" class="mono text-tertiary">' + fmtAgo(lastDispatchedAt) + '</td>';

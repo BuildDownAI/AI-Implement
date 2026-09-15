@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  BUILTIN_REVIEWER_VERDICT_SCHEMA,
   resolveReviewer,
   REVIEWER_VERDICT_SCHEMA,
   type ReviewerDefinition,
@@ -27,18 +28,24 @@ describe("built-in reviewers", () => {
       .resolves.toMatchObject({ id: "code-review" });
   });
 
-  it("uses one shared output schema for both built-ins", async () => {
+  it("keeps the shared schema backward-compatible and uses a strict schema for built-ins", async () => {
     const gap = await resolveReviewer("gap-analysis", { customRoot: "/workspace", existsSyncImpl: () => false });
     const code = await resolveReviewer("code-review", { customRoot: "/workspace", existsSyncImpl: () => false });
 
-    expect(gap?.outputSchema).toBe(REVIEWER_VERDICT_SCHEMA);
-    expect(code?.outputSchema).toBe(REVIEWER_VERDICT_SCHEMA);
+    expect(gap?.outputSchema).toBe(BUILTIN_REVIEWER_VERDICT_SCHEMA);
+    expect(code?.outputSchema).toBe(BUILTIN_REVIEWER_VERDICT_SCHEMA);
     expect(REVIEWER_VERDICT_SCHEMA).toMatchObject({
       required: ["approved", "findings"],
       properties: {
         approved: { type: "boolean" },
         findings: { type: "array" },
+        summary: { type: "string", minLength: 1 },
+        checks: { type: "array", minItems: 1 },
       },
+    });
+    expect(BUILTIN_REVIEWER_VERDICT_SCHEMA).toMatchObject({
+      required: ["approved", "findings", "summary", "checks"],
+      properties: REVIEWER_VERDICT_SCHEMA.properties,
     });
   });
 
@@ -46,17 +53,17 @@ describe("built-in reviewers", () => {
     const gap = await resolveReviewer("gap-analysis", { customRoot: "/workspace", existsSyncImpl: () => false });
     const code = await resolveReviewer("code-review", { customRoot: "/workspace", existsSyncImpl: () => false });
 
-    expect(keys(gap!)).toEqual(["buildPrompt", "id", "maxTurns", "outputSchema"]);
+    expect(keys(gap!)).toEqual(["buildPrompt", "id", "outputSchema"]);
     expect(keys(code!)).toEqual(["buildPrompt", "id", "outputSchema"]);
     expect("gates" in gap!).toBe(false);
     expect("gates" in code!).toBe(false);
   });
 
-  it("caps gap-analysis turns and leaves code-review uncapped for the retry policy default", async () => {
+  it("leaves built-in turn caps to the retry policy default", async () => {
     const gap = await resolveReviewer("gap-analysis", { customRoot: "/workspace", existsSyncImpl: () => false });
     const code = await resolveReviewer("code-review", { customRoot: "/workspace", existsSyncImpl: () => false });
 
-    expect(gap?.maxTurns).toBeGreaterThan(0);
+    expect(gap?.maxTurns).toBeUndefined();
     expect(code?.maxTurns).toBeUndefined();
   });
 
@@ -70,6 +77,15 @@ describe("built-in reviewers", () => {
     expect(prompt).toContain("requirement from the issue acceptance criteria that has no implementation");
     expect(prompt).toContain("unrequested scope");
     expect(prompt).toContain("Do not report style problems, code defects, security issues, test gaps");
+    expect(prompt).toContain("return a top-level checks JSON array and a concise plain-prose summary even when approved");
+    expect(prompt).toContain("Each acceptance criterion should have a checks[] item");
+    expect(prompt).toContain("include one scope check");
+    expect(prompt).toContain("concrete acceptance criterion");
+    expect(prompt).toContain("Use result=\"not_verified\"");
+    expect(prompt).toContain("Distinguish inspecting test");
+    expect(prompt).toContain("Do not claim tests were executed or runtime behavior was checked");
+    expect(prompt).toContain("Do not put tool XML");
+    expect(prompt).toContain("checks must be top-level");
     expect(prompt).toContain(input.issueDescription);
     expect(prompt).toContain(input.diff);
   });
@@ -86,6 +102,15 @@ describe("built-in reviewers", () => {
     expect(prompt).toContain("Do not put praise, overall status, or optional/future cleanup");
     expect(prompt).toContain("On follow-up reviews, first verify every previous issue is fixed");
     expect(prompt).toContain("changed API/data contracts, error handling");
+    expect(prompt).toContain("return a top-level checks JSON array and a concise plain-prose summary even when approved");
+    expect(prompt).toContain("such as changed");
+    expect(prompt).toContain("behavior, edge cases, contracts, security, and tests");
+    expect(prompt).toContain("Use result=\"not_verified\"");
+    expect(prompt).toContain("Distinguish inspecting test source from executing");
+    expect(prompt).toContain("Do not claim runtime tests, browser checks, or");
+    expect(prompt).toContain("Do not put tool XML");
+    expect(prompt).toContain("checks must be top-level");
+    expect(prompt).toContain("Findings remain");
     expect(prompt).not.toContain("missing requirement");
     expect(prompt).not.toContain("check requirements coverage");
     expect(prompt).not.toContain("acceptance criteria");

@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url";
 import { resolveModuleImport, type ImportModuleOptions } from "../resolve-module.js";
 import codeReviewReviewer from "./code-review.js";
 import gapAnalysisReviewer from "./gap-analysis.js";
-export { REVIEWER_VERDICT_SCHEMA } from "./schema.js";
+export { BUILTIN_REVIEWER_VERDICT_SCHEMA, REVIEWER_VERDICT_SCHEMA } from "./schema.js";
 
 export type ReviewerFindingSeverity = "blocking" | "medium" | "minor";
 
@@ -17,6 +17,18 @@ export interface ReviewerFinding {
 export interface ReviewerVerdict {
   approved: boolean;
   findings: ReviewerFinding[];
+  /** Short human-readable review summary. Informational only; findings[] remains the gating channel. */
+  summary?: string;
+  /** Concrete checks the reviewer applied, with evidence and honest limits. Informational only. */
+  checks?: ReviewerCheck[];
+}
+
+export type ReviewerCheckResult = "passed" | "failed" | "not_verified" | "not_applicable";
+
+export interface ReviewerCheck {
+  check: string;
+  result: ReviewerCheckResult;
+  evidence: string;
 }
 
 /**

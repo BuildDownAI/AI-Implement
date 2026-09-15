@@ -272,9 +272,9 @@ function reviewerTurnsExhaustedClassification(
   detailParts.push(`\`\`\`\n${evidenceExcerpt(failure)}\n\`\`\``);
 
   return {
-    summary: `🟠 The post-push reviewer ran out of turns at the configured cap (${cap}); the code was not reviewed.`,
+    summary: `🟠 A post-push reviewer reached its turn limit (${cap}); required review is incomplete.`,
     detail: detailParts.join("\n\n"),
-    remediation: `Manual review required. If this is a recurring pattern, raise Review Max Turns at /admin#settings, then re-dispatch.`,
+    remediation: `Complete the missing review before merging. Adjust the reviewer's Max turns in Projects (/admin#projects), or the inherited Review Max Turns in Settings (/admin#settings). Completed reviewer reports remain on the existing PR.`,
     docsUrl: TROUBLESHOOTING_URL,
     ...(runUrl ? { runUrl } : {}),
   };

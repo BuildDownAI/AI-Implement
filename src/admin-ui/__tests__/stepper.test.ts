@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { JSDOM } from "jsdom";
 import { stepperHtml, stepperScript } from "../stepper.js";
 
 /** Rail order. Inserting a step renumbers every later one, so this is the spine of the file. */
@@ -56,6 +57,15 @@ describe("new-project stepper", () => {
     expect(stepperScript).toContain("ticketingConfig:");
   });
 
+  it("offers filesystem ticketing with a local directory input", () => {
+    expect(stepperHtml).toContain('<option value="filesystem">Filesystem / local</option>');
+    expect(stepperHtml).toContain('id="np-filesystem-config"');
+    expect(stepperHtml).toContain('id="np-filesystem-directory"');
+    expect(stepperHtml).toContain("/private/tmp/filesystem-local-tickets");
+    expect(stepperHtml).toContain("RUNNER_MODE=local");
+    expect(stepperHtml).toContain("real GitHub PRs");
+  });
+
   it("declares the input ids the script reads", () => {
     for (const id of ["np-teamKey", "np-owner", "np-repo", "np-defaultBranch", "np-sessionMode", "np-awsRegion", "np-maxAi"]) {
       expect(stepperHtml).toContain(`id="${id}"`);
@@ -87,6 +97,103 @@ describe("new-project stepper", () => {
 
   it("uses const/let, not var", () => {
     expect(stepperScript).not.toMatch(/\bvar\s+\w/);
+  });
+});
+
+describe("new-project stepper — filesystem ticketing behavior", () => {
+  it("submits the filesystem provider, absolute directory config, and existing reviewer settings", async () => {
+    const dom = new JSDOM(`<!doctype html><body>${stepperHtml}</body>`, { runScripts: "outside-only" });
+    const win = dom.window as unknown as Record<string, any>;
+    const doc = dom.window.document;
+    const posts: any[] = [];
+    win.esc = (s: unknown) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    win.api = async (path: string, init?: RequestInit) => {
+      if (path === "/api/admin/config-status") {
+        return { ok: true, json: async () => ({ linear: true, jira: true }) };
+      }
+      if (path === "/api/mappings" && init?.method === "POST") {
+        posts.push(JSON.parse(String(init.body)));
+        return { ok: true, json: async () => ({ syncJobId: "sync-1" }) };
+      }
+      throw new Error(`unexpected api call ${path}`);
+    };
+    win.refRepoRowsHtml = () => "";
+    win.refRepoStage = () => null;
+    win.loadMappings = async () => {};
+    win.pollSyncStatus = () => {};
+    dom.window.eval(stepperScript);
+
+    win.openNewProjectStepper();
+    win.selectExecutionMode("fly-machines");
+    (doc.getElementById("np-ticketing-provider") as HTMLSelectElement).value = "filesystem";
+    win.onStepperTicketingProviderChange();
+    expect(doc.getElementById("np-local-docker-note")?.hasAttribute("hidden")).toBe(false);
+    win.stepperNext();
+    (doc.getElementById("np-filesystem-directory") as HTMLInputElement).value = "/private/tmp/filesystem-local-tickets";
+    win.stepperNext();
+    (doc.getElementById("np-owner") as HTMLInputElement).value = "BuildDownAI";
+    (doc.getElementById("np-repo") as HTMLInputElement).value = "AI-Implement";
+    (doc.getElementById("np-defaultBranch") as HTMLInputElement).value = "testing";
+    win.stepperNext();
+    win.stepperNext();
+    win.stepperNext();
+    win.stepperNext();
+    win.stepperNext();
+    win.stepperNext();
+    await win.stepperSubmit();
+
+    expect(posts).toHaveLength(1);
+    expect(posts[0]).toMatchObject({
+      teamKey: "filesystem_BuildDownAI_AI-Implement",
+      owner: "BuildDownAI",
+      repo: "AI-Implement",
+      defaultBranch: "testing",
+      ticketingProvider: "filesystem",
+      ticketingConfig: { kind: "filesystem", directory: "/private/tmp/filesystem-local-tickets" },
+      executionMode: "github-actions",
+      sessionMode: "autonomous",
+      provider: "anthropic",
+      planningEnabled: true,
+      autoApprovePlans: true,
+    });
+    // The actual submitted key must also be usable by the filesystem provider.
+    const { ProviderRegistry } = await import("../../providers/registry.js");
+    const previousMode = process.env.RUNNER_MODE;
+    process.env.RUNNER_MODE = "local";
+    try {
+      const registry = new ProviderRegistry({}, () => ({ [posts[0].teamKey]: posts[0] }));
+      const provider = await registry.forMapping(posts[0]);
+      await expect(provider.fetchAIImplementSnapshot()).resolves.toHaveProperty("readyForImplementation");
+    } finally {
+      if (previousMode === undefined) delete process.env.RUNNER_MODE;
+      else process.env.RUNNER_MODE = previousMode;
+    }
+  });
+
+  it("rejects a relative filesystem ticket directory before submitting", () => {
+    const dom = new JSDOM(`<!doctype html><body>${stepperHtml}</body>`, { runScripts: "outside-only" });
+    const win = dom.window as unknown as Record<string, any>;
+    const doc = dom.window.document;
+    const posts: any[] = [];
+    win.esc = (s: unknown) => String(s);
+    win.api = async (path: string, init?: RequestInit) => {
+      if (path === "/api/admin/config-status") return { ok: true, json: async () => ({ linear: true, jira: true }) };
+      if (path === "/api/mappings" && init?.method === "POST") posts.push(JSON.parse(String(init.body)));
+      return { ok: true, json: async () => ({}) };
+    };
+    win.refRepoRowsHtml = () => "";
+    win.refRepoStage = () => null;
+    dom.window.eval(stepperScript);
+
+    win.openNewProjectStepper();
+    (doc.getElementById("np-ticketing-provider") as HTMLSelectElement).value = "filesystem";
+    win.onStepperTicketingProviderChange();
+    win.stepperNext();
+    (doc.getElementById("np-filesystem-directory") as HTMLInputElement).value = "tickets";
+    win.stepperNext();
+
+    expect(posts).toHaveLength(0);
+    expect(doc.getElementById("np-error")?.textContent).toContain("absolute path");
   });
 });
 

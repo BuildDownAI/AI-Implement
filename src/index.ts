@@ -8,10 +8,13 @@ import {
 } from "./config.js";
 import type { RepoMapping } from "./config.js";
 import { isAlreadyDispatched, markDispatched, closeDb, getDispatchedIds, deleteDispatched } from "./dedup.js";
+import { reconcileFilesystemFailures } from "./filesystem-ticket-lifecycle.js";
 import { dispatchWorkflow, postWorkflowDispatch, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, getPullRequestState, buildEnvelopeDispatchInputs, postPrComment, defaultFetchSignal, getRepoDefaultBranch, buildKgRefreshGhaDispatchBody, pollForKgWorkflowRunId } from "./github.js";
 import { resolveWorkflowCapabilities, resolveWorkflowContract } from "./workflow-probe.js";
 import { surfaceDispatchFailure } from "./dispatch-failure.js";
 import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
+import { dispatchLocalGapfill } from "./local-gapfill.js";
+import { getLatestDispatchForPr } from "./log.js";
 import type { TicketingProvider, IssueLifecycleState, FeatureNodeRollUp } from "./providers/types.js";
 import type { TicketIssue } from "./providers/types.js";
 import { rememberCandidates, resolveInFlightSiblings, selectIssuesToDispatch, selectFileOverlapDeferrals, getOrFetchPlanningContexts } from "./poll-selection.js";
@@ -56,7 +59,7 @@ import { safeDestroyMachine, sweepOrphanedMachines, SWEEP_MACHINE_MAX_AGE_MS } f
 import { getRunnerMode, getFlySecretsMinVersion, getFlyProcessLevelSecrets, initSettingsTable, resolveExecutionPath, resolvePlanningExecutionPath, resolveRunnerCallbackBaseUrl, checkForcedPathEligibility } from "./runner-mode.js";
 import { handleGitHubWebhook } from "./webhook.js";
 import { enqueueReconciliation, hasReconciliationForPr, initReconciliationTable } from "./reconciliation.js";
-import { runReconciliations } from "./reconcile-merged.js";
+import { runReconciliations, resolvePrMapping } from "./reconcile-merged.js";
 import { resolveSessionImage, resolveDefaultRunnerImage, resolveRunnerImageForDispatch, type SessionImageStatus } from "./repo-image.js";
 import { getStepRecord, getStepsByJobId, initStepLogTable } from "./step-log.js";
 import { getOrchestratorSettings, seedKgBaseRepoFromEnv, getRetryPolicy } from "./orchestrator-settings.js";
@@ -568,7 +571,12 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
         break;
       }
       try {
-        const mapping = teamRepoMap[issue.scopeKey]!;
+        const storedMapping = teamRepoMap[issue.scopeKey]!;
+        const mapping = {
+          ...storedMapping,
+          maxTurns: issue.maxTurns ?? storedMapping.maxTurns,
+          maxIterations: issue.maxIterations ?? storedMapping.maxIterations,
+        };
         const issueProvider = await registry.forMapping(mapping);
         const isPlanning = needsPlanningIds.has(issue.id) && mapping.planningEnabled;
 
@@ -752,6 +760,8 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
       anthropicApiKey: config.anthropicApiKey,
       claudeOAuthToken: config.claudeOAuthToken,
       sessionImage: config.sessionImage,
+      localRunnerImage: config.localRunnerImage,
+      localRunnerOrchestratorUrl: config.localRunnerOrchestratorUrl ?? config.runnerCallbackBaseUrl ?? `http://host.docker.internal:${config.healthPort}`,
     });
   }
 
@@ -1962,7 +1972,10 @@ async function providerForJob(
 
 async function monitorJobs(config: AppConfig, registry: ProviderRegistry): Promise<void> {
   const inFlightJobs = getInFlightJobs();
-  if (inFlightJobs.length === 0 && getUnnotifiedTerminalJobs().length === 0) return;
+  if (inFlightJobs.length === 0 && getUnnotifiedTerminalJobs().length === 0) {
+    await reconcileFilesystemFailures(registry);
+    return;
+  }
 
   console.log(`[monitor] Checking ${inFlightJobs.length} in-flight jobs`);
 
@@ -1995,6 +2008,7 @@ async function monitorJobs(config: AppConfig, registry: ProviderRegistry): Promi
 
   // Send notifications + post comments for newly terminal jobs
   await reportJobCompletion(config, registry);
+  await reconcileFilesystemFailures(registry);
 }
 
 async function monitorGitHubActionsJob(
@@ -2879,10 +2893,7 @@ async function processReconciliations(config: AppConfig, registry: ProviderRegis
     // Non-fatal; runner commits won't be bucketed separately
   }
   await runReconciliations({
-    mappingForRepo: (repo) => {
-      const entry = Object.entries(teamRepoMap).find(([, m]) => `${m.owner}/${m.repo}` === repo);
-      return entry ? { scopeKey: entry[0], mapping: entry[1] } : undefined;
-    },
+    mappingForRepo: (repo, prNumber) => resolvePrMapping(teamRepoMap, repo, prNumber),
     resolveProvider: (mapping) => registry.forMapping(mapping),
     tokenForOwner: (owner) => getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner),
     appBotLogin,
@@ -2901,8 +2912,11 @@ async function processReviewFixQueue(config: AppConfig): Promise<void> {
 
   for (const fix of pending) {
     try {
+      const [fixOwner, fixRepo] = fix.repo.split("/");
+      const previousDispatch = getLatestDispatchForPr(fixOwner, fixRepo, fix.prNumber);
       const mappingEntry = Object.entries(teamRepoMap).find(
-        ([, mapping]) => `${mapping.owner}/${mapping.repo}` === fix.repo,
+        ([key, mapping]) => `${mapping.owner}/${mapping.repo}` === fix.repo &&
+          (!previousDispatch?.teamKey || key === previousDispatch.teamKey),
       );
 
       if (!mappingEntry) {
@@ -2912,6 +2926,12 @@ async function processReviewFixQueue(config: AppConfig): Promise<void> {
       }
 
       const [scopeKey, mapping] = mappingEntry;
+      const runnerMode = getRunnerMode().mode;
+      if (mapping.ticketingProvider === "filesystem" && runnerMode !== "local") {
+        console.warn(`[review-fix] Filesystem project ${scopeKey} requires local runner mode`);
+        updateReviewFixStatus(fix.id, "skipped");
+        continue;
+      }
       if (mapping.paused) {
         console.log(`[review-fix] Project ${mapping.owner}/${mapping.repo} is paused, skipping review fix #${fix.id}`);
         updateReviewFixStatus(fix.id, "skipped");
@@ -2962,6 +2982,58 @@ async function processReviewFixQueue(config: AppConfig): Promise<void> {
         runnerCallbackUrl = config.runnerCallbackBaseUrl;
         runToken = minted.token;
         runProgressToken = progressMinted.token;
+      }
+
+      if (runnerMode === "local") {
+        if (mapping.provider === "bedrock") {
+          console.error(`[review-fix] Cannot dispatch ${fix.issueIdentifier ?? fix.issueId} via local Docker: provider=bedrock not supported`);
+          updateReviewFixStatus(fix.id, "failed");
+          continue;
+        }
+        const container = await dispatchLocalGapfill({
+          mapping,
+          issue: {
+            id: fix.issueId,
+            identifier: fix.issueIdentifier ?? fix.issueId,
+            title: `Review feedback fix for PR #${fix.prNumber}`,
+            description: `Address late review feedback on PR #${fix.prNumber}. Queue reason: ${fix.reason}.`,
+          },
+          prNumber: fix.prNumber,
+          githubToken: ghToken,
+          image: config.localRunnerImage,
+          orchestratorUrl: config.localRunnerOrchestratorUrl ?? config.runnerCallbackBaseUrl ?? `http://host.docker.internal:${config.healthPort}`,
+          runnerCallbackUrl: runnerCallbackUrl || undefined,
+          runToken: runToken || undefined,
+          runProgressToken: runProgressToken || undefined,
+          anthropicApiKey: config.anthropicApiKey,
+          claudeOAuthToken: config.claudeOAuthToken,
+          retryPolicy: getRetryPolicy(),
+        });
+        const prior = countPriorDispatches(fix.issueId, "implementation");
+        const jobId = appendLog({
+          issueId: fix.issueId,
+          issueIdentifier: fix.issueIdentifier ?? undefined,
+          issueTitle: `Review feedback fix for PR #${fix.prNumber}`,
+          teamKey: scopeKey,
+          repo: fix.repo,
+          dispatchId,
+          dispatchNumber: prior.count + 1,
+          executionMode: "local-docker",
+          runnerMode,
+          sessionImage: config.localRunnerImage,
+          machineNonce: container.machineNonce,
+          machineId: container.containerId,
+          phase: "gap-analysis",
+        });
+        updateJobPrUrl(jobId, `https://github.com/${fix.repo}/pull/${fix.prNumber}`);
+        if (dispatchId) {
+          recordReviewFixDispatch({ queueId: fix.id, dispatchId, repo: fix.repo,
+            prNumber: fix.prNumber, findingIds: dispatchFindingIds });
+        }
+        suppressStaleNotifications(fix.issueId, jobId);
+        updateReviewFixStatus(fix.id, "dispatched");
+        console.log(`[review-fix] Dispatched local review fix for ${fix.issueIdentifier ?? fix.issueId} (PR #${fix.prNumber}, container: ${container.containerId})`);
+        continue;
       }
 
       const runnerImage = await resolveDispatchRunnerImage(config, mapping, ghToken);
@@ -3080,6 +3152,7 @@ async function processReviewFixQueue(config: AppConfig): Promise<void> {
       console.log(`[review-fix] Dispatched review fix for ${fix.issueIdentifier ?? fix.issueId} (PR #${fix.prNumber} in ${fix.repo}, image: ${runnerImage ?? "workflow-default"})`);
     } catch (err) {
       console.error(`[review-fix] Error processing review fix #${fix.id}:`, err);
+      updateReviewFixStatus(fix.id, "failed");
     }
   }
 }

@@ -82,6 +82,11 @@ vi.mock("../linear-app-auth.js", async (importOriginal) => ({
   withLinearToken: withLinearTokenMock,
 }));
 
+const readLocalJobLogsMock = vi.hoisted(() => vi.fn());
+vi.mock("../local-job-logs.js", () => ({
+  readLocalJobLogs: readLocalJobLogsMock,
+}));
+
 function makeFakeRegistry(provider: FakeProvider): ProviderRegistry {
   return {
     forMapping: async () => provider,
@@ -224,6 +229,20 @@ async function requestWithConfig(
   const req = new MockRequest(url, method, { authorization: `Bearer ${token}` });
   const res = new MockResponse();
   admin.handleAdminRequest(req as never, res as never, cfg, makeFakeRegistry(provider));
+  await res.done;
+  return { statusCode: res.statusCode, body: res.body };
+}
+
+async function requestWithRegistry(
+  url: string,
+  method: string,
+  token: string | undefined,
+  registry: ProviderRegistry,
+  body?: unknown,
+): Promise<{ statusCode: number; body: string }> {
+  const req = new MockRequest(url, method, token ? { authorization: `Bearer ${token}` } : {}, body === undefined ? undefined : JSON.stringify(body));
+  const res = new MockResponse();
+  admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), registry);
   await res.done;
   return { statusCode: res.statusCode, body: res.body };
 }
@@ -901,6 +920,49 @@ describe("admin mappings", () => {
     });
   });
 
+  it("persists filesystem project settings and reviewer selection in local mode", async () => {
+    const previousMode = process.env.RUNNER_MODE;
+    process.env.RUNNER_MODE = "local";
+    try {
+      const token = await login("secret");
+      const reviewers = [{ id: "code-review", gates: true }];
+      const create = await request("/api/mappings", "POST", "secret", {
+        teamKey: "LOCAL", owner: "org", repo: "test-app",
+        ticketingProvider: "filesystem",
+        ticketingConfig: { kind: "filesystem", directory: "/tmp/local-tickets" },
+        reviewers,
+      }, token);
+      expect(create.statusCode).toBe(202);
+      const list = await request("/api/mappings", "GET", "secret", undefined, token);
+      expect(JSON.parse(list.body).LOCAL).toMatchObject({
+        ticketingProvider: "filesystem",
+        ticketingConfig: { kind: "filesystem", directory: "/tmp/local-tickets" },
+        reviewers,
+      });
+    } finally {
+      if (previousMode === undefined) delete process.env.RUNNER_MODE;
+      else process.env.RUNNER_MODE = previousMode;
+    }
+  });
+
+  it("rejects filesystem projects on a managed runner", async () => {
+    const previousMode = process.env.RUNNER_MODE;
+    process.env.RUNNER_MODE = "gha";
+    try {
+      const token = await login("secret");
+      const response = await request("/api/mappings", "POST", "secret", {
+        teamKey: "LOCAL", owner: "org", repo: "test-app",
+        ticketingProvider: "filesystem",
+        ticketingConfig: { kind: "filesystem", directory: "/tmp/local-tickets" },
+      }, token);
+      expect(response.statusCode).toBe(400);
+      expect(JSON.parse(response.body).error).toMatch(/local runner mode/);
+    } finally {
+      if (previousMode === undefined) delete process.env.RUNNER_MODE;
+      else process.env.RUNNER_MODE = previousMode;
+    }
+  });
+
   it("upsertMapping rejects Jira ticketingProvider with linear ticketingConfig", async () => {
     const token = await login("secret");
     const res = await request("/api/mappings", "POST", "secret", {
@@ -1367,7 +1429,7 @@ describe("admin mappings", () => {
   it("round-trips a reviewers array, including an empty one", async () => {
     const token = await login("secret");
     const selection = [
-      { id: "gap-analysis", gates: false },
+      { id: "gap-analysis", gates: false, maxTurns: 45 },
       { id: "custom", gates: true },
     ];
     const res = await request("/api/mappings", "POST", "secret", {
@@ -1476,6 +1538,18 @@ describe("admin mappings", () => {
       }, token);
       expect(res.statusCode).toBe(400);
       expect(JSON.parse(res.body).error).toContain("gates");
+    }
+  });
+
+  it("rejects malformed reviewer maxTurns with 400", async () => {
+    const token = await login("secret");
+    for (const badMaxTurns of [0, 201, 1.5, "45", null]) {
+      const res = await request("/api/mappings", "POST", "secret", {
+        teamKey: "REVBAD7", owner: "org", repo: "app",
+        reviewers: [{ id: "gap-analysis", gates: true, maxTurns: badMaxTurns }],
+      }, token);
+      expect(res.statusCode).toBe(400);
+      expect(JSON.parse(res.body).error).toContain("maxTurns");
     }
   });
 
@@ -2470,6 +2544,276 @@ describe("admin job-detail endpoint", () => {
     const res = await request(`/api/jobs/${id}/steps`, "GET", "secret", undefined, token);
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body).job.issueUrl).toBeNull();
+  });
+});
+
+describe("admin filesystem issue detail endpoint", () => {
+  async function withFilesystemProject<T>(
+    run: (ctx: { dir: string; registry: ProviderRegistry; token: string }) => Promise<T>,
+  ): Promise<T> {
+    const previousMode = process.env.RUNNER_MODE;
+    process.env.RUNNER_MODE = "local";
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "admin-fs-issue-"));
+    try {
+      const token = await login("secret");
+      await request("/api/mappings", "POST", "secret", {
+        teamKey: "SAN2",
+        owner: "eudoxus-ai",
+        repo: "ai-implement-sandbox",
+        ticketingProvider: "filesystem",
+        ticketingConfig: { kind: "filesystem", directory: dir },
+      }, token);
+      const { FilesystemProvider } = await import("../providers/filesystem.js");
+      const { initDispatchBreakerTable } = await import("../dispatch-breaker.js");
+      initDispatchBreakerTable();
+      const fsProvider = new FilesystemProvider(() => config.getMappings());
+      const registry = {
+        forMapping: async () => fsProvider,
+        forAllMappings: async () => [fsProvider],
+        invalidate: () => {},
+      } as unknown as ProviderRegistry;
+      return await run({ dir, registry, token });
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+      if (previousMode === undefined) delete process.env.RUNNER_MODE;
+      else process.env.RUNNER_MODE = previousMode;
+    }
+  }
+
+  it("requires auth", async () => {
+    const res = await request("/api/filesystem-issue?issueId=filesystem%3ASAN2%3ASAN2-001", "GET", "secret");
+    expect(res.statusCode).toBe(401);
+  });
+
+  it("requires auth to retry", async () => {
+    const res = await request("/api/filesystem-issue/retry", "POST", "secret", { issueId: "filesystem:SAN2:SAN2-001" });
+    expect(res.statusCode).toBe(401);
+  });
+
+  it("restores an archived failure once and retains the issue history", async () => {
+    await withFilesystemProject(async ({ dir, registry, token }) => {
+      const issueId = "filesystem:SAN2:SAN2-001";
+      fs.mkdirSync(path.join(dir, "failed"));
+      fs.writeFileSync(path.join(dir, "failed", "SAN2-001.md"), "---\ntitle: Retry me\n---\n\nKeep the plan.");
+      fs.mkdirSync(path.join(dir, ".state", "SAN2"), { recursive: true });
+      const comments = [{ body: "Saved plan", createdAt: "2026-09-14T20:00:00.000Z" }];
+      fs.writeFileSync(path.join(dir, ".state", "SAN2", "SAN2-001.json"), JSON.stringify({
+        version: 1, status: "failed", failurePhase: "implementation", comments, prUrls: [], updatedAt: "2026-09-14T20:01:00.000Z",
+      }));
+      const detailUrl = `/api/filesystem-issue?issueId=${encodeURIComponent(issueId)}`;
+      const before = await requestWithRegistry(detailUrl, "GET", token, registry);
+      expect(JSON.parse(before.body)).toMatchObject({ location: "failed", ticketPath: "failed/SAN2-001.md", retryEligible: true });
+      const retry = await requestWithRegistry("/api/filesystem-issue/retry", "POST", token, registry, { issueId });
+      expect(retry.statusCode).toBe(200);
+      expect(JSON.parse(retry.body)).toEqual({ retried: true });
+      expect(fs.existsSync(path.join(dir, "SAN2-001.md"))).toBe(true);
+      expect(fs.existsSync(path.join(dir, "failed", "SAN2-001.md"))).toBe(false);
+      const after = await requestWithRegistry(detailUrl, "GET", token, registry);
+      expect(JSON.parse(after.body)).toMatchObject({ location: "active", retryEligible: false, state: { status: "plan-approved", comments } });
+      const duplicate = await requestWithRegistry("/api/filesystem-issue/retry", "POST", token, registry, { issueId });
+      expect(duplicate.statusCode).toBe(409);
+    });
+  });
+
+  it("rejects retry of invalid ids or a failed ticket with an existing PR", async () => {
+    await withFilesystemProject(async ({ dir, registry, token }) => {
+      const invalid = await requestWithRegistry("/api/filesystem-issue/retry", "POST", token, registry, { issueId: "../SAN2-001" });
+      expect(invalid.statusCode).toBe(400);
+      fs.mkdirSync(path.join(dir, "failed"));
+      fs.writeFileSync(path.join(dir, "failed", "SAN2-001.md"), "---\ntitle: Existing PR\n---\n\nTask.");
+      fs.mkdirSync(path.join(dir, ".state", "SAN2"), { recursive: true });
+      fs.writeFileSync(path.join(dir, ".state", "SAN2", "SAN2-001.json"), JSON.stringify({
+        version: 1, status: "failed", failurePhase: "implementation", comments: [],
+        prUrls: ["https://github.com/example/repo/pull/1"], updatedAt: "2026-09-14T20:01:00.000Z",
+      }));
+      const res = await requestWithRegistry("/api/filesystem-issue/retry", "POST", token, registry, { issueId: "filesystem:SAN2:SAN2-001" });
+      expect(res.statusCode).toBe(409);
+      expect(JSON.parse(res.body).error).toMatch(/pull request/);
+      expect(fs.existsSync(path.join(dir, "failed", "SAN2-001.md"))).toBe(true);
+    });
+  });
+
+  it("returns the parsed issue, raw markdown, relative state path, and persisted state", async () => {
+    await withFilesystemProject(async ({ dir, registry, token }) => {
+      fs.writeFileSync(
+        path.join(dir, "SAN2-001.md"),
+        "---\ntitle: Make the jellyfish pulse less\n---\n\nTone down the animation.",
+        "utf8",
+      );
+      fs.mkdirSync(path.join(dir, ".state", "SAN2"), { recursive: true });
+      fs.writeFileSync(
+        path.join(dir, ".state", "SAN2", "SAN2-001.json"),
+        JSON.stringify({
+          version: 1,
+          status: "implementing",
+          comments: [{ body: "plan", createdAt: "2026-09-14T20:00:00.000Z" }],
+          prUrls: [],
+          updatedAt: "2026-09-14T20:01:00.000Z",
+        }),
+        "utf8",
+      );
+
+      const res = await requestWithRegistry(
+        "/api/filesystem-issue?issueId=filesystem%3ASAN2%3ASAN2-001",
+        "GET",
+        token,
+        registry,
+      );
+      expect(res.statusCode).toBe(200);
+      const body = JSON.parse(res.body);
+      expect(body.issue).toMatchObject({
+        id: "filesystem:SAN2:SAN2-001",
+        identifier: "SAN2-001",
+        title: "Make the jellyfish pulse less",
+        scopeKey: "SAN2",
+        nativeStatus: "implementing",
+      });
+      expect(body.markdown).toContain("Tone down the animation.");
+      expect(body.statePath).toBe(".state/SAN2/SAN2-001.json");
+      expect(body.state.status).toBe("implementing");
+    });
+  });
+
+  it("returns null state without creating a state file", async () => {
+    await withFilesystemProject(async ({ dir, registry, token }) => {
+      fs.writeFileSync(path.join(dir, "SAN2-002.md"), "---\ntitle: Fresh\n---\n\nNew task.", "utf8");
+
+      const res = await requestWithRegistry(
+        "/api/filesystem-issue?issueId=filesystem%3ASAN2%3ASAN2-002",
+        "GET",
+        token,
+        registry,
+      );
+      expect(res.statusCode).toBe(200);
+      const body = JSON.parse(res.body);
+      expect(body.state).toBeNull();
+      expect(body.statePath).toBe(".state/SAN2/SAN2-002.json");
+      expect(fs.existsSync(path.join(dir, ".state", "SAN2", "SAN2-002.json"))).toBe(false);
+    });
+  });
+
+  it("rejects non-filesystem ids and returns 404 for unknown filesystem tasks", async () => {
+    await withFilesystemProject(async ({ registry, token }) => {
+      const invalid = await requestWithRegistry("/api/filesystem-issue?issueId=AII-1", "GET", token, registry);
+      expect(invalid.statusCode).toBe(400);
+      const missing = await requestWithRegistry(
+        "/api/filesystem-issue?issueId=filesystem%3ASAN2%3ASAN2-404",
+        "GET",
+        token,
+        registry,
+      );
+      expect(missing.statusCode).toBe(404);
+    });
+  });
+});
+
+describe("admin local job logs endpoint", () => {
+  beforeEach(() => {
+    readLocalJobLogsMock.mockReset();
+  });
+
+  async function requestJobLogs(
+    jobId: number,
+    token: string,
+  ): Promise<{ statusCode: number; body: string }> {
+    return request(`/api/jobs/${jobId}/logs`, "GET", "secret", undefined, token);
+  }
+
+  it("requires auth", async () => {
+    const res = await request("/api/jobs/1/logs", "GET", "secret");
+    expect(res.statusCode).toBe(401);
+  });
+
+  it("returns 404 for an unknown job id", async () => {
+    const token = await login("secret");
+    const res = await requestJobLogs(99999, token);
+    expect(res.statusCode).toBe(404);
+    expect(readLocalJobLogsMock).not.toHaveBeenCalled();
+  });
+
+  it("requires the orchestrator to be in local runner mode before reading Docker logs", async () => {
+    const token = await login("secret");
+    const id = log.appendLog({
+      issueId: "issue-local",
+      executionMode: "local-docker",
+      machineId: "abcdef123456",
+    });
+    const res = await requestJobLogs(id, token);
+    expect(res.statusCode).toBe(409);
+    expect(readLocalJobLogsMock).not.toHaveBeenCalled();
+  });
+
+  it("reads logs only from the recorded local Docker container id", async () => {
+    const previousMode = process.env.RUNNER_MODE;
+    process.env.RUNNER_MODE = "local";
+    try {
+      readLocalJobLogsMock.mockResolvedValueOnce({ logs: "hello\nworld", source: "live" });
+      const token = await login("secret");
+      const id = log.appendLog({
+        issueId: "issue-local",
+        executionMode: "local-docker",
+        machineId: "abcdef123456",
+      });
+      const res = await requestJobLogs(id, token);
+      expect(res.statusCode).toBe(200);
+      expect(JSON.parse(res.body)).toEqual({ logs: "hello\nworld", source: "live" });
+      expect(readLocalJobLogsMock).toHaveBeenCalledWith("abcdef123456");
+    } finally {
+      if (previousMode === undefined) delete process.env.RUNNER_MODE;
+      else process.env.RUNNER_MODE = previousMode;
+    }
+  });
+
+  it("rejects non-local jobs, missing containers, and malformed recorded container ids", async () => {
+    const previousMode = process.env.RUNNER_MODE;
+    process.env.RUNNER_MODE = "local";
+    try {
+      const token = await login("secret");
+      const nonLocal = log.appendLog({ issueId: "issue-gha", executionMode: "github-actions" });
+      const missingContainer = log.appendLog({ issueId: "issue-no-container", executionMode: "local-docker" });
+      const malformedContainer = log.appendLog({
+        issueId: "issue-bad-container",
+        executionMode: "local-docker",
+        machineId: "../not-a-container",
+      });
+
+      expect((await requestJobLogs(nonLocal, token)).statusCode).toBe(400);
+      expect((await requestJobLogs(missingContainer, token)).statusCode).toBe(400);
+      expect((await requestJobLogs(malformedContainer, token)).statusCode).toBe(400);
+      expect(readLocalJobLogsMock).not.toHaveBeenCalled();
+    } finally {
+      if (previousMode === undefined) delete process.env.RUNNER_MODE;
+      else process.env.RUNNER_MODE = previousMode;
+    }
+  });
+
+  it("returns 404 when local logs are unavailable and 503 for read errors", async () => {
+    const previousMode = process.env.RUNNER_MODE;
+    process.env.RUNNER_MODE = "local";
+    try {
+      const token = await login("secret");
+      const unavailable = log.appendLog({
+        issueId: "issue-unavailable",
+        executionMode: "local-docker",
+        machineId: "abcdef123456",
+      });
+      readLocalJobLogsMock.mockResolvedValueOnce(null);
+      expect((await requestJobLogs(unavailable, token)).statusCode).toBe(404);
+
+      const errored = log.appendLog({
+        issueId: "issue-error",
+        executionMode: "local-docker",
+        machineId: "abcdef123457",
+      });
+      readLocalJobLogsMock.mockRejectedValueOnce(new Error("docker unavailable; token=private-value"));
+      const res = await requestJobLogs(errored, token);
+      expect(res.statusCode).toBe(503);
+      expect(JSON.parse(res.body).error).toBe("Local job logs could not be read");
+      expect(res.body).not.toContain("private-value");
+    } finally {
+      if (previousMode === undefined) delete process.env.RUNNER_MODE;
+      else process.env.RUNNER_MODE = previousMode;
+    }
   });
 });
 

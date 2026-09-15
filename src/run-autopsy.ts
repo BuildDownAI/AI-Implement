@@ -39,17 +39,12 @@ export function formatRunAutopsy(a: RunAutopsy): string {
       return `| ${p.iteration} | ${p.implementOutcome} | ${p.implementTurns ?? "?"} | ${p.attempts ?? 1} | ${cost} | ${review} |`;
     })
     .join("\n");
-  // Mirrors post-push-review.ts's own iteration-aware phrase and run-autonomous.ts's ticket
-  // comment: iteration 1 never carried forward blockers from a prior review ("the code was
-  // not reviewed"); iteration >= 2 means a previous review did run and a fix pass acted on
-  // it — only the latest revision went unreviewed.
-  const notReviewedPhrase = a.iterations >= 2 ? "the latest revision was not reviewed" : "the code was not reviewed";
   const { stageLabel, codeState } = providerUnavailablePhrase(a.failure?.stage, Boolean(a.prUrl));
   return [
     `## 🔎 Run autopsy — ${a.issueIdentifier}`,
     "",
     reviewerTurnsExhausted
-      ? `The post-push reviewer ran out of turns at the configured cap (${a.reviewMaxTurns ?? DEFAULT_RETRY_POLICY.reviewMaxTurns}) after ${a.iterations} iteration(s); ${notReviewedPhrase}.`
+      ? `A post-push reviewer reached its configured cap (${a.reviewMaxTurns ?? DEFAULT_RETRY_POLICY.reviewMaxTurns}) after ${a.iterations} iteration(s); required review is incomplete. Other reviewer results are preserved below.`
       : providerUnavailable
         ? `🟠 The model provider was unavailable during ${stageLabel} after ${a.iterations} iteration(s); the code was ${codeState}.`
         : `The implementation run ended **without review approval** (reason: \`${a.terminationReason}\`) after ${a.iterations} iteration(s).`,

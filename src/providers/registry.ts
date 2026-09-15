@@ -1,6 +1,7 @@
 import type { RepoMapping } from "../config.js";
 import { resolveProvider } from "./index.js";
 import type { ProviderConfig, TicketingProvider } from "./types.js";
+import { getRunnerMode } from "../runner-mode.js";
 
 /**
  * Resolves and caches TicketingProvider instances per provider id.
@@ -13,6 +14,7 @@ import type { ProviderConfig, TicketingProvider } from "./types.js";
 export class ProviderRegistry {
   private linearProvider: Promise<TicketingProvider> | null = null;
   private jiraProvider: Promise<TicketingProvider> | null = null;
+  private filesystemProvider: Promise<TicketingProvider> | null = null;
 
   constructor(
     private readonly config: ProviderConfig,
@@ -20,6 +22,13 @@ export class ProviderRegistry {
   ) {}
 
   async forMapping(mapping: RepoMapping): Promise<TicketingProvider> {
+    if (mapping.ticketingProvider === "filesystem") {
+      if (getRunnerMode().mode !== "local") {
+        throw new Error("Filesystem tickets require local runner mode (RUNNER_MODE=local)");
+      }
+      this.filesystemProvider ??= resolveProvider("filesystem", this.config, { getMappings: this.getMappings });
+      return this.filesystemProvider;
+    }
     if (mapping.ticketingProvider === "linear") {
       this.linearProvider ??= resolveProvider("linear", this.config);
       return this.linearProvider;
@@ -57,5 +66,6 @@ export class ProviderRegistry {
   invalidate(): void {
     this.linearProvider = null;
     this.jiraProvider = null;
+    this.filesystemProvider = null;
   }
 }

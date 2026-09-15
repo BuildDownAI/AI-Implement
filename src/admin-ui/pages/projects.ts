@@ -85,12 +85,14 @@ export const projectsHtml = `
               <select class="select" id="md-ticketing-provider" onchange="onTicketingProviderChange()">
                 <option value="linear">Linear</option>
                 <option value="jira">Jira</option>
+                <option value="filesystem">Filesystem / local</option>
               </select>
+              <div class="field-hint">Filesystem tickets are Markdown files on this machine. They run real GitHub PRs through local Docker and require RUNNER_MODE=local.</div>
             </div>
             <div class="field">
-              <label class="field-label">Team Key</label>
+              <label class="field-label">Mapping Key</label>
               <input class="input mono" id="md-team-key" placeholder="MY_TEAM">
-              <div class="field-hint">The tracker team this mapping serves, e.g. ENG. Cannot be changed after creation.</div>
+              <div class="field-hint">Identifies this project independently of its ticket directory. Cannot be changed after creation.</div>
             </div>
           </div>
           <div id="md-jira-fields" class="hidden" style="display:grid;gap:12px">
@@ -141,6 +143,20 @@ export const projectsHtml = `
                 <option value="">Select a Repo Field first</option>
               </select>
               <input class="input mono hidden" id="md-jira-repo-value-text" type="text" placeholder="owner/repo">
+            </div>
+          </div>
+          <div id="md-filesystem-fields" class="hidden" style="display:grid;gap:12px">
+            <div class="field">
+              <label class="field-label">Ticket Directory</label>
+              <input class="input mono" id="md-filesystem-directory" placeholder="/private/tmp/filesystem-local-tickets">
+              <div class="field-hint">Absolute host path containing Markdown tickets. The orchestrator writes local state there, while implementation still opens real GitHub PRs for review iteration.</div>
+            </div>
+            <div class="alert info">
+              <div class="alert-icon">&#8505;</div>
+              <div>
+                <div class="alert-title">Local Docker execution</div>
+                <div class="alert-desc">Use this with <span class="mono">RUNNER_MODE=local</span>. Local mode sends these tickets through the local Docker runner and the normal GitHub PR review loop.</div>
+              </div>
             </div>
           </div>
         </div>
@@ -226,6 +242,13 @@ export const projectsHtml = `
         <h3 style="font-size:13px;font-weight:600;margin:0 0 4px">Execution</h3>
         <p style="font-size:12px;color:var(--fg-tertiary);margin:0 0 18px">Where runs execute, and what the runner process receives.</p>
         <div style="display:grid;gap:12px">
+          <div id="md-local-docker-note" class="alert info hidden">
+            <div class="alert-icon">&#8505;</div>
+            <div>
+              <div class="alert-title">Filesystem tickets use local Docker</div>
+              <div class="alert-desc">With <span class="mono">RUNNER_MODE=local</span>, this project runs in the local Docker runner and still opens real GitHub PRs for review iteration. No Fly credentials are needed for this path.</div>
+            </div>
+          </div>
           <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
             <div class="field">
               <label class="field-label">Mode</label>
@@ -286,7 +309,7 @@ export const projectsHtml = `
               <input class="input mono" id="md-reviewer-id" placeholder="reviewer id" style="flex:1;min-width:0">
               <button class="btn btn-sm" type="button" onclick="addProjectReviewer()">Add reviewer</button>
             </div>
-            <div class="field-hint">Blank = gap-analysis and code-review both run and gate. Uncheck Runs to leave a reviewer out; uncheck Gates to run it without blocking merge.</div>
+            <div class="field-hint">Blank = gap-analysis and code-review both run and gate. Reviewer Max turns blank = inherit the reviewer default or global limit.</div>
           </div>
           <div class="field">
             <label class="field-label">Job Timeout (min)</label>
@@ -493,24 +516,26 @@ export const projectsScript = `
 
   function defaultReviewerDraft() {
     return BUILT_IN_REVIEWERS.map(function (id) {
-      return { id: id, runs: true, gates: true, builtin: true };
+      return { id: id, runs: true, gates: true, maxTurns: '', builtin: true };
     });
   }
 
   function reviewerRowsFromSelection(selection) {
     if (!Array.isArray(selection)) return defaultReviewerDraft();
     var rows = BUILT_IN_REVIEWERS.map(function (id) {
-      return { id: id, runs: false, gates: true, builtin: true };
+      return { id: id, runs: false, gates: true, maxTurns: '', builtin: true };
     });
     for (var i = 0; i < selection.length; i++) {
       var entry = selection[i] || {};
       if (typeof entry.id !== 'string' || !entry.id) continue;
       var existing = rows.find(function (row) { return row.id === entry.id; });
+      var maxTurns = Number.isInteger(entry.maxTurns) ? String(entry.maxTurns) : '';
       if (existing) {
         existing.runs = true;
         existing.gates = entry.gates === true;
+        existing.maxTurns = maxTurns;
       } else {
-        rows.push({ id: entry.id, runs: true, gates: entry.gates === true, builtin: false });
+        rows.push({ id: entry.id, runs: true, gates: entry.gates === true, maxTurns: maxTurns, builtin: false });
       }
     }
     return rows;
@@ -518,7 +543,7 @@ export const projectsScript = `
 
   function renderProjectReviewers() {
     var list = document.getElementById('md-reviewer-list');
-    var rowStyle = 'display:grid;grid-template-columns:minmax(0,1fr)92px 92px 34px;gap:8px;align-items:center;padding:7px 0;font-size:12.5px;border-top:1px solid var(--border-subtle)';
+    var rowStyle = 'display:grid;grid-template-columns:minmax(0,1fr)92px 92px minmax(120px,150px)34px;gap:8px;align-items:center;padding:7px 0;font-size:12.5px;border-top:1px solid var(--border-subtle)';
     list.innerHTML = reviewerDraft.map(function (reviewer, i) {
       var remove = reviewer.builtin
         ? '<span></span>'
@@ -527,6 +552,7 @@ export const projectsScript = `
         + '<span class="mono" style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + window.escAttr(reviewer.id) + '">' + window.esc(reviewer.id) + '</span>'
         + '<label class="checkbox-row" style="margin:0"><input type="checkbox" aria-label="Runs ' + window.escAttr(reviewer.id) + '" onchange="setProjectReviewerRuns(' + i + ', this.checked)"' + (reviewer.runs ? ' checked' : '') + '> Runs</label>'
         + '<label class="checkbox-row" style="margin:0"><input type="checkbox" aria-label="Gates ' + window.escAttr(reviewer.id) + '" onchange="setProjectReviewerGates(' + i + ', this.checked)"' + (reviewer.gates ? ' checked' : '') + '> Gates</label>'
+        + '<label style="display:grid;gap:2px;margin:0;font-size:11px;color:var(--fg-tertiary)">Max turns<input class="input" type="number" min="1" max="200" step="1" placeholder="inherit" aria-label="Max turns for ' + window.escAttr(reviewer.id) + ', blank inherits reviewer default or global limit" value="' + window.escAttr(reviewer.maxTurns || '') + '" onchange="setProjectReviewerMaxTurns(' + i + ', this.value)" style="height:30px;padding:4px 8px"></label>'
         + remove
         + '</div>';
     }).join('');
@@ -550,6 +576,13 @@ export const projectsScript = `
   }
   window.setProjectReviewerGates = setProjectReviewerGates;
 
+  function setProjectReviewerMaxTurns(i, value) {
+    if (!reviewerDraft[i]) return;
+    reviewerDraft[i].maxTurns = String(value || '').trim();
+    markProjectReviewersTouched();
+  }
+  window.setProjectReviewerMaxTurns = setProjectReviewerMaxTurns;
+
   function stageProjectReviewer() {
     var input = document.getElementById('md-reviewer-id');
     var id = input.value.trim();
@@ -557,7 +590,7 @@ export const projectsScript = `
     if (reviewerDraft.some(function (reviewer) { return reviewer.id === id; })) {
       return 'Reviewer ' + id + ' is already listed.';
     }
-    reviewerDraft.push({ id: id, runs: true, gates: true, builtin: false });
+    reviewerDraft.push({ id: id, runs: true, gates: true, maxTurns: '', builtin: false });
     input.value = '';
     markProjectReviewersTouched();
     renderProjectReviewers();
@@ -587,7 +620,26 @@ export const projectsScript = `
     if (reviewerDefaultUntouched) return null;
     return reviewerDraft
       .filter(function (reviewer) { return reviewer.runs; })
-      .map(function (reviewer) { return { id: reviewer.id, gates: reviewer.gates === true }; });
+      .map(function (reviewer) {
+        var value = { id: reviewer.id, gates: reviewer.gates === true };
+        var maxTurnsText = String(reviewer.maxTurns || '').trim();
+        if (maxTurnsText !== '') value.maxTurns = Number(maxTurnsText);
+        return value;
+      });
+  }
+
+  function projectReviewerProblem() {
+    for (var i = 0; i < reviewerDraft.length; i++) {
+      var reviewer = reviewerDraft[i];
+      if (!reviewer || !reviewer.runs) continue;
+      var maxTurnsText = String(reviewer.maxTurns || '').trim();
+      if (maxTurnsText === '') continue;
+      var maxTurns = Number(maxTurnsText);
+      if (!Number.isInteger(maxTurns) || maxTurns < 1 || maxTurns > 200) {
+        return 'Reviewer ' + reviewer.id + ' Max turns must be blank or an integer from 1 to 200.';
+      }
+    }
+    return null;
   }
 
   // A looser echo of the server's rules, so a mistyped entry fails at the row rather than
@@ -731,10 +783,13 @@ export const projectsScript = `
 
     // Ticketing provider + Jira config
     const tp = m.ticketingProvider || 'linear';
-    document.getElementById('md-ticketing-provider').value = tp;
+    const ticketingProviderEl = document.getElementById('md-ticketing-provider');
+    ticketingProviderEl.value = tp;
+    ticketingProviderEl.dataset.openedProvider = tp;
     const tc = (m.ticketingConfig && typeof m.ticketingConfig === 'object') ? m.ticketingConfig : {};
     document.getElementById('md-jira-mapping-id').value = (tp === 'jira' && tc.kind === 'jira') ? (key || '') : '';
     document.getElementById('md-jira-jql').value = (tp === 'jira' && tc.kind === 'jira' && tc.jql) ? tc.jql : '';
+    document.getElementById('md-filesystem-directory').value = (tp === 'filesystem' && tc.kind === 'filesystem' && tc.directory) ? tc.directory : '';
     const pendingStatus = (tp === 'jira' && tc.statusFieldOverride) ? tc.statusFieldOverride : '';
     const pendingRepoFld = (tp === 'jira' && tc.repoFieldOverride) ? tc.repoFieldOverride : '';
     const pendingProfilesFld = (tp === 'jira' && tc.profilesFieldOverride) ? tc.profilesFieldOverride : '';
@@ -835,14 +890,30 @@ export const projectsScript = `
   window.onPlanningChange = onPlanningChange;
 
   function onTicketingProviderChange() {
-    const provider = document.getElementById('md-ticketing-provider').value;
+    const providerEl = document.getElementById('md-ticketing-provider');
+    const provider = providerEl.value;
     const jiraFields = document.getElementById('md-jira-fields');
+    const filesystemFields = document.getElementById('md-filesystem-fields');
+    const localDockerNote = document.getElementById('md-local-docker-note');
     if (provider === 'jira') {
       jiraFields.classList.remove('hidden');
+      filesystemFields.classList.add('hidden');
+      localDockerNote.classList.add('hidden');
       loadJiraFields();
       preloadRepoFieldOptions();
+    } else if (provider === 'filesystem') {
+      jiraFields.classList.add('hidden');
+      filesystemFields.classList.remove('hidden');
+      localDockerNote.classList.remove('hidden');
+      if (providerEl.dataset.openedProvider !== 'filesystem') {
+        document.getElementById('md-exec-mode').value = 'github-actions';
+        document.getElementById('md-session-mode').value = 'autonomous';
+        onExecModeChange();
+      }
     } else {
       jiraFields.classList.add('hidden');
+      filesystemFields.classList.add('hidden');
+      localDockerNote.classList.add('hidden');
     }
   }
   window.onTicketingProviderChange = onTicketingProviderChange;
@@ -1070,7 +1141,7 @@ export const projectsScript = `
 
     const origKey = document.getElementById('md-team-key-orig').value;
     const isNew = !origKey;
-    const teamKey = isNew ? document.getElementById('md-team-key').value.trim() : origKey;
+    let teamKey = isNew ? document.getElementById('md-team-key').value.trim() : origKey;
     const defaultBranch = document.getElementById('md-branch').value.trim();
     if (!defaultBranch) {
       showMappingError('Default Branch is required.', 'source');
@@ -1091,6 +1162,11 @@ export const projectsScript = `
     if (pendingProjectReviewer()) {
       const pending = stageProjectReviewer();
       if (pending) { showMappingError(pending, 'capacity'); return; }
+    }
+    const reviewerProblem = projectReviewerProblem();
+    if (reviewerProblem) {
+      showMappingError(reviewerProblem, 'capacity');
+      return;
     }
 
     const body = {
@@ -1145,11 +1221,29 @@ export const projectsScript = `
         profilesFieldOverride: profilesFieldOverride,
         baseBranchFieldOverride: baseBranchFieldOverride,
       };
+    } else if (ticketingProvider === 'filesystem') {
+      const directory = document.getElementById('md-filesystem-directory').value.trim();
+      body.ticketingConfig = { kind: 'filesystem', directory: directory };
+      if (isNew && !teamKey) {
+        teamKey = 'filesystem_' + body.owner + '_' + body.repo;
+        body.teamKey = teamKey;
+      }
     }
 
     if (!body.teamKey) {
-      showMappingError('Team Key is required.', 'ticketing');
+      showMappingError('Mapping Key is required.', 'ticketing');
       return;
+    }
+    if (ticketingProvider === 'filesystem') {
+      const directory = body.ticketingConfig && body.ticketingConfig.directory ? body.ticketingConfig.directory : '';
+      if (!directory) {
+        showMappingError('Ticket Directory is required for filesystem ticketing.', 'ticketing');
+        return;
+      }
+      if (directory.charAt(0) !== '/') {
+        showMappingError('Ticket Directory must be an absolute path.', 'ticketing');
+        return;
+      }
     }
     if (!body.owner || !body.repo) {
       showMappingError('Owner and Repo are required.', 'source');

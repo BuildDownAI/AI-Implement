@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { JSDOM } from "jsdom";
 import { projectsHtml, projectsScript } from "../admin-ui/pages/projects.js";
 import { stepperHtml, stepperScript } from "../admin-ui/stepper.js";
 
@@ -88,6 +89,7 @@ describe("mapping dialog — field placement", () => {
 
   it.each([
     ["md-ticketing-provider", "ticketing"],
+    ["md-filesystem-directory", "ticketing"],
     ["md-team-key", "ticketing"],
     ["md-owner", "source"],
     ["md-repo", "source"],
@@ -115,6 +117,95 @@ describe("mapping dialog — field placement", () => {
   it("declares no id twice", () => {
     const ids = [...projectsHtml.matchAll(/id="([a-z0-9-]+)"/g)].map((m) => m[1]);
     expect(ids.length).toBe(new Set(ids).size);
+  });
+});
+
+describe("mapping dialog — filesystem ticketing behavior", () => {
+  it("roundtrips the filesystem directory while preserving reviewer settings", async () => {
+    const mappingKey = "/private/tmp/filesystem-local-tickets";
+    const existing = {
+      [mappingKey]: {
+        owner: "BuildDownAI",
+        repo: "AI-Implement",
+        workflowFile: "claude-implement.yml",
+        defaultBranch: "testing",
+        maxInProgressAiIssues: 2,
+        executionMode: "fly-machines",
+        sessionMode: "autonomous",
+        machineCpus: 4,
+        machineMemoryMb: 8192,
+        planningEnabled: true,
+        autoApprovePlans: false,
+        autoMerge: true,
+        planningWorkflowFile: "claude-plan.yml",
+        extraEnv: { LOG_LEVEL: "debug" },
+        provider: "anthropic",
+        maxTurns: 60,
+        maxIterations: 4,
+        maxJobMinutes: 120,
+        branchPrefix: "pr",
+        skillsRepo: "BuildDownAI/skills",
+        dependencyTokenScope: "installation",
+        sensitiveAddPatterns: ["infra/**"],
+        sensitiveAllowPatterns: ["infra/README.md"],
+        referenceRepos: [{ repo: "BuildDownAI/docs", path: "refs/docs" }],
+        ticketingProvider: "filesystem",
+        ticketingConfig: { kind: "filesystem", directory: mappingKey },
+      },
+    };
+    const posts: any[] = [];
+    const dom = new JSDOM(`<!doctype html><body>${projectsHtml}</body>`, { runScripts: "outside-only" });
+    const win = dom.window as unknown as Record<string, any>;
+    win.registerPage = () => {};
+    win.safeUrl = (s: unknown) => String(s);
+    win.esc = (s: unknown) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    win.escAttr = (s: unknown) => String(s).replace(/&/g, "&amp;").replace(/"/g, "&quot;");
+    win.api = async (path: string, init?: RequestInit) => {
+      if (path === "/api/mappings" && !init) return { ok: true, json: async () => existing };
+      if (path === "/api/mappings" && init?.method === "POST") {
+        posts.push(JSON.parse(String(init.body)));
+        return { ok: true, json: async () => ({ syncJobId: "sync-1" }) };
+      }
+      throw new Error(`unexpected api call ${path}`);
+    };
+    win.pollSyncStatus = () => {};
+    Object.defineProperty(dom.window.HTMLDialogElement.prototype, "showModal", { value() {} });
+    Object.defineProperty(dom.window.HTMLDialogElement.prototype, "close", { value() {} });
+    dom.window.eval(projectsScript);
+
+    await win.loadMappings();
+    win.openMappingDialog(mappingKey);
+    expect((dom.window.document.getElementById("md-ticketing-provider") as HTMLSelectElement).value).toBe("filesystem");
+    expect((dom.window.document.getElementById("md-filesystem-directory") as HTMLInputElement).value).toBe(mappingKey);
+    expect(dom.window.document.getElementById("md-local-docker-note")?.classList.contains("hidden")).toBe(false);
+    expect((dom.window.document.getElementById("md-exec-mode") as HTMLSelectElement).value).toBe("fly-machines");
+
+    await win.saveMappingDialog();
+
+    expect(posts).toHaveLength(1);
+    expect(posts[0]).toMatchObject({
+      teamKey: mappingKey,
+      owner: "BuildDownAI",
+      repo: "AI-Implement",
+      defaultBranch: "testing",
+      maxInProgressAiIssues: 2,
+      executionMode: "fly-machines",
+      sessionMode: "autonomous",
+      machineCpus: 4,
+      machineMemoryMb: 8192,
+      planningEnabled: true,
+      autoApprovePlans: false,
+      autoMerge: true,
+      provider: "anthropic",
+      branchPrefix: "pr",
+      skillsRepo: "BuildDownAI/skills",
+      dependencyTokenScope: "installation",
+      referenceRepos: [{ repo: "BuildDownAI/docs", path: "refs/docs" }],
+      sensitiveAddPatterns: "infra/**",
+      sensitiveAllowPatterns: "infra/README.md",
+      ticketingProvider: "filesystem",
+      ticketingConfig: { kind: "filesystem", directory: mappingKey },
+    });
   });
 });
 

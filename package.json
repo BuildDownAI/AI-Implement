@@ -20,7 +20,8 @@
     "dev:local": "npm run check:node && npm run build:runner:local && RUNNER_MODE=local LOCAL_RUNNER_IMAGE=ai-implement-runner:local tsx --env-file-if-exists=.env src/index.ts",
     "dev:run": "npm run check:node && tsx --env-file-if-exists=.env src/dev-harness/cli.ts",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run",
+    "test": "npm run test:db-isolation && vitest run",
+    "test:db-isolation": "node scripts/check-test-db-isolation.mjs",
     "test:watch": "vitest"
   },
   "dependencies": {

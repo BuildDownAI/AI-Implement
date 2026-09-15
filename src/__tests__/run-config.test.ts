@@ -159,7 +159,7 @@ describe("run-config envelope", () => {
 
   it("round-trips reviewers through pickKnownKeys", () => {
     const reviewers: ReviewerSelection[] = [
-      { id: "gap-analysis", gates: true },
+      { id: "gap-analysis", gates: true, maxTurns: 45 },
       { id: "custom", gates: false },
     ];
     const withExtra = { ...full, reviewers, bogusKey: "dropped" };
@@ -179,6 +179,23 @@ describe("run-config envelope", () => {
       expect(decoded.reviewers).toBeUndefined();
       expect(warnSpy).toHaveBeenCalledTimes(1);
       expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("reviewers"));
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("drops reviewers with malformed per-reviewer maxTurns during decode", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      for (const maxTurns of [0, 201, 1.5, "45"]) {
+        const withMalformedReviewers = { ...full, reviewers: [{ id: "gap-analysis", gates: true, maxTurns }] };
+        const b64 = Buffer.from(JSON.stringify(withMalformedReviewers), "utf-8").toString("base64");
+        const decoded = decodeRunConfig(b64);
+        expect(decoded.issue.identifier).toBe("AII-1");
+        expect(decoded.reviewers).toBeUndefined();
+      }
+      expect(warnSpy).toHaveBeenCalledTimes(4);
+      for (const call of warnSpy.mock.calls) expect(call[0]).toContain("reviewers");
     } finally {
       warnSpy.mockRestore();
     }

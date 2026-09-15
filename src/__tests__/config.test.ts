@@ -750,7 +750,7 @@ describe("config", () => {
   it("round-trips reviewers, preserving order, including an empty array", () => {
     config.initMappingsTable();
     const selection: ReviewerSelection[] = [
-      { id: "gap-analysis", gates: false },
+      { id: "gap-analysis", gates: false, maxTurns: 45 },
       { id: "custom", gates: true },
     ];
     config.upsertMapping("REV", mapping({ owner: "org", repo: "repo", reviewers: selection }));
@@ -813,7 +813,7 @@ describe("config", () => {
   });
 
   it("resolveReviewerSelection passes through a stored non-null selection, including an empty array", () => {
-    const selection: ReviewerSelection[] = [{ id: "gap-analysis", gates: false }];
+    const selection: ReviewerSelection[] = [{ id: "gap-analysis", gates: false, maxTurns: 45 }];
     expect(config.resolveReviewerSelection({ reviewers: selection })).toBe(selection);
     expect(config.resolveReviewerSelection({ reviewers: [] })).toEqual([]);
   });

@@ -1,7 +1,5 @@
 import type { ReviewerDefinition, ReviewerPromptInput } from "./registry.js";
-import { REVIEWER_VERDICT_SCHEMA } from "./schema.js";
-
-const GAP_ANALYSIS_MAX_TURNS = 3;
+import { BUILTIN_REVIEWER_VERDICT_SCHEMA } from "./schema.js";
 
 function buildPrompt(input: ReviewerPromptInput): string {
   return `You are reviewing the diff for PR #${input.prNumber} against issue ${input.issueIdentifier}: ${input.issueTitle}.
@@ -16,6 +14,17 @@ Every finding must name the requirement it came from, or state that the change i
 
 On follow-up reviews, first verify every previous finding is fixed, then review the entire updated diff again for missing requirements or unrequested scope.
 
+Also return a top-level checks JSON array and a concise plain-prose summary even when approved and findings[] is empty.
+Each acceptance criterion should have a checks[] item, and include one scope check for clearly
+unrequested changes. Each checks[] item must name a concrete acceptance criterion, requested behavior, or scope boundary,
+then cite evidence from changed files, symbols, diff hunks, or the issue text. Use result="passed"
+only when the diff contains concrete implementation evidence. Use result="not_verified" when the
+available diff is insufficient, and explain what was not verified. Distinguish inspecting test
+source from executing tests. Do not claim tests were executed or runtime behavior was checked
+unless the review context includes that exact evidence. Do not put tool XML, a
+serialized checklist, or checks content in summary; checks must be top-level
+JSON array items.
+
 Issue description and acceptance criteria:
 ${input.issueDescription}
 
@@ -27,14 +36,13 @@ Review this PR diff:
 ${input.diff}
 </pr_diff>
 
-Output ONLY valid JSON: {"approved": bool, "findings": [{"severity": "blocking|medium|minor", "body": "self-contained finding", "path": "optional file path", "line": optional_number}]}.`;
+Output ONLY valid JSON: {"approved": bool, "findings": [{"severity": "blocking|medium|minor", "body": "self-contained finding", "path": "optional file path", "line": optional_number}], "summary": "short evidence-based summary", "checks": [{"check": "specific requirement or scope boundary inspected", "result": "passed|failed|not_verified|not_applicable", "evidence": "specific evidence or limitation"}]}.`;
 }
 
 const gapAnalysisReviewer: ReviewerDefinition = {
   id: "gap-analysis",
   buildPrompt,
-  outputSchema: REVIEWER_VERDICT_SCHEMA,
-  maxTurns: GAP_ANALYSIS_MAX_TURNS,
+  outputSchema: BUILTIN_REVIEWER_VERDICT_SCHEMA,
 };
 
 export default gapAnalysisReviewer;

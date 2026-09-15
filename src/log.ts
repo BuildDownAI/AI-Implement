@@ -745,6 +745,8 @@ export interface PullSummary {
   issueIdentifier: string | null;
   issueTitle: string | null;
   jobStatus: string;
+  conclusion?: string | null;
+  failure?: FailureRecord | null;
   dispatchNumber: number;
   lastDispatchedAt: number;
   jobId: number;
@@ -768,6 +770,8 @@ export function getPulls(): PullSummary[] {
       issueIdentifier: j.issueIdentifier ?? null,
       issueTitle: j.issueTitle ?? null,
       jobStatus: j.status ?? "unknown",
+      conclusion: j.conclusion,
+      failure: j.failure ? stripEvidenceTails(j.failure) : null,
       dispatchNumber: j.dispatchNumber ?? 1,
       lastDispatchedAt: ts,
       jobId: j.id,
