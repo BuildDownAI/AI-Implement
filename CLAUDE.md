@@ -278,6 +278,7 @@ Built-in step keys, in pipeline order: `clone`, `reference-repos`, `install-skil
 - `custom/` belongs to an AI-Implement **fork**, not a target repo; sync never creates it there.
 - **Place client-specific behaviour in `custom/`** rather than editing built-in modules — that is what keeps a fork rebasing cleanly.
 - A `custom/` file with no `default` export warns and falls back to the built-in rather than misbehaving silently.
+- **A fork updates from upstream with a git merge** (`git fetch upstream && git merge upstream/testing`), not through the orchestrator — procedure in `custom/README.md` § "Updating a fork from upstream".
 - `protect-custom.yml` flags upstream PRs touching `custom/`, but is **advisory only** — it emits a `::warning::`, never fails, and only runs on PRs targeting `main`, so PRs into `testing` never trigger it.
 
 ## Feature-branch grouping

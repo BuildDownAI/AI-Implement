@@ -83,3 +83,33 @@ export interface StepModule<
 ## Files committed here survive upgrades
 
 The orchestrator never overwrites `custom/`. Anything you put here is yours to maintain. Upstream commits only touch `custom/README.md`; a CI check (`protect-custom.yml`) rejects PRs that modify any other file under `custom/`.
+
+## Updating a fork from upstream
+
+A fork takes upstream changes with a git merge. The orchestrator has no rail for this.
+
+**Precondition.** The fork must share history with `BuildDownAI/AI-Implement`. Check with `git log --oneline | tail -3` and compare against upstream. A repo with no common ancestor cannot merge. Create a real fork instead.
+
+Add the remote once:
+
+```bash
+git remote add upstream https://github.com/BuildDownAI/AI-Implement
+```
+
+For each update, merge into the branch the fork deploys from (the `SOURCE_BRANCH` stamp, or the **Watched source** ref on `/admin#deployments`):
+
+```bash
+git fetch upstream
+git merge upstream/testing
+```
+
+`testing` is the development branch. `main` is the release line and lags it (see `docs/plans/2026-09-14-production-promotion-notes.md`). Merge the branch the fork tracks.
+
+Rules:
+
+- Expect conflicts on built-in modules the fork edited. Move that behavior into `custom/` and take the upstream side of the conflict. That is what keeps the next merge small.
+- After the merge, run `npm ci`, `npm run typecheck`, and `npm test`. Check the Node major against `.tool-versions`.
+- Diff `.env.example` against the app's secrets. A missing variable warns at boot and degrades a feature.
+- Sync the fork before you configure a feature that shipped upstream. Older vintages do not have `/admin#deployments`, `/mcp`, or the KG refresh rail.
+
+**Alternative.** The Deployments page can watch upstream directly (`docs/deployment.md` § "Using a public source repository"). The image is then built from upstream code only, so it contains no `custom/` files. Use that path only for a fork with no `custom/` overrides.

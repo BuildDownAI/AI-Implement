@@ -175,6 +175,8 @@ Two caveats apply:
 
 A private upstream repository that the App cannot read fails at tarball fetch time with a message naming the missing installation rather than silently building a stale image.
 
+A fork that carries `custom/` overrides should not use this path. It updates by merging upstream into its own deploy branch instead — `custom/README.md` § "Updating a fork from upstream".
+
 ## Client instances
 
 Each client is a separate Fly app described by a file in `clients/<slug>.toml`. Copy `clients/example-client.toml` to start, or use the guided helper:
