@@ -112,4 +112,40 @@ Rules:
 - Diff `.env.example` against the app's secrets. A missing variable warns at boot and degrades a feature.
 - Sync the fork before you configure a feature that shipped upstream. Older vintages do not have `/admin#deployments`, `/mcp`, or the KG refresh rail.
 
+### Upstream-only files
+
+These files belong to the public project. A private fork does not need them:
+
+| File | Effect in a fork |
+|---|---|
+| `CONTRIBUTING.md` | None. Text only. |
+| `legal/CCLA.md`, `legal/ICLA.md` | None. Text only. |
+| `SECURITY.md` | None. Text only. Names the upstream disclosure contact. |
+| `.github/workflows/cla.yml` | Runs on every PR in the fork and asks contributors to sign the upstream CLA against a `cla-signatures` branch the fork does not have. Remove it, or wait for the repository guard (AII-692). |
+
+`.gitignore` cannot exclude them. It applies to untracked files only. A tracked file always takes part in a merge.
+
+**First removal.** Run this once on the deploy branch after a merge:
+
+```bash
+git rm -q CONTRIBUTING.md legal/CCLA.md legal/ICLA.md .github/workflows/cla.yml
+git commit -m "Drop contributor files (private fork)"
+```
+
+**Every later update.** Replace the two-command merge above with this line:
+
+```bash
+git fetch upstream && git merge upstream/testing; git rm -q --ignore-unmatch CONTRIBUTING.md legal/CCLA.md legal/ICLA.md .github/workflows/cla.yml && git commit --no-edit
+```
+
+What it does in each case:
+
+- Upstream did not touch the removed files: the merge commits on its own. The trailing commit reports `nothing to commit`. That is expected.
+- Upstream edited one of them: git reports `CONFLICT (modify/delete)` and leaves the upstream copy in the tree as an unmerged path. The `git rm` resolves it as deleted and the commit completes with the prepared merge message. The file never lands.
+- A conflict elsewhere: the commit refuses with `Exiting because of an unresolved conflict`. Resolve that conflict by hand, then run `git commit --no-edit`.
+
+A deleted file never returns on its own. Only an upstream edit brings it back, and then only as a conflict the line above resolves.
+
+**A fork cut from `main` sees two conflicts on its first merge of `testing`** (`legal/CCLA.md` add/add and `CONTRIBUTING.md` content). Both come from commits that landed on `main` and `testing` separately (AII-691). Resolve them with the first-removal commands above. After AII-691 lands the first merge is clean.
+
 **Alternative.** The Deployments page can watch upstream directly (`docs/deployment.md` § "Using a public source repository"). The image is then built from upstream code only, so it contains no `custom/` files. Use that path only for a fork with no `custom/` overrides.

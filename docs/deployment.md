@@ -175,7 +175,7 @@ Two caveats apply:
 
 A private upstream repository that the App cannot read fails at tarball fetch time with a message naming the missing installation rather than silently building a stale image.
 
-A fork that carries `custom/` overrides should not use this path. It updates by merging upstream into its own deploy branch instead — `custom/README.md` § "Updating a fork from upstream".
+A fork that carries `custom/` overrides should not use this path. It updates by merging upstream into its own deploy branch instead — `custom/README.md` § "Updating a fork from upstream". The same section lists the upstream-only files (`CONTRIBUTING.md`, `legal/`, `SECURITY.md`, `.github/workflows/cla.yml`) a fork can drop, and the merge line that keeps them dropped.
 
 ## Client instances
 
