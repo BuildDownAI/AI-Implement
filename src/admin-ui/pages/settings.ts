@@ -32,6 +32,23 @@ export const settingsHtml = `
     </div>
 
     <div class="card">
+      <div class="card-header"><h2 class="card-title">Linear Pickup Label</h2></div>
+      <div class="card-body">
+        <div class="warning">Changing this label changes which Linear issues this orchestrator dispatches. Change it only for a planned migration. Issues that carry the old label stop dispatching at the next poll. The lifecycle labels (AI-Planning, AI-Working, Plan-Complete, Ready for Review) do not change.</div>
+        <div class="field">
+          <label>Pickup Label</label>
+          <div style="display:flex;gap:6px">
+            <input class="input" id="settings-pickup-label" placeholder="AI-Implement" style="flex:1">
+            <button class="btn btn-primary btn-sm" onclick="savePickupLabel()">Save</button>
+            <button class="btn btn-sm" onclick="resetPickupLabel()">Reset to default</button>
+          </div>
+          <div id="settings-pickup-label-source" class="text-tertiary" style="font-size:11px;margin-top:3px"></div>
+        </div>
+        <div id="settings-pickup-label-error" class="error hidden"></div>
+      </div>
+    </div>
+
+    <div class="card">
       <div class="card-header"><h2 class="card-title">KG Refresh</h2></div>
       <div class="card-body">
         <div class="field">
@@ -151,6 +168,11 @@ export const settingsScript = `
       kgReportInput.value = (data.kgRefreshReportIssue && data.kgRefreshReportIssue.value) || '';
       const kgBaseRepoInput = document.getElementById('settings-kg-base-repo');
       kgBaseRepoInput.value = (data.kgBaseRepo && data.kgBaseRepo.value) || '';
+      const pickupLabelInput = document.getElementById('settings-pickup-label');
+      const pickupLabelSource = document.getElementById('settings-pickup-label-source');
+      pickupLabelInput.value = data.linearPickupLabel.value || '';
+      pickupLabelSource.textContent = 'Active: ' + data.linearPickupLabel.effective
+        + (data.linearPickupLabel.value === null ? ' (default)' : ' (from settings)');
       const overridden = appInfo.overriddenByEnv || regionInfo.overriddenByEnv;
       envWarn.classList.toggle('hidden', !overridden);
       const srcText = appInfo.runtimeValue
@@ -228,6 +250,37 @@ export const settingsScript = `
     }
   }
   window.saveKgBaseRepo = saveKgBaseRepo;
+
+  async function savePickupLabel() {
+    const val = document.getElementById('settings-pickup-label').value.trim() || null;
+    const errEl = document.getElementById('settings-pickup-label-error');
+    errEl.classList.add('hidden');
+    try {
+      const res = await window.api('/api/settings', { method: 'POST', body: JSON.stringify({ linearPickupLabel: val }) });
+      const data = await res.json();
+      if (!res.ok) { errEl.textContent = data.error || 'Failed to save setting.'; errEl.classList.remove('hidden'); return; }
+      await loadSettings();
+    } catch (err) {
+      errEl.textContent = String(err);
+      errEl.classList.remove('hidden');
+    }
+  }
+  window.savePickupLabel = savePickupLabel;
+
+  async function resetPickupLabel() {
+    const errEl = document.getElementById('settings-pickup-label-error');
+    errEl.classList.add('hidden');
+    try {
+      const res = await window.api('/api/settings', { method: 'POST', body: JSON.stringify({ linearPickupLabel: null }) });
+      const data = await res.json();
+      if (!res.ok) { errEl.textContent = data.error || 'Failed to save setting.'; errEl.classList.remove('hidden'); return; }
+      await loadSettings();
+    } catch (err) {
+      errEl.textContent = String(err);
+      errEl.classList.remove('hidden');
+    }
+  }
+  window.resetPickupLabel = resetPickupLabel;
 
   async function saveSettings(payload, errEl) {
     errEl = errEl || document.getElementById('settings-error');
