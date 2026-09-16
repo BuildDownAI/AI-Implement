@@ -61,8 +61,13 @@ const probeWorkflow = restate.workflow({
   options: PROBE_WORKFLOW_OPTIONS,
 });
 
+// Matches what serviceClient/workflowClient build in @restatedev/restate-sdk-clients'
+// ingress (doComponentInvocation): `${url}/${component}/${key?}/${handler}`, with no
+// `/restate/` prefix — that prefix is reserved for admin/introspection routes
+// (`/restate/health`, `/restate/workflow/<name>/<key>/<op>` for attach/output), not
+// for invoking a handler.
 async function callService<T>(baseUrl: string, service: string, handler: string, body: unknown): Promise<T> {
-  const response = await fetch(`${baseUrl}/restate/call/${service}/${handler}`, {
+  const response = await fetch(`${baseUrl}/${service}/${handler}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
@@ -73,8 +78,59 @@ async function callService<T>(baseUrl: string, service: string, handler: string,
   return response.json() as Promise<T>;
 }
 
+// The admin API's own serialization format for these durations isn't part of the
+// SDK's TypeScript surface (the SDK types describe what the endpoint discovery manifest
+// sends in, not what the server's admin API echoes back), so this accepts either a
+// plain millisecond number or a humantime-style string (e.g. "61s", "1m1s").
+const DURATION_UNIT_MS: Record<string, number> = {
+  ns: 1e-6,
+  us: 1e-3,
+  µs: 1e-3,
+  ms: 1,
+  s: 1_000,
+  sec: 1_000,
+  secs: 1_000,
+  m: 60_000,
+  min: 60_000,
+  mins: 60_000,
+  h: 3_600_000,
+  hour: 3_600_000,
+  hours: 3_600_000,
+};
+
+function durationStringToMs(value: string): number {
+  const pattern = /(\d+(?:\.\d+)?)\s*([a-zµ]+)/gi;
+  let total = 0;
+  let matched = false;
+  for (const match of value.matchAll(pattern)) {
+    matched = true;
+    const [, amount, unit] = match;
+    const unitMs = DURATION_UNIT_MS[unit.toLowerCase()];
+    if (unitMs === undefined) {
+      throw new Error(`unrecognized duration unit "${unit}" in "${value}"`);
+    }
+    total += Number(amount) * unitMs;
+  }
+  if (!matched) {
+    throw new Error(`could not parse duration "${value}"`);
+  }
+  return total;
+}
+
+function expectDurationMs(actual: unknown, expectedMs: number, field: string): void {
+  if (typeof actual === "number") {
+    expect(actual, field).toBe(expectedMs);
+    return;
+  }
+  if (typeof actual === "string") {
+    expect(durationStringToMs(actual), field).toBe(expectedMs);
+    return;
+  }
+  throw new Error(`unexpected type for ${field}: ${typeof actual}`);
+}
+
 async function callWorkflow<T>(baseUrl: string, workflow: string, key: string, handler: string): Promise<T> {
-  const response = await fetch(`${baseUrl}/restate/call/${workflow}/${key}/${handler}`, {
+  const response = await fetch(`${baseUrl}/${workflow}/${key}/${handler}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: "{}",
@@ -87,21 +143,24 @@ async function callWorkflow<T>(baseUrl: string, workflow: string, key: string, h
 
 // Both options are proven for AII-683: each environment boots the same trivial
 // services with one of the two test options RestateTestEnvironment.start supports.
+// RestateTestEnvironment.start() only translates `alwaysReplay`/`disableRetries` into
+// container config in its own default container-factory branch — supplying a custom
+// `container` factory (needed here to pin the image version) bypasses that wiring, so
+// each variant's factory must call the corresponding RestateContainer method itself.
 const VARIANTS = [
-  ["alwaysReplay", { alwaysReplay: true as const }],
-  ["disableRetries", { disableRetries: true as const }],
-] satisfies Array<[string, Record<string, boolean>]>;
+  ["alwaysReplay", (container: RestateContainer) => container.alwaysReplay()],
+  ["disableRetries", (container: RestateContainer) => container.disableRetries()],
+] satisfies Array<[string, (container: RestateContainer) => RestateContainer]>;
 
 describe("Restate harness", () => {
   const environments = new Map<string, RestateTestEnvironment>();
 
   beforeAll(async () => {
     const started = await Promise.all(
-      VARIANTS.map(async ([label, options]) => {
+      VARIANTS.map(async ([label, configure]) => {
         const env = await RestateTestEnvironment.start({
           services: [echoService, probeWorkflow],
-          container: () => new RestateContainer(RESTATE_IMAGE_VERSION),
-          ...options,
+          container: () => configure(new RestateContainer(RESTATE_IMAGE_VERSION)),
         });
         return [label, env] as const;
       }),
@@ -153,9 +212,13 @@ describe("Restate harness", () => {
       const response = await fetch(`${env.adminAPIBaseUrl()}/services/restateHarnessProbe`);
       expect(response.ok).toBe(true);
       const metadata = (await response.json()) as Record<string, unknown>;
-      expect(metadata.inactivity_timeout).toBeTruthy();
-      expect(metadata.abort_timeout).toBeTruthy();
-      expect(metadata.workflow_completion_retention).toBeTruthy();
+      expectDurationMs(metadata.inactivity_timeout, PROBE_WORKFLOW_OPTIONS.inactivityTimeout, "inactivity_timeout");
+      expectDurationMs(metadata.abort_timeout, PROBE_WORKFLOW_OPTIONS.abortTimeout, "abort_timeout");
+      expectDurationMs(
+        metadata.workflow_completion_retention,
+        PROBE_WORKFLOW_OPTIONS.workflowRetention,
+        "workflow_completion_retention",
+      );
     },
   );
 });

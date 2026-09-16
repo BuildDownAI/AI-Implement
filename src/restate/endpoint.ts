@@ -31,7 +31,9 @@ export interface RestateBindAddress {
 
 export function restateBindAddress(): RestateBindAddress {
   const host = process.env.RESTATE_ENDPOINT_HOST?.trim() || DEFAULT_HOST;
-  const port = Number(process.env.RESTATE_ENDPOINT_PORT) || DEFAULT_PORT;
+  const rawPort = process.env.RESTATE_ENDPOINT_PORT?.trim();
+  const parsedPort = rawPort === undefined || rawPort === "" ? NaN : Number(rawPort);
+  const port = Number.isFinite(parsedPort) ? parsedPort : DEFAULT_PORT;
   return { host, port };
 }
 
