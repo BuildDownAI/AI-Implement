@@ -22,15 +22,18 @@
     "typecheck": "tsc --noEmit",
     "test": "npm run test:db-isolation && vitest run",
     "test:db-isolation": "node scripts/check-test-db-isolation.mjs",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "test:restate": "vitest run --config vitest.restate.config.ts"
   },
   "dependencies": {
+    "@restatedev/restate-sdk": "^1.17.1",
     "better-sqlite3": "13.0.3",
     "openid-client": "^6.8.7",
     "picomatch": "^4.0.7",
     "yaml": "^2.9.0"
   },
   "devDependencies": {
+    "@restatedev/restate-sdk-testcontainers": "^1.17.1",
     "@types/better-sqlite3": "^9.6.0",
     "@types/jsdom": "^30.0.0",
     "@types/node": "^24.13.3",

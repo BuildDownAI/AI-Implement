@@ -42,3 +42,49 @@ jobs:
           unset GITHUB_RUN_ID GITHUB_ENV GITHUB_REPOSITORY GITHUB_REF_NAME                 GITHUB_EVENT_NAME GITHUB_SHA GITHUB_ACTIONS GITHUB_ACTION
           npm test
       - run: npm run typecheck
+
+  # Restate harness (AII-612): src/__tests__/*.restate.test.ts, isolated from
+  # `unit-tests` above because it needs Docker for testcontainers. No `on:` block
+  # here on purpose — a job inherits the workflow's triggers only by staying in
+  # this file, which is what gets it onto ai-implement/feature/** PRs (AII-467
+  # pattern). No `needs:` either: it runs in parallel with `unit-tests` so this
+  # job's own time, not the sum, is what the ~2-minutes budget has to cover.
+  restate-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # Pinned (not `latest`) so the image cache key below is stable and so a
+      # new Restate release can't silently change the harness's behavior.
+      # Keep in sync with the `RestateContainer` version pinned in
+      # src/__tests__/restate-harness.restate.test.ts.
+      RESTATE_IMAGE_TAG: "1.7.10"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      # testcontainers pulls this image on every RestateTestEnvironment.start();
+      # caching the `docker save` tar keeps that pull off the network on a cache
+      # hit, which is what keeps this job's added time near ~2 minutes.
+      - name: Cache Restate container image
+        id: restate-image-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/restate-image-cache
+          key: restate-image-${{ env.RESTATE_IMAGE_TAG }}
+      - name: Load cached Restate image
+        if: steps.restate-image-cache.outputs.cache-hit == 'true'
+        run: docker load -i ~/restate-image-cache/restate.tar
+      - name: Pull and cache Restate image
+        if: steps.restate-image-cache.outputs.cache-hit != 'true'
+        run: |
+          docker pull "docker.io/restatedev/restate:${RESTATE_IMAGE_TAG}"
+          mkdir -p ~/restate-image-cache
+          docker save "docker.io/restatedev/restate:${RESTATE_IMAGE_TAG}" -o ~/restate-image-cache/restate.tar
+      - name: npm run test:restate (ambient CI vars scrubbed)
+        run: |
+          unset GITHUB_RUN_ID GITHUB_ENV GITHUB_REPOSITORY GITHUB_REF_NAME                 GITHUB_EVENT_NAME GITHUB_SHA GITHUB_ACTIONS GITHUB_ACTION
+          npm run test:restate
+      - run: npx tsc --noEmit --project tsconfig.restate-tests.json

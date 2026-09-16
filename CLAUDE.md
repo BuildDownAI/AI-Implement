@@ -106,6 +106,7 @@ Entry points for areas that are easy to miss. Each names the module to start fro
 | Run classification and autopsy | `src/completion-classification.ts`, `src/run-autopsy.ts` | |
 | Admin SSO / OIDC, roles, page grants | `src/oauth/`, `src/admin-session.ts`, `src/access-entries.ts`, `src/access-page-grants.ts` | [docs/access-model.md](docs/access-model.md) |
 | Admin SPA | `src/admin-ui/` | |
+| Restate engine: sidecar, endpoint, workflows, testcontainers job | `src/restate/endpoint.ts`, `src/restate/` | [docs/restate.md](docs/restate.md) |
 
 **Diagram convention:** flow diagrams in `docs/`, issue bodies, and PR descriptions are mermaid (validated with `mermaid-cli` before commit); tabular data is a table; ASCII only in this file. Full rule: [docs/README.md](docs/README.md).
 
@@ -168,6 +169,7 @@ The operator's `GH_TOKEN` (or `GITHUB_TOKEN`) is injected as `AI_IMPLEMENT_DEP_T
 ```bash
 npm test          # vitest run
 npm run typecheck # tsc --noEmit
+npm run test:restate # src/__tests__/*.restate.test.ts — needs Docker, not part of npm test
 ```
 
 **`typecheck` excludes `src/__tests__`, and vitest strips types without checking them** — so type errors in a test file are caught by nothing. Type-check a new test file explicitly with a throwaway tsconfig. `src/admin-ui/__tests__/` *is* covered and can break the build.
