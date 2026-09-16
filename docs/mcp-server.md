@@ -15,9 +15,29 @@ Tools come from two places and are merged into one list:
 
 ## Authentication and the per-request re-check
 
-The token is an OAuth access token (authorization code with PKCE, dynamic client registration; endpoints in [kg-sidecar.md § MCP OAuth](kg-sidecar.md#mcp-oauth)). Access tokens default to one hour (`MCP_ACCESS_TOKEN_TTL` seconds); refresh tokens live 30 days and rotate with reuse detection. The verified token yields an identity: email, subject, provider.
+Every caller `/mcp` sees is resolved to one `Caller` (`src/mcp-identity.ts`): `{ kind, email, role }`. `IdentityKind` is `"human" | "system"` today — a human sign-in or in-process/system code (`systemCaller()`, always `role: "admin"`, `email: null`) — with a read-only `"run"` kind reserved for [AII-702](https://linear.app/eudoxus/issue/AII-702/accept-a-run-capability-at-mcp-as-a-read-only-run-identity). The client table covers how each kind reaches `/mcp` today:
 
-Every request re-checks that identity against the allowlist in force — the same matcher the admin gate uses — so a removal ends access on the next call, not at token expiry. A removed identity gets 401; an unreadable allowlist gets 503, so a database fault never looks like a revoked token. The matching entry's role is what the write tier consults; it is read on every call and never stored in the token.
+| Kind | Reaches `/mcp` via | Email | Role |
+| -- | -- | -- | -- |
+| `human` | An OAuth access token (authorization code with PKCE, dynamic client registration; endpoints in [kg-sidecar.md § MCP OAuth](kg-sidecar.md#mcp-oauth)), verified by `verifyMcpToken` (`src/mcp-oauth.ts`) | The OIDC identity's email | The allowlist entry that admits the email, re-checked every request; `null` for an identity with no entry |
+| `system` | Not over HTTP — `systemCaller()` is called by in-process code that needs an unattributed, unrestricted identity | `null` | Always `admin` |
+
+Access tokens default to one hour (`MCP_ACCESS_TOKEN_TTL` seconds); refresh tokens live 30 days and rotate with reuse detection. The refresh grant runs behind the `RefreshAuthority` seam (`src/mcp-identity.ts`): `SqliteRefreshAuthority` (`src/mcp-oauth.ts`) is the only implementation and is wired as the default at module load, so a boot that never calls `setRefreshAuthority()` still refreshes tokens — the seam must never be the reason a boot locks every operator out. Its `rotate()` resolves to a `RefreshOutcome`: `ok` (fresh access + refresh tokens), `replay`, `expired`, `denied` (invalid token, `client_id` mismatch, or an identity the allowlist no longer admits), or `unavailable`.
+
+What ends a session — an identity's ability to keep using its current or next token:
+
+| Event | Effect |
+| -- | -- |
+| Access token expires (`MCP_ACCESS_TOKEN_TTL`, default one hour) | 401 on the next call; the client refreshes |
+| Allowlist removes the identity | The per-request re-check denies on the very next call — not at token expiry, and not up to an hour later |
+| Refresh token expires (30 days) | `RefreshOutcome.expired` → `invalid_grant` on the next refresh attempt |
+| Refresh token replayed (already rotated away) | `RefreshOutcome.replay` → the entire rotation family is revoked (`revokeFamily`), and every token in the chain, including any legitimately-rotated successor, stops working |
+| Allowlist re-check denies a refresh (identity no longer on the allowlist) | `RefreshOutcome.denied` → the rotation family is revoked and `invalid_grant` is returned |
+| Allowlist unreadable (database fault) | `RefreshOutcome.unavailable` → 503, and the rotation chain is left untouched — a transient read failure must not look like a removal |
+
+The matching entry's role is what the write tier consults; it is read on every call and never stored in the token.
+
+## Run identities
 
 ## Reads are open; writes are declared
 

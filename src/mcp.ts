@@ -9,6 +9,7 @@ import { getIssueReportCard, getFleetReport } from "./report-card.js";
 import { isKgDegraded } from "./deploy-notify.js";
 import { recheckIdentity, type AccessRole } from "./access-entries.js";
 import { type MemoryProvider, KG_TOOL_CAPABILITY, sidecarHealthFields } from "./kg-provider.js";
+import type { IdentityKind } from "./mcp-identity.js";
 import { getDeployPosture } from "./deploy-posture.js";
 
 interface JsonRpcRequest {
@@ -355,7 +356,7 @@ async function callDiagnosticTool(
     defaultRunnerImage?: string;
     runKgRefreshPreflight?: () => Promise<PreflightCheckResult>;
     getKgStatus?: () => Promise<KgRefreshStatus>;
-    sessionIdentity?: { email: string; provider: string; role: AccessRole | null };
+    sessionIdentity?: { kind: IdentityKind; email: string; provider: string; role: AccessRole | null };
   } = {},
 ): Promise<unknown> {
   switch (name) {
@@ -501,7 +502,7 @@ async function callDiagnosticTool(
       return context.getKgStatus ? await context.getKgStatus() : { error: "KG refresh is not configured" };
 
     case "get_session_identity":
-      return context.sessionIdentity ?? { email: null, provider: null, role: null };
+      return context.sessionIdentity ?? { kind: null, email: null, provider: null, role: null };
 
     default:
       return { error: `Unknown diagnostic tool: ${name}` };
@@ -681,7 +682,7 @@ export async function handleMcpRequest(
           defaultRunnerImage,
           runKgRefreshPreflight,
           getKgStatus,
-          sessionIdentity: { email: identity.email, provider: identity.provider, role },
+          sessionIdentity: { kind: identity.kind, email: identity.email, provider: identity.provider, role },
         });
         json(res, 200, {
           jsonrpc: "2.0",

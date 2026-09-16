@@ -1312,6 +1312,22 @@ describe("handleMcpRequest", () => {
       const data = JSON.parse(JSON.parse(result.body).result.content[0].text);
       expect(data).toEqual({ email: "user@example.com", provider: "google", role: null });
     });
+
+    it("get_session_identity returns kind: 'human' for an OAuth identity", async () => {
+      mockRole("user");
+      (mcpOauth.verifyMcpToken as ReturnType<typeof vi.fn>).mockReturnValue({
+        kind: "human", email: "user@example.com", sub: "sub1", provider: "google",
+      });
+      const req = new MockRequest("POST", { authorization: "Bearer tok" }, JSON.stringify({
+        jsonrpc: "2.0", id: 32, method: "tools/call", params: { name: "get_session_identity", arguments: {} },
+      }));
+      const res = new MockResponse();
+      handleMcpRequest(req as never, res as never, null, BASE_URL);
+      await res.done;
+      expect(res.statusCode).toBe(200);
+      const data = JSON.parse(JSON.parse(res.body).result.content[0].text);
+      expect(data).toEqual({ kind: "human", email: "user@example.com", provider: "google", role: "user" });
+    });
   });
 
   describe("tools/list — write tier", () => {

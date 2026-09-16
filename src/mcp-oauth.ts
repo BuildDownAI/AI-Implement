@@ -24,6 +24,7 @@ import { getProvider, listConfiguredProviders } from "./oauth/providers.js";
 import { buildAuthUrl, completeAuth } from "./oauth/oidc.js";
 import { authorize } from "./oauth/authorize.js";
 import { bindAccessEntry, getEffectiveAllowlist, matchAccessEntry } from "./access-entries.js";
+import type { RefreshAuthority, RefreshInput, RefreshOutcome } from "./mcp-identity.js";
 
 // Token and state lifetimes
 export const MCP_TOKEN_TTL_MS: number = (() => {
@@ -170,6 +171,7 @@ function isAllowedRedirectUri(redirectUri: string): boolean {
 // ---------- Token verification ----------
 
 export interface McpTokenIdentity {
+  kind: "human";
   email: string;
   sub: string;
   provider: string;
@@ -187,7 +189,7 @@ export function verifyMcpToken(token: string): McpTokenIdentity | null {
     db.prepare("DELETE FROM mcp_tokens WHERE token = ?").run(token);
     return null;
   }
-  return { email: row.email, sub: row.sub, provider: row.provider };
+  return { kind: "human", email: row.email, sub: row.sub, provider: row.provider };
 }
 
 // ---------- Well-known endpoints ----------
@@ -482,7 +484,7 @@ export async function handleMcpTokenRequest(
     return handleAuthorizationCodeGrant(params, res);
   }
   if (grant_type === "refresh_token") {
-    return handleRefreshTokenGrant(params, res);
+    return await handleRefreshTokenGrant(params, res);
   }
   return json(res, 400, { error: "unsupported_grant_type" });
 }
@@ -556,84 +558,127 @@ function handleAuthorizationCodeGrant(
   });
 }
 
-function handleRefreshTokenGrant(
+/**
+ * SQLite-backed `RefreshAuthority` (AII-707): the rotation, reuse-detection, and
+ * allowlist re-check that `handleRefreshTokenGrant` used to run inline, unchanged
+ * byte-for-byte and now reachable through the `RefreshAuthority` seam. This is the
+ * default and only implementation today; it is wired at module load below so a
+ * boot that never calls `setRefreshAuthority()` still refreshes tokens correctly.
+ */
+export class SqliteRefreshAuthority implements RefreshAuthority {
+  async revokeFamily(familyId: string): Promise<void> {
+    getDb().prepare("DELETE FROM mcp_refresh_tokens WHERE family_id = ?").run(familyId);
+  }
+
+  async rotate(input: RefreshInput): Promise<RefreshOutcome> {
+    const { refreshToken, clientId } = input;
+    const db = getDb();
+    const tokenHash = hashToken(refreshToken);
+    const row = db.prepare("SELECT * FROM mcp_refresh_tokens WHERE token_hash = ?").get(tokenHash) as {
+      client_id: string;
+      email: string;
+      sub: string;
+      provider: string;
+      family_id: string;
+      expires_at: number;
+      used_at: number | null;
+    } | undefined;
+
+    if (!row) {
+      return { status: "denied", description: "Invalid refresh token" };
+    }
+    if (Date.now() > row.expires_at) {
+      db.prepare("DELETE FROM mcp_refresh_tokens WHERE token_hash = ?").run(tokenHash);
+      return { status: "expired" };
+    }
+    if (row.client_id !== clientId) {
+      return { status: "denied", description: "client_id mismatch" };
+    }
+    if (row.used_at !== null) {
+      // Replay attack — revoke entire rotation chain
+      await this.revokeFamily(row.family_id);
+      console.warn(`[mcp-oauth] refresh token replay detected — family ${row.family_id} revoked`);
+      return { status: "replay" };
+    }
+
+    // Allowlist re-check (fail-closed: a removed user must not outlive their access token)
+    const allowlist = getEffectiveAllowlist();
+    if (!allowlist) {
+      // Do NOT revoke the chain here — a transient read failure is not a removal.
+      console.error("[mcp-oauth] refresh deferred: the access list could not be loaded");
+      return { status: "unavailable" };
+    }
+    if (!matchAccessEntry(row, allowlist.entries)) {
+      await this.revokeFamily(row.family_id);
+      console.warn(`[mcp-oauth] refresh denied: ${row.email} no longer on allowlist`);
+      return { status: "denied", description: "Identity no longer authorized" };
+    }
+
+    const now = Date.now();
+
+    // Mark old token as used (kept until expiry for replay detection)
+    db.prepare("UPDATE mcp_refresh_tokens SET used_at = ? WHERE token_hash = ?").run(now, tokenHash);
+
+    // Mint new access token
+    const accessToken = crypto.randomBytes(32).toString("hex");
+    db.prepare(
+      "INSERT INTO mcp_tokens (token, email, sub, provider, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
+    ).run(accessToken, row.email, row.sub, row.provider, now, now + MCP_TOKEN_TTL_MS);
+
+    // Mint new refresh token in the same rotation chain
+    const newRefreshToken = crypto.randomBytes(32).toString("hex");
+    db.prepare(
+      "INSERT INTO mcp_refresh_tokens (token_hash, client_id, email, sub, provider, family_id, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    ).run(
+      hashToken(newRefreshToken), clientId, row.email, row.sub, row.provider,
+      row.family_id, now, now + MCP_REFRESH_TOKEN_TTL_MS,
+    );
+
+    return {
+      status: "ok",
+      accessToken,
+      refreshToken: newRefreshToken,
+      expiresInSeconds: Math.floor(MCP_TOKEN_TTL_MS / 1000),
+    };
+  }
+}
+
+let refreshAuthority: RefreshAuthority = new SqliteRefreshAuthority();
+
+/** Swap the refresh-grant authority (step 5 of AII-687's plan). SQLite is the default with no configuration. */
+export function setRefreshAuthority(authority: RefreshAuthority): void {
+  refreshAuthority = authority;
+}
+
+async function handleRefreshTokenGrant(
   params: Record<string, string>,
   res: http.ServerResponse,
-): void {
+): Promise<void> {
   const { refresh_token, client_id } = params;
 
   if (!refresh_token || !client_id) {
     return json(res, 400, { error: "invalid_request", error_description: "Missing required parameters" });
   }
 
-  const db = getDb();
-  const tokenHash = hashToken(refresh_token);
-  const row = db.prepare("SELECT * FROM mcp_refresh_tokens WHERE token_hash = ?").get(tokenHash) as {
-    client_id: string;
-    email: string;
-    sub: string;
-    provider: string;
-    family_id: string;
-    expires_at: number;
-    used_at: number | null;
-  } | undefined;
+  const outcome = await refreshAuthority.rotate({ refreshToken: refresh_token, clientId: client_id });
 
-  if (!row) {
-    return json(res, 400, { error: "invalid_grant", error_description: "Invalid refresh token" });
+  switch (outcome.status) {
+    case "ok":
+      return json(res, 200, {
+        access_token: outcome.accessToken,
+        token_type: "Bearer",
+        expires_in: outcome.expiresInSeconds,
+        refresh_token: outcome.refreshToken,
+      });
+    case "replay":
+      return json(res, 400, { error: "invalid_grant", error_description: "Refresh token already used" });
+    case "expired":
+      return json(res, 400, { error: "invalid_grant", error_description: "Refresh token expired" });
+    case "denied":
+      return json(res, 400, { error: "invalid_grant", error_description: outcome.description });
+    case "unavailable":
+      return json(res, 503, { error: "temporarily_unavailable", error_description: "Access control is unavailable" });
   }
-  if (Date.now() > row.expires_at) {
-    db.prepare("DELETE FROM mcp_refresh_tokens WHERE token_hash = ?").run(tokenHash);
-    return json(res, 400, { error: "invalid_grant", error_description: "Refresh token expired" });
-  }
-  if (row.client_id !== client_id) {
-    return json(res, 400, { error: "invalid_grant", error_description: "client_id mismatch" });
-  }
-  if (row.used_at !== null) {
-    // Replay attack — revoke entire rotation chain
-    db.prepare("DELETE FROM mcp_refresh_tokens WHERE family_id = ?").run(row.family_id);
-    console.warn(`[mcp-oauth] refresh token replay detected — family ${row.family_id} revoked`);
-    return json(res, 400, { error: "invalid_grant", error_description: "Refresh token already used" });
-  }
-
-  // Allowlist re-check (fail-closed: a removed user must not outlive their access token)
-  const allowlist = getEffectiveAllowlist();
-  if (!allowlist) {
-    // Do NOT revoke the chain here — a transient read failure is not a removal.
-    console.error("[mcp-oauth] refresh deferred: the access list could not be loaded");
-    return json(res, 503, { error: "temporarily_unavailable", error_description: "Access control is unavailable" });
-  }
-  if (!matchAccessEntry(row, allowlist.entries)) {
-    db.prepare("DELETE FROM mcp_refresh_tokens WHERE family_id = ?").run(row.family_id);
-    console.warn(`[mcp-oauth] refresh denied: ${row.email} no longer on allowlist`);
-    return json(res, 400, { error: "invalid_grant", error_description: "Identity no longer authorized" });
-  }
-
-  const now = Date.now();
-
-  // Mark old token as used (kept until expiry for replay detection)
-  db.prepare("UPDATE mcp_refresh_tokens SET used_at = ? WHERE token_hash = ?").run(now, tokenHash);
-
-  // Mint new access token
-  const accessToken = crypto.randomBytes(32).toString("hex");
-  db.prepare(
-    "INSERT INTO mcp_tokens (token, email, sub, provider, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
-  ).run(accessToken, row.email, row.sub, row.provider, now, now + MCP_TOKEN_TTL_MS);
-
-  // Mint new refresh token in the same rotation chain
-  const newRefreshToken = crypto.randomBytes(32).toString("hex");
-  db.prepare(
-    "INSERT INTO mcp_refresh_tokens (token_hash, client_id, email, sub, provider, family_id, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-  ).run(
-    hashToken(newRefreshToken), client_id, row.email, row.sub, row.provider,
-    row.family_id, now, now + MCP_REFRESH_TOKEN_TTL_MS,
-  );
-
-  json(res, 200, {
-    access_token: accessToken,
-    token_type: "Bearer",
-    expires_in: Math.floor(MCP_TOKEN_TTL_MS / 1000),
-    refresh_token: newRefreshToken,
-  });
 }
 
 // ---------- Helpers ----------
