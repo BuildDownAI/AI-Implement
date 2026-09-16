@@ -22,7 +22,7 @@ interface EchoOutput {
 }
 
 const echoService = restate.service({
-  name: "restateHarnessEcho",
+  name: "harnessEcho",
   handlers: {
     ping: async (_ctx: restate.Context, input: EchoInput): Promise<EchoOutput> => ({
       echoed: input.value,
@@ -44,7 +44,7 @@ const PROBE_WORKFLOW_OPTIONS = {
 // exercises that working form: nothing ever resolves the promise, so it times out and
 // the handler resolves the round trip with `{ timedOut: true }` instead of throwing.
 const probeWorkflow = restate.workflow({
-  name: "restateHarnessProbe",
+  name: "harnessProbe",
   handlers: {
     run: async (ctx: restate.WorkflowContext): Promise<{ timedOut: boolean }> => {
       try {
@@ -179,7 +179,7 @@ describe("Restate harness", () => {
     async (label) => {
       const env = environments.get(label);
       if (!env) throw new Error(`environment "${label}" did not start`);
-      const result = await callService<EchoOutput>(env.baseUrl(), "restateHarnessEcho", "ping", {
+      const result = await callService<EchoOutput>(env.baseUrl(), "harnessEcho", "ping", {
         value: "pong",
       });
       expect(result).toEqual({ echoed: "pong" });
@@ -193,7 +193,7 @@ describe("Restate harness", () => {
       if (!env) throw new Error(`environment "${label}" did not start`);
       const result = await callWorkflow<{ timedOut: boolean }>(
         env.baseUrl(),
-        "restateHarnessProbe",
+        "harnessProbe",
         randomUUID(),
         "run",
       );
@@ -208,8 +208,8 @@ describe("Restate harness", () => {
       if (!env) throw new Error(`environment "${label}" did not start`);
       // Deploy only happens once a service has been invoked at least once against
       // this environment, so run the metadata check after the round-trip tests.
-      await callWorkflow(env.baseUrl(), "restateHarnessProbe", randomUUID(), "run");
-      const response = await fetch(`${env.adminAPIBaseUrl()}/services/restateHarnessProbe`);
+      await callWorkflow(env.baseUrl(), "harnessProbe", randomUUID(), "run");
+      const response = await fetch(`${env.adminAPIBaseUrl()}/services/harnessProbe`);
       expect(response.ok).toBe(true);
       const metadata = (await response.json()) as Record<string, unknown>;
       expectDurationMs(metadata.inactivity_timeout, PROBE_WORKFLOW_OPTIONS.inactivityTimeout, "inactivity_timeout");
