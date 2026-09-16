@@ -23,7 +23,7 @@
 
 # AI-Implement — Codebase Guide
 
-A Node.js service that polls Linear or Jira for issues labeled `AI-Implement` and dispatches containerized runs of Claude Code to implement them. It also serves an admin UI and manages the workflow templates synced to target repos.
+A Node.js service that polls Linear or Jira for issues that carry the pickup label (default `AI-Implement`, set at `/admin#settings`) and dispatches containerized runs of Claude Code to implement them. It also serves an admin UI and manages the workflow templates synced to target repos.
 
 ## Issue tracker bindings
 
@@ -35,7 +35,7 @@ Bindings for the BuildDown skills (bd-build-up, bd-build-down, bd-summit-push, e
 - Team: `AII`  ← issues filed/listed/searched against this team
 - Team URL: https://linear.app/eudoxus/team/AII/overview
 - GitHub repo (PRs land here): `BuildDownAI/AI-Implement`
-- Implement label: `AI-Implement` (orchestrator pickup trigger)
+- Implement label: `AI-Implement` (orchestrator pickup trigger; this is the orchestrator's default — the effective label is a settings-table row, changeable at `/admin#settings`. Change it only for a planned migration: issues that carry the old label stop dispatching at the next poll)
 - Agent mention (PR comment re-trigger): `/ai-implement`
 
 
