@@ -8,6 +8,11 @@ import type { PreflightCheckResult, KgRefreshStatus } from "../kg-refresh.js";
 
 vi.mock("../mcp-oauth.js", () => ({
   verifyMcpToken: vi.fn(),
+  resolveClientPath: vi.fn().mockReturnValue("unknown"),
+}));
+
+vi.mock("../mcp-auth-events.js", () => ({
+  recordAuthEvent: vi.fn(),
 }));
 
 vi.mock("../access-entries.js", () => ({
@@ -106,8 +111,10 @@ let logMock: typeof import("../log.js");
 let dedupMock: typeof import("../dedup.js");
 let deployNotifyMock: typeof import("../deploy-notify.js");
 let deployPostureMock: typeof import("../deploy-posture.js");
+let authEventsMock: typeof import("../mcp-auth-events.js");
 
 beforeEach(async () => {
+  vi.clearAllMocks();
   mockHttpRequest = vi.fn();
   vi.spyOn(http, "request").mockImplementation(mockHttpRequest as never);
 
@@ -119,6 +126,7 @@ beforeEach(async () => {
   dedupMock = await import("../dedup.js");
   deployNotifyMock = await import("../deploy-notify.js");
   deployPostureMock = await import("../deploy-posture.js");
+  authEventsMock = await import("../mcp-auth-events.js");
   (deployNotifyMock.isKgDegraded as ReturnType<typeof vi.fn>).mockReturnValue(false);
   sidecarHealth.reachable = false;
   sidecarHealth.toolsListed = false;
@@ -154,6 +162,8 @@ beforeEach(async () => {
       all: vi.fn(() => []),
     })),
   });
+
+  (mcpOauth.resolveClientPath as ReturnType<typeof vi.fn>).mockReturnValue("unknown");
 
   // The gate re-checks the token's identity on every request; allow it unless a test says otherwise.
   (accessMock.recheckIdentity as ReturnType<typeof vi.fn>).mockReturnValue({
@@ -253,7 +263,9 @@ async function callMcp(
   writeContext?: McpWriteContext,
 ): Promise<{ statusCode: number; body: string; responseHeaders: Record<string, string> }> {
   (mcpOauth.verifyMcpToken as ReturnType<typeof vi.fn>).mockReturnValue(
-    tokenValid ? { email: "user@example.com", sub: "sub1", provider: "google" } : null,
+    tokenValid
+      ? { ok: true, identity: { kind: "human", email: "user@example.com", sub: "sub1", provider: "google", clientId: null } }
+      : { ok: false, reason: "invalid", clientId: null },
   );
   const req = new MockRequest(method, headers, body);
   const res = new MockResponse();
@@ -341,6 +353,64 @@ describe("handleMcpRequest", () => {
       expect(result.statusCode).toBe(503);
       // Not an authentication failure, so no challenge to re-authenticate against.
       expect(result.responseHeaders["WWW-Authenticate"]).toBeUndefined();
+    });
+  });
+
+  describe("token validation — auth events (AII-708)", () => {
+    it("records a 401 event with cause 'invalid' for a garbage token", async () => {
+      (mcpOauth.verifyMcpToken as ReturnType<typeof vi.fn>).mockReturnValue({
+        ok: false, reason: "invalid", clientId: null,
+      });
+      const result = await callMcp({ authorization: "Bearer garbage" }, false);
+      expect(result.statusCode).toBe(401);
+      expect(authEventsMock.recordAuthEvent).toHaveBeenCalledTimes(1);
+      expect(authEventsMock.recordAuthEvent).toHaveBeenCalledWith(
+        expect.objectContaining({ kind: "401", cause: "invalid", clientId: null, email: null }),
+      );
+    });
+
+    it("records a 401 event with cause 'expired' and the token's client_id for an expired token", async () => {
+      (mcpOauth.verifyMcpToken as ReturnType<typeof vi.fn>).mockReturnValue({
+        ok: false, reason: "expired", clientId: "client-1",
+      });
+      const req = new MockRequest("GET", { authorization: "Bearer expiredtok" });
+      const res = new MockResponse();
+      handleMcpRequest(req as never, res as never, DEFAULT_PROVIDER, BASE_URL);
+      await res.done;
+      expect(res.statusCode).toBe(401);
+      expect(authEventsMock.recordAuthEvent).toHaveBeenCalledWith(
+        expect.objectContaining({ kind: "401", cause: "expired", clientId: "client-1" }),
+      );
+    });
+
+    it("records a 401 event with cause 'allowlist' when a valid token's identity is no longer admitted", async () => {
+      (accessMock.recheckIdentity as ReturnType<typeof vi.fn>).mockReturnValue({ status: "denied" });
+      const result = await callMcp({ authorization: "Bearer tok" }, true);
+      expect(result.statusCode).toBe(401);
+      expect(authEventsMock.recordAuthEvent).toHaveBeenCalledWith(
+        expect.objectContaining({ kind: "401", cause: "allowlist", email: "user@example.com" }),
+      );
+    });
+
+    it("derives clientPath from resolveClientPath for the 401 event", async () => {
+      (mcpOauth.resolveClientPath as ReturnType<typeof vi.fn>).mockReturnValue("loopback");
+      (mcpOauth.verifyMcpToken as ReturnType<typeof vi.fn>).mockReturnValue({
+        ok: false, reason: "expired", clientId: "loopback-client",
+      });
+      const req = new MockRequest("GET", { authorization: "Bearer expiredtok" });
+      const res = new MockResponse();
+      handleMcpRequest(req as never, res as never, DEFAULT_PROVIDER, BASE_URL);
+      await res.done;
+      expect(mcpOauth.resolveClientPath).toHaveBeenCalledWith("loopback-client");
+      expect(authEventsMock.recordAuthEvent).toHaveBeenCalledWith(
+        expect.objectContaining({ clientPath: "loopback" }),
+      );
+    });
+
+    it("does not record an auth event when the allowlist cannot be read (503, not a 401)", async () => {
+      (accessMock.recheckIdentity as ReturnType<typeof vi.fn>).mockReturnValue({ status: "unavailable" });
+      await callMcp({ authorization: "Bearer tok" }, true);
+      expect(authEventsMock.recordAuthEvent).not.toHaveBeenCalled();
     });
   });
 
@@ -1295,7 +1365,7 @@ describe("handleMcpRequest", () => {
       const parsed = JSON.parse(result.body);
       expect(parsed.result.isError).not.toBe(true);
       const data = JSON.parse(parsed.result.content[0].text);
-      expect(data).toEqual({ email: "user@example.com", provider: "google", role: "user" });
+      expect(data).toEqual({ kind: "human", email: "user@example.com", provider: "google", role: "user" });
     });
 
     it("get_session_identity returns role: null for an entry-less identity", async () => {
@@ -1310,13 +1380,14 @@ describe("handleMcpRequest", () => {
       );
       expect(result.statusCode).toBe(200);
       const data = JSON.parse(JSON.parse(result.body).result.content[0].text);
-      expect(data).toEqual({ email: "user@example.com", provider: "google", role: null });
+      expect(data).toEqual({ kind: "human", email: "user@example.com", provider: "google", role: null });
     });
 
     it("get_session_identity returns kind: 'human' for an OAuth identity", async () => {
       mockRole("user");
       (mcpOauth.verifyMcpToken as ReturnType<typeof vi.fn>).mockReturnValue({
-        kind: "human", email: "user@example.com", sub: "sub1", provider: "google",
+        ok: true,
+        identity: { kind: "human", email: "user@example.com", sub: "sub1", provider: "google", clientId: null },
       });
       const req = new MockRequest("POST", { authorization: "Bearer tok" }, JSON.stringify({
         jsonrpc: "2.0", id: 32, method: "tools/call", params: { name: "get_session_identity", arguments: {} },
@@ -2655,7 +2726,8 @@ describe("handleMcpRequest", () => {
       });
 
       (mcpOauth.verifyMcpToken as ReturnType<typeof vi.fn>).mockReturnValue({
-        email: "u@e.ai", sub: "s", provider: "google",
+        ok: true,
+        identity: { kind: "human", email: "u@e.ai", sub: "s", provider: "google", clientId: null },
       });
       const req = new MockRequest("GET", { authorization: "Bearer tok" });
       const res = new MockResponse();

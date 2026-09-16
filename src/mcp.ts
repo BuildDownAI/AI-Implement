@@ -1,6 +1,7 @@
 import http from "node:http";
 import type { PreflightCheckResult, KgRefreshStatus } from "./kg-refresh.js";
-import { verifyMcpToken } from "./mcp-oauth.js";
+import { verifyMcpToken, resolveClientPath } from "./mcp-oauth.js";
+import { recordAuthEvent, type AuthEventCause } from "./mcp-auth-events.js";
 import { getRunnerMode, VALID_RUNNER_MODES } from "./runner-mode.js";
 import { getMappings } from "./config.js";
 import { getInFlightJobs, getRunRecordMergeVerdict } from "./log.js";
@@ -532,9 +533,21 @@ export async function handleMcpRequest(
     return;
   }
 
+  const requestStart = Date.now();
   const auth = req.headers.authorization;
   const submitted = auth?.startsWith("Bearer ") ? auth.slice(7) : "";
-  const unauthorized = (): void => {
+  const unauthorized = (cause: AuthEventCause, clientId: string | null, email: string | null): void => {
+    recordAuthEvent({
+      at: Date.now(),
+      kind: "401",
+      cause,
+      clientId,
+      clientPath: resolveClientPath(clientId),
+      identityKind: email ? "human" : null,
+      email,
+      familyId: null,
+      latencyMs: Date.now() - requestStart,
+    });
     res.writeHead(401, {
       "Content-Type": "application/json",
       "WWW-Authenticate": `Bearer realm="MCP", resource_metadata="${baseUrl}/.well-known/oauth-protected-resource"`,
@@ -542,8 +555,9 @@ export async function handleMcpRequest(
     res.end(JSON.stringify({ error: "unauthorized" }));
   };
 
-  const identity = verifyMcpToken(submitted);
-  if (!identity) return unauthorized();
+  const verification = verifyMcpToken(submitted);
+  if (!verification.ok) return unauthorized(verification.reason, verification.clientId, null);
+  const identity = verification.identity;
 
   // An access token outlives a removal by up to an hour; re-checking closes that window.
   const recheck = recheckIdentity(identity);
@@ -551,7 +565,7 @@ export async function handleMcpRequest(
     json(res, 503, { error: "access control is unavailable" });
     return;
   }
-  if (recheck.status === "denied") return unauthorized();
+  if (recheck.status === "denied") return unauthorized("allowlist", identity.clientId, identity.email);
 
   const role: AccessRole | null = recheck.status === "ok" ? recheck.entry?.role ?? null : null;
 
