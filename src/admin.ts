@@ -62,6 +62,8 @@ import {
   setOrchestratorSetting,
   getRetryPolicy,
   setRetryPolicy,
+  getLinearPickupLabel,
+  DEFAULT_LINEAR_PICKUP_LABEL,
   DEFAULT_RETRY_POLICY,
   type RetryPolicy,
 } from "./orchestrator-settings.js";
@@ -1916,6 +1918,11 @@ function handleGetSettings(
     kgBaseRepo: {
       value: dbSettings.kgBaseRepo,
     },
+    linearPickupLabel: {
+      value: dbSettings.linearPickupLabel,
+      effective: getLinearPickupLabel(),
+      default: DEFAULT_LINEAR_PICKUP_LABEL,
+    },
     retryPolicy: getRetryPolicy(),
     retryPolicyDefaults: DEFAULT_RETRY_POLICY,
   });
@@ -1931,6 +1938,7 @@ async function handlePostSettings(
     flySessionsRegion?: string | null;
     kgRefreshReportIssue?: string | null;
     kgBaseRepo?: string | null;
+    linearPickupLabel?: string | null;
     retryPolicy?: Partial<RetryPolicy> | null;
   };
   try {
@@ -1956,6 +1964,23 @@ async function handlePostSettings(
       json(res, 400, { error: err instanceof Error ? err.message : String(err) });
       return;
     }
+  }
+
+  if ("linearPickupLabel" in body) {
+    if (body.linearPickupLabel !== null && typeof body.linearPickupLabel !== "string") {
+      json(res, 400, { error: "linearPickupLabel must be a string or null" });
+      return;
+    }
+    const trimmed = typeof body.linearPickupLabel === "string" ? body.linearPickupLabel.trim() : "";
+    if (trimmed.length > 100) {
+      json(res, 400, { error: "linearPickupLabel must be 100 characters or fewer" });
+      return;
+    }
+    if (/[\x00-\x1f\x7f]/.test(trimmed)) {
+      json(res, 400, { error: "linearPickupLabel must not contain control characters" });
+      return;
+    }
+    setOrchestratorSetting("linearPickupLabel", trimmed ? trimmed : null);
   }
 
   if ("flySessionsApp" in body) {
@@ -2009,6 +2034,11 @@ async function handlePostSettings(
     },
     kgBaseRepo: {
       value: dbSettings.kgBaseRepo,
+    },
+    linearPickupLabel: {
+      value: dbSettings.linearPickupLabel,
+      effective: getLinearPickupLabel(),
+      default: DEFAULT_LINEAR_PICKUP_LABEL,
     },
     retryPolicy: getRetryPolicy(),
     retryPolicyDefaults: DEFAULT_RETRY_POLICY,

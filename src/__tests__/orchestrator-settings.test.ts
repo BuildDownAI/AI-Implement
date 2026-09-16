@@ -29,7 +29,13 @@ afterEach(() => {
 describe("getOrchestratorSettings", () => {
   it("returns nulls when no DB entries exist", () => {
     const result = settings.getOrchestratorSettings();
-    expect(result).toEqual({ flySessionsApp: null, flySessionsRegion: null, kgRefreshReportIssue: null, kgBaseRepo: null });
+    expect(result).toEqual({
+      flySessionsApp: null,
+      flySessionsRegion: null,
+      kgRefreshReportIssue: null,
+      kgBaseRepo: null,
+      linearPickupLabel: null,
+    });
   });
 
   it("returns nulls gracefully when table does not exist yet", async () => {
@@ -39,7 +45,13 @@ describe("getOrchestratorSettings", () => {
     const dedup2 = await import("../dedup.js");
     const settings2 = await import("../orchestrator-settings.js");
     const result = settings2.getOrchestratorSettings();
-    expect(result).toEqual({ flySessionsApp: null, flySessionsRegion: null, kgRefreshReportIssue: null, kgBaseRepo: null });
+    expect(result).toEqual({
+      flySessionsApp: null,
+      flySessionsRegion: null,
+      kgRefreshReportIssue: null,
+      kgBaseRepo: null,
+      linearPickupLabel: null,
+    });
     dedup2.closeDb();
     try { fs.unlinkSync(dbPath2); } catch { /* ignore */ }
   });
@@ -89,6 +101,51 @@ describe("seedKgBaseRepoFromEnv", () => {
     settings.setOrchestratorSetting("kgBaseRepo", "Org/already-set");
     settings.seedKgBaseRepoFromEnv("Org/different-env-value");
     expect(settings.getOrchestratorSettings().kgBaseRepo).toBe("Org/already-set");
+  });
+});
+
+describe("getLinearPickupLabel", () => {
+  it("returns the default when no row exists", () => {
+    expect(settings.getLinearPickupLabel()).toBe(settings.DEFAULT_LINEAR_PICKUP_LABEL);
+    expect(settings.getLinearPickupLabel()).toBe("AI-Implement");
+  });
+
+  it("returns the trimmed stored value when a row exists", () => {
+    settings.setOrchestratorSetting("linearPickupLabel", "  AI Implement - New  ".trim());
+    expect(settings.getLinearPickupLabel()).toBe("AI Implement - New");
+  });
+
+  it("returns the default when the settings table does not exist", async () => {
+    vi.resetModules();
+    const dbPath2 = path.join(os.tmpdir(), `orch-settings-notable-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
+    process.env.DEDUP_DB_PATH = dbPath2;
+    const dedup2 = await import("../dedup.js");
+    const settings2 = await import("../orchestrator-settings.js");
+    // Deliberately skip runnerMode.initSettingsTable() so the query throws and the catch returns the default.
+    expect(settings2.getLinearPickupLabel()).toBe("AI-Implement");
+    dedup2.closeDb();
+    try { fs.unlinkSync(dbPath2); } catch { /* ignore */ }
+  });
+});
+
+describe("seedLinearPickupLabelFromEnv", () => {
+  it("seeds the DB value from the env value when unset", () => {
+    settings.seedLinearPickupLabelFromEnv("AI Implement - New");
+    expect(settings.getOrchestratorSettings().linearPickupLabel).toBe("AI Implement - New");
+    expect(settings.getLinearPickupLabel()).toBe("AI Implement - New");
+  });
+
+  it("does nothing when the env value is absent or blank", () => {
+    settings.seedLinearPickupLabelFromEnv(undefined);
+    expect(settings.getOrchestratorSettings().linearPickupLabel).toBeNull();
+    settings.seedLinearPickupLabelFromEnv("   ");
+    expect(settings.getOrchestratorSettings().linearPickupLabel).toBeNull();
+  });
+
+  it("never overwrites an existing DB value, even on a later boot with a different env value", () => {
+    settings.setOrchestratorSetting("linearPickupLabel", "Already-Set");
+    settings.seedLinearPickupLabelFromEnv("Different-Env-Value");
+    expect(settings.getOrchestratorSettings().linearPickupLabel).toBe("Already-Set");
   });
 });
 

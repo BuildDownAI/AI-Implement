@@ -309,7 +309,7 @@ The full architecture, env-var reference, SQLite schema, multi-client deploy mod
 
 ### Step 1 — Ticketing setup (one-time per workspace/project)
 
-**Linear**: create an `AI-Implement` label in your workspace. That label is the trigger.
+**Linear**: create a label in your workspace matching the orchestrator's pickup label, default `AI-Implement`, changeable at `/admin#settings`. That label is the trigger. Change it only for a planned migration — issues that carry the old label stop dispatching at the next poll.
 
 **Jira**: add two custom fields to your Jira project. The orchestrator auto-discovers them by name, so use these exact names — or pick the field explicitly in the mapping (stored as a `customfield_XXXXX` override) if yours are named differently.
 

@@ -2233,6 +2233,70 @@ describe("admin settings", () => {
     const after = await request("/api/settings", "GET", "secret", undefined, token);
     expect(JSON.parse(after.body).retryPolicy.reviewMaxTurns).toBe(30);
   });
+
+  it("GET /api/settings returns linearPickupLabel with value/effective/default", async () => {
+    const token = await login("secret");
+    const res = await request("/api/settings", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.linearPickupLabel).toEqual({ value: null, effective: "AI-Implement", default: "AI-Implement" });
+  });
+
+  it("POST /api/settings saves linearPickupLabel and GET reflects it", async () => {
+    const token = await login("secret");
+    const res = await request("/api/settings", "POST", "secret", { linearPickupLabel: "AI Implement - New" }, token);
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body).linearPickupLabel).toEqual({
+      value: "AI Implement - New",
+      effective: "AI Implement - New",
+      default: "AI-Implement",
+    });
+    const after = await request("/api/settings", "GET", "secret", undefined, token);
+    expect(JSON.parse(after.body).linearPickupLabel.value).toBe("AI Implement - New");
+  });
+
+  it("POST /api/settings with linearPickupLabel: '  ' deletes the row, reset to default", async () => {
+    const token = await login("secret");
+    await request("/api/settings", "POST", "secret", { linearPickupLabel: "AI Implement - New" }, token);
+    const res = await request("/api/settings", "POST", "secret", { linearPickupLabel: "  " }, token);
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body).linearPickupLabel).toEqual({ value: null, effective: "AI-Implement", default: "AI-Implement" });
+  });
+
+  it("POST /api/settings with linearPickupLabel: null deletes the row, reset to default", async () => {
+    const token = await login("secret");
+    await request("/api/settings", "POST", "secret", { linearPickupLabel: "AI Implement - New" }, token);
+    const res = await request("/api/settings", "POST", "secret", { linearPickupLabel: null }, token);
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body).linearPickupLabel).toEqual({ value: null, effective: "AI-Implement", default: "AI-Implement" });
+  });
+
+  it("POST /api/settings with a 101-char linearPickupLabel returns 400 and leaves the stored value unchanged", async () => {
+    const token = await login("secret");
+    await request("/api/settings", "POST", "secret", { linearPickupLabel: "Kept" }, token);
+    const res = await request("/api/settings", "POST", "secret", { linearPickupLabel: "x".repeat(101) }, token);
+    expect(res.statusCode).toBe(400);
+    const after = await request("/api/settings", "GET", "secret", undefined, token);
+    expect(JSON.parse(after.body).linearPickupLabel.value).toBe("Kept");
+  });
+
+  it("POST /api/settings with a newline in linearPickupLabel returns 400 and leaves the stored value unchanged", async () => {
+    const token = await login("secret");
+    await request("/api/settings", "POST", "secret", { linearPickupLabel: "Kept" }, token);
+    const res = await request("/api/settings", "POST", "secret", { linearPickupLabel: "line1\nline2" }, token);
+    expect(res.statusCode).toBe(400);
+    const after = await request("/api/settings", "GET", "secret", undefined, token);
+    expect(JSON.parse(after.body).linearPickupLabel.value).toBe("Kept");
+  });
+
+  it("POST /api/settings with a non-string linearPickupLabel returns 400 and leaves the stored value unchanged", async () => {
+    const token = await login("secret");
+    await request("/api/settings", "POST", "secret", { linearPickupLabel: "Kept" }, token);
+    const res = await request("/api/settings", "POST", "secret", { linearPickupLabel: 123 }, token);
+    expect(res.statusCode).toBe(400);
+    const after = await request("/api/settings", "GET", "secret", undefined, token);
+    expect(JSON.parse(after.body).linearPickupLabel.value).toBe("Kept");
+  });
 });
 
 describe("admin global secrets", () => {

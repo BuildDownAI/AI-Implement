@@ -9,14 +9,19 @@ const FLY_SESSIONS_REGION_KEY = "fly_sessions_region";
 const RETRY_POLICY_KEY = "retry_policy";
 const KG_REFRESH_REPORT_ISSUE_KEY = "kg_refresh_report_issue";
 const KG_BASE_REPO_KEY = "kg_base_repo";
+const LINEAR_PICKUP_LABEL_KEY = "linear_pickup_label";
 
-type SettingKey = "flySessionsApp" | "flySessionsRegion" | "kgRefreshReportIssue" | "kgBaseRepo";
+/** Default Linear pickup label when no `linear_pickup_label` row exists (AII-694). */
+export const DEFAULT_LINEAR_PICKUP_LABEL = "AI-Implement";
+
+type SettingKey = "flySessionsApp" | "flySessionsRegion" | "kgRefreshReportIssue" | "kgBaseRepo" | "linearPickupLabel";
 
 const SETTING_KEYS: Record<SettingKey, string> = {
   flySessionsApp: FLY_SESSIONS_APP_KEY,
   flySessionsRegion: FLY_SESSIONS_REGION_KEY,
   kgRefreshReportIssue: KG_REFRESH_REPORT_ISSUE_KEY,
   kgBaseRepo: KG_BASE_REPO_KEY,
+  linearPickupLabel: LINEAR_PICKUP_LABEL_KEY,
 };
 
 export interface OrchestratorSettings {
@@ -26,6 +31,8 @@ export interface OrchestratorSettings {
   kgRefreshReportIssue: string | null;
   /** owner/repo of the base template repo the KG PR-triggered dry-run check watches (AII-633). Seeded once from KG_BASE_REPO. */
   kgBaseRepo: string | null;
+  /** Linear label the provider polls for pickup (AII-694). Seeded once from LINEAR_PICKUP_LABEL. */
+  linearPickupLabel: string | null;
 }
 
 export function getOrchestratorSettings(): OrchestratorSettings {
@@ -40,9 +47,16 @@ export function getOrchestratorSettings(): OrchestratorSettings {
       flySessionsRegion: get(FLY_SESSIONS_REGION_KEY),
       kgRefreshReportIssue: get(KG_REFRESH_REPORT_ISSUE_KEY),
       kgBaseRepo: get(KG_BASE_REPO_KEY),
+      linearPickupLabel: get(LINEAR_PICKUP_LABEL_KEY),
     };
   } catch {
-    return { flySessionsApp: null, flySessionsRegion: null, kgRefreshReportIssue: null, kgBaseRepo: null };
+    return {
+      flySessionsApp: null,
+      flySessionsRegion: null,
+      kgRefreshReportIssue: null,
+      kgBaseRepo: null,
+      linearPickupLabel: null,
+    };
   }
 }
 
@@ -55,6 +69,35 @@ export function seedKgBaseRepoFromEnv(envValue: string | null | undefined): void
   if (!envValue?.trim()) return;
   if (getOrchestratorSettings().kgBaseRepo !== null) return;
   setOrchestratorSetting("kgBaseRepo", envValue.trim());
+}
+
+/**
+ * Effective Linear pickup label: the trimmed stored value when present and non-empty,
+ * else DEFAULT_LINEAR_PICKUP_LABEL. Falls back to the default on any DB error (missing
+ * table, etc.) so pickup never stops because the settings table is unreadable.
+ */
+export function getLinearPickupLabel(): string {
+  try {
+    const db = getDb();
+    const row = db.prepare("SELECT value FROM settings WHERE key = ?").get(LINEAR_PICKUP_LABEL_KEY) as
+      | { value: string }
+      | undefined;
+    const value = row?.value?.trim();
+    return value ? value : DEFAULT_LINEAR_PICKUP_LABEL;
+  } catch {
+    return DEFAULT_LINEAR_PICKUP_LABEL;
+  }
+}
+
+/**
+ * Seeds `linearPickupLabel` from LINEAR_PICKUP_LABEL on first boot only (AII-694) — a
+ * no-op once the DB already holds a value, so a later env removal or edit at
+ * /admin#settings is never clobbered. Call once during startup.
+ */
+export function seedLinearPickupLabelFromEnv(envValue: string | null | undefined): void {
+  if (!envValue?.trim()) return;
+  if (getOrchestratorSettings().linearPickupLabel !== null) return;
+  setOrchestratorSetting("linearPickupLabel", envValue.trim());
 }
 
 export function setOrchestratorSetting(key: SettingKey, value: string | null): void {

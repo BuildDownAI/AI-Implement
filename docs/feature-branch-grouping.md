@@ -13,12 +13,13 @@ This is the operator/developer reference. The decision history lives in
 
 A Linear issue tree maps onto a tree of git branches:
 
-- A **parent issue** that carries the `AI-Implement` label *and* has at least one
-  `AI-Implement` child becomes a **feature node**. It owns a long-running shared branch
-  `ai-implement/<mode>/<issue-key>` (mode defaults to `feature` — see §5).
+- A **parent issue** that carries the pickup label (default `AI-Implement`, changeable at
+  `/admin#settings`) *and* has at least one child carrying that same label becomes a
+  **feature node**. It owns a long-running shared branch `ai-implement/<mode>/<issue-key>`
+  (mode defaults to `feature` — see §5).
 - Its **labelled children** are worked on and open PRs **into that feature branch**, not
   into the repo's base branch.
-- Unlabelled children are ignored until they too get the `AI-Implement` label — so you can
+- Unlabelled children are ignored until they too get the pickup label — so you can
   roll a tree out incrementally.
 - The tree is **recursive**: a child that is itself a feature node gets its own branch cut
   from its parent's branch, and so on.
@@ -27,6 +28,10 @@ A Linear issue tree maps onto a tree of git branches:
   own feature branch.
 - Completed feature branches **roll up** into their parent's branch automatically; the
   single top-of-tree `feature → base` merge is left as a human-reviewed PR.
+- The pickup label is per-orchestrator and configurable; the lifecycle labels below
+  (`AI-Planning`, `Plan-Complete`, `AI-Working`, `Ready for Review`) stay fixed, so two
+  orchestrators polling one Linear team share them and each counts the other's in-flight
+  issues against its own capacity cap.
 
 ```
 testing                                  (repo base branch)
@@ -278,8 +283,10 @@ Recovery for a capped or unapproved child is tracked in [AII-263](https://linear
 
 Feature-branch grouping is supported on **both providers**:
 
-- **Linear**: a parent issue is a feature node when it carries the `AI-Implement` label and
-  has labelled children; completion is the issue reaching a completed workflow state.
+- **Linear**: a parent issue is a feature node when it carries the pickup label (default
+  `AI-Implement`, changeable at `/admin#settings` — change it only for a planned migration,
+  because issues that carry the old label stop dispatching at the next poll) and has
+  labelled children; completion is the issue reaching a completed workflow state.
 - **Jira**: hierarchy comes from the native `parent` field, falling back to the classic
   **Epic Link** custom field when the instance has one (so Epic → Story trees group too).
   An issue is "designated" when its AI-Implement Status field is set and its AI-Implement
