@@ -308,7 +308,7 @@ A failed probe re-runs in the background (throttled) on the next proxied failure
 
 `restate-server` runs as a second child-process sidecar of the orchestrator, spawned and stopped alongside the KG sidecar with the same non-fatal contract (ADR 023; full reference: [docs/restate.md](restate.md) § "Deployment and operations"). It adds no deployment surface of its own — no separate Fly app, no new health endpoint, no `fly.toml` change — because every listener it and its SDK endpoint expose binds to `127.0.0.1` only, and the orchestrator process is the only thing on the machine that talks to any of them.
 
-`RESTATE_DATA_DIR` is the one operator-facing knob (`.env.example`): unset, the embedded store lives under the dedup DB's directory (`/data/restate` on Fly), so a Fly volume that already covers `DEDUP_DB_PATH` covers it without a config change.
+`RESTATE_DATA_DIR` is the one operator-facing knob (`.env.example`): unset, the embedded store lives under the dedup DB's directory (`/data/restate` on Fly), so a Fly volume that already covers `DEDUP_DB_PATH` covers it without a config change. On macOS, a long checkout path can push the sidecar's unix-socket paths past the platform's 104-byte limit and make `restate-server` exit at boot with `RT0004 … path must be shorter than 104 bytes` — set `RESTATE_DATA_DIR` to a short path (e.g. `/tmp/restate-dev`) in that case (full detail: [docs/restate.md](restate.md) § "Deployment and operations").
 
 ### Local image boot check
 

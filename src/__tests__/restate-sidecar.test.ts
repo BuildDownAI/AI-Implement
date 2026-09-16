@@ -3,7 +3,7 @@ import { spawn as realSpawn } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync, chmodSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { RestateSidecar, restateDataDir } from "../restate/server.js";
+import { RestateSidecar, restateDataDir, RESTATE_ADMIN_BASE_URL, RESTATE_INGRESS_BIND_ADDRESS } from "../restate/server.js";
 
 // ---------------------------------------------------------------------------
 // Helpers — mirrors src/__tests__/kg-sidecar.test.ts
@@ -164,6 +164,40 @@ describe("readiness polling", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Spawn configuration — bind addresses
+// ---------------------------------------------------------------------------
+
+describe("spawn configuration", () => {
+  it("binds ingress and admin listeners to 127.0.0.1 via env", async () => {
+    const dataDir = makeTmpDir();
+    const script = join(dataDir, "fake-server.sh");
+    writeScript(script, "sleep 60");
+
+    const spawnSpy = vi.fn(testSpawn);
+    const sidecar = new RestateSidecar(
+      { dataDir, pollTimeoutMs: 5_000, pollIntervalMs: 10 },
+      { httpGet: async () => true, spawn: spawnSpy, resolveBinary: () => script },
+    );
+
+    try {
+      await sidecar.start();
+
+      expect(spawnSpy).toHaveBeenCalledTimes(1);
+      const [, , spawnOpts] = spawnSpy.mock.calls[0] as [string, string[], { env?: NodeJS.ProcessEnv }];
+      const childEnv = spawnOpts.env;
+
+      expect(childEnv?.RESTATE_INGRESS__BIND_ADDRESS).toBe(RESTATE_INGRESS_BIND_ADDRESS);
+      expect(childEnv?.RESTATE_INGRESS__BIND_ADDRESS).toMatch(/^127\.0\.0\.1:\d+$/);
+
+      expect(childEnv?.RESTATE_ADMIN__BIND_ADDRESS).toBe(new URL(RESTATE_ADMIN_BASE_URL).host);
+      expect(childEnv?.RESTATE_ADMIN__BIND_ADDRESS).toMatch(/^127\.0\.0\.1:\d+$/);
+    } finally {
+      await sidecar.stop();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Stop / shutdown behaviour
 // ---------------------------------------------------------------------------
 
@@ -227,7 +261,11 @@ describe("stop / shutdown", () => {
     expect(() => process.kill(pid!, 0)).toThrow();
   }, 10_000);
 
-  it("stop() sends SIGTERM then SIGKILL after the backstop timeout", async () => {
+  it("stop() sends SIGTERM exactly once and the process is gone afterward", async () => {
+    // Whether the SIGKILL backstop also fires is shell-dependent (a `trap '' TERM; sleep`
+    // fake exits on SIGTERM under macOS's bash 3.2 /bin/sh but not under Linux's dash/bash),
+    // so this only pins the SIGTERM count and the end state. The SIGKILL branch itself is
+    // covered by the "no orphan" integration test above.
     const dataDir = makeTmpDir();
     const script = join(dataDir, "fake-server.sh");
     writeScript(script, "trap '' TERM; sleep 60");
@@ -238,14 +276,16 @@ describe("stop / shutdown", () => {
     );
     await sidecar.start();
 
-    const child = (sidecar as unknown as { _child: { kill: (sig: string) => boolean } })._child;
+    const child = (sidecar as unknown as { _child: { pid?: number; kill: (sig: string) => boolean } })._child;
     expect(child).not.toBeNull();
+    const pid = child!.pid;
     const killSpy = vi.spyOn(child!, "kill");
 
     await sidecar.stop();
 
-    const signalsSent = killSpy.mock.calls.map(([sig]) => sig);
-    expect(signalsSent).toEqual(["SIGTERM", "SIGKILL"]);
+    const sigtermCalls = killSpy.mock.calls.filter(([sig]) => sig === "SIGTERM").length;
+    expect(sigtermCalls).toBe(1);
+    expect(() => process.kill(pid!, 0)).toThrow();
   }, 10_000);
 
   it("concurrent stop() calls run the sequence once (re-entrancy latch)", async () => {

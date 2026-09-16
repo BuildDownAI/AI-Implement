@@ -38,7 +38,7 @@ An issue with no Restate surface says so in the same place ("unit tests only"), 
 
 `main()` (`src/index.ts`) constructs one `RestateSidecar` and calls `start()` before `loadConfig()`, right after the KG sidecar's own `start()`. On success it starts the SDK endpoint (`startRestateEndpoint()`) and registers it (`register()`), logging the outcome. `stop()` runs in the same `shutdown` closure that stops the KG sidecar, before `server.close()`.
 
-Every step is non-fatal: a missing platform binary, an early exit, or a readiness timeout each log exactly one warning (`[restate] …`) and boot continues. Until a run kind migrates onto Restate, nothing in the orchestrator depends on the sidecar being up; the first consumer (kg-refresh, AII-683) answers `503 restate-unavailable` at its trigger seam instead of hanging when it is not.
+Every step is non-fatal: a missing platform binary, an early exit, or a readiness timeout each log exactly one warning (`[restate] …`) and boot continues. Until a run kind migrates onto Restate, nothing in the orchestrator depends on the sidecar being up. **No run kind has migrated as of this writing** — `RESTATE_SERVICES` is empty and neither `src/kg-refresh.ts` nor `src/index.ts` has a Restate-backed trigger seam yet. The planned first consumer, kg-refresh (AII-683), is expected to answer `503 restate-unavailable` at its trigger seam when the sidecar is down, instead of hanging; that behavior does not exist until AII-683 lands.
 
 ### Ports and paths — all loopback, all constants
 
@@ -77,6 +77,8 @@ Expect the ingress, admin, and SDK-endpoint ports (8081, 9070, 9080) to show a `
 ### `npm run dev` and `npm run dev:run`
 
 `npm run dev` spawns the Restate sidecar the same way boot does, with its data directory under `./restate` (see `CLAUDE.md` § Running locally). `npm run dev:run`'s mounted-workspace harness does not start it — that path exercises one runner container against a target-repo checkout, not the orchestrator process.
+
+`restate-server` creates `<RESTATE_DATA_DIR>/<hostname>/ingress.sock`, `admin.sock`, and `fabric.sock`, and macOS caps a unix-socket path at 104 bytes. A checkout under a long path trips this at boot — `restate-server` exits with `RT0004 … failed binding on unix-socket file … path must be shorter than 104 bytes` — and the orchestrator logs the one `[restate]` warning and continues degraded, same as any other sidecar-start failure. On macOS, set `RESTATE_DATA_DIR` to a short path (for example `/tmp/restate-dev`) when the checkout path is long; the default `./restate` is fine for a checkout under `~/gitRepos/<repo>`.
 
 ## Writing a workflow for a run kind
 
