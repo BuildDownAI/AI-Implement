@@ -25,6 +25,7 @@ import { buildAuthUrl, completeAuth } from "./oauth/oidc.js";
 import { authorize } from "./oauth/authorize.js";
 import { bindAccessEntry, getEffectiveAllowlist, matchAccessEntry } from "./access-entries.js";
 import type { RefreshAuthority, RefreshInput, RefreshOutcome } from "./mcp-identity.js";
+import { recordAuthEvent, type AuthEventCause, type ClientPath } from "./mcp-auth-events.js";
 
 // Token and state lifetimes
 export const MCP_TOKEN_TTL_MS: number = (() => {
@@ -103,6 +104,11 @@ export function initMcpOAuthTables(): void {
       expires_at INTEGER NOT NULL
     )
   `);
+  const tokenColumns = db.prepare("PRAGMA table_info(mcp_tokens)").all() as Array<{ name: string }>;
+  if (!tokenColumns.some((column) => column.name === "client_id")) {
+    // Pre-existing tokens predate client attribution; NULL resolves to clientPath "unknown".
+    db.exec("ALTER TABLE mcp_tokens ADD COLUMN client_id TEXT");
+  }
   db.exec(`
     CREATE TABLE IF NOT EXISTS mcp_refresh_tokens (
       token_hash TEXT PRIMARY KEY,
@@ -126,6 +132,16 @@ export function initMcpOAuthTables(): void {
   db.prepare("DELETE FROM mcp_refresh_tokens WHERE expires_at < ?").run(now);
 }
 
+/** Loopback IP literal or `localhost` — the client-path split used for auth events too. */
+function isLoopbackHost(hostname: string): boolean {
+  const host = hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  if (host === "localhost") {
+    return true;
+  }
+  const ipVersion = isIP(host);
+  return ipVersion === 6 ? host === "::1" : ipVersion === 4 && host.startsWith("127.");
+}
+
 function isAllowedRedirectUri(redirectUri: string): boolean {
   let parsed: URL;
   try {
@@ -138,15 +154,10 @@ function isAllowedRedirectUri(redirectUri: string): boolean {
     return false;
   }
 
-  const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "");
   if (parsed.protocol === "http:") {
     // RFC 8252 §7.3 prefers loopback IP literals, but real MCP clients
     // (Claude Code included) register http://localhost:<port> — accept both.
-    if (host === "localhost") {
-      return true;
-    }
-    const ipVersion = isIP(host);
-    return ipVersion === 6 ? host === "::1" : ipVersion === 4 && host.startsWith("127.");
+    return isLoopbackHost(parsed.hostname);
   }
 
   if (parsed.protocol !== "https:") {
@@ -168,6 +179,33 @@ function isAllowedRedirectUri(redirectUri: string): boolean {
   return allowedOrigins.includes(parsed.origin);
 }
 
+/**
+ * Which client path a registered client belongs to, for the auth-event `clientPath` field:
+ * a loopback IP literal (or `localhost`) redirect means the Claude Code loopback flow,
+ * anything else means an HTTPS-registered client (e.g. claude.ai). `null`/unregistered
+ * resolves to `"unknown"` rather than guessing — a forged token traces to no client at all.
+ */
+export function resolveClientPath(clientId: string | null | undefined): ClientPath {
+  if (!clientId) return "unknown";
+  const row = getDb()
+    .prepare("SELECT redirect_uris FROM mcp_clients WHERE client_id = ?")
+    .get(clientId) as { redirect_uris: string } | undefined;
+  if (!row) return "unknown";
+  let uris: unknown;
+  try {
+    uris = JSON.parse(row.redirect_uris);
+  } catch {
+    return "unknown";
+  }
+  const first = Array.isArray(uris) ? uris[0] : undefined;
+  if (typeof first !== "string") return "unknown";
+  try {
+    return isLoopbackHost(new URL(first).hostname) ? "loopback" : "https";
+  } catch {
+    return "unknown";
+  }
+}
+
 // ---------- Token verification ----------
 
 export interface McpTokenIdentity {
@@ -175,21 +213,32 @@ export interface McpTokenIdentity {
   email: string;
   sub: string;
   provider: string;
+  clientId: string | null;
 }
 
-/** Verify an MCP access token; returns the identity on success, null on any failure. */
-export function verifyMcpToken(token: string): McpTokenIdentity | null {
-  if (!token) return null;
+/** Why `verifyMcpToken` did not return an identity — lets the caller record a 401 cause without a second query. */
+export type McpTokenVerification =
+  | { ok: true; identity: McpTokenIdentity }
+  | { ok: false; reason: "invalid" | "expired"; clientId: string | null };
+
+/** Verify an MCP access token; returns the identity on success, the failure reason and client on any failure. */
+export function verifyMcpToken(token: string): McpTokenVerification {
+  if (!token) return { ok: false, reason: "invalid", clientId: null };
   const db = getDb();
   const row = db
-    .prepare("SELECT email, sub, provider, expires_at FROM mcp_tokens WHERE token = ?")
-    .get(token) as { email: string; sub: string; provider: string; expires_at: number } | undefined;
-  if (!row) return null;
+    .prepare("SELECT email, sub, provider, expires_at, client_id FROM mcp_tokens WHERE token = ?")
+    .get(token) as
+    | { email: string; sub: string; provider: string; expires_at: number; client_id: string | null }
+    | undefined;
+  if (!row) return { ok: false, reason: "invalid", clientId: null };
   if (Date.now() > row.expires_at) {
     db.prepare("DELETE FROM mcp_tokens WHERE token = ?").run(token);
-    return null;
+    return { ok: false, reason: "expired", clientId: row.client_id };
   }
-  return { kind: "human", email: row.email, sub: row.sub, provider: row.provider };
+  return {
+    ok: true,
+    identity: { kind: "human", email: row.email, sub: row.sub, provider: row.provider, clientId: row.client_id },
+  };
 }
 
 // ---------- Well-known endpoints ----------
@@ -537,8 +586,8 @@ function handleAuthorizationCodeGrant(
   // Mint access token
   const accessToken = crypto.randomBytes(32).toString("hex");
   db.prepare(
-    "INSERT INTO mcp_tokens (token, email, sub, provider, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
-  ).run(accessToken, codeRow.email, codeRow.sub, codeRow.provider, now, now + MCP_TOKEN_TTL_MS);
+    "INSERT INTO mcp_tokens (token, email, sub, provider, created_at, expires_at, client_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+  ).run(accessToken, codeRow.email, codeRow.sub, codeRow.provider, now, now + MCP_TOKEN_TTL_MS, client_id);
 
   // Mint refresh token
   const refreshToken = crypto.randomBytes(32).toString("hex");
@@ -572,6 +621,7 @@ export class SqliteRefreshAuthority implements RefreshAuthority {
 
   async rotate(input: RefreshInput): Promise<RefreshOutcome> {
     const { refreshToken, clientId } = input;
+    const start = Date.now();
     const db = getDb();
     const tokenHash = hashToken(refreshToken);
     const row = db.prepare("SELECT * FROM mcp_refresh_tokens WHERE token_hash = ?").get(tokenHash) as {
@@ -584,20 +634,39 @@ export class SqliteRefreshAuthority implements RefreshAuthority {
       used_at: number | null;
     } | undefined;
 
+    // One event per call, on every return path — never carries the refresh token itself.
+    const emit = (cause: AuthEventCause): void => {
+      recordAuthEvent({
+        at: Date.now(),
+        kind: "refresh",
+        cause,
+        clientId,
+        clientPath: resolveClientPath(clientId),
+        identityKind: row ? "human" : null,
+        email: row?.email ?? null,
+        familyId: row?.family_id ?? null,
+        latencyMs: Date.now() - start,
+      });
+    };
+
     if (!row) {
+      emit("invalid");
       return { status: "denied", description: "Invalid refresh token" };
     }
     if (Date.now() > row.expires_at) {
       db.prepare("DELETE FROM mcp_refresh_tokens WHERE token_hash = ?").run(tokenHash);
+      emit("expired");
       return { status: "expired" };
     }
     if (row.client_id !== clientId) {
+      emit("invalid");
       return { status: "denied", description: "client_id mismatch" };
     }
     if (row.used_at !== null) {
       // Replay attack — revoke entire rotation chain
       await this.revokeFamily(row.family_id);
       console.warn(`[mcp-oauth] refresh token replay detected — family ${row.family_id} revoked`);
+      emit("replay");
       return { status: "replay" };
     }
 
@@ -606,11 +675,13 @@ export class SqliteRefreshAuthority implements RefreshAuthority {
     if (!allowlist) {
       // Do NOT revoke the chain here — a transient read failure is not a removal.
       console.error("[mcp-oauth] refresh deferred: the access list could not be loaded");
+      emit("unavailable");
       return { status: "unavailable" };
     }
     if (!matchAccessEntry(row, allowlist.entries)) {
       await this.revokeFamily(row.family_id);
       console.warn(`[mcp-oauth] refresh denied: ${row.email} no longer on allowlist`);
+      emit("allowlist");
       return { status: "denied", description: "Identity no longer authorized" };
     }
 
@@ -622,8 +693,8 @@ export class SqliteRefreshAuthority implements RefreshAuthority {
     // Mint new access token
     const accessToken = crypto.randomBytes(32).toString("hex");
     db.prepare(
-      "INSERT INTO mcp_tokens (token, email, sub, provider, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
-    ).run(accessToken, row.email, row.sub, row.provider, now, now + MCP_TOKEN_TTL_MS);
+      "INSERT INTO mcp_tokens (token, email, sub, provider, created_at, expires_at, client_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    ).run(accessToken, row.email, row.sub, row.provider, now, now + MCP_TOKEN_TTL_MS, clientId);
 
     // Mint new refresh token in the same rotation chain
     const newRefreshToken = crypto.randomBytes(32).toString("hex");
@@ -634,6 +705,7 @@ export class SqliteRefreshAuthority implements RefreshAuthority {
       row.family_id, now, now + MCP_REFRESH_TOKEN_TTL_MS,
     );
 
+    emit("ok");
     return {
       status: "ok",
       accessToken,
