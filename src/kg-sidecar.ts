@@ -4,6 +4,7 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
+import { stopChildWithBackstop } from "./process-stop.js";
 
 /** Default directory where the baked KG graph lives inside the image. */
 export const KG_DIR = "/app/kg";
@@ -268,35 +269,8 @@ export class KgSidecar {
     const child = this._child;
     if (!child) return;
     this._child = null;
-
-    // Already dead — crashed or exited before stop() was called.
-    if (child.exitCode !== null || child.signalCode !== null) return;
-
-    // Register close listener before sending SIGTERM to avoid a race where
-    // the process exits synchronously (impossible in JS but belt-and-suspenders).
-    const closedPromise = new Promise<boolean>((resolve) => {
-      const timer = setTimeout(() => resolve(false), this._stopTimeoutMs);
-      timer.unref();
-      child.once("close", () => {
-        clearTimeout(timer);
-        resolve(true);
-      });
-    });
-
-    child.kill("SIGTERM");
-
-    const closed = await closedPromise;
-
-    if (!closed) {
-      child.kill("SIGKILL");
-      await waitForClose(child);
-    }
+    await stopChildWithBackstop(child, this._stopTimeoutMs);
   }
-}
-
-function waitForClose(child: ChildProcess): Promise<void> {
-  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
-  return new Promise<void>((resolve) => child.once("close", resolve));
 }
 
 function defaultHttpGet(url: string): Promise<boolean> {
