@@ -121,6 +121,8 @@ npm run dev:local      # rebuilds the local runner image, then runs dispatches i
 
 Only the GitHub App pair is hard-required — `loadConfig` throws without it. Ticketing credentials are not: an absent Linear or Jira configuration logs a warning and skips that provider's mappings, so the orchestrator still boots and serves.
 
+`npm run dev` also spawns the Restate sidecar (`RestateSidecar`, `src/restate/server.ts`) from `node_modules`, with its data under `./restate` — non-fatally, same as the KG sidecar (ADR 023, [docs/restate.md](docs/restate.md)).
+
 Health check `curl http://localhost:8080/` · Admin UI `http://localhost:8080/admin` (needs an OAuth provider **or** `ADMIN_ACCESS_CODE`).
 
 Node is pinned to 24 (`engines`, `.tool-versions`). On a Node-major switch, `npm test` fails wholesale inside `getDb()` with a `NODE_MODULE_VERSION` mismatch — check which Node you are on before reaching for `npm rebuild better-sqlite3`, since the native modules are usually right and the shell is wrong.

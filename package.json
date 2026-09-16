@@ -27,6 +27,7 @@
   },
   "dependencies": {
     "@restatedev/restate-sdk": "^1.17.1",
+    "@restatedev/restate-server": "^1.7.10",
     "better-sqlite3": "13.0.3",
     "openid-client": "^6.8.7",
     "picomatch": "^4.0.7",

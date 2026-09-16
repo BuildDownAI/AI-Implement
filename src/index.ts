@@ -106,6 +106,8 @@ import { listOpenReviewFindings } from "./review-ledger-store.js";
 import { detectMergedPrs, prNumberFromUrl } from "./poll-merged-prs.js";
 import { githubActionsWatchdogDecision } from "./github-actions-watchdog.js";
 import { KgSidecar } from "./kg-sidecar.js";
+import { RestateSidecar } from "./restate/server.js";
+import { startRestateEndpoint, register as registerRestateEndpoint } from "./restate/endpoint.js";
 import { makeKgRefresh, runKgRefreshPreflight } from "./kg-refresh.js";
 import type { KgRefreshHandle } from "./kg-refresh.js";
 import { beginCycle, isCurrentCycle, getPollStats, runWithDeadline } from "./poll-cycle.js";
@@ -4126,6 +4128,22 @@ async function main(): Promise<void> {
   const sidecar = new KgSidecar();
   await sidecar.start();
 
+  // Restate sidecar (AII-627, ADR 023): a second child process, started the same way and
+  // just as non-fatal on failure. A missing binary, an early exit, or a failed registration
+  // logs one warning and boot continues; the kg-refresh trigger seam (AII-683) answers 503
+  // restate-unavailable while no successful registration has completed.
+  const restateSidecar = new RestateSidecar();
+  const restateReady = await restateSidecar.start();
+  if (restateReady) {
+    try {
+      await startRestateEndpoint();
+      const result = await registerRestateEndpoint();
+      console.log(`[restate] boot registration: ${result.outcome}${result.detail ? ` (${result.detail})` : ""}`);
+    } catch (err) {
+      console.error(`[restate] SDK endpoint failed to start: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   const config = loadConfig();
   if (!config.kgSourceRepo) console.log("[kg] KG_SOURCE_REPO not set — knowledge graph disabled");
 
@@ -4240,6 +4258,7 @@ async function main(): Promise<void> {
     ]);
 
     await sidecar.stop();
+    await restateSidecar.stop();
 
     server.close(() => {
       closeDb();
