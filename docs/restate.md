@@ -32,7 +32,51 @@ An issue with no Restate surface says so in the same place ("unit tests only"), 
 
 ## Deployment and operations
 
-Written by AII-627.
+`RestateSidecar` (`src/restate/server.ts`) owns the `restate-server` child process: spawn, readiness poll, stop. It mirrors `KgSidecar` (`src/kg-sidecar.ts`) — injected spawn, an HTTP readiness poll, and `stop()` through the shared SIGTERM-then-SIGKILL backstop in `src/process-stop.ts` — without sharing its spawn or readiness code, since a shell script polled over an MCP GET and a platform binary polled over an admin-API health check have nothing else in common (ADR 023).
+
+### Boot sequence
+
+`main()` (`src/index.ts`) constructs one `RestateSidecar` and calls `start()` before `loadConfig()`, right after the KG sidecar's own `start()`. On success it starts the SDK endpoint (`startRestateEndpoint()`) and registers it (`register()`), logging the outcome. `stop()` runs in the same `shutdown` closure that stops the KG sidecar, before `server.close()`.
+
+Every step is non-fatal: a missing platform binary, an early exit, or a readiness timeout each log exactly one warning (`[restate] …`) and boot continues. Until a run kind migrates onto Restate, nothing in the orchestrator depends on the sidecar being up; the first consumer (kg-refresh, AII-683) answers `503 restate-unavailable` at its trigger seam instead of hanging when it is not.
+
+### Ports and paths — all loopback, all constants
+
+| Listener | Address | Constant |
+|---|---|---|
+| `restate-server` ingress | `127.0.0.1:8081` | `RESTATE_INGRESS_BIND_ADDRESS` (`src/restate/server.ts`) |
+| `restate-server` admin API | `127.0.0.1:9070` | `RESTATE_ADMIN_BASE_URL` (`src/restate/server.ts`) |
+| SDK endpoint | `127.0.0.1:9080` by default | `restateBindAddress()` (`src/restate/endpoint.ts`), overridable with `RESTATE_ENDPOINT_HOST` / `RESTATE_ENDPOINT_PORT` |
+
+None of the three is an admin-UI setting — every consumer is a same-machine peer, so there is nothing for an operator to point elsewhere (ADR 023).
+
+`RestateSidecar` passes the bind addresses and the data directory to `restate-server` through its config-rs environment convention (`RESTATE_<SECTION>__<KEY>`, verified with `--dump-config` against the installed `@restatedev/restate-server` version):
+
+- `RESTATE_INGRESS__BIND_ADDRESS` → the `ingress.bind-address` config key
+- `RESTATE_ADMIN__BIND_ADDRESS` → the `admin.bind-address` config key
+- `RESTATE_BASE_DIR` → the top-level `base-dir` config key, set to `restateDataDir()`
+
+### Data directory
+
+`restateDataDir()` resolves the embedded store's location: `RESTATE_DATA_DIR` when set, else the dedup DB's directory plus `/restate` — `/data/restate` on Fly, `./restate` locally (`.env.example`). `.gitignore` excludes `restate/` so a local run's store never gets committed.
+
+### Local image boot check
+
+To confirm the loopback-only claim inside the built image rather than trusting the source:
+
+```bash
+docker run --rm -d --name ai-implement-boot-check <image>
+sleep 5
+docker exec ai-implement-boot-check sh -c "ss -ltnp 2>/dev/null || netstat -ltnp"
+docker port ai-implement-boot-check
+docker stop ai-implement-boot-check
+```
+
+Expect the ingress, admin, and SDK-endpoint ports (8081, 9070, 9080) to show a `127.0.0.1` local address inside the container, and `docker port` to publish none of them — a listener on `0.0.0.0` or a published port is the regression this check exists to catch.
+
+### `npm run dev` and `npm run dev:run`
+
+`npm run dev` spawns the Restate sidecar the same way boot does, with its data directory under `./restate` (see `CLAUDE.md` § Running locally). `npm run dev:run`'s mounted-workspace harness does not start it — that path exercises one runner container against a target-repo checkout, not the orchestrator process.
 
 ## Writing a workflow for a run kind
 

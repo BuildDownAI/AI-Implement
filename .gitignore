@@ -8,7 +8,7 @@ dist/
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
-restate/
+/restate/
 *.pem
 *.pem.txt
 clients/*.toml

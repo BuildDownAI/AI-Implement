@@ -303,3 +303,23 @@ To repair a degraded image, re-deploy with `--no-cache` and a working `--build-s
 - The **`deployed` / `restarted` deploy notification** adds _⚠️ KG sidecar not serving — <lastError>_ next to the embeddings warning, and the deploy record reads `deployed-not-serving` instead of `deployed-ok` when the boot probe fails.
 
 A failed probe re-runs in the background (throttled) on the next proxied failure, so the fields recover on their own once the sidecar does. The boot probe has one overall deadline (30 s); a timeout is recorded as a failed probe.
+
+## Restate sidecar
+
+`restate-server` runs as a second child-process sidecar of the orchestrator, spawned and stopped alongside the KG sidecar with the same non-fatal contract (ADR 023; full reference: [docs/restate.md](restate.md) § "Deployment and operations"). It adds no deployment surface of its own — no separate Fly app, no new health endpoint, no `fly.toml` change — because every listener it and its SDK endpoint expose binds to `127.0.0.1` only, and the orchestrator process is the only thing on the machine that talks to any of them.
+
+`RESTATE_DATA_DIR` is the one operator-facing knob (`.env.example`): unset, the embedded store lives under the dedup DB's directory (`/data/restate` on Fly), so a Fly volume that already covers `DEDUP_DB_PATH` covers it without a config change.
+
+### Local image boot check
+
+Before shipping a change that touches the sidecar's bind addresses, confirm loopback-only binding inside the actual built image rather than trusting the source:
+
+```bash
+docker run --rm -d --name ai-implement-boot-check <image>
+sleep 5
+docker exec ai-implement-boot-check sh -c "ss -ltnp 2>/dev/null || netstat -ltnp"
+docker port ai-implement-boot-check
+docker stop ai-implement-boot-check
+```
+
+`ss`/`netstat` inside the container should show the ingress (8081), admin API (9070), and SDK endpoint (9080) listening on `127.0.0.1`, never `0.0.0.0`; `docker port` should publish none of them to the host. Either symptom is the regression this check exists to catch — a wrong config key silently falling back to `restate-server`'s own default bind (`0.0.0.0`) would otherwise only surface as an unexplained port collision or an externally reachable admin API.
