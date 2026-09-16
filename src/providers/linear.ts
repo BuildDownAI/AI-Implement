@@ -13,7 +13,7 @@ import { isLinearAuthConfigured, withLinearToken } from "../linear-app-auth.js";
 import { defaultFetchSignal } from "../github.js";
 import { parseIssueConfig } from "../issue-config.js";
 import { nonTerminalDesignatedChildren, type FeatureChildState } from "../feature-branch.js";
-import { getLinearPickupLabel } from "../orchestrator-settings.js";
+import { DEFAULT_LINEAR_PICKUP_LABEL, getLinearPickupLabel } from "../orchestrator-settings.js";
 
 interface GraphQLResponse<T> {
   data?: T;
@@ -22,6 +22,13 @@ interface GraphQLResponse<T> {
 
 /** How far back to scan completed feature nodes for roll-up (bounds the query). */
 const ROLLUP_LOOKBACK_MS = 14 * 24 * 60 * 60 * 1000;
+
+/** Pickup label. Default shown here; the effective value is refreshed from the
+ *  settings table (`linear_pickup_label`, /admin#settings) at the start of each poll. */
+let AI_IMPLEMENT_LABEL = DEFAULT_LINEAR_PICKUP_LABEL;
+function refreshPickupLabel(): void {
+  AI_IMPLEMENT_LABEL = getLinearPickupLabel();
+}
 
 /** A node in the ancestor chain: identifier + description + labels, with a nullable parent. */
 type AncestorNode = {
@@ -47,20 +54,19 @@ type AncestorNode = {
  *  tracker state is completed or cancelled — never inferred from a job row. */
 function childFeatureStates(
   children: Array<{ identifier: string; state?: { type: string } | null; labels?: { nodes: Array<{ name: string }> } }>,
-  label: string,
 ): FeatureChildState[] {
   return children.map((c) => ({
     identifier: c.identifier,
-    designated: (c.labels?.nodes ?? []).some((l) => l.name === label),
+    designated: (c.labels?.nodes ?? []).some((l) => l.name === AI_IMPLEMENT_LABEL),
     terminal: c.state?.type === "completed" || c.state?.type === "canceled",
   }));
 }
 
-function labeledAncestorChain(parent: AncestorNode, label: string): FeatureBranchChainEntry[] {
+function labeledAncestorChain(parent: AncestorNode): FeatureBranchChainEntry[] {
   const collected: FeatureBranchChainEntry[] = [];
   let node = parent;
   while (node) {
-    const hasLabel = (node.labels?.nodes ?? []).some((l) => l.name === label);
+    const hasLabel = (node.labels?.nodes ?? []).some((l) => l.name === AI_IMPLEMENT_LABEL);
     if (!hasLabel) break;
     collected.push({
       identifier: node.identifier,
@@ -161,7 +167,7 @@ export class LinearProvider implements TicketingProvider {
   }
 
   async fetchAIImplementSnapshot(): Promise<AIImplementSnapshot> {
-    const label = getLinearPickupLabel();
+    refreshPickupLabel();
     const PAGE_SIZE = 100;
     const query = `
       query($first: Int!, $after: String, $label: String!) {
@@ -271,7 +277,7 @@ export class LinearProvider implements TicketingProvider {
       const data: IssuePage = await this.linearMutation<IssuePage>(query, {
         first: PAGE_SIZE,
         after: cursor,
-        label,
+        label: AI_IMPLEMENT_LABEL,
       });
       allNodes.push(...data.issues.nodes);
       cursor = data.issues.pageInfo.hasNextPage ? data.issues.pageInfo.endCursor : null;
@@ -284,7 +290,7 @@ export class LinearProvider implements TicketingProvider {
     } while (cursor !== null);
 
     if (allNodes.length === 0) {
-      console.log(`[linear] No open issues carry the pickup label "${label}"`);
+      console.log(`[linear] No open issues carry the pickup label "${AI_IMPLEMENT_LABEL}"`);
     }
 
     const inProgressCountsByScope: Record<string, number> = {};
@@ -330,8 +336,8 @@ export class LinearProvider implements TicketingProvider {
       //   - waiting parent (children but  → skipped (race guard: the parent was labeled before
       //     none AI-Implement yet)          its children were, so let it sit).
       const children = issue.children?.nodes ?? [];
-      const aiChildren = children.filter((c) => (c.labels?.nodes ?? []).some((l) => l.name === label));
-      const ancestorChain = labeledAncestorChain(issue.parent, label);
+      const aiChildren = children.filter((c) => (c.labels?.nodes ?? []).some((l) => l.name === AI_IMPLEMENT_LABEL));
+      const ancestorChain = labeledAncestorChain(issue.parent);
       const parsed = parseIssueConfig(issue.description, issue.identifier);
       const mode = parsed.config.featureBranch.mode;
 
@@ -340,7 +346,7 @@ export class LinearProvider implements TicketingProvider {
         // Leaf. Its own ai-implement.yml (if any) is irrelevant — it owns no branch.
         featureBranchChain = ancestorChain.length > 0 ? ancestorChain : undefined;
       } else if (aiChildren.length > 0) {
-        const blockingChildren = nonTerminalDesignatedChildren(childFeatureStates(children, label));
+        const blockingChildren = nonTerminalDesignatedChildren(childFeatureStates(children));
         if (blockingChildren.length > 0) {
           console.log(
             `[linear] Skipping ${issue.identifier}: ${mode} grouping parent waiting on in-flight AI-Implement children: ${blockingChildren.map((c) => c.identifier).join(", ")}`,
@@ -352,7 +358,7 @@ export class LinearProvider implements TicketingProvider {
         // reach a terminal state — same guard the no-AI-children path already applies.
         const anyUndesignatedActive = children.some(
           (c) =>
-            !(c.labels?.nodes ?? []).some((l) => l.name === label) &&
+            !(c.labels?.nodes ?? []).some((l) => l.name === AI_IMPLEMENT_LABEL) &&
             c.state?.type !== "completed" &&
             c.state?.type !== "canceled",
         );
@@ -369,7 +375,7 @@ export class LinearProvider implements TicketingProvider {
         }
         featureBranchChain = [...ancestorChain, { identifier: issue.identifier, mode }];
       } else {
-        console.log(`[linear] Skipping ${issue.identifier}: parent labeled but no child has "${label}" set yet`);
+        console.log(`[linear] Skipping ${issue.identifier}: parent labeled but no child has "${AI_IMPLEMENT_LABEL}" set yet`);
         continue;
       }
 
@@ -400,7 +406,7 @@ export class LinearProvider implements TicketingProvider {
     // recent window so the set stays small; the merge-up step skips already-merged
     // branches cheaply via a branch comparison. A completed feature node implies its
     // own closing work merged and all its children done.
-    const label = getLinearPickupLabel();
+    refreshPickupLabel();
     const since = new Date(Date.now() - ROLLUP_LOOKBACK_MS).toISOString();
     const data = await this.linearMutation<{
       issues: {
@@ -433,12 +439,12 @@ export class LinearProvider implements TicketingProvider {
           }
         }
       }`,
-      { since, label },
+      { since, label: AI_IMPLEMENT_LABEL },
     );
 
     const rollUps: FeatureNodeRollUp[] = [];
     for (const node of data.issues?.nodes ?? []) {
-      const childStates = childFeatureStates(node.children?.nodes ?? [], label);
+      const childStates = childFeatureStates(node.children?.nodes ?? []);
       const aiChildren = childStates.filter((c) => c.designated);
       if (aiChildren.length === 0) continue;
       // A node's own tracker state reaching "completed" doesn't guarantee its children
@@ -453,7 +459,7 @@ export class LinearProvider implements TicketingProvider {
         continue;
       }
       const parentIsFeatureNode =
-        !!node.parent && (node.parent.labels?.nodes ?? []).some((l) => l.name === label);
+        !!node.parent && (node.parent.labels?.nodes ?? []).some((l) => l.name === AI_IMPLEMENT_LABEL);
       rollUps.push({
         issueId: node.id,
         identifier: node.identifier,
