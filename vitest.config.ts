@@ -8,7 +8,11 @@ export default defineConfig({
     pool: "forks",
     setupFiles: ["src/__tests__/setup/clear-runner-credentials.ts"],
     include: ["src/**/*.test.ts"],
-    exclude: ["node_modules/**", "dist/**", ".worktrees/**"],
+    // *.restate.test.ts needs Docker (testcontainers) and runs only via
+    // `npm run test:restate` / the restate-tests CI job — never the default
+    // suite, which must stay Docker-free on every machine, including a
+    // dispatched runner's implement pass (docs/restate.md).
+    exclude: ["node_modules/**", "dist/**", ".worktrees/**", "src/**/*.restate.test.ts"],
     testTimeout: 30000,
     hookTimeout: 30000,
   },

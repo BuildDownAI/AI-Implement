@@ -24,6 +24,7 @@ Two tiers, distinguished by what a file *is* rather than what it covers.
 | [runner-callbacks.md](runner-callbacks.md) | The run tokens and callback endpoints: who mints, carries, reads, verifies, and consumes each credential; the process boundary inside the runner; the blast radius of one stray use |
 | [private-npm-registry.md](private-npm-registry.md) | Private npm registry auth for the built-in `install` step: the three values, why the token rides the forwarded-secrets rail as `NPM_TOKEN`, the per-run `NPM_CONFIG_USERCONFIG` file, and where the token does and does not exist during a run |
 | [review-findings-contract.md](review-findings-contract.md) | The `review-findings/v1` fenced-JSON-block contract a reviewer posts: schema, a full example, emitter obligations, and how a non-Claude reviewer emits one |
+| [restate.md](restate.md) | The Restate engine: the sidecar process and its ports, the SDK endpoint the orchestrator hosts, the testcontainers job and the default-suite exclusion, and how a run kind's workflow is written |
 
 Two references live outside this directory because they are consumed directly rather than read: `.env.example` is the canonical list of orchestrator environment variables, and `CLAUDE.md` is the index that points at everything here.
 

@@ -42,3 +42,47 @@ jobs:
           unset GITHUB_RUN_ID GITHUB_ENV GITHUB_REPOSITORY GITHUB_REF_NAME                 GITHUB_EVENT_NAME GITHUB_SHA GITHUB_ACTIONS GITHUB_ACTION
           npm test
       - run: npm run typecheck
+
+  # Restate harness tests (AII-612): src/__tests__/*.restate.test.ts, run with
+  # Docker via testcontainers. A job inside this file rather than a new
+  # workflow, deliberately — it must inherit the pull_request branch list
+  # above (including ai-implement/feature/**), the same reason unit-tests
+  # lives here (AII-467).
+  restate-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      # The Restate server image has no version pinned in this harness (it
+      # tracks whatever @restatedev/restate-sdk-testcontainers' RestateContainer
+      # defaults to), so the cache key is time-boxed rather than tag-pinned: a
+      # week-old cache is still a valid warm start for `docker load`, and a
+      # cache miss just falls back to testcontainers' own `docker pull`.
+      - name: Restate image cache key
+        id: restate-image-cache-key
+        run: echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+      - name: Restore cached Restate server image
+        id: restate-image-cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/restate-image-cache/restate.tar
+          key: restate-server-image-${{ steps.restate-image-cache-key.outputs.week }}
+          restore-keys: |
+            restate-server-image-
+      - name: Load cached Restate server image
+        if: hashFiles('/tmp/restate-image-cache/restate.tar') != ''
+        run: docker load -i /tmp/restate-image-cache/restate.tar
+      - name: npm run test:restate (ambient CI vars scrubbed)
+        run: |
+          unset GITHUB_RUN_ID GITHUB_ENV GITHUB_REPOSITORY GITHUB_REF_NAME                 GITHUB_EVENT_NAME GITHUB_SHA GITHUB_ACTIONS GITHUB_ACTION
+          npm run test:restate
+      - name: Save Restate server image to cache
+        if: always()
+        run: |
+          mkdir -p /tmp/restate-image-cache
+          docker save docker.io/restatedev/restate:latest -o /tmp/restate-image-cache/restate.tar
