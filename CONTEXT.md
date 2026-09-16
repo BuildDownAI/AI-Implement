@@ -127,3 +127,9 @@ An advisory finding is a review finding that the run shows to people and never a
 The review verdict is the conclusion one reviewer states about a PR: approve, changes requested, or incomplete.
 
 **Not to be confused with:** Merge readiness, which is the run's own decision over every reviewer's findings and verdicts together.
+
+## Pickup label
+
+The pickup label is the one Linear label whose presence makes an issue a dispatch candidate for an orchestrator. It defaults to `AI-Implement` and is set once per orchestrator.
+
+**Not to be confused with:** The lifecycle labels (`AI-Planning`, `AI-Working`, `Plan-Complete`, `Ready for Review`), which the orchestrator writes to record run state and which are not configurable.
