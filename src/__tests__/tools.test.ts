@@ -7,13 +7,19 @@
 import * as restate from "@restatedev/restate-sdk";
 import { z } from "zod";
 import { describe, expect, it, vi } from "vitest";
-import { tool, listProjects, kgPath, kgHybridSearch, getKgStatusTool } from "../restate/tools.js";
+import { tool, listProjects, kgPath, kgHybridSearch, getKgStatusTool, getIssueReportCardTool, getFleetReportTool } from "../restate/tools.js";
 import { discoverTools, callTool, callToolAsSystem, toolCatalog } from "../restate/tools-client.js";
 import type { Caller } from "../mcp-identity.js";
 import { setKgMemoryProvider } from "../kg-provider.js";
 import type { MemoryProvider } from "../kg-provider.js";
 import { setActiveKgRefresh } from "../kg-refresh.js";
 import { getMappings } from "../config.js";
+import { getIssueReportCard, getFleetReport } from "../report-card.js";
+
+vi.mock("../report-card.js", () => ({
+  getIssueReportCard: vi.fn(),
+  getFleetReport: vi.fn(),
+}));
 
 vi.mock("../config.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../config.js")>()),
@@ -390,5 +396,34 @@ describe("migrated read handlers (AII-711)", () => {
     setActiveKgRefresh(null);
     const result = await getKgStatusTool(fakeContext("get_kg_status"), { caller: system, args: {} });
     expect(JSON.parse(result.content[0].text)).toEqual({ error: "KG refresh is not configured" });
+  });
+});
+
+describe("get_issue_report_card and get_fleet_report thread their arguments (AII-711)", () => {
+  const system: Caller = SYSTEM_ADMIN;
+
+  it("get_issue_report_card passes `issue` through and returns the card verbatim", async () => {
+    (getIssueReportCard as ReturnType<typeof vi.fn>).mockReturnValue({ issue: "AII-1", dispatches: 2, passes: 3, costUsd: 1.5 });
+    const result = await getIssueReportCardTool(fakeContext("get_issue_report_card"), { caller: system, args: { issue: "AII-1" } });
+    expect(getIssueReportCard).toHaveBeenCalledWith("AII-1");
+    expect(JSON.parse(result.content[0].text)).toEqual({ issue: "AII-1", dispatches: 2, passes: 3, costUsd: 1.5 });
+  });
+
+  it("get_issue_report_card answers the pre-migration error object when the issue is missing or unknown", async () => {
+    (getIssueReportCard as ReturnType<typeof vi.fn>).mockClear().mockReturnValue(null);
+    const missing = await getIssueReportCardTool(fakeContext("get_issue_report_card"), { caller: system, args: {} });
+    expect(JSON.parse(missing.content[0].text)).toEqual({ error: "issue is required and must be a non-empty string" });
+    expect(getIssueReportCard).not.toHaveBeenCalled();
+    const unknown = await getIssueReportCardTool(fakeContext("get_issue_report_card"), { caller: system, args: { issue: "AII-404" } });
+    expect(JSON.parse(unknown.content[0].text)).toEqual({ error: "No dispatch records found for issue: AII-404" });
+  });
+
+  it("get_fleet_report passes `days` through when numeric and omits it otherwise", async () => {
+    (getFleetReport as ReturnType<typeof vi.fn>).mockReturnValue({ byRepo: [], oneShotPct: 1, eventualPct: 1, escapeRate: 0, runaways: [] });
+    const withDays = await getFleetReportTool(fakeContext("get_fleet_report"), { caller: system, args: { days: 7 } });
+    expect(getFleetReport).toHaveBeenLastCalledWith({ days: 7 });
+    expect(Object.keys(JSON.parse(withDays.content[0].text)).sort()).toEqual(["byRepo", "escapeRate", "eventualPct", "oneShotPct", "runaways"]);
+    await getFleetReportTool(fakeContext("get_fleet_report"), { caller: system, args: {} });
+    expect(getFleetReport).toHaveBeenLastCalledWith({ days: undefined });
   });
 });

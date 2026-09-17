@@ -146,7 +146,7 @@ Registration is bounded in the same spirit: a dynamically registered client that
 
 `MCP_ALLOWED_REDIRECT_ORIGINS` controls which callback origins dynamic clients may use. Loopback IP-literal HTTP callbacks are allowed by default; any other HTTPS origin must be listed explicitly, and arbitrary HTTPS callbacks are denied.
 
-The orchestrator proxies auth-verified requests to the sidecar verbatim and **strips the `Authorization` header before forwarding**, so the sidecar never sees the caller's token. It should be reachable only from loopback.
+The orchestrator never forwards a caller's request to the sidecar. Since AII-711 a `kg_*` tool call is a handler on the `orchestratorTools` Restate service that calls `MemoryProvider.callKgTool(name, args)`, which sends its own JSON-RPC `tools/call` to the sidecar with the probe headers and no caller credential, so the sidecar never sees the caller's token. It should be reachable only from loopback.
 
 Register two additional redirect URIs in the provider consoles, alongside the admin-UI ones:
 
@@ -177,13 +177,13 @@ Every `MemoryProvider` maps to up to six MCP tool names. The provider declares w
 
 | Capability flag | MCP tool names | Degradation when `false` |
 |---|---|---|
-| `hybridSearch` | `kg_hybrid_search`, `kg_search`, `kg_semantic_search` | Tools are absent from `tools/list`; a `tools/call` for any of them returns JSON-RPC error `-32601` (method not found) |
-| `neighbors` | `kg_neighbors` | Same — absent from list, error on call |
+| `hybridSearch` | `kg_hybrid_search`, `kg_search`, `kg_semantic_search` | Tools are absent from `tools/list`; a `tools/call` for any of them returns a tool result with `isError: true` and the text `Tool not supported by this memory provider: <tool>` |
+| `neighbors` | `kg_neighbors` | Same — absent from list, `isError` on call |
 | `path` | `kg_path` | Same |
 | `provenance` | `kg_provenance` | Same |
 | `stalenessStamp` | *(no dedicated tool — served via `kg_neighbors` on the spine IRI)* | Callers that check graph freshness skip the staleness check or treat the result as unknown |
 
-The orchestrator enforces the capability filter: a `tools/call` for a tool whose capability is `false` returns `{ "error": { "code": -32601, ... } }` at HTTP 200 — never a 503 or a proxy error. This is the contract the skills layer relies on for its dual-target degradation rules.
+The `kg_*` handler enforces the capability filter (`src/restate/tools.ts`): a `tools/call` for a tool whose capability is `false` returns a tool result `{ isError: true, content: [{ type: "text", text: "Tool not supported by this memory provider: <tool>" }] }` at HTTP 200 — never a 503 and never a proxy error. Before AII-711 the same refusal travelled as a JSON-RPC `-32601` error; the text is unchanged and is what the skills layer's dual-target degradation rules key on.
 
 ### Interface
 
@@ -200,20 +200,25 @@ interface MemoryProvider {
   readonly id: string;
   readonly capabilities: MemoryProviderCapabilities;
   listTools(body: Buffer, headers: http.IncomingHttpHeaders): Promise<unknown[]>;
+  callKgTool(name: string, args: Record<string, unknown>): Promise<KgToolResult>;
+  /** Legacy; no caller since AII-711. Deleted with the door restructure (AII-715). */
   proxyCall(req: http.IncomingMessage, res: http.ServerResponse, body: Buffer): void;
 }
+
+type KgToolResult = { ok: true; result: unknown } | { ok: false; error: string };
 ```
 
 - `id` — unique string identifying the provider (e.g. `"sidecar"`).
 - `capabilities` — declare gaps up front; the orchestrator reads this once per request and filters the advertised tool list accordingly.
 - `listTools` — return the MCP tool-definition objects (same shape as a JSON-RPC `tools/list` result) that this provider can serve. Only tools whose capability flag is `true` should appear here; the orchestrator will not enforce a second filter.
-- `proxyCall` — write an MCP response to `res` for the given request and body. Called only for tools that cleared the capability check. The request has already been auth-checked; strip the `Authorization` header before forwarding to a backing service.
+- `callKgTool` — run one `kg_*` tool and return its parsed JSON-RPC `result`, or `{ ok: false, error }` with a human-readable message. Called by the `kg_*` Restate handlers only for tools that cleared the capability check; it never receives the caller's credential and never writes to an HTTP response. The bundled provider's error texts are `KG sidecar unavailable: connection refused`, `KG sidecar error`, or the sidecar's own JSON-RPC error message.
+- `proxyCall` — legacy request forwarding with no remaining caller; still on the interface until AII-715 removes it.
 
 ### Session handling
 
 Only a 400 or 404 from the sidecar is buffered (to classify it as a session signal); every other response is relayed to the client as it arrives, so long or SSE responses are neither held in memory nor delayed until the sidecar closes the stream.
 
-The bundled `SidecarMemoryProvider` prefers a stateless sidecar: `listTools` and `proxyCall` each send a single POST with no MCP session, and that request count never grows when the sidecar answers straight away. A stateful sidecar — the Python MCP SDK's streamable-HTTP transport defaults to this — is tolerated rather than fatal: on a `400` "Missing session ID" rejection, the provider performs a lazy `initialize` → `notifications/initialized` handshake against the same sidecar URL, caches the returned `mcp-session-id` on the provider instance, and retries the original call once with that header attached. The cached id is negotiated once per process lifetime and reused by both `listTools` and `proxyCall`, not renegotiated per request. A `404` on a previously-used session clears the cached id and re-initializes exactly once. At most one handshake and one retry happen per inbound call — if the handshake itself fails, the original rejection is surfaced rather than retried again.
+The bundled `SidecarMemoryProvider` prefers a stateless sidecar: `listTools` and `callKgTool` each send a single POST with no MCP session, and that request count never grows when the sidecar answers straight away. A stateful sidecar — the Python MCP SDK's streamable-HTTP transport defaults to this — is tolerated rather than fatal: on a `400` "Missing session ID" rejection, the provider performs a lazy `initialize` → `notifications/initialized` handshake against the same sidecar URL, caches the returned `mcp-session-id` on the provider instance, and retries the original call once with that header attached. The cached id is negotiated once per process lifetime and reused by `listTools`, `callKgTool` and `probe`, not renegotiated per request. A `404` on a previously-used session clears the cached id and re-initializes exactly once. At most one handshake and one retry happen per inbound call — if the handshake itself fails, the original rejection is surfaced rather than retried again.
 
 `probe()` (the liveness check described above) is a third consumer of this same handshake path — it shares `sendWithSessionRetry` rather than issuing a raw, session-less request, so a sidecar that demands a session behaves identically for the probe as it does for real `tools/list`/`tools/call` traffic.
 
@@ -225,13 +230,13 @@ The active provider is chosen at boot from the `MEMORY_PROVIDER` environment var
 
 1. Implement `MemoryProvider` in TypeScript (or any language that can be imported/loaded into the orchestrator process).
 2. Declare your `capabilities` conservatively — `false` for any tool you cannot reliably serve.
-3. In `listTools`, return only tools whose capability is `true`. Returning a tool you cannot serve will result in proxy errors for callers.
-4. In `proxyCall`, handle every tool the capabilities declare as true. If a call reaches `proxyCall` for a tool you cannot handle, write a JSON-RPC error response rather than crashing.
+3. In `listTools`, return only tools whose capability is `true`.
+4. In `callKgTool`, handle every tool the capabilities declare as true and never throw: resolve `{ ok: false, error }` for anything you cannot serve, so the handler surfaces the text as an `isError` tool result.
 5. Register the provider in `resolveMemoryProvider()` in `src/kg-provider.ts` and add `MEMORY_PROVIDER=your-id` to `.env.example`.
 
 ## Orchestrator-native diagnostic tools
 
-These tools are served directly by the orchestrator and are always present in `tools/list` — they do not require a working sidecar. The full list is in `src/mcp.ts` (`DIAG_TOOLS`).
+These tools need no working sidecar. Since AII-711 they are handlers on the `orchestratorTools` Restate service (`src/restate/tools.ts`), discovered by `/mcp` from Restate's admin API; only `get_session_identity` is served by the door itself.
 
 | Tool | Description |
 |---|---|
