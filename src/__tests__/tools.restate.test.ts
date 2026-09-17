@@ -293,6 +293,29 @@ describe("orchestratorTools (Restate)", () => {
   );
 
   it.each(VARIANTS.map(([label]) => label))(
+    "get_project_binding resolves the fixture mapping by repo with the live pickup label, and omits extraEnv (AII-715) (%s)",
+    async (label) => {
+      const env = environments.get(label);
+      if (!env) throw new Error(`environment "${label}" did not start`);
+      dedup.getDb().prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('linear_pickup_label', ?)").run("AI-Implement-Restate");
+
+      const { status, body } = await callIngress(env.baseUrl(), "get_project_binding", {
+        caller: SYSTEM,
+        args: { repo: "BuildDownAI/skills" },
+      });
+
+      expect(status).toBe(200);
+      const text = body?.content?.[0]?.text as string;
+      const binding = JSON.parse(text) as Record<string, unknown>;
+      expect(binding.team).toBe("BDS");
+      expect(binding.repo).toBe("BuildDownAI/skills");
+      expect(binding.pickupLabel).toBe("AI-Implement-Restate");
+      expect(text).not.toContain("extraEnv");
+      expect(text).not.toContain("leak-me");
+    },
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
     "get_issue_dispatch_status returns the dispatch shape for a valid identifier and lets zod refuse a non-string one (%s)",
     async (label) => {
       const env = environments.get(label);
