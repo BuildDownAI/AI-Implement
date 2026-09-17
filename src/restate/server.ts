@@ -11,10 +11,12 @@ const require = createRequire(import.meta.url);
 /**
  * Admin API and ingress bind targets are fixed constants, not admin-UI settings — there
  * is no operator knob for them (ADR 023). endpoint.ts imports RESTATE_ADMIN_BASE_URL to
- * reach POST /deployments; nothing outside this sidecar needs the ingress address today.
+ * reach POST /deployments; tools-client.ts (AII-710) imports both RESTATE_ADMIN_BASE_URL
+ * and RESTATE_INGRESS_BASE_URL to discover and call tools through the same sidecar.
  */
 export const RESTATE_ADMIN_BASE_URL = "http://127.0.0.1:9070";
 export const RESTATE_INGRESS_BIND_ADDRESS = "127.0.0.1:8081";
+export const RESTATE_INGRESS_BASE_URL = `http://${RESTATE_INGRESS_BIND_ADDRESS}`;
 
 const RESTATE_ADMIN_BIND_ADDRESS = new URL(RESTATE_ADMIN_BASE_URL).host; // "127.0.0.1:9070"
 const RESTATE_HEALTH_URL = `${RESTATE_ADMIN_BASE_URL}/health`;

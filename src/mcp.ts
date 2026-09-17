@@ -7,11 +7,11 @@ import { getMappings } from "./config.js";
 import { getInFlightJobs, getRunRecordMergeVerdict } from "./log.js";
 import { getDb } from "./dedup.js";
 import { getIssueReportCard, getFleetReport } from "./report-card.js";
-import { isKgDegraded } from "./deploy-notify.js";
 import { recheckIdentity, type AccessRole } from "./access-entries.js";
-import { type MemoryProvider, KG_TOOL_CAPABILITY, sidecarHealthFields } from "./kg-provider.js";
-import type { IdentityKind } from "./mcp-identity.js";
+import { type MemoryProvider, KG_TOOL_CAPABILITY } from "./kg-provider.js";
+import type { IdentityKind, Caller } from "./mcp-identity.js";
 import { getDeployPosture } from "./deploy-posture.js";
+import { discoverTools, callTool } from "./restate/tools-client.js";
 
 interface JsonRpcRequest {
   jsonrpc?: string;
@@ -37,12 +37,6 @@ function bufferBody(req: http.IncomingMessage): Promise<Buffer> {
 // ---- Orchestrator-native diagnostic tools ----
 
 const DIAG_TOOLS = [
-  {
-    name: "get_tenant_health",
-    description:
-      "Returns an orchestrator health summary: runner mode, in-flight job count, pending gap-fill queue count, project count, and (when a KG source repo is configured) a live credential preflight for the kg-refresh rail (`kgRefreshPreflight` with one row per repo and grant). Use as a first-pass check before digging deeper.",
-    inputSchema: { type: "object", properties: {} },
-  },
   {
     name: "get_runner_mode",
     description:
@@ -117,6 +111,14 @@ const DIAG_TOOLS = [
 ];
 
 const DIAG_TOOL_NAMES = new Set(DIAG_TOOLS.map((t) => t.name));
+
+// Tool names bound to the orchestratorTools Restate service (src/restate/tools.ts) rather
+// than the inline tables above — mirrors KG_TOOL_CAPABILITY's per-tool table (kg-provider.ts).
+// tools/call routes a name in this set through callTool() instead of callDiagnosticTool();
+// tools/list still sources its description/schema live from discoverTools() rather than
+// duplicating the literal here. Each migration child adds its tool's name and removes the
+// corresponding DIAG_TOOLS/WRITE_TOOLS entry (AII-710).
+const RESTATE_TOOL_NAMES = new Set(["get_tenant_health"]);
 
 // ---- Orchestrator-native write tools ----
 // The entire write surface of /mcp: a tool is a write only if it is declared here, and each
@@ -361,28 +363,6 @@ async function callDiagnosticTool(
   } = {},
 ): Promise<unknown> {
   switch (name) {
-    case "get_tenant_health": {
-      const { mode, source } = getRunnerMode();
-      const inFlight = getInFlightJobs();
-      const db = getDb();
-      const { n: pendingGapfillCount } = db
-        .prepare("SELECT COUNT(*) as n FROM comment_gapfill_queue WHERE status = 'pending'")
-        .get() as { n: number };
-      const projectCount = Object.keys(getMappings()).length;
-      const kgRefreshPreflight = context.runKgRefreshPreflight
-        ? await context.runKgRefreshPreflight()
-        : null;
-      return {
-        runnerMode: { mode, source },
-        inFlightJobCount: inFlight.length,
-        pendingGapfillCount,
-        projectCount,
-        kgDegraded: isKgDegraded(),
-        ...sidecarHealthFields(),
-        kgRefreshPreflight,
-      };
-    }
-
     case "get_runner_mode": {
       const { mode, source } = getRunnerMode();
       return { mode, source };
@@ -621,8 +601,9 @@ export async function handleMcpRequest(
   }
 
   if (rpc?.method === "tools/list") {
-    // Merge native diagnostic tools with kg_* tools from the provider. Hiding a write tool the
-    // caller's role cannot use is a courtesy — the check in tools/call below is the boundary.
+    // Merge native diagnostic tools, tools discovered from the orchestratorTools Restate
+    // service (AII-710), and kg_* tools from the provider. Hiding a tool the caller's role
+    // cannot use is a courtesy — the check in tools/call below is the boundary.
     //
     // kg_* tools are omitted here entirely when there is no provider, rather than listed with
     // an isError response on tools/call: unlike get_tenant_health's `kgDegraded` flag — which
@@ -631,12 +612,18 @@ export async function handleMcpRequest(
     // doesn't exist at all for this session. Listing tools a client can never successfully call
     // would be misleading; omitting them lets tools/list reflect what's actually usable, while
     // the 503 below still carries the "no memory provider is configured" detail for a client
-    // that calls one anyway (e.g. from a stale tool list) (AII-641).
+    // that calls one anyway (e.g. from a stale tool list) (AII-641). A Restate-backed tool
+    // degrades the same way: discoverTools() returns an empty list when the admin API is
+    // unreachable, so the migrated tool simply drops out of tools/list until it recovers.
+    const discovered = await discoverTools();
+    const restateTools = discovered
+      .filter((t) => roleAllows(role, t.role))
+      .map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema }));
     const kgTools = provider ? await provider.listTools(body, req.headers) : [];
     json(res, 200, {
       jsonrpc: "2.0",
       id: rpc.id ?? null,
-      result: { tools: [...DIAG_TOOLS, ...WRITE_TOOLS.filter((t) => roleAllows(role, t.role)), ...kgTools] },
+      result: { tools: [...DIAG_TOOLS, ...WRITE_TOOLS.filter((t) => roleAllows(role, t.role)), ...restateTools, ...kgTools] },
     });
     return;
   }
@@ -649,7 +636,7 @@ export async function handleMcpRequest(
     if (writeTool) {
       const actor = identity.email;
       if (!roleAllows(role, writeTool.role)) {
-        console.log(`[mcp] write tool=${toolName} actor=${actor} role=${role ?? "null"} result=forbidden`);
+        console.log(`[mcp] write tool=${toolName} actor=${actor} role=${role ?? "null"} result=forbidden kind=${identity.kind}`);
         json(res, 200, {
           jsonrpc: "2.0",
           id: rpc.id ?? null,
@@ -670,14 +657,14 @@ export async function handleMcpRequest(
           triggerWorkflowSync,
           clearDispatchDedup,
         });
-        console.log(`[mcp] write tool=${toolName} actor=${actor} role=${role} result=${result.status}`);
+        console.log(`[mcp] write tool=${toolName} actor=${actor} role=${role} result=${result.status} kind=${identity.kind}`);
         json(res, 200, {
           jsonrpc: "2.0",
           id: rpc.id ?? null,
           result: { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] },
         });
       } catch (err) {
-        console.log(`[mcp] write tool=${toolName} actor=${actor} role=${role} result=error`);
+        console.log(`[mcp] write tool=${toolName} actor=${actor} role=${role} result=error kind=${identity.kind}`);
         json(res, 200, {
           jsonrpc: "2.0",
           id: rpc.id ?? null,
@@ -687,6 +674,21 @@ export async function handleMcpRequest(
           },
         });
       }
+      return;
+    }
+
+    if (RESTATE_TOOL_NAMES.has(toolName)) {
+      const caller: Caller = { kind: identity.kind, email: identity.email, role };
+      const callResult = await callTool(toolName, toolArgs, caller);
+      if (callResult.status === "unavailable") {
+        json(res, 503, { error: "restate-unavailable" });
+        return;
+      }
+      json(res, 200, {
+        jsonrpc: "2.0",
+        id: rpc.id ?? null,
+        result: { content: callResult.content, isError: callResult.isError },
+      });
       return;
     }
 

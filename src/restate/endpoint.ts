@@ -1,8 +1,10 @@
-// The SDK endpoint for the run lifecycle's durable-execution engine (ADR 017, ADR 018).
-// No run kind has migrated onto Restate yet, so the service set stays empty until the
-// first workflow module registers here. The Restate server (RestateSidecar, ../restate/server.ts,
-// AII-627) reaches this endpoint by push, over HTTP/2 — nothing else calls it, which is
-// why the bind address defaults to loopback and never leaves it (ADR 023).
+// The SDK endpoint for the run lifecycle's durable-execution engine (ADR 017, ADR 018),
+// the `Operator` Virtual Object (AII-709), and the `orchestratorTools` service /mcp
+// discovers and calls tools through (AII-710). No run kind has migrated onto Restate yet,
+// so a workflow module joins the service set here once one does. The Restate server
+// (RestateSidecar, ../restate/server.ts, AII-627) reaches this endpoint by push, over
+// HTTP/2 — nothing else calls it, which is why the bind address defaults to loopback and
+// never leaves it (ADR 023).
 import * as http2 from "node:http2";
 import { createEndpointHandler } from "@restatedev/restate-sdk/node";
 import type {
@@ -13,15 +15,17 @@ import type {
 import { getInFlightJobs as defaultGetInFlightJobs } from "../log.js";
 import { RESTATE_ADMIN_BASE_URL } from "./server.js";
 import { operatorObject } from "./operator-object.js";
+import { orchestratorTools } from "./tools.js";
 
 export type RestateService =
   | ServiceDefinition<string, unknown>
   | VirtualObjectDefinition<string, unknown>
   | WorkflowDefinition<string, unknown>;
 
-// No run kind's workflow has migrated here yet (ADR 018 case 1: kg-refresh); `Operator`
-// (AII-709) is the first bound object, ahead of any workflow module.
-export const RESTATE_SERVICES: RestateService[] = [operatorObject];
+// `Operator` (AII-709) is the first bound object, `orchestratorTools` (AII-710) the first
+// bound service; a run kind's workflow module joins them here once one migrates (ADR 018
+// case 1: kg-refresh).
+export const RESTATE_SERVICES: RestateService[] = [operatorObject, orchestratorTools];
 
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 9080;
