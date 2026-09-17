@@ -7,6 +7,7 @@
  * SQLite tokens, and carrying one would double the blast radius of a leak.
  */
 
+import { isIP } from "node:net";
 import { getDb } from "./dedup.js";
 import type { IdentityKind } from "./mcp-identity.js";
 
@@ -133,6 +134,43 @@ export function summarizeAuthEvents(since: number): AuthEventSummary {
     byClientPath[row.client_path] = (byClientPath[row.client_path] ?? 0) + 1;
   }
   return { totalEvents: rows.length, byCause, byClientPath };
+}
+
+/** Loopback IP literal or `localhost` — the client-path split used by `resolveClientPath` and mcp-oauth.ts's redirect-uri check. */
+export function isLoopbackHost(hostname: string): boolean {
+  const host = hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  if (host === "localhost") {
+    return true;
+  }
+  const ipVersion = isIP(host);
+  return ipVersion === 6 ? host === "::1" : ipVersion === 4 && host.startsWith("127.");
+}
+
+/**
+ * Which client path a registered client belongs to, for the auth-event `clientPath` field:
+ * a loopback IP literal (or `localhost`) redirect means the Claude Code loopback flow,
+ * anything else means an HTTPS-registered client (e.g. claude.ai). `null`/unregistered
+ * resolves to `"unknown"` rather than guessing — a forged token traces to no client at all.
+ */
+export function resolveClientPath(clientId: string | null | undefined): ClientPath {
+  if (!clientId) return "unknown";
+  const row = getDb()
+    .prepare("SELECT redirect_uris FROM mcp_clients WHERE client_id = ?")
+    .get(clientId) as { redirect_uris: string } | undefined;
+  if (!row) return "unknown";
+  let uris: unknown;
+  try {
+    uris = JSON.parse(row.redirect_uris);
+  } catch {
+    return "unknown";
+  }
+  const first = Array.isArray(uris) ? uris[0] : undefined;
+  if (typeof first !== "string") return "unknown";
+  try {
+    return isLoopbackHost(new URL(first).hostname) ? "loopback" : "https";
+  } catch {
+    return "unknown";
+  }
 }
 
 function rowToEvent(row: AuthEventRow): AuthEvent {

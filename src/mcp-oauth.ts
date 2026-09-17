@@ -18,14 +18,15 @@
 
 import crypto from "node:crypto";
 import type http from "node:http";
-import { isIP } from "node:net";
 import { getDb } from "./dedup.js";
 import { getProvider, listConfiguredProviders } from "./oauth/providers.js";
 import { buildAuthUrl, completeAuth } from "./oauth/oidc.js";
 import { authorize } from "./oauth/authorize.js";
 import { bindAccessEntry, getEffectiveAllowlist, matchAccessEntry } from "./access-entries.js";
-import type { RefreshAuthority, RefreshInput, RefreshOutcome } from "./mcp-identity.js";
-import { recordAuthEvent, type AuthEventCause, type ClientPath } from "./mcp-auth-events.js";
+import type { IssueInput, IssueOutcome, RefreshAuthority, RefreshInput, RefreshOutcome } from "./mcp-identity.js";
+import { recordAuthEvent, resolveClientPath, isLoopbackHost, type AuthEventCause } from "./mcp-auth-events.js";
+import { RestateRefreshAuthority } from "./restate/operator-object.js";
+export { resolveClientPath } from "./mcp-auth-events.js";
 
 // Token and state lifetimes
 export const MCP_TOKEN_TTL_MS: number = (() => {
@@ -132,16 +133,6 @@ export function initMcpOAuthTables(): void {
   db.prepare("DELETE FROM mcp_refresh_tokens WHERE expires_at < ?").run(now);
 }
 
-/** Loopback IP literal or `localhost` — the client-path split used for auth events too. */
-function isLoopbackHost(hostname: string): boolean {
-  const host = hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  if (host === "localhost") {
-    return true;
-  }
-  const ipVersion = isIP(host);
-  return ipVersion === 6 ? host === "::1" : ipVersion === 4 && host.startsWith("127.");
-}
-
 function isAllowedRedirectUri(redirectUri: string): boolean {
   let parsed: URL;
   try {
@@ -177,33 +168,6 @@ function isAllowedRedirectUri(redirectUri: string): boolean {
       }
     });
   return allowedOrigins.includes(parsed.origin);
-}
-
-/**
- * Which client path a registered client belongs to, for the auth-event `clientPath` field:
- * a loopback IP literal (or `localhost`) redirect means the Claude Code loopback flow,
- * anything else means an HTTPS-registered client (e.g. claude.ai). `null`/unregistered
- * resolves to `"unknown"` rather than guessing — a forged token traces to no client at all.
- */
-export function resolveClientPath(clientId: string | null | undefined): ClientPath {
-  if (!clientId) return "unknown";
-  const row = getDb()
-    .prepare("SELECT redirect_uris FROM mcp_clients WHERE client_id = ?")
-    .get(clientId) as { redirect_uris: string } | undefined;
-  if (!row) return "unknown";
-  let uris: unknown;
-  try {
-    uris = JSON.parse(row.redirect_uris);
-  } catch {
-    return "unknown";
-  }
-  const first = Array.isArray(uris) ? uris[0] : undefined;
-  if (typeof first !== "string") return "unknown";
-  try {
-    return isLoopbackHost(new URL(first).hostname) ? "loopback" : "https";
-  } catch {
-    return "unknown";
-  }
 }
 
 // ---------- Token verification ----------
@@ -530,7 +494,7 @@ export async function handleMcpTokenRequest(
   const { grant_type } = params;
 
   if (grant_type === "authorization_code") {
-    return handleAuthorizationCodeGrant(params, res);
+    return await handleAuthorizationCodeGrant(params, res);
   }
   if (grant_type === "refresh_token") {
     return await handleRefreshTokenGrant(params, res);
@@ -538,10 +502,10 @@ export async function handleMcpTokenRequest(
   return json(res, 400, { error: "unsupported_grant_type" });
 }
 
-function handleAuthorizationCodeGrant(
+async function handleAuthorizationCodeGrant(
   params: Record<string, string>,
   res: http.ServerResponse,
-): void {
+): Promise<void> {
   const { code, redirect_uri, client_id, code_verifier } = params;
 
   if (!code || !redirect_uri || !client_id || !code_verifier) {
@@ -581,40 +545,55 @@ function handleAuthorizationCodeGrant(
     return json(res, 400, { error: "invalid_grant", error_description: "PKCE verification failed" });
   }
 
-  const now = Date.now();
+  // Issue the refresh-token family first: on `unavailable`, nothing else is committed —
+  // no orphaned access token left behind for a grant that overall failed.
+  const issued = await refreshAuthority.issue({
+    clientId: client_id,
+    email: codeRow.email,
+    sub: codeRow.sub,
+    provider: codeRow.provider,
+  });
+  if (issued.status === "unavailable") {
+    return json(res, 503, { error: "restate-unavailable" });
+  }
 
-  // Mint access token
+  const now = Date.now();
   const accessToken = crypto.randomBytes(32).toString("hex");
   db.prepare(
     "INSERT INTO mcp_tokens (token, email, sub, provider, created_at, expires_at, client_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
   ).run(accessToken, codeRow.email, codeRow.sub, codeRow.provider, now, now + MCP_TOKEN_TTL_MS, client_id);
 
-  // Mint refresh token
-  const refreshToken = crypto.randomBytes(32).toString("hex");
-  const familyId = crypto.randomBytes(16).toString("hex");
-  db.prepare(
-    "INSERT INTO mcp_refresh_tokens (token_hash, client_id, email, sub, provider, family_id, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-  ).run(
-    hashToken(refreshToken), client_id, codeRow.email, codeRow.sub, codeRow.provider,
-    familyId, now, now + MCP_REFRESH_TOKEN_TTL_MS,
-  );
-
   json(res, 200, {
     access_token: accessToken,
     token_type: "Bearer",
     expires_in: Math.floor(MCP_TOKEN_TTL_MS / 1000),
-    refresh_token: refreshToken,
+    refresh_token: issued.refreshToken,
   });
 }
 
 /**
  * SQLite-backed `RefreshAuthority` (AII-707): the rotation, reuse-detection, and
  * allowlist re-check that `handleRefreshTokenGrant` used to run inline, unchanged
- * byte-for-byte and now reachable through the `RefreshAuthority` seam. This is the
- * default and only implementation today; it is wired at module load below so a
- * boot that never calls `setRefreshAuthority()` still refreshes tokens correctly.
+ * byte-for-byte and now reachable through the `RefreshAuthority` seam. `RestateRefreshAuthority`
+ * (AII-709) is the default as of this release; this class is kept for one release as the
+ * rollback path (flip the default back, the table is untouched) and dropped in a later cleanup.
  */
 export class SqliteRefreshAuthority implements RefreshAuthority {
+  async issue(input: IssueInput): Promise<IssueOutcome> {
+    const now = Date.now();
+    const refreshToken = crypto.randomBytes(32).toString("hex");
+    const familyId = crypto.randomBytes(16).toString("hex");
+    getDb()
+      .prepare(
+        "INSERT INTO mcp_refresh_tokens (token_hash, client_id, email, sub, provider, family_id, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      )
+      .run(
+        hashToken(refreshToken), input.clientId, input.email, input.sub, input.provider,
+        familyId, now, now + MCP_REFRESH_TOKEN_TTL_MS,
+      );
+    return { status: "ok", refreshToken };
+  }
+
   async revokeFamily(familyId: string): Promise<void> {
     getDb().prepare("DELETE FROM mcp_refresh_tokens WHERE family_id = ?").run(familyId);
   }
@@ -715,9 +694,14 @@ export class SqliteRefreshAuthority implements RefreshAuthority {
   }
 }
 
-let refreshAuthority: RefreshAuthority = new SqliteRefreshAuthority();
+let refreshAuthority: RefreshAuthority = new RestateRefreshAuthority({ accessTokenTtlMs: MCP_TOKEN_TTL_MS });
 
-/** Swap the refresh-grant authority (step 5 of AII-687's plan). SQLite is the default with no configuration. */
+/**
+ * Swap the refresh-grant authority (step 5 of AII-687's plan). `RestateRefreshAuthority`
+ * is the default with no configuration; decisions 2 and 4 of AII-687 rule out a shadow
+ * mode, a switch, or a fallback authority — this setter exists for tests and for the
+ * one-release rollback to `SqliteRefreshAuthority` (AII-709).
+ */
 export function setRefreshAuthority(authority: RefreshAuthority): void {
   refreshAuthority = authority;
 }
@@ -749,7 +733,7 @@ async function handleRefreshTokenGrant(
     case "denied":
       return json(res, 400, { error: "invalid_grant", error_description: outcome.description });
     case "unavailable":
-      return json(res, 503, { error: "temporarily_unavailable", error_description: "Access control is unavailable" });
+      return json(res, 503, { error: "restate-unavailable" });
   }
 }
 
