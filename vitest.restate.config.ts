@@ -7,7 +7,7 @@ export default defineConfig({
     env: { DEDUP_DB_PATH: ":memory:" },
     pool: "forks",
     setupFiles: ["src/__tests__/setup/clear-runner-credentials.ts"],
-    include: ["src/**/*.restate.test.ts"],
+    include: ["src/__tests__/restate/**/*.restate.test.ts"],
     exclude: ["node_modules/**", "dist/**", ".worktrees/**"],
     testTimeout: 60000,
     hookTimeout: 60000,
