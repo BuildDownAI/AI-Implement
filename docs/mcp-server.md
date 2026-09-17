@@ -11,7 +11,7 @@ The handshake methods `initialize` and `ping` are answered by the orchestrator i
 Tools come from two places and are merged into one list:
 
 * **`get_session_identity`**, the one tool the door itself serves, because it reports the door's own state for this request.
-* **Every other tool** is a handler on the `orchestratorTools` Restate service (`src/restate/tools.ts`, `docs/restate.md` § "The tools service"), discovered from Restate's admin API on each `tools/list` and called through the ingress on `tools/call`. Reads (`get_*`, `list_*`, and the six `kg_*` tools) are `role: "user"`; the six declared writes still live in `WRITE_TOOLS` in `src/mcp.ts` until AII-713 moves them. The `kg_*` handlers call the KG sidecar through `MemoryProvider.callKgTool` (`src/kg-provider.ts`) rather than proxying the HTTP request; absent a provider, or when the provider lacks the tool's capability, the handler answers a tool result with `isError: true` and the same text `/mcp` always used, and `tools/list` omits those tools (AII-641). When Restate itself is unreachable, a handler call answers `503 restate-unavailable` and the discovered tools drop out of `tools/list` until it recovers.
+* **Every other tool** is a handler on the `orchestratorTools` Restate service (`src/restate/tools.ts`, `docs/restate.md` § "The tools service"), discovered from Restate's admin API on each `tools/list` and called through the ingress on `tools/call`. Reads (`get_*`, `list_*`, and the six `kg_*` tools) are `role: "user"`; the six declared writes are `role: "admin"` handlers on the same service (AII-713) — every tool's role now lives on the handler's own `mcp.role` metadata, asserted inside the shared `tool()` wrapper, rather than in a separate list in `src/mcp.ts`. The `kg_*` handlers call the KG sidecar through `MemoryProvider.callKgTool` (`src/kg-provider.ts`) rather than proxying the HTTP request; absent a provider, or when the provider lacks the tool's capability, the handler answers a tool result with `isError: true` and the same text `/mcp` always used, and `tools/list` omits those tools (AII-641). When Restate itself is unreachable, a handler call — read or write — answers `503 restate-unavailable` and the discovered tools drop out of `tools/list` until it recovers. A write additionally carries a Restate idempotency key derived from the MCP request's JSON-RPC id, namespaced by OAuth client (`src/mcp.ts`'s `RESTATE_WRITE_TOOL_NAMES`), so a client's retry of the same call attaches to the first run instead of re-executing it; reads never carry one.
 
 ## Entry points
 
@@ -51,30 +51,32 @@ The matching entry's role is what the write tier consults; it is read on every c
 
 ## Reads are open; writes are declared
 
-A tool is a **read** unless it is on the declared write list. Every allowlisted identity, `user` or `admin`, sees and may call every read tool, including ones added later — there is no per-tool registration for reads. `list_projects` selects its fields explicitly and omits `extraEnv`, so runner environment values never leave through a read.
+A tool is a **read** unless its handler declares `role: "admin"`. Every allowlisted identity, `user` or `admin`, sees and may call every read tool, including ones added later — there is no per-tool registration for reads. `list_projects` selects its fields explicitly and omits `extraEnv`, so runner environment values never leave through a read.
 
-A **write** exists on `/mcp` only if it is an entry in `WRITE_TOOLS` in `src/mcp.ts`, and each entry names the role it requires. The list is the whole write surface: there is no tool that calls an arbitrary admin route, and every mutation not on the list — allowlist edits, secrets, deploys, page grants — stays on the admin API and its UI.
+A **write** exists on `/mcp` only if it is a handler on the `orchestratorTools` Restate service declaring `role: "admin"` in its `mcp.role` metadata (`tool()`, `src/restate/tools.ts`); the role is asserted inside that wrapper, not by the adapter, so the check holds regardless of which entry point reaches the handler. The six handlers are the whole write surface: there is no tool that calls an arbitrary admin route, and every mutation not among them — allowlist edits, secrets, deploys, page grants — stays on the admin API and its UI.
 
-For a write call the caller's role is the role of the allowlist entry that admitted them on this request; an identity with no entry (a service-class token) has role `null`. A caller's role satisfies an entry when it equals the entry's role or is `admin`. A caller whose role does not satisfy the entry's gets a tool result with `isError: true` and the text `forbidden: <tool> requires the <role> role`; `tools/list` also omits the tools the caller's role cannot use, but the server-side check is the boundary. Each write call, allowed or refused, is logged as one line with the actor's email, the tool, the role, and the result. (Mechanism: [AII-381](https://linear.app/eudoxus/issue/AII-381/mcp-write-tier-admin-role-tools-add-project-set-runner-mode-pause); decision record: ADR 015.)
+For a write call the caller's role is the role of the allowlist entry that admitted them on this request; an identity with no entry (a service-class token) has role `null`. A caller's role satisfies a handler's declared role when it equals that role or is `admin`. A caller whose role does not satisfy it gets a tool result with `isError: true` and the text `forbidden: <tool> requires the <role> role`; `tools/list` also omits the tools the caller's role cannot use, but the check inside `tool()` is the boundary. Each write call, allowed or refused, is logged as one line with the actor's email, the tool, the role, and the result — written by the wrapper itself, so a call that reaches a handler through `POST /api/tools/<name>` or `callToolAsSystem` (`docs/mcp-server.md` § "Entry points") is audited too, not just a call through `/mcp`. (Mechanism: [AII-381](https://linear.app/eudoxus/issue/AII-381/mcp-write-tier-admin-role-tools-add-project-set-runner-mode-pause), moved onto the tools service by [AII-713](https://linear.app/eudoxus/issue/AII-713/migrate-the-declared-mcp-writes-into-the-tools-service-as-durable); decision record: ADR 015.)
 
 ## Tools
 
+Every tool's `Role` column comes straight from its handler's `mcp.role` metadata (`src/restate/tools.ts`), the same value `discoverTools()` surfaces and `tool()` asserts — this table doesn't declare anything of its own.
+
 Reads, orchestrator-native:
 
-| Tool | Returns |
-| -- | -- |
-| `get_session_identity` | The caller's email, provider, and role (`user`, `admin`, or `null` for an identity with no allowlist entry), as the allowlist resolves them now. Admin-only skills call this first. |
-| `get_tenant_health` | Runner mode, in-flight jobs, pending gap-fills, project count, KG degraded flag, `kgUnavailable` + `sidecar` (the sidecar liveness probe's `reachable`/`toolsListed`/`lastError`/`checkedAt`, AII-650), and the kg-refresh credential preflight rows |
-| `get_kg_status` | KG refresh rail state: stage, served stamp, materialize path, last refresh outcome and gate, plus `kgUnavailable` + `sidecar` (same shape as `get_tenant_health`, AII-650) |
-| `get_runner_mode` | Global runner mode and its source |
-| `list_projects` | Every project mapping with its settings, minus `extraEnv` |
-| `list_in_flight_jobs` | Dispatching or running jobs with elapsed time |
-| `get_issue_dispatch_status` | In-flight and dedup state plus recent dispatches for one issue |
-| `get_issue_report_card` | Per-pass telemetry, totals, approval and merge state for one issue |
-| `get_fleet_report` | Per-repo outcomes over a look-back window |
-| `get_deploy_posture` | Autodeploy, deploy hold, running-vs-head commit, runner-channel state |
+| Tool | Role | Returns |
+| -- | -- | -- |
+| `get_session_identity` | user | The caller's email, provider, and role (`user`, `admin`, or `null` for an identity with no allowlist entry), as the allowlist resolves them now. Admin-only skills call this first. |
+| `get_tenant_health` | user | Runner mode, in-flight jobs, pending gap-fills, project count, KG degraded flag, `kgUnavailable` + `sidecar` (the sidecar liveness probe's `reachable`/`toolsListed`/`lastError`/`checkedAt`, AII-650), and the kg-refresh credential preflight rows |
+| `get_kg_status` | user | KG refresh rail state: stage, served stamp, materialize path, last refresh outcome and gate, plus `kgUnavailable` + `sidecar` (same shape as `get_tenant_health`, AII-650) |
+| `get_runner_mode` | user | Global runner mode and its source |
+| `list_projects` | user | Every project mapping with its settings, minus `extraEnv` |
+| `list_in_flight_jobs` | user | Dispatching or running jobs with elapsed time |
+| `get_issue_dispatch_status` | user | In-flight and dedup state plus recent dispatches for one issue |
+| `get_issue_report_card` | user | Per-pass telemetry, totals, approval and merge state for one issue |
+| `get_fleet_report` | user | Per-repo outcomes over a look-back window |
+| `get_deploy_posture` | user | Autodeploy, deploy hold, running-vs-head commit, runner-channel state |
 
-Reads, KG (handlers on the same service, each calling the bound `MemoryProvider.callKgTool`; listed only when a provider is configured and declares the capability): `kg_hybrid_search`, `kg_search`, `kg_semantic_search`, `kg_neighbors`, `kg_path`, `kg_provenance`. The sidecar's own result is returned verbatim in `content[0].text`, `degraded` flag included; the sidecar's own error text comes back as `isError: true`.
+Reads, KG (handlers on the same service, each `role: user`, each calling the bound `MemoryProvider.callKgTool`; listed only when a provider is configured and declares the capability): `kg_hybrid_search`, `kg_search`, `kg_semantic_search`, `kg_neighbors`, `kg_path`, `kg_provenance`. The sidecar's own result is returned verbatim in `content[0].text`, `degraded` flag included; the sidecar's own error text comes back as `isError: true`.
 
 Writes, declared:
 
@@ -99,7 +101,7 @@ Skills bind the server by name in `CLAUDE.md` (`kg.mcp_server`) and discover too
 | `OAUTH_REDIRECT_BASE_URL` unset | 503 to every caller |
 | Allowlist unreadable | 503 |
 | `kg_*` call with no provider, or a capability the provider lacks | tool result `isError: true` with the pre-migration text (`no memory provider is configured` / `Tool not supported by this memory provider: <tool>`); the tool is also absent from `tools/list` |
-| Any handler call while Restate is unreachable | 503 `restate-unavailable`; `initialize`, `get_session_identity` and the write tools still answer |
+| Any handler call — read or write — while Restate is unreachable | 503 `restate-unavailable`; `initialize` and `get_session_identity` still answer, since neither is a Restate handler |
 | GET or DELETE on `/mcp` | 405 with `Allow: POST` |
 | Unknown JSON-RPC method / unknown tool name | JSON-RPC error `-32601` / `-32602` at HTTP 200 |
 | Write call below the required role | tool result `isError: true`, `forbidden: <tool> requires the <role> role`; logged |
