@@ -108,6 +108,12 @@ export interface CallToolDeps {
  * Posts `{ caller, args }` to the ingress at `<service>/<name>` and returns the handler's
  * ToolResponse. A connection failure or a 5xx response answers `{ status: "unavailable" }`
  * — the signal src/mcp.ts maps to `503 { error: "restate-unavailable" }`.
+ *
+ * `name` is percent-encoded before it reaches the URL: an unencoded `../other-service/x`
+ * would let `fetch`'s own dot-segment normalization route the request at a sibling
+ * service outside `ORCHESTRATOR_TOOLS_SERVICE`, bypassing every role check this module and
+ * `src/restate/tools.ts`'s wrapper enforce. This is defense in depth — the primary guard is
+ * the caller-provided name shape check at the route in src/admin.ts.
  */
 export async function callTool(
   name: string,
@@ -120,7 +126,7 @@ export async function callTool(
 
   let response: Response;
   try {
-    response = await fetchImpl(`${ingressBaseUrl}/${ORCHESTRATOR_TOOLS_SERVICE}/${name}`, {
+    response = await fetchImpl(`${ingressBaseUrl}/${ORCHESTRATOR_TOOLS_SERVICE}/${encodeURIComponent(name)}`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ caller, args }),

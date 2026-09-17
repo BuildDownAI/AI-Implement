@@ -3477,6 +3477,49 @@ describe("POST /api/tools/<name>", () => {
     expect(called).not.toHaveBeenCalled();
   });
 
+  // The name shape check runs before deps.callTool is even consulted (AII-712 gap-fill):
+  // an unencoded `../` segment reaching callTool()'s ingress URL construction could
+  // resolve outside the orchestratorTools service, past every role check it enforces.
+  // The first two are the review's exact percent-encoded reproduction — TOOL_CALL_ROUTE
+  // admits them (no literal "/"), decodeURIComponent then produces a "/"-bearing name that
+  // the shape check must catch. "GET_TENANT_HEALTH" checks case, not traversal. "../x" has
+  // a literal "/" so TOOL_CALL_ROUTE itself never matches it — it's included because the
+  // review named it, and it still must 404 with the tool never called, just via the route's
+  // pre-existing catch-all rather than the new "unknown tool" body.
+  it.each([
+    ["..%2FOperator%2Fx%2Frevoke", { error: "unknown tool" }],
+    ["Operator%2Fx%2Frevoke", { error: "unknown tool" }],
+    ["GET_TENANT_HEALTH", { error: "unknown tool" }],
+  ])("rejects a tool name shaped like %s with 404 { error: \"unknown tool\" } before calling the tool", async (rawName, expectedBody) => {
+    const token = await login("secret");
+    const called = vi.fn();
+    const res = await toolRequest(token, { args: {} }, {
+      callTool: async () => { called(); return { status: "ok", content: [] }; },
+    }, rawName);
+    expect(res.statusCode).toBe(404);
+    expect(JSON.parse(res.body)).toEqual(expectedBody);
+    expect(called).not.toHaveBeenCalled();
+  });
+
+  it("answers 404 for a literal ../x path segment without ever calling the tool", async () => {
+    const token = await login("secret");
+    const called = vi.fn();
+    const res = await toolRequest(token, { args: {} }, {
+      callTool: async () => { called(); return { status: "ok", content: [] }; },
+    }, "../x");
+    expect(res.statusCode).toBe(404);
+    expect(called).not.toHaveBeenCalled();
+  });
+
+  it("accepts a valid snake_case tool name", async () => {
+    const token = await login("secret");
+    const res = await toolRequest(token, { args: {} }, {
+      callTool: async () => ({ status: "ok", content: [{ type: "text", text: "healthy" }] }),
+    }, "get_tenant_health");
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ content: [{ type: "text", text: "healthy" }], isError: undefined });
+  });
+
   it("answers 501 when the tools service is not configured", async () => {
     const token = await login("secret");
     const res = await toolRequest(token, { args: {} }, {});

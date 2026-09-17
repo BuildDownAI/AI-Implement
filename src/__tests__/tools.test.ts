@@ -219,6 +219,21 @@ describe("callTool", () => {
     expect(body).toEqual({ caller: HUMAN_USER, args: { id: "1" } });
     expect(Object.keys(body)).toEqual(["caller", "args"]);
   });
+
+  it("percent-encodes a path-traversal name so it stays one path segment (defense in depth)", async () => {
+    let capturedUrl: string | undefined;
+    const fetchImpl = vi.fn(async (url: string | URL | Request) => {
+      capturedUrl = String(url);
+      return { ok: true, status: 200, json: async () => ({ content: [] }) } as Response;
+    });
+
+    await callTool("../Operator/x/revoke", {}, HUMAN_USER, {
+      ingressBaseUrl: "http://ingress.example",
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+
+    expect(capturedUrl).toBe("http://ingress.example/orchestratorTools/..%2FOperator%2Fx%2Frevoke");
+  });
 });
 
 describe("callToolAsSystem", () => {

@@ -20,7 +20,7 @@ Three ways to reach a tool's result, all going through the same handler and the 
 | Entry point | Credential | Notes |
 | -- | -- | -- |
 | `/mcp` | OAuth bearer token | `tools/call`, described below. |
-| `POST /api/tools/<name>` | Admin session (the same session every other `/api/` route requires) | For a caller with no MCP client, such as CI. Maps the session to `Caller { kind: "human", email, role }` using the session's own resolved role — never defaulted to `admin`. A run capability ([AII-688](https://linear.app/eudoxus/issue/AII-688/run-identity-on-restate-for-kg-refresh-capabilities-mcp-reads-and-the)) is a later, separate entry point. |
+| `POST /api/tools/<name>` | Admin session (the same session every other `/api/` route requires) | For a caller with no MCP client, such as CI. Maps the session to `Caller { kind: "human", email, role }` using the session's own resolved role — never defaulted to `admin`. `<name>` must match `^[a-z][a-z0-9_]{0,63}$`; anything else answers `404 { error: "unknown tool" }` before the ingress is reached. A run capability ([AII-688](https://linear.app/eudoxus/issue/AII-688/run-identity-on-restate-for-kg-refresh-capabilities-mcp-reads-and-the)) is a later, separate entry point. |
 | In-process | None | `callToolAsSystem` (`src/restate/tools-client.ts`) calls the handler directly with `systemCaller()` — for orchestrator code that wants a tool result without an HTTP hop. |
 
 ## Authentication and the per-request re-check

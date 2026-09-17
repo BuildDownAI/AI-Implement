@@ -1688,6 +1688,9 @@ async function handleDeployTrigger(
   }
 }
 
+/** Every tool name is snake_case ASCII (src/restate/tools.ts's `tool()` registrations). */
+const TOOL_NAME_SHAPE = /^[a-z][a-z0-9_]{0,63}$/;
+
 /**
  * POST /api/tools/<name> — the REST entry point to the tools service (AII-712), for a
  * caller such as CI that has an admin session but no MCP client. Same handlers, same
@@ -1696,6 +1699,13 @@ async function handleDeployTrigger(
  * a `Caller`. The mapped role is always `gate.role` — the session's own resolved role —
  * never hardcoded to "admin", or a `user`-role operator with a page grant would gain
  * every write tool the wrapper would otherwise refuse them.
+ *
+ * The name is validated against `TOOL_NAME_SHAPE` before anything else — including before
+ * `deps.callTool` is even checked — because a decoded name outside that shape (e.g. a
+ * `../`-containing segment) would otherwise reach `callTool()`'s ingress URL construction
+ * and could resolve outside `ORCHESTRATOR_TOOLS_SERVICE` entirely. Deliberately not a
+ * static allowlist: AII-711 moves every tool to discovery, and a route-local list here
+ * would drift from it.
  */
 async function handleToolCall(
   req: http.IncomingMessage,
@@ -1704,6 +1714,10 @@ async function handleToolCall(
   toolName: string,
   deps: AdminDeps,
 ): Promise<void> {
+  if (!TOOL_NAME_SHAPE.test(toolName)) {
+    json(res, 404, { error: "unknown tool" });
+    return;
+  }
   if (!deps.callTool) {
     json(res, 501, { error: "Tools service is not configured" });
     return;
