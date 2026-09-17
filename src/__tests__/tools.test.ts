@@ -20,6 +20,7 @@ import {
   setRunnerModeTool,
   pauseProjectTool,
   addProjectTool,
+  addProjectArgsSchema,
   triggerWorkflowSyncTool,
   clearDispatchDedupTool,
   setProviderRegistry,
@@ -730,6 +731,33 @@ describe("migrated write handlers (AII-713)", () => {
       const result = await addProjectTool(fakeContext("add_project"), { caller: admin, args });
       expect(upsertMappingAction).toHaveBeenCalledWith(args, expect.any(Object), expect.any(Object));
       expect(JSON.parse(result.content[0].text)).toEqual({ status: 202, body: { teamKey: "AII", syncJobId: 5 } });
+    });
+
+    // AII-720: the tool description promises "pass null to reset to the default" for
+    // reviewers and the description upsertMappingAction (src/admin.ts) actually treats as
+    // reset-on-null. The ingress runs this schema before the handler ever sees the call, so
+    // a field the action accepts as null but the schema declares only .optional() is refused
+    // as a 4xx before it reaches the mock above — safeParse against the exported schema is
+    // what would have caught that (no live ingress needed).
+    it("safeParse on the exported args schema accepts every documented null-reset field, and still rejects wrong shapes", () => {
+      const nullResetArgs = {
+        teamKey: "AII",
+        owner: "org",
+        repo: "repo",
+        reviewers: null,
+        maxTurns: null,
+        maxIterations: null,
+        maxJobMinutes: null,
+        branchPrefix: null,
+        skillsRepo: null,
+        dependencyTokenScope: null,
+        sensitiveAddPatterns: null,
+        sensitiveAllowPatterns: null,
+      };
+      expect(addProjectArgsSchema.safeParse(nullResetArgs).success).toBe(true);
+
+      expect(addProjectArgsSchema.safeParse({ teamKey: null, owner: "org", repo: "repo" }).success).toBe(false);
+      expect(addProjectArgsSchema.safeParse({ teamKey: "AII", owner: "org", repo: "repo", reviewers: "x" }).success).toBe(false);
     });
   });
 

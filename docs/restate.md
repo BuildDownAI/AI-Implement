@@ -161,6 +161,10 @@ The orchestrator, the server, the admin API, and the SDK endpoint are same-machi
 
 A Restate scenario registers only the services it needs and runs two environments from the shared harness: `alwaysReplay: true` forces replay at every suspension for the happy paths, `disableRetries: true` surfaces error paths at once (§ "Testing"). Assert an observable effect — a call count on a fake, a state read through a shared handler, a returned value — never a journal internal. Keep the pure decision logic (for example `decideRefresh`'s grace-window branch) in the default unit suite so it runs with no Docker; the container scenario proves the wiring, not the arithmetic.
 
+### A passthrough tool that gains a zod schema gains a new validation layer — test it against the downstream contract
+
+The ingress runs `input` before the handler ever sees the call. When a tool that used to pass its body through untouched (`WRITE_TOOLS` in `src/mcp.ts`, pre-AII-713) gets a zod schema, that schema can reject a value the handler it wraps has always accepted — `.optional()` alone refuses `null`, so a tool description that says "pass null to reset" needs `.nullable()` too, or the ingress 4xxs before `src/admin.ts` ever runs (AII-720). Test the schema with the values the downstream action's contract accepts, not only the happy shape it was migrated from.
+
 ### A dependency on Restate is a new failure mode — degrade, don't hang
 
 Anything that reaches the ingress or the admin API gains a dependency on the sidecar being up. Decide the degraded answer before you migrate: a discovered tool drops out of `tools/list` while the admin API is unreachable (the same silent-omission the `kg_*` tools already use), a `tools/call` or a refresh answers `503 restate-unavailable`, and `get_session_identity` still answers because it is not a Restate handler. The rule from ADR 025: Restate down narrows to "this one surface is unavailable," never "nobody can use MCP," and never a 401 — a 503 says retry, a 401 says re-authenticate.
