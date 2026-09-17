@@ -12,6 +12,8 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { orchestratorTools, tool, type ToolResponse } from "../restate/tools.js";
 import * as dedup from "../dedup.js";
 import { initLogTable } from "../log.js";
+import { initMappingsTable } from "../config.js";
+import { initSettingsTable } from "../runner-mode.js";
 
 // A second service, built with tool(), whose only handler throws — proves the wrapper's
 // try/catch (not just get_tenant_health's own well-behaved body) turns a thrown error into
@@ -88,6 +90,9 @@ describe("orchestratorTools (Restate)", () => {
     dedup.getDb();
     // getInFlightJobs (src/log.ts) reads dispatch_log, which getDb() does not create.
     initLogTable();
+    // get_tenant_health also reads `mappings` (getMappings) and `settings` (getRunnerMode).
+    initMappingsTable();
+    initSettingsTable();
 
     const started = await Promise.all(
       VARIANTS.map(async ([label, configure]) => {
