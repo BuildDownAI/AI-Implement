@@ -678,7 +678,7 @@ export class SqliteRefreshAuthority implements RefreshAuthority {
       // Do NOT revoke the chain here — a transient read failure is not a removal.
       console.error("[mcp-oauth] refresh deferred: the access list could not be loaded");
       emit("unavailable");
-      return { status: "unavailable" };
+      return { status: "unavailable", cause: "allowlist" };
     }
     if (!matchAccessEntry(row, allowlist.entries)) {
       await this.revokeFamily(row.family_id);
@@ -768,7 +768,13 @@ async function handleRefreshTokenGrant(
     case "denied":
       return json(res, 400, { error: "invalid_grant", error_description: outcome.description });
     case "unavailable":
-      return json(res, 503, { error: "restate-unavailable" });
+      // Two distinct outages share this status: the refresh authority itself unreachable
+      // (Restate down, or SqliteRefreshAuthority has no such case), and the allowlist
+      // re-check unreadable while the authority answered fine. Only the former is a
+      // Restate problem — the SQLite path answered the latter with `temporarily_unavailable`.
+      return outcome.cause === "allowlist"
+        ? json(res, 503, { error: "temporarily_unavailable", error_description: "Access control is unavailable" })
+        : json(res, 503, { error: "restate-unavailable" });
   }
 }
 

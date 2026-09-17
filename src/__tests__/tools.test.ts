@@ -4,6 +4,7 @@
 // returns directly (it's a plain callable, per HandlerWrapper.transpose in the SDK), and
 // discoverTools/callTool are exercised against a faked fetch. Docker-backed round-trip
 // coverage through a real ingress/admin API lives in tools.restate.test.ts.
+import { readFileSync } from "node:fs";
 import * as restate from "@restatedev/restate-sdk";
 import { z } from "zod";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
@@ -63,8 +64,29 @@ vi.mock("../admin.js", () => ({
   clearDedupEntryAction: vi.fn(),
 }));
 
-function fakeContext(handlerName: string): restate.Context {
-  return { request: () => ({ target: { handler: handlerName } }) } as unknown as restate.Context;
+// One call record per fakeContext instance, appended to by `run` — read back by a write
+// scenario to assert the step name and options ctx.run was called with (AII-717). `run`
+// invokes the closure immediately and stores its result too, mirroring the unreplayed
+// (first-attempt) case; a replay is exercised only at the Restate tier (tools.restate.test.ts).
+interface RunCall {
+  name: string;
+  options?: unknown;
+  result: unknown;
+}
+
+function fakeContext(handlerName: string, runCalls: RunCall[] = []): restate.Context {
+  return {
+    request: () => ({ target: { handler: handlerName } }),
+    run: async (name: unknown, action?: unknown, options?: unknown) => {
+      // ctx.run(action) and ctx.run(name, action) are unused by any write handler here, but
+      // the fake still handles the two-arg form defensively rather than assuming three.
+      const fn = typeof name === "function" ? (name as () => unknown) : (action as () => unknown);
+      const stepName = typeof name === "string" ? name : "<unnamed>";
+      const result = await fn();
+      runCalls.push({ name: stepName, options, result });
+      return result;
+    },
+  } as unknown as restate.Context;
 }
 
 const SYSTEM_ADMIN: Caller = { kind: "system", email: null, role: "admin" };
@@ -646,6 +668,12 @@ describe("get_issue_report_card and get_fleet_report thread their arguments (AII
 // validation, and its status-to-text mapping are unchanged — see mcp.test.ts for the same
 // cases exercised through the /mcp adapter, and tools.restate.test.ts for the idempotency
 // scenario and the forbidden-role case over a real ingress.
+//
+// AII-717: every one of these six also now runs its side effect through ctx.run with
+// { maxRetryAttempts: 1 } and declares retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" }
+// on its tool() definition — see the "retryPolicy declarations (AII-717)" describe below for
+// the latter. fakeContext's `run` records each call so a scenario here can assert the step
+// name and options the closure was reached through, not just the closure's own return value.
 describe("migrated write handlers (AII-713)", () => {
   const admin: Caller = SYSTEM_ADMIN;
 
@@ -660,15 +688,17 @@ describe("migrated write handlers (AII-713)", () => {
       expect(result.content[0].text).toContain("KG refresh is not configured");
     });
 
-    it("forwards dryRun, acceptNewBaseline, and the caller's email to the active handle and returns its result verbatim", async () => {
+    it("forwards dryRun, acceptNewBaseline, and the caller's email to the active handle through ctx.run, and returns its result verbatim", async () => {
       const triggerMock = vi.fn(async () => ({ status: 202, body: { accepted: true } }));
       setActiveKgRefresh({ trigger: triggerMock } as unknown as KgRefreshHandle);
-      const result = await triggerKgRefreshTool(fakeContext("trigger_kg_refresh"), {
+      const runCalls: RunCall[] = [];
+      const result = await triggerKgRefreshTool(fakeContext("trigger_kg_refresh", runCalls), {
         caller: { kind: "human", email: "user@example.com", role: "admin" },
         args: { dryRun: true, acceptNewBaseline: true },
       });
       expect(triggerMock).toHaveBeenCalledWith({ dryRun: true, acceptNewBaseline: true, actorEmail: "user@example.com" });
       expect(JSON.parse(result.content[0].text)).toEqual({ status: 202, body: { accepted: true } });
+      expect(runCalls).toEqual([{ name: "kg-refresh-trigger", options: { maxRetryAttempts: 1 }, result: { status: 202, body: { accepted: true } } }]);
     });
 
     it("defaults dryRun and acceptNewBaseline to false when omitted, and actorEmail to undefined for a null-email caller", async () => {
@@ -676,6 +706,25 @@ describe("migrated write handlers (AII-713)", () => {
       setActiveKgRefresh({ trigger: triggerMock } as unknown as KgRefreshHandle);
       await triggerKgRefreshTool(fakeContext("trigger_kg_refresh"), { caller: admin, args: {} });
       expect(triggerMock).toHaveBeenCalledWith({ dryRun: false, acceptNewBaseline: false, actorEmail: undefined });
+    });
+
+    it("answers isError with the wrapper's standard wording when ctx.run rejects with a TerminalError", async () => {
+      const triggerMock = vi.fn(async () => ({ status: 202, body: {} }));
+      setActiveKgRefresh({ trigger: triggerMock } as unknown as KgRefreshHandle);
+      const failingCtx = {
+        request: () => ({ target: { handler: "trigger_kg_refresh" } }),
+        run: async () => {
+          throw new restate.TerminalError("kg-refresh dispatch rejected");
+        },
+      } as unknown as restate.Context;
+
+      const result = await triggerKgRefreshTool(failingCtx, { caller: admin, args: {} });
+
+      expect(result).toEqual({
+        isError: true,
+        content: [{ type: "text", text: "trigger_kg_refresh failed: kg-refresh dispatch rejected" }],
+      });
+      expect(triggerMock).not.toHaveBeenCalled();
     });
   });
 
@@ -687,12 +736,18 @@ describe("migrated write handlers (AII-713)", () => {
       expect(setRunnerModeAction).not.toHaveBeenCalled();
     });
 
-    it("calls setRunnerModeAction with the parsed mode and returns its result verbatim, whatever the status", async () => {
+    it("calls setRunnerModeAction through ctx.run with the parsed mode and returns its result verbatim, whatever the status", async () => {
       (setRunnerModeAction as ReturnType<typeof vi.fn>).mockReturnValue({ status: 400, body: { error: "mode must be one of: default, gha, fly, local, shadow" } });
-      const result = await setRunnerModeTool(fakeContext("set_runner_mode"), { caller: admin, args: { mode: "bogus" } });
+      const runCalls: RunCall[] = [];
+      const result = await setRunnerModeTool(fakeContext("set_runner_mode", runCalls), { caller: admin, args: { mode: "bogus" } });
       expect(setRunnerModeAction).toHaveBeenCalledWith(expect.any(Object), { mode: "bogus" });
       expect(result.isError).toBeUndefined();
       expect(JSON.parse(result.content[0].text)).toEqual({ status: 400, body: { error: "mode must be one of: default, gha, fly, local, shadow" } });
+      expect(runCalls).toEqual([{
+        name: "set-runner-mode",
+        options: { maxRetryAttempts: 1 },
+        result: { status: 400, body: { error: "mode must be one of: default, gha, fly, local, shadow" } },
+      }]);
     });
   });
 
@@ -709,28 +764,64 @@ describe("migrated write handlers (AII-713)", () => {
       expect(pauseProjectAction).not.toHaveBeenCalled();
     });
 
-    it("calls pauseProjectAction with teamKey and paused, returning its result verbatim", async () => {
+    it("calls pauseProjectAction through ctx.run with teamKey and paused, returning its result verbatim", async () => {
       (pauseProjectAction as ReturnType<typeof vi.fn>).mockReturnValue({ status: 200, body: { updated: true, paused: true } });
-      const result = await pauseProjectTool(fakeContext("pause_project"), { caller: admin, args: { teamKey: "AII", paused: true } });
+      const runCalls: RunCall[] = [];
+      const result = await pauseProjectTool(fakeContext("pause_project", runCalls), { caller: admin, args: { teamKey: "AII", paused: true } });
       expect(pauseProjectAction).toHaveBeenCalledWith("AII", true);
       expect(JSON.parse(result.content[0].text)).toEqual({ status: 200, body: { updated: true, paused: true } });
+      expect(runCalls).toEqual([{
+        name: "pause-project",
+        options: { maxRetryAttempts: 1 },
+        result: { status: 200, body: { updated: true, paused: true } },
+      }]);
+    });
+
+    it("answers isError with the wrapper's standard wording when ctx.run rejects with a TerminalError", async () => {
+      (pauseProjectAction as ReturnType<typeof vi.fn>).mockClear();
+      const failingCtx = {
+        request: () => ({ target: { handler: "pause_project" } }),
+        run: async () => {
+          throw new restate.TerminalError("pause rejected");
+        },
+      } as unknown as restate.Context;
+
+      const result = await pauseProjectTool(failingCtx, { caller: admin, args: { teamKey: "AII", paused: true } });
+
+      expect(result).toEqual({
+        isError: true,
+        content: [{ type: "text", text: "pause_project failed: pause rejected" }],
+      });
+      expect(pauseProjectAction).not.toHaveBeenCalled();
     });
   });
 
   describe("add_project", () => {
-    it("has no separate pre-validation — a partial args object reaches upsertMappingAction, whose own 400 comes back verbatim", async () => {
+    it("has no separate pre-validation — a partial args object reaches upsertMappingAction through ctx.run, whose own 400 comes back verbatim", async () => {
       (upsertMappingAction as ReturnType<typeof vi.fn>).mockReturnValue({ status: 400, body: { error: "teamKey, owner, and repo are required" } });
-      const result = await addProjectTool(fakeContext("add_project"), { caller: admin, args: { teamKey: "AII" } });
+      const runCalls: RunCall[] = [];
+      const result = await addProjectTool(fakeContext("add_project", runCalls), { caller: admin, args: { teamKey: "AII" } });
       expect(upsertMappingAction).toHaveBeenCalledWith({ teamKey: "AII" }, expect.any(Object), expect.any(Object));
       expect(JSON.parse(result.content[0].text)).toEqual({ status: 400, body: { error: "teamKey, owner, and repo are required" } });
+      expect(runCalls).toEqual([{
+        name: "upsert-mapping",
+        options: { maxRetryAttempts: 1 },
+        result: { status: 400, body: { error: "teamKey, owner, and repo are required" } },
+      }]);
     });
 
     it("on a full args set, calls upsertMappingAction and returns its success body verbatim", async () => {
       (upsertMappingAction as ReturnType<typeof vi.fn>).mockReturnValue({ status: 202, body: { teamKey: "AII", syncJobId: 5 } });
       const args = { teamKey: "AII", owner: "org", repo: "repo", defaultBranch: "main" };
-      const result = await addProjectTool(fakeContext("add_project"), { caller: admin, args });
+      const runCalls: RunCall[] = [];
+      const result = await addProjectTool(fakeContext("add_project", runCalls), { caller: admin, args });
       expect(upsertMappingAction).toHaveBeenCalledWith(args, expect.any(Object), expect.any(Object));
       expect(JSON.parse(result.content[0].text)).toEqual({ status: 202, body: { teamKey: "AII", syncJobId: 5 } });
+      expect(runCalls).toEqual([{
+        name: "upsert-mapping",
+        options: { maxRetryAttempts: 1 },
+        result: { status: 202, body: { teamKey: "AII", syncJobId: 5 } },
+      }]);
     });
 
     // AII-720: the tool description promises "pass null to reset to the default" for
@@ -768,11 +859,17 @@ describe("migrated write handlers (AII-713)", () => {
       expect(triggerWorkflowSyncAction).not.toHaveBeenCalled();
     });
 
-    it("calls triggerWorkflowSyncAction with teamKey, returning its result verbatim", async () => {
+    it("calls triggerWorkflowSyncAction through ctx.run with teamKey, returning its result verbatim", async () => {
       (triggerWorkflowSyncAction as ReturnType<typeof vi.fn>).mockReturnValue({ status: 202, body: { teamKey: "AII", syncJobId: 7 } });
-      const result = await triggerWorkflowSyncTool(fakeContext("trigger_workflow_sync"), { caller: admin, args: { teamKey: "AII" } });
+      const runCalls: RunCall[] = [];
+      const result = await triggerWorkflowSyncTool(fakeContext("trigger_workflow_sync", runCalls), { caller: admin, args: { teamKey: "AII" } });
       expect(triggerWorkflowSyncAction).toHaveBeenCalledWith(expect.any(Object), "AII");
       expect(JSON.parse(result.content[0].text)).toEqual({ status: 202, body: { teamKey: "AII", syncJobId: 7 } });
+      expect(runCalls).toEqual([{
+        name: "trigger-workflow-sync",
+        options: { maxRetryAttempts: 1 },
+        result: { status: 202, body: { teamKey: "AII", syncJobId: 7 } },
+      }]);
     });
   });
 
@@ -783,12 +880,70 @@ describe("migrated write handlers (AII-713)", () => {
       expect(clearDedupEntryAction).not.toHaveBeenCalled();
     });
 
-    it("calls clearDedupEntryAction with issueId, returning its result verbatim", async () => {
+    it("calls clearDedupEntryAction through ctx.run with issueId, returning its result verbatim", async () => {
       (clearDedupEntryAction as ReturnType<typeof vi.fn>).mockReturnValue({ status: 200, body: { deleted: true } });
-      const result = await clearDispatchDedupTool(fakeContext("clear_dispatch_dedup"), { caller: admin, args: { issueId: "uuid-1" } });
+      const runCalls: RunCall[] = [];
+      const result = await clearDispatchDedupTool(fakeContext("clear_dispatch_dedup", runCalls), { caller: admin, args: { issueId: "uuid-1" } });
       expect(clearDedupEntryAction).toHaveBeenCalledWith("uuid-1");
       expect(JSON.parse(result.content[0].text)).toEqual({ status: 200, body: { deleted: true } });
+      expect(runCalls).toEqual([{
+        name: "clear-dedup-entry",
+        options: { maxRetryAttempts: 1 },
+        result: { status: 200, body: { deleted: true } },
+      }]);
     });
+
+    it("answers isError with the wrapper's standard wording when ctx.run rejects with a TerminalError", async () => {
+      (clearDedupEntryAction as ReturnType<typeof vi.fn>).mockClear();
+      const failingCtx = {
+        request: () => ({ target: { handler: "clear_dispatch_dedup" } }),
+        run: async () => {
+          throw new restate.TerminalError("dedup delete rejected");
+        },
+      } as unknown as restate.Context;
+
+      const result = await clearDispatchDedupTool(failingCtx, { caller: admin, args: { issueId: "uuid-1" } });
+
+      expect(result).toEqual({
+        isError: true,
+        content: [{ type: "text", text: "clear_dispatch_dedup failed: dedup delete rejected" }],
+      });
+      expect(clearDedupEntryAction).not.toHaveBeenCalled();
+    });
+  });
+});
+
+// ---- AII-717: every write's tool() options object declares the retry policy that keeps a
+// dead attempt from ever being re-delivered; no read handler does. Read off the handler
+// function's own closed-over options isn't possible from outside the module, so this checks
+// the same thing restate-boundary.test.ts's static check does — the declaration is present in
+// source — for the six write definitions specifically, plus a negative check on a read.
+describe("retryPolicy declarations (AII-717)", () => {
+  const TOOLS_SOURCE = readFileSync("src/restate/tools.ts", "utf8");
+
+  function optionsBlockFor(exportName: string): string {
+    const start = TOOLS_SOURCE.indexOf(`export const ${exportName} = tool(`);
+    if (start === -1) throw new Error(`could not locate export const ${exportName} = tool( in src/restate/tools.ts`);
+    const end = TOOLS_SOURCE.indexOf("\n  async (", start);
+    if (end === -1) throw new Error(`could not locate the handler body following ${exportName}'s options`);
+    return TOOLS_SOURCE.slice(start, end);
+  }
+
+  it.each([
+    "triggerKgRefreshTool",
+    "setRunnerModeTool",
+    "pauseProjectTool",
+    "addProjectTool",
+    "triggerWorkflowSyncTool",
+    "clearDispatchDedupTool",
+  ])("%s declares retryPolicy: { maxAttempts: 1, onMaxAttempts: \"kill\" }", (exportName) => {
+    const block = optionsBlockFor(exportName);
+    expect(block).toMatch(/retryPolicy:\s*\{\s*maxAttempts:\s*1,\s*onMaxAttempts:\s*"kill"\s*\}/);
+  });
+
+  it("a read handler (get_tenant_health) declares no retryPolicy", () => {
+    const block = optionsBlockFor("getTenantHealth");
+    expect(block).not.toContain("retryPolicy");
   });
 });
 

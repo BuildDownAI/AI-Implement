@@ -937,6 +937,12 @@ describe("refresh grant — auth events", () => {
     const res = new MockResponse();
     await mcpOauth.handleMcpTokenRequest(makeRefreshReq(refreshToken, clientId), asRes(res));
     expect(res.statusCode).toBe(503);
+    // The allowlist outage is distinct from a Restate outage (AII-718): the SQLite path's
+    // only "unavailable" case is the allowlist, so it always answers temporarily_unavailable.
+    expect(JSON.parse(res.body)).toEqual({
+      error: "temporarily_unavailable",
+      error_description: "Access control is unavailable",
+    });
 
     const events = authEvents.listAuthEvents().filter((e) => e.cause === "unavailable");
     expect(events).toHaveLength(1);

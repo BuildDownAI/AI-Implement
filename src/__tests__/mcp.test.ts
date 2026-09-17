@@ -108,8 +108,18 @@ const DISCOVERED_TOOLS = Object.keys(TOOL_HANDLERS).map((name) => ({
   role: (WRITE_TOOL_NAMES.has(name) ? "admin" : "user") as "admin" | "user",
 }));
 
+// AII-717: every write handler now runs its side effect through ctx.run — this fake just
+// invokes the closure immediately and returns its result, the same first-attempt behaviour a
+// real (non-replayed) Restate invocation has. Replay-specific behaviour is exercised only at
+// the Restate tier (tools.restate.test.ts's alwaysReplay counter fixture).
 function fakeRestateContext(handlerName: string): restate.Context {
-  return { request: () => ({ target: { handler: handlerName } }) } as unknown as restate.Context;
+  return {
+    request: () => ({ target: { handler: handlerName } }),
+    run: async (name: unknown, action?: unknown) => {
+      const fn = typeof name === "function" ? (name as () => unknown) : (action as () => unknown);
+      return fn();
+    },
+  } as unknown as restate.Context;
 }
 
 vi.mock("../mcp-oauth.js", () => ({

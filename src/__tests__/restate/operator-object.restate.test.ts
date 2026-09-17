@@ -195,6 +195,35 @@ describe("Operator object", () => {
     },
   );
 
+  it.each(VARIANTS.map(([label]) => label))(
+    "identity returns sub and provider and no hash; a subsequent refresh with the current hash rotates (%s, AII-718)",
+    async (label) => {
+      const env = environments.get(label);
+      if (!env) throw new Error(`environment "${label}" did not start`);
+      const key = randomUUID();
+      const hash = sha256(randomUUID());
+      await callObject(
+        env.baseUrl(),
+        "Operator",
+        key,
+        "issue",
+        issueBody({ hash, sub: "google|identity-test", provider: "google", email: "identity-test@eudoxus.ai" }),
+      );
+
+      const identityResult = await callObject<Record<string, unknown>>(env.baseUrl(), "Operator", key, "identity", {});
+      expect(Object.keys(identityResult).sort()).toEqual(["email", "expiresAt", "provider", "sub"]);
+      expect(identityResult.email).toBe("identity-test@eudoxus.ai");
+      expect(identityResult.sub).toBe("google|identity-test");
+      expect(identityResult.provider).toBe("google");
+      expect(identityResult).not.toHaveProperty("hash");
+      expect(identityResult).not.toHaveProperty("currentHash");
+      expect(identityResult).not.toHaveProperty("rotatedAt");
+
+      const refreshed = await callObject<RefreshResult>(env.baseUrl(), "Operator", key, "refresh", { presentedHash: hash });
+      expect(refreshed.status).toBe("ok");
+    },
+  );
+
   it("state after issue then two refresh calls is equivalent whether or not the server forces replay", async () => {
     async function runSequence(env: RestateTestEnvironment): Promise<{
       rotateStatus: string;

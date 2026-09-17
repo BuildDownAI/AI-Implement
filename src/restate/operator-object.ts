@@ -74,6 +74,20 @@ interface DescribeResult {
 }
 
 /**
+ * The pre-rotation identity read (AII-718): `sub` and `provider` alongside `email` so
+ * `RestateRefreshAuthority.rotate` can run the allowlist check before calling `refresh`,
+ * without adding a hash field that would let a read leak what only `refresh` should mint.
+ * Kept separate from `describe` (AII-714, backing `get_session_identity`) rather than
+ * extending it, so `describe`'s response shape stays exactly what that caller already relies on.
+ */
+interface IdentityResult {
+  email: string | null;
+  sub: string | null;
+  provider: string | null;
+  expiresAt: number | null;
+}
+
+/**
  * The state-table branch, as a pure function of state and time (docs/restate.md's
  * "operator rule": state-table branches are unit-tested with the Restate client
  * injected as a fake, so the exact grace-window boundary is testable without a real
@@ -181,6 +195,21 @@ async function describe(ctx: ObjectSharedContext): Promise<DescribeResult> {
   };
 }
 
+async function identity(ctx: ObjectSharedContext): Promise<IdentityResult> {
+  const [email, sub, provider, family] = await Promise.all([
+    ctx.get<string>("email"),
+    ctx.get<string>("sub"),
+    ctx.get<string>("provider"),
+    ctx.get<FamilyState>("family"),
+  ]);
+  return {
+    email: email ?? null,
+    sub: sub ?? null,
+    provider: provider ?? null,
+    expiresAt: family?.expiresAt ?? null,
+  };
+}
+
 export const operatorObject = restate.object({
   name: "Operator",
   handlers: {
@@ -188,6 +217,7 @@ export const operatorObject = restate.object({
     refresh,
     revoke,
     describe: restate.handlers.object.shared(describe),
+    identity: restate.handlers.object.shared(identity),
   },
 });
 
@@ -262,6 +292,17 @@ export class RestateRefreshAuthority implements RefreshAuthority {
     return { status: "ok", refreshToken };
   }
 
+  /**
+   * Ordered so nothing durable changes before every local check has passed (AII-718): the
+   * identity read (`identity`, shared, no lock) comes first, then the allowlist re-check,
+   * and only then the exclusive `refresh` handler — which is the one call that rotates the
+   * family — followed by the SQLite insert. The previous order rotated first and read the
+   * allowlist after; if the allowlist read or the insert then failed, the caller got a 503
+   * having already lost its current refresh token, and its retry (presenting the
+   * now-previous hash) landed outside `GRACE_MS` often enough to be treated as replay and
+   * wipe the family. Reversing the order means a failed check leaves the family exactly as
+   * it was, so a retry presents the same hash and succeeds normally.
+   */
   async rotate(input: RefreshInput): Promise<RefreshOutcome> {
     const start = Date.now();
     const clientId = input.clientId;
@@ -284,11 +325,53 @@ export class RestateRefreshAuthority implements RefreshAuthority {
       });
     };
 
+    // Step 1: read identity through the shared, non-mutating handler. Nothing durable
+    // changes yet — a Restate outage here mutates nothing.
+    const who = await this.invoke<IdentityResult>(clientId, "identity", {});
+    if (who === "unavailable") {
+      emit("unavailable");
+      return { status: "unavailable", cause: "restate" };
+    }
+    if (who.email === null && who.sub === null && who.provider === null) {
+      // No family was ever issued for this client id, or it was already fully revoked
+      // (`identity` returns every field null in both cases). decideRefresh's own "no
+      // family" branch treats this as replay rather than denial, since there is no
+      // identity to deny or family to revoke; check for it here too so an unknown or
+      // garbage client id maps to the same outcome the pre-AII-718 refresh-first order
+      // produced, instead of a spurious "denied" plus a revoke call against nothing.
+      emit("replay");
+      return { status: "replay" };
+    }
+
+    // Step 2: allowlist re-check on that identity (fail-closed: a removed user must not
+    // outlive their access token). AII-687's rule: the allowlist re-check stays the
+    // revocation path — mirrored from SqliteRefreshAuthority.rotate. Still nothing durable
+    // changed — an unreadable list or a denial both leave the family untouched.
+    const allowlist = getEffectiveAllowlist();
+    const knownIdentity = who.email ? { email: who.email } : undefined;
+    if (!allowlist) {
+      // Do NOT revoke here — a transient read failure is not a removal.
+      console.error("[mcp-oauth] refresh deferred: the access list could not be loaded");
+      emit("unavailable", knownIdentity);
+      return { status: "unavailable", cause: "allowlist" };
+    }
+    if (!matchAccessEntry({ email: who.email, sub: who.sub ?? "", provider: who.provider ?? "" }, allowlist.entries)) {
+      await this.invoke(clientId, "revoke", {});
+      console.warn(`[mcp-oauth] refresh denied: ${who.email ?? "unknown identity"} no longer on allowlist`);
+      emit("allowlist", knownIdentity);
+      return { status: "denied", description: "Identity no longer authorized" };
+    }
+
+    // Step 3: only now, with every local check passed, rotate the family. This is the one
+    // durable write in the whole call — the SQLite insert just below is the one remaining
+    // fallible step after it, and a SQLITE_BUSY there is covered by the GRACE_MS window (a
+    // client retry inside it presents the pre-rotation hash and gets the same pair back,
+    // via decideRefresh's "concurrent" branch, rather than being treated as replay).
     const presentedHash = sha256(input.refreshToken);
     const result = await this.invoke<RefreshHandlerResult>(clientId, "refresh", { presentedHash });
     if (result === "unavailable") {
       emit("unavailable");
-      return { status: "unavailable" };
+      return { status: "unavailable", cause: "restate" };
     }
     if (result.status === "replay") {
       emit("replay");
@@ -297,23 +380,6 @@ export class RestateRefreshAuthority implements RefreshAuthority {
     if (result.status === "expired") {
       emit("expired");
       return { status: "expired" };
-    }
-
-    // Allowlist re-check (fail-closed: a removed user must not outlive their access token).
-    // AII-687's rule: the allowlist re-check stays the revocation path — mirrored from
-    // SqliteRefreshAuthority.rotate.
-    const allowlist = getEffectiveAllowlist();
-    if (!allowlist) {
-      // Do NOT revoke here — a transient read failure is not a removal.
-      console.error("[mcp-oauth] refresh deferred: the access list could not be loaded");
-      emit("unavailable", { email: result.email });
-      return { status: "unavailable" };
-    }
-    if (!matchAccessEntry({ email: result.email, sub: result.sub, provider: result.provider }, allowlist.entries)) {
-      await this.invoke(clientId, "revoke", {});
-      console.warn(`[mcp-oauth] refresh denied: ${result.email} no longer on allowlist`);
-      emit("allowlist", { email: result.email });
-      return { status: "denied", description: "Identity no longer authorized" };
     }
 
     const now = Date.now();

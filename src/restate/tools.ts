@@ -61,6 +61,14 @@ interface ToolOptions<I extends z.ZodType> {
   description: string;
   input: I;
   role: AccessRole;
+  /**
+   * Only a write (`role: "admin"`) handler sets this — `{ maxAttempts: 1, onMaxAttempts: "kill" }`
+   * (AII-717, ADR 025 amendment). An attempt that dies with the orchestrator process is killed
+   * rather than re-delivered, so a crash can never cause Restate to run the handler body a
+   * second time. Paired with `ctx.run` around the handler's own side effect (docs/restate.md
+   * § "Every side effect in a handler goes inside `ctx.run`, and a tool handler never retries").
+   */
+  retryPolicy?: restate.RetryPolicy;
 }
 
 function wireInputSchema<I extends z.ZodType>(input: I) {
@@ -107,6 +115,7 @@ export function tool<I extends z.ZodType>(
       input: serde.zod(wireInput),
       output: serde.zod(ToolResponse),
       metadata: { "mcp.type": "tool", "mcp.role": opts.role },
+      retryPolicy: opts.retryPolicy,
     },
     async (ctx: restate.Context, input: WireInput<I>): Promise<ToolResponse> => {
       const name = ctx.request().target.handler;
@@ -546,17 +555,21 @@ export const triggerKgRefreshTool = tool(
       ),
     }),
     role: "admin",
+    retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },
   },
-  async (_ctx, input): Promise<ToolResponse> => {
+  async (ctx, input): Promise<ToolResponse> => {
     const handle = getActiveKgRefresh();
     if (!handle) {
       throw new Error("KG refresh is not configured");
     }
-    const result = await handle.trigger({
-      dryRun: input.args.dryRun === true,
-      acceptNewBaseline: input.args.acceptNewBaseline === true,
-      actorEmail: input.caller.email ?? undefined,
-    });
+    const dryRun = input.args.dryRun === true;
+    const acceptNewBaseline = input.args.acceptNewBaseline === true;
+    const actorEmail = input.caller.email ?? undefined;
+    const result = await ctx.run(
+      "kg-refresh-trigger",
+      () => handle.trigger({ dryRun, acceptNewBaseline, actorEmail }),
+      { maxRetryAttempts: 1 },
+    );
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   },
 );
@@ -573,14 +586,17 @@ export const setRunnerModeTool = tool(
       ),
     }),
     role: "admin",
+    retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },
   },
-  async (_ctx, input): Promise<ToolResponse> => {
+  async (ctx, input): Promise<ToolResponse> => {
     if (typeof input.args.mode !== "string") {
       return { content: [{ type: "text", text: JSON.stringify({ status: 400, body: { error: "mode is required" } }, null, 2) }] };
     }
     // The mode set is not repeated here: setRunnerModeAction validates with isRunnerMode, the
     // same check POST /api/runner-mode runs, so the tool answers what the route answers.
-    const result = setRunnerModeAction(mcpAdminConfig(), { mode: input.args.mode });
+    const config = mcpAdminConfig();
+    const mode = input.args.mode;
+    const result = await ctx.run("set-runner-mode", () => setRunnerModeAction(config, { mode }), { maxRetryAttempts: 1 });
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   },
 );
@@ -596,15 +612,18 @@ export const pauseProjectTool = tool(
       paused: z.boolean().optional().describe("Whether dispatch for this project should be paused"),
     }),
     role: "admin",
+    retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },
   },
-  async (_ctx, input): Promise<ToolResponse> => {
+  async (ctx, input): Promise<ToolResponse> => {
     if (typeof input.args.teamKey !== "string" || !input.args.teamKey) {
       return { content: [{ type: "text", text: JSON.stringify({ status: 400, body: { error: "teamKey is required" } }, null, 2) }] };
     }
     if (typeof input.args.paused !== "boolean") {
       return { content: [{ type: "text", text: JSON.stringify({ status: 400, body: { error: "paused is required" } }, null, 2) }] };
     }
-    const result = pauseProjectAction(input.args.teamKey, input.args.paused);
+    const teamKey = input.args.teamKey;
+    const paused = input.args.paused;
+    const result = await ctx.run("pause-project", () => pauseProjectAction(teamKey, paused), { maxRetryAttempts: 1 });
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   },
 );
@@ -664,12 +683,16 @@ export const addProjectTool = tool(
     description: ADD_PROJECT_DESCRIPTION,
     input: addProjectArgsSchema,
     role: "admin",
+    retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },
   },
-  async (_ctx, input): Promise<ToolResponse> => {
+  async (ctx, input): Promise<ToolResponse> => {
     // teamKey/owner/repo/defaultBranch are validated by upsertMappingAction itself (the same
     // 400 text) — no separate pre-check here, unlike the other four writes, whose actions
     // don't validate their own required fields.
-    const result = upsertMappingAction(input.args as UpsertMappingBody, mcpAdminConfig(), providerRegistryForTools());
+    const args = input.args as UpsertMappingBody;
+    const config = mcpAdminConfig();
+    const registry = providerRegistryForTools();
+    const result = await ctx.run("upsert-mapping", () => upsertMappingAction(args, config, registry), { maxRetryAttempts: 1 });
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   },
 );
@@ -684,12 +707,15 @@ export const triggerWorkflowSyncTool = tool(
       teamKey: z.string().optional().describe("Team key of the mapping"),
     }),
     role: "admin",
+    retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },
   },
-  async (_ctx, input): Promise<ToolResponse> => {
+  async (ctx, input): Promise<ToolResponse> => {
     if (typeof input.args.teamKey !== "string" || !input.args.teamKey) {
       return { content: [{ type: "text", text: JSON.stringify({ status: 400, body: { error: "teamKey is required" } }, null, 2) }] };
     }
-    const result = triggerWorkflowSyncAction(mcpAdminConfig(), input.args.teamKey);
+    const config = mcpAdminConfig();
+    const teamKey = input.args.teamKey;
+    const result = await ctx.run("trigger-workflow-sync", () => triggerWorkflowSyncAction(config, teamKey), { maxRetryAttempts: 1 });
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   },
 );
@@ -704,12 +730,14 @@ export const clearDispatchDedupTool = tool(
       issueId: z.string().optional().describe("The tracker issue id (not the human identifier) of the dedup entry"),
     }),
     role: "admin",
+    retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },
   },
-  async (_ctx, input): Promise<ToolResponse> => {
+  async (ctx, input): Promise<ToolResponse> => {
     if (typeof input.args.issueId !== "string" || !input.args.issueId) {
       return { content: [{ type: "text", text: JSON.stringify({ status: 400, body: { error: "issueId is required" } }, null, 2) }] };
     }
-    const result = clearDedupEntryAction(input.args.issueId);
+    const issueId = input.args.issueId;
+    const result = await ctx.run("clear-dedup-entry", () => clearDedupEntryAction(issueId), { maxRetryAttempts: 1 });
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   },
 );
