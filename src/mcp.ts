@@ -1,15 +1,10 @@
 import http from "node:http";
-import type { PreflightCheckResult, KgRefreshStatus } from "./kg-refresh.js";
-import { verifyMcpToken } from "./mcp-oauth.js";
-import { getRunnerMode, VALID_RUNNER_MODES } from "./runner-mode.js";
-import { getMappings } from "./config.js";
-import { getInFlightJobs, getRunRecordMergeVerdict } from "./log.js";
-import { getDb } from "./dedup.js";
-import { getIssueReportCard, getFleetReport } from "./report-card.js";
-import { isKgDegraded } from "./deploy-notify.js";
+import { verifyMcpToken, resolveClientPath, getRefreshExpiry } from "./mcp-oauth.js";
+import { recordAuthEvent, type AuthEventCause } from "./mcp-auth-events.js";
 import { recheckIdentity, type AccessRole } from "./access-entries.js";
-import { type MemoryProvider, KG_TOOL_CAPABILITY, sidecarHealthFields } from "./kg-provider.js";
-import { getDeployPosture } from "./deploy-posture.js";
+import { type MemoryProvider, KG_TOOL_CAPABILITY } from "./kg-provider.js";
+import type { Caller } from "./mcp-identity.js";
+import { discoverTools, callTool } from "./restate/tools-client.js";
 
 interface JsonRpcRequest {
   jsonrpc?: string;
@@ -34,506 +29,133 @@ function bufferBody(req: http.IncomingMessage): Promise<Buffer> {
 
 // ---- Orchestrator-native diagnostic tools ----
 
-const DIAG_TOOLS = [
-  {
-    name: "get_tenant_health",
-    description:
-      "Returns an orchestrator health summary: runner mode, in-flight job count, pending gap-fill queue count, project count, and (when a KG source repo is configured) a live credential preflight for the kg-refresh rail (`kgRefreshPreflight` with one row per repo and grant). Use as a first-pass check before digging deeper.",
-    inputSchema: { type: "object", properties: {} },
-  },
-  {
-    name: "get_runner_mode",
-    description:
-      "Returns the current global runner mode (default/gha/fly/local/shadow) and whether it came from an env var, database setting, or built-in default.",
-    inputSchema: { type: "object", properties: {} },
-  },
-  {
-    name: "list_projects",
-    description:
-      "Lists all configured project mappings: team key, repo, execution mode, provider, paused state, and per-project capacity cap.",
-    inputSchema: { type: "object", properties: {} },
-  },
-  {
-    name: "list_in_flight_jobs",
-    description:
-      "Lists all currently dispatching or running jobs with their issue identifier, repo, phase, and elapsed seconds since dispatch.",
-    inputSchema: { type: "object", properties: {} },
-  },
-  {
-    name: "get_issue_dispatch_status",
-    description:
-      "Returns the dispatch status for a specific issue identifier (e.g. 'AII-123'): in-flight flag, dedup-window flag, and the last five dispatch log entries. Use this to diagnose why a ticket is not being picked up.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        identifier: { type: "string", description: "Issue identifier, e.g. 'AII-123'" },
-      },
-      required: ["identifier"],
-    },
-  },
-  {
-    name: "get_issue_report_card",
-    description:
-      "Returns a full report card for a specific issue: all dispatch runs with per-pass telemetry, totals (dispatches, passes, cost), approval/merge/escape status, gap-fill rounds, and review-fix rounds. Use this to understand the full history and outcome of an issue.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        issue: { type: "string", description: "Issue identifier, e.g. 'AII-123'" },
-      },
-      required: ["issue"],
-    },
-  },
-  {
-    name: "get_fleet_report",
-    description:
-      "Returns an aggregated fleet report: per-repo job/issue/cost/pass counts, one-shot and eventual approval rates, planning A/B cohort comparison, review escape rate, and a ranked list of runaway issues. Optional `days` parameter (default 30) controls the look-back window.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        days: { type: "number", description: "Look-back window in days (default 30)" },
-      },
-    },
-  },
-  {
-    name: "get_deploy_posture",
-    description:
-      "Returns the current deploy posture: whether autoDeploy is on, the watched repo/branch, running vs head commit, deploy hold and in-flight state, runner channel image and commit, and a mergeCost field summarising the landing cost of a merge (deploy+image / image / none). Use this before filing or merging to understand the blast radius.",
-    inputSchema: { type: "object", properties: {} },
-  },
-  {
-    name: "get_kg_status",
-    description:
-      "Returns the KG refresh rail state: stage (idle | staging | ingest-running | serving | reverted | failed), the served snapshot stamp, the materialize path the next refresh will stage (rdflib | direct), and the last refresh outcome with its gate. Poll it after `POST /api/kg/refresh`.",
-    inputSchema: { type: "object", properties: {} },
-  },
-  {
-    name: "get_session_identity",
-    description:
-      "Returns the caller's email, sign-in provider, and role (user | admin | null when the identity has no allowlist entry) as the allowlist resolves them now. Admin-only skills call this first.",
-    inputSchema: { type: "object", properties: {} },
-  },
-];
+// get_session_identity is the one read tool that stays here rather than moving onto the
+// orchestratorTools Restate service (AII-711): it reports the door's own state (the
+// identity/role this very request resolved to), which only exists at this layer.
+const GET_SESSION_IDENTITY_TOOL = {
+  name: "get_session_identity",
+  description:
+    "Returns the caller's email, sign-in provider, and role (user | admin | null when the identity has no allowlist entry) as the allowlist resolves them now. Admin-only skills call this first.",
+  inputSchema: { type: "object", properties: {} },
+};
 
-const DIAG_TOOL_NAMES = new Set(DIAG_TOOLS.map((t) => t.name));
+// Tool names bound to the orchestratorTools Restate service (src/restate/tools.ts).
+// tools/call routes a name in this set through callTool(); tools/list sources every
+// discoverable tool's description/schema live from discoverTools() rather than duplicating
+// it here — get_session_identity above is the sole read tool that isn't in this set (AII-711).
+// The six writes joined this set in AII-713: their role ("admin"), schema, and run body now
+// live on the handler itself (src/restate/tools.ts), not in this file — see
+// docs/adr/015-mcp-reads-open-writes-declared.md.
+// `params._meta.idempotencyKey` (AII-719, corrected 2026-09-17 on the AII-687 gate) is
+// checked against IDEMPOTENCY_KEY_SHAPE (below, shared with src/admin.ts so the two doors
+// cannot drift), scoped by the caller's identity with scopeIdempotencyKey (below), and then
+// forwarded to callTool. `/mcp` is stateless — it has no session id and MCP clients restart
+// their JSON-RPC ids on every connection — so nothing in a request names "one connection's
+// attempt at this call" except what the caller states explicitly. A key derived from the
+// access token's issue time and the JSON-RPC id (the prior design) let a second connection's
+// write inside the same token lifetime collide with the first: proven live with
+// `set_runner_mode` (a later connection's `id: 7` answered the first connection's cached
+// result and changed nothing). A derived key protects the wrong thing — a client retry of one
+// call whose response was lost — when MCP clients don't retry `tools/call` on their own; a
+// repeat is a human or script expressing a new intent unless they say otherwise via this field.
 
-// ---- Orchestrator-native write tools ----
-// The entire write surface of /mcp: a tool is a write only if it is declared here, and each
-// declaration names the role required to call it. See docs/adr/015-mcp-reads-open-writes-declared.md.
+/**
+ * Shape for a caller-supplied idempotency key (AII-719): the same check on both doors —
+ * `/mcp`'s `tools/call` (`params._meta.idempotencyKey`) and `POST /api/tools/<name>`'s
+ * `Idempotency-Key` header. It lives here, not in src/restate/tools-client.ts, because
+ * src/admin.ts may import Restate modules as types only (src/__tests__/restate-boundary.test.ts)
+ * and already imports RESTATE_WRITE_TOOL_NAMES from this file.
+ */
+export const IDEMPOTENCY_KEY_SHAPE = /^[A-Za-z0-9._:-]{1,128}$/;
 
-interface WriteToolContext {
-  triggerKgRefresh?: (dryRun?: boolean, acceptNewBaseline?: boolean, actorEmail?: string) => Promise<{ status: number; body: Record<string, unknown> }>;
-  /** Caller's email, for write tools (trigger_kg_refresh's acceptNewBaseline) that need to attribute a consequential action. */
-  actorEmail?: string;
-  setRunnerMode?: (patch: { mode?: string }) => { status: number; body: Record<string, unknown> };
-  pauseProject?: (teamKey: string, paused: boolean) => { status: number; body: Record<string, unknown> };
-  addProject?: (body: Record<string, unknown>) => { status: number; body: Record<string, unknown> };
-  triggerWorkflowSync?: (teamKey: string) => { status: number; body: Record<string, unknown> };
-  clearDispatchDedup?: (issueId: string) => { status: number; body: Record<string, unknown> };
+/**
+ * The key that reaches Restate: the caller's identity, then the caller's own key. Restate scopes
+ * a key by (service, handler, key) and has no notion of caller, so two callers that reuse one
+ * literal key for the same write would otherwise attach to each other's cached result and the
+ * second write would silently not run. The caller still names the request — its key is the
+ * suffix, unchanged — and the prefix only keeps one caller's keys apart from another's.
+ */
+export function scopeIdempotencyKey(callerId: string, supplied: string): string {
+  return `${callerId}:${supplied}`;
 }
 
-export interface WriteTool {
-  name: string;
-  description: string;
-  inputSchema: Record<string, unknown>;
-  role: AccessRole;
-  run: (
-    args: Record<string, unknown>,
-    context: WriteToolContext,
-  ) => Promise<{ status: number; body: Record<string, unknown> }>;
-}
+const RESTATE_TOOL_NAMES = new Set([
+  "get_tenant_health",
+  "get_runner_mode",
+  "list_projects",
+  "get_project_binding",
+  "list_in_flight_jobs",
+  "get_issue_dispatch_status",
+  "get_issue_report_card",
+  "get_fleet_report",
+  "get_deploy_posture",
+  "get_kg_status",
+  "kg_hybrid_search",
+  "kg_search",
+  "kg_semantic_search",
+  "kg_neighbors",
+  "kg_provenance",
+  "kg_path",
+  "trigger_kg_refresh",
+  "set_runner_mode",
+  "pause_project",
+  "add_project",
+  "trigger_workflow_sync",
+  "clear_dispatch_dedup",
+]);
+
+// The subset of RESTATE_TOOL_NAMES that mutates state. Not a role declaration — that lives on
+// each handler's own `mcp.role` metadata and is asserted inside the tool() wrapper regardless
+// of how a call reaches it. This list exists only to decide which calls carry an idempotency
+// key (below): attaching one to a read would make a client's identical retry of a genuine
+// re-poll return a stale cached answer instead of running again, which reads never wanted.
+export const RESTATE_WRITE_TOOL_NAMES = new Set([
+  "trigger_kg_refresh",
+  "set_runner_mode",
+  "pause_project",
+  "add_project",
+  "trigger_workflow_sync",
+  "clear_dispatch_dedup",
+]);
 
 // admin is a strict superset of user (docs/access-model.md § Roles): an entry's role satisfies
-// a requirement when it matches exactly or is admin.
+// a requirement when it matches exactly or is admin. Used only for the tools/list courtesy
+// filter below — the boundary itself is the tool() wrapper's own copy (src/restate/tools.ts).
 const roleAllows = (have: AccessRole | null, need: AccessRole): boolean =>
   have === "admin" || have === need;
-
-// Exported so tests can verify the admin-superset rule against a role: "user" entry without a
-// second write tool existing in production — see mcp.test.ts's "admin is a superset of user" case.
-export const WRITE_TOOLS: WriteTool[] = [
-  {
-    name: "trigger_kg_refresh",
-    description:
-      "Trigger the KG refresh rail (admin role). Same handler as POST /api/kg/refresh: runs the credential preflight, then dispatches the refresh. Poll get_kg_status afterwards. dryRun=true runs the same runner job with kg-snapshot-push's push skipped — all guards run and the guard verdict plus per-part table are reported via get_kg_status, but nothing is pushed, no PR opens, and the served graph never changes. acceptNewBaseline=true downgrades the zero-shrink and 50%-shrink content guards to warnings for this one dispatch and pushes anyway — use only after reviewing a guard refusal's part table and confirming the shrink is an intentional reclassification, not data loss; the accepting identity's email is logged and written into the refresh PR's ### Baseline section.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        dryRun: { type: "boolean", description: "Run the rail without pushing the snapshot or touching the served graph; reports the guard table via get_kg_status." },
-        acceptNewBaseline: { type: "boolean", description: "Push even though a tracked part (issue.nt/comment.nt) shrank or a part dropped below 50% of its previous size — a one-shot override of the zero-shrink guard, applied to this dispatch only." },
-      },
-    },
-    role: "admin",
-    run: async (args, context) => {
-      if (!context.triggerKgRefresh) {
-        throw new Error("KG refresh is not configured");
-      }
-      return context.triggerKgRefresh(args.dryRun === true, args.acceptNewBaseline === true, context.actorEmail);
-    },
-  },
-  {
-    name: "set_runner_mode",
-    description:
-      "Set the global runner mode (admin role). Same handler as POST /api/runner-mode: forces all new dispatches onto the given execution path.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        mode: {
-          type: "string",
-          enum: [...VALID_RUNNER_MODES],
-          description: "Global runner mode: default restores per-project modes, gha/fly force that execution path, shadow dispatches to both without acting on either result, local runs dispatches in local Docker (a developer-machine mode the admin UI does not offer). Validated by the same check as POST /api/runner-mode.",
-        },
-      },
-      required: ["mode"],
-    },
-    role: "admin",
-    run: async (args, context) => {
-      if (!context.setRunnerMode) {
-        throw new Error("set_runner_mode is not configured");
-      }
-      if (typeof args.mode !== "string") {
-        return { status: 400, body: { error: "mode is required" } };
-      }
-      // The mode set is not repeated here: setRunnerModeAction validates with isRunnerMode,
-      // the same check POST /api/runner-mode runs, so the tool answers what the route answers.
-      return context.setRunnerMode({ mode: args.mode });
-    },
-  },
-  {
-    name: "pause_project",
-    description:
-      "Pause or resume a project mapping (admin role). Same as the paused update of PATCH /api/mappings/<teamKey>.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        teamKey: { type: "string", description: "Team key of the mapping" },
-        paused: { type: "boolean", description: "Whether dispatch for this project should be paused" },
-      },
-      required: ["teamKey", "paused"],
-    },
-    role: "admin",
-    run: async (args, context) => {
-      if (!context.pauseProject) {
-        throw new Error("pause_project is not configured");
-      }
-      if (typeof args.teamKey !== "string" || !args.teamKey) {
-        return { status: 400, body: { error: "teamKey is required" } };
-      }
-      if (typeof args.paused !== "boolean") {
-        return { status: 400, body: { error: "paused is required" } };
-      }
-      return context.pauseProject(args.teamKey, args.paused);
-    },
-  },
-  {
-    name: "add_project",
-    description:
-      "Create or update a project mapping (admin role). Same as POST /api/mappings, the mapping upsert behind the admin UI's New project stepper.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        teamKey: { type: "string", description: "Team key, e.g. the Linear team key or Jira project key" },
-        owner: { type: "string", description: "GitHub repo owner/org" },
-        repo: { type: "string", description: "GitHub repo name" },
-        defaultBranch: { type: "string", description: "Base branch PRs are opened against" },
-        workflowFile: { type: "string" },
-        maxInProgressAiIssues: { type: "number" },
-        executionMode: { type: "string", enum: ["github-actions", "fly-machines"] },
-        sessionMode: { type: "string", enum: ["autonomous", "interactive", "hybrid"] },
-        machineCpus: { type: "number" },
-        machineMemoryMb: { type: "number" },
-        planningEnabled: { type: "boolean" },
-        planningWorkflowFile: { type: "string" },
-        autoApprovePlans: { type: "boolean" },
-        autoMerge: { type: "boolean" },
-        extraEnv: { type: "object", description: "Passed through to the model process; visible to the agent" },
-        provider: { type: "string", enum: ["anthropic", "bedrock"] },
-        awsRegion: { type: "string", description: "Required when provider is 'bedrock'" },
-        ticketingProvider: { type: "string" },
-        ticketingConfig: { type: "object" },
-        paused: { type: "boolean" },
-        maxTurns: { type: "number" },
-        maxIterations: { type: "number" },
-        maxJobMinutes: { type: "number" },
-        branchPrefix: { type: "string" },
-        skillsRepo: { type: "string" },
-        referenceRepos: { type: "array" },
-        sensitiveAddPatterns: {
-          description: "String or array of glob strings",
-        },
-        sensitiveAllowPatterns: {
-          description: "String or array of glob strings",
-        },
-        dependencyTokenScope: { type: "string", enum: ["installation"] },
-        reviewers: {
-          type: "array",
-          items: {
-            type: "object",
-            properties: {
-              id: { type: "string" },
-              gates: { type: "boolean" },
-              maxTurns: {
-                type: "integer",
-                minimum: 1,
-                maximum: 200,
-                description: "Optional per-reviewer turn cap. Omit to inherit the reviewer default or global limit.",
-              },
-            },
-            required: ["id", "gates"],
-          },
-          description: "Which reviewers run on this project's PRs. Omit to keep the stored value; pass null to reset to the default (gap-analysis and code-review, both gating).",
-        },
-      },
-      required: ["teamKey", "owner", "repo", "defaultBranch"],
-    },
-    role: "admin",
-    run: async (args, context) => {
-      if (!context.addProject) {
-        throw new Error("add_project is not configured");
-      }
-      if (
-        typeof args.teamKey !== "string" || !args.teamKey ||
-        typeof args.owner !== "string" || !args.owner ||
-        typeof args.repo !== "string" || !args.repo
-      ) {
-        return { status: 400, body: { error: "teamKey, owner, and repo are required" } };
-      }
-      if (typeof args.defaultBranch !== "string" || !args.defaultBranch) {
-        return { status: 400, body: { error: "defaultBranch is required" } };
-      }
-      return context.addProject(args);
-    },
-  },
-  {
-    name: "trigger_workflow_sync",
-    description:
-      "Trigger a workflow-template sync for a project (admin role). Same as POST /api/mappings/<teamKey>/sync-workflows.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        teamKey: { type: "string", description: "Team key of the mapping" },
-      },
-      required: ["teamKey"],
-    },
-    role: "admin",
-    run: async (args, context) => {
-      if (!context.triggerWorkflowSync) {
-        throw new Error("trigger_workflow_sync is not configured");
-      }
-      if (typeof args.teamKey !== "string" || !args.teamKey) {
-        return { status: 400, body: { error: "teamKey is required" } };
-      }
-      return context.triggerWorkflowSync(args.teamKey);
-    },
-  },
-  {
-    name: "clear_dispatch_dedup",
-    description:
-      "Clear a dedup entry so the issue can be re-dispatched (admin role). Same as DELETE /api/dedup/<issueId>.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        issueId: { type: "string", description: "The tracker issue id (not the human identifier) of the dedup entry" },
-      },
-      required: ["issueId"],
-    },
-    role: "admin",
-    run: async (args, context) => {
-      if (!context.clearDispatchDedup) {
-        throw new Error("clear_dispatch_dedup is not configured");
-      }
-      if (typeof args.issueId !== "string" || !args.issueId) {
-        return { status: 400, body: { error: "issueId is required" } };
-      }
-      return context.clearDispatchDedup(args.issueId);
-    },
-  },
-];
-
-async function callDiagnosticTool(
-  name: string,
-  args: Record<string, unknown>,
-  context: {
-    defaultRunnerImage?: string;
-    runKgRefreshPreflight?: () => Promise<PreflightCheckResult>;
-    getKgStatus?: () => Promise<KgRefreshStatus>;
-    sessionIdentity?: { email: string; provider: string; role: AccessRole | null };
-  } = {},
-): Promise<unknown> {
-  switch (name) {
-    case "get_tenant_health": {
-      const { mode, source } = getRunnerMode();
-      const inFlight = getInFlightJobs();
-      const db = getDb();
-      const { n: pendingGapfillCount } = db
-        .prepare("SELECT COUNT(*) as n FROM comment_gapfill_queue WHERE status = 'pending'")
-        .get() as { n: number };
-      const projectCount = Object.keys(getMappings()).length;
-      const kgRefreshPreflight = context.runKgRefreshPreflight
-        ? await context.runKgRefreshPreflight()
-        : null;
-      return {
-        runnerMode: { mode, source },
-        inFlightJobCount: inFlight.length,
-        pendingGapfillCount,
-        projectCount,
-        kgDegraded: isKgDegraded(),
-        ...sidecarHealthFields(),
-        kgRefreshPreflight,
-      };
-    }
-
-    case "get_runner_mode": {
-      const { mode, source } = getRunnerMode();
-      return { mode, source };
-    }
-
-    case "list_projects": {
-      const mappings = getMappings();
-      return Object.entries(mappings).map(([key, m]) => ({
-        teamKey: key,
-        repo: `${m.owner}/${m.repo}`,
-        executionMode: m.executionMode,
-        provider: m.provider,
-        paused: m.paused,
-        planningEnabled: m.planningEnabled,
-        maxInProgressAiIssues: m.maxInProgressAiIssues,
-        defaultBranch: m.defaultBranch,
-        workflowFile: m.workflowFile,
-        sessionMode: m.sessionMode,
-        autoMerge: m.autoMerge,
-        maxTurns: m.maxTurns,
-        maxIterations: m.maxIterations,
-        maxJobMinutes: m.maxJobMinutes,
-        branchPrefix: m.branchPrefix,
-        skillsRepo: m.skillsRepo,
-        referenceRepos: m.referenceRepos,
-        dependencyTokenScope: m.dependencyTokenScope,
-        sensitiveAddPatterns: m.sensitiveAddPatterns,
-        sensitiveAllowPatterns: m.sensitiveAllowPatterns,
-        machineCpus: m.machineCpus,
-        machineMemoryMb: m.machineMemoryMb,
-        awsRegion: m.awsRegion,
-        planningWorkflowFile: m.planningWorkflowFile,
-        autoApprovePlans: m.autoApprovePlans,
-        reviewers: m.reviewers,
-      }));
-    }
-
-    case "list_in_flight_jobs": {
-      const now = Date.now();
-      return getInFlightJobs().map((j) => ({
-        id: j.id,
-        issueIdentifier: j.issueIdentifier,
-        issueTitle: j.issueTitle,
-        repo: j.repo,
-        phase: j.phase,
-        status: j.status,
-        dispatchedAt: j.dispatchedAt,
-        elapsedSeconds: Math.round((now - j.dispatchedAt) / 1000),
-      }));
-    }
-
-    case "get_issue_dispatch_status": {
-      const identifier = args.identifier;
-      if (typeof identifier !== "string" || !identifier) {
-        return { error: "identifier is required and must be a non-empty string" };
-      }
-      const db = getDb();
-      const recentRows = db
-        .prepare(
-          "SELECT id, status, dispatched_at, repo, phase, pr_url, conclusion FROM dispatch_log WHERE issue_identifier = ? ORDER BY dispatched_at DESC LIMIT 5",
-        )
-        .all(identifier) as Array<{
-          id: number;
-          status: string | null;
-          dispatched_at: number;
-          repo: string | null;
-          phase: string | null;
-          pr_url: string | null;
-          conclusion: string | null;
-        }>;
-      const dedupRow = db
-        .prepare("SELECT issue_id, dispatched_at FROM dispatched WHERE issue_identifier = ?")
-        .get(identifier) as { issue_id: string; dispatched_at: number } | undefined;
-      const inFlight = recentRows.some(
-        (j) => j.status === "dispatched" || j.status === "running",
-      );
-      const latestPrUrl = recentRows.find((j) => j.pr_url)?.pr_url ?? null;
-      const mergeVerdict = latestPrUrl
-        ? { verdict: getRunRecordMergeVerdict(identifier, latestPrUrl), prUrl: latestPrUrl }
-        : null;
-      return {
-        identifier,
-        inFlight,
-        inDedupWindow: !!dedupRow,
-        dedupEntry: dedupRow ?? null,
-        mergeVerdict,
-        recentDispatches: recentRows.map((j) => ({
-          id: j.id,
-          status: j.status,
-          dispatchedAt: j.dispatched_at,
-          repo: j.repo,
-          phase: j.phase,
-          prUrl: j.pr_url,
-          conclusion: j.conclusion,
-        })),
-      };
-    }
-
-    case "get_issue_report_card": {
-      const issue = args.issue;
-      if (typeof issue !== "string" || !issue) {
-        return { error: "issue is required and must be a non-empty string" };
-      }
-      const card = getIssueReportCard(issue);
-      if (!card) return { error: `No dispatch records found for issue: ${issue}` };
-      return card;
-    }
-
-    case "get_fleet_report": {
-      const days = typeof args.days === "number" ? args.days : undefined;
-      return getFleetReport({ days });
-    }
-
-    case "get_deploy_posture":
-      return getDeployPosture({ defaultImage: context.defaultRunnerImage });
-
-    case "get_kg_status":
-      return context.getKgStatus ? await context.getKgStatus() : { error: "KG refresh is not configured" };
-
-    case "get_session_identity":
-      return context.sessionIdentity ?? { email: null, provider: null, role: null };
-
-    default:
-      return { error: `Unknown diagnostic tool: ${name}` };
-  }
-}
 
 // ---- Main handler ----
 
 export async function handleMcpRequest(
   req: http.IncomingMessage,
   res: http.ServerResponse,
+  // `provider` is still read by tools/list's kg_* courtesy filter (AII-641); the diagnostic
+  // string is kept in the signature so the boot wiring (src/index.ts) and the tests keep
+  // their positions. AII-715 restructures the door and drops it.
   provider: MemoryProvider | null,
   baseUrl: string | null,
-  providerDiagnostic?: string | null,
-  defaultRunnerImage?: string,
-  runKgRefreshPreflight?: () => Promise<PreflightCheckResult>,
-  getKgStatus?: () => Promise<KgRefreshStatus>,
-  triggerKgRefresh?: (dryRun?: boolean, acceptNewBaseline?: boolean, actorEmail?: string) => Promise<{ status: number; body: Record<string, unknown> }>,
-  setRunnerMode?: (patch: { mode?: string }) => { status: number; body: Record<string, unknown> },
-  pauseProject?: (teamKey: string, paused: boolean) => { status: number; body: Record<string, unknown> },
-  addProject?: (body: Record<string, unknown>) => { status: number; body: Record<string, unknown> },
-  triggerWorkflowSync?: (teamKey: string) => { status: number; body: Record<string, unknown> },
-  clearDispatchDedup?: (issueId: string) => { status: number; body: Record<string, unknown> },
+  _providerDiagnostic?: string | null,
 ): Promise<void> {
   if (!baseUrl) {
     json(res, 503, { error: "MCP endpoint not configured: OAUTH_REDIRECT_BASE_URL is not set" });
     return;
   }
 
+  const requestStart = Date.now();
   const auth = req.headers.authorization;
   const submitted = auth?.startsWith("Bearer ") ? auth.slice(7) : "";
-  const unauthorized = (): void => {
+  const unauthorized = (cause: AuthEventCause, clientId: string | null, email: string | null): void => {
+    recordAuthEvent({
+      at: Date.now(),
+      kind: "401",
+      cause,
+      clientId,
+      clientPath: resolveClientPath(clientId),
+      identityKind: email ? "human" : null,
+      email,
+      familyId: null,
+      latencyMs: Date.now() - requestStart,
+    });
     res.writeHead(401, {
       "Content-Type": "application/json",
       "WWW-Authenticate": `Bearer realm="MCP", resource_metadata="${baseUrl}/.well-known/oauth-protected-resource"`,
@@ -541,8 +163,9 @@ export async function handleMcpRequest(
     res.end(JSON.stringify({ error: "unauthorized" }));
   };
 
-  const identity = verifyMcpToken(submitted);
-  if (!identity) return unauthorized();
+  const verification = verifyMcpToken(submitted);
+  if (!verification.ok) return unauthorized(verification.reason, verification.clientId, null);
+  const identity = verification.identity;
 
   // An access token outlives a removal by up to an hour; re-checking closes that window.
   const recheck = recheckIdentity(identity);
@@ -550,7 +173,7 @@ export async function handleMcpRequest(
     json(res, 503, { error: "access control is unavailable" });
     return;
   }
-  if (recheck.status === "denied") return unauthorized();
+  if (recheck.status === "denied") return unauthorized("allowlist", identity.clientId, identity.email);
 
   const role: AccessRole | null = recheck.status === "ok" ? recheck.entry?.role ?? null : null;
 
@@ -578,7 +201,8 @@ export async function handleMcpRequest(
   // The JSON-RPC handshake (initialize/ping/notifications-initialized) is answered by the
   // orchestrator itself, never proxied: orchestrator-native tools exist regardless of the
   // sidecar, so a real MCP client (not just curl against tools/list) must be able to connect
-  // on a sidecar-less boot. Only kg_* tool calls stay gated on `provider` below (AII-641).
+  // on a sidecar-less boot. A kg_* call without a sidecar configured degrades inside its own
+  // handler (src/restate/tools.ts) rather than gating here.
   if (rpc?.method === "initialize") {
     json(res, 200, {
       jsonrpc: "2.0",
@@ -606,22 +230,31 @@ export async function handleMcpRequest(
   }
 
   if (rpc?.method === "tools/list") {
-    // Merge native diagnostic tools with kg_* tools from the provider. Hiding a write tool the
-    // caller's role cannot use is a courtesy — the check in tools/call below is the boundary.
-    //
-    // kg_* tools are omitted here entirely when there is no provider, rather than listed with
-    // an isError response on tools/call: unlike get_tenant_health's `kgDegraded` flag — which
-    // surfaces a *partially* working KG (search still answers, just lexical-only) so a client
-    // knows the capability exists but is degraded — an unset KG_SIDECAR_URL means the capability
-    // doesn't exist at all for this session. Listing tools a client can never successfully call
-    // would be misleading; omitting them lets tools/list reflect what's actually usable, while
-    // the 503 below still carries the "no memory provider is configured" detail for a client
-    // that calls one anyway (e.g. from a stale tool list) (AII-641).
-    const kgTools = provider ? await provider.listTools(body, req.headers) : [];
+    // Every read tool, including the six kg_* proxies, is now a handler on the
+    // orchestratorTools Restate service (AII-711) — discovered live rather than duplicated
+    // as a literal here. get_session_identity is the one exception: it reports the door's
+    // own state, so it's listed unconditionally alongside the discovered set. Hiding a tool
+    // the caller's role cannot use is a courtesy — the check in tools/call below is the
+    // boundary. The kg_* handlers are discovered like every other tool, but the list keeps
+    // the AII-641 courtesy: a kg_* tool is omitted when no KG sidecar is configured, or when
+    // the provider lacks that tool's capability, so a client never sees a tool it can never
+    // call (tools/call still refuses it inside the handler if called from a stale list). A
+    // Restate-backed tool degrades the same way when the admin API itself is unreachable:
+    // discoverTools() returns an empty list, so the discovered set drops out until it recovers.
+    const kgToolVisible = (name: string): boolean => {
+      const capKey = KG_TOOL_CAPABILITY[name];
+      if (capKey === undefined && !name.startsWith("kg_")) return true;
+      if (!provider) return false;
+      return capKey === undefined || provider.capabilities[capKey] === true;
+    };
+    const discovered = await discoverTools();
+    const restateTools = discovered
+      .filter((t) => roleAllows(role, t.role) && kgToolVisible(t.name))
+      .map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema }));
     json(res, 200, {
       jsonrpc: "2.0",
       id: rpc.id ?? null,
-      result: { tools: [...DIAG_TOOLS, ...WRITE_TOOLS.filter((t) => roleAllows(role, t.role)), ...kgTools] },
+      result: { tools: [GET_SESSION_IDENTITY_TOOL, ...restateTools] },
     });
     return;
   }
@@ -630,102 +263,89 @@ export async function handleMcpRequest(
     const toolName = (rpc.params?.name as string) ?? "";
     const toolArgs = (rpc.params?.arguments as Record<string, unknown>) ?? {};
 
-    const writeTool = WRITE_TOOLS.find((t) => t.name === toolName);
-    if (writeTool) {
-      const actor = identity.email;
-      if (!roleAllows(role, writeTool.role)) {
-        console.log(`[mcp] write tool=${toolName} actor=${actor} role=${role ?? "null"} result=forbidden`);
-        json(res, 200, {
-          jsonrpc: "2.0",
-          id: rpc.id ?? null,
-          result: {
-            content: [{ type: "text", text: `forbidden: ${toolName} requires the ${writeTool.role} role` }],
-            isError: true,
-          },
-        });
-        return;
-      }
-      try {
-        const result = await writeTool.run(toolArgs, {
-          triggerKgRefresh,
-          actorEmail: actor,
-          setRunnerMode,
-          pauseProject,
-          addProject,
-          triggerWorkflowSync,
-          clearDispatchDedup,
-        });
-        console.log(`[mcp] write tool=${toolName} actor=${actor} role=${role} result=${result.status}`);
-        json(res, 200, {
-          jsonrpc: "2.0",
-          id: rpc.id ?? null,
-          result: { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] },
-        });
-      } catch (err) {
-        console.log(`[mcp] write tool=${toolName} actor=${actor} role=${role} result=error`);
-        json(res, 200, {
-          jsonrpc: "2.0",
-          id: rpc.id ?? null,
-          result: {
-            content: [{ type: "text", text: (err as Error).message }],
-            isError: true,
-          },
-        });
-      }
-      return;
-    }
-
-    if (DIAG_TOOL_NAMES.has(toolName)) {
-      try {
-        const result = await callDiagnosticTool(toolName, toolArgs, {
-          defaultRunnerImage,
-          runKgRefreshPreflight,
-          getKgStatus,
-          sessionIdentity: { email: identity.email, provider: identity.provider, role },
-        });
-        json(res, 200, {
-          jsonrpc: "2.0",
-          id: rpc.id ?? null,
-          result: { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] },
-        });
-      } catch (err) {
-        json(res, 200, {
-          jsonrpc: "2.0",
-          id: rpc.id ?? null,
-          result: {
-            content: [{ type: "text", text: `Error: ${(err as Error).message}` }],
-            isError: true,
-          },
-        });
-      }
-      return;
-    }
-
-    // KG tool call — check provider availability and capability
-    if (!provider) {
-      const detail = providerDiagnostic ? ` (${providerDiagnostic})` : "";
-      json(res, 503, { error: `no memory provider is configured${detail}` });
-      return;
-    }
-    const capKey = KG_TOOL_CAPABILITY[toolName];
-    if (capKey !== undefined && !provider.capabilities[capKey]) {
+    if (toolName === "get_session_identity") {
+      const refreshExpiresAt = await getRefreshExpiry(identity.clientId);
+      const result = {
+        email: identity.email,
+        provider: identity.provider,
+        role,
+        kind: identity.kind,
+        token: verification.token,
+        refresh: refreshExpiresAt !== null ? { expiresAt: refreshExpiresAt } : null,
+      };
       json(res, 200, {
         jsonrpc: "2.0",
         id: rpc.id ?? null,
-        error: { code: -32601, message: `Tool not supported by this memory provider: ${toolName}` },
+        result: { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] },
       });
       return;
     }
-    provider.proxyCall(req, res, body);
+
+    if (RESTATE_TOOL_NAMES.has(toolName)) {
+      const caller: Caller = { kind: identity.kind, email: identity.email, role };
+      // A write carries an idempotency key only when the caller states one explicitly via
+      // the MCP `_meta` extension point (see IDEMPOTENCY_KEY_SHAPE above) — the server never
+      // derives one, but it does scope the caller's key by the caller's identity
+      // (scopeIdempotencyKey above) so two callers cannot collide on one literal key. Reads
+      // ignore the field entirely: ignoring rather than validating it keeps a read tolerant of
+      // a client that sends `_meta.idempotencyKey` on every call regardless of tool kind.
+      let idempotencyKey: string | undefined;
+      if (RESTATE_WRITE_TOOL_NAMES.has(toolName)) {
+        const meta = rpc.params?._meta;
+        const supplied = meta && typeof meta === "object" ? (meta as Record<string, unknown>).idempotencyKey : undefined;
+        if (supplied !== undefined) {
+          if (typeof supplied !== "string" || !IDEMPOTENCY_KEY_SHAPE.test(supplied)) {
+            json(res, 200, {
+              jsonrpc: "2.0",
+              id: rpc.id ?? null,
+              error: { code: -32602, message: "params._meta.idempotencyKey must match ^[A-Za-z0-9._:-]{1,128}$" },
+            });
+            return;
+          }
+          idempotencyKey = scopeIdempotencyKey(identity.email ?? identity.clientId ?? "anonymous", supplied);
+        }
+      }
+      const callResult = await callTool(toolName, toolArgs, caller, idempotencyKey ? { idempotencyKey } : undefined);
+      if (callResult.status === "unavailable") {
+        json(res, 503, { error: "restate-unavailable" });
+        return;
+      }
+      json(res, 200, {
+        jsonrpc: "2.0",
+        id: rpc.id ?? null,
+        result: { content: callResult.content, isError: callResult.isError },
+      });
+      return;
+    }
+
+    // A tool name that is neither the door's own tool nor a discovered handler is unknown:
+    // since AII-711 every read (the kg_* tools included) is a handler, and the six writes
+    // joined them in AII-713 — nothing is proxied to the sidecar, and nothing runs inline here.
+    json(res, 200, {
+      jsonrpc: "2.0",
+      id: rpc.id ?? null,
+      error: { code: -32602, message: `Unknown tool: ${toolName}` },
+    });
     return;
   }
 
-  // Proxy everything else to the provider
-  if (!provider) {
-    const detail = providerDiagnostic ? ` (${providerDiagnostic})` : "";
-    json(res, 503, { error: `no memory provider is configured${detail}` });
+  // The raw sidecar proxy that used to sit here left with AII-711. What remains is the
+  // streamable-HTTP contract the door itself implements: POST only (no SSE channel, no
+  // server-side session to DELETE), notifications are acknowledged with no body, and any
+  // other JSON-RPC method is method-not-found.
+  if (req.method !== "POST") {
+    res.writeHead(405, { Allow: "POST", "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "method not allowed" }));
     return;
   }
-
-  provider.proxyCall(req, res, body);
+  if (rpc && rpc.id === undefined && typeof rpc.method === "string" && rpc.method.startsWith("notifications/")) {
+    res.writeHead(202);
+    res.end();
+    return;
+  }
+  json(res, 200, {
+    jsonrpc: "2.0",
+    id: rpc?.id ?? null,
+    error: { code: -32601, message: `Method not found: ${rpc?.method ?? "unknown"}` },
+  });
 }

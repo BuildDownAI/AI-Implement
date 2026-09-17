@@ -86,6 +86,7 @@ let providers: typeof import("../oauth/providers.js");
 let access: typeof import("../access-entries.js");
 let oidc: typeof import("../oauth/oidc.js");
 let dedup: typeof import("../dedup.js");
+let authEvents: typeof import("../mcp-auth-events.js");
 let dbPath: string;
 
 /** Seed the list in force the way a pre-handover deployment does — from the env. */
@@ -106,12 +107,20 @@ beforeEach(async () => {
   access = await import("../access-entries.js");
   oidc = await import("../oauth/oidc.js");
   dedup = await import("../dedup.js");
+  authEvents = await import("../mcp-auth-events.js");
 
   mcpOauth.initMcpOAuthTables();
   access.initAccessEntriesTable();
+  authEvents.initAuthEventsTable();
   providers.configureOAuthProviders([googleProvider]);
   setAllowedDomains("eudoxus.ai");
   (oidc.buildAuthUrl as ReturnType<typeof vi.fn>).mockResolvedValue(OIDC_START);
+  // `RestateRefreshAuthority` is the default as of AII-709, but it requires a live
+  // Restate ingress this suite never starts. Pin the SQLite-backed authority (kept for
+  // one release as the rollback path, AII-709) so the existing rotation/replay/allowlist
+  // coverage below keeps exercising real behavior; the AII-709 describe block further
+  // down tests the default's `unavailable` mapping explicitly, with its own authority.
+  mcpOauth.setRefreshAuthority(new mcpOauth.SqliteRefreshAuthority());
 });
 
 afterEach(() => {
@@ -171,26 +180,6 @@ async function doCallback(id: VerifiedIdentity = identity()): Promise<{ res: Moc
     return { res, code };
   }
   return { res };
-}
-
-// Exchange a code for an MCP token
-async function exchangeToken(code: string, codeVerifier: string, redirectUri = "http://127.0.0.1:8080/callback"): Promise<{ res: MockResponse; token?: string }> {
-  const clientId = await registerClient([redirectUri]);
-  // Re-use the authorize flow to ensure the code row has the right client_id
-  // (In real usage the client_id comes from the registration before authorize)
-  // For test isolation just look up what was stored
-  const body = new URLSearchParams({
-    grant_type: "authorization_code",
-    code,
-    redirect_uri: redirectUri,
-    client_id: clientId,
-    code_verifier: codeVerifier,
-  }).toString();
-  const req = mkReq("/mcp/token", "POST", { "content-type": "application/x-www-form-urlencoded" }, body);
-  const res = new MockResponse();
-  await mcpOauth.handleMcpTokenRequest(req, asRes(res));
-  const data = JSON.parse(res.body);
-  return { res, token: data.access_token };
 }
 
 // ---------- Unit: well-known endpoints ----------
@@ -688,8 +677,8 @@ describe("handleMcpTokenRequest — refresh_token grant", () => {
     await mcpOauth.handleMcpTokenRequest(makeRefreshReq(refreshToken, clientId), asRes(res));
     const { access_token } = JSON.parse(res.body);
     const idResult = mcpOauth.verifyMcpToken(access_token);
-    expect(idResult).not.toBeNull();
-    expect(idResult?.email).toBe("ada@eudoxus.ai");
+    expect(idResult.ok).toBe(true);
+    expect(idResult.ok && idResult.identity.email).toBe("ada@eudoxus.ai");
   });
 
   it("rotated refresh token can be used again (chain continues)", async () => {
@@ -761,15 +750,277 @@ describe("handleMcpTokenRequest — refresh_token grant", () => {
   });
 });
 
+// ---------- Unit: the default authority reporting "unavailable" (AII-709) ----------
+//
+// `RestateRefreshAuthority` is the default, but it needs a live Restate ingress this
+// suite never starts; its own outcome-mapping (including the unroutable-ingress path)
+// is unit-tested directly in operator-object.test.ts. Here, a minimal fake standing in
+// for "the default authority is down" proves the token endpoint's own 503 mapping and
+// that access-token verification is entirely independent of the refresh authority.
+
+function alwaysUnavailableAuthority() {
+  return {
+    issue: async () => ({ status: "unavailable" as const }),
+    rotate: async () => ({ status: "unavailable" as const }),
+    revokeFamily: async () => {},
+    describe: async () => ({ status: "unavailable" as const }),
+  };
+}
+
+describe("refresh authority unavailable — 503 restate-unavailable (AII-709)", () => {
+  it("the refresh_token grant answers 503 restate-unavailable and touches no table", async () => {
+    mcpOauth.setRefreshAuthority(alwaysUnavailableAuthority());
+    const body = new URLSearchParams({
+      grant_type: "refresh_token",
+      refresh_token: "sometoken",
+      client_id: "someclient",
+    }).toString();
+    const req = mkReq("/mcp/token", "POST", { "content-type": "application/x-www-form-urlencoded" }, body);
+    const res = new MockResponse();
+    await mcpOauth.handleMcpTokenRequest(req, asRes(res));
+    expect(res.statusCode).toBe(503);
+    expect(JSON.parse(res.body)).toEqual({ error: "restate-unavailable" });
+  });
+
+  it("the authorization_code grant also answers 503 restate-unavailable, minting no access token", async () => {
+    const { code, codeVerifier, clientId } = await fullFlow();
+    mcpOauth.setRefreshAuthority(alwaysUnavailableAuthority());
+    const body = new URLSearchParams({
+      grant_type: "authorization_code",
+      code,
+      redirect_uri: "http://127.0.0.1:8080/callback",
+      client_id: clientId,
+      code_verifier: codeVerifier,
+    }).toString();
+    const req = mkReq("/mcp/token", "POST", { "content-type": "application/x-www-form-urlencoded" }, body);
+    const res = new MockResponse();
+    await mcpOauth.handleMcpTokenRequest(req, asRes(res));
+    expect(res.statusCode).toBe(503);
+    expect(JSON.parse(res.body)).toEqual({ error: "restate-unavailable" });
+
+    const tokenCount = dedup.getDb().prepare("SELECT COUNT(*) AS count FROM mcp_tokens").get() as { count: number };
+    expect(tokenCount.count).toBe(0);
+  });
+
+  it("an existing access token still passes verifyMcpToken while the refresh authority is unavailable", async () => {
+    const { accessToken } = await getTokensViaFullFlow();
+    mcpOauth.setRefreshAuthority(alwaysUnavailableAuthority());
+
+    const result = mcpOauth.verifyMcpToken(accessToken);
+    expect(result.ok).toBe(true);
+    expect(result.ok && result.identity.email).toBe("ada@eudoxus.ai");
+  });
+});
+
+async function getTokensViaFullFlow(): Promise<{ accessToken: string; refreshToken: string; clientId: string }> {
+  const { code, codeVerifier, clientId } = await fullFlow();
+  const { accessToken, refreshToken } = await exchangeCode(code, codeVerifier, clientId);
+  return { accessToken, refreshToken, clientId };
+}
+
+// ---------- Unit: resolveClientPath ----------
+
+describe("resolveClientPath", () => {
+  it("returns loopback for a loopback-registered client", async () => {
+    const clientId = await registerClient(["http://127.0.0.1:8080/callback"]);
+    expect(mcpOauth.resolveClientPath(clientId)).toBe("loopback");
+  });
+
+  it("returns loopback for a localhost-registered client", async () => {
+    const clientId = await registerClient(["http://localhost:8080/callback"]);
+    expect(mcpOauth.resolveClientPath(clientId)).toBe("loopback");
+  });
+
+  it("returns https for an HTTPS-registered client", async () => {
+    vi.stubEnv("MCP_ALLOWED_REDIRECT_ORIGINS", "https://client.example.com");
+    const clientId = await registerClient(["https://client.example.com/callback"]);
+    expect(mcpOauth.resolveClientPath(clientId)).toBe("https");
+  });
+
+  it("returns unknown for an unregistered client_id", () => {
+    expect(mcpOauth.resolveClientPath("no-such-client")).toBe("unknown");
+  });
+
+  it("returns unknown for a null client_id", () => {
+    expect(mcpOauth.resolveClientPath(null)).toBe("unknown");
+  });
+});
+
+// ---------- Unit: refresh grant auth events (AII-708) ----------
+
+describe("refresh grant — auth events", () => {
+  async function getTokens(): Promise<{ accessToken: string; refreshToken: string; clientId: string }> {
+    const { code, codeVerifier, clientId } = await fullFlow();
+    const { accessToken, refreshToken } = await exchangeCode(code, codeVerifier, clientId);
+    return { accessToken, refreshToken, clientId };
+  }
+
+  function makeRefreshReq(refreshToken: string, clientId: string): http.IncomingMessage {
+    const body = new URLSearchParams({ grant_type: "refresh_token", refresh_token: refreshToken, client_id: clientId }).toString();
+    return mkReq("/mcp/token", "POST", { "content-type": "application/x-www-form-urlencoded" }, body);
+  }
+
+  it("a successful refresh produces exactly one event with cause 'ok', and no token value ever appears", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const { refreshToken, clientId } = await getTokens();
+    const res = new MockResponse();
+    await mcpOauth.handleMcpTokenRequest(makeRefreshReq(refreshToken, clientId), asRes(res));
+    const { access_token: newAccessToken, refresh_token: newRefreshToken } = JSON.parse(res.body);
+
+    const events = authEvents.listAuthEvents();
+    const okEvents = events.filter((e) => e.cause === "ok");
+    expect(okEvents).toHaveLength(1);
+    expect(okEvents[0].kind).toBe("refresh");
+    expect(okEvents[0].clientId).toBe(clientId);
+    expect(okEvents[0].email).toBe("ada@eudoxus.ai");
+
+    // Constraint: no row or log line ever carries a token, refresh token, or code value.
+    const rows = dedup.getDb().prepare("SELECT * FROM mcp_auth_events").all() as Array<Record<string, unknown>>;
+    const serializedRows = JSON.stringify(rows);
+    const loggedText = logSpy.mock.calls.map((call) => call.join(" ")).join("\n");
+    for (const secret of [refreshToken, newAccessToken, newRefreshToken]) {
+      expect(serializedRows).not.toContain(secret);
+      expect(loggedText).not.toContain(secret);
+    }
+    logSpy.mockRestore();
+  });
+
+  it("a forced replay produces exactly one event with cause 'replay'", async () => {
+    const { refreshToken, clientId } = await getTokens();
+    const res1 = new MockResponse();
+    await mcpOauth.handleMcpTokenRequest(makeRefreshReq(refreshToken, clientId), asRes(res1));
+    expect(res1.statusCode).toBe(200);
+
+    // Replay the already-rotated token.
+    const res2 = new MockResponse();
+    await mcpOauth.handleMcpTokenRequest(makeRefreshReq(refreshToken, clientId), asRes(res2));
+    expect(res2.statusCode).toBe(400);
+
+    const replayEvents = authEvents.listAuthEvents().filter((e) => e.cause === "replay");
+    expect(replayEvents).toHaveLength(1);
+    expect(replayEvents[0].kind).toBe("refresh");
+  });
+
+  it("a forced expiry produces exactly one event with cause 'expired'", async () => {
+    const { refreshToken, clientId } = await getTokens();
+    dedup.getDb()
+      .prepare("UPDATE mcp_refresh_tokens SET expires_at = ? WHERE token_hash = ?")
+      .run(Date.now() - 1000, crypto.createHash("sha256").update(refreshToken).digest("hex"));
+
+    const res = new MockResponse();
+    await mcpOauth.handleMcpTokenRequest(makeRefreshReq(refreshToken, clientId), asRes(res));
+    expect(res.statusCode).toBe(400);
+
+    const expiredEvents = authEvents.listAuthEvents().filter((e) => e.cause === "expired");
+    expect(expiredEvents).toHaveLength(1);
+    expect(expiredEvents[0].kind).toBe("refresh");
+  });
+
+  it("records cause 'allowlist' when the identity is removed", async () => {
+    const { refreshToken, clientId } = await getTokens();
+    setAllowedDomains("");
+    const res = new MockResponse();
+    await mcpOauth.handleMcpTokenRequest(makeRefreshReq(refreshToken, clientId), asRes(res));
+    expect(res.statusCode).toBe(400);
+
+    const events = authEvents.listAuthEvents().filter((e) => e.cause === "allowlist");
+    expect(events).toHaveLength(1);
+  });
+
+  it("records cause 'unavailable' when the allowlist cannot be loaded", async () => {
+    const { refreshToken, clientId } = await getTokens();
+    dedup.getDb().exec("DROP TABLE access_entries");
+    // getEffectiveAllowlist only returns null (unavailable) before any successful read has ever
+    // cached a list; force that boot-time state back so the dropped table actually bites.
+    access.__resetAllowlistCacheForTest();
+
+    const res = new MockResponse();
+    await mcpOauth.handleMcpTokenRequest(makeRefreshReq(refreshToken, clientId), asRes(res));
+    expect(res.statusCode).toBe(503);
+    // The allowlist outage is distinct from a Restate outage (AII-718): the SQLite path's
+    // only "unavailable" case is the allowlist, so it always answers temporarily_unavailable.
+    expect(JSON.parse(res.body)).toEqual({
+      error: "temporarily_unavailable",
+      error_description: "Access control is unavailable",
+    });
+
+    const events = authEvents.listAuthEvents().filter((e) => e.cause === "unavailable");
+    expect(events).toHaveLength(1);
+  });
+
+  it("records cause 'invalid' for an unknown refresh token", async () => {
+    const { clientId } = await getTokens();
+    const res = new MockResponse();
+    await mcpOauth.handleMcpTokenRequest(makeRefreshReq("notarealtoken", clientId), asRes(res));
+    expect(res.statusCode).toBe(400);
+
+    const events = authEvents.listAuthEvents().filter((e) => e.cause === "invalid");
+    expect(events).toHaveLength(1);
+    expect(events[0].email).toBeNull();
+  });
+
+  it("summarizeAuthEvents counts per cause and per client path, excluding rows before since", async () => {
+    const { refreshToken, clientId } = await getTokens();
+    const cutoff = Date.now();
+    await mcpOauth.handleMcpTokenRequest(makeRefreshReq("bogus-before-cutoff", clientId), asRes(new MockResponse()));
+    // Backdate that row before the cutoff.
+    dedup.getDb().prepare("UPDATE mcp_auth_events SET at = ? WHERE cause = 'invalid'").run(cutoff - 10_000);
+
+    const res = new MockResponse();
+    await mcpOauth.handleMcpTokenRequest(makeRefreshReq(refreshToken, clientId), asRes(res));
+    expect(res.statusCode).toBe(200);
+
+    const summary = authEvents.summarizeAuthEvents(cutoff);
+    expect(summary.byCause.ok).toBe(1);
+    expect(summary.byCause.invalid ?? 0).toBe(0);
+    expect(summary.byClientPath.loopback).toBe(1);
+    expect(summary.totalEvents).toBe(1);
+  });
+
+  it("prunes rows older than 30 days on write", async () => {
+    const { refreshToken, clientId } = await getTokens();
+    const stale = Date.now() - 31 * 24 * 60 * 60 * 1000;
+    dedup.getDb()
+      .prepare(
+        `INSERT INTO mcp_auth_events (at, kind, cause, client_id, client_path, identity_kind, email, family_id, latency_ms)
+         VALUES (?, 'refresh', 'ok', 'old-client', 'unknown', 'human', 'old@eudoxus.ai', 'old-family', 5)`,
+      )
+      .run(stale);
+
+    const res = new MockResponse();
+    await mcpOauth.handleMcpTokenRequest(makeRefreshReq(refreshToken, clientId), asRes(res));
+    expect(res.statusCode).toBe(200);
+
+    const staleRow = dedup.getDb().prepare("SELECT * FROM mcp_auth_events WHERE client_id = 'old-client'").get();
+    expect(staleRow).toBeUndefined();
+  });
+});
+
 // ---------- Unit: verifyMcpToken ----------
 
 describe("verifyMcpToken", () => {
-  it("returns null for empty token", () => {
-    expect(mcpOauth.verifyMcpToken("")).toBeNull();
+  it("returns invalid for empty token", () => {
+    const result = mcpOauth.verifyMcpToken("");
+    expect(result.ok).toBe(false);
+    expect(!result.ok && result.reason).toBe("invalid");
   });
 
-  it("returns null for unknown token", () => {
-    expect(mcpOauth.verifyMcpToken("unknowntoken")).toBeNull();
+  it("returns invalid for unknown token", () => {
+    const result = mcpOauth.verifyMcpToken("unknowntoken");
+    expect(result.ok).toBe(false);
+    expect(!result.ok && result.reason).toBe("invalid");
+    expect(!result.ok && result.clientId).toBeNull();
+  });
+
+  it("returns expired with the token's client_id for a token past expiry", async () => {
+    const { code, codeVerifier, clientId } = await fullFlow();
+    const { accessToken } = await exchangeCode(code, codeVerifier, clientId);
+    dedup.getDb().prepare("UPDATE mcp_tokens SET expires_at = ? WHERE token = ?").run(Date.now() - 1000, accessToken);
+
+    const result = mcpOauth.verifyMcpToken(accessToken);
+    expect(result.ok).toBe(false);
+    expect(!result.ok && result.reason).toBe("expired");
+    expect(!result.ok && result.clientId).toBe(clientId);
   });
 
   it("returns identity for a token minted after a complete flow", async () => {
@@ -790,8 +1041,93 @@ describe("verifyMcpToken", () => {
     const token = JSON.parse(res.body).access_token;
 
     const result = mcpOauth.verifyMcpToken(token);
-    expect(result).not.toBeNull();
-    expect(result?.email).toBe("ada@eudoxus.ai");
-    expect(result?.provider).toBe("google");
+    expect(result.ok).toBe(true);
+    expect(result.ok && result.identity.email).toBe("ada@eudoxus.ai");
+    expect(result.ok && result.identity.provider).toBe("google");
+    expect(result.ok && result.identity.clientId).toBe(clientId);
+  });
+});
+
+// ---------- Unit: verifyMcpToken token health fields (AII-714) ----------
+
+describe("verifyMcpToken — token health fields (AII-714)", () => {
+  it("token.expiresAt equals the row's expires_at, and clientId/clientPath resolve for the minting client", async () => {
+    const { code, codeVerifier, clientId } = await fullFlow();
+    const { accessToken } = await exchangeCode(code, codeVerifier, clientId);
+
+    const row = dedup
+      .getDb()
+      .prepare("SELECT created_at, expires_at FROM mcp_tokens WHERE token = ?")
+      .get(accessToken) as { created_at: number; expires_at: number };
+    const result = mcpOauth.verifyMcpToken(accessToken);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.token.issuedAt).toBe(row.created_at);
+    expect(result.token.expiresAt).toBe(row.expires_at);
+    expect(result.token.clientId).toBe(clientId);
+    // registerClient() (the fullFlow() default) registers http://127.0.0.1:8080/callback — a loopback redirect.
+    expect(result.token.clientPath).toBe("loopback");
+  });
+
+  it("a fixture token issued 50 minutes ago reports a 50-minute age and a 10-minute-remaining expiry (fake clock, default 60-minute TTL)", () => {
+    const now = Date.now();
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    try {
+      const issuedAt = now - 50 * 60 * 1000;
+      const token = "fixture-token-aii-714";
+      dedup
+        .getDb()
+        .prepare(
+          "INSERT INTO mcp_tokens (token, email, sub, provider, created_at, expires_at, client_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .run(token, "ada@eudoxus.ai", "google|1", "google", issuedAt, issuedAt + mcpOauth.MCP_TOKEN_TTL_MS, "client-x");
+
+      const result = mcpOauth.verifyMcpToken(token);
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      expect(Date.now() - result.token.issuedAt).toBe(50 * 60 * 1000);
+      expect(result.token.expiresAt - Date.now()).toBe(10 * 60 * 1000);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+// ---------- Unit: getRefreshExpiry (AII-714) ----------
+//
+// Backs get_session_identity's `refresh` field: the live refresh-token expiry for a client
+// id, sourced from whichever RefreshAuthority is currently active. Unit-tested here against
+// SqliteRefreshAuthority (the suite's default, per the beforeEach note above) and against a
+// fake standing in for "the Operator/Restate-backed authority is unavailable" — no real
+// Restate ingress needed, matching the existing alwaysUnavailableAuthority() pattern.
+
+describe("getRefreshExpiry", () => {
+  it("returns null without calling the refresh authority when clientId is null", async () => {
+    const describeSpy = vi.fn();
+    mcpOauth.setRefreshAuthority({
+      issue: async () => ({ status: "unavailable" as const }),
+      rotate: async () => ({ status: "unavailable" as const }),
+      revokeFamily: async () => {},
+      describe: describeSpy,
+    });
+    await expect(mcpOauth.getRefreshExpiry(null)).resolves.toBeNull();
+    expect(describeSpy).not.toHaveBeenCalled();
+  });
+
+  it("returns the live refresh token's expiresAt for a client with a current refresh token", async () => {
+    const { code, codeVerifier, clientId } = await fullFlow();
+    await exchangeCode(code, codeVerifier, clientId);
+    const row = dedup
+      .getDb()
+      .prepare("SELECT expires_at FROM mcp_refresh_tokens WHERE client_id = ?")
+      .get(clientId) as { expires_at: number };
+
+    await expect(mcpOauth.getRefreshExpiry(clientId)).resolves.toBe(row.expires_at);
+  });
+
+  it("returns null — never throws — when the active refresh authority reports unavailable (the Operator/Restate-down case)", async () => {
+    mcpOauth.setRefreshAuthority(alwaysUnavailableAuthority());
+    await expect(mcpOauth.getRefreshExpiry("some-client")).resolves.toBeNull();
   });
 });

@@ -10,6 +10,16 @@ export interface MemoryProviderCapabilities {
   stalenessStamp: boolean;
 }
 
+/**
+ * Outcome of a non-streaming `callKgTool`: either the sidecar's own JSON-RPC `result`
+ * (whatever shape that tool returns — e.g. kg_hybrid_search's `degraded` flag travels
+ * inside it untouched), or a human-readable error string. The error text matches what
+ * `proxyCall`'s `writeConnectionError` used to write into a 502 body, or the sidecar's
+ * own JSON-RPC error message, so a caller migrating off `/mcp`'s raw proxy sees the same
+ * wording it always has.
+ */
+export type KgToolResult = { ok: true; result: unknown } | { ok: false; error: string };
+
 export interface MemoryProvider {
   readonly id: string;
   readonly capabilities: MemoryProviderCapabilities;
@@ -17,6 +27,12 @@ export interface MemoryProvider {
   listTools(body: Buffer, headers: http.IncomingHttpHeaders): Promise<unknown[]>;
   /** Forward a tool call to the provider, writing the response directly to `res`. */
   proxyCall(req: http.IncomingMessage, res: http.ServerResponse, body: Buffer): void;
+  /**
+   * Calls a single `kg_*` tool and returns its parsed result rather than writing to an
+   * HTTP response — the path a Restate tool handler (src/restate/tools.ts) uses, since it
+   * has no `res` to stream into.
+   */
+  callKgTool(name: string, args: Record<string, unknown>): Promise<KgToolResult>;
 }
 
 /**
@@ -526,6 +542,65 @@ export class SidecarMemoryProvider implements MemoryProvider {
     return parsed?.result?.tools ?? [];
   }
 
+  /**
+   * Shared by `proxyCall`'s `writeConnectionError` and `callKgTool`: classifies a transport
+   * failure into the same wording both paths have always used, logging as a side effect.
+   */
+  private describeConnectionFailure(err: NodeJS.ErrnoException): string {
+    if (err.code === "ECONNREFUSED") {
+      console.error(`[mcp] KG sidecar connection refused at ${this.kgSidecarUrl}`);
+      return "KG sidecar unavailable: connection refused";
+    }
+    console.error("[mcp] KG sidecar error:", err);
+    return "KG sidecar error";
+  }
+
+  /**
+   * Calls a single `kg_*` tool and returns its parsed JSON-RPC result rather than writing
+   * to an HTTP response — built on the same session-tolerant send path and probe headers
+   * `probe()` uses, so a Restate handler (src/restate/tools.ts) with no `res` to stream into
+   * can still call the sidecar. Never throws: every failure resolves to `{ ok: false }` with
+   * the same wording `proxyCall` has always produced for the same failure.
+   */
+  async callKgTool(name: string, args: Record<string, unknown>): Promise<KgToolResult> {
+    const target = new URL(this.kgSidecarUrl);
+    const transport = target.protocol === "https:" ? https : http;
+    const callBody = Buffer.from(
+      JSON.stringify({ jsonrpc: "2.0", id: `call-${name}`, method: "tools/call", params: { name, arguments: args } }),
+    );
+    const send = (sessionId: string | null) => {
+      const reqHeaders: SidecarHeaders = { ...PROBE_HEADERS, "content-length": String(callBody.length) };
+      if (sessionId) reqHeaders["mcp-session-id"] = sessionId;
+      return this.sendToSidecar(target, transport, "POST", reqHeaders, callBody);
+    };
+
+    const { result, parsed, handshakeError } = await this.sendWithSessionRetry(target, transport, PROBE_HEADERS, send);
+    if (!result.ok) {
+      void this.maybeReprobe();
+      return { ok: false, error: this.describeConnectionFailure(result.error) };
+    }
+    if ("streamed" in result) {
+      // sendToSidecar (unlike sendOrStream) never streams; unreachable in practice.
+      return { ok: false, error: "KG sidecar error" };
+    }
+    if (handshakeError) {
+      console.error(`[mcp] KG sidecar session initialize failed calling ${name}; forwarding the original rejection:`, handshakeError);
+      void this.maybeReprobe();
+    }
+    if (!parsed) {
+      console.error(
+        `[mcp] KG sidecar ${name} returned an unparseable response (status ${result.status}): ${result.raw.toString().slice(0, 200)}`,
+      );
+      void this.maybeReprobe();
+      return { ok: false, error: "KG sidecar error" };
+    }
+    if (parsed.error) {
+      const err = parsed.error as { message?: string };
+      return { ok: false, error: typeof err.message === "string" ? err.message : JSON.stringify(parsed.error) };
+    }
+    return { ok: true, result: parsed.result };
+  }
+
   proxyCall(req: http.IncomingMessage, res: http.ServerResponse, body: Buffer): void {
     const target = new URL(this.kgSidecarUrl);
     const transport = target.protocol === "https:" ? https : http;
@@ -552,13 +627,7 @@ export class SidecarMemoryProvider implements MemoryProvider {
         res.destroy(err);
         return;
       }
-      if (err.code === "ECONNREFUSED") {
-        console.error(`[mcp] KG sidecar connection refused at ${this.kgSidecarUrl}`);
-        writeJson(res, 502, { error: "KG sidecar unavailable: connection refused" });
-      } else {
-        console.error("[mcp] KG sidecar error:", err);
-        writeJson(res, 502, { error: "KG sidecar error" });
-      }
+      writeJson(res, 502, { error: this.describeConnectionFailure(err) });
     };
 
     void (async () => {
@@ -674,4 +743,21 @@ export function providerUnconfiguredReason(
     return "sidecar: KG_SIDECAR_URL unset";
   }
   return null;
+}
+
+let sharedKgMemoryProvider: MemoryProvider | null = null;
+
+/**
+ * Set once at boot (src/index.ts's main()) to the same instance passed into
+ * `handleMcpRequest`. A Restate tool handler (src/restate/tools.ts) has no per-request
+ * dependency injection the way `handleMcpRequest` does, so its kg_* handlers reach the
+ * provider through this getter instead — sharing the negotiated MCP session rather than
+ * starting a second, independent one.
+ */
+export function setKgMemoryProvider(provider: MemoryProvider | null): void {
+  sharedKgMemoryProvider = provider;
+}
+
+export function getKgMemoryProvider(): MemoryProvider | null {
+  return sharedKgMemoryProvider;
 }

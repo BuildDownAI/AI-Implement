@@ -284,6 +284,23 @@ export interface KgRefreshHandle {
   fireRefreshSettled(): void;
 }
 
+let activeKgRefreshHandle: KgRefreshHandle | null = null;
+
+/**
+ * Set once at boot (src/index.ts's main(), alongside its own local `activeKgRefresh`
+ * variable) to the same handle every other kg-refresh entry point already calls through.
+ * Exists so `get_kg_status` (src/restate/tools.ts) — a Restate handler with no per-request
+ * dependency injection, unlike handleMcpRequest's threaded `getKgStatus` callback — can
+ * still reach `.status()` on the live handle.
+ */
+export function setActiveKgRefresh(handle: KgRefreshHandle | null): void {
+  activeKgRefreshHandle = handle;
+}
+
+export function getActiveKgRefresh(): KgRefreshHandle | null {
+  return activeKgRefreshHandle;
+}
+
 interface KgRefreshInput {
   /** The supervised sidecar from AII-425; restart() is the reload mechanism. */
   sidecar: { restart(): Promise<void> };

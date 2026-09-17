@@ -1,13 +1,135 @@
 import { PassThrough, Writable } from "node:stream";
 import http from "node:http";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { handleMcpRequest, WRITE_TOOLS } from "../mcp.js";
-import { SidecarMemoryProvider, sidecarHealth } from "../kg-provider.js";
-import type { MemoryProvider } from "../kg-provider.js";
+import type * as restate from "@restatedev/restate-sdk";
+import { handleMcpRequest } from "../mcp.js";
+import { SidecarMemoryProvider, sidecarHealth, sidecarHealthFields, setKgMemoryProvider } from "../kg-provider.js";
+import type { MemoryProvider, KgToolResult } from "../kg-provider.js";
+import { setActiveKgRefresh } from "../kg-refresh.js";
+import { getIssueReportCard, getFleetReport } from "../report-card.js";
 import type { PreflightCheckResult, KgRefreshStatus } from "../kg-refresh.js";
+import type { Caller } from "../mcp-identity.js";
+import {
+  GET_TENANT_HEALTH_DESCRIPTION,
+  getTenantHealth,
+  getRunnerModeTool,
+  listProjects,
+  listInFlightJobs,
+  getIssueDispatchStatus,
+  getIssueReportCardTool,
+  getFleetReportTool,
+  getDeployPostureTool,
+  getKgStatusTool,
+  kgHybridSearch,
+  kgSearch,
+  kgSemanticSearch,
+  kgNeighbors,
+  kgPath,
+  kgProvenance,
+  triggerKgRefreshTool,
+  setRunnerModeTool,
+  pauseProjectTool,
+  addProjectTool,
+  triggerWorkflowSyncTool,
+  clearDispatchDedupTool,
+  tool,
+  type ToolResponse,
+} from "../restate/tools.js";
+import {
+  setRunnerModeAction,
+  pauseProjectAction,
+  upsertMappingAction,
+  triggerWorkflowSyncAction,
+  clearDedupEntryAction,
+} from "../admin.js";
+
+// The five non-kg-refresh writes call these action functions verbatim (AII-713) — mocked
+// wholesale, same as tools.test.ts, since src/restate/tools.ts only imports these five names
+// from admin.ts.
+vi.mock("../admin.js", () => ({
+  setRunnerModeAction: vi.fn(),
+  pauseProjectAction: vi.fn(),
+  upsertMappingAction: vi.fn(),
+  triggerWorkflowSyncAction: vi.fn(),
+  clearDedupEntryAction: vi.fn(),
+}));
+
+/**
+ * Every tool bound to the orchestratorTools Restate service, keyed by wire name — mirrors
+ * `orchestratorTools`'s own handlers map (src/restate/tools.ts). The mocked
+ * `restate/tools-client.js`'s `callTool` dispatches through this table so a tools/call test
+ * exercises the real handler body (and, through it, the same mocked modules — getRunnerMode,
+ * getMappings, getDb, etc. — a unit test for that handler in tools.test.ts already exercises
+ * directly) rather than a second, hand-duplicated expectation. The six writes (AII-713) are
+ * real handler bodies too — calling one here exercises the real tool() wrapper's role check
+ * and audit line, not just a stub.
+ */
+const TOOL_HANDLERS: Record<
+  string,
+  (ctx: restate.Context, input: { caller: Caller; args: Record<string, unknown> }) => Promise<ToolResponse>
+> = {
+  get_tenant_health: getTenantHealth,
+  get_runner_mode: getRunnerModeTool,
+  list_projects: listProjects,
+  list_in_flight_jobs: listInFlightJobs,
+  get_issue_dispatch_status: getIssueDispatchStatus,
+  get_issue_report_card: getIssueReportCardTool,
+  get_fleet_report: getFleetReportTool,
+  get_deploy_posture: getDeployPostureTool,
+  get_kg_status: getKgStatusTool,
+  kg_hybrid_search: kgHybridSearch,
+  kg_search: kgSearch,
+  kg_semantic_search: kgSemanticSearch,
+  kg_neighbors: kgNeighbors,
+  kg_path: kgPath,
+  kg_provenance: kgProvenance,
+  trigger_kg_refresh: triggerKgRefreshTool,
+  set_runner_mode: setRunnerModeTool,
+  pause_project: pauseProjectTool,
+  add_project: addProjectTool,
+  trigger_workflow_sync: triggerWorkflowSyncTool,
+  clear_dispatch_dedup: clearDispatchDedupTool,
+};
+
+/** The six writes declare role: "admin" (src/restate/tools.ts); every other discoverable tool is "user". */
+const WRITE_TOOL_NAMES = new Set([
+  "trigger_kg_refresh",
+  "set_runner_mode",
+  "pause_project",
+  "add_project",
+  "trigger_workflow_sync",
+  "clear_dispatch_dedup",
+]);
+
+const DISCOVERED_TOOLS = Object.keys(TOOL_HANDLERS).map((name) => ({
+  name,
+  description: name === "get_tenant_health" ? GET_TENANT_HEALTH_DESCRIPTION : name,
+  inputSchema: { type: "object", properties: {} },
+  role: (WRITE_TOOL_NAMES.has(name) ? "admin" : "user") as "admin" | "user",
+}));
+
+// AII-717: every write handler now runs its side effect through ctx.run — this fake just
+// invokes the closure immediately and returns its result, the same first-attempt behaviour a
+// real (non-replayed) Restate invocation has. Replay-specific behaviour is exercised only at
+// the Restate tier (tools.restate.test.ts's alwaysReplay counter fixture).
+function fakeRestateContext(handlerName: string): restate.Context {
+  return {
+    request: () => ({ target: { handler: handlerName } }),
+    run: async (name: unknown, action?: unknown) => {
+      const fn = typeof name === "function" ? (name as () => unknown) : (action as () => unknown);
+      return fn();
+    },
+  } as unknown as restate.Context;
+}
 
 vi.mock("../mcp-oauth.js", () => ({
   verifyMcpToken: vi.fn(),
+  resolveClientPath: vi.fn(),
+  getRefreshExpiry: vi.fn(),
+}));
+
+vi.mock("../mcp-auth-events.js", () => ({
+  recordAuthEvent: vi.fn(),
 }));
 
 vi.mock("../access-entries.js", () => ({
@@ -39,9 +161,24 @@ vi.mock("../deploy-posture.js", () => ({
   getDeployPosture: vi.fn(),
 }));
 
+vi.mock("../report-card.js", () => ({
+  getIssueReportCard: vi.fn(),
+  getFleetReport: vi.fn(),
+}));
+
+vi.mock("../restate/tools-client.js", () => ({
+  discoverTools: vi.fn(),
+  callTool: vi.fn(),
+  IDEMPOTENCY_KEY_SHAPE: /^[A-Za-z0-9._:-]{1,128}$/,
+}));
+
 const BASE_URL = "https://orchestrator.example.com";
 const SIDECAR_URL = "http://127.0.0.1:8765/mcp";
 const DEFAULT_PROVIDER = new SidecarMemoryProvider(SIDECAR_URL);
+
+// The verifyMcpToken mock's `token` field for a valid-token test double (AII-714) — a fixed
+// fixture rather than a live token, since these tests never mint one through mcp-oauth.ts.
+const FIXTURE_TOKEN_INFO = { issuedAt: 1_700_000_000_000, expiresAt: 1_700_003_600_000, clientId: null, clientPath: "unknown" as const };
 
 class MockRequest extends PassThrough {
   url = "/mcp";
@@ -106,8 +243,35 @@ let logMock: typeof import("../log.js");
 let dedupMock: typeof import("../dedup.js");
 let deployNotifyMock: typeof import("../deploy-notify.js");
 let deployPostureMock: typeof import("../deploy-posture.js");
+let authEventsMock: typeof import("../mcp-auth-events.js");
+let toolsClientMock: typeof import("../restate/tools-client.js");
+
+/**
+ * The health payload get_tenant_health produced before AII-710 moved it onto the
+ * orchestratorTools Restate service — computed here from the same mocked modules
+ * (getRunnerMode, getInFlightJobs, getDb, isKgDegraded) plus the real sidecarHealthFields(),
+ * so every pre-migration get_tenant_health assertion keeps exercising the values it always
+ * checked, now via the mocked Restate client instead of the removed inline handler.
+ */
+function buildTenantHealth(): Record<string, unknown> {
+  const { mode, source } = runnerModeMock.getRunnerMode();
+  const inFlight = logMock.getInFlightJobs();
+  const db = dedupMock.getDb();
+  const { n: pendingGapfillCount } = db.prepare("pending gap-fill count").get() as { n: number };
+  const projectCount = Object.keys(configMock.getMappings()).length;
+  return {
+    runnerMode: { mode, source },
+    inFlightJobCount: inFlight.length,
+    pendingGapfillCount,
+    projectCount,
+    kgDegraded: deployNotifyMock.isKgDegraded(),
+    ...sidecarHealthFields(),
+    kgRefreshPreflight: null,
+  };
+}
 
 beforeEach(async () => {
+  vi.clearAllMocks();
   mockHttpRequest = vi.fn();
   vi.spyOn(http, "request").mockImplementation(mockHttpRequest as never);
 
@@ -119,6 +283,8 @@ beforeEach(async () => {
   dedupMock = await import("../dedup.js");
   deployNotifyMock = await import("../deploy-notify.js");
   deployPostureMock = await import("../deploy-posture.js");
+  authEventsMock = await import("../mcp-auth-events.js");
+  toolsClientMock = await import("../restate/tools-client.js");
   (deployNotifyMock.isKgDegraded as ReturnType<typeof vi.fn>).mockReturnValue(false);
   sidecarHealth.reachable = false;
   sidecarHealth.toolsListed = false;
@@ -154,6 +320,25 @@ beforeEach(async () => {
       all: vi.fn(() => []),
     })),
   });
+
+  // Every read tool is sourced from the orchestratorTools Restate service (AII-711); the
+  // mocked client stands in for discovery/ingress so tests don't need a real admin API, but
+  // dispatches to the real handler bodies (TOOL_HANDLERS above) so a test still exercises
+  // production logic end to end.
+  (toolsClientMock.discoverTools as ReturnType<typeof vi.fn>).mockResolvedValue(DISCOVERED_TOOLS);
+  (toolsClientMock.callTool as ReturnType<typeof vi.fn>).mockImplementation(
+    async (name: string, args: Record<string, unknown>, caller: Caller) => {
+      const handler = TOOL_HANDLERS[name];
+      if (!handler) return { status: "unavailable" };
+      const result = await handler(fakeRestateContext(name), { caller, args });
+      return { status: "ok", content: result.content, isError: result.isError };
+    },
+  );
+  setKgMemoryProvider(null);
+  setActiveKgRefresh(null);
+
+  (mcpOauth.resolveClientPath as ReturnType<typeof vi.fn>).mockReturnValue("unknown");
+  (mcpOauth.getRefreshExpiry as ReturnType<typeof vi.fn>).mockResolvedValue(null);
 
   // The gate re-checks the token's identity on every request; allow it unless a test says otherwise.
   (accessMock.recheckIdentity as ReturnType<typeof vi.fn>).mockReturnValue({
@@ -213,32 +398,6 @@ function setupProxyError(errorCode: string): void {
   });
 }
 
-/** Mock the sidecar to return a tools/list JSON-RPC response. */
-function setupSidecarToolsList(tools: unknown[]): void {
-  const mockProxyReq = new PassThrough();
-  const mockProxyRes = new PassThrough();
-  Object.assign(mockProxyRes, {
-    statusCode: 200,
-    headers: { "content-type": "application/json" },
-  });
-  mockHttpRequest.mockImplementationOnce((_opts: http.RequestOptions, cb: (res: unknown) => void) => {
-    process.nextTick(() => {
-      cb(mockProxyRes);
-      mockProxyRes.push(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { tools } }));
-      mockProxyRes.push(null);
-    });
-    return mockProxyReq;
-  });
-}
-
-interface McpWriteContext {
-  setRunnerMode?: (patch: { mode?: string }) => { status: number; body: Record<string, unknown> };
-  pauseProject?: (teamKey: string, paused: boolean) => { status: number; body: Record<string, unknown> };
-  addProject?: (body: Record<string, unknown>) => { status: number; body: Record<string, unknown> };
-  triggerWorkflowSync?: (teamKey: string) => { status: number; body: Record<string, unknown> };
-  clearDispatchDedup?: (issueId: string) => { status: number; body: Record<string, unknown> };
-}
-
 async function callMcp(
   headers: Record<string, string>,
   tokenValid: boolean,
@@ -247,13 +406,41 @@ async function callMcp(
   method = "POST",
   body?: string,
   providerDiagnostic?: string | null,
-  runKgRefreshPreflight?: () => Promise<PreflightCheckResult>,
-  getKgStatus?: () => Promise<KgRefreshStatus>,
+  _legacyRunKgRefreshPreflight?: unknown,
+  _legacyGetKgStatus?: unknown,
   triggerKgRefresh?: (dryRun?: boolean, acceptNewBaseline?: boolean, actorEmail?: string) => Promise<{ status: number; body: Record<string, unknown> }>,
-  writeContext?: McpWriteContext,
+  writeContext?: {
+    setRunnerMode?: (patch: { mode?: string }) => { status: number; body: Record<string, unknown> };
+    pauseProject?: (teamKey: string, paused: boolean) => { status: number; body: Record<string, unknown> };
+    addProject?: (body: Record<string, unknown>) => { status: number; body: Record<string, unknown> };
+    triggerWorkflowSync?: (teamKey: string) => { status: number; body: Record<string, unknown> };
+    clearDispatchDedup?: (issueId: string) => { status: number; body: Record<string, unknown> };
+  },
 ): Promise<{ statusCode: number; body: string; responseHeaders: Record<string, string> }> {
+  // AII-713: the write tools are Restate handlers that call the admin actions and the
+  // kg-refresh handle directly, not closures threaded through handleMcpRequest. The write-tier
+  // cases below still hand their fakes in positionally, so translate them into the module
+  // mocks the handlers actually read. The two `_legacy*` slots keep older call sites aligned.
+  if (triggerKgRefresh) {
+    setActiveKgRefresh({
+      trigger: ({ dryRun, acceptNewBaseline, actorEmail }: { dryRun?: boolean; acceptNewBaseline?: boolean; actorEmail?: string }) =>
+        triggerKgRefresh(dryRun, acceptNewBaseline, actorEmail),
+      status: async () => ({}),
+    } as never);
+  }
+  if (writeContext?.setRunnerMode) (setRunnerModeAction as ReturnType<typeof vi.fn>).mockImplementation((_cfg: unknown, patch: { mode?: string }) => writeContext.setRunnerMode!(patch));
+  if (writeContext?.pauseProject) (pauseProjectAction as ReturnType<typeof vi.fn>).mockImplementation((teamKey: string, paused: boolean) => writeContext.pauseProject!(teamKey, paused));
+  if (writeContext?.addProject) (upsertMappingAction as ReturnType<typeof vi.fn>).mockImplementation((body: Record<string, unknown>) => writeContext.addProject!(body));
+  if (writeContext?.triggerWorkflowSync) (triggerWorkflowSyncAction as ReturnType<typeof vi.fn>).mockImplementation((_cfg: unknown, teamKey: string) => writeContext.triggerWorkflowSync!(teamKey));
+  if (writeContext?.clearDispatchDedup) (clearDedupEntryAction as ReturnType<typeof vi.fn>).mockImplementation((issueId: string) => writeContext.clearDispatchDedup!(issueId));
   (mcpOauth.verifyMcpToken as ReturnType<typeof vi.fn>).mockReturnValue(
-    tokenValid ? { email: "user@example.com", sub: "sub1", provider: "google" } : null,
+    tokenValid
+      ? {
+          ok: true,
+          identity: { kind: "human", email: "user@example.com", sub: "sub1", provider: "google", clientId: null },
+          token: FIXTURE_TOKEN_INFO,
+        }
+      : { ok: false, reason: "invalid", clientId: null },
   );
   const req = new MockRequest(method, headers, body);
   const res = new MockResponse();
@@ -263,15 +450,6 @@ async function callMcp(
     provider,
     baseUrl,
     providerDiagnostic,
-    undefined,
-    runKgRefreshPreflight,
-    getKgStatus,
-    triggerKgRefresh,
-    writeContext?.setRunnerMode,
-    writeContext?.pauseProject,
-    writeContext?.addProject,
-    writeContext?.triggerWorkflowSync,
-    writeContext?.clearDispatchDedup,
   );
   await res.done;
   return { statusCode: res.statusCode, body: res.body, responseHeaders: res.responseHeaders };
@@ -341,6 +519,64 @@ describe("handleMcpRequest", () => {
       expect(result.statusCode).toBe(503);
       // Not an authentication failure, so no challenge to re-authenticate against.
       expect(result.responseHeaders["WWW-Authenticate"]).toBeUndefined();
+    });
+  });
+
+  describe("token validation — auth events (AII-708)", () => {
+    it("records a 401 event with cause 'invalid' for a garbage token", async () => {
+      (mcpOauth.verifyMcpToken as ReturnType<typeof vi.fn>).mockReturnValue({
+        ok: false, reason: "invalid", clientId: null,
+      });
+      const result = await callMcp({ authorization: "Bearer garbage" }, false);
+      expect(result.statusCode).toBe(401);
+      expect(authEventsMock.recordAuthEvent).toHaveBeenCalledTimes(1);
+      expect(authEventsMock.recordAuthEvent).toHaveBeenCalledWith(
+        expect.objectContaining({ kind: "401", cause: "invalid", clientId: null, email: null }),
+      );
+    });
+
+    it("records a 401 event with cause 'expired' and the token's client_id for an expired token", async () => {
+      (mcpOauth.verifyMcpToken as ReturnType<typeof vi.fn>).mockReturnValue({
+        ok: false, reason: "expired", clientId: "client-1",
+      });
+      const req = new MockRequest("GET", { authorization: "Bearer expiredtok" });
+      const res = new MockResponse();
+      handleMcpRequest(req as never, res as never, DEFAULT_PROVIDER, BASE_URL);
+      await res.done;
+      expect(res.statusCode).toBe(401);
+      expect(authEventsMock.recordAuthEvent).toHaveBeenCalledWith(
+        expect.objectContaining({ kind: "401", cause: "expired", clientId: "client-1" }),
+      );
+    });
+
+    it("records a 401 event with cause 'allowlist' when a valid token's identity is no longer admitted", async () => {
+      (accessMock.recheckIdentity as ReturnType<typeof vi.fn>).mockReturnValue({ status: "denied" });
+      const result = await callMcp({ authorization: "Bearer tok" }, true);
+      expect(result.statusCode).toBe(401);
+      expect(authEventsMock.recordAuthEvent).toHaveBeenCalledWith(
+        expect.objectContaining({ kind: "401", cause: "allowlist", email: "user@example.com" }),
+      );
+    });
+
+    it("derives clientPath from resolveClientPath for the 401 event", async () => {
+      (mcpOauth.resolveClientPath as ReturnType<typeof vi.fn>).mockReturnValue("loopback");
+      (mcpOauth.verifyMcpToken as ReturnType<typeof vi.fn>).mockReturnValue({
+        ok: false, reason: "expired", clientId: "loopback-client",
+      });
+      const req = new MockRequest("GET", { authorization: "Bearer expiredtok" });
+      const res = new MockResponse();
+      handleMcpRequest(req as never, res as never, DEFAULT_PROVIDER, BASE_URL);
+      await res.done;
+      expect(mcpOauth.resolveClientPath).toHaveBeenCalledWith("loopback-client");
+      expect(authEventsMock.recordAuthEvent).toHaveBeenCalledWith(
+        expect.objectContaining({ clientPath: "loopback" }),
+      );
+    });
+
+    it("does not record an auth event when the allowlist cannot be read (503, not a 401)", async () => {
+      (accessMock.recheckIdentity as ReturnType<typeof vi.fn>).mockReturnValue({ status: "unavailable" });
+      await callMcp({ authorization: "Bearer tok" }, true);
+      expect(authEventsMock.recordAuthEvent).not.toHaveBeenCalled();
     });
   });
 
@@ -420,7 +656,7 @@ describe("handleMcpRequest", () => {
   });
 
   describe("tools/list", () => {
-    it("returns diagnostic tools when sidecar is not configured", async () => {
+    it("returns every discovered read tool when sidecar is not configured", async () => {
       const result = await callMcp(
         { authorization: "Bearer tok" },
         true,
@@ -442,11 +678,11 @@ describe("handleMcpRequest", () => {
       ]));
     });
 
-    it("does not call the sidecar when sidecar is null", async () => {
+    it("does not call the sidecar for tools/list (discovery no longer touches the provider)", async () => {
       await callMcp(
         { authorization: "Bearer tok" },
         true,
-        null,
+        DEFAULT_PROVIDER,
         BASE_URL,
         "POST",
         '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}',
@@ -454,152 +690,19 @@ describe("handleMcpRequest", () => {
       expect(mockHttpRequest).not.toHaveBeenCalled();
     });
 
-    it("merges diagnostic tools with sidecar kg_* tools", async () => {
-      setupSidecarToolsList([{ name: "kg_search", description: "KG search" }]);
-      const result = await callMcp(
-        { authorization: "Bearer tok" },
-        true,
-        DEFAULT_PROVIDER,
-        BASE_URL,
-        "POST",
-        '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}',
-      );
-      expect(result.statusCode).toBe(200);
-      const parsed = JSON.parse(result.body);
-      const names = parsed.result.tools.map((t: { name: string }) => t.name);
-      expect(names).toContain("get_tenant_health");
-      expect(names).toContain("kg_search");
-    });
+    it("omits kg_* tools when no provider is configured, and lists them when it is (AII-641 courtesy kept after discovery)", async () => {
+      const without = await callMcp({ authorization: "Bearer tok" }, true, null, BASE_URL, "POST", '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}');
+      const namesWithout = JSON.parse(without.body).result.tools.map((t: { name: string }) => t.name);
+      expect(namesWithout.some((n: string) => n.startsWith("kg_"))).toBe(false);
+      expect(namesWithout).toContain("get_runner_mode");
 
-    it("merges kg_* tools from an SSE-framed sidecar response (streamable-HTTP)", async () => {
-      const mockProxyReq = new PassThrough();
-      const mockProxyRes = new PassThrough();
-      Object.assign(mockProxyRes, { statusCode: 200, headers: { "content-type": "text/event-stream" } });
-      mockHttpRequest.mockImplementationOnce((_o: unknown, cb: (r: unknown) => void) => {
-        process.nextTick(() => {
-          cb(mockProxyRes);
-          mockProxyRes.push(": ping\n\n");
-          mockProxyRes.push(
-            `event: message\ndata: ${JSON.stringify({ jsonrpc: "2.0", id: 1, result: { tools: [{ name: "kg_hybrid_search", description: "hybrid" }] } })}\n\n`,
-          );
-          mockProxyRes.push(null);
-        });
-        return mockProxyReq;
-      });
-      const result = await callMcp(
-        { authorization: "Bearer tok" },
-        true,
-        DEFAULT_PROVIDER,
-        BASE_URL,
-        "POST",
-        '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}',
-      );
-      expect(result.statusCode).toBe(200);
-      const names = JSON.parse(result.body).result.tools.map((t: { name: string }) => t.name);
-      expect(names).toContain("get_tenant_health");
-      expect(names).toContain("kg_hybrid_search");
-    });
-
-    it("joins multi-line SSE data fields before parsing", async () => {
-      const payload = JSON.stringify({ jsonrpc: "2.0", id: 1, result: { tools: [{ name: "kg_search" }] } });
-      const mid = Math.floor(payload.length / 2);
-      const mockProxyReq = new PassThrough();
-      const mockProxyRes = new PassThrough();
-      Object.assign(mockProxyRes, { statusCode: 200, headers: { "content-type": "text/event-stream" } });
-      mockHttpRequest.mockImplementationOnce((_o: unknown, cb: (r: unknown) => void) => {
-        process.nextTick(() => {
-          cb(mockProxyRes);
-          mockProxyRes.push(`event: message\ndata: ${payload.slice(0, mid)}\ndata:${payload.slice(mid)}\n\n`);
-          mockProxyRes.push(null);
-        });
-        return mockProxyReq;
-      });
-      const result = await callMcp(
-        { authorization: "Bearer tok" },
-        true,
-        DEFAULT_PROVIDER,
-        BASE_URL,
-        "POST",
-        '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}',
-      );
-      const names = JSON.parse(result.body).result.tools.map((t: { name: string }) => t.name);
-      expect(names).toContain("kg_search");
-    });
-
-    it("returns only diagnostic tools when the sidecar replies with a JSON-RPC error over SSE", async () => {
-      const mockProxyReq = new PassThrough();
-      const mockProxyRes = new PassThrough();
-      Object.assign(mockProxyRes, { statusCode: 400, headers: { "content-type": "text/event-stream" } });
-      mockHttpRequest.mockImplementationOnce((_o: unknown, cb: (r: unknown) => void) => {
-        process.nextTick(() => {
-          cb(mockProxyRes);
-          mockProxyRes.push(
-            `event: message\ndata: ${JSON.stringify({ jsonrpc: "2.0", id: "server-error", error: { code: -32600, message: "Bad Request: Missing session ID" } })}\n\n`,
-          );
-          mockProxyRes.push(null);
-        });
-        return mockProxyReq;
-      });
-      const result = await callMcp(
-        { authorization: "Bearer tok" },
-        true,
-        DEFAULT_PROVIDER,
-        BASE_URL,
-        "POST",
-        '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}',
-      );
-      const parsed = JSON.parse(result.body);
-      expect(parsed.result.tools.some((t: { name: string }) => t.name === "get_tenant_health")).toBe(true);
-      expect(parsed.result.tools.some((t: { name: string }) => t.name.startsWith("kg_"))).toBe(false);
-    });
-
-    it("returns only diagnostic tools when the SSE stream carries only pings", async () => {
-      const mockProxyReq = new PassThrough();
-      const mockProxyRes = new PassThrough();
-      Object.assign(mockProxyRes, { statusCode: 200, headers: { "content-type": "text/event-stream" } });
-      mockHttpRequest.mockImplementationOnce((_o: unknown, cb: (r: unknown) => void) => {
-        process.nextTick(() => {
-          cb(mockProxyRes);
-          mockProxyRes.push(": ping\n\n: ping\n\n");
-          mockProxyRes.push(null);
-        });
-        return mockProxyReq;
-      });
-      const result = await callMcp(
-        { authorization: "Bearer tok" },
-        true,
-        DEFAULT_PROVIDER,
-        BASE_URL,
-        "POST",
-        '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}',
-      );
-      const parsed = JSON.parse(result.body);
-      expect(parsed.result.tools.some((t: { name: string }) => t.name === "get_tenant_health")).toBe(true);
-      expect(parsed.result.tools.some((t: { name: string }) => t.name.startsWith("kg_"))).toBe(false);
-    });
-
-    it("returns only diagnostic tools when sidecar returns invalid JSON", async () => {
-      const mockProxyReq = new PassThrough();
-      const mockProxyRes = new PassThrough();
-      Object.assign(mockProxyRes, { statusCode: 200, headers: {} });
-      mockHttpRequest.mockImplementationOnce((_o: unknown, cb: (r: unknown) => void) => {
-        process.nextTick(() => { cb(mockProxyRes); mockProxyRes.push("not-json"); mockProxyRes.push(null); });
-        return mockProxyReq;
-      });
-      const result = await callMcp(
-        { authorization: "Bearer tok" },
-        true,
-        DEFAULT_PROVIDER,
-        BASE_URL,
-        "POST",
-        '{"jsonrpc":"2.0","id":1,"method":"tools/list"}',
-      );
-      const parsed = JSON.parse(result.body);
-      expect(parsed.result.tools.some((t: { name: string }) => t.name === "get_tenant_health")).toBe(true);
+      const withProvider = await callMcp({ authorization: "Bearer tok" }, true, DEFAULT_PROVIDER, BASE_URL, "POST", '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}');
+      const namesWith = JSON.parse(withProvider.body).result.tools.map((t: { name: string }) => t.name);
+      expect(namesWith).toContain("kg_hybrid_search");
+      expect(mockHttpRequest).not.toHaveBeenCalled();
     });
 
     it("preserves the JSON-RPC id in the tools/list response", async () => {
-      setupSidecarToolsList([]);
       const result = await callMcp(
         { authorization: "Bearer tok" },
         true,
@@ -610,6 +713,24 @@ describe("handleMcpRequest", () => {
       );
       const parsed = JSON.parse(result.body);
       expect(parsed.id).toBe(42);
+    });
+
+    it("still answers 200 without get_tenant_health when discoverTools resolves an empty list", async () => {
+      (toolsClientMock.discoverTools as ReturnType<typeof vi.fn>).mockResolvedValueOnce([]);
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}',
+      );
+      expect(result.statusCode).toBe(200);
+      const parsed = JSON.parse(result.body);
+      const names = parsed.result.tools.map((t: { name: string }) => t.name);
+      expect(names).not.toContain("get_tenant_health");
+      // get_session_identity is listed unconditionally, independent of discoverTools.
+      expect(names).toContain("get_session_identity");
     });
   });
 
@@ -738,7 +859,10 @@ describe("handleMcpRequest", () => {
       expect(data.kgRefreshPreflight).toBeNull();
     });
 
-    it("get_tenant_health includes kgRefreshPreflight result when runKgRefreshPreflight is wired", async () => {
+    it("get_tenant_health round-trips a populated kgRefreshPreflight from the orchestratorTools service", async () => {
+      // get_tenant_health now reads its own KG_SOURCE_REPO env and calls runKgRefreshPreflight
+      // directly inside src/restate/tools.ts (AII-710) rather than through a wired callback —
+      // tools/call just has to pass the Restate response's content through untouched.
       const preflightResult: PreflightCheckResult = {
         ok: false,
         checkedAt: 1700000000000,
@@ -761,7 +885,10 @@ describe("handleMcpRequest", () => {
           },
         ],
       };
-      const runKgRefreshPreflightMock = vi.fn(async () => preflightResult);
+      (toolsClientMock.callTool as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+        status: "ok",
+        content: [{ type: "text", text: JSON.stringify({ ...buildTenantHealth(), kgRefreshPreflight: preflightResult }, null, 2) }],
+      });
 
       const result = await callMcp(
         { authorization: "Bearer tok" },
@@ -770,15 +897,26 @@ describe("handleMcpRequest", () => {
         BASE_URL,
         "POST",
         JSON.stringify({ jsonrpc: "2.0", id: 16, method: "tools/call", params: { name: "get_tenant_health", arguments: {} } }),
-        undefined,
-        runKgRefreshPreflightMock,
       );
 
       expect(result.statusCode).toBe(200);
       const parsed = JSON.parse(result.body);
       const data = JSON.parse(parsed.result.content[0].text);
       expect(data.kgRefreshPreflight).toEqual(preflightResult);
-      expect(runKgRefreshPreflightMock).toHaveBeenCalledOnce();
+    });
+
+    it("returns 503 restate-unavailable when callTool reports the sidecar is unreachable", async () => {
+      (toolsClientMock.callTool as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ status: "unavailable" });
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 17, method: "tools/call", params: { name: "get_tenant_health", arguments: {} } }),
+      );
+      expect(result.statusCode).toBe(503);
+      expect(JSON.parse(result.body)).toEqual({ error: "restate-unavailable" });
     });
 
     it("handles get_runner_mode", async () => {
@@ -1225,7 +1363,7 @@ describe("handleMcpRequest", () => {
       expect(result.statusCode).toBe(401);
     });
 
-    it("handles get_kg_status — returns the getKgStatus result verbatim", async () => {
+    it("handles get_kg_status — returns the active kg-refresh handle's status verbatim", async () => {
       const status: KgRefreshStatus = {
         running: true,
         deployHeld: false,
@@ -1237,7 +1375,10 @@ describe("handleMcpRequest", () => {
         kgUnavailable: false,
         sidecar: { reachable: false, toolsListed: false, lastError: null, checkedAt: null },
       };
-      const getKgStatusMock = vi.fn(async () => status);
+      const statusMock = vi.fn(async () => status);
+      // AII-711: get_kg_status is a Restate handler that reads the boot-time singleton, not a
+      // per-request callback threaded through handleMcpRequest.
+      setActiveKgRefresh({ status: statusMock } as never);
 
       const result = await callMcp(
         { authorization: "Bearer tok" },
@@ -1246,14 +1387,12 @@ describe("handleMcpRequest", () => {
         BASE_URL,
         "POST",
         JSON.stringify({ jsonrpc: "2.0", id: 22, method: "tools/call", params: { name: "get_kg_status", arguments: {} } }),
-        undefined,
-        undefined,
-        getKgStatusMock,
       );
 
       expect(mockHttpRequest).not.toHaveBeenCalled();
       expect(result.statusCode).toBe(200);
-      expect(getKgStatusMock).toHaveBeenCalledOnce();
+      expect(toolsClientMock.callTool).toHaveBeenCalledWith("get_kg_status", {}, expect.objectContaining({ kind: "human" }), undefined);
+      expect(statusMock).toHaveBeenCalledOnce();
       const parsed = JSON.parse(result.body);
       const data = JSON.parse(parsed.result.content[0].text);
       expect(data).toEqual(status);
@@ -1295,7 +1434,14 @@ describe("handleMcpRequest", () => {
       const parsed = JSON.parse(result.body);
       expect(parsed.result.isError).not.toBe(true);
       const data = JSON.parse(parsed.result.content[0].text);
-      expect(data).toEqual({ email: "user@example.com", provider: "google", role: "user" });
+      expect(data).toEqual({
+        kind: "human",
+        email: "user@example.com",
+        provider: "google",
+        role: "user",
+        token: FIXTURE_TOKEN_INFO,
+        refresh: null,
+      });
     });
 
     it("get_session_identity returns role: null for an entry-less identity", async () => {
@@ -1310,7 +1456,73 @@ describe("handleMcpRequest", () => {
       );
       expect(result.statusCode).toBe(200);
       const data = JSON.parse(JSON.parse(result.body).result.content[0].text);
-      expect(data).toEqual({ email: "user@example.com", provider: "google", role: null });
+      expect(data).toEqual({
+        kind: "human",
+        email: "user@example.com",
+        provider: "google",
+        role: null,
+        token: FIXTURE_TOKEN_INFO,
+        refresh: null,
+      });
+    });
+
+    it("get_session_identity returns kind: 'human' for an OAuth identity", async () => {
+      mockRole("user");
+      (mcpOauth.verifyMcpToken as ReturnType<typeof vi.fn>).mockReturnValue({
+        ok: true,
+        identity: { kind: "human", email: "user@example.com", sub: "sub1", provider: "google", clientId: null },
+        token: FIXTURE_TOKEN_INFO,
+      });
+      const req = new MockRequest("POST", { authorization: "Bearer tok" }, JSON.stringify({
+        jsonrpc: "2.0", id: 32, method: "tools/call", params: { name: "get_session_identity", arguments: {} },
+      }));
+      const res = new MockResponse();
+      handleMcpRequest(req as never, res as never, null, BASE_URL);
+      await res.done;
+      expect(res.statusCode).toBe(200);
+      const data = JSON.parse(JSON.parse(res.body).result.content[0].text);
+      expect(data).toEqual({
+        kind: "human",
+        email: "user@example.com",
+        provider: "google",
+        role: "user",
+        token: FIXTURE_TOKEN_INFO,
+        refresh: null,
+      });
+    });
+
+    it("get_session_identity returns refresh.expiresAt when the refresh authority reports a live refresh token", async () => {
+      mockRole("user");
+      (mcpOauth.getRefreshExpiry as ReturnType<typeof vi.fn>).mockResolvedValue(1_700_100_000_000);
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 33, method: "tools/call", params: { name: "get_session_identity", arguments: {} } }),
+      );
+      expect(result.statusCode).toBe(200);
+      const data = JSON.parse(JSON.parse(result.body).result.content[0].text);
+      expect(data.refresh).toEqual({ expiresAt: 1_700_100_000_000 });
+    });
+
+    it("get_session_identity answers refresh: null, not an error, when the refresh authority (Operator/Restate) is unavailable", async () => {
+      mockRole("user");
+      (mcpOauth.getRefreshExpiry as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 34, method: "tools/call", params: { name: "get_session_identity", arguments: {} } }),
+      );
+      expect(result.statusCode).toBe(200);
+      const parsed = JSON.parse(result.body);
+      expect(parsed.result.isError).not.toBe(true);
+      const data = JSON.parse(parsed.result.content[0].text);
+      expect(data.refresh).toBeNull();
     });
   });
 
@@ -1431,7 +1643,7 @@ describe("handleMcpRequest", () => {
   });
 
   describe("tools/call — write tier (trigger_kg_refresh)", () => {
-    it("WRITE_TOOLS has exactly one entry: trigger_kg_refresh", async () => {
+    it("trigger_kg_refresh is listed exactly once for an admin", async () => {
       mockRole("admin");
       const result = await callMcp(
         { authorization: "Bearer tok" },
@@ -1471,7 +1683,7 @@ describe("handleMcpRequest", () => {
       expect(data).toEqual({ status: 202, body: { accepted: true } });
       expect(triggerMock).toHaveBeenCalledOnce();
       expect(logSpy).toHaveBeenCalledWith(
-        expect.stringMatching(/\[mcp\] write tool=trigger_kg_refresh actor=user@example\.com role=admin result=202/),
+        expect.stringMatching(/\[mcp\] write tool=trigger_kg_refresh actor=user@example\.com role=admin result=ok/),
       );
     });
 
@@ -1503,62 +1715,8 @@ describe("handleMcpRequest", () => {
       );
     });
 
-    it("with an entry-less identity (role null), returns the same forbidden result", async () => {
-      mockRole(null);
-      const triggerMock = vi.fn(async () => ({ status: 202, body: { accepted: true } }));
 
-      const result = await callMcp(
-        { authorization: "Bearer tok" },
-        true,
-        null,
-        BASE_URL,
-        "POST",
-        JSON.stringify({ jsonrpc: "2.0", id: 42, method: "tools/call", params: { name: "trigger_kg_refresh", arguments: {} } }),
-        undefined,
-        undefined,
-        undefined,
-        triggerMock,
-      );
 
-      expect(result.statusCode).toBe(200);
-      const parsed = JSON.parse(result.body);
-      expect(parsed.result.isError).toBe(true);
-      expect(parsed.result.content[0].text).toBe("forbidden: trigger_kg_refresh requires the admin role");
-      expect(triggerMock).not.toHaveBeenCalled();
-    });
-
-    it("trigger_kg_refresh's inputSchema declares an optional dryRun boolean", async () => {
-      mockRole("admin");
-      const result = await callMcp(
-        { authorization: "Bearer tok" },
-        true,
-        null,
-        BASE_URL,
-        "POST",
-        '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}',
-      );
-      const tool = JSON.parse(result.body).result.tools.find((t: { name: string }) => t.name === "trigger_kg_refresh");
-      expect(tool.inputSchema.properties.dryRun.type).toBe("boolean");
-    });
-
-    it("add_project's inputSchema declares optional per-reviewer maxTurns", async () => {
-      mockRole("admin");
-      const result = await callMcp(
-        { authorization: "Bearer tok" },
-        true,
-        null,
-        BASE_URL,
-        "POST",
-        '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}',
-      );
-      const tool = JSON.parse(result.body).result.tools.find((t: { name: string }) => t.name === "add_project");
-      expect(tool.inputSchema.properties.reviewers.items.required).toEqual(["id", "gates"]);
-      expect(tool.inputSchema.properties.reviewers.items.properties.maxTurns).toMatchObject({
-        type: "integer",
-        minimum: 1,
-        maximum: 200,
-      });
-    });
 
     it("as admin, dryRun:true is passed through to triggerKgRefresh (AII-632)", async () => {
       mockRole("admin");
@@ -1603,43 +1761,7 @@ describe("handleMcpRequest", () => {
       expect(triggerMock).toHaveBeenCalledWith(false, false, "user@example.com");
     });
 
-    it("as user, dryRun:true is still refused and triggerKgRefresh is never called (AII-632)", async () => {
-      mockRole("user");
-      const triggerMock = vi.fn(async () => ({ status: 202, body: { accepted: true } }));
 
-      const result = await callMcp(
-        { authorization: "Bearer tok" },
-        true,
-        null,
-        BASE_URL,
-        "POST",
-        JSON.stringify({ jsonrpc: "2.0", id: 47, method: "tools/call", params: { name: "trigger_kg_refresh", arguments: { dryRun: true } } }),
-        undefined,
-        undefined,
-        undefined,
-        triggerMock,
-      );
-
-      expect(result.statusCode).toBe(200);
-      const parsed = JSON.parse(result.body);
-      expect(parsed.result.isError).toBe(true);
-      expect(parsed.result.content[0].text).toBe("forbidden: trigger_kg_refresh requires the admin role");
-      expect(triggerMock).not.toHaveBeenCalled();
-    });
-
-    it("trigger_kg_refresh's inputSchema declares an optional acceptNewBaseline boolean (AII-628)", async () => {
-      mockRole("admin");
-      const result = await callMcp(
-        { authorization: "Bearer tok" },
-        true,
-        null,
-        BASE_URL,
-        "POST",
-        '{"jsonrpc":"2.0","id":48,"method":"tools/list","params":{}}',
-      );
-      const tool = JSON.parse(result.body).result.tools.find((t: { name: string }) => t.name === "trigger_kg_refresh");
-      expect(tool.inputSchema.properties.acceptNewBaseline.type).toBe("boolean");
-    });
 
     it("as admin, acceptNewBaseline:true is passed through to triggerKgRefresh with the actor's email (AII-628)", async () => {
       mockRole("admin");
@@ -1743,76 +1865,6 @@ describe("handleMcpRequest", () => {
       expect(triggerMock).not.toHaveBeenCalled();
     });
 
-    it("admin is a superset of user: a role: \"user\" write tool is listed and callable by both roles, refused for null", async () => {
-      const userTool = {
-        name: "test_only_user_write",
-        description: "temporary role: user write entry for the admin-superset test",
-        inputSchema: { type: "object", properties: {} },
-        role: "user" as const,
-        run: async () => ({ status: 200, body: { ok: true } }),
-      };
-      WRITE_TOOLS.push(userTool);
-      try {
-        mockRole("admin");
-        const adminList = await callMcp(
-          { authorization: "Bearer tok" },
-          true,
-          null,
-          BASE_URL,
-          "POST",
-          '{"jsonrpc":"2.0","id":50,"method":"tools/list","params":{}}',
-        );
-        const adminNames = JSON.parse(adminList.body).result.tools.map((t: { name: string }) => t.name);
-        expect(adminNames).toContain("test_only_user_write");
-
-        const adminCall = await callMcp(
-          { authorization: "Bearer tok" },
-          true,
-          null,
-          BASE_URL,
-          "POST",
-          JSON.stringify({ jsonrpc: "2.0", id: 51, method: "tools/call", params: { name: "test_only_user_write", arguments: {} } }),
-        );
-        expect(JSON.parse(adminCall.body).result.isError).not.toBe(true);
-
-        mockRole("user");
-        const userList = await callMcp(
-          { authorization: "Bearer tok" },
-          true,
-          null,
-          BASE_URL,
-          "POST",
-          '{"jsonrpc":"2.0","id":52,"method":"tools/list","params":{}}',
-        );
-        const userNames = JSON.parse(userList.body).result.tools.map((t: { name: string }) => t.name);
-        expect(userNames).toContain("test_only_user_write");
-
-        const userCall = await callMcp(
-          { authorization: "Bearer tok" },
-          true,
-          null,
-          BASE_URL,
-          "POST",
-          JSON.stringify({ jsonrpc: "2.0", id: 53, method: "tools/call", params: { name: "test_only_user_write", arguments: {} } }),
-        );
-        expect(JSON.parse(userCall.body).result.isError).not.toBe(true);
-
-        mockRole(null);
-        const nullCall = await callMcp(
-          { authorization: "Bearer tok" },
-          true,
-          null,
-          BASE_URL,
-          "POST",
-          JSON.stringify({ jsonrpc: "2.0", id: 54, method: "tools/call", params: { name: "test_only_user_write", arguments: {} } }),
-        );
-        const nullParsed = JSON.parse(nullCall.body);
-        expect(nullParsed.result.isError).toBe(true);
-        expect(nullParsed.result.content[0].text).toBe("forbidden: test_only_user_write requires the user role");
-      } finally {
-        WRITE_TOOLS.splice(WRITE_TOOLS.indexOf(userTool), 1);
-      }
-    });
   });
 
   describe("tools/call — write tier (set_runner_mode, pause_project, add_project, trigger_workflow_sync, clear_dispatch_dedup)", () => {
@@ -1842,7 +1894,7 @@ describe("handleMcpRequest", () => {
       expect(data).toEqual({ status: 200, body: { mode: "gha", source: "db" } });
       expect(setRunnerModeMock).toHaveBeenCalledWith({ mode: "gha" });
       expect(logSpy).toHaveBeenCalledWith(
-        expect.stringMatching(/\[mcp\] write tool=set_runner_mode actor=user@example\.com role=admin result=200/),
+        expect.stringMatching(/\[mcp\] write tool=set_runner_mode actor=user@example\.com role=admin result=ok/),
       );
     });
 
@@ -2226,9 +2278,10 @@ describe("handleMcpRequest", () => {
       expect(pauseProjectMock).not.toHaveBeenCalled();
     });
 
-    it("add_project: missing owner returns 400 and never calls addProject", async () => {
+    it("add_project: the action's own 400 for a missing owner flows back as the tool result (AII-713: upsertMappingAction validates)", async () => {
       mockRole("admin");
-      const addProjectMock = vi.fn(() => ({ status: 202, body: { teamKey: "AII", syncJobId: 5 } }));
+      const addProjectMock = vi.fn(() => ({ status: 400, body: { error: "owner is required" } }));
+      vi.spyOn(console, "log").mockImplementation(() => {});
 
       const result = await callMcp(
         { authorization: "Bearer tok" },
@@ -2236,10 +2289,7 @@ describe("handleMcpRequest", () => {
         null,
         BASE_URL,
         "POST",
-        JSON.stringify({
-          jsonrpc: "2.0", id: 74, method: "tools/call",
-          params: { name: "add_project", arguments: { teamKey: "AII", repo: "repo", defaultBranch: "main" } },
-        }),
+        JSON.stringify({ jsonrpc: "2.0", id: 70, method: "tools/call", params: { name: "add_project", arguments: { teamKey: "AII", repo: "repo", defaultBranch: "main" } } }),
         undefined,
         undefined,
         undefined,
@@ -2247,16 +2297,16 @@ describe("handleMcpRequest", () => {
         { addProject: addProjectMock },
       );
 
+      expect(result.statusCode).toBe(200);
       const parsed = JSON.parse(result.body);
-      const data = JSON.parse(parsed.result.content[0].text);
-      expect(data.status).toBe(400);
-      expect(data.body.error).toContain("teamKey, owner, and repo are required");
-      expect(addProjectMock).not.toHaveBeenCalled();
+      expect(JSON.parse(parsed.result.content[0].text)).toEqual({ status: 400, body: { error: "owner is required" } });
+      expect(addProjectMock).toHaveBeenCalledWith({ teamKey: "AII", repo: "repo", defaultBranch: "main" });
     });
 
-    it("add_project: missing defaultBranch returns 400 and never calls addProject", async () => {
+    it("add_project: the action's own 400 for a missing defaultBranch flows back as the tool result", async () => {
       mockRole("admin");
-      const addProjectMock = vi.fn(() => ({ status: 202, body: { teamKey: "AII", syncJobId: 5 } }));
+      const addProjectMock = vi.fn(() => ({ status: 400, body: { error: "defaultBranch is required" } }));
+      vi.spyOn(console, "log").mockImplementation(() => {});
 
       const result = await callMcp(
         { authorization: "Bearer tok" },
@@ -2264,10 +2314,7 @@ describe("handleMcpRequest", () => {
         null,
         BASE_URL,
         "POST",
-        JSON.stringify({
-          jsonrpc: "2.0", id: 75, method: "tools/call",
-          params: { name: "add_project", arguments: { teamKey: "AII", owner: "org", repo: "repo" } },
-        }),
+        JSON.stringify({ jsonrpc: "2.0", id: 71, method: "tools/call", params: { name: "add_project", arguments: { teamKey: "AII", owner: "o", repo: "repo" } } }),
         undefined,
         undefined,
         undefined,
@@ -2275,11 +2322,10 @@ describe("handleMcpRequest", () => {
         { addProject: addProjectMock },
       );
 
+      expect(result.statusCode).toBe(200);
       const parsed = JSON.parse(result.body);
-      const data = JSON.parse(parsed.result.content[0].text);
-      expect(data.status).toBe(400);
-      expect(data.body.error).toContain("defaultBranch is required");
-      expect(addProjectMock).not.toHaveBeenCalled();
+      expect(JSON.parse(parsed.result.content[0].text)).toEqual({ status: 400, body: { error: "defaultBranch is required" } });
+      expect(addProjectMock).toHaveBeenCalledWith({ teamKey: "AII", owner: "o", repo: "repo" });
     });
 
     it("trigger_workflow_sync: missing teamKey returns 400 and never calls triggerWorkflowSync", async () => {
@@ -2349,8 +2395,11 @@ describe("handleMcpRequest", () => {
           stalenessStamp: false,
         },
         listTools: async () => [],
-        proxyCall: () => { /* never reached */ },
+        callKgTool: async () => ({ ok: true, result: {} }),
       };
+      // AII-711: the capability gate runs inside the kg_* handler, which reads the boot-time
+      // singleton; the refusal is a tool result, not a JSON-RPC -32601 envelope.
+      setKgMemoryProvider(stubProvider);
 
       const result = await callMcp(
         { authorization: "Bearer tok" },
@@ -2363,9 +2412,8 @@ describe("handleMcpRequest", () => {
 
       expect(result.statusCode).toBe(200);
       const parsed = JSON.parse(result.body);
-      expect(parsed.error).toBeDefined();
-      expect(parsed.error.code).toBe(-32601);
-      expect(parsed.error.message).toContain("kg_path");
+      expect(parsed.result.isError).toBe(true);
+      expect(parsed.result.content[0].text).toBe("Tool not supported by this memory provider: kg_path");
       expect(mockHttpRequest).not.toHaveBeenCalled();
     });
 
@@ -2380,8 +2428,9 @@ describe("handleMcpRequest", () => {
           stalenessStamp: false,
         },
         listTools: async () => [],
-        proxyCall: () => { /* never reached */ },
+        callKgTool: async () => ({ ok: true, result: {} }),
       };
+      setKgMemoryProvider(stubProvider);
 
       const result = await callMcp(
         { authorization: "Bearer tok" },
@@ -2394,7 +2443,8 @@ describe("handleMcpRequest", () => {
 
       expect(result.statusCode).toBe(200);
       const parsed = JSON.parse(result.body);
-      expect(parsed.error.code).toBe(-32601);
+      expect(parsed.result.isError).toBe(true);
+      expect(parsed.result.content[0].text).toBe("Tool not supported by this memory provider: kg_provenance");
     });
 
     it("proxies kg_hybrid_search when provider has hybridSearch: true", async () => {
@@ -2427,7 +2477,7 @@ describe("handleMcpRequest", () => {
       expect(mockHttpRequest).not.toHaveBeenCalled();
     });
 
-    it("degrades a kg_* tools/call with the existing 503 wording when no provider is configured, rather than failing the whole request", async () => {
+    it("degrades a kg_* tools/call to an isError result with the existing no-provider wording, rather than failing the whole request", async () => {
       const result = await callMcp(
         { authorization: "Bearer tok" },
         true,
@@ -2438,8 +2488,10 @@ describe("handleMcpRequest", () => {
         "sidecar: KG_SIDECAR_URL unset",
       );
 
-      expect(result.statusCode).toBe(503);
-      expect(JSON.parse(result.body).error).toBe("no memory provider is configured (sidecar: KG_SIDECAR_URL unset)");
+      expect(result.statusCode).toBe(200);
+      const parsed = JSON.parse(result.body);
+      expect(parsed.result.isError).toBe(true);
+      expect(parsed.result.content[0].text).toBe("no memory provider is configured");
       expect(mockHttpRequest).not.toHaveBeenCalled();
     });
   });
@@ -2497,169 +2549,241 @@ describe("handleMcpRequest", () => {
         "POST",
         '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"kg_search","arguments":{}}}',
       );
-      expect(kgCall.statusCode).toBe(503);
+      expect(kgCall.statusCode).toBe(200);
+      expect(JSON.parse(kgCall.body).result.isError).toBe(true);
     });
   });
 
-  describe("proxy forwarding (non-diagnostic requests)", () => {
-    it("returns 503 for non-diagnostic requests when sidecar is not configured", async () => {
-      const result = await callMcp({ authorization: "Bearer tok" }, true, null);
-      expect(result.statusCode).toBe(503);
-      expect(JSON.parse(result.body).error).toContain("no memory provider");
+  describe("report-card reads through the tools service (AII-711)", () => {
+    it("get_issue_report_card threads `issue` through /mcp and returns the card verbatim", async () => {
+      (getIssueReportCard as ReturnType<typeof vi.fn>).mockReturnValue({ issue: "AII-1", dispatches: 2, passes: 3, costUsd: 1.5, merged: true });
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 31, method: "tools/call", params: { name: "get_issue_report_card", arguments: { issue: "AII-1" } } }),
+      );
+      expect(result.statusCode).toBe(200);
+      expect(getIssueReportCard).toHaveBeenCalledWith("AII-1");
+      const parsed = JSON.parse(result.body);
+      expect(parsed.result.isError).toBeUndefined();
+      expect(JSON.parse(parsed.result.content[0].text)).toEqual({ issue: "AII-1", dispatches: 2, passes: 3, costUsd: 1.5, merged: true });
     });
 
-    it("includes sidecar diagnostic in 503 when KG_SIDECAR_URL is unset", async () => {
-      const result = await callMcp({ authorization: "Bearer tok" }, true, null, BASE_URL, "POST", undefined, "sidecar: KG_SIDECAR_URL unset");
-      expect(result.statusCode).toBe(503);
-      expect(JSON.parse(result.body).error).toBe("no memory provider is configured (sidecar: KG_SIDECAR_URL unset)");
+    it("get_fleet_report threads `days` through /mcp and returns the report verbatim", async () => {
+      (getFleetReport as ReturnType<typeof vi.fn>).mockReturnValue({ byRepo: [], oneShotPct: 1, eventualPct: 1, planning: {}, escapeRate: 0, runaways: [] });
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 32, method: "tools/call", params: { name: "get_fleet_report", arguments: { days: 7 } } }),
+      );
+      expect(result.statusCode).toBe(200);
+      expect(getFleetReport).toHaveBeenCalledWith({ days: 7 });
+      const parsed = JSON.parse(result.body);
+      expect(Object.keys(JSON.parse(parsed.result.content[0].text)).sort()).toEqual(["byRepo", "escapeRate", "eventualPct", "oneShotPct", "planning", "runaways"]);
     });
+  });
 
-    it("does not proxy when sidecar is null and request is not a diagnostic tool", async () => {
-      await callMcp({ authorization: "Bearer tok" }, true, null);
+  describe("kg_* reads through the tools service (AII-711)", () => {
+    const KG_TOOLS = ["kg_hybrid_search", "kg_search", "kg_semantic_search", "kg_neighbors", "kg_path", "kg_provenance"];
+
+    it.each(KG_TOOLS)("%s returns the sidecar's result verbatim through /mcp, degraded flag intact", async (name) => {
+      const callKgTool = vi.fn(async (): Promise<KgToolResult> => ({ ok: true, result: { degraded: true, tool: name } }));
+      const stubProvider: MemoryProvider = {
+        id: "stub",
+        capabilities: { hybridSearch: true, neighbors: true, path: true, provenance: true, stalenessStamp: false },
+        listTools: async () => [],
+        callKgTool,
+      };
+      setKgMemoryProvider(stubProvider);
+
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        stubProvider,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 30, method: "tools/call", params: { name, arguments: { q: "x" } } }),
+      );
+
+      expect(result.statusCode).toBe(200);
+      const parsed = JSON.parse(result.body);
+      expect(parsed.result.isError).toBeUndefined();
+      expect(JSON.parse(parsed.result.content[0].text)).toEqual({ degraded: true, tool: name });
+      expect(callKgTool).toHaveBeenCalledWith(name, { q: "x" });
+      expect(toolsClientMock.callTool).toHaveBeenCalledWith(name, { q: "x" }, expect.objectContaining({ kind: "human" }), undefined);
+      expect(mockHttpRequest).not.toHaveBeenCalled();
+      setKgMemoryProvider(null);
+    });
+  });
+
+  describe("non-tool requests after the sidecar proxy left (AII-711)", () => {
+    it("answers 405 with Allow: POST to a GET — the door offers no SSE channel", async () => {
+      const result = await callMcp({ authorization: "Bearer tok" }, true, DEFAULT_PROVIDER, BASE_URL, "GET");
+      expect(result.statusCode).toBe(405);
+      expect(result.responseHeaders["allow"] ?? result.responseHeaders["Allow"]).toBe("POST");
       expect(mockHttpRequest).not.toHaveBeenCalled();
     });
 
-    it("forwards the request method to the sidecar", async () => {
-      const { capturedOpts } = setupProxyMock({});
-      await callMcp({ authorization: "Bearer tok" }, true, DEFAULT_PROVIDER, BASE_URL, "GET");
-      expect(capturedOpts.value?.method).toBe("GET");
+    it("answers 405 to a DELETE — there is no server-side session to end", async () => {
+      const result = await callMcp({ authorization: "Bearer tok" }, true, DEFAULT_PROVIDER, BASE_URL, "DELETE");
+      expect(result.statusCode).toBe(405);
+      expect(mockHttpRequest).not.toHaveBeenCalled();
     });
 
-    it("forwards DELETE method to the sidecar", async () => {
-      const { capturedOpts } = setupProxyMock({});
-      await callMcp({ authorization: "Bearer tok" }, true, DEFAULT_PROVIDER, BASE_URL, "DELETE");
-      expect(capturedOpts.value?.method).toBe("DELETE");
-    });
-
-    it("strips authorization header before forwarding", async () => {
-      const { capturedOpts } = setupProxyMock({});
-      await callMcp(
-        { authorization: "Bearer tok", "content-type": "application/json" },
-        true,
-      );
-      const hdrs = capturedOpts.value!.headers as Record<string, string>;
-      expect(hdrs.authorization).toBeUndefined();
-      expect(hdrs.cookie).toBeUndefined();
-      expect(hdrs["content-type"]).toBe("application/json");
-    });
-
-    it("strips incoming host header and sets it to the sidecar host", async () => {
-      const { capturedOpts } = setupProxyMock({});
-      await callMcp({ authorization: "Bearer tok", host: "external.host.com" }, true);
-      const hdrs = capturedOpts.value!.headers as Record<string, string>;
-      expect(hdrs.host).toBe("127.0.0.1:8765");
-    });
-
-    it("forwards non-RPC body to the sidecar", async () => {
-      const receivedChunks: Buffer[] = [];
-      const { mockProxyReq } = setupProxyMock({});
-      mockProxyReq.on("data", (chunk: Buffer) => receivedChunks.push(chunk));
-
-      await callMcp(
-        { authorization: "Bearer tok", "content-type": "application/json" },
+    it("acknowledges any notification with 202 and no body", async () => {
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
         true,
         DEFAULT_PROVIDER,
         BASE_URL,
         "POST",
-        "not-json",
+        '{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}}',
       );
-
-      expect(Buffer.concat(receivedChunks).toString()).toBe("not-json");
+      expect(result.statusCode).toBe(202);
+      expect(result.body).toBe("");
+      expect(mockHttpRequest).not.toHaveBeenCalled();
     });
 
-    it("forwards a kg_* tools/call body to the sidecar", async () => {
-      const receivedChunks: Buffer[] = [];
-      const { mockProxyReq } = setupProxyMock({});
-      mockProxyReq.on("data", (chunk: Buffer) => receivedChunks.push(chunk));
-
-      const kgCall = JSON.stringify({
-        jsonrpc: "2.0", id: 99, method: "tools/call",
-        params: { name: "kg_search", arguments: { query: "test" } },
-      });
-      await callMcp(
-        { authorization: "Bearer tok", "content-type": "application/json" },
+    it("answers -32601 to an unknown JSON-RPC method instead of proxying it", async () => {
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
         true,
         DEFAULT_PROVIDER,
         BASE_URL,
         "POST",
-        kgCall,
+        '{"jsonrpc":"2.0","id":5,"method":"resources/list","params":{}}',
       );
-
-      expect(Buffer.concat(receivedChunks).toString()).toBe(kgCall);
-    });
-
-    it("writes the sidecar response status code back to the client", async () => {
-      setupProxyMock({ statusCode: 200, chunks: ['{"tools":[]}'] });
-      const result = await callMcp({ authorization: "Bearer tok" }, true);
       expect(result.statusCode).toBe(200);
+      const parsed = JSON.parse(result.body);
+      expect(parsed.id).toBe(5);
+      expect(parsed.error.code).toBe(-32601);
+      expect(parsed.error.message).toContain("resources/list");
+      expect(mockHttpRequest).not.toHaveBeenCalled();
     });
 
-    it("streams sidecar response body verbatim to the client", async () => {
-      setupProxyMock({
-        statusCode: 200,
-        responseHeaders: { "content-type": "application/json" },
-        chunks: ['{"result":"ok"}'],
-      });
-      const result = await callMcp({ authorization: "Bearer tok" }, true);
-      expect(result.body).toBe('{"result":"ok"}');
-    });
-
-    it("streams SSE events from sidecar to client", async () => {
-      setupProxyMock({
-        statusCode: 200,
-        responseHeaders: { "content-type": "text/event-stream" },
-        chunks: [
-          'data: {"type":"text","text":"hello"}\n\n',
-          'data: {"type":"end"}\n\n',
-        ],
-      });
-      const result = await callMcp({ authorization: "Bearer tok" }, true);
+    it("answers -32602 to an unknown tool name instead of proxying it", async () => {
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        DEFAULT_PROVIDER,
+        BASE_URL,
+        "POST",
+        '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"no_such_tool","arguments":{}}}',
+      );
       expect(result.statusCode).toBe(200);
-      expect(result.responseHeaders["content-type"]).toBe("text/event-stream");
-      expect(result.body).toContain('data: {"type":"text","text":"hello"}');
-      expect(result.body).toContain('data: {"type":"end"}');
+      const parsed = JSON.parse(result.body);
+      expect(parsed.error.code).toBe(-32602);
+      expect(parsed.error.message).toBe("Unknown tool: no_such_tool");
+      expect(toolsClientMock.callTool).not.toHaveBeenCalled();
+      expect(mockHttpRequest).not.toHaveBeenCalled();
     });
+  });
+});
 
-    it("destroys the response when proxyRes emits an error mid-stream", async () => {
-      const mockProxyReq = new PassThrough();
-      const mockProxyRes = new PassThrough();
-      Object.assign(mockProxyRes, {
-        statusCode: 200,
-        headers: { "content-type": "text/event-stream" },
-      });
+describe("write idempotency key names one request, not one JSON-RPC id (AII-719, 2026-09-17)", () => {
+  // /mcp is stateless and MCP clients restart their JSON-RPC ids on every connection, so
+  // nothing in the request names "one connection's attempt at this call" except what the
+  // caller states explicitly via params._meta.idempotencyKey. The server never derives one.
+  const setRunnerModeCall = (id: number, mode: string, idempotencyKey?: string) =>
+    callMcp(
+      { authorization: "Bearer tok" },
+      true,
+      null,
+      BASE_URL,
+      "POST",
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id,
+        method: "tools/call",
+        params: {
+          name: "set_runner_mode",
+          arguments: { mode },
+          ...(idempotencyKey !== undefined ? { _meta: { idempotencyKey } } : {}),
+        },
+      }),
+    );
 
-      mockHttpRequest.mockImplementationOnce((_options: http.RequestOptions, cb: (res: unknown) => void) => {
-        process.nextTick(() => {
-          cb(mockProxyRes);
-          process.nextTick(() => {
-            mockProxyRes.emit("error", Object.assign(new Error("connection reset"), { code: "ECONNRESET" }));
-          });
-        });
-        return mockProxyReq;
-      });
+  function idempotencyKeys(): (string | undefined)[] {
+    return (toolsClientMock.callTool as ReturnType<typeof vi.fn>).mock.calls.map(
+      (c: unknown[]) => (c[3] as { idempotencyKey?: string } | undefined)?.idempotencyKey,
+    );
+  }
 
-      (mcpOauth.verifyMcpToken as ReturnType<typeof vi.fn>).mockReturnValue({
-        email: "u@e.ai", sub: "s", provider: "google",
-      });
-      const req = new MockRequest("GET", { authorization: "Bearer tok" });
-      const res = new MockResponse();
-      handleMcpRequest(req as never, res as never, DEFAULT_PROVIDER, BASE_URL);
-      await res.done;
-      expect(res.headersSent).toBe(true);
+  beforeEach(() => {
+    mockRole("admin");
+    (toolsClientMock.callTool as ReturnType<typeof vi.fn>).mockResolvedValue({ status: "ok", content: [{ type: "text", text: "{}" }] });
+  });
+
+  it("no _meta.idempotencyKey: two calls with the same rpc id and arguments produce two dispatches, neither carrying a key", async () => {
+    await setRunnerModeCall(7, "fly");
+    await setRunnerModeCall(7, "fly");
+    expect(toolsClientMock.callTool).toHaveBeenCalledTimes(2);
+    expect(idempotencyKeys()).toEqual([undefined, undefined]);
+  });
+
+  // The forwarded key is the caller's identity, then the caller's own key (scopeIdempotencyKey):
+  // Restate scopes a key by (service, handler, key) with no notion of caller, so without the
+  // prefix two callers reusing one literal key would attach to each other's cached result.
+  it("same caller, same _meta.idempotencyKey: both calls forward the same scoped key, with the caller's key as the suffix", async () => {
+    await setRunnerModeCall(7, "fly", "retry-abc");
+    await setRunnerModeCall(7, "default", "retry-abc");
+    expect(idempotencyKeys()).toEqual(["user@example.com:retry-abc", "user@example.com:retry-abc"]);
+  });
+
+  it("two callers with different identities supplying the same _meta.idempotencyKey forward different keys", async () => {
+    await setRunnerModeCall(7, "fly", "retry-abc");
+    // callMcp sets the verifyMcpToken default to user@example.com on every call; a queued
+    // once-value takes precedence, so the second call resolves as a different identity.
+    (mcpOauth.verifyMcpToken as ReturnType<typeof vi.fn>).mockReturnValueOnce({
+      ok: true,
+      identity: { kind: "human", email: "other@example.com", sub: "sub2", provider: "google", clientId: null },
+      token: FIXTURE_TOKEN_INFO,
     });
+    await setRunnerModeCall(7, "fly", "retry-abc");
+    expect(toolsClientMock.callTool).toHaveBeenCalledTimes(2);
+    expect(idempotencyKeys()).toEqual(["user@example.com:retry-abc", "other@example.com:retry-abc"]);
+  });
 
-    it("returns 502 on connection refused", async () => {
-      setupProxyError("ECONNREFUSED");
-      const result = await callMcp({ authorization: "Bearer tok" }, true);
-      expect(result.statusCode).toBe(502);
-      expect(JSON.parse(result.body).error).toContain("connection refused");
-    });
+  it("a key that fails the shape check answers -32602 and never reaches callTool", async () => {
+    const result = await setRunnerModeCall(7, "fly", "has a space");
+    expect(result.statusCode).toBe(200);
+    const parsed = JSON.parse(result.body);
+    expect(parsed.error.code).toBe(-32602);
+    expect(toolsClientMock.callTool).not.toHaveBeenCalled();
+  });
 
-    it("returns 502 on other sidecar errors", async () => {
-      setupProxyError("ETIMEDOUT");
-      const result = await callMcp({ authorization: "Bearer tok" }, true);
-      expect(result.statusCode).toBe(502);
-      expect(JSON.parse(result.body).error).toBeDefined();
-    });
+  it("an empty or over-length key both fail the shape check", async () => {
+    const empty = await setRunnerModeCall(7, "fly", "");
+    expect(JSON.parse(empty.body).error.code).toBe(-32602);
+
+    const tooLong = await setRunnerModeCall(8, "fly", "a".repeat(129));
+    expect(JSON.parse(tooLong.body).error.code).toBe(-32602);
+
+    expect(toolsClientMock.callTool).not.toHaveBeenCalled();
+  });
+
+  it("a read tool ignores a supplied _meta.idempotencyKey — no error, no key forwarded", async () => {
+    const result = await callMcp(
+      { authorization: "Bearer tok" },
+      true,
+      null,
+      BASE_URL,
+      "POST",
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 9,
+        method: "tools/call",
+        params: { name: "get_runner_mode", arguments: {}, _meta: { idempotencyKey: "has a space" } },
+      }),
+    );
+    expect(result.statusCode).toBe(200);
+    expect(JSON.parse(result.body).error).toBeUndefined();
+    expect(toolsClientMock.callTool).toHaveBeenCalledWith("get_runner_mode", {}, expect.objectContaining({ kind: "human" }), undefined);
   });
 });

@@ -1,0 +1,80 @@
+/**
+ * The identity contract every caller of the orchestrator's tools is resolved to.
+ *
+ * `IdentityKind` distinguishes a human sign-in from in-process/system code today;
+ * AII-702 adds `"run"` for a Restate-issued run capability. `Caller` is the shape
+ * every tool handler receives (from AII-707 step 6 on) regardless of which kind
+ * produced it.
+ *
+ * `RefreshAuthority` is the seam behind the MCP refresh-token grant: `SqliteRefreshAuthority`
+ * (src/mcp-oauth.ts, AII-707) was its first implementation; `RestateRefreshAuthority`
+ * (src/restate/operator-object.ts, AII-709) is the default as of AII-709, serializing
+ * concurrent refreshes of one client id through the `Operator` Virtual Object.
+ */
+
+import type { AccessRole } from "./access-entries.js";
+
+export type IdentityKind = "human" | "system";
+
+export interface Caller {
+  kind: IdentityKind;
+  email: string | null;
+  role: AccessRole | null;
+}
+
+/** The identity in-process/system code acts under: unrestricted, unattributed to a person. */
+export function systemCaller(): Caller {
+  return { kind: "system", email: null, role: "admin" };
+}
+
+export interface RefreshInput {
+  refreshToken: string;
+  clientId: string;
+}
+
+/**
+ * The outcome of rotating a refresh token, independent of how it is reported over HTTP.
+ * `denied` carries the specific reason (invalid token, client_id mismatch, or an identity
+ * the allowlist no longer admits) so the caller can preserve today's `error_description`
+ * text; `replay` and `expired` map to a fixed description at the call site. `unavailable`
+ * carries a `cause` so the HTTP layer can distinguish "the refresh authority itself
+ * couldn't be reached" (`restate`, or omitted — `SqliteRefreshAuthority` has no other
+ * unavailable case) from "the allowlist re-check couldn't be read" (`allowlist`), which
+ * the SQLite path answered with a different error code (AII-718).
+ */
+export type RefreshOutcome =
+  | { status: "ok"; accessToken: string; refreshToken: string; expiresInSeconds: number }
+  | { status: "replay" }
+  | { status: "expired" }
+  | { status: "denied"; description: string }
+  | { status: "unavailable"; cause?: "restate" | "allowlist" };
+
+/** A brand-new sign-in (the authorization-code grant): no serialization concern, unlike `rotate`. */
+export interface IssueInput {
+  clientId: string;
+  email: string;
+  sub: string;
+  provider: string;
+}
+
+export type IssueOutcome =
+  | { status: "ok"; refreshToken: string }
+  | { status: "unavailable" };
+
+/**
+ * The refresh-expiry lookup behind `get_session_identity`'s `refresh` field (AII-714):
+ * `expiresAt: null` means the client has no live refresh token (nothing issued, or its
+ * chain was revoked), which is distinct from `unavailable` (the authority couldn't be
+ * reached) — the caller collapses both to `refresh: null`, but the distinction matters
+ * for anyone consuming `describe` directly.
+ */
+export type DescribeOutcome =
+  | { status: "ok"; expiresAt: number | null }
+  | { status: "unavailable" };
+
+export interface RefreshAuthority {
+  issue(input: IssueInput): Promise<IssueOutcome>;
+  rotate(input: RefreshInput): Promise<RefreshOutcome>;
+  revokeFamily(familyId: string): Promise<void>;
+  describe(clientId: string): Promise<DescribeOutcome>;
+}

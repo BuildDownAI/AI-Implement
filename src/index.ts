@@ -27,16 +27,7 @@ import { decideAvailabilityAction, getDeployPolicy, getLastActedCommit, setLastA
 import { canSelfDeploy, makeStartDeploy, readKgSourceRepo, parseKgSourceRepo } from "./deploy.js";
 import { remediateStuckJob, remediateFailedJob } from "./stuck-watchdog.js";
 import type { StuckWatchdogConfig } from "./stuck-watchdog.js";
-import {
-  handleAdminRequest,
-  setRunnerModeAction,
-  pauseProjectAction,
-  upsertMappingAction,
-  triggerWorkflowSyncAction,
-  clearDedupEntryAction,
-  type UpsertMappingBody,
-  type AdminConfig,
-} from "./admin.js";
+import { handleAdminRequest } from "./admin.js";
 import { initLogTable, appendLog, countPriorDispatches, completeOrphanedPlanningJobs, attachJobRunIdIfMissing, updateJobRunId, updateJobStatus, updateJobPrUrl, updateJobMachineDetails, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobById, getJobByMachineId, resetStuckAttempts, getRecentFailedRunUrls } from "./log.js";
 import { isParked, recordDispatchFailure, recordDispatchSuccess, shouldCountFailure, initDispatchBreakerTable } from "./dispatch-breaker.js";
 import type { Job, JobStatus } from "./log.js";
@@ -46,6 +37,7 @@ import { configureOAuthProviders, isOAuthConfigured, providersFromEnv } from "./
 import { handleOAuthCallback, handleOAuthLogout, handleOAuthProviders, handleOAuthStart } from "./oauth/routes.js";
 import { allowlistHasNoAdmin, initAccessEntriesTable } from "./access-entries.js";
 import { initAccessAuditTable } from "./access-audit.js";
+import { initAuthEventsTable } from "./mcp-auth-events.js";
 import { initAccessPageGrantsTable } from "./access-page-grants.js";
 import { handleTokenRequest } from "./token-vending.js";
 import { handleDependencyTokenRequest } from "./dependency-token-vending.js";
@@ -68,7 +60,7 @@ import type { RunnerProgressBody, RunnerResultBody } from "./runner-callback.js"
 import { mintRunToken, PLANNING_TTL_SECONDS, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
 import { handleGapFillTrigger } from "./gap-fill-trigger.js";
 import { handleMcpRequest } from "./mcp.js";
-import { resolveMemoryProvider, providerUnconfiguredReason, SidecarMemoryProvider, KG_TOOL_CAPABILITY, probeWithTimeout, sidecarHealthFields } from "./kg-provider.js";
+import { resolveMemoryProvider, providerUnconfiguredReason, SidecarMemoryProvider, KG_TOOL_CAPABILITY, probeWithTimeout, sidecarHealthFields, setKgMemoryProvider } from "./kg-provider.js";
 import type { MemoryProvider } from "./kg-provider.js";
 import { withRequestErrorBoundary } from "./http-server.js";
 import {
@@ -105,7 +97,11 @@ import { listOpenReviewFindings } from "./review-ledger-store.js";
 import { detectMergedPrs, prNumberFromUrl } from "./poll-merged-prs.js";
 import { githubActionsWatchdogDecision } from "./github-actions-watchdog.js";
 import { KgSidecar } from "./kg-sidecar.js";
-import { makeKgRefresh, runKgRefreshPreflight } from "./kg-refresh.js";
+import { RestateSidecar } from "./restate/server.js";
+import { startRestateEndpoint, register as registerRestateEndpoint } from "./restate/endpoint.js";
+import { setProviderRegistry } from "./restate/tools.js";
+import { callTool } from "./restate/tools-client.js";
+import { makeKgRefresh, setActiveKgRefresh } from "./kg-refresh.js";
 import type { KgRefreshHandle } from "./kg-refresh.js";
 import { beginCycle, isCurrentCycle, getPollStats, runWithDeadline } from "./poll-cycle.js";
 import { monitorKgRefreshGhaJob } from "./monitor-gha.js";
@@ -3485,6 +3481,7 @@ function startServer(
     },
   });
   activeKgRefresh = kgRefresh;
+  setActiveKgRefresh(kgRefresh);
   // A deploy hold clearing is not a `running` transition inside kgRefresh (trigger()'s
   // deployHeld() check answers 409 before running is ever set) — wake any webhook head
   // queued behind that refusal explicitly (AII-636).
@@ -3957,52 +3954,18 @@ function startServer(
       }
     }
 
-    // MCP endpoint — OAuth bearer token authenticated
+    // MCP endpoint — OAuth bearer token authenticated. The six write tools used to be wired
+    // in here as bound closures over this request's config/registry; AII-713 moved them onto
+    // the orchestratorTools Restate service (src/restate/tools.ts), which re-derives its own
+    // AdminConfig/ProviderRegistry the same way the read handlers already did (AII-711) — see
+    // that file's mcpAdminConfig() and providerRegistry.
     if (pathname === "/mcp") {
-      const kgPreflightFn = config.kgSourceRepo
-        ? () => runKgRefreshPreflight({
-            githubAppId: config.githubAppId,
-            githubAppPrivateKey: config.githubAppPrivateKey,
-            kgSourceRepo: config.kgSourceRepo!,
-            kgBaseRepo: getOrchestratorSettings().kgBaseRepo,
-          })
-        : undefined;
-      const getKgStatusFn = () => kgRefresh.status();
-      const triggerKgRefreshFn = (dryRun?: boolean, acceptNewBaseline?: boolean, actorEmail?: string) =>
-        kgRefresh.trigger({ dryRun, acceptNewBaseline, actorEmail });
-      // Same AdminConfig shape the /admin routes build (line ~3908) — the five write
-      // tools below reuse the admin route's own action functions.
-      const mcpAdminConfig: AdminConfig = {
-        adminAccessCode: config.adminAccessCode,
-        flySessionsToken: config.flySessionsToken,
-        flySessionsApp: config.flySessionsApp,
-        flySessionsRegion: config.flySessionsRegion,
-        githubAppId: config.githubAppId,
-        githubAppPrivateKey: config.githubAppPrivateKey,
-        kgSourceRepo: config.kgSourceRepo,
-        notifyWebhookUrl: config.notifyWebhookUrl,
-      };
-      const setRunnerModeFn = (patch: { mode?: string }) => setRunnerModeAction(mcpAdminConfig, patch);
-      const pauseProjectFn = (teamKey: string, paused: boolean) => pauseProjectAction(teamKey, paused);
-      const addProjectFn = (body: Record<string, unknown>) =>
-        upsertMappingAction(body as UpsertMappingBody, mcpAdminConfig, registry);
-      const triggerWorkflowSyncFn = (teamKey: string) => triggerWorkflowSyncAction(mcpAdminConfig, teamKey);
-      const clearDispatchDedupFn = (issueId: string) => clearDedupEntryAction(issueId);
       handleMcpRequest(
         req,
         res,
         memoryProvider,
         config.oauthRedirectBaseUrl,
         memoryProviderDiagnostic,
-        config.sessionImage,
-        kgPreflightFn,
-        getKgStatusFn,
-        triggerKgRefreshFn,
-        setRunnerModeFn,
-        pauseProjectFn,
-        addProjectFn,
-        triggerWorkflowSyncFn,
-        clearDispatchDedupFn,
       ).catch((err) => {
         console.error("[mcp] Unhandled error:", err);
         if (!res.headersSent) {
@@ -4077,7 +4040,7 @@ function startServer(
           return { started: getPollStats().pollCount > before };
         },
         notifyWebhookUrl: config.notifyWebhookUrl,
-      }, registry, { startDeploy, selfDeployTarget: config.selfDeployTarget, kgRefresh })) return;
+      }, registry, { startDeploy, selfDeployTarget: config.selfDeployTarget, kgRefresh, callTool })) return;
     }
 
     res.writeHead(404, { "Content-Type": "application/json" });
@@ -4112,6 +4075,7 @@ async function main(): Promise<void> {
   initMcpOAuthTables();
   initAccessAuditTable();
   initAccessPageGrantsTable();
+  initAuthEventsTable();
 
   // A process that died mid-deploy must not leave dispatch paused forever.
   const holdWasSet = clearDeployHold();
@@ -4124,6 +4088,22 @@ async function main(): Promise<void> {
   const sidecar = new KgSidecar();
   await sidecar.start();
 
+  // Restate sidecar (AII-627, ADR 023): a second child process, started the same way and
+  // just as non-fatal on failure. A missing binary, an early exit, or a failed registration
+  // logs one warning and boot continues; the kg-refresh trigger seam (AII-683) answers 503
+  // restate-unavailable while no successful registration has completed.
+  const restateSidecar = new RestateSidecar();
+  const restateReady = await restateSidecar.start();
+  if (restateReady) {
+    try {
+      await startRestateEndpoint();
+      const result = await registerRestateEndpoint();
+      console.log(`[restate] boot registration: ${result.outcome}${result.detail ? ` (${result.detail})` : ""}`);
+    } catch (err) {
+      console.error(`[restate] SDK endpoint failed to start: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   const config = loadConfig();
   if (!config.kgSourceRepo) console.log("[kg] KG_SOURCE_REPO not set — knowledge graph disabled");
 
@@ -4133,6 +4113,10 @@ async function main(): Promise<void> {
   // second, independent MCP session.
   const memoryProvider = resolveMemoryProvider(config.kgSidecarUrl, config.memoryProviderId);
   const memoryProviderDiagnostic = providerUnconfiguredReason(config.kgSidecarUrl, config.memoryProviderId);
+  // Also reachable from src/restate/tools.ts's kg_* handlers, which — unlike handleMcpRequest
+  // below — have no per-request dependency injection; sharing this instance means they
+  // negotiate the same MCP session rather than a second, independent one.
+  setKgMemoryProvider(memoryProvider);
   let sidecarProbeError: string | null = null;
   if (memoryProvider instanceof SidecarMemoryProvider) {
     const health = await probeWithTimeout(memoryProvider);
@@ -4149,6 +4133,9 @@ async function main(): Promise<void> {
   // for each mapping. Snapshot polling iterates unique providers; verb calls
   // (markPlanningStarted, markImplementing, …) resolve at the call site.
   const registry = new ProviderRegistry(providerConfigFromEnv(), () => getMappings());
+  // The add_project Restate handler (src/restate/tools.ts) must invalidate this registry, not
+  // a private one, when a mapping changes (AII-713).
+  setProviderRegistry(registry);
 
   const teamRepoMap = getMappings();
 
@@ -4238,6 +4225,7 @@ async function main(): Promise<void> {
     ]);
 
     await sidecar.stop();
+    await restateSidecar.stop();
 
     server.close(() => {
       closeDb();

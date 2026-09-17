@@ -574,6 +574,57 @@ describe("SidecarMemoryProvider session handling", () => {
     expect(result).toEqual([]);
     expect(mockHttpRequest).toHaveBeenCalledTimes(4);
   });
+  // ---- callKgTool (AII-711): the non-streaming counterpart to proxyCall that a Restate
+  // tool handler calls. Same session dance, same wording; never writes to a response.
+  describe("callKgTool", () => {
+    beforeEach(() => {
+      // The re-probe a failure kicks off is fire-and-forget (AII-650); keep it out of these
+      // request counts so each case asserts only the call it made.
+      vi.spyOn(SidecarMemoryProvider.prototype as unknown as { maybeReprobe: () => Promise<void> }, "maybeReprobe").mockResolvedValue(undefined);
+    });
+
+    it("returns the sidecar's JSON-RPC result untouched — the degraded flag survives", async () => {
+      queueResponse(200, JSON.stringify({ jsonrpc: "2.0", id: "call-kg_hybrid_search", result: { degraded: true, hits: [] } }));
+      const p = new SidecarMemoryProvider("http://127.0.0.1:8765/mcp");
+      const outcome = await p.callKgTool("kg_hybrid_search", { query: "x" });
+      expect(outcome).toEqual({ ok: true, result: { degraded: true, hits: [] } });
+      expect(mockHttpRequest).toHaveBeenCalledTimes(1);
+      const opts = mockHttpRequest.mock.calls[0][0] as { method: string; headers: Record<string, string> };
+      expect(opts.method).toBe("POST");
+      expect(opts.headers.accept).toContain("text/event-stream");
+    });
+
+    it("turns a JSON-RPC error into { ok: false, error: <its message> }", async () => {
+      queueResponse(200, JSON.stringify({ jsonrpc: "2.0", id: 1, error: { code: -32602, message: "bad iri" } }));
+      const p = new SidecarMemoryProvider("http://127.0.0.1:8765/mcp");
+      expect(await p.callKgTool("kg_neighbors", { iri: "x" })).toEqual({ ok: false, error: "bad iri" });
+    });
+
+    it("maps a refused connection to the same wording proxyCall wrote into its 502", async () => {
+      queueConnectionError("ECONNREFUSED");
+      const p = new SidecarMemoryProvider("http://127.0.0.1:8765/mcp");
+      expect(await p.callKgTool("kg_search", { query: "x" })).toEqual({ ok: false, error: "KG sidecar unavailable: connection refused" });
+    });
+
+    it("maps an unparsable 200 body to \"KG sidecar error\"", async () => {
+      queueResponse(200, "<html>not json</html>");
+      const p = new SidecarMemoryProvider("http://127.0.0.1:8765/mcp");
+      expect(await p.callKgTool("kg_search", { query: "x" })).toEqual({ ok: false, error: "KG sidecar error" });
+    });
+
+    it("retries once with a fresh session after 400 Missing session ID and returns the retry's result", async () => {
+      queueResponse(400, MISSING_SESSION_BODY);
+      queueResponse(200, JSON.stringify({ jsonrpc: "2.0", id: 1, result: {} }), { "mcp-session-id": "sess-7" });
+      queueResponse(200, JSON.stringify({ jsonrpc: "2.0", result: {} }));
+      queueResponse(200, JSON.stringify({ jsonrpc: "2.0", id: 1, result: { hits: [1] } }));
+      const p = new SidecarMemoryProvider("http://127.0.0.1:8765/mcp");
+      expect(await p.callKgTool("kg_search", { query: "x" })).toEqual({ ok: true, result: { hits: [1] } });
+      expect(mockHttpRequest).toHaveBeenCalledTimes(4);
+      const retryOpts = mockHttpRequest.mock.calls[3][0] as { headers: Record<string, unknown> };
+      expect(retryOpts.headers["mcp-session-id"]).toBe("sess-7");
+    });
+  });
+
 });
 
 // ---- SidecarMemoryProvider.probe() and sidecarHealth (AII-648) ----

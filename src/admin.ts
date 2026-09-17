@@ -56,6 +56,7 @@ import { listMachines, destroyMachine, listAppSecrets, setAppSecrets, unsetAppSe
 import type { TicketIssue, AIImplementSnapshot } from "./providers/types.js";
 import type { ProviderRegistry } from "./providers/registry.js";
 import { resolveInFlightSiblings, selectBlockers, selectFileOverlapDeferrals, getOrFetchPlanningContexts } from "./poll-selection.js";
+import { RESTATE_WRITE_TOOL_NAMES, IDEMPOTENCY_KEY_SHAPE, scopeIdempotencyKey } from "./mcp.js";
 import { adminHtml } from "./admin-html.js";
 import {
   getOrchestratorSettings,
@@ -85,6 +86,8 @@ import { normalizeBranchPrefix } from "./pipeline/branch-name.js";
 import { normalizeGitHubRepo, normalizeReferenceRepos, type ReferenceRepo } from "./reference-repos.js";
 import { fetchTrackerIssuesPage } from "./runner-callback.js";
 import { isLinearAuthConfigured } from "./linear-app-auth.js";
+import type { callTool } from "./restate/tools-client.js";
+import type { Caller } from "./mcp-identity.js";
 import picomatch from "picomatch";
 
 function normalizeSkillsRepo(raw: unknown): string | null {
@@ -392,6 +395,8 @@ export interface AdminDeps {
     /** Called by the operator-cancel path to close the ingest chain cleanly. */
     onMachineLost(opts?: { failureCode?: string }): void;
   };
+  /** The tools-service ingress caller (src/restate/tools-client.ts, AII-710). Absent only in tests that don't exercise POST /api/tools/<name>. */
+  callTool?: typeof callTool;
 }
 
 /**
@@ -405,7 +410,10 @@ function grantedRouteAllows(url: string, method: string, grantedPages: string[])
   return grantedPages.some((page) => PAGE_ROUTES[page]?.includes(path));
 }
 
-/** Authorization for every `/api/` route: authenticate, answer the identity probe, then require Admin or a grant. Null means the response is already sent. */
+/** Matches POST /api/tools/<name> — the tools-service entry point (AII-712). */
+const TOOL_CALL_ROUTE = /^\/api\/tools\/([^/]+)$/;
+
+/** Authorization for every `/api/` route: authenticate, answer the identity probe, then require Admin or a grant — except the tools route, which defers to the tool's own role check. Null means the response is already sent. */
 function authorizeApiRequest(
   req: http.IncomingMessage,
   res: http.ServerResponse,
@@ -429,6 +437,15 @@ function authorizeApiRequest(
       grantedPages: listGrantedPages(),
     });
     return null;
+  }
+
+  // The tools route mirrors /mcp's own model instead of the admin-or-grant rule below:
+  // every allowlisted identity may call a read tool, and a write tool is refused by the
+  // tool() wrapper's own role check (src/restate/tools.ts) using this session's real
+  // role — not by a blanket admin requirement here. Reusing that check is the point: a
+  // second, route-local write list here would drift from the one the wrapper enforces.
+  if (TOOL_CALL_ROUTE.test(url) && method === "POST") {
+    return gate;
   }
 
   if (gate.role !== "admin" && !grantedRouteAllows(url, method, listGrantedPages())) {
@@ -478,6 +495,12 @@ export function handleAdminRequest(
 
     if (url === "/api/deploy" && method === "POST") {
       handleDeployTrigger(res, deps);
+      return true;
+    }
+
+    const toolCallMatch = TOOL_CALL_ROUTE.exec(url);
+    if (toolCallMatch && method === "POST") {
+      handleToolCall(req, res, gate, decodeURIComponent(toolCallMatch[1]), deps);
       return true;
     }
 
@@ -1662,6 +1685,92 @@ async function handleDeployTrigger(
     json(res, 202, { deploying: result.commit });
   } catch (err) {
     console.error("[admin] deploy trigger failed:", err);
+    json(res, 500, { error: "Internal server error" });
+  }
+}
+
+/** Every tool name is snake_case ASCII (src/restate/tools.ts's `tool()` registrations). */
+const TOOL_NAME_SHAPE = /^[a-z][a-z0-9_]{0,63}$/;
+
+// `IDEMPOTENCY_KEY_SHAPE` and `scopeIdempotencyKey` (imported above from src/mcp.ts — this
+// file may import src/restate/* as types only, per src/__tests__/restate-boundary.test.ts)
+// are the same contract `/mcp`'s `tools/call` applies to `params._meta.idempotencyKey`
+// (AII-719). Neither surface derives a key: a CI script that wants a retry deduped states the
+// key itself. Only checked when the target tool is in `RESTATE_WRITE_TOOL_NAMES` — a read
+// tool ignores the header entirely, same as `/mcp` ignores `_meta.idempotencyKey` on a read.
+// The header is scoped by the session's identity before it reaches `deps.idempotencyKey`, so
+// two sessions that reuse one literal key cannot attach to each other's cached result.
+
+/**
+ * POST /api/tools/<name> — the REST entry point to the tools service (AII-712), for a
+ * caller such as CI that has an admin session but no MCP client. Same handlers, same
+ * role assertion as /mcp's tools/call (`callTool`, `src/restate/tools-client.ts`); the
+ * only new surface is mapping the session already verified by `authorizeApiRequest` to
+ * a `Caller`. The mapped role is always `gate.role` — the session's own resolved role —
+ * never hardcoded to "admin", or a `user`-role operator with a page grant would gain
+ * every write tool the wrapper would otherwise refuse them.
+ *
+ * The name is validated against `TOOL_NAME_SHAPE` before anything else — including before
+ * `deps.callTool` is even checked — because a decoded name outside that shape (e.g. a
+ * `../`-containing segment) would otherwise reach `callTool()`'s ingress URL construction
+ * and could resolve outside `ORCHESTRATOR_TOOLS_SERVICE` entirely. Deliberately not a
+ * static allowlist: AII-711 moves every tool to discovery, and a route-local list here
+ * would drift from it.
+ */
+async function handleToolCall(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  gate: Extract<AdminGate, { ok: true }>,
+  toolName: string,
+  deps: AdminDeps,
+): Promise<void> {
+  if (!TOOL_NAME_SHAPE.test(toolName)) {
+    json(res, 404, { error: "unknown tool" });
+    return;
+  }
+  if (!deps.callTool) {
+    json(res, 501, { error: "Tools service is not configured" });
+    return;
+  }
+  let idempotencyKey: string | undefined;
+  if (RESTATE_WRITE_TOOL_NAMES.has(toolName)) {
+    const idempotencyKeyHeader = req.headers["idempotency-key"];
+    if (Array.isArray(idempotencyKeyHeader)) {
+      json(res, 400, { error: "Idempotency-Key must be sent once" });
+      return;
+    }
+    const supplied = idempotencyKeyHeader;
+    if (supplied !== undefined) {
+      if (!IDEMPOTENCY_KEY_SHAPE.test(supplied)) {
+        json(res, 400, { error: "Idempotency-Key must match ^[A-Za-z0-9._:-]{1,128}$" });
+        return;
+      }
+      idempotencyKey = scopeIdempotencyKey(gate.identity?.email ?? "session", supplied);
+    }
+  }
+  const raw = await readBody(req);
+  let args: Record<string, unknown> = {};
+  if (raw.trim()) {
+    try {
+      const parsed = JSON.parse(raw) as { args?: unknown };
+      if (parsed.args !== undefined && typeof parsed.args === "object" && parsed.args !== null && !Array.isArray(parsed.args)) {
+        args = parsed.args as Record<string, unknown>;
+      }
+    } catch {
+      json(res, 400, { error: "Invalid JSON body" });
+      return;
+    }
+  }
+  const caller: Caller = { kind: "human", email: gate.identity?.email ?? null, role: gate.role };
+  try {
+    const result = await deps.callTool(toolName, args, caller, idempotencyKey ? { idempotencyKey } : undefined);
+    if (result.status === "unavailable") {
+      json(res, 503, { error: "restate-unavailable" });
+      return;
+    }
+    json(res, 200, { content: result.content, isError: result.isError });
+  } catch (err) {
+    console.error("[admin] tool call failed:", err);
     json(res, 500, { error: "Internal server error" });
   }
 }

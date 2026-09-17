@@ -91,8 +91,8 @@ Entry points for areas that are easy to miss. Each names the module to start fro
 | Private npm registry auth in the `install` step | `src/pipeline/steps/install.ts` | [docs/private-npm-registry.md](docs/private-npm-registry.md) |
 | Runner image selection | `src/repo-image.ts` | [docs/runner-images.md](docs/runner-images.md) |
 | Knowledge graph end-to-end (ingest → snapshot → image → serve) | `Dockerfile` KG stages, `docker-entrypoint.sh` | [docs/kg-architecture.md](docs/kg-architecture.md) |
-| KG sidecar and `/mcp` | `src/mcp.ts`, `src/mcp-oauth.ts` | [docs/kg-sidecar.md](docs/kg-sidecar.md) |
-| MCP server: tools, roles, the declared write list | `src/mcp.ts` | [docs/mcp-server.md](docs/mcp-server.md) |
+| KG sidecar, its OAuth flow, and the image build | `src/mcp.ts`, `src/mcp-oauth.ts` | [docs/kg-sidecar.md](docs/kg-sidecar.md) |
+| MCP door, identity contract, tools service, entry points, roles | `src/restate/tools.ts`, `src/mcp.ts`, `src/mcp-oauth.ts`, `src/mcp-identity.ts` | [docs/mcp-server.md](docs/mcp-server.md), [ADR 025](docs/adr/025-mcp-tools-are-restate-handlers-and-the-operator-object-is-the-refresh-authority.md) |
 | Deploying, clients, Bedrock | `src/deploy.ts` and its `deploy-*` siblings | [docs/deployment.md](docs/deployment.md) |
 | Ticketing provider abstraction | `src/providers/` — `linear.ts`, `jira.ts`, `registry.ts` | |
 | Jira base branch (per-issue PR target) | `src/base-branch.ts` | [docs/jira-base-branch.md](docs/jira-base-branch.md) |
@@ -106,6 +106,7 @@ Entry points for areas that are easy to miss. Each names the module to start fro
 | Run classification and autopsy | `src/completion-classification.ts`, `src/run-autopsy.ts` | |
 | Admin SSO / OIDC, roles, page grants | `src/oauth/`, `src/admin-session.ts`, `src/access-entries.ts`, `src/access-page-grants.ts` | [docs/access-model.md](docs/access-model.md) |
 | Admin SPA | `src/admin-ui/` | |
+| Restate engine: sidecar, endpoint, workflows, testcontainers job | `src/restate/endpoint.ts`, `src/restate/` | [docs/restate.md](docs/restate.md), [docs/restate-testing.md](docs/restate-testing.md) |
 
 **Diagram convention:** flow diagrams in `docs/`, issue bodies, and PR descriptions are mermaid (validated with `mermaid-cli` before commit); tabular data is a table; ASCII only in this file. Full rule: [docs/README.md](docs/README.md).
 
@@ -119,6 +120,8 @@ npm run dev:local      # rebuilds the local runner image, then runs dispatches i
 ```
 
 Only the GitHub App pair is hard-required — `loadConfig` throws without it. Ticketing credentials are not: an absent Linear or Jira configuration logs a warning and skips that provider's mappings, so the orchestrator still boots and serves.
+
+`npm run dev` also spawns the Restate sidecar (`RestateSidecar`, `src/restate/server.ts`) from `node_modules`, with its data under `./restate` — non-fatally, same as the KG sidecar (ADR 023, [docs/restate.md](docs/restate.md)).
 
 Health check `curl http://localhost:8080/` · Admin UI `http://localhost:8080/admin` (needs an OAuth provider **or** `ADMIN_ACCESS_CODE`).
 
@@ -168,6 +171,7 @@ The operator's `GH_TOKEN` (or `GITHUB_TOKEN`) is injected as `AI_IMPLEMENT_DEP_T
 ```bash
 npm test          # vitest run
 npm run typecheck # tsc --noEmit
+npm run test:restate # src/__tests__/restate/**/*.restate.test.ts — needs Docker, not part of npm test
 ```
 
 **`typecheck` excludes `src/__tests__`, and vitest strips types without checking them** — so type errors in a test file are caught by nothing. Type-check a new test file explicitly with a throwaway tsconfig. `src/admin-ui/__tests__/` *is* covered and can break the build.
@@ -301,7 +305,7 @@ Two paths feed one `reconciliation_queue` → `markMerged` worker: a **poll dete
 
 SSO via OIDC (Google, Microsoft) with a deprecated `ADMIN_ACCESS_CODE` fallback; the UI 503s when neither is configured. The fail-closed allowlist is **database-backed and edited at `/admin#access`** — `OAUTH_ALLOWED_*` seed it and apply until the first save, which hands authority to the stored list permanently. Every entry carries a role: `admin` reaches everything, `user` reaches `/mcp` plus whichever pages have been granted — none, until someone grants some.
 
-Four things here are easy to state backwards. **A domain admits as `user`; only a listed address can be `admin`** — so a domain-only seed admits everyone and lets nobody administer, a misconfiguration the boot log and the sign-in page both flag. An entry is *declared* by address but **matched by provider + `sub` once bound** at first sign-in, so a rename keeps its role and a reassigned address inherits nothing — and re-pointing a bound entry takes two saves, not one. **Page grants restrict the admin UI, not what a user can read**: `/mcp` reads are open to every allowlisted identity, so a user granted nothing still reaches every read tool; the declared write tools (`src/mcp.ts` `WRITE_TOOLS`) require the role each entry names. And an unreadable list answers **503, never 401** — the SPA logs out on 401, so a database fault must not eject everyone.
+Four things here are easy to state backwards. **A domain admits as `user`; only a listed address can be `admin`** — so a domain-only seed admits everyone and lets nobody administer, a misconfiguration the boot log and the sign-in page both flag. An entry is *declared* by address but **matched by provider + `sub` once bound** at first sign-in, so a rename keeps its role and a reassigned address inherits nothing — and re-pointing a bound entry takes two saves, not one. **Page grants restrict the admin UI, not what a user can read**: `/mcp` reads are open to every allowlisted identity, so a user granted nothing still reaches every read tool; the declared write tools (the `role: "admin"` handlers on the tools service, `src/restate/tools.ts`) require that role, asserted inside the `tool()` wrapper on every entry point. And an unreadable list answers **503, never 401** — the SPA logs out on 401, so a database fault must not eject everyone.
 
 Every authenticated request re-checks against an in-memory list, so a removal ends a session on the next request rather than at token expiry. **Full reference: [docs/access-model.md](docs/access-model.md)** — precedence, the audit trail, and the host command that recovers from lockout.
 
