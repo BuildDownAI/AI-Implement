@@ -6,6 +6,19 @@
 // alwaysReplay equivalence are covered against a real Restate container in
 // operator-object.restate.test.ts, per the operator rule in docs/restate.md.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// Mocked so rotate()'s allowlist re-check and auth-event emission don't need the
+// access_entries table or a real event sink for every test in this file — most tests
+// exercise paths before either is reached. Individual tests override the return value.
+vi.mock("../access-entries.js", () => ({
+  getEffectiveAllowlist: vi.fn(),
+  matchAccessEntry: vi.fn(),
+}));
+vi.mock("../mcp-auth-events.js", () => ({
+  recordAuthEvent: vi.fn(),
+  resolveClientPath: vi.fn(() => "unknown"),
+}));
+
 import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -13,10 +26,22 @@ import path from "node:path";
 import { decideRefresh, GRACE_MS, RestateRefreshAuthority, type FamilyState } from "../restate/operator-object.js";
 import { initMcpOAuthTables } from "../mcp-oauth.js";
 import { closeDb, getDb } from "../dedup.js";
+import { getEffectiveAllowlist, matchAccessEntry, type AccessEntry } from "../access-entries.js";
+import { recordAuthEvent } from "../mcp-auth-events.js";
 
 // An arbitrary high loopback port nothing listens on: connections fail fast with
 // ECONNREFUSED rather than hanging, which is what "unroutable ingress" needs to test.
 const UNROUTABLE_INGRESS = "http://127.0.0.1:59999";
+
+const ADMITTING_ENTRY: AccessEntry = {
+  kind: "address",
+  value: "ada@eudoxus.ai",
+  role: "user",
+  provider: null,
+  subject: null,
+  addedAt: 0,
+  addedBy: null,
+};
 
 let dbPath: string;
 
@@ -24,6 +49,12 @@ beforeEach(() => {
   dbPath = path.join(os.tmpdir(), `operator-object-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
   process.env.DEDUP_DB_PATH = dbPath;
   initMcpOAuthTables();
+
+  // Default: the allowlist admits whoever is presented. Tests of the allowlist re-check
+  // itself override this with mockReturnValueOnce.
+  vi.mocked(getEffectiveAllowlist).mockReturnValue({ entries: [], source: "env" });
+  vi.mocked(matchAccessEntry).mockReturnValue(ADMITTING_ENTRY);
+  vi.mocked(recordAuthEvent).mockClear();
 });
 
 afterEach(() => {
@@ -191,7 +222,8 @@ describe("RestateRefreshAuthority — outcome mapping", () => {
     const fetchImpl = vi.fn(async (url: string, init: RequestInit) => {
       expect(url).toBe(`${UNROUTABLE_INGRESS}/Operator/c1/issue`);
       capturedBody = JSON.parse(init.body as string);
-      return new Response(JSON.stringify({ status: "ok" }), { status: 200 });
+      // `issue` is a void handler — the real ingress answers with an empty body, never JSON.
+      return new Response("", { status: 200 });
     });
     const authority = authorityWithFetch(fetchImpl as unknown as typeof fetch);
     const outcome = await authority.issue({ clientId: "c1", email: "ada@eudoxus.ai", sub: "sub-1", provider: "google" });
@@ -204,5 +236,106 @@ describe("RestateRefreshAuthority — outcome mapping", () => {
     expect(capturedBody.sub).toBe("sub-1");
     expect(capturedBody.provider).toBe("google");
     expect(typeof capturedBody.expiresAt).toBe("number");
+  });
+
+  it("issue() maps a non-empty, non-JSON 200 body to unavailable rather than throwing", async () => {
+    const fetchImpl = vi.fn(async () => new Response("not json", { status: 200 }));
+    const authority = authorityWithFetch(fetchImpl as unknown as typeof fetch);
+    const outcome = await authority.issue({ clientId: "c1", email: "ada@eudoxus.ai", sub: "sub-1", provider: "google" });
+    expect(outcome).toEqual({ status: "unavailable" });
+  });
+});
+
+describe("RestateRefreshAuthority.rotate — allowlist re-check (AII-687 parity)", () => {
+  function refreshOkResponse(): Response {
+    return new Response(
+      JSON.stringify({
+        status: "ok",
+        token: "new-raw-token",
+        expiresAt: Date.now() + 1000,
+        email: "ada@eudoxus.ai",
+        sub: "sub-1",
+        provider: "google",
+      }),
+      { status: 200 },
+    );
+  }
+
+  it("returns unavailable without revoking when the allowlist cannot be loaded", async () => {
+    vi.mocked(getEffectiveAllowlist).mockReturnValue(null);
+    const fetchImpl = vi.fn(async (url: string) => {
+      if (url.endsWith("/revoke")) {
+        throw new Error("must not revoke on a transient allowlist read failure");
+      }
+      return refreshOkResponse();
+    });
+    const authority = authorityWithFetch(fetchImpl as unknown as typeof fetch);
+    await expect(authority.rotate({ refreshToken: "old-raw-token", clientId: "c1" })).resolves.toEqual({
+      status: "unavailable",
+    });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("revokes the family and returns denied when the allowlist no longer admits the identity", async () => {
+    vi.mocked(getEffectiveAllowlist).mockReturnValue({ entries: [], source: "env" });
+    vi.mocked(matchAccessEntry).mockReturnValue(null);
+    const fetchImpl = vi.fn(async (url: string) => {
+      if (url.endsWith("/revoke")) {
+        return new Response("", { status: 200 });
+      }
+      return refreshOkResponse();
+    });
+    const authority = authorityWithFetch(fetchImpl as unknown as typeof fetch);
+    await expect(authority.rotate({ refreshToken: "old-raw-token", clientId: "c1" })).resolves.toEqual({
+      status: "denied",
+      description: "Identity no longer authorized",
+    });
+    expect(fetchImpl).toHaveBeenCalledWith(`${UNROUTABLE_INGRESS}/Operator/c1/revoke`, expect.anything());
+  });
+});
+
+describe("RestateRefreshAuthority.rotate — auth events (AII-708 parity)", () => {
+  it("emits exactly one 'ok' event on a successful rotation", async () => {
+    const fetchImpl = vi.fn(async () =>
+      new Response(
+        JSON.stringify({
+          status: "ok",
+          token: "new-raw-token",
+          expiresAt: Date.now() + 1000,
+          email: "ada@eudoxus.ai",
+          sub: "sub-1",
+          provider: "google",
+        }),
+        { status: 200 },
+      ),
+    );
+    const authority = authorityWithFetch(fetchImpl as unknown as typeof fetch);
+    await authority.rotate({ refreshToken: "old-raw-token", clientId: "c1" });
+    expect(recordAuthEvent).toHaveBeenCalledTimes(1);
+    expect(recordAuthEvent).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: "refresh", cause: "ok", clientId: "c1", familyId: "c1", email: "ada@eudoxus.ai", identityKind: "human" }),
+    );
+  });
+
+  it("emits exactly one 'replay' event, with no identity, when the object reports replay", async () => {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ status: "replay" }), { status: 200 }));
+    const authority = authorityWithFetch(fetchImpl as unknown as typeof fetch);
+    await authority.rotate({ refreshToken: "old-raw-token", clientId: "c1" });
+    expect(recordAuthEvent).toHaveBeenCalledTimes(1);
+    expect(recordAuthEvent).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: "refresh", cause: "replay", clientId: "c1", familyId: "c1", email: null, identityKind: null }),
+    );
+  });
+
+  it("emits exactly one 'unavailable' event when the ingress is unreachable", async () => {
+    const fetchImpl = vi.fn(async () => {
+      throw new Error("connect ECONNREFUSED 127.0.0.1:59999");
+    });
+    const authority = authorityWithFetch(fetchImpl as unknown as typeof fetch);
+    await authority.rotate({ refreshToken: "old-raw-token", clientId: "c1" });
+    expect(recordAuthEvent).toHaveBeenCalledTimes(1);
+    expect(recordAuthEvent).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: "refresh", cause: "unavailable", clientId: "c1", familyId: "c1", email: null, identityKind: null }),
+    );
   });
 });

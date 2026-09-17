@@ -18,15 +18,15 @@
 
 import crypto from "node:crypto";
 import type http from "node:http";
-import { isIP } from "node:net";
 import { getDb } from "./dedup.js";
 import { getProvider, listConfiguredProviders } from "./oauth/providers.js";
 import { buildAuthUrl, completeAuth } from "./oauth/oidc.js";
 import { authorize } from "./oauth/authorize.js";
 import { bindAccessEntry, getEffectiveAllowlist, matchAccessEntry } from "./access-entries.js";
 import type { IssueInput, IssueOutcome, RefreshAuthority, RefreshInput, RefreshOutcome } from "./mcp-identity.js";
-import { recordAuthEvent, type AuthEventCause, type ClientPath } from "./mcp-auth-events.js";
+import { recordAuthEvent, resolveClientPath, isLoopbackHost, type AuthEventCause } from "./mcp-auth-events.js";
 import { RestateRefreshAuthority } from "./restate/operator-object.js";
+export { resolveClientPath } from "./mcp-auth-events.js";
 
 // Token and state lifetimes
 export const MCP_TOKEN_TTL_MS: number = (() => {
@@ -133,16 +133,6 @@ export function initMcpOAuthTables(): void {
   db.prepare("DELETE FROM mcp_refresh_tokens WHERE expires_at < ?").run(now);
 }
 
-/** Loopback IP literal or `localhost` — the client-path split used for auth events too. */
-function isLoopbackHost(hostname: string): boolean {
-  const host = hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  if (host === "localhost") {
-    return true;
-  }
-  const ipVersion = isIP(host);
-  return ipVersion === 6 ? host === "::1" : ipVersion === 4 && host.startsWith("127.");
-}
-
 function isAllowedRedirectUri(redirectUri: string): boolean {
   let parsed: URL;
   try {
@@ -178,33 +168,6 @@ function isAllowedRedirectUri(redirectUri: string): boolean {
       }
     });
   return allowedOrigins.includes(parsed.origin);
-}
-
-/**
- * Which client path a registered client belongs to, for the auth-event `clientPath` field:
- * a loopback IP literal (or `localhost`) redirect means the Claude Code loopback flow,
- * anything else means an HTTPS-registered client (e.g. claude.ai). `null`/unregistered
- * resolves to `"unknown"` rather than guessing — a forged token traces to no client at all.
- */
-export function resolveClientPath(clientId: string | null | undefined): ClientPath {
-  if (!clientId) return "unknown";
-  const row = getDb()
-    .prepare("SELECT redirect_uris FROM mcp_clients WHERE client_id = ?")
-    .get(clientId) as { redirect_uris: string } | undefined;
-  if (!row) return "unknown";
-  let uris: unknown;
-  try {
-    uris = JSON.parse(row.redirect_uris);
-  } catch {
-    return "unknown";
-  }
-  const first = Array.isArray(uris) ? uris[0] : undefined;
-  if (typeof first !== "string") return "unknown";
-  try {
-    return isLoopbackHost(new URL(first).hostname) ? "loopback" : "https";
-  } catch {
-    return "unknown";
-  }
 }
 
 // ---------- Token verification ----------

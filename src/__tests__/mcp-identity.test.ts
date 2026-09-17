@@ -112,9 +112,6 @@ describe("RefreshOutcome maps to the same HTTP response the inline refresh grant
     const res = new MockResponse();
     await handleMcpTokenRequest(mkRefreshReq(), asRes(res));
     expect(res.statusCode).toBe(503);
-    expect(JSON.parse(res.body)).toEqual({
-      error: "temporarily_unavailable",
-      error_description: "Access control is unavailable",
-    });
+    expect(JSON.parse(res.body)).toEqual({ error: "restate-unavailable" });
   });
 });

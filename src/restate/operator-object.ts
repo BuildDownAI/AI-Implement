@@ -23,6 +23,8 @@ import crypto from "node:crypto";
 import * as restate from "@restatedev/restate-sdk";
 import type { ObjectContext, ObjectSharedContext } from "@restatedev/restate-sdk";
 import { getDb } from "../dedup.js";
+import { getEffectiveAllowlist, matchAccessEntry } from "../access-entries.js";
+import { recordAuthEvent, resolveClientPath, type AuthEventCause } from "../mcp-auth-events.js";
 import type { IssueInput, IssueOutcome, RefreshAuthority, RefreshInput, RefreshOutcome } from "../mcp-identity.js";
 import { RESTATE_INGRESS_BIND_ADDRESS } from "./server.js";
 
@@ -108,7 +110,6 @@ async function issue(ctx: ObjectContext, request: IssueRequest): Promise<void> {
   ctx.set<string>("email", request.email);
   ctx.set<string>("sub", request.sub);
   ctx.set<string>("provider", request.provider);
-  ctx.set<boolean>("revoked", false);
   ctx.set<FamilyState>("family", {
     currentHash: request.hash,
     // Nothing to answer a concurrent-replay with yet — a fresh sign-in has no previous
@@ -230,8 +231,15 @@ export class RestateRefreshAuthority implements RefreshAuthority {
     if (!response.ok) {
       return "unavailable";
     }
+    // A void handler (issue, revoke) answers with an empty body — that is success, not a
+    // parse failure. Anything non-empty is expected to be JSON; a body that isn't maps to
+    // unavailable exactly like a connection failure, rather than throwing.
+    const text = await response.text();
+    if (text === "") {
+      return undefined as T;
+    }
     try {
-      return (await response.json()) as T;
+      return JSON.parse(text) as T;
     } catch {
       return "unavailable";
     }
@@ -255,16 +263,57 @@ export class RestateRefreshAuthority implements RefreshAuthority {
   }
 
   async rotate(input: RefreshInput): Promise<RefreshOutcome> {
+    const start = Date.now();
+    const clientId = input.clientId;
+
+    // One event per call, on every return path — mirrors SqliteRefreshAuthority.rotate so
+    // AII-708's refresh measurement stays populated under the new default authority.
+    const emit = (cause: AuthEventCause, identity?: { email: string }): void => {
+      recordAuthEvent({
+        at: Date.now(),
+        kind: "refresh",
+        cause,
+        clientId,
+        clientPath: resolveClientPath(clientId),
+        identityKind: identity ? "human" : null,
+        email: identity?.email ?? null,
+        // One object per client id (AII-709): the family this seam names is the whole
+        // client's refresh state, so the client id doubles as the family id.
+        familyId: clientId,
+        latencyMs: Date.now() - start,
+      });
+    };
+
     const presentedHash = sha256(input.refreshToken);
-    const result = await this.invoke<RefreshHandlerResult>(input.clientId, "refresh", { presentedHash });
+    const result = await this.invoke<RefreshHandlerResult>(clientId, "refresh", { presentedHash });
     if (result === "unavailable") {
+      emit("unavailable");
       return { status: "unavailable" };
     }
     if (result.status === "replay") {
+      emit("replay");
       return { status: "replay" };
     }
     if (result.status === "expired") {
+      emit("expired");
       return { status: "expired" };
+    }
+
+    // Allowlist re-check (fail-closed: a removed user must not outlive their access token).
+    // AII-687's rule: the allowlist re-check stays the revocation path — mirrored from
+    // SqliteRefreshAuthority.rotate.
+    const allowlist = getEffectiveAllowlist();
+    if (!allowlist) {
+      // Do NOT revoke here — a transient read failure is not a removal.
+      console.error("[mcp-oauth] refresh deferred: the access list could not be loaded");
+      emit("unavailable", { email: result.email });
+      return { status: "unavailable" };
+    }
+    if (!matchAccessEntry({ email: result.email, sub: result.sub, provider: result.provider }, allowlist.entries)) {
+      await this.invoke(clientId, "revoke", {});
+      console.warn(`[mcp-oauth] refresh denied: ${result.email} no longer on allowlist`);
+      emit("allowlist", { email: result.email });
+      return { status: "denied", description: "Identity no longer authorized" };
     }
 
     const now = Date.now();
@@ -273,8 +322,9 @@ export class RestateRefreshAuthority implements RefreshAuthority {
       .prepare(
         "INSERT INTO mcp_tokens (token, email, sub, provider, created_at, expires_at, client_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
       )
-      .run(accessToken, result.email, result.sub, result.provider, now, now + this.accessTokenTtlMs, input.clientId);
+      .run(accessToken, result.email, result.sub, result.provider, now, now + this.accessTokenTtlMs, clientId);
 
+    emit("ok", { email: result.email });
     return {
       status: "ok",
       accessToken,

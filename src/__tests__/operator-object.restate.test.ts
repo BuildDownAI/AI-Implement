@@ -47,10 +47,15 @@ async function callObject<T>(baseUrl: string, key: string, handler: string, body
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
   });
+  const text = await response.text();
   if (!response.ok) {
-    throw new Error(`Operator/${key}/${handler} failed: ${response.status} ${await response.text()}`);
+    throw new Error(`Operator/${key}/${handler} failed: ${response.status} ${text}`);
   }
-  return response.json() as Promise<T>;
+  // A void handler (issue, revoke) answers with an empty body — that is success.
+  if (text === "") {
+    return undefined as T;
+  }
+  return JSON.parse(text) as T;
 }
 
 function issueBody(overrides: Partial<IssueBody> = {}): IssueBody {
@@ -178,6 +183,31 @@ describe("Operator object", () => {
 
       const result = await callObject<RefreshResult>(env.baseUrl(), key, "refresh", { presentedHash: hash });
       expect(result).toEqual({ status: "replay" });
+    },
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "a new sign-in after a prior revoke() works: issue, revoke, issue again, refresh succeeds (%s)",
+    async (label) => {
+      const env = environments.get(label);
+      if (!env) throw new Error(`environment "${label}" did not start`);
+      const key = randomUUID();
+      const firstHash = sha256(randomUUID());
+      await callObject(env.baseUrl(), key, "issue", issueBody({ hash: firstHash }));
+      await callObject(env.baseUrl(), key, "revoke", {});
+
+      // The old family's hash must no longer work post-revoke.
+      const afterRevoke = await callObject<RefreshResult>(env.baseUrl(), key, "refresh", { presentedHash: firstHash });
+      expect(afterRevoke).toEqual({ status: "replay" });
+
+      const secondHash = sha256(randomUUID());
+      await callObject(env.baseUrl(), key, "issue", issueBody({ hash: secondHash, email: "re-signed-in@eudoxus.ai" }));
+
+      const refreshed = await callObject<RefreshResult>(env.baseUrl(), key, "refresh", { presentedHash: secondHash });
+      expect(refreshed.status).toBe("ok");
+      if (refreshed.status === "ok") {
+        expect(refreshed.email).toBe("re-signed-in@eudoxus.ai");
+      }
     },
   );
 
