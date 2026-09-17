@@ -452,7 +452,24 @@ function mcpAdminConfig(): AdminConfig {
 // own boot-time registry is (src/index.ts) — env config plus a live getMappings() closure — and
 // kept as a module singleton so its per-provider caching (src/providers/registry.ts) isn't
 // discarded between calls.
-const providerRegistry = new ProviderRegistry(providerConfigFromEnv(), () => getMappings());
+let sharedProviderRegistry: ProviderRegistry | null = null;
+
+/**
+ * Set once at boot (src/index.ts's main()) to the same `ProviderRegistry` the poll loop, the
+ * reconciler and the admin HTTP routes share, so `add_project` over MCP invalidates the
+ * registry the orchestrator actually reads — the "same as POST /api/mappings" claim in the
+ * tool's description holds only when it is the same instance. Restate handlers have no
+ * per-request injection, hence the setter (same pattern as setKgMemoryProvider). A process
+ * that never calls it (tests, a boot that failed before the registry existed) falls back to a
+ * local instance so the handler still answers.
+ */
+export function setProviderRegistry(registry: ProviderRegistry | null): void {
+  sharedProviderRegistry = registry;
+}
+
+function providerRegistryForTools(): ProviderRegistry {
+  return sharedProviderRegistry ?? new ProviderRegistry(providerConfigFromEnv(), () => getMappings());
+}
 
 export const TRIGGER_KG_REFRESH_DESCRIPTION =
   "Trigger the KG refresh rail (admin role). Same handler as POST /api/kg/refresh: runs the credential preflight, then dispatches the refresh. Poll get_kg_status afterwards. dryRun=true runs the same runner job with kg-snapshot-push's push skipped — all guards run and the guard verdict plus per-part table are reported via get_kg_status, but nothing is pushed, no PR opens, and the served graph never changes. acceptNewBaseline=true downgrades the zero-shrink and 50%-shrink content guards to warnings for this one dispatch and pushes anyway — use only after reviewing a guard refusal's part table and confirming the shrink is an intentional reclassification, not data loss; the accepting identity's email is logged and written into the refresh PR's ### Baseline section.";
@@ -584,7 +601,7 @@ export const addProjectTool = tool(
     // teamKey/owner/repo/defaultBranch are validated by upsertMappingAction itself (the same
     // 400 text) — no separate pre-check here, unlike the other four writes, whose actions
     // don't validate their own required fields.
-    const result = upsertMappingAction(input.args as UpsertMappingBody, mcpAdminConfig(), providerRegistry);
+    const result = upsertMappingAction(input.args as UpsertMappingBody, mcpAdminConfig(), providerRegistryForTools());
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   },
 );

@@ -99,6 +99,7 @@ import { githubActionsWatchdogDecision } from "./github-actions-watchdog.js";
 import { KgSidecar } from "./kg-sidecar.js";
 import { RestateSidecar } from "./restate/server.js";
 import { startRestateEndpoint, register as registerRestateEndpoint } from "./restate/endpoint.js";
+import { setProviderRegistry } from "./restate/tools.js";
 import { callTool } from "./restate/tools-client.js";
 import { makeKgRefresh, setActiveKgRefresh } from "./kg-refresh.js";
 import type { KgRefreshHandle } from "./kg-refresh.js";
@@ -4132,6 +4133,9 @@ async function main(): Promise<void> {
   // for each mapping. Snapshot polling iterates unique providers; verb calls
   // (markPlanningStarted, markImplementing, …) resolve at the call site.
   const registry = new ProviderRegistry(providerConfigFromEnv(), () => getMappings());
+  // The add_project Restate handler (src/restate/tools.ts) must invalidate this registry, not
+  // a private one, when a mapping changes (AII-713).
+  setProviderRegistry(registry);
 
   const teamRepoMap = getMappings();
 

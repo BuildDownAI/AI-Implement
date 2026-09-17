@@ -21,6 +21,7 @@ import {
   addProjectTool,
   triggerWorkflowSyncTool,
   clearDispatchDedupTool,
+  setProviderRegistry,
 } from "../restate/tools.js";
 import { discoverTools, callTool, callToolAsSystem, toolCatalog } from "../restate/tools-client.js";
 import type { Caller } from "../mcp-identity.js";
@@ -641,5 +642,19 @@ describe("migrated write handlers (AII-713)", () => {
       expect(clearDedupEntryAction).toHaveBeenCalledWith("uuid-1");
       expect(JSON.parse(result.content[0].text)).toEqual({ status: 200, body: { deleted: true } });
     });
+  });
+});
+
+describe("add_project uses the registry the boot shares (AII-713 review)", () => {
+  it("passes the registry given to setProviderRegistry() to upsertMappingAction, so its invalidate() reaches the real one", async () => {
+    const registry = { invalidate: vi.fn() } as unknown as Parameters<typeof setProviderRegistry>[0];
+    setProviderRegistry(registry);
+    try {
+      (upsertMappingAction as ReturnType<typeof vi.fn>).mockReturnValue({ status: 202, body: { teamKey: "AII" } });
+      await addProjectTool(fakeContext("add_project"), { caller: SYSTEM_ADMIN, args: { teamKey: "AII", owner: "o", repo: "r", defaultBranch: "main" } });
+      expect(upsertMappingAction).toHaveBeenLastCalledWith(expect.objectContaining({ teamKey: "AII" }), expect.anything(), registry);
+    } finally {
+      setProviderRegistry(null);
+    }
   });
 });
