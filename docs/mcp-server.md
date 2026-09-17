@@ -6,12 +6,12 @@ The orchestrator serves one MCP endpoint, `/mcp`, so a Claude session (and every
 
 `/mcp` is a JSON-RPC endpoint. Two methods matter: `tools/list` and `tools/call`. A request carries a bearer token minted by the MCP OAuth flow; nothing else is accepted, and an admin-UI session or an access code never reaches `/mcp`.
 
-The handshake methods `initialize` and `ping` are answered by the orchestrator itself and `notifications/initialized` is acknowledged with an empty 202 — none of the three touch the memory provider, so a client can connect and list the orchestrator-native tools on a sidecar-less boot; only a `kg_*` tool call still needs one.
+The handshake methods `initialize` and `ping` are answered by the orchestrator itself, `notifications/initialized` (and every other notification) is acknowledged with an empty 202, an unknown JSON-RPC method answers `-32601`, an unknown tool name answers `-32602`, and a non-POST request answers 405. Nothing on `/mcp` is proxied anywhere any more (AII-711): the door implements the streamable-HTTP contract itself and has no SSE channel and no server-side session.
 
 Tools come from two places and are merged into one list:
 
-* **Orchestrator-native tools**, defined in `src/mcp.ts` (`DIAG_TOOLS` for reads, `WRITE_TOOLS` for writes) and served by the orchestrator process itself. They need no sidecar, so they answer on a sidecar-less image.
-* **Memory-provider tools** (`kg_*`), forwarded verbatim to the KG sidecar after the token is verified, with the `Authorization` header stripped. Absent a provider, a `kg_*` call answers 503 with the body naming the fix.
+* **`get_session_identity`**, the one tool the door itself serves, because it reports the door's own state for this request.
+* **Every other tool** is a handler on the `orchestratorTools` Restate service (`src/restate/tools.ts`, `docs/restate.md` § "The tools service"), discovered from Restate's admin API on each `tools/list` and called through the ingress on `tools/call`. Reads (`get_*`, `list_*`, and the six `kg_*` tools) are `role: "user"`; the six declared writes still live in `WRITE_TOOLS` in `src/mcp.ts` until AII-713 moves them. The `kg_*` handlers call the KG sidecar through `MemoryProvider.callKgTool` (`src/kg-provider.ts`) rather than proxying the HTTP request; absent a provider, or when the provider lacks the tool's capability, the handler answers a tool result with `isError: true` and the same text `/mcp` always used, and `tools/list` omits those tools (AII-641). When Restate itself is unreachable, a handler call answers `503 restate-unavailable` and the discovered tools drop out of `tools/list` until it recovers.
 
 ## Entry points
 
@@ -74,7 +74,7 @@ Reads, orchestrator-native:
 | `get_fleet_report` | Per-repo outcomes over a look-back window |
 | `get_deploy_posture` | Autodeploy, deploy hold, running-vs-head commit, runner-channel state |
 
-Reads, memory provider: `kg_hybrid_search`, `kg_search`, `kg_semantic_search`, `kg_neighbors`, `kg_path`, `kg_provenance`, whatever the bound provider lists.
+Reads, KG (handlers on the same service, each calling the bound `MemoryProvider.callKgTool`; listed only when a provider is configured and declares the capability): `kg_hybrid_search`, `kg_search`, `kg_semantic_search`, `kg_neighbors`, `kg_path`, `kg_provenance`. The sidecar's own result is returned verbatim in `content[0].text`, `degraded` flag included; the sidecar's own error text comes back as `isError: true`.
 
 Writes, declared:
 
@@ -98,6 +98,9 @@ Skills bind the server by name in `CLAUDE.md` (`kg.mcp_server`) and discover too
 | No or invalid token, or identity no longer allowlisted | 401 |
 | `OAUTH_REDIRECT_BASE_URL` unset | 503 to every caller |
 | Allowlist unreadable | 503 |
-| `kg_*` call with no provider | 503 naming `KG_SIDECAR_URL` |
+| `kg_*` call with no provider, or a capability the provider lacks | tool result `isError: true` with the pre-migration text (`no memory provider is configured` / `Tool not supported by this memory provider: <tool>`); the tool is also absent from `tools/list` |
+| Any handler call while Restate is unreachable | 503 `restate-unavailable`; `initialize`, `get_session_identity` and the write tools still answer |
+| GET or DELETE on `/mcp` | 405 with `Allow: POST` |
+| Unknown JSON-RPC method / unknown tool name | JSON-RPC error `-32601` / `-32602` at HTTP 200 |
 | Write call below the required role | tool result `isError: true`, `forbidden: <tool> requires the <role> role`; logged |
 | `trigger_kg_refresh` with KG refresh not configured | tool result `isError: true`, "KG refresh is not configured" |

@@ -7,9 +7,24 @@
 import * as restate from "@restatedev/restate-sdk";
 import { z } from "zod";
 import { describe, expect, it, vi } from "vitest";
-import { tool } from "../restate/tools.js";
+import { tool, listProjects, kgPath, kgHybridSearch, getKgStatusTool, getIssueReportCardTool, getFleetReportTool } from "../restate/tools.js";
 import { discoverTools, callTool, callToolAsSystem, toolCatalog } from "../restate/tools-client.js";
 import type { Caller } from "../mcp-identity.js";
+import { setKgMemoryProvider } from "../kg-provider.js";
+import type { MemoryProvider } from "../kg-provider.js";
+import { setActiveKgRefresh } from "../kg-refresh.js";
+import { getMappings } from "../config.js";
+import { getIssueReportCard, getFleetReport } from "../report-card.js";
+
+vi.mock("../report-card.js", () => ({
+  getIssueReportCard: vi.fn(),
+  getFleetReport: vi.fn(),
+}));
+
+vi.mock("../config.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../config.js")>()),
+  getMappings: vi.fn(),
+}));
 
 function fakeContext(handlerName: string): restate.Context {
   return { request: () => ({ target: { handler: handlerName } }) } as unknown as restate.Context;
@@ -191,6 +206,12 @@ describe("callTool", () => {
     expect(result).toEqual({ status: "unavailable" });
   });
 
+  it("answers a 4xx as a tool error carrying the real status, not as \"unavailable\" (AII-711)", async () => {
+    const fetchImpl = vi.fn(async () => ({ ok: false, status: 400, text: async () => "bad args" })) as unknown as typeof fetch;
+    const result = await callTool("get_widget", {}, HUMAN_USER, { ingressBaseUrl: "http://ingress.example", fetchImpl });
+    expect(result).toEqual({ status: "ok", isError: true, content: [{ type: "text", text: "400 bad args" }] });
+  });
+
   it("maps a 503 response to status: \"unavailable\"", async () => {
     const fetchImpl = vi.fn(async () => ({ ok: false, status: 503, json: async () => ({}) })) as unknown as typeof fetch;
     const result = await callTool("get_widget", {}, HUMAN_USER, {
@@ -302,5 +323,107 @@ describe("toolCatalog", () => {
       throw new Error("ECONNREFUSED");
     });
     expect(await toolCatalog({ adminBaseUrl: "http://admin.example", fetchImpl })).toEqual([]);
+  });
+});
+
+// ---- The read handlers AII-711 migrated, with the same fakes the adapter tests use.
+describe("migrated read handlers (AII-711)", () => {
+  const stubProvider = (caps: Partial<MemoryProvider["capabilities"]>, callKgTool: MemoryProvider["callKgTool"]): MemoryProvider => ({
+    id: "stub",
+    capabilities: { hybridSearch: true, neighbors: true, path: true, provenance: true, stalenessStamp: false, ...caps },
+    listTools: async () => [],
+    // Still on the interface until the dead proxy path is deleted with the door restructure (AII-715).
+    proxyCall: () => {},
+    callKgTool,
+  });
+  const system: Caller = SYSTEM_ADMIN;
+
+  it("list_projects selects its fields explicitly — extraEnv never leaves the handler", async () => {
+    (getMappings as ReturnType<typeof vi.fn>).mockReturnValue({
+      BDS: {
+        owner: "BuildDownAI", repo: "skills", executionMode: "gha", provider: "anthropic", paused: false,
+        planningEnabled: true, maxInProgressAiIssues: 2, defaultBranch: "testing", workflowFile: "claude.yml",
+        sessionMode: "fresh", autoMerge: false, maxTurns: null, maxIterations: null, maxJobMinutes: null,
+        branchPrefix: null, skillsRepo: null, referenceRepos: [], dependencyTokenScope: null,
+        sensitiveAddPatterns: [], sensitiveAllowPatterns: [], machineCpus: 2, machineMemoryMb: 4096,
+        awsRegion: null, planningWorkflowFile: "claude-plan.yml", autoApprovePlans: true, reviewers: null,
+        extraEnv: { SUPER_SECRET: "leak-me" },
+      },
+    });
+    const result = await listProjects(fakeContext("list_projects"), { caller: system, args: {} });
+    expect(result.isError).toBeUndefined();
+    const rows = JSON.parse(result.content[0].text) as Array<Record<string, unknown>>;
+    expect(rows).toHaveLength(1);
+    expect(rows[0].teamKey).toBe("BDS");
+    expect(rows[0].repo).toBe("BuildDownAI/skills");
+    expect(result.content[0].text).not.toContain("extraEnv");
+    expect(result.content[0].text).not.toContain("leak-me");
+  });
+
+  it("a kg_* handler with no provider answers isError with the pre-migration wording and never calls the sidecar", async () => {
+    setKgMemoryProvider(null);
+    const result = await kgHybridSearch(fakeContext("kg_hybrid_search"), { caller: system, args: { query: "x" } });
+    expect(result).toEqual({ isError: true, content: [{ type: "text", text: "no memory provider is configured" }] });
+  });
+
+  it("a kg_* handler whose provider lacks the capability answers isError and never calls the sidecar", async () => {
+    const callKgTool = vi.fn();
+    setKgMemoryProvider(stubProvider({ path: false }, callKgTool));
+    const result = await kgPath(fakeContext("kg_path"), { caller: system, args: { from: "a", to: "b" } });
+    expect(result).toEqual({ isError: true, content: [{ type: "text", text: "Tool not supported by this memory provider: kg_path" }] });
+    expect(callKgTool).not.toHaveBeenCalled();
+    setKgMemoryProvider(null);
+  });
+
+  it("a kg_* handler forwards args to callKgTool and returns the sidecar's result verbatim, degraded flag included", async () => {
+    const callKgTool = vi.fn(async () => ({ ok: true as const, result: { degraded: true, hits: [] } }));
+    setKgMemoryProvider(stubProvider({}, callKgTool));
+    const result = await kgHybridSearch(fakeContext("kg_hybrid_search"), { caller: system, args: { query: "x", k: 3 } });
+    expect(callKgTool).toHaveBeenCalledWith("kg_hybrid_search", { query: "x", k: 3 });
+    expect(result.isError).toBeUndefined();
+    expect(JSON.parse(result.content[0].text)).toEqual({ degraded: true, hits: [] });
+    setKgMemoryProvider(null);
+  });
+
+  it("a kg_* handler answers the sidecar's own error text when callKgTool fails", async () => {
+    setKgMemoryProvider(stubProvider({}, async () => ({ ok: false as const, error: "KG sidecar unavailable: connection refused" })));
+    const result = await kgHybridSearch(fakeContext("kg_hybrid_search"), { caller: system, args: { query: "x" } });
+    expect(result).toEqual({ isError: true, content: [{ type: "text", text: "KG sidecar unavailable: connection refused" }] });
+    setKgMemoryProvider(null);
+  });
+
+  it("get_kg_status without an active kg-refresh handle answers the unconfigured error object", async () => {
+    setActiveKgRefresh(null);
+    const result = await getKgStatusTool(fakeContext("get_kg_status"), { caller: system, args: {} });
+    expect(JSON.parse(result.content[0].text)).toEqual({ error: "KG refresh is not configured" });
+  });
+});
+
+describe("get_issue_report_card and get_fleet_report thread their arguments (AII-711)", () => {
+  const system: Caller = SYSTEM_ADMIN;
+
+  it("get_issue_report_card passes `issue` through and returns the card verbatim", async () => {
+    (getIssueReportCard as ReturnType<typeof vi.fn>).mockReturnValue({ issue: "AII-1", dispatches: 2, passes: 3, costUsd: 1.5 });
+    const result = await getIssueReportCardTool(fakeContext("get_issue_report_card"), { caller: system, args: { issue: "AII-1" } });
+    expect(getIssueReportCard).toHaveBeenCalledWith("AII-1");
+    expect(JSON.parse(result.content[0].text)).toEqual({ issue: "AII-1", dispatches: 2, passes: 3, costUsd: 1.5 });
+  });
+
+  it("get_issue_report_card answers the pre-migration error object when the issue is missing or unknown", async () => {
+    (getIssueReportCard as ReturnType<typeof vi.fn>).mockClear().mockReturnValue(null);
+    const missing = await getIssueReportCardTool(fakeContext("get_issue_report_card"), { caller: system, args: {} });
+    expect(JSON.parse(missing.content[0].text)).toEqual({ error: "issue is required and must be a non-empty string" });
+    expect(getIssueReportCard).not.toHaveBeenCalled();
+    const unknown = await getIssueReportCardTool(fakeContext("get_issue_report_card"), { caller: system, args: { issue: "AII-404" } });
+    expect(JSON.parse(unknown.content[0].text)).toEqual({ error: "No dispatch records found for issue: AII-404" });
+  });
+
+  it("get_fleet_report passes `days` through when numeric and omits it otherwise", async () => {
+    (getFleetReport as ReturnType<typeof vi.fn>).mockReturnValue({ byRepo: [], oneShotPct: 1, eventualPct: 1, escapeRate: 0, runaways: [] });
+    const withDays = await getFleetReportTool(fakeContext("get_fleet_report"), { caller: system, args: { days: 7 } });
+    expect(getFleetReport).toHaveBeenLastCalledWith({ days: 7 });
+    expect(Object.keys(JSON.parse(withDays.content[0].text)).sort()).toEqual(["byRepo", "escapeRate", "eventualPct", "oneShotPct", "runaways"]);
+    await getFleetReportTool(fakeContext("get_fleet_report"), { caller: system, args: {} });
+    expect(getFleetReport).toHaveBeenLastCalledWith({ days: undefined });
   });
 });

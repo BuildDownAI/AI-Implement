@@ -1,16 +1,10 @@
 import http from "node:http";
-import type { PreflightCheckResult, KgRefreshStatus } from "./kg-refresh.js";
 import { verifyMcpToken, resolveClientPath } from "./mcp-oauth.js";
 import { recordAuthEvent, type AuthEventCause } from "./mcp-auth-events.js";
-import { getRunnerMode, VALID_RUNNER_MODES } from "./runner-mode.js";
-import { getMappings } from "./config.js";
-import { getInFlightJobs, getRunRecordMergeVerdict } from "./log.js";
-import { getDb } from "./dedup.js";
-import { getIssueReportCard, getFleetReport } from "./report-card.js";
+import { VALID_RUNNER_MODES } from "./runner-mode.js";
 import { recheckIdentity, type AccessRole } from "./access-entries.js";
 import { type MemoryProvider, KG_TOOL_CAPABILITY } from "./kg-provider.js";
-import type { IdentityKind, Caller } from "./mcp-identity.js";
-import { getDeployPosture } from "./deploy-posture.js";
+import type { Caller } from "./mcp-identity.js";
 import { discoverTools, callTool } from "./restate/tools-client.js";
 
 interface JsonRpcRequest {
@@ -36,89 +30,37 @@ function bufferBody(req: http.IncomingMessage): Promise<Buffer> {
 
 // ---- Orchestrator-native diagnostic tools ----
 
-const DIAG_TOOLS = [
-  {
-    name: "get_runner_mode",
-    description:
-      "Returns the current global runner mode (default/gha/fly/local/shadow) and whether it came from an env var, database setting, or built-in default.",
-    inputSchema: { type: "object", properties: {} },
-  },
-  {
-    name: "list_projects",
-    description:
-      "Lists all configured project mappings: team key, repo, execution mode, provider, paused state, and per-project capacity cap.",
-    inputSchema: { type: "object", properties: {} },
-  },
-  {
-    name: "list_in_flight_jobs",
-    description:
-      "Lists all currently dispatching or running jobs with their issue identifier, repo, phase, and elapsed seconds since dispatch.",
-    inputSchema: { type: "object", properties: {} },
-  },
-  {
-    name: "get_issue_dispatch_status",
-    description:
-      "Returns the dispatch status for a specific issue identifier (e.g. 'AII-123'): in-flight flag, dedup-window flag, and the last five dispatch log entries. Use this to diagnose why a ticket is not being picked up.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        identifier: { type: "string", description: "Issue identifier, e.g. 'AII-123'" },
-      },
-      required: ["identifier"],
-    },
-  },
-  {
-    name: "get_issue_report_card",
-    description:
-      "Returns a full report card for a specific issue: all dispatch runs with per-pass telemetry, totals (dispatches, passes, cost), approval/merge/escape status, gap-fill rounds, and review-fix rounds. Use this to understand the full history and outcome of an issue.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        issue: { type: "string", description: "Issue identifier, e.g. 'AII-123'" },
-      },
-      required: ["issue"],
-    },
-  },
-  {
-    name: "get_fleet_report",
-    description:
-      "Returns an aggregated fleet report: per-repo job/issue/cost/pass counts, one-shot and eventual approval rates, planning A/B cohort comparison, review escape rate, and a ranked list of runaway issues. Optional `days` parameter (default 30) controls the look-back window.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        days: { type: "number", description: "Look-back window in days (default 30)" },
-      },
-    },
-  },
-  {
-    name: "get_deploy_posture",
-    description:
-      "Returns the current deploy posture: whether autoDeploy is on, the watched repo/branch, running vs head commit, deploy hold and in-flight state, runner channel image and commit, and a mergeCost field summarising the landing cost of a merge (deploy+image / image / none). Use this before filing or merging to understand the blast radius.",
-    inputSchema: { type: "object", properties: {} },
-  },
-  {
-    name: "get_kg_status",
-    description:
-      "Returns the KG refresh rail state: stage (idle | staging | ingest-running | serving | reverted | failed), the served snapshot stamp, the materialize path the next refresh will stage (rdflib | direct), and the last refresh outcome with its gate. Poll it after `POST /api/kg/refresh`.",
-    inputSchema: { type: "object", properties: {} },
-  },
-  {
-    name: "get_session_identity",
-    description:
-      "Returns the caller's email, sign-in provider, and role (user | admin | null when the identity has no allowlist entry) as the allowlist resolves them now. Admin-only skills call this first.",
-    inputSchema: { type: "object", properties: {} },
-  },
-];
+// get_session_identity is the one read tool that stays here rather than moving onto the
+// orchestratorTools Restate service (AII-711): it reports the door's own state (the
+// identity/role this very request resolved to), which only exists at this layer.
+const GET_SESSION_IDENTITY_TOOL = {
+  name: "get_session_identity",
+  description:
+    "Returns the caller's email, sign-in provider, and role (user | admin | null when the identity has no allowlist entry) as the allowlist resolves them now. Admin-only skills call this first.",
+  inputSchema: { type: "object", properties: {} },
+};
 
-const DIAG_TOOL_NAMES = new Set(DIAG_TOOLS.map((t) => t.name));
-
-// Tool names bound to the orchestratorTools Restate service (src/restate/tools.ts) rather
-// than the inline tables above — mirrors KG_TOOL_CAPABILITY's per-tool table (kg-provider.ts).
-// tools/call routes a name in this set through callTool() instead of callDiagnosticTool();
-// tools/list still sources its description/schema live from discoverTools() rather than
-// duplicating the literal here. Each migration child adds its tool's name and removes the
-// corresponding DIAG_TOOLS/WRITE_TOOLS entry (AII-710).
-const RESTATE_TOOL_NAMES = new Set(["get_tenant_health"]);
+// Tool names bound to the orchestratorTools Restate service (src/restate/tools.ts).
+// tools/call routes a name in this set through callTool(); tools/list sources every
+// discoverable tool's description/schema live from discoverTools() rather than duplicating
+// it here — get_session_identity above is the sole read tool that isn't in this set (AII-711).
+const RESTATE_TOOL_NAMES = new Set([
+  "get_tenant_health",
+  "get_runner_mode",
+  "list_projects",
+  "list_in_flight_jobs",
+  "get_issue_dispatch_status",
+  "get_issue_report_card",
+  "get_fleet_report",
+  "get_deploy_posture",
+  "get_kg_status",
+  "kg_hybrid_search",
+  "kg_search",
+  "kg_semantic_search",
+  "kg_neighbors",
+  "kg_provenance",
+  "kg_path",
+]);
 
 // ---- Orchestrator-native write tools ----
 // The entire write surface of /mcp: a tool is a write only if it is declared here, and each
@@ -352,155 +294,17 @@ export const WRITE_TOOLS: WriteTool[] = [
   },
 ];
 
-async function callDiagnosticTool(
-  name: string,
-  args: Record<string, unknown>,
-  context: {
-    defaultRunnerImage?: string;
-    runKgRefreshPreflight?: () => Promise<PreflightCheckResult>;
-    getKgStatus?: () => Promise<KgRefreshStatus>;
-    sessionIdentity?: { kind: IdentityKind; email: string; provider: string; role: AccessRole | null };
-  } = {},
-): Promise<unknown> {
-  switch (name) {
-    case "get_runner_mode": {
-      const { mode, source } = getRunnerMode();
-      return { mode, source };
-    }
-
-    case "list_projects": {
-      const mappings = getMappings();
-      return Object.entries(mappings).map(([key, m]) => ({
-        teamKey: key,
-        repo: `${m.owner}/${m.repo}`,
-        executionMode: m.executionMode,
-        provider: m.provider,
-        paused: m.paused,
-        planningEnabled: m.planningEnabled,
-        maxInProgressAiIssues: m.maxInProgressAiIssues,
-        defaultBranch: m.defaultBranch,
-        workflowFile: m.workflowFile,
-        sessionMode: m.sessionMode,
-        autoMerge: m.autoMerge,
-        maxTurns: m.maxTurns,
-        maxIterations: m.maxIterations,
-        maxJobMinutes: m.maxJobMinutes,
-        branchPrefix: m.branchPrefix,
-        skillsRepo: m.skillsRepo,
-        referenceRepos: m.referenceRepos,
-        dependencyTokenScope: m.dependencyTokenScope,
-        sensitiveAddPatterns: m.sensitiveAddPatterns,
-        sensitiveAllowPatterns: m.sensitiveAllowPatterns,
-        machineCpus: m.machineCpus,
-        machineMemoryMb: m.machineMemoryMb,
-        awsRegion: m.awsRegion,
-        planningWorkflowFile: m.planningWorkflowFile,
-        autoApprovePlans: m.autoApprovePlans,
-        reviewers: m.reviewers,
-      }));
-    }
-
-    case "list_in_flight_jobs": {
-      const now = Date.now();
-      return getInFlightJobs().map((j) => ({
-        id: j.id,
-        issueIdentifier: j.issueIdentifier,
-        issueTitle: j.issueTitle,
-        repo: j.repo,
-        phase: j.phase,
-        status: j.status,
-        dispatchedAt: j.dispatchedAt,
-        elapsedSeconds: Math.round((now - j.dispatchedAt) / 1000),
-      }));
-    }
-
-    case "get_issue_dispatch_status": {
-      const identifier = args.identifier;
-      if (typeof identifier !== "string" || !identifier) {
-        return { error: "identifier is required and must be a non-empty string" };
-      }
-      const db = getDb();
-      const recentRows = db
-        .prepare(
-          "SELECT id, status, dispatched_at, repo, phase, pr_url, conclusion FROM dispatch_log WHERE issue_identifier = ? ORDER BY dispatched_at DESC LIMIT 5",
-        )
-        .all(identifier) as Array<{
-          id: number;
-          status: string | null;
-          dispatched_at: number;
-          repo: string | null;
-          phase: string | null;
-          pr_url: string | null;
-          conclusion: string | null;
-        }>;
-      const dedupRow = db
-        .prepare("SELECT issue_id, dispatched_at FROM dispatched WHERE issue_identifier = ?")
-        .get(identifier) as { issue_id: string; dispatched_at: number } | undefined;
-      const inFlight = recentRows.some(
-        (j) => j.status === "dispatched" || j.status === "running",
-      );
-      const latestPrUrl = recentRows.find((j) => j.pr_url)?.pr_url ?? null;
-      const mergeVerdict = latestPrUrl
-        ? { verdict: getRunRecordMergeVerdict(identifier, latestPrUrl), prUrl: latestPrUrl }
-        : null;
-      return {
-        identifier,
-        inFlight,
-        inDedupWindow: !!dedupRow,
-        dedupEntry: dedupRow ?? null,
-        mergeVerdict,
-        recentDispatches: recentRows.map((j) => ({
-          id: j.id,
-          status: j.status,
-          dispatchedAt: j.dispatched_at,
-          repo: j.repo,
-          phase: j.phase,
-          prUrl: j.pr_url,
-          conclusion: j.conclusion,
-        })),
-      };
-    }
-
-    case "get_issue_report_card": {
-      const issue = args.issue;
-      if (typeof issue !== "string" || !issue) {
-        return { error: "issue is required and must be a non-empty string" };
-      }
-      const card = getIssueReportCard(issue);
-      if (!card) return { error: `No dispatch records found for issue: ${issue}` };
-      return card;
-    }
-
-    case "get_fleet_report": {
-      const days = typeof args.days === "number" ? args.days : undefined;
-      return getFleetReport({ days });
-    }
-
-    case "get_deploy_posture":
-      return getDeployPosture({ defaultImage: context.defaultRunnerImage });
-
-    case "get_kg_status":
-      return context.getKgStatus ? await context.getKgStatus() : { error: "KG refresh is not configured" };
-
-    case "get_session_identity":
-      return context.sessionIdentity ?? { kind: null, email: null, provider: null, role: null };
-
-    default:
-      return { error: `Unknown diagnostic tool: ${name}` };
-  }
-}
-
 // ---- Main handler ----
 
 export async function handleMcpRequest(
   req: http.IncomingMessage,
   res: http.ServerResponse,
+  // `provider` is still read by tools/list's kg_* courtesy filter (AII-641); the diagnostic
+  // string is kept in the signature so the boot wiring (src/index.ts) and the tests keep
+  // their positions. AII-715 restructures the door and drops it.
   provider: MemoryProvider | null,
   baseUrl: string | null,
-  providerDiagnostic?: string | null,
-  defaultRunnerImage?: string,
-  runKgRefreshPreflight?: () => Promise<PreflightCheckResult>,
-  getKgStatus?: () => Promise<KgRefreshStatus>,
+  _providerDiagnostic?: string | null,
   triggerKgRefresh?: (dryRun?: boolean, acceptNewBaseline?: boolean, actorEmail?: string) => Promise<{ status: number; body: Record<string, unknown> }>,
   setRunnerMode?: (patch: { mode?: string }) => { status: number; body: Record<string, unknown> },
   pauseProject?: (teamKey: string, paused: boolean) => { status: number; body: Record<string, unknown> },
@@ -573,7 +377,8 @@ export async function handleMcpRequest(
   // The JSON-RPC handshake (initialize/ping/notifications-initialized) is answered by the
   // orchestrator itself, never proxied: orchestrator-native tools exist regardless of the
   // sidecar, so a real MCP client (not just curl against tools/list) must be able to connect
-  // on a sidecar-less boot. Only kg_* tool calls stay gated on `provider` below (AII-641).
+  // on a sidecar-less boot. A kg_* call without a sidecar configured degrades inside its own
+  // handler (src/restate/tools.ts) rather than gating here.
   if (rpc?.method === "initialize") {
     json(res, 200, {
       jsonrpc: "2.0",
@@ -601,29 +406,31 @@ export async function handleMcpRequest(
   }
 
   if (rpc?.method === "tools/list") {
-    // Merge native diagnostic tools, tools discovered from the orchestratorTools Restate
-    // service (AII-710), and kg_* tools from the provider. Hiding a tool the caller's role
-    // cannot use is a courtesy — the check in tools/call below is the boundary.
-    //
-    // kg_* tools are omitted here entirely when there is no provider, rather than listed with
-    // an isError response on tools/call: unlike get_tenant_health's `kgDegraded` flag — which
-    // surfaces a *partially* working KG (search still answers, just lexical-only) so a client
-    // knows the capability exists but is degraded — an unset KG_SIDECAR_URL means the capability
-    // doesn't exist at all for this session. Listing tools a client can never successfully call
-    // would be misleading; omitting them lets tools/list reflect what's actually usable, while
-    // the 503 below still carries the "no memory provider is configured" detail for a client
-    // that calls one anyway (e.g. from a stale tool list) (AII-641). A Restate-backed tool
-    // degrades the same way: discoverTools() returns an empty list when the admin API is
-    // unreachable, so the migrated tool simply drops out of tools/list until it recovers.
+    // Every read tool, including the six kg_* proxies, is now a handler on the
+    // orchestratorTools Restate service (AII-711) — discovered live rather than duplicated
+    // as a literal here. get_session_identity is the one exception: it reports the door's
+    // own state, so it's listed unconditionally alongside the discovered set. Hiding a tool
+    // the caller's role cannot use is a courtesy — the check in tools/call below is the
+    // boundary. The kg_* handlers are discovered like every other tool, but the list keeps
+    // the AII-641 courtesy: a kg_* tool is omitted when no KG sidecar is configured, or when
+    // the provider lacks that tool's capability, so a client never sees a tool it can never
+    // call (tools/call still refuses it inside the handler if called from a stale list). A
+    // Restate-backed tool degrades the same way when the admin API itself is unreachable:
+    // discoverTools() returns an empty list, so the discovered set drops out until it recovers.
+    const kgToolVisible = (name: string): boolean => {
+      const capKey = KG_TOOL_CAPABILITY[name];
+      if (capKey === undefined && !name.startsWith("kg_")) return true;
+      if (!provider) return false;
+      return capKey === undefined || provider.capabilities[capKey] === true;
+    };
     const discovered = await discoverTools();
     const restateTools = discovered
-      .filter((t) => roleAllows(role, t.role))
+      .filter((t) => roleAllows(role, t.role) && kgToolVisible(t.name))
       .map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema }));
-    const kgTools = provider ? await provider.listTools(body, req.headers) : [];
     json(res, 200, {
       jsonrpc: "2.0",
       id: rpc.id ?? null,
-      result: { tools: [...DIAG_TOOLS, ...WRITE_TOOLS.filter((t) => roleAllows(role, t.role)), ...restateTools, ...kgTools] },
+      result: { tools: [GET_SESSION_IDENTITY_TOOL, ...WRITE_TOOLS.filter((t) => roleAllows(role, t.role)), ...restateTools] },
     });
     return;
   }
@@ -677,6 +484,16 @@ export async function handleMcpRequest(
       return;
     }
 
+    if (toolName === "get_session_identity") {
+      const result = { kind: identity.kind, email: identity.email, provider: identity.provider, role };
+      json(res, 200, {
+        jsonrpc: "2.0",
+        id: rpc.id ?? null,
+        result: { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] },
+      });
+      return;
+    }
+
     if (RESTATE_TOOL_NAMES.has(toolName)) {
       const caller: Caller = { kind: identity.kind, email: identity.email, role };
       const callResult = await callTool(toolName, toolArgs, caller);
@@ -692,57 +509,34 @@ export async function handleMcpRequest(
       return;
     }
 
-    if (DIAG_TOOL_NAMES.has(toolName)) {
-      try {
-        const result = await callDiagnosticTool(toolName, toolArgs, {
-          defaultRunnerImage,
-          runKgRefreshPreflight,
-          getKgStatus,
-          sessionIdentity: { kind: identity.kind, email: identity.email, provider: identity.provider, role },
-        });
-        json(res, 200, {
-          jsonrpc: "2.0",
-          id: rpc.id ?? null,
-          result: { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] },
-        });
-      } catch (err) {
-        json(res, 200, {
-          jsonrpc: "2.0",
-          id: rpc.id ?? null,
-          result: {
-            content: [{ type: "text", text: `Error: ${(err as Error).message}` }],
-            isError: true,
-          },
-        });
-      }
-      return;
-    }
-
-    // KG tool call — check provider availability and capability
-    if (!provider) {
-      const detail = providerDiagnostic ? ` (${providerDiagnostic})` : "";
-      json(res, 503, { error: `no memory provider is configured${detail}` });
-      return;
-    }
-    const capKey = KG_TOOL_CAPABILITY[toolName];
-    if (capKey !== undefined && !provider.capabilities[capKey]) {
-      json(res, 200, {
-        jsonrpc: "2.0",
-        id: rpc.id ?? null,
-        error: { code: -32601, message: `Tool not supported by this memory provider: ${toolName}` },
-      });
-      return;
-    }
-    provider.proxyCall(req, res, body);
+    // A tool name that is neither the door's own tool nor a discovered handler is unknown:
+    // since AII-711 every read (the kg_* tools included) is a handler, and nothing is
+    // proxied to the sidecar any more.
+    json(res, 200, {
+      jsonrpc: "2.0",
+      id: rpc.id ?? null,
+      error: { code: -32602, message: `Unknown tool: ${toolName}` },
+    });
     return;
   }
 
-  // Proxy everything else to the provider
-  if (!provider) {
-    const detail = providerDiagnostic ? ` (${providerDiagnostic})` : "";
-    json(res, 503, { error: `no memory provider is configured${detail}` });
+  // The raw sidecar proxy that used to sit here left with AII-711. What remains is the
+  // streamable-HTTP contract the door itself implements: POST only (no SSE channel, no
+  // server-side session to DELETE), notifications are acknowledged with no body, and any
+  // other JSON-RPC method is method-not-found.
+  if (req.method !== "POST") {
+    res.writeHead(405, { Allow: "POST", "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "method not allowed" }));
     return;
   }
-
-  provider.proxyCall(req, res, body);
+  if (rpc && rpc.id === undefined && typeof rpc.method === "string" && rpc.method.startsWith("notifications/")) {
+    res.writeHead(202);
+    res.end();
+    return;
+  }
+  json(res, 200, {
+    jsonrpc: "2.0",
+    id: rpc?.id ?? null,
+    error: { code: -32601, message: `Method not found: ${rpc?.method ?? "unknown"}` },
+  });
 }

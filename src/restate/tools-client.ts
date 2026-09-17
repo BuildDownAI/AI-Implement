@@ -134,8 +134,14 @@ export async function callTool(
   } catch {
     return { status: "unavailable" };
   }
+  // Only a connection failure or a 5xx means Restate is unavailable. A 4xx from the ingress
+  // (unknown handler, an args shape zod rejects) is the caller's error and is answered as a
+  // tool error with the real status, so it is not mistaken for a down sidecar (AII-711).
   if (response.status >= 500) return { status: "unavailable" };
-  if (!response.ok) return { status: "unavailable" };
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    return { status: "ok", isError: true, content: [{ type: "text", text: `${response.status} ${text}`.trim() }] };
+  }
 
   try {
     const body = (await response.json()) as { content: Array<{ type: string; text: string }>; isError?: boolean };
