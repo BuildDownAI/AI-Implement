@@ -4,6 +4,6 @@
     "noEmit": true,
     "declaration": false
   },
-  "include": ["src/__tests__/restate/**/*.ts", "src/__tests__/restate-*.test.ts", "src/__tests__/operator-object.test.ts", "src/restate/**/*.ts"],
+  "include": ["src/__tests__/restate/**/*.ts", "src/__tests__/restate-*.test.ts", "src/__tests__/operator-object.test.ts", "src/__tests__/tools.test.ts", "src/restate/**/*.ts"],
   "exclude": []
 }
