@@ -813,9 +813,15 @@ describe("migrated write handlers (AII-713)", () => {
     it("on a full args set, calls upsertMappingAction and returns its success body verbatim", async () => {
       (upsertMappingAction as ReturnType<typeof vi.fn>).mockReturnValue({ status: 202, body: { teamKey: "AII", syncJobId: 5 } });
       const args = { teamKey: "AII", owner: "org", repo: "repo", defaultBranch: "main" };
-      const result = await addProjectTool(fakeContext("add_project"), { caller: admin, args });
+      const runCalls: RunCall[] = [];
+      const result = await addProjectTool(fakeContext("add_project", runCalls), { caller: admin, args });
       expect(upsertMappingAction).toHaveBeenCalledWith(args, expect.any(Object), expect.any(Object));
       expect(JSON.parse(result.content[0].text)).toEqual({ status: 202, body: { teamKey: "AII", syncJobId: 5 } });
+      expect(runCalls).toEqual([{
+        name: "upsert-mapping",
+        options: { maxRetryAttempts: 1 },
+        result: { status: 202, body: { teamKey: "AII", syncJobId: 5 } },
+      }]);
     });
 
     // AII-720: the tool description promises "pass null to reset to the default" for

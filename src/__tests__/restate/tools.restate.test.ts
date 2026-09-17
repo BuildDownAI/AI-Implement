@@ -363,7 +363,8 @@ describe("orchestratorTools (Restate)", () => {
   // deployment record for one handler; its handler list uses snake_case keys for every
   // multi-word field observed elsewhere in this suite (`input_json_schema`,
   // `output_json_schema` above), so `retry_policy`/`max_attempts`/`on_max_attempts` is the
-  // pinned path here, consistent with that convention.
+  // pinned path here, consistent with that convention. restate-server 1.7.10 reports
+  // on_max_attempts as "Kill" (capitalised enum), so the comparison below is case-insensitive.
   it.each(VARIANTS.map(([label]) => label))(
     "the admin API's per-handler record for pause_project carries retryPolicy: { maxAttempts: 1, onMaxAttempts: \"kill\" } (%s)",
     async (label) => {
@@ -381,7 +382,7 @@ describe("orchestratorTools (Restate)", () => {
       const retryPolicy = (handler.retry_policy ?? handler.retryPolicy) as Record<string, unknown> | undefined;
       expect(retryPolicy, `no retry_policy/retryPolicy field on the handler record: ${JSON.stringify(handler)}`).toBeDefined();
       expect(retryPolicy?.max_attempts ?? retryPolicy?.maxAttempts).toBe(1);
-      expect(retryPolicy?.on_max_attempts ?? retryPolicy?.onMaxAttempts).toBe("kill");
+      expect(String(retryPolicy?.on_max_attempts ?? retryPolicy?.onMaxAttempts).toLowerCase()).toBe("kill");
     },
   );
 
