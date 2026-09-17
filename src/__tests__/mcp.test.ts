@@ -1,11 +1,73 @@
 import { PassThrough, Writable } from "node:stream";
 import http from "node:http";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type * as restate from "@restatedev/restate-sdk";
 import { handleMcpRequest, WRITE_TOOLS } from "../mcp.js";
-import { SidecarMemoryProvider, sidecarHealth, sidecarHealthFields } from "../kg-provider.js";
-import type { MemoryProvider } from "../kg-provider.js";
+import { SidecarMemoryProvider, sidecarHealth, sidecarHealthFields, setKgMemoryProvider } from "../kg-provider.js";
+import type { MemoryProvider, KgToolResult } from "../kg-provider.js";
+import { setActiveKgRefresh } from "../kg-refresh.js";
 import type { PreflightCheckResult, KgRefreshStatus } from "../kg-refresh.js";
-import { GET_TENANT_HEALTH_DESCRIPTION } from "../restate/tools.js";
+import type { Caller } from "../mcp-identity.js";
+import {
+  GET_TENANT_HEALTH_DESCRIPTION,
+  getTenantHealth,
+  getRunnerModeTool,
+  listProjects,
+  listInFlightJobs,
+  getIssueDispatchStatus,
+  getIssueReportCardTool,
+  getFleetReportTool,
+  getDeployPostureTool,
+  getKgStatusTool,
+  kgHybridSearch,
+  kgSearch,
+  kgSemanticSearch,
+  kgNeighbors,
+  kgPath,
+  kgProvenance,
+  type ToolResponse,
+} from "../restate/tools.js";
+
+/**
+ * Every tool bound to the orchestratorTools Restate service, keyed by wire name — mirrors
+ * `orchestratorTools`'s own handlers map (src/restate/tools.ts). The mocked
+ * `restate/tools-client.js`'s `callTool` dispatches through this table so a tools/call test
+ * exercises the real handler body (and, through it, the same mocked modules — getRunnerMode,
+ * getMappings, getDb, etc. — a unit test for that handler in tools.test.ts already exercises
+ * directly) rather than a second, hand-duplicated expectation.
+ */
+const TOOL_HANDLERS: Record<
+  string,
+  (ctx: restate.Context, input: { caller: Caller; args: Record<string, unknown> }) => Promise<ToolResponse>
+> = {
+  get_tenant_health: getTenantHealth,
+  get_runner_mode: getRunnerModeTool,
+  list_projects: listProjects,
+  list_in_flight_jobs: listInFlightJobs,
+  get_issue_dispatch_status: getIssueDispatchStatus,
+  get_issue_report_card: getIssueReportCardTool,
+  get_fleet_report: getFleetReportTool,
+  get_deploy_posture: getDeployPostureTool,
+  get_kg_status: getKgStatusTool,
+  kg_hybrid_search: kgHybridSearch,
+  kg_search: kgSearch,
+  kg_semantic_search: kgSemanticSearch,
+  kg_neighbors: kgNeighbors,
+  kg_path: kgPath,
+  kg_provenance: kgProvenance,
+};
+
+/** Every discoverable tool's role is "user" in production; mirrors DiscoveredTool. */
+const DISCOVERED_TOOLS = Object.keys(TOOL_HANDLERS).map((name) => ({
+  name,
+  description: name === "get_tenant_health" ? GET_TENANT_HEALTH_DESCRIPTION : name,
+  inputSchema: { type: "object", properties: {} },
+  role: "user" as const,
+}));
+
+function fakeRestateContext(handlerName: string): restate.Context {
+  return { request: () => ({ target: { handler: handlerName } }) } as unknown as restate.Context;
+}
 
 vi.mock("../mcp-oauth.js", () => ({
   verifyMcpToken: vi.fn(),
@@ -195,20 +257,21 @@ beforeEach(async () => {
     })),
   });
 
-  // get_tenant_health is sourced from the orchestratorTools Restate service (AII-710);
-  // the mocked client stands in for it so tests don't need a real sidecar/admin API.
-  (toolsClientMock.discoverTools as ReturnType<typeof vi.fn>).mockResolvedValue([
-    {
-      name: "get_tenant_health",
-      description: GET_TENANT_HEALTH_DESCRIPTION,
-      inputSchema: { type: "object", properties: {} },
-      role: "user",
+  // Every read tool is sourced from the orchestratorTools Restate service (AII-711); the
+  // mocked client stands in for discovery/ingress so tests don't need a real admin API, but
+  // dispatches to the real handler bodies (TOOL_HANDLERS above) so a test still exercises
+  // production logic end to end.
+  (toolsClientMock.discoverTools as ReturnType<typeof vi.fn>).mockResolvedValue(DISCOVERED_TOOLS);
+  (toolsClientMock.callTool as ReturnType<typeof vi.fn>).mockImplementation(
+    async (name: string, args: Record<string, unknown>, caller: Caller) => {
+      const handler = TOOL_HANDLERS[name];
+      if (!handler) return { status: "unavailable" };
+      const result = await handler(fakeRestateContext(name), { caller, args });
+      return { status: "ok", content: result.content, isError: result.isError };
     },
-  ]);
-  (toolsClientMock.callTool as ReturnType<typeof vi.fn>).mockImplementation(async () => ({
-    status: "ok",
-    content: [{ type: "text", text: JSON.stringify(buildTenantHealth(), null, 2) }],
-  }));
+  );
+  setKgMemoryProvider(null);
+  setActiveKgRefresh(null);
 
   (mcpOauth.resolveClientPath as ReturnType<typeof vi.fn>).mockReturnValue("unknown");
 
@@ -265,24 +328,6 @@ function setupProxyError(errorCode: string): void {
     process.nextTick(() => {
       const err = Object.assign(new Error(errorCode), { code: errorCode });
       mockProxyReq.emit("error", err);
-    });
-    return mockProxyReq;
-  });
-}
-
-/** Mock the sidecar to return a tools/list JSON-RPC response. */
-function setupSidecarToolsList(tools: unknown[]): void {
-  const mockProxyReq = new PassThrough();
-  const mockProxyRes = new PassThrough();
-  Object.assign(mockProxyRes, {
-    statusCode: 200,
-    headers: { "content-type": "application/json" },
-  });
-  mockHttpRequest.mockImplementationOnce((_opts: http.RequestOptions, cb: (res: unknown) => void) => {
-    process.nextTick(() => {
-      cb(mockProxyRes);
-      mockProxyRes.push(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { tools } }));
-      mockProxyRes.push(null);
     });
     return mockProxyReq;
   });
@@ -537,7 +582,7 @@ describe("handleMcpRequest", () => {
   });
 
   describe("tools/list", () => {
-    it("returns diagnostic tools when sidecar is not configured", async () => {
+    it("returns every discovered read tool when sidecar is not configured", async () => {
       const result = await callMcp(
         { authorization: "Bearer tok" },
         true,
@@ -559,11 +604,11 @@ describe("handleMcpRequest", () => {
       ]));
     });
 
-    it("does not call the sidecar when sidecar is null", async () => {
+    it("does not call the sidecar for tools/list (discovery no longer touches the provider)", async () => {
       await callMcp(
         { authorization: "Bearer tok" },
         true,
-        null,
+        DEFAULT_PROVIDER,
         BASE_URL,
         "POST",
         '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}',
@@ -571,152 +616,21 @@ describe("handleMcpRequest", () => {
       expect(mockHttpRequest).not.toHaveBeenCalled();
     });
 
-    it("merges diagnostic tools with sidecar kg_* tools", async () => {
-      setupSidecarToolsList([{ name: "kg_search", description: "KG search" }]);
+    it("lists kg_* tools even when no provider is configured — discovery no longer depends on it", async () => {
       const result = await callMcp(
         { authorization: "Bearer tok" },
         true,
-        DEFAULT_PROVIDER,
+        null,
         BASE_URL,
         "POST",
         '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}',
       );
-      expect(result.statusCode).toBe(200);
-      const parsed = JSON.parse(result.body);
-      const names = parsed.result.tools.map((t: { name: string }) => t.name);
-      expect(names).toContain("get_tenant_health");
-      expect(names).toContain("kg_search");
-    });
-
-    it("merges kg_* tools from an SSE-framed sidecar response (streamable-HTTP)", async () => {
-      const mockProxyReq = new PassThrough();
-      const mockProxyRes = new PassThrough();
-      Object.assign(mockProxyRes, { statusCode: 200, headers: { "content-type": "text/event-stream" } });
-      mockHttpRequest.mockImplementationOnce((_o: unknown, cb: (r: unknown) => void) => {
-        process.nextTick(() => {
-          cb(mockProxyRes);
-          mockProxyRes.push(": ping\n\n");
-          mockProxyRes.push(
-            `event: message\ndata: ${JSON.stringify({ jsonrpc: "2.0", id: 1, result: { tools: [{ name: "kg_hybrid_search", description: "hybrid" }] } })}\n\n`,
-          );
-          mockProxyRes.push(null);
-        });
-        return mockProxyReq;
-      });
-      const result = await callMcp(
-        { authorization: "Bearer tok" },
-        true,
-        DEFAULT_PROVIDER,
-        BASE_URL,
-        "POST",
-        '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}',
-      );
-      expect(result.statusCode).toBe(200);
       const names = JSON.parse(result.body).result.tools.map((t: { name: string }) => t.name);
-      expect(names).toContain("get_tenant_health");
       expect(names).toContain("kg_hybrid_search");
-    });
-
-    it("joins multi-line SSE data fields before parsing", async () => {
-      const payload = JSON.stringify({ jsonrpc: "2.0", id: 1, result: { tools: [{ name: "kg_search" }] } });
-      const mid = Math.floor(payload.length / 2);
-      const mockProxyReq = new PassThrough();
-      const mockProxyRes = new PassThrough();
-      Object.assign(mockProxyRes, { statusCode: 200, headers: { "content-type": "text/event-stream" } });
-      mockHttpRequest.mockImplementationOnce((_o: unknown, cb: (r: unknown) => void) => {
-        process.nextTick(() => {
-          cb(mockProxyRes);
-          mockProxyRes.push(`event: message\ndata: ${payload.slice(0, mid)}\ndata:${payload.slice(mid)}\n\n`);
-          mockProxyRes.push(null);
-        });
-        return mockProxyReq;
-      });
-      const result = await callMcp(
-        { authorization: "Bearer tok" },
-        true,
-        DEFAULT_PROVIDER,
-        BASE_URL,
-        "POST",
-        '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}',
-      );
-      const names = JSON.parse(result.body).result.tools.map((t: { name: string }) => t.name);
       expect(names).toContain("kg_search");
-    });
-
-    it("returns only diagnostic tools when the sidecar replies with a JSON-RPC error over SSE", async () => {
-      const mockProxyReq = new PassThrough();
-      const mockProxyRes = new PassThrough();
-      Object.assign(mockProxyRes, { statusCode: 400, headers: { "content-type": "text/event-stream" } });
-      mockHttpRequest.mockImplementationOnce((_o: unknown, cb: (r: unknown) => void) => {
-        process.nextTick(() => {
-          cb(mockProxyRes);
-          mockProxyRes.push(
-            `event: message\ndata: ${JSON.stringify({ jsonrpc: "2.0", id: "server-error", error: { code: -32600, message: "Bad Request: Missing session ID" } })}\n\n`,
-          );
-          mockProxyRes.push(null);
-        });
-        return mockProxyReq;
-      });
-      const result = await callMcp(
-        { authorization: "Bearer tok" },
-        true,
-        DEFAULT_PROVIDER,
-        BASE_URL,
-        "POST",
-        '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}',
-      );
-      const parsed = JSON.parse(result.body);
-      expect(parsed.result.tools.some((t: { name: string }) => t.name === "get_tenant_health")).toBe(true);
-      expect(parsed.result.tools.some((t: { name: string }) => t.name.startsWith("kg_"))).toBe(false);
-    });
-
-    it("returns only diagnostic tools when the SSE stream carries only pings", async () => {
-      const mockProxyReq = new PassThrough();
-      const mockProxyRes = new PassThrough();
-      Object.assign(mockProxyRes, { statusCode: 200, headers: { "content-type": "text/event-stream" } });
-      mockHttpRequest.mockImplementationOnce((_o: unknown, cb: (r: unknown) => void) => {
-        process.nextTick(() => {
-          cb(mockProxyRes);
-          mockProxyRes.push(": ping\n\n: ping\n\n");
-          mockProxyRes.push(null);
-        });
-        return mockProxyReq;
-      });
-      const result = await callMcp(
-        { authorization: "Bearer tok" },
-        true,
-        DEFAULT_PROVIDER,
-        BASE_URL,
-        "POST",
-        '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}',
-      );
-      const parsed = JSON.parse(result.body);
-      expect(parsed.result.tools.some((t: { name: string }) => t.name === "get_tenant_health")).toBe(true);
-      expect(parsed.result.tools.some((t: { name: string }) => t.name.startsWith("kg_"))).toBe(false);
-    });
-
-    it("returns only diagnostic tools when sidecar returns invalid JSON", async () => {
-      const mockProxyReq = new PassThrough();
-      const mockProxyRes = new PassThrough();
-      Object.assign(mockProxyRes, { statusCode: 200, headers: {} });
-      mockHttpRequest.mockImplementationOnce((_o: unknown, cb: (r: unknown) => void) => {
-        process.nextTick(() => { cb(mockProxyRes); mockProxyRes.push("not-json"); mockProxyRes.push(null); });
-        return mockProxyReq;
-      });
-      const result = await callMcp(
-        { authorization: "Bearer tok" },
-        true,
-        DEFAULT_PROVIDER,
-        BASE_URL,
-        "POST",
-        '{"jsonrpc":"2.0","id":1,"method":"tools/list"}',
-      );
-      const parsed = JSON.parse(result.body);
-      expect(parsed.result.tools.some((t: { name: string }) => t.name === "get_tenant_health")).toBe(true);
     });
 
     it("preserves the JSON-RPC id in the tools/list response", async () => {
-      setupSidecarToolsList([]);
       const result = await callMcp(
         { authorization: "Bearer tok" },
         true,
@@ -743,7 +657,8 @@ describe("handleMcpRequest", () => {
       const parsed = JSON.parse(result.body);
       const names = parsed.result.tools.map((t: { name: string }) => t.name);
       expect(names).not.toContain("get_tenant_health");
-      expect(names).toContain("get_runner_mode");
+      // get_session_identity is listed unconditionally, independent of discoverTools.
+      expect(names).toContain("get_session_identity");
     });
   });
 

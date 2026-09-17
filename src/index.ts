@@ -69,7 +69,7 @@ import type { RunnerProgressBody, RunnerResultBody } from "./runner-callback.js"
 import { mintRunToken, PLANNING_TTL_SECONDS, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
 import { handleGapFillTrigger } from "./gap-fill-trigger.js";
 import { handleMcpRequest } from "./mcp.js";
-import { resolveMemoryProvider, providerUnconfiguredReason, SidecarMemoryProvider, KG_TOOL_CAPABILITY, probeWithTimeout, sidecarHealthFields } from "./kg-provider.js";
+import { resolveMemoryProvider, providerUnconfiguredReason, SidecarMemoryProvider, KG_TOOL_CAPABILITY, probeWithTimeout, sidecarHealthFields, setKgMemoryProvider } from "./kg-provider.js";
 import type { MemoryProvider } from "./kg-provider.js";
 import { withRequestErrorBoundary } from "./http-server.js";
 import {
@@ -108,7 +108,7 @@ import { githubActionsWatchdogDecision } from "./github-actions-watchdog.js";
 import { KgSidecar } from "./kg-sidecar.js";
 import { RestateSidecar } from "./restate/server.js";
 import { startRestateEndpoint, register as registerRestateEndpoint } from "./restate/endpoint.js";
-import { makeKgRefresh, runKgRefreshPreflight } from "./kg-refresh.js";
+import { makeKgRefresh, setActiveKgRefresh } from "./kg-refresh.js";
 import type { KgRefreshHandle } from "./kg-refresh.js";
 import { beginCycle, isCurrentCycle, getPollStats, runWithDeadline } from "./poll-cycle.js";
 import { monitorKgRefreshGhaJob } from "./monitor-gha.js";
@@ -3488,6 +3488,7 @@ function startServer(
     },
   });
   activeKgRefresh = kgRefresh;
+  setActiveKgRefresh(kgRefresh);
   // A deploy hold clearing is not a `running` transition inside kgRefresh (trigger()'s
   // deployHeld() check answers 409 before running is ever set) — wake any webhook head
   // queued behind that refusal explicitly (AII-636).
@@ -3962,15 +3963,6 @@ function startServer(
 
     // MCP endpoint — OAuth bearer token authenticated
     if (pathname === "/mcp") {
-      const kgPreflightFn = config.kgSourceRepo
-        ? () => runKgRefreshPreflight({
-            githubAppId: config.githubAppId,
-            githubAppPrivateKey: config.githubAppPrivateKey,
-            kgSourceRepo: config.kgSourceRepo!,
-            kgBaseRepo: getOrchestratorSettings().kgBaseRepo,
-          })
-        : undefined;
-      const getKgStatusFn = () => kgRefresh.status();
       const triggerKgRefreshFn = (dryRun?: boolean, acceptNewBaseline?: boolean, actorEmail?: string) =>
         kgRefresh.trigger({ dryRun, acceptNewBaseline, actorEmail });
       // Same AdminConfig shape the /admin routes build (line ~3908) — the five write
@@ -3997,9 +3989,6 @@ function startServer(
         memoryProvider,
         config.oauthRedirectBaseUrl,
         memoryProviderDiagnostic,
-        config.sessionImage,
-        kgPreflightFn,
-        getKgStatusFn,
         triggerKgRefreshFn,
         setRunnerModeFn,
         pauseProjectFn,
@@ -4153,6 +4142,10 @@ async function main(): Promise<void> {
   // second, independent MCP session.
   const memoryProvider = resolveMemoryProvider(config.kgSidecarUrl, config.memoryProviderId);
   const memoryProviderDiagnostic = providerUnconfiguredReason(config.kgSidecarUrl, config.memoryProviderId);
+  // Also reachable from src/restate/tools.ts's kg_* handlers, which — unlike handleMcpRequest
+  // below — have no per-request dependency injection; sharing this instance means they
+  // negotiate the same MCP session rather than a second, independent one.
+  setKgMemoryProvider(memoryProvider);
   let sidecarProbeError: string | null = null;
   if (memoryProvider instanceof SidecarMemoryProvider) {
     const health = await probeWithTimeout(memoryProvider);
