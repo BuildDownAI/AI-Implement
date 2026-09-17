@@ -191,6 +191,10 @@ describe("spawn configuration", () => {
 
       expect(childEnv?.RESTATE_ADMIN__BIND_ADDRESS).toBe(new URL(RESTATE_ADMIN_BASE_URL).host);
       expect(childEnv?.RESTATE_ADMIN__BIND_ADDRESS).toMatch(/^127\.0\.0\.1:\d+$/);
+
+      expect(childEnv?.RESTATE_BIND_ADDRESS).toBe("127.0.0.1:5122");
+      expect(childEnv?.RESTATE_DEFAULT_NUM_PARTITIONS).toBe("4");
+      expect(childEnv?.RESTATE_ROCKSDB_TOTAL_MEMORY_SIZE).toBe("256 MB");
     } finally {
       await sidecar.stop();
     }

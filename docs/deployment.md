@@ -312,14 +312,18 @@ A failed probe re-runs in the background (throttled) on the next proxied failure
 
 ### Local image boot check
 
-Before shipping a change that touches the sidecar's bind addresses, confirm loopback-only binding inside the actual built image rather than trusting the source:
+Before shipping a change that touches the sidecar's bind addresses, confirm loopback-only binding inside the actual built image rather than trusting the source. Run with a memory cap and a `/data` volume so the run also measures the sidecar's resident footprint (docs/restate.md § "Memory") — populate the named volume once as root first, since Docker only re-seeds an empty named volume from the image's own root-owned `/data` on its *first* mount, not on every run:
 
 ```bash
-docker run --rm -d --name ai-implement-boot-check <image>
+docker volume create ai-implement-boot-check-data
+docker run --rm --entrypoint sh -v ai-implement-boot-check-data:/data <image> \
+  -c "chown -R node:node /data && touch /data/.keep"
+docker run --rm -d --name ai-implement-boot-check --memory 1g -v ai-implement-boot-check-data:/data <image>
 sleep 5
 docker exec ai-implement-boot-check sh -c "ss -ltnp 2>/dev/null || netstat -ltnp"
 docker port ai-implement-boot-check
+docker stats --no-stream ai-implement-boot-check
 docker stop ai-implement-boot-check
 ```
 
-`ss`/`netstat` inside the container should show the ingress (8081), admin API (9070), and SDK endpoint (9080) listening on `127.0.0.1`, never `0.0.0.0`; `docker port` should publish none of them to the host. Either symptom is the regression this check exists to catch — a wrong config key silently falling back to `restate-server`'s own default bind (`0.0.0.0`) would otherwise only surface as an unexplained port collision or an externally reachable admin API.
+`ss`/`netstat` inside the container should show the ingress (8081), admin API (9070), the fabric port (5122), and SDK endpoint (9080) listening on `127.0.0.1`, never `0.0.0.0`; `docker port` should publish none of them to the host. Either symptom is the regression this check exists to catch — a wrong config key silently falling back to `restate-server`'s own default bind (`0.0.0.0`) would otherwise only surface as an unexplained port collision or an externally reachable admin API. `docker stats`' container total is the number recorded in docs/restate.md § "Memory".

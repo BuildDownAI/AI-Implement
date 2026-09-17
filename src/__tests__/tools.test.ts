@@ -598,6 +598,18 @@ describe("get_project_binding (AII-715)", () => {
     const byTeam = await getProjectBinding(fakeContext("get_project_binding"), { caller: system, args: { team: "NOPE" } });
     expect(byTeam.isError).toBe(true);
   });
+
+  it("returns pickupLabel: null for a non-Linear (Jira) mapping, regardless of the Linear setting", async () => {
+    (getMappings as ReturnType<typeof vi.fn>).mockReturnValue({
+      AII: fixtureMapping({ ticketingProvider: "jira", ticketingConfig: { kind: "jira" } }),
+    });
+    setOrchestratorSetting("linearPickupLabel", "AI-Implement-Custom");
+
+    const result = await getProjectBinding(fakeContext("get_project_binding"), { caller: system, args: { team: "AII" } });
+
+    expect(JSON.parse(result.content[0].text).pickupLabel).toBeNull();
+    expect(JSON.parse(result.content[0].text).tracker).toEqual({ kind: "jira", team: "AII" });
+  });
 });
 
 describe("get_issue_report_card and get_fleet_report thread their arguments (AII-711)", () => {
