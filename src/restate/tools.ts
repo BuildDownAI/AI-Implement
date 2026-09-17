@@ -3,8 +3,8 @@
 // Restate's admin API surfaces to src/restate/tools-client.ts's discoverTools(). The
 // wrapper is the trust boundary — the role assertion runs inside it, before the handler
 // body, so a caller that reaches a tool any other way (a raw ingress POST, not just
-// tools/call on /mcp) is still checked (docs/mcp-server.md § "Reads are open" no longer
-// depends solely on the /mcp adapter).
+// tools/call on /mcp) is still checked (docs/mcp-server.md § "Identity: kind, role and
+// the caller" — the check no longer depends solely on the /mcp adapter).
 //
 // get_tenant_health was the first migrated handler (AII-710) — moved verbatim from
 // src/mcp.ts's callDiagnosticTool. AII-711 migrates the rest of the read surface,
@@ -261,14 +261,16 @@ export const getProjectBinding = tool(
       searchTool: "kg_hybrid_search" as const,
     };
     // Read fresh on every call (no caching, per ADR 022 / getLinearPickupLabel) so a
-    // settings-page change takes effect on the next call with no restart.
-    const pickupLabel = getLinearPickupLabel();
+    // settings-page change takes effect on the next call with no restart. The setting is
+    // a Linear-only row: a Jira or filesystem tracker's pickup signal is its own
+    // `AI-Implement-Status` field, so a non-Linear mapping gets null rather than a value
+    // that doesn't apply to it.
     const binding = (key: string, m: RepoMapping) => ({
       team: key,
       repo: `${m.owner}/${m.repo}`,
       defaultBranch: m.defaultBranch,
       tracker: { kind: m.ticketingConfig.kind, team: key },
-      pickupLabel,
+      pickupLabel: m.ticketingConfig.kind === "linear" ? getLinearPickupLabel() : null,
       kg,
     });
 

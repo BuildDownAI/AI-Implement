@@ -50,15 +50,21 @@ Every step is non-fatal: a missing platform binary, an early exit, or a readines
 |---|---|---|
 | `restate-server` ingress | `127.0.0.1:8081` | `RESTATE_INGRESS_BIND_ADDRESS` (`src/restate/server.ts`) |
 | `restate-server` admin API | `127.0.0.1:9070` | `RESTATE_ADMIN_BASE_URL` (`src/restate/server.ts`) |
+| `restate-server` node/fabric | `127.0.0.1:5122` | `RESTATE_BIND_ADDRESS` (`src/restate/server.ts`) |
 | SDK endpoint | `127.0.0.1:9080` by default | `restateBindAddress()` (`src/restate/endpoint.ts`), overridable with `RESTATE_ENDPOINT_HOST` / `RESTATE_ENDPOINT_PORT` |
 
-None of the three is an admin-UI setting — every consumer is a same-machine peer, so there is nothing for an operator to point elsewhere (ADR 023).
+None of the four is an admin-UI setting — every consumer is a same-machine peer, so there is nothing for an operator to point elsewhere (ADR 023). The fabric port (`bind-address`) defaults to `0.0.0.0:5122` upstream and was the one listener not already on loopback until it was pinned here — on Fly, an all-interfaces port is reachable over the private network.
 
 `RestateSidecar` passes the bind addresses and the data directory to `restate-server` through its config-rs environment convention (`RESTATE_<SECTION>__<KEY>`, verified with `--dump-config` against the installed `@restatedev/restate-server` version):
 
 - `RESTATE_INGRESS__BIND_ADDRESS` → the `ingress.bind-address` config key
 - `RESTATE_ADMIN__BIND_ADDRESS` → the `admin.bind-address` config key
 - `RESTATE_BASE_DIR` → the top-level `base-dir` config key, set to `restateDataDir()`
+- `RESTATE_BIND_ADDRESS` → the top-level `bind-address` config key (the fabric port, above)
+
+### Memory
+
+Measured in the built image with `docker run --memory 1g` (2026-09-17): 881 MiB container total with Restate's defaults (24 partitions, 2 GiB RocksDB budget), ≈ 480–490 MiB with `RESTATE_DEFAULT_NUM_PARTITIONS=4` and `RESTATE_ROCKSDB_TOTAL_MEMORY_SIZE=256 MB` (both set in `src/restate/server.ts`'s child environment). The partition count is fixed the first time Restate provisions its data directory — set it before the first deploy, not after; changing it later has no effect on an existing `RESTATE_BASE_DIR`. The Fly Machine size for these numbers is the operator's decision, not this code's (ADR 023 amendment).
 
 ### Data directory
 
@@ -76,7 +82,7 @@ docker port ai-implement-boot-check
 docker stop ai-implement-boot-check
 ```
 
-Expect the ingress, admin, and SDK-endpoint ports (8081, 9070, 9080) to show a `127.0.0.1` local address inside the container, and `docker port` to publish none of them — a listener on `0.0.0.0` or a published port is the regression this check exists to catch.
+Expect the ingress, admin, fabric, and SDK-endpoint ports (8081, 9070, 5122, 9080) to show a `127.0.0.1` local address inside the container, and `docker port` to publish none of them — a listener on `0.0.0.0` or a published port is the regression this check exists to catch.
 
 ### `npm run dev` and `npm run dev:run`
 

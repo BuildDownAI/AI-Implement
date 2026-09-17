@@ -21,6 +21,13 @@ export const RESTATE_INGRESS_BASE_URL = `http://${RESTATE_INGRESS_BIND_ADDRESS}`
 const RESTATE_ADMIN_BIND_ADDRESS = new URL(RESTATE_ADMIN_BASE_URL).host; // "127.0.0.1:9070"
 const RESTATE_HEALTH_URL = `${RESTATE_ADMIN_BASE_URL}/health`;
 
+// Restate's node/fabric port (`bind-address`) — defaults to 0.0.0.0:5122, the one listener not on loopback.
+export const RESTATE_BIND_ADDRESS = "127.0.0.1:5122";
+// Default 24 partitions cost ~766 MiB resident at idle vs. ~365 MiB for 4; fixed at first data-dir provisioning.
+export const RESTATE_DEFAULT_NUM_PARTITIONS = "4";
+// Default is 2 GiB; format is `^\d+(\.\d+)? ?[KMG]B$`.
+export const RESTATE_ROCKSDB_TOTAL_MEMORY_SIZE = "256 MB";
+
 /**
  * Data directory for the Restate sidecar's embedded store: RESTATE_DATA_DIR when set,
  * else the dedup DB's directory plus /restate. Mirrors DEDUP_DB_PATH's own default
@@ -114,6 +121,9 @@ export class RestateSidecar {
       RESTATE_INGRESS__BIND_ADDRESS: RESTATE_INGRESS_BIND_ADDRESS,
       RESTATE_ADMIN__BIND_ADDRESS: RESTATE_ADMIN_BIND_ADDRESS,
       RESTATE_BASE_DIR: this._dataDir,
+      RESTATE_BIND_ADDRESS: RESTATE_BIND_ADDRESS,
+      RESTATE_DEFAULT_NUM_PARTITIONS: RESTATE_DEFAULT_NUM_PARTITIONS,
+      RESTATE_ROCKSDB_TOTAL_MEMORY_SIZE: RESTATE_ROCKSDB_TOTAL_MEMORY_SIZE,
     };
 
     const child = this._spawn(bin, ["--no-logo"], {
