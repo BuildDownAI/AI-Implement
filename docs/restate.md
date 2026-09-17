@@ -107,7 +107,7 @@ Expect the ingress, admin, and SDK-endpoint ports (8081, 9070, 9080) to show a `
 
 Both admin API and ingress calls degrade the same way: a connection failure, a non-2xx response, or an unparsable body all collapse to an empty result rather than a thrown error. For `discoverTools()` that means a migrated tool silently drops out of `tools/list` while the admin API is unreachable — the same silent-omission precedent the `kg_*` tools already follow when their own capability doesn't exist for a session. For `callTool()` it means `tools/call` on a migrated tool answers `503 { error: "restate-unavailable" }`, distinct from the tool's own `isError` responses (a forbidden role, or a handler-reported failure), which still answer `200`.
 
-A handler error is returned as an `isError` tool result by the wrapper, never retried, so `/mcp` keeps the pre-migration error behaviour.
+A handler error is returned as an `isError` tool result by the wrapper, never retried, so `/mcp` keeps the pre-migration error behaviour. Restate's own suspension signal is not a handler error: the wrapper checks `restate.internal.isSuspendedError` before converting anything to `isError` and rethrows it unconverted, so a handler that awaits `ctx.sleep()`/`ctx.call()`/`ctx.get()` still suspends and resumes normally instead of coming back as a false failure.
 
 ## Writing a workflow for a run kind
 

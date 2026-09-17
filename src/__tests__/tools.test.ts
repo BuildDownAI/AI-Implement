@@ -4,7 +4,7 @@
 // returns directly (it's a plain callable, per HandlerWrapper.transpose in the SDK), and
 // discoverTools/callTool are exercised against a faked fetch. Docker-backed round-trip
 // coverage through a real ingress/admin API lives in tools.restate.test.ts.
-import type * as restate from "@restatedev/restate-sdk";
+import * as restate from "@restatedev/restate-sdk";
 import { z } from "zod";
 import { describe, expect, it, vi } from "vitest";
 import { tool } from "../restate/tools.js";
@@ -51,6 +51,47 @@ describe("tool()", () => {
 
     expect(result).toEqual({ content: [{ type: "text", text: "ran" }] });
     expect(handlerBody).toHaveBeenCalledOnce();
+  });
+
+  it("returns isError rather than rethrowing when the handler throws", async () => {
+    const handlerBody = vi.fn(async () => {
+      throw new Error("boom");
+    });
+    const myTool = tool({ description: "d", input: z.object({}), role: "user" }, handlerBody);
+
+    const result = await myTool(fakeContext("my_tool"), { caller: HUMAN_USER, args: {} });
+
+    expect(result).toEqual({
+      isError: true,
+      content: [{ type: "text", text: "my_tool failed: boom" }],
+    });
+  });
+
+  it("rethrows Restate's own suspension signal instead of converting it to isError", async () => {
+    // 599 is the SDK's internal SUSPENDED_ERROR_CODE (not exported); isSuspendedError checks
+    // `e instanceof RestateError && e.code === 599`, so this is the smallest fake that
+    // satisfies the check without reaching into a real suspending await.
+    const suspended = new restate.RestateError("suspended", { errorCode: 599 });
+    const handlerBody = vi.fn(async () => {
+      throw suspended;
+    });
+    const myTool = tool({ description: "d", input: z.object({}), role: "user" }, handlerBody);
+
+    await expect(myTool(fakeContext("my_tool"), { caller: HUMAN_USER, args: {} })).rejects.toBe(suspended);
+  });
+
+  it("stringifies a thrown non-Error value", async () => {
+    const handlerBody = vi.fn(async () => {
+      throw "boom";
+    });
+    const myTool = tool({ description: "d", input: z.object({}), role: "user" }, handlerBody);
+
+    const result = await myTool(fakeContext("my_tool"), { caller: HUMAN_USER, args: {} });
+
+    expect(result).toEqual({
+      isError: true,
+      content: [{ type: "text", text: "my_tool failed: boom" }],
+    });
   });
 });
 

@@ -67,7 +67,14 @@ export type WireInput<I extends z.ZodType> = z.infer<ReturnType<typeof wireInput
  * metadata (`mcp.type`, `mcp.role`) tools-client.ts's discoverTools() reads back. The
  * wire input is `{ caller, args }` — the credential never travels with the request
  * (the ingress journals bodies), only the already-verified `Caller`. A caller whose role
- * doesn't satisfy `role` (equal, or admin) is refused before `handler` runs.
+ * doesn't satisfy `role` (equal, or admin) is refused before `handler` runs. A handler
+ * that throws is caught here and returned as an `isError` result rather than rethrown —
+ * Restate retries a thrown non-terminal error indefinitely, which would turn a bug or a
+ * transient failure into a hanging `tools/call` instead of the error result `/mcp` expects.
+ * Restate's own suspension signal (thrown internally while an attempt awaits e.g.
+ * `ctx.sleep()`/`ctx.call()`/`ctx.get()` across a not-yet-resolved journal entry, or a
+ * dropped connection) is not a handler error — `restate.internal.isSuspendedError` detects
+ * it and it is rethrown unconverted so the SDK can suspend and resume the invocation.
  */
 export function tool<I extends z.ZodType>(
   opts: ToolOptions<I>,
@@ -82,14 +89,25 @@ export function tool<I extends z.ZodType>(
       metadata: { "mcp.type": "tool", "mcp.role": opts.role },
     },
     async (ctx: restate.Context, input: WireInput<I>): Promise<ToolResponse> => {
+      const name = ctx.request().target.handler;
       if (!roleAllows(input.caller.role, opts.role)) {
-        const name = ctx.request().target.handler;
         return {
           isError: true,
           content: [{ type: "text", text: `forbidden: ${name} requires the ${opts.role} role` }],
         };
       }
-      return handler(ctx, input);
+      try {
+        return await handler(ctx, input);
+      } catch (err) {
+        if (restate.internal.isSuspendedError(err)) {
+          throw err;
+        }
+        const message = err instanceof Error ? err.message : String(err);
+        return {
+          isError: true,
+          content: [{ type: "text", text: `${name} failed: ${message}` }],
+        };
+      }
     },
   );
 }

@@ -5,10 +5,50 @@
 // tools.test.ts. Shape mirrors src/__tests__/restate-harness.restate.test.ts exactly.
 //
 // Run with `npm run test:restate` (Docker required); excluded from `npm test`.
+import * as restate from "@restatedev/restate-sdk";
 import { RestateContainer, RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
+import { z } from "zod";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { orchestratorTools } from "../restate/tools.js";
+import { orchestratorTools, tool, type ToolResponse } from "../restate/tools.js";
 import * as dedup from "../dedup.js";
+import { initLogTable } from "../log.js";
+
+// A second service, built with tool(), whose only handler throws — proves the wrapper's
+// try/catch (not just get_tenant_health's own well-behaved body) turns a thrown error into
+// an isError result instead of letting Restate retry a hung handler forever.
+const alwaysThrows = tool(
+  { description: "always throws, for the isError-not-retried regression test", input: z.object({}), role: "user" },
+  async (): Promise<ToolResponse> => {
+    throw new Error("boom");
+  },
+);
+
+const failingTools = restate.service({
+  name: "failingTools",
+  handlers: { always_throws: alwaysThrows },
+});
+
+// A third service whose handler awaits ctx.sleep() — a real durable timer that can force
+// the current attempt to suspend. Proves the wrapper's try/catch does not intercept
+// Restate's own suspension signal (thrown internally while unwinding a suspending await)
+// and convert it into a false isError result; the SDK must be left to suspend and resume
+// the invocation on its own.
+const sleepThenSucceed = tool(
+  {
+    description: "sleeps via ctx.sleep, then succeeds — regression test for the wrapper not swallowing suspension",
+    input: z.object({}),
+    role: "user",
+  },
+  async (ctx): Promise<ToolResponse> => {
+    await ctx.sleep(50);
+    return { content: [{ type: "text", text: "done" }] };
+  },
+);
+
+const suspendingTools = restate.service({
+  name: "suspendingTools",
+  handlers: { sleep_then_succeed: sleepThenSucceed },
+});
 
 // Pinned to match the image cached by .github/workflows/unit-tests.yml's restate-tests job.
 const RESTATE_IMAGE_VERSION = "1.7.10";
@@ -24,8 +64,13 @@ interface IngressResult {
   body: { content?: Array<{ type: string; text: string }>; isError?: boolean } | undefined;
 }
 
-async function callIngress(baseUrl: string, handler: string, payload: unknown): Promise<IngressResult> {
-  const response = await fetch(`${baseUrl}/orchestratorTools/${handler}`, {
+async function callIngress(
+  baseUrl: string,
+  handler: string,
+  payload: unknown,
+  service = "orchestratorTools",
+): Promise<IngressResult> {
+  const response = await fetch(`${baseUrl}/${service}/${handler}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(payload),
@@ -41,11 +86,13 @@ describe("orchestratorTools (Restate)", () => {
     // get_tenant_health reads comment_gapfill_queue via dedup.getDb(); DEDUP_DB_PATH is
     // ":memory:" in vitest.restate.config.ts, so this just needs the schema created once.
     dedup.getDb();
+    // getInFlightJobs (src/log.ts) reads dispatch_log, which getDb() does not create.
+    initLogTable();
 
     const started = await Promise.all(
       VARIANTS.map(async ([label, configure]) => {
         const env = await RestateTestEnvironment.start({
-          services: [orchestratorTools],
+          services: [orchestratorTools, failingTools, suspendingTools],
           container: () => configure(new RestateContainer(RESTATE_IMAGE_VERSION)),
         });
         return [label, env] as const;
@@ -122,6 +169,44 @@ describe("orchestratorTools (Restate)", () => {
       const handler = metadata.handlers.find((h) => h.name === "get_tenant_health");
       expect(handler?.metadata?.["mcp.type"]).toBe("tool");
       expect(handler?.metadata?.["mcp.role"]).toBe("user");
+    },
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "a throwing handler answers 200 with isError: true instead of retrying (%s)",
+    async (label) => {
+      const env = environments.get(label);
+      if (!env) throw new Error(`environment "${label}" did not start`);
+
+      const { status, body } = await callIngress(
+        env.baseUrl(),
+        "always_throws",
+        { caller: { kind: "system", email: null, role: "admin" }, args: {} },
+        "failingTools",
+      );
+
+      expect(status).toBe(200);
+      expect(body?.isError).toBe(true);
+      expect(body?.content?.[0]?.text).toBe("always_throws failed: boom");
+    },
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "a handler that suspends via ctx.sleep() still completes successfully, not as isError (%s)",
+    async (label) => {
+      const env = environments.get(label);
+      if (!env) throw new Error(`environment "${label}" did not start`);
+
+      const { status, body } = await callIngress(
+        env.baseUrl(),
+        "sleep_then_succeed",
+        { caller: { kind: "system", email: null, role: "admin" }, args: {} },
+        "suspendingTools",
+      );
+
+      expect(status).toBe(200);
+      expect(body?.isError).toBeFalsy();
+      expect(body?.content?.[0]?.text).toBe("done");
     },
   );
 });
