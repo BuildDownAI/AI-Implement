@@ -6,10 +6,11 @@
 // coverage through a real ingress/admin API lives in tools.restate.test.ts.
 import * as restate from "@restatedev/restate-sdk";
 import { z } from "zod";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   tool,
   listProjects,
+  getProjectBinding,
   kgPath,
   kgHybridSearch,
   getKgStatusTool,
@@ -29,6 +30,8 @@ import { setKgMemoryProvider } from "../kg-provider.js";
 import type { MemoryProvider } from "../kg-provider.js";
 import { setActiveKgRefresh, type KgRefreshHandle } from "../kg-refresh.js";
 import { getMappings } from "../config.js";
+import { setOrchestratorSetting } from "../orchestrator-settings.js";
+import { initSettingsTable } from "../runner-mode.js";
 import { getIssueReportCard, getFleetReport } from "../report-card.js";
 import {
   setRunnerModeAction,
@@ -490,6 +493,110 @@ describe("migrated read handlers (AII-711)", () => {
     setActiveKgRefresh(null);
     const result = await getKgStatusTool(fakeContext("get_kg_status"), { caller: system, args: {} });
     expect(JSON.parse(result.content[0].text)).toEqual({ error: "KG refresh is not configured" });
+  });
+});
+
+// ---- get_project_binding (AII-715): the binding a skill needs for its own project, so
+// CLAUDE.md in a bound repo can keep only the client-side server name. Pattern anchor:
+// list_projects' explicit field selection (extraEnv never leaves a read).
+describe("get_project_binding (AII-715)", () => {
+  const system: Caller = SYSTEM_ADMIN;
+
+  const fixtureMapping = (overrides: Record<string, unknown> = {}) => ({
+    owner: "BuildDownAI", repo: "skills", executionMode: "gha", provider: "anthropic", paused: false,
+    planningEnabled: true, maxInProgressAiIssues: 2, defaultBranch: "testing", workflowFile: "claude.yml",
+    sessionMode: "fresh", autoMerge: false, maxTurns: null, maxIterations: null, maxJobMinutes: null,
+    branchPrefix: null, skillsRepo: null, referenceRepos: [], dependencyTokenScope: null,
+    sensitiveAddPatterns: [], sensitiveAllowPatterns: [], machineCpus: 2, machineMemoryMb: 4096,
+    awsRegion: null, planningWorkflowFile: "claude-plan.yml", autoApprovePlans: true, reviewers: null,
+    extraEnv: { NPM_TOKEN: "leak-me" },
+    ticketingProvider: "linear", ticketingConfig: { kind: "linear" },
+    ...overrides,
+  });
+
+  beforeAll(() => {
+    initSettingsTable();
+  });
+
+  afterEach(() => {
+    delete process.env.KG_SOURCE_REPO;
+    delete process.env.RUNNER_CALLBACK_BASE_URL;
+    setOrchestratorSetting("linearPickupLabel", null);
+    setOrchestratorSetting("kgBaseRepo", null);
+  });
+
+  it("resolves the BDS mapping by repo, with the live pickup label and orchestrator-wide kg binding (AC1, AC2, AC3)", async () => {
+    (getMappings as ReturnType<typeof vi.fn>).mockReturnValue({ BDS: fixtureMapping() });
+    setOrchestratorSetting("linearPickupLabel", "AI-Implement-Custom");
+    setOrchestratorSetting("kgBaseRepo", "BuildDownAI/bd-knowledge-graph-base");
+    process.env.KG_SOURCE_REPO = "BuildDownAI/knowledge-graph-ai-implement";
+    process.env.RUNNER_CALLBACK_BASE_URL = "https://ai-implement-testing-orchestrator.fly.dev";
+
+    const result = await getProjectBinding(fakeContext("get_project_binding"), {
+      caller: system,
+      args: { repo: "BuildDownAI/skills" },
+    });
+
+    expect(result.isError).toBeUndefined();
+    expect(JSON.parse(result.content[0].text)).toEqual({
+      team: "BDS",
+      repo: "BuildDownAI/skills",
+      defaultBranch: "testing",
+      tracker: { kind: "linear", team: "BDS" },
+      pickupLabel: "AI-Implement-Custom",
+      kg: {
+        present: true,
+        orchestratorUrl: "https://ai-implement-testing-orchestrator.fly.dev",
+        sourceRepo: "BuildDownAI/knowledge-graph-ai-implement",
+        baseRepo: "BuildDownAI/bd-knowledge-graph-base",
+        searchTool: "kg_hybrid_search",
+      },
+    });
+  });
+
+  it("reflects a pickup-label change on the very next call in the same process, no restart (AII-696 criterion 1)", async () => {
+    (getMappings as ReturnType<typeof vi.fn>).mockReturnValue({ BDS: fixtureMapping() });
+    setOrchestratorSetting("linearPickupLabel", "First-Label");
+
+    const first = await getProjectBinding(fakeContext("get_project_binding"), { caller: system, args: { team: "BDS" } });
+    expect(JSON.parse(first.content[0].text).pickupLabel).toBe("First-Label");
+
+    setOrchestratorSetting("linearPickupLabel", "Second-Label");
+    const second = await getProjectBinding(fakeContext("get_project_binding"), { caller: system, args: { team: "BDS" } });
+    expect(JSON.parse(second.content[0].text).pickupLabel).toBe("Second-Label");
+  });
+
+  it("never includes extraEnv or a token, in the single-project or the all-mappings shape (AC5)", async () => {
+    (getMappings as ReturnType<typeof vi.fn>).mockReturnValue({ BDS: fixtureMapping() });
+
+    const single = await getProjectBinding(fakeContext("get_project_binding"), { caller: system, args: { team: "BDS" } });
+    expect(single.content[0].text).not.toContain("extraEnv");
+    expect(single.content[0].text).not.toContain("leak-me");
+
+    const all = await getProjectBinding(fakeContext("get_project_binding"), { caller: system, args: {} });
+    expect(all.content[0].text).not.toContain("extraEnv");
+    expect(all.content[0].text).not.toContain("leak-me");
+  });
+
+  it("returns every mapping as an array when neither repo nor team is given (AC6)", async () => {
+    (getMappings as ReturnType<typeof vi.fn>).mockReturnValue({
+      BDS: fixtureMapping(),
+      AII: fixtureMapping({ repo: "AI-Implement" }),
+    });
+
+    const result = await getProjectBinding(fakeContext("get_project_binding"), { caller: system, args: {} });
+    const rows = JSON.parse(result.content[0].text) as Array<{ team: string }>;
+    expect(rows.map((r) => r.team).sort()).toEqual(["AII", "BDS"]);
+  });
+
+  it("answers isError for an unmatched repo or team, rather than silently returning every mapping (AC7)", async () => {
+    (getMappings as ReturnType<typeof vi.fn>).mockReturnValue({ BDS: fixtureMapping() });
+
+    const byRepo = await getProjectBinding(fakeContext("get_project_binding"), { caller: system, args: { repo: "nope/nope" } });
+    expect(byRepo.isError).toBe(true);
+
+    const byTeam = await getProjectBinding(fakeContext("get_project_binding"), { caller: system, args: { team: "NOPE" } });
+    expect(byTeam.isError).toBe(true);
   });
 });
 

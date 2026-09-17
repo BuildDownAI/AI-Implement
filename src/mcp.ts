@@ -50,6 +50,7 @@ const RESTATE_TOOL_NAMES = new Set([
   "get_tenant_health",
   "get_runner_mode",
   "list_projects",
+  "get_project_binding",
   "list_in_flight_jobs",
   "get_issue_dispatch_status",
   "get_issue_report_card",

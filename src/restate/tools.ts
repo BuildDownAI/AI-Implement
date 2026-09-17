@@ -17,14 +17,14 @@ import { serde } from "@restatedev/restate-sdk-zod";
 import { z } from "zod";
 import type { AccessRole } from "../access-entries.js";
 import { getRunnerMode } from "../runner-mode.js";
-import { getMappings } from "../config.js";
+import { getMappings, type RepoMapping } from "../config.js";
 import { getInFlightJobs, getRunRecordMergeVerdict } from "../log.js";
 import { getDb } from "../dedup.js";
 import { isKgDegraded } from "../deploy-notify.js";
 import { sidecarHealthFields, getKgMemoryProvider, KG_TOOL_CAPABILITY } from "../kg-provider.js";
 import { readKgSourceRepo } from "../deploy.js";
 import { runKgRefreshPreflight, getActiveKgRefresh } from "../kg-refresh.js";
-import { getOrchestratorSettings } from "../orchestrator-settings.js";
+import { getOrchestratorSettings, getLinearPickupLabel } from "../orchestrator-settings.js";
 import { getIssueReportCard, getFleetReport } from "../report-card.js";
 import { getDeployPosture } from "../deploy-posture.js";
 import {
@@ -231,6 +231,64 @@ export const listProjects = tool(
       autoApprovePlans: m.autoApprovePlans,
       reviewers: m.reviewers,
     }));
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  },
+);
+
+export const GET_PROJECT_BINDING_DESCRIPTION =
+  "Returns the binding a skill needs for its own project: team key, repo, default branch, tracker kind, the effective pickup label (the live ADR 022 settings value, not a hardcoded default), and the knowledge-graph binding (present, orchestratorUrl, sourceRepo, baseRepo, searchTool). Pass `repo` (owner/repo) or `team` to select one project, returned as a single object; omit both to list every mapping as an array. Never includes extraEnv or a token.";
+
+export const getProjectBinding = tool(
+  {
+    description: GET_PROJECT_BINDING_DESCRIPTION,
+    input: z.object({
+      repo: z.string().optional().describe("owner/repo of the target repo, e.g. \"BuildDownAI/skills\""),
+      team: z.string().optional().describe("Team key of the mapping"),
+    }),
+    role: "user",
+  },
+  async (_ctx, input): Promise<ToolResponse> => {
+    const mappings = getMappings();
+    // kg.* reflects orchestrator-wide config, not the mapping — the KG is one graph, not
+    // per-project, so every result shares the same kg object regardless of which project
+    // (or how many) matched.
+    const kgSourceRepo = readKgSourceRepo(process.env.KG_SOURCE_REPO);
+    const kg = {
+      present: kgSourceRepo !== null,
+      orchestratorUrl: process.env.RUNNER_CALLBACK_BASE_URL || null,
+      sourceRepo: kgSourceRepo,
+      baseRepo: getOrchestratorSettings().kgBaseRepo,
+      searchTool: "kg_hybrid_search" as const,
+    };
+    // Read fresh on every call (no caching, per ADR 022 / getLinearPickupLabel) so a
+    // settings-page change takes effect on the next call with no restart.
+    const pickupLabel = getLinearPickupLabel();
+    const binding = (key: string, m: RepoMapping) => ({
+      team: key,
+      repo: `${m.owner}/${m.repo}`,
+      defaultBranch: m.defaultBranch,
+      tracker: { kind: m.ticketingConfig.kind, team: key },
+      pickupLabel,
+      kg,
+    });
+
+    const repo = input.args.repo;
+    if (typeof repo === "string" && repo) {
+      const match = Object.entries(mappings).find(([, m]) => `${m.owner}/${m.repo}` === repo);
+      if (!match) {
+        return { isError: true, content: [{ type: "text", text: `No project mapping found for repo: ${repo}` }] };
+      }
+      return { content: [{ type: "text", text: JSON.stringify(binding(match[0], match[1]), null, 2) }] };
+    }
+    const team = input.args.team;
+    if (typeof team === "string" && team) {
+      const match = Object.entries(mappings).find(([key]) => key === team);
+      if (!match) {
+        return { isError: true, content: [{ type: "text", text: `No project mapping found for team: ${team}` }] };
+      }
+      return { content: [{ type: "text", text: JSON.stringify(binding(match[0], match[1]), null, 2) }] };
+    }
+    const result = Object.entries(mappings).map(([key, m]) => binding(key, m));
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   },
 );
@@ -652,6 +710,7 @@ export const orchestratorTools = restate.service({
     get_tenant_health: getTenantHealth,
     get_runner_mode: getRunnerModeTool,
     list_projects: listProjects,
+    get_project_binding: getProjectBinding,
     list_in_flight_jobs: listInFlightJobs,
     get_issue_dispatch_status: getIssueDispatchStatus,
     get_issue_report_card: getIssueReportCardTool,
