@@ -56,6 +56,7 @@ import { listMachines, destroyMachine, listAppSecrets, setAppSecrets, unsetAppSe
 import type { TicketIssue, AIImplementSnapshot } from "./providers/types.js";
 import type { ProviderRegistry } from "./providers/registry.js";
 import { resolveInFlightSiblings, selectBlockers, selectFileOverlapDeferrals, getOrFetchPlanningContexts } from "./poll-selection.js";
+import { RESTATE_WRITE_TOOL_NAMES, IDEMPOTENCY_KEY_SHAPE, scopeIdempotencyKey } from "./mcp.js";
 import { adminHtml } from "./admin-html.js";
 import {
   getOrchestratorSettings,
@@ -1691,6 +1692,15 @@ async function handleDeployTrigger(
 /** Every tool name is snake_case ASCII (src/restate/tools.ts's `tool()` registrations). */
 const TOOL_NAME_SHAPE = /^[a-z][a-z0-9_]{0,63}$/;
 
+// `IDEMPOTENCY_KEY_SHAPE` and `scopeIdempotencyKey` (imported above from src/mcp.ts — this
+// file may import src/restate/* as types only, per src/__tests__/restate-boundary.test.ts)
+// are the same contract `/mcp`'s `tools/call` applies to `params._meta.idempotencyKey`
+// (AII-719). Neither surface derives a key: a CI script that wants a retry deduped states the
+// key itself. Only checked when the target tool is in `RESTATE_WRITE_TOOL_NAMES` — a read
+// tool ignores the header entirely, same as `/mcp` ignores `_meta.idempotencyKey` on a read.
+// The header is scoped by the session's identity before it reaches `deps.idempotencyKey`, so
+// two sessions that reuse one literal key cannot attach to each other's cached result.
+
 /**
  * POST /api/tools/<name> — the REST entry point to the tools service (AII-712), for a
  * caller such as CI that has an admin session but no MCP client. Same handlers, same
@@ -1722,6 +1732,22 @@ async function handleToolCall(
     json(res, 501, { error: "Tools service is not configured" });
     return;
   }
+  let idempotencyKey: string | undefined;
+  if (RESTATE_WRITE_TOOL_NAMES.has(toolName)) {
+    const idempotencyKeyHeader = req.headers["idempotency-key"];
+    if (Array.isArray(idempotencyKeyHeader)) {
+      json(res, 400, { error: "Idempotency-Key must be sent once" });
+      return;
+    }
+    const supplied = idempotencyKeyHeader;
+    if (supplied !== undefined) {
+      if (!IDEMPOTENCY_KEY_SHAPE.test(supplied)) {
+        json(res, 400, { error: "Idempotency-Key must match ^[A-Za-z0-9._:-]{1,128}$" });
+        return;
+      }
+      idempotencyKey = scopeIdempotencyKey(gate.identity?.email ?? "session", supplied);
+    }
+  }
   const raw = await readBody(req);
   let args: Record<string, unknown> = {};
   if (raw.trim()) {
@@ -1737,7 +1763,7 @@ async function handleToolCall(
   }
   const caller: Caller = { kind: "human", email: gate.identity?.email ?? null, role: gate.role };
   try {
-    const result = await deps.callTool(toolName, args, caller);
+    const result = await deps.callTool(toolName, args, caller, idempotencyKey ? { idempotencyKey } : undefined);
     if (result.status === "unavailable") {
       json(res, 503, { error: "restate-unavailable" });
       return;

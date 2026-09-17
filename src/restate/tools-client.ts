@@ -106,8 +106,10 @@ export interface CallToolDeps {
    * Restate's own idempotency key (https://docs.restate.dev/operate/invocation#invoke-a-handler-idempotently),
    * sent as the `idempotency-key` header. Restate scopes it by (service, handler, key), so a
    * second call with the same key attaches to the first invocation's result instead of running
-   * the handler again — src/mcp.ts sets this for the six write tools only (AII-713); a read
-   * call never passes one.
+   * the handler again. Set only when the caller supplied a key, and already scoped by the
+   * caller's identity (`scopeIdempotencyKey` in src/mcp.ts, applied by both doors) so two
+   * callers that reuse one literal key cannot collide (AII-719). Writes only; a read call
+   * never passes one.
    */
   idempotencyKey?: string;
 }

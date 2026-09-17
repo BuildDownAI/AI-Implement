@@ -3445,11 +3445,12 @@ describe("POST /api/tools/<name>", () => {
     body: unknown,
     deps: AdminModule.AdminDeps,
     toolName = "get_tenant_health",
+    extraHeaders: Record<string, string> = {},
   ): Promise<{ statusCode: number; body: string }> {
     const req = new MockRequest(
       `/api/tools/${toolName}`,
       "POST",
-      { authorization: `Bearer ${token}` },
+      { authorization: `Bearer ${token}`, ...extraHeaders },
       body === undefined ? undefined : JSON.stringify(body),
     );
     const res = new MockResponse();
@@ -3608,6 +3609,92 @@ describe("POST /api/tools/<name>", () => {
       callTool: async (_name, args) => { capturedArgs = args; return { status: "ok", content: [] }; },
     });
     expect(capturedArgs).toEqual({});
+  });
+
+  // The same caller-supplied contract as /mcp's tools/call params._meta.idempotencyKey
+  // (AII-719): the route never derives a key, so a CI script that wants a retry deduped
+  // states the key itself via the Idempotency-Key header. The route scopes it by the
+  // session's identity before it reaches Restate (scopeIdempotencyKey, src/mcp.ts); an
+  // access-code session has no email, so its prefix is the literal "session".
+  it("forwards an Idempotency-Key header to callTool's deps, scoped by the session identity with the caller's key as the suffix", async () => {
+    const token = await login("secret");
+    let capturedDeps: { idempotencyKey?: string } | undefined;
+    await toolRequest(
+      token,
+      { args: {} },
+      {
+        callTool: async (_name, _args, _caller, deps) => { capturedDeps = deps; return { status: "ok", content: [] }; },
+      },
+      "set_runner_mode",
+      { "idempotency-key": "abc" },
+    );
+    expect(capturedDeps).toEqual({ idempotencyKey: "session:abc" });
+  });
+
+  it("forwards no idempotency key when the header is absent", async () => {
+    const token = await login("secret");
+    let capturedDeps: { idempotencyKey?: string } | undefined;
+    await toolRequest(token, { args: {} }, {
+      callTool: async (_name, _args, _caller, deps) => { capturedDeps = deps; return { status: "ok", content: [] }; },
+    });
+    expect(capturedDeps).toBeUndefined();
+  });
+
+  it("rejects an Idempotency-Key that fails the shape check with 400, without calling the tool", async () => {
+    const token = await login("secret");
+    const called = vi.fn();
+    const res = await toolRequest(
+      token,
+      { args: {} },
+      { callTool: async () => { called(); return { status: "ok", content: [] }; } },
+      "set_runner_mode",
+      { "idempotency-key": "has a space" },
+    );
+    expect(res.statusCode).toBe(400);
+    expect(called).not.toHaveBeenCalled();
+  });
+
+  // node collapses repeated headers of the same name into a string array; treating that
+  // silently as "no key supplied" would let a client that (accidentally or otherwise) sent
+  // the header twice believe it deduped a write that in fact ran with no key at all
+  // (AII-719 gap-fill).
+  it("rejects a repeated Idempotency-Key header with 400, without calling the tool", async () => {
+    const token = await login("secret");
+    const called = vi.fn();
+    const req = new MockRequest(
+      "/api/tools/set_runner_mode",
+      "POST",
+      { authorization: `Bearer ${token}` },
+      JSON.stringify({ args: {} }),
+    );
+    (req.headers as Record<string, string | string[]>)["idempotency-key"] = ["abc", "def"];
+    const res = new MockResponse();
+    admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider), {
+      callTool: async () => { called(); return { status: "ok", content: [] }; },
+    });
+    await res.done;
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body)).toEqual({ error: "Idempotency-Key must be sent once" });
+    expect(called).not.toHaveBeenCalled();
+  });
+
+  // Mirrors /mcp's read-tool gate on RESTATE_WRITE_TOOL_NAMES: a read tool ignores a
+  // supplied Idempotency-Key silently rather than either erroring or forwarding it, since
+  // forwarding it would let a repeat of the same read return a stale cached answer.
+  it("ignores an Idempotency-Key header on a read tool, forwarding no idempotency key at all", async () => {
+    const token = await login("secret");
+    let capturedDeps: { idempotencyKey?: string } | undefined;
+    const res = await toolRequest(
+      token,
+      { args: {} },
+      {
+        callTool: async (_name, _args, _caller, deps) => { capturedDeps = deps; return { status: "ok", content: [] }; },
+      },
+      "get_tenant_health",
+      { "idempotency-key": "abc" },
+    );
+    expect(res.statusCode).toBe(200);
+    expect(capturedDeps).toBeUndefined();
   });
 });
 
