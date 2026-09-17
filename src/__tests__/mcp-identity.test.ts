@@ -107,11 +107,30 @@ describe("RefreshOutcome maps to the same HTTP response the inline refresh grant
     });
   });
 
-  it("unavailable maps to 503", async () => {
+  it("unavailable with no cause (the refresh authority itself unreachable) maps to 503 restate-unavailable", async () => {
     setRefreshAuthority(new FakeRefreshAuthority({ status: "unavailable" }));
     const res = new MockResponse();
     await handleMcpTokenRequest(mkRefreshReq(), asRes(res));
     expect(res.statusCode).toBe(503);
     expect(JSON.parse(res.body)).toEqual({ error: "restate-unavailable" });
+  });
+
+  it("unavailable with cause 'restate' maps to 503 restate-unavailable (AII-718)", async () => {
+    setRefreshAuthority(new FakeRefreshAuthority({ status: "unavailable", cause: "restate" }));
+    const res = new MockResponse();
+    await handleMcpTokenRequest(mkRefreshReq(), asRes(res));
+    expect(res.statusCode).toBe(503);
+    expect(JSON.parse(res.body)).toEqual({ error: "restate-unavailable" });
+  });
+
+  it("unavailable with cause 'allowlist' maps to 503 temporarily_unavailable, distinct from a Restate outage (AII-718)", async () => {
+    setRefreshAuthority(new FakeRefreshAuthority({ status: "unavailable", cause: "allowlist" }));
+    const res = new MockResponse();
+    await handleMcpTokenRequest(mkRefreshReq(), asRes(res));
+    expect(res.statusCode).toBe(503);
+    expect(JSON.parse(res.body)).toEqual({
+      error: "temporarily_unavailable",
+      error_description: "Access control is unavailable",
+    });
   });
 });
