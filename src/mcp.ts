@@ -3,7 +3,7 @@ import { verifyMcpToken, resolveClientPath } from "./mcp-oauth.js";
 import { recordAuthEvent, type AuthEventCause } from "./mcp-auth-events.js";
 import { VALID_RUNNER_MODES } from "./runner-mode.js";
 import { recheckIdentity, type AccessRole } from "./access-entries.js";
-import type { MemoryProvider } from "./kg-provider.js";
+import { type MemoryProvider, KG_TOOL_CAPABILITY } from "./kg-provider.js";
 import type { Caller } from "./mcp-identity.js";
 import { discoverTools, callTool } from "./restate/tools-client.js";
 
@@ -299,9 +299,12 @@ export const WRITE_TOOLS: WriteTool[] = [
 export async function handleMcpRequest(
   req: http.IncomingMessage,
   res: http.ServerResponse,
+  // `provider` is still read by tools/list's kg_* courtesy filter (AII-641); the diagnostic
+  // string is kept in the signature so the boot wiring (src/index.ts) and the tests keep
+  // their positions. AII-715 restructures the door and drops it.
   provider: MemoryProvider | null,
   baseUrl: string | null,
-  providerDiagnostic?: string | null,
+  _providerDiagnostic?: string | null,
   triggerKgRefresh?: (dryRun?: boolean, acceptNewBaseline?: boolean, actorEmail?: string) => Promise<{ status: number; body: Record<string, unknown> }>,
   setRunnerMode?: (patch: { mode?: string }) => { status: number; body: Record<string, unknown> },
   pauseProject?: (teamKey: string, paused: boolean) => { status: number; body: Record<string, unknown> },
@@ -408,14 +411,21 @@ export async function handleMcpRequest(
     // as a literal here. get_session_identity is the one exception: it reports the door's
     // own state, so it's listed unconditionally alongside the discovered set. Hiding a tool
     // the caller's role cannot use is a courtesy — the check in tools/call below is the
-    // boundary. A kg_* tool now appears regardless of whether a KG sidecar is actually
-    // configured (discovery no longer depends on `provider`); calling one without a sidecar
-    // degrades to an isError result rather than disappearing from the list. A Restate-backed
-    // tool degrades the same way when the admin API itself is unreachable: discoverTools()
-    // returns an empty list, so the whole discovered set simply drops out until it recovers.
+    // boundary. The kg_* handlers are discovered like every other tool, but the list keeps
+    // the AII-641 courtesy: a kg_* tool is omitted when no KG sidecar is configured, or when
+    // the provider lacks that tool's capability, so a client never sees a tool it can never
+    // call (tools/call still refuses it inside the handler if called from a stale list). A
+    // Restate-backed tool degrades the same way when the admin API itself is unreachable:
+    // discoverTools() returns an empty list, so the discovered set drops out until it recovers.
+    const kgToolVisible = (name: string): boolean => {
+      const capKey = KG_TOOL_CAPABILITY[name];
+      if (capKey === undefined && !name.startsWith("kg_")) return true;
+      if (!provider) return false;
+      return capKey === undefined || provider.capabilities[capKey] === true;
+    };
     const discovered = await discoverTools();
     const restateTools = discovered
-      .filter((t) => roleAllows(role, t.role))
+      .filter((t) => roleAllows(role, t.role) && kgToolVisible(t.name))
       .map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema }));
     json(res, 200, {
       jsonrpc: "2.0",
@@ -499,13 +509,31 @@ export async function handleMcpRequest(
       return;
     }
 
-    // A tool name that is neither the door's own tool nor a discovered handler is unknown
-    // here: since AII-711 every read (the kg_* tools included) is a handler, so nothing is
+    // A tool name that is neither the door's own tool nor a discovered handler is unknown:
+    // since AII-711 every read (the kg_* tools included) is a handler, and nothing is
     // proxied to the sidecar any more.
+    json(res, 200, {
+      jsonrpc: "2.0",
+      id: rpc.id ?? null,
+      error: { code: -32602, message: `Unknown tool: ${toolName}` },
+    });
+    return;
   }
 
-  // Every other JSON-RPC method, and every unknown tool name, is a method-not-found error.
-  // The raw sidecar proxy that used to sit here left with AII-711.
+  // The raw sidecar proxy that used to sit here left with AII-711. What remains is the
+  // streamable-HTTP contract the door itself implements: POST only (no SSE channel, no
+  // server-side session to DELETE), notifications are acknowledged with no body, and any
+  // other JSON-RPC method is method-not-found.
+  if (req.method !== "POST") {
+    res.writeHead(405, { Allow: "POST", "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "method not allowed" }));
+    return;
+  }
+  if (rpc && rpc.id === undefined && typeof rpc.method === "string" && rpc.method.startsWith("notifications/")) {
+    res.writeHead(202);
+    res.end();
+    return;
+  }
   json(res, 200, {
     jsonrpc: "2.0",
     id: rpc?.id ?? null,
