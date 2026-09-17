@@ -24,6 +24,8 @@ Every Restate test lives under `src/__tests__/restate/` and is told apart from a
 
 **The empty-body rule.** The call helpers read `response.text()` before parsing, so an empty 2xx body — what a `void` handler answers with on success — resolves to `undefined` instead of throwing a JSON-parse error. A non-2xx response throws, with both the status and the body text in the error message. Calling `response.json()` unconditionally is the AII-709 regression: a copy of the fetch helper that skipped this check parsed an empty body as JSON and failed all 13 scenarios against `issue`/`revoke`; the shared helper fixes that class once.
 
+For a component-by-component walkthrough of one Restate test file, the fakes in each tier, and the rule for choosing a Restate test over a unit test, read `docs/restate-testing.md`.
+
 ### How an issue adds Restate tests (operator rule, 2026-09-16)
 
 Every issue that adds or changes Restate behavior writes its tests in this order and states the order in its acceptance criteria:
