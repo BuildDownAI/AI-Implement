@@ -127,6 +127,36 @@ Both admin API and ingress calls degrade the same way: a connection failure, a n
 
 A handler error is returned as an `isError` tool result by the wrapper, never retried, so `/mcp` keeps the pre-migration error behaviour. Restate's own suspension signal is not a handler error: the wrapper checks `restate.internal.isSuspendedError` before converting anything to `isError` and rethrows it unconverted, so a handler that awaits `ctx.sleep()`/`ctx.call()`/`ctx.get()` still suspends and resumes normally instead of coming back as a false failure.
 
+## Durable steps in plain terms: what `ctx.run` is and why every side effect goes inside it
+
+Restate runs a handler and writes a journal as it goes. Each recorded step holds the step's result. If the process that runs the handler dies, Restate starts the handler again from the top. This is a replay. During a replay, Restate hands back each recorded result instead of running that step again, until the code reaches the point where it stopped. Then normal execution continues.
+
+Restate can only replay what it recorded. Plain code inside a handler is not recorded. A SQLite write, an HTTP call, a random number, a read of the clock: on replay, each of these runs again. That is how a write could run twice on the tools service before AII-717.
+
+`ctx.run(name, fn)` is the recording wrapper. The first time through, Restate calls `fn`, stores its return value under `name`, and hands the value back. On every replay, Restate returns the stored value and does not call `fn`. One rule follows:
+
+> Inside `ctx.run`, a thing happens once. Outside `ctx.run`, a thing happens on every attempt.
+
+**What goes inside.** Anything that touches the world or the clock: a database write, a call to another service, a dispatch of a runner, a message to a user, a random value, the current time, a read of `process.env`. Restate offers `ctx.rand.uuidv4()` and `ctx.date.now()` for the last two, and the `Operator` object uses them. **What stays outside.** Other Restate context calls: `ctx.get`, `ctx.set`, `ctx.sleep`, `ctx.call`, a nested `ctx.run`. Those are journaled by design and are forbidden inside the closure. The closure must return a value the journal can store: plain JSON, no class instances, no functions. Compute the inputs before the call and pass them in; do not read them inside.
+
+**Two levels of retry, two settings.**
+
+| Level | What fails | Setting | What the tools service chose |
+|---|---|---|---|
+| The step | `fn` throws inside `ctx.run` | `RunOptions { maxRetryAttempts }` on the call | `1`: a failing action fails once and surfaces as a `TerminalError`, which the `tool()` wrapper turns into an `isError` result |
+| The attempt | the handler's process dies, or a step exhausts its retries | `retryPolicy { maxAttempts, onMaxAttempts }` on the handler | `{ maxAttempts: 1, onMaxAttempts: "kill" }` on every write: a dead attempt is never re-delivered, the same as the in-process tools |
+
+With no settings, Restate retries both levels for a long time with a growing back-off. That is the right default for a workflow that must finish. It is the wrong default for a request-scoped tool that a person is waiting on, which is why the writes set both. A handler with no side effect (every read tool) needs neither.
+
+**How this relates to the work around it.**
+
+- *Today, the tools service (AII-713, AII-717).* Each write is one `ctx.run` around one admin action, plus the two settings above. The Restate scenario "ctx.run runs its closure once while the code outside it re-executes on replay" in `src/__tests__/restate/tools.restate.test.ts` is the proof: under the `alwaysReplay` variant a counter inside the wrapper reads 1 and a counter outside it reads more than 1. The unit tier fakes `ctx.run` with a stub that records the name and options and calls the closure (`fakeContext` in `src/__tests__/tools.test.ts`).
+- *Today, the `Operator` object (AII-709).* It has no `ctx.run` because it uses only journaled context calls: `ctx.get`/`ctx.set` for state, `ctx.rand` for the token, `ctx.date` for the clock. That is the other way to be replay-safe: touch nothing outside Restate.
+- *Next, the run-kind workflows (ADR 017, AII-682, AII-684, AII-686).* A workflow is a sequence of `ctx.run` steps: dispatch the runner, record the run id, wait for the report through a durable promise, run each rail gate as its own step, revert as the compensation step when a gate fails. Because each step is recorded, a restart resumes at the last recorded step instead of dispatching a second runner. That is the whole reason ADR 017 chose an engine: the sweeps, state machines, and reapers a run kind carries today exist to reconstruct exactly this position by hand. Every step in those workflows follows the same rule as the tools service; the difference is that a workflow keeps the default retry policy, because finishing is the point.
+- *Testing (docs/restate-testing.md).* Anything that only holds because of the journal is a Restate-tier test. The step logic itself, what a step does once called, is a unit test with the `run` stub.
+
+A one-line rule of thumb for review: if a handler line touches the world or the clock, it is inside `ctx.run`; if it touches Restate, it is outside; if it touches neither, it does not matter.
+
 ## Working with Restate: patterns and pitfalls
 
 Every rule below cost a failed run, a live-gate finding, or a discarded review to learn on the AII-687 tree. Each is enforced in code where noted; this section is the one place they are collected so the next migration does not relearn them.
