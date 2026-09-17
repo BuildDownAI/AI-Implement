@@ -115,6 +115,12 @@ beforeEach(async () => {
   providers.configureOAuthProviders([googleProvider]);
   setAllowedDomains("eudoxus.ai");
   (oidc.buildAuthUrl as ReturnType<typeof vi.fn>).mockResolvedValue(OIDC_START);
+  // `RestateRefreshAuthority` is the default as of AII-709, but it requires a live
+  // Restate ingress this suite never starts. Pin the SQLite-backed authority (kept for
+  // one release as the rollback path, AII-709) so the existing rotation/replay/allowlist
+  // coverage below keeps exercising real behavior; the AII-709 describe block further
+  // down tests the default's `unavailable` mapping explicitly, with its own authority.
+  mcpOauth.setRefreshAuthority(new mcpOauth.SqliteRefreshAuthority());
 });
 
 afterEach(() => {
@@ -743,6 +749,73 @@ describe("handleMcpTokenRequest — refresh_token grant", () => {
     expect(JSON.parse(res.body).error).toBe("invalid_request");
   });
 });
+
+// ---------- Unit: the default authority reporting "unavailable" (AII-709) ----------
+//
+// `RestateRefreshAuthority` is the default, but it needs a live Restate ingress this
+// suite never starts; its own outcome-mapping (including the unroutable-ingress path)
+// is unit-tested directly in operator-object.test.ts. Here, a minimal fake standing in
+// for "the default authority is down" proves the token endpoint's own 503 mapping and
+// that access-token verification is entirely independent of the refresh authority.
+
+function alwaysUnavailableAuthority() {
+  return {
+    issue: async () => ({ status: "unavailable" as const }),
+    rotate: async () => ({ status: "unavailable" as const }),
+    revokeFamily: async () => {},
+  };
+}
+
+describe("refresh authority unavailable — 503 restate-unavailable (AII-709)", () => {
+  it("the refresh_token grant answers 503 restate-unavailable and touches no table", async () => {
+    mcpOauth.setRefreshAuthority(alwaysUnavailableAuthority());
+    const body = new URLSearchParams({
+      grant_type: "refresh_token",
+      refresh_token: "sometoken",
+      client_id: "someclient",
+    }).toString();
+    const req = mkReq("/mcp/token", "POST", { "content-type": "application/x-www-form-urlencoded" }, body);
+    const res = new MockResponse();
+    await mcpOauth.handleMcpTokenRequest(req, asRes(res));
+    expect(res.statusCode).toBe(503);
+    expect(JSON.parse(res.body)).toEqual({ error: "restate-unavailable" });
+  });
+
+  it("the authorization_code grant also answers 503 restate-unavailable, minting no access token", async () => {
+    const { code, codeVerifier, clientId } = await fullFlow();
+    mcpOauth.setRefreshAuthority(alwaysUnavailableAuthority());
+    const body = new URLSearchParams({
+      grant_type: "authorization_code",
+      code,
+      redirect_uri: "http://127.0.0.1:8080/callback",
+      client_id: clientId,
+      code_verifier: codeVerifier,
+    }).toString();
+    const req = mkReq("/mcp/token", "POST", { "content-type": "application/x-www-form-urlencoded" }, body);
+    const res = new MockResponse();
+    await mcpOauth.handleMcpTokenRequest(req, asRes(res));
+    expect(res.statusCode).toBe(503);
+    expect(JSON.parse(res.body)).toEqual({ error: "restate-unavailable" });
+
+    const tokenCount = dedup.getDb().prepare("SELECT COUNT(*) AS count FROM mcp_tokens").get() as { count: number };
+    expect(tokenCount.count).toBe(0);
+  });
+
+  it("an existing access token still passes verifyMcpToken while the refresh authority is unavailable", async () => {
+    const { accessToken } = await getTokensViaFullFlow();
+    mcpOauth.setRefreshAuthority(alwaysUnavailableAuthority());
+
+    const result = mcpOauth.verifyMcpToken(accessToken);
+    expect(result.ok).toBe(true);
+    expect(result.ok && result.identity.email).toBe("ada@eudoxus.ai");
+  });
+});
+
+async function getTokensViaFullFlow(): Promise<{ accessToken: string; refreshToken: string; clientId: string }> {
+  const { code, codeVerifier, clientId } = await fullFlow();
+  const { accessToken, refreshToken } = await exchangeCode(code, codeVerifier, clientId);
+  return { accessToken, refreshToken, clientId };
+}
 
 // ---------- Unit: resolveClientPath ----------
 

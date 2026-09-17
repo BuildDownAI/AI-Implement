@@ -6,9 +6,10 @@
  * every tool handler receives (from AII-707 step 6 on) regardless of which kind
  * produced it.
  *
- * `RefreshAuthority` is the seam behind the MCP refresh-token grant: today's
- * `SqliteRefreshAuthority` (src/mcp-oauth.ts) is its only implementation, and this
- * issue does not change its behaviour — only gives it a swappable interface.
+ * `RefreshAuthority` is the seam behind the MCP refresh-token grant: `SqliteRefreshAuthority`
+ * (src/mcp-oauth.ts, AII-707) was its first implementation; `RestateRefreshAuthority`
+ * (src/restate/operator-object.ts, AII-709) is the default as of AII-709, serializing
+ * concurrent refreshes of one client id through the `Operator` Virtual Object.
  */
 
 import type { AccessRole } from "./access-entries.js";
@@ -44,7 +45,20 @@ export type RefreshOutcome =
   | { status: "denied"; description: string }
   | { status: "unavailable" };
 
+/** A brand-new sign-in (the authorization-code grant): no serialization concern, unlike `rotate`. */
+export interface IssueInput {
+  clientId: string;
+  email: string;
+  sub: string;
+  provider: string;
+}
+
+export type IssueOutcome =
+  | { status: "ok"; refreshToken: string }
+  | { status: "unavailable" };
+
 export interface RefreshAuthority {
+  issue(input: IssueInput): Promise<IssueOutcome>;
   rotate(input: RefreshInput): Promise<RefreshOutcome>;
   revokeFamily(familyId: string): Promise<void>;
 }
