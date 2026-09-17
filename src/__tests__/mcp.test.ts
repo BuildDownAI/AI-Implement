@@ -2,7 +2,7 @@ import { PassThrough, Writable } from "node:stream";
 import http from "node:http";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as restate from "@restatedev/restate-sdk";
-import { handleMcpRequest } from "../mcp.js";
+import { handleMcpRequest, writeIdempotencyKey } from "../mcp.js";
 import { SidecarMemoryProvider, sidecarHealth, sidecarHealthFields, setKgMemoryProvider } from "../kg-provider.js";
 import type { MemoryProvider, KgToolResult } from "../kg-provider.js";
 import { setActiveKgRefresh } from "../kg-refresh.js";
@@ -2672,5 +2672,48 @@ describe("handleMcpRequest", () => {
       expect(toolsClientMock.callTool).not.toHaveBeenCalled();
       expect(mockHttpRequest).not.toHaveBeenCalled();
     });
+  });
+});
+
+describe("write idempotency key names one request, not one JSON-RPC id (AII-687 gate, 2026-09-17)", () => {
+  const issued = 1_700_000_000_000;
+
+  it("a retry — same client, same token, same id, same arguments — produces the same key", () => {
+    expect(writeIdempotencyKey("cli-1", issued, 7, { mode: "fly" })).toBe(writeIdempotencyKey("cli-1", issued, 7, { mode: "fly" }));
+  });
+
+  it("the same id with different arguments produces a different key, so the later call runs", () => {
+    expect(writeIdempotencyKey("cli-1", issued, 7, { mode: "fly" })).not.toBe(writeIdempotencyKey("cli-1", issued, 7, { mode: "default" }));
+  });
+
+  it("the same id and arguments under a different access token (a new session) produces a different key", () => {
+    expect(writeIdempotencyKey("cli-1", issued, 7, {})).not.toBe(writeIdempotencyKey("cli-1", issued + 60_000, 7, {}));
+  });
+
+  it("two OAuth clients never share a key; a missing client id or JSON-RPC id is named, not blank", () => {
+    expect(writeIdempotencyKey("cli-1", issued, 7, {})).not.toBe(writeIdempotencyKey("cli-2", issued, 7, {}));
+    expect(writeIdempotencyKey(null, issued, undefined, undefined)).toMatch(/^no-client:1700000000000:no-id:[0-9a-f]{16}$/);
+  });
+
+  it("through the adapter: two set_runner_mode calls with the same id and different arguments reach callTool with different keys", async () => {
+    mockRole("admin");
+    (toolsClientMock.callTool as ReturnType<typeof vi.fn>).mockResolvedValue({ status: "ok", content: [{ type: "text", text: "{}" }] });
+    const post = (mode: string) =>
+      callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 7, method: "tools/call", params: { name: "set_runner_mode", arguments: { mode } } }),
+      );
+    await post("fly");
+    await post("default");
+    await post("default");
+    const keys = (toolsClientMock.callTool as ReturnType<typeof vi.fn>).mock.calls.map((c: unknown[]) => (c[3] as { idempotencyKey: string }).idempotencyKey);
+    expect(keys).toHaveLength(3);
+    expect(keys[0]).not.toBe(keys[1]);
+    expect(keys[1]).toBe(keys[2]);
+    expect(keys[0]).toBe(writeIdempotencyKey(null, FIXTURE_TOKEN_INFO.issuedAt, 7, { mode: "fly" }));
   });
 });

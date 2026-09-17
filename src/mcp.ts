@@ -1,4 +1,5 @@
 import http from "node:http";
+import crypto from "node:crypto";
 import { verifyMcpToken, resolveClientPath, getRefreshExpiry } from "./mcp-oauth.js";
 import { recordAuthEvent, type AuthEventCause } from "./mcp-auth-events.js";
 import { recheckIdentity, type AccessRole } from "./access-entries.js";
@@ -46,6 +47,22 @@ const GET_SESSION_IDENTITY_TOOL = {
 // The six writes joined this set in AII-713: their role ("admin"), schema, and run body now
 // live on the handler itself (src/restate/tools.ts), not in this file — see
 // docs/adr/015-mcp-reads-open-writes-declared.md.
+/**
+ * The Restate idempotency key for one write through /mcp (AII-713; corrected 2026-09-17 on the
+ * AII-687 gate). The key must name one request, not one JSON-RPC id: a client's ids restart at
+ * zero in every MCP session, and Restate keeps a keyed result for 24 hours by default, so
+ * `clientId:id` alone let a later session's write with a colliding id attach to an old result and
+ * never run — proven live with `set_runner_mode` (a second `id: 7` with different arguments
+ * answered the first call's body and changed nothing). The access token's issue time scopes the
+ * key to one token, and the argument hash to one call, so a genuine retry — same token, same id,
+ * same arguments — still attaches to the first run, while a new session or a different call runs.
+ * The hash covers the arguments as serialized: a retry re-sends the same bytes, so the same key.
+ */
+export function writeIdempotencyKey(clientId: string | null, tokenIssuedAt: number, rpcId: unknown, args: unknown): string {
+  const argsHash = crypto.createHash("sha256").update(JSON.stringify(args ?? {})).digest("hex").slice(0, 16);
+  return `${clientId ?? "no-client"}:${tokenIssuedAt}:${rpcId ?? "no-id"}:${argsHash}`;
+}
+
 const RESTATE_TOOL_NAMES = new Set([
   "get_tenant_health",
   "get_runner_mode",
@@ -250,15 +267,12 @@ export async function handleMcpRequest(
 
     if (RESTATE_TOOL_NAMES.has(toolName)) {
       const caller: Caller = { kind: identity.kind, email: identity.email, role };
-      // A write is invoked with an idempotency key derived from this MCP request's JSON-RPC
-      // id, namespaced by OAuth client so two different clients coincidentally reusing the
-      // same id (the JSON-RPC spec only guarantees uniqueness within one client's outstanding
-      // requests) can't collide on Restate's dedup store; Restate itself further scopes the
-      // key by service+handler, so no tool name needs to be folded in here. A client retry of
-      // the same call attaches to the first run instead of re-executing it (AII-713). Reads
-      // never carry one — see RESTATE_WRITE_TOOL_NAMES above.
+      // A write is invoked with an idempotency key that names this one request (see
+      // writeIdempotencyKey), so a client retry of the same call attaches to the first run
+      // instead of re-executing it (AII-713). Restate scopes the key by service+handler, so
+      // the tool name is not folded in. Reads never carry one — see RESTATE_WRITE_TOOL_NAMES.
       const idempotencyKey = RESTATE_WRITE_TOOL_NAMES.has(toolName)
-        ? `${identity.clientId ?? "no-client"}:${rpc.id ?? "no-id"}`
+        ? writeIdempotencyKey(identity.clientId, verification.token.issuedAt, rpc.id, toolArgs)
         : undefined;
       const callResult = await callTool(toolName, toolArgs, caller, idempotencyKey ? { idempotencyKey } : undefined);
       if (callResult.status === "unavailable") {
