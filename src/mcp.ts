@@ -499,16 +499,16 @@ export async function handleMcpRequest(
       return;
     }
 
-    // Anything else falls through to the raw proxy below (e.g. a tool name the sidecar
-    // itself defines that has no orchestrator-native handler).
+    // A tool name that is neither the door's own tool nor a discovered handler is unknown
+    // here: since AII-711 every read (the kg_* tools included) is a handler, so nothing is
+    // proxied to the sidecar any more.
   }
 
-  // Proxy everything else to the provider
-  if (!provider) {
-    const detail = providerDiagnostic ? ` (${providerDiagnostic})` : "";
-    json(res, 503, { error: `no memory provider is configured${detail}` });
-    return;
-  }
-
-  provider.proxyCall(req, res, body);
+  // Every other JSON-RPC method, and every unknown tool name, is a method-not-found error.
+  // The raw sidecar proxy that used to sit here left with AII-711.
+  json(res, 200, {
+    jsonrpc: "2.0",
+    id: rpc?.id ?? null,
+    error: { code: -32601, message: `Method not found: ${rpc?.method ?? "unknown"}` },
+  });
 }

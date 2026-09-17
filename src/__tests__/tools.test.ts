@@ -8,7 +8,7 @@ import * as restate from "@restatedev/restate-sdk";
 import { z } from "zod";
 import { describe, expect, it, vi } from "vitest";
 import { tool } from "../restate/tools.js";
-import { discoverTools, callTool } from "../restate/tools-client.js";
+import { discoverTools, callTool, callToolAsSystem, toolCatalog } from "../restate/tools-client.js";
 import type { Caller } from "../mcp-identity.js";
 
 function fakeContext(handlerName: string): restate.Context {
@@ -218,5 +218,89 @@ describe("callTool", () => {
     const body = JSON.parse(capturedInit?.body as string);
     expect(body).toEqual({ caller: HUMAN_USER, args: { id: "1" } });
     expect(Object.keys(body)).toEqual(["caller", "args"]);
+  });
+
+  it("percent-encodes a path-traversal name so it stays one path segment (defense in depth)", async () => {
+    let capturedUrl: string | undefined;
+    const fetchImpl = vi.fn(async (url: string | URL | Request) => {
+      capturedUrl = String(url);
+      return { ok: true, status: 200, json: async () => ({ content: [] }) } as Response;
+    });
+
+    await callTool("../Operator/x/revoke", {}, HUMAN_USER, {
+      ingressBaseUrl: "http://ingress.example",
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+
+    expect(capturedUrl).toBe("http://ingress.example/orchestratorTools/..%2FOperator%2Fx%2Frevoke");
+  });
+});
+
+describe("callToolAsSystem", () => {
+  it("posts with a systemCaller() caller and returns the same result shape as callTool", async () => {
+    let capturedBody: unknown;
+    const fetchImpl = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      capturedBody = JSON.parse(init?.body as string);
+      return { ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: "health" }] }) } as Response;
+    });
+
+    const result = await callToolAsSystem("get_tenant_health", {}, {
+      ingressBaseUrl: "http://ingress.example",
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+
+    expect(result).toEqual({ status: "ok", content: [{ type: "text", text: "health" }], isError: undefined });
+    expect(capturedBody).toEqual({
+      caller: { kind: "system", email: null, role: "admin" },
+      args: {},
+    });
+  });
+
+  it("maps a connection failure to status: \"unavailable\", same as callTool", async () => {
+    const fetchImpl = vi.fn(async () => {
+      throw new Error("ECONNREFUSED");
+    });
+    const result = await callToolAsSystem("get_tenant_health", {}, {
+      ingressBaseUrl: "http://ingress.example",
+      fetchImpl,
+    });
+    expect(result).toEqual({ status: "unavailable" });
+  });
+});
+
+describe("toolCatalog", () => {
+  it("returns the same discovered names and schemas as discoverTools, sourced from the registry", async () => {
+    const fetchImpl = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        handlers: [
+          {
+            name: "get_tenant_health",
+            documentation: "Health summary",
+            metadata: { "mcp.type": "tool", "mcp.role": "user" },
+            input_json_schema: { properties: { args: { type: "object", properties: {} } } },
+          },
+        ],
+      }),
+    })) as unknown as typeof fetch;
+
+    const catalog = await toolCatalog({ adminBaseUrl: "http://admin.example", fetchImpl });
+
+    expect(catalog).toEqual([
+      {
+        name: "get_tenant_health",
+        description: "Health summary",
+        inputSchema: { type: "object", properties: {} },
+        role: "user",
+      },
+    ]);
+  });
+
+  it("returns [] when discovery cannot reach the admin API", async () => {
+    const fetchImpl = vi.fn(async () => {
+      throw new Error("ECONNREFUSED");
+    });
+    expect(await toolCatalog({ adminBaseUrl: "http://admin.example", fetchImpl })).toEqual([]);
   });
 });
