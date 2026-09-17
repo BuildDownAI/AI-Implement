@@ -246,6 +246,41 @@ describe("RestateRefreshAuthority — outcome mapping", () => {
   });
 });
 
+describe("RestateRefreshAuthority.describe (AII-714)", () => {
+  it("maps the object's describe result to expiresAt", async () => {
+    const fetchImpl = vi.fn(async (url: string) => {
+      expect(url).toBe(`${UNROUTABLE_INGRESS}/Operator/c1/describe`);
+      return new Response(
+        JSON.stringify({ email: "ada@eudoxus.ai", rotatedAt: 1000, expiresAt: 1_700_000_000_000 }),
+        { status: 200 },
+      );
+    });
+    const authority = authorityWithFetch(fetchImpl as unknown as typeof fetch);
+    await expect(authority.describe("c1")).resolves.toEqual({ status: "ok", expiresAt: 1_700_000_000_000 });
+  });
+
+  it("maps a family with no live refresh token (expiresAt: null) straight through", async () => {
+    const fetchImpl = vi.fn(async () =>
+      new Response(JSON.stringify({ email: null, rotatedAt: null, expiresAt: null }), { status: 200 }),
+    );
+    const authority = authorityWithFetch(fetchImpl as unknown as typeof fetch);
+    await expect(authority.describe("c1")).resolves.toEqual({ status: "ok", expiresAt: null });
+  });
+
+  it("maps an unroutable ingress to unavailable rather than throwing", async () => {
+    const authority = new RestateRefreshAuthority({ ingressBaseUrl: UNROUTABLE_INGRESS, accessTokenTtlMs: 3600_000 });
+    await expect(authority.describe("c1")).resolves.toEqual({ status: "unavailable" });
+  });
+
+  it("maps a thrown connection error to unavailable, never rejects", async () => {
+    const fetchImpl = vi.fn(async () => {
+      throw new Error("connect ECONNREFUSED 127.0.0.1:59999");
+    });
+    const authority = authorityWithFetch(fetchImpl as unknown as typeof fetch);
+    await expect(authority.describe("c1")).resolves.toEqual({ status: "unavailable" });
+  });
+});
+
 describe("RestateRefreshAuthority.rotate — allowlist re-check (AII-687 parity)", () => {
   function refreshOkResponse(): Response {
     return new Response(

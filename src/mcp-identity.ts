@@ -57,8 +57,20 @@ export type IssueOutcome =
   | { status: "ok"; refreshToken: string }
   | { status: "unavailable" };
 
+/**
+ * The refresh-expiry lookup behind `get_session_identity`'s `refresh` field (AII-714):
+ * `expiresAt: null` means the client has no live refresh token (nothing issued, or its
+ * chain was revoked), which is distinct from `unavailable` (the authority couldn't be
+ * reached) — the caller collapses both to `refresh: null`, but the distinction matters
+ * for anyone consuming `describe` directly.
+ */
+export type DescribeOutcome =
+  | { status: "ok"; expiresAt: number | null }
+  | { status: "unavailable" };
+
 export interface RefreshAuthority {
   issue(input: IssueInput): Promise<IssueOutcome>;
   rotate(input: RefreshInput): Promise<RefreshOutcome>;
   revokeFamily(familyId: string): Promise<void>;
+  describe(clientId: string): Promise<DescribeOutcome>;
 }

@@ -65,7 +65,7 @@ Reads, orchestrator-native:
 
 | Tool | Role | Returns |
 | -- | -- | -- |
-| `get_session_identity` | user | The caller's email, provider, and role (`user`, `admin`, or `null` for an identity with no allowlist entry), as the allowlist resolves them now. Admin-only skills call this first. |
+| `get_session_identity` | user | The caller's email, provider, and role (`user`, `admin`, or `null` for an identity with no allowlist entry), as the allowlist resolves them now; `kind` (`"human"` today); `token: { issuedAt, expiresAt, clientId, clientPath }` for the access token that resolved this request; `refresh: { expiresAt } | null`, the refresh token's expiry from the `Operator` object's `describe()` — `null` when the client has no live refresh token, or during a Restate outage (never an error: identity must answer regardless). Admin-only skills call this first. A skill that reads `get_session_identity` should warn the operator when `refresh.expiresAt` is within 48 hours, so a re-auth happens before the refresh token itself expires. |
 | `get_tenant_health` | user | Runner mode, in-flight jobs, pending gap-fills, project count, KG degraded flag, `kgUnavailable` + `sidecar` (the sidecar liveness probe's `reachable`/`toolsListed`/`lastError`/`checkedAt`, AII-650), and the kg-refresh credential preflight rows |
 | `get_kg_status` | user | KG refresh rail state: stage, served stamp, materialize path, last refresh outcome and gate, plus `kgUnavailable` + `sidecar` (same shape as `get_tenant_health`, AII-650) |
 | `get_runner_mode` | user | Global runner mode and its source |
@@ -101,7 +101,7 @@ Skills bind the server by name in `CLAUDE.md` (`kg.mcp_server`) and discover too
 | `OAUTH_REDIRECT_BASE_URL` unset | 503 to every caller |
 | Allowlist unreadable | 503 |
 | `kg_*` call with no provider, or a capability the provider lacks | tool result `isError: true` with the pre-migration text (`no memory provider is configured` / `Tool not supported by this memory provider: <tool>`); the tool is also absent from `tools/list` |
-| Any handler call — read or write — while Restate is unreachable | 503 `restate-unavailable`; `initialize` and `get_session_identity` still answer, since neither is a Restate handler |
+| Any handler call — read or write — while Restate is unreachable | 503 `restate-unavailable`; `initialize` and `get_session_identity` still answer, since neither is a Restate handler — `get_session_identity`'s `refresh` field degrades to `null` rather than erroring |
 | GET or DELETE on `/mcp` | 405 with `Allow: POST` |
 | Unknown JSON-RPC method / unknown tool name | JSON-RPC error `-32601` / `-32602` at HTTP 200 |
 | Write call below the required role | tool result `isError: true`, `forbidden: <tool> requires the <role> role`; logged |

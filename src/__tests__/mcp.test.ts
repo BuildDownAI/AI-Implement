@@ -114,7 +114,8 @@ function fakeRestateContext(handlerName: string): restate.Context {
 
 vi.mock("../mcp-oauth.js", () => ({
   verifyMcpToken: vi.fn(),
-  resolveClientPath: vi.fn().mockReturnValue("unknown"),
+  resolveClientPath: vi.fn(),
+  getRefreshExpiry: vi.fn(),
 }));
 
 vi.mock("../mcp-auth-events.js", () => ({
@@ -163,6 +164,10 @@ vi.mock("../restate/tools-client.js", () => ({
 const BASE_URL = "https://orchestrator.example.com";
 const SIDECAR_URL = "http://127.0.0.1:8765/mcp";
 const DEFAULT_PROVIDER = new SidecarMemoryProvider(SIDECAR_URL);
+
+// The verifyMcpToken mock's `token` field for a valid-token test double (AII-714) — a fixed
+// fixture rather than a live token, since these tests never mint one through mcp-oauth.ts.
+const FIXTURE_TOKEN_INFO = { issuedAt: 1_700_000_000_000, expiresAt: 1_700_003_600_000, clientId: null, clientPath: "unknown" as const };
 
 class MockRequest extends PassThrough {
   url = "/mcp";
@@ -322,6 +327,7 @@ beforeEach(async () => {
   setActiveKgRefresh(null);
 
   (mcpOauth.resolveClientPath as ReturnType<typeof vi.fn>).mockReturnValue("unknown");
+  (mcpOauth.getRefreshExpiry as ReturnType<typeof vi.fn>).mockResolvedValue(null);
 
   // The gate re-checks the token's identity on every request; allow it unless a test says otherwise.
   (accessMock.recheckIdentity as ReturnType<typeof vi.fn>).mockReturnValue({
@@ -418,7 +424,11 @@ async function callMcp(
   if (writeContext?.clearDispatchDedup) (clearDedupEntryAction as ReturnType<typeof vi.fn>).mockImplementation((issueId: string) => writeContext.clearDispatchDedup!(issueId));
   (mcpOauth.verifyMcpToken as ReturnType<typeof vi.fn>).mockReturnValue(
     tokenValid
-      ? { ok: true, identity: { kind: "human", email: "user@example.com", sub: "sub1", provider: "google", clientId: null } }
+      ? {
+          ok: true,
+          identity: { kind: "human", email: "user@example.com", sub: "sub1", provider: "google", clientId: null },
+          token: FIXTURE_TOKEN_INFO,
+        }
       : { ok: false, reason: "invalid", clientId: null },
   );
   const req = new MockRequest(method, headers, body);
@@ -1413,7 +1423,14 @@ describe("handleMcpRequest", () => {
       const parsed = JSON.parse(result.body);
       expect(parsed.result.isError).not.toBe(true);
       const data = JSON.parse(parsed.result.content[0].text);
-      expect(data).toEqual({ kind: "human", email: "user@example.com", provider: "google", role: "user" });
+      expect(data).toEqual({
+        kind: "human",
+        email: "user@example.com",
+        provider: "google",
+        role: "user",
+        token: FIXTURE_TOKEN_INFO,
+        refresh: null,
+      });
     });
 
     it("get_session_identity returns role: null for an entry-less identity", async () => {
@@ -1428,7 +1445,14 @@ describe("handleMcpRequest", () => {
       );
       expect(result.statusCode).toBe(200);
       const data = JSON.parse(JSON.parse(result.body).result.content[0].text);
-      expect(data).toEqual({ kind: "human", email: "user@example.com", provider: "google", role: null });
+      expect(data).toEqual({
+        kind: "human",
+        email: "user@example.com",
+        provider: "google",
+        role: null,
+        token: FIXTURE_TOKEN_INFO,
+        refresh: null,
+      });
     });
 
     it("get_session_identity returns kind: 'human' for an OAuth identity", async () => {
@@ -1436,6 +1460,7 @@ describe("handleMcpRequest", () => {
       (mcpOauth.verifyMcpToken as ReturnType<typeof vi.fn>).mockReturnValue({
         ok: true,
         identity: { kind: "human", email: "user@example.com", sub: "sub1", provider: "google", clientId: null },
+        token: FIXTURE_TOKEN_INFO,
       });
       const req = new MockRequest("POST", { authorization: "Bearer tok" }, JSON.stringify({
         jsonrpc: "2.0", id: 32, method: "tools/call", params: { name: "get_session_identity", arguments: {} },
@@ -1445,7 +1470,48 @@ describe("handleMcpRequest", () => {
       await res.done;
       expect(res.statusCode).toBe(200);
       const data = JSON.parse(JSON.parse(res.body).result.content[0].text);
-      expect(data).toEqual({ kind: "human", email: "user@example.com", provider: "google", role: "user" });
+      expect(data).toEqual({
+        kind: "human",
+        email: "user@example.com",
+        provider: "google",
+        role: "user",
+        token: FIXTURE_TOKEN_INFO,
+        refresh: null,
+      });
+    });
+
+    it("get_session_identity returns refresh.expiresAt when the refresh authority reports a live refresh token", async () => {
+      mockRole("user");
+      (mcpOauth.getRefreshExpiry as ReturnType<typeof vi.fn>).mockResolvedValue(1_700_100_000_000);
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 33, method: "tools/call", params: { name: "get_session_identity", arguments: {} } }),
+      );
+      expect(result.statusCode).toBe(200);
+      const data = JSON.parse(JSON.parse(result.body).result.content[0].text);
+      expect(data.refresh).toEqual({ expiresAt: 1_700_100_000_000 });
+    });
+
+    it("get_session_identity answers refresh: null, not an error, when the refresh authority (Operator/Restate) is unavailable", async () => {
+      mockRole("user");
+      (mcpOauth.getRefreshExpiry as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 34, method: "tools/call", params: { name: "get_session_identity", arguments: {} } }),
+      );
+      expect(result.statusCode).toBe(200);
+      const parsed = JSON.parse(result.body);
+      expect(parsed.result.isError).not.toBe(true);
+      const data = JSON.parse(parsed.result.content[0].text);
+      expect(data.refresh).toBeNull();
     });
   });
 
