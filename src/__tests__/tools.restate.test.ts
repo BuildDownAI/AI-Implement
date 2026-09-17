@@ -14,6 +14,7 @@ import * as dedup from "../dedup.js";
 import { initLogTable } from "../log.js";
 import { initMappingsTable } from "../config.js";
 import { initSettingsTable } from "../runner-mode.js";
+import { setKgMemoryProvider } from "../kg-provider.js";
 
 // A second service, built with tool(), whose only handler throws — proves the wrapper's
 // try/catch (not just get_tenant_health's own well-behaved body) turns a thrown error into
@@ -81,6 +82,8 @@ async function callIngress(
   return { status: response.status, body: text ? JSON.parse(text) : undefined };
 }
 
+const SYSTEM = { kind: "system", email: null, role: "admin" } as const;
+
 describe("orchestratorTools (Restate)", () => {
   const environments = new Map<string, RestateTestEnvironment>();
 
@@ -93,6 +96,11 @@ describe("orchestratorTools (Restate)", () => {
     // get_tenant_health also reads `mappings` (getMappings) and `settings` (getRunnerMode).
     initMappingsTable();
     initSettingsTable();
+    // One fixture mapping for list_projects, with a non-empty extra_env the handler must drop.
+    dedup.getDb().prepare(
+      "INSERT INTO mappings (team_key, owner, repo, workflow_file, default_branch, extra_env) VALUES (?, ?, ?, ?, ?, ?)",
+    ).run("BDS", "BuildDownAI", "skills", "claude.yml", "testing", JSON.stringify({ SUPER_SECRET: "leak-me" }));
+    setKgMemoryProvider(null);
 
     const started = await Promise.all(
       VARIANTS.map(async ([label, configure]) => {
@@ -214,4 +222,62 @@ describe("orchestratorTools (Restate)", () => {
       expect(body?.content?.[0]?.text).toBe("done");
     },
   );
+  // ---- AII-711: the migrated read handlers through the real ingress.
+  it.each(VARIANTS.map(([label]) => label))(
+    "get_runner_mode returns { mode, source } (%s)",
+    async (label) => {
+      const env = environments.get(label);
+      if (!env) throw new Error(`environment "${label}" did not start`);
+      const { status, body } = await callIngress(env.baseUrl(), "get_runner_mode", { caller: SYSTEM, args: {} });
+      expect(status).toBe(200);
+      expect(body?.isError).toBeUndefined();
+      expect(Object.keys(JSON.parse(body?.content?.[0]?.text as string)).sort()).toEqual(["mode", "source"]);
+    },
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "list_projects returns the fixture mapping without extraEnv (%s)",
+    async (label) => {
+      const env = environments.get(label);
+      if (!env) throw new Error(`environment "${label}" did not start`);
+      const { status, body } = await callIngress(env.baseUrl(), "list_projects", { caller: SYSTEM, args: {} });
+      expect(status).toBe(200);
+      const text = body?.content?.[0]?.text as string;
+      const rows = JSON.parse(text) as Array<{ teamKey: string; repo: string }>;
+      expect(rows.map((r) => r.teamKey)).toEqual(["BDS"]);
+      expect(rows[0].repo).toBe("BuildDownAI/skills");
+      expect(text).not.toContain("extraEnv");
+      expect(text).not.toContain("leak-me");
+    },
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "get_issue_dispatch_status returns the dispatch shape for a valid identifier and lets zod refuse a non-string one (%s)",
+    async (label) => {
+      const env = environments.get(label);
+      if (!env) throw new Error(`environment "${label}" did not start`);
+      const ok = await callIngress(env.baseUrl(), "get_issue_dispatch_status", { caller: SYSTEM, args: { identifier: "AII-1" } });
+      expect(ok.status).toBe(200);
+      const shape = JSON.parse(ok.body?.content?.[0]?.text as string) as Record<string, unknown>;
+      expect(Object.keys(shape).sort()).toEqual(["dedupEntry", "identifier", "inDedupWindow", "inFlight", "mergeVerdict", "recentDispatches"]);
+      expect(shape.inFlight).toBe(false);
+      // zod rejects a number before the handler body runs: the ingress answers 4xx.
+      const bad = await callIngress(env.baseUrl(), "get_issue_dispatch_status", { caller: SYSTEM, args: { identifier: 5 } });
+      expect(bad.status).toBeGreaterThanOrEqual(400);
+      expect(bad.status).toBeLessThan(500);
+    },
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "kg_hybrid_search with no provider answers isError with the pre-migration wording (%s)",
+    async (label) => {
+      const env = environments.get(label);
+      if (!env) throw new Error(`environment "${label}" did not start`);
+      const { status, body } = await callIngress(env.baseUrl(), "kg_hybrid_search", { caller: SYSTEM, args: { query: "x" } });
+      expect(status).toBe(200);
+      expect(body?.isError).toBe(true);
+      expect(body?.content?.[0]?.text).toBe("no memory provider is configured");
+    },
+  );
+
 });

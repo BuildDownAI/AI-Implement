@@ -2587,6 +2587,39 @@ describe("handleMcpRequest", () => {
     });
   });
 
+  describe("kg_* reads through the tools service (AII-711)", () => {
+    const KG_TOOLS = ["kg_hybrid_search", "kg_search", "kg_semantic_search", "kg_neighbors", "kg_path", "kg_provenance"];
+
+    it.each(KG_TOOLS)("%s returns the sidecar's result verbatim through /mcp, degraded flag intact", async (name) => {
+      const callKgTool = vi.fn(async (): Promise<KgToolResult> => ({ ok: true, result: { degraded: true, tool: name } }));
+      const stubProvider: MemoryProvider = {
+        id: "stub",
+        capabilities: { hybridSearch: true, neighbors: true, path: true, provenance: true, stalenessStamp: false },
+        listTools: async () => [],
+        callKgTool,
+      };
+      setKgMemoryProvider(stubProvider);
+
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        stubProvider,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 30, method: "tools/call", params: { name, arguments: { q: "x" } } }),
+      );
+
+      expect(result.statusCode).toBe(200);
+      const parsed = JSON.parse(result.body);
+      expect(parsed.result.isError).toBeUndefined();
+      expect(JSON.parse(parsed.result.content[0].text)).toEqual({ degraded: true, tool: name });
+      expect(callKgTool).toHaveBeenCalledWith(name, { q: "x" });
+      expect(toolsClientMock.callTool).toHaveBeenCalledWith(name, { q: "x" }, expect.objectContaining({ kind: "human" }));
+      expect(mockHttpRequest).not.toHaveBeenCalled();
+      setKgMemoryProvider(null);
+    });
+  });
+
   describe("non-tool requests after the sidecar proxy left (AII-711)", () => {
     it("answers 405 with Allow: POST to a GET — the door offers no SSE channel", async () => {
       const result = await callMcp({ authorization: "Bearer tok" }, true, DEFAULT_PROVIDER, BASE_URL, "GET");
