@@ -1,7 +1,6 @@
 import http from "node:http";
 import { verifyMcpToken, resolveClientPath } from "./mcp-oauth.js";
 import { recordAuthEvent, type AuthEventCause } from "./mcp-auth-events.js";
-import { VALID_RUNNER_MODES } from "./runner-mode.js";
 import { recheckIdentity, type AccessRole } from "./access-entries.js";
 import { type MemoryProvider, KG_TOOL_CAPABILITY } from "./kg-provider.js";
 import type { Caller } from "./mcp-identity.js";
@@ -44,6 +43,9 @@ const GET_SESSION_IDENTITY_TOOL = {
 // tools/call routes a name in this set through callTool(); tools/list sources every
 // discoverable tool's description/schema live from discoverTools() rather than duplicating
 // it here — get_session_identity above is the sole read tool that isn't in this set (AII-711).
+// The six writes joined this set in AII-713: their role ("admin"), schema, and run body now
+// live on the handler itself (src/restate/tools.ts), not in this file — see
+// docs/adr/015-mcp-reads-open-writes-declared.md.
 const RESTATE_TOOL_NAMES = new Set([
   "get_tenant_health",
   "get_runner_mode",
@@ -60,239 +62,33 @@ const RESTATE_TOOL_NAMES = new Set([
   "kg_neighbors",
   "kg_provenance",
   "kg_path",
+  "trigger_kg_refresh",
+  "set_runner_mode",
+  "pause_project",
+  "add_project",
+  "trigger_workflow_sync",
+  "clear_dispatch_dedup",
 ]);
 
-// ---- Orchestrator-native write tools ----
-// The entire write surface of /mcp: a tool is a write only if it is declared here, and each
-// declaration names the role required to call it. See docs/adr/015-mcp-reads-open-writes-declared.md.
-
-interface WriteToolContext {
-  triggerKgRefresh?: (dryRun?: boolean, acceptNewBaseline?: boolean, actorEmail?: string) => Promise<{ status: number; body: Record<string, unknown> }>;
-  /** Caller's email, for write tools (trigger_kg_refresh's acceptNewBaseline) that need to attribute a consequential action. */
-  actorEmail?: string;
-  setRunnerMode?: (patch: { mode?: string }) => { status: number; body: Record<string, unknown> };
-  pauseProject?: (teamKey: string, paused: boolean) => { status: number; body: Record<string, unknown> };
-  addProject?: (body: Record<string, unknown>) => { status: number; body: Record<string, unknown> };
-  triggerWorkflowSync?: (teamKey: string) => { status: number; body: Record<string, unknown> };
-  clearDispatchDedup?: (issueId: string) => { status: number; body: Record<string, unknown> };
-}
-
-export interface WriteTool {
-  name: string;
-  description: string;
-  inputSchema: Record<string, unknown>;
-  role: AccessRole;
-  run: (
-    args: Record<string, unknown>,
-    context: WriteToolContext,
-  ) => Promise<{ status: number; body: Record<string, unknown> }>;
-}
+// The subset of RESTATE_TOOL_NAMES that mutates state. Not a role declaration — that lives on
+// each handler's own `mcp.role` metadata and is asserted inside the tool() wrapper regardless
+// of how a call reaches it. This list exists only to decide which calls carry an idempotency
+// key (below): attaching one to a read would make a client's identical retry of a genuine
+// re-poll return a stale cached answer instead of running again, which reads never wanted.
+const RESTATE_WRITE_TOOL_NAMES = new Set([
+  "trigger_kg_refresh",
+  "set_runner_mode",
+  "pause_project",
+  "add_project",
+  "trigger_workflow_sync",
+  "clear_dispatch_dedup",
+]);
 
 // admin is a strict superset of user (docs/access-model.md § Roles): an entry's role satisfies
-// a requirement when it matches exactly or is admin.
+// a requirement when it matches exactly or is admin. Used only for the tools/list courtesy
+// filter below — the boundary itself is the tool() wrapper's own copy (src/restate/tools.ts).
 const roleAllows = (have: AccessRole | null, need: AccessRole): boolean =>
   have === "admin" || have === need;
-
-// Exported so tests can verify the admin-superset rule against a role: "user" entry without a
-// second write tool existing in production — see mcp.test.ts's "admin is a superset of user" case.
-export const WRITE_TOOLS: WriteTool[] = [
-  {
-    name: "trigger_kg_refresh",
-    description:
-      "Trigger the KG refresh rail (admin role). Same handler as POST /api/kg/refresh: runs the credential preflight, then dispatches the refresh. Poll get_kg_status afterwards. dryRun=true runs the same runner job with kg-snapshot-push's push skipped — all guards run and the guard verdict plus per-part table are reported via get_kg_status, but nothing is pushed, no PR opens, and the served graph never changes. acceptNewBaseline=true downgrades the zero-shrink and 50%-shrink content guards to warnings for this one dispatch and pushes anyway — use only after reviewing a guard refusal's part table and confirming the shrink is an intentional reclassification, not data loss; the accepting identity's email is logged and written into the refresh PR's ### Baseline section.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        dryRun: { type: "boolean", description: "Run the rail without pushing the snapshot or touching the served graph; reports the guard table via get_kg_status." },
-        acceptNewBaseline: { type: "boolean", description: "Push even though a tracked part (issue.nt/comment.nt) shrank or a part dropped below 50% of its previous size — a one-shot override of the zero-shrink guard, applied to this dispatch only." },
-      },
-    },
-    role: "admin",
-    run: async (args, context) => {
-      if (!context.triggerKgRefresh) {
-        throw new Error("KG refresh is not configured");
-      }
-      return context.triggerKgRefresh(args.dryRun === true, args.acceptNewBaseline === true, context.actorEmail);
-    },
-  },
-  {
-    name: "set_runner_mode",
-    description:
-      "Set the global runner mode (admin role). Same handler as POST /api/runner-mode: forces all new dispatches onto the given execution path.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        mode: {
-          type: "string",
-          enum: [...VALID_RUNNER_MODES],
-          description: "Global runner mode: default restores per-project modes, gha/fly force that execution path, shadow dispatches to both without acting on either result, local runs dispatches in local Docker (a developer-machine mode the admin UI does not offer). Validated by the same check as POST /api/runner-mode.",
-        },
-      },
-      required: ["mode"],
-    },
-    role: "admin",
-    run: async (args, context) => {
-      if (!context.setRunnerMode) {
-        throw new Error("set_runner_mode is not configured");
-      }
-      if (typeof args.mode !== "string") {
-        return { status: 400, body: { error: "mode is required" } };
-      }
-      // The mode set is not repeated here: setRunnerModeAction validates with isRunnerMode,
-      // the same check POST /api/runner-mode runs, so the tool answers what the route answers.
-      return context.setRunnerMode({ mode: args.mode });
-    },
-  },
-  {
-    name: "pause_project",
-    description:
-      "Pause or resume a project mapping (admin role). Same as the paused update of PATCH /api/mappings/<teamKey>.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        teamKey: { type: "string", description: "Team key of the mapping" },
-        paused: { type: "boolean", description: "Whether dispatch for this project should be paused" },
-      },
-      required: ["teamKey", "paused"],
-    },
-    role: "admin",
-    run: async (args, context) => {
-      if (!context.pauseProject) {
-        throw new Error("pause_project is not configured");
-      }
-      if (typeof args.teamKey !== "string" || !args.teamKey) {
-        return { status: 400, body: { error: "teamKey is required" } };
-      }
-      if (typeof args.paused !== "boolean") {
-        return { status: 400, body: { error: "paused is required" } };
-      }
-      return context.pauseProject(args.teamKey, args.paused);
-    },
-  },
-  {
-    name: "add_project",
-    description:
-      "Create or update a project mapping (admin role). Same as POST /api/mappings, the mapping upsert behind the admin UI's New project stepper.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        teamKey: { type: "string", description: "Team key, e.g. the Linear team key or Jira project key" },
-        owner: { type: "string", description: "GitHub repo owner/org" },
-        repo: { type: "string", description: "GitHub repo name" },
-        defaultBranch: { type: "string", description: "Base branch PRs are opened against" },
-        workflowFile: { type: "string" },
-        maxInProgressAiIssues: { type: "number" },
-        executionMode: { type: "string", enum: ["github-actions", "fly-machines"] },
-        sessionMode: { type: "string", enum: ["autonomous", "interactive", "hybrid"] },
-        machineCpus: { type: "number" },
-        machineMemoryMb: { type: "number" },
-        planningEnabled: { type: "boolean" },
-        planningWorkflowFile: { type: "string" },
-        autoApprovePlans: { type: "boolean" },
-        autoMerge: { type: "boolean" },
-        extraEnv: { type: "object", description: "Passed through to the model process; visible to the agent" },
-        provider: { type: "string", enum: ["anthropic", "bedrock"] },
-        awsRegion: { type: "string", description: "Required when provider is 'bedrock'" },
-        ticketingProvider: { type: "string" },
-        ticketingConfig: { type: "object" },
-        paused: { type: "boolean" },
-        maxTurns: { type: "number" },
-        maxIterations: { type: "number" },
-        maxJobMinutes: { type: "number" },
-        branchPrefix: { type: "string" },
-        skillsRepo: { type: "string" },
-        referenceRepos: { type: "array" },
-        sensitiveAddPatterns: {
-          description: "String or array of glob strings",
-        },
-        sensitiveAllowPatterns: {
-          description: "String or array of glob strings",
-        },
-        dependencyTokenScope: { type: "string", enum: ["installation"] },
-        reviewers: {
-          type: "array",
-          items: {
-            type: "object",
-            properties: {
-              id: { type: "string" },
-              gates: { type: "boolean" },
-              maxTurns: {
-                type: "integer",
-                minimum: 1,
-                maximum: 200,
-                description: "Optional per-reviewer turn cap. Omit to inherit the reviewer default or global limit.",
-              },
-            },
-            required: ["id", "gates"],
-          },
-          description: "Which reviewers run on this project's PRs. Omit to keep the stored value; pass null to reset to the default (gap-analysis and code-review, both gating).",
-        },
-      },
-      required: ["teamKey", "owner", "repo", "defaultBranch"],
-    },
-    role: "admin",
-    run: async (args, context) => {
-      if (!context.addProject) {
-        throw new Error("add_project is not configured");
-      }
-      if (
-        typeof args.teamKey !== "string" || !args.teamKey ||
-        typeof args.owner !== "string" || !args.owner ||
-        typeof args.repo !== "string" || !args.repo
-      ) {
-        return { status: 400, body: { error: "teamKey, owner, and repo are required" } };
-      }
-      if (typeof args.defaultBranch !== "string" || !args.defaultBranch) {
-        return { status: 400, body: { error: "defaultBranch is required" } };
-      }
-      return context.addProject(args);
-    },
-  },
-  {
-    name: "trigger_workflow_sync",
-    description:
-      "Trigger a workflow-template sync for a project (admin role). Same as POST /api/mappings/<teamKey>/sync-workflows.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        teamKey: { type: "string", description: "Team key of the mapping" },
-      },
-      required: ["teamKey"],
-    },
-    role: "admin",
-    run: async (args, context) => {
-      if (!context.triggerWorkflowSync) {
-        throw new Error("trigger_workflow_sync is not configured");
-      }
-      if (typeof args.teamKey !== "string" || !args.teamKey) {
-        return { status: 400, body: { error: "teamKey is required" } };
-      }
-      return context.triggerWorkflowSync(args.teamKey);
-    },
-  },
-  {
-    name: "clear_dispatch_dedup",
-    description:
-      "Clear a dedup entry so the issue can be re-dispatched (admin role). Same as DELETE /api/dedup/<issueId>.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        issueId: { type: "string", description: "The tracker issue id (not the human identifier) of the dedup entry" },
-      },
-      required: ["issueId"],
-    },
-    role: "admin",
-    run: async (args, context) => {
-      if (!context.clearDispatchDedup) {
-        throw new Error("clear_dispatch_dedup is not configured");
-      }
-      if (typeof args.issueId !== "string" || !args.issueId) {
-        return { status: 400, body: { error: "issueId is required" } };
-      }
-      return context.clearDispatchDedup(args.issueId);
-    },
-  },
-];
 
 // ---- Main handler ----
 
@@ -305,12 +101,6 @@ export async function handleMcpRequest(
   provider: MemoryProvider | null,
   baseUrl: string | null,
   _providerDiagnostic?: string | null,
-  triggerKgRefresh?: (dryRun?: boolean, acceptNewBaseline?: boolean, actorEmail?: string) => Promise<{ status: number; body: Record<string, unknown> }>,
-  setRunnerMode?: (patch: { mode?: string }) => { status: number; body: Record<string, unknown> },
-  pauseProject?: (teamKey: string, paused: boolean) => { status: number; body: Record<string, unknown> },
-  addProject?: (body: Record<string, unknown>) => { status: number; body: Record<string, unknown> },
-  triggerWorkflowSync?: (teamKey: string) => { status: number; body: Record<string, unknown> },
-  clearDispatchDedup?: (issueId: string) => { status: number; body: Record<string, unknown> },
 ): Promise<void> {
   if (!baseUrl) {
     json(res, 503, { error: "MCP endpoint not configured: OAUTH_REDIRECT_BASE_URL is not set" });
@@ -430,7 +220,7 @@ export async function handleMcpRequest(
     json(res, 200, {
       jsonrpc: "2.0",
       id: rpc.id ?? null,
-      result: { tools: [GET_SESSION_IDENTITY_TOOL, ...WRITE_TOOLS.filter((t) => roleAllows(role, t.role)), ...restateTools] },
+      result: { tools: [GET_SESSION_IDENTITY_TOOL, ...restateTools] },
     });
     return;
   }
@@ -438,51 +228,6 @@ export async function handleMcpRequest(
   if (rpc?.method === "tools/call") {
     const toolName = (rpc.params?.name as string) ?? "";
     const toolArgs = (rpc.params?.arguments as Record<string, unknown>) ?? {};
-
-    const writeTool = WRITE_TOOLS.find((t) => t.name === toolName);
-    if (writeTool) {
-      const actor = identity.email;
-      if (!roleAllows(role, writeTool.role)) {
-        console.log(`[mcp] write tool=${toolName} actor=${actor} role=${role ?? "null"} result=forbidden kind=${identity.kind}`);
-        json(res, 200, {
-          jsonrpc: "2.0",
-          id: rpc.id ?? null,
-          result: {
-            content: [{ type: "text", text: `forbidden: ${toolName} requires the ${writeTool.role} role` }],
-            isError: true,
-          },
-        });
-        return;
-      }
-      try {
-        const result = await writeTool.run(toolArgs, {
-          triggerKgRefresh,
-          actorEmail: actor,
-          setRunnerMode,
-          pauseProject,
-          addProject,
-          triggerWorkflowSync,
-          clearDispatchDedup,
-        });
-        console.log(`[mcp] write tool=${toolName} actor=${actor} role=${role} result=${result.status} kind=${identity.kind}`);
-        json(res, 200, {
-          jsonrpc: "2.0",
-          id: rpc.id ?? null,
-          result: { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] },
-        });
-      } catch (err) {
-        console.log(`[mcp] write tool=${toolName} actor=${actor} role=${role} result=error kind=${identity.kind}`);
-        json(res, 200, {
-          jsonrpc: "2.0",
-          id: rpc.id ?? null,
-          result: {
-            content: [{ type: "text", text: (err as Error).message }],
-            isError: true,
-          },
-        });
-      }
-      return;
-    }
 
     if (toolName === "get_session_identity") {
       const result = { kind: identity.kind, email: identity.email, provider: identity.provider, role };
@@ -496,7 +241,17 @@ export async function handleMcpRequest(
 
     if (RESTATE_TOOL_NAMES.has(toolName)) {
       const caller: Caller = { kind: identity.kind, email: identity.email, role };
-      const callResult = await callTool(toolName, toolArgs, caller);
+      // A write is invoked with an idempotency key derived from this MCP request's JSON-RPC
+      // id, namespaced by OAuth client so two different clients coincidentally reusing the
+      // same id (the JSON-RPC spec only guarantees uniqueness within one client's outstanding
+      // requests) can't collide on Restate's dedup store; Restate itself further scopes the
+      // key by service+handler, so no tool name needs to be folded in here. A client retry of
+      // the same call attaches to the first run instead of re-executing it (AII-713). Reads
+      // never carry one — see RESTATE_WRITE_TOOL_NAMES above.
+      const idempotencyKey = RESTATE_WRITE_TOOL_NAMES.has(toolName)
+        ? `${identity.clientId ?? "no-client"}:${rpc.id ?? "no-id"}`
+        : undefined;
+      const callResult = await callTool(toolName, toolArgs, caller, idempotencyKey ? { idempotencyKey } : undefined);
       if (callResult.status === "unavailable") {
         json(res, 503, { error: "restate-unavailable" });
         return;
@@ -510,8 +265,8 @@ export async function handleMcpRequest(
     }
 
     // A tool name that is neither the door's own tool nor a discovered handler is unknown:
-    // since AII-711 every read (the kg_* tools included) is a handler, and nothing is
-    // proxied to the sidecar any more.
+    // since AII-711 every read (the kg_* tools included) is a handler, and the six writes
+    // joined them in AII-713 — nothing is proxied to the sidecar, and nothing runs inline here.
     json(res, 200, {
       jsonrpc: "2.0",
       id: rpc.id ?? null,

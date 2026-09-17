@@ -2,7 +2,7 @@ import { PassThrough, Writable } from "node:stream";
 import http from "node:http";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as restate from "@restatedev/restate-sdk";
-import { handleMcpRequest, WRITE_TOOLS } from "../mcp.js";
+import { handleMcpRequest } from "../mcp.js";
 import { SidecarMemoryProvider, sidecarHealth, sidecarHealthFields, setKgMemoryProvider } from "../kg-provider.js";
 import type { MemoryProvider, KgToolResult } from "../kg-provider.js";
 import { setActiveKgRefresh } from "../kg-refresh.js";
@@ -26,8 +26,32 @@ import {
   kgNeighbors,
   kgPath,
   kgProvenance,
+  triggerKgRefreshTool,
+  setRunnerModeTool,
+  pauseProjectTool,
+  addProjectTool,
+  triggerWorkflowSyncTool,
+  clearDispatchDedupTool,
   type ToolResponse,
 } from "../restate/tools.js";
+import {
+  setRunnerModeAction,
+  pauseProjectAction,
+  upsertMappingAction,
+  triggerWorkflowSyncAction,
+  clearDedupEntryAction,
+} from "../admin.js";
+
+// The five non-kg-refresh writes call these action functions verbatim (AII-713) — mocked
+// wholesale, same as tools.test.ts, since src/restate/tools.ts only imports these five names
+// from admin.ts.
+vi.mock("../admin.js", () => ({
+  setRunnerModeAction: vi.fn(),
+  pauseProjectAction: vi.fn(),
+  upsertMappingAction: vi.fn(),
+  triggerWorkflowSyncAction: vi.fn(),
+  clearDedupEntryAction: vi.fn(),
+}));
 
 /**
  * Every tool bound to the orchestratorTools Restate service, keyed by wire name — mirrors
@@ -35,7 +59,9 @@ import {
  * `restate/tools-client.js`'s `callTool` dispatches through this table so a tools/call test
  * exercises the real handler body (and, through it, the same mocked modules — getRunnerMode,
  * getMappings, getDb, etc. — a unit test for that handler in tools.test.ts already exercises
- * directly) rather than a second, hand-duplicated expectation.
+ * directly) rather than a second, hand-duplicated expectation. The six writes (AII-713) are
+ * real handler bodies too — calling one here exercises the real tool() wrapper's role check
+ * and audit line, not just a stub.
  */
 const TOOL_HANDLERS: Record<
   string,
@@ -56,14 +82,29 @@ const TOOL_HANDLERS: Record<
   kg_neighbors: kgNeighbors,
   kg_path: kgPath,
   kg_provenance: kgProvenance,
+  trigger_kg_refresh: triggerKgRefreshTool,
+  set_runner_mode: setRunnerModeTool,
+  pause_project: pauseProjectTool,
+  add_project: addProjectTool,
+  trigger_workflow_sync: triggerWorkflowSyncTool,
+  clear_dispatch_dedup: clearDispatchDedupTool,
 };
 
-/** Every discoverable tool's role is "user" in production; mirrors DiscoveredTool. */
+/** The six writes declare role: "admin" (src/restate/tools.ts); every other discoverable tool is "user". */
+const WRITE_TOOL_NAMES = new Set([
+  "trigger_kg_refresh",
+  "set_runner_mode",
+  "pause_project",
+  "add_project",
+  "trigger_workflow_sync",
+  "clear_dispatch_dedup",
+]);
+
 const DISCOVERED_TOOLS = Object.keys(TOOL_HANDLERS).map((name) => ({
   name,
   description: name === "get_tenant_health" ? GET_TENANT_HEALTH_DESCRIPTION : name,
   inputSchema: { type: "object", properties: {} },
-  role: "user" as const,
+  role: (WRITE_TOOL_NAMES.has(name) ? "admin" : "user") as "admin" | "user",
 }));
 
 function fakeRestateContext(handlerName: string): restate.Context {
@@ -339,14 +380,6 @@ function setupProxyError(errorCode: string): void {
   });
 }
 
-interface McpWriteContext {
-  setRunnerMode?: (patch: { mode?: string }) => { status: number; body: Record<string, unknown> };
-  pauseProject?: (teamKey: string, paused: boolean) => { status: number; body: Record<string, unknown> };
-  addProject?: (body: Record<string, unknown>) => { status: number; body: Record<string, unknown> };
-  triggerWorkflowSync?: (teamKey: string) => { status: number; body: Record<string, unknown> };
-  clearDispatchDedup?: (issueId: string) => { status: number; body: Record<string, unknown> };
-}
-
 async function callMcp(
   headers: Record<string, string>,
   tokenValid: boolean,
@@ -355,10 +388,6 @@ async function callMcp(
   method = "POST",
   body?: string,
   providerDiagnostic?: string | null,
-  runKgRefreshPreflight?: () => Promise<PreflightCheckResult>,
-  getKgStatus?: () => Promise<KgRefreshStatus>,
-  triggerKgRefresh?: (dryRun?: boolean, acceptNewBaseline?: boolean, actorEmail?: string) => Promise<{ status: number; body: Record<string, unknown> }>,
-  writeContext?: McpWriteContext,
 ): Promise<{ statusCode: number; body: string; responseHeaders: Record<string, string> }> {
   (mcpOauth.verifyMcpToken as ReturnType<typeof vi.fn>).mockReturnValue(
     tokenValid
@@ -373,12 +402,6 @@ async function callMcp(
     provider,
     baseUrl,
     providerDiagnostic,
-    triggerKgRefresh,
-    writeContext?.setRunnerMode,
-    writeContext?.pauseProject,
-    writeContext?.addProject,
-    writeContext?.triggerWorkflowSync,
-    writeContext?.clearDispatchDedup,
   );
   await res.done;
   return { statusCode: res.statusCode, body: res.body, responseHeaders: res.responseHeaders };

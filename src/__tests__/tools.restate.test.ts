@@ -12,7 +12,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { orchestratorTools, tool, type ToolResponse } from "../restate/tools.js";
 import * as dedup from "../dedup.js";
 import { initLogTable } from "../log.js";
-import { initMappingsTable } from "../config.js";
+import { initMappingsTable, getMappings } from "../config.js";
 import { initSettingsTable } from "../runner-mode.js";
 import { setKgMemoryProvider } from "../kg-provider.js";
 
@@ -53,6 +53,25 @@ const suspendingTools = restate.service({
   handlers: { sleep_then_succeed: sleepThenSucceed },
 });
 
+// A fourth service, deliberately built WITHOUT tool() — tool() converts every handler throw
+// into a completed isError result specifically so a /mcp call is never held open by Restate's
+// own retry loop (its own doc comment), which means none of the six real write tools ever let
+// Restate retry an invocation. Demonstrating the retry+idempotency-key primitive those writes
+// now carry a key for (AII-713) needs a raw handler that lets a throw reach the SDK instead.
+let idempotentAttempts = 0;
+const idempotentTools = restate.service({
+  name: "idempotentTools",
+  handlers: {
+    throws_once_then_succeeds: async (): Promise<{ attempt: number }> => {
+      idempotentAttempts += 1;
+      if (idempotentAttempts === 1) {
+        throw new Error("transient failure on the first attempt");
+      }
+      return { attempt: idempotentAttempts };
+    },
+  },
+});
+
 // Pinned to match the image cached by .github/workflows/unit-tests.yml's restate-tests job.
 const RESTATE_IMAGE_VERSION = "1.7.10";
 
@@ -82,6 +101,28 @@ async function callIngress(
   return { status: response.status, body: text ? JSON.parse(text) : undefined };
 }
 
+/**
+ * Like callIngress, but carries Restate's own `idempotency-key` header
+ * (https://docs.restate.dev/operate/invocation#invoke-a-handler-idempotently) and returns the
+ * raw body untyped — used by the idempotency tests below, one of which targets a non-tool()
+ * service whose response shape (`{ attempt }`) isn't a ToolResponse.
+ */
+async function callIngressWithIdempotencyKey(
+  baseUrl: string,
+  handler: string,
+  idempotencyKey: string,
+  payload: unknown,
+  service = "orchestratorTools",
+): Promise<{ status: number; body: unknown }> {
+  const response = await fetch(`${baseUrl}/${service}/${handler}`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "idempotency-key": idempotencyKey },
+    body: JSON.stringify(payload),
+  });
+  const text = await response.text();
+  return { status: response.status, body: text ? JSON.parse(text) : undefined };
+}
+
 const SYSTEM = { kind: "system", email: null, role: "admin" } as const;
 
 describe("orchestratorTools (Restate)", () => {
@@ -105,7 +146,7 @@ describe("orchestratorTools (Restate)", () => {
     const started = await Promise.all(
       VARIANTS.map(async ([label, configure]) => {
         const env = await RestateTestEnvironment.start({
-          services: [orchestratorTools, failingTools, suspendingTools],
+          services: [orchestratorTools, failingTools, suspendingTools, idempotentTools],
           container: () => configure(new RestateContainer(RESTATE_IMAGE_VERSION)),
         });
         return [label, env] as const;
@@ -280,4 +321,114 @@ describe("orchestratorTools (Restate)", () => {
     },
   );
 
+  // ---- AII-713: the six writes, migrated off WRITE_TOOLS in src/mcp.ts onto this same
+  // service. Business-logic parity (each action's own status codes and validation) is unit
+  // tested in tools.test.ts against a mocked src/admin.ts; what's real-ingress-only here is
+  // discovery metadata, the forbidden path over the wire, and Restate's own idempotency-key
+  // and retry mechanics.
+  it.each(VARIANTS.map(([label]) => label))(
+    "the admin API lists pause_project with mcp.type: tool and mcp.role: admin (%s)",
+    async (label) => {
+      const env = environments.get(label);
+      if (!env) throw new Error(`environment "${label}" did not start`);
+      await callIngress(env.baseUrl(), "pause_project", { caller: SYSTEM, args: { teamKey: "no-such-team", paused: true } });
+      const response = await fetch(`${env.adminAPIBaseUrl()}/services/orchestratorTools`);
+      expect(response.ok).toBe(true);
+      const metadata = (await response.json()) as {
+        handlers: Array<{ name: string; metadata?: Record<string, string> }>;
+      };
+      const handler = metadata.handlers.find((h) => h.name === "pause_project");
+      expect(handler?.metadata?.["mcp.type"]).toBe("tool");
+      expect(handler?.metadata?.["mcp.role"]).toBe("admin");
+    },
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "trigger_kg_refresh's discovered schema declares dryRun/acceptNewBaseline booleans, and add_project's reviewers array matches the pre-migration shape (%s)",
+    async (label) => {
+      const env = environments.get(label);
+      if (!env) throw new Error(`environment "${label}" did not start`);
+      // Deployment metadata only appears once each handler has been invoked at least once.
+      await callIngress(env.baseUrl(), "trigger_kg_refresh", { caller: SYSTEM, args: {} });
+      await callIngress(env.baseUrl(), "add_project", { caller: SYSTEM, args: {} });
+
+      const response = await fetch(`${env.adminAPIBaseUrl()}/services/orchestratorTools`);
+      const metadata = (await response.json()) as {
+        handlers: Array<{ name: string; input_json_schema?: { properties?: { args?: { properties?: Record<string, unknown> } } } }>;
+      };
+
+      const kgRefreshArgs = metadata.handlers.find((h) => h.name === "trigger_kg_refresh")?.input_json_schema?.properties?.args
+        ?.properties as Record<string, { type?: string }> | undefined;
+      expect(kgRefreshArgs?.dryRun?.type).toBe("boolean");
+      expect(kgRefreshArgs?.acceptNewBaseline?.type).toBe("boolean");
+
+      const addProjectArgs = metadata.handlers.find((h) => h.name === "add_project")?.input_json_schema?.properties?.args?.properties;
+      const reviewers = addProjectArgs?.reviewers as { items?: { required?: string[]; properties?: Record<string, unknown> } } | undefined;
+      expect(reviewers?.items?.required).toEqual(["id", "gates"]);
+      expect(reviewers?.items?.properties?.maxTurns).toMatchObject({ type: "integer", minimum: 1, maximum: 200 });
+    },
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "a user caller is refused a write tool over the real ingress and never runs the action (%s)",
+    async (label) => {
+      const env = environments.get(label);
+      if (!env) throw new Error(`environment "${label}" did not start`);
+      const { status, body } = await callIngress(env.baseUrl(), "clear_dispatch_dedup", {
+        caller: { kind: "human", email: "user@example.com", role: "user" },
+        args: { issueId: "some-issue" },
+      });
+      expect(status).toBe(200);
+      expect(body?.isError).toBe(true);
+      expect(body?.content?.[0]?.text).toBe("forbidden: clear_dispatch_dedup requires the admin role");
+    },
+  );
+
+  it("pause_project: a second ingress call with the same idempotency key attaches to the first result instead of running pauseProjectAction again", async () => {
+    const env = environments.get("alwaysReplay");
+    if (!env) throw new Error('environment "alwaysReplay" did not start');
+    const key = "pause-project-dedup-test";
+
+    const first = await callIngressWithIdempotencyKey(env.baseUrl(), "pause_project", key, {
+      caller: SYSTEM,
+      args: { teamKey: "BDS", paused: true },
+    });
+    expect(first.status).toBe(200);
+    const firstBody = first.body as { content: Array<{ type: string; text: string }> };
+    expect(JSON.parse(firstBody.content[0].text)).toEqual({ status: 200, body: { updated: true, paused: true } });
+
+    // Same key, opposite `paused` value — if this ran pauseProjectAction again the mapping
+    // would flip back to false; instead Restate returns the first call's cached result and
+    // the second `args` are never seen by the handler.
+    const second = await callIngressWithIdempotencyKey(env.baseUrl(), "pause_project", key, {
+      caller: SYSTEM,
+      args: { teamKey: "BDS", paused: false },
+    });
+    const secondBody = second.body as { content: Array<{ type: string; text: string }> };
+    expect(JSON.parse(secondBody.content[0].text)).toEqual({ status: 200, body: { updated: true, paused: true } });
+
+    expect(getMappings().BDS?.paused).toBe(true);
+  });
+
+  // Runs only against alwaysReplay: the disableRetries variant is built to fail a throwing
+  // handler immediately (its own docstring above), so it cannot demonstrate a retry
+  // succeeding — see idempotentTools' comment for why this bypasses tool() to prove it.
+  it(
+    "throws_once_then_succeeds: Restate retries the raw handler until it succeeds, then a second call with the same idempotency key doesn't run it a third time",
+    async () => {
+      const env = environments.get("alwaysReplay");
+      if (!env) throw new Error('environment "alwaysReplay" did not start');
+      const key = "throws-once-dedup-test";
+
+      const first = await callIngressWithIdempotencyKey(env.baseUrl(), "throws_once_then_succeeds", key, {}, "idempotentTools");
+      expect(first.status).toBe(200);
+      expect(first.body).toEqual({ attempt: 2 });
+      expect(idempotentAttempts).toBe(2);
+
+      const second = await callIngressWithIdempotencyKey(env.baseUrl(), "throws_once_then_succeeds", key, {}, "idempotentTools");
+      expect(second.body).toEqual({ attempt: 2 });
+      expect(idempotentAttempts).toBe(2);
+    },
+    30_000,
+  );
 });

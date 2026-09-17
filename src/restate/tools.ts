@@ -27,6 +27,16 @@ import { runKgRefreshPreflight, getActiveKgRefresh } from "../kg-refresh.js";
 import { getOrchestratorSettings } from "../orchestrator-settings.js";
 import { getIssueReportCard, getFleetReport } from "../report-card.js";
 import { getDeployPosture } from "../deploy-posture.js";
+import {
+  setRunnerModeAction,
+  pauseProjectAction,
+  upsertMappingAction,
+  triggerWorkflowSyncAction,
+  clearDedupEntryAction,
+  type AdminConfig,
+  type UpsertMappingBody,
+} from "../admin.js";
+import { providerConfigFromEnv, ProviderRegistry } from "../providers/index.js";
 
 const CallerSchema = z.object({
   kind: z.enum(["human", "system"]),
@@ -79,6 +89,12 @@ export type WireInput<I extends z.ZodType> = z.infer<ReturnType<typeof wireInput
  * `ctx.sleep()`/`ctx.call()`/`ctx.get()` across a not-yet-resolved journal entry, or a
  * dropped connection) is not a handler error — `restate.internal.isSuspendedError` detects
  * it and it is rethrown unconverted so the SDK can suspend and resume the invocation.
+ *
+ * A `role: "admin"` tool is a declared write (ADR 015): every call to one, allowed or
+ * refused, is logged here — inside the wrapper, not the `/mcp` adapter — so a call that
+ * reaches a handler through `POST /api/tools/<name>` or `callToolAsSystem` (AII-712),
+ * which never passes through the adapter, is still audited. `WRITE_TOOLS` in `src/mcp.ts`
+ * used to be the only place this line was written (AII-713 retired it).
  */
 export function tool<I extends z.ZodType>(
   opts: ToolOptions<I>,
@@ -94,19 +110,30 @@ export function tool<I extends z.ZodType>(
     },
     async (ctx: restate.Context, input: WireInput<I>): Promise<ToolResponse> => {
       const name = ctx.request().target.handler;
+      const audit = (result: "forbidden" | "ok" | "error"): void => {
+        if (opts.role !== "admin") return;
+        const actor = input.caller.email ?? "system";
+        console.log(
+          `[mcp] write tool=${name} actor=${actor} role=${input.caller.role ?? "null"} result=${result} kind=${input.caller.kind}`,
+        );
+      };
       if (!roleAllows(input.caller.role, opts.role)) {
+        audit("forbidden");
         return {
           isError: true,
           content: [{ type: "text", text: `forbidden: ${name} requires the ${opts.role} role` }],
         };
       }
       try {
-        return await handler(ctx, input);
+        const result = await handler(ctx, input);
+        audit(result.isError ? "error" : "ok");
+        return result;
       } catch (err) {
         if (restate.internal.isSuspendedError(err)) {
           throw err;
         }
         const message = err instanceof Error ? err.message : String(err);
+        audit("error");
         return {
           isError: true,
           content: [{ type: "text", text: `${name} failed: ${message}` }],
@@ -396,6 +423,212 @@ export const kgNeighbors = kgTool("kg_neighbors");
 export const kgPath = kgTool("kg_path");
 export const kgProvenance = kgTool("kg_provenance");
 
+// ---- Writes (AII-713): moved verbatim off WRITE_TOOLS in src/mcp.ts. Each admin action
+// call, its args validation, and its status-to-text mapping are unchanged — only the caller
+// (this handler, reached via /mcp, POST /api/tools/<name>, or callToolAsSystem) and the
+// audit line (now in tool()'s wrapper, above) moved. `docs/adr/015-...md` amendment.
+
+/**
+ * The `AdminConfig` subset the five non-kg-refresh writes need, re-derived from process.env
+ * on every call rather than injected — the same "no per-request injection" tradeoff
+ * getDeployPostureTool and getTenantHealth already make (both comment on it above). This is
+ * deliberately *not* the orchestrator's own `loadConfig()` (src/index.ts): that function logs
+ * boot warnings and configures OAuth/Linear auth as a side effect and must run exactly once.
+ */
+function mcpAdminConfig(): AdminConfig {
+  return {
+    adminAccessCode: process.env.ADMIN_ACCESS_CODE || null,
+    flySessionsToken: process.env.FLY_SESSIONS_TOKEN || null,
+    flySessionsApp: process.env.FLY_SESSIONS_APP || getOrchestratorSettings().flySessionsApp,
+    flySessionsRegion: process.env.FLY_SESSIONS_REGION || getOrchestratorSettings().flySessionsRegion,
+    githubAppId: process.env.GITHUB_APP_ID ?? "",
+    githubAppPrivateKey: process.env.GITHUB_APP_PRIVATE_KEY ?? "",
+    notifyWebhookUrl: process.env.NOTIFY_WEBHOOK_URL || null,
+    kgSourceRepo: readKgSourceRepo(process.env.KG_SOURCE_REPO),
+  };
+}
+
+// One registry for add_project's upsertMappingAction call, built the same way the orchestrator's
+// own boot-time registry is (src/index.ts) — env config plus a live getMappings() closure — and
+// kept as a module singleton so its per-provider caching (src/providers/registry.ts) isn't
+// discarded between calls.
+const providerRegistry = new ProviderRegistry(providerConfigFromEnv(), () => getMappings());
+
+export const TRIGGER_KG_REFRESH_DESCRIPTION =
+  "Trigger the KG refresh rail (admin role). Same handler as POST /api/kg/refresh: runs the credential preflight, then dispatches the refresh. Poll get_kg_status afterwards. dryRun=true runs the same runner job with kg-snapshot-push's push skipped — all guards run and the guard verdict plus per-part table are reported via get_kg_status, but nothing is pushed, no PR opens, and the served graph never changes. acceptNewBaseline=true downgrades the zero-shrink and 50%-shrink content guards to warnings for this one dispatch and pushes anyway — use only after reviewing a guard refusal's part table and confirming the shrink is an intentional reclassification, not data loss; the accepting identity's email is logged and written into the refresh PR's ### Baseline section.";
+
+export const triggerKgRefreshTool = tool(
+  {
+    description: TRIGGER_KG_REFRESH_DESCRIPTION,
+    input: z.object({
+      dryRun: z.boolean().optional().describe(
+        "Run the rail without pushing the snapshot or touching the served graph; reports the guard table via get_kg_status.",
+      ),
+      acceptNewBaseline: z.boolean().optional().describe(
+        "Push even though a tracked part (issue.nt/comment.nt) shrank or a part dropped below 50% of its previous size — a one-shot override of the zero-shrink guard, applied to this dispatch only.",
+      ),
+    }),
+    role: "admin",
+  },
+  async (_ctx, input): Promise<ToolResponse> => {
+    const handle = getActiveKgRefresh();
+    if (!handle) {
+      throw new Error("KG refresh is not configured");
+    }
+    const result = await handle.trigger({
+      dryRun: input.args.dryRun === true,
+      acceptNewBaseline: input.args.acceptNewBaseline === true,
+      actorEmail: input.caller.email ?? undefined,
+    });
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  },
+);
+
+export const SET_RUNNER_MODE_DESCRIPTION =
+  "Set the global runner mode (admin role). Same handler as POST /api/runner-mode: forces all new dispatches onto the given execution path.";
+
+export const setRunnerModeTool = tool(
+  {
+    description: SET_RUNNER_MODE_DESCRIPTION,
+    input: z.object({
+      mode: z.string().optional().describe(
+        "Global runner mode: default restores per-project modes, gha/fly force that execution path, shadow dispatches to both without acting on either result, local runs dispatches in local Docker (a developer-machine mode the admin UI does not offer). Validated by the same check as POST /api/runner-mode.",
+      ),
+    }),
+    role: "admin",
+  },
+  async (_ctx, input): Promise<ToolResponse> => {
+    if (typeof input.args.mode !== "string") {
+      return { content: [{ type: "text", text: JSON.stringify({ status: 400, body: { error: "mode is required" } }, null, 2) }] };
+    }
+    // The mode set is not repeated here: setRunnerModeAction validates with isRunnerMode, the
+    // same check POST /api/runner-mode runs, so the tool answers what the route answers.
+    const result = setRunnerModeAction(mcpAdminConfig(), { mode: input.args.mode });
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  },
+);
+
+export const PAUSE_PROJECT_DESCRIPTION =
+  "Pause or resume a project mapping (admin role). Same as the paused update of PATCH /api/mappings/<teamKey>.";
+
+export const pauseProjectTool = tool(
+  {
+    description: PAUSE_PROJECT_DESCRIPTION,
+    input: z.object({
+      teamKey: z.string().optional().describe("Team key of the mapping"),
+      paused: z.boolean().optional().describe("Whether dispatch for this project should be paused"),
+    }),
+    role: "admin",
+  },
+  async (_ctx, input): Promise<ToolResponse> => {
+    if (typeof input.args.teamKey !== "string" || !input.args.teamKey) {
+      return { content: [{ type: "text", text: JSON.stringify({ status: 400, body: { error: "teamKey is required" } }, null, 2) }] };
+    }
+    if (typeof input.args.paused !== "boolean") {
+      return { content: [{ type: "text", text: JSON.stringify({ status: 400, body: { error: "paused is required" } }, null, 2) }] };
+    }
+    const result = pauseProjectAction(input.args.teamKey, input.args.paused);
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  },
+);
+
+export const ADD_PROJECT_DESCRIPTION =
+  "Create or update a project mapping (admin role). Same as POST /api/mappings, the mapping upsert behind the admin UI's New project stepper.";
+
+export const addProjectTool = tool(
+  {
+    description: ADD_PROJECT_DESCRIPTION,
+    input: z.object({
+      teamKey: z.string().optional().describe("Team key, e.g. the Linear team key or Jira project key"),
+      owner: z.string().optional().describe("GitHub repo owner/org"),
+      repo: z.string().optional().describe("GitHub repo name"),
+      defaultBranch: z.string().optional().describe("Base branch PRs are opened against"),
+      workflowFile: z.string().optional(),
+      maxInProgressAiIssues: z.number().optional(),
+      executionMode: z.enum(["github-actions", "fly-machines"]).optional(),
+      sessionMode: z.enum(["autonomous", "interactive", "hybrid"]).optional(),
+      machineCpus: z.number().optional(),
+      machineMemoryMb: z.number().optional(),
+      planningEnabled: z.boolean().optional(),
+      planningWorkflowFile: z.string().optional(),
+      autoApprovePlans: z.boolean().optional(),
+      autoMerge: z.boolean().optional(),
+      extraEnv: z.record(z.string(), z.string()).optional().describe("Passed through to the model process; visible to the agent"),
+      provider: z.enum(["anthropic", "bedrock"]).optional(),
+      awsRegion: z.string().optional().describe("Required when provider is 'bedrock'"),
+      ticketingProvider: z.string().optional(),
+      ticketingConfig: z.record(z.string(), z.unknown()).optional(),
+      paused: z.boolean().optional(),
+      maxTurns: z.number().optional(),
+      maxIterations: z.number().optional(),
+      maxJobMinutes: z.number().optional(),
+      branchPrefix: z.string().optional(),
+      skillsRepo: z.string().optional(),
+      referenceRepos: z.array(z.unknown()).optional(),
+      sensitiveAddPatterns: z.union([z.string(), z.array(z.string())]).optional().describe("String or array of glob strings"),
+      sensitiveAllowPatterns: z.union([z.string(), z.array(z.string())]).optional().describe("String or array of glob strings"),
+      dependencyTokenScope: z.enum(["installation"]).optional(),
+      reviewers: z.array(z.object({
+        id: z.string(),
+        gates: z.boolean(),
+        maxTurns: z.number().int().min(1).max(200).optional().describe(
+          "Optional per-reviewer turn cap. Omit to inherit the reviewer default or global limit.",
+        ),
+      })).optional().describe(
+        "Which reviewers run on this project's PRs. Omit to keep the stored value; pass null to reset to the default (gap-analysis and code-review, both gating).",
+      ),
+    }),
+    role: "admin",
+  },
+  async (_ctx, input): Promise<ToolResponse> => {
+    // teamKey/owner/repo/defaultBranch are validated by upsertMappingAction itself (the same
+    // 400 text) — no separate pre-check here, unlike the other four writes, whose actions
+    // don't validate their own required fields.
+    const result = upsertMappingAction(input.args as UpsertMappingBody, mcpAdminConfig(), providerRegistry);
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  },
+);
+
+export const TRIGGER_WORKFLOW_SYNC_DESCRIPTION =
+  "Trigger a workflow-template sync for a project (admin role). Same as POST /api/mappings/<teamKey>/sync-workflows.";
+
+export const triggerWorkflowSyncTool = tool(
+  {
+    description: TRIGGER_WORKFLOW_SYNC_DESCRIPTION,
+    input: z.object({
+      teamKey: z.string().optional().describe("Team key of the mapping"),
+    }),
+    role: "admin",
+  },
+  async (_ctx, input): Promise<ToolResponse> => {
+    if (typeof input.args.teamKey !== "string" || !input.args.teamKey) {
+      return { content: [{ type: "text", text: JSON.stringify({ status: 400, body: { error: "teamKey is required" } }, null, 2) }] };
+    }
+    const result = triggerWorkflowSyncAction(mcpAdminConfig(), input.args.teamKey);
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  },
+);
+
+export const CLEAR_DISPATCH_DEDUP_DESCRIPTION =
+  "Clear a dedup entry so the issue can be re-dispatched (admin role). Same as DELETE /api/dedup/<issueId>.";
+
+export const clearDispatchDedupTool = tool(
+  {
+    description: CLEAR_DISPATCH_DEDUP_DESCRIPTION,
+    input: z.object({
+      issueId: z.string().optional().describe("The tracker issue id (not the human identifier) of the dedup entry"),
+    }),
+    role: "admin",
+  },
+  async (_ctx, input): Promise<ToolResponse> => {
+    if (typeof input.args.issueId !== "string" || !input.args.issueId) {
+      return { content: [{ type: "text", text: JSON.stringify({ status: 400, body: { error: "issueId is required" } }, null, 2) }] };
+    }
+    const result = clearDedupEntryAction(input.args.issueId);
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  },
+);
+
 export const orchestratorTools = restate.service({
   name: "orchestratorTools",
   handlers: {
@@ -414,5 +647,11 @@ export const orchestratorTools = restate.service({
     kg_neighbors: kgNeighbors,
     kg_path: kgPath,
     kg_provenance: kgProvenance,
+    trigger_kg_refresh: triggerKgRefreshTool,
+    set_runner_mode: setRunnerModeTool,
+    pause_project: pauseProjectTool,
+    add_project: addProjectTool,
+    trigger_workflow_sync: triggerWorkflowSyncTool,
+    clear_dispatch_dedup: clearDispatchDedupTool,
   },
 });

@@ -102,6 +102,14 @@ export type CallToolResult =
 export interface CallToolDeps {
   ingressBaseUrl?: string;
   fetchImpl?: typeof fetch;
+  /**
+   * Restate's own idempotency key (https://docs.restate.dev/operate/invocation#invoke-a-handler-idempotently),
+   * sent as the `idempotency-key` header. Restate scopes it by (service, handler, key), so a
+   * second call with the same key attaches to the first invocation's result instead of running
+   * the handler again — src/mcp.ts sets this for the six write tools only (AII-713); a read
+   * call never passes one.
+   */
+  idempotencyKey?: string;
 }
 
 /**
@@ -128,7 +136,10 @@ export async function callTool(
   try {
     response = await fetchImpl(`${ingressBaseUrl}/${ORCHESTRATOR_TOOLS_SERVICE}/${encodeURIComponent(name)}`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        ...(deps.idempotencyKey ? { "idempotency-key": deps.idempotencyKey } : {}),
+      },
       body: JSON.stringify({ caller, args }),
     });
   } catch {

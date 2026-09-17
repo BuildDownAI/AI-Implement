@@ -6,15 +6,36 @@
 // coverage through a real ingress/admin API lives in tools.restate.test.ts.
 import * as restate from "@restatedev/restate-sdk";
 import { z } from "zod";
-import { describe, expect, it, vi } from "vitest";
-import { tool, listProjects, kgPath, kgHybridSearch, getKgStatusTool, getIssueReportCardTool, getFleetReportTool } from "../restate/tools.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  tool,
+  listProjects,
+  kgPath,
+  kgHybridSearch,
+  getKgStatusTool,
+  getIssueReportCardTool,
+  getFleetReportTool,
+  triggerKgRefreshTool,
+  setRunnerModeTool,
+  pauseProjectTool,
+  addProjectTool,
+  triggerWorkflowSyncTool,
+  clearDispatchDedupTool,
+} from "../restate/tools.js";
 import { discoverTools, callTool, callToolAsSystem, toolCatalog } from "../restate/tools-client.js";
 import type { Caller } from "../mcp-identity.js";
 import { setKgMemoryProvider } from "../kg-provider.js";
 import type { MemoryProvider } from "../kg-provider.js";
-import { setActiveKgRefresh } from "../kg-refresh.js";
+import { setActiveKgRefresh, type KgRefreshHandle } from "../kg-refresh.js";
 import { getMappings } from "../config.js";
 import { getIssueReportCard, getFleetReport } from "../report-card.js";
+import {
+  setRunnerModeAction,
+  pauseProjectAction,
+  upsertMappingAction,
+  triggerWorkflowSyncAction,
+  clearDedupEntryAction,
+} from "../admin.js";
 
 vi.mock("../report-card.js", () => ({
   getIssueReportCard: vi.fn(),
@@ -24,6 +45,17 @@ vi.mock("../report-card.js", () => ({
 vi.mock("../config.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../config.js")>()),
   getMappings: vi.fn(),
+}));
+
+// The five non-kg-refresh writes call these action functions verbatim (AII-713) — mocked
+// wholesale (no importOriginal) since tools.ts only imports these five names from admin.ts
+// and nothing here needs the rest of that module's (much heavier) real behaviour.
+vi.mock("../admin.js", () => ({
+  setRunnerModeAction: vi.fn(),
+  pauseProjectAction: vi.fn(),
+  upsertMappingAction: vi.fn(),
+  triggerWorkflowSyncAction: vi.fn(),
+  clearDedupEntryAction: vi.fn(),
 }));
 
 function fakeContext(handlerName: string): restate.Context {
@@ -106,6 +138,67 @@ describe("tool()", () => {
     expect(result).toEqual({
       isError: true,
       content: [{ type: "text", text: "my_tool failed: boom" }],
+    });
+  });
+
+  // ---- AII-713: the audit line moved from src/mcp.ts's adapter into this wrapper, so it is
+  // written for every entry point (POST /api/tools/<name>, callToolAsSystem) a role: "admin"
+  // tool is reached through, not only a call that happens to go through /mcp.
+  describe("audit logging (AII-713)", () => {
+    const ADMIN: Caller = { kind: "human", email: "admin@example.com", role: "admin" };
+
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    it("logs one line for a role: \"admin\" tool call that succeeds", async () => {
+      const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+      const handlerBody = vi.fn(async () => ({ content: [{ type: "text", text: "done" }] }));
+      const myWrite = tool({ description: "d", input: z.object({}), role: "admin" }, handlerBody);
+
+      await myWrite(fakeContext("my_write"), { caller: ADMIN, args: {} });
+
+      expect(logSpy).toHaveBeenCalledWith(
+        "[mcp] write tool=my_write actor=admin@example.com role=admin result=ok kind=human",
+      );
+    });
+
+    it("logs a forbidden line without invoking the handler", async () => {
+      const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+      const handlerBody = vi.fn(async () => ({ content: [{ type: "text", text: "done" }] }));
+      const myWrite = tool({ description: "d", input: z.object({}), role: "admin" }, handlerBody);
+
+      await myWrite(fakeContext("my_write"), { caller: HUMAN_USER, args: {} });
+
+      expect(handlerBody).not.toHaveBeenCalled();
+      expect(logSpy).toHaveBeenCalledWith(
+        "[mcp] write tool=my_write actor=user@example.com role=user result=forbidden kind=human",
+      );
+    });
+
+    it("logs result=error for a caught throw, and actor=system for a null-email caller", async () => {
+      const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+      const handlerBody = vi.fn(async () => {
+        throw new Error("boom");
+      });
+      const myWrite = tool({ description: "d", input: z.object({}), role: "admin" }, handlerBody);
+
+      await myWrite(fakeContext("my_write"), { caller: SYSTEM_ADMIN, args: {} });
+
+      expect(logSpy).toHaveBeenCalledWith(
+        "[mcp] write tool=my_write actor=system role=admin result=error kind=system",
+      );
+    });
+
+    it("never logs for a role: \"user\" tool, success or refusal", async () => {
+      const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+      const handlerBody = vi.fn(async () => ({ content: [{ type: "text", text: "done" }] }));
+      const myRead = tool({ description: "d", input: z.object({}), role: "user" }, handlerBody);
+
+      await myRead(fakeContext("my_read"), { caller: HUMAN_USER, args: {} });
+      await myRead(fakeContext("my_read"), { caller: NO_ROLE, args: {} });
+
+      expect(logSpy).not.toHaveBeenCalled();
     });
   });
 });
@@ -425,5 +518,128 @@ describe("get_issue_report_card and get_fleet_report thread their arguments (AII
     expect(Object.keys(JSON.parse(withDays.content[0].text)).sort()).toEqual(["byRepo", "escapeRate", "eventualPct", "oneShotPct", "runaways"]);
     await getFleetReportTool(fakeContext("get_fleet_report"), { caller: system, args: {} });
     expect(getFleetReport).toHaveBeenLastCalledWith({ days: undefined });
+  });
+});
+
+// ---- The six writes AII-713 moved off WRITE_TOOLS in src/mcp.ts. Each action call, its args
+// validation, and its status-to-text mapping are unchanged — see mcp.test.ts for the same
+// cases exercised through the /mcp adapter, and tools.restate.test.ts for the idempotency
+// scenario and the forbidden-role case over a real ingress.
+describe("migrated write handlers (AII-713)", () => {
+  const admin: Caller = SYSTEM_ADMIN;
+
+  afterEach(() => {
+    setActiveKgRefresh(null);
+  });
+
+  describe("trigger_kg_refresh", () => {
+    it("throws \"KG refresh is not configured\" when no handle is active", async () => {
+      const result = await triggerKgRefreshTool(fakeContext("trigger_kg_refresh"), { caller: admin, args: {} });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("KG refresh is not configured");
+    });
+
+    it("forwards dryRun, acceptNewBaseline, and the caller's email to the active handle and returns its result verbatim", async () => {
+      const triggerMock = vi.fn(async () => ({ status: 202, body: { accepted: true } }));
+      setActiveKgRefresh({ trigger: triggerMock } as unknown as KgRefreshHandle);
+      const result = await triggerKgRefreshTool(fakeContext("trigger_kg_refresh"), {
+        caller: { kind: "human", email: "user@example.com", role: "admin" },
+        args: { dryRun: true, acceptNewBaseline: true },
+      });
+      expect(triggerMock).toHaveBeenCalledWith({ dryRun: true, acceptNewBaseline: true, actorEmail: "user@example.com" });
+      expect(JSON.parse(result.content[0].text)).toEqual({ status: 202, body: { accepted: true } });
+    });
+
+    it("defaults dryRun and acceptNewBaseline to false when omitted, and actorEmail to undefined for a null-email caller", async () => {
+      const triggerMock = vi.fn(async () => ({ status: 202, body: {} }));
+      setActiveKgRefresh({ trigger: triggerMock } as unknown as KgRefreshHandle);
+      await triggerKgRefreshTool(fakeContext("trigger_kg_refresh"), { caller: admin, args: {} });
+      expect(triggerMock).toHaveBeenCalledWith({ dryRun: false, acceptNewBaseline: false, actorEmail: undefined });
+    });
+  });
+
+  describe("set_runner_mode", () => {
+    it("returns an embedded 400 and never calls the action when mode is missing", async () => {
+      const result = await setRunnerModeTool(fakeContext("set_runner_mode"), { caller: admin, args: {} });
+      expect(result.isError).toBeUndefined();
+      expect(JSON.parse(result.content[0].text)).toEqual({ status: 400, body: { error: "mode is required" } });
+      expect(setRunnerModeAction).not.toHaveBeenCalled();
+    });
+
+    it("calls setRunnerModeAction with the parsed mode and returns its result verbatim, whatever the status", async () => {
+      (setRunnerModeAction as ReturnType<typeof vi.fn>).mockReturnValue({ status: 400, body: { error: "mode must be one of: default, gha, fly, local, shadow" } });
+      const result = await setRunnerModeTool(fakeContext("set_runner_mode"), { caller: admin, args: { mode: "bogus" } });
+      expect(setRunnerModeAction).toHaveBeenCalledWith(expect.any(Object), { mode: "bogus" });
+      expect(result.isError).toBeUndefined();
+      expect(JSON.parse(result.content[0].text)).toEqual({ status: 400, body: { error: "mode must be one of: default, gha, fly, local, shadow" } });
+    });
+  });
+
+  describe("pause_project", () => {
+    it("returns an embedded 400 and never calls the action when teamKey is missing", async () => {
+      const result = await pauseProjectTool(fakeContext("pause_project"), { caller: admin, args: { paused: true } });
+      expect(JSON.parse(result.content[0].text)).toEqual({ status: 400, body: { error: "teamKey is required" } });
+      expect(pauseProjectAction).not.toHaveBeenCalled();
+    });
+
+    it("returns an embedded 400 and never calls the action when paused is missing", async () => {
+      const result = await pauseProjectTool(fakeContext("pause_project"), { caller: admin, args: { teamKey: "AII" } });
+      expect(JSON.parse(result.content[0].text)).toEqual({ status: 400, body: { error: "paused is required" } });
+      expect(pauseProjectAction).not.toHaveBeenCalled();
+    });
+
+    it("calls pauseProjectAction with teamKey and paused, returning its result verbatim", async () => {
+      (pauseProjectAction as ReturnType<typeof vi.fn>).mockReturnValue({ status: 200, body: { updated: true, paused: true } });
+      const result = await pauseProjectTool(fakeContext("pause_project"), { caller: admin, args: { teamKey: "AII", paused: true } });
+      expect(pauseProjectAction).toHaveBeenCalledWith("AII", true);
+      expect(JSON.parse(result.content[0].text)).toEqual({ status: 200, body: { updated: true, paused: true } });
+    });
+  });
+
+  describe("add_project", () => {
+    it("has no separate pre-validation — a partial args object reaches upsertMappingAction, whose own 400 comes back verbatim", async () => {
+      (upsertMappingAction as ReturnType<typeof vi.fn>).mockReturnValue({ status: 400, body: { error: "teamKey, owner, and repo are required" } });
+      const result = await addProjectTool(fakeContext("add_project"), { caller: admin, args: { teamKey: "AII" } });
+      expect(upsertMappingAction).toHaveBeenCalledWith({ teamKey: "AII" }, expect.any(Object), expect.any(Object));
+      expect(JSON.parse(result.content[0].text)).toEqual({ status: 400, body: { error: "teamKey, owner, and repo are required" } });
+    });
+
+    it("on a full args set, calls upsertMappingAction and returns its success body verbatim", async () => {
+      (upsertMappingAction as ReturnType<typeof vi.fn>).mockReturnValue({ status: 202, body: { teamKey: "AII", syncJobId: 5 } });
+      const args = { teamKey: "AII", owner: "org", repo: "repo", defaultBranch: "main" };
+      const result = await addProjectTool(fakeContext("add_project"), { caller: admin, args });
+      expect(upsertMappingAction).toHaveBeenCalledWith(args, expect.any(Object), expect.any(Object));
+      expect(JSON.parse(result.content[0].text)).toEqual({ status: 202, body: { teamKey: "AII", syncJobId: 5 } });
+    });
+  });
+
+  describe("trigger_workflow_sync", () => {
+    it("returns an embedded 400 and never calls the action when teamKey is missing", async () => {
+      const result = await triggerWorkflowSyncTool(fakeContext("trigger_workflow_sync"), { caller: admin, args: {} });
+      expect(JSON.parse(result.content[0].text)).toEqual({ status: 400, body: { error: "teamKey is required" } });
+      expect(triggerWorkflowSyncAction).not.toHaveBeenCalled();
+    });
+
+    it("calls triggerWorkflowSyncAction with teamKey, returning its result verbatim", async () => {
+      (triggerWorkflowSyncAction as ReturnType<typeof vi.fn>).mockReturnValue({ status: 202, body: { teamKey: "AII", syncJobId: 7 } });
+      const result = await triggerWorkflowSyncTool(fakeContext("trigger_workflow_sync"), { caller: admin, args: { teamKey: "AII" } });
+      expect(triggerWorkflowSyncAction).toHaveBeenCalledWith(expect.any(Object), "AII");
+      expect(JSON.parse(result.content[0].text)).toEqual({ status: 202, body: { teamKey: "AII", syncJobId: 7 } });
+    });
+  });
+
+  describe("clear_dispatch_dedup", () => {
+    it("returns an embedded 400 and never calls the action when issueId is missing", async () => {
+      const result = await clearDispatchDedupTool(fakeContext("clear_dispatch_dedup"), { caller: admin, args: {} });
+      expect(JSON.parse(result.content[0].text)).toEqual({ status: 400, body: { error: "issueId is required" } });
+      expect(clearDedupEntryAction).not.toHaveBeenCalled();
+    });
+
+    it("calls clearDedupEntryAction with issueId, returning its result verbatim", async () => {
+      (clearDedupEntryAction as ReturnType<typeof vi.fn>).mockReturnValue({ status: 200, body: { deleted: true } });
+      const result = await clearDispatchDedupTool(fakeContext("clear_dispatch_dedup"), { caller: admin, args: { issueId: "uuid-1" } });
+      expect(clearDedupEntryAction).toHaveBeenCalledWith("uuid-1");
+      expect(JSON.parse(result.content[0].text)).toEqual({ status: 200, body: { deleted: true } });
+    });
   });
 });

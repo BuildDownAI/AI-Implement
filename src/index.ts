@@ -27,16 +27,7 @@ import { decideAvailabilityAction, getDeployPolicy, getLastActedCommit, setLastA
 import { canSelfDeploy, makeStartDeploy, readKgSourceRepo, parseKgSourceRepo } from "./deploy.js";
 import { remediateStuckJob, remediateFailedJob } from "./stuck-watchdog.js";
 import type { StuckWatchdogConfig } from "./stuck-watchdog.js";
-import {
-  handleAdminRequest,
-  setRunnerModeAction,
-  pauseProjectAction,
-  upsertMappingAction,
-  triggerWorkflowSyncAction,
-  clearDedupEntryAction,
-  type UpsertMappingBody,
-  type AdminConfig,
-} from "./admin.js";
+import { handleAdminRequest } from "./admin.js";
 import { initLogTable, appendLog, countPriorDispatches, completeOrphanedPlanningJobs, attachJobRunIdIfMissing, updateJobRunId, updateJobStatus, updateJobPrUrl, updateJobMachineDetails, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobById, getJobByMachineId, resetStuckAttempts, getRecentFailedRunUrls } from "./log.js";
 import { isParked, recordDispatchFailure, recordDispatchSuccess, shouldCountFailure, initDispatchBreakerTable } from "./dispatch-breaker.js";
 import type { Job, JobStatus } from "./log.js";
@@ -3962,40 +3953,18 @@ function startServer(
       }
     }
 
-    // MCP endpoint — OAuth bearer token authenticated
+    // MCP endpoint — OAuth bearer token authenticated. The six write tools used to be wired
+    // in here as bound closures over this request's config/registry; AII-713 moved them onto
+    // the orchestratorTools Restate service (src/restate/tools.ts), which re-derives its own
+    // AdminConfig/ProviderRegistry the same way the read handlers already did (AII-711) — see
+    // that file's mcpAdminConfig() and providerRegistry.
     if (pathname === "/mcp") {
-      const triggerKgRefreshFn = (dryRun?: boolean, acceptNewBaseline?: boolean, actorEmail?: string) =>
-        kgRefresh.trigger({ dryRun, acceptNewBaseline, actorEmail });
-      // Same AdminConfig shape the /admin routes build (line ~3908) — the five write
-      // tools below reuse the admin route's own action functions.
-      const mcpAdminConfig: AdminConfig = {
-        adminAccessCode: config.adminAccessCode,
-        flySessionsToken: config.flySessionsToken,
-        flySessionsApp: config.flySessionsApp,
-        flySessionsRegion: config.flySessionsRegion,
-        githubAppId: config.githubAppId,
-        githubAppPrivateKey: config.githubAppPrivateKey,
-        kgSourceRepo: config.kgSourceRepo,
-        notifyWebhookUrl: config.notifyWebhookUrl,
-      };
-      const setRunnerModeFn = (patch: { mode?: string }) => setRunnerModeAction(mcpAdminConfig, patch);
-      const pauseProjectFn = (teamKey: string, paused: boolean) => pauseProjectAction(teamKey, paused);
-      const addProjectFn = (body: Record<string, unknown>) =>
-        upsertMappingAction(body as UpsertMappingBody, mcpAdminConfig, registry);
-      const triggerWorkflowSyncFn = (teamKey: string) => triggerWorkflowSyncAction(mcpAdminConfig, teamKey);
-      const clearDispatchDedupFn = (issueId: string) => clearDedupEntryAction(issueId);
       handleMcpRequest(
         req,
         res,
         memoryProvider,
         config.oauthRedirectBaseUrl,
         memoryProviderDiagnostic,
-        triggerKgRefreshFn,
-        setRunnerModeFn,
-        pauseProjectFn,
-        addProjectFn,
-        triggerWorkflowSyncFn,
-        clearDispatchDedupFn,
       ).catch((err) => {
         console.error("[mcp] Unhandled error:", err);
         if (!res.headersSent) {
