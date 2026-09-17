@@ -3613,8 +3613,10 @@ describe("POST /api/tools/<name>", () => {
 
   // The same caller-supplied contract as /mcp's tools/call params._meta.idempotencyKey
   // (AII-719): the route never derives a key, so a CI script that wants a retry deduped
-  // states the key itself via the Idempotency-Key header.
-  it("forwards an Idempotency-Key header to callTool's deps", async () => {
+  // states the key itself via the Idempotency-Key header. The route scopes it by the
+  // session's identity before it reaches Restate (scopeIdempotencyKey, src/mcp.ts); an
+  // access-code session has no email, so its prefix is the literal "session".
+  it("forwards an Idempotency-Key header to callTool's deps, scoped by the session identity with the caller's key as the suffix", async () => {
     const token = await login("secret");
     let capturedDeps: { idempotencyKey?: string } | undefined;
     await toolRequest(
@@ -3626,7 +3628,7 @@ describe("POST /api/tools/<name>", () => {
       "set_runner_mode",
       { "idempotency-key": "abc" },
     );
-    expect(capturedDeps).toEqual({ idempotencyKey: "abc" });
+    expect(capturedDeps).toEqual({ idempotencyKey: "session:abc" });
   });
 
   it("forwards no idempotency key when the header is absent", async () => {

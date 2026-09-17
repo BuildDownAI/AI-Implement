@@ -2727,10 +2727,27 @@ describe("write idempotency key names one request, not one JSON-RPC id (AII-719,
     expect(idempotencyKeys()).toEqual([undefined, undefined]);
   });
 
-  it("same _meta.idempotencyKey: two calls both carry that exact value", async () => {
+  // The forwarded key is the caller's identity, then the caller's own key (scopeIdempotencyKey):
+  // Restate scopes a key by (service, handler, key) with no notion of caller, so without the
+  // prefix two callers reusing one literal key would attach to each other's cached result.
+  it("same caller, same _meta.idempotencyKey: both calls forward the same scoped key, with the caller's key as the suffix", async () => {
     await setRunnerModeCall(7, "fly", "retry-abc");
     await setRunnerModeCall(7, "default", "retry-abc");
-    expect(idempotencyKeys()).toEqual(["retry-abc", "retry-abc"]);
+    expect(idempotencyKeys()).toEqual(["user@example.com:retry-abc", "user@example.com:retry-abc"]);
+  });
+
+  it("two callers with different identities supplying the same _meta.idempotencyKey forward different keys", async () => {
+    await setRunnerModeCall(7, "fly", "retry-abc");
+    // callMcp sets the verifyMcpToken default to user@example.com on every call; a queued
+    // once-value takes precedence, so the second call resolves as a different identity.
+    (mcpOauth.verifyMcpToken as ReturnType<typeof vi.fn>).mockReturnValueOnce({
+      ok: true,
+      identity: { kind: "human", email: "other@example.com", sub: "sub2", provider: "google", clientId: null },
+      token: FIXTURE_TOKEN_INFO,
+    });
+    await setRunnerModeCall(7, "fly", "retry-abc");
+    expect(toolsClientMock.callTool).toHaveBeenCalledTimes(2);
+    expect(idempotencyKeys()).toEqual(["user@example.com:retry-abc", "other@example.com:retry-abc"]);
   });
 
   it("a key that fails the shape check answers -32602 and never reaches callTool", async () => {

@@ -4,7 +4,7 @@ import { recordAuthEvent, type AuthEventCause } from "./mcp-auth-events.js";
 import { recheckIdentity, type AccessRole } from "./access-entries.js";
 import { type MemoryProvider, KG_TOOL_CAPABILITY } from "./kg-provider.js";
 import type { Caller } from "./mcp-identity.js";
-import { discoverTools, callTool, IDEMPOTENCY_KEY_SHAPE } from "./restate/tools-client.js";
+import { discoverTools, callTool } from "./restate/tools-client.js";
 
 interface JsonRpcRequest {
   jsonrpc?: string;
@@ -47,17 +47,37 @@ const GET_SESSION_IDENTITY_TOOL = {
 // live on the handler itself (src/restate/tools.ts), not in this file — see
 // docs/adr/015-mcp-reads-open-writes-declared.md.
 // `params._meta.idempotencyKey` (AII-719, corrected 2026-09-17 on the AII-687 gate) is
-// checked against IDEMPOTENCY_KEY_SHAPE (imported above from src/restate/tools-client.ts,
-// shared with src/admin.ts so the two doors cannot drift) and forwarded to callTool verbatim.
-// `/mcp` is stateless — it has no session id and MCP clients restart their JSON-RPC ids on
-// every connection — so nothing in a request names "one connection's attempt at this call"
-// except what the caller states explicitly. A key derived from the access token's issue time
-// and the JSON-RPC id (the prior design) let a second connection's write inside the same
-// token lifetime collide with the first: proven live with `set_runner_mode` (a later
-// connection's `id: 7` answered the first connection's cached result and changed nothing). A
-// derived key protects the wrong thing — a client retry of one call whose response was lost —
-// when MCP clients don't retry `tools/call` on their own; a repeat is a human or script
-// expressing a new intent unless they say otherwise via this field.
+// checked against IDEMPOTENCY_KEY_SHAPE (below, shared with src/admin.ts so the two doors
+// cannot drift), scoped by the caller's identity with scopeIdempotencyKey (below), and then
+// forwarded to callTool. `/mcp` is stateless — it has no session id and MCP clients restart
+// their JSON-RPC ids on every connection — so nothing in a request names "one connection's
+// attempt at this call" except what the caller states explicitly. A key derived from the
+// access token's issue time and the JSON-RPC id (the prior design) let a second connection's
+// write inside the same token lifetime collide with the first: proven live with
+// `set_runner_mode` (a later connection's `id: 7` answered the first connection's cached
+// result and changed nothing). A derived key protects the wrong thing — a client retry of one
+// call whose response was lost — when MCP clients don't retry `tools/call` on their own; a
+// repeat is a human or script expressing a new intent unless they say otherwise via this field.
+
+/**
+ * Shape for a caller-supplied idempotency key (AII-719): the same check on both doors —
+ * `/mcp`'s `tools/call` (`params._meta.idempotencyKey`) and `POST /api/tools/<name>`'s
+ * `Idempotency-Key` header. It lives here, not in src/restate/tools-client.ts, because
+ * src/admin.ts may import Restate modules as types only (src/__tests__/restate-boundary.test.ts)
+ * and already imports RESTATE_WRITE_TOOL_NAMES from this file.
+ */
+export const IDEMPOTENCY_KEY_SHAPE = /^[A-Za-z0-9._:-]{1,128}$/;
+
+/**
+ * The key that reaches Restate: the caller's identity, then the caller's own key. Restate scopes
+ * a key by (service, handler, key) and has no notion of caller, so two callers that reuse one
+ * literal key for the same write would otherwise attach to each other's cached result and the
+ * second write would silently not run. The caller still names the request — its key is the
+ * suffix, unchanged — and the prefix only keeps one caller's keys apart from another's.
+ */
+export function scopeIdempotencyKey(callerId: string, supplied: string): string {
+  return `${callerId}:${supplied}`;
+}
 
 const RESTATE_TOOL_NAMES = new Set([
   "get_tenant_health",
@@ -265,9 +285,10 @@ export async function handleMcpRequest(
       const caller: Caller = { kind: identity.kind, email: identity.email, role };
       // A write carries an idempotency key only when the caller states one explicitly via
       // the MCP `_meta` extension point (see IDEMPOTENCY_KEY_SHAPE above) — the server never
-      // derives one. Reads ignore the field entirely: ignoring rather than validating it keeps
-      // a read tolerant of a client that sends `_meta.idempotencyKey` on every call regardless
-      // of tool kind.
+      // derives one, but it does scope the caller's key by the caller's identity
+      // (scopeIdempotencyKey above) so two callers cannot collide on one literal key. Reads
+      // ignore the field entirely: ignoring rather than validating it keeps a read tolerant of
+      // a client that sends `_meta.idempotencyKey` on every call regardless of tool kind.
       let idempotencyKey: string | undefined;
       if (RESTATE_WRITE_TOOL_NAMES.has(toolName)) {
         const meta = rpc.params?._meta;
@@ -281,7 +302,7 @@ export async function handleMcpRequest(
             });
             return;
           }
-          idempotencyKey = supplied;
+          idempotencyKey = scopeIdempotencyKey(identity.email ?? identity.clientId ?? "anonymous", supplied);
         }
       }
       const callResult = await callTool(toolName, toolArgs, caller, idempotencyKey ? { idempotencyKey } : undefined);
