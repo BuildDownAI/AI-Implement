@@ -56,6 +56,7 @@ import { listMachines, destroyMachine, listAppSecrets, setAppSecrets, unsetAppSe
 import type { TicketIssue, AIImplementSnapshot } from "./providers/types.js";
 import type { ProviderRegistry } from "./providers/registry.js";
 import { resolveInFlightSiblings, selectBlockers, selectFileOverlapDeferrals, getOrFetchPlanningContexts } from "./poll-selection.js";
+import { RESTATE_WRITE_TOOL_NAMES } from "./mcp.js";
 import { adminHtml } from "./admin-html.js";
 import {
   getOrchestratorSettings,
@@ -1692,6 +1693,15 @@ async function handleDeployTrigger(
 const TOOL_NAME_SHAPE = /^[a-z][a-z0-9_]{0,63}$/;
 
 /**
+ * Shape for a caller-supplied `Idempotency-Key` header — the same contract `/mcp`'s
+ * `tools/call` applies to `params._meta.idempotencyKey` (AII-719). Neither surface derives
+ * a key: a CI script that wants a retry deduped states the key itself. Only checked when
+ * the target tool is in `RESTATE_WRITE_TOOL_NAMES` (imported from `./mcp.js`) — a read tool
+ * ignores the header entirely, same as `/mcp` ignores `_meta.idempotencyKey` on a read.
+ */
+const IDEMPOTENCY_KEY_SHAPE = /^[A-Za-z0-9._:-]{1,128}$/;
+
+/**
  * POST /api/tools/<name> — the REST entry point to the tools service (AII-712), for a
  * caller such as CI that has an admin session but no MCP client. Same handlers, same
  * role assertion as /mcp's tools/call (`callTool`, `src/restate/tools-client.ts`); the
@@ -1722,6 +1732,18 @@ async function handleToolCall(
     json(res, 501, { error: "Tools service is not configured" });
     return;
   }
+  let idempotencyKey: string | undefined;
+  if (RESTATE_WRITE_TOOL_NAMES.has(toolName)) {
+    const idempotencyKeyHeader = req.headers["idempotency-key"];
+    const supplied = typeof idempotencyKeyHeader === "string" ? idempotencyKeyHeader : undefined;
+    if (supplied !== undefined) {
+      if (!IDEMPOTENCY_KEY_SHAPE.test(supplied)) {
+        json(res, 400, { error: "Idempotency-Key must match ^[A-Za-z0-9._:-]{1,128}$" });
+        return;
+      }
+      idempotencyKey = supplied;
+    }
+  }
   const raw = await readBody(req);
   let args: Record<string, unknown> = {};
   if (raw.trim()) {
@@ -1737,7 +1759,7 @@ async function handleToolCall(
   }
   const caller: Caller = { kind: "human", email: gate.identity?.email ?? null, role: gate.role };
   try {
-    const result = await deps.callTool(toolName, args, caller);
+    const result = await deps.callTool(toolName, args, caller, idempotencyKey ? { idempotencyKey } : undefined);
     if (result.status === "unavailable") {
       json(res, 503, { error: "restate-unavailable" });
       return;

@@ -3445,11 +3445,12 @@ describe("POST /api/tools/<name>", () => {
     body: unknown,
     deps: AdminModule.AdminDeps,
     toolName = "get_tenant_health",
+    extraHeaders: Record<string, string> = {},
   ): Promise<{ statusCode: number; body: string }> {
     const req = new MockRequest(
       `/api/tools/${toolName}`,
       "POST",
-      { authorization: `Bearer ${token}` },
+      { authorization: `Bearer ${token}`, ...extraHeaders },
       body === undefined ? undefined : JSON.stringify(body),
     );
     const res = new MockResponse();
@@ -3608,6 +3609,66 @@ describe("POST /api/tools/<name>", () => {
       callTool: async (_name, args) => { capturedArgs = args; return { status: "ok", content: [] }; },
     });
     expect(capturedArgs).toEqual({});
+  });
+
+  // The same caller-supplied contract as /mcp's tools/call params._meta.idempotencyKey
+  // (AII-719): the route never derives a key, so a CI script that wants a retry deduped
+  // states the key itself via the Idempotency-Key header.
+  it("forwards an Idempotency-Key header to callTool's deps", async () => {
+    const token = await login("secret");
+    let capturedDeps: { idempotencyKey?: string } | undefined;
+    await toolRequest(
+      token,
+      { args: {} },
+      {
+        callTool: async (_name, _args, _caller, deps) => { capturedDeps = deps; return { status: "ok", content: [] }; },
+      },
+      "set_runner_mode",
+      { "idempotency-key": "abc" },
+    );
+    expect(capturedDeps).toEqual({ idempotencyKey: "abc" });
+  });
+
+  it("forwards no idempotency key when the header is absent", async () => {
+    const token = await login("secret");
+    let capturedDeps: { idempotencyKey?: string } | undefined;
+    await toolRequest(token, { args: {} }, {
+      callTool: async (_name, _args, _caller, deps) => { capturedDeps = deps; return { status: "ok", content: [] }; },
+    });
+    expect(capturedDeps).toBeUndefined();
+  });
+
+  it("rejects an Idempotency-Key that fails the shape check with 400, without calling the tool", async () => {
+    const token = await login("secret");
+    const called = vi.fn();
+    const res = await toolRequest(
+      token,
+      { args: {} },
+      { callTool: async () => { called(); return { status: "ok", content: [] }; } },
+      "set_runner_mode",
+      { "idempotency-key": "has a space" },
+    );
+    expect(res.statusCode).toBe(400);
+    expect(called).not.toHaveBeenCalled();
+  });
+
+  // Mirrors /mcp's read-tool gate on RESTATE_WRITE_TOOL_NAMES: a read tool ignores a
+  // supplied Idempotency-Key silently rather than either erroring or forwarding it, since
+  // forwarding it would let a repeat of the same read return a stale cached answer.
+  it("ignores an Idempotency-Key header on a read tool, forwarding no idempotency key at all", async () => {
+    const token = await login("secret");
+    let capturedDeps: { idempotencyKey?: string } | undefined;
+    const res = await toolRequest(
+      token,
+      { args: {} },
+      {
+        callTool: async (_name, _args, _caller, deps) => { capturedDeps = deps; return { status: "ok", content: [] }; },
+      },
+      "get_tenant_health",
+      { "idempotency-key": "abc" },
+    );
+    expect(res.statusCode).toBe(200);
+    expect(capturedDeps).toBeUndefined();
   });
 });
 

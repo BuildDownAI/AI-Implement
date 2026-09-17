@@ -2,7 +2,7 @@ import { PassThrough, Writable } from "node:stream";
 import http from "node:http";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as restate from "@restatedev/restate-sdk";
-import { handleMcpRequest, writeIdempotencyKey } from "../mcp.js";
+import { handleMcpRequest } from "../mcp.js";
 import { SidecarMemoryProvider, sidecarHealth, sidecarHealthFields, setKgMemoryProvider } from "../kg-provider.js";
 import type { MemoryProvider, KgToolResult } from "../kg-provider.js";
 import { setActiveKgRefresh } from "../kg-refresh.js";
@@ -2675,45 +2675,87 @@ describe("handleMcpRequest", () => {
   });
 });
 
-describe("write idempotency key names one request, not one JSON-RPC id (AII-687 gate, 2026-09-17)", () => {
-  const issued = 1_700_000_000_000;
+describe("write idempotency key names one request, not one JSON-RPC id (AII-719, 2026-09-17)", () => {
+  // /mcp is stateless and MCP clients restart their JSON-RPC ids on every connection, so
+  // nothing in the request names "one connection's attempt at this call" except what the
+  // caller states explicitly via params._meta.idempotencyKey. The server never derives one.
+  const setRunnerModeCall = (id: number, mode: string, idempotencyKey?: string) =>
+    callMcp(
+      { authorization: "Bearer tok" },
+      true,
+      null,
+      BASE_URL,
+      "POST",
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id,
+        method: "tools/call",
+        params: {
+          name: "set_runner_mode",
+          arguments: { mode },
+          ...(idempotencyKey !== undefined ? { _meta: { idempotencyKey } } : {}),
+        },
+      }),
+    );
 
-  it("a retry — same client, same token, same id, same arguments — produces the same key", () => {
-    expect(writeIdempotencyKey("cli-1", issued, 7, { mode: "fly" })).toBe(writeIdempotencyKey("cli-1", issued, 7, { mode: "fly" }));
-  });
+  function idempotencyKeys(): (string | undefined)[] {
+    return (toolsClientMock.callTool as ReturnType<typeof vi.fn>).mock.calls.map(
+      (c: unknown[]) => (c[3] as { idempotencyKey?: string } | undefined)?.idempotencyKey,
+    );
+  }
 
-  it("the same id with different arguments produces a different key, so the later call runs", () => {
-    expect(writeIdempotencyKey("cli-1", issued, 7, { mode: "fly" })).not.toBe(writeIdempotencyKey("cli-1", issued, 7, { mode: "default" }));
-  });
-
-  it("the same id and arguments under a different access token (a new session) produces a different key", () => {
-    expect(writeIdempotencyKey("cli-1", issued, 7, {})).not.toBe(writeIdempotencyKey("cli-1", issued + 60_000, 7, {}));
-  });
-
-  it("two OAuth clients never share a key; a missing client id or JSON-RPC id is named, not blank", () => {
-    expect(writeIdempotencyKey("cli-1", issued, 7, {})).not.toBe(writeIdempotencyKey("cli-2", issued, 7, {}));
-    expect(writeIdempotencyKey(null, issued, undefined, undefined)).toMatch(/^no-client:1700000000000:no-id:[0-9a-f]{16}$/);
-  });
-
-  it("through the adapter: two set_runner_mode calls with the same id and different arguments reach callTool with different keys", async () => {
+  beforeEach(() => {
     mockRole("admin");
     (toolsClientMock.callTool as ReturnType<typeof vi.fn>).mockResolvedValue({ status: "ok", content: [{ type: "text", text: "{}" }] });
-    const post = (mode: string) =>
-      callMcp(
-        { authorization: "Bearer tok" },
-        true,
-        null,
-        BASE_URL,
-        "POST",
-        JSON.stringify({ jsonrpc: "2.0", id: 7, method: "tools/call", params: { name: "set_runner_mode", arguments: { mode } } }),
-      );
-    await post("fly");
-    await post("default");
-    await post("default");
-    const keys = (toolsClientMock.callTool as ReturnType<typeof vi.fn>).mock.calls.map((c: unknown[]) => (c[3] as { idempotencyKey: string }).idempotencyKey);
-    expect(keys).toHaveLength(3);
-    expect(keys[0]).not.toBe(keys[1]);
-    expect(keys[1]).toBe(keys[2]);
-    expect(keys[0]).toBe(writeIdempotencyKey(null, FIXTURE_TOKEN_INFO.issuedAt, 7, { mode: "fly" }));
+  });
+
+  it("no _meta.idempotencyKey: two calls with the same rpc id and arguments produce two dispatches, neither carrying a key", async () => {
+    await setRunnerModeCall(7, "fly");
+    await setRunnerModeCall(7, "fly");
+    expect(toolsClientMock.callTool).toHaveBeenCalledTimes(2);
+    expect(idempotencyKeys()).toEqual([undefined, undefined]);
+  });
+
+  it("same _meta.idempotencyKey: two calls both carry that exact value", async () => {
+    await setRunnerModeCall(7, "fly", "retry-abc");
+    await setRunnerModeCall(7, "default", "retry-abc");
+    expect(idempotencyKeys()).toEqual(["retry-abc", "retry-abc"]);
+  });
+
+  it("a key that fails the shape check answers -32602 and never reaches callTool", async () => {
+    const result = await setRunnerModeCall(7, "fly", "has a space");
+    expect(result.statusCode).toBe(200);
+    const parsed = JSON.parse(result.body);
+    expect(parsed.error.code).toBe(-32602);
+    expect(toolsClientMock.callTool).not.toHaveBeenCalled();
+  });
+
+  it("an empty or over-length key both fail the shape check", async () => {
+    const empty = await setRunnerModeCall(7, "fly", "");
+    expect(JSON.parse(empty.body).error.code).toBe(-32602);
+
+    const tooLong = await setRunnerModeCall(8, "fly", "a".repeat(129));
+    expect(JSON.parse(tooLong.body).error.code).toBe(-32602);
+
+    expect(toolsClientMock.callTool).not.toHaveBeenCalled();
+  });
+
+  it("a read tool ignores a supplied _meta.idempotencyKey — no error, no key forwarded", async () => {
+    const result = await callMcp(
+      { authorization: "Bearer tok" },
+      true,
+      null,
+      BASE_URL,
+      "POST",
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 9,
+        method: "tools/call",
+        params: { name: "get_runner_mode", arguments: {}, _meta: { idempotencyKey: "has a space" } },
+      }),
+    );
+    expect(result.statusCode).toBe(200);
+    expect(JSON.parse(result.body).error).toBeUndefined();
+    expect(toolsClientMock.callTool).toHaveBeenCalledWith("get_runner_mode", {}, expect.objectContaining({ kind: "human" }), undefined);
   });
 });
