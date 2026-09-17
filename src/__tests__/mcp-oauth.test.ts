@@ -763,6 +763,7 @@ function alwaysUnavailableAuthority() {
     issue: async () => ({ status: "unavailable" as const }),
     rotate: async () => ({ status: "unavailable" as const }),
     revokeFamily: async () => {},
+    describe: async () => ({ status: "unavailable" as const }),
   };
 }
 
@@ -1038,5 +1039,89 @@ describe("verifyMcpToken", () => {
     expect(result.ok && result.identity.email).toBe("ada@eudoxus.ai");
     expect(result.ok && result.identity.provider).toBe("google");
     expect(result.ok && result.identity.clientId).toBe(clientId);
+  });
+});
+
+// ---------- Unit: verifyMcpToken token health fields (AII-714) ----------
+
+describe("verifyMcpToken — token health fields (AII-714)", () => {
+  it("token.expiresAt equals the row's expires_at, and clientId/clientPath resolve for the minting client", async () => {
+    const { code, codeVerifier, clientId } = await fullFlow();
+    const { accessToken } = await exchangeCode(code, codeVerifier, clientId);
+
+    const row = dedup
+      .getDb()
+      .prepare("SELECT created_at, expires_at FROM mcp_tokens WHERE token = ?")
+      .get(accessToken) as { created_at: number; expires_at: number };
+    const result = mcpOauth.verifyMcpToken(accessToken);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.token.issuedAt).toBe(row.created_at);
+    expect(result.token.expiresAt).toBe(row.expires_at);
+    expect(result.token.clientId).toBe(clientId);
+    // registerClient() (the fullFlow() default) registers http://127.0.0.1:8080/callback — a loopback redirect.
+    expect(result.token.clientPath).toBe("loopback");
+  });
+
+  it("a fixture token issued 50 minutes ago reports a 50-minute age and a 10-minute-remaining expiry (fake clock, default 60-minute TTL)", () => {
+    const now = Date.now();
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    try {
+      const issuedAt = now - 50 * 60 * 1000;
+      const token = "fixture-token-aii-714";
+      dedup
+        .getDb()
+        .prepare(
+          "INSERT INTO mcp_tokens (token, email, sub, provider, created_at, expires_at, client_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .run(token, "ada@eudoxus.ai", "google|1", "google", issuedAt, issuedAt + mcpOauth.MCP_TOKEN_TTL_MS, "client-x");
+
+      const result = mcpOauth.verifyMcpToken(token);
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      expect(Date.now() - result.token.issuedAt).toBe(50 * 60 * 1000);
+      expect(result.token.expiresAt - Date.now()).toBe(10 * 60 * 1000);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+// ---------- Unit: getRefreshExpiry (AII-714) ----------
+//
+// Backs get_session_identity's `refresh` field: the live refresh-token expiry for a client
+// id, sourced from whichever RefreshAuthority is currently active. Unit-tested here against
+// SqliteRefreshAuthority (the suite's default, per the beforeEach note above) and against a
+// fake standing in for "the Operator/Restate-backed authority is unavailable" — no real
+// Restate ingress needed, matching the existing alwaysUnavailableAuthority() pattern.
+
+describe("getRefreshExpiry", () => {
+  it("returns null without calling the refresh authority when clientId is null", async () => {
+    const describeSpy = vi.fn();
+    mcpOauth.setRefreshAuthority({
+      issue: async () => ({ status: "unavailable" as const }),
+      rotate: async () => ({ status: "unavailable" as const }),
+      revokeFamily: async () => {},
+      describe: describeSpy,
+    });
+    await expect(mcpOauth.getRefreshExpiry(null)).resolves.toBeNull();
+    expect(describeSpy).not.toHaveBeenCalled();
+  });
+
+  it("returns the live refresh token's expiresAt for a client with a current refresh token", async () => {
+    const { code, codeVerifier, clientId } = await fullFlow();
+    await exchangeCode(code, codeVerifier, clientId);
+    const row = dedup
+      .getDb()
+      .prepare("SELECT expires_at FROM mcp_refresh_tokens WHERE client_id = ?")
+      .get(clientId) as { expires_at: number };
+
+    await expect(mcpOauth.getRefreshExpiry(clientId)).resolves.toBe(row.expires_at);
+  });
+
+  it("returns null — never throws — when the active refresh authority reports unavailable (the Operator/Restate-down case)", async () => {
+    mcpOauth.setRefreshAuthority(alwaysUnavailableAuthority());
+    await expect(mcpOauth.getRefreshExpiry("some-client")).resolves.toBeNull();
   });
 });

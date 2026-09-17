@@ -1,5 +1,5 @@
 import http from "node:http";
-import { verifyMcpToken, resolveClientPath } from "./mcp-oauth.js";
+import { verifyMcpToken, resolveClientPath, getRefreshExpiry } from "./mcp-oauth.js";
 import { recordAuthEvent, type AuthEventCause } from "./mcp-auth-events.js";
 import { recheckIdentity, type AccessRole } from "./access-entries.js";
 import { type MemoryProvider, KG_TOOL_CAPABILITY } from "./kg-provider.js";
@@ -230,7 +230,15 @@ export async function handleMcpRequest(
     const toolArgs = (rpc.params?.arguments as Record<string, unknown>) ?? {};
 
     if (toolName === "get_session_identity") {
-      const result = { kind: identity.kind, email: identity.email, provider: identity.provider, role };
+      const refreshExpiresAt = await getRefreshExpiry(identity.clientId);
+      const result = {
+        email: identity.email,
+        provider: identity.provider,
+        role,
+        kind: identity.kind,
+        token: verification.token,
+        refresh: refreshExpiresAt !== null ? { expiresAt: refreshExpiresAt } : null,
+      };
       json(res, 200, {
         jsonrpc: "2.0",
         id: rpc.id ?? null,

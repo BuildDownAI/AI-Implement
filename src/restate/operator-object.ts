@@ -25,7 +25,7 @@ import type { ObjectContext, ObjectSharedContext } from "@restatedev/restate-sdk
 import { getDb } from "../dedup.js";
 import { getEffectiveAllowlist, matchAccessEntry } from "../access-entries.js";
 import { recordAuthEvent, resolveClientPath, type AuthEventCause } from "../mcp-auth-events.js";
-import type { IssueInput, IssueOutcome, RefreshAuthority, RefreshInput, RefreshOutcome } from "../mcp-identity.js";
+import type { DescribeOutcome, IssueInput, IssueOutcome, RefreshAuthority, RefreshInput, RefreshOutcome } from "../mcp-identity.js";
 import { RESTATE_INGRESS_BIND_ADDRESS } from "./server.js";
 
 /** One tick past this and a presentation of the previous (just-rotated-away) hash is treated as replay. */
@@ -337,5 +337,14 @@ export class RestateRefreshAuthority implements RefreshAuthority {
     // One object per client id (AII-709) — the "family" this seam names is the whole
     // client's refresh state, so revoking it is the object's own `revoke` handler.
     await this.invoke(clientId, "revoke", {});
+  }
+
+  /** Backs `get_session_identity`'s `refresh` field (AII-714) — reads the object's own state via its shared `describe` handler, minting nothing and rotating nothing. */
+  async describe(clientId: string): Promise<DescribeOutcome> {
+    const result = await this.invoke<DescribeResult>(clientId, "describe", {});
+    if (result === "unavailable") {
+      return { status: "unavailable" };
+    }
+    return { status: "ok", expiresAt: result.expiresAt };
   }
 }

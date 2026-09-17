@@ -23,8 +23,8 @@ import { getProvider, listConfiguredProviders } from "./oauth/providers.js";
 import { buildAuthUrl, completeAuth } from "./oauth/oidc.js";
 import { authorize } from "./oauth/authorize.js";
 import { bindAccessEntry, getEffectiveAllowlist, matchAccessEntry } from "./access-entries.js";
-import type { IssueInput, IssueOutcome, RefreshAuthority, RefreshInput, RefreshOutcome } from "./mcp-identity.js";
-import { recordAuthEvent, resolveClientPath, isLoopbackHost, type AuthEventCause } from "./mcp-auth-events.js";
+import type { DescribeOutcome, IssueInput, IssueOutcome, RefreshAuthority, RefreshInput, RefreshOutcome } from "./mcp-identity.js";
+import { recordAuthEvent, resolveClientPath, isLoopbackHost, type AuthEventCause, type ClientPath } from "./mcp-auth-events.js";
 import { RestateRefreshAuthority } from "./restate/operator-object.js";
 export { resolveClientPath } from "./mcp-auth-events.js";
 
@@ -180,9 +180,17 @@ export interface McpTokenIdentity {
   clientId: string | null;
 }
 
+/** Auth health for the token that resolved the current request (AII-714): beside the identity, so a skill can warn before a call fails rather than learning about expiry from a 401. */
+export interface McpTokenInfo {
+  issuedAt: number;
+  expiresAt: number;
+  clientId: string | null;
+  clientPath: ClientPath;
+}
+
 /** Why `verifyMcpToken` did not return an identity — lets the caller record a 401 cause without a second query. */
 export type McpTokenVerification =
-  | { ok: true; identity: McpTokenIdentity }
+  | { ok: true; identity: McpTokenIdentity; token: McpTokenInfo }
   | { ok: false; reason: "invalid" | "expired"; clientId: string | null };
 
 /** Verify an MCP access token; returns the identity on success, the failure reason and client on any failure. */
@@ -190,9 +198,9 @@ export function verifyMcpToken(token: string): McpTokenVerification {
   if (!token) return { ok: false, reason: "invalid", clientId: null };
   const db = getDb();
   const row = db
-    .prepare("SELECT email, sub, provider, expires_at, client_id FROM mcp_tokens WHERE token = ?")
+    .prepare("SELECT email, sub, provider, created_at, expires_at, client_id FROM mcp_tokens WHERE token = ?")
     .get(token) as
-    | { email: string; sub: string; provider: string; expires_at: number; client_id: string | null }
+    | { email: string; sub: string; provider: string; created_at: number; expires_at: number; client_id: string | null }
     | undefined;
   if (!row) return { ok: false, reason: "invalid", clientId: null };
   if (Date.now() > row.expires_at) {
@@ -202,6 +210,12 @@ export function verifyMcpToken(token: string): McpTokenVerification {
   return {
     ok: true,
     identity: { kind: "human", email: row.email, sub: row.sub, provider: row.provider, clientId: row.client_id },
+    token: {
+      issuedAt: row.created_at,
+      expiresAt: row.expires_at,
+      clientId: row.client_id,
+      clientPath: resolveClientPath(row.client_id),
+    },
   };
 }
 
@@ -598,6 +612,15 @@ export class SqliteRefreshAuthority implements RefreshAuthority {
     getDb().prepare("DELETE FROM mcp_refresh_tokens WHERE family_id = ?").run(familyId);
   }
 
+  async describe(clientId: string): Promise<DescribeOutcome> {
+    const row = getDb()
+      .prepare(
+        "SELECT expires_at FROM mcp_refresh_tokens WHERE client_id = ? AND used_at IS NULL ORDER BY created_at DESC LIMIT 1",
+      )
+      .get(clientId) as { expires_at: number } | undefined;
+    return { status: "ok", expiresAt: row?.expires_at ?? null };
+  }
+
   async rotate(input: RefreshInput): Promise<RefreshOutcome> {
     const { refreshToken, clientId } = input;
     const start = Date.now();
@@ -704,6 +727,18 @@ let refreshAuthority: RefreshAuthority = new RestateRefreshAuthority({ accessTok
  */
 export function setRefreshAuthority(authority: RefreshAuthority): void {
   refreshAuthority = authority;
+}
+
+/**
+ * The live refresh-token expiry for a client id, sourced from the active `RefreshAuthority`'s
+ * `describe` (AII-714) — the `Operator` object's `describe()` handler when `RestateRefreshAuthority`
+ * is the default. Collapses "no clientId", "no live refresh token", and "authority unavailable"
+ * all to `null`: `get_session_identity` must answer during a Restate outage, never error.
+ */
+export async function getRefreshExpiry(clientId: string | null): Promise<number | null> {
+  if (!clientId) return null;
+  const outcome = await refreshAuthority.describe(clientId);
+  return outcome.status === "ok" ? outcome.expiresAt : null;
 }
 
 async function handleRefreshTokenGrant(
