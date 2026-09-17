@@ -13,6 +13,16 @@ Tools come from two places and are merged into one list:
 * **Orchestrator-native tools**, defined in `src/mcp.ts` (`DIAG_TOOLS` for reads, `WRITE_TOOLS` for writes) and served by the orchestrator process itself. They need no sidecar, so they answer on a sidecar-less image.
 * **Memory-provider tools** (`kg_*`), forwarded verbatim to the KG sidecar after the token is verified, with the `Authorization` header stripped. Absent a provider, a `kg_*` call answers 503 with the body naming the fix.
 
+## Entry points
+
+Three ways to reach a tool's result, all going through the same handler and the same role assertion (`tool()`'s wrapper, `src/restate/tools.ts`) for a tool migrated to the Restate tools service — there is no separate auth mechanism per entry point.
+
+| Entry point | Credential | Notes |
+| -- | -- | -- |
+| `/mcp` | OAuth bearer token | `tools/call`, described below. |
+| `POST /api/tools/<name>` | Admin session (the same session every other `/api/` route requires) | For a caller with no MCP client, such as CI. Maps the session to `Caller { kind: "human", email, role }` using the session's own resolved role — never defaulted to `admin`. A run capability ([AII-688](https://linear.app/eudoxus/issue/AII-688/run-identity-on-restate-for-kg-refresh-capabilities-mcp-reads-and-the)) is a later, separate entry point. |
+| In-process | None | `callToolAsSystem` (`src/restate/tools-client.ts`) calls the handler directly with `systemCaller()` — for orchestrator code that wants a tool result without an HTTP hop. |
+
 ## Authentication and the per-request re-check
 
 Every caller `/mcp` sees is resolved to one `Caller` (`src/mcp-identity.ts`): `{ kind, email, role }`. `IdentityKind` is `"human" | "system"` today — a human sign-in or in-process/system code (`systemCaller()`, always `role: "admin"`, `email: null`) — with a read-only `"run"` kind reserved for [AII-702](https://linear.app/eudoxus/issue/AII-702/accept-a-run-capability-at-mcp-as-a-read-only-run-identity). The client table covers how each kind reaches `/mcp` today:

@@ -3437,6 +3437,137 @@ describe("POST /api/deploy", () => {
   });
 });
 
+describe("POST /api/tools/<name>", () => {
+  // The route defers to a fake `callTool` (AdminDeps injection), matching the deps.startDeploy /
+  // deps.kgRefresh pattern above — no Restate scenario belongs in this issue (AII-712).
+  async function toolRequest(
+    token: string,
+    body: unknown,
+    deps: AdminModule.AdminDeps,
+    toolName = "get_tenant_health",
+  ): Promise<{ statusCode: number; body: string }> {
+    const req = new MockRequest(
+      `/api/tools/${toolName}`,
+      "POST",
+      { authorization: `Bearer ${token}` },
+      body === undefined ? undefined : JSON.stringify(body),
+    );
+    const res = new MockResponse();
+    admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider), deps);
+    await res.done;
+    return { statusCode: res.statusCode, body: res.body };
+  }
+
+  /** Admitted by the domain seed, so a `user` rather than an admin — same shape as the per-page-grants block below. */
+  function userSession(): string {
+    return adminSession.createSession({
+      email: "reader@eudoxus.ai",
+      sub: "google|reader",
+      provider: "google",
+      name: "Reader",
+    });
+  }
+
+  it("rejects an unauthenticated request with the route's existing 401, without calling the tool", async () => {
+    const called = vi.fn();
+    const res = await toolRequest("not-a-session", { args: {} }, {
+      callTool: async () => { called(); return { status: "ok", content: [] }; },
+    });
+    expect(res.statusCode).toBe(401);
+    expect(called).not.toHaveBeenCalled();
+  });
+
+  it("answers 501 when the tools service is not configured", async () => {
+    const token = await login("secret");
+    const res = await toolRequest(token, { args: {} }, {});
+    expect(res.statusCode).toBe(501);
+  });
+
+  it("returns the tool result for an admin session", async () => {
+    const token = await login("secret");
+    const res = await toolRequest(token, { args: { foo: "bar" } }, {
+      callTool: async () => ({ status: "ok", content: [{ type: "text", text: "health" }] }),
+    });
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ content: [{ type: "text", text: "health" }], isError: undefined });
+  });
+
+  it("maps an access-code admin session to a system-less human Caller, passing the tool name and args through", async () => {
+    const token = await login("secret");
+    let captured: { name: string; args: Record<string, unknown>; caller: unknown } | undefined;
+    await toolRequest(token, { args: { foo: "bar" } }, {
+      callTool: async (name, args, caller) => {
+        captured = { name, args, caller };
+        return { status: "ok", content: [] };
+      },
+    });
+    expect(captured).toEqual({
+      name: "get_tenant_health",
+      args: { foo: "bar" },
+      caller: { kind: "human", email: null, role: "admin" },
+    });
+  });
+
+  // The constraint the issue calls out by name: the route must forward the session's real
+  // role, not default to "admin" — otherwise a user-role operator with a page grant would
+  // gain every write tool. A `user` session reaches this route at all (unlike other /api/
+  // POST routes) because authorization for reads-vs-writes here belongs to the tool's own
+  // role check, mirroring /mcp — see the comment on TOOL_CALL_ROUTE in admin.ts.
+  it("passes a user session's real role through, and a wrapper forbidden result reaches the caller as-is", async () => {
+    const token = userSession();
+    let capturedCaller: unknown;
+    const res = await toolRequest(token, { args: {} }, {
+      callTool: async (_name, _args, caller) => {
+        capturedCaller = caller;
+        if (caller.role !== "admin") {
+          return {
+            status: "ok",
+            isError: true,
+            content: [{ type: "text", text: "forbidden: some_write_tool requires the admin role" }],
+          };
+        }
+        return { status: "ok", content: [] };
+      },
+    }, "some_write_tool");
+    expect(res.statusCode).toBe(200);
+    expect(capturedCaller).toEqual({ kind: "human", email: "reader@eudoxus.ai", role: "user" });
+    expect(JSON.parse(res.body)).toEqual({
+      content: [{ type: "text", text: "forbidden: some_write_tool requires the admin role" }],
+      isError: true,
+    });
+  });
+
+  it("maps status: \"unavailable\" to 503", async () => {
+    const token = await login("secret");
+    const res = await toolRequest(token, { args: {} }, {
+      callTool: async () => ({ status: "unavailable" }),
+    });
+    expect(res.statusCode).toBe(503);
+  });
+
+  it("answers 400 on malformed JSON instead of reaching the tool", async () => {
+    const token = await login("secret");
+    const called = vi.fn();
+    const req = new MockRequest("/api/tools/get_tenant_health", "POST", { authorization: `Bearer ${token}` }, "{not json");
+    const res = new MockResponse();
+    admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider), {
+      callTool: async () => { called(); return { status: "ok", content: [] }; },
+    });
+    await res.done;
+    expect(res.statusCode).toBe(400);
+    expect(called).not.toHaveBeenCalled();
+  });
+
+  it("defaults args to {} when the body omits it", async () => {
+    const token = await login("secret");
+    let capturedArgs: Record<string, unknown> | undefined;
+    await toolRequest(token, {}, {
+      callTool: async (_name, args) => { capturedArgs = args; return { status: "ok", content: [] }; },
+    });
+    expect(capturedArgs).toEqual({});
+  });
+});
+
 describe("GET /api/deployment-status", () => {
   // The page reads this once per poll; every field it renders comes from here, so the
   // route is tested for shape and passthrough rather than for the values themselves.

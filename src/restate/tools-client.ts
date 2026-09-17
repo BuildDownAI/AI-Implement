@@ -6,6 +6,7 @@
 // does, because the ingress journals request bodies (the trust boundary named in AII-710).
 import type { AccessRole } from "../access-entries.js";
 import type { Caller } from "../mcp-identity.js";
+import { systemCaller } from "../mcp-identity.js";
 import { RESTATE_ADMIN_BASE_URL, RESTATE_INGRESS_BASE_URL } from "./server.js";
 
 const ORCHESTRATOR_TOOLS_SERVICE = "orchestratorTools";
@@ -84,6 +85,15 @@ export async function discoverTools(deps: DiscoverToolsDeps = {}): Promise<Disco
   return tools;
 }
 
+/**
+ * The discovered tool names and schemas, for in-process agents that supply their own
+ * schema rather than a hand-maintained list that can drift from the registry — a thin
+ * pass-through over `discoverTools` so this module has one discovery implementation.
+ */
+export async function toolCatalog(deps: DiscoverToolsDeps = {}): Promise<DiscoveredTool[]> {
+  return discoverTools(deps);
+}
+
 export type CallToolResult =
   | { status: "ok"; content: Array<{ type: string; text: string }>; isError?: boolean }
   | { status: "unavailable" };
@@ -127,4 +137,18 @@ export async function callTool(
   } catch {
     return { status: "unavailable" };
   }
+}
+
+/**
+ * Calls a tool as in-process orchestrator code, unattributed to a person: `Caller`
+ * is always `systemCaller()` (`{ kind: "system", email: null, role: "admin" }`), so a
+ * tool's own role check never refuses this caller. Same handler, same wrapper, no HTTP
+ * hop — the ingress round trip is what makes this "direct" versus `/mcp`'s `tools/call`.
+ */
+export async function callToolAsSystem(
+  name: string,
+  args: Record<string, unknown>,
+  deps: CallToolDeps = {},
+): Promise<CallToolResult> {
+  return callTool(name, args, systemCaller(), deps);
 }
