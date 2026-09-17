@@ -119,6 +119,50 @@ Both admin API and ingress calls degrade the same way: a connection failure, a n
 
 A handler error is returned as an `isError` tool result by the wrapper, never retried, so `/mcp` keeps the pre-migration error behaviour. Restate's own suspension signal is not a handler error: the wrapper checks `restate.internal.isSuspendedError` before converting anything to `isError` and rethrows it unconverted, so a handler that awaits `ctx.sleep()`/`ctx.call()`/`ctx.get()` still suspends and resumes normally instead of coming back as a false failure.
 
+## Working with Restate: patterns and pitfalls
+
+Every rule below cost a failed run, a live-gate finding, or a discarded review to learn on the AII-687 tree. Each is enforced in code where noted; this section is the one place they are collected so the next migration does not relearn them.
+
+### A `void` handler answers with an empty 200 body — read the text before parsing
+
+A Restate handler that returns nothing answers a successful ingress call with an empty body, not `null` or `{}`. A client that calls `response.json()` unconditionally throws a parse error and reports success as failure. Read `response.text()` first and treat an empty 2xx body as success; parse only a non-empty body. The shared test helpers and `RestateRefreshAuthority.invoke` both do this. The AII-709 regression was a copy of the fetch helper that skipped the check and failed all 13 `issue`/`revoke` scenarios; `src/__tests__/restate/harness.ts` fixes the class once.
+
+### A thrown handler error is retried forever — catch it, and never swallow the suspension signal
+
+Restate retries a handler that throws until it succeeds. A tool handler that lets an application error propagate makes the ingress call hang and `/mcp` with it. The `tool()` wrapper (`src/restate/tools.ts`) catches handler errors and returns an `isError` tool result instead — but it first checks `restate.internal.isSuspendedError` and rethrows that unconverted, because a handler awaiting `ctx.sleep()` / `ctx.call()` / `ctx.get()` signals suspension by throwing, and converting that to `isError` would turn a normal suspension into a false failure. Any code that wraps a handler body in `try/catch` must re-throw the suspension error.
+
+### The ingress journals request and response bodies — never send a raw secret through it
+
+`restate-server` records the bytes of every ingress request and response in its journal, and a journaled value outlives the call. A raw refresh token sent as a handler argument would sit in the journal past its own rotation. The `Operator` object accepts only hashes as input and mints the next raw token inside the exclusive handler (`ctx.rand.uuidv4()`), returning it once; the raw value lives in object state only long enough to answer a concurrent caller inside the grace window (`docs/restate.md` § "The Operator object", ADR 025). Treat the journal as durable, readable storage: a credential has no business in it, which is also why `caller` (an already-verified identity) travels with a tool call instead of the bearer token.
+
+### Never interpolate a caller-supplied segment into an ingress URL
+
+`callTool` builds `orchestratorTools/<name>` and the REST route builds an ingress path from `<name>`; `fetch` normalizes `..` path segments, so an unescaped `..%2FOperator%2F<key>%2Frevoke` reaches a sibling service with no role check. Validate the shape first (`POST /api/tools/<name>` rejects anything outside `^[a-z][a-z0-9_]{0,63}$` with a 404 before the ingress is touched) and `encodeURIComponent` every dynamic segment. AII-712's live gate cleared a whole `Operator` family this way before the fix.
+
+### An idempotency key must name one request, not a per-client counter
+
+Restate scopes an idempotency key by (service, handler, key) and keeps the keyed result for 24 hours by default, so a second call with the same key attaches to the first result instead of running. A key built from only the OAuth client id and the JSON-RPC request id is not unique over time: MCP clients restart their JSON-RPC ids at zero every session, so a later session's write collided with a day-old result and silently did nothing. `writeIdempotencyKey` (`src/mcp.ts`) names one request — client id, the access token's issue time, the JSON-RPC id, and a hash of the arguments — so a genuine retry deduplicates while a new session or a different call runs. When you add an idempotency key, prove a collision live: the same key with different arguments must run, not attach.
+
+### Register the SDK endpoint without `force`, and force only after draining
+
+`register()` (`src/restate/endpoint.ts`) posts the deployment without `force` at boot: an unchanged endpoint answers 200/201, and a changed service set at the same URI answers a `META0004` conflict. `force: true` overrides the deployment but "can lead inflight invocations to an unrecoverable error state" (Restate's own guidance), so it is used only after `getInFlightJobs()` confirms zero in-flight work — the self-deploy interlock drains runs before the replacement process registers. Never force a registration to get past a conflict.
+
+### All Restate ports bind loopback — check the fabric port too
+
+The orchestrator, the server, the admin API, and the SDK endpoint are same-machine peers, so ingress (8081), admin (9070), the SDK endpoint (9080), and the node/fabric port (5122) all bind `127.0.0.1` (§ "Ports and paths"). The fabric port defaults to `0.0.0.0:5122` upstream and was the one listener not on loopback until `RESTATE_BIND_ADDRESS` pinned it; on Fly an all-interfaces port is reachable over the private network. The local image boot check exists to catch a bind that regresses to `0.0.0.0`. On macOS, a long checkout path trips the 104-byte unix-socket limit (`RT0004`); set `RESTATE_DATA_DIR` to a short path.
+
+### The partition count and machine size are fixed early — decide them before the first deploy
+
+`restate-server` fixes its partition count the first time it provisions a data directory; changing `RESTATE_DEFAULT_NUM_PARTITIONS` afterward has no effect on an existing store (§ "Memory"). The default 24 partitions and 2 GiB RocksDB budget cost far more resident memory than a one-operator orchestrator needs, so the sidecar sets 4 partitions and a 256 MB budget, and `fly.toml` carries 2 GB — both must be right on the first boot of a new volume, not tuned later.
+
+### Test with two environment variants, and assert observable effects
+
+A Restate scenario registers only the services it needs and runs two environments from the shared harness: `alwaysReplay: true` forces replay at every suspension for the happy paths, `disableRetries: true` surfaces error paths at once (§ "Testing"). Assert an observable effect — a call count on a fake, a state read through a shared handler, a returned value — never a journal internal. Keep the pure decision logic (for example `decideRefresh`'s grace-window branch) in the default unit suite so it runs with no Docker; the container scenario proves the wiring, not the arithmetic.
+
+### A dependency on Restate is a new failure mode — degrade, don't hang
+
+Anything that reaches the ingress or the admin API gains a dependency on the sidecar being up. Decide the degraded answer before you migrate: a discovered tool drops out of `tools/list` while the admin API is unreachable (the same silent-omission the `kg_*` tools already use), a `tools/call` or a refresh answers `503 restate-unavailable`, and `get_session_identity` still answers because it is not a Restate handler. The rule from ADR 025: Restate down narrows to "this one surface is unavailable," never "nobody can use MCP," and never a 401 — a 503 says retry, a 401 says re-authenticate.
+
 ## Writing a workflow for a run kind
 
 Written by the delete slice of the first case, after the first workflow is real.
