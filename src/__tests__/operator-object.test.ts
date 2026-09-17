@@ -319,6 +319,22 @@ describe("RestateRefreshAuthority.describe (AII-714)", () => {
   });
 });
 
+describe("RestateRefreshAuthority.rotate — unknown/never-issued client id (AII-718 parity)", () => {
+  it("returns replay, without checking the allowlist or revoking, when the identity read comes back all-null", async () => {
+    const fetchImpl = vi.fn(async (url: string) => {
+      if (isIdentityUrl(url)) {
+        return new Response(JSON.stringify({ email: null, sub: null, provider: null, expiresAt: null }), { status: 200 });
+      }
+      throw new Error("must not call the allowlist path or any other handler for an unknown identity");
+    });
+    const authority = authorityWithFetch(fetchImpl as unknown as typeof fetch);
+    const allowlistCallsBefore = vi.mocked(getEffectiveAllowlist).mock.calls.length;
+    await expect(authority.rotate({ refreshToken: "old-raw-token", clientId: "c1" })).resolves.toEqual({ status: "replay" });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(getEffectiveAllowlist).mock.calls.length).toBe(allowlistCallsBefore);
+  });
+});
+
 describe("RestateRefreshAuthority.rotate — allowlist re-check (AII-687 parity)", () => {
   it("returns unavailable (cause allowlist) without revoking or calling refresh when the allowlist cannot be loaded", async () => {
     vi.mocked(getEffectiveAllowlist).mockReturnValue(null);

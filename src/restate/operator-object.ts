@@ -332,6 +332,16 @@ export class RestateRefreshAuthority implements RefreshAuthority {
       emit("unavailable");
       return { status: "unavailable", cause: "restate" };
     }
+    if (who.email === null && who.sub === null && who.provider === null) {
+      // No family was ever issued for this client id, or it was already fully revoked
+      // (`identity` returns every field null in both cases). decideRefresh's own "no
+      // family" branch treats this as replay rather than denial, since there is no
+      // identity to deny or family to revoke; check for it here too so an unknown or
+      // garbage client id maps to the same outcome the pre-AII-718 refresh-first order
+      // produced, instead of a spurious "denied" plus a revoke call against nothing.
+      emit("replay");
+      return { status: "replay" };
+    }
 
     // Step 2: allowlist re-check on that identity (fail-closed: a removed user must not
     // outlive their access token). AII-687's rule: the allowlist re-check stays the
