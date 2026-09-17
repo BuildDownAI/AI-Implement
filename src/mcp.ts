@@ -636,7 +636,7 @@ export async function handleMcpRequest(
     if (writeTool) {
       const actor = identity.email;
       if (!roleAllows(role, writeTool.role)) {
-        console.log(`[mcp] write tool=${toolName} actor=${actor} role=${role ?? "null"} kind=${identity.kind} result=forbidden`);
+        console.log(`[mcp] write tool=${toolName} actor=${actor} role=${role ?? "null"} result=forbidden kind=${identity.kind}`);
         json(res, 200, {
           jsonrpc: "2.0",
           id: rpc.id ?? null,
@@ -657,14 +657,14 @@ export async function handleMcpRequest(
           triggerWorkflowSync,
           clearDispatchDedup,
         });
-        console.log(`[mcp] write tool=${toolName} actor=${actor} role=${role} kind=${identity.kind} result=${result.status}`);
+        console.log(`[mcp] write tool=${toolName} actor=${actor} role=${role} result=${result.status} kind=${identity.kind}`);
         json(res, 200, {
           jsonrpc: "2.0",
           id: rpc.id ?? null,
           result: { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] },
         });
       } catch (err) {
-        console.log(`[mcp] write tool=${toolName} actor=${actor} role=${role} kind=${identity.kind} result=error`);
+        console.log(`[mcp] write tool=${toolName} actor=${actor} role=${role} result=error kind=${identity.kind}`);
         json(res, 200, {
           jsonrpc: "2.0",
           id: rpc.id ?? null,

@@ -2,9 +2,10 @@ import { PassThrough, Writable } from "node:stream";
 import http from "node:http";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { handleMcpRequest, WRITE_TOOLS } from "../mcp.js";
-import { SidecarMemoryProvider, sidecarHealth } from "../kg-provider.js";
+import { SidecarMemoryProvider, sidecarHealth, sidecarHealthFields } from "../kg-provider.js";
 import type { MemoryProvider } from "../kg-provider.js";
 import type { PreflightCheckResult, KgRefreshStatus } from "../kg-refresh.js";
+import { GET_TENANT_HEALTH_DESCRIPTION } from "../restate/tools.js";
 
 vi.mock("../mcp-oauth.js", () => ({
   verifyMcpToken: vi.fn(),
@@ -42,6 +43,11 @@ vi.mock("../deploy-notify.js", () => ({
 
 vi.mock("../deploy-posture.js", () => ({
   getDeployPosture: vi.fn(),
+}));
+
+vi.mock("../restate/tools-client.js", () => ({
+  discoverTools: vi.fn(),
+  callTool: vi.fn(),
 }));
 
 const BASE_URL = "https://orchestrator.example.com";
@@ -112,6 +118,31 @@ let dedupMock: typeof import("../dedup.js");
 let deployNotifyMock: typeof import("../deploy-notify.js");
 let deployPostureMock: typeof import("../deploy-posture.js");
 let authEventsMock: typeof import("../mcp-auth-events.js");
+let toolsClientMock: typeof import("../restate/tools-client.js");
+
+/**
+ * The health payload get_tenant_health produced before AII-710 moved it onto the
+ * orchestratorTools Restate service — computed here from the same mocked modules
+ * (getRunnerMode, getInFlightJobs, getDb, isKgDegraded) plus the real sidecarHealthFields(),
+ * so every pre-migration get_tenant_health assertion keeps exercising the values it always
+ * checked, now via the mocked Restate client instead of the removed inline handler.
+ */
+function buildTenantHealth(): Record<string, unknown> {
+  const { mode, source } = runnerModeMock.getRunnerMode();
+  const inFlight = logMock.getInFlightJobs();
+  const db = dedupMock.getDb();
+  const { n: pendingGapfillCount } = db.prepare("pending gap-fill count").get() as { n: number };
+  const projectCount = Object.keys(configMock.getMappings()).length;
+  return {
+    runnerMode: { mode, source },
+    inFlightJobCount: inFlight.length,
+    pendingGapfillCount,
+    projectCount,
+    kgDegraded: deployNotifyMock.isKgDegraded(),
+    ...sidecarHealthFields(),
+    kgRefreshPreflight: null,
+  };
+}
 
 beforeEach(async () => {
   vi.clearAllMocks();
@@ -127,6 +158,7 @@ beforeEach(async () => {
   deployNotifyMock = await import("../deploy-notify.js");
   deployPostureMock = await import("../deploy-posture.js");
   authEventsMock = await import("../mcp-auth-events.js");
+  toolsClientMock = await import("../restate/tools-client.js");
   (deployNotifyMock.isKgDegraded as ReturnType<typeof vi.fn>).mockReturnValue(false);
   sidecarHealth.reachable = false;
   sidecarHealth.toolsListed = false;
@@ -162,6 +194,21 @@ beforeEach(async () => {
       all: vi.fn(() => []),
     })),
   });
+
+  // get_tenant_health is sourced from the orchestratorTools Restate service (AII-710);
+  // the mocked client stands in for it so tests don't need a real sidecar/admin API.
+  (toolsClientMock.discoverTools as ReturnType<typeof vi.fn>).mockResolvedValue([
+    {
+      name: "get_tenant_health",
+      description: GET_TENANT_HEALTH_DESCRIPTION,
+      inputSchema: { type: "object", properties: {} },
+      role: "user",
+    },
+  ]);
+  (toolsClientMock.callTool as ReturnType<typeof vi.fn>).mockImplementation(async () => ({
+    status: "ok",
+    content: [{ type: "text", text: JSON.stringify(buildTenantHealth(), null, 2) }],
+  }));
 
   (mcpOauth.resolveClientPath as ReturnType<typeof vi.fn>).mockReturnValue("unknown");
 
@@ -681,6 +728,23 @@ describe("handleMcpRequest", () => {
       const parsed = JSON.parse(result.body);
       expect(parsed.id).toBe(42);
     });
+
+    it("still answers 200 without get_tenant_health when discoverTools resolves an empty list", async () => {
+      (toolsClientMock.discoverTools as ReturnType<typeof vi.fn>).mockResolvedValueOnce([]);
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}',
+      );
+      expect(result.statusCode).toBe(200);
+      const parsed = JSON.parse(result.body);
+      const names = parsed.result.tools.map((t: { name: string }) => t.name);
+      expect(names).not.toContain("get_tenant_health");
+      expect(names).toContain("get_runner_mode");
+    });
   });
 
   describe("tools/call — diagnostic tools", () => {
@@ -808,7 +872,10 @@ describe("handleMcpRequest", () => {
       expect(data.kgRefreshPreflight).toBeNull();
     });
 
-    it("get_tenant_health includes kgRefreshPreflight result when runKgRefreshPreflight is wired", async () => {
+    it("get_tenant_health round-trips a populated kgRefreshPreflight from the orchestratorTools service", async () => {
+      // get_tenant_health now reads its own KG_SOURCE_REPO env and calls runKgRefreshPreflight
+      // directly inside src/restate/tools.ts (AII-710) rather than through a wired callback —
+      // tools/call just has to pass the Restate response's content through untouched.
       const preflightResult: PreflightCheckResult = {
         ok: false,
         checkedAt: 1700000000000,
@@ -831,7 +898,10 @@ describe("handleMcpRequest", () => {
           },
         ],
       };
-      const runKgRefreshPreflightMock = vi.fn(async () => preflightResult);
+      (toolsClientMock.callTool as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+        status: "ok",
+        content: [{ type: "text", text: JSON.stringify({ ...buildTenantHealth(), kgRefreshPreflight: preflightResult }, null, 2) }],
+      });
 
       const result = await callMcp(
         { authorization: "Bearer tok" },
@@ -840,15 +910,26 @@ describe("handleMcpRequest", () => {
         BASE_URL,
         "POST",
         JSON.stringify({ jsonrpc: "2.0", id: 16, method: "tools/call", params: { name: "get_tenant_health", arguments: {} } }),
-        undefined,
-        runKgRefreshPreflightMock,
       );
 
       expect(result.statusCode).toBe(200);
       const parsed = JSON.parse(result.body);
       const data = JSON.parse(parsed.result.content[0].text);
       expect(data.kgRefreshPreflight).toEqual(preflightResult);
-      expect(runKgRefreshPreflightMock).toHaveBeenCalledOnce();
+    });
+
+    it("returns 503 restate-unavailable when callTool reports the sidecar is unreachable", async () => {
+      (toolsClientMock.callTool as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ status: "unavailable" });
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 17, method: "tools/call", params: { name: "get_tenant_health", arguments: {} } }),
+      );
+      expect(result.statusCode).toBe(503);
+      expect(JSON.parse(result.body)).toEqual({ error: "restate-unavailable" });
     });
 
     it("handles get_runner_mode", async () => {

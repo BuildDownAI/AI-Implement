@@ -69,10 +69,15 @@ export async function discoverTools(deps: DiscoverToolsDeps = {}): Promise<Disco
     if (handler.metadata?.["mcp.type"] !== "tool") continue;
     const role = handler.metadata["mcp.role"];
     if (role !== "user" && role !== "admin") continue;
+    const args = handler.input_json_schema?.properties?.args;
+    const inputSchema =
+      typeof args === "object" && args !== null
+        ? (args as Record<string, unknown>)
+        : { type: "object", properties: {} };
     tools.push({
       name: handler.name,
       description: handler.documentation ?? "",
-      inputSchema: handler.input_json_schema?.properties?.args ?? { type: "object", properties: {} },
+      inputSchema,
       role,
     });
   }
