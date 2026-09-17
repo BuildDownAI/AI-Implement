@@ -326,6 +326,8 @@ describe("migrated read handlers (AII-711)", () => {
     id: "stub",
     capabilities: { hybridSearch: true, neighbors: true, path: true, provenance: true, stalenessStamp: false, ...caps },
     listTools: async () => [],
+    // Still on the interface until the dead proxy path is deleted with the door restructure (AII-715).
+    proxyCall: () => {},
     callKgTool,
   });
   const system: Caller = SYSTEM_ADMIN;
