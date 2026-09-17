@@ -6,6 +6,7 @@ import { handleMcpRequest, WRITE_TOOLS } from "../mcp.js";
 import { SidecarMemoryProvider, sidecarHealth, sidecarHealthFields, setKgMemoryProvider } from "../kg-provider.js";
 import type { MemoryProvider, KgToolResult } from "../kg-provider.js";
 import { setActiveKgRefresh } from "../kg-refresh.js";
+import { getIssueReportCard, getFleetReport } from "../report-card.js";
 import type { PreflightCheckResult, KgRefreshStatus } from "../kg-refresh.js";
 import type { Caller } from "../mcp-identity.js";
 import {
@@ -105,6 +106,11 @@ vi.mock("../deploy-notify.js", () => ({
 
 vi.mock("../deploy-posture.js", () => ({
   getDeployPosture: vi.fn(),
+}));
+
+vi.mock("../report-card.js", () => ({
+  getIssueReportCard: vi.fn(),
+  getFleetReport: vi.fn(),
 }));
 
 vi.mock("../restate/tools-client.js", () => ({
@@ -2584,6 +2590,41 @@ describe("handleMcpRequest", () => {
       );
       expect(kgCall.statusCode).toBe(200);
       expect(JSON.parse(kgCall.body).result.isError).toBe(true);
+    });
+  });
+
+  describe("report-card reads through the tools service (AII-711)", () => {
+    it("get_issue_report_card threads `issue` through /mcp and returns the card verbatim", async () => {
+      (getIssueReportCard as ReturnType<typeof vi.fn>).mockReturnValue({ issue: "AII-1", dispatches: 2, passes: 3, costUsd: 1.5, merged: true });
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 31, method: "tools/call", params: { name: "get_issue_report_card", arguments: { issue: "AII-1" } } }),
+      );
+      expect(result.statusCode).toBe(200);
+      expect(getIssueReportCard).toHaveBeenCalledWith("AII-1");
+      const parsed = JSON.parse(result.body);
+      expect(parsed.result.isError).toBeUndefined();
+      expect(JSON.parse(parsed.result.content[0].text)).toEqual({ issue: "AII-1", dispatches: 2, passes: 3, costUsd: 1.5, merged: true });
+    });
+
+    it("get_fleet_report threads `days` through /mcp and returns the report verbatim", async () => {
+      (getFleetReport as ReturnType<typeof vi.fn>).mockReturnValue({ byRepo: [], oneShotPct: 1, eventualPct: 1, planning: {}, escapeRate: 0, runaways: [] });
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 32, method: "tools/call", params: { name: "get_fleet_report", arguments: { days: 7 } } }),
+      );
+      expect(result.statusCode).toBe(200);
+      expect(getFleetReport).toHaveBeenCalledWith({ days: 7 });
+      const parsed = JSON.parse(result.body);
+      expect(Object.keys(JSON.parse(parsed.result.content[0].text)).sort()).toEqual(["byRepo", "escapeRate", "eventualPct", "oneShotPct", "planning", "runaways"]);
     });
   });
 
