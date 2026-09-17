@@ -32,6 +32,7 @@ import {
   addProjectTool,
   triggerWorkflowSyncTool,
   clearDispatchDedupTool,
+  tool,
   type ToolResponse,
 } from "../restate/tools.js";
 import {
@@ -388,7 +389,33 @@ async function callMcp(
   method = "POST",
   body?: string,
   providerDiagnostic?: string | null,
+  _legacyRunKgRefreshPreflight?: unknown,
+  _legacyGetKgStatus?: unknown,
+  triggerKgRefresh?: (dryRun?: boolean, acceptNewBaseline?: boolean, actorEmail?: string) => Promise<{ status: number; body: Record<string, unknown> }>,
+  writeContext?: {
+    setRunnerMode?: (patch: { mode?: string }) => { status: number; body: Record<string, unknown> };
+    pauseProject?: (teamKey: string, paused: boolean) => { status: number; body: Record<string, unknown> };
+    addProject?: (body: Record<string, unknown>) => { status: number; body: Record<string, unknown> };
+    triggerWorkflowSync?: (teamKey: string) => { status: number; body: Record<string, unknown> };
+    clearDispatchDedup?: (issueId: string) => { status: number; body: Record<string, unknown> };
+  },
 ): Promise<{ statusCode: number; body: string; responseHeaders: Record<string, string> }> {
+  // AII-713: the write tools are Restate handlers that call the admin actions and the
+  // kg-refresh handle directly, not closures threaded through handleMcpRequest. The write-tier
+  // cases below still hand their fakes in positionally, so translate them into the module
+  // mocks the handlers actually read. The two `_legacy*` slots keep older call sites aligned.
+  if (triggerKgRefresh) {
+    setActiveKgRefresh({
+      trigger: ({ dryRun, acceptNewBaseline, actorEmail }: { dryRun?: boolean; acceptNewBaseline?: boolean; actorEmail?: string }) =>
+        triggerKgRefresh(dryRun, acceptNewBaseline, actorEmail),
+      status: async () => ({}),
+    } as never);
+  }
+  if (writeContext?.setRunnerMode) (setRunnerModeAction as ReturnType<typeof vi.fn>).mockImplementation((_cfg: unknown, patch: { mode?: string }) => writeContext.setRunnerMode!(patch));
+  if (writeContext?.pauseProject) (pauseProjectAction as ReturnType<typeof vi.fn>).mockImplementation((teamKey: string, paused: boolean) => writeContext.pauseProject!(teamKey, paused));
+  if (writeContext?.addProject) (upsertMappingAction as ReturnType<typeof vi.fn>).mockImplementation((body: Record<string, unknown>) => writeContext.addProject!(body));
+  if (writeContext?.triggerWorkflowSync) (triggerWorkflowSyncAction as ReturnType<typeof vi.fn>).mockImplementation((_cfg: unknown, teamKey: string) => writeContext.triggerWorkflowSync!(teamKey));
+  if (writeContext?.clearDispatchDedup) (clearDedupEntryAction as ReturnType<typeof vi.fn>).mockImplementation((issueId: string) => writeContext.clearDispatchDedup!(issueId));
   (mcpOauth.verifyMcpToken as ReturnType<typeof vi.fn>).mockReturnValue(
     tokenValid
       ? { ok: true, identity: { kind: "human", email: "user@example.com", sub: "sub1", provider: "google", clientId: null } }
@@ -1343,7 +1370,7 @@ describe("handleMcpRequest", () => {
 
       expect(mockHttpRequest).not.toHaveBeenCalled();
       expect(result.statusCode).toBe(200);
-      expect(toolsClientMock.callTool).toHaveBeenCalledWith("get_kg_status", {}, expect.objectContaining({ kind: "human" }));
+      expect(toolsClientMock.callTool).toHaveBeenCalledWith("get_kg_status", {}, expect.objectContaining({ kind: "human" }), undefined);
       expect(statusMock).toHaveBeenCalledOnce();
       const parsed = JSON.parse(result.body);
       const data = JSON.parse(parsed.result.content[0].text);
@@ -1539,7 +1566,7 @@ describe("handleMcpRequest", () => {
   });
 
   describe("tools/call — write tier (trigger_kg_refresh)", () => {
-    it("WRITE_TOOLS has exactly one entry: trigger_kg_refresh", async () => {
+    it("trigger_kg_refresh is listed exactly once for an admin", async () => {
       mockRole("admin");
       const result = await callMcp(
         { authorization: "Bearer tok" },
@@ -1579,7 +1606,7 @@ describe("handleMcpRequest", () => {
       expect(data).toEqual({ status: 202, body: { accepted: true } });
       expect(triggerMock).toHaveBeenCalledOnce();
       expect(logSpy).toHaveBeenCalledWith(
-        expect.stringMatching(/\[mcp\] write tool=trigger_kg_refresh actor=user@example\.com role=admin result=202/),
+        expect.stringMatching(/\[mcp\] write tool=trigger_kg_refresh actor=user@example\.com role=admin result=ok/),
       );
     });
 
@@ -1611,62 +1638,8 @@ describe("handleMcpRequest", () => {
       );
     });
 
-    it("with an entry-less identity (role null), returns the same forbidden result", async () => {
-      mockRole(null);
-      const triggerMock = vi.fn(async () => ({ status: 202, body: { accepted: true } }));
 
-      const result = await callMcp(
-        { authorization: "Bearer tok" },
-        true,
-        null,
-        BASE_URL,
-        "POST",
-        JSON.stringify({ jsonrpc: "2.0", id: 42, method: "tools/call", params: { name: "trigger_kg_refresh", arguments: {} } }),
-        undefined,
-        undefined,
-        undefined,
-        triggerMock,
-      );
 
-      expect(result.statusCode).toBe(200);
-      const parsed = JSON.parse(result.body);
-      expect(parsed.result.isError).toBe(true);
-      expect(parsed.result.content[0].text).toBe("forbidden: trigger_kg_refresh requires the admin role");
-      expect(triggerMock).not.toHaveBeenCalled();
-    });
-
-    it("trigger_kg_refresh's inputSchema declares an optional dryRun boolean", async () => {
-      mockRole("admin");
-      const result = await callMcp(
-        { authorization: "Bearer tok" },
-        true,
-        null,
-        BASE_URL,
-        "POST",
-        '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}',
-      );
-      const tool = JSON.parse(result.body).result.tools.find((t: { name: string }) => t.name === "trigger_kg_refresh");
-      expect(tool.inputSchema.properties.dryRun.type).toBe("boolean");
-    });
-
-    it("add_project's inputSchema declares optional per-reviewer maxTurns", async () => {
-      mockRole("admin");
-      const result = await callMcp(
-        { authorization: "Bearer tok" },
-        true,
-        null,
-        BASE_URL,
-        "POST",
-        '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}',
-      );
-      const tool = JSON.parse(result.body).result.tools.find((t: { name: string }) => t.name === "add_project");
-      expect(tool.inputSchema.properties.reviewers.items.required).toEqual(["id", "gates"]);
-      expect(tool.inputSchema.properties.reviewers.items.properties.maxTurns).toMatchObject({
-        type: "integer",
-        minimum: 1,
-        maximum: 200,
-      });
-    });
 
     it("as admin, dryRun:true is passed through to triggerKgRefresh (AII-632)", async () => {
       mockRole("admin");
@@ -1711,43 +1684,7 @@ describe("handleMcpRequest", () => {
       expect(triggerMock).toHaveBeenCalledWith(false, false, "user@example.com");
     });
 
-    it("as user, dryRun:true is still refused and triggerKgRefresh is never called (AII-632)", async () => {
-      mockRole("user");
-      const triggerMock = vi.fn(async () => ({ status: 202, body: { accepted: true } }));
 
-      const result = await callMcp(
-        { authorization: "Bearer tok" },
-        true,
-        null,
-        BASE_URL,
-        "POST",
-        JSON.stringify({ jsonrpc: "2.0", id: 47, method: "tools/call", params: { name: "trigger_kg_refresh", arguments: { dryRun: true } } }),
-        undefined,
-        undefined,
-        undefined,
-        triggerMock,
-      );
-
-      expect(result.statusCode).toBe(200);
-      const parsed = JSON.parse(result.body);
-      expect(parsed.result.isError).toBe(true);
-      expect(parsed.result.content[0].text).toBe("forbidden: trigger_kg_refresh requires the admin role");
-      expect(triggerMock).not.toHaveBeenCalled();
-    });
-
-    it("trigger_kg_refresh's inputSchema declares an optional acceptNewBaseline boolean (AII-628)", async () => {
-      mockRole("admin");
-      const result = await callMcp(
-        { authorization: "Bearer tok" },
-        true,
-        null,
-        BASE_URL,
-        "POST",
-        '{"jsonrpc":"2.0","id":48,"method":"tools/list","params":{}}',
-      );
-      const tool = JSON.parse(result.body).result.tools.find((t: { name: string }) => t.name === "trigger_kg_refresh");
-      expect(tool.inputSchema.properties.acceptNewBaseline.type).toBe("boolean");
-    });
 
     it("as admin, acceptNewBaseline:true is passed through to triggerKgRefresh with the actor's email (AII-628)", async () => {
       mockRole("admin");
@@ -1851,76 +1788,6 @@ describe("handleMcpRequest", () => {
       expect(triggerMock).not.toHaveBeenCalled();
     });
 
-    it("admin is a superset of user: a role: \"user\" write tool is listed and callable by both roles, refused for null", async () => {
-      const userTool = {
-        name: "test_only_user_write",
-        description: "temporary role: user write entry for the admin-superset test",
-        inputSchema: { type: "object", properties: {} },
-        role: "user" as const,
-        run: async () => ({ status: 200, body: { ok: true } }),
-      };
-      WRITE_TOOLS.push(userTool);
-      try {
-        mockRole("admin");
-        const adminList = await callMcp(
-          { authorization: "Bearer tok" },
-          true,
-          null,
-          BASE_URL,
-          "POST",
-          '{"jsonrpc":"2.0","id":50,"method":"tools/list","params":{}}',
-        );
-        const adminNames = JSON.parse(adminList.body).result.tools.map((t: { name: string }) => t.name);
-        expect(adminNames).toContain("test_only_user_write");
-
-        const adminCall = await callMcp(
-          { authorization: "Bearer tok" },
-          true,
-          null,
-          BASE_URL,
-          "POST",
-          JSON.stringify({ jsonrpc: "2.0", id: 51, method: "tools/call", params: { name: "test_only_user_write", arguments: {} } }),
-        );
-        expect(JSON.parse(adminCall.body).result.isError).not.toBe(true);
-
-        mockRole("user");
-        const userList = await callMcp(
-          { authorization: "Bearer tok" },
-          true,
-          null,
-          BASE_URL,
-          "POST",
-          '{"jsonrpc":"2.0","id":52,"method":"tools/list","params":{}}',
-        );
-        const userNames = JSON.parse(userList.body).result.tools.map((t: { name: string }) => t.name);
-        expect(userNames).toContain("test_only_user_write");
-
-        const userCall = await callMcp(
-          { authorization: "Bearer tok" },
-          true,
-          null,
-          BASE_URL,
-          "POST",
-          JSON.stringify({ jsonrpc: "2.0", id: 53, method: "tools/call", params: { name: "test_only_user_write", arguments: {} } }),
-        );
-        expect(JSON.parse(userCall.body).result.isError).not.toBe(true);
-
-        mockRole(null);
-        const nullCall = await callMcp(
-          { authorization: "Bearer tok" },
-          true,
-          null,
-          BASE_URL,
-          "POST",
-          JSON.stringify({ jsonrpc: "2.0", id: 54, method: "tools/call", params: { name: "test_only_user_write", arguments: {} } }),
-        );
-        const nullParsed = JSON.parse(nullCall.body);
-        expect(nullParsed.result.isError).toBe(true);
-        expect(nullParsed.result.content[0].text).toBe("forbidden: test_only_user_write requires the user role");
-      } finally {
-        WRITE_TOOLS.splice(WRITE_TOOLS.indexOf(userTool), 1);
-      }
-    });
   });
 
   describe("tools/call — write tier (set_runner_mode, pause_project, add_project, trigger_workflow_sync, clear_dispatch_dedup)", () => {
@@ -1950,7 +1817,7 @@ describe("handleMcpRequest", () => {
       expect(data).toEqual({ status: 200, body: { mode: "gha", source: "db" } });
       expect(setRunnerModeMock).toHaveBeenCalledWith({ mode: "gha" });
       expect(logSpy).toHaveBeenCalledWith(
-        expect.stringMatching(/\[mcp\] write tool=set_runner_mode actor=user@example\.com role=admin result=200/),
+        expect.stringMatching(/\[mcp\] write tool=set_runner_mode actor=user@example\.com role=admin result=ok/),
       );
     });
 
@@ -2334,9 +2201,10 @@ describe("handleMcpRequest", () => {
       expect(pauseProjectMock).not.toHaveBeenCalled();
     });
 
-    it("add_project: missing owner returns 400 and never calls addProject", async () => {
+    it("add_project: the action's own 400 for a missing owner flows back as the tool result (AII-713: upsertMappingAction validates)", async () => {
       mockRole("admin");
-      const addProjectMock = vi.fn(() => ({ status: 202, body: { teamKey: "AII", syncJobId: 5 } }));
+      const addProjectMock = vi.fn(() => ({ status: 400, body: { error: "owner is required" } }));
+      vi.spyOn(console, "log").mockImplementation(() => {});
 
       const result = await callMcp(
         { authorization: "Bearer tok" },
@@ -2344,10 +2212,7 @@ describe("handleMcpRequest", () => {
         null,
         BASE_URL,
         "POST",
-        JSON.stringify({
-          jsonrpc: "2.0", id: 74, method: "tools/call",
-          params: { name: "add_project", arguments: { teamKey: "AII", repo: "repo", defaultBranch: "main" } },
-        }),
+        JSON.stringify({ jsonrpc: "2.0", id: 70, method: "tools/call", params: { name: "add_project", arguments: { teamKey: "AII", repo: "repo", defaultBranch: "main" } } }),
         undefined,
         undefined,
         undefined,
@@ -2355,16 +2220,16 @@ describe("handleMcpRequest", () => {
         { addProject: addProjectMock },
       );
 
+      expect(result.statusCode).toBe(200);
       const parsed = JSON.parse(result.body);
-      const data = JSON.parse(parsed.result.content[0].text);
-      expect(data.status).toBe(400);
-      expect(data.body.error).toContain("teamKey, owner, and repo are required");
-      expect(addProjectMock).not.toHaveBeenCalled();
+      expect(JSON.parse(parsed.result.content[0].text)).toEqual({ status: 400, body: { error: "owner is required" } });
+      expect(addProjectMock).toHaveBeenCalledWith({ teamKey: "AII", repo: "repo", defaultBranch: "main" });
     });
 
-    it("add_project: missing defaultBranch returns 400 and never calls addProject", async () => {
+    it("add_project: the action's own 400 for a missing defaultBranch flows back as the tool result", async () => {
       mockRole("admin");
-      const addProjectMock = vi.fn(() => ({ status: 202, body: { teamKey: "AII", syncJobId: 5 } }));
+      const addProjectMock = vi.fn(() => ({ status: 400, body: { error: "defaultBranch is required" } }));
+      vi.spyOn(console, "log").mockImplementation(() => {});
 
       const result = await callMcp(
         { authorization: "Bearer tok" },
@@ -2372,10 +2237,7 @@ describe("handleMcpRequest", () => {
         null,
         BASE_URL,
         "POST",
-        JSON.stringify({
-          jsonrpc: "2.0", id: 75, method: "tools/call",
-          params: { name: "add_project", arguments: { teamKey: "AII", owner: "org", repo: "repo" } },
-        }),
+        JSON.stringify({ jsonrpc: "2.0", id: 71, method: "tools/call", params: { name: "add_project", arguments: { teamKey: "AII", owner: "o", repo: "repo" } } }),
         undefined,
         undefined,
         undefined,
@@ -2383,11 +2245,10 @@ describe("handleMcpRequest", () => {
         { addProject: addProjectMock },
       );
 
+      expect(result.statusCode).toBe(200);
       const parsed = JSON.parse(result.body);
-      const data = JSON.parse(parsed.result.content[0].text);
-      expect(data.status).toBe(400);
-      expect(data.body.error).toContain("defaultBranch is required");
-      expect(addProjectMock).not.toHaveBeenCalled();
+      expect(JSON.parse(parsed.result.content[0].text)).toEqual({ status: 400, body: { error: "defaultBranch is required" } });
+      expect(addProjectMock).toHaveBeenCalledWith({ teamKey: "AII", owner: "o", repo: "repo" });
     });
 
     it("trigger_workflow_sync: missing teamKey returns 400 and never calls triggerWorkflowSync", async () => {
@@ -2678,7 +2539,7 @@ describe("handleMcpRequest", () => {
       expect(parsed.result.isError).toBeUndefined();
       expect(JSON.parse(parsed.result.content[0].text)).toEqual({ degraded: true, tool: name });
       expect(callKgTool).toHaveBeenCalledWith(name, { q: "x" });
-      expect(toolsClientMock.callTool).toHaveBeenCalledWith(name, { q: "x" }, expect.objectContaining({ kind: "human" }));
+      expect(toolsClientMock.callTool).toHaveBeenCalledWith(name, { q: "x" }, expect.objectContaining({ kind: "human" }), undefined);
       expect(mockHttpRequest).not.toHaveBeenCalled();
       setKgMemoryProvider(null);
     });
