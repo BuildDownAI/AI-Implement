@@ -132,10 +132,11 @@ describe("decideRefresh — the state-table branch, as a pure function", () => {
 });
 
 describe("RestateRefreshAuthority — unavailable against an unroutable ingress", () => {
-  it("rotate() resolves to unavailable rather than throwing", async () => {
+  it("rotate() resolves to unavailable (cause restate) rather than throwing", async () => {
     const authority = new RestateRefreshAuthority({ ingressBaseUrl: UNROUTABLE_INGRESS, accessTokenTtlMs: 3600_000 });
     await expect(authority.rotate({ refreshToken: "sometoken", clientId: "client-1" })).resolves.toEqual({
       status: "unavailable",
+      cause: "restate",
     });
   });
 
@@ -152,41 +153,77 @@ describe("RestateRefreshAuthority — unavailable against an unroutable ingress"
   });
 });
 
+/** The `identity` handler's response for an admitted, already-issued client. */
+function identityOkResponse(): Response {
+  return new Response(
+    JSON.stringify({ email: "ada@eudoxus.ai", sub: "sub-1", provider: "google", expiresAt: Date.now() + 1000 }),
+    { status: 200 },
+  );
+}
+
+function isIdentityUrl(url: string): boolean {
+  return url === `${UNROUTABLE_INGRESS}/Operator/c1/identity`;
+}
+
 describe("RestateRefreshAuthority — outcome mapping", () => {
-  it("maps a 5xx ingress response to unavailable", async () => {
+  it("maps a 5xx ingress response on the identity read to unavailable (cause restate), never reaching refresh", async () => {
     const fetchImpl = vi.fn(async () => new Response("", { status: 503 }));
     const authority = authorityWithFetch(fetchImpl as unknown as typeof fetch);
-    await expect(authority.rotate({ refreshToken: "x", clientId: "c1" })).resolves.toEqual({ status: "unavailable" });
+    await expect(authority.rotate({ refreshToken: "x", clientId: "c1" })).resolves.toEqual({
+      status: "unavailable",
+      cause: "restate",
+    });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(fetchImpl).toHaveBeenCalledWith(`${UNROUTABLE_INGRESS}/Operator/c1/identity`, expect.anything());
   });
 
-  it("maps a thrown connection error to unavailable, never rejects", async () => {
+  it("maps a thrown connection error to unavailable (cause restate), never rejects", async () => {
     const fetchImpl = vi.fn(async () => {
       throw new Error("connect ECONNREFUSED 127.0.0.1:59999");
     });
     const authority = authorityWithFetch(fetchImpl as unknown as typeof fetch);
-    await expect(authority.rotate({ refreshToken: "x", clientId: "c1" })).resolves.toEqual({ status: "unavailable" });
+    await expect(authority.rotate({ refreshToken: "x", clientId: "c1" })).resolves.toEqual({
+      status: "unavailable",
+      cause: "restate",
+    });
   });
 
-  it("maps a non-JSON 200 body to unavailable rather than throwing", async () => {
+  it("maps a non-JSON 200 body on the identity read to unavailable rather than throwing", async () => {
     const fetchImpl = vi.fn(async () => new Response("not json", { status: 200 }));
     const authority = authorityWithFetch(fetchImpl as unknown as typeof fetch);
-    await expect(authority.rotate({ refreshToken: "x", clientId: "c1" })).resolves.toEqual({ status: "unavailable" });
+    await expect(authority.rotate({ refreshToken: "x", clientId: "c1" })).resolves.toEqual({
+      status: "unavailable",
+      cause: "restate",
+    });
   });
 
-  it("maps a replay result straight through", async () => {
-    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ status: "replay" }), { status: 200 }));
+  it("maps a replay result from refresh straight through, after a successful identity read", async () => {
+    const fetchImpl = vi.fn(async (url: string) => {
+      if (isIdentityUrl(url)) return identityOkResponse();
+      return new Response(JSON.stringify({ status: "replay" }), { status: 200 });
+    });
     const authority = authorityWithFetch(fetchImpl as unknown as typeof fetch);
     await expect(authority.rotate({ refreshToken: "x", clientId: "c1" })).resolves.toEqual({ status: "replay" });
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
 
-  it("maps an expired result straight through", async () => {
-    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ status: "expired" }), { status: 200 }));
+  it("maps an expired result from refresh straight through, after a successful identity read", async () => {
+    const fetchImpl = vi.fn(async (url: string) => {
+      if (isIdentityUrl(url)) return identityOkResponse();
+      return new Response(JSON.stringify({ status: "expired" }), { status: 200 });
+    });
     const authority = authorityWithFetch(fetchImpl as unknown as typeof fetch);
     await expect(authority.rotate({ refreshToken: "x", clientId: "c1" })).resolves.toEqual({ status: "expired" });
   });
 
-  it("maps a successful rotation to ok and mints the access token in SQLite (access tokens stay in SQLite)", async () => {
+  it("maps a successful rotation to ok and mints the access token in SQLite, reading identity then refresh, in order", async () => {
+    const callOrder: string[] = [];
     const fetchImpl = vi.fn(async (url: string, init: RequestInit) => {
+      if (isIdentityUrl(url)) {
+        callOrder.push("identity");
+        return identityOkResponse();
+      }
+      callOrder.push("refresh");
       expect(url).toBe(`${UNROUTABLE_INGRESS}/Operator/c1/refresh`);
       expect(JSON.parse(init.body as string)).toEqual({
         presentedHash: crypto.createHash("sha256").update("old-raw-token").digest("hex"),
@@ -211,6 +248,7 @@ describe("RestateRefreshAuthority — outcome mapping", () => {
       refreshToken: "new-raw-token",
       expiresInSeconds: 3600,
     });
+    expect(callOrder).toEqual(["identity", "refresh"]);
     if (outcome.status === "ok") {
       const row = getDb().prepare("SELECT email, sub, provider, client_id FROM mcp_tokens WHERE token = ?").get(outcome.accessToken);
       expect(row).toEqual({ email: "ada@eudoxus.ai", sub: "sub-1", provider: "google", client_id: "c1" });
@@ -281,51 +319,64 @@ describe("RestateRefreshAuthority.describe (AII-714)", () => {
   });
 });
 
-describe("RestateRefreshAuthority.rotate — allowlist re-check (AII-687 parity)", () => {
-  function refreshOkResponse(): Response {
-    return new Response(
-      JSON.stringify({
-        status: "ok",
-        token: "new-raw-token",
-        expiresAt: Date.now() + 1000,
-        email: "ada@eudoxus.ai",
-        sub: "sub-1",
-        provider: "google",
-      }),
-      { status: 200 },
-    );
-  }
+describe("RestateRefreshAuthority.rotate — unknown/never-issued client id (AII-718 parity)", () => {
+  it("returns replay, without checking the allowlist or revoking, when the identity read comes back all-null", async () => {
+    const fetchImpl = vi.fn(async (url: string) => {
+      if (isIdentityUrl(url)) {
+        return new Response(JSON.stringify({ email: null, sub: null, provider: null, expiresAt: null }), { status: 200 });
+      }
+      throw new Error("must not call the allowlist path or any other handler for an unknown identity");
+    });
+    const authority = authorityWithFetch(fetchImpl as unknown as typeof fetch);
+    const allowlistCallsBefore = vi.mocked(getEffectiveAllowlist).mock.calls.length;
+    await expect(authority.rotate({ refreshToken: "old-raw-token", clientId: "c1" })).resolves.toEqual({ status: "replay" });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(getEffectiveAllowlist).mock.calls.length).toBe(allowlistCallsBefore);
+  });
+});
 
-  it("returns unavailable without revoking when the allowlist cannot be loaded", async () => {
+describe("RestateRefreshAuthority.rotate — allowlist re-check (AII-687 parity)", () => {
+  it("returns unavailable (cause allowlist) without revoking or calling refresh when the allowlist cannot be loaded", async () => {
     vi.mocked(getEffectiveAllowlist).mockReturnValue(null);
     const fetchImpl = vi.fn(async (url: string) => {
       if (url.endsWith("/revoke")) {
         throw new Error("must not revoke on a transient allowlist read failure");
       }
-      return refreshOkResponse();
+      if (url.endsWith("/refresh")) {
+        throw new Error("must not rotate before the allowlist check passes");
+      }
+      return identityOkResponse();
     });
     const authority = authorityWithFetch(fetchImpl as unknown as typeof fetch);
     await expect(authority.rotate({ refreshToken: "old-raw-token", clientId: "c1" })).resolves.toEqual({
       status: "unavailable",
+      cause: "allowlist",
     });
+    // Only the identity read happened — nothing durable was touched.
     expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(fetchImpl).toHaveBeenCalledWith(`${UNROUTABLE_INGRESS}/Operator/c1/identity`, expect.anything());
   });
 
-  it("revokes the family and returns denied when the allowlist no longer admits the identity", async () => {
+  it("revokes the family and returns denied, without calling refresh, when the allowlist no longer admits the identity", async () => {
     vi.mocked(getEffectiveAllowlist).mockReturnValue({ entries: [], source: "env" });
     vi.mocked(matchAccessEntry).mockReturnValue(null);
     const fetchImpl = vi.fn(async (url: string) => {
       if (url.endsWith("/revoke")) {
         return new Response("", { status: 200 });
       }
-      return refreshOkResponse();
+      if (url.endsWith("/refresh")) {
+        throw new Error("a denied identity must not be rotated");
+      }
+      return identityOkResponse();
     });
     const authority = authorityWithFetch(fetchImpl as unknown as typeof fetch);
     await expect(authority.rotate({ refreshToken: "old-raw-token", clientId: "c1" })).resolves.toEqual({
       status: "denied",
       description: "Identity no longer authorized",
     });
+    expect(fetchImpl).toHaveBeenCalledWith(`${UNROUTABLE_INGRESS}/Operator/c1/identity`, expect.anything());
     expect(fetchImpl).toHaveBeenCalledWith(`${UNROUTABLE_INGRESS}/Operator/c1/revoke`, expect.anything());
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
 });
 

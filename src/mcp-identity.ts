@@ -36,14 +36,18 @@ export interface RefreshInput {
  * The outcome of rotating a refresh token, independent of how it is reported over HTTP.
  * `denied` carries the specific reason (invalid token, client_id mismatch, or an identity
  * the allowlist no longer admits) so the caller can preserve today's `error_description`
- * text; `replay` and `expired` map to a fixed description at the call site.
+ * text; `replay` and `expired` map to a fixed description at the call site. `unavailable`
+ * carries a `cause` so the HTTP layer can distinguish "the refresh authority itself
+ * couldn't be reached" (`restate`, or omitted — `SqliteRefreshAuthority` has no other
+ * unavailable case) from "the allowlist re-check couldn't be read" (`allowlist`), which
+ * the SQLite path answered with a different error code (AII-718).
  */
 export type RefreshOutcome =
   | { status: "ok"; accessToken: string; refreshToken: string; expiresInSeconds: number }
   | { status: "replay" }
   | { status: "expired" }
   | { status: "denied"; description: string }
-  | { status: "unavailable" };
+  | { status: "unavailable"; cause?: "restate" | "allowlist" };
 
 /** A brand-new sign-in (the authorization-code grant): no serialization concern, unlike `rotate`. */
 export interface IssueInput {
