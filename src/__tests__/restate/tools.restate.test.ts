@@ -73,6 +73,37 @@ const idempotentTools = restate.service({
   },
 });
 
+// A fifth service, built WITH tool() (unlike idempotentTools above), whose handler increments
+// one module counter inside ctx.run and a second outside it. This is the observable proof
+// behind AII-717's rule (docs/restate.md § "Every side effect in a handler goes inside
+// ctx.run..."): under the alwaysReplay container variant the server forces a replay at the
+// handler's one durable step, so code before that step (outsideCounter) runs again on the
+// replay while the step itself (insideCounter, journaled by ctx.run) is recovered from the
+// journal and not re-executed. Only run against the "alwaysReplay" environment — disableRetries
+// gives no replay to observe.
+let replayInsideCounter = 0;
+let replayOutsideCounter = 0;
+const replayCounterTool = tool(
+  {
+    description: "increments a counter inside ctx.run and one outside, for the alwaysReplay regression test",
+    input: z.object({}),
+    role: "user",
+  },
+  async (ctx): Promise<ToolResponse> => {
+    replayOutsideCounter += 1;
+    await ctx.run("increment-inside", () => {
+      replayInsideCounter += 1;
+      return replayInsideCounter;
+    });
+    return { content: [{ type: "text", text: "done" }] };
+  },
+);
+
+const replayCounterTools = restate.service({
+  name: "replayCounterTools",
+  handlers: { increment: replayCounterTool },
+});
+
 interface ToolCallResult {
   content?: Array<{ type: string; text: string }>;
   isError?: boolean;
@@ -98,7 +129,7 @@ describe("orchestratorTools (Restate)", () => {
     ).run("BDS", "BuildDownAI", "skills", "claude.yml", "testing", JSON.stringify({ SUPER_SECRET: "leak-me" }));
     setKgMemoryProvider(null);
 
-    environments = await startVariants([orchestratorTools, failingTools, suspendingTools, idempotentTools]);
+    environments = await startVariants([orchestratorTools, failingTools, suspendingTools, idempotentTools, replayCounterTools]);
   }, 60_000);
 
   afterAll(async () => {
@@ -325,6 +356,36 @@ describe("orchestratorTools (Restate)", () => {
     },
   );
 
+  // AII-717: the retry policy that keeps a dead attempt from ever being re-delivered
+  // (tool()'s ToolOptions.retryPolicy, threaded to restate.handlers.handler) has to actually
+  // reach the deployed handler's config, not just exist in our source. The per-handler admin
+  // route (`GET /services/{service}/handlers/{handler}`, restate-server 1.7.10) is the
+  // deployment record for one handler; its handler list uses snake_case keys for every
+  // multi-word field observed elsewhere in this suite (`input_json_schema`,
+  // `output_json_schema` above), so `retry_policy`/`max_attempts`/`on_max_attempts` is the
+  // pinned path here, consistent with that convention. restate-server 1.7.10 reports
+  // on_max_attempts as "Kill" (capitalised enum), so the comparison below is case-insensitive.
+  it.each(VARIANTS.map(([label]) => label))(
+    "the admin API's per-handler record for pause_project carries retryPolicy: { maxAttempts: 1, onMaxAttempts: \"kill\" } (%s)",
+    async (label) => {
+      const env = environments.get(label);
+      if (!env) throw new Error(`environment "${label}" did not start`);
+      // Deployment metadata only appears once the handler has been invoked at least once
+      // against this environment (same precondition as the mcp.type/mcp.role check above).
+      await callService(env.baseUrl(), "orchestratorTools", "pause_project", {
+        caller: SYSTEM,
+        args: { teamKey: "no-such-team", paused: true },
+      });
+      const response = await fetch(`${env.adminAPIBaseUrl()}/services/orchestratorTools/handlers/pause_project`);
+      expect(response.ok).toBe(true);
+      const handler = (await response.json()) as Record<string, unknown>;
+      const retryPolicy = (handler.retry_policy ?? handler.retryPolicy) as Record<string, unknown> | undefined;
+      expect(retryPolicy, `no retry_policy/retryPolicy field on the handler record: ${JSON.stringify(handler)}`).toBeDefined();
+      expect(retryPolicy?.max_attempts ?? retryPolicy?.maxAttempts).toBe(1);
+      expect(String(retryPolicy?.on_max_attempts ?? retryPolicy?.onMaxAttempts).toLowerCase()).toBe("kill");
+    },
+  );
+
   it.each(VARIANTS.map(([label]) => label))(
     "trigger_kg_refresh's discovered schema declares dryRun/acceptNewBaseline booleans, and add_project's reviewers array matches the pre-migration shape (%s)",
     async (label) => {
@@ -395,6 +456,24 @@ describe("orchestratorTools (Restate)", () => {
       expect(body?.content?.[0]?.text).toBe("forbidden: clear_dispatch_dedup requires the admin role");
     },
   );
+
+  it("alwaysReplay: ctx.run runs its closure once while the code outside it re-executes on replay (AII-717)", async () => {
+    const env = environments.get("alwaysReplay");
+    if (!env) throw new Error('environment "alwaysReplay" did not start');
+    replayInsideCounter = 0;
+    replayOutsideCounter = 0;
+
+    await callService(env.baseUrl(), "replayCounterTools", "increment", { caller: SYSTEM, args: {} });
+
+    // insideCounter is journaled by ctx.run: recovered from the journal on every replay after
+    // the first, never re-run. outsideCounter runs again on each replay the alwaysReplay
+    // container forces at the handler's one durable step — this is the same mechanism that
+    // would double-run a bare admin action call outside ctx.run after a real crash (AII-717's
+    // concrete failure: a replayed clear_dispatch_dedup deleting a dedup row the first poll
+    // had just written).
+    expect(replayInsideCounter).toBe(1);
+    expect(replayOutsideCounter).toBeGreaterThan(1);
+  });
 
   it("pause_project: a second ingress call with the same idempotency key attaches to the first result instead of running pauseProjectAction again", async () => {
     const env = environments.get("alwaysReplay");
