@@ -3652,6 +3652,30 @@ describe("POST /api/tools/<name>", () => {
     expect(called).not.toHaveBeenCalled();
   });
 
+  // node collapses repeated headers of the same name into a string array; treating that
+  // silently as "no key supplied" would let a client that (accidentally or otherwise) sent
+  // the header twice believe it deduped a write that in fact ran with no key at all
+  // (AII-719 gap-fill).
+  it("rejects a repeated Idempotency-Key header with 400, without calling the tool", async () => {
+    const token = await login("secret");
+    const called = vi.fn();
+    const req = new MockRequest(
+      "/api/tools/set_runner_mode",
+      "POST",
+      { authorization: `Bearer ${token}` },
+      JSON.stringify({ args: {} }),
+    );
+    (req.headers as Record<string, string | string[]>)["idempotency-key"] = ["abc", "def"];
+    const res = new MockResponse();
+    admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider), {
+      callTool: async () => { called(); return { status: "ok", content: [] }; },
+    });
+    await res.done;
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body)).toEqual({ error: "Idempotency-Key must be sent once" });
+    expect(called).not.toHaveBeenCalled();
+  });
+
   // Mirrors /mcp's read-tool gate on RESTATE_WRITE_TOOL_NAMES: a read tool ignores a
   // supplied Idempotency-Key silently rather than either erroring or forwarding it, since
   // forwarding it would let a repeat of the same read return a stale cached answer.

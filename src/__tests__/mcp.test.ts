@@ -159,6 +159,7 @@ vi.mock("../report-card.js", () => ({
 vi.mock("../restate/tools-client.js", () => ({
   discoverTools: vi.fn(),
   callTool: vi.fn(),
+  IDEMPOTENCY_KEY_SHAPE: /^[A-Za-z0-9._:-]{1,128}$/,
 }));
 
 const BASE_URL = "https://orchestrator.example.com";

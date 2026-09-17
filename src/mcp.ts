@@ -4,7 +4,7 @@ import { recordAuthEvent, type AuthEventCause } from "./mcp-auth-events.js";
 import { recheckIdentity, type AccessRole } from "./access-entries.js";
 import { type MemoryProvider, KG_TOOL_CAPABILITY } from "./kg-provider.js";
 import type { Caller } from "./mcp-identity.js";
-import { discoverTools, callTool } from "./restate/tools-client.js";
+import { discoverTools, callTool, IDEMPOTENCY_KEY_SHAPE } from "./restate/tools-client.js";
 
 interface JsonRpcRequest {
   jsonrpc?: string;
@@ -46,19 +46,18 @@ const GET_SESSION_IDENTITY_TOOL = {
 // The six writes joined this set in AII-713: their role ("admin"), schema, and run body now
 // live on the handler itself (src/restate/tools.ts), not in this file — see
 // docs/adr/015-mcp-reads-open-writes-declared.md.
-/**
- * Shape for a caller-supplied `params._meta.idempotencyKey` (AII-719, corrected 2026-09-17 on
- * the AII-687 gate). `/mcp` is stateless — it has no session id and MCP clients restart their
- * JSON-RPC ids on every connection — so nothing in a request names "one connection's attempt at
- * this call" except what the caller states explicitly. A key derived from the access token's
- * issue time and the JSON-RPC id (the prior design) let a second connection's write inside the
- * same token lifetime collide with the first: proven live with `set_runner_mode` (a later
- * connection's `id: 7` answered the first connection's cached result and changed nothing). A
- * derived key protects the wrong thing — a client retry of one call whose response was lost —
- * when MCP clients don't retry `tools/call` on their own; a repeat is a human or script
- * expressing a new intent unless they say otherwise via this field.
- */
-const IDEMPOTENCY_KEY_SHAPE = /^[A-Za-z0-9._:-]{1,128}$/;
+// `params._meta.idempotencyKey` (AII-719, corrected 2026-09-17 on the AII-687 gate) is
+// checked against IDEMPOTENCY_KEY_SHAPE (imported above from src/restate/tools-client.ts,
+// shared with src/admin.ts so the two doors cannot drift) and forwarded to callTool verbatim.
+// `/mcp` is stateless — it has no session id and MCP clients restart their JSON-RPC ids on
+// every connection — so nothing in a request names "one connection's attempt at this call"
+// except what the caller states explicitly. A key derived from the access token's issue time
+// and the JSON-RPC id (the prior design) let a second connection's write inside the same
+// token lifetime collide with the first: proven live with `set_runner_mode` (a later
+// connection's `id: 7` answered the first connection's cached result and changed nothing). A
+// derived key protects the wrong thing — a client retry of one call whose response was lost —
+// when MCP clients don't retry `tools/call` on their own; a repeat is a human or script
+// expressing a new intent unless they say otherwise via this field.
 
 const RESTATE_TOOL_NAMES = new Set([
   "get_tenant_health",

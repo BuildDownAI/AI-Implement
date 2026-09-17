@@ -98,6 +98,15 @@ export type CallToolResult =
   | { status: "ok"; content: Array<{ type: string; text: string }>; isError?: boolean }
   | { status: "unavailable" };
 
+/**
+ * Shape for a caller-supplied idempotency key (AII-719): checked identically by both doors —
+ * `/mcp`'s `tools/call` (`params._meta.idempotencyKey`) and `POST /api/tools/<name>`'s
+ * `Idempotency-Key` header — before it is forwarded to Restate verbatim. Defined once here
+ * and imported by both doors (src/mcp.ts, src/admin.ts) so the two surfaces cannot drift
+ * apart.
+ */
+export const IDEMPOTENCY_KEY_SHAPE = /^[A-Za-z0-9._:-]{1,128}$/;
+
 /** For testing: override the ingress base URL and the fetch implementation. */
 export interface CallToolDeps {
   ingressBaseUrl?: string;
@@ -106,8 +115,9 @@ export interface CallToolDeps {
    * Restate's own idempotency key (https://docs.restate.dev/operate/invocation#invoke-a-handler-idempotently),
    * sent as the `idempotency-key` header. Restate scopes it by (service, handler, key), so a
    * second call with the same key attaches to the first invocation's result instead of running
-   * the handler again — src/mcp.ts sets this for the six write tools only (AII-713); a read
-   * call never passes one.
+   * the handler again. Set only when the caller supplied a key — src/mcp.ts's `tools/call` and
+   * src/admin.ts's `handleToolCall` forward it verbatim, unmodified, for the six write tools
+   * only (AII-713); a read call never passes one.
    */
   idempotencyKey?: string;
 }

@@ -57,6 +57,7 @@ import type { TicketIssue, AIImplementSnapshot } from "./providers/types.js";
 import type { ProviderRegistry } from "./providers/registry.js";
 import { resolveInFlightSiblings, selectBlockers, selectFileOverlapDeferrals, getOrFetchPlanningContexts } from "./poll-selection.js";
 import { RESTATE_WRITE_TOOL_NAMES } from "./mcp.js";
+import { IDEMPOTENCY_KEY_SHAPE } from "./restate/tools-client.js";
 import { adminHtml } from "./admin-html.js";
 import {
   getOrchestratorSettings,
@@ -1692,14 +1693,12 @@ async function handleDeployTrigger(
 /** Every tool name is snake_case ASCII (src/restate/tools.ts's `tool()` registrations). */
 const TOOL_NAME_SHAPE = /^[a-z][a-z0-9_]{0,63}$/;
 
-/**
- * Shape for a caller-supplied `Idempotency-Key` header — the same contract `/mcp`'s
- * `tools/call` applies to `params._meta.idempotencyKey` (AII-719). Neither surface derives
- * a key: a CI script that wants a retry deduped states the key itself. Only checked when
- * the target tool is in `RESTATE_WRITE_TOOL_NAMES` (imported from `./mcp.js`) — a read tool
- * ignores the header entirely, same as `/mcp` ignores `_meta.idempotencyKey` on a read.
- */
-const IDEMPOTENCY_KEY_SHAPE = /^[A-Za-z0-9._:-]{1,128}$/;
+// `IDEMPOTENCY_KEY_SHAPE` (imported above from src/restate/tools-client.ts) is the same
+// contract `/mcp`'s `tools/call` applies to `params._meta.idempotencyKey` (AII-719). Neither
+// surface derives a key: a CI script that wants a retry deduped states the key itself. Only
+// checked when the target tool is in `RESTATE_WRITE_TOOL_NAMES` (imported from `./mcp.js`) —
+// a read tool ignores the header entirely, same as `/mcp` ignores `_meta.idempotencyKey` on a
+// read. The header is forwarded verbatim as `deps.idempotencyKey`.
 
 /**
  * POST /api/tools/<name> — the REST entry point to the tools service (AII-712), for a
@@ -1735,7 +1734,11 @@ async function handleToolCall(
   let idempotencyKey: string | undefined;
   if (RESTATE_WRITE_TOOL_NAMES.has(toolName)) {
     const idempotencyKeyHeader = req.headers["idempotency-key"];
-    const supplied = typeof idempotencyKeyHeader === "string" ? idempotencyKeyHeader : undefined;
+    if (Array.isArray(idempotencyKeyHeader)) {
+      json(res, 400, { error: "Idempotency-Key must be sent once" });
+      return;
+    }
+    const supplied = idempotencyKeyHeader;
     if (supplied !== undefined) {
       if (!IDEMPOTENCY_KEY_SHAPE.test(supplied)) {
         json(res, 400, { error: "Idempotency-Key must match ^[A-Za-z0-9._:-]{1,128}$" });
