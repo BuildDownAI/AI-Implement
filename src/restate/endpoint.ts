@@ -12,14 +12,16 @@ import type {
 } from "@restatedev/restate-sdk";
 import { getInFlightJobs as defaultGetInFlightJobs } from "../log.js";
 import { RESTATE_ADMIN_BASE_URL } from "./server.js";
+import { operatorObject } from "./operator-object.js";
 
 export type RestateService =
   | ServiceDefinition<string, unknown>
   | VirtualObjectDefinition<string, unknown>
   | WorkflowDefinition<string, unknown>;
 
-// Empty until a run kind's workflow module registers here (ADR 018 case 1: kg-refresh).
-export const RESTATE_SERVICES: RestateService[] = [];
+// No run kind's workflow has migrated here yet (ADR 018 case 1: kg-refresh); `Operator`
+// (AII-709) is the first bound object, ahead of any workflow module.
+export const RESTATE_SERVICES: RestateService[] = [operatorObject];
 
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 9080;

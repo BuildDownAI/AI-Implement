@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import type http from "node:http";
-import { systemCaller, type RefreshAuthority, type RefreshOutcome } from "../mcp-identity.js";
+import { systemCaller, type IssueOutcome, type RefreshAuthority, type RefreshOutcome } from "../mcp-identity.js";
 import { handleMcpTokenRequest, setRefreshAuthority } from "../mcp-oauth.js";
 
 describe("systemCaller", () => {
