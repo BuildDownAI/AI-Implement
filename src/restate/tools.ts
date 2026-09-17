@@ -612,49 +612,57 @@ export const pauseProjectTool = tool(
 export const ADD_PROJECT_DESCRIPTION =
   "Create or update a project mapping (admin role). Same as POST /api/mappings, the mapping upsert behind the admin UI's New project stepper.";
 
+/**
+ * Exported so the unit tier can `safeParse` the documented "pass null to reset" contract
+ * without going through the Restate ingress (AII-720). The nullable fields here must match
+ * `upsertMappingAction`'s null-accepting set exactly (src/admin.ts) — reviewers and the three
+ * caps, branchPrefix, skillsRepo, dependencyTokenScope, and the two sensitive-glob fields.
+ */
+export const addProjectArgsSchema = z.object({
+  teamKey: z.string().optional().describe("Team key, e.g. the Linear team key or Jira project key"),
+  owner: z.string().optional().describe("GitHub repo owner/org"),
+  repo: z.string().optional().describe("GitHub repo name"),
+  defaultBranch: z.string().optional().describe("Base branch PRs are opened against"),
+  workflowFile: z.string().optional(),
+  maxInProgressAiIssues: z.number().optional(),
+  executionMode: z.enum(["github-actions", "fly-machines"]).optional(),
+  sessionMode: z.enum(["autonomous", "interactive", "hybrid"]).optional(),
+  machineCpus: z.number().optional(),
+  machineMemoryMb: z.number().optional(),
+  planningEnabled: z.boolean().optional(),
+  planningWorkflowFile: z.string().optional(),
+  autoApprovePlans: z.boolean().optional(),
+  autoMerge: z.boolean().optional(),
+  extraEnv: z.record(z.string(), z.string()).optional().describe("Passed through to the model process; visible to the agent"),
+  provider: z.enum(["anthropic", "bedrock"]).optional(),
+  awsRegion: z.string().optional().describe("Required when provider is 'bedrock'"),
+  ticketingProvider: z.string().optional(),
+  ticketingConfig: z.record(z.string(), z.unknown()).optional(),
+  paused: z.boolean().optional(),
+  maxTurns: z.number().nullable().optional(),
+  maxIterations: z.number().nullable().optional(),
+  maxJobMinutes: z.number().nullable().optional(),
+  branchPrefix: z.string().nullable().optional(),
+  skillsRepo: z.string().nullable().optional(),
+  referenceRepos: z.array(z.unknown()).optional(),
+  sensitiveAddPatterns: z.union([z.string(), z.array(z.string())]).nullable().optional().describe("String or array of glob strings; pass null to reset to the default (none)"),
+  sensitiveAllowPatterns: z.union([z.string(), z.array(z.string())]).nullable().optional().describe("String or array of glob strings; pass null to reset to the default (none)"),
+  dependencyTokenScope: z.enum(["installation"]).nullable().optional(),
+  reviewers: z.array(z.object({
+    id: z.string(),
+    gates: z.boolean(),
+    maxTurns: z.number().int().min(1).max(200).optional().describe(
+      "Optional per-reviewer turn cap. Omit to inherit the reviewer default or global limit.",
+    ),
+  })).nullable().optional().describe(
+    "Which reviewers run on this project's PRs. Omit to keep the stored value; pass null to reset to the default (gap-analysis and code-review, both gating).",
+  ),
+});
+
 export const addProjectTool = tool(
   {
     description: ADD_PROJECT_DESCRIPTION,
-    input: z.object({
-      teamKey: z.string().optional().describe("Team key, e.g. the Linear team key or Jira project key"),
-      owner: z.string().optional().describe("GitHub repo owner/org"),
-      repo: z.string().optional().describe("GitHub repo name"),
-      defaultBranch: z.string().optional().describe("Base branch PRs are opened against"),
-      workflowFile: z.string().optional(),
-      maxInProgressAiIssues: z.number().optional(),
-      executionMode: z.enum(["github-actions", "fly-machines"]).optional(),
-      sessionMode: z.enum(["autonomous", "interactive", "hybrid"]).optional(),
-      machineCpus: z.number().optional(),
-      machineMemoryMb: z.number().optional(),
-      planningEnabled: z.boolean().optional(),
-      planningWorkflowFile: z.string().optional(),
-      autoApprovePlans: z.boolean().optional(),
-      autoMerge: z.boolean().optional(),
-      extraEnv: z.record(z.string(), z.string()).optional().describe("Passed through to the model process; visible to the agent"),
-      provider: z.enum(["anthropic", "bedrock"]).optional(),
-      awsRegion: z.string().optional().describe("Required when provider is 'bedrock'"),
-      ticketingProvider: z.string().optional(),
-      ticketingConfig: z.record(z.string(), z.unknown()).optional(),
-      paused: z.boolean().optional(),
-      maxTurns: z.number().optional(),
-      maxIterations: z.number().optional(),
-      maxJobMinutes: z.number().optional(),
-      branchPrefix: z.string().optional(),
-      skillsRepo: z.string().optional(),
-      referenceRepos: z.array(z.unknown()).optional(),
-      sensitiveAddPatterns: z.union([z.string(), z.array(z.string())]).optional().describe("String or array of glob strings"),
-      sensitiveAllowPatterns: z.union([z.string(), z.array(z.string())]).optional().describe("String or array of glob strings"),
-      dependencyTokenScope: z.enum(["installation"]).optional(),
-      reviewers: z.array(z.object({
-        id: z.string(),
-        gates: z.boolean(),
-        maxTurns: z.number().int().min(1).max(200).optional().describe(
-          "Optional per-reviewer turn cap. Omit to inherit the reviewer default or global limit.",
-        ),
-      })).optional().describe(
-        "Which reviewers run on this project's PRs. Omit to keep the stored value; pass null to reset to the default (gap-analysis and code-review, both gating).",
-      ),
-    }),
+    input: addProjectArgsSchema,
     role: "admin",
   },
   async (_ctx, input): Promise<ToolResponse> => {
