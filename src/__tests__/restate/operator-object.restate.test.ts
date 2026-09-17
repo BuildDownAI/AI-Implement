@@ -9,12 +9,10 @@
 // Run with `npm run test:restate` (Docker required); excluded from `npm test`.
 import crypto from "node:crypto";
 import { randomUUID } from "node:crypto";
-import { RestateContainer, RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
+import { RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { operatorObject } from "../restate/operator-object.js";
-
-// Pinned to match the image cached by .github/workflows/unit-tests.yml's restate-tests job.
-const RESTATE_IMAGE_VERSION = "1.7.10";
+import { operatorObject } from "../../restate/operator-object.js";
+import { VARIANTS, callObject, startVariants, stopAll } from "./harness.js";
 
 function sha256(value: string): string {
   return crypto.createHash("sha256").update(value).digest("hex");
@@ -39,25 +37,6 @@ interface DescribeResult {
   expiresAt: number | null;
 }
 
-// Matches what the ingress expects for a virtual object: `${url}/${object}/${key}/${handler}`
-// (restate-harness.restate.test.ts documents the same convention for services/workflows).
-async function callObject<T>(baseUrl: string, key: string, handler: string, body: unknown): Promise<T> {
-  const response = await fetch(`${baseUrl}/Operator/${encodeURIComponent(key)}/${handler}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  const text = await response.text();
-  if (!response.ok) {
-    throw new Error(`Operator/${key}/${handler} failed: ${response.status} ${text}`);
-  }
-  // A void handler (issue, revoke) answers with an empty body — that is success.
-  if (text === "") {
-    return undefined as T;
-  }
-  return JSON.parse(text) as T;
-}
-
 function issueBody(overrides: Partial<IssueBody> = {}): IssueBody {
   return {
     email: "ada@eudoxus.ai",
@@ -69,31 +48,15 @@ function issueBody(overrides: Partial<IssueBody> = {}): IssueBody {
   };
 }
 
-const VARIANTS = [
-  ["alwaysReplay", (container: RestateContainer) => container.alwaysReplay()],
-  ["disableRetries", (container: RestateContainer) => container.disableRetries()],
-] satisfies Array<[string, (container: RestateContainer) => RestateContainer]>;
-
 describe("Operator object", () => {
-  const environments = new Map<string, RestateTestEnvironment>();
+  let environments: Map<string, RestateTestEnvironment>;
 
   beforeAll(async () => {
-    const started = await Promise.all(
-      VARIANTS.map(async ([label, configure]) => {
-        const env = await RestateTestEnvironment.start({
-          services: [operatorObject],
-          container: () => configure(new RestateContainer(RESTATE_IMAGE_VERSION)),
-        });
-        return [label, env] as const;
-      }),
-    );
-    for (const [label, env] of started) {
-      environments.set(label, env);
-    }
+    environments = await startVariants([operatorObject]);
   }, 60_000);
 
   afterAll(async () => {
-    await Promise.all([...environments.values()].map((env) => env.stop()));
+    await stopAll(environments);
   });
 
   it.each(VARIANTS.map(([label]) => label))(
@@ -104,11 +67,11 @@ describe("Operator object", () => {
       const key = randomUUID();
       const raw = randomUUID();
       const hash = sha256(raw);
-      await callObject(env.baseUrl(), key, "issue", issueBody({ hash }));
+      await callObject(env.baseUrl(), "Operator", key, "issue", issueBody({ hash }));
 
       const [first, second] = await Promise.all([
-        callObject<RefreshResult>(env.baseUrl(), key, "refresh", { presentedHash: hash }),
-        callObject<RefreshResult>(env.baseUrl(), key, "refresh", { presentedHash: hash }),
+        callObject<RefreshResult>(env.baseUrl(), "Operator", key, "refresh", { presentedHash: hash }),
+        callObject<RefreshResult>(env.baseUrl(), "Operator", key, "refresh", { presentedHash: hash }),
       ]);
 
       expect(first.status).toBe("ok");
@@ -125,13 +88,13 @@ describe("Operator object", () => {
       const key = randomUUID();
       const raw = randomUUID();
       const hash = sha256(raw);
-      await callObject(env.baseUrl(), key, "issue", issueBody({ hash }));
+      await callObject(env.baseUrl(), "Operator", key, "issue", issueBody({ hash }));
 
-      const rotated = await callObject<RefreshResult>(env.baseUrl(), key, "refresh", { presentedHash: hash });
+      const rotated = await callObject<RefreshResult>(env.baseUrl(), "Operator", key, "refresh", { presentedHash: hash });
       expect(rotated.status).toBe("ok");
 
       // Present the now-rotated-away hash again — immediately, well inside the 30s window.
-      const concurrent = await callObject<RefreshResult>(env.baseUrl(), key, "refresh", { presentedHash: hash });
+      const concurrent = await callObject<RefreshResult>(env.baseUrl(), "Operator", key, "refresh", { presentedHash: hash });
       expect(concurrent).toEqual(rotated);
     },
   );
@@ -143,13 +106,15 @@ describe("Operator object", () => {
       if (!env) throw new Error(`environment "${label}" did not start`);
       const key = randomUUID();
       const hash = sha256(randomUUID());
-      await callObject(env.baseUrl(), key, "issue", issueBody({ hash }));
+      await callObject(env.baseUrl(), "Operator", key, "issue", issueBody({ hash }));
 
-      const forged = await callObject<RefreshResult>(env.baseUrl(), key, "refresh", { presentedHash: sha256("forged") });
+      const forged = await callObject<RefreshResult>(env.baseUrl(), "Operator", key, "refresh", {
+        presentedHash: sha256("forged"),
+      });
       expect(forged).toEqual({ status: "replay" });
 
       // The legitimate current hash still works — the forged presentation did not clear state.
-      const legitimate = await callObject<RefreshResult>(env.baseUrl(), key, "refresh", { presentedHash: hash });
+      const legitimate = await callObject<RefreshResult>(env.baseUrl(), "Operator", key, "refresh", { presentedHash: hash });
       expect(legitimate.status).toBe("ok");
     },
   );
@@ -161,12 +126,12 @@ describe("Operator object", () => {
       if (!env) throw new Error(`environment "${label}" did not start`);
       const key = randomUUID();
       const hash = sha256(randomUUID());
-      await callObject(env.baseUrl(), key, "issue", issueBody({ hash, expiresAt: Date.now() - 1000 }));
+      await callObject(env.baseUrl(), "Operator", key, "issue", issueBody({ hash, expiresAt: Date.now() - 1000 }));
 
-      const result = await callObject<RefreshResult>(env.baseUrl(), key, "refresh", { presentedHash: hash });
+      const result = await callObject<RefreshResult>(env.baseUrl(), "Operator", key, "refresh", { presentedHash: hash });
       expect(result).toEqual({ status: "expired" });
 
-      const description = await callObject<DescribeResult>(env.baseUrl(), key, "describe", {});
+      const description = await callObject<DescribeResult>(env.baseUrl(), "Operator", key, "describe", {});
       expect(description).toEqual({ email: null, rotatedAt: null, expiresAt: null });
     },
   );
@@ -178,10 +143,10 @@ describe("Operator object", () => {
       if (!env) throw new Error(`environment "${label}" did not start`);
       const key = randomUUID();
       const hash = sha256(randomUUID());
-      await callObject(env.baseUrl(), key, "issue", issueBody({ hash }));
-      await callObject(env.baseUrl(), key, "revoke", {});
+      await callObject(env.baseUrl(), "Operator", key, "issue", issueBody({ hash }));
+      await callObject(env.baseUrl(), "Operator", key, "revoke", {});
 
-      const result = await callObject<RefreshResult>(env.baseUrl(), key, "refresh", { presentedHash: hash });
+      const result = await callObject<RefreshResult>(env.baseUrl(), "Operator", key, "refresh", { presentedHash: hash });
       expect(result).toEqual({ status: "replay" });
     },
   );
@@ -193,17 +158,19 @@ describe("Operator object", () => {
       if (!env) throw new Error(`environment "${label}" did not start`);
       const key = randomUUID();
       const firstHash = sha256(randomUUID());
-      await callObject(env.baseUrl(), key, "issue", issueBody({ hash: firstHash }));
-      await callObject(env.baseUrl(), key, "revoke", {});
+      await callObject(env.baseUrl(), "Operator", key, "issue", issueBody({ hash: firstHash }));
+      await callObject(env.baseUrl(), "Operator", key, "revoke", {});
 
       // The old family's hash must no longer work post-revoke.
-      const afterRevoke = await callObject<RefreshResult>(env.baseUrl(), key, "refresh", { presentedHash: firstHash });
+      const afterRevoke = await callObject<RefreshResult>(env.baseUrl(), "Operator", key, "refresh", {
+        presentedHash: firstHash,
+      });
       expect(afterRevoke).toEqual({ status: "replay" });
 
       const secondHash = sha256(randomUUID());
-      await callObject(env.baseUrl(), key, "issue", issueBody({ hash: secondHash, email: "re-signed-in@eudoxus.ai" }));
+      await callObject(env.baseUrl(), "Operator", key, "issue", issueBody({ hash: secondHash, email: "re-signed-in@eudoxus.ai" }));
 
-      const refreshed = await callObject<RefreshResult>(env.baseUrl(), key, "refresh", { presentedHash: secondHash });
+      const refreshed = await callObject<RefreshResult>(env.baseUrl(), "Operator", key, "refresh", { presentedHash: secondHash });
       expect(refreshed.status).toBe("ok");
       if (refreshed.status === "ok") {
         expect(refreshed.email).toBe("re-signed-in@eudoxus.ai");
@@ -218,9 +185,9 @@ describe("Operator object", () => {
       if (!env) throw new Error(`environment "${label}" did not start`);
       const key = randomUUID();
       const hash = sha256(randomUUID());
-      await callObject(env.baseUrl(), key, "issue", issueBody({ hash, email: "describe-test@eudoxus.ai" }));
+      await callObject(env.baseUrl(), "Operator", key, "issue", issueBody({ hash, email: "describe-test@eudoxus.ai" }));
 
-      const description = await callObject<Record<string, unknown>>(env.baseUrl(), key, "describe", {});
+      const description = await callObject<Record<string, unknown>>(env.baseUrl(), "Operator", key, "describe", {});
       expect(Object.keys(description).sort()).toEqual(["email", "expiresAt", "rotatedAt"]);
       expect(description.email).toBe("describe-test@eudoxus.ai");
       expect(typeof description.rotatedAt).toBe("number");
@@ -237,9 +204,9 @@ describe("Operator object", () => {
       const key = randomUUID();
       const raw = randomUUID();
       const hash = sha256(raw);
-      await callObject(env.baseUrl(), key, "issue", issueBody({ hash }));
-      const rotated = await callObject<RefreshResult>(env.baseUrl(), key, "refresh", { presentedHash: hash });
-      const concurrent = await callObject<RefreshResult>(env.baseUrl(), key, "refresh", { presentedHash: hash });
+      await callObject(env.baseUrl(), "Operator", key, "issue", issueBody({ hash }));
+      const rotated = await callObject<RefreshResult>(env.baseUrl(), "Operator", key, "refresh", { presentedHash: hash });
+      const concurrent = await callObject<RefreshResult>(env.baseUrl(), "Operator", key, "refresh", { presentedHash: hash });
       return {
         rotateStatus: rotated.status,
         concurrentStatus: concurrent.status,

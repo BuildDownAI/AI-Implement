@@ -7,11 +7,9 @@
 // Run with `npm run test:restate` (Docker required); excluded from `npm test`.
 import { randomUUID } from "node:crypto";
 import * as restate from "@restatedev/restate-sdk";
-import { RestateContainer, RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
+import { RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-
-// Pinned to match the image cached by .github/workflows/unit-tests.yml's restate-tests job.
-const RESTATE_IMAGE_VERSION = "1.7.10";
+import { VARIANTS, callService, callWorkflow, startVariants, stopAll } from "./harness.js";
 
 interface EchoInput {
   value: string;
@@ -27,6 +25,11 @@ const echoService = restate.service({
     ping: async (_ctx: restate.Context, input: EchoInput): Promise<EchoOutput> => ({
       echoed: input.value,
     }),
+    // A void handler, used below to prove callService resolves an empty 2xx body to
+    // `undefined` instead of throwing a JSON-parse error (the AII-709 regression).
+    noop: async (): Promise<void> => {
+      return;
+    },
   },
 });
 
@@ -60,23 +63,6 @@ const probeWorkflow = restate.workflow({
   },
   options: PROBE_WORKFLOW_OPTIONS,
 });
-
-// Matches what serviceClient/workflowClient build in @restatedev/restate-sdk-clients'
-// ingress (doComponentInvocation): `${url}/${component}/${key?}/${handler}`, with no
-// `/restate/` prefix — that prefix is reserved for admin/introspection routes
-// (`/restate/health`, `/restate/workflow/<name>/<key>/<op>` for attach/output), not
-// for invoking a handler.
-async function callService<T>(baseUrl: string, service: string, handler: string, body: unknown): Promise<T> {
-  const response = await fetch(`${baseUrl}/${service}/${handler}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!response.ok) {
-    throw new Error(`${service}/${handler} failed: ${response.status} ${await response.text()}`);
-  }
-  return response.json() as Promise<T>;
-}
 
 // The admin API's own serialization format for these durations isn't part of the
 // SDK's TypeScript surface (the SDK types describe what the endpoint discovery manifest
@@ -129,49 +115,15 @@ function expectDurationMs(actual: unknown, expectedMs: number, field: string): v
   throw new Error(`unexpected type for ${field}: ${typeof actual}`);
 }
 
-async function callWorkflow<T>(baseUrl: string, workflow: string, key: string, handler: string): Promise<T> {
-  const response = await fetch(`${baseUrl}/${workflow}/${key}/${handler}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: "{}",
-  });
-  if (!response.ok) {
-    throw new Error(`${workflow}/${key}/${handler} failed: ${response.status} ${await response.text()}`);
-  }
-  return response.json() as Promise<T>;
-}
-
-// Both options are proven for AII-683: each environment boots the same trivial
-// services with one of the two test options RestateTestEnvironment.start supports.
-// RestateTestEnvironment.start() only translates `alwaysReplay`/`disableRetries` into
-// container config in its own default container-factory branch — supplying a custom
-// `container` factory (needed here to pin the image version) bypasses that wiring, so
-// each variant's factory must call the corresponding RestateContainer method itself.
-const VARIANTS = [
-  ["alwaysReplay", (container: RestateContainer) => container.alwaysReplay()],
-  ["disableRetries", (container: RestateContainer) => container.disableRetries()],
-] satisfies Array<[string, (container: RestateContainer) => RestateContainer]>;
-
 describe("Restate harness", () => {
-  const environments = new Map<string, RestateTestEnvironment>();
+  let environments: Map<string, RestateTestEnvironment>;
 
   beforeAll(async () => {
-    const started = await Promise.all(
-      VARIANTS.map(async ([label, configure]) => {
-        const env = await RestateTestEnvironment.start({
-          services: [echoService, probeWorkflow],
-          container: () => configure(new RestateContainer(RESTATE_IMAGE_VERSION)),
-        });
-        return [label, env] as const;
-      }),
-    );
-    for (const [label, env] of started) {
-      environments.set(label, env);
-    }
+    environments = await startVariants([echoService, probeWorkflow]);
   }, 60_000);
 
   afterAll(async () => {
-    await Promise.all([...environments.values()].map((env) => env.stop()));
+    await stopAll(environments);
   });
 
   it.each(VARIANTS.map(([label]) => label))(
@@ -183,6 +135,16 @@ describe("Restate harness", () => {
         value: "pong",
       });
       expect(result).toEqual({ echoed: "pong" });
+    },
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "returns undefined on an empty 2xx body from a void handler (%s)",
+    async (label) => {
+      const env = environments.get(label);
+      if (!env) throw new Error(`environment "${label}" did not start`);
+      const result = await callService<void>(env.baseUrl(), "harnessEcho", "noop", {});
+      expect(result).toBeUndefined();
     },
   );
 

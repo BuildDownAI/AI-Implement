@@ -171,7 +171,7 @@ The operator's `GH_TOKEN` (or `GITHUB_TOKEN`) is injected as `AI_IMPLEMENT_DEP_T
 ```bash
 npm test          # vitest run
 npm run typecheck # tsc --noEmit
-npm run test:restate # src/__tests__/*.restate.test.ts — needs Docker, not part of npm test
+npm run test:restate # src/__tests__/restate/**/*.restate.test.ts — needs Docker, not part of npm test
 ```
 
 **`typecheck` excludes `src/__tests__`, and vitest strips types without checking them** — so type errors in a test file are caught by nothing. Type-check a new test file explicitly with a throwaway tsconfig. `src/admin-ui/__tests__/` *is* covered and can break the build.

@@ -43,7 +43,7 @@ jobs:
           npm test
       - run: npm run typecheck
 
-  # Restate harness (AII-612): src/__tests__/*.restate.test.ts, isolated from
+  # Restate harness (AII-612): src/__tests__/restate/**/*.restate.test.ts, isolated from
   # `unit-tests` above because it needs Docker for testcontainers. No `on:` block
   # here on purpose — a job inherits the workflow's triggers only by staying in
   # this file, which is what gets it onto ai-implement/feature/** PRs (AII-467
@@ -55,8 +55,8 @@ jobs:
     env:
       # Pinned (not `latest`) so the image cache key below is stable and so a
       # new Restate release can't silently change the harness's behavior.
-      # Keep in sync with the `RestateContainer` version pinned in
-      # src/__tests__/restate-harness.restate.test.ts.
+      # Keep in sync with the `RESTATE_IMAGE_VERSION` constant in
+      # src/__tests__/restate/harness.ts.
       RESTATE_IMAGE_TAG: "1.7.10"
     steps:
       - uses: actions/checkout@v4

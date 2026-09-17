@@ -2,19 +2,20 @@
 // AII-710) — a real Restate server (via testcontainers) journals the ingress body and
 // delivers it to our in-process endpoint, proving the role assertion and the discovery
 // metadata work through the real wire, not just against the unit-level fakes in
-// tools.test.ts. Shape mirrors src/__tests__/restate-harness.restate.test.ts exactly.
+// tools.test.ts. Shape mirrors src/__tests__/restate/harness.restate.test.ts exactly.
 //
 // Run with `npm run test:restate` (Docker required); excluded from `npm test`.
 import * as restate from "@restatedev/restate-sdk";
-import { RestateContainer, RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
+import { RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
 import { z } from "zod";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { orchestratorTools, tool, type ToolResponse } from "../restate/tools.js";
-import * as dedup from "../dedup.js";
-import { initLogTable } from "../log.js";
-import { initMappingsTable, getMappings } from "../config.js";
-import { initSettingsTable } from "../runner-mode.js";
-import { setKgMemoryProvider } from "../kg-provider.js";
+import { orchestratorTools, tool, type ToolResponse } from "../../restate/tools.js";
+import * as dedup from "../../dedup.js";
+import { initLogTable } from "../../log.js";
+import { initMappingsTable, getMappings } from "../../config.js";
+import { initSettingsTable } from "../../runner-mode.js";
+import { setKgMemoryProvider } from "../../kg-provider.js";
+import { VARIANTS, callService, startVariants, stopAll } from "./harness.js";
 
 // A second service, built with tool(), whose only handler throws — proves the wrapper's
 // try/catch (not just get_tenant_health's own well-behaved body) turns a thrown error into
@@ -72,61 +73,15 @@ const idempotentTools = restate.service({
   },
 });
 
-// Pinned to match the image cached by .github/workflows/unit-tests.yml's restate-tests job.
-const RESTATE_IMAGE_VERSION = "1.7.10";
-
-// Same two variants restate-harness.restate.test.ts proves the endpoint boots under.
-const VARIANTS = [
-  ["alwaysReplay", (container: RestateContainer) => container.alwaysReplay()],
-  ["disableRetries", (container: RestateContainer) => container.disableRetries()],
-] satisfies Array<[string, (container: RestateContainer) => RestateContainer]>;
-
-interface IngressResult {
-  status: number;
-  body: { content?: Array<{ type: string; text: string }>; isError?: boolean } | undefined;
-}
-
-async function callIngress(
-  baseUrl: string,
-  handler: string,
-  payload: unknown,
-  service = "orchestratorTools",
-): Promise<IngressResult> {
-  const response = await fetch(`${baseUrl}/${service}/${handler}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  const text = await response.text();
-  return { status: response.status, body: text ? JSON.parse(text) : undefined };
-}
-
-/**
- * Like callIngress, but carries Restate's own `idempotency-key` header
- * (https://docs.restate.dev/operate/invocation#invoke-a-handler-idempotently) and returns the
- * raw body untyped — used by the idempotency tests below, one of which targets a non-tool()
- * service whose response shape (`{ attempt }`) isn't a ToolResponse.
- */
-async function callIngressWithIdempotencyKey(
-  baseUrl: string,
-  handler: string,
-  idempotencyKey: string,
-  payload: unknown,
-  service = "orchestratorTools",
-): Promise<{ status: number; body: unknown }> {
-  const response = await fetch(`${baseUrl}/${service}/${handler}`, {
-    method: "POST",
-    headers: { "content-type": "application/json", "idempotency-key": idempotencyKey },
-    body: JSON.stringify(payload),
-  });
-  const text = await response.text();
-  return { status: response.status, body: text ? JSON.parse(text) : undefined };
+interface ToolCallResult {
+  content?: Array<{ type: string; text: string }>;
+  isError?: boolean;
 }
 
 const SYSTEM = { kind: "system", email: null, role: "admin" } as const;
 
 describe("orchestratorTools (Restate)", () => {
-  const environments = new Map<string, RestateTestEnvironment>();
+  let environments: Map<string, RestateTestEnvironment>;
 
   beforeAll(async () => {
     // get_tenant_health reads comment_gapfill_queue via dedup.getDb(); DEDUP_DB_PATH is
@@ -143,22 +98,11 @@ describe("orchestratorTools (Restate)", () => {
     ).run("BDS", "BuildDownAI", "skills", "claude.yml", "testing", JSON.stringify({ SUPER_SECRET: "leak-me" }));
     setKgMemoryProvider(null);
 
-    const started = await Promise.all(
-      VARIANTS.map(async ([label, configure]) => {
-        const env = await RestateTestEnvironment.start({
-          services: [orchestratorTools, failingTools, suspendingTools, idempotentTools],
-          container: () => configure(new RestateContainer(RESTATE_IMAGE_VERSION)),
-        });
-        return [label, env] as const;
-      }),
-    );
-    for (const [label, env] of started) {
-      environments.set(label, env);
-    }
+    environments = await startVariants([orchestratorTools, failingTools, suspendingTools, idempotentTools]);
   }, 60_000);
 
   afterAll(async () => {
-    await Promise.all([...environments.values()].map((env) => env.stop()));
+    await stopAll(environments);
   });
 
   it.each(VARIANTS.map(([label]) => label))(
@@ -167,12 +111,11 @@ describe("orchestratorTools (Restate)", () => {
       const env = environments.get(label);
       if (!env) throw new Error(`environment "${label}" did not start`);
 
-      const { status, body } = await callIngress(env.baseUrl(), "get_tenant_health", {
+      const body = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", "get_tenant_health", {
         caller: { kind: "system", email: null, role: "admin" },
         args: {},
       });
 
-      expect(status).toBe(200);
       const text = body?.content?.[0]?.text;
       expect(text).toBeTruthy();
       const health = JSON.parse(text as string) as Record<string, unknown>;
@@ -191,12 +134,11 @@ describe("orchestratorTools (Restate)", () => {
       const env = environments.get(label);
       if (!env) throw new Error(`environment "${label}" did not start`);
 
-      const { status, body } = await callIngress(env.baseUrl(), "get_tenant_health", {
+      const body = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", "get_tenant_health", {
         caller: { kind: "human", email: "user@example.com", role: null },
         args: {},
       });
 
-      expect(status).toBe(200);
       expect(body?.isError).toBe(true);
       expect(body?.content?.[0]?.text).toBe("forbidden: get_tenant_health requires the user role");
     },
@@ -209,8 +151,8 @@ describe("orchestratorTools (Restate)", () => {
       if (!env) throw new Error(`environment "${label}" did not start`);
 
       // Deployment metadata only appears after the handler has been invoked at least
-      // once against this environment (noted in restate-harness.restate.test.ts too).
-      await callIngress(env.baseUrl(), "get_tenant_health", {
+      // once against this environment (noted in harness.restate.test.ts too).
+      await callService(env.baseUrl(), "orchestratorTools", "get_tenant_health", {
         caller: { kind: "system", email: null, role: "admin" },
         args: {},
       });
@@ -232,14 +174,11 @@ describe("orchestratorTools (Restate)", () => {
       const env = environments.get(label);
       if (!env) throw new Error(`environment "${label}" did not start`);
 
-      const { status, body } = await callIngress(
-        env.baseUrl(),
-        "always_throws",
-        { caller: { kind: "system", email: null, role: "admin" }, args: {} },
-        "failingTools",
-      );
+      const body = await callService<ToolCallResult>(env.baseUrl(), "failingTools", "always_throws", {
+        caller: { kind: "system", email: null, role: "admin" },
+        args: {},
+      });
 
-      expect(status).toBe(200);
       expect(body?.isError).toBe(true);
       expect(body?.content?.[0]?.text).toBe("always_throws failed: boom");
     },
@@ -251,26 +190,26 @@ describe("orchestratorTools (Restate)", () => {
       const env = environments.get(label);
       if (!env) throw new Error(`environment "${label}" did not start`);
 
-      const { status, body } = await callIngress(
-        env.baseUrl(),
-        "sleep_then_succeed",
-        { caller: { kind: "system", email: null, role: "admin" }, args: {} },
-        "suspendingTools",
-      );
+      const body = await callService<ToolCallResult>(env.baseUrl(), "suspendingTools", "sleep_then_succeed", {
+        caller: { kind: "system", email: null, role: "admin" },
+        args: {},
+      });
 
-      expect(status).toBe(200);
       expect(body?.isError).toBeFalsy();
       expect(body?.content?.[0]?.text).toBe("done");
     },
   );
+
   // ---- AII-711: the migrated read handlers through the real ingress.
   it.each(VARIANTS.map(([label]) => label))(
     "get_runner_mode returns { mode, source } (%s)",
     async (label) => {
       const env = environments.get(label);
       if (!env) throw new Error(`environment "${label}" did not start`);
-      const { status, body } = await callIngress(env.baseUrl(), "get_runner_mode", { caller: SYSTEM, args: {} });
-      expect(status).toBe(200);
+      const body = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", "get_runner_mode", {
+        caller: SYSTEM,
+        args: {},
+      });
       expect(body?.isError).toBeUndefined();
       expect(Object.keys(JSON.parse(body?.content?.[0]?.text as string)).sort()).toEqual(["mode", "source"]);
     },
@@ -281,8 +220,10 @@ describe("orchestratorTools (Restate)", () => {
     async (label) => {
       const env = environments.get(label);
       if (!env) throw new Error(`environment "${label}" did not start`);
-      const { status, body } = await callIngress(env.baseUrl(), "list_projects", { caller: SYSTEM, args: {} });
-      expect(status).toBe(200);
+      const body = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", "list_projects", {
+        caller: SYSTEM,
+        args: {},
+      });
       const text = body?.content?.[0]?.text as string;
       const rows = JSON.parse(text) as Array<{ teamKey: string; repo: string }>;
       expect(rows.map((r) => r.teamKey)).toEqual(["BDS"]);
@@ -299,12 +240,11 @@ describe("orchestratorTools (Restate)", () => {
       if (!env) throw new Error(`environment "${label}" did not start`);
       dedup.getDb().prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('linear_pickup_label', ?)").run("AI-Implement-Restate");
 
-      const { status, body } = await callIngress(env.baseUrl(), "get_project_binding", {
+      const body = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", "get_project_binding", {
         caller: SYSTEM,
         args: { repo: "BuildDownAI/skills" },
       });
 
-      expect(status).toBe(200);
       const text = body?.content?.[0]?.text as string;
       const binding = JSON.parse(text) as Record<string, unknown>;
       expect(binding.team).toBe("BDS");
@@ -320,15 +260,29 @@ describe("orchestratorTools (Restate)", () => {
     async (label) => {
       const env = environments.get(label);
       if (!env) throw new Error(`environment "${label}" did not start`);
-      const ok = await callIngress(env.baseUrl(), "get_issue_dispatch_status", { caller: SYSTEM, args: { identifier: "AII-1" } });
-      expect(ok.status).toBe(200);
-      const shape = JSON.parse(ok.body?.content?.[0]?.text as string) as Record<string, unknown>;
-      expect(Object.keys(shape).sort()).toEqual(["dedupEntry", "identifier", "inDedupWindow", "inFlight", "mergeVerdict", "recentDispatches"]);
+      const ok = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", "get_issue_dispatch_status", {
+        caller: SYSTEM,
+        args: { identifier: "AII-1" },
+      });
+      const shape = JSON.parse(ok?.content?.[0]?.text as string) as Record<string, unknown>;
+      expect(Object.keys(shape).sort()).toEqual([
+        "dedupEntry",
+        "identifier",
+        "inDedupWindow",
+        "inFlight",
+        "mergeVerdict",
+        "recentDispatches",
+      ]);
       expect(shape.inFlight).toBe(false);
-      // zod rejects a number before the handler body runs: the ingress answers 4xx.
-      const bad = await callIngress(env.baseUrl(), "get_issue_dispatch_status", { caller: SYSTEM, args: { identifier: 5 } });
-      expect(bad.status).toBeGreaterThanOrEqual(400);
-      expect(bad.status).toBeLessThan(500);
+
+      // zod rejects a number before the handler body runs: the ingress answers 4xx, which
+      // callService surfaces as a thrown error carrying the status.
+      await expect(
+        callService(env.baseUrl(), "orchestratorTools", "get_issue_dispatch_status", {
+          caller: SYSTEM,
+          args: { identifier: 5 },
+        }),
+      ).rejects.toThrow(/orchestratorTools\/get_issue_dispatch_status failed: 4\d\d/);
     },
   );
 
@@ -337,8 +291,10 @@ describe("orchestratorTools (Restate)", () => {
     async (label) => {
       const env = environments.get(label);
       if (!env) throw new Error(`environment "${label}" did not start`);
-      const { status, body } = await callIngress(env.baseUrl(), "kg_hybrid_search", { caller: SYSTEM, args: { query: "x" } });
-      expect(status).toBe(200);
+      const body = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", "kg_hybrid_search", {
+        caller: SYSTEM,
+        args: { query: "x" },
+      });
       expect(body?.isError).toBe(true);
       expect(body?.content?.[0]?.text).toBe("no memory provider is configured");
     },
@@ -354,7 +310,10 @@ describe("orchestratorTools (Restate)", () => {
     async (label) => {
       const env = environments.get(label);
       if (!env) throw new Error(`environment "${label}" did not start`);
-      await callIngress(env.baseUrl(), "pause_project", { caller: SYSTEM, args: { teamKey: "no-such-team", paused: true } });
+      await callService(env.baseUrl(), "orchestratorTools", "pause_project", {
+        caller: SYSTEM,
+        args: { teamKey: "no-such-team", paused: true },
+      });
       const response = await fetch(`${env.adminAPIBaseUrl()}/services/orchestratorTools`);
       expect(response.ok).toBe(true);
       const metadata = (await response.json()) as {
@@ -372,8 +331,8 @@ describe("orchestratorTools (Restate)", () => {
       const env = environments.get(label);
       if (!env) throw new Error(`environment "${label}" did not start`);
       // Deployment metadata only appears once each handler has been invoked at least once.
-      await callIngress(env.baseUrl(), "trigger_kg_refresh", { caller: SYSTEM, args: {} });
-      await callIngress(env.baseUrl(), "add_project", { caller: SYSTEM, args: {} });
+      await callService(env.baseUrl(), "orchestratorTools", "trigger_kg_refresh", { caller: SYSTEM, args: {} });
+      await callService(env.baseUrl(), "orchestratorTools", "add_project", { caller: SYSTEM, args: {} });
 
       const response = await fetch(`${env.adminAPIBaseUrl()}/services/orchestratorTools`);
       const metadata = (await response.json()) as {
@@ -397,11 +356,10 @@ describe("orchestratorTools (Restate)", () => {
     async (label) => {
       const env = environments.get(label);
       if (!env) throw new Error(`environment "${label}" did not start`);
-      const { status, body } = await callIngress(env.baseUrl(), "clear_dispatch_dedup", {
+      const body = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", "clear_dispatch_dedup", {
         caller: { kind: "human", email: "user@example.com", role: "user" },
         args: { issueId: "some-issue" },
       });
-      expect(status).toBe(200);
       expect(body?.isError).toBe(true);
       expect(body?.content?.[0]?.text).toBe("forbidden: clear_dispatch_dedup requires the admin role");
     },
@@ -412,23 +370,26 @@ describe("orchestratorTools (Restate)", () => {
     if (!env) throw new Error('environment "alwaysReplay" did not start');
     const key = "pause-project-dedup-test";
 
-    const first = await callIngressWithIdempotencyKey(env.baseUrl(), "pause_project", key, {
-      caller: SYSTEM,
-      args: { teamKey: "BDS", paused: true },
-    });
-    expect(first.status).toBe(200);
-    const firstBody = first.body as { content: Array<{ type: string; text: string }> };
-    expect(JSON.parse(firstBody.content[0].text)).toEqual({ status: 200, body: { updated: true, paused: true } });
+    const first = await callService<ToolCallResult>(
+      env.baseUrl(),
+      "orchestratorTools",
+      "pause_project",
+      { caller: SYSTEM, args: { teamKey: "BDS", paused: true } },
+      { "idempotency-key": key },
+    );
+    expect(JSON.parse(first.content?.[0]?.text as string)).toEqual({ status: 200, body: { updated: true, paused: true } });
 
     // Same key, opposite `paused` value — if this ran pauseProjectAction again the mapping
     // would flip back to false; instead Restate returns the first call's cached result and
     // the second `args` are never seen by the handler.
-    const second = await callIngressWithIdempotencyKey(env.baseUrl(), "pause_project", key, {
-      caller: SYSTEM,
-      args: { teamKey: "BDS", paused: false },
-    });
-    const secondBody = second.body as { content: Array<{ type: string; text: string }> };
-    expect(JSON.parse(secondBody.content[0].text)).toEqual({ status: 200, body: { updated: true, paused: true } });
+    const second = await callService<ToolCallResult>(
+      env.baseUrl(),
+      "orchestratorTools",
+      "pause_project",
+      { caller: SYSTEM, args: { teamKey: "BDS", paused: false } },
+      { "idempotency-key": key },
+    );
+    expect(JSON.parse(second.content?.[0]?.text as string)).toEqual({ status: 200, body: { updated: true, paused: true } });
 
     expect(getMappings().BDS?.paused).toBe(true);
   });
@@ -443,13 +404,24 @@ describe("orchestratorTools (Restate)", () => {
       if (!env) throw new Error('environment "alwaysReplay" did not start');
       const key = "throws-once-dedup-test";
 
-      const first = await callIngressWithIdempotencyKey(env.baseUrl(), "throws_once_then_succeeds", key, {}, "idempotentTools");
-      expect(first.status).toBe(200);
-      expect(first.body).toEqual({ attempt: 2 });
+      const first = await callService<{ attempt: number }>(
+        env.baseUrl(),
+        "idempotentTools",
+        "throws_once_then_succeeds",
+        {},
+        { "idempotency-key": key },
+      );
+      expect(first).toEqual({ attempt: 2 });
       expect(idempotentAttempts).toBe(2);
 
-      const second = await callIngressWithIdempotencyKey(env.baseUrl(), "throws_once_then_succeeds", key, {}, "idempotentTools");
-      expect(second.body).toEqual({ attempt: 2 });
+      const second = await callService<{ attempt: number }>(
+        env.baseUrl(),
+        "idempotentTools",
+        "throws_once_then_succeeds",
+        {},
+        { "idempotency-key": key },
+      );
+      expect(second).toEqual({ attempt: 2 });
       expect(idempotentAttempts).toBe(2);
     },
     30_000,
