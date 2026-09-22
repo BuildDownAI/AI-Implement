@@ -70,3 +70,17 @@ The knowledge-graph work since `main` diverged. Each item is live on the testing
 Add a dated line here whenever `testing` gains something the promotion will need.
 
 - 2026-09-14 — initial list, written after the AII-630 programme landed on `testing`.
+- 2026-09-22 — **Connector-first skills need the `testing` MCP door.** BuildDown skills 1.5.29 (skills
+  PR #128, ADR 0002) bind through `get_project_binding()` and the claude.ai connector model. Checked
+  against production (`https://ai-implement.fly.dev`, v1.1.0, `main` at #336, 451 commits behind
+  `testing`) on 2026-09-22: `/mcp` serves seven read tools and no `get_project_binding`,
+  `get_session_identity`, `kg_*` or Restate-backed tools (AII-687 tree, AII-715), and dynamic client
+  registration with the claude.ai callback returns 400 because `MCP_ALLOWED_REDIRECT_ORIGINS` is not
+  set there (the code path exists on `main`; the secret does not). Until production carries `testing`'s
+  MCP surface, the current skills cannot point at it; only skills `v1.4.0` (the `main` channel, with
+  `bd-project-setup` and a per-repo `.mcp.json`) pair with orchestrator v1.1.0. Add at promotion time:
+  (a) set the redirect-origin secret on the production app, or land AII-732 first so it is an admin
+  setting; (b) add the production `/mcp` as a claude.ai connector and sign in once from chat and once
+  from Claude Code `/mcp`; (c) confirm the production mappings' Linear workspace and reconnect the
+  Linear connector to it; (d) run `bd-kg-search` in a fresh chat and a fresh `claude -p` session and read
+  the first six lines (BDS-80 capstone lists the expected text).
