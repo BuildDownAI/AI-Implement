@@ -91,7 +91,7 @@ import { resolveBaseBranch, findOpenRollUpPr } from "./feature-branch.js";
 import { validateIssueBaseBranch, postBranchComment } from "./base-branch.js";
 import { runMergeUps, clearRollUpHandledMarkersByIdentifier } from "./merge-up.js";
 import { runGroupingBranchAutoMerge } from "./auto-merge.js";
-import { getPendingReviewFixes, recordReviewFixDispatch, updateReviewFixStatus, shouldSkipReviewFix, enqueueReviewFix } from "./review-fix-queue.js";
+import { getPendingReviewFixes, recordReviewFixDispatch, updateReviewFixStatus, shouldSkipReviewFix, enqueueReviewFix, buildReviewFixTaskDescription } from "./review-fix-queue.js";
 import { drainCommentGapfillQueue } from "./comment-gapfill-drain.js";
 import { sweepOrphanedGapfillRows } from "./comment-gapfill-queue.js";
 import { processPendingWorkflowSyncs } from "./workflow-sync-queue.js";
@@ -3176,7 +3176,8 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
       // This snapshot defines the findings this specific gap-fill dispatch is
       // allowed to resolve. Findings that arrive after the snapshot remain open
       // for a later queue event rather than being cleared by an older run.
-      const dispatchFindingIds = listOpenReviewFindings(fix.repo, fix.prNumber).map((finding) => finding.id);
+      const openFindings = listOpenReviewFindings(fix.repo, fix.prNumber);
+      const dispatchFindingIds = openFindings.map((finding) => finding.id);
 
       const [owner] = fix.repo.split("/");
       const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
@@ -3187,6 +3188,32 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
         updateReviewFixStatus(fix.id, "skipped");
         continue;
       }
+
+      let issueDescription: string | null = null;
+      if (fix.issueIdentifier) {
+        try {
+          const provider = await registry.forMapping(mapping);
+          const issue = await provider.findByKey(fix.issueIdentifier);
+          issueDescription = issue?.description ?? null;
+        } catch (err) {
+          console.error(`[review-fix] Failed to fetch issue ${fix.issueIdentifier} for review fix #${fix.id}:`, err);
+        }
+      }
+
+      const taskDescription = buildReviewFixTaskDescription({
+        prNumber: fix.prNumber,
+        reason: fix.reason,
+        findings: openFindings.map((finding) => ({
+          finding_key: finding.findingKey,
+          source: finding.source,
+          severity: finding.severity,
+          path: finding.path ?? null,
+          line: finding.line ?? null,
+          body: finding.body,
+          url: finding.url ?? null,
+        })),
+        issueDescription,
+      });
 
       if (config.runnerCallbackBaseUrl && config.runnerTokenSecret) {
         // Gap-fill dispatches run the implementation workflow and can take as
@@ -3227,7 +3254,7 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
             id: fix.issueId,
             identifier: fix.issueIdentifier ?? fix.issueId,
             title: `Review feedback fix for PR #${fix.prNumber}`,
-            description: `Address late review feedback on PR #${fix.prNumber}. Queue reason: ${fix.reason}.`,
+            description: taskDescription,
           },
           prNumber: fix.prNumber,
           githubToken: ghToken,
@@ -3298,7 +3325,7 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
         id: fix.issueId,
         identifier: fix.issueIdentifier ?? fix.issueId,
         title: `Review feedback fix for PR #${fix.prNumber}`,
-        description: `Address late review feedback on PR #${fix.prNumber}. Queue reason: ${fix.reason}.`,
+        description: taskDescription,
       };
 
       const reviewFixInputs = reviewFixContract === "envelope"
@@ -3316,7 +3343,7 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
             issue_id: fix.issueId,
             issue_identifier: fix.issueIdentifier ?? fix.issueId,
             issue_title: `Review feedback fix for PR #${fix.prNumber}`,
-            issue_description: `Address late review feedback on PR #${fix.prNumber}. Queue reason: ${fix.reason}.`,
+            issue_description: taskDescription,
             pr_number: String(fix.prNumber),
             runner_phase: "gap-analysis" as const,
             ...providerDispatchFields(mapping),

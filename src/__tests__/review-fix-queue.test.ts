@@ -159,3 +159,137 @@ describe("review fix queue", () => {
     expect(queue.getPendingReviewFixes()).toEqual([]);
   });
 });
+
+describe("buildReviewFixTaskDescription", () => {
+  function makeFinding(overrides: Partial<ReviewFixQueueModule.ReviewFixTaskFinding> = {}): ReviewFixQueueModule.ReviewFixTaskFinding {
+    return {
+      finding_key: "finding-1",
+      source: "github-claude-code-review",
+      severity: "major",
+      path: "src/foo.ts",
+      line: 42,
+      body: "Something is wrong here.",
+      url: "https://github.com/org/repo/pull/1#discussion_r1",
+      ...overrides,
+    };
+  }
+
+  it("orders sections: header, issue requirements, then open review findings", () => {
+    const result = queue.buildReviewFixTaskDescription({
+      prNumber: 7,
+      reason: "changes_requested",
+      findings: [makeFinding()],
+      issueDescription: "Do the thing.",
+    });
+
+    expect(result.startsWith("Address review feedback on PR #7. Queue reason: changes_requested.")).toBe(true);
+    const issueIdx = result.indexOf("## Issue requirements");
+    const findingsIdx = result.indexOf("## Open review findings");
+    expect(issueIdx).toBeGreaterThan(-1);
+    expect(findingsIdx).toBeGreaterThan(issueIdx);
+    expect(result).toContain("Do the thing.");
+  });
+
+  it("renders a finding as a heading with source/severity/location, quoted body, and URL", () => {
+    const result = queue.buildReviewFixTaskDescription({
+      prNumber: 7,
+      reason: "changes_requested",
+      findings: [makeFinding({ finding_key: "abc123" })],
+      issueDescription: "Do the thing.",
+    });
+
+    expect(result).toContain("### abc123");
+    expect(result).toContain("github-claude-code-review · major · src/foo.ts:42");
+    expect(result).toContain("> Something is wrong here.");
+    expect(result).toContain("https://github.com/org/repo/pull/1#discussion_r1");
+  });
+
+  it("omits the line number when line is null and the whole location when path is null", () => {
+    const noLine = queue.buildReviewFixTaskDescription({
+      prNumber: 7,
+      reason: "r",
+      findings: [makeFinding({ path: "src/foo.ts", line: null })],
+      issueDescription: null,
+    });
+    expect(noLine).toContain("github-claude-code-review · major · src/foo.ts");
+    expect(noLine).not.toContain("src/foo.ts:");
+
+    const noPath = queue.buildReviewFixTaskDescription({
+      prNumber: 7,
+      reason: "r",
+      findings: [makeFinding({ path: null, line: null })],
+      issueDescription: null,
+    });
+    expect(noPath).toContain("github-claude-code-review · major");
+    expect(noPath).not.toContain("src/foo.ts");
+  });
+
+  it("omits the URL line when url is null", () => {
+    const result = queue.buildReviewFixTaskDescription({
+      prNumber: 7,
+      reason: "r",
+      findings: [makeFinding({ url: null })],
+      issueDescription: null,
+    });
+    expect(result).not.toContain("discussion_r1");
+    expect(result).not.toContain("https://");
+  });
+
+  it("falls back to a discussion-read line when there are no findings", () => {
+    const result = queue.buildReviewFixTaskDescription({
+      prNumber: 7,
+      reason: "r",
+      findings: [],
+      issueDescription: "Do the thing.",
+    });
+    expect(result).toContain("No structured findings are recorded. Read the PR discussion.");
+  });
+
+  it("caps at 30 findings and states the exact number left out", () => {
+    const findings = Array.from({ length: 31 }, (_, i) => makeFinding({ finding_key: `finding-${i}` }));
+    const result = queue.buildReviewFixTaskDescription({
+      prNumber: 7,
+      reason: "r",
+      findings,
+      issueDescription: null,
+    });
+
+    const headingCount = (result.match(/### finding-/g) ?? []).length;
+    expect(headingCount).toBe(30);
+    expect(result).toContain("1 additional finding was left out of this task");
+  });
+
+  it("truncates a finding body to 2000 characters plus an ellipsis", () => {
+    const longBody = "x".repeat(3000);
+    const result = queue.buildReviewFixTaskDescription({
+      prNumber: 7,
+      reason: "r",
+      findings: [makeFinding({ body: longBody })],
+      issueDescription: null,
+    });
+
+    expect(result).toContain(`> ${"x".repeat(2000)}…`);
+    expect(result).not.toContain("x".repeat(2001));
+  });
+
+  it("reports the original issue text as unavailable when null", () => {
+    const result = queue.buildReviewFixTaskDescription({
+      prNumber: 7,
+      reason: "r",
+      findings: [],
+      issueDescription: null,
+    });
+    expect(result).toContain("The original issue text was not available. Treat only defects as in scope.");
+  });
+
+  it("passes a non-null issue description through verbatim", () => {
+    const result = queue.buildReviewFixTaskDescription({
+      prNumber: 7,
+      reason: "r",
+      findings: [],
+      issueDescription: "Custom acceptance criteria here.",
+    });
+    expect(result).toContain("Custom acceptance criteria here.");
+    expect(result).not.toContain("not available");
+  });
+});

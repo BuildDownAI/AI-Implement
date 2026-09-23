@@ -62,9 +62,10 @@ const mockConfig = {
 } as unknown as IndexModule.AppConfig;
 
 const trackerPostCommentMock = vi.fn<(issueId: string, body: string) => Promise<void>>(async () => undefined);
+const findByKeyMock = vi.fn<(key: string) => Promise<TicketIssue | null>>(async () => null);
 
 const mockRegistry = {
-  forMapping: vi.fn(async () => ({ postComment: trackerPostCommentMock })),
+  forMapping: vi.fn(async () => ({ postComment: trackerPostCommentMock, findByKey: findByKeyMock })),
 } as unknown as import("../providers/index.js").ProviderRegistry;
 
 function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
@@ -133,6 +134,8 @@ beforeEach(async () => {
   configModule.initMappingsTable();
 
   githubAppAuthMocks.getInstallationToken.mockResolvedValue("gh-token");
+  findByKeyMock.mockReset();
+  findByKeyMock.mockResolvedValue(null);
   localGapfillMocks.dispatchLocalGapfill.mockResolvedValue({
     containerId: "container-1",
     containerName: "container-1",
@@ -621,5 +624,163 @@ describe("processReviewFixQueue — GHA phase fix", () => {
 
     const prior = log.countPriorDispatches("issue-5", "gap-analysis");
     expect(prior.count).toBe(1);
+  });
+});
+
+describe("processReviewFixQueue — task description wiring", () => {
+  it("builds the local-Docker dispatch's issue description with buildReviewFixTaskDescription", async () => {
+    const mapping = makeMapping();
+    configModule.upsertMapping("TEAM", mapping);
+
+    reviewFixQueue.enqueueReviewFix({
+      issueId: "issue-local",
+      issueIdentifier: "AII-10",
+      repo: "acme/billing",
+      prNumber: 60,
+      reason: "late review comment",
+    });
+
+    const reviewLedgerStore = await import("../review-ledger-store.js");
+    reviewLedgerStore.upsertReviewFinding({
+      repo: "acme/billing",
+      prNumber: 60,
+      source: "github-claude-code-review",
+      severity: "major",
+      body: "Fix the null check.",
+      path: "src/foo.ts",
+      line: 10,
+      url: "https://github.com/acme/billing/pull/60#discussion_r1",
+    });
+
+    findByKeyMock.mockResolvedValue({
+      id: "issue-local",
+      identifier: "AII-10",
+      title: "Some issue",
+      description: "Implement the widget.",
+      scopeKey: "TEAM",
+      nativeStatus: "In Progress",
+    });
+
+    await indexModule.processReviewFixQueue(mockConfig, mockRegistry);
+
+    expect(localGapfillMocks.dispatchLocalGapfill).toHaveBeenCalledTimes(1);
+    const [call] = localGapfillMocks.dispatchLocalGapfill.mock.calls[0]!;
+    const openFindings = reviewLedgerStore.listOpenReviewFindings("acme/billing", 60);
+    const expected = reviewFixQueue.buildReviewFixTaskDescription({
+      prNumber: 60,
+      reason: "late review comment",
+      findings: openFindings.map((f) => ({
+        finding_key: f.findingKey,
+        source: f.source,
+        severity: f.severity,
+        path: f.path ?? null,
+        line: f.line ?? null,
+        body: f.body,
+        url: f.url ?? null,
+      })),
+      issueDescription: "Implement the widget.",
+    });
+
+    expect(call.issue.description).toBe(expected);
+    expect(expected).toContain(`### ${openFindings[0]!.findingKey}`);
+    expect(expected).toContain("Implement the widget.");
+  });
+
+  it("uses buildReviewFixTaskDescription for the legacy issue_description dispatch field on the GHA path", async () => {
+    process.env.RUNNER_MODE = "default";
+    const mapping = makeMapping({ executionMode: "github-actions" });
+    configModule.upsertMapping("TEAM", mapping);
+
+    reviewFixQueue.enqueueReviewFix({
+      issueId: "issue-6",
+      issueIdentifier: "AII-6",
+      repo: "acme/billing",
+      prNumber: 55,
+      reason: "late review comment",
+    });
+
+    const reviewLedgerStore = await import("../review-ledger-store.js");
+    reviewLedgerStore.upsertReviewFinding({
+      repo: "acme/billing",
+      prNumber: 55,
+      source: "github-claude-code-review",
+      severity: "major",
+      body: "Fix the null check.",
+      path: "src/foo.ts",
+      line: 10,
+      url: "https://github.com/acme/billing/pull/55#discussion_r1",
+    });
+
+    findByKeyMock.mockResolvedValue({
+      id: "issue-6",
+      identifier: "AII-6",
+      title: "Some issue",
+      description: "Implement the widget.",
+      scopeKey: "TEAM",
+      nativeStatus: "In Progress",
+    });
+
+    const githubModule = await import("../github.js");
+    const workflowProbeModule = await import("../workflow-probe.js");
+    const repoImageModule = await import("../repo-image.js");
+
+    const dispatchWorkflowSpy = vi.spyOn(githubModule, "dispatchWorkflow").mockResolvedValue({ success: true, status: 204 });
+    vi.spyOn(workflowProbeModule, "resolveWorkflowCapabilities").mockResolvedValue({
+      contract: "legacy",
+      supportsRunPublicationToken: false,
+    });
+    vi.spyOn(repoImageModule, "resolveRunnerImageForDispatch").mockResolvedValue(undefined);
+
+    await indexModule.processReviewFixQueue(mockConfig, mockRegistry);
+
+    expect(dispatchWorkflowSpy).toHaveBeenCalledTimes(1);
+    const [, , inputs] = dispatchWorkflowSpy.mock.calls[0]!;
+    const openFindings = reviewLedgerStore.listOpenReviewFindings("acme/billing", 55);
+    const expected = reviewFixQueue.buildReviewFixTaskDescription({
+      prNumber: 55,
+      reason: "late review comment",
+      findings: openFindings.map((f) => ({
+        finding_key: f.findingKey,
+        source: f.source,
+        severity: f.severity,
+        path: f.path ?? null,
+        line: f.line ?? null,
+        body: f.body,
+        url: f.url ?? null,
+      })),
+      issueDescription: "Implement the widget.",
+    });
+
+    expect((inputs as Record<string, unknown>).issue_description).toBe(expected);
+    expect(expected).toContain(`### ${openFindings[0]!.findingKey}`);
+    expect(expected).toContain("Implement the widget.");
+  });
+
+  it("does not block dispatch when findByKey rejects, and falls back to the not-available line", async () => {
+    const mapping = makeMapping();
+    configModule.upsertMapping("TEAM", mapping);
+
+    reviewFixQueue.enqueueReviewFix({
+      issueId: "issue-fail",
+      issueIdentifier: "AII-11",
+      repo: "acme/billing",
+      prNumber: 61,
+      reason: "late review comment",
+    });
+
+    findByKeyMock.mockRejectedValue(new Error("provider unavailable"));
+
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    await indexModule.processReviewFixQueue(mockConfig, mockRegistry);
+
+    expect(localGapfillMocks.dispatchLocalGapfill).toHaveBeenCalledTimes(1);
+    const [call] = localGapfillMocks.dispatchLocalGapfill.mock.calls[0]!;
+    expect(call.issue.description).toContain("The original issue text was not available. Treat only defects as in scope.");
+
+    const pending = reviewFixQueue.getPendingReviewFixes();
+    expect(pending).toHaveLength(0);
+
+    consoleErrorSpy.mockRestore();
   });
 });
