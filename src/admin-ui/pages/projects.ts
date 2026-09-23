@@ -302,6 +302,11 @@ export const projectsHtml = `
             <input class="input" id="md-max-iter" type="number" min="1" step="1" placeholder="3">
             <div class="field-hint">Implement/review cycles. Blank = 2 on bedrock, 3 on anthropic.</div>
           </div>
+          <div class="field">
+            <label class="field-label">PR Dispatch Budget</label>
+            <input class="input" id="md-pr-budget" type="number" min="1" step="1" placeholder="4">
+            <div class="field-hint">Gap-fill runs per PR in 24 hours. At the limit, the PR is parked for a human.</div>
+          </div>
           <div class="field" style="grid-column:1 / -1">
             <label class="field-label">Reviewers</label>
             <div id="md-reviewer-list"></div>
@@ -765,6 +770,7 @@ export const projectsScript = `
     document.getElementById('md-aws-region').value = m.awsRegion || '';
     document.getElementById('md-max-turns').value = m.maxTurns == null ? '' : String(m.maxTurns);
     document.getElementById('md-max-iter').value = m.maxIterations == null ? '' : String(m.maxIterations);
+    document.getElementById('md-pr-budget').value = m.prDispatchBudget == null ? '' : String(m.prDispatchBudget);
     document.getElementById('md-max-job-min').value = m.maxJobMinutes == null ? '' : String(m.maxJobMinutes);
     reviewerDraft = reviewerRowsFromSelection(m.reviewers);
     reviewerDefaultUntouched = !Array.isArray(m.reviewers);
@@ -851,6 +857,7 @@ export const projectsScript = `
   const CAP_FIELDS = [
     ['Max Turns', 'maxTurns'],
     ['Max Iterations', 'maxIterations'],
+    ['PR Dispatch Budget', 'prDispatchBudget'],
     ['Job Timeout', 'maxJobMinutes'],
   ];
 
@@ -1189,6 +1196,7 @@ export const projectsScript = `
       awsRegion: document.getElementById('md-aws-region').value.trim() || null,
       maxTurns: optionalCap('md-max-turns'),
       maxIterations: optionalCap('md-max-iter'),
+      prDispatchBudget: optionalCap('md-pr-budget'),
       maxJobMinutes: optionalCap('md-max-job-min'),
       branchPrefix: (function(){ var v = document.getElementById('md-branch-prefix').value.trim(); return v === '' ? null : v; })(),
       skillsRepo: (function(){ var v = document.getElementById('md-skills-repo').value.trim(); return v === '' ? null : v; })(),

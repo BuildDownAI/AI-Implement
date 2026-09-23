@@ -229,6 +229,7 @@ describe("new-project stepper — the four touch points a new field needs", () =
     ["branchPrefix", "np-branch-prefix"],
     ["maxTurns", "np-maxTurns"],
     ["maxIterations", "np-maxIterations"],
+    ["prDispatchBudget", "np-prDispatchBudget"],
     ["maxJobMinutes", "np-maxJobMinutes"],
   ])("%s is declared, reset, collected and submitted", (field, id) => {
     expect(stepperHtml).toContain(`id="${id}"`);
@@ -247,7 +248,7 @@ describe("new-project stepper — cap validation", () => {
   });
 
   it("checks all three optional caps, not only the required one", () => {
-    for (const field of ["maxTurns", "maxIterations", "maxJobMinutes"]) {
+    for (const field of ["maxTurns", "maxIterations", "prDispatchBudget", "maxJobMinutes"]) {
       expect(stepperScript).toContain(`'${field}'`);
     }
     expect(stepperScript).toContain("for (const cap of CAP_FIELDS)");
@@ -279,6 +280,7 @@ describe("new-project stepper — field placement", () => {
     ["np-sessionMode", 4],
     ["np-maxAi", 6],
     ["np-maxTurns", 6],
+    ["np-prDispatchBudget", 6],
     ["np-maxJobMinutes", 6],
   ])("%s sits on step %i", (id, step) => {
     expect(stepOf(id)).toBe(step);

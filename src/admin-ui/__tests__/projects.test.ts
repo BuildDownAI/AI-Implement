@@ -230,3 +230,54 @@ describe("projects page reviewer control", () => {
     expect(posts[0]).toMatchObject({ reviewers: [{ id: custom, gates: false, maxTurns: 33 }] });
   });
 });
+
+describe("projects page PR dispatch budget field", () => {
+  it("declares the field right after Max Iterations with matching attributes", () => {
+    const maxIterAt = projectsHtml.indexOf('id="md-max-iter"');
+    const budgetAt = projectsHtml.indexOf('id="md-pr-budget"');
+    expect(maxIterAt).toBeGreaterThan(-1);
+    expect(budgetAt).toBeGreaterThan(maxIterAt);
+    expect(projectsHtml).toContain('id="md-pr-budget" type="number" min="1" step="1" placeholder="4"');
+    expect(projectsHtml).toContain("Gap-fill runs per PR in 24 hours. At the limit, the PR is parked for a human.");
+  });
+
+  it("loads the stored budget, and leaves it blank when null", async () => {
+    const { win, doc } = mountProjects(baseMapping({ prDispatchBudget: 6 }));
+    await win.loadMappings();
+    win.openMappingDialog("AII");
+    expect((doc.getElementById("md-pr-budget") as HTMLInputElement).value).toBe("6");
+
+    const { win: win2, doc: doc2 } = mountProjects(baseMapping({ prDispatchBudget: null }));
+    await win2.loadMappings();
+    win2.openMappingDialog("AII");
+    expect((doc2.getElementById("md-pr-budget") as HTMLInputElement).value).toBe("");
+  });
+
+  it("saves a changed value as a number and a blank as null", async () => {
+    const { win, doc, posts } = mountProjects(baseMapping({ prDispatchBudget: null }));
+    await win.loadMappings();
+    win.openMappingDialog("AII");
+
+    (doc.getElementById("md-pr-budget") as HTMLInputElement).value = "8";
+    await save(win);
+    expect(posts[0]).toMatchObject({ prDispatchBudget: 8 });
+
+    win.openMappingDialog("AII");
+    (doc.getElementById("md-pr-budget") as HTMLInputElement).value = "";
+    await save(win);
+    expect(posts[1]).toMatchObject({ prDispatchBudget: null });
+  });
+
+  it("validates the field like the other caps, via CAP_FIELDS", async () => {
+    expect(projectsScript).toContain("['PR Dispatch Budget', 'prDispatchBudget']");
+
+    const { win, doc, posts } = mountProjects(baseMapping({ prDispatchBudget: null }));
+    await win.loadMappings();
+    win.openMappingDialog("AII");
+
+    (doc.getElementById("md-pr-budget") as HTMLInputElement).value = "1.5";
+    await save(win);
+    expect(posts).toEqual([]);
+    expect(doc.getElementById("md-error")?.textContent).toContain("PR Dispatch Budget must be a positive integer, or blank for the default.");
+  });
+});
