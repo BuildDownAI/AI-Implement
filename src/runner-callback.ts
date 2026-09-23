@@ -6,6 +6,7 @@ import {
   updateJobFailure,
   updateJobPrUrl,
   updateJobStatus,
+  type Job,
 } from "./log.js";
 import type { Step } from "./pipeline/types.js";
 import { describeReferenceRepoCause, type ReferenceRepoResult } from "./reference-repos.js";
@@ -13,8 +14,10 @@ import type { TicketingProvider } from "./providers/types.js";
 import { remediateFailedJob, type StuckWatchdogConfig } from "./stuck-watchdog.js";
 import { verifyAndConsumeRunToken, verifyRunToken } from "./runner-tokens.js";
 import { getStepsByJobId, upsertStepRecord } from "./step-log.js";
-import { getReviewFixDispatchSnapshot } from "./review-fix-queue.js";
+import { enqueueReviewFix, getReviewFixDispatchSnapshot } from "./review-fix-queue.js";
 import { markReviewFindingsResolvedByIds, markReviewFindingsResolvedForPrSeenBefore } from "./review-ledger-store.js";
+import { getInstallationToken } from "./github-app-auth.js";
+import { getCommitAuthorType, getPullRequestState, postOrUpdateStickyComment } from "./github.js";
 import {
   renderClassification,
   renderFailureRecord,
@@ -271,6 +274,68 @@ function validateGithubRunId(body: unknown): number | null | HandleRunnerResultO
     : bad(400, "invalid_github_run_id");
 }
 
+const LEASE_HUMAN_COMMENT_MARKER = "<!-- ai-implement lease-human -->";
+
+/**
+ * AII-749: a gap-fill's push refused because the PR branch moved underneath it
+ * (`GIT_LEASE_REJECTED`) either lost the bot's own re-dispatched review-fix work
+ * (safe to retry) or collided with a human actively pushing to the same branch
+ * (never safe to race). Distinguishes the two by asking GitHub who authored the
+ * PR's current head commit, and only ever re-enqueues on a definite "Bot"
+ * answer — both "User" and an indeterminate `null` (unknown author, or the
+ * GitHub calls themselves failing) are treated as human, since guessing "Bot"
+ * here would race a human editing the branch. Every GitHub call is inside the
+ * try/catch: a failure here must not change the callback's own HTTP result.
+ */
+async function handleLeaseRejectedFailure(
+  job: Job,
+  watchdogConfig: StuckWatchdogConfig | undefined,
+): Promise<void> {
+  if (!job.repo || !job.prUrl) return;
+  const prNumber = parsePrNumber(job.prUrl);
+  if (prNumber === null) return;
+  if (!watchdogConfig) {
+    console.warn(
+      `[runner-callback] Lease rejected on PR ${job.prUrl} but no GitHub App credentials are configured — skipping`,
+    );
+    return;
+  }
+  const slashIdx = job.repo.indexOf("/");
+  const owner = slashIdx >= 0 ? job.repo.slice(0, slashIdx) : "";
+  const repo = slashIdx >= 0 ? job.repo.slice(slashIdx + 1) : "";
+  if (!owner || !repo) return;
+
+  try {
+    const token = await getInstallationToken(watchdogConfig.githubAppId, watchdogConfig.githubAppPrivateKey, owner);
+    const prState = await getPullRequestState(token, owner, repo, prNumber);
+    const authorType = prState?.headRef ? await getCommitAuthorType(token, owner, repo, prState.headRef) : null;
+
+    if (authorType === "Bot") {
+      enqueueReviewFix({
+        issueId: job.issueId,
+        issueIdentifier: job.issueIdentifier,
+        repo: job.repo,
+        prNumber,
+        reason: "lease_rejected",
+      });
+      console.log(`[runner-callback] Lease rejected on PR #${prNumber}; bot head, re-enqueued`);
+    } else {
+      // "User" and null (unknown author, or a GitHub call above failing) share
+      // this branch on purpose — see the function doc comment.
+      await postOrUpdateStickyComment(
+        token,
+        owner,
+        repo,
+        prNumber,
+        LEASE_HUMAN_COMMENT_MARKER,
+        `${LEASE_HUMAN_COMMENT_MARKER}\nA human pushed to this branch while AI-Implement was running, so the run stopped without pushing. Comment \`/ai-implement\` to resume.`,
+      );
+    }
+  } catch (err) {
+    console.error(`[runner-callback] leaseRejectedHandling failed for PR ${job.prUrl}:`, err);
+  }
+}
+
 export async function handleRunnerResult(
   input: HandleRunnerResultInput,
 ): Promise<HandleRunnerResultOutput> {
@@ -433,6 +498,15 @@ export async function handleRunnerResult(
     // after the provider call below actually posts, never pre-claimed: see the field's doc
     // comment on `Job`.
     if (failure && job) updateJobFailure(job.id, failure);
+
+    // AII-749: applies to any phase (including gap-analysis, which otherwise does
+    // nothing on failure below) and runs ahead of the phase-specific chain — a run
+    // record with no pr_url (an initial run) is left to that chain unchanged.
+    const isLeaseRejected = input.body.failureCode === "GIT_LEASE_REJECTED" || failure?.code === "GIT_LEASE_REJECTED";
+    if (isLeaseRejected && job?.prUrl) {
+      await handleLeaseRejectedFailure(job, input.watchdogConfig);
+    }
+
     if (input.body.phase === "planning") {
       const lastSuccessfulStage =
         failure && job ? deriveLastSuccessfulStage(getStepsByJobId(job.id), failure.stage) : null;

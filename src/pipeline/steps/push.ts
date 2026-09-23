@@ -224,9 +224,7 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
         console.error(`[push] remote branch advanced by agent push (${baseRef} → ${remoteBranchSha}); adopting`);
         expectedRemoteSha = remoteBranchSha;
       } else {
-        throw new Error(
-          `Existing PR branch changed during the run (expected ${baseRef}, found ${remoteBranchSha ?? "missing"}); refusing to overwrite concurrent work`,
-        );
+        throw buildExistingPrBranchChangedError(workspaceDir, activeGithubToken, baseRef, remoteBranchSha, commitSha);
       }
     } else {
       expectedRemoteSha = existingPrNumber ? baseRef : remoteBranchSha;
@@ -739,6 +737,40 @@ function describeUnpublishedWork(
   const primaryRef = compareRef ?? fallbackRef;
   const { stat, refUsed } = summarizeDiffStat(workspaceDir, githubToken, primaryRef, compareRef ? fallbackRef : null);
   return `\n\nUnpublished local commit: ${commitSha ?? "unknown"}\ngit diff --stat ${refUsed}..HEAD:\n${stat}`;
+}
+
+/**
+ * Builds the terminal `GIT_LEASE_REJECTED` error for a gap-fill push whose remote
+ * branch moved to a SHA that is neither the leased `baseRef` nor reachable from
+ * HEAD (i.e. not this run's own earlier push) — someone else's write landed on
+ * the PR branch before this run could push. Thrown before the push retry loop
+ * starts, so there is no already-classified `FailureRecord` to build from; this
+ * mirrors `classifyGitFailure`'s shape directly (BAC-27112-style: `category`,
+ * `code`, `evidence`). Message text and the lost-work evidence match the
+ * pre-AII-749 plain-`Error` this replaces, so downstream rendering
+ * (`formatFailureComment`) is unchanged; only classification is added.
+ */
+function buildExistingPrBranchChangedError(
+  workspaceDir: string,
+  githubToken: string,
+  expectedRef: string,
+  foundRef: string | null,
+  commitSha: string | null,
+): Error & { failure?: FailureRecord } {
+  const message = `Existing PR branch changed during the run (expected ${expectedRef}, found ${foundRef ?? "missing"}); refusing to overwrite concurrent work`;
+  const err = new Error(
+    `${message}${describeUnpublishedWork(workspaceDir, githubToken, commitSha, foundRef, expectedRef)}`,
+  ) as Error & { failure?: FailureRecord };
+  err.failure = {
+    category: "conflict",
+    code: "GIT_LEASE_REJECTED",
+    stage: "push",
+    attempt: 1,
+    retryable: false,
+    message,
+    evidence: { truncated: false },
+  };
+  return err;
 }
 
 /**
