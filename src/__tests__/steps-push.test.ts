@@ -3071,10 +3071,20 @@ describe("pushStep — push guard: adopt agent push vs refuse foreign work", () 
   it("refuses genuinely foreign push when remote SHA is not reachable from HEAD (merge-base exit 1)", async () => {
     mockGapFillWithRemoteSha("foreignsha", 1);
 
-    await expect(
-      pushStep.run(makeContext({ prNumber: "42" }), GAP_FILL_INPUTS, new NoopStepReporter()),
-    ).rejects.toThrow(/refusing to overwrite concurrent work/);
+    let caught: (Error & { failure?: FailureRecord }) | undefined;
+    try {
+      await pushStep.run(makeContext({ prNumber: "42" }), GAP_FILL_INPUTS, new NoopStepReporter());
+    } catch (err) {
+      caught = err as typeof caught;
+    }
 
+    expect(caught?.message).toMatch(/refusing to overwrite concurrent work/);
+    // AII-749: classified so the failure callback can decide whether to
+    // re-enqueue (bot moved the branch) or notify a human, instead of the
+    // refusal just being an unclassified plain Error.
+    expect(caught?.failure?.category).toBe("conflict");
+    expect(caught?.failure?.code).toBe("GIT_LEASE_REJECTED");
+    expect(caught?.failure?.retryable).toBe(false);
     expect(spawnSync).not.toHaveBeenCalledWith(
       "git",
       expect.arrayContaining(["push"]),

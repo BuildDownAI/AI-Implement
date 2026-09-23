@@ -19,6 +19,37 @@ import type { ReferenceRepoResult } from "../reference-repos.js";
 import type { FailureRecord } from "../pipeline/failure-classification.js";
 import { shouldPostMonitorClassificationComment } from "../completion-classification.js";
 
+// ---------- Hoisted mocks for AII-749 lease-rejected handling ----------
+// Everything else in these two modules passes through to the real
+// implementation (stuck-watchdog.ts's cancelWorkflowRun, linear-app-auth.ts's
+// defaultFetchSignal, etc.) — only the three calls the new lease-rejected
+// branch makes are stubbed, so the rest of this file's existing coverage
+// (which never mocked github.js/github-app-auth.js) keeps exercising the
+// real code.
+const hoisted = vi.hoisted(() => ({
+  getInstallationToken: vi.fn<() => Promise<string>>(() => Promise.resolve("fake-installation-token")),
+  getPullRequestState: vi.fn<
+    () => Promise<{ merged: boolean; state: "open" | "closed"; headRef: string | null } | null>
+  >(() => Promise.resolve({ merged: false, state: "open", headRef: "ai-implement/eng-1" })),
+  getCommitAuthorType: vi.fn<() => Promise<"Bot" | "User" | null>>(() => Promise.resolve("Bot")),
+  postOrUpdateStickyComment: vi.fn<() => Promise<void>>(() => Promise.resolve()),
+}));
+
+vi.mock("../github-app-auth.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../github-app-auth.js")>();
+  return { ...actual, getInstallationToken: hoisted.getInstallationToken };
+});
+
+vi.mock("../github.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../github.js")>();
+  return {
+    ...actual,
+    getPullRequestState: hoisted.getPullRequestState,
+    getCommitAuthorType: hoisted.getCommitAuthorType,
+    postOrUpdateStickyComment: hoisted.postOrUpdateStickyComment,
+  };
+});
+
 const SECRET = "test-secret-with-enough-entropy-for-hmac";
 
 let dbPath: string;
@@ -2648,5 +2679,220 @@ describe("handleRunnerResult — call attribution", () => {
     expect(warnSpy).toHaveBeenCalledWith(
       expect.stringContaining(`result burned dispatch=${dispatchId} reason=missing_prUrl`),
     );
+  });
+});
+
+describe("handleRunnerResult — GIT_LEASE_REJECTED failure handling (AII-749)", () => {
+  const watchdogConfig = {
+    githubAppId: "app-id",
+    githubAppPrivateKey: "key",
+    notifyType: "slack",
+    notifyWebhookUrl: null,
+  };
+
+  beforeEach(() => {
+    hoisted.getInstallationToken.mockReset().mockResolvedValue("fake-installation-token");
+    hoisted.getPullRequestState
+      .mockReset()
+      .mockResolvedValue({ merged: false, state: "open", headRef: "ai-implement/eng-1" });
+    hoisted.getCommitAuthorType.mockReset().mockResolvedValue("Bot");
+    hoisted.postOrUpdateStickyComment.mockReset().mockResolvedValue(undefined);
+  });
+
+  it("re-pends one review_fix_queue row with reason lease_rejected when the PR head was written by the bot", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "gap-analysis",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({ issueId: "i", issueIdentifier: "ENG-1", repo: "o/r", dispatchId });
+    log.updateJobPrUrl(jobId, "https://github.com/o/r/pull/7");
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "gap-analysis",
+        outcome: "failure",
+        failureCode: "GIT_LEASE_REJECTED",
+        failureReason: "Existing PR branch changed during the run",
+        comments: [],
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider()),
+      watchdogConfig,
+    });
+
+    expect(res.status).toBe(200);
+    const pending = reviewFixQueue.getPendingReviewFixes();
+    expect(pending).toHaveLength(1);
+    expect(pending[0]).toMatchObject({ repo: "o/r", prNumber: 7, reason: "lease_rejected" });
+    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("Lease rejected on PR #7; bot head, re-enqueued"));
+    expect(hoisted.postOrUpdateStickyComment).not.toHaveBeenCalled();
+  });
+
+  it("posts exactly one marked comment and enqueues nothing when the PR head was written by a human", async () => {
+    hoisted.getCommitAuthorType.mockResolvedValue("User");
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "gap-analysis",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({ issueId: "i", issueIdentifier: "ENG-1", repo: "o/r", dispatchId });
+    log.updateJobPrUrl(jobId, "https://github.com/o/r/pull/8");
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "gap-analysis",
+        outcome: "failure",
+        failureCode: "GIT_LEASE_REJECTED",
+        failureReason: "Existing PR branch changed during the run",
+        comments: [],
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider()),
+      watchdogConfig,
+    });
+
+    expect(res.status).toBe(200);
+    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(0);
+    expect(hoisted.postOrUpdateStickyComment).toHaveBeenCalledTimes(1);
+    expect(hoisted.postOrUpdateStickyComment).toHaveBeenCalledWith(
+      "fake-installation-token",
+      "o",
+      "r",
+      8,
+      "<!-- ai-implement lease-human -->",
+      expect.stringContaining("A human pushed to this branch"),
+    );
+  });
+
+  it("treats an unknown head author (null) the same as human — posts the comment, enqueues nothing", async () => {
+    hoisted.getCommitAuthorType.mockResolvedValue(null);
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "gap-analysis",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({ issueId: "i", issueIdentifier: "ENG-1", repo: "o/r", dispatchId });
+    log.updateJobPrUrl(jobId, "https://github.com/o/r/pull/9");
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "gap-analysis",
+        outcome: "failure",
+        failureCode: "GIT_LEASE_REJECTED",
+        failureReason: "Existing PR branch changed during the run",
+        comments: [],
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider()),
+      watchdogConfig,
+    });
+
+    expect(res.status).toBe(200);
+    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(0);
+    expect(hoisted.postOrUpdateStickyComment).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not change the callback's HTTP result when the GitHub helper throws, and does not enqueue", async () => {
+    hoisted.getInstallationToken.mockRejectedValue(new Error("installation token mint failed"));
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "gap-analysis",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({ issueId: "i", issueIdentifier: "ENG-1", repo: "o/r", dispatchId });
+    log.updateJobPrUrl(jobId, "https://github.com/o/r/pull/10");
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "gap-analysis",
+        outcome: "failure",
+        failureCode: "GIT_LEASE_REJECTED",
+        failureReason: "Existing PR branch changed during the run",
+        comments: [],
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider()),
+      watchdogConfig,
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ acknowledged: true });
+    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(0);
+    expect(hoisted.postOrUpdateStickyComment).not.toHaveBeenCalled();
+  });
+
+  it("does nothing new when the run record has no pr_url (initial run)", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    log.appendLog({ issueId: "i", issueIdentifier: "ENG-1", repo: "o/r", dispatchId });
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "failure",
+        failureCode: "GIT_LEASE_REJECTED",
+        failureReason: "Existing PR branch changed during the run",
+        comments: [],
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider()),
+      watchdogConfig,
+    });
+
+    expect(res.status).toBe(200);
+    expect(hoisted.getInstallationToken).not.toHaveBeenCalled();
+    expect(hoisted.postOrUpdateStickyComment).not.toHaveBeenCalled();
+    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(0);
+  });
+
+  it("does not fire for a different failure code even when the run record has a pr_url", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({ issueId: "i", issueIdentifier: "ENG-1", repo: "o/r", dispatchId });
+    log.updateJobPrUrl(jobId, "https://github.com/o/r/pull/11");
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "failure",
+        failureCode: "REVIEW_UNAPPROVED",
+        failureReason: "nope",
+        prUrl: "https://github.com/o/r/pull/11",
+        comments: [],
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider()),
+      watchdogConfig,
+    });
+
+    expect(res.status).toBe(200);
+    expect(hoisted.getInstallationToken).not.toHaveBeenCalled();
+    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(0);
   });
 });

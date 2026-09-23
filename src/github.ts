@@ -888,6 +888,31 @@ export async function getPullRequestState(
   };
 }
 
+/**
+ * Returns the GitHub-reported author type ("Bot" or "User") of a commit, or
+ * `null` when the commit's author has no GitHub account (`author` is null —
+ * an email-only committer) or the request fails. `ref` accepts a SHA or a
+ * branch name (e.g. a PR's `headRef`). Never throws: a caller deciding
+ * whether a human or the bot last wrote to a branch must treat an
+ * indeterminate answer the same as "not the bot", not a fatal error.
+ */
+export async function getCommitAuthorType(
+  token: string,
+  owner: string,
+  repo: string,
+  ref: string,
+): Promise<"Bot" | "User" | null> {
+  try {
+    const url = `https://api.github.com/repos/${owner}/${repo}/commits/${encodeURIComponent(ref)}`;
+    const res = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
+    if (!res.ok) return null;
+    const data = (await res.json()) as { author?: { type?: string } | null };
+    return data.author?.type === "Bot" || data.author?.type === "User" ? data.author.type : null;
+  } catch {
+    return null;
+  }
+}
+
 // ---------- Feature-branch roll-up (merge-up) helpers ----------
 
 /**
