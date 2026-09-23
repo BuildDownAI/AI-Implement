@@ -1,5 +1,6 @@
 import type { RepoMapping } from "./config.js";
 import type { DispatchFailureContext } from "./dispatch-failure.js";
+import { canDispatch } from "./dispatch-gate.js";
 import { claimPendingCommentGapfills, markCommentGapfillProcessed } from "./comment-gapfill-queue.js";
 import { getLatestDispatchForPr, getLatestDispatchForIssueIdentifier, appendLog, countPriorDispatches, updateJobPrUrl, suppressStaleNotifications, type Job } from "./log.js";
 import { resolveExecutionPath, getFlySecretsMinVersion, getFlyProcessLevelSecrets, type RunnerMode } from "./runner-mode.js";
@@ -148,6 +149,17 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
       if (mapping.ticketingProvider === "filesystem" && opts.runnerMode !== "local") {
         console.warn(`[comment-gapfill] Filesystem mapping ${scopeKey} requires RUNNER_MODE=local; skipping item #${item.id}`);
         markCommentGapfillProcessed(item.id, "skipped");
+        continue;
+      }
+
+      const gateDecision = canDispatch({
+        issueId: prLog.issueId,
+        kind: "gap-fill",
+        teamKey: scopeKey,
+        maxInProgressAiIssues: mapping.maxInProgressAiIssues,
+      });
+      if (!gateDecision.ok) {
+        console.log(`[comment-gapfill] Deferring item #${item.id} for PR #${item.prNumber}: ${gateDecision.reason}`);
         continue;
       }
 

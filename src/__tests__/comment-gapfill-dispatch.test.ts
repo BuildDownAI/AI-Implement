@@ -5,6 +5,7 @@ import path from "node:path";
 import type * as DedupModule from "../dedup.js";
 import type * as QueueModule from "../comment-gapfill-queue.js";
 import type * as LogModule from "../log.js";
+import type * as BreakerModule from "../dispatch-breaker.js";
 import type * as DrainModule from "../comment-gapfill-drain.js";
 import type * as FlyMachinesModule from "../fly-machines.js";
 import type * as RepoImageModule from "../repo-image.js";
@@ -42,6 +43,7 @@ let dbPath: string;
 let dedup: typeof DedupModule;
 let queue: typeof QueueModule;
 let log: typeof LogModule;
+let breaker: typeof BreakerModule;
 let drain: typeof DrainModule;
 
 beforeEach(async () => {
@@ -54,6 +56,7 @@ beforeEach(async () => {
   dedup = await import("../dedup.js");
   queue = await import("../comment-gapfill-queue.js");
   log = await import("../log.js");
+  breaker = await import("../dispatch-breaker.js");
   drain = await import("../comment-gapfill-drain.js");
   flyMocks.createMachine.mockResolvedValue({
     id: "fly-machine-1",
@@ -69,6 +72,7 @@ beforeEach(async () => {
   // Initialize tables
   dedup.getDb();
   log.initLogTable();
+  breaker.initDispatchBreakerTable();
 });
 
 afterEach(async () => {
@@ -166,7 +170,15 @@ function makeBaseDrainOpts(overrides: Partial<DrainInput> = {}): DrainInput {
   };
 }
 
-function seedDispatchLog(issueId: string, issueIdentifier: string, issueTitle: string, owner: string, repo: string, prNumber: number): number {
+function seedDispatchLog(
+  issueId: string,
+  issueIdentifier: string,
+  issueTitle: string,
+  owner: string,
+  repo: string,
+  prNumber: number,
+  status: LogModule.JobStatus = "completed",
+): number {
   const jobId = log.appendLog({
     issueId,
     issueIdentifier,
@@ -174,6 +186,7 @@ function seedDispatchLog(issueId: string, issueIdentifier: string, issueTitle: s
     teamKey: "TEAM",
     repo: `${owner}/${repo}`,
     phase: "implementation",
+    status,
   });
   log.updateJobPrUrl(jobId, `https://github.com/${owner}/${repo}/pull/${prNumber}`);
   return jobId;
@@ -454,6 +467,52 @@ describe("drainCommentGapfillQueue", () => {
     expect(dispatchSpy).not.toHaveBeenCalled();
     const pending = queue.claimPendingCommentGapfills();
     expect(pending).toHaveLength(0);
+  });
+
+  it("case (g): defers the item when the issue has an in-flight dispatch_log row, leaving it pending", async () => {
+    const mapping = makeMapping({ owner: "acme", repo: "billing" });
+
+    queue.enqueueCommentGapfill({
+      owner: "acme",
+      repo: "billing",
+      prNumber: 42,
+      commentId: 6101,
+      commenter: "kim",
+      instruction: "",
+    });
+    // The PR's originating dispatch (completed) establishes tracker identity for the PR...
+    seedDispatchLog("issue-11", "AII-108", "In-flight gate test", "acme", "billing", 42);
+    // ...but a second, still-running dispatch for the SAME issue (e.g. a concurrent
+    // review-fix run already in progress) makes the issue in-flight.
+    log.appendLog({
+      issueId: "issue-11",
+      teamKey: "TEAM",
+      repo: "acme/billing",
+      phase: "gap-analysis",
+      status: "running",
+    });
+
+    const dispatchSpy = vi.fn<DrainInput["dispatch"]>(async () => ({ success: true, status: 204 }));
+    const consoleLogSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    await drain.drainCommentGapfillQueue(makeBaseDrainOpts({
+      getMappings: () => ({ TEAM: mapping }),
+      dispatch: dispatchSpy,
+    }));
+
+    expect(dispatchSpy).not.toHaveBeenCalled();
+    expect(
+      consoleLogSpy.mock.calls.some(
+        ([msg]) => typeof msg === "string" && msg.includes("[comment-gapfill] Deferring item #") && msg.includes("PR #42"),
+      ),
+    ).toBe(true);
+
+    // Row stays pending — not marked failed/skipped/dispatched — so the next tick retries it.
+    const pending = queue.claimPendingCommentGapfills();
+    expect(pending).toHaveLength(1);
+    expect(pending[0]!.prNumber).toBe(42);
+
+    consoleLogSpy.mockRestore();
   });
 
   it("commentInstruction is forwarded inside run_config in envelope mode", async () => {
