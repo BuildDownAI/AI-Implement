@@ -14,7 +14,11 @@ A sync opens (or updates) one pull request in the target repo. It touches three 
 
 Templates are read from the orchestrator's package root (`templatesRoot` overrides it in tests). A missing always-synced template throws; a missing seed template is skipped.
 
-The dispatcher calls the workflow by the mapping's `workflowFile` (implement) and `planningWorkflowFile` (planning), so the sync delivers the templates under those names (AII-738/AII-739). Two orchestrators can serve one repo during a migration, each with its own names; neither sync touches the other's files. Before any write — before even the initial repo lookup — `syncWorkflowTemplates` checks both names with the exported `isBareWorkflowFileName` and throws when a name is not a bare `.yml`/`.yaml` file name (no `/`, no `\`, no `..`). The thrown message names both the offending field (`workflowFile` or `planningWorkflowFile`) and the rule.
+The dispatcher calls the workflow by the mapping's `workflowFile` (implement) and `planningWorkflowFile` (planning), so the sync delivers the templates under those names (AII-738/AII-739). Two orchestrators can serve one repo during a migration, each with its own names; neither sync touches the other's files. Before any write — before even the initial repo lookup — `syncWorkflowTemplates` checks both names with the exported `isBareWorkflowFileName` and throws when a name is not a bare `.yml`/`.yaml` file name (no `/`, no `\`, no `..`). The thrown message names both the offending field (`workflowFile` or `planningWorkflowFile`) and the rule. It then checks the pair with the exported `workflowFileNamesCollide` and throws when the two names are equal, since both would resolve to the same `.github/workflows/` path.
+
+## File name rules
+
+A mapping's `workflowFile` and `planningWorkflowFile` must each be a bare file name ending in `.yml` or `.yaml`: no `/`, no `..`. `upsertMappingAction` rejects any other value with 400, so the admin form and the MCP `add_project` tool share the rule. The sync applies the same check before it writes, so a name stored before the rule existed fails the sync with a clear message instead of writing outside `.github/workflows/`.
 
 ## The sync branch and pull request
 

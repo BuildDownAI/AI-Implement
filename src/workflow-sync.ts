@@ -37,6 +37,11 @@ export function isBareWorkflowFileName(name: string): boolean {
   return /\.(ya?ml)$/i.test(name) && !name.includes("/") && !name.includes("\\") && !name.includes("..");
 }
 
+/** Whether `workflowFile` and `planningWorkflowFile` would collide on the same `.github/workflows/` path. */
+export function workflowFileNamesCollide(workflowFile: string, planningWorkflowFile: string): boolean {
+  return workflowFile === planningWorkflowFile;
+}
+
 const REMOVE_FILES = [
   {
     remote: ".github/workflows/comment-trigger.yml",
@@ -427,6 +432,12 @@ export async function syncWorkflowTemplates(
           `and contain no "/", "\\", or "..".`,
       );
     }
+  }
+  if (workflowFileNamesCollide(mapping.workflowFile, mapping.planningWorkflowFile)) {
+    throw new Error(
+      `Mapping workflowFile and planningWorkflowFile are both "${mapping.workflowFile}" — they must name ` +
+        `different files under .github/workflows/.`,
+    );
   }
   const syncedFiles = alwaysSyncFiles(mapping);
 
