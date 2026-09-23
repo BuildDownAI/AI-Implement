@@ -110,6 +110,14 @@ export function parkIssue(issueId: string, phase: string, conclusion: string): b
   return !alreadyParked;
 }
 
+/**
+ * The "Needs Human" notice posted once (PR comment + tracker comment) the moment
+ * `parkIssue` transitions a PR from `pr_budget`-blocked to actually parked.
+ */
+export function prBudgetParkMessage(budget: number): string {
+  return `**AI-Implement: Needs Human.** This PR reached its limit of ${budget} automatic fix runs in 24 hours, so AI-Implement stopped starting new ones. Comment \`/ai-implement\` on the PR to run once more, or unpark the issue at /admin to resume automatic runs.`;
+}
+
 /** Returns true when the issue+phase has been parked by the breaker. */
 export function isParked(issueId: string, phase: string): boolean {
   const row = getDb()

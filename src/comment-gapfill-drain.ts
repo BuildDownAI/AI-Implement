@@ -1,6 +1,8 @@
 import type { RepoMapping } from "./config.js";
+import { resolvePrDispatchBudget } from "./config.js";
 import type { DispatchFailureContext } from "./dispatch-failure.js";
 import { canDispatch } from "./dispatch-gate.js";
+import { parkIssue, prBudgetParkMessage } from "./dispatch-breaker.js";
 import { claimPendingCommentGapfills, markCommentGapfillProcessed } from "./comment-gapfill-queue.js";
 import { getLatestDispatchForPr, getLatestDispatchForIssueIdentifier, appendLog, countPriorDispatches, updateJobPrUrl, suppressStaleNotifications, type Job } from "./log.js";
 import { resolveExecutionPath, getFlySecretsMinVersion, getFlyProcessLevelSecrets, type RunnerMode } from "./runner-mode.js";
@@ -27,6 +29,7 @@ export interface DrainCommentGapfillsInput {
   checkContract(opts: { owner: string; repo: string; workflowFile: string; token: string; ref: string }): Promise<ContractProbeResult>;
   dispatch(token: string, mapping: RepoMapping, inputs: Record<string, string | undefined>): Promise<{ success: boolean; status: number; error?: string }>;
   postComment(token: string, owner: string, repo: string, prNumber: number, body: string): Promise<void>;
+  postTrackerComment(mapping: RepoMapping, issueId: string, body: string): Promise<void>;
   onDispatchFailure(failure: { status: number; error?: string }, notifyType: string, notifyWebhookUrl: string | null, ctx: DispatchFailureContext): Promise<void>;
   // Fly Machines config
   flySessionsToken: string | null;
@@ -79,6 +82,40 @@ async function resolveRollUpParentDispatch(
   } catch (err) {
     console.warn(`[comment-gapfill] roll-up fallback failed for PR #${prNumber}:`, err);
     return null;
+  }
+}
+
+/**
+ * Fires when the gate's `pr_budget` reason is the one that actually parks the
+ * PR (parkIssue returns true exactly once, on that transition). Posts one PR
+ * comment and one tracker comment, both best-effort. Never throws.
+ */
+async function firePrBudgetPark(
+  opts: DrainCommentGapfillsInput,
+  mapping: RepoMapping,
+  issueId: string,
+  owner: string,
+  repo: string,
+  prNumber: number,
+  budget: number,
+): Promise<void> {
+  if (!parkIssue(issueId, "gap-analysis", "pr_budget")) return;
+
+  console.warn(`[comment-gapfill] Parked PR #${prNumber} in ${owner}/${repo} at its dispatch budget (${budget}/24h)`);
+
+  const body = prBudgetParkMessage(budget);
+
+  try {
+    const ghToken = await opts.getInstallationToken(owner);
+    await opts.postComment(ghToken, owner, repo, prNumber, `<!-- ai-implement pr-budget -->\n${body}`);
+  } catch (err) {
+    console.error(`[comment-gapfill] Failed to post PR budget comment on ${owner}/${repo}#${prNumber}:`, err);
+  }
+
+  try {
+    await opts.postTrackerComment(mapping, issueId, body);
+  } catch (err) {
+    console.error(`[comment-gapfill] Failed to post tracker comment for PR budget park (${issueId}):`, err);
   }
 }
 
@@ -152,13 +189,21 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
         continue;
       }
 
+      const prBudget = resolvePrDispatchBudget(mapping);
+      const humanRequested = item.commentId > 0;
       const gateDecision = canDispatch({
         issueId: prLog.issueId,
         kind: "gap-fill",
         teamKey: scopeKey,
         maxInProgressAiIssues: mapping.maxInProgressAiIssues,
+        prUrl: `https://github.com/${item.owner}/${item.repo}/pull/${item.prNumber}`,
+        prDispatchBudget: prBudget,
+        humanRequested,
       });
       if (!gateDecision.ok) {
+        if (gateDecision.reason === "pr_budget") {
+          await firePrBudgetPark(opts, mapping, prLog.issueId, item.owner, item.repo, item.prNumber, prBudget);
+        }
         console.log(`[comment-gapfill] Deferring item #${item.id} for PR #${item.prNumber}: ${gateDecision.reason}`);
         continue;
       }

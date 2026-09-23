@@ -5,6 +5,7 @@ import http from "node:http";
 import {
   getMappings,
   initMappingsTable,
+  resolvePrDispatchBudget,
 } from "./config.js";
 import type { RepoMapping } from "./config.js";
 import { markDispatched, closeDb, getDispatchedIds, deleteDispatched } from "./dedup.js";
@@ -30,7 +31,7 @@ import { remediateStuckJob, remediateFailedJob } from "./stuck-watchdog.js";
 import type { StuckWatchdogConfig } from "./stuck-watchdog.js";
 import { handleAdminRequest } from "./admin.js";
 import { initLogTable, appendLog, countPriorDispatches, completeOrphanedPlanningJobs, attachJobRunIdIfMissing, updateJobRunId, updateJobStatus, updateJobPrUrl, updateJobMachineDetails, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobById, getJobByMachineId, resetStuckAttempts, getRecentFailedRunUrls } from "./log.js";
-import { recordDispatchFailure, recordDispatchSuccess, shouldCountFailure, initDispatchBreakerTable } from "./dispatch-breaker.js";
+import { recordDispatchFailure, recordDispatchSuccess, shouldCountFailure, initDispatchBreakerTable, parkIssue, prBudgetParkMessage } from "./dispatch-breaker.js";
 import type { Job, JobStatus } from "./log.js";
 import { getInstallationToken, getAppSlug } from "./github-app-auth.js";
 import { configureLinearAuth } from "./linear-app-auth.js";
@@ -799,7 +800,7 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
     console.log("[deploy] Review-fix and gap-fill drains paused. self-deployment in progress");
   } else {
     // Process pending late review feedback that arrived after the original run.
-    await processReviewFixQueue(config);
+    await processReviewFixQueue(config, registry);
 
     // Drain orchestrator-mediated /ai-implement comment gap-fills.
     await drainCommentGapfillQueue({
@@ -814,6 +815,10 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
       checkContract: (params) => resolveWorkflowCapabilities(params),
       dispatch: dispatchWorkflow,
       postComment: postPrComment,
+      postTrackerComment: async (mapping, issueId, body) => {
+        const provider = await registry.forMapping(mapping);
+        await provider.postComment(issueId, body);
+      },
       onDispatchFailure: surfaceDispatchFailure,
       flySessionsToken: config.flySessionsToken,
       flySessionsApp: config.flySessionsApp,
@@ -898,6 +903,43 @@ async function fireBreakerTrip(
     } catch (err) {
       console.error(`[breaker] Failed to send park notification for ${issueIdentifier ?? issueId}:`, err);
     }
+  }
+}
+
+/**
+ * Fires when the gate's `pr_budget` reason for a gap-fill dispatch is the one
+ * that actually parks the PR (parkIssue returns true exactly once, on that
+ * transition). Posts one PR comment and one tracker comment, both best-effort.
+ * Never throws.
+ */
+async function firePrBudgetPark(
+  config: AppConfig,
+  registry: ProviderRegistry,
+  mapping: RepoMapping,
+  issueId: string,
+  repo: string,
+  prNumber: number,
+  budget: number,
+): Promise<void> {
+  if (!parkIssue(issueId, "gap-analysis", "pr_budget")) return;
+
+  console.warn(`[dispatch-gate] Parked PR #${prNumber} in ${repo} at its dispatch budget (${budget}/24h)`);
+
+  const body = prBudgetParkMessage(budget);
+  const [owner, repoName] = repo.split("/");
+
+  try {
+    const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
+    await postPrComment(ghToken, owner, repoName, prNumber, `<!-- ai-implement pr-budget -->\n${body}`);
+  } catch (err) {
+    console.error(`[dispatch-gate] Failed to post PR budget comment on ${repo}#${prNumber}:`, err);
+  }
+
+  try {
+    const provider = await registry.forMapping(mapping);
+    await provider.postComment(issueId, body);
+  } catch (err) {
+    console.error(`[dispatch-gate] Failed to post tracker comment for PR budget park (${issueId}):`, err);
   }
 }
 
@@ -3073,7 +3115,7 @@ async function processReconciliations(config: AppConfig, registry: ProviderRegis
 
 // ---------- Late Review Fix Queue ----------
 
-export async function processReviewFixQueue(config: AppConfig): Promise<void> {
+export async function processReviewFixQueue(config: AppConfig, registry: ProviderRegistry): Promise<void> {
   const pending = getPendingReviewFixes();
   if (pending.length === 0) return;
 
@@ -3109,13 +3151,20 @@ export async function processReviewFixQueue(config: AppConfig): Promise<void> {
         continue;
       }
 
+      const prBudget = resolvePrDispatchBudget(mapping);
       const gateDecision = canDispatch({
         issueId: fix.issueId,
         kind: "gap-fill",
         teamKey: scopeKey,
         maxInProgressAiIssues: mapping.maxInProgressAiIssues,
+        prUrl: `https://github.com/${fix.repo}/pull/${fix.prNumber}`,
+        prDispatchBudget: prBudget,
+        humanRequested: false,
       });
       if (!gateDecision.ok) {
+        if (gateDecision.reason === "pr_budget") {
+          await firePrBudgetPark(config, registry, mapping, fix.issueId, fix.repo, fix.prNumber, prBudget);
+        }
         console.log(`[review-fix] Deferring review fix #${fix.id} for PR #${fix.prNumber}: ${gateDecision.reason}`);
         continue;
       }
