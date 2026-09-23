@@ -15,7 +15,13 @@ import { remediateFailedJob, type StuckWatchdogConfig } from "./stuck-watchdog.j
 import { verifyAndConsumeRunToken, verifyRunToken } from "./runner-tokens.js";
 import { getStepsByJobId, upsertStepRecord } from "./step-log.js";
 import { enqueueReviewFix, getReviewFixDispatchSnapshot } from "./review-fix-queue.js";
-import { markReviewFindingsResolvedByIds, markReviewFindingsResolvedForPrSeenBefore } from "./review-ledger-store.js";
+import {
+  getReviewFindingsByKeys,
+  markReviewFindingsDeferredByKeys,
+  markReviewFindingsResolvedByIds,
+  markReviewFindingsResolvedForPrSeenBefore,
+  type StoredReviewFinding,
+} from "./review-ledger-store.js";
 import { getInstallationToken } from "./github-app-auth.js";
 import { getCommitAuthorType, getPullRequestState, postOrUpdateStickyComment } from "./github.js";
 import {
@@ -502,6 +508,30 @@ export async function handleRunnerResult(
     }
   }
 
+  // AII-756: a fixing agent may defer a finding as out-of-scope follow-up work. This must
+  // run before any phase-specific resolution below (e.g. the gap-analysis snapshot
+  // resolution) — resolving first would flip a just-deferred finding back to resolved.
+  // Applies on any phase/outcome once a PR exists, so it is not nested in the
+  // outcome/phase branches that follow.
+  const followUpDispositions = sanitizedFindingDispositions.filter((d) => d.disposition === "follow-up");
+  if (followUpDispositions.length > 0) {
+    const dispositionJob = getJobByDispatchId(claims.dispatchId);
+    const dispositionPrNumber = parsePrNumber(dispositionJob?.prUrl ?? null);
+    if (dispositionJob?.repo && dispositionPrNumber !== null) {
+      const keys = followUpDispositions.map((d) => d.findingKey);
+      markReviewFindingsDeferredByKeys(dispositionJob.repo, dispositionPrNumber, keys);
+      const rowsByKey = new Map(
+        getReviewFindingsByKeys(dispositionJob.repo, dispositionPrNumber, keys).map((row) => [row.findingKey, row]),
+      );
+      const body = renderDeferredFindingsComment(followUpDispositions, dispositionPrNumber, rowsByKey);
+      try {
+        await provider.postComment(claims.issueId, body);
+      } catch (err) {
+        warn("postComment(deferred-findings)", err);
+      }
+    }
+  }
+
   if (input.body.outcome === "failure") {
     const job = getJobByDispatchId(claims.dispatchId);
     const isInitialRun = !job?.prUrl;
@@ -663,6 +693,28 @@ function parsePrNumber(prUrl: string | null): number | null {
   if (!prUrl) return null;
   const match = prUrl.match(/\/pull\/(\d+)(?:$|[?#])/);
   return match ? Number.parseInt(match[1], 10) : null;
+}
+
+function renderDeferredFindingsComment(
+  followUpDispositions: FindingDisposition[],
+  prNumber: number,
+  rowsByKey: Map<string, StoredReviewFinding>,
+): string {
+  const lines = followUpDispositions.map((d) => {
+    const row = rowsByKey.get(d.findingKey);
+    if (!row) return `- ${d.reason}`;
+    const location = row.path !== undefined ? (typeof row.line === "number" ? `${row.path}:${row.line}` : row.path) : undefined;
+    const origin = [row.source, location].filter(Boolean).join(" · ");
+    const url = row.url ? ` (${row.url})` : "";
+    return `- ${origin} — ${d.reason}${url}`;
+  });
+
+  return [
+    `**AI-Implement deferred ${followUpDispositions.length} review finding(s) as follow-ups** on PR #${prNumber}.`,
+    "These asked for work this issue does not require. They no longer block the merge. Please triage them.",
+    "",
+    ...lines,
+  ].join("\n");
 }
 
 export async function handleRunnerProgress(

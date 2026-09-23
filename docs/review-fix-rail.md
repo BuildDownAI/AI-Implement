@@ -37,7 +37,7 @@ A finding's identity is a SHA-256 over its source, path, line, and **normalized*
 
 Two consequences worth knowing:
 
-- The same finding reported repeatedly collapses to one row, with `last_seen_at` advancing. Re-reporting a **resolved** finding reopens it — the upsert sets `status = 'open'` and clears `resolved_at`.
+- The same finding reported repeatedly collapses to one row, with `last_seen_at` advancing. Re-reporting a **resolved** finding reopens it — the upsert sets `status = 'open'` and clears `resolved_at`. Re-reporting a **deferred** finding does not: the upsert leaves `deferred` rows alone (status and `resolved_at` both), so a fixing agent's follow-up deferral survives a later run that reports the same finding again.
 - A **reworded** finding is a new finding. A reviewer who rephrases the same objection produces a second row, because the hash covers the body.
 
 Collection additionally dedupes in memory by normalized body before anything is stored, keeping the variant that carries a file and line over one that does not.
@@ -46,7 +46,7 @@ Collection additionally dedupes in memory by normalized body before anything is 
 
 | Table | Grain | Purpose |
 |-------|-------|---------|
-| `review_findings` | one row per distinct finding per PR | The ledger. `status` is `open` or `resolved` |
+| `review_findings` | one row per distinct finding per PR | The ledger. `status` is `open`, `resolved`, or `deferred`. A fixing agent that dispositions a finding `follow-up` (ADR 028) moves it from `open` to `deferred` — no longer counted as open, but distinct from `resolved` so it is not silently reopenable by a normal resolve call |
 | `review_fix_queue` | **one row per PR** (unique on `repo, pr_number`) | Work queue; `pending` → `dispatched` / `skipped` / `failed` |
 | `review_fix_events` | append-only, one per enqueue | Audit trail of what triggered each enqueue, with actor and source URL |
 | `review_fix_dispatches` | one per dispatch id | Snapshot of which finding ids a given dispatch is allowed to resolve |

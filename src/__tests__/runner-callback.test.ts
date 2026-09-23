@@ -3072,3 +3072,215 @@ describe("handleRunnerResult — finding dispositions (AII-753)", () => {
     warnSpy.mockRestore();
   });
 });
+
+describe("handleRunnerResult — deferred findings (AII-756)", () => {
+  it("defers a follow-up finding instead of resolving it, and resolves the rest, on a successful gap-analysis callback", async () => {
+    const keptOpen = reviewStore.upsertReviewFinding({
+      repo: "org/repo",
+      prNumber: 12,
+      source: "github-review",
+      severity: "blocking",
+      body: "Fix the null check.",
+    });
+    const deferredId = reviewStore.upsertReviewFinding({
+      repo: "org/repo",
+      prNumber: 12,
+      source: "github-review",
+      severity: "minor",
+      body: "Add a config flag for this.",
+    });
+    const findings = reviewStore.listOpenReviewFindings("org/repo", 12);
+    const deferredKey = findings.find((f) => f.id === deferredId)!.findingKey;
+    const keptOpenKey = findings.find((f) => f.id === keptOpen)!.findingKey;
+
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "gap-analysis",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({ issueId: "i", repo: "org/repo", dispatchId });
+    log.updateJobPrUrl(jobId, "https://github.com/org/repo/pull/12");
+
+    const fake = new FakeProvider({ recordCalls: true });
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "gap-analysis",
+        outcome: "success",
+        comments: [],
+        findingDispositions: [
+          { findingKey: deferredKey, disposition: "follow-up", reason: "Out of scope for this issue." },
+          { findingKey: keptOpenKey, disposition: "fixed", reason: "Fixed it." },
+        ],
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+    });
+
+    expect(res.status).toBe(200);
+    expect(reviewStore.listOpenReviewFindings("org/repo", 12)).toEqual([]);
+    const rows = reviewStore.getReviewFindingsByKeys("org/repo", 12, [deferredKey, keptOpenKey]);
+    expect(rows.find((r) => r.findingKey === deferredKey)?.status).toBe("deferred");
+    expect(rows.find((r) => r.findingKey === keptOpenKey)?.status).toBe("resolved");
+
+    const postComments = fake.recordedCalls().filter((c) => c.method === "postComment");
+    expect(postComments).toHaveLength(1);
+    const body = postComments[0].args[1] as string;
+    expect(body).toContain("deferred 1 review finding(s) as follow-ups");
+    expect(body).toContain("Out of scope for this issue.");
+  });
+
+  it("does not post a deferred-findings comment when there are no follow-ups", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "gap-analysis",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({ issueId: "i", repo: "org/repo", dispatchId });
+    log.updateJobPrUrl(jobId, "https://github.com/org/repo/pull/12");
+
+    const fake = new FakeProvider({ recordCalls: true });
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "gap-analysis",
+        outcome: "success",
+        comments: [],
+        findingDispositions: [
+          { findingKey: "c".repeat(64), disposition: "fixed", reason: "Fixed it." },
+        ],
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+    });
+
+    expect(res.status).toBe(200);
+    expect(fake.recordedCalls().filter((c) => c.method === "postComment")).toHaveLength(0);
+  });
+
+  it("includes the reason for a follow-up key with no matching ledger row, without a source/path/line prefix", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "gap-analysis",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({ issueId: "i", repo: "org/repo", dispatchId });
+    log.updateJobPrUrl(jobId, "https://github.com/org/repo/pull/12");
+
+    const missingKey = "d".repeat(64);
+    const fake = new FakeProvider({ recordCalls: true });
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "gap-analysis",
+        outcome: "success",
+        comments: [],
+        findingDispositions: [
+          { findingKey: missingKey, disposition: "follow-up", reason: "No matching row in the ledger." },
+        ],
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+    });
+
+    expect(res.status).toBe(200);
+    const postComments = fake.recordedCalls().filter((c) => c.method === "postComment");
+    expect(postComments).toHaveLength(1);
+    const body = postComments[0].args[1] as string;
+    expect(body).toContain("- No matching row in the ledger.");
+    expect(body).not.toContain("·");
+  });
+
+  it("defers and comments on a failure outcome too, as long as the job already has a PR", async () => {
+    const deferredId = reviewStore.upsertReviewFinding({
+      repo: "org/repo",
+      prNumber: 11,
+      source: "github-review",
+      severity: "blocking",
+      body: "Add a config flag for this.",
+    });
+    const deferredKey = reviewStore.listOpenReviewFindings("org/repo", 11).find((f) => f.id === deferredId)!.findingKey;
+
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({ issueId: "i", repo: "org/repo", dispatchId });
+    log.updateJobPrUrl(jobId, "https://github.com/org/repo/pull/11");
+
+    const fake = new FakeProvider({ recordCalls: true });
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "failure",
+        failureCode: "REVIEW_UNAPPROVED",
+        failureReason: "still has findings",
+        prUrl: "https://github.com/org/repo/pull/11",
+        comments: [],
+        findingDispositions: [
+          { findingKey: deferredKey, disposition: "follow-up", reason: "Not required by this issue." },
+        ],
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+    });
+
+    expect(res.status).toBe(200);
+    expect(reviewStore.getReviewFindingsByKeys("org/repo", 11, [deferredKey])[0]?.status).toBe("deferred");
+    expect(fake.recordedCalls().filter((c) => c.method === "postComment" && (c.args[1] as string).includes("deferred"))).toHaveLength(1);
+  });
+
+  it("logs and swallows a postComment failure for the deferred-findings comment without changing the callback response", async () => {
+    const deferredId = reviewStore.upsertReviewFinding({
+      repo: "org/repo",
+      prNumber: 12,
+      source: "github-review",
+      severity: "blocking",
+      body: "Add a config flag for this.",
+    });
+    const deferredKey = reviewStore.listOpenReviewFindings("org/repo", 12).find((f) => f.id === deferredId)!.findingKey;
+
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "gap-analysis",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({ issueId: "i", repo: "org/repo", dispatchId });
+    log.updateJobPrUrl(jobId, "https://github.com/org/repo/pull/12");
+
+    const fake = new FakeProvider({ recordCalls: true });
+    fake.postComment = async () => {
+      throw new Error("provider down");
+    };
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "gap-analysis",
+        outcome: "success",
+        comments: [],
+        findingDispositions: [
+          { findingKey: deferredKey, disposition: "follow-up", reason: "Not required by this issue." },
+        ],
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body.acknowledged).toBe(true);
+    expect(reviewStore.getReviewFindingsByKeys("org/repo", 12, [deferredKey])[0]?.status).toBe("deferred");
+  });
+});

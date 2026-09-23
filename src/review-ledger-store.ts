@@ -9,7 +9,7 @@ export interface StoredReviewFinding extends ReviewLedgerFinding {
   repo: string;
   prNumber: number;
   findingKey: string;
-  status: "open" | "resolved";
+  status: "open" | "resolved" | "deferred";
   firstSeenAt: number;
   lastSeenAt: number;
   resolvedAt: number | null;
@@ -31,7 +31,7 @@ interface ReviewFindingRow {
   path: string | null;
   line: number | null;
   url: string | null;
-  status: "open" | "resolved";
+  status: "open" | "resolved" | "deferred";
   first_seen_at: number;
   last_seen_at: number;
   resolved_at: number | null;
@@ -52,9 +52,9 @@ export function upsertReviewFinding(input: UpsertReviewFindingInput): number {
       path = excluded.path,
       line = excluded.line,
       url = excluded.url,
-      status = 'open',
+      status = CASE WHEN review_findings.status = 'deferred' THEN 'deferred' ELSE 'open' END,
       last_seen_at = excluded.last_seen_at,
-      resolved_at = NULL
+      resolved_at = CASE WHEN review_findings.status = 'deferred' THEN review_findings.resolved_at ELSE NULL END
   `).run({
     repo: input.repo,
     prNumber: input.prNumber,
@@ -122,6 +122,31 @@ export function markReviewFindingsResolvedByIds(repo: string, prNumber: number, 
     `)
     .run(Date.now(), Date.now(), repo, prNumber, ...findingIds);
   return result.changes;
+}
+
+export function markReviewFindingsDeferredByKeys(repo: string, prNumber: number, keys: string[]): number {
+  if (keys.length === 0) return 0;
+  const placeholders = keys.map(() => "?").join(", ");
+  const result = getDb()
+    .prepare(`
+      UPDATE review_findings
+      SET status = 'deferred'
+      WHERE repo = ? AND pr_number = ? AND status = 'open' AND finding_key IN (${placeholders})
+    `)
+    .run(repo, prNumber, ...keys);
+  return result.changes;
+}
+
+export function getReviewFindingsByKeys(repo: string, prNumber: number, keys: string[]): StoredReviewFinding[] {
+  if (keys.length === 0) return [];
+  const placeholders = keys.map(() => "?").join(", ");
+  const rows = getDb()
+    .prepare(`
+      SELECT * FROM review_findings
+      WHERE repo = ? AND pr_number = ? AND finding_key IN (${placeholders})
+    `)
+    .all(repo, prNumber, ...keys) as ReviewFindingRow[];
+  return rows.map(mapRow);
 }
 
 function mapRow(row: ReviewFindingRow): StoredReviewFinding {
