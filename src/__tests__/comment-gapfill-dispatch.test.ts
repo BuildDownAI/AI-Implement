@@ -157,6 +157,7 @@ function makeBaseDrainOpts(overrides: Partial<DrainInput> = {}): DrainInput {
     checkContract: vi.fn<DrainInput["checkContract"]>(async () => "envelope"),
     dispatch: vi.fn<DrainInput["dispatch"]>(async () => ({ success: true, status: 204 })),
     postComment: vi.fn<DrainInput["postComment"]>(async () => undefined),
+    postTrackerComment: vi.fn<DrainInput["postTrackerComment"]>(async () => undefined),
     onDispatchFailure: vi.fn<DrainInput["onDispatchFailure"]>(async () => undefined),
     flySessionsToken: null,
     flySessionsApp: null,
@@ -190,6 +191,19 @@ function seedDispatchLog(
   });
   log.updateJobPrUrl(jobId, `https://github.com/${owner}/${repo}/pull/${prNumber}`);
   return jobId;
+}
+
+/** Seeds a completed gap-analysis dispatch counted toward a PR's 24h budget.
+ *  Terminal status keeps it out of the in_flight gate. */
+function seedGapAnalysisDispatch(issueId: string, owner: string, repo: string, prNumber: number): void {
+  const jobId = log.appendLog({
+    issueId,
+    teamKey: "TEAM",
+    repo: `${owner}/${repo}`,
+    phase: "gap-analysis",
+    status: "completed",
+  });
+  log.updateJobPrUrl(jobId, `https://github.com/${owner}/${repo}/pull/${prNumber}`);
 }
 
 async function dispatchFlyGapfillAndDecodeReviewers(reviewers: RepoMapping["reviewers"]) {
@@ -789,6 +803,150 @@ describe("roll-up PR fallback (grouping feature→base PRs have no dispatch row)
 
     expect(dispatchSpy).not.toHaveBeenCalled();
     expect(postCommentSpy).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("drainCommentGapfillQueue — PR dispatch budget", () => {
+  it("parks the PR and posts exactly one PR comment and one tracker comment when a synthetic row hits the budget", async () => {
+    const mapping = makeMapping({ owner: "acme", repo: "billing", prDispatchBudget: 2 });
+
+    seedDispatchLog("issue-20", "AII-200", "Budget test", "acme", "billing", 42);
+    seedGapAnalysisDispatch("issue-20", "acme", "billing", 42);
+    seedGapAnalysisDispatch("issue-20", "acme", "billing", 42);
+
+    const queueId = queue.enqueueConflictResolution({
+      owner: "acme", repo: "billing", prNumber: 42, featureBranch: "ai-implement/feature/foo",
+    });
+
+    const dispatchSpy = vi.fn<DrainInput["dispatch"]>(async () => ({ success: true, status: 204 }));
+    const postCommentSpy = vi.fn<DrainInput["postComment"]>(async () => undefined);
+    const postTrackerCommentSpy = vi.fn<DrainInput["postTrackerComment"]>(async () => undefined);
+    const consoleLogSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    await drain.drainCommentGapfillQueue(makeBaseDrainOpts({
+      getMappings: () => ({ TEAM: mapping }),
+      dispatch: dispatchSpy,
+      postComment: postCommentSpy,
+      postTrackerComment: postTrackerCommentSpy,
+    }));
+
+    expect(dispatchSpy).not.toHaveBeenCalled();
+    expect(
+      consoleLogSpy.mock.calls.some(
+        ([msg]) => typeof msg === "string" && msg.includes(`[comment-gapfill] Deferring item #${queueId} for PR #42: pr_budget`),
+      ),
+    ).toBe(true);
+
+    expect(postCommentSpy).toHaveBeenCalledTimes(1);
+    const [, owner, repo, prNumber, body] = postCommentSpy.mock.calls[0]!;
+    expect(owner).toBe("acme");
+    expect(repo).toBe("billing");
+    expect(prNumber).toBe(42);
+    expect(body.startsWith("<!-- ai-implement pr-budget -->")).toBe(true);
+    expect(body).toContain("Needs Human");
+    expect(body).toContain("limit of 2 automatic fix runs");
+
+    expect(postTrackerCommentSpy).toHaveBeenCalledTimes(1);
+    const [trackerMapping, trackerIssueId, trackerBody] = postTrackerCommentSpy.mock.calls[0]!;
+    expect(trackerMapping.owner).toBe("acme");
+    expect(trackerIssueId).toBe("issue-20");
+    expect(trackerBody).toContain("Needs Human");
+
+    // Left unprocessed so the next tick retries once unparked.
+    const pending = queue.claimPendingCommentGapfills();
+    expect(pending).toHaveLength(1);
+    expect(pending[0]!.id).toBe(queueId);
+
+    consoleLogSpy.mockRestore();
+  });
+
+  it("posts no additional comments on a second drain tick in the same state", async () => {
+    const mapping = makeMapping({ owner: "acme", repo: "billing", prDispatchBudget: 2 });
+
+    seedDispatchLog("issue-20", "AII-200", "Budget test", "acme", "billing", 42);
+    seedGapAnalysisDispatch("issue-20", "acme", "billing", 42);
+    seedGapAnalysisDispatch("issue-20", "acme", "billing", 42);
+
+    queue.enqueueConflictResolution({
+      owner: "acme", repo: "billing", prNumber: 42, featureBranch: "ai-implement/feature/foo",
+    });
+
+    const dispatchSpy = vi.fn<DrainInput["dispatch"]>(async () => ({ success: true, status: 204 }));
+    const postCommentSpy = vi.fn<DrainInput["postComment"]>(async () => undefined);
+    const postTrackerCommentSpy = vi.fn<DrainInput["postTrackerComment"]>(async () => undefined);
+
+    const opts = makeBaseDrainOpts({
+      getMappings: () => ({ TEAM: mapping }),
+      dispatch: dispatchSpy,
+      postComment: postCommentSpy,
+      postTrackerComment: postTrackerCommentSpy,
+    });
+
+    await drain.drainCommentGapfillQueue(opts);
+    await drain.drainCommentGapfillQueue(opts);
+
+    expect(dispatchSpy).not.toHaveBeenCalled();
+    expect(postCommentSpy).toHaveBeenCalledTimes(1);
+    expect(postTrackerCommentSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("dispatches a human /ai-implement row on an already-parked PR when nothing is in flight", async () => {
+    const mapping = makeMapping({ owner: "acme", repo: "billing", prDispatchBudget: 2 });
+
+    seedDispatchLog("issue-21", "AII-201", "Human bypass test", "acme", "billing", 42);
+    seedGapAnalysisDispatch("issue-21", "acme", "billing", 42);
+    seedGapAnalysisDispatch("issue-21", "acme", "billing", 42);
+    // Simulate a PR already parked by an earlier tick.
+    breaker.parkIssue("issue-21", "gap-analysis", "pr_budget");
+
+    queue.enqueueCommentGapfill({
+      owner: "acme", repo: "billing", prNumber: 42, commentId: 9401, commenter: "alice", instruction: "please retry",
+    });
+
+    const dispatchSpy = vi.fn<DrainInput["dispatch"]>(async () => ({ success: true, status: 204 }));
+
+    await drain.drainCommentGapfillQueue(makeBaseDrainOpts({
+      getMappings: () => ({ TEAM: mapping }),
+      dispatch: dispatchSpy,
+    }));
+
+    expect(dispatchSpy).toHaveBeenCalledTimes(1);
+    const pending = queue.claimPendingCommentGapfills();
+    expect(pending).toHaveLength(0);
+  });
+
+  it("does not dispatch a synthetic conflict row on an already-parked PR", async () => {
+    const mapping = makeMapping({ owner: "acme", repo: "billing", prDispatchBudget: 2 });
+
+    seedDispatchLog("issue-22", "AII-202", "Synthetic no-bypass test", "acme", "billing", 42);
+    seedGapAnalysisDispatch("issue-22", "acme", "billing", 42);
+    seedGapAnalysisDispatch("issue-22", "acme", "billing", 42);
+    // Simulate a PR already parked by an earlier tick.
+    breaker.parkIssue("issue-22", "gap-analysis", "pr_budget");
+
+    const queueId = queue.enqueueConflictResolution({
+      owner: "acme", repo: "billing", prNumber: 42, featureBranch: "ai-implement/feature/foo",
+    });
+
+    const dispatchSpy = vi.fn<DrainInput["dispatch"]>(async () => ({ success: true, status: 204 }));
+    const postCommentSpy = vi.fn<DrainInput["postComment"]>(async () => undefined);
+    const postTrackerCommentSpy = vi.fn<DrainInput["postTrackerComment"]>(async () => undefined);
+
+    await drain.drainCommentGapfillQueue(makeBaseDrainOpts({
+      getMappings: () => ({ TEAM: mapping }),
+      dispatch: dispatchSpy,
+      postComment: postCommentSpy,
+      postTrackerComment: postTrackerCommentSpy,
+    }));
+
+    expect(dispatchSpy).not.toHaveBeenCalled();
+    // Already parked before this tick: parkIssue returns false, so no new comments.
+    expect(postCommentSpy).not.toHaveBeenCalled();
+    expect(postTrackerCommentSpy).not.toHaveBeenCalled();
+
+    const pending = queue.claimPendingCommentGapfills();
+    expect(pending).toHaveLength(1);
+    expect(pending[0]!.id).toBe(queueId);
   });
 });
 

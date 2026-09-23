@@ -61,6 +61,12 @@ const mockConfig = {
   claudeOAuthToken: null,
 } as unknown as IndexModule.AppConfig;
 
+const trackerPostCommentMock = vi.fn<(issueId: string, body: string) => Promise<void>>(async () => undefined);
+
+const mockRegistry = {
+  forMapping: vi.fn(async () => ({ postComment: trackerPostCommentMock })),
+} as unknown as import("../providers/index.js").ProviderRegistry;
+
 function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
   return {
     owner: "acme",
@@ -150,6 +156,7 @@ afterEach(() => {
   vi.restoreAllMocks();
   localGapfillMocks.dispatchLocalGapfill.mockReset();
   githubAppAuthMocks.getInstallationToken.mockReset();
+  trackerPostCommentMock.mockClear();
 });
 
 describe("processReviewFixQueue — dispatch gate", () => {
@@ -177,7 +184,7 @@ describe("processReviewFixQueue — dispatch gate", () => {
 
     const consoleLogSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
 
-    await indexModule.processReviewFixQueue(mockConfig);
+    await indexModule.processReviewFixQueue(mockConfig, mockRegistry);
 
     expect(localGapfillMocks.dispatchLocalGapfill).not.toHaveBeenCalled();
     expect(
@@ -213,7 +220,7 @@ describe("processReviewFixQueue — dispatch gate", () => {
       reason: "late review comment",
     });
 
-    await indexModule.processReviewFixQueue(mockConfig);
+    await indexModule.processReviewFixQueue(mockConfig, mockRegistry);
 
     // The first dispatch's own dispatch_log row makes the issue in-flight for the
     // second item processed later in the same loop — read fresh from the DB, not cached.
@@ -247,7 +254,7 @@ describe("processReviewFixQueue — dispatch gate", () => {
 
     const consoleLogSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
 
-    await indexModule.processReviewFixQueue(mockConfig);
+    await indexModule.processReviewFixQueue(mockConfig, mockRegistry);
 
     expect(localGapfillMocks.dispatchLocalGapfill).not.toHaveBeenCalled();
     expect(
@@ -276,11 +283,185 @@ describe("processReviewFixQueue — dispatch gate", () => {
       reason: "late review comment",
     });
 
-    await indexModule.processReviewFixQueue(mockConfig);
+    await indexModule.processReviewFixQueue(mockConfig, mockRegistry);
 
     expect(localGapfillMocks.dispatchLocalGapfill).toHaveBeenCalledTimes(1);
     const pending = reviewFixQueue.getPendingReviewFixes();
     expect(pending).toHaveLength(0);
+  });
+});
+
+describe("processReviewFixQueue — PR dispatch budget", () => {
+  /** Seeds a completed gap-analysis dispatch counted toward a PR's 24h budget.
+   *  Terminal status keeps it out of the in_flight gate, which would otherwise
+   *  mask the pr_budget reason this suite exercises. */
+  function seedGapAnalysisDispatch(issueId: string, repo: string, prNumber: number): void {
+    const jobId = log.appendLog({
+      issueId,
+      teamKey: "TEAM",
+      repo,
+      phase: "gap-analysis",
+      status: "completed",
+    });
+    log.updateJobPrUrl(jobId, `https://github.com/${repo}/pull/${prNumber}`);
+  }
+
+  it("parks the PR and posts exactly one PR comment and one tracker comment when the budget is reached", async () => {
+    const mapping = makeMapping({ prDispatchBudget: 2 });
+    configModule.upsertMapping("TEAM", mapping);
+
+    seedGapAnalysisDispatch("issue-1", "acme/billing", 42);
+    seedGapAnalysisDispatch("issue-1", "acme/billing", 42);
+
+    const queueId = reviewFixQueue.enqueueReviewFix({
+      issueId: "issue-1",
+      issueIdentifier: "AII-1",
+      repo: "acme/billing",
+      prNumber: 42,
+      reason: "late review comment",
+    });
+
+    const githubModule = await import("../github.js");
+    const postPrCommentSpy = vi.spyOn(githubModule, "postPrComment").mockResolvedValue(undefined);
+    const consoleLogSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    await indexModule.processReviewFixQueue(mockConfig, mockRegistry);
+
+    expect(localGapfillMocks.dispatchLocalGapfill).not.toHaveBeenCalled();
+    expect(
+      consoleLogSpy.mock.calls.some(
+        ([msg]) => typeof msg === "string" && msg.includes(`[review-fix] Deferring review fix #${queueId} for PR #42: pr_budget`),
+      ),
+    ).toBe(true);
+
+    expect(postPrCommentSpy).toHaveBeenCalledTimes(1);
+    const [, owner, repo, prNumber, body] = postPrCommentSpy.mock.calls[0]!;
+    expect(owner).toBe("acme");
+    expect(repo).toBe("billing");
+    expect(prNumber).toBe(42);
+    expect(body.startsWith("<!-- ai-implement pr-budget -->")).toBe(true);
+    expect(body).toContain("Needs Human");
+    expect(body).toContain("limit of 2 automatic fix runs");
+
+    expect(trackerPostCommentMock).toHaveBeenCalledTimes(1);
+    const [trackerIssueId, trackerBody] = trackerPostCommentMock.mock.calls[0]!;
+    expect(trackerIssueId).toBe("issue-1");
+    expect(trackerBody).toContain("Needs Human");
+
+    expect(breaker.isParked("issue-1", "gap-analysis")).toBe(true);
+
+    const pending = reviewFixQueue.getPendingReviewFixes();
+    expect(pending).toHaveLength(1);
+    expect(pending[0]!.id).toBe(queueId);
+    expect(pending[0]!.status).toBe("pending");
+
+    consoleLogSpy.mockRestore();
+  });
+
+  it("posts no additional comments on a second drain tick in the same state", async () => {
+    const mapping = makeMapping({ prDispatchBudget: 2 });
+    configModule.upsertMapping("TEAM", mapping);
+
+    seedGapAnalysisDispatch("issue-1", "acme/billing", 42);
+    seedGapAnalysisDispatch("issue-1", "acme/billing", 42);
+
+    reviewFixQueue.enqueueReviewFix({
+      issueId: "issue-1",
+      issueIdentifier: "AII-1",
+      repo: "acme/billing",
+      prNumber: 42,
+      reason: "late review comment",
+    });
+
+    const githubModule = await import("../github.js");
+    const postPrCommentSpy = vi.spyOn(githubModule, "postPrComment").mockResolvedValue(undefined);
+
+    await indexModule.processReviewFixQueue(mockConfig, mockRegistry);
+    await indexModule.processReviewFixQueue(mockConfig, mockRegistry);
+
+    expect(localGapfillMocks.dispatchLocalGapfill).not.toHaveBeenCalled();
+    expect(postPrCommentSpy).toHaveBeenCalledTimes(1);
+    expect(trackerPostCommentMock).toHaveBeenCalledTimes(1);
+
+    const pending = reviewFixQueue.getPendingReviewFixes();
+    expect(pending).toHaveLength(1);
+    expect(pending[0]!.status).toBe("pending");
+  });
+
+  it("dispatches the pending row after unpark once the count is below budget", async () => {
+    const mapping = makeMapping({ prDispatchBudget: 2 });
+    configModule.upsertMapping("TEAM", mapping);
+
+    seedGapAnalysisDispatch("issue-1", "acme/billing", 42);
+    seedGapAnalysisDispatch("issue-1", "acme/billing", 42);
+
+    reviewFixQueue.enqueueReviewFix({
+      issueId: "issue-1",
+      issueIdentifier: "AII-1",
+      repo: "acme/billing",
+      prNumber: 42,
+      reason: "late review comment",
+    });
+
+    const githubModule = await import("../github.js");
+    vi.spyOn(githubModule, "postPrComment").mockResolvedValue(undefined);
+
+    // First tick parks the issue at its budget.
+    await indexModule.processReviewFixQueue(mockConfig, mockRegistry);
+    expect(breaker.isParked("issue-1", "gap-analysis")).toBe(true);
+
+    // The count drops below budget (e.g. the older dispatches age out of the 24h
+    // window) while the park persists (unpark is human-only).
+    dedup.getDb().prepare("DELETE FROM dispatch_log WHERE phase = 'gap-analysis'").run();
+
+    breaker.unpark("issue-1", "gap-analysis");
+
+    await indexModule.processReviewFixQueue(mockConfig, mockRegistry);
+
+    expect(localGapfillMocks.dispatchLocalGapfill).toHaveBeenCalledTimes(1);
+    const pending = reviewFixQueue.getPendingReviewFixes();
+    expect(pending).toHaveLength(0);
+  });
+
+  it("defers with reason parked and no comments once the count drops below budget while still parked", async () => {
+    const mapping = makeMapping({ prDispatchBudget: 2 });
+    configModule.upsertMapping("TEAM", mapping);
+
+    seedGapAnalysisDispatch("issue-1", "acme/billing", 42);
+    seedGapAnalysisDispatch("issue-1", "acme/billing", 42);
+
+    const queueId = reviewFixQueue.enqueueReviewFix({
+      issueId: "issue-1",
+      issueIdentifier: "AII-1",
+      repo: "acme/billing",
+      prNumber: 42,
+      reason: "late review comment",
+    });
+
+    const githubModule = await import("../github.js");
+    const postPrCommentSpy = vi.spyOn(githubModule, "postPrComment").mockResolvedValue(undefined);
+    const consoleLogSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    // First tick parks the issue at its budget.
+    await indexModule.processReviewFixQueue(mockConfig, mockRegistry);
+    expect(postPrCommentSpy).toHaveBeenCalledTimes(1);
+
+    // The count drops below budget, but the park persists (no unpark call).
+    dedup.getDb().prepare("DELETE FROM dispatch_log WHERE phase = 'gap-analysis'").run();
+
+    await indexModule.processReviewFixQueue(mockConfig, mockRegistry);
+
+    expect(localGapfillMocks.dispatchLocalGapfill).not.toHaveBeenCalled();
+    // No new comment: this tick's block reason is "parked", not "pr_budget".
+    expect(postPrCommentSpy).toHaveBeenCalledTimes(1);
+    expect(trackerPostCommentMock).toHaveBeenCalledTimes(1);
+    expect(
+      consoleLogSpy.mock.calls.some(
+        ([msg]) => typeof msg === "string" && msg.includes(`[review-fix] Deferring review fix #${queueId} for PR #42: parked`),
+      ),
+    ).toBe(true);
+
+    consoleLogSpy.mockRestore();
   });
 });
 
@@ -427,7 +608,7 @@ describe("processReviewFixQueue — GHA phase fix", () => {
     });
     vi.spyOn(repoImageModule, "resolveRunnerImageForDispatch").mockResolvedValue(undefined);
 
-    await indexModule.processReviewFixQueue(mockConfig);
+    await indexModule.processReviewFixQueue(mockConfig, mockRegistry);
 
     const jobs = log.getInFlightJobs().concat(
       // dispatched (non-terminal) rows are already covered by getInFlightJobs, but read the
