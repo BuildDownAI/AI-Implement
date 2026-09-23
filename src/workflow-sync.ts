@@ -11,18 +11,31 @@ const GH_HEADERS = {
   "User-Agent": "ai-implement-orchestrator",
 } as const;
 
-const ALWAYS_SYNC_FILES = [
-  {
-    local: "workflows/claude-implement.yml",
-    remote: ".github/workflows/claude-implement.yml",
-    message: "Sync claude-implement.yml from ai-implement",
-  },
-  {
-    local: "workflows/claude-plan.yml",
-    remote: ".github/workflows/claude-plan.yml",
-    message: "Sync claude-plan.yml from ai-implement",
-  },
-] as const;
+interface AlwaysSyncFile {
+  local: string;
+  remote: string;
+  message: string;
+}
+
+function alwaysSyncFiles(mapping: RepoMapping): AlwaysSyncFile[] {
+  return [
+    {
+      local: "workflows/claude-implement.yml",
+      remote: `.github/workflows/${mapping.workflowFile}`,
+      message: `Sync ${mapping.workflowFile} from ai-implement`,
+    },
+    {
+      local: "workflows/claude-plan.yml",
+      remote: `.github/workflows/${mapping.planningWorkflowFile}`,
+      message: `Sync ${mapping.planningWorkflowFile} from ai-implement`,
+    },
+  ];
+}
+
+/** Whether `name` is safe to join under `.github/workflows/` as a sync target: a bare `.yml`/`.yaml` file name with no path separators or `..`. */
+export function isBareWorkflowFileName(name: string): boolean {
+  return /\.(ya?ml)$/i.test(name) && !name.includes("/") && !name.includes("\\") && !name.includes("..");
+}
 
 const REMOVE_FILES = [
   {
@@ -346,12 +359,12 @@ async function findSyncPr(
   return prs[0] ?? null;
 }
 
-function syncPrBody(): string {
+function syncPrBody(alwaysSynced: AlwaysSyncFile[]): string {
   return [
     "Auto-synced from ai-implement.",
     "",
     "**Always updated:**",
-    ...ALWAYS_SYNC_FILES.map((file) => `- \`${file.remote}\``),
+    ...alwaysSynced.map((file) => `- \`${file.remote}\``),
     "",
     "**Added once (never overwritten):**",
     ...SEED_ONCE_FILES.map((file) => `- \`${file.remote}\` — ${file.description}`),
@@ -366,15 +379,16 @@ async function createSyncPr(params: {
   repo: string;
   baseBranch: string;
   syncBranch: string;
+  alwaysSynced: AlwaysSyncFile[];
 }): Promise<PullRequest> {
-  const { gh, repo, baseBranch, syncBranch } = params;
+  const { gh, repo, baseBranch, syncBranch, alwaysSynced } = params;
   return await gh.request<PullRequest>(`/repos/${repo}/pulls`, {
     method: "POST",
     body: JSON.stringify({
       title: "Sync AI implementation workflow files",
       head: syncBranch,
       base: baseBranch,
-      body: syncPrBody(),
+      body: syncPrBody(alwaysSynced),
     }),
   });
 }
@@ -403,12 +417,25 @@ export async function syncWorkflowTemplates(
   const token = await getToken(options.githubAppId, options.githubAppPrivateKey, mapping.owner);
   const gh = new GitHubClient(token, options.fetchImpl ?? fetch);
 
+  for (const [field, value] of [
+    ["workflowFile", mapping.workflowFile],
+    ["planningWorkflowFile", mapping.planningWorkflowFile],
+  ] as const) {
+    if (!isBareWorkflowFileName(value)) {
+      throw new Error(
+        `Mapping ${field} "${value}" is not a bare workflow file name — it must end in .yml or .yaml ` +
+          `and contain no "/", "\\", or "..".`,
+      );
+    }
+  }
+  const syncedFiles = alwaysSyncFiles(mapping);
+
   const repo = await gh.request<{ default_branch: string }>(`/repos/${targetRepo}`);
   const baseBranch = options.targetBase || mapping.defaultBranch || repo.default_branch;
   await ensureSyncBranch({ gh, repo: targetRepo, baseBranch, syncBranch });
 
   const changedFiles: string[] = [];
-  for (const file of ALWAYS_SYNC_FILES) {
+  for (const file of syncedFiles) {
     const content = readTemplate(templatesRoot, file.local);
     if (content === null) {
       throw new Error(`Missing workflow template: ${file.local}`);
@@ -464,7 +491,7 @@ export async function syncWorkflowTemplates(
     };
   }
 
-  const finalPr = pr ?? await createSyncPr({ gh, repo: targetRepo, baseBranch, syncBranch });
+  const finalPr = pr ?? await createSyncPr({ gh, repo: targetRepo, baseBranch, syncBranch, alwaysSynced: syncedFiles });
   return {
     status: pr ? "pr-updated" : "pr-opened",
     targetRepo,
