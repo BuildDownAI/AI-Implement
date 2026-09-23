@@ -96,7 +96,7 @@ Entry points for areas that are easy to miss. Each names the module to start fro
 | Execution backends | `src/fly-machines.ts`, `src/local-docker.ts`, `src/github.ts` | |
 | Runner callbacks and tokens | `src/runner-callback.ts`, `src/runner-token.ts`, `src/token-vending.ts` | [docs/runner-callbacks.md](docs/runner-callbacks.md) |
 | Merge reconciliation | `src/reconciliation.ts`, `src/reconcile-merged.ts`, `src/poll-merged-prs.ts` | |
-| Workflow sync to target repos | `src/workflow-sync.ts`, `src/workflow-sync-queue.ts` | |
+| Workflow sync to target repos | `src/workflow-sync.ts`, `src/workflow-sync-queue.ts` | [docs/workflow-sync.md](docs/workflow-sync.md) |
 | `/ai-implement` comment rail | `src/webhook.ts`, `src/comment-gapfill-drain.ts` | |
 | Stuck-run recovery | `src/reaper.ts`, `src/stuck-watchdog.ts` | |
 | Per-team dispatch capacity | `src/poll-selection.ts` | |
@@ -173,6 +173,8 @@ npm run test:restate # src/__tests__/restate/**/*.restate.test.ts — needs Dock
 
 **`typecheck` excludes `src/__tests__`, and vitest strips types without checking them** — so type errors in a test file are caught by nothing. Type-check a new test file explicitly with a throwaway tsconfig. `src/admin-ui/__tests__/` *is* covered and can break the build.
 
+Fixing a bug: write the failing test first, then the fix, in one pull request — see [docs/bug-fix-tests.md](docs/bug-fix-tests.md).
+
 ## Data layer
 
 One SQLite file at `DEDUP_DB_PATH` (default `/data/dedup.sqlite`; `./dedup.sqlite` locally) holding 22 tables. `dedup.ts` owns the singleton — every other module imports `getDb` from it rather than opening its own handle.
@@ -214,7 +216,7 @@ The target repo's "Allow GitHub Actions to create and approve pull requests" tog
 
 ## Workflow templates
 
-`workflows/claude-implement.yml` and `claude-plan.yml` are synced to target repos; `WORKFLOW.md` and `PLANNING.md` are **seeded once and never overwritten**, so every repo keeps whatever template it was created with. Sync also *removes* `comment-trigger.yml`, since the orchestrator webhook now handles `/ai-implement` for envelope repos.
+`workflows/claude-implement.yml` and `claude-plan.yml` are synced to target repos under the mapping's Workflow File and Planning Workflow File names (defaults `claude-implement.yml`, `claude-plan.yml`); a sync never touches a workflow file the mapping does not name. `WORKFLOW.md` and `PLANNING.md` are **seeded once and never overwritten**, so every repo keeps whatever template it was created with. Sync also *removes* `comment-trigger.yml`, since the orchestrator webhook now handles `/ai-implement` for envelope repos. **Full reference: [docs/workflow-sync.md](docs/workflow-sync.md).**
 
 That seed-once rule has a consequence worth internalising: **a template correction never reaches an existing repo.** Fixing a bug in `workflows/WORKFLOW.md` fixes it for repos onboarded afterward and for nobody else.
 

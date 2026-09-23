@@ -81,6 +81,7 @@ import { filesystemRetryEligibility, retryFilesystemTicket } from "./filesystem-
 import { JiraClient, JiraFieldNotSelectError } from "./providers/jira-client.js";
 import { readLocalJobLogs } from "./local-job-logs.js";
 import { enqueueWorkflowSync, runWorkflowSync, getWorkflowSyncById } from "./workflow-sync-queue.js";
+import { isBareWorkflowFileName, workflowFileNamesCollide } from "./workflow-sync.js";
 import type { KgRefreshStatus } from "./kg-refresh.js";
 import { normalizeBranchPrefix } from "./pipeline/branch-name.js";
 import { normalizeGitHubRepo, normalizeReferenceRepos, type ReferenceRepo } from "./reference-repos.js";
@@ -2444,6 +2445,7 @@ export function upsertMappingAction(
     return { status: 400, body: { error: "machineMemoryMb must be an integer >= 256" } };
   }
 
+  const workflowFile = body.workflowFile || "claude-implement.yml";
   const planningEnabled = body.planningEnabled ?? DEFAULT_PLANNING_ENABLED;
   const planningWorkflowFile = body.planningWorkflowFile ?? DEFAULT_PLANNING_WORKFLOW_FILE;
   const autoApprovePlans = body.autoApprovePlans ?? DEFAULT_AUTO_APPROVE_PLANS;
@@ -2451,6 +2453,24 @@ export function upsertMappingAction(
 
   if (planningEnabled && !planningWorkflowFile) {
     return { status: 400, body: { error: "planningWorkflowFile is required when planningEnabled is true" } };
+  }
+
+  for (const [field, value] of [
+    ["workflowFile", workflowFile],
+    ["planningWorkflowFile", planningWorkflowFile],
+  ] as const) {
+    if (!isBareWorkflowFileName(value)) {
+      return {
+        status: 400,
+        body: { error: `${field} must be a bare file name ending in .yml or .yaml` },
+      };
+    }
+  }
+  if (workflowFileNamesCollide(workflowFile, planningWorkflowFile)) {
+    return {
+      status: 400,
+      body: { error: "workflowFile and planningWorkflowFile must not be the same file name" },
+    };
   }
 
   let extraEnv: Record<string, string> = {};
@@ -2587,7 +2607,7 @@ export function upsertMappingAction(
   const mapping: RepoMapping = {
     owner: body.owner,
     repo: body.repo,
-    workflowFile: body.workflowFile || "claude-implement.yml",
+    workflowFile,
     defaultBranch,
     maxInProgressAiIssues,
     executionMode,
