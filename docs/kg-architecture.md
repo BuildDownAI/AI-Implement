@@ -285,7 +285,7 @@ reloadable on its own; here it rides a release, so the release has to be sequenc
 ### PR check (AII-633)
 
 A PR that touches `kg_ingest/**`, `sources.yml`, `ontology/**`, or `snapshot/**` on the bound KG
-source repo (`kg.source_repo`) or the configured base template repo (Settings → KG Refresh · "Base
+source repo (`kg.sourceRepo` in the `get_project_binding` answer) or the configured base template repo (Settings → KG Refresh · "Base
 template repo", seeded once from `KG_BASE_REPO`), or whose head branch matches `kg-upstream/*` or
 `sync/upstream-*` (an upstream merge, guard-relevant regardless of which files it happens to touch),
 gets the same dry run described above run against the PR's head instead of the default branch: the
