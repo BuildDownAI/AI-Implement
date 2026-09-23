@@ -85,4 +85,78 @@ describe("review ledger store", () => {
 
     expect(store.listOpenReviewFindings("org/repo", 42)).toEqual([]);
   });
+
+  it("defers only open findings matching the given keys, and excludes deferred rows from the open list", () => {
+    const deferredId = store.upsertReviewFinding({
+      repo: "org/repo",
+      prNumber: 42,
+      source: "github-review",
+      severity: "blocking",
+      body: "Add a config flag for this.",
+    });
+    const openId = store.upsertReviewFinding({
+      repo: "org/repo",
+      prNumber: 42,
+      source: "github-review",
+      severity: "blocking",
+      body: "Fix the null check.",
+    });
+
+    const deferredRow = store.listOpenReviewFindings("org/repo", 42).find((f) => f.id === deferredId)!;
+
+    const changed = store.markReviewFindingsDeferredByKeys("org/repo", 42, [deferredRow.findingKey]);
+
+    expect(changed).toBe(1);
+    expect(store.listOpenReviewFindings("org/repo", 42)).toMatchObject([{ id: openId, status: "open" }]);
+  });
+
+  it("keeps a deferred finding deferred across a re-report (upsert), including resolved_at", () => {
+    store.upsertReviewFinding({
+      repo: "org/repo",
+      prNumber: 42,
+      source: "github-review",
+      severity: "blocking",
+      body: "Add a config flag for this.",
+    });
+    const finding = store.listOpenReviewFindings("org/repo", 42)[0];
+    store.markReviewFindingsDeferredByKeys("org/repo", 42, [finding.findingKey]);
+
+    store.upsertReviewFinding({
+      repo: "org/repo",
+      prNumber: 42,
+      source: "github-review",
+      severity: "blocking",
+      body: "Add a config flag for this.",
+      url: "https://github.com/org/repo/pull/42#review-updated",
+    });
+
+    const [row] = store.getReviewFindingsByKeys("org/repo", 42, [finding.findingKey]);
+    expect(row.status).toBe("deferred");
+    expect(row.resolvedAt).toBeNull();
+    expect(store.listOpenReviewFindings("org/repo", 42)).toEqual([]);
+  });
+
+  it("getReviewFindingsByKeys returns rows for the given keys regardless of status", () => {
+    store.upsertReviewFinding({
+      repo: "org/repo",
+      prNumber: 42,
+      source: "github-review",
+      severity: "blocking",
+      body: "Finding A",
+    });
+    store.upsertReviewFinding({
+      repo: "org/repo",
+      prNumber: 42,
+      source: "github-review",
+      severity: "blocking",
+      body: "Finding B",
+    });
+    const [a, b] = store.listOpenReviewFindings("org/repo", 42);
+    store.markReviewFindingsDeferredByKeys("org/repo", 42, [a.findingKey]);
+
+    const rows = store.getReviewFindingsByKeys("org/repo", 42, [a.findingKey, b.findingKey, "nonexistent-key"]);
+    expect(rows).toHaveLength(2);
+    expect(rows.find((r) => r.findingKey === a.findingKey)?.status).toBe("deferred");
+    expect(rows.find((r) => r.findingKey === b.findingKey)?.status).toBe("open");
+  });
 });
