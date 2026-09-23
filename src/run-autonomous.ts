@@ -25,6 +25,13 @@ import { prepareScratchExclusionIfGit } from "./pipeline/scratch-exclude.js";
 import type { ReferenceRepo, ReferenceRepoResult } from "./reference-repos.js";
 import { DEFAULT_REVIEWER_SELECTION, type ReviewerSelection } from "./config.js";
 import { resolveTrustedReviewer, type ReviewerDefinition } from "./pipeline/reviewers/registry.js";
+import {
+  buildDispositionInstructions,
+  readFindingDispositions,
+  replyToDispositionThreads,
+  type FindingDisposition,
+} from "./pipeline/finding-dispositions.js";
+import type { GhSpawn } from "./pipeline/review-ledger.js";
 
 type RunAutopsyPasses = Array<{
   iteration: number;
@@ -43,6 +50,9 @@ export interface RunAutonomousOptions {
   fetchImpl?: typeof fetch;
   pipeline?: PipelineDefinition;
   runner?: PipelineRunner;
+  /** Injectable `gh` CLI spawner for finding-disposition thread replies. Defaults to a
+   *  real `gh` spawn scoped to `workspaceDir`, mirroring post-push-review.ts's own default. */
+  ghSpawn?: GhSpawn;
 }
 
 export interface RunAutonomousResult {
@@ -121,14 +131,21 @@ ${issueDescription}`;
 
 function appendPipelineOwnedGitInstructions(prompt: string, prNumber: string): string {
   if (prNumber) {
-    if (prompt.includes("Pipeline-owned gap-fill Git")) return prompt;
-    return `${prompt.trimEnd()}
+    let result = prompt.includes("Pipeline-owned gap-fill Git")
+      ? prompt
+      : `${prompt.trimEnd()}
 
 ## Pipeline-owned gap-fill Git
 
 Do NOT create or switch branches. Do NOT commit, push, or open a pull request.
 Modify files only in the current checkout and leave the working tree changes unstaged and uncommitted.
 The AI-Implement pipeline will commit and push the reviewed changes to the existing PR branch.`;
+    if (!result.includes("## Finding dispositions")) {
+      result = `${result.trimEnd()}
+
+${buildDispositionInstructions()}`;
+    }
+    return result;
   }
   if (prompt.includes("Pipeline-owned Git")) return prompt;
   return `${prompt.trimEnd()}
@@ -186,6 +203,18 @@ export function waitForContainerRemoval(
 /** Single-quote a shell value, escaping embedded single-quotes. */
 function shellQuote(val: string): string {
   return "'" + val.replace(/'/g, "'\\''") + "'";
+}
+
+/** Mirrors post-push-review.ts's makeDefaultGhSpawn — there is no shared export to reuse. */
+function makeDefaultGhSpawn(cwd: string): GhSpawn {
+  return (args: string[]) => {
+    const r = spawnSync("gh", args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+    return {
+      stdout: r.stdout?.toString() ?? "",
+      stderr: r.stderr?.toString() ?? "",
+      exitCode: r.status ?? 1,
+    };
+  };
 }
 
 /**
@@ -579,6 +608,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     const outputs = context.getOutputs("reference-repos") as { results?: ReferenceRepoResult[] };
     return Array.isArray(outputs.results) ? outputs.results : undefined;
   };
+  const ghSpawn: GhSpawn = opts.ghSpawn ?? makeDefaultGhSpawn(workspaceDir);
 
   const devHarnessMode = isLocalDevHarness();
   const untilStep = devHarnessMode ? optionalEnv("AI_IMPLEMENT_UNTIL_STEP") ?? undefined : undefined;
@@ -613,6 +643,23 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     const approved = fbOutputs.approved === true
       && (!postPushReviewRequired || postPushReviewOutputs.approved === true);
 
+    // Gap-fill runs ask the agent for dispositions directly (post-push-review never runs for
+    // an existing PR — it requires prUrl, which a gap-fill push never sets). Read once here so
+    // every branch below sees the same value, mirroring referenceRepoResults above. Reached only
+    // when the pipeline completed without throwing, so the push step (if it ran) never failed —
+    // the "skip replies on push failure" rule therefore applies only in the catch block below.
+    // Do NOT gate replies on pushOutputs.branchPushed: the dispositions file lives under
+    // ai-output/, which scratch-exclude.ts excludes from git, so a run that only defers a
+    // finding produces no git change and a no-op push — the primary use case for this field.
+    const findingDispositions: FindingDisposition[] = prNumber
+      ? readFindingDispositions(workspaceDir).valid
+      : Array.isArray(postPushReviewOutputs.findingDispositions)
+        ? (postPushReviewOutputs.findingDispositions as FindingDisposition[])
+        : [];
+    if (prNumber) {
+      replyToDispositionThreads(ghSpawn, prNumber, findingDispositions);
+    }
+
     // Case B: grouping-parent run where the agent produced genuinely no changes. Push returned
     // a no-op (branchPushed=false, prUrl=null). Report success without a prUrl so the
     // orchestrator finalizes the issue and merge-up.ts opens the feature→base roll-up PR.
@@ -626,6 +673,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
         outcome: "success",
         noWork: true,
         referenceRepoResults,
+        findingDispositions,
         callbackUrl,
         fetchImpl: opts.fetchImpl,
       });
@@ -673,6 +721,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
         outcome: "success",
         prUrl,
         referenceRepoResults,
+        findingDispositions,
         callbackUrl,
         fetchImpl: opts.fetchImpl,
       });
@@ -782,6 +831,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       failure: reviewerFailure,
       prUrl,
       referenceRepoResults,
+      findingDispositions,
       callbackUrl,
       fetchImpl: opts.fetchImpl,
     });
@@ -791,6 +841,15 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     disposition = `failed: ${err instanceof Error ? err.message : String(err)}`;
     referenceRepoResults = readReferenceRepoResults();
     const failure = classifyThrown(err, { stage: "pipeline", attempt: 1 });
+    // Reading the dispositions file here is harmless even when it doesn't exist (the common
+    // case — a step failed before the agent wrote one). Replies are skipped specifically when
+    // the push step itself threw: a `fixed`/`follow-up` reply would assert a code change that
+    // did not land. Any other step failing (push never having run) does not suppress replies.
+    const { valid: findingDispositions } = readFindingDispositions(workspaceDir);
+    const pushFailed = Boolean(context.getOutputs("push").error);
+    if (prNumber && !pushFailed) {
+      replyToDispositionThreads(ghSpawn, prNumber, findingDispositions);
+    }
     await postRunnerResult({
       workspaceDir,
       phase: runnerPhase,
@@ -801,6 +860,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
         : failure.code,
       failure,
       referenceRepoResults,
+      findingDispositions,
       callbackUrl,
       fetchImpl: opts.fetchImpl,
     });
