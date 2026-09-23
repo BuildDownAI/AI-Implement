@@ -70,7 +70,11 @@ export async function handlePublicationTokenRequest(
         // workflow-side mint's — decides what the runner can push. Without it, any
         // run touching .github/workflows/ dies at push with a buried remote-reject
         // (three live occurrences before the omission was found).
-        permissions: { contents: "write", pull_requests: "write", workflows: "write" },
+        // checks:read is load-bearing for the same reason: post-push review runs on this
+        // credential and polls check runs for the external review and failing CI. Without
+        // it every poll 403s, the gate fails closed, and every clean PR ends as
+        // "external review did not complete within the wait budget".
+        permissions: { contents: "write", pull_requests: "write", workflows: "write", checks: "read" },
         repositories: [repo],
         forceRefresh: true,
       },
