@@ -301,6 +301,16 @@ export function countPriorDispatches(issueId: string, phase?: string): { count: 
   return { count: row.count, lastDispatchedAt: row.last_at };
 }
 
+/** Gap-fill runs started on one PR since `sinceMs`. */
+export function countGapfillDispatchesForPr(prUrl: string, sinceMs: number): number {
+  const row = getDb()
+    .prepare(
+      "SELECT COUNT(*) as count FROM dispatch_log WHERE pr_url = ? AND phase = 'gap-analysis' AND dispatched_at >= ?",
+    )
+    .get(prUrl, sinceMs) as { count: number };
+  return row.count;
+}
+
 export function updateJobRunId(jobId: number, runId: number): void {
   getDb()
     .prepare("UPDATE dispatch_log SET run_id = ?, status = 'running' WHERE id = ?")

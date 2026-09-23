@@ -174,3 +174,202 @@ describe("canDispatch — team_capacity (gap-fill only)", () => {
     ).toEqual({ ok: true });
   });
 });
+
+describe("countGapfillDispatchesForPr", () => {
+  const PR = "https://github.com/eudoxus/AI-Implement/pull/42";
+
+  it("counts only gap-analysis rows for that PR in the window, regardless of status", () => {
+    log.appendLog({ issueId: "i1", teamKey: "AII", phase: "gap-analysis", status: "dispatched" });
+    log.appendLog({ issueId: "i2", teamKey: "AII", phase: "gap-analysis", status: "running" });
+    log.appendLog({ issueId: "i3", teamKey: "AII", phase: "gap-analysis", status: "failed" });
+    log.appendLog({ issueId: "i4", teamKey: "AII", phase: "gap-analysis", status: "completed" });
+    const ids = [1, 2, 3, 4];
+    for (const id of ids) {
+      log.updateJobPrUrl(id, PR);
+    }
+    // A different PR and a different phase must not count.
+    const otherPr = log.appendLog({ issueId: "i5", teamKey: "AII", phase: "gap-analysis", status: "dispatched" });
+    log.updateJobPrUrl(otherPr, "https://github.com/eudoxus/AI-Implement/pull/43");
+    const implRow = log.appendLog({ issueId: "i6", teamKey: "AII", phase: "implementation", status: "dispatched" });
+    log.updateJobPrUrl(implRow, PR);
+
+    expect(log.countGapfillDispatchesForPr(PR, 0)).toBe(4);
+  });
+
+  it("excludes a row dispatched before the window and includes one at the boundary", () => {
+    const nowSpy = vi.spyOn(Date, "now");
+    nowSpy.mockReturnValue(1_000_000);
+    const before = log.appendLog({ issueId: "i1", teamKey: "AII", phase: "gap-analysis", status: "dispatched" });
+    log.updateJobPrUrl(before, PR);
+
+    nowSpy.mockReturnValue(2_000_000);
+    const atBoundary = log.appendLog({ issueId: "i2", teamKey: "AII", phase: "gap-analysis", status: "dispatched" });
+    log.updateJobPrUrl(atBoundary, PR);
+    nowSpy.mockRestore();
+
+    expect(log.countGapfillDispatchesForPr(PR, 2_000_000)).toBe(1);
+  });
+});
+
+describe("canDispatch — pr_budget (gap-fill only)", () => {
+  const PR = "https://github.com/eudoxus/AI-Implement/pull/42";
+
+  function gapfillRow(issueId: string, prUrl: string): void {
+    const id = log.appendLog({ issueId, teamKey: "AII", phase: "gap-analysis", status: "completed" });
+    log.updateJobPrUrl(id, prUrl);
+  }
+
+  it("humanRequested=false, budget given, count >= budget -> pr_budget, even when also parked (fires before parked)", () => {
+    gapfillRow("other-a", PR);
+    gapfillRow("other-b", PR);
+    parkAt("issue-12", "gap-analysis");
+
+    const decision = gate.canDispatch({
+      issueId: "issue-12",
+      kind: "gap-fill",
+      teamKey: "AII",
+      maxInProgressAiIssues: 5,
+      prUrl: PR,
+      prDispatchBudget: 2,
+    });
+    expect(decision).toEqual({ ok: false, reason: "pr_budget" });
+  });
+
+  it("humanRequested=false, budget given, count < budget, parked -> parked", () => {
+    gapfillRow("other-a", PR);
+    parkAt("issue-13", "gap-analysis");
+
+    const decision = gate.canDispatch({
+      issueId: "issue-13",
+      kind: "gap-fill",
+      teamKey: "AII",
+      maxInProgressAiIssues: 5,
+      prUrl: PR,
+      prDispatchBudget: 2,
+    });
+    expect(decision).toEqual({ ok: false, reason: "parked" });
+  });
+
+  it("no prUrl/prDispatchBudget -> budget check skipped entirely, parked/team_capacity behavior unchanged", () => {
+    gapfillRow("other-a", PR);
+    gapfillRow("other-b", PR);
+    gapfillRow("other-c", PR);
+
+    const okDecision = gate.canDispatch({
+      issueId: "issue-14",
+      kind: "gap-fill",
+      teamKey: "AII",
+      maxInProgressAiIssues: 5,
+    });
+    expect(okDecision).toEqual({ ok: true });
+
+    parkAt("issue-15", "gap-analysis");
+    const parkedDecision = gate.canDispatch({
+      issueId: "issue-15",
+      kind: "gap-fill",
+      teamKey: "AII",
+      maxInProgressAiIssues: 5,
+    });
+    expect(parkedDecision).toEqual({ ok: false, reason: "parked" });
+  });
+
+  it("humanRequested=true skips both pr_budget and parked: over-budget, parked PR, no in-flight run -> ok:true", () => {
+    gapfillRow("other-a", PR);
+    gapfillRow("other-b", PR);
+    parkAt("issue-16", "gap-analysis");
+
+    const decision = gate.canDispatch({
+      issueId: "issue-16",
+      kind: "gap-fill",
+      teamKey: "AII",
+      maxInProgressAiIssues: 5,
+      prUrl: PR,
+      prDispatchBudget: 2,
+      humanRequested: true,
+    });
+    expect(decision).toEqual({ ok: true });
+  });
+
+  it("humanRequested=true still blocks on in_flight", () => {
+    log.appendLog({ issueId: "issue-17", teamKey: "AII", phase: "gap-analysis", status: "running" });
+    gapfillRow("other-a", PR);
+    gapfillRow("other-b", PR);
+    parkAt("issue-17", "gap-analysis");
+
+    const decision = gate.canDispatch({
+      issueId: "issue-17",
+      kind: "gap-fill",
+      teamKey: "AII",
+      maxInProgressAiIssues: 5,
+      prUrl: PR,
+      prDispatchBudget: 2,
+      humanRequested: true,
+    });
+    expect(decision).toEqual({ ok: false, reason: "in_flight" });
+  });
+
+  it("humanRequested=true still blocks on team_capacity", () => {
+    log.appendLog({ issueId: "other-1", teamKey: "AII", phase: "implementation", status: "dispatched" });
+    log.appendLog({ issueId: "other-2", teamKey: "AII", phase: "implementation", status: "running" });
+    gapfillRow("other-a", PR);
+    gapfillRow("other-b", PR);
+    parkAt("issue-18", "gap-analysis");
+
+    const decision = gate.canDispatch({
+      issueId: "issue-18",
+      kind: "gap-fill",
+      teamKey: "AII",
+      maxInProgressAiIssues: 2,
+      prUrl: PR,
+      prDispatchBudget: 2,
+      humanRequested: true,
+    });
+    expect(decision).toEqual({ ok: false, reason: "team_capacity" });
+  });
+
+  it("in_flight still wins over pr_budget/parked when humanRequested=false", () => {
+    log.appendLog({ issueId: "issue-19", teamKey: "AII", phase: "gap-analysis", status: "dispatched" });
+    gapfillRow("other-a", PR);
+    gapfillRow("other-b", PR);
+    parkAt("issue-19", "gap-analysis");
+
+    const decision = gate.canDispatch({
+      issueId: "issue-19",
+      kind: "gap-fill",
+      teamKey: "AII",
+      maxInProgressAiIssues: 5,
+      prUrl: PR,
+      prDispatchBudget: 2,
+    });
+    expect(decision).toEqual({ ok: false, reason: "in_flight" });
+  });
+
+  it("planning/implementation kinds ignore prUrl/prDispatchBudget/humanRequested", () => {
+    gapfillRow("other-a", PR);
+    gapfillRow("other-b", PR);
+
+    expect(
+      gate.canDispatch({
+        issueId: "issue-20",
+        kind: "implementation",
+        teamKey: "AII",
+        maxInProgressAiIssues: 5,
+        prUrl: PR,
+        prDispatchBudget: 1,
+        humanRequested: false,
+      }),
+    ).toEqual({ ok: true });
+
+    expect(
+      gate.canDispatch({
+        issueId: "issue-21",
+        kind: "planning",
+        teamKey: "AII",
+        maxInProgressAiIssues: 5,
+        prUrl: PR,
+        prDispatchBudget: 1,
+        humanRequested: false,
+      }),
+    ).toEqual({ ok: true });
+  });
+});

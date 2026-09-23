@@ -309,6 +309,64 @@ describe("shouldCountFailure (BAC-27134)", () => {
   });
 });
 
+describe("parkIssue", () => {
+  it("returns true on the first call, sets parked_at and last_conclusion, and leaves consecutive_failures at 0 for a fresh row", () => {
+    const result = breaker.parkIssue("issue-1", "gap-analysis", "pr_budget");
+    expect(result).toBe(true);
+    expect(breaker.isParked("issue-1", "gap-analysis")).toBe(true);
+
+    const parked = breaker.listParked();
+    expect(parked).toHaveLength(1);
+    expect(parked[0]).toMatchObject({
+      issueId: "issue-1",
+      phase: "gap-analysis",
+      failures: 0,
+      lastConclusion: "pr_budget",
+    });
+  });
+
+  it("returns false on a second call and leaves the original parked_at unchanged", () => {
+    const nowSpy = vi.spyOn(Date, "now");
+    nowSpy.mockReturnValue(1_000_000);
+    breaker.parkIssue("issue-1", "gap-analysis", "pr_budget");
+    const first = breaker.listParked()[0].parkedAt;
+    expect(first).toBe(1_000_000);
+
+    nowSpy.mockReturnValue(2_000_000);
+    const second = breaker.parkIssue("issue-1", "gap-analysis", "pr_budget_again");
+    expect(second).toBe(false);
+
+    const parked = breaker.listParked();
+    expect(parked).toHaveLength(1);
+    expect(parked[0].parkedAt).toBe(first);
+    nowSpy.mockRestore();
+  });
+
+  it("interleaves safely with recordDispatchFailure: parking after two prior failures keeps consecutive_failures at 2", () => {
+    breaker.recordDispatchFailure("issue-1", "gap-analysis", "failure");
+    breaker.recordDispatchFailure("issue-1", "gap-analysis", "failure");
+
+    const result = breaker.parkIssue("issue-1", "gap-analysis", "pr_budget");
+    expect(result).toBe(true);
+
+    const parked = breaker.listParked();
+    expect(parked).toHaveLength(1);
+    expect(parked[0].failures).toBe(2);
+    expect(parked[0].lastConclusion).toBe("pr_budget");
+  });
+
+  it("a subsequent recordDispatchFailure call is unaffected by parkIssue's failure count", () => {
+    breaker.recordDispatchFailure("issue-1", "gap-analysis", "failure");
+    breaker.recordDispatchFailure("issue-1", "gap-analysis", "failure");
+    breaker.parkIssue("issue-1", "gap-analysis", "pr_budget");
+
+    const r = breaker.recordDispatchFailure("issue-1", "gap-analysis", "failure");
+    expect(r.failures).toBe(3);
+    // Already parked by parkIssue, so this call does not newly trip it.
+    expect(r.tripped).toBe(false);
+  });
+});
+
 describe("initDispatchBreakerTable idempotency", () => {
   it("can be called multiple times without error", () => {
     expect(() => breaker.initDispatchBreakerTable()).not.toThrow();

@@ -84,6 +84,32 @@ export function recordDispatchSuccess(issueId: string, phase: string): void {
     .run(issueId, phase);
 }
 
+/**
+ * Parks an issue for one phase outside the failure counter. Leaves
+ * `consecutive_failures` unchanged and keeps an existing `parked_at`
+ * (mirrors the COALESCE idiom in `recordDispatchFailure`).
+ * Returns true when this call parked it, false when it was already parked.
+ */
+export function parkIssue(issueId: string, phase: string, conclusion: string): boolean {
+  const db = getDb();
+  const row = db
+    .prepare("SELECT parked_at FROM dispatch_breaker WHERE issue_id = ? AND phase = ?")
+    .get(issueId, phase) as { parked_at: number | null } | undefined;
+
+  const alreadyParked = row != null && row.parked_at != null;
+  const now = Date.now();
+
+  db.prepare(`
+    INSERT INTO dispatch_breaker (issue_id, phase, consecutive_failures, last_conclusion, last_failure_at, parked_at)
+    VALUES (?, ?, 0, ?, NULL, ?)
+    ON CONFLICT (issue_id, phase) DO UPDATE SET
+      last_conclusion = excluded.last_conclusion,
+      parked_at        = COALESCE(dispatch_breaker.parked_at, excluded.parked_at)
+  `).run(issueId, phase, conclusion, now);
+
+  return !alreadyParked;
+}
+
 /** Returns true when the issue+phase has been parked by the breaker. */
 export function isParked(issueId: string, phase: string): boolean {
   const row = getDb()
