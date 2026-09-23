@@ -1,4 +1,6 @@
 import { spawnSync } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
 import type { ReviewerSelection } from "../../config.js";
 import { OperatorCancelledError, PrMergedError } from "../operator-cancelled.js";
 import type { LLMResult, PipelineContext, RunTelemetry, StepModule, StepReporter } from "../types.js";
@@ -17,6 +19,14 @@ import {
   type ReviewLedgerFinding,
   type ReviewLedgerSource,
 } from "../review-ledger.js";
+import {
+  buildDispositionInstructions,
+  DISPOSITIONS_FILE,
+  readFindingDispositions,
+  replyToDispositionThreads,
+  stableReviewFindingKey,
+  type FindingDisposition,
+} from "../finding-dispositions.js";
 import { READ_ONLY_ALLOWED_TOOLS } from "./read-only-tools.js";
 import { REVIEWER_VERDICT_SCHEMA, resolveTrustedReviewer, type ReviewerDefinition, type ReviewerFinding, type ReviewerVerdict } from "../reviewers/registry.js";
 import { isChecksPermissionError } from "../../checks-permission.js";
@@ -85,6 +95,9 @@ interface PostPushReviewOutputs extends Record<string, unknown> {
    *  prefix, so run-autonomous.ts can add it to the ticket-facing "Total cost" and agree with
    *  the report card (BAC-27201). */
   costUsd: number | null;
+  /** Every finding disposition read from the fix agent's dispositions file across every
+   *  fix-pass push in this run, deduplicated by findingKey with the last one read winning. */
+  findingDispositions: FindingDisposition[];
 }
 
 interface SpawnResult {
@@ -350,6 +363,24 @@ function reviewFindingsCommentBlock(findings: PostPushReviewLedgerFinding[], opt
     ? "Advisory external review findings (do not block merge):"
     : "Unresolved external review findings:";
   return `\n\n${heading}\n${formatReviewFindingsAsIssueList(findings)}`;
+}
+
+// Local to the fix-pass prompt: renders each external finding keyed by its stable
+// findingKey rather than a positional [external-N] index (formatReviewLedgerForPrompt's
+// form), so the fix agent can cite the exact finding it is dispositioning.
+function formatExternalFindingWithKey(finding: ReviewLedgerFinding): string {
+  const location = finding.path
+    ? (typeof finding.line === "number" ? `${finding.path}:${finding.line}` : finding.path)
+    : undefined;
+  const header = [`[${stableReviewFindingKey(finding)}]`, finding.source, finding.severity, location]
+    .filter(Boolean)
+    .join(" ");
+  return `${header}\n${finding.body}`;
+}
+
+function requiredReviewFindingsBlockWithKeys(findings: ReviewLedgerFinding[]): string {
+  if (findings.length === 0) return "";
+  return `\n\nRequired external review findings:\n${findings.map(formatExternalFindingWithKey).join("\n\n")}`;
 }
 
 function extractCommentIdWithMarker(stdout: string, marker: string): number | null {
@@ -1352,7 +1383,7 @@ ${feedback}
 **Merge readiness:** Manual review required; automated review did not complete.`,
     marker,
   );
-  return { approved: false, iterations: 0, finalFeedback: feedback, forcePushedRevisions: 0, terminationReason: "invalid_review", costUsd: null };
+  return { approved: false, iterations: 0, finalFeedback: feedback, forcePushedRevisions: 0, terminationReason: "invalid_review", costUsd: null, findingDispositions: [] };
 }
 
 function reviewerReportId(iteration: number, reviewerIndex: number, reviewer: SelectedReviewer): string {
@@ -1811,6 +1842,14 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
     // (PrMergedError or OperatorCancelledError) thrown afterward while posting the failure
     // comment is suppressed so the genuine failure conclusion surfaces rather than being masked.
     let priorLlmFailure = false;
+    // findingKeys the fix agent disposed as "follow-up": dropped from gatingExternalFindings
+    // on every later iteration so an external reviewer's out-of-scope ask stops gating merge
+    // readiness or reappearing in the next fix prompt. Per-run only (AII-751); a gap-fill run
+    // starts with an empty set.
+    const deferredKeys = new Set<string>();
+    // Every disposition read from the fix agent's dispositions file across every push this
+    // run, keyed by findingKey so a later push's entry for the same key overwrites an earlier one.
+    const findingDispositionsByKey = new Map<string, FindingDisposition>();
 
     try {
     assertPrWritable(ghSpawn, prNumber);
@@ -2037,7 +2076,13 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       const reviewLedger = buildReviewLedger(internalIssues, [...selectedInternalFindings, ...externalFindings], effectiveReviewerPolicy);
       const gatingReviewFindings = reviewLedger.filter((finding) => isReviewLedgerFindingGating(finding, effectiveReviewerPolicy));
       const advisoryReviewFindings = reviewLedger.filter((finding) => !isReviewLedgerFindingGating(finding, effectiveReviewerPolicy));
-      const gatingExternalFindings = gatingReviewFindings.filter((finding) => finding.source !== "ai-implement-internal");
+      // A finding the fix agent disposed as "follow-up" on an earlier iteration is dropped here,
+      // before the merge-readiness decision and before it can reappear in the next fix prompt.
+      // An "invalid" disposition is not filtered — it stays gating so the next review decides.
+      const gatingExternalFindings = gatingReviewFindings
+        .filter((finding) => finding.source !== "ai-implement-internal")
+        .filter((finding) => !deferredKeys.has(stableReviewFindingKey(finding)));
+      const hasGatingExternalFindings = gatingExternalFindings.length > 0;
       const advisoryExternalFindings = advisoryReviewFindings;
       let issues = internalIssuesFromReviewLedger(gatingReviewFindings);
       const externalReviewVerdictBlocks = externalFindingsResult.verdictSource === "review-contract"
@@ -2234,12 +2279,34 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         ? formatIssueListForPrompt(issues)
         : "None provided.";
 
+      // Internal reviewer issues are already scoped to this issue by their own prompts, so
+      // they keep the unconditional "fix every listed issue" rule below. External findings get
+      // that treatment too when none are gating. Once any are gating, add scoping text after
+      // the same sentence: the agent must give each external finding a disposition (ADR 028)
+      // instead of treating the external list as required work.
+      const internalFixInstruction = hasGatingExternalFindings
+        ? `Fix every listed issue, not only the easiest or first issue. Treat the list as
+a required repair plan. This applies to the internal reviewer issues under
+"Issues:" below, which are already scoped to this issue by their own prompts.
+External review findings are listed separately below — do not treat that list
+as required work; give each one a disposition instead, following the rules
+under "Finding dispositions".`
+        : `Fix every listed issue, not only the easiest or first issue. Treat the list as
+a required repair plan.`;
+
+      const externalFindingsFixBlock = hasGatingExternalFindings
+        ? requiredReviewFindingsBlockWithKeys(gatingExternalFindings)
+        : requiredReviewFindingsBlock(gatingExternalFindings);
+
+      const dispositionFixBlock = hasGatingExternalFindings
+        ? `\n\n${buildDispositionInstructions()}\n\nIssue requirements (the scope for every disposition):\n${context.data.issueDescription}`
+        : "";
+
       const fixPrompt = `You are fixing reviewer feedback on PR #${prNumber} for issue ${context.data.issueIdentifier}: ${context.data.issueTitle}.
 
 Do NOT create a new branch or PR. Make changes to the current working tree. After your changes, the harness will commit and push.
 
-Fix every listed issue, not only the easiest or first issue. Treat the list as
-a required repair plan. Before editing, inspect the relevant code paths so the
+${internalFixInstruction} Before editing, inspect the relevant code paths so the
 fix is consistent with local architecture and tests. After editing, review the
 full resulting diff yourself against the issue requirements and the complete
 review history; fix any directly related defect, regression, or missing test
@@ -2264,8 +2331,8 @@ ${issueList}
 
 Summary:
 ${feedback}
-${requiredReviewFindingsBlock(gatingExternalFindings)}
-</reviewer_feedback>`;
+${externalFindingsFixBlock}
+</reviewer_feedback>${dispositionFixBlock}`;
 
       const fixResult = await context.llmExecutor.invoke({
         prompt: fixPrompt,
@@ -2401,6 +2468,22 @@ ${requiredReviewFindingsBlock(gatingExternalFindings)}
         }
       }
 
+      // Only asked the fix agent for dispositions when it saw gating external findings — no
+      // file is expected otherwise. Read, then delete, so a later iteration's read never picks
+      // up this pass's (or a stale) file. Runs only once the push above has succeeded (AII-751):
+      // a failed push throws above and reaches none of this.
+      if (hasGatingExternalFindings) {
+        const { valid: dispositions } = readFindingDispositions(inputs.workspaceDir);
+        fs.rmSync(path.join(inputs.workspaceDir, DISPOSITIONS_FILE), { force: true });
+        for (const disposition of dispositions) {
+          findingDispositionsByKey.set(disposition.findingKey, disposition);
+        }
+        replyToDispositionThreads(ghSpawn, prNumber, dispositions);
+        for (const disposition of dispositions) {
+          if (disposition.disposition === "follow-up") deferredKeys.add(disposition.findingKey);
+        }
+      }
+
       forcePushed++;
       const marker = `<!-- ai-implement post-push iter=${iteration} fix-complete -->`;
       postPrComment(
@@ -2419,7 +2502,7 @@ ${requiredReviewFindingsBlock(gatingExternalFindings)}
             `[post-push-review] PR #${prNumber} was closed by operator while posting failure comment — ` +
               `genuine failure surfaces as ${terminationReason}`,
           );
-          return { approved, iterations: iteration, finalFeedback: feedback, forcePushedRevisions: forcePushed, terminationReason, costUsd, ...(reviewerFailure ? { failure: reviewerFailure } : {}) };
+          return { approved, iterations: iteration, finalFeedback: feedback, forcePushedRevisions: forcePushed, terminationReason, costUsd, findingDispositions: [...findingDispositionsByKey.values()], ...(reviewerFailure ? { failure: reviewerFailure } : {}) };
         }
         // No prior genuine failure — the operator cancel is the sole anomaly.
         terminationReason = "operator_cancelled";
@@ -2434,11 +2517,11 @@ ${requiredReviewFindingsBlock(gatingExternalFindings)}
             `[post-push-review] PR #${prNumber} was merged while posting failure comment — ` +
               `genuine failure surfaces as ${terminationReason}`,
           );
-          return { approved, iterations: iteration, finalFeedback: feedback, forcePushedRevisions: forcePushed, terminationReason, costUsd, ...(reviewerFailure ? { failure: reviewerFailure } : {}) };
+          return { approved, iterations: iteration, finalFeedback: feedback, forcePushedRevisions: forcePushed, terminationReason, costUsd, findingDispositions: [...findingDispositionsByKey.values()], ...(reviewerFailure ? { failure: reviewerFailure } : {}) };
         }
         terminationReason = "pr_merged";
         console.warn(`[post-push-review] PR #${prNumber} was merged under the run — exiting as pr_merged`);
-        return { approved: true, iterations: iteration, finalFeedback: "", forcePushedRevisions: forcePushed, terminationReason: "pr_merged", costUsd };
+        return { approved: true, iterations: iteration, finalFeedback: "", forcePushedRevisions: forcePushed, terminationReason: "pr_merged", costUsd, findingDispositions: [...findingDispositionsByKey.values()] };
       }
       throw err;
     }
@@ -2450,6 +2533,7 @@ ${requiredReviewFindingsBlock(gatingExternalFindings)}
       forcePushedRevisions: forcePushed,
       terminationReason,
       costUsd,
+      findingDispositions: [...findingDispositionsByKey.values()],
       ...(reviewerFailure ? { failure: reviewerFailure } : {}),
     };
   },
