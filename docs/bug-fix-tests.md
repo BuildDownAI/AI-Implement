@@ -6,12 +6,29 @@ The pattern for fixing a bug in this repo. The test that proves the bug is writt
 
 1. **Find the seam.** Name the function that holds the wrong behaviour and the fake that already drives it. Most orchestrator modules take an injected `fetch` or client (`fetchImpl`, `getInstallationTokenImpl`); reuse the fake in the module's existing test file before writing a new one.
 2. **Write the failing test.** Assert the correct behaviour, not the bug. Run it on the unfixed code and keep the output.
-3. **Record the red output.** Commit the test first, or paste the failing `npx vitest run <file>` output into the PR body under "Before the fix".
+3. **Record the red output.** Commit the test first, or paste the failing `npx vitest run <file>` output into the PR body under "Before the fix". A pipeline run cannot do either; see "Red evidence on a pipeline run" below.
 4. **Fix the code** with the smallest change that turns the test green. No drive-by refactors.
 5. **Run the whole suite.** `npm test` and `npm run typecheck`. Existing tests must pass unchanged unless the bug was in what they asserted — say so in the PR.
 6. **Add a recipe when the bug is visible from outside.** If an operator can see the bug on a deployed orchestrator, add an `integration-tests/recipes/` file (AII-472 format) so the check can run again later.
 
 Tests and fix ship in **one** pull request. A pull request that contains only failing tests fails CI and never gets the runner's approval mark.
+
+## Red evidence on a pipeline run
+
+Step 3 assumes a person opens the PR. An AI-Implement pipeline run cannot record the red output itself: `WORKFLOW.md` tells the agent to leave its changes uncommitted, the pipeline makes one commit of everything, and `buildPullRequestBody` (`src/pipeline/steps/push.ts`) writes the PR body from a fixed template. A "Before the fix" line in an issue's acceptance criteria therefore cannot be met by the run.
+
+The build-down records it instead, against the PR head, without touching the PR branch:
+
+```bash
+git fetch origin <pr-head-branch> <base-branch>
+git worktree add --detach /tmp/red origin/<pr-head-branch>
+cd /tmp/red && ln -s <repo>/node_modules node_modules
+npx vitest run <new-test-file>                                     # green at the PR head
+git checkout origin/<base-branch> -- <fixed-source-files>
+npx vitest run <new-test-file>                                     # red on the unfixed source
+```
+
+Post the red lines as a PR comment or in the issue's `# ai-implement-build-down-learnings` comment. On AII-739 this showed 11 new tests red on the unfixed `src/workflow-sync.ts` and all 34 green at the PR head. A test file that opens the shared database, such as `src/__tests__/admin.test.ts`, can fail wholesale in a scratch worktree for setup reasons; trust CI for those and record only the files that run cleanly.
 
 ## Which tier
 
