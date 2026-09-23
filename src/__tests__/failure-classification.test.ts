@@ -472,6 +472,26 @@ describe("classifyGitFailure", () => {
     expect(record.code).toBe("GIT_AUTH");
   });
 
+  it("classifies a DNS resolution failure as transient/GIT_REMOTE_TRANSIENT, not conflict", () => {
+    const record = classifyGitFailure(
+      "fatal: unable to access 'https://github.com/acme/app.git/': Could not resolve host: github.com",
+      128,
+      GIT_CTX,
+    );
+    expect(record.category).toBe("transient");
+    expect(record.code).toBe("GIT_REMOTE_TRANSIENT");
+  });
+
+  it("classifies a connect-timeout failure as transient/GIT_REMOTE_TRANSIENT", () => {
+    const record = classifyGitFailure(
+      "fatal: unable to access 'https://github.com/acme/app.git/': Failed to connect to github.com port 443: Connection timed out",
+      128,
+      GIT_CTX,
+    );
+    expect(record.category).toBe("transient");
+    expect(record.code).toBe("GIT_REMOTE_TRANSIENT");
+  });
+
   it("returns unknown/UNKNOWN for unmatched git stderr", () => {
     const record = classifyGitFailure("something completely unrelated happened", 1, GIT_CTX);
     expect(record.category).toBe("unknown");
@@ -750,6 +770,39 @@ describe("classifyThrown", () => {
     const record = classifyThrown(err, CT_CTX);
     expect(record.category).toBe("transient");
     expect(record.code).toBe("GIT_REMOTE_TRANSIENT");
+  });
+
+  it("classifies a git push --force-with-lease wrapper carrying a DNS failure as transient/GIT_REMOTE_TRANSIENT, not conflict", () => {
+    // Same "rejected"/"force-with-lease" wrapper as the 403/503 cases above, but this
+    // time the underlying cause is a plain network failure with no auth or 5xx marker —
+    // this must not fall through to the generic GIT_LEASE_REJECTED row below it.
+    const err = new Error(
+      "git push --force-with-lease rejected: fatal: unable to access 'https://github.com/acme/app.git/': " +
+        "Could not resolve host: github.com",
+    );
+    const record = classifyThrown(err, CT_CTX);
+    expect(record.category).toBe("transient");
+    expect(record.code).toBe("GIT_REMOTE_TRANSIENT");
+  });
+
+  it("classifies a git push --force-with-lease wrapper carrying a connect timeout as transient/GIT_REMOTE_TRANSIENT, not conflict", () => {
+    const err = new Error(
+      "git push --force-with-lease rejected: fatal: unable to access 'https://github.com/acme/app.git/': " +
+        "Failed to connect to github.com port 443: Connection timed out",
+    );
+    const record = classifyThrown(err, CT_CTX);
+    expect(record.category).toBe("transient");
+    expect(record.code).toBe("GIT_REMOTE_TRANSIENT");
+  });
+
+  it("still classifies a genuine stale-info lease rejection as conflict/GIT_LEASE_REJECTED when no network phrase is present", () => {
+    const err = new Error(
+      "git push --force-with-lease rejected (stale info): expected A, found B. " +
+        "! [rejected] HEAD -> ai-implement/eng-1 (stale info)",
+    );
+    const record = classifyThrown(err, CT_CTX);
+    expect(record.category).toBe("conflict");
+    expect(record.code).toBe("GIT_LEASE_REJECTED");
   });
 });
 

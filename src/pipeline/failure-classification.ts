@@ -211,6 +211,18 @@ export const GIT_SIGNATURES: SignatureRow[] = [
     code: "GIT_REMOTE_TRANSIENT",
     test: /(RPC failed; HTTP|HTTP\/[\d.]+|The requested URL returned error:?|HTTP code\s*=)\s*(500|502|503|504)\b/i,
   },
+  // Checked after the 5xx row and ahead of GIT_LEASE_REJECTED, for the same reason:
+  // post-push-review's `git push --force-with-lease rejected: ...` wrapper fixes the
+  // words "rejected" and "force-with-lease" onto every push failure regardless of
+  // cause, so a DNS/connect/timeout network failure reported through that wrapper
+  // must still classify transient rather than being shadowed by the lease-conflict
+  // row below. These phrases name a failed network connection, so they never trail
+  // an auth or lease failure the way the generic trailing transient row's phrases can.
+  {
+    category: "transient",
+    code: "GIT_REMOTE_TRANSIENT",
+    test: /(Could not resolve host|Connection timed out|Operation timed out|Failed to connect to|Network is unreachable)/i,
+  },
   {
     category: "conflict",
     code: "GIT_LEASE_REJECTED",
