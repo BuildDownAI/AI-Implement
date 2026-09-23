@@ -2970,6 +2970,88 @@ describe("postPushReviewStep", () => {
     expect(failure.code).toBe("GIT_LEASE_REJECTED");
   });
 
+  it("throws the original push failure, not a lease-conflict message, when the diagnostic ls-remote also fails", async () => {
+    const notApproved = { approved: false, blocking_issues: [{ title: "x", problem: "x", required_fix: "x" }], feedback: "fix", score: 4, progress_delta: 0 };
+    const pushCalls: string[][] = [];
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "status") return { stdout: "M file.ts\n", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "--short") return { stdout: "abc1234\n", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "ai-implement/aii-744-x\n", exitCode: 0 };
+      if (args[0] === "ls-remote") {
+        return { stdout: "", stderr: "fatal: unable to access: Could not resolve host", exitCode: 128 };
+      }
+      if (args[0] === "push") {
+        pushCalls.push(args);
+        return { stdout: "", stderr: "remote: 403 Forbidden", exitCode: 1 };
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const ghSpawn = vi.fn(() => ({ stdout: "diff", exitCode: 0 }));
+    const ctx = makeCtx(vi.fn(async () => (structuredReviewResult(notApproved))));
+
+    let caught: (Error & { failure?: unknown }) | undefined;
+    try {
+      await postPushReviewStep.run(
+        ctx,
+        { prNumber: "42", workspaceDir: "/tmp", maxIterations: 3, ghSpawn, gitSpawn, pushedSha: "aaaaaaa" },
+        { report: vi.fn(async () => undefined) },
+      );
+    } catch (err) {
+      caught = err as typeof caught;
+    }
+
+    expect(caught).toBeDefined();
+    expect(pushCalls).toHaveLength(1);
+    expect(caught!.message).toBe("git push --force-with-lease rejected: remote: 403 Forbidden");
+    expect(caught!.message).not.toContain("stale info");
+    const failure = classifyThrown(caught, { stage: "post-push-review", attempt: 1 });
+    expect(failure.code).not.toBe("GIT_LEASE_REJECTED");
+    warnSpy.mockRestore();
+  });
+
+  it("does not classify an auth-style rejection as a lease conflict when the remote SHA still matches the lease", async () => {
+    const notApproved = { approved: false, blocking_issues: [{ title: "x", problem: "x", required_fix: "x" }], feedback: "fix", score: 4, progress_delta: 0 };
+    const pushCalls: string[][] = [];
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "status") return { stdout: "M file.ts\n", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "--short") return { stdout: "abc1234\n", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "ai-implement/aii-744-x\n", exitCode: 0 };
+      if (args[0] === "ls-remote") {
+        // The remote never moved: this was an auth failure, not a lease conflict.
+        return { stdout: "aaaaaaa\trefs/heads/ai-implement/aii-744-x\n", exitCode: 0 };
+      }
+      if (args[0] === "push") {
+        pushCalls.push(args);
+        return { stdout: "", stderr: "remote: Permission to org/repo.git denied to ai-implement[bot]", exitCode: 1 };
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const ghSpawn = vi.fn(() => ({ stdout: "diff", exitCode: 0 }));
+    const ctx = makeCtx(vi.fn(async () => (structuredReviewResult(notApproved))));
+
+    let caught: (Error & { failure?: unknown }) | undefined;
+    try {
+      await postPushReviewStep.run(
+        ctx,
+        { prNumber: "42", workspaceDir: "/tmp", maxIterations: 3, ghSpawn, gitSpawn, pushedSha: "aaaaaaa" },
+        { report: vi.fn(async () => undefined) },
+      );
+    } catch (err) {
+      caught = err as typeof caught;
+    }
+
+    expect(caught).toBeDefined();
+    expect(pushCalls).toHaveLength(1);
+    expect(caught!.message).toBe(
+      "git push --force-with-lease rejected: remote: Permission to org/repo.git denied to ai-implement[bot]",
+    );
+    expect(caught!.message).not.toContain("stale info");
+    const failure = classifyThrown(caught, { stage: "post-push-review", attempt: 1 });
+    expect(failure.code).not.toBe("GIT_LEASE_REJECTED");
+    expect(failure.code).toBe("GIT_AUTH");
+  });
+
   it("advances the fix-pass lease to the run's own last-pushed commit across iterations", async () => {
     const notApproved = { approved: false, blocking_issues: [{ title: "x", problem: "x", required_fix: "x" }], feedback: "fix", score: 4, progress_delta: 0 };
     const pushCalls: string[][] = [];
@@ -3023,7 +3105,7 @@ describe("postPushReviewStep", () => {
     });
     const ghSpawn = vi.fn(() => ({ stdout: "diff", exitCode: 0 }));
     const ctx = makeCtx(vi.fn(async () => (structuredReviewResult(notApproved))));
-    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
 
     await postPushReviewStep.run(
       ctx,
@@ -3035,11 +3117,11 @@ describe("postPushReviewStep", () => {
     expect(lsRemoteCalls).toHaveLength(2);
     expect(pushCalls[0]).toContain("--force-with-lease=refs/heads/ai-implement/aii-744-x:beadfeed");
     expect(pushCalls[1]).toContain("--force-with-lease=refs/heads/ai-implement/aii-744-x:beadfeed");
-    const fallbackLogs = errorSpy.mock.calls.filter((call) =>
+    const fallbackLogs = warnSpy.mock.calls.filter((call) =>
       call.some((arg) => typeof arg === "string" && arg.includes("No pushedSha input; lease falls back to ls-remote")),
     );
     expect(fallbackLogs).toHaveLength(1);
-    errorSpy.mockRestore();
+    warnSpy.mockRestore();
   });
 
   it("stops without pushing when the fix pass makes no changes", async () => {

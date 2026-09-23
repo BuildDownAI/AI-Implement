@@ -2362,7 +2362,7 @@ ${requiredReviewFindingsBlock(gatingExternalFindings)}
         expectedRemoteSha = leaseSha ?? null;
       } else {
         if (!loggedLeaseFallback) {
-          console.error("[post-push-review] No pushedSha input; lease falls back to ls-remote");
+          console.warn("[post-push-review] No pushedSha input; lease falls back to ls-remote");
           loggedLeaseFallback = true;
         }
         expectedRemoteSha = remoteBranchSha(gitSpawn, branchName);
@@ -2374,13 +2374,24 @@ ${requiredReviewFindingsBlock(gatingExternalFindings)}
         `--force-with-lease=${remoteRef}:${expectedRemoteSha ?? ""}`,
       ]);
       if (push.exitCode !== 0) {
+        const originalFailure = new Error(`git push --force-with-lease rejected: ${resultMessage(push)}`);
         if (hasPushedShaLease) {
-          const actualRemoteSha = remoteBranchSha(gitSpawn, branchName);
-          throw new Error(
-            `git push --force-with-lease rejected (stale info): expected remote ${expectedRemoteSha ?? "<none>"}, found ${actualRemoteSha ?? "<none>"}. ${resultMessage(push)}`,
-          );
+          let actualRemoteSha: string | null;
+          try {
+            actualRemoteSha = remoteBranchSha(gitSpawn, branchName);
+          } catch (lsRemoteErr) {
+            console.warn(
+              `[post-push-review] Diagnostic ls-remote after rejected push failed; reporting the original push failure: ${lsRemoteErr instanceof Error ? lsRemoteErr.message : String(lsRemoteErr)}`,
+            );
+            throw originalFailure;
+          }
+          if (actualRemoteSha !== expectedRemoteSha) {
+            throw new Error(
+              `git push --force-with-lease rejected (stale info): expected remote ${expectedRemoteSha ?? "<none>"}, found ${actualRemoteSha ?? "<none>"}. ${resultMessage(push)}`,
+            );
+          }
         }
-        throw new Error(`git push --force-with-lease rejected: ${resultMessage(push)}`);
+        throw originalFailure;
       }
 
       if (hasPushedShaLease) {
