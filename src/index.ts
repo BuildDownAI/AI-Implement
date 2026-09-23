@@ -7,7 +7,8 @@ import {
   initMappingsTable,
 } from "./config.js";
 import type { RepoMapping } from "./config.js";
-import { isAlreadyDispatched, markDispatched, closeDb, getDispatchedIds, deleteDispatched } from "./dedup.js";
+import { markDispatched, closeDb, getDispatchedIds, deleteDispatched } from "./dedup.js";
+import { canDispatch, type DispatchKind } from "./dispatch-gate.js";
 import { reconcileFilesystemFailures } from "./filesystem-ticket-lifecycle.js";
 import { dispatchWorkflow, postWorkflowDispatch, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, getPullRequestState, buildEnvelopeDispatchInputs, postPrComment, defaultFetchSignal, getRepoDefaultBranch, buildKgRefreshGhaDispatchBody, pollForKgWorkflowRunId } from "./github.js";
 import { resolveWorkflowCapabilities, resolveWorkflowContract } from "./workflow-probe.js";
@@ -29,7 +30,7 @@ import { remediateStuckJob, remediateFailedJob } from "./stuck-watchdog.js";
 import type { StuckWatchdogConfig } from "./stuck-watchdog.js";
 import { handleAdminRequest } from "./admin.js";
 import { initLogTable, appendLog, countPriorDispatches, completeOrphanedPlanningJobs, attachJobRunIdIfMissing, updateJobRunId, updateJobStatus, updateJobPrUrl, updateJobMachineDetails, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobById, getJobByMachineId, resetStuckAttempts, getRecentFailedRunUrls } from "./log.js";
-import { isParked, recordDispatchFailure, recordDispatchSuccess, shouldCountFailure, initDispatchBreakerTable } from "./dispatch-breaker.js";
+import { recordDispatchFailure, recordDispatchSuccess, shouldCountFailure, initDispatchBreakerTable } from "./dispatch-breaker.js";
 import type { Job, JobStatus } from "./log.js";
 import { getInstallationToken, getAppSlug } from "./github-app-auth.js";
 import { configureLinearAuth } from "./linear-app-auth.js";
@@ -512,9 +513,12 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
     const needsPlanningIds = new Set(needsPlanning.map((i) => i.id));
 
     const inFlightIssueIds = getInFlightIssueIds();
+    const candidateScopeKeyById = new Map(allCandidates.map((issue) => [issue.id, issue.scopeKey]));
     const isDispatchBlocked = (issueId: string) => {
-      const phase = needsPlanningIds.has(issueId) ? "planning" : "implementation";
-      return isAlreadyDispatched(issueId) || inFlightIssueIds.has(issueId) || isParked(issueId, phase);
+      const kind: DispatchKind = needsPlanningIds.has(issueId) ? "planning" : "implementation";
+      const teamKey = candidateScopeKeyById.get(issueId) ?? "";
+      const maxInProgressAiIssues = teamRepoMap[teamKey]?.maxInProgressAiIssues ?? 0;
+      return !canDispatch({ issueId, kind, teamKey, maxInProgressAiIssues }).ok;
     };
 
     // A deploy is holding new work back. Skipping selection cannot lose work:
@@ -3006,7 +3010,7 @@ async function processReconciliations(config: AppConfig, registry: ProviderRegis
 
 // ---------- Late Review Fix Queue ----------
 
-async function processReviewFixQueue(config: AppConfig): Promise<void> {
+export async function processReviewFixQueue(config: AppConfig): Promise<void> {
   const pending = getPendingReviewFixes();
   if (pending.length === 0) return;
 
@@ -3039,6 +3043,17 @@ async function processReviewFixQueue(config: AppConfig): Promise<void> {
       if (mapping.paused) {
         console.log(`[review-fix] Project ${mapping.owner}/${mapping.repo} is paused, skipping review fix #${fix.id}`);
         updateReviewFixStatus(fix.id, "skipped");
+        continue;
+      }
+
+      const gateDecision = canDispatch({
+        issueId: fix.issueId,
+        kind: "gap-fill",
+        teamKey: scopeKey,
+        maxInProgressAiIssues: mapping.maxInProgressAiIssues,
+      });
+      if (!gateDecision.ok) {
+        console.log(`[review-fix] Deferring review fix #${fix.id} for PR #${fix.prNumber}: ${gateDecision.reason}`);
         continue;
       }
 
@@ -3228,7 +3243,7 @@ async function processReviewFixQueue(config: AppConfig): Promise<void> {
         continue;
       }
 
-      const prior = countPriorDispatches(fix.issueId, "implementation");
+      const prior = countPriorDispatches(fix.issueId, "gap-analysis");
       const jobId = appendLog({
         issueId: fix.issueId,
         issueIdentifier: fix.issueIdentifier ?? undefined,
@@ -3240,6 +3255,7 @@ async function processReviewFixQueue(config: AppConfig): Promise<void> {
         executionMode: "github-actions",
         runnerMode: "default",
         contract: reviewFixContract,
+        phase: "gap-analysis",
       });
       updateJobPrUrl(jobId, `https://github.com/${fix.repo}/pull/${fix.prNumber}`);
       if (dispatchId) {

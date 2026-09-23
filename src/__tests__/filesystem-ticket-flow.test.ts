@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import type * as DedupModule from "../dedup.js";
 import type * as LogModule from "../log.js";
+import type * as BreakerModule from "../dispatch-breaker.js";
 import type * as QueueModule from "../comment-gapfill-queue.js";
 import type * as RunnerTokensModule from "../runner-tokens.js";
 import type * as RunnerCallbackModule from "../runner-callback.js";
@@ -29,6 +30,7 @@ let dbPath: string;
 let ticketDir: string;
 let dedup: typeof DedupModule;
 let log: typeof LogModule;
+let breaker: typeof BreakerModule;
 let queue: typeof QueueModule;
 let runnerTokens: typeof RunnerTokensModule;
 let runnerCallback: typeof RunnerCallbackModule;
@@ -42,12 +44,14 @@ beforeEach(async () => {
   vi.stubEnv("RUNNER_MODE", "local");
   dedup = await import("../dedup.js");
   log = await import("../log.js");
+  breaker = await import("../dispatch-breaker.js");
   queue = await import("../comment-gapfill-queue.js");
   runnerTokens = await import("../runner-tokens.js");
   runnerCallback = await import("../runner-callback.js");
   drain = await import("../comment-gapfill-drain.js");
   dedup.getDb();
   log.initLogTable();
+  breaker.initDispatchBreakerTable();
   localDockerMock.startLocalRunnerContainer.mockResolvedValue({
     containerId: "local-container-1",
     containerName: "ai-implement-fs-1",
@@ -264,6 +268,10 @@ describe("filesystem tickets through the local PR loop", () => {
       teamKey: "FS",
       repo: "BuildDownAI/AI-Implement",
       phase: "implementation",
+      // Completed, not in-flight: this row only establishes tracker identity for the
+      // PR (via getLatestDispatchForPr); the dispatch gate would otherwise defer the
+      // comment gap-fill below as if this original run were still running.
+      status: "completed",
     });
     log.updateJobPrUrl(seedJob, "https://github.com/BuildDownAI/AI-Implement/pull/9001");
 
