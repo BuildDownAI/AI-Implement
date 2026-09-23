@@ -474,6 +474,28 @@ describe("monitorJobs TTL check (AII-743)", () => {
     expect(incrementStuckAttempts).not.toHaveBeenCalled();
   });
 
+  it("does not TTL a Fly job under its own 75-minute limit even when the mapping's GHA-only maxJobMinutes would have expired it", async () => {
+    // maxJobMinutes is a GHA-only setting; a Fly job must use FLY_MACHINE_TIMEOUT_MS (60m) + 15m
+    // grace = 75m, not the mapping's low GHA value (20m + 15m = 35m, which this 40m-old job
+    // would fail under the old, wrong logic).
+    vi.mocked(getMappings).mockReturnValue({ AII: makeMapping({ maxJobMinutes: 20 }) });
+    const job = makeJob({
+      teamKey: "AII",
+      repo: "org/repo",
+      executionMode: "fly-machines",
+      machineId: "machine-456",
+      runId: null,
+      dispatchedAt: Date.now() - 40 * 60 * 1000,
+    });
+    vi.mocked(getInFlightJobs).mockReturnValue([job]);
+
+    await monitorJobs(mockAppConfig, makeRegistry(makeProvider()));
+
+    expect(updateJobStatus).not.toHaveBeenCalled();
+    expect(incrementStuckAttempts).not.toHaveBeenCalled();
+    expect(destroyMachine).not.toHaveBeenCalled();
+  });
+
   it("never TTLs a kg-refresh job, however old", async () => {
     const job = makeJob({
       teamKey: "AII",

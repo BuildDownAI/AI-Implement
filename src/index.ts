@@ -2043,10 +2043,15 @@ export async function monitorJobs(config: AppConfig, registry: ProviderRegistry)
       // kg-refresh has its own lifecycle (monitorKgRefreshGhaJob) — never TTL it here.
       if (job.phase !== "kg-refresh") {
         const mapping = mappingForJob(teamRepoMap, job);
+        // maxJobMinutes is a GHA-only setting (docs/pipeline: Job Timeout (min)); Fly and
+        // local-docker jobs have their own timeout (FLY_MACHINE_TIMEOUT_MS) and must not
+        // inherit a GHA value that could be shorter than their actual machine timeout.
+        const isFlyOrLocal =
+          job.executionMode === "fly-machines" || job.executionMode === "local-docker";
         const ttl = jobTtlDecision({
           dispatchedAtMs: job.dispatchedAt,
           nowMs: Date.now(),
-          maxJobMinutes: mapping?.maxJobMinutes,
+          maxJobMinutes: isFlyOrLocal ? FLY_MACHINE_TIMEOUT_MS / 60_000 : mapping?.maxJobMinutes,
         });
         // A runner callback can set conclusion to operator_cancelled/runner_approved
         // concurrently with this tick reading the (now-stale) in-flight snapshot.

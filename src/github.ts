@@ -722,7 +722,7 @@ export async function findWorkflowRunId(
     if (!issueIdentifier) return run.id;
 
     const title = run.display_title ?? "";
-    if (title.includes(issueIdentifier)) return run.id;
+    if (title === `${RUN_TITLE_PREFIX}${issueIdentifier}`) return run.id;
     if (title.startsWith(RUN_TITLE_PREFIX)) continue; // titled for another issue
     if (fallback === null) fallback = run.id;
   }

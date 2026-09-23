@@ -140,6 +140,50 @@ describe("findWorkflowRunId", () => {
       );
       expect(runId).toBeNull();
     });
+
+    it("does not let a substring match link a shorter issue key to a longer one's run", async () => {
+      const now = new Date();
+      vi.mocked(fetch).mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          workflow_runs: [
+            // Newer run, titled for a different (longer) issue key that contains "AII-74" as a substring.
+            { id: 993, created_at: now.toISOString(), display_title: "Claude AI Implementation — AII-743" },
+            // Older run, titled for the exact issue being looked up.
+            { id: 992, created_at: new Date(now.getTime() - 60_000).toISOString(), display_title: "Claude AI Implementation — AII-74" },
+          ],
+        }),
+      } as Response);
+
+      const runId = await findWorkflowRunId(
+        "token", "org", "repo", "workflow.yml", "main",
+        new Date(now.getTime() - 120_000),
+        undefined,
+        "AII-74",
+      );
+      expect(runId).toBe(992);
+    });
+
+    it("never returns another issue's run when only that run is present, even as a substring match", async () => {
+      const now = new Date();
+      vi.mocked(fetch).mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          workflow_runs: [
+            { id: 991, created_at: now.toISOString(), display_title: "Claude AI Implementation — AII-743" },
+          ],
+        }),
+      } as Response);
+
+      const runId = await findWorkflowRunId(
+        "token", "org", "repo", "workflow.yml", "main",
+        new Date(now.getTime() - 60_000),
+        undefined,
+        "AII-74",
+      );
+      expect(runId).not.toBe(991);
+      expect(runId).toBeNull();
+    });
   });
 });
 
