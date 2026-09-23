@@ -2396,6 +2396,7 @@ export interface UpsertMappingBody {
   sensitiveAllowPatterns?: string | string[] | null;
   dependencyTokenScope?: string | null;
   reviewers?: unknown;
+  prDispatchBudget?: number | null;
 }
 
 export function upsertMappingAction(
@@ -2510,10 +2511,12 @@ export function upsertMappingAction(
   let maxTurns: number | null;
   let maxIterations: number | null;
   let maxJobMinutes: number | null;
+  let prDispatchBudget: number | null;
   try {
     maxTurns = resolveCap("maxTurns", body.maxTurns);
     maxIterations = resolveCap("maxIterations", body.maxIterations);
     maxJobMinutes = resolveCap("maxJobMinutes", body.maxJobMinutes);
+    prDispatchBudget = resolveCap("prDispatchBudget", body.prDispatchBudget);
   } catch (err) {
     return { status: 400, body: { error: err instanceof Error ? err.message : String(err) } };
   }
@@ -2616,6 +2619,7 @@ export function upsertMappingAction(
     dependencyTokenScope,
     memoryProviderId: existingMapping?.memoryProviderId ?? null,
     reviewers,
+    prDispatchBudget,
   };
 
   upsertMapping(body.teamKey, mapping);

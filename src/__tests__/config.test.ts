@@ -512,6 +512,55 @@ describe("config", () => {
     expect(all.NULLS.maxJobMinutes).toBeNull();
   });
 
+  it("round-trips prDispatchBudget (including null)", () => {
+    config.initMappingsTable();
+    config.upsertMapping("BUDGET", mapping({ owner: "org", repo: "repo", prDispatchBudget: 6 }));
+    config.upsertMapping("NOBUDGET", mapping({ owner: "org", repo: "repo", prDispatchBudget: null }));
+
+    const all = config.getMappings();
+    expect(all.BUDGET.prDispatchBudget).toBe(6);
+    expect(all.NOBUDGET.prDispatchBudget).toBeNull();
+  });
+
+  it("migrates a pre-existing mappings table to include the pr_dispatch_budget column, reading back null", () => {
+    const db = new Database(dbPath);
+    db.exec(`
+      CREATE TABLE mappings (
+        team_key TEXT PRIMARY KEY,
+        owner TEXT NOT NULL,
+        repo TEXT NOT NULL,
+        workflow_file TEXT NOT NULL,
+        default_branch TEXT NOT NULL,
+        max_in_progress_ai_issues INTEGER NOT NULL DEFAULT 3,
+        execution_mode TEXT NOT NULL DEFAULT 'github-actions',
+        session_mode TEXT NOT NULL DEFAULT 'autonomous',
+        machine_cpus INTEGER NOT NULL DEFAULT 2,
+        machine_memory_mb INTEGER NOT NULL DEFAULT 4096,
+        planning_enabled INTEGER NOT NULL DEFAULT 0,
+        planning_workflow_file TEXT NOT NULL DEFAULT 'claude-plan.yml',
+        auto_approve_plans INTEGER NOT NULL DEFAULT 1,
+        extra_env TEXT,
+        provider TEXT NOT NULL DEFAULT 'anthropic',
+        ticketing_provider TEXT NOT NULL DEFAULT 'linear',
+        ticketing_config TEXT NOT NULL DEFAULT '{"kind":"linear"}',
+        aws_region TEXT
+      )
+    `);
+    db.prepare("INSERT INTO mappings (team_key, owner, repo, workflow_file, default_branch) VALUES (?, ?, ?, ?, ?)")
+      .run("LEG", "org", "legacy", "claude-implement.yml", "main");
+    db.close();
+
+    config.initMappingsTable();
+    expect(config.getMappings().LEG.prDispatchBudget).toBeNull();
+  });
+
+  it("resolvePrDispatchBudget defaults to 4 for null/undefined and returns the stored value otherwise", () => {
+    expect(config.resolvePrDispatchBudget({})).toBe(4);
+    expect(config.resolvePrDispatchBudget({ prDispatchBudget: null })).toBe(4);
+    expect(config.resolvePrDispatchBudget({ prDispatchBudget: 6 })).toBe(6);
+    expect(config.DEFAULT_PR_DISPATCH_BUDGET).toBe(4);
+  });
+
   it("round-trips branchPrefix (including null)", () => {
     config.initMappingsTable();
     config.upsertMapping("PFX", mapping({ owner: "org", repo: "repo", branchPrefix: "pr" }));

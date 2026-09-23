@@ -838,6 +838,7 @@ describe("migrated write handlers (AII-713)", () => {
         reviewers: null,
         maxTurns: null,
         maxIterations: null,
+        prDispatchBudget: null,
         maxJobMinutes: null,
         branchPrefix: null,
         skillsRepo: null,
