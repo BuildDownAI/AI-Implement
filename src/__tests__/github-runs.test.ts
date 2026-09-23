@@ -57,6 +57,90 @@ describe("findWorkflowRunId", () => {
     const runId = await findWorkflowRunId("token", "org", "repo", "w.yml", "main", new Date(0));
     expect(runId).toBeNull();
   });
+
+  describe("with issueIdentifier", () => {
+    it("skips a newer run titled for another issue and returns the older run titled for this issue", async () => {
+      const now = new Date();
+      vi.mocked(fetch).mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          workflow_runs: [
+            { id: 999, created_at: now.toISOString(), display_title: "Claude AI Implementation — OTHER-1" },
+            { id: 998, created_at: new Date(now.getTime() - 60_000).toISOString(), display_title: "Claude AI Implementation — AII-743" },
+          ],
+        }),
+      } as Response);
+
+      const runId = await findWorkflowRunId(
+        "token", "org", "repo", "workflow.yml", "main",
+        new Date(now.getTime() - 120_000),
+        undefined,
+        "AII-743",
+      );
+      expect(runId).toBe(998);
+    });
+
+    it("returns an untitled (old-template) run only when no titled run matches", async () => {
+      const now = new Date();
+      vi.mocked(fetch).mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          workflow_runs: [
+            { id: 997, created_at: now.toISOString() },
+          ],
+        }),
+      } as Response);
+
+      const runId = await findWorkflowRunId(
+        "token", "org", "repo", "workflow.yml", "main",
+        new Date(now.getTime() - 60_000),
+        undefined,
+        "AII-743",
+      );
+      expect(runId).toBe(997);
+    });
+
+    it("prefers a titled match over an earlier-seen untitled fallback candidate", async () => {
+      const now = new Date();
+      vi.mocked(fetch).mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          workflow_runs: [
+            { id: 996, created_at: now.toISOString() }, // untitled, seen first
+            { id: 995, created_at: new Date(now.getTime() - 60_000).toISOString(), display_title: "Claude AI Implementation — AII-743" },
+          ],
+        }),
+      } as Response);
+
+      const runId = await findWorkflowRunId(
+        "token", "org", "repo", "workflow.yml", "main",
+        new Date(now.getTime() - 120_000),
+        undefined,
+        "AII-743",
+      );
+      expect(runId).toBe(995);
+    });
+
+    it("returns null when only another issue's run is available", async () => {
+      const now = new Date();
+      vi.mocked(fetch).mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          workflow_runs: [
+            { id: 994, created_at: now.toISOString(), display_title: "Claude AI Implementation — OTHER-1" },
+          ],
+        }),
+      } as Response);
+
+      const runId = await findWorkflowRunId(
+        "token", "org", "repo", "workflow.yml", "main",
+        new Date(now.getTime() - 60_000),
+        undefined,
+        "AII-743",
+      );
+      expect(runId).toBeNull();
+    });
+  });
 });
 
 describe("getWorkflowRunStatus", () => {

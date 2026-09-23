@@ -683,6 +683,16 @@ export async function ensureBranchExists(
  * runs list for a recent run on the expected branch with a "workflow_dispatch" event.
  * We filter to runs created after `dispatchedAfter` to avoid matching old runs.
  */
+const RUN_TITLE_PREFIX = "Claude AI Implementation — ";
+
+/**
+ * Finds the workflow run dispatched for a given job. Without `issueIdentifier`, the first
+ * unclaimed candidate created at or after `dispatchedAfter` wins (today's behavior). With
+ * `issueIdentifier`, `display_title` (the synced template's `run-name`, AII-656) disambiguates
+ * concurrent dispatches on one repo: a run titled for another issue is skipped, a run titled
+ * for this issue wins outright, and an old-template run with no key is kept only as a fallback
+ * returned when no run matches by key.
+ */
 export async function findWorkflowRunId(
   token: string,
   owner: string,
@@ -691,6 +701,7 @@ export async function findWorkflowRunId(
   branch: string,
   dispatchedAfter: Date,
   excludeRunIds?: Set<number>,
+  issueIdentifier?: string,
 ): Promise<number | null> {
   const url =
     `https://api.github.com/repos/${owner}/${repo}/actions/workflows/${workflowFile}/runs` +
@@ -700,16 +711,22 @@ export async function findWorkflowRunId(
   if (!res.ok) return null;
 
   const data = (await res.json()) as {
-    workflow_runs: Array<{ id: number; created_at: string }>;
+    workflow_runs: Array<{ id: number; created_at: string; display_title?: string }>;
   };
 
+  let fallback: number | null = null;
   for (const run of data.workflow_runs) {
-    if (new Date(run.created_at) >= dispatchedAfter) {
-      if (excludeRunIds && excludeRunIds.has(run.id)) continue;
-      return run.id;
-    }
+    if (new Date(run.created_at) < dispatchedAfter) continue;
+    if (excludeRunIds && excludeRunIds.has(run.id)) continue;
+
+    if (!issueIdentifier) return run.id;
+
+    const title = run.display_title ?? "";
+    if (title.includes(issueIdentifier)) return run.id;
+    if (title.startsWith(RUN_TITLE_PREFIX)) continue; // titled for another issue
+    if (fallback === null) fallback = run.id;
   }
-  return null;
+  return fallback;
 }
 
 export const KG_GHA_POLL_DELAYS_MS: readonly number[] = [5_000, 10_000, 20_000, 30_000, 25_000];

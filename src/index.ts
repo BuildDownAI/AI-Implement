@@ -95,7 +95,7 @@ import { sweepOrphanedGapfillRows } from "./comment-gapfill-queue.js";
 import { processPendingWorkflowSyncs } from "./workflow-sync-queue.js";
 import { listOpenReviewFindings } from "./review-ledger-store.js";
 import { detectMergedPrs, prNumberFromUrl } from "./poll-merged-prs.js";
-import { githubActionsWatchdogDecision } from "./github-actions-watchdog.js";
+import { githubActionsWatchdogDecision, jobTtlDecision } from "./github-actions-watchdog.js";
 import { KgSidecar } from "./kg-sidecar.js";
 import { RestateSidecar } from "./restate/server.js";
 import { startRestateEndpoint, register as registerRestateEndpoint } from "./restate/endpoint.js";
@@ -1966,7 +1966,61 @@ async function providerForJob(
   return registry.forMapping(mapping);
 }
 
-async function monitorJobs(config: AppConfig, registry: ProviderRegistry): Promise<void> {
+/** Resolves a job's mapping by teamKey, falling back to a repo match (orphaned teamKey). */
+function mappingForJob(
+  teamRepoMap: Record<string, RepoMapping>,
+  job: Job,
+): RepoMapping | undefined {
+  if (job.teamKey && teamRepoMap[job.teamKey]) return teamRepoMap[job.teamKey];
+  if (!job.repo) return undefined;
+  return Object.values(teamRepoMap).find((m) => `${m.owner}/${m.repo}` === job.repo);
+}
+
+/**
+ * Resolves a mode-appropriate stopRunner for a TTL-expired job, mirroring
+ * monitorFlyMachineJob's and monitorLocalDockerJob's own timeout stopRunner
+ * callbacks. Returns undefined for GHA jobs (and for fly/local jobs missing
+ * the fields needed to stop them), which leaves remediateStuckJob's default
+ * GHA-cancel path as the fallback.
+ */
+function ttlStopRunnerForJob(config: AppConfig, job: Job): (() => Promise<void>) | undefined {
+  if (job.executionMode === "fly-machines") {
+    if (!config.flySessionsToken || !config.flySessionsApp || !job.machineId) return undefined;
+    const token = config.flySessionsToken;
+    const app = config.flySessionsApp;
+    const machineId = job.machineId;
+    return async () => {
+      try {
+        await destroyMachine(token, app, machineId);
+        console.log(`[monitor] Destroyed timed-out machine ${machineId}`);
+      } catch (err) {
+        // Machine may already be gone — that's fine
+        if (!(err instanceof Error && err.message.includes("404"))) {
+          console.error(`[monitor] Failed to destroy timed-out machine ${machineId}:`, err);
+        }
+      }
+      invalidateNonce(job.id);
+    };
+  }
+  if (job.executionMode === "local-docker") {
+    if (!job.machineId) return undefined;
+    const machineId = job.machineId;
+    return async () => {
+      try {
+        await removeLocalContainer(machineId);
+        console.log(`[monitor] Removed timed-out local Docker container ${machineId}`);
+      } catch (err) {
+        console.error(`[monitor] Failed to remove timed-out local Docker container ${machineId}:`, err);
+      }
+      invalidateNonce(job.id);
+    };
+  }
+  return undefined;
+}
+
+const TTL_STALE_CONCLUSIONS = new Set(["operator_cancelled", "runner_approved"]);
+
+export async function monitorJobs(config: AppConfig, registry: ProviderRegistry): Promise<void> {
   const inFlightJobs = getInFlightJobs();
   if (inFlightJobs.length === 0 && getUnnotifiedTerminalJobs().length === 0) {
     await reconcileFilesystemFailures(registry);
@@ -1977,9 +2031,48 @@ async function monitorJobs(config: AppConfig, registry: ProviderRegistry): Promi
 
   const teamRepoMap = getMappings();
   const claimedRunIds = getClaimedRunIds();
+  const watchdogConfig: StuckWatchdogConfig = {
+    githubAppId: config.githubAppId,
+    githubAppPrivateKey: config.githubAppPrivateKey,
+    notifyType: config.notifyType,
+    notifyWebhookUrl: config.notifyWebhookUrl,
+  };
 
   for (const job of inFlightJobs) {
     try {
+      // kg-refresh has its own lifecycle (monitorKgRefreshGhaJob) — never TTL it here.
+      if (job.phase !== "kg-refresh") {
+        const mapping = mappingForJob(teamRepoMap, job);
+        const ttl = jobTtlDecision({
+          dispatchedAtMs: job.dispatchedAt,
+          nowMs: Date.now(),
+          maxJobMinutes: mapping?.maxJobMinutes,
+        });
+        // A runner callback can set conclusion to operator_cancelled/runner_approved
+        // concurrently with this tick reading the (now-stale) in-flight snapshot.
+        // updateJobStatus only guards `conclusion`, not `status`, so writing here
+        // without checking would stomp a legitimate terminal status. Skip the TTL
+        // branch entirely for a stale job — same guard remediateStuckJob applies
+        // itself — and let normal per-mode monitoring below handle it as before.
+        const freshConclusion = ttl.expired ? getJobById(job.id)?.conclusion : undefined;
+        if (ttl.expired && !TTL_STALE_CONCLUSIONS.has(freshConclusion ?? "")) {
+          console.warn(`[monitor] Job ${job.id} (${job.issueIdentifier}) exceeded its time limit; marking timed_out`);
+          const provider = await providerForJob(registry, job);
+          const stopRunner = ttlStopRunnerForJob(config, job);
+          await remediateStuckJob(watchdogConfig, provider, job, "ttl_expired", stopRunner);
+          // remediateStuckJob's own bookkeeping (requeue/give-up) unconditionally
+          // overwrites conclusion with stuck_requeued/stuck_giveup — reassert
+          // ttl_expired as the row's final, observable conclusion, unless
+          // remediateStuckJob itself detected staleness mid-flight and bailed
+          // without writing (in which case its guard's outcome must stand).
+          const postConclusion = getJobById(job.id)?.conclusion;
+          if (!TTL_STALE_CONCLUSIONS.has(postConclusion ?? "")) {
+            updateJobStatus(job.id, "timed_out", "ttl_expired");
+          }
+          continue;
+        }
+      }
+
       if (job.executionMode === "fly-machines") {
         const provider = await providerForJob(registry, job);
         if (!provider) {
@@ -2015,7 +2108,10 @@ async function monitorGitHubActionsJob(
   registry: ProviderRegistry,
 ): Promise<void> {
   const repoFullName = job.repo;
-  if (!repoFullName) return;
+  if (!repoFullName) {
+    console.warn(`[monitor] Job ${job.id} (${job.issueIdentifier}) has no repo; skipping`);
+    return;
+  }
 
   const [owner, repo] = repoFullName.split("/");
   if (!owner || !repo) return;
@@ -2041,7 +2137,10 @@ async function monitorGitHubActionsJob(
 
   // If we don't have a run ID yet, try to find it
   if (!job.runId) {
-    if (!mapping) return;
+    if (!mapping) {
+      console.warn(`[monitor] Job ${job.id} (${job.issueIdentifier}) has no mapping for ${repoFullName}; skipping`);
+      return;
+    }
 
     const dispatchTime = new Date(job.dispatchedAt - 30_000);
     const workflowFile = workflowFileForJob(job, mapping);
@@ -2054,6 +2153,7 @@ async function monitorGitHubActionsJob(
       mapping.defaultBranch,
       dispatchTime,
       claimedRunIds,
+      job.issueIdentifier ?? undefined,
     );
 
     if (runId) {
@@ -2079,7 +2179,10 @@ async function monitorGitHubActionsJob(
 
   // Check run status
   const runStatus = await getWorkflowRunStatus(ghToken, owner, repo, job.runId);
-  if (!runStatus) return;
+  if (!runStatus) {
+    console.warn(`[monitor] Job ${job.id} (${job.issueIdentifier}) run status unavailable for run ${job.runId}; skipping`);
+    return;
+  }
   if (!isMonitorRunIdStillCurrent(job)) return;
 
   // Detect stuck: non-terminal past the configured workflow timeout plus reconciliation grace.
