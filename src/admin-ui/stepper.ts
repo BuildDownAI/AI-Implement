@@ -322,6 +322,11 @@ export const stepperHtml = `
             <div class="field-hint">Implement/review cycles. Blank = 2 on bedrock, 3 on anthropic.</div>
           </div>
           <div class="field">
+            <label class="field-label">PR Dispatch Budget <span style="font-weight:400;color:var(--fg-tertiary)">(optional)</span></label>
+            <input class="input" type="number" id="np-prDispatchBudget" min="1" step="1" placeholder="4">
+            <div class="field-hint">Gap-fill runs per PR in 24 hours. At the limit, the PR is parked for a human.</div>
+          </div>
+          <div class="field">
             <label class="field-label">Job Timeout (min) <span style="font-weight:400;color:var(--fg-tertiary)">(optional)</span></label>
             <input class="input" type="number" id="np-maxJobMinutes" min="1" step="1" placeholder="90">
             <div class="field-hint">GitHub Actions only. Blank = 90.</div>
@@ -485,7 +490,7 @@ export const stepperScript = `
     executionMode: 'github-actions', machineCpus: 2, machineMemoryMb: 4096, sessionMode: 'autonomous',
     provider: 'anthropic', awsRegion: '',
     planningEnabled: true, autoApprovePlans: true, autoMerge: false,
-    maxInProgressAiIssues: 3, maxTurns: null, maxIterations: null, maxJobMinutes: null,
+    maxInProgressAiIssues: 3, maxTurns: null, maxIterations: null, prDispatchBudget: null, maxJobMinutes: null,
     secrets: [],
   };
   let jiraFieldsLoaded = false;
@@ -523,11 +528,12 @@ export const stepperScript = `
     data.maxInProgressAiIssues = 3;
     data.maxTurns = null;
     data.maxIterations = null;
+    data.prDispatchBudget = null;
     data.maxJobMinutes = null;
     data.secrets = [];
 
     // Clear inputs. Not derived from the initializer above — a new field needs both.
-    const toClear = ['np-teamKey', 'np-filesystem-directory', 'np-owner', 'np-repo', 'np-defaultBranch', 'np-branch-prefix', 'np-skills-repo', 'np-refrepo-repo', 'np-refrepo-path', 'np-refrepo-ref', 'np-sensitive-add', 'np-sensitive-allow', 'np-awsRegion', 'np-maxTurns', 'np-maxIterations', 'np-maxJobMinutes'];
+    const toClear = ['np-teamKey', 'np-filesystem-directory', 'np-owner', 'np-repo', 'np-defaultBranch', 'np-branch-prefix', 'np-skills-repo', 'np-refrepo-repo', 'np-refrepo-path', 'np-refrepo-ref', 'np-sensitive-add', 'np-sensitive-allow', 'np-awsRegion', 'np-maxTurns', 'np-maxIterations', 'np-prDispatchBudget', 'np-maxJobMinutes'];
     const depScopeEl = document.getElementById('np-dep-token-scope');
     if (depScopeEl) depScopeEl.value = '';
     for (const id of toClear) {
@@ -844,6 +850,7 @@ export const stepperScript = `
   const CAP_FIELDS = [
     ['Max Turns', 'maxTurns'],
     ['Max Iterations', 'maxIterations'],
+    ['PR Dispatch Budget', 'prDispatchBudget'],
     ['Job Timeout', 'maxJobMinutes'],
   ];
 
@@ -919,6 +926,7 @@ export const stepperScript = `
       if (maxEl) data.maxInProgressAiIssues = maxEl.value.trim() === '' ? NaN : Number(maxEl.value);
       data.maxTurns = optionalCap('np-maxTurns');
       data.maxIterations = optionalCap('np-maxIterations');
+      data.prDispatchBudget = optionalCap('np-prDispatchBudget');
       data.maxJobMinutes = optionalCap('np-maxJobMinutes');
     } else if (n === 7) {
       const secrets = [];
@@ -1074,6 +1082,7 @@ export const stepperScript = `
     const capText = function (value, unit) { return value == null ? 'default' : value + (unit || ''); };
     set('caps', 'turns ' + capText(data.maxTurns)
       + ' &middot; iterations ' + capText(data.maxIterations)
+      + ' &middot; PR budget ' + capText(data.prDispatchBudget)
       + ' &middot; timeout ' + capText(data.maxJobMinutes, ' min'));
 
     const validSecrets = data.secrets.filter(function (s) { return s.name && s.value; });
@@ -1412,6 +1421,7 @@ export const stepperScript = `
       branchPrefix: data.branchPrefix || null,
       maxTurns: data.maxTurns,
       maxIterations: data.maxIterations,
+      prDispatchBudget: data.prDispatchBudget,
       maxJobMinutes: data.maxJobMinutes,
       skillsRepo: data.skillsRepo || null,
       referenceRepos: data.referenceRepos.length ? data.referenceRepos : null,
