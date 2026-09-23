@@ -226,6 +226,7 @@ export const listProjects = tool(
       autoMerge: m.autoMerge,
       maxTurns: m.maxTurns,
       maxIterations: m.maxIterations,
+      prDispatchBudget: m.prDispatchBudget,
       maxJobMinutes: m.maxJobMinutes,
       branchPrefix: m.branchPrefix,
       skillsRepo: m.skillsRepo,
@@ -634,7 +635,7 @@ export const ADD_PROJECT_DESCRIPTION =
 /**
  * Exported so the unit tier can `safeParse` the documented "pass null to reset" contract
  * without going through the Restate ingress (AII-720). The nullable fields here must match
- * `upsertMappingAction`'s null-accepting set exactly (src/admin.ts) — reviewers and the three
+ * `upsertMappingAction`'s null-accepting set exactly (src/admin.ts) — reviewers and the four
  * caps, branchPrefix, skillsRepo, dependencyTokenScope, and the two sensitive-glob fields.
  */
 export const addProjectArgsSchema = z.object({
@@ -660,6 +661,7 @@ export const addProjectArgsSchema = z.object({
   paused: z.boolean().optional(),
   maxTurns: z.number().nullable().optional(),
   maxIterations: z.number().nullable().optional(),
+  prDispatchBudget: z.number().nullable().optional(),
   maxJobMinutes: z.number().nullable().optional(),
   branchPrefix: z.string().nullable().optional(),
   skillsRepo: z.string().nullable().optional(),

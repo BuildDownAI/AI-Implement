@@ -892,6 +892,58 @@ describe("admin mappings", () => {
     expect(JSON.parse(create.body).maxTurns).toBeNull();
   });
 
+  it("creates a mapping with prDispatchBudget and round-trips it", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", {
+      teamKey: "PRB", owner: "org", repo: "prb-repo",
+      prDispatchBudget: 6,
+    }, token);
+    expect(create.statusCode).toBe(202);
+    const body = JSON.parse(create.body);
+    expect(body.prDispatchBudget).toBe(6);
+
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    const m = JSON.parse(list.body).PRB;
+    expect(m.prDispatchBudget).toBe(6);
+  });
+
+  it("defaults prDispatchBudget to null when omitted", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", {
+      teamKey: "PRBD", owner: "org", repo: "prbd-repo",
+    }, token);
+    expect(create.statusCode).toBe(202);
+    expect(JSON.parse(create.body).prDispatchBudget).toBeNull();
+  });
+
+  it("accepts null prDispatchBudget explicitly and stores null", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", {
+      teamKey: "PRBN", owner: "org", repo: "prbn-repo",
+      prDispatchBudget: null,
+    }, token);
+    expect(create.statusCode).toBe(202);
+    expect(JSON.parse(create.body).prDispatchBudget).toBeNull();
+  });
+
+  it("rejects prDispatchBudget:0 with 400 mentioning prDispatchBudget", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "BAD", owner: "org", repo: "bad", prDispatchBudget: 0,
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toMatch(/prDispatchBudget/);
+  });
+
+  it("rejects prDispatchBudget:-1 with 400 mentioning prDispatchBudget", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "BAD", owner: "org", repo: "bad", prDispatchBudget: -1,
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toMatch(/prDispatchBudget/);
+  });
+
   it("upsertMapping accepts a Jira ticketingProvider with valid config", async () => {
     const token = await login("secret");
     const create = await request("/api/mappings", "POST", "secret", {
