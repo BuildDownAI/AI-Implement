@@ -1572,6 +1572,315 @@ describe("review feedback ingestion", () => {
   });
 });
 
+// ---------- Bot review gate (AII-745 / ADR 027) ----------
+
+describe("shouldEnqueueReviewEvent", () => {
+  const BASE = {
+    authorType: "Bot" as string | undefined,
+    body: "Please fix the null check.",
+    commitId: "sha-current" as string | undefined,
+    headSha: "sha-current" as string | undefined,
+    eventAt: 1_000 as number | undefined,
+    latestRunDispatchedAt: null as number | null,
+  };
+
+  it("never enqueues when the body carries the self marker, regardless of author or other disqualifying fields", () => {
+    expect(
+      webhook.shouldEnqueueReviewEvent({
+        ...BASE,
+        authorType: undefined,
+        body: "<!-- ai-implement finding-disposition -->\nAcknowledged.",
+        commitId: "sha-old",
+        headSha: "sha-new",
+        latestRunDispatchedAt: 2_000,
+      }),
+    ).toEqual({ enqueue: false, reason: "self" });
+  });
+
+  it("enqueues a human author unconditionally (today's behavior)", () => {
+    expect(webhook.shouldEnqueueReviewEvent({ ...BASE, authorType: "User" })).toEqual({ enqueue: true });
+  });
+
+  it("treats an author with no declared type as human, matching existing fixtures that omit user.type", () => {
+    expect(webhook.shouldEnqueueReviewEvent({ ...BASE, authorType: undefined })).toEqual({ enqueue: true });
+  });
+
+  it("enqueues a bot event describing the PR's current head with no run dispatched since", () => {
+    expect(webhook.shouldEnqueueReviewEvent(BASE)).toEqual({ enqueue: true });
+  });
+
+  it("rejects a bot event describing a stale head as stale_head", () => {
+    expect(
+      webhook.shouldEnqueueReviewEvent({ ...BASE, commitId: "sha-old", headSha: "sha-current" }),
+    ).toEqual({ enqueue: false, reason: "stale_head" });
+  });
+
+  it("rejects a bot event as run_after_review when a run was dispatched after it", () => {
+    expect(webhook.shouldEnqueueReviewEvent({ ...BASE, latestRunDispatchedAt: 2_000 })).toEqual({
+      enqueue: false,
+      reason: "run_after_review",
+    });
+  });
+
+  it("does not treat a dispatch at or before the event as run_after_review", () => {
+    expect(webhook.shouldEnqueueReviewEvent({ ...BASE, latestRunDispatchedAt: 1_000 })).toEqual({ enqueue: true });
+    expect(webhook.shouldEnqueueReviewEvent({ ...BASE, latestRunDispatchedAt: 500 })).toEqual({ enqueue: true });
+  });
+
+  it("rejects a bot issue_comment (no commit fields) with no event timestamp as missing_fields", () => {
+    expect(
+      webhook.shouldEnqueueReviewEvent({ ...BASE, commitId: undefined, headSha: undefined, eventAt: undefined }),
+    ).toEqual({ enqueue: false, reason: "missing_fields" });
+  });
+
+  it("enqueues a bot issue_comment (no commit fields) once an event timestamp is present", () => {
+    expect(webhook.shouldEnqueueReviewEvent({ ...BASE, commitId: undefined, headSha: undefined })).toEqual({
+      enqueue: true,
+    });
+  });
+
+  it("rejects a bot review or review-comment missing only commit_id as missing_fields", () => {
+    expect(webhook.shouldEnqueueReviewEvent({ ...BASE, commitId: undefined })).toEqual({
+      enqueue: false,
+      reason: "missing_fields",
+    });
+  });
+
+  it("rejects a bot review or review-comment missing only head.sha as missing_fields", () => {
+    expect(webhook.shouldEnqueueReviewEvent({ ...BASE, headSha: undefined })).toEqual({
+      enqueue: false,
+      reason: "missing_fields",
+    });
+  });
+});
+
+describe("bot review gate integration (AII-745)", () => {
+  it("enqueues a bot pull_request_review_comment matching the PR's current head with no run dispatched since", async () => {
+    const jobId = log.appendLog({ issueId: "issue-50", issueIdentifier: "AII-50", repo: "org/repo" });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/50");
+
+    const { req, res } = makeRequest(SECRET, "pull_request_review_comment", {
+      action: "created",
+      comment: {
+        body: "Still missing a null check here.",
+        html_url: "https://github.com/org/repo/pull/50#discussion_r99",
+        path: "src/x.ts",
+        line: 5,
+        user: { login: "codex[bot]", type: "Bot" },
+        commit_id: "sha-current",
+        created_at: new Date().toISOString(),
+      },
+      pull_request: {
+        number: 50,
+        html_url: "https://github.com/org/repo/pull/50",
+        head: { ref: "ai-implement/AII-50-fix", sha: "sha-current" },
+      },
+      repository: { full_name: "org/repo" },
+    });
+
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    await res.done;
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toMatchObject({ queued: true });
+    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(1);
+  });
+
+  it("ignores a bot pull_request_review_comment on a stale head as stale_head, touching no ledger state", async () => {
+    const jobId = log.appendLog({ issueId: "issue-51", issueIdentifier: "AII-51", repo: "org/repo" });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/51");
+
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const { req, res } = makeRequest(SECRET, "pull_request_review_comment", {
+      action: "created",
+      comment: {
+        body: "Still missing a null check here.",
+        html_url: "https://github.com/org/repo/pull/51#discussion_r100",
+        user: { login: "codex[bot]", type: "Bot" },
+        commit_id: "sha-old",
+        created_at: new Date().toISOString(),
+      },
+      pull_request: {
+        number: 51,
+        html_url: "https://github.com/org/repo/pull/51",
+        head: { ref: "ai-implement/AII-51-fix", sha: "sha-current" },
+      },
+      repository: { full_name: "org/repo" },
+    });
+
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    await res.done;
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ ignored: true, reason: "stale_head" });
+    expect(reviewStore.listOpenReviewFindings("org/repo", 51)).toEqual([]);
+    expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
+    expect(
+      logSpy.mock.calls.some((c) => String(c[0]).includes("Ignored bot review on PR #51: stale_head")),
+    ).toBe(true);
+    logSpy.mockRestore();
+  });
+
+  it("still enqueues a human's pull_request_review_comment on a stale commit", async () => {
+    const jobId = log.appendLog({ issueId: "issue-52", issueIdentifier: "AII-52", repo: "org/repo" });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/52");
+
+    const { req, res } = makeRequest(SECRET, "pull_request_review_comment", {
+      action: "created",
+      comment: {
+        body: "Still missing a null check here.",
+        html_url: "https://github.com/org/repo/pull/52#discussion_r101",
+        user: { login: "a-human", type: "User" },
+        commit_id: "sha-old",
+        created_at: new Date().toISOString(),
+      },
+      pull_request: {
+        number: 52,
+        html_url: "https://github.com/org/repo/pull/52",
+        head: { ref: "ai-implement/AII-52-fix", sha: "sha-current" },
+      },
+      repository: { full_name: "org/repo" },
+    });
+
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    await res.done;
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toMatchObject({ queued: true });
+    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(1);
+  });
+
+  it("rejects a bot pull_request_review_comment as run_after_review when a run was dispatched after it", async () => {
+    const jobId = log.appendLog({ issueId: "issue-53", issueIdentifier: "AII-53", repo: "org/repo" });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/54");
+
+    const eventAt = new Date(Date.now() - 60_000).toISOString();
+
+    const rerunJobId = log.appendLog({ issueId: "issue-53", issueIdentifier: "AII-53", repo: "org/repo" });
+    log.updateJobStatus(rerunJobId, "completed", "success", "https://github.com/org/repo/pull/54");
+
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const { req, res } = makeRequest(SECRET, "pull_request_review_comment", {
+      action: "created",
+      comment: {
+        body: "Still missing a null check here.",
+        html_url: "https://github.com/org/repo/pull/54#discussion_r102",
+        user: { login: "codex[bot]", type: "Bot" },
+        commit_id: "sha-current",
+        created_at: eventAt,
+      },
+      pull_request: {
+        number: 54,
+        html_url: "https://github.com/org/repo/pull/54",
+        head: { ref: "ai-implement/AII-53-fix", sha: "sha-current" },
+      },
+      repository: { full_name: "org/repo" },
+    });
+
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    await res.done;
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ ignored: true, reason: "run_after_review" });
+    expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
+    expect(
+      logSpy.mock.calls.some((c) => String(c[0]).includes("Ignored bot review on PR #54: run_after_review")),
+    ).toBe(true);
+    logSpy.mockRestore();
+  });
+
+  it("never enqueues a pull_request_review whose body carries the self marker, for a bot or human author", async () => {
+    const jobId = log.appendLog({ issueId: "issue-55", issueIdentifier: "AII-55", repo: "org/repo" });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/55");
+
+    for (const author of [{ login: "codex[bot]", type: "Bot" }, { login: "a-human", type: "User" }]) {
+      const { req, res } = makeRequest(SECRET, "pull_request_review", {
+        action: "submitted",
+        review: {
+          state: "changes_requested",
+          body: "<!-- ai-implement finding-disposition -->\nAcknowledged and resolved.",
+          html_url: "https://github.com/org/repo/pull/55#pullrequestreview-9",
+          user: author,
+          commit_id: "sha-current",
+          submitted_at: new Date().toISOString(),
+        },
+        pull_request: {
+          number: 55,
+          html_url: "https://github.com/org/repo/pull/55",
+          head: { ref: "ai-implement/AII-55-fix", sha: "sha-current" },
+        },
+        repository: { full_name: "org/repo" },
+      });
+
+      webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+      await res.done;
+
+      expect(res.statusCode).toBe(200);
+      expect(JSON.parse(res.body)).toEqual({ ignored: true, reason: "self" });
+    }
+    expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
+  });
+
+  it("never enqueues a pull_request_review_comment whose body carries the self marker, for a bot or human author", async () => {
+    const jobId = log.appendLog({ issueId: "issue-56", issueIdentifier: "AII-56", repo: "org/repo" });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/56");
+
+    for (const author of [{ login: "codex[bot]", type: "Bot" }, { login: "a-human", type: "User" }]) {
+      const { req, res } = makeRequest(SECRET, "pull_request_review_comment", {
+        action: "created",
+        comment: {
+          body: "<!-- ai-implement finding-disposition -->\nAcknowledged and resolved.",
+          html_url: "https://github.com/org/repo/pull/56#discussion_r103",
+          user: author,
+          commit_id: "sha-current",
+          created_at: new Date().toISOString(),
+        },
+        pull_request: {
+          number: 56,
+          html_url: "https://github.com/org/repo/pull/56",
+          head: { ref: "ai-implement/AII-56-fix", sha: "sha-current" },
+        },
+        repository: { full_name: "org/repo" },
+      });
+
+      webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+      await res.done;
+
+      expect(res.statusCode).toBe(200);
+      expect(JSON.parse(res.body)).toEqual({ ignored: true, reason: "self" });
+    }
+    expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
+  });
+
+  it("never enqueues a trusted-author issue_comment whose body carries the self marker", async () => {
+    const jobId = log.appendLog({ issueId: "issue-57", issueIdentifier: "AII-57", repo: "org/repo" });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/57");
+
+    const { req, res } = makeRequest(SECRET, "issue_comment", {
+      action: "created",
+      comment: {
+        body: "<!-- ai-implement finding-disposition -->\n### PR Review: Changes requested\n\n**1. Missing callback update**\nPersist the PR URL before the runner exits.",
+        html_url: "https://github.com/org/repo/issues/57#issuecomment-3",
+        user: { login: "claude-code[bot]", type: "Bot" },
+        created_at: new Date().toISOString(),
+      },
+      issue: {
+        number: 57,
+        html_url: "https://github.com/org/repo/pull/57",
+        pull_request: { url: "https://api.github.com/repos/org/repo/pulls/57" },
+      },
+      repository: { full_name: "org/repo" },
+    });
+
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    await res.done;
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ ignored: true, reason: "self" });
+    expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
+  });
+});
+
 // ---------- /ai-implement comment trigger ----------
 
 function makeMappedEnvelopeRepo(owner = "org", repo = "repo"): Record<string, RepoMapping> {

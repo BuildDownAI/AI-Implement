@@ -1,6 +1,6 @@
 import crypto from "node:crypto";
 import http from "node:http";
-import { listLog } from "./log.js";
+import { listLog, getLatestDispatchForPr } from "./log.js";
 import { enqueueReconciliation, hasReconciliationForPr } from "./reconciliation.js";
 import { branchMatchesIssueIdentifier } from "./pipeline/branch-name.js";
 import { enqueueReviewFix } from "./review-fix-queue.js";
@@ -338,12 +338,14 @@ interface ReviewPayload {
     state?: string;
     body?: string | null;
     html_url?: string;
-    user?: { login?: string };
+    user?: { login?: string; type?: string };
+    commit_id?: string;
+    submitted_at?: string;
   };
   pull_request?: {
     number?: number;
     html_url?: string;
-    head?: { ref?: string };
+    head?: { ref?: string; sha?: string };
   };
   repository?: {
     full_name?: string;
@@ -358,12 +360,14 @@ interface ReviewCommentPayload {
     path?: string;
     line?: number | null;
     original_line?: number | null;
-    user?: { login?: string };
+    user?: { login?: string; type?: string };
+    commit_id?: string;
+    created_at?: string;
   };
   pull_request?: {
     number?: number;
     html_url?: string;
-    head?: { ref?: string };
+    head?: { ref?: string; sha?: string };
   };
   repository?: {
     full_name?: string;
@@ -376,7 +380,8 @@ interface IssueCommentPayload {
     id?: number;
     body?: string;
     html_url?: string;
-    user?: { login?: string };
+    user?: { login?: string; type?: string };
+    created_at?: string;
   };
   issue?: {
     number?: number;
@@ -603,6 +608,22 @@ function handleReviewWebhook(payload: ReviewPayload, res: http.ServerResponse): 
     return;
   }
 
+  const [reviewOwner, reviewRepo] = repoFullName.split("/");
+  const gate = shouldEnqueueReviewEvent({
+    authorType: payload.review?.user?.type,
+    body,
+    commitId: payload.review?.commit_id,
+    headSha: payload.pull_request?.head?.sha,
+    eventAt: parseEventTimestamp(payload.review?.submitted_at),
+    latestRunDispatchedAt: getLatestDispatchForPr(reviewOwner, reviewRepo, prNumber)?.dispatchedAt ?? null,
+  });
+  if (!gate.enqueue) {
+    console.log(`[webhook] Ignored bot review on PR #${prNumber}: ${gate.reason}`);
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ignored: true, reason: gate.reason }));
+    return;
+  }
+
   const findingId = upsertReviewFinding({
     repo: repoFullName,
     prNumber,
@@ -648,6 +669,22 @@ function handleReviewCommentWebhook(payload: ReviewCommentPayload, res: http.Ser
   if (!match) {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ignored: true, reason: "no matching dispatch" }));
+    return;
+  }
+
+  const [commentOwner, commentRepo] = repoFullName.split("/");
+  const gate = shouldEnqueueReviewEvent({
+    authorType: payload.comment?.user?.type,
+    body,
+    commitId: payload.comment?.commit_id,
+    headSha: payload.pull_request?.head?.sha,
+    eventAt: parseEventTimestamp(payload.comment?.created_at),
+    latestRunDispatchedAt: getLatestDispatchForPr(commentOwner, commentRepo, prNumber)?.dispatchedAt ?? null,
+  });
+  if (!gate.enqueue) {
+    console.log(`[webhook] Ignored bot review on PR #${prNumber}: ${gate.reason}`);
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ignored: true, reason: gate.reason }));
     return;
   }
 
@@ -906,6 +943,22 @@ async function handleIssueCommentWebhook(
     return;
   }
 
+  const [issueCommentOwner, issueCommentRepo] = repoFullName.split("/");
+  const gate = shouldEnqueueReviewEvent({
+    authorType: payload.comment?.user?.type,
+    body,
+    commitId: undefined,
+    headSha: undefined,
+    eventAt: parseEventTimestamp(payload.comment?.created_at),
+    latestRunDispatchedAt: getLatestDispatchForPr(issueCommentOwner, issueCommentRepo, prNumber)?.dispatchedAt ?? null,
+  });
+  if (!gate.enqueue) {
+    console.log(`[webhook] Ignored bot review on PR #${prNumber}: ${gate.reason}`);
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ignored: true, reason: gate.reason }));
+    return;
+  }
+
   const findingIds = findings.map((finding) => upsertReviewFinding({ repo: repoFullName, prNumber, ...finding }));
   const reviewFixId = enqueueReviewFix({
     issueId: match.issueId,
@@ -925,4 +978,58 @@ async function handleIssueCommentWebhook(
 function isAiImplementNativeReviewBody(body: string): boolean {
   return body.includes(AI_IMPLEMENT_NATIVE_REVIEW_MARKER) ||
     body.replace(/\s+/g, " ").trim().startsWith("AI-Implement post-push review");
+}
+
+/** Parses an ISO-8601 timestamp to milliseconds since epoch, treating a missing or malformed
+ *  value the same as "unknown" rather than letting NaN compare as 0. */
+function parseEventTimestamp(value: string | undefined): number | undefined {
+  if (!value) return undefined;
+  const ms = Date.parse(value);
+  return Number.isNaN(ms) ? undefined : ms;
+}
+
+/**
+ * Gates whether a review-shaped webhook event (a `pull_request_review`, a
+ * `pull_request_review_comment`, or a trusted-author `issue_comment`) should enqueue a
+ * review-fix run. Human authors always enqueue. A bot's event only enqueues when it
+ * describes the PR's current head and no run has been dispatched since — otherwise a
+ * bot reviewing its own fix's push starts another run, looping (ADR 027).
+ */
+export function shouldEnqueueReviewEvent(input: {
+  authorType: string | undefined;
+  body: string;
+  commitId: string | undefined;
+  headSha: string | undefined;
+  eventAt: number | undefined;
+  latestRunDispatchedAt: number | null;
+}): { enqueue: true } | { enqueue: false; reason: "self" | "stale_head" | "run_after_review" | "missing_fields" } {
+  if (input.body.includes("<!-- ai-implement")) {
+    return { enqueue: false, reason: "self" };
+  }
+
+  if (input.authorType !== "Bot") {
+    return { enqueue: true };
+  }
+
+  if (input.commitId !== undefined && input.headSha !== undefined && input.commitId !== input.headSha) {
+    return { enqueue: false, reason: "stale_head" };
+  }
+
+  if (
+    input.eventAt !== undefined &&
+    input.latestRunDispatchedAt !== null &&
+    input.latestRunDispatchedAt > input.eventAt
+  ) {
+    return { enqueue: false, reason: "run_after_review" };
+  }
+
+  if (input.commitId === undefined && input.headSha === undefined) {
+    if (input.eventAt === undefined) {
+      return { enqueue: false, reason: "missing_fields" };
+    }
+  } else if (input.commitId === undefined || input.headSha === undefined) {
+    return { enqueue: false, reason: "missing_fields" };
+  }
+
+  return { enqueue: true };
 }
