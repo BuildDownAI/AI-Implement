@@ -709,6 +709,12 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     // "did not approve" — the reviewer never ran to a verdict, or the implementer's
     // partial work was preserved as a draft, either way not the code being turned down.
     const providerUnavailable = terminationReason === "provider_unavailable";
+    // The check-runs read that gates the external review (or CI) failed with a
+    // permission error and post-push-review.ts already terminated the wait and
+    // attached a CHECKS_PERMISSION_DENIED FailureRecord — never a rejection, so
+    // it gets its own failureCode/wording instead of REVIEW_UNAPPROVED's "did
+    // not approve" (AII-736).
+    const checksPermissionDenied = terminationReason === "checks_permission_denied";
     const reviewerFailure = isFailureRecord(authoritativeReviewOutputs.failure)
       ? authoritativeReviewOutputs.failure
       : undefined;
@@ -716,16 +722,20 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       ? "REVIEWER_TURNS_EXHAUSTED"
       : providerUnavailable
         ? "PROVIDER_UNAVAILABLE"
-        : terminationReason === "max_turns"
-          ? "MAX_TURNS_EXHAUSTED"
-          : "REVIEW_UNAPPROVED";
+        : checksPermissionDenied
+          ? "CHECKS_PERMISSION_DENIED"
+          : terminationReason === "max_turns"
+            ? "MAX_TURNS_EXHAUSTED"
+            : "REVIEW_UNAPPROVED";
     const reviewMaxTurns = reviewerFailure?.reviewMaxTurns ?? retryPolicy.reviewMaxTurns ?? DEFAULT_RETRY_POLICY.reviewMaxTurns;
     const failureReason = reviewerTurnsExhausted
       ? `🟠 A post-push reviewer reached its turn limit (${reviewMaxTurns}); required review is incomplete.\n\n${finalFeedback.slice(0, 500)}\n\nSee the PR for completed reviewer reports and remaining review work.`
       : providerUnavailable
         ? finalFeedback || "The model provider was unavailable and the run could not complete."
-        : `Automated review did not approve (${terminationReason} after ${iterations} iteration(s)). ` +
-          finalFeedback.slice(0, 500);
+        : checksPermissionDenied
+          ? finalFeedback || "Check runs could not be read due to a missing permission and the run could not complete review."
+          : `Automated review did not approve (${terminationReason} after ${iterations} iteration(s)). ` +
+            finalFeedback.slice(0, 500);
 
     const prKind = pushOutputs.draft === true ? "draft PR" : "PR";
     const prDisposition = prUrl
@@ -735,7 +745,9 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       ? `${prDisposition} — reviewer ran out of turns at the cap after ${iterations} iteration(s) (${terminationReason})`
       : providerUnavailable
         ? `${prDisposition} — provider unavailable after ${iterations} iteration(s) (${terminationReason})`
-        : `${prDisposition} — review unapproved after ${iterations} iteration(s) (${terminationReason})`;
+        : checksPermissionDenied
+          ? `${prDisposition} — check runs could not be read due to a missing permission after ${iterations} iteration(s) (${terminationReason})`
+          : `${prDisposition} — review unapproved after ${iterations} iteration(s) (${terminationReason})`;
 
     writeRunAutopsy(workspaceDir, {
       issueIdentifier,
@@ -755,8 +767,11 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
         : providerUnavailable
           ? `::warning::AI-Implement: model provider was unavailable after ${iterations} iteration(s) (${terminationReason}) — ` +
             (prUrl ? `${prKind} opened: ${prUrl}` : "no PR opened")
-          : `::warning::AI-Implement: review did not approve after ${iterations} iteration(s) (${terminationReason}) — ` +
-            (prUrl ? `${prKind} opened: ${prUrl}` : "no PR opened"),
+          : checksPermissionDenied
+            ? `::warning::AI-Implement: check runs could not be read due to a missing permission after ${iterations} iteration(s) (${terminationReason}) — ` +
+              (prUrl ? `${prKind} opened: ${prUrl}` : "no PR opened")
+            : `::warning::AI-Implement: review did not approve after ${iterations} iteration(s) (${terminationReason}) — ` +
+              (prUrl ? `${prKind} opened: ${prUrl}` : "no PR opened"),
     );
     await postRunnerResult({
       workspaceDir,

@@ -1109,16 +1109,21 @@ export async function getCombinedChecksState(
       if (c.status !== "completed") return "pending";
       if (c.conclusion && FAIL.has(c.conclusion)) return "failure";
     }
-  } else if (isChecksPermissionError({ status: runsRes.status })) {
+  } else {
     // A check-runs read we could not do is not evidence the checks passed — falling through to
     // the unconditional "success" below would let auto-merge merge a PR with red or running
     // checks purely because the token could not read them (AII-736). "pending" holds the PR
-    // the same way an in-progress check would, via the existing auto-merge.ts:84 branch.
+    // the same way an in-progress check would, via the existing auto-merge.ts:84 branch. This
+    // applies to every unreadable response, not only a permission denial: a transient 5xx is
+    // just as much "not evidence the checks passed" as a 403, and this call has no retry loop
+    // of its own to fall back on before auto-merge acts on its result.
     const repoKey = `${owner}/${repo}`;
     if (!checksPermissionDeniedLogged.has(repoKey)) {
       checksPermissionDeniedLogged.add(repoKey);
       console.warn(
-        `[github] Cannot read check runs for ${repoKey}: the GitHub App lacks Checks: read, or the installation hasn't accepted updated permissions. Holding PRs on this repo as pending until it's granted.`,
+        isChecksPermissionError({ status: runsRes.status })
+          ? `[github] Cannot read check runs for ${repoKey}: the GitHub App lacks Checks: read, or the installation hasn't accepted updated permissions. Holding PRs on this repo as pending until it's granted.`
+          : `[github] Cannot read check runs for ${repoKey}: HTTP ${runsRes.status}. Holding PRs on this repo as pending until the read succeeds.`,
       );
     }
     return "pending";

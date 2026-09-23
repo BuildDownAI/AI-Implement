@@ -1450,6 +1450,71 @@ describe("runAutonomous", () => {
     expect(body.failure).toEqual(reviewerFailure);
   });
 
+  it("uses CHECKS_PERMISSION_DENIED with the classified failure when post-push review terminates on a check-runs permission error (AII-736)", async () => {
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    const checksFailure = {
+      category: "invalid_output" as const,
+      code: "CHECKS_PERMISSION_DENIED",
+      stage: "post-push-review/review-1",
+      attempt: 1,
+      retryable: false,
+      message: "Check runs could not be read: the GitHub App lacks Checks: read.",
+      evidence: { truncated: false },
+    };
+    const { pipeline, runner } = makeStepsPipeline([
+      [
+        "feedback-loop",
+        { run: vi.fn().mockResolvedValue({ approved: true, iterations: 1, terminationReason: "approved", passes: [] }) },
+      ],
+      [
+        "push",
+        {
+          run: vi.fn().mockResolvedValue({
+            prUrl: "https://github.com/o/r/pull/13",
+            prNumber: 13,
+            branchPushed: true,
+            draft: true,
+          }),
+        },
+      ],
+      [
+        "post-push-review",
+        {
+          run: vi.fn().mockResolvedValue({
+            approved: false,
+            iterations: 1,
+            finalFeedback: "Check runs could not be read: the GitHub App lacks Checks: read.",
+            terminationReason: "checks_permission_denied",
+            forcePushedRevisions: 0,
+            failure: checksFailure,
+          }),
+        },
+      ],
+    ]);
+
+    const result = await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+      fetchImpl: mockFetch,
+    });
+
+    expect(result.exitCode).toBe(0);
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
+      failureCode: string;
+      failureReason: string;
+      failure?: typeof checksFailure;
+    };
+    expect(body.failureCode).toBe("CHECKS_PERMISSION_DENIED");
+    expect(body.failureReason).not.toContain("did not approve");
+    expect(body.failure).toEqual(checksFailure);
+  });
+
   it("turn exhaustion describes incomplete review and includes iteration count in disposition and warning", async () => {
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
     vi.stubEnv("RUN_TOKEN", "run-token");

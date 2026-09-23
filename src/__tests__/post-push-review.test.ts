@@ -3945,6 +3945,44 @@ describe("postPushReviewStep", () => {
     expect(comment).toContain("Manual review required");
   });
 
+  it("reports CHECKS_PERMISSION_DENIED immediately on a 404 from the check-runs probe, treated as a permission error on a repo already read this run (AII-736)", async () => {
+    const reviewerOutput = { approved: true, blocking_issues: [], feedback: "ok", score: 9, progress_delta: 0 };
+    const sleep = vi.fn(async () => undefined);
+    const ghComments: string[] = [];
+    let probes = 0;
+    const gitSpawn = vi.fn(() => ({ stdout: "", exitCode: 0 }));
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "api" && args.some((a) => a === "repos/:owner/:repo/pulls/42")) {
+        return { stdout: JSON.stringify({ head: { sha: "deadbeef" } }), exitCode: 0 };
+      }
+      if (args[0] === "api" && args.some((a) => a.includes("commits/deadbeef/check-runs"))) {
+        probes++;
+        return { stdout: "", exitCode: 1, stderr: "gh: Not Found (HTTP 404)" };
+      }
+      if (args[0] === "pr" && args[1] === "comment") {
+        ghComments.push(args[args.indexOf("--body") + 1]);
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => (structuredReviewResult(reviewerOutput)));
+    const ctx = makeCtx(invoke);
+
+    const out = await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn, sleep, reviewWaitPollMs: 1000, reviewWaitTimeoutMs: 300000 },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(false);
+    expect(out.terminationReason).toBe("checks_permission_denied");
+    expect(out.failure?.code).toBe("CHECKS_PERMISSION_DENIED");
+    expect(sleep).not.toHaveBeenCalled();
+    expect(probes).toBe(1);
+    const comment = ghComments.find((c) => c.includes("Checks: read"));
+    expect(comment).toBeDefined();
+  });
+
   it("keeps retrying a transient (non-permission) check-runs read failure until the timeout", async () => {
     const reviewerOutput = { approved: true, blocking_issues: [], feedback: "ok", score: 9, progress_delta: 0 };
     const sleep = vi.fn(async () => undefined);

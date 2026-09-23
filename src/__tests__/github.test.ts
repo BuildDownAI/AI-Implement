@@ -730,6 +730,22 @@ describe("getCombinedChecksState", () => {
     );
     expect(await getCombinedChecksState("tok", "owner", "repo", "abc")).toBe("pending");
   });
+
+  it('returns "pending" specifically on a check-runs 404, treated as a permission error on a repo the token can otherwise see (AII-736)', async () => {
+    vi.stubGlobal("fetch", vi.fn()
+      .mockResolvedValueOnce({ ok: false, status: 404, json: async () => ({ message: "Not Found" }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ state: "success", total_count: 0 }) }),
+    );
+    expect(await getCombinedChecksState("tok", "owner", "repo", "abc")).toBe("pending");
+  });
+
+  it('does not return "success" on a transient, non-permission check-runs read failure (e.g. a 500), even with an empty/ok commit-status response (AII-736)', async () => {
+    vi.stubGlobal("fetch", vi.fn()
+      .mockResolvedValueOnce({ ok: false, status: 500, json: async () => ({ message: "Internal Server Error" }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ state: "success", total_count: 0 }) }),
+    );
+    expect(await getCombinedChecksState("tok", "owner", "repo", "abc")).toBe("pending");
+  });
 });
 
 describe("fetchRepoTarball", () => {

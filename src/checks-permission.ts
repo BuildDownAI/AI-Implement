@@ -13,13 +13,16 @@
  * A 403 is unambiguous and is matched on status when available. `gh api` has
  * no separate status field on a spawn result, so the CLI's own rendering of a
  * 403 — the literal "Resource not accessible by integration" text — is
- * matched on stderr/stdout instead. A 404 is deliberately NOT treated as a
- * permission error here: it collides with "repo not visible for an unrelated
- * reason", and telling the two apart needs cross-call context (e.g. that the
- * same token already read the repo successfully this run) that isn't
- * available at this shared, stateless check.
+ * matched on stderr/stdout instead. A 404 is also treated as a permission
+ * error: every call site only reaches a check-runs read once the same token
+ * has already read the owning repo/PR successfully this run, so a 404 here
+ * is "repo the token can otherwise see" per the issue's required behaviour,
+ * not an unrelated not-found. `gh api`'s rendering of a 404 carries no
+ * distinguishing message text (just "Not Found"), so the text match instead
+ * looks for the CLI's own "(HTTP 404)" suffix, the same way it does for 403.
  */
 export function isChecksPermissionError(input: { status?: number | null; text?: string }): boolean {
-  if (input.status === 403) return true;
-  return /resource not accessible by integration/i.test(input.text ?? "");
+  if (input.status === 403 || input.status === 404) return true;
+  const text = input.text ?? "";
+  return /resource not accessible by integration/i.test(text) || /\(HTTP 404\)/.test(text);
 }
