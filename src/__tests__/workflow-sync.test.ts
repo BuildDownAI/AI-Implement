@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it } from "vitest";
 import type { RepoMapping } from "../config.js";
-import { syncWorkflowTemplates, classifySyncError, isBareWorkflowFileName } from "../workflow-sync.js";
+import { syncWorkflowTemplates, classifySyncError, isBareWorkflowFileName, workflowFileNamesCollide } from "../workflow-sync.js";
 import { GitHubApiError } from "../github-errors.js";
 
 const mapping: RepoMapping = {
@@ -721,6 +721,22 @@ describe("syncWorkflowTemplates", () => {
 
       expect(fake.calls.some((call) => call.method === "PUT" && call.path.includes("/contents/"))).toBe(false);
     });
+
+    it("throws before any write when workflowFile equals planningWorkflowFile", async () => {
+      const templatesRoot = makeTemplatesRoot();
+      const fake = makeGithubFetch();
+
+      await expect(syncWorkflowTemplates({
+        mapping: { ...mapping, workflowFile: "claude-implement.yml", planningWorkflowFile: "claude-implement.yml" },
+        githubAppId: "app-id",
+        githubAppPrivateKey: "private-key",
+        templatesRoot,
+        fetchImpl: fake.fetchImpl,
+        getInstallationTokenImpl: async () => "token",
+      })).rejects.toThrow(/workflowFile and planningWorkflowFile/i);
+
+      expect(fake.calls.some((call) => call.method === "PUT" && call.path.includes("/contents/"))).toBe(false);
+    });
   });
 });
 
@@ -736,6 +752,16 @@ describe("isBareWorkflowFileName", () => {
     expect(isBareWorkflowFileName("dir\\x.yml")).toBe(false);
     expect(isBareWorkflowFileName("x.txt")).toBe(false);
     expect(isBareWorkflowFileName("..yml")).toBe(false);
+  });
+});
+
+describe("workflowFileNamesCollide", () => {
+  it("is true when the two names are equal", () => {
+    expect(workflowFileNamesCollide("claude-implement.yml", "claude-implement.yml")).toBe(true);
+  });
+
+  it("is false when the two names differ", () => {
+    expect(workflowFileNamesCollide("claude-implement.yml", "claude-plan.yml")).toBe(false);
   });
 });
 

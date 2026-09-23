@@ -33,7 +33,8 @@ vi.mock("../fly-machines.js", async (importOriginal) => ({
   listMachines: listMachinesMock,
 }));
 
-vi.mock("../workflow-sync.js", () => ({
+vi.mock("../workflow-sync.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../workflow-sync.js")>()),
   syncWorkflowTemplates: vi.fn(),
   classifySyncError: (err: unknown) => ({
     category: "unknown",
@@ -756,6 +757,65 @@ describe("admin mappings", () => {
     }, token);
     expect(res.statusCode).toBe(400);
     expect(JSON.parse(res.body).error).toContain("planningWorkflowFile");
+  });
+
+  it("accepts bare workflow file names for workflowFile and planningWorkflowFile", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "WFOK", owner: "org", repo: "wfok-repo",
+      workflowFile: "claude-implement-2.yml", planningWorkflowFile: "x.yaml",
+    }, token);
+    expect(res.statusCode).toBe(202);
+
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    expect(JSON.parse(list.body).WFOK.workflowFile).toBe("claude-implement-2.yml");
+    expect(JSON.parse(list.body).WFOK.planningWorkflowFile).toBe("x.yaml");
+  });
+
+  it.each([
+    ["../x.yml"],
+    ["dir/x.yml"],
+    ["x.txt"],
+  ])("rejects workflowFile %s and stores nothing", async (badName) => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "WFBAD", owner: "org", repo: "wfbad-repo", workflowFile: badName,
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toContain("workflowFile");
+
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    expect(JSON.parse(list.body).WFBAD).toBeUndefined();
+  });
+
+  it.each([
+    ["../x.yml"],
+    ["dir/x.yml"],
+    ["x.txt"],
+  ])("rejects planningWorkflowFile %s and stores nothing", async (badName) => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "PWFBAD", owner: "org", repo: "pwfbad-repo", planningWorkflowFile: badName,
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toContain("planningWorkflowFile");
+
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    expect(JSON.parse(list.body).PWFBAD).toBeUndefined();
+  });
+
+  it("rejects workflowFile equal to planningWorkflowFile and stores nothing", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "WFDUP", owner: "org", repo: "wfdup-repo",
+      workflowFile: "claude-implement.yml", planningWorkflowFile: "claude-implement.yml",
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toContain("workflowFile");
+    expect(JSON.parse(res.body).error).toContain("planningWorkflowFile");
+
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    expect(JSON.parse(list.body).WFDUP).toBeUndefined();
   });
 
   it("rejects array extraEnv with 400", async () => {
