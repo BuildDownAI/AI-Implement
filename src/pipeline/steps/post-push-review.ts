@@ -46,6 +46,14 @@ interface PostPushReviewInputs extends Record<string, unknown> {
   sleep?: (ms: number) => Promise<void>;
   /** Injectable credential refresh for tests. */
   refreshCredentials?: () => Promise<void>;
+  /**
+   * SHA the `push` step last pushed to the branch. Seeds the fix pass's lease so it
+   * protects against a concurrent writer instead of re-reading `ls-remote` right
+   * before the push (which would simply adopt whatever is on the remote, protecting
+   * nothing). Absent for direct callers and pre-upgrade loaders, which fall back to
+   * the ls-remote-right-before-push behavior.
+   */
+  pushedSha?: string;
 }
 
 type ExternalReviewState = "skipped" | "absent" | "running" | "completed" | "permission-denied";
@@ -1784,6 +1792,14 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
     let approved = false;
     let feedback = "";
     let forcePushed = 0;
+    // Lease for the fix pass's force-with-lease push. Seeded from the push step's own
+    // last-pushed SHA (this run's own writes) rather than a fresh `ls-remote`, so a
+    // concurrent writer's commits are never adopted as "expected" and then destroyed.
+    // Absent `pushedSha` (a direct caller or a pre-upgrade loader) falls back to the
+    // previous ls-remote-right-before-push behavior.
+    const hasPushedShaLease = inputs.pushedSha !== undefined;
+    let leaseSha: string | undefined = inputs.pushedSha;
+    let loggedLeaseFallback = false;
     let terminationReason: PostPushReviewTerminationReason = "iterations_exhausted";
     let reviewerFailure: FailureRecord | undefined;
     const reviewHistory: ReviewFinding[] = [];
@@ -2341,14 +2357,49 @@ ${requiredReviewFindingsBlock(gatingExternalFindings)}
       // the latest token already present in the environment and origin URL.
       assertPrWritable(ghSpawn, prNumber);
       await refreshCredentialsBeforePush(context, inputs);
-      const expectedRemoteSha = remoteBranchSha(gitSpawn, branchName);
+      let expectedRemoteSha: string | null;
+      if (hasPushedShaLease) {
+        expectedRemoteSha = leaseSha ?? null;
+      } else {
+        if (!loggedLeaseFallback) {
+          console.warn("[post-push-review] No pushedSha input; lease falls back to ls-remote");
+          loggedLeaseFallback = true;
+        }
+        expectedRemoteSha = remoteBranchSha(gitSpawn, branchName);
+      }
       const push = gitSpawn([
         "push",
         "origin",
         `HEAD:${remoteRef}`,
         `--force-with-lease=${remoteRef}:${expectedRemoteSha ?? ""}`,
       ]);
-      if (push.exitCode !== 0) throw new Error(`git push --force-with-lease rejected: ${resultMessage(push)}`);
+      if (push.exitCode !== 0) {
+        const originalFailure = new Error(`git push --force-with-lease rejected: ${resultMessage(push)}`);
+        if (hasPushedShaLease) {
+          let actualRemoteSha: string | null;
+          try {
+            actualRemoteSha = remoteBranchSha(gitSpawn, branchName);
+          } catch (lsRemoteErr) {
+            console.warn(
+              `[post-push-review] Diagnostic ls-remote after rejected push failed; reporting the original push failure: ${lsRemoteErr instanceof Error ? lsRemoteErr.message : String(lsRemoteErr)}`,
+            );
+            throw originalFailure;
+          }
+          if (actualRemoteSha !== expectedRemoteSha) {
+            throw new Error(
+              `git push --force-with-lease rejected (stale info): expected remote ${expectedRemoteSha ?? "<none>"}, found ${actualRemoteSha ?? "<none>"}. ${resultMessage(push)}`,
+            );
+          }
+        }
+        throw originalFailure;
+      }
+
+      if (hasPushedShaLease) {
+        const revParseHead = gitSpawn(["rev-parse", "HEAD"]);
+        if (revParseHead.exitCode === 0 && revParseHead.stdout.trim()) {
+          leaseSha = revParseHead.stdout.trim();
+        }
+      }
 
       forcePushed++;
       const marker = `<!-- ai-implement post-push iter=${iteration} fix-complete -->`;

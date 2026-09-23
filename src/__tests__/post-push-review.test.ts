@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { postPushReviewStep } from "../pipeline/steps/post-push-review.js";
 import { OperatorCancelledError, PrMergedError } from "../pipeline/operator-cancelled.js";
 import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
+import { classifyThrown } from "../pipeline/failure-classification.js";
 import type { ReviewerDefinition } from "../pipeline/reviewers/registry.js";
 import { REVIEWER_VERDICT_SCHEMA } from "../pipeline/reviewers/schema.js";
 
@@ -2923,6 +2924,204 @@ describe("postPushReviewStep", () => {
         { report: vi.fn(async () => undefined) },
       ),
     ).rejects.toThrow(/stale info/);
+  });
+
+  it("leases the fix-pass push on pushedSha, rejects a lease against a remote another writer moved, and classifies GIT_LEASE_REJECTED", async () => {
+    const notApproved = { approved: false, blocking_issues: [{ title: "x", problem: "x", required_fix: "x" }], feedback: "fix", score: 4, progress_delta: 0 };
+    const pushCalls: string[][] = [];
+    const lsRemoteCalls: string[][] = [];
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "status") return { stdout: "M file.ts\n", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "--short") return { stdout: "abc1234\n", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "ai-implement/aii-744-x\n", exitCode: 0 };
+      if (args[0] === "ls-remote") {
+        lsRemoteCalls.push(args);
+        // Simulates a concurrent writer: the remote moved to "deadb0b0", not "aaaaaaa" (pushedSha).
+        return { stdout: "deadb0b0\trefs/heads/ai-implement/aii-744-x\n", exitCode: 0 };
+      }
+      if (args[0] === "push") {
+        pushCalls.push(args);
+        return { stdout: "", stderr: "! [rejected] ai-implement/aii-744-x -> ai-implement/aii-744-x (stale info)", exitCode: 1 };
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const ghSpawn = vi.fn(() => ({ stdout: "diff", exitCode: 0 }));
+    const ctx = makeCtx(vi.fn(async () => (structuredReviewResult(notApproved))));
+
+    let caught: (Error & { failure?: unknown }) | undefined;
+    try {
+      await postPushReviewStep.run(
+        ctx,
+        { prNumber: "42", workspaceDir: "/tmp", maxIterations: 3, ghSpawn, gitSpawn, pushedSha: "aaaaaaa" },
+        { report: vi.fn(async () => undefined) },
+      );
+    } catch (err) {
+      caught = err as typeof caught;
+    }
+
+    expect(caught).toBeDefined();
+    expect(pushCalls).toHaveLength(1);
+    expect(pushCalls[0]).toContain("--force-with-lease=refs/heads/ai-implement/aii-744-x:aaaaaaa");
+    expect(lsRemoteCalls).toHaveLength(1); // only the post-rejection lookup for the error message, never for the lease itself
+    expect(caught!.message).toContain("stale info");
+    expect(caught!.message).toContain("aaaaaaa");
+    expect(caught!.message).toContain("deadb0b0");
+    const failure = classifyThrown(caught, { stage: "post-push-review", attempt: 1 });
+    expect(failure.code).toBe("GIT_LEASE_REJECTED");
+  });
+
+  it("throws the original push failure, not a lease-conflict message, when the diagnostic ls-remote also fails", async () => {
+    const notApproved = { approved: false, blocking_issues: [{ title: "x", problem: "x", required_fix: "x" }], feedback: "fix", score: 4, progress_delta: 0 };
+    const pushCalls: string[][] = [];
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "status") return { stdout: "M file.ts\n", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "--short") return { stdout: "abc1234\n", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "ai-implement/aii-744-x\n", exitCode: 0 };
+      if (args[0] === "ls-remote") {
+        return { stdout: "", stderr: "fatal: unable to access: Could not resolve host", exitCode: 128 };
+      }
+      if (args[0] === "push") {
+        pushCalls.push(args);
+        return { stdout: "", stderr: "remote: 403 Forbidden", exitCode: 1 };
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const ghSpawn = vi.fn(() => ({ stdout: "diff", exitCode: 0 }));
+    const ctx = makeCtx(vi.fn(async () => (structuredReviewResult(notApproved))));
+
+    let caught: (Error & { failure?: unknown }) | undefined;
+    try {
+      await postPushReviewStep.run(
+        ctx,
+        { prNumber: "42", workspaceDir: "/tmp", maxIterations: 3, ghSpawn, gitSpawn, pushedSha: "aaaaaaa" },
+        { report: vi.fn(async () => undefined) },
+      );
+    } catch (err) {
+      caught = err as typeof caught;
+    }
+
+    expect(caught).toBeDefined();
+    expect(pushCalls).toHaveLength(1);
+    expect(caught!.message).toBe("git push --force-with-lease rejected: remote: 403 Forbidden");
+    expect(caught!.message).not.toContain("stale info");
+    const failure = classifyThrown(caught, { stage: "post-push-review", attempt: 1 });
+    expect(failure.code).not.toBe("GIT_LEASE_REJECTED");
+    warnSpy.mockRestore();
+  });
+
+  it("does not classify an auth-style rejection as a lease conflict when the remote SHA still matches the lease", async () => {
+    const notApproved = { approved: false, blocking_issues: [{ title: "x", problem: "x", required_fix: "x" }], feedback: "fix", score: 4, progress_delta: 0 };
+    const pushCalls: string[][] = [];
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "status") return { stdout: "M file.ts\n", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "--short") return { stdout: "abc1234\n", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "ai-implement/aii-744-x\n", exitCode: 0 };
+      if (args[0] === "ls-remote") {
+        // The remote never moved: this was an auth failure, not a lease conflict.
+        return { stdout: "aaaaaaa\trefs/heads/ai-implement/aii-744-x\n", exitCode: 0 };
+      }
+      if (args[0] === "push") {
+        pushCalls.push(args);
+        return { stdout: "", stderr: "remote: Permission to org/repo.git denied to ai-implement[bot]", exitCode: 1 };
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const ghSpawn = vi.fn(() => ({ stdout: "diff", exitCode: 0 }));
+    const ctx = makeCtx(vi.fn(async () => (structuredReviewResult(notApproved))));
+
+    let caught: (Error & { failure?: unknown }) | undefined;
+    try {
+      await postPushReviewStep.run(
+        ctx,
+        { prNumber: "42", workspaceDir: "/tmp", maxIterations: 3, ghSpawn, gitSpawn, pushedSha: "aaaaaaa" },
+        { report: vi.fn(async () => undefined) },
+      );
+    } catch (err) {
+      caught = err as typeof caught;
+    }
+
+    expect(caught).toBeDefined();
+    expect(pushCalls).toHaveLength(1);
+    expect(caught!.message).toBe(
+      "git push --force-with-lease rejected: remote: Permission to org/repo.git denied to ai-implement[bot]",
+    );
+    expect(caught!.message).not.toContain("stale info");
+    const failure = classifyThrown(caught, { stage: "post-push-review", attempt: 1 });
+    expect(failure.code).not.toBe("GIT_LEASE_REJECTED");
+    expect(failure.code).toBe("GIT_AUTH");
+  });
+
+  it("advances the fix-pass lease to the run's own last-pushed commit across iterations", async () => {
+    const notApproved = { approved: false, blocking_issues: [{ title: "x", problem: "x", required_fix: "x" }], feedback: "fix", score: 4, progress_delta: 0 };
+    const pushCalls: string[][] = [];
+    let headCallCount = 0;
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "status") return { stdout: "M file.ts\n", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "--short") return { stdout: "abc1234\n", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "ai-implement/aii-744-x\n", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "HEAD") {
+        headCallCount++;
+        return { stdout: `fixcommit${headCallCount}\n`, exitCode: 0 };
+      }
+      if (args[0] === "ls-remote") throw new Error("ls-remote must not be consulted while a pushedSha lease is active");
+      if (args[0] === "push") {
+        pushCalls.push(args);
+        return { stdout: "", exitCode: 0 };
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const ghSpawn = vi.fn(() => ({ stdout: "diff", exitCode: 0 }));
+    const ctx = makeCtx(vi.fn(async () => (structuredReviewResult(notApproved))));
+
+    await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 3, ghSpawn, gitSpawn, pushedSha: "aaaaaaa" },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(pushCalls).toHaveLength(2);
+    expect(pushCalls[0]).toContain("--force-with-lease=refs/heads/ai-implement/aii-744-x:aaaaaaa");
+    expect(pushCalls[1]).toContain("--force-with-lease=refs/heads/ai-implement/aii-744-x:fixcommit1");
+  });
+
+  it("falls back to ls-remote and logs once when pushedSha is absent", async () => {
+    const notApproved = { approved: false, blocking_issues: [{ title: "x", problem: "x", required_fix: "x" }], feedback: "fix", score: 4, progress_delta: 0 };
+    const pushCalls: string[][] = [];
+    const lsRemoteCalls: string[][] = [];
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "status") return { stdout: "M file.ts\n", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "--short") return { stdout: "abc1234\n", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "ai-implement/aii-744-x\n", exitCode: 0 };
+      if (args[0] === "ls-remote") {
+        lsRemoteCalls.push(args);
+        return { stdout: "beadfeed\trefs/heads/ai-implement/aii-744-x\n", exitCode: 0 };
+      }
+      if (args[0] === "push") {
+        pushCalls.push(args);
+        return { stdout: "", exitCode: 0 };
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const ghSpawn = vi.fn(() => ({ stdout: "diff", exitCode: 0 }));
+    const ctx = makeCtx(vi.fn(async () => (structuredReviewResult(notApproved))));
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 3, ghSpawn, gitSpawn },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(pushCalls).toHaveLength(2);
+    expect(lsRemoteCalls).toHaveLength(2);
+    expect(pushCalls[0]).toContain("--force-with-lease=refs/heads/ai-implement/aii-744-x:beadfeed");
+    expect(pushCalls[1]).toContain("--force-with-lease=refs/heads/ai-implement/aii-744-x:beadfeed");
+    const fallbackLogs = warnSpy.mock.calls.filter((call) =>
+      call.some((arg) => typeof arg === "string" && arg.includes("No pushedSha input; lease falls back to ls-remote")),
+    );
+    expect(fallbackLogs).toHaveLength(1);
+    warnSpy.mockRestore();
   });
 
   it("stops without pushing when the fix pass makes no changes", async () => {

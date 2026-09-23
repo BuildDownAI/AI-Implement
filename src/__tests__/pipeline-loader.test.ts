@@ -368,6 +368,38 @@ describe("loadPipelineDefinition", () => {
     expect(inputs.trustedConfigReviewerDefinitions).toBe(trustedConfigReviewerDefinitions);
   });
 
+  it("wires the push step's commitSha through as post-push-review's pushedSha lease seed", () => {
+    const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: (_path, _enc) => BUILTIN_PIPELINE_YAML,
+    });
+
+    const ctx = makeContext();
+    ctx.setOutputs("clone", { workspaceDir: "/tmp/repo" });
+    ctx.setOutputs("install", { reviewProviders: ["github-claude-code-review"] });
+    ctx.setOutputs("push", { prNumber: 42, branchPushed: true, commitSha: "deadbeef" });
+
+    const step = pipeline.steps.find((s) => s.id === "post-push-review")!;
+    const inputs = ctx.resolveInputs(step.inputs);
+    expect(inputs.pushedSha).toBe("deadbeef");
+  });
+
+  it("leaves post-push-review's pushedSha undefined when the push step reports a null commitSha", () => {
+    const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: (_path, _enc) => BUILTIN_PIPELINE_YAML,
+    });
+
+    const ctx = makeContext();
+    ctx.setOutputs("clone", { workspaceDir: "/tmp/repo" });
+    ctx.setOutputs("install", { reviewProviders: ["github-claude-code-review"] });
+    ctx.setOutputs("push", { prNumber: 42, branchPushed: true, commitSha: null });
+
+    const step = pipeline.steps.find((s) => s.id === "post-push-review")!;
+    const inputs = ctx.resolveInputs(step.inputs);
+    expect(inputs.pushedSha).toBeUndefined();
+  });
+
   it("preserves an explicit empty reviewer selection for post-push-review", () => {
     const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
       existsSyncImpl: () => false,
