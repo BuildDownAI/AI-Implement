@@ -15,7 +15,7 @@ import { resolveWorkflowCapabilities, resolveWorkflowContract } from "./workflow
 import { surfaceDispatchFailure } from "./dispatch-failure.js";
 import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
 import { dispatchLocalGapfill } from "./local-gapfill.js";
-import { getLatestDispatchForPr } from "./log.js";
+import { getLatestDispatchForPr, getLatestPrUrlForIssue } from "./log.js";
 import type { TicketingProvider, IssueLifecycleState, FeatureNodeRollUp } from "./providers/types.js";
 import type { TicketIssue } from "./providers/types.js";
 import { rememberCandidates, resolveInFlightSiblings, selectIssuesToDispatch, selectFileOverlapDeferrals, getOrFetchPlanningContexts } from "./poll-selection.js";
@@ -90,7 +90,7 @@ import { resolveBaseBranch, findOpenRollUpPr } from "./feature-branch.js";
 import { validateIssueBaseBranch, postBranchComment } from "./base-branch.js";
 import { runMergeUps, clearRollUpHandledMarkersByIdentifier } from "./merge-up.js";
 import { runGroupingBranchAutoMerge } from "./auto-merge.js";
-import { getPendingReviewFixes, recordReviewFixDispatch, updateReviewFixStatus, shouldSkipReviewFix } from "./review-fix-queue.js";
+import { getPendingReviewFixes, recordReviewFixDispatch, updateReviewFixStatus, shouldSkipReviewFix, enqueueReviewFix } from "./review-fix-queue.js";
 import { drainCommentGapfillQueue } from "./comment-gapfill-drain.js";
 import { sweepOrphanedGapfillRows } from "./comment-gapfill-queue.js";
 import { processPendingWorkflowSyncs } from "./workflow-sync-queue.js";
@@ -289,6 +289,62 @@ function isGroupingParentDispatch(issue: DispatchableIssue): boolean {
   const chain = issue.featureBranchChain;
   if (!chain || chain.length === 0) return false;
   return chain[chain.length - 1].identifier === issue.identifier;
+}
+
+/** Parses a stored PR URL of the shape https://github.com/<owner>/<repo>/pull/<n>. Returns
+ *  null for anything else, so a malformed record falls through to "no PR" rather than
+ *  throwing and aborting the whole poll tick. */
+function parseGitHubPrUrl(url: string): { owner: string; repo: string; prNumber: number } | null {
+  const m = /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/.exec(url);
+  if (!m) return null;
+  return { owner: m[1]!, repo: m[2]!, prNumber: Number(m[3]) };
+}
+
+/**
+ * AII-752: an issue with an open PR must never get a fresh implementation dispatch — the
+ * initial run's push leases against the remote SHA it reads just before pushing
+ * (pipeline/steps/push.ts), so a fresh run force-overwrites the open PR's branch. Looks up
+ * the issue's newest recorded PR and, when it is still open, routes the issue to a
+ * review-fix run instead. Never called for planning dispatches.
+ * Returns true when the caller must skip dispatching an implementation this tick.
+ */
+export async function guardOpenPrBeforeImplementationDispatch(
+  ghToken: string,
+  issue: DispatchableIssue,
+): Promise<boolean> {
+  const prUrl = getLatestPrUrlForIssue(issue.id);
+  if (!prUrl) return false;
+
+  const parsed = parseGitHubPrUrl(prUrl);
+  if (!parsed) return false;
+
+  const prState = await getPullRequestState(ghToken, parsed.owner, parsed.repo, parsed.prNumber);
+  if (prState === null) {
+    console.log(`[poll] ${issue.identifier}: PR state unavailable; retrying next poll`);
+    return true;
+  }
+
+  if (prState.merged) {
+    console.log(`[poll] ${issue.identifier}: PR #${parsed.prNumber} is merged; skipping dispatch, reconciliation will complete the issue`);
+    return true;
+  }
+
+  if (prState.state === "open") {
+    enqueueReviewFix({
+      issueId: issue.id,
+      issueIdentifier: issue.identifier,
+      repo: `${parsed.owner}/${parsed.repo}`,
+      prNumber: parsed.prNumber,
+      reason: "open_pr",
+      actor: null,
+    });
+    markDispatched(issue.id, issue.identifier, issue.title);
+    console.log(`[poll] ${issue.identifier} has open PR #${parsed.prNumber}; routed to a review-fix run`);
+    return true;
+  }
+
+  // Closed, not merged — a human closed the PR to start over. Today's behavior: dispatch.
+  return false;
 }
 
 async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void> {
@@ -628,6 +684,13 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
           // dispatches agree on one base, and never creates the branch twice. The token
           // is per-owner cached, so the in-dispatch-fn fetches below are cache hits.
           const baseGhToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
+
+          // AII-752: an issue with an already-open PR is never re-implemented — route it
+          // to a review-fix run instead. Checked before any of the dispatch prep below so
+          // a redirected issue doesn't also validate/resolve a base branch it won't use.
+          if (await guardOpenPrBeforeImplementationDispatch(baseGhToken, issue)) {
+            continue;
+          }
 
           // Validate the "AI-Implement Base Branch" field before dispatch. On refusal
           // markImplementationFailed has already been called — skip this issue.
