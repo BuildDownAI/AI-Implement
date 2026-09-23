@@ -1850,6 +1850,22 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
     // Every disposition read from the fix agent's dispositions file across every push this
     // run, keyed by findingKey so a later push's entry for the same key overwrites an earlier one.
     const findingDispositionsByKey = new Map<string, FindingDisposition>();
+    // Reads and applies the fix agent's dispositions file (reply to threads, defer follow-ups,
+    // record for outputs), then deletes it so a later iteration never re-reads a stale file.
+    // Called both after a successful push and when the fix pass made no pushable change —
+    // dispositioning an out-of-scope external finding as "follow-up" is itself a complete,
+    // no-code-change outcome (AII-751), so it cannot be gated on a push happening at all.
+    function applyFixPassDispositions(): void {
+      const { valid: dispositions } = readFindingDispositions(inputs.workspaceDir);
+      fs.rmSync(path.join(inputs.workspaceDir, DISPOSITIONS_FILE), { force: true });
+      for (const disposition of dispositions) {
+        findingDispositionsByKey.set(disposition.findingKey, disposition);
+      }
+      replyToDispositionThreads(ghSpawn, prNumber, dispositions);
+      for (const disposition of dispositions) {
+        if (disposition.disposition === "follow-up") deferredKeys.add(disposition.findingKey);
+      }
+    }
 
     try {
     assertPrWritable(ghSpawn, prNumber);
@@ -2389,6 +2405,22 @@ ${externalFindingsFixBlock}
       const status = gitSpawn(["status", "--porcelain"]);
       if (status.exitCode !== 0) throw new Error(`git status failed: ${resultMessage(status)}`);
       if (!status.stdout.trim()) {
+        if (hasGatingExternalFindings) applyFixPassDispositions();
+        const remainingGatingExternalFindings = gatingExternalFindings
+          .filter((finding) => !deferredKeys.has(stableReviewFindingKey(finding)));
+        if (hasGatingExternalFindings && issues.length === 0 && remainingGatingExternalFindings.length === 0) {
+          // Every gating item was an external finding, and the fix agent dispositioned all
+          // of them instead of touching code — a complete outcome with nothing to push. Let
+          // the next iteration's review re-evaluate rather than failing this pass as no_changes.
+          const marker = `<!-- ai-implement post-push iter=${iteration} dispositions-only -->`;
+          postPrComment(
+            ghSpawn,
+            prNumber,
+            `${marker}\nℹ️ Fix pass ${fixPassLabel(iteration, maxIterations)} made no code changes; disposed of ${gatingExternalFindings.length} external finding(s) instead.\n\n**Merge readiness:** Not ready to merge; re-reviewing.`,
+            marker,
+          );
+          continue;
+        }
         terminationReason = "no_changes";
         const marker = `<!-- ai-implement post-push iter=${iteration} no-changes -->`;
         const reviewUrl = submitPrReview(
@@ -2469,20 +2501,10 @@ ${externalFindingsFixBlock}
       }
 
       // Only asked the fix agent for dispositions when it saw gating external findings — no
-      // file is expected otherwise. Read, then delete, so a later iteration's read never picks
-      // up this pass's (or a stale) file. Runs only once the push above has succeeded (AII-751):
-      // a failed push throws above and reaches none of this.
-      if (hasGatingExternalFindings) {
-        const { valid: dispositions } = readFindingDispositions(inputs.workspaceDir);
-        fs.rmSync(path.join(inputs.workspaceDir, DISPOSITIONS_FILE), { force: true });
-        for (const disposition of dispositions) {
-          findingDispositionsByKey.set(disposition.findingKey, disposition);
-        }
-        replyToDispositionThreads(ghSpawn, prNumber, dispositions);
-        for (const disposition of dispositions) {
-          if (disposition.disposition === "follow-up") deferredKeys.add(disposition.findingKey);
-        }
-      }
+      // file is expected otherwise. Runs only once the push above has succeeded (AII-751): a
+      // failed push throws above and reaches none of this. The no-changes branch above covers
+      // the case where the fix pass had nothing to push at all.
+      if (hasGatingExternalFindings) applyFixPassDispositions();
 
       forcePushed++;
       const marker = `<!-- ai-implement post-push iter=${iteration} fix-complete -->`;

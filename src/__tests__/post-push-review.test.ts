@@ -5966,6 +5966,45 @@ Minor issue worth addressing.
     }
   });
 
+  it("resolves a follow-up disposition's thread and drops the finding from gating even when the fix pass makes no code changes", async () => {
+    const workspaceDir = makeWorkspaceDir();
+    try {
+      writeDispositionsFile(workspaceDir, [{ findingKey, disposition: "follow-up", reason: "Indexing is out of scope for this issue." }]);
+      const { ghSpawn, ghComments, graphqlCalls } = ghSpawnWithOneExternalFinding();
+      const cleanInternalReview = { approved: true, blocking_issues: [], feedback: "", score: 9, progress_delta: 0 };
+      const invoke = vi.fn(async () => structuredReviewResult(cleanInternalReview));
+      // Unlike makeGitSpawn(), "status" is empty: the fix agent only wrote the (git-excluded)
+      // dispositions file and made no other tracked change — the feature's core no-op-fix case.
+      const gitSpawn = vi.fn((args: string[]) => {
+        if (args[0] === "status") return { stdout: "", exitCode: 0 };
+        if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "fix-branch\n", exitCode: 0 };
+        return { stdout: "", exitCode: 0 };
+      });
+
+      const out = await postPushReviewStep.run(
+        makeCtx(invoke),
+        { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
+        { report: vi.fn(async () => undefined) },
+      );
+
+      const replyCall = graphqlCalls.find((call) => call.includes("threadId=RT_1") && call.some((a) => a.includes("addPullRequestReviewThreadReply")));
+      expect(replyCall).toBeTruthy();
+      const resolveCall = graphqlCalls.find((call) => call.includes("threadId=RT_1") && call.some((a) => a.includes("resolveReviewThread")));
+      expect(resolveCall).toBeTruthy();
+      expect(fs.existsSync(path.join(workspaceDir, DISPOSITIONS_FILE))).toBe(false);
+
+      // The no-op fix pass does not fail the run: the loop re-reviews, finds the deferred
+      // finding no longer gating, and approves on iteration 2 instead of stopping as no_changes.
+      expect(out.terminationReason).toBe("approved");
+      expect(out.approved).toBe(true);
+      expect(invoke).toHaveBeenCalledTimes(3);
+      const dispositionsOnlyComment = ghComments.find((comment) => comment.includes("made no code changes"));
+      expect(dispositionsOnlyComment).toBeTruthy();
+    } finally {
+      fs.rmSync(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
   it("keeps an invalid disposition's finding gating on the next iteration and does not resolve its thread (AC3)", async () => {
     const workspaceDir = makeWorkspaceDir();
     try {
@@ -5991,6 +6030,37 @@ Minor issue worth addressing.
       // whether the finding still gates. It does, so the run stops on the review cap instead.
       expect(out.approved).toBe(false);
       expect(invokePrompt(invoke, 1)).toContain(findingKey);
+    } finally {
+      fs.rmSync(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("still stops the loop as no_changes when an invalid disposition leaves the finding gating and the fix pass made no code changes", async () => {
+    const workspaceDir = makeWorkspaceDir();
+    try {
+      writeDispositionsFile(workspaceDir, [{ findingKey, disposition: "invalid", reason: "The index already exists." }]);
+      const { ghSpawn, graphqlCalls } = ghSpawnWithOneExternalFinding();
+      const cleanInternalReview = { approved: true, blocking_issues: [], feedback: "", score: 9, progress_delta: 0 };
+      const invoke = vi.fn(async () => structuredReviewResult(cleanInternalReview));
+      const gitSpawn = vi.fn((args: string[]) => {
+        if (args[0] === "status") return { stdout: "", exitCode: 0 };
+        if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "fix-branch\n", exitCode: 0 };
+        return { stdout: "", exitCode: 0 };
+      });
+
+      const out = await postPushReviewStep.run(
+        makeCtx(invoke),
+        { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
+        { report: vi.fn(async () => undefined) },
+      );
+
+      // The disposition is still processed (reply posted, thread left unresolved)...
+      const resolveCall = graphqlCalls.find((call) => call.includes("threadId=RT_1") && call.some((a) => a.includes("resolveReviewThread")));
+      expect(resolveCall).toBeUndefined();
+      // ...but since the finding still gates and no code changed, the pass fails as no_changes
+      // rather than silently looping.
+      expect(out.terminationReason).toBe("no_changes");
+      expect(out.approved).toBe(false);
     } finally {
       fs.rmSync(workspaceDir, { recursive: true, force: true });
     }
