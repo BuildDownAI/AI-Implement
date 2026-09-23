@@ -29,6 +29,8 @@ The post-run half is **entirely webhook-driven**. Three GitHub event subscriptio
 
 Every path additionally requires a **matching dispatch record**: the orchestrator looks up the PR against its own dispatch log, and ignores anything it did not create. Reviews on unrelated PRs in the same repo are not picked up.
 
+Past the matching-dispatch check, `shouldEnqueueReviewEvent` gates all three events one more way: a **bot-authored** event (`user.type == "Bot"`) enqueues only when it describes the PR's *current* head SHA (`commit_id` / `comment.commit_id` equals `pull_request.head.sha`) **and** no run has been dispatched on the PR since the event's timestamp — otherwise a bot reviewing the fix run's own push would enqueue another run, looping. A human-authored event always enqueues, and an event whose body carries the orchestrator's own review marker never does, regardless of author. See ADR 027.
+
 ## Finding identity
 
 A finding's identity is a SHA-256 over its source, path, line, and **normalized** body — whitespace collapsed and lowercased (`stableReviewFindingKey`). The table is unique on `(repo, pr_number, finding_key)`.
