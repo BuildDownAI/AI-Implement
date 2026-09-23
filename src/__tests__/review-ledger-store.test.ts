@@ -65,6 +65,12 @@ describe("review ledger store", () => {
     ]);
   });
 
+  it("re-exports stableReviewFindingKey unchanged after the move to finding-dispositions.ts", () => {
+    expect(
+      store.stableReviewFindingKey({ source: "github-review", severity: "blocking", body: "Fix the validation." }),
+    ).toBe("ec9106e87e088d48b108fee8fd1359ee9b71f51818b77106c502fce245a3687a");
+  });
+
   it("resolves open findings for a PR", () => {
     store.upsertReviewFinding({
       repo: "org/repo",

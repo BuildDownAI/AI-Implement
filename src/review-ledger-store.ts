@@ -1,6 +1,8 @@
-import crypto from "node:crypto";
 import { getDb } from "./dedup.js";
+import { stableReviewFindingKey } from "./pipeline/finding-dispositions.js";
 import type { ReviewLedgerFinding, ReviewLedgerSeverity, ReviewLedgerSource } from "./pipeline/review-ledger.js";
+
+export { stableReviewFindingKey };
 
 export interface StoredReviewFinding extends ReviewLedgerFinding {
   id: number;
@@ -33,16 +35,6 @@ interface ReviewFindingRow {
   first_seen_at: number;
   last_seen_at: number;
   resolved_at: number | null;
-}
-
-export function stableReviewFindingKey(finding: ReviewLedgerFinding): string {
-  const material = [
-    finding.source,
-    finding.path ?? "",
-    typeof finding.line === "number" ? String(finding.line) : "",
-    normalizeBody(finding.body),
-  ].join("\n");
-  return crypto.createHash("sha256").update(material).digest("hex");
 }
 
 export function upsertReviewFinding(input: UpsertReviewFindingInput): number {
@@ -149,8 +141,4 @@ function mapRow(row: ReviewFindingRow): StoredReviewFinding {
     lastSeenAt: row.last_seen_at,
     resolvedAt: row.resolved_at,
   };
-}
-
-function normalizeBody(body: string): string {
-  return body.replace(/\s+/g, " ").trim().toLowerCase();
 }
