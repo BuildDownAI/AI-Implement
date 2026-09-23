@@ -3903,6 +3903,155 @@ describe("postPushReviewStep", () => {
     expect(warnings).toHaveLength(1);        // ...and was reported once, despite differing text
   });
 
+  it("reports CHECKS_PERMISSION_DENIED immediately on a 403 from the check-runs probe, without retrying (AII-736)", async () => {
+    // Unlike a transient read failure, a missing Checks: read grant will not clear on a later
+    // poll within the same run — retrying to the timeout would only waste the wait budget on an
+    // error that can never resolve itself.
+    const reviewerOutput = { approved: true, blocking_issues: [], feedback: "ok", score: 9, progress_delta: 0 };
+    const sleep = vi.fn(async () => undefined);
+    const ghComments: string[] = [];
+    let probes = 0;
+    const gitSpawn = vi.fn(() => ({ stdout: "", exitCode: 0 }));
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "api" && args.some((a) => a === "repos/:owner/:repo/pulls/42")) {
+        return { stdout: JSON.stringify({ head: { sha: "deadbeef" } }), exitCode: 0 };
+      }
+      if (args[0] === "api" && args.some((a) => a.includes("commits/deadbeef/check-runs"))) {
+        probes++;
+        return { stdout: "", exitCode: 1, stderr: "gh: Resource not accessible by integration (HTTP 403)" };
+      }
+      if (args[0] === "pr" && args[1] === "comment") {
+        ghComments.push(args[args.indexOf("--body") + 1]);
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => (structuredReviewResult(reviewerOutput)));
+    const ctx = makeCtx(invoke);
+
+    const out = await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn, sleep, reviewWaitPollMs: 1000, reviewWaitTimeoutMs: 300000 },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(false);
+    expect(out.terminationReason).toBe("checks_permission_denied");
+    expect(out.failure?.code).toBe("CHECKS_PERMISSION_DENIED");
+    expect(sleep).not.toHaveBeenCalled();
+    expect(probes).toBe(1);
+    const comment = ghComments.find((c) => c.includes("Checks: read"));
+    expect(comment).toBeDefined();
+    expect(comment).toContain("Manual review required");
+  });
+
+  it("reports CHECKS_PERMISSION_DENIED immediately on a 404 from the check-runs probe, treated as a permission error on a repo already read this run (AII-736)", async () => {
+    const reviewerOutput = { approved: true, blocking_issues: [], feedback: "ok", score: 9, progress_delta: 0 };
+    const sleep = vi.fn(async () => undefined);
+    const ghComments: string[] = [];
+    let probes = 0;
+    const gitSpawn = vi.fn(() => ({ stdout: "", exitCode: 0 }));
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "api" && args.some((a) => a === "repos/:owner/:repo/pulls/42")) {
+        return { stdout: JSON.stringify({ head: { sha: "deadbeef" } }), exitCode: 0 };
+      }
+      if (args[0] === "api" && args.some((a) => a.includes("commits/deadbeef/check-runs"))) {
+        probes++;
+        return { stdout: "", exitCode: 1, stderr: "gh: Not Found (HTTP 404)" };
+      }
+      if (args[0] === "pr" && args[1] === "comment") {
+        ghComments.push(args[args.indexOf("--body") + 1]);
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => (structuredReviewResult(reviewerOutput)));
+    const ctx = makeCtx(invoke);
+
+    const out = await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn, sleep, reviewWaitPollMs: 1000, reviewWaitTimeoutMs: 300000 },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(false);
+    expect(out.terminationReason).toBe("checks_permission_denied");
+    expect(out.failure?.code).toBe("CHECKS_PERMISSION_DENIED");
+    expect(sleep).not.toHaveBeenCalled();
+    expect(probes).toBe(1);
+    const comment = ghComments.find((c) => c.includes("Checks: read"));
+    expect(comment).toBeDefined();
+  });
+
+  it("keeps retrying a transient (non-permission) check-runs read failure until the timeout", async () => {
+    const reviewerOutput = { approved: true, blocking_issues: [], feedback: "ok", score: 9, progress_delta: 0 };
+    const sleep = vi.fn(async () => undefined);
+    let probes = 0;
+    const gitSpawn = vi.fn(() => ({ stdout: "", exitCode: 0 }));
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "api" && args.some((a) => a === "repos/:owner/:repo/pulls/42")) {
+        return { stdout: JSON.stringify({ head: { sha: "deadbeef" } }), exitCode: 0 };
+      }
+      if (args[0] === "api" && args.some((a) => a.includes("commits/deadbeef/check-runs"))) {
+        probes++;
+        return { stdout: "", exitCode: 1, stderr: "HTTP 503 Service Unavailable" };
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => (structuredReviewResult(reviewerOutput)));
+    const ctx = makeCtx(invoke);
+
+    const out = await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn, sleep, reviewWaitPollMs: 1000, reviewWaitTimeoutMs: 3000 },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.terminationReason).not.toBe("checks_permission_denied");
+    expect(sleep.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(probes).toBeGreaterThan(1);
+  });
+
+  it("does not treat a CI check-runs read failure as 'no failing checks' (AII-736)", async () => {
+    // The external-review wait loop's own probe succeeds (so it never short-circuits the run),
+    // but findFailingCiChecks' separate re-read of the same endpoint fails transiently. That
+    // failure must not be laundered into "no failing checks" — the run must not approve as if
+    // CI were verified green.
+    const reviewerOutput = { approved: true, blocking_issues: [], feedback: "Internal reviewer approves.", score: 9, progress_delta: 0 };
+    const ghComments: string[] = [];
+    const gitSpawn = vi.fn(() => ({ stdout: "", exitCode: 0 }));
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "api" && args.some((a) => a === "repos/:owner/:repo/pulls/42")) {
+        return { stdout: JSON.stringify({ head: { sha: "deadbeef" } }), exitCode: 0 };
+      }
+      if (args[0] === "api" && args.some((a) => a.includes("commits/deadbeef/check-runs"))) {
+        if (args.includes("--paginate")) {
+          return { stdout: JSON.stringify({ check_runs: [{ name: "claude-review", status: "completed", conclusion: "success" }] }), exitCode: 0 };
+        }
+        return { stdout: "", exitCode: 1, stderr: "HTTP 500 Internal Server Error" };
+      }
+      if (args[0] === "pr" && args[1] === "comment") {
+        ghComments.push(args[args.indexOf("--body") + 1]);
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => (structuredReviewResult(reviewerOutput)));
+    const ctx = makeCtx(invoke);
+
+    const out = await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn, sleep: vi.fn(async () => undefined), reviewWaitPollMs: 1000, reviewWaitTimeoutMs: 3000 },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(false);
+    expect(out.terminationReason).not.toBe("checks_permission_denied");
+    const comment = ghComments.find((c) => c.includes("could not be verified"));
+    expect(comment).toBeDefined();
+  });
+
   it("paginates the check-runs read and finds a match on a later page", async () => {
     // A bare per_page=100 truncates on a busy SHA, and a truncated page is indistinguishable
     // from "no reviewer" — which resolves to "absent" and fails OPEN. Pins both halves: that

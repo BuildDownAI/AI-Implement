@@ -711,6 +711,41 @@ describe("getCombinedChecksState", () => {
     );
     expect(await getCombinedChecksState("tok", "owner", "repo", "abc")).toBe("failure");
   });
+
+  it('does not return "success" when check-runs 403s, even with an empty/ok commit-status response (AII-736)', async () => {
+    // A check-runs read the App is not permitted to do is not evidence the checks passed —
+    // falling through to the unconditional "success" would let auto-merge merge a PR with red
+    // or running checks purely because the token could not read them.
+    vi.stubGlobal("fetch", vi.fn()
+      .mockResolvedValueOnce({ ok: false, status: 403, json: async () => ({ message: "Resource not accessible by integration" }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ state: "success", total_count: 0 }) }),
+    );
+    expect(await getCombinedChecksState("tok", "owner", "repo", "abc")).not.toBe("success");
+  });
+
+  it('returns "pending" specifically on a check-runs 403, matching the existing hold-and-continue branch in auto-merge.ts', async () => {
+    vi.stubGlobal("fetch", vi.fn()
+      .mockResolvedValueOnce({ ok: false, status: 403, json: async () => ({ message: "Resource not accessible by integration" }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ state: "success", total_count: 0 }) }),
+    );
+    expect(await getCombinedChecksState("tok", "owner", "repo", "abc")).toBe("pending");
+  });
+
+  it('returns "pending" specifically on a check-runs 404, treated as a permission error on a repo the token can otherwise see (AII-736)', async () => {
+    vi.stubGlobal("fetch", vi.fn()
+      .mockResolvedValueOnce({ ok: false, status: 404, json: async () => ({ message: "Not Found" }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ state: "success", total_count: 0 }) }),
+    );
+    expect(await getCombinedChecksState("tok", "owner", "repo", "abc")).toBe("pending");
+  });
+
+  it('does not return "success" on a transient, non-permission check-runs read failure (e.g. a 500), even with an empty/ok commit-status response (AII-736)', async () => {
+    vi.stubGlobal("fetch", vi.fn()
+      .mockResolvedValueOnce({ ok: false, status: 500, json: async () => ({ message: "Internal Server Error" }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ state: "success", total_count: 0 }) }),
+    );
+    expect(await getCombinedChecksState("tok", "owner", "repo", "abc")).toBe("pending");
+  });
 });
 
 describe("fetchRepoTarball", () => {

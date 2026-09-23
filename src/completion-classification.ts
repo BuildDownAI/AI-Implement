@@ -281,6 +281,34 @@ function reviewerTurnsExhaustedClassification(
 }
 
 /**
+ * CHECKS_PERMISSION_DENIED — a check-runs read (post-push review's external-review wait, or its
+ * CI gate) failed with a 403/"Resource not accessible by integration" rather than a transient
+ * error (AII-736). Not a code problem and not a timeout — the App's own permissions are the
+ * cause, so this bypasses CATEGORY_NEXT_STEPS's generic auth wording (which points at
+ * credentials, not a missing installation-level permission grant) for one that names the fix.
+ */
+function checksPermissionDeniedClassification(
+  failure: FailureRecord,
+  prUrl?: string,
+  runUrl?: string | null,
+  lastSuccessfulStage?: string | null,
+): Classification {
+  const detailParts: string[] = [];
+  const statusLine = statusLineFor(failure, lastSuccessfulStage);
+  if (statusLine) detailParts.push(statusLine);
+  detailParts.push(prUrl ? `The PR is open and ready for human review: ${prUrl}` : "No PR was opened.");
+  detailParts.push(`\`\`\`\n${evidenceExcerpt(failure)}\n\`\`\``);
+
+  return {
+    summary: "🔒 The GitHub App cannot read check runs on this repo.",
+    detail: detailParts.join("\n\n"),
+    remediation: "Grant Checks: read to the GitHub App and accept the updated permissions on the installation, then re-dispatch.",
+    docsUrl: TROUBLESHOOTING_URL,
+    ...(runUrl ? { runUrl } : {}),
+  };
+}
+
+/**
  * Builds the Classification for a structured terminal FailureRecord (BAC-27111).
  * Shared by `classifyCompletion` (monitor-detected terminal jobs) and
  * `formatFailureComment` (runner-callback) so both render byte-identical
@@ -316,6 +344,9 @@ export function classificationForFailure(
   }
   if (failure.code === "REVIEWER_TURNS_EXHAUSTED") {
     return reviewerTurnsExhaustedClassification(failure, prUrl, runUrl, lastSuccessfulStage);
+  }
+  if (failure.code === "CHECKS_PERMISSION_DENIED") {
+    return checksPermissionDeniedClassification(failure, prUrl, runUrl, lastSuccessfulStage);
   }
 
   const attemptSuffix = failure.attempt > 1 ? ` after ${failure.attempt} attempt(s)` : "";
