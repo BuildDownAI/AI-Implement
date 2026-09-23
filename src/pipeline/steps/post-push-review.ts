@@ -19,6 +19,7 @@ import {
 } from "../review-ledger.js";
 import { READ_ONLY_ALLOWED_TOOLS } from "./read-only-tools.js";
 import { REVIEWER_VERDICT_SCHEMA, resolveTrustedReviewer, type ReviewerDefinition, type ReviewerFinding, type ReviewerVerdict } from "../reviewers/registry.js";
+import { isChecksPermissionError } from "../../checks-permission.js";
 
 interface PostPushReviewInputs extends Record<string, unknown> {
   prNumber: string;
@@ -47,7 +48,7 @@ interface PostPushReviewInputs extends Record<string, unknown> {
   refreshCredentials?: () => Promise<void>;
 }
 
-type ExternalReviewState = "skipped" | "absent" | "running" | "completed";
+type ExternalReviewState = "skipped" | "absent" | "running" | "completed" | "permission-denied";
 type PostPushReviewTerminationReason =
   | "approved"
   | "pr_merged"
@@ -59,7 +60,8 @@ type PostPushReviewTerminationReason =
   | "external_review_pending"
   | "fix_failed"
   | "no_changes"
-  | "operator_cancelled";
+  | "operator_cancelled"
+  | "checks_permission_denied";
 
 interface PostPushReviewOutputs extends Record<string, unknown> {
   approved: boolean;
@@ -486,18 +488,38 @@ function internalReviewSummaryBlock(feedback: string): string {
   return `\n\nInternal review:\n${summary}`;
 }
 
+interface CiChecksReadResult {
+  failingChecks: string[];
+  /** True when the check-runs read failed — `failingChecks` is `[]`, but that is NOT evidence
+   *  CI is green. Distinguishes a genuine empty check-runs list from a read that never happened. */
+  unreadable: boolean;
+  /** True when `unreadable` was specifically a missing Checks: read permission, as opposed to a
+   *  transient read failure. */
+  permissionDenied: boolean;
+}
+
 function findFailingCiChecks(
   ghSpawn: (args: string[]) => SpawnResult,
   headSha: string,
   configuredCheckNames: string[] | undefined,
   excludeExternalReviewChecks = true,
-): string[] {
-  if (!headSha) return [];
+): CiChecksReadResult {
+  if (!headSha) return { failingChecks: [], unreadable: false, permissionDenied: false };
   const res = ghSpawn(["api", `repos/:owner/:repo/commits/${headSha}/check-runs?per_page=100`]);
-  if (res.exitCode !== 0) return [];
-  return parseCheckRuns(res.stdout)
-    .filter((run) => run.conclusion === "failure" && (!excludeExternalReviewChecks || !isExternalReviewCheckName(run.name, configuredCheckNames)))
-    .map((run) => run.name);
+  if (res.exitCode !== 0) {
+    // No console.warn here for the transient case: this re-reads the same endpoint the wait
+    // loop's probe already reads and warns on once per condition (see createWarnOnce) — a second,
+    // unconditional warning here would double-report the same outage. The read failure still
+    // reaches the caller via `unreadable` below rather than being reported as a clean run.
+    return { failingChecks: [], unreadable: true, permissionDenied: isChecksPermissionError({ text: res.stderr || res.stdout }) };
+  }
+  return {
+    failingChecks: parseCheckRuns(res.stdout)
+      .filter((run) => run.conclusion === "failure" && (!excludeExternalReviewChecks || !isExternalReviewCheckName(run.name, configuredCheckNames)))
+      .map((run) => run.name),
+    unreadable: false,
+    permissionDenied: false,
+  };
 }
 
 function shouldCollectExternalReviewFindings(reviewProviders: string[] | undefined): boolean {
@@ -596,7 +618,7 @@ function probeExternalReviewCheck(
   headSha: string,
   configuredCheckNames: string[] | undefined,
   warnOnce: WarnOnce,
-): "absent" | "running" | "completed" | "no-real-verdict" | "unreadable" {
+): "absent" | "running" | "completed" | "no-real-verdict" | "unreadable" | "permission-denied" {
   // --paginate --slurp, not a bare per_page=100: on a busy SHA the review check can fall
   // outside the first page, and a truncated page is indistinguishable from "no reviewer" —
   // which resolves to "absent" and fails OPEN. parseCheckRuns already accepts the array-of-
@@ -606,7 +628,17 @@ function probeExternalReviewCheck(
   // `gh api` to "absent" — which the caller fails OPEN on — lets one transient failure
   // auto-approve a PR nobody reviewed. Report it distinctly and let the wait loop keep
   // trying; the existing timeout still bounds it, and running out of budget fails CLOSED.
+  //
+  // A permission denial is a narrower case of the same unreadable state, but it must NOT
+  // follow that path: the read will never succeed on a later poll (the App's grant does not
+  // change mid-run), so retrying to the timeout only wastes the wait budget on an error that
+  // will never clear (AII-736). Reported as its own terminal state so the caller can stop
+  // waiting immediately instead.
   if (res.exitCode !== 0) {
+    if (isChecksPermissionError({ text: res.stderr || res.stdout })) {
+      warnOnce(`permission-denied:${headSha}`, `[post-push-review] Cannot read check runs at ${headSha}: the GitHub App lacks Checks: read, or the installation hasn't accepted updated permissions: ${res.stderr || `exit ${res.exitCode}`}`);
+      return "permission-denied";
+    }
     warnOnce(`unreadable:${headSha}`, `[post-push-review] Could not read check runs at ${headSha}: ${res.stderr || `exit ${res.exitCode}`}`);
     return "unreadable";
   }
@@ -703,6 +735,14 @@ async function waitForExternalReviewCompletion(
     const state = headSha
       ? probeExternalReviewCheck(ghSpawn, headSha, opts.configuredCheckNames, warnOnce)
       : "unreadable";
+
+    // Immediate, unambiguous terminal return — deliberately ahead of the sawMatching/
+    // pendingSettle machinery below. That machinery exists to avoid mistaking a single bad
+    // read for "absent" (fail open); a permission denial is neither transient nor ambiguous,
+    // so routing it through the same settling logic could let it be reinterpreted as "absent"
+    // on a later probe instead of stopping the wait right away (AII-736).
+    if (state === "permission-denied") return { state: "permission-denied", headSha };
+
     if (state === "running" || state === "completed" || state === "no-real-verdict") sawMatching = true;
 
     // Once matching runs have been seen, a later "absent" is a read artefact: check runs are
@@ -1679,6 +1719,51 @@ async function reportInvalidStructuredReview(
   );
 }
 
+const CHECKS_PERMISSION_DENIED_MESSAGE =
+  "The GitHub App cannot read check runs on this repo. Grant Checks: read to the App and accept the updated permissions on the installation.";
+
+/**
+ * Reports and posts the CHECKS_PERMISSION_DENIED terminal outcome — shared by the two call
+ * sites that can discover the permission is missing (the external-review wait loop and the CI
+ * check-runs read), so both fail closed with the same code, comment, and tracker message
+ * rather than one falling back to a generic "did not complete" (AII-736).
+ */
+async function reportChecksPermissionDenied(
+  reporter: StepReporter,
+  ghSpawn: (args: string[]) => SpawnResult,
+  prNumber: string,
+  iteration: number,
+): Promise<FailureRecord> {
+  const failure: FailureRecord = {
+    category: "auth",
+    code: "CHECKS_PERMISSION_DENIED",
+    stage: "post-push-review",
+    attempt: 1,
+    retryable: false,
+    message: CHECKS_PERMISSION_DENIED_MESSAGE,
+    evidence: { truncated: false },
+  };
+  await reporter.report({
+    id: `post-push-review.${iteration}`,
+    type: "custom",
+    status: "failed",
+    started_at: new Date().toISOString(),
+    ended_at: new Date().toISOString(),
+    parent_step_id: "post-push-review",
+    inputs: { iteration, prNumber },
+    outputs: { approved: false, feedback: CHECKS_PERMISSION_DENIED_MESSAGE, issues: [], blockingIssues: [], failure },
+    logs_url: null,
+  });
+  const marker = `<!-- ai-implement post-push iter=${iteration} checks-permission-denied -->`;
+  postPrComment(
+    ghSpawn,
+    prNumber,
+    `${marker}\n🔒 Post-push review could not verify check runs.\n\n${CHECKS_PERMISSION_DENIED_MESSAGE}\n\n**Merge readiness:** Manual review required; check runs could not be read.`,
+    marker,
+  );
+  return failure;
+}
+
 export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReviewOutputs> = {
   async run(context, inputs, reporter) {
     const ghSpawn = inputs.ghSpawn ?? makeDefaultGhSpawn(inputs.workspaceDir);
@@ -1882,6 +1967,16 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
             headSha: filesystemWithoutExternalReviewer ? (resolvePrHeadSha(ghSpawn, prNumber) ?? "") : "",
           };
       const externalReviewState = externalReviewResult.state;
+      // A permission error is stable for the run — the App's grant does not change mid-wait —
+      // so it gates closed immediately here rather than falling into the normal iteration flow
+      // below, which would otherwise report it as an ordinary "review did not complete" timeout
+      // (AII-736).
+      if (externalReviewState === "permission-denied") {
+        terminationReason = "checks_permission_denied";
+        feedback = CHECKS_PERMISSION_DENIED_MESSAGE;
+        reviewerFailure = await reportChecksPermissionDenied(reporter, ghSpawn, prNumber, iteration);
+        break;
+      }
       const externalReviewPending = externalReviewState === "running";
       const externalFindingsResult = externalReviewState === "skipped"
         ? { findings: [] as ReviewLedgerFinding[], findingsUnavailable: false }
@@ -1892,12 +1987,30 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       // CI gate: collect failing non-review checks so a red build can never produce
       // "Ready to merge". Filesystem projects still check CI when external review is
       // unconfigured, including CI jobs whose names happen to resemble review checks.
-      const failingCiChecks = ((externalReviewState !== "skipped" || filesystemWithoutExternalReviewer) && externalReviewResult.headSha)
+      const ciChecksResult = ((externalReviewState !== "skipped" || filesystemWithoutExternalReviewer) && externalReviewResult.headSha)
         ? findFailingCiChecks(ghSpawn, externalReviewResult.headSha, inputs.reviewCheckNames, !filesystemWithoutExternalReviewer)
-        : [];
+        : { failingChecks: [] as string[], unreadable: false, permissionDenied: false };
+
+      if (ciChecksResult.permissionDenied) {
+        terminationReason = "checks_permission_denied";
+        feedback = CHECKS_PERMISSION_DENIED_MESSAGE;
+        reviewerFailure = await reportChecksPermissionDenied(reporter, ghSpawn, prNumber, iteration);
+        break;
+      }
 
       const internalIssues = verdict.blockingIssues.map(issueFromVerdictIssue);
-      for (const checkName of failingCiChecks) {
+      if (ciChecksResult.unreadable) {
+        // A read failure is not "no failing checks" — asserting that here would let a red or
+        // unverifiable build slip through as clean (AII-736). Surfaced as an ordinary blocking
+        // issue so it flows through the same ledger/gating path "CI check failing" already uses,
+        // rather than silently approving on missing evidence.
+        internalIssues.push({
+          title: "CI check status could not be verified",
+          problem: `Could not read check runs at ${externalReviewResult.headSha} to determine whether CI checks passed.`,
+          requiredFix: "Investigate the check-runs read failure (transient API error or credential issue), then re-run review once check runs can be read.",
+        });
+      }
+      for (const checkName of ciChecksResult.failingChecks) {
         internalIssues.push({
           title: "CI check failing",
           problem: `CI check '${checkName}' is failing on the current head`,

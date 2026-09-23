@@ -209,7 +209,9 @@ A change that adds or alters an architectural feature must update the matching `
 
 The GitHub App needs **Workflows** permission alongside **Contents** — GitHub rejects writes under `.github/workflows/` without it, and the sync fails with "permission denied" before opening its PR. If the orchestrator restarts mid-sync, the poll loop reclaims the orphaned job after a stale window.
 
-The target repo's "Allow GitHub Actions to create and approve pull requests" toggle is **not** a prerequisite, despite older instructions saying so. Every synced workflow opens PRs with a **GitHub App token**, while that toggle governs the default `github-actions[bot]` actor — a different identity. Leaving it on is harmless; the real prerequisite is the App installed with contents, pull-requests, and workflows permissions.
+The App also needs **Checks: read**. Without it, every check-runs read (post-push review's wait for the external review check, its CI gate, and `getCombinedChecksState` for auto-merge) gets a 403 instead of data — reported as `CHECKS_PERMISSION_DENIED`, not a review timeout — and auto-merge holds affected PRs as pending rather than merging them blind. Granting the permission after the App is already installed requires the installation to accept the updated permission set, not just a settings change.
+
+The target repo's "Allow GitHub Actions to create and approve pull requests" toggle is **not** a prerequisite, despite older instructions saying so. Every synced workflow opens PRs with a **GitHub App token**, while that toggle governs the default `github-actions[bot]` actor — a different identity. Leaving it on is harmless; the real prerequisite is the App installed with contents, pull-requests, workflows, and checks permissions.
 
 `.github/workflows/sync-workflow.yml` remains a manual bulk fallback, but normal distribution happens from the orchestrator.
 

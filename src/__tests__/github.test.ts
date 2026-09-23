@@ -711,6 +711,25 @@ describe("getCombinedChecksState", () => {
     );
     expect(await getCombinedChecksState("tok", "owner", "repo", "abc")).toBe("failure");
   });
+
+  it('does not return "success" when check-runs 403s, even with an empty/ok commit-status response (AII-736)', async () => {
+    // A check-runs read the App is not permitted to do is not evidence the checks passed —
+    // falling through to the unconditional "success" would let auto-merge merge a PR with red
+    // or running checks purely because the token could not read them.
+    vi.stubGlobal("fetch", vi.fn()
+      .mockResolvedValueOnce({ ok: false, status: 403, json: async () => ({ message: "Resource not accessible by integration" }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ state: "success", total_count: 0 }) }),
+    );
+    expect(await getCombinedChecksState("tok", "owner", "repo", "abc")).not.toBe("success");
+  });
+
+  it('returns "pending" specifically on a check-runs 403, matching the existing hold-and-continue branch in auto-merge.ts', async () => {
+    vi.stubGlobal("fetch", vi.fn()
+      .mockResolvedValueOnce({ ok: false, status: 403, json: async () => ({ message: "Resource not accessible by integration" }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ state: "success", total_count: 0 }) }),
+    );
+    expect(await getCombinedChecksState("tok", "owner", "repo", "abc")).toBe("pending");
+  });
 });
 
 describe("fetchRepoTarball", () => {

@@ -450,6 +450,44 @@ describe("classificationForFailure — REVIEWER_TURNS_EXHAUSTED", () => {
   });
 });
 
+describe("classificationForFailure — CHECKS_PERMISSION_DENIED (AII-736)", () => {
+  function checksPermissionDeniedFailure(): FailureRecord {
+    return {
+      category: "auth",
+      code: "CHECKS_PERMISSION_DENIED",
+      stage: "post-push-review",
+      attempt: 1,
+      retryable: false,
+      message: "The GitHub App cannot read check runs on this repo.",
+      evidence: { truncated: false },
+    };
+  }
+
+  it("names the missing permission and the fix, not a generic unknown/timeout message", () => {
+    const c = classificationForFailure(checksPermissionDeniedFailure(), PR);
+    expect(c.summary).toContain("cannot read check runs");
+    expect(c.remediation).toContain("Checks: read");
+    expect(c.remediation).toContain("accept the updated permissions");
+    expect(c.summary).not.toContain("unknown");
+    expect(c.summary).not.toContain("UNKNOWN");
+    expect(c.summary).not.toContain("timed out");
+    expect(c.summary).not.toContain("time limit");
+  });
+
+  it("links the PR when present, and says no PR was opened when absent", () => {
+    expect(classificationForFailure(checksPermissionDeniedFailure(), PR).detail).toContain(PR);
+    expect(classificationForFailure(checksPermissionDeniedFailure(), undefined).detail).toContain(
+      "No PR was opened.",
+    );
+  });
+
+  it("carries the run URL through like the generic branch does", () => {
+    const c = classificationForFailure(checksPermissionDeniedFailure(), PR, "https://example.com/run/1");
+    expect(c.runUrl).toBe("https://example.com/run/1");
+    expect(c.docsUrl).toBe(TROUBLESHOOTING_URL);
+  });
+});
+
 describe("PROVIDER_UNAVAILABLE / REVIEWER_TURNS_EXHAUSTED — callback path equals monitor path (AII-647)", () => {
   it("renders byte-identically for PROVIDER_UNAVAILABLE with a draft PR (dirty tree)", () => {
     const failure: FailureRecord = {

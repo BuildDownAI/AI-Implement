@@ -2,6 +2,7 @@ import type { RepoMapping } from "./config.js";
 import { GitHubApiError } from "./github-errors.js";
 import { type RunConfigV1, encodeRunConfig } from "./run-config.js";
 import { DEFAULT_RETRY_POLICY, type RetryPolicy } from "./pipeline/retry-backoff.js";
+import { isChecksPermissionError } from "./checks-permission.js";
 
 export interface DispatchInputs {
   /** Legacy mode: per-field issue data. */
@@ -1086,6 +1087,12 @@ export async function listOpenPullRequests(
   }));
 }
 
+/** Repos for which a check-runs permission denial has already been logged this process —
+ *  auto-merge polls every open PR on every tick, and a missing Checks: read grant does not
+ *  clear itself between polls, so an unconditional warn would repeat once per PR per tick. */
+const checksPermissionDeniedLogged = new Set<string>();
+export function resetChecksPermissionDeniedLogging(): void { checksPermissionDeniedLogged.clear(); }
+
 export async function getCombinedChecksState(
   token: string, owner: string, repo: string, sha: string,
 ): Promise<"success" | "pending" | "failure"> {
@@ -1102,6 +1109,19 @@ export async function getCombinedChecksState(
       if (c.status !== "completed") return "pending";
       if (c.conclusion && FAIL.has(c.conclusion)) return "failure";
     }
+  } else if (isChecksPermissionError({ status: runsRes.status })) {
+    // A check-runs read we could not do is not evidence the checks passed — falling through to
+    // the unconditional "success" below would let auto-merge merge a PR with red or running
+    // checks purely because the token could not read them (AII-736). "pending" holds the PR
+    // the same way an in-progress check would, via the existing auto-merge.ts:84 branch.
+    const repoKey = `${owner}/${repo}`;
+    if (!checksPermissionDeniedLogged.has(repoKey)) {
+      checksPermissionDeniedLogged.add(repoKey);
+      console.warn(
+        `[github] Cannot read check runs for ${repoKey}: the GitHub App lacks Checks: read, or the installation hasn't accepted updated permissions. Holding PRs on this repo as pending until it's granted.`,
+      );
+    }
+    return "pending";
   }
   if (statusRes.ok) {
     const s = (await statusRes.json()) as { state?: string; total_count?: number };
