@@ -30,7 +30,7 @@ A Node.js service that polls Linear or Jira for issues that carry the pickup lab
 Bindings for the BuildDown skills (bd-build-up, bd-build-down, bd-summit-push, etc.). These are read by name — keep the keys intact when editing.
 
 - tracker.kind: linear
-- MCP server: `linear-eudoxus` (declared in the project `.mcp.json`, which is **gitignored** — copy `.mcp.json.example` to `.mcp.json` on a fresh clone and add any machine-local servers there. Also **not** pre-approved: `.claude/` is gitignored and absent here, so each machine approves the server on first use)
+- MCP server: the global claude.ai **Linear** connector (`https://mcp.linear.app/mcp`), not a project `.mcp.json` entry. Confirm it reaches `Eudoxus` with `get_workspace` before any write
 - Workspace: `eudoxus` (bound at OAuth time)
 - Team: `AII`  ← issues filed/listed/searched against this team
 - Team URL: https://linear.app/eudoxus/team/AII/overview
@@ -48,11 +48,8 @@ Bindings for the KG skills (bd-kg-search, kg recon — format: skills `plugin/sk
 > resolve. Use the `bd-shared/` path in new references.
 
 - kg.present:      true
-- kg.orchestrator: https://ai-implement-testing-orchestrator.fly.dev
-- kg.mcp_server:   orch-ai-implement-testing
-- kg.search_tool:  mcp__orch-ai-implement-testing__kg_hybrid_search
-- kg.source_repo:  BuildDownAI/knowledge-graph-ai-implement
-- kg.prefer:       orchestrator
+
+The KG is served by the testing orchestrator's `/mcp` (`https://ai-implement-testing-orchestrator.fly.dev/mcp`), reached through a global claude.ai connector — no project `.mcp.json` entry and no local KG server. Skills discover the connector with ToolSearch `get_project_binding`, and that call returns the rest of the binding (search tool, source repo); the old `kg.mcp_server` / `kg.search_tool` / `kg.orchestrator` / `kg.source_repo` / `kg.prefer` keys are retired.
 
 Project-specific orchestrator instances can override the bundled graph with `KG_SOURCE_REPO=owner/repo`.
 The value is a GitHub repo identifier, not a URL; see `docs/kg-sidecar.md`.
