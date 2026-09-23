@@ -12,6 +12,8 @@ import { NoopStepReporter } from "../pipeline/reporter.js";
 import { encodeRunConfig } from "../run-config.js";
 import type { LLMExecutor, PipelineDefinition, StepModule } from "../pipeline/types.js";
 import { __resetPublicationCredentialForTests } from "../publication-credential.js";
+import { DISPOSITIONS_FILE, stableReviewFindingKey, type FindingDisposition } from "../pipeline/finding-dispositions.js";
+import type { GhSpawn } from "../pipeline/review-ledger.js";
 
 const REQUIRED_ENV: Record<string, string> = {
   ISSUE_ID: "issue-abc",
@@ -2235,6 +2237,272 @@ describe("runAutonomous", () => {
       expect(result.exitCode).toBe(0);
       expect(feedbackMod.run).toHaveBeenCalledOnce();
       expect(pushMod.run).toHaveBeenCalledOnce();
+    });
+  });
+
+  describe("finding dispositions", () => {
+    // Mirrors replyToDispositionThreads' own test fixture (finding-dispositions.test.ts):
+    // a single unresolved thread whose body/path/line match the disposition's findingKey.
+    function makeGhSpawn(threadBody: string, threadPath: string, threadLine: number): { ghSpawn: GhSpawn; calls: string[][] } {
+      const calls: string[][] = [];
+      const ghSpawn: GhSpawn = (args) => {
+        calls.push(args);
+        if (args.some((a) => a.includes("addPullRequestReviewThreadReply"))) {
+          return { exitCode: 0, stdout: JSON.stringify({ data: { addPullRequestReviewThreadReply: { comment: { id: "IC_1" } } } }) };
+        }
+        if (args.some((a) => a.includes("resolveReviewThread"))) {
+          return { exitCode: 0, stdout: JSON.stringify({ data: { resolveReviewThread: { thread: { id: "RT_1" } } } }) };
+        }
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            data: {
+              repository: {
+                pullRequest: {
+                  reviewThreads: {
+                    nodes: [
+                      { id: "RT_1", isResolved: false, path: threadPath, line: threadLine, comments: { nodes: [{ body: threadBody }] } },
+                    ],
+                    pageInfo: { hasNextPage: false, endCursor: null },
+                  },
+                },
+              },
+            },
+          }),
+        };
+      };
+      return { ghSpawn, calls };
+    }
+
+    it("gap-fill run's prompt contains the disposition instructions exactly once", async () => {
+      vi.stubEnv("PR_NUMBER", "42");
+
+      let capturedPrompt: string | undefined;
+      const mod: StepModule = {
+        run: vi.fn(async (ctx) => {
+          capturedPrompt = ctx.data.implementationPrompt;
+          return {};
+        }),
+      };
+      const { pipeline, runner } = makeSingleStepPipeline("check-prompt", mod);
+
+      await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeMockExecutor(0),
+      });
+
+      expect(capturedPrompt?.match(/## Finding dispositions/g)).toHaveLength(1);
+    });
+
+    it("a gap-fill run that pushed and wrote a dispositions file posts thread replies and sends dispositions on the callback", async () => {
+      vi.stubEnv("PR_NUMBER", "42");
+      vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+      vi.stubEnv("RUN_TOKEN", "run-token");
+
+      const threadBody = "Missing null check.";
+      const threadPath = "src/app.ts";
+      const threadLine = 10;
+      const findingKey = stableReviewFindingKey({
+        source: "github-review-thread",
+        severity: "medium",
+        body: threadBody,
+        path: threadPath,
+        line: threadLine,
+      });
+      mkdirSync(join(workspaceDir, "ai-output"), { recursive: true });
+      writeFileSync(
+        join(workspaceDir, DISPOSITIONS_FILE),
+        JSON.stringify([{ findingKey, disposition: "follow-up", reason: "Out of scope for this issue." }]),
+      );
+
+      const { ghSpawn, calls } = makeGhSpawn(threadBody, threadPath, threadLine);
+      const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+      const { pipeline, runner } = makeStepsPipeline([
+        ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true }) }],
+        ["push", { run: vi.fn().mockResolvedValue({ prUrl: null, prNumber: 42, branchPushed: true }) }],
+      ]);
+
+      const result = await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeMockExecutor(0),
+        fetchImpl: mockFetch,
+        ghSpawn,
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(calls.some((c) => c.some((a) => a.includes("addPullRequestReviewThreadReply")))).toBe(true);
+      expect(calls.some((c) => c.some((a) => a.includes("resolveReviewThread")))).toBe(true);
+      const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
+        findingDispositions?: FindingDisposition[];
+      };
+      expect(body.findingDispositions).toEqual([
+        { findingKey, disposition: "follow-up", reason: "Out of scope for this issue." },
+      ]);
+    });
+
+    it("a gap-fill run with no code change and a follow-up disposition still replies, resolves the thread, and sends the dispositions", async () => {
+      vi.stubEnv("PR_NUMBER", "42");
+      vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+      vi.stubEnv("RUN_TOKEN", "run-token");
+
+      const threadBody = "Consider caching this result.";
+      const threadPath = "src/service.ts";
+      const threadLine = 42;
+      const findingKey = stableReviewFindingKey({
+        source: "github-review-thread",
+        severity: "medium",
+        body: threadBody,
+        path: threadPath,
+        line: threadLine,
+      });
+      mkdirSync(join(workspaceDir, "ai-output"), { recursive: true });
+      writeFileSync(
+        join(workspaceDir, DISPOSITIONS_FILE),
+        JSON.stringify([{ findingKey, disposition: "follow-up", reason: "Not required by the acceptance criteria." }]),
+      );
+
+      const { ghSpawn, calls } = makeGhSpawn(threadBody, threadPath, threadLine);
+      const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+      // No git change: push reports a no-op (existing-PR shape), mirroring push.ts's
+      // branchPushed=false with no prUrl for an already-up-to-date PR branch.
+      const { pipeline, runner } = makeStepsPipeline([
+        ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true }) }],
+        ["push", { run: vi.fn().mockResolvedValue({ prUrl: null, prNumber: 42, branchPushed: false }) }],
+      ]);
+
+      const result = await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeMockExecutor(0),
+        fetchImpl: mockFetch,
+        ghSpawn,
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(calls.some((c) => c.some((a) => a.includes("addPullRequestReviewThreadReply")))).toBe(true);
+      expect(calls.some((c) => c.some((a) => a.includes("resolveReviewThread")))).toBe(true);
+      const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
+        findingDispositions?: FindingDisposition[];
+      };
+      expect(body.findingDispositions).toEqual([
+        { findingKey, disposition: "follow-up", reason: "Not required by the acceptance criteria." },
+      ]);
+    });
+
+    it("a gap-fill run whose push step failed with an error posts no replies", async () => {
+      vi.stubEnv("PR_NUMBER", "42");
+      vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+      vi.stubEnv("RUN_TOKEN", "run-token");
+
+      const threadBody = "Missing null check.";
+      const threadPath = "src/app.ts";
+      const threadLine = 10;
+      const findingKey = stableReviewFindingKey({
+        source: "github-review-thread",
+        severity: "medium",
+        body: threadBody,
+        path: threadPath,
+        line: threadLine,
+      });
+      mkdirSync(join(workspaceDir, "ai-output"), { recursive: true });
+      writeFileSync(
+        join(workspaceDir, DISPOSITIONS_FILE),
+        JSON.stringify([{ findingKey, disposition: "follow-up", reason: "Out of scope for this issue." }]),
+      );
+
+      const { ghSpawn, calls } = makeGhSpawn(threadBody, threadPath, threadLine);
+      const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+      const { pipeline, runner } = makeStepsPipeline([
+        ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true }) }],
+        ["push", { run: vi.fn().mockRejectedValue(new Error("push failed")) }],
+      ]);
+
+      const result = await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeMockExecutor(0),
+        fetchImpl: mockFetch,
+        ghSpawn,
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(calls).toHaveLength(0);
+    });
+
+    it("an initial run sends the post-push review step's dispositions on the result callback", async () => {
+      vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+      vi.stubEnv("RUN_TOKEN", "run-token");
+
+      const dispositions: FindingDisposition[] = [
+        { findingKey: "a".repeat(64), disposition: "fixed", reason: "Addressed in this pass." },
+      ];
+      const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+      const { pipeline, runner } = makeStepsPipeline([
+        ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true }) }],
+        [
+          "push",
+          {
+            run: vi.fn().mockResolvedValue({
+              prUrl: "https://github.com/acme/app/pull/1",
+              prNumber: 1,
+              branchPushed: true,
+            }),
+          },
+        ],
+        [
+          "post-push-review",
+          { run: vi.fn().mockResolvedValue({ approved: true, findingDispositions: dispositions }) },
+        ],
+      ]);
+
+      const result = await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeMockExecutor(0),
+        fetchImpl: mockFetch,
+      });
+
+      expect(result.exitCode).toBe(0);
+      const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
+        findingDispositions?: FindingDisposition[];
+      };
+      expect(body.findingDispositions).toEqual(dispositions);
+    });
+
+    it("sends no findingDispositions field when there are none", async () => {
+      vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+      vi.stubEnv("RUN_TOKEN", "run-token");
+
+      const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+      const { pipeline, runner } = makeStepsPipeline([
+        ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true }) }],
+        ["push", { run: vi.fn().mockResolvedValue({ prUrl: "https://github.com/acme/app/pull/1" }) }],
+      ]);
+
+      const result = await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeMockExecutor(0),
+        fetchImpl: mockFetch,
+      });
+
+      expect(result.exitCode).toBe(0);
+      const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as Record<string, unknown>;
+      expect(body.findingDispositions).toBeUndefined();
     });
   });
 });
