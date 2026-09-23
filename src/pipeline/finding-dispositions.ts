@@ -144,14 +144,14 @@ function listUnresolvedThreads(ghSpawn: GhSpawn, prNumber: string): ReviewThread
     for (const node of connection.nodes) {
       if (!isRecord(node) || node.isResolved !== false || typeof node.id !== "string") continue;
       const comments = isRecord(node.comments) && Array.isArray(node.comments.nodes) ? node.comments.nodes : [];
-      const firstComment = comments[0];
-      if (!isRecord(firstComment) || typeof firstComment.body !== "string") continue;
+      const latestComment = comments.at(-1);
+      if (!isRecord(latestComment) || typeof latestComment.body !== "string") continue;
       threads.push({
         id: node.id,
         isResolved: false,
         ...(typeof node.path === "string" ? { path: node.path } : {}),
         ...(typeof node.line === "number" ? { line: node.line } : {}),
-        body: firstComment.body.trim(),
+        body: latestComment.body.trim(),
       });
     }
 
@@ -259,7 +259,7 @@ query($owner: String!, $repo: String!, $number: Int!, $after: String) {
           isResolved
           path
           line
-          comments(first: 1) {
+          comments(last: 1) {
             nodes {
               body
             }

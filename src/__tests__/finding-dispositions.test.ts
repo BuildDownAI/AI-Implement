@@ -314,4 +314,60 @@ describe("replyToDispositionThreads", () => {
     // RT_4's reply throws and is not counted, but RT_1 and RT_2 still succeed.
     expect(replied).toBe(2);
   });
+
+  it("matches a thread by its latest comment when the thread has more than one comment", () => {
+    const earlierBody = "Can you clarify this?";
+    const latestBody = "Missing null check on the response.";
+    const multiCommentKey = stableReviewFindingKey({
+      source: "github-review-thread",
+      severity: "medium",
+      body: latestBody,
+      path: "src/multi.ts",
+      line: 15,
+    });
+
+    const calls: string[][] = [];
+    const ghSpawn: GhSpawn = (args) => {
+      calls.push(args);
+      if (args.some((a) => a.includes("addPullRequestReviewThreadReply"))) {
+        return { exitCode: 0, stdout: JSON.stringify({ data: { addPullRequestReviewThreadReply: { comment: { id: "IC_1" } } } }) };
+      }
+      if (args.some((a) => a.includes("resolveReviewThread"))) {
+        return { exitCode: 0, stdout: JSON.stringify({ data: { resolveReviewThread: { thread: { id: "RT_5" } } } }) };
+      }
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({
+          data: {
+            repository: {
+              pullRequest: {
+                reviewThreads: {
+                  nodes: [
+                    {
+                      id: "RT_5",
+                      isResolved: false,
+                      path: "src/multi.ts",
+                      line: 15,
+                      comments: { nodes: [{ body: earlierBody }, { body: latestBody }] },
+                    },
+                  ],
+                  pageInfo: { hasNextPage: false, endCursor: null },
+                },
+              },
+            },
+          },
+        }),
+      };
+    };
+
+    const replied = replyToDispositionThreads(ghSpawn, "42", [
+      { findingKey: multiCommentKey, disposition: "follow-up", reason: "Tracked separately." },
+    ]);
+
+    expect(replied).toBe(1);
+    const resolveCall = calls.find(
+      (call) => call.includes("threadId=RT_5") && call.some((a) => a.includes("resolveReviewThread")),
+    );
+    expect(resolveCall).toBeTruthy();
+  });
 });
