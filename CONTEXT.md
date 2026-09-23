@@ -128,6 +128,30 @@ The review verdict is the conclusion one reviewer states about a PR: approve, ch
 
 **Not to be confused with:** Merge readiness, which is the run's own decision over every reviewer's findings and verdicts together.
 
+## Review-fix run
+
+A review-fix run is a gap-fill run that the orchestrator starts on an open PR because review feedback arrived after the PR's last run ended. It reads the open findings, changes the PR branch, and never opens a new PR.
+
+**Not to be confused with:** The in-run fix pass, which post-push review runs inside the initial run before that run ends. Also not a fresh implementation, which an issue with an open PR never gets (ADR 026).
+
+## Finding disposition
+
+A finding disposition is the fixing agent's decision about one review finding: `fixed`, `follow-up`, or `invalid`, with a one-sentence reason. A defect in lines the PR changed can only be `fixed` or `invalid` (ADR 028).
+
+**Not to be confused with:** A review verdict, which a reviewer states about the whole PR.
+
+## Deferred finding
+
+A deferred finding is a review finding that the fixing agent gave the `follow-up` disposition. It stays in the ledger, it no longer gates the merge, and the orchestrator lists it on the issue for a human to triage.
+
+**Not to be confused with:** A resolved finding, which a run fixed. Also not an advisory finding, which never gated because of its source.
+
+## PR dispatch budget
+
+The PR dispatch budget is the number of gap-fill runs the orchestrator may start on one PR in a rolling 24 hours. The default is 4, and it is set per project. At the budget, the orchestrator parks the PR and asks for a human. A human `/ai-implement` comment still dispatches and still counts.
+
+**Not to be confused with:** Max Iterations, which caps implement and review cycles inside one run.
+
 ## Pickup label
 
 The pickup label is the one Linear label whose presence makes an issue a dispatch candidate for an orchestrator. It defaults to `AI-Implement` and is set once per orchestrator.
