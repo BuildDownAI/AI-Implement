@@ -2896,3 +2896,179 @@ describe("handleRunnerResult — GIT_LEASE_REJECTED failure handling (AII-749)",
     expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(0);
   });
 });
+
+describe("handleRunnerResult — finding dispositions (AII-753)", () => {
+  const VALID_KEY_A = "a".repeat(64);
+  const VALID_KEY_B = "b".repeat(64);
+
+  it("returns the same outcome for a malformed findingDispositions value as when the field is absent", async () => {
+    const fake1 = new FakeProvider({ recordCalls: true });
+    const { token: token1 } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const resWithout = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token1}`,
+      body: {
+        phase: "implementation",
+        outcome: "success",
+        comments: [],
+        prUrl: "https://github.com/o/r/pull/1",
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake1),
+    });
+
+    const fake2 = new FakeProvider({ recordCalls: true });
+    const { token: token2 } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const resMalformedString = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token2}`,
+      body: {
+        phase: "implementation",
+        outcome: "success",
+        comments: [],
+        prUrl: "https://github.com/o/r/pull/1",
+        findingDispositions: "oops",
+      } as unknown as RunnerCallbackModule.RunnerResultBody,
+      secret: SECRET,
+      resolveProvider: makeResolve(fake2),
+    });
+
+    const fake3 = new FakeProvider({ recordCalls: true });
+    const { token: token3 } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const resBadEntries = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token3}`,
+      body: {
+        phase: "implementation",
+        outcome: "success",
+        comments: [],
+        prUrl: "https://github.com/o/r/pull/1",
+        findingDispositions: [{ bogus: true }, { findingKey: "not-hex", disposition: "fixed" }],
+      } as unknown as RunnerCallbackModule.RunnerResultBody,
+      secret: SECRET,
+      resolveProvider: makeResolve(fake3),
+    });
+
+    expect(resWithout.status).toBe(200);
+    expect(resMalformedString).toEqual(resWithout);
+    expect(resBadEntries).toEqual(resWithout);
+  });
+
+  it("drops malformed entries, logs the drop count, and exposes exactly the sanitized list on the parsed body", async () => {
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const fake = new FakeProvider({ recordCalls: true });
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    const body = {
+      phase: "implementation",
+      outcome: "success",
+      comments: [],
+      prUrl: "https://github.com/o/r/pull/1",
+      findingDispositions: [
+        { findingKey: VALID_KEY_A, disposition: "fixed", reason: "addressed it" },
+        { findingKey: "not-a-valid-key", disposition: "invalid", reason: "bad key" },
+        { findingKey: VALID_KEY_B, disposition: "bogus-disposition", reason: "bad enum" },
+      ],
+    } as unknown as RunnerCallbackModule.RunnerResultBody;
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body,
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+    });
+
+    expect(res.status).toBe(200);
+    expect(body.findingDispositions).toEqual([
+      { findingKey: VALID_KEY_A, disposition: "fixed", reason: "addressed it" },
+    ]);
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("[runner-callback] Dropped 2 invalid finding disposition(s)"),
+    );
+    warnSpy.mockRestore();
+  });
+
+  it("does not log a drop when every entry is valid", async () => {
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const fake = new FakeProvider({ recordCalls: true });
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    const body: RunnerCallbackModule.RunnerResultBody = {
+      phase: "implementation",
+      outcome: "success",
+      comments: [],
+      prUrl: "https://github.com/o/r/pull/1",
+      findingDispositions: [{ findingKey: VALID_KEY_A, disposition: "fixed", reason: "addressed it" }],
+    };
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body,
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+    });
+
+    expect(res.status).toBe(200);
+    expect(body.findingDispositions).toEqual([
+      { findingKey: VALID_KEY_A, disposition: "fixed", reason: "addressed it" },
+    ]);
+    expect(warnSpy).not.toHaveBeenCalledWith(expect.stringContaining("Dropped"));
+    warnSpy.mockRestore();
+  });
+
+  it("does not log a drop when the field is absent, and existing callback behavior is unchanged", async () => {
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const fake = new FakeProvider({ recordCalls: true });
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "success",
+        comments: [],
+        prUrl: "https://github.com/o/r/pull/1",
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+    });
+
+    expect(res.status).toBe(200);
+    expect(fake.getPhase("i")).toBe("pr_ready");
+    expect(warnSpy).not.toHaveBeenCalledWith(expect.stringContaining("Dropped"));
+    warnSpy.mockRestore();
+  });
+});

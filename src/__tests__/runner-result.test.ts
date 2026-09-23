@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { fetchPlanningContextFromOrchestrator, postRunnerResult } from "../runner-result.js";
 import type { ReferenceRepoResult } from "../reference-repos.js";
+import type { FindingDisposition } from "../pipeline/finding-dispositions.js";
 
 describe("fetchPlanningContextFromOrchestrator", () => {
   it("GETs /runner/planning-context with the progress token and returns the context", async () => {
@@ -144,6 +145,59 @@ describe("postRunnerResult", () => {
 
     const body = JSON.parse(vi.mocked(fetchImpl).mock.calls[0][1]!.body as string);
     expect(body).not.toHaveProperty("referenceRepoResults");
+  });
+
+  it("includes findingDispositions in body when non-empty", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    const findingDispositions: FindingDisposition[] = [
+      { findingKey: "a".repeat(64), disposition: "fixed", reason: "addressed it" },
+    ];
+
+    await postRunnerResult({
+      workspaceDir: "/tmp",
+      phase: "implementation",
+      outcome: "success",
+      prUrl: "https://github.com/o/r/pull/1",
+      callbackUrl: "https://cb",
+      findingDispositions,
+      fetchImpl,
+    });
+
+    const body = JSON.parse(vi.mocked(fetchImpl).mock.calls[0][1]!.body as string);
+    expect(body.findingDispositions).toEqual(findingDispositions);
+  });
+
+  it("omits findingDispositions from body when array is empty", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+
+    await postRunnerResult({
+      workspaceDir: "/tmp",
+      phase: "implementation",
+      outcome: "success",
+      prUrl: "https://github.com/o/r/pull/1",
+      callbackUrl: "https://cb",
+      findingDispositions: [],
+      fetchImpl,
+    });
+
+    const body = JSON.parse(vi.mocked(fetchImpl).mock.calls[0][1]!.body as string);
+    expect(body).not.toHaveProperty("findingDispositions");
+  });
+
+  it("omits findingDispositions from body when not provided", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+
+    await postRunnerResult({
+      workspaceDir: "/tmp",
+      phase: "implementation",
+      outcome: "success",
+      prUrl: "https://github.com/o/r/pull/1",
+      callbackUrl: "https://cb",
+      fetchImpl,
+    });
+
+    const body = JSON.parse(vi.mocked(fetchImpl).mock.calls[0][1]!.body as string);
+    expect(body).not.toHaveProperty("findingDispositions");
   });
 
   it("includes guardVerdict and partTable in body when present (AII-632)", async () => {

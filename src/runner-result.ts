@@ -1,6 +1,7 @@
 import { readFileSync, existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import type { FailureRecord } from "./pipeline/failure-classification.js";
+import type { FindingDisposition } from "./pipeline/finding-dispositions.js";
 import type { ReferenceRepoResult } from "./reference-repos.js";
 
 export function collectRunnerComments(workspaceDir: string): Array<{ body: string }> {
@@ -58,6 +59,8 @@ export async function postRunnerResult(params: {
   noWork?: boolean;
   /** Reference repository clone outcomes, present only when the run declared entries. */
   referenceRepoResults?: ReferenceRepoResult[];
+  /** Per-finding disposition from the fixing agent (fixed/follow-up/invalid), present only when non-empty. */
+  findingDispositions?: FindingDisposition[];
   /** SHA of the snapshot commit pushed by a kg-refresh runner. Only meaningful for phase=kg-refresh. */
   snapshotCommit?: string | null;
   /** Number of the refresh PR opened alongside snapshotCommit. Only meaningful for phase=kg-refresh. */
@@ -93,6 +96,9 @@ export async function postRunnerResult(params: {
   if (params.noWork) body.noWork = params.noWork;
   if (params.referenceRepoResults && params.referenceRepoResults.length > 0) {
     body.referenceRepoResults = params.referenceRepoResults;
+  }
+  if (params.findingDispositions && params.findingDispositions.length > 0) {
+    body.findingDispositions = params.findingDispositions;
   }
   if (params.snapshotCommit) body.snapshotCommit = params.snapshotCommit;
   if (params.snapshotPr) body.snapshotPr = params.snapshotPr;

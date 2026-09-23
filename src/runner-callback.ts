@@ -30,6 +30,7 @@ import {
 } from "./completion-classification.js";
 import { isLinearAuthConfigured, withLinearToken } from "./linear-app-auth.js";
 import { isFailureRecord, projectFailureRecord, type FailureRecord } from "./pipeline/failure-classification.js";
+import { sanitizeFindingDispositions, type FindingDisposition } from "./pipeline/finding-dispositions.js";
 
 export type RunnerPhase = "planning" | "implementation" | "gap-analysis" | "kg-refresh";
 
@@ -112,6 +113,8 @@ export interface RunnerResultBody {
   partTable?: Array<{ part: string; prev: string; new: string }>;
   /** Reference repository clone outcomes, present only when the run declared entries. */
   referenceRepoResults?: ReferenceRepoResult[];
+  /** Per-finding disposition from the fixing agent (fixed/follow-up/invalid). Shape-validated below. */
+  findingDispositions?: FindingDisposition[];
 }
 
 export interface HandleRunnerResultInput {
@@ -350,6 +353,7 @@ export async function handleRunnerResult(
     outcome?: unknown;
     comments?: unknown;
     failure?: unknown;
+    findingDispositions?: unknown;
   } | null | undefined;
   if (!body || typeof body !== "object") return bad(400, "invalid_body");
   if (
@@ -419,6 +423,15 @@ export async function handleRunnerResult(
     console.warn(
       `[runner-callback] dropping malformed failure record for dispatchId=${claims.dispatchId}`,
     );
+  }
+
+  // Same sanitize-and-drop treatment as `failure` above: an unrecognised entry
+  // (e.g. from a newer runner) must never reject the whole callback.
+  const { valid: sanitizedFindingDispositions, dropped: droppedFindingDispositions } =
+    sanitizeFindingDispositions(body.findingDispositions);
+  input.body.findingDispositions = sanitizedFindingDispositions;
+  if (droppedFindingDispositions > 0) {
+    console.warn(`[runner-callback] Dropped ${droppedFindingDispositions} invalid finding disposition(s)`);
   }
 
   // kg-refresh runs have no mapping and no tracker issue to update.
