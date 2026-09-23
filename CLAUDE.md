@@ -173,6 +173,8 @@ npm run test:restate # src/__tests__/restate/**/*.restate.test.ts — needs Dock
 
 **`typecheck` excludes `src/__tests__`, and vitest strips types without checking them** — so type errors in a test file are caught by nothing. Type-check a new test file explicitly with a throwaway tsconfig. `src/admin-ui/__tests__/` *is* covered and can break the build.
 
+Fixing a bug: write the failing test first, then the fix, in one pull request — see [docs/bug-fix-tests.md](docs/bug-fix-tests.md).
+
 ## Data layer
 
 One SQLite file at `DEDUP_DB_PATH` (default `/data/dedup.sqlite`; `./dedup.sqlite` locally) holding 22 tables. `dedup.ts` owns the singleton — every other module imports `getDb` from it rather than opening its own handle.
