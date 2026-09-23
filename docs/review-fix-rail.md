@@ -17,7 +17,7 @@ The second half is the reason the rail exists. Without it, any review posted aft
 
 ## Prerequisites
 
-The post-run half is **entirely webhook-driven**. Three GitHub event subscriptions feed it, and a repo subscribed to none of them silently gets no rail at all — no error, no log line, just a PR that never receives a fix run:
+The post-run half's finding-driven enqueues are **entirely webhook-driven**. Three GitHub event subscriptions feed it, and a repo subscribed to none of them silently gets no rail at all — no error, no log line, just a PR that never receives a fix run:
 
 | Event | Gate | Recorded as |
 |-------|------|-------------|
@@ -164,6 +164,20 @@ reviewCheckNames:
 External collection can be disabled per repo via `reviewProviders` in `.ai-implement/config.yml`; when it is, the step skips the wait entirely.
 
 The `claude-review`/`claude-code-review`/`claude` workflows pin `anthropics/claude-code-action` to v1.0.217 rather than floating `@v1` — a `@v1` build shipped 2026-09-08 that failed the native binary install on every run, silently starving this gate of a verdict. v1.0.217 is pinned rather than a later build because it's the last version upstream confirms works; move the pin forward only once a newer release is confirmed to fix the installer regression (tracked upstream as issue #1817).
+
+## A non-webhook enqueue source: an issue selected for dispatch that already has an open PR
+
+Before the poll loop dispatches a fresh implementation for a selected issue, it looks up the
+issue's newest recorded PR (`getLatestPrUrlForIssue`, `src/log.ts`) and checks its state
+(`guardOpenPrBeforeImplementationDispatch`, `src/index.ts`). An **open** PR is never
+re-implemented — a fresh run's push would force-overwrite the open PR's branch (see ADR 026,
+decision 4). Instead the issue is routed into this same queue with reason `open_pr`, and
+`markDispatched` is called so the issue is not re-selected and re-enqueued on the next poll tick.
+A **merged** PR gets no dispatch and no queue row — merge reconciliation completes the issue. A
+PR state lookup that fails (network/API error) blocks dispatch for that tick only, so the issue is
+re-evaluated on the next poll rather than falling through to a fresh implementation. A **closed,
+unmerged** PR still gets a fresh implementation, on the assumption a human closed it to start over.
+This check only applies to implementation dispatches, never planning.
 
 ## Post-run: the drain loop
 

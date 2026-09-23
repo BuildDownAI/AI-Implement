@@ -582,6 +582,21 @@ export function getLatestDispatchForPr(owner: string, repo: string, prNumber: nu
   return mapRows([row])[0];
 }
 
+/**
+ * Returns the newest recorded PR URL for an issue, across all repos and phases, skipping
+ * any newer dispatch_log row that has no pr_url (e.g. a later run that failed before
+ * opening a PR). AII-752: the poll loop uses this to detect an issue that already has a
+ * PR before dispatching a fresh implementation that would force-overwrite it.
+ */
+export function getLatestPrUrlForIssue(issueId: string): string | null {
+  const row = getDb()
+    .prepare(
+      "SELECT pr_url FROM dispatch_log WHERE issue_id = ? AND pr_url IS NOT NULL ORDER BY dispatched_at DESC, id DESC LIMIT 1",
+    )
+    .get(issueId) as { pr_url: string } | undefined;
+  return row?.pr_url ?? null;
+}
+
 /** Latest dispatch for an issue in a repo, matched case-insensitively on the tracker
  *  identifier. Recovery path for PRs the orchestrator opened WITHOUT a dispatch —
  *  a grouping roll-up PR encodes its feature-node parent's key in the head branch,

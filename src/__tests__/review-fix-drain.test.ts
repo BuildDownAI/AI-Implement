@@ -10,6 +10,7 @@ import type * as IndexModule from "../index.js";
 import type * as ReviewFixQueueModule from "../review-fix-queue.js";
 import type * as LocalGapfillModule from "../local-gapfill.js";
 import type { RepoMapping } from "../config.js";
+import type { TicketIssue } from "../providers/types.js";
 
 type DispatchLocalGapfillFn = typeof LocalGapfillModule.dispatchLocalGapfill;
 
@@ -280,6 +281,124 @@ describe("processReviewFixQueue — dispatch gate", () => {
     expect(localGapfillMocks.dispatchLocalGapfill).toHaveBeenCalledTimes(1);
     const pending = reviewFixQueue.getPendingReviewFixes();
     expect(pending).toHaveLength(0);
+  });
+});
+
+describe("guardOpenPrBeforeImplementationDispatch", () => {
+  function makeIssue(overrides: Partial<TicketIssue> = {}): TicketIssue {
+    return {
+      id: "issue-open-pr",
+      identifier: "AII-900",
+      title: "Some issue",
+      description: null,
+      scopeKey: "TEAM",
+      nativeStatus: "Todo (unstarted)",
+      ...overrides,
+    };
+  }
+
+  function stubPrLookup(json: unknown, ok = true): void {
+    vi.stubGlobal("fetch", vi.fn(async () => ({
+      ok,
+      json: async () => json,
+    }) as Response));
+  }
+
+  it("dispatches (returns false) when the issue has no recorded PR", async () => {
+    const issue = makeIssue({ id: "issue-no-pr" });
+    const result = await indexModule.guardOpenPrBeforeImplementationDispatch("gh-token", issue);
+    expect(result).toBe(false);
+    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(0);
+  });
+
+  it("routes an open PR to a review-fix run and marks the issue dispatched", async () => {
+    const issue = makeIssue({ id: "issue-open-pr", identifier: "AII-901" });
+    const id = log.appendLog({ issueId: issue.id, executionMode: "github-actions" });
+    log.updateJobStatus(id, "completed", "success", "https://github.com/acme/billing/pull/77");
+
+    stubPrLookup({ merged: false, state: "open", head: { ref: "some-branch" } });
+
+    const consoleLogSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const result = await indexModule.guardOpenPrBeforeImplementationDispatch("gh-token", issue);
+
+    expect(result).toBe(true);
+
+    const pending = reviewFixQueue.getPendingReviewFixes();
+    expect(pending).toHaveLength(1);
+    expect(pending[0]!.reason).toBe("open_pr");
+    expect(pending[0]!.repo).toBe("acme/billing");
+    expect(pending[0]!.prNumber).toBe(77);
+    expect(pending[0]!.issueId).toBe(issue.id);
+
+    expect(dedup.isAlreadyDispatched(issue.id)).toBe(true);
+    expect(
+      consoleLogSpy.mock.calls.some(
+        ([msg]) => typeof msg === "string" && msg.includes("[poll] AII-901 has open PR #77; routed to a review-fix run"),
+      ),
+    ).toBe(true);
+    consoleLogSpy.mockRestore();
+  });
+
+  it("does not enqueue a second review-fix row when called again for the same open PR", async () => {
+    const issue = makeIssue({ id: "issue-open-pr-2", identifier: "AII-906" });
+    const id = log.appendLog({ issueId: issue.id, executionMode: "github-actions" });
+    log.updateJobStatus(id, "completed", "success", "https://github.com/acme/billing/pull/81");
+
+    stubPrLookup({ merged: false, state: "open" });
+
+    await indexModule.guardOpenPrBeforeImplementationDispatch("gh-token", issue);
+    await indexModule.guardOpenPrBeforeImplementationDispatch("gh-token", issue);
+
+    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(1);
+  });
+
+  it("dispatches (returns false) when the PR is closed and not merged", async () => {
+    const issue = makeIssue({ id: "issue-closed-pr" });
+    const id = log.appendLog({ issueId: issue.id, executionMode: "github-actions" });
+    log.updateJobStatus(id, "completed", "success", "https://github.com/acme/billing/pull/78");
+
+    stubPrLookup({ merged: false, state: "closed" });
+
+    const result = await indexModule.guardOpenPrBeforeImplementationDispatch("gh-token", issue);
+
+    expect(result).toBe(false);
+    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(0);
+    expect(dedup.isAlreadyDispatched(issue.id)).toBe(false);
+  });
+
+  it("skips dispatch (returns true) with no review-fix row when the PR is merged", async () => {
+    const issue = makeIssue({ id: "issue-merged-pr" });
+    const id = log.appendLog({ issueId: issue.id, executionMode: "github-actions" });
+    log.updateJobStatus(id, "completed", "success", "https://github.com/acme/billing/pull/79");
+
+    stubPrLookup({ merged: true, state: "closed" });
+
+    const result = await indexModule.guardOpenPrBeforeImplementationDispatch("gh-token", issue);
+
+    expect(result).toBe(true);
+    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(0);
+    expect(dedup.isAlreadyDispatched(issue.id)).toBe(false);
+  });
+
+  it("skips dispatch (returns true) and logs when the PR state lookup fails", async () => {
+    const issue = makeIssue({ id: "issue-lookup-fails", identifier: "AII-905" });
+    const id = log.appendLog({ issueId: issue.id, executionMode: "github-actions" });
+    log.updateJobStatus(id, "completed", "success", "https://github.com/acme/billing/pull/80");
+
+    stubPrLookup({}, false);
+
+    const consoleLogSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const result = await indexModule.guardOpenPrBeforeImplementationDispatch("gh-token", issue);
+
+    expect(result).toBe(true);
+    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(0);
+    expect(dedup.isAlreadyDispatched(issue.id)).toBe(false);
+    expect(
+      consoleLogSpy.mock.calls.some(
+        ([msg]) => typeof msg === "string" && msg.includes("[poll] AII-905: PR state unavailable; retrying next poll"),
+      ),
+    ).toBe(true);
+    consoleLogSpy.mockRestore();
   });
 });
 

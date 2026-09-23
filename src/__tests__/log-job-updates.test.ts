@@ -76,6 +76,36 @@ describe("updateJobStatus CASE guard — runner_approved conclusion survives mon
   });
 });
 
+describe("getLatestPrUrlForIssue", () => {
+  it("returns the newest non-null pr_url even when a newer row for the issue has pr_url = NULL", () => {
+    const older = log.appendLog({ issueId: "issue-pr", executionMode: "github-actions" });
+    log.updateJobStatus(older, "completed", "success", "https://github.com/o/r/pull/5");
+
+    // A later run for the same issue that failed before opening a PR — no pr_url recorded.
+    log.appendLog({ issueId: "issue-pr", executionMode: "github-actions" });
+
+    expect(log.getLatestPrUrlForIssue("issue-pr")).toBe("https://github.com/o/r/pull/5");
+  });
+
+  it("returns the newer pr_url when the newest row does have one", () => {
+    const older = log.appendLog({ issueId: "issue-pr-2", executionMode: "github-actions" });
+    log.updateJobStatus(older, "completed", "success", "https://github.com/o/r/pull/5");
+    const newer = log.appendLog({ issueId: "issue-pr-2", executionMode: "github-actions" });
+    log.updateJobStatus(newer, "completed", "success", "https://github.com/o/r/pull/6");
+
+    expect(log.getLatestPrUrlForIssue("issue-pr-2")).toBe("https://github.com/o/r/pull/6");
+  });
+
+  it("returns null when no row for the issue has a pr_url", () => {
+    log.appendLog({ issueId: "issue-no-pr", executionMode: "github-actions" });
+    expect(log.getLatestPrUrlForIssue("issue-no-pr")).toBeNull();
+  });
+
+  it("returns null when the issue has no dispatch_log rows at all", () => {
+    expect(log.getLatestPrUrlForIssue("issue-never-dispatched")).toBeNull();
+  });
+});
+
 describe("getRunRecordMergeVerdict", () => {
   it("returns in_flight when a row is running", () => {
     const id = log.appendLog({ issueId: "i1", issueIdentifier: "AII-100", executionMode: "github-actions" });
