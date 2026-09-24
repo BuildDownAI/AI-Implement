@@ -325,6 +325,42 @@ describe("ActivityReporter", () => {
     expect(stats.missingTail).toBe(true);
   });
 
+  it("drops the remaining buffer as a visible gap when a mid-stream batch is rejected as stale (410), rather than waiting for shutdown()", async () => {
+    const responses = [
+      response(410, { acknowledged: false, outcome: "conflict", attemptId: "attempt-1", reason: "stream stale" }),
+      response(200, { acknowledged: true, outcome: "accepted", attemptId: "attempt-1" }),
+    ];
+    let i = 0;
+    const calls: unknown[] = [];
+    const fetchImpl = (async (_url: string | URL, init?: RequestInit) => {
+      calls.push(JSON.parse(String(init?.body)));
+      const res = responses[Math.min(i, responses.length - 1)];
+      i++;
+      return res;
+    }) as typeof fetch;
+
+    const reporter = new ActivityReporter("https://orchestrator.test", "progress-token", "attempt-1", "producer-1", {
+      fetchImpl,
+      retryDelaysMs: [],
+      batchSize: 5,
+    });
+
+    for (let i = 0; i < 12; i++) {
+      reporter.record({ cycle: 1, kind: "tool_call", action: "Bash", detail: { i } });
+    }
+
+    await reporter.flush();
+
+    // Only the first (rejected) batch is sent — flush() must not keep going
+    // once the stream is closed, and it must not silently strand the rest.
+    expect(calls).toHaveLength(1);
+    const stats = reporter.getStats();
+    expect(stats.closed).toBe(true);
+    expect(stats.bufferedCount).toBe(0);
+    expect(stats.droppedRanges.some((r) => r.reason === "transport_failure" && r.fromSequence === 5 && r.toSequence === 11)).toBe(true);
+    expect(stats.missingTail).toBe(true);
+  });
+
   it("sends the finalSequence marker once the buffer has drained, closing the stream", async () => {
     const { fetchImpl, calls } = capturingFetch([response(200, { acknowledged: true, outcome: "accepted", attemptId: "attempt-1" })]);
     const reporter = new ActivityReporter("https://orchestrator.test", "progress-token", "attempt-1", "producer-1", {

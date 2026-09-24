@@ -264,7 +264,16 @@ export class ActivityReporter {
         // between the last successful ack and finalSequence still shows up
         // via computeMissingTail().
         if (attachFinal) this.finalSequenceSent = true;
-        if (this.closed) return;
+        if (this.closed) {
+          // A mid-stream rejection (410, stream-stale) can close the stream
+          // while events beyond the rejected batch are still buffered —
+          // record() also stops accepting new ones from here on, so nothing
+          // else will ever account for them. Drop them here rather than
+          // deferring that bookkeeping to a possibly much-later or never-
+          // called shutdown(), so getStats() reflects the gap immediately.
+          this.dropRemainingBuffer("stream close");
+          return;
+        }
       }
     }
   }
@@ -279,13 +288,7 @@ export class ActivityReporter {
   async shutdown(): Promise<void> {
     await this.flush();
 
-    if (this.buffer.length > 0) {
-      const from = this.buffer[0].sequence;
-      const to = this.buffer[this.buffer.length - 1].sequence;
-      this.droppedRanges.push({ fromSequence: from, toSequence: to, reason: "transport_failure" });
-      this.raiseAlert("transport_dropped", `dropped sequences ${from}-${to} at shutdown`, from);
-      this.buffer = [];
-    }
+    this.dropRemainingBuffer("shutdown");
 
     if (this.finalized && !this.finalSequenceSent) {
       this.raiseAlert("transport_dropped", `final sequence marker ${this.finalSequence} never acknowledged`, this.finalSequence ?? undefined);
@@ -368,6 +371,25 @@ export class ActivityReporter {
       return;
     }
     this.buffer.push(event);
+  }
+
+  /**
+   * Flags whatever is still buffered as a dropped range and clears it — the
+   * shared tail of both `shutdown()`'s unconditional cleanup and `flush()`'s
+   * mid-stream-close path (a rejected non-final batch that sets `closed`
+   * while events beyond it remain buffered). Without this, a caller that
+   * only inspects `flush()`/`getStats()` — never calling `shutdown()` — would
+   * see an empty `droppedRanges` and `missingTail: false` despite buffered
+   * events that can now never be sent (`record()` also stops accepting new
+   * ones once `closed` is true).
+   */
+  private dropRemainingBuffer(context: string): void {
+    if (this.buffer.length === 0) return;
+    const from = this.buffer[0].sequence;
+    const to = this.buffer[this.buffer.length - 1].sequence;
+    this.droppedRanges.push({ fromSequence: from, toSequence: to, reason: "transport_failure" });
+    this.raiseAlert("transport_dropped", `dropped sequences ${from}-${to} at ${context}`, from);
+    this.buffer = [];
   }
 
   private raiseAlert(kind: ActivityAlert["kind"], reason: string, sequence?: number): void {
