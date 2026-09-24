@@ -67,4 +67,8 @@ describe("overview page", () => {
     const afterFn = overviewScript.slice(failuresIdx);
     expect(afterFn).toContain("stuck_giveup");
   });
+
+  it("no longer renders the removed gap-fill trigger row", () => {
+    expect(overviewScript).not.toContain("Gap-fill trigger");
+  });
 });

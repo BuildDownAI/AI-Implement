@@ -968,7 +968,6 @@ export function handleAdminRequest(
         ),
         jiraSiteUrl: process.env.JIRA_SITE_URL ?? null,
         runnerCallback: !!(process.env.RUNNER_CALLBACK_BASE_URL && process.env.RUNNER_TOKEN_SECRET),
-        gapFillTrigger: !!process.env.GAP_FILL_TRIGGER_SECRET,
       });
       return true;
     }

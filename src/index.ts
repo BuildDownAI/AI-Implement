@@ -60,7 +60,6 @@ import { getOrchestratorSettings, seedKgBaseRepoFromEnv, seedLinearPickupLabelFr
 import { handleRunnerPlanningContext, handleRunnerProgress, handleRunnerResult, handleKgTrackerDataRequest, handleKgScopeRequest, planningDispatchBlockReason } from "./runner-callback.js";
 import type { RunnerProgressBody, RunnerResultBody } from "./runner-callback.js";
 import { mintRunToken, PLANNING_TTL_SECONDS, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
-import { handleGapFillTrigger } from "./gap-fill-trigger.js";
 import { handleMcpRequest } from "./mcp.js";
 import { resolveMemoryProvider, providerUnconfiguredReason, SidecarMemoryProvider, KG_TOOL_CAPABILITY, probeWithTimeout, sidecarHealthFields, setKgMemoryProvider } from "./kg-provider.js";
 import type { MemoryProvider } from "./kg-provider.js";
@@ -74,7 +73,6 @@ import {
   handleMcpOidcCallback,
   handleMcpTokenRequest,
 } from "./mcp-oauth.js";
-import type { GapFillTriggerBody } from "./gap-fill-trigger.js";
 import { buildPlanningContextInputs } from "./planning-context.js";
 import {
   fetchLocalContainerLogs,
@@ -142,7 +140,6 @@ export interface AppConfig {
   reaperAlertThreshold: number;
   runnerCallbackBaseUrl: string | null;
   runnerTokenSecret: string | null;
-  gapFillTriggerSecret: string | null;
   localRunnerImage: string;
   localRunnerOrchestratorUrl: string | null;
   kgSidecarUrl: string | null;
@@ -211,16 +208,12 @@ function loadConfig(): AppConfig {
     console.log(`[main] RUNNER_CALLBACK_BASE_URL not set — defaulting to ${runnerCallbackBaseUrl} (RUNNER_MODE=local)`);
   }
   const runnerTokenSecret = process.env.RUNNER_TOKEN_SECRET || null;
-  const gapFillTriggerSecret = process.env.GAP_FILL_TRIGGER_SECRET || null;
 
   // Resolve the default runner image once; main() reads the status for the deprecation warning.
   const defaultRunner = resolveDefaultRunnerImage(process.env);
 
   if (!runnerCallbackBaseUrl || !runnerTokenSecret) {
     console.warn("[main] runner callback path disabled (RUNNER_CALLBACK_BASE_URL or RUNNER_TOKEN_SECRET not set)");
-  }
-  if (!gapFillTriggerSecret) {
-    console.warn("[main] /trigger/gap-fill endpoint disabled (GAP_FILL_TRIGGER_SECRET not set)");
   }
 
   const linearClientId = process.env.LINEAR_CLIENT_ID || null;
@@ -265,7 +258,6 @@ function loadConfig(): AppConfig {
     reaperAlertThreshold: parseInt(process.env.REAPER_ALERT_THRESHOLD || "10", 10),
     runnerCallbackBaseUrl,
     runnerTokenSecret,
-    gapFillTriggerSecret,
     localRunnerImage: process.env.LOCAL_RUNNER_IMAGE || "ai-implement-runner:local",
     localRunnerOrchestratorUrl: process.env.LOCAL_RUNNER_ORCHESTRATOR_URL || null,
     kgSidecarUrl: process.env.KG_SIDECAR_URL || null,
@@ -4100,48 +4092,6 @@ function startServer(
         res.end(JSON.stringify(result.body));
       })().catch((err) => {
         console.error("[runner-progress] Unhandled error:", err);
-        if (!res.headersSent) {
-          res.writeHead(500, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Internal server error" }));
-        }
-      });
-      return;
-    }
-
-    // Gap-fill trigger from target-repo /ai-implement PR comment workflows
-    if (url === "/trigger/gap-fill" && req.method === "POST") {
-      (async () => {
-        let bodyText: string;
-        try {
-          bodyText = await readBody(req);
-        } catch {
-          res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Failed to read body" }));
-          return;
-        }
-        let parsed: GapFillTriggerBody;
-        try {
-          parsed = JSON.parse(bodyText) as GapFillTriggerBody;
-        } catch {
-          res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Invalid JSON" }));
-          return;
-        }
-        const result = await handleGapFillTrigger({
-          authorization: req.headers.authorization,
-          body: parsed,
-          triggerSecret: config.gapFillTriggerSecret,
-          runnerCallbackBaseUrl: config.runnerCallbackBaseUrl,
-          runnerTokenSecret: config.runnerTokenSecret,
-          getMappings: () => getMappings(),
-          resolveProvider: (mapping) => registry.forMapping(mapping),
-          getInstallationToken: (owner) =>
-            getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner),
-        });
-        res.writeHead(result.status, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(result.body));
-      })().catch((err) => {
-        console.error("[trigger/gap-fill] Unhandled error:", err);
         if (!res.headersSent) {
           res.writeHead(500, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "Internal server error" }));
