@@ -85,7 +85,7 @@ export interface RepoMapping {
   reviewers: ReviewerSelection[] | null;
   /** Max gap-fill runs the orchestrator may start on one PR in 24 hours. NULL means use DEFAULT_PR_DISPATCH_BUDGET. Enforced by `canDispatch` (src/dispatch-gate.ts): at the limit the PR is parked and a human is notified — see [AII-757](https://linear.app/eudoxus/issue/AII-757/park-a-pr-at-its-dispatch-budget-and-ask-for-a-human). */
   prDispatchBudget?: number | null;
-  /** Extra GitHub logins trusted as review authors for this project, additive to the built-in trusted authors (github-actions[bot] and the Claude logins). NULL means built-ins only. */
+  /** Extra GitHub logins trusted as review authors for this project, additive to the built-in trusted authors (`ai-implement`, `ai-implement[bot]`, and the Claude logins — `github-actions[bot]` is trusted separately). NULL means built-ins only. */
   trustedReviewAuthors?: string[] | null;
 }
 
@@ -227,8 +227,9 @@ function ensureMappingsColumns(): void {
     db.exec(`ALTER TABLE mappings ADD COLUMN pr_dispatch_budget INTEGER`);
   }
   if (!names.has("trusted_review_authors")) {
-    // NULL means built-ins only (github-actions[bot] plus the Claude logins) —
-    // this list is additive, not a replacement.
+    // NULL means built-ins only (ai-implement, ai-implement[bot], and the Claude
+    // logins — github-actions[bot] is trusted separately) — this list is additive,
+    // not a replacement.
     db.exec(`ALTER TABLE mappings ADD COLUMN trusted_review_authors TEXT`);
   }
 }
@@ -271,8 +272,9 @@ export function initMappingsTable(): void {
       -- gating), not an empty list — see resolveReviewerSelection().
       reviewers TEXT,
       pr_dispatch_budget INTEGER,
-      -- NULL means built-ins only (github-actions[bot] plus the Claude
-      -- logins) — this list is additive, not a replacement.
+      -- NULL means built-ins only (ai-implement, ai-implement[bot], and the
+      -- Claude logins — github-actions[bot] is trusted separately) — this
+      -- list is additive, not a replacement.
       trusted_review_authors TEXT
     )
   `);
