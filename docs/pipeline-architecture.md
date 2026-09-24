@@ -41,10 +41,10 @@ The `context` argument carries `PipelineContextData` — the issue fields, works
 | 6 | `setup` | no `setup:` hook in `WORKFLOW.md` front matter |
 | 7 | `feedback-loop` | never |
 | 8 | `install-retry` | `install`'s `installFailed` output is not `true` |
-| 9 | `preflight` | the feedback loop did not approve |
-| 10 | `push` | never (initial runs create the branch and PR; gap-fill runs commit remaining changes and force-push to the existing PR branch) |
-| 11 | `verify` | no `verify:` hook, or the feedback loop did not approve |
-| 12 | `post-push-review` | not approved, or nothing was pushed, or no PR number |
+| 9 | `preflight` | the feedback loop did not approve, or `dependenciesMissing` (skip reason `"dependency install failed"`) |
+| 10 | `push` | never (initial runs create the branch and PR; gap-fill runs commit remaining changes and force-push to the existing PR branch); `draft` is set when the feedback loop did not approve **or** `dependenciesMissing` |
+| 11 | `verify` | no `verify:` hook, the feedback loop did not approve, or `dependenciesMissing` |
+| 12 | `post-push-review` | not approved, `dependenciesMissing`, nothing was pushed, or no PR number |
 
 `install` never fails the run: a non-zero exit or a spawn error from `npm ci`/`yarn install`/`pnpm install` resolves rather than throws, setting `installFailed: true` and `installError` (a redacted, 4096-char tail of combined stdout/stderr) instead of stopping the pipeline. `packageManager: none` in `.ai-implement/config.yml` skips the install entirely (`installFailed: false`) when a `package.json` is present. `install-retry` reruns the same built-in `install` module — registered under the `install` key, resolved through the `install-retry` step id — with `retry: true` and the first attempt's `packageManager`, skipping the `.ai-implement/config.yml` read and the trusted-reviewer fetch since those outputs already came from the first `install` step.
 
@@ -59,6 +59,8 @@ The `context` argument carries `PipelineContextData` — the issue fields, works
 Two consequences worth internalising:
 
 **`preflight` does not gate the push.** It is skipped unless the review already approved, and `push` runs regardless of what it found. It records `typecheck`/`lint`/`test` results; it does not block a pull request on them. Work that fails preflight still ships.
+
+**`dependenciesMissing` gates the steps that need `node_modules`.** `dependenciesMissing` (exported from `src/pipeline/pipeline-loader.ts`) is `true` only when both `install`'s `installFailed` output and `install-retry`'s `installFailed` output are `true` — a skipped `install-retry` (the first install succeeded) leaves empty outputs, so `dependenciesMissing` is `false` in that case. When it is `true`, `preflight` and `verify` skip (their `typecheck`/`lint`/`test`/hook commands would fail for reasons unrelated to the change) and `post-push-review` skips (the run was never verified). `push` still runs and opens the PR, but as a draft: its `draft` input is `!approved || dependenciesMissing`, so an approved run with a failed install still ships a draft rather than a normal PR. This only widens the initial-run `draft` condition — the gap-fill `push` skip (`existingPrNumber && !approved`) is untouched by `dependenciesMissing`, so a gap-fill run with a failed install still pushes to the existing PR whenever `feedback-loop` approved.
 
 **The pipeline owns all repository writes.** `push` runs for both initial and gap-fill runs: an initial run creates the implementation branch and opens a PR, while a gap-fill run commits any remaining uncommitted changes and force-pushes to the existing PR branch. `WORKFLOW.md` must instruct the agent to leave changes uncommitted in both modes — the pipeline always handles the commit and push.
 
