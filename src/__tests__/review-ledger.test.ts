@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  classifyReviewIssueComment,
   collectExternalReviewFindingsFromGh,
   extractClaudeSummaryFindings,
   extractGithubActionsClaudeReviewFindings,
@@ -1932,6 +1933,112 @@ describe("collectExternalReviewFindingsFromGh", () => {
           severity: "blocking",
           body: "Keep findings collected before a later gh failure.",
           url: "https://example.com/review",
+        },
+      ],
+      findingsUnavailable: false,
+    });
+  });
+});
+
+describe("classifyReviewIssueComment", () => {
+  it("returns null for an author outside the trusted allowlist, even with a valid block", () => {
+    expect(
+      classifyReviewIssueComment({
+        user: { login: "random-user" },
+        body: "```json review-findings\n{\"schema\":\"review-findings/v1\",\"verdict\":\"changes_requested\",\"findings\":[{\"severity\":\"blocking\",\"body\":\"Nope.\"}]}\n```",
+        html_url: "https://example.com/1",
+      }),
+    ).toBeNull();
+  });
+
+  it("returns null for the rail's own self-marked comment, regardless of author", () => {
+    expect(
+      classifyReviewIssueComment({
+        user: { login: "claude" },
+        body: "<!-- ai-implement post-push iter=1 review-feedback -->\n### Code Review\n\n## Blocking\n- Ignore our own marker comment.",
+        html_url: "https://example.com/2",
+      }),
+    ).toBeNull();
+  });
+
+  it("returns null for an eligible github-actions[bot] author with no block and no Claude heading", () => {
+    expect(
+      classifyReviewIssueComment({
+        user: { login: "github-actions[bot]", type: "Bot" },
+        body: "Deployed a preview environment for this PR.",
+        html_url: "https://example.com/3",
+      }),
+    ).toBeNull();
+  });
+
+  it("returns an approve verdict with empty findings and verdictSource review-contract", () => {
+    expect(
+      classifyReviewIssueComment({
+        user: { login: "github-actions[bot]", type: "Bot" },
+        body: "```json review-findings\n{\"schema\":\"review-findings/v1\",\"verdict\":\"approve\",\"findings\":[]}\n```",
+        html_url: "https://example.com/4",
+      }),
+    ).toEqual({
+      findings: [],
+      findingsUnavailable: false,
+      verdict: "approve",
+      verdictSource: "review-contract",
+    });
+  });
+
+  it("returns review-contract findings tagged with source review-contract", () => {
+    expect(
+      classifyReviewIssueComment({
+        user: { login: "github-actions[bot]", type: "Bot" },
+        body: "```json review-findings\n{\"schema\":\"review-findings/v1\",\"verdict\":\"changes_requested\",\"findings\":[{\"severity\":\"blocking\",\"path\":\"src/x.ts\",\"line\":10,\"body\":\"Missing null check.\"}]}\n```",
+        html_url: "https://example.com/5",
+      }),
+    ).toEqual({
+      findings: [
+        {
+          source: "review-contract",
+          severity: "blocking",
+          path: "src/x.ts",
+          line: 10,
+          body: "Missing null check.",
+          url: "https://example.com/5",
+        },
+      ],
+      findingsUnavailable: false,
+      verdict: "changes_requested",
+      verdictSource: "review-contract",
+    });
+  });
+
+  it("flags an unclosed block as findingsUnavailable with verdict incomplete", () => {
+    expect(
+      classifyReviewIssueComment({
+        user: { login: "github-actions[bot]", type: "Bot" },
+        body: "```json review-findings\n{\"schema\":\"review-findings/v1\",\"verdict\":\"changes_requested\",\"findings\":[",
+        html_url: "https://example.com/6",
+      }),
+    ).toEqual({
+      findings: [],
+      findingsUnavailable: true,
+      verdict: "incomplete",
+      verdictSource: "review-contract",
+    });
+  });
+
+  it("falls back to heading-based prose extraction for a trusted Claude author with no block", () => {
+    expect(
+      classifyReviewIssueComment({
+        user: { login: "claude" },
+        body: "### Code Review\n\n## Blocking\n- Validate path params before database access.",
+        html_url: "https://example.com/7",
+      }),
+    ).toEqual({
+      findings: [
+        {
+          source: "claude-review-summary",
+          severity: "blocking",
+          body: "Validate path params before database access.",
+          url: "https://example.com/7",
         },
       ],
       findingsUnavailable: false,
