@@ -3,6 +3,7 @@ import { join } from "node:path";
 import type { FailureRecord } from "./pipeline/failure-classification.js";
 import type { FindingDisposition } from "./pipeline/finding-dispositions.js";
 import type { ReferenceRepoResult } from "./reference-repos.js";
+import type { ReviewFixResultMetadataV1 } from "./review-fix-contract.js";
 
 export function collectRunnerComments(workspaceDir: string): Array<{ body: string }> {
   const dir = join(workspaceDir, "ai-output", "comments");
@@ -72,6 +73,13 @@ export async function postRunnerResult(params: {
   /** Per-part {part, prev, new} table from kg-snapshot-push, present for a kg-refresh dry-run (AII-632) or a real `KG_SNAPSHOT_TRACKER_REGRESSION` refusal (AII-638). */
   partTable?: Array<{ part: string; prev: string; new: string }>;
   /**
+   * Optional pilot marker (AII-769 Restate review-fix pilot; AII-770 contract).
+   * Present only when this result comes from a Restate-owned review-fix
+   * attempt. Serialized verbatim — no producer calls this yet (AII-777 is
+   * contracts + validation only).
+   */
+  reviewFix?: ReviewFixResultMetadataV1;
+  /**
    * Resolved callback URL, e.g. from resolveRunnerInputs()/the envelope's runnerCallbackUrl.
    * Falls back to the legacy RUNNER_CALLBACK_URL env var (never set in GHA envelope mode,
    * where the URL travels inside AI_IMPLEMENT_RUN_CONFIG instead).
@@ -105,6 +113,7 @@ export async function postRunnerResult(params: {
   if (params.snapshotBranch) body.snapshotBranch = params.snapshotBranch;
   if (params.guardVerdict) body.guardVerdict = params.guardVerdict;
   if (params.partTable) body.partTable = params.partTable;
+  if (params.reviewFix) body.reviewFix = params.reviewFix;
   const fetchFn = params.fetchImpl ?? fetch;
   try {
     const res = await fetchFn(`${callbackUrl.replace(/\/$/, "")}/runner/result`, {

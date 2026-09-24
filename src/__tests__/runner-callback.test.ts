@@ -18,6 +18,10 @@ import type { Step } from "../pipeline/types.js";
 import type { ReferenceRepoResult } from "../reference-repos.js";
 import type { FailureRecord } from "../pipeline/failure-classification.js";
 import { shouldPostMonitorClassificationComment } from "../completion-classification.js";
+import type {
+  ReviewFixResultMetadataV1,
+  ResultIntakeOutcome,
+} from "../review-fix-contract.js";
 
 // ---------- Hoisted mocks for AII-749 lease-rejected handling ----------
 // Everything else in these two modules passes through to the real
@@ -3282,5 +3286,525 @@ describe("handleRunnerResult — deferred findings (AII-756)", () => {
     expect(res.status).toBe(200);
     expect(res.body.acknowledged).toBe(true);
     expect(reviewStore.getReviewFindingsByKeys("org/repo", 12, [deferredKey])[0]?.status).toBe("deferred");
+  });
+});
+
+// ── AII-777: reviewFix pilot result marker ─────────────────────────────────
+
+describe("handleRunnerResult — reviewFix pilot marker (AII-777)", () => {
+  const validReviewFix: ReviewFixResultMetadataV1 = {
+    version: 1,
+    attemptId: "attempt-1",
+    installationId: 1,
+    repository: "acme/widgets",
+    prNumber: 42,
+    deadlineAt: 1_800_000_000_000,
+    githubRunId: 555,
+    githubRunAttempt: 1,
+    outputCommit: "a".repeat(40),
+  };
+
+  it("an unrelated unknown top-level field does not reject an old (no-reviewFix) result", async () => {
+    const fake = new FakeProvider({ recordCalls: true });
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "success",
+        comments: [],
+        prUrl: "https://github.com/o/r/pull/1",
+        someFutureField: "unrecognised",
+      } as unknown as RunnerCallbackModule.RunnerResultBody,
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+    });
+
+    expect(res.status).toBe(200);
+    expect(fake.getPhase("i")).toBe("pr_ready");
+  });
+
+  it("rejects a present-but-malformed reviewFix marker with 400 invalid_review_fix, before the run token is consumed and with no provider calls", async () => {
+    const fake = new FakeProvider({ recordCalls: true });
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+
+    const first = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "success",
+        comments: [],
+        prUrl: "https://github.com/o/r/pull/1",
+        reviewFix: { version: 1, attemptId: "attempt-1" }, // missing installationId/repository/prNumber/deadlineAt/evidence
+      } as unknown as RunnerCallbackModule.RunnerResultBody,
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+    });
+
+    expect(first.status).toBe(400);
+    expect(first.body.error).toBe("invalid_review_fix");
+    expect(fake.recordedCalls()).toEqual([]);
+
+    // Token must still be usable — the malformed marker must not have burned it.
+    const second = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: { phase: "implementation", outcome: "success", comments: [], prUrl: "https://github.com/o/r/pull/1" },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+    });
+    expect(second.status).toBe(200);
+  });
+
+  it("rejects an unsupported reviewFix version with a distinct 400 invalid_review_fix_version code", async () => {
+    const fake = new FakeProvider({ recordCalls: true });
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "success",
+        comments: [],
+        prUrl: "https://github.com/o/r/pull/1",
+        reviewFix: { ...validReviewFix, version: 2 },
+      } as unknown as RunnerCallbackModule.RunnerResultBody,
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+    });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("invalid_review_fix_version");
+    expect(fake.recordedCalls()).toEqual([]);
+  });
+
+  it("a malformed reviewFix marker rejects even when the rest of the body is an otherwise-valid legacy success", async () => {
+    const fake = new FakeProvider({ recordCalls: true });
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "success",
+        comments: [{ body: "looks good" }],
+        prUrl: "https://github.com/o/r/pull/1",
+        reviewFix: { ...validReviewFix, prNumber: -1 },
+      } as unknown as RunnerCallbackModule.RunnerResultBody,
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+    });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("invalid_review_fix");
+    expect(fake.getPhase("i")).toBeUndefined();
+  });
+
+  it("accepts a valid reviewFix marker and proceeds into unchanged legacy processing when no seam is provided", async () => {
+    const fake = new FakeProvider({ recordCalls: true });
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "success",
+        comments: [],
+        prUrl: "https://github.com/o/r/pull/1",
+        reviewFix: validReviewFix,
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+    });
+
+    expect(res.status).toBe(200);
+    expect(fake.getPhase("i")).toBe("pr_ready");
+  });
+
+  it("accepts a valid reviewFix marker and proceeds into legacy processing when the seam classifies it 'stored'", async () => {
+    const fake = new FakeProvider({ recordCalls: true });
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const onReviewFixResult = vi.fn(
+      (result: ReviewFixResultMetadataV1): ResultIntakeOutcome => ({ status: "stored", result }),
+    );
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "success",
+        comments: [],
+        prUrl: "https://github.com/o/r/pull/1",
+        reviewFix: validReviewFix,
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+      onReviewFixResult,
+    });
+
+    expect(res.status).toBe(200);
+    expect(fake.getPhase("i")).toBe("pr_ready");
+    expect(onReviewFixResult).toHaveBeenCalledWith(validReviewFix);
+  });
+
+  it.each([
+    { status: "duplicate", expectedHttp: 200 },
+    { status: "conflict", expectedHttp: 409 },
+    { status: "stale", expectedHttp: 410 },
+  ] as const)(
+    "maps a '$status' classification to HTTP $expectedHttp with no token consumption and no provider calls",
+    async ({ status, expectedHttp }) => {
+      const fake = new FakeProvider({ recordCalls: true });
+      const { token } = runnerTokens.mintRunToken({
+        issueId: "i",
+        mappingTeamKey: "ENG",
+        phase: "implementation",
+        ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+        secret: SECRET,
+      });
+      const outcome: ResultIntakeOutcome =
+        status === "duplicate"
+          ? { status: "duplicate", attemptId: validReviewFix.attemptId }
+          : { status, attemptId: validReviewFix.attemptId, reason: `already ${status}` };
+      const onReviewFixResult = vi.fn((): ResultIntakeOutcome => outcome);
+
+      const res = await runnerCallback.handleRunnerResult({
+        authorization: `Bearer ${token}`,
+        body: {
+          phase: "implementation",
+          outcome: "success",
+          comments: [{ body: "should not be posted" }],
+          prUrl: "https://github.com/o/r/pull/1",
+          reviewFix: validReviewFix,
+        },
+        secret: SECRET,
+        resolveProvider: makeResolve(fake),
+        onReviewFixResult,
+      });
+
+      expect(res.status).toBe(expectedHttp);
+      expect(res.body.outcome).toBe(status);
+      expect(res.body.retryable).toBe(false);
+      expect(fake.recordedCalls()).toEqual([]);
+      expect(fake.getPhase("i")).toBeUndefined();
+
+      // The token must still be unconsumed — a fresh (reviewFix-free) call with
+      // the same token succeeds.
+      const replay = await runnerCallback.handleRunnerResult({
+        authorization: `Bearer ${token}`,
+        body: { phase: "implementation", outcome: "success", comments: [], prUrl: "https://github.com/o/r/pull/1" },
+        secret: SECRET,
+        resolveProvider: makeResolve(fake),
+      });
+      expect(replay.status).toBe(200);
+    },
+  );
+
+  it("reposting the same attemptId + evidence through the injectable seam classifies identically both times (idempotent)", async () => {
+    const fake = new FakeProvider({ recordCalls: true });
+    const seenAttempts = new Set<string>();
+    const onReviewFixResult = (result: ReviewFixResultMetadataV1): ResultIntakeOutcome => {
+      if (seenAttempts.has(result.attemptId)) return { status: "duplicate", attemptId: result.attemptId };
+      seenAttempts.add(result.attemptId);
+      return { status: "stored", result };
+    };
+
+    const firstToken = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    }).token;
+    const first = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${firstToken}`,
+      body: {
+        phase: "implementation",
+        outcome: "success",
+        comments: [],
+        prUrl: "https://github.com/o/r/pull/1",
+        reviewFix: validReviewFix,
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+      onReviewFixResult,
+    });
+    expect(first.status).toBe(200);
+    expect(fake.getPhase("i")).toBe("pr_ready");
+    const callsAfterFirst = fake.recordedCalls().length;
+
+    const secondToken = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    }).token;
+    const second = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${secondToken}`,
+      body: {
+        phase: "implementation",
+        outcome: "success",
+        comments: [{ body: "retry" }],
+        prUrl: "https://github.com/o/r/pull/1",
+        reviewFix: validReviewFix,
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+      onReviewFixResult,
+    });
+
+    expect(second.status).toBe(200);
+    expect(second.body.outcome).toBe("duplicate");
+    // The retry classified as duplicate before any provider call — call count unchanged.
+    expect(fake.recordedCalls().length).toBe(callsAfterFirst);
+  });
+});
+
+describe("reviewFixResultIntakeResponse (AII-777)", () => {
+  it("maps 'stored' to 200 acknowledged, non-retryable", () => {
+    const res = runnerCallback.reviewFixResultIntakeResponse({
+      status: "stored",
+      result: {
+        version: 1,
+        attemptId: "a",
+        installationId: 1,
+        repository: "o/r",
+        prNumber: 1,
+        deadlineAt: 1,
+        githubRunId: 1,
+        githubRunAttempt: 1,
+        outputCommit: "a".repeat(40),
+      },
+    });
+    expect(res).toEqual({ status: 200, body: { acknowledged: true, outcome: "stored", retryable: false } });
+  });
+
+  it("maps 'duplicate' to 200 acknowledged, non-retryable, carrying attemptId", () => {
+    const res = runnerCallback.reviewFixResultIntakeResponse({ status: "duplicate", attemptId: "a" });
+    expect(res).toEqual({
+      status: 200,
+      body: { acknowledged: true, outcome: "duplicate", attemptId: "a", retryable: false },
+    });
+  });
+
+  it("maps 'conflict' to 409 unacknowledged, non-retryable, carrying reason", () => {
+    const res = runnerCallback.reviewFixResultIntakeResponse({ status: "conflict", attemptId: "a", reason: "r" });
+    expect(res).toEqual({
+      status: 409,
+      body: { acknowledged: false, outcome: "conflict", attemptId: "a", reason: "r", retryable: false },
+    });
+  });
+
+  it("maps 'stale' to 410 unacknowledged, non-retryable, carrying reason", () => {
+    const res = runnerCallback.reviewFixResultIntakeResponse({ status: "stale", attemptId: "a", reason: "r" });
+    expect(res).toEqual({
+      status: 410,
+      body: { acknowledged: false, outcome: "stale", attemptId: "a", reason: "r", retryable: false },
+    });
+  });
+});
+
+describe("isRetryableStatus (AII-777)", () => {
+  it("treats 429 and any 5xx as retryable", () => {
+    expect(runnerCallback.isRetryableStatus(429)).toBe(true);
+    expect(runnerCallback.isRetryableStatus(500)).toBe(true);
+    expect(runnerCallback.isRetryableStatus(503)).toBe(true);
+  });
+
+  it("treats 2xx/4xx (other than 429) as not retryable", () => {
+    expect(runnerCallback.isRetryableStatus(200)).toBe(false);
+    expect(runnerCallback.isRetryableStatus(400)).toBe(false);
+    expect(runnerCallback.isRetryableStatus(409)).toBe(false);
+    expect(runnerCallback.isRetryableStatus(410)).toBe(false);
+  });
+});
+
+// ── AII-777: proposed /runner/activity intake (unwired) ────────────────────
+
+describe("handleRunnerActivity (AII-777)", () => {
+  function activityEvent(overrides: Partial<Record<string, unknown>> = {}): Record<string, unknown> {
+    return {
+      version: 1,
+      attemptId: "attempt-1",
+      producerId: "producer-1",
+      sequence: 0,
+      cycle: 1,
+      kind: "tool-call",
+      timestamp: 1_800_000_000_000,
+      payload: "did a thing",
+      truncated: false,
+      ...overrides,
+    };
+  }
+
+  it("accepts a well-formed activity body with no seam, defaulting to 'accepted'", () => {
+    const res = runnerCallback.handleRunnerActivity({
+      body: {
+        version: 1,
+        attemptId: "attempt-1",
+        producerId: "producer-1",
+        events: [activityEvent()],
+      },
+    });
+    expect(res).toEqual({
+      status: 200,
+      body: { acknowledged: true, outcome: "accepted", attemptId: "attempt-1", retryable: false },
+    });
+  });
+
+  it("accepts a body with a finalSequence at or beyond the last event's sequence", () => {
+    const res = runnerCallback.handleRunnerActivity({
+      body: {
+        version: 1,
+        attemptId: "attempt-1",
+        producerId: "producer-1",
+        events: [activityEvent({ sequence: 0 }), activityEvent({ sequence: 1 })],
+        finalSequence: 1,
+      },
+    });
+    expect(res.status).toBe(200);
+  });
+
+  it("rejects a non-object body", () => {
+    const res = runnerCallback.handleRunnerActivity({ body: "nope" });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("invalid_activity_body");
+  });
+
+  it("rejects an unsupported version with a distinct code", () => {
+    const res = runnerCallback.handleRunnerActivity({
+      body: { version: 2, attemptId: "attempt-1", producerId: "producer-1", events: [] },
+    });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("invalid_activity_version");
+  });
+
+  it("rejects a malformed attemptId", () => {
+    const res = runnerCallback.handleRunnerActivity({
+      body: { version: 1, attemptId: "not an id!", producerId: "producer-1", events: [] },
+    });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("invalid_activity_attempt_id");
+  });
+
+  it("rejects an empty producerId", () => {
+    const res = runnerCallback.handleRunnerActivity({
+      body: { version: 1, attemptId: "attempt-1", producerId: "", events: [] },
+    });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("invalid_activity_producer_id");
+  });
+
+  it("rejects a non-array events field", () => {
+    const res = runnerCallback.handleRunnerActivity({
+      body: { version: 1, attemptId: "attempt-1", producerId: "producer-1", events: "nope" },
+    });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("invalid_activity_events");
+  });
+
+  it("rejects an event whose attemptId does not match the batch's attemptId", () => {
+    const res = runnerCallback.handleRunnerActivity({
+      body: {
+        version: 1,
+        attemptId: "attempt-1",
+        producerId: "producer-1",
+        events: [activityEvent({ attemptId: "attempt-2" })],
+      },
+    });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("invalid_activity_event");
+  });
+
+  it("rejects events out of increasing sequence order", () => {
+    const res = runnerCallback.handleRunnerActivity({
+      body: {
+        version: 1,
+        attemptId: "attempt-1",
+        producerId: "producer-1",
+        events: [activityEvent({ sequence: 1 }), activityEvent({ sequence: 1 })],
+      },
+    });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("invalid_activity_event");
+  });
+
+  it("rejects a finalSequence lower than the last event's sequence", () => {
+    const res = runnerCallback.handleRunnerActivity({
+      body: {
+        version: 1,
+        attemptId: "attempt-1",
+        producerId: "producer-1",
+        events: [activityEvent({ sequence: 5 })],
+        finalSequence: 2,
+      },
+    });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("invalid_activity_final_sequence");
+  });
+
+  it.each([
+    { status: "duplicate", expectedHttp: 200 },
+    { status: "conflict", expectedHttp: 409 },
+    { status: "stale", expectedHttp: 410 },
+  ] as const)("maps a seam '$status' classification to HTTP $expectedHttp, non-retryable", ({ status, expectedHttp }) => {
+    const onReviewFixActivity = vi.fn(
+      () =>
+        (status === "duplicate"
+          ? { status: "duplicate", attemptId: "attempt-1" }
+          : { status, attemptId: "attempt-1", reason: `already ${status}` }) as RunnerCallbackModule.ActivityIntakeOutcome,
+    );
+
+    const res = runnerCallback.handleRunnerActivity({
+      body: {
+        version: 1,
+        attemptId: "attempt-1",
+        producerId: "producer-1",
+        events: [activityEvent()],
+      },
+      onReviewFixActivity,
+    });
+
+    expect(res.status).toBe(expectedHttp);
+    expect(res.body.outcome).toBe(status);
+    expect(res.body.retryable).toBe(false);
+    expect(onReviewFixActivity).toHaveBeenCalledOnce();
   });
 });
