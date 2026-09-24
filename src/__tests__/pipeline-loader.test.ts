@@ -39,6 +39,8 @@ steps:
   - id: feedback-loop
     type: custom
     moduleId: feedback-loop
+  - id: install-retry
+    type: install
   - id: preflight
     type: preflight
   - id: push
@@ -82,6 +84,7 @@ describe("loadPipelineDefinition", () => {
       "install",
       "setup",
       "feedback-loop",
+      "install-retry",
       "preflight",
       "push",
       "verify",
@@ -258,6 +261,40 @@ describe("loadPipelineDefinition", () => {
     const inputs = ctx.resolveInputs(step.inputs);
     expect(inputs.workspaceDir).toBe("/tmp/repo");
     expect(inputs.packageManager).toBe("npm");
+  });
+
+  it("applies install-retry input wiring from clone and install outputs", () => {
+    const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: (_path, _enc) => BUILTIN_PIPELINE_YAML,
+    });
+
+    const ctx = makeContext();
+    ctx.setOutputs("clone", { workspaceDir: "/tmp/repo" });
+    ctx.setOutputs("install", { packageManager: "yarn", installFailed: true });
+
+    const step = pipeline.steps.find((s) => s.id === "install-retry")!;
+    const inputs = ctx.resolveInputs(step.inputs);
+    expect(inputs.workspaceDir).toBe("/tmp/repo");
+    expect(inputs.packageManager).toBe("yarn");
+    expect(inputs.retry).toBe(true);
+  });
+
+  it("skips install-retry when the first install succeeded, runs it when it failed", () => {
+    const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: (_path, _enc) => BUILTIN_PIPELINE_YAML,
+    });
+
+    const step = pipeline.steps.find((s) => s.id === "install-retry")!;
+
+    const ctxSucceeded = makeContext();
+    ctxSucceeded.setOutputs("install", { installFailed: false });
+    expect(step.skip?.(ctxSucceeded)).toBe("first install succeeded");
+
+    const ctxFailed = makeContext();
+    ctxFailed.setOutputs("install", { installFailed: true });
+    expect(step.skip?.(ctxFailed)).toBe(false);
   });
 
   it("applies preflight skip condition based on feedback-loop approval", () => {

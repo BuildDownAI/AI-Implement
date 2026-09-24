@@ -164,6 +164,18 @@ function applyWiring(step: YamlStep): StepDefinition {
         }),
       };
 
+    case "install-retry":
+      return {
+        ...step,
+        inputs: (ctx: PipelineContext) => ({
+          workspaceDir: ctx.getOutputs("clone").workspaceDir,
+          packageManager: ctx.getOutputs("install").packageManager,
+          retry: true,
+        }),
+        skip: (ctx: PipelineContext) =>
+          ctx.getOutputs("install").installFailed === true ? false : "first install succeeded",
+      };
+
     case "setup":
       return {
         ...step,
