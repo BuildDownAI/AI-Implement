@@ -85,6 +85,8 @@ export interface RepoMapping {
   reviewers: ReviewerSelection[] | null;
   /** Max gap-fill runs the orchestrator may start on one PR in 24 hours. NULL means use DEFAULT_PR_DISPATCH_BUDGET. Enforced by `canDispatch` (src/dispatch-gate.ts): at the limit the PR is parked and a human is notified — see [AII-757](https://linear.app/eudoxus/issue/AII-757/park-a-pr-at-its-dispatch-budget-and-ask-for-a-human). */
   prDispatchBudget?: number | null;
+  /** Extra GitHub logins trusted as review authors for this project, additive to the built-in trusted authors (github-actions[bot] and the Claude logins). NULL means built-ins only. */
+  trustedReviewAuthors?: string[] | null;
 }
 
 /** Which reviewers run on this project's PRs, and which of them may hold a merge. */
@@ -224,6 +226,11 @@ function ensureMappingsColumns(): void {
   if (!names.has("pr_dispatch_budget")) {
     db.exec(`ALTER TABLE mappings ADD COLUMN pr_dispatch_budget INTEGER`);
   }
+  if (!names.has("trusted_review_authors")) {
+    // NULL means built-ins only (github-actions[bot] plus the Claude logins) —
+    // this list is additive, not a replacement.
+    db.exec(`ALTER TABLE mappings ADD COLUMN trusted_review_authors TEXT`);
+  }
 }
 
 export function initMappingsTable(): void {
@@ -263,7 +270,10 @@ export function initMappingsTable(): void {
       -- NULL means the default selection (gap-analysis + code-review, both
       -- gating), not an empty list — see resolveReviewerSelection().
       reviewers TEXT,
-      pr_dispatch_budget INTEGER
+      pr_dispatch_budget INTEGER,
+      -- NULL means built-ins only (github-actions[bot] plus the Claude
+      -- logins) — this list is additive, not a replacement.
+      trusted_review_authors TEXT
     )
   `);
   ensureMappingsColumns();
@@ -272,10 +282,10 @@ export function initMappingsTable(): void {
   const count = db.prepare("SELECT COUNT(*) as n FROM mappings").get() as { n: number };
   if (count.n === 0 && Object.keys(SEED_MAPPINGS).length > 0) {
     const insert = db.prepare(
-      "INSERT INTO mappings (team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, auto_merge, extra_env, provider, ticketing_provider, ticketing_config, aws_region, paused, max_turns, max_iterations, max_job_minutes, branch_prefix, skills_repo, reference_repos, sensitive_add_patterns, sensitive_allow_patterns, dependency_token_scope, memory_provider_id, reviewers, pr_dispatch_budget) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      "INSERT INTO mappings (team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, auto_merge, extra_env, provider, ticketing_provider, ticketing_config, aws_region, paused, max_turns, max_iterations, max_job_minutes, branch_prefix, skills_repo, reference_repos, sensitive_add_patterns, sensitive_allow_patterns, dependency_token_scope, memory_provider_id, reviewers, pr_dispatch_budget, trusted_review_authors) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     );
     for (const [key, m] of Object.entries(SEED_MAPPINGS)) {
-      insert.run(key, m.owner, m.repo, m.workflowFile, m.defaultBranch, m.maxInProgressAiIssues, m.executionMode, m.sessionMode, m.machineCpus, m.machineMemoryMb, m.planningEnabled ? 1 : 0, m.planningWorkflowFile, m.autoApprovePlans ? 1 : 0, m.autoMerge ? 1 : 0, Object.keys(m.extraEnv).length > 0 ? JSON.stringify(m.extraEnv) : null, m.provider, m.ticketingProvider, JSON.stringify(m.ticketingConfig), m.awsRegion, m.paused ? 1 : 0, m.maxTurns, m.maxIterations, m.maxJobMinutes, m.branchPrefix, m.skillsRepo, m.referenceRepos ? JSON.stringify(m.referenceRepos) : null, m.sensitiveAddPatterns ? JSON.stringify(m.sensitiveAddPatterns) : null, m.sensitiveAllowPatterns ? JSON.stringify(m.sensitiveAllowPatterns) : null, m.dependencyTokenScope, m.memoryProviderId, m.reviewers ? JSON.stringify(m.reviewers) : null, m.prDispatchBudget ?? null);
+      insert.run(key, m.owner, m.repo, m.workflowFile, m.defaultBranch, m.maxInProgressAiIssues, m.executionMode, m.sessionMode, m.machineCpus, m.machineMemoryMb, m.planningEnabled ? 1 : 0, m.planningWorkflowFile, m.autoApprovePlans ? 1 : 0, m.autoMerge ? 1 : 0, Object.keys(m.extraEnv).length > 0 ? JSON.stringify(m.extraEnv) : null, m.provider, m.ticketingProvider, JSON.stringify(m.ticketingConfig), m.awsRegion, m.paused ? 1 : 0, m.maxTurns, m.maxIterations, m.maxJobMinutes, m.branchPrefix, m.skillsRepo, m.referenceRepos ? JSON.stringify(m.referenceRepos) : null, m.sensitiveAddPatterns ? JSON.stringify(m.sensitiveAddPatterns) : null, m.sensitiveAllowPatterns ? JSON.stringify(m.sensitiveAllowPatterns) : null, m.dependencyTokenScope, m.memoryProviderId, m.reviewers ? JSON.stringify(m.reviewers) : null, m.prDispatchBudget ?? null, m.trustedReviewAuthors ? JSON.stringify(m.trustedReviewAuthors) : null);
     }
     console.log(`[config] Seeded ${Object.keys(SEED_MAPPINGS).length} default mappings`);
   }
@@ -284,7 +294,7 @@ export function initMappingsTable(): void {
 export function getMappings(): Record<string, RepoMapping> {
   const rows = getDb()
     .prepare(
-      "SELECT team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, auto_merge, extra_env, provider, ticketing_provider, ticketing_config, aws_region, paused, max_turns, max_iterations, max_job_minutes, branch_prefix, skills_repo, reference_repos, sensitive_add_patterns, sensitive_allow_patterns, dependency_token_scope, memory_provider_id, reviewers, pr_dispatch_budget FROM mappings",
+      "SELECT team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, auto_merge, extra_env, provider, ticketing_provider, ticketing_config, aws_region, paused, max_turns, max_iterations, max_job_minutes, branch_prefix, skills_repo, reference_repos, sensitive_add_patterns, sensitive_allow_patterns, dependency_token_scope, memory_provider_id, reviewers, pr_dispatch_budget, trusted_review_authors FROM mappings",
     )
     .all() as Array<{
       team_key: string;
@@ -319,6 +329,7 @@ export function getMappings(): Record<string, RepoMapping> {
       memory_provider_id: string | null;
       reviewers: string | null;
       pr_dispatch_budget: number | null;
+      trusted_review_authors: string | null;
     }>;
 
   const result: Record<string, RepoMapping> = {};
@@ -365,6 +376,7 @@ export function getMappings(): Record<string, RepoMapping> {
       memoryProviderId: row.memory_provider_id ?? null,
       reviewers: (() => { try { return row.reviewers ? JSON.parse(row.reviewers) as ReviewerSelection[] : null; } catch { return null; } })(),
       prDispatchBudget: row.pr_dispatch_budget,
+      trustedReviewAuthors: (() => { try { return row.trusted_review_authors ? JSON.parse(row.trusted_review_authors) as string[] : null; } catch { return null; } })(),
     };
   }
   return result;
@@ -373,7 +385,7 @@ export function getMappings(): Record<string, RepoMapping> {
 export function upsertMapping(teamKey: string, mapping: RepoMapping): void {
   getDb()
     .prepare(
-      "INSERT OR REPLACE INTO mappings (team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, auto_merge, extra_env, provider, ticketing_provider, ticketing_config, aws_region, paused, max_turns, max_iterations, max_job_minutes, branch_prefix, skills_repo, reference_repos, sensitive_add_patterns, sensitive_allow_patterns, dependency_token_scope, memory_provider_id, reviewers, pr_dispatch_budget) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      "INSERT OR REPLACE INTO mappings (team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, auto_merge, extra_env, provider, ticketing_provider, ticketing_config, aws_region, paused, max_turns, max_iterations, max_job_minutes, branch_prefix, skills_repo, reference_repos, sensitive_add_patterns, sensitive_allow_patterns, dependency_token_scope, memory_provider_id, reviewers, pr_dispatch_budget, trusted_review_authors) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
     .run(
       teamKey,
@@ -408,6 +420,7 @@ export function upsertMapping(teamKey: string, mapping: RepoMapping): void {
       mapping.memoryProviderId,
       mapping.reviewers ? JSON.stringify(mapping.reviewers) : null,
       mapping.prDispatchBudget ?? null,
+      mapping.trustedReviewAuthors ? JSON.stringify(mapping.trustedReviewAuthors) : null,
     );
 }
 

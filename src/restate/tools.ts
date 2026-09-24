@@ -240,6 +240,7 @@ export const listProjects = tool(
       planningWorkflowFile: m.planningWorkflowFile,
       autoApprovePlans: m.autoApprovePlans,
       reviewers: m.reviewers,
+      trustedReviewAuthors: m.trustedReviewAuthors,
     }));
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   },
@@ -635,8 +636,9 @@ export const ADD_PROJECT_DESCRIPTION =
 /**
  * Exported so the unit tier can `safeParse` the documented "pass null to reset" contract
  * without going through the Restate ingress (AII-720). The nullable fields here must match
- * `upsertMappingAction`'s null-accepting set exactly (src/admin.ts) — reviewers and the four
- * caps, branchPrefix, skillsRepo, dependencyTokenScope, and the two sensitive-glob fields.
+ * `upsertMappingAction`'s null-accepting set exactly (src/admin.ts) — reviewers,
+ * trustedReviewAuthors, and the four caps, branchPrefix, skillsRepo, dependencyTokenScope,
+ * and the two sensitive-glob fields.
  */
 export const addProjectArgsSchema = z.object({
   teamKey: z.string().optional().describe("Team key, e.g. the Linear team key or Jira project key"),
@@ -677,6 +679,9 @@ export const addProjectArgsSchema = z.object({
     ),
   })).nullable().optional().describe(
     "Which reviewers run on this project's PRs. Omit to keep the stored value; pass null to reset to the default (gap-analysis and code-review, both gating).",
+  ),
+  trustedReviewAuthors: z.array(z.string()).nullable().optional().describe(
+    "Extra GitHub logins trusted as review authors for this project, additive to the built-in trusted authors (github-actions[bot] and the Claude logins). Omit to keep the stored value; pass null to reset to built-ins only.",
   ),
 });
 
