@@ -202,6 +202,35 @@ describe("PipelineRunner", () => {
       expect(stepReports[1].outputs).toEqual({ workspaceDir: "/x" });
     });
 
+    it("continues to the next step when the install module resolves with installFailed: true", async () => {
+      const order: string[] = [];
+      const installMod: StepModule = {
+        run: vi.fn(async () => { order.push("install"); return { installFailed: true }; }),
+      };
+      const setupMod: StepModule = {
+        run: vi.fn(async () => { order.push("setup"); return {}; }),
+      };
+
+      const pipeline: PipelineDefinition = {
+        id: "test",
+        steps: [
+          { id: "install", type: "install" },
+          { id: "setup", type: "custom", moduleId: "setup" },
+        ],
+      };
+
+      const runner = new PipelineRunner()
+        .register("install", installMod)
+        .register("setup", setupMod);
+
+      const ctx = makeContext();
+      await runner.run(pipeline, ctx, new NoopStepReporter());
+
+      expect(order).toEqual(["install", "setup"]);
+      expect(setupMod.run).toHaveBeenCalledOnce();
+      expect(ctx.getOutputs("install").installFailed).toBe(true);
+    });
+
     it("reports failed status and rethrows on module error", async () => {
       const reports: Step[] = [];
       const reporter: StepReporter = { report: async (s) => { reports.push({ ...s }); } };
