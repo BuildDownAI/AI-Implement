@@ -422,7 +422,8 @@ export function validateResultIntakeOutcome(raw: unknown): ValidationResult<Resu
 
 export const REVIEW_FIX_ACTIVITY_VERSION = 1 as const;
 
-/** Conservative, documented cap on a redacted activity payload snippet — see docs note in AC risk log. */
+/** Conservative cap on a redacted activity payload snippet, chosen per the issue's guidance to pick a
+ *  documented bound (cf. MAX_DESCRIPTION_CHARS in run-config.ts) since storage consumers build on this shape. */
 const MAX_ACTIVITY_PAYLOAD_CHARS = 8_000;
 const MAX_PRODUCER_ID_LENGTH = 128;
 const MAX_KIND_LENGTH = 64;
@@ -537,10 +538,7 @@ export function validateReviewFixActivityBatch(raw: unknown): ValidationResult<R
       `activity batch final marker has sequence ${final.value.sequence}, expected greater than ${previousSequence}`,
     );
   }
-  if (final.value.lastSequence < previousSequence) {
-    return err(
-      `activity batch final marker has lastSequence ${final.value.lastSequence}, expected at least ${previousSequence}`,
-    );
-  }
+  // final.value.lastSequence >= final.value.sequence is already enforced by
+  // validateReviewFixActivityFinalMarker, so it necessarily exceeds previousSequence too — no separate check needed.
   return ok({ attemptId: attemptId.value, events, final: final.value });
 }
