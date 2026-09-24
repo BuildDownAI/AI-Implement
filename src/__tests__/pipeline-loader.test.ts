@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { loadPipelineDefinition } from "../pipeline/pipeline-loader.js";
+import { loadPipelineDefinition, dependenciesMissing } from "../pipeline/pipeline-loader.js";
 import { DefaultPipelineContext } from "../pipeline/context.js";
 import { PipelineRunner } from "../pipeline/runner.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
@@ -709,6 +709,170 @@ describe("loadPipelineDefinition", () => {
       const ctx = makeContext();
       ctx.setOutputs("feedback-loop", { approved: false });
       expect(push.skip?.(ctx)).toBe(false);
+    });
+  });
+
+  describe("dependenciesMissing", () => {
+    it("is true only when both install and install-retry report installFailed", () => {
+      const bothFailed = makeContext();
+      bothFailed.setOutputs("install", { installFailed: true });
+      bothFailed.setOutputs("install-retry", { installFailed: true });
+      expect(dependenciesMissing(bothFailed)).toBe(true);
+
+      const retrySkipped = makeContext();
+      retrySkipped.setOutputs("install", { installFailed: true });
+      // install-retry never ran (first install succeeded elsewhere in this test) — empty outputs.
+      expect(dependenciesMissing(retrySkipped)).toBe(false);
+
+      const retrySucceeded = makeContext();
+      retrySucceeded.setOutputs("install", { installFailed: true });
+      retrySucceeded.setOutputs("install-retry", { installFailed: false });
+      expect(dependenciesMissing(retrySucceeded)).toBe(false);
+
+      const neitherFailed = makeContext();
+      neitherFailed.setOutputs("install", { installFailed: false });
+      expect(dependenciesMissing(neitherFailed)).toBe(false);
+    });
+  });
+
+  describe("dependenciesMissing gates (AII-826 state table)", () => {
+    function buildPipeline() {
+      return loadPipelineDefinition("pipelines/autonomous.yml", {
+        existsSyncImpl: () => false,
+        readFileSyncImpl: (_path, _enc) => BUILTIN_PIPELINE_YAML,
+      });
+    }
+
+    function setInstallOutputs(
+      ctx: DefaultPipelineContext,
+      opts: { installFailed: boolean; retryFailed?: boolean },
+    ) {
+      ctx.setOutputs("install", { installFailed: opts.installFailed, packageManager: "npm" });
+      if (opts.retryFailed !== undefined) {
+        ctx.setOutputs("install-retry", { installFailed: opts.retryFailed });
+      }
+    }
+
+    it("row: install ok, approved -> preflight/verify run, post-push-review as today, draft=false", () => {
+      const pipeline = buildPipeline();
+      const ctx = makeContext({ hooks: { verify: "scripts/verify.sh" } });
+      setInstallOutputs(ctx, { installFailed: false });
+      ctx.setOutputs("feedback-loop", { approved: true });
+      ctx.setOutputs("push", { branchPushed: true, prNumber: 1 });
+
+      expect(pipeline.steps.find((s) => s.id === "preflight")!.skip?.(ctx)).toBe(false);
+      expect(pipeline.steps.find((s) => s.id === "verify")!.skip?.(ctx)).toBe(false);
+      expect(pipeline.steps.find((s) => s.id === "post-push-review")!.skip?.(ctx)).toBe(false);
+      const pushInputs = ctx.resolveInputs(pipeline.steps.find((s) => s.id === "push")!.inputs);
+      expect(pushInputs.draft).toBe(false);
+    });
+
+    it("row: install ok, unapproved -> preflight/verify/post-push-review skip, draft=true", () => {
+      const pipeline = buildPipeline();
+      const ctx = makeContext({ hooks: { verify: "scripts/verify.sh" } });
+      setInstallOutputs(ctx, { installFailed: false });
+      ctx.setOutputs("feedback-loop", { approved: false });
+      ctx.setOutputs("push", { branchPushed: true, prNumber: 1 });
+
+      expect(pipeline.steps.find((s) => s.id === "preflight")!.skip?.(ctx)).toBe(true);
+      expect(pipeline.steps.find((s) => s.id === "verify")!.skip?.(ctx)).toBe(true);
+      expect(pipeline.steps.find((s) => s.id === "post-push-review")!.skip?.(ctx)).toBe(true);
+      const pushInputs = ctx.resolveInputs(pipeline.steps.find((s) => s.id === "push")!.inputs);
+      expect(pushInputs.draft).toBe(true);
+    });
+
+    it("row: install skipped (no package.json), approved -> preflight/verify run, draft=false", () => {
+      const pipeline = buildPipeline();
+      const ctx = makeContext({ hooks: { verify: "scripts/verify.sh" } });
+      ctx.setOutputs("install", { installFailed: false, installMethod: "skipped: no package.json" });
+      ctx.setOutputs("feedback-loop", { approved: true });
+      ctx.setOutputs("push", { branchPushed: true, prNumber: 1 });
+
+      expect(pipeline.steps.find((s) => s.id === "preflight")!.skip?.(ctx)).toBe(false);
+      expect(pipeline.steps.find((s) => s.id === "verify")!.skip?.(ctx)).toBe(false);
+      expect(pipeline.steps.find((s) => s.id === "post-push-review")!.skip?.(ctx)).toBe(false);
+      const pushInputs = ctx.resolveInputs(pipeline.steps.find((s) => s.id === "push")!.inputs);
+      expect(pushInputs.draft).toBe(false);
+    });
+
+    it("row: install failed, retry ok, approved -> preflight/verify run, draft=false", () => {
+      const pipeline = buildPipeline();
+      const ctx = makeContext({ hooks: { verify: "scripts/verify.sh" } });
+      setInstallOutputs(ctx, { installFailed: true, retryFailed: false });
+      ctx.setOutputs("feedback-loop", { approved: true });
+      ctx.setOutputs("push", { branchPushed: true, prNumber: 1 });
+
+      expect(pipeline.steps.find((s) => s.id === "preflight")!.skip?.(ctx)).toBe(false);
+      expect(pipeline.steps.find((s) => s.id === "verify")!.skip?.(ctx)).toBe(false);
+      expect(pipeline.steps.find((s) => s.id === "post-push-review")!.skip?.(ctx)).toBe(false);
+      const pushInputs = ctx.resolveInputs(pipeline.steps.find((s) => s.id === "push")!.inputs);
+      expect(pushInputs.draft).toBe(false);
+    });
+
+    it("row: install failed, retry ok, unapproved -> preflight/verify/post-push-review skip, draft=true", () => {
+      const pipeline = buildPipeline();
+      const ctx = makeContext({ hooks: { verify: "scripts/verify.sh" } });
+      setInstallOutputs(ctx, { installFailed: true, retryFailed: false });
+      ctx.setOutputs("feedback-loop", { approved: false });
+      ctx.setOutputs("push", { branchPushed: true, prNumber: 1 });
+
+      expect(pipeline.steps.find((s) => s.id === "preflight")!.skip?.(ctx)).toBe(true);
+      expect(pipeline.steps.find((s) => s.id === "verify")!.skip?.(ctx)).toBe(true);
+      expect(pipeline.steps.find((s) => s.id === "post-push-review")!.skip?.(ctx)).toBe(true);
+      const pushInputs = ctx.resolveInputs(pipeline.steps.find((s) => s.id === "push")!.inputs);
+      expect(pushInputs.draft).toBe(true);
+    });
+
+    it("row: both install attempts failed, approved -> preflight skips with reason string, verify/post-push-review skip, draft=true", () => {
+      const pipeline = buildPipeline();
+      const ctx = makeContext({ hooks: { verify: "scripts/verify.sh" } });
+      setInstallOutputs(ctx, { installFailed: true, retryFailed: true });
+      ctx.setOutputs("feedback-loop", { approved: true });
+      ctx.setOutputs("push", { branchPushed: true, prNumber: 1 });
+
+      expect(pipeline.steps.find((s) => s.id === "preflight")!.skip?.(ctx)).toBe("dependency install failed");
+      expect(pipeline.steps.find((s) => s.id === "verify")!.skip?.(ctx)).toBe(true);
+      expect(pipeline.steps.find((s) => s.id === "post-push-review")!.skip?.(ctx)).toBe(true);
+      const pushInputs = ctx.resolveInputs(pipeline.steps.find((s) => s.id === "push")!.inputs);
+      expect(pushInputs.draft).toBe(true);
+    });
+
+    it("row: both install attempts failed, unapproved -> preflight/verify/post-push-review skip (not the reason string), draft=true", () => {
+      const pipeline = buildPipeline();
+      const ctx = makeContext({ hooks: { verify: "scripts/verify.sh" } });
+      setInstallOutputs(ctx, { installFailed: true, retryFailed: true });
+      ctx.setOutputs("feedback-loop", { approved: false });
+      ctx.setOutputs("push", { branchPushed: true, prNumber: 1 });
+
+      expect(pipeline.steps.find((s) => s.id === "preflight")!.skip?.(ctx)).toBe(true);
+      expect(pipeline.steps.find((s) => s.id === "verify")!.skip?.(ctx)).toBe(true);
+      expect(pipeline.steps.find((s) => s.id === "post-push-review")!.skip?.(ctx)).toBe(true);
+      const pushInputs = ctx.resolveInputs(pipeline.steps.find((s) => s.id === "push")!.inputs);
+      expect(pushInputs.draft).toBe(true);
+    });
+
+    it("gap-fill run: both install attempts failed and approved -> push is not skipped", () => {
+      const pipeline = buildPipeline();
+      const ctx = makeContext({ prNumber: "42" });
+      setInstallOutputs(ctx, { installFailed: true, retryFailed: true });
+      ctx.setOutputs("feedback-loop", { approved: true });
+
+      const push = pipeline.steps.find((s) => s.id === "push")!;
+      expect(push.skip?.(ctx)).toBe(false);
+    });
+
+    it("gap-fill run: preflight/verify/post-push-review still skip when dependencies are missing", () => {
+      const pipeline = buildPipeline();
+      const ctx = makeContext({ prNumber: "42", hooks: { verify: "scripts/verify.sh" } });
+      setInstallOutputs(ctx, { installFailed: true, retryFailed: true });
+      ctx.setOutputs("feedback-loop", { approved: true });
+      ctx.setOutputs("push", { branchPushed: true, prNumber: 42 });
+
+      expect(pipeline.steps.find((s) => s.id === "preflight")!.skip?.(ctx)).toBe("dependency install failed");
+      expect(pipeline.steps.find((s) => s.id === "verify")!.skip?.(ctx)).toBe(true);
+      // Gap-fill runs always skip post-push-review (existing prNumber check), independent
+      // of dependenciesMissing.
+      expect(pipeline.steps.find((s) => s.id === "post-push-review")!.skip?.(ctx)).toBe(true);
     });
   });
 });

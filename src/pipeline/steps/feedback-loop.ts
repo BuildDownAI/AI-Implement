@@ -85,6 +85,12 @@ interface FeedbackLoopInputs extends Record<string, unknown> {
   reviewRubric?: string;
   /** Injectable backoff sleep for tests; defaults to a real timer-based wait. */
   sleep?: (ms: number) => Promise<void>;
+  /** True when the first install attempt failed (`install` step output). */
+  installFailed?: boolean;
+  /** The install command that failed (`install` step output). */
+  installMethod?: string;
+  /** Redacted tail of the failed install's output (`install` step output). */
+  installError?: string;
 }
 
 export type TerminationReason =
@@ -140,20 +146,33 @@ function buildImplementPrompt(
   reviewIssues: string[],
   issueIdentifier: string,
   implementationPrompt?: string,
+  installFailed?: boolean,
+  installMethod?: string,
+  installError?: string,
 ): string {
   const basePrompt =
     implementationPrompt && implementationPrompt.trim()
       ? implementationPrompt
       : `Implement the following issue.\n\nTitle: ${issueTitle}\n\nDescription:\n${issueDescription}`;
 
+  let prompt = basePrompt;
+
+  // Appended on every iteration, including review-feedback ones — a
+  // review-feedback pass that doesn't see this reads the test failures as
+  // its own defects.
+  if (installFailed) {
+    prompt += `\n\n## Dependency install failed\n\n\`${installMethod ?? "install"}\` failed in this workspace, so \`node_modules\` is missing or incomplete:\n\n\`\`\`\n${installError ?? ""}\n\`\`\`\n\nBuild, test, lint, and typecheck commands will not work until this is resolved.\nDo not treat their failure as a defect in the code you are asked to change. If the\ndependency problem is within the scope of this issue, fixing it is in scope. The\npipeline runs the install again after you finish. Otherwise work from source and\nsay so in your summary.`;
+  }
+
   if (reviewFeedback || reviewIssues.length > 0) {
     const issueBlock =
       reviewIssues.length > 0
         ? `\n\nReviewer issues:\n${reviewIssues.map((issue, index) => `${index + 1}. ${issue}`).join("\n")}`
         : "";
-    return `${basePrompt}\n\n## Reviewer Feedback\n\nYou previously attempted to implement ${issueIdentifier}: ${issueTitle}.${issueBlock}\n\nReviewer feedback:\n${reviewFeedback ?? "(none)"}\n\nPlease address every listed issue and use the feedback for context.`;
+    prompt += `\n\n## Reviewer Feedback\n\nYou previously attempted to implement ${issueIdentifier}: ${issueTitle}.${issueBlock}\n\nReviewer feedback:\n${reviewFeedback ?? "(none)"}\n\nPlease address every listed issue and use the feedback for context.`;
   }
-  return basePrompt;
+
+  return prompt;
 }
 
 /**
@@ -467,6 +486,9 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
         reviewIssues,
         context.data.issueIdentifier,
         inputs.implementationPrompt !== undefined ? String(inputs.implementationPrompt) : undefined,
+        inputs.installFailed === true,
+        inputs.installMethod !== undefined ? String(inputs.installMethod) : undefined,
+        inputs.installError !== undefined ? String(inputs.installError) : undefined,
       );
 
       // --- implement sub-step (stage-level retry on a transient failure, BAC-27134) ---
@@ -700,6 +722,7 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
             issueDescription: inputs.issueDescription,
             acceptanceBar,
             ...(reviewRubric ? { reviewRubric } : {}),
+            installFailed: inputs.installFailed === true,
           },
           outputs: {},
           logs_url: null,
@@ -718,6 +741,7 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
                 inputs.issueDescription !== undefined ? String(inputs.issueDescription) : undefined,
               acceptanceBar,
               reviewRubric,
+              installFailed: inputs.installFailed === true,
             },
             reporter,
           );
