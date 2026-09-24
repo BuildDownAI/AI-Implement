@@ -91,7 +91,7 @@ import { resolveBaseBranch, findOpenRollUpPr } from "./feature-branch.js";
 import { validateIssueBaseBranch, postBranchComment } from "./base-branch.js";
 import { runMergeUps, clearRollUpHandledMarkersByIdentifier } from "./merge-up.js";
 import { runGroupingBranchAutoMerge } from "./auto-merge.js";
-import { getPendingReviewFixes, recordReviewFixDispatch, updateReviewFixStatus, shouldSkipReviewFix, enqueueReviewFix, buildReviewFixTaskDescription } from "./review-fix-queue.js";
+import { getPendingReviewFixes, recordReviewFixDispatch, updateReviewFixStatus, shouldSkipReviewFix, enqueueReviewFix, buildReviewFixTaskDescription, MAX_TASK_FINDINGS } from "./review-fix-queue.js";
 import { drainCommentGapfillQueue } from "./comment-gapfill-drain.js";
 import { sweepOrphanedGapfillRows } from "./comment-gapfill-queue.js";
 import { processPendingWorkflowSyncs } from "./workflow-sync-queue.js";
@@ -3177,7 +3177,11 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
       // allowed to resolve. Findings that arrive after the snapshot remain open
       // for a later queue event rather than being cleared by an older run.
       const openFindings = listOpenReviewFindings(fix.repo, fix.prNumber);
-      const dispatchFindingIds = openFindings.map((finding) => finding.id);
+      // Must match the slice buildReviewFixTaskDescription renders into the task text
+      // below: a finding beyond MAX_TASK_FINDINGS is never shown to the agent, so it
+      // has to stay "open" rather than being resolved by this dispatch's callback.
+      const taskFindings = openFindings.slice(0, MAX_TASK_FINDINGS);
+      const dispatchFindingIds = taskFindings.map((finding) => finding.id);
 
       const [owner] = fix.repo.split("/");
       const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);

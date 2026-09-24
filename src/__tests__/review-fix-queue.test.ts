@@ -272,6 +272,19 @@ describe("buildReviewFixTaskDescription", () => {
     expect(result).not.toContain("x".repeat(2001));
   });
 
+  it("truncates the issue description to 20,000 characters with a truncation marker", () => {
+    const longDescription = "y".repeat(25000);
+    const result = queue.buildReviewFixTaskDescription({
+      prNumber: 7,
+      reason: "r",
+      findings: [],
+      issueDescription: longDescription,
+    });
+
+    expect(result).toContain(`${"y".repeat(20000)}…(issue text truncated)`);
+    expect(result).not.toContain("y".repeat(20001));
+  });
+
   it("reports the original issue text as unavailable when null", () => {
     const result = queue.buildReviewFixTaskDescription({
       prNumber: 7,

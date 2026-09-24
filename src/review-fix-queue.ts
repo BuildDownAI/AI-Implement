@@ -2,8 +2,9 @@ import { getDb } from "./dedup.js";
 
 export type ReviewFixStatus = "pending" | "dispatched" | "skipped" | "failed";
 
-const MAX_TASK_FINDINGS = 30;
+export const MAX_TASK_FINDINGS = 30;
 const MAX_FINDING_BODY_LENGTH = 2000;
+const MAX_ISSUE_DESCRIPTION_LENGTH = 20000;
 
 export interface ReviewFixTaskFinding {
   finding_key: string;
@@ -31,7 +32,7 @@ export function buildReviewFixTaskDescription(input: {
     `Address review feedback on PR #${input.prNumber}. Queue reason: ${input.reason}.`,
     "## Issue requirements",
     input.issueDescription !== null
-      ? input.issueDescription
+      ? truncateIssueDescription(input.issueDescription)
       : "The original issue text was not available. Treat only defects as in scope.",
     "## Open review findings",
   ];
@@ -69,6 +70,12 @@ function formatTaskFinding(finding: ReviewFixTaskFinding): string {
 
 function truncateFindingBody(body: string): string {
   return body.length > MAX_FINDING_BODY_LENGTH ? `${body.slice(0, MAX_FINDING_BODY_LENGTH)}…` : body;
+}
+
+function truncateIssueDescription(text: string): string {
+  return text.length > MAX_ISSUE_DESCRIPTION_LENGTH
+    ? `${text.slice(0, MAX_ISSUE_DESCRIPTION_LENGTH)}…(issue text truncated)`
+    : text;
 }
 
 export interface ReviewFixQueueItem {
