@@ -60,7 +60,7 @@ export interface ActivityAlert {
 export interface DroppedRange {
   readonly fromSequence: number;
   readonly toSequence: number;
-  readonly reason: "buffer_overflow" | "transport_failure";
+  readonly reason: "buffer_overflow" | "transport_failure" | "attempt_limit_reached";
 }
 
 export interface ActivityReporterStats {
@@ -177,7 +177,10 @@ export class ActivityReporter {
     if (this.closed || this.finalized) return;
     const sequence = this.nextSequence++;
 
-    if (this.attemptLimitReached) return;
+    if (this.attemptLimitReached) {
+      this.recordAttemptLimitDrop(sequence);
+      return;
+    }
 
     const redacted = redactPayload({ action: input.action, detail: input.detail }, this.knownSecretValues);
     let payload = redacted;
@@ -252,8 +255,16 @@ export class ActivityReporter {
           this.finalSequenceSent = true;
           this.lastAckedSequence = this.finalSequence;
         }
-      } else if (this.closed) {
-        return;
+      } else {
+        // A rejected closing/final-only send is just as definitive as an
+        // accepted one — the marker cannot be resolved by resending it
+        // unchanged, so treat it as resolved rather than looping forever.
+        // Unlike the "sent" branch, lastAckedSequence is deliberately left
+        // alone: it is not advanced to finalSequence, so any real gap
+        // between the last successful ack and finalSequence still shows up
+        // via computeMissingTail().
+        if (attachFinal) this.finalSequenceSent = true;
+        if (this.closed) return;
       }
     }
   }
@@ -330,6 +341,23 @@ export class ActivityReporter {
     };
     this.attemptBytesUsed += byteLength(event.payload);
     this.enqueue(event);
+  }
+
+  /**
+   * Records a sequence silently dropped after the per-attempt byte limit was
+   * reached (every `record()` call past the one that produced the
+   * `activity_limit_reached` marker). Coalesces into the trailing range so a
+   * long run of drops doesn't grow `droppedRanges` unbounded, and makes the
+   * gap visible via `computeMissingTail()` even when a later final-sequence
+   * send succeeds.
+   */
+  private recordAttemptLimitDrop(sequence: number): void {
+    const last = this.droppedRanges[this.droppedRanges.length - 1];
+    if (last && last.reason === "attempt_limit_reached" && last.toSequence === sequence - 1) {
+      this.droppedRanges[this.droppedRanges.length - 1] = { ...last, toSequence: sequence };
+      return;
+    }
+    this.droppedRanges.push({ fromSequence: sequence, toSequence: sequence, reason: "attempt_limit_reached" });
   }
 
   private enqueue(event: ReviewFixActivityEvent): void {

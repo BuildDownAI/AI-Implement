@@ -272,6 +272,59 @@ describe("ActivityReporter", () => {
     expect("report" in reporter).toBe(false);
   });
 
+  it("resolves the closing send instead of spinning forever when it is rejected with a definitive non-410 status", async () => {
+    const responses = [
+      response(200, { acknowledged: true, outcome: "accepted", attemptId: "attempt-1" }), // initial batch
+      response(409, { acknowledged: false, outcome: "conflict", attemptId: "attempt-1", reason: "stale final marker" }), // closing send
+    ];
+    let i = 0;
+    const calls: unknown[] = [];
+    const fetchImpl = (async (_url: string | URL, init?: RequestInit) => {
+      calls.push(JSON.parse(String(init?.body)));
+      const res = responses[Math.min(i, responses.length - 1)];
+      i++;
+      return res;
+    }) as typeof fetch;
+
+    const reporter = new ActivityReporter("https://orchestrator.test", "progress-token", "attempt-1", "producer-1", {
+      fetchImpl,
+      retryDelaysMs: [],
+    });
+
+    reporter.record({ cycle: 1, kind: "tool_call", action: "Bash", detail: { i: 1 } });
+    await reporter.flush(); // drains the buffer first, so the closing send below is batch-empty
+    reporter.finalize();
+
+    await reporter.flush(); // must resolve rather than looping on the repeated 409
+
+    // One call to drain the buffer, one for the closing send — no spin.
+    expect(calls).toHaveLength(2);
+    const stats = reporter.getStats();
+    expect(stats.finalSequenceSent).toBe(true);
+  });
+
+  it("keeps a missing-tail signal visible when events are dropped after the per-attempt byte limit is reached, even if the final send succeeds", async () => {
+    const { fetchImpl } = capturingFetch([response(200, { acknowledged: true, outcome: "accepted", attemptId: "attempt-1" })]);
+    const reporter = new ActivityReporter("https://orchestrator.test", "progress-token", "attempt-1", "producer-1", {
+      fetchImpl,
+      retryDelaysMs: [],
+      maxEventBytes: 1000,
+      maxAttemptBytes: 120,
+    });
+
+    for (let i = 0; i < 50; i++) {
+      reporter.record({ cycle: 1, kind: "tool_call", action: "Bash", detail: { i } });
+    }
+    reporter.finalize();
+    await reporter.flush();
+
+    const stats = reporter.getStats();
+    expect(stats.attemptLimitReached).toBe(true);
+    expect(stats.droppedRanges.some((r) => r.reason === "attempt_limit_reached")).toBe(true);
+    expect(stats.finalSequenceSent).toBe(true);
+    expect(stats.missingTail).toBe(true);
+  });
+
   it("sends the finalSequence marker once the buffer has drained, closing the stream", async () => {
     const { fetchImpl, calls } = capturingFetch([response(200, { acknowledged: true, outcome: "accepted", attemptId: "attempt-1" })]);
     const reporter = new ActivityReporter("https://orchestrator.test", "progress-token", "attempt-1", "producer-1", {
