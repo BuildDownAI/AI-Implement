@@ -83,7 +83,7 @@ export interface RepoMapping {
    * An empty array is a distinct, deliberate choice to run no reviewers.
    */
   reviewers: ReviewerSelection[] | null;
-  /** Max gap-fill runs the orchestrator may start on one PR in 24 hours. NULL means use DEFAULT_PR_DISPATCH_BUDGET. Not yet enforced. */
+  /** Max gap-fill runs the orchestrator may start on one PR in 24 hours. NULL means use DEFAULT_PR_DISPATCH_BUDGET. Enforced by `canDispatch` (src/dispatch-gate.ts): at the limit the PR is parked and a human is notified — see [AII-757](https://linear.app/eudoxus/issue/AII-757/park-a-pr-at-its-dispatch-budget-and-ask-for-a-human). */
   prDispatchBudget?: number | null;
 }
 
