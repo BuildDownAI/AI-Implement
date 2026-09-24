@@ -141,8 +141,6 @@ forwarder. Configure the matching `GITHUB_WEBHOOK_SECRET`. Subscribe to
 `issue_comment`, `pull_request`, `pull_request_review`, and
 `pull_request_review_comment` for the iteration scenarios. Use the current
 orchestrator-mediated comment workflow contract on the target repository.
-The legacy `/trigger/gap-fill` endpoint is refused for filesystem projects because
-it dispatches GitHub Actions; use the webhook path above.
 
 Post `/ai-implement` with a concrete follow-up instruction on the PR. The
 orchestrator launches another local Docker run against that PR. Late review

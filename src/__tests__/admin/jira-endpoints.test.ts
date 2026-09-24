@@ -318,7 +318,6 @@ describe("/api/admin/config-status", () => {
     delete process.env.JIRA_SITE_URL;
     delete process.env.RUNNER_CALLBACK_BASE_URL;
     delete process.env.RUNNER_TOKEN_SECRET;
-    delete process.env.GAP_FILL_TRIGGER_SECRET;
   });
 
   it("returns linear: true / jira: false when only Linear client creds set", async () => {
@@ -329,7 +328,7 @@ describe("/api/admin/config-status", () => {
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body)).toEqual({
       linear: true, jira: false, jiraSiteUrl: null,
-      runnerCallback: false, gapFillTrigger: false,
+      runnerCallback: false,
     });
   });
 
@@ -342,7 +341,7 @@ describe("/api/admin/config-status", () => {
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body)).toEqual({
       linear: false, jira: true, jiraSiteUrl: "https://x.atlassian.net",
-      runnerCallback: false, gapFillTrigger: false,
+      runnerCallback: false,
     });
   });
 
@@ -354,13 +353,12 @@ describe("/api/admin/config-status", () => {
     process.env.JIRA_SITE_URL = "https://x.atlassian.net";
     process.env.RUNNER_CALLBACK_BASE_URL = "https://cb";
     process.env.RUNNER_TOKEN_SECRET = "rsec";
-    process.env.GAP_FILL_TRIGGER_SECRET = "gsec";
     const token = await login("secret");
     const res = await request("/api/admin/config-status", "GET", "secret", undefined, token);
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body)).toEqual({
       linear: true, jira: true, jiraSiteUrl: "https://x.atlassian.net",
-      runnerCallback: true, gapFillTrigger: true,
+      runnerCallback: true,
     });
   });
 

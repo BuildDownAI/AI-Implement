@@ -47,7 +47,6 @@ const mockConfig = {
   reaperAlertThreshold: 5,
   runnerCallbackBaseUrl: null,
   runnerTokenSecret: null,
-  gapFillTriggerSecret: null,
   localRunnerImage: "test-local-image",
   localRunnerOrchestratorUrl: null,
   kgSidecarUrl: null,
