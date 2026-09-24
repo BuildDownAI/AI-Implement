@@ -2,6 +2,82 @@ import { getDb } from "./dedup.js";
 
 export type ReviewFixStatus = "pending" | "dispatched" | "skipped" | "failed";
 
+export const MAX_TASK_FINDINGS = 30;
+const MAX_FINDING_BODY_LENGTH = 2000;
+const MAX_ISSUE_DESCRIPTION_LENGTH = 20000;
+
+export interface ReviewFixTaskFinding {
+  finding_key: string;
+  source: string;
+  severity: string;
+  path: string | null;
+  line: number | null;
+  body: string;
+  url: string | null;
+}
+
+/**
+ * Builds a review-fix run's task description: the queue reason, the original
+ * issue's requirements, and the open review findings keyed by finding_key so
+ * the agent can give each one a disposition instead of re-deriving scope from
+ * the raw PR thread.
+ */
+export function buildReviewFixTaskDescription(input: {
+  prNumber: number;
+  reason: string;
+  findings: ReviewFixTaskFinding[];
+  issueDescription: string | null;
+}): string {
+  const sections: string[] = [
+    `Address review feedback on PR #${input.prNumber}. Queue reason: ${input.reason}.`,
+    "## Issue requirements",
+    input.issueDescription !== null
+      ? truncateIssueDescription(input.issueDescription)
+      : "The original issue text was not available. Treat only defects as in scope.",
+    "## Open review findings",
+  ];
+
+  if (input.findings.length === 0) {
+    sections.push("No structured findings are recorded. Read the PR discussion.");
+  } else {
+    const included = input.findings.slice(0, MAX_TASK_FINDINGS);
+    const omitted = input.findings.length - included.length;
+    for (const finding of included) {
+      sections.push(formatTaskFinding(finding));
+    }
+    if (omitted > 0) {
+      sections.push(`${omitted} additional finding${omitted === 1 ? " was" : "s were"} left out of this task; consult the PR discussion for the rest.`);
+    }
+  }
+
+  return sections.join("\n\n");
+}
+
+function formatTaskFinding(finding: ReviewFixTaskFinding): string {
+  const location = finding.path
+    ? (typeof finding.line === "number" ? `${finding.path}:${finding.line}` : finding.path)
+    : undefined;
+  const meta = [finding.source, finding.severity, location].filter((part): part is string => Boolean(part)).join(" · ");
+  const body = truncateFindingBody(finding.body)
+    .split("\n")
+    .map((line) => `> ${line}`)
+    .join("\n");
+
+  const lines = [`### ${finding.finding_key}`, meta, body];
+  if (finding.url) lines.push(finding.url);
+  return lines.join("\n\n");
+}
+
+function truncateFindingBody(body: string): string {
+  return body.length > MAX_FINDING_BODY_LENGTH ? `${body.slice(0, MAX_FINDING_BODY_LENGTH)}…` : body;
+}
+
+function truncateIssueDescription(text: string): string {
+  return text.length > MAX_ISSUE_DESCRIPTION_LENGTH
+    ? `${text.slice(0, MAX_ISSUE_DESCRIPTION_LENGTH)}…(issue text truncated)`
+    : text;
+}
+
 export interface ReviewFixQueueItem {
   id: number;
   issueId: string;
