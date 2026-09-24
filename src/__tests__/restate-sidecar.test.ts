@@ -1,9 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { spawn as realSpawn } from "node:child_process";
+import { spawn as realSpawn, type ChildProcess } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { mkdtempSync, rmSync, writeFileSync, chmodSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { RestateSidecar, restateDataDir, RESTATE_ADMIN_BASE_URL, RESTATE_INGRESS_BIND_ADDRESS } from "../restate/server.js";
+import { getRestateStatus, resetRestateStatus } from "../restate/status.js";
 
 // ---------------------------------------------------------------------------
 // Helpers — mirrors src/__tests__/kg-sidecar.test.ts
@@ -31,6 +33,7 @@ function testSpawn(cmd: string, args: string[], opts: object) {
 afterEach(() => {
   for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
   vi.restoreAllMocks();
+  resetRestateStatus();
 });
 
 // ---------------------------------------------------------------------------
@@ -312,5 +315,262 @@ describe("stop / shutdown", () => {
 
     const sigtermCalls = killSpy.mock.calls.filter(([sig]) => sig === "SIGTERM").length;
     expect(sigtermCalls).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Late readiness — background polling continues past the initial timeout
+// ---------------------------------------------------------------------------
+
+describe("late readiness", () => {
+  it("resolves whenReady() true after the initial timeout, without a second spawn", async () => {
+    const dataDir = makeTmpDir();
+    const script = join(dataDir, "fake-server.sh");
+    writeScript(script, "sleep 60");
+
+    const spawnSpy = vi.fn(testSpawn);
+    let calls = 0;
+    // pollTimeoutMs / pollIntervalMs bounds the initial poll to roughly 10 calls;
+    // answering ready only after 25 guarantees the "true" answer lands in the
+    // background-polling phase, past the initial timeout.
+    const sidecar = new RestateSidecar(
+      { dataDir, pollTimeoutMs: 100, pollIntervalMs: 10 },
+      {
+        httpGet: async () => {
+          calls++;
+          return calls > 25;
+        },
+        spawn: spawnSpy,
+        resolveBinary: () => script,
+      },
+    );
+
+    try {
+      const ready = await sidecar.start();
+      expect(ready).toBe(false);
+      expect(getRestateStatus().sidecar).toEqual({ state: "timeout" });
+
+      await expect(sidecar.whenReady()).resolves.toBe(true);
+      expect(getRestateStatus().sidecar).toEqual({ state: "ready" });
+      expect(spawnSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      await sidecar.stop();
+    }
+  });
+
+  it("exit after a ready sidecar logs code/signal exactly once and status becomes 'exited'", async () => {
+    const dataDir = makeTmpDir();
+    const script = join(dataDir, "fake-server.sh");
+    writeScript(script, "sleep 60");
+
+    const stderrOutput: string[] = [];
+    vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+      stderrOutput.push(args.join(" "));
+    });
+
+    const sidecar = new RestateSidecar(
+      { dataDir, pollTimeoutMs: 5_000, pollIntervalMs: 10 },
+      { httpGet: async () => true, spawn: testSpawn, resolveBinary: () => script },
+    );
+
+    await sidecar.start();
+    await sidecar.stop(); // SIGTERM → child exits
+
+    const exitLines = stderrOutput.filter((line) => line.includes("sidecar exited (code="));
+    expect(exitLines).toHaveLength(1);
+    expect(getRestateStatus().sidecar.state).toBe("exited");
+  });
+
+  it("exit while still degraded (never became ready) resolves whenReady() false", async () => {
+    const dataDir = makeTmpDir();
+    const script = join(dataDir, "fake-server.sh");
+    // Ignores SIGTERM so the SIGKILL backstop fires deterministically (same pattern as
+    // the "no orphan" stop/shutdown test above).
+    writeScript(script, "trap '' TERM; sleep 60");
+
+    const sidecar = new RestateSidecar(
+      { dataDir, pollTimeoutMs: 100, pollIntervalMs: 20, stopTimeoutMs: 200 },
+      { httpGet: async () => false, spawn: testSpawn, resolveBinary: () => script },
+    );
+
+    await sidecar.start();
+    expect(getRestateStatus().sidecar).toEqual({ state: "timeout" });
+
+    await sidecar.stop(); // SIGTERM ignored → SIGKILL backstop exits the child before it ever answers ready
+
+    await expect(sidecar.whenReady()).resolves.toBe(false);
+    expect(getRestateStatus().sidecar).toEqual({ state: "exited", code: null, signal: "SIGKILL" });
+  }, 10_000);
+
+  it("stop() clears background polling — httpGet call count stabilizes", async () => {
+    const dataDir = makeTmpDir();
+    const script = join(dataDir, "fake-server.sh");
+    writeScript(script, "sleep 60");
+
+    let calls = 0;
+    const sidecar = new RestateSidecar(
+      { dataDir, pollTimeoutMs: 50, pollIntervalMs: 10 },
+      {
+        httpGet: async () => {
+          calls++;
+          return false;
+        },
+        spawn: testSpawn,
+        resolveBinary: () => script,
+      },
+    );
+
+    await sidecar.start();
+    expect(getRestateStatus().sidecar).toEqual({ state: "timeout" });
+
+    await sidecar.stop();
+    const callsAtStop = calls;
+
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(calls).toBe(callsAtStop);
+  });
+
+  it("no implicit restart on exit; explicit restart() spawns exactly one new child", async () => {
+    const dataDir = makeTmpDir();
+    const script = join(dataDir, "fake-server.sh");
+    writeScript(script, "exit 0"); // exits immediately every time
+
+    const spawnSpy = vi.fn(testSpawn);
+    const sidecar = new RestateSidecar(
+      { dataDir, pollTimeoutMs: 500, pollIntervalMs: 20 },
+      { httpGet: async () => false, spawn: spawnSpy, resolveBinary: () => script },
+    );
+
+    await sidecar.start();
+    expect(spawnSpy).toHaveBeenCalledTimes(1);
+
+    // The child already exited on its own; nothing should re-spawn it.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(spawnSpy).toHaveBeenCalledTimes(1);
+
+    const ready = await sidecar.restart();
+    expect(spawnSpy).toHaveBeenCalledTimes(2);
+    expect(ready).toBe(false);
+  });
+
+  it("exit fires without a lagging close — status stays 'exited', not clobbered back to 'timeout'", async () => {
+    // Regression test: childDead must be readable as soon as "exit" fires, not only once
+    // "close" fires (which Node does not guarantee is synchronous with "exit" — it lags by
+    // one or more event-loop ticks). This fake child never emits "close" at all, which
+    // pins that the post-timeout guard's `isDead()` check no longer depends on it.
+    const fakeChild = new EventEmitter() as unknown as ChildProcess;
+    Object.assign(fakeChild, { pid: 4242, kill: vi.fn() });
+
+    const sidecar = new RestateSidecar(
+      { dataDir: "/tmp/restate-fake-child", pollTimeoutMs: 60, pollIntervalMs: 15 },
+      {
+        httpGet: async () => false,
+        spawn: () => fakeChild,
+        resolveBinary: () => "/fake/restate-server",
+      },
+    );
+
+    const startPromise = sidecar.start();
+
+    // Fires well inside the polling window, before the readiness deadline elapses —
+    // "close" is deliberately never emitted.
+    setTimeout(() => {
+      fakeChild.emit("exit", 1, null);
+    }, 20);
+
+    const ready = await startPromise;
+    expect(ready).toBe(false);
+    expect(getRestateStatus().sidecar).toEqual({ state: "exited", code: 1, signal: null });
+    await expect(sidecar.whenReady()).resolves.toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Status contract (AII-773, src/restate/status.ts) transitions
+// ---------------------------------------------------------------------------
+
+describe("status contract transitions", () => {
+  it("missing binary → status 'missing-binary'", async () => {
+    const sidecar = new RestateSidecar({}, { spawn: vi.fn(testSpawn), resolveBinary: () => null });
+    await sidecar.start();
+    expect(getRestateStatus().sidecar).toEqual({ state: "missing-binary" });
+  });
+
+  it("early exit during startup → status 'exited' with code/signal", async () => {
+    const dataDir = makeTmpDir();
+    const script = join(dataDir, "fake-server.sh");
+    writeScript(script, "exit 3");
+
+    const sidecar = new RestateSidecar(
+      { dataDir, pollTimeoutMs: 3_000, pollIntervalMs: 50 },
+      { httpGet: async () => false, spawn: testSpawn, resolveBinary: () => script },
+    );
+    await sidecar.start();
+    expect(getRestateStatus().sidecar).toEqual({ state: "exited", code: 3, signal: null });
+  });
+
+  it("readiness timeout without exit → status 'timeout'", async () => {
+    const dataDir = makeTmpDir();
+    const script = join(dataDir, "fake-server.sh");
+    writeScript(script, "sleep 60");
+
+    const sidecar = new RestateSidecar(
+      { dataDir, pollTimeoutMs: 100, pollIntervalMs: 20 },
+      { httpGet: async () => false, spawn: testSpawn, resolveBinary: () => script },
+    );
+    try {
+      await sidecar.start();
+      expect(getRestateStatus().sidecar).toEqual({ state: "timeout" });
+    } finally {
+      await sidecar.stop();
+    }
+  });
+
+  it("ready within the initial timeout → status 'ready'", async () => {
+    const dataDir = makeTmpDir();
+    const script = join(dataDir, "fake-server.sh");
+    writeScript(script, "sleep 60");
+
+    const sidecar = new RestateSidecar(
+      { dataDir, pollTimeoutMs: 5_000, pollIntervalMs: 10 },
+      { httpGet: async () => true, spawn: testSpawn, resolveBinary: () => script },
+    );
+    try {
+      await sidecar.start();
+      expect(getRestateStatus().sidecar).toEqual({ state: "ready" });
+    } finally {
+      await sidecar.stop();
+    }
+  });
+
+  it("spawn 'error' event (e.g. EACCES) → status 'exited', not stuck at 'starting'", async () => {
+    const fakeChild = new EventEmitter() as unknown as ChildProcess;
+    Object.assign(fakeChild, { pid: undefined, kill: vi.fn() });
+
+    const stderrOutput: string[] = [];
+    vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+      stderrOutput.push(args.join(" "));
+    });
+
+    const sidecar = new RestateSidecar(
+      { dataDir: "/tmp/restate-fake-child-error", pollTimeoutMs: 200, pollIntervalMs: 20 },
+      {
+        httpGet: async () => false,
+        spawn: () => fakeChild,
+        resolveBinary: () => "/fake/restate-server",
+      },
+    );
+
+    const startPromise = sidecar.start();
+
+    setTimeout(() => {
+      fakeChild.emit("error", Object.assign(new Error("spawn EACCES"), { code: "EACCES" }));
+    }, 10);
+
+    const ready = await startPromise;
+    expect(ready).toBe(false);
+    expect(getRestateStatus().sidecar).toEqual({ state: "exited", code: null, signal: null });
+    expect(stderrOutput.some((line) => line.includes("sidecar process error"))).toBe(true);
+    await expect(sidecar.whenReady()).resolves.toBe(false);
   });
 });
