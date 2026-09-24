@@ -121,7 +121,7 @@ async function firePrBudgetPark(
 
 function normalizeContractProbeResult(result: ContractProbeResult): WorkflowCapabilities {
   return typeof result === "string"
-    ? { contract: result, supportsRunPublicationToken: false }
+    ? { contract: result, supportsRunPublicationToken: false, supportsAttemptCorrelation: false }
     : result;
 }
 

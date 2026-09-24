@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { dispatchWorkflow, providerDispatchFields, getBranchSha, fetchRepoTarball, ensureBranchExists, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, buildEnvelopeDispatchInputs, cancelWorkflowRun, getPullRequestState, deleteBranch, findPullRequestByBranches, mergePullRequest, getCombinedChecksState, parseLinkNext, listRepoBranchesAndTags, listPullRequestFiles } from "../github.js";
+import { dispatchWorkflow, postWorkflowDispatch, providerDispatchFields, getBranchSha, fetchRepoTarball, ensureBranchExists, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, buildEnvelopeDispatchInputs, cancelWorkflowRun, getPullRequestState, deleteBranch, findPullRequestByBranches, mergePullRequest, getCombinedChecksState, parseLinkNext, listRepoBranchesAndTags, listPullRequestFiles } from "../github.js";
 import { decodeRunConfig, encodeRunConfig } from "../run-config.js";
 import type { RepoMapping } from "../config.js";
 
@@ -143,6 +143,218 @@ describe("dispatchWorkflow", () => {
     await dispatchWorkflow("gh-token", mockMapping, mockInputs);
     const body = JSON.parse((vi.mocked(fetch).mock.calls[0][1] as RequestInit).body as string);
     expect("base_branch" in body.inputs).toBe(false);
+  });
+});
+
+// ---------- postWorkflowDispatch — returnRunDetails (AII-778) ----------
+
+describe("postWorkflowDispatch — returnRunDetails opt-in", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function jsonResponse(status: number, body: unknown): Response {
+    return new Response(JSON.stringify(body), { status });
+  }
+
+  function textResponse(status: number, body: string | null): Response {
+    return new Response(body, { status });
+  }
+
+  const baseOpts = {
+    token: "tok",
+    owner: "acme",
+    repo: "widgets",
+    workflowFile: "claude-implement.yml",
+    ref: "main",
+    inputs: { run_config: "cfg", run_token: "rt" },
+  };
+
+  it("sends return_run_details: true in the POST body when opted in", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(textResponse(204, null));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await postWorkflowDispatch({ ...baseOpts, returnRunDetails: true });
+
+    const body = JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body));
+    expect(body.return_run_details).toBe(true);
+  });
+
+  it("omits return_run_details from the POST body when not opted in (legacy byte-for-byte)", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(textResponse(204, null));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await postWorkflowDispatch(baseOpts);
+
+    const body = JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body));
+    expect("return_run_details" in body).toBe(false);
+    expect(result).toEqual({ success: true, status: 204 });
+    expect("outcome" in result).toBe(false);
+  });
+
+  it("200 with valid run details for the requested repo → accepted with exact identity", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(
+      jsonResponse(200, {
+        id: 555,
+        html_url: "https://github.com/acme/widgets/actions/runs/555",
+        repository: { full_name: "acme/widgets" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await postWorkflowDispatch({ ...baseOpts, returnRunDetails: true });
+
+    expect(result).toEqual({
+      success: true,
+      status: 200,
+      outcome: "accepted",
+      runId: 555,
+      runUrl: "https://github.com/acme/widgets/actions/runs/555",
+    });
+  });
+
+  it("204 → accepted with unresolved identity, distinct from rejected", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(textResponse(204, null));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await postWorkflowDispatch({ ...baseOpts, returnRunDetails: true });
+
+    expect(result).toEqual({ success: true, status: 204, outcome: "accepted" });
+    expect("runId" in result).toBe(false);
+    expect("runUrl" in result).toBe(false);
+  });
+
+  it("a definite 422/404 application rejection → rejected", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(textResponse(422, "Unprocessable Entity"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await postWorkflowDispatch({ ...baseOpts, returnRunDetails: true });
+
+    expect(result).toEqual({
+      success: false,
+      status: 422,
+      error: "Unprocessable Entity",
+      outcome: "rejected",
+    });
+  });
+
+  it("a transport failure (thrown fetch) → unknown, without throwing", async () => {
+    const fetchMock = vi.fn().mockRejectedValueOnce(new Error("network reset"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await postWorkflowDispatch({ ...baseOpts, returnRunDetails: true });
+
+    expect(result.success).toBe(false);
+    expect(result.outcome).toBe("unknown");
+  });
+
+  it("legacy (non-opted-in) throws on a transport failure, unchanged", async () => {
+    const fetchMock = vi.fn().mockRejectedValueOnce(new Error("network reset"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(postWorkflowDispatch(baseOpts)).rejects.toThrow("network reset");
+  });
+
+  it("an unparseable 200 body → unknown, not accepted", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(
+      new Response("not json", { status: 200 }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await postWorkflowDispatch({ ...baseOpts, returnRunDetails: true });
+
+    expect(result).toEqual({ success: true, status: 200, outcome: "unknown" });
+    expect("runId" in result).toBe(false);
+  });
+
+  it("a 5xx (ambiguous server outcome) → unknown, not rejected", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(textResponse(503, "Service Unavailable"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await postWorkflowDispatch({ ...baseOpts, returnRunDetails: true });
+
+    expect(result).toEqual({
+      success: false,
+      status: 503,
+      error: "Service Unavailable",
+      outcome: "unknown",
+    });
+  });
+
+  it("a 200 body whose html_url points at a different repo never populates trusted identity", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(
+      jsonResponse(200, {
+        id: 999,
+        html_url: "https://github.com/other-org/other-repo/actions/runs/999",
+        repository: { full_name: "other-org/other-repo" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await postWorkflowDispatch({ ...baseOpts, returnRunDetails: true });
+
+    expect(result).toEqual({ success: true, status: 200, outcome: "unknown" });
+    expect("runId" in result).toBe(false);
+    expect("runUrl" in result).toBe(false);
+  });
+
+  it("a 200 body whose repository field disagrees with a matching html_url never populates trusted identity", async () => {
+    // html_url alone can't be trusted if another field on the same payload contradicts it —
+    // both signals must agree before identity is trusted.
+    const fetchMock = vi.fn().mockResolvedValueOnce(
+      jsonResponse(200, {
+        id: 42,
+        html_url: "https://github.com/acme/widgets/actions/runs/42",
+        repository: { full_name: "acme/other-repo" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await postWorkflowDispatch({ ...baseOpts, returnRunDetails: true });
+
+    expect(result).toEqual({ success: true, status: 200, outcome: "unknown" });
+  });
+
+  it("still performs the existing 422 strip-and-retry when returnRunDetails is also requested", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(textResponse(422, 'Unexpected inputs provided: ["runner_phase"]'))
+      .mockResolvedValueOnce(textResponse(204, null));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await postWorkflowDispatch({
+      ...baseOpts,
+      inputs: { run_config: "cfg", run_token: "rt", runner_phase: "kg-refresh" },
+      returnRunDetails: true,
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const secondBody = JSON.parse(String((fetchMock.mock.calls[1][1] as RequestInit).body));
+    expect("runner_phase" in secondBody.inputs).toBe(false);
+    expect(secondBody.return_run_details).toBe(true);
+    expect(result).toEqual({ success: true, status: 204, outcome: "accepted" });
+  });
+
+  it("never repeats a POST following an unknown outcome (no retry loop on ambiguity)", async () => {
+    // Only the definite 422 strip-and-retry path issues a second request; an unknown
+    // outcome (transport loss, unparseable/mismatched 200, 5xx) must return immediately so
+    // a caller building retry logic on this contract never double-dispatches.
+    const fetchMock = vi.fn().mockRejectedValueOnce(new Error("timeout"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await postWorkflowDispatch({ ...baseOpts, returnRunDetails: true });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("dispatchWorkflow (used by index.ts and comment-gapfill-drain.ts) never opts into returnRunDetails", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(textResponse(204, null));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await dispatchWorkflow("gh-token", mockMapping, mockInputs);
+
+    const body = JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body));
+    expect("return_run_details" in body).toBe(false);
+    expect(result).toEqual({ success: true, status: 204 });
   });
 });
 
