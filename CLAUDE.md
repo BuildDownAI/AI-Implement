@@ -243,6 +243,7 @@ Editable per mapping; blank means the default.
 | Branch Prefix | none | Path segment prepended to the implementation branch |
 | Sensitive Add / Allow Globs | none | Extends or un-blocks the push step's blocklist; **allow always wins** |
 | Dependency Token Scope | off | `installation` lets the run read private sibling repos during dependency install |
+| PR Dispatch Budget | 4 | Gap-fill runs per PR per rolling 24 h; at the limit the PR is parked for a human |
 
 **Secrets** seeded via the Projects-row action stop at the hooks — they are stripped from the model process and the agent never sees them. On Fly, they are also excluded at the Fly boundary by default (process-level mode). **Extra Env** entries are passed through to the model process and are visible to the agent.
 
