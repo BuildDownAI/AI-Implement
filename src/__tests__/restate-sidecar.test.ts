@@ -542,4 +542,35 @@ describe("status contract transitions", () => {
       await sidecar.stop();
     }
   });
+
+  it("spawn 'error' event (e.g. EACCES) → status 'exited', not stuck at 'starting'", async () => {
+    const fakeChild = new EventEmitter() as unknown as ChildProcess;
+    Object.assign(fakeChild, { pid: undefined, kill: vi.fn() });
+
+    const stderrOutput: string[] = [];
+    vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+      stderrOutput.push(args.join(" "));
+    });
+
+    const sidecar = new RestateSidecar(
+      { dataDir: "/tmp/restate-fake-child-error", pollTimeoutMs: 200, pollIntervalMs: 20 },
+      {
+        httpGet: async () => false,
+        spawn: () => fakeChild,
+        resolveBinary: () => "/fake/restate-server",
+      },
+    );
+
+    const startPromise = sidecar.start();
+
+    setTimeout(() => {
+      fakeChild.emit("error", Object.assign(new Error("spawn EACCES"), { code: "EACCES" }));
+    }, 10);
+
+    const ready = await startPromise;
+    expect(ready).toBe(false);
+    expect(getRestateStatus().sidecar).toEqual({ state: "exited", code: null, signal: null });
+    expect(stderrOutput.some((line) => line.includes("sidecar process error"))).toBe(true);
+    await expect(sidecar.whenReady()).resolves.toBe(false);
+  });
 });

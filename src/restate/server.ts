@@ -180,6 +180,7 @@ export class RestateSidecar {
       console.error(`[restate] sidecar process error: ${err.message}`);
       childDead = true;
       if (this._child === child) this._child = null;
+      setRestateStatus({ sidecar: { state: "exited", code: null, signal: null } });
       deferred.resolve(false);
     });
     child.on("exit", (code, signal) => {
