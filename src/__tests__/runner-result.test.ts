@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { fetchPlanningContextFromOrchestrator, postRunnerResult } from "../runner-result.js";
 import type { ReferenceRepoResult } from "../reference-repos.js";
 import type { FindingDisposition } from "../pipeline/finding-dispositions.js";
+import type { ReviewFixResultMetadataV1 } from "../review-fix-contract.js";
 
 describe("fetchPlanningContextFromOrchestrator", () => {
   it("GETs /runner/planning-context with the progress token and returns the context", async () => {
@@ -232,6 +233,50 @@ describe("postRunnerResult", () => {
     const body = JSON.parse(vi.mocked(fetchImpl).mock.calls[0][1]!.body as string);
     expect(body).not.toHaveProperty("guardVerdict");
     expect(body).not.toHaveProperty("partTable");
+  });
+
+  it("includes reviewFix in body when present (AII-777)", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    const reviewFix: ReviewFixResultMetadataV1 = {
+      version: 1,
+      attemptId: "attempt-1",
+      installationId: 1,
+      repository: "acme/widgets",
+      prNumber: 42,
+      deadlineAt: 1_800_000_000_000,
+      githubRunId: 555,
+      githubRunAttempt: 1,
+      outputCommit: "a".repeat(40),
+    };
+
+    await postRunnerResult({
+      workspaceDir: "/tmp",
+      phase: "gap-analysis",
+      outcome: "success",
+      prUrl: "https://github.com/o/r/pull/1",
+      callbackUrl: "https://cb",
+      reviewFix,
+      fetchImpl,
+    });
+
+    const body = JSON.parse(vi.mocked(fetchImpl).mock.calls[0][1]!.body as string);
+    expect(body.reviewFix).toEqual(reviewFix);
+  });
+
+  it("omits reviewFix from body when not provided", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+
+    await postRunnerResult({
+      workspaceDir: "/tmp",
+      phase: "implementation",
+      outcome: "success",
+      prUrl: "https://github.com/o/r/pull/1",
+      callbackUrl: "https://cb",
+      fetchImpl,
+    });
+
+    const body = JSON.parse(vi.mocked(fetchImpl).mock.calls[0][1]!.body as string);
+    expect(body).not.toHaveProperty("reviewFix");
   });
 
   it("logs the status and does not claim success when the post is refused", async () => {
