@@ -1,9 +1,13 @@
-const MODEL_CREDENTIAL_KEYS = [
+// Exported (alongside GITHUB_WRITE_CREDENTIAL_KEYS and parseForwardedSecrets below)
+// so other modules that need to recognise these same credential surfaces — e.g. the
+// activity reporter's redaction pass — can reuse this list instead of maintaining a
+// second one that could drift from what actually gets stripped here.
+export const MODEL_CREDENTIAL_KEYS = [
   "ANTHROPIC_API_KEY",
   "CLAUDE_CODE_OAUTH_TOKEN",
 ] as const;
 
-const RUNNER_CREDENTIAL_KEYS = [
+export const RUNNER_CREDENTIAL_KEYS = [
   "RUN_PROGRESS_TOKEN",
   "RUN_PUBLICATION_TOKEN",
   "RUN_TOKEN",
@@ -13,7 +17,7 @@ const RUNNER_CREDENTIAL_KEYS = [
 // secrets rail and is stripped by name below, but it is also stripped here so
 // a token injected outside that rail (e.g. an app-wide Fly secret or a local
 // Docker env) still never reaches the model.
-const INSTALL_CREDENTIAL_KEYS = ["NPM_TOKEN"] as const;
+export const INSTALL_CREDENTIAL_KEYS = ["NPM_TOKEN"] as const;
 
 export const GITHUB_WRITE_CREDENTIAL_KEYS = [
   "GITHUB_TOKEN",
