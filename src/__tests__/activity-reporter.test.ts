@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ActivityReporter, type ActivityAlert } from "../pipeline/activity-reporter.js";
+import { handleRunnerActivity } from "../runner-callback.js";
 
 function response(status: number, body: unknown = {}): Response {
   return {
@@ -450,6 +451,34 @@ describe("ActivityReporter", () => {
 
     expect(calls).toHaveLength(1);
     expect((calls[0].body as any).finalSequence).toBe(reporter.getStats().finalSequence);
+    expect(reporter.getStats().finalSequenceSent).toBe(true);
+    expect(reporter.getStats().missingTail).toBe(false);
+  });
+
+  it("closes an empty stream with a valid, stable marker across transport retries", async () => {
+    const bodies: unknown[] = [];
+    const fetchImpl = (async (_url: string | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body));
+      bodies.push(body);
+      if (bodies.length === 1) throw new TypeError("temporary network failure");
+      const result = handleRunnerActivity({ body });
+      return response(result.status, result.body);
+    }) as typeof fetch;
+    const reporter = new ActivityReporter("https://orchestrator.test", "progress-token", "attempt-1", "producer-1", {
+      fetchImpl,
+      retryDelaysMs: [0],
+      now: () => 1_800_000_000_000,
+    });
+
+    reporter.finalize();
+    await reporter.flush();
+
+    expect(bodies).toHaveLength(2);
+    expect(bodies[1]).toEqual(bodies[0]);
+    expect(bodies[1]).toMatchObject({
+      finalSequence: 0,
+      events: [{ sequence: 0, kind: "activity_stream_empty", timestamp: 1_800_000_000_000 }],
+    });
     expect(reporter.getStats().finalSequenceSent).toBe(true);
     expect(reporter.getStats().missingTail).toBe(false);
   });
