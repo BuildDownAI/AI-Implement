@@ -185,6 +185,8 @@ function mountDrawer(job: unknown, steps: unknown[]): { win: any; doc: Document 
       .replace(/"/g, "&quot;")
       .replace(/'/g, "&#39;");
   win.safeUrl = (s: unknown) => (s == null ? "#" : String(s));
+  win.isAdmin = () => true;
+  win.confirm = () => true;
   const script = dom.window.document.createElement("script");
   script.textContent = drawerScript;
   dom.window.document.head.appendChild(script);
@@ -461,6 +463,385 @@ describe("job drawer failure evidence", () => {
     const preAfter = doc.getElementById("failure-stderr-implement") as unknown as { scrollTop: number } | null;
     expect(preAfter).toBeTruthy();
     expect(preAfter!.scrollTop).toBe(77);
+    win.closeJobDrawer();
+  });
+});
+
+// ---- Restate review-fix attempt section (AII-808) ----
+//
+// AII-806's `/api/review-fix/attempts/:id` and `/:id/activity` contract landed in this
+// tree (see ReviewFixAttemptDetail/ReviewFixActivityPage in src/admin.ts), but nothing
+// in the job-steps response yet marks *which* job owns which attempt. The attempt store
+// keys `review_fix_attempts.attempt_id` on the admission `dispatchId` (already present
+// on every Job — src/review-fix-attempt-store.ts's `lifecycleOwner: { kind: "restate",
+// attemptId: dispatchId }`), so the drawer probes `GET /api/review-fix/attempts/:dispatchId`
+// itself: a 404/501 (no such attempt, or the facade isn't configured) renders the job
+// exactly as Legacy, and a 200 renders the pilot section alongside it. This scoped
+// assumption is called out here because wiring a dedicated field onto the job response
+// is out of this issue's file list (src/admin-ui/drawer.ts and its test only).
+
+const PILOT_JOB = {
+  id: 10,
+  issueId: "i-10",
+  issueIdentifier: "AII-808",
+  issueTitle: "Pilot job",
+  teamKey: "AII",
+  repo: "org/repo",
+  dispatchedAt: Date.now() - 120000,
+  dispatchNumber: 1,
+  dispatchId: "attempt-10",
+  status: "running",
+  conclusion: null,
+  prUrl: null,
+  completedAt: null,
+  executionMode: "github-actions",
+  machineId: null,
+  runnerMode: null,
+  runId: null,
+  failure: null,
+};
+
+function pilotAttemptFixture(overrides: Record<string, unknown> = {}) {
+  return {
+    attemptId: "attempt-10",
+    owner: { kind: "unknown" },
+    execution: null,
+    deadlineAt: Date.now() + 5 * 60000,
+    pendingFeedback: true,
+    snapshot: {
+      taskText: "Fix the flaky test <script>alert(1)</script>",
+      findings: [{ findingKey: "flaky-test", version: 2 }],
+    },
+    state: "running",
+    evidenceComplete: false,
+    terminationConfirmed: false,
+    cycles: [
+      {
+        cycle: 1,
+        inputCommit: "abc123def456",
+        outputCommit: null,
+        dispositions: [{ key: "lint", disposition: "fixed" }],
+        tests: [{ name: "unit", status: "passed" }],
+        verdict: { approved: null, reason: "awaiting next cycle" },
+        usage: { tokensIn: 100, tokensOut: 200, costUsd: 0.5 },
+        completedAt: Date.now() - 60000,
+      },
+    ],
+    ...overrides,
+  };
+}
+
+const ACTIVITY_PAGE_1 = {
+  events: [
+    { producerId: "p1", sequence: 1, cycle: 1, kind: "tool_call", occurredAt: Date.now() - 30000, payload: "<script>alert(1)</script>", truncated: false, byteCount: 30 },
+    { producerId: "p1", sequence: 2, cycle: 1, kind: "tool_result", occurredAt: Date.now() - 20000, payload: null, truncated: true, byteCount: 0 },
+  ],
+  nextCursor: { producerId: "p1", sequence: 2 },
+  truncated: true,
+};
+
+const ACTIVITY_PAGE_2 = {
+  events: [
+    { producerId: "p1", sequence: 3, cycle: 1, kind: "tool_call", occurredAt: Date.now() - 10000, payload: "second page payload", truncated: false, byteCount: 20 },
+  ],
+  nextCursor: null,
+  truncated: false,
+};
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function mountPilotDrawer(opts: {
+  job: unknown;
+  attemptStatus: number;
+  attempt?: unknown;
+  activityPages?: unknown[];
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  onAction?: (action: string, body: any) => { status: number; body: Record<string, unknown> };
+}): { win: any; doc: Document; calls: string[] } {
+  const { win, doc } = mountDrawer(opts.job, []);
+  const activityQueue = (opts.activityPages || [ACTIVITY_PAGE_1]).slice();
+  const calls: string[] = [];
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  win.api = async (url: string, reqOpts?: any) => {
+    calls.push(url);
+    if (url === "/api/mappings") return { ok: true, status: 200, json: async () => ({}) };
+    if (url === "/api/jobs/" + (opts.job as { id: number }).id + "/steps") {
+      return { ok: true, status: 200, json: async () => ({ job: opts.job, steps: [] }) };
+    }
+    if (url.includes("/activity")) {
+      const page = activityQueue.shift() || { events: [], nextCursor: null, truncated: false };
+      return { ok: true, status: 200, json: async () => page };
+    }
+    const actionMatch = url.match(/\/api\/review-fix\/attempts\/[^/]+\/(reconcile|adopt|cancel)$/);
+    if (actionMatch && reqOpts && reqOpts.method === "POST") {
+      const action = actionMatch[1];
+      const body = reqOpts.body ? JSON.parse(reqOpts.body) : undefined;
+      const outcome = opts.onAction
+        ? opts.onAction(action, body)
+        : { status: 202, body: { status: "accepted" } };
+      return { ok: outcome.status < 300, status: outcome.status, json: async () => outcome.body };
+    }
+    if (/\/api\/review-fix\/attempts\/[^/]+$/.test(url)) {
+      return { ok: opts.attemptStatus < 300, status: opts.attemptStatus, json: async () => opts.attempt ?? {} };
+    }
+    throw new Error("mountPilotDrawer: unexpected url " + url);
+  };
+  return { win, doc, calls };
+}
+
+describe("job drawer restate attempt section", () => {
+  it("keeps the pilot section hidden for a legacy job with no dispatchId", async () => {
+    const { win, doc } = mountDrawer({ ...PILOT_JOB, dispatchId: null }, []);
+    win.api = async (url: string) => {
+      if (url === "/api/mappings") return { ok: true, status: 200, json: async () => ({}) };
+      return { ok: true, status: 200, json: async () => ({ job: { ...PILOT_JOB, dispatchId: null }, steps: [] }) };
+    };
+    await win.openJobDrawer(10);
+    expect(doc.getElementById("drawer-pilot-heading")!.hidden).toBe(true);
+    expect(doc.getElementById("drawer-pilot")!.hidden).toBe(true);
+    win.closeJobDrawer();
+  });
+
+  it("renders lifecycle owner, state/deadline, snapshot, cycles, and activity for a pilot fixture without throwing", async () => {
+    const { win, doc } = mountPilotDrawer({ job: PILOT_JOB, attemptStatus: 200, attempt: pilotAttemptFixture() });
+    await win.openJobDrawer(10);
+
+    expect(doc.getElementById("drawer-pilot")!.hidden).toBe(false);
+    expect(doc.getElementById("drawer-pilot-heading")!.hidden).toBe(false);
+    expect(doc.getElementById("drawer-pilot-state-badge")!.textContent).toContain("running");
+    expect(doc.getElementById("drawer-pilot-state-badge")!.textContent).toContain("pending feedback");
+    expect(doc.getElementById("drawer-pilot-snapshot-text")!.textContent).toBe("Fix the flaky test <script>alert(1)</script>");
+    expect(doc.getElementById("drawer-pilot-cycles")!.textContent).toContain("cycle 1");
+    expect(doc.getElementById("drawer-pilot-cycle-count")!.textContent).toBe("1 cycle");
+    win.closeJobDrawer();
+  });
+
+  it("never shows a pending verdict, missing evidence, or a truncated activity page as success", async () => {
+    const { win, doc } = mountPilotDrawer({ job: PILOT_JOB, attemptStatus: 200, attempt: pilotAttemptFixture() });
+    await win.openJobDrawer(10);
+
+    // Verdict is explicitly null on the fixture — must read as pending, never approved.
+    const cycleHtml = doc.getElementById("drawer-pilot-cycles")!.innerHTML;
+    expect(cycleHtml).toContain("verdict pending");
+    expect(cycleHtml).not.toContain("approved");
+    expect(cycleHtml).toContain("no output commit");
+
+    // evidenceComplete/terminationConfirmed are both false on the fixture.
+    const flagsText = doc.getElementById("drawer-pilot-evidence-flags")!.textContent || "";
+    expect(flagsText).toContain("evidence incomplete");
+    expect(flagsText).toContain("termination unconfirmed");
+
+    // The activity page is marked truncated and has an event with no payload.
+    const activityText = doc.getElementById("drawer-pilot-activity")!.textContent || "";
+    expect(activityText).toContain("no payload recorded");
+    expect(doc.getElementById("drawer-pilot-activity-count")!.textContent).toContain("stream truncated");
+    win.closeJobDrawer();
+  });
+
+  it("shows an explicit unavailable banner instead of silent success when Restate cannot be reached", async () => {
+    const { win, doc } = mountPilotDrawer({ job: PILOT_JOB, attemptStatus: 503 });
+    await win.openJobDrawer(10);
+
+    expect(doc.getElementById("drawer-pilot")!.hidden).toBe(false);
+    expect(doc.getElementById("drawer-pilot-unavailable")!.textContent).toContain("Attempt data unavailable");
+    expect(doc.getElementById("drawer-pilot-cycles")!.innerHTML).toBe("");
+    // Recovery actions remain available even though the read side is degraded.
+    expect(doc.getElementById("drawer-pilot-reconcile")).toBeTruthy();
+    win.closeJobDrawer();
+  });
+
+  it("renders nothing pilot-specific for a dispatchId with no attempt record (404) or an unconfigured facade (501)", async () => {
+    for (const status of [404, 501]) {
+      const { win, doc } = mountPilotDrawer({ job: PILOT_JOB, attemptStatus: status });
+      await win.openJobDrawer(10);
+      expect(doc.getElementById("drawer-pilot")!.hidden).toBe(true);
+      expect(doc.getElementById("drawer-pilot-heading")!.hidden).toBe(true);
+      win.closeJobDrawer();
+    }
+  });
+
+  it("shows recovery controls for an unknown launch state without any force-release action", async () => {
+    const { win, doc } = mountPilotDrawer({
+      job: PILOT_JOB,
+      attemptStatus: 200,
+      attempt: pilotAttemptFixture({ execution: null, owner: { kind: "unknown" } }),
+    });
+    await win.openJobDrawer(10);
+
+    expect(doc.getElementById("drawer-pilot-links")!.textContent).toContain("launch state unknown");
+    const actionsHtml = doc.getElementById("drawer-pilot-actions")!.innerHTML;
+    expect(actionsHtml).toContain("Reconcile");
+    expect(actionsHtml).toContain("Adopt");
+    expect(actionsHtml).toContain("Cancel attempt");
+    expect(actionsHtml.toLowerCase()).not.toContain("force");
+    win.closeJobDrawer();
+  });
+
+  it("cannot be injected via a tool activity payload containing markup", async () => {
+    const { win, doc } = mountPilotDrawer({ job: PILOT_JOB, attemptStatus: 200, attempt: pilotAttemptFixture() });
+    await win.openJobDrawer(10);
+
+    const pres = doc.querySelectorAll("#drawer-pilot-activity pre");
+    expect(pres.length).toBeGreaterThan(0);
+    let found = false;
+    pres.forEach((pre) => {
+      if (pre.textContent && pre.textContent.includes("<script>alert(1)</script>")) found = true;
+      expect(pre.querySelector("script")).toBeNull();
+    });
+    expect(found).toBe(true);
+    win.closeJobDrawer();
+  });
+
+  it("caps the activity fetch at the fixed page size and only loads another page on demand", async () => {
+    const { win, doc, calls } = mountPilotDrawer({
+      job: PILOT_JOB,
+      attemptStatus: 200,
+      attempt: pilotAttemptFixture(),
+      activityPages: [ACTIVITY_PAGE_1, ACTIVITY_PAGE_2],
+    });
+    await win.openJobDrawer(10);
+
+    const activityCalls = calls.filter((u) => u.includes("/activity"));
+    expect(activityCalls.length).toBe(1);
+    expect(activityCalls[0]).toContain("pageSize=50");
+    expect(doc.getElementById("drawer-pilot-activity")!.textContent).not.toContain("second page payload");
+
+    const moreBtn = doc.getElementById("drawer-pilot-activity-more") as unknown as { hidden: boolean; onclick: () => Promise<void> };
+    expect(moreBtn.hidden).toBe(false);
+    await moreBtn.onclick();
+
+    expect(calls.filter((u) => u.includes("/activity")).length).toBe(2);
+    expect(doc.getElementById("drawer-pilot-activity")!.textContent).toContain("second page payload");
+    expect((doc.getElementById("drawer-pilot-activity-more") as unknown as { hidden: boolean }).hidden).toBe(true);
+    win.closeJobDrawer();
+  });
+
+  it("keeps loaded activity in place across a background refresh of the same attempt", async () => {
+    const { win, doc } = mountPilotDrawer({
+      job: PILOT_JOB,
+      attemptStatus: 200,
+      attempt: pilotAttemptFixture(),
+      activityPages: [ACTIVITY_PAGE_1, ACTIVITY_PAGE_2],
+    });
+    await win.openJobDrawer(10);
+    const moreBtn = doc.getElementById("drawer-pilot-activity-more") as unknown as { onclick: () => Promise<void> };
+    await moreBtn.onclick();
+    expect(doc.getElementById("drawer-pilot-activity")!.textContent).toContain("second page payload");
+
+    await win.refreshJobDrawer(10, { background: true });
+
+    expect(doc.getElementById("drawer-pilot-activity")!.textContent).toContain("second page payload");
+    win.closeJobDrawer();
+  });
+
+  it("gates reconcile/adopt/cancel on window.isAdmin(), the same permission check the Pipelines cancel button already uses", async () => {
+    const { win, doc } = mountPilotDrawer({ job: PILOT_JOB, attemptStatus: 200, attempt: pilotAttemptFixture() });
+    win.isAdmin = () => false;
+    await win.openJobDrawer(10);
+
+    expect(doc.getElementById("drawer-pilot-reconcile")).toBeNull();
+    expect(doc.getElementById("drawer-pilot-actions")!.textContent).toContain("require admin access");
+    win.closeJobDrawer();
+  });
+
+  it("labels a queued action as accepted, distinct from the attempt's own completed state", async () => {
+    const { win, doc } = mountPilotDrawer({
+      job: PILOT_JOB,
+      attemptStatus: 200,
+      attempt: pilotAttemptFixture({ state: "completed" }),
+      onAction: () => ({ status: 202, body: { status: "accepted" } }),
+    });
+    await win.openJobDrawer(10);
+
+    expect(doc.getElementById("drawer-pilot-state-badge")!.textContent).toContain("completed");
+
+    const reconcileBtn = doc.getElementById("drawer-pilot-reconcile") as unknown as { onclick: () => Promise<void> };
+    await reconcileBtn.onclick();
+
+    const statusText = doc.getElementById("drawer-pilot-action-status")!.textContent || "";
+    expect(statusText).toContain("accepted");
+    expect(statusText).not.toContain("completed");
+    win.closeJobDrawer();
+  });
+
+  it("reports a durably-queued action distinctly when Restate is unavailable", async () => {
+    const { win, doc } = mountPilotDrawer({
+      job: PILOT_JOB,
+      attemptStatus: 200,
+      attempt: pilotAttemptFixture(),
+      onAction: () => ({ status: 202, body: { status: "durable-accepted", detail: "queued" } }),
+    });
+    await win.openJobDrawer(10);
+    const cancelBtn = doc.getElementById("drawer-pilot-cancel") as unknown as { onclick: () => Promise<void> };
+    await cancelBtn.onclick();
+    const statusText = doc.getElementById("drawer-pilot-action-status")!.textContent || "";
+    expect(statusText).toContain("accepted");
+    expect(statusText).toContain("Restate temporarily unavailable");
+    win.closeJobDrawer();
+  });
+
+  it("surfaces a partial cancel where authority revocation could not be confirmed, distinct from an outright failure", async () => {
+    const { win, doc } = mountPilotDrawer({
+      job: PILOT_JOB,
+      attemptStatus: 200,
+      attempt: pilotAttemptFixture(),
+      onAction: () => ({
+        status: 503,
+        body: {
+          status: "partial",
+          authorityRevocation: "accepted",
+          cancellation: "unconfirmed",
+          detail: "Reconcile before retrying cancellation.",
+        },
+      }),
+    });
+    await win.openJobDrawer(10);
+    const cancelBtn = doc.getElementById("drawer-pilot-cancel") as unknown as { onclick: () => Promise<void> };
+    await cancelBtn.onclick();
+    const statusText = doc.getElementById("drawer-pilot-action-status")!.textContent || "";
+    expect(statusText).not.toContain("failed");
+    expect(statusText).toContain("authority revoked");
+    expect(statusText).toContain("termination unconfirmed");
+    expect(statusText).toContain("reconcile");
+    win.closeJobDrawer();
+  });
+
+  it("surfaces a partial cancel where authority revocation itself is only durably queued", async () => {
+    const { win, doc } = mountPilotDrawer({
+      job: PILOT_JOB,
+      attemptStatus: 200,
+      attempt: pilotAttemptFixture(),
+      onAction: () => ({
+        status: 503,
+        body: {
+          status: "partial",
+          authorityRevocation: "durable-accepted",
+          cancellation: "not-requested",
+          detail: "Authority revocation is queued, but termination has not been requested.",
+        },
+      }),
+    });
+    await win.openJobDrawer(10);
+    const cancelBtn = doc.getElementById("drawer-pilot-cancel") as unknown as { onclick: () => Promise<void> };
+    await cancelBtn.onclick();
+    const statusText = doc.getElementById("drawer-pilot-action-status")!.textContent || "";
+    expect(statusText).not.toContain("failed");
+    expect(statusText).toContain("queued");
+    expect(statusText).toContain("durably accepted");
+    expect(statusText).toContain("not yet requested");
+    win.closeJobDrawer();
+  });
+
+  it("requires a valid run id and attempt number before submitting adopt", async () => {
+    const { win, doc, calls } = mountPilotDrawer({ job: PILOT_JOB, attemptStatus: 200, attempt: pilotAttemptFixture() });
+    await win.openJobDrawer(10);
+    const callsBefore = calls.length;
+
+    const adoptBtn = doc.getElementById("drawer-pilot-adopt") as unknown as { onclick: () => void };
+    (doc.getElementById("drawer-pilot-adopt-run-id") as HTMLInputElement).value = "";
+    adoptBtn.onclick();
+
+    expect(calls.length).toBe(callsBefore);
+    expect(doc.getElementById("drawer-pilot-action-status")!.textContent).toContain("Enter a valid run id");
     win.closeJobDrawer();
   });
 });

@@ -20,6 +20,23 @@ export const drawerHtml = `
       <div id="drawer-steps"></div>
       <div class="section-h"><h3>Context</h3></div>
       <div id="drawer-context" style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:24px"></div>
+      <div class="section-h" id="drawer-pilot-heading" hidden><h3>Restate attempt</h3><span class="section-meta" id="drawer-pilot-state-badge"></span></div>
+      <div id="drawer-pilot" hidden>
+        <div id="drawer-pilot-unavailable"></div>
+        <div id="drawer-pilot-evidence-flags"></div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px">
+          <div id="drawer-pilot-owner"></div>
+          <div id="drawer-pilot-links"></div>
+        </div>
+        <div id="drawer-pilot-snapshot"></div>
+        <div class="section-h"><h3>Review cycles</h3><span class="section-meta" id="drawer-pilot-cycle-count"></span></div>
+        <div id="drawer-pilot-cycles"></div>
+        <div class="section-h"><h3>Tool activity</h3><span class="section-meta" id="drawer-pilot-activity-count"></span></div>
+        <div id="drawer-pilot-activity"></div>
+        <button id="drawer-pilot-activity-more" type="button" class="btn btn-sm" style="margin:8px 0 20px" hidden>Load more</button>
+        <div class="section-h"><h3>Recovery actions</h3></div>
+        <div id="drawer-pilot-actions" style="margin-bottom:20px"></div>
+      </div>
     </div>
     <div class="drawer-footer">
       <div></div>
@@ -36,11 +53,22 @@ export const drawerHtml = `
 export const drawerScript = `
 (function () {
   const DRAWER_REFRESH_MS = 5000;
+  // Fixed, capped page size for the tool-activity fetch — the server itself caps at 500
+  // (AII-806), but this keeps a single page small and pagination explicit via "Load more"
+  // rather than ever accumulating unbounded pages in one render pass.
+  const PILOT_ACTIVITY_PAGE_SIZE = 50;
   let currentJobId = null;
   let currentJobTerminal = false;
   let mappingsCache = null;
   let drawerRefreshTimer = null;
   let drawerRefreshInFlightFor = null;
+  // Restate review-fix attempt state (AII-808). Kept outside renderPilotAttempt so a
+  // background 5s refresh of the same attempt can leave an in-progress activity
+  // pagination alone instead of silently resetting it back to page one.
+  let currentAttemptId = null;
+  let pilotActivityEvents = [];
+  let pilotActivityCursor = null;
+  let pilotActivityTruncated = false;
 
   function isTerminalJobStatus(status) {
     return status === 'completed' || status === 'failed' || status === 'timed_out' || status === 'review_failed' || status === 'dispatch-failed';
@@ -61,6 +89,18 @@ export const drawerScript = `
     if (diff < 3600000) return Math.floor(diff / 60000) + 'm ago';
     if (diff < 86400000) return Math.floor(diff / 3600000) + 'h ago';
     return Math.floor(diff / 86400000) + 'd ago';
+  }
+
+  // Same buckets as fmtAgo, but signed — a deadline is usually in the future, where
+  // "5m ago" would read backwards.
+  function fmtRelative(ms) {
+    const diff = ms - Date.now();
+    const abs = Math.abs(diff);
+    const suffix = diff >= 0 ? ' from now' : ' ago';
+    if (abs < 60000) return 'just now';
+    if (abs < 3600000) return Math.floor(abs / 60000) + 'm' + suffix;
+    if (abs < 86400000) return Math.floor(abs / 3600000) + 'h' + suffix;
+    return Math.floor(abs / 86400000) + 'd' + suffix;
   }
 
   function fmtDuration(ms) {
@@ -532,6 +572,387 @@ export const drawerScript = `
     renderLogsLink(job, mappings);
   }
 
+  // ---- Restate review-fix attempt section (AII-808) ----
+  //
+  // A legacy job carries no dispatchId-owned row in review_fix_attempts, so the GET
+  // below 404s and the whole section stays hidden — the drawer renders exactly as it
+  // did before this section existed. A dispatchId that *does* own an attempt renders
+  // it alongside the existing sections, never replacing them (there is no parallel
+  // timeline page).
+
+  function resetPilotState() {
+    currentAttemptId = null;
+    pilotActivityEvents = [];
+    pilotActivityCursor = null;
+    pilotActivityTruncated = false;
+  }
+
+  async function fetchReviewFixAttempt(attemptId) {
+    try {
+      const res = await window.api('/api/review-fix/attempts/' + encodeURIComponent(attemptId));
+      if (res.status === 404 || res.status === 501) return { kind: 'none' };
+      if (res.status === 503) return { kind: 'unavailable' };
+      if (!res.ok) return { kind: 'error' };
+      return { kind: 'ok', attempt: await res.json() };
+    } catch (err) {
+      console.error('Failed to fetch review-fix attempt:', err);
+      return { kind: 'error' };
+    }
+  }
+
+  async function fetchReviewFixActivityPage(attemptId, cursor) {
+    const params = new URLSearchParams();
+    params.set('pageSize', String(PILOT_ACTIVITY_PAGE_SIZE));
+    if (cursor) {
+      params.set('cursorProducerId', cursor.producerId);
+      params.set('cursorSequence', String(cursor.sequence));
+    }
+    try {
+      const res = await window.api('/api/review-fix/attempts/' + encodeURIComponent(attemptId) + '/activity?' + params.toString());
+      if (!res.ok) return null;
+      return await res.json();
+    } catch (err) {
+      console.error('Failed to fetch review-fix activity:', err);
+      return null;
+    }
+  }
+
+  function pilotStateBadgeKind(state) {
+    if (state === 'completed') return 'success';
+    if (state === 'cancelled' || state === 'failed') return 'fail';
+    if (state === 'running' || state === 'prepared') return 'running';
+    return 'neutral';
+  }
+
+  function renderPilotStateBadge(attempt) {
+    const el = document.getElementById('drawer-pilot-state-badge');
+    let html = '<span class="badge ' + pilotStateBadgeKind(attempt.state) + '"><span class="dot"></span>' + window.esc(attempt.state || 'unknown') + '</span>';
+    if (attempt.deadlineAt != null) {
+      const label = attempt.deadlineAt < Date.now() ? 'deadline passed ' : 'deadline in ';
+      html += ' <span class="text-tertiary" style="font-size:11px">' + window.esc(label) + window.esc(fmtRelative(attempt.deadlineAt).replace(/ (from now|ago)$/, '')) + '</span>';
+    }
+    if (attempt.pendingFeedback) {
+      html += ' <span class="badge info"><span class="dot"></span>pending feedback</span>';
+    }
+    el.innerHTML = html;
+  }
+
+  function renderPilotEvidenceFlags(attempt) {
+    const el = document.getElementById('drawer-pilot-evidence-flags');
+    const parts = [];
+    // Explicit, never inferred from an absent field — mirrors AII-806's own contract note.
+    if (!attempt.evidenceComplete) parts.push('<span class="badge warn"><span class="dot"></span>evidence incomplete</span>');
+    if (!attempt.terminationConfirmed) parts.push('<span class="badge warn"><span class="dot"></span>termination unconfirmed</span>');
+    el.innerHTML = parts.length ? '<div style="margin-bottom:10px">' + parts.join(' ') + '</div>' : '';
+  }
+
+  function renderPilotOwner(attempt) {
+    const el = document.getElementById('drawer-pilot-owner');
+    if (!attempt.owner) {
+      el.innerHTML = '<div class="field"><div class="field-label">Lifecycle owner</div><div style="font-size:12.5px" class="text-tertiary">unknown — no owner recorded</div></div>';
+      return;
+    }
+    let ownerText;
+    try { ownerText = JSON.stringify(attempt.owner); } catch (e) { ownerText = String(attempt.owner); }
+    el.innerHTML = '<div class="field"><div class="field-label">Lifecycle owner</div><div class="mono" id="drawer-pilot-owner-value" style="font-size:12px"></div></div>';
+    // Owner is a free-form Record from the runner/GitHub side — textContent, never
+    // interpolated into innerHTML, so it cannot inject markup no matter its shape.
+    document.getElementById('drawer-pilot-owner-value').textContent = ownerText;
+  }
+
+  function renderPilotLinks(attempt, job) {
+    const el = document.getElementById('drawer-pilot-links');
+    if (!attempt.execution) {
+      el.innerHTML = '<div class="field"><div class="field-label">Execution</div><div style="font-size:12.5px" class="text-tertiary">launch state unknown — no execution recorded yet</div></div>';
+      return;
+    }
+    const repoParts = repoPartsForJob(job, null);
+    let html = '<div class="field"><div class="field-label">Workflow run</div><div style="font-size:12.5px">';
+    if (repoParts) {
+      const runUrl = 'https://github.com/' + repoParts.owner + '/' + repoParts.repo + '/actions/runs/' + attempt.execution.githubRunId;
+      html += '<a class="text-accent" href="' + window.safeUrl(runUrl) + '" target="_blank">Run #' + window.esc(String(attempt.execution.githubRunId)) + ' &#8599;</a>';
+      if (attempt.execution.githubRunAttempt > 1) {
+        html += ' <a class="text-accent" href="' + window.safeUrl(runUrl + '/attempts/' + attempt.execution.githubRunAttempt) + '" target="_blank">(attempt ' + window.esc(String(attempt.execution.githubRunAttempt)) + ' &#8599;)</a>';
+      }
+    } else {
+      html += '<span class="mono">run ' + window.esc(String(attempt.execution.githubRunId)) + ' · attempt ' + window.esc(String(attempt.execution.githubRunAttempt)) + '</span>';
+    }
+    html += '</div></div>';
+    el.innerHTML = html;
+  }
+
+  function renderPilotSnapshot(attempt) {
+    const el = document.getElementById('drawer-pilot-snapshot');
+    if (!attempt.snapshot) {
+      el.innerHTML = '<div class="field-label" style="margin:10px 0 4px">Snapshot</div><div style="font-size:12.5px" class="text-tertiary">no snapshot recorded</div>';
+      return;
+    }
+    const findings = attempt.snapshot.findings || [];
+    const findingsText = findings.map(function (f) { return window.esc(f.findingKey) + ' v' + window.esc(String(f.version)); }).join(', ');
+    let html = '<div class="field-label" style="margin:10px 0 4px">Snapshot</div>'
+      + '<pre id="drawer-pilot-snapshot-text" class="mono" style="white-space:pre-wrap;font-size:11.5px;max-height:160px;overflow:auto;margin:0 0 6px"></pre>'
+      + '<div style="font-size:11.5px" class="text-tertiary">' + findings.length + ' finding' + (findings.length === 1 ? '' : 's') + (findingsText ? ': ' + findingsText : '') + '</div>';
+    el.innerHTML = html;
+    // taskText is agent-authored free text — textContent only, same rule as owner above.
+    document.getElementById('drawer-pilot-snapshot-text').textContent = attempt.snapshot.taskText || '';
+  }
+
+  function verdictBadge(verdict) {
+    // No verdict yet must never read as a pass — this is the same "absent result can't
+    // look like success" rule the failure-evidence panel already applies to steps.
+    if (!verdict || verdict.approved === null || verdict.approved === undefined) {
+      return '<span class="badge neutral"><span class="dot"></span>verdict pending</span>';
+    }
+    return verdict.approved
+      ? '<span class="badge success"><span class="dot"></span>approved</span>'
+      : '<span class="badge fail"><span class="dot"></span>changes requested</span>';
+  }
+
+  function renderPilotCycles(attempt) {
+    const el = document.getElementById('drawer-pilot-cycles');
+    const countEl = document.getElementById('drawer-pilot-cycle-count');
+    const cycles = attempt.cycles || [];
+    countEl.textContent = cycles.length + ' cycle' + (cycles.length === 1 ? '' : 's');
+    if (!cycles.length) {
+      el.innerHTML = '<div style="font-size:12px;color:var(--fg-tertiary);padding:8px 0">No review cycles recorded</div>';
+      return;
+    }
+    let html = '';
+    for (const cycle of cycles) {
+      const inCommit = cycle.inputCommit ? '<span class="mono">' + window.esc(cycle.inputCommit.slice(0, 10)) + '</span>' : '<span class="text-tertiary">no input commit</span>';
+      const outCommit = cycle.outputCommit ? '<span class="mono">' + window.esc(cycle.outputCommit.slice(0, 10)) + '</span>' : '<span class="text-tertiary">no output commit</span>';
+      const dispositions = (cycle.dispositions || []).map(function (d) { return window.esc(d.key) + ': ' + window.esc(d.disposition); }).join(', ');
+      const tests = (cycle.tests || []).map(function (t) { return window.esc(t.name) + ': ' + window.esc(t.status); }).join(', ');
+      const usage = cycle.usage || {};
+      const usageParts = [];
+      if (usage.tokensIn != null) usageParts.push(window.esc(String(usage.tokensIn)) + ' in');
+      if (usage.tokensOut != null) usageParts.push(window.esc(String(usage.tokensOut)) + ' out');
+      if (usage.costUsd != null) usageParts.push('$' + window.esc(usage.costUsd.toFixed(2)));
+      html += '<div style="padding:8px 0;border-bottom:1px solid var(--border-subtle);font-size:12.5px">'
+        + '<div style="display:flex;justify-content:space-between;align-items:center">'
+        + '<span class="mono text-secondary">cycle ' + window.esc(String(cycle.cycle)) + '</span>'
+        + verdictBadge(cycle.verdict)
+        + '</div>'
+        + '<div style="margin-top:4px">' + inCommit + ' &rarr; ' + outCommit + '</div>'
+        + '<div class="text-tertiary" style="margin-top:4px">Dispositions: ' + (dispositions || 'none recorded') + '</div>'
+        + '<div class="text-tertiary" style="margin-top:2px">Tests: ' + (tests || 'none recorded') + '</div>'
+        + (cycle.verdict && cycle.verdict.reason ? '<div style="margin-top:4px"><strong>Reason:</strong> ' + window.esc(cycle.verdict.reason) + '</div>' : '')
+        + (cycle.verdict && cycle.verdict.summary ? '<div style="margin-top:2px"><strong>Summary:</strong> ' + window.esc(cycle.verdict.summary) + '</div>' : '')
+        + '<div class="text-tertiary" style="margin-top:4px">' + (usageParts.length ? usageParts.join(' · ') : 'usage unavailable') + ' · ' + window.esc(fmtAgo(cycle.completedAt)) + '</div>'
+        + '</div>';
+    }
+    el.innerHTML = html;
+  }
+
+  function renderPilotActivity() {
+    const el = document.getElementById('drawer-pilot-activity');
+    const countEl = document.getElementById('drawer-pilot-activity-count');
+    const moreBtn = document.getElementById('drawer-pilot-activity-more');
+    countEl.textContent = pilotActivityEvents.length + ' event' + (pilotActivityEvents.length === 1 ? '' : 's') + (pilotActivityTruncated ? ' · stream truncated' : '');
+    if (!pilotActivityEvents.length) {
+      el.innerHTML = pilotActivityTruncated
+        ? '<div style="font-size:12px;color:var(--fg-tertiary);padding:8px 0">Activity truncated — no events available</div>'
+        : '<div style="font-size:12px;color:var(--fg-tertiary);padding:8px 0">No tool activity recorded</div>';
+      moreBtn.hidden = true;
+      moreBtn.onclick = loadMorePilotActivity;
+      return;
+    }
+    let html = '';
+    const payloads = [];
+    for (let i = 0; i < pilotActivityEvents.length; i++) {
+      const event = pilotActivityEvents[i];
+      const payloadId = 'drawer-pilot-activity-payload-' + i;
+      html += '<div style="padding:6px 0;border-bottom:1px solid var(--border-subtle);font-size:12px">'
+        + '<div style="display:flex;justify-content:space-between;align-items:center">'
+        + '<span class="mono text-secondary">' + window.esc(event.kind) + '</span>'
+        + '<span class="text-tertiary" style="font-size:11px">' + (event.cycle != null ? 'cycle ' + window.esc(String(event.cycle)) + ' · ' : '') + window.esc(fmtAgo(event.occurredAt)) + '</span>'
+        + '</div>'
+        + (event.payload != null
+          ? '<pre id="' + window.escAttr(payloadId) + '" class="mono" style="white-space:pre-wrap;font-size:11px;max-height:160px;overflow:auto;margin:4px 0 0"></pre>'
+            + (event.truncated ? '<div class="text-tertiary" style="font-size:10.5px">payload truncated (' + window.esc(String(event.byteCount)) + ' bytes)</div>' : '')
+          : '<div class="text-tertiary" style="font-size:10.5px">no payload recorded' + (event.truncated ? ' · truncated' : '') + '</div>')
+        + '</div>';
+      if (event.payload != null) payloads.push({ id: payloadId, text: event.payload });
+    }
+    el.innerHTML = html;
+    // Tool output is untrusted runner/model text — assigned via textContent onto the
+    // <pre> placeholders above, exactly like the failure-evidence stderr/stdout tails,
+    // so a payload containing markup can never be parsed as HTML.
+    for (const p of payloads) {
+      const target = document.getElementById(p.id);
+      if (target) target.textContent = p.text;
+    }
+    moreBtn.hidden = !pilotActivityCursor;
+    moreBtn.onclick = loadMorePilotActivity;
+  }
+
+  async function loadMorePilotActivity() {
+    if (!currentAttemptId || !pilotActivityCursor) return;
+    const page = await fetchReviewFixActivityPage(currentAttemptId, pilotActivityCursor);
+    if (!page) return;
+    pilotActivityEvents = pilotActivityEvents.concat(page.events);
+    pilotActivityCursor = page.nextCursor;
+    pilotActivityTruncated = page.truncated;
+    renderPilotActivity();
+  }
+
+  function setPilotActionStatus(text) {
+    const el = document.getElementById('drawer-pilot-action-status');
+    if (el) el.textContent = text;
+  }
+
+  async function runPilotAction(attemptId, action, body) {
+    if (!window.isAdmin()) return;
+    // "accepted" describes the POST being queued, never that the action has taken
+    // effect — the attempt's own state badge above is the source of truth for that,
+    // and the 5s auto-refresh will pick up the eventual transition to it.
+    setPilotActionStatus(action + ' requested…');
+    try {
+      const res = await window.api('/api/review-fix/attempts/' + encodeURIComponent(attemptId) + '/' + action, {
+        method: 'POST',
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      let payload;
+      try { payload = await res.json(); } catch (e) { payload = {}; }
+      if (res.status === 202) {
+        setPilotActionStatus(action + ' accepted' + (payload.status === 'durable-accepted' ? ' (queued — Restate temporarily unavailable)' : '') + '.');
+      } else if (res.status === 409) {
+        setPilotActionStatus(action + ' rejected: ' + (payload.error || 'conflict') + '.');
+      } else if (res.status === 422) {
+        setPilotActionStatus(action + ' rejected: execution reference did not verify.');
+      } else if (res.status === 404) {
+        setPilotActionStatus(action + ' failed: attempt not found.');
+      } else if (res.status === 503 && payload.status === 'partial') {
+        // Cancel's revoke-then-terminate split means a 503 here is not an outright
+        // failure: authority may already be revoked even though termination wasn't
+        // confirmed, so the message must say which half landed rather than "failed".
+        if (payload.cancellation === 'unconfirmed') {
+          setPilotActionStatus(action + ' partially applied: authority revoked, termination unconfirmed — reconcile before retrying. ' + (payload.detail || ''));
+        } else {
+          setPilotActionStatus(action + ' queued: authority revocation durably accepted, termination not yet requested. ' + (payload.detail || ''));
+        }
+      } else {
+        setPilotActionStatus(action + ' failed (status ' + res.status + ').');
+      }
+    } catch (err) {
+      console.error('review-fix ' + action + ' failed:', err);
+      setPilotActionStatus(action + ' failed: request error.');
+    }
+  }
+
+  // Reconcile/adopt/cancel reuse the same window.isAdmin() gate the Pipelines page
+  // already uses for its own KG-refresh cancel button — no new permission mechanism.
+  // There is deliberately no combined force-release action: cancel always revokes
+  // authority before requesting termination, matching the two-step server contract.
+  function renderPilotActions(attemptId) {
+    const el = document.getElementById('drawer-pilot-actions');
+    if (!window.isAdmin()) {
+      el.innerHTML = '<div class="text-tertiary" style="font-size:12px">Recovery actions require admin access.</div>';
+      return;
+    }
+    el.innerHTML =
+      '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
+      + '<button id="drawer-pilot-reconcile" type="button" class="btn btn-sm">Reconcile</button>'
+      + '<span style="display:flex;gap:4px;align-items:center">'
+      + '<input id="drawer-pilot-adopt-run-id" class="input mono" placeholder="run id" style="width:100px;font-size:11.5px" />'
+      + '<input id="drawer-pilot-adopt-run-attempt" class="input mono" placeholder="attempt #" style="width:80px;font-size:11.5px" />'
+      + '<button id="drawer-pilot-adopt" type="button" class="btn btn-sm">Adopt</button>'
+      + '</span>'
+      + '<button id="drawer-pilot-cancel" type="button" class="btn btn-sm btn-danger">Cancel attempt</button>'
+      + '</div>'
+      + '<div id="drawer-pilot-action-status" class="text-tertiary" style="font-size:11.5px;margin-top:6px"></div>';
+
+    // Each handler returns runPilotAction's promise — a real click never awaits it, but
+    // returning it lets a caller (the test harness included) await the action to settle.
+    document.getElementById('drawer-pilot-reconcile').onclick = function () {
+      return runPilotAction(attemptId, 'reconcile');
+    };
+    document.getElementById('drawer-pilot-adopt').onclick = function () {
+      const runId = document.getElementById('drawer-pilot-adopt-run-id').value.trim();
+      const runAttempt = Number(document.getElementById('drawer-pilot-adopt-run-attempt').value.trim());
+      if (!runId || !Number.isInteger(runAttempt) || runAttempt < 1) {
+        setPilotActionStatus('Enter a valid run id and attempt number before adopting.');
+        return undefined;
+      }
+      return runPilotAction(attemptId, 'adopt', { githubRunId: runId, githubRunAttempt: runAttempt });
+    };
+    document.getElementById('drawer-pilot-cancel').onclick = function () {
+      if (confirm('Cancel this attempt? Authority is revoked first, then termination is requested.')) {
+        return runPilotAction(attemptId, 'cancel');
+      }
+      return undefined;
+    };
+  }
+
+  function hidePilotSection() {
+    document.getElementById('drawer-pilot-heading').hidden = true;
+    document.getElementById('drawer-pilot').hidden = true;
+  }
+
+  async function renderPilotAttempt(job, background) {
+    if (!job.dispatchId) {
+      resetPilotState();
+      hidePilotSection();
+      return;
+    }
+    const isNewAttempt = currentAttemptId !== job.dispatchId;
+    if (isNewAttempt) {
+      currentAttemptId = job.dispatchId;
+      pilotActivityEvents = [];
+      pilotActivityCursor = null;
+      pilotActivityTruncated = false;
+    }
+    const result = await fetchReviewFixAttempt(job.dispatchId);
+    if (currentJobId !== job.id) return;
+    if (result.kind === 'none' || result.kind === 'error') {
+      hidePilotSection();
+      return;
+    }
+    document.getElementById('drawer-pilot-heading').hidden = false;
+    document.getElementById('drawer-pilot').hidden = false;
+    if (result.kind === 'unavailable') {
+      document.getElementById('drawer-pilot-state-badge').innerHTML = '';
+      document.getElementById('drawer-pilot-unavailable').innerHTML =
+        '<div class="alert warn" style="margin-bottom:16px"><div class="alert-icon">&#9888;</div><div style="flex:1"><div class="alert-title">Attempt data unavailable</div><div class="alert-desc">Restate could not be reached for this attempt. State, cycles, and activity below may be stale or missing.</div></div></div>';
+      document.getElementById('drawer-pilot-evidence-flags').innerHTML = '';
+      document.getElementById('drawer-pilot-owner').innerHTML = '';
+      document.getElementById('drawer-pilot-links').innerHTML = '';
+      document.getElementById('drawer-pilot-snapshot').innerHTML = '';
+      document.getElementById('drawer-pilot-cycles').innerHTML = '';
+      document.getElementById('drawer-pilot-cycle-count').textContent = '';
+      document.getElementById('drawer-pilot-activity').innerHTML = '';
+      document.getElementById('drawer-pilot-activity-count').textContent = '';
+      document.getElementById('drawer-pilot-activity-more').hidden = true;
+      // Recovery controls stay reachable even when the read side is degraded — an
+      // unknown/unreadable attempt is exactly when reconcile/adopt/cancel matter most,
+      // and none of them is a force-release that bypasses that uncertainty.
+      renderPilotActions(job.dispatchId);
+      return;
+    }
+    document.getElementById('drawer-pilot-unavailable').innerHTML = '';
+    const attempt = result.attempt;
+    renderPilotStateBadge(attempt);
+    renderPilotEvidenceFlags(attempt);
+    renderPilotOwner(attempt);
+    renderPilotLinks(attempt, job);
+    renderPilotSnapshot(attempt);
+    renderPilotCycles(attempt);
+    renderPilotActions(job.dispatchId);
+    if (isNewAttempt || !background) {
+      const page = await fetchReviewFixActivityPage(job.dispatchId, null);
+      if (currentJobId !== job.id) return;
+      if (page) {
+        pilotActivityEvents = page.events;
+        pilotActivityCursor = page.nextCursor;
+        pilotActivityTruncated = page.truncated;
+      }
+      renderPilotActivity();
+    }
+    // A background refresh of the same attempt deliberately leaves an in-progress
+    // activity pagination alone rather than re-fetching page one — the same reason
+    // renderSteps preserves open evidence panels across its own 5s re-render.
+  }
+
   function resetDrawerContent() {
     document.getElementById('drawer-title').textContent = 'Loading…';
     document.getElementById('drawer-issue-row').innerHTML = '';
@@ -546,6 +967,8 @@ export const drawerScript = `
     document.getElementById('drawer-logs-link').removeAttribute('href');
     document.getElementById('drawer-local-logs').hidden = true;
     document.getElementById('drawer-local-logs').onclick = null;
+    resetPilotState();
+    hidePilotSection();
   }
 
   function stopDrawerAutoRefresh() {
@@ -590,6 +1013,8 @@ export const drawerScript = `
       const json = await res.json();
       if (currentJobId !== id) return;
       renderDrawer(json.job, json.steps, mappings);
+      await renderPilotAttempt(json.job, background);
+      if (currentJobId !== id) return;
       // A finished job's steps cannot change — stop polling instead of collapsing
       // an open evidence panel and resetting scroll every 5s for no reason.
       currentJobTerminal = isTerminalJobStatus(json.job.status);
@@ -624,6 +1049,7 @@ export const drawerScript = `
     if (wrap) wrap.setAttribute('hidden', '');
     document.body.style.overflow = '';
     currentJobId = null;
+    resetPilotState();
   }
 
   document.addEventListener('keydown', function (e) {
