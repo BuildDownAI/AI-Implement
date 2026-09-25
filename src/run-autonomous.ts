@@ -23,7 +23,7 @@ import { TimingCollector, TimingStepReporter, runWithTiming, formatSummary } fro
 import { runHookScript } from "./pipeline/steps/hooks.js";
 import { normalizeBranchPrefix } from "./pipeline/branch-name.js";
 import { parseWorkflowMd } from "./workflow-md.js";
-import { fetchPlanningContextFromOrchestrator, postRunnerResult } from "./runner-result.js";
+import { fetchPlanningContextFromOrchestrator, postRunnerCycleSummary, postRunnerResult } from "./runner-result.js";
 import { SensitiveFilesError } from "./pipeline/sensitive-files.js";
 import { OperatorCancelledError } from "./pipeline/operator-cancelled.js";
 import { classifyThrown, isFailureRecord } from "./pipeline/failure-classification.js";
@@ -501,6 +501,18 @@ async function reportRunnerResult(
   env: NodeJS.ProcessEnv,
   params: Omit<Parameters<typeof postRunnerResult>[0], "reviewFix" | "cycleSummaries">,
 ): Promise<void> {
+  const cycleSummaries = identity ? readCycleSummaries(params.workspaceDir) : [];
+  const progressToken = env.RUN_PROGRESS_TOKEN?.trim();
+  const callbackUrl = params.callbackUrl ?? env.RUNNER_CALLBACK_URL;
+  if (identity && cycleSummaries.length > 0) {
+    if (!progressToken || !callbackUrl) {
+      console.error(`[cycle-summary] no progress credential for pilot attempt ${identity.attemptId}`);
+    } else {
+      for (const summary of cycleSummaries) {
+        await postRunnerCycleSummary({ callbackUrl, progressToken, summary, fetchImpl: params.fetchImpl });
+      }
+    }
+  }
   const resolution = resolveReviewFixResult(identity, outputCommit, env);
   if (resolution.kind === "no-result") {
     console.error(
@@ -509,10 +521,9 @@ async function reportRunnerResult(
     );
     return;
   }
-  const cycleSummaries = resolution.kind === "attached" ? readCycleSummaries(params.workspaceDir) : [];
   await postRunnerResult({
     ...params,
-    ...(cycleSummaries.length > 0 ? { cycleSummaries } : {}),
+    ...(resolution.kind === "attached" && cycleSummaries.length > 0 ? { cycleSummaries } : {}),
     reviewFix: resolution.kind === "attached" ? resolution.reviewFix : undefined,
   });
 }

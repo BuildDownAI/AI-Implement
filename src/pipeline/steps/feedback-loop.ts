@@ -631,7 +631,7 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
           outputCommit: null,
           outputCommitStatus: "pending_push",
           dispositions: [],
-          tests: inferTestResults(toolTraceLines(implementProviderUnavailableTelemetry)),
+          tests: inferTestResults(toolTraceLines(implementProviderUnavailableTelemetry), undefined, implementProviderUnavailableTelemetry?.executedCommands),
           verdict: { approved: null, reason: "provider_unavailable", summary: implementProviderUnavailable.message },
           usage: sumUsage(implementProviderUnavailableTelemetry),
         });
@@ -697,7 +697,7 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
           outputCommit: null,
           outputCommitStatus: "pending_push",
           dispositions: [],
-          tests: inferTestResults(toolTraceLines(implementTelemetry)),
+          tests: inferTestResults(toolTraceLines(implementTelemetry), undefined, implementTelemetry?.executedCommands),
           verdict: { approved: null, reason: "max_turns", summary: feedback },
           usage: sumUsage(implementTelemetry),
         });
@@ -769,7 +769,7 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
             outputCommit: null,
             outputCommitStatus: "pending_push",
             dispositions: [],
-            tests: inferTestResults([...toolTraceLines(implementTelemetry), ...toolTraceLines(reviewOutputs.telemetry)]),
+            tests: inferTestResults([...toolTraceLines(implementTelemetry), ...toolTraceLines(reviewOutputs.telemetry)], undefined, [...(implementTelemetry?.executedCommands ?? []), ...(reviewOutputs.telemetry?.executedCommands ?? [])]),
             verdict: {
               approved: reviewOutputs.approved,
               reason: reviewOutputs.approved ? "approved" : "changes_requested",
@@ -844,7 +844,7 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
             outputCommit: null,
             outputCommitStatus: "pending_push",
             dispositions: [],
-            tests: inferTestResults(toolTraceLines(implementTelemetry)),
+            tests: inferTestResults(toolTraceLines(implementTelemetry), undefined, implementTelemetry?.executedCommands),
             verdict: { approved: null, reason: terminationReason, summary: feedback },
             usage: sumUsage(implementTelemetry, reviewErrTelemetry),
           });

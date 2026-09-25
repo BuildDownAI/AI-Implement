@@ -109,6 +109,35 @@ export async function fetchPlanningContextFromOrchestrator(params: {
   }
 }
 
+/** Deliver one immutable cycle before terminal result intake. The progress bearer identifies
+ * the prepared pilot attempt, so this also works when no output commit was published. */
+export async function postRunnerCycleSummary(params: {
+  callbackUrl: string;
+  progressToken: string;
+  summary: CycleSummary;
+  fetchImpl?: typeof fetch;
+}): Promise<boolean> {
+  const url = `${params.callbackUrl.replace(/\/$/, "")}/runner/cycle-summary`;
+  const payload = JSON.stringify({ summary: params.summary });
+  const headers = { "Content-Type": "application/json", Authorization: `Bearer ${params.progressToken}` };
+  const fetchFn = params.fetchImpl ?? fetch;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const res = await fetchWithAbortTimeout(fetchFn, url, { method: "POST", headers, body: payload }, 5_000);
+      if (res.ok) return true;
+      if (!isRetryableStatus(res.status)) {
+        console.error(`[cycle-summary] durable delivery rejected (HTTP ${res.status})`);
+        return false;
+      }
+    } catch {
+      // Transport outcome is unknown; a byte-identical retry is safe because storage is idempotent.
+    }
+    if (attempt < 2) await sleep(250 * (attempt + 1));
+  }
+  console.error("[cycle-summary] durable delivery exhausted retries");
+  return false;
+}
+
 export async function postRunnerResult(params: {
   phase: "planning" | "implementation" | "gap-analysis" | "kg-refresh";
   workspaceDir: string;

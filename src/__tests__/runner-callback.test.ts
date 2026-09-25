@@ -3767,6 +3767,54 @@ describe("handleRunnerResult — cycle summary durable evidence (AII-801)", () =
   });
 });
 
+describe("handleRunnerCycleSummary — independent pilot evidence", () => {
+  const attemptId = "attempt-independent-cycle";
+  const summary: CycleSummary = {
+    id: "feedback-loop.1", stage: "feedback-loop", cycle: 1,
+    inputCommit: "a".repeat(40), outputCommit: null, outputCommitStatus: "not_applicable",
+    dispositions: [], tests: [{ name: "npm test", status: "failed" }],
+    verdict: { approved: null, reason: "fix_failed" },
+    usage: { tokensIn: 12, tokensOut: 3, costUsd: null },
+    truncated: false, limitReached: false, completedAt: 1_700_000_000_000,
+  };
+
+  function preparedToken(): string {
+    const db = dedup.getDb();
+    db.prepare(`INSERT INTO dispatch_admissions
+      (dispatch_id, mapping_key, issue_scope, issue_id, installation_id, repository, pr_number,
+       lifecycle_owner, phase, backend, created_at)
+      VALUES (?, 'AII', 'pr', 'acme/app#42', '7', 'acme/app', 42, ?, 'implementation', 'github-actions', ?)`)
+      .run(attemptId, `restate:${attemptId}`, Date.now());
+    db.prepare(`INSERT INTO review_fix_attempts
+      (attempt_id, dispatch_id, mapping_key, installation_id, repository, pr_number, issue_scope,
+       issue_id, owner, state, created_at, deadline_at, task_snapshot_json, finding_versions_json)
+      VALUES (?, ?, 'AII', '7', 'acme/app', 42, 'pr', 'acme/app#42', ?, 'prepared', ?, ?, '{}', '[]')`)
+      .run(attemptId, attemptId, attemptId, Date.now(), Date.now() + 60_000);
+    return runnerTokens.mintPreparedReviewFixToken({ attemptId, audience: "progress", secret: SECRET }).token;
+  }
+
+  it("commits a failed no-output cycle independently, accepts identical retry and rejects conflict", () => {
+    const token = preparedToken();
+    const post = (entry: CycleSummary) => runnerCallback.handleRunnerCycleSummary({
+      authorization: `Bearer ${token}`, secret: SECRET, body: { summary: entry },
+    });
+    expect(post(summary)).toMatchObject({ status: 200, body: { outcome: "recorded" } });
+    expect(reviewFixEvidence.getReviewFixCycleSummary(attemptId, 1)?.tests).toEqual(summary.tests);
+    expect(post(summary)).toMatchObject({ status: 200, body: { outcome: "duplicate" } });
+    expect(post({ ...summary, completedAt: summary.completedAt + 1 }).status).toBe(409);
+    expect(reviewFixEvidence.getReviewFixCycleSummary(attemptId, 1)?.completedAt).toBe(summary.completedAt);
+  });
+
+  it("rejects unprepared credentials and oversized evidence", () => {
+    const token = preparedToken();
+    const legacy = runnerTokens.mintRunToken({ issueId: "i", mappingTeamKey: "AII", phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS, secret: SECRET }).token;
+    expect(runnerCallback.handleRunnerCycleSummary({ authorization: `Bearer ${legacy}`, secret: SECRET, body: { summary } }).status).toBe(401);
+    expect(runnerCallback.handleRunnerCycleSummary({ authorization: `Bearer ${token}`, secret: SECRET,
+      body: { summary: { ...summary, tests: [{ name: "x".repeat(17_000), status: "passed" }] } } }).status).toBe(400);
+  });
+});
+
 describe("reviewFixResultIntakeResponse (AII-777)", () => {
   it("maps 'stored' to 200 acknowledged, non-retryable", () => {
     const res = runnerCallback.reviewFixResultIntakeResponse({

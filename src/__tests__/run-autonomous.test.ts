@@ -991,6 +991,7 @@ describe("runAutonomous", () => {
       stubReviewFixEnvelope();
       vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
       vi.stubEnv("RUN_TOKEN", "run-token");
+      vi.stubEnv("RUN_PROGRESS_TOKEN", "pilot-progress");
       vi.stubEnv("GITHUB_RUN_ID", "999888");
       vi.stubEnv("GITHUB_RUN_ATTEMPT", "2");
 
@@ -1040,8 +1041,38 @@ describe("runAutonomous", () => {
       });
 
       expect(result.exitCode).toBe(0);
-      const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as { cycleSummaries?: CycleSummary[] };
+      expect(mockFetch.mock.calls[0][0]).toBe("https://orchestrator.example/runner/cycle-summary");
+      expect(JSON.parse(mockFetch.mock.calls[0][1].body as string)).toEqual({ summary: cycleSummary });
+      const body = JSON.parse(mockFetch.mock.calls[1][1].body as string) as { cycleSummaries?: CycleSummary[] };
       expect(body.cycleSummaries).toEqual([cycleSummary]);
+    });
+
+    it("delivers a failed cycle before no-output pilot result is skipped", async () => {
+      stubReviewFixEnvelope();
+      vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+      vi.stubEnv("RUN_TOKEN", "run-token");
+      vi.stubEnv("RUN_PROGRESS_TOKEN", "pilot-progress");
+      vi.stubEnv("GITHUB_RUN_ID", "42");
+      vi.stubEnv("GITHUB_RUN_ATTEMPT", "1");
+      const summary: CycleSummary = {
+        id: "feedback-loop.1", stage: "feedback-loop", cycle: 1,
+        inputCommit: "a".repeat(40), outputCommit: null, outputCommitStatus: "not_applicable",
+        dispositions: [], tests: [{ name: "npm test", status: "failed" }],
+        verdict: { approved: null, reason: "fix_failed" },
+        usage: { tokensIn: 1, tokensOut: 1, costUsd: null },
+        truncated: false, limitReached: false, completedAt: 1_700_000_000_000,
+      };
+      mkdirSync(join(workspaceDir, "ai-output"), { recursive: true });
+      writeFileSync(join(workspaceDir, CYCLE_SUMMARY_FILE), `${JSON.stringify(summary)}\n`);
+      const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200 });
+      const { pipeline, runner } = makeStepsPipeline([
+        ["setup", { run: vi.fn().mockRejectedValue(new Error("setup exploded before push ran")) }],
+      ]);
+      await runAutonomous({ workspaceDir, pipeline, runner, reporter: new NoopStepReporter(),
+        llmExecutor: makeMockExecutor(0), fetchImpl: mockFetch });
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      expect(mockFetch.mock.calls[0][0]).toBe("https://orchestrator.example/runner/cycle-summary");
+      expect(JSON.parse(mockFetch.mock.calls[0][1].body as string)).toEqual({ summary });
     });
 
     it("sends no cycleSummaries field when the run wrote none", async () => {

@@ -12,7 +12,7 @@ import type { Step } from "./pipeline/types.js";
 import { describeReferenceRepoCause, type ReferenceRepoResult } from "./reference-repos.js";
 import type { TicketingProvider } from "./providers/types.js";
 import { remediateFailedJob, type StuckWatchdogConfig } from "./stuck-watchdog.js";
-import { verifyAndConsumeRunToken, verifyRunToken } from "./runner-tokens.js";
+import { verifyAndConsumeRunToken, verifyPreparedReviewFixToken, verifyRunToken } from "./runner-tokens.js";
 import { getStepsByJobId, upsertStepRecord } from "./step-log.js";
 import { enqueueReviewFix, getReviewFixDispatchSnapshot } from "./review-fix-queue.js";
 import {
@@ -37,8 +37,8 @@ import {
 import { isLinearAuthConfigured, withLinearToken } from "./linear-app-auth.js";
 import { isFailureRecord, projectFailureRecord, type FailureRecord } from "./pipeline/failure-classification.js";
 import { sanitizeFindingDispositions, type FindingDisposition } from "./pipeline/finding-dispositions.js";
-import { sanitizeCycleSummaries, type CycleSummary, type CycleDisposition } from "./pipeline/cycle-summary.js";
-import { recordReviewFixCycleSummary } from "./review-fix-evidence.js";
+import { isCycleSummary, sanitizeCycleSummaries, type CycleSummary, type CycleDisposition } from "./pipeline/cycle-summary.js";
+import { recordReviewFixCycleSummary, type ReviewFixCycleSummaryOutcome } from "./review-fix-evidence.js";
 import type { ReviewFixFindingDisposition } from "./review-fix-ports.js";
 import {
   REVIEW_FIX_CONTRACT_VERSION,
@@ -440,9 +440,8 @@ function toReviewFixDispositions(dispositions: readonly CycleDisposition[]): Rev
  * rejected/conflicting record is logged and otherwise ignored, matching the non-fatal,
  * best-effort convention `writeCycleSummary` itself already uses.
  */
-function recordCycleSummaries(attemptId: string, summaries: readonly CycleSummary[]): void {
-  for (const summary of summaries) {
-    const outcome = recordReviewFixCycleSummary({
+function recordOneCycleSummary(attemptId: string, summary: CycleSummary): ReviewFixCycleSummaryOutcome {
+  return recordReviewFixCycleSummary({
       attemptId,
       cycle: reviewFixCycleRecordNumber(summary),
       inputCommit: summary.inputCommit,
@@ -453,11 +452,46 @@ function recordCycleSummaries(attemptId: string, summaries: readonly CycleSummar
       usage: summary.usage,
       completedAt: summary.completedAt,
     });
+}
+
+function recordCycleSummaries(attemptId: string, summaries: readonly CycleSummary[]): void {
+  for (const summary of summaries) {
+    const outcome = recordOneCycleSummary(attemptId, summary);
     if (outcome.status === "conflict" || outcome.status === "rejected") {
       console.warn(
         `[runner-callback] cycle summary "${summary.id}" for attempt ${attemptId} not recorded (${outcome.status}): ${outcome.reason}`,
       );
     }
+  }
+}
+
+/** Independently persists one pilot cycle before terminal result intake. The reusable
+ * progress bearer is bound to a live prepared attempt; identical retry is idempotent. */
+export function handleRunnerCycleSummary(input: {
+  authorization: string | undefined;
+  secret: string;
+  body: unknown;
+}): HandleRunnerResultOutput {
+  const bearer = parseBearerToken(input.authorization);
+  if (!bearer) return bad(401, "missing_bearer");
+  const verified = verifyPreparedReviewFixToken(bearer, input.secret, "progress");
+  if (!verified.ok || !verified.claims.attemptId) return bad(401, verified.ok ? "wrong_scope" : verified.reason);
+  if (!input.body || typeof input.body !== "object" || Array.isArray(input.body)) return bad(400, "invalid_cycle_body");
+  const summary = (input.body as { summary?: unknown }).summary;
+  if (!isCycleSummary(summary)) return bad(400, "invalid_cycle_summary");
+
+  const outcome = recordOneCycleSummary(verified.claims.attemptId, summary);
+  switch (outcome.status) {
+    case "recorded":
+    case "duplicate":
+      return { status: 200, body: { acknowledged: true, outcome: outcome.status } };
+    case "conflict":
+      console.warn(`[runner-callback] conflicting cycle summary for attempt ${verified.claims.attemptId} cycle ${summary.cycle}`);
+      return bad(409, "cycle_conflict");
+    case "tombstoned":
+      return bad(410, "attempt_tombstoned");
+    case "rejected":
+      return bad(400, "invalid_cycle_summary");
   }
 }
 

@@ -16,8 +16,9 @@ off the runner workspace and recorded durably before the run ends.
 
 This is the bounded slice AII-801 delivers on the Restate review-fix pilot
 feature branch: it emits the evidence contract for cycles that still run
-in-process and makes it durable through the existing `/runner/result`
-callback. It does not move those cycles to Restate, and it does not touch
+in-process and makes them durable through `/runner/cycle-summary` before
+terminal result intake, including runs with no output commit. It does not move
+those cycles to Restate, and it does not touch
 retention, tombstones, or the 10 MiB per-attempt activity cap those separate
 issues (AII-786, AII-779) own.
 
@@ -38,10 +39,9 @@ piggybacking on `/runner/activity`.
 
 Instead, `cycle-summary.ts` persists via a declared append-only JSON Lines
 file, the same convention `finding-dispositions.ts` uses for
-`DISPOSITIONS_FILE`, and this issue closes the durability gap through the
-existing terminal-result path instead: `/runner/result` already forwards
-`findingDispositions` read back from the workspace, and cycle summaries now
-travel the same way. When a concrete `ActivitySink` lands on
+`DISPOSITIONS_FILE`. The runner sends each pilot cycle to a dedicated callback
+using the prepared attempt's progress token, before the terminal result.
+When a concrete `ActivitySink` lands on
 `PipelineContext` and its `cycleSummary` delivery is wired end-to-end, this
 file-and-forward path can be replaced with a live `activitySink.cycleSummary(...)`
 call — the `CycleSummary` shape here is deliberately close to
@@ -57,23 +57,17 @@ is the forwarding chain that runs before the container exits:
 
 1. `feedback-loop.ts`/`post-push-review.ts` call `writeCycleSummary`, which
    appends to the declared file as each cycle completes.
-2. At the run's terminal result, `run-autonomous.ts`'s `reportRunnerResult`
-   reads the file back with `readCycleSummaries` and attaches the records to
-   the `/runner/result` POST body as `cycleSummaries` — but only when the
-   result also carries a resolved `reviewFix` pilot marker (`resolution.kind
-   === "attached"`, see `resolveReviewFixResult`). A Legacy (non-pilot) run
-   has no `attemptId` to record durable evidence against, so it never
-   attaches cycle summaries; the file still exists on disk for the lifetime
-   of that run (e.g. a `--shell` dev-harness session) but is not forwarded.
-3. `runner-callback.ts`'s `handleRunnerResult` shape-validates each entry
-   (`sanitizeCycleSummaries`, dropping and counting anything malformed the
-   same way `findingDispositions` are sanitized) and, once the `reviewFix`
-   marker itself is validated and classified `"stored"`, calls
-   `recordReviewFixCycleSummary` (`src/review-fix-evidence.ts`, AII-786) once
-   per summary with that marker's `attemptId`. The record lands in the
-   `review_fix_cycles` SQLite table — independent of the runner workspace,
-   the container, and the 10 MiB tool-activity attempt cap — and is readable
-   afterward via `getReviewFixCycleSummary`/`listReviewFixCycleSummaries`.
+2. Before terminal result delivery, `run-autonomous.ts` reads the file and
+   posts each pilot cycle to `/runner/cycle-summary` with the prepared attempt's
+   progress token. The callback verifies live attempt authority and commits one
+   record to `review_fix_cycles` before acknowledging it. Identical retries are
+   idempotent; conflicting content is rejected. The runner retries transient
+   failures with a byte-identical payload. This works when the terminal result
+   cannot attach because no output commit was published.
+3. When a terminal result can attach a `reviewFix` marker, it also forwards
+   `cycleSummaries` as a redundant replay. A Legacy run has no pilot attempt
+   identity, so its workspace file is not forwarded. Durable records are
+   independent of the runner workspace and the tool-activity attempt cap.
 
 Two format translations happen at that last step, both evidence-only (neither
 feeds `applyApproval`, which reads `findingDispositions` from a separate
@@ -194,26 +188,16 @@ interface CycleSummary {
 
 ## Test-status inference (`inferTestResults`)
 
-There is no structured "which tests ran and did they pass" source yet — that
-is AII-798's tool-activity contract, a separate and later piece.
-`extractToolTrace` records only the `tool_use` *input* (e.g. the Bash command
-line), never the matching tool result or exit status, and the fix agent's
-free-text `testing[]` notes are self-reported. Neither is an observed
-result, so `inferTestResults` never classifies a match as `passed`, `failed`,
-or `skipped` — only `missing` or `unobserved`:
+`extractTelemetry` correlates Bash `tool_use` IDs with structured `tool_result`
+events. A recognised test command with a matching result is `passed` when
+`is_error` is false and `failed` when true. Command-only traces and the fix
+agent's free-text `testing[]` notes remain unobserved:
 
 - No recognisable test-command mention (`npm test`, `npm run typecheck`,
   `vitest`, `jest`, `pytest`, `go test`, `yarn test`, `pnpm test`, `tsc`) in
   any source line → one explicit `"missing"` entry, never an empty list.
-- A recognisable test-command mention → `"unobserved"`, regardless of
-  pass/fail-looking words on the same line. A line reading `npm test -- 12
-  passed` is evidence the command was *mentioned*, not that it ran or
-  passed — a clean process exit, plain silence, or a self-reported "passed"
-  note is never treated as evidence of a pass.
-
-`passed`/`failed`/`skipped` remain valid `TestStatus` values for a future
-structured source (AII-798) to report; `inferTestResults` itself never
-produces them today.
+- A recognisable command without a matching structured result → `"unobserved"`,
+  regardless of pass/fail-looking words on the same line.
 
 ## Redaction and per-record cap
 
@@ -243,7 +227,9 @@ implementation:
    ten-entry, per-field-capped record still overflows, `tests` collapses to
    one explicit placeholder entry (`"test evidence omitted (cycle-summary
    size limit)"`, status `unobserved`) and `dispositions` to `[]` — the
-   smallest valid shape, never an oversized or silently dropped write.
+   smallest valid shape. If even that exceeds the cap, the writer logs and
+   omits the record rather than writing an oversized one. The callback rejects
+   externally supplied records above the same 16 KiB cap.
 
 A capped field is always still present in some bounded form — capping never
 silently drops a whole field to empty/absent, only shortens or truncates its

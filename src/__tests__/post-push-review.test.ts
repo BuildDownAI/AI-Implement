@@ -6225,6 +6225,7 @@ describe("postPushReviewStep — cycle summaries (AII-801)", () => {
       const [summary] = summaries;
       expect(summary!.id).toBe("post-push-review.fix-1");
       expect(summary!.stage).toBe("post-push-review-fix");
+      expect(summary!.inputCommit).toBe("abc1234567890abc1234567890abc1234567890");
       expect(summary!.outputCommitStatus).toBe("committed");
       expect(summary!.outputCommit).toBe("abc1234567890abc1234567890abc1234567890");
       expect(summary!.verdict).toMatchObject({ approved: null, reason: "fixed" });

@@ -49,6 +49,20 @@ describe("cycle-summary", () => {
     expect(summaries[0]).toMatchObject({ id: "feedback-loop.1", verdict: { approved: true, reason: "approved" } });
   });
 
+  it("bounds pathological identifiers and commit fields at the writer", () => {
+    writeCycleSummary(tmpDir, baseInput({
+      id: "x".repeat(20_000), inputCommit: "a".repeat(20_000),
+      verdict: { approved: null, reason: "r".repeat(20_000) },
+    }));
+    const [record] = readCycleSummaries(tmpDir);
+    expect(record).toBeDefined();
+    expect(record!.truncated).toBe(true);
+    expect(record!.inputCommit).toBeNull();
+    expect(record!.id.length).toBeLessThanOrEqual(128);
+    expect(record!.verdict.reason.length).toBeLessThanOrEqual(128);
+    expect(Buffer.byteLength(JSON.stringify(record), "utf-8")).toBeLessThanOrEqual(CYCLE_SUMMARY_MAX_BYTES);
+  });
+
   it("keeps multiple cycles individually inspectable", () => {
     writeCycleSummary(tmpDir, baseInput({ id: "feedback-loop.1", cycle: 1 }));
     writeCycleSummary(tmpDir, baseInput({
@@ -197,6 +211,16 @@ describe("cycle-summary", () => {
   });
 
   describe("inferTestResults", () => {
+    it("uses matching structured Bash results for observed pass and failure", () => {
+      const results = inferTestResults([], [], [
+        { command: "npm test", failed: false },
+        { command: "npm run typecheck", failed: true },
+      ]);
+      expect(results).toEqual([
+        { name: "npm test", status: "passed" },
+        { name: "npm run typecheck", status: "failed" },
+      ]);
+    });
     it("never claims a missing test command passed", () => {
       const results = inferTestResults(["Read src/foo.ts", "Edit src/foo.ts"]);
       expect(results).toEqual([{ name: "test execution", status: "missing" }]);

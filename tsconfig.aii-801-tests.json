@@ -6,8 +6,12 @@
   },
   "include": [
     "src/__tests__/cycle-summary.test.ts",
+    "src/__tests__/claude-stream.test.ts",
     "src/__tests__/steps-feedback-loop.test.ts",
-    "src/__tests__/post-push-review.test.ts"
+    "src/__tests__/post-push-review.test.ts",
+    "src/__tests__/run-autonomous.test.ts",
+    "src/__tests__/runner-callback.test.ts",
+    "src/__tests__/runner-result.test.ts"
   ],
   "exclude": []
 }

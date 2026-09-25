@@ -184,6 +184,7 @@ export function extractTerminalStatus(events: StreamEvent[]): LLMTerminalStatus 
 
 export function extractTelemetry(events: StreamEvent[]): RunTelemetry {
   const result = lastResult(events);
+  const executedCommands = extractExecutedCommands(events);
   if (!result) {
     return {
       outcome: "unknown",
@@ -195,6 +196,7 @@ export function extractTelemetry(events: StreamEvent[]): RunTelemetry {
       cacheReadTokens: null,
       cacheCreationTokens: null,
       toolTrace: extractToolTrace(events),
+      ...(executedCommands.length > 0 ? { executedCommands } : {}),
     };
   }
   const usage = (result.usage ?? {}) as {
@@ -219,7 +221,29 @@ export function extractTelemetry(events: StreamEvent[]): RunTelemetry {
     cacheReadTokens: cacheRead,
     cacheCreationTokens: cacheCreation,
     toolTrace: extractToolTrace(events),
+    ...(executedCommands.length > 0 ? { executedCommands } : {}),
   };
+}
+
+export function extractExecutedCommands(events: StreamEvent[]): Array<{ command: string; failed: boolean }> {
+  const pending = new Map<string, string>();
+  const observed: Array<{ command: string; failed: boolean }> = [];
+  for (const event of events) {
+    for (const start of extractToolStarts(event)) {
+      if (!start.id || !start.action.startsWith("Bash")) continue;
+      const input = start.detail;
+      if (input && typeof input === "object" && typeof (input as { command?: unknown }).command === "string") {
+        pending.set(start.id, (input as { command: string }).command);
+      }
+    }
+    for (const result of extractToolResults(event)) {
+      const command = result.toolUseId ? pending.get(result.toolUseId) : undefined;
+      if (!command) continue;
+      observed.push({ command, failed: result.isError });
+      pending.delete(result.toolUseId!);
+    }
+  }
+  return observed;
 }
 
 const TOOL_INPUT_MAX = 160;

@@ -11,14 +11,10 @@ import { ACTIVITY_MAX_EVENT_BYTES, type RunTelemetry } from "./types.js";
  * `finding-dispositions.ts`'s `DISPOSITIONS_FILE` convention) so a later swap to
  * a real sink is additive rather than a rewrite.
  *
- * This file's own durability ends at the runner workspace's teardown. Outliving that boundary
- * is `run-autonomous.ts`'s job: it reads this file back with `readCycleSummaries` and forwards
- * the records on `/runner/result` (mirroring how `findingDispositions` is already forwarded
- * there), and `runner-callback.ts`'s `handleRunnerResult` records each one into the durable
- * `review_fix_cycles` table via `recordReviewFixCycleSummary` (../review-fix-evidence.ts,
- * AII-786) when the result carries a `reviewFix` pilot attempt marker. See
- * docs/cycle-summary-evidence.md for the full path and its current limitation (no attemptId for
- * a Legacy, non-pilot run — there is nothing to record durably against).
+ * This file's own durability ends at runner teardown. `run-autonomous.ts` forwards each
+ * pilot record through the independently authenticated `/runner/cycle-summary` callback
+ * before terminal result intake, so even a run without an output commit can retain evidence.
+ * See docs/cycle-summary-evidence.md for the full path and Legacy limitation.
  */
 
 export type TestStatus = "passed" | "failed" | "missing" | "skipped" | "unobserved";
@@ -116,25 +112,23 @@ export function toolTraceLines(telemetry: RunTelemetry | undefined): string[] {
 
 /**
  * Best-effort scan for test-runner invocations across tool-trace lines and/or free-text agent
- * notes (e.g. the fix agent's `testing[]` summary). Neither source carries an observed outcome:
- * `extractToolTrace` records only the `tool_use` input, never the matching tool result or exit
- * status (AII-798's structured tool-activity records — the real source for "did it pass" — are a
- * separate, later contract), and the agent's free-text notes are self-reported. So this never
- * infers "passed" or "failed" from either — a command-only or self-reported mention is always
- * "unobserved", regardless of pass/fail-looking words on the line (a line reading "npm test --
- * all passed" is not evidence the tests ran, only that the command was mentioned). A source list
- * with no recognisable test-command mention returns a single explicit "missing" entry rather than
- * an empty array.
+ * notes (e.g. the fix agent's `testing[]` summary). These remain unobserved unless a matching
+ * structured Bash tool_result is supplied through `observed`. No verdict is inferred from
+ * agent prose. With no recognised command, the result explicitly says "missing".
  */
-export function inferTestResults(sources: string[], secrets: string[] = envSecrets()): CycleTestResult[] {
+export function inferTestResults(sources: string[], secrets: string[] = envSecrets(), observed: readonly { command: string; failed: boolean }[] = []): CycleTestResult[] {
+  const witnessed = observed.filter((entry) => TEST_COMMAND_RE.test(entry.command)).map((entry) => ({
+    name: redactEvidence(entry.command.trim(), secrets).slice(0, MAX_TEST_NAME_CHARS),
+    status: (entry.failed ? "failed" : "passed") as TestStatus,
+  }));
   const candidates = sources.filter((line) => TEST_COMMAND_RE.test(line));
-  if (candidates.length === 0) {
+  if (candidates.length === 0 && witnessed.length === 0) {
     return [{ name: "test execution", status: "missing" }];
   }
-  return candidates.map((line) => ({
+  return [...witnessed, ...candidates.filter((line) => !witnessed.some((entry) => line.includes(entry.name))).map((line) => ({
     name: redactEvidence(line.trim(), secrets).slice(0, MAX_TEST_NAME_CHARS),
     status: "unobserved" as TestStatus,
-  }));
+  }))];
 }
 
 /** Nullable-aware sum across every telemetry object a cycle spent (e.g. implement + review) —
@@ -161,15 +155,28 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  *  below does, rather than re-implementing this check. */
 export function isCycleSummary(value: unknown): value is CycleSummary {
   if (!isRecord(value)) return false;
-  if (typeof value.id !== "string") return false;
+  if (typeof value.id !== "string" || value.id.length === 0 || value.id.length > 128) return false;
   if (value.stage !== "feedback-loop" && value.stage !== "post-push-review-fix") return false;
-  if (typeof value.cycle !== "number") return false;
-  if (!Array.isArray(value.dispositions) || !Array.isArray(value.tests)) return false;
-  if (!isRecord(value.verdict) || typeof value.verdict.reason !== "string") return false;
+  if (!Number.isSafeInteger(value.cycle) || (value.cycle as number) <= 0) return false;
+  if ((value.inputCommit !== null && (typeof value.inputCommit !== "string" || value.inputCommit.length > 40))
+    || (value.outputCommit !== null && (typeof value.outputCommit !== "string" || value.outputCommit.length > 40))) return false;
+  if (value.outputCommitStatus !== "committed" && value.outputCommitStatus !== "pending_push" && value.outputCommitStatus !== "not_applicable") return false;
+  if (!Array.isArray(value.dispositions) || !value.dispositions.every((d) => isRecord(d) && typeof d.key === "string" && typeof d.disposition === "string")) return false;
+  if (!Array.isArray(value.tests) || value.tests.length === 0 || !value.tests.every((t) => isRecord(t) && typeof t.name === "string" && ["passed", "failed", "missing", "skipped", "unobserved"].includes(String(t.status)))) return false;
+  if (!isRecord(value.verdict) || typeof value.verdict.reason !== "string" || value.verdict.reason.length > 128) return false;
+  if (value.verdict.approved !== null && typeof value.verdict.approved !== "boolean") return false;
+  if (value.verdict.summary !== undefined && typeof value.verdict.summary !== "string") return false;
   if (!isRecord(value.usage)) return false;
+  for (const field of [value.usage.tokensIn, value.usage.tokensOut, value.usage.costUsd]) {
+    if (field !== null && (typeof field !== "number" || !Number.isFinite(field))) return false;
+  }
   if (typeof value.truncated !== "boolean" || typeof value.limitReached !== "boolean") return false;
-  if (typeof value.completedAt !== "number") return false;
-  return true;
+  if (!Number.isSafeInteger(value.completedAt) || (value.completedAt as number) <= 0) return false;
+  try {
+    return Buffer.byteLength(JSON.stringify(value), "utf-8") <= CYCLE_SUMMARY_MAX_BYTES;
+  } catch {
+    return false;
+  }
 }
 
 /** Filters `value` down to well-formed `CycleSummary` entries, same fail-safe convention as
@@ -291,17 +298,17 @@ export function writeCycleSummary(
   }
 
   let record: CycleSummary = {
-    id: input.id,
+    id: boundField(input.id, 128, secrets).value,
     stage: input.stage,
     cycle: input.cycle,
-    inputCommit: input.inputCommit,
-    outputCommit: input.outputCommit,
+    inputCommit: input.inputCommit && input.inputCommit.length <= 40 ? input.inputCommit : null,
+    outputCommit: input.outputCommit && input.outputCommit.length <= 40 ? input.outputCommit : null,
     outputCommitStatus: input.outputCommitStatus,
     dispositions: boundedDispositions.slice(0, MAX_DISPOSITION_ENTRIES),
     tests: boundedTests.slice(0, MAX_TEST_ENTRIES),
     verdict: {
       approved: input.verdict.approved,
-      reason: input.verdict.reason,
+      reason: boundField(input.verdict.reason, 128, secrets).value,
       ...(verdictSummary !== undefined ? { summary: verdictSummary } : {}),
     },
     usage: input.usage,
@@ -309,6 +316,8 @@ export function writeCycleSummary(
     limitReached: false,
     completedAt,
   };
+  if (record.id !== input.id || record.verdict.reason !== input.verdict.reason
+    || record.inputCommit !== input.inputCommit || record.outputCommit !== input.outputCommit) truncated = true;
 
   let limitReached = false;
   let sizeBytes = Buffer.byteLength(JSON.stringify(record), "utf-8");
@@ -333,8 +342,9 @@ export function writeCycleSummary(
     if (sizeBytes > CYCLE_SUMMARY_MAX_BYTES) {
       console.warn(
         `[cycle-summary] cycle summary "${record.id}" is ${sizeBytes} bytes, still over the ` +
-          `${CYCLE_SUMMARY_MAX_BYTES}-byte cap after the full fallback; writing it anyway`,
+          `${CYCLE_SUMMARY_MAX_BYTES}-byte cap after the full fallback; omitting it`,
       );
+      return record;
     }
   }
   record.truncated = truncated;

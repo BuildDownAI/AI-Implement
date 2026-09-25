@@ -2358,7 +2358,8 @@ ${externalFindingsFixBlock}
 
       // Snapshot before this cycle's invoke/commit/push mutate `leaseSha` below — this is the
       // commit the fix pass started from, reported as the cycle summary's `inputCommit`.
-      const fixCycleInputCommit = leaseSha ?? null;
+      const inputHead = leaseSha ? null : gitSpawn(["rev-parse", "HEAD"]);
+      const fixCycleInputCommit = leaseSha ?? (inputHead?.exitCode === 0 && inputHead.stdout.trim() ? inputHead.stdout.trim() : null);
       const fixResult = await context.llmExecutor.invoke({
         prompt: fixPrompt,
         model,
@@ -2379,7 +2380,7 @@ ${externalFindingsFixBlock}
           outputCommit: null,
           outputCommitStatus: "not_applicable",
           dispositions: [],
-          tests: inferTestResults(toolTraceLines(fixResult.telemetry)),
+          tests: inferTestResults(toolTraceLines(fixResult.telemetry), undefined, fixResult.telemetry?.executedCommands),
           verdict: { approved: null, reason: "fix_failed", summary: failure },
           usage: sumUsage(fixResult.telemetry),
         });
@@ -2448,7 +2449,7 @@ ${externalFindingsFixBlock}
             outputCommit: null,
             outputCommitStatus: "not_applicable",
             dispositions: toCycleDispositions(noChangesDispositions),
-            tests: inferTestResults(toolTraceLines(fixResult.telemetry)),
+            tests: inferTestResults(toolTraceLines(fixResult.telemetry), undefined, fixResult.telemetry?.executedCommands),
             verdict: { approved: null, reason: "dispositioned_no_changes" },
             usage: sumUsage(fixResult.telemetry),
           });
@@ -2475,7 +2476,7 @@ ${externalFindingsFixBlock}
           outputCommit: null,
           outputCommitStatus: "not_applicable",
           dispositions: toCycleDispositions(noChangesDispositions),
-          tests: inferTestResults(toolTraceLines(fixResult.telemetry)),
+          tests: inferTestResults(toolTraceLines(fixResult.telemetry), undefined, fixResult.telemetry?.executedCommands),
           verdict: { approved: null, reason: "no_changes", summary: feedback },
           usage: sumUsage(fixResult.telemetry),
         });
@@ -2581,7 +2582,7 @@ ${externalFindingsFixBlock}
         outputCommit: fixCycleOutputCommit,
         outputCommitStatus: "committed",
         dispositions: toCycleDispositions(pushedDispositions),
-        tests: inferTestResults([...toolTraceLines(fixResult.telemetry), ...(fixSummary?.testing ?? [])]),
+        tests: inferTestResults([...toolTraceLines(fixResult.telemetry), ...(fixSummary?.testing ?? [])], undefined, fixResult.telemetry?.executedCommands),
         verdict: { approved: null, reason: "fixed", summary: fixSummary?.notes || undefined },
         usage: sumUsage(fixResult.telemetry),
       });
