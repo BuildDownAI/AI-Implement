@@ -22,6 +22,7 @@ import type * as LedgerModule from "../review-ledger-store.js";
 import type * as QueueModule from "../review-fix-queue.js";
 import type * as PendingModule from "../review-fix-pending.js";
 import type * as CloseModule from "../review-fix-close.js";
+import type * as AdminFacadeModule from "../review-fix-admin-facade.js";
 import type { ReviewFixAdmissionRequest, ReviewFixAttemptStorePort } from "../review-fix-ports.js";
 import type { ReviewFixResultMetadataV1, ScopedPrIdentity } from "../review-fix-contract.js";
 import type { RepoMapping } from "../config.js";
@@ -34,6 +35,7 @@ let ledger: typeof LedgerModule;
 let queue: typeof QueueModule;
 let pending: typeof PendingModule;
 let close: typeof CloseModule;
+let adminFacade: typeof AdminFacadeModule;
 
 beforeEach(async () => {
   vi.resetModules();
@@ -49,6 +51,7 @@ beforeEach(async () => {
   queue = await import("../review-fix-queue.js");
   pending = await import("../review-fix-pending.js");
   close = await import("../review-fix-close.js");
+  adminFacade = await import("../review-fix-admin-facade.js");
 });
 
 afterEach(() => {
@@ -157,6 +160,33 @@ describe("SqliteReviewFixAttemptStore: satisfies the port without unsafe casts",
 });
 
 describe("SqliteReviewFixAttemptStore: admission", () => {
+  it("exposes durable attempt state and only lets an administrator cancel its exact owner", async () => {
+    seedMapping();
+    const store = new storeModule.SqliteReviewFixAttemptStore();
+    const admitted = await store.admit(admissionRequest());
+    if (admitted.status !== "prepared") throw new Error("expected prepared");
+    const facade = adminFacade.createReviewFixAdminFacade(store, {
+      reconcile: async () => ({ status: "unknown" }),
+    });
+    const user = { role: "user" as const, email: "reader@example.com" };
+    const admin = { role: "admin" as const, email: "operator@example.com" };
+    expect(await facade.getAttempt(admitted.attempt.attemptId, user)).toEqual({ status: "not_found" });
+    const detail = await facade.getAttempt(admitted.attempt.attemptId, admin);
+    expect(detail.status).toBe("ok");
+    if (detail.status === "ok") {
+      expect(detail.attempt.terminationConfirmed).toBe(false);
+      expect(detail.attempt.evidenceComplete).toBe(false);
+      expect(detail.attempt.snapshot?.findings).toEqual(admitted.attempt.findings);
+    }
+    expect(await facade.requestCancellation(admitted.attempt.attemptId, admin)).toMatchObject({ status: "rejected" });
+    expect(await facade.revokeAuthority(admitted.attempt.attemptId, user)).toEqual({ status: "not_found" });
+    expect(await facade.revokeAuthority(admitted.attempt.attemptId, admin)).toEqual({ status: "accepted" });
+    expect(await facade.requestCancellation(admitted.attempt.attemptId, admin)).toEqual({ status: "accepted" });
+    expect((dedup.getDb().prepare("SELECT kind FROM review_fix_inbox").get() as { kind: string }).kind).toBe("cancellation");
+    expect(dedup.getDb().prepare("SELECT released_at FROM dispatch_admissions WHERE dispatch_id = ?")
+      .get(admitted.attempt.attemptId)).toMatchObject({ released_at: null });
+  });
+
   it("durably revokes authority and requests cancellation when its PR closes", async () => {
     seedMapping();
     const store = new storeModule.SqliteReviewFixAttemptStore();

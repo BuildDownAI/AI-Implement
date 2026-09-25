@@ -73,6 +73,8 @@ import { CYCLE_SUMMARY_MAX_BYTES } from "./pipeline/cycle-summary.js";
 import type { RunnerProgressBody, RunnerResultBody, RunnerActivityBody, ActivityIntakeOutcome } from "./runner-callback.js";
 import { mintRunToken, PLANNING_TTL_SECONDS, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
 import { SqliteReviewFixAttemptStore } from "./review-fix-attempt-store.js";
+import { createReviewFixAdminFacade } from "./review-fix-admin-facade.js";
+import { GithubReviewFixWorker, createGithubAppCredentialResolver, reviewFixAttemptStoreScopeStore } from "./review-fix-worker.js";
 import { listActiveRestateReviewFixPrs, queueReviewFixCancellationForClosedPr } from "./review-fix-close.js";
 import { acceptDelivery as acceptReviewFixDelivery, ReviewFixDeliveryPump } from "./restate/review-fix-client.js";
 import { appendReviewFixActivityBatch, isReviewFixEvidenceTombstoned } from "./review-fix-evidence.js";
@@ -4511,6 +4513,10 @@ function startServer(
   memoryProviderDiagnostic: string | null,
 ): http.Server {
   const startDeploy = makeStartDeploy({ ...config, onBuildFailure: onDeployBuildFailure });
+  const reviewFixAttempts = createReviewFixAdminFacade(reviewFixAttemptStore, new GithubReviewFixWorker({
+    credentials: createGithubAppCredentialResolver(config.githubAppId, config.githubAppPrivateKey),
+    scopeStore: reviewFixAttemptStoreScopeStore(reviewFixAttemptStore),
+  }));
   const kgRefresh: KgRefreshHandle = makeKgRefresh({
     sidecar,
     githubAppId: config.githubAppId,
@@ -5171,7 +5177,8 @@ function startServer(
           return { started: getPollStats().pollCount > before };
         },
         notifyWebhookUrl: config.notifyWebhookUrl,
-      }, registry, { startDeploy, selfDeployTarget: config.selfDeployTarget, kgRefresh, callTool, getRestateStatus })) return;
+      }, registry, { startDeploy, selfDeployTarget: config.selfDeployTarget, kgRefresh, callTool, getRestateStatus,
+        reviewFixAttempts })) return;
     }
 
     res.writeHead(404, { "Content-Type": "application/json" });
