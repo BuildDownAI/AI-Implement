@@ -223,6 +223,31 @@ describe("review ledger store", () => {
     expect(store.getReviewFindingById(id)?.status).toBe("deferred");
   });
 
+  it("a post-snapshot re-report stays open after a stale conditional defer", () => {
+    const id = store.upsertReviewFinding({
+      repo: "org/repo",
+      prNumber: 42,
+      source: "github-review",
+      severity: "blocking",
+      body: "Add a config flag for this.",
+    });
+    const snapshot = store.getReviewFindingById(id)!;
+    expect(snapshot.revision).toBe(1);
+
+    // Re-report bumps the revision past the caller's snapshot.
+    store.upsertReviewFinding({
+      repo: "org/repo",
+      prNumber: 42,
+      source: "github-review",
+      severity: "blocking",
+      body: "Add a config flag for this.",
+    });
+
+    const changed = store.markReviewFindingDeferredIfRevision(id, snapshot.revision);
+    expect(changed).toBe(0);
+    expect(store.listOpenReviewFindings("org/repo", 42)).toMatchObject([{ id, status: "open" }]);
+  });
+
   it("conditional dispositions are scoped to a single id: resolving a subset of more than 30 findings leaves the rest open", () => {
     const ids = Array.from({ length: 31 }, (_, i) =>
       store.upsertReviewFinding({
