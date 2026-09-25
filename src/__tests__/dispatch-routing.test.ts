@@ -28,6 +28,39 @@ vi.mock("../local-docker.js", () => ({
   sweepExitedLocalContainers: vi.fn(),
 }));
 
+// Only mocked for the "result-based admission release/hold" describe block below —
+// resolveRunnerImageForDispatch, resolveWorkflowCapabilities/resolveWorkflowContract all
+// hit GitHub (image.yml / workflow probe) over real HTTP, which those tests need to bypass
+// to reach postWorkflowDispatch. Everything else from these modules stays real.
+vi.mock("../repo-image.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../repo-image.js")>();
+  return { ...actual, resolveRunnerImageForDispatch: vi.fn() };
+});
+
+vi.mock("../workflow-probe.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../workflow-probe.js")>();
+  return {
+    ...actual,
+    resolveWorkflowCapabilities: vi.fn(),
+    resolveWorkflowContract: vi.fn(),
+  };
+});
+
+vi.mock("../github.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../github.js")>();
+  return { ...actual, postWorkflowDispatch: vi.fn() };
+});
+
+// Only mocked (as a spy wrapping the real implementation) for the "defers
+// buildPlanningContextInputs until after admission" describe block below — every other
+// test in this file uses provider.id: "jira" so the real implementation already
+// short-circuits to NONE_CONTEXT without a network call, and does not need call-order
+// tracking.
+vi.mock("../planning-context.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../planning-context.js")>();
+  return { ...actual, buildPlanningContextInputs: vi.fn(actual.buildPlanningContextInputs) };
+});
+
 // AII-783 gap-fill (review finding on PR #681): the exact four cases the blocking review
 // comment asked for, tested directly against the pure decision seam dispatchSession's
 // catch block now delegates to, rather than only indirectly through a full dispatch call.
@@ -436,5 +469,368 @@ describe("dispatch entry points — pre-launch failure releases the reservation 
       backend: "local-docker",
     });
     expect(retry.ok).toBe(true);
+  });
+});
+
+// AII-783 review on PR #681 (finding 2): the non-thrown, result.outcome-based release/hold
+// branch — `if (result.outcome === "rejected") admission.release(...)` — had zero coverage
+// on either side. dispatchGitHubActions and dispatchPlanning's GHA path each have their own
+// independent copy of this check, so both are exercised here: "rejected" (a 4xx GitHub
+// itself refused) must free the reservation, while "unknown" (e.g. a 5xx or a lost response)
+// must leave it held, since the run may have actually started. Only postWorkflowDispatch and
+// the image/workflow-contract probes are mocked; dedup/log/dispatch-breaker/dispatch-admission/
+// dispatch-gate all run for real against a temp sqlite db, so the assertions below check the
+// actual reservation state, not a stub's call count.
+describe("dispatchGitHubActions / dispatchPlanning GHA path — result.outcome admission release/hold (AII-783 review on PR #681)", () => {
+  let dbPath: string;
+  let dedup: typeof DedupModule;
+  let gate: typeof GateModule;
+  let breaker: typeof BreakerModule;
+  let log: typeof import("../log.js");
+  let indexModule: typeof import("../index.js");
+  let githubAppAuth: typeof import("../github-app-auth.js");
+  let repoImage: typeof import("../repo-image.js");
+  let workflowProbe: typeof import("../workflow-probe.js");
+  let github: typeof import("../github.js");
+
+  const issue: TicketIssue = {
+    id: "issue-result-outcome-1",
+    identifier: "AII-910",
+    title: "Test issue",
+    description: "desc",
+    scopeKey: "AII",
+    nativeStatus: "Todo",
+  };
+
+  const mapping = {
+    owner: "eudoxus",
+    repo: "AI-Implement",
+    workflowFile: "claude-implement.yml",
+    planningWorkflowFile: "claude-plan.yml",
+    defaultBranch: "main",
+    maxInProgressAiIssues: 1,
+    provider: "anthropic",
+    sessionMode: "default",
+    machineCpus: 1,
+    machineMemoryMb: 512,
+    extraEnv: {},
+  } as unknown as RepoMapping;
+
+  // provider.id is deliberately not "linear": buildPlanningContextInputs short-circuits to
+  // NONE_CONTEXT without any network call whenever ticketingProviderId !== "linear", which
+  // keeps this test independent of whether Linear auth env vars happen to be set.
+  const provider = {
+    id: "jira",
+    issueUrl: vi.fn().mockReturnValue("https://example.atlassian.net/browse/AII-910"),
+    markImplementationFailed: vi.fn(),
+    markPlanningFailed: vi.fn(),
+    markPlanningStarted: vi.fn().mockResolvedValue(undefined),
+    postComment: vi.fn().mockResolvedValue(undefined),
+  } as unknown as TicketingProvider;
+
+  const prior = { count: 0, lastDispatchedAt: null };
+  const config = { githubAppId: "id", githubAppPrivateKey: "key" } as unknown as AppConfig;
+
+  const planningCtx = {
+    execPath: "github-actions" as const,
+    runnerMode: "default",
+    resolvedPlanningBranch: mapping.defaultBranch,
+    planningFieldValue: null,
+  };
+
+  beforeEach(async () => {
+    vi.resetModules();
+    dbPath = path.join(
+      os.tmpdir(),
+      `dispatch-outcome-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
+    );
+    process.env.DEDUP_DB_PATH = dbPath;
+    dedup = await import("../dedup.js");
+    gate = await import("../dispatch-gate.js");
+    breaker = await import("../dispatch-breaker.js");
+    breaker.initDispatchBreakerTable();
+    log = await import("../log.js");
+    log.initLogTable();
+    githubAppAuth = await import("../github-app-auth.js");
+    repoImage = await import("../repo-image.js");
+    workflowProbe = await import("../workflow-probe.js");
+    github = await import("../github.js");
+    indexModule = await import("../index.js");
+
+    vi.mocked(githubAppAuth.getInstallationToken).mockResolvedValue("gh-token");
+    vi.mocked(repoImage.resolveRunnerImageForDispatch).mockResolvedValue(undefined);
+    vi.mocked(workflowProbe.resolveWorkflowCapabilities).mockResolvedValue({
+      contract: "legacy",
+      supportsRunPublicationToken: false,
+      supportsAttemptCorrelation: false,
+    });
+    vi.mocked(workflowProbe.resolveWorkflowContract).mockResolvedValue("legacy");
+  });
+
+  afterEach(() => {
+    dedup.closeDb();
+    try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+  });
+
+  it("dispatchGitHubActions: outcome 'rejected' releases the reservation", async () => {
+    vi.mocked(github.postWorkflowDispatch).mockResolvedValue({
+      success: false,
+      status: 422,
+      error: "unexpected inputs",
+      outcome: "rejected",
+    });
+
+    await indexModule.dispatchGitHubActions(config, provider, issue, mapping, prior, "default", mapping.defaultBranch, null);
+
+    // The exact reservation is free again — a definitive GitHub-side refusal never launched.
+    const retry = gate.acquireDispatch({
+      dispatchId: "retry-gha-rejected",
+      issueId: issue.id,
+      issueIdentifier: issue.identifier,
+      kind: "implementation",
+      teamKey: issue.scopeKey,
+      maxInProgressAiIssues: 1,
+      backend: "github-actions",
+    });
+    expect(retry.ok).toBe(true);
+  });
+
+  it("dispatchGitHubActions: outcome 'unknown' holds the reservation", async () => {
+    vi.mocked(github.postWorkflowDispatch).mockResolvedValue({
+      success: false,
+      status: 503,
+      error: "upstream timeout",
+      outcome: "unknown",
+    });
+
+    await indexModule.dispatchGitHubActions(config, provider, issue, mapping, prior, "default", mapping.defaultBranch, null);
+
+    // An ambiguous failure (the run may have actually started) must not free the slot.
+    const retry = gate.acquireDispatch({
+      dispatchId: "retry-gha-unknown",
+      issueId: issue.id,
+      issueIdentifier: issue.identifier,
+      kind: "implementation",
+      teamKey: issue.scopeKey,
+      maxInProgressAiIssues: 1,
+      backend: "github-actions",
+    });
+    expect(retry).toEqual({ ok: false, reason: "occupied", count: 1, cap: 1 });
+  });
+
+  it("dispatchPlanning GHA path: outcome 'rejected' releases the reservation", async () => {
+    vi.mocked(github.postWorkflowDispatch).mockResolvedValue({
+      success: false,
+      status: 422,
+      error: "unexpected inputs",
+      outcome: "rejected",
+    });
+
+    await indexModule.dispatchPlanning(config, provider, issue, mapping, planningCtx);
+
+    const retry = gate.acquireDispatch({
+      dispatchId: "retry-plan-rejected",
+      issueId: issue.id,
+      issueIdentifier: issue.identifier,
+      kind: "planning",
+      teamKey: issue.scopeKey,
+      maxInProgressAiIssues: 1,
+      backend: "github-actions",
+    });
+    expect(retry.ok).toBe(true);
+  });
+
+  it("dispatchPlanning GHA path: outcome 'unknown' holds the reservation", async () => {
+    vi.mocked(github.postWorkflowDispatch).mockResolvedValue({
+      success: false,
+      status: 503,
+      error: "upstream timeout",
+      outcome: "unknown",
+    });
+
+    await indexModule.dispatchPlanning(config, provider, issue, mapping, planningCtx);
+
+    const retry = gate.acquireDispatch({
+      dispatchId: "retry-plan-unknown",
+      issueId: issue.id,
+      issueIdentifier: issue.identifier,
+      kind: "planning",
+      teamKey: issue.scopeKey,
+      maxInProgressAiIssues: 1,
+      backend: "github-actions",
+    });
+    expect(retry).toEqual({ ok: false, reason: "occupied", count: 1, cap: 1 });
+  });
+});
+
+// AII-783 second review round on PR #681: an earlier version of this refactor moved the
+// pre-admission checks (checkForcedPathEligibility, validateIssueBaseBranch) out of
+// dispatchPlanning into preparePlanningDispatch, but left buildPlanningContextInputs — a
+// real Linear GraphQL call — as dispatchPlanning's actual first statement, executing on
+// every attempt before acquireDispatch ran on either the GHA or fly-machines/local-docker
+// path. These tests exercise the fix directly: pre-occupy the team's only capacity slot so
+// dispatchPlanning's own admission check is guaranteed to fail, then assert the Linear
+// call never happened — the failure mode the original bug could not have caught, since
+// provider.id: "jira" alone makes buildPlanningContextInputs a no-op regardless of when
+// it runs.
+describe("dispatchPlanning defers buildPlanningContextInputs until after admission (AII-783 second review round on PR #681)", () => {
+  let dbPath: string;
+  let dedup: typeof DedupModule;
+  let gate: typeof GateModule;
+  let breaker: typeof BreakerModule;
+  let log: typeof import("../log.js");
+  let indexModule: typeof import("../index.js");
+  let githubAppAuth: typeof import("../github-app-auth.js");
+  let repoImage: typeof import("../repo-image.js");
+  let workflowProbe: typeof import("../workflow-probe.js");
+  let github: typeof import("../github.js");
+  let localDocker: typeof import("../local-docker.js");
+  let planningContext: typeof import("../planning-context.js");
+
+  const issue: TicketIssue = {
+    id: "issue-defer-context-1",
+    identifier: "AII-920",
+    title: "Test issue",
+    description: "desc",
+    scopeKey: "AII",
+    nativeStatus: "Todo",
+  };
+
+  const mapping = {
+    owner: "eudoxus",
+    repo: "AI-Implement",
+    workflowFile: "claude-implement.yml",
+    planningWorkflowFile: "claude-plan.yml",
+    defaultBranch: "main",
+    maxInProgressAiIssues: 1,
+    provider: "anthropic",
+    sessionMode: "default",
+    machineCpus: 1,
+    machineMemoryMb: 512,
+    extraEnv: {},
+  } as unknown as RepoMapping;
+
+  // Linear-tracked, so buildPlanningContextInputs would take the real network-call
+  // branch if it were ever reached — isLinearAuthConfigured() is false in this test env
+  // (no Linear env vars set), so a *reached* call still resolves to NONE_CONTEXT rather
+  // than throwing, but the mock records that it was invoked at all.
+  const provider = {
+    id: "linear",
+    issueUrl: vi.fn().mockReturnValue("https://linear.app/issue/AII-920"),
+    markImplementationFailed: vi.fn(),
+    markPlanningFailed: vi.fn(),
+    markPlanningStarted: vi.fn().mockResolvedValue(undefined),
+    postComment: vi.fn().mockResolvedValue(undefined),
+  } as unknown as TicketingProvider;
+
+  const planningCtx = {
+    execPath: "github-actions" as const,
+    runnerMode: "default",
+    resolvedPlanningBranch: mapping.defaultBranch,
+    planningFieldValue: null,
+  };
+
+  const localPlanningCtx = {
+    execPath: "local-docker" as const,
+    runnerMode: "default",
+    resolvedPlanningBranch: mapping.defaultBranch,
+    planningFieldValue: null,
+  };
+
+  beforeEach(async () => {
+    vi.resetModules();
+    dbPath = path.join(
+      os.tmpdir(),
+      `dispatch-defer-context-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
+    );
+    process.env.DEDUP_DB_PATH = dbPath;
+    dedup = await import("../dedup.js");
+    gate = await import("../dispatch-gate.js");
+    breaker = await import("../dispatch-breaker.js");
+    breaker.initDispatchBreakerTable();
+    log = await import("../log.js");
+    log.initLogTable();
+    githubAppAuth = await import("../github-app-auth.js");
+    repoImage = await import("../repo-image.js");
+    workflowProbe = await import("../workflow-probe.js");
+    github = await import("../github.js");
+    localDocker = await import("../local-docker.js");
+    planningContext = await import("../planning-context.js");
+    indexModule = await import("../index.js");
+
+    vi.mocked(githubAppAuth.getInstallationToken).mockResolvedValue("gh-token");
+    vi.mocked(repoImage.resolveRunnerImageForDispatch).mockResolvedValue(undefined);
+    vi.mocked(workflowProbe.resolveWorkflowCapabilities).mockResolvedValue({
+      contract: "legacy",
+      supportsRunPublicationToken: false,
+      supportsAttemptCorrelation: false,
+    });
+    vi.mocked(workflowProbe.resolveWorkflowContract).mockResolvedValue("legacy");
+    vi.mocked(planningContext.buildPlanningContextInputs).mockClear();
+    vi.mocked(github.postWorkflowDispatch).mockClear();
+    vi.mocked(localDocker.startLocalRunnerContainer).mockClear();
+  });
+
+  afterEach(() => {
+    dedup.closeDb();
+    try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+  });
+
+  it("GHA path: never fetches planning context when the team's capacity is already spent", async () => {
+    const occupied = gate.acquireDispatch({
+      dispatchId: "occupy-gha",
+      issueId: "AII-other-1",
+      issueIdentifier: "AII-other-1",
+      kind: "implementation",
+      teamKey: issue.scopeKey,
+      maxInProgressAiIssues: 1,
+      backend: "github-actions",
+    });
+    expect(occupied.ok).toBe(true);
+
+    const config = { githubAppId: "id", githubAppPrivateKey: "key" } as unknown as AppConfig;
+    await indexModule.dispatchPlanning(config, provider, issue, mapping, planningCtx);
+
+    expect(planningContext.buildPlanningContextInputs).not.toHaveBeenCalled();
+    expect(github.postWorkflowDispatch).not.toHaveBeenCalled();
+  });
+
+  it("GHA path: fetches planning context once admission succeeds", async () => {
+    vi.mocked(github.postWorkflowDispatch).mockResolvedValue({
+      success: true,
+      status: 204,
+      outcome: "accepted",
+    });
+
+    const config = { githubAppId: "id", githubAppPrivateKey: "key" } as unknown as AppConfig;
+    await indexModule.dispatchPlanning(config, provider, issue, mapping, planningCtx);
+
+    expect(planningContext.buildPlanningContextInputs).toHaveBeenCalledTimes(1);
+  });
+
+  it("local-docker path: never fetches planning context when the team's capacity is already spent", async () => {
+    const occupied = gate.acquireDispatch({
+      dispatchId: "occupy-local",
+      issueId: "AII-other-2",
+      issueIdentifier: "AII-other-2",
+      kind: "planning",
+      teamKey: issue.scopeKey,
+      maxInProgressAiIssues: 1,
+      backend: "local-docker",
+    });
+    expect(occupied.ok).toBe(true);
+
+    const config = {
+      githubAppId: "id",
+      githubAppPrivateKey: "key",
+      anthropicApiKey: "sk-test",
+      localRunnerImage: "ai-implement-runner:local",
+      healthPort: 8080,
+    } as unknown as AppConfig;
+
+    await indexModule.dispatchPlanning(config, provider, issue, mapping, localPlanningCtx);
+
+    expect(planningContext.buildPlanningContextInputs).not.toHaveBeenCalled();
+    expect(vi.mocked(localDocker.startLocalRunnerContainer)).not.toHaveBeenCalled();
   });
 });

@@ -645,7 +645,9 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
         const isPlanning = needsPlanningIds.has(issue.id) && mapping.planningEnabled;
 
         if (isPlanning) {
-          await dispatchPlanning(config, issueProvider, issue, mapping);
+          const planningCtx = await preparePlanningDispatch(config, issueProvider, issue, mapping);
+          if (!planningCtx) continue;
+          await dispatchPlanning(config, issueProvider, issue, mapping, planningCtx);
         } else {
           const prior = countPriorDispatches(issue.id, "implementation");
 
@@ -1222,17 +1224,44 @@ export async function dispatchGitHubActions(
  * markDispatched() so the dedup table stays clear for the subsequent
  * implementation dispatch.
  */
-async function dispatchPlanning(
+export type PlanningDispatchContext = {
+  execPath: ReturnType<typeof resolvePlanningExecutionPath>;
+  runnerMode: string;
+  /** Validated "AI-Implement Base Branch" field value, or the mapping default. */
+  resolvedPlanningBranch: string;
+  /** The validated field value itself, or null when unset — distinct from
+   *  resolvedPlanningBranch, which falls back to the mapping default. */
+  planningFieldValue: string | null;
+};
+
+/**
+ * Pre-admission checks and the base-branch credential mint for planning dispatch,
+ * run once in poll() before dispatchPlanning is called — mirroring the
+ * implementation path, where this same work (checkForcedPathEligibility,
+ * validateIssueBaseBranch) happens in poll() ahead of dispatchGitHubActions /
+ * dispatchFlyMachine / dispatchLocalDocker.
+ *
+ * dispatchPlanning itself also defers `buildPlanningContextInputs` — a real Linear
+ * GraphQL call — until after its own admission check succeeds (acquireDispatch
+ * directly on the GHA path, or dispatchSession's internal acquireDispatch on the
+ * fly-machines/local-docker path), so no network call of any kind runs before capacity
+ * is reserved (AII-783 second review round on PR #681: an earlier version of this
+ * refactor moved the pre-admission checks here but left buildPlanningContextInputs as
+ * dispatchPlanning's actual first statement).
+ * Returns null when the issue must not be dispatched this tick — every reason is
+ * already logged/marked by this function, so the caller only needs to skip.
+ */
+async function preparePlanningDispatch(
   config: AppConfig,
   provider: TicketingProvider,
   issue: DispatchableIssue,
   mapping: RepoMapping,
-): Promise<void> {
+): Promise<PlanningDispatchContext | null> {
   if (!mapping.planningWorkflowFile) {
     console.warn(
       `[poll] Planning enabled for team ${issue.scopeKey} but planningWorkflowFile is not set — skipping ${issue.identifier}`,
     );
-    return;
+    return null;
   }
 
   const { mode: runnerMode } = getRunnerMode();
@@ -1246,7 +1275,7 @@ async function dispatchPlanning(
     console.log(
       `[poll] Skipping planning for ${issue.identifier}: forced runner mode "${runnerMode}" but team ${issue.scopeKey} is ineligible — ${planningEligibility.reason}`,
     );
-    return;
+    return null;
   }
 
   // AII-430: every planning execution path (GHA, Fly, local Docker) advances the
@@ -1257,7 +1286,7 @@ async function dispatchPlanning(
     console.error(
       `[poll] Refusing to dispatch planning for ${issue.identifier}: ${callbackBlockReason}`,
     );
-    return;
+    return null;
   }
 
   // Validate the "AI-Implement Base Branch" field before planning dispatch: planning
@@ -1277,17 +1306,27 @@ async function dispatchPlanning(
     issue,
     markFailed: (id, sk, reason) => provider.markPlanningFailed(id, sk, reason),
   });
-  if (planningValidated.refused) return;
+  if (planningValidated.refused) return null;
 
   // featureBranchChain is NOT consulted for planning — that grouping applies only to
   // implementation dispatches. Planning clones the validated field value or the default.
   const resolvedPlanningBranch = planningValidated.branch ?? mapping.defaultBranch;
 
-  // Build planning context (PARENT/SIBLINGS/DEPENDENCIES) for all execution paths.
-  const planningContextInputs = await buildPlanningContextInputs({
-    issue,
-    ticketingProviderId: provider.id,
-  });
+  return { execPath, runnerMode, resolvedPlanningBranch, planningFieldValue: planningValidated.branch };
+}
+
+// Exported for direct testing of the GHA result-based admission release/hold branch —
+// see "dispatchPlanning GHA path" in dispatch-routing.test.ts. Not part of the module's
+// public API otherwise; the only production call site is poll(), via
+// preparePlanningDispatch's resolved context.
+export async function dispatchPlanning(
+  config: AppConfig,
+  provider: TicketingProvider,
+  issue: DispatchableIssue,
+  mapping: RepoMapping,
+  ctx: PlanningDispatchContext,
+): Promise<void> {
+  const { execPath, runnerMode, resolvedPlanningBranch, planningFieldValue } = ctx;
 
   if (execPath === "fly-machines" || execPath === "local-docker") {
     // Bedrock is not supported on container runners.
@@ -1326,6 +1365,16 @@ async function dispatchPlanning(
       backendKind: execPath,
       isDefinitiveLaunchFailure: execPath === "fly-machines" ? isDefinitiveFlyRejectionError : isDefinitiveLocalDockerLaunchFailure,
       backend: async ({ sessionToken, machineNonce, runnerCallbackUrl, runToken, markLaunchAttempted }) => {
+        // Build planning context (PARENT/SIBLINGS/DEPENDENCIES) here, not before
+        // dispatchSession's admission check above: this is a real network call
+        // (Linear GraphQL lookup) and must not run before capacity is reserved
+        // (AII-783 review on PR #681). `backend` only runs once dispatchSession's
+        // acquireDispatch has already succeeded.
+        const planningContextInputs = await buildPlanningContextInputs({
+          issue,
+          ticketingProviderId: provider.id,
+        });
+
         const planningEnv = {
           PARENT: planningContextInputs.parent,
           SIBLINGS: planningContextInputs.siblings,
@@ -1482,7 +1531,7 @@ async function dispatchPlanning(
             err,
           );
         }
-        postBranchComment(provider, issue, planningValidated.branch, mapping.defaultBranch, "planning");
+        postBranchComment(provider, issue, planningFieldValue, mapping.defaultBranch, "planning");
       },
     });
     return;
@@ -1509,6 +1558,14 @@ async function dispatchPlanning(
   // dispatchGitHubActions.
   const { ghToken, runnerImage, planningSentBaseBranch, planningContract, planningDispatchInputs } =
     await (async () => {
+      // Build planning context (PARENT/SIBLINGS/DEPENDENCIES) only once admission is
+      // confirmed: this is a real network call (Linear GraphQL lookup) and must not run
+      // before capacity is reserved (AII-783 review on PR #681).
+      const planningContextInputs = await buildPlanningContextInputs({
+        issue,
+        ticketingProviderId: provider.id,
+      });
+
       const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
 
       let runnerCallbackUrl = "";
@@ -1673,7 +1730,7 @@ async function dispatchPlanning(
     );
   }
 
-  postBranchComment(provider, issue, planningValidated.branch, mapping.defaultBranch, "planning");
+  postBranchComment(provider, issue, planningFieldValue, mapping.defaultBranch, "planning");
 
   console.log(`[poll] Dispatched planning for ${issue.identifier} -> ${mapping.owner}/${mapping.repo} (${mapping.planningWorkflowFile}, image: ${runnerImage ?? "workflow-default"})`);
 }
