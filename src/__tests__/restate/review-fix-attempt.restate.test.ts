@@ -309,7 +309,7 @@ describe("ReviewFixAttempt durable workflow", () => {
       await callWorkflow(env.baseUrl(), "ReviewFixAttempt", recovering.prepared.attemptId,
         "result", resultOf(recovering));
       const attached = await callWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt",
-        recovering.prepared.attemptId, "run", { attemptId: recovering.prepared.attemptId });
+        recovering.prepared.attemptId, "workflowAttach");
       expect(attached).toMatchObject({ status: "finalized", approval: "applied" });
       expect([recovering.launchEffects, recovering.approvalEffects, recovering.releaseEffects])
         .toEqual([1, 1, 1]);
