@@ -11,7 +11,7 @@ import {
 import type { RepoMapping } from "./config.js";
 import { markDispatched, closeDb, getDispatchedIds, deleteDispatched } from "./dedup.js";
 import { canDispatch, acquireDispatch, type DispatchKind, type AcquireDispatchOutcome } from "./dispatch-gate.js";
-import { count as countAdmissionReservations } from "./dispatch-admission.js";
+import { count as countAdmissionReservations, sweepStaleAdmissions } from "./dispatch-admission.js";
 import { reconcileFilesystemFailures } from "./filesystem-ticket-lifecycle.js";
 import { dispatchWorkflow, postWorkflowDispatch, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, getPullRequestState, buildEnvelopeDispatchInputs, postPrComment, defaultFetchSignal, getRepoDefaultBranch, buildKgRefreshGhaDispatchBody, pollForKgWorkflowRunId } from "./github.js";
 import { resolveWorkflowCapabilities, resolveWorkflowContract } from "./workflow-probe.js";
@@ -788,6 +788,15 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
     failKgRefreshMachine: (_job, opts) => { activeKgRefresh?.onMachineLost(opts); },
   });
 
+  // Reconciliation for admission reservations whose launch response or process was lost
+  // (AII-783 review): a committed reservation with no confirmed release eventually frees
+  // its slot here, mirroring the reaper's own machine max-age sweep above.
+  for (const released of sweepStaleAdmissions()) {
+    console.log(
+      `[admission] released stale reservation dispatch=${released.dispatchId} mapping=${released.mappingKey} age_ms=${released.ageMs}`,
+    );
+  }
+
   // Guaranteed (webhook-independent) merge detector: enqueue reconciliations
   // for merged PRs the webhook may have missed.
   await detectMergedPrs({
@@ -977,7 +986,10 @@ async function resolveDispatchRunnerImage(
   });
 }
 
-async function dispatchGitHubActions(
+// Exported for direct testing of the pre-launch-failure release path — see
+// "real entry-point/monitor regressions" in dispatch-routing.test.ts. Not part of the
+// module's public API otherwise; every production call site is within this file.
+export async function dispatchGitHubActions(
   config: AppConfig,
   provider: TicketingProvider,
   issue: DispatchableIssue,
@@ -1004,98 +1016,111 @@ async function dispatchGitHubActions(
   });
   if (!admission.ok) return;
 
-  const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
-
-  let runnerCallbackUrl = "";
-  let runToken = "";
-  let runProgressToken = "";
-  if (config.runnerCallbackBaseUrl && config.runnerTokenSecret) {
-    const minted = mintRunToken({
-      issueId: issue.id,
-      mappingTeamKey: issue.scopeKey,
-      phase: "implementation",
-      audience: "result",
-      dispatchId,
-      ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
-      secret: config.runnerTokenSecret,
-    });
-    const progressMinted = mintRunToken({
-      issueId: issue.id,
-      mappingTeamKey: issue.scopeKey,
-      phase: "implementation",
-      audience: "progress",
-      dispatchId,
-      ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
-      secret: config.runnerTokenSecret,
-    });
-    runnerCallbackUrl = config.runnerCallbackBaseUrl;
-    runToken = minted.token;
-    runProgressToken = progressMinted.token;
-  }
-
-  const runnerImage = await resolveDispatchRunnerImage(config, mapping, ghToken);
-
   // True whenever base_branch is forwarded as a legacy workflow input — set by the
   // field OR by feature-branch grouping. Used only to attribute a 422 below.
   const implSentBaseBranch = baseBranch !== mapping.defaultBranch;
 
-  const workflowCapabilities = await resolveWorkflowCapabilities({
-    owner: mapping.owner,
-    repo: mapping.repo,
-    workflowFile: mapping.workflowFile,
-    token: ghToken,
-    ref: mapping.defaultBranch,
-  });
-  const { contract } = workflowCapabilities;
-  const runPublicationToken = contract === "envelope"
-    && workflowCapabilities.supportsRunPublicationToken
-    && dispatchId
-    && config.runnerCallbackBaseUrl
-    && config.runnerTokenSecret
-    ? mintRunToken({
-        issueId: issue.id,
-        mappingTeamKey: issue.scopeKey,
-        phase: "implementation",
-        audience: "publication",
-        dispatchId,
-        repository: `${mapping.owner}/${mapping.repo}`,
-        ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
-        secret: config.runnerTokenSecret,
-      }).token
-    : undefined;
+  // Everything below is pure prep — no launch call has fired yet. A throw anywhere in
+  // here (e.g. an installation-token mint failure) is by construction a definitive
+  // non-launch, so it's wrapped in one block and released unconditionally, unlike the
+  // postWorkflowDispatch call after it, whose failure modes are deliberately not all
+  // treated as definitive (see the comment below).
+  const { ghToken, runnerImage, contract, dispatchInputs } =
+    await (async () => {
+      const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
 
-  const dispatchInputs = contract === "envelope"
-    ? buildEnvelopeDispatchInputs(mapping, issue, {
-        runnerPhase: "implementation",
-        baseBranch: baseBranch !== mapping.defaultBranch ? baseBranch : undefined,
-        runnerCallbackUrl: runnerCallbackUrl || undefined,
-        runToken,
-        runProgressToken,
-        runPublicationToken,
-        runnerImage,
-        groupingParent: isGroupingParentDispatch(issue) || undefined,
-        retryPolicy: getRetryPolicy(),
-      })
-    : {
-        issue_id: issue.id,
-        issue_identifier: issue.identifier,
-        issue_title: issue.title,
-        issue_description: issue.description || issue.title,
-        runner_phase: "implementation" as const,
-        ...providerDispatchFields(mapping),
-        // Only forward base_branch when grouping moved it off the repo default: GitHub
-        // rejects unknown workflow_dispatch inputs (422), so target repos that haven't
-        // re-synced the workflow keep working for the common (non-grouped) path.
-        ...(baseBranch !== mapping.defaultBranch ? { base_branch: baseBranch } : {}),
-        ...capDispatchFields(mapping),
-        ...branchPrefixDispatchFields(mapping),
-        ...skillsRepoDispatchFields(mapping),
-        ...profilesDispatchFields(issue),
-        runner_callback_url: runnerCallbackUrl,
-        run_token: runToken,
-        run_progress_token: runProgressToken,
-        ...(runnerImage ? { runner_image: runnerImage } : {}),
-      };
+      let runnerCallbackUrl = "";
+      let runToken = "";
+      let runProgressToken = "";
+      if (config.runnerCallbackBaseUrl && config.runnerTokenSecret) {
+        const minted = mintRunToken({
+          issueId: issue.id,
+          mappingTeamKey: issue.scopeKey,
+          phase: "implementation",
+          audience: "result",
+          dispatchId,
+          ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
+          secret: config.runnerTokenSecret,
+        });
+        const progressMinted = mintRunToken({
+          issueId: issue.id,
+          mappingTeamKey: issue.scopeKey,
+          phase: "implementation",
+          audience: "progress",
+          dispatchId,
+          ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
+          secret: config.runnerTokenSecret,
+        });
+        runnerCallbackUrl = config.runnerCallbackBaseUrl;
+        runToken = minted.token;
+        runProgressToken = progressMinted.token;
+      }
+
+      const runnerImage = await resolveDispatchRunnerImage(config, mapping, ghToken);
+
+      const workflowCapabilities = await resolveWorkflowCapabilities({
+        owner: mapping.owner,
+        repo: mapping.repo,
+        workflowFile: mapping.workflowFile,
+        token: ghToken,
+        ref: mapping.defaultBranch,
+      });
+      const { contract } = workflowCapabilities;
+      const runPublicationToken = contract === "envelope"
+        && workflowCapabilities.supportsRunPublicationToken
+        && dispatchId
+        && config.runnerCallbackBaseUrl
+        && config.runnerTokenSecret
+        ? mintRunToken({
+            issueId: issue.id,
+            mappingTeamKey: issue.scopeKey,
+            phase: "implementation",
+            audience: "publication",
+            dispatchId,
+            repository: `${mapping.owner}/${mapping.repo}`,
+            ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
+            secret: config.runnerTokenSecret,
+          }).token
+        : undefined;
+
+      const dispatchInputs = contract === "envelope"
+        ? buildEnvelopeDispatchInputs(mapping, issue, {
+            runnerPhase: "implementation",
+            baseBranch: baseBranch !== mapping.defaultBranch ? baseBranch : undefined,
+            runnerCallbackUrl: runnerCallbackUrl || undefined,
+            runToken,
+            runProgressToken,
+            runPublicationToken,
+            runnerImage,
+            groupingParent: isGroupingParentDispatch(issue) || undefined,
+            retryPolicy: getRetryPolicy(),
+          })
+        : {
+            issue_id: issue.id,
+            issue_identifier: issue.identifier,
+            issue_title: issue.title,
+            issue_description: issue.description || issue.title,
+            runner_phase: "implementation" as const,
+            ...providerDispatchFields(mapping),
+            // Only forward base_branch when grouping moved it off the repo default: GitHub
+            // rejects unknown workflow_dispatch inputs (422), so target repos that haven't
+            // re-synced the workflow keep working for the common (non-grouped) path.
+            ...(baseBranch !== mapping.defaultBranch ? { base_branch: baseBranch } : {}),
+            ...capDispatchFields(mapping),
+            ...branchPrefixDispatchFields(mapping),
+            ...skillsRepoDispatchFields(mapping),
+            ...profilesDispatchFields(issue),
+            runner_callback_url: runnerCallbackUrl,
+            run_token: runToken,
+            run_progress_token: runProgressToken,
+            ...(runnerImage ? { runner_image: runnerImage } : {}),
+          };
+
+      return { ghToken, runnerCallbackUrl, runToken, runProgressToken, runnerImage, contract, dispatchInputs };
+    })().catch((err) => {
+      admission.release("launch_rejected");
+      throw err;
+    });
 
   // returnRunDetails (AII-778) gets us result.outcome: "rejected" means GitHub's API
   // itself refused the request (a 4xx before any run started) — the one signal precise
@@ -1297,8 +1322,8 @@ async function dispatchPlanning(
       doMarkDispatched: false,
       shadow: false,
       backendKind: execPath,
-      isDefinitiveLaunchFailure: execPath === "fly-machines" ? isDefinitiveFlyRejectionError : undefined,
-      backend: async ({ sessionToken, machineNonce, runnerCallbackUrl, runToken }) => {
+      isDefinitiveLaunchFailure: execPath === "fly-machines" ? isDefinitiveFlyRejectionError : isDefinitiveLocalDockerLaunchFailure,
+      backend: async ({ sessionToken, machineNonce, runnerCallbackUrl, runToken, markLaunchAttempted }) => {
         const planningEnv = {
           PARENT: planningContextInputs.parent,
           SIBLINGS: planningContextInputs.siblings,
@@ -1379,6 +1404,7 @@ async function dispatchPlanning(
             console.log(`[poll] process-level secrets for ${issue.identifier} planning: [${secretNames.join(", ")}]`);
           }
 
+          markLaunchAttempted();
           const machine = await createMachine(flyToken!, flyApp!, machineConfig);
           const machineLogsUrl = `https://fly.io/apps/${flyApp}/machines/${machine.id}`;
           console.log(`[poll] Dispatched planning for ${issue.identifier} -> ${mapping.owner}/${mapping.repo} (fly-machines, machine: ${machine.id}, image: ${resolvedImage} [${imageSource}])`);
@@ -1396,6 +1422,7 @@ async function dispatchPlanning(
             config.runnerCallbackBaseUrl ??
             `http://host.docker.internal:${config.healthPort}`;
 
+          markLaunchAttempted();
           const container = await startLocalRunnerContainer({
             image: config.localRunnerImage,
             issueId: issue.id,
@@ -1473,76 +1500,88 @@ async function dispatchPlanning(
   });
   if (!planningAdmission.ok) return;
 
-  const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
   const planningMapping = { ...mapping, workflowFile: mapping.planningWorkflowFile };
 
-  let runnerCallbackUrl = "";
-  let runToken = "";
-  if (config.runnerCallbackBaseUrl && config.runnerTokenSecret) {
-    const minted = mintRunToken({
-      issueId: issue.id,
-      mappingTeamKey: issue.scopeKey,
-      phase: "planning",
-      audience: "result",
-      dispatchId,
-      ttlSeconds: PLANNING_TTL_SECONDS,
-      secret: config.runnerTokenSecret,
+  // Everything below is pure prep — no launch call has fired yet. A throw anywhere in
+  // here is by construction a definitive non-launch — see the matching comment in
+  // dispatchGitHubActions.
+  const { ghToken, runnerImage, planningSentBaseBranch, planningContract, planningDispatchInputs } =
+    await (async () => {
+      const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
+
+      let runnerCallbackUrl = "";
+      let runToken = "";
+      if (config.runnerCallbackBaseUrl && config.runnerTokenSecret) {
+        const minted = mintRunToken({
+          issueId: issue.id,
+          mappingTeamKey: issue.scopeKey,
+          phase: "planning",
+          audience: "result",
+          dispatchId,
+          ttlSeconds: PLANNING_TTL_SECONDS,
+          secret: config.runnerTokenSecret,
+        });
+        runnerCallbackUrl = config.runnerCallbackBaseUrl;
+        runToken = minted.token;
+      }
+
+      // Forward the resolved runner image so GHA planning honors the orchestrator's
+      // channel and per-repo `.ai-implement/image.yml` override, exactly as the
+      // implementation dispatch does. claude-plan.yml's validate-runner-image step
+      // does not read image.yml itself, so this is the only path by which GHA
+      // planning picks up either. Only sent when explicit (override or explicit
+      // SESSION_IMAGE/AI_IMPLEMENT_RUNNER_IMAGE), so repos that haven't re-synced
+      // claude-plan.yml are not rejected with a 422 "unexpected inputs".
+      const runnerImage = await resolveDispatchRunnerImage(config, mapping, ghToken);
+
+      // Only forward base_branch when it differs from the repo default — same guard as the
+      // implementation dispatch: GitHub rejects unknown workflow_dispatch inputs with 422,
+      // so repos that have not re-synced claude-plan.yml keep working on the common path.
+      // Legacy contract only; under the envelope the branch rides inside run_config.
+      const planningSentBaseBranch = resolvedPlanningBranch !== mapping.defaultBranch;
+
+      const planningContract = await resolveWorkflowContract({
+        owner: mapping.owner,
+        repo: mapping.repo,
+        workflowFile: mapping.planningWorkflowFile,
+        token: ghToken,
+        ref: mapping.defaultBranch,
+      });
+
+      const planningDispatchInputs = planningContract === "envelope"
+        ? buildEnvelopeDispatchInputs(planningMapping, issue, {
+            runnerPhase: "planning",
+            // Base branch for the planning clone. Rides inside run_config on the envelope.
+            baseBranch: planningSentBaseBranch ? resolvedPlanningBranch : undefined,
+            runnerCallbackUrl: runnerCallbackUrl || undefined,
+            runToken,
+            // No runProgressToken: planning dispatches don't mint progress tokens.
+            runnerImage,
+            planningContext: planningContextInputs,
+            // Planning has no retry loop, so nothing is stamped — but retryPolicy is
+            // required on EnvelopeDispatchOpts, so every call site must say so explicitly.
+            retryPolicy: null,
+          })
+        : {
+            issue_id: issue.id,
+            issue_identifier: issue.identifier,
+            issue_title: issue.title,
+            issue_description: issue.description || issue.title,
+            ...planningContextInputs,
+            ...providerDispatchFields(planningMapping),
+            // Gated: an empty spread when unset, so legacy repos on the common path still
+            // send no unexpected inputs and cannot 422.
+            ...(planningSentBaseBranch ? { base_branch: resolvedPlanningBranch } : {}),
+            runner_callback_url: runnerCallbackUrl,
+            run_token: runToken,
+            ...(runnerImage ? { runner_image: runnerImage } : {}),
+          };
+
+      return { ghToken, runnerCallbackUrl, runToken, runnerImage, planningSentBaseBranch, planningContract, planningDispatchInputs };
+    })().catch((err) => {
+      planningAdmission.release("launch_rejected");
+      throw err;
     });
-    runnerCallbackUrl = config.runnerCallbackBaseUrl;
-    runToken = minted.token;
-  }
-
-  // Forward the resolved runner image so GHA planning honors the orchestrator's
-  // channel and per-repo `.ai-implement/image.yml` override, exactly as the
-  // implementation dispatch does. claude-plan.yml's validate-runner-image step
-  // does not read image.yml itself, so this is the only path by which GHA
-  // planning picks up either. Only sent when explicit (override or explicit
-  // SESSION_IMAGE/AI_IMPLEMENT_RUNNER_IMAGE), so repos that haven't re-synced
-  // claude-plan.yml are not rejected with a 422 "unexpected inputs".
-  const runnerImage = await resolveDispatchRunnerImage(config, mapping, ghToken);
-
-  // Only forward base_branch when it differs from the repo default — same guard as the
-  // implementation dispatch: GitHub rejects unknown workflow_dispatch inputs with 422,
-  // so repos that have not re-synced claude-plan.yml keep working on the common path.
-  // Legacy contract only; under the envelope the branch rides inside run_config.
-  const planningSentBaseBranch = resolvedPlanningBranch !== mapping.defaultBranch;
-
-  const planningContract = await resolveWorkflowContract({
-    owner: mapping.owner,
-    repo: mapping.repo,
-    workflowFile: mapping.planningWorkflowFile,
-    token: ghToken,
-    ref: mapping.defaultBranch,
-  });
-
-  const planningDispatchInputs = planningContract === "envelope"
-    ? buildEnvelopeDispatchInputs(planningMapping, issue, {
-        runnerPhase: "planning",
-        // Base branch for the planning clone. Rides inside run_config on the envelope.
-        baseBranch: planningSentBaseBranch ? resolvedPlanningBranch : undefined,
-        runnerCallbackUrl: runnerCallbackUrl || undefined,
-        runToken,
-        // No runProgressToken: planning dispatches don't mint progress tokens.
-        runnerImage,
-        planningContext: planningContextInputs,
-        // Planning has no retry loop, so nothing is stamped — but retryPolicy is
-        // required on EnvelopeDispatchOpts, so every call site must say so explicitly.
-        retryPolicy: null,
-      })
-    : {
-        issue_id: issue.id,
-        issue_identifier: issue.identifier,
-        issue_title: issue.title,
-        issue_description: issue.description || issue.title,
-        ...planningContextInputs,
-        ...providerDispatchFields(planningMapping),
-        // Gated: an empty spread when unset, so legacy repos on the common path still
-        // send no unexpected inputs and cannot 422.
-        ...(planningSentBaseBranch ? { base_branch: resolvedPlanningBranch } : {}),
-        runner_callback_url: runnerCallbackUrl,
-        run_token: runToken,
-        ...(runnerImage ? { runner_image: runnerImage } : {}),
-      };
 
   // returnRunDetails (AII-778): outcome "rejected" is the only signal precise enough to
   // treat as a definitive non-launch — see the matching comment in dispatchGitHubActions.
@@ -1652,6 +1691,15 @@ function isDefinitiveFlyRejectionError(err: unknown): boolean {
   return status >= 400 && status < 500;
 }
 
+// startLocalRunnerContainer runs `docker run -d` over the local Docker socket and awaits
+// its exit before returning — unlike Fly's remote HTTP API, there is no "the request
+// reached the server but the response was lost" window: the CLI call either completes
+// with a container id or fails before one was ever created. Any throw from the backend
+// after markLaunchAttempted() is therefore always a definitive non-launch.
+function isDefinitiveLocalDockerLaunchFailure(): boolean {
+  return true;
+}
+
 interface SessionBackendResult {
   machineId: string;
   sessionImage: string;
@@ -1659,6 +1707,22 @@ interface SessionBackendResult {
   executionMode: "fly-machines" | "local-docker";
   statusComment: { machineName: string; logsUrl?: string } | null;
   dispatchedLogLine?: string;
+}
+
+/**
+ * Whether a `dispatchSession` backend's thrown error is a proven non-launch, safe to
+ * release the admission reservation for. A throw before the backend ever called
+ * `markLaunchAttempted` is always a definitive non-launch — the actual launch call was
+ * never reached. Once launchAttempted, fall back to the backend's own classifier
+ * (undefined means "stay uncertain"). Exported as a pure seam for direct testing — see
+ * dispatch-routing.test.ts.
+ */
+export function shouldReleaseAdmissionOnDispatchError(
+  launchAttempted: boolean,
+  err: unknown,
+  isDefinitiveLaunchFailure?: (err: unknown) => boolean,
+): boolean {
+  return !launchAttempted || (isDefinitiveLaunchFailure?.(err) ?? false);
 }
 
 async function dispatchSession(
@@ -1677,16 +1741,24 @@ async function dispatchSession(
      *  the shadow Fly dispatch mirrors an already-admitted GHA primary and must not
      *  compete for (or be blocked by) the same issue's reservation. */
     backendKind: "fly-machines" | "local-docker";
-    /** Classifies a thrown backend() error as a proven non-launch (safe to release the
-     *  reservation) versus an ambiguous failure (must stay held for the matching Legacy
-     *  monitor to resolve). Omit when the backend has no reliable "never launched"
-     *  signal — every throw then stays uncertain. */
+    /** Classifies a thrown backend() error, once the backend has called
+     *  `markLaunchAttempted`, as a proven non-launch (safe to release the reservation)
+     *  versus an ambiguous failure (must stay held for the matching Legacy monitor to
+     *  resolve). Omit when the backend has no reliable "never launched" signal for its
+     *  actual launch call — every post-attempt throw then stays uncertain. Irrelevant to
+     *  a throw before `markLaunchAttempted` is called: that is always definitive, since
+     *  the launch call itself was never reached. */
     isDefinitiveLaunchFailure?: (err: unknown) => boolean;
     backend: (input: {
       sessionToken: string;
       machineNonce: string;
       runnerCallbackUrl: string;
       runToken: string;
+      /** Call immediately before the actual launch call (createMachine / the local
+       *  Docker spawn) — everything the backend does before this point (minting a
+       *  credential, resolving an image) is provably side-effect-free for the
+       *  reservation, so a throw before this call is always a definitive non-launch. */
+      markLaunchAttempted: () => void;
     }) => Promise<SessionBackendResult>;
     onPostDispatch?: (
       config: AppConfig,
@@ -1742,11 +1814,16 @@ async function dispatchSession(
     runToken = minted.token;
   }
 
+  let launchAttempted = false;
+  const markLaunchAttempted = () => {
+    launchAttempted = true;
+  };
+
   let result: SessionBackendResult;
   try {
-    result = await opts.backend({ sessionToken, machineNonce, runnerCallbackUrl, runToken });
+    result = await opts.backend({ sessionToken, machineNonce, runnerCallbackUrl, runToken, markLaunchAttempted });
   } catch (err) {
-    if (admission && (opts.isDefinitiveLaunchFailure?.(err) ?? false)) {
+    if (admission && shouldReleaseAdmissionOnDispatchError(launchAttempted, err, opts.isDefinitiveLaunchFailure)) {
       admission.release("launch_rejected");
     }
     throw err;
@@ -1864,7 +1941,7 @@ async function dispatchFlyMachine(
     backendKind: "fly-machines",
     isDefinitiveLaunchFailure: isDefinitiveFlyRejectionError,
     branchInfo: shadow ? undefined : { fieldValue: baseBranchFieldValue, defaultBranch: mapping.defaultBranch },
-    backend: async ({ sessionToken, machineNonce, runnerCallbackUrl, runToken }) => {
+    backend: async ({ sessionToken, machineNonce, runnerCallbackUrl, runToken, markLaunchAttempted }) => {
       const minSecretsVersion = getFlySecretsMinVersion();
 
       let allSecretNames: string[] = [];
@@ -1932,6 +2009,7 @@ async function dispatchFlyMachine(
         console.log(`[poll] process-level secrets for ${issue.identifier}: [${secretNames.join(", ")}]`);
       }
 
+      markLaunchAttempted();
       const machine = await createMachine(flyToken, flyApp, machineConfig);
 
       const tag = shadow ? "shadow fly-machines" : "fly-machines";
@@ -1951,7 +2029,9 @@ async function dispatchFlyMachine(
 
 // ---------- Dispatch: Local Docker ----------
 
-async function dispatchLocalDocker(
+// Exported for direct testing of the pre-launch-failure release path — see the matching
+// comment on dispatchGitHubActions.
+export async function dispatchLocalDocker(
   config: AppConfig,
   provider: TicketingProvider,
   issue: DispatchableIssue,
@@ -1979,8 +2059,9 @@ async function dispatchLocalDocker(
     doMarkDispatched: true,
     shadow: false,
     backendKind: "local-docker",
+    isDefinitiveLaunchFailure: isDefinitiveLocalDockerLaunchFailure,
     branchInfo: { fieldValue: baseBranchFieldValue, defaultBranch: mapping.defaultBranch },
-    backend: async ({ sessionToken, machineNonce, runnerCallbackUrl, runToken }) => {
+    backend: async ({ sessionToken, machineNonce, runnerCallbackUrl, runToken, markLaunchAttempted }) => {
       const localOrchestratorUrl =
         config.localRunnerOrchestratorUrl ??
         config.runnerCallbackBaseUrl ??
@@ -1997,6 +2078,7 @@ async function dispatchLocalDocker(
         retryPolicy: getRetryPolicy(),
       });
 
+      markLaunchAttempted();
       const container = await startLocalRunnerContainer({
         image: config.localRunnerImage,
         issueId: issue.id,
@@ -2205,37 +2287,49 @@ function mappingForJob(
  * callbacks. Returns undefined for GHA jobs (and for fly/local jobs missing
  * the fields needed to stop them), which leaves remediateStuckJob's default
  * GHA-cancel path as the fallback.
+ *
+ * The returned callback resolves to whether the stop is confirmed (destroy/remove
+ * succeeded, or 404/"already gone") — remediateStuckJob (AII-783) uses this to decide
+ * whether the job's admission reservation may be released.
  */
-function ttlStopRunnerForJob(config: AppConfig, job: Job): (() => Promise<void>) | undefined {
+function ttlStopRunnerForJob(config: AppConfig, job: Job): (() => Promise<boolean>) | undefined {
   if (job.executionMode === "fly-machines") {
     if (!config.flySessionsToken || !config.flySessionsApp || !job.machineId) return undefined;
     const token = config.flySessionsToken;
     const app = config.flySessionsApp;
     const machineId = job.machineId;
     return async () => {
+      let confirmed = false;
       try {
         await destroyMachine(token, app, machineId);
+        confirmed = true;
         console.log(`[monitor] Destroyed timed-out machine ${machineId}`);
       } catch (err) {
-        // Machine may already be gone — that's fine
-        if (!(err instanceof Error && err.message.includes("404"))) {
+        // Machine may already be gone — that's fine, and still confirmed.
+        if (err instanceof Error && err.message.includes("404")) {
+          confirmed = true;
+        } else {
           console.error(`[monitor] Failed to destroy timed-out machine ${machineId}:`, err);
         }
       }
       invalidateNonce(job.id);
+      return confirmed;
     };
   }
   if (job.executionMode === "local-docker") {
     if (!job.machineId) return undefined;
     const machineId = job.machineId;
     return async () => {
+      let confirmed = false;
       try {
         await removeLocalContainer(machineId);
+        confirmed = true;
         console.log(`[monitor] Removed timed-out local Docker container ${machineId}`);
       } catch (err) {
         console.error(`[monitor] Failed to remove timed-out local Docker container ${machineId}:`, err);
       }
       invalidateNonce(job.id);
+      return confirmed;
     };
   }
   return undefined;
@@ -2287,7 +2381,7 @@ export async function monitorJobs(config: AppConfig, registry: ProviderRegistry)
           console.warn(`[monitor] Job ${job.id} (${job.issueIdentifier}) exceeded its time limit; marking timed_out`);
           const provider = await providerForJob(registry, job);
           const stopRunner = ttlStopRunnerForJob(config, job);
-          await remediateStuckJob(watchdogConfig, provider, job, "ttl_expired", stopRunner);
+          const stopConfirmed = await remediateStuckJob(watchdogConfig, provider, job, "ttl_expired", stopRunner);
           // remediateStuckJob's own bookkeeping (requeue/give-up) unconditionally
           // overwrites conclusion with stuck_requeued/stuck_giveup — reassert
           // ttl_expired as the row's final, observable conclusion, unless
@@ -2295,7 +2389,14 @@ export async function monitorJobs(config: AppConfig, registry: ProviderRegistry)
           // without writing (in which case its guard's outcome must stand).
           const postConclusion = getJobById(job.id)?.conclusion;
           if (!TTL_STALE_CONCLUSIONS.has(postConclusion ?? "")) {
-            updateJobStatus(job.id, "timed_out", "ttl_expired");
+            // Mirror remediateStuckJob's own release gating (AII-783): this reassertion
+            // re-triggers updateJobStatus's terminal hook, so it must not release the
+            // admission reservation when the backend's death wasn't actually confirmed.
+            if (stopConfirmed) {
+              updateJobStatus(job.id, "timed_out", "ttl_expired");
+            } else {
+              updateJobStatus(job.id, "timed_out", "ttl_expired", undefined, { skipAdmissionRelease: true });
+            }
           }
           continue;
         }
@@ -2575,16 +2676,21 @@ async function monitorFlyMachineJob(
     };
 
     const stopRunner = async () => {
+      let confirmed = false;
       try {
         await destroyMachine(config.flySessionsToken!, config.flySessionsApp!, job.machineId!);
+        confirmed = true;
         console.log(`[monitor] Destroyed timed-out machine ${job.machineId}`);
       } catch (err) {
-        // Machine may already be gone — that's fine
-        if (!(err instanceof Error && err.message.includes("404"))) {
+        // Machine may already be gone — that's fine, and still confirmed.
+        if (err instanceof Error && err.message.includes("404")) {
+          confirmed = true;
+        } else {
           console.error(`[monitor] Failed to destroy timed-out machine ${job.machineId}:`, err);
         }
       }
       invalidateNonce(job.id);
+      return confirmed;
     };
 
     await remediateStuckJob(watchdogConfig, provider, job, "machine_timeout", stopRunner);
@@ -2755,13 +2861,16 @@ async function monitorLocalDockerJob(
     };
 
     const stopRunner = async () => {
+      let confirmed = false;
       try {
         await removeLocalContainer(job.machineId!);
+        confirmed = true;
         console.log(`[monitor] Removed timed-out local Docker container ${job.machineId}`);
       } catch (err) {
         console.error(`[monitor] Failed to remove timed-out local Docker container ${job.machineId}:`, err);
       }
       invalidateNonce(job.id);
+      return confirmed;
     };
 
     await remediateStuckJob(watchdogConfig, provider, job, "container_timeout", stopRunner);

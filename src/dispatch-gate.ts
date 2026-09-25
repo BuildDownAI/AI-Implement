@@ -109,12 +109,14 @@ const ADMISSION_BREAKER_PHASE: Record<AcquireDispatchKind, string> = {
  * Final-authority admission check for planning/implementation dispatch. Call this as
  * the first statement in a dispatch function — before minting credentials or making
  * any launch call — and only proceed to launch when it returns `ok: true`. On success,
- * hold the returned `release` closure: call it with `"launch_rejected"` only when the
+ * hold the returned `release` closure: call it with `"launch_rejected"` when the
  * backend's own response definitively proves the launch never happened (e.g. GitHub's
- * workflow_dispatch returning a non-2xx). Any other post-acquire failure (a thrown
- * exception, a timeout, an ambiguous response) must NOT call release — the reservation
- * stays held as explicit uncertain state for the matching Legacy monitor (reaper /
- * stuck-watchdog) to resolve later.
+ * workflow_dispatch returning a non-2xx), and also for any throw before the real launch
+ * call is reached (a credential mint failure, an image resolution error) — those are
+ * definitive non-launches by construction. A throw *after* the launch call whose outcome
+ * is ambiguous (a timeout, a 5xx, an unclassifiable error) must NOT call release — the
+ * reservation stays held as explicit uncertain state for the matching Legacy monitor
+ * (reaper / stuck-watchdog) to resolve later.
  */
 export function acquireDispatch(input: AcquireDispatchInput): AcquireDispatchOutcome {
   const parked = isParked(input.issueId, ADMISSION_BREAKER_PHASE[input.kind]);

@@ -413,3 +413,66 @@ export function release(
     .run(Date.now(), reason, dispatchId, encodeOwner(owner), generation);
   return result.changes > 0 ? { status: "released" } : { status: "not_owner" };
 }
+
+/**
+ * Convenience release for a caller that has only the `dispatchId` — not the `owner`/
+ * `generation` `release` requires — because it observes termination well after the
+ * reservation was made (a monitor poll, a runner callback, an admin action, days of
+ * wall-clock apart from `acquire`). Reads the current record and releases it if still
+ * active; a no-op, never an error, when no reservation exists for this id or it is
+ * already released. That covers every dispatch kind that never calls `acquire` in the
+ * first place (gap-fill/gap-analysis stay on the legacy `canDispatch` path, kg-refresh
+ * never spends capacity) — their dispatch ids simply have no row to release.
+ */
+export function releaseByDispatchId(
+  dispatchId: string,
+  reason: DispatchAdmissionReleaseReason,
+): DispatchAdmissionReleaseOutcome {
+  const record = read(dispatchId);
+  if (!record || record.releasedAt !== null) return { status: "not_owner" };
+  return release(record.dispatchId, record.lifecycleOwner, record.generation, reason);
+}
+
+/** Reservations older than this with no confirmed release are swept unconditionally —
+ *  the safety net for "a committed reservation whose launch response or process was
+ *  lost" (a crash between `acquire` returning and the caller's own `appendLog`, so no
+ *  `dispatch_log` row ever exists for `releaseByDispatchId` to key off), and the eventual
+ *  backstop for a reservation `updateJobStatus` deliberately left held pending confirmed
+ *  termination (AII-783 review: reaper/stuck-watchdog give-up paths that cannot vouch
+ *  for the backend actually being dead). Generous relative to every job timeout in the
+ *  codebase (GHA's default 90 min job timeout, Fly/local's FLY_MACHINE_TIMEOUT_MS, and
+ *  the stuck-watchdog's own bounded retries on top of that) so this never races a
+ *  legitimately long-running attempt. */
+export const DEFAULT_ADMISSION_SWEEP_MAX_AGE_MS = 6 * 60 * 60 * 1000; // 6 hours
+
+export interface StaleAdmissionSweepResult {
+  readonly dispatchId: string;
+  readonly mappingKey: string;
+  readonly ageMs: number;
+}
+
+/**
+ * Age-based reconciliation sweep, mirroring reaper.ts's own SWEEP_MACHINE_MAX_AGE_MS
+ * pattern: any reservation still unreleased past `maxAgeMs` is released, regardless of
+ * `lifecycleOwner` or whether a matching `dispatch_log` row was ever written. Intended
+ * to run once per poll cycle alongside `sweepOrphanedMachines`. Returns the reservations
+ * it actually released (a row that raced a legitimate release between the read and the
+ * sweep's own `release` call is excluded, not double-counted).
+ */
+export function sweepStaleAdmissions(
+  maxAgeMs: number = DEFAULT_ADMISSION_SWEEP_MAX_AGE_MS,
+): StaleAdmissionSweepResult[] {
+  const db = getDb();
+  const cutoff = Date.now() - maxAgeMs;
+  const rows = db
+    .prepare("SELECT * FROM dispatch_admissions WHERE released_at IS NULL AND created_at < ?")
+    .all(cutoff) as Row[];
+  const released: StaleAdmissionSweepResult[] = [];
+  for (const row of rows) {
+    const outcome = release(row.dispatch_id, decodeOwner(row.lifecycle_owner), row.generation, "deadline_exceeded");
+    if (outcome.status === "released") {
+      released.push({ dispatchId: row.dispatch_id, mappingKey: row.mapping_key, ageMs: Date.now() - row.created_at });
+    }
+  }
+  return released;
+}

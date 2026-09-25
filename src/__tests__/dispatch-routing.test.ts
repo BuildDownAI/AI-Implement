@@ -6,6 +6,49 @@ import { resolveExecutionPath, resolvePlanningExecutionPath } from "../runner-mo
 import type * as DedupModule from "../dedup.js";
 import type * as GateModule from "../dispatch-gate.js";
 import type * as BreakerModule from "../dispatch-breaker.js";
+import type { TicketIssue, TicketingProvider } from "../providers/types.js";
+import type { RepoMapping } from "../config.js";
+import type { AppConfig } from "../index.js";
+import { shouldReleaseAdmissionOnDispatchError } from "../index.js";
+
+// Mocked only for the "pre-launch failure releases the reservation" describe block below —
+// dedup.js/log.js/dispatch-breaker.js/dispatch-admission.js/dispatch-gate.js stay real
+// (a temp sqlite db per test) so the admission release actually being exercised is the
+// real transactional one, not a stub.
+vi.mock("../github-app-auth.js", () => ({
+  getInstallationToken: vi.fn(),
+  getAppSlug: vi.fn(),
+}));
+
+vi.mock("../local-docker.js", () => ({
+  fetchLocalContainerLogs: vi.fn(),
+  inspectLocalContainer: vi.fn(),
+  removeLocalContainer: vi.fn(),
+  startLocalRunnerContainer: vi.fn(),
+  sweepExitedLocalContainers: vi.fn(),
+}));
+
+// AII-783 gap-fill (review finding on PR #681): the exact four cases the blocking review
+// comment asked for, tested directly against the pure decision seam dispatchSession's
+// catch block now delegates to, rather than only indirectly through a full dispatch call.
+describe("shouldReleaseAdmissionOnDispatchError", () => {
+  it("releases when the throw happened before markLaunchAttempted, regardless of classifier", () => {
+    expect(shouldReleaseAdmissionOnDispatchError(false, new Error("boom"))).toBe(true);
+    expect(shouldReleaseAdmissionOnDispatchError(false, new Error("boom"), () => false)).toBe(true);
+  });
+
+  it("holds when the throw happened after markLaunchAttempted and no classifier was given", () => {
+    expect(shouldReleaseAdmissionOnDispatchError(true, new Error("boom"))).toBe(false);
+  });
+
+  it("releases when the throw happened after markLaunchAttempted and the classifier matches", () => {
+    expect(shouldReleaseAdmissionOnDispatchError(true, new Error("boom"), () => true)).toBe(true);
+  });
+
+  it("holds when the throw happened after markLaunchAttempted and the classifier does not match", () => {
+    expect(shouldReleaseAdmissionOnDispatchError(true, new Error("boom"), () => false)).toBe(false);
+  });
+});
 
 describe("resolveExecutionPath", () => {
   describe("shadow mode", () => {
@@ -242,5 +285,156 @@ describe("acquireDispatch — cross-entry-point admission (poll loop vs. another
       backend: "github-actions",
     });
     expect(thirdClaimant).toEqual({ ok: false, reason: "at_capacity", count: 1, cap: 1 });
+  });
+});
+
+// AII-783 gap-fill (review finding on PR #681): acquireDispatch's transaction alone only
+// reserves. dispatch-gate.test.ts's "updateJobStatus — releases..." suite covers the
+// post-launch, verified-terminal-via-monitor release half. Nothing previously exercised
+// the *other* half the review named explicitly: a throw between acquire and the real
+// launch call (e.g. an installation-token mint failure) must be classified as a
+// definitive non-launch and release the reservation, via the real dispatchGitHubActions /
+// dispatchLocalDocker entry points rather than a stub. Only the external launch call
+// (getInstallationToken, startLocalRunnerContainer) is mocked; dedup/log/dispatch-breaker/
+// dispatch-admission/dispatch-gate all run for real against a temp sqlite db, so a
+// regression that silently swallowed-without-releasing (or double-released) the
+// reservation would be caught by the capacity assertion below.
+describe("dispatch entry points — pre-launch failure releases the reservation (AII-783 gap-fill)", () => {
+  let dbPath: string;
+  let dedup: typeof DedupModule;
+  let gate: typeof GateModule;
+  let breaker: typeof BreakerModule;
+  let indexModule: typeof import("../index.js");
+  let githubAppAuth: typeof import("../github-app-auth.js");
+  let localDocker: typeof import("../local-docker.js");
+
+  const issue: TicketIssue = {
+    id: "issue-entrypoint-1",
+    identifier: "AII-900",
+    title: "Test issue",
+    description: "desc",
+    scopeKey: "AII",
+    nativeStatus: "Todo",
+  };
+
+  const mapping = {
+    owner: "eudoxus",
+    repo: "AI-Implement",
+    workflowFile: "claude-implement.yml",
+    defaultBranch: "main",
+    maxInProgressAiIssues: 1,
+    provider: "anthropic",
+    sessionMode: "default",
+    machineCpus: 1,
+    machineMemoryMb: 512,
+    extraEnv: {},
+  } as unknown as RepoMapping;
+
+  const provider = {
+    id: "linear",
+    issueUrl: vi.fn().mockReturnValue("https://linear.app/issue/AII-900"),
+    markImplementationFailed: vi.fn(),
+  } as unknown as TicketingProvider;
+
+  const prior = { count: 0, lastDispatchedAt: null };
+
+  beforeEach(async () => {
+    vi.resetModules();
+    dbPath = path.join(
+      os.tmpdir(),
+      `dispatch-entrypoint-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
+    );
+    process.env.DEDUP_DB_PATH = dbPath;
+    dedup = await import("../dedup.js");
+    gate = await import("../dispatch-gate.js");
+    breaker = await import("../dispatch-breaker.js");
+    breaker.initDispatchBreakerTable();
+    githubAppAuth = await import("../github-app-auth.js");
+    localDocker = await import("../local-docker.js");
+    indexModule = await import("../index.js");
+  });
+
+  afterEach(() => {
+    dedup.closeDb();
+    try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+  });
+
+  it("dispatchGitHubActions: an installation-token mint failure after acquire releases the reservation", async () => {
+    vi.mocked(githubAppAuth.getInstallationToken).mockRejectedValue(new Error("mint failed"));
+    const config = { githubAppId: "id", githubAppPrivateKey: "key" } as unknown as AppConfig;
+
+    await expect(
+      indexModule.dispatchGitHubActions(config, provider, issue, mapping, prior, "default", mapping.defaultBranch, null),
+    ).rejects.toThrow("mint failed");
+
+    // The exact reservation (same issue, same team) is free again, not just the count —
+    // proving occupancy was released, not only capacity.
+    const retry = gate.acquireDispatch({
+      dispatchId: "retry-gha",
+      issueId: issue.id,
+      issueIdentifier: issue.identifier,
+      kind: "implementation",
+      teamKey: issue.scopeKey,
+      maxInProgressAiIssues: 1,
+      backend: "github-actions",
+    });
+    expect(retry.ok).toBe(true);
+  });
+
+  it("dispatchLocalDocker: a throw before markLaunchAttempted (installation-token mint failure) releases the reservation", async () => {
+    vi.mocked(githubAppAuth.getInstallationToken).mockRejectedValue(new Error("mint failed"));
+    const config = {
+      githubAppId: "id",
+      githubAppPrivateKey: "key",
+      anthropicApiKey: "sk-test",
+      localRunnerImage: "test-image",
+      localRunnerOrchestratorUrl: "http://localhost:9000",
+    } as unknown as AppConfig;
+
+    await expect(
+      indexModule.dispatchLocalDocker(config, provider, issue, mapping, prior, "default", mapping.defaultBranch, null),
+    ).rejects.toThrow("mint failed");
+
+    expect(localDocker.startLocalRunnerContainer).not.toHaveBeenCalled();
+
+    const retry = gate.acquireDispatch({
+      dispatchId: "retry-local-before",
+      issueId: issue.id,
+      issueIdentifier: issue.identifier,
+      kind: "implementation",
+      teamKey: issue.scopeKey,
+      maxInProgressAiIssues: 1,
+      backend: "local-docker",
+    });
+    expect(retry.ok).toBe(true);
+  });
+
+  it("dispatchLocalDocker: a throw after markLaunchAttempted (container launch failure) also releases — local-docker has no ambiguous-launch window", async () => {
+    vi.mocked(githubAppAuth.getInstallationToken).mockResolvedValue("gh-token");
+    vi.mocked(localDocker.startLocalRunnerContainer).mockRejectedValue(new Error("docker run failed"));
+    const config = {
+      githubAppId: "id",
+      githubAppPrivateKey: "key",
+      anthropicApiKey: "sk-test",
+      localRunnerImage: "test-image",
+      localRunnerOrchestratorUrl: "http://localhost:9000",
+    } as unknown as AppConfig;
+
+    await expect(
+      indexModule.dispatchLocalDocker(config, provider, issue, mapping, prior, "default", mapping.defaultBranch, null),
+    ).rejects.toThrow("docker run failed");
+
+    expect(localDocker.startLocalRunnerContainer).toHaveBeenCalledOnce();
+
+    const retry = gate.acquireDispatch({
+      dispatchId: "retry-local-after",
+      issueId: issue.id,
+      issueIdentifier: issue.identifier,
+      kind: "implementation",
+      teamKey: issue.scopeKey,
+      maxInProgressAiIssues: 1,
+      backend: "local-docker",
+    });
+    expect(retry.ok).toBe(true);
   });
 });

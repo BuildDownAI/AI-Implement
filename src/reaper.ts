@@ -46,14 +46,20 @@ export function getLastSweepAt(): number | null {
 /**
  * Destroys a single Fly machine. In dry-run mode logs `would destroy` instead
  * of calling the API, so no machines are actually affected.
+ *
+ * Returns whether the machine's death is confirmed — the API call succeeded, or it
+ * 404'd (already gone) — versus a swallowed non-404 error, which leaves the machine's
+ * actual state unknown. Callers that gate an admission-reservation release (AII-783) on
+ * verified termination need this distinction: a caught-and-logged failure here used to
+ * read identically to a real destroy from the outside.
  */
 export async function safeDestroyMachine(
   config: ReaperConfig,
   machineId: string,
   reason: string,
   ctx?: DestroyContext,
-): Promise<void> {
-  if (!config.flySessionsToken || !config.flySessionsApp) return;
+): Promise<boolean> {
+  if (!config.flySessionsToken || !config.flySessionsApp) return false;
 
   const t = ctx?.tenantId ?? "-";
   const i = ctx?.issueIdentifier ?? "-";
@@ -64,14 +70,17 @@ export async function safeDestroyMachine(
     `[reaper] rule=${reason} machine=${machineId} tenant=${t} issue=${i} age_s=${a} dry_run=${d}`,
   );
 
-  if (d) return;
+  if (d) return true;
 
   try {
     await destroyMachine(config.flySessionsToken, config.flySessionsApp, machineId);
+    return true;
   } catch (err) {
-    if (!(err instanceof Error && err.message.includes("404"))) {
-      console.error(`[reaper] Failed to destroy machine=${machineId} rule=${reason}:`, err);
+    if (err instanceof Error && err.message.includes("404")) {
+      return true; // already gone — confirmed dead
     }
+    console.error(`[reaper] Failed to destroy machine=${machineId} rule=${reason}:`, err);
+    return false;
   }
 }
 
@@ -280,14 +289,21 @@ export async function sweepOrphanedMachines(
         ageSeconds,
         dryRun: config.reaperDryRun,
       });
-      await safeDestroyMachine(config, machine.id, "max-age-exceeded", {
+      const maxAgeDestroyConfirmed = await safeDestroyMachine(config, machine.id, "max-age-exceeded", {
         tenantId: job.teamKey,
         issueIdentifier: job.issueIdentifier,
         ageSeconds,
       });
       if (!config.reaperDryRun) {
         destroyedCount++;
-        updateJobStatus(job.id, "timed_out", "machine_max_age_sweep");
+        // A destroy call that failed (and wasn't a 404-already-gone) leaves the machine's
+        // real state unknown — hold the admission reservation for the stale-reservation
+        // sweep rather than releasing a slot whose backend might still be running.
+        if (maxAgeDestroyConfirmed) {
+          updateJobStatus(job.id, "timed_out", "machine_max_age_sweep");
+        } else {
+          updateJobStatus(job.id, "timed_out", "machine_max_age_sweep", undefined, { skipAdmissionRelease: true });
+        }
         invalidateNonce(job.id);
         if (job.phase === "kg-refresh") {
           // Issue-less run: notify the handle so it closes the chain immediately
@@ -315,14 +331,18 @@ export async function sweepOrphanedMachines(
         ageSeconds,
         dryRun: config.reaperDryRun,
       });
-      await safeDestroyMachine(config, machine.id, "issue-terminal", {
+      const issueTerminalDestroyConfirmed = await safeDestroyMachine(config, machine.id, "issue-terminal", {
         tenantId: job.teamKey,
         issueIdentifier: job.issueIdentifier,
         ageSeconds,
       });
       if (!config.reaperDryRun) {
         destroyedCount++;
-        updateJobStatus(job.id, "timed_out", "issue_completed_sweep");
+        if (issueTerminalDestroyConfirmed) {
+          updateJobStatus(job.id, "timed_out", "issue_completed_sweep");
+        } else {
+          updateJobStatus(job.id, "timed_out", "issue_completed_sweep", undefined, { skipAdmissionRelease: true });
+        }
         invalidateNonce(job.id);
         await helpers.resetTicket(job);
       }

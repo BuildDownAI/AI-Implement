@@ -134,31 +134,42 @@ async function boundedCleanup(
  * Stop happens before dedup is cleared to prevent a race where the next poll
  * cycle re-dispatches before the zombie runner is stopped.
  *
- * @param stopRunner - Optional caller-supplied cleanup callback. For GHA jobs,
- *   omit this and the helper cancels the workflow run itself. For Fly/local
- *   jobs, supply a callback that destroys the machine/container and invalidates
- *   the nonce.
+ * Returns whether the backend's death was confirmed (`stopRunner` returned true, or the
+ * default GHA-cancel path had its cancellation accepted). AII-783: this job may hold an
+ * admission reservation, and only a confirmed stop is allowed to release it — an
+ * unconfirmed one is written with `skipAdmissionRelease` so the reservation stays held
+ * for `dispatch-admission.ts`'s stale-reservation sweep instead of freeing a slot whose
+ * runner might still be alive. The return value lets a caller that writes its own
+ * follow-up terminal status (e.g. the TTL-expiry reassertion in index.ts) apply the same
+ * gating.
+ *
+ * @param stopRunner - Optional caller-supplied cleanup callback that resolves to
+ *   whether the backend's death is confirmed (a successful destroy/remove, or a
+ *   404/"already gone"). For GHA jobs, omit this and the helper cancels the workflow
+ *   run itself. For Fly/local jobs, supply a callback that destroys the machine/
+ *   container, invalidates the nonce, and reports its own confirmation.
  */
 export async function remediateStuckJob(
   config: StuckWatchdogConfig,
   provider: TicketingProvider | null,
   job: Job,
   lastRunStatus: string,
-  stopRunner?: () => Promise<void>,
-): Promise<void> {
-  if (!job.issueId) return;
+  stopRunner?: () => Promise<boolean>,
+): Promise<boolean> {
+  if (!job.issueId) return false;
   // kg-refresh jobs have their own outcome rail — never re-arm or clear dedup for them.
-  if (job.phase === "kg-refresh") return;
+  if (job.phase === "kg-refresh") return false;
   // Re-read conclusion from DB: the runner callback may have set "operator_cancelled"
   // after the monitor tick started reading the job, so the passed-in job may be stale.
   const freshConclusionStuck = getJobById(job.id)?.conclusion;
-  if (job.conclusion === "operator_cancelled" || freshConclusionStuck === "operator_cancelled") return;
+  if (job.conclusion === "operator_cancelled" || freshConclusionStuck === "operator_cancelled") return false;
 
   // Stop the runner before resetting dedup — prevents a re-dispatch racing
   // with a still-live runner.
+  let stopConfirmed = false;
   if (stopRunner) {
     try {
-      await stopRunner();
+      stopConfirmed = await stopRunner();
     } catch (err) {
       console.error(`[monitor] stopRunner failed for ${job.issueIdentifier}:`, err);
     }
@@ -171,8 +182,15 @@ export async function remediateStuckJob(
           config.githubAppPrivateKey,
           owner,
         );
-        await cancelWorkflowRun(ghToken, owner, repo, job.runId);
-        console.log(`[monitor] Cancelled run ${job.runId} for stuck job ${job.issueIdentifier}`);
+        // cancelWorkflowRun resolves true only on GitHub accepting the cancel request
+        // (202/409) — the same signal admin.ts's operator-cancel endpoint already treats
+        // as confirmation.
+        stopConfirmed = await cancelWorkflowRun(ghToken, owner, repo, job.runId);
+        if (stopConfirmed) {
+          console.log(`[monitor] Cancelled run ${job.runId} for stuck job ${job.issueIdentifier}`);
+        } else {
+          console.warn(`[monitor] GHA did not accept cancellation for run ${job.runId} (${job.issueIdentifier})`);
+        }
       } catch (err) {
         console.error(`[monitor] Failed to cancel run ${job.runId} for ${job.issueIdentifier}:`, err);
       }
@@ -188,18 +206,28 @@ export async function remediateStuckJob(
   const attempts = await boundedCleanup(config, provider, job, runUrl, lastRunStatus);
 
   if (attempts <= STUCK_JOB_MAX_ATTEMPTS) {
-    updateJobStatus(job.id, "timed_out", "stuck_requeued");
+    if (stopConfirmed) {
+      updateJobStatus(job.id, "timed_out", "stuck_requeued");
+    } else {
+      updateJobStatus(job.id, "timed_out", "stuck_requeued", undefined, { skipAdmissionRelease: true });
+    }
     console.warn(
       `[monitor] Job ${job.id} (${job.issueIdentifier}) stuck after ${elapsedMin}m ` +
         `(attempt ${attempts}/${STUCK_JOB_MAX_ATTEMPTS}) — requeueing`,
     );
   } else {
-    updateJobStatus(job.id, "timed_out", "stuck_giveup");
+    if (stopConfirmed) {
+      updateJobStatus(job.id, "timed_out", "stuck_giveup");
+    } else {
+      updateJobStatus(job.id, "timed_out", "stuck_giveup", undefined, { skipAdmissionRelease: true });
+    }
     console.warn(
       `[monitor] Job ${job.id} (${job.issueIdentifier}) stuck after ${elapsedMin}m ` +
         `(attempt ${attempts}) — giving up, needs human`,
     );
   }
+
+  return stopConfirmed;
 }
 
 /**

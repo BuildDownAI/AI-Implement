@@ -383,3 +383,123 @@ describe("count", () => {
     expect(admission.count("AII")).toBe(1);
   });
 });
+
+// AII-783 gap-fill: releaseByDispatchId is the convenience release used by log.ts's
+// updateJobStatus so a caller that only has the dispatchId (a poll monitor, a runner
+// callback, an admin action, a reaper sweep — anything observing termination long after
+// the acquire() call returned) can free the reservation without also carrying the
+// owner/generation `release` requires.
+describe("releaseByDispatchId", () => {
+  it("releases an active reservation given only its dispatchId", () => {
+    const a = admission.acquire(issueRequest({ dispatchId: "a" }));
+    expect(a.ok).toBe(true);
+
+    expect(admission.releaseByDispatchId("a", "finalized")).toEqual({ status: "released" });
+    expect(admission.read("a")?.releasedAt).not.toBeNull();
+    expect(admission.count("AII")).toBe(0);
+  });
+
+  it("frees team capacity for a subsequent acquire", () => {
+    admission.acquire(issueRequest({ dispatchId: "a", cap: 1 }));
+    const blocked = admission.acquire(
+      issueRequest({ dispatchId: "b", scope: { kind: "issue", issueScope: "s", issueId: "b" }, cap: 1 }),
+    );
+    expect(blocked).toEqual({ ok: false, reason: "at_capacity", count: 1, cap: 1 });
+
+    admission.releaseByDispatchId("a", "finalized");
+
+    const retry = admission.acquire(
+      issueRequest({ dispatchId: "b", scope: { kind: "issue", issueScope: "s", issueId: "b" }, cap: 1 }),
+    );
+    expect(retry.ok).toBe(true);
+  });
+
+  it("is a no-op, not an error, for a dispatchId that never acquired a reservation", () => {
+    // Matches gap-fill/gap-analysis and kg-refresh dispatch ids, which never call
+    // `acquire` and so have no row for this to find.
+    expect(admission.releaseByDispatchId("never-existed", "finalized")).toEqual({ status: "not_owner" });
+  });
+
+  it("is a no-op for an already-released reservation", () => {
+    admission.acquire(issueRequest({ dispatchId: "a" }));
+    expect(admission.releaseByDispatchId("a", "finalized")).toEqual({ status: "released" });
+    expect(admission.releaseByDispatchId("a", "finalized")).toEqual({ status: "not_owner" });
+  });
+});
+
+// AII-783 gap-fill (review finding on PR #681): "No restart/reaper reconciliation for a
+// committed reservation whose launch response or process was lost" — a reservation with
+// no matching dispatch_log row (the orchestrator crashed between acquire() returning and
+// the caller's own appendLog) has no dispatchId a monitor could ever key a release off
+// of, so it would be held forever without this sweep. Also covers the companion case:
+// updateJobStatus deliberately leaving a reservation held pending confirmed termination
+// (reaper/stuck-watchdog's give-up paths) — this sweep is the eventual backstop for that
+// too, on the same age-based schedule.
+describe("sweepStaleAdmissions", () => {
+  it("releases a reservation past maxAgeMs and frees its slot for a subsequent acquire", () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+      const acquired = admission.acquire(issueRequest({ dispatchId: "orphan-a", cap: 1 }));
+      expect(acquired.ok).toBe(true);
+
+      // Still within the window — not swept yet.
+      vi.setSystemTime(new Date("2026-01-01T05:00:00.000Z"));
+      expect(admission.sweepStaleAdmissions(6 * 60 * 60 * 1000)).toEqual([]);
+      expect(admission.read("orphan-a")?.releasedAt).toBeNull();
+
+      // Past the 6h window.
+      vi.setSystemTime(new Date("2026-01-01T06:00:01.000Z"));
+      const released = admission.sweepStaleAdmissions(6 * 60 * 60 * 1000);
+      expect(released).toEqual([
+        { dispatchId: "orphan-a", mappingKey: "AII", ageMs: expect.any(Number) },
+      ]);
+      expect(admission.read("orphan-a")?.releasedAt).not.toBeNull();
+
+      const retry = admission.acquire(
+        issueRequest({ dispatchId: "orphan-a-retry", scope: { kind: "issue", issueScope: "team-a", issueId: "AII-1" }, cap: 1 }),
+      );
+      expect(retry.ok).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not touch an already-released reservation or an unreleased one within the window", () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+      admission.acquire(issueRequest({ dispatchId: "fresh", cap: 5 }));
+      const old = admission.acquire(issueRequest({ dispatchId: "old", scope: { kind: "issue", issueScope: "team-a", issueId: "AII-2" }, cap: 5 }));
+      expect(old.ok).toBe(true);
+      admission.release("old", LEGACY, (old as { ok: true; record: { generation: number } }).record.generation, "finalized");
+
+      vi.setSystemTime(new Date("2026-01-01T07:00:00.000Z"));
+      const released = admission.sweepStaleAdmissions(6 * 60 * 60 * 1000);
+
+      // Only "fresh" was eligible (unreleased + past the window); "old" was already
+      // released before the sweep ran, so it must not appear in the sweep's own result.
+      expect(released).toEqual([
+        { dispatchId: "fresh", mappingKey: "AII", ageMs: expect.any(Number) },
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("defaults to a multi-hour window so an in-progress run is never swept mid-flight", () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+      admission.acquire(issueRequest({ dispatchId: "in-progress", cap: 5 }));
+
+      // 90 minutes is the longest default GHA job timeout in the codebase — well within
+      // the default sweep window.
+      vi.setSystemTime(new Date("2026-01-01T01:30:00.000Z"));
+      expect(admission.sweepStaleAdmissions()).toEqual([]);
+      expect(admission.read("in-progress")?.releasedAt).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

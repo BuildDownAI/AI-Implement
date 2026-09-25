@@ -428,10 +428,13 @@ describe("monitorJobs TTL check (AII-743)", () => {
     // remediateStuckJob's own requeue/give-up bookkeeping writes its own
     // conclusion afterward — the *last* write for this job must still be
     // ttl_expired, not stuck_requeued/stuck_giveup.
+    // No runId means remediateStuckJob's default GHA-cancel path never even attempts a
+    // cancel (job.runId && job.repo is false) — the backend's death is unconfirmed, so
+    // AII-783's admission-release gating must hold the reservation here.
     const callsForJob = vi
       .mocked(updateJobStatus)
       .mock.calls.filter(([id]) => id === job.id);
-    expect(callsForJob.at(-1)).toEqual([job.id, "timed_out", "ttl_expired"]);
+    expect(callsForJob.at(-1)).toEqual([job.id, "timed_out", "ttl_expired", undefined, { skipAdmissionRelease: true }]);
     expect(incrementStuckAttempts).toHaveBeenCalledWith(job.issueId);
     expect(cancelWorkflowRun).not.toHaveBeenCalled();
   });
