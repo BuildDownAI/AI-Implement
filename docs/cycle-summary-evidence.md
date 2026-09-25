@@ -65,7 +65,10 @@ is the forwarding chain that runs before the container exits:
    failures with a byte-identical payload. This works when the terminal result
    cannot attach because no output commit was published.
 3. When a terminal result can attach a `reviewFix` marker, it also forwards
-   `cycleSummaries` as a redundant replay. A Legacy run has no pilot attempt
+   `cycleSummaries` as a redundant replay. If result intake committed before its
+   cycle writes and the callback crashed, an identical duplicate result repairs
+   missing cycle records without repeating tracker or token side effects.
+   A Legacy run has no pilot attempt
    identity, so its workspace file is not forwarded. Durable records are
    independent of the runner workspace and the tool-activity attempt cap.
 

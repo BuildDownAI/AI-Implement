@@ -3936,6 +3936,31 @@ describe("handleRunnerResult — cycle summary durable evidence (AII-801)", () =
     };
   }
 
+  it("repairs missing cycle evidence on an identical duplicate result without replaying provider effects", async () => {
+    const fake = new FakeProvider({ recordCalls: true });
+    const token = runnerTokens.mintRunToken({ issueId: "i", mappingTeamKey: "ENG", phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS, secret: SECRET }).token;
+    let stored = false;
+    const onReviewFixResult = (result: ReviewFixResultMetadataV1): ResultIntakeOutcome => {
+      if (stored) return { status: "duplicate", attemptId: result.attemptId };
+      stored = true;
+      return { status: "stored", result };
+    };
+    const body = { phase: "implementation" as const, outcome: "success" as const, comments: [],
+      prUrl: "https://github.com/o/r/pull/1", reviewFix: validReviewFix };
+    const first = await runnerCallback.handleRunnerResult({ authorization: `Bearer ${token}`, body,
+      secret: SECRET, resolveProvider: makeResolve(fake), onReviewFixResult });
+    expect(first.status).toBe(200);
+    expect(reviewFixEvidence.getReviewFixCycleSummary(validReviewFix.attemptId, 1)).toBeNull();
+    const providerCalls = fake.recordedCalls().length;
+    const second = await runnerCallback.handleRunnerResult({ authorization: `Bearer ${token}`,
+      body: { ...body, cycleSummaries: [baseCycleSummary()] }, secret: SECRET,
+      resolveProvider: makeResolve(fake), onReviewFixResult });
+    expect(second.body.outcome).toBe("duplicate");
+    expect(reviewFixEvidence.getReviewFixCycleSummary(validReviewFix.attemptId, 1)).not.toBeNull();
+    expect(fake.recordedCalls()).toHaveLength(providerCalls);
+  });
+
   async function postResult(body: Partial<RunnerCallbackModule.RunnerResultBody>) {
     const fake = new FakeProvider({ recordCalls: true });
     const { token } = runnerTokens.mintRunToken({

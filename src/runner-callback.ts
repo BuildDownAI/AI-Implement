@@ -641,6 +641,14 @@ export async function handleRunnerResult(
       ? input.onReviewFixResult(validated.value)
       : ({ status: "stored", result: validated.value } as const);
     if (outcome.status !== "stored") {
+      // The result marker may have committed just before a process crash, leaving
+      // its attached cycles unwritten. A byte-identical duplicate may repair only
+      // that evidence; the run token and provider effects remain exactly once.
+      if (outcome.status === "duplicate" && outcome.attemptId === validated.value.attemptId) {
+        const { valid, dropped } = sanitizeCycleSummaries(body.cycleSummaries);
+        if (dropped > 0) console.warn(`[runner-callback] Dropped ${dropped} invalid cycle summary record(s)`);
+        recordCycleSummaries(outcome.attemptId, valid);
+      }
       return reviewFixResultIntakeResponse(outcome);
     }
     recordedReviewFixAttemptId = validated.value.attemptId;
