@@ -4279,6 +4279,77 @@ describe("Review-fix attempt evidence + recovery actions (AII-806)", () => {
       );
       expect(res.statusCode).toBe(503);
     });
+
+    it("defaults pageSize to a sensible bound when absent", async () => {
+      const token = await login("secret");
+      let capturedOpts: { cursor?: AdminModule.ReviewFixActivityCursor; pageSize?: number } | undefined;
+      await requestWithDeps(
+        "/api/review-fix/attempts/attempt-1/activity",
+        "GET",
+        token,
+        { reviewFixAttempts: fakeFacade({ getActivity: async (_id, opts) => { capturedOpts = opts; return { status: "ok", page: PAGE }; } }) },
+      );
+      expect(capturedOpts?.pageSize).toBe(100);
+    });
+
+    it("clamps a pageSize above the storage contract's max down to 500", async () => {
+      const token = await login("secret");
+      let capturedOpts: { cursor?: AdminModule.ReviewFixActivityCursor; pageSize?: number } | undefined;
+      await requestWithDeps(
+        "/api/review-fix/attempts/attempt-1/activity?pageSize=999999",
+        "GET",
+        token,
+        { reviewFixAttempts: fakeFacade({ getActivity: async (_id, opts) => { capturedOpts = opts; return { status: "ok", page: PAGE }; } }) },
+      );
+      expect(capturedOpts?.pageSize).toBe(500);
+    });
+
+    it.each([
+      ["negative", "-5"],
+      ["noninteger", "3.5"],
+      ["nonnumeric", "abc"],
+    ])("normalizes a %s pageSize to the default rather than passing it through raw", async (_label, raw) => {
+      const token = await login("secret");
+      let capturedOpts: { cursor?: AdminModule.ReviewFixActivityCursor; pageSize?: number } | undefined;
+      await requestWithDeps(
+        `/api/review-fix/attempts/attempt-1/activity?pageSize=${raw}`,
+        "GET",
+        token,
+        { reviewFixAttempts: fakeFacade({ getActivity: async (_id, opts) => { capturedOpts = opts; return { status: "ok", page: PAGE }; } }) },
+      );
+      expect(capturedOpts?.pageSize).toBe(100);
+    });
+
+    it.each([
+      ["huge", "99999999999999999999999999"],
+      ["negative", "-1"],
+      ["noninteger", "1.5"],
+      ["nonnumeric", "abc"],
+    ])("rejects a %s cursorSequence with 400, without calling the facade", async (_label, raw) => {
+      const token = await login("secret");
+      const called = vi.fn();
+      const res = await requestWithDeps(
+        `/api/review-fix/attempts/attempt-1/activity?cursorProducerId=runner&cursorSequence=${raw}`,
+        "GET",
+        token,
+        { reviewFixAttempts: fakeFacade({ getActivity: async () => { called(); return { status: "ok", page: PAGE }; } }) },
+      );
+      expect(res.statusCode).toBe(400);
+      expect(called).not.toHaveBeenCalled();
+    });
+
+    it("rejects a cursorSequence supplied without cursorProducerId with 400, without calling the facade", async () => {
+      const token = await login("secret");
+      const called = vi.fn();
+      const res = await requestWithDeps(
+        "/api/review-fix/attempts/attempt-1/activity?cursorSequence=7",
+        "GET",
+        token,
+        { reviewFixAttempts: fakeFacade({ getActivity: async () => { called(); return { status: "ok", page: PAGE }; } }) },
+      );
+      expect(res.statusCode).toBe(400);
+      expect(called).not.toHaveBeenCalled();
+    });
   });
 
   describe("POST /api/review-fix/attempts/:attemptId/reconcile", () => {
@@ -4345,6 +4416,24 @@ describe("Review-fix attempt evidence + recovery actions (AII-806)", () => {
         reviewFixAttempts: fakeFacade({ adopt: async () => { called(); return { status: "accepted" }; } }),
       });
       await res.done;
+      expect(res.statusCode).toBe(400);
+      expect(called).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["negative", -1],
+      ["zero", 0],
+      ["noninteger", 1.5],
+    ])("answers 400 and never calls the facade for a %s githubRunAttempt", async (_label, githubRunAttempt) => {
+      const token = await login("secret");
+      const called = vi.fn();
+      const res = await requestWithDeps(
+        "/api/review-fix/attempts/attempt-1/adopt",
+        "POST",
+        token,
+        { reviewFixAttempts: fakeFacade({ adopt: async () => { called(); return { status: "accepted" }; } }) },
+        { githubRunId: "999", githubRunAttempt },
+      );
       expect(res.statusCode).toBe(400);
       expect(called).not.toHaveBeenCalled();
     });
@@ -4449,6 +4538,50 @@ describe("Review-fix attempt evidence + recovery actions (AII-806)", () => {
       );
       expect(res.statusCode).toBe(202);
       expect(JSON.parse(res.body).status).toBe("durable-accepted");
+      expect(calls).toEqual(["revoke", "cancel"]);
+    });
+
+    // The crash/unavailability boundary the review flagged: when only revokeAuthority
+    // was attempted, the response must not claim the whole cancel (revoke + terminate)
+    // is durably queued — requestCancellation was never called or durably queued at all.
+    it("never claims the whole cancel is durably accepted when only revokeAuthority is unavailable, and never requests cancellation", async () => {
+      const token = await login("secret");
+      const calls: string[] = [];
+      const res = await requestWithDeps(
+        "/api/review-fix/attempts/attempt-1/cancel",
+        "POST",
+        token,
+        {
+          reviewFixAttempts: fakeFacade({
+            revokeAuthority: async () => { calls.push("revoke"); return { status: "unavailable" }; },
+            requestCancellation: async () => { calls.push("cancel"); return { status: "accepted" }; },
+          }),
+        },
+      );
+      expect(res.statusCode).toBe(202);
+      const body = JSON.parse(res.body);
+      expect(body.status).not.toBe("durable-accepted");
+      expect(typeof body.detail).toBe("string");
+      expect(calls).toEqual(["revoke"]);
+    });
+
+    it("reports revoked-but-uncertain, not a bare 500, when requestCancellation fails after a successful revoke", async () => {
+      const token = await login("secret");
+      const calls: string[] = [];
+      const res = await requestWithDeps(
+        "/api/review-fix/attempts/attempt-1/cancel",
+        "POST",
+        token,
+        {
+          reviewFixAttempts: fakeFacade({
+            revokeAuthority: async () => { calls.push("revoke"); return { status: "accepted" }; },
+            requestCancellation: async () => { calls.push("cancel"); throw new Error("network blip"); },
+          }),
+        },
+      );
+      expect(res.statusCode).toBe(502);
+      const body = JSON.parse(res.body);
+      expect(body.status).toBe("revoked-cancellation-uncertain");
       expect(calls).toEqual(["revoke", "cancel"]);
     });
   });

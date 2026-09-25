@@ -610,6 +610,32 @@ const REVIEW_FIX_RECONCILE_ROUTE = /^\/api\/review-fix\/attempts\/([^/]+)\/recon
 const REVIEW_FIX_ADOPT_ROUTE = /^\/api\/review-fix\/attempts\/([^/]+)\/adopt$/;
 const REVIEW_FIX_CANCEL_ROUTE = /^\/api\/review-fix\/attempts\/([^/]+)\/cancel$/;
 
+/** The storage contract's max activity page size (AII-786) and the default this route
+ *  applies when the caller doesn't specify one. */
+const REVIEW_FIX_ACTIVITY_MAX_PAGE_SIZE = 500;
+const REVIEW_FIX_ACTIVITY_DEFAULT_PAGE_SIZE = 100;
+
+/** Normalizes a `pageSize` query param: absent, non-integer, zero, or negative all fall
+ *  back to the sensible default; anything above the storage contract's max is clamped
+ *  down to it. Never rejects — pagination size is always safe to renegotiate. */
+function parseReviewFixActivityPageSize(raw: string | null): number {
+  if (raw === null) return REVIEW_FIX_ACTIVITY_DEFAULT_PAGE_SIZE;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n <= 0) return REVIEW_FIX_ACTIVITY_DEFAULT_PAGE_SIZE;
+  return Math.min(n, REVIEW_FIX_ACTIVITY_MAX_PAGE_SIZE);
+}
+
+/** Parses a query param as a positive integer, rejecting (returning null) on anything
+ *  negative, non-integer, or too large to represent exactly — unlike `pageSize`, a
+ *  cursor position is unsafe to silently renegotiate, so an invalid value must fail the
+ *  request rather than be normalized. */
+function parseReviewFixPositiveInt(raw: string): number | null {
+  if (!/^\d+$/.test(raw)) return null;
+  const n = Number(raw);
+  if (!Number.isSafeInteger(n) || n <= 0) return null;
+  return n;
+}
+
 /** Authorization for every `/api/` route: authenticate, answer the identity probe, then require Admin or a grant — except the tools route, which defers to the tool's own role check. Null means the response is already sent. */
 function authorizeApiRequest(
   req: http.IncomingMessage,
@@ -2107,13 +2133,22 @@ function handleReviewFixActivity(
   }
   const qs = url.includes("?") ? url.slice(url.indexOf("?") + 1) : "";
   const params = new URLSearchParams(qs);
-  const pageSizeRaw = params.get("pageSize");
-  const pageSize = pageSizeRaw && Number.isFinite(Number(pageSizeRaw)) ? Number(pageSizeRaw) : undefined;
+  const pageSize = parseReviewFixActivityPageSize(params.get("pageSize"));
+
   const cursorProducerId = params.get("cursorProducerId");
   const cursorSequenceRaw = params.get("cursorSequence");
   let cursor: ReviewFixActivityCursor | undefined;
-  if (cursorProducerId !== null && cursorSequenceRaw !== null && Number.isFinite(Number(cursorSequenceRaw))) {
-    cursor = { producerId: cursorProducerId, sequence: Number(cursorSequenceRaw) };
+  if (cursorSequenceRaw !== null) {
+    const sequence = parseReviewFixPositiveInt(cursorSequenceRaw);
+    if (sequence === null) {
+      json(res, 400, { error: "cursorSequence must be a positive integer" });
+      return;
+    }
+    if (cursorProducerId === null) {
+      json(res, 400, { error: "cursorProducerId is required when cursorSequence is set" });
+      return;
+    }
+    cursor = { producerId: cursorProducerId, sequence };
   }
   deps.reviewFixAttempts.getActivity(attemptId, { cursor, pageSize }, reviewFixCaller(gate)).then(
     (result) => {
@@ -2164,8 +2199,11 @@ async function handleReviewFixAdopt(
   let execution: ReviewFixAttemptExecutionRef;
   try {
     const parsed = JSON.parse(raw) as { githubRunId?: unknown; githubRunAttempt?: unknown };
-    if (typeof parsed.githubRunId !== "string" || !parsed.githubRunId || typeof parsed.githubRunAttempt !== "number") {
-      json(res, 400, { error: "Body must include githubRunId (string) and githubRunAttempt (number)" });
+    if (
+      typeof parsed.githubRunId !== "string" || !parsed.githubRunId ||
+      typeof parsed.githubRunAttempt !== "number" || !Number.isInteger(parsed.githubRunAttempt) || parsed.githubRunAttempt <= 0
+    ) {
+      json(res, 400, { error: "Body must include githubRunId (string) and githubRunAttempt (positive integer)" });
       return;
     }
     execution = { githubRunId: parsed.githubRunId, githubRunAttempt: parsed.githubRunAttempt };
@@ -2183,10 +2221,20 @@ async function handleReviewFixAdopt(
   }
 }
 
-/** Cancel is two explicit facade calls, made in this order: authority is revoked before
- *  termination is even requested, and a revoke that fails or finds nothing short-circuits
- *  before requestCancellation is ever called (AII-806 — "revoke authority then follows
- *  workflow termination", no unconditional force-release). */
+/**
+ * Cancel is two explicit facade calls, made in this order: authority is revoked before
+ * termination is even requested, and a revoke that fails or finds nothing short-circuits
+ * before requestCancellation is ever called (AII-806 — "revoke authority then follows
+ * workflow termination", no unconditional force-release).
+ *
+ * The two steps are never collapsed into one "cancel accepted" answer. `revokeAuthority`
+ * returning "unavailable" gets its own response rather than reusing the generic
+ * `reviewFixActionResponse` "durable-accepted" body — reusing it here would tell the
+ * caller the whole cancel is queued when `requestCancellation` was never called or
+ * durably queued at all. Likewise, a thrown/rejected `requestCancellation` after a
+ * successful revoke is reported as revoked-but-uncertain, not folded into a bare 500 that
+ * would look like nothing happened.
+ */
 async function handleReviewFixCancel(
   res: http.ServerResponse,
   gate: Extract<AdminGate, { ok: true }>,
@@ -2198,19 +2246,36 @@ async function handleReviewFixCancel(
     return;
   }
   const caller = reviewFixCaller(gate);
+  let revoked: ReviewFixActionOutcome;
   try {
-    const revoked = await deps.reviewFixAttempts.revokeAuthority(attemptId, caller);
-    if (revoked.status !== "accepted") {
-      const [status, body] = reviewFixActionResponse(revoked);
-      json(res, status, body);
-      return;
-    }
+    revoked = await deps.reviewFixAttempts.revokeAuthority(attemptId, caller);
+  } catch (err) {
+    console.error("[admin] review-fix cancel (revoke authority) failed:", err);
+    json(res, 500, { error: "Internal server error" });
+    return;
+  }
+  if (revoked.status === "unavailable") {
+    json(res, 202, {
+      status: "revoke-durable-accepted",
+      detail: "Restate is temporarily unavailable; authority revocation is durably queued, but cancellation has not been requested yet. Retry this call once Restate recovers.",
+    });
+    return;
+  }
+  if (revoked.status !== "accepted") {
+    const [status, body] = reviewFixActionResponse(revoked);
+    json(res, status, body);
+    return;
+  }
+  try {
     const cancelled = await deps.reviewFixAttempts.requestCancellation(attemptId, caller);
     const [status, body] = reviewFixActionResponse(cancelled);
     json(res, status, body);
   } catch (err) {
-    console.error("[admin] review-fix cancel failed:", err);
-    json(res, 500, { error: "Internal server error" });
+    console.error("[admin] review-fix cancel (request cancellation) failed:", err);
+    json(res, 502, {
+      status: "revoked-cancellation-uncertain",
+      detail: "Authority was already revoked, but requesting termination failed. Retry cancellation or verify termination manually.",
+    });
   }
 }
 
