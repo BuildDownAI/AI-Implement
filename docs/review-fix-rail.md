@@ -89,7 +89,7 @@ The gate (`shouldEnqueueReviewEvent`, below) runs before this seam, not inside i
 
 The internal automatic producers use the same transactional acceptance seam with no findings: `guardOpenPrBeforeImplementationDispatch` (`open_pr`) identifies the PR and its most recent source dispatch, while `handleLeaseRejectedFailure` (`lease_rejected`) identifies the failed dispatch. Retrying the same source event does not reset a dispatched queue row; a later dispatch has a new identity and can requeue it. `/ai-implement` (`enqueueCommentGapfill`, `src/comment-gapfill-queue.ts`) uses a separate queue.
 
-This is the "Restate review-fix pilot" wiring described in CLAUDE.md's issue-tracker bindings — durable webhook acceptance, without picking a lifecycle owner. No lifecycle selection (Legacy vs. Restate, AII-772/AII-804) happens here; every event enqueued this way still runs the pre-existing Legacy dispatch and drain path below.
+This is the "Restate review-fix pilot" webhook intake described in CLAUDE.md's issue-tracker bindings. It durably accepts feedback before choosing a lifecycle owner. A project still defaults to Legacy; when its review-fix lifecycle is set to Restate and its runner mode is GitHub Actions, `processReviewFixQueue` delivers automatic work to the durable inbox and `ReviewFixPR`. Local and human-comment runs remain on the Legacy path.
 
 ## Source, severity, and why an inline comment does not block
 
