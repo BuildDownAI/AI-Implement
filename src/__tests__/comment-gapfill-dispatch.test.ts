@@ -575,6 +575,7 @@ describe("drainCommentGapfillQueue", () => {
     const checkContractSpy = vi.fn<DrainInput["checkContract"]>(async () => ({
       contract: "envelope",
       supportsRunPublicationToken: true,
+      supportsAttemptCorrelation: false,
     }));
 
     await drain.drainCommentGapfillQueue(makeBaseDrainOpts({
@@ -621,6 +622,7 @@ describe("drainCommentGapfillQueue", () => {
       checkContract: vi.fn<DrainInput["checkContract"]>(async () => ({
         contract: "envelope",
         supportsRunPublicationToken: false,
+        supportsAttemptCorrelation: false,
       })),
     }));
 

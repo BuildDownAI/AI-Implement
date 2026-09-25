@@ -608,6 +608,7 @@ describe("processReviewFixQueue — GHA phase fix", () => {
     vi.spyOn(workflowProbeModule, "resolveWorkflowCapabilities").mockResolvedValue({
       contract: "legacy",
       supportsRunPublicationToken: false,
+      supportsAttemptCorrelation: false,
     });
     vi.spyOn(repoImageModule, "resolveRunnerImageForDispatch").mockResolvedValue(undefined);
 
@@ -728,6 +729,7 @@ describe("processReviewFixQueue — task description wiring", () => {
     vi.spyOn(workflowProbeModule, "resolveWorkflowCapabilities").mockResolvedValue({
       contract: "legacy",
       supportsRunPublicationToken: false,
+      supportsAttemptCorrelation: false,
     });
     vi.spyOn(repoImageModule, "resolveRunnerImageForDispatch").mockResolvedValue(undefined);
 
