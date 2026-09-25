@@ -226,6 +226,9 @@ export interface ClaimDeliveriesOptions {
   readonly now?: number;
   /** A deploy drain admits completion events while leaving new feedback queued. */
   readonly completionOnly?: boolean;
+  /** The Restate forwarding pump cannot execute approval effects. Leave those
+   * rows for the finalizer's exact-identity reconciliation path. */
+  readonly routableOnly?: boolean;
 }
 
 /**
@@ -251,6 +254,7 @@ export function claimDeliveries(options: ClaimDeliveriesOptions = {}): ReviewFix
       WHERE delivery_state != 'delivered'
         AND (retry_at IS NULL OR retry_at < ?)
         ${options.completionOnly ? "AND kind != 'feedback'" : ""}
+        ${options.routableOnly ? "AND kind != 'terminal-effect'" : ""}
       ORDER BY accepted_at ASC
       LIMIT ?
     `).all(now, limit) as ReviewFixInboxRow[];

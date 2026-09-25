@@ -3712,8 +3712,9 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
 
       const [scopeKey, mapping] = mappingEntry;
       const runnerMode = getRunnerMode().mode;
-      if (resolveReviewFixLifecycle(mapping) === "restate") {
-        if (resolveExecutionPath(runnerMode, mapping.executionMode) !== "github-actions") {
+      const selectedExecutionPath = resolveExecutionPath(runnerMode, mapping.executionMode);
+      if (resolveReviewFixLifecycle(mapping) === "restate" && selectedExecutionPath !== "local-docker") {
+        if (selectedExecutionPath !== "github-actions") {
           console.warn(`[review-fix] Restate pilot runner mode unavailable for ${fix.repo}; keeping #${fix.id} pending`);
           continue;
         }

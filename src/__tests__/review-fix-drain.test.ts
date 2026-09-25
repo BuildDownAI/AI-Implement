@@ -214,6 +214,18 @@ describe("processReviewFixQueue — owner selection", () => {
     expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(1);
     expect((dedup.getDb().prepare("SELECT COUNT(*) AS n FROM review_fix_inbox").get() as { n: number }).n).toBe(0);
   });
+
+  it("keeps a local review-fix run on Legacy even when the project selects Restate for GHA", async () => {
+    process.env.RUNNER_MODE = "local";
+    configModule.upsertMapping("TEAM", makeMapping({ reviewFixLifecycle: "restate" }));
+    restateStatus.setRestateStatus({ sidecar: { state: "ready" }, registration: { state: "registered" } });
+    queueOne();
+
+    await indexModule.processReviewFixQueue(mockConfig, mockRegistry);
+
+    expect(localGapfillMocks.dispatchLocalGapfill).toHaveBeenCalledTimes(1);
+    expect((dedup.getDb().prepare("SELECT COUNT(*) AS n FROM review_fix_inbox").get() as { n: number }).n).toBe(0);
+  });
 });
 
 describe("processReviewFixQueue — dispatch gate", () => {

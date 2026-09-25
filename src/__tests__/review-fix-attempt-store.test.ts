@@ -203,6 +203,24 @@ describe("SqliteReviewFixAttemptStore: admission", () => {
     expect((dedup.getDb().prepare("SELECT COUNT(*) AS n FROM review_fix_attempts").get() as { n: number }).n).toBe(0);
   });
 
+  it("keeps a newer queue event pending when it arrives after the snapshot but before admission", async () => {
+    seedMapping();
+    queue.enqueueReviewFix({ issueId: "issue-42", issueIdentifier: "AII-42", repo: SCOPE.repository,
+      prNumber: SCOPE.prNumber, reason: "review_feedback", sourceEventId: "event-1" });
+    const firstFeedback = pending.loadPendingReviewFixFeedback(SCOPE, null)!;
+    queue.enqueueReviewFix({ issueId: "issue-42", issueIdentifier: "AII-42", repo: SCOPE.repository,
+      prNumber: SCOPE.prNumber, reason: "review_feedback", sourceEventId: "event-2" });
+    const store = new storeModule.SqliteReviewFixAttemptStore();
+    const first = await store.admit(admissionRequest({ feedback: firstFeedback }));
+    if (first.status !== "prepared") throw new Error("expected prepared");
+    expect(queue.getPendingReviewFixes()).toHaveLength(1);
+    await store.releaseOwner(first.attempt.owner, "finalized");
+    const nextFeedback = pending.loadPendingReviewFixFeedback(SCOPE, null)!;
+    expect(nextFeedback.queueCursor!.eventId).toBeGreaterThan(firstFeedback.queueCursor!.eventId);
+    const second = await store.admit(admissionRequest({ feedback: nextFeedback }));
+    expect(second.status).toBe("prepared");
+  });
+
   it("prepares a reservation, deadline, and exactly one budget entry", async () => {
     seedMapping();
     const store = new storeModule.SqliteReviewFixAttemptStore();

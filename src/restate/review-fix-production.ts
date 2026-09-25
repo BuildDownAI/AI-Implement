@@ -6,7 +6,7 @@ import { getDb } from "../dedup.js";
 import { getInstallationToken } from "../github-app-auth.js";
 import { getPullRequestState } from "../github.js";
 import { listReviewFixCycleSummaries } from "../review-fix-evidence.js";
-import { createReviewFixFinalizer } from "../review-fix-finalize.js";
+import { createReviewFixFinalizer, retryApprovalEffect } from "../review-fix-finalize.js";
 import { createReviewFixGithubAdapter } from "../review-fix-github-adapter.js";
 import { loadPendingReviewFixFeedback } from "../review-fix-pending.js";
 import { SqliteReviewFixAttemptStore } from "../review-fix-attempt-store.js";
@@ -84,7 +84,35 @@ export function createProductionReviewFixServices(
       };
     },
   });
-  const finalizer = createReviewFixFinalizer({ attemptStore: store, github });
+  const baseFinalizer = createReviewFixFinalizer({ attemptStore: store, github });
+  const finalizer: typeof baseFinalizer = {
+    recordOutcome: baseFinalizer.recordOutcome,
+    applyApproval: async (input) => {
+      // The result handler may record a conflict after the workflow's earlier
+      // evidence step. Re-read current SQLite authority and the accepted
+      // identity immediately before any GitHub write.
+      const accepted = await store.getAcceptedResult(input.attemptId);
+      const outcome = await store.getRecordedOutcome(input.attemptId);
+      if (!accepted?.result || accepted.hasConflict || outcome?.terminal.status !== "succeeded"
+        || JSON.stringify(accepted.result) !== JSON.stringify(input.result)
+        || !await store.hasCurrentAuthority(input.attemptId)) {
+        return { status: "withheld", reason: "current attempt authority or accepted result changed" };
+      }
+      const head = await github.getPrHeadSha(input.scope) ?? "";
+      if (head !== input.result.outputCommit || !input.policyAllows
+        || !await github.evaluateMergePolicy(input.scope, input.findingDispositions)) {
+        return { status: "withheld", reason: "current PR head or merge policy changed" };
+      }
+      const current = { ...input, currentAuthority: true, currentPrHeadSha: head };
+      const effect = await baseFinalizer.applyApproval(current);
+      if (effect.status === "withheld" && effect.reason.includes("reconcile via retryApprovalEffect")) {
+        // A previous effect may have reached GitHub before its local ACK was
+        // lost. The explicit retry observes the stable attempt marker first.
+        return retryApprovalEffect({ attemptStore: store, github }, current);
+      }
+      return effect;
+    },
+  };
   const pr = createReviewFixPR({
     attempts: {
       admit: async (request) => await canAdmit(request.scope, config)

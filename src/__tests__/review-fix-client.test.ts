@@ -556,7 +556,7 @@ describe("ReviewFixDeliveryPump — routing", () => {
     expect(facade.deliverCancel).toHaveBeenCalledWith("attempt-99", expect.any(String));
   });
 
-  it("leaves a terminal-effect row pending rather than dropping it, since no route exists yet", async () => {
+  it("leaves a terminal-effect row unclaimed for exact-identity finalizer reconciliation", async () => {
     const destination = makeDestination();
     inbox.acceptDelivery({
       authenticatedSource: "runner",
@@ -576,7 +576,8 @@ describe("ReviewFixDeliveryPump — routing", () => {
     expect(facade.deliverResult).not.toHaveBeenCalled();
     expect(facade.deliverCancel).not.toHaveBeenCalled();
     const row = inbox.getDelivery("runner", "evt-terminal");
-    expect(row?.deliveryState).not.toBe("delivered");
+    expect(row?.deliveryState).toBe("pending");
+    expect(pump.status().lastTickUnavailable).toBe(0);
   });
 });
 
