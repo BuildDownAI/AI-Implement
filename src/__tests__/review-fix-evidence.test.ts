@@ -67,14 +67,55 @@ function getStreamRow(attemptId: string) {
     .get(attemptId) as { accepted_bytes: number; limit_reached_at: number | null; truncated_at: number | null; conflict_at: number | null } | undefined;
 }
 
-function insertAttemptWithCompletion(db: Database.Database, attemptId: string, completedAt: number | null) {
+function insertAttemptWithCompletion(
+  db: Database.Database,
+  attemptId: string,
+  completedAt: number | null,
+  opts: {
+    installationId?: string;
+    repository?: string;
+    prNumber?: number;
+    dispatchId?: string;
+    /** Defaults to a bound execution (a typical fully-lifecycled attempt); pass null to
+     *  model "unknown execution" — bindExecution never ran/landed for this attempt. */
+    githubRunId?: number | null;
+    resultConflictAt?: number | null;
+  } = {},
+) {
+  const installationId = opts.installationId ?? "7";
+  const repository = opts.repository ?? "acme/app";
+  const prNumber = opts.prNumber ?? 42;
+  const dispatchId = opts.dispatchId ?? `dispatch-${attemptId}`;
+  const githubRunId = opts.githubRunId === undefined ? 1 : opts.githubRunId;
+  const githubRunAttempt = githubRunId === null ? null : 1;
   db.prepare(`INSERT INTO review_fix_attempts
     (attempt_id, dispatch_id, mapping_key, installation_id, repository, pr_number,
      issue_scope, issue_id, owner, state, created_at, deadline_at,
-     task_snapshot_json, finding_versions_json, completed_at)
-    VALUES (@attemptId, @dispatchId, 'APP', '7', 'acme/app', 42,
-            'team', 'issue-1', @attemptId, 'completed', 10, 1000, '{}', '[]', @completedAt)`)
-    .run({ attemptId, dispatchId: `dispatch-${attemptId}`, completedAt });
+     task_snapshot_json, finding_versions_json, completed_at,
+     github_run_id, github_run_attempt, result_conflict_at)
+    VALUES (@attemptId, @dispatchId, 'APP', @installationId, @repository, @prNumber,
+            'team', 'issue-1', @attemptId, 'completed', 10, 1000, '{}', '[]', @completedAt,
+            @githubRunId, @githubRunAttempt, @resultConflictAt)`)
+    .run({
+      attemptId, dispatchId, installationId, repository, prNumber, completedAt,
+      githubRunId, githubRunAttempt, resultConflictAt: opts.resultConflictAt ?? null,
+    });
+}
+
+function insertActiveReservation(db: Database.Database, dispatchId: string) {
+  db.prepare(`INSERT INTO dispatch_admissions
+    (dispatch_id, mapping_key, issue_scope, issue_id, installation_id, repository, pr_number,
+     lifecycle_owner, phase, backend, created_at, released_at)
+    VALUES (@dispatchId, 'APP', 'pr', 'issue-1', '7', 'acme/app', 42,
+            'restate', 'implementation', 'github-actions', 10, NULL)`)
+    .run({ dispatchId });
+}
+
+function insertPendingInboxDelivery(db: Database.Database, opts: { installationId: string; repository: string; prNumber: number; eventId: string }) {
+  db.prepare(`INSERT INTO review_fix_inbox
+    (authenticated_source, event_id, installation_id, repository, pr_number, kind, payload_json, payload_hash, accepted_at, delivery_state)
+    VALUES ('github-webhook', @eventId, @installationId, @repository, @prNumber, 'feedback', '{}', 'hash', 10, 'pending')`)
+    .run(opts);
 }
 
 describe("appendReviewFixActivityBatch", () => {
@@ -476,5 +517,83 @@ describe("retention and tombstones", () => {
       attemptId: "attempt-old", cycle: 1, dispositions: [], tests: {}, verdict: "x", usage: {}, completedAt: now,
     });
     expect(replayCycle.status).toBe("tombstoned");
+  });
+
+  it("never purges a long-completed attempt whose execution was never bound (unknown execution)", () => {
+    const db = dedup.getDb();
+    const now = 1_700_000_000_000;
+    const sevenDaysMs = 7 * 24 * 60 * 60 * 1000;
+
+    insertAttemptWithCompletion(db, "attempt-unbound", now - sevenDaysMs - 1_000, { githubRunId: null });
+    evidence.appendReviewFixActivityBatch({
+      attemptId: "attempt-unbound", producerId: "producer-1",
+      events: [makeEvent({ attemptId: "attempt-unbound", producerId: "producer-1", sequence: 0, payload: "x" })],
+    });
+
+    const result = evidence.sweepExpiredReviewFixEvidence(now);
+    expect(result.purgedAttemptIds).not.toContain("attempt-unbound");
+    expect(evidence.listReviewFixActivity("attempt-unbound", { pageSize: 10 }).events).toHaveLength(1);
+    expect(evidence.isReviewFixEvidenceTombstoned("attempt-unbound")).toBe(false);
+  });
+
+  it("never purges a long-completed attempt with a still-active dispatch reservation, and purges it once released", () => {
+    const db = dedup.getDb();
+    const now = 1_700_000_000_000;
+    const sevenDaysMs = 7 * 24 * 60 * 60 * 1000;
+    const dispatchId = "dispatch-attempt-reserved";
+
+    insertAttemptWithCompletion(db, "attempt-reserved", now - sevenDaysMs - 1_000, { dispatchId });
+    insertActiveReservation(db, dispatchId);
+    evidence.appendReviewFixActivityBatch({
+      attemptId: "attempt-reserved", producerId: "producer-1",
+      events: [makeEvent({ attemptId: "attempt-reserved", producerId: "producer-1", sequence: 0, payload: "x" })],
+    });
+
+    const held = evidence.sweepExpiredReviewFixEvidence(now);
+    expect(held.purgedAttemptIds).not.toContain("attempt-reserved");
+    expect(evidence.listReviewFixActivity("attempt-reserved", { pageSize: 10 }).events).toHaveLength(1);
+
+    db.prepare(`UPDATE dispatch_admissions SET released_at = ? WHERE dispatch_id = ?`).run(now, dispatchId);
+    const released = evidence.sweepExpiredReviewFixEvidence(now);
+    expect(released.purgedAttemptIds).toContain("attempt-reserved");
+    expect(evidence.isReviewFixEvidenceTombstoned("attempt-reserved")).toBe(true);
+  });
+
+  it("never purges a long-completed attempt with an unresolved result conflict", () => {
+    const db = dedup.getDb();
+    const now = 1_700_000_000_000;
+    const sevenDaysMs = 7 * 24 * 60 * 60 * 1000;
+
+    insertAttemptWithCompletion(db, "attempt-conflicted", now - sevenDaysMs - 1_000, { resultConflictAt: now - 500 });
+    evidence.appendReviewFixActivityBatch({
+      attemptId: "attempt-conflicted", producerId: "producer-1",
+      events: [makeEvent({ attemptId: "attempt-conflicted", producerId: "producer-1", sequence: 0, payload: "x" })],
+    });
+
+    const result = evidence.sweepExpiredReviewFixEvidence(now);
+    expect(result.purgedAttemptIds).not.toContain("attempt-conflicted");
+    expect(evidence.listReviewFixActivity("attempt-conflicted", { pageSize: 10 }).events).toHaveLength(1);
+  });
+
+  it("never purges a long-completed attempt while its PR still has a non-delivered inbox event, and purges it once delivered", () => {
+    const db = dedup.getDb();
+    const now = 1_700_000_000_000;
+    const sevenDaysMs = 7 * 24 * 60 * 60 * 1000;
+
+    insertAttemptWithCompletion(db, "attempt-pending-delivery", now - sevenDaysMs - 1_000, {
+      installationId: "9", repository: "acme/pending", prNumber: 7,
+    });
+    insertPendingInboxDelivery(db, { installationId: "9", repository: "acme/pending", prNumber: 7, eventId: "evt-1" });
+    evidence.appendReviewFixActivityBatch({
+      attemptId: "attempt-pending-delivery", producerId: "producer-1",
+      events: [makeEvent({ attemptId: "attempt-pending-delivery", producerId: "producer-1", sequence: 0, payload: "x" })],
+    });
+
+    const held = evidence.sweepExpiredReviewFixEvidence(now);
+    expect(held.purgedAttemptIds).not.toContain("attempt-pending-delivery");
+
+    db.prepare(`UPDATE review_fix_inbox SET delivery_state = 'delivered' WHERE event_id = 'evt-1'`).run();
+    const released = evidence.sweepExpiredReviewFixEvidence(now);
+    expect(released.purgedAttemptIds).toContain("attempt-pending-delivery");
   });
 });
