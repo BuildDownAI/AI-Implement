@@ -175,15 +175,17 @@ export interface HandleRunnerResultInput {
     },
   ) => void;
   /**
-   * Injectable seam that classifies a validated `reviewFix` result marker
-   * (AII-769/AII-770). Called before the run token is consumed and before any
-   * provider call, so a "duplicate"/"conflict"/"stale" classification is fully
-   * side-effect-free. Absent, or when the marker classifies "stored", the
-   * callback proceeds through its existing (legacy) phase handling unchanged —
-   * the attempt store this would classify against is added by AII-771/AII-774,
-   * not this issue.
+   * Injectable seam that durably records a validated `reviewFix` result marker
+   * (AII-769/AII-803) — e.g. `SqliteReviewFixAttemptStore.recordResult`, composed
+   * with queuing the accepted result for Restate delivery. Authenticated and
+   * called before the Legacy run token is ever consumed and before any provider
+   * call, so every classification ("stored"/"duplicate"/"conflict"/"stale") is
+   * fully side-effect-free with respect to Legacy. A "stored" classification
+   * never falls through into Legacy phase handling either — see
+   * `handleRunnerResult`'s reviewFix branch, which returns directly. Absent,
+   * defaults to a synthetic "stored" classification (no attempt store wired).
    */
-  onReviewFixResult?: (result: ReviewFixResultMetadataV1) => ResultIntakeOutcome;
+  onReviewFixResult?: (result: ReviewFixResultMetadataV1) => ResultIntakeOutcome | Promise<ResultIntakeOutcome>;
   /**
    * Immediate one-shot backend-termination check for a planning callback's admission
    * reservation (AII-783 review, third round, on PR #681). The planning branch below
@@ -625,34 +627,56 @@ export async function handleRunnerResult(
     }
   }
 
-  // A present reviewFix marker is validated and classified here, BEFORE the
-  // run token is consumed and before any provider call — unlike `failure`/
-  // `findingDispositions` below, a malformed marker must never reach the
-  // legacy success branch, and a "duplicate"/"conflict"/"stale" classification
-  // must be fully side-effect-free (no token burned, no comment posted).
-  // `recordedReviewFixAttemptId` is set only once this marker is confirmed live
-  // ("stored") — a Legacy result (no marker) or a duplicate/conflict/stale one
-  // (which returns early above) never reaches the cycle-summary recording below.
-  let recordedReviewFixAttemptId: string | undefined;
+  // A present reviewFix marker puts this message under Restate's control instead
+  // of Legacy (AII-769/AII-803). It is authenticated and classified here, before
+  // the Legacy run token is ever consumed and before any provider call — a
+  // malformed marker or a failed authentication must never reach the legacy
+  // success branch below, and once classified "stored" this message must never
+  // fall through into it either: a pilot result bypasses every Legacy
+  // completion, disposition, and approval side effect (approval is applied
+  // independently by review-fix-finalize.ts, never by this callback).
   if (body.reviewFix !== undefined) {
     const validated = validateResultReviewFix(body.reviewFix);
     if (!validated.ok) return bad(400, validated.error);
 
+    // Authenticate against the prepared attempt's own credential, never the
+    // request body: the token must have been minted for exactly this attempt.
+    // `onReviewFixResult` (recordResult) separately verifies the body's
+    // repository/prNumber/installationId/deadlineAt against the stored attempt
+    // row, so a caller holding a genuine token still cannot smuggle a forged
+    // scope through the marker.
+    const authenticated = verifyPreparedReviewFixToken(bearerToken, input.secret, "result");
+    if (!authenticated.ok || authenticated.claims.attemptId !== validated.value.attemptId) {
+      const reason = authenticated.ok ? "reviewfix_wrong_attempt" : authenticated.reason;
+      console.warn(
+        `[runner-callback] pilot result refused attempt=${validated.value.attemptId} reason=${reason}`,
+      );
+      return bad(401, reason);
+    }
+
     const outcome = input.onReviewFixResult
-      ? input.onReviewFixResult(validated.value)
+      ? await input.onReviewFixResult(validated.value)
       : ({ status: "stored", result: validated.value } as const);
-    if (outcome.status !== "stored") {
-      // The result marker may have committed just before a process crash, leaving
-      // its attached cycles unwritten. A byte-identical duplicate may repair only
-      // that evidence; the run token and provider effects remain exactly once.
-      if (outcome.status === "duplicate" && outcome.attemptId === validated.value.attemptId) {
-        const { valid, dropped } = sanitizeCycleSummaries(body.cycleSummaries);
-        if (dropped > 0) console.warn(`[runner-callback] Dropped ${dropped} invalid cycle summary record(s)`);
-        recordCycleSummaries(outcome.attemptId, valid);
-      }
+
+    // The result marker may have committed just before a process crash, leaving
+    // its attached cycles unwritten. A byte-identical duplicate may repair only
+    // that evidence; nothing else here is ever replayed.
+    if (outcome.status === "duplicate" && outcome.attemptId === validated.value.attemptId) {
+      const { valid, dropped } = sanitizeCycleSummaries(body.cycleSummaries);
+      if (dropped > 0) console.warn(`[runner-callback] Dropped ${dropped} invalid cycle summary record(s)`);
+      recordCycleSummaries(outcome.attemptId, valid);
       return reviewFixResultIntakeResponse(outcome);
     }
-    recordedReviewFixAttemptId = validated.value.attemptId;
+    if (outcome.status !== "stored") {
+      return reviewFixResultIntakeResponse(outcome);
+    }
+
+    const { valid, dropped } = sanitizeCycleSummaries(body.cycleSummaries);
+    if (dropped > 0) console.warn(`[runner-callback] Dropped ${dropped} invalid cycle summary record(s)`);
+    recordCycleSummaries(validated.value.attemptId, valid);
+
+    console.log(`[runner-callback] pilot result accepted attempt=${validated.value.attemptId}`);
+    return reviewFixResultIntakeResponse(outcome);
   }
 
   // Note: token is consumed atomically here BEFORE any provider call. If
@@ -709,17 +733,15 @@ export async function handleRunnerResult(
     console.warn(`[runner-callback] Dropped ${droppedFindingDispositions} invalid finding disposition(s)`);
   }
 
-  // Same sanitize-and-drop treatment again, then durably recorded (AII-801) — but only when this
-  // result also carried a live `reviewFix` marker: a Legacy run has no attemptId to record
-  // against, so its cycle summaries (if any were even forwarded) are acknowledged and dropped.
+  // Same sanitize-and-drop treatment again: a Legacy run (no reviewFix marker —
+  // the only way execution reaches this point) has no attemptId to record cycle
+  // evidence against, so its cycle summaries (if any were even forwarded) are
+  // acknowledged and dropped rather than recorded (AII-801).
   const { valid: sanitizedCycleSummaries, dropped: droppedCycleSummaries } =
     sanitizeCycleSummaries(body.cycleSummaries);
   input.body.cycleSummaries = sanitizedCycleSummaries;
   if (droppedCycleSummaries > 0) {
     console.warn(`[runner-callback] Dropped ${droppedCycleSummaries} invalid cycle summary record(s)`);
-  }
-  if (recordedReviewFixAttemptId && sanitizedCycleSummaries.length > 0) {
-    recordCycleSummaries(recordedReviewFixAttemptId, sanitizedCycleSummaries);
   }
 
   // kg-refresh runs have no mapping and no tracker issue to update.
@@ -1022,11 +1044,10 @@ function renderDeferredFindingsComment(
 }
 
 // ---------------------------------------------------------------------------
-// Pilot activity intake (AII-769/AII-770) — proposed POST /runner/activity.
-// No route in src/index.ts calls this yet, and no runner call site posts to
-// it (both are separate downstream issues). This defines the wire body, its
-// validator, and a typed injectable classification seam so a later issue can
-// wire a route and a producer without re-deriving the contract.
+// Pilot activity intake (AII-769/AII-770/AII-803) — POST /runner/activity.
+// Wired to a route in src/index.ts (AII-803); no runner call site posts to it
+// yet (a separate downstream issue). This defines the wire body, its
+// validator, and a typed injectable classification seam.
 // ---------------------------------------------------------------------------
 
 /** Wire body proposed for `POST /runner/activity`. */
@@ -1109,27 +1130,36 @@ function validateRunnerActivityBody(
 }
 
 export interface HandleRunnerActivityInput {
+  authorization: string | undefined;
+  secret: string;
   body: unknown;
   /**
-   * Injectable seam that classifies a validated activity batch
-   * (AII-769/AII-770). Absent means "accepted" without further action — no
-   * store or Restate producer is wired by this issue.
+   * Injectable seam that durably stores a validated activity batch
+   * (AII-769/AII-803) — e.g. `appendReviewFixActivityBatch`. Absent means
+   * "accepted" without further action.
    */
-  onReviewFixActivity?: (batch: RunnerActivityBody) => ActivityIntakeOutcome;
+  onReviewFixActivity?: (batch: RunnerActivityBody) => ActivityIntakeOutcome | Promise<ActivityIntakeOutcome>;
 }
 
 /**
- * Validates and classifies a proposed `/runner/activity` body. Deliberately
- * takes no bearer token: `RunTokenAudience` (src/runner-tokens.ts) has no
- * "activity" member yet, so this function performs no authentication —
- * whichever issue adds the route decides that story (see AII-770's risk log).
+ * Validates, authenticates, and classifies a `/runner/activity` body
+ * (AII-769/AII-803). Authenticated with the same reusable prepared "progress"
+ * credential `handleRunnerCycleSummary` uses — a bearer bound to a live
+ * prepared attempt — never the body's own `attemptId` alone, so a caller
+ * cannot report activity for an attempt it holds no credential for.
  */
-export function handleRunnerActivity(input: HandleRunnerActivityInput): HandleRunnerResultOutput {
+export async function handleRunnerActivity(input: HandleRunnerActivityInput): Promise<HandleRunnerResultOutput> {
+  const bearer = parseBearerToken(input.authorization);
+  if (!bearer) return bad(401, "missing_bearer");
+  const verified = verifyPreparedReviewFixToken(bearer, input.secret, "progress");
+  if (!verified.ok || !verified.claims.attemptId) return bad(401, verified.ok ? "wrong_scope" : verified.reason);
+
   const validated = validateRunnerActivityBody(input.body);
   if (!validated.ok) return bad(400, validated.error);
+  if (validated.value.attemptId !== verified.claims.attemptId) return bad(401, "activity_wrong_attempt");
 
   const outcome = input.onReviewFixActivity
-    ? input.onReviewFixActivity(validated.value)
+    ? await input.onReviewFixActivity(validated.value)
     : ({ status: "accepted", attemptId: validated.value.attemptId } as const);
   return activityIntakeResponse(outcome);
 }

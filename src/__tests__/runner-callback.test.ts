@@ -108,6 +108,47 @@ function makeResolve(provider: TicketingProvider | null) {
   return async (_mappingTeamKey: string) => provider;
 }
 
+/**
+ * Inserts a prepared review-fix attempt (idempotent — a second call for the same
+ * attemptId is a no-op) and mints a "result"-audience prepared credential for it
+ * (AII-803). Defaults match `validReviewFix` fixtures used throughout this file.
+ */
+function preparedResultToken(
+  attemptId: string,
+  scope: { installationId?: number; repository?: string; prNumber?: number; deadlineAt?: number } = {},
+): string {
+  const db = dedup.getDb();
+  const installationId = String(scope.installationId ?? 1);
+  const repository = scope.repository ?? "acme/widgets";
+  const prNumber = scope.prNumber ?? 42;
+  const deadlineAt = scope.deadlineAt ?? 1_800_000_000_000;
+  const issueId = `${repository}#${prNumber}`;
+  const existing = db.prepare("SELECT 1 FROM review_fix_attempts WHERE attempt_id = ?").get(attemptId);
+  if (!existing) {
+    db.prepare(`INSERT INTO dispatch_admissions
+      (dispatch_id, mapping_key, issue_scope, issue_id, installation_id, repository, pr_number,
+       lifecycle_owner, phase, backend, created_at)
+      VALUES (?, 'ENG', 'pr', ?, ?, ?, ?, ?, 'implementation', 'github-actions', ?)`)
+      .run(attemptId, issueId, installationId, repository, prNumber, `restate:${attemptId}`, Date.now());
+    db.prepare(`INSERT INTO review_fix_attempts
+      (attempt_id, dispatch_id, mapping_key, installation_id, repository, pr_number, issue_scope,
+       issue_id, owner, state, created_at, deadline_at, task_snapshot_json, finding_versions_json)
+      VALUES (?, ?, 'ENG', ?, ?, ?, 'pr', ?, ?, 'prepared', ?, ?, '{}', '[]')`)
+      .run(attemptId, attemptId, installationId, repository, prNumber, issueId, attemptId, Date.now(), deadlineAt);
+  }
+  return runnerTokens.mintPreparedReviewFixToken({ attemptId, audience: "result", secret: SECRET }).token;
+}
+
+/** Same prepared-attempt setup, minting a "progress"-audience credential instead — the
+ *  credential family `/runner/activity` and `/runner/cycle-summary` authenticate with. */
+function preparedProgressToken(
+  attemptId: string,
+  scope: { installationId?: number; repository?: string; prNumber?: number; deadlineAt?: number } = {},
+): string {
+  preparedResultToken(attemptId, scope); // ensures the row exists; discards the "result" token
+  return runnerTokens.mintPreparedReviewFixToken({ attemptId, audience: "progress", secret: SECRET }).token;
+}
+
 const STEP: Step = {
   id: "implement.1",
   type: "implement",
@@ -3731,34 +3772,7 @@ describe("handleRunnerResult — reviewFix pilot marker (AII-777)", () => {
     expect(fake.getPhase("i")).toBeUndefined();
   });
 
-  it("accepts a valid reviewFix marker and proceeds into unchanged legacy processing when no seam is provided", async () => {
-    const fake = new FakeProvider({ recordCalls: true });
-    const { token } = runnerTokens.mintRunToken({
-      issueId: "i",
-      mappingTeamKey: "ENG",
-      phase: "implementation",
-      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
-      secret: SECRET,
-    });
-
-    const res = await runnerCallback.handleRunnerResult({
-      authorization: `Bearer ${token}`,
-      body: {
-        phase: "implementation",
-        outcome: "success",
-        comments: [],
-        prUrl: "https://github.com/o/r/pull/1",
-        reviewFix: validReviewFix,
-      },
-      secret: SECRET,
-      resolveProvider: makeResolve(fake),
-    });
-
-    expect(res.status).toBe(200);
-    expect(fake.getPhase("i")).toBe("pr_ready");
-  });
-
-  it("accepts a valid reviewFix marker and proceeds into legacy processing when the seam classifies it 'stored'", async () => {
+  it("rejects a valid reviewFix marker authenticated with a plain (non-prepared) token, before the seam is ever called", async () => {
     const fake = new FakeProvider({ recordCalls: true });
     const { token } = runnerTokens.mintRunToken({
       issueId: "i",
@@ -3776,6 +3790,86 @@ describe("handleRunnerResult — reviewFix pilot marker (AII-777)", () => {
       body: {
         phase: "implementation",
         outcome: "success",
+        comments: [{ body: "should not be posted" }],
+        prUrl: "https://github.com/o/r/pull/1",
+        reviewFix: validReviewFix,
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+      onReviewFixResult,
+    });
+
+    expect(res.status).toBe(401);
+    expect(onReviewFixResult).not.toHaveBeenCalled();
+    expect(fake.recordedCalls()).toEqual([]);
+    expect(fake.getPhase("i")).toBeUndefined();
+  });
+
+  it("rejects a valid reviewFix marker whose attemptId does not match the authenticated attempt's own token (forged attempt)", async () => {
+    const fake = new FakeProvider({ recordCalls: true });
+    // A token minted for a *different* prepared attempt than the one the body claims.
+    const token = preparedResultToken("attempt-other");
+    const onReviewFixResult = vi.fn(
+      (result: ReviewFixResultMetadataV1): ResultIntakeOutcome => ({ status: "stored", result }),
+    );
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "success",
+        comments: [],
+        prUrl: "https://github.com/o/r/pull/1",
+        reviewFix: validReviewFix, // attemptId: "attempt-1"
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+      onReviewFixResult,
+    });
+
+    expect(res.status).toBe(401);
+    expect(res.body.error).toBe("reviewfix_wrong_attempt");
+    expect(onReviewFixResult).not.toHaveBeenCalled();
+  });
+
+  it("authenticates a valid reviewFix marker via its prepared credential and never touches Legacy processing when no seam is provided", async () => {
+    const fake = new FakeProvider({ recordCalls: true });
+    const token = preparedResultToken(validReviewFix.attemptId);
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "success",
+        comments: [{ body: "should not be posted" }],
+        prUrl: "https://github.com/o/r/pull/1",
+        reviewFix: validReviewFix,
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ acknowledged: true, outcome: "stored" });
+    expect(fake.recordedCalls()).toEqual([]);
+    expect(fake.getPhase("i")).toBeUndefined();
+  });
+
+  it("authenticates a valid reviewFix marker and never falls through into Legacy phase/finding-resolution/approval handling when the seam classifies it 'stored' (AII-803)", async () => {
+    const fake = new FakeProvider({ recordCalls: true });
+    const token = preparedResultToken(validReviewFix.attemptId);
+    const onReviewFixResult = vi.fn(
+      (result: ReviewFixResultMetadataV1): ResultIntakeOutcome => ({ status: "stored", result }),
+    );
+    const stampApprovedSpy = vi.spyOn(log, "stampJobApproved");
+    const resolveByIdsSpy = vi.spyOn(reviewStore, "markReviewFindingsResolvedByIds");
+    const resolveSeenBeforeSpy = vi.spyOn(reviewStore, "markReviewFindingsResolvedForPrSeenBefore");
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "success",
         comments: [],
         prUrl: "https://github.com/o/r/pull/1",
         reviewFix: validReviewFix,
@@ -3786,8 +3880,12 @@ describe("handleRunnerResult — reviewFix pilot marker (AII-777)", () => {
     });
 
     expect(res.status).toBe(200);
-    expect(fake.getPhase("i")).toBe("pr_ready");
     expect(onReviewFixResult).toHaveBeenCalledWith(validReviewFix);
+    expect(fake.getPhase("i")).toBeUndefined();
+    expect(fake.recordedCalls()).toEqual([]);
+    expect(stampApprovedSpy).not.toHaveBeenCalled();
+    expect(resolveByIdsSpy).not.toHaveBeenCalled();
+    expect(resolveSeenBeforeSpy).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -3795,16 +3893,10 @@ describe("handleRunnerResult — reviewFix pilot marker (AII-777)", () => {
     { status: "conflict", expectedHttp: 409 },
     { status: "stale", expectedHttp: 410 },
   ] as const)(
-    "maps a '$status' classification to HTTP $expectedHttp with no token consumption and no provider calls",
+    "maps a '$status' classification to HTTP $expectedHttp with no provider calls, and leaves the prepared credential reusable",
     async ({ status, expectedHttp }) => {
       const fake = new FakeProvider({ recordCalls: true });
-      const { token } = runnerTokens.mintRunToken({
-        issueId: "i",
-        mappingTeamKey: "ENG",
-        phase: "implementation",
-        ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
-        secret: SECRET,
-      });
+      const token = preparedResultToken(validReviewFix.attemptId);
       const outcome: ResultIntakeOutcome =
         status === "duplicate"
           ? { status: "duplicate", attemptId: validReviewFix.attemptId }
@@ -3831,20 +3923,29 @@ describe("handleRunnerResult — reviewFix pilot marker (AII-777)", () => {
       expect(fake.recordedCalls()).toEqual([]);
       expect(fake.getPhase("i")).toBeUndefined();
 
-      // The token must still be unconsumed — a fresh (reviewFix-free) call with
-      // the same token succeeds.
+      // Prepared "result" credentials are never single-use — a lost-ACK retry with
+      // the identical body and the SAME token authenticates again.
       const replay = await runnerCallback.handleRunnerResult({
         authorization: `Bearer ${token}`,
-        body: { phase: "implementation", outcome: "success", comments: [], prUrl: "https://github.com/o/r/pull/1" },
+        body: {
+          phase: "implementation",
+          outcome: "success",
+          comments: [{ body: "should not be posted" }],
+          prUrl: "https://github.com/o/r/pull/1",
+          reviewFix: validReviewFix,
+        },
         secret: SECRET,
         resolveProvider: makeResolve(fake),
+        onReviewFixResult,
       });
-      expect(replay.status).toBe(200);
+      expect(replay.status).toBe(expectedHttp);
+      expect(replay.body.outcome).toBe(status);
     },
   );
 
-  it("reposting the same attemptId + evidence through the injectable seam classifies identically both times (idempotent)", async () => {
+  it("reposting the same attemptId + evidence through the injectable seam classifies identically both times (idempotent) — a lost-ACK retry returns the stored result and cannot duplicate approval", async () => {
     const fake = new FakeProvider({ recordCalls: true });
+    const stampApprovedSpy = vi.spyOn(log, "stampJobApproved");
     const seenAttempts = new Set<string>();
     const onReviewFixResult = (result: ReviewFixResultMetadataV1): ResultIntakeOutcome => {
       if (seenAttempts.has(result.attemptId)) return { status: "duplicate", attemptId: result.attemptId };
@@ -3852,15 +3953,11 @@ describe("handleRunnerResult — reviewFix pilot marker (AII-777)", () => {
       return { status: "stored", result };
     };
 
-    const firstToken = runnerTokens.mintRunToken({
-      issueId: "i",
-      mappingTeamKey: "ENG",
-      phase: "implementation",
-      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
-      secret: SECRET,
-    }).token;
+    // Prepared "result" credentials are reusable, so the lost-ACK retry below
+    // presents the identical token, matching how a runner would actually retry.
+    const token = preparedResultToken(validReviewFix.attemptId);
     const first = await runnerCallback.handleRunnerResult({
-      authorization: `Bearer ${firstToken}`,
+      authorization: `Bearer ${token}`,
       body: {
         phase: "implementation",
         outcome: "success",
@@ -3873,18 +3970,12 @@ describe("handleRunnerResult — reviewFix pilot marker (AII-777)", () => {
       onReviewFixResult,
     });
     expect(first.status).toBe(200);
-    expect(fake.getPhase("i")).toBe("pr_ready");
+    expect(first.body.outcome).toBe("stored");
+    expect(fake.getPhase("i")).toBeUndefined();
     const callsAfterFirst = fake.recordedCalls().length;
 
-    const secondToken = runnerTokens.mintRunToken({
-      issueId: "i",
-      mappingTeamKey: "ENG",
-      phase: "implementation",
-      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
-      secret: SECRET,
-    }).token;
     const second = await runnerCallback.handleRunnerResult({
-      authorization: `Bearer ${secondToken}`,
+      authorization: `Bearer ${token}`,
       body: {
         phase: "implementation",
         outcome: "success",
@@ -3901,6 +3992,137 @@ describe("handleRunnerResult — reviewFix pilot marker (AII-777)", () => {
     expect(second.body.outcome).toBe("duplicate");
     // The retry classified as duplicate before any provider call — call count unchanged.
     expect(fake.recordedCalls().length).toBe(callsAfterFirst);
+    // Neither call ever approaches Legacy's approval side effect.
+    expect(stampApprovedSpy).not.toHaveBeenCalled();
+  });
+
+  it("forged repository/prNumber cannot store a result even with a genuine token for the attemptId (verified against stored authority, not the request body)", async () => {
+    const fake = new FakeProvider({ recordCalls: true });
+    const attemptStore = new (await import("../review-fix-attempt-store.js")).SqliteReviewFixAttemptStore();
+    const token = preparedResultToken("attempt-forged", { repository: "acme/widgets", prNumber: 42 });
+    const forged: ReviewFixResultMetadataV1 = { ...validReviewFix, attemptId: "attempt-forged", repository: "evil/repo" };
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: { phase: "implementation", outcome: "success", comments: [], prUrl: "https://github.com/o/r/pull/1", reviewFix: forged },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+      onReviewFixResult: (result) => attemptStore.recordResult(result.attemptId, result),
+    });
+
+    expect(res.status).toBe(410);
+    expect(res.body.outcome).toBe("stale");
+    const accepted = await attemptStore.getAcceptedResult("attempt-forged");
+    expect(accepted?.result).toBeNull();
+  });
+
+  it("does not acknowledge when the seam's durable persistence itself fails (DB failure), unlike a merely-unavailable delivery sidecar", async () => {
+    const fake = new FakeProvider({ recordCalls: true });
+    const token = preparedResultToken("attempt-db-failure");
+    const onReviewFixResult = vi.fn(async (): Promise<ResultIntakeOutcome> => {
+      throw new Error("sqlite disk I/O error");
+    });
+
+    await expect(
+      runnerCallback.handleRunnerResult({
+        authorization: `Bearer ${token}`,
+        body: {
+          phase: "implementation",
+          outcome: "success",
+          comments: [],
+          prUrl: "https://github.com/o/r/pull/1",
+          reviewFix: { ...validReviewFix, attemptId: "attempt-db-failure" },
+        },
+        secret: SECRET,
+        resolveProvider: makeResolve(fake),
+        onReviewFixResult,
+      }),
+    ).rejects.toThrow("sqlite disk I/O error");
+  });
+
+  it("ACKs 'stored' when the seam's durable write succeeds even though it also reports a simulated delivery-sidecar outage (best-effort, non-blocking)", async () => {
+    const fake = new FakeProvider({ recordCalls: true });
+    const token = preparedResultToken("attempt-sidecar-outage");
+    const onReviewFixResult = vi.fn(async (result: ReviewFixResultMetadataV1): Promise<ResultIntakeOutcome> => {
+      // Durable write succeeds; a simulated Restate delivery attempt reports
+      // "unavailable" internally (mirrors ReviewFixDeliveryFacade's degrade-to-
+      // unavailable contract) — this must never affect the ack.
+      return { status: "stored", result };
+    });
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "success",
+        comments: [],
+        prUrl: "https://github.com/o/r/pull/1",
+        reviewFix: { ...validReviewFix, attemptId: "attempt-sidecar-outage" },
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+      onReviewFixResult,
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ acknowledged: true, outcome: "stored" });
+  });
+
+  it("accepts a result reported before the launch response is bound (result-before-launch-response) via the real attempt store", async () => {
+    const fake = new FakeProvider({ recordCalls: true });
+    const attemptStore = new (await import("../review-fix-attempt-store.js")).SqliteReviewFixAttemptStore();
+    const attemptId = "attempt-result-before-launch";
+    const token = preparedResultToken(attemptId);
+    // No bindExecution call happened yet — the store's row has no github_run_id/attempt
+    // bound. recordResult must still accept a genuine, correctly-scoped result.
+    const result: ReviewFixResultMetadataV1 = { ...validReviewFix, attemptId };
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: { phase: "implementation", outcome: "success", comments: [], prUrl: "https://github.com/o/r/pull/1", reviewFix: result },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+      onReviewFixResult: (r) => attemptStore.recordResult(r.attemptId, r),
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body.outcome).toBe("stored");
+    const accepted = await attemptStore.getAcceptedResult(attemptId);
+    expect(accepted?.result?.outputCommit).toBe(result.outputCommit);
+  });
+
+  it("replay after a consumed Legacy token still 409s exactly as before — the pilot credential family never touches Legacy token state (version skew)", async () => {
+    const fake = new FakeProvider({ recordCalls: true });
+    const legacyToken = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    }).token;
+    const legacyBody = { phase: "implementation" as const, outcome: "success" as const, comments: [], prUrl: "https://github.com/o/r/pull/1" };
+
+    const first = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${legacyToken}`, body: legacyBody, secret: SECRET, resolveProvider: makeResolve(fake),
+    });
+    expect(first.status).toBe(200);
+
+    const replay = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${legacyToken}`, body: legacyBody, secret: SECRET, resolveProvider: makeResolve(fake),
+    });
+    expect(replay.status).toBe(409);
+    expect(replay.body.error).toBe("already_consumed");
+
+    // A pilot-marked message for an unrelated attempt, authenticated with its own
+    // prepared credential, is unaffected by the Legacy token's consumed state.
+    const pilotToken = preparedResultToken(validReviewFix.attemptId);
+    const pilotRes = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${pilotToken}`,
+      body: { ...legacyBody, reviewFix: validReviewFix },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+    });
+    expect(pilotRes.status).toBe(200);
   });
 });
 
@@ -3938,8 +4160,7 @@ describe("handleRunnerResult — cycle summary durable evidence (AII-801)", () =
 
   it("repairs missing cycle evidence on an identical duplicate result without replaying provider effects", async () => {
     const fake = new FakeProvider({ recordCalls: true });
-    const token = runnerTokens.mintRunToken({ issueId: "i", mappingTeamKey: "ENG", phase: "implementation",
-      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS, secret: SECRET }).token;
+    const token = preparedResultToken(validReviewFix.attemptId);
     let stored = false;
     const onReviewFixResult = (result: ReviewFixResultMetadataV1): ResultIntakeOutcome => {
       if (stored) return { status: "duplicate", attemptId: result.attemptId };
@@ -3963,13 +4184,17 @@ describe("handleRunnerResult — cycle summary durable evidence (AII-801)", () =
 
   async function postResult(body: Partial<RunnerCallbackModule.RunnerResultBody>) {
     const fake = new FakeProvider({ recordCalls: true });
-    const { token } = runnerTokens.mintRunToken({
-      issueId: "i",
-      mappingTeamKey: "ENG",
-      phase: "implementation",
-      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
-      secret: SECRET,
-    });
+    // A body carrying a reviewFix marker authenticates with its prepared "result"
+    // credential; a Legacy body (no marker) keeps using a plain run token.
+    const token = body.reviewFix
+      ? preparedResultToken((body.reviewFix as ReviewFixResultMetadataV1).attemptId)
+      : runnerTokens.mintRunToken({
+          issueId: "i",
+          mappingTeamKey: "ENG",
+          phase: "implementation",
+          ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+          secret: SECRET,
+        }).token;
     return runnerCallback.handleRunnerResult({
       authorization: `Bearer ${token}`,
       body: { phase: "implementation", outcome: "success", comments: [], prUrl: "https://github.com/o/r/pull/1", ...body },
@@ -4202,9 +4427,9 @@ describe("isRetryableStatus (AII-777)", () => {
   });
 });
 
-// ── AII-777: proposed /runner/activity intake (unwired) ────────────────────
+// ── AII-769/AII-803: POST /runner/activity intake ───────────────────────────
 
-describe("handleRunnerActivity (AII-777)", () => {
+describe("handleRunnerActivity (AII-777/AII-803)", () => {
   function activityEvent(overrides: Partial<Record<string, unknown>> = {}): Record<string, unknown> {
     return {
       version: 1,
@@ -4220,8 +4445,50 @@ describe("handleRunnerActivity (AII-777)", () => {
     };
   }
 
-  it("accepts a well-formed activity body with no seam, defaulting to 'accepted'", () => {
-    const res = runnerCallback.handleRunnerActivity({
+  it("returns 401 when the bearer is missing", async () => {
+    const res = await runnerCallback.handleRunnerActivity({
+      authorization: undefined,
+      secret: SECRET,
+      body: { version: 1, attemptId: "attempt-1", producerId: "producer-1", events: [activityEvent()] },
+    });
+    expect(res.status).toBe(401);
+    expect(res.body.error).toBe("missing_bearer");
+  });
+
+  it("returns 401 for a plain (non-prepared) token", async () => {
+    const legacy = runnerTokens.mintRunToken({
+      issueId: "i", mappingTeamKey: "ENG", phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS, secret: SECRET,
+    }).token;
+    const res = await runnerCallback.handleRunnerActivity({
+      authorization: `Bearer ${legacy}`,
+      secret: SECRET,
+      body: { version: 1, attemptId: "attempt-1", producerId: "producer-1", events: [activityEvent()] },
+    });
+    expect(res.status).toBe(401);
+  });
+
+  it("returns 401 when the body's attemptId does not match the authenticated (owner) attempt", async () => {
+    const token = preparedProgressToken("attempt-1");
+    const res = await runnerCallback.handleRunnerActivity({
+      authorization: `Bearer ${token}`,
+      secret: SECRET,
+      body: {
+        version: 1,
+        attemptId: "attempt-other",
+        producerId: "producer-1",
+        events: [activityEvent({ attemptId: "attempt-other" })],
+      },
+    });
+    expect(res.status).toBe(401);
+    expect(res.body.error).toBe("activity_wrong_attempt");
+  });
+
+  it("accepts a well-formed activity body authenticated with its prepared progress credential, defaulting to 'accepted' with no seam", async () => {
+    const token = preparedProgressToken("attempt-1");
+    const res = await runnerCallback.handleRunnerActivity({
+      authorization: `Bearer ${token}`,
+      secret: SECRET,
       body: {
         version: 1,
         attemptId: "attempt-1",
@@ -4235,8 +4502,11 @@ describe("handleRunnerActivity (AII-777)", () => {
     });
   });
 
-  it("accepts a body with a finalSequence at or beyond the last event's sequence", () => {
-    const res = runnerCallback.handleRunnerActivity({
+  it("accepts a body with a finalSequence at or beyond the last event's sequence", async () => {
+    const token = preparedProgressToken("attempt-1");
+    const res = await runnerCallback.handleRunnerActivity({
+      authorization: `Bearer ${token}`,
+      secret: SECRET,
       body: {
         version: 1,
         attemptId: "attempt-1",
@@ -4248,46 +4518,62 @@ describe("handleRunnerActivity (AII-777)", () => {
     expect(res.status).toBe(200);
   });
 
-  it("rejects a non-object body", () => {
-    const res = runnerCallback.handleRunnerActivity({ body: "nope" });
+  it("rejects a non-object body", async () => {
+    const token = preparedProgressToken("attempt-1");
+    const res = await runnerCallback.handleRunnerActivity({ authorization: `Bearer ${token}`, secret: SECRET, body: "nope" });
     expect(res.status).toBe(400);
     expect(res.body.error).toBe("invalid_activity_body");
   });
 
-  it("rejects an unsupported version with a distinct code", () => {
-    const res = runnerCallback.handleRunnerActivity({
+  it("rejects an unsupported version with a distinct code", async () => {
+    const token = preparedProgressToken("attempt-1");
+    const res = await runnerCallback.handleRunnerActivity({
+      authorization: `Bearer ${token}`,
+      secret: SECRET,
       body: { version: 2, attemptId: "attempt-1", producerId: "producer-1", events: [] },
     });
     expect(res.status).toBe(400);
     expect(res.body.error).toBe("invalid_activity_version");
   });
 
-  it("rejects a malformed attemptId", () => {
-    const res = runnerCallback.handleRunnerActivity({
+  it("rejects a malformed attemptId", async () => {
+    const token = preparedProgressToken("attempt-1");
+    const res = await runnerCallback.handleRunnerActivity({
+      authorization: `Bearer ${token}`,
+      secret: SECRET,
       body: { version: 1, attemptId: "not an id!", producerId: "producer-1", events: [] },
     });
     expect(res.status).toBe(400);
     expect(res.body.error).toBe("invalid_activity_attempt_id");
   });
 
-  it("rejects an empty producerId", () => {
-    const res = runnerCallback.handleRunnerActivity({
+  it("rejects an empty producerId", async () => {
+    const token = preparedProgressToken("attempt-1");
+    const res = await runnerCallback.handleRunnerActivity({
+      authorization: `Bearer ${token}`,
+      secret: SECRET,
       body: { version: 1, attemptId: "attempt-1", producerId: "", events: [] },
     });
     expect(res.status).toBe(400);
     expect(res.body.error).toBe("invalid_activity_producer_id");
   });
 
-  it("rejects a non-array events field", () => {
-    const res = runnerCallback.handleRunnerActivity({
+  it("rejects a non-array events field", async () => {
+    const token = preparedProgressToken("attempt-1");
+    const res = await runnerCallback.handleRunnerActivity({
+      authorization: `Bearer ${token}`,
+      secret: SECRET,
       body: { version: 1, attemptId: "attempt-1", producerId: "producer-1", events: "nope" },
     });
     expect(res.status).toBe(400);
     expect(res.body.error).toBe("invalid_activity_events");
   });
 
-  it("rejects an event whose attemptId does not match the batch's attemptId", () => {
-    const res = runnerCallback.handleRunnerActivity({
+  it("rejects an event whose attemptId does not match the batch's attemptId", async () => {
+    const token = preparedProgressToken("attempt-1");
+    const res = await runnerCallback.handleRunnerActivity({
+      authorization: `Bearer ${token}`,
+      secret: SECRET,
       body: {
         version: 1,
         attemptId: "attempt-1",
@@ -4299,8 +4585,11 @@ describe("handleRunnerActivity (AII-777)", () => {
     expect(res.body.error).toBe("invalid_activity_event");
   });
 
-  it("rejects events out of increasing sequence order", () => {
-    const res = runnerCallback.handleRunnerActivity({
+  it("rejects events out of increasing sequence order", async () => {
+    const token = preparedProgressToken("attempt-1");
+    const res = await runnerCallback.handleRunnerActivity({
+      authorization: `Bearer ${token}`,
+      secret: SECRET,
       body: {
         version: 1,
         attemptId: "attempt-1",
@@ -4312,8 +4601,11 @@ describe("handleRunnerActivity (AII-777)", () => {
     expect(res.body.error).toBe("invalid_activity_event");
   });
 
-  it("rejects a finalSequence lower than the last event's sequence", () => {
-    const res = runnerCallback.handleRunnerActivity({
+  it("rejects a finalSequence lower than the last event's sequence", async () => {
+    const token = preparedProgressToken("attempt-1");
+    const res = await runnerCallback.handleRunnerActivity({
+      authorization: `Bearer ${token}`,
+      secret: SECRET,
       body: {
         version: 1,
         attemptId: "attempt-1",
@@ -4330,7 +4622,8 @@ describe("handleRunnerActivity (AII-777)", () => {
     { status: "duplicate", expectedHttp: 200 },
     { status: "conflict", expectedHttp: 409 },
     { status: "stale", expectedHttp: 410 },
-  ] as const)("maps a seam '$status' classification to HTTP $expectedHttp, non-retryable", ({ status, expectedHttp }) => {
+  ] as const)("maps a seam '$status' classification to HTTP $expectedHttp, non-retryable", async ({ status, expectedHttp }) => {
+    const token = preparedProgressToken("attempt-1");
     const onReviewFixActivity = vi.fn(
       () =>
         (status === "duplicate"
@@ -4338,7 +4631,9 @@ describe("handleRunnerActivity (AII-777)", () => {
           : { status, attemptId: "attempt-1", reason: `already ${status}` }) as RunnerCallbackModule.ActivityIntakeOutcome,
     );
 
-    const res = runnerCallback.handleRunnerActivity({
+    const res = await runnerCallback.handleRunnerActivity({
+      authorization: `Bearer ${token}`,
+      secret: SECRET,
       body: {
         version: 1,
         attemptId: "attempt-1",
@@ -4352,5 +4647,39 @@ describe("handleRunnerActivity (AII-777)", () => {
     expect(res.body.outcome).toBe(status);
     expect(res.body.retryable).toBe(false);
     expect(onReviewFixActivity).toHaveBeenCalledOnce();
+  });
+
+  it("real store integration: batches are acknowledged only after SQLite commits, and a conflicting payload at the same identity is rejected and alerted", async () => {
+    const token = preparedProgressToken("attempt-activity-real");
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const onReviewFixActivity = (batch: RunnerCallbackModule.RunnerActivityBody): RunnerCallbackModule.ActivityIntakeOutcome => {
+      const { appendReviewFixActivityBatch } = reviewFixEvidence;
+      const result = appendReviewFixActivityBatch({
+        attemptId: batch.attemptId, producerId: batch.producerId, events: batch.events, finalSequence: batch.finalSequence,
+      });
+      if (result.conflicts.length > 0) {
+        console.error(`conflicting activity payload attempt=${batch.attemptId} sequences=${result.conflicts.join(",")}`);
+        return { status: "conflict", attemptId: batch.attemptId, reason: "conflict" };
+      }
+      if (result.stored === 0 && result.duplicates > 0) return { status: "duplicate", attemptId: batch.attemptId };
+      return { status: "accepted", attemptId: batch.attemptId };
+    };
+    const body = {
+      version: 1 as const,
+      attemptId: "attempt-activity-real",
+      producerId: "producer-1",
+      events: [activityEvent({ attemptId: "attempt-activity-real" })],
+    };
+
+    const first = await runnerCallback.handleRunnerActivity({ authorization: `Bearer ${token}`, secret: SECRET, body, onReviewFixActivity });
+    expect(first.status).toBe(200);
+    expect(first.body.outcome).toBe("accepted");
+    expect(reviewFixEvidence.listReviewFixActivity("attempt-activity-real", { pageSize: 10 }).events).toHaveLength(1);
+
+    const conflicting = { ...body, events: [activityEvent({ attemptId: "attempt-activity-real", payload: "a different thing" })] };
+    const second = await runnerCallback.handleRunnerActivity({ authorization: `Bearer ${token}`, secret: SECRET, body: conflicting, onReviewFixActivity });
+    expect(second.status).toBe(409);
+    expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("conflicting activity payload"));
+    errorSpy.mockRestore();
   });
 });
