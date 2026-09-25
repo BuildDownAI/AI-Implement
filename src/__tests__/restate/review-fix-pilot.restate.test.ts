@@ -938,6 +938,57 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     expect(admission.released_at).not.toBeNull();
   }, 25_000);
 
+  it("a lost cancellation acknowledgement and endpoint restart retain occupancy until the exact run stops", async () => {
+    const fixture = freshScenario("cancel-lost-ack");
+    const acceptedCancel = fixture.cancelImpl;
+    fixture.cancelImpl = crashAfterFirstCall(
+      (input: Parameters<ReviewFixWorkerTransport["cancelRun"]>[0]) => acceptedCancel(input),
+    );
+    const env = await startRetryEnabled([pr, attemptWorkflow]);
+    let replacement: Awaited<ReturnType<typeof replaceEndpoint>> | undefined;
+    try {
+      await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
+      await until(() => fixture.runId !== null, 8_000);
+      const attemptId = fixture.attemptId!;
+      await callWorkflow(env.baseUrl(), "ReviewFixAttempt", attemptId, "cancel", { attemptId });
+      await until(() => fixture.cancelCalls > 0, 5_000);
+
+      const state = getDb().prepare(`SELECT authority_revoked_at, terminal_outcome_json
+        FROM review_fix_attempts WHERE attempt_id = ?`).get(attemptId) as
+        { authority_revoked_at: number | null; terminal_outcome_json: string | null };
+      expect(state.authority_revoked_at).not.toBeNull();
+      expect(state.terminal_outcome_json).toBeNull();
+      let admission = getDb().prepare(`SELECT released_at FROM dispatch_admissions WHERE dispatch_id = ?`)
+        .get(attemptId) as { released_at: number | null };
+      expect(admission.released_at).toBeNull();
+      expect(fixture.commentPosts).toBe(0);
+
+      replacement = await replaceEndpoint(env, [pr, attemptWorkflow]);
+      await env.startedRestateContainer.restart();
+      await until(() => fixture.cancelCalls > 1, 10_000);
+      admission = getDb().prepare(`SELECT released_at FROM dispatch_admissions WHERE dispatch_id = ?`)
+        .get(attemptId) as { released_at: number | null };
+      expect(admission.released_at).toBeNull();
+      expect(fixture.dispatchCalls).toBe(1);
+
+      fixture.runDetail = { status: "completed", conclusion: "cancelled", runAttempt: fixture.runAttempt };
+      const done = await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", attemptId);
+      expect(done).toMatchObject({ status: "finalized", approval: "not_applicable" });
+      admission = getDb().prepare(`SELECT released_at FROM dispatch_admissions WHERE dispatch_id = ?`)
+        .get(attemptId) as { released_at: number | null };
+      expect(admission.released_at).not.toBeNull();
+      expect(fixture.dispatchCalls).toBe(1);
+      expect(fixture.commentPosts).toBe(0);
+      const attempts = getDb().prepare(`SELECT COUNT(*) AS n FROM review_fix_attempts
+        WHERE repository = ? AND pr_number = ?`)
+        .get(fixture.scope.repository, fixture.scope.prNumber) as { n: number };
+      expect(attempts.n).toBe(1);
+    } finally {
+      replacement?.close();
+      await env.stop();
+    }
+  }, 60_000);
+
   it.each(VARIANTS.map(([label]) => label))("a closed PR blocks further automatic admission once it is unoccupied, specifically because load() reports it closed (%s)", async (label) => {
     const env = envFor(label);
     const fixture = freshScenario("closed-pr");
