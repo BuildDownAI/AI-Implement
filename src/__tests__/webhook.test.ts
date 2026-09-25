@@ -252,6 +252,26 @@ describe("event filtering", () => {
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body).ignored).toBe(true);
   });
+
+  it("queues a pilot cancellation before acknowledging an authenticated PR close", async () => {
+    const onClosed = vi.fn(async () => undefined);
+    const payload = { action: "closed", pull_request: { number: 5, merged: false },
+      repository: { full_name: "org/repo" } };
+    const valid = makeRequest(SECRET, "pull_request", payload);
+    webhook.handleGitHubWebhook(valid.req as never, valid.res as never, SECRET,
+      undefined, undefined, undefined, undefined, onClosed);
+    await valid.res.done;
+    expect(valid.res.statusCode).toBe(200);
+    expect(onClosed).toHaveBeenCalledWith("org/repo", 5);
+
+    onClosed.mockClear();
+    const invalid = makeRequest(SECRET, "pull_request", payload, "wrong-secret");
+    webhook.handleGitHubWebhook(invalid.req as never, invalid.res as never, SECRET,
+      undefined, undefined, undefined, undefined, onClosed);
+    await invalid.res.done;
+    expect(invalid.res.statusCode).toBe(401);
+    expect(onClosed).not.toHaveBeenCalled();
+  });
 });
 
 // ---------- Non-AI PR matching ----------

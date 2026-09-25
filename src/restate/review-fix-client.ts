@@ -301,7 +301,8 @@ export class ReviewFixDeliveryPump {
     let unavailable = 0;
     try {
       const now = this.now();
-      const claimed = this.claim({ limit: this.batchLimit, leaseMs: this.leaseMs, now, completionOnly: !this.permitsNewFeedback() });
+      const claimed = this.claim({ limit: this.batchLimit, leaseMs: this.leaseMs, now,
+        completionOnly: !this.permitsNewFeedback(), routableOnly: true });
       for (const delivery of claimed) {
         if (this.paused || this.stopGeneration !== stopGenerationAtStart) break;
         // The hold may begin after the batch was claimed. Do not start a new

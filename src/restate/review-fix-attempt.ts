@@ -23,6 +23,7 @@ import {
   type ReviewFixFindingDisposition,
   type ReviewFixWorkerPort,
 } from "../review-fix-ports.js";
+import { reviewFixPRKey } from "./review-fix-pr.js";
 
 export const REVIEW_FIX_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const INSPECTION_INTERVAL_MS = 1_000;
@@ -42,6 +43,9 @@ export interface ReviewFixAttemptDependencies {
   finalizer: ReviewFixFinalizerPort;
   loadApprovalEvidence(attempt: PreparedReviewFixAttempt, result: ReviewFixResultMetadataV1): Promise<ReviewFixApprovalEvidence>;
   alert?(attemptId: AttemptId, reason: string): Promise<void>;
+  /** Production composition registers ReviewFixPR beside this workflow. Keep
+   * disabled for isolated workflow tests that register only ReviewFixAttempt. */
+  notifyPrOnCompletion?: boolean;
 }
 
 type Wake =
@@ -84,7 +88,7 @@ export function createReviewFixAttempt(deps: ReviewFixAttemptDependencies) {
     });
   }
 
-  async function run(ctx: WorkflowContext, input: { attemptId: string }): Promise<ReviewFixAttemptCompletion> {
+  async function runAttempt(ctx: WorkflowContext, input: { attemptId: string }): Promise<{ completion: ReviewFixAttemptCompletion; scope: PreparedReviewFixAttempt["scope"] }> {
     const attemptId = validKey(ctx.key, input?.attemptId);
     const attempt = await ctx.run("load-prepared-attempt", () => store.getPreparedAttempt(attemptId));
     if (!attempt || attempt.attemptId !== attemptId || attempt.owner !== attemptId) {
@@ -93,14 +97,20 @@ export function createReviewFixAttempt(deps: ReviewFixAttemptDependencies) {
 
     if (await ctx.date.now() >= attempt.deadlineAt) {
       await ctx.run("revoke-expired-before-launch", () => store.revokeAuthority(attemptId));
+      await ctx.run("record-expired-before-launch", () => finalizer.recordOutcome({
+        attemptId, scope: attempt.scope, terminal: { status: "cancelled" },
+      }));
       await ctx.run("release-expired-before-launch", () => store.releaseOwner(attempt.owner, "deadline_exceeded"));
-      return { status: "deadline_before_launch" };
+      return { completion: { status: "deadline_before_launch" }, scope: attempt.scope };
     }
 
     // A cancellation or conflicting early result can revoke authority before run starts.
     if (!await ctx.run("check-prelaunch-authority", () => store.hasCurrentAuthority(attemptId))) {
+      await ctx.run("record-cancelled-before-launch", () => finalizer.recordOutcome({
+        attemptId, scope: attempt.scope, terminal: { status: "cancelled" },
+      }));
       await ctx.run("release-before-launch", () => store.releaseOwner(attempt.owner, "cancelled"));
-      return { status: "not_owner" };
+      return { completion: { status: "not_owner" }, scope: attempt.scope };
     }
 
     const plan = await worker.prepare(attempt); // pure, deterministic adapter obligation
@@ -130,7 +140,7 @@ export function createReviewFixAttempt(deps: ReviewFixAttemptDependencies) {
         attemptId, scope: attempt.scope, terminal: { status: "failed", reason: launch.reason },
       }));
       await ctx.run("release-rejected-launch", () => store.releaseOwner(attempt.owner, "launch_rejected"));
-      return { status: "launch_rejected" };
+      return { completion: { status: "launch_rejected" }, scope: attempt.scope };
     }
 
     let execution: WorkerExecutionIdentity;
@@ -161,7 +171,7 @@ export function createReviewFixAttempt(deps: ReviewFixAttemptDependencies) {
     }
 
     const bound = await ctx.run("bind-exact-execution", () => store.bindExecution(attemptId, execution));
-    if (bound.status === "not_owner") return { status: "not_owner" };
+    if (bound.status === "not_owner") return { completion: { status: "not_owner" }, scope: attempt.scope };
     if (bound.status === "already_bound" && !sameExecution(bound.execution, execution)) {
       await ctx.run("revoke-conflicting-execution", () => store.revokeAuthority(attemptId));
       await alert(ctx, attemptId, "different execution already bound; occupancy retained", "alert-conflicting-execution");
@@ -244,7 +254,20 @@ export function createReviewFixAttempt(deps: ReviewFixAttemptDependencies) {
     await ctx.run("release-confirmed-terminal", () => store.releaseOwner(
       attempt.owner, cancelled ? "cancelled" : "finalized",
     ));
-    return { status: "finalized", terminal, approval };
+    return { completion: { status: "finalized", terminal, approval }, scope: attempt.scope };
+  }
+
+  async function run(ctx: WorkflowContext, input: { attemptId: string }): Promise<ReviewFixAttemptCompletion> {
+    const { completion, scope } = await runAttempt(ctx, input);
+    if (deps.notifyPrOnCompletion) {
+      // The durable send is recorded after the terminal business state. A
+      // replay cannot clear a successor: ReviewFixPR.completed compares IDs.
+      ctx.genericSend({
+        service: "ReviewFixPR", method: "completed", key: reviewFixPRKey(scope),
+        parameter: { attemptId: input.attemptId }, inputSerde: restate.serde.json,
+      });
+    }
+    return completion;
   }
 
   async function result(ctx: WorkflowSharedContext, raw: unknown): Promise<ResultIntakeOutcome> {
@@ -255,9 +278,13 @@ export function createReviewFixAttempt(deps: ReviewFixAttemptDependencies) {
     if (!checked.ok) throw new restate.TerminalError("invalid review-fix result metadata");
     const attemptId = validKey(ctx.key, checked.value.attemptId);
     const outcome = await ctx.run("store-result", () => store.recordResult(attemptId, checked.value));
-    if (outcome.status === "stored") {
+    if (outcome.status === "stored" || outcome.status === "duplicate") {
+      // The authenticated HTTP callback commits the result before its durable
+      // inbox delivers this signal. Delivery therefore normally sees a
+      // byte-identical duplicate, not a fresh store write. It must still wake
+      // the workflow; recordResult only returns duplicate for that same body.
       const wake = ctx.promise<Wake>("wake");
-      if (await wake.peek() === undefined) await wake.resolve({ kind: "result", result: outcome.result });
+      if (await wake.peek() === undefined) await wake.resolve({ kind: "result", result: outcome.status === "stored" ? outcome.result : checked.value });
     } else if (outcome.status === "conflict") {
       await ctx.run("revoke-conflicting-result", () => store.revokeAuthority(attemptId));
       const cancellation = ctx.promise<boolean>("cancel");

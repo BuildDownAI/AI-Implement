@@ -554,7 +554,7 @@ describe("sweepStaleAdmissions", () => {
     }
   });
 
-  it("passes the candidate's backend and lifecycle owner to the confirmation callback", async () => {
+  it("never offers a Restate-owned reservation to the Legacy stale sweep", async () => {
     vi.useFakeTimers();
     try {
       vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
@@ -567,15 +567,8 @@ describe("sweepStaleAdmissions", () => {
         return true;
       });
 
-      expect(seen).toEqual([
-        expect.objectContaining({
-          dispatchId: "restate-owned",
-          mappingKey: "AII",
-          backend: "fly-machines",
-          lifecycleOwner: RESTATE_A,
-          ageMs: expect.any(Number),
-        }),
-      ]);
+      expect(seen).toEqual([]);
+      expect(admission.read("restate-owned")?.releasedAt).toBeNull();
     } finally {
       vi.useRealTimers();
     }

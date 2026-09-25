@@ -7,6 +7,7 @@ import {
   getMappings,
   initMappingsTable,
   resolvePrDispatchBudget,
+  resolveReviewFixLifecycle,
 } from "./config.js";
 import type { RepoMapping } from "./config.js";
 import { markDispatched, closeDb, getDispatchedIds, deleteDispatched } from "./dedup.js";
@@ -72,7 +73,10 @@ import { CYCLE_SUMMARY_MAX_BYTES } from "./pipeline/cycle-summary.js";
 import type { RunnerProgressBody, RunnerResultBody, RunnerActivityBody, ActivityIntakeOutcome } from "./runner-callback.js";
 import { mintRunToken, PLANNING_TTL_SECONDS, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
 import { SqliteReviewFixAttemptStore } from "./review-fix-attempt-store.js";
-import { acceptDelivery as acceptReviewFixDelivery } from "./restate/review-fix-client.js";
+import { createReviewFixAdminFacade } from "./review-fix-admin-facade.js";
+import { GithubReviewFixWorker, createGithubAppCredentialResolver, reviewFixAttemptStoreScopeStore } from "./review-fix-worker.js";
+import { listActiveRestateReviewFixPrs, queueReviewFixCancellationForClosedPr } from "./review-fix-close.js";
+import { acceptDelivery as acceptReviewFixDelivery, ReviewFixDeliveryPump } from "./restate/review-fix-client.js";
 import { appendReviewFixActivityBatch, isReviewFixEvidenceTombstoned } from "./review-fix-evidence.js";
 import type { ReviewFixResultMetadataV1, ResultIntakeOutcome } from "./review-fix-contract.js";
 import { handleMcpRequest } from "./mcp.js";
@@ -104,7 +108,7 @@ import { resolveBaseBranch, findOpenRollUpPr } from "./feature-branch.js";
 import { validateIssueBaseBranch, postBranchComment } from "./base-branch.js";
 import { runMergeUps, clearRollUpHandledMarkersByIdentifier } from "./merge-up.js";
 import { runGroupingBranchAutoMerge } from "./auto-merge.js";
-import { getPendingReviewFixes, recordReviewFixDispatch, updateReviewFixStatus, shouldSkipReviewFix, acceptReviewFixWebhookEvent, buildReviewFixTaskDescription, MAX_TASK_FINDINGS } from "./review-fix-queue.js";
+import { getPendingReviewFixes, listReviewFixEvents, recordReviewFixDispatch, updateReviewFixStatus, shouldSkipReviewFix, acceptReviewFixWebhookEvent, buildReviewFixTaskDescription, MAX_TASK_FINDINGS } from "./review-fix-queue.js";
 import { initReviewFixEvidenceTable, sweepExpiredReviewFixEvidence } from "./review-fix-evidence.js";
 import { drainCommentGapfillQueue } from "./comment-gapfill-drain.js";
 import { sweepOrphanedGapfillRows } from "./comment-gapfill-queue.js";
@@ -114,7 +118,8 @@ import { detectMergedPrs, prNumberFromUrl } from "./poll-merged-prs.js";
 import { githubActionsWatchdogDecision, jobTtlDecision } from "./github-actions-watchdog.js";
 import { KgSidecar } from "./kg-sidecar.js";
 import { RestateSidecar } from "./restate/server.js";
-import { startRestateEndpoint, register as registerRestateEndpoint } from "./restate/endpoint.js";
+import { startRestateEndpoint, register as registerRestateEndpoint, RESTATE_SERVICES } from "./restate/endpoint.js";
+import { createProductionReviewFixServices } from "./restate/review-fix-production.js";
 import type { RestateRegisterOutcome, RestateRegisterResult } from "./restate/endpoint.js";
 import { getRestateStatus, setRestateStatus } from "./restate/status.js";
 import type { RestateRegistrationStatus } from "./restate/status.js";
@@ -854,6 +859,23 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
 
   // Process any pending reconciliation jobs triggered by merged PRs
   await processReconciliations(config, registry);
+
+  // Recover a missed close webhook for an active Restate owner. Cancellation
+  // remains durable during deploy hold; unknown GitHub state leaves authority
+  // and capacity untouched until a later observation can confirm closure.
+  for (const active of listActiveRestateReviewFixPrs()) {
+    const [owner, repo] = active.repository.split("/");
+    if (!owner || !repo) continue;
+    try {
+      const token = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
+      const state = await getPullRequestState(token, owner, repo, active.prNumber);
+      if (state && shouldSkipReviewFix(state)) {
+        queueReviewFixCancellationForClosedPr(active.repository, active.prNumber);
+      }
+    } catch (err) {
+      console.warn(`[review-fix] Could not reconcile PR closure for ${active.repository}#${active.prNumber}:`, err);
+    }
+  }
 
   // Both of these launch runner jobs, so they pause with issue dispatch —
   // otherwise the hold would block on work it is itself still creating.
@@ -3710,6 +3732,42 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
 
       const [scopeKey, mapping] = mappingEntry;
       const runnerMode = getRunnerMode().mode;
+      const selectedExecutionPath = resolveExecutionPath(runnerMode, mapping.executionMode);
+      if (resolveReviewFixLifecycle(mapping) === "restate" && selectedExecutionPath !== "local-docker") {
+        if (selectedExecutionPath !== "github-actions") {
+          console.warn(`[review-fix] Restate pilot runner mode unavailable for ${fix.repo}; keeping #${fix.id} pending`);
+          continue;
+        }
+        if (mapping.paused || !config.runnerCallbackBaseUrl || !config.runnerTokenSecret) continue;
+        const restate = getRestateStatus();
+        if (restate.sidecar.state !== "ready" || restate.registration.state !== "registered") continue;
+        try {
+          const token = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
+          const prState = await getPullRequestState(token, mapping.owner, mapping.repo, fix.prNumber);
+          if (!prState) continue;
+          if (shouldSkipReviewFix(prState)) {
+            updateReviewFixStatus(fix.id, "skipped");
+            continue;
+          }
+          const installationId = await getInstallationId(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
+          const lastEvent = listReviewFixEvents(fix.id).at(-1);
+          if (!lastEvent) continue;
+          // Periodic, identity-stable nudges repair a missed signal or a project
+          // toggled away from and back to Restate while the same queue row waits.
+          // ReviewFixPR's existing wake never extends its first 5-second window.
+          const delivery = acceptReviewFixDelivery({
+            authenticatedSource: "review-fix-queue",
+            deliveryId: `${fix.id}.${lastEvent.id}.${Math.floor(Date.now() / 30_000)}`,
+            kind: "feedback",
+            destination: { installationId, repository: fix.repo, prNumber: fix.prNumber },
+            payload: {},
+          });
+          if (delivery.status !== "accepted") console.error(`[review-fix] Could not queue Restate feedback for #${fix.id}: ${delivery.status}`);
+        } catch (err) {
+          console.warn(`[review-fix] Could not signal Restate feedback for #${fix.id}; keeping pending:`, err);
+        }
+        continue;
+      }
       if (mapping.ticketingProvider === "filesystem" && runnerMode !== "local") {
         console.warn(`[review-fix] Filesystem project ${scopeKey} requires local runner mode`);
         updateReviewFixStatus(fix.id, "skipped");
@@ -4455,6 +4513,10 @@ function startServer(
   memoryProviderDiagnostic: string | null,
 ): http.Server {
   const startDeploy = makeStartDeploy({ ...config, onBuildFailure: onDeployBuildFailure });
+  const reviewFixAttempts = createReviewFixAdminFacade(reviewFixAttemptStore, new GithubReviewFixWorker({
+    credentials: createGithubAppCredentialResolver(config.githubAppId, config.githubAppPrivateKey),
+    scopeStore: reviewFixAttemptStoreScopeStore(reviewFixAttemptStore),
+  }));
   const kgRefresh: KgRefreshHandle = makeKgRefresh({
     sidecar,
     githubAppId: config.githubAppId,
@@ -4741,7 +4803,7 @@ function startServer(
         reportDryRun: (report) => kgRefresh.reportDryRun(report),
         onRefreshSettled: (cb) => kgRefresh.onRefreshSettled(cb),
         forgetKgPr: (repo, prNumber) => kgRefresh.forgetPr(repo, prNumber),
-      }).catch((err) => {
+      }, (repository, prNumber) => { queueReviewFixCancellationForClosedPr(repository, prNumber); }).catch((err) => {
         console.error("[webhook] Unhandled error:", err);
         if (!res.headersSent) {
           res.writeHead(500, { "Content-Type": "application/json" });
@@ -5115,7 +5177,8 @@ function startServer(
           return { started: getPollStats().pollCount > before };
         },
         notifyWebhookUrl: config.notifyWebhookUrl,
-      }, registry, { startDeploy, selfDeployTarget: config.selfDeployTarget, kgRefresh, callTool, getRestateStatus })) return;
+      }, registry, { startDeploy, selfDeployTarget: config.selfDeployTarget, kgRefresh, callTool, getRestateStatus,
+        reviewFixAttempts })) return;
     }
 
     res.writeHead(404, { "Content-Type": "application/json" });
@@ -5286,15 +5349,7 @@ async function main(): Promise<void> {
   // logs one warning and boot continues; the kg-refresh trigger seam (AII-683) answers 503
   // restate-unavailable while no successful registration has completed.
   const restateSidecar = new RestateSidecar();
-  const restateRegistration = createRestateRegistrationGate(() => shuttingDown);
   await restateSidecar.start();
-  // Driven off whenReady() rather than start()'s own return value so a sidecar that only
-  // becomes ready later, in the background (AII-724's late readiness past the initial
-  // timeout), still gets its endpoint started and registered — the gate's latch keeps this
-  // single-shot regardless of whether whenReady() settles now or after the await above.
-  void restateSidecar.whenReady().then((ready) => {
-    if (ready) void restateRegistration.attempt();
-  });
 
   const config = loadConfig();
   if (!config.kgSourceRepo) console.log("[kg] KG_SOURCE_REPO not set — knowledge graph disabled");
@@ -5328,6 +5383,22 @@ async function main(): Promise<void> {
   // The add_project Restate handler (src/restate/tools.ts) must invalidate this registry, not
   // a private one, when a mapping changes (AII-713).
   setProviderRegistry(registry);
+
+  // Compose the production adapters after configuration and provider setup. The
+  // services are registered even with every mapping on the Legacy default;
+  // selecting Restate later only changes ownership of *new* automatic GHA work.
+  const reviewFixServices = createProductionReviewFixServices(config, registry, reviewFixAttemptStore);
+  const restateRegistration = createRestateRegistrationGate(() => shuttingDown, {
+    startRestateEndpoint: () => startRestateEndpoint([...RESTATE_SERVICES, ...reviewFixServices]),
+    registerRestateEndpoint,
+  });
+  // A sidecar which becomes ready after its initial timeout still registers the
+  // same fully composed service set; the gate starts the endpoint only once.
+  void restateSidecar.whenReady().then((ready) => {
+    if (ready) void restateRegistration.attempt();
+  });
+  const reviewFixPump = new ReviewFixDeliveryPump();
+  reviewFixPump.start();
 
   const teamRepoMap = getMappings();
 
@@ -5402,6 +5473,7 @@ async function main(): Promise<void> {
     console.log(`[main] Received ${signal}, shutting down...`);
     clearInterval(interval);
     restateRegistration.stopRetrying();
+    reviewFixPump.stop();
 
     // forced exit armed before any awaiting, so shutdowns aren't dependent on notifications settling
     setTimeout(() => {

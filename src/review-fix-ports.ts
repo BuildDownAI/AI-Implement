@@ -90,6 +90,9 @@ export interface ReviewFixFindingVersion {
 export interface ReviewFixPendingFeedback {
   readonly taskText: string;
   readonly findings: readonly ReviewFixFindingVersion[];
+  /** Durable queue high-water mark captured with this task. Production admission
+   * consumes only through this event; later arrivals remain pending. */
+  readonly queueCursor?: { readonly queueId: number; readonly eventId: number };
 }
 
 /**

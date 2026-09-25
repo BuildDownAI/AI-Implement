@@ -57,6 +57,7 @@ import type { TicketIssue, AIImplementSnapshot } from "./providers/types.js";
 import type { ProviderRegistry } from "./providers/registry.js";
 import { resolveInFlightSiblings, selectBlockers, selectFileOverlapDeferrals, getOrFetchPlanningContexts } from "./poll-selection.js";
 import { count as countReservedCapacity } from "./dispatch-admission.js";
+import { read as readDispatchAdmission } from "./dispatch-admission.js";
 import { RESTATE_WRITE_TOOL_NAMES, IDEMPOTENCY_KEY_SHAPE, scopeIdempotencyKey } from "./mcp.js";
 import { adminHtml } from "./admin-html.js";
 import {
@@ -201,6 +202,19 @@ async function reviewFixLifecycleEnablementError(
   const restateStatus = deps.getRestateStatus?.();
   if (!restateStatus || restateStatus.sidecar.state !== "ready" || restateStatus.registration.state !== "registered") {
     return `reviewFixLifecycle "restate" requires a registered, healthy Restate endpoint, which is not currently available`;
+  }
+
+  // The reservation ledger was introduced after some Legacy jobs were launched.
+  // Those jobs do not occupy a ledger slot, so admitting Restate work while one
+  // remains active could exceed the shared cap or let both owners work on a PR.
+  // Initial activation waits for the whole unreserved Legacy fleet to drain.
+  const unreservedLegacyJob = getInFlightJobs().find((job) => {
+    if (job.phase === "kg-refresh") return false;
+    const admission = job.dispatchId ? readDispatchAdmission(job.dispatchId) : null;
+    return !admission || admission.releasedAt !== null;
+  });
+  if (unreservedLegacyJob) {
+    return `reviewFixLifecycle "restate" requires active unreserved Legacy workers to drain before activation`;
   }
 
   let capabilities: Awaited<ReturnType<typeof resolveWorkflowCapabilities>>;

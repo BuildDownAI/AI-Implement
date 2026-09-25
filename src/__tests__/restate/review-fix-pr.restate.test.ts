@@ -113,6 +113,7 @@ describe("ReviewFixPR durable coordination", () => {
     },
   };
   const attempt = createReviewFixAttempt({
+    notifyPrOnCompletion: true,
     store,
     worker: {
       prepare: async (prepared) => ({ attemptId: prepared.attemptId, scope: prepared.scope,
@@ -168,11 +169,12 @@ describe("ReviewFixPR durable coordination", () => {
     state.terminal = { status: "succeeded", outputCommit: SHA };
     const result: ReviewFixResultMetadataV1 = { version: 1, attemptId: prepared.attemptId,
       ...prepared.scope, ...state.execution!, deadlineAt: prepared.deadlineAt, outputCommit: SHA };
+    // Production callback intake has already persisted this exact result by
+    // the time its inbox delivery invokes the Restate shared handler.
+    state.result = result;
     await callWorkflow(env.baseUrl(), "ReviewFixAttempt", prepared.attemptId, "result", result);
     await attachWorkflow(env.baseUrl(), "ReviewFixAttempt", prepared.attemptId);
     expect(state.released).toBe(true);
-    expect(await callObject(env.baseUrl(), "ReviewFixPR", reviewFixPRKey(pr.scope), "completed",
-      { attemptId: prepared.attemptId })).toBe(true);
   }
 
   it.each(VARIANTS.map(([label]) => label))("one fixed feedback window and one active attempt (%s)", async (label) => {

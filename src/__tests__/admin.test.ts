@@ -1684,6 +1684,24 @@ describe("admin mappings", () => {
     expect(JSON.parse(list.body).RFLOK.reviewFixLifecycle).toBe("restate");
   });
 
+  it("rejects initial Restate activation while an unreserved Legacy runner is active", async () => {
+    const token = await login("secret");
+    resolveWorkflowCapabilitiesMock.mockClear();
+    dedup.getDb().prepare(`
+      INSERT INTO dispatch_log (issue_id, repo, dispatched_at, status, phase)
+      VALUES ('legacy-issue', 'org/app', ?, 'running', 'gap-analysis')
+    `).run(Date.now());
+    const res = await requestWithDeps("/api/mappings", "POST", token, {
+      getRestateStatus: () => ({ sidecar: { state: "ready" }, registration: { state: "registered" } }),
+    }, {
+      teamKey: "RFLDRAIN", owner: "org", repo: "app", defaultBranch: "main",
+      executionMode: "github-actions", reviewFixLifecycle: "restate",
+    });
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toContain("unreserved Legacy workers to drain");
+    expect(resolveWorkflowCapabilitiesMock).not.toHaveBeenCalled();
+  });
+
   it("preserves a selected Restate lifecycle during an unrelated edit and rejects an unsupported dispatch change", async () => {
     const token = await login("secret");
     resolveWorkflowCapabilitiesMock.mockResolvedValueOnce({

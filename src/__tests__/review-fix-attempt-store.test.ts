@@ -19,6 +19,11 @@ import type * as DedupModule from "../dedup.js";
 import type * as ConfigModule from "../config.js";
 import type * as StoreModule from "../review-fix-attempt-store.js";
 import type * as LedgerModule from "../review-ledger-store.js";
+import type * as QueueModule from "../review-fix-queue.js";
+import type * as PendingModule from "../review-fix-pending.js";
+import type * as CloseModule from "../review-fix-close.js";
+import type * as AdminFacadeModule from "../review-fix-admin-facade.js";
+import type * as BreakerModule from "../dispatch-breaker.js";
 import type { ReviewFixAdmissionRequest, ReviewFixAttemptStorePort } from "../review-fix-ports.js";
 import type { ReviewFixResultMetadataV1, ScopedPrIdentity } from "../review-fix-contract.js";
 import type { RepoMapping } from "../config.js";
@@ -28,6 +33,11 @@ let dedup: typeof DedupModule;
 let config: typeof ConfigModule;
 let storeModule: typeof StoreModule;
 let ledger: typeof LedgerModule;
+let queue: typeof QueueModule;
+let pending: typeof PendingModule;
+let close: typeof CloseModule;
+let adminFacade: typeof AdminFacadeModule;
+let breaker: typeof BreakerModule;
 
 beforeEach(async () => {
   vi.resetModules();
@@ -40,6 +50,12 @@ beforeEach(async () => {
   config = await import("../config.js");
   storeModule = await import("../review-fix-attempt-store.js");
   ledger = await import("../review-ledger-store.js");
+  queue = await import("../review-fix-queue.js");
+  pending = await import("../review-fix-pending.js");
+  close = await import("../review-fix-close.js");
+  adminFacade = await import("../review-fix-admin-facade.js");
+  breaker = await import("../dispatch-breaker.js");
+  breaker.initDispatchBreakerTable();
 });
 
 afterEach(() => {
@@ -148,6 +164,148 @@ describe("SqliteReviewFixAttemptStore: satisfies the port without unsafe casts",
 });
 
 describe("SqliteReviewFixAttemptStore: admission", () => {
+  it("exposes durable attempt state and only lets an administrator cancel its exact owner", async () => {
+    seedMapping();
+    const store = new storeModule.SqliteReviewFixAttemptStore();
+    const admitted = await store.admit(admissionRequest());
+    if (admitted.status !== "prepared") throw new Error("expected prepared");
+    const facade = adminFacade.createReviewFixAdminFacade(store, {
+      reconcile: async () => ({ status: "unknown" }),
+    });
+    const user = { role: "user" as const, email: "reader@example.com" };
+    const admin = { role: "admin" as const, email: "operator@example.com" };
+    expect(await facade.getAttempt(admitted.attempt.attemptId, user)).toEqual({ status: "not_found" });
+    const detail = await facade.getAttempt(admitted.attempt.attemptId, admin);
+    expect(detail.status).toBe("ok");
+    if (detail.status === "ok") {
+      expect(detail.attempt.terminationConfirmed).toBe(false);
+      expect(detail.attempt.evidenceComplete).toBe(false);
+      expect(detail.attempt.snapshot?.findings).toEqual(admitted.attempt.findings);
+    }
+    expect(await facade.requestCancellation(admitted.attempt.attemptId, admin)).toMatchObject({ status: "rejected" });
+    expect(await facade.revokeAuthority(admitted.attempt.attemptId, user)).toEqual({ status: "not_found" });
+    expect(await facade.revokeAuthority(admitted.attempt.attemptId, admin)).toEqual({ status: "accepted" });
+    expect(await facade.requestCancellation(admitted.attempt.attemptId, admin)).toEqual({ status: "accepted" });
+    expect((dedup.getDb().prepare("SELECT kind FROM review_fix_inbox").get() as { kind: string }).kind).toBe("cancellation");
+    expect(dedup.getDb().prepare("SELECT released_at FROM dispatch_admissions WHERE dispatch_id = ?")
+      .get(admitted.attempt.attemptId)).toMatchObject({ released_at: null });
+  });
+
+  it("adopts only the execution independently verified for the same attempt", async () => {
+    seedMapping();
+    const store = new storeModule.SqliteReviewFixAttemptStore();
+    const admitted = await store.admit(admissionRequest());
+    if (admitted.status !== "prepared") throw new Error("expected prepared");
+    const execution = { githubRunId: 9001, githubRunAttempt: 2 };
+    const facade = adminFacade.createReviewFixAdminFacade(store, {
+      reconcile: async () => ({ status: "found", execution }),
+    });
+    const admin = { role: "admin" as const, email: "operator@example.com" };
+    expect(await facade.adopt(admitted.attempt.attemptId,
+      { githubRunId: "9002", githubRunAttempt: 2 }, admin)).toEqual({ status: "unverified" });
+    expect(await store.findPreparedAttemptByExecution(execution)).toBeNull();
+    expect(await facade.adopt(admitted.attempt.attemptId,
+      { githubRunId: "9001", githubRunAttempt: 2 }, admin)).toEqual({ status: "accepted" });
+    expect((await store.findPreparedAttemptByExecution(execution))?.attemptId).toBe(admitted.attempt.attemptId);
+  });
+
+  it("durably revokes authority and requests cancellation when its PR closes", async () => {
+    seedMapping();
+    const store = new storeModule.SqliteReviewFixAttemptStore();
+    const admitted = await store.admit(admissionRequest());
+    if (admitted.status !== "prepared") throw new Error("expected prepared");
+    expect(close.listActiveRestateReviewFixPrs()).toEqual([{ repository: SCOPE.repository, prNumber: SCOPE.prNumber }]);
+    expect(close.queueReviewFixCancellationForClosedPr(SCOPE.repository, SCOPE.prNumber)).toBe(true);
+    expect(await store.hasCurrentAuthority(admitted.attempt.attemptId)).toBe(false);
+    expect(close.queueReviewFixCancellationForClosedPr(SCOPE.repository, SCOPE.prNumber)).toBe(true);
+    const rows = dedup.getDb().prepare("SELECT kind, delivery_state FROM review_fix_inbox").all() as
+      Array<{ kind: string; delivery_state: string }>;
+    expect(rows).toEqual([{ kind: "cancellation", delivery_state: "pending" }]);
+    expect(dedup.getDb().prepare("SELECT released_at FROM dispatch_admissions WHERE dispatch_id = ?")
+      .get(admitted.attempt.attemptId)).toMatchObject({ released_at: null });
+    await store.releaseOwner(admitted.attempt.owner, "cancelled");
+    expect(close.listActiveRestateReviewFixPrs()).toEqual([]);
+  });
+
+  it("consumes exactly one queue snapshot while preserving overflow and new finding revisions", async () => {
+    seedMapping();
+    const queueId = queue.enqueueReviewFix({
+      issueId: "issue-42", issueIdentifier: "AII-42", repo: SCOPE.repository,
+      prNumber: SCOPE.prNumber, reason: "review_feedback", sourceEventId: "event-1",
+    });
+    const records = Array.from({ length: 35 }, (_, i) => ({
+      repo: SCOPE.repository, prNumber: SCOPE.prNumber,
+      source: "github-review-thread" as const, severity: "medium" as const,
+      body: `finding ${i}`, path: `file${i}.ts`, line: i,
+    }));
+    for (const finding of records) ledger.upsertReviewFinding(finding);
+    const store = new storeModule.SqliteReviewFixAttemptStore();
+    const firstFeedback = pending.loadPendingReviewFixFeedback(SCOPE, "issue text");
+    expect(firstFeedback?.findings).toHaveLength(30);
+    const first = await store.admit(admissionRequest({ feedback: firstFeedback! }));
+    if (first.status !== "prepared") throw new Error("expected prepared");
+    expect(queue.getPendingReviewFixes().map((item) => item.id)).toContain(queueId);
+
+    // Re-reporting an included finding increments its version. It must join
+    // the five overflow findings in the next attempt after exact-owner release.
+    ledger.upsertReviewFinding(records[0]);
+    await store.releaseOwner(first.attempt.owner, "finalized");
+    const secondFeedback = pending.loadPendingReviewFixFeedback(SCOPE, "issue text");
+    expect(secondFeedback?.findings).toHaveLength(6);
+    expect(secondFeedback?.findings).toContainEqual({
+      findingKey: first.attempt.findings[0].findingKey, version: 2,
+    });
+    const second = await store.admit(admissionRequest({ feedback: secondFeedback! }));
+    expect(second.status).toBe("prepared");
+    expect(queue.getPendingReviewFixes().map((item) => item.id)).not.toContain(queueId);
+  });
+
+  it("defers a stale queue snapshot after a finding revision changes before admission", async () => {
+    seedMapping();
+    queue.enqueueReviewFix({ issueId: "issue-42", issueIdentifier: "AII-42", repo: SCOPE.repository,
+      prNumber: SCOPE.prNumber, reason: "review_feedback", sourceEventId: "event-1" });
+    const finding = { repo: SCOPE.repository, prNumber: SCOPE.prNumber,
+      source: "github-review-thread" as const, severity: "medium" as const,
+      body: "changed finding", path: "file.ts", line: 1 };
+    ledger.upsertReviewFinding(finding);
+    const oldFeedback = pending.loadPendingReviewFixFeedback(SCOPE, null)!;
+    ledger.upsertReviewFinding(finding);
+    const store = new storeModule.SqliteReviewFixAttemptStore();
+    expect(await store.admit(admissionRequest({ feedback: oldFeedback }))).toEqual({ status: "deferred", reason: "occupied" });
+    expect(queue.getPendingReviewFixes()).toHaveLength(1);
+    expect((dedup.getDb().prepare("SELECT COUNT(*) AS n FROM review_fix_attempts").get() as { n: number }).n).toBe(0);
+  });
+
+  it("keeps a newer queue event pending when it arrives after the snapshot but before admission", async () => {
+    seedMapping();
+    queue.enqueueReviewFix({ issueId: "issue-42", issueIdentifier: "AII-42", repo: SCOPE.repository,
+      prNumber: SCOPE.prNumber, reason: "review_feedback", sourceEventId: "event-1" });
+    const firstFeedback = pending.loadPendingReviewFixFeedback(SCOPE, null)!;
+    queue.enqueueReviewFix({ issueId: "issue-42", issueIdentifier: "AII-42", repo: SCOPE.repository,
+      prNumber: SCOPE.prNumber, reason: "review_feedback", sourceEventId: "event-2" });
+    const store = new storeModule.SqliteReviewFixAttemptStore();
+    const first = await store.admit(admissionRequest({ feedback: firstFeedback }));
+    if (first.status !== "prepared") throw new Error("expected prepared");
+    expect(queue.getPendingReviewFixes()).toHaveLength(1);
+    await store.releaseOwner(first.attempt.owner, "finalized");
+    const nextFeedback = pending.loadPendingReviewFixFeedback(SCOPE, null)!;
+    expect(nextFeedback.queueCursor!.eventId).toBeGreaterThan(firstFeedback.queueCursor!.eventId);
+    const second = await store.admit(admissionRequest({ feedback: nextFeedback }));
+    expect(second.status).toBe("prepared");
+  });
+
+  it("defers parked automatic feedback without spending a reservation or budget entry", async () => {
+    seedMapping();
+    queue.enqueueReviewFix({ issueId: "issue-42", issueIdentifier: "AII-42", repo: SCOPE.repository,
+      prNumber: SCOPE.prNumber, reason: "review_feedback", sourceEventId: "event-1" });
+    breaker.parkIssue("issue-42", "gap-analysis", "pr_budget");
+    const feedback = pending.loadPendingReviewFixFeedback(SCOPE, null)!;
+    const store = new storeModule.SqliteReviewFixAttemptStore();
+    expect(await store.admit(admissionRequest({ feedback }))).toEqual({ status: "deferred", reason: "paused" });
+    expect(queue.getPendingReviewFixes()).toHaveLength(1);
+    expect((dedup.getDb().prepare("SELECT COUNT(*) AS n FROM dispatch_admissions").get() as { n: number }).n).toBe(0);
+  });
+
   it("prepares a reservation, deadline, and exactly one budget entry", async () => {
     seedMapping();
     const store = new storeModule.SqliteReviewFixAttemptStore();

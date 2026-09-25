@@ -467,9 +467,10 @@ export interface StaleAdmissionSweepResult {
 
 /**
  * Age-based reconciliation sweep, mirroring reaper.ts's own SWEEP_MACHINE_MAX_AGE_MS
- * pattern: candidate rows are every reservation still unreleased past `maxAgeMs`,
- * regardless of `lifecycleOwner` or whether a matching `dispatch_log` row was ever
- * written. Intended to run once per poll cycle alongside `sweepOrphanedMachines`.
+ * pattern: candidate rows are Legacy reservations still unreleased past `maxAgeMs`,
+ * whether or not a matching `dispatch_log` row was ever written. Restate owns
+ * its own deadline/termination wait and must never enter this Legacy sweep.
+ * Intended to run once per poll cycle alongside `sweepOrphanedMachines`.
  *
  * A candidate is only released once `confirmTerminated` resolves `true` for it — the
  * caller is expected to check the actual backend (GHA run status, Fly machine state,
@@ -487,7 +488,7 @@ export async function sweepStaleAdmissions(
   const db = getDb();
   const cutoff = Date.now() - maxAgeMs;
   const rows = db
-    .prepare("SELECT * FROM dispatch_admissions WHERE released_at IS NULL AND created_at < ?")
+    .prepare("SELECT * FROM dispatch_admissions WHERE lifecycle_owner = 'legacy' AND released_at IS NULL AND created_at < ?")
     .all(cutoff) as Row[];
   const released: StaleAdmissionSweepResult[] = [];
   for (const row of rows) {
