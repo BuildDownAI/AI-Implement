@@ -2108,12 +2108,22 @@ function handleReviewFixActivity(
   const qs = url.includes("?") ? url.slice(url.indexOf("?") + 1) : "";
   const params = new URLSearchParams(qs);
   const pageSizeRaw = params.get("pageSize");
-  const pageSize = pageSizeRaw && Number.isFinite(Number(pageSizeRaw)) ? Number(pageSizeRaw) : undefined;
+  const requestedPageSize = pageSizeRaw === null ? 100 : Number(pageSizeRaw);
+  if (!Number.isSafeInteger(requestedPageSize) || requestedPageSize < 1) {
+    json(res, 400, { error: "pageSize must be a positive integer" });
+    return;
+  }
+  const pageSize = Math.min(requestedPageSize, 500);
   const cursorProducerId = params.get("cursorProducerId");
   const cursorSequenceRaw = params.get("cursorSequence");
   let cursor: ReviewFixActivityCursor | undefined;
-  if (cursorProducerId !== null && cursorSequenceRaw !== null && Number.isFinite(Number(cursorSequenceRaw))) {
-    cursor = { producerId: cursorProducerId, sequence: Number(cursorSequenceRaw) };
+  if (cursorProducerId !== null || cursorSequenceRaw !== null) {
+    const sequence = Number(cursorSequenceRaw);
+    if (!cursorProducerId || cursorSequenceRaw === null || !Number.isSafeInteger(sequence) || sequence < 0) {
+      json(res, 400, { error: "cursorProducerId and a non-negative integer cursorSequence are required together" });
+      return;
+    }
+    cursor = { producerId: cursorProducerId, sequence };
   }
   deps.reviewFixAttempts.getActivity(attemptId, { cursor, pageSize }, reviewFixCaller(gate)).then(
     (result) => {
@@ -2160,12 +2170,18 @@ async function handleReviewFixAdopt(
     json(res, 501, { error: "Review-fix attempts are not configured" });
     return;
   }
-  const raw = await readBody(req);
+  let raw: string;
+  try {
+    raw = await readBody(req);
+  } catch {
+    json(res, 400, { error: "Could not read request body" });
+    return;
+  }
   let execution: ReviewFixAttemptExecutionRef;
   try {
     const parsed = JSON.parse(raw) as { githubRunId?: unknown; githubRunAttempt?: unknown };
-    if (typeof parsed.githubRunId !== "string" || !parsed.githubRunId || typeof parsed.githubRunAttempt !== "number") {
-      json(res, 400, { error: "Body must include githubRunId (string) and githubRunAttempt (number)" });
+    if (typeof parsed.githubRunId !== "string" || !parsed.githubRunId || typeof parsed.githubRunAttempt !== "number" || !Number.isSafeInteger(parsed.githubRunAttempt) || parsed.githubRunAttempt < 1) {
+      json(res, 400, { error: "Body must include githubRunId (string) and githubRunAttempt (positive integer)" });
       return;
     }
     execution = { githubRunId: parsed.githubRunId, githubRunAttempt: parsed.githubRunAttempt };
@@ -2200,12 +2216,33 @@ async function handleReviewFixCancel(
   const caller = reviewFixCaller(gate);
   try {
     const revoked = await deps.reviewFixAttempts.revokeAuthority(attemptId, caller);
+    if (revoked.status === "unavailable") {
+      json(res, 503, {
+        status: "partial",
+        authorityRevocation: "durable-accepted",
+        cancellation: "not-requested",
+        detail: "Authority revocation is queued, but termination has not been requested. Retry cancellation after recovery.",
+      });
+      return;
+    }
     if (revoked.status !== "accepted") {
       const [status, body] = reviewFixActionResponse(revoked);
       json(res, status, body);
       return;
     }
-    const cancelled = await deps.reviewFixAttempts.requestCancellation(attemptId, caller);
+    let cancelled: ReviewFixActionOutcome;
+    try {
+      cancelled = await deps.reviewFixAttempts.requestCancellation(attemptId, caller);
+    } catch {
+      console.error("[admin] review-fix cancellation request failed");
+      json(res, 503, {
+        status: "partial",
+        authorityRevocation: "accepted",
+        cancellation: "unconfirmed",
+        detail: "Authority was revoked, but termination could not be confirmed. Reconcile before retrying cancellation.",
+      });
+      return;
+    }
     const [status, body] = reviewFixActionResponse(cancelled);
     json(res, status, body);
   } catch (err) {

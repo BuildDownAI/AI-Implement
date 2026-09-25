@@ -4257,6 +4257,31 @@ describe("Review-fix attempt evidence + recovery actions (AII-806)", () => {
       expect(capturedOpts).toEqual({ cursor: { producerId: "runner", sequence: 7 }, pageSize: 25 });
     });
 
+    it("defaults and caps activity pages before calling the facade", async () => {
+      const token = await login("secret");
+      const sizes: number[] = [];
+      const facade = fakeFacade({ getActivity: async (_id, opts) => {
+        sizes.push(opts.pageSize ?? -1);
+        return { status: "ok", page: PAGE };
+      } });
+      await requestWithDeps("/api/review-fix/attempts/attempt-1/activity", "GET", token, { reviewFixAttempts: facade });
+      await requestWithDeps("/api/review-fix/attempts/attempt-1/activity?pageSize=100000", "GET", token, { reviewFixAttempts: facade });
+      expect(sizes).toEqual([100, 500]);
+    });
+
+    it.each(["pageSize=0", "pageSize=-1", "pageSize=1.5", "pageSize=oops", "cursorProducerId=runner", "cursorSequence=1", "cursorProducerId=runner&cursorSequence=-1", "cursorProducerId=runner&cursorSequence=1.5", "cursorProducerId=runner&cursorSequence=oops"])(
+      "rejects malformed activity query %s before calling the facade",
+      async (query) => {
+        const token = await login("secret");
+        const called = vi.fn();
+        const res = await requestWithDeps(`/api/review-fix/attempts/attempt-1/activity?${query}`, "GET", token, {
+          reviewFixAttempts: fakeFacade({ getActivity: async () => { called(); return { status: "ok", page: PAGE }; } }),
+        });
+        expect(res.statusCode).toBe(400);
+        expect(called).not.toHaveBeenCalled();
+      },
+    );
+
     it("passes a truncated page through untouched — not summarized away", async () => {
       const token = await login("secret");
       const res = await requestWithDeps(
@@ -4349,6 +4374,30 @@ describe("Review-fix attempt evidence + recovery actions (AII-806)", () => {
       expect(called).not.toHaveBeenCalled();
     });
 
+    it.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY])("rejects invalid GitHub run attempt %s", async (githubRunAttempt) => {
+      const token = await login("secret");
+      const called = vi.fn();
+      const res = await requestWithDeps("/api/review-fix/attempts/attempt-1/adopt", "POST", token, {
+        reviewFixAttempts: fakeFacade({ adopt: async () => { called(); return { status: "accepted" }; } }),
+      }, { githubRunId: "999", githubRunAttempt });
+      expect(res.statusCode).toBe(400);
+      expect(called).not.toHaveBeenCalled();
+    });
+
+    it("handles a failed request-body read without invoking adoption", async () => {
+      const token = await login("secret");
+      const called = vi.fn();
+      const req = new MockRequest("/api/review-fix/attempts/attempt-1/adopt", "POST", { authorization: `Bearer ${token}` });
+      const res = new MockResponse();
+      admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider), {
+        reviewFixAttempts: fakeFacade({ adopt: async () => { called(); return { status: "accepted" }; } }),
+      });
+      req.emit("error", new Error("connection dropped"));
+      await res.done;
+      expect(res.statusCode).toBe(400);
+      expect(called).not.toHaveBeenCalled();
+    });
+
     it("passes the caller-supplied execution reference to the facade and answers 202 on a verified match", async () => {
       const token = await login("secret");
       let capturedExecution: AdminModule.ReviewFixAttemptExecutionRef | undefined;
@@ -4433,6 +4482,20 @@ describe("Review-fix attempt evidence + recovery actions (AII-806)", () => {
       expect(calls).toEqual(["revoke"]);
     });
 
+    it("reports partial cancellation and requires retry if only revocation was durably queued", async () => {
+      const token = await login("secret");
+      const calls: string[] = [];
+      const res = await requestWithDeps("/api/review-fix/attempts/attempt-1/cancel", "POST", token, {
+        reviewFixAttempts: fakeFacade({
+          revokeAuthority: async () => { calls.push("revoke"); return { status: "unavailable" }; },
+          requestCancellation: async () => { calls.push("cancel"); return { status: "accepted" }; },
+        }),
+      });
+      expect(res.statusCode).toBe(503);
+      expect(JSON.parse(res.body)).toMatchObject({ status: "partial", authorityRevocation: "durable-accepted", cancellation: "not-requested" });
+      expect(calls).toEqual(["revoke"]);
+    });
+
     it("surfaces requestCancellation's durable-acceptance outcome when Restate is unavailable at that step", async () => {
       const token = await login("secret");
       const calls: string[] = [];
@@ -4450,6 +4513,18 @@ describe("Review-fix attempt evidence + recovery actions (AII-806)", () => {
       expect(res.statusCode).toBe(202);
       expect(JSON.parse(res.body).status).toBe("durable-accepted");
       expect(calls).toEqual(["revoke", "cancel"]);
+    });
+
+    it("reports an unconfirmed cancellation request after authority was revoked", async () => {
+      const token = await login("secret");
+      const res = await requestWithDeps("/api/review-fix/attempts/attempt-1/cancel", "POST", token, {
+        reviewFixAttempts: fakeFacade({
+          revokeAuthority: async () => ({ status: "accepted" }),
+          requestCancellation: async () => { throw new Error("connection dropped"); },
+        }),
+      });
+      expect(res.statusCode).toBe(503);
+      expect(JSON.parse(res.body)).toMatchObject({ status: "partial", authorityRevocation: "accepted", cancellation: "unconfirmed" });
     });
   });
 });
