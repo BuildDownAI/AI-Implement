@@ -867,3 +867,292 @@ describe("job drawer restate attempt section", () => {
     win.closeJobDrawer();
   });
 });
+
+// ---- Gap-fill: evidence/async-state gaps in the pilot section (AII-808 PR #708) ----
+
+describe("job drawer restate attempt section — evidence and race gaps", () => {
+  it("fetches activity page one on the first successful background refresh after an initial attempt read failure (503)", async () => {
+    const { win, doc } = mountPilotDrawer({ job: PILOT_JOB, attemptStatus: 503 });
+    await win.openJobDrawer(10);
+    expect(doc.getElementById("drawer-pilot-unavailable")!.textContent).toContain("Attempt data unavailable");
+
+    // The attempt read now succeeds — simulate the 5s background refresh picking it up.
+    win.api = async (url: string) => {
+      if (url === "/api/mappings") return { ok: true, status: 200, json: async () => ({}) };
+      if (url === "/api/jobs/10/steps") return { ok: true, status: 200, json: async () => ({ job: PILOT_JOB, steps: [] }) };
+      if (url.includes("/activity")) return { ok: true, status: 200, json: async () => ACTIVITY_PAGE_1 };
+      if (/\/api\/review-fix\/attempts\/[^/]+$/.test(url)) return { ok: true, status: 200, json: async () => pilotAttemptFixture() };
+      throw new Error("unexpected " + url);
+    };
+    await win.refreshJobDrawer(10, { background: true });
+
+    const activityText = doc.getElementById("drawer-pilot-activity")!.textContent || "";
+    expect(activityText).not.toContain("No tool activity recorded");
+    expect(doc.querySelectorAll("#drawer-pilot-activity pre").length).toBeGreaterThan(0);
+    win.closeJobDrawer();
+  });
+
+  it("discards a delayed Load more response if the drawer is closed before it resolves", async () => {
+    let resolveSecondPage!: () => void;
+    const secondPagePromise = new Promise<void>((resolve) => {
+      resolveSecondPage = resolve;
+    });
+    const { win, doc } = mountPilotDrawer({
+      job: PILOT_JOB,
+      attemptStatus: 200,
+      attempt: pilotAttemptFixture(),
+      activityPages: [ACTIVITY_PAGE_1],
+    });
+    const baseApi = win.api;
+    let activityCallCount = 0;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    win.api = async (url: string, reqOpts?: any) => {
+      if (url.includes("/activity")) {
+        activityCallCount++;
+        if (activityCallCount === 2) {
+          await secondPagePromise;
+          return { ok: true, status: 200, json: async () => ACTIVITY_PAGE_2 };
+        }
+      }
+      return baseApi(url, reqOpts);
+    };
+    await win.openJobDrawer(10);
+    const moreBtn = doc.getElementById("drawer-pilot-activity-more") as unknown as { onclick: () => Promise<void> };
+    const loadMorePromise = moreBtn.onclick();
+    win.closeJobDrawer();
+
+    resolveSecondPage();
+    await loadMorePromise;
+
+    expect(doc.getElementById("job-drawer-wrap")!.hidden).toBe(true);
+    expect(doc.getElementById("drawer-pilot-activity")!.textContent || "").not.toContain("second page payload");
+  });
+
+  it("discards a delayed Load more response if the job/attempt switches before it resolves", async () => {
+    let resolveSecondPage!: () => void;
+    const secondPagePromise = new Promise<void>((resolve) => {
+      resolveSecondPage = resolve;
+    });
+    const { win, doc } = mountPilotDrawer({
+      job: PILOT_JOB,
+      attemptStatus: 200,
+      attempt: pilotAttemptFixture(),
+      activityPages: [ACTIVITY_PAGE_1],
+    });
+    const baseApi = win.api;
+    let activityCallCount = 0;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    win.api = async (url: string, reqOpts?: any) => {
+      if (url.includes("/activity")) {
+        activityCallCount++;
+        if (activityCallCount === 2) {
+          await secondPagePromise;
+          return { ok: true, status: 200, json: async () => ACTIVITY_PAGE_2 };
+        }
+      }
+      return baseApi(url, reqOpts);
+    };
+    await win.openJobDrawer(10);
+    const moreBtn = doc.getElementById("drawer-pilot-activity-more") as unknown as { onclick: () => Promise<void> };
+    const loadMorePromise = moreBtn.onclick();
+
+    // A different attempt takes over the same open drawer before the delayed page resolves.
+    const otherAttemptJob = { ...PILOT_JOB, dispatchId: "attempt-11" };
+    win.api = async (url: string) => {
+      if (url === "/api/mappings") return { ok: true, status: 200, json: async () => ({}) };
+      if (url === "/api/jobs/10/steps") return { ok: true, status: 200, json: async () => ({ job: otherAttemptJob, steps: [] }) };
+      if (url.includes("/activity")) return { ok: true, status: 200, json: async () => ({ events: [], nextCursor: null, truncated: false }) };
+      if (/\/api\/review-fix\/attempts\/[^/]+$/.test(url)) return { ok: true, status: 200, json: async () => pilotAttemptFixture({ attemptId: "attempt-11" }) };
+      throw new Error("unexpected " + url);
+    };
+    await win.refreshJobDrawer(10, { background: true });
+
+    resolveSecondPage();
+    await loadMorePromise;
+
+    expect(doc.getElementById("drawer-pilot-activity")!.textContent || "").not.toContain("second page payload");
+    win.closeJobDrawer();
+  });
+
+  it("shows an explicit unavailable state instead of \"No tool activity recorded\" when the first activity page fetch fails, with a working retry", async () => {
+    const { win, doc } = mountDrawer(PILOT_JOB, []);
+    let activityShouldFail = true;
+    win.api = async (url: string) => {
+      if (url === "/api/mappings") return { ok: true, status: 200, json: async () => ({}) };
+      if (url === "/api/jobs/10/steps") return { ok: true, status: 200, json: async () => ({ job: PILOT_JOB, steps: [] }) };
+      if (url.includes("/activity")) {
+        if (activityShouldFail) return { ok: false, status: 503, json: async () => ({}) };
+        return { ok: true, status: 200, json: async () => ACTIVITY_PAGE_1 };
+      }
+      if (/\/api\/review-fix\/attempts\/[^/]+$/.test(url)) return { ok: true, status: 200, json: async () => pilotAttemptFixture() };
+      throw new Error("unexpected " + url);
+    };
+    await win.openJobDrawer(10);
+
+    const activityText = doc.getElementById("drawer-pilot-activity")!.textContent || "";
+    expect(activityText).not.toContain("No tool activity recorded");
+    expect(activityText).toContain("unavailable");
+    const retryBtn = doc.getElementById("drawer-pilot-activity-retry") as unknown as { onclick: () => Promise<void> } | null;
+    expect(retryBtn).toBeTruthy();
+
+    activityShouldFail = false;
+    await retryBtn!.onclick();
+
+    expect(doc.getElementById("drawer-pilot-activity")!.textContent || "").not.toContain("unavailable");
+    expect(doc.querySelectorAll("#drawer-pilot-activity pre").length).toBeGreaterThan(0);
+    win.closeJobDrawer();
+  });
+
+  it("shows an explicit unavailable state and a working retry when a Load more request fails, without losing the events already shown", async () => {
+    const { win, doc } = mountPilotDrawer({
+      job: PILOT_JOB,
+      attemptStatus: 200,
+      attempt: pilotAttemptFixture(),
+      activityPages: [ACTIVITY_PAGE_1],
+    });
+    await win.openJobDrawer(10);
+    expect(doc.getElementById("drawer-pilot-activity")!.textContent).not.toContain("second page payload");
+
+    const baseApi = win.api;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    win.api = async (url: string, reqOpts?: any) => {
+      if (url.includes("/activity")) return { ok: false, status: 503, json: async () => ({}) };
+      return baseApi(url, reqOpts);
+    };
+    const moreBtn = doc.getElementById("drawer-pilot-activity-more") as unknown as { onclick: () => Promise<void> };
+    await moreBtn.onclick();
+
+    const activityTextAfterFailure = doc.getElementById("drawer-pilot-activity")!.textContent || "";
+    expect(activityTextAfterFailure).toContain("unavailable");
+    // The first page's already-shown events must survive a failed later-page fetch.
+    expect(activityTextAfterFailure).toContain("tool_call");
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    win.api = async (url: string, reqOpts?: any) => {
+      if (url.includes("/activity")) return { ok: true, status: 200, json: async () => ACTIVITY_PAGE_2 };
+      return baseApi(url, reqOpts);
+    };
+    const retryBtn = doc.getElementById("drawer-pilot-activity-retry") as unknown as { onclick: () => Promise<void> };
+    await retryBtn.onclick();
+
+    expect(doc.getElementById("drawer-pilot-activity")!.textContent).toContain("second page payload");
+    win.closeJobDrawer();
+  });
+
+  it("keeps truncation sticky once a page reports it true, even after a later page reports false", async () => {
+    const { win, doc } = mountPilotDrawer({
+      job: PILOT_JOB,
+      attemptStatus: 200,
+      attempt: pilotAttemptFixture(),
+      activityPages: [ACTIVITY_PAGE_1, ACTIVITY_PAGE_2],
+    });
+    await win.openJobDrawer(10);
+    expect(doc.getElementById("drawer-pilot-activity-count")!.textContent).toContain("stream truncated");
+
+    const moreBtn = doc.getElementById("drawer-pilot-activity-more") as unknown as { onclick: () => Promise<void> };
+    await moreBtn.onclick();
+
+    expect(doc.getElementById("drawer-pilot-activity-count")!.textContent).toContain("stream truncated");
+    win.closeJobDrawer();
+  });
+
+  it("cannot have the workflow-run link attribute broken out of by a quote in repoParts or the run id", async () => {
+    const maliciousJob = {
+      ...PILOT_JOB,
+      repo: 'org"onmouseover="alert(1)/repo',
+    };
+    const maliciousAttempt = pilotAttemptFixture({
+      execution: { githubRunId: '123" onclick="alert(2)', githubRunAttempt: 2 },
+    });
+    const { win, doc } = mountPilotDrawer({ job: maliciousJob, attemptStatus: 200, attempt: maliciousAttempt });
+    await win.openJobDrawer(10);
+
+    const links = doc.querySelectorAll("#drawer-pilot-links a");
+    expect(links.length).toBeGreaterThan(0);
+    links.forEach((link) => {
+      expect(link.getAttributeNames()).not.toContain("onmouseover");
+      expect(link.getAttributeNames()).not.toContain("onclick");
+    });
+    win.closeJobDrawer();
+  });
+
+  it("preserves a visible action status and in-progress Adopt inputs across a background refresh of the same attempt", async () => {
+    const { win, doc } = mountPilotDrawer({
+      job: PILOT_JOB,
+      attemptStatus: 200,
+      attempt: pilotAttemptFixture(),
+      onAction: () => ({ status: 202, body: { status: "accepted" } }),
+    });
+    await win.openJobDrawer(10);
+
+    const reconcileBtn = doc.getElementById("drawer-pilot-reconcile") as unknown as { onclick: () => Promise<void> };
+    await reconcileBtn.onclick();
+    expect(doc.getElementById("drawer-pilot-action-status")!.textContent).toContain("accepted");
+
+    (doc.getElementById("drawer-pilot-adopt-run-id") as HTMLInputElement).value = "12345";
+
+    await win.refreshJobDrawer(10, { background: true });
+
+    expect(doc.getElementById("drawer-pilot-action-status")!.textContent).toContain("accepted");
+    expect((doc.getElementById("drawer-pilot-adopt-run-id") as HTMLInputElement).value).toBe("12345");
+    win.closeJobDrawer();
+  });
+
+  it("resets action status and Adopt inputs when the drawer moves to a different attempt", async () => {
+    const { win, doc } = mountPilotDrawer({
+      job: PILOT_JOB,
+      attemptStatus: 200,
+      attempt: pilotAttemptFixture(),
+      onAction: () => ({ status: 202, body: { status: "accepted" } }),
+    });
+    await win.openJobDrawer(10);
+    const reconcileBtn = doc.getElementById("drawer-pilot-reconcile") as unknown as { onclick: () => Promise<void> };
+    await reconcileBtn.onclick();
+    expect(doc.getElementById("drawer-pilot-action-status")!.textContent).toContain("accepted");
+
+    const nextAttemptJob = { ...PILOT_JOB, dispatchId: "attempt-11" };
+    win.api = async (url: string) => {
+      if (url === "/api/mappings") return { ok: true, status: 200, json: async () => ({}) };
+      if (url === "/api/jobs/10/steps") return { ok: true, status: 200, json: async () => ({ job: nextAttemptJob, steps: [] }) };
+      if (url.includes("/activity")) return { ok: true, status: 200, json: async () => ({ events: [], nextCursor: null, truncated: false }) };
+      if (/\/api\/review-fix\/attempts\/[^/]+$/.test(url)) return { ok: true, status: 200, json: async () => pilotAttemptFixture({ attemptId: "attempt-11" }) };
+      throw new Error("unexpected " + url);
+    };
+    await win.refreshJobDrawer(10, { background: true });
+
+    expect(doc.getElementById("drawer-pilot-action-status")!.textContent || "").toBe("");
+    win.closeJobDrawer();
+  });
+
+  it("does not badge a completed attempt as an unqualified success when evidence is incomplete or termination is unconfirmed", async () => {
+    const { win, doc } = mountPilotDrawer({
+      job: PILOT_JOB,
+      attemptStatus: 200,
+      attempt: pilotAttemptFixture({ state: "completed", evidenceComplete: false, terminationConfirmed: false }),
+    });
+    await win.openJobDrawer(10);
+
+    const badgeHtml = doc.getElementById("drawer-pilot-state-badge")!.innerHTML;
+    expect(badgeHtml).toContain("completed");
+    expect(badgeHtml).not.toContain("badge success");
+    expect(badgeHtml).toContain("badge warn");
+    // The separate evidence-flags warnings must still be present alongside the badge.
+    const flagsText = doc.getElementById("drawer-pilot-evidence-flags")!.textContent || "";
+    expect(flagsText).toContain("evidence incomplete");
+    expect(flagsText).toContain("termination unconfirmed");
+    win.closeJobDrawer();
+  });
+
+  it("still badges a completed attempt with complete evidence and confirmed termination as success", async () => {
+    const { win, doc } = mountPilotDrawer({
+      job: PILOT_JOB,
+      attemptStatus: 200,
+      attempt: pilotAttemptFixture({ state: "completed", evidenceComplete: true, terminationConfirmed: true }),
+    });
+    await win.openJobDrawer(10);
+
+    const badgeHtml = doc.getElementById("drawer-pilot-state-badge")!.innerHTML;
+    expect(badgeHtml).toContain("badge success");
+    win.closeJobDrawer();
+  });
+});

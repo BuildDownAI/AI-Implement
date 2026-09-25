@@ -66,9 +66,21 @@ export const drawerScript = `
   // background 5s refresh of the same attempt can leave an in-progress activity
   // pagination alone instead of silently resetting it back to page one.
   let currentAttemptId = null;
+  // True once page one of tool activity has been successfully fetched for currentAttemptId —
+  // deliberately independent of "is this a new attempt", so an attempt read that itself
+  // failed (error/503) is never mistaken by the next refresh for "activity already loaded".
+  let pilotActivityLoaded = false;
   let pilotActivityEvents = [];
   let pilotActivityCursor = null;
   let pilotActivityTruncated = false;
+  // null | 'initial' | 'more' — which activity fetch most recently failed, so the render
+  // can show an explicit unavailable state with a retry path instead of looking like zero
+  // (or complete) activity.
+  let pilotActivityError = null;
+  // Attempt id the recovery-actions panel is currently rendered for. Kept separate from
+  // currentAttemptId's eager reset so a background refresh of the same attempt never
+  // re-creates the panel and wipes a visible action status or in-progress Adopt inputs.
+  let pilotActionsAttemptId = null;
 
   function isTerminalJobStatus(status) {
     return status === 'completed' || status === 'failed' || status === 'timed_out' || status === 'review_failed' || status === 'dispatch-failed';
@@ -582,9 +594,12 @@ export const drawerScript = `
 
   function resetPilotState() {
     currentAttemptId = null;
+    pilotActivityLoaded = false;
     pilotActivityEvents = [];
     pilotActivityCursor = null;
     pilotActivityTruncated = false;
+    pilotActivityError = null;
+    pilotActionsAttemptId = null;
   }
 
   async function fetchReviewFixAttempt(attemptId) {
@@ -617,16 +632,21 @@ export const drawerScript = `
     }
   }
 
-  function pilotStateBadgeKind(state) {
-    if (state === 'completed') return 'success';
-    if (state === 'cancelled' || state === 'failed') return 'fail';
-    if (state === 'running' || state === 'prepared') return 'running';
+  function pilotStateBadgeKind(attempt) {
+    if (attempt.state === 'completed') {
+      // A completed attempt with incomplete evidence or unconfirmed termination is not an
+      // unqualified success — the badge itself must not read green, on top of the separate
+      // evidence-flags warnings rendered just below it.
+      return (attempt.evidenceComplete === false || attempt.terminationConfirmed === false) ? 'warn' : 'success';
+    }
+    if (attempt.state === 'cancelled' || attempt.state === 'failed') return 'fail';
+    if (attempt.state === 'running' || attempt.state === 'prepared') return 'running';
     return 'neutral';
   }
 
   function renderPilotStateBadge(attempt) {
     const el = document.getElementById('drawer-pilot-state-badge');
-    let html = '<span class="badge ' + pilotStateBadgeKind(attempt.state) + '"><span class="dot"></span>' + window.esc(attempt.state || 'unknown') + '</span>';
+    let html = '<span class="badge ' + pilotStateBadgeKind(attempt) + '"><span class="dot"></span>' + window.esc(attempt.state || 'unknown') + '</span>';
     if (attempt.deadlineAt != null) {
       const label = attempt.deadlineAt < Date.now() ? 'deadline passed ' : 'deadline in ';
       html += ' <span class="text-tertiary" style="font-size:11px">' + window.esc(label) + window.esc(fmtRelative(attempt.deadlineAt).replace(/ (from now|ago)$/, '')) + '</span>';
@@ -669,10 +689,15 @@ export const drawerScript = `
     const repoParts = repoPartsForJob(job, null);
     let html = '<div class="field"><div class="field-label">Workflow run</div><div style="font-size:12.5px">';
     if (repoParts) {
+      // The URL is assembled from repoParts.owner/repo and githubRunId before either helper
+      // runs — window.safeUrl() validates the scheme but does not escape quotes, so the
+      // final attribute value still needs window.escAttr() or an embedded '"' breaks out of
+      // href="..." and lets the remainder of the string land as new, live HTML attributes.
       const runUrl = 'https://github.com/' + repoParts.owner + '/' + repoParts.repo + '/actions/runs/' + attempt.execution.githubRunId;
-      html += '<a class="text-accent" href="' + window.safeUrl(runUrl) + '" target="_blank">Run #' + window.esc(String(attempt.execution.githubRunId)) + ' &#8599;</a>';
+      html += '<a class="text-accent" href="' + window.escAttr(window.safeUrl(runUrl)) + '" target="_blank">Run #' + window.esc(String(attempt.execution.githubRunId)) + ' &#8599;</a>';
       if (attempt.execution.githubRunAttempt > 1) {
-        html += ' <a class="text-accent" href="' + window.safeUrl(runUrl + '/attempts/' + attempt.execution.githubRunAttempt) + '" target="_blank">(attempt ' + window.esc(String(attempt.execution.githubRunAttempt)) + ' &#8599;)</a>';
+        const attemptUrl = runUrl + '/attempts/' + attempt.execution.githubRunAttempt;
+        html += ' <a class="text-accent" href="' + window.escAttr(window.safeUrl(attemptUrl)) + '" target="_blank">(attempt ' + window.esc(String(attempt.execution.githubRunAttempt)) + ' &#8599;)</a>';
       }
     } else {
       html += '<span class="mono">run ' + window.esc(String(attempt.execution.githubRunId)) + ' · attempt ' + window.esc(String(attempt.execution.githubRunAttempt)) + '</span>';
@@ -744,22 +769,45 @@ export const drawerScript = `
     el.innerHTML = html;
   }
 
+  function pilotActivityErrorBanner() {
+    if (!pilotActivityError) return '';
+    const message = pilotActivityError === 'initial'
+      ? 'Could not load activity for this attempt.'
+      : 'Could not load the next page of activity.';
+    return '<div class="alert warn" style="margin:6px 0"><div class="alert-icon">&#9888;</div><div style="flex:1">'
+      + '<div class="alert-title">Tool activity unavailable</div>'
+      + '<div class="alert-desc">' + window.esc(message) + ' <button id="drawer-pilot-activity-retry" type="button" class="btn btn-sm" style="margin-left:6px">Retry</button></div>'
+      + '</div></div>';
+  }
+
+  function wirePilotActivityRetry() {
+    const retryBtn = document.getElementById('drawer-pilot-activity-retry');
+    if (!retryBtn) return;
+    retryBtn.onclick = pilotActivityError === 'initial'
+      ? function () { return loadInitialPilotActivity(currentJobId, currentAttemptId); }
+      : function () { return loadMorePilotActivity(); };
+  }
+
   function renderPilotActivity() {
     const el = document.getElementById('drawer-pilot-activity');
     const countEl = document.getElementById('drawer-pilot-activity-count');
     const moreBtn = document.getElementById('drawer-pilot-activity-more');
     countEl.textContent = pilotActivityEvents.length + ' event' + (pilotActivityEvents.length === 1 ? '' : 's') + (pilotActivityTruncated ? ' · stream truncated' : '');
+    const errorBanner = pilotActivityErrorBanner();
     if (!pilotActivityEvents.length) {
-      el.innerHTML = pilotActivityCursor
+      // A fetch failure must never render as "nothing here" (empty/no-activity) or as
+      // stale-but-current — it gets its own explicit banner with a retry path instead.
+      el.innerHTML = errorBanner || (pilotActivityCursor
         ? '<div style="font-size:12px;color:var(--fg-tertiary);padding:8px 0">No events on this page — more activity may be available</div>'
         : (pilotActivityTruncated
           ? '<div style="font-size:12px;color:var(--fg-tertiary);padding:8px 0">Activity truncated — no events available</div>'
-          : '<div style="font-size:12px;color:var(--fg-tertiary);padding:8px 0">No tool activity recorded</div>');
+          : '<div style="font-size:12px;color:var(--fg-tertiary);padding:8px 0">No tool activity recorded</div>'));
       // A page can legitimately return zero events while still carrying a cursor
       // (e.g. every event on that page was redacted) — the control must stay
       // reachable so bounded-but-incomplete data never masquerades as "nothing here".
       moreBtn.hidden = !pilotActivityCursor;
       moreBtn.onclick = loadMorePilotActivity;
+      wirePilotActivityRetry();
       return;
     }
     let html = '';
@@ -779,7 +827,7 @@ export const drawerScript = `
         + '</div>';
       if (event.payload != null) payloads.push({ id: payloadId, text: event.payload });
     }
-    el.innerHTML = html;
+    el.innerHTML = html + errorBanner;
     // Tool output is untrusted runner/model text — assigned via textContent onto the
     // <pre> placeholders above, exactly like the failure-evidence stderr/stdout tails,
     // so a payload containing markup can never be parsed as HTML.
@@ -789,15 +837,47 @@ export const drawerScript = `
     }
     moreBtn.hidden = !pilotActivityCursor;
     moreBtn.onclick = loadMorePilotActivity;
+    wirePilotActivityRetry();
+  }
+
+  async function loadInitialPilotActivity(jobId, attemptId) {
+    const page = await fetchReviewFixActivityPage(attemptId, null);
+    if (currentJobId !== jobId || currentAttemptId !== attemptId) return;
+    if (!page) {
+      pilotActivityError = 'initial';
+      renderPilotActivity();
+      return;
+    }
+    pilotActivityEvents = page.events;
+    pilotActivityCursor = page.nextCursor;
+    // Sticky: a later page reporting false must never erase an earlier page's true — once
+    // the stream is known truncated for this attempt, that stays the case until the attempt
+    // itself switches (see resetPilotState/isNewAttempt), not just until the next page.
+    pilotActivityTruncated = pilotActivityTruncated || page.truncated;
+    pilotActivityLoaded = true;
+    pilotActivityError = null;
+    renderPilotActivity();
   }
 
   async function loadMorePilotActivity() {
-    if (!currentAttemptId || !pilotActivityCursor) return;
-    const page = await fetchReviewFixActivityPage(currentAttemptId, pilotActivityCursor);
-    if (!page) return;
+    // Capture identity before the await — a fast job/attempt switch or a drawer close while
+    // this request is in flight must discard the response rather than concat it into
+    // whatever activity list is current by the time it resolves.
+    const jobId = currentJobId;
+    const attemptId = currentAttemptId;
+    const cursor = pilotActivityCursor;
+    if (!attemptId || !cursor) return;
+    const page = await fetchReviewFixActivityPage(attemptId, cursor);
+    if (currentJobId !== jobId || currentAttemptId !== attemptId) return;
+    if (!page) {
+      pilotActivityError = 'more';
+      renderPilotActivity();
+      return;
+    }
     pilotActivityEvents = pilotActivityEvents.concat(page.events);
     pilotActivityCursor = page.nextCursor;
-    pilotActivityTruncated = page.truncated;
+    pilotActivityTruncated = pilotActivityTruncated || page.truncated;
+    pilotActivityError = null;
     renderPilotActivity();
   }
 
@@ -903,13 +983,18 @@ export const drawerScript = `
     const isNewAttempt = currentAttemptId !== job.dispatchId;
     if (isNewAttempt) {
       currentAttemptId = job.dispatchId;
+      pilotActivityLoaded = false;
       pilotActivityEvents = [];
       pilotActivityCursor = null;
       pilotActivityTruncated = false;
+      pilotActivityError = null;
     }
     const result = await fetchReviewFixAttempt(job.dispatchId);
     if (currentJobId !== job.id) return;
     if (result.kind === 'none' || result.kind === 'error') {
+      // Deliberately leaves pilotActivityLoaded/currentAttemptId untouched: an attempt read
+      // that itself failed must never be mistaken by the next refresh for "activity already
+      // loaded", or a later successful background refresh would silently skip page one.
       hidePilotSection();
       return;
     }
@@ -928,10 +1013,19 @@ export const drawerScript = `
       document.getElementById('drawer-pilot-activity').innerHTML = '';
       document.getElementById('drawer-pilot-activity-count').textContent = '';
       document.getElementById('drawer-pilot-activity-more').hidden = true;
+      // The read side just went dark, so any activity shown before it did is no longer
+      // trustworthy — require a fresh page one once it recovers, rather than leaving
+      // pilotActivityLoaded true and quietly keeping this wiped-out DOM on the next refresh.
+      pilotActivityLoaded = false;
+      pilotActivityError = null;
       // Recovery controls stay reachable even when the read side is degraded — an
-      // unknown/unreadable attempt is exactly when reconcile/adopt/cancel matter most,
-      // and none of them is a force-release that bypasses that uncertainty.
-      renderPilotActions(job.dispatchId);
+      // unknown/unreadable attempt is exactly when reconcile/adopt/cancel matter most, and
+      // none of them is a force-release that bypasses that uncertainty. Rendered once per
+      // attempt (see pilotActionsAttemptId below), not on every degraded refresh.
+      if (pilotActionsAttemptId !== job.dispatchId) {
+        renderPilotActions(job.dispatchId);
+        pilotActionsAttemptId = job.dispatchId;
+      }
       return;
     }
     document.getElementById('drawer-pilot-unavailable').innerHTML = '';
@@ -942,20 +1036,20 @@ export const drawerScript = `
     renderPilotLinks(attempt, job);
     renderPilotSnapshot(attempt);
     renderPilotCycles(attempt);
-    renderPilotActions(job.dispatchId);
-    if (isNewAttempt || !background) {
-      const page = await fetchReviewFixActivityPage(job.dispatchId, null);
-      if (currentJobId !== job.id) return;
-      if (page) {
-        pilotActivityEvents = page.events;
-        pilotActivityCursor = page.nextCursor;
-        pilotActivityTruncated = page.truncated;
-      }
-      renderPilotActivity();
+    // Rendered once per attempt, not on every 5s refresh — recreating these buttons on a
+    // background refresh of the same attempt would wipe a visible action status message and
+    // any in-progress Adopt input the reader hasn't submitted yet.
+    if (pilotActionsAttemptId !== job.dispatchId) {
+      renderPilotActions(job.dispatchId);
+      pilotActionsAttemptId = job.dispatchId;
     }
-    // A background refresh of the same attempt deliberately leaves an in-progress
-    // activity pagination alone rather than re-fetching page one — the same reason
-    // renderSteps preserves open evidence panels across its own 5s re-render.
+    if (!pilotActivityLoaded || !background) {
+      await loadInitialPilotActivity(job.id, job.dispatchId);
+      if (currentJobId !== job.id) return;
+    }
+    // A background refresh that already has page one loaded deliberately leaves an
+    // in-progress activity pagination alone rather than re-fetching page one — the same
+    // reason renderSteps preserves open evidence panels across its own 5s re-render.
   }
 
   function resetDrawerContent() {
