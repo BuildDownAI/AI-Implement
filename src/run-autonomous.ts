@@ -124,7 +124,7 @@ export class RunnerActivitySink implements ActivitySink {
   }
 
   final(identity: ActivityIdentity, _lastSequence: number): void {
-    this.reporters.get(identity.producerId)?.finalize();
+    this.reporterFor(identity.producerId).finalize();
   }
 
   /** Bounded best-effort flush of every producer this run ever touched. Never throws. */

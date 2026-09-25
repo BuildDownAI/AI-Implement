@@ -1221,14 +1221,24 @@ describe("runAutonomous", () => {
         expect(body.finalSequence).toBe(1);
       });
 
-      it("never contacts the network for a producerId that recorded no events — final() on an untouched producer is a no-op", async () => {
-        const mockFetch = vi.fn();
+      it("delivers the empty-stream marker and final sequence for a producerId that recorded no tool events — an empty model invocation still gets a final marker", async () => {
+        const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
         const sink = new RunnerActivitySink("https://orchestrator.example", "ptok", "attempt-activity-1", mockFetch);
 
         sink.final({ attemptId: "attempt-activity-1", producerId: "never-touched", sequence: 0 }, 0);
         await sink.shutdown();
 
-        expect(mockFetch).not.toHaveBeenCalled();
+        expect(mockFetch).toHaveBeenCalledTimes(1);
+        const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
+          attemptId: string;
+          producerId: string;
+          events: Array<{ kind: string; sequence: number }>;
+          finalSequence?: number;
+        };
+        expect(body.attemptId).toBe("attempt-activity-1");
+        expect(body.producerId).toBe("never-touched");
+        expect(body.events.map((e) => e.kind)).toEqual(["activity_stream_empty"]);
+        expect(body.finalSequence).toBe(0);
       });
     });
 
