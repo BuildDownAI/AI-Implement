@@ -60,6 +60,8 @@ Two consequences worth knowing:
 
 Collection additionally dedupes in memory by normalized body before anything is stored, keeping the variant that carries a file and line over one that does not.
 
+**Revisioning.** Every row also carries a `revision` counter, starting at 1 on first insert and incremented by exactly 1 on every accepted upsert against that `(repo, pr_number, finding_key)` key — including a byte-identical re-report, and independent of the status-preservation rule above. `markReviewFindingResolvedIfRevision` / `markReviewFindingDeferredIfRevision` (`src/review-ledger-store.ts`) take an `(id, revision)` pair and only apply when the stored revision still matches: a disposition computed from a snapshot taken before a later re-report bumped the revision is a no-op, and that newer report stays `open` for its own disposition rather than being silently closed by a stale caller. The unconditional resolve/defer helpers (`markReviewFindingsResolvedByIds`, `markReviewFindingsDeferredByKeys`, `markReviewFindingsResolvedForPrSeenBefore`) are unchanged and remain what the callback path in `src/runner-callback.ts` uses today; the `(id, revision)`-conditional helpers are additive and not yet wired into a production caller.
+
 ## The four tables
 
 | Table | Grain | Purpose |
