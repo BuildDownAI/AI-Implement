@@ -665,8 +665,8 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
   // Crash window #1 (inbox commit before ACK), via the real durable inbox and
   // the real ReviewFixDeliveryPump/facade — the production callback ingress.
   // -------------------------------------------------------------------------
-  it("inbox commit before ACK: a feedback delivery whose HTTP acknowledgement is lost still becomes exactly one admitted attempt", async () => {
-    const env = envFor("alwaysReplay");
+  it.each(VARIANTS.map(([label]) => label))("inbox commit before ACK: a feedback delivery whose HTTP acknowledgement is lost still becomes exactly one admitted attempt (%s)", async (label) => {
+    const env = envFor(label);
     const fixture = freshScenario("inbox-crash");
     fixture.pending = { taskText: "Fix 1 finding version", findings: [{ findingKey: "f1", version: 1 }] };
     const deliveryId = feedbackDeliveryId(fixture.scope, 1);
