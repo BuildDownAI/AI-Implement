@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { RestateSidecar, restateDataDir, RESTATE_ADMIN_BASE_URL, RESTATE_INGRESS_BIND_ADDRESS } from "../restate/server.js";
 import { getRestateStatus, resetRestateStatus } from "../restate/status.js";
+import { createRestateRegistrationGate, stopSidecarsConcurrently } from "../index.js";
 
 // ---------------------------------------------------------------------------
 // Helpers — mirrors src/__tests__/kg-sidecar.test.ts
@@ -572,5 +573,162 @@ describe("status contract transitions", () => {
     expect(getRestateStatus().sidecar).toEqual({ state: "exited", code: null, signal: null });
     expect(stderrOutput.some((line) => line.includes("sidecar process error"))).toBe(true);
     await expect(sidecar.whenReady()).resolves.toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Boot wiring (AII-807): src/index.ts's createRestateRegistrationGate /
+// stopSidecarsConcurrently, exercised standalone with fakes, then combined with a real
+// RestateSidecar to prove the whenReady()-driven wiring end to end.
+// ---------------------------------------------------------------------------
+
+describe("createRestateRegistrationGate", () => {
+  it("attempt() starts and registers the endpoint exactly once, even called twice (flapping late-readiness signal)", async () => {
+    const startRestateEndpoint = vi.fn(async () => undefined);
+    const registerRestateEndpoint = vi.fn(async () => ({ outcome: "registered-no-force" as const }));
+    const gate = createRestateRegistrationGate(() => false, { startRestateEndpoint, registerRestateEndpoint });
+
+    await gate.attempt();
+    await gate.attempt();
+
+    expect(startRestateEndpoint).toHaveBeenCalledTimes(1);
+    expect(registerRestateEndpoint).toHaveBeenCalledTimes(1);
+    expect(getRestateStatus().registration).toEqual({ state: "registered" });
+  });
+
+  it("refuses to start or register once shutdown has begun", async () => {
+    const startRestateEndpoint = vi.fn(async () => undefined);
+    const registerRestateEndpoint = vi.fn(async () => ({ outcome: "registered-no-force" as const }));
+    const gate = createRestateRegistrationGate(() => true, { startRestateEndpoint, registerRestateEndpoint });
+
+    await gate.attempt();
+
+    expect(startRestateEndpoint).not.toHaveBeenCalled();
+    expect(registerRestateEndpoint).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["registered-no-force", { state: "registered" }],
+    ["registered-drained-force", { state: "registered" }],
+    ["declined-conflict", { state: "declined-conflict" }],
+    ["unreachable", { state: "unreachable" }],
+  ] as const)("maps registration outcome %s onto the shared status contract", async (outcome, expected) => {
+    const gate = createRestateRegistrationGate(() => false, {
+      startRestateEndpoint: async () => undefined,
+      registerRestateEndpoint: async () => ({ outcome }),
+    });
+
+    await gate.attempt();
+
+    expect(getRestateStatus().registration).toEqual(expected);
+  });
+
+  it("a thrown endpoint-start error is reported as unreachable, not left unset", async () => {
+    const gate = createRestateRegistrationGate(() => false, {
+      startRestateEndpoint: async () => {
+        throw new Error("boom");
+      },
+      registerRestateEndpoint: async () => ({ outcome: "registered-no-force" }),
+    });
+
+    await gate.attempt();
+
+    expect(getRestateStatus().registration).toEqual({ state: "unreachable" });
+  });
+});
+
+describe("stopSidecarsConcurrently", () => {
+  it("two 4s stops finish together in under 5s", async () => {
+    const fakeStop = () => new Promise<void>((resolve) => setTimeout(resolve, 4_000));
+    const started = Date.now();
+
+    await stopSidecarsConcurrently({ stop: fakeStop }, { stop: fakeStop });
+
+    expect(Date.now() - started).toBeLessThan(5_000);
+  }, 10_000);
+});
+
+describe("main() wiring: whenReady() drives the registration gate end to end", () => {
+  it("a sidecar that only becomes ready after the initial timeout still gets registered, exactly once", async () => {
+    const dataDir = makeTmpDir();
+    const script = join(dataDir, "fake-server.sh");
+    writeScript(script, "sleep 60");
+
+    let calls = 0;
+    const sidecar = new RestateSidecar(
+      { dataDir, pollTimeoutMs: 100, pollIntervalMs: 10 },
+      {
+        httpGet: async () => {
+          calls++;
+          return calls > 15;
+        },
+        spawn: testSpawn,
+        resolveBinary: () => script,
+      },
+    );
+
+    const startRestateEndpoint = vi.fn(async () => undefined);
+    const registerRestateEndpoint = vi.fn(async () => ({ outcome: "registered-no-force" as const }));
+    const gate = createRestateRegistrationGate(() => false, { startRestateEndpoint, registerRestateEndpoint });
+
+    try {
+      const ready = await sidecar.start();
+      expect(ready).toBe(false); // times out initially — recovers in the background
+
+      void sidecar.whenReady().then((r) => {
+        if (r) void gate.attempt();
+      });
+
+      await expect(sidecar.whenReady()).resolves.toBe(true);
+      await new Promise((resolve) => setTimeout(resolve, 20)); // let the .then() continuation run
+
+      expect(startRestateEndpoint).toHaveBeenCalledTimes(1);
+      expect(registerRestateEndpoint).toHaveBeenCalledTimes(1);
+    } finally {
+      await sidecar.stop();
+    }
+  });
+
+  it("a late-readiness signal that arrives after shutdown starts does not start or register the endpoint", async () => {
+    const dataDir = makeTmpDir();
+    const script = join(dataDir, "fake-server.sh");
+    writeScript(script, "sleep 60");
+
+    let calls = 0;
+    const sidecar = new RestateSidecar(
+      { dataDir, pollTimeoutMs: 100, pollIntervalMs: 10 },
+      {
+        httpGet: async () => {
+          calls++;
+          return calls > 15;
+        },
+        spawn: testSpawn,
+        resolveBinary: () => script,
+      },
+    );
+
+    const startRestateEndpoint = vi.fn(async () => undefined);
+    const registerRestateEndpoint = vi.fn(async () => ({ outcome: "registered-no-force" as const }));
+    let shuttingDown = false;
+    const gate = createRestateRegistrationGate(() => shuttingDown, { startRestateEndpoint, registerRestateEndpoint });
+
+    try {
+      const ready = await sidecar.start();
+      expect(ready).toBe(false);
+
+      shuttingDown = true; // shutdown wins the race — begins before the late signal arrives
+
+      void sidecar.whenReady().then((r) => {
+        if (r) void gate.attempt();
+      });
+
+      await expect(sidecar.whenReady()).resolves.toBe(true);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      expect(startRestateEndpoint).not.toHaveBeenCalled();
+      expect(registerRestateEndpoint).not.toHaveBeenCalled();
+    } finally {
+      await sidecar.stop();
+    }
   });
 });

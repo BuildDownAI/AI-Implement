@@ -52,19 +52,54 @@ An issue with no Restate surface says so in the same place ("unit tests only"), 
 
 ### Boot sequence
 
-`main()` (`src/index.ts`) constructs one `RestateSidecar` and calls `start()` before `loadConfig()`, right after the KG sidecar's own `start()`. On success it starts the SDK endpoint (`startRestateEndpoint()`) and registers it (`register()`), logging the outcome. `stop()` runs in the same `shutdown` closure that stops the KG sidecar, before `server.close()`.
+`main()` (`src/index.ts`) constructs one `RestateSidecar` and calls `start()` before `loadConfig()`, right after the KG sidecar's own `start()`. Starting the SDK endpoint (`startRestateEndpoint()`) and registering it (`register()`) is driven off `whenReady()` (AII-724's late-readiness promise, below), not off `start()`'s own returned boolean — so a sidecar that only becomes ready in the background, after an initial readiness timeout, still gets its endpoint started and registered, exactly once (AII-807). `createRestateRegistrationGate` (`src/index.ts`) is the latch: its `attempt()` runs the start-and-register sequence at most once per boot, records the outcome via `setRestateStatus`, and refuses outright once shutdown has begun. `shuttingDown` is declared at the very top of `main()`, above the sidecar's own construction, specifically so the gate's `isShuttingDown()` check and the `shutdown` closure below read the exact same flag — a late readiness callback and a shutdown signal race over one latch, not two, so shutdown always wins: a `whenReady()` resolution that arrives after `shuttingDown` flips `true` is a no-op.
+
+`stop()` runs in the same `shutdown` closure that stops the KG sidecar, before `server.close()`, and the two sidecars are stopped concurrently — `stopSidecarsConcurrently` (`src/index.ts`), a thin `Promise.all` — rather than one after the other, so neither sidecar's `stopTimeoutMs` adds to the other's inside the 10-second forced-shutdown budget (`SHUTDOWN_BUDGET_MS`). Two sidecars each taking up to their own `stopTimeoutMs` (5s default) to exit now cost one wait, not two, leaving margin for `postShutdownNotice` ahead of them and `server.close()` after.
 
 Every step is non-fatal: a missing platform binary, an early exit, or a readiness timeout each log at least one warning (`[restate] …`) and boot continues. Until a run kind migrates onto Restate, nothing in the orchestrator depends on the sidecar being up. **No run kind has migrated as of this writing** — `RESTATE_SERVICES` is empty and neither `src/kg-refresh.ts` nor `src/index.ts` has a Restate-backed trigger seam yet. The planned first consumer, kg-refresh (AII-683), is expected to answer `503 restate-unavailable` at its trigger seam when the sidecar is down, instead of hanging; that behavior does not exist until AII-683 lands.
 
 #### Late readiness (AII-724)
 
-A readiness timeout no longer ends the sidecar's lifecycle. `start()` still resolves its original boolean at the `pollTimeoutMs` deadline — `main()`'s call sites are unchanged and boot proceeds exactly as before — but `RestateSidecar` keeps polling the same child in the background after that deadline instead of giving up on it. Two things can happen next, each logged and reported exactly once: the child later answers healthy (`[restate] sidecar ready after degraded period …`), or it exits (`[restate] sidecar exited (code=…, signal=…)`, read off the `"exit"` event rather than `"close"`, so the message does not wait on a lagging stream-drain event).
+A readiness timeout no longer ends the sidecar's lifecycle. `start()` still resolves its original boolean at the `pollTimeoutMs` deadline — `main()`'s call to `start()` is unchanged and boot proceeds exactly as before — but `RestateSidecar` keeps polling the same child in the background after that deadline instead of giving up on it. Two things can happen next, each logged and reported exactly once: the child later answers healthy (`[restate] sidecar ready after degraded period …`), or it exits (`[restate] sidecar exited (code=…, signal=…)`, read off the `"exit"` event rather than `"close"`, so the message does not wait on a lagging stream-drain event).
 
-`whenReady(): Promise<boolean>` is how a caller observes that eventual outcome — it resolves once for the child spawned by the most recent `start()`, `true` on ready (immediate or delayed) and `false` on exit, missing binary, or `stop()`. No caller in this repo awaits it yet; it exists as the seam AII-807 wires into a boot/health route.
+`whenReady(): Promise<boolean>` is how a caller observes that eventual outcome — it resolves once for the child spawned by the most recent `start()`, `true` on ready (immediate or delayed) and `false` on exit, missing binary, or `stop()`. `main()` attaches its continuation to `whenReady()` right after `start()` returns (§ "Boot sequence") — that single attachment covers both an immediate ready (the promise is already settled) and a delayed one, because `createRestateRegistrationGate`'s latch makes calling `attempt()` from that continuation idempotent regardless of when it fires.
 
-`restart()` (`stop()` then `start()`, mirroring `KgSidecar.restart()` at `src/kg-sidecar.ts:179-182`) is the only re-spawn path. There is no automatic restart when the child exits unexpectedly — an unattended exit is reported through the status below and left there. `stop()` clears the background poll timer and resolves any pending `whenReady()` to `false` before tearing down the child, so a `stop()`/`restart()` during a degraded period cannot leave an orphaned timer polling a child that is no longer current.
+`restart()` (`stop()` then `start()`, mirroring `KgSidecar.restart()` at `src/kg-sidecar.ts:179-182`) is the only re-spawn path. There is no automatic restart when the child exits unexpectedly, and no admin route calls `restart()` either — an unattended exit is reported through the status contract below and left there. `stop()` clears the background poll timer and resolves any pending `whenReady()` to `false` before tearing down the child, so a `stop()`/`restart()` during a degraded period cannot leave an orphaned timer polling a child that is no longer current.
 
-**Status contract.** Sidecar lifecycle is reported through `src/restate/status.ts` (`setRestateStatus` / `getRestateStatus`, AII-773), a module-level state machine independent of this class: `starting` → `ready` | `timeout` | `exited` | `missing-binary`, with `timeout` able to transition to `ready` or `exited` once the background poll settles. `RestateSidecar` writes to it; nothing reads it into a route yet — wiring `getRestateStatus()` into boot logging and a health endpoint is AII-807, not this issue.
+**Status contract.** Sidecar lifecycle is reported through `src/restate/status.ts` (`setRestateStatus` / `getRestateStatus`, AII-773), a module-level state machine independent of this class: `starting` → `ready` | `timeout` | `exited` | `missing-binary`, with `timeout` able to transition to `ready` or `exited` once the background poll settles. `RestateSidecar` writes the sidecar half; `createRestateRegistrationGate` writes the registration half after each `attempt()` (§ "Health surfaces" below covers both in full).
+
+#### Operator restart behavior
+
+There is no admin-triggered restart for just the Restate sidecar or its endpoint registration — recovering from a stuck sidecar (`exited`, `missing-binary`, or a registration stuck at `unreachable`/`declined-conflict`) means restarting or redeploying the whole orchestrator process (the backend-outage playbook in `CLAUDE.md`, or a plain process restart on Fly). A fresh process re-runs the entire boot sequence above from scratch: a new `RestateSidecar` instance, a new `createRestateRegistrationGate` with its latch unset, and `status.ts` back at its honest `starting`/`not-attempted` default — so a previous process's stuck state never carries forward, and there is nothing to reset by hand before restarting. In-flight work is unaffected either way: no run kind has migrated onto Restate yet (§ "Boot sequence" above), so a stuck sidecar degrades `/mcp`'s `get_tenant_health` and the kg-refresh trigger seam, never a run in progress.
+
+### Health surfaces (AII-807)
+
+`GET /` (`src/index.ts`) and `get_tenant_health` (`src/restate/tools.ts`, over `/mcp`) both add a `restate` field, `getRestateStatus()` read verbatim — one source of truth (`src/restate/status.ts`), so the two surfaces cannot drift under a flapping sidecar the way two independently-tracked copies could. The shape:
+
+```json
+{ "sidecar": { "state": "..." }, "registration": { "state": "..." } }
+```
+
+`sidecar.state` — written by `RestateSidecar` (`src/restate/server.ts`):
+
+| Value | Meaning |
+|---|---|
+| `starting` | `start()` has been called; no readiness answer yet (also the value before `start()` is ever called) |
+| `ready` | The admin API answered healthy — immediately, or later via the background poll after a timeout |
+| `timeout` | The initial `pollTimeoutMs` deadline passed with no healthy answer; background polling continues (may still transition to `ready` or `exited`) |
+| `exited` (`code`, `signal`) | The child process exited or errored, at any point — during startup, after becoming ready, or during the post-timeout background poll |
+| `missing-binary` | No `@restatedev/restate-server-<platform>` optional dependency is installed for this OS/arch; `start()` never spawned a child |
+
+`registration.state` — written by `createRestateRegistrationGate` (`src/index.ts`) after each `attempt()`, mapping the finer-grained `register()` outcome (`src/restate/endpoint.ts`) onto this coarser contract:
+
+| Value | Meaning | `register()` outcome(s) it covers |
+|---|---|---|
+| `not-attempted` | The gate has not run yet — the sidecar has never reported ready, or shutdown began first | *(none — pre-attempt default)* |
+| `registered` | The SDK endpoint is registered with the admin API | `registered-no-force` (no conflict), `registered-drained-force` (conflicted, but zero in-flight jobs let a forced re-registration through) |
+| `declined-conflict` | A `META0004` conflict was found and in-flight kg-refresh jobs exist, so the gate declined to force the registration | `declined-conflict` |
+| `unreachable` | The admin API could not be reached, answered an unexpected error, or `startRestateEndpoint()`/`registerRestateEndpoint()` threw | `unreachable`, plus any thrown error from either call |
+
+Both `sidecar` and `registration` are independent — a `registration.state` other than `not-attempted` implies `sidecar.state` was `ready` at some point, but the reverse is not guaranteed (the gate could still be mid-`attempt()`, or shutdown could have won the race first).
 
 ### Ports and paths — all loopback, all constants
 
