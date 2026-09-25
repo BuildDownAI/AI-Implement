@@ -3,6 +3,14 @@ import { DefaultPipelineContext } from "../pipeline/context.js";
 import { PipelineRunner, type PipelineRunnerOptions } from "../pipeline/runner.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
 import type {
+  ActivityIdentity,
+  ActivitySink,
+  ActivityToolResult,
+  ActivityToolStart,
+  BoundedActivityText,
+  CycleActivitySummary,
+  InvokeParams,
+  LLMExecutor,
   PipelineContext,
   PipelineDefinition,
   Step,
@@ -10,7 +18,7 @@ import type {
   StepReporter,
 } from "../pipeline/types.js";
 
-function makeContext(overrides: Partial<Parameters<typeof DefaultPipelineContext>[0]> = {}): DefaultPipelineContext {
+function makeContext(overrides: Partial<ConstructorParameters<typeof DefaultPipelineContext>[0]> = {}): DefaultPipelineContext {
   return new DefaultPipelineContext({
     jobId: 1,
     issueId: "issue-1",
@@ -577,5 +585,149 @@ describe("PipelineRunner — dynamic step loading via resolveModule()", () => {
     );
 
     expect(helloMod.run).toHaveBeenCalledOnce();
+  });
+});
+
+describe("ActivitySink contract (AII-788)", () => {
+  it("PipelineContext, PipelineContextData and InvokeParams compile and behave unchanged with no activitySink", () => {
+    const ctx: PipelineContext = makeContext();
+    expect(ctx.activitySink).toBeUndefined();
+    expect(ctx.data.activitySink).toBeUndefined();
+
+    const params: InvokeParams = { prompt: "do the thing", model: "claude-x" };
+    expect(params.activitySink).toBeUndefined();
+
+    // Existing LLMExecutor implementations stay source compatible: no
+    // implementation is required to read or even declare activitySink.
+    const executor: LLMExecutor = {
+      invoke: vi.fn().mockResolvedValue({ stdout: "", exitCode: 0, tokensUsed: 0 }),
+    };
+    expect(executor).toBeDefined();
+
+    // Existing StepReporter implementations (single-arg `report(step)`) stay
+    // source compatible with the interface's new optional second param.
+    const reporter: StepReporter = new NoopStepReporter();
+    expect(reporter).toBeDefined();
+  });
+
+  it("PipelineContextData carries an optional activitySink independently of PipelineContext's own field", () => {
+    const sink: ActivitySink = {
+      toolStart: vi.fn(),
+      toolResult: vi.fn(),
+      cycleSummary: vi.fn(),
+      final: vi.fn(),
+    };
+
+    const ctx = makeContext({ activitySink: sink });
+    expect(ctx.data.activitySink).toBe(sink);
+    // PipelineContext's own `activitySink` field is independent and stays
+    // unset unless a concrete implementation wires it through.
+    expect((ctx as PipelineContext).activitySink).toBeUndefined();
+  });
+
+  it("StepReporter.report accepts an optional activitySink second argument", async () => {
+    const sink: ActivitySink = {
+      toolStart: vi.fn(),
+      toolResult: vi.fn(),
+      cycleSummary: vi.fn(),
+      final: vi.fn(),
+    };
+
+    const received: (ActivitySink | undefined)[] = [];
+    const reporter: StepReporter = {
+      report: async (_step, activitySink) => {
+        received.push(activitySink);
+      },
+    };
+
+    const step: Step = {
+      id: "s1",
+      type: "custom",
+      status: "passed",
+      started_at: new Date().toISOString(),
+      ended_at: new Date().toISOString(),
+      parent_step_id: null,
+      inputs: {},
+      outputs: {},
+      logs_url: null,
+    };
+
+    await reporter.report(step);
+    await reporter.report(step, sink);
+
+    expect(received).toEqual([undefined, sink]);
+
+    // A reporter that ignores the new param (every existing built-in) still
+    // satisfies the interface with zero edits.
+    const legacyReporter: StepReporter = new NoopStepReporter();
+    await legacyReporter.report(step);
+    expect(legacyReporter).toBeDefined();
+  });
+
+  it("an object literal satisfies ActivitySink with the (attemptId, producerId, sequence) identity on every method", () => {
+    const calls: string[] = [];
+
+    const sink: ActivitySink = {
+      toolStart(identity, input) {
+        calls.push(`start:${identity.attemptId}:${identity.producerId}:${identity.sequence}:${input.action}`);
+      },
+      toolResult(identity, result) {
+        calls.push(`result:${identity.sequence}:${result.output.truncated}`);
+      },
+      cycleSummary(identity, summary) {
+        calls.push(`cycle:${identity.sequence}:${summary.cycle}`);
+      },
+      final(identity, lastSequence) {
+        calls.push(`final:${identity.sequence}:${lastSequence}`);
+      },
+    };
+
+    const identity: ActivityIdentity = { attemptId: "attempt-1", producerId: "runner-1", sequence: 0 };
+    const startInput: ActivityToolStart = { cycle: 1, action: "Bash", detail: { command: "echo hi" } };
+    sink.toolStart(identity, startInput);
+
+    const notTruncated: BoundedActivityText = { text: "ok", truncated: false };
+    const resultInput: ActivityToolResult = { cycle: 1, action: "Bash", output: notTruncated };
+    sink.toolResult({ ...identity, sequence: 1 }, resultInput);
+
+    const summary: CycleActivitySummary = {
+      cycle: 1,
+      commits: ["a".repeat(40)],
+      dispositions: [{ key: "finding-1", disposition: "fixed" }],
+      tests: [{ name: "unit", passed: true }],
+      verdict: { approved: true, summary: "looks good" },
+      usage: { tokensIn: 100, tokensOut: 50, costUsd: 0.01 },
+    };
+    sink.cycleSummary({ ...identity, sequence: 2 }, summary);
+    sink.final({ ...identity, sequence: 3 }, 3);
+
+    expect(calls).toEqual([
+      "start:attempt-1:runner-1:0:Bash",
+      "result:1:false",
+      "cycle:2:1",
+      "final:3:3",
+    ]);
+
+    // A missing method fails compilation, not just this assertion — see the
+    // `ActivitySink` type import above, which is what actually exercises it.
+    const attached: PipelineContext = {
+      ...makeContext(),
+      activitySink: sink,
+      getOutputs: () => ({}),
+      setOutputs: () => {},
+      resolveInputs: () => ({}),
+    };
+    expect(attached.activitySink).toBe(sink);
+
+    const params: InvokeParams = { prompt: "p", model: "m", activitySink: sink };
+    expect(params.activitySink).toBe(sink);
+  });
+
+  it("BoundedActivityText covers both the truncated and non-truncated event contract", () => {
+    const notTruncated: BoundedActivityText = { text: "small payload", truncated: false };
+    const truncated: BoundedActivityText = { text: "large payload cut short…[truncated]", truncated: true };
+
+    expect(notTruncated.truncated).toBe(false);
+    expect(truncated.truncated).toBe(true);
   });
 });
