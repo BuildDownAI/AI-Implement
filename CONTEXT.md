@@ -162,7 +162,7 @@ The pickup label is the one Linear label whose presence makes an issue a dispatc
 
 A review-fix attempt is one authorized runner execution that addresses review feedback on an existing PR. An infrastructure retry keeps the attempt's identity; a replacement runner starts a new attempt.
 
-**Not to be confused with:** An internal review/fix cycle within the runner.
+**Not to be confused with:** A review-fix run, which is the orchestrator dispatch that may contain a Restate-tracked attempt; or an internal review/fix cycle within the runner.
 
 ## Lifecycle owner
 
