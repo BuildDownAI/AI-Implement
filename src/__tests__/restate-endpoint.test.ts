@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { restateBindAddress, register } from "../restate/endpoint.js";
+import { restateBindAddress, register, queryNonCompletedInvocations } from "../restate/endpoint.js";
 
 describe("restateBindAddress", () => {
   afterEach(() => {
@@ -86,7 +86,6 @@ describe("register", () => {
     const result = await register({
       adminBaseUrl: "http://127.0.0.1:9070",
       fetchImpl: fetchImpl as unknown as typeof fetch,
-      getInFlightJobs: () => [],
     });
 
     expect(fetchImpl).toHaveBeenCalledTimes(1);
@@ -102,14 +101,13 @@ describe("register", () => {
     const result = await register({
       adminBaseUrl: "http://127.0.0.1:9070",
       fetchImpl: fetchImpl as unknown as typeof fetch,
-      getInFlightJobs: () => [],
     });
 
     expect(fetchImpl).toHaveBeenCalledTimes(1);
     expect(result).toEqual({ outcome: "registered-no-force" });
   });
 
-  it("META0004 conflict with zero in-flight jobs retries with force:true and succeeds", async () => {
+  it("META0004 conflict with zero non-completed invocations on the old deployment retries with force:true and succeeds", async () => {
     const fetchImpl = vi
       .fn<(url: string, init: RequestInit) => Promise<Response>>()
       .mockResolvedValueOnce(jsonResponse(409, { restate_code: "META0004", message: "conflict" }))
@@ -118,7 +116,7 @@ describe("register", () => {
     const result = await register({
       adminBaseUrl: "http://127.0.0.1:9070",
       fetchImpl: fetchImpl as unknown as typeof fetch,
-      getInFlightJobs: () => [],
+      queryNonCompletedInvocations: async () => 0,
     });
 
     expect(fetchImpl).toHaveBeenCalledTimes(2);
@@ -127,13 +125,41 @@ describe("register", () => {
     expect(result).toEqual({ outcome: "registered-drained-force" });
   });
 
-  it("META0004 conflict with in-flight jobs declines force — no second call", async () => {
+  it("META0004 conflict with a nonzero non-completed-invocation count declines force — no second call", async () => {
     const fetchImpl = vi.fn(async () => jsonResponse(409, { restate_code: "META0004", message: "conflict" }));
 
     const result = await register({
       adminBaseUrl: "http://127.0.0.1:9070",
       fetchImpl: fetchImpl as unknown as typeof fetch,
-      getInFlightJobs: () => [{ id: 1 } as never],
+      queryNonCompletedInvocations: async () => 3,
+    });
+
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(result.outcome).toBe("declined-conflict");
+  });
+
+  it("META0004 conflict with an unknown non-completed-invocation count (null) declines force, fail-closed — no second call", async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse(409, { restate_code: "META0004", message: "conflict" }));
+
+    const result = await register({
+      adminBaseUrl: "http://127.0.0.1:9070",
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      queryNonCompletedInvocations: async () => null,
+    });
+
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(result.outcome).toBe("declined-conflict");
+  });
+
+  it("META0004 conflict with a throwing invocation-count query declines force, fail-closed — no second call", async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse(409, { restate_code: "META0004", message: "conflict" }));
+
+    const result = await register({
+      adminBaseUrl: "http://127.0.0.1:9070",
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      queryNonCompletedInvocations: async () => {
+        throw new Error("admin API unreachable mid-query");
+      },
     });
 
     expect(fetchImpl).toHaveBeenCalledTimes(1);
@@ -146,7 +172,6 @@ describe("register", () => {
     const result = await register({
       adminBaseUrl: "http://127.0.0.1:9070",
       fetchImpl: fetchImpl as unknown as typeof fetch,
-      getInFlightJobs: () => [],
     });
 
     expect(fetchImpl).toHaveBeenCalledTimes(1);
@@ -159,7 +184,6 @@ describe("register", () => {
       const result = await register({
         adminBaseUrl: "http://127.0.0.1:9070",
         fetchImpl: hangingFetch(),
-        getInFlightJobs: () => [],
       });
       expect(result.outcome).toBe("unreachable");
     } finally {
@@ -178,7 +202,7 @@ describe("register", () => {
       const result = await register({
         adminBaseUrl: "http://127.0.0.1:9070",
         fetchImpl: fetchImpl as unknown as typeof fetch,
-        getInFlightJobs: () => [],
+        queryNonCompletedInvocations: async () => 0,
       });
       expect(result.outcome).toBe("unreachable");
     } finally {
@@ -195,11 +219,76 @@ describe("register", () => {
     const result = await register({
       adminBaseUrl: "http://127.0.0.1:9070",
       fetchImpl: fetchImpl as unknown as typeof fetch,
-      getInFlightJobs: () => [],
     });
 
     expect(result.outcome).toBe("unreachable");
     expect(errorSpy).toHaveBeenCalledTimes(1);
     expect(errorSpy.mock.calls[0][0]).toContain("unreachable");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// queryNonCompletedInvocations() — the drain check's own HTTP/parsing contract
+// ---------------------------------------------------------------------------
+
+describe("queryNonCompletedInvocations", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("posts a SQL query to POST /query with an Accept: application/json header, and resolves the row's count", async () => {
+    const fetchImpl = vi
+      .fn<(url: string, init: RequestInit) => Promise<Response>>()
+      .mockImplementation(async () => jsonResponse(200, { rows: [{ count: 2 }] }));
+
+    const result = await queryNonCompletedInvocations(fetchImpl as unknown as typeof fetch, "http://127.0.0.1:9070", "http://127.0.0.1:9080");
+
+    expect(result).toBe(2);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchImpl.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("http://127.0.0.1:9070/query");
+    expect(init.method).toBe("POST");
+    expect((init.headers as Record<string, string>).accept).toBe("application/json");
+    const body = JSON.parse(init.body as string) as { query: string };
+    expect(body.query).toContain("http://127.0.0.1:9080");
+    expect(body.query).toContain("status != 'completed'");
+    expect(body.query).toContain("last_attempt_deployment_id");
+    expect(body.query).toContain("target_service_name IN (SELECT name FROM sys_service");
+  });
+
+  it("resolves 0 when the query returns no matching deployment (nothing registered yet at that URI)", async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse(200, { rows: [{ count: 0 }] }));
+    const result = await queryNonCompletedInvocations(fetchImpl as unknown as typeof fetch, "http://127.0.0.1:9070", "http://127.0.0.1:9080");
+    expect(result).toBe(0);
+  });
+
+  it("resolves null (unknown) on a non-2xx response", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const fetchImpl = vi.fn(async () => jsonResponse(500, { message: "internal error" }));
+    const result = await queryNonCompletedInvocations(fetchImpl as unknown as typeof fetch, "http://127.0.0.1:9070", "http://127.0.0.1:9080");
+    expect(result).toBeNull();
+  });
+
+  it("resolves null (unknown) on an unrecognized response shape — no rows array", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const fetchImpl = vi.fn(async () => jsonResponse(200, { data: [] }));
+    const result = await queryNonCompletedInvocations(fetchImpl as unknown as typeof fetch, "http://127.0.0.1:9070", "http://127.0.0.1:9080");
+    expect(result).toBeNull();
+  });
+
+  it("resolves null (unknown) when the count column isn't a number", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const fetchImpl = vi.fn(async () => jsonResponse(200, { rows: [{ count: "2" }] }));
+    const result = await queryNonCompletedInvocations(fetchImpl as unknown as typeof fetch, "http://127.0.0.1:9070", "http://127.0.0.1:9080");
+    expect(result).toBeNull();
+  });
+
+  it("resolves null (unknown) when fetch itself throws", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const fetchImpl = vi.fn(async () => {
+      throw new Error("connect ECONNREFUSED 127.0.0.1:9070");
+    });
+    const result = await queryNonCompletedInvocations(fetchImpl as unknown as typeof fetch, "http://127.0.0.1:9070", "http://127.0.0.1:9080");
+    expect(result).toBeNull();
   });
 });

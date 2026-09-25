@@ -734,6 +734,103 @@ describe("createRestateRegistrationGate", () => {
 
     expect(getRestateStatus().registration).toEqual({ state: "unreachable" });
   });
+
+  // -------------------------------------------------------------------------
+  // Retry-on-decline (AII-721): a `declined-conflict` outcome arms a single
+  // unref'd 60s retry timer, one attempt at a time, cleared on success or on
+  // shutdown.
+  // -------------------------------------------------------------------------
+
+  const RETRY_MS = 60_000;
+
+  it("a declined-conflict outcome retries registration every 60s until it succeeds", async () => {
+    vi.useFakeTimers();
+    try {
+      const registerRestateEndpoint = vi
+        .fn<() => Promise<{ outcome: "declined-conflict" | "registered-drained-force" }>>()
+        .mockResolvedValueOnce({ outcome: "declined-conflict" })
+        .mockResolvedValueOnce({ outcome: "registered-drained-force" });
+      const gate = createRestateRegistrationGate(() => false, {
+        startRestateEndpoint: async () => undefined,
+        registerRestateEndpoint,
+      });
+
+      await gate.attempt();
+      expect(registerRestateEndpoint).toHaveBeenCalledTimes(1);
+      expect(getRestateStatus().registration).toEqual({ state: "declined-conflict" });
+
+      await vi.advanceTimersByTimeAsync(RETRY_MS);
+      expect(registerRestateEndpoint).toHaveBeenCalledTimes(2);
+      expect(getRestateStatus().registration).toEqual({ state: "registered" });
+
+      // The timer cleared itself on success: a further tick calls register no more.
+      await vi.advanceTimersByTimeAsync(RETRY_MS);
+      expect(registerRestateEndpoint).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not arm a second interval while a retry is already pending — one timer, not one per decline", async () => {
+    vi.useFakeTimers();
+    try {
+      const registerRestateEndpoint = vi.fn(async () => ({ outcome: "declined-conflict" as const }));
+      const setIntervalSpy = vi.spyOn(global, "setInterval");
+      const gate = createRestateRegistrationGate(() => false, {
+        startRestateEndpoint: async () => undefined,
+        registerRestateEndpoint,
+      });
+
+      await gate.attempt();
+      await vi.advanceTimersByTimeAsync(RETRY_MS);
+      await vi.advanceTimersByTimeAsync(RETRY_MS);
+
+      expect(registerRestateEndpoint).toHaveBeenCalledTimes(3); // initial attempt + two retries
+      expect(setIntervalSpy).toHaveBeenCalledTimes(1); // armed once, reused on every subsequent decline
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("the retry timer is unref'd — it must never keep the process alive on its own", async () => {
+    vi.useFakeTimers();
+    try {
+      const setIntervalSpy = vi.spyOn(global, "setInterval");
+      const gate = createRestateRegistrationGate(() => false, {
+        startRestateEndpoint: async () => undefined,
+        registerRestateEndpoint: async () => ({ outcome: "declined-conflict" as const }),
+      });
+
+      await gate.attempt();
+
+      expect(setIntervalSpy).toHaveBeenCalledTimes(1);
+      const timer = setIntervalSpy.mock.results[0].value as { hasRef(): boolean };
+      expect(timer.hasRef()).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stopRetrying() clears an armed retry timer — a shutdown must not leave a pending retry", async () => {
+    vi.useFakeTimers();
+    try {
+      const registerRestateEndpoint = vi.fn(async () => ({ outcome: "declined-conflict" as const }));
+      const gate = createRestateRegistrationGate(() => false, {
+        startRestateEndpoint: async () => undefined,
+        registerRestateEndpoint,
+      });
+
+      await gate.attempt();
+      expect(registerRestateEndpoint).toHaveBeenCalledTimes(1);
+
+      gate.stopRetrying();
+
+      await vi.advanceTimersByTimeAsync(RETRY_MS * 2);
+      expect(registerRestateEndpoint).toHaveBeenCalledTimes(1); // no retry fired after stopRetrying()
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe("stopSidecarsConcurrently", () => {

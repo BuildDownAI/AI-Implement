@@ -5152,6 +5152,9 @@ export interface RestateEndpointWireDeps {
   registerRestateEndpoint: () => Promise<RestateRegisterResult>;
 }
 
+/** How often a declined registration retries (AII-721) — the old deployment's non-completed invocations are expected to drain on their own; this just keeps checking back. */
+const RESTATE_REGISTRATION_RETRY_MS = 60_000;
+
 /**
  * Starts the Restate SDK endpoint and registers it with the sidecar's admin API. Called
  * from a `RestateSidecar.whenReady()` continuation (main(), below) rather than a single
@@ -5163,12 +5166,53 @@ export interface RestateEndpointWireDeps {
  * `isShuttingDown()` answers true: a late readiness signal must not start an endpoint, or
  * register it, after shutdown has begun. The two checks share one closure so a late
  * callback and the shutdown handler race over the same latch rather than two.
+ *
+ * A `declined-conflict` outcome (from either the initial attempt or a retry) arms a single
+ * unref'd `setInterval` that re-runs `registerRestateEndpoint()` every
+ * RESTATE_REGISTRATION_RETRY_MS — the endpoint itself is already up, so a retry only needs
+ * to re-register, not restart it. The timer clears itself once an attempt stops being
+ * `declined-conflict` (success or a distinct failure), and `stopRetrying()` clears it
+ * unconditionally — main()'s shutdown closure calls that so a shutdown doesn't leave a
+ * pending retry, and `.unref()` means an armed timer never keeps the process alive on its
+ * own either way.
  */
 export function createRestateRegistrationGate(
   isShuttingDown: () => boolean,
   deps: RestateEndpointWireDeps = { startRestateEndpoint, registerRestateEndpoint },
 ) {
   let attempted = false;
+  let retryTimer: ReturnType<typeof setInterval> | null = null;
+
+  function clearRetry(): void {
+    if (retryTimer !== null) {
+      clearInterval(retryTimer);
+      retryTimer = null;
+    }
+  }
+
+  async function attemptRegistration(label: string): Promise<void> {
+    try {
+      const result = await deps.registerRestateEndpoint();
+      if (isShuttingDown()) return;
+      setRestateStatus({ registration: restateRegistrationStatusFor(result.outcome) });
+      console.log(`[restate] ${label}: ${result.outcome}${result.detail ? ` (${result.detail})` : ""}`);
+      if (result.outcome === "declined-conflict") {
+        if (retryTimer === null && !isShuttingDown()) {
+          retryTimer = setInterval(() => {
+            void attemptRegistration("registration retry");
+          }, RESTATE_REGISTRATION_RETRY_MS);
+          retryTimer.unref();
+        }
+      } else {
+        clearRetry();
+      }
+    } catch (err) {
+      if (isShuttingDown()) return;
+      setRestateStatus({ registration: { state: "unreachable" } });
+      console.error(`[restate] ${label} failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   return {
     async attempt(): Promise<void> {
       if (attempted || isShuttingDown()) return;
@@ -5178,15 +5222,16 @@ export function createRestateRegistrationGate(
         // Shutdown may begin while the endpoint is opening. Never start a registration
         // after that await if the process is already draining.
         if (isShuttingDown()) return;
-        const result = await deps.registerRestateEndpoint();
-        if (isShuttingDown()) return;
-        setRestateStatus({ registration: restateRegistrationStatusFor(result.outcome) });
-        console.log(`[restate] boot registration: ${result.outcome}${result.detail ? ` (${result.detail})` : ""}`);
+        await attemptRegistration("boot registration");
       } catch (err) {
         if (isShuttingDown()) return;
         setRestateStatus({ registration: { state: "unreachable" } });
         console.error(`[restate] SDK endpoint failed to start: ${err instanceof Error ? err.message : String(err)}`);
       }
+    },
+    /** Clears any armed retry timer. Called from main()'s shutdown closure. */
+    stopRetrying(): void {
+      clearRetry();
     },
   };
 }
@@ -5356,6 +5401,7 @@ async function main(): Promise<void> {
     shuttingDown = true;
     console.log(`[main] Received ${signal}, shutting down...`);
     clearInterval(interval);
+    restateRegistration.stopRetrying();
 
     // forced exit armed before any awaiting, so shutdowns aren't dependent on notifications settling
     setTimeout(() => {
