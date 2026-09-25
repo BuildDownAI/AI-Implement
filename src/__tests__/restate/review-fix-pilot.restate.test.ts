@@ -47,7 +47,7 @@ import {
 } from "../../review-fix-worker.js";
 import { acceptDelivery } from "../../review-fix-inbox.js";
 import { appendReviewFixActivityBatch, getReviewFixActivityGaps, getReviewFixCycleSummary, listReviewFixActivity, recordReviewFixCycleSummary } from "../../review-fix-evidence.js";
-import { handleRunnerActivity, type RunnerActivityBody } from "../../runner-callback.js";
+import { handleRunnerActivity, handleRunnerResult, type RunnerActivityBody } from "../../runner-callback.js";
 import { mintPreparedReviewFixToken } from "../../runner-tokens.js";
 import type { ReviewFixActivityEvent } from "../../review-fix-contract.js";
 import { acquire as acquireDispatchAdmission, release as releaseDispatchAdmission } from "../../dispatch-admission.js";
@@ -779,6 +779,51 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     expect(second).toEqual({ status: "duplicate", attemptId: fixture.attemptId });
     expect((await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!)).status).toBe("finalized");
     expect(fixture.commentPosts).toBe(1);
+  }, 25_000);
+
+  it("authenticated result ingress commits one inbox delivery, classifies retries/conflicts, and withholds approval", async () => {
+    const env = envFor("alwaysReplay");
+    const fixture = freshScenario("result-ingress");
+    await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
+    await until(() => fixture.runId !== null, 8_000);
+    const attemptId = fixture.attemptId!;
+    const prepared = (await sqliteStore.getPreparedAttempt(attemptId))!;
+    const result = resultOf(fixture, prepared);
+    const secret = "result-ingress-secret";
+    const token = mintPreparedReviewFixToken({ attemptId, audience: "result", secret }).token;
+    let legacyProviderLookups = 0;
+    const intake = (candidate: ReviewFixResultMetadataV1) => handleRunnerResult({
+      authorization: `Bearer ${token}`, secret,
+      body: { phase: "gap-analysis", outcome: "success", comments: [], reviewFix: candidate },
+      resolveProvider: async () => { legacyProviderLookups++; return null; },
+      onReviewFixResult: (validated) => sqliteStore.recordResult(validated.attemptId, validated, () => {
+        const delivery = acceptDelivery({
+          authenticatedSource: "runner-callback", deliveryId: `${validated.attemptId}.result`,
+          kind: "result", destination: fixture.scope, payload: validated,
+        });
+        if (delivery.status !== "accepted") throw new Error(`result delivery was ${delivery.status}`);
+      }),
+    });
+
+    expect(await intake(result)).toMatchObject({ status: 200, body: { outcome: "stored" } });
+    expect(await intake(result)).toMatchObject({ status: 200, body: { outcome: "duplicate" } });
+    expect(await intake(resultOf(fixture, prepared, { outputCommit: sha("callback-conflict") })))
+      .toMatchObject({ status: 409, body: { outcome: "conflict" } });
+    expect(legacyProviderLookups).toBe(0);
+    const inbox = getDb().prepare(`SELECT COUNT(*) AS n FROM review_fix_inbox
+      WHERE authenticated_source = 'runner-callback' AND event_id = ?`)
+      .get(`${attemptId}.result`) as { n: number };
+    expect(inbox.n).toBe(1);
+    const conflict = getDb().prepare(`SELECT result_conflict_at FROM review_fix_attempts WHERE attempt_id = ?`)
+      .get(attemptId) as { result_conflict_at: number | null };
+    expect(conflict.result_conflict_at).not.toBeNull();
+
+    fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: fixture.runAttempt };
+    await pumpFor(env.baseUrl()).tick();
+    const done = await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", attemptId);
+    expect(done).toMatchObject({ status: "finalized", approval: "withheld" });
+    expect(fixture.commentPosts).toBe(0);
+    expect(fixture.dispatchCalls).toBe(1);
   }, 25_000);
 
   it.each(VARIANTS.map(([label]) => label))("a conflicting result before the final outcome persists conflict and blocks approval (%s)", async (label) => {
