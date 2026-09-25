@@ -11,7 +11,7 @@ import {
 import type { RepoMapping } from "./config.js";
 import { markDispatched, closeDb, getDispatchedIds, deleteDispatched } from "./dedup.js";
 import { canDispatch, acquireDispatch, type DispatchKind, type AcquireDispatchOutcome } from "./dispatch-gate.js";
-import { count as countAdmissionReservations, sweepStaleAdmissions } from "./dispatch-admission.js";
+import { count as countAdmissionReservations, sweepStaleAdmissions, type StaleAdmissionCandidate } from "./dispatch-admission.js";
 import { reconcileFilesystemFailures } from "./filesystem-ticket-lifecycle.js";
 import { dispatchWorkflow, postWorkflowDispatch, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, getPullRequestState, buildEnvelopeDispatchInputs, postPrComment, defaultFetchSignal, getRepoDefaultBranch, buildKgRefreshGhaDispatchBody, pollForKgWorkflowRunId } from "./github.js";
 import { resolveWorkflowCapabilities, resolveWorkflowContract } from "./workflow-probe.js";
@@ -32,7 +32,7 @@ import { canSelfDeploy, makeStartDeploy, readKgSourceRepo, parseKgSourceRepo } f
 import { remediateStuckJob, remediateFailedJob } from "./stuck-watchdog.js";
 import type { StuckWatchdogConfig } from "./stuck-watchdog.js";
 import { handleAdminRequest } from "./admin.js";
-import { initLogTable, appendLog, countPriorDispatches, completeOrphanedPlanningJobs, attachJobRunIdIfMissing, updateJobRunId, updateJobStatus, updateJobPrUrl, updateJobMachineDetails, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobById, getJobByMachineId, resetStuckAttempts, getRecentFailedRunUrls } from "./log.js";
+import { initLogTable, appendLog, countPriorDispatches, completeOrphanedPlanningJobs, attachJobRunIdIfMissing, updateJobRunId, updateJobStatus, updateJobPrUrl, updateJobMachineDetails, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobById, getJobByMachineId, getJobByDispatchId, resetStuckAttempts, getRecentFailedRunUrls } from "./log.js";
 import { recordDispatchFailure, recordDispatchSuccess, shouldCountFailure, initDispatchBreakerTable, parkIssue, prBudgetParkMessage } from "./dispatch-breaker.js";
 import type { Job, JobStatus } from "./log.js";
 import { getInstallationToken, getAppSlug } from "./github-app-auth.js";
@@ -790,8 +790,10 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
 
   // Reconciliation for admission reservations whose launch response or process was lost
   // (AII-783 review): a committed reservation with no confirmed release eventually frees
-  // its slot here, mirroring the reaper's own machine max-age sweep above.
-  for (const released of sweepStaleAdmissions()) {
+  // its slot here, mirroring the reaper's own machine max-age sweep above. Each candidate
+  // is checked against its actual backend state before release — age alone is not proof
+  // of termination (PR #681 review).
+  for (const released of await sweepStaleAdmissions((candidate) => confirmAdmissionTerminated(config, candidate))) {
     console.log(
       `[admission] released stale reservation dispatch=${released.dispatchId} mapping=${released.mappingKey} age_ms=${released.ageMs}`,
     );
@@ -2333,6 +2335,116 @@ function ttlStopRunnerForJob(config: AppConfig, job: Job): (() => Promise<boolea
     };
   }
   return undefined;
+}
+
+/**
+ * `sweepStaleAdmissions`'s confirmation oracle (AII-783 review on PR #681): checks
+ * whether the backend behind a stale, still-reserved admission has actually terminated,
+ * rather than letting the sweep infer death from age alone. Looks up the matching
+ * `dispatch_log` row by `dispatchId` and, per execution mode, asks the backend itself:
+ *
+ * - No matching job row at all: the reservation's launch response/process was lost
+ *   before anything was ever dispatched (the crash-before-`appendLog` case this sweep
+ *   originally existed for) — nothing can still be running, so this is confirmed.
+ * - github-actions: confirmed only once the run's own status is `completed` — a prior
+ *   cancellation request being accepted (202/409) is not by itself proof of termination.
+ *   A job that never got its runId linked is NOT treated as "never launched": the
+ *   best-effort link (postDispatch / monitorGitHubActionsJob's own retry loop) can fail
+ *   to ever resolve for a run that is genuinely still executing — a transient GitHub API
+ *   hiccup, a getClaimedRunIds() exclusion, or a workflowFile/defaultBranch mismatch
+ *   after a resync — so a missing runId gets one more lookup attempt here before this
+ *   resolves to unconfirmed rather than confirmed (AII-783 PR #681 second review round).
+ * - fly-machines / local-docker: confirmed once the machine/container is actually
+ *   observed stopped, or (404 / "no such container") already gone. A machineId is
+ *   always recorded in the same write as the job row for these backends (never a later
+ *   best-effort attach), so a missing machineId does mean nothing was ever launched —
+ *   but missing Fly credentials mean the backend simply cannot be asked right now, which
+ *   is uncertain, not confirmed-dead.
+ *
+ * An unrecognized execution mode means nothing was ever launched under this
+ * reservation, so it is also confirmed — but any other lookup failure (network error,
+ * unexpected state) resolves to unconfirmed, since an error here must never read as
+ * proof the backend is dead.
+ */
+export async function confirmAdmissionTerminated(
+  config: AppConfig,
+  candidate: StaleAdmissionCandidate,
+): Promise<boolean> {
+  const job = getJobByDispatchId(candidate.dispatchId);
+  if (!job) return true;
+
+  if (job.executionMode === "github-actions") {
+    if (!job.repo) return false;
+    const [owner, repo] = job.repo.split("/");
+    if (!owner || !repo) return false;
+
+    let token: string;
+    try {
+      token = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
+    } catch (err) {
+      console.error(`[admission] Failed to mint installation token for dispatch=${candidate.dispatchId}:`, err);
+      return false;
+    }
+
+    let runId = job.runId;
+    if (!runId) {
+      const mapping = mappingForJob(getMappings(), job);
+      if (!mapping) return false;
+      try {
+        const found = await findWorkflowRunId(
+          token,
+          owner,
+          repo,
+          workflowFileForJob(job, mapping),
+          mapping.defaultBranch,
+          new Date(job.dispatchedAt - 30_000),
+          getClaimedRunIds(),
+          job.issueIdentifier ?? undefined,
+        );
+        if (!found) return false;
+        attachJobRunIdIfMissing(job.id, found);
+        runId = found;
+      } catch (err) {
+        console.error(`[admission] Failed to look up run ID for dispatch=${candidate.dispatchId}:`, err);
+        return false;
+      }
+    }
+
+    try {
+      const status = await getWorkflowRunStatus(token, owner, repo, runId);
+      return status?.status === "completed";
+    } catch (err) {
+      console.error(`[admission] Failed to check GHA run status for dispatch=${candidate.dispatchId}:`, err);
+      return false;
+    }
+  }
+
+  if (job.executionMode === "fly-machines") {
+    if (!job.machineId) return true;
+    if (!config.flySessionsToken || !config.flySessionsApp) return false;
+    try {
+      const machine = await getMachine(config.flySessionsToken, config.flySessionsApp, job.machineId);
+      return machine.state === "destroyed" || machine.state === "stopped";
+    } catch (err) {
+      if (err instanceof Error && err.message.includes("404")) return true; // already gone
+      console.error(`[admission] Failed to check Fly machine state for dispatch=${candidate.dispatchId}:`, err);
+      return false;
+    }
+  }
+
+  if (job.executionMode === "local-docker") {
+    if (!job.machineId) return true;
+    try {
+      const state = await inspectLocalContainer(job.machineId);
+      return !state.running;
+    } catch (err) {
+      // `docker inspect` fails identically for "container gone" and "daemon
+      // unreachable" — only the former is safe to treat as confirmed-terminated.
+      return err instanceof Error && /No such container/i.test(err.message);
+    }
+  }
+
+  return false;
 }
 
 const TTL_STALE_CONCLUSIONS = new Set(["operator_cancelled", "runner_approved"]);

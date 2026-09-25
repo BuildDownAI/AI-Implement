@@ -435,8 +435,16 @@ describe("releaseByDispatchId", () => {
 // updateJobStatus deliberately leaving a reservation held pending confirmed termination
 // (reaper/stuck-watchdog's give-up paths) — this sweep is the eventual backstop for that
 // too, on the same age-based schedule.
+//
+// A second PR #681 review round found that the sweep released every past-maxAgeMs row
+// unconditionally, on age alone — turning an uncertain "might still be running" case
+// into free capacity. `sweepStaleAdmissions` now requires the caller to confirm each
+// candidate's backend is actually dead before it is released.
 describe("sweepStaleAdmissions", () => {
-  it("releases a reservation past maxAgeMs and frees its slot for a subsequent acquire", () => {
+  const CONFIRM_ALL = async () => true;
+  const CONFIRM_NONE = async () => false;
+
+  it("releases a reservation past maxAgeMs (once confirmed dead) and frees its slot for a subsequent acquire", async () => {
     vi.useFakeTimers();
     try {
       vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
@@ -445,12 +453,12 @@ describe("sweepStaleAdmissions", () => {
 
       // Still within the window — not swept yet.
       vi.setSystemTime(new Date("2026-01-01T05:00:00.000Z"));
-      expect(admission.sweepStaleAdmissions(6 * 60 * 60 * 1000)).toEqual([]);
+      await expect(admission.sweepStaleAdmissions(CONFIRM_ALL, 6 * 60 * 60 * 1000)).resolves.toEqual([]);
       expect(admission.read("orphan-a")?.releasedAt).toBeNull();
 
-      // Past the 6h window.
+      // Past the 6h window, and the caller confirms the backend is dead.
       vi.setSystemTime(new Date("2026-01-01T06:00:01.000Z"));
-      const released = admission.sweepStaleAdmissions(6 * 60 * 60 * 1000);
+      const released = await admission.sweepStaleAdmissions(CONFIRM_ALL, 6 * 60 * 60 * 1000);
       expect(released).toEqual([
         { dispatchId: "orphan-a", mappingKey: "AII", ageMs: expect.any(Number) },
       ]);
@@ -465,7 +473,50 @@ describe("sweepStaleAdmissions", () => {
     }
   });
 
-  it("does not touch an already-released reservation or an unreleased one within the window", () => {
+  it("leaves an old still-running/unknown attempt reserved when the backend cannot be confirmed dead", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+      admission.acquire(issueRequest({ dispatchId: "still-running", cap: 1 }));
+
+      // Past the 6h age window, but the caller's backend check says it's still running
+      // (or the check itself can't tell) — age alone must never release this slot.
+      vi.setSystemTime(new Date("2026-01-01T06:00:01.000Z"));
+      const released = await admission.sweepStaleAdmissions(CONFIRM_NONE, 6 * 60 * 60 * 1000);
+
+      expect(released).toEqual([]);
+      expect(admission.read("still-running")?.releasedAt).toBeNull();
+
+      // The slot must still read as occupied — a second acquire for the same team must
+      // not see it as free capacity.
+      const blocked = admission.acquire(
+        issueRequest({ dispatchId: "other-issue", scope: { kind: "issue", issueScope: "team-a", issueId: "AII-2" }, cap: 1 }),
+      );
+      expect(blocked).toMatchObject({ ok: false, reason: "at_capacity" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("holds the reservation when the confirmation check itself throws", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+      admission.acquire(issueRequest({ dispatchId: "check-failed", cap: 1 }));
+
+      vi.setSystemTime(new Date("2026-01-01T06:00:01.000Z"));
+      const released = await admission.sweepStaleAdmissions(async () => {
+        throw new Error("backend unreachable");
+      }, 6 * 60 * 60 * 1000);
+
+      expect(released).toEqual([]);
+      expect(admission.read("check-failed")?.releasedAt).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not touch an already-released reservation or an unreleased one within the window", async () => {
     vi.useFakeTimers();
     try {
       vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
@@ -475,7 +526,7 @@ describe("sweepStaleAdmissions", () => {
       admission.release("old", LEGACY, (old as { ok: true; record: { generation: number } }).record.generation, "finalized");
 
       vi.setSystemTime(new Date("2026-01-01T07:00:00.000Z"));
-      const released = admission.sweepStaleAdmissions(6 * 60 * 60 * 1000);
+      const released = await admission.sweepStaleAdmissions(CONFIRM_ALL, 6 * 60 * 60 * 1000);
 
       // Only "fresh" was eligible (unreleased + past the window); "old" was already
       // released before the sweep ran, so it must not appear in the sweep's own result.
@@ -487,7 +538,7 @@ describe("sweepStaleAdmissions", () => {
     }
   });
 
-  it("defaults to a multi-hour window so an in-progress run is never swept mid-flight", () => {
+  it("defaults to a multi-hour window so an in-progress run is never swept mid-flight", async () => {
     vi.useFakeTimers();
     try {
       vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
@@ -496,8 +547,35 @@ describe("sweepStaleAdmissions", () => {
       // 90 minutes is the longest default GHA job timeout in the codebase — well within
       // the default sweep window.
       vi.setSystemTime(new Date("2026-01-01T01:30:00.000Z"));
-      expect(admission.sweepStaleAdmissions()).toEqual([]);
+      await expect(admission.sweepStaleAdmissions(CONFIRM_ALL)).resolves.toEqual([]);
       expect(admission.read("in-progress")?.releasedAt).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("passes the candidate's backend and lifecycle owner to the confirmation callback", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+      admission.acquire(issueRequest({ dispatchId: "restate-owned", backend: "fly-machines", lifecycleOwner: RESTATE_A, cap: 5 }));
+
+      vi.setSystemTime(new Date("2026-01-01T06:00:01.000Z"));
+      const seen: unknown[] = [];
+      await admission.sweepStaleAdmissions(async (candidate) => {
+        seen.push(candidate);
+        return true;
+      });
+
+      expect(seen).toEqual([
+        expect.objectContaining({
+          dispatchId: "restate-owned",
+          mappingKey: "AII",
+          backend: "fly-machines",
+          lifecycleOwner: RESTATE_A,
+          ageMs: expect.any(Number),
+        }),
+      ]);
     } finally {
       vi.useRealTimers();
     }

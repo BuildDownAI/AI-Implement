@@ -7,6 +7,11 @@ import { shouldSkipCompletionNotice } from "../monitor-status.js";
 
 vi.mock("../github.js", () => ({
   cancelWorkflowRun: vi.fn().mockResolvedValue(true),
+  // These tests exercise the requeue/give-up/notification bookkeeping, not the
+  // accepted-cancel-vs-confirmed-terminated distinction (covered in
+  // stuck-watchdog.test.ts) — default the run's observed status to already
+  // "completed" so the existing confirmed-stop assertions below are unaffected.
+  getWorkflowRunStatus: vi.fn().mockResolvedValue({ status: "completed", conclusion: "cancelled", html_url: "https://x" }),
 }));
 
 vi.mock("../fly-machines.js", () => ({

@@ -433,17 +433,30 @@ export function releaseByDispatchId(
   return release(record.dispatchId, record.lifecycleOwner, record.generation, reason);
 }
 
-/** Reservations older than this with no confirmed release are swept unconditionally —
- *  the safety net for "a committed reservation whose launch response or process was
- *  lost" (a crash between `acquire` returning and the caller's own `appendLog`, so no
- *  `dispatch_log` row ever exists for `releaseByDispatchId` to key off), and the eventual
- *  backstop for a reservation `updateJobStatus` deliberately left held pending confirmed
- *  termination (AII-783 review: reaper/stuck-watchdog give-up paths that cannot vouch
- *  for the backend actually being dead). Generous relative to every job timeout in the
- *  codebase (GHA's default 90 min job timeout, Fly/local's FLY_MACHINE_TIMEOUT_MS, and
- *  the stuck-watchdog's own bounded retries on top of that) so this never races a
- *  legitimately long-running attempt. */
+/** Reservations older than this with no confirmed release are swept — the safety net
+ *  for "a committed reservation whose launch response or process was lost" (a crash
+ *  between `acquire` returning and the caller's own `appendLog`, so no `dispatch_log`
+ *  row ever exists for `releaseByDispatchId` to key off), and the eventual backstop for
+ *  a reservation `updateJobStatus` deliberately left held pending confirmed termination
+ *  (AII-783 review: reaper/stuck-watchdog give-up paths that cannot vouch for the
+ *  backend actually being dead). Generous relative to every job timeout in the codebase
+ *  (GHA's default 90 min job timeout, Fly/local's FLY_MACHINE_TIMEOUT_MS, and the
+ *  stuck-watchdog's own bounded retries on top of that) so this never races a
+ *  legitimately long-running attempt.
+ *
+ *  Age alone is never proof of termination (AII-783 review on PR #681) — this module has
+ *  no network access and no knowledge of GHA/Fly/local backend state, so `sweepStaleAdmissions`
+ *  requires the caller to vouch for each candidate via `confirmTerminated` before a row is
+ *  released; age only selects which rows are even considered. */
 export const DEFAULT_ADMISSION_SWEEP_MAX_AGE_MS = 6 * 60 * 60 * 1000; // 6 hours
+
+export interface StaleAdmissionCandidate {
+  readonly dispatchId: string;
+  readonly mappingKey: string;
+  readonly backend: DispatchAdmissionBackend;
+  readonly lifecycleOwner: LifecycleOwner;
+  readonly ageMs: number;
+}
 
 export interface StaleAdmissionSweepResult {
   readonly dispatchId: string;
@@ -453,15 +466,23 @@ export interface StaleAdmissionSweepResult {
 
 /**
  * Age-based reconciliation sweep, mirroring reaper.ts's own SWEEP_MACHINE_MAX_AGE_MS
- * pattern: any reservation still unreleased past `maxAgeMs` is released, regardless of
- * `lifecycleOwner` or whether a matching `dispatch_log` row was ever written. Intended
- * to run once per poll cycle alongside `sweepOrphanedMachines`. Returns the reservations
- * it actually released (a row that raced a legitimate release between the read and the
- * sweep's own `release` call is excluded, not double-counted).
+ * pattern: candidate rows are every reservation still unreleased past `maxAgeMs`,
+ * regardless of `lifecycleOwner` or whether a matching `dispatch_log` row was ever
+ * written. Intended to run once per poll cycle alongside `sweepOrphanedMachines`.
+ *
+ * A candidate is only released once `confirmTerminated` resolves `true` for it — the
+ * caller is expected to check the actual backend (GHA run status, Fly machine state,
+ * local container state) rather than infer death from age. A candidate whose backend
+ * cannot be confirmed dead (still running, unknown, or the check itself throws) stays
+ * reserved: this function propagates the uncertainty rather than resolving it in the
+ * caller's favor, so a still-running/unknown attempt is never turned into free capacity.
+ * Returns the reservations actually released (a row that raced a legitimate release
+ * between the read and this sweep's own `release` call is excluded, not double-counted).
  */
-export function sweepStaleAdmissions(
+export async function sweepStaleAdmissions(
+  confirmTerminated: (candidate: StaleAdmissionCandidate) => Promise<boolean>,
   maxAgeMs: number = DEFAULT_ADMISSION_SWEEP_MAX_AGE_MS,
-): StaleAdmissionSweepResult[] {
+): Promise<StaleAdmissionSweepResult[]> {
   const db = getDb();
   const cutoff = Date.now() - maxAgeMs;
   const rows = db
@@ -469,9 +490,26 @@ export function sweepStaleAdmissions(
     .all(cutoff) as Row[];
   const released: StaleAdmissionSweepResult[] = [];
   for (const row of rows) {
+    const candidate: StaleAdmissionCandidate = {
+      dispatchId: row.dispatch_id,
+      mappingKey: row.mapping_key,
+      backend: row.backend as DispatchAdmissionBackend,
+      lifecycleOwner: decodeOwner(row.lifecycle_owner),
+      ageMs: Date.now() - row.created_at,
+    };
+    let confirmed: boolean;
+    try {
+      confirmed = await confirmTerminated(candidate);
+    } catch (err) {
+      // A failed reconciliation check is exactly the uncertain case this function must
+      // hold, not release — never let a thrown error read as proof of termination.
+      console.error(`[admission] confirmTerminated threw for dispatch=${candidate.dispatchId}:`, err);
+      confirmed = false;
+    }
+    if (!confirmed) continue;
     const outcome = release(row.dispatch_id, decodeOwner(row.lifecycle_owner), row.generation, "deadline_exceeded");
     if (outcome.status === "released") {
-      released.push({ dispatchId: row.dispatch_id, mappingKey: row.mapping_key, ageMs: Date.now() - row.created_at });
+      released.push({ dispatchId: row.dispatch_id, mappingKey: row.mapping_key, ageMs: candidate.ageMs });
     }
   }
   return released;

@@ -1,6 +1,6 @@
 import type { TicketingProvider, TicketIssue } from "./providers/types.js";
 import type { Job } from "./log.js";
-import { cancelWorkflowRun } from "./github.js";
+import { cancelWorkflowRun, getWorkflowRunStatus } from "./github.js";
 import { incrementStuckAttempts, updateJobStatus, getJobById } from "./log.js";
 import { deleteDispatched } from "./dedup.js";
 import { notifyStuckGiveUp } from "./notify.js";
@@ -134,11 +134,13 @@ async function boundedCleanup(
  * Stop happens before dedup is cleared to prevent a race where the next poll
  * cycle re-dispatches before the zombie runner is stopped.
  *
- * Returns whether the backend's death was confirmed (`stopRunner` returned true, or the
- * default GHA-cancel path had its cancellation accepted). AII-783: this job may hold an
- * admission reservation, and only a confirmed stop is allowed to release it — an
- * unconfirmed one is written with `skipAdmissionRelease` so the reservation stays held
- * for `dispatch-admission.ts`'s stale-reservation sweep instead of freeing a slot whose
+ * Returns whether the backend's death was confirmed (`stopRunner` returned true, or —
+ * for the default GHA-cancel path — the run's own status was subsequently observed as
+ * `completed`; accepting the cancellation request, 202 or 409, is not itself
+ * confirmation — AII-783 review on PR #681). AII-783: this job may hold an admission
+ * reservation, and only a confirmed stop is allowed to release it — an unconfirmed one
+ * is written with `skipAdmissionRelease` so the reservation stays held for
+ * `dispatch-admission.ts`'s stale-reservation sweep instead of freeing a slot whose
  * runner might still be alive. The return value lets a caller that writes its own
  * follow-up terminal status (e.g. the TTL-expiry reassertion in index.ts) apply the same
  * gating.
@@ -182,15 +184,21 @@ export async function remediateStuckJob(
           config.githubAppPrivateKey,
           owner,
         );
-        // cancelWorkflowRun resolves true only on GitHub accepting the cancel request
-        // (202/409) — the same signal admin.ts's operator-cancel endpoint already treats
-        // as confirmation.
-        stopConfirmed = await cancelWorkflowRun(ghToken, owner, repo, job.runId);
-        if (stopConfirmed) {
-          console.log(`[monitor] Cancelled run ${job.runId} for stuck job ${job.issueIdentifier}`);
+        // cancelWorkflowRun resolving true means GitHub *accepted the request*
+        // (202/409) — not that the run has actually stopped (AII-783 review on PR
+        // #681): a 409 in particular can mean the run isn't in a cancellable state for
+        // reasons other than "already finished". Request the cancellation as a
+        // best-effort nudge, but only the run's own subsequent status — not the accept
+        // code — is allowed to confirm the backend's death for admission-release
+        // purposes.
+        const cancelAccepted = await cancelWorkflowRun(ghToken, owner, repo, job.runId);
+        if (cancelAccepted) {
+          console.log(`[monitor] Requested cancellation of run ${job.runId} for stuck job ${job.issueIdentifier}`);
         } else {
           console.warn(`[monitor] GHA did not accept cancellation for run ${job.runId} (${job.issueIdentifier})`);
         }
+        const runStatus = await getWorkflowRunStatus(ghToken, owner, repo, job.runId);
+        stopConfirmed = runStatus?.status === "completed";
       } catch (err) {
         console.error(`[monitor] Failed to cancel run ${job.runId} for ${job.issueIdentifier}:`, err);
       }
