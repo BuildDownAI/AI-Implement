@@ -3,9 +3,11 @@
  * `npm run typecheck` excludes `src/__tests__`, and vitest strips types without
  * checking them, so the `@ts-expect-error` cases below only fail a build under
  * the throwaway `tsconfig.review-fix-ports-tests.json` — run explicitly via
- * `npx tsc --noEmit -p tsconfig.review-fix-ports-tests.json`. The `it()` blocks
- * exercise representative, entirely in-memory test doubles for all three ports;
- * nothing here does real I/O.
+ * `npx tsc --noEmit -p tsconfig.review-fix-ports-tests.json`, and wired into
+ * `.github/workflows/unit-tests.yml` (`unit-tests` job) so a regression is
+ * caught automatically rather than only by a human remembering to run it.
+ * The `it()` blocks exercise representative, entirely in-memory test doubles
+ * for all three ports; nothing here does real I/O.
  */
 import { describe, expect, it } from "vitest";
 import type {
