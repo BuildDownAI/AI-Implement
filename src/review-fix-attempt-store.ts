@@ -264,6 +264,23 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
     return row ? toPrepared(row) : null;
   }
 
+  /**
+   * Reverse lookup by bound execution identity — not part of `ReviewFixAttemptStorePort`
+   * (whose `bindExecution` only writes this direction), but the same `github_run_id`/
+   * `github_run_attempt` columns `bindExecution` populates already carry it, so no second
+   * index is needed. This is the durable counterpart `review-fix-worker.ts`'s
+   * `reviewFixAttemptStoreScopeStore()` uses for `inspectTerminal`, whose port signature
+   * (AII-829) carries an execution but no `attemptId` — a freshly constructed store instance
+   * (e.g. after a process restart) resolves scope from this table exactly as
+   * `getPreparedAttempt` does for `attemptId`, with no in-memory state of its own.
+   */
+  async findPreparedAttemptByExecution(execution: WorkerExecutionIdentity): Promise<PreparedReviewFixAttempt | null> {
+    const row = getDb()
+      .prepare("SELECT * FROM review_fix_attempts WHERE github_run_id = ? AND github_run_attempt = ?")
+      .get(execution.githubRunId, execution.githubRunAttempt) as AttemptRow | undefined;
+    return row ? toPrepared(row) : null;
+  }
+
   async recordLaunchIntent(attemptId: AttemptId): Promise<ReviewFixLaunchIntentOutcome> {
     const db = getDb();
     return db.transaction((): ReviewFixLaunchIntentOutcome => {

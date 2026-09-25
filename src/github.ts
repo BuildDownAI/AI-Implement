@@ -68,6 +68,14 @@ export interface DispatchInputs {
   runner_image?: string;
   /** Operator instruction forwarded from the /ai-implement PR comment. Legacy mode only; envelope mode carries this inside run_config. */
   comment_instruction?: string;
+  /**
+   * Secret-free Restate review-fix pilot attempt id (AII-782/AII-793), read by the workflow's
+   * `run-name:` before any step runs and cross-validated there against `run_config.reviewFix.attemptId`
+   * (`workflows/claude-implement.yml` "Validate attempt correlation" step). Must match exactly —
+   * absent on every non-pilot dispatch. See `src/workflow-probe.ts`'s `supportsAttemptCorrelation`
+   * for detecting whether a target repo's synced workflow declares this input.
+   */
+  run_attempt_token?: string;
 }
 
 /**
