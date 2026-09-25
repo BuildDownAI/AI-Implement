@@ -70,6 +70,41 @@ function authorityWithFetch(fetchImpl: typeof fetch, accessTokenTtlMs = 60 * 60 
   return new RestateRefreshAuthority({ ingressBaseUrl: UNROUTABLE_INGRESS, fetchImpl, accessTokenTtlMs });
 }
 
+/**
+ * A fetchImpl that never settles unless its request's AbortSignal fires — the only way a
+ * fixture can prove a fetch is actually bounded by `signal` rather than merely accepting an
+ * ignored option (AII-728). Rejects with the signal's abort reason once the signal fires.
+ */
+function hangingFetch(): typeof fetch {
+  return vi.fn((_url: unknown, init?: RequestInit) => {
+    return new Promise((_resolve, reject) => {
+      const signal = init?.signal;
+      if (!signal) return; // no signal given: hangs forever, same as before AII-728
+      if (signal.aborted) {
+        reject(signal.reason);
+        return;
+      }
+      signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+    });
+  }) as unknown as typeof fetch;
+}
+
+/**
+ * vitest's fake timers do not intercept Node's AbortSignal.timeout — verified empirically,
+ * it schedules through an internal timer rather than the patchable global setTimeout — so
+ * this bounds the wait by stubbing AbortSignal.timeout's own implementation instead of the
+ * clock. Asserts the exact ms value production code passes, then fires the abort on the next
+ * microtask so the test does not block on real wall-clock time.
+ */
+function stubAbortTimeout(expectedMs: number): ReturnType<typeof vi.spyOn> {
+  return vi.spyOn(AbortSignal, "timeout").mockImplementation((ms: number) => {
+    expect(ms).toBe(expectedMs);
+    const controller = new AbortController();
+    queueMicrotask(() => controller.abort(new DOMException("The operation was aborted due to timeout", "TimeoutError")));
+    return controller.signal;
+  });
+}
+
 describe("GRACE_MS", () => {
   it("is 30 seconds, exported for tests", () => {
     expect(GRACE_MS).toBe(30_000);
@@ -164,6 +199,38 @@ function identityOkResponse(): Response {
 function isIdentityUrl(url: string): boolean {
   return url === `${UNROUTABLE_INGRESS}/Operator/c1/identity`;
 }
+
+describe("RestateRefreshAuthority — invoke() bounded at 10s (AII-728)", () => {
+  it("a never-resolving identity call degrades to unavailable (cause restate) once the bound fires", async () => {
+    const timeoutSpy = stubAbortTimeout(10_000);
+    try {
+      const authority = authorityWithFetch(hangingFetch());
+      await expect(authority.rotate({ refreshToken: "x", clientId: "c1" })).resolves.toEqual({
+        status: "unavailable",
+        cause: "restate",
+      });
+    } finally {
+      timeoutSpy.mockRestore();
+    }
+  });
+
+  it("a never-resolving refresh call (after a successful identity read) degrades to unavailable once the bound fires", async () => {
+    const timeoutSpy = stubAbortTimeout(10_000);
+    try {
+      const fetchImpl = vi.fn(async (url: string, init?: RequestInit) => {
+        if (isIdentityUrl(url)) return identityOkResponse();
+        return hangingFetch()(url, init);
+      });
+      const authority = authorityWithFetch(fetchImpl as unknown as typeof fetch);
+      await expect(authority.rotate({ refreshToken: "x", clientId: "c1" })).resolves.toEqual({
+        status: "unavailable",
+        cause: "restate",
+      });
+    } finally {
+      timeoutSpy.mockRestore();
+    }
+  });
+});
 
 describe("RestateRefreshAuthority — outcome mapping", () => {
   it("maps a 5xx ingress response on the identity read to unavailable (cause restate), never reaching refresh", async () => {

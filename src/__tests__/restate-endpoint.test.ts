@@ -40,6 +40,41 @@ function jsonResponse(status: number, body: unknown): Response {
   });
 }
 
+/**
+ * A fetchImpl that never settles unless its request's AbortSignal fires — the only way a
+ * fixture can prove a fetch is actually bounded by `signal` rather than merely accepting an
+ * ignored option (AII-728). Rejects with the signal's abort reason once the signal fires.
+ */
+function hangingFetch(): typeof fetch {
+  return vi.fn((_url: unknown, init?: RequestInit) => {
+    return new Promise((_resolve, reject) => {
+      const signal = init?.signal;
+      if (!signal) return; // no signal given: hangs forever, same as before AII-728
+      if (signal.aborted) {
+        reject(signal.reason);
+        return;
+      }
+      signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+    });
+  }) as unknown as typeof fetch;
+}
+
+/**
+ * vitest's fake timers do not intercept Node's AbortSignal.timeout — verified empirically,
+ * it schedules through an internal timer rather than the patchable global setTimeout — so
+ * this bounds the wait by stubbing AbortSignal.timeout's own implementation instead of the
+ * clock. Asserts the exact ms value production code passes, then fires the abort on the next
+ * microtask so the test does not block on real wall-clock time.
+ */
+function stubAbortTimeout(expectedMs: number): ReturnType<typeof vi.spyOn> {
+  return vi.spyOn(AbortSignal, "timeout").mockImplementation((ms: number) => {
+    expect(ms).toBe(expectedMs);
+    const controller = new AbortController();
+    queueMicrotask(() => controller.abort(new DOMException("The operation was aborted due to timeout", "TimeoutError")));
+    return controller.signal;
+  });
+}
+
 describe("register", () => {
   afterEach(() => {
     vi.unstubAllEnvs();
@@ -116,6 +151,39 @@ describe("register", () => {
 
     expect(fetchImpl).toHaveBeenCalledTimes(1);
     expect(result.outcome).toBe("unreachable");
+  });
+
+  it("bounds the no-force registration call at 10s — a never-resolving fetch degrades to unreachable once the bound fires (AII-728)", async () => {
+    const timeoutSpy = stubAbortTimeout(10_000);
+    try {
+      const result = await register({
+        adminBaseUrl: "http://127.0.0.1:9070",
+        fetchImpl: hangingFetch(),
+        getInFlightJobs: () => [],
+      });
+      expect(result.outcome).toBe("unreachable");
+    } finally {
+      timeoutSpy.mockRestore();
+    }
+  });
+
+  it("bounds the forced retry at 10s — a never-resolving fetch on the retry after a META0004 conflict degrades to unreachable (AII-728)", async () => {
+    const timeoutSpy = stubAbortTimeout(10_000);
+    try {
+      const fetchImpl = vi.fn(async (url: string, init?: RequestInit) => {
+        const body = JSON.parse((init?.body as string) ?? "{}");
+        if (body.force) return hangingFetch()(url, init);
+        return jsonResponse(409, { restate_code: "META0004", message: "conflict" });
+      });
+      const result = await register({
+        adminBaseUrl: "http://127.0.0.1:9070",
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        getInFlightJobs: () => [],
+      });
+      expect(result.outcome).toBe("unreachable");
+    } finally {
+      timeoutSpy.mockRestore();
+    }
   });
 
   it("an unreachable admin API logs one warning and returns unreachable", async () => {

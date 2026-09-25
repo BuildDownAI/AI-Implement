@@ -80,6 +80,9 @@ export interface RegisterDeps {
 
 const META0004_CONFLICT = "META0004";
 
+/** Registration bound (AII-728): a hung admin API must not hang boot indefinitely. Applies to both the no-force call and the forced retry. */
+const REGISTER_TIMEOUT_MS = 10_000;
+
 /**
  * Registers the SDK endpoint with the Restate admin API's POST /deployments, once,
  * at boot, without `force`. Verified against the Restate admin API (2026-09-14): an
@@ -163,6 +166,7 @@ function postDeployment(
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(force ? { uri, force: true } : { uri }),
+    signal: AbortSignal.timeout(REGISTER_TIMEOUT_MS),
   });
 }
 

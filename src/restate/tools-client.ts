@@ -11,6 +11,11 @@ import { RESTATE_ADMIN_BASE_URL, RESTATE_INGRESS_BASE_URL } from "./server.js";
 
 const ORCHESTRATOR_TOOLS_SERVICE = "orchestratorTools";
 
+/** Admin discovery bound (AII-728): a hung admin API must not hang /mcp's tools/list. */
+const DISCOVER_TOOLS_TIMEOUT_MS = 5_000;
+/** Tool ingress bound (AII-728): a hung ingress must not hang a tools/call caller forever. */
+const CALL_TOOL_TIMEOUT_MS = 60_000;
+
 export interface DiscoveredTool {
   name: string;
   description: string;
@@ -52,7 +57,9 @@ export async function discoverTools(deps: DiscoverToolsDeps = {}): Promise<Disco
 
   let response: Response;
   try {
-    response = await fetchImpl(`${adminBaseUrl}/services/${ORCHESTRATOR_TOOLS_SERVICE}`);
+    response = await fetchImpl(`${adminBaseUrl}/services/${ORCHESTRATOR_TOOLS_SERVICE}`, {
+      signal: AbortSignal.timeout(DISCOVER_TOOLS_TIMEOUT_MS),
+    });
   } catch {
     return [];
   }
@@ -143,6 +150,7 @@ export async function callTool(
         ...(deps.idempotencyKey ? { "idempotency-key": deps.idempotencyKey } : {}),
       },
       body: JSON.stringify({ caller, args }),
+      signal: AbortSignal.timeout(CALL_TOOL_TIMEOUT_MS),
     });
   } catch {
     return { status: "unavailable" };

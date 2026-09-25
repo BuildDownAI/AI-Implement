@@ -44,6 +44,19 @@ export function restateDataDir(
   return path.join(path.dirname(dedupDbPath), "restate");
 }
 
+/**
+ * Every operator-set `RESTATE_*` key in the given environment, forwarded by prefix match so
+ * a future override (not one of the fixed constants below) still reaches the child. Callers
+ * apply this first, then overwrite with the fixed constants so those always win on collision.
+ */
+function restateEnvOverrides(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const overrides: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(env)) {
+    if (key.startsWith("RESTATE_") && value !== undefined) overrides[key] = value;
+  }
+  return overrides;
+}
+
 interface Deferred<T> {
   promise: Promise<T>;
   resolve: (value: T) => void;
@@ -158,15 +171,27 @@ export class RestateSidecar {
     // server's config-rs double-underscore env convention (RESTATE_INGRESS__BIND_ADDRESS /
     // RESTATE_ADMIN__BIND_ADDRESS); the embedded store's location is the top-level
     // `base-dir` key, RESTATE_BASE_DIR.
-    const childEnv: NodeJS.ProcessEnv = {
-      ...process.env,
+    //
+    // childEnv is an explicit allowlist (AII-728), never `...process.env`: the sidecar is a
+    // separate binary that has no business seeing the orchestrator's full environment (GitHub
+    // App keys, ticketing tokens, etc). PATH/HOME/TMPDIR/TZ are the process-hygiene basics a
+    // spawned binary needs; every RESTATE_* key already set as a fixed constant below is
+    // forwarded explicitly, and any operator-set RESTATE_* override in process.env (for
+    // example a future knob) is forwarded by prefix match, with the fixed constants winning
+    // on key collision.
+    const childEnv: NodeJS.ProcessEnv = { ...restateEnvOverrides(process.env) };
+    for (const key of ["PATH", "HOME", "TMPDIR", "TZ"] as const) {
+      const value = process.env[key];
+      if (value !== undefined) childEnv[key] = value;
+    }
+    Object.assign(childEnv, {
       RESTATE_INGRESS__BIND_ADDRESS: RESTATE_INGRESS_BIND_ADDRESS,
       RESTATE_ADMIN__BIND_ADDRESS: RESTATE_ADMIN_BIND_ADDRESS,
       RESTATE_BASE_DIR: this._dataDir,
       RESTATE_BIND_ADDRESS: RESTATE_BIND_ADDRESS,
       RESTATE_DEFAULT_NUM_PARTITIONS: RESTATE_DEFAULT_NUM_PARTITIONS,
       RESTATE_ROCKSDB_TOTAL_MEMORY_SIZE: RESTATE_ROCKSDB_TOTAL_MEMORY_SIZE,
-    };
+    });
 
     const child = this._spawn(bin, ["--no-logo"], {
       stdio: ["ignore", "inherit", "inherit"],
