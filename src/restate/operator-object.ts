@@ -63,6 +63,15 @@ interface IssueRequest {
 
 interface RefreshRequest {
   presentedHash: string;
+  /**
+   * Test-only seam (AII-727): when set, the handler durably sleeps this many ms — still
+   * holding the exclusive lock — before deciding. Proves a concurrent `describe` (shared)
+   * answers without waiting on it. Omitted on every production call path (issue/rotate never
+   * set it), so it is inert there: it never changes decideRefresh's branch or the inputs to
+   * it, and the alwaysReplay-vs-disableRetries equivalence check in
+   * operator-object.restate.test.ts never exercises it.
+   */
+  sleepMs?: number;
 }
 
 type RefreshHandlerResult =
@@ -139,6 +148,9 @@ async function issue(ctx: ObjectContext, request: IssueRequest): Promise<void> {
 }
 
 async function refresh(ctx: ObjectContext, request: RefreshRequest): Promise<RefreshHandlerResult> {
+  if (request.sleepMs !== undefined) {
+    await ctx.sleep(request.sleepMs);
+  }
   const family = await ctx.get<FamilyState>("family");
   const now = await ctx.date.now();
   const decision = decideRefresh(family, request.presentedHash, now);
