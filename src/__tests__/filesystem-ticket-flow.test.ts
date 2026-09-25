@@ -122,6 +122,7 @@ function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
       { id: "code-review", gates: true },
       { id: "branch-preview", gates: false },
     ],
+    reviewFixLifecycle: null,
     ...overrides,
   };
 }

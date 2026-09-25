@@ -5115,7 +5115,7 @@ function startServer(
           return { started: getPollStats().pollCount > before };
         },
         notifyWebhookUrl: config.notifyWebhookUrl,
-      }, registry, { startDeploy, selfDeployTarget: config.selfDeployTarget, kgRefresh, callTool })) return;
+      }, registry, { startDeploy, selfDeployTarget: config.selfDeployTarget, kgRefresh, callTool, getRestateStatus })) return;
     }
 
     res.writeHead(404, { "Content-Type": "application/json" });

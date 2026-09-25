@@ -42,6 +42,7 @@ function mapping(overrides: Partial<RepoMapping> & Pick<RepoMapping, "owner" | "
     memoryProviderId: null,
     referenceRepos: null,
     reviewers: null,
+    reviewFixLifecycle: null,
     ...overrides,
   };
 }
@@ -60,7 +61,7 @@ afterEach(() => {
 });
 
 describe("config", () => {
-  it("adds an unused nullable review-fix lifecycle column on fresh and repeated initialization", () => {
+  it("adds a nullable review-fix lifecycle column on fresh and repeated initialization, resolving to Legacy", () => {
     config.initMappingsTable();
     config.initMappingsTable();
     const db = new Database(dbPath);
@@ -72,7 +73,8 @@ describe("config", () => {
         .run("NEW", "org", "repo", "claude-implement.yml", "main");
       expect(db.prepare("SELECT review_fix_lifecycle FROM mappings WHERE team_key = ?").get("NEW"))
         .toEqual({ review_fix_lifecycle: null });
-      expect(config.getMappings().NEW).not.toHaveProperty("reviewFixLifecycle");
+      expect(config.getMappings().NEW.reviewFixLifecycle).toBeNull();
+      expect(config.resolveReviewFixLifecycle(config.getMappings().NEW)).toBe("legacy");
     } finally { db.close(); }
   });
 
@@ -94,8 +96,16 @@ describe("config", () => {
         .toEqual({ owner: "org", repo: "legacy", review_fix_lifecycle: null });
       expect((reopened.prepare("PRAGMA table_info(mappings)").all() as Array<{ name: string }> )
         .filter((item) => item.name === "review_fix_lifecycle")).toHaveLength(1);
-      expect(config.getMappings().LEG).not.toHaveProperty("reviewFixLifecycle");
+      expect(config.getMappings().LEG.reviewFixLifecycle).toBeNull();
+      expect(config.resolveReviewFixLifecycle(config.getMappings().LEG)).toBe("legacy");
     } finally { reopened.close(); }
+  });
+
+  it("upsertMapping stores and retrieves an explicit review-fix lifecycle", () => {
+    config.initMappingsTable();
+    config.upsertMapping("RES", mapping({ owner: "org", repo: "res", reviewFixLifecycle: "restate" }));
+    expect(config.getMappings().RES.reviewFixLifecycle).toBe("restate");
+    expect(config.resolveReviewFixLifecycle(config.getMappings().RES)).toBe("restate");
   });
 
   it("initialises an empty mappings table", () => {
