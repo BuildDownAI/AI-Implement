@@ -47,8 +47,9 @@
 #   runner image is only usable in this GitHub Actions execution mode.
 
 name: Claude AI Implementation
-# Display-only: the ticket key also rides inside run_config, which run-name expressions cannot decode.
-run-name: ${{ inputs.issue_identifier && format('Claude AI Implementation — {0}', inputs.issue_identifier) || 'Claude AI Implementation' }}
+# Display-only: the ticket key and pilot attempt ID also ride inside run_config.
+# GitHub evaluates this before a step can decode or validate the envelope.
+run-name: ${{ inputs.run_attempt_token && format('Claude AI Implementation — {0} · attempt {1}', inputs.issue_identifier || 'review-fix', inputs.run_attempt_token) || inputs.issue_identifier && format('Claude AI Implementation — {0}', inputs.issue_identifier) || 'Claude AI Implementation' }}
 
 on:
   workflow_dispatch:
@@ -62,6 +63,11 @@ on:
         type: string
       issue_identifier:
         description: "Ticket key for the run title; display only — run_config is authoritative"
+        required: false
+        type: string
+        default: ""
+      run_attempt_token:
+        description: "Secret-free pilot attempt ID for exact run correlation; must match run_config.reviewFix.attemptId"
         required: false
         type: string
         default: ""
@@ -223,6 +229,37 @@ jobs:
             | gsub("%"; "%25") | gsub("\r"; "%0D") | gsub("\n"; "%0A")
             | "::add-mask::" + .
           ' "$GITHUB_EVENT_PATH"
+
+      - name: Validate attempt correlation
+        env:
+          RUN_CONFIG: ${{ inputs.run_config }}
+          RUN_ATTEMPT_TOKEN: ${{ inputs.run_attempt_token }}
+        run: |
+          # Keep all untrusted data in env/quoted variables, never in script text.
+          # The runner repeats full contract validation; this gate prevents a malformed
+          # pilot marker from reaching subsequent steps or silently running as Legacy.
+          decoded="$(printf '%s' "$RUN_CONFIG" | base64 -d)" || {
+            echo "::error::run_config is not valid base64" >&2
+            exit 1
+          }
+          if ! printf '%s' "$decoded" | jq -e --arg marker "$RUN_ATTEMPT_TOKEN" '
+            def id: type == "string" and length > 0 and length <= 128
+              and test("^[A-Za-z0-9][A-Za-z0-9._-]*$");
+            def positive_int: type == "number" and . > 0 and . <= 9007199254740991 and floor == .;
+            .v == 1 and (.issue | type == "object") and
+            (if has("reviewFix") then
+              ($marker | id) and (.reviewFix | type == "object") and
+              (.reviewFix.version == 1) and
+              (.reviewFix.attemptId == $marker) and
+              (.reviewFix.installationId | positive_int) and
+              (.reviewFix.repository | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")) and
+              (.reviewFix.prNumber | positive_int) and
+              (.reviewFix.deadlineAt | positive_int)
+            else $marker == "" end)
+          ' >/dev/null 2>&1; then
+            echo "::error::run_config reviewFix metadata and run_attempt_token must form one valid, matching pilot identity (or both be absent for Legacy)" >&2
+            exit 1
+          fi
 
       - name: Print dispatch inputs
         env:

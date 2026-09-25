@@ -117,11 +117,12 @@ describe("GHA workflow shims", () => {
   });
 
   for (const f of IMPLEMENT_WORKFLOWS) {
-    it(`${f} declares exactly the 9 envelope inputs, in order`, () => {
+    it(`${f} declares the optional attempt correlation input alongside the legacy envelope inputs`, () => {
       const doc = parse(readFileSync(f, "utf-8")) as any;
       expect(Object.keys(doc.on.workflow_dispatch.inputs)).toEqual([
         "run_config",
         "issue_identifier",
+        "run_attempt_token",
         "runner_image",
         "job_timeout_minutes",
         "provider",
@@ -142,9 +143,12 @@ describe("GHA workflow shims", () => {
 
     it(`${f} titles the run with the ticket key via run-name:`, () => {
       const yaml = readFileSync(f, "utf-8");
-      expect(yaml).toContain(
-        "run-name: ${{ inputs.issue_identifier && format('Claude AI Implementation — {0}', inputs.issue_identifier) || 'Claude AI Implementation' }}",
-      );
+      expect(yaml).toContain("inputs.run_attempt_token");
+      expect(yaml).toContain("inputs.issue_identifier");
+      expect(yaml).not.toMatch(/^run-name:.*(?:run_token|run_progress_token|run_publication_token)/m);
+      const doc = parse(yaml) as any;
+      expect(doc.on.workflow_dispatch.inputs.run_attempt_token).toMatchObject({ required: false, type: "string", default: "" });
+      expect(doc.run__name ?? doc["run-name"]).toContain("inputs.run_attempt_token");
     });
   }
 
@@ -581,7 +585,8 @@ describe("GHA workflow shims", () => {
     it(`${f} masks tokens before Print dispatch inputs in the implement job`, () => {
       const doc = parse(readFileSync(f, "utf-8")) as any;
       expect(doc.jobs.implement.steps[0].name).toBe("Mask runner callback tokens");
-      expect(doc.jobs.implement.steps[1].name).toBe("Print dispatch inputs");
+      expect(doc.jobs.implement.steps[1].name).toBe("Validate attempt correlation");
+      expect(doc.jobs.implement.steps[2].name).toBe("Print dispatch inputs");
     });
 
     it(`${f} Print dispatch inputs never passes run_token or run_progress_token as raw expressions`, () => {
