@@ -1,0 +1,13 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "declaration": false
+  },
+  "include": [
+    "src/__tests__/cycle-summary.test.ts",
+    "src/__tests__/steps-feedback-loop.test.ts",
+    "src/__tests__/post-push-review.test.ts"
+  ],
+  "exclude": []
+}
