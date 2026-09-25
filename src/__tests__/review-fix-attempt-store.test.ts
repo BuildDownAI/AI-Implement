@@ -21,6 +21,7 @@ import type * as StoreModule from "../review-fix-attempt-store.js";
 import type * as LedgerModule from "../review-ledger-store.js";
 import type * as QueueModule from "../review-fix-queue.js";
 import type * as PendingModule from "../review-fix-pending.js";
+import type * as CloseModule from "../review-fix-close.js";
 import type { ReviewFixAdmissionRequest, ReviewFixAttemptStorePort } from "../review-fix-ports.js";
 import type { ReviewFixResultMetadataV1, ScopedPrIdentity } from "../review-fix-contract.js";
 import type { RepoMapping } from "../config.js";
@@ -32,6 +33,7 @@ let storeModule: typeof StoreModule;
 let ledger: typeof LedgerModule;
 let queue: typeof QueueModule;
 let pending: typeof PendingModule;
+let close: typeof CloseModule;
 
 beforeEach(async () => {
   vi.resetModules();
@@ -46,6 +48,7 @@ beforeEach(async () => {
   ledger = await import("../review-ledger-store.js");
   queue = await import("../review-fix-queue.js");
   pending = await import("../review-fix-pending.js");
+  close = await import("../review-fix-close.js");
 });
 
 afterEach(() => {
@@ -154,6 +157,24 @@ describe("SqliteReviewFixAttemptStore: satisfies the port without unsafe casts",
 });
 
 describe("SqliteReviewFixAttemptStore: admission", () => {
+  it("durably revokes authority and requests cancellation when its PR closes", async () => {
+    seedMapping();
+    const store = new storeModule.SqliteReviewFixAttemptStore();
+    const admitted = await store.admit(admissionRequest());
+    if (admitted.status !== "prepared") throw new Error("expected prepared");
+    expect(close.listActiveRestateReviewFixPrs()).toEqual([{ repository: SCOPE.repository, prNumber: SCOPE.prNumber }]);
+    expect(close.queueReviewFixCancellationForClosedPr(SCOPE.repository, SCOPE.prNumber)).toBe(true);
+    expect(await store.hasCurrentAuthority(admitted.attempt.attemptId)).toBe(false);
+    expect(close.queueReviewFixCancellationForClosedPr(SCOPE.repository, SCOPE.prNumber)).toBe(true);
+    const rows = dedup.getDb().prepare("SELECT kind, delivery_state FROM review_fix_inbox").all() as
+      Array<{ kind: string; delivery_state: string }>;
+    expect(rows).toEqual([{ kind: "cancellation", delivery_state: "pending" }]);
+    expect(dedup.getDb().prepare("SELECT released_at FROM dispatch_admissions WHERE dispatch_id = ?")
+      .get(admitted.attempt.attemptId)).toMatchObject({ released_at: null });
+    await store.releaseOwner(admitted.attempt.owner, "cancelled");
+    expect(close.listActiveRestateReviewFixPrs()).toEqual([]);
+  });
+
   it("consumes exactly one queue snapshot while preserving overflow and new finding revisions", async () => {
     seedMapping();
     const queueId = queue.enqueueReviewFix({

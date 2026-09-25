@@ -73,6 +73,7 @@ import { CYCLE_SUMMARY_MAX_BYTES } from "./pipeline/cycle-summary.js";
 import type { RunnerProgressBody, RunnerResultBody, RunnerActivityBody, ActivityIntakeOutcome } from "./runner-callback.js";
 import { mintRunToken, PLANNING_TTL_SECONDS, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
 import { SqliteReviewFixAttemptStore } from "./review-fix-attempt-store.js";
+import { listActiveRestateReviewFixPrs, queueReviewFixCancellationForClosedPr } from "./review-fix-close.js";
 import { acceptDelivery as acceptReviewFixDelivery, ReviewFixDeliveryPump } from "./restate/review-fix-client.js";
 import { appendReviewFixActivityBatch, isReviewFixEvidenceTombstoned } from "./review-fix-evidence.js";
 import type { ReviewFixResultMetadataV1, ResultIntakeOutcome } from "./review-fix-contract.js";
@@ -856,6 +857,23 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
 
   // Process any pending reconciliation jobs triggered by merged PRs
   await processReconciliations(config, registry);
+
+  // Recover a missed close webhook for an active Restate owner. Cancellation
+  // remains durable during deploy hold; unknown GitHub state leaves authority
+  // and capacity untouched until a later observation can confirm closure.
+  for (const active of listActiveRestateReviewFixPrs()) {
+    const [owner, repo] = active.repository.split("/");
+    if (!owner || !repo) continue;
+    try {
+      const token = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
+      const state = await getPullRequestState(token, owner, repo, active.prNumber);
+      if (state && shouldSkipReviewFix(state)) {
+        queueReviewFixCancellationForClosedPr(active.repository, active.prNumber);
+      }
+    } catch (err) {
+      console.warn(`[review-fix] Could not reconcile PR closure for ${active.repository}#${active.prNumber}:`, err);
+    }
+  }
 
   // Both of these launch runner jobs, so they pause with issue dispatch —
   // otherwise the hold would block on work it is itself still creating.
@@ -4779,7 +4797,7 @@ function startServer(
         reportDryRun: (report) => kgRefresh.reportDryRun(report),
         onRefreshSettled: (cb) => kgRefresh.onRefreshSettled(cb),
         forgetKgPr: (repo, prNumber) => kgRefresh.forgetPr(repo, prNumber),
-      }).catch((err) => {
+      }, (repository, prNumber) => { queueReviewFixCancellationForClosedPr(repository, prNumber); }).catch((err) => {
         console.error("[webhook] Unhandled error:", err);
         if (!res.headersSent) {
           res.writeHead(500, { "Content-Type": "application/json" });

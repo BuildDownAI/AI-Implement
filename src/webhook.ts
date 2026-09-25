@@ -451,6 +451,7 @@ export async function handleGitHubWebhook(
   privateKey?: string,
   selfDeploy?: SelfDeployTarget,
   kgPrCheck?: KgPrCheckConfig,
+  onReviewFixPrClosed?: (repository: string, prNumber: number) => void | Promise<void>,
 ): Promise<void> {
   const body = await readRawBody(req);
   const signature = req.headers["x-hub-signature-256"] as string | undefined;
@@ -526,6 +527,9 @@ export async function handleGitHubWebhook(
     const kgPrNumber = payload.pull_request?.number;
     if (kgRepoFullName && kgPrNumber && (kgRepoFullName === kgPrCheck?.kgSourceRepo || kgRepoFullName === kgPrCheck?.kgBaseRepo)) {
       forgetKgPr(kgPrCheck, kgRepoFullName, kgPrNumber);
+    }
+    if (kgRepoFullName && kgPrNumber && onReviewFixPrClosed) {
+      await onReviewFixPrClosed(kgRepoFullName, kgPrNumber);
     }
   }
 
