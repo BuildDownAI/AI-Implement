@@ -101,6 +101,26 @@ describe("createRestateReviewFixFacade", () => {
     );
     expect(outcome).toEqual({ status: "unavailable" });
   });
+
+  it("treats a request that never resolves as unavailable once the configured timeout elapses, instead of hanging forever", async () => {
+    // Simulates a stalled sidecar connection: fetch never resolves on its own, but must
+    // still react to the AbortSignal invoke() is expected to pass through fetchImpl's init.
+    const fetchImpl = vi.fn(
+      (_url: string, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(new Error("The operation was aborted")));
+        }),
+    );
+    const facade = client.createRestateReviewFixFacade({
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      timeoutMs: 20,
+    });
+
+    const outcome = await facade.deliverCancel("attempt-1", "cancellation:github:evt-1");
+
+    expect(outcome).toEqual({ status: "unavailable" });
+    expect((fetchImpl.mock.calls[0]![1] as RequestInit).signal).toBeInstanceOf(AbortSignal);
+  });
 });
 
 describe("reviewFixDeliveryIdempotencyKey", () => {
@@ -285,6 +305,111 @@ describe("ReviewFixDeliveryPump — drain pause", () => {
     const deliveredAfterResume = await pump.tick();
     expect(deliveredAfterResume).toBe(1);
     expect(inbox.getDelivery("github", "evt-paused")?.deliveryState).toBe("delivered");
+  });
+});
+
+describe("ReviewFixDeliveryPump — barrier re-check mid-batch", () => {
+  // Regression for a stop()/pause() called while a multi-row batch is still awaiting its
+  // first endpoint call: without a re-check before every row, the in-flight tick would
+  // keep initiating endpoint calls for the rest of the claimed batch even after the
+  // caller believed delivery had stopped.
+  function acceptTwo(prefix: string): ScopedPrIdentity {
+    const destination = makeDestination();
+    inbox.acceptDelivery({ authenticatedSource: "github", deliveryId: `${prefix}-a`, kind: "feedback", destination, payload: {} });
+    inbox.acceptDelivery({ authenticatedSource: "github", deliveryId: `${prefix}-b`, kind: "feedback", destination, payload: {} });
+    return destination;
+  }
+
+  it("stop() during an in-flight tick starts no further endpoint call for the rest of that batch", async () => {
+    acceptTwo("evt-stop");
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const deliverFeedback = vi.fn(async () => {
+      await gate;
+      return { status: "accepted" } as const;
+    });
+    const pump = new client.ReviewFixDeliveryPump({ facade: makeFakeFacade({ deliverFeedback }), now: () => 1_000 });
+
+    const tickPromise = pump.tick();
+    // The first row's facade call is already in flight (awaiting `gate`) by this point.
+    pump.stop();
+    release();
+    const delivered = await tickPromise;
+
+    expect(delivered).toBe(1);
+    expect(deliverFeedback).toHaveBeenCalledTimes(1);
+    // The second row was claimed with the batch but never reached: left claimed, not
+    // touched, so it is recoverable once its lease elapses (same as restart recovery).
+    expect(inbox.getDelivery("github", "evt-stop-b")?.deliveryState).toBe("claimed");
+  });
+
+  it("pause() during an in-flight tick starts no further endpoint call for the rest of that batch", async () => {
+    acceptTwo("evt-pause");
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const deliverFeedback = vi.fn(async () => {
+      await gate;
+      return { status: "accepted" } as const;
+    });
+    const pump = new client.ReviewFixDeliveryPump({ facade: makeFakeFacade({ deliverFeedback }), now: () => 1_000 });
+
+    const tickPromise = pump.tick();
+    pump.pause();
+    release();
+    const delivered = await tickPromise;
+
+    expect(delivered).toBe(1);
+    expect(deliverFeedback).toHaveBeenCalledTimes(1);
+    expect(inbox.getDelivery("github", "evt-pause-b")?.deliveryState).toBe("claimed");
+  });
+});
+
+describe("ReviewFixDeliveryPump — invalid payload vs. facade unavailable", () => {
+  it("reports a locally-invalid cancellation payload separately from a genuine facade outage, in both the reschedule cadence and status()", async () => {
+    const destination = makeDestination();
+    inbox.acceptDelivery({
+      authenticatedSource: "runner",
+      deliveryId: "evt-poison",
+      kind: "cancellation",
+      // No attemptId: extractAttemptId() will fail — this can never succeed by retrying
+      // the sidecar, unlike a real outage.
+      destination,
+      payload: {},
+    });
+
+    const facade = makeFakeFacade();
+    const pump = new client.ReviewFixDeliveryPump({ facade, now: () => 1_000, retryDelayMs: 500, invalidRetryDelayMs: 60_000 });
+
+    const delivered = await pump.tick();
+
+    expect(delivered).toBe(0);
+    expect(facade.deliverCancel).not.toHaveBeenCalled(); // never touches the network
+    const status = pump.status();
+    expect(status.lastTickInvalid).toBe(1);
+    expect(status.lastTickUnavailable).toBe(0);
+    // Rescheduled at the longer invalid-payload cadence, not the short transient-retry one.
+    const row = inbox.getDelivery("runner", "evt-poison");
+    expect(row?.deliveryState).toBe("pending");
+    expect(row?.retryAt).toBe(1_000 + 60_000);
+  });
+
+  it("counts a genuine facade outage under lastTickUnavailable, not lastTickInvalid", async () => {
+    const destination = makeDestination();
+    inbox.acceptDelivery({ authenticatedSource: "github", deliveryId: "evt-down", kind: "feedback", destination, payload: {} });
+
+    const facade = makeFakeFacade({ deliverFeedback: vi.fn(async () => ({ status: "unavailable" }) as const) });
+    const pump = new client.ReviewFixDeliveryPump({ facade, now: () => 1_000 });
+
+    const delivered = await pump.tick();
+
+    expect(delivered).toBe(0);
+    const status = pump.status();
+    expect(status.lastTickInvalid).toBe(0);
+    expect(status.lastTickUnavailable).toBe(1);
   });
 });
 

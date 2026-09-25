@@ -50,11 +50,18 @@ export interface ReviewFixDeliveryFacade {
   deliverCancel(attemptId: AttemptId, idempotencyKey: string): Promise<ReviewFixFacadeOutcome>;
 }
 
-/** For testing: override the ingress base URL and the fetch implementation. */
+/** For testing: override the ingress base URL, the fetch implementation, and the
+ *  per-request timeout. */
 export interface RestateReviewFixFacadeDeps {
   ingressBaseUrl?: string;
   fetchImpl?: typeof fetch;
+  /** Bounds how long a single delivery call may hang before it is treated as
+   *  unavailable. Without this, a stalled sidecar connection would hold up the pump's
+   *  tick indefinitely (the tick awaits each delivery in sequence). Default 10s. */
+  timeoutMs?: number;
 }
+
+const DEFAULT_FACADE_TIMEOUT_MS = 10_000;
 
 async function invoke(
   deps: Required<RestateReviewFixFacadeDeps>,
@@ -70,8 +77,12 @@ async function invoke(
       method: "POST",
       headers: { "content-type": "application/json", "idempotency-key": idempotencyKey },
       body: JSON.stringify(body ?? {}),
+      signal: AbortSignal.timeout(deps.timeoutMs),
     });
   } catch {
+    // Covers a connection failure and a request-timeout abort alike: both mean this
+    // call could not confirm acceptance, so both degrade to "unavailable" and the
+    // durable row is retried rather than treated as a business-logic decision here.
     return { status: "unavailable" };
   }
   // Any non-2xx — including a 4xx this caller cannot repair by retrying the identical
@@ -87,6 +98,7 @@ export function createRestateReviewFixFacade(deps: RestateReviewFixFacadeDeps = 
   const resolved: Required<RestateReviewFixFacadeDeps> = {
     ingressBaseUrl: deps.ingressBaseUrl ?? RESTATE_INGRESS_BASE_URL,
     fetchImpl: deps.fetchImpl ?? fetch,
+    timeoutMs: deps.timeoutMs ?? DEFAULT_FACADE_TIMEOUT_MS,
   };
   return {
     async deliverFeedback(destination, idempotencyKey) {
@@ -141,6 +153,15 @@ export interface ReviewFixPumpStatus {
   readonly state: ReviewFixPumpRunState;
   readonly lastTickAt: number | null;
   readonly lastTickDelivered: number;
+  /** Count of deliveries the last tick rescheduled because their payload is locally,
+   *  permanently invalid (failed contract validation) — never because the sidecar was
+   *  unreachable. A nonzero, steady value here (unlike `lastTickUnavailable`, which
+   *  tracks genuine sidecar outages) points at a poison-pill event, not an outage. */
+  readonly lastTickInvalid: number;
+  /** Count of deliveries the last tick rescheduled because the facade reported the
+   *  sidecar unreachable or non-2xx — kept separate from `lastTickInvalid` so a stuck
+   *  poison-pill event never masquerades as an ongoing outage, or vice versa. */
+  readonly lastTickUnavailable: number;
   readonly lastError: string | null;
 }
 
@@ -154,6 +175,14 @@ export interface ReviewFixDeliveryPumpDeps {
   batchLimit?: number;
   leaseMs?: number;
   retryDelayMs?: number;
+  /** Reschedule delay for a locally-invalid payload. Deliberately longer than
+   *  `retryDelayMs`: a validation failure cannot be fixed by a network retry, so
+   *  retrying it at the same cadence as a transient outage would burn a `batchLimit`
+   *  slot every tick for a condition that never self-heals. Default 60s. */
+  invalidRetryDelayMs?: number;
+  /** Per-request timeout passed to the default facade. Ignored when `facade` is
+   *  supplied — an injected facade owns its own timeout behavior. */
+  requestTimeoutMs?: number;
 }
 
 /**
@@ -174,16 +203,23 @@ export class ReviewFixDeliveryPump {
   private readonly batchLimit: number;
   private readonly leaseMs: number;
   private readonly retryDelayMs: number;
+  private readonly invalidRetryDelayMs: number;
 
   private timer: ReturnType<typeof setInterval> | null = null;
   private paused = false;
   private ticking = false;
+  // Bumped by stop() so an in-flight tick can notice mid-batch, independent of whether
+  // the pump was ever start()ed — a test (or any caller) driving tick() directly without
+  // an interval timer must still be able to stop a multi-row batch partway through.
+  private stopGeneration = 0;
   private lastTickAt: number | null = null;
   private lastTickDelivered = 0;
+  private lastTickInvalid = 0;
+  private lastTickUnavailable = 0;
   private lastError: string | null = null;
 
   constructor(deps: ReviewFixDeliveryPumpDeps = {}) {
-    this.facade = deps.facade ?? createRestateReviewFixFacade();
+    this.facade = deps.facade ?? createRestateReviewFixFacade({ timeoutMs: deps.requestTimeoutMs });
     this.claim = deps.claim ?? claimDeliveries;
     this.retryFn = deps.retry ?? retryDelivery;
     this.ack = deps.ack ?? ackDelivery;
@@ -192,6 +228,7 @@ export class ReviewFixDeliveryPump {
     this.batchLimit = deps.batchLimit ?? 20;
     this.leaseMs = deps.leaseMs ?? 5 * 60_000;
     this.retryDelayMs = deps.retryDelayMs ?? 5_000;
+    this.invalidRetryDelayMs = deps.invalidRetryDelayMs ?? 60_000;
   }
 
   status(): ReviewFixPumpStatus {
@@ -199,6 +236,8 @@ export class ReviewFixDeliveryPump {
       state: this.timer === null ? "stopped" : this.paused ? "paused" : "running",
       lastTickAt: this.lastTickAt,
       lastTickDelivered: this.lastTickDelivered,
+      lastTickInvalid: this.lastTickInvalid,
+      lastTickUnavailable: this.lastTickUnavailable,
       lastError: this.lastError,
     };
   }
@@ -215,6 +254,7 @@ export class ReviewFixDeliveryPump {
    *  Never claims a new row once stopped, but never touches a row already claimed — that
    *  row's lease simply runs its course, same as during a pause. */
   stop(): void {
+    this.stopGeneration++;
     if (this.timer !== null) {
       clearInterval(this.timer);
       this.timer = null;
@@ -236,19 +276,37 @@ export class ReviewFixDeliveryPump {
    * directly (not only via the interval timer) so a caller — including a test — can
    * drive delivery deterministically. A tick already in flight is never overlapped by a
    * second one; the interval timer's own tick simply no-ops while one is still running.
+   *
+   * Re-checks pause/stop before every row, not just at the top of the tick: a batch can
+   * span several awaited network calls, and stop()/pause() run synchronously between
+   * those awaits (this class holds no lock, but JS never interleaves two synchronous
+   * sections). Without the re-check, a batch already claimed at tick start would keep
+   * initiating new endpoint calls after the caller believed delivery had stopped —
+   * breaking the "no new endpoint call starts after the barrier" shutdown/drain
+   * guarantee. Rows not yet reached this way are left claimed, exactly like a row a
+   * crashed pump never got to: they become reclaimable once their lease elapses.
    */
   async tick(): Promise<number> {
     if (this.paused || this.ticking) return 0;
     this.ticking = true;
+    const stopGenerationAtStart = this.stopGeneration;
     let delivered = 0;
+    let invalid = 0;
+    let unavailable = 0;
     try {
       const now = this.now();
       const claimed = this.claim({ limit: this.batchLimit, leaseMs: this.leaseMs, now });
       for (const delivery of claimed) {
-        if (await this.deliverOne(delivery, now)) delivered++;
+        if (this.paused || this.stopGeneration !== stopGenerationAtStart) break;
+        const outcome = await this.deliverOne(delivery, now);
+        if (outcome === "delivered") delivered++;
+        else if (outcome === "invalid") invalid++;
+        else unavailable++;
       }
       this.lastTickAt = now;
       this.lastTickDelivered = delivered;
+      this.lastTickInvalid = invalid;
+      this.lastTickUnavailable = unavailable;
       this.lastError = null;
     } catch (err) {
       this.lastError = err instanceof Error ? err.message : String(err);
@@ -258,40 +316,74 @@ export class ReviewFixDeliveryPump {
     return delivered;
   }
 
-  private async deliverOne(delivery: ReviewFixDelivery, now: number): Promise<boolean> {
+  private async deliverOne(delivery: ReviewFixDelivery, now: number): Promise<"delivered" | "invalid" | "unavailable"> {
     const idempotencyKey = reviewFixDeliveryIdempotencyKey(delivery);
+    this.logDelivery("accepted-for-forwarding", delivery);
     const outcome = await this.route(delivery, idempotencyKey);
     if (outcome.status === "accepted") {
       this.ack(delivery.authenticatedSource, delivery.deliveryId);
-      return true;
+      this.logDelivery("acknowledged", delivery);
+      return "delivered";
     }
-    // Transient sidecar failure, or a kind not yet routable: reschedule sooner than the
-    // full claim lease so a recovered sidecar redelivers promptly rather than waiting
-    // out the lease. Never marked delivered, never dropped.
-    this.retryFn(delivery.authenticatedSource, delivery.deliveryId, now + this.retryDelayMs);
-    return false;
+    // A locally-invalid payload and a genuinely unreachable sidecar are both rescheduled
+    // — this module makes no drop/finalize decision either way — but at a different
+    // cadence and under a different reason, so a poison-pill event that will never
+    // succeed cannot masquerade as a live outage in the logs or in status().
+    const retryDelayMs = outcome.status === "invalid" ? this.invalidRetryDelayMs : this.retryDelayMs;
+    this.logDelivery("rescheduled", delivery, outcome.reason);
+    this.retryFn(delivery.authenticatedSource, delivery.deliveryId, now + retryDelayMs);
+    return outcome.status;
   }
 
-  private async route(delivery: ReviewFixDelivery, idempotencyKey: string): Promise<ReviewFixFacadeOutcome> {
+  /** Structured, identity-only logging: kind/authenticatedSource/deliveryId/destination
+   *  and (for a reschedule) a normalized reason — never delivery payload content, which
+   *  may carry finding text or other user-supplied data. */
+  private logDelivery(event: "accepted-for-forwarding" | "acknowledged" | "rescheduled", delivery: ReviewFixDelivery, reason?: string): void {
+    const identity = {
+      kind: delivery.kind,
+      authenticatedSource: delivery.authenticatedSource,
+      deliveryId: delivery.deliveryId,
+      destination: delivery.destination,
+    };
+    const detail = reason ? ` reason=${reason}` : "";
+    const message = `[review-fix-client] ${event} ${JSON.stringify(identity)}${detail}`;
+    if (event === "rescheduled") console.warn(message);
+    else console.log(message);
+  }
+
+  private async route(delivery: ReviewFixDelivery, idempotencyKey: string): Promise<RouteOutcome> {
     switch (delivery.kind) {
       case "feedback":
-        return this.facade.deliverFeedback(delivery.destination, idempotencyKey);
+        return toRouteOutcome(await this.facade.deliverFeedback(delivery.destination, idempotencyKey), "facade unavailable (sidecar unreachable or non-2xx response)");
       case "result": {
         const validated = validateReviewFixResultMetadata(delivery.payload);
-        if (!validated.ok) return { status: "unavailable" };
-        return this.facade.deliverResult(validated.value, idempotencyKey);
+        if (!validated.ok) return { status: "invalid", reason: `invalid result metadata: ${validated.error}` };
+        return toRouteOutcome(await this.facade.deliverResult(validated.value, idempotencyKey), "facade unavailable (sidecar unreachable or non-2xx response)");
       }
       case "cancellation": {
         const attemptId = extractAttemptId(delivery.payload);
-        if (!attemptId) return { status: "unavailable" };
-        return this.facade.deliverCancel(attemptId, idempotencyKey);
+        if (!attemptId) return { status: "invalid", reason: "missing or invalid attemptId in cancellation payload" };
+        return toRouteOutcome(await this.facade.deliverCancel(attemptId, idempotencyKey), "facade unavailable (sidecar unreachable or non-2xx response)");
       }
       case "terminal-effect":
       default:
         // Not yet wired to a Restate handler (AII-811 composes the production adapters
         // that own this decision) — never dropped, never marked delivered; left claimed
-        // for a later redelivery once a route exists.
-        return { status: "unavailable" };
+        // for a later redelivery once a route exists. This is a known gap, not a
+        // malformed event, so it is reported as "unavailable" rather than "invalid".
+        return { status: "unavailable", reason: "no Restate route registered yet for this delivery kind" };
     }
   }
+}
+
+/**
+ * Internal routing outcome: adds a normalized `reason` for logging/status, and a third
+ * `"invalid"` case the facade itself never returns — it exists only for payloads this
+ * module rejects before ever calling the facade (a `ReviewFixDeliveryFacade` never sees
+ * them), so it is kept out of the public `ReviewFixFacadeOutcome` contract.
+ */
+type RouteOutcome = { readonly status: "accepted" } | { readonly status: "unavailable" | "invalid"; readonly reason: string };
+
+function toRouteOutcome(outcome: ReviewFixFacadeOutcome, unavailableReason: string): RouteOutcome {
+  return outcome.status === "accepted" ? outcome : { status: "unavailable", reason: unavailableReason };
 }
