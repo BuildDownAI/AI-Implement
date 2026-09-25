@@ -12,7 +12,17 @@ Restate is the durable-execution engine that holds workflow position for the run
 
 ## The endpoint module
 
-`src/restate/endpoint.ts` builds the SDK endpoint with the registered service set and exposes the bind address. The service set is empty until the first workflow registers. It binds to localhost only: the server and the orchestrator share a machine, and the SDK endpoint must never be reachable from outside it.
+`src/restate/endpoint.ts` builds the SDK endpoint with the registered service set and exposes the bind address. AII-811 composes `ReviewFixPR` and `ReviewFixAttempt` with production adapters and registers them at boot. The project lifecycle setting still defaults to Legacy. The endpoint binds to localhost only: the server and the orchestrator share a machine, and the SDK endpoint must never be reachable from outside it.
+
+### Prepared review-fix attempts (AII-796)
+
+`src/restate/review-fix-attempt.ts` defines the `ReviewFixAttempt` workflow over the SDK-free store, worker, and finalizer contracts in `src/review-fix-ports.ts`. The caller admits and persists an immutable attempt in SQLite before invoking `run` under its exact `attemptId` workflow key. The workflow records launch intent and dispatch in one retry-safe step: if the external response or journal acknowledgement is lost, an existing intent forces exact reconciliation instead of a second launch. `result` and `cancel` are shared handlers so they can update the durable promise and persisted authority while `run` waits; result metadata is validated and must match the bound GitHub run ID and attempt before it can support approval.
+
+Cancellation and deadlines revoke approval authority but retain the occupied slot until `inspectTerminal` confirms the backend stopped. An unknown launch similarly retains occupancy while exact reconciliation is inconclusive. The approval-evidence dependency must supply the current PR head, finding dispositions, and policy decision from current stored state; the workflow never infers them from a successful GitHub job. The factory does not wire a real adapter, boot registration, or live project selection. AII-811 owns that composition and AII-815 owns the live SAN evaluation. Workflow completion, journal, and handler-idempotency retention are each set to at least seven days after completion.
+
+### Per-PR feedback coordination (AII-800)
+
+`src/restate/review-fix-pr.ts` defines the `ReviewFixPR` Virtual Object keyed by installation, repository, and PR. The caller persists accepted feedback before signaling `feedback`; the object journals only a wakeup, not the feedback body. The first signal reads the effective collection window from its injected configuration provider (default five seconds) and schedules one check; later signals do not extend that timer, and a setting change applies only to later windows. An exclusive, short `check` handler reads current pending work from the injected store and atomically asks the attempt store to admit it. Deferred work gets a durable recheck without an attempt deadline or budget entry. A prepared attempt is sent to `ReviewFixAttempt.run` asynchronously, so the PR object never holds its exclusive handler while a runner waits. The attempt workflow sends `completed` after finalization; this wakes persisted pending feedback, and a stale completion cannot clear a replacement attempt. The `capacityAvailable` handler also supports a wake on release, but production does not call it yet; deferred checks supply the current retry path.
 
 ## Testing
 
@@ -20,7 +30,7 @@ Restate is the durable-execution engine that holds workflow position for the run
 
 Every Restate test lives under `src/__tests__/restate/` and is told apart from a unit test by that folder, not only by the `.restate.test.ts` suffix — a reader never has to check the suffix alone. A test never declares its own container, variants, start/stop hooks, or fetch helper: `src/__tests__/restate/harness.ts` exports `RESTATE_IMAGE_VERSION`, `VARIANTS`, `startVariants(services)` / `stopAll(environments)`, and the three call helpers `callService`, `callObject`, `callWorkflow`, and every test file imports them from there (AII-716).
 
-`startVariants` boots one Restate container per variant with `RestateTestEnvironment.start` from `@restatedev/restate-sdk-testcontainers`, registering only the services the scenario needs. Container boot takes seconds; a file is capped at 60 seconds. `alwaysReplay: true` forces replay at every suspension and is on for every scenario; `disableRetries: true` surfaces error paths at once. Tests run disarmed: the suite setup clears `RUN_TOKEN`, `RUNNER_CALLBACK_URL`, and `RUN_PROGRESS_TOKEN`, and an armed fixture points at an unroutable host (AII-567).
+`startVariants` boots one Restate container per variant with `RestateTestEnvironment.start` from `@restatedev/restate-sdk-testcontainers`, registering only the services the scenario needs. Container boot takes seconds; the normal hook/test cap is 60 seconds. `alwaysReplay: true` forces replay at every suspension; `disableRetries: true` surfaces error paths at once. The AII-796 recovery scenario separately uses the shared harness's pinned, retry-enabled, disk-backed environment to verify an endpoint and sidecar restart without replacing the journal. Tests run disarmed: the suite setup clears `RUN_TOKEN`, `RUNNER_CALLBACK_URL`, and `RUN_PROGRESS_TOKEN`, and an armed fixture points at an unroutable host (AII-567).
 
 **The empty-body rule.** The call helpers read `response.text()` before parsing, so an empty 2xx body — what a `void` handler answers with on success — resolves to `undefined` instead of throwing a JSON-parse error. A non-2xx response throws, with both the status and the body text in the error message. Calling `response.json()` unconditionally is the AII-709 regression: a copy of the fetch helper that skipped this check parsed an empty body as JSON and failed all 13 scenarios against `issue`/`revoke`; the shared helper fixes that class once.
 
@@ -42,9 +52,56 @@ An issue with no Restate surface says so in the same place ("unit tests only"), 
 
 ### Boot sequence
 
-`main()` (`src/index.ts`) constructs one `RestateSidecar` and calls `start()` before `loadConfig()`, right after the KG sidecar's own `start()`. On success it starts the SDK endpoint (`startRestateEndpoint()`) and registers it (`register()`), logging the outcome. `stop()` runs in the same `shutdown` closure that stops the KG sidecar, before `server.close()`.
+`main()` (`src/index.ts`) constructs one `RestateSidecar` and calls `start()` before `loadConfig()`, right after the KG sidecar's own `start()`. Starting the SDK endpoint (`startRestateEndpoint()`) and registering it (`register()`) is driven off `whenReady()` (AII-724's late-readiness promise, below), not off `start()`'s own returned boolean — so a sidecar that only becomes ready in the background, after an initial readiness timeout, still gets its endpoint started and registered, exactly once (AII-807). `createRestateRegistrationGate` (`src/index.ts`) is the latch: its `attempt()` runs the start-and-register sequence at most once per boot, records the outcome via `setRestateStatus`, and refuses outright once shutdown has begun. `shuttingDown` is declared at the very top of `main()`, above the sidecar's own construction, specifically so the gate's `isShuttingDown()` check and the `shutdown` closure below read the exact same flag — a late readiness callback and a shutdown signal race over one latch, not two, so shutdown always wins: a `whenReady()` resolution that arrives after `shuttingDown` flips `true` is a no-op.
 
-Every step is non-fatal: a missing platform binary, an early exit, or a readiness timeout each log exactly one warning (`[restate] …`) and boot continues. Until a run kind migrates onto Restate, nothing in the orchestrator depends on the sidecar being up. **No run kind has migrated as of this writing** — `RESTATE_SERVICES` is empty and neither `src/kg-refresh.ts` nor `src/index.ts` has a Restate-backed trigger seam yet. The planned first consumer, kg-refresh (AII-683), is expected to answer `503 restate-unavailable` at its trigger seam when the sidecar is down, instead of hanging; that behavior does not exist until AII-683 lands.
+A `declined-conflict` outcome, from either the initial `attempt()` or a later retry, is not final (AII-721): the gate arms a single unref'd `setInterval` that re-runs `register()` every 60 seconds until it stops coming back `declined-conflict` — the old deployment's non-completed invocations are expected to drain on their own, so this just keeps checking back rather than requiring an operator restart. The timer is armed at most once (a decline while one is already pending reuses it rather than stacking a second), clears itself the moment an attempt succeeds or fails a different way, and `.unref()` means an armed timer never keeps the process alive on its own. `main()`'s shutdown closure calls the gate's `stopRetrying()` unconditionally, so a shutdown never leaves a pending retry behind.
+
+`stop()` runs in the same `shutdown` closure that stops the KG sidecar, before `server.close()`, and the two sidecars are stopped concurrently — `stopSidecarsConcurrently` (`src/index.ts`), a thin `Promise.all` — rather than one after the other, so neither sidecar's `stopTimeoutMs` adds to the other's inside the 10-second forced-shutdown budget (`SHUTDOWN_BUDGET_MS`). Two sidecars each taking up to their own `stopTimeoutMs` (5s default) to exit now cost one wait, not two, leaving margin for `postShutdownNotice` ahead of them and `server.close()` after.
+
+Every step is non-fatal: a missing platform binary, an early exit, or a readiness timeout each log at least one warning (`[restate] …`) and boot continues. Until a run kind migrates onto Restate, nothing in the orchestrator depends on the sidecar being up. **No run kind has migrated as of this writing** — `RESTATE_SERVICES` is empty and neither `src/kg-refresh.ts` nor `src/index.ts` has a Restate-backed trigger seam yet. The planned first consumer, kg-refresh (AII-683), is expected to answer `503 restate-unavailable` at its trigger seam when the sidecar is down, instead of hanging; that behavior does not exist until AII-683 lands.
+
+#### Late readiness (AII-724)
+
+A readiness timeout no longer ends the sidecar's lifecycle. `start()` still resolves its original boolean at the `pollTimeoutMs` deadline — `main()`'s call to `start()` is unchanged and boot proceeds exactly as before — but `RestateSidecar` keeps polling the same child in the background after that deadline instead of giving up on it. Two things can happen next, each logged and reported exactly once: the child later answers healthy (`[restate] sidecar ready after degraded period …`), or it exits (`[restate] sidecar exited (code=…, signal=…)`, read off the `"exit"` event rather than `"close"`, so the message does not wait on a lagging stream-drain event).
+
+`whenReady(): Promise<boolean>` is how a caller observes that eventual outcome — it resolves once for the child spawned by the most recent `start()`, `true` on ready (immediate or delayed) and `false` on exit, missing binary, or `stop()`. `main()` attaches its continuation to `whenReady()` right after `start()` returns (§ "Boot sequence") — that single attachment covers both an immediate ready (the promise is already settled) and a delayed one, because `createRestateRegistrationGate`'s latch makes calling `attempt()` from that continuation idempotent regardless of when it fires.
+
+`restart()` (`stop()` then `start()`, mirroring `KgSidecar.restart()` at `src/kg-sidecar.ts:179-182`) is the only re-spawn path. There is no automatic restart when the child exits unexpectedly, and no admin route calls `restart()` either — an unattended exit is reported through the status contract below and left there. `stop()` clears the background poll timer and resolves any pending `whenReady()` to `false` before tearing down the child, so a `stop()`/`restart()` during a degraded period cannot leave an orphaned timer polling a child that is no longer current.
+
+**Status contract.** Sidecar lifecycle is reported through `src/restate/status.ts` (`setRestateStatus` / `getRestateStatus`, AII-773), a module-level state machine independent of this class: `starting` → `ready` | `timeout` | `exited` | `missing-binary`, with `timeout` able to transition to `ready` or `exited` once the background poll settles. `RestateSidecar` writes the sidecar half; `createRestateRegistrationGate` writes the registration half after each `attempt()` (§ "Health surfaces" below covers both in full).
+
+#### Operator restart behavior
+
+There is no admin-triggered restart for just the Restate sidecar or its endpoint registration — recovering from a stuck sidecar (`exited`, `missing-binary`, or a registration stuck at `unreachable`/`declined-conflict`) means restarting or redeploying the whole orchestrator process (the backend-outage playbook in `CLAUDE.md`, or a plain process restart on Fly). A fresh process re-runs the entire boot sequence above from scratch: a new `RestateSidecar` instance, a new `createRestateRegistrationGate` with its latch unset, and `status.ts` back at its honest `starting`/`not-attempted` default — so a previous process's stuck state never carries forward, and there is nothing to reset by hand before restarting. Legacy review-fix work remains independent of the sidecar. For a project with Restate review-fix active, new automatic admissions pause while the sidecar is unavailable, and existing attempts recover from the retained journal after it returns; their reservations remain held until terminal confirmation.
+
+### Health surfaces (AII-807)
+
+`GET /` (`src/index.ts`) and `get_tenant_health` (`src/restate/tools.ts`, over `/mcp`) both add a `restate` field, `getRestateStatus()` read verbatim — one source of truth (`src/restate/status.ts`), so the two surfaces cannot drift under a flapping sidecar the way two independently-tracked copies could. The shape:
+
+```json
+{ "sidecar": { "state": "..." }, "registration": { "state": "..." } }
+```
+
+`sidecar.state` — written by `RestateSidecar` (`src/restate/server.ts`):
+
+| Value | Meaning |
+|---|---|
+| `starting` | `start()` has been called; no readiness answer yet (also the value before `start()` is ever called) |
+| `ready` | The admin API answered healthy — immediately, or later via the background poll after a timeout |
+| `timeout` | The initial `pollTimeoutMs` deadline passed with no healthy answer; background polling continues (may still transition to `ready` or `exited`) |
+| `exited` (`code`, `signal`) | The child process exited or errored, at any point — during startup, after becoming ready, or during the post-timeout background poll |
+| `missing-binary` | No `@restatedev/restate-server-<platform>` optional dependency is installed for this OS/arch; `start()` never spawned a child |
+
+`registration.state` — written by `createRestateRegistrationGate` (`src/index.ts`) after each `attempt()`, mapping the finer-grained `register()` outcome (`src/restate/endpoint.ts`) onto this coarser contract:
+
+| Value | Meaning | `register()` outcome(s) it covers |
+|---|---|---|
+| `not-attempted` | The gate has not run yet — the sidecar has never reported ready, or shutdown began first | *(none — pre-attempt default)* |
+| `registered` | The SDK endpoint is registered with the admin API | `registered-no-force` (no conflict), `registered-drained-force` (conflicted, but zero non-completed invocations on the old deployment let a forced re-registration through) |
+| `declined-conflict` | A `META0004` conflict was found and the old deployment still has non-completed invocations (or that count could not be determined), so the gate declined to force the registration; a retry is armed and keeps checking back every 60s (§ "Boot sequence" above) | `declined-conflict` |
+| `unreachable` | The admin API could not be reached, answered an unexpected error, or `startRestateEndpoint()`/`registerRestateEndpoint()` threw | `unreachable`, plus any thrown error from either call |
+
+Both `sidecar` and `registration` are independent — a `registration.state` other than `not-attempted` implies `sidecar.state` was `ready` at some point, but the reverse is not guaranteed (the gate could still be mid-`attempt()`, or shutdown could have won the race first).
 
 ### Ports and paths — all loopback, all constants
 
@@ -63,6 +120,15 @@ None of the four is an admin-UI setting — every consumer is a same-machine pee
 - `RESTATE_ADMIN__BIND_ADDRESS` → the `admin.bind-address` config key
 - `RESTATE_BASE_DIR` → the top-level `base-dir` config key, set to `restateDataDir()`
 - `RESTATE_BIND_ADDRESS` → the top-level `bind-address` config key (the fabric port, above)
+
+### Sidecar environment is an explicit allowlist, never `...process.env` (AII-728)
+
+`RestateSidecar.start()` builds the spawned child's environment (`childEnv`, `src/restate/server.ts`) from an explicit allowlist rather than spreading the orchestrator's full `process.env`: the sidecar is a separate binary with no business seeing the GitHub App key, ticketing credentials, or anything else the orchestrator process holds. The allowlist is:
+
+- `PATH`, `HOME`, `TMPDIR`, `TZ` — the process-hygiene basics a spawned binary needs, forwarded verbatim from `process.env` when set.
+- Every `RESTATE_*` key, in two layers: any `RESTATE_*` key already present in `process.env` is forwarded by prefix match first (an operator-set override), then the six fixed constants above (`RESTATE_INGRESS__BIND_ADDRESS`, `RESTATE_ADMIN__BIND_ADDRESS`, `RESTATE_BASE_DIR`, `RESTATE_BIND_ADDRESS`, `RESTATE_DEFAULT_NUM_PARTITIONS`, `RESTATE_ROCKSDB_TOTAL_MEMORY_SIZE`) are applied on top, so a same-named operator override can never shadow one of them.
+
+Nothing else crosses. A decoy credential set anywhere else in `process.env` (an AWS key, the GitHub App private key, an npm token) never reaches the child.
 
 ### Memory
 
@@ -183,7 +249,15 @@ Restate scopes an idempotency key by (service, handler, key) and keeps the keyed
 
 ### Register the SDK endpoint without `force`, and force only after draining
 
-`register()` (`src/restate/endpoint.ts`) posts the deployment without `force` at boot: an unchanged endpoint answers 200/201, and a changed service set at the same URI answers a `META0004` conflict. `force: true` overrides the deployment but "can lead inflight invocations to an unrecoverable error state" (Restate's own guidance), so it is used only after `getInFlightJobs()` confirms zero in-flight work — the self-deploy interlock drains runs before the replacement process registers. Never force a registration to get past a conflict.
+`register()` (`src/restate/endpoint.ts`) posts the deployment without `force` at boot: an unchanged endpoint answers 200/201, and a changed service set at the same URI answers a `META0004` conflict. `force: true` overrides the deployment but "can lead inflight invocations to an unrecoverable error state" (Restate's own guidance), so it is used only after confirming zero non-completed invocations on the deployment it would replace. Never force a registration to get past a conflict.
+
+That confirmation (AII-721/AII-841) is `queryNonCompletedInvocations()` (same file): `POST {adminBaseUrl}/query` with an `Accept: application/json` header — omitting that header answers Arrow IPC instead, which would need an undeclared production dependency — runs a DataFusion SQL count over non-completed `sys_invocation` rows scoped to deployments registered at the endpoint URI. The scope checks `pinned_deployment_id`, `last_attempt_deployment_id`, and unassigned invocations whose `target_service_name` currently maps to the old deployment in `sys_service`. The pinned 1.7.10 runtime test found a suspended running invocation with only `last_attempt_deployment_id`, and an exclusive invocation queued behind it with neither deployment ID; checking `pinned_deployment_id` alone incorrectly reported zero for both. `status != 'completed'` covers non-terminal states without an enumerated allowlist. Persistent Virtual Object state lives in a separate `state` table that never appears in `sys_invocation`, so durable state alone never counts as invocation activity — this is what replaced the old `getInFlightJobs()` (SQLite `dispatch_log`) guard, which only ever saw GitHub Actions/local-Docker job rows, not Restate's own invocations.
+
+A query error, a non-2xx response, or a response shape this function doesn't recognize all resolve to `null` ("unknown"), which `register()` treats the same as a nonzero count: fail closed, decline the force. No deployment registered yet at the endpoint's URI resolves to `0` — nothing to drain. `getInFlightJobs()` stays exactly as used elsewhere (`src/dispatch-gate.ts`, `src/admin.ts`, `src/restate/tools.ts`) for legacy GitHub Actions/local-Docker job tracking; this drain check is unrelated to it.
+
+A `declined-conflict` outcome is not treated as final: `createRestateRegistrationGate` (`src/index.ts`) retries on a timer rather than requiring an operator restart — see § "Boot sequence" above.
+
+Both `postDeployment()` calls inside `register()` — the initial no-force attempt and the forced retry after a `META0004` conflict — carry `signal: AbortSignal.timeout(10_000)` (AII-728). A hung admin API answers the same `{ outcome: "unreachable" }` a connection failure already produces; `main()`'s unconditional `await registerRestateEndpoint()` therefore cannot block boot indefinitely on a sidecar that accepted the TCP connection but never answered.
 
 ### All Restate ports bind loopback — check the fabric port too
 
@@ -204,6 +278,17 @@ The ingress runs `input` before the handler ever sees the call. When a tool that
 ### A dependency on Restate is a new failure mode — degrade, don't hang
 
 Anything that reaches the ingress or the admin API gains a dependency on the sidecar being up. Decide the degraded answer before you migrate: a discovered tool drops out of `tools/list` while the admin API is unreachable (the same silent-omission the `kg_*` tools already use), a `tools/call` or a refresh answers `503 restate-unavailable`, and `get_session_identity` still answers because it is not a Restate handler. The rule from ADR 025: Restate down narrows to "this one surface is unavailable," never "nobody can use MCP," and never a 401 — a 503 says retry, a 401 says re-authenticate.
+
+**"Down" includes "hangs," not only "refuses" (AII-728).** A connection failure resolves instantly; a sidecar that accepts a connection and never answers does not, and an unbounded `fetch` would hold the caller (and, for registration, boot itself) open indefinitely. Every fetch that crosses into the sidecar carries `signal: AbortSignal.timeout(ms)`, and a timeout is wired through the exact same fallback branch as a thrown connection error — no new status value anywhere:
+
+| Call | Bound | Degrades to |
+|---|---|---|
+| `discoverTools()` (`src/restate/tools-client.ts`) — admin discovery | 5s | `[]` (drops out of `tools/list`, same as an unreachable admin API) |
+| `callTool()` (`src/restate/tools-client.ts`) — tool ingress | 60s | `{ status: "unavailable" }` |
+| `RestateRefreshAuthority.invoke()` (`src/restate/operator-object.ts`) — backs `issue`/`refresh`/`revoke`/`describe`/`identity` | 10s | `"unavailable"` (`rotate()` reports `{ status: "unavailable", cause: "restate" }`) |
+| `postDeployment()` inside `register()` (`src/restate/endpoint.ts`) — both the no-force call and the forced retry | 10s | `{ outcome: "unreachable" }` |
+
+The `RestateSidecar`'s own readiness poll (`_pollReadiness`, `RESTATE_HEALTH_URL`) already bounds each attempt at 2s via `http.get(url, { timeout: 2_000 })` and is unaffected by this table — it was bounded before AII-728 and named here only so the four bounds above are not mistaken for a fifth.
 
 ### Every side effect in a handler goes inside `ctx.run`, and a tool handler never retries
 

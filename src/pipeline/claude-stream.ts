@@ -87,6 +87,81 @@ export function sawUnsafeToolUse(events: StreamEvent[]): boolean {
   return false;
 }
 
+export interface DerivedToolStart {
+  readonly id?: string;
+  readonly action: string;
+  readonly detail?: unknown;
+}
+
+export interface DerivedToolResult {
+  readonly toolUseId?: string;
+  readonly action: string;
+  readonly output: string;
+  readonly isError: boolean;
+}
+
+/**
+ * Observable `tool_use` blocks in one `assistant` event, for runner-activity reporting
+ * (AII-798). An event with no `tool_use` block yields an empty array — never derived
+ * from a `text` block, which is what keeps absent tool activity absent rather than
+ * synthesized from the model's response text.
+ */
+export function extractToolStarts(event: StreamEvent): DerivedToolStart[] {
+  if (event.type !== "assistant") return [];
+  const msg = event.message as { content?: Array<Record<string, unknown>> } | undefined;
+  const out: DerivedToolStart[] = [];
+  for (const block of msg?.content ?? []) {
+    if (block.type !== "tool_use") continue;
+    out.push({
+      id: typeof block.id === "string" ? block.id : undefined,
+      action: typeof block.name === "string" ? block.name : "tool",
+      detail: block.input,
+    });
+  }
+  return out;
+}
+
+function toolResultText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((block) =>
+        block && typeof block === "object" && typeof (block as { text?: unknown }).text === "string"
+          ? (block as { text: string }).text
+          : "",
+      )
+      .filter(Boolean)
+      .join("\n");
+  }
+  if (content == null) return "";
+  try {
+    return JSON.stringify(content);
+  } catch {
+    return "[unserializable tool_result]";
+  }
+}
+
+/**
+ * Observable `tool_result` blocks in one `user` event, for runner-activity reporting
+ * (AII-798). Mirrors `formatEvent`'s own `hasToolResult` check so the initial prompt
+ * turn (plain text, no `tool_use_id`) is never misread as a tool result.
+ */
+export function extractToolResults(event: StreamEvent): DerivedToolResult[] {
+  if (event.type !== "user") return [];
+  const msg = event.message as { content?: Array<Record<string, unknown>> } | undefined;
+  const out: DerivedToolResult[] = [];
+  for (const block of msg?.content ?? []) {
+    if (block.type !== "tool_result" && typeof block.tool_use_id !== "string") continue;
+    out.push({
+      toolUseId: typeof block.tool_use_id === "string" ? block.tool_use_id : undefined,
+      action: "tool_result",
+      output: toolResultText(block.content),
+      isError: block.is_error === true,
+    });
+  }
+  return out;
+}
+
 function num(v: unknown): number | null {
   return typeof v === "number" ? v : null;
 }
@@ -109,6 +184,7 @@ export function extractTerminalStatus(events: StreamEvent[]): LLMTerminalStatus 
 
 export function extractTelemetry(events: StreamEvent[]): RunTelemetry {
   const result = lastResult(events);
+  const executedCommands = extractExecutedCommands(events);
   if (!result) {
     return {
       outcome: "unknown",
@@ -120,6 +196,7 @@ export function extractTelemetry(events: StreamEvent[]): RunTelemetry {
       cacheReadTokens: null,
       cacheCreationTokens: null,
       toolTrace: extractToolTrace(events),
+      ...(executedCommands.length > 0 ? { executedCommands } : {}),
     };
   }
   const usage = (result.usage ?? {}) as {
@@ -144,7 +221,29 @@ export function extractTelemetry(events: StreamEvent[]): RunTelemetry {
     cacheReadTokens: cacheRead,
     cacheCreationTokens: cacheCreation,
     toolTrace: extractToolTrace(events),
+    ...(executedCommands.length > 0 ? { executedCommands } : {}),
   };
+}
+
+export function extractExecutedCommands(events: StreamEvent[]): Array<{ command: string; failed: boolean }> {
+  const pending = new Map<string, string>();
+  const observed: Array<{ command: string; failed: boolean }> = [];
+  for (const event of events) {
+    for (const start of extractToolStarts(event)) {
+      if (!start.id || start.action !== "Bash") continue;
+      const input = start.detail;
+      if (input && typeof input === "object" && typeof (input as { command?: unknown }).command === "string") {
+        pending.set(start.id, (input as { command: string }).command);
+      }
+    }
+    for (const result of extractToolResults(event)) {
+      const command = result.toolUseId ? pending.get(result.toolUseId) : undefined;
+      if (!command) continue;
+      observed.push({ command, failed: result.isError });
+      pending.delete(result.toolUseId!);
+    }
+  }
+  return observed;
 }
 
 const TOOL_INPUT_MAX = 160;

@@ -22,6 +22,7 @@ import { getInFlightJobs, getRunRecordMergeVerdict } from "../log.js";
 import { getDb } from "../dedup.js";
 import { isKgDegraded } from "../deploy-notify.js";
 import { sidecarHealthFields, getKgMemoryProvider, KG_TOOL_CAPABILITY } from "../kg-provider.js";
+import { getRestateStatus } from "./status.js";
 import { readKgSourceRepo } from "../deploy.js";
 import { runKgRefreshPreflight, getActiveKgRefresh } from "../kg-refresh.js";
 import { getOrchestratorSettings, getLinearPickupLabel } from "../orchestrator-settings.js";
@@ -185,6 +186,7 @@ export const getTenantHealth = tool(
       projectCount,
       kgDegraded: isKgDegraded(),
       ...sidecarHealthFields(),
+      restate: getRestateStatus(),
       kgRefreshPreflight,
     };
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };

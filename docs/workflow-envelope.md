@@ -56,6 +56,49 @@ The retry is **capped at exactly two requests, by construction, not just by the 
 
 ---
 
+## Dispatch outcomes and `returnRunDetails`
+
+`postDispatchOnce`, the function inside `postWorkflowDispatch`/`dispatchWorkflow` that actually posts one `workflow_dispatch` request, accepts an opt-in `returnRunDetails?: boolean` option (AII-778, default off). Every existing call site — `dispatchWorkflow`'s implementation, gap-analysis, and planning dispatches; the review-fix re-dispatch; the kg-refresh GHA dispatch — leaves it unset today, so nothing in this repo yet requests or reads the fields below. The option exists as wire-contract plumbing for a consumer (the Restate review-fix pilot) that has not landed.
+
+Setting `returnRunDetails: true`:
+
+- Adds `return_run_details: true` to the POST body sent to GitHub's `workflow_dispatch` endpoint.
+- Populates a new `outcome: DispatchOutcome` field on `DispatchResult`, and — only when the response is a repo-validated `200` — `runId`/`runUrl`.
+
+```typescript
+export type DispatchOutcome = "accepted" | "rejected" | "unknown";
+
+export interface DispatchResult {
+  success: boolean;
+  status: number;
+  error?: string;
+  outcome?: DispatchOutcome;   // only set when returnRunDetails: true
+  runId?: number;              // only set for a repo-validated 200
+  runUrl?: string;             // only set for a repo-validated 200
+}
+```
+
+`outcome` reflects an identity-trust judgment, not just the HTTP status:
+
+| Response | `outcome` | `runId`/`runUrl` | Why |
+|---|---|---|---|
+| `204` | `accepted` | absent | GitHub queued the dispatch. `workflow_dispatch` never returns a run id on a plain 204 — there is no exact identity to report, only "this plausibly started." |
+| `200`, body validates against the requested repo | `accepted` | present | `extractDispatchRunIdentity` requires `html_url` to match `https://github.com/{owner}/{repo}/actions/runs/{id}` and, if the body also carries a `repository` field (string or `{full_name}`), that it names the same `owner/repo`. Either signal disagreeing — or missing/malformed entirely — is treated as unresolved, not trusted; GitHub's `return_run_details` response shape isn't documented, so parsing stays tolerant of fields it doesn't recognise and strict only about the ones that prove repo ownership. |
+| `200`, unparseable or repo-mismatched body | `unknown` | absent | Same reasoning as above, on the failing side. |
+| `4xx` | `rejected` | absent | A definite application-level refusal — safe to treat as "did not happen." |
+| `5xx`, or any other unrecognised status | `unknown` | absent | GitHub may have started the run before failing to report it cleanly; not safe to assume either accepted or rejected. |
+| transport failure (`fetch` throws) | `unknown` (only if `returnRunDetails: true`) | absent | See legacy behavior below — the identical failure is a thrown error for a caller that did not opt in. |
+
+The three-way split matters to a caller trying to avoid a duplicate dispatch: `rejected` is safe to retry (GitHub is certain nothing started), `accepted` needs no retry, and `unknown` is neither — a transport failure or 5xx must not be blindly retried, because GitHub may have already started the run.
+
+**Legacy callers are unchanged, byte-for-byte.** A caller that does not pass `returnRunDetails` gets exactly the pre-AII-778 `DispatchResult` shape (`success`/`status`/`error`, no `outcome`/`runId`/`runUrl`) and the pre-AII-778 throw-on-transport-failure behavior: `postDispatchOnce` only catches and converts a `fetch` rejection into `{ outcome: "unknown", ... }` when `returnRunDetails` is set; otherwise the rejection propagates exactly as it always did. This is deliberate (AII-778's compatibility constraint) — opting in to run-detail reporting must never change behavior for a caller that didn't ask for it.
+
+**`findWorkflowRunId` stays, but only as legacy identity — the pilot must not treat it as exact.** The existing post-dispatch heuristic (`src/github.ts`) scans the workflow's recent-runs list for a run created at or after the dispatch time, on the expected branch, optionally disambiguated by `display_title` against `issueIdentifier` — because `workflow_dispatch` alone never returns a run id, this scan is how every legacy (non-pilot) caller resolves one today, and `returnRunDetails` changes nothing there: a legacy caller doesn't pass it and keeps using the heuristic exactly as before.
+
+The Restate review-fix pilot is held to a stricter rule: a title/time-window match is never exact execution identity, so the pilot must not fall back to `findWorkflowRunId` to manufacture one. A `200` with a validated body (`runId`/`runUrl`) *is* exact identity, and needs no heuristic. A `204` — the common case — is accepted but carries no identity at all; that is not a signal to guess via the heuristic, and it is not a signal to blindly repeat the POST (GitHub may have already started the run, and a second dispatch would duplicate it). Instead the pilot holds the attempt's occupancy and reconciles by exact attempt/execution identity — correlating the run that reports back against `run_config.reviewFix.attemptId` — until that resolves or the attempt's `deadlineAt` passes. This constraint is specific to the pilot; every other dispatch/monitor path (gap-analysis, planning, `src/monitor-gha.ts`, the GHA polling in `src/index.ts`) is unaffected and keeps resolving run identity via the heuristic as before.
+
+---
+
 ## `RunConfigV1` Schema
 
 The envelope is decoded by `src/run-config.ts` (`decodeRunConfig`). Unknown fields are stripped on decode. The `v: 1` discriminant is validated; any other value throws immediately.
@@ -90,6 +133,14 @@ interface RunConfigV1 {
     backoffJitter: number;
     reviewMaxTurns: number;
   };
+  reviewFix?: {
+    version: 1;
+    attemptId: string;
+    installationId: number;
+    repository: string;
+    prNumber: number;
+    deadlineAt: number;
+  };
 }
 ```
 
@@ -111,6 +162,7 @@ Field notes:
 | `referenceRepos` | Repositories to clone read-only into the workspace before the implement loop. Each entry carries `repo` (normalized `https://github.com/owner/repo`), `path` (workspace-relative directory), and an optional `ref` (branch, tag, or commit hash; absent means the default branch). **Absent on planning dispatches** — the planning runner reads no such field. **Absent on kg-refresh dispatches** — the kg-refresh pipeline clones a knowledge-graph source repository as its workspace and has no pipeline step that would consume reference repos. Envelope-only: no dispatch input and no environment variable carry this field, so a target repo on the legacy workflow contract does not receive it. |
 | `reviewers` | Project reviewer selection copied from the mapping when non-null. Each entry carries a reviewer `id` and whether that reviewer `gates` merge readiness. Absent means the runner uses `DEFAULT_REVIEWER_SELECTION` (`gap-analysis` and `code-review`, both gating), not an empty list; this keeps older orchestrators and already-dispatched runs from silently losing their review gate. Malformed values are dropped during decode with one warning and then resolve to the same default. The runner forwards the selection to the post-push review step, which runs selected internal reviewers, applies their gating policy, and fails closed for an empty selection. The external `claude-review-summary` id controls prose gating rather than resolving executable reviewer code. |
 | `retryPolicy` | Global retry/backoff policy and reviewer turn cap, edited on the admin Settings page and stored in the orchestrator's `settings` table (never an env var). Absent means the runner uses `DEFAULT_RETRY_POLICY` (`src/pipeline/retry-backoff.ts`). Populated by `getRetryPolicy()` on every implementation-phase and gap-analysis-phase dispatch across all three execution modes — the initial dispatch, the `/ai-implement` comment gap-fill drain, the PR-comment gap-fill trigger, and the review-fix re-dispatch — because `pushRetries` and `reviewMaxTurns` apply to those re-dispatches exactly as to initial runs. Never sent on planning or kg-refresh dispatches, which have no retry loop. On the GHA path, `buildEnvelopeDispatchInputs`'s `retryPolicy` option is required (nullable), not optional — a caller can no longer omit it silently, it must state intent: planning passes `null` explicitly, implementation/gap-analysis pass the real policy from `getRetryPolicy()`. The function itself only stamps the field into `run_config` when `runnerPhase` is neither `planning` nor `kg-refresh`, substituting `DEFAULT_RETRY_POLICY` only if the passed value is `null`, so all three backends agree that every implementation/gap-analysis dispatch carries this field. The runner runs the decoded value through `normalizeRetryPolicy` (an out-of-range or malformed field degrades to the default for that field alone; an unknown key is dropped). The `push` step consumes `pushRetries` and the backoff fields (see [pipeline-architecture.md](pipeline-architecture.md), "Push retry and remote reconciliation"); the remaining fields are stored and transported so the retry rails built on top of them read one source of truth. |
+| `reviewFix` | The Restate review-fix pilot's explicit attempt-identity marker (AII-776), shaped by the canonical AII-770 contract (`src/review-fix-contract.ts`'s `ReviewFixMetadataV1`): `attemptId` identifies one Restate attempt, `installationId`/`repository`/`prNumber` scope it to one PR under one GitHub App installation, and `deadlineAt` is an epoch-ms timestamp (not ISO) so it compares with plain `<`/`>`. Absent means Legacy (non-pilot) dispatch, the only path the legacy flat-env contract can produce — there is no environment-variable equivalent. Unlike every other optional field on this envelope, a **present but malformed or unsupported** `reviewFix` fails closed: `decodeRunConfig` throws rather than dropping the field and falling back to Legacy, because a bad pilot marker must never be silently treated as a non-pilot dispatch. Carries no credential or token — repository/PR/execution authority is verified downstream against stored state, never trusted from this field alone. This slice only carries the field through `RunConfigV1` and `ResolvedRunnerInputs`; no pipeline step reads it yet. |
 
 Below the TS runner layer, `session/entrypoint.sh` picks the phase (and, for kg-refresh, the callback URL it re-exports) via `resolve_envelope_field` in `session/lib.sh`: when `RUNNER_PHASE` (or `RUNNER_CALLBACK_URL`) is already set in the container env, that value wins and the envelope is not consulted; only when the env var is empty does the shell decode `AI_IMPLEMENT_RUN_CONFIG` and fill it from `runnerPhase` / `runnerCallbackUrl`, falling back to the `implementation` default (no fallback for the callback URL) if the envelope is absent, malformed, or lacks the field. Env-wins matters because Fly Machines and local Docker set `RUNNER_PHASE`/`RUNNER_CALLBACK_URL` directly in the container env, and the local dev harness (`npm run dev:run`) sets `RUNNER_PHASE=full` or `local-planning` while its envelope still carries `runnerPhase: implementation` — if the envelope won, a local dev run would silently switch to the autonomous loop instead of the local full loop it asked for.
 
@@ -120,12 +172,24 @@ Below the TS runner layer, `session/entrypoint.sh` picks the phase (and, for kg-
 
 Before every dispatch the orchestrator calls `resolveWorkflowCapabilities` (`src/workflow-probe.ts`; `resolveWorkflowContract` remains the backward-compatible contract-only wrapper). The probe:
 
-1. Fetches `https://api.github.com/repos/{owner}/{repo}/contents/.github/workflows/{workflowFile}` from the **default branch**.
-2. Base64-decodes the YAML and detects the required `run_config` input plus optional capability inputs such as `run_publication_token`.
-3. Returns the envelope/legacy contract and optional capability bits. Publication credentials are minted and dispatched only when the target explicitly advertises support.
-4. On any fetch error (network failure, 404, non-200, malformed JSON) returns `"legacy"` and logs a warning — fail-safe.
+1. Fetches `https://api.github.com/repos/{owner}/{repo}/contents/.github/workflows/{workflowFile}` from `ref` — the branch the actual `workflow_dispatch` will target, so the contract check agrees with the dispatch it gates. Every current call site passes `mapping.defaultBranch` for both the probe's `ref` and the dispatch's own `ref` (`dispatchWorkflow` always dispatches against `mapping.defaultBranch`, even for a feature-branch child whose run then checks out a different branch via `run_config.baseBranch`), so in practice this reads as "the default branch" — but the parameter, not a hardcoded branch, is what the probe and the dispatch actually agree on.
+2. Base64-decodes the YAML and detects the required `run_config` input plus optional capability inputs: `run_publication_token` (`RUN_PUBLICATION_TOKEN_RE`) and, identically, `run_attempt_token` (`RUN_ATTEMPT_TOKEN_RE`) — see "Attempt correlation" below.
+3. Returns the envelope/legacy contract plus both capability bits, `supportsRunPublicationToken` and `supportsAttemptCorrelation`. Publication credentials are minted and dispatched only when the target explicitly advertises support; the same principle applies to attempt correlation once a consumer sends it.
+4. On any fetch error (network failure, 404, non-200, malformed JSON) returns `"legacy"` with both capability bits `false`, and logs a warning — fail-safe.
 
-Results are cached in-process per `owner/repo/workflowFile` key for **5 minutes** (`CACHE_TTL_MS = 300_000 ms`). A re-sync that merges the envelope template will be picked up at most one poll cycle (60 s) after the cache expires.
+Results are cached in-process per `owner/repo/workflowFile/ref` key for **5 minutes** (`CACHE_TTL_MS = 300_000 ms`) — `WorkflowCapabilities` as a whole is the cached value, so `supportsAttemptCorrelation` shares the same cache entry, key, and TTL as the contract and `supportsRunPublicationToken`; there is no separate probe or cache for it. A re-sync that merges the envelope template will be picked up at most one poll cycle (60 s) after the cache expires.
+
+---
+
+## Attempt correlation: `supportsAttemptCorrelation` and `run_attempt_token`
+
+`WorkflowCapabilities` carries a `supportsAttemptCorrelation` bit, detected the same way as `supportsRunPublicationToken`: the probe regex-matches a `run_attempt_token:` input declaration in the fetched YAML; it does not parse the YAML structure. The bit is `true` only when the contract itself resolved to `"envelope"` and the regex matched; a `"legacy"` result (or any probe failure) forces it `false` regardless of what the YAML contains.
+
+The implementation template now declares the optional, secret-free `run_attempt_token` input (AII-782), and its synced `.github/workflows/claude-implement.yml` copy is identical. A target repo must re-sync the template before its probe can advertise support; until then that target still reports `supportsAttemptCorrelation: false`. Re-sync is part of the later manual pilot, not this source change. The five-minute probe cache applies after re-sync.
+
+**The probe bit is a template capability marker, not an attempt identity.** It answers "does this target's declared workflow support attempt correlation." For an individual pilot run, the top-level `run_attempt_token` value is the exact `attemptId` shown in the GitHub run name; the authoritative scoped identity travels in `run_config.reviewFix` (`ReviewFixMetadataV1`, AII-776; shape in the `RunConfigV1` schema above: `attemptId`, `installationId`, `repository`, `prNumber`, `deadlineAt`). The workflow validates that both values match before printing the envelope or running the pipeline. An explicit pilot marker with a missing, malformed, or mismatched top-level input fails closed; a Legacy run omits `reviewFix` and leaves the optional input empty.
+
+The capability bit and a run's metadata remain separate: a repo may support the input while a Legacy dispatch uses neither field. AII-793 will use the capability probe when wiring pilot dispatch; `decodeRunConfig` still validates `reviewFix` on its own terms, while this workflow checks the display input against it.
 
 ---
 

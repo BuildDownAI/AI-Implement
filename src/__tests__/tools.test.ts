@@ -15,6 +15,7 @@ import {
   kgPath,
   kgHybridSearch,
   getKgStatusTool,
+  getTenantHealth,
   getIssueReportCardTool,
   getFleetReportTool,
   triggerKgRefreshTool,
@@ -34,6 +35,8 @@ import { setActiveKgRefresh, type KgRefreshHandle } from "../kg-refresh.js";
 import { getMappings } from "../config.js";
 import { setOrchestratorSetting } from "../orchestrator-settings.js";
 import { initSettingsTable } from "../runner-mode.js";
+import { initLogTable } from "../log.js";
+import { getRestateStatus, setRestateStatus, resetRestateStatus } from "../restate/status.js";
 import { getIssueReportCard, getFleetReport } from "../report-card.js";
 import {
   setRunnerModeAction,
@@ -87,6 +90,42 @@ function fakeContext(handlerName: string, runCalls: RunCall[] = []): restate.Con
       return result;
     },
   } as unknown as restate.Context;
+}
+
+/**
+ * A fetchImpl that never settles unless its request's AbortSignal fires — the only way a
+ * fixture can prove a fetch is actually bounded by `signal` rather than merely accepting an
+ * ignored option (AII-728). Rejects with the signal's abort reason once the signal fires.
+ */
+function hangingFetch(): typeof fetch {
+  return vi.fn((_url: unknown, init?: RequestInit) => {
+    return new Promise((_resolve, reject) => {
+      const signal = init?.signal;
+      if (!signal) return; // no signal given: hangs forever, same as before AII-728
+      if (signal.aborted) {
+        reject(signal.reason);
+        return;
+      }
+      signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+    });
+  }) as unknown as typeof fetch;
+}
+
+/**
+ * vitest's fake timers do not intercept Node's AbortSignal.timeout — verified empirically,
+ * it schedules through an internal timer rather than the patchable global setTimeout — so
+ * these tests bound the wait by stubbing AbortSignal.timeout's own implementation instead of
+ * the clock. Asserts the exact ms value production code passes (proving the configured bound,
+ * not just "some" bound), then fires the abort on the next microtask so the test does not
+ * block on real wall-clock time.
+ */
+function stubAbortTimeout(expectedMs: number): ReturnType<typeof vi.spyOn> {
+  return vi.spyOn(AbortSignal, "timeout").mockImplementation((ms: number) => {
+    expect(ms).toBe(expectedMs);
+    const controller = new AbortController();
+    queueMicrotask(() => controller.abort(new DOMException("The operation was aborted due to timeout", "TimeoutError")));
+    return controller.signal;
+  });
 }
 
 const SYSTEM_ADMIN: Caller = { kind: "system", email: null, role: "admin" };
@@ -297,9 +336,28 @@ describe("discoverTools", () => {
     })) as unknown as typeof fetch;
     expect(await discoverTools({ adminBaseUrl: "http://admin.example", fetchImpl })).toEqual([]);
   });
+
+  it("bounds admin discovery at 5s — a never-resolving fetch degrades to [] once the bound fires (AII-728)", async () => {
+    const timeoutSpy = stubAbortTimeout(5_000);
+    try {
+      const result = await discoverTools({ adminBaseUrl: "http://admin.example", fetchImpl: hangingFetch() });
+      expect(result).toEqual([]);
+    } finally {
+      timeoutSpy.mockRestore();
+    }
+  });
 });
 
 describe("callTool", () => {
+  it("returns unavailable without an ingress request when drain admission closes", async () => {
+    const fetchImpl = vi.fn() as unknown as typeof fetch;
+    const result = await callTool("get_widget", {}, HUMAN_USER, {
+      ingressBaseUrl: "http://ingress.example", fetchImpl,
+      permitsExternalCall: () => false,
+    });
+    expect(result).toEqual({ status: "unavailable" });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
   it("maps a 200 ToolResponse body to status: \"ok\"", async () => {
     const fetchImpl = vi.fn(async () => ({
       ok: true,
@@ -375,9 +433,30 @@ describe("callTool", () => {
 
     expect(capturedUrl).toBe("http://ingress.example/orchestratorTools/..%2FOperator%2Fx%2Frevoke");
   });
+
+  it("bounds tool ingress at 60s — a never-resolving fetch degrades to unavailable once the bound fires (AII-728)", async () => {
+    const timeoutSpy = stubAbortTimeout(60_000);
+    try {
+      const result = await callTool("get_widget", {}, HUMAN_USER, {
+        ingressBaseUrl: "http://ingress.example",
+        fetchImpl: hangingFetch(),
+      });
+      expect(result).toEqual({ status: "unavailable" });
+    } finally {
+      timeoutSpy.mockRestore();
+    }
+  });
 });
 
 describe("callToolAsSystem", () => {
+  it("uses the same drain admission barrier", async () => {
+    const fetchImpl = vi.fn() as unknown as typeof fetch;
+    expect(await callToolAsSystem("get_tenant_health", {}, {
+      ingressBaseUrl: "http://ingress.example", fetchImpl,
+      permitsExternalCall: () => false,
+    })).toEqual({ status: "unavailable" });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
   it("posts with a systemCaller() caller and returns the same result shape as callTool", async () => {
     let capturedBody: unknown;
     const fetchImpl = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
@@ -516,6 +595,50 @@ describe("migrated read handlers (AII-711)", () => {
     setActiveKgRefresh(null);
     const result = await getKgStatusTool(fakeContext("get_kg_status"), { caller: system, args: {} });
     expect(JSON.parse(result.content[0].text)).toEqual({ error: "KG refresh is not configured" });
+  });
+});
+
+// ---- get_tenant_health's restate field (AII-807): reports the shared status contract
+// (src/restate/status.ts, AII-773) the same way GET / does — same source of truth, no
+// second copy of sidecar/registration state.
+describe("get_tenant_health restate health field (AII-807)", () => {
+  const system: Caller = SYSTEM_ADMIN;
+
+  beforeAll(() => {
+    initSettingsTable();
+    initLogTable();
+  });
+
+  afterEach(() => {
+    resetRestateStatus();
+  });
+
+  it("reports the not-attempted/starting default before any sidecar write", async () => {
+    (getMappings as ReturnType<typeof vi.fn>).mockReturnValue({});
+    const result = await getTenantHealth(fakeContext("get_tenant_health"), { caller: system, args: {} });
+    const parsed = JSON.parse(result.content[0].text) as { restate: unknown };
+    expect(parsed.restate).toEqual({ sidecar: { state: "starting" }, registration: { state: "not-attempted" } });
+  });
+
+  it("reflects a ready sidecar with a declined-conflict registration", async () => {
+    (getMappings as ReturnType<typeof vi.fn>).mockReturnValue({});
+    setRestateStatus({ sidecar: { state: "ready" }, registration: { state: "declined-conflict" } });
+
+    const result = await getTenantHealth(fakeContext("get_tenant_health"), { caller: system, args: {} });
+    const parsed = JSON.parse(result.content[0].text) as { restate: unknown };
+
+    expect(parsed.restate).toEqual(getRestateStatus());
+    expect(parsed.restate).toEqual({ sidecar: { state: "ready" }, registration: { state: "declined-conflict" } });
+  });
+
+  it("reflects an exited sidecar with code/signal and an unreachable registration", async () => {
+    (getMappings as ReturnType<typeof vi.fn>).mockReturnValue({});
+    setRestateStatus({ sidecar: { state: "exited", code: 1, signal: null }, registration: { state: "unreachable" } });
+
+    const result = await getTenantHealth(fakeContext("get_tenant_health"), { caller: system, args: {} });
+    const parsed = JSON.parse(result.content[0].text) as { restate: unknown };
+
+    expect(parsed.restate).toEqual({ sidecar: { state: "exited", code: 1, signal: null }, registration: { state: "unreachable" } });
   });
 });
 

@@ -1,22 +1,35 @@
 import { readFileSync, existsSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
-import { ClaudeCliExecutor } from "./pipeline/executor.js";
+import { ClaudeCliExecutor, type ActivityReportingConfig } from "./pipeline/executor.js";
 import { getPublicationCredential } from "./publication-credential.js";
 import { DefaultPipelineContext } from "./pipeline/context.js";
 import { PipelineRunner } from "./pipeline/runner.js";
 import { DEFAULT_PIPELINE, createDefaultRunner } from "./pipeline/default-pipeline.js";
-import type { LLMExecutor, LogLevel, PipelineContext, PipelineDefinition, StepReporter } from "./pipeline/types.js";
+import type {
+  LLMExecutor,
+  LogLevel,
+  PipelineContext,
+  PipelineDefinition,
+  StepReporter,
+  ActivitySink,
+  ActivityIdentity,
+  ActivityToolStart,
+  ActivityToolResult,
+  CycleActivitySummary,
+} from "./pipeline/types.js";
 import { HttpStepReporter, NoopStepReporter, TokenStepReporter } from "./pipeline/reporter.js";
 import { TimingCollector, TimingStepReporter, runWithTiming, formatSummary } from "./pipeline/timing.js";
 import { runHookScript } from "./pipeline/steps/hooks.js";
 import { normalizeBranchPrefix } from "./pipeline/branch-name.js";
 import { parseWorkflowMd } from "./workflow-md.js";
-import { fetchPlanningContextFromOrchestrator, postRunnerResult } from "./runner-result.js";
+import { fetchPlanningContextFromOrchestrator, postRunnerCycleSummary, postRunnerResult } from "./runner-result.js";
 import { SensitiveFilesError } from "./pipeline/sensitive-files.js";
 import { OperatorCancelledError } from "./pipeline/operator-cancelled.js";
 import { classifyThrown, isFailureRecord } from "./pipeline/failure-classification.js";
 import { decodeRunConfig, type RunConfigV1 } from "./run-config.js";
+import type { ReviewFixMetadataV1, ReviewFixResultMetadataV1 } from "./review-fix-contract.js";
+import { ActivityReporter, type ActivityDetailValue } from "./pipeline/activity-reporter.js";
 import { DEFAULT_RETRY_POLICY, normalizeRetryPolicy, type RetryPolicy } from "./pipeline/retry-backoff.js";
 import { writeRunAutopsy, writeRunStats } from "./run-autopsy.js";
 import { parsePlanningBlock } from "./planning-block.js";
@@ -31,7 +44,114 @@ import {
   replyToDispositionThreads,
   type FindingDisposition,
 } from "./pipeline/finding-dispositions.js";
+import { readCycleSummaries } from "./pipeline/cycle-summary.js";
 import type { GhSpawn } from "./pipeline/review-ledger.js";
+
+/**
+ * Runner-activity wiring for one autonomous run (AII-798). `sink` is handed to the
+ * `ClaudeCliExecutor` so its stream parser can report observable tool start/result
+ * events; `shutdown()` is the bounded best-effort flush attempted in `runAutonomous`'s
+ * outer `finally` (mirroring the teardown-hook-always-runs pattern already there), so
+ * delivery is attempted on both the success and failure exit paths.
+ */
+export interface RunnerActivityReporting {
+  readonly attemptId: string;
+  readonly sink: ActivitySink;
+  shutdown(): Promise<void>;
+}
+
+/** JSON-safe copy of an observable tool detail/output value, for `ActivityReporter.record()`'s
+ *  `ActivityDetailValue` input. Falls back to a stringified value rather than throwing on a
+ *  non-serializable input (e.g. a circular structure) — reporting is always best-effort. */
+function toActivityDetail(value: unknown): ActivityDetailValue | undefined {
+  if (value === undefined) return undefined;
+  try {
+    return JSON.parse(JSON.stringify(value)) as ActivityDetailValue;
+  } catch {
+    return String(value);
+  }
+}
+
+/**
+ * Adapts one or more `ActivityReporter` instances (AII-784 — buffering, redaction,
+ * size caps, batching/retry over the `/runner/activity` callback) to the pipeline's
+ * `ActivitySink` contract (AII-788). One `ActivityReporter` per distinct producerId,
+ * created lazily on first use — a run that never dispatches a retried spawn attempt
+ * or more than one stage never creates more than it needs. `cycleSummary` is not
+ * wired yet: no pipeline step reports one through this sink, and delivering it is a
+ * separate concern (out of this issue's scope — see AII-790).
+ */
+export class RunnerActivitySink implements ActivitySink {
+  private readonly reporters = new Map<string, ActivityReporter>();
+
+  constructor(
+    private readonly callbackUrl: string,
+    private readonly progressToken: string,
+    private readonly attemptId: string,
+    private readonly fetchImpl?: typeof fetch,
+  ) {}
+
+  private reporterFor(producerId: string): ActivityReporter {
+    let reporter = this.reporters.get(producerId);
+    if (!reporter) {
+      reporter = new ActivityReporter(this.callbackUrl, this.progressToken, this.attemptId, producerId, {
+        ...(this.fetchImpl ? { fetchImpl: this.fetchImpl } : {}),
+      });
+      this.reporters.set(producerId, reporter);
+    }
+    return reporter;
+  }
+
+  toolStart(identity: ActivityIdentity, input: ActivityToolStart): void {
+    this.reporterFor(identity.producerId).record({
+      cycle: input.cycle,
+      kind: "tool_start",
+      action: input.action,
+      detail: toActivityDetail(input.detail),
+    });
+  }
+
+  toolResult(identity: ActivityIdentity, result: ActivityToolResult): void {
+    this.reporterFor(identity.producerId).record({
+      cycle: result.cycle,
+      kind: "tool_result",
+      action: result.action,
+      detail: { text: result.output.text, truncated: result.output.truncated },
+    });
+  }
+
+  cycleSummary(_identity: ActivityIdentity, _summary: CycleActivitySummary): void {
+    // Not wired yet — see class doc comment.
+  }
+
+  final(identity: ActivityIdentity, _lastSequence: number): void {
+    this.reporterFor(identity.producerId).finalize();
+  }
+
+  /** Bounded best-effort flush of every producer this run ever touched. Never throws. */
+  async shutdown(): Promise<void> {
+    await Promise.all([...this.reporters.values()].map((r) => r.shutdown()));
+  }
+}
+
+/**
+ * Resolves runner-activity reporting for this run: present only for a Restate
+ * review-fix pilot attempt (`reviewFix`, AII-776) with a callback URL and progress
+ * token to report through — the same gating `reportRunnerResult` already applies to
+ * result delivery. Absent for every Legacy (non-pilot) dispatch, which is what keeps
+ * `ClaudeCliExecutor`'s stream parsing and legacy telemetry byte-identical when no
+ * sink is supplied.
+ */
+export function resolveActivityReporting(
+  reviewFix: ReviewFixMetadataV1 | undefined,
+  callbackUrl: string | null,
+  progressToken: string | null,
+  fetchImpl?: typeof fetch,
+): RunnerActivityReporting | undefined {
+  if (!reviewFix || !callbackUrl || !progressToken) return undefined;
+  const sink = new RunnerActivitySink(callbackUrl, progressToken, reviewFix.attemptId, fetchImpl);
+  return { attemptId: reviewFix.attemptId, sink, shutdown: () => sink.shutdown() };
+}
 
 type RunAutopsyPasses = Array<{
   iteration: number;
@@ -53,6 +173,10 @@ export interface RunAutonomousOptions {
   /** Injectable `gh` CLI spawner for finding-disposition thread replies. Defaults to a
    *  real `gh` spawn scoped to `workspaceDir`, mirroring post-push-review.ts's own default. */
   ghSpawn?: GhSpawn;
+  /** Injectable runner-activity reporting (AII-798). Defaults to `resolveActivityReporting`'s
+   *  decision from the resolved reviewFix identity/callback/progress token; tests can supply a
+   *  fake here instead of exercising the real `ActivityReporter` transport. */
+  activityReporting?: RunnerActivityReporting;
 }
 
 export interface RunAutonomousResult {
@@ -270,6 +394,10 @@ export interface ResolvedRunnerInputs {
    *  not validate it, so this is the runner-side guard. Defaults to DEFAULT_RETRY_POLICY
    *  when absent or invalid — there is no legacy-env equivalent. */
   retryPolicy: RetryPolicy;
+  /** Restate review-fix pilot attempt identity (from run_config.reviewFix, AII-776). Undefined
+   *  on Legacy (non-pilot) dispatches and always undefined on the legacy flat-env path — there
+   *  is no env-var equivalent. Carriage only: no downstream pipeline seam reads this yet. */
+  reviewFix: ReviewFixMetadataV1 | undefined;
 }
 
 function parseEnvInt(raw: string | undefined, name: string): number | undefined {
@@ -297,6 +425,107 @@ function safeBranchPrefix(raw: string | undefined): string | undefined {
     console.warn(`[runner] Ignoring invalid branch prefix: ${err instanceof Error ? err.message : String(err)}`);
     return undefined;
   }
+}
+
+/** Mirrors pipeline/reporter.ts's parseGithubRunId (not exported there): a bounded positive-integer
+ *  parse used for both GITHUB_RUN_ID and GITHUB_RUN_ATTEMPT, which share the same shape. */
+function parsePositiveIntEnv(value: string | undefined): number | null {
+  if (value === undefined) return null;
+  if (!/^[1-9]\d*$/.test(value)) return null;
+  const n = Number(value);
+  return Number.isSafeInteger(n) ? n : null;
+}
+
+/**
+ * What `resolveReviewFixResult` could establish for a terminal call site: `legacy` for a
+ * non-pilot dispatch (no marker was ever in play), `attached` when the full wire marker was
+ * assembled, and `no-result` when a pilot attempt's identity is present but the evidence needed
+ * to complete it isn't — the caller must never treat `no-result` as `legacy`.
+ */
+type ReviewFixResultResolution =
+  | { readonly kind: "legacy" }
+  | { readonly kind: "attached"; readonly reviewFix: ReviewFixResultMetadataV1 }
+  | { readonly kind: "no-result"; readonly reason: string };
+
+/**
+ * Folds the actual GitHub Actions execution identity and the real published output commit onto
+ * a pilot attempt's resolved identity (run_config.reviewFix, AII-776) into the full result
+ * marker the callback validates (ReviewFixResultMetadataV1, AII-794). Undefined `identity` means
+ * a Legacy (non-pilot) dispatch — no marker is ever in play. `outputCommit` and
+ * githubRunId/githubRunAttempt are all required by the wire contract (ReviewFixResultMetadataV1
+ * has no optional-evidence variant), so when any of them can't be resolved (no push happened on
+ * this path, or the process isn't actually running under GHA) this reports `no-result` rather
+ * than a fabricated or partial marker. The caller must not then send an unmarked Legacy POST for
+ * this attempt: the server's `classifyLifecycleOwner` (review-fix-contract.ts) would read a
+ * missing `reviewFix` field as "this was never a pilot attempt" and process it on the Legacy
+ * path, which is exactly the silent downgrade the contract is designed to forbid on malformed
+ * input — omitting the field entirely has the same effect as sending a malformed one.
+ */
+function resolveReviewFixResult(
+  identity: ReviewFixMetadataV1 | undefined,
+  outputCommit: string | null,
+  env: NodeJS.ProcessEnv,
+): ReviewFixResultResolution {
+  if (!identity) return { kind: "legacy" };
+  const githubRunId = parsePositiveIntEnv(env.GITHUB_RUN_ID);
+  const githubRunAttempt = parsePositiveIntEnv(env.GITHUB_RUN_ATTEMPT);
+  if (githubRunId === null || githubRunAttempt === null) {
+    return {
+      kind: "no-result",
+      reason: `missing/invalid GITHUB_RUN_ID or GITHUB_RUN_ATTEMPT for attempt ${identity.attemptId}`,
+    };
+  }
+  if (!outputCommit) {
+    return { kind: "no-result", reason: `no published output commit for attempt ${identity.attemptId}` };
+  }
+  return { kind: "attached", reviewFix: { ...identity, githubRunId, githubRunAttempt, outputCommit } };
+}
+
+/**
+ * Delivers a run's terminal result, attaching the pilot marker (AII-794) when `identity`
+ * resolves cleanly. A pilot dispatch whose evidence can't be completed skips the network call
+ * entirely and logs an explicit no-result outcome — see resolveReviewFixResult's doc comment for
+ * why a partial or unmarked delivery is never sent instead.
+ *
+ * When a `reviewFix` marker attaches, this also reads back this run's declared cycle-summary
+ * file (AII-801, ./pipeline/cycle-summary.js) and forwards its records on the same call —
+ * mirroring how `findingDispositions` is already read from the workspace and forwarded here.
+ * The orchestrator's `handleRunnerResult` records each one into the durable `review_fix_cycles`
+ * store keyed by this attempt's id, which is the only identity a Legacy (non-pilot) run lacks —
+ * so a Legacy result never attaches cycle summaries, matching `writeCycleSummary`'s own
+ * "no attemptId to record against" limitation (docs/cycle-summary-evidence.md).
+ */
+async function reportRunnerResult(
+  identity: ReviewFixMetadataV1 | undefined,
+  outputCommit: string | null,
+  env: NodeJS.ProcessEnv,
+  params: Omit<Parameters<typeof postRunnerResult>[0], "reviewFix" | "cycleSummaries">,
+): Promise<void> {
+  const cycleSummaries = identity ? readCycleSummaries(params.workspaceDir) : [];
+  const progressToken = env.RUN_PROGRESS_TOKEN?.trim();
+  const callbackUrl = params.callbackUrl ?? env.RUNNER_CALLBACK_URL;
+  if (identity && cycleSummaries.length > 0) {
+    if (!progressToken || !callbackUrl) {
+      console.error(`[cycle-summary] no progress credential for pilot attempt ${identity.attemptId}`);
+    } else {
+      for (const summary of cycleSummaries) {
+        await postRunnerCycleSummary({ callbackUrl, progressToken, summary, fetchImpl: params.fetchImpl });
+      }
+    }
+  }
+  const resolution = resolveReviewFixResult(identity, outputCommit, env);
+  if (resolution.kind === "no-result") {
+    console.error(
+      `[runner] pilot result delivery skipped for attempt ${identity?.attemptId}: ${resolution.reason} — ` +
+        "refusing to send an unmarked Legacy result for a pilot-owned attempt",
+    );
+    return;
+  }
+  await postRunnerResult({
+    ...params,
+    ...(resolution.kind === "attached" && cycleSummaries.length > 0 ? { cycleSummaries } : {}),
+    reviewFix: resolution.kind === "attached" ? resolution.reviewFix : undefined,
+  });
 }
 
 
@@ -372,6 +601,7 @@ function inputsFromConfig(cfg: RunConfigV1, env: NodeJS.ProcessEnv): ResolvedRun
     logLevel: resolveLogLevel(env.AI_IMPLEMENT_LOG_LEVEL),
     groupingParent: cfg.groupingParent === true,
     retryPolicy: normalizeRetryPolicy(cfg.retryPolicy),
+    reviewFix: cfg.reviewFix,
   };
 }
 
@@ -453,6 +683,7 @@ export function resolveRunnerInputs(env: NodeJS.ProcessEnv): ResolvedRunnerInput
     logLevel: resolveLogLevel(env.AI_IMPLEMENT_LOG_LEVEL),
     groupingParent: env.AI_IMPLEMENT_GROUPING_PARENT === "true",
     retryPolicy: { ...DEFAULT_RETRY_POLICY },
+    reviewFix: undefined,
   };
 }
 
@@ -492,6 +723,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     claudeModel,
     groupingParent,
     retryPolicy,
+    reviewFix,
   } = resolveRunnerInputs(process.env);
   const branch = resolveBranch(workspaceDir, baseBranch, prNumber);
   const trustedReviewerDefinitions = await resolveTrustedReviewerDefinitions(reviewers);
@@ -544,7 +776,12 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
   );
   implementationPrompt = appendOperatorInstruction(implementationPrompt, commentInstruction);
   const model = claudeModel || workflowModel || "claude-sonnet-5";
-  const llmExecutor = opts.llmExecutor ?? new ClaudeCliExecutor(workspaceDir, logLevel);
+  const activityReporting = opts.activityReporting ?? resolveActivityReporting(reviewFix, callbackUrl, progressToken, opts.fetchImpl);
+  const activityReportingConfig: ActivityReportingConfig | undefined = activityReporting
+    ? { attemptId: activityReporting.attemptId, sink: activityReporting.sink }
+    : undefined;
+  const llmExecutor =
+    opts.llmExecutor ?? new ClaudeCliExecutor(workspaceDir, logLevel, false, undefined, undefined, activityReportingConfig);
   const orchestratorUrl = process.env.ORCHESTRATOR_URL;
   const nonce = process.env.MACHINE_NONCE ?? "";
   if (orchestratorUrl && !nonce) {
@@ -632,6 +869,9 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     const pushOutputs = context.getOutputs("push");
     const postPushReviewOutputs = context.getOutputs("post-push-review");
     const prUrl = typeof pushOutputs.prUrl === "string" ? pushOutputs.prUrl : undefined;
+    // The actual published output commit, not GITHUB_SHA/the initial checkout — null on a
+    // no-op/no-push path (grouping parent with no own work, mounted dev-harness runs).
+    const outputCommit = typeof pushOutputs.commitSha === "string" ? pushOutputs.commitSha : null;
     // Mirror the post-push-review skip contract: a statically registered step is
     // authoritative only when the internal review approved and push produced the
     // branch/PR inputs that cause the step to run. Otherwise its outputs are empty.
@@ -667,7 +907,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     // existing-PR update path below.)
     if (context.data.groupingParent && pushOutputs.branchPushed === false && !prUrl) {
       disposition = "no-op (grouping parent: no own work; finalized for roll-up)";
-      await postRunnerResult({
+      await reportRunnerResult(reviewFix, outputCommit, process.env, {
         workspaceDir,
         phase: runnerPhase,
         outcome: "success",
@@ -675,6 +915,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
         referenceRepoResults,
         findingDispositions,
         callbackUrl,
+        retryPolicy,
         fetchImpl: opts.fetchImpl,
       });
       return { exitCode: 0 };
@@ -715,7 +956,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
         : prNumber
         ? `gap-fill on PR #${prNumber} (approved after ${iterations} iteration(s))`
         : `local: approved after ${iterations} iteration(s) (mounted mode)`;
-      await postRunnerResult({
+      await reportRunnerResult(reviewFix, outputCommit, process.env, {
         workspaceDir,
         phase: runnerPhase,
         outcome: "success",
@@ -723,6 +964,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
         referenceRepoResults,
         findingDispositions,
         callbackUrl,
+        retryPolicy,
         fetchImpl: opts.fetchImpl,
       });
       return { exitCode: 0 };
@@ -822,7 +1064,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
             : `::warning::AI-Implement: review did not approve after ${iterations} iteration(s) (${terminationReason}) — ` +
               (prUrl ? `${prKind} opened: ${prUrl}` : "no PR opened"),
     );
-    await postRunnerResult({
+    await reportRunnerResult(reviewFix, outputCommit, process.env, {
       workspaceDir,
       phase: runnerPhase,
       outcome: "failure",
@@ -833,6 +1075,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       referenceRepoResults,
       findingDispositions,
       callbackUrl,
+      retryPolicy,
       fetchImpl: opts.fetchImpl,
     });
     return { exitCode: 0 };
@@ -846,11 +1089,16 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     // the push step itself threw: a `fixed`/`follow-up` reply would assert a code change that
     // did not land. Any other step failing (push never having run) does not suppress replies.
     const { valid: findingDispositions } = readFindingDispositions(workspaceDir);
-    const pushFailed = Boolean(context.getOutputs("push").error);
+    const pushOutputsOnError = context.getOutputs("push");
+    const pushFailed = Boolean(pushOutputsOnError.error);
     if (prNumber && !pushFailed) {
       replyToDispositionThreads(ghSpawn, prNumber, findingDispositions);
     }
-    await postRunnerResult({
+    // A step can throw after push already ran and published a commit (e.g. post-push-review
+    // erroring out) — read the real commit here too rather than assume no-op, same as the
+    // success/rejected paths above.
+    const outputCommitOnError = typeof pushOutputsOnError.commitSha === "string" ? pushOutputsOnError.commitSha : null;
+    await reportRunnerResult(reviewFix, outputCommitOnError, process.env, {
       workspaceDir,
       phase: runnerPhase,
       outcome: "failure",
@@ -862,6 +1110,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       referenceRepoResults,
       findingDispositions,
       callbackUrl,
+      retryPolicy,
       fetchImpl: opts.fetchImpl,
     });
     return { exitCode: 1 };
@@ -881,6 +1130,16 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
         }
       } catch (teardownErr) {
         console.error(`teardown hook error: ${teardownErr}`);
+      }
+    }
+    if (activityReporting) {
+      // Bounded best-effort, attempted on every exit path (success, coded failure,
+      // and a caught pipeline exception) — mirrors the teardown hook immediately
+      // above, which runs unconditionally for the same reason.
+      try {
+        await activityReporting.shutdown();
+      } catch (activityErr) {
+        console.error(`[activity] shutdown failed: ${activityErr instanceof Error ? activityErr.message : String(activityErr)}`);
       }
     }
     if (shellMode) {

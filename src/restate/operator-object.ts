@@ -27,9 +27,13 @@ import { getEffectiveAllowlist, matchAccessEntry } from "../access-entries.js";
 import { recordAuthEvent, resolveClientPath, type AuthEventCause } from "../mcp-auth-events.js";
 import type { DescribeOutcome, IssueInput, IssueOutcome, RefreshAuthority, RefreshInput, RefreshOutcome } from "../mcp-identity.js";
 import { RESTATE_INGRESS_BIND_ADDRESS } from "./server.js";
+import { isDeployHeld } from "../deploy-hold.js";
 
 /** One tick past this and a presentation of the previous (just-rotated-away) hash is treated as replay. */
 export const GRACE_MS = 30_000;
+
+/** Refresh invocation bound (AII-728): a hung ingress call must not hang a token refresh forever. */
+const INVOKE_TIMEOUT_MS = 10_000;
 
 // Mirrors mcp-oauth.ts's own MCP_REFRESH_TOKEN_TTL_MS (30 days). Duplicated rather than
 // imported to keep the dependency direction one-way: mcp-oauth.ts imports
@@ -60,6 +64,15 @@ interface IssueRequest {
 
 interface RefreshRequest {
   presentedHash: string;
+  /**
+   * Test-only seam (AII-727): when set, the handler durably sleeps this many ms — still
+   * holding the exclusive lock — before deciding. Proves a concurrent `describe` (shared)
+   * answers without waiting on it. Omitted on every production call path (issue/rotate never
+   * set it), so it is inert there: it never changes decideRefresh's branch or the inputs to
+   * it, and the alwaysReplay-vs-disableRetries equivalence check in
+   * operator-object.restate.test.ts never exercises it.
+   */
+  sleepMs?: number;
 }
 
 type RefreshHandlerResult =
@@ -136,6 +149,9 @@ async function issue(ctx: ObjectContext, request: IssueRequest): Promise<void> {
 }
 
 async function refresh(ctx: ObjectContext, request: RefreshRequest): Promise<RefreshHandlerResult> {
+  if (request.sleepMs !== undefined) {
+    await ctx.sleep(request.sleepMs);
+  }
   const family = await ctx.get<FamilyState>("family");
   const now = await ctx.date.now();
   const decision = decideRefresh(family, request.presentedHash, now);
@@ -227,6 +243,8 @@ export interface RestateRefreshAuthorityOptions {
   /** Defaults to the real ingress (127.0.0.1:8081, AII-627). Overridable for tests. */
   ingressBaseUrl?: string;
   fetchImpl?: typeof fetch;
+  /** Shared deploy drain admission check; injectable for deterministic tests. */
+  permitsExternalCall?: () => boolean;
   /** The access token's TTL, minted here in SQLite alongside a successful rotation. */
   accessTokenTtlMs: number;
 }
@@ -240,20 +258,24 @@ export class RestateRefreshAuthority implements RefreshAuthority {
   private readonly baseUrl: string;
   private readonly fetchImpl: typeof fetch;
   private readonly accessTokenTtlMs: number;
+  private readonly permitsExternalCall: () => boolean;
 
   constructor(options: RestateRefreshAuthorityOptions) {
     this.baseUrl = options.ingressBaseUrl ?? `http://${RESTATE_INGRESS_BIND_ADDRESS}`;
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.accessTokenTtlMs = options.accessTokenTtlMs;
+    this.permitsExternalCall = options.permitsExternalCall ?? (() => !isDeployHeld());
   }
 
   private async invoke<T>(clientId: string, handler: string, body: unknown): Promise<T | "unavailable"> {
+    if (!this.permitsExternalCall()) return "unavailable";
     let response: Response;
     try {
       response = await this.fetchImpl(`${this.baseUrl}/Operator/${encodeURIComponent(clientId)}/${handler}`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(body),
+        signal: AbortSignal.timeout(INVOKE_TIMEOUT_MS),
       });
     } catch {
       return "unavailable";

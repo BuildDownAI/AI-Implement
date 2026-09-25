@@ -5,11 +5,25 @@ import type { ProviderRegistry } from "./providers/registry.js";
 import type { RepoMapping } from "./config.js";
 import { recordReaperAction } from "./dedup.js";
 import { notifyReaperBurst } from "./notify.js";
+import { read as readAdmission } from "./dispatch-admission.js";
 import type { Job } from "./log.js";
 
 export const SWEEP_MACHINE_MAX_AGE_MS = 4 * 60 * 60 * 1000; // 4 hours
 const KG_REFRESH_BOOTSTRAP_DEADLINE_MS = 5 * 60 * 1000; // 5 minutes
 const TERMINAL_LIFECYCLE_STATES = new Set<IssueLifecycleState>(["completed", "cancelled"]);
+
+/**
+ * AII-791: before any reaper outcome action (a destroy, a status write, a ticket reset),
+ * read the row's immutable admission owner and skip entirely when it names a Restate
+ * attempt — Restate's own workflow owns confirming that attempt's termination and
+ * releasing its reservation, not the reaper. A job with no `dispatchId`, or no matching
+ * admission row (historical/unreserved dispatch), is unaffected — it keeps the existing
+ * Legacy handling this function guards.
+ */
+function isRestateOwnedJob(job: Job): boolean {
+  if (!job.dispatchId) return false;
+  return readAdmission(job.dispatchId)?.lifecycleOwner.kind === "restate";
+}
 
 export interface ReaperConfig {
   flySessionsToken: string | null;
@@ -46,14 +60,20 @@ export function getLastSweepAt(): number | null {
 /**
  * Destroys a single Fly machine. In dry-run mode logs `would destroy` instead
  * of calling the API, so no machines are actually affected.
+ *
+ * Returns whether the machine's death is confirmed — the API call succeeded, or it
+ * 404'd (already gone) — versus a swallowed non-404 error, which leaves the machine's
+ * actual state unknown. Callers that gate an admission-reservation release (AII-783) on
+ * verified termination need this distinction: a caught-and-logged failure here used to
+ * read identically to a real destroy from the outside.
  */
 export async function safeDestroyMachine(
   config: ReaperConfig,
   machineId: string,
   reason: string,
   ctx?: DestroyContext,
-): Promise<void> {
-  if (!config.flySessionsToken || !config.flySessionsApp) return;
+): Promise<boolean> {
+  if (!config.flySessionsToken || !config.flySessionsApp) return false;
 
   const t = ctx?.tenantId ?? "-";
   const i = ctx?.issueIdentifier ?? "-";
@@ -64,14 +84,17 @@ export async function safeDestroyMachine(
     `[reaper] rule=${reason} machine=${machineId} tenant=${t} issue=${i} age_s=${a} dry_run=${d}`,
   );
 
-  if (d) return;
+  if (d) return true;
 
   try {
     await destroyMachine(config.flySessionsToken, config.flySessionsApp, machineId);
+    return true;
   } catch (err) {
-    if (!(err instanceof Error && err.message.includes("404"))) {
-      console.error(`[reaper] Failed to destroy machine=${machineId} rule=${reason}:`, err);
+    if (err instanceof Error && err.message.includes("404")) {
+      return true; // already gone — confirmed dead
     }
+    console.error(`[reaper] Failed to destroy machine=${machineId} rule=${reason}:`, err);
+    return false;
   }
 }
 
@@ -91,6 +114,7 @@ async function sweepOrphanedKgRefreshJobs(
   const jobs = getInFlightKgRefreshJobs();
   for (const job of jobs) {
     if (job.executionMode === "github-actions") continue; // handled by monitorGitHubActionsJob
+    if (isRestateOwnedJob(job)) continue; // Restate finalizes its own attempts (AII-791)
 
     // Fly / local-Docker path below.
 
@@ -239,6 +263,10 @@ export async function sweepOrphanedMachines(
       continue;
     }
 
+    // AII-791: the reaper never finalizes a Restate-owned attempt, even one that looks
+    // orphaned or stale from this row's own status.
+    if (isRestateOwnedJob(job)) continue;
+
     const isTerminal =
       job.status === "completed" || job.status === "review_failed" || job.status === "failed" || job.status === "timed_out";
     if (isTerminal) {
@@ -280,14 +308,21 @@ export async function sweepOrphanedMachines(
         ageSeconds,
         dryRun: config.reaperDryRun,
       });
-      await safeDestroyMachine(config, machine.id, "max-age-exceeded", {
+      const maxAgeDestroyConfirmed = await safeDestroyMachine(config, machine.id, "max-age-exceeded", {
         tenantId: job.teamKey,
         issueIdentifier: job.issueIdentifier,
         ageSeconds,
       });
       if (!config.reaperDryRun) {
         destroyedCount++;
-        updateJobStatus(job.id, "timed_out", "machine_max_age_sweep");
+        // A destroy call that failed (and wasn't a 404-already-gone) leaves the machine's
+        // real state unknown — hold the admission reservation for the stale-reservation
+        // sweep rather than releasing a slot whose backend might still be running.
+        if (maxAgeDestroyConfirmed) {
+          updateJobStatus(job.id, "timed_out", "machine_max_age_sweep", undefined, { backendTerminated: true });
+        } else {
+          updateJobStatus(job.id, "timed_out", "machine_max_age_sweep", undefined, { skipAdmissionRelease: true });
+        }
         invalidateNonce(job.id);
         if (job.phase === "kg-refresh") {
           // Issue-less run: notify the handle so it closes the chain immediately
@@ -315,14 +350,18 @@ export async function sweepOrphanedMachines(
         ageSeconds,
         dryRun: config.reaperDryRun,
       });
-      await safeDestroyMachine(config, machine.id, "issue-terminal", {
+      const issueTerminalDestroyConfirmed = await safeDestroyMachine(config, machine.id, "issue-terminal", {
         tenantId: job.teamKey,
         issueIdentifier: job.issueIdentifier,
         ageSeconds,
       });
       if (!config.reaperDryRun) {
         destroyedCount++;
-        updateJobStatus(job.id, "timed_out", "issue_completed_sweep");
+        if (issueTerminalDestroyConfirmed) {
+          updateJobStatus(job.id, "timed_out", "issue_completed_sweep", undefined, { backendTerminated: true });
+        } else {
+          updateJobStatus(job.id, "timed_out", "issue_completed_sweep", undefined, { skipAdmissionRelease: true });
+        }
         invalidateNonce(job.id);
         await helpers.resetTicket(job);
       }

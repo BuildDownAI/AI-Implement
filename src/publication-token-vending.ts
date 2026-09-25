@@ -1,11 +1,14 @@
 import { getScopedInstallationToken } from "./github-app-auth.js";
-import { releasePublicationClaim, verifyRunToken } from "./runner-tokens.js";
+import { releasePublicationClaim, verifyPreparedReviewFixToken, verifyRunToken } from "./runner-tokens.js";
 
 export interface HandlePublicationTokenInput {
   authorization: string | undefined;
   secret: string;
   githubAppId: string;
   githubAppPrivateKey: string;
+  repository?: string;
+  githubRunId?: number;
+  githubRunAttempt?: number;
 }
 
 export interface HandlePublicationTokenOutput {
@@ -39,9 +42,19 @@ export async function handlePublicationTokenRequest(
     return AUTH_FAILURE;
   }
 
-  // Consume before the external mint. This gives the credential at-most-once
-  // semantics even when concurrent runner requests race.
-  const verified = verifyRunToken(bearerToken, input.secret, "publication", { consume: true });
+  // Legacy keeps its original consume-before-mint behavior. The pilot checks
+  // authority first, then consumes after a successful mint so mint failures
+  // can retry without resetting the consumed claim.
+  const identified = verifyRunToken(bearerToken, input.secret, "publication", { consume: false });
+  if (!identified.ok) return AUTH_FAILURE;
+  const pilot = Boolean(identified.claims.attemptId);
+  const execution = pilot ? publicationExecution(input) : null;
+  if (pilot && !execution) return AUTH_FAILURE;
+  const verified = pilot
+    ? verifyPreparedReviewFixToken(bearerToken, input.secret, "publication", {
+        publicationExecution: execution!,
+      })
+    : verifyRunToken(bearerToken, input.secret, "publication", { consume: true });
   if (!verified.ok) {
     console.warn(`[publication-token] Token verification failed: ${verified.reason}`);
     return AUTH_FAILURE;
@@ -79,14 +92,46 @@ export async function handlePublicationTokenRequest(
         forceRefresh: true,
       },
     );
+    // A failed external mint must leave the pilot's credential available for a
+    // later retry. Consume only after a token exists, then recheck authority in
+    // the same transaction as consumption; a concurrent loser never receives it.
+    if (pilot && !verifyPreparedReviewFixToken(bearerToken, input.secret, "publication", {
+      consumePublication: true, publicationExecution: execution!,
+    }).ok) return AUTH_FAILURE;
     return { status: 200, body: { token, expires_at: expiresAt } };
   } catch (err) {
     // The GitHub mint issued no credential. Restore only the exact claim made
-    // above so the runner's existing 5xx retry can exchange it once.
-    if (verified.consumedAt !== null) {
+    // by a Legacy exchange so the runner's existing 5xx retry can use it.
+    // The pilot never claims until after a successful mint.
+    if (!pilot && verified.consumedAt !== null) {
       releasePublicationClaim(verified.claims.dispatchId, verified.consumedAt);
     }
     console.error("[publication-token] Failed to mint installation token:", err);
     return { status: 500, body: { error: "Failed to mint token" } };
   }
+}
+
+function publicationExecution(input: HandlePublicationTokenInput): {
+  repository: string; githubRunId: number; githubRunAttempt: number;
+} | null {
+  if (!input.repository?.match(/^[^/\s]+\/[^/\s]+$/)
+    || !Number.isSafeInteger(input.githubRunId) || (input.githubRunId ?? 0) <= 0
+    || !Number.isSafeInteger(input.githubRunAttempt) || (input.githubRunAttempt ?? 0) <= 0) return null;
+  return { repository: input.repository, githubRunId: input.githubRunId!, githubRunAttempt: input.githubRunAttempt! };
+}
+
+/** Recheck current pilot authority before each external write, including later
+ * review-fix pushes after the one-shot publication credential has been cleared. */
+export function handlePublicationAuthorityCheck(
+  input: HandlePublicationTokenInput,
+): HandlePublicationTokenOutput {
+  const bearerToken = parseBearerToken(input.authorization);
+  const execution = publicationExecution(input);
+  if (!bearerToken || !execution) return AUTH_FAILURE;
+  const verified = verifyPreparedReviewFixToken(bearerToken, input.secret, "result", {
+    publicationExecution: execution,
+  });
+  return verified.ok && verified.claims.attemptId
+    ? { status: 200, body: { authorized: true } }
+    : AUTH_FAILURE;
 }

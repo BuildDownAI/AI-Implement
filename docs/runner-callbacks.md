@@ -30,10 +30,17 @@ sequenceDiagram
 |---|---|---|---|---|---|---|
 | `RUN_TOKEN` | `result` | `mintRunToken` at dispatch (`src/runner-tokens.ts`) | GHA: `inputs.run_token` into the step env in `workflows/claude-implement.yml`, `claude-plan.yml`, `claude-kg-refresh.yml`. Fly: machine env in `buildSessionMachineConfig` (`src/fly-machines.ts`). Local: container env (`src/local-docker.ts`) | `postRunnerResult` (`src/runner-result.ts`) | `POST /runner/result` with `verifyRunToken(…, "result", { consume: true })` | Yes, on first use |
 | `RUN_PROGRESS_TOKEN` | `progress` | `mintRunToken` at dispatch | Same three carriers | `src/run-autonomous.ts`, `src/run-planning.ts`, `src/pipeline/kg-refresh-run.ts`, `src/pipeline/steps/dependency-auth.ts`, `reference-repos.ts`, `kg-tracker-data.ts` | `POST /runner/progress`, `GET /runner/planning-context`, `POST /api/runner/dependency-token`, `reference-token`, `kg-push-token`, `kg-tracker-data`, all with `{ consume: false }` | No |
-| `RUN_PUBLICATION_TOKEN` | `publication` | `mintRunToken` with a repository claim | Runner env | The push path exchanges it | `POST /api/runner/publication-token` claims before the GitHub mint; returns a repository write credential | Yes after a successful mint; a failed mint releases only its matching claim so the runner can retry |
+| `RUN_PUBLICATION_TOKEN` | `publication` | `mintRunToken` with a repository claim | Runner env | The push path exchanges it | `POST /api/runner/publication-token` returns a repository write credential; Legacy claims before mint, pilot verifies attempt authority and claims after mint | Yes after a successful exchange; a failed Legacy mint releases only its matching claim, while a failed pilot mint leaves the claim unused |
 | `RUNNER_CALLBACK_URL` | none, an address | Envelope `runnerCallbackUrl` or a plain env var | Same carriers | `postRunnerResult` fallback and the progress posters | none | No |
 
 A token is a signed claim set stored in the `runner_tokens` table with `dispatch_id`, `audience`, and `consumed_at`. `verifyRunToken` answers `already_consumed` when `consumed_at` is set. The callback endpoints answer 501 when `RUNNER_TOKEN_SECRET` is unset.
+
+Pilot review-fix attempts use prepared credentials for the same `result` and
+`progress` audiences. Their claims bind the immutable attempt, repository, PR,
+and dispatch reservation. `verifyPreparedReviewFixToken` checks that stored
+scope and active authority on each callback without consuming the credential:
+the result and activity senders can retry an identical body after a lost ACK.
+Unmarked Legacy callbacks retain the single-use result token above.
 
 ## Process boundary inside the runner
 
@@ -53,8 +60,28 @@ What one stray use of each credential destroys, and where the symptom appears.
 |---|---|---|---|---|
 | Result token | One extra `POST /runner/result` before the real report | The real report is refused `409 already_consumed`: outcome, PR URL, implementation summary, and the approval mark (ADR 014). On GitHub Actions the tracker transition too: the issue keeps `AI-Working`, holds its dispatch slot, and fills the per-team cap | In other subsystems: the merge gate holds the PR with "no approval mark"; a fix that stamps the mark has nothing to stamp; the cap shows finished runs as in progress; `get_issue_dispatch_status` reads `conclusion: success` with `mergeVerdict: hold` | None for that run. A person merges by hand and clears the labels. Observed 2026-09-04 to 2026-09-07 (AII-567), about three days of build-down |
 | Progress token | A stray progress post or token exchange | Nothing is burned; the token is reusable. A stray exchange mints a dependency or reference token for the run's team, which reads every repository the App installation covers | `step_log` rows that do not match a real step; unexplained token rows | Tokens expire; nothing to repair |
-| Publication token | One stray successful exchange | The real push has no write credential and the run cannot open its PR | The push step fails | Re-dispatch. A failed GitHub mint releases its stamp-matched claim for the runner retry; an in-flight or successful mint still excludes concurrent/late exchanges, preserving at most one successful exchange |
+| Publication token | One stray successful exchange | The real push has no write credential and the run cannot open its PR | The push step fails | Re-dispatch. A failed Legacy GitHub mint releases its stamp-matched claim for retry; the pilot claims only after mint and rechecks authority. A successful exchange remains single-use |
 | Callback URL with a token | A test that reaches the live orchestrator | Whatever the token allows, above | See the result-token row | See above |
+
+## Pilot result retries (AII-794)
+
+`postRunnerResult` sends exactly one `POST /runner/result` for a Legacy call (no `reviewFix`), unchanged from before. For a Restate review-fix pilot attempt (`reviewFix` present), it instead retries on a transient transport failure or a `429`/`5xx` response, using `pipeline/retry-backoff.ts`'s `computeBackoffMs` against the run's `retryPolicy`. The loop is bounded two ways: a hard cap of 8 attempts, and the attempt's own `deadlineAt` plus a 15-minute delivery grace (mirroring `runner-tokens.ts`'s `PILOT_DELIVERY_GRACE_MS` — the two constants must stay numerically in sync, since `runner-tokens.ts` cannot be imported into the runner bundle). Every retry resends the identical serialized JSON body built before the first attempt, never a freshly re-encoded one. Any other response — including the pilot's own `409 conflict` / `410 stale` classifications — stops the loop immediately; exhausting the deadline or the attempt cap logs an explicit `POST no-result` line rather than silently giving up. Neither path reruns agent work or mints a new attempt; this is delivery retry only.
+
+The pilot branch now authenticates the prepared result credential and checks the
+marker against its attempt before any Legacy token consumption or provider
+effect. The injected result seam records the canonical result and its durable
+delivery row in one SQLite transaction. An identical retry returns `200`
+`duplicate` and checks/repairs the same delivery identity; a conflicting result
+returns `409`, and a stale one returns `410`. The delivery pump contacts Restate
+afterward, so a sidecar outage does not reverse SQLite acceptance. A failed
+database write or missing persistence seam does not acknowledge the callback.
+Explicit pilot metadata cannot fall through to Legacy completion, finding
+resolution, or approval.
+
+`POST /runner/activity` uses the prepared, reusable `progress` credential.
+The handler validates and stores a bounded activity batch under the token's
+attempt identity before ACK. A missing store, forged attempt, or storage failure
+cannot produce a success ACK. Legacy runs do not use this route.
 
 ## Rules
 
