@@ -1212,6 +1212,123 @@ describe("pushStep draft PRs", () => {
   });
 });
 
+describe("pushStep — dependency install status in the PR body", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.stubGlobal("fetch", vi.fn());
+  });
+
+  it("leads the body with a warning and names installMethod/installError when both attempts failed", async () => {
+    mockGitSuccess("abc123");
+    const ctx = makeContext();
+    ctx.setOutputs("install", { installFailed: true, installMethod: "npm ci" });
+    ctx.setOutputs("install-retry", { installFailed: true, installMethod: "npm ci", installError: "ERESOLVE unable to resolve dependency tree" });
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true, status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/11", number: 11 }),
+      text: async () => "",
+    } as Response);
+
+    await pushStep.run(ctx, BASE_INPUTS, new NoopStepReporter());
+
+    const [, init] = vi.mocked(fetch).mock.calls[0];
+    const body = JSON.parse(String(init?.body)) as { body: string };
+    expect(body.body.startsWith("## ⚠️ Dependencies did not install")).toBe(true);
+    expect(body.body).toContain("`npm ci`");
+    expect(body.body).toContain("ERESOLVE unable to resolve dependency tree");
+    expect(body.body).toContain("- [ ] Automated verification was skipped — dependency install failed.");
+  });
+
+  it("orders the dependency warning before the unapproved section when both are present", async () => {
+    mockGitSuccess("abc123");
+    const ctx = makeContext();
+    ctx.setOutputs("install", { installFailed: true, installMethod: "npm ci" });
+    ctx.setOutputs("install-retry", { installFailed: true, installMethod: "npm ci", installError: "boom" });
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true, status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/11", number: 11 }),
+      text: async () => "",
+    } as Response);
+
+    await pushStep.run(ctx, { ...BASE_INPUTS, draft: true, reviewSummary: REVIEW_SUMMARY }, new NoopStepReporter());
+
+    const [, init] = vi.mocked(fetch).mock.calls[0];
+    const body = JSON.parse(String(init?.body)) as { body: string };
+    const warningIdx = body.body.indexOf("## ⚠️ Dependencies did not install");
+    const unapprovedIdx = body.body.indexOf("Automated review did not approve");
+    expect(warningIdx).toBeGreaterThanOrEqual(0);
+    expect(unapprovedIdx).toBeGreaterThan(warningIdx);
+  });
+
+  it("reports the retry succeeding after an initial failure with no warning section", async () => {
+    mockGitSuccess("abc123");
+    const ctx = makeContext();
+    ctx.setOutputs("install", { installFailed: true, installMethod: "npm ci" });
+    ctx.setOutputs("install-retry", { installFailed: false, installMethod: "npm ci" });
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true, status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/12", number: 12 }),
+      text: async () => "",
+    } as Response);
+
+    await pushStep.run(ctx, BASE_INPUTS, new NoopStepReporter());
+
+    const [, init] = vi.mocked(fetch).mock.calls[0];
+    const body = JSON.parse(String(init?.body)) as { body: string };
+    expect(body.body).not.toContain("## ⚠️ Dependencies did not install");
+    expect(body.body).toContain("Initial dependency install failed; it succeeded after this change.");
+  });
+
+  it.each([
+    ["ok", { installFailed: false, installMethod: "npm ci" }],
+    ["skipped", { installFailed: false, installMethod: "skipped: no package.json" }],
+  ])("adds nothing new when the first install is %s and the retry never ran", async (_label, installOutputs) => {
+    mockGitSuccess("abc123");
+    const ctx = makeContext();
+    ctx.setOutputs("install", installOutputs);
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true, status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/13", number: 13 }),
+      text: async () => "",
+    } as Response);
+
+    await pushStep.run(ctx, BASE_INPUTS, new NoopStepReporter());
+
+    const [, init] = vi.mocked(fetch).mock.calls[0];
+    const body = JSON.parse(String(init?.body)) as { body: string };
+    expect(body.body).not.toContain("## ⚠️ Dependencies did not install");
+    expect(body.body).not.toContain("Initial dependency install failed; it succeeded after this change.");
+    expect(body.body).not.toContain("dependency install failed");
+  });
+
+  it("never renders install status for a gap-fill push (no PR body is built)", async () => {
+    mockGitSuccess("abc123");
+    const ctx = makeContext({ prNumber: "42" });
+    ctx.setOutputs("install", { installFailed: true, installMethod: "npm ci" });
+    ctx.setOutputs("install-retry", { installFailed: true, installMethod: "npm ci", installError: "boom" });
+
+    const outputs = await pushStep.run(
+      ctx,
+      {
+        ...BASE_INPUTS,
+        branchName: "feature/existing-pr",
+        baseBranch: "feature/existing-pr",
+        baseRef: "beadfeed",
+        existingPrNumber: "42",
+      },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.prNumber).toBe(42);
+    for (const call of vi.mocked(fetch).mock.calls) {
+      const init = call[1];
+      if (init?.body) {
+        expect(String(init.body)).not.toContain("Dependencies did not install");
+      }
+    }
+  });
+});
+
 // ---- Case A: agent committed its own changes ----
 
 describe("pushStep — Case A (agent-committed changes)", () => {

@@ -380,6 +380,35 @@ interface SpawnInstallResult {
 }
 
 /**
+ * Retry mode always follows a failed first attempt (install-retry's skip condition
+ * guarantees that), so this reports the retry's own outcome without re-checking the
+ * first attempt. Comments are posted in filename order; 70- sorts ahead of the 80-
+ * reviewer-feedback and 90-/95- run-autopsy/run-stats files.
+ */
+function writeDependencyInstallComment(
+  workspaceDir: string,
+  installMethod: string,
+  result: SpawnInstallResult,
+): void {
+  const body = result.installFailed
+    ? [
+        `Dependency install (\`${installMethod}\`) failed before and after the agent ran. Build and tests did not run.`,
+        "",
+        "```",
+        result.installError ?? "(no output captured)",
+        "```",
+      ].join("\n")
+    : `Dependency install (\`${installMethod}\`) failed before the agent ran and succeeded after its change.`;
+  try {
+    const commentsDir = path.join(workspaceDir, "ai-output", "comments");
+    fs.mkdirSync(commentsDir, { recursive: true });
+    fs.writeFileSync(path.join(commentsDir, "70-dependency-install.md"), body, "utf-8");
+  } catch (err) {
+    console.warn(`[install] could not write dependency install comment file (non-fatal): ${String(err)}`);
+  }
+}
+
+/**
  * Runs `installMethod` in `workspaceDir`, streaming stdout/stderr through to the process
  * streams (so live log tailing is unaffected) while keeping a rolling tail for `installError`.
  * Never rejects: a non-zero exit or a spawn `error` event both resolve with `installFailed: true`
@@ -445,6 +474,7 @@ export const installStep: StepModule<InstallInputs, InstallOutputs> = {
       } finally {
         removeNpmAuth(npmAuth);
       }
+      writeDependencyInstallComment(workspaceDir, installMethod, result);
       return {
         packageManager,
         installMethod,

@@ -573,6 +573,15 @@ function buildPullRequestBody(
 ): string {
   const { issueIdentifier, issueTitle, issueDescription } = context.data;
   const preflightOutputs = context.getOutputs("preflight");
+  const installOutputs = context.getOutputs("install");
+  const installRetryOutputs = context.getOutputs("install-retry");
+  const initialInstallFailed = installOutputs.installFailed === true;
+  const retryFailed = installRetryOutputs.installFailed === true;
+  // A skipped install-retry (first install succeeded) leaves empty outputs, so
+  // retryFailed is false and both branches below fall through to "nothing new" —
+  // matching dependenciesMissing's own skip semantics (src/pipeline/pipeline-loader.ts).
+  const retrySucceeded = initialInstallFailed && !retryFailed;
+  const dependenciesFailed = initialInstallFailed && retryFailed;
   const title = stringValue(issueTitle) ?? "AI implementation";
   const description = stringValue(issueDescription);
 
@@ -583,21 +592,31 @@ function buildPullRequestBody(
   // A provider outage is not a review verdict — the reviewer may never have run, so this
   // fallback must not claim the review loop rejected the change (BAC-27201).
   const providerUnavailableForTestsSummary = inputs.reviewSummary?.terminationReason === "provider_unavailable";
-  // No explicit/preflight summary to fall back on: say what actually happened. An unapproved
-  // run (reviewSummary present) skipped preflight/verify entirely — claiming verification ran
-  // would contradict the "Automated review did not approve" section above it.
-  const testsSummary =
-    explicitTestsSummary ??
-    (inputs.reviewSummary
-      ? providerUnavailableForTestsSummary
-        ? "Automated verification was skipped — the model provider was unavailable and the run was interrupted."
-        : "Automated verification was skipped — the review loop did not approve this change."
-      : "Automated verification was run by the AI-Implement pipeline before opening this PR.");
-  const testsSummaryChecked = explicitTestsSummary != null || !inputs.reviewSummary;
+  // A failed install (after the retry) is a more specific reason than a review rejection —
+  // preflight/verify never ran either way, but the install failure is the actual cause.
+  const testsSummary = dependenciesFailed
+    ? "Automated verification was skipped — dependency install failed."
+    : // No explicit/preflight summary to fall back on: say what actually happened. An unapproved
+      // run (reviewSummary present) skipped preflight/verify entirely — claiming verification ran
+      // would contradict the "Automated review did not approve" section above it.
+      explicitTestsSummary ??
+      (inputs.reviewSummary
+        ? providerUnavailableForTestsSummary
+          ? "Automated verification was skipped — the model provider was unavailable and the run was interrupted."
+          : "Automated verification was skipped — the review loop did not approve this change."
+        : "Automated verification was run by the AI-Implement pipeline before opening this PR.");
+  const testsSummaryChecked = dependenciesFailed ? false : explicitTestsSummary != null || !inputs.reviewSummary;
 
+  const dependencyInstallSection = dependenciesFailed
+    ? buildDependencyInstallSection(
+        stringValue(installRetryOutputs.installMethod) ?? stringValue(installOutputs.installMethod) ?? "install",
+        stringValue(installRetryOutputs.installError) ?? undefined,
+      )
+    : null;
   const unapprovedSection = buildUnapprovedSection(inputs.reviewSummary as ReviewSummary | undefined, inputs.draft === true);
 
   return [
+    ...(dependencyInstallSection ? [dependencyInstallSection, ""] : []),
     ...(unapprovedSection ? [unapprovedSection, ""] : []),
     "## Summary",
     implementationSummary,
@@ -609,11 +628,30 @@ function buildPullRequestBody(
     "",
     "## Test plan",
     `- [${testsSummaryChecked ? "x" : " "}] ${testsSummary}`,
+    ...(retrySucceeded ? ["- [x] Initial dependency install failed; it succeeded after this change."] : []),
     "- [ ] Manual: review the changed behavior against the ticket acceptance criteria.",
     "",
     `Fixes ${issueIdentifier}`,
     "",
     `Generated with AI-Implement · harness: Claude Code · model: ${context.data.model ?? "unknown"} · provider: ${context.data.provider ?? "anthropic"}`,
+  ].join("\n");
+}
+
+/**
+ * Leads the PR body (before the unapproved section, per the "why first" rationale:
+ * reviewers and the external review check read top-down, and a build/lint/typecheck/test
+ * warning must land before the summary of what the change does) when both the first
+ * install and its retry (after feedback-loop) failed.
+ */
+function buildDependencyInstallSection(installMethod: string, installError: string | undefined): string {
+  return [
+    "## ⚠️ Dependencies did not install",
+    "",
+    `Dependency install (\`${installMethod}\`) failed before and after the agent ran; build, lint, typecheck, and tests never ran.`,
+    "",
+    "```",
+    installError ?? "(no output captured)",
+    "```",
   ].join("\n");
 }
 
