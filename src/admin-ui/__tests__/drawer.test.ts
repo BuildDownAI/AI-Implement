@@ -589,6 +589,145 @@ function mountPilotDrawer(opts: {
 }
 
 describe("job drawer restate attempt section", () => {
+  it("retries page one after an initial attempt read failure", async () => {
+    const { win, doc, calls } = mountPilotDrawer({ job: PILOT_JOB, attemptStatus: 503, attempt: pilotAttemptFixture() });
+    const api = win.api;
+    let first = true;
+    win.api = async (url: string, options?: unknown) => {
+      if (url === "/api/review-fix/attempts/attempt-10" && first) {
+        first = false;
+        return { ok: false, status: 503 };
+      }
+      if (url === "/api/review-fix/attempts/attempt-10") {
+        return { ok: true, status: 200, json: async () => pilotAttemptFixture() };
+      }
+      return api(url, options);
+    };
+    await win.openJobDrawer(10);
+    expect(doc.getElementById("drawer-pilot-unavailable")!.textContent).toContain("unavailable");
+    await win.refreshJobDrawer(10, { background: true });
+    expect(calls.filter((url) => url.includes("/activity"))).toHaveLength(1);
+    expect(doc.getElementById("drawer-pilot-activity")!.textContent).toContain("tool_call");
+    win.closeJobDrawer();
+  });
+
+  it("keeps a known truncation warning after a clean later page", async () => {
+    const { win, doc } = mountPilotDrawer({ job: PILOT_JOB, attemptStatus: 200, attempt: pilotAttemptFixture(), activityPages: [ACTIVITY_PAGE_1, ACTIVITY_PAGE_2] });
+    await win.openJobDrawer(10);
+    await (doc.getElementById("drawer-pilot-activity-more") as unknown as { onclick: () => Promise<void> }).onclick();
+    expect(doc.getElementById("drawer-pilot-activity-count")!.textContent).toContain("stream truncated");
+    win.closeJobDrawer();
+  });
+
+  it("escapes the final workflow URL attribute", async () => {
+    const attempt = pilotAttemptFixture({ execution: { githubRunId: '12" onmouseover="alert(1)', githubRunAttempt: 1 } });
+    const { win, doc } = mountPilotDrawer({ job: PILOT_JOB, attemptStatus: 200, attempt });
+    await win.openJobDrawer(10);
+    const link = doc.querySelector("#drawer-pilot-links a")!;
+    expect(link.getAttribute("onmouseover")).toBeNull();
+    expect(link.getAttribute("href")).toContain("onmouseover=");
+    win.closeJobDrawer();
+  });
+
+  it("shows unavailable activity and retries a failed first page", async () => {
+    const { win, doc } = mountPilotDrawer({ job: PILOT_JOB, attemptStatus: 200, attempt: pilotAttemptFixture() });
+    const api = win.api;
+    let failed = false;
+    win.api = async (url: string, options?: unknown) => {
+      if (url.includes("/activity") && !failed) {
+        failed = true;
+        return { ok: false, status: 503 };
+      }
+      return api(url, options);
+    };
+    await win.openJobDrawer(10);
+    expect(doc.getElementById("drawer-pilot-activity")!.textContent).toContain("Activity unavailable");
+    expect(doc.getElementById("drawer-pilot-activity")!.textContent).not.toContain("No tool activity recorded");
+    await (doc.getElementById("drawer-pilot-activity-more") as unknown as { onclick: () => Promise<void> }).onclick();
+    expect(doc.getElementById("drawer-pilot-activity")!.textContent).toContain("tool_call");
+    win.closeJobDrawer();
+  });
+
+  it("shows unavailable activity and retries a failed later page", async () => {
+    const { win, doc } = mountPilotDrawer({ job: PILOT_JOB, attemptStatus: 200, attempt: pilotAttemptFixture(), activityPages: [ACTIVITY_PAGE_1, ACTIVITY_PAGE_2] });
+    const api = win.api;
+    let failed = false;
+    win.api = async (url: string, options?: unknown) => {
+      if (url.includes("cursorProducerId") && !failed) {
+        failed = true;
+        return { ok: false, status: 503 };
+      }
+      return api(url, options);
+    };
+    await win.openJobDrawer(10);
+    await (doc.getElementById("drawer-pilot-activity-more") as unknown as { onclick: () => Promise<void> }).onclick();
+    expect(doc.getElementById("drawer-pilot-activity")!.textContent).toContain("Activity unavailable");
+    expect(doc.getElementById("drawer-pilot-activity-count")!.textContent).toContain("stream truncated");
+    await (doc.getElementById("drawer-pilot-activity-more") as unknown as { onclick: () => Promise<void> }).onclick();
+    expect(doc.getElementById("drawer-pilot-activity")!.textContent).toContain("second page payload");
+    win.closeJobDrawer();
+  });
+
+  it("does not apply a late activity page after closing the drawer", async () => {
+    const { win, doc } = mountPilotDrawer({ job: PILOT_JOB, attemptStatus: 200, attempt: pilotAttemptFixture() });
+    const api = win.api;
+    let finish!: (page: unknown) => void;
+    win.api = async (url: string, options?: unknown) => {
+      if (url.includes("/activity") && url.includes("cursorProducerId")) {
+        return new Promise((resolve) => { finish = (page) => resolve({ ok: true, status: 200, json: async () => page }); });
+      }
+      return api(url, options);
+    };
+    await win.openJobDrawer(10);
+    const pending = (doc.getElementById("drawer-pilot-activity-more") as unknown as { onclick: () => Promise<void> }).onclick();
+    win.closeJobDrawer();
+    finish(ACTIVITY_PAGE_2);
+    await pending;
+    expect(doc.getElementById("drawer-pilot-activity")!.textContent).not.toContain("second page payload");
+  });
+
+  it("does not mix an old job's late activity page into a new job", async () => {
+    const { win, doc } = mountPilotDrawer({ job: PILOT_JOB, attemptStatus: 200, attempt: pilotAttemptFixture() });
+    const api = win.api;
+    let finish!: (page: unknown) => void;
+    win.api = async (url: string, options?: unknown) => {
+      if (url.includes("/activity") && url.includes("cursorProducerId")) {
+        return new Promise((resolve) => { finish = (page) => resolve({ ok: true, status: 200, json: async () => page }); });
+      }
+      if (url === "/api/jobs/11/steps") return { ok: true, status: 200, json: async () => ({ job: { ...PILOT_JOB, id: 11, dispatchId: "attempt-11" }, steps: [] }) };
+      if (url === "/api/review-fix/attempts/attempt-11") return { ok: true, status: 200, json: async () => pilotAttemptFixture({ attemptId: "attempt-11" }) };
+      if (url.includes("/attempt-11/activity")) return { ok: true, status: 200, json: async () => ({ events: [], nextCursor: null, truncated: false }) };
+      return api(url, options);
+    };
+    await win.openJobDrawer(10);
+    const pending = (doc.getElementById("drawer-pilot-activity-more") as unknown as { onclick: () => Promise<void> }).onclick();
+    await win.openJobDrawer(11);
+    finish(ACTIVITY_PAGE_2);
+    await pending;
+    expect(doc.getElementById("drawer-pilot-activity")!.textContent).not.toContain("second page payload");
+    win.closeJobDrawer();
+  });
+
+  it("keeps action feedback and Adopt inputs across same-attempt refresh", async () => {
+    const { win, doc } = mountPilotDrawer({ job: PILOT_JOB, attemptStatus: 200, attempt: pilotAttemptFixture() });
+    await win.openJobDrawer(10);
+    (doc.getElementById("drawer-pilot-adopt-run-id") as HTMLInputElement).value = "12345";
+    (doc.getElementById("drawer-pilot-adopt-run-attempt") as HTMLInputElement).value = "2";
+    await (doc.getElementById("drawer-pilot-reconcile") as unknown as { onclick: () => Promise<void> }).onclick();
+    await win.refreshJobDrawer(10, { background: true });
+    expect(doc.getElementById("drawer-pilot-action-status")!.textContent).toContain("accepted");
+    expect((doc.getElementById("drawer-pilot-adopt-run-id") as HTMLInputElement).value).toBe("12345");
+    expect((doc.getElementById("drawer-pilot-adopt-run-attempt") as HTMLInputElement).value).toBe("2");
+    win.closeJobDrawer();
+  });
+
+  it("does not show a verified green badge for completed attempts with missing evidence", async () => {
+    const { win, doc } = mountPilotDrawer({ job: PILOT_JOB, attemptStatus: 200, attempt: pilotAttemptFixture({ state: "completed" }) });
+    await win.openJobDrawer(10);
+    expect(doc.querySelector("#drawer-pilot-state-badge .badge.success")).toBeNull();
+    expect(doc.getElementById("drawer-pilot-state-badge")!.textContent).toContain("verification incomplete");
+    win.closeJobDrawer();
+  });
   it("keeps the pilot section hidden for a legacy job with no dispatchId", async () => {
     const { win, doc } = mountDrawer({ ...PILOT_JOB, dispatchId: null }, []);
     win.api = async (url: string) => {

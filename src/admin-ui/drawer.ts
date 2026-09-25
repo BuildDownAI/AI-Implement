@@ -69,6 +69,8 @@ export const drawerScript = `
   let pilotActivityEvents = [];
   let pilotActivityCursor = null;
   let pilotActivityTruncated = false;
+  let pilotActivityLoaded = false;
+  let pilotActivityUnavailable = false;
 
   function isTerminalJobStatus(status) {
     return status === 'completed' || status === 'failed' || status === 'timed_out' || status === 'review_failed' || status === 'dispatch-failed';
@@ -585,6 +587,8 @@ export const drawerScript = `
     pilotActivityEvents = [];
     pilotActivityCursor = null;
     pilotActivityTruncated = false;
+    pilotActivityLoaded = false;
+    pilotActivityUnavailable = false;
   }
 
   async function fetchReviewFixAttempt(attemptId) {
@@ -626,7 +630,8 @@ export const drawerScript = `
 
   function renderPilotStateBadge(attempt) {
     const el = document.getElementById('drawer-pilot-state-badge');
-    let html = '<span class="badge ' + pilotStateBadgeKind(attempt.state) + '"><span class="dot"></span>' + window.esc(attempt.state || 'unknown') + '</span>';
+    const incomplete = attempt.state === 'completed' && (!attempt.evidenceComplete || !attempt.terminationConfirmed);
+    let html = '<span class="badge ' + (incomplete ? 'warn' : pilotStateBadgeKind(attempt.state)) + '"><span class="dot"></span>' + window.esc(incomplete ? 'completed · verification incomplete' : (attempt.state || 'unknown')) + '</span>';
     if (attempt.deadlineAt != null) {
       const label = attempt.deadlineAt < Date.now() ? 'deadline passed ' : 'deadline in ';
       html += ' <span class="text-tertiary" style="font-size:11px">' + window.esc(label) + window.esc(fmtRelative(attempt.deadlineAt).replace(/ (from now|ago)$/, '')) + '</span>';
@@ -670,9 +675,9 @@ export const drawerScript = `
     let html = '<div class="field"><div class="field-label">Workflow run</div><div style="font-size:12.5px">';
     if (repoParts) {
       const runUrl = 'https://github.com/' + repoParts.owner + '/' + repoParts.repo + '/actions/runs/' + attempt.execution.githubRunId;
-      html += '<a class="text-accent" href="' + window.safeUrl(runUrl) + '" target="_blank">Run #' + window.esc(String(attempt.execution.githubRunId)) + ' &#8599;</a>';
+      html += '<a class="text-accent" href="' + window.escAttr(window.safeUrl(runUrl)) + '" target="_blank">Run #' + window.esc(String(attempt.execution.githubRunId)) + ' &#8599;</a>';
       if (attempt.execution.githubRunAttempt > 1) {
-        html += ' <a class="text-accent" href="' + window.safeUrl(runUrl + '/attempts/' + attempt.execution.githubRunAttempt) + '" target="_blank">(attempt ' + window.esc(String(attempt.execution.githubRunAttempt)) + ' &#8599;)</a>';
+        html += ' <a class="text-accent" href="' + window.escAttr(window.safeUrl(runUrl + '/attempts/' + attempt.execution.githubRunAttempt)) + '" target="_blank">(attempt ' + window.esc(String(attempt.execution.githubRunAttempt)) + ' &#8599;)</a>';
       }
     } else {
       html += '<span class="mono">run ' + window.esc(String(attempt.execution.githubRunId)) + ' · attempt ' + window.esc(String(attempt.execution.githubRunAttempt)) + '</span>';
@@ -748,7 +753,15 @@ export const drawerScript = `
     const el = document.getElementById('drawer-pilot-activity');
     const countEl = document.getElementById('drawer-pilot-activity-count');
     const moreBtn = document.getElementById('drawer-pilot-activity-more');
-    countEl.textContent = pilotActivityEvents.length + ' event' + (pilotActivityEvents.length === 1 ? '' : 's') + (pilotActivityTruncated ? ' · stream truncated' : '');
+    countEl.textContent = pilotActivityEvents.length + ' event' + (pilotActivityEvents.length === 1 ? '' : 's') + (pilotActivityTruncated ? ' · stream truncated' : '') + (pilotActivityUnavailable ? ' · activity unavailable' : '');
+    if (pilotActivityUnavailable) {
+      el.innerHTML = '<div class="alert warn">Activity unavailable — retry the page to confirm the evidence.</div>';
+      moreBtn.hidden = false;
+      moreBtn.textContent = 'Retry activity';
+      moreBtn.onclick = pilotActivityLoaded ? loadMorePilotActivity : loadFirstPilotActivity;
+      return;
+    }
+    moreBtn.textContent = 'Load more';
     if (!pilotActivityEvents.length) {
       el.innerHTML = pilotActivityCursor
         ? '<div style="font-size:12px;color:var(--fg-tertiary);padding:8px 0">No events on this page — more activity may be available</div>'
@@ -793,11 +806,37 @@ export const drawerScript = `
 
   async function loadMorePilotActivity() {
     if (!currentAttemptId || !pilotActivityCursor) return;
-    const page = await fetchReviewFixActivityPage(currentAttemptId, pilotActivityCursor);
-    if (!page) return;
+    const attemptId = currentAttemptId;
+    const jobId = currentJobId;
+    const page = await fetchReviewFixActivityPage(attemptId, pilotActivityCursor);
+    if (currentJobId !== jobId || currentAttemptId !== attemptId) return;
+    if (!page) {
+      pilotActivityUnavailable = true;
+      renderPilotActivity();
+      return;
+    }
     pilotActivityEvents = pilotActivityEvents.concat(page.events);
     pilotActivityCursor = page.nextCursor;
-    pilotActivityTruncated = page.truncated;
+    pilotActivityTruncated = pilotActivityTruncated || page.truncated;
+    pilotActivityUnavailable = false;
+    renderPilotActivity();
+  }
+
+  async function loadFirstPilotActivity() {
+    if (!currentAttemptId) return;
+    const attemptId = currentAttemptId;
+    const jobId = currentJobId;
+    const page = await fetchReviewFixActivityPage(attemptId, null);
+    if (currentJobId !== jobId || currentAttemptId !== attemptId) return;
+    if (!page) {
+      pilotActivityUnavailable = true;
+    } else {
+      pilotActivityEvents = page.events;
+      pilotActivityCursor = page.nextCursor;
+      pilotActivityTruncated = pilotActivityTruncated || page.truncated;
+      pilotActivityLoaded = true;
+      pilotActivityUnavailable = false;
+    }
     renderPilotActivity();
   }
 
@@ -808,10 +847,14 @@ export const drawerScript = `
 
   async function runPilotAction(attemptId, action, body) {
     if (!window.isAdmin()) return;
+    const jobId = currentJobId;
+    const report = function (message) {
+      if (currentJobId === jobId && currentAttemptId === attemptId) setPilotActionStatus(message);
+    };
     // "accepted" describes the POST being queued, never that the action has taken
     // effect — the attempt's own state badge above is the source of truth for that,
     // and the 5s auto-refresh will pick up the eventual transition to it.
-    setPilotActionStatus(action + ' requested…');
+    report(action + ' requested…');
     try {
       const res = await window.api('/api/review-fix/attempts/' + encodeURIComponent(attemptId) + '/' + action, {
         method: 'POST',
@@ -820,28 +863,28 @@ export const drawerScript = `
       let payload;
       try { payload = await res.json(); } catch (e) { payload = {}; }
       if (res.status === 202) {
-        setPilotActionStatus(action + ' accepted' + (payload.status === 'durable-accepted' ? ' (queued — Restate temporarily unavailable)' : '') + '.');
+        report(action + ' accepted' + (payload.status === 'durable-accepted' ? ' (queued — Restate temporarily unavailable)' : '') + '.');
       } else if (res.status === 409) {
-        setPilotActionStatus(action + ' rejected: ' + (payload.error || 'conflict') + '.');
+        report(action + ' rejected: ' + (payload.error || 'conflict') + '.');
       } else if (res.status === 422) {
-        setPilotActionStatus(action + ' rejected: execution reference did not verify.');
+        report(action + ' rejected: execution reference did not verify.');
       } else if (res.status === 404) {
-        setPilotActionStatus(action + ' failed: attempt not found.');
+        report(action + ' failed: attempt not found.');
       } else if (res.status === 503 && payload.status === 'partial') {
         // Cancel's revoke-then-terminate split means a 503 here is not an outright
         // failure: authority may already be revoked even though termination wasn't
         // confirmed, so the message must say which half landed rather than "failed".
         if (payload.cancellation === 'unconfirmed') {
-          setPilotActionStatus(action + ' partially applied: authority revoked, termination unconfirmed — reconcile before retrying. ' + (payload.detail || ''));
+          report(action + ' partially applied: authority revoked, termination unconfirmed — reconcile before retrying. ' + (payload.detail || ''));
         } else {
-          setPilotActionStatus(action + ' queued: authority revocation durably accepted, termination not yet requested. ' + (payload.detail || ''));
+          report(action + ' queued: authority revocation durably accepted, termination not yet requested. ' + (payload.detail || ''));
         }
       } else {
-        setPilotActionStatus(action + ' failed (status ' + res.status + ').');
+        report(action + ' failed (status ' + res.status + ').');
       }
     } catch (err) {
       console.error('review-fix ' + action + ' failed:', err);
-      setPilotActionStatus(action + ' failed: request error.');
+      report(action + ' failed: request error.');
     }
   }
 
@@ -906,9 +949,11 @@ export const drawerScript = `
       pilotActivityEvents = [];
       pilotActivityCursor = null;
       pilotActivityTruncated = false;
+      pilotActivityLoaded = false;
+      pilotActivityUnavailable = false;
     }
     const result = await fetchReviewFixAttempt(job.dispatchId);
-    if (currentJobId !== job.id) return;
+    if (currentJobId !== job.id || currentAttemptId !== job.dispatchId) return;
     if (result.kind === 'none' || result.kind === 'error') {
       hidePilotSection();
       return;
@@ -931,7 +976,7 @@ export const drawerScript = `
       // Recovery controls stay reachable even when the read side is degraded — an
       // unknown/unreadable attempt is exactly when reconcile/adopt/cancel matter most,
       // and none of them is a force-release that bypasses that uncertainty.
-      renderPilotActions(job.dispatchId);
+      if (isNewAttempt || !document.getElementById('drawer-pilot-action-status')) renderPilotActions(job.dispatchId);
       return;
     }
     document.getElementById('drawer-pilot-unavailable').innerHTML = '';
@@ -942,15 +987,14 @@ export const drawerScript = `
     renderPilotLinks(attempt, job);
     renderPilotSnapshot(attempt);
     renderPilotCycles(attempt);
-    renderPilotActions(job.dispatchId);
-    if (isNewAttempt || !background) {
-      const page = await fetchReviewFixActivityPage(job.dispatchId, null);
-      if (currentJobId !== job.id) return;
-      if (page) {
-        pilotActivityEvents = page.events;
-        pilotActivityCursor = page.nextCursor;
-        pilotActivityTruncated = page.truncated;
-      }
+    if (isNewAttempt || !document.getElementById('drawer-pilot-action-status')) renderPilotActions(job.dispatchId);
+    if (!pilotActivityLoaded || !background) {
+      await loadFirstPilotActivity();
+      if (currentJobId !== job.id || currentAttemptId !== job.dispatchId) return;
+      renderPilotActivity();
+    } else {
+      // A temporary attempt-read outage clears the section's markup above. Restore
+      // the last successfully loaded page once the detail read recovers.
       renderPilotActivity();
     }
     // A background refresh of the same attempt deliberately leaves an in-progress
