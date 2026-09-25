@@ -14,6 +14,9 @@ const LEGACY_YML =
 const PUBLICATION_TOKEN_YML =
   "on:\n  workflow_dispatch:\n    inputs:\n      run_config:\n        required: true\n      run_publication_token:\n        required: false\n";
 
+const ATTEMPT_TOKEN_YML =
+  "on:\n  workflow_dispatch:\n    inputs:\n      run_config:\n        required: true\n      run_attempt_token:\n        required: false\n";
+
 function mockContents(yamlBody: string): ReturnType<typeof vi.fn> {
   return vi.fn().mockResolvedValue({
     ok: true,
@@ -65,6 +68,7 @@ describe("resolveWorkflowContract", () => {
     expect(capabilities).toEqual({
       contract: "envelope",
       supportsRunPublicationToken: true,
+      supportsAttemptCorrelation: false,
     });
   });
 
@@ -81,6 +85,7 @@ describe("resolveWorkflowContract", () => {
     expect(capabilities).toEqual({
       contract: "envelope",
       supportsRunPublicationToken: false,
+      supportsAttemptCorrelation: false,
     });
   });
 
@@ -99,6 +104,7 @@ describe("resolveWorkflowContract", () => {
     expect(capabilities).toEqual({
       contract: "envelope",
       supportsRunPublicationToken: false,
+      supportsAttemptCorrelation: false,
     });
   });
 
@@ -141,6 +147,7 @@ describe("resolveWorkflowContract", () => {
     expect(capabilities).toEqual({
       contract: "legacy",
       supportsRunPublicationToken: false,
+      supportsAttemptCorrelation: false,
     });
   });
 
@@ -305,5 +312,106 @@ describe("resolveWorkflowContract", () => {
     expect(modeDev).toBe("envelope");
     expect(fetchImplMain).toHaveBeenCalledOnce();
     expect(fetchImplDev).toHaveBeenCalledOnce();
+  });
+});
+
+// ---------- supportsAttemptCorrelation (AII-778) ----------
+
+describe("resolveWorkflowCapabilities — supportsAttemptCorrelation", () => {
+  beforeEach(() => {
+    __clearWorkflowProbeCacheForTests();
+  });
+
+  it("reports attempt-correlation support when the workflow declares run_attempt_token", async () => {
+    const fetchImpl = mockContents(ATTEMPT_TOKEN_YML);
+    const capabilities = await resolveWorkflowCapabilities({
+      owner: "o",
+      repo: "r",
+      workflowFile: "claude-implement.yml",
+      token: "t",
+      ref: "main",
+      fetchImpl,
+    });
+    expect(capabilities).toEqual({
+      contract: "envelope",
+      supportsRunPublicationToken: false,
+      supportsAttemptCorrelation: true,
+    });
+  });
+
+  it("does not report attempt-correlation support for an otherwise-envelope workflow that lacks the marker", async () => {
+    const fetchImpl = mockContents(ENVELOPE_YML);
+    const capabilities = await resolveWorkflowCapabilities({
+      owner: "o",
+      repo: "r",
+      workflowFile: "claude-implement.yml",
+      token: "t",
+      ref: "main",
+      fetchImpl,
+    });
+    expect(capabilities.supportsAttemptCorrelation).toBe(false);
+  });
+
+  it("does not report attempt-correlation support when the marker is only mentioned in a YAML comment", async () => {
+    const commentYml =
+      "on:\n  workflow_dispatch:\n    inputs:\n      run_config:\n        required: true\n      # run_attempt_token: would go here\n";
+    const fetchImpl = mockContents(commentYml);
+    const capabilities = await resolveWorkflowCapabilities({
+      owner: "o",
+      repo: "r",
+      workflowFile: "claude-implement.yml",
+      token: "t",
+      ref: "main",
+      fetchImpl,
+    });
+    expect(capabilities.supportsAttemptCorrelation).toBe(false);
+  });
+
+  it("cannot claim attempt-correlation support on a legacy-contract workflow, even if run_attempt_token appears in the YAML", async () => {
+    // A workflow that declares run_attempt_token but not run_config is not on the envelope
+    // contract at all — the marker must be gated by contract === "envelope", the same way
+    // supportsRunPublicationToken is, so an unsupported (legacy) workflow can never claim
+    // pilot support.
+    const legacyWithMarkerYml =
+      "on:\n  workflow_dispatch:\n    inputs:\n      issue_id:\n        required: true\n      run_attempt_token:\n        required: false\n";
+    const fetchImpl = mockContents(legacyWithMarkerYml);
+    const capabilities = await resolveWorkflowCapabilities({
+      owner: "o",
+      repo: "r",
+      workflowFile: "claude-implement.yml",
+      token: "t",
+      ref: "main",
+      fetchImpl,
+    });
+    expect(capabilities).toEqual({
+      contract: "legacy",
+      supportsRunPublicationToken: false,
+      supportsAttemptCorrelation: false,
+    });
+  });
+
+  it("probes attempt-correlation support on the actual dispatch ref, not a cached different ref", async () => {
+    const fetchImplMain = mockContents(ENVELOPE_YML);
+    const fetchImplDev = mockContents(ATTEMPT_TOKEN_YML);
+
+    const main = await resolveWorkflowCapabilities({
+      owner: "o",
+      repo: "r",
+      workflowFile: "claude-implement.yml",
+      token: "t",
+      ref: "main",
+      fetchImpl: fetchImplMain,
+    });
+    const dev = await resolveWorkflowCapabilities({
+      owner: "o",
+      repo: "r",
+      workflowFile: "claude-implement.yml",
+      token: "t",
+      ref: "dev",
+      fetchImpl: fetchImplDev,
+    });
+
+    expect(main.supportsAttemptCorrelation).toBe(false);
+    expect(dev.supportsAttemptCorrelation).toBe(true);
   });
 });
