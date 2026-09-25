@@ -113,27 +113,33 @@ function makeCredentials(opts: { installationId?: number; fail?: boolean } = {})
   };
 }
 
-type CandidateRun = { runId: number; runAttempt: number; displayTitle: string; headBranch: string };
-type RunDetail = { status: string; conclusion: string | null; runAttempt: number; headSha: string };
+type CandidateRun = { runId: number; runAttempt: number | null; displayTitle: string; headBranch: string };
+type RunDetail = { status: string; conclusion: string | null; runAttempt: number | null };
 
 /** Controllable GitHub double. `dispatch` can be told to "accept, then lose the response" —
  *  it records server-side state (as GitHub itself would) before throwing, so a later
- *  `listRuns` call (possibly through a freshly constructed adapter) can still discover it. */
+ *  `listRuns` call (possibly through a freshly constructed adapter) can still discover it.
+ *  The PR head SHA is tracked separately from any run detail, since a real gap-fill run's
+ *  dispatch-time `head_sha` and the PR's actual published head are two different values. */
 function makeTransport() {
   const dispatchCalls: unknown[] = [];
   const cancelCalls: unknown[] = [];
+  const pullRequestHeadShaCalls: unknown[] = [];
   let dispatchImpl: (input: any) => Promise<any> = async () => ({ success: true, status: 204, outcome: "accepted" as const });
   let serverRuns: CandidateRun[] = [];
   let runDetail: RunDetail | null = null;
   let cancelResult = true;
+  let pullRequestHeadSha: string | null = null;
 
   return {
     dispatchCalls,
     cancelCalls,
+    pullRequestHeadShaCalls,
     setDispatchImpl(fn: (input: any) => Promise<any>) { dispatchImpl = fn; },
     setServerRuns(runs: CandidateRun[]) { serverRuns = runs; },
     setRunDetail(detail: RunDetail | null) { runDetail = detail; },
     setCancelResult(v: boolean) { cancelResult = v; },
+    setPullRequestHeadSha(sha: string | null) { pullRequestHeadSha = sha; },
     transport: {
       async dispatch(input: any) {
         dispatchCalls.push(input);
@@ -148,6 +154,10 @@ function makeTransport() {
       async cancelRun(input: any) {
         cancelCalls.push(input);
         return cancelResult;
+      },
+      async getPullRequestHeadSha(input: any) {
+        pullRequestHeadShaCalls.push(input);
+        return pullRequestHeadSha;
       },
     },
   };
@@ -346,6 +356,23 @@ describe("GithubReviewFixWorker.reconcile", () => {
     expect(outcome).toEqual({ status: "unknown" });
   });
 
+  it("never fabricates run_attempt 1 for a candidate whose run_attempt is missing — stays uncertain", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    const attemptId = "attempt-no-run-attempt";
+    t.setServerRuns([{
+      runId: 1, runAttempt: null,
+      displayTitle: `Claude AI Implementation — review-fix-${SCOPE.prNumber} · attempt ${attemptId}`,
+      headBranch: "main",
+    }]);
+
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
+    const outcome = await worker.reconcile(attemptId, SCOPE);
+
+    expect(outcome).toEqual({ status: "unknown" });
+  });
+
   it("returns unknown when the credential's installation does not match", async () => {
     seedMapping();
     const { resolver } = makeCredentials({ installationId: 999 });
@@ -409,7 +436,7 @@ describe("GithubReviewFixWorker.inspectTerminal", () => {
       displayTitle: "Claude AI Implementation — review-fix-42 · attempt attempt-poll",
       headBranch: "main",
     }]);
-    t.setRunDetail({ status: "in_progress", conclusion: null, runAttempt: 1, headSha: "" });
+    t.setRunDetail({ status: "in_progress", conclusion: null, runAttempt: 1 });
 
     const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
     await worker.reconcile("attempt-poll", SCOPE);
@@ -418,20 +445,41 @@ describe("GithubReviewFixWorker.inspectTerminal", () => {
     expect(inspection).toEqual({ reached: false });
   });
 
-  it("reports a confirmed terminal success with the run's head sha as outputCommit", async () => {
+  it("reports a confirmed terminal success with the PR's current head, not the run's dispatch-time head_sha", async () => {
     seedMapping();
     const { resolver } = makeCredentials();
     const t = makeTransport();
-    const sha = "a".repeat(40);
+    const publishedSha = "a".repeat(40);
     t.setDispatchImpl(async () => ({ success: true, status: 200, outcome: "accepted", runId: 8001 }));
-    t.setRunDetail({ status: "completed", conclusion: "success", runAttempt: 1, headSha: sha });
+    // The run's own record carries no head_sha field at all now — outputCommit must come
+    // exclusively from a live PR read, never from anything reported by getRun.
+    t.setRunDetail({ status: "completed", conclusion: "success", runAttempt: 1 });
+    t.setPullRequestHeadSha(publishedSha);
 
     const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
     const plan = await worker.prepare(makeAttempt({ attemptId: "attempt-success" }));
     await worker.launch(plan);
     const inspection = await worker.inspectTerminal({ githubRunId: 8001, githubRunAttempt: 1 });
 
-    expect(inspection).toEqual({ reached: true, outcome: { status: "succeeded", outputCommit: sha } });
+    expect(inspection).toEqual({ reached: true, outcome: { status: "succeeded", outputCommit: publishedSha } });
+    expect(t.pullRequestHeadShaCalls).toHaveLength(1);
+    expect(t.pullRequestHeadShaCalls[0]).toMatchObject({ prNumber: SCOPE.prNumber });
+  });
+
+  it("does not report succeeded when the PR's head cannot be read", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    t.setDispatchImpl(async () => ({ success: true, status: 200, outcome: "accepted", runId: 8005 }));
+    t.setRunDetail({ status: "completed", conclusion: "success", runAttempt: 1 });
+    t.setPullRequestHeadSha(null);
+
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
+    const plan = await worker.prepare(makeAttempt({ attemptId: "attempt-unreadable-head" }));
+    await worker.launch(plan);
+    const inspection = await worker.inspectTerminal({ githubRunId: 8005, githubRunAttempt: 1 });
+
+    expect(inspection).toEqual({ reached: false });
   });
 
   it("reports confirmed cancelled only once the backend itself is terminal", async () => {
@@ -439,7 +487,7 @@ describe("GithubReviewFixWorker.inspectTerminal", () => {
     const { resolver } = makeCredentials();
     const t = makeTransport();
     t.setDispatchImpl(async () => ({ success: true, status: 200, outcome: "accepted", runId: 8002 }));
-    t.setRunDetail({ status: "completed", conclusion: "cancelled", runAttempt: 1, headSha: "" });
+    t.setRunDetail({ status: "completed", conclusion: "cancelled", runAttempt: 1 });
 
     const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
     const plan = await worker.prepare(makeAttempt({ attemptId: "attempt-cancelled" }));
@@ -447,6 +495,8 @@ describe("GithubReviewFixWorker.inspectTerminal", () => {
     const inspection = await worker.inspectTerminal({ githubRunId: 8002, githubRunAttempt: 1 });
 
     expect(inspection).toEqual({ reached: true, outcome: { status: "cancelled" } });
+    // No PR read for a non-success conclusion.
+    expect(t.pullRequestHeadShaCalls).toHaveLength(0);
   });
 
   it("reports failed with a reason for any other conclusion", async () => {
@@ -454,7 +504,7 @@ describe("GithubReviewFixWorker.inspectTerminal", () => {
     const { resolver } = makeCredentials();
     const t = makeTransport();
     t.setDispatchImpl(async () => ({ success: true, status: 200, outcome: "accepted", runId: 8003 }));
-    t.setRunDetail({ status: "completed", conclusion: "failure", runAttempt: 1, headSha: "" });
+    t.setRunDetail({ status: "completed", conclusion: "failure", runAttempt: 1 });
 
     const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
     const plan = await worker.prepare(makeAttempt({ attemptId: "attempt-failed" }));
@@ -470,7 +520,7 @@ describe("GithubReviewFixWorker.inspectTerminal", () => {
     const t = makeTransport();
     t.setDispatchImpl(async () => ({ success: true, status: 200, outcome: "accepted", runId: 8004 }));
     // GitHub reports a *different* run_attempt (e.g. a manual re-run) as terminal.
-    t.setRunDetail({ status: "completed", conclusion: "success", runAttempt: 2, headSha: "b".repeat(40) });
+    t.setRunDetail({ status: "completed", conclusion: "success", runAttempt: 2 });
 
     const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
     const plan = await worker.prepare(makeAttempt({ attemptId: "attempt-wrong-run-attempt" }));
@@ -478,5 +528,55 @@ describe("GithubReviewFixWorker.inspectTerminal", () => {
     const inspection = await worker.inspectTerminal({ githubRunId: 8004, githubRunAttempt: 1 });
 
     expect(inspection).toEqual({ reached: false });
+  });
+
+  it("never fabricates run_attempt 1 when GitHub's run detail omits it — stays not reached", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    t.setDispatchImpl(async () => ({ success: true, status: 200, outcome: "accepted", runId: 8006 }));
+    t.setRunDetail({ status: "completed", conclusion: "success", runAttempt: null });
+    t.setPullRequestHeadSha("c".repeat(40));
+
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
+    const plan = await worker.prepare(makeAttempt({ attemptId: "attempt-missing-run-attempt" }));
+    await worker.launch(plan);
+    const inspection = await worker.inspectTerminal({ githubRunId: 8006, githubRunAttempt: 1 });
+
+    expect(inspection).toEqual({ reached: false });
+  });
+});
+
+describe("durable scope lookup: cancel/inspectTerminal after adapter reconstruction", () => {
+  it("accepted launch -> fresh adapter sharing only the scope store -> terminal inspection and cancellation against the same persisted execution", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    t.setDispatchImpl(async () => ({ success: true, status: 200, outcome: "accepted", runId: 9200 }));
+    // A durable store shared across adapter instances, standing in for the SQLite/Restate-
+    // object-backed composition a later issue wires in production. workerC below never itself
+    // calls prepare/launch/reconcile — it recovers scope purely from this shared store, the way
+    // a freshly constructed adapter after a process restart would.
+    const sharedScopeStore = workerModule.inMemoryReviewFixWorkerScopeStore();
+
+    const workerA = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport, scopeStore: sharedScopeStore });
+    const attempt = makeAttempt({ attemptId: "attempt-reconstruct" });
+    const plan = await workerA.prepare(attempt);
+    const launchOutcome = await workerA.launch(plan);
+    expect(launchOutcome).toEqual({ status: "accepted", execution: { githubRunId: 9200, githubRunAttempt: 1 } });
+
+    const workerC = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport, scopeStore: sharedScopeStore });
+
+    t.setRunDetail({ status: "in_progress", conclusion: null, runAttempt: 1 });
+    const midInspection = await workerC.inspectTerminal({ githubRunId: 9200, githubRunAttempt: 1 });
+    expect(midInspection).toEqual({ reached: false });
+
+    const cancelOutcome = await workerC.cancel("attempt-reconstruct", { githubRunId: 9200, githubRunAttempt: 1 });
+    expect(cancelOutcome).toEqual({ status: "cancelled" });
+    expect(t.cancelCalls).toHaveLength(1);
+
+    t.setRunDetail({ status: "completed", conclusion: "cancelled", runAttempt: 1 });
+    const terminalInspection = await workerC.inspectTerminal({ githubRunId: 9200, githubRunAttempt: 1 });
+    expect(terminalInspection).toEqual({ reached: true, outcome: { status: "cancelled" } });
   });
 });

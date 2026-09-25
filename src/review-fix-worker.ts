@@ -34,26 +34,29 @@
  * happen; the port's own doc comment states the same rule.
  *
  * `inspectTerminal(execution)` and `cancel(attemptId, execution)` take only an
- * execution identity or attempt id — no scope — so this adapter keeps a small
- * non-authoritative in-memory `attemptId`/execution → scope cache, populated
- * by `prepare`, `launch`, and `reconcile` (all of which see the full scope).
- * SQLite (`ReviewFixAttemptStorePort`) remains the sole authority on
- * occupancy, authority, and results; a cache miss here (e.g. a process
- * restart between binding an execution and later inspecting it) degrades to
- * the safe "not yet reached" / `"unknown"` outcome rather than guessing which
- * repo an execution belongs to.
+ * execution identity or attempt id — no scope — so this adapter routes scope
+ * lookups through an injectable `ReviewFixWorkerScopeStore`, populated by
+ * `prepare`, `launch`, and `reconcile` (all of which see the full scope). The
+ * default implementation is an in-memory map, matching this issue's "no
+ * production wiring" boundary — a later issue composes a durable
+ * implementation so a freshly constructed adapter (e.g. after a process
+ * restart) can still `cancel`/`inspectTerminal` an execution it never itself
+ * saw `prepare`/`reconcile` for, as long as the injected store is shared
+ * across that reconstruction. SQLite (`ReviewFixAttemptStorePort`) remains
+ * the sole authority on occupancy, authority, and results; a store miss here
+ * still degrades to the safe "not yet reached" / `"unknown"` outcome rather
+ * than guessing which repo an execution belongs to.
  *
- * `succeeded` outcomes from `inspectTerminal` carry `outputCommit` sourced
- * from the workflow run's own `head_sha`, which GitHub fixes at dispatch time
- * to the ref's tip — for a gap-fill attempt that checks out and pushes to the
- * existing PR branch from inside the job, this is *not* the commit the runner
- * produces. `review-fix-attempt.ts` cross-checks this value against the
- * runner's own reported `outputCommit` before ever approving, so a mismatch
- * here can only withhold approval, never grant a false one — but it does mean
- * this adapter cannot itself prove a successful gap-fill's output commit from
- * GitHub data alone. Flagged here, not silently assumed away, per the
- * approved seam-test amendment's instruction to surface exactly this kind of
- * gap rather than guess at an unlanded shape.
+ * `succeeded` outcomes from `inspectTerminal` never use the workflow run's own
+ * `head_sha`, which GitHub fixes at dispatch time to the ref's tip — for a
+ * gap-fill attempt that checks out and pushes to the existing PR branch from
+ * inside the job, that value is not the commit the runner produces. Instead,
+ * once GitHub reports the run terminal with `conclusion: "success"`, this
+ * adapter fetches the PR's *current* head SHA directly (`getPullRequestHeadSha`)
+ * and reports that as `outputCommit`. `review-fix-attempt.ts` still cross-checks
+ * this value against the PR's head at approval time before ever approving, so a
+ * PR that moved again after this read can only withhold approval, never grant a
+ * false one.
  */
 import { getInstallation } from "./github-app-auth.js";
 import {
@@ -122,7 +125,10 @@ export function createGithubAppCredentialResolver(appId: string, privateKey: str
 
 export interface ReviewFixWorkerCandidateRun {
   readonly runId: number;
-  readonly runAttempt: number;
+  /** `null` when GitHub's run object omitted `run_attempt` or reported a non-positive-integer
+   *  value — never fabricated as `1`. A candidate with `null` cannot be verified against the
+   *  required identity set and is excluded from matching (see `reconcile`). */
+  readonly runAttempt: number | null;
   readonly displayTitle: string;
   readonly headBranch: string;
 }
@@ -130,8 +136,9 @@ export interface ReviewFixWorkerCandidateRun {
 export interface ReviewFixWorkerRunDetail {
   readonly status: string;
   readonly conclusion: string | null;
-  readonly runAttempt: number;
-  readonly headSha: string;
+  /** `null` under the same missing/invalid condition as `ReviewFixWorkerCandidateRun.runAttempt` —
+   *  never fabricated as `1`. `inspectTerminal` treats `null` as "not verifiably reached". */
+  readonly runAttempt: number | null;
 }
 
 export interface ReviewFixWorkerTransport {
@@ -165,6 +172,16 @@ export interface ReviewFixWorkerTransport {
     readonly repo: string;
     readonly runId: number;
   }): Promise<boolean>;
+
+  /** The PR's current head SHA, read fresh at call time — the sole legitimate source for a
+   *  successful terminal outcome's `outputCommit` (see the module doc comment on why the
+   *  workflow run's own `head_sha` cannot be used for this). `null` when the PR cannot be read. */
+  getPullRequestHeadSha(input: {
+    readonly token: string;
+    readonly owner: string;
+    readonly repo: string;
+    readonly prNumber: number;
+  }): Promise<string | null>;
 }
 
 const GH_API_HEADERS = {
@@ -175,6 +192,12 @@ const GH_API_HEADERS = {
 
 function authHeaders(token: string): Record<string, string> {
   return { ...GH_API_HEADERS, Authorization: `Bearer ${token}` };
+}
+
+/** `null` for anything but a positive integer — never coerces a missing/invalid GitHub
+ *  `run_attempt` field into a fabricated `1`. */
+function parseRunAttempt(value: unknown): number | null {
+  return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : null;
 }
 
 /** Bound on one reconcile query. A genuinely old run beyond the most recent page on this
@@ -208,7 +231,7 @@ export const githubActionsReviewFixWorkerTransport: ReviewFixWorkerTransport = {
     };
     return (data.workflow_runs ?? []).map((run) => ({
       runId: run.id,
-      runAttempt: run.run_attempt ?? 1,
+      runAttempt: parseRunAttempt(run.run_attempt),
       displayTitle: run.display_title ?? "",
       headBranch: run.head_branch ?? "",
     }));
@@ -219,12 +242,20 @@ export const githubActionsReviewFixWorkerTransport: ReviewFixWorkerTransport = {
     const res = await fetch(url, { headers: authHeaders(input.token), signal: defaultFetchSignal() });
     if (res.status === 404) return null;
     if (!res.ok) throw new Error(`getRun failed: HTTP ${res.status}`);
-    const data = (await res.json()) as { status: string; conclusion: string | null; run_attempt?: number; head_sha?: string };
-    return { status: data.status, conclusion: data.conclusion, runAttempt: data.run_attempt ?? 1, headSha: data.head_sha ?? "" };
+    const data = (await res.json()) as { status: string; conclusion: string | null; run_attempt?: number };
+    return { status: data.status, conclusion: data.conclusion, runAttempt: parseRunAttempt(data.run_attempt) };
   },
 
   async cancelRun(input) {
     return cancelWorkflowRun(input.token, input.owner, input.repo, input.runId);
+  },
+
+  async getPullRequestHeadSha(input) {
+    const url = `https://api.github.com/repos/${input.owner}/${input.repo}/pulls/${input.prNumber}`;
+    const res = await fetch(url, { headers: authHeaders(input.token), signal: defaultFetchSignal() });
+    if (!res.ok) return null;
+    const data = (await res.json()) as { head?: { sha?: string } };
+    return typeof data.head?.sha === "string" ? data.head.sha : null;
   },
 };
 
@@ -301,6 +332,50 @@ function buildLaunchInputs(plan: WorkerLaunchPlan, mapping: RepoMapping): Dispat
 const FULL_SHA_PATTERN = /^[0-9a-f]{40}$/;
 
 // ---------------------------------------------------------------------------
+// Scope-routing seam (the durable lookup `cancel`/`inspectTerminal` need)
+// ---------------------------------------------------------------------------
+
+function executionKey(execution: WorkerExecutionIdentity): string {
+  return `${execution.githubRunId}:${execution.githubRunAttempt}`;
+}
+
+/**
+ * Routes `attemptId`/execution identity back to the `ScopedPrIdentity` needed to resolve a
+ * mapping and mint credentials — the port's `cancel`/`inspectTerminal` methods carry neither.
+ * Populated by `prepare`, `launch`, and `reconcile`. Injectable so a later issue can compose a
+ * durable (e.g. SQLite-backed) implementation without this adapter gaining direct storage
+ * access — see the module doc comment. The default is an in-memory map, matching this issue's
+ * "no production wiring" boundary: without an injected durable store, a freshly constructed
+ * adapter still degrades safely to "not yet reached" / `"unknown"` for an execution it never
+ * itself saw `prepare`/`launch`/`reconcile` for.
+ */
+export interface ReviewFixWorkerScopeStore {
+  rememberAttempt(attemptId: AttemptId, scope: ScopedPrIdentity): Promise<void>;
+  rememberExecution(execution: WorkerExecutionIdentity, scope: ScopedPrIdentity): Promise<void>;
+  scopeForAttempt(attemptId: AttemptId): Promise<ScopedPrIdentity | null>;
+  scopeForExecution(execution: WorkerExecutionIdentity): Promise<ScopedPrIdentity | null>;
+}
+
+export function inMemoryReviewFixWorkerScopeStore(): ReviewFixWorkerScopeStore {
+  const byAttempt = new Map<AttemptId, ScopedPrIdentity>();
+  const byExecution = new Map<string, ScopedPrIdentity>();
+  return {
+    async rememberAttempt(attemptId, scope) {
+      byAttempt.set(attemptId, scope);
+    },
+    async rememberExecution(execution, scope) {
+      byExecution.set(executionKey(execution), scope);
+    },
+    async scopeForAttempt(attemptId) {
+      return byAttempt.get(attemptId) ?? null;
+    },
+    async scopeForExecution(execution) {
+      return byExecution.get(executionKey(execution)) ?? null;
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
 // The adapter
 // ---------------------------------------------------------------------------
 
@@ -309,31 +384,32 @@ export interface GithubReviewFixWorkerDeps {
   /** Defaults to `githubActionsReviewFixWorkerTransport`. Overridden by tests with a
    *  controllable double. */
   transport?: ReviewFixWorkerTransport;
+  /** Defaults to a fresh, per-instance `inMemoryReviewFixWorkerScopeStore()`. Share one store
+   *  across adapter instances (tests reconstructing an adapter; a later issue's durable
+   *  composition) to route `cancel`/`inspectTerminal` without a preceding `prepare`/`reconcile`
+   *  on that instance. */
+  scopeStore?: ReviewFixWorkerScopeStore;
 }
 
 export class GithubReviewFixWorker implements ReviewFixWorkerPort {
   private readonly credentials: ReviewFixWorkerCredentialResolver;
   private readonly transport: ReviewFixWorkerTransport;
-  private readonly scopeByAttempt = new Map<AttemptId, ScopedPrIdentity>();
-  private readonly scopeByExecution = new Map<string, ScopedPrIdentity>();
+  private readonly scopeStore: ReviewFixWorkerScopeStore;
 
   constructor(deps: GithubReviewFixWorkerDeps) {
     this.credentials = deps.credentials;
     this.transport = deps.transport ?? githubActionsReviewFixWorkerTransport;
+    this.scopeStore = deps.scopeStore ?? inMemoryReviewFixWorkerScopeStore();
   }
 
-  private executionKey(execution: WorkerExecutionIdentity): string {
-    return `${execution.githubRunId}:${execution.githubRunAttempt}`;
-  }
-
-  private remember(attemptId: AttemptId, scope: ScopedPrIdentity, execution?: WorkerExecutionIdentity): void {
-    this.scopeByAttempt.set(attemptId, scope);
-    if (execution) this.scopeByExecution.set(this.executionKey(execution), scope);
+  private async remember(attemptId: AttemptId, scope: ScopedPrIdentity, execution?: WorkerExecutionIdentity): Promise<void> {
+    await this.scopeStore.rememberAttempt(attemptId, scope);
+    if (execution) await this.scopeStore.rememberExecution(execution, scope);
   }
 
   async prepare(attempt: PreparedReviewFixAttempt): Promise<WorkerLaunchPlan> {
-    // Non-authoritative routing cache only, not a network call — see module doc comment.
-    this.scopeByAttempt.set(attempt.attemptId, attempt.scope);
+    // Non-authoritative routing store only, not a network call — see module doc comment.
+    await this.scopeStore.rememberAttempt(attempt.attemptId, attempt.scope);
     return {
       attemptId: attempt.attemptId,
       scope: attempt.scope,
@@ -378,7 +454,7 @@ export class GithubReviewFixWorker implements ReviewFixWorkerPort {
       // A freshly dispatched run always starts at its first attempt; GitHub's dispatch
       // response carries no run_attempt field of its own to read this from.
       const execution: WorkerExecutionIdentity = { githubRunId: result.runId, githubRunAttempt: 1 };
-      this.remember(plan.attemptId, plan.scope, execution);
+      await this.remember(plan.attemptId, plan.scope, execution);
       return { status: "accepted", execution };
     }
     // A 204/"accepted" response with no resolvable run id cannot be bound to an execution
@@ -411,8 +487,11 @@ export class GithubReviewFixWorker implements ReviewFixWorkerPort {
       return { status: "unknown" };
     }
 
+    // A candidate with no verifiable run_attempt (GitHub omitted or reported an invalid value)
+    // can never satisfy the required "installation/repo/workflow/ref/marker/run_attempt" set as
+    // one exact match — excluded here rather than treated as attempt 1.
     const matches = candidates.filter((run) =>
-      run.headBranch === mapping.defaultBranch && matchesAttemptMarker(run.displayTitle, attemptId));
+      run.runAttempt !== null && run.headBranch === mapping.defaultBranch && matchesAttemptMarker(run.displayTitle, attemptId));
 
     // Exactly one verified match (installation via the credential check above, repo/workflow
     // via the queried endpoint, ref via headBranch, attempt marker via display_title, and
@@ -422,13 +501,13 @@ export class GithubReviewFixWorker implements ReviewFixWorkerPort {
     if (matches.length !== 1) return { status: "unknown" };
 
     const match = matches[0];
-    const execution: WorkerExecutionIdentity = { githubRunId: match.runId, githubRunAttempt: match.runAttempt };
-    this.remember(attemptId, scope, execution);
+    const execution: WorkerExecutionIdentity = { githubRunId: match.runId, githubRunAttempt: match.runAttempt as number };
+    await this.remember(attemptId, scope, execution);
     return { status: "found", execution };
   }
 
   async cancel(attemptId: AttemptId, execution: WorkerExecutionIdentity): Promise<WorkerCancelOutcome> {
-    const scope = this.scopeByAttempt.get(attemptId) ?? this.scopeByExecution.get(this.executionKey(execution));
+    const scope = (await this.scopeStore.scopeForAttempt(attemptId)) ?? (await this.scopeStore.scopeForExecution(execution));
     if (!scope) return { status: "unknown" };
     const mapping = findMapping(scope.repository);
     if (!mapping) return { status: "unknown" };
@@ -457,7 +536,7 @@ export class GithubReviewFixWorker implements ReviewFixWorkerPort {
   }
 
   async inspectTerminal(execution: WorkerExecutionIdentity): Promise<WorkerTerminalInspection> {
-    const scope = this.scopeByExecution.get(this.executionKey(execution));
+    const scope = await this.scopeStore.scopeForExecution(execution);
     if (!scope) return { reached: false };
     const mapping = findMapping(scope.repository);
     if (!mapping) return { reached: false };
@@ -487,8 +566,22 @@ export class GithubReviewFixWorker implements ReviewFixWorkerPort {
 
     if (detail.conclusion === "cancelled") return { reached: true, outcome: { status: "cancelled" } };
     if (detail.conclusion === "success") {
-      if (!FULL_SHA_PATTERN.test(detail.headSha)) return { reached: false };
-      return { reached: true, outcome: { status: "succeeded", outputCommit: detail.headSha } };
+      // The run's own head_sha is fixed at dispatch time and is never the commit a gap-fill
+      // attempt pushes — the PR's current head, read fresh here, is the only legitimate source
+      // for outputCommit. See the module doc comment.
+      let prHeadSha: string | null;
+      try {
+        prHeadSha = await this.transport.getPullRequestHeadSha({
+          token: credential.token,
+          owner: mapping.owner,
+          repo: mapping.repo,
+          prNumber: scope.prNumber,
+        });
+      } catch {
+        return { reached: false };
+      }
+      if (prHeadSha === null || !FULL_SHA_PATTERN.test(prHeadSha)) return { reached: false };
+      return { reached: true, outcome: { status: "succeeded", outputCommit: prHeadSha } };
     }
     return { reached: true, outcome: { status: "failed", reason: detail.conclusion ?? "unknown conclusion" } };
   }
