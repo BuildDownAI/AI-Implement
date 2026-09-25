@@ -143,12 +143,20 @@ export function getDb(): Database.Database {
         line INTEGER,
         url TEXT,
         status TEXT NOT NULL DEFAULT 'open',
+        revision INTEGER NOT NULL DEFAULT 1,
         first_seen_at INTEGER NOT NULL,
         last_seen_at INTEGER NOT NULL,
         resolved_at INTEGER,
         UNIQUE (repo, pr_number, finding_key)
       )
     `);
+    // Existing finding identities and history remain untouched. SQLite fills
+    // the new version field as 1 for old rows without a rewrite or backfill.
+    const findingColumns = new Set((db.prepare("PRAGMA table_info(review_findings)").all() as Array<{ name: string }>)
+      .map((column) => column.name));
+    if (!findingColumns.has("revision")) {
+      db.exec("ALTER TABLE review_findings ADD COLUMN revision INTEGER NOT NULL DEFAULT 1");
+    }
     db.exec(`CREATE INDEX IF NOT EXISTS idx_review_findings_open ON review_findings(repo, pr_number, status)`);
     db.exec(`
       CREATE TABLE IF NOT EXISTS review_fix_queue (
@@ -235,6 +243,63 @@ export function getDb(): Database.Database {
     `);
     db.exec(`CREATE INDEX IF NOT EXISTS idx_dispatch_budget_entries_pr_window
       ON dispatch_budget_entries(repository, pr_number, created_at)`);
+    // AII-774: immutable attempt snapshots and authenticated event inbox. No
+    // consumer is wired here; accepted deliveries retain identity tombstones.
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS review_fix_attempts (
+        attempt_id TEXT PRIMARY KEY,
+        dispatch_id TEXT NOT NULL UNIQUE,
+        mapping_key TEXT NOT NULL,
+        installation_id TEXT NOT NULL,
+        repository TEXT NOT NULL,
+        pr_number INTEGER NOT NULL,
+        issue_scope TEXT NOT NULL,
+        issue_id TEXT NOT NULL,
+        owner TEXT NOT NULL,
+        state TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        deadline_at INTEGER NOT NULL,
+        authority_revoked_at INTEGER,
+        github_run_id INTEGER,
+        github_run_attempt INTEGER,
+        task_snapshot_json TEXT NOT NULL,
+        finding_versions_json TEXT NOT NULL,
+        accepted_result_json TEXT,
+        accepted_result_hash TEXT,
+        result_conflict_at INTEGER,
+        terminal_outcome_json TEXT,
+        completed_at INTEGER,
+        CHECK ((github_run_id IS NULL) = (github_run_attempt IS NULL)),
+        CHECK ((accepted_result_json IS NULL) = (accepted_result_hash IS NULL))
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_review_fix_attempts_pr_history
+      ON review_fix_attempts(installation_id, repository, pr_number, created_at)`);
+    db.exec(`CREATE TRIGGER IF NOT EXISTS trg_review_fix_attempt_owner_immutable
+      BEFORE UPDATE OF owner ON review_fix_attempts
+      WHEN NEW.owner <> OLD.owner
+      BEGIN SELECT RAISE(ABORT, 'review-fix attempt owner is immutable'); END`);
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS review_fix_inbox (
+        authenticated_source TEXT NOT NULL,
+        event_id TEXT NOT NULL,
+        installation_id TEXT NOT NULL,
+        repository TEXT NOT NULL,
+        pr_number INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        payload_hash TEXT NOT NULL,
+        accepted_at INTEGER NOT NULL,
+        delivery_state TEXT NOT NULL DEFAULT 'pending',
+        retry_at INTEGER,
+        delivered_at INTEGER,
+        PRIMARY KEY (authenticated_source, event_id)
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_review_fix_inbox_due
+      ON review_fix_inbox(delivery_state, retry_at, accepted_at)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_review_fix_inbox_pr
+      ON review_fix_inbox(installation_id, repository, pr_number, accepted_at)`);
     db.exec(`
       CREATE TABLE IF NOT EXISTS comment_gapfill_queue (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
