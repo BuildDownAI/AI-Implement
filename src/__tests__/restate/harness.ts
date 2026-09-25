@@ -3,6 +3,9 @@
 // helper — it imports them from here. See docs/restate.md § Testing for the rule.
 import { RestateContainer, RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
 import type { ServiceDefinition, VirtualObjectDefinition, WorkflowDefinition } from "@restatedev/restate-sdk-testcontainers";
+import { createEndpointHandler } from "@restatedev/restate-sdk/node";
+import * as http2 from "node:http2";
+import type { AddressInfo } from "node:net";
 
 // Pinned (not `latest`) to match the image cached by .github/workflows/unit-tests.yml's
 // restate-tests job (`RESTATE_IMAGE_TAG`), which keys its image cache on this same value.
@@ -34,6 +37,31 @@ export async function startVariants(services: RestateServices): Promise<Map<stri
     }),
   );
   return new Map(started);
+}
+
+/** Fault-injection scenarios need the engine's normal retry policy. Disk storage
+ * keeps the same journal across a restart of the pinned sidecar container. */
+export function startRetryEnabled(services: RestateServices): Promise<RestateTestEnvironment> {
+  return RestateTestEnvironment.start({
+    services,
+    storage: "disk",
+    container: () => new RestateContainer(RESTATE_IMAGE_VERSION),
+  });
+}
+
+/** Replace only the SDK endpoint, keeping the Restate container and its journal.
+ * A sidecar restart after this closes its old HTTP/2 sessions and reconnects to
+ * the replacement endpoint at the same address. */
+export async function replaceEndpoint(env: RestateTestEnvironment, services: RestateServices): Promise<http2.Http2Server> {
+  const old = env.startedRestateHttpServer;
+  const address = old.address() as AddressInfo;
+  old.close();
+  const replacement = http2.createServer(createEndpointHandler({ services }));
+  await new Promise<void>((resolve, reject) => {
+    replacement.once("error", reject);
+    replacement.listen(address.port, address.address, resolve);
+  });
+  return replacement;
 }
 
 export async function stopAll(environments: Map<string, RestateTestEnvironment>): Promise<void> {
@@ -76,6 +104,12 @@ export async function callObject<T>(baseUrl: string, object: string, key: string
   return post<T>(`${baseUrl}/${object}/${encodeURIComponent(key)}/${handler}`, `${object}/${key}/${handler}`, body);
 }
 
-export async function callWorkflow<T>(baseUrl: string, workflow: string, key: string, handler: string): Promise<T> {
-  return post<T>(`${baseUrl}/${workflow}/${key}/${handler}`, `${workflow}/${key}/${handler}`, "{}");
+export async function callWorkflow<T>(baseUrl: string, workflow: string, key: string, handler: string, body: unknown = {}): Promise<T> {
+  return post<T>(`${baseUrl}/${workflow}/${encodeURIComponent(key)}/${handler}`, `${workflow}/${key}/${handler}`, body);
+}
+
+export async function attachWorkflow<T>(baseUrl: string, workflow: string, key: string): Promise<T> {
+  return post<T>(`${baseUrl}/restate/attach`, `${workflow}/${key}/attach`, {
+    target: "workflow", workflowName: workflow, workflowKey: key,
+  });
 }
