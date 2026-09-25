@@ -686,6 +686,26 @@ describe("job drawer restate attempt section", () => {
     expect(doc.getElementById("drawer-pilot-activity")!.textContent).not.toContain("second page payload");
   });
 
+  it("discards an old page after closing and reopening the same job", async () => {
+    const { win, doc } = mountPilotDrawer({ job: PILOT_JOB, attemptStatus: 200, attempt: pilotAttemptFixture() });
+    const api = win.api;
+    let finish!: (page: unknown) => void;
+    win.api = async (url: string, options?: unknown) => {
+      if (url.includes("/activity") && url.includes("cursorProducerId")) {
+        return new Promise((resolve) => { finish = (page) => resolve({ ok: true, status: 200, json: async () => page }); });
+      }
+      return api(url, options);
+    };
+    await win.openJobDrawer(10);
+    const pending = (doc.getElementById("drawer-pilot-activity-more") as unknown as { onclick: () => Promise<void> }).onclick();
+    win.closeJobDrawer();
+    await win.openJobDrawer(10);
+    finish(ACTIVITY_PAGE_2);
+    await pending;
+    expect(doc.getElementById("drawer-pilot-activity")!.textContent).not.toContain("second page payload");
+    win.closeJobDrawer();
+  });
+
   it("does not mix an old job's late activity page into a new job", async () => {
     const { win, doc } = mountPilotDrawer({ job: PILOT_JOB, attemptStatus: 200, attempt: pilotAttemptFixture() });
     const api = win.api;

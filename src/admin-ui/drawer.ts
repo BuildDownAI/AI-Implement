@@ -71,6 +71,7 @@ export const drawerScript = `
   let pilotActivityTruncated = false;
   let pilotActivityLoaded = false;
   let pilotActivityUnavailable = false;
+  let pilotGeneration = 0;
 
   function isTerminalJobStatus(status) {
     return status === 'completed' || status === 'failed' || status === 'timed_out' || status === 'review_failed' || status === 'dispatch-failed';
@@ -583,6 +584,7 @@ export const drawerScript = `
   // timeline page).
 
   function resetPilotState() {
+    pilotGeneration++;
     currentAttemptId = null;
     pilotActivityEvents = [];
     pilotActivityCursor = null;
@@ -808,8 +810,9 @@ export const drawerScript = `
     if (!currentAttemptId || !pilotActivityCursor) return;
     const attemptId = currentAttemptId;
     const jobId = currentJobId;
+    const generation = pilotGeneration;
     const page = await fetchReviewFixActivityPage(attemptId, pilotActivityCursor);
-    if (currentJobId !== jobId || currentAttemptId !== attemptId) return;
+    if (currentJobId !== jobId || currentAttemptId !== attemptId || pilotGeneration !== generation) return;
     if (!page) {
       pilotActivityUnavailable = true;
       renderPilotActivity();
@@ -826,8 +829,9 @@ export const drawerScript = `
     if (!currentAttemptId) return;
     const attemptId = currentAttemptId;
     const jobId = currentJobId;
+    const generation = pilotGeneration;
     const page = await fetchReviewFixActivityPage(attemptId, null);
-    if (currentJobId !== jobId || currentAttemptId !== attemptId) return;
+    if (currentJobId !== jobId || currentAttemptId !== attemptId || pilotGeneration !== generation) return;
     if (!page) {
       pilotActivityUnavailable = true;
     } else {
@@ -945,6 +949,7 @@ export const drawerScript = `
     }
     const isNewAttempt = currentAttemptId !== job.dispatchId;
     if (isNewAttempt) {
+      pilotGeneration++;
       currentAttemptId = job.dispatchId;
       pilotActivityEvents = [];
       pilotActivityCursor = null;
@@ -952,8 +957,9 @@ export const drawerScript = `
       pilotActivityLoaded = false;
       pilotActivityUnavailable = false;
     }
+    const generation = pilotGeneration;
     const result = await fetchReviewFixAttempt(job.dispatchId);
-    if (currentJobId !== job.id || currentAttemptId !== job.dispatchId) return;
+    if (currentJobId !== job.id || currentAttemptId !== job.dispatchId || pilotGeneration !== generation) return;
     if (result.kind === 'none' || result.kind === 'error') {
       hidePilotSection();
       return;
@@ -990,7 +996,7 @@ export const drawerScript = `
     if (isNewAttempt || !document.getElementById('drawer-pilot-action-status')) renderPilotActions(job.dispatchId);
     if (!pilotActivityLoaded || !background) {
       await loadFirstPilotActivity();
-      if (currentJobId !== job.id || currentAttemptId !== job.dispatchId) return;
+      if (currentJobId !== job.id || currentAttemptId !== job.dispatchId || pilotGeneration !== generation) return;
       renderPilotActivity();
     } else {
       // A temporary attempt-read outage clears the section's markup above. Restore
