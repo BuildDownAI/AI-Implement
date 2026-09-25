@@ -46,6 +46,13 @@ export interface ReviewFixAttemptDependencies {
   /** Production composition registers ReviewFixPR beside this workflow. Keep
    * disabled for isolated workflow tests that register only ReviewFixAttempt. */
   notifyPrOnCompletion?: boolean;
+  /** Overrides `REVIEW_FIX_UNKNOWN_LAUNCH_ALERT_MINUTES` (in milliseconds) for the
+   * uncertain-launch alert threshold. Production composition must leave this unset
+   * so the real two-minute threshold applies; a test exercising the alert
+   * deterministically (rather than waiting two real minutes) supplies a short
+   * value here, the same way a short `jobTimeoutMinutes` on an admission request
+   * shrinks `deadlineAt` without touching the production buffer constant. */
+  unknownLaunchAlertMs?: number;
 }
 
 type Wake =
@@ -80,8 +87,9 @@ function sameScope(a: PreparedReviewFixAttempt, b: ReviewFixResultMetadataV1): b
  * endpoint with these same durable doubles must not erase the admitted attempt. */
 export function createReviewFixAttempt(deps: ReviewFixAttemptDependencies) {
   const { store, worker, finalizer } = deps;
+  const unknownLaunchAlertMs = deps.unknownLaunchAlertMs ?? REVIEW_FIX_UNKNOWN_LAUNCH_ALERT_MINUTES * 60_000;
 
-  async function alert(ctx: WorkflowContext, attemptId: AttemptId, reason: string, step: string): Promise<void> {
+  async function alert(ctx: WorkflowSharedContext, attemptId: AttemptId, reason: string, step: string): Promise<void> {
     await ctx.run(step, async () => {
       if (deps.alert) await deps.alert(attemptId, reason);
       else console.warn(`[review-fix] ${attemptId}: ${reason}`);
@@ -159,7 +167,7 @@ export function createReviewFixAttempt(deps: ReviewFixAttemptDependencies) {
         // Even an empty exact search cannot prove the dispatch never started.
         // A deadline or cancellation revokes authority, not occupancy.
         const now = await ctx.date.now();
-        if (!warned && now - unknownSince >= REVIEW_FIX_UNKNOWN_LAUNCH_ALERT_MINUTES * 60_000) {
+        if (!warned && now - unknownSince >= unknownLaunchAlertMs) {
           await alert(ctx, attemptId, "launch identity still unresolved; occupancy retained", "alert-unknown-launch");
           warned = true;
         }
@@ -291,6 +299,12 @@ export function createReviewFixAttempt(deps: ReviewFixAttemptDependencies) {
       if (await cancellation.peek() === undefined) await cancellation.resolve(true);
       const wake = ctx.promise<Wake>("wake");
       if (await wake.peek() === undefined) await wake.resolve({ kind: "conflict" });
+    } else if (outcome.status === "stale") {
+      // A stale result after the final outcome is already recorded (store.recordResult
+      // returns "stale" only once the dispatch is inactive or the row is already
+      // finalized) must never rewrite that outcome — this branch does nothing to
+      // durable state beyond the alert itself, which is the only required signal.
+      await alert(ctx, attemptId, `stale result rejected: ${outcome.reason}`, "alert-stale-result");
     }
     return outcome;
   }

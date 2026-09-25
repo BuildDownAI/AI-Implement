@@ -68,6 +68,30 @@ export async function stopAll(environments: Map<string, RestateTestEnvironment>)
   await Promise.all([...environments.values()].map((env) => env.stop()));
 }
 
+/**
+ * Wraps an async external effect so its first call performs the real effect and then
+ * throws, simulating the "commit/dispatch/write succeeded but the caller crashed before
+ * observing the acknowledgement" window a fault-injection scenario needs: the durable
+ * `ctx.run` step this effect lives in sees a thrown error and the engine retries it, so
+ * the assertion is "did the effect run exactly once, and did the retry reconcile instead
+ * of repeating it" — never a journal internal. Every call after the first behaves
+ * normally, so a scenario that also needs the effect's eventual real return value
+ * (e.g. to keep driving the same fixture) still gets it on the retried attempt.
+ */
+export function crashAfterFirstCall<Args extends unknown[], R>(
+  effect: (...args: Args) => Promise<R>,
+): (...args: Args) => Promise<R> {
+  let crashed = false;
+  return async (...args: Args): Promise<R> => {
+    const result = await effect(...args);
+    if (!crashed) {
+      crashed = true;
+      throw new Error("injected crash: effect committed, caller never observed the response");
+    }
+    return result;
+  };
+}
+
 // A `void` handler answers with an empty body on success. Reading response.text() first
 // (rather than calling response.json() directly) lets an empty 2xx body resolve to
 // `undefined` instead of throwing a JSON-parse error — the AII-709 regression: its
