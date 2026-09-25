@@ -1,0 +1,16 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "declaration": false
+  },
+  "include": [
+    "src/review-fix-finalize.ts",
+    "src/review-fix-ports.ts",
+    "src/review-fix-contract.ts",
+    "src/review-fix-attempt-store.ts",
+    "src/review-fix-inbox.ts",
+    "src/__tests__/review-fix-finalize.test.ts"
+  ],
+  "exclude": []
+}
