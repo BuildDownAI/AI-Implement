@@ -2,6 +2,7 @@ import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import http from "node:http";
+import crypto from "node:crypto";
 import {
   getMappings,
   initMappingsTable,
@@ -9,10 +10,19 @@ import {
 } from "./config.js";
 import type { RepoMapping } from "./config.js";
 import { markDispatched, closeDb, getDispatchedIds, deleteDispatched } from "./dedup.js";
-import { canDispatch, type DispatchKind } from "./dispatch-gate.js";
+import { canDispatch, acquireDispatch, type DispatchKind, type AcquireDispatchOutcome } from "./dispatch-gate.js";
+import {
+  acquire as acquireAdmission,
+  count as countAdmissionReservations,
+  sweepStaleAdmissions,
+  reconcileTerminalCallbackAdmissions,
+  read as readAdmission,
+  release as releaseAdmission,
+  type StaleAdmissionCandidate,
+} from "./dispatch-admission.js";
 import { reconcileFilesystemFailures } from "./filesystem-ticket-lifecycle.js";
-import { dispatchWorkflow, postWorkflowDispatch, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, getPullRequestState, buildEnvelopeDispatchInputs, postPrComment, defaultFetchSignal, getRepoDefaultBranch, buildKgRefreshGhaDispatchBody, pollForKgWorkflowRunId } from "./github.js";
-import { resolveWorkflowCapabilities, resolveWorkflowContract } from "./workflow-probe.js";
+import { dispatchWorkflow, postWorkflowDispatch, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, getPullRequestState, buildEnvelopeDispatchInputs, postPrComment, defaultFetchSignal, getRepoDefaultBranch, buildKgRefreshGhaDispatchBody, pollForKgWorkflowRunId, type DispatchInputs } from "./github.js";
+import { resolveWorkflowCapabilities, resolveWorkflowContract, type WorkflowContract } from "./workflow-probe.js";
 import { surfaceDispatchFailure } from "./dispatch-failure.js";
 import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
 import { dispatchLocalGapfill } from "./local-gapfill.js";
@@ -30,10 +40,10 @@ import { canSelfDeploy, makeStartDeploy, readKgSourceRepo, parseKgSourceRepo } f
 import { remediateStuckJob, remediateFailedJob } from "./stuck-watchdog.js";
 import type { StuckWatchdogConfig } from "./stuck-watchdog.js";
 import { handleAdminRequest } from "./admin.js";
-import { initLogTable, appendLog, countPriorDispatches, completeOrphanedPlanningJobs, attachJobRunIdIfMissing, updateJobRunId, updateJobStatus, updateJobPrUrl, updateJobMachineDetails, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobById, getJobByMachineId, resetStuckAttempts, getRecentFailedRunUrls } from "./log.js";
-import { recordDispatchFailure, recordDispatchSuccess, shouldCountFailure, initDispatchBreakerTable, parkIssue, prBudgetParkMessage } from "./dispatch-breaker.js";
+import { initLogTable, appendLog, countPriorDispatches, completeOrphanedPlanningJobs, attachJobRunIdIfMissing, updateJobRunId, updateJobStatus, updateJobPrUrl, updateJobMachineDetails, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobById, getJobByMachineId, getJobByDispatchId, resetStuckAttempts, getRecentFailedRunUrls } from "./log.js";
+import { recordDispatchFailure, recordDispatchSuccess, shouldCountFailure, initDispatchBreakerTable, parkIssue, prBudgetParkMessage, isParked } from "./dispatch-breaker.js";
 import type { Job, JobStatus } from "./log.js";
-import { getInstallationToken, getAppSlug } from "./github-app-auth.js";
+import { getInstallationToken, getInstallationId, getAppSlug } from "./github-app-auth.js";
 import { configureLinearAuth } from "./linear-app-auth.js";
 import { configureOAuthProviders, isOAuthConfigured, providersFromEnv } from "./oauth/providers.js";
 import { handleOAuthCallback, handleOAuthLogout, handleOAuthProviders, handleOAuthStart } from "./oauth/routes.js";
@@ -496,8 +506,12 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
       }
       return acc;
     }, {});
+    // Tracker-label counts are retained as a diagnostic only — see the poll() call to
+    // selectIssuesToDispatch below, which now sizes slots from the DB-backed
+    // dispatch_admissions count (src/dispatch-admission.ts) rather than this snapshot.
     const inProgressCountsByTeam = inProgressCountsByScope;
     console.log(`[poll] Found ${needsPlanning.length} needing planning, ${readyForImplementation.length} ready for implementation`);
+    console.log(`[poll] Tracker-label in-progress counts (diagnostic only, not admission authority): ${JSON.stringify(inProgressCountsByTeam)}`);
 
     // Build the dispatch view of mappings: hide paused ones so the poller
     // skips them entirely (no new dispatches, no planning, no gap-fill). The
@@ -578,12 +592,21 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
       console.log(`[deploy] Dispatch paused — ${allCandidates.length} candidate(s) stay queued`);
     }
 
+    // Slot sizing for this tick's selection comes from the DB-backed dispatch_admissions
+    // count, not the tracker-label snapshot above — this is only a soft pre-filter for how
+    // many candidates to attempt; acquireDispatch's transaction is the real authority at
+    // dispatch time, per-issue, right before launch.
+    const admissionCountsByTeam: Record<string, number> = {};
+    for (const teamKey of Object.keys(teamRepoMap)) {
+      admissionCountsByTeam[teamKey] = countAdmissionReservations(teamKey);
+    }
+
     const toProcess = deployHeld
       ? []
       : selectIssuesToDispatch(
           allCandidates,
           teamRepoMap,
-          inProgressCountsByTeam,
+          admissionCountsByTeam,
           isDispatchBlocked,
         );
 
@@ -631,7 +654,9 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
         const isPlanning = needsPlanningIds.has(issue.id) && mapping.planningEnabled;
 
         if (isPlanning) {
-          await dispatchPlanning(config, issueProvider, issue, mapping);
+          const planningCtx = await preparePlanningDispatch(config, issueProvider, issue, mapping);
+          if (!planningCtx) continue;
+          await dispatchPlanning(config, issueProvider, issue, mapping, planningCtx);
         } else {
           const prior = countPriorDispatches(issue.id, "implementation");
 
@@ -774,6 +799,31 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
     failKgRefreshMachine: (_job, opts) => { activeKgRefresh?.onMachineLost(opts); },
   });
 
+  // Reconciliation for admission reservations whose launch response or process was lost
+  // (AII-783 review): a committed reservation with no confirmed release eventually frees
+  // its slot here, mirroring the reaper's own machine max-age sweep above. Each candidate
+  // is checked against its actual backend state before release — age alone is not proof
+  // of termination (PR #681 review).
+  for (const released of await sweepStaleAdmissions((candidate) => confirmAdmissionTerminated(config, candidate))) {
+    console.log(
+      `[admission] released stale reservation dispatch=${released.dispatchId} mapping=${released.mappingKey} age_ms=${released.ageMs}`,
+    );
+  }
+
+  // Per-poll reconciliation for the two terminal callback conclusions that deliberately
+  // hold their reservation via skipAdmissionRelease (planning_callback, operator_cancelled
+  // — AII-783 review, third round, on PR #681): both callbacks self-report from inside the
+  // still-running backend and their write drops the job out of getInFlightJobs()'s tracked
+  // set, so besides this, only the 6-hour stale-admission sweep above would ever notice the
+  // backend has since exited. No age floor — eligibility is "terminal callback conclusion,
+  // still reserved," re-checked fresh every poll — and each candidate goes through the same
+  // confirmAdmissionTerminated oracle before release.
+  for (const released of await reconcileTerminalCallbackAdmissions((candidate) => confirmAdmissionTerminated(config, candidate))) {
+    console.log(
+      `[admission] released terminal-callback reservation dispatch=${released.dispatchId} mapping=${released.mappingKey} conclusion=${released.conclusion}`,
+    );
+  }
+
   // Guaranteed (webhook-independent) merge detector: enqueue reconciliations
   // for merged PRs the webhook may have missed.
   await detectMergedPrs({
@@ -804,6 +854,7 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
       runnerCallbackBaseUrl: config.runnerCallbackBaseUrl,
       runnerTokenSecret: config.runnerTokenSecret,
       getInstallationToken: (owner) => getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner),
+      getInstallationId: (owner) => getInstallationId(config.githubAppId, config.githubAppPrivateKey, owner),
       resolveRunnerImage: (mapping, ghToken) => resolveDispatchRunnerImage(config, mapping, ghToken),
       checkContract: (params) => resolveWorkflowCapabilities(params),
       dispatch: dispatchWorkflow,
@@ -963,7 +1014,10 @@ async function resolveDispatchRunnerImage(
   });
 }
 
-async function dispatchGitHubActions(
+// Exported for direct testing of the pre-launch-failure release path — see
+// "real entry-point/monitor regressions" in dispatch-routing.test.ts. Not part of the
+// module's public API otherwise; every production call site is within this file.
+export async function dispatchGitHubActions(
   config: AppConfig,
   provider: TicketingProvider,
   issue: DispatchableIssue,
@@ -975,101 +1029,140 @@ async function dispatchGitHubActions(
    *  from baseBranch, which also covers the feature-branch-grouping fallback. */
   baseBranchFieldValue: string | null,
 ): Promise<void> {
-  const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
-
-  let runnerCallbackUrl = "";
-  let runToken = "";
-  let runProgressToken = "";
-  let dispatchId: string | undefined;
-  if (config.runnerCallbackBaseUrl && config.runnerTokenSecret) {
-    const minted = mintRunToken({
-      issueId: issue.id,
-      mappingTeamKey: issue.scopeKey,
-      phase: "implementation",
-      audience: "result",
-      ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
-      secret: config.runnerTokenSecret,
-    });
-    dispatchId = minted.dispatchId;
-    const progressMinted = mintRunToken({
-      issueId: issue.id,
-      mappingTeamKey: issue.scopeKey,
-      phase: "implementation",
-      audience: "progress",
-      dispatchId,
-      ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
-      secret: config.runnerTokenSecret,
-    });
-    runnerCallbackUrl = config.runnerCallbackBaseUrl;
-    runToken = minted.token;
-    runProgressToken = progressMinted.token;
-  }
-
-  const runnerImage = await resolveDispatchRunnerImage(config, mapping, ghToken);
+  // Final admission authority: one transaction reserves team capacity and per-issue
+  // occupancy before any credential mint or launch call. canDispatch (checked earlier,
+  // in poll()) is only the preview.
+  const dispatchId = crypto.randomUUID();
+  const admission = acquireDispatch({
+    dispatchId,
+    issueId: issue.id,
+    issueIdentifier: issue.identifier,
+    kind: "implementation",
+    teamKey: issue.scopeKey,
+    maxInProgressAiIssues: mapping.maxInProgressAiIssues,
+    backend: "github-actions",
+  });
+  if (!admission.ok) return;
 
   // True whenever base_branch is forwarded as a legacy workflow input — set by the
   // field OR by feature-branch grouping. Used only to attribute a 422 below.
   const implSentBaseBranch = baseBranch !== mapping.defaultBranch;
 
-  const workflowCapabilities = await resolveWorkflowCapabilities({
+  // Everything below is pure prep — no launch call has fired yet. A throw anywhere in
+  // here (e.g. an installation-token mint failure) is by construction a definitive
+  // non-launch, so it's wrapped in one block and released unconditionally, unlike the
+  // postWorkflowDispatch call after it, whose failure modes are deliberately not all
+  // treated as definitive (see the comment below).
+  const { ghToken, runnerImage, contract, dispatchInputs } =
+    await (async () => {
+      const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
+
+      let runnerCallbackUrl = "";
+      let runToken = "";
+      let runProgressToken = "";
+      if (config.runnerCallbackBaseUrl && config.runnerTokenSecret) {
+        const minted = mintRunToken({
+          issueId: issue.id,
+          mappingTeamKey: issue.scopeKey,
+          phase: "implementation",
+          audience: "result",
+          dispatchId,
+          ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
+          secret: config.runnerTokenSecret,
+        });
+        const progressMinted = mintRunToken({
+          issueId: issue.id,
+          mappingTeamKey: issue.scopeKey,
+          phase: "implementation",
+          audience: "progress",
+          dispatchId,
+          ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
+          secret: config.runnerTokenSecret,
+        });
+        runnerCallbackUrl = config.runnerCallbackBaseUrl;
+        runToken = minted.token;
+        runProgressToken = progressMinted.token;
+      }
+
+      const runnerImage = await resolveDispatchRunnerImage(config, mapping, ghToken);
+
+      const workflowCapabilities = await resolveWorkflowCapabilities({
+        owner: mapping.owner,
+        repo: mapping.repo,
+        workflowFile: mapping.workflowFile,
+        token: ghToken,
+        ref: mapping.defaultBranch,
+      });
+      const { contract } = workflowCapabilities;
+      const runPublicationToken = contract === "envelope"
+        && workflowCapabilities.supportsRunPublicationToken
+        && dispatchId
+        && config.runnerCallbackBaseUrl
+        && config.runnerTokenSecret
+        ? mintRunToken({
+            issueId: issue.id,
+            mappingTeamKey: issue.scopeKey,
+            phase: "implementation",
+            audience: "publication",
+            dispatchId,
+            repository: `${mapping.owner}/${mapping.repo}`,
+            ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
+            secret: config.runnerTokenSecret,
+          }).token
+        : undefined;
+
+      const dispatchInputs = contract === "envelope"
+        ? buildEnvelopeDispatchInputs(mapping, issue, {
+            runnerPhase: "implementation",
+            baseBranch: baseBranch !== mapping.defaultBranch ? baseBranch : undefined,
+            runnerCallbackUrl: runnerCallbackUrl || undefined,
+            runToken,
+            runProgressToken,
+            runPublicationToken,
+            runnerImage,
+            groupingParent: isGroupingParentDispatch(issue) || undefined,
+            retryPolicy: getRetryPolicy(),
+          })
+        : {
+            issue_id: issue.id,
+            issue_identifier: issue.identifier,
+            issue_title: issue.title,
+            issue_description: issue.description || issue.title,
+            runner_phase: "implementation" as const,
+            ...providerDispatchFields(mapping),
+            // Only forward base_branch when grouping moved it off the repo default: GitHub
+            // rejects unknown workflow_dispatch inputs (422), so target repos that haven't
+            // re-synced the workflow keep working for the common (non-grouped) path.
+            ...(baseBranch !== mapping.defaultBranch ? { base_branch: baseBranch } : {}),
+            ...capDispatchFields(mapping),
+            ...branchPrefixDispatchFields(mapping),
+            ...skillsRepoDispatchFields(mapping),
+            ...profilesDispatchFields(issue),
+            runner_callback_url: runnerCallbackUrl,
+            run_token: runToken,
+            run_progress_token: runProgressToken,
+            ...(runnerImage ? { runner_image: runnerImage } : {}),
+          };
+
+      return { ghToken, runnerCallbackUrl, runToken, runProgressToken, runnerImage, contract, dispatchInputs };
+    })().catch((err) => {
+      admission.release("launch_rejected");
+      throw err;
+    });
+
+  // returnRunDetails (AII-778) gets us result.outcome: "rejected" means GitHub's API
+  // itself refused the request (a 4xx before any run started) — the one signal precise
+  // enough to treat as a definitive non-launch. Anything else (a thrown network error,
+  // a 5xx, "unknown") stays uncertain and must not release the reservation below.
+  const result = await postWorkflowDispatch({
+    token: ghToken,
     owner: mapping.owner,
     repo: mapping.repo,
     workflowFile: mapping.workflowFile,
-    token: ghToken,
     ref: mapping.defaultBranch,
+    inputs: dispatchInputs,
+    returnRunDetails: true,
   });
-  const { contract } = workflowCapabilities;
-  const runPublicationToken = contract === "envelope"
-    && workflowCapabilities.supportsRunPublicationToken
-    && dispatchId
-    && config.runnerCallbackBaseUrl
-    && config.runnerTokenSecret
-    ? mintRunToken({
-        issueId: issue.id,
-        mappingTeamKey: issue.scopeKey,
-        phase: "implementation",
-        audience: "publication",
-        dispatchId,
-        repository: `${mapping.owner}/${mapping.repo}`,
-        ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
-        secret: config.runnerTokenSecret,
-      }).token
-    : undefined;
-
-  const dispatchInputs = contract === "envelope"
-    ? buildEnvelopeDispatchInputs(mapping, issue, {
-        runnerPhase: "implementation",
-        baseBranch: baseBranch !== mapping.defaultBranch ? baseBranch : undefined,
-        runnerCallbackUrl: runnerCallbackUrl || undefined,
-        runToken,
-        runProgressToken,
-        runPublicationToken,
-        runnerImage,
-        groupingParent: isGroupingParentDispatch(issue) || undefined,
-        retryPolicy: getRetryPolicy(),
-      })
-    : {
-        issue_id: issue.id,
-        issue_identifier: issue.identifier,
-        issue_title: issue.title,
-        issue_description: issue.description || issue.title,
-        runner_phase: "implementation" as const,
-        ...providerDispatchFields(mapping),
-        // Only forward base_branch when grouping moved it off the repo default: GitHub
-        // rejects unknown workflow_dispatch inputs (422), so target repos that haven't
-        // re-synced the workflow keep working for the common (non-grouped) path.
-        ...(baseBranch !== mapping.defaultBranch ? { base_branch: baseBranch } : {}),
-        ...capDispatchFields(mapping),
-        ...branchPrefixDispatchFields(mapping),
-        ...skillsRepoDispatchFields(mapping),
-        ...profilesDispatchFields(issue),
-        runner_callback_url: runnerCallbackUrl,
-        run_token: runToken,
-        run_progress_token: runProgressToken,
-        ...(runnerImage ? { runner_image: runnerImage } : {}),
-      };
-
-  const result = await dispatchWorkflow(ghToken, mapping, dispatchInputs);
 
   if (!result.success) {
     await surfaceDispatchFailure(
@@ -1090,6 +1183,9 @@ async function dispatchGitHubActions(
         phase: "implementation",
       },
     );
+    if (result.outcome === "rejected") {
+      admission.release("launch_rejected");
+    }
     // Only reachable on the legacy contract — under the envelope base_branch is not a
     // workflow input at all (it rides inside run_config), so a 422 can never be about
     // it. implSentBaseBranch is also true for the pre-existing feature-branch grouping
@@ -1121,6 +1217,7 @@ async function dispatchGitHubActions(
     repo: `${mapping.owner}/${mapping.repo}`,
     issueState: issue.nativeStatus,
     dispatchId,
+    admissionGeneration: admission.admissionGeneration,
     dispatchNumber: prior.count + 1,
     executionMode: "github-actions",
     runnerMode,
@@ -1152,17 +1249,44 @@ async function dispatchGitHubActions(
  * markDispatched() so the dedup table stays clear for the subsequent
  * implementation dispatch.
  */
-async function dispatchPlanning(
+export type PlanningDispatchContext = {
+  execPath: ReturnType<typeof resolvePlanningExecutionPath>;
+  runnerMode: string;
+  /** Validated "AI-Implement Base Branch" field value, or the mapping default. */
+  resolvedPlanningBranch: string;
+  /** The validated field value itself, or null when unset — distinct from
+   *  resolvedPlanningBranch, which falls back to the mapping default. */
+  planningFieldValue: string | null;
+};
+
+/**
+ * Pre-admission checks and the base-branch credential mint for planning dispatch,
+ * run once in poll() before dispatchPlanning is called — mirroring the
+ * implementation path, where this same work (checkForcedPathEligibility,
+ * validateIssueBaseBranch) happens in poll() ahead of dispatchGitHubActions /
+ * dispatchFlyMachine / dispatchLocalDocker.
+ *
+ * dispatchPlanning itself also defers `buildPlanningContextInputs` — a real Linear
+ * GraphQL call — until after its own admission check succeeds (acquireDispatch
+ * directly on the GHA path, or dispatchSession's internal acquireDispatch on the
+ * fly-machines/local-docker path), so no network call of any kind runs before capacity
+ * is reserved (AII-783 second review round on PR #681: an earlier version of this
+ * refactor moved the pre-admission checks here but left buildPlanningContextInputs as
+ * dispatchPlanning's actual first statement).
+ * Returns null when the issue must not be dispatched this tick — every reason is
+ * already logged/marked by this function, so the caller only needs to skip.
+ */
+async function preparePlanningDispatch(
   config: AppConfig,
   provider: TicketingProvider,
   issue: DispatchableIssue,
   mapping: RepoMapping,
-): Promise<void> {
+): Promise<PlanningDispatchContext | null> {
   if (!mapping.planningWorkflowFile) {
     console.warn(
       `[poll] Planning enabled for team ${issue.scopeKey} but planningWorkflowFile is not set — skipping ${issue.identifier}`,
     );
-    return;
+    return null;
   }
 
   const { mode: runnerMode } = getRunnerMode();
@@ -1176,7 +1300,7 @@ async function dispatchPlanning(
     console.log(
       `[poll] Skipping planning for ${issue.identifier}: forced runner mode "${runnerMode}" but team ${issue.scopeKey} is ineligible — ${planningEligibility.reason}`,
     );
-    return;
+    return null;
   }
 
   // AII-430: every planning execution path (GHA, Fly, local Docker) advances the
@@ -1187,7 +1311,7 @@ async function dispatchPlanning(
     console.error(
       `[poll] Refusing to dispatch planning for ${issue.identifier}: ${callbackBlockReason}`,
     );
-    return;
+    return null;
   }
 
   // Validate the "AI-Implement Base Branch" field before planning dispatch: planning
@@ -1207,17 +1331,27 @@ async function dispatchPlanning(
     issue,
     markFailed: (id, sk, reason) => provider.markPlanningFailed(id, sk, reason),
   });
-  if (planningValidated.refused) return;
+  if (planningValidated.refused) return null;
 
   // featureBranchChain is NOT consulted for planning — that grouping applies only to
   // implementation dispatches. Planning clones the validated field value or the default.
   const resolvedPlanningBranch = planningValidated.branch ?? mapping.defaultBranch;
 
-  // Build planning context (PARENT/SIBLINGS/DEPENDENCIES) for all execution paths.
-  const planningContextInputs = await buildPlanningContextInputs({
-    issue,
-    ticketingProviderId: provider.id,
-  });
+  return { execPath, runnerMode, resolvedPlanningBranch, planningFieldValue: planningValidated.branch };
+}
+
+// Exported for direct testing of the GHA result-based admission release/hold branch —
+// see "dispatchPlanning GHA path" in dispatch-routing.test.ts. Not part of the module's
+// public API otherwise; the only production call site is poll(), via
+// preparePlanningDispatch's resolved context.
+export async function dispatchPlanning(
+  config: AppConfig,
+  provider: TicketingProvider,
+  issue: DispatchableIssue,
+  mapping: RepoMapping,
+  ctx: PlanningDispatchContext,
+): Promise<void> {
+  const { execPath, runnerMode, resolvedPlanningBranch, planningFieldValue } = ctx;
 
   if (execPath === "fly-machines" || execPath === "local-docker") {
     // Bedrock is not supported on container runners.
@@ -1253,7 +1387,19 @@ async function dispatchPlanning(
       tokenTtlSeconds: PLANNING_TTL_SECONDS,
       doMarkDispatched: false,
       shadow: false,
-      backend: async ({ sessionToken, machineNonce, runnerCallbackUrl, runToken }) => {
+      backendKind: execPath,
+      isDefinitiveLaunchFailure: execPath === "fly-machines" ? isDefinitiveFlyRejectionError : isDefinitiveLocalDockerLaunchFailure,
+      backend: async ({ sessionToken, machineNonce, runnerCallbackUrl, runToken, markLaunchAttempted }) => {
+        // Build planning context (PARENT/SIBLINGS/DEPENDENCIES) here, not before
+        // dispatchSession's admission check above: this is a real network call
+        // (Linear GraphQL lookup) and must not run before capacity is reserved
+        // (AII-783 review on PR #681). `backend` only runs once dispatchSession's
+        // acquireDispatch has already succeeded.
+        const planningContextInputs = await buildPlanningContextInputs({
+          issue,
+          ticketingProviderId: provider.id,
+        });
+
         const planningEnv = {
           PARENT: planningContextInputs.parent,
           SIBLINGS: planningContextInputs.siblings,
@@ -1334,6 +1480,7 @@ async function dispatchPlanning(
             console.log(`[poll] process-level secrets for ${issue.identifier} planning: [${secretNames.join(", ")}]`);
           }
 
+          markLaunchAttempted();
           const machine = await createMachine(flyToken!, flyApp!, machineConfig);
           const machineLogsUrl = `https://fly.io/apps/${flyApp}/machines/${machine.id}`;
           console.log(`[poll] Dispatched planning for ${issue.identifier} -> ${mapping.owner}/${mapping.repo} (fly-machines, machine: ${machine.id}, image: ${resolvedImage} [${imageSource}])`);
@@ -1351,6 +1498,7 @@ async function dispatchPlanning(
             config.runnerCallbackBaseUrl ??
             `http://host.docker.internal:${config.healthPort}`;
 
+          markLaunchAttempted();
           const container = await startLocalRunnerContainer({
             image: config.localRunnerImage,
             issueId: issue.id,
@@ -1408,86 +1556,128 @@ async function dispatchPlanning(
             err,
           );
         }
-        postBranchComment(provider, issue, planningValidated.branch, mapping.defaultBranch, "planning");
+        postBranchComment(provider, issue, planningFieldValue, mapping.defaultBranch, "planning");
       },
     });
     return;
   }
 
   // ---------- GHA path (also handles shadow → GHA-only via resolvePlanningExecutionPath) ----------
-  const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
+  // Final admission authority — see the matching comment in dispatchGitHubActions.
+  const dispatchId = crypto.randomUUID();
+  const planningAdmission = acquireDispatch({
+    dispatchId,
+    issueId: issue.id,
+    issueIdentifier: issue.identifier,
+    kind: "planning",
+    teamKey: issue.scopeKey,
+    maxInProgressAiIssues: mapping.maxInProgressAiIssues,
+    backend: "github-actions",
+  });
+  if (!planningAdmission.ok) return;
+
   const planningMapping = { ...mapping, workflowFile: mapping.planningWorkflowFile };
 
-  let runnerCallbackUrl = "";
-  let runToken = "";
-  let dispatchId: string | undefined;
-  if (config.runnerCallbackBaseUrl && config.runnerTokenSecret) {
-    const minted = mintRunToken({
-      issueId: issue.id,
-      mappingTeamKey: issue.scopeKey,
-      phase: "planning",
-      audience: "result",
-      ttlSeconds: PLANNING_TTL_SECONDS,
-      secret: config.runnerTokenSecret,
+  // Everything below is pure prep — no launch call has fired yet. A throw anywhere in
+  // here is by construction a definitive non-launch — see the matching comment in
+  // dispatchGitHubActions.
+  const { ghToken, runnerImage, planningSentBaseBranch, planningContract, planningDispatchInputs } =
+    await (async () => {
+      // Build planning context (PARENT/SIBLINGS/DEPENDENCIES) only once admission is
+      // confirmed: this is a real network call (Linear GraphQL lookup) and must not run
+      // before capacity is reserved (AII-783 review on PR #681).
+      const planningContextInputs = await buildPlanningContextInputs({
+        issue,
+        ticketingProviderId: provider.id,
+      });
+
+      const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
+
+      let runnerCallbackUrl = "";
+      let runToken = "";
+      if (config.runnerCallbackBaseUrl && config.runnerTokenSecret) {
+        const minted = mintRunToken({
+          issueId: issue.id,
+          mappingTeamKey: issue.scopeKey,
+          phase: "planning",
+          audience: "result",
+          dispatchId,
+          ttlSeconds: PLANNING_TTL_SECONDS,
+          secret: config.runnerTokenSecret,
+        });
+        runnerCallbackUrl = config.runnerCallbackBaseUrl;
+        runToken = minted.token;
+      }
+
+      // Forward the resolved runner image so GHA planning honors the orchestrator's
+      // channel and per-repo `.ai-implement/image.yml` override, exactly as the
+      // implementation dispatch does. claude-plan.yml's validate-runner-image step
+      // does not read image.yml itself, so this is the only path by which GHA
+      // planning picks up either. Only sent when explicit (override or explicit
+      // SESSION_IMAGE/AI_IMPLEMENT_RUNNER_IMAGE), so repos that haven't re-synced
+      // claude-plan.yml are not rejected with a 422 "unexpected inputs".
+      const runnerImage = await resolveDispatchRunnerImage(config, mapping, ghToken);
+
+      // Only forward base_branch when it differs from the repo default — same guard as the
+      // implementation dispatch: GitHub rejects unknown workflow_dispatch inputs with 422,
+      // so repos that have not re-synced claude-plan.yml keep working on the common path.
+      // Legacy contract only; under the envelope the branch rides inside run_config.
+      const planningSentBaseBranch = resolvedPlanningBranch !== mapping.defaultBranch;
+
+      const planningContract = await resolveWorkflowContract({
+        owner: mapping.owner,
+        repo: mapping.repo,
+        workflowFile: mapping.planningWorkflowFile,
+        token: ghToken,
+        ref: mapping.defaultBranch,
+      });
+
+      const planningDispatchInputs = planningContract === "envelope"
+        ? buildEnvelopeDispatchInputs(planningMapping, issue, {
+            runnerPhase: "planning",
+            // Base branch for the planning clone. Rides inside run_config on the envelope.
+            baseBranch: planningSentBaseBranch ? resolvedPlanningBranch : undefined,
+            runnerCallbackUrl: runnerCallbackUrl || undefined,
+            runToken,
+            // No runProgressToken: planning dispatches don't mint progress tokens.
+            runnerImage,
+            planningContext: planningContextInputs,
+            // Planning has no retry loop, so nothing is stamped — but retryPolicy is
+            // required on EnvelopeDispatchOpts, so every call site must say so explicitly.
+            retryPolicy: null,
+          })
+        : {
+            issue_id: issue.id,
+            issue_identifier: issue.identifier,
+            issue_title: issue.title,
+            issue_description: issue.description || issue.title,
+            ...planningContextInputs,
+            ...providerDispatchFields(planningMapping),
+            // Gated: an empty spread when unset, so legacy repos on the common path still
+            // send no unexpected inputs and cannot 422.
+            ...(planningSentBaseBranch ? { base_branch: resolvedPlanningBranch } : {}),
+            runner_callback_url: runnerCallbackUrl,
+            run_token: runToken,
+            ...(runnerImage ? { runner_image: runnerImage } : {}),
+          };
+
+      return { ghToken, runnerCallbackUrl, runToken, runnerImage, planningSentBaseBranch, planningContract, planningDispatchInputs };
+    })().catch((err) => {
+      planningAdmission.release("launch_rejected");
+      throw err;
     });
-    dispatchId = minted.dispatchId;
-    runnerCallbackUrl = config.runnerCallbackBaseUrl;
-    runToken = minted.token;
-  }
 
-  // Forward the resolved runner image so GHA planning honors the orchestrator's
-  // channel and per-repo `.ai-implement/image.yml` override, exactly as the
-  // implementation dispatch does. claude-plan.yml's validate-runner-image step
-  // does not read image.yml itself, so this is the only path by which GHA
-  // planning picks up either. Only sent when explicit (override or explicit
-  // SESSION_IMAGE/AI_IMPLEMENT_RUNNER_IMAGE), so repos that haven't re-synced
-  // claude-plan.yml are not rejected with a 422 "unexpected inputs".
-  const runnerImage = await resolveDispatchRunnerImage(config, mapping, ghToken);
-
-  // Only forward base_branch when it differs from the repo default — same guard as the
-  // implementation dispatch: GitHub rejects unknown workflow_dispatch inputs with 422,
-  // so repos that have not re-synced claude-plan.yml keep working on the common path.
-  // Legacy contract only; under the envelope the branch rides inside run_config.
-  const planningSentBaseBranch = resolvedPlanningBranch !== mapping.defaultBranch;
-
-  const planningContract = await resolveWorkflowContract({
-    owner: mapping.owner,
-    repo: mapping.repo,
-    workflowFile: mapping.planningWorkflowFile,
+  // returnRunDetails (AII-778): outcome "rejected" is the only signal precise enough to
+  // treat as a definitive non-launch — see the matching comment in dispatchGitHubActions.
+  const result = await postWorkflowDispatch({
     token: ghToken,
-    ref: mapping.defaultBranch,
+    owner: planningMapping.owner,
+    repo: planningMapping.repo,
+    workflowFile: planningMapping.workflowFile,
+    ref: planningMapping.defaultBranch,
+    inputs: planningDispatchInputs,
+    returnRunDetails: true,
   });
-
-  const planningDispatchInputs = planningContract === "envelope"
-    ? buildEnvelopeDispatchInputs(planningMapping, issue, {
-        runnerPhase: "planning",
-        // Base branch for the planning clone. Rides inside run_config on the envelope.
-        baseBranch: planningSentBaseBranch ? resolvedPlanningBranch : undefined,
-        runnerCallbackUrl: runnerCallbackUrl || undefined,
-        runToken,
-        // No runProgressToken: planning dispatches don't mint progress tokens.
-        runnerImage,
-        planningContext: planningContextInputs,
-        // Planning has no retry loop, so nothing is stamped — but retryPolicy is
-        // required on EnvelopeDispatchOpts, so every call site must say so explicitly.
-        retryPolicy: null,
-      })
-    : {
-        issue_id: issue.id,
-        issue_identifier: issue.identifier,
-        issue_title: issue.title,
-        issue_description: issue.description || issue.title,
-        ...planningContextInputs,
-        ...providerDispatchFields(planningMapping),
-        // Gated: an empty spread when unset, so legacy repos on the common path still
-        // send no unexpected inputs and cannot 422.
-        ...(planningSentBaseBranch ? { base_branch: resolvedPlanningBranch } : {}),
-        runner_callback_url: runnerCallbackUrl,
-        run_token: runToken,
-        ...(runnerImage ? { runner_image: runnerImage } : {}),
-      };
-
-  const result = await dispatchWorkflow(ghToken, planningMapping, planningDispatchInputs);
 
   if (!result.success) {
     await surfaceDispatchFailure(
@@ -1508,6 +1698,9 @@ async function dispatchPlanning(
         phase: "planning",
       },
     );
+    if (result.outcome === "rejected") {
+      planningAdmission.release("launch_rejected");
+    }
     // Same legacy-only, content-gated attribution as the implementation path: under the
     // envelope base_branch is not an input at all, and planningSentBaseBranch alone is
     // not a reliable signal, so require the error body to mention base_branch before
@@ -1535,6 +1728,7 @@ async function dispatchPlanning(
     repo: `${mapping.owner}/${mapping.repo}`,
     issueState: issue.nativeStatus,
     dispatchId,
+    admissionGeneration: planningAdmission.admissionGeneration,
     executionMode: "github-actions",
     phase: "planning",
     sessionImage: runnerImage ?? null,
@@ -1562,12 +1756,38 @@ async function dispatchPlanning(
     );
   }
 
-  postBranchComment(provider, issue, planningValidated.branch, mapping.defaultBranch, "planning");
+  postBranchComment(provider, issue, planningFieldValue, mapping.defaultBranch, "planning");
 
   console.log(`[poll] Dispatched planning for ${issue.identifier} -> ${mapping.owner}/${mapping.repo} (${mapping.planningWorkflowFile}, image: ${runnerImage ?? "workflow-default"})`);
 }
 
 // ---------- Shared session-dispatch core ----------
+
+// Fly's createMachine throws a generic Error with the HTTP status embedded in the
+// message ("Failed to create machine in <app> (<status>): <body>"). A 4xx means Fly's
+// API rejected the request before creating anything — a definitive non-launch safe to
+// release. A 5xx, a network/timeout error, or any other shape is ambiguous (the machine
+// may have been created despite the failed response) and must stay held.
+function isDefinitiveFlyRejectionError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const match = /\((\d{3})\)/.exec(err.message);
+  if (!match) return false;
+  const status = Number(match[1]);
+  return status >= 400 && status < 500;
+}
+
+// startLocalRunnerContainer runs `docker run -d` over the local Docker socket and awaits
+// its exit before returning. That is not immune to a lost response the way a remote HTTP
+// call is not immune either: the daemon can create the container and the CLI process can
+// still fail to report success back to us (killed, socket dropped, daemon restart mid-call).
+// Unlike Fly's HTTP status, the docker CLI gives no structured signal that distinguishes
+// "rejected before creation" from "created but the response was lost", so — mirroring the
+// conservative default `shouldReleaseAdmissionOnDispatchError` already applies when no
+// classifier is given — every post-`markLaunchAttempted` throw here stays uncertain rather
+// than being treated as proof nothing launched (AII-783 review, second round, on PR #681).
+function isDefinitiveLocalDockerLaunchFailure(): boolean {
+  return false;
+}
 
 interface SessionBackendResult {
   machineId: string;
@@ -1576,6 +1796,22 @@ interface SessionBackendResult {
   executionMode: "fly-machines" | "local-docker";
   statusComment: { machineName: string; logsUrl?: string } | null;
   dispatchedLogLine?: string;
+}
+
+/**
+ * Whether a `dispatchSession` backend's thrown error is a proven non-launch, safe to
+ * release the admission reservation for. A throw before the backend ever called
+ * `markLaunchAttempted` is always a definitive non-launch — the actual launch call was
+ * never reached. Once launchAttempted, fall back to the backend's own classifier
+ * (undefined means "stay uncertain"). Exported as a pure seam for direct testing — see
+ * dispatch-routing.test.ts.
+ */
+export function shouldReleaseAdmissionOnDispatchError(
+  launchAttempted: boolean,
+  err: unknown,
+  isDefinitiveLaunchFailure?: (err: unknown) => boolean,
+): boolean {
+  return !launchAttempted || (isDefinitiveLaunchFailure?.(err) ?? false);
 }
 
 async function dispatchSession(
@@ -1590,11 +1826,28 @@ async function dispatchSession(
     tokenTtlSeconds: number;
     doMarkDispatched: boolean;
     shadow: boolean;
+    /** Admission backend label for the acquire call. Ignored when shadow is true —
+     *  the shadow Fly dispatch mirrors an already-admitted GHA primary and must not
+     *  compete for (or be blocked by) the same issue's reservation. */
+    backendKind: "fly-machines" | "local-docker";
+    /** Classifies a thrown backend() error, once the backend has called
+     *  `markLaunchAttempted`, as a proven non-launch (safe to release the reservation)
+     *  versus an ambiguous failure (must stay held for the matching Legacy monitor to
+     *  resolve). Omit when the backend has no reliable "never launched" signal for its
+     *  actual launch call — every post-attempt throw then stays uncertain. Irrelevant to
+     *  a throw before `markLaunchAttempted` is called: that is always definitive, since
+     *  the launch call itself was never reached. */
+    isDefinitiveLaunchFailure?: (err: unknown) => boolean;
     backend: (input: {
       sessionToken: string;
       machineNonce: string;
       runnerCallbackUrl: string;
       runToken: string;
+      /** Call immediately before the actual launch call (createMachine / the local
+       *  Docker spawn) — everything the backend does before this point (minting a
+       *  credential, resolving an image) is provably side-effect-free for the
+       *  reservation, so a throw before this call is always a definitive non-launch. */
+      markLaunchAttempted: () => void;
     }) => Promise<SessionBackendResult>;
     onPostDispatch?: (
       config: AppConfig,
@@ -1614,25 +1867,56 @@ async function dispatchSession(
 ): Promise<void> {
   const sessionToken = generateSessionToken();
   const machineNonce = generateMachineNonce();
+  const dispatchId = crypto.randomUUID();
+
+  // Final admission authority — see the matching comment in dispatchGitHubActions.
+  // Skipped for the shadow Fly mirror: the primary (GHA) dispatch already holds the
+  // reservation for this issue, and the shadow run is not a competing dispatch path.
+  let admission: Extract<AcquireDispatchOutcome, { ok: true }> | null = null;
+  if (!opts.shadow) {
+    const decision = acquireDispatch({
+      dispatchId,
+      issueId: issue.id,
+      issueIdentifier: issue.identifier,
+      kind: opts.phase,
+      teamKey: issue.scopeKey,
+      maxInProgressAiIssues: mapping.maxInProgressAiIssues,
+      backend: opts.backendKind,
+    });
+    if (!decision.ok) return;
+    admission = decision;
+  }
 
   let runnerCallbackUrl = "";
   let runToken = "";
-  let dispatchId: string | undefined;
   if (config.runnerCallbackBaseUrl && config.runnerTokenSecret) {
     const minted = mintRunToken({
       issueId: issue.id,
       mappingTeamKey: issue.scopeKey,
       phase: opts.phase,
       audience: "result",
+      dispatchId,
       ttlSeconds: opts.tokenTtlSeconds,
       secret: config.runnerTokenSecret,
     });
-    dispatchId = minted.dispatchId;
     runnerCallbackUrl = config.runnerCallbackBaseUrl;
     runToken = minted.token;
   }
 
-  const result = await opts.backend({ sessionToken, machineNonce, runnerCallbackUrl, runToken });
+  let launchAttempted = false;
+  const markLaunchAttempted = () => {
+    launchAttempted = true;
+  };
+
+  let result: SessionBackendResult;
+  try {
+    result = await opts.backend({ sessionToken, machineNonce, runnerCallbackUrl, runToken, markLaunchAttempted });
+  } catch (err) {
+    if (admission && shouldReleaseAdmissionOnDispatchError(launchAttempted, err, opts.isDefinitiveLaunchFailure)) {
+      admission.release("launch_rejected");
+    }
+    throw err;
+  }
 
   if (opts.doMarkDispatched) {
     markDispatched(issue.id, issue.identifier, issue.title);
@@ -1649,6 +1933,7 @@ async function dispatchSession(
       repo: `${mapping.owner}/${mapping.repo}`,
       issueState: issue.nativeStatus,
       dispatchId,
+      admissionGeneration: admission?.admissionGeneration ?? null,
       dispatchNumber: prior.count + 1,
       executionMode: result.executionMode,
       machineNonce,
@@ -1743,8 +2028,10 @@ async function dispatchFlyMachine(
     tokenTtlSeconds: IMPLEMENTATION_TTL_SECONDS,
     doMarkDispatched: !shadow,
     shadow,
+    backendKind: "fly-machines",
+    isDefinitiveLaunchFailure: isDefinitiveFlyRejectionError,
     branchInfo: shadow ? undefined : { fieldValue: baseBranchFieldValue, defaultBranch: mapping.defaultBranch },
-    backend: async ({ sessionToken, machineNonce, runnerCallbackUrl, runToken }) => {
+    backend: async ({ sessionToken, machineNonce, runnerCallbackUrl, runToken, markLaunchAttempted }) => {
       const minSecretsVersion = getFlySecretsMinVersion();
 
       let allSecretNames: string[] = [];
@@ -1812,6 +2099,7 @@ async function dispatchFlyMachine(
         console.log(`[poll] process-level secrets for ${issue.identifier}: [${secretNames.join(", ")}]`);
       }
 
+      markLaunchAttempted();
       const machine = await createMachine(flyToken, flyApp, machineConfig);
 
       const tag = shadow ? "shadow fly-machines" : "fly-machines";
@@ -1831,7 +2119,9 @@ async function dispatchFlyMachine(
 
 // ---------- Dispatch: Local Docker ----------
 
-async function dispatchLocalDocker(
+// Exported for direct testing of the pre-launch-failure release path — see the matching
+// comment on dispatchGitHubActions.
+export async function dispatchLocalDocker(
   config: AppConfig,
   provider: TicketingProvider,
   issue: DispatchableIssue,
@@ -1858,8 +2148,10 @@ async function dispatchLocalDocker(
     tokenTtlSeconds: IMPLEMENTATION_TTL_SECONDS,
     doMarkDispatched: true,
     shadow: false,
+    backendKind: "local-docker",
+    isDefinitiveLaunchFailure: isDefinitiveLocalDockerLaunchFailure,
     branchInfo: { fieldValue: baseBranchFieldValue, defaultBranch: mapping.defaultBranch },
-    backend: async ({ sessionToken, machineNonce, runnerCallbackUrl, runToken }) => {
+    backend: async ({ sessionToken, machineNonce, runnerCallbackUrl, runToken, markLaunchAttempted }) => {
       const localOrchestratorUrl =
         config.localRunnerOrchestratorUrl ??
         config.runnerCallbackBaseUrl ??
@@ -1876,6 +2168,7 @@ async function dispatchLocalDocker(
         retryPolicy: getRetryPolicy(),
       });
 
+      markLaunchAttempted();
       const container = await startLocalRunnerContainer({
         image: config.localRunnerImage,
         issueId: issue.id,
@@ -2084,40 +2377,214 @@ function mappingForJob(
  * callbacks. Returns undefined for GHA jobs (and for fly/local jobs missing
  * the fields needed to stop them), which leaves remediateStuckJob's default
  * GHA-cancel path as the fallback.
+ *
+ * The returned callback resolves to whether the stop is confirmed (destroy/remove
+ * succeeded, or 404/"already gone") — remediateStuckJob (AII-783) uses this to decide
+ * whether the job's admission reservation may be released.
  */
-function ttlStopRunnerForJob(config: AppConfig, job: Job): (() => Promise<void>) | undefined {
+function ttlStopRunnerForJob(config: AppConfig, job: Job): (() => Promise<boolean>) | undefined {
   if (job.executionMode === "fly-machines") {
     if (!config.flySessionsToken || !config.flySessionsApp || !job.machineId) return undefined;
     const token = config.flySessionsToken;
     const app = config.flySessionsApp;
     const machineId = job.machineId;
     return async () => {
+      let confirmed = false;
       try {
         await destroyMachine(token, app, machineId);
+        confirmed = true;
         console.log(`[monitor] Destroyed timed-out machine ${machineId}`);
       } catch (err) {
-        // Machine may already be gone — that's fine
-        if (!(err instanceof Error && err.message.includes("404"))) {
+        // Machine may already be gone — that's fine, and still confirmed.
+        if (err instanceof Error && err.message.includes("404")) {
+          confirmed = true;
+        } else {
           console.error(`[monitor] Failed to destroy timed-out machine ${machineId}:`, err);
         }
       }
       invalidateNonce(job.id);
+      return confirmed;
     };
   }
   if (job.executionMode === "local-docker") {
     if (!job.machineId) return undefined;
     const machineId = job.machineId;
     return async () => {
+      let confirmed = false;
       try {
         await removeLocalContainer(machineId);
+        confirmed = true;
         console.log(`[monitor] Removed timed-out local Docker container ${machineId}`);
       } catch (err) {
         console.error(`[monitor] Failed to remove timed-out local Docker container ${machineId}:`, err);
       }
       invalidateNonce(job.id);
+      return confirmed;
     };
   }
   return undefined;
+}
+
+/**
+ * `sweepStaleAdmissions`'s confirmation oracle (AII-783 review on PR #681): checks
+ * whether the backend behind a stale, still-reserved admission has actually terminated,
+ * rather than letting the sweep infer death from age alone. Looks up the matching
+ * `dispatch_log` row by `dispatchId` and, per execution mode, asks the backend itself:
+ *
+ * - No matching job row at all: this is genuinely ambiguous, not proof of anything. It
+ *   covers both "the launch was never attempted" (safe to confirm) AND "GitHub/Fly/local
+ *   accepted the launch but the process crashed before `appendLog` recorded the job row"
+ *   (a live run with no way to look it up — the exact gap the second review round on PR
+ *   #681 flagged: `dispatchGitHubActions` calls `dispatchWorkflow` before `appendLog`, and
+ *   the Fly/local session backends create the machine/container before returning the ID
+ *   `appendLog` records). The admission row alone carries no owner/repo/workflow/machine
+ *   identity to check against a backend directly, so there is no way to tell these two
+ *   cases apart here — this resolves to unconfirmed rather than risk freeing a live run's
+ *   capacity slot.
+ * - github-actions: confirmed only once the run's own status is `completed` — a prior
+ *   cancellation request being accepted (202/409) is not by itself proof of termination.
+ *   A job that never got its runId linked is NOT treated as "never launched": the
+ *   best-effort link (postDispatch / monitorGitHubActionsJob's own retry loop) can fail
+ *   to ever resolve for a run that is genuinely still executing — a transient GitHub API
+ *   hiccup, a getClaimedRunIds() exclusion, or a workflowFile/defaultBranch mismatch
+ *   after a resync — so a missing runId gets one more lookup attempt here before this
+ *   resolves to unconfirmed rather than confirmed (AII-783 PR #681 second review round).
+ * - fly-machines / local-docker: confirmed once the machine/container is actually
+ *   observed stopped, or (404 / "no such container") already gone. A missing machineId on
+ *   an existing job row is treated the same way as the no-job-row case above — unconfirmed,
+ *   not proof nothing launched — since a lost launch response could just as easily have
+ *   left the ID unrecorded on the row as left the row itself unwritten. Missing Fly
+ *   credentials mean the backend simply cannot be asked right now, which is also uncertain,
+ *   not confirmed-dead.
+ *
+ * An unrecognized execution mode resolves to unconfirmed for the same reason — this
+ * function never has enough information to prove a negative, only a positive (an
+ * explicitly observed terminal backend state). Any other lookup failure (network error,
+ * unexpected state) also resolves to unconfirmed, since an error here must never read as
+ * proof the backend is dead.
+ */
+export async function confirmAdmissionTerminated(
+  config: AppConfig,
+  candidate: StaleAdmissionCandidate,
+): Promise<boolean> {
+  const job = getJobByDispatchId(candidate.dispatchId);
+  if (!job) return false;
+
+  if (job.executionMode === "github-actions") {
+    if (!job.repo) return false;
+    const [owner, repo] = job.repo.split("/");
+    if (!owner || !repo) return false;
+
+    let token: string;
+    try {
+      token = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
+    } catch (err) {
+      console.error(`[admission] Failed to mint installation token for dispatch=${candidate.dispatchId}:`, err);
+      return false;
+    }
+
+    let runId = job.runId;
+    if (!runId) {
+      const mapping = mappingForJob(getMappings(), job);
+      if (!mapping) return false;
+      try {
+        const found = await findWorkflowRunId(
+          token,
+          owner,
+          repo,
+          workflowFileForJob(job, mapping),
+          mapping.defaultBranch,
+          new Date(job.dispatchedAt - 30_000),
+          getClaimedRunIds(),
+          job.issueIdentifier ?? undefined,
+        );
+        if (!found) return false;
+        attachJobRunIdIfMissing(job.id, found);
+        runId = found;
+      } catch (err) {
+        console.error(`[admission] Failed to look up run ID for dispatch=${candidate.dispatchId}:`, err);
+        return false;
+      }
+    }
+
+    try {
+      const status = await getWorkflowRunStatus(token, owner, repo, runId);
+      return status?.status === "completed";
+    } catch (err) {
+      console.error(`[admission] Failed to check GHA run status for dispatch=${candidate.dispatchId}:`, err);
+      return false;
+    }
+  }
+
+  if (job.executionMode === "fly-machines") {
+    if (!job.machineId) return false;
+    if (!config.flySessionsToken || !config.flySessionsApp) return false;
+    try {
+      const machine = await getMachine(config.flySessionsToken, config.flySessionsApp, job.machineId);
+      return machine.state === "destroyed" || machine.state === "stopped";
+    } catch (err) {
+      if (err instanceof Error && err.message.includes("404")) return true; // already gone
+      console.error(`[admission] Failed to check Fly machine state for dispatch=${candidate.dispatchId}:`, err);
+      return false;
+    }
+  }
+
+  if (job.executionMode === "local-docker") {
+    if (!job.machineId) return false;
+    try {
+      const state = await inspectLocalContainer(job.machineId);
+      return !state.running;
+    } catch (err) {
+      // `docker inspect` fails identically for "container gone" and "daemon
+      // unreachable" — only the former is safe to treat as confirmed-terminated.
+      return err instanceof Error && /No such container/i.test(err.message);
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Fast-path companion to `confirmAdmissionTerminated` for the planning callback
+ * (AII-783 review, third round, on PR #681): the callback marks the job row
+ * `completed` with `skipAdmissionRelease` because its own self-report is not proof the
+ * backend has exited, but that write also drops the job out of `getInFlightJobs()`'s
+ * `dispatched`/`running` set — the set every per-poll-cycle monitor (GHA run-status
+ * poll, Fly/local monitor) reads from. Relying solely on `sweepStaleAdmissions`'s
+ * 6-hour floor to eventually notice an already-finished backend would strand the common
+ * case — a planning run that finishes in minutes — at full team capacity for hours,
+ * reversing the very "accelerate the planning→implementation handoff" optimization the
+ * callback exists for.
+ *
+ * This runs the same termination oracle once, immediately, right after the callback
+ * records the job as completed. A backend already confirmed terminal releases the
+ * reservation right away; a still-running or unconfirmable backend is a no-op here —
+ * the reservation then stays held exactly as `skipAdmissionRelease` left it, for a
+ * later monitor tick or the stale-admission sweep to resolve.
+ */
+export async function tryFastReleasePlanningAdmission(config: AppConfig, dispatchId: string): Promise<void> {
+  const record = readAdmission(dispatchId);
+  if (!record || record.releasedAt !== null) return;
+
+  let confirmed: boolean;
+  try {
+    confirmed = await confirmAdmissionTerminated(config, {
+      dispatchId: record.dispatchId,
+      mappingKey: record.mappingKey,
+      backend: record.backend,
+      lifecycleOwner: record.lifecycleOwner,
+      ageMs: Date.now() - record.createdAt,
+    });
+  } catch (err) {
+    console.error(`[admission] Fast-path confirmAdmissionTerminated threw for dispatch=${dispatchId}:`, err);
+    return;
+  }
+  if (!confirmed) return;
+
+  const outcome = releaseAdmission(record.dispatchId, record.lifecycleOwner, record.generation, "finalized");
+  if (outcome.status === "released") {
+    console.log(`[admission] Fast-released planning admission dispatch=${dispatchId} mapping=${record.mappingKey}`);
+  }
 }
 
 const TTL_STALE_CONCLUSIONS = new Set(["operator_cancelled", "runner_approved"]);
@@ -2166,7 +2633,7 @@ export async function monitorJobs(config: AppConfig, registry: ProviderRegistry)
           console.warn(`[monitor] Job ${job.id} (${job.issueIdentifier}) exceeded its time limit; marking timed_out`);
           const provider = await providerForJob(registry, job);
           const stopRunner = ttlStopRunnerForJob(config, job);
-          await remediateStuckJob(watchdogConfig, provider, job, "ttl_expired", stopRunner);
+          const stopConfirmed = await remediateStuckJob(watchdogConfig, provider, job, "ttl_expired", stopRunner);
           // remediateStuckJob's own bookkeeping (requeue/give-up) unconditionally
           // overwrites conclusion with stuck_requeued/stuck_giveup — reassert
           // ttl_expired as the row's final, observable conclusion, unless
@@ -2174,7 +2641,14 @@ export async function monitorJobs(config: AppConfig, registry: ProviderRegistry)
           // without writing (in which case its guard's outcome must stand).
           const postConclusion = getJobById(job.id)?.conclusion;
           if (!TTL_STALE_CONCLUSIONS.has(postConclusion ?? "")) {
-            updateJobStatus(job.id, "timed_out", "ttl_expired");
+            // Mirror remediateStuckJob's own release gating (AII-783): this reassertion
+            // re-triggers updateJobStatus's terminal hook, so it must not release the
+            // admission reservation when the backend's death wasn't actually confirmed.
+            if (stopConfirmed) {
+              updateJobStatus(job.id, "timed_out", "ttl_expired");
+            } else {
+              updateJobStatus(job.id, "timed_out", "ttl_expired", undefined, { skipAdmissionRelease: true });
+            }
           }
           continue;
         }
@@ -2454,16 +2928,21 @@ async function monitorFlyMachineJob(
     };
 
     const stopRunner = async () => {
+      let confirmed = false;
       try {
         await destroyMachine(config.flySessionsToken!, config.flySessionsApp!, job.machineId!);
+        confirmed = true;
         console.log(`[monitor] Destroyed timed-out machine ${job.machineId}`);
       } catch (err) {
-        // Machine may already be gone — that's fine
-        if (!(err instanceof Error && err.message.includes("404"))) {
+        // Machine may already be gone — that's fine, and still confirmed.
+        if (err instanceof Error && err.message.includes("404")) {
+          confirmed = true;
+        } else {
           console.error(`[monitor] Failed to destroy timed-out machine ${job.machineId}:`, err);
         }
       }
       invalidateNonce(job.id);
+      return confirmed;
     };
 
     await remediateStuckJob(watchdogConfig, provider, job, "machine_timeout", stopRunner);
@@ -2634,13 +3113,16 @@ async function monitorLocalDockerJob(
     };
 
     const stopRunner = async () => {
+      let confirmed = false;
       try {
         await removeLocalContainer(job.machineId!);
+        confirmed = true;
         console.log(`[monitor] Removed timed-out local Docker container ${job.machineId}`);
       } catch (err) {
         console.error(`[monitor] Failed to remove timed-out local Docker container ${job.machineId}:`, err);
       }
       invalidateNonce(job.id);
+      return confirmed;
     };
 
     await remediateStuckJob(watchdogConfig, provider, job, "container_timeout", stopRunner);
@@ -3108,6 +3590,45 @@ async function processReconciliations(config: AppConfig, registry: ProviderRegis
 
 // ---------- Late Review Fix Queue ----------
 
+/**
+ * Final admission authority for gap-fill dispatch (review-fix and comment gap-fill):
+ * one transaction reserves per-team capacity and PR-scoped occupancy, and records the
+ * dispatch identity, before any credential mint or launch call. `canDispatch` (checked
+ * earlier by both callers) is only the non-transactional preview — this closes the race
+ * window between that preview and the actual launch (AII-787).
+ */
+function acquireGapfillAdmission(input: {
+  dispatchId: string;
+  issueId: string;
+  teamKey: string;
+  maxInProgressAiIssues: number;
+  backend: "github-actions" | "fly-machines" | "local-docker";
+  installationId: string;
+  repository: string;
+  prNumber: number;
+  prDispatchBudget?: number;
+  humanRequested?: boolean;
+}): ReturnType<typeof acquireAdmission> {
+  return acquireAdmission({
+    dispatchId: input.dispatchId,
+    mappingKey: input.teamKey,
+    scope: {
+      kind: "pr",
+      issueId: input.issueId,
+      installationId: input.installationId,
+      repository: input.repository,
+      prNumber: input.prNumber,
+    },
+    kind: "gap-fill",
+    backend: input.backend,
+    lifecycleOwner: { kind: "legacy" },
+    cap: input.maxInProgressAiIssues,
+    prDispatchBudget: input.prDispatchBudget,
+    humanRequested: input.humanRequested,
+    parked: isParked(input.issueId, "gap-analysis"),
+  });
+}
+
 export async function processReviewFixQueue(config: AppConfig, registry: ProviderRegistry): Promise<void> {
   const pending = getPendingReviewFixes();
   if (pending.length === 0) return;
@@ -3178,6 +3699,7 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
 
       const [owner] = fix.repo.split("/");
       const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
+      const installationId = String(await getInstallationId(config.githubAppId, config.githubAppPrivateKey, owner));
 
       let prState: Awaited<ReturnType<typeof getPullRequestState>>;
       try {
@@ -3261,25 +3783,53 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
           updateReviewFixStatus(fix.id, "failed");
           continue;
         }
-        const container = await dispatchLocalGapfill({
-          mapping,
-          issue: {
-            id: fix.issueId,
-            identifier: fix.issueIdentifier ?? fix.issueId,
-            title: `Review feedback fix for PR #${fix.prNumber}`,
-            description: taskDescription,
-          },
+        if (!dispatchId) dispatchId = crypto.randomUUID();
+        const admission = acquireGapfillAdmission({
+          dispatchId,
+          issueId: fix.issueId,
+          teamKey: scopeKey,
+          maxInProgressAiIssues: mapping.maxInProgressAiIssues,
+          backend: "local-docker",
+          installationId,
+          repository: fix.repo,
           prNumber: fix.prNumber,
-          githubToken: ghToken,
-          image: config.localRunnerImage,
-          orchestratorUrl: config.localRunnerOrchestratorUrl ?? config.runnerCallbackBaseUrl ?? `http://host.docker.internal:${config.healthPort}`,
-          runnerCallbackUrl: runnerCallbackUrl || undefined,
-          runToken: runToken || undefined,
-          runProgressToken: runProgressToken || undefined,
-          anthropicApiKey: config.anthropicApiKey,
-          claudeOAuthToken: config.claudeOAuthToken,
-          retryPolicy: getRetryPolicy(),
+          prDispatchBudget: prBudget,
+          humanRequested: false,
         });
+        if (!admission.ok) {
+          if (admission.reason === "budget_exhausted") {
+            await firePrBudgetPark(config, registry, mapping, fix.issueId, fix.repo, fix.prNumber, prBudget);
+          }
+          console.log(`[review-fix] Deferring local review fix #${fix.id} for PR #${fix.prNumber}: ${admission.reason}`);
+          continue;
+        }
+        let launchStarted = false;
+        let container: Awaited<ReturnType<typeof dispatchLocalGapfill>>;
+        try {
+          container = await dispatchLocalGapfill({
+            mapping,
+            issue: {
+              id: fix.issueId,
+              identifier: fix.issueIdentifier ?? fix.issueId,
+              title: `Review feedback fix for PR #${fix.prNumber}`,
+              description: taskDescription,
+            },
+            prNumber: fix.prNumber,
+            githubToken: ghToken,
+            image: config.localRunnerImage,
+            orchestratorUrl: config.localRunnerOrchestratorUrl ?? config.runnerCallbackBaseUrl ?? `http://host.docker.internal:${config.healthPort}`,
+            runnerCallbackUrl: runnerCallbackUrl || undefined,
+            runToken: runToken || undefined,
+            runProgressToken: runProgressToken || undefined,
+            anthropicApiKey: config.anthropicApiKey,
+            claudeOAuthToken: config.claudeOAuthToken,
+            retryPolicy: getRetryPolicy(),
+            onBeforeLaunch: () => { launchStarted = true; },
+          });
+        } catch (err) {
+          if (!launchStarted) releaseAdmission(admission.record.dispatchId, admission.record.lifecycleOwner, admission.record.generation, "launch_rejected");
+          throw err;
+        }
         const prior = countPriorDispatches(fix.issueId, "implementation");
         const jobId = appendLog({
           issueId: fix.issueId,
@@ -3288,6 +3838,7 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
           teamKey: scopeKey,
           repo: fix.repo,
           dispatchId,
+          admissionGeneration: admission.record.generation,
           dispatchNumber: prior.count + 1,
           executionMode: "local-docker",
           runnerMode,
@@ -3307,91 +3858,159 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
         continue;
       }
 
-      const runnerImage = await resolveDispatchRunnerImage(config, mapping, ghToken);
-
-      const reviewFixCapabilities = await resolveWorkflowCapabilities({
-        owner: mapping.owner,
-        repo: mapping.repo,
-        workflowFile: mapping.workflowFile,
-        token: ghToken,
-        ref: mapping.defaultBranch,
+      // Final admission authority: one transaction reserves team capacity and PR-scoped
+      // occupancy before any credential mint or launch call. gateDecision (checked above)
+      // is only the preview. Reuse a dispatchId already minted above (callback configured);
+      // otherwise mint one now so the reservation and this launch share one stable identity.
+      if (!dispatchId) dispatchId = crypto.randomUUID();
+      const admission = acquireGapfillAdmission({
+        dispatchId,
+        issueId: fix.issueId,
+        teamKey: scopeKey,
+        maxInProgressAiIssues: mapping.maxInProgressAiIssues,
+        backend: "github-actions",
+        installationId,
+        repository: fix.repo,
+        prNumber: fix.prNumber,
+        prDispatchBudget: prBudget,
+        humanRequested: false,
       });
-      const reviewFixContract = reviewFixCapabilities.contract;
-      const runPublicationToken = reviewFixContract === "envelope"
-        && reviewFixCapabilities.supportsRunPublicationToken
-        && dispatchId
-        && config.runnerCallbackBaseUrl
-        && config.runnerTokenSecret
-        ? mintRunToken({
-            issueId: fix.issueId,
-            mappingTeamKey: scopeKey,
-            phase: "gap-analysis",
-            audience: "publication",
-            dispatchId,
-            repository: `${mapping.owner}/${mapping.repo}`,
-            ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
-            secret: config.runnerTokenSecret,
-          }).token
-        : undefined;
+      if (!admission.ok) {
+        if (admission.reason === "budget_exhausted") {
+          await firePrBudgetPark(config, registry, mapping, fix.issueId, fix.repo, fix.prNumber, prBudget);
+        }
+        console.log(`[review-fix] Deferring review fix #${fix.id} for PR #${fix.prNumber}: ${admission.reason}`);
+        continue;
+      }
 
-      const fixIssue = {
-        id: fix.issueId,
-        identifier: fix.issueIdentifier ?? fix.issueId,
-        title: `Review feedback fix for PR #${fix.prNumber}`,
-        description: taskDescription,
-      };
+      // Everything below is pure prep — no launch call has fired yet. A throw anywhere in
+      // here (e.g. a workflow-capabilities probe failure) is by construction a definitive
+      // non-launch, so it releases the reservation and rethrows for the outer per-item catch
+      // to log and mark the item failed, unlike dispatchWorkflow below, whose failure is
+      // handled explicitly (release only on !result.success, held otherwise).
+      let runnerImage: string | undefined;
+      let reviewFixContract: WorkflowContract;
+      let reviewFixInputs: DispatchInputs;
+      try {
+        runnerImage = await resolveDispatchRunnerImage(config, mapping, ghToken);
 
-      const reviewFixInputs = reviewFixContract === "envelope"
-        ? buildEnvelopeDispatchInputs(mapping, fixIssue, {
-            runnerPhase: "gap-analysis",
-            prNumber: String(fix.prNumber),
-            runnerCallbackUrl: runnerCallbackUrl || undefined,
-            runToken,
-            runProgressToken,
-            runPublicationToken,
-            runnerImage,
-            retryPolicy: getRetryPolicy(),
-          })
-        : {
-            issue_id: fix.issueId,
-            issue_identifier: fix.issueIdentifier ?? fix.issueId,
-            issue_title: `Review feedback fix for PR #${fix.prNumber}`,
-            issue_description: taskDescription,
-            pr_number: String(fix.prNumber),
-            runner_phase: "gap-analysis" as const,
-            ...providerDispatchFields(mapping),
-            ...capDispatchFields(mapping),
-            ...skillsRepoDispatchFields(mapping),
-            // No profilesDispatchFields here: profiles are per-issue (read off the fresh
-            // TicketIssue at poll time), and review-fix queue entries only persist the
-            // issue id — re-fetching the ticket just for profiles isn't worth it for a
-            // gap-fill pass on a PR the profile-aware initial run already produced.
-            runner_callback_url: runnerCallbackUrl,
-            run_token: runToken,
-            run_progress_token: runProgressToken,
-            ...(runnerImage ? { runner_image: runnerImage } : {}),
-          };
+        const reviewFixCapabilities = await resolveWorkflowCapabilities({
+          owner: mapping.owner,
+          repo: mapping.repo,
+          workflowFile: mapping.workflowFile,
+          token: ghToken,
+          ref: mapping.defaultBranch,
+        });
+        reviewFixContract = reviewFixCapabilities.contract;
+        const runPublicationToken = reviewFixContract === "envelope"
+          && reviewFixCapabilities.supportsRunPublicationToken
+          && dispatchId
+          && config.runnerCallbackBaseUrl
+          && config.runnerTokenSecret
+          ? mintRunToken({
+              issueId: fix.issueId,
+              mappingTeamKey: scopeKey,
+              phase: "gap-analysis",
+              audience: "publication",
+              dispatchId,
+              repository: `${mapping.owner}/${mapping.repo}`,
+              ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
+              secret: config.runnerTokenSecret,
+            }).token
+          : undefined;
 
-      const result = await dispatchWorkflow(ghToken, mapping, reviewFixInputs);
+        const fixIssue = {
+          id: fix.issueId,
+          identifier: fix.issueIdentifier ?? fix.issueId,
+          title: `Review feedback fix for PR #${fix.prNumber}`,
+          description: taskDescription,
+        };
+
+        reviewFixInputs = reviewFixContract === "envelope"
+          ? buildEnvelopeDispatchInputs(mapping, fixIssue, {
+              runnerPhase: "gap-analysis",
+              prNumber: String(fix.prNumber),
+              runnerCallbackUrl: runnerCallbackUrl || undefined,
+              runToken,
+              runProgressToken,
+              runPublicationToken,
+              runnerImage,
+              retryPolicy: getRetryPolicy(),
+            })
+          : {
+              issue_id: fix.issueId,
+              issue_identifier: fix.issueIdentifier ?? fix.issueId,
+              issue_title: `Review feedback fix for PR #${fix.prNumber}`,
+              issue_description: taskDescription,
+              pr_number: String(fix.prNumber),
+              runner_phase: "gap-analysis" as const,
+              ...providerDispatchFields(mapping),
+              ...capDispatchFields(mapping),
+              ...skillsRepoDispatchFields(mapping),
+              // No profilesDispatchFields here: profiles are per-issue (read off the fresh
+              // TicketIssue at poll time), and review-fix queue entries only persist the
+              // issue id — re-fetching the ticket just for profiles isn't worth it for a
+              // gap-fill pass on a PR the profile-aware initial run already produced.
+              runner_callback_url: runnerCallbackUrl,
+              run_token: runToken,
+              run_progress_token: runProgressToken,
+              ...(runnerImage ? { runner_image: runnerImage } : {}),
+            };
+      } catch (err) {
+        releaseAdmission(admission.record.dispatchId, admission.record.lifecycleOwner, admission.record.generation, "launch_rejected");
+        throw err;
+      }
+
+      const result = await dispatchWorkflow(ghToken, mapping, reviewFixInputs, { returnRunDetails: true });
 
       if (!result.success) {
-        await surfaceDispatchFailure(
-          result,
-          config.notifyType,
-          config.notifyWebhookUrl,
-          {
-            site: "review-fix",
+        if (result.outcome !== "rejected") {
+          // GitHub may have started the run despite a lost/5xx response. Leave a job
+          // identity for the monitor and stale-admission oracle to reconcile.
+          const prior = countPriorDispatches(fix.issueId, "gap-analysis");
+          const jobId = appendLog({
             issueId: fix.issueId,
             issueIdentifier: fix.issueIdentifier ?? undefined,
             issueTitle: `Review feedback fix for PR #${fix.prNumber}`,
             teamKey: scopeKey,
             repo: fix.repo,
-            workflowFile: mapping.workflowFile,
+            dispatchId,
+            admissionGeneration: admission.record.generation,
+            dispatchNumber: prior.count + 1,
+            executionMode: "github-actions",
+            runnerMode: "default",
             contract: reviewFixContract,
             phase: "gap-analysis",
-          },
-        );
-        updateReviewFixStatus(fix.id, "failed");
+          });
+          updateJobPrUrl(jobId, `https://github.com/${fix.repo}/pull/${fix.prNumber}`);
+          recordReviewFixDispatch({ queueId: fix.id, dispatchId, repo: fix.repo,
+            prNumber: fix.prNumber, findingIds: dispatchFindingIds });
+          suppressStaleNotifications(fix.issueId, jobId);
+          console.warn(`[review-fix] Unknown GitHub launch outcome for PR #${fix.prNumber}; retained dispatch ${dispatchId} for reconciliation`);
+        }
+        if (result.outcome === "rejected") {
+          try {
+            await surfaceDispatchFailure(
+              result, config.notifyType, config.notifyWebhookUrl,
+              {
+                site: "review-fix",
+                issueId: fix.issueId,
+                issueIdentifier: fix.issueIdentifier ?? undefined,
+                issueTitle: `Review feedback fix for PR #${fix.prNumber}`,
+                teamKey: scopeKey,
+                repo: fix.repo,
+                workflowFile: mapping.workflowFile,
+                contract: reviewFixContract,
+                phase: "gap-analysis",
+              },
+            );
+          } catch (err) {
+            console.error(`[review-fix] Failed to report rejected dispatch for PR #${fix.prNumber}:`, err);
+          } finally {
+            releaseAdmission(admission.record.dispatchId, admission.record.lifecycleOwner, admission.record.generation, "launch_rejected");
+          }
+        }
+        updateReviewFixStatus(fix.id, result.outcome === "rejected" ? "failed" : "dispatched");
         continue;
       }
 
@@ -3403,6 +4022,7 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
         teamKey: scopeKey,
         repo: fix.repo,
         dispatchId,
+        admissionGeneration: admission.record.generation,
         dispatchNumber: prior.count + 1,
         executionMode: "github-actions",
         runnerMode: "default",
@@ -4090,6 +4710,7 @@ function startServer(
             notifyWebhookUrl: config.notifyWebhookUrl,
           },
           onKgRefreshRunnerComplete: kgRefresh.onRunnerComplete.bind(kgRefresh),
+          checkPlanningAdmissionTermination: (dispatchId) => tryFastReleasePlanningAdmission(config, dispatchId),
         });
         res.writeHead(result.status, { "Content-Type": "application/json" });
         res.end(JSON.stringify(result.body));

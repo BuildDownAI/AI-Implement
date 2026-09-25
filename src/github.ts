@@ -539,6 +539,7 @@ export async function dispatchWorkflow(
   token: string,
   mapping: RepoMapping,
   inputs: DispatchInputs,
+  opts?: { returnRunDetails?: boolean },
 ): Promise<DispatchResult> {
   return postWorkflowDispatch({
     token,
@@ -547,6 +548,7 @@ export async function dispatchWorkflow(
     workflowFile: mapping.workflowFile,
     ref: mapping.defaultBranch,
     inputs,
+    returnRunDetails: opts?.returnRunDetails,
   });
 }
 

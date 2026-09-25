@@ -383,3 +383,395 @@ describe("count", () => {
     expect(admission.count("AII")).toBe(1);
   });
 });
+
+// AII-783 gap-fill: releaseByDispatchId is the convenience release used by log.ts's
+// updateJobStatus so a caller that only has the dispatchId (a poll monitor, a runner
+// callback, an admin action, a reaper sweep — anything observing termination long after
+// the acquire() call returned) can free the reservation without also carrying the
+// owner/generation `release` requires.
+describe("releaseByDispatchId", () => {
+  it("releases an active reservation given only its dispatchId", () => {
+    const a = admission.acquire(issueRequest({ dispatchId: "a" }));
+    expect(a.ok).toBe(true);
+
+    expect(admission.releaseByDispatchId("a", "finalized")).toEqual({ status: "released" });
+    expect(admission.read("a")?.releasedAt).not.toBeNull();
+    expect(admission.count("AII")).toBe(0);
+  });
+
+  it("frees team capacity for a subsequent acquire", () => {
+    admission.acquire(issueRequest({ dispatchId: "a", cap: 1 }));
+    const blocked = admission.acquire(
+      issueRequest({ dispatchId: "b", scope: { kind: "issue", issueScope: "s", issueId: "b" }, cap: 1 }),
+    );
+    expect(blocked).toEqual({ ok: false, reason: "at_capacity", count: 1, cap: 1 });
+
+    admission.releaseByDispatchId("a", "finalized");
+
+    const retry = admission.acquire(
+      issueRequest({ dispatchId: "b", scope: { kind: "issue", issueScope: "s", issueId: "b" }, cap: 1 }),
+    );
+    expect(retry.ok).toBe(true);
+  });
+
+  it("is a no-op, not an error, for a dispatchId that never acquired a reservation", () => {
+    // Matches gap-fill/gap-analysis and kg-refresh dispatch ids, which never call
+    // `acquire` and so have no row for this to find.
+    expect(admission.releaseByDispatchId("never-existed", "finalized")).toEqual({ status: "not_owner" });
+  });
+
+  it("is a no-op for an already-released reservation", () => {
+    admission.acquire(issueRequest({ dispatchId: "a" }));
+    expect(admission.releaseByDispatchId("a", "finalized")).toEqual({ status: "released" });
+    expect(admission.releaseByDispatchId("a", "finalized")).toEqual({ status: "not_owner" });
+  });
+});
+
+// AII-783 gap-fill (review finding on PR #681): "No restart/reaper reconciliation for a
+// committed reservation whose launch response or process was lost" — a reservation with
+// no matching dispatch_log row (the orchestrator crashed between acquire() returning and
+// the caller's own appendLog) has no dispatchId a monitor could ever key a release off
+// of, so it would be held forever without this sweep. Also covers the companion case:
+// updateJobStatus deliberately leaving a reservation held pending confirmed termination
+// (reaper/stuck-watchdog's give-up paths) — this sweep is the eventual backstop for that
+// too, on the same age-based schedule.
+//
+// A second PR #681 review round found that the sweep released every past-maxAgeMs row
+// unconditionally, on age alone — turning an uncertain "might still be running" case
+// into free capacity. `sweepStaleAdmissions` now requires the caller to confirm each
+// candidate's backend is actually dead before it is released.
+describe("sweepStaleAdmissions", () => {
+  const CONFIRM_ALL = async () => true;
+  const CONFIRM_NONE = async () => false;
+
+  it("releases a reservation past maxAgeMs (once confirmed dead) and frees its slot for a subsequent acquire", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+      const acquired = admission.acquire(issueRequest({ dispatchId: "orphan-a", cap: 1 }));
+      expect(acquired.ok).toBe(true);
+
+      // Still within the window — not swept yet.
+      vi.setSystemTime(new Date("2026-01-01T05:00:00.000Z"));
+      await expect(admission.sweepStaleAdmissions(CONFIRM_ALL, 6 * 60 * 60 * 1000)).resolves.toEqual([]);
+      expect(admission.read("orphan-a")?.releasedAt).toBeNull();
+
+      // Past the 6h window, and the caller confirms the backend is dead.
+      vi.setSystemTime(new Date("2026-01-01T06:00:01.000Z"));
+      const released = await admission.sweepStaleAdmissions(CONFIRM_ALL, 6 * 60 * 60 * 1000);
+      expect(released).toEqual([
+        { dispatchId: "orphan-a", mappingKey: "AII", ageMs: expect.any(Number) },
+      ]);
+      expect(admission.read("orphan-a")?.releasedAt).not.toBeNull();
+
+      const retry = admission.acquire(
+        issueRequest({ dispatchId: "orphan-a-retry", scope: { kind: "issue", issueScope: "team-a", issueId: "AII-1" }, cap: 1 }),
+      );
+      expect(retry.ok).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("leaves an old still-running/unknown attempt reserved when the backend cannot be confirmed dead", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+      admission.acquire(issueRequest({ dispatchId: "still-running", cap: 1 }));
+
+      // Past the 6h age window, but the caller's backend check says it's still running
+      // (or the check itself can't tell) — age alone must never release this slot.
+      vi.setSystemTime(new Date("2026-01-01T06:00:01.000Z"));
+      const released = await admission.sweepStaleAdmissions(CONFIRM_NONE, 6 * 60 * 60 * 1000);
+
+      expect(released).toEqual([]);
+      expect(admission.read("still-running")?.releasedAt).toBeNull();
+
+      // The slot must still read as occupied — a second acquire for the same team must
+      // not see it as free capacity.
+      const blocked = admission.acquire(
+        issueRequest({ dispatchId: "other-issue", scope: { kind: "issue", issueScope: "team-a", issueId: "AII-2" }, cap: 1 }),
+      );
+      expect(blocked).toMatchObject({ ok: false, reason: "at_capacity" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("holds the reservation when the confirmation check itself throws", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+      admission.acquire(issueRequest({ dispatchId: "check-failed", cap: 1 }));
+
+      vi.setSystemTime(new Date("2026-01-01T06:00:01.000Z"));
+      const released = await admission.sweepStaleAdmissions(async () => {
+        throw new Error("backend unreachable");
+      }, 6 * 60 * 60 * 1000);
+
+      expect(released).toEqual([]);
+      expect(admission.read("check-failed")?.releasedAt).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not touch an already-released reservation or an unreleased one within the window", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+      admission.acquire(issueRequest({ dispatchId: "fresh", cap: 5 }));
+      const old = admission.acquire(issueRequest({ dispatchId: "old", scope: { kind: "issue", issueScope: "team-a", issueId: "AII-2" }, cap: 5 }));
+      expect(old.ok).toBe(true);
+      admission.release("old", LEGACY, (old as { ok: true; record: { generation: number } }).record.generation, "finalized");
+
+      vi.setSystemTime(new Date("2026-01-01T07:00:00.000Z"));
+      const released = await admission.sweepStaleAdmissions(CONFIRM_ALL, 6 * 60 * 60 * 1000);
+
+      // Only "fresh" was eligible (unreleased + past the window); "old" was already
+      // released before the sweep ran, so it must not appear in the sweep's own result.
+      expect(released).toEqual([
+        { dispatchId: "fresh", mappingKey: "AII", ageMs: expect.any(Number) },
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("defaults to a multi-hour window so an in-progress run is never swept mid-flight", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+      admission.acquire(issueRequest({ dispatchId: "in-progress", cap: 5 }));
+
+      // 90 minutes is the longest default GHA job timeout in the codebase — well within
+      // the default sweep window.
+      vi.setSystemTime(new Date("2026-01-01T01:30:00.000Z"));
+      await expect(admission.sweepStaleAdmissions(CONFIRM_ALL)).resolves.toEqual([]);
+      expect(admission.read("in-progress")?.releasedAt).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("passes the candidate's backend and lifecycle owner to the confirmation callback", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+      admission.acquire(issueRequest({ dispatchId: "restate-owned", backend: "fly-machines", lifecycleOwner: RESTATE_A, cap: 5 }));
+
+      vi.setSystemTime(new Date("2026-01-01T06:00:01.000Z"));
+      const seen: unknown[] = [];
+      await admission.sweepStaleAdmissions(async (candidate) => {
+        seen.push(candidate);
+        return true;
+      });
+
+      expect(seen).toEqual([
+        expect.objectContaining({
+          dispatchId: "restate-owned",
+          mappingKey: "AII",
+          backend: "fly-machines",
+          lifecycleOwner: RESTATE_A,
+          ageMs: expect.any(Number),
+        }),
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+// AII-783 gap-fill (third and final round, on PR #681): the planning_callback and
+// operator_cancelled branches both write a terminal dispatch_log row with
+// skipAdmissionRelease: true — the callback's own self-report is not proof the backend has
+// exited — but that same write drops the job out of getInFlightJobs()'s dispatched/running
+// set, so the ordinary per-poll monitor never looks at it again. Left to
+// sweepStaleAdmissions alone, a run that in fact finishes seconds later would hold
+// capacity for up to 6 hours. reconcileTerminalCallbackAdmissions is the no-age-floor,
+// join-based reconciliation path that closes that gap on every poll.
+describe("reconcileTerminalCallbackAdmissions", () => {
+  const CONFIRM_ALL = async () => true;
+  const CONFIRM_NONE = async () => false;
+
+  let log: typeof import("../log.js");
+
+  beforeEach(async () => {
+    log = await import("../log.js");
+    log.initLogTable();
+  });
+
+  function acquireAndLogTerminal(
+    dispatchId: string,
+    conclusion: "planning_callback" | "operator_cancelled",
+    overrides: Partial<AdmissionModule.DispatchAdmissionRequest> = {},
+  ): void {
+    const admitted = admission.acquire(issueRequest({ dispatchId, ...overrides }));
+    expect(admitted.ok).toBe(true);
+    if (!admitted.ok) throw new Error("test admission unexpectedly deferred");
+    const jobId = log.appendLog({
+      issueId: overrides.scope && overrides.scope.kind === "issue" ? overrides.scope.issueId : "AII-1",
+      issueIdentifier: "AII-1",
+      teamKey: "AII",
+      repo: "o/r",
+      dispatchId,
+      admissionGeneration: admitted.record.generation,
+      executionMode: "local-docker",
+      phase: conclusion === "planning_callback" ? "planning" : "implementation",
+    });
+    const status = conclusion === "planning_callback" ? "completed" : "failed";
+    log.updateJobStatus(jobId, status, conclusion, undefined, { skipAdmissionRelease: true });
+  }
+
+  it("releases a planning_callback reservation once the backend is confirmed terminal", async () => {
+    acquireAndLogTerminal("dispatch-pc-1", "planning_callback");
+
+    const released = await admission.reconcileTerminalCallbackAdmissions(CONFIRM_ALL);
+
+    expect(released).toEqual([
+      { dispatchId: "dispatch-pc-1", mappingKey: "AII", conclusion: "planning_callback" },
+    ]);
+    const record = admission.read("dispatch-pc-1");
+    expect(record?.releasedAt).not.toBeNull();
+    expect(record?.releaseReason).toBe("finalized");
+  });
+
+  it("releases an operator_cancelled reservation once the backend is confirmed terminal", async () => {
+    acquireAndLogTerminal("dispatch-oc-1", "operator_cancelled");
+
+    const released = await admission.reconcileTerminalCallbackAdmissions(CONFIRM_ALL);
+
+    expect(released).toEqual([
+      { dispatchId: "dispatch-oc-1", mappingKey: "AII", conclusion: "operator_cancelled" },
+    ]);
+    const record = admission.read("dispatch-oc-1");
+    expect(record?.releasedAt).not.toBeNull();
+    expect(record?.releaseReason).toBe("cancelled");
+  });
+
+  it("holds the reservation while the backend is still observed running", async () => {
+    acquireAndLogTerminal("dispatch-pc-2", "planning_callback");
+
+    const released = await admission.reconcileTerminalCallbackAdmissions(CONFIRM_NONE);
+
+    expect(released).toEqual([]);
+    expect(admission.read("dispatch-pc-2")?.releasedAt).toBeNull();
+    expect(admission.count("AII")).toBe(1);
+  });
+
+  it("holds the reservation when the confirmation check itself throws", async () => {
+    acquireAndLogTerminal("dispatch-pc-3", "planning_callback");
+
+    const released = await admission.reconcileTerminalCallbackAdmissions(async () => {
+      throw new Error("backend unreachable");
+    });
+
+    expect(released).toEqual([]);
+    expect(admission.read("dispatch-pc-3")?.releasedAt).toBeNull();
+  });
+
+  it("leaves a reservation with no matching dispatch_log row untouched (missing row)", async () => {
+    const admitted = admission.acquire(issueRequest({ dispatchId: "dispatch-no-row" }));
+    expect(admitted.ok).toBe(true);
+
+    const released = await admission.reconcileTerminalCallbackAdmissions(CONFIRM_ALL);
+
+    expect(released).toEqual([]);
+    expect(admission.read("dispatch-no-row")?.releasedAt).toBeNull();
+  });
+
+  it("leaves a still in-flight job's reservation untouched (non-terminal conclusion)", async () => {
+    const admitted = admission.acquire(issueRequest({ dispatchId: "dispatch-inflight" }));
+    expect(admitted.ok).toBe(true);
+    log.appendLog({
+      issueId: "AII-1",
+      dispatchId: "dispatch-inflight",
+      executionMode: "local-docker",
+      phase: "implementation",
+    });
+
+    const released = await admission.reconcileTerminalCallbackAdmissions(CONFIRM_ALL);
+
+    expect(released).toEqual([]);
+    expect(admission.read("dispatch-inflight")?.releasedAt).toBeNull();
+  });
+
+  it("is idempotent across repeated polls", async () => {
+    acquireAndLogTerminal("dispatch-pc-4", "planning_callback");
+
+    const first = await admission.reconcileTerminalCallbackAdmissions(CONFIRM_ALL);
+    expect(first).toEqual([
+      { dispatchId: "dispatch-pc-4", mappingKey: "AII", conclusion: "planning_callback" },
+    ]);
+
+    const second = await admission.reconcileTerminalCallbackAdmissions(CONFIRM_ALL);
+    expect(second).toEqual([]);
+    expect(admission.count("AII")).toBe(0);
+  });
+
+  it("does not release a replacement generation when an old terminal check finishes late", async () => {
+    const dispatchId = "dispatch-generation-race";
+    acquireAndLogTerminal(dispatchId, "planning_callback");
+    const original = admission.read(dispatchId);
+    expect(original).not.toBeNull();
+    if (!original) throw new Error("test admission missing");
+
+    const released = await admission.reconcileTerminalCallbackAdmissions(async () => {
+      expect(admission.release(dispatchId, original.lifecycleOwner, original.generation, "finalized")).toEqual({ status: "released" });
+      const replacement = admission.acquire(issueRequest({
+        dispatchId,
+        scope: { kind: "issue", issueScope: "team-a", issueId: "AII-2" },
+      }));
+      expect(replacement.ok).toBe(true);
+      return true; // stale observation of the original backend
+    });
+
+    expect(released).toEqual([]);
+    expect(admission.read(dispatchId)).toMatchObject({ generation: original.generation + 1, releasedAt: null });
+    // The old dispatch_log row is still present, but belongs to generation 0.
+    expect(await admission.reconcileTerminalCallbackAdmissions(CONFIRM_ALL)).toEqual([]);
+    expect(admission.count("AII")).toBe(1);
+  });
+
+  it("does not release a replacement generation on a delayed duplicate terminal job update", () => {
+    const dispatchId = "dispatch-monitor-race";
+    const original = admission.acquire(issueRequest({ dispatchId }));
+    expect(original.ok).toBe(true);
+    if (!original.ok) throw new Error("test admission unexpectedly deferred");
+    const oldJobId = log.appendLog({
+      issueId: "AII-1",
+      dispatchId,
+      admissionGeneration: original.record.generation,
+      executionMode: "local-docker",
+    });
+    log.updateJobStatus(oldJobId, "completed", "success");
+    expect(admission.read(dispatchId)?.releasedAt).not.toBeNull();
+
+    const replacement = admission.acquire(issueRequest({
+      dispatchId,
+      scope: { kind: "issue", issueScope: "team-a", issueId: "AII-2" },
+    }));
+    expect(replacement.ok).toBe(true);
+    if (!replacement.ok) throw new Error("replacement admission unexpectedly deferred");
+    log.updateJobStatus(oldJobId, "completed", "success");
+
+    expect(admission.read(dispatchId)).toMatchObject({ generation: replacement.record.generation, releasedAt: null });
+    expect(admission.count("AII")).toBe(1);
+  });
+
+  it("frees team capacity for a subsequent acquire once released", async () => {
+    acquireAndLogTerminal("dispatch-oc-2", "operator_cancelled", { cap: 1 });
+
+    const blocked = admission.acquire(
+      issueRequest({ dispatchId: "waiting", scope: { kind: "issue", issueScope: "team-a", issueId: "AII-2" }, cap: 1 }),
+    );
+    expect(blocked).toMatchObject({ ok: false, reason: "at_capacity" });
+
+    await admission.reconcileTerminalCallbackAdmissions(CONFIRM_ALL);
+
+    const retry = admission.acquire(
+      issueRequest({ dispatchId: "waiting", scope: { kind: "issue", issueScope: "team-a", issueId: "AII-2" }, cap: 1 }),
+    );
+    expect(retry.ok).toBe(true);
+  });
+});

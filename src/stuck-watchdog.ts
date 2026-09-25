@@ -1,6 +1,6 @@
 import type { TicketingProvider, TicketIssue } from "./providers/types.js";
 import type { Job } from "./log.js";
-import { cancelWorkflowRun } from "./github.js";
+import { cancelWorkflowRun, getWorkflowRunStatus } from "./github.js";
 import { incrementStuckAttempts, updateJobStatus, getJobById } from "./log.js";
 import { deleteDispatched } from "./dedup.js";
 import { notifyStuckGiveUp } from "./notify.js";
@@ -134,31 +134,44 @@ async function boundedCleanup(
  * Stop happens before dedup is cleared to prevent a race where the next poll
  * cycle re-dispatches before the zombie runner is stopped.
  *
- * @param stopRunner - Optional caller-supplied cleanup callback. For GHA jobs,
- *   omit this and the helper cancels the workflow run itself. For Fly/local
- *   jobs, supply a callback that destroys the machine/container and invalidates
- *   the nonce.
+ * Returns whether the backend's death was confirmed (`stopRunner` returned true, or —
+ * for the default GHA-cancel path — the run's own status was subsequently observed as
+ * `completed`; accepting the cancellation request, 202 or 409, is not itself
+ * confirmation — AII-783 review on PR #681). AII-783: this job may hold an admission
+ * reservation, and only a confirmed stop is allowed to release it — an unconfirmed one
+ * is written with `skipAdmissionRelease` so the reservation stays held for
+ * `dispatch-admission.ts`'s stale-reservation sweep instead of freeing a slot whose
+ * runner might still be alive. The return value lets a caller that writes its own
+ * follow-up terminal status (e.g. the TTL-expiry reassertion in index.ts) apply the same
+ * gating.
+ *
+ * @param stopRunner - Optional caller-supplied cleanup callback that resolves to
+ *   whether the backend's death is confirmed (a successful destroy/remove, or a
+ *   404/"already gone"). For GHA jobs, omit this and the helper cancels the workflow
+ *   run itself. For Fly/local jobs, supply a callback that destroys the machine/
+ *   container, invalidates the nonce, and reports its own confirmation.
  */
 export async function remediateStuckJob(
   config: StuckWatchdogConfig,
   provider: TicketingProvider | null,
   job: Job,
   lastRunStatus: string,
-  stopRunner?: () => Promise<void>,
-): Promise<void> {
-  if (!job.issueId) return;
+  stopRunner?: () => Promise<boolean>,
+): Promise<boolean> {
+  if (!job.issueId) return false;
   // kg-refresh jobs have their own outcome rail — never re-arm or clear dedup for them.
-  if (job.phase === "kg-refresh") return;
+  if (job.phase === "kg-refresh") return false;
   // Re-read conclusion from DB: the runner callback may have set "operator_cancelled"
   // after the monitor tick started reading the job, so the passed-in job may be stale.
   const freshConclusionStuck = getJobById(job.id)?.conclusion;
-  if (job.conclusion === "operator_cancelled" || freshConclusionStuck === "operator_cancelled") return;
+  if (job.conclusion === "operator_cancelled" || freshConclusionStuck === "operator_cancelled") return false;
 
   // Stop the runner before resetting dedup — prevents a re-dispatch racing
   // with a still-live runner.
+  let stopConfirmed = false;
   if (stopRunner) {
     try {
-      await stopRunner();
+      stopConfirmed = await stopRunner();
     } catch (err) {
       console.error(`[monitor] stopRunner failed for ${job.issueIdentifier}:`, err);
     }
@@ -171,8 +184,21 @@ export async function remediateStuckJob(
           config.githubAppPrivateKey,
           owner,
         );
-        await cancelWorkflowRun(ghToken, owner, repo, job.runId);
-        console.log(`[monitor] Cancelled run ${job.runId} for stuck job ${job.issueIdentifier}`);
+        // cancelWorkflowRun resolving true means GitHub *accepted the request*
+        // (202/409) — not that the run has actually stopped (AII-783 review on PR
+        // #681): a 409 in particular can mean the run isn't in a cancellable state for
+        // reasons other than "already finished". Request the cancellation as a
+        // best-effort nudge, but only the run's own subsequent status — not the accept
+        // code — is allowed to confirm the backend's death for admission-release
+        // purposes.
+        const cancelAccepted = await cancelWorkflowRun(ghToken, owner, repo, job.runId);
+        if (cancelAccepted) {
+          console.log(`[monitor] Requested cancellation of run ${job.runId} for stuck job ${job.issueIdentifier}`);
+        } else {
+          console.warn(`[monitor] GHA did not accept cancellation for run ${job.runId} (${job.issueIdentifier})`);
+        }
+        const runStatus = await getWorkflowRunStatus(ghToken, owner, repo, job.runId);
+        stopConfirmed = runStatus?.status === "completed";
       } catch (err) {
         console.error(`[monitor] Failed to cancel run ${job.runId} for ${job.issueIdentifier}:`, err);
       }
@@ -188,18 +214,28 @@ export async function remediateStuckJob(
   const attempts = await boundedCleanup(config, provider, job, runUrl, lastRunStatus);
 
   if (attempts <= STUCK_JOB_MAX_ATTEMPTS) {
-    updateJobStatus(job.id, "timed_out", "stuck_requeued");
+    if (stopConfirmed) {
+      updateJobStatus(job.id, "timed_out", "stuck_requeued");
+    } else {
+      updateJobStatus(job.id, "timed_out", "stuck_requeued", undefined, { skipAdmissionRelease: true });
+    }
     console.warn(
       `[monitor] Job ${job.id} (${job.issueIdentifier}) stuck after ${elapsedMin}m ` +
         `(attempt ${attempts}/${STUCK_JOB_MAX_ATTEMPTS}) — requeueing`,
     );
   } else {
-    updateJobStatus(job.id, "timed_out", "stuck_giveup");
+    if (stopConfirmed) {
+      updateJobStatus(job.id, "timed_out", "stuck_giveup");
+    } else {
+      updateJobStatus(job.id, "timed_out", "stuck_giveup", undefined, { skipAdmissionRelease: true });
+    }
     console.warn(
       `[monitor] Job ${job.id} (${job.issueIdentifier}) stuck after ${elapsedMin}m ` +
         `(attempt ${attempts}) — giving up, needs human`,
     );
   }
+
+  return stopConfirmed;
 }
 
 /**
