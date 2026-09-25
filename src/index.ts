@@ -2,6 +2,7 @@ import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import http from "node:http";
+import crypto from "node:crypto";
 import {
   getMappings,
   initMappingsTable,
@@ -9,7 +10,8 @@ import {
 } from "./config.js";
 import type { RepoMapping } from "./config.js";
 import { markDispatched, closeDb, getDispatchedIds, deleteDispatched } from "./dedup.js";
-import { canDispatch, type DispatchKind } from "./dispatch-gate.js";
+import { canDispatch, acquireDispatch, type DispatchKind, type AcquireDispatchOutcome } from "./dispatch-gate.js";
+import { count as countAdmissionReservations } from "./dispatch-admission.js";
 import { reconcileFilesystemFailures } from "./filesystem-ticket-lifecycle.js";
 import { dispatchWorkflow, postWorkflowDispatch, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, getPullRequestState, buildEnvelopeDispatchInputs, postPrComment, defaultFetchSignal, getRepoDefaultBranch, buildKgRefreshGhaDispatchBody, pollForKgWorkflowRunId } from "./github.js";
 import { resolveWorkflowCapabilities, resolveWorkflowContract } from "./workflow-probe.js";
@@ -495,8 +497,12 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
       }
       return acc;
     }, {});
+    // Tracker-label counts are retained as a diagnostic only — see the poll() call to
+    // selectIssuesToDispatch below, which now sizes slots from the DB-backed
+    // dispatch_admissions count (src/dispatch-admission.ts) rather than this snapshot.
     const inProgressCountsByTeam = inProgressCountsByScope;
     console.log(`[poll] Found ${needsPlanning.length} needing planning, ${readyForImplementation.length} ready for implementation`);
+    console.log(`[poll] Tracker-label in-progress counts (diagnostic only, not admission authority): ${JSON.stringify(inProgressCountsByTeam)}`);
 
     // Build the dispatch view of mappings: hide paused ones so the poller
     // skips them entirely (no new dispatches, no planning, no gap-fill). The
@@ -577,12 +583,21 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
       console.log(`[deploy] Dispatch paused — ${allCandidates.length} candidate(s) stay queued`);
     }
 
+    // Slot sizing for this tick's selection comes from the DB-backed dispatch_admissions
+    // count, not the tracker-label snapshot above — this is only a soft pre-filter for how
+    // many candidates to attempt; acquireDispatch's transaction is the real authority at
+    // dispatch time, per-issue, right before launch.
+    const admissionCountsByTeam: Record<string, number> = {};
+    for (const teamKey of Object.keys(teamRepoMap)) {
+      admissionCountsByTeam[teamKey] = countAdmissionReservations(teamKey);
+    }
+
     const toProcess = deployHeld
       ? []
       : selectIssuesToDispatch(
           allCandidates,
           teamRepoMap,
-          inProgressCountsByTeam,
+          admissionCountsByTeam,
           isDispatchBlocked,
         );
 
@@ -974,22 +989,36 @@ async function dispatchGitHubActions(
    *  from baseBranch, which also covers the feature-branch-grouping fallback. */
   baseBranchFieldValue: string | null,
 ): Promise<void> {
+  // Final admission authority: one transaction reserves team capacity and per-issue
+  // occupancy before any credential mint or launch call. canDispatch (checked earlier,
+  // in poll()) is only the preview.
+  const dispatchId = crypto.randomUUID();
+  const admission = acquireDispatch({
+    dispatchId,
+    issueId: issue.id,
+    issueIdentifier: issue.identifier,
+    kind: "implementation",
+    teamKey: issue.scopeKey,
+    maxInProgressAiIssues: mapping.maxInProgressAiIssues,
+    backend: "github-actions",
+  });
+  if (!admission.ok) return;
+
   const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
 
   let runnerCallbackUrl = "";
   let runToken = "";
   let runProgressToken = "";
-  let dispatchId: string | undefined;
   if (config.runnerCallbackBaseUrl && config.runnerTokenSecret) {
     const minted = mintRunToken({
       issueId: issue.id,
       mappingTeamKey: issue.scopeKey,
       phase: "implementation",
       audience: "result",
+      dispatchId,
       ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
       secret: config.runnerTokenSecret,
     });
-    dispatchId = minted.dispatchId;
     const progressMinted = mintRunToken({
       issueId: issue.id,
       mappingTeamKey: issue.scopeKey,
@@ -1068,7 +1097,19 @@ async function dispatchGitHubActions(
         ...(runnerImage ? { runner_image: runnerImage } : {}),
       };
 
-  const result = await dispatchWorkflow(ghToken, mapping, dispatchInputs);
+  // returnRunDetails (AII-778) gets us result.outcome: "rejected" means GitHub's API
+  // itself refused the request (a 4xx before any run started) — the one signal precise
+  // enough to treat as a definitive non-launch. Anything else (a thrown network error,
+  // a 5xx, "unknown") stays uncertain and must not release the reservation below.
+  const result = await postWorkflowDispatch({
+    token: ghToken,
+    owner: mapping.owner,
+    repo: mapping.repo,
+    workflowFile: mapping.workflowFile,
+    ref: mapping.defaultBranch,
+    inputs: dispatchInputs,
+    returnRunDetails: true,
+  });
 
   if (!result.success) {
     await surfaceDispatchFailure(
@@ -1089,6 +1130,9 @@ async function dispatchGitHubActions(
         phase: "implementation",
       },
     );
+    if (result.outcome === "rejected") {
+      admission.release("launch_rejected");
+    }
     // Only reachable on the legacy contract — under the envelope base_branch is not a
     // workflow input at all (it rides inside run_config), so a 422 can never be about
     // it. implSentBaseBranch is also true for the pre-existing feature-branch grouping
@@ -1252,6 +1296,8 @@ async function dispatchPlanning(
       tokenTtlSeconds: PLANNING_TTL_SECONDS,
       doMarkDispatched: false,
       shadow: false,
+      backendKind: execPath,
+      isDefinitiveLaunchFailure: execPath === "fly-machines" ? isDefinitiveFlyRejectionError : undefined,
       backend: async ({ sessionToken, machineNonce, runnerCallbackUrl, runToken }) => {
         const planningEnv = {
           PARENT: planningContextInputs.parent,
@@ -1414,22 +1460,34 @@ async function dispatchPlanning(
   }
 
   // ---------- GHA path (also handles shadow → GHA-only via resolvePlanningExecutionPath) ----------
+  // Final admission authority — see the matching comment in dispatchGitHubActions.
+  const dispatchId = crypto.randomUUID();
+  const planningAdmission = acquireDispatch({
+    dispatchId,
+    issueId: issue.id,
+    issueIdentifier: issue.identifier,
+    kind: "planning",
+    teamKey: issue.scopeKey,
+    maxInProgressAiIssues: mapping.maxInProgressAiIssues,
+    backend: "github-actions",
+  });
+  if (!planningAdmission.ok) return;
+
   const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
   const planningMapping = { ...mapping, workflowFile: mapping.planningWorkflowFile };
 
   let runnerCallbackUrl = "";
   let runToken = "";
-  let dispatchId: string | undefined;
   if (config.runnerCallbackBaseUrl && config.runnerTokenSecret) {
     const minted = mintRunToken({
       issueId: issue.id,
       mappingTeamKey: issue.scopeKey,
       phase: "planning",
       audience: "result",
+      dispatchId,
       ttlSeconds: PLANNING_TTL_SECONDS,
       secret: config.runnerTokenSecret,
     });
-    dispatchId = minted.dispatchId;
     runnerCallbackUrl = config.runnerCallbackBaseUrl;
     runToken = minted.token;
   }
@@ -1486,7 +1544,17 @@ async function dispatchPlanning(
         ...(runnerImage ? { runner_image: runnerImage } : {}),
       };
 
-  const result = await dispatchWorkflow(ghToken, planningMapping, planningDispatchInputs);
+  // returnRunDetails (AII-778): outcome "rejected" is the only signal precise enough to
+  // treat as a definitive non-launch — see the matching comment in dispatchGitHubActions.
+  const result = await postWorkflowDispatch({
+    token: ghToken,
+    owner: planningMapping.owner,
+    repo: planningMapping.repo,
+    workflowFile: planningMapping.workflowFile,
+    ref: planningMapping.defaultBranch,
+    inputs: planningDispatchInputs,
+    returnRunDetails: true,
+  });
 
   if (!result.success) {
     await surfaceDispatchFailure(
@@ -1507,6 +1575,9 @@ async function dispatchPlanning(
         phase: "planning",
       },
     );
+    if (result.outcome === "rejected") {
+      planningAdmission.release("launch_rejected");
+    }
     // Same legacy-only, content-gated attribution as the implementation path: under the
     // envelope base_branch is not an input at all, and planningSentBaseBranch alone is
     // not a reliable signal, so require the error body to mention base_branch before
@@ -1568,6 +1639,19 @@ async function dispatchPlanning(
 
 // ---------- Shared session-dispatch core ----------
 
+// Fly's createMachine throws a generic Error with the HTTP status embedded in the
+// message ("Failed to create machine in <app> (<status>): <body>"). A 4xx means Fly's
+// API rejected the request before creating anything — a definitive non-launch safe to
+// release. A 5xx, a network/timeout error, or any other shape is ambiguous (the machine
+// may have been created despite the failed response) and must stay held.
+function isDefinitiveFlyRejectionError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const match = /\((\d{3})\)/.exec(err.message);
+  if (!match) return false;
+  const status = Number(match[1]);
+  return status >= 400 && status < 500;
+}
+
 interface SessionBackendResult {
   machineId: string;
   sessionImage: string;
@@ -1589,6 +1673,15 @@ async function dispatchSession(
     tokenTtlSeconds: number;
     doMarkDispatched: boolean;
     shadow: boolean;
+    /** Admission backend label for the acquire call. Ignored when shadow is true —
+     *  the shadow Fly dispatch mirrors an already-admitted GHA primary and must not
+     *  compete for (or be blocked by) the same issue's reservation. */
+    backendKind: "fly-machines" | "local-docker";
+    /** Classifies a thrown backend() error as a proven non-launch (safe to release the
+     *  reservation) versus an ambiguous failure (must stay held for the matching Legacy
+     *  monitor to resolve). Omit when the backend has no reliable "never launched"
+     *  signal — every throw then stays uncertain. */
+    isDefinitiveLaunchFailure?: (err: unknown) => boolean;
     backend: (input: {
       sessionToken: string;
       machineNonce: string;
@@ -1613,25 +1706,51 @@ async function dispatchSession(
 ): Promise<void> {
   const sessionToken = generateSessionToken();
   const machineNonce = generateMachineNonce();
+  const dispatchId = crypto.randomUUID();
+
+  // Final admission authority — see the matching comment in dispatchGitHubActions.
+  // Skipped for the shadow Fly mirror: the primary (GHA) dispatch already holds the
+  // reservation for this issue, and the shadow run is not a competing dispatch path.
+  let admission: Extract<AcquireDispatchOutcome, { ok: true }> | null = null;
+  if (!opts.shadow) {
+    const decision = acquireDispatch({
+      dispatchId,
+      issueId: issue.id,
+      issueIdentifier: issue.identifier,
+      kind: opts.phase,
+      teamKey: issue.scopeKey,
+      maxInProgressAiIssues: mapping.maxInProgressAiIssues,
+      backend: opts.backendKind,
+    });
+    if (!decision.ok) return;
+    admission = decision;
+  }
 
   let runnerCallbackUrl = "";
   let runToken = "";
-  let dispatchId: string | undefined;
   if (config.runnerCallbackBaseUrl && config.runnerTokenSecret) {
     const minted = mintRunToken({
       issueId: issue.id,
       mappingTeamKey: issue.scopeKey,
       phase: opts.phase,
       audience: "result",
+      dispatchId,
       ttlSeconds: opts.tokenTtlSeconds,
       secret: config.runnerTokenSecret,
     });
-    dispatchId = minted.dispatchId;
     runnerCallbackUrl = config.runnerCallbackBaseUrl;
     runToken = minted.token;
   }
 
-  const result = await opts.backend({ sessionToken, machineNonce, runnerCallbackUrl, runToken });
+  let result: SessionBackendResult;
+  try {
+    result = await opts.backend({ sessionToken, machineNonce, runnerCallbackUrl, runToken });
+  } catch (err) {
+    if (admission && (opts.isDefinitiveLaunchFailure?.(err) ?? false)) {
+      admission.release("launch_rejected");
+    }
+    throw err;
+  }
 
   if (opts.doMarkDispatched) {
     markDispatched(issue.id, issue.identifier, issue.title);
@@ -1742,6 +1861,8 @@ async function dispatchFlyMachine(
     tokenTtlSeconds: IMPLEMENTATION_TTL_SECONDS,
     doMarkDispatched: !shadow,
     shadow,
+    backendKind: "fly-machines",
+    isDefinitiveLaunchFailure: isDefinitiveFlyRejectionError,
     branchInfo: shadow ? undefined : { fieldValue: baseBranchFieldValue, defaultBranch: mapping.defaultBranch },
     backend: async ({ sessionToken, machineNonce, runnerCallbackUrl, runToken }) => {
       const minSecretsVersion = getFlySecretsMinVersion();
@@ -1857,6 +1978,7 @@ async function dispatchLocalDocker(
     tokenTtlSeconds: IMPLEMENTATION_TTL_SECONDS,
     doMarkDispatched: true,
     shadow: false,
+    backendKind: "local-docker",
     branchInfo: { fieldValue: baseBranchFieldValue, defaultBranch: mapping.defaultBranch },
     backend: async ({ sessionToken, machineNonce, runnerCallbackUrl, runToken }) => {
       const localOrchestratorUrl =
