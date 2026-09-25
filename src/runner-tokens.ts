@@ -39,6 +39,14 @@ export const PLANNING_TTL_SECONDS = 30 * 60;
 export const IMPLEMENTATION_TTL_SECONDS = 2 * 60 * 60;
 export const GAP_ANALYSIS_TTL_SECONDS = 30 * 60;
 
+// Distinguish consecutive claims even if they occur in the same millisecond.
+// The claim stamp is a consumed-at timestamp, not a token or a secret.
+let lastClaimStamp = 0;
+function nextClaimStamp(): number {
+  lastClaimStamp = Math.max(Date.now(), lastClaimStamp + 1);
+  return lastClaimStamp;
+}
+
 function b64url(buf: Buffer): string {
   return buf.toString("base64").replace(/=+$/, "").replace(/\+/g, "-").replace(/\//g, "_");
 }
@@ -126,12 +134,22 @@ export function verifyRunToken(
   if (verified.consumedAt !== null) return { ok: false, reason: "already_consumed", claims };
   if (!options.consume) return verified;
 
+  const stamp = nextClaimStamp();
   const result = getDb()
     .prepare("UPDATE runner_tokens SET consumed_at = ? WHERE dispatch_id = ? AND audience = ? AND consumed_at IS NULL")
-    .run(Date.now(), claims.dispatchId, claims.audience);
+    .run(stamp, claims.dispatchId, claims.audience);
   if (result.changes === 0) return { ok: false, reason: "already_consumed", claims };
 
-  return verified;
+  return { ...verified, consumedAt: stamp };
+}
+
+/** Release only this failed publication mint's claim. A later successful claim
+ * survives a delayed or repeated release carrying an older stamp. */
+export function releasePublicationClaim(dispatchId: string, stamp: number): boolean {
+  const result = getDb()
+    .prepare("UPDATE runner_tokens SET consumed_at = NULL WHERE dispatch_id = ? AND audience = 'publication' AND consumed_at = ?")
+    .run(dispatchId, stamp);
+  return result.changes === 1;
 }
 
 export function verifyAndConsumeRunToken(token: string, secret: string): VerifyResult {

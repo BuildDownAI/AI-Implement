@@ -31,6 +31,29 @@ afterEach(() => {
 });
 
 describe("mintRunToken", () => {
+  it("a stale publication release cannot clear a newer claim, even within one millisecond", () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "issue-1", mappingTeamKey: "ENG", phase: "implementation",
+      audience: "publication", repository: "acme/app", ttlSeconds: 60, secret: SECRET,
+    });
+    const now = Date.now();
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    try {
+      const first = runnerTokens.verifyRunToken(token, SECRET, "publication", { consume: true });
+      expect(first.ok).toBe(true);
+      if (!first.ok || first.consumedAt === null) throw new Error("missing first claim stamp");
+      expect(runnerTokens.releasePublicationClaim(dispatchId, first.consumedAt)).toBe(true);
+
+      const second = runnerTokens.verifyRunToken(token, SECRET, "publication", { consume: true });
+      expect(second.ok).toBe(true);
+      if (!second.ok || second.consumedAt === null) throw new Error("missing second claim stamp");
+      expect(second.consumedAt).not.toBe(first.consumedAt);
+      expect(runnerTokens.releasePublicationClaim(dispatchId, first.consumedAt)).toBe(false);
+      const replay = runnerTokens.verifyRunToken(token, SECRET, "publication", { consume: true });
+      expect(replay).toMatchObject({ ok: false, reason: "already_consumed" });
+    } finally { vi.restoreAllMocks(); }
+  });
+
   it("returns a token and dispatchId, persists a row", () => {
     const { token, dispatchId } = runnerTokens.mintRunToken({
       issueId: "issue-1",
