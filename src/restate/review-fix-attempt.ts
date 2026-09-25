@@ -97,12 +97,18 @@ export function createReviewFixAttempt(deps: ReviewFixAttemptDependencies) {
 
     if (await ctx.date.now() >= attempt.deadlineAt) {
       await ctx.run("revoke-expired-before-launch", () => store.revokeAuthority(attemptId));
+      await ctx.run("record-expired-before-launch", () => finalizer.recordOutcome({
+        attemptId, scope: attempt.scope, terminal: { status: "cancelled" },
+      }));
       await ctx.run("release-expired-before-launch", () => store.releaseOwner(attempt.owner, "deadline_exceeded"));
       return { completion: { status: "deadline_before_launch" }, scope: attempt.scope };
     }
 
     // A cancellation or conflicting early result can revoke authority before run starts.
     if (!await ctx.run("check-prelaunch-authority", () => store.hasCurrentAuthority(attemptId))) {
+      await ctx.run("record-cancelled-before-launch", () => finalizer.recordOutcome({
+        attemptId, scope: attempt.scope, terminal: { status: "cancelled" },
+      }));
       await ctx.run("release-before-launch", () => store.releaseOwner(attempt.owner, "cancelled"));
       return { completion: { status: "not_owner" }, scope: attempt.scope };
     }

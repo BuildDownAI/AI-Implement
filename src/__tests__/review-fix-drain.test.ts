@@ -226,6 +226,21 @@ describe("processReviewFixQueue — owner selection", () => {
     expect(localGapfillMocks.dispatchLocalGapfill).toHaveBeenCalledTimes(1);
     expect((dedup.getDb().prepare("SELECT COUNT(*) AS n FROM review_fix_inbox").get() as { n: number }).n).toBe(0);
   });
+
+  it("retires selected automatic feedback when GitHub confirms the PR is closed", async () => {
+    process.env.RUNNER_MODE = "gha";
+    configModule.upsertMapping("TEAM", makeMapping({ reviewFixLifecycle: "restate" }));
+    restateStatus.setRestateStatus({ sidecar: { state: "ready" }, registration: { state: "registered" } });
+    queueOne();
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ merged: false, state: "closed", head: { ref: "branch" } })));
+    const pilotConfig = { ...mockConfig, runnerCallbackBaseUrl: "https://callback.example",
+      runnerTokenSecret: "test-secret" };
+
+    await indexModule.processReviewFixQueue(pilotConfig, mockRegistry);
+
+    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(0);
+    expect((dedup.getDb().prepare("SELECT COUNT(*) AS n FROM review_fix_inbox").get() as { n: number }).n).toBe(0);
+  });
 });
 
 describe("processReviewFixQueue — dispatch gate", () => {

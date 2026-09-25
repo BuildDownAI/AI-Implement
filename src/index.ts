@@ -3722,6 +3722,13 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
         const restate = getRestateStatus();
         if (restate.sidecar.state !== "ready" || restate.registration.state !== "registered") continue;
         try {
+          const token = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
+          const prState = await getPullRequestState(token, mapping.owner, mapping.repo, fix.prNumber);
+          if (!prState) continue;
+          if (shouldSkipReviewFix(prState)) {
+            updateReviewFixStatus(fix.id, "skipped");
+            continue;
+          }
           const installationId = await getInstallationId(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
           const lastEvent = listReviewFixEvents(fix.id).at(-1);
           if (!lastEvent) continue;

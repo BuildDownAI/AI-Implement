@@ -3,7 +3,7 @@
  * boundary where those adapters become Restate services. */
 import { getMappings, resolveReviewFixLifecycle, type RepoMapping } from "../config.js";
 import { getDb } from "../dedup.js";
-import { getInstallationToken } from "../github-app-auth.js";
+import { getInstallationId, getInstallationToken } from "../github-app-auth.js";
 import { getPullRequestState } from "../github.js";
 import { listReviewFixCycleSummaries } from "../review-fix-evidence.js";
 import { createReviewFixFinalizer, retryApprovalEffect } from "../review-fix-finalize.js";
@@ -45,6 +45,7 @@ async function canAdmit(scope: ScopedPrIdentity, config: ReviewFixProductionConf
   if (!mapping || !config.runnerCallbackBaseUrl || !config.runnerTokenSecret) return false;
   try {
     const token = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
+    if (await getInstallationId(config.githubAppId, config.githubAppPrivateKey, mapping.owner) !== scope.installationId) return false;
     const capabilities = await resolveWorkflowCapabilities({ owner: mapping.owner, repo: mapping.repo,
       workflowFile: mapping.workflowFile, token, ref: mapping.defaultBranch });
     const prState = await getPullRequestState(token, mapping.owner, mapping.repo, scope.prNumber);
