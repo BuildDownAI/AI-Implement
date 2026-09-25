@@ -681,10 +681,16 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     // feedback() handler really runs — then the local process "crashes" before
     // observing the 2xx, so the pump reschedules the row as if it were unavailable.
     const crashyFetch = crashAfterFirstCall(fetch);
-    const pump = pumpFor(env.baseUrl(), crashyFetch);
+    let now = Date.now();
+    const pump = new ReviewFixDeliveryPump({
+      facade: createRestateReviewFixFacade({ ingressBaseUrl: env.baseUrl(), fetchImpl: crashyFetch }),
+      intervalMs: 60_000,
+      now: () => now,
+    });
     await pump.tick();
     expect(getDb().prepare(`SELECT delivery_state FROM review_fix_inbox WHERE event_id = ?`)
       .get(deliveryId)).toMatchObject({ delivery_state: "pending" });
+    now += 5_001; // advance past the pump's durable unavailable-delivery retry delay
     await pump.tick();
     expect(getDb().prepare(`SELECT delivery_state FROM review_fix_inbox WHERE event_id = ?`)
       .get(deliveryId)).toMatchObject({ delivery_state: "delivered" });
