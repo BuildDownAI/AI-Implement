@@ -56,6 +56,47 @@ The retry is **capped at exactly two requests, by construction, not just by the 
 
 ---
 
+## Dispatch outcomes and `returnRunDetails`
+
+`postDispatchOnce`, the function inside `postWorkflowDispatch`/`dispatchWorkflow` that actually posts one `workflow_dispatch` request, accepts an opt-in `returnRunDetails?: boolean` option (AII-778, default off). Every existing call site — `dispatchWorkflow`'s implementation, gap-analysis, and planning dispatches; the review-fix re-dispatch; the kg-refresh GHA dispatch — leaves it unset today, so nothing in this repo yet requests or reads the fields below. The option exists as wire-contract plumbing for a consumer (the Restate review-fix pilot) that has not landed.
+
+Setting `returnRunDetails: true`:
+
+- Adds `return_run_details: true` to the POST body sent to GitHub's `workflow_dispatch` endpoint.
+- Populates a new `outcome: DispatchOutcome` field on `DispatchResult`, and — only when the response is a repo-validated `200` — `runId`/`runUrl`.
+
+```typescript
+export type DispatchOutcome = "accepted" | "rejected" | "unknown";
+
+export interface DispatchResult {
+  success: boolean;
+  status: number;
+  error?: string;
+  outcome?: DispatchOutcome;   // only set when returnRunDetails: true
+  runId?: number;              // only set for a repo-validated 200
+  runUrl?: string;             // only set for a repo-validated 200
+}
+```
+
+`outcome` reflects an identity-trust judgment, not just the HTTP status:
+
+| Response | `outcome` | `runId`/`runUrl` | Why |
+|---|---|---|---|
+| `204` | `accepted` | absent | GitHub queued the dispatch. `workflow_dispatch` never returns a run id on a plain 204 — there is no exact identity to report, only "this plausibly started." |
+| `200`, body validates against the requested repo | `accepted` | present | `extractDispatchRunIdentity` requires `html_url` to match `https://github.com/{owner}/{repo}/actions/runs/{id}` and, if the body also carries a `repository` field (string or `{full_name}`), that it names the same `owner/repo`. Either signal disagreeing — or missing/malformed entirely — is treated as unresolved, not trusted; GitHub's `return_run_details` response shape isn't documented, so parsing stays tolerant of fields it doesn't recognise and strict only about the ones that prove repo ownership. |
+| `200`, unparseable or repo-mismatched body | `unknown` | absent | Same reasoning as above, on the failing side. |
+| `4xx` | `rejected` | absent | A definite application-level refusal — safe to treat as "did not happen." |
+| `5xx`, or any other unrecognised status | `unknown` | absent | GitHub may have started the run before failing to report it cleanly; not safe to assume either accepted or rejected. |
+| transport failure (`fetch` throws) | `unknown` (only if `returnRunDetails: true`) | absent | See legacy behavior below — the identical failure is a thrown error for a caller that did not opt in. |
+
+The three-way split matters to a caller trying to avoid a duplicate dispatch: `rejected` is safe to retry (GitHub is certain nothing started), `accepted` needs no retry, and `unknown` is neither — a transport failure or 5xx must not be blindly retried, because GitHub may have already started the run.
+
+**Legacy callers are unchanged, byte-for-byte.** A caller that does not pass `returnRunDetails` gets exactly the pre-AII-778 `DispatchResult` shape (`success`/`status`/`error`, no `outcome`/`runId`/`runUrl`) and the pre-AII-778 throw-on-transport-failure behavior: `postDispatchOnce` only catches and converts a `fetch` rejection into `{ outcome: "unknown", ... }` when `returnRunDetails` is set; otherwise the rejection propagates exactly as it always did. This is deliberate (AII-778's compatibility constraint) — opting in to run-detail reporting must never change behavior for a caller that didn't ask for it.
+
+**Coexists with, does not replace, `findWorkflowRunId`.** The existing post-dispatch heuristic (`src/github.ts`) scans the workflow's recent-runs list for a run created at or after the dispatch time, on the expected branch, optionally disambiguated by `display_title` against `issueIdentifier` — because `workflow_dispatch` alone never returns a run id, this scan is how the orchestrator resolves one today, for every dispatch regardless of `returnRunDetails`. A `200` with a validated body narrows *when* that scan is needed (a caller already holding `runId`/`runUrl` skips it), but a `204` — the common case — still carries no identity, so the heuristic remains necessary; `returnRunDetails` is not a superset replacement for it.
+
+---
+
 ## `RunConfigV1` Schema
 
 The envelope is decoded by `src/run-config.ts` (`decodeRunConfig`). Unknown fields are stripped on decode. The `v: 1` discriminant is validated; any other value throws immediately.
@@ -129,12 +170,27 @@ Below the TS runner layer, `session/entrypoint.sh` picks the phase (and, for kg-
 
 Before every dispatch the orchestrator calls `resolveWorkflowCapabilities` (`src/workflow-probe.ts`; `resolveWorkflowContract` remains the backward-compatible contract-only wrapper). The probe:
 
-1. Fetches `https://api.github.com/repos/{owner}/{repo}/contents/.github/workflows/{workflowFile}` from the **default branch**.
-2. Base64-decodes the YAML and detects the required `run_config` input plus optional capability inputs such as `run_publication_token`.
-3. Returns the envelope/legacy contract and optional capability bits. Publication credentials are minted and dispatched only when the target explicitly advertises support.
-4. On any fetch error (network failure, 404, non-200, malformed JSON) returns `"legacy"` and logs a warning — fail-safe.
+1. Fetches `https://api.github.com/repos/{owner}/{repo}/contents/.github/workflows/{workflowFile}` from `ref` — the branch the actual `workflow_dispatch` will target, so the contract check agrees with the dispatch it gates. Every current call site passes `mapping.defaultBranch` for both the probe's `ref` and the dispatch's own `ref` (`dispatchWorkflow` always dispatches against `mapping.defaultBranch`, even for a feature-branch child whose run then checks out a different branch via `run_config.baseBranch`), so in practice this reads as "the default branch" — but the parameter, not a hardcoded branch, is what the probe and the dispatch actually agree on.
+2. Base64-decodes the YAML and detects the required `run_config` input plus optional capability inputs: `run_publication_token` (`RUN_PUBLICATION_TOKEN_RE`) and, identically, `run_attempt_token` (`RUN_ATTEMPT_TOKEN_RE`) — see "Attempt correlation" below.
+3. Returns the envelope/legacy contract plus both capability bits, `supportsRunPublicationToken` and `supportsAttemptCorrelation`. Publication credentials are minted and dispatched only when the target explicitly advertises support; the same principle applies to attempt correlation once a consumer sends it.
+4. On any fetch error (network failure, 404, non-200, malformed JSON) returns `"legacy"` with both capability bits `false`, and logs a warning — fail-safe.
 
-Results are cached in-process per `owner/repo/workflowFile` key for **5 minutes** (`CACHE_TTL_MS = 300_000 ms`). A re-sync that merges the envelope template will be picked up at most one poll cycle (60 s) after the cache expires.
+Results are cached in-process per `owner/repo/workflowFile/ref` key for **5 minutes** (`CACHE_TTL_MS = 300_000 ms`) — `WorkflowCapabilities` as a whole is the cached value, so `supportsAttemptCorrelation` shares the same cache entry, key, and TTL as the contract and `supportsRunPublicationToken`; there is no separate probe or cache for it. A re-sync that merges the envelope template will be picked up at most one poll cycle (60 s) after the cache expires.
+
+---
+
+## Attempt correlation: `supportsAttemptCorrelation` and `run_attempt_token`
+
+`WorkflowCapabilities` carries a `supportsAttemptCorrelation` bit, detected the same way as `supportsRunPublicationToken`: the probe tests the fetched YAML for a top-level `run_attempt_token:` input declaration. It is `true` only when the contract itself resolved to `"envelope"` and the regex matched; a `"legacy"` result (or any probe failure) forces it `false` regardless of what the YAML contains.
+
+Publishing that input in `workflows/claude-implement.yml` is AII-782's job, not this repo's current state: as of this branch, no synced template declares `run_attempt_token`, so `supportsAttemptCorrelation` probes `false` for every repo until AII-782 lands and repos re-sync the template. The detection mechanism itself is not speculative — `resolveWorkflowCapabilities` already computes and caches the bit correctly today — only the template input it detects has not been published yet.
+
+**This bit is a template capability marker, not attempt identity.** It answers "does this target's declared workflow support attempt correlation," nothing more, and carries no attempt data itself. The identity of a specific attempt — which Restate attempt, which PR, which installation, when it expires — travels separately, inside `run_config.reviewFix` (`ReviewFixMetadataV1`, AII-776; shape in the `RunConfigV1` schema above: `attemptId`, `installationId`, `repository`, `prNumber`, `deadlineAt`). The two are independent:
+
+- A repo can declare `run_attempt_token` (probe `true`) while a given dispatch to it carries no `reviewFix` field at all (Legacy/non-pilot dispatch).
+- A dispatch can in principle carry `reviewFix` metadata regardless of whether the target's `run_attempt_token` capability bit is set — `decodeRunConfig` validates `reviewFix` against the AII-770 contract on its own terms and does not consult the probe.
+
+Treat "the marker is declared" and "this run carries attempt metadata" as two separate questions with two separate sources of truth — the probe bit for the former, `run_config.reviewFix` for the latter — never inferred from each other.
 
 ---
 
