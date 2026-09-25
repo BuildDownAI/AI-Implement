@@ -750,10 +750,15 @@ export const drawerScript = `
     const moreBtn = document.getElementById('drawer-pilot-activity-more');
     countEl.textContent = pilotActivityEvents.length + ' event' + (pilotActivityEvents.length === 1 ? '' : 's') + (pilotActivityTruncated ? ' · stream truncated' : '');
     if (!pilotActivityEvents.length) {
-      el.innerHTML = pilotActivityTruncated
-        ? '<div style="font-size:12px;color:var(--fg-tertiary);padding:8px 0">Activity truncated — no events available</div>'
-        : '<div style="font-size:12px;color:var(--fg-tertiary);padding:8px 0">No tool activity recorded</div>';
-      moreBtn.hidden = true;
+      el.innerHTML = pilotActivityCursor
+        ? '<div style="font-size:12px;color:var(--fg-tertiary);padding:8px 0">No events on this page — more activity may be available</div>'
+        : (pilotActivityTruncated
+          ? '<div style="font-size:12px;color:var(--fg-tertiary);padding:8px 0">Activity truncated — no events available</div>'
+          : '<div style="font-size:12px;color:var(--fg-tertiary);padding:8px 0">No tool activity recorded</div>');
+      // A page can legitimately return zero events while still carrying a cursor
+      // (e.g. every event on that page was redacted) — the control must stay
+      // reachable so bounded-but-incomplete data never masquerades as "nothing here".
+      moreBtn.hidden = !pilotActivityCursor;
       moreBtn.onclick = loadMorePilotActivity;
       return;
     }

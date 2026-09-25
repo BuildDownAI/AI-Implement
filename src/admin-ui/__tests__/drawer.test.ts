@@ -715,6 +715,28 @@ describe("job drawer restate attempt section", () => {
     win.closeJobDrawer();
   });
 
+  it("keeps the Load more control reachable when a page returns zero events but a valid next cursor", async () => {
+    const EMPTY_PAGE_WITH_CURSOR = {
+      events: [],
+      nextCursor: { producerId: "p1", sequence: 5 },
+      truncated: true,
+    };
+    const { win, doc } = mountPilotDrawer({
+      job: PILOT_JOB,
+      attemptStatus: 200,
+      attempt: pilotAttemptFixture(),
+      activityPages: [EMPTY_PAGE_WITH_CURSOR],
+    });
+    await win.openJobDrawer(10);
+
+    const activityText = doc.getElementById("drawer-pilot-activity")!.textContent || "";
+    expect(activityText).not.toContain("No tool activity recorded");
+    expect(activityText).not.toContain("Activity truncated — no events available");
+    const moreBtn = doc.getElementById("drawer-pilot-activity-more") as unknown as { hidden: boolean };
+    expect(moreBtn.hidden).toBe(false);
+    win.closeJobDrawer();
+  });
+
   it("keeps loaded activity in place across a background refresh of the same attempt", async () => {
     const { win, doc } = mountPilotDrawer({
       job: PILOT_JOB,
