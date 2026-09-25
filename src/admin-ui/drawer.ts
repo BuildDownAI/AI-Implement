@@ -422,7 +422,7 @@ export const drawerScript = `
       else badgeKind = 'neutral';
 
       const logsLink = step.logsUrl
-        ? '<a class="btn btn-sm" href="' + window.safeUrl(step.logsUrl) + '" target="_blank" style="font-size:11px">Logs ↗</a>'
+        ? '<a class="btn btn-sm" href="' + window.escAttr(window.safeUrl(step.logsUrl)) + '" target="_blank" style="font-size:11px">Logs ↗</a>'
         : '';
 
       html += '<div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--border-subtle);font-size:12.5px">'
@@ -493,7 +493,7 @@ export const drawerScript = `
       // The server resolves issueUrl through the mapping's ticketing provider, so the
       // drawer never has to know which tracker (or which Jira site) a project uses.
       const valueHtml = job.issueUrl
-        ? '<a class="text-accent" href="' + window.safeUrl(job.issueUrl) + '" target="_blank">' + window.esc(job.issueIdentifier) + ' &#8599;</a>'
+        ? '<a class="text-accent" href="' + window.escAttr(window.safeUrl(job.issueUrl)) + '" target="_blank">' + window.esc(job.issueIdentifier) + ' &#8599;</a>'
         : window.esc(job.issueIdentifier);
       fields.push({ label: 'Issue', value: valueHtml });
     }
@@ -523,7 +523,7 @@ export const drawerScript = `
       const prNum = job.prUrl.split('/').pop() || '';
       fields.push({
         label: 'Pull request',
-        value: '<a class="text-accent" href="' + window.safeUrl(job.prUrl) + '" target="_blank">#' + window.esc(prNum) + ' &#8599;</a>'
+        value: '<a class="text-accent" href="' + window.escAttr(window.safeUrl(job.prUrl)) + '" target="_blank">#' + window.esc(prNum) + ' &#8599;</a>'
       });
     }
 
@@ -852,8 +852,9 @@ export const drawerScript = `
   async function runPilotAction(attemptId, action, body) {
     if (!window.isAdmin()) return;
     const jobId = currentJobId;
+    const generation = pilotGeneration;
     const report = function (message) {
-      if (currentJobId === jobId && currentAttemptId === attemptId) setPilotActionStatus(message);
+      if (currentJobId === jobId && currentAttemptId === attemptId && pilotGeneration === generation) setPilotActionStatus(message);
     };
     // "accepted" describes the POST being queued, never that the action has taken
     // effect — the attempt's own state badge above is the source of truth for that,

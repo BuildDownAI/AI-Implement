@@ -589,6 +589,15 @@ function mountPilotDrawer(opts: {
 }
 
 describe("job drawer restate attempt section", () => {
+  it("escapes legacy issue, PR, and step-log link attributes", async () => {
+    const injected = 'https://example.test/123" onmouseover="alert(1)';
+    const { win, doc } = mountDrawer({ ...BASE_JOB, issueUrl: injected, prUrl: injected }, [{ ...PASSED_STEP, logsUrl: injected }]);
+    await win.openJobDrawer(1);
+    const links = doc.querySelectorAll("#drawer-context a, #drawer-steps a");
+    expect(links).toHaveLength(3);
+    for (const link of links) expect(link.getAttribute("onmouseover")).toBeNull();
+    win.closeJobDrawer();
+  });
   it("retries page one after an initial attempt read failure", async () => {
     const { win, doc, calls } = mountPilotDrawer({ job: PILOT_JOB, attemptStatus: 503, attempt: pilotAttemptFixture() });
     const api = win.api;
@@ -738,6 +747,26 @@ describe("job drawer restate attempt section", () => {
     expect(doc.getElementById("drawer-pilot-action-status")!.textContent).toContain("accepted");
     expect((doc.getElementById("drawer-pilot-adopt-run-id") as HTMLInputElement).value).toBe("12345");
     expect((doc.getElementById("drawer-pilot-adopt-run-attempt") as HTMLInputElement).value).toBe("2");
+    win.closeJobDrawer();
+  });
+
+  it("discards an old action response after reopening the same job", async () => {
+    const { win, doc } = mountPilotDrawer({ job: PILOT_JOB, attemptStatus: 200, attempt: pilotAttemptFixture() });
+    const api = win.api;
+    let finish!: () => void;
+    win.api = async (url: string, options?: { method?: string }) => {
+      if (url.endsWith("/reconcile") && options?.method === "POST") {
+        return new Promise((resolve) => { finish = () => resolve({ ok: true, status: 202, json: async () => ({ status: "accepted" }) }); });
+      }
+      return api(url, options);
+    };
+    await win.openJobDrawer(10);
+    const pending = (doc.getElementById("drawer-pilot-reconcile") as unknown as { onclick: () => Promise<void> }).onclick();
+    win.closeJobDrawer();
+    await win.openJobDrawer(10);
+    finish();
+    await pending;
+    expect(doc.getElementById("drawer-pilot-action-status")!.textContent).toBe("");
     win.closeJobDrawer();
   });
 
