@@ -241,9 +241,23 @@ export function getDb(): Database.Database {
         released_at INTEGER,
         release_reason TEXT,
         execution_id TEXT,
+        generation INTEGER NOT NULL DEFAULT 0,
         CHECK (pr_number IS NULL OR (installation_id IS NOT NULL AND repository IS NOT NULL))
       )
     `);
+    // AII-775 review fix: a released dispatch_id can be reacquired by a new
+    // owner-equivalent reservation (e.g. two "legacy" holders), so matching
+    // release() on (dispatch_id, lifecycle_owner) alone lets a delayed release
+    // from the first holder clear its replacement. generation disambiguates
+    // successive reservations under the same dispatch_id.
+    const dispatchAdmissionColumns = new Set(
+      (db.prepare("PRAGMA table_info(dispatch_admissions)").all() as Array<{ name: string }>).map(
+        (column) => column.name,
+      ),
+    );
+    if (!dispatchAdmissionColumns.has("generation")) {
+      db.exec("ALTER TABLE dispatch_admissions ADD COLUMN generation INTEGER NOT NULL DEFAULT 0");
+    }
     db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_dispatch_admissions_active_issue
       ON dispatch_admissions(issue_scope, issue_id)
       WHERE released_at IS NULL AND pr_number IS NULL`);
