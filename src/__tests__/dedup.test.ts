@@ -215,11 +215,17 @@ describe("review-fix activity and cycle schema", () => {
     expect(db.prepare("SELECT accepted_bytes FROM review_fix_activity_streams WHERE attempt_id = 'attempt-1'").get())
       .toEqual({ accepted_bytes: 10 * 1024 * 1024 });
     expect(() => insertActivity.run(640, "hash-640", "{}", 2)).toThrow(/CHECK/);
+    db.prepare(`INSERT INTO review_fix_activity
+      (attempt_id, producer_id, sequence, payload_hash, kind, cycle, occurred_at,
+       redacted_payload_json, byte_count)
+      VALUES ('attempt-2', 'runner-1', 0, 'other-hash', 'tool-result', 1, 102, '{}', 2)`).run();
+    expect(db.prepare("SELECT accepted_bytes FROM review_fix_activity_streams WHERE attempt_id = 'attempt-2'").get())
+      .toEqual({ accepted_bytes: 2 });
     db.prepare(`INSERT INTO review_fix_activity_producers
       (attempt_id, producer_id, highest_contiguous_sequence, final_sequence, limit_reached_at)
       VALUES ('attempt-1', 'runner-1', 639, 640, 101)`).run();
-    db.prepare(`INSERT INTO review_fix_activity_streams
-      (attempt_id, limit_reached_at, truncated_at) VALUES ('attempt-2', 102, 102)`).run();
+    db.prepare(`UPDATE review_fix_activity_streams
+      SET limit_reached_at = 102, truncated_at = 102 WHERE attempt_id = 'attempt-2'`).run();
     db.prepare(`INSERT INTO review_fix_cycles
       (attempt_id, cycle, summary_id, summary_hash, input_commit, output_commit,
        dispositions_json, tests_json, verdict, usage_json, completed_at)
@@ -231,6 +237,8 @@ describe("review-fix activity and cycle schema", () => {
       .toEqual({ accepted_bytes: 10 * 1024 * 1024, limit_reached_at: null });
     expect(reopened.prepare("SELECT final_sequence, limit_reached_at FROM review_fix_activity_producers WHERE attempt_id = 'attempt-1'").get())
       .toEqual({ final_sequence: 640, limit_reached_at: 101 });
+    expect(reopened.prepare("SELECT accepted_bytes, truncated_at FROM review_fix_activity_streams WHERE attempt_id = 'attempt-2'").get())
+      .toEqual({ accepted_bytes: 2, truncated_at: 102 });
     expect(reopened.prepare("SELECT input_commit, output_commit, verdict FROM review_fix_cycles WHERE attempt_id = 'attempt-1'").get())
       .toEqual({ input_commit: "before", output_commit: "after", verdict: "passed" });
   });
