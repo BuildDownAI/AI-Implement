@@ -50,6 +50,7 @@
 import { createHash } from "node:crypto";
 import { getDb } from "./dedup.js";
 import { isDeployHeld } from "./deploy-hold.js";
+import { isParked } from "./dispatch-breaker.js";
 import { getMappings, resolvePrDispatchBudget, type RepoMapping } from "./config.js";
 import { acceptDelivery } from "./review-fix-inbox.js";
 import { unprocessedOpenReviewFindings } from "./review-fix-pending.js";
@@ -175,8 +176,8 @@ function hashResult(result: ReviewFixResultMetadataV1): string {
   return createHash("sha256").update(JSON.stringify(result)).digest("hex");
 }
 
-function mapDeferReason(reason: Extract<DispatchAdmissionDecision, { ok: false }>["reason"]): "occupied" | "at_capacity" | "budget_exhausted" {
-  return reason === "at_capacity" || reason === "budget_exhausted" ? reason : "occupied";
+function mapDeferReason(reason: Extract<DispatchAdmissionDecision, { ok: false }>["reason"]): "paused" | "occupied" | "at_capacity" | "budget_exhausted" {
+  return reason === "parked" ? "paused" : reason;
 }
 
 export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
@@ -191,6 +192,7 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
       // first would leak the live reservation/budget slot on retry.
       const findings = request.feedback.findings.slice(0, MAX_REVIEW_FIX_FINDING_VERSIONS);
       const cursor = request.feedback.queueCursor;
+      let queueIssueId: string | null = null;
       const base = deriveContentDispatchId(request.scope, request.feedback.taskText, findings, cursor);
       const { dispatchId, replay } = resolveDispatchId(db, base);
       if (replay) {
@@ -202,13 +204,15 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
 
       if (cursor) {
         const queue = db.prepare(`
-          SELECT id FROM review_fix_queue WHERE id = ? AND repo = ? AND pr_number = ? AND status = 'pending'
-        `).get(cursor.queueId, request.scope.repository, request.scope.prNumber);
+          SELECT id, issue_id FROM review_fix_queue WHERE id = ? AND repo = ? AND pr_number = ? AND status = 'pending'
+        `).get(cursor.queueId, request.scope.repository, request.scope.prNumber) as
+          { id: number; issue_id: string } | undefined;
         const newest = db.prepare("SELECT MAX(id) AS id FROM review_fix_events WHERE queue_id = ?")
           .get(cursor.queueId) as { id: number | null };
         if (!queue || newest.id === null || newest.id < cursor.eventId) {
           return { status: "deferred", reason: "occupied" };
         }
+        queueIssueId = queue.issue_id;
         const available = new Set(unprocessedOpenReviewFindings(request.scope).map(
           (finding) => JSON.stringify([finding.findingKey, finding.revision]),
         ));
@@ -245,6 +249,7 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
           lifecycleOwner: { kind: "restate", attemptId: dispatchId },
           cap: mapping.maxInProgressAiIssues,
           prDispatchBudget: resolvePrDispatchBudget(mapping),
+          parked: queueIssueId !== null && isParked(queueIssueId, "gap-analysis"),
         },
         () => {
           db.prepare(`

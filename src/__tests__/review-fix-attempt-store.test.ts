@@ -23,6 +23,7 @@ import type * as QueueModule from "../review-fix-queue.js";
 import type * as PendingModule from "../review-fix-pending.js";
 import type * as CloseModule from "../review-fix-close.js";
 import type * as AdminFacadeModule from "../review-fix-admin-facade.js";
+import type * as BreakerModule from "../dispatch-breaker.js";
 import type { ReviewFixAdmissionRequest, ReviewFixAttemptStorePort } from "../review-fix-ports.js";
 import type { ReviewFixResultMetadataV1, ScopedPrIdentity } from "../review-fix-contract.js";
 import type { RepoMapping } from "../config.js";
@@ -36,6 +37,7 @@ let queue: typeof QueueModule;
 let pending: typeof PendingModule;
 let close: typeof CloseModule;
 let adminFacade: typeof AdminFacadeModule;
+let breaker: typeof BreakerModule;
 
 beforeEach(async () => {
   vi.resetModules();
@@ -52,6 +54,8 @@ beforeEach(async () => {
   pending = await import("../review-fix-pending.js");
   close = await import("../review-fix-close.js");
   adminFacade = await import("../review-fix-admin-facade.js");
+  breaker = await import("../dispatch-breaker.js");
+  breaker.initDispatchBreakerTable();
 });
 
 afterEach(() => {
@@ -288,6 +292,18 @@ describe("SqliteReviewFixAttemptStore: admission", () => {
     expect(nextFeedback.queueCursor!.eventId).toBeGreaterThan(firstFeedback.queueCursor!.eventId);
     const second = await store.admit(admissionRequest({ feedback: nextFeedback }));
     expect(second.status).toBe("prepared");
+  });
+
+  it("defers parked automatic feedback without spending a reservation or budget entry", async () => {
+    seedMapping();
+    queue.enqueueReviewFix({ issueId: "issue-42", issueIdentifier: "AII-42", repo: SCOPE.repository,
+      prNumber: SCOPE.prNumber, reason: "review_feedback", sourceEventId: "event-1" });
+    breaker.parkIssue("issue-42", "gap-analysis", "pr_budget");
+    const feedback = pending.loadPendingReviewFixFeedback(SCOPE, null)!;
+    const store = new storeModule.SqliteReviewFixAttemptStore();
+    expect(await store.admit(admissionRequest({ feedback }))).toEqual({ status: "deferred", reason: "paused" });
+    expect(queue.getPendingReviewFixes()).toHaveLength(1);
+    expect((dedup.getDb().prepare("SELECT COUNT(*) AS n FROM dispatch_admissions").get() as { n: number }).n).toBe(0);
   });
 
   it("prepares a reservation, deadline, and exactly one budget entry", async () => {
