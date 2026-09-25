@@ -5,10 +5,33 @@ vi.mock("node:child_process", () => ({
 }));
 
 import { spawnSync } from "node:child_process";
-import { refreshRunnerGithubCredentials, refreshRunnerGithubToken } from "../runner-token.js";
+import { assertRunnerPublicationAuthority, refreshRunnerGithubCredentials, refreshRunnerGithubToken } from "../runner-token.js";
 import { __resetPublicationCredentialForTests } from "../publication-credential.js";
 
 describe("refreshRunnerGithubToken", () => {
+  it("rechecks pilot authority for the exact GitHub execution before publication", async () => {
+    const config = {
+      v: 1,
+      issue: { id: "issue-1", identifier: "AII-799", title: "Test", description: "Test" },
+      reviewFix: { version: 1, attemptId: "attempt-1", installationId: 7,
+        repository: "acme/app", prNumber: 42, deadlineAt: Date.now() + 60_000 },
+    };
+    vi.stubEnv("AI_IMPLEMENT_RUN_CONFIG", Buffer.from(JSON.stringify(config)).toString("base64"));
+    vi.stubEnv("RUN_TOKEN", "result-token");
+    vi.stubEnv("GITHUB_RUN_ID", "123");
+    vi.stubEnv("GITHUB_RUN_ATTEMPT", "2");
+    const fetchImpl = vi.fn().mockResolvedValue({ ok: true, status: 200 } as Response);
+    await assertRunnerPublicationAuthority({ callbackUrl: "https://orchestrator.example", owner: "acme", repo: "app", fetchImpl });
+    expect(fetchImpl).toHaveBeenCalledWith("https://orchestrator.example/api/runner/publication-authority", expect.objectContaining({
+      headers: {
+        Authorization: "Bearer result-token", "x-run-repository": "acme/app",
+        "x-github-run-id": "123", "x-github-run-attempt": "2",
+      },
+    }));
+    fetchImpl.mockResolvedValue({ ok: false, status: 403 } as Response);
+    await expect(assertRunnerPublicationAuthority({ callbackUrl: "https://orchestrator.example", owner: "acme", repo: "app", fetchImpl }))
+      .rejects.toThrow(/authority rejected with HTTP 403/);
+  });
   beforeEach(() => {
     vi.clearAllMocks();
   });

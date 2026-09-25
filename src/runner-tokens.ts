@@ -155,6 +155,11 @@ interface PreparedAttemptTokenRow {
   pr_number: number;
   deadline_at: number;
   authority_revoked_at: number | null;
+  state: string;
+  github_run_id: number | null;
+  github_run_attempt: number | null;
+  terminal_outcome_json: string | null;
+  completed_at: number | null;
   owner: string;
   lifecycle_owner: string;
   admission_mapping_key: string;
@@ -172,7 +177,8 @@ function preparedAttempt(attemptId: string): PreparedAttemptTokenRow | undefined
   return getDb().prepare(`
     SELECT a.attempt_id, a.dispatch_id, a.issue_scope, a.issue_id, a.mapping_key,
            a.installation_id, a.repository, a.pr_number, a.deadline_at,
-           a.authority_revoked_at, a.owner, d.lifecycle_owner,
+           a.authority_revoked_at, a.state, a.github_run_id, a.github_run_attempt,
+           a.terminal_outcome_json, a.completed_at, a.owner, d.lifecycle_owner,
            d.mapping_key AS admission_mapping_key, d.issue_scope AS admission_issue_scope,
            d.issue_id AS admission_issue_id, d.installation_id AS admission_installation_id,
            d.repository AS admission_repository, d.pr_number AS admission_pr_number,
@@ -213,6 +219,10 @@ export function mintPreparedReviewFixToken(input: {
     const attempt = preparedAttempt(input.attemptId);
     if (!attempt || !hasPreparedAdmissionAuthority(attempt)) {
       throw new Error("Prepared review-fix attempt has no current authority");
+    }
+    if (input.audience === "publication" && (Date.now() >= attempt.deadline_at
+      || attempt.terminal_outcome_json !== null || attempt.completed_at !== null)) {
+      throw new Error("Prepared review-fix publication authority has ended");
     }
     const latestExpiry = attempt.deadline_at + PILOT_DELIVERY_GRACE_MS;
     if (!Number.isSafeInteger(latestExpiry) || latestExpiry <= Date.now()) {
@@ -262,7 +272,10 @@ export function verifyPreparedReviewFixToken(
   token: string,
   secret: string,
   expectedAudience: RunTokenAudience,
-  options: { consumePublication?: boolean } = {},
+  options: {
+    consumePublication?: boolean;
+    publicationExecution?: { repository: string; githubRunId: number; githubRunAttempt: number };
+  } = {},
 ): VerifyResult {
   const db = getDb();
   return db.transaction((): VerifyResult => {
@@ -282,6 +295,18 @@ export function verifyPreparedReviewFixToken(
     if (!row || claims.exp !== row.expires_at) return { ok: false, reason: "wrong_scope", claims };
     if (!hasPreparedAdmissionAuthority(attempt)) {
       return { ok: false, reason: "revoked", claims };
+    }
+    if (options.publicationExecution) {
+      const execution = options.publicationExecution;
+      if (attempt.repository !== execution.repository
+        || attempt.github_run_id !== execution.githubRunId
+        || attempt.github_run_attempt !== execution.githubRunAttempt) {
+        return { ok: false, reason: "wrong_scope", claims };
+      }
+      if (Date.now() >= attempt.deadline_at || attempt.terminal_outcome_json !== null
+        || attempt.completed_at !== null || attempt.state !== "launch_intent") {
+        return { ok: false, reason: "revoked", claims };
+      }
     }
     if (options.consumePublication) {
       if (expectedAudience !== "publication") return { ok: false, reason: "wrong_audience", claims };

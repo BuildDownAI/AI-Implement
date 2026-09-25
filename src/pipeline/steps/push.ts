@@ -3,7 +3,7 @@ import type { PipelineContext, StepModule, StepReporter } from "../types.js";
 import { formatGitNameStatusSummary, openOrFindPullRequest, PROVIDER_OUTAGE_TITLE_PREFIX, UNAPPROVED_TITLE_PREFIX } from "../step-utils.js";
 import { span } from "../timing.js";
 import { findSensitiveFiles, SensitiveFilesError } from "../sensitive-files.js";
-import { refreshRunnerGithubCredentials } from "../../runner-token.js";
+import { assertRunnerPublicationAuthority, refreshRunnerGithubCredentials } from "../../runner-token.js";
 import { getPublicationCredential } from "../../publication-credential.js";
 import { classifyGitFailure, envSecrets, oneLinerMessage, type FailureRecord } from "../failure-classification.js";
 import { computeBackoffMs, normalizeRetryPolicy } from "../retry-backoff.js";
@@ -269,6 +269,7 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
       return ` (${capped})`;
     };
     for (;;) {
+      await assertRunnerPublicationAuthority({ callbackUrl: inputs.callbackUrl, owner: repoOwner, repo: repoRepo });
       const { args: pushArgs, env: pushEnv } = buildGitPushInvocation(
         remote,
         remoteRef,

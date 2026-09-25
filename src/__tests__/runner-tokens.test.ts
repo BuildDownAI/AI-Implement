@@ -380,6 +380,48 @@ function resignPilotClaims(token: string, changes: Record<string, unknown>): str
 }
 
 describe("prepared review-fix credentials", () => {
+  it("permits publication only for the bound live execution, then rejects revocation and termination", () => {
+    seedPreparedPilotAttempt();
+    const db = dedup.getDb();
+    db.prepare("UPDATE review_fix_attempts SET state = 'launch_intent', github_run_id = 123, github_run_attempt = 2 WHERE attempt_id = ?")
+      .run(PILOT_ATTEMPT);
+    const publication = runnerTokens.mintPreparedReviewFixToken({ attemptId: PILOT_ATTEMPT, audience: "publication", secret: SECRET });
+    const result = runnerTokens.mintPreparedReviewFixToken({ attemptId: PILOT_ATTEMPT, audience: "result", secret: SECRET });
+    const execution = { repository: "acme/app", githubRunId: 123, githubRunAttempt: 2 };
+    expect(runnerTokens.verifyPreparedReviewFixToken(result.token, SECRET, "result", { publicationExecution: execution }).ok).toBe(true);
+    expect(runnerTokens.verifyPreparedReviewFixToken(publication.token, SECRET, "publication", {
+      consumePublication: true, publicationExecution: { ...execution, githubRunAttempt: 3 },
+    })).toMatchObject({ ok: false, reason: "wrong_scope" });
+    expect(runnerTokens.verifyPreparedReviewFixToken(publication.token, SECRET, "publication", {
+      consumePublication: true, publicationExecution: execution,
+    }).ok).toBe(true);
+    db.prepare("UPDATE review_fix_attempts SET authority_revoked_at = ? WHERE attempt_id = ?").run(Date.now(), PILOT_ATTEMPT);
+    expect(runnerTokens.verifyPreparedReviewFixToken(result.token, SECRET, "result", { publicationExecution: execution }))
+      .toMatchObject({ ok: false, reason: "revoked" });
+    db.prepare("UPDATE review_fix_attempts SET authority_revoked_at = NULL, terminal_outcome_json = '{}' WHERE attempt_id = ?")
+      .run(PILOT_ATTEMPT);
+    expect(runnerTokens.verifyPreparedReviewFixToken(result.token, SECRET, "result", { publicationExecution: execution }))
+      .toMatchObject({ ok: false, reason: "revoked" });
+  });
+
+  it("holds publication at the deadline while preserving result-delivery grace", () => {
+    const now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+    seedPreparedPilotAttempt(now + 1000);
+    const db = dedup.getDb();
+    db.prepare("UPDATE review_fix_attempts SET state = 'launch_intent', github_run_id = 123, github_run_attempt = 1 WHERE attempt_id = ?")
+      .run(PILOT_ATTEMPT);
+    const publication = runnerTokens.mintPreparedReviewFixToken({ attemptId: PILOT_ATTEMPT, audience: "publication", secret: SECRET });
+    const result = runnerTokens.mintPreparedReviewFixToken({ attemptId: PILOT_ATTEMPT, audience: "result", secret: SECRET });
+    clock.mockReturnValue(now + 1001);
+    const execution = { repository: "acme/app", githubRunId: 123, githubRunAttempt: 1 };
+    expect(runnerTokens.verifyPreparedReviewFixToken(publication.token, SECRET, "publication", {
+      consumePublication: true, publicationExecution: execution,
+    })).toMatchObject({ ok: false, reason: "revoked" });
+    expect(runnerTokens.verifyPreparedReviewFixToken(result.token, SECRET, "result").ok).toBe(true);
+    expect(() => runnerTokens.mintPreparedReviewFixToken({ attemptId: PILOT_ATTEMPT, audience: "publication", secret: SECRET }))
+      .toThrow(/publication authority has ended/);
+  });
   it("reuses the stored identity and expiry without resetting a consumed publication claim", () => {
     seedPreparedPilotAttempt();
     const first = runnerTokens.mintPreparedReviewFixToken({ attemptId: PILOT_ATTEMPT, audience: "publication", secret: SECRET });
