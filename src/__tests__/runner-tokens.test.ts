@@ -462,6 +462,19 @@ describe("prepared review-fix credentials", () => {
       .toMatchObject({ ok: false, reason: "revoked" });
   });
 
+  it("allows a credential retry during delivery grace but no first issuance after the deadline", () => {
+    const now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+    seedPreparedPilotAttempt(now + 1_000);
+    const first = runnerTokens.mintPreparedReviewFixToken({ attemptId: PILOT_ATTEMPT, audience: "result", secret: SECRET });
+    clock.mockReturnValue(now + 1_001);
+    expect(runnerTokens.mintPreparedReviewFixToken({ attemptId: PILOT_ATTEMPT, audience: "result", secret: SECRET }))
+      .toEqual(first);
+    expect(runnerTokens.verifyPreparedReviewFixToken(first.token, SECRET, "result").ok).toBe(true);
+    expect(() => runnerTokens.mintPreparedReviewFixToken({ attemptId: PILOT_ATTEMPT, audience: "progress", secret: SECRET }))
+      .toThrow(/deadline has passed/);
+  });
+
   it("rejects credentials if the admission is reassigned", () => {
     seedPreparedPilotAttempt();
     const minted = runnerTokens.mintPreparedReviewFixToken({ attemptId: PILOT_ATTEMPT, audience: "result", secret: SECRET });

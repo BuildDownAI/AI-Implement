@@ -218,6 +218,11 @@ export function mintPreparedReviewFixToken(input: {
     if (!Number.isSafeInteger(latestExpiry) || latestExpiry <= Date.now()) {
       throw new Error("Prepared review-fix credential has expired");
     }
+    const existing = db.prepare("SELECT 1 FROM runner_tokens WHERE dispatch_id = ? AND audience = ?")
+      .get(attempt.dispatch_id, input.audience);
+    if (!existing && Date.now() >= attempt.deadline_at) {
+      throw new Error("Prepared review-fix attempt deadline has passed");
+    }
     db.prepare(`
       INSERT INTO runner_tokens
         (dispatch_id, audience, issue_id, phase, expires_at, consumed_at, mapping_team_key)
