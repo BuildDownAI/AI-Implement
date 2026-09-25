@@ -199,3 +199,43 @@ Known gaps, for the next issue that touches the area:
 |---|---|
 | The real `restate-server` binary is never spawned in a test | The `RESTATE_*__*` env keys are verified by hand with `--dump-config`, not by a test. (`endpoint.restate.test.ts`'s container runs the Docker *image*, not the `@restatedev/restate-server` platform binary `RestateSidecar` spawns in production — a different artifact) |
 | `restate-tests` is not a required check on `testing` | A red job does not block a merge until an operator marks the check required |
+
+## `review-fix-pilot.restate.test.ts`: the production-composition fault matrix (AII-813)
+
+`review-fix-attempt.restate.test.ts` (AII-796) and `review-fix-pr.restate.test.ts` (AII-800)
+prove the durable workflow and PR coordinator against fully in-memory `store`/`worker`/
+`finalizer` doubles — fast, but they never exercise `SqliteReviewFixAttemptStore`'s real
+admission SQL, `review-fix-finalize.ts`'s real approval-effect idempotency, `review-fix-inbox.ts`'s
+real delivery ledger, or `GithubReviewFixWorker`/`createReviewFixGithubAdapter`'s real
+reconciliation logic. `review-fix-pilot.restate.test.ts` composes those production modules for
+real — the same `createReviewFixPR` / `createReviewFixAttempt` / `SqliteReviewFixAttemptStore` /
+`createReviewFixFinalizer` / `GithubReviewFixWorker` / `createReviewFixGithubAdapter` /
+`ReviewFixDeliveryPump` a live pilot would run — and fakes only the external GitHub transport,
+the GitHub REST fetch layer, and the PR coordinator's admission-eligibility/pending-feedback
+reads (the same seams `review-fix-production.ts` itself calls out to GitHub for). Both files stay
+in the tree; this one does not re-prove the fixed 5-second coalescing window's exact timing,
+which AII-800's suite already covers precisely against a faster-to-assert fake.
+
+**What this file's assertions are proof of, by claim type:**
+
+| Claim | Kind | Where |
+|---|---|---|
+| Admission SQL (capacity, PR budget, pause, 30-finding cap, re-admission of a re-reported finding) is race-free and idempotent under real `dispatch_admissions`/`dispatch_budget_entries`/`review_fix_attempts` writes | Real engine + real SQLite | every "Admission:" scenario |
+| A crashed `ctx.run` step (admission commit before journal, result commit before ACK) converges to exactly one durable effect on engine retry | Real engine + real SQLite | the two `alwaysReplay`-only "crash window" scenarios, `crashAfterFirstCall` |
+| A crashed inbox delivery (HTTP ack lost after the real handler ran) redelivers to exactly one outcome | Real engine + real SQLite + real `ReviewFixDeliveryPump`/facade | "inbox commit before ACK" |
+| A crashed approval-effect write reconciles via `retryApprovalEffect` without a second GitHub write | Real engine + real SQLite + real finalizer, simulated GitHub write (fake `fetch`) | "final approval effect before acknowledgement" |
+| Launch response loss, uncertain-launch reconciliation (including the two-minute-equivalent unknown-launch alert actually firing), definitive rejection, duplicate/conflicting result intake, a stale result delivered after the attempt's final outcome (alerts, never rewrites the recorded outcome), GitHub-success-without-result, cancel/closed-PR/unverifiable-termination | Real engine + real SQLite + real worker/finalizer adapters, simulated GitHub Actions API (fake transport/fetch) | the matching named scenarios |
+| GitHub-success-without-result specifically never approves *before* the deadline, not just *at* it | Real engine + real SQLite, checked directly against `review_fix_attempts.terminal_outcome_json`/`accepted_result_json` and `dispatch_admissions.released_at` partway through a real (short) deadline window — `RestateTestEnvironment` has no virtual-clock/timer-control API to fast-forward past the wait instead (confirmed against its type declarations), so this mid-window SQLite read, not a simulated clock, is the deterministic "not yet" proof | "GitHub success without a stored result never approves and stops without approval at the deadline" |
+| A restart (replaced SDK endpoint + restarted, disk-backed Restate container) resumes the same attempt from the same SQLite row and the same journal | Real engine + real SQLite, across a genuine container restart | the final "restart" scenario |
+| GitHub's actual dispatch/reconcile/check-run/review/merge-policy behavior, its actual rate limits, and its actual eventual consistency (e.g. `workflow_dispatch` run-listing lag) | **Not proven here** — simulated by hand-built fixtures | needs live evidence |
+| The literal two real minutes of `REVIEW_FIX_UNKNOWN_LAUNCH_ALERT_MINUTES` elapsing in production | **Not proven here** — `review-fix-attempt.ts`'s workflow now accepts an optional `unknownLaunchAlertMs` override (defaulting to the real two minutes; production composition leaves it unset), and this suite's shared `attemptWorkflow` supplies a one-second value so the uncertain-launch scenario asserts the `alert-unknown-launch` callback actually fires (reason including "launch identity still unresolved") without a 120s+ test. This proves the alert-firing code path — the same comparison and callback production uses — end to end against the real engine; it does not independently exercise the production constant's literal value, which is a one-line arithmetic input to that same path | a long-running live/soak test is the only way to observe the real two-minute constant elapse; not required for AII-813 |
+| Deployment drain (`register()`'s conflict/force-registration path) and the workflow/journal/idempotency retention configuration | Already proven elsewhere, not duplicated here | `endpoint.restate.test.ts` / `endpoint-registration.restate.test.ts` (drain); `REVIEW_FIX_RETENTION_MS` metadata assertion in `review-fix-attempt.restate.test.ts` (retention) |
+| Real Fly Machines/GitHub Actions runner container behavior under the pilot | **Not proven anywhere in this repo's test tree** | needs live evidence — this is the same class of gap the "real `restate-server` binary" row above already names for the engine itself |
+
+This file was authored in a session with no local Docker daemon (`docker info` failed), the same
+constraint `endpoint.restate.test.ts` (AII-727) recorded in its own header comment and in this
+doc's "Container-to-host reachability" section above. It has not been run against a live
+container; `npm run test:restate` in CI (pinned server 1.7.10) is its first real execution, and
+its pass/fail there — not this document — is the authoritative evidence for AII-813's "both
+container variants and SDK boundary suite pass" acceptance criterion. `npx tsc --noEmit --project
+tsconfig.restate-tests.json` passes as of the commit that added this section.
