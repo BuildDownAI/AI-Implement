@@ -90,7 +90,7 @@ describe("acquire — no double-spend or phantom release", () => {
     const blocked = admission.acquire(issueRequest({ dispatchId: "c", scope: { kind: "issue", issueScope: "s", issueId: "issue-c" }, cap: 2 }));
     expect(blocked).toEqual({ ok: false, reason: "at_capacity", count: 2, cap: 2 });
 
-    expect(admission.release("a", LEGACY, "finalized")).toEqual({ status: "released" });
+    expect(a.ok && admission.release("a", LEGACY, a.record.generation, "finalized")).toEqual({ status: "released" });
 
     const c = admission.acquire(issueRequest({ dispatchId: "c", scope: { kind: "issue", issueScope: "s", issueId: "issue-c" }, cap: 2 }));
     expect(c.ok).toBe(true);
@@ -101,25 +101,48 @@ describe("acquire — no double-spend or phantom release", () => {
 
   it("releasing an already-released or never-acquired identity is a no-op and does not throw", () => {
     admission.acquire(issueRequest({ dispatchId: "a" }));
-    expect(admission.release("a", LEGACY, "finalized")).toEqual({ status: "released" });
-    expect(admission.release("a", LEGACY, "finalized")).toEqual({ status: "not_owner" });
-    expect(admission.release("never-existed", LEGACY, "finalized")).toEqual({ status: "not_owner" });
+    expect(admission.release("a", LEGACY, 0, "finalized")).toEqual({ status: "released" });
+    expect(admission.release("a", LEGACY, 0, "finalized")).toEqual({ status: "not_owner" });
+    expect(admission.release("never-existed", LEGACY, 0, "finalized")).toEqual({ status: "not_owner" });
   });
 
   it("a mismatched-owner release does not clear a replacement's reservation", () => {
     admission.acquire(issueRequest({ dispatchId: "a", lifecycleOwner: RESTATE_A }));
-    expect(admission.release("a", LEGACY, "finalized")).toEqual({ status: "not_owner" });
-    expect(admission.release("a", RESTATE_B, "finalized")).toEqual({ status: "not_owner" });
+    expect(admission.release("a", LEGACY, 0, "finalized")).toEqual({ status: "not_owner" });
+    expect(admission.release("a", RESTATE_B, 0, "finalized")).toEqual({ status: "not_owner" });
     expect(admission.read("a")?.releasedAt).toBeNull();
 
-    expect(admission.release("a", RESTATE_A, "finalized")).toEqual({ status: "released" });
+    expect(admission.release("a", RESTATE_A, 0, "finalized")).toEqual({ status: "released" });
     expect(admission.read("a")?.releasedAt).not.toBeNull();
+  });
+
+  it("a mismatched-generation release does not clear a replacement's reservation even with the same owner", () => {
+    // Regression for the review finding: `release` matching on (dispatchId, owner) alone
+    // lets a delayed release from a released reservation clear its replacement whenever
+    // both share an encoded owner — trivially true for every `{ kind: "legacy" }` holder.
+    const a = admission.acquire(issueRequest({ dispatchId: "shared", lifecycleOwner: LEGACY }));
+    expect(a.ok).toBe(true);
+    if (!a.ok) throw new Error("unreachable");
+    expect(admission.release("shared", LEGACY, a.record.generation, "finalized")).toEqual({ status: "released" });
+
+    const b = admission.acquire(issueRequest({ dispatchId: "shared", lifecycleOwner: LEGACY }));
+    expect(b.ok).toBe(true);
+    if (!b.ok) throw new Error("unreachable");
+    expect(b.record.generation).not.toBe(a.record.generation);
+
+    // A's release replays with A's stale generation against B's owner-identical row.
+    expect(admission.release("shared", LEGACY, a.record.generation, "launch_rejected")).toEqual({ status: "not_owner" });
+    expect(admission.read("shared")?.releasedAt).toBeNull();
+    expect(admission.count("AII")).toBe(1);
+
+    expect(admission.release("shared", LEGACY, b.record.generation, "finalized")).toEqual({ status: "released" });
   });
 
   it("reacquiring an already-released dispatchId yields a fresh reservation, not a reused slot", () => {
     const first = admission.acquire(issueRequest({ dispatchId: "a" }));
     expect(first.ok).toBe(true);
-    admission.release("a", LEGACY, "finalized");
+    if (!first.ok) throw new Error("unreachable");
+    admission.release("a", LEGACY, first.record.generation, "finalized");
     expect(admission.read("a")?.releasedAt).not.toBeNull();
 
     const second = admission.acquire(issueRequest({ dispatchId: "a" }));
@@ -127,19 +150,20 @@ describe("acquire — no double-spend or phantom release", () => {
     if (second.ok) {
       expect(second.record.releasedAt).toBeNull();
       expect(second.record.releaseReason).toBeNull();
-      if (first.ok) {
-        expect(second.record.createdAt).toBeGreaterThanOrEqual(first.record.createdAt);
-      }
+      expect(second.record.generation).toBeGreaterThan(first.record.generation);
+      expect(second.record.createdAt).toBeGreaterThanOrEqual(first.record.createdAt);
     }
     expect(admission.read("a")?.releasedAt).toBeNull();
     expect(admission.count("AII")).toBe(1);
 
-    expect(admission.release("a", LEGACY, "finalized")).toEqual({ status: "released" });
+    if (second.ok) {
+      expect(admission.release("a", LEGACY, second.record.generation, "finalized")).toEqual({ status: "released" });
+    }
   });
 
   it("reacquiring a released dispatchId re-evaluates occupancy and capacity rather than skipping the checks", () => {
-    admission.acquire(issueRequest({ dispatchId: "a", cap: 1 }));
-    admission.release("a", LEGACY, "finalized");
+    const a = admission.acquire(issueRequest({ dispatchId: "a", cap: 1 }));
+    if (a.ok) admission.release("a", LEGACY, a.record.generation, "finalized");
 
     const blockerScope = { kind: "issue" as const, issueScope: "team-a", issueId: "AII-1" };
     const blocker = admission.acquire(issueRequest({ dispatchId: "blocker", scope: blockerScope, cap: 1 }));
@@ -200,10 +224,10 @@ describe("acquire — human override obeys capacity but bypasses parked/budget",
     const PR = { kind: "pr" as const, issueId: "AII-b", installationId: "7", repository: "BuildDownAI/AI-Implement", prNumber: 42 };
     const one = admission.acquire(prRequest({ dispatchId: "b1", scope: PR, prDispatchBudget: 2 }));
     expect(one.ok).toBe(true);
-    admission.release("b1", LEGACY, "finalized");
+    if (one.ok) admission.release("b1", LEGACY, one.record.generation, "finalized");
     const two = admission.acquire(prRequest({ dispatchId: "b2", scope: PR, prDispatchBudget: 2 }));
     expect(two.ok).toBe(true);
-    admission.release("b2", LEGACY, "finalized");
+    if (two.ok) admission.release("b2", LEGACY, two.record.generation, "finalized");
 
     const blocked = admission.acquire(prRequest({ dispatchId: "b3", scope: PR, prDispatchBudget: 2 }));
     expect(blocked).toEqual({ ok: false, reason: "budget_exhausted", count: 0, cap: 5 });
@@ -219,16 +243,16 @@ describe("acquire — reacquiring a released PR-scoped dispatchId", () => {
 
     const first = admission.acquire(prRequest({ dispatchId: "retry-pr", scope: PR, prDispatchBudget: 2 }));
     expect(first.ok).toBe(true);
-    admission.release("retry-pr", LEGACY, "launch_rejected");
+    if (first.ok) admission.release("retry-pr", LEGACY, first.record.generation, "launch_rejected");
 
     expect(() => admission.acquire(prRequest({ dispatchId: "retry-pr", scope: PR, prDispatchBudget: 2 }))).not.toThrow();
     const second = admission.acquire(prRequest({ dispatchId: "retry-pr", scope: PR, prDispatchBudget: 2 }));
     expect(second.ok).toBe(true);
-    admission.release("retry-pr", LEGACY, "finalized");
+    if (second.ok) admission.release("retry-pr", LEGACY, second.record.generation, "finalized");
 
     const third = admission.acquire(prRequest({ dispatchId: "second-pr", scope: PR, prDispatchBudget: 2 }));
     expect(third.ok).toBe(true);
-    admission.release("second-pr", LEGACY, "finalized");
+    if (third.ok) admission.release("second-pr", LEGACY, third.record.generation, "finalized");
 
     // Budget cap is 2. "retry-pr" recorded exactly one budget entry despite two
     // acquires (the second acquire's INSERT OR IGNORE kept the original), so this
@@ -293,7 +317,8 @@ describe("acquire — scope isolation", () => {
 
 describe("acquire — kg-refresh exclusion", () => {
   it("kg-refresh reservations are excluded from team-capacity counts and never spend capacity themselves", () => {
-    admission.acquire(issueRequest({ dispatchId: "kg-1", kind: "kg-refresh", cap: 1 }));
+    const kg1 = admission.acquire(issueRequest({ dispatchId: "kg-1", kind: "kg-refresh", cap: 1 }));
+    expect(kg1).toMatchObject({ ok: true, count: 0, cap: 1 });
     admission.acquire(issueRequest({ dispatchId: "kg-2", kind: "kg-refresh", scope: { kind: "issue", issueScope: "s", issueId: "kg-2" }, cap: 1 }));
     expect(admission.count("AII")).toBe(0);
 
@@ -302,7 +327,10 @@ describe("acquire — kg-refresh exclusion", () => {
     expect(admission.count("AII")).toBe(1);
 
     const anotherKg = admission.acquire(issueRequest({ dispatchId: "kg-3", kind: "kg-refresh", scope: { kind: "issue", issueScope: "s", issueId: "kg-3" }, cap: 1 }));
-    expect(anotherKg.ok).toBe(true);
+    // The decision's own `count` must match the authoritative `count()` reader — a
+    // kg-refresh acquire must not report count()+1 for a row that count() itself
+    // never includes.
+    expect(anotherKg).toMatchObject({ ok: true, count: 1, cap: 1 });
     expect(admission.count("AII")).toBe(1);
   });
 });
@@ -348,10 +376,10 @@ describe("acquire — prepare type contract", () => {
 describe("count", () => {
   it("returns the unreleased, non-kg-refresh count for a mapping key", () => {
     expect(admission.count("AII")).toBe(0);
-    admission.acquire(issueRequest({ dispatchId: "a" }));
+    const a = admission.acquire(issueRequest({ dispatchId: "a" }));
     admission.acquire(issueRequest({ dispatchId: "b", scope: { kind: "issue", issueScope: "s", issueId: "b" } }));
     expect(admission.count("AII")).toBe(2);
-    admission.release("a", LEGACY, "finalized");
+    if (a.ok) admission.release("a", LEGACY, a.record.generation, "finalized");
     expect(admission.count("AII")).toBe(1);
   });
 });

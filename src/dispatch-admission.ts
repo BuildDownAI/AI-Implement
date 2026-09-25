@@ -98,6 +98,13 @@ export interface DispatchAdmissionRecord {
   readonly kind: DispatchAdmissionKind;
   readonly backend: DispatchAdmissionBackend;
   readonly lifecycleOwner: LifecycleOwner;
+  /** Opaque token distinguishing this reservation from any other that has ever held
+   *  the same `dispatchId`. `release` must be given the generation it read (from
+   *  `acquire`'s decision or a subsequent `read`) — a generation mismatch resolves to
+   *  `not_owner` exactly like an owner mismatch, so a delayed release from a released
+   *  reservation can never clear its replacement even when both share the same
+   *  `lifecycleOwner` (e.g. two `{ kind: "legacy" }` holders in a row). */
+  readonly generation: number;
   readonly createdAt: number;
   readonly releasedAt: number | null;
   readonly releaseReason: string | null;
@@ -115,9 +122,10 @@ export type DispatchAdmissionDecision =
 export type DispatchAdmissionReleaseReason = "launch_rejected" | "cancelled" | "deadline_exceeded" | "finalized";
 
 /** `released` frees the slot. `not_owner` covers every case where this call must not
- *  clear the row: it does not exist, it is already released, or `owner` does not match
- *  the current holder — a stale completion racing a newer attempt's admission must
- *  never be able to clear its replacement. Not an error; safe to call again. */
+ *  clear the row: it does not exist, it is already released, or `owner`/`generation`
+ *  does not match the current holder — a stale completion racing a newer attempt's
+ *  admission must never be able to clear its replacement. Not an error; safe to call
+ *  again. */
 export type DispatchAdmissionReleaseOutcome = { readonly status: "released" } | { readonly status: "not_owner" };
 
 /** Rejects an `async`/Promise-returning `prepare` at the type level: such a callback's
@@ -140,6 +148,7 @@ interface Row {
   released_at: number | null;
   release_reason: string | null;
   execution_id: string | null;
+  generation: number;
 }
 
 function encodeOwner(owner: LifecycleOwner): string {
@@ -171,6 +180,7 @@ function toRecord(row: Row): DispatchAdmissionRecord {
     kind: row.phase as DispatchAdmissionKind,
     backend: row.backend as DispatchAdmissionBackend,
     lifecycleOwner: decodeOwner(row.lifecycle_owner),
+    generation: row.generation,
     createdAt: row.created_at,
     releasedAt: row.released_at,
     releaseReason: row.release_reason,
@@ -294,9 +304,9 @@ export function acquire(
       db.prepare(
         `INSERT INTO dispatch_admissions
           (dispatch_id, mapping_key, issue_scope, issue_id, installation_id, repository, pr_number,
-           lifecycle_owner, phase, backend, created_at, released_at, release_reason, execution_id)
+           lifecycle_owner, phase, backend, created_at, released_at, release_reason, execution_id, generation)
          VALUES (@dispatchId, @mappingKey, @issueScope, @issueId, @installationId, @repository, @prNumber,
-                 @lifecycleOwner, @phase, @backend, @createdAt, NULL, NULL, @executionId)
+                 @lifecycleOwner, @phase, @backend, @createdAt, NULL, NULL, @executionId, 0)
          ON CONFLICT(dispatch_id) DO UPDATE SET
            mapping_key = excluded.mapping_key,
            issue_scope = excluded.issue_scope,
@@ -310,7 +320,8 @@ export function acquire(
            created_at = excluded.created_at,
            released_at = NULL,
            release_reason = NULL,
-           execution_id = excluded.execution_id`,
+           execution_id = excluded.execution_id,
+           generation = dispatch_admissions.generation + 1`,
       ).run({
         dispatchId: request.dispatchId,
         mappingKey: request.mappingKey,
@@ -350,7 +361,11 @@ export function acquire(
     }
 
     const row = db.prepare("SELECT * FROM dispatch_admissions WHERE dispatch_id = ?").get(request.dispatchId) as Row;
-    return { ok: true, record: toRecord(row), count: capCount + 1, cap };
+    // kg-refresh reservations are excluded from `countActive`, so this insert never
+    // moves the authoritative count — returning `capCount + 1` here would overstate it
+    // for the one kind that doesn't spend capacity.
+    const resultingCount = request.kind === "kg-refresh" ? capCount : capCount + 1;
+    return { ok: true, record: toRecord(row), count: resultingCount, cap };
   })();
 }
 
@@ -370,20 +385,31 @@ export function count(mappingKey: string): number {
 }
 
 /**
- * Releases the reservation for exactly the supplied `owner`. A mismatched owner, an
- * already-released row, or an unknown `dispatchId` all resolve to `not_owner` — never
- * an exception, and never a mutation of someone else's reservation.
+ * Releases the reservation for exactly the supplied `owner` *and* `generation`. A
+ * mismatched owner, a mismatched generation, an already-released row, or an unknown
+ * `dispatchId` all resolve to `not_owner` — never an exception, and never a mutation of
+ * someone else's reservation.
+ *
+ * `generation` is required, not just `owner`, because `lifecycleOwner` alone is not
+ * unique per reservation: two successive holders of the same `dispatchId` can share an
+ * identical encoded owner (every `{ kind: "legacy" }` reservation encodes to the same
+ * string, and a caller could in principle reuse a `restate` `attemptId`). Without the
+ * generation check, a release call delayed past its own reservation's lifetime — e.g. a
+ * slow launch-failure callback for a reservation that was already released and
+ * reacquired by a new holder under the same `dispatchId`/`owner` — would match and clear
+ * the replacement's still-active reservation instead of safely no-op'ing.
  */
 export function release(
   dispatchId: string,
   owner: LifecycleOwner,
+  generation: number,
   reason: DispatchAdmissionReleaseReason,
 ): DispatchAdmissionReleaseOutcome {
   const result = getDb()
     .prepare(
       `UPDATE dispatch_admissions SET released_at = ?, release_reason = ?
-       WHERE dispatch_id = ? AND lifecycle_owner = ? AND released_at IS NULL`,
+       WHERE dispatch_id = ? AND lifecycle_owner = ? AND generation = ? AND released_at IS NULL`,
     )
-    .run(Date.now(), reason, dispatchId, encodeOwner(owner));
+    .run(Date.now(), reason, dispatchId, encodeOwner(owner), generation);
   return result.changes > 0 ? { status: "released" } : { status: "not_owner" };
 }
