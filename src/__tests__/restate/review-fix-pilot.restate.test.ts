@@ -18,6 +18,7 @@ import type { RestateTestEnvironment } from "@restatedev/restate-sdk-testcontain
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { getDb } from "../../dedup.js";
 import { initMappingsTable } from "../../config.js";
+import { initDispatchBreakerTable } from "../../dispatch-breaker.js";
 import {
   type AttemptId,
   type ReviewFixResultMetadataV1,
@@ -436,6 +437,7 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
   beforeAll(async () => {
     getDb();
     initMappingsTable();
+    initDispatchBreakerTable();
     environments = await startVariants([pr, attemptWorkflow]);
   }, 60_000);
   afterAll(async () => { if (environments) await stopAll(environments); });
