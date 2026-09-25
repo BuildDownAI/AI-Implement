@@ -60,6 +60,44 @@ afterEach(() => {
 });
 
 describe("config", () => {
+  it("adds an unused nullable review-fix lifecycle column on fresh and repeated initialization", () => {
+    config.initMappingsTable();
+    config.initMappingsTable();
+    const db = new Database(dbPath);
+    try {
+      const column = (db.prepare("PRAGMA table_info(mappings)").all() as Array<{ name: string; type: string; notnull: number; dflt_value: unknown }>)
+        .find((item) => item.name === "review_fix_lifecycle");
+      expect(column).toMatchObject({ type: "TEXT", notnull: 0, dflt_value: null });
+      db.prepare("INSERT INTO mappings (team_key, owner, repo, workflow_file, default_branch) VALUES (?, ?, ?, ?, ?)")
+        .run("NEW", "org", "repo", "claude-implement.yml", "main");
+      expect(db.prepare("SELECT review_fix_lifecycle FROM mappings WHERE team_key = ?").get("NEW"))
+        .toEqual({ review_fix_lifecycle: null });
+      expect(config.getMappings().NEW).not.toHaveProperty("reviewFixLifecycle");
+    } finally { db.close(); }
+  });
+
+  it("migrates old mappings twice without enabling Restate or losing stored rows", () => {
+    const db = new Database(dbPath);
+    db.exec(`CREATE TABLE mappings (
+      team_key TEXT PRIMARY KEY, owner TEXT NOT NULL, repo TEXT NOT NULL,
+      workflow_file TEXT NOT NULL, default_branch TEXT NOT NULL
+    )`);
+    db.prepare("INSERT INTO mappings (team_key, owner, repo, workflow_file, default_branch) VALUES (?, ?, ?, ?, ?)")
+      .run("LEG", "org", "legacy", "claude-implement.yml", "main");
+    db.close();
+
+    config.initMappingsTable();
+    config.initMappingsTable();
+    const reopened = new Database(dbPath);
+    try {
+      expect(reopened.prepare("SELECT owner, repo, review_fix_lifecycle FROM mappings WHERE team_key = ?").get("LEG"))
+        .toEqual({ owner: "org", repo: "legacy", review_fix_lifecycle: null });
+      expect((reopened.prepare("PRAGMA table_info(mappings)").all() as Array<{ name: string }> )
+        .filter((item) => item.name === "review_fix_lifecycle")).toHaveLength(1);
+      expect(config.getMappings().LEG).not.toHaveProperty("reviewFixLifecycle");
+    } finally { reopened.close(); }
+  });
+
   it("initialises an empty mappings table", () => {
     config.initMappingsTable();
     expect(config.getMappings()).toEqual({});
