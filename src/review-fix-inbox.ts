@@ -142,7 +142,7 @@ export interface AcceptDeliveryInput {
 }
 
 export type AcceptDeliveryOutcome =
-  | { readonly status: "accepted"; readonly delivery: ReviewFixDelivery }
+  | { readonly status: "accepted"; readonly delivery: ReviewFixDelivery; readonly isNew: boolean }
   | { readonly status: "conflict"; readonly reason: string; readonly delivery: ReviewFixDelivery }
   | { readonly status: "rejected"; readonly reason: string };
 
@@ -175,7 +175,11 @@ export function acceptDelivery(input: AcceptDeliveryInput): AcceptDeliveryOutcom
     const existing = db.prepare(SELECT_ONE).get(source.value, deliveryId.value) as ReviewFixInboxRow | undefined;
     if (existing) {
       if (existing.payload_hash === hash) {
-        return { status: "accepted", delivery: mapRow(existing) };
+        // `isNew: false` — this identity was already accepted (by this call or an earlier one)
+        // before this transaction ran. A caller applying a retryable external effect keyed to
+        // this delivery must treat that as "do not know whether the effect already ran", not as
+        // license to reapply it — see review-fix-finalize.ts's `applyApproval`.
+        return { status: "accepted", delivery: mapRow(existing), isNew: false };
       }
 
       db.prepare(`
@@ -210,7 +214,7 @@ export function acceptDelivery(input: AcceptDeliveryInput): AcceptDeliveryOutcom
     });
 
     const inserted = db.prepare(SELECT_ONE).get(source.value, deliveryId.value) as ReviewFixInboxRow;
-    return { status: "accepted", delivery: mapRow(inserted) };
+    return { status: "accepted", delivery: mapRow(inserted), isNew: true };
   })();
 }
 
@@ -258,6 +262,44 @@ export function claimDeliveries(options: ClaimDeliveriesOptions = {}): ReviewFix
     }
 
     return rows.map((row) => mapRow({ ...row, delivery_state: "claimed", retry_at: leasedUntil }));
+  })();
+}
+
+export type ClaimDeliveryOutcome =
+  | { readonly status: "claimed"; readonly delivery: ReviewFixDelivery }
+  | { readonly status: "already_leased"; readonly delivery: ReviewFixDelivery }
+  | { readonly status: "delivered" }
+  | { readonly status: "not_found" };
+
+/**
+ * Claims exactly one delivery by identity, atomically, without touching any other row —
+ * unlike `claimDeliveries`, which leases a batch across every source and would sweep in
+ * unrelated deliveries if used to reconcile a single one. Used by a caller that must
+ * deliberately retry one specific terminal effect (e.g. `review-fix-finalize.ts`'s
+ * `retryApprovalEffect`) after finding it left `pending` by a crashed prior attempt: the
+ * claim proves no other retry currently holds it, so the effect is safe to (re-)apply.
+ */
+export function claimDelivery(authenticatedSource: string, deliveryId: string, options: { leaseMs?: number; now?: number } = {}): ClaimDeliveryOutcome {
+  const leaseMs = options.leaseMs ?? DEFAULT_LEASE_MS;
+  const now = options.now ?? Date.now();
+  const db = getDb();
+
+  return db.transaction((): ClaimDeliveryOutcome => {
+    const existing = db.prepare(SELECT_ONE).get(authenticatedSource, deliveryId) as ReviewFixInboxRow | undefined;
+    if (!existing) return { status: "not_found" };
+    if (existing.delivery_state === "delivered") return { status: "delivered" };
+    if (existing.delivery_state === "claimed" && existing.retry_at != null && existing.retry_at > now) {
+      return { status: "already_leased", delivery: mapRow(existing) };
+    }
+
+    const leasedUntil = now + leaseMs;
+    db.prepare(`
+      UPDATE review_fix_inbox SET delivery_state = 'claimed', retry_at = ?
+      WHERE authenticated_source = ? AND event_id = ?
+    `).run(leasedUntil, authenticatedSource, deliveryId);
+
+    const updated = db.prepare(SELECT_ONE).get(authenticatedSource, deliveryId) as ReviewFixInboxRow;
+    return { status: "claimed", delivery: mapRow(updated) };
   })();
 }
 
