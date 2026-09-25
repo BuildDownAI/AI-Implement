@@ -107,3 +107,9 @@ export async function callObject<T>(baseUrl: string, object: string, key: string
 export async function callWorkflow<T>(baseUrl: string, workflow: string, key: string, handler: string, body: unknown = {}): Promise<T> {
   return post<T>(`${baseUrl}/${workflow}/${encodeURIComponent(key)}/${handler}`, `${workflow}/${key}/${handler}`, body);
 }
+
+export async function attachWorkflow<T>(baseUrl: string, workflow: string, key: string): Promise<T> {
+  return post<T>(`${baseUrl}/restate/attach`, `${workflow}/${key}/attach`, {
+    target: "workflow", workflowName: workflow, workflowKey: key,
+  });
+}

@@ -6,7 +6,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { ReviewFixResultMetadataV1, WorkerTerminalOutcome } from "../../review-fix-contract.js";
 import type { PreparedReviewFixAttempt } from "../../review-fix-ports.js";
 import { createReviewFixAttempt, REVIEW_FIX_RETENTION_MS, type ReviewFixAttemptCompletion } from "../../restate/review-fix-attempt.js";
-import { VARIANTS, callWorkflow, replaceEndpoint, startRetryEnabled, startVariants, stopAll } from "./harness.js";
+import { VARIANTS, attachWorkflow, callWorkflow, replaceEndpoint, startRetryEnabled, startVariants, stopAll } from "./harness.js";
 
 const SHA = "a".repeat(40);
 const EXECUTION = { githubRunId: 782, githubRunAttempt: 1 };
@@ -309,8 +309,8 @@ describe("ReviewFixAttempt durable workflow", () => {
       recovering.terminal = { status: "succeeded", outputCommit: SHA };
       await callWorkflow(env.baseUrl(), "ReviewFixAttempt", recovering.prepared.attemptId,
         "result", resultOf(recovering));
-      const attached = await callWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt",
-        recovering.prepared.attemptId, "workflowAttach");
+      const attached = await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt",
+        recovering.prepared.attemptId);
       expect(attached).toMatchObject({ status: "finalized", approval: "applied" });
       expect([recovering.launchEffects, recovering.approvalEffects, recovering.releaseEffects])
         .toEqual([1, 1, 1]);
