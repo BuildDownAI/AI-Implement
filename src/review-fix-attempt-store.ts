@@ -348,7 +348,17 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
     return isDispatchActive(db, row.dispatch_id);
   }
 
-  async recordResult(attemptId: AttemptId, result: ReviewFixResultMetadataV1): Promise<ResultIntakeOutcome> {
+  /**
+   * `onAccepted` runs inside the same SQLite transaction as the canonical result
+   * write, on both a first acceptance and a byte-identical retry. It may only
+   * perform synchronous SQLite work; a thrown error rolls the result write back.
+   * The callback route uses it to commit the durable delivery inbox atomically.
+   */
+  async recordResult(
+    attemptId: AttemptId,
+    result: ReviewFixResultMetadataV1,
+    onAccepted?: () => void,
+  ): Promise<ResultIntakeOutcome> {
     const db = getDb();
     return db.transaction((): ResultIntakeOutcome => {
       const row = db.prepare("SELECT * FROM review_fix_attempts WHERE attempt_id = ?").get(attemptId) as AttemptRow | undefined;
@@ -376,7 +386,10 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
 
       const hash = hashResult(result);
       if (row.accepted_result_json !== null) {
-        if (row.accepted_result_hash === hash) return { status: "duplicate", attemptId };
+        if (row.accepted_result_hash === hash) {
+          onAccepted?.();
+          return { status: "duplicate", attemptId };
+        }
         db.prepare("UPDATE review_fix_attempts SET result_conflict_at = COALESCE(result_conflict_at, ?) WHERE attempt_id = ?")
           .run(Date.now(), attemptId);
         return { status: "conflict", attemptId, reason: "a different result is already stored for this attempt" };
@@ -390,6 +403,7 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
         UPDATE review_fix_attempts SET accepted_result_json = ?, accepted_result_hash = ?
         WHERE attempt_id = ? AND accepted_result_json IS NULL
       `).run(JSON.stringify(result), hash, attemptId);
+      onAccepted?.();
       return { status: "stored", result };
     })();
   }

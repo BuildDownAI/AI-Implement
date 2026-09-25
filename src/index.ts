@@ -67,10 +67,14 @@ import { runReconciliations, resolvePrMapping } from "./reconcile-merged.js";
 import { resolveSessionImage, resolveDefaultRunnerImage, resolveRunnerImageForDispatch, type SessionImageStatus } from "./repo-image.js";
 import { getStepRecord, getStepsByJobId, initStepLogTable } from "./step-log.js";
 import { getOrchestratorSettings, seedKgBaseRepoFromEnv, seedLinearPickupLabelFromEnv, getRetryPolicy } from "./orchestrator-settings.js";
-import { handleRunnerPlanningContext, handleRunnerProgress, handleRunnerCycleSummary, handleRunnerResult, handleKgTrackerDataRequest, handleKgScopeRequest, planningDispatchBlockReason } from "./runner-callback.js";
+import { handleRunnerPlanningContext, handleRunnerProgress, handleRunnerCycleSummary, handleRunnerResult, handleRunnerActivity, handleKgTrackerDataRequest, handleKgScopeRequest, planningDispatchBlockReason } from "./runner-callback.js";
 import { CYCLE_SUMMARY_MAX_BYTES } from "./pipeline/cycle-summary.js";
-import type { RunnerProgressBody, RunnerResultBody } from "./runner-callback.js";
+import type { RunnerProgressBody, RunnerResultBody, RunnerActivityBody, ActivityIntakeOutcome } from "./runner-callback.js";
 import { mintRunToken, PLANNING_TTL_SECONDS, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
+import { SqliteReviewFixAttemptStore } from "./review-fix-attempt-store.js";
+import { acceptDelivery as acceptReviewFixDelivery } from "./restate/review-fix-client.js";
+import { appendReviewFixActivityBatch, isReviewFixEvidenceTombstoned } from "./review-fix-evidence.js";
+import type { ReviewFixResultMetadataV1, ResultIntakeOutcome } from "./review-fix-contract.js";
 import { handleMcpRequest } from "./mcp.js";
 import { resolveMemoryProvider, providerUnconfiguredReason, SidecarMemoryProvider, KG_TOOL_CAPABILITY, probeWithTimeout, sidecarHealthFields, setKgMemoryProvider } from "./kg-provider.js";
 import type { MemoryProvider } from "./kg-provider.js";
@@ -111,6 +115,9 @@ import { githubActionsWatchdogDecision, jobTtlDecision } from "./github-actions-
 import { KgSidecar } from "./kg-sidecar.js";
 import { RestateSidecar } from "./restate/server.js";
 import { startRestateEndpoint, register as registerRestateEndpoint } from "./restate/endpoint.js";
+import type { RestateRegisterOutcome, RestateRegisterResult } from "./restate/endpoint.js";
+import { getRestateStatus, setRestateStatus } from "./restate/status.js";
+import type { RestateRegistrationStatus } from "./restate/status.js";
 import { setProviderRegistry } from "./restate/tools.js";
 import { callTool } from "./restate/tools-client.js";
 import { getRestateStatus } from "./restate/status.js";
@@ -4381,6 +4388,66 @@ async function dispatchKgRefreshRun(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Restate review-fix pilot callback wiring (AII-769/AII-803): the injected,
+// non-SDK seams handleRunnerResult/handleRunnerActivity call. Both persist to
+// SQLite (the sole authority an ACK depends on) before ever touching Restate —
+// delivery to the sidecar is the pre-existing async pump (ReviewFixDeliveryPump,
+// src/restate/review-fix-client.ts), so a sidecar outage never blocks or fails
+// an ACK that SQLite already accepted, while a SQLite failure here throws and
+// is never acknowledged (caught by the route wrapper below as a 500).
+// ---------------------------------------------------------------------------
+
+const reviewFixAttemptStore = new SqliteReviewFixAttemptStore();
+
+async function onReviewFixResult(result: ReviewFixResultMetadataV1): Promise<ResultIntakeOutcome> {
+  // The accepted result and its delivery entry commit together. The callback
+  // also runs on an identical retry, repairing an older result that somehow
+  // lacks its inbox row; a rejected or conflicted identity aborts the write.
+  // This callback performs synchronous SQLite work only, never a Restate call.
+  return reviewFixAttemptStore.recordResult(result.attemptId, result, () => {
+    const delivery = acceptReviewFixDelivery({
+      authenticatedSource: "runner-callback",
+      deliveryId: `${result.attemptId}.result`,
+      kind: "result",
+      destination: { installationId: result.installationId, repository: result.repository, prNumber: result.prNumber },
+      payload: result,
+    });
+    if (delivery.status !== "accepted") {
+      throw new Error(`review-fix result delivery was ${delivery.status}`);
+    }
+  });
+}
+
+function onReviewFixActivity(batch: RunnerActivityBody): ActivityIntakeOutcome {
+  if (isReviewFixEvidenceTombstoned(batch.attemptId)) {
+    return { status: "stale", attemptId: batch.attemptId, reason: "attempt evidence has expired" };
+  }
+  const result = appendReviewFixActivityBatch({
+    attemptId: batch.attemptId,
+    producerId: batch.producerId,
+    events: batch.events,
+    finalSequence: batch.finalSequence,
+  });
+  if (result.tombstoned) {
+    return { status: "stale", attemptId: batch.attemptId, reason: "attempt evidence has expired" };
+  }
+  if (result.conflicts.length > 0) {
+    console.error(
+      `[runner-activity] conflicting activity payload attempt=${batch.attemptId} producer=${batch.producerId} sequences=${result.conflicts.join(",")}`,
+    );
+    return {
+      status: "conflict",
+      attemptId: batch.attemptId,
+      reason: `conflicting payload at sequence(s) ${result.conflicts.join(",")}`,
+    };
+  }
+  if (result.stored === 0 && result.duplicates > 0) {
+    return { status: "duplicate", attemptId: batch.attemptId };
+  }
+  return { status: "accepted", attemptId: batch.attemptId };
+}
+
 function startServer(
   config: AppConfig,
   registry: ProviderRegistry,
@@ -4459,6 +4526,7 @@ function startServer(
         polls,
         kgDegraded: isKgDegraded(),
         ...sidecarHealthFields(),
+        restate: getRestateStatus(),
         lastPollStartedAt: lastPollStartedAt?.toISOString() ?? null,
         lastPollFinishedAt: lastPollFinishedAt?.toISOString() ?? null,
       }));
@@ -4761,6 +4829,7 @@ function startServer(
           },
           onKgRefreshRunnerComplete: kgRefresh.onRunnerComplete.bind(kgRefresh),
           checkPlanningAdmissionTermination: (dispatchId) => tryFastReleasePlanningAdmission(config, dispatchId),
+          onReviewFixResult,
         });
         res.writeHead(result.status, { "Content-Type": "application/json" });
         res.end(JSON.stringify(result.body));
@@ -4838,6 +4907,50 @@ function startServer(
         res.end(JSON.stringify(result.body));
       })().catch((err) => {
         console.error("[runner-progress] Unhandled error:", err);
+        if (!res.headersSent) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Internal server error" }));
+        }
+      });
+      return;
+    }
+
+    // Runner activity callback (AII-769/AII-803) — reusable "progress" bearer
+    // bound to a live prepared review-fix attempt, same credential family as
+    // /runner/cycle-summary above. Bounded read: a batch may carry many
+    // redacted events, each already capped by the contract validator, but the
+    // raw body is still read under a defensive ceiling before it is parsed.
+    if (url === "/runner/activity" && req.method === "POST") {
+      (async () => {
+        if (!config.runnerTokenSecret) {
+          res.writeHead(501, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Runner callback not configured" }));
+          return;
+        }
+        const body = await readBodyLimited(req, 2 * 1024 * 1024);
+        if (body === null) {
+          res.writeHead(413, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Activity batch too large" }));
+          return;
+        }
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(body);
+        } catch {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Invalid JSON" }));
+          return;
+        }
+        const result = await handleRunnerActivity({
+          authorization: req.headers.authorization,
+          secret: config.runnerTokenSecret,
+          body: parsed,
+          onReviewFixActivity,
+        });
+        res.writeHead(result.status, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(result.body));
+      })().catch((err) => {
+        console.error("[runner-activity] Unhandled error:", err);
         if (!res.headersSent) {
           res.writeHead(500, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "Internal server error" }));
@@ -5021,9 +5134,81 @@ function startServer(
   return server;
 }
 
+/** Maps the fine-grained registration outcome (src/restate/endpoint.ts) onto the shared, coarser status contract (src/restate/status.ts, AII-773). */
+function restateRegistrationStatusFor(outcome: RestateRegisterOutcome): RestateRegistrationStatus {
+  switch (outcome) {
+    case "registered-no-force":
+    case "registered-drained-force":
+      return { state: "registered" };
+    case "declined-conflict":
+      return { state: "declined-conflict" };
+    case "unreachable":
+      return { state: "unreachable" };
+  }
+}
+
+/** For testing: override the SDK endpoint start/register calls. */
+export interface RestateEndpointWireDeps {
+  startRestateEndpoint: () => Promise<unknown>;
+  registerRestateEndpoint: () => Promise<RestateRegisterResult>;
+}
+
+/**
+ * Starts the Restate SDK endpoint and registers it with the sidecar's admin API. Called
+ * from a `RestateSidecar.whenReady()` continuation (main(), below) rather than a single
+ * boot-time check, so a sidecar that only becomes ready after an initial readiness timeout
+ * (AII-724's late readiness) still gets wired up — `whenReady()` resolves true both for an
+ * immediate boot-time ready and for one recovered later in the background.
+ *
+ * `attempt()` is idempotent — it registers at most once per gate — and refuses once
+ * `isShuttingDown()` answers true: a late readiness signal must not start an endpoint, or
+ * register it, after shutdown has begun. The two checks share one closure so a late
+ * callback and the shutdown handler race over the same latch rather than two.
+ */
+export function createRestateRegistrationGate(
+  isShuttingDown: () => boolean,
+  deps: RestateEndpointWireDeps = { startRestateEndpoint, registerRestateEndpoint },
+) {
+  let attempted = false;
+  return {
+    async attempt(): Promise<void> {
+      if (attempted || isShuttingDown()) return;
+      attempted = true;
+      try {
+        await deps.startRestateEndpoint();
+        // Shutdown may begin while the endpoint is opening. Never start a registration
+        // after that await if the process is already draining.
+        if (isShuttingDown()) return;
+        const result = await deps.registerRestateEndpoint();
+        if (isShuttingDown()) return;
+        setRestateStatus({ registration: restateRegistrationStatusFor(result.outcome) });
+        console.log(`[restate] boot registration: ${result.outcome}${result.detail ? ` (${result.detail})` : ""}`);
+      } catch (err) {
+        if (isShuttingDown()) return;
+        setRestateStatus({ registration: { state: "unreachable" } });
+        console.error(`[restate] SDK endpoint failed to start: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    },
+  };
+}
+
+/** For testing: stops both sidecars concurrently rather than one after the other, so neither's stopTimeoutMs adds to the other's inside the shutdown budget. */
+export async function stopSidecarsConcurrently(
+  sidecar: { stop(): Promise<void> },
+  restateSidecar: { stop(): Promise<void> },
+): Promise<void> {
+  await Promise.all([sidecar.stop(), restateSidecar.stop()]);
+}
+
 // ---------- Main ----------
 
 async function main(): Promise<void> {
+  // Fly can send a second signal before the first shutdown finishes. The forced-exit timer
+  // armed inside shutdown() below guarantees the process always dies regardless. Hoisted
+  // above the Restate sidecar construction so its late-readiness continuation can see the
+  // same latch as the shutdown handler — the two can't race past each other (AII-807).
+  let shuttingDown = false;
+
   // Initialize DB tables before loadConfig() so DB-backed settings are readable on first boot
   initMappingsTable();
   initLogTable();
@@ -5057,16 +5242,15 @@ async function main(): Promise<void> {
   // logs one warning and boot continues; the kg-refresh trigger seam (AII-683) answers 503
   // restate-unavailable while no successful registration has completed.
   const restateSidecar = new RestateSidecar();
-  const restateReady = await restateSidecar.start();
-  if (restateReady) {
-    try {
-      await startRestateEndpoint();
-      const result = await registerRestateEndpoint();
-      console.log(`[restate] boot registration: ${result.outcome}${result.detail ? ` (${result.detail})` : ""}`);
-    } catch (err) {
-      console.error(`[restate] SDK endpoint failed to start: ${err instanceof Error ? err.message : String(err)}`);
-    }
-  }
+  const restateRegistration = createRestateRegistrationGate(() => shuttingDown);
+  await restateSidecar.start();
+  // Driven off whenReady() rather than start()'s own return value so a sidecar that only
+  // becomes ready later, in the background (AII-724's late readiness past the initial
+  // timeout), still gets its endpoint started and registered — the gate's latch keeps this
+  // single-shot regardless of whether whenReady() settles now or after the await above.
+  void restateSidecar.whenReady().then((ready) => {
+    if (ready) void restateRegistration.attempt();
+  });
 
   const config = loadConfig();
   if (!config.kgSourceRepo) console.log("[kg] KG_SOURCE_REPO not set — knowledge graph disabled");
@@ -5162,9 +5346,9 @@ async function main(): Promise<void> {
 
   // total amount of time allotted for a graceful shutdown, otherwise the shutdown is forced
   const SHUTDOWN_BUDGET_MS = 10_000; // 10s
-  // Fly can send a second signal before the first shutdown finishes. The latch needs no
-  // reset: the forced-exit timer below is armed before any await, so the process always dies.
-  let shuttingDown = false;
+  // `shuttingDown` is declared at the top of main() (see comment there) so the Restate
+  // late-readiness continuation can read it too. The latch needs no reset: the forced-exit
+  // timer below is armed before any await, so the process always dies.
   const shutdown = async (signal: "SIGTERM" | "SIGINT") => {
     if (shuttingDown) {
       console.log(`[main] Received ${signal} while already shutting down; ignoring`);
@@ -5188,8 +5372,10 @@ async function main(): Promise<void> {
       new Promise((resolve) => setTimeout(resolve, SHUTDOWN_BUDGET_MS * 0.3).unref()),
     ]);
 
-    await sidecar.stop();
-    await restateSidecar.stop();
+    // Concurrent: each sidecar's own stopTimeoutMs must not add to the other's inside the
+    // shutdown budget above (AII-807 — was sequential, which could exceed SHUTDOWN_BUDGET_MS
+    // and hit the forced-exit path instead of a clean shutdown).
+    await stopSidecarsConcurrently(sidecar, restateSidecar);
 
     server.close(() => {
       closeDb();

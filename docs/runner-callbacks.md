@@ -35,6 +35,13 @@ sequenceDiagram
 
 A token is a signed claim set stored in the `runner_tokens` table with `dispatch_id`, `audience`, and `consumed_at`. `verifyRunToken` answers `already_consumed` when `consumed_at` is set. The callback endpoints answer 501 when `RUNNER_TOKEN_SECRET` is unset.
 
+Pilot review-fix attempts use prepared credentials for the same `result` and
+`progress` audiences. Their claims bind the immutable attempt, repository, PR,
+and dispatch reservation. `verifyPreparedReviewFixToken` checks that stored
+scope and active authority on each callback without consuming the credential:
+the result and activity senders can retry an identical body after a lost ACK.
+Unmarked Legacy callbacks retain the single-use result token above.
+
 ## Process boundary inside the runner
 
 | Process | Environment builder | Run tokens | Model credentials | Forwarded secrets | GitHub write tokens |
@@ -60,7 +67,21 @@ What one stray use of each credential destroys, and where the symptom appears.
 
 `postRunnerResult` sends exactly one `POST /runner/result` for a Legacy call (no `reviewFix`), unchanged from before. For a Restate review-fix pilot attempt (`reviewFix` present), it instead retries on a transient transport failure or a `429`/`5xx` response, using `pipeline/retry-backoff.ts`'s `computeBackoffMs` against the run's `retryPolicy`. The loop is bounded two ways: a hard cap of 8 attempts, and the attempt's own `deadlineAt` plus a 15-minute delivery grace (mirroring `runner-tokens.ts`'s `PILOT_DELIVERY_GRACE_MS` — the two constants must stay numerically in sync, since `runner-tokens.ts` cannot be imported into the runner bundle). Every retry resends the identical serialized JSON body built before the first attempt, never a freshly re-encoded one. Any other response — including the pilot's own `409 conflict` / `410 stale` classifications — stops the loop immediately; exhausting the deadline or the attempt cap logs an explicit `POST no-result` line rather than silently giving up. Neither path reruns agent work or mints a new attempt; this is delivery retry only.
 
-This interacts with the Result token's blast-radius row above: until a later issue wires a real `onReviewFixResult` attempt-store classifier into `handleRunnerResult` (today's default classifies every `reviewFix` result `"stored"` unconditionally), a lost-ACK retry that resends a result whose token was already consumed on the first (successfully processed) attempt gets back `409 already_consumed` — a non-retryable status, so the retry loop stops and logs it as terminal rather than looping. Once that classifier lands, the same retry is expected to classify `"duplicate"` and return `200` before token verification is reached at all (see `runner-callback.ts`'s `handleRunnerResult`, which classifies a present `reviewFix` marker before consuming the token).
+The pilot branch now authenticates the prepared result credential and checks the
+marker against its attempt before any Legacy token consumption or provider
+effect. The injected result seam records the canonical result and its durable
+delivery row in one SQLite transaction. An identical retry returns `200`
+`duplicate` and checks/repairs the same delivery identity; a conflicting result
+returns `409`, and a stale one returns `410`. The delivery pump contacts Restate
+afterward, so a sidecar outage does not reverse SQLite acceptance. A failed
+database write or missing persistence seam does not acknowledge the callback.
+Explicit pilot metadata cannot fall through to Legacy completion, finding
+resolution, or approval.
+
+`POST /runner/activity` uses the prepared, reusable `progress` credential.
+The handler validates and stores a bounded activity batch under the token's
+attempt identity before ACK. A missing store, forged attempt, or storage failure
+cannot produce a success ACK. Legacy runs do not use this route.
 
 ## Rules
 

@@ -15,6 +15,7 @@ import {
   kgPath,
   kgHybridSearch,
   getKgStatusTool,
+  getTenantHealth,
   getIssueReportCardTool,
   getFleetReportTool,
   triggerKgRefreshTool,
@@ -34,6 +35,8 @@ import { setActiveKgRefresh, type KgRefreshHandle } from "../kg-refresh.js";
 import { getMappings } from "../config.js";
 import { setOrchestratorSetting } from "../orchestrator-settings.js";
 import { initSettingsTable } from "../runner-mode.js";
+import { initLogTable } from "../log.js";
+import { getRestateStatus, setRestateStatus, resetRestateStatus } from "../restate/status.js";
 import { getIssueReportCard, getFleetReport } from "../report-card.js";
 import {
   setRunnerModeAction,
@@ -516,6 +519,50 @@ describe("migrated read handlers (AII-711)", () => {
     setActiveKgRefresh(null);
     const result = await getKgStatusTool(fakeContext("get_kg_status"), { caller: system, args: {} });
     expect(JSON.parse(result.content[0].text)).toEqual({ error: "KG refresh is not configured" });
+  });
+});
+
+// ---- get_tenant_health's restate field (AII-807): reports the shared status contract
+// (src/restate/status.ts, AII-773) the same way GET / does — same source of truth, no
+// second copy of sidecar/registration state.
+describe("get_tenant_health restate health field (AII-807)", () => {
+  const system: Caller = SYSTEM_ADMIN;
+
+  beforeAll(() => {
+    initSettingsTable();
+    initLogTable();
+  });
+
+  afterEach(() => {
+    resetRestateStatus();
+  });
+
+  it("reports the not-attempted/starting default before any sidecar write", async () => {
+    (getMappings as ReturnType<typeof vi.fn>).mockReturnValue({});
+    const result = await getTenantHealth(fakeContext("get_tenant_health"), { caller: system, args: {} });
+    const parsed = JSON.parse(result.content[0].text) as { restate: unknown };
+    expect(parsed.restate).toEqual({ sidecar: { state: "starting" }, registration: { state: "not-attempted" } });
+  });
+
+  it("reflects a ready sidecar with a declined-conflict registration", async () => {
+    (getMappings as ReturnType<typeof vi.fn>).mockReturnValue({});
+    setRestateStatus({ sidecar: { state: "ready" }, registration: { state: "declined-conflict" } });
+
+    const result = await getTenantHealth(fakeContext("get_tenant_health"), { caller: system, args: {} });
+    const parsed = JSON.parse(result.content[0].text) as { restate: unknown };
+
+    expect(parsed.restate).toEqual(getRestateStatus());
+    expect(parsed.restate).toEqual({ sidecar: { state: "ready" }, registration: { state: "declined-conflict" } });
+  });
+
+  it("reflects an exited sidecar with code/signal and an unreachable registration", async () => {
+    (getMappings as ReturnType<typeof vi.fn>).mockReturnValue({});
+    setRestateStatus({ sidecar: { state: "exited", code: 1, signal: null }, registration: { state: "unreachable" } });
+
+    const result = await getTenantHealth(fakeContext("get_tenant_health"), { caller: system, args: {} });
+    const parsed = JSON.parse(result.content[0].text) as { restate: unknown };
+
+    expect(parsed.restate).toEqual({ sidecar: { state: "exited", code: 1, signal: null }, registration: { state: "unreachable" } });
   });
 });
 

@@ -277,3 +277,51 @@ describe("/runner/result route wrapper", () => {
     expect(res.status).toBe(401);
   });
 });
+
+/**
+ * Mirror of the /runner/activity route wrapper in src/index.ts (AII-803):
+ * 501-when-not-configured and 400-on-invalid-JSON, then delegates straight to
+ * handleRunnerActivity (which owns its own bearer authentication).
+ */
+async function callRunnerActivityRoute(opts: {
+  runnerTokenSecret: string | null;
+  authorization?: string;
+  rawBody: string;
+}): Promise<{ status: number; body: Record<string, unknown> }> {
+  if (!opts.runnerTokenSecret) {
+    return { status: 501, body: { error: "Runner callback not configured" } };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(opts.rawBody);
+  } catch {
+    return { status: 400, body: { error: "Invalid JSON" } };
+  }
+  return runnerCallback.handleRunnerActivity({
+    authorization: opts.authorization,
+    secret: opts.runnerTokenSecret,
+    body: parsed,
+  });
+}
+
+describe("/runner/activity route wrapper", () => {
+  it("returns 501 when RUNNER_TOKEN_SECRET is unset", async () => {
+    const res = await callRunnerActivityRoute({ runnerTokenSecret: null, rawBody: "{}" });
+    expect(res.status).toBe(501);
+    expect(res.body.error).toBe("Runner callback not configured");
+  });
+
+  it("returns 400 on invalid JSON body", async () => {
+    const res = await callRunnerActivityRoute({ runnerTokenSecret: "secret", rawBody: "{not json" });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("Invalid JSON");
+  });
+
+  it("returns 401 when bearer is missing (after parse)", async () => {
+    const res = await callRunnerActivityRoute({
+      runnerTokenSecret: "secret",
+      rawBody: JSON.stringify({ version: 1, attemptId: "attempt-1", producerId: "producer-1", events: [] }),
+    });
+    expect(res.status).toBe(401);
+  });
+});

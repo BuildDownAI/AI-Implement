@@ -371,6 +371,53 @@ describe("SqliteReviewFixAttemptStore: result intake", () => {
     expect(second).toEqual({ status: "duplicate", attemptId });
   });
 
+  it("commits the canonical result and its delivery together, and repairs an identical retry", async () => {
+    const { store, attemptId, deadlineAt, execution } = await prepareBound();
+    const inbox = await import("../review-fix-inbox.js");
+    const r = result({ attemptId, deadlineAt, githubRunId: execution.githubRunId, githubRunAttempt: execution.githubRunAttempt });
+    const queue = () => {
+      const accepted = inbox.acceptDelivery({
+        authenticatedSource: "runner-callback", deliveryId: `${attemptId}.result`, kind: "result",
+        destination: { installationId: r.installationId, repository: r.repository, prNumber: r.prNumber },
+        payload: r,
+      });
+      if (accepted.status !== "accepted") throw new Error(`delivery ${accepted.status}`);
+    };
+
+    await expect(store.recordResult(attemptId, r, () => { throw new Error("inbox write failed"); }))
+      .rejects.toThrow("inbox write failed");
+    expect((await store.getAcceptedResult(attemptId))?.result).toBeNull();
+    expect(inbox.getDelivery("runner-callback", `${attemptId}.result`)).toBeNull();
+
+    expect((await store.recordResult(attemptId, r, queue)).status).toBe("stored");
+    const first = inbox.getDelivery("runner-callback", `${attemptId}.result`);
+    expect(first?.deliveryState).toBe("pending");
+
+    // A lost HTTP ACK repeats the same credential and payload after a restart.
+    const restarted = new storeModule.SqliteReviewFixAttemptStore();
+    expect((await restarted.recordResult(attemptId, r, queue)).status).toBe("duplicate");
+    expect(inbox.getDelivery("runner-callback", `${attemptId}.result`)?.payloadHash).toBe(first?.payloadHash);
+  });
+
+  it("repairs a previously accepted result whose delivery row is missing", async () => {
+    const { store, attemptId, deadlineAt, execution } = await prepareBound();
+    const inbox = await import("../review-fix-inbox.js");
+    const r = result({ attemptId, deadlineAt, githubRunId: execution.githubRunId, githubRunAttempt: execution.githubRunAttempt });
+    expect((await store.recordResult(attemptId, r)).status).toBe("stored");
+    expect(inbox.getDelivery("runner-callback", `${attemptId}.result`)).toBeNull();
+
+    const retried = await store.recordResult(attemptId, r, () => {
+      const accepted = inbox.acceptDelivery({
+        authenticatedSource: "runner-callback", deliveryId: `${attemptId}.result`, kind: "result",
+        destination: { installationId: r.installationId, repository: r.repository, prNumber: r.prNumber },
+        payload: r,
+      });
+      if (accepted.status !== "accepted") throw new Error(`delivery ${accepted.status}`);
+    });
+    expect(retried.status).toBe("duplicate");
+    expect(inbox.getDelivery("runner-callback", `${attemptId}.result`)?.deliveryState).toBe("pending");
+  });
+
   it("rejects a result whose scope or deadline does not match the prepared attempt, including an early result before binding", async () => {
     seedMapping();
     const store = new storeModule.SqliteReviewFixAttemptStore();
