@@ -30,6 +30,7 @@ import {
 import { READ_ONLY_ALLOWED_TOOLS } from "./read-only-tools.js";
 import { REVIEWER_VERDICT_SCHEMA, resolveTrustedReviewer, type ReviewerDefinition, type ReviewerFinding, type ReviewerVerdict } from "../reviewers/registry.js";
 import { isChecksPermissionError } from "../../checks-permission.js";
+import { inferTestResults, sumUsage, toolTraceLines, writeCycleSummary, type CycleDisposition } from "../cycle-summary.js";
 
 interface PostPushReviewInputs extends Record<string, unknown> {
   prNumber: string;
@@ -904,6 +905,10 @@ function formatFixSummaryBlock(summary: FixSummary | null): string {
     sections.push(`Notes:\n${compactForComment(summary.notes, 320)}`);
   }
   return sections.length > 0 ? `\n\n${sections.join("\n\n")}` : "";
+}
+
+function toCycleDispositions(dispositions: FindingDisposition[]): CycleDisposition[] {
+  return dispositions.map((d) => ({ key: d.findingKey, disposition: d.disposition }));
 }
 
 function currentBranchName(gitSpawn: (args: string[]) => SpawnResult): string {
@@ -1855,7 +1860,7 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
     // Called both after a successful push and when the fix pass made no pushable change —
     // dispositioning an out-of-scope external finding as "follow-up" is itself a complete,
     // no-code-change outcome (AII-751), so it cannot be gated on a push happening at all.
-    function applyFixPassDispositions(): void {
+    function applyFixPassDispositions(): FindingDisposition[] {
       const { valid: dispositions } = readFindingDispositions(inputs.workspaceDir);
       fs.rmSync(path.join(inputs.workspaceDir, DISPOSITIONS_FILE), { force: true });
       for (const disposition of dispositions) {
@@ -1865,6 +1870,7 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
       for (const disposition of dispositions) {
         if (disposition.disposition === "follow-up") deferredKeys.add(disposition.findingKey);
       }
+      return dispositions;
     }
 
     try {
@@ -2350,6 +2356,10 @@ ${feedback}
 ${externalFindingsFixBlock}
 </reviewer_feedback>${dispositionFixBlock}`;
 
+      // Snapshot before this cycle's invoke/commit/push mutate `leaseSha` below — this is the
+      // commit the fix pass started from, reported as the cycle summary's `inputCommit`.
+      const inputHead = leaseSha ? null : gitSpawn(["rev-parse", "HEAD"]);
+      const fixCycleInputCommit = leaseSha ?? (inputHead?.exitCode === 0 && inputHead.stdout.trim() ? inputHead.stdout.trim() : null);
       const fixResult = await context.llmExecutor.invoke({
         prompt: fixPrompt,
         model,
@@ -2362,6 +2372,18 @@ ${externalFindingsFixBlock}
         priorLlmFailure = true;
         terminationReason = "fix_failed";
         const failure = compactErrorMessage(`Fix-pass LLM failed (${llmResultMessage(fixResult)})`);
+        writeCycleSummary(inputs.workspaceDir, {
+          id: `post-push-review.fix-${iteration}`,
+          stage: "post-push-review-fix",
+          cycle: iteration,
+          inputCommit: fixCycleInputCommit,
+          outputCommit: null,
+          outputCommitStatus: "not_applicable",
+          dispositions: [],
+          tests: inferTestResults(toolTraceLines(fixResult.telemetry), undefined, fixResult.telemetry?.executedCommands),
+          verdict: { approved: null, reason: "fix_failed", summary: failure },
+          usage: sumUsage(fixResult.telemetry),
+        });
         // The fix pass reports as its own custom sub-step (BAC-27201) — same `post-push-review.`
         // step_id prefix the review sub-step uses, so report-card.ts's cost query picks up its
         // spend even on a failed pass.
@@ -2405,7 +2427,7 @@ ${externalFindingsFixBlock}
       const status = gitSpawn(["status", "--porcelain"]);
       if (status.exitCode !== 0) throw new Error(`git status failed: ${resultMessage(status)}`);
       if (!status.stdout.trim()) {
-        if (hasGatingExternalFindings) applyFixPassDispositions();
+        const noChangesDispositions = hasGatingExternalFindings ? applyFixPassDispositions() : [];
         const remainingGatingExternalFindings = gatingExternalFindings
           .filter((finding) => !deferredKeys.has(stableReviewFindingKey(finding)));
         if (hasGatingExternalFindings && issues.length === 0 && remainingGatingExternalFindings.length === 0) {
@@ -2419,6 +2441,18 @@ ${externalFindingsFixBlock}
             `${marker}\nℹ️ Fix pass ${fixPassLabel(iteration, maxIterations)} made no code changes; disposed of ${gatingExternalFindings.length} external finding(s) instead.\n\n**Merge readiness:** Not ready to merge; re-reviewing.`,
             marker,
           );
+          writeCycleSummary(inputs.workspaceDir, {
+            id: `post-push-review.fix-${iteration}`,
+            stage: "post-push-review-fix",
+            cycle: iteration,
+            inputCommit: fixCycleInputCommit,
+            outputCommit: null,
+            outputCommitStatus: "not_applicable",
+            dispositions: toCycleDispositions(noChangesDispositions),
+            tests: inferTestResults(toolTraceLines(fixResult.telemetry), undefined, fixResult.telemetry?.executedCommands),
+            verdict: { approved: null, reason: "dispositioned_no_changes" },
+            usage: sumUsage(fixResult.telemetry),
+          });
           continue;
         }
         terminationReason = "no_changes";
@@ -2434,6 +2468,18 @@ ${externalFindingsFixBlock}
           `${marker}\n⚠️ Fix pass ${fixPassLabel(iteration, maxIterations)} completed with no file changes; stopping the post-push review loop.${blockingIssuesBlock(issues, { heading: "Unresolved blocking issues:" })}${reviewFindingsCommentBlock(gatingExternalFindings)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${reviewerSummaryBlock(reviewReportForComment(reviewUrl, feedback), issues)}\n\n**Merge readiness:** Not ready to merge.`,
           marker,
         );
+        writeCycleSummary(inputs.workspaceDir, {
+          id: `post-push-review.fix-${iteration}`,
+          stage: "post-push-review-fix",
+          cycle: iteration,
+          inputCommit: fixCycleInputCommit,
+          outputCommit: null,
+          outputCommitStatus: "not_applicable",
+          dispositions: toCycleDispositions(noChangesDispositions),
+          tests: inferTestResults(toolTraceLines(fixResult.telemetry), undefined, fixResult.telemetry?.executedCommands),
+          verdict: { approved: null, reason: "no_changes", summary: feedback },
+          usage: sumUsage(fixResult.telemetry),
+        });
         break;
       }
 
@@ -2504,12 +2550,21 @@ ${externalFindingsFixBlock}
           leaseSha = revParseHead.stdout.trim();
         }
       }
+      // Full commit sha for the cycle summary's outputCommit — reuses the lease sha just
+      // refreshed above when available, otherwise resolves HEAD directly (the ls-remote-lease
+      // fallback path never populates `leaseSha`).
+      const fixCycleOutputCommit = hasPushedShaLease
+        ? (leaseSha ?? null)
+        : (() => {
+            const rp = gitSpawn(["rev-parse", "HEAD"]);
+            return rp.exitCode === 0 && rp.stdout.trim() ? rp.stdout.trim() : null;
+          })();
 
       // Only asked the fix agent for dispositions when it saw gating external findings — no
       // file is expected otherwise. Runs only once the push above has succeeded (AII-751): a
       // failed push throws above and reaches none of this. The no-changes branch above covers
       // the case where the fix pass had nothing to push at all.
-      if (hasGatingExternalFindings) applyFixPassDispositions();
+      const pushedDispositions = hasGatingExternalFindings ? applyFixPassDispositions() : [];
 
       forcePushed++;
       const marker = `<!-- ai-implement post-push iter=${iteration} fix-complete -->`;
@@ -2519,6 +2574,18 @@ ${externalFindingsFixBlock}
         `${marker}\n✅ Fix pass ${fixPassLabel(iteration, maxIterations)} completed and pushed changes.${commitLabel}${fixSummaryBlock}${changesBlock}\n\n**Merge readiness:** Awaiting follow-up review.`,
         marker,
       );
+      writeCycleSummary(inputs.workspaceDir, {
+        id: `post-push-review.fix-${iteration}`,
+        stage: "post-push-review-fix",
+        cycle: iteration,
+        inputCommit: fixCycleInputCommit,
+        outputCommit: fixCycleOutputCommit,
+        outputCommitStatus: "committed",
+        dispositions: toCycleDispositions(pushedDispositions),
+        tests: inferTestResults([...toolTraceLines(fixResult.telemetry), ...(fixSummary?.testing ?? [])], undefined, fixResult.telemetry?.executedCommands),
+        verdict: { approved: null, reason: "fixed", summary: fixSummary?.notes || undefined },
+        usage: sumUsage(fixResult.telemetry),
+      });
     }
     } catch (err) {
       if (err instanceof OperatorCancelledError) {

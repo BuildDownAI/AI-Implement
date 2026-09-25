@@ -270,6 +270,8 @@ export interface RunTelemetry {
   cacheCreationTokens?: number | null;
   /** Compact per-call tool trace ("ToolName input-summary"), capped; last entry may be a truncation marker. */
   toolTrace?: string[];
+  /** Bash commands with a matching structured tool result; never inferred from model text. */
+  executedCommands?: Array<{ command: string; failed: boolean }>;
 }
 
 export interface LLMTerminalStatus {
