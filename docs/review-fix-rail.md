@@ -60,6 +60,14 @@ Two consequences worth knowing:
 
 Collection additionally dedupes in memory by normalized body before anything is stored, keeping the variant that carries a file and line over one that does not.
 
+### Revisions
+
+Every row also carries a `revision`, starting at 1 on insert (`upsertReviewFinding`, `src/review-ledger-store.ts`). Every re-report of an existing `(repo, pr_number, finding_key)` row reaches the `ON CONFLICT` branch, regardless of the row's current status, and that branch increments the revision by exactly 1 unconditionally — even when the key and body are byte-identical to the previous report, and even when the row is currently `deferred`. There is no "no-op" re-report that leaves the revision unchanged. Only the `status` and `resolved_at` columns are conditional on the current status (a separate `CASE WHEN` preserves `deferred` rather than reopening them); the revision bump is not gated by it. This is a change from the pre-revision behavior described above: the row still collapses to one, but its revision now moves on every accepted repeat, not just on a substantive edit.
+
+The revision exists so a caller can hold a stale snapshot and detect that the finding moved under it. `markReviewFindingResolvedIfRevision` and `markReviewFindingDeferredIfRevision` (`src/review-ledger-store.ts`) each take an `(id, revision)` pair and update only when the row's current revision still matches — a disposition keyed by an older `(id, revision)` is a no-op against the row, and the newer open report (from the re-report that bumped the revision past the caller's snapshot) is left untouched, still `open`, for the next pass to see. This is what protects a fix run's disposition from silently resolving or deferring a finding that was re-reported after the run took its snapshot.
+
+**These conditional helpers have no current caller.** The legacy disposition path (`markReviewFindingsDeferredByKeys`, used from `src/runner-callback.ts`) still dispositions by key alone, unaware of revisions, and is unchanged by their addition. `markReviewFindingResolvedIfRevision` and `markReviewFindingDeferredIfRevision` exist as the contract surface for a later revision-aware pilot consumer, not as something wired into today's resolution or disposition flow.
+
 ## The four tables
 
 | Table | Grain | Purpose |
