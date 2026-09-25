@@ -3218,6 +3218,62 @@ describe("admin blockers endpoint", () => {
       ["no-mapping", "ZZZ-1", null],
     ]);
   });
+
+  it("reports capacityByMapping from unreleased dispatch_admissions reservations, and the concurrency blocker's used/cap matches it exactly — ignoring a stale tracker-label snapshot", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", { teamKey: "CORE", owner: "org", repo: "core", maxInProgressAiIssues: 1, planningWorkflowFile: "claude-plan.yml" }, token);
+
+    const admission = await import("../dispatch-admission.js");
+    const acquired = admission.acquire({
+      dispatchId: "res-core-1",
+      mappingKey: "CORE",
+      scope: { kind: "issue", issueScope: "CORE", issueId: "issue-held" },
+      kind: "implementation",
+      backend: "github-actions",
+      lifecycleOwner: { kind: "legacy" },
+      cap: 1,
+    });
+    expect(acquired.ok).toBe(true);
+
+    const candidate: TicketIssue = { id: "issue-2", identifier: "CORE-2", title: "Needs a slot", description: null, scopeKey: "CORE", nativeStatus: "Todo" };
+    vi.spyOn(provider, "fetchAIImplementSnapshot").mockResolvedValueOnce({
+      readyForImplementation: [candidate],
+      needsPlanning: [],
+      // A stale/never-advanced tracker-label snapshot reports the team idle — the
+      // response must not trust it.
+      inProgressCountsByScope: { CORE: 0 },
+    });
+
+    const res = await request("/api/blockers", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.capacityByMapping.CORE).toEqual({ used: 1, cap: 1, source: "reservations" });
+    const concurrencyBlocker = body.blockers.find((b: { reason: string }) => b.reason === "concurrency");
+    expect(concurrencyBlocker).toBeDefined();
+    expect(concurrencyBlocker.detail).toContain("(1/1)");
+  });
+
+  it("excludes kg-refresh reservations from capacityByMapping", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", { teamKey: "CORE", owner: "org", repo: "core", maxInProgressAiIssues: 1, planningWorkflowFile: "claude-plan.yml" }, token);
+
+    const admission = await import("../dispatch-admission.js");
+    const acquired = admission.acquire({
+      dispatchId: "res-core-kg",
+      mappingKey: "CORE",
+      scope: { kind: "issue", issueScope: "CORE", issueId: "issue-kg" },
+      kind: "kg-refresh",
+      backend: "github-actions",
+      lifecycleOwner: { kind: "legacy" },
+      cap: 1,
+    });
+    expect(acquired.ok).toBe(true);
+
+    const res = await request("/api/blockers", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.capacityByMapping.CORE).toEqual({ used: 0, cap: 1, source: "reservations" });
+  });
 });
 
 describe("admin customizations endpoint", () => {

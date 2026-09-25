@@ -239,6 +239,16 @@ A human is not stuck once a PR is parked. A `/ai-implement` comment sets `humanR
 
 See the glossary's [PR dispatch budget](../CONTEXT.md#pr-dispatch-budget) entry.
 
+## Reported capacity: reservations, not tracker labels or running-job displays
+
+`GET /api/blockers` (`handleListBlockers`, `src/admin.ts`) reports `capacityByMapping`, one entry per mapping key: `{ used, cap, source: "reservations" }`. `used` is `count(mappingKey)` from `src/dispatch-admission.ts` — the unreleased, non-`kg-refresh` row count in `dispatch_admissions`, the exact same read `acquireDispatch` (`src/dispatch-gate.ts`) checks against `cap` before reserving a slot for a planning/implementation dispatch. `cap` is the mapping's own `maxInProgressAiIssues`. `selectBlockers` (`src/poll-selection.ts`) is fed this same per-team count for its `concurrency` reason, so the blocker preview's `used`/`cap` never drifts from the projection: both read `dispatch_admissions`, never a tracker-provider's business-status label.
+
+This is a deliberate authority split, not an oversight:
+
+- **Planning/implementation capacity** (this projection, and `acquireDispatch`'s own check) is reservation-backed: a slot is spent the instant `acquireDispatch`'s transaction commits — before the external launch call — and freed only by an explicit `release` once a launch is confirmed rejected, cancelled, or a run's termination is verified (see AII-783/AII-791). A reservation with no `dispatch_log` `run_id` yet (the launch call hasn't returned) still counts as used; a tracker label that hasn't advanced (or never will, because the provider write failed) never masks it.
+- **`gap-fill`'s `team_capacity` reason** in `canDispatch` (`src/dispatch-gate.ts`, "One writer per PR" above) is a separate, older predicate over `dispatch_log`'s `dispatched`/`running` rows, excluding `kg-refresh` the same way. It is not sourced from `capacityByMapping` and is out of scope for this projection — gap-fill's own migration onto `dispatch_admissions` is a later issue (AII-787).
+- **The Admin UI's own capacity display** (`src/admin-ui/pages/overview.ts`) still independently recomputes an in-progress count client-side from `/api/log` + `/api/mappings` — a *running-job* view, not this reservation authority. The two can disagree in the interim: a reservation is held (and shows in `capacityByMapping`) from the moment `acquireDispatch` commits, while a `dispatch_log` row (and so the overview's count) only exists once the dispatch is actually appended, and only reflects `dispatched`/`running` status, not "reserved". Wiring the overview and blocker views onto `capacityByMapping` is [AII-797](https://linear.app/eudoxus/issue/AII-797/show-reserved-capacity-in-admin-views); until it lands, treat the overview page's number as a display of recent activity, not the admission authority.
+
 ## A non-webhook enqueue source: an issue selected for dispatch that already has an open PR
 
 Before the poll loop dispatches a fresh implementation for a selected issue, it looks up the

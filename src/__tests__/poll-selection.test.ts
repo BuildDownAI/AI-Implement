@@ -198,6 +198,110 @@ describe("selectBlockers", () => {
     expect(blockers[2]).toMatchObject({ reason: "dedup", issueIdentifier: "APP-1" });
     expect(blockers[3]).toMatchObject({ reason: "no-mapping", issueIdentifier: "API-1" });
   });
+
+  it("logs the exclusion with issue, team, count, and cap when a concurrency blocker fires", () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    selectBlockers(
+      [makeIssue("1", "APP-1", "APP")],
+      { APP: makeMapping(2) },
+      { APP: 2 },
+      () => false,
+    );
+    expect(logSpy).toHaveBeenCalledWith(
+      "[poll-selection] Capacity exclusion: issue=APP-1 team=APP count=2 cap=2",
+    );
+    logSpy.mockRestore();
+  });
+
+  it("does not log an exclusion for an issue that clears the cap", () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    selectBlockers(
+      [makeIssue("1", "APP-1", "APP")],
+      { APP: makeMapping(3) },
+      { APP: 1 },
+      () => false,
+    );
+    expect(logSpy).not.toHaveBeenCalled();
+    logSpy.mockRestore();
+  });
+});
+
+// AII-569: selectBlockers's concurrency check is fed the same DB-backed
+// dispatch_admissions reservation count acquireDispatch checks capacity against
+// (src/dispatch-admission.ts#count), never a tracker-label count — a stranded label
+// (never advanced, or advanced late) must not hide a real reservation, and a
+// reservation with no run ID yet (acquireDispatch's transaction commits before the
+// external launch call returns) must still count as used.
+describe("selectBlockers — reservation-backed concurrency, not tracker labels", () => {
+  let dbPath: string;
+  let dedup: typeof DedupModule;
+  let gate: typeof GateModule;
+  let admission: typeof AdmissionModule;
+  let breaker: typeof BreakerModule;
+
+  beforeEach(async () => {
+    vi.resetModules();
+    dbPath = path.join(
+      os.tmpdir(),
+      `poll-selection-blockers-admission-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
+    );
+    process.env.DEDUP_DB_PATH = dbPath;
+    dedup = await import("../dedup.js");
+    gate = await import("../dispatch-gate.js");
+    admission = await import("../dispatch-admission.js");
+    breaker = await import("../dispatch-breaker.js");
+    breaker.initDispatchBreakerTable();
+  });
+
+  afterEach(() => {
+    dedup.closeDb();
+    try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+  });
+
+  it("a prepared reservation with no run ID yet still blocks, even when the tracker label is stranded (idle)", () => {
+    const held = gate.acquireDispatch({
+      dispatchId: "prepared-1",
+      issueId: "AII-held",
+      issueIdentifier: "AII-held",
+      kind: "implementation",
+      teamKey: "AII",
+      maxInProgressAiIssues: 1,
+      backend: "fly-machines",
+    });
+    expect(held.ok).toBe(true);
+
+    // Tracker label snapshot says idle (0) — a stale/never-advanced label must not mask
+    // the live reservation.
+    const staleTrackerCounts = { AII: 0 };
+    const reservedCounts = { AII: admission.count("AII") };
+    expect(reservedCounts.AII).toBe(1);
+
+    const candidate = makeIssue("AII-2", "AII-2", "AII");
+    const usingStaleTracker = selectBlockers([candidate], { AII: makeMapping(1) }, staleTrackerCounts, () => false);
+    const usingReservations = selectBlockers([candidate], { AII: makeMapping(1) }, reservedCounts, () => false);
+
+    expect(usingStaleTracker).toHaveLength(0);
+    expect(usingReservations).toHaveLength(1);
+    expect(usingReservations[0].reason).toBe("concurrency");
+  });
+
+  it("releasing the reservation frees the slot for the next blocker check", () => {
+    const held = gate.acquireDispatch({
+      dispatchId: "prepared-2",
+      issueId: "AII-held-2",
+      issueIdentifier: "AII-held-2",
+      kind: "planning",
+      teamKey: "AII",
+      maxInProgressAiIssues: 1,
+      backend: "github-actions",
+    });
+    expect(held.ok).toBe(true);
+    if (held.ok) held.release("finalized");
+
+    const candidate = makeIssue("AII-3", "AII-3", "AII");
+    const blockers = selectBlockers([candidate], { AII: makeMapping(1) }, { AII: admission.count("AII") }, () => false);
+    expect(blockers).toHaveLength(0);
+  });
 });
 
 describe("parseDeclaredFiles", () => {

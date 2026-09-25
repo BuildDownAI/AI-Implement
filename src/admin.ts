@@ -56,6 +56,7 @@ import { listMachines, destroyMachine, listAppSecrets, setAppSecrets, unsetAppSe
 import type { TicketIssue, AIImplementSnapshot } from "./providers/types.js";
 import type { ProviderRegistry } from "./providers/registry.js";
 import { resolveInFlightSiblings, selectBlockers, selectFileOverlapDeferrals, getOrFetchPlanningContexts } from "./poll-selection.js";
+import { count as countReservedCapacity } from "./dispatch-admission.js";
 import { RESTATE_WRITE_TOOL_NAMES, IDEMPOTENCY_KEY_SHAPE, scopeIdempotencyKey } from "./mcp.js";
 import { adminHtml } from "./admin-html.js";
 import {
@@ -1122,6 +1123,32 @@ async function handleGetLocalJobLogs(
   }
 }
 
+export interface MappingCapacity {
+  used: number;
+  cap: number;
+  source: "reservations";
+}
+
+/**
+ * Reservation-backed capacity per mapping — `used` is the unreleased, non-kg-refresh
+ * `dispatch_admissions` count for the mapping key (`dispatch-admission.ts#count`, the
+ * same authority `acquireDispatch` reserves against), never a tracker-label count.
+ * `cap` is the mapping's own `maxInProgressAiIssues`, so a concurrency blocker's
+ * used/cap always matches this projection exactly rather than drifting from a
+ * separately-derived number.
+ */
+function buildCapacityByMapping(teamRepoMap: Record<string, RepoMapping>): Record<string, MappingCapacity> {
+  const out: Record<string, MappingCapacity> = {};
+  for (const [teamKey, mapping] of Object.entries(teamRepoMap)) {
+    out[teamKey] = {
+      used: countReservedCapacity(teamKey),
+      cap: mapping.maxInProgressAiIssues,
+      source: "reservations",
+    };
+  }
+  return out;
+}
+
 async function handleListBlockers(
   res: http.ServerResponse,
   registry: ProviderRegistry,
@@ -1132,10 +1159,14 @@ async function handleListBlockers(
     const teamRepoMap = getMappings();
     const dispatchedSet = new Set(getDispatchedIds());
     const inFlightIds = getInFlightIssueIds();
+    const capacityByMapping = buildCapacityByMapping(teamRepoMap);
+    const reservedCountsByTeam = Object.fromEntries(
+      Object.entries(capacityByMapping).map(([teamKey, capacity]) => [teamKey, capacity.used]),
+    );
     const baseBlockers = selectBlockers(
       allIssues,
       teamRepoMap,
-      snapshot.inProgressCountsByScope,
+      reservedCountsByTeam,
       (id) => dispatchedSet.has(id),
     );
     // In-flight issues drop out of the snapshot (AI-Working), so resolve them through the
@@ -1168,6 +1199,7 @@ async function handleListBlockers(
     json(res, 200, {
       blockers,
       totals: { teams: teams.size, issues: blockers.length, byReason },
+      capacityByMapping,
     });
   } catch (err) {
     json(res, 502, { error: err instanceof Error ? err.message : String(err) });
