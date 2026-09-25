@@ -17,9 +17,10 @@ function mountOverview(fixtures: {
   log?: unknown[];
   mappings?: Record<string, unknown>;
   capacityOk?: boolean;
+  capacityReject?: boolean;
   capacityByMapping?: CapacityByMapping | null;
 }): { win: any; doc: Document } {
-  const { log = [], mappings = {}, capacityOk = true, capacityByMapping = {} } = fixtures;
+  const { log = [], mappings = {}, capacityOk = true, capacityReject = false, capacityByMapping = {} } = fixtures;
   const dom = new JSDOM(`<!DOCTYPE html><body>${overviewHtml}</body>`, {
     runScripts: "dangerously",
     url: "http://localhost/admin#overview",
@@ -36,6 +37,7 @@ function mountOverview(fixtures: {
     if (url === "/api/mappings") return { ok: true, status: 200, json: async () => mappings };
     if (url === "/api/reaper/summary") return { ok: true, status: 200, json: async () => ({ lastSweepAt: null }) };
     if (url === "/api/blockers") {
+      if (capacityReject) throw new Error("network unavailable");
       if (!capacityOk) return { ok: false, status: 503, json: async () => ({ error: "unavailable" }) };
       return {
         ok: true,
@@ -198,6 +200,19 @@ describe("overview page capacity projection (AII-797)", () => {
       log: [],
       mappings: { AII: mapping },
       capacityOk: false,
+    });
+    await win.loadOverview();
+    expect(doc.getElementById("kpi-capacity-value")?.textContent).toBe("—");
+    expect(doc.getElementById("kpi-blocked-value")?.textContent).toBe("—");
+    expect(doc.getElementById("overview-atcap-unavailable")?.classList.contains("hidden")).toBe(false);
+    expect(doc.getElementById("overview-atcap-empty")?.classList.contains("hidden")).toBe(true);
+    expect(doc.getElementById("overview-projects-body")?.textContent).toContain("unavailable");
+  });
+
+  it("renders unavailable when the capacity request rejects before a response", async () => {
+    const { win, doc } = mountOverview({
+      mappings: { AII: mapping },
+      capacityReject: true,
     });
     await win.loadOverview();
     expect(doc.getElementById("kpi-capacity-value")?.textContent).toBe("—");

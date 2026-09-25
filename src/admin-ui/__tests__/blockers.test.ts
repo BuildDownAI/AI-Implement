@@ -14,10 +14,11 @@ function escapeText(value: unknown): string {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function mountBlockers(fixtures: {
   ok?: boolean;
+  reject?: boolean;
   totals?: { teams: number; issues: number; byReason: Record<string, number> };
   capacityByMapping?: CapacityByMapping | null;
 }): { win: any; doc: Document } {
-  const { ok = true, totals = { teams: 0, issues: 0, byReason: {} }, capacityByMapping = {} } = fixtures;
+  const { ok = true, reject = false, totals = { teams: 0, issues: 0, byReason: {} }, capacityByMapping = {} } = fixtures;
   const dom = new JSDOM(`<!DOCTYPE html><body>${blockersHtml}</body>`, {
     runScripts: "dangerously",
     url: "http://localhost/admin#blockers",
@@ -29,6 +30,7 @@ function mountBlockers(fixtures: {
   win.registerPage = () => {};
   win.api = async (url: string) => {
     if (url !== "/api/blockers") return { ok: true, status: 200, json: async () => ({}) };
+    if (reject) throw new Error("network unavailable");
     if (!ok) return { ok: false, status: 502, json: async () => ({ error: "upstream unavailable" }) };
     return { ok: true, status: 200, json: async () => ({ blockers: [], totals, capacityByMapping }) };
   };
@@ -101,5 +103,12 @@ describe("blockers page capacity projection (AII-797)", () => {
     await win.loadBlockers();
     expect((doc.getElementById("blockers-kpis") as HTMLElement).hidden).toBe(true);
     expect((doc.getElementById("blockers-error") as HTMLElement).hidden).toBe(false);
+  });
+
+  it("hides the KPI grid when the blockers request rejects", async () => {
+    const { win, doc } = mountBlockers({ reject: true });
+    await win.loadBlockers();
+    expect((doc.getElementById("blockers-kpis") as HTMLElement).hidden).toBe(true);
+    expect((doc.getElementById("blockers-error") as HTMLElement).textContent).toContain("Capacity data unavailable");
   });
 });

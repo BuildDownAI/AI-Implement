@@ -15,7 +15,7 @@ export const blockersHtml = `
     <div class="kpi-grid" id="blockers-kpis" hidden>
       <div class="kpi"><div class="kpi-label">Total blocked</div><div class="kpi-value" id="kpi-blocked-total">0</div></div>
       <div class="kpi"><div class="kpi-label">Teams affected</div><div class="kpi-value" id="kpi-blocked-teams">0</div></div>
-      <div class="kpi"><div class="kpi-label">By concurrency cap</div><div class="kpi-value" id="kpi-blocked-concurrency">0</div></div>
+      <div class="kpi"><div class="kpi-label">Teams at cap</div><div class="kpi-value" id="kpi-blocked-concurrency">0</div></div>
       <div class="kpi"><div class="kpi-label">By dedup</div><div class="kpi-value" id="kpi-blocked-dedup">0</div></div>
     </div>
 
@@ -105,13 +105,20 @@ export const blockersScript = `
   async function loadBlockers() {
     const errorEl = document.getElementById('blockers-error');
     errorEl.hidden = true;
-    const res = await window.api('/api/blockers');
-    if (!res.ok) {
-      let errorMsg = 'Unknown error';
-      try {
-        const errBody = await res.json();
-        errorMsg = errBody.error || errorMsg;
-      } catch (_) { /* ignore parse errors */ }
+    let res;
+    try {
+      res = await window.api('/api/blockers');
+    } catch (_) {
+      res = null;
+    }
+    if (!res || !res.ok) {
+      let errorMsg = 'Capacity data unavailable';
+      if (res) {
+        try {
+          const errBody = await res.json();
+          errorMsg = errBody.error || errorMsg;
+        } catch (_) { /* ignore parse errors */ }
+      }
       errorEl.innerHTML = '<div style="flex:1"><div class="alert-title">Failed to load blockers</div><div class="alert-desc">' + window.esc(errorMsg) + '</div></div>';
       errorEl.hidden = false;
       document.getElementById('blockers-kpis').hidden = true;

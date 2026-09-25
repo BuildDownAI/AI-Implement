@@ -505,7 +505,7 @@ export const overviewScript = `
         window.api('/api/log'),
         window.api('/api/mappings'),
         window.api('/api/reaper/summary'),
-        window.api('/api/blockers'),
+        window.api('/api/blockers').catch(function () { return null; }),
       ]);
       const log = await logRes.json();
       const mappings = await mappingsRes.json();
