@@ -1,5 +1,15 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { restateBindAddress, register, queryNonCompletedInvocations } from "../restate/endpoint.js";
+import { restateBindAddress, register, queryNonCompletedInvocations, RESTATE_SERVICES } from "../restate/endpoint.js";
+
+// AII-727: a static pin, unit-tier only. Dropping either service from RESTATE_SERVICES
+// passes every other test in this file (they all fake the admin API), and a real container
+// only catches it in endpoint.restate.test.ts — this is the fast, no-Docker half of that
+// same regression.
+describe("RESTATE_SERVICES", () => {
+  it("names exactly Operator and orchestratorTools", () => {
+    expect(RESTATE_SERVICES.map((service) => service.name)).toEqual(["Operator", "orchestratorTools"]);
+  });
+});
 
 describe("restateBindAddress", () => {
   afterEach(() => {
