@@ -3242,6 +3242,7 @@ describe("admin blockers endpoint", () => {
       // A stale/never-advanced tracker-label snapshot reports the team idle — the
       // response must not trust it.
       inProgressCountsByScope: { CORE: 0 },
+      parentsToFinalize: [],
     });
 
     const res = await request("/api/blockers", "GET", "secret", undefined, token);
