@@ -133,7 +133,121 @@ describe("review ledger store", () => {
     const [row] = store.getReviewFindingsByKeys("org/repo", 42, [finding.findingKey]);
     expect(row.status).toBe("deferred");
     expect(row.resolvedAt).toBeNull();
+    expect(row.revision).toBe(2);
     expect(store.listOpenReviewFindings("org/repo", 42)).toEqual([]);
+  });
+
+  it("starts a new finding at revision 1 and increments by exactly 1 on every accepted re-report, including a byte-identical repeat", () => {
+    const id = store.upsertReviewFinding({
+      repo: "org/repo",
+      prNumber: 42,
+      source: "github-review",
+      severity: "blocking",
+      body: "Fix the validation.",
+    });
+    expect(store.getReviewFindingById(id)?.revision).toBe(1);
+
+    const repeatId = store.upsertReviewFinding({
+      repo: "org/repo",
+      prNumber: 42,
+      source: "github-review",
+      severity: "blocking",
+      body: "Fix the validation.",
+    });
+    expect(repeatId).toBe(id);
+    expect(store.getReviewFindingById(id)?.revision).toBe(2);
+  });
+
+  it("a post-snapshot re-report stays open after a stale conditional resolve", () => {
+    const id = store.upsertReviewFinding({
+      repo: "org/repo",
+      prNumber: 42,
+      source: "github-review",
+      severity: "blocking",
+      body: "Fix the validation.",
+    });
+    const snapshot = store.getReviewFindingById(id)!;
+    expect(snapshot.revision).toBe(1);
+
+    // Re-report bumps the revision past the caller's snapshot.
+    store.upsertReviewFinding({
+      repo: "org/repo",
+      prNumber: 42,
+      source: "github-review",
+      severity: "blocking",
+      body: "Fix the validation.",
+    });
+
+    const changed = store.markReviewFindingResolvedIfRevision(id, snapshot.revision);
+    expect(changed).toBe(0);
+    expect(store.listOpenReviewFindings("org/repo", 42)).toMatchObject([{ id, status: "open" }]);
+  });
+
+  it("a conditional resolve at the current revision succeeds and removes the finding from the open list", () => {
+    const id = store.upsertReviewFinding({
+      repo: "org/repo",
+      prNumber: 42,
+      source: "github-review",
+      severity: "blocking",
+      body: "Fix the validation.",
+    });
+    const snapshot = store.getReviewFindingById(id)!;
+
+    const changed = store.markReviewFindingResolvedIfRevision(id, snapshot.revision);
+    expect(changed).toBe(1);
+    expect(store.listOpenReviewFindings("org/repo", 42)).toEqual([]);
+    expect(store.getReviewFindingById(id)?.status).toBe("resolved");
+  });
+
+  it("a conditional defer at the current revision succeeds and preserves the deferred/fixed/invalid policy on re-report", () => {
+    const id = store.upsertReviewFinding({
+      repo: "org/repo",
+      prNumber: 42,
+      source: "github-review",
+      severity: "blocking",
+      body: "Add a config flag for this.",
+    });
+    const snapshot = store.getReviewFindingById(id)!;
+
+    const changed = store.markReviewFindingDeferredIfRevision(id, snapshot.revision);
+    expect(changed).toBe(1);
+    expect(store.getReviewFindingById(id)?.status).toBe("deferred");
+
+    store.upsertReviewFinding({
+      repo: "org/repo",
+      prNumber: 42,
+      source: "github-review",
+      severity: "blocking",
+      body: "Add a config flag for this.",
+    });
+    expect(store.getReviewFindingById(id)?.status).toBe("deferred");
+  });
+
+  it("conditional dispositions are scoped to a single id: resolving a subset of more than 30 findings leaves the rest open", () => {
+    const ids = Array.from({ length: 31 }, (_, i) =>
+      store.upsertReviewFinding({
+        repo: "org/repo",
+        prNumber: 42,
+        source: "github-review",
+        severity: "blocking",
+        body: `Finding number ${i}`,
+      }),
+    );
+
+    const dispatched = ids.slice(0, 30);
+    for (const id of dispatched) {
+      const snapshot = store.getReviewFindingById(id)!;
+      const changed = store.markReviewFindingResolvedIfRevision(id, snapshot.revision);
+      expect(changed).toBe(1);
+    }
+
+    const stillOpen = store.listOpenReviewFindings("org/repo", 42);
+    expect(stillOpen).toHaveLength(1);
+    expect(stillOpen[0]!.id).toBe(ids[30]);
+  });
+
+  it("getReviewFindingById returns undefined for a nonexistent id", () => {
+    expect(store.getReviewFindingById(999999)).toBeUndefined();
   });
 
   it("getReviewFindingsByKeys returns rows for the given keys regardless of status", () => {
