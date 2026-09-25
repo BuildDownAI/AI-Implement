@@ -760,7 +760,12 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     const env = envFor(label);
     const fixture = freshScenario("rejected-launch");
     fixture.dispatchImpl = async () => ({ success: false, status: 422, outcome: "rejected" as const, error: "workflow file not found" });
-    fixture.pending = { taskText: "Fix 1 finding version", findings: [{ findingKey: "f1", version: 1 }] };
+    // Use the production queue projection here. A hand-supplied pending fixture
+    // would keep offering the same finding after admission and correctly cause
+    // another attempt, inflating the budget ledger before this assertion runs.
+    fixture.useProductionPending = true;
+    const findingId = seedOpenFinding(fixture, "Rejected-launch finding");
+    seedQueueEvent(fixture, "automatic review-fix finding", [findingId]);
     await triggerFeedback(env, fixture.scope);
     await until(() => latestAttemptRow(fixture.scope) !== undefined, 5_000);
     const attemptId = latestAttemptRow(fixture.scope)!.attemptId;
