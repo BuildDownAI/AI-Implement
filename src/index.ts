@@ -3812,9 +3812,12 @@ function startServer(
           secret: config.runnerTokenSecret,
           githubAppId: config.githubAppId,
           githubAppPrivateKey: config.githubAppPrivateKey,
-          repository: req.headers["x-run-repository"] as string | undefined,
-          githubRunId: Number(req.headers["x-github-run-id"]),
-          githubRunAttempt: Number(req.headers["x-github-run-attempt"]),
+          repository: typeof req.headers["x-run-repository"] === "string"
+            ? req.headers["x-run-repository"] : undefined,
+          githubRunId: typeof req.headers["x-github-run-id"] === "string"
+            ? Number(req.headers["x-github-run-id"]) : NaN,
+          githubRunAttempt: typeof req.headers["x-github-run-attempt"] === "string"
+            ? Number(req.headers["x-github-run-attempt"]) : NaN,
         };
         const result = url === "/api/runner/publication-authority"
           ? handlePublicationAuthorityCheck(request)
