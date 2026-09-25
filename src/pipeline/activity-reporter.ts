@@ -264,6 +264,18 @@ export class ActivityReporter {
         // between the last successful ack and finalSequence still shows up
         // via computeMissingTail().
         if (attachFinal) this.finalSequenceSent = true;
+        if (batch.length > 0) {
+          // A rejected batch's events are gone just as surely as a dropped
+          // one — record the range now, or a later batch's successful ack
+          // can advance lastAckedSequence past this gap and mask it from
+          // computeMissingTail() (droppedRanges is otherwise the only signal
+          // once the stream isn't closed).
+          this.droppedRanges.push({
+            fromSequence: batch[0].sequence,
+            toSequence: batch[batch.length - 1].sequence,
+            reason: "transport_failure",
+          });
+        }
         if (this.closed) {
           // A mid-stream rejection (410, stream-stale) can close the stream
           // while events beyond the rejected batch are still buffered —
@@ -501,10 +513,16 @@ function redactStructured(value: ActivityDetailValue | undefined): unknown {
   const out: Record<string, unknown> = {};
   for (const [key, v] of Object.entries(value)) {
     if (REASONING_KEY_PATTERN.test(key)) continue; // hidden reasoning: explicitly stripped, never journaled
+    if (SECRET_KEY_PATTERN.test(key)) {
+      // A credential-shaped key redacts its entire subtree — checked before
+      // recursing, or a secret nested under an array/object value (e.g.
+      // `tokens: [...]`, `credentials: { raw: ... }`) recurses past the key
+      // check and serializes untouched.
+      out[key] = v === null || v === undefined ? v : REDACTED;
+      continue;
+    }
     if (v !== null && typeof v === "object") {
       out[key] = redactStructured(v as ActivityDetailValue);
-    } else if (SECRET_KEY_PATTERN.test(key) && (typeof v === "string" || typeof v === "number")) {
-      out[key] = REDACTED;
     } else {
       out[key] = v;
     }

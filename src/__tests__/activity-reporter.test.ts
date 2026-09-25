@@ -361,6 +361,82 @@ describe("ActivityReporter", () => {
     expect(stats.missingTail).toBe(true);
   });
 
+  it("records a DroppedRange for a rejected non-final batch, keeping missingTail true even after later batches succeed", async () => {
+    const responses = [
+      response(409, { acknowledged: false, outcome: "conflict", attemptId: "attempt-1", reason: "different payload already stored" }), // batch 0-4
+      response(200, { acknowledged: true, outcome: "accepted", attemptId: "attempt-1" }), // batch 5-9
+      response(200, { acknowledged: true, outcome: "accepted", attemptId: "attempt-1" }), // batch 10-11 + final marker
+    ];
+    let i = 0;
+    const fetchImpl = (async () => {
+      const res = responses[Math.min(i, responses.length - 1)];
+      i++;
+      return res;
+    }) as typeof fetch;
+
+    const reporter = new ActivityReporter("https://orchestrator.test", "progress-token", "attempt-1", "producer-1", {
+      fetchImpl,
+      retryDelaysMs: [],
+      batchSize: 5,
+    });
+
+    for (let i = 0; i < 12; i++) {
+      reporter.record({ cycle: 1, kind: "tool_call", action: "Bash", detail: { i } });
+    }
+    reporter.finalize();
+
+    await reporter.flush();
+
+    const stats = reporter.getStats();
+    expect(stats.closed).toBe(false); // a 409 (unlike 410) does not close the stream
+    expect(stats.finalSequenceSent).toBe(true);
+    expect(stats.bufferedCount).toBe(0);
+    expect(stats.droppedRanges.some((r) => r.reason === "transport_failure" && r.fromSequence === 0 && r.toSequence === 4)).toBe(true);
+    expect(stats.missingTail).toBe(true);
+  });
+
+  it("redacts an entire array subtree under a credential-shaped key rather than recursing past it", async () => {
+    const { fetchImpl, calls } = capturingFetch([response(200, { acknowledged: true, outcome: "accepted", attemptId: "attempt-1" })]);
+    const reporter = new ActivityReporter("https://orchestrator.test", "progress-token", "attempt-1", "producer-1", {
+      fetchImpl,
+      retryDelaysMs: [],
+    });
+
+    reporter.record({
+      cycle: 1,
+      kind: "tool_result",
+      action: "Bash",
+      detail: { tokens: ["secret1"], note: "kept" } as any,
+    });
+    await reporter.flush();
+
+    const serialized = JSON.stringify(calls[0].body);
+    expect(serialized).not.toContain("secret1");
+    expect(serialized).toContain("kept");
+    expect(serialized).toContain("[REDACTED]");
+  });
+
+  it("redacts an entire nested-object subtree under a credential-shaped key rather than recursing past it", async () => {
+    const { fetchImpl, calls } = capturingFetch([response(200, { acknowledged: true, outcome: "accepted", attemptId: "attempt-1" })]);
+    const reporter = new ActivityReporter("https://orchestrator.test", "progress-token", "attempt-1", "producer-1", {
+      fetchImpl,
+      retryDelaysMs: [],
+    });
+
+    reporter.record({
+      cycle: 1,
+      kind: "tool_result",
+      action: "Bash",
+      detail: { credentials: { raw: "secret2" }, note: "kept" } as any,
+    });
+    await reporter.flush();
+
+    const serialized = JSON.stringify(calls[0].body);
+    expect(serialized).not.toContain("secret2");
+    expect(serialized).toContain("kept");
+    expect(serialized).toContain("[REDACTED]");
+  });
+
   it("sends the finalSequence marker once the buffer has drained, closing the stream", async () => {
     const { fetchImpl, calls } = capturingFetch([response(200, { acknowledged: true, outcome: "accepted", attemptId: "attempt-1" })]);
     const reporter = new ActivityReporter("https://orchestrator.test", "progress-token", "attempt-1", "producer-1", {
