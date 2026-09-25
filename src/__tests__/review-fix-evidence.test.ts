@@ -486,6 +486,8 @@ describe("retention and tombstones", () => {
     });
 
     insertAttemptWithCompletion(db, "attempt-old", now - sevenDaysMs - 1_000);
+    db.prepare(`UPDATE review_fix_attempts SET terminal_outcome_json = ? WHERE attempt_id = ?`)
+      .run('{"kind":"completed"}', "attempt-old");
     evidence.appendReviewFixActivityBatch({
       attemptId: "attempt-old", producerId: "producer-1",
       events: [makeEvent({ attemptId: "attempt-old", producerId: "producer-1", sequence: 0, payload: "x" })],
@@ -504,6 +506,8 @@ describe("retention and tombstones", () => {
     expect(evidence.listReviewFixActivity("attempt-unknown", { pageSize: 10 }).events).toHaveLength(1);
     expect(evidence.listReviewFixActivity("attempt-old", { pageSize: 10 }).events).toHaveLength(0);
     expect(evidence.isReviewFixEvidenceTombstoned("attempt-old")).toBe(true);
+    expect((db.prepare(`SELECT terminal_outcome_json as outcome FROM review_fix_attempts WHERE attempt_id = ?`)
+      .get("attempt-old") as { outcome: string }).outcome).toBe('{"kind":"completed"}');
     expect(evidence.isReviewFixEvidenceTombstoned("attempt-recent")).toBe(false);
 
     const replay = evidence.appendReviewFixActivityBatch({

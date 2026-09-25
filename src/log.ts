@@ -247,9 +247,9 @@ export function appendLog(entry: {
   // for the run lifetime; invalidateNonce() makes it prunable when terminal), and
   // never evict a row correlated to a Restate review-fix pilot attempt (via
   // dispatch_id) that is still unresolved (review_fix_attempts.completed_at IS
-  // NULL) or completed within the last 7 days (AII-795) — that attempt's own
-  // evidence in review-fix-evidence.ts is retained on the same clock, and this
-  // row is what a caller resolving ownership from dispatch_log needs until then.
+  // NULL) or completed within the last 7 days (AII-795). A terminal attempt
+  // stays exempt while delivery, reservation, result conflict, or execution
+  // identity is unresolved, matching review-fix-evidence's retention guard.
   db.prepare(
     `DELETE FROM dispatch_log
      WHERE machine_nonce IS NULL
@@ -259,7 +259,16 @@ export function appendLog(entry: {
          OR NOT EXISTS (
            SELECT 1 FROM review_fix_attempts a
            WHERE a.dispatch_id = dispatch_log.dispatch_id
-             AND (a.completed_at IS NULL OR a.completed_at >= ?)
+             AND (
+               a.completed_at IS NULL OR a.completed_at >= ?
+               OR a.result_conflict_at IS NOT NULL OR a.github_run_id IS NULL
+               OR EXISTS (SELECT 1 FROM dispatch_admissions d
+                          WHERE d.dispatch_id = a.dispatch_id AND d.released_at IS NULL)
+               OR EXISTS (SELECT 1 FROM review_fix_inbox i
+                          WHERE i.installation_id = a.installation_id
+                            AND i.repository = a.repository AND i.pr_number = a.pr_number
+                            AND i.delivery_state != 'delivered')
+             )
          )
        )`,
   ).run(MAX_LOG_ENTRIES, Date.now() - REVIEW_FIX_EVIDENCE_RETENTION_MS);
