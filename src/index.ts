@@ -101,6 +101,7 @@ import { validateIssueBaseBranch, postBranchComment } from "./base-branch.js";
 import { runMergeUps, clearRollUpHandledMarkersByIdentifier } from "./merge-up.js";
 import { runGroupingBranchAutoMerge } from "./auto-merge.js";
 import { getPendingReviewFixes, recordReviewFixDispatch, updateReviewFixStatus, shouldSkipReviewFix, acceptReviewFixWebhookEvent, buildReviewFixTaskDescription, MAX_TASK_FINDINGS } from "./review-fix-queue.js";
+import { initReviewFixEvidenceTable, sweepExpiredReviewFixEvidence } from "./review-fix-evidence.js";
 import { drainCommentGapfillQueue } from "./comment-gapfill-drain.js";
 import { sweepOrphanedGapfillRows } from "./comment-gapfill-queue.js";
 import { processPendingWorkflowSyncs } from "./workflow-sync-queue.js";
@@ -822,6 +823,16 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
     console.log(
       `[admission] released terminal-callback reservation dispatch=${released.dispatchId} mapping=${released.mappingKey} conclusion=${released.conclusion}`,
     );
+  }
+
+  // Bounded cleanup of Restate review-fix pilot evidence (AII-795): purges activity/cycle
+  // rows past the 7-day-since-completion retention floor, skipping any attempt whose
+  // ownership is still unresolved (pending delivery, active reservation, result conflict,
+  // or unbound execution). SQLite-only and synchronous — safe on every poll regardless of
+  // runner mode.
+  const evidenceSweep = sweepExpiredReviewFixEvidence();
+  if (evidenceSweep.purgedAttemptIds.length > 0) {
+    console.log(`[review-fix-evidence] expired ${evidenceSweep.purgedAttemptIds.length} attempt(s): ${evidenceSweep.purgedAttemptIds.join(", ")}`);
   }
 
   // Guaranteed (webhook-independent) merge detector: enqueue reconciliations
@@ -5027,6 +5038,7 @@ async function main(): Promise<void> {
   initAccessAuditTable();
   initAccessPageGrantsTable();
   initAuthEventsTable();
+  initReviewFixEvidenceTable();
 
   // A process that died mid-deploy must not leave dispatch paused forever.
   const holdWasSet = clearDeployHold();

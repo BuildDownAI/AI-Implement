@@ -2,6 +2,7 @@ import { getDb } from "./dedup.js";
 import { markCommentGapfillRunTerminal } from "./comment-gapfill-queue.js";
 import { isFailureRecord, type FailureRecord } from "./pipeline/failure-classification.js";
 import { read as readAdmission, release as releaseAdmission } from "./dispatch-admission.js";
+import { REVIEW_FIX_EVIDENCE_RETENTION_MS } from "./review-fix-evidence.js";
 
 const MAX_LOG_ENTRIES = 500;
 
@@ -242,13 +243,35 @@ export function appendLog(entry: {
   );
 
   // Keep only the most recent MAX_LOG_ENTRIES rows, but never evict a row while
-  // its machine nonce is active. Token vending and callbacks depend on that row
-  // for the run lifetime; invalidateNonce() makes it prunable when terminal.
+  // its machine nonce is active (token vending and callbacks depend on that row
+  // for the run lifetime; invalidateNonce() makes it prunable when terminal), and
+  // never evict a row correlated to a Restate review-fix pilot attempt (via
+  // dispatch_id) that is still unresolved (review_fix_attempts.completed_at IS
+  // NULL) or completed within the last 7 days (AII-795). A terminal attempt
+  // stays exempt while delivery, reservation, result conflict, or execution
+  // identity is unresolved, matching review-fix-evidence's retention guard.
   db.prepare(
     `DELETE FROM dispatch_log
      WHERE machine_nonce IS NULL
-       AND id NOT IN (SELECT id FROM dispatch_log ORDER BY dispatched_at DESC LIMIT ?)`,
-  ).run(MAX_LOG_ENTRIES);
+       AND id NOT IN (SELECT id FROM dispatch_log ORDER BY dispatched_at DESC LIMIT ?)
+       AND (
+         dispatch_id IS NULL
+         OR NOT EXISTS (
+           SELECT 1 FROM review_fix_attempts a
+           WHERE a.dispatch_id = dispatch_log.dispatch_id
+             AND (
+               a.completed_at IS NULL OR a.completed_at >= ?
+               OR a.result_conflict_at IS NOT NULL OR a.github_run_id IS NULL
+               OR EXISTS (SELECT 1 FROM dispatch_admissions d
+                          WHERE d.dispatch_id = a.dispatch_id AND d.released_at IS NULL)
+               OR EXISTS (SELECT 1 FROM review_fix_inbox i
+                          WHERE i.installation_id = a.installation_id
+                            AND i.repository = a.repository AND i.pr_number = a.pr_number
+                            AND i.delivery_state != 'delivered')
+             )
+         )
+       )`,
+  ).run(MAX_LOG_ENTRIES, Date.now() - REVIEW_FIX_EVIDENCE_RETENTION_MS);
 
   return Number(result.lastInsertRowid);
 }

@@ -660,6 +660,56 @@ export interface ReviewFixEvidenceSweepResult {
   readonly purgedAttemptIds: readonly string[];
 }
 
+interface AttemptOwnershipRow {
+  completedAt: number | null;
+  dispatchId: string;
+  installationId: string;
+  repository: string;
+  prNumber: number;
+  githubRunId: number | null;
+  resultConflictAt: number | null;
+}
+
+/**
+ * True when some piece of evidence this module does not own still needs `attemptId`'s
+ * row to resolve ownership of the PR/attempt — cleanup must not run underneath it even
+ * though `completed_at` is old enough on its own:
+ *  - **active reservation** — `dispatch_admissions` for this attempt's `dispatch_id` has
+ *    no `released_at` yet. `releaseOwner` (`review-fix-attempt-store.ts`) always runs
+ *    before/around `recordOutcome` on every real path, so this only fires on a genuinely
+ *    stuck row.
+ *  - **result conflict** — `result_conflict_at` is set: a second, disagreeing result was
+ *    seen for this attempt and nothing has resolved which one is authoritative.
+ *  - **unknown execution** — `github_run_id` is still null. `bindExecution` never ran
+ *    (or never landed) for this attempt, so the row that recorded activity/a terminal
+ *    outcome cannot be tied to the GitHub Actions run that produced it. A `launch_rejected`
+ *    attempt (never bound, by design — see `restate/review-fix-attempt.ts`) never reaches
+ *    this check in practice: it never streams activity or a cycle summary, so it's never a
+ *    sweep candidate to begin with.
+ *  - **pending delivery** — `review_fix_inbox` still holds a non-`delivered` row for the
+ *    same `(installationId, repository, prNumber)`. Inbox deliveries are scoped to the PR,
+ *    not the attempt (an attempt doesn't exist yet when its admitting delivery arrives), so
+ *    this is deliberately PR-scoped and can hold back an older attempt's cleanup while a
+ *    newer delivery for the same PR is still in flight — retention erring wide, not narrow.
+ */
+function hasUnresolvedOwnership(db: ReturnType<typeof getDb>, attempt: AttemptOwnershipRow): boolean {
+  const activeReservation = db
+    .prepare(`SELECT 1 FROM dispatch_admissions WHERE dispatch_id = ? AND released_at IS NULL`)
+    .get(attempt.dispatchId) !== undefined;
+  if (activeReservation) return true;
+
+  if (attempt.resultConflictAt !== null) return true;
+
+  if (attempt.githubRunId === null) return true;
+
+  const pendingDelivery = db
+    .prepare(`SELECT 1 FROM review_fix_inbox WHERE installation_id = ? AND repository = ? AND pr_number = ? AND delivery_state != 'delivered'`)
+    .get(attempt.installationId, attempt.repository, attempt.prNumber) !== undefined;
+  if (pendingDelivery) return true;
+
+  return false;
+}
+
 /**
  * Purges activity and cycle evidence for attempts that completed (per
  * `review_fix_attempts.completed_at`, owned by a sibling module) at least
@@ -667,7 +717,14 @@ export interface ReviewFixEvidenceSweepResult {
  * late-arriving event or cycle summary for that identity is rejected rather than
  * silently starting a fresh record. An attempt with no row in `review_fix_attempts`,
  * or with `completed_at` still null, is never purged — unresolved/unknown status
- * fails closed toward retention, not deletion.
+ * fails closed toward retention, not deletion. Past the retention floor, `hasUnresolvedOwnership`
+ * still holds the row back when pending delivery, active reservation, result conflict, or
+ * unknown execution evidence would be needed to resolve ownership.
+ *
+ * After a purge, `listReviewFixActivity`/`getReviewFixCycleSummary`/`listReviewFixCycleSummaries`
+ * read back empty/null for `attemptId` exactly as they would for an attempt that never recorded
+ * anything — call `isReviewFixEvidenceTombstoned(attemptId)` first to tell "expired" apart from
+ * "never recorded".
  */
 export function sweepExpiredReviewFixEvidence(now: number = Date.now()): ReviewFixEvidenceSweepResult {
   const db = getDb();
@@ -692,10 +749,16 @@ export function sweepExpiredReviewFixEvidence(now: number = Date.now()): ReviewF
 
   const purged: string[] = [];
   for (const { attemptId } of candidates) {
-    const attempt = db.prepare(`SELECT completed_at as completedAt FROM review_fix_attempts WHERE attempt_id = ?`).get(attemptId) as
-      { completedAt: number | null } | undefined;
+    const attempt = db
+      .prepare(`
+        SELECT completed_at as completedAt, dispatch_id as dispatchId, installation_id as installationId,
+               repository, pr_number as prNumber, github_run_id as githubRunId, result_conflict_at as resultConflictAt
+        FROM review_fix_attempts WHERE attempt_id = ?
+      `)
+      .get(attemptId) as AttemptOwnershipRow | undefined;
     if (!attempt || attempt.completedAt === null) continue;
     if (now - attempt.completedAt < REVIEW_FIX_EVIDENCE_RETENTION_MS) continue;
+    if (hasUnresolvedOwnership(db, attempt)) continue;
     purgeOne(attemptId);
     purged.push(attemptId);
   }
@@ -704,7 +767,10 @@ export function sweepExpiredReviewFixEvidence(now: number = Date.now()): ReviewF
 }
 
 /** Whether `attemptId` has already been purged and tombstoned — a late-arriving batch or cycle
- *  summary for this identity will be rejected rather than creating fresh evidence. */
+ *  summary for this identity will be rejected rather than creating fresh evidence. Callers reading
+ *  evidence back (`listReviewFixActivity`, `getReviewFixCycleSummary`, `listReviewFixCycleSummaries`)
+ *  see the same empty/null result for a tombstoned attempt as for one that never recorded anything;
+ *  check here first to report "expired" instead of a misleading "missing". */
 export function isReviewFixEvidenceTombstoned(attemptId: string): boolean {
   const db = getDb();
   ensureTombstoneTable(db);

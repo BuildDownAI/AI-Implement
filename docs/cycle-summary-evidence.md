@@ -252,3 +252,15 @@ doc comment in `types.ts`), so a chatty tool-trace never competes with cycle
 evidence for the same byte budget, and a cycle summary is never dropped or
 truncated because unrelated tool activity has already used up an attempt's
 byte allowance.
+
+`appendLog` retains a pilot-correlated `dispatch_log` row beyond its usual
+500-row limit while the attempt is active, within seven days of completion,
+or still has unresolved delivery, reservation, result-conflict, or execution
+identity. The poller sweeps activity payloads and cycle summaries seven days
+after completion only when those ownership checks are clear. It leaves the
+immutable terminal outcome in `review_fix_attempts` and a durable evidence
+identity tombstone. After the sweep, the low-level activity and cycle readers
+return empty/null; a caller must check `isReviewFixEvidenceTombstoned` and
+report **expired** for that attempt, never infer that an empty read means a
+successful run with no evidence. An unknown attempt with no tombstone is
+**missing**. Late writes to an expired identity are rejected.
