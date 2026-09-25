@@ -814,14 +814,10 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
     );
   }
 
-  // Per-poll reconciliation for the two terminal callback conclusions that deliberately
-  // hold their reservation via skipAdmissionRelease (planning_callback, operator_cancelled
-  // — AII-783 review, third round, on PR #681): both callbacks self-report from inside the
-  // still-running backend and their write drops the job out of getInFlightJobs()'s tracked
-  // set, so besides this, only the 6-hour stale-admission sweep above would ever notice the
-  // backend has since exited. No age floor — eligibility is "terminal callback conclusion,
-  // still reserved," re-checked fresh every poll — and each candidate goes through the same
-  // confirmAdmissionTerminated oracle before release.
+  // A terminal business status can arrive while its backend still runs, dropping the job
+  // out of the ordinary monitor set. Reconcile every terminal Legacy job with a held
+  // reservation on each poll, confirming the exact backend before release. There is no
+  // age floor; unknown status stays held for a later poll or the stale sweep.
   for (const released of await reconcileTerminalCallbackAdmissions((candidate) => confirmAdmissionTerminated(config, candidate))) {
     console.log(
       `[admission] released terminal-callback reservation dispatch=${released.dispatchId} mapping=${released.mappingKey} conclusion=${released.conclusion}`,
@@ -2376,6 +2372,20 @@ function mappingForJob(
 }
 
 /**
+ * AII-791: before any Legacy monitor/boot-recovery outcome action (a status write, a
+ * destroy/remove, a ticket reset), read the row's immutable admission owner and skip
+ * entirely when it names a Restate attempt — Restate's own workflow owns confirming that
+ * attempt's termination and releasing its reservation, not this poller. A job with no
+ * `dispatchId`, or no matching admission row (historical/unreserved dispatch, or one that
+ * never went through `acquireDispatch`), is unaffected — it keeps the existing Legacy
+ * handling this function guards.
+ */
+function isRestateOwnedJob(job: Job): boolean {
+  if (!job.dispatchId) return false;
+  return readAdmission(job.dispatchId)?.lifecycleOwner.kind === "restate";
+}
+
+/**
  * Resolves a mode-appropriate stopRunner for a TTL-expired job, mirroring
  * monitorFlyMachineJob's and monitorLocalDockerJob's own timeout stopRunner
  * callbacks. Returns undefined for GHA jobs (and for fly/local jobs missing
@@ -2473,6 +2483,8 @@ export async function confirmAdmissionTerminated(
 ): Promise<boolean> {
   const job = getJobByDispatchId(candidate.dispatchId);
   if (!job) return false;
+  if (candidate.lifecycleOwner.kind !== "legacy" || job.executionMode !== candidate.backend) return false;
+  if (candidate.generation !== undefined && job.admissionGeneration !== candidate.generation) return false;
 
   if (job.executionMode === "github-actions") {
     if (!job.repo) return false;
@@ -2577,6 +2589,7 @@ export async function tryFastReleasePlanningAdmission(config: AppConfig, dispatc
       mappingKey: record.mappingKey,
       backend: record.backend,
       lifecycleOwner: record.lifecycleOwner,
+      generation: record.generation,
       ageMs: Date.now() - record.createdAt,
     });
   } catch (err) {
@@ -2614,7 +2627,10 @@ export async function monitorJobs(config: AppConfig, registry: ProviderRegistry)
   for (const job of inFlightJobs) {
     try {
       // kg-refresh has its own lifecycle (monitorKgRefreshGhaJob) — never TTL it here.
-      if (job.phase !== "kg-refresh") {
+      // A Restate-owned job is never TTL-finalized here either (AII-791) — it falls
+      // through to the per-mode monitor below, which carries the same owner fence at
+      // its own terminal branch.
+      if (job.phase !== "kg-refresh" && !isRestateOwnedJob(job)) {
         const mapping = mappingForJob(teamRepoMap, job);
         // maxJobMinutes is a GHA-only setting (docs/pipeline: Job Timeout (min)); Fly and
         // local-docker jobs have their own timeout (FLY_MACHINE_TIMEOUT_MS) and must not
@@ -2649,7 +2665,7 @@ export async function monitorJobs(config: AppConfig, registry: ProviderRegistry)
             // re-triggers updateJobStatus's terminal hook, so it must not release the
             // admission reservation when the backend's death wasn't actually confirmed.
             if (stopConfirmed) {
-              updateJobStatus(job.id, "timed_out", "ttl_expired");
+              updateJobStatus(job.id, "timed_out", "ttl_expired", undefined, { backendTerminated: true });
             } else {
               updateJobStatus(job.id, "timed_out", "ttl_expired", undefined, { skipAdmissionRelease: true });
             }
@@ -2700,6 +2716,10 @@ async function monitorGitHubActionsJob(
 
   const [owner, repo] = repoFullName.split("/");
   if (!owner || !repo) return;
+
+  // AII-791: Restate finalizes its own attempts — this poller never acts on one, no
+  // matter what GHA itself reports for the run.
+  if (isRestateOwnedJob(job)) return;
 
   const mapping = Object.values(teamRepoMap).find(
     (m) => `${m.owner}/${m.repo}` === repoFullName,
@@ -2820,7 +2840,7 @@ async function monitorGitHubActionsJob(
     }
 
     if (!isMonitorRunIdStillCurrent(job)) return;
-    updateJobStatus(job.id, jobStatus, runStatus.conclusion, prUrl);
+    updateJobStatus(job.id, jobStatus, runStatus.conclusion, prUrl, { backendTerminated: true });
     console.log(`[monitor] Job ${job.id} (${job.issueIdentifier}) → ${jobStatus} (${runStatus.conclusion})`);
 
     // AII-264 r6: the run's PR already merged (auto-merge beat this check) — route straight
@@ -2903,6 +2923,10 @@ async function monitorFlyMachineJob(
   job: Job,
 ): Promise<void> {
   if (!config.flySessionsToken || !config.flySessionsApp || !job.machineId) return;
+
+  // AII-791: Restate finalizes its own attempts — this poller never acts on one, whether
+  // the machine looks timed-out or has already stopped.
+  if (isRestateOwnedJob(job)) return;
 
   // Check machine age timeout — also destroy the machine to stop accruing cost
   if (Date.now() - job.dispatchedAt > FLY_MACHINE_TIMEOUT_MS) {
@@ -3039,7 +3063,7 @@ async function monitorFlyMachineJob(
     }
 
     const durationMs = Date.now() - job.dispatchedAt;
-    updateJobStatus(job.id, jobStatus, decision.finalizeGroupingParent ? "no_op_finalized" : machineConclusion, prUrl);
+    updateJobStatus(job.id, jobStatus, decision.finalizeGroupingParent ? "no_op_finalized" : machineConclusion, prUrl, { backendTerminated: true });
     invalidateNonce(job.id);
     clearPrNotFoundGrace(job.id);
     console.log(`[monitor] Fly machine ${job.machineId} (${job.issueIdentifier}) → ${jobStatus} (${machineConclusion}, PR: ${prUrl || "none"})`);
@@ -3094,6 +3118,10 @@ async function monitorLocalDockerJob(
   job: Job,
 ): Promise<void> {
   if (!job.machineId) return;
+
+  // AII-791: Restate finalizes its own attempts — this poller never acts on one, no
+  // matter what the container itself reports.
+  if (isRestateOwnedJob(job)) return;
 
   if (Date.now() - job.dispatchedAt > FLY_MACHINE_TIMEOUT_MS) {
     await postLocalContainerLogs(provider, job, "container_timeout");
@@ -3178,7 +3206,7 @@ async function monitorLocalDockerJob(
   }
 
   const durationMs = Date.now() - job.dispatchedAt;
-  updateJobStatus(job.id, jobStatus, decision.finalizeGroupingParent ? "no_op_finalized" : `exit_${state.exitCode}`, prUrl);
+  updateJobStatus(job.id, jobStatus, decision.finalizeGroupingParent ? "no_op_finalized" : `exit_${state.exitCode}`, prUrl, { backendTerminated: true });
   invalidateNonce(job.id);
   clearPrNotFoundGrace(job.id);
   console.log(`[monitor] Local Docker container ${job.machineId} (${job.issueIdentifier}) → ${jobStatus} (exit ${state.exitCode}, PR: ${prUrl || "none"})`);
@@ -3317,9 +3345,10 @@ export async function reportJobCompletion(config: AppConfig, registry: ProviderR
   const mappings = getMappings();
   for (const job of terminalJobs) {
     try {
-      // Record dispatch breaker state for ALL terminal jobs before any early-continue.
-      // Uses reportJobCompletion as the single integration point because it sees every
-      // terminal job regardless of which backend or path produced it (GHA callback,
+      // Restate owns the outcome, breaker, and notification path for its attempts.
+      if (isRestateOwnedJob(job)) continue;
+      // Record dispatch breaker state for every Legacy terminal job before any other
+      // early-continue. This path sees every Legacy backend and result source (GHA callback,
       // GHA monitor, Fly, local-docker).
       let pendingBreakerTrip: { phase: string; failures: number; conclusion: string } | null = null;
       // kg-refresh dispatch never calls isParked(), so breaker bookkeeping here is dead weight that silently mutates DB without notification.
@@ -3547,6 +3576,11 @@ async function startupReconciliation(config: AppConfig, registry: ProviderRegist
       if (!config.reaperDryRun) destroyed++;
       continue;
     }
+
+    // AII-791: boot recovery never finalizes a Restate-owned attempt, even one that
+    // looks orphaned or stale from this row's own status — Restate's own workflow
+    // owns confirming its termination.
+    if (isRestateOwnedJob(job)) continue;
 
     const isTerminal =
       job.status === "completed" || job.status === "review_failed" || job.status === "failed" || job.status === "timed_out";

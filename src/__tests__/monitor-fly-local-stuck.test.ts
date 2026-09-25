@@ -99,7 +99,7 @@ describe("remediateStuckJob — Fly machine timeout path", () => {
       await remediateStuckJob(mockConfig, provider, makeJob(), "machine_timeout", stopRunner);
 
       expect(stopRunner).toHaveBeenCalledOnce();
-      expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_requeued");
+      expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_requeued", undefined, { backendTerminated: true });
       expect(provider.clearWorkingState).toHaveBeenCalledWith("issue-abc", "AII");
       expect(deleteDispatched).toHaveBeenCalledWith("issue-abc");
       expect(notifyStuckGiveUp).not.toHaveBeenCalled();
@@ -112,7 +112,7 @@ describe("remediateStuckJob — Fly machine timeout path", () => {
 
       await remediateStuckJob(mockConfig, provider, makeJob(), "machine_timeout", stopRunner);
 
-      expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_requeued");
+      expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_requeued", undefined, { backendTerminated: true });
       expect(deleteDispatched).toHaveBeenCalledWith("issue-abc");
       expect(notifyStuckGiveUp).not.toHaveBeenCalled();
     });
@@ -124,7 +124,7 @@ describe("remediateStuckJob — Fly machine timeout path", () => {
 
       await remediateStuckJob(mockConfig, provider, makeJob(), "machine_timeout", stopRunner);
 
-      expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_requeued");
+      expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_requeued", undefined, { backendTerminated: true });
       expect(deleteDispatched).toHaveBeenCalled();
       expect(notifyStuckGiveUp).not.toHaveBeenCalled();
     });
@@ -139,7 +139,7 @@ describe("remediateStuckJob — Fly machine timeout path", () => {
       await remediateStuckJob(mockConfig, provider, makeJob(), "machine_timeout", stopRunner);
 
       expect(stopRunner).toHaveBeenCalledOnce();
-      expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_giveup");
+      expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_giveup", undefined, { backendTerminated: true });
     });
 
     it("clears working state but preserves dedup on hard-stop", async () => {
@@ -194,7 +194,7 @@ describe("remediateStuckJob — local-docker timeout path", () => {
       await remediateStuckJob(mockConfig, provider, job, "container_timeout", stopRunner);
 
       expect(stopRunner).toHaveBeenCalledOnce();
-      expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_requeued");
+      expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_requeued", undefined, { backendTerminated: true });
       expect(provider.clearWorkingState).toHaveBeenCalledWith("issue-abc", "AII");
       expect(deleteDispatched).toHaveBeenCalledWith("issue-abc");
       expect(notifyStuckGiveUp).not.toHaveBeenCalled();
@@ -208,7 +208,7 @@ describe("remediateStuckJob — local-docker timeout path", () => {
 
       await remediateStuckJob(mockConfig, provider, job, "container_timeout", stopRunner);
 
-      expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_requeued");
+      expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_requeued", undefined, { backendTerminated: true });
       expect(deleteDispatched).toHaveBeenCalled();
       expect(notifyStuckGiveUp).not.toHaveBeenCalled();
     });
@@ -224,7 +224,7 @@ describe("remediateStuckJob — local-docker timeout path", () => {
       await remediateStuckJob(mockConfig, provider, job, "container_timeout", stopRunner);
 
       expect(stopRunner).toHaveBeenCalledOnce();
-      expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_giveup");
+      expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_giveup", undefined, { backendTerminated: true });
     });
 
     it("clears working state but preserves dedup on hard-stop", async () => {

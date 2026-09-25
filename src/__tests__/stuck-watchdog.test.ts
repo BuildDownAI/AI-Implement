@@ -210,7 +210,7 @@ describe("remediateStuckJob — GHA cancel-acceptance is not termination confirm
     const stopConfirmed = await remediateStuckJob(mockConfig, provider, job, "in_progress");
 
     expect(stopConfirmed).toBe(true);
-    expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_requeued");
+    expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_requeued", undefined, { backendTerminated: true });
   });
 
   it("holds the reservation when the cancel request itself throws", async () => {
