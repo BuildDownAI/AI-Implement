@@ -214,10 +214,18 @@ export function selectFileOverlapDeferrals(
   return blockers;
 }
 
+/**
+ * `reservedCountsByTeam` is the DB-backed reservation count per team (unreleased,
+ * non-kg-refresh `dispatch_admissions` rows — `src/dispatch-admission.ts#count`), the
+ * same authority `acquireDispatch` checks capacity against. Never a tracker-label
+ * count: a stranded label (advanced late, or not at all) must not mask real capacity,
+ * and a reservation with no run ID yet (a prepared launch mid-flight) must still count
+ * as used.
+ */
 export function selectBlockers(
   issues: TicketIssue[],
   teamRepoMap: Record<string, RepoMapping>,
-  inProgressCountsByTeam: Record<string, number>,
+  reservedCountsByTeam: Record<string, number>,
   isAlreadyDispatched: (issueId: string) => boolean,
 ): Blocker[] {
   const blockers: Blocker[] = [];
@@ -246,16 +254,19 @@ export function selectBlockers(
       });
       continue;
     }
-    const inProgress = inProgressCountsByTeam[teamKey] ?? 0;
+    const used = reservedCountsByTeam[teamKey] ?? 0;
     const cap = mapping.maxInProgressAiIssues;
-    if (cap - inProgress <= 0) {
+    if (cap - used <= 0) {
+      console.log(
+        `[poll-selection] Capacity exclusion: issue=${issue.identifier} team=${teamKey} count=${used} cap=${cap}`,
+      );
       blockers.push({
         issueId: issue.id,
         issueIdentifier: issue.identifier,
         issueTitle: issue.title,
         teamKey,
         reason: "concurrency",
-        detail: `${teamKey} at concurrency cap (${inProgress}/${cap}). Waiting for a slot.`,
+        detail: `${teamKey} at concurrency cap (${used}/${cap}). Waiting for a slot.`,
       });
     }
   }

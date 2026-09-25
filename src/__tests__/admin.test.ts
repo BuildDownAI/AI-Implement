@@ -3054,6 +3054,7 @@ describe("admin issues endpoint", () => {
       readyForImplementation: [ready],
       needsPlanning: [needsPlan],
       inProgressCountsByScope: { CORE: 2 },
+      parentsToFinalize: [],
     });
     const token = await login("secret");
     const res = await request("/api/issues", "GET", "secret", undefined, token);
@@ -3080,6 +3081,7 @@ describe("admin issues endpoint", () => {
       readyForImplementation: [mapped],
       needsPlanning: [unmapped],
       inProgressCountsByScope: {},
+      parentsToFinalize: [],
     });
     const res = await request("/api/issues", "GET", "secret", undefined, token);
     expect(res.statusCode).toBe(200);
@@ -3186,6 +3188,7 @@ describe("admin blockers endpoint", () => {
       readyForImplementation: [issue],
       needsPlanning: [],
       inProgressCountsByScope: {},
+      parentsToFinalize: [],
     });
     const token = await login("secret");
     // No mapping for CORE team → should produce a no-mapping blocker
@@ -3209,6 +3212,7 @@ describe("admin blockers endpoint", () => {
       readyForImplementation: [dedupBlocked, unmapped],
       needsPlanning: [],
       inProgressCountsByScope: {},
+      parentsToFinalize: [],
     });
     const res = await request("/api/blockers", "GET", "secret", undefined, token);
     expect(res.statusCode).toBe(200);
@@ -3217,6 +3221,63 @@ describe("admin blockers endpoint", () => {
       ["dedup", "CORE-100", "https://fake/issue/CORE-100"],
       ["no-mapping", "ZZZ-1", null],
     ]);
+  });
+
+  it("reports capacityByMapping from unreleased dispatch_admissions reservations, and the concurrency blocker's used/cap matches it exactly — ignoring a stale tracker-label snapshot", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", { teamKey: "CORE", owner: "org", repo: "core", maxInProgressAiIssues: 1, planningWorkflowFile: "claude-plan.yml" }, token);
+
+    const admission = await import("../dispatch-admission.js");
+    const acquired = admission.acquire({
+      dispatchId: "res-core-1",
+      mappingKey: "CORE",
+      scope: { kind: "issue", issueScope: "CORE", issueId: "issue-held" },
+      kind: "implementation",
+      backend: "github-actions",
+      lifecycleOwner: { kind: "legacy" },
+      cap: 1,
+    });
+    expect(acquired.ok).toBe(true);
+
+    const candidate: TicketIssue = { id: "issue-2", identifier: "CORE-2", title: "Needs a slot", description: null, scopeKey: "CORE", nativeStatus: "Todo" };
+    vi.spyOn(provider, "fetchAIImplementSnapshot").mockResolvedValueOnce({
+      readyForImplementation: [candidate],
+      needsPlanning: [],
+      // A stale/never-advanced tracker-label snapshot reports the team idle — the
+      // response must not trust it.
+      inProgressCountsByScope: { CORE: 0 },
+      parentsToFinalize: [],
+    });
+
+    const res = await request("/api/blockers", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.capacityByMapping.CORE).toEqual({ used: 1, cap: 1, source: "reservations" });
+    const concurrencyBlocker = body.blockers.find((b: { reason: string }) => b.reason === "concurrency");
+    expect(concurrencyBlocker).toBeDefined();
+    expect(concurrencyBlocker.detail).toContain("(1/1)");
+  });
+
+  it("excludes kg-refresh reservations from capacityByMapping", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", { teamKey: "CORE", owner: "org", repo: "core", maxInProgressAiIssues: 1, planningWorkflowFile: "claude-plan.yml" }, token);
+
+    const admission = await import("../dispatch-admission.js");
+    const acquired = admission.acquire({
+      dispatchId: "res-core-kg",
+      mappingKey: "CORE",
+      scope: { kind: "issue", issueScope: "CORE", issueId: "issue-kg" },
+      kind: "kg-refresh",
+      backend: "github-actions",
+      lifecycleOwner: { kind: "legacy" },
+      cap: 1,
+    });
+    expect(acquired.ok).toBe(true);
+
+    const res = await request("/api/blockers", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.capacityByMapping.CORE).toEqual({ used: 0, cap: 1, source: "reservations" });
   });
 });
 
@@ -3467,11 +3528,11 @@ describe("github-install-state endpoint", () => {
 
   it("returns 200 with the probe result", async () => {
     const token = await login("secret");
-    vi.mocked(installState.probeInstallState).mockResolvedValueOnce({ state: "ready", installationId: 7 });
+    vi.mocked(installState.probeInstallState).mockResolvedValueOnce({ state: "ready" });
 
     const res = await request("/api/admin/github-install-state?owner=acme&repo=backend", "GET", "secret", undefined, token);
     expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body)).toEqual({ state: "ready", installationId: 7 });
+    expect(JSON.parse(res.body)).toEqual({ state: "ready" });
   });
 
   it("returns 500 when the probe throws (e.g. a rethrown credential error)", async () => {
@@ -3867,6 +3928,7 @@ describe("GET /api/deployment-status", () => {
       runningCommit: "abc1234",
       headCommit: "def5678",
       checkedAt: 1_700_000_000_000,
+      isDowngrade: false,
     });
     const token = await login("secret");
     const res = await statusRequest(token);
@@ -3884,6 +3946,7 @@ describe("GET /api/deployment-status", () => {
       runningCommit: "abc1234",
       headCommit: "abc1234",
       checkedAt: 1,
+      isDowngrade: false,
     });
     const token = await login("secret");
     const res = await statusRequest(token);
@@ -4559,7 +4622,7 @@ describe("admin sessions — kg-refresh destroy", () => {
   async function deleteSession(
     machineId: string,
     token: string,
-    kgRefresh?: Parameters<typeof admin.handleAdminRequest>[4]["kgRefresh"],
+    kgRefresh?: NonNullable<Parameters<typeof admin.handleAdminRequest>[4]>["kgRefresh"],
   ): Promise<{ statusCode: number; body: string }> {
     const req = new MockRequest(
       `/api/sessions/${encodeURIComponent(machineId)}`,
