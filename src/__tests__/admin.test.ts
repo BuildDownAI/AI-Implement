@@ -1684,6 +1684,57 @@ describe("admin mappings", () => {
     expect(JSON.parse(list.body).RFLOK.reviewFixLifecycle).toBe("restate");
   });
 
+  it("preserves a selected Restate lifecycle during an unrelated edit and rejects an unsupported dispatch change", async () => {
+    const token = await login("secret");
+    resolveWorkflowCapabilitiesMock.mockResolvedValueOnce({
+      contract: "envelope", supportsRunPublicationToken: true, supportsAttemptCorrelation: true,
+    });
+    const healthy = { getRestateStatus: () => ({ sidecar: { state: "ready" as const }, registration: { state: "registered" as const } }) };
+    const original = await requestWithDeps("/api/mappings", "POST", token, healthy, {
+      teamKey: "RFLPRESERVE", owner: "org", repo: "app", defaultBranch: "pilot-ref",
+      workflowFile: "pilot.yml", executionMode: "github-actions", reviewFixLifecycle: "restate",
+    });
+    expect(original.statusCode).toBe(202);
+
+    const unrelated = await requestWithDeps("/api/mappings", "POST", token, {}, {
+      teamKey: "RFLPRESERVE", owner: "org", repo: "app", paused: true,
+      reviewFixLifecycle: "restate",
+    });
+    expect(unrelated.statusCode).toBe(202);
+    expect(JSON.parse(unrelated.body)).toMatchObject({
+      reviewFixLifecycle: "restate", workflowFile: "pilot.yml", executionMode: "github-actions", paused: true,
+    });
+
+    const changed = await requestWithDeps("/api/mappings", "POST", token, {}, {
+      teamKey: "RFLPRESERVE", owner: "org", repo: "app", executionMode: "fly-machines",
+    });
+    expect(changed.statusCode).toBe(400);
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    expect(JSON.parse(list.body).RFLPRESERVE.executionMode).toBe("github-actions");
+  });
+
+  it("rejects a workflow without publication support and does not expose probe errors", async () => {
+    const token = await login("secret");
+    const healthy = { getRestateStatus: () => ({ sidecar: { state: "ready" as const }, registration: { state: "registered" as const } }) };
+    resolveWorkflowCapabilitiesMock.mockResolvedValueOnce({
+      contract: "envelope", supportsRunPublicationToken: false, supportsAttemptCorrelation: true,
+    });
+    const unsupported = await requestWithDeps("/api/mappings", "POST", token, healthy, {
+      teamKey: "RFLNO-PUB", owner: "org", repo: "app", defaultBranch: "main",
+      reviewFixLifecycle: "restate",
+    });
+    expect(unsupported.statusCode).toBe(400);
+    expect(JSON.parse(unsupported.body).error).toContain("run_publication_token");
+
+    resolveWorkflowCapabilitiesMock.mockRejectedValueOnce(new Error("secret probe detail"));
+    const failed = await requestWithDeps("/api/mappings", "POST", token, healthy, {
+      teamKey: "RFLPROBE", owner: "org", repo: "app", defaultBranch: "main",
+      reviewFixLifecycle: "restate",
+    });
+    expect(failed.statusCode).toBe(400);
+    expect(failed.body).not.toContain("secret probe detail");
+  });
+
   it("does not write reviewFixLifecycle='restate' when a save is rejected — the mapping keeps its prior Legacy selection", async () => {
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", {

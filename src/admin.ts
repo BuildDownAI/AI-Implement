@@ -207,12 +207,12 @@ async function reviewFixLifecycleEnablementError(
   try {
     const token = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
     capabilities = await resolveWorkflowCapabilities({ owner, repo, workflowFile, token, ref });
-  } catch (err) {
-    return `reviewFixLifecycle "restate" requires confirming the dispatch-ref workflow's capability, but the check failed: ${err instanceof Error ? err.message : String(err)}`;
+  } catch {
+    return `reviewFixLifecycle "restate" could not verify the dispatch-ref workflow's capability`;
   }
 
-  if (!capabilities.supportsAttemptCorrelation) {
-    return `reviewFixLifecycle "restate" requires "${workflowFile}" on "${ref}" to declare run_attempt_token (installed template/runner capability), which it does not`;
+  if (capabilities.contract !== "envelope" || !capabilities.supportsAttemptCorrelation || !capabilities.supportsRunPublicationToken) {
+    return `reviewFixLifecycle "restate" requires "${workflowFile}" on "${ref}" to declare run_attempt_token and run_publication_token (installed template/runner capability)`;
   }
 
   return null;
@@ -2515,7 +2515,7 @@ export async function upsertMappingAction(
   }
 
   const validExecutionModes: ExecutionMode[] = ["github-actions", "fly-machines"];
-  const executionMode = (body.executionMode ?? DEFAULT_EXECUTION_MODE) as ExecutionMode;
+  const executionMode = (body.executionMode ?? existingMapping?.executionMode ?? DEFAULT_EXECUTION_MODE) as ExecutionMode;
   if (!validExecutionModes.includes(executionMode)) {
     return { status: 400, body: { error: "executionMode must be 'github-actions' or 'fly-machines'" } };
   }
@@ -2536,7 +2536,7 @@ export async function upsertMappingAction(
     return { status: 400, body: { error: "machineMemoryMb must be an integer >= 256" } };
   }
 
-  const workflowFile = body.workflowFile || "claude-implement.yml";
+  const workflowFile = body.workflowFile || existingMapping?.workflowFile || "claude-implement.yml";
   const planningEnabled = body.planningEnabled ?? DEFAULT_PLANNING_ENABLED;
   const planningWorkflowFile = body.planningWorkflowFile ?? DEFAULT_PLANNING_WORKFLOW_FILE;
   const autoApprovePlans = body.autoApprovePlans ?? DEFAULT_AUTO_APPROVE_PLANS;
@@ -2691,14 +2691,6 @@ export async function upsertMappingAction(
   } else if (rawLifecycle === "legacy") {
     reviewFixLifecycle = "legacy";
   } else if (rawLifecycle === "restate") {
-    const enablementError = await reviewFixLifecycleEnablementError(
-      { executionMode, owner: body.owner, repo: body.repo, workflowFile, ref: defaultBranch },
-      config,
-      deps,
-    );
-    if (enablementError) {
-      return { status: 400, body: { error: enablementError } };
-    }
     reviewFixLifecycle = "restate";
   } else {
     return { status: 400, body: { error: `reviewFixLifecycle invalid: must be null, "legacy", or "restate"` } };
@@ -2757,6 +2749,23 @@ export async function upsertMappingAction(
     prDispatchBudget,
     reviewFixLifecycle,
   };
+
+  // Existing attempts keep their stored owner. Revalidate only when a save first enables
+  // Restate or changes where future attempts dispatch; ordinary edits keep the selection
+  // even while the endpoint is temporarily unhealthy.
+  if (reviewFixLifecycle === "restate" && (
+    !existingMapping || existingMapping.reviewFixLifecycle !== "restate" ||
+    mapping.owner !== existingMapping.owner || mapping.repo !== existingMapping.repo ||
+    mapping.workflowFile !== existingMapping.workflowFile || mapping.defaultBranch !== existingMapping.defaultBranch ||
+    mapping.executionMode !== existingMapping.executionMode
+  )) {
+    const enablementError = await reviewFixLifecycleEnablementError(
+      { executionMode, owner: mapping.owner, repo: mapping.repo, workflowFile: mapping.workflowFile, ref: mapping.defaultBranch },
+      config,
+      deps,
+    );
+    if (enablementError) return { status: 400, body: { error: enablementError } };
+  }
 
   upsertMapping(body.teamKey, mapping);
   registry.invalidate();
