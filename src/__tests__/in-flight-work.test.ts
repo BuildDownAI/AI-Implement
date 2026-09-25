@@ -54,6 +54,71 @@ function dispatchKgRefreshJob(issueId: string): number {
 }
 
 describe("getInFlightWork", () => {
+  function reserve(dispatchId: string, phase = "implementation"): void {
+    dedup.getDb().prepare(`INSERT INTO dispatch_admissions
+      (dispatch_id, mapping_key, issue_scope, issue_id, lifecycle_owner, phase, backend, created_at)
+      VALUES (?, 'AII', 'AII', ?, ?, ?, 'github-actions', ?)`).run(
+        dispatchId, dispatchId, `restate:${dispatchId}`, phase, Date.now(),
+      );
+  }
+
+  it("counts a held reservation even without a dispatch log row", () => {
+    reserve("unknown-launch");
+    expect(inFlight.getInFlightWork()).toEqual([{ kind: "runner-job", count: 1 }]);
+  });
+
+  it("does not double-count a live log and its held reservation", () => {
+    reserve("same-dispatch");
+    log.appendLog({ issueId: "issue-1", repo: "org/app", phase: "implementation", dispatchId: "same-dispatch" });
+    expect(inFlight.getInFlightWork()).toEqual([{ kind: "runner-job", count: 1 }]);
+  });
+
+  it("retains historical log work alongside an unrelated reservation", () => {
+    reserve("pilot-dispatch");
+    dispatchJob("legacy-issue");
+    expect(inFlight.getInFlightWork()).toEqual([{ kind: "runner-job", count: 2 }]);
+  });
+
+  it("keeps a reservation blocking after its log reaches terminal state", () => {
+    reserve("unknown-stop");
+    const jobId = log.appendLog({ issueId: "issue-1", repo: "org/app", phase: "implementation", dispatchId: "unknown-stop" });
+    log.updateJobStatus(jobId, "completed");
+    expect(inFlight.getInFlightWork()).toEqual([{ kind: "runner-job", count: 1 }]);
+  });
+
+  it("does not change kg-refresh occupancy when only its reservation remains", () => {
+    reserve("kg-reservation", "kg-refresh");
+    expect(inFlight.getInFlightWork()).toEqual([]);
+  });
+
+  it("does not count a released reservation after its log completes", () => {
+    reserve("finished");
+    dedup.getDb().prepare("UPDATE dispatch_admissions SET released_at = ? WHERE dispatch_id = ?").run(Date.now(), "finished");
+    expect(inFlight.getInFlightWork()).toEqual([]);
+  });
+
+  it("probes unresolved launch, stop, and owner state without a log row", async () => {
+    reserve("attempt-1");
+    const db = dedup.getDb();
+    db.prepare(`INSERT INTO review_fix_attempts
+      (attempt_id, dispatch_id, mapping_key, installation_id, repository, pr_number,
+       issue_scope, issue_id, owner, state, created_at, deadline_at,
+       task_snapshot_json, finding_versions_json)
+      VALUES ('attempt-1', 'attempt-1', 'AII', '1', 'org/app', 1,
+       'AII', 'issue-1', 'attempt-1', 'launch_intent', 1, 9999999999999, '{}', '[]')`).run();
+    const { createRestateDrainProbes } = await import("../deploy.js");
+    const probes = createRestateDrainProbes();
+    expect(await probes.unresolvedLaunches()).toBe(1);
+    expect(await probes.unresolvedTerminations()).toBe(0);
+    expect(await probes.activeOwners()).toBe(1);
+
+    db.prepare("UPDATE review_fix_attempts SET github_run_id = 10, github_run_attempt = 1, authority_revoked_at = 2 WHERE attempt_id = 'attempt-1'").run();
+    expect(await probes.unresolvedLaunches()).toBe(0);
+    expect(await probes.unresolvedTerminations()).toBe(1);
+    db.prepare("UPDATE review_fix_attempts SET completed_at = 3 WHERE attempt_id = 'attempt-1'").run();
+    expect(await probes.unresolvedTerminations()).toBe(0);
+    expect(await probes.activeOwners()).toBe(1);
+  });
   it("reports nothing on an idle orchestrator", () => {
     expect(inFlight.getInFlightWork()).toEqual([]);
   });

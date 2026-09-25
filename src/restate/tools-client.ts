@@ -7,6 +7,7 @@
 import type { AccessRole } from "../access-entries.js";
 import type { Caller } from "../mcp-identity.js";
 import { systemCaller } from "../mcp-identity.js";
+import { isDeployHeld } from "../deploy-hold.js";
 import { RESTATE_ADMIN_BASE_URL, RESTATE_INGRESS_BASE_URL } from "./server.js";
 
 const ORCHESTRATOR_TOOLS_SERVICE = "orchestratorTools";
@@ -109,6 +110,8 @@ export type CallToolResult =
 export interface CallToolDeps {
   ingressBaseUrl?: string;
   fetchImpl?: typeof fetch;
+  /** Shared deploy drain admission check; injectable for deterministic tests. */
+  permitsExternalCall?: () => boolean;
   /**
    * Restate's own idempotency key (https://docs.restate.dev/operate/invocation#invoke-a-handler-idempotently),
    * sent as the `idempotency-key` header. Restate scopes it by (service, handler, key), so a
@@ -138,6 +141,9 @@ export async function callTool(
   caller: Caller,
   deps: CallToolDeps = {},
 ): Promise<CallToolResult> {
+  // Both MCP and POST /api/tools/<name> enter through this seam. Refuse before
+  // contacting the old endpoint once deployment has closed external admission.
+  if (!(deps.permitsExternalCall ?? (() => !isDeployHeld()))()) return { status: "unavailable" };
   const ingressBaseUrl = deps.ingressBaseUrl ?? RESTATE_INGRESS_BASE_URL;
   const fetchImpl = deps.fetchImpl ?? fetch;
 

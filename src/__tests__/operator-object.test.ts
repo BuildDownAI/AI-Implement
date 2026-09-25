@@ -242,6 +242,34 @@ describe("refresh (real handler, via a fake ObjectContext) — stale-hash clearA
 });
 
 describe("RestateRefreshAuthority — unavailable against an unroutable ingress", () => {
+  it("does not invoke the old endpoint after drain admission closes", async () => {
+    const fetchImpl = vi.fn() as unknown as typeof fetch;
+    const authority = new RestateRefreshAuthority({
+      ingressBaseUrl: UNROUTABLE_INGRESS,
+      fetchImpl,
+      accessTokenTtlMs: 3600_000,
+      permitsExternalCall: () => false,
+    });
+    expect(await authority.describe("c1")).toEqual({ status: "unavailable" });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("uses the deploy hold as the default admission barrier", async () => {
+    const { setDeployHold, clearDeployHold } = await import("../deploy-hold.js");
+    const { initSettingsTable } = await import("../runner-mode.js");
+    initSettingsTable();
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ expiresAt: null }), { status: 200 }));
+    const authority = new RestateRefreshAuthority({ ingressBaseUrl: UNROUTABLE_INGRESS, fetchImpl, accessTokenTtlMs: 3600_000 });
+    setDeployHold();
+    try {
+      expect(await authority.describe("c1")).toEqual({ status: "unavailable" });
+      expect(fetchImpl).not.toHaveBeenCalled();
+    } finally {
+      clearDeployHold();
+    }
+    expect(await authority.describe("c1")).toEqual({ status: "ok", expiresAt: null });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
   it("rotate() resolves to unavailable (cause restate) rather than throwing", async () => {
     const authority = new RestateRefreshAuthority({ ingressBaseUrl: UNROUTABLE_INGRESS, accessTokenTtlMs: 3600_000 });
     await expect(authority.rotate({ refreshToken: "sometoken", clientId: "client-1" })).resolves.toEqual({
