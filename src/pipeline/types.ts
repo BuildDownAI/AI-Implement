@@ -109,11 +109,25 @@ export interface PipelineContextData {
   kgAcceptNewBaseline?: boolean;
   /** kg-refresh: email of the admin who set kgAcceptNewBaseline, for the guard-override log line and the refresh PR's ### Baseline section. */
   kgBaselineActor?: string;
+  /**
+   * Optional runner-activity/cycle sink (AII-788). Mirrors `PipelineContext.activitySink`
+   * so a context constructed from a plain `PipelineContextData` bag (e.g. the dev harness,
+   * or a future concrete `PipelineContext` implementation) can carry the same optional
+   * sink through the data bag rather than only the interface. Absent on every existing
+   * call site — nothing constructs or calls one yet.
+   */
+  activitySink?: ActivitySink;
 }
 
 export interface PipelineContext {
   readonly data: PipelineContextData;
   readonly llmExecutor: LLMExecutor;
+  /**
+   * Optional runner-activity/cycle sink (AII-788). Absent on every existing
+   * `PipelineContext` implementation and call site — nothing constructs or
+   * calls one yet; a later issue wires a concrete sink here.
+   */
+  readonly activitySink?: ActivitySink;
   getOutputs(stepId: string): Record<string, unknown>;
   setOutputs(stepId: string, outputs: Record<string, unknown>): void;
   resolveInputs(
@@ -124,8 +138,115 @@ export interface PipelineContext {
   ): Record<string, unknown>;
 }
 
+// ---------------------------------------------------------------------------
+// Activity/cycle sink (AII-788)
+// ---------------------------------------------------------------------------
+//
+// Pure protocol shapes for reporting runner activity and per-cycle summaries
+// out of the pipeline — no Restate or Claude Code SDK dependency, no
+// transport, no buffering/redaction/retry behavior. Those belong to a
+// concrete implementation (e.g. `ActivityReporter`, ./activity-reporter.ts,
+// AII-784) that a later issue wires into the executor/steps below. Every
+// method exists so a producer never has to invent its own wire shape.
+// Optional everywhere it attaches, so every existing implementation of
+// `PipelineContext`/`InvokeParams` and every existing call site stays source
+// compatible with no edits. Nothing in this codebase constructs or calls an
+// `ActivitySink` yet.
+
+/**
+ * Identifies one activity record within an attempt's ordered stream.
+ * `sequence` must be contiguous per (attemptId, producerId) — a gap is how a
+ * downstream consumer detects a missing tail, matching the wire identity
+ * already used by the AII-784 activity transport (`ReviewFixActivityEvent`,
+ * ../review-fix-contract.ts).
+ */
+export interface ActivityIdentity {
+  readonly attemptId: string;
+  readonly producerId: string;
+  readonly sequence: number;
+}
+
+/** Per-event redacted-payload byte cap. */
+export const ACTIVITY_MAX_EVENT_BYTES = 16 * 1024;
+
+/** Cumulative redacted-byte cap per attempt. */
+export const ACTIVITY_MAX_ATTEMPT_BYTES = 10 * 1024 * 1024;
+
+/**
+ * Already-redacted text bounded to `ACTIVITY_MAX_EVENT_BYTES`. `truncated` is
+ * explicit so a consumer never has to infer truncation from length.
+ */
+export interface BoundedActivityText {
+  readonly text: string;
+  readonly truncated: boolean;
+}
+
+/** An observable tool call starting. Never the model's hidden reasoning or tokens. */
+export interface ActivityToolStart {
+  readonly cycle: number;
+  readonly action: string;
+  /** Observable, structured arguments only — must not carry hidden reasoning. */
+  readonly detail?: unknown;
+}
+
+/** An observable tool call's outcome. `output` is already bounded per `ACTIVITY_MAX_EVENT_BYTES`. */
+export interface ActivityToolResult {
+  readonly cycle: number;
+  readonly action: string;
+  readonly output: BoundedActivityText;
+}
+
+/**
+ * End-of-cycle summary. Deliberately independent of the activity byte limit:
+ * none of these fields is redacted/bounded text, so a cycle summary always
+ * carries its full commit list, disposition set, test results, verdict and
+ * usage rather than competing with tool activity for the
+ * `ACTIVITY_MAX_EVENT_BYTES`/`ACTIVITY_MAX_ATTEMPT_BYTES` caps.
+ */
+export interface CycleActivitySummary {
+  readonly cycle: number;
+  readonly commits: readonly string[];
+  readonly dispositions: readonly { readonly key: string; readonly disposition: string }[];
+  readonly tests: readonly { readonly name: string; readonly passed: boolean }[] | null;
+  readonly verdict: { readonly approved: boolean; readonly summary?: string } | null;
+  readonly usage: {
+    readonly tokensIn: number | null;
+    readonly tokensOut: number | null;
+    readonly costUsd: number | null;
+  };
+}
+
+/**
+ * Optional producer-side sink for runner activity and per-cycle telemetry.
+ *
+ * Behavior a concrete implementation must honor (enforced by the
+ * transport/storage layer, not by this type — nothing here does I/O):
+ *  - The same identity with an identical payload is idempotent — replaying it
+ *    is a safe no-op.
+ *  - The same identity with a *different* payload is rejected and must raise
+ *    an alert, never silently overwrite the stored event.
+ *  - `sequence` is contiguous per (attemptId, producerId); a gap is the
+ *    signal a missing tail is visible downstream.
+ *  - `final()` marks the highest sequence issued for the identity's
+ *    (attemptId, producerId) pair; an attempt with no final marker is
+ *    presumed still in-flight.
+ */
+export interface ActivitySink {
+  toolStart(identity: ActivityIdentity, input: ActivityToolStart): void;
+  toolResult(identity: ActivityIdentity, result: ActivityToolResult): void;
+  cycleSummary(identity: ActivityIdentity, summary: CycleActivitySummary): void;
+  final(identity: ActivityIdentity, lastSequence: number): void;
+}
+
 export interface StepReporter {
-  report(step: Step): Promise<void>;
+  /**
+   * Optional second param carries the runner-activity/cycle sink (AII-788)
+   * alongside the step report. Optional so `NoopStepReporter`, `HttpStepReporter`,
+   * `TokenStepReporter`, `TimingStepReporter` and every existing call site
+   * (`reporter.report(step)`) stay source compatible with zero edits. No
+   * implementation reads it yet.
+   */
+  report(step: Step, activitySink?: ActivitySink): Promise<void>;
 }
 
 export interface StepModule<
@@ -209,6 +330,13 @@ export interface InvokeParams {
      */
     toolUseIsSafe: boolean;
   };
+  /**
+   * Optional runner-activity sink this invocation may report tool
+   * start/result and cycle-summary events to (AII-788). Absent means no
+   * activity reporting — identical behavior to before this field existed.
+   * No built-in `LLMExecutor` reads it yet.
+   */
+  activitySink?: ActivitySink;
 }
 
 export interface LLMExecutor {
