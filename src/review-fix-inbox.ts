@@ -61,6 +61,10 @@ export interface ReviewFixDelivery {
   readonly retryAt: number | null;
   readonly deliveredAt: number | null;
   readonly tombstonedAt: number | null;
+  /** Set when this identity was later reused with different content; the reuse is
+   *  rejected as a conflict and never overwrites the originally accepted fields above. */
+  readonly conflictAt: number | null;
+  readonly conflictCount: number;
 }
 
 interface ReviewFixInboxRow {
@@ -77,12 +81,14 @@ interface ReviewFixInboxRow {
   retry_at: number | null;
   delivered_at: number | null;
   tombstoned_at: number | null;
+  conflict_at: number | null;
+  conflict_count: number;
 }
 
 const SELECT_ONE = `
   SELECT authenticated_source, event_id, installation_id, repository, pr_number,
          kind, payload_json, payload_hash, accepted_at, delivery_state, retry_at,
-         delivered_at, tombstoned_at
+         delivered_at, tombstoned_at, conflict_at, conflict_count
   FROM review_fix_inbox
   WHERE authenticated_source = ? AND event_id = ?
 `;
@@ -104,6 +110,8 @@ function mapRow(row: ReviewFixInboxRow): ReviewFixDelivery {
     retryAt: row.retry_at,
     deliveredAt: row.delivered_at,
     tombstonedAt: row.tombstoned_at,
+    conflictAt: row.conflict_at,
+    conflictCount: row.conflict_count,
   };
 }
 
@@ -135,7 +143,7 @@ export interface AcceptDeliveryInput {
 
 export type AcceptDeliveryOutcome =
   | { readonly status: "accepted"; readonly delivery: ReviewFixDelivery }
-  | { readonly status: "conflict"; readonly reason: string }
+  | { readonly status: "conflict"; readonly reason: string; readonly delivery: ReviewFixDelivery }
   | { readonly status: "rejected"; readonly reason: string };
 
 /**
@@ -143,8 +151,11 @@ export type AcceptDeliveryOutcome =
  * (same kind, destination, and payload) returns the originally stored record —
  * including after a process restart, since the check-and-insert runs inside one
  * transaction against the durable table. Reuse of the same identity with a
- * different kind, destination, or payload is a conflict, and the stored row is
- * left untouched.
+ * different kind, destination, or payload is a conflict: the originally accepted
+ * kind, destination, payload, hash, and delivery state are left untouched, and the
+ * conflict is instead recorded on `conflictAt` / `conflictCount` so a later process
+ * can tell the identity was reused, rather than being silently indistinguishable
+ * from a plain replay.
  */
 export function acceptDelivery(input: AcceptDeliveryInput): AcceptDeliveryOutcome {
   const source = validateIdentity(input.authenticatedSource, "authenticatedSource");
@@ -166,9 +177,17 @@ export function acceptDelivery(input: AcceptDeliveryInput): AcceptDeliveryOutcom
       if (existing.payload_hash === hash) {
         return { status: "accepted", delivery: mapRow(existing) };
       }
+
+      db.prepare(`
+        UPDATE review_fix_inbox SET conflict_at = ?, conflict_count = conflict_count + 1
+        WHERE authenticated_source = ? AND event_id = ?
+      `).run(Date.now(), source.value, deliveryId.value);
+
+      const conflicted = db.prepare(SELECT_ONE).get(source.value, deliveryId.value) as ReviewFixInboxRow;
       return {
         status: "conflict",
         reason: `delivery ${source.value}/${deliveryId.value} was already accepted with different content`,
+        delivery: mapRow(conflicted),
       };
     }
 
@@ -221,7 +240,7 @@ export function claimDeliveries(options: ClaimDeliveriesOptions = {}): ReviewFix
     const rows = db.prepare(`
       SELECT authenticated_source, event_id, installation_id, repository, pr_number,
              kind, payload_json, payload_hash, accepted_at, delivery_state, retry_at,
-             delivered_at, tombstoned_at
+             delivered_at, tombstoned_at, conflict_at, conflict_count
       FROM review_fix_inbox
       WHERE delivery_state != 'delivered'
         AND (retry_at IS NULL OR retry_at < ?)

@@ -46,13 +46,21 @@ function ensureAdminSessionColumns(): void {
 
 /** AII-781: tombstones are tracked independently of payload retention — a delivery
  *  can be tombstoned without its payload_json being purged, and a later payload-purge
- *  path (if one is ever added) must not clear this column. */
+ *  path (if one is ever added) must not clear this column. `conflict_at` /
+ *  `conflict_count` mark that an identity was reused with different content
+ *  (rejected, not overwritten) without disturbing the originally accepted row. */
 function ensureReviewFixInboxColumns(): void {
   if (!db) return;
   const info = db.prepare("PRAGMA table_info(review_fix_inbox)").all() as Array<{ name: string }>;
   const names = new Set(info.map((c) => c.name));
   if (!names.has("tombstoned_at")) {
     db.exec("ALTER TABLE review_fix_inbox ADD COLUMN tombstoned_at INTEGER");
+  }
+  if (!names.has("conflict_at")) {
+    db.exec("ALTER TABLE review_fix_inbox ADD COLUMN conflict_at INTEGER");
+  }
+  if (!names.has("conflict_count")) {
+    db.exec("ALTER TABLE review_fix_inbox ADD COLUMN conflict_count INTEGER NOT NULL DEFAULT 0");
   }
 }
 

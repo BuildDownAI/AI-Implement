@@ -80,6 +80,7 @@ describe("acceptDelivery", () => {
       payload: { text: "original" },
     });
     expect(first.status).toBe("accepted");
+    const originalHash = first.status === "accepted" ? first.delivery.payloadHash : null;
 
     const conflict = inbox.acceptDelivery({
       authenticatedSource: "github",
@@ -89,11 +90,76 @@ describe("acceptDelivery", () => {
       payload: { text: "different content" },
     });
     expect(conflict.status).toBe("conflict");
+    if (conflict.status === "conflict") {
+      expect(conflict.delivery.payload).toEqual({ text: "original" });
+      expect(conflict.delivery.conflictCount).toBe(1);
+      expect(conflict.delivery.conflictAt).not.toBeNull();
+    }
 
     const stored = inbox.getDelivery("github", "evt-2");
     expect(stored?.payload).toEqual({ text: "original" });
+    expect(stored?.kind).toBe("feedback");
+    expect(stored?.destination).toEqual(destination);
+    expect(stored?.payloadHash).toEqual(originalHash);
+    expect(stored?.deliveryState).toBe("pending");
     const count = dedup.getDb().prepare("SELECT COUNT(*) AS n FROM review_fix_inbox").get() as { n: number };
     expect(count.n).toBe(1);
+  });
+
+  it("records a conflict marker that survives closing and reopening the database, and increments on repeated conflicting reuse", async () => {
+    const destination = makeDestination();
+    inbox.acceptDelivery({
+      authenticatedSource: "github",
+      deliveryId: "evt-conflict-durable",
+      kind: "feedback",
+      destination,
+      payload: { text: "original" },
+    });
+
+    inbox.acceptDelivery({
+      authenticatedSource: "github",
+      deliveryId: "evt-conflict-durable",
+      kind: "feedback",
+      destination,
+      payload: { text: "different content" },
+    });
+
+    dedup.closeDb();
+    vi.resetModules();
+    dedup = await import("../dedup.js");
+    inbox = await import("../review-fix-inbox.js");
+
+    const afterReopen = inbox.getDelivery("github", "evt-conflict-durable");
+    expect(afterReopen?.conflictCount).toBe(1);
+    expect(afterReopen?.conflictAt).not.toBeNull();
+    expect(afterReopen?.payload).toEqual({ text: "original" });
+
+    // A second, distinct conflicting reuse increments the counter rather than
+    // resetting it, and a matching replay of the originally accepted content
+    // must not touch the marker at all.
+    const secondConflict = inbox.acceptDelivery({
+      authenticatedSource: "github",
+      deliveryId: "evt-conflict-durable",
+      kind: "feedback",
+      destination,
+      payload: { text: "yet another content" },
+    });
+    expect(secondConflict.status).toBe("conflict");
+    if (secondConflict.status === "conflict") {
+      expect(secondConflict.delivery.conflictCount).toBe(2);
+    }
+
+    const replay = inbox.acceptDelivery({
+      authenticatedSource: "github",
+      deliveryId: "evt-conflict-durable",
+      kind: "feedback",
+      destination,
+      payload: { text: "original" },
+    });
+    expect(replay.status).toBe("accepted");
+    if (replay.status === "accepted") {
+      expect(replay.delivery.conflictCount).toBe(2);
+    }
   });
 
   it("cannot report accepted when the underlying write fails, and leaves no partial row", () => {
