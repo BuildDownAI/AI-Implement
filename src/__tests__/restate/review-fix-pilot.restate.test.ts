@@ -11,13 +11,14 @@
 //
 // This suite was authored without a local Docker daemon (no `docker info`), the same
 // constraint `endpoint.restate.test.ts` (AII-727) documents — see that file's header and
-// docs/restate-testing.md's "Container-to-host reachability" section. It has not been run
-// against a live container; `npm run test:restate` in CI is the first real execution.
+// docs/restate-testing.md's "Container-to-host reachability" section. CI subsequently ran
+// it against pinned Restate 1.7.10; that is container evidence, not live-pilot evidence.
 import { randomUUID, createHash } from "node:crypto";
 import type { RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { getDb } from "../../dedup.js";
 import { initMappingsTable } from "../../config.js";
+import { initDispatchBreakerTable } from "../../dispatch-breaker.js";
 import {
   type AttemptId,
   type ReviewFixResultMetadataV1,
@@ -46,6 +47,10 @@ import {
   type ReviewFixWorkerTransport,
 } from "../../review-fix-worker.js";
 import { acceptDelivery } from "../../review-fix-inbox.js";
+import { appendReviewFixActivityBatch, getReviewFixActivityGaps, getReviewFixCycleSummary, listReviewFixActivity, recordReviewFixCycleSummary } from "../../review-fix-evidence.js";
+import { handleRunnerActivity, handleRunnerResult, type RunnerActivityBody } from "../../runner-callback.js";
+import { mintPreparedReviewFixToken } from "../../runner-tokens.js";
+import type { ReviewFixActivityEvent } from "../../review-fix-contract.js";
 import { acquire as acquireDispatchAdmission, release as releaseDispatchAdmission } from "../../dispatch-admission.js";
 import { createRestateReviewFixFacade, ReviewFixDeliveryPump } from "../../restate/review-fix-client.js";
 import { createReviewFixAttempt, type ReviewFixAttemptCompletion } from "../../restate/review-fix-attempt.js";
@@ -287,8 +292,14 @@ const transport: ReviewFixWorkerTransport = {
   async dispatch(input) {
     const attemptId = input.inputs.run_attempt_token;
     if (!attemptId) throw new Error("test bug: dispatch without run_attempt_token");
-    const fixture = fixtureByAttempt.get(attemptId);
+    // Restate can launch the attempt as soon as SQLite admission commits, before
+    // the test's polling helper observes the row and records fixtureByAttempt.
+    const prepared = await sqliteStore.getPreparedAttempt(attemptId);
+    const fixture = fixtureByAttempt.get(attemptId)
+      ?? (prepared ? findFixture(prepared.scope.repository) : undefined);
     if (!fixture) throw new Error(`test bug: no fixture registered for attempt ${attemptId}`);
+    fixture.attemptId = attemptId;
+    fixtureByAttempt.set(attemptId, fixture);
     return fixture.dispatchImpl(input);
   },
   async listRuns(input) {
@@ -432,6 +443,7 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
   beforeAll(async () => {
     getDb();
     initMappingsTable();
+    initDispatchBreakerTable();
     environments = await startVariants([pr, attemptWorkflow]);
   }, 60_000);
   afterAll(async () => { if (environments) await stopAll(environments); });
@@ -661,8 +673,8 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
   // Crash window #1 (inbox commit before ACK), via the real durable inbox and
   // the real ReviewFixDeliveryPump/facade — the production callback ingress.
   // -------------------------------------------------------------------------
-  it("inbox commit before ACK: a feedback delivery whose HTTP acknowledgement is lost still becomes exactly one admitted attempt", async () => {
-    const env = envFor("alwaysReplay");
+  it.each(VARIANTS.map(([label]) => label))("inbox commit before ACK: a feedback delivery whose HTTP acknowledgement is lost still becomes exactly one admitted attempt (%s)", async (label) => {
+    const env = envFor(label);
     const fixture = freshScenario("inbox-crash");
     fixture.pending = { taskText: "Fix 1 finding version", findings: [{ findingKey: "f1", version: 1 }] };
     const deliveryId = feedbackDeliveryId(fixture.scope, 1);
@@ -675,10 +687,16 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     // feedback() handler really runs — then the local process "crashes" before
     // observing the 2xx, so the pump reschedules the row as if it were unavailable.
     const crashyFetch = crashAfterFirstCall(fetch);
-    const pump = pumpFor(env.baseUrl(), crashyFetch);
+    let now = Date.now();
+    const pump = new ReviewFixDeliveryPump({
+      facade: createRestateReviewFixFacade({ ingressBaseUrl: env.baseUrl(), fetchImpl: crashyFetch }),
+      intervalMs: 60_000,
+      now: () => now,
+    });
     await pump.tick();
     expect(getDb().prepare(`SELECT delivery_state FROM review_fix_inbox WHERE event_id = ?`)
       .get(deliveryId)).toMatchObject({ delivery_state: "pending" });
+    now += 5_001; // advance past the pump's durable unavailable-delivery retry delay
     await pump.tick();
     expect(getDb().prepare(`SELECT delivery_state FROM review_fix_inbox WHERE event_id = ?`)
       .get(deliveryId)).toMatchObject({ delivery_state: "delivered" });
@@ -748,10 +766,24 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     const attemptId = latestAttemptRow(fixture.scope)!.attemptId;
     fixture.attemptId = attemptId;
     fixtureByAttempt.set(attemptId, fixture);
-    // Same reasoning as the uncertain-launch scenario above: the coordinator already
-    // dispatched "run"; attach to that invocation rather than starting a second one.
-    const done = await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", attemptId);
-    expect(done).toEqual({ status: "launch_rejected" });
+    // Rejection can finish before this test observes the committed admission;
+    // Restate no longer has an attachable invocation then. The recorded terminal
+    // result and released reservation are the durable effects that matter here.
+    await until(() => {
+      const row = getDb().prepare(`SELECT terminal_outcome_json FROM review_fix_attempts WHERE attempt_id = ?`)
+        .get(attemptId) as { terminal_outcome_json: string | null };
+      return row.terminal_outcome_json !== null;
+    }, 8_000);
+    const terminal = getDb().prepare(`SELECT terminal_outcome_json FROM review_fix_attempts WHERE attempt_id = ?`)
+      .get(attemptId) as { terminal_outcome_json: string };
+    expect(JSON.parse(terminal.terminal_outcome_json)).toMatchObject({
+      terminal: { status: "failed", reason: "workflow file not found" },
+    });
+    await until(() => {
+      const row = getDb().prepare(`SELECT released_at FROM dispatch_admissions WHERE dispatch_id = ?`)
+        .get(attemptId) as { released_at: number | null };
+      return row.released_at !== null;
+    }, 8_000);
     const released = getDb().prepare(`SELECT released_at FROM dispatch_admissions WHERE dispatch_id = ?`).get(attemptId) as { released_at: number | null };
     expect(released.released_at).not.toBeNull();
     expect(budgetEntryCount(fixture.scope.repository, fixture.scope.prNumber)).toBe(1);
@@ -775,6 +807,51 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     expect(second).toEqual({ status: "duplicate", attemptId: fixture.attemptId });
     expect((await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!)).status).toBe("finalized");
     expect(fixture.commentPosts).toBe(1);
+  }, 25_000);
+
+  it("authenticated result ingress commits one inbox delivery, classifies retries/conflicts, and withholds approval", async () => {
+    const env = envFor("alwaysReplay");
+    const fixture = freshScenario("result-ingress");
+    await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
+    await until(() => fixture.runId !== null, 8_000);
+    const attemptId = fixture.attemptId!;
+    const prepared = (await sqliteStore.getPreparedAttempt(attemptId))!;
+    const result = resultOf(fixture, prepared);
+    const secret = "result-ingress-secret";
+    const token = mintPreparedReviewFixToken({ attemptId, audience: "result", secret }).token;
+    let legacyProviderLookups = 0;
+    const intake = (candidate: ReviewFixResultMetadataV1) => handleRunnerResult({
+      authorization: `Bearer ${token}`, secret,
+      body: { phase: "gap-analysis", outcome: "success", comments: [], reviewFix: candidate },
+      resolveProvider: async () => { legacyProviderLookups++; return null; },
+      onReviewFixResult: (validated) => sqliteStore.recordResult(validated.attemptId, validated, () => {
+        const delivery = acceptDelivery({
+          authenticatedSource: "runner-callback", deliveryId: `${validated.attemptId}.result`,
+          kind: "result", destination: fixture.scope, payload: validated,
+        });
+        if (delivery.status !== "accepted") throw new Error(`result delivery was ${delivery.status}`);
+      }),
+    });
+
+    expect(await intake(result)).toMatchObject({ status: 200, body: { outcome: "stored" } });
+    expect(await intake(result)).toMatchObject({ status: 200, body: { outcome: "duplicate" } });
+    expect(await intake(resultOf(fixture, prepared, { outputCommit: sha("callback-conflict") })))
+      .toMatchObject({ status: 409, body: { outcome: "conflict" } });
+    expect(legacyProviderLookups).toBe(0);
+    const inbox = getDb().prepare(`SELECT COUNT(*) AS n FROM review_fix_inbox
+      WHERE authenticated_source = 'runner-callback' AND event_id = ?`)
+      .get(`${attemptId}.result`) as { n: number };
+    expect(inbox.n).toBe(1);
+    const conflict = getDb().prepare(`SELECT result_conflict_at FROM review_fix_attempts WHERE attempt_id = ?`)
+      .get(attemptId) as { result_conflict_at: number | null };
+    expect(conflict.result_conflict_at).not.toBeNull();
+
+    fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: fixture.runAttempt };
+    await pumpFor(env.baseUrl()).tick();
+    const done = await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", attemptId);
+    expect(done).toMatchObject({ status: "finalized", approval: "withheld" });
+    expect(fixture.commentPosts).toBe(0);
+    expect(fixture.dispatchCalls).toBe(1);
   }, 25_000);
 
   it.each(VARIANTS.map(([label]) => label))("a conflicting result before the final outcome persists conflict and blocks approval (%s)", async (label) => {
@@ -937,6 +1014,121 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     admission = getDb().prepare(`SELECT released_at FROM dispatch_admissions WHERE dispatch_id = ?`).get(fixture.attemptId!) as { released_at: number | null };
     expect(admission.released_at).not.toBeNull();
   }, 25_000);
+
+  it("authenticated activity intake preserves gaps, enforces both byte caps, and leaves cycle evidence independent", async () => {
+    const env = envFor("alwaysReplay");
+    const secret = "activity-fault-matrix-secret";
+    const producerId = "runner-tools";
+    const overhead = Buffer.byteLength(JSON.stringify({ payload: "", truncated: false }), "utf8");
+    const remaining = 16 * 1024 - overhead;
+    const maxPayload = "€".repeat(Math.floor(remaining / 3)) + "a".repeat(remaining % 3);
+    const event = (attemptId: string, sequence: number, payload: string): ReviewFixActivityEvent => ({
+      version: 1, attemptId, producerId, sequence, cycle: 1, kind: "tool_result",
+      timestamp: Date.now(), payload, truncated: false,
+    });
+    const post = async (attemptId: string, events: ReviewFixActivityEvent[], finalSequence?: number) => {
+      const token = mintPreparedReviewFixToken({ attemptId, audience: "progress", secret }).token;
+      const response = await handleRunnerActivity({
+        authorization: `Bearer ${token}`, secret,
+        body: { version: 1, attemptId, producerId, events, finalSequence },
+        onReviewFixActivity: (batch: RunnerActivityBody) => {
+          const stored = appendReviewFixActivityBatch(batch);
+          if (stored.rejectedInvalid.length > 0) throw new Error("validated activity was rejected by SQLite");
+          return { status: "accepted", attemptId: batch.attemptId };
+        },
+      });
+      expect(response.status).toBe(200);
+    };
+
+    const gapFixture = freshScenario("activity-gaps");
+    await admitOne(env, gapFixture, [{ findingKey: "f1", version: 1 }]);
+    const gapAttemptId = gapFixture.attemptId!;
+    await post(gapAttemptId, [event(gapAttemptId, 0, "first"), event(gapAttemptId, 2, maxPayload + "a")], 4);
+    expect(getReviewFixActivityGaps(gapAttemptId, producerId)).toMatchObject({
+      ranges: [{ from: 1, to: 1 }, { from: 3, to: 4 }], finalSequence: 4, tailComplete: false,
+    });
+    const truncated = listReviewFixActivity(gapAttemptId, { pageSize: 10 }).events.find((row) => row.sequence === 2);
+    expect(truncated).toMatchObject({ truncated: true, payload: null });
+    await post(gapAttemptId, [1, 3, 4].map((sequence) => event(gapAttemptId, sequence, `event-${sequence}`)));
+    expect(getReviewFixActivityGaps(gapAttemptId, producerId)).toMatchObject({
+      ranges: [], finalSequence: 4, tailComplete: true,
+    });
+
+    const capFixture = freshScenario("activity-cap");
+    await admitOne(env, capFixture, [{ findingKey: "f1", version: 1 }]);
+    const capAttemptId = capFixture.attemptId!;
+    for (let start = 0; start < 640; start += 64) {
+      await post(capAttemptId, Array.from({ length: 64 }, (_, i) => event(capAttemptId, start + i, maxPayload)));
+    }
+    const beforeLimit = getDb().prepare(`SELECT accepted_bytes, limit_reached_at FROM review_fix_activity_streams WHERE attempt_id = ?`)
+      .get(capAttemptId) as { accepted_bytes: number; limit_reached_at: number | null };
+    expect(beforeLimit).toMatchObject({ accepted_bytes: 10 * 1024 * 1024, limit_reached_at: null });
+    await post(capAttemptId, [event(capAttemptId, 640, "over the attempt cap")]);
+    const afterLimit = getDb().prepare(`SELECT accepted_bytes, limit_reached_at FROM review_fix_activity_streams WHERE attempt_id = ?`)
+      .get(capAttemptId) as { accepted_bytes: number; limit_reached_at: number | null };
+    expect(afterLimit.accepted_bytes).toBe(10 * 1024 * 1024);
+    expect(afterLimit.limit_reached_at).not.toBeNull();
+    const storedCount = getDb().prepare(`SELECT COUNT(*) AS n FROM review_fix_activity WHERE attempt_id = ?`)
+      .get(capAttemptId) as { n: number };
+    expect(storedCount.n).toBe(640);
+    const summary = recordReviewFixCycleSummary({
+      attemptId: capAttemptId, cycle: 1, inputCommit: capFixture.headSha, outputCommit: capFixture.headSha,
+      dispositions: [], tests: { passed: 1 }, verdict: "passed", usage: { tokens: 10 }, completedAt: Date.now(),
+    });
+    expect(summary.status).toBe("recorded");
+    expect(getReviewFixCycleSummary(capAttemptId, 1)).toMatchObject({ verdict: "passed" });
+  }, 40_000);
+
+  it("a lost cancellation acknowledgement and endpoint restart retain occupancy until the exact run stops", async () => {
+    const fixture = freshScenario("cancel-lost-ack");
+    const acceptedCancel = fixture.cancelImpl;
+    fixture.cancelImpl = crashAfterFirstCall(
+      (input: Parameters<ReviewFixWorkerTransport["cancelRun"]>[0]) => acceptedCancel(input),
+    );
+    const env = await startRetryEnabled([pr, attemptWorkflow]);
+    let replacement: Awaited<ReturnType<typeof replaceEndpoint>> | undefined;
+    try {
+      await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
+      await until(() => fixture.runId !== null, 8_000);
+      const attemptId = fixture.attemptId!;
+      await callWorkflow(env.baseUrl(), "ReviewFixAttempt", attemptId, "cancel", { attemptId });
+      await until(() => fixture.cancelCalls > 0, 5_000);
+
+      const state = getDb().prepare(`SELECT authority_revoked_at, terminal_outcome_json
+        FROM review_fix_attempts WHERE attempt_id = ?`).get(attemptId) as
+        { authority_revoked_at: number | null; terminal_outcome_json: string | null };
+      expect(state.authority_revoked_at).not.toBeNull();
+      expect(state.terminal_outcome_json).toBeNull();
+      let admission = getDb().prepare(`SELECT released_at FROM dispatch_admissions WHERE dispatch_id = ?`)
+        .get(attemptId) as { released_at: number | null };
+      expect(admission.released_at).toBeNull();
+      expect(fixture.commentPosts).toBe(0);
+
+      replacement = await replaceEndpoint(env, [pr, attemptWorkflow]);
+      await env.startedRestateContainer.restart();
+      await until(() => fixture.cancelCalls > 1, 10_000);
+      admission = getDb().prepare(`SELECT released_at FROM dispatch_admissions WHERE dispatch_id = ?`)
+        .get(attemptId) as { released_at: number | null };
+      expect(admission.released_at).toBeNull();
+      expect(fixture.dispatchCalls).toBe(1);
+
+      fixture.runDetail = { status: "completed", conclusion: "cancelled", runAttempt: fixture.runAttempt };
+      const done = await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", attemptId);
+      expect(done).toMatchObject({ status: "finalized", approval: "not_applicable" });
+      admission = getDb().prepare(`SELECT released_at FROM dispatch_admissions WHERE dispatch_id = ?`)
+        .get(attemptId) as { released_at: number | null };
+      expect(admission.released_at).not.toBeNull();
+      expect(fixture.dispatchCalls).toBe(1);
+      expect(fixture.commentPosts).toBe(0);
+      const attempts = getDb().prepare(`SELECT COUNT(*) AS n FROM review_fix_attempts
+        WHERE repository = ? AND pr_number = ?`)
+        .get(fixture.scope.repository, fixture.scope.prNumber) as { n: number };
+      expect(attempts.n).toBe(1);
+    } finally {
+      replacement?.close();
+      await env.stop();
+    }
+  }, 60_000);
 
   it.each(VARIANTS.map(([label]) => label))("a closed PR blocks further automatic admission once it is unoccupied, specifically because load() reports it closed (%s)", async (label) => {
     const env = envFor(label);
