@@ -653,27 +653,25 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
             suppressStaleNotifications(prLog.issueId, jobId);
             console.warn(`[comment-gapfill] Unknown GitHub launch outcome for PR #${item.prNumber}; retained dispatch ${dispatchId} for reconciliation`);
           }
-          try {
-            await opts.onDispatchFailure(
-              result,
-              opts.notifyType,
-              opts.notifyWebhookUrl,
-              {
-                site: "comment-gapfill",
-                issueId: prLog.issueId,
-                issueIdentifier: prLog.issueIdentifier ?? undefined,
-                issueTitle: prLog.issueTitle ?? undefined,
-                teamKey: scopeKey,
-                repo: fullRepo,
-                workflowFile: mapping.workflowFile,
-                contract,
-                phase: "gap-analysis",
-              },
-            );
-          } catch (err) {
-            console.error(`[comment-gapfill] Failed to report dispatch outcome for PR #${item.prNumber}:`, err);
-          } finally {
-            if (result.outcome === "rejected") {
+          if (result.outcome === "rejected") {
+            try {
+              await opts.onDispatchFailure(
+                result, opts.notifyType, opts.notifyWebhookUrl,
+                {
+                  site: "comment-gapfill",
+                  issueId: prLog.issueId,
+                  issueIdentifier: prLog.issueIdentifier ?? undefined,
+                  issueTitle: prLog.issueTitle ?? undefined,
+                  teamKey: scopeKey,
+                  repo: fullRepo,
+                  workflowFile: mapping.workflowFile,
+                  contract,
+                  phase: "gap-analysis",
+                },
+              );
+            } catch (err) {
+              console.error(`[comment-gapfill] Failed to report rejected dispatch for PR #${item.prNumber}:`, err);
+            } finally {
               releaseAdmission(admission.record.dispatchId, admission.record.lifecycleOwner, admission.record.generation, "launch_rejected");
             }
           }

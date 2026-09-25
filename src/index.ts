@@ -3987,27 +3987,25 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
           suppressStaleNotifications(fix.issueId, jobId);
           console.warn(`[review-fix] Unknown GitHub launch outcome for PR #${fix.prNumber}; retained dispatch ${dispatchId} for reconciliation`);
         }
-        try {
-          await surfaceDispatchFailure(
-            result,
-            config.notifyType,
-            config.notifyWebhookUrl,
-            {
-              site: "review-fix",
-              issueId: fix.issueId,
-              issueIdentifier: fix.issueIdentifier ?? undefined,
-              issueTitle: `Review feedback fix for PR #${fix.prNumber}`,
-              teamKey: scopeKey,
-              repo: fix.repo,
-              workflowFile: mapping.workflowFile,
-              contract: reviewFixContract,
-              phase: "gap-analysis",
-            },
-          );
-        } catch (err) {
-          console.error(`[review-fix] Failed to report dispatch outcome for PR #${fix.prNumber}:`, err);
-        } finally {
-          if (result.outcome === "rejected") {
+        if (result.outcome === "rejected") {
+          try {
+            await surfaceDispatchFailure(
+              result, config.notifyType, config.notifyWebhookUrl,
+              {
+                site: "review-fix",
+                issueId: fix.issueId,
+                issueIdentifier: fix.issueIdentifier ?? undefined,
+                issueTitle: `Review feedback fix for PR #${fix.prNumber}`,
+                teamKey: scopeKey,
+                repo: fix.repo,
+                workflowFile: mapping.workflowFile,
+                contract: reviewFixContract,
+                phase: "gap-analysis",
+              },
+            );
+          } catch (err) {
+            console.error(`[review-fix] Failed to report rejected dispatch for PR #${fix.prNumber}:`, err);
+          } finally {
             releaseAdmission(admission.record.dispatchId, admission.record.lifecycleOwner, admission.record.generation, "launch_rejected");
           }
         }

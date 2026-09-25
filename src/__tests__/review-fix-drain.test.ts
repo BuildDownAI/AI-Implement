@@ -1132,6 +1132,7 @@ describe("processReviewFixQueue — admission (AII-787)", () => {
     expect(admission.count("TEAM")).toBe(1);
     const recorded = dedup.getDb().prepare("SELECT admission_generation, status FROM dispatch_log WHERE issue_id = ? AND phase = 'gap-analysis'").get("issue-unknown") as { admission_generation: number; status: string };
     expect(recorded).toEqual({ admission_generation: 0, status: "dispatched" });
+    expect((dedup.getDb().prepare("SELECT COUNT(*) AS n FROM dispatch_log WHERE issue_id = ? AND status = 'dispatch-failed'").get("issue-unknown") as { n: number }).n).toBe(0);
     expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(0);
   });
 

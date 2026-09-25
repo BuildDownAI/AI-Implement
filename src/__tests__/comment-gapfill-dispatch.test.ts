@@ -378,7 +378,7 @@ describe("drainCommentGapfillQueue", () => {
     });
     seedDispatchLog("issue-3", "AII-101", "Something", "acme", "billing", 42);
 
-    const dispatchSpy = vi.fn<DrainInput["dispatch"]>(async () => ({ success: false, status: 422, error: "Workflow not found" }));
+    const dispatchSpy = vi.fn<DrainInput["dispatch"]>(async () => ({ success: false, status: 422, error: "Workflow not found", outcome: "rejected" }));
     const failureSpy = vi.fn<DrainInput["onDispatchFailure"]>(async () => undefined);
 
     await drain.drainCommentGapfillQueue(makeBaseDrainOpts({
@@ -1206,6 +1206,7 @@ describe("drainCommentGapfillQueue — admission (AII-787)", () => {
     expect(admission.count("TEAM")).toBe(1);
     const recorded = dedup.getDb().prepare("SELECT admission_generation, status FROM dispatch_log WHERE issue_id = ? AND phase = 'gap-analysis'").get("issue-unknown") as { admission_generation: number; status: string };
     expect(recorded).toEqual({ admission_generation: 0, status: "dispatched" });
+    expect((dedup.getDb().prepare("SELECT COUNT(*) AS n FROM dispatch_log WHERE issue_id = ? AND status = 'dispatch-failed'").get("issue-unknown") as { n: number }).n).toBe(0);
   });
 
   it("releases Fly admission if image preparation fails before createMachine", async () => {
