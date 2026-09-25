@@ -140,10 +140,36 @@ describe("reportJobCompletion breaker integration (BAC-27134)", () => {
 // AII-791: a runner callback reports its own business outcome (success/failure) from
 // inside the still-running backend — that self-report is not proof the GHA run / Fly
 // machine / local container has actually exited. log.ts's updateJobStatus only releases
-// the admission reservation when the caller can vouch for verified termination
-// (skipAdmissionRelease unset); a callback-style write must pass skipAdmissionRelease:
-// true, exactly like the reaper/watchdog give-up paths already covered elsewhere.
+// the admission reservation when the caller explicitly reports verified termination.
 describe("admission reservation survives a callback-style terminal write (AII-791)", () => {
+  it("leaves a Restate-owned terminal outcome to Restate rather than applying Legacy breaker actions", async () => {
+    const admitted = dispatchAdmission.acquire({
+      dispatchId: "restate-completion-1",
+      mappingKey: "ENG",
+      scope: { kind: "issue", issueScope: "ENG", issueId: "issue-restate-completion" },
+      kind: "implementation",
+      backend: "github-actions",
+      lifecycleOwner: { kind: "restate", attemptId: "attempt-1" },
+      cap: 2,
+    });
+    expect(admitted.ok).toBe(true);
+    if (!admitted.ok) return;
+    const jobId = log.appendLog({
+      issueId: "issue-restate-completion",
+      issueIdentifier: "AII-REST",
+      phase: "implementation",
+      dispatchId: "restate-completion-1",
+      admissionGeneration: admitted.record.generation,
+    });
+    log.updateJobStatus(jobId, "failed", "runner_failure");
+
+    await runReportOnce();
+
+    expect(log.getJobById(jobId)?.notifiedAt).toBeNull();
+    const breakerRow = dedup.getDb().prepare("SELECT 1 FROM dispatch_breaker WHERE issue_id = ?").get("issue-restate-completion");
+    expect(breakerRow).toBeUndefined();
+    expect(dispatchAdmission.read("restate-completion-1")?.releasedAt).toBeNull();
+  });
   it("stays occupied on a callback terminal write while the backend is still running", async () => {
     const dispatchId = "dispatch-callback-1";
     const admitted = dispatchAdmission.acquire({

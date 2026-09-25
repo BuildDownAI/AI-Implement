@@ -3345,9 +3345,10 @@ export async function reportJobCompletion(config: AppConfig, registry: ProviderR
   const mappings = getMappings();
   for (const job of terminalJobs) {
     try {
-      // Record dispatch breaker state for ALL terminal jobs before any early-continue.
-      // Uses reportJobCompletion as the single integration point because it sees every
-      // terminal job regardless of which backend or path produced it (GHA callback,
+      // Restate owns the outcome, breaker, and notification path for its attempts.
+      if (isRestateOwnedJob(job)) continue;
+      // Record dispatch breaker state for every Legacy terminal job before any other
+      // early-continue. This path sees every Legacy backend and result source (GHA callback,
       // GHA monitor, Fly, local-docker).
       let pendingBreakerTrip: { phase: string; failures: number; conclusion: string } | null = null;
       // kg-refresh dispatch never calls isParked(), so breaker bookkeeping here is dead weight that silently mutates DB without notification.
