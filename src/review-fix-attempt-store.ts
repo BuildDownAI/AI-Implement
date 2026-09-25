@@ -280,6 +280,22 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
         return { status: "already_bound", execution: { githubRunId: row.github_run_id, githubRunAttempt: row.github_run_attempt } };
       }
 
+      // A result can be accepted before binding (recordResult never writes
+      // github_run_id/github_run_attempt). Binding a genuinely different
+      // execution than that early result's embedded identity would otherwise
+      // leave accepted_result_json and the bound columns permanently
+      // inconsistent with nothing recorded — surface it the same way a
+      // post-bind mismatch is surfaced (already_bound with the original
+      // identity), and persist the conflict marker.
+      if (row.accepted_result_json !== null) {
+        const accepted = JSON.parse(row.accepted_result_json) as ReviewFixResultMetadataV1;
+        if (accepted.githubRunId !== execution.githubRunId || accepted.githubRunAttempt !== execution.githubRunAttempt) {
+          db.prepare("UPDATE review_fix_attempts SET result_conflict_at = COALESCE(result_conflict_at, ?) WHERE attempt_id = ?")
+            .run(Date.now(), attemptId);
+          return { status: "already_bound", execution: { githubRunId: accepted.githubRunId, githubRunAttempt: accepted.githubRunAttempt } };
+        }
+      }
+
       db.prepare(`
         UPDATE review_fix_attempts
         SET github_run_id = ?, github_run_attempt = ?,
@@ -297,10 +313,16 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
   }
 
   async hasCurrentAuthority(attemptId: AttemptId): Promise<boolean> {
-    const row = getDb().prepare("SELECT authority_revoked_at FROM review_fix_attempts WHERE attempt_id = ?").get(attemptId) as
-      | Pick<AttemptRow, "authority_revoked_at">
+    const db = getDb();
+    const row = db.prepare("SELECT dispatch_id, authority_revoked_at, deadline_at FROM review_fix_attempts WHERE attempt_id = ?").get(attemptId) as
+      | Pick<AttemptRow, "dispatch_id" | "authority_revoked_at" | "deadline_at">
       | undefined;
-    return row !== undefined && row.authority_revoked_at === null;
+    if (!row || row.authority_revoked_at !== null) return false;
+    if (Date.now() >= row.deadline_at) return false;
+    // An approval consumer must observe "still owns an active reservation," not
+    // merely "was never explicitly revoked" — a released attempt (e.g. after a
+    // confirmed terminal observation) carries no revocation timestamp at all.
+    return isDispatchActive(db, row.dispatch_id);
   }
 
   async recordResult(attemptId: AttemptId, result: ReviewFixResultMetadataV1): Promise<ResultIntakeOutcome> {
@@ -311,11 +333,21 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
       if (result.attemptId !== attemptId) {
         return { status: "stale", attemptId, reason: "result attemptId does not match the target attempt" };
       }
+      // A syntactically valid result carrying attemptId's exact string but a
+      // different scope or deadline than the prepared row is not evidence about
+      // this attempt at all — reject it before it can become the first accepted
+      // result (this also covers an early result, before execution binding).
+      if (result.installationId !== Number(row.installation_id) || result.repository !== row.repository
+        || result.prNumber !== row.pr_number || result.deadlineAt !== row.deadline_at) {
+        return { status: "stale", attemptId, reason: "result scope or deadline does not match the prepared attempt" };
+      }
       if (!isDispatchActive(db, row.dispatch_id)) {
         return { status: "stale", attemptId, reason: "attempt has been released or superseded" };
       }
       if (row.github_run_id !== null
         && (row.github_run_id !== result.githubRunId || row.github_run_attempt !== result.githubRunAttempt)) {
+        db.prepare("UPDATE review_fix_attempts SET result_conflict_at = COALESCE(result_conflict_at, ?) WHERE attempt_id = ?")
+          .run(Date.now(), attemptId);
         return { status: "conflict", attemptId, reason: "result execution identity does not match the bound execution" };
       }
 
