@@ -230,7 +230,7 @@ export function extractExecutedCommands(events: StreamEvent[]): Array<{ command:
   const observed: Array<{ command: string; failed: boolean }> = [];
   for (const event of events) {
     for (const start of extractToolStarts(event)) {
-      if (!start.id || !start.action.startsWith("Bash")) continue;
+      if (!start.id || start.action !== "Bash") continue;
       const input = start.detail;
       if (input && typeof input === "object" && typeof (input as { command?: unknown }).command === "string") {
         pending.set(start.id, (input as { command: string }).command);

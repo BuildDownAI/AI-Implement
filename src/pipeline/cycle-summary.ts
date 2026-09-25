@@ -340,6 +340,8 @@ export function writeCycleSummary(
     record = { ...record, tests: [SIZE_LIMIT_TEST_PLACEHOLDER], dispositions: [] };
     sizeBytes = Buffer.byteLength(JSON.stringify(record), "utf-8");
     if (sizeBytes > CYCLE_SUMMARY_MAX_BYTES) {
+      record.truncated = truncated;
+      record.limitReached = limitReached;
       console.warn(
         `[cycle-summary] cycle summary "${record.id}" is ${sizeBytes} bytes, still over the ` +
           `${CYCLE_SUMMARY_MAX_BYTES}-byte cap after the full fallback; omitting it`,
