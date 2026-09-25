@@ -259,6 +259,24 @@ describe("acceptReviewFixWebhookEvent (AII-792)", () => {
     expect(queue.listReviewFixEvents(first.reviewFixId)).toHaveLength(2);
   });
 
+  it("retains internal event identity across a database reopen", () => {
+    const input = {
+      eventId: "internal:lease_rejected:dispatch-7",
+      issueId: "issue-1",
+      issueIdentifier: "AII-1",
+      repo: "org/repo",
+      prNumber: 45,
+      reason: "lease_rejected",
+    };
+    const first = queue.acceptReviewFixWebhookEvent(input);
+    queue.updateReviewFixStatus(first.reviewFixId, "dispatched");
+    dedup.closeDb();
+
+    expect(queue.acceptReviewFixWebhookEvent(input).status).toBe("duplicate");
+    expect(queue.getPendingReviewFixes()).toHaveLength(0);
+    expect(queue.listReviewFixEvents(first.reviewFixId)).toHaveLength(1);
+  });
+
   it("leaves the legacy enqueueReviewFix seam (no eventId) untouched — repeated calls still merge on (repo, pr_number)", () => {
     const first = queue.enqueueReviewFix({
       issueId: "issue-1",

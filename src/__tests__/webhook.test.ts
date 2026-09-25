@@ -2179,6 +2179,7 @@ function makeMappedEnvelopeRepo(owner = "org", repo = "repo"): Record<string, Re
       planningEnabled: false,
       planningWorkflowFile: "",
       autoApprovePlans: true,
+      autoMerge: false,
       extraEnv: {},
       provider: "anthropic",
       awsRegion: null,
@@ -2190,6 +2191,12 @@ function makeMappedEnvelopeRepo(owner = "org", repo = "repo"): Record<string, Re
       maxJobMinutes: null,
       branchPrefix: null,
       skillsRepo: null,
+      referenceRepos: null,
+      sensitiveAddPatterns: null,
+      sensitiveAllowPatterns: null,
+      dependencyTokenScope: null,
+      memoryProviderId: null,
+      reviewers: null,
     },
   };
 }
