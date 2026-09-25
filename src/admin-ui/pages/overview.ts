@@ -90,6 +90,7 @@ export const overviewHtml = `
         <div class="card-body">
           <div id="overview-atcap-body" style="display:flex;flex-direction:column;gap:8px"></div>
           <div id="overview-atcap-empty" class="hidden text-tertiary" style="padding:4px 0">All projects have available capacity. <a href="#blockers" onclick="window.navigate('blockers');return false" style="color:var(--accent)">View blockers page</a> for more details.</div>
+          <div id="overview-atcap-unavailable" class="hidden text-tertiary" style="padding:4px 0">Capacity data is unavailable right now &mdash; team status can&rsquo;t be determined.</div>
         </div>
       </div>
     </div>
@@ -182,6 +183,20 @@ export const overviewScript = `
       + '</div>';
   }
 
+  function capacityMeterUnavailable() {
+    return '<span class="text-tertiary" style="font-size:11px">unavailable</span>';
+  }
+
+  // Reservation-backed totals from the /api/blockers capacity projection
+  // (src/admin.ts#buildCapacityByMapping) — never derived by filtering the job log,
+  // so a prepared/unknown/stopping reservation with no visible running row still
+  // counts as used, and a stranded tracker label can never mask real capacity.
+  function capacityAtCapTeams(capacityByMapping) {
+    return Object.entries(capacityByMapping).filter(function (pair) {
+      return pair[1].used >= pair[1].cap;
+    });
+  }
+
   function isReviewIncomplete(e) {
     if (!e || e.status !== 'review_failed') return false;
     const failure = e.failure;
@@ -226,25 +241,11 @@ export const overviewScript = `
     el.textContent = 'last sweep ' + (reaper.lastSweepAt ? fmtAgo(reaper.lastSweepAt) : 'never');
   }
 
-  function renderKpis(log, mappings, running) {
+  function renderKpis(log, running, capacityByMapping) {
     const now = Date.now();
     const failed24h = log.filter(function (e) {
       return (e.status === 'failed' || e.status === 'review_failed' || (e.status === 'timed_out' && e.conclusion === 'stuck_giveup')) && (now - new Date(e.dispatchedAt).getTime()) < 86400000;
     });
-
-    const mappingEntries = Object.entries(mappings);
-    const sumMax = mappingEntries.reduce(function (acc, pair) {
-      return acc + (pair[1].maxInProgressAiIssues != null ? pair[1].maxInProgressAiIssues : 3);
-    }, 0);
-    const pct = sumMax > 0 ? Math.round((running.length / sumMax) * 100) : 0;
-
-    const atCapCount = mappingEntries.filter(function (pair) {
-      const key = pair[0];
-      const m = pair[1];
-      const cap = m.maxInProgressAiIssues != null ? m.maxInProgressAiIssues : 3;
-      const cnt = running.filter(function (r) { return r.teamKey === key; }).length;
-      return cnt >= cap;
-    }).length;
 
     const teams = new Set(running.filter(function (r) { return r.teamKey; }).map(function (r) { return r.teamKey; }));
 
@@ -254,14 +255,31 @@ export const overviewScript = `
     if (rs) rs.textContent = 'across ' + teams.size + ' team' + (teams.size === 1 ? '' : 's');
 
     const cv = document.getElementById('kpi-capacity-value');
-    if (cv) cv.textContent = String(running.length);
     const cu = document.getElementById('kpi-capacity-unit');
-    if (cu) cu.textContent = '/ ' + sumMax;
     const cs = document.getElementById('kpi-capacity-sub');
-    if (cs) cs.textContent = pct + '% of total slots';
-
     const bv = document.getElementById('kpi-blocked-value');
-    if (bv) bv.textContent = String(atCapCount);
+    const bs = document.getElementById('kpi-blocked-sub');
+
+    if (!capacityByMapping) {
+      // Missing/failed capacity projection is unavailable, never rendered as 0/free.
+      if (cv) cv.textContent = '—';
+      if (cu) cu.textContent = '';
+      if (cs) cs.textContent = 'Capacity data unavailable';
+      if (bv) bv.textContent = '—';
+      if (bs) bs.textContent = 'Capacity data unavailable';
+    } else {
+      const capacityEntries = Object.values(capacityByMapping);
+      const sumUsed = capacityEntries.reduce(function (acc, c) { return acc + c.used; }, 0);
+      const sumCap = capacityEntries.reduce(function (acc, c) { return acc + c.cap; }, 0);
+      const pct = sumCap > 0 ? Math.round((sumUsed / sumCap) * 100) : 0;
+      const atCapCount = capacityAtCapTeams(capacityByMapping).length;
+
+      if (cv) cv.textContent = String(sumUsed);
+      if (cu) cu.textContent = '/ ' + sumCap;
+      if (cs) cs.textContent = pct + '% of total slots';
+      if (bv) bv.textContent = String(atCapCount);
+      if (bs) bs.textContent = 'at concurrency cap';
+    }
 
     const fv = document.getElementById('kpi-failed-value');
     if (fv) fv.textContent = String(failed24h.length);
@@ -302,19 +320,23 @@ export const overviewScript = `
     });
   }
 
-  function renderAtCapacity(running, mappings) {
+  function renderAtCapacity(capacityByMapping) {
     const body = document.getElementById('overview-atcap-body');
     const empty = document.getElementById('overview-atcap-empty');
+    const unavailable = document.getElementById('overview-atcap-unavailable');
     const subtitle = document.getElementById('overview-atcap-subtitle');
     if (!body || !empty) return;
     body.innerHTML = '';
-    const atCap = Object.entries(mappings).filter(function (pair) {
-      const key = pair[0];
-      const m = pair[1];
-      const cap = m.maxInProgressAiIssues != null ? m.maxInProgressAiIssues : 3;
-      const cnt = running.filter(function (r) { return r.teamKey === key; }).length;
-      return cnt >= cap;
-    });
+
+    if (!capacityByMapping) {
+      empty.classList.add('hidden');
+      if (unavailable) unavailable.classList.remove('hidden');
+      if (subtitle) subtitle.textContent = 'Capacity data unavailable';
+      return;
+    }
+    if (unavailable) unavailable.classList.add('hidden');
+
+    const atCap = capacityAtCapTeams(capacityByMapping);
     if (subtitle) subtitle.textContent = atCap.length + ' team' + (atCap.length === 1 ? '' : 's') + ' at cap';
     if (atCap.length === 0) {
       empty.classList.remove('hidden');
@@ -323,12 +345,10 @@ export const overviewScript = `
     empty.classList.add('hidden');
     atCap.forEach(function (pair) {
       const key = pair[0];
-      const m = pair[1];
-      const cap = m.maxInProgressAiIssues != null ? m.maxInProgressAiIssues : 3;
-      const cnt = running.filter(function (r) { return r.teamKey === key; }).length;
+      const c = pair[1];
       const div = document.createElement('div');
       div.innerHTML = '<span class="mono">' + window.esc(key) + '</span> '
-        + '<span class="text-secondary">at capacity (' + cnt + '/' + cap + ')</span>';
+        + '<span class="text-secondary">at capacity (' + c.used + '/' + c.cap + ')</span>';
       body.appendChild(div);
     });
   }
@@ -380,7 +400,7 @@ export const overviewScript = `
     });
   }
 
-  function renderProjectGrid(log, mappings) {
+  function renderProjectGrid(mappings, capacityByMapping) {
     const tbody = document.getElementById('overview-projects-body');
     const empty = document.getElementById('overview-projects-empty');
     if (!tbody || !empty) return;
@@ -391,12 +411,10 @@ export const overviewScript = `
       return;
     }
     empty.classList.add('hidden');
-    const running = log.filter(function (e) { return e.status === 'running'; });
     entries.forEach(function (pair) {
       const key = pair[0];
       const m = pair[1];
-      const cap = m.maxInProgressAiIssues != null ? m.maxInProgressAiIssues : 3;
-      const cnt = running.filter(function (r) { return r.teamKey === key; }).length;
+      const c = capacityByMapping ? capacityByMapping[key] : null;
       const isFly = m.executionMode === 'fly-machines';
       const runnerKind = isFly ? 'success' : 'info';
       const runnerLabel = isFly ? 'fly' : 'gha';
@@ -405,7 +423,7 @@ export const overviewScript = `
         + '<td class="mono text-secondary">' + window.esc((m.owner || '?') + '/' + (m.repo || '?')) + '</td>'
         + '<td><span class="badge ' + runnerKind + '">' + runnerLabel + '</span></td>'
         + '<td class="text-secondary">' + window.esc(m.provider || 'anthropic') + '</td>'
-        + '<td>' + capacityMeter(cnt, cap) + '</td>'
+        + '<td>' + (c ? capacityMeter(c.used, c.cap) : capacityMeterUnavailable()) + '</td>'
         + '<td style="text-align:right" class="mono text-secondary">&mdash;</td>';
       tbody.appendChild(tr);
     });
@@ -467,12 +485,27 @@ export const overviewScript = `
     }
   }
 
+  // The capacity projection rides /api/blockers's capacityByMapping (same field
+  // blockers.ts reads), so both pages report identical at-cap teams without either
+  // recomputing it from the job log or a tracker label.
+  async function readCapacityByMapping(capacityRes) {
+    if (!capacityRes || !capacityRes.ok) return null;
+    try {
+      const data = await capacityRes.json();
+      if (!data || typeof data.capacityByMapping !== 'object' || data.capacityByMapping === null) return null;
+      return data.capacityByMapping;
+    } catch (err) {
+      return null;
+    }
+  }
+
   async function loadOverview() {
     try {
-      const [logRes, mappingsRes, reaperRes] = await Promise.all([
+      const [logRes, mappingsRes, reaperRes, capacityRes] = await Promise.all([
         window.api('/api/log'),
         window.api('/api/mappings'),
         window.api('/api/reaper/summary'),
+        window.api('/api/blockers'),
       ]);
       const log = await logRes.json();
       const mappings = await mappingsRes.json();
@@ -480,12 +513,13 @@ export const overviewScript = `
       const safeLog = Array.isArray(log) ? log : [];
       const safeMappings = mappings && typeof mappings === 'object' && !Array.isArray(mappings) ? mappings : {};
       const running = safeLog.filter(function (e) { return e.status === 'running'; });
+      const capacityByMapping = await readCapacityByMapping(capacityRes);
       renderHeaderSubtitle(reaper);
-      renderKpis(safeLog, safeMappings, running);
+      renderKpis(safeLog, running, capacityByMapping);
       renderRunningNow(running);
-      renderAtCapacity(running, safeMappings);
+      renderAtCapacity(capacityByMapping);
       renderRecentFailures(safeLog);
-      renderProjectGrid(safeLog, safeMappings);
+      renderProjectGrid(safeMappings, capacityByMapping);
       loadEnvStatus();
       loadTemplateStatus();
     } catch (err) {

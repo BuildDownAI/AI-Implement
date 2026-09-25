@@ -74,10 +74,20 @@ export const blockersScript = `
     }
   }
 
-  function renderKpis(totals) {
+  // Teams at capacity, sourced from the same reservation-backed capacityByMapping
+  // projection overview.ts reads off this same /api/blockers response — never
+  // recomputed from a tracker label or the job log, so the two pages agree by
+  // construction. A missing/malformed projection renders unavailable, never 0.
+  function renderKpis(totals, capacityByMapping) {
     document.getElementById('kpi-blocked-total').textContent = totals.issues;
     document.getElementById('kpi-blocked-teams').textContent = totals.teams;
-    document.getElementById('kpi-blocked-concurrency').textContent = totals.byReason.concurrency ?? 0;
+    const concurrencyEl = document.getElementById('kpi-blocked-concurrency');
+    if (!capacityByMapping) {
+      concurrencyEl.textContent = '—';
+    } else {
+      const atCapCount = Object.values(capacityByMapping).filter(function (c) { return c.used >= c.cap; }).length;
+      concurrencyEl.textContent = String(atCapCount);
+    }
     document.getElementById('kpi-blocked-dedup').textContent = totals.byReason.dedup ?? 0;
     document.getElementById('blockers-kpis').hidden = false;
   }
@@ -111,7 +121,10 @@ export const blockersScript = `
       return;
     }
     const data = await res.json();
-    renderKpis(data.totals);
+    const capacityByMapping = data && typeof data.capacityByMapping === 'object' && data.capacityByMapping !== null
+      ? data.capacityByMapping
+      : null;
+    renderKpis(data.totals, capacityByMapping);
     renderRows(data.blockers);
     renderSubtitle(data.blockers, data.totals);
   }
