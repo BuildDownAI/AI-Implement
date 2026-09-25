@@ -266,12 +266,36 @@ describe("ReviewFixAttempt durable workflow", () => {
     // Keep the invocation suspended; this fixture has no exact execution to bind.
   }, 10_000);
 
+  it.each(VARIANTS.map(([label]) => label))("an expired prepared attempt never launches (%s)", async (label) => {
+    const fake = newFake("accepted", -1_000);
+    attempts.set(fake.prepared.attemptId, fake);
+    const done = await callWorkflow<ReviewFixAttemptCompletion>(envFor(label).baseUrl(), "ReviewFixAttempt",
+      fake.prepared.attemptId, "run", { attemptId: fake.prepared.attemptId });
+    expect(done).toEqual({ status: "deadline_before_launch" });
+    expect([fake.launchEffects, fake.authority, fake.releaseEffects]).toEqual([0, false, 1]);
+  }, 20_000);
+
+  it.each(VARIANTS.map(([label]) => label))("binding cannot displace a departed owner (%s)", async (label) => {
+    const fake = newFake("accepted");
+    fake.holdBinding = true;
+    attempts.set(fake.prepared.attemptId, fake);
+    const done = callWorkflow<ReviewFixAttemptCompletion>(envFor(label).baseUrl(), "ReviewFixAttempt",
+      fake.prepared.attemptId, "run", { attemptId: fake.prepared.attemptId });
+    await until(() => fake.launchEffects === 1);
+    fake.occupied = false; // another owner won the guarded SQLite binding
+    fake.holdBinding = false;
+    expect(await done).toEqual({ status: "not_owner" });
+    expect([fake.approvalEffects, fake.releaseEffects]).toEqual([0, 0]);
+  }, 20_000);
+
   it("advertises independent seven-day workflow, journal and handler idempotency retention", async () => {
     const env = envFor("alwaysReplay");
     const fake = newFake("rejected");
     attempts.set(fake.prepared.attemptId, fake);
-    await callWorkflow(env.baseUrl(), "ReviewFixAttempt", fake.prepared.attemptId,
+    const rejected = await callWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", fake.prepared.attemptId,
       "run", { attemptId: fake.prepared.attemptId });
+    expect(rejected).toEqual({ status: "launch_rejected" });
+    expect([fake.launchEffects, fake.releaseEffects, fake.approvalEffects]).toEqual([0, 1, 0]);
     const response = await fetch(`${env.adminAPIBaseUrl()}/services/ReviewFixAttempt`);
     expect(response.ok).toBe(true);
     const metadata = JSON.stringify(await response.json());

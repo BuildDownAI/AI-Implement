@@ -164,6 +164,7 @@ export function createReviewFixAttempt(deps: ReviewFixAttemptDependencies) {
     if (bound.status === "not_owner") return { status: "not_owner" };
     if (bound.status === "already_bound" && !sameExecution(bound.execution, execution)) {
       await ctx.run("revoke-conflicting-execution", () => store.revokeAuthority(attemptId));
+      await alert(ctx, attemptId, "different execution already bound; occupancy retained", "alert-conflicting-execution");
       throw new restate.TerminalError("attempt was already bound to a different execution");
     }
 
