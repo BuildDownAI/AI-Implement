@@ -11,6 +11,7 @@ import { capDiff } from "./review.js";
 import { wrapWithPlanningGuard } from "../../planning-context-assembly.js";
 import { classifyThrown, type FailureRecord } from "../failure-classification.js";
 import { computeBackoffMs, normalizeRetryPolicy } from "../retry-backoff.js";
+import { inferTestResults, sumUsage, toolTraceLines, writeCycleSummary } from "../cycle-summary.js";
 
 const DEFAULT_MAX_ITERATIONS = 3;
 const DEFAULT_MODEL = "claude-sonnet-5";
@@ -622,6 +623,18 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
           cacheCreationTokens: implementProviderUnavailableTelemetry?.cacheCreationTokens ?? null,
           attempts: implementAttemptsTotal,
         });
+        writeCycleSummary(String(inputs.workspaceDir), {
+          id: `feedback-loop.${iteration}`,
+          stage: "feedback-loop",
+          cycle: iteration,
+          inputCommit: runStartHead,
+          outputCommit: null,
+          outputCommitStatus: "pending_push",
+          dispositions: [],
+          tests: inferTestResults(toolTraceLines(implementProviderUnavailableTelemetry), undefined, implementProviderUnavailableTelemetry?.executedCommands),
+          verdict: { approved: null, reason: "provider_unavailable", summary: implementProviderUnavailable.message },
+          usage: sumUsage(implementProviderUnavailableTelemetry),
+        });
         break;
       }
 
@@ -676,6 +689,18 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
             },
             reporter,
           )) ?? undefined;
+        writeCycleSummary(String(inputs.workspaceDir), {
+          id: `feedback-loop.${iteration}`,
+          stage: "feedback-loop",
+          cycle: iteration,
+          inputCommit: runStartHead,
+          outputCommit: null,
+          outputCommitStatus: "pending_push",
+          dispositions: [],
+          tests: inferTestResults(toolTraceLines(implementTelemetry), undefined, implementTelemetry?.executedCommands),
+          verdict: { approved: null, reason: "max_turns", summary: feedback },
+          usage: sumUsage(implementTelemetry),
+        });
         break;
       }
 
@@ -736,6 +761,22 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
           pass.reviewAttempts = reviewAttemptsTotal;
           pass.reviewCostUsd = reviewOutputs.telemetry?.costUsd ?? null;
           if (approved) terminationReason = "approved";
+          writeCycleSummary(String(inputs.workspaceDir), {
+            id: `feedback-loop.${iteration}`,
+            stage: "feedback-loop",
+            cycle: iteration,
+            inputCommit: runStartHead,
+            outputCommit: null,
+            outputCommitStatus: "pending_push",
+            dispositions: [],
+            tests: inferTestResults([...toolTraceLines(implementTelemetry), ...toolTraceLines(reviewOutputs.telemetry)], undefined, [...(implementTelemetry?.executedCommands ?? []), ...(reviewOutputs.telemetry?.executedCommands ?? [])]),
+            verdict: {
+              approved: reviewOutputs.approved,
+              reason: reviewOutputs.approved ? "approved" : "changes_requested",
+              summary: reviewOutputs.feedback,
+            },
+            usage: sumUsage(implementTelemetry, reviewOutputs.telemetry),
+          });
           break;
         } catch (err) {
           // A review failure (e.g. "Prompt is too long", a transient API error)
@@ -795,6 +836,18 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
             feedback = `Review step failed and was skipped: ${String(err)}`;
             terminationReason = "review_error";
           }
+          writeCycleSummary(String(inputs.workspaceDir), {
+            id: `feedback-loop.${iteration}`,
+            stage: "feedback-loop",
+            cycle: iteration,
+            inputCommit: runStartHead,
+            outputCommit: null,
+            outputCommitStatus: "pending_push",
+            dispositions: [],
+            tests: inferTestResults(toolTraceLines(implementTelemetry), undefined, implementTelemetry?.executedCommands),
+            verdict: { approved: null, reason: terminationReason, summary: feedback },
+            usage: sumUsage(implementTelemetry, reviewErrTelemetry),
+          });
           break;
         }
       }

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { fetchPlanningContextFromOrchestrator, postRunnerResult } from "../runner-result.js";
+import { fetchPlanningContextFromOrchestrator, postRunnerCycleSummary, postRunnerResult } from "../runner-result.js";
 import type { ReferenceRepoResult } from "../reference-repos.js";
 import type { FindingDisposition } from "../pipeline/finding-dispositions.js";
 import type { ReviewFixResultMetadataV1 } from "../review-fix-contract.js";
@@ -45,6 +45,20 @@ describe("fetchPlanningContextFromOrchestrator", () => {
       fetchImpl,
     });
     expect(ctx).toBe("");
+  });
+});
+
+describe("postRunnerCycleSummary", () => {
+  it("retries a transient response with the identical authenticated payload", async () => {
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce({ ok: false, status: 503 })
+      .mockResolvedValueOnce({ ok: true, status: 200 });
+    const summary = { id: "feedback-loop.1", completedAt: 123 } as Parameters<typeof postRunnerCycleSummary>[0]["summary"];
+    expect(await postRunnerCycleSummary({ callbackUrl: "https://cb/", progressToken: "pilot-progress", summary, fetchImpl })).toBe(true);
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(fetchImpl.mock.calls[0][0]).toBe("https://cb/runner/cycle-summary");
+    expect(fetchImpl.mock.calls[0][1]).toMatchObject({ headers: { Authorization: "Bearer pilot-progress" } });
+    expect(fetchImpl.mock.calls[0][1].body).toBe(fetchImpl.mock.calls[1][1].body);
   });
 });
 

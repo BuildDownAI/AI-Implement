@@ -797,6 +797,121 @@ describe("feedbackLoopStep termination reasons", () => {
   });
 });
 
+describe("feedbackLoopStep — cycle summaries (AII-801)", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(implementStep.run).mockResolvedValue(IMPLEMENT_OUTPUTS);
+    mockDiff();
+    tmpDir = mkdtempSync(join(tmpdir(), "fl-cycle-summary-"));
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function readCycleSummaries(): Array<{
+    id: string;
+    cycle: number;
+    verdict: { approved: boolean | null; reason: string };
+    tests: { name: string; status: string }[];
+    outputCommitStatus: string;
+  }> {
+    const filePath = join(tmpDir, "ai-output", "cycle-summaries.jsonl");
+    if (!existsSync(filePath)) return [];
+    return readFileSync(filePath, "utf-8")
+      .split("\n")
+      .filter((line) => line.trim().length > 0)
+      .map((line) => JSON.parse(line));
+  }
+
+  it("emits one distinct, individually inspectable cycle summary per pass across a rejected-then-approved run", async () => {
+    vi.mocked(reviewStep.run)
+      .mockResolvedValueOnce(REJECTED_REVIEW)
+      .mockResolvedValueOnce(REJECTED_REVIEW)
+      .mockResolvedValueOnce(APPROVED_REVIEW);
+
+    await feedbackLoopStep.run(
+      makeContext(),
+      { ...BASE_INPUTS, workspaceDir: tmpDir, maxIterations: 3 },
+      new NoopStepReporter(),
+    );
+
+    const summaries = readCycleSummaries();
+    expect(summaries).toHaveLength(3);
+    expect(summaries.map((s) => s.id).sort()).toEqual(["feedback-loop.1", "feedback-loop.2", "feedback-loop.3"]);
+    expect(summaries[0]!.verdict).toMatchObject({ approved: false, reason: "changes_requested" });
+    expect(summaries[1]!.verdict).toMatchObject({ approved: false, reason: "changes_requested" });
+    expect(summaries[2]!.verdict).toMatchObject({ approved: true, reason: "approved" });
+    expect(summaries.every((s) => s.outputCommitStatus === "pending_push")).toBe(true);
+  });
+
+  it("records an explicit non-passed test status and a null verdict on a max_turns pass, without changing loop control flow", async () => {
+    vi.mocked(implementStep.run).mockResolvedValue({ ...IMPLEMENT_OUTPUTS, telemetry: MAX_TURNS_TELEMETRY });
+    const invoke = vi.fn().mockResolvedValue({ stdout: "## Post-mortem", exitCode: 0, tokensUsed: 10 });
+
+    const outputs = await feedbackLoopStep.run(
+      makeContextWithExecutor(invoke),
+      { ...BASE_INPUTS, workspaceDir: tmpDir },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.terminationReason).toBe("max_turns");
+    expect(reviewStep.run).not.toHaveBeenCalled();
+    const summaries = readCycleSummaries();
+    expect(summaries).toHaveLength(1);
+    expect(summaries[0]!.verdict).toMatchObject({ approved: null, reason: "max_turns" });
+    expect(summaries[0]!.tests.length).toBeGreaterThan(0);
+    expect(summaries[0]!.tests.every((t) => t.status !== "passed")).toBe(true);
+  });
+
+  it("records an explicit missing test status and a provider_unavailable verdict when implement is exhausted with a dirty tree", async () => {
+    vi.mocked(spawnSync).mockImplementation((_cmd: unknown, args?: readonly string[] | null) => {
+      const argv = (args ?? []) as string[];
+      const isStatus = argv[0] === "status";
+      const stdout = isStatus ? "M src/foo.ts\n" : "diff --git a/foo.ts\n+added line";
+      return {
+        status: 0,
+        stdout: Buffer.from(stdout),
+        stderr: Buffer.from(""),
+        pid: 0,
+        output: [],
+        signal: null,
+        error: undefined,
+      };
+    });
+    vi.mocked(implementStep.run).mockRejectedValueOnce(new Error(TRANSIENT_ERROR_MESSAGE));
+
+    const outputs = await feedbackLoopStep.run(
+      makeContext({ retryPolicy: { ...DEFAULT_RETRY_POLICY, stageRetries: 0 } }),
+      { ...BASE_INPUTS, workspaceDir: tmpDir, sleep: NO_SLEEP },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.terminationReason).toBe("provider_unavailable");
+    const summaries = readCycleSummaries();
+    expect(summaries).toHaveLength(1);
+    expect(summaries[0]!.verdict).toMatchObject({ approved: null, reason: "provider_unavailable" });
+    expect(summaries[0]!.tests).toEqual([{ name: "test execution", status: "missing" }]);
+  });
+
+  it("records review_error with a null verdict when the review step fails non-transiently", async () => {
+    vi.mocked(reviewStep.run).mockRejectedValueOnce(new Error("Prompt is too long"));
+
+    const outputs = await feedbackLoopStep.run(
+      makeContext(),
+      { ...BASE_INPUTS, workspaceDir: tmpDir },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.terminationReason).toBe("review_error");
+    const summaries = readCycleSummaries();
+    expect(summaries).toHaveLength(1);
+    expect(summaries[0]!.verdict).toMatchObject({ approved: null, reason: "review_error" });
+  });
+});
+
 describe("feedbackLoopStep — reviewer feedback file", () => {
   let tmpDir: string;
 

@@ -67,7 +67,8 @@ import { runReconciliations, resolvePrMapping } from "./reconcile-merged.js";
 import { resolveSessionImage, resolveDefaultRunnerImage, resolveRunnerImageForDispatch, type SessionImageStatus } from "./repo-image.js";
 import { getStepRecord, getStepsByJobId, initStepLogTable } from "./step-log.js";
 import { getOrchestratorSettings, seedKgBaseRepoFromEnv, seedLinearPickupLabelFromEnv, getRetryPolicy } from "./orchestrator-settings.js";
-import { handleRunnerPlanningContext, handleRunnerProgress, handleRunnerResult, handleKgTrackerDataRequest, handleKgScopeRequest, planningDispatchBlockReason } from "./runner-callback.js";
+import { handleRunnerPlanningContext, handleRunnerProgress, handleRunnerCycleSummary, handleRunnerResult, handleKgTrackerDataRequest, handleKgScopeRequest, planningDispatchBlockReason } from "./runner-callback.js";
+import { CYCLE_SUMMARY_MAX_BYTES } from "./pipeline/cycle-summary.js";
 import type { RunnerProgressBody, RunnerResultBody } from "./runner-callback.js";
 import { mintRunToken, PLANNING_TTL_SECONDS, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
 import { handleMcpRequest } from "./mcp.js";
@@ -4059,6 +4060,19 @@ function readBody(req: http.IncomingMessage): Promise<string> {
   });
 }
 
+function readBodyLimited(req: http.IncomingMessage, maxBytes: number): Promise<string | null> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let bytes = 0;
+    req.on("data", (chunk: Buffer) => {
+      bytes += chunk.length;
+      if (bytes <= maxBytes) chunks.push(chunk);
+    });
+    req.on("end", () => resolve(bytes > maxBytes ? null : Buffer.concat(chunks).toString()));
+    req.on("error", reject);
+  });
+}
+
 function onDeployBuildFailure(commit: string, err: unknown): void {
   recordDeployOutcome({ kind: "build-failed", commit, timestamp: Date.now(), detail: String(err) });
 }
@@ -4612,6 +4626,42 @@ function startServer(
         forgetKgPr: (repo, prNumber) => kgRefresh.forgetPr(repo, prNumber),
       }).catch((err) => {
         console.error("[webhook] Unhandled error:", err);
+        if (!res.headersSent) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Internal server error" }));
+        }
+      });
+      return;
+    }
+
+    // Pilot cycle evidence uses a reusable, attempt-scoped progress bearer and commits
+    // independently of the result callback, including runs with no output commit.
+    if (url === "/runner/cycle-summary" && req.method === "POST") {
+      (async () => {
+        if (!config.runnerTokenSecret) {
+          res.writeHead(501, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Runner callback not configured" }));
+          return;
+        }
+        const body = await readBodyLimited(req, CYCLE_SUMMARY_MAX_BYTES + 1024);
+        if (body === null) {
+          res.writeHead(413, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Cycle summary too large" }));
+          return;
+        }
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(body);
+        } catch {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Invalid JSON" }));
+          return;
+        }
+        const result = handleRunnerCycleSummary({ authorization: req.headers.authorization, body: parsed, secret: config.runnerTokenSecret });
+        res.writeHead(result.status, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(result.body));
+      })().catch((err) => {
+        console.error("[runner-cycle-summary] Unhandled error:", err);
         if (!res.headersSent) {
           res.writeHead(500, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "Internal server error" }));

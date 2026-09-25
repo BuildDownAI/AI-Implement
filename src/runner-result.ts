@@ -2,6 +2,7 @@ import { readFileSync, existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import type { FailureRecord } from "./pipeline/failure-classification.js";
 import type { FindingDisposition } from "./pipeline/finding-dispositions.js";
+import type { CycleSummary } from "./pipeline/cycle-summary.js";
 import type { ReferenceRepoResult } from "./reference-repos.js";
 import type { ReviewFixResultMetadataV1 } from "./review-fix-contract.js";
 import { computeBackoffMs, DEFAULT_RETRY_POLICY, type RetryPolicy } from "./pipeline/retry-backoff.js";
@@ -108,6 +109,35 @@ export async function fetchPlanningContextFromOrchestrator(params: {
   }
 }
 
+/** Deliver one immutable cycle before terminal result intake. The progress bearer identifies
+ * the prepared pilot attempt, so this also works when no output commit was published. */
+export async function postRunnerCycleSummary(params: {
+  callbackUrl: string;
+  progressToken: string;
+  summary: CycleSummary;
+  fetchImpl?: typeof fetch;
+}): Promise<boolean> {
+  const url = `${params.callbackUrl.replace(/\/$/, "")}/runner/cycle-summary`;
+  const payload = JSON.stringify({ summary: params.summary });
+  const headers = { "Content-Type": "application/json", Authorization: `Bearer ${params.progressToken}` };
+  const fetchFn = params.fetchImpl ?? fetch;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const res = await fetchWithAbortTimeout(fetchFn, url, { method: "POST", headers, body: payload }, 5_000);
+      if (res.ok) return true;
+      if (!isRetryableStatus(res.status)) {
+        console.error(`[cycle-summary] durable delivery rejected (HTTP ${res.status})`);
+        return false;
+      }
+    } catch {
+      // Transport outcome is unknown; a byte-identical retry is safe because storage is idempotent.
+    }
+    if (attempt < 2) await sleep(250 * (attempt + 1));
+  }
+  console.error("[cycle-summary] durable delivery exhausted retries");
+  return false;
+}
+
 export async function postRunnerResult(params: {
   phase: "planning" | "implementation" | "gap-analysis" | "kg-refresh";
   workspaceDir: string;
@@ -128,6 +158,13 @@ export async function postRunnerResult(params: {
   referenceRepoResults?: ReferenceRepoResult[];
   /** Per-finding disposition from the fixing agent (fixed/follow-up/invalid), present only when non-empty. */
   findingDispositions?: FindingDisposition[];
+  /**
+   * Per-cycle evidence records read back from this run's declared cycle-summary file (AII-801,
+   * ./pipeline/cycle-summary.js), present only when non-empty. The caller (run-autonomous.ts)
+   * only attaches these alongside a `reviewFix` marker — a Legacy run has no attemptId for the
+   * orchestrator to record them against.
+   */
+  cycleSummaries?: CycleSummary[];
   /** SHA of the snapshot commit pushed by a kg-refresh runner. Only meaningful for phase=kg-refresh. */
   snapshotCommit?: string | null;
   /** Number of the refresh PR opened alongside snapshotCommit. Only meaningful for phase=kg-refresh. */
@@ -184,6 +221,9 @@ export async function postRunnerResult(params: {
   }
   if (params.findingDispositions && params.findingDispositions.length > 0) {
     body.findingDispositions = params.findingDispositions;
+  }
+  if (params.cycleSummaries && params.cycleSummaries.length > 0) {
+    body.cycleSummaries = params.cycleSummaries;
   }
   if (params.snapshotCommit) body.snapshotCommit = params.snapshotCommit;
   if (params.snapshotPr) body.snapshotPr = params.snapshotPr;
