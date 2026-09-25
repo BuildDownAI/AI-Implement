@@ -281,3 +281,109 @@ describe("projects page PR dispatch budget field", () => {
     expect(doc.getElementById("md-error")?.textContent).toContain("PR Dispatch Budget must be a positive integer, or blank for the default.");
   });
 });
+
+describe("projects page review-fix lifecycle field", () => {
+  it("declares the Legacy/Restate select in the Execution panel with owner-retention copy", () => {
+    expect(projectsHtml).toContain('id="md-review-fix-lifecycle"');
+    expect(projectsHtml).toContain('<option value="legacy">Legacy</option>');
+    expect(projectsHtml).toContain('<option value="restate">Restate (pilot)</option>');
+    expect(projectsHtml).toContain("an attempt already dispatched keeps the lifecycle that dispatched it");
+    expect(projectsHtml).toContain("does not cancel or migrate anything already in flight");
+  });
+
+  it("defaults a new mapping's visual selection to Legacy when the field is absent", async () => {
+    const { win, doc } = mountProjects(baseMapping());
+    await win.loadMappings();
+    win.openMappingDialog("AII");
+
+    expect((doc.getElementById("md-review-fix-lifecycle") as HTMLSelectElement).value).toBe("legacy");
+  });
+
+  it("loads an existing Restate selection as-is regardless of the default", async () => {
+    const { win, doc } = mountProjects(baseMapping({ reviewFixLifecycle: "restate" }));
+    await win.loadMappings();
+    win.openMappingDialog("AII");
+
+    expect((doc.getElementById("md-review-fix-lifecycle") as HTMLSelectElement).value).toBe("restate");
+  });
+
+  it("round-trips a changed selection through save and reload", async () => {
+    const mapping = baseMapping({ reviewFixLifecycle: "legacy" });
+    const { win, doc, posts } = mountProjects(mapping);
+    await win.loadMappings();
+    win.openMappingDialog("AII");
+
+    (doc.getElementById("md-review-fix-lifecycle") as HTMLSelectElement).value = "restate";
+    await save(win);
+    expect(posts[0]).toMatchObject({ reviewFixLifecycle: "restate" });
+    expect(posts).toHaveLength(1);
+
+    // Simulate the persisted store reflecting the save (the mock GET otherwise stays static).
+    mapping.reviewFixLifecycle = "restate";
+    win.openMappingDialog("AII");
+    expect((doc.getElementById("md-review-fix-lifecycle") as HTMLSelectElement).value).toBe("restate");
+  });
+
+  it("leaves a rejected enable visibly unsaved with the backend's cause, and issues no other call", async () => {
+    const { win, doc, posts } = mountProjects(baseMapping({ reviewFixLifecycle: "legacy" }));
+    await win.loadMappings();
+    win.openMappingDialog("AII");
+
+    (doc.getElementById("md-review-fix-lifecycle") as HTMLSelectElement).value = "restate";
+
+    const calls: Array<{ url: string; method?: string }> = [];
+    const origApi = win.api;
+    win.api = async (url: string, init?: { method?: string; body?: string }) => {
+      calls.push({ url, method: init?.method });
+      if (url === "/api/mappings" && init?.method === "POST") {
+        return {
+          ok: false,
+          status: 400,
+          json: async () => ({
+            error: 'reviewFixLifecycle "restate" requires a registered, healthy Restate endpoint, which is not currently available',
+          }),
+        };
+      }
+      return origApi(url, init);
+    };
+
+    await save(win);
+
+    expect(posts).toEqual([]);
+    expect(calls.filter((c) => c.method === "POST")).toHaveLength(1);
+    const dialog = doc.getElementById("mapping-dialog") as unknown as { open: boolean };
+    expect(dialog.open).toBe(true);
+    const errEl = doc.getElementById("md-error");
+    expect(errEl?.classList.contains("hidden")).toBe(false);
+    expect(errEl?.textContent).toContain("registered, healthy Restate endpoint");
+    // The attempted (not reverted) value stays visible.
+    expect((doc.getElementById("md-review-fix-lifecycle") as HTMLSelectElement).value).toBe("restate");
+  });
+
+  it("renders a distinct cause for an unsupported execution mode vs. an unavailable registration", async () => {
+    const { win, doc, posts } = mountProjects(baseMapping({ reviewFixLifecycle: "legacy", executionMode: "fly-machines" }));
+    await win.loadMappings();
+    win.openMappingDialog("AII");
+
+    (doc.getElementById("md-review-fix-lifecycle") as HTMLSelectElement).value = "restate";
+
+    const origApi = win.api;
+    win.api = async (url: string, init?: { method?: string; body?: string }) => {
+      if (url === "/api/mappings" && init?.method === "POST") {
+        return {
+          ok: false,
+          status: 400,
+          json: async () => ({ error: 'reviewFixLifecycle "restate" requires executionMode "github-actions"' }),
+        };
+      }
+      return origApi(url, init);
+    };
+
+    await save(win);
+
+    expect(posts).toEqual([]);
+    const unsupportedExecutionMessage = doc.getElementById("md-error")?.textContent;
+    expect(unsupportedExecutionMessage).toContain('requires executionMode "github-actions"');
+    expect(unsupportedExecutionMessage).not.toContain("registered, healthy Restate endpoint");
+  });
+});

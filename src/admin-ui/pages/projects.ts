@@ -277,6 +277,14 @@ export const projectsHtml = `
             </div>
           </div>
           <div class="field">
+            <label class="field-label">Review-fix Lifecycle</label>
+            <select class="select" id="md-review-fix-lifecycle">
+              <option value="legacy">Legacy</option>
+              <option value="restate">Restate (pilot)</option>
+            </select>
+            <div class="field-hint">Coordinates this project's automatic GitHub Actions review-fix runs. Local review-fix (the dev harness) and human comment-triggered gap-fill runs always stay on Legacy regardless of this selection &mdash; this control cannot move those paths to Restate. Changing this does not cancel or migrate anything already in flight: an attempt already dispatched keeps the lifecycle that dispatched it, and only future automatic dispatches follow the new selection.</div>
+          </div>
+          <div class="field">
             <label class="field-label">Extra Env</label>
             <textarea class="textarea" id="md-env" rows="4" placeholder="LOG_LEVEL=debug&#10;FEATURE_FLAG=on"></textarea>
             <div class="field-hint">One KEY=VALUE per line. Unlike secrets, these reach the model process and are visible to the agent.</div>
@@ -781,6 +789,9 @@ export const projectsScript = `
     document.getElementById('md-sensitive-add').value = (m.sensitiveAddPatterns || []).join('\\n');
     document.getElementById('md-sensitive-allow').value = (m.sensitiveAllowPatterns || []).join('\\n');
     document.getElementById('md-dep-token-scope').value = m.dependencyTokenScope || '';
+    // Absent/null means the backend resolves it to "legacy" (resolveReviewFixLifecycle) —
+    // default the control to match rather than leaving it on whichever option is first.
+    document.getElementById('md-review-fix-lifecycle').value = m.reviewFixLifecycle || 'legacy';
     // slice() so editing the draft never mutates the cached mapping behind it.
     refRepoDraft = (m.referenceRepos || []).slice();
     // The add row survives a Cancel, so an abandoned attempt would reappear on the next open.
@@ -1203,6 +1214,7 @@ export const projectsScript = `
       sensitiveAddPatterns: (function(){ var v = document.getElementById('md-sensitive-add').value.trim(); return v === '' ? null : v; })(),
       sensitiveAllowPatterns: (function(){ var v = document.getElementById('md-sensitive-allow').value.trim(); return v === '' ? null : v; })(),
       dependencyTokenScope: (function(){ var v = document.getElementById('md-dep-token-scope').value; return v === '' ? null : v; })(),
+      reviewFixLifecycle: document.getElementById('md-review-fix-lifecycle').value,
       referenceRepos: refRepoValue(),
       reviewers: reviewerValue(),
     };
