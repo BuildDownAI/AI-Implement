@@ -15,6 +15,7 @@
  */
 import type { AttemptId, ReviewFixResultMetadataV1, ScopedPrIdentity } from "../review-fix-contract.js";
 import { validateAttemptId, validateReviewFixResultMetadata } from "../review-fix-contract.js";
+import { isDeployHeld } from "../deploy-hold.js";
 import {
   ackDelivery,
   claimDeliveries,
@@ -168,6 +169,8 @@ export interface ReviewFixPumpStatus {
 export interface ReviewFixDeliveryPumpDeps {
   facade?: ReviewFixDeliveryFacade;
   claim?: typeof claimDeliveries;
+  /** During deploy, completion still flows but new feedback stays queued. */
+  permitsNewFeedback?: () => boolean;
   retry?: typeof retryDelivery;
   ack?: typeof ackDelivery;
   now?: () => number;
@@ -196,6 +199,7 @@ export interface ReviewFixDeliveryPumpDeps {
 export class ReviewFixDeliveryPump {
   private readonly facade: ReviewFixDeliveryFacade;
   private readonly claim: typeof claimDeliveries;
+  private readonly permitsNewFeedback: () => boolean;
   private readonly retryFn: typeof retryDelivery;
   private readonly ack: typeof ackDelivery;
   private readonly now: () => number;
@@ -221,6 +225,7 @@ export class ReviewFixDeliveryPump {
   constructor(deps: ReviewFixDeliveryPumpDeps = {}) {
     this.facade = deps.facade ?? createRestateReviewFixFacade({ timeoutMs: deps.requestTimeoutMs });
     this.claim = deps.claim ?? claimDeliveries;
+    this.permitsNewFeedback = deps.permitsNewFeedback ?? (() => !isDeployHeld());
     this.retryFn = deps.retry ?? retryDelivery;
     this.ack = deps.ack ?? ackDelivery;
     this.now = deps.now ?? Date.now;
@@ -261,8 +266,9 @@ export class ReviewFixDeliveryPump {
     }
   }
 
-  /** For incompatible-drain: halts new claims without clearing or failing whatever this
-   *  pump has already claimed. Safe to call whether or not the pump is running. */
+  /** Full pause for shutdown/testing: halts every claim without clearing or failing
+   *  already-claimed rows. Deployment drain instead uses the default completion-only
+   *  claim filter, so result/cancellation can finish while feedback stays queued. */
   pause(): void {
     this.paused = true;
   }
@@ -295,9 +301,16 @@ export class ReviewFixDeliveryPump {
     let unavailable = 0;
     try {
       const now = this.now();
-      const claimed = this.claim({ limit: this.batchLimit, leaseMs: this.leaseMs, now });
+      const claimed = this.claim({ limit: this.batchLimit, leaseMs: this.leaseMs, now, completionOnly: !this.permitsNewFeedback() });
       for (const delivery of claimed) {
         if (this.paused || this.stopGeneration !== stopGenerationAtStart) break;
+        // The hold may begin after the batch was claimed. Do not start a new
+        // feedback invocation. Reschedule the durable row so it resumes shortly
+        // after the hold clears instead of waiting for the full claim lease.
+        if (delivery.kind === "feedback" && !this.permitsNewFeedback()) {
+          this.retryFn(delivery.authenticatedSource, delivery.deliveryId, now + this.retryDelayMs);
+          continue;
+        }
         const outcome = await this.deliverOne(delivery, now);
         if (outcome === "delivered") delivered++;
         else if (outcome === "invalid") invalid++;

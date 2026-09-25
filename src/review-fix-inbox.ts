@@ -224,6 +224,8 @@ export interface ClaimDeliveriesOptions {
   readonly limit?: number;
   readonly leaseMs?: number;
   readonly now?: number;
+  /** A deploy drain admits completion events while leaving new feedback queued. */
+  readonly completionOnly?: boolean;
 }
 
 /**
@@ -248,6 +250,7 @@ export function claimDeliveries(options: ClaimDeliveriesOptions = {}): ReviewFix
       FROM review_fix_inbox
       WHERE delivery_state != 'delivered'
         AND (retry_at IS NULL OR retry_at < ?)
+        ${options.completionOnly ? "AND kind != 'feedback'" : ""}
       ORDER BY accepted_at ASC
       LIMIT ?
     `).all(now, limit) as ReviewFixInboxRow[];
