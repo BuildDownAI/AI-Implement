@@ -300,6 +300,101 @@ export function getDb(): Database.Database {
       ON review_fix_inbox(delivery_state, retry_at, accepted_at)`);
     db.exec(`CREATE INDEX IF NOT EXISTS idx_review_fix_inbox_pr
       ON review_fix_inbox(installation_id, repository, pr_number, accepted_at)`);
+    // AII-779: retain bounded redacted activity independently from completed
+    // cycle evidence. The byte tally is updated only after a new event insert,
+    // so replayed identities cannot consume the allowance again.
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS review_fix_activity_streams (
+        attempt_id TEXT PRIMARY KEY,
+        accepted_bytes INTEGER NOT NULL DEFAULT 0
+          CHECK (accepted_bytes BETWEEN 0 AND 10485760),
+        limit_reached_at INTEGER,
+        truncated_at INTEGER,
+        conflict_at INTEGER
+      )
+    `);
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS review_fix_activity_producers (
+        attempt_id TEXT NOT NULL,
+        producer_id TEXT NOT NULL,
+        highest_contiguous_sequence INTEGER NOT NULL DEFAULT -1,
+        final_sequence INTEGER,
+        gap_detected_at INTEGER,
+        limit_reached_at INTEGER,
+        conflict_at INTEGER,
+        PRIMARY KEY (attempt_id, producer_id),
+        CHECK (highest_contiguous_sequence >= -1),
+        CHECK (final_sequence IS NULL OR final_sequence >= 0)
+      )
+    `);
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS review_fix_activity (
+        attempt_id TEXT NOT NULL,
+        producer_id TEXT NOT NULL,
+        sequence INTEGER NOT NULL CHECK (sequence >= 0),
+        payload_hash TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        cycle INTEGER NOT NULL CHECK (cycle > 0),
+        occurred_at INTEGER NOT NULL,
+        redacted_payload_json TEXT NOT NULL,
+        byte_count INTEGER NOT NULL
+          CHECK (byte_count = length(CAST(redacted_payload_json AS BLOB))
+            AND byte_count BETWEEN 0 AND 16384),
+        PRIMARY KEY (attempt_id, producer_id, sequence)
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_review_fix_activity_cycle
+      ON review_fix_activity(attempt_id, cycle, occurred_at)`);
+    db.exec(`CREATE TRIGGER IF NOT EXISTS trg_review_fix_activity_conflicting_replay
+      BEFORE INSERT ON review_fix_activity
+      WHEN EXISTS (
+        SELECT 1 FROM review_fix_activity AS existing
+        WHERE existing.attempt_id = NEW.attempt_id
+          AND existing.producer_id = NEW.producer_id
+          AND existing.sequence = NEW.sequence
+          AND (existing.payload_hash <> NEW.payload_hash
+            OR existing.kind <> NEW.kind OR existing.cycle <> NEW.cycle
+            OR existing.occurred_at <> NEW.occurred_at
+            OR existing.redacted_payload_json <> NEW.redacted_payload_json
+            OR existing.byte_count <> NEW.byte_count)
+      )
+      BEGIN SELECT RAISE(ABORT, 'conflicting review-fix activity replay'); END`);
+    db.exec(`CREATE TRIGGER IF NOT EXISTS trg_review_fix_activity_immutable
+      BEFORE UPDATE ON review_fix_activity
+      BEGIN SELECT RAISE(ABORT, 'review-fix activity is immutable'); END`);
+    db.exec(`CREATE TRIGGER IF NOT EXISTS trg_review_fix_activity_bytes_monotonic
+      BEFORE UPDATE OF accepted_bytes ON review_fix_activity_streams
+      WHEN NEW.accepted_bytes < OLD.accepted_bytes
+      BEGIN SELECT RAISE(ABORT, 'review-fix activity byte count cannot decrease'); END`);
+    db.exec(`CREATE TRIGGER IF NOT EXISTS trg_review_fix_activity_count_bytes
+      AFTER INSERT ON review_fix_activity
+      BEGIN
+        INSERT OR IGNORE INTO review_fix_activity_streams (attempt_id)
+          VALUES (NEW.attempt_id);
+        UPDATE review_fix_activity_streams
+          SET accepted_bytes = accepted_bytes + NEW.byte_count
+          WHERE attempt_id = NEW.attempt_id;
+      END`);
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS review_fix_cycles (
+        attempt_id TEXT NOT NULL,
+        cycle INTEGER NOT NULL CHECK (cycle > 0),
+        summary_id TEXT NOT NULL UNIQUE,
+        summary_hash TEXT NOT NULL,
+        input_commit TEXT,
+        output_commit TEXT,
+        dispositions_json TEXT NOT NULL,
+        tests_json TEXT NOT NULL,
+        verdict TEXT NOT NULL,
+        usage_json TEXT NOT NULL,
+        completed_at INTEGER NOT NULL,
+        PRIMARY KEY (attempt_id, cycle)
+      )
+    `);
+    db.exec(`CREATE TRIGGER IF NOT EXISTS trg_review_fix_cycle_identity_immutable
+      BEFORE UPDATE OF summary_id ON review_fix_cycles
+      WHEN NEW.summary_id <> OLD.summary_id
+      BEGIN SELECT RAISE(ABORT, 'review-fix cycle identity is immutable'); END`);
     db.exec(`
       CREATE TABLE IF NOT EXISTS comment_gapfill_queue (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
