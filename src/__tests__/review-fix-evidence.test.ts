@@ -221,6 +221,77 @@ describe("appendReviewFixActivityBatch", () => {
     expect(getStreamRow(attemptId)?.conflict_at).not.toBeNull();
   });
 
+  it("rejects a payload-identical event whose timestamp changed as a conflict, not a duplicate", () => {
+    const attemptId = "attempt-conflict-timestamp";
+    const producerId = "producer-1";
+    evidence.appendReviewFixActivityBatch({
+      attemptId, producerId,
+      events: [makeEvent({ attemptId, producerId, sequence: 0, payload: "same payload", timestamp: 1_000 })],
+    });
+
+    const r = evidence.appendReviewFixActivityBatch({
+      attemptId, producerId,
+      events: [makeEvent({ attemptId, producerId, sequence: 0, payload: "same payload", timestamp: 2_000 })],
+    });
+    expect(r.conflicts).toEqual([0]);
+    expect(r.duplicates).toBe(0);
+    expect(r.stored).toBe(0);
+
+    const stored = evidence.listReviewFixActivity(attemptId, { pageSize: 10 }).events;
+    expect(stored).toHaveLength(1);
+    expect(stored[0].occurredAt).toBe(1_000);
+    expect(getStreamRow(attemptId)?.conflict_at).not.toBeNull();
+  });
+
+  it("rejects two distinct oversized payloads of equal byte length as a conflict rather than misreporting a duplicate truncation marker", () => {
+    const attemptId = "attempt-conflict-oversized";
+    const producerId = "producer-1";
+    // Same character count, different multi-byte characters -> identical JSON-wrapped
+    // byte length after truncation, but genuinely different original content.
+    const euroPayload = "€".repeat(8000);
+    const rupeePayload = "₹".repeat(8000);
+
+    const r1 = evidence.appendReviewFixActivityBatch({
+      attemptId, producerId,
+      events: [makeEvent({ attemptId, producerId, sequence: 0, payload: euroPayload, timestamp: 1_000 })],
+    });
+    expect(r1.stored).toBe(1);
+
+    const r2 = evidence.appendReviewFixActivityBatch({
+      attemptId, producerId,
+      events: [makeEvent({ attemptId, producerId, sequence: 0, payload: rupeePayload, timestamp: 2_000 })],
+    });
+    expect(r2.duplicates).toBe(0);
+    expect(r2.conflicts).toEqual([0]);
+    expect(r2.stored).toBe(0);
+    expect(getStreamRow(attemptId)?.conflict_at).not.toBeNull();
+
+    // Identical retry of the original oversized payload must still be byte-idempotent.
+    const r3 = evidence.appendReviewFixActivityBatch({
+      attemptId, producerId,
+      events: [makeEvent({ attemptId, producerId, sequence: 0, payload: euroPayload, timestamp: 1_000 })],
+    });
+    expect(r3.duplicates).toBe(1);
+    expect(r3.conflicts).toEqual([]);
+    expect(r3.stored).toBe(0);
+  });
+
+  it("sets the durable truncated_at marker even when the producer already flagged the oversized event as truncated", () => {
+    const attemptId = "attempt-pretruncated";
+    const producerId = "producer-1";
+    const oversized = "€".repeat(8000);
+
+    evidence.appendReviewFixActivityBatch({
+      attemptId, producerId,
+      events: [makeEvent({ attemptId, producerId, sequence: 0, payload: oversized, truncated: true })],
+    });
+
+    const rec = evidence.listReviewFixActivity(attemptId, { pageSize: 10 }).events[0];
+    expect(rec.payload).toBeNull();
+    expect(rec.truncated).toBe(true);
+    expect(getStreamRow(attemptId)?.truncated_at).not.toBeNull();
+  });
+
   it("rejects events with invalid attemptId/producerId/identity before persisting or counting against the cap", () => {
     const badAttempt = evidence.appendReviewFixActivityBatch({
       attemptId: "bad id with spaces", producerId: "producer-1", events: [],
@@ -302,6 +373,30 @@ describe("getReviewFixActivityGaps", () => {
     gaps = evidence.getReviewFixActivityGaps(attemptId, producerId);
     expect(gaps.ranges).toEqual([]);
     expect(gaps.tailComplete).toBe(true);
+  });
+
+  it("returns promptly for a sparse, very large final sequence instead of enumerating the range", () => {
+    const attemptId = "attempt-huge-final";
+    const producerId = "producer-1";
+    const hugeFinal = Number.MAX_SAFE_INTEGER - 1;
+
+    const appendStart = Date.now();
+    const appendResult = evidence.appendReviewFixActivityBatch({
+      attemptId, producerId,
+      events: [makeEvent({ attemptId, producerId, sequence: 0, payload: "only-event" })],
+      finalSequence: hugeFinal,
+    });
+    expect(Date.now() - appendStart).toBeLessThan(1_000);
+    expect(appendResult.finalSequenceConflict).toBe(false);
+    expect(appendResult.stored).toBe(1);
+
+    const start = Date.now();
+    const gaps = evidence.getReviewFixActivityGaps(attemptId, producerId);
+    expect(Date.now() - start).toBeLessThan(1_000);
+
+    expect(gaps.finalSequence).toBe(hugeFinal);
+    expect(gaps.ranges).toEqual([{ from: 1, to: hugeFinal }]);
+    expect(gaps.tailComplete).toBe(false);
   });
 });
 

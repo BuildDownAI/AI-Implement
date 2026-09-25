@@ -136,11 +136,11 @@ export interface ReviewFixActivityBatchResult {
   readonly tombstoned: boolean;
 }
 
-function buildStoredPayload(event: ReviewFixActivityEvent): { json: string; bytes: number; truncated: boolean } {
+function buildStoredPayload(event: ReviewFixActivityEvent): { json: string; bytes: number; truncated: boolean; truncatedByStorage: boolean } {
   const full = JSON.stringify({ payload: event.payload, truncated: event.truncated });
   const fullBytes = Buffer.byteLength(full, "utf8");
   if (fullBytes <= MAX_EVENT_BYTES) {
-    return { json: full, bytes: fullBytes, truncated: event.truncated };
+    return { json: full, bytes: fullBytes, truncated: event.truncated, truncatedByStorage: false };
   }
   const marker = JSON.stringify({
     payload: null,
@@ -148,7 +148,26 @@ function buildStoredPayload(event: ReviewFixActivityEvent): { json: string; byte
     truncationMarker: "review_fix_activity_event_exceeded_16384_bytes",
     originalBytes: fullBytes,
   });
-  return { json: marker, bytes: Buffer.byteLength(marker, "utf8"), truncated: true };
+  return { json: marker, bytes: Buffer.byteLength(marker, "utf8"), truncated: true, truncatedByStorage: true };
+}
+
+/**
+ * Hash of the original validated event's identity-independent content — used for the
+ * duplicate/conflict decision. Deliberately independent of `buildStoredPayload`'s lossy
+ * on-disk representation: two oversized payloads can produce byte-identical truncation
+ * markers (same JSON-wrapped length, different content) and must still be told apart.
+ */
+function hashOriginalEvent(event: ReviewFixActivityEvent): string {
+  return crypto.createHash("sha256").update(canonicalStringify({
+    attemptId: event.attemptId,
+    producerId: event.producerId,
+    sequence: event.sequence,
+    kind: event.kind,
+    cycle: event.cycle,
+    timestamp: event.timestamp,
+    payload: event.payload,
+    truncated: event.truncated,
+  })).digest("hex");
 }
 
 interface ProducerBookkeepingRow {
@@ -194,11 +213,12 @@ function refreshProducerBookkeeping(
     }
   }
 
-  const upperBound = finalSequence !== null ? Math.max(finalSequence, maxObserved) : maxObserved;
-  let gapDetected = false;
-  for (let i = 0; i <= upperBound; i++) {
-    if (!present.has(i)) { gapDetected = true; break; }
-  }
+  // A gap exists either within the stored rows (the contiguous run from 0 stops before
+  // the highest stored sequence) or in the tail beyond the highest stored sequence up to
+  // a recorded final marker. Deliberately does not loop over the [0, upperBound] range:
+  // `finalSequence` is attacker-controlled and can be up to Number.MAX_SAFE_INTEGER while
+  // only a handful of rows are actually stored, so that loop is an unbounded hang.
+  const gapDetected = highestContiguous !== maxObserved || (finalSequence !== null && finalSequence > maxObserved);
 
   db.prepare(`
     INSERT INTO review_fix_activity_producers
@@ -302,10 +322,15 @@ export function appendReviewFixActivityBatch(input: ReviewFixActivityBatchInput)
         continue;
       }
 
-      const { json, bytes, truncated } = buildStoredPayload(event);
-      if (truncated && !event.truncated) truncatedThisBatch = true;
+      const { json, bytes, truncatedByStorage } = buildStoredPayload(event);
+      if (truncatedByStorage) truncatedThisBatch = true;
 
-      const payloadHash = crypto.createHash("sha256").update(json).digest("hex");
+      // The dedup/conflict decision hashes the original validated event, not the
+      // (possibly truncated) stored JSON: two different oversized payloads can collapse
+      // into byte-identical truncation markers, which must never be treated as the same
+      // content. `payloadHash` doubles as the DB row's `payload_hash` column so the
+      // `trg_review_fix_activity_conflicting_replay` trigger applies the same rule.
+      const payloadHash = hashOriginalEvent(event);
 
       // Resolve duplicate/conflict against any already-durable row for this identity
       // *before* the cap check: a retry of already-stored content (or a genuine
@@ -485,23 +510,25 @@ export function getReviewFixActivityGaps(attemptId: string, producerId: string):
     };
   }
 
-  const present = new Set(rows.map((r) => r.sequence));
-  const maxObserved = rows[rows.length - 1].sequence;
-  const upperBound = finalSequence !== null ? Math.max(finalSequence, maxObserved) : maxObserved;
-
+  // Built from the sorted stored sequences directly — O(rows), never a loop over
+  // [0, upperBound]. `finalSequence` is attacker-controlled and can be an arbitrarily
+  // large safe integer while only a handful of rows are actually stored; looping over
+  // that range (as an earlier version did) lets one batch hang the server.
   const ranges: Array<{ from: number; to: number }> = [];
-  let gapStart: number | null = null;
-  for (let i = 0; i <= upperBound; i++) {
-    if (!present.has(i)) {
-      if (gapStart === null) gapStart = i;
-    } else if (gapStart !== null) {
-      ranges.push({ from: gapStart, to: i - 1 });
-      gapStart = null;
-    }
+  if (rows[0].sequence > 0) ranges.push({ from: 0, to: rows[0].sequence - 1 });
+  for (let i = 1; i < rows.length; i++) {
+    const prev = rows[i - 1].sequence;
+    const curr = rows[i].sequence;
+    if (curr > prev + 1) ranges.push({ from: prev + 1, to: curr - 1 });
   }
-  if (gapStart !== null) ranges.push({ from: gapStart, to: upperBound });
+  const maxObserved = rows[rows.length - 1].sequence;
+  if (finalSequence !== null && finalSequence > maxObserved) {
+    ranges.push({ from: maxObserved + 1, to: finalSequence });
+  }
 
-  return { ranges, finalSequence, tailComplete: finalSequence !== null && present.has(finalSequence) };
+  const tailComplete = finalSequence !== null && rows.some((r) => r.sequence === finalSequence);
+
+  return { ranges, finalSequence, tailComplete };
 }
 
 // ---------------------------------------------------------------------------
