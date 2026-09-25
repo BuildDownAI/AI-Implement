@@ -717,7 +717,13 @@ export async function handleRunnerResult(
           warn("clearWorkingState(operator_cancelled)", err);
         }
         if (job) {
-          updateJobStatus(job.id, "failed", "operator_cancelled");
+          // skipAdmissionRelease: true for the same reason the planning "completed" write
+          // above does — this callback is the runner's own self-report, posted from inside
+          // the still-running backend, not proof the GitHub Actions job / Fly machine /
+          // local container has actually exited (AII-783 review, third round, on PR #681).
+          // The reservation stays held for the matching Legacy monitor / stale-admission
+          // sweep to resolve once the backend is independently confirmed terminal.
+          updateJobStatus(job.id, "failed", "operator_cancelled", undefined, { skipAdmissionRelease: true });
           console.log(
             `[runner-callback] PR closed by operator — job ${job.id} (${claims.issueId}) marked operator_cancelled`,
           );

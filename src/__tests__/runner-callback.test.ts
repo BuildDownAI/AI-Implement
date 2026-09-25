@@ -956,6 +956,75 @@ describe("handleRunnerResult — implementation", () => {
     expect(log.getJobById(jobId)?.conclusion).toBe("operator_cancelled");
   });
 
+  // AII-783 review, fourth round, on PR #681: OPERATOR_CANCELLED is the runner's own
+  // self-report of the PR being closed mid-run — posted from inside the still-running
+  // backend, same as the planning "completed" callback above — not proof the GitHub
+  // Actions job / Fly machine / local container has actually exited. The admission
+  // reservation must stay held across this callback and only clear once the backend is
+  // independently confirmed terminal by the matching Legacy monitor / stale-admission sweep.
+  it("holds the admission reservation across an operator_cancelled implementation callback while the backend may still be running", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const admitted = dispatchAdmission.acquire({
+      dispatchId,
+      mappingKey: "ENG",
+      scope: { kind: "issue", issueScope: "ENG", issueId: "i" },
+      kind: "implementation",
+      backend: "github-actions",
+      lifecycleOwner: { kind: "legacy" },
+      cap: 1,
+    });
+    expect(admitted.ok).toBe(true);
+    log.appendLog({
+      issueId: "i",
+      issueIdentifier: "ENG-1",
+      issueTitle: "Implement it",
+      teamKey: "ENG",
+      repo: "o/r",
+      dispatchId,
+      executionMode: "github-actions",
+    });
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "failure",
+        failureCode: "OPERATOR_CANCELLED",
+        comments: [],
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider({ recordCalls: true })),
+    });
+    expect(res.status).toBe(200);
+    expect(log.getJobById(log.getJobByDispatchId(dispatchId)!.id)?.conclusion).toBe("operator_cancelled");
+
+    // Still reserved: a competing acquire for the same issue must not be admitted yet.
+    const competing = dispatchAdmission.acquire({
+      dispatchId: "competing-dispatch-operator-cancelled",
+      mappingKey: "ENG",
+      scope: { kind: "issue", issueScope: "ENG", issueId: "i" },
+      kind: "implementation",
+      backend: "github-actions",
+      lifecycleOwner: { kind: "legacy" },
+      cap: 1,
+    });
+    expect(competing.ok).toBe(false);
+    const held = dispatchAdmission.read(dispatchId);
+    expect(held?.releasedAt).toBeNull();
+
+    // Once the matching Legacy monitor independently confirms the backend terminated,
+    // it releases by owner/generation exactly as dispatch-admission.ts documents.
+    const released = dispatchAdmission.release(dispatchId, held!.lifecycleOwner, held!.generation, "finalized");
+    expect(released.status).toBe("released");
+    expect(dispatchAdmission.count("ENG")).toBe(0);
+  });
+
   it("writes runner_approved on implementation success with a PR URL (AII-460)", async () => {
     const { token, dispatchId } = runnerTokens.mintRunToken({
       issueId: "i-approved",
