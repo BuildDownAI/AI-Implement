@@ -1,0 +1,6 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "noEmit": true, "declaration": false },
+  "include": ["src/__tests__/report-job-completion.test.ts", "src/__tests__/reaper.test.ts"],
+  "exclude": []
+}

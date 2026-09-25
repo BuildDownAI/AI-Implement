@@ -5,11 +5,25 @@ import type { ProviderRegistry } from "./providers/registry.js";
 import type { RepoMapping } from "./config.js";
 import { recordReaperAction } from "./dedup.js";
 import { notifyReaperBurst } from "./notify.js";
+import { read as readAdmission } from "./dispatch-admission.js";
 import type { Job } from "./log.js";
 
 export const SWEEP_MACHINE_MAX_AGE_MS = 4 * 60 * 60 * 1000; // 4 hours
 const KG_REFRESH_BOOTSTRAP_DEADLINE_MS = 5 * 60 * 1000; // 5 minutes
 const TERMINAL_LIFECYCLE_STATES = new Set<IssueLifecycleState>(["completed", "cancelled"]);
+
+/**
+ * AII-791: before any reaper outcome action (a destroy, a status write, a ticket reset),
+ * read the row's immutable admission owner and skip entirely when it names a Restate
+ * attempt — Restate's own workflow owns confirming that attempt's termination and
+ * releasing its reservation, not the reaper. A job with no `dispatchId`, or no matching
+ * admission row (historical/unreserved dispatch), is unaffected — it keeps the existing
+ * Legacy handling this function guards.
+ */
+function isRestateOwnedJob(job: Job): boolean {
+  if (!job.dispatchId) return false;
+  return readAdmission(job.dispatchId)?.lifecycleOwner.kind === "restate";
+}
 
 export interface ReaperConfig {
   flySessionsToken: string | null;
@@ -100,6 +114,7 @@ async function sweepOrphanedKgRefreshJobs(
   const jobs = getInFlightKgRefreshJobs();
   for (const job of jobs) {
     if (job.executionMode === "github-actions") continue; // handled by monitorGitHubActionsJob
+    if (isRestateOwnedJob(job)) continue; // Restate finalizes its own attempts (AII-791)
 
     // Fly / local-Docker path below.
 
@@ -247,6 +262,10 @@ export async function sweepOrphanedMachines(
       if (!config.reaperDryRun) destroyedCount++;
       continue;
     }
+
+    // AII-791: the reaper never finalizes a Restate-owned attempt, even one that looks
+    // orphaned or stale from this row's own status.
+    if (isRestateOwnedJob(job)) continue;
 
     const isTerminal =
       job.status === "completed" || job.status === "review_failed" || job.status === "failed" || job.status === "timed_out";

@@ -8,16 +8,21 @@ import type * as BreakerModule from "../dispatch-breaker.js";
 import type * as ConfigModule from "../config.js";
 import type * as IndexModule from "../index.js";
 import type * as RegistryModule from "../providers/registry.js";
+import type * as DispatchAdmissionModule from "../dispatch-admission.js";
 import type { FailureRecord } from "../pipeline/failure-classification.js";
 
 // Integration coverage for BAC-27134 round-one item 7c: reportJobCompletion must not
 // let a transient terminal failure count toward the dispatch breaker (a provider outage
 // is the provider's problem, not the ticket's), while every other category still counts.
+//
+// AII-791 coverage (below): a runner callback's own terminal write must not, by itself,
+// release the admission reservation it holds — only a verified backend termination may.
 
 let dbPath: string;
 let dedup: typeof DedupModule;
 let log: typeof LogModule;
 let breaker: typeof BreakerModule;
+let dispatchAdmission: typeof DispatchAdmissionModule;
 let configModule: typeof ConfigModule;
 let indexModule: typeof IndexModule;
 let registryModule: typeof RegistryModule;
@@ -77,6 +82,7 @@ beforeEach(async () => {
   configModule = await import("../config.js");
   registryModule = await import("../providers/registry.js");
   indexModule = await import("../index.js");
+  dispatchAdmission = await import("../dispatch-admission.js");
   log.initLogTable();
   breaker.initDispatchBreakerTable();
   configModule.initMappingsTable();
@@ -128,5 +134,75 @@ describe("reportJobCompletion breaker integration (BAC-27134)", () => {
       .get("issue-crash", "implementation") as { consecutive_failures: number } | undefined;
     expect(row).toBeDefined();
     expect(row?.consecutive_failures).toBe(1);
+  });
+});
+
+// AII-791: a runner callback reports its own business outcome (success/failure) from
+// inside the still-running backend — that self-report is not proof the GHA run / Fly
+// machine / local container has actually exited. log.ts's updateJobStatus only releases
+// the admission reservation when the caller can vouch for verified termination
+// (skipAdmissionRelease unset); a callback-style write must pass skipAdmissionRelease:
+// true, exactly like the reaper/watchdog give-up paths already covered elsewhere.
+describe("admission reservation survives a callback-style terminal write (AII-791)", () => {
+  it("stays occupied when updateJobStatus is called with skipAdmissionRelease (backend still running)", async () => {
+    const dispatchId = "dispatch-callback-1";
+    const admitted = dispatchAdmission.acquire({
+      dispatchId,
+      mappingKey: "ENG",
+      scope: { kind: "issue", issueScope: "ENG", issueId: "issue-callback" },
+      kind: "implementation",
+      backend: "github-actions",
+      lifecycleOwner: { kind: "legacy" },
+      cap: 5,
+    });
+    expect(admitted.ok).toBe(true);
+    if (!admitted.ok) return;
+
+    const jobId = log.appendLog({
+      issueId: "issue-callback",
+      issueIdentifier: "BAC-3",
+      phase: "implementation",
+      dispatchId,
+      admissionGeneration: admitted.record.generation,
+    });
+
+    // Mirrors the runner callback's own write: it knows its business outcome, but has
+    // no way to confirm the GHA run itself has completed — skipAdmissionRelease: true.
+    log.updateJobStatus(jobId, "completed", "success", null, { skipAdmissionRelease: true });
+
+    const record = dispatchAdmission.read(dispatchId);
+    expect(record?.releasedAt).toBeNull();
+    expect(dispatchAdmission.count("ENG")).toBe(1);
+  });
+
+  it("releases once a caller vouches for verified termination (contrast case)", async () => {
+    const dispatchId = "dispatch-callback-2";
+    const admitted = dispatchAdmission.acquire({
+      dispatchId,
+      mappingKey: "ENG",
+      scope: { kind: "issue", issueScope: "ENG", issueId: "issue-callback-2" },
+      kind: "implementation",
+      backend: "github-actions",
+      lifecycleOwner: { kind: "legacy" },
+      cap: 5,
+    });
+    expect(admitted.ok).toBe(true);
+    if (!admitted.ok) return;
+
+    const jobId = log.appendLog({
+      issueId: "issue-callback-2",
+      issueIdentifier: "BAC-4",
+      phase: "implementation",
+      dispatchId,
+      admissionGeneration: admitted.record.generation,
+    });
+
+    // No skipAdmissionRelease: the caller here (e.g. the GHA monitor, having observed
+    // the run's own status as completed) vouches for verified termination.
+    log.updateJobStatus(jobId, "completed", "success");
+
+    const record = dispatchAdmission.read(dispatchId);
+    expect(record?.releasedAt).not.toBeNull();
+    expect(dispatchAdmission.count("ENG")).toBe(0);
   });
 });

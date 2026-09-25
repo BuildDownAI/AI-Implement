@@ -5,8 +5,21 @@ import { incrementStuckAttempts, updateJobStatus, getJobById } from "./log.js";
 import { deleteDispatched } from "./dedup.js";
 import { notifyStuckGiveUp } from "./notify.js";
 import { getInstallationToken } from "./github-app-auth.js";
+import { read as readAdmission } from "./dispatch-admission.js";
 
 export const STUCK_JOB_MAX_ATTEMPTS = 3;
+
+/**
+ * AII-791: before any watchdog outcome action (a stop, a status write, a dedup clear),
+ * read the row's immutable admission owner and skip entirely when it names a Restate
+ * attempt — Restate's own workflow owns confirming that attempt's termination and
+ * releasing its reservation, not the watchdog. A job with no `dispatchId`, or no
+ * matching admission row (historical/unreserved dispatch), is unaffected.
+ */
+function isRestateOwnedJob(job: Job): boolean {
+  if (!job.dispatchId) return false;
+  return readAdmission(job.dispatchId)?.lifecycleOwner.kind === "restate";
+}
 
 export interface StuckWatchdogConfig {
   githubAppId: string;
@@ -161,6 +174,8 @@ export async function remediateStuckJob(
   if (!job.issueId) return false;
   // kg-refresh jobs have their own outcome rail — never re-arm or clear dedup for them.
   if (job.phase === "kg-refresh") return false;
+  // Restate finalizes its own attempts — never re-arm or clear dedup for them (AII-791).
+  if (isRestateOwnedJob(job)) return false;
   // Re-read conclusion from DB: the runner callback may have set "operator_cancelled"
   // after the monitor tick started reading the job, so the passed-in job may be stale.
   const freshConclusionStuck = getJobById(job.id)?.conclusion;
@@ -259,6 +274,8 @@ export async function remediateFailedJob(
   if (!job.issueId) return;
   // kg-refresh jobs have their own outcome rail — never re-arm or clear dedup for them.
   if (job.phase === "kg-refresh") return;
+  // Restate finalizes its own attempts — never re-arm or clear dedup for them (AII-791).
+  if (isRestateOwnedJob(job)) return;
   // Re-read conclusion from DB: the runner callback may have set "operator_cancelled"
   // after the monitor tick started reading the job, so the passed-in job may be stale.
   const freshConclusion = getJobById(job.id)?.conclusion;

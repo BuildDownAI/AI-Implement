@@ -32,10 +32,18 @@ vi.mock("../notify.js", () => ({
   notifyReaperBurst: vi.fn(() => Promise.resolve()),
 }));
 
+// Default: no admission row for any dispatchId, so every existing test (none of which
+// cares about the Restate-owner fence) keeps exercising the pre-AII-791 code paths.
+// Restate-owner tests below override this per-case with mockReturnValueOnce.
+vi.mock("../dispatch-admission.js", () => ({
+  read: vi.fn(() => null),
+}));
+
 import { listMachines, destroyMachine } from "../fly-machines.js";
 import { getJobByMachineId, updateJobStatus, invalidateNonce, getInFlightKgRefreshJobs } from "../log.js";
 import { recordReaperAction } from "../dedup.js";
 import { notifyReaperBurst } from "../notify.js";
+import { read as readAdmission } from "../dispatch-admission.js";
 
 const TOKEN = "fly-test-token";
 const APP = "test-sessions-app";
@@ -403,6 +411,134 @@ describe("sweepOrphanedMachines — side effects skipped in dry-run", () => {
   });
 });
 
+// ---------- sweepOrphanedMachines — Restate-owned reservation fence (AII-791) ----------
+
+describe("sweepOrphanedMachines — Restate-owned reservation fence (AII-791)", () => {
+  function restateOwnedRecord(attemptId = "attempt-1") {
+    return { lifecycleOwner: { kind: "restate", attemptId } } as never;
+  }
+
+  const inflightJob = {
+    id: 2,
+    issueId: "issue-2",
+    issueIdentifier: "ENG-2",
+    issueTitle: "Another",
+    teamKey: "ENG",
+    repo: "org/repo",
+    dispatchedAt: Date.now() - 6 * 3600_000,
+    dispatchNumber: 2,
+    issueState: null,
+    runId: null,
+    status: "running" as const,
+    conclusion: null,
+    prUrl: null,
+    completedAt: null,
+    notifiedAt: null,
+    machineNonce: "nonce-abc",
+    executionMode: "fly-machines",
+    machineId: "m-aged",
+    runnerMode: "autonomous",
+    sessionImage: null,
+    phase: "implementation",
+    contract: null,
+    groupingParent: false,
+    approved: false,
+    failure: null,
+    failureCommentedAt: null,
+  };
+
+  it("does not destroy or finalize a Restate-owned max-age-exceeded machine", async () => {
+    const restateJob = { ...inflightJob, id: 30, dispatchId: "disp-restate-1" };
+    const oldMachine = makeMachine("m-restate-aged", {
+      created_at: new Date(Date.now() - 5 * 3600_000).toISOString(),
+    });
+    vi.mocked(listMachines).mockResolvedValueOnce([oldMachine] as never);
+    vi.mocked(getJobByMachineId).mockReturnValue(restateJob);
+    vi.mocked(readAdmission).mockReturnValueOnce(restateOwnedRecord());
+    const helpers = makeHelpers();
+
+    await sweepOrphanedMachines(makeConfig(false), helpers);
+
+    expect(destroyMachine).not.toHaveBeenCalled();
+    expect(updateJobStatus).not.toHaveBeenCalled();
+    expect(invalidateNonce).not.toHaveBeenCalled();
+    expect(helpers.resetTicket).not.toHaveBeenCalled();
+    expect(recordReaperAction).not.toHaveBeenCalled();
+  });
+
+  it("does not destroy or finalize a young, in-flight Restate-owned machine even though it resolves an admission row", async () => {
+    const restateJob = { ...inflightJob, id: 31, dispatchId: "disp-restate-2" };
+    const machine = makeMachine("m-restate-terminal");
+    vi.mocked(listMachines).mockResolvedValueOnce([machine] as never);
+    vi.mocked(getJobByMachineId).mockReturnValue(restateJob);
+    vi.mocked(readAdmission).mockReturnValueOnce(restateOwnedRecord());
+
+    await sweepOrphanedMachines(makeConfig(false), makeHelpers());
+
+    expect(destroyMachine).not.toHaveBeenCalled();
+    expect(updateJobStatus).not.toHaveBeenCalled();
+    expect(invalidateNonce).not.toHaveBeenCalled();
+  });
+
+  it("does not destroy a Restate-owned stale-terminal-job machine", async () => {
+    const restateTerminalJob = {
+      id: 32,
+      issueId: "issue-restate",
+      issueIdentifier: "ENG-9",
+      issueTitle: "Restate-owned",
+      teamKey: "ENG",
+      repo: "org/repo",
+      dispatchedAt: Date.now() - 3600_000,
+      dispatchId: "disp-restate-3",
+      dispatchNumber: 1,
+      issueState: null,
+      runId: null,
+      status: "completed" as const,
+      conclusion: "success",
+      prUrl: null,
+      completedAt: Date.now() - 1800_000,
+      notifiedAt: null,
+      machineNonce: null,
+      executionMode: "fly-machines",
+      machineId: "m-restate-stale",
+      runnerMode: "autonomous",
+      sessionImage: null,
+      phase: "implementation",
+      contract: null,
+      groupingParent: false,
+      approved: false,
+      failure: null,
+      failureCommentedAt: null,
+    };
+    const machine = makeMachine("m-restate-stale");
+    vi.mocked(listMachines).mockResolvedValueOnce([machine] as never);
+    vi.mocked(getJobByMachineId).mockReturnValue(restateTerminalJob);
+    vi.mocked(readAdmission).mockReturnValueOnce(restateOwnedRecord());
+
+    await sweepOrphanedMachines(makeConfig(false), makeHelpers());
+
+    expect(destroyMachine).not.toHaveBeenCalled();
+    expect(recordReaperAction).not.toHaveBeenCalled();
+  });
+
+  it("still destroys a Legacy-owned max-age-exceeded machine (regression: owner check does not over-fence)", async () => {
+    const legacyJob = { ...inflightJob, id: 33, dispatchId: "disp-legacy-1" };
+    const oldMachine = makeMachine("m-legacy-aged", {
+      created_at: new Date(Date.now() - 5 * 3600_000).toISOString(),
+    });
+    vi.mocked(listMachines).mockResolvedValueOnce([oldMachine] as never);
+    vi.mocked(getJobByMachineId).mockReturnValue(legacyJob);
+    vi.mocked(readAdmission).mockReturnValueOnce({ lifecycleOwner: { kind: "legacy" } } as never);
+    vi.mocked(destroyMachine).mockResolvedValueOnce(undefined);
+    const helpers = makeHelpers();
+
+    await sweepOrphanedMachines(makeConfig(false), helpers);
+
+    expect(destroyMachine).toHaveBeenCalledWith(TOKEN, APP, "m-legacy-aged");
+    expect(updateJobStatus).toHaveBeenCalledWith(legacyJob.id, "timed_out", "machine_max_age_sweep");
+  });
+});
+
 // ---------- sweepOrphanedMachines — skips destroyed machines ----------
 
 describe("sweepOrphanedMachines — skips destroyed machines", () => {
@@ -713,6 +849,24 @@ describe("sweepOrphanedMachines — kg-refresh machine-absent rule", () => {
     // kg-refresh machine absent — failKgRefreshMachine called
     expect(helpers.failKgRefreshMachine).toHaveBeenCalledOnce();
     expect(helpers.failKgRefreshMachine).toHaveBeenCalledWith(kgRefreshJob);
+  });
+
+  // AII-791: kg-refresh dispatches never spend admission capacity in practice, but the
+  // owner fence still applies uniformly to any row carrying a dispatchId — a Restate-owned
+  // kg-refresh row (however unlikely today) must not be closed out by this sweep either.
+  it("does not call failKgRefreshMachine for a Restate-owned kg-refresh row (owner fence)", async () => {
+    vi.mocked(listMachines).mockResolvedValueOnce([] as never);
+    vi.mocked(getJobByMachineId).mockReturnValue(undefined);
+    vi.mocked(getInFlightKgRefreshJobs).mockReturnValue([kgRefreshJob]);
+    vi.mocked(readAdmission).mockReturnValueOnce({
+      lifecycleOwner: { kind: "restate", attemptId: "attempt-kg" },
+    } as never);
+    const helpers = makeHelpers();
+
+    await sweepOrphanedMachines(makeConfig(false), helpers);
+
+    expect(helpers.failKgRefreshMachine).not.toHaveBeenCalled();
+    expect(recordReaperAction).not.toHaveBeenCalled();
   });
 });
 
