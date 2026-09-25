@@ -52,6 +52,7 @@ import { getDb } from "./dedup.js";
 import { isDeployHeld } from "./deploy-hold.js";
 import { getMappings, resolvePrDispatchBudget, type RepoMapping } from "./config.js";
 import { acceptDelivery } from "./review-fix-inbox.js";
+import { unprocessedOpenReviewFindings } from "./review-fix-pending.js";
 import {
   acquire as acquireDispatchAdmission,
   release as releaseDispatchAdmission,
@@ -120,13 +121,14 @@ function findMappingEntry(repository: string): { teamKey: string; mapping: RepoM
 /** Deterministic identity for "this exact admission request" — content, not a
  *  caller-supplied key (the port carries none). Two calls with the same scope,
  *  task text, and finding versions derive the same id every time. */
-function deriveContentDispatchId(scope: ScopedPrIdentity, taskText: string, findings: readonly ReviewFixFindingVersion[]): string {
+function deriveContentDispatchId(scope: ScopedPrIdentity, taskText: string, findings: readonly ReviewFixFindingVersion[], queueCursor?: { queueId: number; eventId: number }): string {
   const material = JSON.stringify([
     scope.installationId,
     scope.repository,
     scope.prNumber,
     taskText,
     findings.map((f) => [f.findingKey, f.version]),
+    queueCursor ? [queueCursor.queueId, queueCursor.eventId] : null,
   ]);
   return `reviewfix-${createHash("sha256").update(material).digest("hex")}`;
 }
@@ -188,13 +190,31 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
       // not whether an already-prepared attempt may be handed back; checking it
       // first would leak the live reservation/budget slot on retry.
       const findings = request.feedback.findings.slice(0, MAX_REVIEW_FIX_FINDING_VERSIONS);
-      const base = deriveContentDispatchId(request.scope, request.feedback.taskText, findings);
+      const cursor = request.feedback.queueCursor;
+      const base = deriveContentDispatchId(request.scope, request.feedback.taskText, findings, cursor);
       const { dispatchId, replay } = resolveDispatchId(db, base);
       if (replay) {
         return { status: "prepared", attempt: toPrepared(replay) };
       }
       if (isDeployHeld()) {
         return { status: "deferred", reason: "paused" };
+      }
+
+      if (cursor) {
+        const queue = db.prepare(`
+          SELECT id FROM review_fix_queue WHERE id = ? AND repo = ? AND pr_number = ? AND status = 'pending'
+        `).get(cursor.queueId, request.scope.repository, request.scope.prNumber);
+        const newest = db.prepare("SELECT MAX(id) AS id FROM review_fix_events WHERE queue_id = ?")
+          .get(cursor.queueId) as { id: number | null };
+        if (!queue || newest.id === null || newest.id < cursor.eventId) {
+          return { status: "deferred", reason: "occupied" };
+        }
+        const available = new Set(unprocessedOpenReviewFindings(request.scope).map(
+          (finding) => JSON.stringify([finding.findingKey, finding.revision]),
+        ));
+        if (findings.some((finding) => !available.has(JSON.stringify([finding.findingKey, finding.version])))) {
+          return { status: "deferred", reason: "occupied" };
+        }
       }
 
       const mappingEntry = findMappingEntry(request.scope.repository);
@@ -206,7 +226,7 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
       const now = Date.now();
       const issueId = `${request.scope.repository}#${request.scope.prNumber}`;
       const deadlineAt = now + (request.jobTimeoutMinutes + REVIEW_FIX_DEADLINE_BUFFER_MINUTES) * 60_000;
-      const taskSnapshotJson = JSON.stringify({ taskText: request.feedback.taskText });
+      const taskSnapshotJson = JSON.stringify({ taskText: request.feedback.taskText, queueCursor: cursor ?? null });
       const findingVersionsJson = JSON.stringify(findings);
 
       const decision = acquireDispatchAdmission(
@@ -256,6 +276,20 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
 
       if (!decision.ok) {
         return { status: "deferred", reason: mapDeferReason(decision.reason) };
+      }
+
+      if (cursor) {
+        // This executes in the same transaction as the reservation and attempt
+        // snapshot. A newer event or an overflow finding remains pending.
+        const newest = db.prepare("SELECT MAX(id) AS id FROM review_fix_events WHERE queue_id = ?")
+          .get(cursor.queueId) as { id: number | null };
+        const overflow = unprocessedOpenReviewFindings(request.scope).length > 0;
+        if (newest.id === cursor.eventId && !overflow) {
+          db.prepare(`
+            UPDATE review_fix_queue SET status = 'dispatched', dispatched_at = ?, updated_at = ?
+            WHERE id = ? AND status = 'pending'
+          `).run(now, now, cursor.queueId);
+        }
       }
 
       const row = db.prepare("SELECT * FROM review_fix_attempts WHERE dispatch_id = ?").get(dispatchId) as AttemptRow;

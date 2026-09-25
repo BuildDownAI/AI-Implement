@@ -19,6 +19,8 @@ import type * as DedupModule from "../dedup.js";
 import type * as ConfigModule from "../config.js";
 import type * as StoreModule from "../review-fix-attempt-store.js";
 import type * as LedgerModule from "../review-ledger-store.js";
+import type * as QueueModule from "../review-fix-queue.js";
+import type * as PendingModule from "../review-fix-pending.js";
 import type { ReviewFixAdmissionRequest, ReviewFixAttemptStorePort } from "../review-fix-ports.js";
 import type { ReviewFixResultMetadataV1, ScopedPrIdentity } from "../review-fix-contract.js";
 import type { RepoMapping } from "../config.js";
@@ -28,6 +30,8 @@ let dedup: typeof DedupModule;
 let config: typeof ConfigModule;
 let storeModule: typeof StoreModule;
 let ledger: typeof LedgerModule;
+let queue: typeof QueueModule;
+let pending: typeof PendingModule;
 
 beforeEach(async () => {
   vi.resetModules();
@@ -40,6 +44,8 @@ beforeEach(async () => {
   config = await import("../config.js");
   storeModule = await import("../review-fix-attempt-store.js");
   ledger = await import("../review-ledger-store.js");
+  queue = await import("../review-fix-queue.js");
+  pending = await import("../review-fix-pending.js");
 });
 
 afterEach(() => {
@@ -148,6 +154,55 @@ describe("SqliteReviewFixAttemptStore: satisfies the port without unsafe casts",
 });
 
 describe("SqliteReviewFixAttemptStore: admission", () => {
+  it("consumes exactly one queue snapshot while preserving overflow and new finding revisions", async () => {
+    seedMapping();
+    const queueId = queue.enqueueReviewFix({
+      issueId: "issue-42", issueIdentifier: "AII-42", repo: SCOPE.repository,
+      prNumber: SCOPE.prNumber, reason: "review_feedback", sourceEventId: "event-1",
+    });
+    const records = Array.from({ length: 35 }, (_, i) => ({
+      repo: SCOPE.repository, prNumber: SCOPE.prNumber,
+      source: "github-review-thread" as const, severity: "medium" as const,
+      body: `finding ${i}`, path: `file${i}.ts`, line: i,
+    }));
+    for (const finding of records) ledger.upsertReviewFinding(finding);
+    const store = new storeModule.SqliteReviewFixAttemptStore();
+    const firstFeedback = pending.loadPendingReviewFixFeedback(SCOPE, "issue text");
+    expect(firstFeedback?.findings).toHaveLength(30);
+    const first = await store.admit(admissionRequest({ feedback: firstFeedback! }));
+    if (first.status !== "prepared") throw new Error("expected prepared");
+    expect(queue.getPendingReviewFixes().map((item) => item.id)).toContain(queueId);
+
+    // Re-reporting an included finding increments its version. It must join
+    // the five overflow findings in the next attempt after exact-owner release.
+    ledger.upsertReviewFinding(records[0]);
+    await store.releaseOwner(first.attempt.owner, "finalized");
+    const secondFeedback = pending.loadPendingReviewFixFeedback(SCOPE, "issue text");
+    expect(secondFeedback?.findings).toHaveLength(6);
+    expect(secondFeedback?.findings).toContainEqual({
+      findingKey: first.attempt.findings[0].findingKey, version: 2,
+    });
+    const second = await store.admit(admissionRequest({ feedback: secondFeedback! }));
+    expect(second.status).toBe("prepared");
+    expect(queue.getPendingReviewFixes().map((item) => item.id)).not.toContain(queueId);
+  });
+
+  it("defers a stale queue snapshot after a finding revision changes before admission", async () => {
+    seedMapping();
+    queue.enqueueReviewFix({ issueId: "issue-42", issueIdentifier: "AII-42", repo: SCOPE.repository,
+      prNumber: SCOPE.prNumber, reason: "review_feedback", sourceEventId: "event-1" });
+    const finding = { repo: SCOPE.repository, prNumber: SCOPE.prNumber,
+      source: "github-review-thread" as const, severity: "medium" as const,
+      body: "changed finding", path: "file.ts", line: 1 };
+    ledger.upsertReviewFinding(finding);
+    const oldFeedback = pending.loadPendingReviewFixFeedback(SCOPE, null)!;
+    ledger.upsertReviewFinding(finding);
+    const store = new storeModule.SqliteReviewFixAttemptStore();
+    expect(await store.admit(admissionRequest({ feedback: oldFeedback }))).toEqual({ status: "deferred", reason: "occupied" });
+    expect(queue.getPendingReviewFixes()).toHaveLength(1);
+    expect((dedup.getDb().prepare("SELECT COUNT(*) AS n FROM review_fix_attempts").get() as { n: number }).n).toBe(0);
+  });
+
   it("prepares a reservation, deadline, and exactly one budget entry", async () => {
     seedMapping();
     const store = new storeModule.SqliteReviewFixAttemptStore();
