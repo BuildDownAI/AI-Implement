@@ -17,6 +17,7 @@ import { SensitiveFilesError } from "./pipeline/sensitive-files.js";
 import { OperatorCancelledError } from "./pipeline/operator-cancelled.js";
 import { classifyThrown, isFailureRecord } from "./pipeline/failure-classification.js";
 import { decodeRunConfig, type RunConfigV1 } from "./run-config.js";
+import type { ReviewFixMetadataV1 } from "./review-fix-contract.js";
 import { DEFAULT_RETRY_POLICY, normalizeRetryPolicy, type RetryPolicy } from "./pipeline/retry-backoff.js";
 import { writeRunAutopsy, writeRunStats } from "./run-autopsy.js";
 import { parsePlanningBlock } from "./planning-block.js";
@@ -270,6 +271,10 @@ export interface ResolvedRunnerInputs {
    *  not validate it, so this is the runner-side guard. Defaults to DEFAULT_RETRY_POLICY
    *  when absent or invalid — there is no legacy-env equivalent. */
   retryPolicy: RetryPolicy;
+  /** Restate review-fix pilot attempt identity (from run_config.reviewFix, AII-776). Undefined
+   *  on Legacy (non-pilot) dispatches and always undefined on the legacy flat-env path — there
+   *  is no env-var equivalent. Carriage only: no downstream pipeline seam reads this yet. */
+  reviewFix: ReviewFixMetadataV1 | undefined;
 }
 
 function parseEnvInt(raw: string | undefined, name: string): number | undefined {
@@ -372,6 +377,7 @@ function inputsFromConfig(cfg: RunConfigV1, env: NodeJS.ProcessEnv): ResolvedRun
     logLevel: resolveLogLevel(env.AI_IMPLEMENT_LOG_LEVEL),
     groupingParent: cfg.groupingParent === true,
     retryPolicy: normalizeRetryPolicy(cfg.retryPolicy),
+    reviewFix: cfg.reviewFix,
   };
 }
 
@@ -453,6 +459,7 @@ export function resolveRunnerInputs(env: NodeJS.ProcessEnv): ResolvedRunnerInput
     logLevel: resolveLogLevel(env.AI_IMPLEMENT_LOG_LEVEL),
     groupingParent: env.AI_IMPLEMENT_GROUPING_PARENT === "true",
     retryPolicy: { ...DEFAULT_RETRY_POLICY },
+    reviewFix: undefined,
   };
 }
 
