@@ -413,3 +413,215 @@ export function release(
     .run(Date.now(), reason, dispatchId, encodeOwner(owner), generation);
   return result.changes > 0 ? { status: "released" } : { status: "not_owner" };
 }
+
+/**
+ * Convenience release for a caller that has only the `dispatchId` — not the `owner`/
+ * `generation` `release` requires — because it observes termination well after the
+ * reservation was made (a monitor poll, a runner callback, an admin action, days of
+ * wall-clock apart from `acquire`). Reads the current record and releases it if still
+ * active; a no-op, never an error, when no reservation exists for this id or it is
+ * already released. That covers every dispatch kind that never calls `acquire` in the
+ * first place (gap-fill/gap-analysis stay on the legacy `canDispatch` path, kg-refresh
+ * never spends capacity) — their dispatch ids simply have no row to release.
+ */
+export function releaseByDispatchId(
+  dispatchId: string,
+  reason: DispatchAdmissionReleaseReason,
+): DispatchAdmissionReleaseOutcome {
+  const record = read(dispatchId);
+  if (!record || record.releasedAt !== null) return { status: "not_owner" };
+  return release(record.dispatchId, record.lifecycleOwner, record.generation, reason);
+}
+
+/** Reservations older than this with no confirmed release are swept — the safety net
+ *  for "a committed reservation whose launch response or process was lost" (a crash
+ *  between `acquire` returning and the caller's own `appendLog`, so no `dispatch_log`
+ *  row ever exists for `releaseByDispatchId` to key off), and the eventual backstop for
+ *  a reservation `updateJobStatus` deliberately left held pending confirmed termination
+ *  (AII-783 review: reaper/stuck-watchdog give-up paths that cannot vouch for the
+ *  backend actually being dead). Generous relative to every job timeout in the codebase
+ *  (GHA's default 90 min job timeout, Fly/local's FLY_MACHINE_TIMEOUT_MS, and the
+ *  stuck-watchdog's own bounded retries on top of that) so this never races a
+ *  legitimately long-running attempt.
+ *
+ *  Age alone is never proof of termination (AII-783 review on PR #681) — this module has
+ *  no network access and no knowledge of GHA/Fly/local backend state, so `sweepStaleAdmissions`
+ *  requires the caller to vouch for each candidate via `confirmTerminated` before a row is
+ *  released; age only selects which rows are even considered. */
+export const DEFAULT_ADMISSION_SWEEP_MAX_AGE_MS = 6 * 60 * 60 * 1000; // 6 hours
+
+export interface StaleAdmissionCandidate {
+  readonly dispatchId: string;
+  readonly mappingKey: string;
+  readonly backend: DispatchAdmissionBackend;
+  readonly lifecycleOwner: LifecycleOwner;
+  readonly ageMs: number;
+}
+
+export interface StaleAdmissionSweepResult {
+  readonly dispatchId: string;
+  readonly mappingKey: string;
+  readonly ageMs: number;
+}
+
+/**
+ * Age-based reconciliation sweep, mirroring reaper.ts's own SWEEP_MACHINE_MAX_AGE_MS
+ * pattern: candidate rows are every reservation still unreleased past `maxAgeMs`,
+ * regardless of `lifecycleOwner` or whether a matching `dispatch_log` row was ever
+ * written. Intended to run once per poll cycle alongside `sweepOrphanedMachines`.
+ *
+ * A candidate is only released once `confirmTerminated` resolves `true` for it — the
+ * caller is expected to check the actual backend (GHA run status, Fly machine state,
+ * local container state) rather than infer death from age. A candidate whose backend
+ * cannot be confirmed dead (still running, unknown, or the check itself throws) stays
+ * reserved: this function propagates the uncertainty rather than resolving it in the
+ * caller's favor, so a still-running/unknown attempt is never turned into free capacity.
+ * Returns the reservations actually released (a row that raced a legitimate release
+ * between the read and this sweep's own `release` call is excluded, not double-counted).
+ */
+export async function sweepStaleAdmissions(
+  confirmTerminated: (candidate: StaleAdmissionCandidate) => Promise<boolean>,
+  maxAgeMs: number = DEFAULT_ADMISSION_SWEEP_MAX_AGE_MS,
+): Promise<StaleAdmissionSweepResult[]> {
+  const db = getDb();
+  const cutoff = Date.now() - maxAgeMs;
+  const rows = db
+    .prepare("SELECT * FROM dispatch_admissions WHERE released_at IS NULL AND created_at < ?")
+    .all(cutoff) as Row[];
+  const released: StaleAdmissionSweepResult[] = [];
+  for (const row of rows) {
+    const candidate: StaleAdmissionCandidate = {
+      dispatchId: row.dispatch_id,
+      mappingKey: row.mapping_key,
+      backend: row.backend as DispatchAdmissionBackend,
+      lifecycleOwner: decodeOwner(row.lifecycle_owner),
+      ageMs: Date.now() - row.created_at,
+    };
+    let confirmed: boolean;
+    try {
+      confirmed = await confirmTerminated(candidate);
+    } catch (err) {
+      // A failed reconciliation check is exactly the uncertain case this function must
+      // hold, not release — never let a thrown error read as proof of termination.
+      console.error(`[admission] confirmTerminated threw for dispatch=${candidate.dispatchId}:`, err);
+      confirmed = false;
+    }
+    if (!confirmed) continue;
+    const outcome = release(row.dispatch_id, decodeOwner(row.lifecycle_owner), row.generation, "deadline_exceeded");
+    if (outcome.status === "released") {
+      released.push({ dispatchId: row.dispatch_id, mappingKey: row.mapping_key, ageMs: candidate.ageMs });
+    }
+  }
+  return released;
+}
+
+/** `updateJobStatus`'s terminal-conclusion values that are written with
+ *  `skipAdmissionRelease: true` — the callback's own self-report is not proof the backend
+ *  has exited, so the write deliberately leaves the reservation held (see `log.ts`'s
+ *  `updateJobStatus` and `runner-callback.ts`'s planning/`operator_cancelled` branches). */
+const TERMINAL_CALLBACK_CONCLUSIONS = ["planning_callback", "operator_cancelled"] as const;
+
+export interface TerminalCallbackAdmissionResult {
+  readonly dispatchId: string;
+  readonly mappingKey: string;
+  readonly conclusion: (typeof TERMINAL_CALLBACK_CONCLUSIONS)[number];
+}
+
+interface TerminalCallbackCandidateRow {
+  dispatch_id: string;
+  mapping_key: string;
+  backend: string;
+  lifecycle_owner: string;
+  generation: number;
+  created_at: number;
+  conclusion: string;
+}
+
+/** operator_cancelled is a human decision surfaced through the runner's self-report, not a
+ *  deadline; planning_callback is the ordinary end of a planning run. Neither is the
+ *  age-based "deadline_exceeded" `sweepStaleAdmissions` uses. */
+function releaseReasonForConclusion(conclusion: string): DispatchAdmissionReleaseReason {
+  return conclusion === "operator_cancelled" ? "cancelled" : "finalized";
+}
+
+/**
+ * Per-poll companion to `sweepStaleAdmissions` for the two terminal conclusions above
+ * (AII-783 review, third round, on PR #681). Both `planning_callback` and
+ * `operator_cancelled` are written by `updateJobStatus` with `skipAdmissionRelease: true`
+ * because the callback's own self-report — posted from inside the still-running backend —
+ * is not proof of termination, but that same write also drops the job out of
+ * `getInFlightJobs()`'s `dispatched`/`running` set, so the ordinary per-poll GHA/Fly/local
+ * monitor never looks at it again. `planning_callback` has a companion fast path
+ * (`tryFastReleasePlanningAdmission`) that runs once, inline, right after the callback —
+ * but that check usually races a backend that is still shutting down, and
+ * `operator_cancelled` has no fast check at all. Left alone, only `sweepStaleAdmissions`'s
+ * 6-hour age floor would eventually notice, stranding issue/team capacity for hours behind
+ * a run that in fact finished in minutes.
+ *
+ * Eligibility carries no age floor of its own: a targeted join — unreleased
+ * `dispatch_admissions` rows whose `dispatch_id` matches a `dispatch_log` row already
+ * carrying one of the two conclusions above — re-evaluated fresh on every call, rather
+ * than scanning every active reservation the way an age sweep must. Each candidate is
+ * independently confirmed dead through the same `confirmTerminated` oracle
+ * `sweepStaleAdmissions` uses before release; a still-running, unknown, or throwing check
+ * leaves the reservation held exactly as `skipAdmissionRelease` left it. Idempotent: a
+ * `dispatch_id` already released — by the planning fast path, a prior poll's call to this
+ * function, or the stale-admission sweep — simply has no unreleased row left to match.
+ */
+export async function reconcileTerminalCallbackAdmissions(
+  confirmTerminated: (candidate: StaleAdmissionCandidate) => Promise<boolean>,
+): Promise<TerminalCallbackAdmissionResult[]> {
+  const db = getDb();
+  const placeholders = TERMINAL_CALLBACK_CONCLUSIONS.map(() => "?").join(", ");
+  const rows = db
+    .prepare(
+      `SELECT da.dispatch_id AS dispatch_id, da.mapping_key AS mapping_key, da.backend AS backend,
+              da.lifecycle_owner AS lifecycle_owner, da.generation AS generation,
+              da.created_at AS created_at, dl.conclusion AS conclusion
+       FROM dispatch_admissions da
+       JOIN dispatch_log dl ON dl.dispatch_id = da.dispatch_id
+           AND dl.admission_generation = da.generation
+       WHERE da.released_at IS NULL
+         AND dl.status IN ('completed', 'failed')
+         AND dl.conclusion IN (${placeholders})`,
+    )
+    .all(...TERMINAL_CALLBACK_CONCLUSIONS) as TerminalCallbackCandidateRow[];
+
+  const results: TerminalCallbackAdmissionResult[] = [];
+  for (const row of rows) {
+    const candidate: StaleAdmissionCandidate = {
+      dispatchId: row.dispatch_id,
+      mappingKey: row.mapping_key,
+      backend: row.backend as DispatchAdmissionBackend,
+      lifecycleOwner: decodeOwner(row.lifecycle_owner),
+      ageMs: Date.now() - row.created_at,
+    };
+    let confirmed: boolean;
+    try {
+      confirmed = await confirmTerminated(candidate);
+    } catch (err) {
+      // Same rule as sweepStaleAdmissions: a failed check is uncertain, not proof of
+      // termination — never release on a throw.
+      console.error(`[admission] confirmTerminated threw for dispatch=${candidate.dispatchId}:`, err);
+      confirmed = false;
+    }
+    if (!confirmed) continue;
+    // The backend check awaited above can race a release and reacquire of this same
+    // dispatch ID. Release only the generation observed before the check; a stale
+    // terminal result must not clear its replacement reservation.
+    const outcome = release(
+      row.dispatch_id,
+      candidate.lifecycleOwner,
+      row.generation,
+      releaseReasonForConclusion(row.conclusion),
+    );
+    if (outcome.status === "released") {
+      results.push({
+        dispatchId: row.dispatch_id,
+        mappingKey: row.mapping_key,
+        conclusion: row.conclusion as TerminalCallbackAdmissionResult["conclusion"],
+      });
+    }
+  }
+  return results;
+}

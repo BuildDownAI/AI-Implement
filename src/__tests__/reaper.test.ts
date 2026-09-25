@@ -137,21 +137,36 @@ describe("safeDestroyMachine", () => {
     );
   });
 
-  it("swallows 404 errors in live mode", async () => {
+  it("swallows 404 errors in live mode and reports the machine confirmed gone", async () => {
     vi.mocked(destroyMachine).mockRejectedValueOnce(new Error("404 not found"));
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
     const config = makeConfig(false);
 
-    await expect(safeDestroyMachine(config, "gone-machine", "orphan")).resolves.toBeUndefined();
+    await expect(safeDestroyMachine(config, "gone-machine", "orphan")).resolves.toBe(true);
     expect(consoleError).not.toHaveBeenCalled();
   });
 
-  it("returns early when token is missing", async () => {
+  it("returns early (not confirmed) when token is missing", async () => {
     const config: ReaperConfig = { ...makeConfig(false), flySessionsToken: null };
 
-    await safeDestroyMachine(config, "machine-abc", "orphan");
+    await expect(safeDestroyMachine(config, "machine-abc", "orphan")).resolves.toBe(false);
 
     expect(destroyMachine).not.toHaveBeenCalled();
+  });
+
+  it("resolves true on a successful live destroy", async () => {
+    vi.mocked(destroyMachine).mockResolvedValueOnce(undefined);
+    const config = makeConfig(false);
+
+    await expect(safeDestroyMachine(config, "machine-abc", "orphan")).resolves.toBe(true);
+  });
+
+  it("resolves false when destroy fails with a non-404 error", async () => {
+    vi.mocked(destroyMachine).mockRejectedValueOnce(new Error("500 internal error"));
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const config = makeConfig(false);
+
+    await expect(safeDestroyMachine(config, "machine-abc", "orphan")).resolves.toBe(false);
   });
 });
 
@@ -342,6 +357,49 @@ describe("sweepOrphanedMachines — side effects skipped in dry-run", () => {
     expect(updateJobStatus).toHaveBeenCalledWith(inflight.id, "timed_out", "machine_max_age_sweep");
     expect(invalidateNonce).toHaveBeenCalledWith(inflight.id);
     expect(helpers.resetTicket).toHaveBeenCalledWith(inflight);
+  });
+
+  // AII-783 gap-fill (review finding on PR #681): a destroy call that fails (and isn't a
+  // 404-already-gone) must not read as verified termination — log.ts's updateJobStatus
+  // only releases the admission reservation when skipAdmissionRelease is unset/false, so
+  // this uncertain case must be written with it set.
+  it("marks skipAdmissionRelease when the machine destroy fails with a non-404 error (max-age rule)", async () => {
+    const oldMachine = makeMachine("m-aged", {
+      created_at: new Date(Date.now() - 5 * 3600_000).toISOString(),
+    });
+    vi.mocked(listMachines).mockResolvedValueOnce([oldMachine] as never);
+    vi.mocked(getJobByMachineId).mockReturnValue(inflight);
+    vi.mocked(destroyMachine).mockRejectedValueOnce(new Error("500 internal error"));
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const helpers = makeHelpers();
+
+    await sweepOrphanedMachines(makeConfig(false), helpers);
+
+    expect(updateJobStatus).toHaveBeenCalledWith(
+      inflight.id,
+      "timed_out",
+      "machine_max_age_sweep",
+      undefined,
+      { skipAdmissionRelease: true },
+    );
+    // The job is still finalized (ticket reset, nonce invalidated) — only the admission
+    // release is withheld, not the rest of the sweep's cleanup.
+    expect(invalidateNonce).toHaveBeenCalledWith(inflight.id);
+    expect(helpers.resetTicket).toHaveBeenCalledWith(inflight);
+  });
+
+  it("does not mark skipAdmissionRelease when the machine destroy 404s (already gone)", async () => {
+    const oldMachine = makeMachine("m-aged", {
+      created_at: new Date(Date.now() - 5 * 3600_000).toISOString(),
+    });
+    vi.mocked(listMachines).mockResolvedValueOnce([oldMachine] as never);
+    vi.mocked(getJobByMachineId).mockReturnValue(inflight);
+    vi.mocked(destroyMachine).mockRejectedValueOnce(new Error("404 not found"));
+    const helpers = makeHelpers();
+
+    await sweepOrphanedMachines(makeConfig(false), helpers);
+
+    expect(updateJobStatus).toHaveBeenCalledWith(inflight.id, "timed_out", "machine_max_age_sweep");
   });
 });
 

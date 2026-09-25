@@ -172,6 +172,19 @@ export interface HandleRunnerResultInput {
    * not this issue.
    */
   onReviewFixResult?: (result: ReviewFixResultMetadataV1) => ResultIntakeOutcome;
+  /**
+   * Immediate one-shot backend-termination check for a planning callback's admission
+   * reservation (AII-783 review, third round, on PR #681). The planning branch below
+   * marks the job `completed` with `skipAdmissionRelease` because the callback's own
+   * self-report is not proof the backend has exited — but that write also removes the
+   * job from `getInFlightJobs()`'s `dispatched`/`running` set, so the normal per-poll
+   * monitor never looks at it again. Wired to `tryFastReleasePlanningAdmission` in
+   * index.ts: when the backend is already confirmed terminal it releases the
+   * reservation right away; otherwise it is a no-op and the reservation stays held for
+   * the stale-admission sweep. Absent in tests that don't need it — the reservation
+   * then simply stays held, matching pre-fast-path behavior.
+   */
+  checkPlanningAdmissionTermination?: (dispatchId: string) => Promise<void>;
 }
 
 export interface HandleRunnerResultOutput {
@@ -704,7 +717,13 @@ export async function handleRunnerResult(
           warn("clearWorkingState(operator_cancelled)", err);
         }
         if (job) {
-          updateJobStatus(job.id, "failed", "operator_cancelled");
+          // skipAdmissionRelease: true for the same reason the planning "completed" write
+          // above does — this callback is the runner's own self-report, posted from inside
+          // the still-running backend, not proof the GitHub Actions job / Fly machine /
+          // local container has actually exited (AII-783 review, third round, on PR #681).
+          // The reservation stays held for the matching Legacy monitor / stale-admission
+          // sweep to resolve once the backend is independently confirmed terminal.
+          updateJobStatus(job.id, "failed", "operator_cancelled", undefined, { skipAdmissionRelease: true });
           console.log(
             `[runner-callback] PR closed by operator — job ${job.id} (${claims.issueId}) marked operator_cancelled`,
           );
@@ -760,9 +779,25 @@ export async function handleRunnerResult(
     // while its planning job is in flight, so waiting for the GHA monitor to
     // notice the run finished delays the planning→implementation handoff — and
     // if run tracking failed entirely, blocks it until the stuck watchdog fires.
+    // skipAdmissionRelease: true because this callback is the runner's own
+    // self-report, posted from inside the still-running backend — it is not proof
+    // the GitHub Actions job / Fly machine / local container has actually exited
+    // (AII-783 review, second round, on PR #681). This same "completed" write also
+    // drops the job out of getInFlightJobs()'s dispatched/running set, so the normal
+    // per-poll GHA/Fly/local monitor never looks at this job again (AII-783 review,
+    // third round) — checkPlanningAdmissionTermination immediately below is the fast
+    // confirmation path that takes its place; a still-uncertain backend falls back to
+    // the stale-admission sweep.
     const job = getJobByDispatchId(claims.dispatchId);
     if (job) {
-      updateJobStatus(job.id, "completed", "planning_callback");
+      updateJobStatus(job.id, "completed", "planning_callback", undefined, { skipAdmissionRelease: true });
+      if (input.checkPlanningAdmissionTermination) {
+        try {
+          await input.checkPlanningAdmissionTermination(claims.dispatchId);
+        } catch (err) {
+          warn("checkPlanningAdmissionTermination", err);
+        }
+      }
     }
   } else if (input.body.phase === "implementation") {
     if (input.body.noWork) {

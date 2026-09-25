@@ -4,6 +4,7 @@ import path from "node:path";
 import fs from "node:fs";
 import type * as DedupModule from "../dedup.js";
 import type * as LogModule from "../log.js";
+import type * as DispatchAdmissionModule from "../dispatch-admission.js";
 import type * as RunnerTokensModule from "../runner-tokens.js";
 import type * as RunnerCallbackModule from "../runner-callback.js";
 import type * as StepLogModule from "../step-log.js";
@@ -59,6 +60,7 @@ const SECRET = "test-secret-with-enough-entropy-for-hmac";
 let dbPath: string;
 let dedup: typeof DedupModule;
 let log: typeof LogModule;
+let dispatchAdmission: typeof DispatchAdmissionModule;
 let runnerTokens: typeof RunnerTokensModule;
 let runnerCallback: typeof RunnerCallbackModule;
 let stepLog: typeof StepLogModule;
@@ -75,6 +77,7 @@ beforeEach(async () => {
   process.env.DEDUP_DB_PATH = dbPath;
   dedup = await import("../dedup.js");
   log = await import("../log.js");
+  dispatchAdmission = await import("../dispatch-admission.js");
   runnerTokens = await import("../runner-tokens.js");
   runnerCallback = await import("../runner-callback.js");
   stepLog = await import("../step-log.js");
@@ -327,6 +330,237 @@ describe("handleRunnerResult — planning", () => {
     const job = log.getJobById(jobId);
     expect(job?.status).toBe("completed");
     expect(job?.completedAt).not.toBeNull();
+  });
+
+  // AII-783 review, second round, on PR #681: a planning callback is the runner's own
+  // self-report, posted from inside the still-running backend — it is not proof the
+  // GitHub Actions job / Fly machine / local container has actually exited. The admission
+  // reservation must stay held across this callback and only clear once the backend is
+  // independently confirmed terminal (mirroring dispatch-admission.ts's release-by-owner
+  // contract, exercised directly here since this callback holds no owner/generation).
+  it("holds the admission reservation across a planning callback while the backend may still be running, and releases it once termination is independently confirmed", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "planning",
+      ttlSeconds: runnerTokens.PLANNING_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const admitted = dispatchAdmission.acquire({
+      dispatchId,
+      mappingKey: "ENG",
+      scope: { kind: "issue", issueScope: "ENG", issueId: "i" },
+      kind: "planning",
+      backend: "github-actions",
+      lifecycleOwner: { kind: "legacy" },
+      cap: 1,
+    });
+    expect(admitted.ok).toBe(true);
+    log.appendLog({
+      issueId: "i",
+      issueIdentifier: "ENG-1",
+      issueTitle: "Plan it",
+      teamKey: "ENG",
+      repo: "o/r",
+      dispatchId,
+      executionMode: "github-actions",
+      phase: "planning",
+    });
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: { phase: "planning", outcome: "success", comments: [] },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider({ recordCalls: true })),
+    });
+    expect(res.status).toBe(200);
+
+    // Still reserved: a competing acquire for the same issue must not be admitted yet.
+    const competing = dispatchAdmission.acquire({
+      dispatchId: "competing-dispatch",
+      mappingKey: "ENG",
+      scope: { kind: "issue", issueScope: "ENG", issueId: "i" },
+      kind: "planning",
+      backend: "github-actions",
+      lifecycleOwner: { kind: "legacy" },
+      cap: 1,
+    });
+    expect(competing.ok).toBe(false);
+    const held = dispatchAdmission.read(dispatchId);
+    expect(held?.releasedAt).toBeNull();
+
+    // Once the matching Legacy monitor independently confirms the backend terminated,
+    // it releases by owner/generation exactly as dispatch-admission.ts documents.
+    const released = dispatchAdmission.release(dispatchId, held!.lifecycleOwner, held!.generation, "finalized");
+    expect(released.status).toBe("released");
+    expect(dispatchAdmission.count("ENG")).toBe(0);
+  });
+
+  // AII-783 review, third round, on PR #681: updateJobStatus's "completed" write above
+  // drops the job out of getInFlightJobs()'s dispatched/running set, so the normal
+  // per-poll monitor never looks at it again — relying solely on sweepStaleAdmissions's
+  // 6-hour floor would strand every ordinary, already-finished planning run at full team
+  // capacity for hours. checkPlanningAdmissionTermination is the fast path that takes the
+  // monitor's place: this asserts the callback actually invokes it (with the right
+  // dispatchId) and that a backend the check confirms terminal is released well under the
+  // 6-hour sweep floor, not just eventually.
+  it("releases the admission reservation promptly via checkPlanningAdmissionTermination when the backend is already confirmed terminal", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "planning",
+      ttlSeconds: runnerTokens.PLANNING_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const admitted = dispatchAdmission.acquire({
+      dispatchId,
+      mappingKey: "ENG",
+      scope: { kind: "issue", issueScope: "ENG", issueId: "i" },
+      kind: "planning",
+      backend: "github-actions",
+      lifecycleOwner: { kind: "legacy" },
+      cap: 1,
+    });
+    expect(admitted.ok).toBe(true);
+    log.appendLog({
+      issueId: "i",
+      issueIdentifier: "ENG-1",
+      issueTitle: "Plan it",
+      teamKey: "ENG",
+      repo: "o/r",
+      dispatchId,
+      executionMode: "github-actions",
+      phase: "planning",
+    });
+
+    const checkPlanningAdmissionTermination = vi.fn(async (id: string) => {
+      // Simulates index.ts's tryFastReleasePlanningAdmission having independently
+      // confirmed the backend terminal and released the reservation.
+      dispatchAdmission.releaseByDispatchId(id, "finalized");
+    });
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: { phase: "planning", outcome: "success", comments: [] },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider({ recordCalls: true })),
+      checkPlanningAdmissionTermination,
+    });
+    expect(res.status).toBe(200);
+    expect(checkPlanningAdmissionTermination).toHaveBeenCalledWith(dispatchId);
+
+    const released = dispatchAdmission.read(dispatchId);
+    expect(released?.releasedAt).not.toBeNull();
+    expect(dispatchAdmission.count("ENG")).toBe(0);
+
+    // Capacity is free again immediately — not gated behind the 6-hour sweep floor.
+    const competing = dispatchAdmission.acquire({
+      dispatchId: "competing-dispatch-2",
+      mappingKey: "ENG",
+      scope: { kind: "issue", issueScope: "ENG", issueId: "i" },
+      kind: "planning",
+      backend: "github-actions",
+      lifecycleOwner: { kind: "legacy" },
+      cap: 1,
+    });
+    expect(competing.ok).toBe(true);
+  });
+
+  // A still-uncertain backend must leave the reservation held even when the fast-path
+  // seam is present — checkPlanningAdmissionTermination is a no-op call for the caller,
+  // not an automatic release.
+  it("leaves the admission reservation held when checkPlanningAdmissionTermination cannot confirm termination", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "planning",
+      ttlSeconds: runnerTokens.PLANNING_TTL_SECONDS,
+      secret: SECRET,
+    });
+    dispatchAdmission.acquire({
+      dispatchId,
+      mappingKey: "ENG",
+      scope: { kind: "issue", issueScope: "ENG", issueId: "i" },
+      kind: "planning",
+      backend: "github-actions",
+      lifecycleOwner: { kind: "legacy" },
+      cap: 1,
+    });
+    log.appendLog({
+      issueId: "i",
+      issueIdentifier: "ENG-1",
+      issueTitle: "Plan it",
+      teamKey: "ENG",
+      repo: "o/r",
+      dispatchId,
+      executionMode: "github-actions",
+      phase: "planning",
+    });
+
+    const checkPlanningAdmissionTermination = vi.fn(async () => {
+      // Backend still running / unconfirmable: a real no-op, mirroring
+      // tryFastReleasePlanningAdmission when confirmAdmissionTerminated resolves false.
+    });
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: { phase: "planning", outcome: "success", comments: [] },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider({ recordCalls: true })),
+      checkPlanningAdmissionTermination,
+    });
+    expect(res.status).toBe(200);
+    expect(checkPlanningAdmissionTermination).toHaveBeenCalledWith(dispatchId);
+
+    const held = dispatchAdmission.read(dispatchId);
+    expect(held?.releasedAt).toBeNull();
+    expect(dispatchAdmission.count("ENG")).toBe(1);
+  });
+
+  // A throw from checkPlanningAdmissionTermination (e.g. a lost network call) must not
+  // fail the callback — the reservation simply stays held for the sweep, same as an
+  // absent seam.
+  it("does not fail the callback when checkPlanningAdmissionTermination throws", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "planning",
+      ttlSeconds: runnerTokens.PLANNING_TTL_SECONDS,
+      secret: SECRET,
+    });
+    dispatchAdmission.acquire({
+      dispatchId,
+      mappingKey: "ENG",
+      scope: { kind: "issue", issueScope: "ENG", issueId: "i" },
+      kind: "planning",
+      backend: "github-actions",
+      lifecycleOwner: { kind: "legacy" },
+      cap: 1,
+    });
+    log.appendLog({
+      issueId: "i",
+      issueIdentifier: "ENG-1",
+      issueTitle: "Plan it",
+      teamKey: "ENG",
+      repo: "o/r",
+      dispatchId,
+      executionMode: "github-actions",
+      phase: "planning",
+    });
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: { phase: "planning", outcome: "success", comments: [] },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider({ recordCalls: true })),
+      checkPlanningAdmissionTermination: vi.fn(async () => {
+        throw new Error("network hiccup");
+      }),
+    });
+    expect(res.status).toBe(200);
+
+    const held = dispatchAdmission.read(dispatchId);
+    expect(held?.releasedAt).toBeNull();
   });
 
   it("calls markPlanningFailed on failure", async () => {
@@ -720,6 +954,75 @@ describe("handleRunnerResult — implementation", () => {
     expect(calls.find((c) => c.method === "clearWorkingState")).toBeDefined();
     expect(calls.find((c) => c.method === "markImplementationFailed")).toBeUndefined();
     expect(log.getJobById(jobId)?.conclusion).toBe("operator_cancelled");
+  });
+
+  // AII-783 review, fourth round, on PR #681: OPERATOR_CANCELLED is the runner's own
+  // self-report of the PR being closed mid-run — posted from inside the still-running
+  // backend, same as the planning "completed" callback above — not proof the GitHub
+  // Actions job / Fly machine / local container has actually exited. The admission
+  // reservation must stay held across this callback and only clear once the backend is
+  // independently confirmed terminal by the matching Legacy monitor / stale-admission sweep.
+  it("holds the admission reservation across an operator_cancelled implementation callback while the backend may still be running", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const admitted = dispatchAdmission.acquire({
+      dispatchId,
+      mappingKey: "ENG",
+      scope: { kind: "issue", issueScope: "ENG", issueId: "i" },
+      kind: "implementation",
+      backend: "github-actions",
+      lifecycleOwner: { kind: "legacy" },
+      cap: 1,
+    });
+    expect(admitted.ok).toBe(true);
+    log.appendLog({
+      issueId: "i",
+      issueIdentifier: "ENG-1",
+      issueTitle: "Implement it",
+      teamKey: "ENG",
+      repo: "o/r",
+      dispatchId,
+      executionMode: "github-actions",
+    });
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "failure",
+        failureCode: "OPERATOR_CANCELLED",
+        comments: [],
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider({ recordCalls: true })),
+    });
+    expect(res.status).toBe(200);
+    expect(log.getJobById(log.getJobByDispatchId(dispatchId)!.id)?.conclusion).toBe("operator_cancelled");
+
+    // Still reserved: a competing acquire for the same issue must not be admitted yet.
+    const competing = dispatchAdmission.acquire({
+      dispatchId: "competing-dispatch-operator-cancelled",
+      mappingKey: "ENG",
+      scope: { kind: "issue", issueScope: "ENG", issueId: "i" },
+      kind: "implementation",
+      backend: "github-actions",
+      lifecycleOwner: { kind: "legacy" },
+      cap: 1,
+    });
+    expect(competing.ok).toBe(false);
+    const held = dispatchAdmission.read(dispatchId);
+    expect(held?.releasedAt).toBeNull();
+
+    // Once the matching Legacy monitor independently confirms the backend terminated,
+    // it releases by owner/generation exactly as dispatch-admission.ts documents.
+    const released = dispatchAdmission.release(dispatchId, held!.lifecycleOwner, held!.generation, "finalized");
+    expect(released.status).toBe("released");
+    expect(dispatchAdmission.count("ENG")).toBe(0);
   });
 
   it("writes runner_approved on implementation success with a PR URL (AII-460)", async () => {
