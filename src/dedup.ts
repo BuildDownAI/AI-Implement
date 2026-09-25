@@ -44,6 +44,18 @@ function ensureAdminSessionColumns(): void {
   if (!names.has("name")) db.exec("ALTER TABLE admin_sessions ADD COLUMN name TEXT");
 }
 
+/** AII-781: tombstones are tracked independently of payload retention — a delivery
+ *  can be tombstoned without its payload_json being purged, and a later payload-purge
+ *  path (if one is ever added) must not clear this column. */
+function ensureReviewFixInboxColumns(): void {
+  if (!db) return;
+  const info = db.prepare("PRAGMA table_info(review_fix_inbox)").all() as Array<{ name: string }>;
+  const names = new Set(info.map((c) => c.name));
+  if (!names.has("tombstoned_at")) {
+    db.exec("ALTER TABLE review_fix_inbox ADD COLUMN tombstoned_at INTEGER");
+  }
+}
+
 function createRunnerTokensTable(): void {
   if (!db) return;
   db.exec(`
@@ -300,6 +312,7 @@ export function getDb(): Database.Database {
       ON review_fix_inbox(delivery_state, retry_at, accepted_at)`);
     db.exec(`CREATE INDEX IF NOT EXISTS idx_review_fix_inbox_pr
       ON review_fix_inbox(installation_id, repository, pr_number, accepted_at)`);
+    ensureReviewFixInboxColumns();
     // AII-779: retain bounded redacted activity independently from completed
     // cycle evidence. The byte tally is updated only after a new event insert,
     // so replayed identities cannot consume the allowance again.
