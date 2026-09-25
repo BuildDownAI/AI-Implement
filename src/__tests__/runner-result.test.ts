@@ -279,6 +279,154 @@ describe("postRunnerResult", () => {
     expect(body).not.toHaveProperty("reviewFix");
   });
 
+  it("does not retry a legacy (no reviewFix) call on a transient 503 — single-attempt behavior is unchanged (AII-794)", async () => {
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const fetchImpl = vi.fn().mockResolvedValue({ ok: false, status: 503, text: async () => "unavailable" });
+
+    await postRunnerResult({
+      workspaceDir: "/tmp",
+      phase: "implementation",
+      outcome: "failure",
+      callbackUrl: "https://cb",
+      fetchImpl,
+    });
+
+    expect(fetchImpl).toHaveBeenCalledOnce();
+    expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("POST failed HTTP 503"));
+  });
+
+  describe("pilot bounded retry/backoff (AII-794)", () => {
+    function makeReviewFix(overrides: Partial<ReviewFixResultMetadataV1> = {}): ReviewFixResultMetadataV1 {
+      return {
+        version: 1,
+        attemptId: "attempt-1",
+        installationId: 1,
+        repository: "acme/widgets",
+        prNumber: 42,
+        deadlineAt: Date.now() + 60 * 60_000,
+        githubRunId: 555,
+        githubRunAttempt: 1,
+        outputCommit: "a".repeat(40),
+        ...overrides,
+      };
+    }
+
+    it("retries a lost ACK and resends a byte-identical canonical body until it succeeds", async () => {
+      const bodies: string[] = [];
+      const sleepCalls: number[] = [];
+      let callCount = 0;
+      const fetchImpl = vi.fn(async (_url: string, init: { body?: unknown }) => {
+        bodies.push(init.body as string);
+        callCount++;
+        if (callCount < 3) return { ok: false, status: 503, text: async () => "unavailable" } as Response;
+        return { ok: true, status: 200, text: async () => "" } as Response;
+      });
+
+      await postRunnerResult({
+        workspaceDir: "/tmp",
+        phase: "gap-analysis",
+        outcome: "success",
+        prUrl: "https://github.com/acme/widgets/pull/42",
+        callbackUrl: "https://cb",
+        reviewFix: makeReviewFix(),
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        sleepImpl: async (ms) => { sleepCalls.push(ms); },
+      });
+
+      expect(callCount).toBe(3);
+      expect(new Set(bodies).size).toBe(1);
+      expect(sleepCalls).toHaveLength(2);
+    });
+
+    it("stops immediately on a terminal 409 conflict response without retrying", async () => {
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const fetchImpl = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 409,
+        text: async () => '{"error":"conflict"}',
+      });
+
+      await postRunnerResult({
+        workspaceDir: "/tmp",
+        phase: "gap-analysis",
+        outcome: "success",
+        callbackUrl: "https://cb",
+        reviewFix: makeReviewFix(),
+        fetchImpl,
+        sleepImpl: async () => {},
+      });
+
+      expect(fetchImpl).toHaveBeenCalledOnce();
+      expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("HTTP 409"));
+      expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("terminal, not retrying"));
+    });
+
+    it("stops immediately on a terminal 410 stale response without retrying", async () => {
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const fetchImpl = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 410,
+        text: async () => '{"error":"stale"}',
+      });
+
+      await postRunnerResult({
+        workspaceDir: "/tmp",
+        phase: "gap-analysis",
+        outcome: "failure",
+        callbackUrl: "https://cb",
+        reviewFix: makeReviewFix(),
+        fetchImpl,
+        sleepImpl: async () => {},
+      });
+
+      expect(fetchImpl).toHaveBeenCalledOnce();
+      expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("terminal, not retrying"));
+    });
+
+    it("gives up once the stored deadline plus delivery grace elapses, logging an explicit no-result outcome", async () => {
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const fetchImpl = vi.fn().mockResolvedValue({ ok: false, status: 503, text: async () => "unavailable" });
+      let virtualNow = 1_000_000;
+      const reviewFix = makeReviewFix({ deadlineAt: virtualNow });
+
+      await postRunnerResult({
+        workspaceDir: "/tmp",
+        phase: "gap-analysis",
+        outcome: "failure",
+        callbackUrl: "https://cb",
+        reviewFix,
+        fetchImpl,
+        now: () => virtualNow,
+        // Jumps 20 minutes per backoff wait — past the 15-minute delivery grace after one attempt.
+        sleepImpl: async () => { virtualNow += 20 * 60_000; },
+      });
+
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+      expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("POST no-result"));
+      expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("deadline exceeded"));
+    });
+
+    it("bounds retries by attempt count even when the deadline is far in the future", async () => {
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const fetchImpl = vi.fn().mockResolvedValue({ ok: false, status: 503, text: async () => "unavailable" });
+
+      await postRunnerResult({
+        workspaceDir: "/tmp",
+        phase: "gap-analysis",
+        outcome: "failure",
+        callbackUrl: "https://cb",
+        reviewFix: makeReviewFix({ deadlineAt: Date.now() + 24 * 60 * 60_000 }),
+        fetchImpl,
+        sleepImpl: async () => {},
+      });
+
+      expect(fetchImpl.mock.calls.length).toBeGreaterThan(1);
+      expect(fetchImpl.mock.calls.length).toBeLessThanOrEqual(8);
+      expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("POST no-result"));
+      expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("retry attempts exhausted"));
+    });
+  });
+
   it("logs the status and does not claim success when the post is refused", async () => {
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
