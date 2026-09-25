@@ -198,6 +198,108 @@ describe("review-fix attempt and inbox schema", () => {
   });
 });
 
+describe("review-fix activity and cycle schema", () => {
+  it("retains cycle evidence independently when activity reaches its durable cap", () => {
+    const db = dedup.getDb();
+    const payload = JSON.stringify({ text: "x".repeat(16373) });
+    expect(Buffer.byteLength(payload)).toBe(16384);
+    const insertActivity = db.prepare(`INSERT INTO review_fix_activity
+      (attempt_id, producer_id, sequence, payload_hash, kind, cycle, occurred_at,
+       redacted_payload_json, byte_count)
+      VALUES ('attempt-1', 'runner-1', ?, ?, 'tool-result', 1, 100, ?, ?)`);
+    db.transaction(() => {
+      for (let sequence = 1; sequence <= 640; sequence++) {
+        insertActivity.run(sequence, `hash-${sequence}`, payload, 16384);
+      }
+    })();
+    expect(db.prepare("SELECT accepted_bytes FROM review_fix_activity_streams WHERE attempt_id = 'attempt-1'").get())
+      .toEqual({ accepted_bytes: 10 * 1024 * 1024 });
+    expect(() => insertActivity.run(641, "hash-641", "{}", 2)).toThrow(/CHECK/);
+    db.prepare(`INSERT INTO review_fix_activity_producers
+      (attempt_id, producer_id, highest_contiguous_sequence, final_sequence, limit_reached_at)
+      VALUES ('attempt-1', 'runner-1', 640, 641, 101)`).run();
+    db.prepare(`INSERT INTO review_fix_activity_streams
+      (attempt_id, limit_reached_at, truncated_at) VALUES ('attempt-2', 102, 102)`).run();
+    db.prepare(`INSERT INTO review_fix_cycles
+      (attempt_id, cycle, summary_id, summary_hash, input_commit, output_commit,
+       dispositions_json, tests_json, verdict, usage_json, completed_at)
+      VALUES ('attempt-1', 1, 'summary-1', 'summary-hash', 'before', 'after',
+              '[]', '[]', 'passed', '{}', 103)`).run();
+    dedup.closeDb();
+    const reopened = dedup.getDb();
+    expect(reopened.prepare("SELECT accepted_bytes, limit_reached_at FROM review_fix_activity_streams WHERE attempt_id = 'attempt-1'").get())
+      .toEqual({ accepted_bytes: 10 * 1024 * 1024, limit_reached_at: null });
+    expect(reopened.prepare("SELECT final_sequence, limit_reached_at FROM review_fix_activity_producers WHERE attempt_id = 'attempt-1'").get())
+      .toEqual({ final_sequence: 641, limit_reached_at: 101 });
+    expect(reopened.prepare("SELECT input_commit, output_commit, verdict FROM review_fix_cycles WHERE attempt_id = 'attempt-1'").get())
+      .toEqual({ input_commit: "before", output_commit: "after", verdict: "passed" });
+  });
+
+  it("rejects conflicting activity identities and keeps replay from increasing the byte tally", () => {
+    const db = dedup.getDb();
+    const insert = db.prepare(`INSERT INTO review_fix_activity
+      (attempt_id, producer_id, sequence, payload_hash, kind, cycle, occurred_at,
+       redacted_payload_json, byte_count)
+      VALUES ('attempt-1', 'runner-1', 1, ?, 'tool-call', 1, 100, ?, ?)`);
+    insert.run("hash-1", "{}", 2);
+    expect(() => insert.run("hash-2", "[]", 2)).toThrow(/conflicting/);
+    db.prepare(`INSERT OR IGNORE INTO review_fix_activity
+      (attempt_id, producer_id, sequence, payload_hash, kind, cycle, occurred_at,
+       redacted_payload_json, byte_count)
+      VALUES ('attempt-1', 'runner-1', 1, 'hash-1', 'tool-call', 1, 100, '{}', 2)`).run();
+    expect(() => db.prepare(`INSERT OR IGNORE INTO review_fix_activity
+      (attempt_id, producer_id, sequence, payload_hash, kind, cycle, occurred_at,
+       redacted_payload_json, byte_count)
+      VALUES ('attempt-1', 'runner-1', 1, 'hash-2', 'tool-call', 1, 100, '[]', 2)`).run())
+      .toThrow(/conflicting/);
+    expect(db.prepare("SELECT accepted_bytes FROM review_fix_activity_streams WHERE attempt_id = 'attempt-1'").get())
+      .toEqual({ accepted_bytes: 2 });
+    expect(() => db.prepare("UPDATE review_fix_activity SET redacted_payload_json = '[]'").run())
+      .toThrow(/immutable/);
+    expect(() => db.prepare("UPDATE review_fix_activity_streams SET accepted_bytes = 0").run())
+      .toThrow(/cannot decrease/);
+    expect(() => db.prepare(`INSERT INTO review_fix_activity
+      (attempt_id, producer_id, sequence, payload_hash, kind, cycle, occurred_at,
+       redacted_payload_json, byte_count)
+      VALUES ('attempt-1', 'runner-1', 2, 'hash-3', 'tool-call', 1, 101, '{}', 3)`).run())
+      .toThrow(/CHECK/);
+    db.prepare(`INSERT INTO review_fix_cycles
+      (attempt_id, cycle, summary_id, summary_hash, dispositions_json,
+       tests_json, verdict, usage_json, completed_at)
+      VALUES ('attempt-1', 1, 'summary-1', 'hash', '[]', '[]', 'passed', '{}', 101)`).run();
+    expect(() => db.prepare("UPDATE review_fix_cycles SET summary_id = 'summary-2'").run())
+      .toThrow(/immutable/);
+  });
+
+  it("adds activity tables around an existing attempt without changing its identity", () => {
+    const old = new Database(dbPath);
+    old.exec(`CREATE TABLE review_fix_attempts (
+      attempt_id TEXT PRIMARY KEY, dispatch_id TEXT NOT NULL UNIQUE,
+      owner TEXT NOT NULL, installation_id TEXT NOT NULL,
+      repository TEXT NOT NULL, pr_number INTEGER NOT NULL,
+      created_at INTEGER NOT NULL
+    )`);
+    old.prepare(`INSERT INTO review_fix_attempts VALUES
+      ('attempt-legacy', 'dispatch-legacy', 'legacy', '7', 'acme/app', 42, 10)`).run();
+    old.close();
+    const db = dedup.getDb();
+    db.prepare(`INSERT INTO review_fix_activity_streams (attempt_id, accepted_bytes, limit_reached_at)
+      VALUES ('attempt-legacy', 10485760, 20)`).run();
+    db.prepare(`INSERT INTO review_fix_cycles
+      (attempt_id, cycle, summary_id, summary_hash, dispositions_json,
+       tests_json, verdict, usage_json, completed_at)
+      VALUES ('attempt-legacy', 1, 'summary-legacy', 'hash', '[]', '[]', 'passed', '{}', 30)`).run();
+    dedup.closeDb();
+    const reopened = dedup.getDb();
+    expect(reopened.prepare("SELECT dispatch_id, owner FROM review_fix_attempts WHERE attempt_id = 'attempt-legacy'").get())
+      .toEqual({ dispatch_id: "dispatch-legacy", owner: "legacy" });
+    expect(reopened.prepare("SELECT summary_id FROM review_fix_cycles WHERE attempt_id = 'attempt-legacy'").get())
+      .toEqual({ summary_id: "summary-legacy" });
+    expect(reopened.prepare("SELECT accepted_bytes FROM review_fix_activity_streams WHERE attempt_id = 'attempt-legacy'").get())
+      .toEqual({ accepted_bytes: 10 * 1024 * 1024 });
+  });
+});
+
 describe("reaper actions", () => {
   it("recordReaperAction persists a row and listReaperActions returns it", () => {
     dedup.recordReaperAction({
