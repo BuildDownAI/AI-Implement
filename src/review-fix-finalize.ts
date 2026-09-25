@@ -59,6 +59,7 @@ import {
   acceptDelivery,
   ackDelivery,
   claimDelivery,
+  retryDelivery,
 } from "./review-fix-inbox.js";
 import type {
   ApprovalEffectOutcome,
@@ -133,6 +134,11 @@ export interface ReviewFixFinalizeAttemptStore extends ReviewFixAttemptStorePort
   /** The persisted accepted result and conflict marker `finalizeReviewFixAttempt` binds approval
    *  to — see `SqliteReviewFixAttemptStore.getAcceptedResult`. */
   getAcceptedResult(attemptId: AttemptId): Promise<ReviewFixAcceptedResultView | null>;
+  /** The attempt's immutable terminal verdict, or `null` if none has been recorded yet — a
+   *  read-only peek at what `recordOutcome` has durably written, never itself writing. Used by
+   *  `retryApprovalEffect` to withhold when a since-recorded verdict is incompatible with
+   *  approval — see `SqliteReviewFixAttemptStore.getRecordedOutcome`. */
+  getRecordedOutcome(attemptId: AttemptId): Promise<ReviewFixImmutableOutcome | null>;
 }
 
 /** `result` is the durably accepted result for the attempt, or `null` if none has been accepted
@@ -152,6 +158,14 @@ function canonicalDispositionPayload(dispositions: readonly ReviewFixFindingDisp
   return [...dispositions]
     .sort((a, b) => a.findingKey.localeCompare(b.findingKey))
     .map((d) => ({ findingKey: d.findingKey, disposition: d.disposition }));
+}
+
+/** The exact payload shape an approval delivery is accepted under (see `acceptDelivery` calls
+ *  below) — shared so `retryApprovalEffect` can verify a retry's caller-supplied result and
+ *  dispositions still match what the delivery's identity was originally accepted for, rather
+ *  than trusting the caller not to have changed them. */
+function approvalDeliveryPayload(result: ReviewFixResultMetadataV1, dispositions: readonly ReviewFixFindingDisposition[]): unknown {
+  return { outputCommit: result.outputCommit, dispositions: canonicalDispositionPayload(dispositions) };
 }
 
 /**
@@ -191,10 +205,7 @@ export function createReviewFixFinalizer(deps: {
         deliveryId,
         kind: "terminal-effect",
         destination: input.scope,
-        payload: {
-          outputCommit: input.result.outputCommit,
-          dispositions: canonicalDispositionPayload(input.findingDispositions),
-        },
+        payload: approvalDeliveryPayload(input.result, input.findingDispositions),
       });
       if (accepted.status === "rejected") {
         return { status: "withheld", reason: `unable to record approval effect: ${accepted.reason}` };
@@ -243,9 +254,21 @@ export function createReviewFixFinalizer(deps: {
  * a repeat call (an upsert, mirroring `github.ts#postOrUpdateStickyComment`) precisely so that a
  * crash between this call's own effect application and its ack remains recoverable by calling
  * this function again.
+ *
+ * Two further safeguards, beyond what `applyApproval` itself needs, exist because a retry can be
+ * separated from the original accept by an arbitrary amount of time and by a caller that recomputed
+ * its evidence from scratch:
+ *  - The caller-supplied `result`/`findingDispositions` are compared against the payload the
+ *    claimed delivery was originally accepted under (`approvalDeliveryPayload`) before any remote
+ *    reconciliation or write. A retry carrying changed dispositions must never post a different
+ *    GitHub effect while acknowledging the identity accepted for the original one.
+ *  - The durable attempt state is re-read directly (not merely trusted from `input`): a conflicting
+ *    result recorded against the attempt, or an immutable terminal verdict recorded as anything
+ *    other than `succeeded`, withholds — a pending delivery must not be completed after either has
+ *    since been recorded, even though the caller's own booleans might still say "proceed".
  */
 export async function retryApprovalEffect(
-  deps: { github: ReviewFixGitHubAdapter },
+  deps: { github: ReviewFixGitHubAdapter; attemptStore: ReviewFixFinalizeAttemptStore },
   input: ReviewFixApprovalInput,
 ): Promise<ApprovalEffectOutcome> {
   if (!input.currentAuthority) {
@@ -271,6 +294,36 @@ export async function retryApprovalEffect(
   }
   if (claimed.status === "already_leased") {
     return { status: "withheld", reason: `approval effect delivery ${deliveryId} is currently leased by another retry` };
+  }
+
+  // Below this point the delivery is held under this call's claim/lease. Any withhold from here
+  // releases it back to `pending` immediately (rather than leaving it leased until the lease
+  // naturally expires) so a corrected retry is not needlessly blocked in the meantime.
+  const withholdClaim = (reason: string): ApprovalEffectOutcome => {
+    retryDelivery(FINALIZE_SOURCE, deliveryId);
+    return { status: "withheld", reason };
+  };
+
+  // Safeguard 1: the retry must reconcile the same effect it claimed, not a different one. A
+  // caller supplying changed dispositions (or a different result) for the same attempt/delivery
+  // identity must withhold rather than post a divergent GitHub effect under the original identity.
+  const expectedPayload = approvalDeliveryPayload(input.result, input.findingDispositions);
+  if (JSON.stringify(expectedPayload) !== JSON.stringify(claimed.delivery.payload)) {
+    return withholdClaim(
+      `retry payload for ${deliveryId} does not match the delivery originally accepted for this attempt; reconcile with the accepted result and dispositions before retrying`,
+    );
+  }
+
+  // Safeguard 2: re-read the durable attempt state directly rather than trusting only the
+  // caller's evidence — a conflict or an incompatible recorded verdict may have been persisted
+  // after the original `applyApproval` call accepted this delivery.
+  const accepted = await deps.attemptStore.getAcceptedResult(input.attemptId);
+  if (!accepted || accepted.hasConflict) {
+    return withholdClaim("a conflicting result has been recorded for this attempt since the approval delivery was accepted");
+  }
+  const recordedOutcome = await deps.attemptStore.getRecordedOutcome(input.attemptId);
+  if (recordedOutcome && recordedOutcome.terminal.status !== "succeeded") {
+    return withholdClaim(`attempt's recorded terminal outcome is '${recordedOutcome.terminal.status}', not 'succeeded'`);
   }
 
   // The claim above only proves no other local retry holds this delivery — it is not evidence

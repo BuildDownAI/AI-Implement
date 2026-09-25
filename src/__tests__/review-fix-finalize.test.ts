@@ -338,14 +338,14 @@ describe("createReviewFixFinalizer.applyApproval: idempotency", () => {
 
     // The explicit reconciliation path completes it.
     shouldThrow = false;
-    const retried = await finalizeModule.retryApprovalEffect({ github }, input);
+    const retried = await finalizeModule.retryApprovalEffect({ github, attemptStore: store }, input);
     expect(retried).toEqual({ status: "applied", effectId: `${attempt.attemptId}.approval` });
     expect(counts.applyApprovalEffect).toBe(2);
 
     // Once delivered, both the ordinary path and a further retry report already_applied
     // without calling the adapter again.
     expect(await finalizer.applyApproval(input)).toEqual({ status: "already_applied", effectId: `${attempt.attemptId}.approval` });
-    expect(await finalizeModule.retryApprovalEffect({ github }, input)).toEqual({
+    expect(await finalizeModule.retryApprovalEffect({ github, attemptStore: store }, input)).toEqual({
       status: "already_applied",
       effectId: `${attempt.attemptId}.approval`,
     });
@@ -380,12 +380,125 @@ describe("createReviewFixFinalizer.applyApproval: idempotency", () => {
     await expect(finalizer.applyApproval(input)).rejects.toThrow("simulated crash after the remote write landed, before local ack");
     expect(counts.applyApprovalEffect).toBe(1);
 
-    const retried = await finalizeModule.retryApprovalEffect({ github }, input);
+    const retried = await finalizeModule.retryApprovalEffect({ github, attemptStore: store }, input);
     expect(retried).toEqual({ status: "already_applied", effectId: `${attempt.attemptId}.approval` });
     // The write is never repeated once GitHub's own state shows the effect already landed.
     expect(counts.applyApprovalEffect).toBe(1);
 
     expect(await finalizer.applyApproval(input)).toEqual({ status: "already_applied", effectId: `${attempt.attemptId}.approval` });
+    expect(counts.applyApprovalEffect).toBe(1);
+  });
+
+  it("retryApprovalEffect withholds, never calling GitHub, when the caller supplies changed dispositions for an already-accepted delivery", async () => {
+    const { store, attempt } = await prepareAttempt();
+    let shouldThrow = true;
+    const counts = { applyApprovalEffect: 0 };
+    const github = fakeGithub({
+      async applyApprovalEffect() {
+        counts.applyApprovalEffect++;
+        if (shouldThrow) throw new Error("simulated crash before ack");
+      },
+    });
+    const finalizer = finalizeModule.createReviewFixFinalizer({ attemptStore: store, github });
+    const result = resultFor(attempt.attemptId, attempt.deadlineAt);
+    const input = {
+      attemptId: attempt.attemptId,
+      scope: attempt.scope,
+      result,
+      currentAuthority: true,
+      currentPrHeadSha: OUTPUT_COMMIT,
+      findingDispositions: DISPOSITIONS,
+      policyAllows: true,
+    };
+
+    await expect(finalizer.applyApproval(input)).rejects.toThrow("simulated crash before ack");
+    expect(counts.applyApprovalEffect).toBe(1);
+
+    // A retry that changes the dispositions from what the delivery was originally accepted for
+    // must never post a different GitHub effect under the original delivery identity.
+    const changedInput = { ...input, findingDispositions: [{ findingKey: "f1", disposition: "dismissed" as const }] };
+    const outcome = await finalizeModule.retryApprovalEffect({ github, attemptStore: store }, changedInput);
+
+    expect(outcome.status).toBe("withheld");
+    expect(counts.applyApprovalEffect).toBe(1);
+
+    // The original, unchanged payload still reconciles correctly afterward.
+    shouldThrow = false;
+    const retried = await finalizeModule.retryApprovalEffect({ github, attemptStore: store }, input);
+    expect(retried).toEqual({ status: "applied", effectId: `${attempt.attemptId}.approval` });
+    expect(counts.applyApprovalEffect).toBe(2);
+  });
+
+  it("retryApprovalEffect withholds when a conflicting result has been recorded since the delivery was accepted", async () => {
+    const { store, attempt } = await prepareAttempt();
+    const counts = { applyApprovalEffect: 0 };
+    const github = fakeGithub({
+      async applyApprovalEffect() {
+        counts.applyApprovalEffect++;
+        throw new Error("simulated crash before ack");
+      },
+    });
+    const finalizer = finalizeModule.createReviewFixFinalizer({ attemptStore: store, github });
+    const result = resultFor(attempt.attemptId, attempt.deadlineAt);
+    expect((await store.recordResult(attempt.attemptId, result)).status).toBe("stored");
+    const input = {
+      attemptId: attempt.attemptId,
+      scope: attempt.scope,
+      result,
+      currentAuthority: true,
+      currentPrHeadSha: OUTPUT_COMMIT,
+      findingDispositions: DISPOSITIONS,
+      policyAllows: true,
+    };
+
+    await expect(finalizer.applyApproval(input)).rejects.toThrow("simulated crash before ack");
+    expect(counts.applyApprovalEffect).toBe(1);
+
+    // A racing result for the same attempt is rejected as a conflict — recorded on the row even
+    // though it never displaces the originally accepted result.
+    const conflicting = resultFor(attempt.attemptId, attempt.deadlineAt, { outputCommit: "c".repeat(40) });
+    expect((await store.recordResult(attempt.attemptId, conflicting)).status).toBe("conflict");
+
+    const outcome = await finalizeModule.retryApprovalEffect({ github, attemptStore: store }, input);
+    expect(outcome.status).toBe("withheld");
+    expect(counts.applyApprovalEffect).toBe(1);
+  });
+
+  it("retryApprovalEffect withholds when the attempt's recorded terminal outcome is incompatible with approval", async () => {
+    const { store, attempt } = await prepareAttempt();
+    const counts = { applyApprovalEffect: 0 };
+    const github = fakeGithub({
+      async applyApprovalEffect() {
+        counts.applyApprovalEffect++;
+        throw new Error("simulated crash before ack");
+      },
+    });
+    const finalizer = finalizeModule.createReviewFixFinalizer({ attemptStore: store, github });
+    const result = resultFor(attempt.attemptId, attempt.deadlineAt);
+    const input = {
+      attemptId: attempt.attemptId,
+      scope: attempt.scope,
+      result,
+      currentAuthority: true,
+      currentPrHeadSha: OUTPUT_COMMIT,
+      findingDispositions: DISPOSITIONS,
+      policyAllows: true,
+    };
+
+    await expect(finalizer.applyApproval(input)).rejects.toThrow("simulated crash before ack");
+    expect(counts.applyApprovalEffect).toBe(1);
+
+    // A failed/cancelled verdict is recorded for the attempt after the approval delivery was
+    // accepted — the pending delivery must not be completed against a now-incompatible verdict.
+    const recorded = await finalizer.recordOutcome({
+      attemptId: attempt.attemptId,
+      scope: attempt.scope,
+      terminal: { status: "failed", reason: "backend reported failure after the effect was accepted" },
+    });
+    expect(recorded.status).toBe("recorded");
+
+    const outcome = await finalizeModule.retryApprovalEffect({ github, attemptStore: store }, input);
+    expect(outcome.status).toBe("withheld");
     expect(counts.applyApprovalEffect).toBe(1);
   });
 

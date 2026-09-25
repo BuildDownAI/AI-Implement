@@ -434,6 +434,20 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
   }
 
   /**
+   * Read-only peek at the attempt's immutable terminal verdict, or `null` if `recordOutcome` has
+   * never written one — never itself writes, unlike `recordOutcome`. `retryApprovalEffect`
+   * (AII-790) uses this to withhold a reconciliation when a verdict recorded after the original
+   * approval delivery was accepted turns out incompatible with approval.
+   */
+  async getRecordedOutcome(attemptId: AttemptId): Promise<ReviewFixImmutableOutcome | null> {
+    const row = getDb().prepare("SELECT terminal_outcome_json FROM review_fix_attempts WHERE attempt_id = ?").get(attemptId) as
+      | Pick<AttemptRow, "terminal_outcome_json">
+      | undefined;
+    if (!row || row.terminal_outcome_json === null) return null;
+    return JSON.parse(row.terminal_outcome_json) as ReviewFixImmutableOutcome;
+  }
+
+  /**
    * Idempotent outbox entry for one attempt's terminal effect (e.g. one
    * approval attempt), over the already-approved inbox schema (AII-774/781):
    * `review_fix_inbox` with `kind: "terminal-effect"`, keyed by
