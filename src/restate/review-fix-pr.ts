@@ -46,7 +46,8 @@ export function createReviewFixPR(deps: ReviewFixPRDependencies) {
   async function schedule(ctx: ObjectContext, kind: Wake["kind"], delay: number): Promise<void> {
     const wake: Wake = { token: ctx.rand.uuidv4(), kind };
     ctx.set("wake", wake);
-    ctx.genericSend({ service: "ReviewFixPR", method: "check", key: ctx.key, parameter: wake, delay });
+    ctx.genericSend({ service: "ReviewFixPR", method: "check", key: ctx.key, parameter: wake,
+      inputSerde: restate.serde.json, delay });
   }
 
   /** Called after the accepted event is durably written; no untrusted finding
@@ -80,7 +81,7 @@ export function createReviewFixPR(deps: ReviewFixPRDependencies) {
     }
     ctx.set("active", outcome.attempt.attemptId);
     ctx.genericSend({ service: "ReviewFixAttempt", method: "run", key: outcome.attempt.attemptId,
-      parameter: { attemptId: outcome.attempt.attemptId } });
+      parameter: { attemptId: outcome.attempt.attemptId }, inputSerde: restate.serde.json });
   }
 
   /** AII-811 calls this after the attempt workflow has finalized. An old
