@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
+import Database from "better-sqlite3";
 import type * as DedupModule from "../dedup.js";
 
 let dbPath: string;
@@ -56,6 +57,62 @@ describe("dedup", () => {
     dedup.markDispatched("id-2");
     const ids = dedup.getDispatchedIds();
     expect(ids.sort()).toEqual(["id-1", "id-2"]);
+  });
+});
+
+describe("dispatch admission schema", () => {
+  it("upgrades a pre-pilot database twice without backfilling or changing old dispatch history", () => {
+    const old = new Database(dbPath);
+    old.exec("CREATE TABLE dispatched (issue_id TEXT PRIMARY KEY, dispatched_at INTEGER NOT NULL)");
+    old.prepare("INSERT INTO dispatched (issue_id, dispatched_at) VALUES (?, ?)").run("old-issue", 123);
+    old.close();
+
+    const first = dedup.getDb();
+    expect(first.prepare("SELECT issue_id, dispatched_at FROM dispatched").all())
+      .toEqual([{ issue_id: "old-issue", dispatched_at: 123 }]);
+    expect((first.prepare("SELECT COUNT(*) AS n FROM dispatch_admissions").get() as { n: number }).n).toBe(0);
+    dedup.closeDb();
+    const second = dedup.getDb();
+    expect((second.prepare("SELECT COUNT(*) AS n FROM dispatch_admissions").get() as { n: number }).n).toBe(0);
+    expect((second.prepare("SELECT COUNT(*) AS n FROM dispatch_budget_entries").get() as { n: number }).n).toBe(0);
+    expect(second.prepare("SELECT issue_id FROM dispatched").all()).toEqual([{ issue_id: "old-issue" }]);
+  });
+
+  it("enforces one active scoped issue and PR while retaining released history and budget identity", () => {
+    const db = dedup.getDb();
+    const insert = db.prepare(`INSERT INTO dispatch_admissions
+      (dispatch_id, mapping_key, issue_scope, issue_id, installation_id, repository, pr_number,
+       lifecycle_owner, phase, backend, created_at)
+      VALUES (@dispatchId, 'APP', @issueScope, @issueId, @installationId, @repository, @prNumber,
+              'legacy', 'review-fix', 'github-actions', @createdAt)`);
+    const issue = (dispatchId: string, issueScope = "team-a", issueId = "AII-1") => insert.run({
+      dispatchId, issueScope, issueId, installationId: null, repository: null, prNumber: null, createdAt: 100,
+    });
+    issue("issue-1");
+    expect(() => issue("issue-conflict")).toThrow(/UNIQUE/);
+    issue("other-scope", "team-b");
+    db.prepare("UPDATE dispatch_admissions SET released_at = ?, release_reason = ? WHERE dispatch_id = ?")
+      .run(200, "terminal", "issue-1");
+    issue("issue-2");
+
+    const pr = (dispatchId: string, installationId = "7", repository = "BuildDownAI/AI-Implement", prNumber = 42) => insert.run({
+      dispatchId, issueScope: "pr", issueId: dispatchId, installationId, repository, prNumber, createdAt: 100,
+    });
+    pr("pr-1");
+    expect(() => pr("pr-conflict")).toThrow(/UNIQUE/);
+    pr("other-installation", "8");
+    pr("other-repository", "7", "BuildDownAI/Sandbox");
+    db.prepare("UPDATE dispatch_admissions SET released_at = ? WHERE dispatch_id = ?").run(201, "pr-1");
+    pr("pr-2");
+
+    const budget = db.prepare(`INSERT INTO dispatch_budget_entries
+      (dispatch_id, repository, pr_number, request_kind, created_at) VALUES (?, ?, ?, ?, ?)`);
+    budget.run("pr-1", "BuildDownAI/AI-Implement", 42, "automatic", 100);
+    expect(() => budget.run("pr-1", "BuildDownAI/AI-Implement", 42, "automatic", 101)).toThrow(/UNIQUE/);
+    budget.run("pr-2", "BuildDownAI/AI-Implement", 42, "automatic", 201);
+    expect(db.prepare("SELECT dispatch_id FROM dispatch_budget_entries ORDER BY created_at").all())
+      .toEqual([{ dispatch_id: "pr-1" }, { dispatch_id: "pr-2" }]);
+    expect((db.prepare("SELECT COUNT(*) AS n FROM review_fix_dispatches").get() as { n: number }).n).toBe(0);
   });
 });
 
