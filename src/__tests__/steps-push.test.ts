@@ -1239,6 +1239,30 @@ describe("pushStep — dependency install status in the PR body", () => {
     expect(body.body).toContain("- [ ] Automated verification was skipped — dependency install failed.");
   });
 
+  it("neutralizes an embedded fence in installError so the PR body's code block is not broken", async () => {
+    mockGitSuccess("abc123");
+    const ctx = makeContext();
+    ctx.setOutputs("install", { installFailed: true, installMethod: "npm ci" });
+    ctx.setOutputs("install-retry", {
+      installFailed: true,
+      installMethod: "npm ci",
+      installError: "some output\n```\nmalicious markdown injected here\n```\nmore output",
+    });
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true, status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/11", number: 11 }),
+      text: async () => "",
+    } as Response);
+
+    await pushStep.run(ctx, BASE_INPUTS, new NoopStepReporter());
+
+    const [, init] = vi.mocked(fetch).mock.calls[0];
+    const body = JSON.parse(String(init?.body)) as { body: string };
+    const fenceCount = (body.body.match(/^```$/gm) ?? []).length;
+    expect(fenceCount).toBe(2);
+    expect(body.body).toContain("'''\nmalicious markdown injected here\n'''");
+  });
+
   it("orders the dependency warning before the unapproved section when both are present", async () => {
     mockGitSuccess("abc123");
     const ctx = makeContext();

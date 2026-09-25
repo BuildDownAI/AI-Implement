@@ -7,6 +7,8 @@ import { refreshRunnerGithubCredentials } from "../../runner-token.js";
 import { getPublicationCredential } from "../../publication-credential.js";
 import { classifyGitFailure, envSecrets, oneLinerMessage, type FailureRecord } from "../failure-classification.js";
 import { computeBackoffMs, normalizeRetryPolicy } from "../retry-backoff.js";
+import { dependenciesMissing } from "../pipeline-loader.js";
+import { neutralizeFences } from "../../completion-classification.js";
 
 const LS_REMOTE_MAX_ATTEMPTS = 3;
 const LS_REMOTE_RETRY_DELAYS_MS = [250, 1000];
@@ -578,10 +580,11 @@ function buildPullRequestBody(
   const initialInstallFailed = installOutputs.installFailed === true;
   const retryFailed = installRetryOutputs.installFailed === true;
   // A skipped install-retry (first install succeeded) leaves empty outputs, so
-  // retryFailed is false and both branches below fall through to "nothing new" —
-  // matching dependenciesMissing's own skip semantics (src/pipeline/pipeline-loader.ts).
+  // retryFailed is false and both branches below fall through to "nothing new".
   const retrySucceeded = initialInstallFailed && !retryFailed;
-  const dependenciesFailed = initialInstallFailed && retryFailed;
+  // Single source of truth shared with the push step's own `draft` input
+  // (pipeline-loader.ts) so this section can never diverge from draft/skip behaviour.
+  const dependenciesFailed = dependenciesMissing(context);
   const title = stringValue(issueTitle) ?? "AI implementation";
   const description = stringValue(issueDescription);
 
@@ -650,7 +653,7 @@ function buildDependencyInstallSection(installMethod: string, installError: stri
     `Dependency install (\`${installMethod}\`) failed before and after the agent ran; build, lint, typecheck, and tests never ran.`,
     "",
     "```",
-    installError ?? "(no output captured)",
+    installError ? neutralizeFences(installError) : "(no output captured)",
     "```",
   ].join("\n");
 }

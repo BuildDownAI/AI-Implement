@@ -9,6 +9,7 @@ import { repoProcessEnv } from "../process-env.js";
 import { resolveTrustedReviewer, type ReviewerDefinition } from "../reviewers/registry.js";
 import { REVIEWER_VERDICT_SCHEMA } from "../reviewers/schema.js";
 import { redactAndCap } from "../failure-classification.js";
+import { neutralizeFences } from "../../completion-classification.js";
 
 interface RepoModels {
   implement?: string;
@@ -395,7 +396,7 @@ function writeDependencyInstallComment(
         `Dependency install (\`${installMethod}\`) failed before and after the agent ran. Build and tests did not run.`,
         "",
         "```",
-        result.installError ?? "(no output captured)",
+        result.installError ? neutralizeFences(result.installError) : "(no output captured)",
         "```",
       ].join("\n")
     : `Dependency install (\`${installMethod}\`) failed before the agent ran and succeeded after its change.`;

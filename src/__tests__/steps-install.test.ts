@@ -574,6 +574,21 @@ describe("installStep", () => {
       expect(body as string).toContain("ERESOLVE unable to resolve dependency tree");
     });
 
+    it("neutralizes an embedded fence in installError so the comment's code block is not broken", async () => {
+      mockSpawnExit(1, { stdout: ["some output\n```\nmalicious markdown injected here\n```\nmore output\n"] });
+
+      await installStep.run(
+        makeContext(),
+        { workspaceDir: "/tmp/test", retry: true, packageManager: "npm" },
+        new NoopStepReporter(),
+      );
+
+      const [[, body]] = vi.mocked(fs.writeFileSync).mock.calls;
+      const fenceCount = ((body as string).match(/^```$/gm) ?? []).length;
+      expect(fenceCount).toBe(2);
+      expect(body as string).toContain("'''\nmalicious markdown injected here\n'''");
+    });
+
     it("never writes a comment file on the first (non-retry) attempt, success or failure", async () => {
       mockRootPackageJson();
       mockSpawnSuccess();
