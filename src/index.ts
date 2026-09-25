@@ -43,7 +43,7 @@ import { initAuthEventsTable } from "./mcp-auth-events.js";
 import { initAccessPageGrantsTable } from "./access-page-grants.js";
 import { handleTokenRequest } from "./token-vending.js";
 import { handleDependencyTokenRequest } from "./dependency-token-vending.js";
-import { handlePublicationTokenRequest } from "./publication-token-vending.js";
+import { handlePublicationAuthorityCheck, handlePublicationTokenRequest } from "./publication-token-vending.js";
 import { handleReferenceTokenRequest } from "./reference-token-vending.js";
 import { handleStatusUpdate, handleStepReport } from "./session-api.js";
 import { postStatusComment } from "./status-events.js";
@@ -3800,19 +3800,25 @@ function startServer(
 
     // Publication token vending — dedicated, single-use runner credential;
     // returns a fresh token scoped to the exact repository signed at dispatch.
-    if (url === "/api/runner/publication-token" && req.method === "POST") {
+    if ((url === "/api/runner/publication-token" || url === "/api/runner/publication-authority") && req.method === "POST") {
       (async () => {
         if (!config.runnerTokenSecret) {
           res.writeHead(501, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "Runner callback not configured" }));
           return;
         }
-        const result = await handlePublicationTokenRequest({
+        const request = {
           authorization: req.headers.authorization,
           secret: config.runnerTokenSecret,
           githubAppId: config.githubAppId,
           githubAppPrivateKey: config.githubAppPrivateKey,
-        });
+          repository: req.headers["x-run-repository"] as string | undefined,
+          githubRunId: Number(req.headers["x-github-run-id"]),
+          githubRunAttempt: Number(req.headers["x-github-run-attempt"]),
+        };
+        const result = url === "/api/runner/publication-authority"
+          ? handlePublicationAuthorityCheck(request)
+          : await handlePublicationTokenRequest(request);
         res.writeHead(result.status, { "Content-Type": "application/json" });
         res.end(JSON.stringify(result.body));
       })().catch((err) => {

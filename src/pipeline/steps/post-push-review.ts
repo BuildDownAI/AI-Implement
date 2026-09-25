@@ -10,7 +10,7 @@ import { REVIEW_VERDICT_JSON_SCHEMA, parseReviewVerdict, type ReviewIssue as Ver
 import { classifyLlmResult, type FailureRecord } from "../failure-classification.js";
 import { computeBackoffMs, normalizeRetryPolicy } from "../retry-backoff.js";
 import { summaryLine } from "../claude-stream.js";
-import { refreshRunnerGithubCredentials } from "../../runner-token.js";
+import { assertRunnerPublicationAuthority, refreshRunnerGithubCredentials } from "../../runner-token.js";
 import { getPublicationCredential } from "../../publication-credential.js";
 import {
   AI_IMPLEMENT_NATIVE_REVIEW_MARKER,
@@ -2466,6 +2466,11 @@ ${externalFindingsFixBlock}
         }
         expectedRemoteSha = remoteBranchSha(gitSpawn, branchName);
       }
+      await assertRunnerPublicationAuthority({
+        callbackUrl: context.data.callbackUrl,
+        owner: context.data.githubOwner ?? "",
+        repo: context.data.githubRepo ?? "",
+      });
       const push = gitSpawn([
         "push",
         "origin",
