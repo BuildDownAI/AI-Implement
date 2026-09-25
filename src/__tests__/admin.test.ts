@@ -88,6 +88,15 @@ vi.mock("../local-job-logs.js", () => ({
   readLocalJobLogs: readLocalJobLogsMock,
 }));
 
+// The reviewFixLifecycle="restate" enablement check (AII-804) probes the dispatch-ref
+// workflow's capabilities the same way the review-fix dispatcher itself does; mocked here
+// so the save-boundary tests below don't depend on real network access.
+const resolveWorkflowCapabilitiesMock = vi.hoisted(() => vi.fn());
+vi.mock("../workflow-probe.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../workflow-probe.js")>()),
+  resolveWorkflowCapabilities: resolveWorkflowCapabilitiesMock,
+}));
+
 function makeFakeRegistry(provider: FakeProvider): ProviderRegistry {
   return {
     forMapping: async () => provider,
@@ -230,6 +239,20 @@ async function requestWithConfig(
   const req = new MockRequest(url, method, { authorization: `Bearer ${token}` });
   const res = new MockResponse();
   admin.handleAdminRequest(req as never, res as never, cfg, makeFakeRegistry(provider));
+  await res.done;
+  return { statusCode: res.statusCode, body: res.body };
+}
+
+async function requestWithDeps(
+  url: string,
+  method: string,
+  token: string,
+  deps: Parameters<typeof admin.handleAdminRequest>[4],
+  body?: unknown,
+): Promise<{ statusCode: number; body: string }> {
+  const req = new MockRequest(url, method, { authorization: `Bearer ${token}` }, body === undefined ? undefined : JSON.stringify(body));
+  const res = new MockResponse();
+  admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider), deps);
   await res.done;
   return { statusCode: res.statusCode, body: res.body };
 }
@@ -1609,7 +1632,7 @@ describe("admin mappings", () => {
     expect(JSON.parse(res.body).error).toContain("github-actions");
   });
 
-  it("rejects reviewFixLifecycle='restate' on github-actions with an actionable 400 — no Restate endpoint/capability signal is wired yet (fail closed, not a live enablement)", async () => {
+  it("rejects reviewFixLifecycle='restate' on github-actions with an actionable 400 when no Restate endpoint status is available (fail closed, deps.getRestateStatus unset)", async () => {
     const token = await login("secret");
     const res = await request("/api/mappings", "POST", "secret", {
       teamKey: "RFLGHA", owner: "org", repo: "app",
@@ -1621,6 +1644,44 @@ describe("admin mappings", () => {
 
     const list = await request("/api/mappings", "GET", "secret", undefined, token);
     expect(JSON.parse(list.body).RFLGHA).toBeUndefined();
+  });
+
+  it("rejects reviewFixLifecycle='restate' with a registered, healthy Restate endpoint but a dispatch-ref workflow lacking the attempt-correlation capability", async () => {
+    const token = await login("secret");
+    resolveWorkflowCapabilitiesMock.mockResolvedValueOnce({
+      contract: "envelope", supportsRunPublicationToken: true, supportsAttemptCorrelation: false,
+    });
+    const res = await requestWithDeps("/api/mappings", "POST", token, {
+      getRestateStatus: () => ({ sidecar: { state: "ready" }, registration: { state: "registered" } }),
+    }, {
+      teamKey: "RFLCAP", owner: "org", repo: "app", defaultBranch: "main",
+      executionMode: "github-actions",
+      reviewFixLifecycle: "restate",
+    });
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toContain("run_attempt_token");
+    expect(resolveWorkflowCapabilitiesMock).toHaveBeenCalledWith(expect.objectContaining({
+      owner: "org", repo: "app", workflowFile: "claude-implement.yml", ref: "main", token: "gh-token-mock",
+    }));
+  });
+
+  it("accepts reviewFixLifecycle='restate' when github-actions, the Restate endpoint is registered and healthy, and the dispatch-ref workflow supports attempt correlation", async () => {
+    const token = await login("secret");
+    resolveWorkflowCapabilitiesMock.mockResolvedValueOnce({
+      contract: "envelope", supportsRunPublicationToken: true, supportsAttemptCorrelation: true,
+    });
+    const res = await requestWithDeps("/api/mappings", "POST", token, {
+      getRestateStatus: () => ({ sidecar: { state: "ready" }, registration: { state: "registered" } }),
+    }, {
+      teamKey: "RFLOK", owner: "org", repo: "app", defaultBranch: "main",
+      executionMode: "github-actions",
+      reviewFixLifecycle: "restate",
+    });
+    expect(res.statusCode).toBe(202);
+    expect(JSON.parse(res.body).reviewFixLifecycle).toBe("restate");
+
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    expect(JSON.parse(list.body).RFLOK.reviewFixLifecycle).toBe("restate");
   });
 
   it("does not write reviewFixLifecycle='restate' when a save is rejected — the mapping keeps its prior Legacy selection", async () => {

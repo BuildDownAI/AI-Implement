@@ -88,7 +88,9 @@ import { normalizeBranchPrefix } from "./pipeline/branch-name.js";
 import { normalizeGitHubRepo, normalizeReferenceRepos, type ReferenceRepo } from "./reference-repos.js";
 import { fetchTrackerIssuesPage } from "./runner-callback.js";
 import { isLinearAuthConfigured } from "./linear-app-auth.js";
+import { resolveWorkflowCapabilities } from "./workflow-probe.js";
 import type { callTool } from "./restate/tools-client.js";
+import type { RestateStatus } from "./restate/status.js";
 import type { Caller } from "./mcp-identity.js";
 import picomatch from "picomatch";
 
@@ -173,21 +175,47 @@ function validReviewerMaxTurns(value: unknown): value is number {
  * proceed. Only automatic GitHub Actions review-fix runs ever move to Restate — local
  * review-fix and human comment-triggered runs stay on Legacy admission regardless.
  *
- * Fails closed on unknown support (AII-804): this validator has no admin-safe signal yet for
- * either "registered, healthy Restate endpoint" (src/restate/status.ts's registration state,
- * set only by AII-807's boot wiring, not yet implemented) or "installed template/runner
- * capability on the dispatch ref" (src/workflow-probe.ts's live, async GitHub probe, which
- * this synchronous validator cannot call — and src/admin.ts may only import src/restate/* as
- * types, per src/__tests__/restate-boundary.test.ts). Both prerequisites are therefore
- * reported as unavailable rather than guessed at; a later issue wires a real signal in and
- * narrows this message once one exists. This issue carries the storage/validation shape, not
- * permission to enable the live pilot.
+ * Checks both real prerequisites and fails closed whenever either signal is unavailable or
+ * ambiguous (AII-804) — this never guesses:
+ *  - "registered, healthy Restate endpoint": `deps.getRestateStatus()` (src/restate/status.ts,
+ *    injected — see AdminDeps.getRestateStatus for why this file can't import it directly)
+ *    must report the sidecar ready and the endpoint registered. AII-773/AII-724/AII-807 own
+ *    when that state actually becomes reachable in production; until then this reports the
+ *    endpoint unavailable rather than accepting on a hardcoded assumption.
+ *  - "installed template/runner capability on the dispatch ref": a live probe of the target
+ *    workflow file at `ref` (src/workflow-probe.ts's resolveWorkflowCapabilities, the same
+ *    call the review-fix dispatcher itself makes) must show it declares `run_attempt_token`
+ *    (AII-778's attempt-correlation contract) — the capability the Restate pilot actually
+ *    depends on to correlate a dispatch back to its attempt.
  */
-function reviewFixLifecycleEnablementError(executionMode: ExecutionMode): string | null {
+async function reviewFixLifecycleEnablementError(
+  params: { executionMode: ExecutionMode; owner: string; repo: string; workflowFile: string; ref: string },
+  config: AdminConfig,
+  deps: AdminDeps,
+): Promise<string | null> {
+  const { executionMode, owner, repo, workflowFile, ref } = params;
   if (executionMode !== "github-actions") {
     return `reviewFixLifecycle "restate" requires executionMode "github-actions"`;
   }
-  return `reviewFixLifecycle "restate" requires a registered, healthy Restate endpoint and installed template/runner capability on the dispatch ref, neither of which is available yet`;
+
+  const restateStatus = deps.getRestateStatus?.();
+  if (!restateStatus || restateStatus.sidecar.state !== "ready" || restateStatus.registration.state !== "registered") {
+    return `reviewFixLifecycle "restate" requires a registered, healthy Restate endpoint, which is not currently available`;
+  }
+
+  let capabilities: Awaited<ReturnType<typeof resolveWorkflowCapabilities>>;
+  try {
+    const token = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
+    capabilities = await resolveWorkflowCapabilities({ owner, repo, workflowFile, token, ref });
+  } catch (err) {
+    return `reviewFixLifecycle "restate" requires confirming the dispatch-ref workflow's capability, but the check failed: ${err instanceof Error ? err.message : String(err)}`;
+  }
+
+  if (!capabilities.supportsAttemptCorrelation) {
+    return `reviewFixLifecycle "restate" requires "${workflowFile}" on "${ref}" to declare run_attempt_token (installed template/runner capability), which it does not`;
+  }
+
+  return null;
 }
 
 let _adminJiraClient: JiraClient | null = null;
@@ -421,6 +449,14 @@ export interface AdminDeps {
   };
   /** The tools-service ingress caller (src/restate/tools-client.ts, AII-710). Absent only in tests that don't exercise POST /api/tools/<name>. */
   callTool?: typeof callTool;
+  /**
+   * Reads the Restate sidecar/endpoint status (src/restate/status.ts's getRestateStatus,
+   * AII-773/AII-804). Injected rather than imported at runtime because this file may only
+   * import src/restate/* as types (src/__tests__/restate-boundary.test.ts) — the real
+   * function is bound in src/index.ts, which sits on that test's runtime-import allowlist.
+   * Absent only in tests that don't exercise reviewFixLifecycle="restate" enablement.
+   */
+  getRestateStatus?: () => RestateStatus;
 }
 
 /**
@@ -513,7 +549,7 @@ export function handleAdminRequest(
     }
 
     if (url === "/api/mappings" && method === "POST") {
-      handleUpsertMapping(req, res, config, registry);
+      handleUpsertMapping(req, res, config, registry, deps);
       return true;
     }
 
@@ -2454,11 +2490,12 @@ export interface UpsertMappingBody {
   reviewFixLifecycle?: string | null;
 }
 
-export function upsertMappingAction(
+export async function upsertMappingAction(
   body: UpsertMappingBody,
   config: AdminConfig,
   registry: ProviderRegistry,
-): { status: number; body: Record<string, unknown> } {
+  deps: AdminDeps = {},
+): Promise<{ status: number; body: Record<string, unknown> }> {
   if (!body.teamKey || !body.owner || !body.repo) {
     return { status: 400, body: { error: "teamKey, owner, and repo are required" } };
   }
@@ -2654,7 +2691,11 @@ export function upsertMappingAction(
   } else if (rawLifecycle === "legacy") {
     reviewFixLifecycle = "legacy";
   } else if (rawLifecycle === "restate") {
-    const enablementError = reviewFixLifecycleEnablementError(executionMode);
+    const enablementError = await reviewFixLifecycleEnablementError(
+      { executionMode, owner: body.owner, repo: body.repo, workflowFile, ref: defaultBranch },
+      config,
+      deps,
+    );
     if (enablementError) {
       return { status: 400, body: { error: enablementError } };
     }
@@ -2736,10 +2777,11 @@ async function handleUpsertMapping(
   res: http.ServerResponse,
   config: AdminConfig,
   registry: ProviderRegistry,
+  deps: AdminDeps,
 ): Promise<void> {
   try {
     const body = JSON.parse(await readBody(req)) as UpsertMappingBody;
-    const result = upsertMappingAction(body, config, registry);
+    const result = await upsertMappingAction(body, config, registry, deps);
     json(res, result.status, result.body);
   } catch {
     json(res, 400, { error: "Invalid request body" });
