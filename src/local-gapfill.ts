@@ -26,6 +26,8 @@ export interface DispatchLocalGapfillInput {
   claudeOAuthToken?: string | null;
   commentInstruction?: string;
   retryPolicy: RetryPolicy | null;
+  /** Called after all local preparation, immediately before the potentially ambiguous Docker launch. */
+  onBeforeLaunch?: () => void;
 }
 
 export interface DispatchLocalGapfillResult {
@@ -64,6 +66,7 @@ export async function dispatchLocalGapfill(input: DispatchLocalGapfillInput): Pr
     throw new Error("Local gap-fill envelope did not include run_config");
   }
   const runConfig = decodeRunConfig(envelope.run_config);
+  input.onBeforeLaunch?.();
   const container = await startLocalRunnerContainer({
     image: input.image,
     issueId: input.issue.id,

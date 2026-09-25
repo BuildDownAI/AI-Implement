@@ -178,6 +178,7 @@ function makeBaseDrainOpts(overrides: Partial<DrainInput> = {}): DrainInput {
     runnerCallbackBaseUrl: null,
     runnerTokenSecret: null,
     getInstallationToken: vi.fn<DrainInput["getInstallationToken"]>(async () => "gh-token"),
+    getInstallationId: vi.fn<DrainInput["getInstallationId"]>(async () => 778899),
     resolveRunnerImage: vi.fn<DrainInput["resolveRunnerImage"]>(async () => undefined),
     checkContract: vi.fn<DrainInput["checkContract"]>(async () => "envelope"),
     dispatch: vi.fn<DrainInput["dispatch"]>(async () => ({ success: true, status: 204 })),
@@ -1009,7 +1010,7 @@ describe("drainCommentGapfillQueue — admission (AII-787)", () => {
     const competitor = admission.acquire({
       dispatchId: "competitor-dispatch",
       mappingKey: "TEAM",
-      scope: { kind: "pr", issueId: "issue-race-1", installationId: "acme", repository: "acme/billing", prNumber: 80 },
+      scope: { kind: "pr", issueId: "issue-race-1", installationId: "778899", repository: "acme/billing", prNumber: 80 },
       kind: "gap-fill",
       backend: "github-actions",
       lifecycleOwner: { kind: "legacy" },
@@ -1047,7 +1048,7 @@ describe("drainCommentGapfillQueue — admission (AII-787)", () => {
     const filler = admission.acquire({
       dispatchId: "filler-dispatch",
       mappingKey: "TEAM",
-      scope: { kind: "pr", issueId: "other-issue", installationId: "acme", repository: "acme/billing", prNumber: 82 },
+      scope: { kind: "pr", issueId: "other-issue", installationId: "778899", repository: "acme/billing", prNumber: 82 },
       kind: "gap-fill",
       backend: "github-actions",
       lifecycleOwner: { kind: "legacy" },
@@ -1078,7 +1079,7 @@ describe("drainCommentGapfillQueue — admission (AII-787)", () => {
     seedDispatchLog("issue-release-1", "AII-302", "Release test", "acme", "billing", 83);
     queue.enqueueCommentGapfill({ owner: "acme", repo: "billing", prNumber: 83, commentId: 0, commenter: "", instruction: "" });
 
-    const dispatchSpy = vi.fn<DrainInput["dispatch"]>(async () => ({ success: false, status: 500, error: "boom" }));
+    const dispatchSpy = vi.fn<DrainInput["dispatch"]>(async () => ({ success: false, status: 422, error: "Workflow not found", outcome: "rejected" }));
 
     await drain.drainCommentGapfillQueue(makeBaseDrainOpts({
       getMappings: () => ({ TEAM: mapping }),
@@ -1095,7 +1096,7 @@ describe("drainCommentGapfillQueue — admission (AII-787)", () => {
     const retryScope = {
       kind: "pr" as const,
       issueId: "issue-release-1",
-      installationId: "acme",
+      installationId: "778899",
       repository: "acme/billing",
       prNumber: 83,
     };
@@ -1142,7 +1143,7 @@ describe("drainCommentGapfillQueue — admission (AII-787)", () => {
     const blocked = admission.acquire({
       dispatchId: "post-success-dispatch",
       mappingKey: "TEAM",
-      scope: { kind: "pr", issueId: "other-issue-2", installationId: "acme", repository: "acme/billing", prNumber: 85 },
+      scope: { kind: "pr", issueId: "other-issue-2", installationId: "778899", repository: "acme/billing", prNumber: 85 },
       kind: "gap-fill",
       backend: "github-actions",
       lifecycleOwner: { kind: "legacy" },
@@ -1169,7 +1170,7 @@ describe("drainCommentGapfillQueue — admission (AII-787)", () => {
     const blocked = admission.acquire({
       dispatchId: "post-fly-success-dispatch",
       mappingKey: "TEAM",
-      scope: { kind: "pr", issueId: "other-issue-3", installationId: "acme", repository: "acme/billing", prNumber: 87 },
+      scope: { kind: "pr", issueId: "other-issue-3", installationId: "778899", repository: "acme/billing", prNumber: 87 },
       kind: "gap-fill",
       backend: "fly-machines",
       lifecycleOwner: { kind: "legacy" },
@@ -1178,7 +1179,7 @@ describe("drainCommentGapfillQueue — admission (AII-787)", () => {
     expect(blocked).toEqual(expect.objectContaining({ ok: false, reason: "at_capacity" }));
   });
 
-  it("local-docker dispatch (Legacy) never writes to the admission table", async () => {
+  it("local-docker dispatch reserves capacity under the Legacy lifecycle owner", async () => {
     const mapping = makeMapping({ owner: "acme", repo: "billing" });
     seedDispatchLog("issue-local-admission", "AII-305", "Local test", "acme", "billing", 88);
     queue.enqueueCommentGapfill({ owner: "acme", repo: "billing", prNumber: 88, commentId: 0, commenter: "", instruction: "" });
@@ -1190,6 +1191,59 @@ describe("drainCommentGapfillQueue — admission (AII-787)", () => {
     }));
 
     expect(localGapfillMocks.dispatchLocalGapfill).toHaveBeenCalledTimes(1);
+    expect(admission.count("TEAM")).toBe(1);
+  });
+
+  it("holds capacity after an unknown GitHub 5xx outcome", async () => {
+    const mapping = makeMapping({ owner: "acme", repo: "billing", maxInProgressAiIssues: 1 });
+    seedDispatchLog("issue-unknown", "AII-306", "Unknown launch", "acme", "billing", 89);
+    queue.enqueueCommentGapfill({ owner: "acme", repo: "billing", prNumber: 89, commentId: 1, commenter: "operator", instruction: "fix" });
+    const dispatchSpy = vi.fn<DrainInput["dispatch"]>(async () => ({ success: false, status: 500, outcome: "unknown" }));
+
+    await drain.drainCommentGapfillQueue(makeBaseDrainOpts({ getMappings: () => ({ TEAM: mapping }), dispatch: dispatchSpy }));
+
+    expect(dispatchSpy).toHaveBeenCalledWith(expect.anything(), expect.anything(), expect.anything(), { returnRunDetails: true });
+    expect(admission.count("TEAM")).toBe(1);
+    const recorded = dedup.getDb().prepare("SELECT admission_generation, status FROM dispatch_log WHERE issue_id = ? AND phase = 'gap-analysis'").get("issue-unknown") as { admission_generation: number; status: string };
+    expect(recorded).toEqual({ admission_generation: 0, status: "dispatched" });
+  });
+
+  it("releases Fly admission if image preparation fails before createMachine", async () => {
+    const mapping = makeMapping({ owner: "acme", repo: "billing", executionMode: "fly-machines" });
+    seedDispatchLog("issue-fly-prep", "AII-307", "Fly prep", "acme", "billing", 90);
+    queue.enqueueCommentGapfill({ owner: "acme", repo: "billing", prNumber: 90, commentId: 0, commenter: "", instruction: "" });
+    flyMocks.resolveSessionImage.mockRejectedValueOnce(new Error("image unavailable"));
+
+    await drain.drainCommentGapfillQueue(makeBaseDrainOpts({
+      getMappings: () => ({ TEAM: mapping }), flySessionsToken: "fly-token", flySessionsApp: "fly-app", anthropicApiKey: "anthropic-key",
+    }));
+
+    expect(flyMocks.createMachine).not.toHaveBeenCalled();
+    expect(admission.count("TEAM")).toBe(0);
+  });
+
+  it("releases a rejected launch even if failure notification throws", async () => {
+    const mapping = makeMapping({ owner: "acme", repo: "billing" });
+    seedDispatchLog("issue-notify", "AII-308", "Notify failure", "acme", "billing", 91);
+    queue.enqueueCommentGapfill({ owner: "acme", repo: "billing", prNumber: 91, commentId: 0, commenter: "", instruction: "" });
+
+    await drain.drainCommentGapfillQueue(makeBaseDrainOpts({
+      getMappings: () => ({ TEAM: mapping }),
+      dispatch: vi.fn(async () => ({ success: false, status: 422, outcome: "rejected" as const })),
+      onDispatchFailure: vi.fn(async () => { throw new Error("notifier down"); }),
+    }));
+
+    expect(admission.count("TEAM")).toBe(0);
+  });
+
+  it("releases local admission when preparation fails before Docker launch", async () => {
+    const mapping = makeMapping({ owner: "acme", repo: "billing" });
+    seedDispatchLog("issue-local-prep", "AII-309", "Local preparation", "acme", "billing", 92);
+    queue.enqueueCommentGapfill({ owner: "acme", repo: "billing", prNumber: 92, commentId: 0, commenter: "", instruction: "" });
+    localGapfillMocks.dispatchLocalGapfill.mockRejectedValueOnce(new Error("missing image"));
+
+    await drain.drainCommentGapfillQueue(makeBaseDrainOpts({ getMappings: () => ({ TEAM: mapping }), runnerMode: "local", anthropicApiKey: "anthropic-key" }));
+
     expect(admission.count("TEAM")).toBe(0);
   });
 });
