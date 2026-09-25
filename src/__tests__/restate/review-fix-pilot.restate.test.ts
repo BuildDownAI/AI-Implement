@@ -33,6 +33,9 @@ import {
   type ReviewFixPendingFeedback,
 } from "../../review-fix-ports.js";
 import { SqliteReviewFixAttemptStore } from "../../review-fix-attempt-store.js";
+import { upsertReviewFinding } from "../../review-ledger-store.js";
+import { enqueueReviewFix } from "../../review-fix-queue.js";
+import { loadPendingReviewFixFeedback } from "../../review-fix-pending.js";
 import { createReviewFixFinalizer, retryApprovalEffect } from "../../review-fix-finalize.js";
 import type { ReviewFixGitHubAdapter } from "../../review-fix-finalize.js";
 import { createReviewFixGithubAdapter } from "../../review-fix-github-adapter.js";
@@ -90,6 +93,17 @@ function sha(seed: string): string {
   return createHash("sha256").update(seed).digest("hex").slice(0, 40);
 }
 
+/** A stable, `review-fix-inbox.ts`-legal delivery id for one PR's Nth feedback
+ *  signal. `reviewFixPRKey(scope)` is a JSON array string (`[installationId,
+ *  "owner/repo",prNumber]`) — embedding it directly, as an earlier version of
+ *  this suite did, produces `[`, `"`, `,`, and `/` characters that `acceptDelivery`'s
+ *  `ID_PATTERN` rejects before any test reaches the workflow. Hashing keeps the
+ *  charset legal while staying deterministic per (scope, n) so a retried delivery
+ *  (e.g. the "inbox commit before ACK" crash window) still resolves to the same row. */
+function feedbackDeliveryId(scope: ScopedPrIdentity, n: number): string {
+  return `feedback-${sha(`${reviewFixPRKey(scope)}#${n}`)}`;
+}
+
 async function until(predicate: () => boolean, timeoutMs = 10_000): Promise<void> {
   const stop = Date.now() + timeoutMs;
   while (!predicate()) {
@@ -120,6 +134,10 @@ interface GithubFixture {
   comments: string[];
   commentPosts: number;
   pending: ReviewFixPendingFeedback | null;
+  /** When true, `load()` ignores `pending` above and derives it from the real
+   *  `review_fix_queue`/`review_findings` tables via `loadPendingReviewFixFeedback`
+   *  (including its `queueCursor`), instead of the hand-supplied fixture value. */
+  useProductionPending: boolean;
   windowMs: number;
   jobTimeoutMinutes: number;
   blockAdmission: "paused" | "occupied" | "at_capacity" | "budget_exhausted" | null;
@@ -160,7 +178,7 @@ function freshScenario(prefix: string, opts: { cap?: number; budget?: number; pa
     open: true, draft: false, merged: false, mergeable: true, mergeableState: "clean",
     headSha: sha(`${owner}-initial`),
     checks: [], statusState: "success", statusCount: 0, reviews: [], comments: [], commentPosts: 0,
-    pending: null, windowMs: 200, jobTimeoutMinutes: LONG_DEADLINE_JOB_TIMEOUT_MINUTES,
+    pending: null, useProductionPending: false, windowMs: 200, jobTimeoutMinutes: LONG_DEADLINE_JOB_TIMEOUT_MINUTES,
     blockAdmission: null, admitOverride: null, recordResultOverride: null, applyApprovalEffectOverride: null,
     dispatchImpl: () => { throw new Error("unset"); },
     dispatchCalls: 0, listRunsVisible: true, runId: null, runAttempt: 1, runDetail: null,
@@ -382,7 +400,8 @@ const pr = createReviewFixPR({
   },
   load: async (scope) => {
     const fixture = findFixture(scope.repository);
-    return { closed: fixture.merged || !fixture.open, jobTimeoutMinutes: fixture.jobTimeoutMinutes, pending: fixture.pending };
+    const pending = fixture.useProductionPending ? loadPendingReviewFixFeedback(scope, null) : fixture.pending;
+    return { closed: fixture.merged || !fixture.open, jobTimeoutMinutes: fixture.jobTimeoutMinutes, pending };
   },
   collectionWindowMs: async (scope) => findFixture(scope.repository).windowMs,
 });
@@ -425,10 +444,10 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
 
   async function triggerFeedback(env: RestateTestEnvironment, scope: ScopedPrIdentity, n = 1): Promise<void> {
     const accepted = acceptDelivery({
-      authenticatedSource: "test-tracker", deliveryId: `${reviewFixPRKey(scope)}.feedback.${n}`,
+      authenticatedSource: "test-tracker", deliveryId: feedbackDeliveryId(scope, n),
       kind: "feedback", destination: scope, payload: {},
     });
-    if (accepted.status !== "accepted") throw new Error(`test bug: feedback delivery ${accepted.status}`);
+    expect(accepted.status).toBe("accepted");
     await pumpFor(env.baseUrl()).tick();
   }
 
@@ -439,6 +458,29 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     const attemptId = latestAttemptRow(fixture.scope)!.attemptId;
     fixture.attemptId = attemptId;
     fixtureByAttempt.set(attemptId, fixture);
+  }
+
+  /** Seeds one real, open `review_findings` row for `fixture`'s scope — a distinct
+   *  `body` per call so each gets its own content-addressed `finding_key`
+   *  (`stableReviewFindingKey`, hashed from source/path/line/body). */
+  function seedOpenFinding(fixture: GithubFixture, body: string): number {
+    return upsertReviewFinding({
+      repo: fixture.scope.repository, prNumber: fixture.scope.prNumber,
+      source: "review-contract", severity: "medium", body,
+    });
+  }
+
+  let queueEventSeq = 0;
+  /** Enqueues one real `review_fix_queue`/`review_fix_events` row referencing the
+   *  given finding ids — what moves `loadPendingReviewFixFeedback`'s queue lookup
+   *  from "no pending queue entry" to a fresh `queueCursor`, exactly as the
+   *  production webhook-driven path does via `acceptReviewFixWebhookEvent`. */
+  function seedQueueEvent(fixture: GithubFixture, reason: string, findingIds: number[]): void {
+    enqueueReviewFix({
+      issueId: `${fixture.scope.repository}#${fixture.scope.prNumber}`, issueIdentifier: null,
+      repo: fixture.scope.repository, prNumber: fixture.scope.prNumber, reason, findingIds,
+      sourceEventId: `seed-${queueEventSeq++}`,
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -508,29 +550,82 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     expect(budgetEntryCount(fixture.scope.repository, fixture.scope.prNumber)).toBe(0);
   }, 20_000);
 
-  it.each(VARIANTS.map(([label]) => label))("more than 30 finding versions admits the oldest 30 and preserves the rest pending (%s)", async (label) => {
+  it.each(VARIANTS.map(([label]) => label))("more than 30 finding versions admits the oldest 30 and preserves the rest pending, per the production pending-feedback projection (%s)", async (label) => {
     const env = envFor(label);
     const fixture = freshScenario("overflow");
-    const findings = Array.from({ length: 35 }, (_, i) => ({ findingKey: `finding-${i}`, version: 1 }));
-    await admitOne(env, fixture, findings);
-    const prepared = await sqliteStore.getPreparedAttempt(fixture.attemptId!);
+    fixture.useProductionPending = true;
+    // Real review_findings rows (distinct body per finding, so each gets its own
+    // content-addressed finding_key) plus one real review_fix_queue/events row —
+    // the exact tables loadPendingReviewFixFeedback (and admit()'s cursor
+    // re-validation) read, not a hand-built ReviewFixPendingFeedback.
+    const findingIds = Array.from({ length: 35 }, (_, i) => seedOpenFinding(fixture, `Overflow finding number ${i}`));
+    seedQueueEvent(fixture, "automatic review-fix findings", findingIds);
+    const beforeAdmission = loadPendingReviewFixFeedback(fixture.scope, null);
+    expect(beforeAdmission?.findings).toHaveLength(30);
+    expect(beforeAdmission?.queueCursor).toMatchObject({ queueId: expect.any(Number), eventId: expect.any(Number) });
+
+    await triggerFeedback(env, fixture.scope);
+    await until(() => latestAttemptRow(fixture.scope) !== undefined, 8_000);
+    const attemptId = latestAttemptRow(fixture.scope)!.attemptId;
+    fixture.attemptId = attemptId;
+    fixtureByAttempt.set(attemptId, fixture);
+
+    const prepared = await sqliteStore.getPreparedAttempt(attemptId);
     expect(prepared?.findings).toHaveLength(30);
+
+    // The 31st-35th finding versions were never offered to admission and remain
+    // open and unprocessed in the real ledger/queue projection after the first
+    // admission committed — not merely "not yet admitted" but re-derivable on demand.
+    const stillPending = loadPendingReviewFixFeedback(fixture.scope, null);
+    expect(stillPending?.findings).toHaveLength(5);
   }, 20_000);
 
-  it.each(VARIANTS.map(([label]) => label))("a new/re-reported finding after a snapshot stays open for the next attempt (%s)", async (label) => {
+  it.each(VARIANTS.map(([label]) => label))("a new/re-reported finding after a snapshot stays open for the next attempt, per the production pending-feedback projection (%s)", async (label) => {
     const env = envFor(label);
     const fixture = freshScenario("snapshot");
-    await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
+    fixture.useProductionPending = true;
+    const findingId = seedOpenFinding(fixture, "Snapshot finding f1");
+    seedQueueEvent(fixture, "automatic review-fix finding", [findingId]);
+
+    await triggerFeedback(env, fixture.scope);
+    await until(() => latestAttemptRow(fixture.scope) !== undefined, 8_000);
+    const attemptId1 = latestAttemptRow(fixture.scope)!.attemptId;
+    fixture.attemptId = attemptId1;
+    fixtureByAttempt.set(attemptId1, fixture);
+
     // Complete the first attempt so the PR is unoccupied again.
     await until(() => fixture.runId !== null, 8_000);
     fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
-    const prepared1 = (await sqliteStore.getPreparedAttempt(fixture.attemptId!))!;
-    await callWorkflow(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!, "result", resultOf(fixture, prepared1));
-    expect((await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!)).status).toBe("finalized");
-    // The same finding key re-reported at a newer version — the store derives a fresh
-    // content-addressed dispatch id from the version bump, so this is a genuinely new
-    // admission rather than a silently dropped repeat of one already in a completed snapshot.
-    fixture.pending = { taskText: "Fix 1 finding version", findings: [{ findingKey: "f1", version: 2 }] };
+    const prepared1 = (await sqliteStore.getPreparedAttempt(attemptId1))!;
+    await callWorkflow(env.baseUrl(), "ReviewFixAttempt", attemptId1, "result", resultOf(fixture, prepared1));
+    expect((await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", attemptId1)).status).toBe("finalized");
+
+    // Finalizing the first attempt never touches review_findings — resolution is a
+    // separate concern this pilot does not own — so the snapshotted finding is
+    // still open, at its original revision, and still unprocessed (its only
+    // recorded attempt used revision 1).
+    const afterFinalization = getDb().prepare(`SELECT status, revision, finding_key FROM review_findings WHERE id = ?`)
+      .get(findingId) as { status: string; revision: number; finding_key: string };
+    expect(afterFinalization.status).toBe("open");
+    expect(afterFinalization.revision).toBe(1);
+
+    // The same finding, re-reported: upsertReviewFinding bumps its revision (same
+    // content-derived finding_key) and a fresh queue event re-opens the queue row —
+    // the store derives a fresh content-addressed dispatch id from the version
+    // bump, so this is a genuinely new admission rather than a silently dropped
+    // repeat of one already in a completed snapshot.
+    upsertReviewFinding({
+      repo: fixture.scope.repository, prNumber: fixture.scope.prNumber,
+      source: "review-contract", severity: "medium", body: "Snapshot finding f1",
+    });
+    seedQueueEvent(fixture, "automatic review-fix finding (re-reported)", [findingId]);
+    const rereported = getDb().prepare(`SELECT status, revision FROM review_findings WHERE id = ?`)
+      .get(findingId) as { status: string; revision: number };
+    expect(rereported).toEqual({ status: "open", revision: 2 });
+    const pendingAfterRereport = loadPendingReviewFixFeedback(fixture.scope, null);
+    expect(pendingAfterRereport?.findings).toEqual([{ findingKey: afterFinalization.finding_key, version: 2 }]);
+    expect(pendingAfterRereport?.queueCursor).toMatchObject({ queueId: expect.any(Number), eventId: expect.any(Number) });
+
     await triggerFeedback(env, fixture.scope, 2);
     await until(() => {
       const row = getDb().prepare(`SELECT COUNT(*) AS n FROM review_fix_attempts WHERE repository = ? AND pr_number = ?`)
@@ -539,7 +634,7 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     }, 8_000);
     const rows = getDb().prepare(`SELECT finding_versions_json FROM review_fix_attempts WHERE repository = ? AND pr_number = ? ORDER BY created_at ASC`)
       .all(fixture.scope.repository, fixture.scope.prNumber) as Array<{ finding_versions_json: string }>;
-    expect(JSON.parse(rows[1].finding_versions_json)).toEqual([{ findingKey: "f1", version: 2 }]);
+    expect(JSON.parse(rows[1].finding_versions_json)).toEqual([{ findingKey: afterFinalization.finding_key, version: 2 }]);
   }, 20_000);
 
   // -------------------------------------------------------------------------
@@ -570,8 +665,9 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     const env = envFor("alwaysReplay");
     const fixture = freshScenario("inbox-crash");
     fixture.pending = { taskText: "Fix 1 finding version", findings: [{ findingKey: "f1", version: 1 }] };
+    const deliveryId = feedbackDeliveryId(fixture.scope, 1);
     const accepted = acceptDelivery({
-      authenticatedSource: "test-tracker", deliveryId: `${reviewFixPRKey(fixture.scope)}.feedback.1`,
+      authenticatedSource: "test-tracker", deliveryId,
       kind: "feedback", destination: fixture.scope, payload: {},
     });
     expect(accepted.status).toBe("accepted");
@@ -582,10 +678,10 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     const pump = pumpFor(env.baseUrl(), crashyFetch);
     await pump.tick();
     expect(getDb().prepare(`SELECT delivery_state FROM review_fix_inbox WHERE event_id = ?`)
-      .get(`${reviewFixPRKey(fixture.scope)}.feedback.1`)).toMatchObject({ delivery_state: "pending" });
+      .get(deliveryId)).toMatchObject({ delivery_state: "pending" });
     await pump.tick();
     expect(getDb().prepare(`SELECT delivery_state FROM review_fix_inbox WHERE event_id = ?`)
-      .get(`${reviewFixPRKey(fixture.scope)}.feedback.1`)).toMatchObject({ delivery_state: "delivered" });
+      .get(deliveryId)).toMatchObject({ delivery_state: "delivered" });
     await until(() => latestAttemptRow(fixture.scope) !== undefined, 5_000);
     const rows = getDb().prepare(`SELECT COUNT(*) AS n FROM review_fix_attempts WHERE repository = ? AND pr_number = ?`)
       .get(fixture.scope.repository, fixture.scope.prNumber) as { n: number };
