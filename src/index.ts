@@ -67,10 +67,14 @@ import { runReconciliations, resolvePrMapping } from "./reconcile-merged.js";
 import { resolveSessionImage, resolveDefaultRunnerImage, resolveRunnerImageForDispatch, type SessionImageStatus } from "./repo-image.js";
 import { getStepRecord, getStepsByJobId, initStepLogTable } from "./step-log.js";
 import { getOrchestratorSettings, seedKgBaseRepoFromEnv, seedLinearPickupLabelFromEnv, getRetryPolicy } from "./orchestrator-settings.js";
-import { handleRunnerPlanningContext, handleRunnerProgress, handleRunnerCycleSummary, handleRunnerResult, handleKgTrackerDataRequest, handleKgScopeRequest, planningDispatchBlockReason } from "./runner-callback.js";
+import { handleRunnerPlanningContext, handleRunnerProgress, handleRunnerCycleSummary, handleRunnerResult, handleRunnerActivity, handleKgTrackerDataRequest, handleKgScopeRequest, planningDispatchBlockReason } from "./runner-callback.js";
 import { CYCLE_SUMMARY_MAX_BYTES } from "./pipeline/cycle-summary.js";
-import type { RunnerProgressBody, RunnerResultBody } from "./runner-callback.js";
+import type { RunnerProgressBody, RunnerResultBody, RunnerActivityBody, ActivityIntakeOutcome } from "./runner-callback.js";
 import { mintRunToken, PLANNING_TTL_SECONDS, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
+import { SqliteReviewFixAttemptStore } from "./review-fix-attempt-store.js";
+import { acceptDelivery as acceptReviewFixDelivery } from "./restate/review-fix-client.js";
+import { appendReviewFixActivityBatch, isReviewFixEvidenceTombstoned } from "./review-fix-evidence.js";
+import type { ReviewFixResultMetadataV1, ResultIntakeOutcome } from "./review-fix-contract.js";
 import { handleMcpRequest } from "./mcp.js";
 import { resolveMemoryProvider, providerUnconfiguredReason, SidecarMemoryProvider, KG_TOOL_CAPABILITY, probeWithTimeout, sidecarHealthFields, setKgMemoryProvider } from "./kg-provider.js";
 import type { MemoryProvider } from "./kg-provider.js";
@@ -4380,6 +4384,66 @@ async function dispatchKgRefreshRun(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Restate review-fix pilot callback wiring (AII-769/AII-803): the injected,
+// non-SDK seams handleRunnerResult/handleRunnerActivity call. Both persist to
+// SQLite (the sole authority an ACK depends on) before ever touching Restate —
+// delivery to the sidecar is the pre-existing async pump (ReviewFixDeliveryPump,
+// src/restate/review-fix-client.ts), so a sidecar outage never blocks or fails
+// an ACK that SQLite already accepted, while a SQLite failure here throws and
+// is never acknowledged (caught by the route wrapper below as a 500).
+// ---------------------------------------------------------------------------
+
+const reviewFixAttemptStore = new SqliteReviewFixAttemptStore();
+
+async function onReviewFixResult(result: ReviewFixResultMetadataV1): Promise<ResultIntakeOutcome> {
+  // The accepted result and its delivery entry commit together. The callback
+  // also runs on an identical retry, repairing an older result that somehow
+  // lacks its inbox row; a rejected or conflicted identity aborts the write.
+  // This callback performs synchronous SQLite work only, never a Restate call.
+  return reviewFixAttemptStore.recordResult(result.attemptId, result, () => {
+    const delivery = acceptReviewFixDelivery({
+      authenticatedSource: "runner-callback",
+      deliveryId: `${result.attemptId}.result`,
+      kind: "result",
+      destination: { installationId: result.installationId, repository: result.repository, prNumber: result.prNumber },
+      payload: result,
+    });
+    if (delivery.status !== "accepted") {
+      throw new Error(`review-fix result delivery was ${delivery.status}`);
+    }
+  });
+}
+
+function onReviewFixActivity(batch: RunnerActivityBody): ActivityIntakeOutcome {
+  if (isReviewFixEvidenceTombstoned(batch.attemptId)) {
+    return { status: "stale", attemptId: batch.attemptId, reason: "attempt evidence has expired" };
+  }
+  const result = appendReviewFixActivityBatch({
+    attemptId: batch.attemptId,
+    producerId: batch.producerId,
+    events: batch.events,
+    finalSequence: batch.finalSequence,
+  });
+  if (result.tombstoned) {
+    return { status: "stale", attemptId: batch.attemptId, reason: "attempt evidence has expired" };
+  }
+  if (result.conflicts.length > 0) {
+    console.error(
+      `[runner-activity] conflicting activity payload attempt=${batch.attemptId} producer=${batch.producerId} sequences=${result.conflicts.join(",")}`,
+    );
+    return {
+      status: "conflict",
+      attemptId: batch.attemptId,
+      reason: `conflicting payload at sequence(s) ${result.conflicts.join(",")}`,
+    };
+  }
+  if (result.stored === 0 && result.duplicates > 0) {
+    return { status: "duplicate", attemptId: batch.attemptId };
+  }
+  return { status: "accepted", attemptId: batch.attemptId };
+}
+
 function startServer(
   config: AppConfig,
   registry: ProviderRegistry,
@@ -4760,6 +4824,7 @@ function startServer(
           },
           onKgRefreshRunnerComplete: kgRefresh.onRunnerComplete.bind(kgRefresh),
           checkPlanningAdmissionTermination: (dispatchId) => tryFastReleasePlanningAdmission(config, dispatchId),
+          onReviewFixResult,
         });
         res.writeHead(result.status, { "Content-Type": "application/json" });
         res.end(JSON.stringify(result.body));
@@ -4837,6 +4902,50 @@ function startServer(
         res.end(JSON.stringify(result.body));
       })().catch((err) => {
         console.error("[runner-progress] Unhandled error:", err);
+        if (!res.headersSent) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Internal server error" }));
+        }
+      });
+      return;
+    }
+
+    // Runner activity callback (AII-769/AII-803) — reusable "progress" bearer
+    // bound to a live prepared review-fix attempt, same credential family as
+    // /runner/cycle-summary above. Bounded read: a batch may carry many
+    // redacted events, each already capped by the contract validator, but the
+    // raw body is still read under a defensive ceiling before it is parsed.
+    if (url === "/runner/activity" && req.method === "POST") {
+      (async () => {
+        if (!config.runnerTokenSecret) {
+          res.writeHead(501, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Runner callback not configured" }));
+          return;
+        }
+        const body = await readBodyLimited(req, 2 * 1024 * 1024);
+        if (body === null) {
+          res.writeHead(413, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Activity batch too large" }));
+          return;
+        }
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(body);
+        } catch {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Invalid JSON" }));
+          return;
+        }
+        const result = await handleRunnerActivity({
+          authorization: req.headers.authorization,
+          secret: config.runnerTokenSecret,
+          body: parsed,
+          onReviewFixActivity,
+        });
+        res.writeHead(result.status, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(result.body));
+      })().catch((err) => {
+        console.error("[runner-activity] Unhandled error:", err);
         if (!res.headersSent) {
           res.writeHead(500, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "Internal server error" }));

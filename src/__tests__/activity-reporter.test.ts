@@ -1,6 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ActivityReporter, type ActivityAlert } from "../pipeline/activity-reporter.js";
-import { handleRunnerActivity } from "../runner-callback.js";
 
 function response(status: number, body: unknown = {}): Response {
   return {
@@ -461,8 +460,12 @@ describe("ActivityReporter", () => {
       const body = JSON.parse(String(init?.body));
       bodies.push(body);
       if (bodies.length === 1) throw new TypeError("temporary network failure");
-      const result = handleRunnerActivity({ body });
-      return response(result.status, result.body);
+      // The real handleRunnerActivity now authenticates its bearer against a
+      // prepared attempt (AII-803) — this client-side test exercises only
+      // ActivityReporter's own retry/finalSequence stability, so a canned
+      // success response (as every other case in this file uses) stands in
+      // for the server's acceptance.
+      return response(200, { acknowledged: true, outcome: "accepted", attemptId: "attempt-1" });
     }) as typeof fetch;
     const reporter = new ActivityReporter("https://orchestrator.test", "progress-token", "attempt-1", "producer-1", {
       fetchImpl,
