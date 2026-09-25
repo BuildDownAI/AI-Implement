@@ -292,6 +292,28 @@ describe("processReviewFixQueue — dispatch gate", () => {
     const pending = reviewFixQueue.getPendingReviewFixes();
     expect(pending).toHaveLength(0);
   });
+
+  it("keeps a review fix pending when GitHub cannot confirm the PR is open", async () => {
+    configModule.upsertMapping("TEAM", makeMapping());
+    const queueId = reviewFixQueue.enqueueReviewFix({
+      issueId: "issue-unknown-pr",
+      issueIdentifier: "AII-999",
+      repo: "acme/billing",
+      prNumber: 42,
+      reason: "late review comment",
+    });
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: false, status: 503 }) as Response));
+
+    await indexModule.processReviewFixQueue(mockConfig, mockRegistry);
+
+    expect(localGapfillMocks.dispatchLocalGapfill).not.toHaveBeenCalled();
+    expect(reviewFixQueue.getPendingReviewFixes()).toMatchObject([{ id: queueId, status: "pending" }]);
+
+    stubOpenPrLookup();
+    await indexModule.processReviewFixQueue(mockConfig, mockRegistry);
+    expect(localGapfillMocks.dispatchLocalGapfill).toHaveBeenCalledTimes(1);
+    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(0);
+  });
 });
 
 describe("processReviewFixQueue — PR dispatch budget", () => {

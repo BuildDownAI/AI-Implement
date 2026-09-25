@@ -260,7 +260,8 @@ export function recordReviewFixDispatch(input: {
   return Number(result.lastInsertRowid);
 }
 
-/** Returns true when a review fix should be skipped because the PR is already merged or closed. Fail-open on null (API error) to avoid dropping a valid fix. */
+/** Returns true when a PR is confirmed merged or closed. Callers must defer a
+ * null lookup before using this predicate; false alone is not proof of open. */
 export function shouldSkipReviewFix(state: { merged: boolean; state: "open" | "closed" } | null): boolean {
   if (state === null) return false;
   return state.merged || state.state === "closed";
