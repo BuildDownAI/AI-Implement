@@ -6,7 +6,7 @@ import type { ObjectContext } from "@restatedev/restate-sdk";
 import { validateScopedPrIdentity, type AttemptId, type ScopedPrIdentity } from "../review-fix-contract.js";
 import type { ReviewFixAdmissionRequest, ReviewFixAttemptStorePort, ReviewFixPendingFeedback } from "../review-fix-ports.js";
 
-export const REVIEW_FIX_COALESCE_MS = 5_000;
+export const REVIEW_FIX_COLLECTION_WINDOW_MS = 5_000;
 export const REVIEW_FIX_DEFERRED_RECHECK_MS = 30_000;
 
 export interface ReviewFixPRSnapshot {
@@ -22,6 +22,9 @@ export interface ReviewFixPRSnapshot {
 export interface ReviewFixPRDependencies {
   readonly attempts: Pick<ReviewFixAttemptStorePort, "admit">;
   load(scope: ScopedPrIdentity): Promise<ReviewFixPRSnapshot>;
+  /** Current project value. Read only when the first signal schedules a new
+   * window; an already-scheduled timer keeps its original delay. */
+  collectionWindowMs?(scope: ScopedPrIdentity): Promise<number>;
 }
 
 interface Wake { token: string; kind: "coalesce" | "deferred" | "release" }
@@ -53,8 +56,14 @@ export function createReviewFixPR(deps: ReviewFixPRDependencies) {
   /** Called after the accepted event is durably written; no untrusted finding
    * body enters Restate's journal. A later arrival never extends the first tick. */
   async function feedback(ctx: ObjectContext): Promise<void> {
-    keyScope(ctx.key);
-    if (!await ctx.get<Wake>("wake")) await schedule(ctx, "coalesce", REVIEW_FIX_COALESCE_MS);
+    const scope = keyScope(ctx.key);
+    if (await ctx.get<Wake>("wake")) return;
+    const delay = await ctx.run("load-collection-window", () =>
+      deps.collectionWindowMs?.(scope) ?? Promise.resolve(REVIEW_FIX_COLLECTION_WINDOW_MS));
+    if (!Number.isSafeInteger(delay) || delay < 0) {
+      throw new restate.TerminalError("invalid review-fix collection window");
+    }
+    await schedule(ctx, "coalesce", delay);
   }
 
   async function check(ctx: ObjectContext, wake: Wake): Promise<void> {
