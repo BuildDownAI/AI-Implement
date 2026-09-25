@@ -33,8 +33,8 @@ import { createEndpointHandler } from "@restatedev/restate-sdk/node";
 import { RestateContainer } from "@restatedev/restate-sdk-testcontainers";
 import { TestContainers } from "testcontainers";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { RESTATE_SERVICES, register, restateBindAddress, startRestateEndpoint } from "../../restate/endpoint.js";
-import { operatorObject } from "../../restate/operator-object.js";
+import { RESTATE_SERVICES, queryNonCompletedInvocations, register, restateBindAddress, startRestateEndpoint } from "../../restate/endpoint.js";
+import { orchestratorTools } from "../../restate/tools.js";
 import * as dedup from "../../dedup.js";
 import { initSettingsTable } from "../../runner-mode.js";
 import { RESTATE_IMAGE_VERSION, callObject, callService } from "./harness.js";
@@ -191,15 +191,28 @@ describe("startRestateEndpoint() / register() against a real server 1.7.10 (AII-
       });
       const sleepMs = 8_000;
       const inFlight = callObject(ingressBaseUrl, "Operator", key, "refresh", { presentedHash: hash, sleepMs });
-      // Give the exclusive invocation a moment to be admitted and start sleeping before the
-      // swap below, so it is genuinely non-completed by the time register() queries for it.
-      await new Promise((resolve) => setTimeout(resolve, 1_000));
+      // Attach this immediately so an assertion failure during registration cannot
+      // turn the still-pending request into an unhandled rejection during cleanup.
+      void inFlight.catch(() => undefined);
+      // Observe the actual non-completed invocation before swapping endpoints;
+      // a fixed sleep can race Restate's admission on a busy CI host.
+      const oldUri = `http://host.testcontainers.internal:${port}`;
+      const admissionDeadline = Date.now() + 10_000;
+      while (Date.now() < admissionDeadline) {
+        const count = await queryNonCompletedInvocations(fetch, adminBaseUrl, oldUri);
+        if (count !== null && count > 0) break;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      expect(await queryNonCompletedInvocations(fetch, adminBaseUrl, oldUri)).toBeGreaterThan(0);
 
       // Swap this process's own SDK endpoint for a changed service set at the same URI —
       // mirrors harness.ts's replaceEndpoint(), inlined here since there is no
       // RestateTestEnvironment to attach it to in this file.
       server.close();
-      server = http2.createServer(createEndpointHandler({ services: [operatorObject] }));
+      // Removing the service that owns the active invocation is the incompatible
+      // change. Removing only orchestratorTools would leave Operator intact and
+      // Restate can accept that registration without the drain/force path.
+      server = http2.createServer(createEndpointHandler({ services: [orchestratorTools] }));
       await new Promise<void>((resolve, reject) => {
         server.once("error", reject);
         server.listen(port, bindHost, resolve);
