@@ -6,7 +6,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { ReviewFixResultMetadataV1, ScopedPrIdentity, WorkerTerminalOutcome } from "../../review-fix-contract.js";
 import type { PreparedReviewFixAttempt, ReviewFixFindingVersion } from "../../review-fix-ports.js";
 import { createReviewFixAttempt } from "../../restate/review-fix-attempt.js";
-import { createReviewFixPR, reviewFixPRKey, REVIEW_FIX_COALESCE_MS } from "../../restate/review-fix-pr.js";
+import { createReviewFixPR, reviewFixPRKey, REVIEW_FIX_COLLECTION_WINDOW_MS } from "../../restate/review-fix-pr.js";
 import { VARIANTS, attachWorkflow, callObject, callWorkflow, startVariants, stopAll } from "./harness.js";
 
 const SHA = "a".repeat(40);
@@ -18,6 +18,7 @@ interface PRState {
   prepared: PreparedReviewFixAttempt[];
   admissionCalls: number;
   launches: number;
+  windowMs: number;
 }
 interface AttemptState {
   prepared: PreparedReviewFixAttempt;
@@ -47,7 +48,8 @@ describe("ReviewFixPR durable coordination", () => {
 
   function makePR(): PRState {
     const scope = { installationId: 7, repository: "BuildDownAI/AI-Implement", prNumber: nextPr++ };
-    const state: PRState = { scope, pending: [], active: null, closed: false, prepared: [], admissionCalls: 0, launches: 0 };
+    const state: PRState = { scope, pending: [], active: null, closed: false, prepared: [], admissionCalls: 0,
+      launches: 0, windowMs: REVIEW_FIX_COLLECTION_WINDOW_MS };
     prs.set(reviewFixPRKey(scope), state);
     return state;
   }
@@ -138,7 +140,8 @@ describe("ReviewFixPR durable coordination", () => {
     },
     loadApprovalEvidence: async () => ({ currentPrHeadSha: SHA, findingDispositions: [], policyAllows: false }),
   });
-  const coordinator = createReviewFixPR({ attempts: store, load: async (scope) => {
+  const coordinator = createReviewFixPR({ attempts: store, collectionWindowMs: async (scope) => stateFor(scope).windowMs,
+    load: async (scope) => {
     const pr = stateFor(scope);
     return { closed: pr.closed, jobTimeoutMinutes: 90,
       pending: pr.pending.length ? { taskText: `Fix ${pr.pending.length} finding versions`, findings: [...pr.pending] } : null };
@@ -175,17 +178,23 @@ describe("ReviewFixPR durable coordination", () => {
   it.each(VARIANTS.map(([label]) => label))("one fixed feedback window and one active attempt (%s)", async (label) => {
     const env = envFor(label);
     const pr = makePR();
+    pr.windowMs = 2_000;
     const started = Date.now();
     await feedback(env, pr, 1);
-    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    pr.windowMs = 4_000; // a changed setting cannot extend the scheduled window
     await feedback(env, pr, 2);
-    await new Promise((resolve) => setTimeout(resolve, 2_500));
+    await new Promise((resolve) => setTimeout(resolve, 700));
     expect(pr.launches).toBe(0);
-    await until(() => pr.launches === 1, 9_000);
-    expect(Date.now() - started).toBeLessThan(8_000);
+    await until(() => pr.launches === 1, 5_000);
+    expect(Date.now() - started).toBeLessThan(3_500);
     expect(pr.prepared[0].findings).toHaveLength(3);
     expect(pr.admissionCalls).toBe(1);
     await finish(env, pr, 0);
+    pr.windowMs = 250;
+    await feedback(env, pr);
+    await until(() => pr.launches === 2, 3_000);
+    await finish(env, pr, 1);
   }, 20_000);
 
   it.each(VARIANTS.map(([label]) => label))("another PR proceeds while first waits; active feedback and overflow remain pending (%s)", async (label) => {
@@ -227,8 +236,9 @@ describe("ReviewFixPR durable coordination", () => {
 
       const closed = makePR();
       closed.closed = true;
+      closed.windowMs = 250;
       await feedback(env, closed);
-      await new Promise((resolve) => setTimeout(resolve, REVIEW_FIX_COALESCE_MS + 300));
+      await new Promise((resolve) => setTimeout(resolve, closed.windowMs + 300));
       expect([closed.launches, closed.admissionCalls]).toEqual([0, 0]);
     } finally { capacity = 10; }
   }, 40_000);
