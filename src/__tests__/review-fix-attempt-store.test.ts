@@ -98,6 +98,33 @@ function admissionRequest(overrides: Partial<ReviewFixAdmissionRequest> = {}): R
   };
 }
 
+describe("deploy drain admission barrier", () => {
+  it("defers new attempts under the hold while preserving idempotent prepared replays", async () => {
+    seedMapping();
+    const { initSettingsTable } = await import("../runner-mode.js");
+    const { setDeployHold, clearDeployHold } = await import("../deploy-hold.js");
+    initSettingsTable();
+    const store = new storeModule.SqliteReviewFixAttemptStore();
+    const request = admissionRequest();
+    setDeployHold();
+    try {
+      expect(await store.admit(request)).toEqual({ status: "deferred", reason: "paused" });
+      expect((dedup.getDb().prepare("SELECT COUNT(*) AS n FROM dispatch_admissions WHERE released_at IS NULL").get() as { n: number }).n).toBe(0);
+    } finally {
+      clearDeployHold();
+    }
+    const prepared = await store.admit(request);
+    expect(prepared.status).toBe("prepared");
+    setDeployHold();
+    try {
+      expect(await store.admit(request)).toEqual(prepared);
+      expect(await store.admit(admissionRequest({ feedback: { taskText: "different review", findings: [{ findingKey: "f2", version: 1 }] } }))).toEqual({ status: "deferred", reason: "paused" });
+    } finally {
+      clearDeployHold();
+    }
+  });
+});
+
 function result(overrides: Partial<ReviewFixResultMetadataV1> = {}): ReviewFixResultMetadataV1 {
   return {
     version: 1,
