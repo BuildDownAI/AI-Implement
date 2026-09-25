@@ -978,12 +978,13 @@ describe("runAutonomous", () => {
       });
     });
 
-    it("omits the reviewFix marker on a grouping-parent no-op success rather than fabricating a commit", async () => {
+    it("skips delivery and logs an explicit no-result outcome on a grouping-parent no-op success — never an unmarked Legacy POST for a pilot attempt", async () => {
       stubReviewFixEnvelope({}, { groupingParent: true });
       vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
       vi.stubEnv("RUN_TOKEN", "run-token");
       vi.stubEnv("GITHUB_RUN_ID", "1");
       vi.stubEnv("GITHUB_RUN_ATTEMPT", "1");
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
       const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
       const { pipeline, runner } = makeStepsPipeline([
@@ -1000,18 +1001,19 @@ describe("runAutonomous", () => {
       });
 
       expect(result.exitCode).toBe(0);
-      const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as Record<string, unknown>;
-      expect(body.noWork).toBe(true);
-      expect(body).not.toHaveProperty("reviewFix");
+      expect(mockFetch).not.toHaveBeenCalled();
+      expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("pilot result delivery skipped"));
+      expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("attempt-1"));
+      errSpy.mockRestore();
     });
 
-    it("omits the reviewFix marker (with a warning) when GITHUB_RUN_ID/GITHUB_RUN_ATTEMPT cannot be parsed", async () => {
+    it("skips delivery and logs an explicit no-result outcome when GITHUB_RUN_ID/GITHUB_RUN_ATTEMPT cannot be parsed — never an unmarked Legacy POST for a pilot attempt", async () => {
       stubReviewFixEnvelope();
       vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
       vi.stubEnv("RUN_TOKEN", "run-token");
       vi.stubEnv("GITHUB_RUN_ID", "");
       vi.stubEnv("GITHUB_RUN_ATTEMPT", "");
-      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
       const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
       const { pipeline, runner } = makeStepsPipeline([
@@ -1040,10 +1042,37 @@ describe("runAutonomous", () => {
       });
 
       expect(result.exitCode).toBe(0);
-      const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as Record<string, unknown>;
-      expect(body).not.toHaveProperty("reviewFix");
-      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("reviewFix result omitted"));
-      warnSpy.mockRestore();
+      expect(mockFetch).not.toHaveBeenCalled();
+      expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("pilot result delivery skipped"));
+      errSpy.mockRestore();
+    });
+
+    it("skips delivery and logs an explicit no-result outcome on a caught pipeline failure with no push at all — never an unmarked Legacy POST for a pilot attempt", async () => {
+      stubReviewFixEnvelope();
+      vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+      vi.stubEnv("RUN_TOKEN", "run-token");
+      vi.stubEnv("GITHUB_RUN_ID", "42");
+      vi.stubEnv("GITHUB_RUN_ATTEMPT", "1");
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+      const { pipeline, runner } = makeStepsPipeline([
+        ["setup", { run: vi.fn().mockRejectedValue(new Error("setup exploded before push ran")) }],
+      ]);
+
+      const result = await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeMockExecutor(0),
+        fetchImpl: mockFetch,
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(mockFetch).not.toHaveBeenCalled();
+      expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("pilot result delivery skipped"));
+      errSpy.mockRestore();
     });
 
     it("attaches the reviewFix marker on a caught pipeline failure once push already published a commit", async () => {

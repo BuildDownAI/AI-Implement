@@ -406,6 +406,70 @@ describe("postRunnerResult", () => {
       expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("deadline exceeded"));
     });
 
+    it("aborts a pending fetch at the per-attempt transport timeout instead of leaving it in flight (AII-794)", async () => {
+      const abortedSignals: AbortSignal[] = [];
+      let callCount = 0;
+      const fetchImpl = vi.fn((_url: string, init: { signal?: AbortSignal }) => {
+        callCount++;
+        return new Promise<Response>((_resolve, reject) => {
+          const signal = init.signal;
+          if (!signal) return;
+          signal.addEventListener("abort", () => {
+            abortedSignals.push(signal);
+            const err = new Error("simulated abort");
+            err.name = "AbortError";
+            reject(err);
+          });
+        });
+      });
+
+      await postRunnerResult({
+        workspaceDir: "/tmp",
+        phase: "gap-analysis",
+        outcome: "success",
+        callbackUrl: "https://cb",
+        reviewFix: makeReviewFix(),
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        transportTimeoutMs: 10,
+        sleepImpl: async () => {},
+      });
+
+      // Every attempt that timed out must have actually aborted the in-flight request — not
+      // merely stopped awaiting it — so a later retry never races a still-running earlier one.
+      expect(abortedSignals.length).toBe(callCount);
+      expect(callCount).toBeGreaterThan(1);
+    });
+
+    it("never logs raw response text or a thrown error's message — only a normalized reason (AII-794)", async () => {
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const secret = "Bearer sk-super-secret-token-should-never-be-logged";
+      let call = 0;
+      const fetchImpl = vi.fn(async () => {
+        call++;
+        // First attempt: the credential-shaped string arrives via the response body.
+        if (call === 1) return { ok: false, status: 503, text: async () => secret } as Response;
+        // Every later attempt: it arrives via a thrown error's message instead.
+        throw new Error(`upstream said: ${secret}`);
+      });
+
+      await postRunnerResult({
+        workspaceDir: "/tmp",
+        phase: "gap-analysis",
+        outcome: "failure",
+        callbackUrl: "https://cb",
+        reviewFix: makeReviewFix(),
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        sleepImpl: async () => {},
+      });
+
+      expect(call).toBeGreaterThan(1);
+      for (const args of errSpy.mock.calls) {
+        for (const arg of args) {
+          if (typeof arg === "string") expect(arg).not.toContain(secret);
+        }
+      }
+    });
+
     it("bounds retries by attempt count even when the deadline is far in the future", async () => {
       const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
       const fetchImpl = vi.fn().mockResolvedValue({ ok: false, status: 503, text: async () => "unavailable" });

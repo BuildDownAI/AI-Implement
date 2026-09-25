@@ -17,7 +17,7 @@ const PILOT_RESULT_DELIVERY_GRACE_MS = 15 * 60_000;
 /** Safety backstop independent of the deadline, in case `deadlineAt` is set unreasonably far out. */
 const MAX_PILOT_RESULT_ATTEMPTS = 8;
 
-/** Bounds a single delivery attempt regardless of whether fetchImpl honours AbortSignal. */
+/** Bounds a single delivery attempt; overridable per-call via `transportTimeoutMs` for tests. */
 const PILOT_TRANSPORT_TIMEOUT_MS = 10_000;
 
 function isRetryableStatus(status: number): boolean {
@@ -29,21 +29,46 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** Bounds `promise` even if it never settles and ignores its own cancellation signal. */
-function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`runner-result POST timed out after ${ms}ms`)), ms);
-    promise.then(
-      (value) => {
-        clearTimeout(timer);
-        resolve(value);
-      },
-      (err) => {
-        clearTimeout(timer);
-        reject(err);
-      },
-    );
-  });
+/**
+ * Bounds one delivery attempt AND aborts the underlying request at the timeout, so a slow
+ * response can't stay in flight while a later retry starts concurrently — the previous
+ * Promise-race approach only stopped *awaiting* `fetch`; the real request kept running
+ * underneath. The abort is what actually stops it; the global `fetch` honours the signal.
+ */
+async function fetchWithAbortTimeout(
+  fetchFn: typeof fetch,
+  url: string,
+  init: { method: "POST"; headers: Record<string, string>; body: string },
+  timeoutMs: number,
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetchFn(url, { ...init, signal: controller.signal });
+  } catch (err) {
+    if (controller.signal.aborted) {
+      throw new Error(`runner-result POST timed out after ${timeoutMs}ms`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Normalizes a delivery failure to a bounded, credential-free category for logging. Pilot
+ * failure logs must never include the raw response body or a thrown error's message — either
+ * can carry an echoed Authorization header, request body, or other server/transport string
+ * neither side intended to end up in a log.
+ */
+function classifyFailureReason(status: number | null, err: unknown): string {
+  if (status !== null) {
+    if (status === 429) return "rate_limited";
+    if (status >= 500) return "server_error";
+    if (status >= 400) return "client_error";
+    return "unexpected_status";
+  }
+  return err instanceof Error && err.name === "AbortError" ? "timeout" : "transport_error";
 }
 
 export function collectRunnerComments(workspaceDir: string): Array<{ body: string }> {
@@ -136,6 +161,8 @@ export async function postRunnerResult(params: {
   /** Injectable clock/sleep, for deterministic tests of the bounded retry loop only. */
   now?: () => number;
   sleepImpl?: (ms: number) => Promise<void>;
+  /** Per-attempt transport timeout override, for deterministic abort tests only. Defaults to PILOT_TRANSPORT_TIMEOUT_MS. */
+  transportTimeoutMs?: number;
 }): Promise<void> {
   const callbackUrl = params.callbackUrl ?? process.env.RUNNER_CALLBACK_URL;
   const runToken = process.env.RUN_TOKEN;
@@ -196,39 +223,42 @@ export async function postRunnerResult(params: {
   const nowFn = params.now ?? Date.now;
   const sleepFn = params.sleepImpl ?? sleep;
   const policy = params.retryPolicy ?? DEFAULT_RETRY_POLICY;
+  const transportTimeoutMs = params.transportTimeoutMs ?? PILOT_TRANSPORT_TIMEOUT_MS;
   const deadline = params.reviewFix.deadlineAt + PILOT_RESULT_DELIVERY_GRACE_MS;
-  let lastDetail = "";
+  let lastReason = "unknown";
 
   for (let attempt = 1; attempt <= MAX_PILOT_RESULT_ATTEMPTS; attempt++) {
     if (nowFn() >= deadline) {
       console.error(
         `[runner-callback] POST no-result phase=${params.phase} outcome=${params.outcome} attemptId=${attemptId}: ` +
-          `delivery deadline exceeded before attempt ${attempt}${lastDetail}`,
+          `delivery deadline exceeded before attempt ${attempt} (last reason=${lastReason})`,
       );
       return;
     }
     try {
-      const res = await withTimeout(fetchFn(url, { method: "POST", headers, body: payload }), PILOT_TRANSPORT_TIMEOUT_MS);
+      const res = await fetchWithAbortTimeout(fetchFn, url, { method: "POST", headers, body: payload }, transportTimeoutMs);
       if (res.ok) {
         console.log(`[runner-callback] POST ok phase=${params.phase} outcome=${params.outcome} attemptId=${attemptId}`);
         return;
       }
-      const detailText = await res.text().catch(() => "");
-      lastDetail = ` (last HTTP ${res.status}: ${detailText})`;
+      // Drain the body to free the connection without ever logging its contents — an untrusted
+      // server/transport string here could carry an echoed bearer or other request data.
+      await res.text().catch(() => "");
+      lastReason = classifyFailureReason(res.status, null);
       if (!isRetryableStatus(res.status)) {
         console.error(
-          `[runner-callback] POST failed HTTP ${res.status} attemptId=${attemptId} (terminal, not retrying): ${detailText}`,
+          `[runner-callback] POST failed HTTP ${res.status} attemptId=${attemptId} (terminal, not retrying) reason=${lastReason}`,
         );
         return;
       }
     } catch (err) {
-      lastDetail = ` (last error: ${err instanceof Error ? err.message : String(err)})`;
+      lastReason = classifyFailureReason(null, err);
     }
 
     if (attempt === MAX_PILOT_RESULT_ATTEMPTS) {
       console.error(
         `[runner-callback] POST no-result phase=${params.phase} outcome=${params.outcome} attemptId=${attemptId}: ` +
-          `retry attempts exhausted (${MAX_PILOT_RESULT_ATTEMPTS})${lastDetail}`,
+          `retry attempts exhausted (${MAX_PILOT_RESULT_ATTEMPTS}) (last reason=${lastReason})`,
       );
       return;
     }
@@ -237,7 +267,7 @@ export async function postRunnerResult(params: {
     if (remaining <= 0) {
       console.error(
         `[runner-callback] POST no-result phase=${params.phase} outcome=${params.outcome} attemptId=${attemptId}: ` +
-          `delivery deadline exceeded after attempt ${attempt}${lastDetail}`,
+          `delivery deadline exceeded after attempt ${attempt} (last reason=${lastReason})`,
       );
       return;
     }
