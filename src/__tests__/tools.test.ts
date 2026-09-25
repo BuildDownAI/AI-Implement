@@ -92,6 +92,42 @@ function fakeContext(handlerName: string, runCalls: RunCall[] = []): restate.Con
   } as unknown as restate.Context;
 }
 
+/**
+ * A fetchImpl that never settles unless its request's AbortSignal fires — the only way a
+ * fixture can prove a fetch is actually bounded by `signal` rather than merely accepting an
+ * ignored option (AII-728). Rejects with the signal's abort reason once the signal fires.
+ */
+function hangingFetch(): typeof fetch {
+  return vi.fn((_url: unknown, init?: RequestInit) => {
+    return new Promise((_resolve, reject) => {
+      const signal = init?.signal;
+      if (!signal) return; // no signal given: hangs forever, same as before AII-728
+      if (signal.aborted) {
+        reject(signal.reason);
+        return;
+      }
+      signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+    });
+  }) as unknown as typeof fetch;
+}
+
+/**
+ * vitest's fake timers do not intercept Node's AbortSignal.timeout — verified empirically,
+ * it schedules through an internal timer rather than the patchable global setTimeout — so
+ * these tests bound the wait by stubbing AbortSignal.timeout's own implementation instead of
+ * the clock. Asserts the exact ms value production code passes (proving the configured bound,
+ * not just "some" bound), then fires the abort on the next microtask so the test does not
+ * block on real wall-clock time.
+ */
+function stubAbortTimeout(expectedMs: number): ReturnType<typeof vi.spyOn> {
+  return vi.spyOn(AbortSignal, "timeout").mockImplementation((ms: number) => {
+    expect(ms).toBe(expectedMs);
+    const controller = new AbortController();
+    queueMicrotask(() => controller.abort(new DOMException("The operation was aborted due to timeout", "TimeoutError")));
+    return controller.signal;
+  });
+}
+
 const SYSTEM_ADMIN: Caller = { kind: "system", email: null, role: "admin" };
 const HUMAN_USER: Caller = { kind: "human", email: "user@example.com", role: "user" };
 const NO_ROLE: Caller = { kind: "human", email: "user@example.com", role: null };
@@ -300,6 +336,16 @@ describe("discoverTools", () => {
     })) as unknown as typeof fetch;
     expect(await discoverTools({ adminBaseUrl: "http://admin.example", fetchImpl })).toEqual([]);
   });
+
+  it("bounds admin discovery at 5s — a never-resolving fetch degrades to [] once the bound fires (AII-728)", async () => {
+    const timeoutSpy = stubAbortTimeout(5_000);
+    try {
+      const result = await discoverTools({ adminBaseUrl: "http://admin.example", fetchImpl: hangingFetch() });
+      expect(result).toEqual([]);
+    } finally {
+      timeoutSpy.mockRestore();
+    }
+  });
 });
 
 describe("callTool", () => {
@@ -377,6 +423,19 @@ describe("callTool", () => {
     });
 
     expect(capturedUrl).toBe("http://ingress.example/orchestratorTools/..%2FOperator%2Fx%2Frevoke");
+  });
+
+  it("bounds tool ingress at 60s — a never-resolving fetch degrades to unavailable once the bound fires (AII-728)", async () => {
+    const timeoutSpy = stubAbortTimeout(60_000);
+    try {
+      const result = await callTool("get_widget", {}, HUMAN_USER, {
+        ingressBaseUrl: "http://ingress.example",
+        fetchImpl: hangingFetch(),
+      });
+      expect(result).toEqual({ status: "unavailable" });
+    } finally {
+      timeoutSpy.mockRestore();
+    }
   });
 });
 

@@ -206,6 +206,88 @@ describe("spawn configuration", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Env allowlist (AII-728) — childEnv is built from an explicit allowlist, never
+// `...process.env`: the sidecar is a separate binary that has no business seeing the
+// orchestrator's full environment (GitHub App keys, ticketing tokens, etc).
+// ---------------------------------------------------------------------------
+
+describe("env allowlist (AII-728)", () => {
+  it("forwards only PATH/HOME/TMPDIR/TZ and RESTATE_* keys, excluding an unrelated decoy credential", async () => {
+    const dataDir = makeTmpDir();
+    const script = join(dataDir, "fake-server.sh");
+    writeScript(script, "sleep 60");
+
+    vi.stubEnv("PATH", "/usr/bin:/bin");
+    vi.stubEnv("HOME", "/home/tester");
+    vi.stubEnv("TMPDIR", "/tmp");
+    vi.stubEnv("TZ", "UTC");
+    vi.stubEnv("AWS_SECRET_ACCESS_KEY", "decoy-secret-value");
+    vi.stubEnv("GITHUB_APP_PRIVATE_KEY", "decoy-private-key");
+    vi.stubEnv("RESTATE_OPERATOR_OVERRIDE", "operator-set-value");
+
+    const spawnSpy = vi.fn(testSpawn);
+    const sidecar = new RestateSidecar(
+      { dataDir, pollTimeoutMs: 5_000, pollIntervalMs: 10 },
+      { httpGet: async () => true, spawn: spawnSpy, resolveBinary: () => script },
+    );
+
+    try {
+      await sidecar.start();
+
+      expect(spawnSpy).toHaveBeenCalledTimes(1);
+      const [, , spawnOpts] = spawnSpy.mock.calls[0] as [string, string[], { env?: NodeJS.ProcessEnv }];
+      const childEnv = spawnOpts.env ?? {};
+
+      expect(childEnv.PATH).toBe("/usr/bin:/bin");
+      expect(childEnv.HOME).toBe("/home/tester");
+      expect(childEnv.TMPDIR).toBe("/tmp");
+      expect(childEnv.TZ).toBe("UTC");
+      expect(childEnv.RESTATE_OPERATOR_OVERRIDE).toBe("operator-set-value");
+      expect(childEnv.RESTATE_INGRESS__BIND_ADDRESS).toBe(RESTATE_INGRESS_BIND_ADDRESS);
+      expect(childEnv.RESTATE_ADMIN__BIND_ADDRESS).toBe(new URL(RESTATE_ADMIN_BASE_URL).host);
+      expect(childEnv.RESTATE_BASE_DIR).toBe(dataDir);
+      expect(childEnv.RESTATE_BIND_ADDRESS).toBe("127.0.0.1:5122");
+      expect(childEnv.RESTATE_DEFAULT_NUM_PARTITIONS).toBe("4");
+      expect(childEnv.RESTATE_ROCKSDB_TOTAL_MEMORY_SIZE).toBe("256 MB");
+
+      expect(childEnv).not.toHaveProperty("AWS_SECRET_ACCESS_KEY");
+      expect(childEnv).not.toHaveProperty("GITHUB_APP_PRIVATE_KEY");
+      expect(Object.values(childEnv)).not.toContain("decoy-secret-value");
+      expect(Object.values(childEnv)).not.toContain("decoy-private-key");
+    } finally {
+      await sidecar.stop();
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("a fixed RESTATE_* constant wins over an operator-set override of the same key", async () => {
+    const dataDir = makeTmpDir();
+    const script = join(dataDir, "fake-server.sh");
+    writeScript(script, "sleep 60");
+
+    // An operator override of a key this module also sets explicitly must not win —
+    // the fixed constants (ingress/admin bind addresses, base dir, etc.) are load-bearing
+    // for the loopback-only guarantee (ADR 023) and must not be shadowable via process.env.
+    vi.stubEnv("RESTATE_BASE_DIR", "/should-not-be-used");
+
+    const spawnSpy = vi.fn(testSpawn);
+    const sidecar = new RestateSidecar(
+      { dataDir, pollTimeoutMs: 5_000, pollIntervalMs: 10 },
+      { httpGet: async () => true, spawn: spawnSpy, resolveBinary: () => script },
+    );
+
+    try {
+      await sidecar.start();
+      const [, , spawnOpts] = spawnSpy.mock.calls[0] as [string, string[], { env?: NodeJS.ProcessEnv }];
+      expect(spawnOpts.env?.RESTATE_BASE_DIR).toBe(dataDir);
+    } finally {
+      await sidecar.stop();
+      vi.unstubAllEnvs();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Stop / shutdown behaviour
 // ---------------------------------------------------------------------------
 

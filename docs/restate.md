@@ -119,6 +119,15 @@ None of the four is an admin-UI setting — every consumer is a same-machine pee
 - `RESTATE_BASE_DIR` → the top-level `base-dir` config key, set to `restateDataDir()`
 - `RESTATE_BIND_ADDRESS` → the top-level `bind-address` config key (the fabric port, above)
 
+### Sidecar environment is an explicit allowlist, never `...process.env` (AII-728)
+
+`RestateSidecar.start()` builds the spawned child's environment (`childEnv`, `src/restate/server.ts`) from an explicit allowlist rather than spreading the orchestrator's full `process.env`: the sidecar is a separate binary with no business seeing the GitHub App key, ticketing credentials, or anything else the orchestrator process holds. The allowlist is:
+
+- `PATH`, `HOME`, `TMPDIR`, `TZ` — the process-hygiene basics a spawned binary needs, forwarded verbatim from `process.env` when set.
+- Every `RESTATE_*` key, in two layers: any `RESTATE_*` key already present in `process.env` is forwarded by prefix match first (an operator-set override), then the six fixed constants above (`RESTATE_INGRESS__BIND_ADDRESS`, `RESTATE_ADMIN__BIND_ADDRESS`, `RESTATE_BASE_DIR`, `RESTATE_BIND_ADDRESS`, `RESTATE_DEFAULT_NUM_PARTITIONS`, `RESTATE_ROCKSDB_TOTAL_MEMORY_SIZE`) are applied on top, so a same-named operator override can never shadow one of them.
+
+Nothing else crosses. A decoy credential set anywhere else in `process.env` (an AWS key, the GitHub App private key, an npm token) never reaches the child.
+
 ### Memory
 
 Measured in the built image with `docker run --memory 1g` (2026-09-17): 881 MiB container total with Restate's defaults (24 partitions, 2 GiB RocksDB budget), ≈ 480–490 MiB with `RESTATE_DEFAULT_NUM_PARTITIONS=4` and `RESTATE_ROCKSDB_TOTAL_MEMORY_SIZE=256 MB` (both set in `src/restate/server.ts`'s child environment). The partition count is fixed the first time Restate provisions its data directory — set it before the first deploy, not after; changing it later has no effect on an existing `RESTATE_BASE_DIR`. The Fly Machine size for these numbers is the operator's decision, not this code's (ADR 023 amendment). Decision 2026-09-17: `fly.toml` sets `memory = "2gb"` — the orchestrator and Restate idle at ≈ 585 MiB together and the KG sidecar adds 300–400 MiB, which left no headroom in 1 GB.
@@ -240,6 +249,8 @@ Restate scopes an idempotency key by (service, handler, key) and keeps the keyed
 
 `register()` (`src/restate/endpoint.ts`) posts the deployment without `force` at boot: an unchanged endpoint answers 200/201, and a changed service set at the same URI answers a `META0004` conflict. `force: true` overrides the deployment but "can lead inflight invocations to an unrecoverable error state" (Restate's own guidance), so it is used only after `getInFlightJobs()` confirms zero in-flight work — the self-deploy interlock drains runs before the replacement process registers. Never force a registration to get past a conflict.
 
+Both `postDeployment()` calls inside `register()` — the initial no-force attempt and the forced retry after a `META0004` conflict — carry `signal: AbortSignal.timeout(10_000)` (AII-728). A hung admin API answers the same `{ outcome: "unreachable" }` a connection failure already produces; `main()`'s unconditional `await registerRestateEndpoint()` therefore cannot block boot indefinitely on a sidecar that accepted the TCP connection but never answered.
+
 ### All Restate ports bind loopback — check the fabric port too
 
 The orchestrator, the server, the admin API, and the SDK endpoint are same-machine peers, so ingress (8081), admin (9070), the SDK endpoint (9080), and the node/fabric port (5122) all bind `127.0.0.1` (§ "Ports and paths"). The fabric port defaults to `0.0.0.0:5122` upstream and was the one listener not on loopback until `RESTATE_BIND_ADDRESS` pinned it; on Fly an all-interfaces port is reachable over the private network. The local image boot check exists to catch a bind that regresses to `0.0.0.0`. On macOS, a long checkout path trips the 104-byte unix-socket limit (`RT0004`); set `RESTATE_DATA_DIR` to a short path.
@@ -259,6 +270,17 @@ The ingress runs `input` before the handler ever sees the call. When a tool that
 ### A dependency on Restate is a new failure mode — degrade, don't hang
 
 Anything that reaches the ingress or the admin API gains a dependency on the sidecar being up. Decide the degraded answer before you migrate: a discovered tool drops out of `tools/list` while the admin API is unreachable (the same silent-omission the `kg_*` tools already use), a `tools/call` or a refresh answers `503 restate-unavailable`, and `get_session_identity` still answers because it is not a Restate handler. The rule from ADR 025: Restate down narrows to "this one surface is unavailable," never "nobody can use MCP," and never a 401 — a 503 says retry, a 401 says re-authenticate.
+
+**"Down" includes "hangs," not only "refuses" (AII-728).** A connection failure resolves instantly; a sidecar that accepts a connection and never answers does not, and an unbounded `fetch` would hold the caller (and, for registration, boot itself) open indefinitely. Every fetch that crosses into the sidecar carries `signal: AbortSignal.timeout(ms)`, and a timeout is wired through the exact same fallback branch as a thrown connection error — no new status value anywhere:
+
+| Call | Bound | Degrades to |
+|---|---|---|
+| `discoverTools()` (`src/restate/tools-client.ts`) — admin discovery | 5s | `[]` (drops out of `tools/list`, same as an unreachable admin API) |
+| `callTool()` (`src/restate/tools-client.ts`) — tool ingress | 60s | `{ status: "unavailable" }` |
+| `RestateRefreshAuthority.invoke()` (`src/restate/operator-object.ts`) — backs `issue`/`refresh`/`revoke`/`describe`/`identity` | 10s | `"unavailable"` (`rotate()` reports `{ status: "unavailable", cause: "restate" }`) |
+| `postDeployment()` inside `register()` (`src/restate/endpoint.ts`) — both the no-force call and the forced retry | 10s | `{ outcome: "unreachable" }` |
+
+The `RestateSidecar`'s own readiness poll (`_pollReadiness`, `RESTATE_HEALTH_URL`) already bounds each attempt at 2s via `http.get(url, { timeout: 2_000 })` and is unaffected by this table — it was bounded before AII-728 and named here only so the four bounds above are not mistaken for a fifth.
 
 ### Every side effect in a handler goes inside `ctx.run`, and a tool handler never retries
 

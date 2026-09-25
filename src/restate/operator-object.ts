@@ -31,6 +31,9 @@ import { RESTATE_INGRESS_BIND_ADDRESS } from "./server.js";
 /** One tick past this and a presentation of the previous (just-rotated-away) hash is treated as replay. */
 export const GRACE_MS = 30_000;
 
+/** Refresh invocation bound (AII-728): a hung ingress call must not hang a token refresh forever. */
+const INVOKE_TIMEOUT_MS = 10_000;
+
 // Mirrors mcp-oauth.ts's own MCP_REFRESH_TOKEN_TTL_MS (30 days). Duplicated rather than
 // imported to keep the dependency direction one-way: mcp-oauth.ts imports
 // RestateRefreshAuthority from this module, so this module must not import mcp-oauth.ts.
@@ -254,6 +257,7 @@ export class RestateRefreshAuthority implements RefreshAuthority {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(body),
+        signal: AbortSignal.timeout(INVOKE_TIMEOUT_MS),
       });
     } catch {
       return "unavailable";
