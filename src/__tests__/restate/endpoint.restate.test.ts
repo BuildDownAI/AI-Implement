@@ -33,8 +33,8 @@ import { createEndpointHandler } from "@restatedev/restate-sdk/node";
 import { RestateContainer } from "@restatedev/restate-sdk-testcontainers";
 import { TestContainers } from "testcontainers";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { RESTATE_SERVICES, register, restateBindAddress, startRestateEndpoint } from "../../restate/endpoint.js";
-import { operatorObject } from "../../restate/operator-object.js";
+import { RESTATE_SERVICES, queryNonCompletedInvocations, register, restateBindAddress, startRestateEndpoint } from "../../restate/endpoint.js";
+import { orchestratorTools } from "../../restate/tools.js";
 import * as dedup from "../../dedup.js";
 import { initSettingsTable } from "../../runner-mode.js";
 import { RESTATE_IMAGE_VERSION, callObject, callService } from "./harness.js";
@@ -92,6 +92,10 @@ describe("startRestateEndpoint() / register() against a real server 1.7.10 (AII-
   let adminBaseUrl: string;
   let ingressBaseUrl: string;
   let registerFetch: typeof fetch;
+  let changedServer: http2.Http2Server;
+  let changedPort: number;
+  let changedFetch: typeof fetch;
+  let changedHandler = createEndpointHandler({ services: RESTATE_SERVICES });
 
   beforeAll(async () => {
     dedup.getDb();
@@ -113,8 +117,18 @@ describe("startRestateEndpoint() / register() against a real server 1.7.10 (AII-
     vi.stubEnv("RESTATE_ENDPOINT_PORT", String(port));
     bindHost = restateBindAddress().host;
 
-    await TestContainers.exposeHostPorts(port);
+    // A second endpoint has a swappable handler on one live HTTP/2 server. Keeping
+    // the connection alive matters: a closed server can still serve discovery on
+    // an existing HTTP/2 session through TestContainers' host-port proxy.
+    changedServer = http2.createServer((request, response) => changedHandler(request, response));
+    await new Promise<void>((resolve) => changedServer.listen(0, bindHost, resolve));
+    const changedAddress = changedServer.address();
+    if (changedAddress === null || typeof changedAddress === "string") throw new Error("expected second TCP port");
+    changedPort = changedAddress.port;
+
+    await TestContainers.exposeHostPorts(port, changedPort);
     registerFetch = tunnelingFetch(`${bindHost}:${port}`, `host.testcontainers.internal:${port}`);
+    changedFetch = tunnelingFetch(`${bindHost}:${changedPort}`, `host.testcontainers.internal:${changedPort}`);
 
     const container = new RestateContainer(RESTATE_IMAGE_VERSION).withExposedPorts(8080, 9070);
     started = await container.start();
@@ -126,19 +140,20 @@ describe("startRestateEndpoint() / register() against a real server 1.7.10 (AII-
   afterAll(async () => {
     await started?.stop();
     await new Promise<void>((resolve) => server.close(() => resolve()));
+    await new Promise<void>((resolve) => changedServer.close(() => resolve()));
     vi.unstubAllEnvs();
   });
 
   it(
-    "registers the real endpoint (no-force), stays success on an unchanged re-registration, and both bound services answer through the container ingress",
+    "registers the real endpoint, safely re-discovers the same URI, and both bound services answer through the container ingress",
     async () => {
       const first = await register({ adminBaseUrl, fetchImpl: registerFetch });
       expect(first).toEqual({ outcome: "registered-no-force" });
 
-      // An unchanged re-registration at the same URI is still success — no second call needed
-      // to prove it, the real admin API just answers 200 again.
+      // The pinned server answers 200 for the existing URI without re-discovery;
+      // register() checks zero active invocations before forcing discovery.
       const again = await register({ adminBaseUrl, fetchImpl: registerFetch });
-      expect(again).toEqual({ outcome: "registered-no-force" });
+      expect(again).toEqual({ outcome: "registered-drained-force" });
 
       // Operator (the Virtual Object) answers through the container's real ingress.
       const key = randomUUID();
@@ -173,9 +188,11 @@ describe("startRestateEndpoint() / register() against a real server 1.7.10 (AII-
   it(
     "a changed service set at the same URI is declined while a non-completed invocation is pinned to the old deployment, then force-registers once it drains",
     async () => {
-      // Establish (or re-confirm) the full-service-set deployment as current, independent of
-      // whatever the previous test left behind.
-      await register({ adminBaseUrl, fetchImpl: registerFetch });
+      // Register the swappable endpoint on its own URI. This leaves the first
+      // test's production endpoint intact while making the second endpoint the
+      // current deployment for both services.
+      vi.stubEnv("RESTATE_ENDPOINT_PORT", String(changedPort));
+      expect(await register({ adminBaseUrl, fetchImpl: changedFetch })).toEqual({ outcome: "registered-no-force" });
 
       // A genuinely in-flight, non-completed invocation against that deployment — held open
       // by the refresh test seam (AII-727, src/restate/operator-object.ts's sleepMs), not a
@@ -191,29 +208,39 @@ describe("startRestateEndpoint() / register() against a real server 1.7.10 (AII-
       });
       const sleepMs = 8_000;
       const inFlight = callObject(ingressBaseUrl, "Operator", key, "refresh", { presentedHash: hash, sleepMs });
-      // Give the exclusive invocation a moment to be admitted and start sleeping before the
-      // swap below, so it is genuinely non-completed by the time register() queries for it.
-      await new Promise((resolve) => setTimeout(resolve, 1_000));
+      // Attach this immediately so an assertion failure during registration cannot
+      // turn the still-pending request into an unhandled rejection during cleanup.
+      void inFlight.catch(() => undefined);
+      // Observe the actual non-completed invocation before swapping endpoints;
+      // a fixed sleep can race Restate's admission on a busy CI host.
+      const oldUri = `http://host.testcontainers.internal:${changedPort}`;
+      const admissionDeadline = Date.now() + 10_000;
+      while (Date.now() < admissionDeadline) {
+        const count = await queryNonCompletedInvocations(fetch, adminBaseUrl, oldUri);
+        if (count !== null && count > 0) break;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      expect(await queryNonCompletedInvocations(fetch, adminBaseUrl, oldUri)).toBeGreaterThan(0);
 
-      // Swap this process's own SDK endpoint for a changed service set at the same URI —
-      // mirrors harness.ts's replaceEndpoint(), inlined here since there is no
-      // RestateTestEnvironment to attach it to in this file.
-      server.close();
-      server = http2.createServer(createEndpointHandler({ services: [operatorObject] }));
-      await new Promise<void>((resolve, reject) => {
-        server.once("error", reject);
-        server.listen(port, bindHost, resolve);
-      });
+      // Change the live endpoint's discovery manifest at the same URI. Restate's
+      // duplicate-URI 200 does not rediscover it; register() must check drain
+      // and force after the active Operator invocation finishes.
+      changedHandler = createEndpointHandler({ services: [orchestratorTools] });
 
-      const declined = await register({ adminBaseUrl, fetchImpl: registerFetch });
+      const declined = await register({ adminBaseUrl, fetchImpl: changedFetch });
       expect(declined.outcome).toBe("declined-conflict");
 
       // Let the in-flight invocation complete — the old deployment now has zero
       // non-completed invocations pinned to it.
       await inFlight;
 
-      const forced = await register({ adminBaseUrl, fetchImpl: registerFetch });
+      const forced = await register({ adminBaseUrl, fetchImpl: changedFetch });
       expect(forced).toEqual({ outcome: "registered-drained-force" });
+      const deployments = await (await fetch(`${adminBaseUrl}/deployments`)).json() as {
+        deployments: Array<{ uri: string; services: Array<{ name: string }> }>;
+      };
+      const current = deployments.deployments.find((deployment) => deployment.uri === `${oldUri}/`);
+      expect(current?.services.map((service) => service.name)).toEqual(["orchestratorTools"]);
     },
     45_000,
   );
