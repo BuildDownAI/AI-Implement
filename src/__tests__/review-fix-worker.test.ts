@@ -16,6 +16,7 @@ import fs from "node:fs";
 import type * as DedupModule from "../dedup.js";
 import type * as ConfigModule from "../config.js";
 import type * as WorkerModule from "../review-fix-worker.js";
+import type * as AttemptStoreModule from "../review-fix-attempt-store.js";
 import type { RepoMapping } from "../config.js";
 import type { ScopedPrIdentity } from "../review-fix-contract.js";
 import type { PreparedReviewFixAttempt } from "../review-fix-ports.js";
@@ -24,6 +25,7 @@ let dbPath: string;
 let dedup: typeof DedupModule;
 let config: typeof ConfigModule;
 let workerModule: typeof WorkerModule;
+let attemptStoreModule: typeof AttemptStoreModule;
 
 beforeEach(async () => {
   vi.resetModules();
@@ -35,6 +37,7 @@ beforeEach(async () => {
   dedup = await import("../dedup.js");
   config = await import("../config.js");
   workerModule = await import("../review-fix-worker.js");
+  attemptStoreModule = await import("../review-fix-attempt-store.js");
 });
 
 afterEach(() => {
@@ -238,6 +241,36 @@ describe("GithubReviewFixWorker.launch", () => {
 
     expect(outcome).toEqual({ status: "unknown" });
     expect(t.dispatchCalls).toHaveLength(0);
+  });
+
+  it("forwards the mapping's dependencyTokenScope into the versioned run config when enabled", async () => {
+    seedMapping({ dependencyTokenScope: "installation" });
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    t.setDispatchImpl(async () => ({ success: true, status: 200, outcome: "accepted", runId: 9002 }));
+
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
+    const plan = await worker.prepare(makeAttempt({ attemptId: "attempt-dep-token" }));
+    await worker.launch(plan);
+
+    const dispatched = t.dispatchCalls[0] as { inputs: Record<string, unknown> };
+    const runConfig = JSON.parse(Buffer.from(dispatched.inputs.run_config as string, "base64").toString("utf8"));
+    expect(runConfig.dependencyTokenScope).toBe("installation");
+  });
+
+  it("omits dependencyTokenScope from the run config when the mapping has none set", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    t.setDispatchImpl(async () => ({ success: true, status: 200, outcome: "accepted", runId: 9003 }));
+
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
+    const plan = await worker.prepare(makeAttempt({ attemptId: "attempt-no-dep-token" }));
+    await worker.launch(plan);
+
+    const dispatched = t.dispatchCalls[0] as { inputs: Record<string, unknown> };
+    const runConfig = JSON.parse(Buffer.from(dispatched.inputs.run_config as string, "base64").toString("utf8"));
+    expect(runConfig.dependencyTokenScope).toBeUndefined();
   });
 
   it("returns unknown, never throws, when the mapping cannot be resolved", async () => {
@@ -547,36 +580,82 @@ describe("GithubReviewFixWorker.inspectTerminal", () => {
   });
 });
 
-describe("durable scope lookup: cancel/inspectTerminal after adapter reconstruction", () => {
-  it("accepted launch -> fresh adapter sharing only the scope store -> terminal inspection and cancellation against the same persisted execution", async () => {
+describe("durable scope lookup: cancel/inspectTerminal after a genuine adapter+store reconstruction", () => {
+  it("accepted launch -> persisted attempt record -> fresh SqliteReviewFixAttemptStore instance and fresh adapter, sharing no JS object -> terminal inspection and cancellation resolve scope from disk", async () => {
     seedMapping();
     const { resolver } = makeCredentials();
     const t = makeTransport();
     t.setDispatchImpl(async () => ({ success: true, status: 200, outcome: "accepted", runId: 9200 }));
-    // A durable store shared across adapter instances, standing in for the SQLite/Restate-
-    // object-backed composition a later issue wires in production. workerC below never itself
-    // calls prepare/launch/reconcile — it recovers scope purely from this shared store, the way
-    // a freshly constructed adapter after a process restart would.
-    const sharedScopeStore = workerModule.inMemoryReviewFixWorkerScopeStore();
 
-    const workerA = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport, scopeStore: sharedScopeStore });
-    const attempt = makeAttempt({ attemptId: "attempt-reconstruct" });
-    const plan = await workerA.prepare(attempt);
+    // The workflow's own persistence, standing in for `src/restate/review-fix-attempt.ts`
+    // (not landed): `admit` writes the attempt snapshot (attemptId -> scope) and
+    // `bindExecution` later writes the bound execution (execution -> scope) into the same
+    // SQLite row `review_fix_attempts`. Neither call is made by `GithubReviewFixWorker`
+    // itself — the worker only reads through the injected scope store.
+    const storeA = new attemptStoreModule.SqliteReviewFixAttemptStore();
+    const admission = await storeA.admit({
+      scope: SCOPE,
+      feedback: { taskText: "Address the reported findings", findings: [{ findingKey: "finding-1", version: 1 }] },
+      jobTimeoutMinutes: 90,
+    });
+    if (admission.status !== "prepared") throw new Error(`expected admission to prepare, got ${admission.status}`);
+    const attemptId = admission.attempt.attemptId;
+
+    const workerA = new workerModule.GithubReviewFixWorker({
+      credentials: resolver,
+      transport: t.transport,
+      scopeStore: workerModule.reviewFixAttemptStoreScopeStore(storeA),
+    });
+    const plan = await workerA.prepare(admission.attempt);
     const launchOutcome = await workerA.launch(plan);
     expect(launchOutcome).toEqual({ status: "accepted", execution: { githubRunId: 9200, githubRunAttempt: 1 } });
 
-    const workerC = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport, scopeStore: sharedScopeStore });
+    // The workflow binds the accepted execution to the persisted attempt row — the fact this
+    // reconstruction test relies on to resolve scope with no shared in-memory state.
+    const bindOutcome = await storeA.bindExecution(attemptId, { githubRunId: 9200, githubRunAttempt: 1 });
+    expect(bindOutcome).toEqual({ status: "bound" });
+
+    // A genuinely fresh store instance and a genuinely fresh adapter — the only thing shared
+    // with workerA/storeA is the on-disk SQLite file (via the process-wide getDb() singleton),
+    // exactly as a process restart would leave it. No in-memory Map is shared.
+    const storeC = new attemptStoreModule.SqliteReviewFixAttemptStore();
+    const workerC = new workerModule.GithubReviewFixWorker({
+      credentials: resolver,
+      transport: t.transport,
+      scopeStore: workerModule.reviewFixAttemptStoreScopeStore(storeC),
+    });
 
     t.setRunDetail({ status: "in_progress", conclusion: null, runAttempt: 1 });
     const midInspection = await workerC.inspectTerminal({ githubRunId: 9200, githubRunAttempt: 1 });
     expect(midInspection).toEqual({ reached: false });
 
-    const cancelOutcome = await workerC.cancel("attempt-reconstruct", { githubRunId: 9200, githubRunAttempt: 1 });
+    const cancelOutcome = await workerC.cancel(attemptId, { githubRunId: 9200, githubRunAttempt: 1 });
     expect(cancelOutcome).toEqual({ status: "cancelled" });
     expect(t.cancelCalls).toHaveLength(1);
+    // A cancellation acknowledgement is not terminal evidence — only a subsequent getRun
+    // reporting "completed" may report a terminal outcome.
+    const stillNotTerminal = await workerC.inspectTerminal({ githubRunId: 9200, githubRunAttempt: 1 });
+    expect(stillNotTerminal).toEqual({ reached: false });
 
     t.setRunDetail({ status: "completed", conclusion: "cancelled", runAttempt: 1 });
     const terminalInspection = await workerC.inspectTerminal({ githubRunId: 9200, githubRunAttempt: 1 });
     expect(terminalInspection).toEqual({ reached: true, outcome: { status: "cancelled" } });
+  });
+
+  it("scopeForExecution finds no route for an execution the store never bound (fresh store instance, no fabricated scope)", async () => {
+    seedMapping();
+    const { resolver, calls } = makeCredentials();
+    const t = makeTransport();
+    const store = new attemptStoreModule.SqliteReviewFixAttemptStore();
+
+    const worker = new workerModule.GithubReviewFixWorker({
+      credentials: resolver,
+      transport: t.transport,
+      scopeStore: workerModule.reviewFixAttemptStoreScopeStore(store),
+    });
+    const inspection = await worker.inspectTerminal({ githubRunId: 12345, githubRunAttempt: 1 });
+
+    expect(inspection).toEqual({ reached: false });
+    expect(calls).toHaveLength(0);
   });
 });

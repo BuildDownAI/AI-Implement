@@ -36,16 +36,22 @@
  * `inspectTerminal(execution)` and `cancel(attemptId, execution)` take only an
  * execution identity or attempt id — no scope — so this adapter routes scope
  * lookups through an injectable `ReviewFixWorkerScopeStore`, populated by
- * `prepare`, `launch`, and `reconcile` (all of which see the full scope). The
- * default implementation is an in-memory map, matching this issue's "no
- * production wiring" boundary — a later issue composes a durable
- * implementation so a freshly constructed adapter (e.g. after a process
- * restart) can still `cancel`/`inspectTerminal` an execution it never itself
- * saw `prepare`/`reconcile` for, as long as the injected store is shared
- * across that reconstruction. SQLite (`ReviewFixAttemptStorePort`) remains
- * the sole authority on occupancy, authority, and results; a store miss here
- * still degrades to the safe "not yet reached" / `"unknown"` outcome rather
- * than guessing which repo an execution belongs to.
+ * `prepare`, `launch`, and `reconcile` (all of which see the full scope).
+ * `inMemoryReviewFixWorkerScopeStore()` (the default when no store is injected)
+ * is private to one adapter instance and cannot survive a reconstruction on its
+ * own. `reviewFixAttemptStoreScopeStore()` is the concrete durable alternative:
+ * it reads `attemptId`/execution -> scope from the attempt record itself
+ * (`ReviewFixAttemptStorePort.getPreparedAttempt` and
+ * `SqliteReviewFixAttemptStore.findPreparedAttemptByExecution`), which the
+ * workflow already persists via `admit`/`bindExecution` before this adapter's
+ * `cancel`/`inspectTerminal` would ever be called on a bound execution — so a
+ * freshly constructed adapter, wired to that store, resolves scope with no
+ * shared in-memory state at all. No production wiring composes it here (that
+ * remains a later issue's job), but the store and its test coverage are part of
+ * this slice. SQLite (`ReviewFixAttemptStorePort`) remains the sole authority on
+ * occupancy, authority, and results; a store miss here still degrades to the
+ * safe "not yet reached" / `"unknown"` outcome rather than guessing which repo
+ * an execution belongs to.
  *
  * `succeeded` outcomes from `inspectTerminal` never use the workflow run's own
  * `head_sha`, which GitHub fixes at dispatch time to the ref's tip — for a
@@ -315,6 +321,7 @@ function buildLaunchInputs(plan: WorkerLaunchPlan, mapping: RepoMapping): Dispat
       ? { sensitiveFiles: { add: mapping.sensitiveAddPatterns ?? undefined, allow: mapping.sensitiveAllowPatterns ?? undefined } }
       : {}),
     ...(mapping.reviewers != null ? { reviewers: mapping.reviewers } : {}),
+    ...(mapping.dependencyTokenScope != null ? { dependencyTokenScope: mapping.dependencyTokenScope } : {}),
   };
 
   return {
@@ -375,6 +382,45 @@ export function inMemoryReviewFixWorkerScopeStore(): ReviewFixWorkerScopeStore {
   };
 }
 
+/** The two read paths `reviewFixAttemptStoreScopeStore` needs from a durable attempt record —
+ *  `ReviewFixAttemptStorePort.getPreparedAttempt` plus `SqliteReviewFixAttemptStore`'s extra
+ *  `findPreparedAttemptByExecution` (not part of the port, since `bindExecution` only writes
+ *  that direction). A `PreparedReviewFixAttempt`-shaped return is accepted so the production
+ *  `SqliteReviewFixAttemptStore` satisfies this with no adapter needed. */
+export interface ReviewFixWorkerAttemptScopeSource {
+  getPreparedAttempt(attemptId: AttemptId): Promise<{ readonly scope: ScopedPrIdentity } | null>;
+  findPreparedAttemptByExecution(execution: WorkerExecutionIdentity): Promise<{ readonly scope: ScopedPrIdentity } | null>;
+}
+
+/**
+ * A `ReviewFixWorkerScopeStore` backed by the durable attempt record itself, rather than an
+ * in-memory map private to one adapter instance. `attemptId` -> scope comes from `admit`'s
+ * persisted snapshot; execution -> scope comes from `bindExecution`'s persisted
+ * `github_run_id`/`github_run_attempt` columns — both already written by the workflow (not
+ * this adapter) before it would ever call `cancel`/`inspectTerminal` on a bound execution.
+ * `rememberAttempt`/`rememberExecution` are no-ops here: this store only reads, since the
+ * durable write already happened through `source` itself. Composing this with
+ * `SqliteReviewFixAttemptStore` (or, in production, whatever AII-811 wires) is what makes a
+ * freshly constructed `GithubReviewFixWorker` — e.g. after a process restart, sharing no
+ * in-memory state with whichever instance ran `prepare`/`launch`/`reconcile` — still resolve
+ * scope for a previously bound execution instead of degrading to `unknown`/`reached: false`
+ * forever, which is all `inMemoryReviewFixWorkerScopeStore()` alone can ever do.
+ */
+export function reviewFixAttemptStoreScopeStore(source: ReviewFixWorkerAttemptScopeSource): ReviewFixWorkerScopeStore {
+  return {
+    async rememberAttempt() {},
+    async rememberExecution() {},
+    async scopeForAttempt(attemptId) {
+      const attempt = await source.getPreparedAttempt(attemptId);
+      return attempt?.scope ?? null;
+    },
+    async scopeForExecution(execution) {
+      const attempt = await source.findPreparedAttemptByExecution(execution);
+      return attempt?.scope ?? null;
+    },
+  };
+}
+
 // ---------------------------------------------------------------------------
 // The adapter
 // ---------------------------------------------------------------------------
@@ -384,10 +430,10 @@ export interface GithubReviewFixWorkerDeps {
   /** Defaults to `githubActionsReviewFixWorkerTransport`. Overridden by tests with a
    *  controllable double. */
   transport?: ReviewFixWorkerTransport;
-  /** Defaults to a fresh, per-instance `inMemoryReviewFixWorkerScopeStore()`. Share one store
-   *  across adapter instances (tests reconstructing an adapter; a later issue's durable
-   *  composition) to route `cancel`/`inspectTerminal` without a preceding `prepare`/`reconcile`
-   *  on that instance. */
+  /** Defaults to a fresh, per-instance `inMemoryReviewFixWorkerScopeStore()`. Inject
+   *  `reviewFixAttemptStoreScopeStore()` (or share one in-memory store across adapter
+   *  instances, e.g. in a test) to route `cancel`/`inspectTerminal` without a preceding
+   *  `prepare`/`reconcile` on that instance. */
   scopeStore?: ReviewFixWorkerScopeStore;
 }
 
