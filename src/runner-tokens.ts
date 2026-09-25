@@ -147,6 +147,7 @@ export function verifyAndConsumeRunToken(token: string, secret: string): VerifyR
 interface PreparedAttemptTokenRow {
   attempt_id: string;
   dispatch_id: string;
+  issue_scope: string;
   issue_id: string;
   mapping_key: string;
   installation_id: string;
@@ -154,6 +155,14 @@ interface PreparedAttemptTokenRow {
   pr_number: number;
   deadline_at: number;
   authority_revoked_at: number | null;
+  owner: string;
+  lifecycle_owner: string;
+  admission_mapping_key: string;
+  admission_issue_scope: string;
+  admission_issue_id: string;
+  admission_installation_id: string | null;
+  admission_repository: string | null;
+  admission_pr_number: number | null;
   released_at: number | null;
 }
 
@@ -161,13 +170,31 @@ const PILOT_DELIVERY_GRACE_MS = 15 * 60_000;
 
 function preparedAttempt(attemptId: string): PreparedAttemptTokenRow | undefined {
   return getDb().prepare(`
-    SELECT a.attempt_id, a.dispatch_id, a.issue_id, a.mapping_key,
+    SELECT a.attempt_id, a.dispatch_id, a.issue_scope, a.issue_id, a.mapping_key,
            a.installation_id, a.repository, a.pr_number, a.deadline_at,
-           a.authority_revoked_at, d.released_at
+           a.authority_revoked_at, a.owner, d.lifecycle_owner,
+           d.mapping_key AS admission_mapping_key, d.issue_scope AS admission_issue_scope,
+           d.issue_id AS admission_issue_id, d.installation_id AS admission_installation_id,
+           d.repository AS admission_repository, d.pr_number AS admission_pr_number,
+           d.released_at
     FROM review_fix_attempts a
     JOIN dispatch_admissions d ON d.dispatch_id = a.dispatch_id
     WHERE a.attempt_id = ?
   `).get(attemptId) as PreparedAttemptTokenRow | undefined;
+}
+
+function hasPreparedAdmissionAuthority(attempt: PreparedAttemptTokenRow): boolean {
+  return attempt.dispatch_id === attempt.attempt_id
+    && attempt.owner === attempt.attempt_id
+    && attempt.lifecycle_owner === `restate:${attempt.attempt_id}`
+    && attempt.admission_mapping_key === attempt.mapping_key
+    && attempt.admission_issue_scope === attempt.issue_scope
+    && attempt.admission_issue_id === attempt.issue_id
+    && attempt.admission_installation_id === attempt.installation_id
+    && attempt.admission_repository === attempt.repository
+    && attempt.admission_pr_number === attempt.pr_number
+    && attempt.authority_revoked_at === null
+    && attempt.released_at === null;
 }
 
 /** Mint for an already-prepared pilot attempt. Calling this again returns the same
@@ -184,8 +211,7 @@ export function mintPreparedReviewFixToken(input: {
   const db = getDb();
   return db.transaction((): MintOutput => {
     const attempt = preparedAttempt(input.attemptId);
-    if (!attempt || attempt.dispatch_id !== input.attemptId || attempt.authority_revoked_at !== null
-      || attempt.released_at !== null) {
+    if (!attempt || !hasPreparedAdmissionAuthority(attempt)) {
       throw new Error("Prepared review-fix attempt has no current authority");
     }
     const latestExpiry = attempt.deadline_at + PILOT_DELIVERY_GRACE_MS;
@@ -249,7 +275,7 @@ export function verifyPreparedReviewFixToken(
       SELECT expires_at FROM runner_tokens WHERE dispatch_id = ? AND audience = ?
     `).get(claims.dispatchId, claims.audience) as { expires_at: number } | undefined;
     if (!row || claims.exp !== row.expires_at) return { ok: false, reason: "wrong_scope", claims };
-    if (attempt.authority_revoked_at !== null || attempt.released_at !== null) {
+    if (!hasPreparedAdmissionAuthority(attempt)) {
       return { ok: false, reason: "revoked", claims };
     }
     if (options.consumePublication) {

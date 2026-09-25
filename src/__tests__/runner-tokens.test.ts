@@ -360,7 +360,7 @@ function seedPreparedPilotAttempt(deadlineAt = Date.now() + 60_000): void {
        repository, pr_number, lifecycle_owner, phase, backend, created_at)
     VALUES (?, 'AII', 'pr', 'acme/app#42', '7', 'acme/app', 42,
             ?, 'implementation', 'github-actions', ?)
-  `).run(PILOT_ATTEMPT, JSON.stringify({ kind: "restate", attemptId: PILOT_ATTEMPT }), Date.now());
+  `).run(PILOT_ATTEMPT, `restate:${PILOT_ATTEMPT}`, Date.now());
   db.prepare(`
     INSERT INTO review_fix_attempts
       (attempt_id, dispatch_id, mapping_key, installation_id, repository,
@@ -459,6 +459,21 @@ describe("prepared review-fix credentials", () => {
     dedup.getDb().prepare("UPDATE dispatch_admissions SET released_at = ? WHERE dispatch_id = ?")
       .run(now, PILOT_ATTEMPT);
     expect(runnerTokens.verifyPreparedReviewFixToken(minted.token, SECRET, "progress"))
+      .toMatchObject({ ok: false, reason: "revoked" });
+  });
+
+  it("rejects credentials if the admission is reassigned", () => {
+    seedPreparedPilotAttempt();
+    const minted = runnerTokens.mintPreparedReviewFixToken({ attemptId: PILOT_ATTEMPT, audience: "result", secret: SECRET });
+    dedup.getDb().prepare("UPDATE dispatch_admissions SET lifecycle_owner = 'legacy' WHERE dispatch_id = ?")
+      .run(PILOT_ATTEMPT);
+    expect(runnerTokens.verifyPreparedReviewFixToken(minted.token, SECRET, "result"))
+      .toMatchObject({ ok: false, reason: "revoked" });
+    expect(() => runnerTokens.mintPreparedReviewFixToken({ attemptId: PILOT_ATTEMPT, audience: "progress", secret: SECRET }))
+      .toThrow(/no current authority/);
+    dedup.getDb().prepare("UPDATE dispatch_admissions SET lifecycle_owner = ?, repository = 'other/app' WHERE dispatch_id = ?")
+      .run(`restate:${PILOT_ATTEMPT}`, PILOT_ATTEMPT);
+    expect(runnerTokens.verifyPreparedReviewFixToken(minted.token, SECRET, "result"))
       .toMatchObject({ ok: false, reason: "revoked" });
   });
 });
