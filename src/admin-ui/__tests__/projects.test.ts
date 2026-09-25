@@ -396,6 +396,11 @@ describe("projects page review-fix lifecycle field", () => {
     expect(errEl?.classList.contains("hidden")).toBe(false);
     expect(errEl?.textContent).toBeTruthy();
     expect(errEl?.textContent).not.toMatch(/^Server error:/);
+    // A rejected request doesn't prove the save didn't apply server-side, so the
+    // message must not claim certainty that nothing was saved.
+    expect(errEl?.textContent).not.toMatch(/was not saved/i);
+    expect(errEl?.textContent).toMatch(/could not confirm the save/i);
+    expect(errEl?.textContent).toMatch(/reload/i);
   });
 
   it("renders a distinct cause for an unsupported execution mode vs. an unavailable registration", async () => {

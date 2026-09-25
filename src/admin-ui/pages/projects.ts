@@ -1301,7 +1301,7 @@ export const projectsScript = `
       res = await window.api('/api/mappings', { method: 'POST', body: JSON.stringify(body) });
     } catch (_) {
       if (saveBtn) { saveBtn.disabled = false; saveBtn.textContent = origSaveLabel; }
-      errEl.textContent = 'Could not reach the server. The change was not saved.';
+      errEl.textContent = 'Could not confirm the save. Reload and check the project before retrying.';
       errEl.classList.remove('hidden');
       return;
     }
