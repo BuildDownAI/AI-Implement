@@ -105,12 +105,29 @@ describe("handlePublicationTokenRequest", () => {
     expect(mockGetScopedToken).toHaveBeenCalledTimes(1);
   });
 
-  it("consumes the credential before a failed GitHub mint", async () => {
+  it("releases the credential after a failed GitHub mint", async () => {
     const token = mintPublicationToken();
     mockGetScopedToken.mockRejectedValueOnce(new Error("GitHub unavailable"));
+    mockGetScopedToken.mockResolvedValueOnce({ token: "ghs_retry", expiresAt: "2030-01-01T00:00:00Z" });
 
     expect((await callHandler(token)).status).toBe(500);
+    expect((await callHandler(token)).status).toBe(200);
     expect((await callHandler(token)).status).toBe(403);
+    expect(mockGetScopedToken).toHaveBeenCalledTimes(2);
+  });
+
+  it("rejects a concurrent exchange while a mint is in flight and keeps a successful claim consumed", async () => {
+    const token = mintPublicationToken();
+    let finishMint: ((value: { token: string; expiresAt: string }) => void) | undefined;
+    mockGetScopedToken.mockImplementationOnce(() => new Promise((resolve) => { finishMint = resolve; }));
+
+    const first = callHandler(token);
+    expect(mockGetScopedToken).toHaveBeenCalledTimes(1);
+    expect((await callHandler(token)).status).toBe(403);
+    finishMint?.({ token: "ghs_first", expiresAt: "2030-01-01T00:00:00Z" });
+    expect((await first).status).toBe(200);
+    expect((await callHandler(token)).status).toBe(403);
+    expect(mockGetScopedToken).toHaveBeenCalledTimes(1);
   });
 
   it("rejects missing, wrong-audience, and planning credentials identically", async () => {

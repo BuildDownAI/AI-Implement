@@ -1,5 +1,5 @@
 import { getScopedInstallationToken } from "./github-app-auth.js";
-import { verifyRunToken } from "./runner-tokens.js";
+import { releasePublicationClaim, verifyRunToken } from "./runner-tokens.js";
 
 export interface HandlePublicationTokenInput {
   authorization: string | undefined;
@@ -81,6 +81,11 @@ export async function handlePublicationTokenRequest(
     );
     return { status: 200, body: { token, expires_at: expiresAt } };
   } catch (err) {
+    // The GitHub mint issued no credential. Restore only the exact claim made
+    // above so the runner's existing 5xx retry can exchange it once.
+    if (verified.consumedAt !== null) {
+      releasePublicationClaim(verified.claims.dispatchId, verified.consumedAt);
+    }
     console.error("[publication-token] Failed to mint installation token:", err);
     return { status: 500, body: { error: "Failed to mint token" } };
   }
