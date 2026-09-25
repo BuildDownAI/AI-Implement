@@ -262,10 +262,13 @@ export function createReviewFixFinalizer(deps: {
  *    claimed delivery was originally accepted under (`approvalDeliveryPayload`) before any remote
  *    reconciliation or write. A retry carrying changed dispositions must never post a different
  *    GitHub effect while acknowledging the identity accepted for the original one.
- *  - The durable attempt state is re-read directly (not merely trusted from `input`): a conflicting
- *    result recorded against the attempt, or an immutable terminal verdict recorded as anything
- *    other than `succeeded`, withholds — a pending delivery must not be completed after either has
- *    since been recorded, even though the caller's own booleans might still say "proceed".
+ *  - The durable attempt state is re-read directly (not merely trusted from `input`): approval is
+ *    bound to an accepted result that exists, carries no conflict, and matches this delivery's own
+ *    output commit, and to an immutable terminal verdict recorded as `succeeded` — an absent
+ *    accepted result, an absent recorded verdict, a mismatched output commit, a conflict, or any
+ *    verdict other than `succeeded` all withhold. A pending delivery must not be completed while
+ *    any of that evidence is still missing or has since diverged, even though the caller's own
+ *    booleans might still say "proceed".
  */
 export async function retryApprovalEffect(
   deps: { github: ReviewFixGitHubAdapter; attemptStore: ReviewFixFinalizeAttemptStore },
@@ -316,14 +319,32 @@ export async function retryApprovalEffect(
 
   // Safeguard 2: re-read the durable attempt state directly rather than trusting only the
   // caller's evidence — a conflict or an incompatible recorded verdict may have been persisted
-  // after the original `applyApproval` call accepted this delivery.
+  // after the original `applyApproval` call accepted this delivery. Unlike `applyApproval`
+  // (whose gates only ever see the caller-supplied `input`), this reconciliation path must bind
+  // to what the attempt repository has actually durably accepted: a pending delivery with no
+  // accepted result, or one whose accepted result has diverged from this delivery's own
+  // identity, or an attempt with no recorded `succeeded` verdict, must never be completed —
+  // `getAcceptedResult`/`getRecordedOutcome` returning `null` is not itself proof of "safe to
+  // proceed" and must withhold exactly like a conflicting or incompatible value would.
   const accepted = await deps.attemptStore.getAcceptedResult(input.attemptId);
-  if (!accepted || accepted.hasConflict) {
+  if (!accepted || !accepted.result) {
+    return withholdClaim("no durably accepted runner result is on record for this attempt");
+  }
+  if (accepted.hasConflict) {
     return withholdClaim("a conflicting result has been recorded for this attempt since the approval delivery was accepted");
   }
+  if (accepted.result.outputCommit !== input.result.outputCommit) {
+    return withholdClaim(
+      `accepted result outputCommit ${accepted.result.outputCommit} does not match the approval delivery's outputCommit ${input.result.outputCommit}`,
+    );
+  }
   const recordedOutcome = await deps.attemptStore.getRecordedOutcome(input.attemptId);
-  if (recordedOutcome && recordedOutcome.terminal.status !== "succeeded") {
-    return withholdClaim(`attempt's recorded terminal outcome is '${recordedOutcome.terminal.status}', not 'succeeded'`);
+  if (!recordedOutcome || recordedOutcome.terminal.status !== "succeeded") {
+    return withholdClaim(
+      recordedOutcome
+        ? `attempt's recorded terminal outcome is '${recordedOutcome.terminal.status}', not 'succeeded'`
+        : "attempt has no recorded terminal outcome yet",
+    );
   }
 
   // The claim above only proves no other local retry holds this delivery — it is not evidence
