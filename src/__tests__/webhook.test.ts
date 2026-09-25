@@ -1408,6 +1408,31 @@ describe("review feedback ingestion", () => {
     expect(reviewFixQueue.listReviewFixEvents(firstResponse.reviewFixId)).toHaveLength(1);
   });
 
+  it("keeps headerless inline comments at different paths distinct even with identical text", async () => {
+    const jobId = log.appendLog({ issueId: "issue-inline-paths", issueIdentifier: "AII-PATHS", repo: "org/repo" });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/54");
+    const base = {
+      action: "created",
+      pull_request: { number: 54, html_url: "https://github.com/org/repo/pull/54", head: { ref: "ai-implement/AII-PATHS-fix" } },
+      repository: { full_name: "org/repo" },
+    };
+    const deliver = async (path: string) => {
+      const request = makeRequest(SECRET, "pull_request_review_comment", {
+        ...base,
+        comment: { body: "Guard this value.", path, line: 12, created_at: "2026-01-01T00:00:00Z" },
+      });
+      webhook.handleGitHubWebhook(request.req as never, request.res as never, SECRET);
+      await request.res.done;
+      return JSON.parse(request.res.body) as { reviewFixId: number; duplicate: boolean };
+    };
+
+    const first = await deliver("src/one.ts");
+    const second = await deliver("src/two.ts");
+    expect(first.duplicate).toBe(false);
+    expect(second.duplicate).toBe(false);
+    expect(reviewFixQueue.listReviewFixEvents(first.reviewFixId)).toHaveLength(2);
+  });
+
   it("a redelivered Claude PR summary comment (same x-github-delivery) is a no-op across multiple findings (AII-792)", async () => {
     const jobId = log.appendLog({
       issueId: "issue-dup-summary",

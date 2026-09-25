@@ -236,6 +236,29 @@ describe("acceptReviewFixWebhookEvent (AII-792)", () => {
     expect(second.reviewFixId).not.toBe(first.reviewFixId);
   });
 
+  it("does not re-pend a dispatched internal event on retry, but accepts the next source dispatch", () => {
+    const input = {
+      eventId: "internal:open_pr:issue-1:44:dispatch-1",
+      issueId: "issue-1",
+      issueIdentifier: "AII-1",
+      repo: "org/repo",
+      prNumber: 44,
+      reason: "open_pr",
+    };
+    const first = queue.acceptReviewFixWebhookEvent(input);
+    queue.updateReviewFixStatus(first.reviewFixId, "dispatched");
+
+    expect(queue.acceptReviewFixWebhookEvent(input).status).toBe("duplicate");
+    expect(queue.getPendingReviewFixes()).toHaveLength(0);
+    expect(queue.listReviewFixEvents(first.reviewFixId)).toHaveLength(1);
+
+    const next = queue.acceptReviewFixWebhookEvent({ ...input, eventId: "internal:open_pr:issue-1:44:dispatch-2" });
+    expect(next.status).toBe("accepted");
+    expect(next.reviewFixId).toBe(first.reviewFixId);
+    expect(queue.getPendingReviewFixes()).toHaveLength(1);
+    expect(queue.listReviewFixEvents(first.reviewFixId)).toHaveLength(2);
+  });
+
   it("leaves the legacy enqueueReviewFix seam (no eventId) untouched — repeated calls still merge on (repo, pr_number)", () => {
     const first = queue.enqueueReviewFix({
       issueId: "issue-1",

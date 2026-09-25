@@ -99,7 +99,7 @@ import { resolveBaseBranch, findOpenRollUpPr } from "./feature-branch.js";
 import { validateIssueBaseBranch, postBranchComment } from "./base-branch.js";
 import { runMergeUps, clearRollUpHandledMarkersByIdentifier } from "./merge-up.js";
 import { runGroupingBranchAutoMerge } from "./auto-merge.js";
-import { getPendingReviewFixes, recordReviewFixDispatch, updateReviewFixStatus, shouldSkipReviewFix, enqueueReviewFix, buildReviewFixTaskDescription, MAX_TASK_FINDINGS } from "./review-fix-queue.js";
+import { getPendingReviewFixes, recordReviewFixDispatch, updateReviewFixStatus, shouldSkipReviewFix, acceptReviewFixWebhookEvent, buildReviewFixTaskDescription, MAX_TASK_FINDINGS } from "./review-fix-queue.js";
 import { drainCommentGapfillQueue } from "./comment-gapfill-drain.js";
 import { sweepOrphanedGapfillRows } from "./comment-gapfill-queue.js";
 import { processPendingWorkflowSyncs } from "./workflow-sync-queue.js";
@@ -333,7 +333,11 @@ export async function guardOpenPrBeforeImplementationDispatch(
   }
 
   if (prState.state === "open") {
-    enqueueReviewFix({
+    const previousDispatch = getLatestDispatchForPr(parsed.owner, parsed.repo, parsed.prNumber);
+    acceptReviewFixWebhookEvent({
+      // A poll retry sees the same source dispatch. A new fix run gets a new log id,
+      // so an open PR can legitimately be queued again after that run.
+      eventId: `internal:open_pr:${issue.id}:${parsed.prNumber}:${previousDispatch?.id ?? "initial"}`,
       issueId: issue.id,
       issueIdentifier: issue.identifier,
       repo: `${parsed.owner}/${parsed.repo}`,

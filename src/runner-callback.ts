@@ -14,7 +14,7 @@ import type { TicketingProvider } from "./providers/types.js";
 import { remediateFailedJob, type StuckWatchdogConfig } from "./stuck-watchdog.js";
 import { verifyAndConsumeRunToken, verifyRunToken } from "./runner-tokens.js";
 import { getStepsByJobId, upsertStepRecord } from "./step-log.js";
-import { enqueueReviewFix, getReviewFixDispatchSnapshot } from "./review-fix-queue.js";
+import { acceptReviewFixWebhookEvent, getReviewFixDispatchSnapshot } from "./review-fix-queue.js";
 import {
   getReviewFindingsByKeys,
   markReviewFindingsDeferredByKeys,
@@ -440,7 +440,8 @@ async function handleLeaseRejectedFailure(
     const authorType = prState?.headRef ? await getCommitAuthorType(token, owner, repo, prState.headRef) : null;
 
     if (authorType === "Bot") {
-      enqueueReviewFix({
+      acceptReviewFixWebhookEvent({
+        eventId: `internal:lease_rejected:${job.dispatchId ?? job.id}`,
         issueId: job.issueId,
         issueIdentifier: job.issueIdentifier,
         repo: job.repo,

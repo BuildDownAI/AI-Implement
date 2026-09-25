@@ -334,6 +334,7 @@ async function handleKgPrCheckWebhook(
 interface ReviewPayload {
   action?: string;
   review?: {
+    id?: number;
     state?: string;
     body?: string | null;
     html_url?: string;
@@ -354,6 +355,7 @@ interface ReviewPayload {
 interface ReviewCommentPayload {
   action?: string;
   comment?: {
+    id?: number;
     body?: string;
     html_url?: string;
     path?: string;
@@ -636,6 +638,7 @@ function handleReviewWebhook(payload: ReviewPayload, res: http.ServerResponse, d
       repo: repoFullName,
       prNumber,
       kind: "pull_request_review",
+      sourceId: payload.review?.id,
       actor: payload.review?.user?.login,
       body,
       commitId: payload.review?.commit_id,
@@ -725,6 +728,9 @@ function handleReviewCommentWebhook(payload: ReviewCommentPayload, res: http.Ser
       repo: repoFullName,
       prNumber,
       kind: "pull_request_review_comment",
+      sourceId: payload.comment?.id,
+      path: payload.comment?.path,
+      line,
       actor: payload.comment?.user?.login,
       body,
       commitId: payload.comment?.commit_id,
@@ -992,6 +998,7 @@ async function handleIssueCommentWebhook(
       repo: repoFullName,
       prNumber,
       kind: "issue_comment",
+      sourceId: payload.comment?.id,
       actor: payload.comment?.user?.login,
       body,
       commitId: undefined,
@@ -1033,8 +1040,9 @@ function parseEventTimestamp(value: string | undefined): number | undefined {
  * A stable identity for one webhook-sourced review event, scoped to `acceptReviewFixWebhookEvent`'s
  * per-repo dedup key (AII-792). GitHub's delivery id (`x-github-delivery`) is preferred — a genuine
  * redelivery of the same webhook carries the identical GUID. When it is absent (a caller without that
- * header, e.g. a test or a future non-GitHub host adapter), a deterministic hash of the fields that
- * make two events "the same" stands in: two calls with identical repo/PR/kind/actor/body/commit/eventAt
+ * header, a GitHub review/comment id identifies the source object. If neither exists,
+ * a deterministic hash of the fields that
+ * make two events "the same" stands in: two calls with identical repo/PR/kind/actor/body/commit/eventAt/path/line
  * synthesize to the same id, while a genuinely distinct event (different timestamp, different body, ...)
  * does not.
  */
@@ -1044,6 +1052,9 @@ function resolveReviewFixEventId(
     repo: string;
     prNumber: number;
     kind: "pull_request_review" | "pull_request_review_comment" | "issue_comment";
+    sourceId?: number;
+    path?: string;
+    line?: number;
     actor: string | undefined;
     body: string;
     commitId: string | undefined;
@@ -1051,6 +1062,7 @@ function resolveReviewFixEventId(
   },
 ): string {
   if (deliveryId) return `gh-delivery:${deliveryId}`;
+  if (parts.sourceId !== undefined) return `gh-object:${parts.kind}:${parts.sourceId}`;
   const digest = crypto
     .createHash("sha256")
     .update(JSON.stringify([
@@ -1061,6 +1073,8 @@ function resolveReviewFixEventId(
       parts.body,
       parts.commitId ?? null,
       parts.eventAt ?? null,
+      parts.path ?? null,
+      parts.line ?? null,
     ]))
     .digest("hex");
   return `synthesized:${digest}`;

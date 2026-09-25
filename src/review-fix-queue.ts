@@ -127,9 +127,7 @@ export interface EnqueueReviewFixInput {
   sourceUrl?: string | null;
   actor?: string | null;
   findingIds?: number[];
-  /** Stable identity of the webhook delivery (or synthesized equivalent) that produced this
-   *  event — set only by `acceptReviewFixWebhookEvent`. Omitted (NULL) by the pre-existing
-   *  internal producers (open_pr, lease_rejected), which stay on Legacy queue behavior. */
+  /** Stable identity of the webhook delivery or internal automatic event. */
   sourceEventId?: string | null;
 }
 
@@ -223,8 +221,7 @@ export function enqueueReviewFix(input: EnqueueReviewFixInput): number {
 }
 
 export interface AcceptReviewFixWebhookEventInput {
-  /** GitHub delivery id when present, else a synthesized hash — see `resolveReviewFixEventId`
-   *  in webhook.ts. Scoped by repo, matching every other identity in this table. */
+  /** GitHub delivery id, synthesized webhook id, or stable internal source id. Scoped by repo. */
   eventId: string;
   issueId: string;
   issueIdentifier: string | null;
@@ -233,7 +230,7 @@ export interface AcceptReviewFixWebhookEventInput {
   reason: string;
   sourceUrl?: string | null;
   actor?: string | null;
-  findings: ReviewLedgerFinding[];
+  findings?: ReviewLedgerFinding[];
 }
 
 export type AcceptReviewFixWebhookEventOutcome =
@@ -246,7 +243,7 @@ interface ReviewFixSourceEventRow {
 }
 
 /**
- * Atomically accepts one webhook-sourced review event: bumps (or creates) the
+ * Atomically accepts one automatic review-fix event: bumps (or creates) any
  * finding-version rows (AII-780) and enqueues/merges the review-fix queue entry
  * (this module's existing `ON CONFLICT (repo, pr_number)` seam), all inside one
  * `db.transaction()` so a caller's HTTP 200 ACK — written only after this returns —
@@ -270,7 +267,7 @@ export function acceptReviewFixWebhookEvent(input: AcceptReviewFixWebhookEventIn
       };
     }
 
-    const findingIds = input.findings.map((finding) =>
+    const findingIds = (input.findings ?? []).map((finding) =>
       upsertReviewFinding({ repo: input.repo, prNumber: input.prNumber, ...finding }),
     );
     const reviewFixId = enqueueReviewFix({
