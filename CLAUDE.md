@@ -81,6 +81,7 @@ Entry points for areas that are easy to miss. Each names the module to start fro
 |---|---|---|
 | Pipeline, steps, custom overrides | `src/pipeline/` | [docs/pipeline-architecture.md](docs/pipeline-architecture.md) |
 | Review findings → fix dispatches | `src/review-fix-queue.ts` | [docs/review-fix-rail.md](docs/review-fix-rail.md) |
+| Restate review-fix pilot setup, recovery, drain, rollback | `src/restate/review-fix-attempt.ts`, `src/restate/review-fix-pr.ts` | [docs/restate-review-fix-pilot.md](docs/restate-review-fix-pilot.md) |
 | Per-review-cycle evidence (input/output commit, dispositions, tests, verdict, usage) | `src/pipeline/cycle-summary.ts` | [docs/cycle-summary-evidence.md](docs/cycle-summary-evidence.md) |
 | Parent/child grouping and roll-up | `src/feature-branch.ts`, `src/merge-up.ts` | [docs/feature-branch-grouping.md](docs/feature-branch-grouping.md) |
 | Issueless run kinds (kg-refresh lifecycle and pattern) | `src/kg-refresh.ts`, `src/index.ts` | [docs/issueless-runs.md](docs/issueless-runs.md) |
