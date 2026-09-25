@@ -165,6 +165,7 @@ function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
     dependencyTokenScope: null,
     memoryProviderId: null,
     reviewers: null,
+    reviewFixLifecycle: null,
     ...overrides,
   };
 }

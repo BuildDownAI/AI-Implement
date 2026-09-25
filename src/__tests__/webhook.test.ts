@@ -2197,6 +2197,7 @@ function makeMappedEnvelopeRepo(owner = "org", repo = "repo"): Record<string, Re
       dependencyTokenScope: null,
       memoryProviderId: null,
       reviewers: null,
+      reviewFixLifecycle: null,
     },
   };
 }
