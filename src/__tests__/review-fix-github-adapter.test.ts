@@ -51,4 +51,21 @@ describe("production review-fix GitHub effect", () => {
     expect(await adapter.getPrHeadSha(scope)).toBe(sha);
     expect(await adapter.evaluateMergePolicy(scope, [])).toBe(false);
   });
+
+  it("allows a clean PR only after current-head checks and reviews are readable", async () => {
+    const fetchImpl = vi.fn(async (url: string) => {
+      if (url.endsWith("/pulls/42")) return Response.json({ state: "open", draft: false,
+        merged: false, mergeable: true, mergeable_state: "clean", head: { sha } });
+      if (url.includes("/check-runs")) return Response.json({ total_count: 1,
+        check_runs: [{ status: "completed", conclusion: "success" }] });
+      if (url.endsWith(`/commits/${sha}/status`)) return Response.json({ state: "success", total_count: 1 });
+      if (url.endsWith("/pulls/42/reviews?per_page=100")) return Response.json([]);
+      throw new Error(`unexpected ${url}`);
+    });
+    const adapter = createReviewFixGithubAdapter({
+      credentials: { resolve: async () => ({ token: "secret-token", installationId: 7 }) },
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    expect(await adapter.evaluateMergePolicy(scope, [])).toBe(true);
+  });
 });

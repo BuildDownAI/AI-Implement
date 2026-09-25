@@ -187,6 +187,24 @@ describe("SqliteReviewFixAttemptStore: admission", () => {
       .get(admitted.attempt.attemptId)).toMatchObject({ released_at: null });
   });
 
+  it("adopts only the execution independently verified for the same attempt", async () => {
+    seedMapping();
+    const store = new storeModule.SqliteReviewFixAttemptStore();
+    const admitted = await store.admit(admissionRequest());
+    if (admitted.status !== "prepared") throw new Error("expected prepared");
+    const execution = { githubRunId: 9001, githubRunAttempt: 2 };
+    const facade = adminFacade.createReviewFixAdminFacade(store, {
+      reconcile: async () => ({ status: "found", execution }),
+    });
+    const admin = { role: "admin" as const, email: "operator@example.com" };
+    expect(await facade.adopt(admitted.attempt.attemptId,
+      { githubRunId: "9002", githubRunAttempt: 2 }, admin)).toEqual({ status: "unverified" });
+    expect(await store.findPreparedAttemptByExecution(execution)).toBeNull();
+    expect(await facade.adopt(admitted.attempt.attemptId,
+      { githubRunId: "9001", githubRunAttempt: 2 }, admin)).toEqual({ status: "accepted" });
+    expect((await store.findPreparedAttemptByExecution(execution))?.attemptId).toBe(admitted.attempt.attemptId);
+  });
+
   it("durably revokes authority and requests cancellation when its PR closes", async () => {
     seedMapping();
     const store = new storeModule.SqliteReviewFixAttemptStore();
