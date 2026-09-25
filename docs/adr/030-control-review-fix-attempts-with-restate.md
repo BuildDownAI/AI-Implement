@@ -101,8 +101,6 @@ Rollback stops new Restate admissions and drains owned work before routing new w
 | AII-285, AII-651 | Link the pilot; retain the broader remaining scope. |
 | AII-568, AII-210 | Keep legacy fixes separate; exclude Restate attempts from their outcome decisions. |
 
-Assign the final ADR number when the implementation PR opens, using the highest existing ADR number.
-
 ## Alternatives considered
 
 - **Relaunch after an uncertain response and rely on a runner claim** — rejected. The pilot first reconciles the original execution instead of knowingly admitting duplicate launches.

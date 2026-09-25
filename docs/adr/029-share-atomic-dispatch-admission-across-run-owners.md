@@ -49,8 +49,6 @@ The migration inventory included accessors and underlying state: `canDispatch`, 
 
 The pilot adds schema without tightening existing historical columns. New tables and additive fields have their own migration issues. Any later proposal to tighten a historical constraint must first enumerate all production, fixture, and tool writers; it is not implied by this design.
 
-Assign the final ADR number when the implementation PR opens, using the highest existing ADR number.
-
 ## Alternatives considered
 
 - **Reserve only for Restate review-fix attempts** — rejected. Another dispatch path can pass its capacity check before it sees the reservation and exceed the limit.
