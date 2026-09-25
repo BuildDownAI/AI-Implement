@@ -259,6 +259,8 @@ export function createReviewFixAttempt(deps: ReviewFixAttemptDependencies) {
       if (await wake.peek() === undefined) await wake.resolve({ kind: "result", result: outcome.result });
     } else if (outcome.status === "conflict") {
       await ctx.run("revoke-conflicting-result", () => store.revokeAuthority(attemptId));
+      const cancellation = ctx.promise<boolean>("cancel");
+      if (await cancellation.peek() === undefined) await cancellation.resolve(true);
       const wake = ctx.promise<Wake>("wake");
       if (await wake.peek() === undefined) await wake.resolve({ kind: "conflict" });
     }

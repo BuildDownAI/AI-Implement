@@ -235,6 +235,7 @@ describe("ReviewFixAttempt durable workflow", () => {
     fake.terminal = { status: "succeeded", outputCommit: SHA };
     expect((await done).status).toBe("finalized");
     expect([fake.authority, fake.approvalEffects, fake.releaseEffects]).toEqual([false, 0, 1]);
+    expect(fake.cancelCalls).toBeGreaterThan(0);
   }, 20_000);
 
   it.each(VARIANTS.map(([label]) => label))("cancellation retains capacity until terminal confirmation (%s)", async (label) => {
