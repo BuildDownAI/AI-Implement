@@ -392,6 +392,24 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
   }
 
   /**
+   * Reads back the attempt's currently accepted result and whether any conflicting result has
+   * ever been recorded against it (`result_conflict_at`) — the state `review-fix-finalize.ts`
+   * binds approval to instead of trusting a caller-supplied result directly, since a racing
+   * result can be rejected as a conflict (marked on the row) without ever displacing the
+   * originally accepted one. `null` means the attempt itself is unknown.
+   */
+  async getAcceptedResult(attemptId: AttemptId): Promise<{ result: ReviewFixResultMetadataV1 | null; hasConflict: boolean } | null> {
+    const row = getDb()
+      .prepare("SELECT accepted_result_json, result_conflict_at FROM review_fix_attempts WHERE attempt_id = ?")
+      .get(attemptId) as Pick<AttemptRow, "accepted_result_json" | "result_conflict_at"> | undefined;
+    if (!row) return null;
+    return {
+      result: row.accepted_result_json !== null ? (JSON.parse(row.accepted_result_json) as ReviewFixResultMetadataV1) : null,
+      hasConflict: row.result_conflict_at !== null,
+    };
+  }
+
+  /**
    * Writes `review_fix_attempts.terminal_outcome_json` exactly once — the
    * immutable per-attempt verdict `ReviewFixFinalizerPort.recordOutcome`
    * (AII-790) will also need. Not part of `ReviewFixAttemptStorePort`, but the

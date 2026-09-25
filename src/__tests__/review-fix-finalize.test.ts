@@ -124,6 +124,7 @@ function fakeGithub(overrides: Partial<ReviewFixGitHubAdapter> = {}): ReviewFixG
     async getPrHeadSha() { return OUTPUT_COMMIT; },
     async evaluateMergePolicy() { return true; },
     async applyApprovalEffect() { calls.applyApprovalEffect++; },
+    async hasAppliedApprovalEffect() { return false; },
     ...overrides,
   };
 }
@@ -351,6 +352,43 @@ describe("createReviewFixFinalizer.applyApproval: idempotency", () => {
     expect(counts.applyApprovalEffect).toBe(2);
   });
 
+  it("retryApprovalEffect reconciles silently, without a duplicate write, when the crash happened after the remote write landed", async () => {
+    const { store, attempt } = await prepareAttempt();
+    const counts = { applyApprovalEffect: 0 };
+    // The adapter throws on its very first call — simulating a crash between the remote write
+    // actually succeeding and this module's own acknowledgement — but `hasAppliedApprovalEffect`
+    // reports that the effect genuinely landed on GitHub, distinguishing this from a real failure.
+    const github = fakeGithub({
+      async applyApprovalEffect() {
+        counts.applyApprovalEffect++;
+        throw new Error("simulated crash after the remote write landed, before local ack");
+      },
+      async hasAppliedApprovalEffect() { return true; },
+    });
+    const finalizer = finalizeModule.createReviewFixFinalizer({ attemptStore: store, github });
+    const result = resultFor(attempt.attemptId, attempt.deadlineAt);
+    const input = {
+      attemptId: attempt.attemptId,
+      scope: attempt.scope,
+      result,
+      currentAuthority: true,
+      currentPrHeadSha: OUTPUT_COMMIT,
+      findingDispositions: DISPOSITIONS,
+      policyAllows: true,
+    };
+
+    await expect(finalizer.applyApproval(input)).rejects.toThrow("simulated crash after the remote write landed, before local ack");
+    expect(counts.applyApprovalEffect).toBe(1);
+
+    const retried = await finalizeModule.retryApprovalEffect({ github }, input);
+    expect(retried).toEqual({ status: "already_applied", effectId: `${attempt.attemptId}.approval` });
+    // The write is never repeated once GitHub's own state shows the effect already landed.
+    expect(counts.applyApprovalEffect).toBe(1);
+
+    expect(await finalizer.applyApproval(input)).toEqual({ status: "already_applied", effectId: `${attempt.attemptId}.approval` });
+    expect(counts.applyApprovalEffect).toBe(1);
+  });
+
   it("distinguishes attempts: applying approval for one attempt never marks a different attempt as applied", async () => {
     seedMapping();
     const store = new storeModule.SqliteReviewFixAttemptStore();
@@ -486,14 +524,16 @@ describe("finalizeReviewFixAttempt", () => {
     expect(github.calls.applyApprovalEffect).toBe(0);
   });
 
-  it("a concurrent conflicting result never reaches approval, and the originally accepted result is what gets approved", async () => {
+  it("a concurrent conflicting result never reaches approval, even though the originally accepted result remains on record", async () => {
     const { store, attempt } = await prepareAttempt();
     const stored = resultFor(attempt.attemptId, attempt.deadlineAt, { outputCommit: OUTPUT_COMMIT });
     expect((await store.recordResult(attempt.attemptId, stored)).status).toBe("stored");
 
     // A second, racing result for the same attempt with a different output commit is rejected
     // as a conflict by the attempt repository's own compare-and-set — it never becomes the
-    // accepted result, so it can never reach the finalizer's approval gate at all.
+    // accepted result. AII-790 requires that this conflict marker alone — recorded before this
+    // attempt's final outcome — prevents approval, even for the originally accepted result that
+    // the conflict never displaced: a conflict on record must reconcile before anything approves.
     const conflicting = resultFor(attempt.attemptId, attempt.deadlineAt, { outputCommit: "c".repeat(40) });
     const conflictOutcome = await store.recordResult(attempt.attemptId, conflicting);
     expect(conflictOutcome.status).toBe("conflict");
@@ -515,9 +555,44 @@ describe("finalizeReviewFixAttempt", () => {
       },
     );
 
-    expect(outcome.approval?.status).toBe("applied");
-    if (outcome.approval?.status !== "applied") throw new Error("expected applied");
-    expect(github.calls.applyApprovalEffect).toBe(1);
+    expect(outcome.approval?.status).toBe("withheld");
+    expect(github.calls.applyApprovalEffect).toBe(0);
+  });
+
+  it("a conflict injected while evidence is being gathered still blocks approval at the final decision point", async () => {
+    const { store, attempt } = await prepareAttempt();
+    const stored = resultFor(attempt.attemptId, attempt.deadlineAt, { outputCommit: OUTPUT_COMMIT });
+    expect((await store.recordResult(attempt.attemptId, stored)).status).toBe("stored");
+
+    // No conflict exists yet when finalization starts gathering evidence — `evaluateMergePolicy`
+    // is the last evidence call before the final decision, and it is where a racing result lands
+    // its conflict, simulating a real interleaving between this call's evidence gathering and a
+    // concurrent call's compare-and-set.
+    const github = fakeGithub({
+      async evaluateMergePolicy() {
+        const conflicting = resultFor(attempt.attemptId, attempt.deadlineAt, { outputCommit: "c".repeat(40) });
+        const conflictOutcome = await store.recordResult(attempt.attemptId, conflicting);
+        expect(conflictOutcome.status).toBe("conflict");
+        return true;
+      },
+    });
+    const tracker = fakeTracker();
+    const finalizer = finalizeModule.createReviewFixFinalizer({ attemptStore: store, github });
+
+    const outcome = await finalizeModule.finalizeReviewFixAttempt(
+      { attemptStore: store, finalizer, github, tracker },
+      {
+        attemptId: attempt.attemptId,
+        result: stored,
+        findingDispositions: DISPOSITIONS,
+        terminal: REACHED_SUCCEEDED,
+        terminationVerifiable: true,
+        revoke: null,
+      },
+    );
+
+    expect(outcome.approval?.status).toBe("withheld");
+    expect(github.calls.applyApprovalEffect).toBe(0);
   });
 
   it("cancellation revokes authority before the approval gate, so a successful result still does not approve, and the newer finding version survives", async () => {
@@ -557,6 +632,53 @@ describe("finalizeReviewFixAttempt", () => {
     expect(reAdmitted.status).toBe("prepared");
     if (reAdmitted.status !== "prepared") throw new Error("expected prepared");
     expect(reAdmitted.attempt.findings).toEqual([{ findingKey: "f1", version: 2 }]);
+  });
+
+  it("a previously recorded, incompatible terminal outcome blocks a later call from approving", async () => {
+    const { store, attempt } = await prepareAttempt();
+    const result = resultFor(attempt.attemptId, attempt.deadlineAt);
+    await store.recordResult(attempt.attemptId, result);
+    const github = fakeGithub();
+    const tracker = fakeTracker();
+    const finalizer = finalizeModule.createReviewFixFinalizer({ attemptStore: store, github });
+
+    // An earlier call already established the immutable verdict as cancelled and released the
+    // attempt.
+    const first = await finalizeModule.finalizeReviewFixAttempt(
+      { attemptStore: store, finalizer, github, tracker },
+      {
+        attemptId: attempt.attemptId,
+        result: null,
+        findingDispositions: [],
+        terminal: { reached: true, outcome: { status: "cancelled" } },
+        terminationVerifiable: true,
+        revoke: { reason: "cancelled" },
+      },
+    );
+    expect(first.recordedOutcome?.status).toBe("recorded");
+    expect(first.release?.status).toBe("released");
+
+    // A later, e.g. delayed or duplicate, call believes the backend succeeded with a valid
+    // result, but the immutable verdict is already fixed as cancelled — it must never approve,
+    // regardless of what this call's own (stale) terminal observation claims.
+    const second = await finalizeModule.finalizeReviewFixAttempt(
+      { attemptStore: store, finalizer, github, tracker },
+      {
+        attemptId: attempt.attemptId,
+        result,
+        findingDispositions: DISPOSITIONS,
+        terminal: REACHED_SUCCEEDED,
+        terminationVerifiable: true,
+        revoke: null,
+      },
+    );
+
+    expect(second.approval?.status).toBe("withheld");
+    expect(github.calls.applyApprovalEffect).toBe(0);
+    expect(second.recordedOutcome).toEqual({
+      status: "already_recorded",
+      outcome: { attemptId: attempt.attemptId, scope: attempt.scope, terminal: { status: "cancelled" } },
+    });
   });
 
   it("keeps occupancy and alerts the operator when backend termination cannot be verified, without recording an outcome or releasing", async () => {
