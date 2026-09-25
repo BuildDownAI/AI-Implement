@@ -155,7 +155,7 @@ describe("remediateStuckJob", () => {
 
       await remediateStuckJob(mockConfig, provider, job, "queued");
 
-      expect(updateJobStatus).toHaveBeenCalledWith(job.id, "timed_out", "stuck_requeued");
+      expect(updateJobStatus).toHaveBeenCalledWith(job.id, "timed_out", "stuck_requeued", undefined, { backendTerminated: true });
       expect(provider.clearWorkingState).toHaveBeenCalledWith("issue-abc", "ENG");
       expect(deleteDispatched).toHaveBeenCalledWith("issue-abc");
       expect(provider.postComment).not.toHaveBeenCalled();
@@ -168,7 +168,7 @@ describe("remediateStuckJob", () => {
 
       await remediateStuckJob(mockConfig, provider, makeJob(), "in_progress");
 
-      expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_requeued");
+      expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_requeued", undefined, { backendTerminated: true });
       expect(deleteDispatched).toHaveBeenCalled();
       expect(notifyStuckGiveUp).not.toHaveBeenCalled();
     });
@@ -179,7 +179,7 @@ describe("remediateStuckJob", () => {
 
       await remediateStuckJob(mockConfig, provider, makeJob(), "queued");
 
-      expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_requeued");
+      expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_requeued", undefined, { backendTerminated: true });
       expect(deleteDispatched).toHaveBeenCalled();
       expect(notifyStuckGiveUp).not.toHaveBeenCalled();
     });
@@ -192,7 +192,7 @@ describe("remediateStuckJob", () => {
 
       await remediateStuckJob(mockConfig, provider, makeJob(), "queued");
 
-      expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_giveup");
+      expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_giveup", undefined, { backendTerminated: true });
     });
 
     it("clears working state but does NOT clear dedup on hard-stop", async () => {
@@ -348,7 +348,7 @@ describe("remediateStuckJob", () => {
         remediateStuckJob(mockConfig, null, makeJob(), "queued"),
       ).resolves.not.toThrow();
 
-      expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_requeued");
+      expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_requeued", undefined, { backendTerminated: true });
       expect(deleteDispatched).not.toHaveBeenCalled();
     });
 
@@ -359,7 +359,7 @@ describe("remediateStuckJob", () => {
         remediateStuckJob(mockConfig, null, makeJob(), "queued"),
       ).resolves.not.toThrow();
 
-      expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_giveup");
+      expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_giveup", undefined, { backendTerminated: true });
     });
   });
 });
@@ -462,7 +462,7 @@ describe("monitorJobs TTL check (AII-743)", () => {
     const callsForJob = vi
       .mocked(updateJobStatus)
       .mock.calls.filter(([id]) => id === job.id);
-    expect(callsForJob.at(-1)).toEqual([job.id, "timed_out", "ttl_expired"]);
+    expect(callsForJob.at(-1)).toEqual([job.id, "timed_out", "ttl_expired", undefined, { backendTerminated: true }]);
     expect(cancelWorkflowRun).toHaveBeenCalledWith("gh-token-mock", "org", "repo", 555);
   });
 
@@ -541,7 +541,7 @@ describe("monitorJobs TTL check (AII-743)", () => {
     const callsForJob = vi
       .mocked(updateJobStatus)
       .mock.calls.filter(([id]) => id === job.id);
-    expect(callsForJob.at(-1)).toEqual([job.id, "timed_out", "ttl_expired"]);
+    expect(callsForJob.at(-1)).toEqual([job.id, "timed_out", "ttl_expired", undefined, { backendTerminated: true }]);
   });
 
   it("removes the local Docker container when a local-docker job TTLs out (no GHA-only fallback)", async () => {
@@ -564,7 +564,7 @@ describe("monitorJobs TTL check (AII-743)", () => {
     const callsForJob = vi
       .mocked(updateJobStatus)
       .mock.calls.filter(([id]) => id === job.id);
-    expect(callsForJob.at(-1)).toEqual([job.id, "timed_out", "ttl_expired"]);
+    expect(callsForJob.at(-1)).toEqual([job.id, "timed_out", "ttl_expired", undefined, { backendTerminated: true }]);
   });
 
   it("skips the TTL branch entirely for a job whose fresh conclusion is operator_cancelled", async () => {
