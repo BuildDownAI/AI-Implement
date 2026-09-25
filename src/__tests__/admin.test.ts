@@ -3054,6 +3054,7 @@ describe("admin issues endpoint", () => {
       readyForImplementation: [ready],
       needsPlanning: [needsPlan],
       inProgressCountsByScope: { CORE: 2 },
+      parentsToFinalize: [],
     });
     const token = await login("secret");
     const res = await request("/api/issues", "GET", "secret", undefined, token);
@@ -3080,6 +3081,7 @@ describe("admin issues endpoint", () => {
       readyForImplementation: [mapped],
       needsPlanning: [unmapped],
       inProgressCountsByScope: {},
+      parentsToFinalize: [],
     });
     const res = await request("/api/issues", "GET", "secret", undefined, token);
     expect(res.statusCode).toBe(200);
@@ -3186,6 +3188,7 @@ describe("admin blockers endpoint", () => {
       readyForImplementation: [issue],
       needsPlanning: [],
       inProgressCountsByScope: {},
+      parentsToFinalize: [],
     });
     const token = await login("secret");
     // No mapping for CORE team → should produce a no-mapping blocker
@@ -3209,6 +3212,7 @@ describe("admin blockers endpoint", () => {
       readyForImplementation: [dedupBlocked, unmapped],
       needsPlanning: [],
       inProgressCountsByScope: {},
+      parentsToFinalize: [],
     });
     const res = await request("/api/blockers", "GET", "secret", undefined, token);
     expect(res.statusCode).toBe(200);
@@ -3524,11 +3528,11 @@ describe("github-install-state endpoint", () => {
 
   it("returns 200 with the probe result", async () => {
     const token = await login("secret");
-    vi.mocked(installState.probeInstallState).mockResolvedValueOnce({ state: "ready", installationId: 7 });
+    vi.mocked(installState.probeInstallState).mockResolvedValueOnce({ state: "ready" });
 
     const res = await request("/api/admin/github-install-state?owner=acme&repo=backend", "GET", "secret", undefined, token);
     expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body)).toEqual({ state: "ready", installationId: 7 });
+    expect(JSON.parse(res.body)).toEqual({ state: "ready" });
   });
 
   it("returns 500 when the probe throws (e.g. a rethrown credential error)", async () => {
@@ -3924,6 +3928,7 @@ describe("GET /api/deployment-status", () => {
       runningCommit: "abc1234",
       headCommit: "def5678",
       checkedAt: 1_700_000_000_000,
+      isDowngrade: false,
     });
     const token = await login("secret");
     const res = await statusRequest(token);
@@ -3941,6 +3946,7 @@ describe("GET /api/deployment-status", () => {
       runningCommit: "abc1234",
       headCommit: "abc1234",
       checkedAt: 1,
+      isDowngrade: false,
     });
     const token = await login("secret");
     const res = await statusRequest(token);
@@ -4616,7 +4622,7 @@ describe("admin sessions — kg-refresh destroy", () => {
   async function deleteSession(
     machineId: string,
     token: string,
-    kgRefresh?: Parameters<typeof admin.handleAdminRequest>[4]["kgRefresh"],
+    kgRefresh?: NonNullable<Parameters<typeof admin.handleAdminRequest>[4]>["kgRefresh"],
   ): Promise<{ statusCode: number; body: string }> {
     const req = new MockRequest(
       `/api/sessions/${encodeURIComponent(machineId)}`,
