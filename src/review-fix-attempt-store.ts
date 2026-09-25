@@ -180,18 +180,24 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
   async admit(request: ReviewFixAdmissionRequest): Promise<ReviewFixAdmissionOutcome> {
     const db = getDb();
     return db.transaction((): ReviewFixAdmissionOutcome => {
-      const mappingEntry = findMappingEntry(request.scope.repository);
-      if (!mappingEntry || mappingEntry.mapping.paused) {
-        return { status: "deferred", reason: "paused" };
-      }
-      const { teamKey, mapping } = mappingEntry;
-
+      // Resolve replay *before* applying mapping policy (paused/missing). A
+      // content-identical retry can arrive after its prepare committed but its
+      // acknowledgement was lost — including after the mapping was since paused
+      // or removed. Mapping policy governs whether a *new* admission may start,
+      // not whether an already-prepared attempt may be handed back; checking it
+      // first would leak the live reservation/budget slot on retry.
       const findings = request.feedback.findings.slice(0, MAX_REVIEW_FIX_FINDING_VERSIONS);
       const base = deriveContentDispatchId(request.scope, request.feedback.taskText, findings);
       const { dispatchId, replay } = resolveDispatchId(db, base);
       if (replay) {
         return { status: "prepared", attempt: toPrepared(replay) };
       }
+
+      const mappingEntry = findMappingEntry(request.scope.repository);
+      if (!mappingEntry || mappingEntry.mapping.paused) {
+        return { status: "deferred", reason: "paused" };
+      }
+      const { teamKey, mapping } = mappingEntry;
 
       const now = Date.now();
       const issueId = `${request.scope.repository}#${request.scope.prNumber}`;

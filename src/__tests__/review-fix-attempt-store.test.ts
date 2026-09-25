@@ -157,6 +157,31 @@ describe("SqliteReviewFixAttemptStore: admission", () => {
     expect(attemptRows).toHaveLength(1);
   });
 
+  it("replays an identical retry that commits before the mapping is paused, even against a fresh store instance", async () => {
+    seedMapping();
+    const store = new storeModule.SqliteReviewFixAttemptStore();
+    const request = admissionRequest();
+    const first = await store.admit(request);
+    if (first.status !== "prepared") throw new Error("expected prepared");
+
+    // Simulate "acknowledgement lost" (the crash window this issue exists to
+    // close) followed by an operator pausing the mapping before the retry
+    // arrives: the prepare already committed, so the retry must still return
+    // the live reservation rather than leaking it behind a "paused" defer.
+    seedMapping({ paused: true });
+    dedup.closeDb();
+    const reopenedStore = new storeModule.SqliteReviewFixAttemptStore();
+    const retry = await reopenedStore.admit(request);
+
+    expect(retry.status).toBe("prepared");
+    if (retry.status !== "prepared") throw new Error("expected prepared");
+    expect(retry.attempt.attemptId).toBe(first.attempt.attemptId);
+
+    const attemptRows = dedup.getDb().prepare("SELECT * FROM review_fix_attempts WHERE repository = ? AND pr_number = ?")
+      .all(SCOPE.repository, SCOPE.prNumber);
+    expect(attemptRows).toHaveLength(1);
+  });
+
   it("defers as occupied when different feedback targets an already-active PR", async () => {
     seedMapping();
     const store = new storeModule.SqliteReviewFixAttemptStore();
