@@ -208,16 +208,16 @@ describe("review-fix activity and cycle schema", () => {
        redacted_payload_json, byte_count)
       VALUES ('attempt-1', 'runner-1', ?, ?, 'tool-result', 1, 100, ?, ?)`);
     db.transaction(() => {
-      for (let sequence = 1; sequence <= 640; sequence++) {
+      for (let sequence = 0; sequence < 640; sequence++) {
         insertActivity.run(sequence, `hash-${sequence}`, payload, 16384);
       }
     })();
     expect(db.prepare("SELECT accepted_bytes FROM review_fix_activity_streams WHERE attempt_id = 'attempt-1'").get())
       .toEqual({ accepted_bytes: 10 * 1024 * 1024 });
-    expect(() => insertActivity.run(641, "hash-641", "{}", 2)).toThrow(/CHECK/);
+    expect(() => insertActivity.run(640, "hash-640", "{}", 2)).toThrow(/CHECK/);
     db.prepare(`INSERT INTO review_fix_activity_producers
       (attempt_id, producer_id, highest_contiguous_sequence, final_sequence, limit_reached_at)
-      VALUES ('attempt-1', 'runner-1', 640, 641, 101)`).run();
+      VALUES ('attempt-1', 'runner-1', 639, 640, 101)`).run();
     db.prepare(`INSERT INTO review_fix_activity_streams
       (attempt_id, limit_reached_at, truncated_at) VALUES ('attempt-2', 102, 102)`).run();
     db.prepare(`INSERT INTO review_fix_cycles
@@ -230,7 +230,7 @@ describe("review-fix activity and cycle schema", () => {
     expect(reopened.prepare("SELECT accepted_bytes, limit_reached_at FROM review_fix_activity_streams WHERE attempt_id = 'attempt-1'").get())
       .toEqual({ accepted_bytes: 10 * 1024 * 1024, limit_reached_at: null });
     expect(reopened.prepare("SELECT final_sequence, limit_reached_at FROM review_fix_activity_producers WHERE attempt_id = 'attempt-1'").get())
-      .toEqual({ final_sequence: 641, limit_reached_at: 101 });
+      .toEqual({ final_sequence: 640, limit_reached_at: 101 });
     expect(reopened.prepare("SELECT input_commit, output_commit, verdict FROM review_fix_cycles WHERE attempt_id = 'attempt-1'").get())
       .toEqual({ input_commit: "before", output_commit: "after", verdict: "passed" });
   });
@@ -240,17 +240,17 @@ describe("review-fix activity and cycle schema", () => {
     const insert = db.prepare(`INSERT INTO review_fix_activity
       (attempt_id, producer_id, sequence, payload_hash, kind, cycle, occurred_at,
        redacted_payload_json, byte_count)
-      VALUES ('attempt-1', 'runner-1', 1, ?, 'tool-call', 1, 100, ?, ?)`);
+      VALUES ('attempt-1', 'runner-1', 0, ?, 'tool-call', 1, 100, ?, ?)`);
     insert.run("hash-1", "{}", 2);
     expect(() => insert.run("hash-2", "[]", 2)).toThrow(/conflicting/);
     db.prepare(`INSERT OR IGNORE INTO review_fix_activity
       (attempt_id, producer_id, sequence, payload_hash, kind, cycle, occurred_at,
        redacted_payload_json, byte_count)
-      VALUES ('attempt-1', 'runner-1', 1, 'hash-1', 'tool-call', 1, 100, '{}', 2)`).run();
+      VALUES ('attempt-1', 'runner-1', 0, 'hash-1', 'tool-call', 1, 100, '{}', 2)`).run();
     expect(() => db.prepare(`INSERT OR IGNORE INTO review_fix_activity
       (attempt_id, producer_id, sequence, payload_hash, kind, cycle, occurred_at,
        redacted_payload_json, byte_count)
-      VALUES ('attempt-1', 'runner-1', 1, 'hash-2', 'tool-call', 1, 100, '[]', 2)`).run())
+      VALUES ('attempt-1', 'runner-1', 0, 'hash-2', 'tool-call', 1, 100, '[]', 2)`).run())
       .toThrow(/conflicting/);
     expect(db.prepare("SELECT accepted_bytes FROM review_fix_activity_streams WHERE attempt_id = 'attempt-1'").get())
       .toEqual({ accepted_bytes: 2 });
@@ -261,7 +261,7 @@ describe("review-fix activity and cycle schema", () => {
     expect(() => db.prepare(`INSERT INTO review_fix_activity
       (attempt_id, producer_id, sequence, payload_hash, kind, cycle, occurred_at,
        redacted_payload_json, byte_count)
-      VALUES ('attempt-1', 'runner-1', 2, 'hash-3', 'tool-call', 1, 101, '{}', 3)`).run())
+      VALUES ('attempt-1', 'runner-1', 1, 'hash-3', 'tool-call', 1, 101, '{}', 3)`).run())
       .toThrow(/CHECK/);
     db.prepare(`INSERT INTO review_fix_cycles
       (attempt_id, cycle, summary_id, summary_hash, dispositions_json,

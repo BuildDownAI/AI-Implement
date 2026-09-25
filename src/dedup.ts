@@ -317,13 +317,13 @@ export function getDb(): Database.Database {
       CREATE TABLE IF NOT EXISTS review_fix_activity_producers (
         attempt_id TEXT NOT NULL,
         producer_id TEXT NOT NULL,
-        highest_contiguous_sequence INTEGER NOT NULL DEFAULT 0,
+        highest_contiguous_sequence INTEGER NOT NULL DEFAULT -1,
         final_sequence INTEGER,
         gap_detected_at INTEGER,
         limit_reached_at INTEGER,
         conflict_at INTEGER,
         PRIMARY KEY (attempt_id, producer_id),
-        CHECK (highest_contiguous_sequence >= 0),
+        CHECK (highest_contiguous_sequence >= -1),
         CHECK (final_sequence IS NULL OR final_sequence >= 0)
       )
     `);
@@ -331,7 +331,7 @@ export function getDb(): Database.Database {
       CREATE TABLE IF NOT EXISTS review_fix_activity (
         attempt_id TEXT NOT NULL,
         producer_id TEXT NOT NULL,
-        sequence INTEGER NOT NULL CHECK (sequence > 0),
+        sequence INTEGER NOT NULL CHECK (sequence >= 0),
         payload_hash TEXT NOT NULL,
         kind TEXT NOT NULL,
         cycle INTEGER NOT NULL CHECK (cycle > 0),
