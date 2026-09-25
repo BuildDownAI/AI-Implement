@@ -1,6 +1,16 @@
 import { spawn, spawnSync } from "node:child_process";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
-import type { InvokeParams, LLMExecutor, LLMResult, LogLevel, RunTelemetry } from "./types.js";
+import type {
+  InvokeParams,
+  LLMExecutor,
+  LLMResult,
+  LogLevel,
+  RunTelemetry,
+  ActivitySink,
+  ActivityIdentity,
+  BoundedActivityText,
+} from "./types.js";
+import { ACTIVITY_MAX_EVENT_BYTES } from "./types.js";
 import {
   parseLine,
   formatEvent,
@@ -11,7 +21,11 @@ import {
   summaryLine,
   sawToolUse,
   sawUnsafeToolUse,
+  extractToolStarts,
+  extractToolResults,
   type StreamEvent,
+  type DerivedToolStart,
+  type DerivedToolResult,
 } from "./claude-stream.js";
 import { classifyLlmResult, classifySpawnError, isLlmResultFailure, type FailureRecord } from "./failure-classification.js";
 import { computeBackoffMs, type RetryPolicy } from "./retry-backoff.js";
@@ -20,6 +34,62 @@ import { modelProcessEnv, parseForwardedSecrets } from "./process-env.js";
 interface AttemptResult extends Omit<LLMResult, "attempts"> {
   sawToolUse: boolean;
   sawUnsafeToolUse: boolean;
+}
+
+/**
+ * Runner-activity sink wiring for one `ClaudeCliExecutor` (AII-798). `attemptId`
+ * identifies the whole review-fix pilot attempt and stays constant across every
+ * `invoke()` call this executor makes; each `invoke()` call, and each `spawnOnce`
+ * retry within it, gets its own producerId (see `buildProducerId`) so neither a
+ * later feedback-loop iteration nor a retried spawn ever continues a prior
+ * call's sequence space.
+ */
+export interface ActivityReportingConfig {
+  readonly attemptId: string;
+  readonly sink: ActivitySink;
+}
+
+const PRODUCER_ID_INVALID_CHARS = /[^A-Za-z0-9._-]/g;
+const MAX_PRODUCER_ID_LENGTH = 128;
+
+/**
+ * Builds a producerId charset-safe per the wire contract's ID_PATTERN
+ * (review-fix-contract.ts), unique per (stage, invocation, spawn attempt).
+ * `invocationId` is a monotonically increasing counter bumped once per
+ * `invoke()` call on this executor instance (see `ClaudeCliExecutor.invoke`),
+ * independent of `attempt` (spawnOnce's own retry counter, which always
+ * restarts at 1 within a single `invoke()` call). Folding both in is what
+ * keeps two logically distinct calls that share the same `stage` — e.g.
+ * feedback-loop.ts's implement/review calls, which pass a constant
+ * `stage: "implement"` / `"review"` on every iteration against the one
+ * `ClaudeCliExecutor` shared for the whole pipeline run — from colliding on
+ * the same producerId. A collision would otherwise route the second call's
+ * tool events to an `ActivityReporter` already finalized by the first call's
+ * `final()`, which silently no-ops post-finalize record() calls (see
+ * activity-reporter.ts) and drops the second call's activity entirely.
+ * Retrying a transient pre-tool-use failure re-spawns a fresh CLI session
+ * with no memory of the last one, so its activity sequence must also start
+ * fresh under a fresh producerId rather than continuing the previous
+ * attempt's — hence `attempt` is still part of the id.
+ */
+function buildProducerId(stage: string | undefined, invocationId: number, attempt: number): string {
+  const cleaned = (stage || "invoke").replace(PRODUCER_ID_INVALID_CHARS, "-");
+  const safe = /^[A-Za-z0-9]/.test(cleaned) ? cleaned : `p-${cleaned}`;
+  return `${safe}-${invocationId}-${attempt}`.slice(0, MAX_PRODUCER_ID_LENGTH);
+}
+
+const ACTIVITY_TRUNCATION_SUFFIX = "…[truncated]";
+
+/**
+ * Bounds a tool-result text to the shared per-event byte cap, flagging
+ * truncation explicitly rather than silently dropping or shipping an
+ * unbounded payload (issue requirement: 16 KiB per event).
+ */
+function boundActivityText(raw: string, maxBytes: number): BoundedActivityText {
+  if (Buffer.byteLength(raw, "utf8") <= maxBytes) return { text: raw, truncated: false };
+  const budget = Math.max(0, maxBytes - Buffer.byteLength(ACTIVITY_TRUNCATION_SUFFIX, "utf8"));
+  const cut = Buffer.from(raw, "utf8").subarray(0, budget).toString("utf8");
+  return { text: cut + ACTIVITY_TRUNCATION_SUFFIX, truncated: true };
 }
 
 /** Decision inputs shared by the two retry sites in `invoke` (a completed attempt, and a spawn-level rejection). */
@@ -271,9 +341,18 @@ export class ClaudeCliExecutor implements LLMExecutor {
     private readonly allowRepositoryWrites = false,
     private readonly spawnImpl: typeof spawn = spawn,
     private readonly sleepImpl: (ms: number) => Promise<void> = defaultSleep,
+    private readonly activityReporting?: ActivityReportingConfig,
   ) {}
 
+  /**
+   * Bumped once per `invoke()` call (see `buildProducerId`'s doc comment) — never per
+   * spawn-retry attempt — so two logically distinct `invoke()` calls sharing the same
+   * `stage` on this executor instance never collide on the same producerId.
+   */
+  private invocationSeq = 0;
+
   async invoke(params: InvokeParams): Promise<LLMResult> {
+    const invocationId = ++this.invocationSeq;
     let attempt = 1;
     let totalSleptMs = 0;
     const invokeStartedAt = Date.now();
@@ -306,7 +385,7 @@ export class ClaudeCliExecutor implements LLMExecutor {
     for (;;) {
       let attemptResult: AttemptResult;
       try {
-        attemptResult = await this.spawnOnce(params);
+        attemptResult = await this.spawnOnce(params, attempt, invocationId);
       } catch (err) {
         // A spawn-level failure (ENOENT/EAGAIN/ENOMEM from proc.on("error"), or the
         // stdin EPIPE handler) never produced an LLMResult, but it is by construction
@@ -434,7 +513,7 @@ export class ClaudeCliExecutor implements LLMExecutor {
     }
   }
 
-  private spawnOnce(params: InvokeParams): Promise<AttemptResult> {
+  private spawnOnce(params: InvokeParams, attempt: number, invocationId: number): Promise<AttemptResult> {
     let restoreOrigin: (() => void) | null = null;
     if (!this.allowRepositoryWrites) {
       try {
@@ -447,7 +526,7 @@ export class ClaudeCliExecutor implements LLMExecutor {
       }
     }
 
-    return new Promise((resolve, reject) => {
+    return new Promise((resolveRaw, rejectRaw) => {
       let originRestored = false;
       const restoreProtectedOrigin = (): void => {
         if (originRestored) return;
@@ -497,11 +576,14 @@ export class ClaudeCliExecutor implements LLMExecutor {
           detached: true,
         }) as ChildProcessWithoutNullStreams;
       } catch (err) {
+        // `spawnImpl` never started a process here — no producerId/activity state
+        // exists yet to report a final marker for, so this settles via the raw
+        // reject directly rather than the wrapped one defined below.
         try {
           restoreProtectedOrigin();
-          reject(err);
+          rejectRaw(err);
         } catch (restoreErr) {
-          reject(markNotASpawnFailure(restoreErr));
+          rejectRaw(markNotASpawnFailure(restoreErr));
         }
         return;
       }
@@ -514,6 +596,83 @@ export class ClaudeCliExecutor implements LLMExecutor {
       const selfKillSignals = new Set<string>();
       let killTimer: ReturnType<typeof setTimeout> | null = null;
       let unresponsiveTimer: ReturnType<typeof setTimeout> | null = null;
+
+      // Runner-activity reporting (AII-798): a fresh producerId per spawnOnce call
+      // (see buildProducerId) keeps a retried attempt's sequence from continuing a
+      // prior attempt's, and every call below is wrapped so a slow or throwing sink
+      // can never block or fail this attempt's own settlement.
+      const activityProducerId = this.activityReporting ? buildProducerId(params.stage, invocationId, attempt) : "";
+      let activitySeq = 0;
+      let activityFinalReported = false;
+      const toolNamesById = new Map<string, string>();
+
+      const reportToolStart = (start: DerivedToolStart): void => {
+        if (!this.activityReporting) return;
+        if (start.id) toolNamesById.set(start.id, start.action);
+        const identity: ActivityIdentity = {
+          attemptId: this.activityReporting.attemptId,
+          producerId: activityProducerId,
+          sequence: activitySeq++,
+        };
+        try {
+          this.activityReporting.sink.toolStart(identity, { cycle: params.cycle ?? 1, action: start.action, detail: start.detail });
+        } catch (err) {
+          console.error(`[activity] toolStart delivery failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      };
+
+      const reportToolResult = (result: DerivedToolResult): void => {
+        if (!this.activityReporting) return;
+        const action = (result.toolUseId && toolNamesById.get(result.toolUseId)) || result.action;
+        const identity: ActivityIdentity = {
+          attemptId: this.activityReporting.attemptId,
+          producerId: activityProducerId,
+          sequence: activitySeq++,
+        };
+        try {
+          this.activityReporting.sink.toolResult(identity, {
+            cycle: params.cycle ?? 1,
+            action,
+            output: boundActivityText(result.output, ACTIVITY_MAX_EVENT_BYTES),
+          });
+        } catch (err) {
+          console.error(`[activity] toolResult delivery failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      };
+
+      // Attempted from every settle path below (close, stdin-EPIPE reject, the
+      // unresponsive-after-SIGKILL timeout, and proc.on("error")) — not only the
+      // success path — so a missing tail is visible downstream even when this
+      // attempt never reaches a clean `close`. Idempotent so it is safe to call
+      // from more than one guarded settle branch.
+      const reportActivityFinal = (): void => {
+        if (!this.activityReporting || activityFinalReported) return;
+        activityFinalReported = true;
+        const lastSequence = activitySeq > 0 ? activitySeq - 1 : 0;
+        const identity: ActivityIdentity = {
+          attemptId: this.activityReporting.attemptId,
+          producerId: activityProducerId,
+          sequence: lastSequence,
+        };
+        try {
+          this.activityReporting.sink.final(identity, lastSequence);
+        } catch (err) {
+          console.error(`[activity] final marker failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      };
+
+      // Shadow the Promise executor's own resolve/reject so every settle path below
+      // (success and failure alike) attempts the final marker exactly once, at the
+      // moment of settlement — after any trailing-buffer flush that precedes it,
+      // so a tool event parsed from that flush is never missed by the marker.
+      const resolve = (value: AttemptResult): void => {
+        reportActivityFinal();
+        resolveRaw(value);
+      };
+      const reject = (err: unknown): void => {
+        reportActivityFinal();
+        rejectRaw(err);
+      };
 
       const attachToolUseFlags = <E extends Error>(
         err: E,
@@ -613,6 +772,13 @@ export class ClaudeCliExecutor implements LLMExecutor {
         if (this.logLevel === "stream") {
           const formatted = formatEvent(event);
           if (formatted) console.log(formatted);
+        }
+        // Deliberately unconditional on logLevel — activity reporting mirrors
+        // toolTrace/telemetry (retained at both log levels), not the stream
+        // console log.
+        if (this.activityReporting) {
+          for (const start of extractToolStarts(event)) reportToolStart(start);
+          for (const result of extractToolResults(event)) reportToolResult(result);
         }
       };
 

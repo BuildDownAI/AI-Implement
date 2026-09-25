@@ -8,8 +8,9 @@ import { execFileSync, spawn } from "node:child_process";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { PassThrough } from "node:stream";
 import { EventEmitter } from "node:events";
-import { ClaudeCliExecutor, readTelemetryFlag } from "../pipeline/executor.js";
+import { ClaudeCliExecutor, readTelemetryFlag, type ActivityReportingConfig } from "../pipeline/executor.js";
 import { computeBackoffMs, DEFAULT_RETRY_POLICY, type RetryPolicy } from "../pipeline/retry-backoff.js";
+import type { ActivitySink, ActivityIdentity, ActivityToolResult } from "../pipeline/types.js";
 
 interface FakeAttempt {
   stdoutLines?: string[];
@@ -2176,5 +2177,334 @@ describe.skipIf(isWindows)("ClaudeCliExecutor request-level retry (BAC-27114)", 
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe.skipIf(isWindows)("ClaudeCliExecutor runner-activity reporting (AII-798)", () => {
+  interface RecordedCall {
+    method: "toolStart" | "toolResult" | "cycleSummary" | "final";
+    identity: ActivityIdentity;
+    payload: unknown;
+  }
+
+  function makeRecordingSink(): { sink: ActivitySink; calls: RecordedCall[] } {
+    const calls: RecordedCall[] = [];
+    const sink: ActivitySink = {
+      toolStart: (identity, input) => calls.push({ method: "toolStart", identity, payload: input }),
+      toolResult: (identity, result) => calls.push({ method: "toolResult", identity, payload: result }),
+      cycleSummary: (identity, summary) => calls.push({ method: "cycleSummary", identity, payload: summary }),
+      final: (identity, lastSequence) => calls.push({ method: "final", identity, payload: { lastSequence } }),
+    };
+    return { sink, calls };
+  }
+
+  const TOOL_ACTIVITY_LINES = [
+    JSON.stringify({ type: "system", subtype: "init", model: "claude-x", cwd: "/workspace" }),
+    JSON.stringify({
+      type: "assistant",
+      message: {
+        content: [
+          { type: "text", text: "About to look at the test output." },
+          { type: "tool_use", id: "toolu_1", name: "Bash", input: { command: "pnpm test" } },
+        ],
+      },
+    }),
+    JSON.stringify({
+      type: "user",
+      message: { content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "42 passed", is_error: false }] },
+    }),
+    JSON.stringify({
+      type: "assistant",
+      message: { content: [{ type: "tool_use", id: "toolu_2", name: "Read", input: { file_path: "/tmp/x" } }] },
+    }),
+    JSON.stringify({
+      type: "user",
+      message: {
+        content: [{ type: "tool_result", tool_use_id: "toolu_2", content: [{ type: "text", text: "file body" }], is_error: false }],
+      },
+    }),
+    JSON.stringify({
+      type: "result",
+      subtype: "success",
+      result: "Done.",
+      num_turns: 2,
+      duration_ms: 10,
+      usage: { input_tokens: 5, output_tokens: 5 },
+    }),
+  ];
+
+  beforeEach(() => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+  });
+
+  it.each(["summary", "stream"] as const)(
+    "reports ordered, correctly-identified tool start/result events, then a final marker, in %s log mode",
+    async (logLevel) => {
+      const proc = makeTestProcess(TOOL_ACTIVITY_LINES.join("\n") + "\n", 0);
+      const spawnImpl = () => proc;
+      const { sink, calls } = makeRecordingSink();
+      const activityReporting: ActivityReportingConfig = { attemptId: "attempt-1", sink };
+      const exec = new ClaudeCliExecutor("/tmp", logLevel, false, spawnImpl as unknown as typeof spawn, undefined, activityReporting);
+
+      const result = await exec.invoke({ prompt: "p", model: "m", stage: "implement" });
+
+      expect(result.exitCode).toBe(0);
+      expect(calls.map((c) => c.method)).toEqual(["toolStart", "toolResult", "toolStart", "toolResult", "final"]);
+      // Strictly increasing sequence, all under the same (attemptId, producerId) identity.
+      expect(calls.map((c) => c.identity.sequence)).toEqual([0, 1, 2, 3, 3]);
+      for (const call of calls) {
+        expect(call.identity.attemptId).toBe("attempt-1");
+        expect(call.identity.producerId).toBe("implement-1-1");
+      }
+      expect(calls[0].payload).toMatchObject({ cycle: 1, action: "Bash", detail: { command: "pnpm test" } });
+      expect(calls[1].payload).toMatchObject({ cycle: 1, action: "Bash" });
+      expect((calls[1].payload as ActivityToolResult).output).toEqual({ text: "42 passed", truncated: false });
+      expect(calls[2].payload).toMatchObject({ cycle: 1, action: "Read", detail: { file_path: "/tmp/x" } });
+      expect(calls[3].payload).toMatchObject({ cycle: 1, action: "Read" });
+      expect((calls[3].payload as ActivityToolResult).output).toEqual({ text: "file body", truncated: false });
+      expect(calls[4].payload).toEqual({ lastSequence: 3 });
+    },
+  );
+
+  it("leaves the returned LLMResult byte-identical whether or not a sink is supplied (absent sink = unchanged legacy behavior)", async () => {
+    const procA = makeTestProcess(TOOL_ACTIVITY_LINES.join("\n") + "\n", 0);
+    const resultWithoutSink = await new ClaudeCliExecutor("/tmp", "summary", false, (() => procA) as unknown as typeof spawn).invoke({
+      prompt: "p",
+      model: "m",
+    });
+
+    const procB = makeTestProcess(TOOL_ACTIVITY_LINES.join("\n") + "\n", 0);
+    const { sink } = makeRecordingSink();
+    const activityReporting: ActivityReportingConfig = { attemptId: "attempt-1", sink };
+    const resultWithSink = await new ClaudeCliExecutor(
+      "/tmp",
+      "summary",
+      false,
+      (() => procB) as unknown as typeof spawn,
+      undefined,
+      activityReporting,
+    ).invoke({ prompt: "p", model: "m" });
+
+    expect(resultWithSink).toEqual(resultWithoutSink);
+  });
+
+  it("never lets a throwing sink block or fail model work", async () => {
+    const proc = makeTestProcess(TOOL_ACTIVITY_LINES.join("\n") + "\n", 0);
+    const spawnImpl = () => proc;
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const sink: ActivitySink = {
+      toolStart: () => {
+        throw new Error("sink boom");
+      },
+      toolResult: () => {
+        throw new Error("sink boom");
+      },
+      cycleSummary: () => {},
+      final: () => {
+        throw new Error("sink boom");
+      },
+    };
+    const activityReporting: ActivityReportingConfig = { attemptId: "attempt-1", sink };
+    const result = await new ClaudeCliExecutor(
+      "/tmp",
+      "summary",
+      false,
+      spawnImpl as unknown as typeof spawn,
+      undefined,
+      activityReporting,
+    ).invoke({ prompt: "p", model: "m" });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toBe("Done.");
+    expect(errSpy.mock.calls.some((c) => String(c[0]).includes("[activity]"))).toBe(true);
+  });
+
+  const RETRY_OVERLOAD_STDERR =
+    'API Error: 529 {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}';
+
+  it("resets sequence and producerId on a retried spawnOnce attempt rather than continuing the prior attempt's sequence", async () => {
+    const { spawnImpl } = makeFakeSpawn([
+      { stderr: RETRY_OVERLOAD_STDERR, exitCode: 1 },
+      { stdoutLines: TOOL_ACTIVITY_LINES, exitCode: 0 },
+    ]);
+    const { sleepImpl } = makeFakeSleep();
+    const { sink, calls } = makeRecordingSink();
+    const policy: RetryPolicy = { ...DEFAULT_RETRY_POLICY, requestRetries: 2, backoffJitter: 0 };
+    const activityReporting: ActivityReportingConfig = { attemptId: "attempt-1", sink };
+    const exec = new ClaudeCliExecutor("/tmp", "summary", false, spawnImpl, sleepImpl, activityReporting);
+
+    const result = await exec.invoke({
+      prompt: "p",
+      model: "m",
+      stage: "implement",
+      retry: { policy, toolUseIsSafe: false },
+    });
+
+    expect(result.attempts).toBe(2);
+    const finals = calls.filter((c) => c.method === "final");
+    expect(finals).toHaveLength(2);
+    // Attempt 1 failed before any tool use, so it only ever reaches sequence 0 (its own
+    // final marker) under its own producerId — this must never bleed into attempt 2's count.
+    expect(finals[0].identity).toMatchObject({ producerId: "implement-1-1", sequence: 0 });
+    expect(finals[1].identity).toMatchObject({ producerId: "implement-1-2", sequence: 3 });
+    const attempt2ToolStarts = calls.filter((c) => c.method === "toolStart" && c.identity.producerId === "implement-1-2");
+    expect(attempt2ToolStarts.map((c) => c.identity.sequence)).toEqual([0, 2]);
+  });
+
+  it("gives two sequential invoke() calls sharing the same stage on one executor+sink distinct, non-colliding producerIds (regression: a shared executor across feedback-loop iterations must not finalize and then silently drop the second call's activity)", async () => {
+    // Mirrors real feedback-loop.ts usage: implement.ts/review.ts pass a constant
+    // `stage` (e.g. "implement") on every iteration against the one ClaudeCliExecutor
+    // instance shared for the whole pipeline run. Before the invocation-counter fix,
+    // both calls derived producerId from `stage` + spawnOnce's per-call attempt counter
+    // (which always restarts at 1), so the second call's producerId collided with the
+    // first's already-finalized ActivityReporter and its tool events were dropped.
+    const procA = makeTestProcess(TOOL_ACTIVITY_LINES.join("\n") + "\n", 0);
+    const procB = makeTestProcess(TOOL_ACTIVITY_LINES.join("\n") + "\n", 0);
+    const procs = [procA, procB];
+    const spawnImpl = (() => procs.shift()) as unknown as typeof spawn;
+    const { sink, calls } = makeRecordingSink();
+    const activityReporting: ActivityReportingConfig = { attemptId: "attempt-1", sink };
+    const exec = new ClaudeCliExecutor("/tmp", "summary", false, spawnImpl, undefined, activityReporting);
+
+    const first = await exec.invoke({ prompt: "p", model: "m", stage: "implement", cycle: 1 });
+    const second = await exec.invoke({ prompt: "p", model: "m", stage: "implement", cycle: 2 });
+
+    expect(first.exitCode).toBe(0);
+    expect(second.exitCode).toBe(0);
+
+    const producerIds = [...new Set(calls.map((c) => c.identity.producerId))];
+    expect(producerIds).toHaveLength(2);
+    expect(producerIds).toEqual(["implement-1-1", "implement-2-1"]);
+
+    const firstCallEvents = calls.filter((c) => c.identity.producerId === "implement-1-1");
+    const secondCallEvents = calls.filter((c) => c.identity.producerId === "implement-2-1");
+    // Each call reaches its own toolStart/toolResult/toolStart/toolResult/final sequence —
+    // the second call's activity must actually be delivered, not silently no-op'd by an
+    // already-finalized reporter.
+    expect(firstCallEvents.map((c) => c.method)).toEqual(["toolStart", "toolResult", "toolStart", "toolResult", "final"]);
+    expect(secondCallEvents.map((c) => c.method)).toEqual(["toolStart", "toolResult", "toolStart", "toolResult", "final"]);
+    expect(secondCallEvents.map((c) => c.identity.sequence)).toEqual([0, 1, 2, 3, 3]);
+
+    // Regression: each call's `cycle` param (feedback-loop.ts's iteration counter, once
+    // threaded through) must land on that call's own toolStart/toolResult payloads rather
+    // than being hardcoded — the second invoke() call's events must carry cycle 2, not 1,
+    // even though both calls share the same executor, sink, and `stage`.
+    const toolPayloadCycles = (events: typeof calls) =>
+      events.filter((c) => c.method === "toolStart" || c.method === "toolResult").map((c) => (c.payload as { cycle: number }).cycle);
+    expect(toolPayloadCycles(firstCallEvents)).toEqual([1, 1, 1, 1]);
+    expect(toolPayloadCycles(secondCallEvents)).toEqual([2, 2, 2, 2]);
+  });
+
+  it("attempts the final marker on a stdin-EPIPE failure path, not only on success", async () => {
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    const stdin = new PassThrough();
+    const ee = new EventEmitter();
+    const proc = Object.assign(ee, { stdout, stderr, stdin }) as unknown as ChildProcessWithoutNullStreams;
+
+    stdin.end = ((..._args: unknown[]) => {
+      setImmediate(() => stdin.emit("error", Object.assign(new Error("write EPIPE"), { code: "EPIPE" })));
+      return stdin;
+    }) as unknown as typeof stdin.end;
+
+    setImmediate(() => {
+      stdout.push(null);
+      stderr.push(null);
+      setImmediate(() => ee.emit("close", 1));
+    });
+
+    const fakeSpawn = () => proc;
+    const { sink, calls } = makeRecordingSink();
+    const activityReporting: ActivityReportingConfig = { attemptId: "attempt-1", sink };
+    await new ClaudeCliExecutor("/tmp", "summary", false, fakeSpawn as unknown as typeof spawn, undefined, activityReporting)
+      .invoke({ prompt: "p", model: "m" })
+      .catch(() => {});
+
+    expect(calls.filter((c) => c.method === "final")).toHaveLength(1);
+  });
+
+  it("attempts the final marker on a proc.on('error') spawn failure, not only on success", async () => {
+    const spawnImpl = ((_cmd: string, _args: readonly string[], _opts: unknown) => {
+      const proc = new EventEmitter() as unknown as ChildProcessWithoutNullStreams;
+      const stdin = new EventEmitter() as unknown as ChildProcessWithoutNullStreams["stdin"];
+      (stdin as unknown as { end: (s: string) => void }).end = () => {};
+      Object.assign(proc, { stdin, stdout: new EventEmitter(), stderr: new EventEmitter() });
+      setImmediate(() => {
+        proc.emit("error", Object.assign(new Error("spawn claude ENOENT"), { code: "ENOENT" }));
+      });
+      return proc;
+    }) as unknown as typeof spawn;
+    const { sink, calls } = makeRecordingSink();
+    const activityReporting: ActivityReportingConfig = { attemptId: "attempt-1", sink };
+    await new ClaudeCliExecutor("/tmp", "summary", false, spawnImpl, undefined, activityReporting)
+      .invoke({ prompt: "p", model: "m" })
+      .catch(() => {});
+
+    expect(calls.filter((c) => c.method === "final")).toHaveLength(1);
+  });
+
+  const TEXT_ONLY_LINES = [
+    JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "Thinking about this privately." }] } }),
+    JSON.stringify({
+      type: "result",
+      subtype: "success",
+      result: "done",
+      num_turns: 1,
+      duration_ms: 1,
+      usage: { input_tokens: 500, output_tokens: 500 },
+    }),
+  ];
+
+  it("never derives activity from assistant text or usage/token fields, and yields no synthesized events when the executor reports zero tool_use blocks", async () => {
+    const proc = makeTestProcess(TEXT_ONLY_LINES.join("\n") + "\n", 0);
+    const spawnImpl = () => proc;
+    const { sink, calls } = makeRecordingSink();
+    const activityReporting: ActivityReportingConfig = { attemptId: "attempt-1", sink };
+    await new ClaudeCliExecutor("/tmp", "summary", false, spawnImpl as unknown as typeof spawn, undefined, activityReporting).invoke({
+      prompt: "p",
+      model: "m",
+    });
+
+    expect(calls.filter((c) => c.method === "toolStart" || c.method === "toolResult")).toHaveLength(0);
+    const finals = calls.filter((c) => c.method === "final");
+    expect(finals).toHaveLength(1);
+    expect(finals[0].identity.sequence).toBe(0);
+  });
+
+  const HUGE_TOOL_OUTPUT = "x".repeat(20 * 1024);
+  const BOUNDS_LINES = [
+    JSON.stringify({
+      type: "assistant",
+      message: { content: [{ type: "tool_use", id: "toolu_1", name: "Bash", input: { command: "cat big.txt" } }] },
+    }),
+    JSON.stringify({
+      type: "user",
+      message: { content: [{ type: "tool_result", tool_use_id: "toolu_1", content: HUGE_TOOL_OUTPUT, is_error: false }] },
+    }),
+    JSON.stringify({
+      type: "result",
+      subtype: "success",
+      result: "done",
+      num_turns: 1,
+      duration_ms: 1,
+      usage: { input_tokens: 1, output_tokens: 1 },
+    }),
+  ];
+
+  it("truncates a tool_result output over the 16 KiB per-event cap and flags it explicitly, rather than dropping it or shipping it unbounded", async () => {
+    const proc = makeTestProcess(BOUNDS_LINES.join("\n") + "\n", 0);
+    const spawnImpl = () => proc;
+    const { sink, calls } = makeRecordingSink();
+    const activityReporting: ActivityReportingConfig = { attemptId: "attempt-1", sink };
+    await new ClaudeCliExecutor("/tmp", "summary", false, spawnImpl as unknown as typeof spawn, undefined, activityReporting).invoke({
+      prompt: "p",
+      model: "m",
+    });
+
+    const toolResultCall = calls.find((c) => c.method === "toolResult");
+    expect(toolResultCall).toBeDefined();
+    const output = (toolResultCall!.payload as ActivityToolResult).output;
+    expect(output.truncated).toBe(true);
+    expect(Buffer.byteLength(output.text, "utf8")).toBeLessThanOrEqual(16 * 1024);
   });
 });

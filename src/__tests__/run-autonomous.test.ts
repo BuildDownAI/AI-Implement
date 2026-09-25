@@ -5,7 +5,15 @@ import { chmodSync, mkdirSync, mkdtempSync, writeFileSync, rmSync, existsSync, r
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { runAutonomous, resolveLogLevel, waitForContainerRemoval, runAutonomousLocally } from "../run-autonomous.js";
+import {
+  runAutonomous,
+  resolveLogLevel,
+  waitForContainerRemoval,
+  runAutonomousLocally,
+  resolveActivityReporting,
+  RunnerActivitySink,
+  type RunnerActivityReporting,
+} from "../run-autonomous.js";
 import { DEFAULT_PIPELINE } from "../pipeline/default-pipeline.js";
 import { PipelineRunner } from "../pipeline/runner.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
@@ -1140,6 +1148,213 @@ describe("runAutonomous", () => {
       expect(result.exitCode).toBe(0);
       const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as Record<string, unknown>;
       expect(body).not.toHaveProperty("reviewFix");
+    });
+  });
+
+  describe("runner-activity reporting (AII-798)", () => {
+    const REVIEW_FIX_IDENTITY: ReviewFixMetadataV1 = {
+      version: 1,
+      attemptId: "attempt-activity-1",
+      installationId: 999,
+      repository: "acme/app",
+      prNumber: 7,
+      deadlineAt: Date.now() + 60 * 60_000,
+    };
+
+    function makeNoopSink(): RunnerActivityReporting["sink"] {
+      return { toolStart: () => {}, toolResult: () => {}, cycleSummary: () => {}, final: () => {} };
+    }
+
+    describe("resolveActivityReporting", () => {
+      it("resolves a sink only when reviewFix identity, callback URL, and progress token are all present", () => {
+        const resolved = resolveActivityReporting(REVIEW_FIX_IDENTITY, "https://orchestrator.example", "ptok");
+        expect(resolved).toBeDefined();
+        expect(resolved?.attemptId).toBe("attempt-activity-1");
+      });
+
+      it("is undefined for a Legacy (non-pilot) dispatch, even with a callback URL and progress token", () => {
+        expect(resolveActivityReporting(undefined, "https://orchestrator.example", "ptok")).toBeUndefined();
+      });
+
+      it("is undefined without a callback URL", () => {
+        expect(resolveActivityReporting(REVIEW_FIX_IDENTITY, null, "ptok")).toBeUndefined();
+      });
+
+      it("is undefined without a progress token", () => {
+        expect(resolveActivityReporting(REVIEW_FIX_IDENTITY, "https://orchestrator.example", null)).toBeUndefined();
+      });
+    });
+
+    describe("RunnerActivitySink", () => {
+      it("delivers a buffered tool start/result batch plus the final marker to /runner/activity on shutdown()", async () => {
+        const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+        const sink = new RunnerActivitySink("https://orchestrator.example", "ptok", "attempt-activity-1", mockFetch);
+
+        sink.toolStart(
+          { attemptId: "attempt-activity-1", producerId: "implement-1", sequence: 0 },
+          { cycle: 1, action: "Bash", detail: { command: "ls" } },
+        );
+        sink.toolResult(
+          { attemptId: "attempt-activity-1", producerId: "implement-1", sequence: 1 },
+          { cycle: 1, action: "Bash", output: { text: "file.txt", truncated: false } },
+        );
+        sink.final({ attemptId: "attempt-activity-1", producerId: "implement-1", sequence: 1 }, 1);
+
+        await sink.shutdown();
+
+        expect(mockFetch).toHaveBeenCalledWith(
+          "https://orchestrator.example/runner/activity",
+          expect.objectContaining({
+            method: "POST",
+            headers: expect.objectContaining({ Authorization: "Bearer ptok" }),
+          }),
+        );
+        const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
+          attemptId: string;
+          producerId: string;
+          events: Array<{ kind: string; sequence: number }>;
+          finalSequence?: number;
+        };
+        expect(body.attemptId).toBe("attempt-activity-1");
+        expect(body.producerId).toBe("implement-1");
+        expect(body.events.map((e) => e.kind)).toEqual(["tool_start", "tool_result"]);
+        expect(body.finalSequence).toBe(1);
+      });
+
+      it("never contacts the network for a producerId that recorded no events — final() on an untouched producer is a no-op", async () => {
+        const mockFetch = vi.fn();
+        const sink = new RunnerActivitySink("https://orchestrator.example", "ptok", "attempt-activity-1", mockFetch);
+
+        sink.final({ attemptId: "attempt-activity-1", producerId: "never-touched", sequence: 0 }, 0);
+        await sink.shutdown();
+
+        expect(mockFetch).not.toHaveBeenCalled();
+      });
+    });
+
+    describe("runAutonomous finally-block wiring", () => {
+      it("attempts activity shutdown from the outer finally block on a successful run", async () => {
+        const shutdown = vi.fn().mockResolvedValue(undefined);
+        const fakeReporting: RunnerActivityReporting = { attemptId: "attempt-1", sink: makeNoopSink(), shutdown };
+        const mod: StepModule = { run: vi.fn().mockResolvedValue({}) };
+        const { pipeline, runner } = makeSingleStepPipeline("do-work", mod);
+
+        const result = await runAutonomous({
+          workspaceDir,
+          pipeline,
+          runner,
+          reporter: new NoopStepReporter(),
+          llmExecutor: makeMockExecutor(0),
+          activityReporting: fakeReporting,
+        });
+
+        expect(result.exitCode).toBe(0);
+        expect(shutdown).toHaveBeenCalledTimes(1);
+      });
+
+      it("attempts activity shutdown from the outer finally block even when the pipeline throws — mirrors the always-runs teardown hook", async () => {
+        const shutdown = vi.fn().mockResolvedValue(undefined);
+        const fakeReporting: RunnerActivityReporting = { attemptId: "attempt-1", sink: makeNoopSink(), shutdown };
+        const mod: StepModule = { run: vi.fn().mockRejectedValue(new Error("step exploded")) };
+        const { pipeline, runner } = makeSingleStepPipeline("bad-step", mod);
+
+        const result = await runAutonomous({
+          workspaceDir,
+          pipeline,
+          runner,
+          reporter: new NoopStepReporter(),
+          llmExecutor: makeMockExecutor(0),
+          activityReporting: fakeReporting,
+        });
+
+        expect(result.exitCode).toBe(1);
+        expect(shutdown).toHaveBeenCalledTimes(1);
+      });
+
+      it("does not let a rejecting shutdown() crash the run — logged, never fatal", async () => {
+        const shutdown = vi.fn().mockRejectedValue(new Error("network down"));
+        const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+        const fakeReporting: RunnerActivityReporting = { attemptId: "attempt-1", sink: makeNoopSink(), shutdown };
+        const mod: StepModule = { run: vi.fn().mockResolvedValue({}) };
+        const { pipeline, runner } = makeSingleStepPipeline("do-work", mod);
+
+        const result = await runAutonomous({
+          workspaceDir,
+          pipeline,
+          runner,
+          reporter: new NoopStepReporter(),
+          llmExecutor: makeMockExecutor(0),
+          activityReporting: fakeReporting,
+        });
+
+        expect(result.exitCode).toBe(0);
+        expect(shutdown).toHaveBeenCalledTimes(1);
+        expect(errSpy.mock.calls.some((c) => String(c[0]).includes("[activity] shutdown failed"))).toBe(true);
+        errSpy.mockRestore();
+      });
+
+      it("auto-resolves activity reporting from a pilot reviewFix envelope (no injected override) without throwing", async () => {
+        vi.stubEnv(
+          "AI_IMPLEMENT_RUN_CONFIG",
+          encodeRunConfig({
+            v: 1,
+            issue: { id: "issue-abc", identifier: "AII-1", title: "Test issue", description: "Issue description" },
+            reviewFix: REVIEW_FIX_IDENTITY,
+          }),
+        );
+        vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+        vi.stubEnv("RUN_PROGRESS_TOKEN", "ptok");
+        vi.stubEnv("RUN_TOKEN", "run-token");
+        vi.stubEnv("GITHUB_RUN_ID", "1");
+        vi.stubEnv("GITHUB_RUN_ATTEMPT", "1");
+
+        const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+        const { pipeline, runner } = makeStepsPipeline([
+          ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true }) }],
+          [
+            "push",
+            {
+              run: vi.fn().mockResolvedValue({
+                prUrl: "https://github.com/acme/app/pull/7",
+                prNumber: 7,
+                branchPushed: true,
+                commitSha: "f".repeat(40),
+                draft: false,
+              }),
+            },
+          ],
+        ]);
+
+        const result = await runAutonomous({
+          workspaceDir,
+          pipeline,
+          runner,
+          reporter: new NoopStepReporter(),
+          llmExecutor: makeMockExecutor(0),
+          fetchImpl: mockFetch,
+        });
+
+        expect(result.exitCode).toBe(0);
+      });
+
+      it("never constructs activity reporting for a Legacy (non-pilot) dispatch, even with a callback URL and progress token set", async () => {
+        vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+        vi.stubEnv("RUN_PROGRESS_TOKEN", "ptok");
+        vi.stubEnv("RUN_TOKEN", "run-token");
+
+        const mod: StepModule = { run: vi.fn().mockResolvedValue({}) };
+        const { pipeline, runner } = makeSingleStepPipeline("do-work", mod);
+
+        const result = await runAutonomous({
+          workspaceDir,
+          pipeline,
+          runner,
+          reporter: new NoopStepReporter(),
+          llmExecutor: makeMockExecutor(0),
+        });
+
+        expect(result.exitCode).toBe(0);
+      });
     });
   });
 

@@ -103,6 +103,7 @@ export const reviewStep: StepModule<ReviewInputs, ReviewOutputs> = {
       stage: "review",
       expectsStructuredOutput: true,
       retry: retryPolicy ? { policy: retryPolicy, toolUseIsSafe: true } : undefined,
+      cycle: iteration,
     });
 
     // The executor already classified this failure (with the correct
