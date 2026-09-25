@@ -19,6 +19,7 @@ import { classifyThrown, isFailureRecord } from "./pipeline/failure-classificati
 import { decodeRunConfig, type RunConfigV1 } from "./run-config.js";
 import { DEFAULT_RETRY_POLICY, normalizeRetryPolicy, type RetryPolicy } from "./pipeline/retry-backoff.js";
 import { writeRunAutopsy, writeRunStats } from "./run-autopsy.js";
+import { dependenciesMissing } from "./pipeline/pipeline-loader.js";
 import { parsePlanningBlock } from "./planning-block.js";
 import type { LocalRunTokenSummary } from "./local/run-result.js";
 import { prepareScratchExclusionIfGit } from "./pipeline/scratch-exclude.js";
@@ -686,6 +687,41 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     // Similarly, an approved mounted dev-harness run has no push step and no PR URL,
     // but is a genuine local success.
     if (approved && (prUrl || prNumber || devHarnessMode)) {
+      // The change was approved but dependencies never installed — build and tests
+      // never ran, so this must not report success or carry the runner-approval mark
+      // that lets feature-branch child PRs auto-merge unverified. Report a coded
+      // failure instead, mirroring the REVIEW_UNAPPROVED path below but skipping the
+      // autopsy (AII-823's install comment covers it) while keeping exitCode 0 so the
+      // GHA job stays green with a warning.
+      if (dependenciesMissing(context)) {
+        const installRetryOutputs = context.getOutputs("install-retry");
+        const installMethod =
+          typeof installRetryOutputs.installMethod === "string" ? installRetryOutputs.installMethod : "install";
+        const installError =
+          typeof installRetryOutputs.installError === "string" ? installRetryOutputs.installError : "";
+        const prKind = pushOutputs.draft === true ? "draft PR" : "PR";
+        const failureReason =
+          `Dependency install failed twice (${installMethod}); the change was approved by review but never built or tested.\n\n` +
+          installError.slice(0, 500);
+        disposition = `${prKind} ${prUrl} — dependency install failed; not verified`;
+        console.warn(
+          `::warning::AI-Implement: dependency install failed — ${prKind} opened: ${prUrl}`,
+        );
+        await postRunnerResult({
+          workspaceDir,
+          phase: runnerPhase,
+          outcome: "failure",
+          failureCode: "INSTALL_FAILED",
+          failureReason,
+          prUrl,
+          referenceRepoResults,
+          findingDispositions,
+          callbackUrl,
+          fetchImpl: opts.fetchImpl,
+        });
+        return { exitCode: 0 };
+      }
+
       const statPasses = Array.isArray(fbOutputs.passes) ? (fbOutputs.passes as RunAutopsyPasses) : [];
       const planningBlock = parsePlanningBlock(planningContext);
       // For new runs prUrl is set and branch is the base — compare committed diff.

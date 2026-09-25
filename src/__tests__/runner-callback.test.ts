@@ -841,6 +841,39 @@ describe("handleRunnerResult — implementation", () => {
     expect(log.getJobById(jobId)?.conclusion).not.toBe("runner_approved");
   });
 
+  it("does NOT write runner_approved on INSTALL_FAILED coded failure", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i-install-failed",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({
+      issueId: "i-install-failed",
+      issueIdentifier: "ENG-4b",
+      teamKey: "ENG",
+      repo: "o/r",
+      dispatchId,
+      executionMode: "github-actions",
+    });
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "failure",
+        failureCode: "INSTALL_FAILED",
+        failureReason: "Dependency install failed twice (npm ci); the change was approved by review but never built or tested.",
+        comments: [],
+        prUrl: "https://github.com/o/r/pull/99",
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider({ recordCalls: true })),
+    });
+    expect(res.status).toBe(200);
+    expect(log.getJobById(jobId)?.conclusion).not.toBe("runner_approved");
+  });
+
   it("does NOT write runner_approved on MAX_TURNS_EXHAUSTED coded failure", async () => {
     const { token, dispatchId } = runnerTokens.mintRunToken({
       issueId: "i-maxturn",
@@ -2344,6 +2377,31 @@ describe("unapproved-run failure codes", () => {
     expect(formatFailureComment("SOMETHING_NEW", "boom")).toContain("boom");
   });
 
+  it("formatFailureComment renders INSTALL_FAILED with the draft PR link for an initial run", () => {
+    const comment = formatFailureComment(
+      "INSTALL_FAILED",
+      "Dependency install failed twice (npm ci); the change was approved by review but never built or tested.\n\nnpm ci failed: dependency conflict",
+      { prUrl: "https://github.com/o/r/pull/9", isInitialRun: true },
+    );
+    expect(comment).toContain("dependencies did not install");
+    expect(comment).toContain("build and tests never ran");
+    expect(comment).toContain("The work is in a draft PR: https://github.com/o/r/pull/9");
+    expect(comment).toContain("npm ci failed: dependency conflict");
+    expect(comment).toContain(
+      "Fix the install (lockfile, peer ranges, registry access), or set packageManager: none in .ai-implement/config.yml and install in a setup hook.",
+    );
+    expect(comment).toContain("**Next step:**");
+  });
+
+  it("formatFailureComment renders INSTALL_FAILED's PR line as 'updated by this run' for a gap-fill/re-dispatch", () => {
+    const comment = formatFailureComment("INSTALL_FAILED", "install failed", {
+      prUrl: "https://github.com/o/r/pull/9",
+      isInitialRun: false,
+    });
+    expect(comment).toContain("The existing PR was updated by this run.");
+    expect(comment).not.toContain("The work is in a draft PR");
+  });
+
   it("records the draft PR url on the job for an implementation failure", async () => {
     const { token, dispatchId } = runnerTokens.mintRunToken({
       issueId: "i",
@@ -2449,6 +2507,45 @@ describe("watchdogConfig — remediateFailedJob gating", () => {
     expect(res.status).toBe(200);
     // clearWorkingState is what remediateFailedJob calls via boundedCleanup;
     // it must NOT fire when a draft PR is already open.
+    const clearCall = fake.recordedCalls().find((c) => c.method === "clearWorkingState");
+    expect(clearCall).toBeUndefined();
+  });
+
+  it("skips remediateFailedJob for an INSTALL_FAILED callback carrying prUrl", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    log.appendLog({
+      issueId: "i",
+      issueIdentifier: "ENG-1",
+      issueTitle: "t",
+      teamKey: "ENG",
+      repo: "o/r",
+      dispatchId,
+      executionMode: "github-actions",
+    });
+    const fake = new FakeProvider({ recordCalls: true });
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "failure",
+        failureCode: "INSTALL_FAILED",
+        failureReason: "Dependency install failed twice (npm ci); the change was approved by review but never built or tested.",
+        prUrl: "https://github.com/o/r/pull/9",
+        comments: [],
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+      watchdogConfig,
+    });
+
+    expect(res.status).toBe(200);
     const clearCall = fake.recordedCalls().find((c) => c.method === "clearWorkingState");
     expect(clearCall).toBeUndefined();
   });

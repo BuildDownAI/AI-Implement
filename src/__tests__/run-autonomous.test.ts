@@ -1056,6 +1056,119 @@ describe("runAutonomous", () => {
     expect(body.prUrl).toBe("https://github.com/o/r/pull/9");
   });
 
+  it("reports INSTALL_FAILED (not success) when an approved run's dependencies never installed", async () => {
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    const { pipeline, runner } = makeStepsPipeline([
+      ["install", { run: vi.fn().mockResolvedValue({ installFailed: true, installMethod: "npm ci", installError: "npm ci failed: dependency conflict" }) }],
+      ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true, iterations: 2, terminationReason: "approved", passes: [] }) }],
+      ["install-retry", { run: vi.fn().mockResolvedValue({ installFailed: true, installMethod: "npm ci", installError: "npm ci failed again: dependency conflict".repeat(30) }) }],
+      [
+        "push",
+        {
+          run: vi.fn().mockResolvedValue({
+            prUrl: "https://github.com/o/r/pull/9",
+            prNumber: 9,
+            branchPushed: true,
+            draft: true,
+          }),
+        },
+      ],
+    ]);
+
+    try {
+      const result = await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeMockExecutor(0),
+        fetchImpl: mockFetch,
+      });
+
+      expect(result.exitCode).toBe(0);
+      const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
+        outcome: string;
+        failureCode: string;
+        failureReason: string;
+        prUrl: string;
+      };
+      expect(body.outcome).toBe("failure");
+      expect(body.failureCode).toBe("INSTALL_FAILED");
+      expect(body.prUrl).toBe("https://github.com/o/r/pull/9");
+      expect(body.failureReason).toContain(
+        "Dependency install failed twice (npm ci); the change was approved by review but never built or tested.",
+      );
+      expect(body.failureReason).toContain("npm ci failed again: dependency conflict");
+      // Capped at the first 500 characters of the retry's installError.
+      expect(body.failureReason.length).toBeLessThan(700);
+
+      expect(existsSync(join(workspaceDir, "ai-output", "comments", "95-run-stats.md"))).toBe(false);
+      expect(existsSync(join(workspaceDir, "ai-output", "comments", "90-run-autopsy.md"))).toBe(false);
+
+      const warnings = warn.mock.calls.map((call) => call.join(" ")).join("\n");
+      expect(warnings).toContain(
+        "::warning::AI-Implement: dependency install failed — draft PR opened: https://github.com/o/r/pull/9",
+      );
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("keeps REVIEW_UNAPPROVED (not INSTALL_FAILED) when an unapproved run's dependencies also never installed", async () => {
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    const { pipeline, runner } = makeStepsPipeline([
+      ["install", { run: vi.fn().mockResolvedValue({ installFailed: true, installMethod: "npm ci", installError: "conflict" }) }],
+      [
+        "feedback-loop",
+        {
+          run: vi.fn().mockResolvedValue({
+            approved: false,
+            iterations: 3,
+            finalFeedback: "nope",
+            terminationReason: "iterations_exhausted",
+            passes: [],
+          }),
+        },
+      ],
+      ["install-retry", { run: vi.fn().mockResolvedValue({ installFailed: true, installMethod: "npm ci", installError: "still conflict" }) }],
+      [
+        "push",
+        {
+          run: vi.fn().mockResolvedValue({
+            prUrl: "https://github.com/o/r/pull/9",
+            prNumber: 9,
+            branchPushed: true,
+            draft: true,
+          }),
+        },
+      ],
+    ]);
+
+    const result = await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+      fetchImpl: mockFetch,
+    });
+
+    expect(result.exitCode).toBe(0);
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
+      outcome: string;
+      failureCode: string;
+    };
+    expect(body.outcome).toBe("failure");
+    expect(body.failureCode).toBe("REVIEW_UNAPPROVED");
+  });
+
   it("reports the push step's actual non-draft PR state when an unapproved run reuses a real PR", async () => {
     const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
