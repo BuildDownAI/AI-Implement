@@ -1,4 +1,6 @@
 import { getDb } from "./dedup.js";
+import { upsertReviewFinding } from "./review-ledger-store.js";
+import type { ReviewLedgerFinding } from "./pipeline/review-ledger.js";
 
 export type ReviewFixStatus = "pending" | "dispatched" | "skipped" | "failed";
 
@@ -102,6 +104,7 @@ export interface ReviewFixEvent {
   sourceUrl: string | null;
   actor: string | null;
   findingIds: number[];
+  sourceEventId: string | null;
   createdAt: number;
 }
 
@@ -124,6 +127,10 @@ export interface EnqueueReviewFixInput {
   sourceUrl?: string | null;
   actor?: string | null;
   findingIds?: number[];
+  /** Stable identity of the webhook delivery (or synthesized equivalent) that produced this
+   *  event — set only by `acceptReviewFixWebhookEvent`. Omitted (NULL) by the pre-existing
+   *  internal producers (open_pr, lease_rejected), which stay on Legacy queue behavior. */
+  sourceEventId?: string | null;
 }
 
 interface ReviewFixQueueRow {
@@ -150,6 +157,7 @@ interface ReviewFixEventRow {
   source_url: string | null;
   actor: string | null;
   finding_ids_json: string;
+  source_event_id: string | null;
   created_at: number;
 }
 
@@ -195,9 +203,9 @@ export function enqueueReviewFix(input: EnqueueReviewFixInput): number {
     .get(input.repo, input.prNumber) as { id: number };
   db.prepare(`
     INSERT INTO review_fix_events
-      (queue_id, issue_id, issue_identifier, repo, pr_number, reason, source_url, actor, finding_ids_json, created_at)
+      (queue_id, issue_id, issue_identifier, repo, pr_number, reason, source_url, actor, finding_ids_json, source_event_id, created_at)
     VALUES
-      (@queueId, @issueId, @issueIdentifier, @repo, @prNumber, @reason, @sourceUrl, @actor, @findingIdsJson, @now)
+      (@queueId, @issueId, @issueIdentifier, @repo, @prNumber, @reason, @sourceUrl, @actor, @findingIdsJson, @sourceEventId, @now)
   `).run({
     queueId: row.id,
     issueId: input.issueId,
@@ -208,9 +216,76 @@ export function enqueueReviewFix(input: EnqueueReviewFixInput): number {
     sourceUrl: input.sourceUrl ?? null,
     actor: input.actor ?? null,
     findingIdsJson: JSON.stringify(input.findingIds ?? []),
+    sourceEventId: input.sourceEventId ?? null,
     now,
   });
   return row.id;
+}
+
+export interface AcceptReviewFixWebhookEventInput {
+  /** GitHub delivery id when present, else a synthesized hash — see `resolveReviewFixEventId`
+   *  in webhook.ts. Scoped by repo, matching every other identity in this table. */
+  eventId: string;
+  issueId: string;
+  issueIdentifier: string | null;
+  repo: string;
+  prNumber: number;
+  reason: string;
+  sourceUrl?: string | null;
+  actor?: string | null;
+  findings: ReviewLedgerFinding[];
+}
+
+export type AcceptReviewFixWebhookEventOutcome =
+  | { status: "accepted"; findingIds: number[]; reviewFixId: number }
+  | { status: "duplicate"; findingIds: number[]; reviewFixId: number };
+
+interface ReviewFixSourceEventRow {
+  queue_id: number;
+  finding_ids_json: string;
+}
+
+/**
+ * Atomically accepts one webhook-sourced review event: bumps (or creates) the
+ * finding-version rows (AII-780) and enqueues/merges the review-fix queue entry
+ * (this module's existing `ON CONFLICT (repo, pr_number)` seam), all inside one
+ * `db.transaction()` so a caller's HTTP 200 ACK — written only after this returns —
+ * never precedes the durable write. Identity is `(repo, eventId)`: a second call
+ * with an identity already recorded in `review_fix_events` is a no-op that returns
+ * the originally accepted findingIds/reviewFixId rather than bumping any finding's
+ * revision or inserting a second queue/event row — see the unique index on
+ * `review_fix_events(repo, source_event_id)` in dedup.ts.
+ */
+export function acceptReviewFixWebhookEvent(input: AcceptReviewFixWebhookEventInput): AcceptReviewFixWebhookEventOutcome {
+  const db = getDb();
+  return db.transaction((): AcceptReviewFixWebhookEventOutcome => {
+    const existing = db
+      .prepare("SELECT queue_id, finding_ids_json FROM review_fix_events WHERE repo = ? AND source_event_id = ?")
+      .get(input.repo, input.eventId) as ReviewFixSourceEventRow | undefined;
+    if (existing) {
+      return {
+        status: "duplicate",
+        findingIds: parseFindingIds(existing.finding_ids_json),
+        reviewFixId: existing.queue_id,
+      };
+    }
+
+    const findingIds = input.findings.map((finding) =>
+      upsertReviewFinding({ repo: input.repo, prNumber: input.prNumber, ...finding }),
+    );
+    const reviewFixId = enqueueReviewFix({
+      issueId: input.issueId,
+      issueIdentifier: input.issueIdentifier,
+      repo: input.repo,
+      prNumber: input.prNumber,
+      reason: input.reason,
+      sourceUrl: input.sourceUrl,
+      actor: input.actor,
+      findingIds,
+      sourceEventId: input.eventId,
+    });
+    return { status: "accepted", findingIds, reviewFixId };
+  })();
 }
 
 export function getPendingReviewFixes(limit = 20): ReviewFixQueueItem[] {
@@ -301,6 +376,7 @@ function mapEventRow(row: ReviewFixEventRow): ReviewFixEvent {
     sourceUrl: row.source_url,
     actor: row.actor,
     findingIds: parseFindingIds(row.finding_ids_json),
+    sourceEventId: row.source_event_id,
     createdAt: row.created_at,
   };
 }

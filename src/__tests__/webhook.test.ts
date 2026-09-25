@@ -84,6 +84,7 @@ function makeRequest(
   event: string,
   payload: unknown,
   signWith?: string,
+  extraHeaders?: Record<string, string>,
 ): { req: MockRequest; res: MockResponse } {
   const body = JSON.stringify(payload);
   const sig = sign(signWith ?? secret, body);
@@ -92,6 +93,7 @@ function makeRequest(
       "x-hub-signature-256": sig,
       "x-github-event": event,
       "content-type": "application/json",
+      ...extraHeaders,
     },
     body,
   );
@@ -1239,7 +1241,10 @@ describe("review feedback ingestion", () => {
     });
     log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/50");
 
-    const makeReviewRequest = () =>
+    // Two genuinely separate review submissions with identical text — distinguished from a
+    // redelivery of one webhook (see the "duplicate delivery" tests below) by their distinct
+    // submitted_at, since neither request carries an x-github-delivery header here.
+    const makeReviewRequest = (submittedAt: string) =>
       makeRequest(SECRET, "pull_request_review", {
         action: "submitted",
         review: {
@@ -1247,6 +1252,7 @@ describe("review feedback ingestion", () => {
           body: "Please fix the callback race.",
           html_url: "https://github.com/org/repo/pull/50#pullrequestreview-1",
           user: { login: "claude[bot]" },
+          submitted_at: submittedAt,
         },
         pull_request: {
           number: 50,
@@ -1256,19 +1262,229 @@ describe("review feedback ingestion", () => {
         repository: { full_name: "org/repo" },
       });
 
+    const first = makeReviewRequest("2026-01-01T00:00:00Z");
+    webhook.handleGitHubWebhook(first.req as never, first.res as never, SECRET);
+    await first.res.done;
+    const firstResponse = JSON.parse(first.res.body) as { findingId: number; duplicate: boolean };
+    expect(firstResponse.duplicate).toBe(false);
+    expect(reviewStore.getReviewFindingById(firstResponse.findingId)?.revision).toBe(1);
+
+    const second = makeReviewRequest("2026-01-01T00:05:00Z");
+    webhook.handleGitHubWebhook(second.req as never, second.res as never, SECRET);
+    await second.res.done;
+    const secondResponse = JSON.parse(second.res.body) as { findingId: number; duplicate: boolean };
+
+    expect(secondResponse.duplicate).toBe(false);
+    expect(secondResponse.findingId).toBe(firstResponse.findingId);
+    expect(reviewStore.getReviewFindingById(firstResponse.findingId)?.revision).toBe(2);
+  });
+
+  it("without a delivery header, an exact repeat (same body/timestamp/actor/commit) synthesizes the same identity and is a no-op (AII-792)", async () => {
+    const jobId = log.appendLog({
+      issueId: "issue-synth-dup",
+      issueIdentifier: "AII-SYNTHDUP",
+      repo: "org/repo",
+    });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/52");
+
+    const makeReviewRequest = () =>
+      makeRequest(SECRET, "pull_request_review", {
+        action: "submitted",
+        review: {
+          state: "changes_requested",
+          body: "Please fix the callback race.",
+          html_url: "https://github.com/org/repo/pull/52#pullrequestreview-1",
+          user: { login: "claude[bot]" },
+          submitted_at: "2026-01-01T00:00:00Z",
+        },
+        pull_request: {
+          number: 52,
+          html_url: "https://github.com/org/repo/pull/52",
+          head: { ref: "ai-implement/AII-SYNTHDUP-fix" },
+        },
+        repository: { full_name: "org/repo" },
+      });
+
     const first = makeReviewRequest();
     webhook.handleGitHubWebhook(first.req as never, first.res as never, SECRET);
     await first.res.done;
-    const firstResponse = JSON.parse(first.res.body) as { findingId: number };
-    expect(reviewStore.getReviewFindingById(firstResponse.findingId)?.revision).toBe(1);
+    const firstResponse = JSON.parse(first.res.body) as { findingId: number; reviewFixId: number; duplicate: boolean };
+    expect(firstResponse.duplicate).toBe(false);
 
     const second = makeReviewRequest();
     webhook.handleGitHubWebhook(second.req as never, second.res as never, SECRET);
     await second.res.done;
-    const secondResponse = JSON.parse(second.res.body) as { findingId: number };
+    const secondResponse = JSON.parse(second.res.body) as { findingId: number; reviewFixId: number; duplicate: boolean };
 
+    expect(secondResponse.duplicate).toBe(true);
     expect(secondResponse.findingId).toBe(firstResponse.findingId);
-    expect(reviewStore.getReviewFindingById(firstResponse.findingId)?.revision).toBe(2);
+    expect(secondResponse.reviewFixId).toBe(firstResponse.reviewFixId);
+    expect(reviewStore.getReviewFindingById(firstResponse.findingId)?.revision).toBe(1);
+    expect(reviewFixQueue.listReviewFixEvents(firstResponse.reviewFixId)).toHaveLength(1);
+  });
+
+  it("a redelivered pull_request_review (same x-github-delivery) is a no-op: no revision bump, no second queue/event row (AII-792)", async () => {
+    const jobId = log.appendLog({
+      issueId: "issue-dup-review",
+      issueIdentifier: "AII-DUPR",
+      repo: "org/repo",
+    });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/51");
+
+    const payload = {
+      action: "submitted",
+      review: {
+        state: "changes_requested",
+        body: "Please fix the callback race.",
+        html_url: "https://github.com/org/repo/pull/51#pullrequestreview-1",
+        user: { login: "claude[bot]" },
+      },
+      pull_request: {
+        number: 51,
+        html_url: "https://github.com/org/repo/pull/51",
+        head: { ref: "ai-implement/AII-DUPR-fix" },
+      },
+      repository: { full_name: "org/repo" },
+    };
+    const headers = { "x-github-delivery": "delivery-review-1" };
+
+    const first = makeRequest(SECRET, "pull_request_review", payload, undefined, headers);
+    webhook.handleGitHubWebhook(first.req as never, first.res as never, SECRET);
+    await first.res.done;
+    const firstResponse = JSON.parse(first.res.body) as { findingId: number; reviewFixId: number; duplicate: boolean };
+    expect(firstResponse.duplicate).toBe(false);
+
+    const second = makeRequest(SECRET, "pull_request_review", payload, undefined, headers);
+    webhook.handleGitHubWebhook(second.req as never, second.res as never, SECRET);
+    await second.res.done;
+    const secondResponse = JSON.parse(second.res.body) as { findingId: number; reviewFixId: number; duplicate: boolean };
+
+    expect(secondResponse.duplicate).toBe(true);
+    expect(secondResponse.findingId).toBe(firstResponse.findingId);
+    expect(secondResponse.reviewFixId).toBe(firstResponse.reviewFixId);
+    expect(reviewStore.getReviewFindingById(firstResponse.findingId)?.revision).toBe(1);
+    expect(reviewFixQueue.listReviewFixEvents(firstResponse.reviewFixId)).toHaveLength(1);
+  });
+
+  it("a redelivered pull_request_review_comment (same x-github-delivery) is a no-op (AII-792)", async () => {
+    const jobId = log.appendLog({
+      issueId: "issue-dup-comment",
+      issueIdentifier: "AII-DUPC",
+      repo: "org/repo",
+    });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/53");
+
+    const payload = {
+      action: "created",
+      comment: {
+        body: "This line still accepts null owners.",
+        html_url: "https://github.com/org/repo/pull/53#discussion_r1",
+        path: "src/auth.ts",
+        line: 12,
+      },
+      pull_request: {
+        number: 53,
+        html_url: "https://github.com/org/repo/pull/53",
+        head: { ref: "ai-implement/AII-DUPC-fix" },
+      },
+      repository: { full_name: "org/repo" },
+    };
+    const headers = { "x-github-delivery": "delivery-comment-1" };
+
+    const first = makeRequest(SECRET, "pull_request_review_comment", payload, undefined, headers);
+    webhook.handleGitHubWebhook(first.req as never, first.res as never, SECRET);
+    await first.res.done;
+    const firstResponse = JSON.parse(first.res.body) as { findingId: number; reviewFixId: number; duplicate: boolean };
+    expect(firstResponse.duplicate).toBe(false);
+
+    const second = makeRequest(SECRET, "pull_request_review_comment", payload, undefined, headers);
+    webhook.handleGitHubWebhook(second.req as never, second.res as never, SECRET);
+    await second.res.done;
+    const secondResponse = JSON.parse(second.res.body) as { findingId: number; reviewFixId: number; duplicate: boolean };
+
+    expect(secondResponse.duplicate).toBe(true);
+    expect(secondResponse.findingId).toBe(firstResponse.findingId);
+    expect(reviewStore.listOpenReviewFindings("org/repo", 53)).toHaveLength(1);
+    expect(reviewFixQueue.listReviewFixEvents(firstResponse.reviewFixId)).toHaveLength(1);
+  });
+
+  it("a redelivered Claude PR summary comment (same x-github-delivery) is a no-op across multiple findings (AII-792)", async () => {
+    const jobId = log.appendLog({
+      issueId: "issue-dup-summary",
+      issueIdentifier: "AII-DUPS2",
+      repo: "org/repo",
+    });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/54");
+
+    const payload = {
+      action: "created",
+      comment: {
+        body: "### PR Review: Changes requested\n\n**1. Missing callback update**\nPersist the PR URL before the runner exits.\n\n**2. Missing test**\nAdd a regression test.",
+        html_url: "https://github.com/org/repo/issues/54#issuecomment-1",
+        user: { login: "claude-code[bot]" },
+      },
+      issue: {
+        number: 54,
+        html_url: "https://github.com/org/repo/pull/54",
+        pull_request: { url: "https://api.github.com/repos/org/repo/pulls/54" },
+      },
+      repository: { full_name: "org/repo" },
+    };
+    const headers = { "x-github-delivery": "delivery-summary-1" };
+
+    const first = makeRequest(SECRET, "issue_comment", payload, undefined, headers);
+    webhook.handleGitHubWebhook(first.req as never, first.res as never, SECRET);
+    await first.res.done;
+    const firstResponse = JSON.parse(first.res.body) as { findingIds: number[]; reviewFixId: number; duplicate: boolean };
+    expect(firstResponse.duplicate).toBe(false);
+    expect(firstResponse.findingIds).toHaveLength(2);
+
+    const second = makeRequest(SECRET, "issue_comment", payload, undefined, headers);
+    webhook.handleGitHubWebhook(second.req as never, second.res as never, SECRET);
+    await second.res.done;
+    const secondResponse = JSON.parse(second.res.body) as { findingIds: number[]; reviewFixId: number; duplicate: boolean };
+
+    expect(secondResponse.duplicate).toBe(true);
+    expect(secondResponse.findingIds).toEqual(firstResponse.findingIds);
+    expect(reviewStore.listOpenReviewFindings("org/repo", 54)).toHaveLength(2);
+    expect(reviewFixQueue.listReviewFixEvents(firstResponse.reviewFixId)).toHaveLength(1);
+  });
+
+  it("propagates a DB failure instead of writing the blanket 200 ack, so GitHub can redeliver (AII-792)", async () => {
+    const jobId = log.appendLog({
+      issueId: "issue-db-fail",
+      issueIdentifier: "AII-DBFAIL",
+      repo: "org/repo",
+    });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/60");
+
+    const db = dedup.getDb();
+    vi.spyOn(db, "transaction").mockImplementation(() => {
+      throw new Error("simulated DB failure");
+    });
+
+    const { req, res } = makeRequest(SECRET, "pull_request_review", {
+      action: "submitted",
+      review: {
+        state: "changes_requested",
+        body: "Please fix the callback race.",
+        html_url: "https://github.com/org/repo/pull/60#pullrequestreview-1",
+        user: { login: "claude[bot]" },
+      },
+      pull_request: {
+        number: 60,
+        html_url: "https://github.com/org/repo/pull/60",
+        head: { ref: "ai-implement/AII-DBFAIL-fix" },
+      },
+      repository: { full_name: "org/repo" },
+    });
+
+    await expect(webhook.handleGitHubWebhook(req as never, res as never, SECRET)).rejects.toThrow(
+      "simulated DB failure",
+    );
+    // No premature ack: the 200 write never happened, so a caller wrapper (as index.ts does for
+    // this exact endpoint) is free to answer 500 and let GitHub's own redelivery retry.
+    expect(res.body).toBe("");
   });
 
   it("ignores AI-Implement native request-changes reviews to avoid self-triggered fix loops", async () => {

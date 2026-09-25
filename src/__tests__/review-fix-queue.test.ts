@@ -160,6 +160,106 @@ describe("review fix queue", () => {
   });
 });
 
+describe("acceptReviewFixWebhookEvent (AII-792)", () => {
+  it("accepts a fresh event: bumps the finding and enqueues, atomically", () => {
+    const outcome = queue.acceptReviewFixWebhookEvent({
+      eventId: "gh-delivery:abc-1",
+      issueId: "issue-1",
+      issueIdentifier: "AII-1",
+      repo: "org/repo",
+      prNumber: 42,
+      reason: "changes_requested",
+      sourceUrl: "https://github.com/org/repo/pull/42#pullrequestreview-1",
+      actor: "claude[bot]",
+      findings: [{ source: "github-review", severity: "blocking", body: "Please fix the race." }],
+    });
+
+    expect(outcome.status).toBe("accepted");
+    expect(outcome.findingIds).toHaveLength(1);
+    expect(queue.getPendingReviewFixes()).toMatchObject([
+      { id: outcome.reviewFixId, repo: "org/repo", prNumber: 42, status: "pending" },
+    ]);
+    expect(queue.listReviewFixEvents(outcome.reviewFixId)).toMatchObject([
+      { sourceEventId: "gh-delivery:abc-1", findingIds: outcome.findingIds },
+    ]);
+  });
+
+  it("a replayed eventId is a no-op: same findingIds/reviewFixId, no second event row, no revision bump", () => {
+    const finding = { source: "github-review" as const, severity: "blocking" as const, body: "Please fix the race." };
+    const first = queue.acceptReviewFixWebhookEvent({
+      eventId: "gh-delivery:abc-2",
+      issueId: "issue-1",
+      issueIdentifier: "AII-1",
+      repo: "org/repo",
+      prNumber: 43,
+      reason: "changes_requested",
+      findings: [finding],
+    });
+    expect(first.status).toBe("accepted");
+
+    const second = queue.acceptReviewFixWebhookEvent({
+      eventId: "gh-delivery:abc-2",
+      issueId: "issue-1",
+      issueIdentifier: "AII-1",
+      repo: "org/repo",
+      prNumber: 43,
+      reason: "changes_requested",
+      findings: [finding],
+    });
+
+    expect(second).toEqual({ status: "duplicate", findingIds: first.findingIds, reviewFixId: first.reviewFixId });
+    expect(queue.listReviewFixEvents(first.reviewFixId)).toHaveLength(1);
+  });
+
+  it("scopes the eventId identity by repo — the same id in a different repo is a fresh event", () => {
+    const finding = { source: "github-review" as const, severity: "blocking" as const, body: "Please fix the race." };
+    const first = queue.acceptReviewFixWebhookEvent({
+      eventId: "gh-delivery:shared",
+      issueId: "issue-1",
+      issueIdentifier: "AII-1",
+      repo: "org/repo-a",
+      prNumber: 1,
+      reason: "changes_requested",
+      findings: [finding],
+    });
+    const second = queue.acceptReviewFixWebhookEvent({
+      eventId: "gh-delivery:shared",
+      issueId: "issue-2",
+      issueIdentifier: "AII-2",
+      repo: "org/repo-b",
+      prNumber: 1,
+      reason: "changes_requested",
+      findings: [finding],
+    });
+
+    expect(second.status).toBe("accepted");
+    expect(second.reviewFixId).not.toBe(first.reviewFixId);
+  });
+
+  it("leaves the legacy enqueueReviewFix seam (no eventId) untouched — repeated calls still merge on (repo, pr_number)", () => {
+    const first = queue.enqueueReviewFix({
+      issueId: "issue-1",
+      issueIdentifier: "AII-1",
+      repo: "org/repo",
+      prNumber: 44,
+      reason: "open_pr",
+    });
+    const second = queue.enqueueReviewFix({
+      issueId: "issue-1",
+      issueIdentifier: "AII-1",
+      repo: "org/repo",
+      prNumber: 44,
+      reason: "lease_rejected",
+    });
+
+    expect(second).toBe(first);
+    expect(queue.listReviewFixEvents(first)).toMatchObject([
+      { sourceEventId: null, reason: "open_pr" },
+      { sourceEventId: null, reason: "lease_rejected" },
+    ]);
+  });
+});
+
 describe("buildReviewFixTaskDescription", () => {
   function makeFinding(overrides: Partial<ReviewFixQueueModule.ReviewFixTaskFinding> = {}): ReviewFixQueueModule.ReviewFixTaskFinding {
     return {
