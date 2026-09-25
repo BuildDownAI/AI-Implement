@@ -4087,6 +4087,373 @@ describe("POST /api/tools/<name>", () => {
   });
 });
 
+describe("Review-fix attempt evidence + recovery actions (AII-806)", () => {
+  const ATTEMPT_DETAIL: AdminModule.ReviewFixAttemptDetail = {
+    attemptId: "attempt-1",
+    owner: { kind: "restate", attemptId: "attempt-1" },
+    execution: { githubRunId: "123", githubRunAttempt: 1 },
+    deadlineAt: 1_700_000_000_000,
+    pendingFeedback: false,
+    snapshot: { taskText: "fix the thing", findings: [{ findingKey: "f1", version: 2 }] },
+    state: "launched",
+    evidenceComplete: false,
+    terminationConfirmed: false,
+    cycles: [],
+  };
+
+  /** Admitted by the domain seed, so a `user` rather than an admin — same shape as the
+   *  POST /api/tools/<name> block above. */
+  function userSession(): string {
+    return adminSession.createSession({
+      email: "reader@eudoxus.ai",
+      sub: "google|reader",
+      provider: "google",
+      name: "Reader",
+    });
+  }
+
+  function fakeFacade(overrides: Partial<AdminModule.ReviewFixAttemptsFacade> = {}): AdminModule.ReviewFixAttemptsFacade {
+    return {
+      getAttempt: async () => ({ status: "not_found" }),
+      getActivity: async () => ({ status: "not_found" }),
+      reconcile: async () => ({ status: "accepted" }),
+      adopt: async () => ({ status: "accepted" }),
+      revokeAuthority: async () => ({ status: "accepted" }),
+      requestCancellation: async () => ({ status: "accepted" }),
+      ...overrides,
+    };
+  }
+
+  const READ_ROUTES = [
+    ["/api/review-fix/attempts/attempt-1", "GET"],
+    ["/api/review-fix/attempts/attempt-1/activity", "GET"],
+  ] as const;
+  const WRITE_ROUTES = [
+    ["/api/review-fix/attempts/attempt-1/reconcile", "POST"],
+    ["/api/review-fix/attempts/attempt-1/adopt", "POST"],
+    ["/api/review-fix/attempts/attempt-1/cancel", "POST"],
+  ] as const;
+  const ALL_ROUTES = [...READ_ROUTES, ...WRITE_ROUTES];
+
+  it.each(ALL_ROUTES)("answers 501 for %s %s when reviewFixAttempts is not configured", async (url, method) => {
+    const token = await login("secret");
+    const res = await requestWithDeps(url, method, token, {});
+    expect(res.statusCode).toBe(501);
+  });
+
+  it.each(ALL_ROUTES)("rejects an unauthenticated request to %s %s with 401, without calling the facade", async (url, method) => {
+    const called = vi.fn();
+    const facade = fakeFacade({
+      getAttempt: async () => { called(); return { status: "not_found" }; },
+      getActivity: async () => { called(); return { status: "not_found" }; },
+      reconcile: async () => { called(); return { status: "accepted" }; },
+      adopt: async () => { called(); return { status: "accepted" }; },
+      revokeAuthority: async () => { called(); return { status: "accepted" }; },
+    });
+    const res = await requestWithDeps(url, method, "not-a-session", { reviewFixAttempts: facade });
+    expect(res.statusCode).toBe(401);
+    expect(called).not.toHaveBeenCalled();
+  });
+
+  it.each(WRITE_ROUTES)("rejects a non-admin (user-role) request to %s %s with 403, without calling the facade", async (url, method) => {
+    const called = vi.fn();
+    const facade = fakeFacade({
+      reconcile: async () => { called(); return { status: "accepted" }; },
+      adopt: async () => { called(); return { status: "accepted" }; },
+      revokeAuthority: async () => { called(); return { status: "accepted" }; },
+    });
+    const res = await requestWithDeps(url, method, userSession(), { reviewFixAttempts: facade }, { githubRunId: "1", githubRunAttempt: 1 });
+    expect(res.statusCode).toBe(403);
+    expect(called).not.toHaveBeenCalled();
+  });
+
+  describe("GET /api/review-fix/attempts/:attemptId", () => {
+    it("is reachable by a non-admin user session (reads are open, scope is enforced inside the facade)", async () => {
+      const res = await requestWithDeps(
+        "/api/review-fix/attempts/attempt-1",
+        "GET",
+        userSession(),
+        { reviewFixAttempts: fakeFacade({ getAttempt: async () => ({ status: "ok", attempt: ATTEMPT_DETAIL }) }) },
+      );
+      expect(res.statusCode).toBe(200);
+    });
+
+    it("returns the attempt detail with explicit evidenceComplete/terminationConfirmed fields, never omitted", async () => {
+      const token = await login("secret");
+      const res = await requestWithDeps(
+        "/api/review-fix/attempts/attempt-1",
+        "GET",
+        token,
+        { reviewFixAttempts: fakeFacade({ getAttempt: async () => ({ status: "ok", attempt: ATTEMPT_DETAIL }) }) },
+      );
+      expect(res.statusCode).toBe(200);
+      const body = JSON.parse(res.body);
+      expect(body).toHaveProperty("evidenceComplete", false);
+      expect(body).toHaveProperty("terminationConfirmed", false);
+      expect(body).toEqual(ATTEMPT_DETAIL);
+    });
+
+    it("maps a facade \"unavailable\" result to 503 restate-unavailable", async () => {
+      const token = await login("secret");
+      const res = await requestWithDeps(
+        "/api/review-fix/attempts/attempt-1",
+        "GET",
+        token,
+        { reviewFixAttempts: fakeFacade({ getAttempt: async () => ({ status: "unavailable" }) }) },
+      );
+      expect(res.statusCode).toBe(503);
+      expect(JSON.parse(res.body)).toEqual({ error: "restate-unavailable" });
+    });
+
+    it("passes the caller's role and email through to the facade", async () => {
+      let captured: AdminModule.ReviewFixAttemptCaller | undefined;
+      await requestWithDeps(
+        "/api/review-fix/attempts/attempt-1",
+        "GET",
+        userSession(),
+        { reviewFixAttempts: fakeFacade({ getAttempt: async (_id, caller) => { captured = caller; return { status: "not_found" }; } }) },
+      );
+      expect(captured).toEqual({ role: "user", email: "reader@eudoxus.ai" });
+    });
+
+    // Scope isolation: a nonexistent id and an id outside the caller's authorized scope
+    // must be indistinguishable from the outside — both are the facade's own "not_found",
+    // and the route must not add any extra information that would let a caller tell them
+    // apart by probing IDs.
+    it("returns the identical 404 status/body for a nonexistent id and an out-of-scope id", async () => {
+      const token = await login("secret");
+      const facade = fakeFacade({
+        getAttempt: async (attemptId) => {
+          if (attemptId === "unknown-id" || attemptId === "other-scope-id") return { status: "not_found" };
+          return { status: "ok", attempt: ATTEMPT_DETAIL };
+        },
+      });
+      const badId = await requestWithDeps("/api/review-fix/attempts/unknown-id", "GET", token, { reviewFixAttempts: facade });
+      const outOfScope = await requestWithDeps("/api/review-fix/attempts/other-scope-id", "GET", token, { reviewFixAttempts: facade });
+      expect(badId.statusCode).toBe(404);
+      expect(badId).toEqual(outOfScope);
+      expect(JSON.parse(badId.body)).toEqual({ error: "not_found" });
+    });
+  });
+
+  describe("GET /api/review-fix/attempts/:attemptId/activity", () => {
+    const PAGE: AdminModule.ReviewFixActivityPage = {
+      events: [
+        { producerId: "runner", sequence: 1, cycle: 1, kind: "tool_start", occurredAt: 1, payload: "{}", truncated: false, byteCount: 2 },
+      ],
+      nextCursor: { producerId: "runner", sequence: 2 },
+      truncated: true,
+    };
+
+    it("passes cursor and pageSize query params through to the facade", async () => {
+      const token = await login("secret");
+      let capturedOpts: { cursor?: AdminModule.ReviewFixActivityCursor; pageSize?: number } | undefined;
+      await requestWithDeps(
+        "/api/review-fix/attempts/attempt-1/activity?pageSize=25&cursorProducerId=runner&cursorSequence=7",
+        "GET",
+        token,
+        { reviewFixAttempts: fakeFacade({ getActivity: async (_id, opts) => { capturedOpts = opts; return { status: "ok", page: PAGE }; } }) },
+      );
+      expect(capturedOpts).toEqual({ cursor: { producerId: "runner", sequence: 7 }, pageSize: 25 });
+    });
+
+    it("passes a truncated page through untouched — not summarized away", async () => {
+      const token = await login("secret");
+      const res = await requestWithDeps(
+        "/api/review-fix/attempts/attempt-1/activity",
+        "GET",
+        token,
+        { reviewFixAttempts: fakeFacade({ getActivity: async () => ({ status: "ok", page: PAGE }) }) },
+      );
+      expect(res.statusCode).toBe(200);
+      expect(JSON.parse(res.body)).toEqual(PAGE);
+    });
+
+    it("maps a facade \"unavailable\" result to 503 restate-unavailable", async () => {
+      const token = await login("secret");
+      const res = await requestWithDeps(
+        "/api/review-fix/attempts/attempt-1/activity",
+        "GET",
+        token,
+        { reviewFixAttempts: fakeFacade({ getActivity: async () => ({ status: "unavailable" }) }) },
+      );
+      expect(res.statusCode).toBe(503);
+    });
+  });
+
+  describe("POST /api/review-fix/attempts/:attemptId/reconcile", () => {
+    it("answers 202 when the facade accepts", async () => {
+      const token = await login("secret");
+      const res = await requestWithDeps(
+        "/api/review-fix/attempts/attempt-1/reconcile",
+        "POST",
+        token,
+        { reviewFixAttempts: fakeFacade({ reconcile: async () => ({ status: "accepted" }) }) },
+      );
+      expect(res.statusCode).toBe(202);
+      expect(JSON.parse(res.body)).toEqual({ status: "accepted" });
+    });
+
+    it("answers 202 with an explicit durable-acceptance body when Restate is unavailable, never a generic 500", async () => {
+      const token = await login("secret");
+      const res = await requestWithDeps(
+        "/api/review-fix/attempts/attempt-1/reconcile",
+        "POST",
+        token,
+        { reviewFixAttempts: fakeFacade({ reconcile: async () => ({ status: "unavailable" }) }) },
+      );
+      expect(res.statusCode).toBe(202);
+      const body = JSON.parse(res.body);
+      expect(body.status).toBe("durable-accepted");
+      expect(typeof body.detail).toBe("string");
+    });
+
+    it("answers 409 with the facade's reason when rejected", async () => {
+      const token = await login("secret");
+      const res = await requestWithDeps(
+        "/api/review-fix/attempts/attempt-1/reconcile",
+        "POST",
+        token,
+        { reviewFixAttempts: fakeFacade({ reconcile: async () => ({ status: "rejected", reason: "already_terminal" }) }) },
+      );
+      expect(res.statusCode).toBe(409);
+      expect(JSON.parse(res.body)).toEqual({ error: "already_terminal", status: "rejected" });
+    });
+  });
+
+  describe("POST /api/review-fix/attempts/:attemptId/adopt", () => {
+    it("answers 400 and never calls the facade when the body is missing the execution reference", async () => {
+      const token = await login("secret");
+      const called = vi.fn();
+      const res = await requestWithDeps(
+        "/api/review-fix/attempts/attempt-1/adopt",
+        "POST",
+        token,
+        { reviewFixAttempts: fakeFacade({ adopt: async () => { called(); return { status: "accepted" }; } }) },
+        {},
+      );
+      expect(res.statusCode).toBe(400);
+      expect(called).not.toHaveBeenCalled();
+    });
+
+    it("answers 400 on malformed JSON, never calling the facade", async () => {
+      const token = await login("secret");
+      const called = vi.fn();
+      const req = new MockRequest("/api/review-fix/attempts/attempt-1/adopt", "POST", { authorization: `Bearer ${token}` }, "{not json");
+      const res = new MockResponse();
+      admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider), {
+        reviewFixAttempts: fakeFacade({ adopt: async () => { called(); return { status: "accepted" }; } }),
+      });
+      await res.done;
+      expect(res.statusCode).toBe(400);
+      expect(called).not.toHaveBeenCalled();
+    });
+
+    it("passes the caller-supplied execution reference to the facade and answers 202 on a verified match", async () => {
+      const token = await login("secret");
+      let capturedExecution: AdminModule.ReviewFixAttemptExecutionRef | undefined;
+      const res = await requestWithDeps(
+        "/api/review-fix/attempts/attempt-1/adopt",
+        "POST",
+        token,
+        { reviewFixAttempts: fakeFacade({ adopt: async (_id, execution) => { capturedExecution = execution; return { status: "accepted" }; } }) },
+        { githubRunId: "999", githubRunAttempt: 2 },
+      );
+      expect(res.statusCode).toBe(202);
+      expect(capturedExecution).toEqual({ githubRunId: "999", githubRunAttempt: 2 });
+    });
+
+    it("answers 422 and never flips ownership when the facade reports the execution unverified", async () => {
+      const token = await login("secret");
+      const res = await requestWithDeps(
+        "/api/review-fix/attempts/attempt-1/adopt",
+        "POST",
+        token,
+        { reviewFixAttempts: fakeFacade({ adopt: async () => ({ status: "unverified" }) }) },
+        { githubRunId: "999", githubRunAttempt: 2 },
+      );
+      expect(res.statusCode).toBe(422);
+      expect(JSON.parse(res.body)).toEqual({ error: "unverified", status: "unverified" });
+    });
+  });
+
+  describe("POST /api/review-fix/attempts/:attemptId/cancel", () => {
+    it("revokes authority before requesting cancellation, in that order", async () => {
+      const token = await login("secret");
+      const calls: string[] = [];
+      const res = await requestWithDeps(
+        "/api/review-fix/attempts/attempt-1/cancel",
+        "POST",
+        token,
+        {
+          reviewFixAttempts: fakeFacade({
+            revokeAuthority: async () => { calls.push("revoke"); return { status: "accepted" }; },
+            requestCancellation: async () => { calls.push("cancel"); return { status: "accepted" }; },
+          }),
+        },
+      );
+      expect(res.statusCode).toBe(202);
+      expect(calls).toEqual(["revoke", "cancel"]);
+    });
+
+    it("never requests cancellation when revoking authority is rejected, and surfaces the revoke outcome", async () => {
+      const token = await login("secret");
+      const calls: string[] = [];
+      const res = await requestWithDeps(
+        "/api/review-fix/attempts/attempt-1/cancel",
+        "POST",
+        token,
+        {
+          reviewFixAttempts: fakeFacade({
+            revokeAuthority: async () => { calls.push("revoke"); return { status: "rejected", reason: "already_terminal" }; },
+            requestCancellation: async () => { calls.push("cancel"); return { status: "accepted" }; },
+          }),
+        },
+      );
+      expect(res.statusCode).toBe(409);
+      expect(JSON.parse(res.body)).toEqual({ error: "already_terminal", status: "rejected" });
+      expect(calls).toEqual(["revoke"]);
+    });
+
+    it("never requests cancellation when revoking authority finds no such attempt", async () => {
+      const token = await login("secret");
+      const calls: string[] = [];
+      const res = await requestWithDeps(
+        "/api/review-fix/attempts/attempt-1/cancel",
+        "POST",
+        token,
+        {
+          reviewFixAttempts: fakeFacade({
+            revokeAuthority: async () => { calls.push("revoke"); return { status: "not_found" }; },
+            requestCancellation: async () => { calls.push("cancel"); return { status: "accepted" }; },
+          }),
+        },
+      );
+      expect(res.statusCode).toBe(404);
+      expect(calls).toEqual(["revoke"]);
+    });
+
+    it("surfaces requestCancellation's durable-acceptance outcome when Restate is unavailable at that step", async () => {
+      const token = await login("secret");
+      const calls: string[] = [];
+      const res = await requestWithDeps(
+        "/api/review-fix/attempts/attempt-1/cancel",
+        "POST",
+        token,
+        {
+          reviewFixAttempts: fakeFacade({
+            revokeAuthority: async () => { calls.push("revoke"); return { status: "accepted" }; },
+            requestCancellation: async () => { calls.push("cancel"); return { status: "unavailable" }; },
+          }),
+        },
+      );
+      expect(res.statusCode).toBe(202);
+      expect(JSON.parse(res.body).status).toBe("durable-accepted");
+      expect(calls).toEqual(["revoke", "cancel"]);
+    });
+  });
+});
+
 describe("GET /api/deployment-status", () => {
   // The page reads this once per poll; every field it renders comes from here, so the
   // route is tested for shape and passthrough rather than for the values themselves.
