@@ -684,13 +684,22 @@ export class ClaudeCliExecutor implements LLMExecutor {
           ...(signal ? { signal } : {}),
         });
 
-      proc.stdin.on("error", (err) => {
-        // EPIPE here means the child exited (or is exiting) before consuming the
-        // prompt — but the child may still be alive at this instant. Kill it and
-        // wait for `close` before rejecting (escalating to SIGKILL after 5s if it
-        // hasn't exited), so `invoke`'s retry rail never spawns a second `claude`
-        // into the same workspace while this one is still running.
-        //
+      // EPIPE here means the child exited (or is exiting) before consuming the
+      // prompt — but the child may still be alive at this instant. Kill it and
+      // wait for `close` before rejecting (escalating to SIGKILL after 5s if it
+      // hasn't exited), so `invoke`'s retry rail never spawns a second `claude`
+      // into the same workspace while this one is still running.
+      //
+      // Named (not inline in `.on("error", ...)`) so the same handling also
+      // covers a *synchronous* EPIPE thrown directly out of `proc.stdin.end()`
+      // below — observed for a child that exits (closing its end of the stdin
+      // pipe) before the write is dispatched: Node's stream internals can
+      // complete that write synchronously and throw rather than emitting
+      // `error` on a later tick. An uncaught throw there would abort this
+      // Promise executor immediately, skipping every registration below
+      // (`close`, `stdout`/`stderr` data, the second `proc.on("error")`) and
+      // discarding a child that may otherwise have completed successfully.
+      const handleStdinFailure = (err: unknown): void => {
         // Guarded on `settled` too: if `close` or `proc.on("error")` already settled
         // this attempt (e.g. both fire for the same underlying failure), this handler
         // must not call `proc.kill()` or arm a SIGKILL timer that nothing will ever
@@ -762,8 +771,16 @@ export class ClaudeCliExecutor implements LLMExecutor {
           killProcessGroup(proc, "SIGKILL");
         }, 5000);
         killProcessGroup(proc, "SIGTERM");
-      });
-      proc.stdin.end(params.prompt);
+      };
+      proc.stdin.on("error", handleStdinFailure);
+      try {
+        proc.stdin.end(params.prompt);
+      } catch (err) {
+        // See `handleStdinFailure`'s doc comment — a synchronous EPIPE from this
+        // call must be routed through the same graceful path as the async
+        // `error` event, not left to abort this Promise executor.
+        handleStdinFailure(err);
+      }
 
       const handleLine = (line: string) => {
         const event = parseLine(line);

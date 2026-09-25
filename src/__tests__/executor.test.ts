@@ -106,6 +106,7 @@ function installEnvironmentRecordingClaude(): void {
     usage: { input_tokens: 1, output_tokens: 1 },
   });
   const script = `#!/usr/bin/env bash
+cat > /dev/null
 printf '%s\n' "\${GITHUB_TOKEN-unset}" > "${binDir}/github-token.txt"
 printf '%s\n' "\${GH_TOKEN-unset}" > "${binDir}/gh-token.txt"
 printf '%s\n' "\${GH_ENTERPRISE_TOKEN-unset}" > "${binDir}/gh-enterprise-token.txt"
@@ -134,6 +135,7 @@ function installForwardedSecretRecordingClaude(): void {
     usage: { input_tokens: 1, output_tokens: 1 },
   });
   const script = `#!/usr/bin/env bash
+cat > /dev/null
 printf '%s\n' "\${QA_BASE_URL-unset}" > "${binDir}/qa-base-url.txt"
 printf '%s\n' "\${QA_TOKEN-unset}" > "${binDir}/qa-token.txt"
 printf '%s\n' "\${AI_IMPLEMENT_FORWARDED_SECRETS-unset}" > "${binDir}/ai-implement-forwarded-secrets.txt"
@@ -156,6 +158,7 @@ function installModelCredentialRecordingClaude(): void {
     usage: { input_tokens: 1, output_tokens: 1 },
   });
   const script = `#!/usr/bin/env bash
+cat > /dev/null
 printf '%s\n' "\${ANTHROPIC_API_KEY-unset}" > "${binDir}/anthropic-api-key.txt"
 printf '%s\n' "\${CLAUDE_CODE_OAUTH_TOKEN-unset}" > "${binDir}/claude-oauth-token.txt"
 printf '%s\n' '${resultLine}'
@@ -559,6 +562,53 @@ describe.skipIf(isWindows)("ClaudeCliExecutor", () => {
     const failure = (err as Error & { failure?: { category?: string; code?: string } }).failure;
     expect(failure?.category).toBe("transient");
     expect(failure?.code).toBe("PROCESS_SPAWN_FAILED");
+  });
+
+  it("preserves telemetry collected before a synchronous EPIPE thrown directly out of stdin.end() (AII-798 gap-fill regression)", async () => {
+    // Node's stream internals can complete `proc.stdin.end()`'s write synchronously
+    // and throw rather than emitting `error` on a later tick — observed for a real
+    // child that exits (closing its end of the stdin pipe) before the write is
+    // dispatched. Before this fix, an uncaught throw there aborted the whole
+    // `spawnOnce` Promise executor immediately, skipping every handler registered
+    // after `.end()` (close, stdout data) — so the child was never killed and
+    // whatever it had already printed to stdout (asserted below via telemetry)
+    // was silently dropped instead of folded in via the graceful stdin-failure
+    // path the async-EPIPE tests above exercise.
+    const EPIPE_RESULT_LINE = JSON.stringify({
+      type: "result",
+      subtype: "error_during_execution",
+      is_error: true,
+      num_turns: 3,
+      duration_ms: 2000,
+      total_cost_usd: 0.05,
+      usage: { input_tokens: 50, output_tokens: 10 },
+    });
+    const proc = new EventEmitter() as unknown as ChildProcessWithoutNullStreams;
+    const stdin = new EventEmitter() as unknown as ChildProcessWithoutNullStreams["stdin"];
+    (stdin as unknown as { end: (s: string) => void }).end = () => {
+      throw Object.assign(new Error("write EPIPE"), { code: "EPIPE" });
+    };
+    Object.assign(proc, { stdin, stdout: new EventEmitter(), stderr: new EventEmitter() });
+    (proc as unknown as { kill: (signal?: NodeJS.Signals | number) => boolean }).kill = (() => {
+      setImmediate(() => proc.emit("close", 1, null));
+      return true;
+    }) as ChildProcessWithoutNullStreams["kill"];
+    // The result event arrives on stdout right after the synchronous EPIPE —
+    // reaching `events` requires the `stdout.on("data", ...)` listener normally
+    // registered just after `proc.stdin.end()` to have actually been set up.
+    setImmediate(() => {
+      (proc.stdout as unknown as EventEmitter).emit("data", Buffer.from(`${EPIPE_RESULT_LINE}\n`));
+    });
+
+    const spawnImpl = () => proc;
+    const err = await new ClaudeCliExecutor("/tmp", "summary", false, spawnImpl as unknown as typeof spawn)
+      .invoke({ prompt: "p", model: "m" })
+      .catch((e: unknown) => e);
+    expect(err).toMatchObject({ code: "EPIPE" });
+    const telemetry = (err as Error & { telemetry?: { tokensIn?: number; tokensOut?: number; numTurns?: number } }).telemetry;
+    expect(telemetry?.tokensIn).toBe(50);
+    expect(telemetry?.tokensOut).toBe(10);
+    expect(telemetry?.numTurns).toBe(3);
   });
 
   it("rejects on non-EPIPE stdin write error once the killed child closes, classified as a non-transient spawn failure", async () => {
