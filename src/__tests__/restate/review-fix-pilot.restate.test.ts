@@ -766,10 +766,24 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     const attemptId = latestAttemptRow(fixture.scope)!.attemptId;
     fixture.attemptId = attemptId;
     fixtureByAttempt.set(attemptId, fixture);
-    // Same reasoning as the uncertain-launch scenario above: the coordinator already
-    // dispatched "run"; attach to that invocation rather than starting a second one.
-    const done = await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", attemptId);
-    expect(done).toEqual({ status: "launch_rejected" });
+    // Rejection can finish before this test observes the committed admission;
+    // Restate no longer has an attachable invocation then. The recorded terminal
+    // result and released reservation are the durable effects that matter here.
+    await until(() => {
+      const row = getDb().prepare(`SELECT terminal_outcome_json FROM review_fix_attempts WHERE attempt_id = ?`)
+        .get(attemptId) as { terminal_outcome_json: string | null };
+      return row.terminal_outcome_json !== null;
+    }, 8_000);
+    const terminal = getDb().prepare(`SELECT terminal_outcome_json FROM review_fix_attempts WHERE attempt_id = ?`)
+      .get(attemptId) as { terminal_outcome_json: string };
+    expect(JSON.parse(terminal.terminal_outcome_json)).toMatchObject({
+      terminal: { status: "failed", reason: "workflow file not found" },
+    });
+    await until(() => {
+      const row = getDb().prepare(`SELECT released_at FROM dispatch_admissions WHERE dispatch_id = ?`)
+        .get(attemptId) as { released_at: number | null };
+      return row.released_at !== null;
+    }, 8_000);
     const released = getDb().prepare(`SELECT released_at FROM dispatch_admissions WHERE dispatch_id = ?`).get(attemptId) as { released_at: number | null };
     expect(released.released_at).not.toBeNull();
     expect(budgetEntryCount(fixture.scope.repository, fixture.scope.prNumber)).toBe(1);
