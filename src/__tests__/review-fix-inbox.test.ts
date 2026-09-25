@@ -238,6 +238,16 @@ describe("acceptDelivery", () => {
 });
 
 describe("claimDeliveries", () => {
+  it("leaves feedback queued while claiming completion deliveries during a deploy drain", () => {
+    let order = 0;
+    for (const [deliveryId, kind] of [["feedback-1", "feedback"], ["result-1", "result"], ["cancel-1", "cancellation"]] as const) {
+      inbox.acceptDelivery({ authenticatedSource: "github", deliveryId, kind, destination: makeDestination(), payload: { attemptId: "a-1" } });
+      dedup.getDb().prepare("UPDATE review_fix_inbox SET accepted_at = ? WHERE event_id = ?").run(++order, deliveryId);
+    }
+    const completion = inbox.claimDeliveries({ now: Date.now(), completionOnly: true });
+    expect(completion.map((delivery) => delivery.deliveryId)).toEqual(["result-1", "cancel-1"]);
+    expect(inbox.claimDeliveries({ now: Date.now() }).map((delivery) => delivery.deliveryId)).toEqual(["feedback-1"]);
+  });
   it("leases a delivery claim recoverable after a crash, retrying the same destination identity", () => {
     const destination = makeDestination();
     inbox.acceptDelivery({

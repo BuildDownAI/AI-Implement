@@ -140,6 +140,39 @@ describe("reviewFixDeliveryIdempotencyKey", () => {
 });
 
 describe("ReviewFixDeliveryPump — mark-delivered only on acceptance", () => {
+  it("claims only completion events while deploy admission is closed", async () => {
+    let admissionOpen = false;
+    const claim = vi.fn(() => []);
+    const pump = new client.ReviewFixDeliveryPump({ claim, permitsNewFeedback: () => admissionOpen, now: () => 1_000 });
+    await pump.tick();
+    expect(claim).toHaveBeenLastCalledWith(expect.objectContaining({ completionOnly: true }));
+    admissionOpen = true;
+    await pump.tick();
+    expect(claim).toHaveBeenLastCalledWith(expect.objectContaining({ completionOnly: false }));
+  });
+
+  it("delivers cancellation during a real deploy hold and resumes queued feedback afterward", async () => {
+    const { initSettingsTable } = await import("../runner-mode.js");
+    const { setDeployHold, clearDeployHold } = await import("../deploy-hold.js");
+    initSettingsTable();
+    const destination = makeDestination();
+    inbox.acceptDelivery({ authenticatedSource: "github", deliveryId: "feedback-held", kind: "feedback", destination, payload: {} });
+    inbox.acceptDelivery({ authenticatedSource: "github", deliveryId: "cancel-live", kind: "cancellation", destination, payload: { attemptId: "attempt-1" } });
+    const facade = makeFakeFacade();
+    const pump = new client.ReviewFixDeliveryPump({ facade, now: () => 1_000 });
+    setDeployHold();
+    try {
+      expect(await pump.tick()).toBe(1);
+      expect(facade.deliverFeedback).not.toHaveBeenCalled();
+      expect(facade.deliverCancel).toHaveBeenCalledTimes(1);
+      expect(inbox.getDelivery("github", "feedback-held")?.deliveryState).toBe("pending");
+    } finally {
+      clearDeployHold();
+    }
+    expect(await pump.tick()).toBe(1);
+    expect(facade.deliverFeedback).toHaveBeenCalledTimes(1);
+    expect(inbox.getDelivery("github", "feedback-held")?.deliveryState).toBe("delivered");
+  });
   it("never acks when the facade reports unavailable, leaving the row claimed", async () => {
     const destination = makeDestination();
     inbox.acceptDelivery({
@@ -309,6 +342,26 @@ describe("ReviewFixDeliveryPump — drain pause", () => {
 });
 
 describe("ReviewFixDeliveryPump — barrier re-check mid-batch", () => {
+  it("finishes cancellation but starts no new feedback after the deploy hold begins", async () => {
+    const destination = makeDestination();
+    for (const [index, deliveryId, kind] of [[1, "feedback-a", "feedback"], [2, "feedback-b", "feedback"], [3, "cancel-c", "cancellation"]] as const) {
+      inbox.acceptDelivery({ authenticatedSource: "github", deliveryId, kind, destination, payload: { attemptId: "attempt-1" } });
+      dedup.getDb().prepare("UPDATE review_fix_inbox SET accepted_at = ? WHERE event_id = ?").run(index, deliveryId);
+    }
+    let admissionOpen = true;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const deliverFeedback = vi.fn(async () => { await gate; return { status: "accepted" } as const; });
+    const deliverCancel = vi.fn(async () => ({ status: "accepted" }) as const);
+    const pump = new client.ReviewFixDeliveryPump({ facade: makeFakeFacade({ deliverFeedback, deliverCancel }), permitsNewFeedback: () => admissionOpen, now: () => 1_000 });
+    const pending = pump.tick();
+    admissionOpen = false;
+    release();
+    expect(await pending).toBe(2);
+    expect(deliverFeedback).toHaveBeenCalledTimes(1);
+    expect(deliverCancel).toHaveBeenCalledTimes(1);
+    expect(inbox.getDelivery("github", "feedback-b")).toMatchObject({ deliveryState: "pending", retryAt: 6_000 });
+  });
   // Regression for a stop()/pause() called while a multi-row batch is still awaiting its
   // first endpoint call: without a re-check before every row, the in-flight tick would
   // keep initiating endpoint calls for the rest of the claimed batch even after the

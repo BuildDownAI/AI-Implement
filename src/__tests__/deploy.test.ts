@@ -3,8 +3,16 @@ import os from "node:os";
 import path from "node:path";
 import { readFileSync } from "node:fs";
 import type * as DeployModule from "../deploy.js";
+import { RestateDrainCoordinator } from "../restate/drain.js";
 
 let deploy: typeof DeployModule;
+
+const DRAINED_PROBES = {
+  oldDeploymentInvocations: async () => 0,
+  unresolvedLaunches: async () => 0,
+  unresolvedTerminations: async () => 0,
+  activeOwners: async () => 0,
+};
 
 beforeEach(async () => {
   vi.resetModules();
@@ -157,12 +165,38 @@ describe("drainPollMs", () => {
   });
 });
 
+describe("endpoint drain barrier", () => {
+  function coordinator(invocations: () => Promise<number | null>) {
+    return new RestateDrainCoordinator({
+      oldDeploymentInvocations: invocations,
+      unresolvedLaunches: async () => 0,
+      unresolvedTerminations: async () => 0,
+      activeOwners: async () => 0,
+    });
+  }
+
+  it("refuses a quiet dispatch log when the old endpoint is unknown", async () => {
+    const drain = coordinator(async () => null);
+    drain.begin();
+    await expect(deploy.waitForQuiet(0, 1, drain, () => [])).rejects.toThrow(/did not drain/);
+  });
+
+  it("waits for old-deployment invocations separately from runner occupancy", async () => {
+    let count = 1;
+    const drain = coordinator(async () => count-- > 0 ? 1 : 0);
+    drain.begin();
+    await deploy.waitForQuiet(1000, 1, drain, () => []);
+    expect(drain.snapshot().state).toBe("drained");
+  });
+});
+
 describe("makeStartDeploy", () => {
   const configured = {
     flyDeployToken: "fly-token",
     flyOrchestratorApp: "orchestrator",
     selfDeployTarget: { owner: "Owner", repo: "Repo", branch: "testing", runningCommit: "abc" },
     pollIntervalMs: 60_000,
+    restateDrainProbes: DRAINED_PROBES,
     githubAppId: "1",
     githubAppPrivateKey: "key",
     kgSourceRepo: "BuildDownAI/knowledge-graph-ai-implement",
@@ -335,6 +369,7 @@ describe("makeStartDeploy onBuildFailure callback", () => {
       githubAppPrivateKey: "key",
       kgSourceRepo: null,
       onBuildFailure,
+      restateDrainProbes: DRAINED_PROBES,
     })!;
 
     const result = await start();
@@ -360,6 +395,7 @@ describe("makeStartDeploy onBuildFailure callback", () => {
       githubAppPrivateKey: "key",
       kgSourceRepo: "BuildDownAI/knowledge-graph-ai-implement",
       onBuildFailure,
+      restateDrainProbes: DRAINED_PROBES,
     })!;
 
     const result = await start();
@@ -416,6 +452,7 @@ describe("makeStartDeploy — public mode (no App installation on source owner)"
       githubAppPrivateKey: "key",
       kgSourceRepo: null,
       onBuildFailure: vi.fn(),
+      restateDrainProbes: DRAINED_PROBES,
     })!;
 
     const result = await start();
@@ -441,6 +478,7 @@ describe("makeStartDeploy — public mode (no App installation on source owner)"
       githubAppPrivateKey: "key",
       kgSourceRepo: null,
       onBuildFailure,
+      restateDrainProbes: DRAINED_PROBES,
     })!;
 
     const result = await start();

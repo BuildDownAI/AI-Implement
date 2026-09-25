@@ -1,5 +1,6 @@
 import { getInFlightJobs } from "./log.js";
 import { countRunningWorkflowSyncs } from "./workflow-sync-queue.js";
+import { getDb } from "./dedup.js";
 
 /** A category of work executing right now. Callers render or count it. */
 export interface InFlightWork {
@@ -11,9 +12,9 @@ export interface InFlightWork {
  * Everything currently executing — not everything queued. Queued work is durable
  * and resumes in the next process, so it belongs to no caller's blocking set.
  *
- * Every dispatch surface writes a dispatch_log row, so in-flight jobs cover issue
- * dispatch, review fixes and gap-fills alike; workflow sync is the one worker that
- * executes outside that table.
+ * Active reservations remain occupied through uncertain launch or termination,
+ * even when no live dispatch_log row exists. Legacy rows without a reservation
+ * remain visible; matching rows count only once.
  *
  * An empty array means nothing is executing.
  */
@@ -21,7 +22,13 @@ export function getInFlightWork(): InFlightWork[] {
   const work: InFlightWork[] = [];
 
   const allJobs = getInFlightJobs();
-  const runnerJobs = allJobs.filter((j) => j.phase !== "kg-refresh").length;
+  const activeReservations = getDb().prepare(
+    "SELECT dispatch_id FROM dispatch_admissions WHERE released_at IS NULL AND phase != 'kg-refresh'",
+  ).all() as Array<{ dispatch_id: string }>;
+  const reservedIds = new Set(activeReservations.map((row) => row.dispatch_id));
+  const runnerJobs = activeReservations.length + allJobs.filter(
+    (j) => j.phase !== "kg-refresh" && (!j.dispatchId || !reservedIds.has(j.dispatchId)),
+  ).length;
   const kgRefreshJobs = allJobs.filter((j) => j.phase === "kg-refresh").length;
 
   if (runnerJobs > 0) work.push({ kind: "runner-job", count: runnerJobs });

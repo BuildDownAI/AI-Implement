@@ -27,6 +27,7 @@ import { getEffectiveAllowlist, matchAccessEntry } from "../access-entries.js";
 import { recordAuthEvent, resolveClientPath, type AuthEventCause } from "../mcp-auth-events.js";
 import type { DescribeOutcome, IssueInput, IssueOutcome, RefreshAuthority, RefreshInput, RefreshOutcome } from "../mcp-identity.js";
 import { RESTATE_INGRESS_BIND_ADDRESS } from "./server.js";
+import { isDeployHeld } from "../deploy-hold.js";
 
 /** One tick past this and a presentation of the previous (just-rotated-away) hash is treated as replay. */
 export const GRACE_MS = 30_000;
@@ -242,6 +243,8 @@ export interface RestateRefreshAuthorityOptions {
   /** Defaults to the real ingress (127.0.0.1:8081, AII-627). Overridable for tests. */
   ingressBaseUrl?: string;
   fetchImpl?: typeof fetch;
+  /** Shared deploy drain admission check; injectable for deterministic tests. */
+  permitsExternalCall?: () => boolean;
   /** The access token's TTL, minted here in SQLite alongside a successful rotation. */
   accessTokenTtlMs: number;
 }
@@ -255,14 +258,17 @@ export class RestateRefreshAuthority implements RefreshAuthority {
   private readonly baseUrl: string;
   private readonly fetchImpl: typeof fetch;
   private readonly accessTokenTtlMs: number;
+  private readonly permitsExternalCall: () => boolean;
 
   constructor(options: RestateRefreshAuthorityOptions) {
     this.baseUrl = options.ingressBaseUrl ?? `http://${RESTATE_INGRESS_BIND_ADDRESS}`;
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.accessTokenTtlMs = options.accessTokenTtlMs;
+    this.permitsExternalCall = options.permitsExternalCall ?? (() => !isDeployHeld());
   }
 
   private async invoke<T>(clientId: string, handler: string, body: unknown): Promise<T | "unavailable"> {
+    if (!this.permitsExternalCall()) return "unavailable";
     let response: Response;
     try {
       response = await this.fetchImpl(`${this.baseUrl}/Operator/${encodeURIComponent(clientId)}/${handler}`, {

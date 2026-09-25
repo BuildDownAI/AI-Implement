@@ -49,6 +49,7 @@
  */
 import { createHash } from "node:crypto";
 import { getDb } from "./dedup.js";
+import { isDeployHeld } from "./deploy-hold.js";
 import { getMappings, resolvePrDispatchBudget, type RepoMapping } from "./config.js";
 import { acceptDelivery } from "./review-fix-inbox.js";
 import {
@@ -191,6 +192,9 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
       const { dispatchId, replay } = resolveDispatchId(db, base);
       if (replay) {
         return { status: "prepared", attempt: toPrepared(replay) };
+      }
+      if (isDeployHeld()) {
+        return { status: "deferred", reason: "paused" };
       }
 
       const mappingEntry = findMappingEntry(request.scope.repository);
