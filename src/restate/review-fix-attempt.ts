@@ -279,7 +279,6 @@ export function createReviewFixAttempt(deps: ReviewFixAttemptDependencies) {
     handlers: {
       run: restate.handlers.workflow.workflow({
         journalRetention: REVIEW_FIX_RETENTION_MS,
-        idempotencyRetention: REVIEW_FIX_RETENTION_MS,
       }, run),
       result: restate.handlers.workflow.shared({
         journalRetention: REVIEW_FIX_RETENTION_MS,
