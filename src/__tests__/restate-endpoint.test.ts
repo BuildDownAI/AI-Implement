@@ -252,6 +252,8 @@ describe("queryNonCompletedInvocations", () => {
     const body = JSON.parse(init.body as string) as { query: string };
     expect(body.query).toContain("http://127.0.0.1:9080");
     expect(body.query).toContain("status != 'completed'");
+    expect(body.query).toContain("last_attempt_deployment_id");
+    expect(body.query).toContain("target_service_name IN (SELECT name FROM sys_service");
   });
 
   it("resolves 0 when the query returns no matching deployment (nothing registered yet at that URI)", async () => {

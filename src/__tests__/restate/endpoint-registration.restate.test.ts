@@ -14,20 +14,51 @@ import { RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { queryNonCompletedInvocations } from "../../restate/endpoint.js";
 import { operatorObject } from "../../restate/operator-object.js";
-import { VARIANTS, callObject, callService, startVariants, stopAll } from "./harness.js";
+import { VARIANTS, callObject, startVariants, stopAll } from "./harness.js";
 
-// A durable, never-resolved awakeable: the invocation that calls this suspends and stays
-// pending for the life of the test, giving the drain check a real non-completed invocation
-// to find. Mirrors harness.restate.test.ts's own never-resolved-promise probe, but with no
-// `.orTimeout` — this one is meant to stay suspended, not time out.
-const hangingTool = restate.service({
-  name: "hangingTool",
+// An exclusive handler held on an awakeable leaves a second handler on the same key
+// queued before dispatch. In pinned Restate 1.7.10 the first has only
+// last_attempt_deployment_id; the second has neither deployment ID yet.
+const drainProbe = restate.object({
+  name: "DrainProbeTest",
   handlers: {
-    hang: async (ctx: restate.Context): Promise<void> => {
+    block: async (ctx: restate.ObjectContext): Promise<void> => {
       await ctx.awakeable<never>().promise;
     },
+    follow: async (_ctx: restate.ObjectContext): Promise<string> => "followed",
   },
 });
+
+interface InvocationRow {
+  status: string;
+  pinned_deployment_id?: string;
+  last_attempt_deployment_id?: string;
+}
+
+async function waitForInvocation(
+  adminBaseUrl: string,
+  key: string,
+  handler: "block" | "follow",
+  status: "running" | "pending",
+): Promise<InvocationRow> {
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    const response = await fetch(`${adminBaseUrl}/query`, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json" },
+      body: JSON.stringify({
+        query: `SELECT status, pinned_deployment_id, last_attempt_deployment_id FROM sys_invocation WHERE target_service_name = 'DrainProbeTest' AND target_service_key = '${key}' AND target_handler_name = '${handler}'`,
+      }),
+    });
+    if (!response.ok) throw new Error(`POST /query failed: HTTP ${response.status}`);
+    const body = (await response.json()) as { rows: InvocationRow[] };
+    const row = body.rows.find((candidate) =>
+      candidate.status === status && (handler === "follow" || !!candidate.last_attempt_deployment_id));
+    if (row) return row;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(`DrainProbeTest/${key}/${handler} did not reach ${status}`);
+}
 
 interface DeploymentsResponse {
   deployments: Array<{ id: string; uri?: string }>;
@@ -53,7 +84,7 @@ describe("queryNonCompletedInvocations against a real pinned 1.7.10 admin API (A
   let environments: Map<string, RestateTestEnvironment>;
 
   beforeAll(async () => {
-    environments = await startVariants([operatorObject, hangingTool]);
+    environments = await startVariants([operatorObject, drainProbe]);
   }, 60_000);
 
   afterAll(async () => {
@@ -99,22 +130,27 @@ describe("queryNonCompletedInvocations against a real pinned 1.7.10 admin API (A
   );
 
   it.each(VARIANTS.map(([label]) => label))(
-    "a suspended invocation pinned to the deployment counts as non-completed (%s)",
+    "a suspended running invocation and a queued exclusive invocation both block drain (%s)",
     async (label) => {
       const env = environments.get(label);
       if (!env) throw new Error(`environment "${label}" did not start`);
       const uri = await registeredDeploymentUri(env.adminAPIBaseUrl());
+      const key = randomUUID();
 
-      // Fire-and-forget: the ingress call blocks on the handler's response, and the
-      // handler never returns one (its awakeable never resolves), so this promise is left
-      // dangling on purpose. The invocation itself is admitted, journaled, and suspended
-      // well before the container is torn down in afterAll.
-      void callService(env.baseUrl(), "hangingTool", "hang", {}).catch(() => {});
-      await new Promise((resolve) => setTimeout(resolve, 1_000));
+      // The first call never settles; wait for a real engine status instead of a fixed
+      // sleep, then assert the observed deployment identity before checking the count.
+      void callObject(env.baseUrl(), "DrainProbeTest", key, "block", {}).catch(() => {});
+      const running = await waitForInvocation(env.adminAPIBaseUrl(), key, "block", "running");
+      expect(running.pinned_deployment_id).toBeUndefined();
+      expect(running.last_attempt_deployment_id).toBeTruthy();
+      expect(await queryNonCompletedInvocations(fetch, env.adminAPIBaseUrl(), uri)).toBe(1);
 
-      const count = await queryNonCompletedInvocations(fetch, env.adminAPIBaseUrl(), uri);
-
-      expect(count).toBeGreaterThan(0);
+      void callObject(env.baseUrl(), "DrainProbeTest", key, "follow", {}).catch(() => {});
+      const queued = await waitForInvocation(env.adminAPIBaseUrl(), key, "follow", "pending");
+      expect(queued.pinned_deployment_id).toBeUndefined();
+      expect(queued.last_attempt_deployment_id).toBeUndefined();
+      expect(await queryNonCompletedInvocations(fetch, env.adminAPIBaseUrl(), uri)).toBe(2);
+      expect(await queryNonCompletedInvocations(fetch, env.adminAPIBaseUrl(), "http://127.0.0.1:1")).toBe(0);
     },
   );
 });

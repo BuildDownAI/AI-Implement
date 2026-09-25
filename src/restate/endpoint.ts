@@ -129,10 +129,12 @@ function sqlQuote(value: string): string {
  * devDependency) this production module has no business on.
  *
  * `sys_deployment.endpoint` holds the registered URI with a trailing slash this module's own
- * `uri` never carries, so both forms are matched. `sys_deployment.id` is the value
- * `sys_invocation.pinned_deployment_id` carries once an invocation is first dispatched to that
- * deployment; pinning survives suspension (an in-progress `ctx.sleep`, an unresolved `ctx.run`),
- * so a suspended invocation still counts, and `status != 'completed'` covers every other
+ * `uri` never carries, so both forms are matched. Restate 1.7.10 does not always set
+ * `pinned_deployment_id`: a running handler suspended on an awakeable has
+ * `last_attempt_deployment_id` instead, while an exclusive handler queued behind it has
+ * neither deployment ID yet. For that last case, `sys_service` maps its target service
+ * to the deployment currently serving it. Count all three forms, scoped to deployments
+ * registered at this URI. `status != 'completed'` covers every other
  * non-terminal state (pending, scheduled, ready, running, backing-off) with one comparison
  * rather than an enumerated allowlist. Persistent Virtual Object state lives in the separate
  * `state` table and never appears in `sys_invocation`, so it is never counted — durable state
@@ -150,11 +152,16 @@ export async function queryNonCompletedInvocations(
   try {
     const normalized = uri.replace(/\/+$/, "");
     const escaped = sqlQuote(normalized);
+    const oldDeployments =
+      `(SELECT id FROM sys_deployment WHERE endpoint = '${escaped}' OR endpoint = '${escaped}/')`;
     const rows = await runIntrospectionQuery(
       fetchImpl,
       adminBaseUrl,
-      "SELECT COUNT(*) AS count FROM sys_invocation WHERE status != 'completed' AND pinned_deployment_id IN " +
-        `(SELECT id FROM sys_deployment WHERE endpoint = '${escaped}' OR endpoint = '${escaped}/')`,
+      "SELECT COUNT(*) AS count FROM sys_invocation WHERE status != 'completed' AND (" +
+        `pinned_deployment_id IN ${oldDeployments} OR ` +
+        `last_attempt_deployment_id IN ${oldDeployments} OR ` +
+        "(pinned_deployment_id IS NULL AND last_attempt_deployment_id IS NULL AND " +
+        `target_service_name IN (SELECT name FROM sys_service WHERE deployment_id IN ${oldDeployments})))`,
     );
     const count = rows[0]?.count;
     return typeof count === "number" ? count : null;
