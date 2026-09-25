@@ -357,7 +357,13 @@ export class ReviewFixDeliveryPump {
         return toRouteOutcome(await this.facade.deliverFeedback(delivery.destination, idempotencyKey), "facade unavailable (sidecar unreachable or non-2xx response)");
       case "result": {
         const validated = validateReviewFixResultMetadata(delivery.payload);
-        if (!validated.ok) return { status: "invalid", reason: `invalid result metadata: ${validated.error}` };
+        // Deliberately a fixed, normalized reason — never `validated.error` — because
+        // that message can embed raw payload content (e.g. validateReviewFixMetadata's
+        // unsupported-version error interpolates the stored, attacker-controlled
+        // `version` field via JSON.stringify), and this string reaches console.warn via
+        // logDelivery(). The issue's secret-free observability requirement applies to
+        // every log line this module writes, not only the happy path.
+        if (!validated.ok) return { status: "invalid", reason: "invalid_result_metadata" };
         return toRouteOutcome(await this.facade.deliverResult(validated.value, idempotencyKey), "facade unavailable (sidecar unreachable or non-2xx response)");
       }
       case "cancellation": {

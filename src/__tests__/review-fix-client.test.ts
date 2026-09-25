@@ -411,6 +411,40 @@ describe("ReviewFixDeliveryPump — invalid payload vs. facade unavailable", () 
     expect(status.lastTickInvalid).toBe(0);
     expect(status.lastTickUnavailable).toBe(1);
   });
+
+  it("never logs a secret-shaped value from a malformed stored result's version field", async () => {
+    const destination = makeDestination();
+    const secret = "super-secret-token-value";
+    inbox.acceptDelivery({
+      authenticatedSource: "runner",
+      deliveryId: "evt-poison-version",
+      kind: "result",
+      destination,
+      // An unsupported version fails validateReviewFixMetadata, whose error message
+      // interpolates the raw `version` value via JSON.stringify — this must never reach
+      // a log line, even though the pump still needs to classify and reschedule it.
+      payload: { version: secret },
+    });
+
+    const facade = makeFakeFacade();
+    const pump = new client.ReviewFixDeliveryPump({ facade, now: () => 1_000, invalidRetryDelayMs: 60_000 });
+
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const delivered = await pump.tick();
+
+      expect(delivered).toBe(0);
+      expect(pump.status().lastTickInvalid).toBe(1);
+      expect(facade.deliverResult).not.toHaveBeenCalled();
+
+      const allLoggedText = [...logSpy.mock.calls, ...warnSpy.mock.calls].map((call) => call.join(" ")).join("\n");
+      expect(allLoggedText).not.toContain(secret);
+    } finally {
+      logSpy.mockRestore();
+      warnSpy.mockRestore();
+    }
+  });
 });
 
 describe("ReviewFixDeliveryPump — routing", () => {
