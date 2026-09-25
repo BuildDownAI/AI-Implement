@@ -42,6 +42,35 @@ vi.mock("../github-app-auth.js", async (importOriginal) => {
   };
 });
 
+// Backend-lifecycle mocks for the monitorJobs/startupReconciliation owner-fence
+// regression tests below (AII-812): these detect whether a legacy monitor ever
+// reaches into a Restate-owned job's backend, without making real Fly/Docker calls.
+const flyMachinesMocks = vi.hoisted(() => ({
+  createMachine: vi.fn(),
+  getMachine: vi.fn(),
+  listMachines: vi.fn(),
+  destroyMachine: vi.fn().mockResolvedValue(undefined),
+  generateSessionToken: vi.fn(),
+  generateMachineNonce: vi.fn(),
+  buildSessionMachineConfig: vi.fn(),
+  listAppSecrets: vi.fn(),
+  fetchMachineLogs: vi.fn().mockResolvedValue(""),
+  updateMachineMetadata: vi.fn().mockResolvedValue(undefined),
+  readMachineExitCode: vi.fn().mockReturnValue(null),
+}));
+
+vi.mock("../fly-machines.js", () => flyMachinesMocks);
+
+const localDockerMocks = vi.hoisted(() => ({
+  fetchLocalContainerLogs: vi.fn().mockResolvedValue(""),
+  inspectLocalContainer: vi.fn(),
+  removeLocalContainer: vi.fn().mockResolvedValue(undefined),
+  startLocalRunnerContainer: vi.fn(),
+  sweepExitedLocalContainers: vi.fn(),
+}));
+
+vi.mock("../local-docker.js", () => localDockerMocks);
+
 let dbPath: string;
 let dedup: typeof DedupModule;
 let log: typeof LogModule;
@@ -153,6 +182,12 @@ beforeEach(async () => {
     sessionToken: "session-token-1",
     runConfig: {} as never,
   });
+  flyMachinesMocks.destroyMachine.mockResolvedValue(undefined);
+  flyMachinesMocks.fetchMachineLogs.mockResolvedValue("");
+  flyMachinesMocks.updateMachineMetadata.mockResolvedValue(undefined);
+  flyMachinesMocks.readMachineExitCode.mockReturnValue(null);
+  localDockerMocks.removeLocalContainer.mockResolvedValue(undefined);
+  localDockerMocks.fetchLocalContainerLogs.mockResolvedValue("");
 
   stubOpenPrLookup();
 });
@@ -171,6 +206,8 @@ afterEach(() => {
   localGapfillMocks.dispatchLocalGapfill.mockReset();
   githubAppAuthMocks.getInstallationToken.mockReset();
   githubAppAuthMocks.getInstallationId.mockReset();
+  for (const mockFn of Object.values(flyMachinesMocks)) mockFn.mockReset();
+  for (const mockFn of Object.values(localDockerMocks)) mockFn.mockReset();
   trackerPostCommentMock.mockClear();
 });
 
@@ -1226,5 +1263,193 @@ describe("processReviewFixQueue — admission (AII-787)", () => {
 
     expect(localGapfillMocks.dispatchLocalGapfill).not.toHaveBeenCalled();
     expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(1);
+  });
+});
+
+// AII-812: after the owner-based switch (AII-811), a Restate-owned attempt must never be
+// timed out, destroyed, or finalized by a Legacy poller — the `isRestateOwnedJob` fence at
+// the top of monitorFlyMachineJob, monitorLocalDockerJob, and startupReconciliation is the
+// seam that keeps that true (AII-791) and must survive this issue's cleanup, per the
+// review that caught a prior attempt deleting it by mistake. These tests exercise both the
+// TTL/timeout branch and the "backend already reports terminal" branch of each monitor,
+// since only the second is not additionally covered by stuck-watchdog.ts's own internal
+// owner fence.
+describe("monitorJobs / startupReconciliation — Restate ownership fence (AII-791/AII-812)", () => {
+  function insertJob(input: {
+    dispatchId: string;
+    executionMode: "fly-machines" | "local-docker";
+    machineId: string;
+    status?: LogModule.JobStatus;
+    dispatchedAtMsAgo?: number;
+  }): number {
+    const jobId = log.appendLog({
+      issueId: `issue-${input.dispatchId}`,
+      issueIdentifier: "AII-90",
+      teamKey: "TEAM",
+      repo: "acme/billing",
+      dispatchId: input.dispatchId,
+      executionMode: input.executionMode,
+      machineId: input.machineId,
+      phase: "gap-analysis",
+      status: input.status ?? "running",
+    });
+    dedup.getDb()
+      .prepare("UPDATE dispatch_log SET dispatched_at = ? WHERE id = ?")
+      .run(Date.now() - (input.dispatchedAtMsAgo ?? 0), jobId);
+    return jobId;
+  }
+
+  function admitRestate(dispatchId: string, backend: "fly-machines" | "local-docker"): void {
+    const result = admission.acquire({
+      dispatchId,
+      mappingKey: "TEAM",
+      scope: { kind: "issue", issueScope: "review-fix", issueId: `issue-${dispatchId}` },
+      kind: "gap-fill",
+      backend,
+      lifecycleOwner: { kind: "restate", attemptId: `attempt-${dispatchId}` },
+      cap: 3,
+    });
+    expect(result.ok).toBe(true);
+  }
+
+  const SIXTY_FIVE_MIN_MS = 65 * 60 * 1000;
+
+  describe("monitorJobs", () => {
+    it("never destroys a Restate-owned Fly-machines job that looks timed out", async () => {
+      configModule.upsertMapping("TEAM", makeMapping({ executionMode: "fly-machines" }));
+      const jobId = insertJob({
+        dispatchId: "dispatch-restate-fly-ttl", executionMode: "fly-machines",
+        machineId: "machine-restate-ttl", dispatchedAtMsAgo: SIXTY_FIVE_MIN_MS,
+      });
+      admitRestate("dispatch-restate-fly-ttl", "fly-machines");
+      const flyConfig = { ...mockConfig, flySessionsToken: "fly-token", flySessionsApp: "fly-app" } as unknown as IndexModule.AppConfig;
+
+      await indexModule.monitorJobs(flyConfig, mockRegistry);
+
+      expect(flyMachinesMocks.destroyMachine).not.toHaveBeenCalled();
+      expect(flyMachinesMocks.getMachine).not.toHaveBeenCalled();
+      expect(log.getJobById(jobId)?.status).toBe("running");
+    });
+
+    it("never touches a Restate-owned Fly-machines job whose backend already reports stopped", async () => {
+      configModule.upsertMapping("TEAM", makeMapping({ executionMode: "fly-machines" }));
+      const jobId = insertJob({
+        dispatchId: "dispatch-restate-fly-done", executionMode: "fly-machines",
+        machineId: "machine-restate-done",
+      });
+      admitRestate("dispatch-restate-fly-done", "fly-machines");
+      flyMachinesMocks.getMachine.mockResolvedValue({
+        id: "machine-restate-done", name: "m", state: "stopped", region: "iad",
+        created_at: "", updated_at: "", config: { image: "x" },
+      });
+      const flyConfig = { ...mockConfig, flySessionsToken: "fly-token", flySessionsApp: "fly-app" } as unknown as IndexModule.AppConfig;
+
+      await indexModule.monitorJobs(flyConfig, mockRegistry);
+
+      // The fence returns before ever probing the machine's live state — a Legacy
+      // completion decided from a since-stale probe must never be possible.
+      expect(flyMachinesMocks.getMachine).not.toHaveBeenCalled();
+      expect(flyMachinesMocks.destroyMachine).not.toHaveBeenCalled();
+      expect(log.getJobById(jobId)?.status).toBe("running");
+    });
+
+    it("still destroys and finalizes a Legacy Fly-machines job that timed out (contrast)", async () => {
+      configModule.upsertMapping("TEAM", makeMapping({ executionMode: "fly-machines" }));
+      const jobId = insertJob({
+        dispatchId: "dispatch-legacy-fly-ttl", executionMode: "fly-machines",
+        machineId: "machine-legacy-ttl", dispatchedAtMsAgo: SIXTY_FIVE_MIN_MS,
+      });
+      // No admission row: isRestateOwnedJob reads this the same as any historical
+      // Legacy dispatch that never went through acquireDispatch.
+      const flyConfig = { ...mockConfig, flySessionsToken: "fly-token", flySessionsApp: "fly-app" } as unknown as IndexModule.AppConfig;
+
+      await indexModule.monitorJobs(flyConfig, mockRegistry);
+
+      expect(flyMachinesMocks.destroyMachine).toHaveBeenCalledWith("fly-token", "fly-app", "machine-legacy-ttl");
+      expect(log.getJobById(jobId)?.status).toBe("timed_out");
+    });
+
+    it("never destroys a Restate-owned local-docker job that looks timed out", async () => {
+      // Note: "local-docker" is a job-row execution mode, not a RepoMapping.executionMode
+      // value — it's selected via RUNNER_MODE=local (set in beforeEach), not the mapping.
+      configModule.upsertMapping("TEAM", makeMapping());
+      const jobId = insertJob({
+        dispatchId: "dispatch-restate-local-ttl", executionMode: "local-docker",
+        machineId: "container-restate-ttl", dispatchedAtMsAgo: SIXTY_FIVE_MIN_MS,
+      });
+      admitRestate("dispatch-restate-local-ttl", "local-docker");
+
+      await indexModule.monitorJobs(mockConfig, mockRegistry);
+
+      expect(localDockerMocks.removeLocalContainer).not.toHaveBeenCalled();
+      expect(localDockerMocks.inspectLocalContainer).not.toHaveBeenCalled();
+      expect(log.getJobById(jobId)?.status).toBe("running");
+    });
+
+    it("never touches a Restate-owned local-docker job whose container already exited", async () => {
+      configModule.upsertMapping("TEAM", makeMapping());
+      const jobId = insertJob({
+        dispatchId: "dispatch-restate-local-done", executionMode: "local-docker",
+        machineId: "container-restate-done",
+      });
+      admitRestate("dispatch-restate-local-done", "local-docker");
+      localDockerMocks.inspectLocalContainer.mockResolvedValue({ running: false, exitCode: 0 });
+
+      await indexModule.monitorJobs(mockConfig, mockRegistry);
+
+      expect(localDockerMocks.inspectLocalContainer).not.toHaveBeenCalled();
+      expect(localDockerMocks.removeLocalContainer).not.toHaveBeenCalled();
+      expect(log.getJobById(jobId)?.status).toBe("running");
+    });
+
+    it("still destroys and finalizes a Legacy local-docker job that timed out (contrast)", async () => {
+      configModule.upsertMapping("TEAM", makeMapping());
+      const jobId = insertJob({
+        dispatchId: "dispatch-legacy-local-ttl", executionMode: "local-docker",
+        machineId: "container-legacy-ttl", dispatchedAtMsAgo: SIXTY_FIVE_MIN_MS,
+      });
+
+      await indexModule.monitorJobs(mockConfig, mockRegistry);
+
+      expect(localDockerMocks.removeLocalContainer).toHaveBeenCalledWith("container-legacy-ttl");
+      expect(log.getJobById(jobId)?.status).toBe("timed_out");
+    });
+  });
+
+  describe("startupReconciliation", () => {
+    it("never destroys a Restate-owned machine even when its job row is terminal and the machine is still live", async () => {
+      configModule.upsertMapping("TEAM", makeMapping({ executionMode: "fly-machines" }));
+      insertJob({
+        dispatchId: "dispatch-restate-boot", executionMode: "fly-machines",
+        machineId: "machine-restate-boot", status: "completed",
+      });
+      admitRestate("dispatch-restate-boot", "fly-machines");
+      flyMachinesMocks.listMachines.mockResolvedValue([
+        { id: "machine-restate-boot", name: "m", state: "started", region: "iad",
+          created_at: "", updated_at: "", config: { image: "x" } },
+      ]);
+      const flyConfig = { ...mockConfig, flySessionsToken: "fly-token", flySessionsApp: "fly-app" } as unknown as IndexModule.AppConfig;
+
+      await indexModule.startupReconciliation(flyConfig, mockRegistry);
+
+      expect(flyMachinesMocks.destroyMachine).not.toHaveBeenCalled();
+    });
+
+    it("still destroys a Legacy machine whose job row is terminal but the machine is still live (contrast)", async () => {
+      configModule.upsertMapping("TEAM", makeMapping({ executionMode: "fly-machines" }));
+      insertJob({
+        dispatchId: "dispatch-legacy-boot", executionMode: "fly-machines",
+        machineId: "machine-legacy-boot", status: "completed",
+      });
+      flyMachinesMocks.listMachines.mockResolvedValue([
+        { id: "machine-legacy-boot", name: "m", state: "started", region: "iad",
+          created_at: "", updated_at: "", config: { image: "x" } },
+      ]);
+      const flyConfig = { ...mockConfig, flySessionsToken: "fly-token", flySessionsApp: "fly-app" } as unknown as IndexModule.AppConfig;
+
+      await indexModule.startupReconciliation(flyConfig, mockRegistry);
+
+      expect(flyMachinesMocks.destroyMachine).toHaveBeenCalledWith("fly-token", "fly-app", "machine-legacy-boot");
+    });
   });
 });
