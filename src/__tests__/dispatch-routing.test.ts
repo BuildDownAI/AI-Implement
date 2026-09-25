@@ -937,3 +937,161 @@ describe("tryFastReleasePlanningAdmission — fast release path for the planning
     expect(localDocker.inspectLocalContainer).not.toHaveBeenCalled();
   });
 });
+
+// AII-783 gap-fill (third and final round, on PR #681): the planning_callback fast path
+// above usually catches a planning run's reservation before the poll loop's own
+// reconciliation gets a chance to — but operator_cancelled has no fast path at all, and a
+// planning_callback whose backend was still shutting down at fast-path time falls through
+// to here too. reconcileTerminalCallbackAdmissions is wired into the poll loop right next
+// to sweepStaleAdmissions (index.ts); this exercises it end-to-end through the real
+// confirmAdmissionTerminated oracle against the real dispatch_admissions/dispatch_log
+// tables, the same way the fast-path block above does.
+describe("reconcileTerminalCallbackAdmissions — per-poll reconciliation for terminal callback conclusions (AII-783 gap-fill, third round, on PR #681)", () => {
+  let dbPath: string;
+  let dedup: typeof DedupModule;
+  let dispatchAdmission: typeof import("../dispatch-admission.js");
+  let log: typeof import("../log.js");
+  let indexModule: typeof import("../index.js");
+  let localDocker: typeof import("../local-docker.js");
+
+  const config = { githubAppId: "id", githubAppPrivateKey: "key" } as unknown as AppConfig;
+
+  beforeEach(async () => {
+    vi.resetModules();
+    dbPath = path.join(
+      os.tmpdir(),
+      `terminal-callback-admission-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
+    );
+    process.env.DEDUP_DB_PATH = dbPath;
+    dedup = await import("../dedup.js");
+    dispatchAdmission = await import("../dispatch-admission.js");
+    log = await import("../log.js");
+    log.initLogTable();
+    localDocker = await import("../local-docker.js");
+    indexModule = await import("../index.js");
+    vi.mocked(localDocker.inspectLocalContainer).mockClear();
+  });
+
+  afterEach(() => {
+    dedup.closeDb();
+    try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+  });
+
+  function acquireLogAndFinalize(
+    dispatchId: string,
+    issueId: string,
+    conclusion: "planning_callback" | "operator_cancelled",
+  ): void {
+    const admitted = dispatchAdmission.acquire({
+      dispatchId,
+      mappingKey: "AII",
+      scope: { kind: "issue", issueScope: "AII", issueId },
+      kind: conclusion === "planning_callback" ? "planning" : "implementation",
+      backend: "local-docker",
+      lifecycleOwner: { kind: "legacy" },
+      cap: 1,
+    });
+    expect(admitted.ok).toBe(true);
+    const jobId = log.appendLog({
+      issueId,
+      issueIdentifier: issueId,
+      issueTitle: "Issue",
+      teamKey: "AII",
+      repo: "o/r",
+      dispatchId,
+      executionMode: "local-docker",
+      phase: conclusion === "planning_callback" ? "planning" : "implementation",
+      machineId: "container-1",
+    });
+    const status = conclusion === "planning_callback" ? "completed" : "failed";
+    // Mirrors runner-callback.ts's own write: terminal status/conclusion, admission
+    // reservation deliberately left held for a monitor to confirm the backend is dead.
+    log.updateJobStatus(jobId, status, conclusion, undefined, { skipAdmissionRelease: true });
+  }
+
+  it("releases an operator_cancelled reservation once the backend is confirmed stopped", async () => {
+    acquireLogAndFinalize("dispatch-oc-1", "issue-1", "operator_cancelled");
+    vi.mocked(localDocker.inspectLocalContainer).mockResolvedValue({ status: "exited", running: false, exitCode: 0 });
+
+    const released = await dispatchAdmission.reconcileTerminalCallbackAdmissions((candidate) =>
+      indexModule.confirmAdmissionTerminated(config, candidate),
+    );
+
+    expect(released).toEqual([{ dispatchId: "dispatch-oc-1", mappingKey: "AII", conclusion: "operator_cancelled" }]);
+    expect(dispatchAdmission.read("dispatch-oc-1")?.releasedAt).not.toBeNull();
+    expect(dispatchAdmission.count("AII")).toBe(0);
+  });
+
+  it("holds an operator_cancelled reservation while the backend is still observed running", async () => {
+    acquireLogAndFinalize("dispatch-oc-2", "issue-1", "operator_cancelled");
+    vi.mocked(localDocker.inspectLocalContainer).mockResolvedValue({ status: "running", running: true, exitCode: null });
+
+    const released = await dispatchAdmission.reconcileTerminalCallbackAdmissions((candidate) =>
+      indexModule.confirmAdmissionTerminated(config, candidate),
+    );
+
+    expect(released).toEqual([]);
+    expect(dispatchAdmission.read("dispatch-oc-2")?.releasedAt).toBeNull();
+    expect(dispatchAdmission.count("AII")).toBe(1);
+  });
+
+  it("catches a planning_callback reservation the inline fast path missed (backend still running at fast-path time, terminal by the next poll)", async () => {
+    acquireLogAndFinalize("dispatch-pc-1", "issue-1", "planning_callback");
+    vi.mocked(localDocker.inspectLocalContainer).mockResolvedValue({ status: "running", running: true, exitCode: null });
+
+    // Simulates the inline fast path (tryFastReleasePlanningAdmission) observing the
+    // backend still running right after the callback — it must be a no-op, not a release.
+    await indexModule.tryFastReleasePlanningAdmission(config, "dispatch-pc-1");
+    expect(dispatchAdmission.read("dispatch-pc-1")?.releasedAt).toBeNull();
+
+    // By the next poll cycle, the backend has actually exited.
+    vi.mocked(localDocker.inspectLocalContainer).mockResolvedValue({ status: "exited", running: false, exitCode: 0 });
+
+    const released = await dispatchAdmission.reconcileTerminalCallbackAdmissions((candidate) =>
+      indexModule.confirmAdmissionTerminated(config, candidate),
+    );
+
+    expect(released).toEqual([{ dispatchId: "dispatch-pc-1", mappingKey: "AII", conclusion: "planning_callback" }]);
+    expect(dispatchAdmission.count("AII")).toBe(0);
+  });
+
+  it("is idempotent across repeated polls and does not touch a still in-flight sibling", async () => {
+    acquireLogAndFinalize("dispatch-oc-3", "issue-1", "operator_cancelled");
+    vi.mocked(localDocker.inspectLocalContainer).mockResolvedValue({ status: "exited", running: false, exitCode: 0 });
+
+    const first = await dispatchAdmission.reconcileTerminalCallbackAdmissions((candidate) =>
+      indexModule.confirmAdmissionTerminated(config, candidate),
+    );
+    expect(first).toEqual([{ dispatchId: "dispatch-oc-3", mappingKey: "AII", conclusion: "operator_cancelled" }]);
+
+    const second = await dispatchAdmission.reconcileTerminalCallbackAdmissions((candidate) =>
+      indexModule.confirmAdmissionTerminated(config, candidate),
+    );
+    expect(second).toEqual([]);
+
+    // A genuinely in-flight job (no terminal callback conclusion) must never be touched by
+    // this reconciliation path, even if its own admission is still unreleased.
+    const stillRunning = dispatchAdmission.acquire({
+      dispatchId: "dispatch-running",
+      mappingKey: "AII",
+      scope: { kind: "issue", issueScope: "AII", issueId: "issue-2" },
+      kind: "implementation",
+      backend: "local-docker",
+      lifecycleOwner: { kind: "legacy" },
+      cap: 5,
+    });
+    expect(stillRunning.ok).toBe(true);
+    log.appendLog({
+      issueId: "issue-2",
+      dispatchId: "dispatch-running",
+      executionMode: "local-docker",
+      phase: "implementation",
+    });
+
+    const third = await dispatchAdmission.reconcileTerminalCallbackAdmissions((candidate) =>
+      indexModule.confirmAdmissionTerminated(config, candidate),
+    );
+    expect(third).toEqual([]);
+    expect(dispatchAdmission.read("dispatch-running")?.releasedAt).toBeNull();
+  });
+});

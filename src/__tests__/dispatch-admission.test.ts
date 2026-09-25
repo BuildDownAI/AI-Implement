@@ -581,3 +581,145 @@ describe("sweepStaleAdmissions", () => {
     }
   });
 });
+
+// AII-783 gap-fill (third and final round, on PR #681): the planning_callback and
+// operator_cancelled branches both write a terminal dispatch_log row with
+// skipAdmissionRelease: true — the callback's own self-report is not proof the backend has
+// exited — but that same write drops the job out of getInFlightJobs()'s dispatched/running
+// set, so the ordinary per-poll monitor never looks at it again. Left to
+// sweepStaleAdmissions alone, a run that in fact finishes seconds later would hold
+// capacity for up to 6 hours. reconcileTerminalCallbackAdmissions is the no-age-floor,
+// join-based reconciliation path that closes that gap on every poll.
+describe("reconcileTerminalCallbackAdmissions", () => {
+  const CONFIRM_ALL = async () => true;
+  const CONFIRM_NONE = async () => false;
+
+  let log: typeof import("../log.js");
+
+  beforeEach(async () => {
+    log = await import("../log.js");
+    log.initLogTable();
+  });
+
+  function acquireAndLogTerminal(
+    dispatchId: string,
+    conclusion: "planning_callback" | "operator_cancelled",
+    overrides: Partial<AdmissionModule.DispatchAdmissionRequest> = {},
+  ): void {
+    const admitted = admission.acquire(issueRequest({ dispatchId, ...overrides }));
+    expect(admitted.ok).toBe(true);
+    const jobId = log.appendLog({
+      issueId: overrides.scope && overrides.scope.kind === "issue" ? overrides.scope.issueId : "AII-1",
+      issueIdentifier: "AII-1",
+      teamKey: "AII",
+      repo: "o/r",
+      dispatchId,
+      executionMode: "local-docker",
+      phase: conclusion === "planning_callback" ? "planning" : "implementation",
+    });
+    const status = conclusion === "planning_callback" ? "completed" : "failed";
+    log.updateJobStatus(jobId, status, conclusion, undefined, { skipAdmissionRelease: true });
+  }
+
+  it("releases a planning_callback reservation once the backend is confirmed terminal", async () => {
+    acquireAndLogTerminal("dispatch-pc-1", "planning_callback");
+
+    const released = await admission.reconcileTerminalCallbackAdmissions(CONFIRM_ALL);
+
+    expect(released).toEqual([
+      { dispatchId: "dispatch-pc-1", mappingKey: "AII", conclusion: "planning_callback" },
+    ]);
+    const record = admission.read("dispatch-pc-1");
+    expect(record?.releasedAt).not.toBeNull();
+    expect(record?.releaseReason).toBe("finalized");
+  });
+
+  it("releases an operator_cancelled reservation once the backend is confirmed terminal", async () => {
+    acquireAndLogTerminal("dispatch-oc-1", "operator_cancelled");
+
+    const released = await admission.reconcileTerminalCallbackAdmissions(CONFIRM_ALL);
+
+    expect(released).toEqual([
+      { dispatchId: "dispatch-oc-1", mappingKey: "AII", conclusion: "operator_cancelled" },
+    ]);
+    const record = admission.read("dispatch-oc-1");
+    expect(record?.releasedAt).not.toBeNull();
+    expect(record?.releaseReason).toBe("cancelled");
+  });
+
+  it("holds the reservation while the backend is still observed running", async () => {
+    acquireAndLogTerminal("dispatch-pc-2", "planning_callback");
+
+    const released = await admission.reconcileTerminalCallbackAdmissions(CONFIRM_NONE);
+
+    expect(released).toEqual([]);
+    expect(admission.read("dispatch-pc-2")?.releasedAt).toBeNull();
+    expect(admission.count("AII")).toBe(1);
+  });
+
+  it("holds the reservation when the confirmation check itself throws", async () => {
+    acquireAndLogTerminal("dispatch-pc-3", "planning_callback");
+
+    const released = await admission.reconcileTerminalCallbackAdmissions(async () => {
+      throw new Error("backend unreachable");
+    });
+
+    expect(released).toEqual([]);
+    expect(admission.read("dispatch-pc-3")?.releasedAt).toBeNull();
+  });
+
+  it("leaves a reservation with no matching dispatch_log row untouched (missing row)", async () => {
+    const admitted = admission.acquire(issueRequest({ dispatchId: "dispatch-no-row" }));
+    expect(admitted.ok).toBe(true);
+
+    const released = await admission.reconcileTerminalCallbackAdmissions(CONFIRM_ALL);
+
+    expect(released).toEqual([]);
+    expect(admission.read("dispatch-no-row")?.releasedAt).toBeNull();
+  });
+
+  it("leaves a still in-flight job's reservation untouched (non-terminal conclusion)", async () => {
+    const admitted = admission.acquire(issueRequest({ dispatchId: "dispatch-inflight" }));
+    expect(admitted.ok).toBe(true);
+    log.appendLog({
+      issueId: "AII-1",
+      dispatchId: "dispatch-inflight",
+      executionMode: "local-docker",
+      phase: "implementation",
+    });
+
+    const released = await admission.reconcileTerminalCallbackAdmissions(CONFIRM_ALL);
+
+    expect(released).toEqual([]);
+    expect(admission.read("dispatch-inflight")?.releasedAt).toBeNull();
+  });
+
+  it("is idempotent across repeated polls", async () => {
+    acquireAndLogTerminal("dispatch-pc-4", "planning_callback");
+
+    const first = await admission.reconcileTerminalCallbackAdmissions(CONFIRM_ALL);
+    expect(first).toEqual([
+      { dispatchId: "dispatch-pc-4", mappingKey: "AII", conclusion: "planning_callback" },
+    ]);
+
+    const second = await admission.reconcileTerminalCallbackAdmissions(CONFIRM_ALL);
+    expect(second).toEqual([]);
+    expect(admission.count("AII")).toBe(0);
+  });
+
+  it("frees team capacity for a subsequent acquire once released", async () => {
+    acquireAndLogTerminal("dispatch-oc-2", "operator_cancelled", { cap: 1 });
+
+    const blocked = admission.acquire(
+      issueRequest({ dispatchId: "waiting", scope: { kind: "issue", issueScope: "team-a", issueId: "AII-2" }, cap: 1 }),
+    );
+    expect(blocked).toMatchObject({ ok: false, reason: "at_capacity" });
+
+    await admission.reconcileTerminalCallbackAdmissions(CONFIRM_ALL);
+
+    const retry = admission.acquire(
+      issueRequest({ dispatchId: "waiting", scope: { kind: "issue", issueScope: "team-a", issueId: "AII-2" }, cap: 1 }),
+    );
+    expect(retry.ok).toBe(true);
+  });
+});

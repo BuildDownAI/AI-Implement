@@ -14,6 +14,7 @@ import { canDispatch, acquireDispatch, type DispatchKind, type AcquireDispatchOu
 import {
   count as countAdmissionReservations,
   sweepStaleAdmissions,
+  reconcileTerminalCallbackAdmissions,
   read as readAdmission,
   releaseByDispatchId as releaseAdmissionByDispatchId,
   type StaleAdmissionCandidate,
@@ -804,6 +805,20 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
   for (const released of await sweepStaleAdmissions((candidate) => confirmAdmissionTerminated(config, candidate))) {
     console.log(
       `[admission] released stale reservation dispatch=${released.dispatchId} mapping=${released.mappingKey} age_ms=${released.ageMs}`,
+    );
+  }
+
+  // Per-poll reconciliation for the two terminal callback conclusions that deliberately
+  // hold their reservation via skipAdmissionRelease (planning_callback, operator_cancelled
+  // — AII-783 review, third round, on PR #681): both callbacks self-report from inside the
+  // still-running backend and their write drops the job out of getInFlightJobs()'s tracked
+  // set, so besides this, only the 6-hour stale-admission sweep above would ever notice the
+  // backend has since exited. No age floor — eligibility is "terminal callback conclusion,
+  // still reserved," re-checked fresh every poll — and each candidate goes through the same
+  // confirmAdmissionTerminated oracle before release.
+  for (const released of await reconcileTerminalCallbackAdmissions((candidate) => confirmAdmissionTerminated(config, candidate))) {
+    console.log(
+      `[admission] released terminal-callback reservation dispatch=${released.dispatchId} mapping=${released.mappingKey} conclusion=${released.conclusion}`,
     );
   }
 
