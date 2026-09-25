@@ -11,8 +11,8 @@
 //
 // This suite was authored without a local Docker daemon (no `docker info`), the same
 // constraint `endpoint.restate.test.ts` (AII-727) documents — see that file's header and
-// docs/restate-testing.md's "Container-to-host reachability" section. It has not been run
-// against a live container; `npm run test:restate` in CI is the first real execution.
+// docs/restate-testing.md's "Container-to-host reachability" section. CI subsequently ran
+// it against pinned Restate 1.7.10; that is container evidence, not live-pilot evidence.
 import { randomUUID, createHash } from "node:crypto";
 import type { RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
