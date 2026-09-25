@@ -328,8 +328,8 @@ function buildLaunchInputs(plan: WorkerLaunchPlan, mapping: RepoMapping): Dispat
     run_config: encodeRunConfig(runConfig),
     issue_identifier: identifier,
     run_attempt_token: plan.attemptId,
-    // Runner callback wiring (run_token/run_progress_token) is not carried by
-    // WorkerLaunchPlan and is out of scope for this adapter — composed later (AII-811).
+    // Production composition adds callback credentials inside launch(); they
+    // deliberately never enter WorkerLaunchPlan or a journaled result.
     run_token: "",
     ...providerDispatchFields(mapping),
     ...(mapping.maxJobMinutes != null ? { job_timeout_minutes: String(mapping.maxJobMinutes) } : {}),
@@ -427,6 +427,9 @@ export function reviewFixAttemptStoreScopeStore(source: ReviewFixWorkerAttemptSc
 
 export interface GithubReviewFixWorkerDeps {
   credentials: ReviewFixWorkerCredentialResolver;
+  /** Mint callback bearers inside the launch adapter, after preparation. The
+   * returned values go only to the GitHub dispatch request, never to Restate. */
+  callbackInputs?: (attemptId: AttemptId) => Promise<Pick<DispatchInputs, "run_token" | "run_progress_token" | "runner_callback_url">>;
   /** Defaults to `githubActionsReviewFixWorkerTransport`. Overridden by tests with a
    *  controllable double. */
   transport?: ReviewFixWorkerTransport;
@@ -441,11 +444,13 @@ export class GithubReviewFixWorker implements ReviewFixWorkerPort {
   private readonly credentials: ReviewFixWorkerCredentialResolver;
   private readonly transport: ReviewFixWorkerTransport;
   private readonly scopeStore: ReviewFixWorkerScopeStore;
+  private readonly callbackInputs?: GithubReviewFixWorkerDeps["callbackInputs"];
 
   constructor(deps: GithubReviewFixWorkerDeps) {
     this.credentials = deps.credentials;
     this.transport = deps.transport ?? githubActionsReviewFixWorkerTransport;
     this.scopeStore = deps.scopeStore ?? inMemoryReviewFixWorkerScopeStore();
+    this.callbackInputs = deps.callbackInputs;
   }
 
   private async remember(attemptId: AttemptId, scope: ScopedPrIdentity, execution?: WorkerExecutionIdentity): Promise<void> {
@@ -478,7 +483,14 @@ export class GithubReviewFixWorker implements ReviewFixWorkerPort {
     // under is not evidence the dispatch was rejected — it is unresolved identity.
     if (credential.installationId !== plan.scope.installationId) return { status: "unknown" };
 
-    const inputs = buildLaunchInputs(plan, mapping);
+    let inputs = buildLaunchInputs(plan, mapping);
+    try {
+      if (this.callbackInputs) inputs = { ...inputs, ...await this.callbackInputs(plan.attemptId) };
+    } catch {
+      // A missing/expired prepared credential is not proof that an earlier
+      // dispatch did not happen. The workflow reconciles under its launch intent.
+      return { status: "unknown" };
+    }
     let result: DispatchResult;
     try {
       result = await this.transport.dispatch({
