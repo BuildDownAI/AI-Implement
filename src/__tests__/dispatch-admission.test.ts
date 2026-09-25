@@ -601,6 +601,40 @@ describe("reconcileTerminalCallbackAdmissions", () => {
     log.initLogTable();
   });
 
+  it("holds a generic callback success until the exact backend terminates, then releases it", async () => {
+    const dispatchId = "dispatch-generic-success";
+    const admitted = admission.acquire(issueRequest({ dispatchId }));
+    expect(admitted.ok).toBe(true);
+    if (!admitted.ok) return;
+    const jobId = log.appendLog({
+      issueId: "AII-1", dispatchId, admissionGeneration: admitted.record.generation,
+      executionMode: "github-actions", phase: "gap-analysis",
+    });
+    log.updateJobStatus(jobId, "completed", "success");
+    expect(admission.read(dispatchId)?.releasedAt).toBeNull();
+    expect(await admission.reconcileTerminalCallbackAdmissions(CONFIRM_NONE)).toEqual([]);
+    expect(admission.count("AII")).toBe(1);
+
+    expect(await admission.reconcileTerminalCallbackAdmissions(CONFIRM_ALL)).toEqual([
+      { dispatchId, mappingKey: "AII", conclusion: "success" },
+    ]);
+    expect(admission.count("AII")).toBe(0);
+  });
+
+  it("does not let the Legacy terminal reconciler release a Restate-owned admission", async () => {
+    const dispatchId = "dispatch-restate-terminal";
+    const admitted = admission.acquire(issueRequest({ dispatchId, lifecycleOwner: RESTATE_A }));
+    expect(admitted.ok).toBe(true);
+    if (!admitted.ok) return;
+    const jobId = log.appendLog({
+      issueId: "AII-1", dispatchId, admissionGeneration: admitted.record.generation,
+      executionMode: "github-actions", phase: "implementation",
+    });
+    log.updateJobStatus(jobId, "completed", "success", undefined, { backendTerminated: true });
+    expect(await admission.reconcileTerminalCallbackAdmissions(CONFIRM_ALL)).toEqual([]);
+    expect(admission.read(dispatchId)?.releasedAt).toBeNull();
+  });
+
   function acquireAndLogTerminal(
     dispatchId: string,
     conclusion: "planning_callback" | "operator_cancelled",
@@ -742,9 +776,9 @@ describe("reconcileTerminalCallbackAdmissions", () => {
       issueId: "AII-1",
       dispatchId,
       admissionGeneration: original.record.generation,
-      executionMode: "local-docker",
+      executionMode: "github-actions",
     });
-    log.updateJobStatus(oldJobId, "completed", "success");
+    log.updateJobStatus(oldJobId, "completed", "success", undefined, { backendTerminated: true });
     expect(admission.read(dispatchId)?.releasedAt).not.toBeNull();
 
     const replacement = admission.acquire(issueRequest({

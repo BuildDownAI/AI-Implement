@@ -809,14 +809,10 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
     );
   }
 
-  // Per-poll reconciliation for the two terminal callback conclusions that deliberately
-  // hold their reservation via skipAdmissionRelease (planning_callback, operator_cancelled
-  // — AII-783 review, third round, on PR #681): both callbacks self-report from inside the
-  // still-running backend and their write drops the job out of getInFlightJobs()'s tracked
-  // set, so besides this, only the 6-hour stale-admission sweep above would ever notice the
-  // backend has since exited. No age floor — eligibility is "terminal callback conclusion,
-  // still reserved," re-checked fresh every poll — and each candidate goes through the same
-  // confirmAdmissionTerminated oracle before release.
+  // A terminal business status can arrive while its backend still runs, dropping the job
+  // out of the ordinary monitor set. Reconcile every terminal Legacy job with a held
+  // reservation on each poll, confirming the exact backend before release. There is no
+  // age floor; unknown status stays held for a later poll or the stale sweep.
   for (const released of await reconcileTerminalCallbackAdmissions((candidate) => confirmAdmissionTerminated(config, candidate))) {
     console.log(
       `[admission] released terminal-callback reservation dispatch=${released.dispatchId} mapping=${released.mappingKey} conclusion=${released.conclusion}`,
@@ -2482,6 +2478,8 @@ export async function confirmAdmissionTerminated(
 ): Promise<boolean> {
   const job = getJobByDispatchId(candidate.dispatchId);
   if (!job) return false;
+  if (candidate.lifecycleOwner.kind !== "legacy" || job.executionMode !== candidate.backend) return false;
+  if (candidate.generation !== undefined && job.admissionGeneration !== candidate.generation) return false;
 
   if (job.executionMode === "github-actions") {
     if (!job.repo) return false;
@@ -2586,6 +2584,7 @@ export async function tryFastReleasePlanningAdmission(config: AppConfig, dispatc
       mappingKey: record.mappingKey,
       backend: record.backend,
       lifecycleOwner: record.lifecycleOwner,
+      generation: record.generation,
       ageMs: Date.now() - record.createdAt,
     });
   } catch (err) {
@@ -2661,7 +2660,7 @@ export async function monitorJobs(config: AppConfig, registry: ProviderRegistry)
             // re-triggers updateJobStatus's terminal hook, so it must not release the
             // admission reservation when the backend's death wasn't actually confirmed.
             if (stopConfirmed) {
-              updateJobStatus(job.id, "timed_out", "ttl_expired");
+              updateJobStatus(job.id, "timed_out", "ttl_expired", undefined, { backendTerminated: true });
             } else {
               updateJobStatus(job.id, "timed_out", "ttl_expired", undefined, { skipAdmissionRelease: true });
             }
@@ -2836,7 +2835,7 @@ async function monitorGitHubActionsJob(
     }
 
     if (!isMonitorRunIdStillCurrent(job)) return;
-    updateJobStatus(job.id, jobStatus, runStatus.conclusion, prUrl);
+    updateJobStatus(job.id, jobStatus, runStatus.conclusion, prUrl, { backendTerminated: true });
     console.log(`[monitor] Job ${job.id} (${job.issueIdentifier}) → ${jobStatus} (${runStatus.conclusion})`);
 
     // AII-264 r6: the run's PR already merged (auto-merge beat this check) — route straight
@@ -3059,7 +3058,7 @@ async function monitorFlyMachineJob(
     }
 
     const durationMs = Date.now() - job.dispatchedAt;
-    updateJobStatus(job.id, jobStatus, decision.finalizeGroupingParent ? "no_op_finalized" : machineConclusion, prUrl);
+    updateJobStatus(job.id, jobStatus, decision.finalizeGroupingParent ? "no_op_finalized" : machineConclusion, prUrl, { backendTerminated: true });
     invalidateNonce(job.id);
     clearPrNotFoundGrace(job.id);
     console.log(`[monitor] Fly machine ${job.machineId} (${job.issueIdentifier}) → ${jobStatus} (${machineConclusion}, PR: ${prUrl || "none"})`);
@@ -3202,7 +3201,7 @@ async function monitorLocalDockerJob(
   }
 
   const durationMs = Date.now() - job.dispatchedAt;
-  updateJobStatus(job.id, jobStatus, decision.finalizeGroupingParent ? "no_op_finalized" : `exit_${state.exitCode}`, prUrl);
+  updateJobStatus(job.id, jobStatus, decision.finalizeGroupingParent ? "no_op_finalized" : `exit_${state.exitCode}`, prUrl, { backendTerminated: true });
   invalidateNonce(job.id);
   clearPrNotFoundGrace(job.id);
   console.log(`[monitor] Local Docker container ${job.machineId} (${job.issueIdentifier}) → ${jobStatus} (exit ${state.exitCode}, PR: ${prUrl || "none"})`);

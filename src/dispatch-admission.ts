@@ -455,6 +455,7 @@ export interface StaleAdmissionCandidate {
   readonly mappingKey: string;
   readonly backend: DispatchAdmissionBackend;
   readonly lifecycleOwner: LifecycleOwner;
+  readonly generation?: number;
   readonly ageMs: number;
 }
 
@@ -495,6 +496,7 @@ export async function sweepStaleAdmissions(
       mappingKey: row.mapping_key,
       backend: row.backend as DispatchAdmissionBackend,
       lifecycleOwner: decodeOwner(row.lifecycle_owner),
+      generation: row.generation,
       ageMs: Date.now() - row.created_at,
     };
     let confirmed: boolean;
@@ -515,16 +517,10 @@ export async function sweepStaleAdmissions(
   return released;
 }
 
-/** `updateJobStatus`'s terminal-conclusion values that are written with
- *  `skipAdmissionRelease: true` — the callback's own self-report is not proof the backend
- *  has exited, so the write deliberately leaves the reservation held (see `log.ts`'s
- *  `updateJobStatus` and `runner-callback.ts`'s planning/`operator_cancelled` branches). */
-const TERMINAL_CALLBACK_CONCLUSIONS = ["planning_callback", "operator_cancelled"] as const;
-
 export interface TerminalCallbackAdmissionResult {
   readonly dispatchId: string;
   readonly mappingKey: string;
-  readonly conclusion: (typeof TERMINAL_CALLBACK_CONCLUSIONS)[number];
+  readonly conclusion: string | null;
 }
 
 interface TerminalCallbackCandidateRow {
@@ -534,37 +530,29 @@ interface TerminalCallbackCandidateRow {
   lifecycle_owner: string;
   generation: number;
   created_at: number;
-  conclusion: string;
+  conclusion: string | null;
 }
 
 /** operator_cancelled is a human decision surfaced through the runner's self-report, not a
  *  deadline; planning_callback is the ordinary end of a planning run. Neither is the
  *  age-based "deadline_exceeded" `sweepStaleAdmissions` uses. */
-function releaseReasonForConclusion(conclusion: string): DispatchAdmissionReleaseReason {
+function releaseReasonForConclusion(conclusion: string | null): DispatchAdmissionReleaseReason {
   return conclusion === "operator_cancelled" ? "cancelled" : "finalized";
 }
 
 /**
- * Per-poll companion to `sweepStaleAdmissions` for the two terminal conclusions above
- * (AII-783 review, third round, on PR #681). Both `planning_callback` and
- * `operator_cancelled` are written by `updateJobStatus` with `skipAdmissionRelease: true`
- * because the callback's own self-report — posted from inside the still-running backend —
- * is not proof of termination, but that same write also drops the job out of
- * `getInFlightJobs()`'s `dispatched`/`running` set, so the ordinary per-poll GHA/Fly/local
- * monitor never looks at it again. `planning_callback` has a companion fast path
- * (`tryFastReleasePlanningAdmission`) that runs once, inline, right after the callback —
- * but that check usually races a backend that is still shutting down, and
- * `operator_cancelled` has no fast check at all. Left alone, only `sweepStaleAdmissions`'s
- * 6-hour age floor would eventually notice, stranding issue/team capacity for hours behind
- * a run that in fact finished in minutes.
+ * Per-poll companion to `sweepStaleAdmissions` for every terminal Legacy job whose
+ * reservation remains held. A callback or uncertain stop can remove a job from the
+ * in-flight monitor before its backend exits; this path checks that backend on each
+ * poll rather than waiting for the six-hour stale sweep.
  *
  * Eligibility carries no age floor of its own: a targeted join — unreleased
- * `dispatch_admissions` rows whose `dispatch_id` matches a `dispatch_log` row already
- * carrying one of the two conclusions above — re-evaluated fresh on every call, rather
+ * `dispatch_admissions` rows whose `dispatch_id` and generation match a terminal
+ * `dispatch_log` row — re-evaluated fresh on every call, rather
  * than scanning every active reservation the way an age sweep must. Each candidate is
  * independently confirmed dead through the same `confirmTerminated` oracle
  * `sweepStaleAdmissions` uses before release; a still-running, unknown, or throwing check
- * leaves the reservation held exactly as `skipAdmissionRelease` left it. Idempotent: a
+ * leaves the reservation held. Idempotent: a
  * `dispatch_id` already released — by the planning fast path, a prior poll's call to this
  * function, or the stale-admission sweep — simply has no unreleased row left to match.
  */
@@ -572,7 +560,6 @@ export async function reconcileTerminalCallbackAdmissions(
   confirmTerminated: (candidate: StaleAdmissionCandidate) => Promise<boolean>,
 ): Promise<TerminalCallbackAdmissionResult[]> {
   const db = getDb();
-  const placeholders = TERMINAL_CALLBACK_CONCLUSIONS.map(() => "?").join(", ");
   const rows = db
     .prepare(
       `SELECT da.dispatch_id AS dispatch_id, da.mapping_key AS mapping_key, da.backend AS backend,
@@ -582,10 +569,9 @@ export async function reconcileTerminalCallbackAdmissions(
        JOIN dispatch_log dl ON dl.dispatch_id = da.dispatch_id
            AND dl.admission_generation = da.generation
        WHERE da.released_at IS NULL
-         AND dl.status IN ('completed', 'failed')
-         AND dl.conclusion IN (${placeholders})`,
+         AND dl.status IN ('completed', 'review_failed', 'failed', 'timed_out', 'dispatch-failed')`,
     )
-    .all(...TERMINAL_CALLBACK_CONCLUSIONS) as TerminalCallbackCandidateRow[];
+    .all() as TerminalCallbackCandidateRow[];
 
   const results: TerminalCallbackAdmissionResult[] = [];
   for (const row of rows) {
@@ -594,8 +580,10 @@ export async function reconcileTerminalCallbackAdmissions(
       mappingKey: row.mapping_key,
       backend: row.backend as DispatchAdmissionBackend,
       lifecycleOwner: decodeOwner(row.lifecycle_owner),
+      generation: row.generation,
       ageMs: Date.now() - row.created_at,
     };
+    if (candidate.lifecycleOwner.kind !== "legacy") continue;
     let confirmed: boolean;
     try {
       confirmed = await confirmTerminated(candidate);
@@ -619,7 +607,7 @@ export async function reconcileTerminalCallbackAdmissions(
       results.push({
         dispatchId: row.dispatch_id,
         mappingKey: row.mapping_key,
-        conclusion: row.conclusion as TerminalCallbackAdmissionResult["conclusion"],
+        conclusion: row.conclusion,
       });
     }
   }

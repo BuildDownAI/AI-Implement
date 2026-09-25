@@ -471,11 +471,9 @@ describe("acquireDispatch — transactional final authority (AII-783)", () => {
 
 // AII-783 gap-fill (review finding on PR #681): acquireDispatch alone only reserves —
 // nothing released it back, so every successful dispatch would fill a slot permanently.
-// log.ts's updateJobStatus now releases the matching reservation whenever a job leaves
-// the in-flight set, which is the single hook every monitor (GHA/Fly/local), the runner
-// callback, admin actions, and the reaper all already go through to record a verified
-// terminal outcome — so wiring it there, once, covers all of them without a bespoke
-// release call at each site. These tests exercise that hook the way a real dispatch +
+// log.ts's updateJobStatus releases only when the caller confirms the exact backend
+// has terminated. A callback or timeout status alone leaves the reservation held.
+// These tests exercise that hook the way a real dispatch +
 // monitor cycle would: acquire the reservation, record the matching dispatch_log row
 // (appendLog, exactly as dispatchGitHubActions/dispatchSession do immediately after a
 // successful launch), then drive the row through the status transitions a monitor would.
@@ -495,10 +493,8 @@ describe("updateJobStatus — releases the admission reservation on verified ter
     );
     expect(blocked).toEqual({ ok: false, reason: "at_capacity", count: 1, cap: 1 });
 
-    // The monitor confirms the run finished (mirrors monitorGitHubActionsJob's
-    // runStatus.status === "completed" branch, or the runner callback's own terminal
-    // write) — this is the exact call every verified-terminal write site already makes.
-    log.updateJobStatus(jobId, "completed", "success", "https://github.com/o/r/pull/1");
+    // The monitor has observed the exact GHA run finish.
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/o/r/pull/1", { backendTerminated: true });
 
     const retry = gate.acquireDispatch(
       { dispatchId: "run-b", issueId: "issue-b", issueIdentifier: "AII-b", kind: "implementation", teamKey: "AII", maxInProgressAiIssues: 1, backend: "github-actions" },
@@ -533,7 +529,7 @@ describe("updateJobStatus — releases the admission reservation on verified ter
     if (!acquired.ok) throw new Error("expected admission");
     const jobId = log.appendLog({ issueId: "issue-e", teamKey: "AII", phase: "implementation", status: "dispatched", dispatchId: "run-e", admissionGeneration: acquired.admissionGeneration });
 
-    log.updateJobStatus(jobId, "failed", "failure");
+    log.updateJobStatus(jobId, "failed", "failure", undefined, { backendTerminated: true });
 
     const retry = gate.acquireDispatch(
       { dispatchId: "run-f", issueId: "issue-f", issueIdentifier: "AII-f", kind: "implementation", teamKey: "AII", maxInProgressAiIssues: 1, backend: "github-actions" },
@@ -603,6 +599,7 @@ describe("remediateStuckJob — admission release only on confirmed stop (AII-78
       status: "dispatched",
       dispatchId: "stuck-a",
       admissionGeneration: acquired.admissionGeneration,
+      executionMode: "fly-machines",
     });
     const job = log.getJobById(jobId)!;
 

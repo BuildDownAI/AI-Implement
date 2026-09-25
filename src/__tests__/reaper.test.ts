@@ -362,7 +362,7 @@ describe("sweepOrphanedMachines — side effects skipped in dry-run", () => {
 
     await sweepOrphanedMachines(makeConfig(false), helpers);
 
-    expect(updateJobStatus).toHaveBeenCalledWith(inflight.id, "timed_out", "machine_max_age_sweep");
+    expect(updateJobStatus).toHaveBeenCalledWith(inflight.id, "timed_out", "machine_max_age_sweep", undefined, { backendTerminated: true });
     expect(invalidateNonce).toHaveBeenCalledWith(inflight.id);
     expect(helpers.resetTicket).toHaveBeenCalledWith(inflight);
   });
@@ -407,7 +407,7 @@ describe("sweepOrphanedMachines — side effects skipped in dry-run", () => {
 
     await sweepOrphanedMachines(makeConfig(false), helpers);
 
-    expect(updateJobStatus).toHaveBeenCalledWith(inflight.id, "timed_out", "machine_max_age_sweep");
+    expect(updateJobStatus).toHaveBeenCalledWith(inflight.id, "timed_out", "machine_max_age_sweep", undefined, { backendTerminated: true });
   });
 });
 
@@ -535,7 +535,7 @@ describe("sweepOrphanedMachines — Restate-owned reservation fence (AII-791)", 
     await sweepOrphanedMachines(makeConfig(false), helpers);
 
     expect(destroyMachine).toHaveBeenCalledWith(TOKEN, APP, "m-legacy-aged");
-    expect(updateJobStatus).toHaveBeenCalledWith(legacyJob.id, "timed_out", "machine_max_age_sweep");
+    expect(updateJobStatus).toHaveBeenCalledWith(legacyJob.id, "timed_out", "machine_max_age_sweep", undefined, { backendTerminated: true });
   });
 });
 
@@ -936,7 +936,7 @@ describe("sweepOrphanedMachines — kg-refresh max-age rule", () => {
 
     await sweepOrphanedMachines(makeConfig(false), makeHelpers());
 
-    expect(updateJobStatus).toHaveBeenCalledWith(kgRefreshInflight.id, "timed_out", "machine_max_age_sweep");
+    expect(updateJobStatus).toHaveBeenCalledWith(kgRefreshInflight.id, "timed_out", "machine_max_age_sweep", undefined, { backendTerminated: true });
     expect(invalidateNonce).toHaveBeenCalledWith(kgRefreshInflight.id);
   });
 

@@ -319,7 +319,7 @@ export async function sweepOrphanedMachines(
         // real state unknown — hold the admission reservation for the stale-reservation
         // sweep rather than releasing a slot whose backend might still be running.
         if (maxAgeDestroyConfirmed) {
-          updateJobStatus(job.id, "timed_out", "machine_max_age_sweep");
+          updateJobStatus(job.id, "timed_out", "machine_max_age_sweep", undefined, { backendTerminated: true });
         } else {
           updateJobStatus(job.id, "timed_out", "machine_max_age_sweep", undefined, { skipAdmissionRelease: true });
         }
@@ -358,7 +358,7 @@ export async function sweepOrphanedMachines(
       if (!config.reaperDryRun) {
         destroyedCount++;
         if (issueTerminalDestroyConfirmed) {
-          updateJobStatus(job.id, "timed_out", "issue_completed_sweep");
+          updateJobStatus(job.id, "timed_out", "issue_completed_sweep", undefined, { backendTerminated: true });
         } else {
           updateJobStatus(job.id, "timed_out", "issue_completed_sweep", undefined, { skipAdmissionRelease: true });
         }

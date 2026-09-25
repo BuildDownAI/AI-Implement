@@ -144,7 +144,7 @@ describe("reportJobCompletion breaker integration (BAC-27134)", () => {
 // (skipAdmissionRelease unset); a callback-style write must pass skipAdmissionRelease:
 // true, exactly like the reaper/watchdog give-up paths already covered elsewhere.
 describe("admission reservation survives a callback-style terminal write (AII-791)", () => {
-  it("stays occupied when updateJobStatus is called with skipAdmissionRelease (backend still running)", async () => {
+  it("stays occupied on a callback terminal write while the backend is still running", async () => {
     const dispatchId = "dispatch-callback-1";
     const admitted = dispatchAdmission.acquire({
       dispatchId,
@@ -166,9 +166,9 @@ describe("admission reservation survives a callback-style terminal write (AII-79
       admissionGeneration: admitted.record.generation,
     });
 
-    // Mirrors the runner callback's own write: it knows its business outcome, but has
-    // no way to confirm the GHA run itself has completed — skipAdmissionRelease: true.
-    log.updateJobStatus(jobId, "completed", "success", null, { skipAdmissionRelease: true });
+    // Mirrors the runner callback's own write: its business outcome is not evidence
+    // that the GHA run itself has completed.
+    log.updateJobStatus(jobId, "completed", "success");
 
     const record = dispatchAdmission.read(dispatchId);
     expect(record?.releasedAt).toBeNull();
@@ -197,9 +197,8 @@ describe("admission reservation survives a callback-style terminal write (AII-79
       admissionGeneration: admitted.record.generation,
     });
 
-    // No skipAdmissionRelease: the caller here (e.g. the GHA monitor, having observed
-    // the run's own status as completed) vouches for verified termination.
-    log.updateJobStatus(jobId, "completed", "success");
+    // The GHA monitor observed this exact run's completed status.
+    log.updateJobStatus(jobId, "completed", "success", undefined, { backendTerminated: true });
 
     const record = dispatchAdmission.read(dispatchId);
     expect(record?.releasedAt).not.toBeNull();

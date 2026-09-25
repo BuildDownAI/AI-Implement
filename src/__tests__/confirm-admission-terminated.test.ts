@@ -117,6 +117,15 @@ beforeEach(() => {
   vi.mocked(attachJobRunIdIfMissing).mockReturnValue(true);
 });
 
+it("refuses to confirm a different backend, generation, or Restate-owned attempt", async () => {
+  vi.mocked(getJobByDispatchId).mockReturnValue(makeJob({ runId: 123, admissionGeneration: 2 }));
+  expect(await confirmAdmissionTerminated(mockConfig, makeCandidate({ backend: "fly-machines", generation: 2 }))).toBe(false);
+  expect(await confirmAdmissionTerminated(mockConfig, makeCandidate({ generation: 1 }))).toBe(false);
+  expect(await confirmAdmissionTerminated(mockConfig, makeCandidate({ generation: 2, lifecycleOwner: { kind: "restate", attemptId: "a" } }))).toBe(false);
+  expect(getWorkflowRunStatus).not.toHaveBeenCalled();
+  expect(getMachine).not.toHaveBeenCalled();
+});
+
 describe("confirmAdmissionTerminated — github-actions, runId never linked", () => {
   it("holds the reservation (unconfirmed) when no mapping is found to retry the run-ID lookup", async () => {
     const job = makeJob({ runId: null, teamKey: "missing-team" });

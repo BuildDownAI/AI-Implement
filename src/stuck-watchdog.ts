@@ -230,7 +230,7 @@ export async function remediateStuckJob(
 
   if (attempts <= STUCK_JOB_MAX_ATTEMPTS) {
     if (stopConfirmed) {
-      updateJobStatus(job.id, "timed_out", "stuck_requeued");
+      updateJobStatus(job.id, "timed_out", "stuck_requeued", undefined, { backendTerminated: true });
     } else {
       updateJobStatus(job.id, "timed_out", "stuck_requeued", undefined, { skipAdmissionRelease: true });
     }
@@ -240,7 +240,7 @@ export async function remediateStuckJob(
     );
   } else {
     if (stopConfirmed) {
-      updateJobStatus(job.id, "timed_out", "stuck_giveup");
+      updateJobStatus(job.id, "timed_out", "stuck_giveup", undefined, { backendTerminated: true });
     } else {
       updateJobStatus(job.id, "timed_out", "stuck_giveup", undefined, { skipAdmissionRelease: true });
     }

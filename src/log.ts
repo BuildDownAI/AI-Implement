@@ -24,6 +24,7 @@ export interface Job {
   repo: string | null;
   dispatchedAt: number;
   dispatchId: string | null;
+  admissionGeneration: number | null;
   dispatchNumber: number;
   issueState: string | null;
   runId: number | null;
@@ -398,6 +399,9 @@ export function updateJobStatus(
   conclusion?: string | null,
   prUrl?: string | null,
   opts?: {
+    /** The caller observed the exact backend execution in a terminal state. A
+     * callback, timeout, or cancellation request must leave this unset. */
+    backendTerminated?: boolean;
     /** Set by a caller that reached this terminal status through a best-effort stop/
      *  destroy that may itself have failed silently (the reaper's machine sweeps,
      *  stuck-watchdog's remediation paths) — i.e. "terminal status string" without
@@ -412,8 +416,8 @@ export function updateJobStatus(
   // terminalize its queue row, or hasPendingConflictResolution stays true
   // forever and conflict-recovery attempt 2 is unreachable (observed livelock).
   if (isTerminal) {
-    const job = getDb().prepare("SELECT repo, trigger, pr_url, dispatch_id, admission_generation FROM dispatch_log WHERE id = ?").get(jobId) as
-      | { repo: string; trigger: string | null; pr_url: string | null; dispatch_id: string | null; admission_generation: number | null } | undefined;
+    const job = getDb().prepare("SELECT repo, trigger, pr_url, dispatch_id, admission_generation, execution_mode FROM dispatch_log WHERE id = ?").get(jobId) as
+      | { repo: string; trigger: string | null; pr_url: string | null; dispatch_id: string | null; admission_generation: number | null; execution_mode: string | null } | undefined;
     const prUrlForRow = prUrl ?? job?.pr_url ?? null;
     const m = prUrlForRow ? /\/pull\/(\d+)$/.exec(prUrlForRow) : null;
     if (job?.trigger === "comment" && m) {
@@ -421,19 +425,15 @@ export function updateJobStatus(
       const n = markCommentGapfillRunTerminal(job.repo, Number(m[1]), outcome);
       if (n > 0) console.log(`[gapfill] terminalized ${n} queue row(s) for ${job.repo}#${m[1]} -> ${outcome}`);
     }
-    // Single hook for every verified-terminal write, wherever it originates (poll
-    // monitor, runner callback, admin action, reaper sweep, stuck watchdog): a job
-    // leaving the in-flight set (getInFlightJobs filters to 'dispatched'/'running')
-    // is exactly what "verified termination" means operationally in this codebase, so
-    // this is the single place that can release the matching admission reservation
-    // without hunting every call site individually. A no-op for dispatch kinds that
-    // never reserved one (gap-fill/gap-analysis stay on the legacy canDispatch path).
-    // `skipAdmissionRelease` is the escape hatch for a caller that cannot vouch for the
-    // backend actually being dead (AII-783 review: reaper/stuck-watchdog give-up paths
-    // swallow their own stop/destroy failures and still write a terminal status here).
-    if (job?.dispatch_id && job.admission_generation !== null && !opts?.skipAdmissionRelease) {
+    // A terminal business status does not prove that the backend has exited: callbacks
+    // and watchdogs can write it from inside a live run. Only an exact backend monitor
+    // observation may opt in to immediate release. Other rows are reconciled against
+    // the backend on the next poll, with owner and generation fences.
+    if (job?.dispatch_id && job.admission_generation !== null && opts?.backendTerminated && !opts.skipAdmissionRelease) {
       const current = readAdmission(job.dispatch_id);
-      if (current) releaseAdmission(job.dispatch_id, current.lifecycleOwner, job.admission_generation, "finalized");
+      if (current?.lifecycleOwner.kind === "legacy" && current.backend === job.execution_mode) {
+        releaseAdmission(job.dispatch_id, current.lifecycleOwner, job.admission_generation, "finalized");
+      }
     }
   }
   // COALESCE keeps a pr_url recorded earlier (e.g. by the runner callback) when the
@@ -706,6 +706,7 @@ interface RawRow {
   repo: string | null;
   dispatched_at: number;
   dispatch_id: string | null;
+  admission_generation: number | null;
   dispatch_number: number;
   issue_state: string | null;
   run_id: number | null;
@@ -738,6 +739,7 @@ function mapRows(rows: RawRow[]): Job[] {
     repo: row.repo,
     dispatchedAt: row.dispatched_at,
     dispatchId: row.dispatch_id ?? null,
+    admissionGeneration: row.admission_generation ?? null,
     dispatchNumber: row.dispatch_number ?? 1,
     issueState: row.issue_state ?? null,
     runId: row.run_id ?? null,
