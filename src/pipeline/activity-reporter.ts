@@ -109,6 +109,7 @@ const HANG_GUARD_SLACK_MS = 250;
 const MAX_KIND_LENGTH = 64;
 const TRUNCATION_SUFFIX = "…[truncated]";
 const ATTEMPT_LIMIT_MARKER_KIND = "activity_limit_reached";
+const EMPTY_STREAM_MARKER_KIND = "activity_stream_empty";
 
 /** Wire body for `POST /runner/activity`, matching `RunnerActivityBody` (src/runner-callback.ts). */
 interface ActivityBatchRequest {
@@ -223,6 +224,12 @@ export class ActivityReporter {
   /** Closes the activity stream at the highest sequence issued so far. Idempotent. */
   finalize(): void {
     if (this.finalized) return;
+    // The callback accepts nonnegative finalSequence values. An otherwise
+    // empty stream still needs a durable closing identity, so emit one safe
+    // marker at sequence 0 before freezing the final sequence.
+    if (this.nextSequence === 0) {
+      this.enqueueMarker(this.nextSequence++, 1, EMPTY_STREAM_MARKER_KIND, "no observable tool activity");
+    }
     this.finalized = true;
     this.finalSequence = this.nextSequence - 1;
   }
