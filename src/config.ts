@@ -224,6 +224,9 @@ function ensureMappingsColumns(): void {
   if (!names.has("pr_dispatch_budget")) {
     db.exec(`ALTER TABLE mappings ADD COLUMN pr_dispatch_budget INTEGER`);
   }
+  if (!names.has("review_fix_lifecycle")) {
+    db.exec("ALTER TABLE mappings ADD COLUMN review_fix_lifecycle TEXT");
+  }
 }
 
 export function initMappingsTable(): void {
@@ -263,7 +266,8 @@ export function initMappingsTable(): void {
       -- NULL means the default selection (gap-analysis + code-review, both
       -- gating), not an empty list — see resolveReviewerSelection().
       reviewers TEXT,
-      pr_dispatch_budget INTEGER
+      pr_dispatch_budget INTEGER,
+      review_fix_lifecycle TEXT
     )
   `);
   ensureMappingsColumns();
