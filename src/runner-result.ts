@@ -2,6 +2,7 @@ import { readFileSync, existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import type { FailureRecord } from "./pipeline/failure-classification.js";
 import type { FindingDisposition } from "./pipeline/finding-dispositions.js";
+import type { CycleSummary } from "./pipeline/cycle-summary.js";
 import type { ReferenceRepoResult } from "./reference-repos.js";
 import type { ReviewFixResultMetadataV1 } from "./review-fix-contract.js";
 import { computeBackoffMs, DEFAULT_RETRY_POLICY, type RetryPolicy } from "./pipeline/retry-backoff.js";
@@ -128,6 +129,13 @@ export async function postRunnerResult(params: {
   referenceRepoResults?: ReferenceRepoResult[];
   /** Per-finding disposition from the fixing agent (fixed/follow-up/invalid), present only when non-empty. */
   findingDispositions?: FindingDisposition[];
+  /**
+   * Per-cycle evidence records read back from this run's declared cycle-summary file (AII-801,
+   * ./pipeline/cycle-summary.js), present only when non-empty. The caller (run-autonomous.ts)
+   * only attaches these alongside a `reviewFix` marker — a Legacy run has no attemptId for the
+   * orchestrator to record them against.
+   */
+  cycleSummaries?: CycleSummary[];
   /** SHA of the snapshot commit pushed by a kg-refresh runner. Only meaningful for phase=kg-refresh. */
   snapshotCommit?: string | null;
   /** Number of the refresh PR opened alongside snapshotCommit. Only meaningful for phase=kg-refresh. */
@@ -184,6 +192,9 @@ export async function postRunnerResult(params: {
   }
   if (params.findingDispositions && params.findingDispositions.length > 0) {
     body.findingDispositions = params.findingDispositions;
+  }
+  if (params.cycleSummaries && params.cycleSummaries.length > 0) {
+    body.cycleSummaries = params.cycleSummaries;
   }
   if (params.snapshotCommit) body.snapshotCommit = params.snapshotCommit;
   if (params.snapshotPr) body.snapshotPr = params.snapshotPr;

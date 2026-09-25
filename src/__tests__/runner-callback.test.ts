@@ -10,6 +10,8 @@ import type * as StepLogModule from "../step-log.js";
 import type * as ReviewLedgerStoreModule from "../review-ledger-store.js";
 import type * as ReviewFixQueueModule from "../review-fix-queue.js";
 import type * as CommentGapfillQueueModule from "../comment-gapfill-queue.js";
+import type * as ReviewFixEvidenceModule from "../review-fix-evidence.js";
+import type { CycleSummary } from "../pipeline/cycle-summary.js";
 import { formatFailureComment, boundStatusText } from "../runner-callback.js";
 import { FakeProvider } from "./providers/fake.js";
 import { STUCK_JOB_MAX_ATTEMPTS } from "../stuck-watchdog.js";
@@ -65,6 +67,7 @@ let stepLog: typeof StepLogModule;
 let reviewStore: typeof ReviewLedgerStoreModule;
 let reviewFixQueue: typeof ReviewFixQueueModule;
 let commentGapfillQueue: typeof CommentGapfillQueueModule;
+let reviewFixEvidence: typeof ReviewFixEvidenceModule;
 
 beforeEach(async () => {
   vi.resetModules();
@@ -81,6 +84,7 @@ beforeEach(async () => {
   reviewStore = await import("../review-ledger-store.js");
   reviewFixQueue = await import("../review-fix-queue.js");
   commentGapfillQueue = await import("../comment-gapfill-queue.js");
+  reviewFixEvidence = await import("../review-fix-evidence.js");
   dedup.getDb();
   log.initLogTable();
   stepLog.initStepLogTable();
@@ -3594,6 +3598,172 @@ describe("handleRunnerResult — reviewFix pilot marker (AII-777)", () => {
     expect(second.body.outcome).toBe("duplicate");
     // The retry classified as duplicate before any provider call — call count unchanged.
     expect(fake.recordedCalls().length).toBe(callsAfterFirst);
+  });
+});
+
+describe("handleRunnerResult — cycle summary durable evidence (AII-801)", () => {
+  const validReviewFix: ReviewFixResultMetadataV1 = {
+    version: 1,
+    attemptId: "attempt-cycles-1",
+    installationId: 1,
+    repository: "acme/widgets",
+    prNumber: 42,
+    deadlineAt: 1_800_000_000_000,
+    githubRunId: 555,
+    githubRunAttempt: 1,
+    outputCommit: "a".repeat(40),
+  };
+
+  function baseCycleSummary(overrides: Partial<CycleSummary> = {}): CycleSummary {
+    return {
+      id: "feedback-loop.1",
+      stage: "feedback-loop",
+      cycle: 1,
+      inputCommit: "a".repeat(40),
+      outputCommit: null,
+      outputCommitStatus: "pending_push",
+      dispositions: [],
+      tests: [{ name: "test execution", status: "missing" }],
+      verdict: { approved: true, reason: "approved" },
+      usage: { tokensIn: 10, tokensOut: 20, costUsd: 0.01 },
+      truncated: false,
+      limitReached: false,
+      completedAt: 1_700_000_000_000,
+      ...overrides,
+    };
+  }
+
+  async function postResult(body: Partial<RunnerCallbackModule.RunnerResultBody>) {
+    const fake = new FakeProvider({ recordCalls: true });
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    return runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: { phase: "implementation", outcome: "success", comments: [], prUrl: "https://github.com/o/r/pull/1", ...body },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+    });
+  }
+
+  // This test never touches a workspace directory or the `ai-output/cycle-summaries.jsonl` file
+  // at all — the record it verifies exists only because `handleRunnerResult` (the orchestrator
+  // side of the production `/runner/result` boundary) stored it in the real SQLite database this
+  // suite points `getDb()` at. That is precisely the gap the AII-801 blocking review flagged:
+  // proof that a cycle survives past the runner workspace/container, not just within one test's
+  // in-process file round-trip.
+  it("durably records a cycle summary via the production /runner/result boundary, readable after the callback returns", async () => {
+    const summary = baseCycleSummary();
+
+    const res = await postResult({ reviewFix: validReviewFix, cycleSummaries: [summary] });
+
+    expect(res.status).toBe(200);
+    const stored = reviewFixEvidence.getReviewFixCycleSummary(validReviewFix.attemptId, 1);
+    expect(stored).not.toBeNull();
+    expect(stored).toMatchObject({
+      attemptId: validReviewFix.attemptId,
+      cycle: 1,
+      inputCommit: summary.inputCommit,
+      outputCommit: summary.outputCommit,
+      tests: summary.tests,
+      usage: summary.usage,
+      completedAt: summary.completedAt,
+    });
+    expect(JSON.parse(stored!.verdict)).toEqual(summary.verdict);
+  });
+
+  it("bands a post-push-review-fix cycle into a disjoint number so it never collides with a feedback-loop cycle on the same attempt", async () => {
+    const feedbackLoopCycle = baseCycleSummary({ id: "feedback-loop.1", stage: "feedback-loop", cycle: 1 });
+    const fixCycle = baseCycleSummary({
+      id: "post-push-review.fix-1",
+      stage: "post-push-review-fix",
+      cycle: 1,
+      outputCommit: "c".repeat(40),
+      outputCommitStatus: "committed",
+      verdict: { approved: null, reason: "fixed" },
+    });
+
+    const res = await postResult({ reviewFix: validReviewFix, cycleSummaries: [feedbackLoopCycle, fixCycle] });
+
+    expect(res.status).toBe(200);
+    const all = reviewFixEvidence.listReviewFixCycleSummaries(validReviewFix.attemptId);
+    expect(all).toHaveLength(2);
+    const storedFeedbackLoop = reviewFixEvidence.getReviewFixCycleSummary(validReviewFix.attemptId, 1);
+    const storedFixPass = reviewFixEvidence.getReviewFixCycleSummary(validReviewFix.attemptId, 100_001);
+    expect(storedFeedbackLoop?.outputCommit).toBe(null);
+    expect(storedFixPass?.outputCommit).toBe("c".repeat(40));
+  });
+
+  it("maps the fix agent's fixed/invalid/follow-up dispositions onto the durable store's addressed/dismissed/deferred vocabulary", async () => {
+    const summary = baseCycleSummary({
+      dispositions: [
+        { key: "a".repeat(64), disposition: "fixed" },
+        { key: "b".repeat(64), disposition: "invalid" },
+        { key: "c".repeat(64), disposition: "follow-up" },
+      ],
+    });
+
+    const res = await postResult({ reviewFix: validReviewFix, cycleSummaries: [summary] });
+
+    expect(res.status).toBe(200);
+    const stored = reviewFixEvidence.getReviewFixCycleSummary(validReviewFix.attemptId, 1);
+    expect(stored?.dispositions).toEqual([
+      { findingKey: "a".repeat(64), disposition: "addressed" },
+      { findingKey: "b".repeat(64), disposition: "dismissed" },
+      { findingKey: "c".repeat(64), disposition: "deferred" },
+    ]);
+  });
+
+  it("drops a malformed cycle summary entry, logs the drop count, and still records the valid ones", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const summary = baseCycleSummary();
+
+    const res = await postResult({
+      reviewFix: validReviewFix,
+      cycleSummaries: [summary, { bogus: true }] as unknown as CycleSummary[],
+    });
+
+    expect(res.status).toBe(200);
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("Dropped 1 invalid cycle summary record(s)"));
+    expect(reviewFixEvidence.getReviewFixCycleSummary(validReviewFix.attemptId, 1)).not.toBeNull();
+    warnSpy.mockRestore();
+  });
+
+  it("never records a cycle summary for a Legacy result with no reviewFix marker", async () => {
+    const summary = baseCycleSummary();
+
+    const res = await postResult({ cycleSummaries: [summary] });
+
+    expect(res.status).toBe(200);
+    const count = dedup.getDb().prepare("SELECT COUNT(*) as c FROM review_fix_cycles").get() as { c: number };
+    expect(count.c).toBe(0);
+  });
+
+  it("reposting the identical attempt+cycle content is a no-op; a conflicting retry is rejected, logged, and never overwrites the first-recorded evidence", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const summary = baseCycleSummary();
+
+    const first = await postResult({ reviewFix: validReviewFix, cycleSummaries: [summary] });
+    expect(first.status).toBe(200);
+
+    // Byte-identical replay (e.g. a retried delivery of the same terminal result): a silent no-op.
+    const second = await postResult({ reviewFix: validReviewFix, cycleSummaries: [summary] });
+    expect(second.status).toBe(200);
+    expect(reviewFixEvidence.listReviewFixCycleSummaries(validReviewFix.attemptId)).toHaveLength(1);
+
+    // A different payload for the same (attemptId, cycle) identity: rejected, not merged.
+    const conflicting = baseCycleSummary({ verdict: { approved: false, reason: "changes_requested" } });
+    const third = await postResult({ reviewFix: validReviewFix, cycleSummaries: [conflicting] });
+    expect(third.status).toBe(200);
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("not recorded (conflict)"));
+
+    const stored = reviewFixEvidence.getReviewFixCycleSummary(validReviewFix.attemptId, 1);
+    expect(JSON.parse(stored!.verdict)).toEqual(summary.verdict);
+    warnSpy.mockRestore();
   });
 });
 

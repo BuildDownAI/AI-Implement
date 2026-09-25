@@ -6176,7 +6176,7 @@ describe("postPushReviewStep — cycle summaries (AII-801)", () => {
       .map((line) => JSON.parse(line));
   }
 
-  it("records a committed cycle summary with an inferred passed test status after a successful fix-pass push", async () => {
+  it("records a committed cycle summary with an unobserved (not inferred-passed) test status after a successful fix-pass push", async () => {
     const workspaceDir = makeWorkspaceDir();
     try {
       const ghSpawn = vi.fn((args: string[]) => {
@@ -6228,7 +6228,10 @@ describe("postPushReviewStep — cycle summaries (AII-801)", () => {
       expect(summary!.outputCommitStatus).toBe("committed");
       expect(summary!.outputCommit).toBe("abc1234567890abc1234567890abc1234567890");
       expect(summary!.verdict).toMatchObject({ approved: null, reason: "fixed" });
-      expect(summary!.tests.some((t) => t.status === "passed")).toBe(true);
+      // The fix agent's testing[] note ("npm test -- all passed") is self-reported, not an
+      // observed tool result — it must never be read as an inferred "passed" (AII-801 review).
+      expect(summary!.tests.length).toBeGreaterThan(0);
+      expect(summary!.tests.every((t) => t.status === "unobserved")).toBe(true);
       expect(summary!.usage).toMatchObject({ tokensIn: 50, tokensOut: 25, costUsd: 0.1 });
     } finally {
       fs.rmSync(workspaceDir, { recursive: true, force: true });

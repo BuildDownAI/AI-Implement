@@ -37,6 +37,9 @@ import {
 import { isLinearAuthConfigured, withLinearToken } from "./linear-app-auth.js";
 import { isFailureRecord, projectFailureRecord, type FailureRecord } from "./pipeline/failure-classification.js";
 import { sanitizeFindingDispositions, type FindingDisposition } from "./pipeline/finding-dispositions.js";
+import { sanitizeCycleSummaries, type CycleSummary, type CycleDisposition } from "./pipeline/cycle-summary.js";
+import { recordReviewFixCycleSummary } from "./review-fix-evidence.js";
+import type { ReviewFixFindingDisposition } from "./review-fix-ports.js";
 import {
   REVIEW_FIX_CONTRACT_VERSION,
   REVIEW_FIX_ACTIVITY_VERSION,
@@ -131,6 +134,15 @@ export interface RunnerResultBody {
   referenceRepoResults?: ReferenceRepoResult[];
   /** Per-finding disposition from the fixing agent (fixed/follow-up/invalid). Shape-validated below. */
   findingDispositions?: FindingDisposition[];
+  /**
+   * Per-cycle evidence records forwarded from the runner workspace's declared cycle-summary file
+   * (AII-801, pipeline/cycle-summary.ts). Shape-validated below; an unrecognised/malformed entry
+   * is dropped rather than failing the callback, same convention as `findingDispositions`.
+   * Recorded durably (`recordReviewFixCycleSummary`, review-fix-evidence.ts) only when this
+   * result also carries a validated `reviewFix` marker — a Legacy run has no attemptId to record
+   * against, so its cycle summaries (if any were even forwarded) are acknowledged and dropped.
+   */
+  cycleSummaries?: CycleSummary[];
   /**
    * Optional pilot marker (AII-769 Restate review-fix pilot; shape defined by
    * AII-770's review-fix-contract.ts). Present only on a result reported by a
@@ -380,6 +392,76 @@ export function reviewFixResultIntakeResponse(outcome: ResultIntakeOutcome): Han
 }
 
 /**
+ * `review_fix_cycles` predates AII-801 and keys evidence on `(attemptId, cycle)` alone (AII-786,
+ * src/dedup.ts) — it has no stage column to separate a feedback-loop implement/review pass from a
+ * post-push-review fix pass sharing the same attempt, and both stages number their own cycles
+ * starting at 1. Recording both under their raw `cycle` would collide and misclassify a genuine
+ * second stream as a conflicting retry of the first. Until a schema change adds a stage column
+ * (tracked with the rest of AII-790's "apply attempt outcomes under one authority" work), a
+ * post-push-review-fix cycle is offset into a disjoint numeric band well above any realistic
+ * feedback-loop iteration count, keeping the two streams distinguishable without touching the
+ * frozen schema.
+ */
+const POST_PUSH_REVIEW_FIX_CYCLE_BAND = 100_000;
+
+function reviewFixCycleRecordNumber(summary: CycleSummary): number {
+  return summary.stage === "post-push-review-fix" ? POST_PUSH_REVIEW_FIX_CYCLE_BAND + summary.cycle : summary.cycle;
+}
+
+/**
+ * Cycle-summary evidence (AII-801) dispositions use the fix agent's own fixed/invalid/follow-up
+ * vocabulary (`Disposition`, pipeline/finding-dispositions.ts); `review_fix_cycles`' disposition
+ * field predates it and uses addressed/dismissed/deferred instead (AII-786). This is an
+ * evidence-only mapping for durable storage — nothing reads `review_fix_cycles.dispositions_json`
+ * back into `applyApproval` today (that reads `findingDispositions` from a separate path) — so an
+ * unrecognised value is dropped rather than failing the whole record.
+ */
+const CYCLE_DISPOSITION_TO_REVIEW_FIX: Record<string, ReviewFixFindingDisposition["disposition"]> = {
+  fixed: "addressed",
+  invalid: "dismissed",
+  "follow-up": "deferred",
+};
+
+function toReviewFixDispositions(dispositions: readonly CycleDisposition[]): ReviewFixFindingDisposition[] {
+  const out: ReviewFixFindingDisposition[] = [];
+  for (const d of dispositions) {
+    const mapped = CYCLE_DISPOSITION_TO_REVIEW_FIX[d.disposition];
+    if (mapped) out.push({ findingKey: d.key, disposition: mapped });
+  }
+  return out;
+}
+
+/**
+ * Forwards this result's shape-validated cycle summaries into the durable `review_fix_cycles`
+ * store (AII-786, review-fix-evidence.ts), completing the path AII-801's blocking review asked
+ * for: a cycle written to the runner workspace's declared file is no longer lost when the
+ * workspace/container tears down. Called only when the result also carried a validated
+ * `reviewFix` marker — `attemptId` is that marker's, never invented here. Never throws: a
+ * rejected/conflicting record is logged and otherwise ignored, matching the non-fatal,
+ * best-effort convention `writeCycleSummary` itself already uses.
+ */
+function recordCycleSummaries(attemptId: string, summaries: readonly CycleSummary[]): void {
+  for (const summary of summaries) {
+    const outcome = recordReviewFixCycleSummary({
+      attemptId,
+      cycle: reviewFixCycleRecordNumber(summary),
+      inputCommit: summary.inputCommit,
+      outputCommit: summary.outputCommit,
+      dispositions: toReviewFixDispositions(summary.dispositions),
+      tests: summary.tests,
+      verdict: JSON.stringify(summary.verdict),
+      usage: summary.usage,
+      completedAt: summary.completedAt,
+    });
+    if (outcome.status === "conflict" || outcome.status === "rejected") {
+      console.warn(
+        `[runner-callback] cycle summary "${summary.id}" for attempt ${attemptId} not recorded (${outcome.status}): ${outcome.reason}`,
+      );
+    }
+  }
+}
+
+/**
  * The only retryable outcome in the review-fix pilot's result/activity
  * contract is a transient failure: a 429/5xx response, or a transport-level
  * failure that never reached this classification at all. A durable
@@ -467,6 +549,7 @@ export async function handleRunnerResult(
     comments?: unknown;
     failure?: unknown;
     findingDispositions?: unknown;
+    cycleSummaries?: unknown;
     reviewFix?: unknown;
   } | null | undefined;
   if (!body || typeof body !== "object") return bad(400, "invalid_body");
@@ -499,6 +582,10 @@ export async function handleRunnerResult(
   // `findingDispositions` below, a malformed marker must never reach the
   // legacy success branch, and a "duplicate"/"conflict"/"stale" classification
   // must be fully side-effect-free (no token burned, no comment posted).
+  // `recordedReviewFixAttemptId` is set only once this marker is confirmed live
+  // ("stored") — a Legacy result (no marker) or a duplicate/conflict/stale one
+  // (which returns early above) never reaches the cycle-summary recording below.
+  let recordedReviewFixAttemptId: string | undefined;
   if (body.reviewFix !== undefined) {
     const validated = validateResultReviewFix(body.reviewFix);
     if (!validated.ok) return bad(400, validated.error);
@@ -509,6 +596,7 @@ export async function handleRunnerResult(
     if (outcome.status !== "stored") {
       return reviewFixResultIntakeResponse(outcome);
     }
+    recordedReviewFixAttemptId = validated.value.attemptId;
   }
 
   // Note: token is consumed atomically here BEFORE any provider call. If
@@ -563,6 +651,19 @@ export async function handleRunnerResult(
   input.body.findingDispositions = sanitizedFindingDispositions;
   if (droppedFindingDispositions > 0) {
     console.warn(`[runner-callback] Dropped ${droppedFindingDispositions} invalid finding disposition(s)`);
+  }
+
+  // Same sanitize-and-drop treatment again, then durably recorded (AII-801) — but only when this
+  // result also carried a live `reviewFix` marker: a Legacy run has no attemptId to record
+  // against, so its cycle summaries (if any were even forwarded) are acknowledged and dropped.
+  const { valid: sanitizedCycleSummaries, dropped: droppedCycleSummaries } =
+    sanitizeCycleSummaries(body.cycleSummaries);
+  input.body.cycleSummaries = sanitizedCycleSummaries;
+  if (droppedCycleSummaries > 0) {
+    console.warn(`[runner-callback] Dropped ${droppedCycleSummaries} invalid cycle summary record(s)`);
+  }
+  if (recordedReviewFixAttemptId && sanitizedCycleSummaries.length > 0) {
+    recordCycleSummaries(recordedReviewFixAttemptId, sanitizedCycleSummaries);
   }
 
   // kg-refresh runs have no mapping and no tracker issue to update.

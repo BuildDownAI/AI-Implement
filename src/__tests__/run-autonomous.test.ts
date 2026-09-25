@@ -21,6 +21,7 @@ import { encodeRunConfig } from "../run-config.js";
 import type { LLMExecutor, PipelineDefinition, StepModule } from "../pipeline/types.js";
 import { __resetPublicationCredentialForTests } from "../publication-credential.js";
 import { DISPOSITIONS_FILE, stableReviewFindingKey, type FindingDisposition } from "../pipeline/finding-dispositions.js";
+import { CYCLE_SUMMARY_FILE, type CycleSummary } from "../pipeline/cycle-summary.js";
 import type { GhSpawn } from "../pipeline/review-ledger.js";
 import type { ReviewFixMetadataV1 } from "../review-fix-contract.js";
 
@@ -984,6 +985,101 @@ describe("runAutonomous", () => {
         githubRunAttempt: 2,
         outputCommit: publishedCommit,
       });
+    });
+
+    it("forwards this run's declared cycle summaries alongside an attached reviewFix marker (AII-801)", async () => {
+      stubReviewFixEnvelope();
+      vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+      vi.stubEnv("RUN_TOKEN", "run-token");
+      vi.stubEnv("GITHUB_RUN_ID", "999888");
+      vi.stubEnv("GITHUB_RUN_ATTEMPT", "2");
+
+      const cycleSummary: CycleSummary = {
+        id: "feedback-loop.1",
+        stage: "feedback-loop",
+        cycle: 1,
+        inputCommit: "a".repeat(40),
+        outputCommit: null,
+        outputCommitStatus: "pending_push",
+        dispositions: [],
+        tests: [{ name: "test execution", status: "missing" }],
+        verdict: { approved: true, reason: "approved" },
+        usage: { tokensIn: 10, tokensOut: 20, costUsd: 0.01 },
+        truncated: false,
+        limitReached: false,
+        completedAt: 1_700_000_000_000,
+      };
+      mkdirSync(join(workspaceDir, "ai-output"), { recursive: true });
+      writeFileSync(join(workspaceDir, CYCLE_SUMMARY_FILE), `${JSON.stringify(cycleSummary)}\n`);
+
+      const publishedCommit = "b".repeat(40);
+      const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+      const { pipeline, runner } = makeStepsPipeline([
+        ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true }) }],
+        [
+          "push",
+          {
+            run: vi.fn().mockResolvedValue({
+              prUrl: "https://github.com/acme/app/pull/42",
+              prNumber: 42,
+              branchPushed: true,
+              commitSha: publishedCommit,
+              draft: false,
+            }),
+          },
+        ],
+      ]);
+
+      const result = await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeMockExecutor(0),
+        fetchImpl: mockFetch,
+      });
+
+      expect(result.exitCode).toBe(0);
+      const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as { cycleSummaries?: CycleSummary[] };
+      expect(body.cycleSummaries).toEqual([cycleSummary]);
+    });
+
+    it("sends no cycleSummaries field when the run wrote none", async () => {
+      stubReviewFixEnvelope();
+      vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+      vi.stubEnv("RUN_TOKEN", "run-token");
+      vi.stubEnv("GITHUB_RUN_ID", "999888");
+      vi.stubEnv("GITHUB_RUN_ATTEMPT", "2");
+
+      const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+      const { pipeline, runner } = makeStepsPipeline([
+        ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true }) }],
+        [
+          "push",
+          {
+            run: vi.fn().mockResolvedValue({
+              prUrl: "https://github.com/acme/app/pull/42",
+              prNumber: 42,
+              branchPushed: true,
+              commitSha: "b".repeat(40),
+              draft: false,
+            }),
+          },
+        ],
+      ]);
+
+      const result = await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeMockExecutor(0),
+        fetchImpl: mockFetch,
+      });
+
+      expect(result.exitCode).toBe(0);
+      const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as { cycleSummaries?: CycleSummary[] };
+      expect(body.cycleSummaries).toBeUndefined();
     });
 
     it("skips delivery and logs an explicit no-result outcome on a grouping-parent no-op success — never an unmarked Legacy POST for a pilot attempt", async () => {

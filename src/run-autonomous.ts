@@ -44,6 +44,7 @@ import {
   replyToDispositionThreads,
   type FindingDisposition,
 } from "./pipeline/finding-dispositions.js";
+import { readCycleSummaries } from "./pipeline/cycle-summary.js";
 import type { GhSpawn } from "./pipeline/review-ledger.js";
 
 /**
@@ -485,12 +486,20 @@ function resolveReviewFixResult(
  * resolves cleanly. A pilot dispatch whose evidence can't be completed skips the network call
  * entirely and logs an explicit no-result outcome — see resolveReviewFixResult's doc comment for
  * why a partial or unmarked delivery is never sent instead.
+ *
+ * When a `reviewFix` marker attaches, this also reads back this run's declared cycle-summary
+ * file (AII-801, ./pipeline/cycle-summary.js) and forwards its records on the same call —
+ * mirroring how `findingDispositions` is already read from the workspace and forwarded here.
+ * The orchestrator's `handleRunnerResult` records each one into the durable `review_fix_cycles`
+ * store keyed by this attempt's id, which is the only identity a Legacy (non-pilot) run lacks —
+ * so a Legacy result never attaches cycle summaries, matching `writeCycleSummary`'s own
+ * "no attemptId to record against" limitation (docs/cycle-summary-evidence.md).
  */
 async function reportRunnerResult(
   identity: ReviewFixMetadataV1 | undefined,
   outputCommit: string | null,
   env: NodeJS.ProcessEnv,
-  params: Omit<Parameters<typeof postRunnerResult>[0], "reviewFix">,
+  params: Omit<Parameters<typeof postRunnerResult>[0], "reviewFix" | "cycleSummaries">,
 ): Promise<void> {
   const resolution = resolveReviewFixResult(identity, outputCommit, env);
   if (resolution.kind === "no-result") {
@@ -500,8 +509,10 @@ async function reportRunnerResult(
     );
     return;
   }
+  const cycleSummaries = resolution.kind === "attached" ? readCycleSummaries(params.workspaceDir) : [];
   await postRunnerResult({
     ...params,
+    ...(cycleSummaries.length > 0 ? { cycleSummaries } : {}),
     reviewFix: resolution.kind === "attached" ? resolution.reviewFix : undefined,
   });
 }

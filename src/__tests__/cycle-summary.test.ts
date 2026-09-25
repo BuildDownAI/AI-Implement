@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtempSync, rmSync, appendFileSync, existsSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -77,13 +77,26 @@ describe("cycle-summary", () => {
     expect(new Set(summaries.map((s) => s.id)).size).toBe(20);
   });
 
-  it("upserts by id on retry instead of duplicating the record", () => {
+  it("is idempotent when the same id is re-written with identical content", () => {
+    writeCycleSummary(tmpDir, baseInput({ id: "feedback-loop.1", verdict: { approved: true, reason: "approved" } }));
+    writeCycleSummary(tmpDir, baseInput({ id: "feedback-loop.1", verdict: { approved: true, reason: "approved" } }));
+
+    const summaries = readCycleSummaries(tmpDir);
+    expect(summaries).toHaveLength(1);
+    expect(summaries[0]!.verdict.reason).toBe("approved");
+  });
+
+  it("rejects a conflicting payload for an already-recorded id instead of silently replacing it", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     writeCycleSummary(tmpDir, baseInput({ id: "feedback-loop.1", verdict: { approved: true, reason: "approved" } }));
     writeCycleSummary(tmpDir, baseInput({ id: "feedback-loop.1", verdict: { approved: false, reason: "changes_requested" } }));
 
     const summaries = readCycleSummaries(tmpDir);
     expect(summaries).toHaveLength(1);
-    expect(summaries[0]!.verdict.reason).toBe("changes_requested");
+    // The first-recorded summary wins; the conflicting second write is discarded, not merged.
+    expect(summaries[0]!.verdict.reason).toBe("approved");
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("conflicting cycle summary"));
+    warn.mockRestore();
   });
 
   it("redacts a secret embedded in the verdict summary", () => {
@@ -107,17 +120,56 @@ describe("cycle-summary", () => {
     expect(persisted!.truncated).toBe(true);
   });
 
-  it("falls back to the overflow cap and marks limitReached when the whole record exceeds the byte cap", () => {
-    const bigTests = Array.from({ length: 20 }, (_, i) => ({ name: `test-${i}-${"x".repeat(1000)}`, status: "passed" as const }));
+  it("bounds an individual oversized test name or disposition field rather than leaving it unbounded", () => {
+    const record = writeCycleSummary(tmpDir, baseInput({
+      tests: [{ name: "x".repeat(5000), status: "unobserved" }],
+      dispositions: [{ key: "f".repeat(5000), disposition: "fixed: " + "d".repeat(5000) }],
+    }));
 
-    const record = writeCycleSummary(tmpDir, baseInput({ tests: bigTests }));
+    expect(record.tests[0]!.name.length).toBeLessThan(300);
+    expect(record.dispositions[0]!.key.length).toBeLessThan(300);
+    expect(record.dispositions[0]!.disposition.length).toBeLessThan(300);
+    expect(record.truncated).toBe(true);
+  });
+
+  it("falls back to the overflow cap and marks limitReached when many per-field-capped entries still exceed the byte cap", () => {
+    // Each entry is individually capped at write time (below the per-field char limit), so
+    // hitting the byte cap here requires enough *entries*, not merely long strings on a few.
+    const manyDispositions = Array.from({ length: 200 }, (_, i) => ({
+      key: `finding-${i}-${"a".repeat(300)}`,
+      disposition: `fixed-${"b".repeat(300)}`,
+    }));
+
+    const record = writeCycleSummary(tmpDir, baseInput({ dispositions: manyDispositions }));
 
     expect(Buffer.byteLength(JSON.stringify(record), "utf-8")).toBeLessThanOrEqual(CYCLE_SUMMARY_MAX_BYTES);
     expect(record.limitReached).toBe(true);
     expect(record.truncated).toBe(true);
-    expect(record.tests.length).toBeLessThanOrEqual(10);
+    expect(record.dispositions.length).toBeLessThanOrEqual(10);
+    for (const d of record.dispositions) {
+      expect(d.key.length).toBeLessThan(300);
+      expect(d.disposition.length).toBeLessThan(300);
+    }
     const [persisted] = readCycleSummaries(tmpDir);
-    expect(persisted!.tests.length).toBeLessThanOrEqual(10);
+    expect(persisted!.dispositions.length).toBeLessThanOrEqual(10);
+  });
+
+  it("collapses to the placeholder shape when even the overflow cap still exceeds the byte cap", () => {
+    // Each field sits at the per-field character cap (200) using a 3-byte-UTF-8 filler, so
+    // ten entries of each still serialize past 16 KiB after the ten-entry overflow fallback —
+    // forcing the final placeholder-shape fallback rather than merely re-slicing to 10.
+    const filler = "€".repeat(200);
+    const tenTests = Array.from({ length: 10 }, () => ({ name: filler, status: "unobserved" as const }));
+    const tenDispositions = Array.from({ length: 10 }, () => ({ key: filler, disposition: filler }));
+
+    const record = writeCycleSummary(tmpDir, baseInput({ tests: tenTests, dispositions: tenDispositions }));
+
+    expect(Buffer.byteLength(JSON.stringify(record), "utf-8")).toBeLessThanOrEqual(CYCLE_SUMMARY_MAX_BYTES);
+    expect(record.limitReached).toBe(true);
+    expect(record.truncated).toBe(true);
+    // The placeholder keeps `tests` non-empty rather than silently dropping the field.
+    expect(record.tests.length).toBeGreaterThan(0);
+    expect(record.dispositions).toEqual([]);
   });
 
   it("does not throw when the write fails (non-fatal, best-effort)", () => {
@@ -150,14 +202,23 @@ describe("cycle-summary", () => {
       expect(results).toEqual([{ name: "test execution", status: "missing" }]);
     });
 
-    it("records failed status when a test-command line reports failure", () => {
-      const results = inferTestResults(["Bash npm test -- 2 failed, 5 passed"]);
-      expect(results[0]!.status).toBe("failed");
+    it("never infers passed from a pass-looking command that has no observed result (regression)", () => {
+      // The command was mentioned (a tool_use input, per extractToolTrace) but there is no
+      // matching tool result/exit status recorded anywhere — "passed" in the text is not
+      // evidence the tests ran, let alone passed.
+      const results = inferTestResults(["npm test --grep passed"]);
+      expect(results[0]!.status).toBe("unobserved");
     });
 
-    it("records skipped status explicitly rather than passed", () => {
+    it("never infers failed from a fail-looking command that has no observed result", () => {
+      const results = inferTestResults(["Bash npm test -- 2 failed, 5 passed"]);
+      expect(results[0]!.status).toBe("unobserved");
+    });
+
+    it("never infers skipped from a skip-looking command that has no observed result", () => {
       const results = inferTestResults(["Bash npm test skipped due to missing fixture"]);
-      expect(results.some((r) => r.status === "skipped")).toBe(true);
+      expect(results.every((r) => r.status !== "skipped")).toBe(true);
+      expect(results[0]!.status).toBe("unobserved");
     });
 
     it("records unobserved when a recognised test command's outcome cannot be read", () => {
@@ -165,9 +226,9 @@ describe("cycle-summary", () => {
       expect(results[0]!.status).toBe("unobserved");
     });
 
-    it("records passed only when a pass token accompanies the test command", () => {
-      const results = inferTestResults(["Bash npm test -- 12 passed"]);
-      expect(results[0]!.status).toBe("passed");
+    it("treats a fix agent's self-reported free-text testing note the same as any other unverified mention", () => {
+      const results = inferTestResults(["npm test -- all passed"]);
+      expect(results[0]!.status).toBe("unobserved");
     });
 
     it("redacts a secret embedded in the matched line", () => {
