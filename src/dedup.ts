@@ -64,6 +64,20 @@ function ensureReviewFixInboxColumns(): void {
   }
 }
 
+/** AII-792: the source event identity a webhook-intake caller supplies to
+ *  `acceptReviewFixWebhookEvent` (review-fix-queue.ts) — the GitHub delivery id when
+ *  present, else a synthesized hash. NULL for the pre-existing internal producers
+ *  (open_pr, lease_rejected) that never carry one, so the partial unique index below
+ *  never conflicts across them. */
+function ensureReviewFixEventsColumns(): void {
+  if (!db) return;
+  const info = db.prepare("PRAGMA table_info(review_fix_events)").all() as Array<{ name: string }>;
+  const names = new Set(info.map((c) => c.name));
+  if (!names.has("source_event_id")) {
+    db.exec("ALTER TABLE review_fix_events ADD COLUMN source_event_id TEXT");
+  }
+}
+
 function createRunnerTokensTable(): void {
   if (!db) return;
   db.exec(`
@@ -209,8 +223,17 @@ export function getDb(): Database.Database {
         created_at INTEGER NOT NULL
       )
     `);
+    ensureReviewFixEventsColumns();
     db.exec(`CREATE INDEX IF NOT EXISTS idx_review_fix_events_queue ON review_fix_events(queue_id, created_at)`);
     db.exec(`CREATE INDEX IF NOT EXISTS idx_review_fix_events_pr ON review_fix_events(repo, pr_number, created_at)`);
+    // A webhook-intake source event is accepted at most once per repo: a second
+    // insert attempt for the same (repo, source_event_id) is exactly the "duplicate
+    // delivery" case acceptReviewFixWebhookEvent checks for before it ever reaches
+    // this INSERT. NULL source_event_id (the legacy open_pr/lease_rejected producers)
+    // is excluded from the index, since SQLite would otherwise treat repeated NULLs
+    // as distinct anyway — the WHERE clause just makes that explicit.
+    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_review_fix_events_source_event
+      ON review_fix_events(repo, source_event_id) WHERE source_event_id IS NOT NULL`);
     db.exec(`
       CREATE TABLE IF NOT EXISTS review_fix_dispatches (
         id INTEGER PRIMARY KEY AUTOINCREMENT,

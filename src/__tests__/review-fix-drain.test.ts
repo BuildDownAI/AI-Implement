@@ -585,9 +585,12 @@ describe("guardOpenPrBeforeImplementationDispatch", () => {
     stubPrLookup({ merged: false, state: "open" });
 
     await indexModule.guardOpenPrBeforeImplementationDispatch("gh-token", issue);
+    const [queued] = reviewFixQueue.getPendingReviewFixes();
+    reviewFixQueue.updateReviewFixStatus(queued!.id, "dispatched");
     await indexModule.guardOpenPrBeforeImplementationDispatch("gh-token", issue);
 
-    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(1);
+    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(0);
+    expect(reviewFixQueue.listReviewFixEvents(queued!.id)).toHaveLength(1);
   });
 
   it("dispatches (returns false) when the PR is closed and not merged", async () => {

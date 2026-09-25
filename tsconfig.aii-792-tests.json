@@ -1,0 +1,11 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "noEmit": true, "declaration": false },
+  "include": [
+    "src/__tests__/review-fix-queue.test.ts",
+    "src/__tests__/review-fix-drain.test.ts",
+    "src/__tests__/runner-callback.test.ts",
+    "src/__tests__/webhook.test.ts"
+  ],
+  "exclude": []
+}
