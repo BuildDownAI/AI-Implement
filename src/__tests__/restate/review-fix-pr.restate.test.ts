@@ -169,6 +169,9 @@ describe("ReviewFixPR durable coordination", () => {
     state.terminal = { status: "succeeded", outputCommit: SHA };
     const result: ReviewFixResultMetadataV1 = { version: 1, attemptId: prepared.attemptId,
       ...prepared.scope, ...state.execution!, deadlineAt: prepared.deadlineAt, outputCommit: SHA };
+    // Production callback intake has already persisted this exact result by
+    // the time its inbox delivery invokes the Restate shared handler.
+    state.result = result;
     await callWorkflow(env.baseUrl(), "ReviewFixAttempt", prepared.attemptId, "result", result);
     await attachWorkflow(env.baseUrl(), "ReviewFixAttempt", prepared.attemptId);
     expect(state.released).toBe(true);

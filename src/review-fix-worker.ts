@@ -429,7 +429,7 @@ export interface GithubReviewFixWorkerDeps {
   credentials: ReviewFixWorkerCredentialResolver;
   /** Mint callback bearers inside the launch adapter, after preparation. The
    * returned values go only to the GitHub dispatch request, never to Restate. */
-  callbackInputs?: (attemptId: AttemptId) => Promise<Pick<DispatchInputs, "run_token" | "run_progress_token" | "runner_callback_url">>;
+  callbackInputs?: (attemptId: AttemptId) => Promise<Pick<DispatchInputs, "run_token" | "run_progress_token" | "run_publication_token" | "runner_callback_url">>;
   /** Defaults to `githubActionsReviewFixWorkerTransport`. Overridden by tests with a
    *  controllable double. */
   transport?: ReviewFixWorkerTransport;

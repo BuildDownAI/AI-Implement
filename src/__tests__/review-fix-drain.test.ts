@@ -10,6 +10,7 @@ import type * as IndexModule from "../index.js";
 import type * as ReviewFixQueueModule from "../review-fix-queue.js";
 import type * as LocalGapfillModule from "../local-gapfill.js";
 import type * as AdmissionModule from "../dispatch-admission.js";
+import type * as RestateStatusModule from "../restate/status.js";
 import type { RepoMapping } from "../config.js";
 import type { TicketIssue } from "../providers/types.js";
 
@@ -49,6 +50,7 @@ let configModule: typeof ConfigModule;
 let indexModule: typeof IndexModule;
 let reviewFixQueue: typeof ReviewFixQueueModule;
 let admission: typeof AdmissionModule;
+let restateStatus: typeof RestateStatusModule;
 
 // processReviewFixQueue only reads githubAppId/githubAppPrivateKey (forwarded verbatim to the
 // mocked getInstallationToken) off this config in the paths these tests exercise.
@@ -132,6 +134,7 @@ beforeEach(async () => {
   configModule = await import("../config.js");
   reviewFixQueue = await import("../review-fix-queue.js");
   admission = await import("../dispatch-admission.js");
+  restateStatus = await import("../restate/status.js");
   indexModule = await import("../index.js");
 
   dedup.getDb();
@@ -162,12 +165,55 @@ afterEach(() => {
     /* ignore */
   }
   delete process.env.RUNNER_MODE;
+  restateStatus.resetRestateStatus();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
   localGapfillMocks.dispatchLocalGapfill.mockReset();
   githubAppAuthMocks.getInstallationToken.mockReset();
   githubAppAuthMocks.getInstallationId.mockReset();
   trackerPostCommentMock.mockClear();
+});
+
+describe("processReviewFixQueue — owner selection", () => {
+  function queueOne(): number {
+    return reviewFixQueue.enqueueReviewFix({ issueId: "issue-pilot", issueIdentifier: "AII-42",
+      repo: "acme/billing", prNumber: 42, reason: "review_feedback", sourceEventId: "event-pilot" });
+  }
+
+  it("signals the durable inbox for selected automatic GHA work and leaves Legacy dispatch inert", async () => {
+    process.env.RUNNER_MODE = "gha";
+    configModule.upsertMapping("TEAM", makeMapping({ reviewFixLifecycle: "restate" }));
+    restateStatus.setRestateStatus({ sidecar: { state: "ready" }, registration: { state: "registered" } });
+    const queueId = queueOne();
+    const pilotConfig = { ...mockConfig, runnerCallbackBaseUrl: "https://callback.example",
+      runnerTokenSecret: "test-secret" };
+
+    await indexModule.processReviewFixQueue(pilotConfig, mockRegistry);
+
+    expect(reviewFixQueue.getPendingReviewFixes().map((item) => item.id)).toContain(queueId);
+    expect(localGapfillMocks.dispatchLocalGapfill).not.toHaveBeenCalled();
+    expect((dedup.getDb().prepare("SELECT COUNT(*) AS n FROM dispatch_admissions").get() as { n: number }).n).toBe(0);
+    const rows = dedup.getDb().prepare("SELECT kind, authenticated_source FROM review_fix_inbox").all() as
+      Array<{ kind: string; authenticated_source: string }>;
+    expect(rows).toEqual([{ kind: "feedback", authenticated_source: "review-fix-queue" }]);
+  });
+
+  it("keeps selected work pending when registration or the runner mode is unavailable", async () => {
+    process.env.RUNNER_MODE = "gha";
+    configModule.upsertMapping("TEAM", makeMapping({ reviewFixLifecycle: "restate" }));
+    queueOne();
+    const pilotConfig = { ...mockConfig, runnerCallbackBaseUrl: "https://callback.example",
+      runnerTokenSecret: "test-secret" };
+    await indexModule.processReviewFixQueue(pilotConfig, mockRegistry);
+    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(1);
+    expect((dedup.getDb().prepare("SELECT COUNT(*) AS n FROM review_fix_inbox").get() as { n: number }).n).toBe(0);
+
+    restateStatus.setRestateStatus({ sidecar: { state: "ready" }, registration: { state: "registered" } });
+    process.env.RUNNER_MODE = "fly";
+    await indexModule.processReviewFixQueue(pilotConfig, mockRegistry);
+    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(1);
+    expect((dedup.getDb().prepare("SELECT COUNT(*) AS n FROM review_fix_inbox").get() as { n: number }).n).toBe(0);
+  });
 });
 
 describe("processReviewFixQueue — dispatch gate", () => {

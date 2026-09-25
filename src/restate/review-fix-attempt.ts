@@ -272,9 +272,13 @@ export function createReviewFixAttempt(deps: ReviewFixAttemptDependencies) {
     if (!checked.ok) throw new restate.TerminalError("invalid review-fix result metadata");
     const attemptId = validKey(ctx.key, checked.value.attemptId);
     const outcome = await ctx.run("store-result", () => store.recordResult(attemptId, checked.value));
-    if (outcome.status === "stored") {
+    if (outcome.status === "stored" || outcome.status === "duplicate") {
+      // The authenticated HTTP callback commits the result before its durable
+      // inbox delivers this signal. Delivery therefore normally sees a
+      // byte-identical duplicate, not a fresh store write. It must still wake
+      // the workflow; recordResult only returns duplicate for that same body.
       const wake = ctx.promise<Wake>("wake");
-      if (await wake.peek() === undefined) await wake.resolve({ kind: "result", result: outcome.result });
+      if (await wake.peek() === undefined) await wake.resolve({ kind: "result", result: outcome.status === "stored" ? outcome.result : checked.value });
     } else if (outcome.status === "conflict") {
       await ctx.run("revoke-conflicting-result", () => store.revokeAuthority(attemptId));
       const cancellation = ctx.promise<boolean>("cancel");

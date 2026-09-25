@@ -192,7 +192,7 @@ describe("GithubReviewFixWorker.launch", () => {
     const t = makeTransport();
     t.setDispatchImpl(async () => ({ success: true, status: 200, outcome: "accepted", runId: 9002 }));
     const callbackInputs = vi.fn(async () => ({
-      run_token: "secret-result", run_progress_token: "secret-progress",
+      run_token: "secret-result", run_progress_token: "secret-progress", run_publication_token: "secret-publication",
       runner_callback_url: "https://callback.example/runner",
     }));
     const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport, callbackInputs });
@@ -202,7 +202,7 @@ describe("GithubReviewFixWorker.launch", () => {
     const outcome = await worker.launch(plan);
     expect(callbackInputs).toHaveBeenCalledWith(plan.attemptId);
     expect((t.dispatchCalls[0] as { inputs: Record<string, unknown> }).inputs).toEqual(expect.objectContaining({
-      run_token: "secret-result", run_progress_token: "secret-progress",
+      run_token: "secret-result", run_progress_token: "secret-progress", run_publication_token: "secret-publication",
       runner_callback_url: "https://callback.example/runner",
     }));
     expect(JSON.stringify(outcome)).not.toContain("secret-");
