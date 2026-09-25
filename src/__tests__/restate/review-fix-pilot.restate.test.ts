@@ -292,8 +292,14 @@ const transport: ReviewFixWorkerTransport = {
   async dispatch(input) {
     const attemptId = input.inputs.run_attempt_token;
     if (!attemptId) throw new Error("test bug: dispatch without run_attempt_token");
-    const fixture = fixtureByAttempt.get(attemptId);
+    // Restate can launch the attempt as soon as SQLite admission commits, before
+    // the test's polling helper observes the row and records fixtureByAttempt.
+    const prepared = await sqliteStore.getPreparedAttempt(attemptId);
+    const fixture = fixtureByAttempt.get(attemptId)
+      ?? (prepared ? findFixture(prepared.scope.repository) : undefined);
     if (!fixture) throw new Error(`test bug: no fixture registered for attempt ${attemptId}`);
+    fixture.attemptId = attemptId;
+    fixtureByAttempt.set(attemptId, fixture);
     return fixture.dispatchImpl(input);
   },
   async listRuns(input) {
