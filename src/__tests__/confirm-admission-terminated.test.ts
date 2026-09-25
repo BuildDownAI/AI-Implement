@@ -6,11 +6,13 @@ import type { StaleAdmissionCandidate } from "../dispatch-admission.js";
 // confirmAdmissionTerminated (src/index.ts) is sweepStaleAdmissions' real production
 // oracle — wired in at poll()'s admission sweep — as opposed to the injected
 // CONFIRM_ALL/CONFIRM_NONE fakes exercised in dispatch-admission.test.ts. This file
-// covers the AII-783 PR #681 second review round finding: a github-actions job whose
-// runId was never linked is a reachable, still-possibly-running state (a transient
-// GitHub API hiccup, a getClaimedRunIds() exclusion, or a workflowFile/defaultBranch
-// mismatch after a resync), not proof nothing launched, so it must resolve to
-// unconfirmed rather than confirmed-terminated.
+// covers both AII-783 PR #681 review rounds: a github-actions job whose runId was never
+// linked is a reachable, still-possibly-running state (a transient GitHub API hiccup, a
+// getClaimedRunIds() exclusion, or a workflowFile/defaultBranch mismatch after a resync),
+// not proof nothing launched; and — second round — neither "no dispatch_log row at all"
+// nor "a row with no machineId/containerId" is proof either, since both can result from a
+// launch that was accepted but whose response/process was lost before it could be
+// recorded. All of these must resolve to unconfirmed rather than confirmed-terminated.
 
 vi.mock("../github.js", () => ({
   getWorkflowRunStatus: vi.fn(),
@@ -43,6 +45,7 @@ import { confirmAdmissionTerminated } from "../index.js";
 import type { AppConfig } from "../index.js";
 import { getWorkflowRunStatus, findWorkflowRunId } from "../github.js";
 import { getMachine } from "../fly-machines.js";
+import { inspectLocalContainer } from "../local-docker.js";
 import { getJobByDispatchId, attachJobRunIdIfMissing } from "../log.js";
 import { getMappings } from "../config.js";
 
@@ -198,13 +201,14 @@ describe("confirmAdmissionTerminated — fly-machines", () => {
     expect(getMachine).not.toHaveBeenCalled();
   });
 
-  it("confirms terminated when no machineId was ever recorded (nothing launched under this reservation)", async () => {
+  it("holds the reservation when a job row exists but no machineId was ever recorded — a lost launch response, not proof nothing launched (AII-783 review, second round)", async () => {
     const job = makeJob({ executionMode: "fly-machines", machineId: null });
     vi.mocked(getJobByDispatchId).mockReturnValue(job);
 
     const result = await confirmAdmissionTerminated(mockConfig, makeCandidate({ backend: "fly-machines" }));
 
-    expect(result).toBe(true);
+    expect(result).toBe(false);
+    expect(getMachine).not.toHaveBeenCalled();
   });
 
   it("confirms terminated once the machine is observed stopped", async () => {
@@ -229,11 +233,62 @@ describe("confirmAdmissionTerminated — fly-machines", () => {
 });
 
 describe("confirmAdmissionTerminated — no matching job row", () => {
-  it("confirms terminated when the dispatch_log row itself never existed (crash before appendLog)", async () => {
+  it("holds the reservation when the dispatch_log row itself never existed — indistinguishable from a crash after an accepted launch but before appendLog (AII-783 review, both rounds, on PR #681)", async () => {
     vi.mocked(getJobByDispatchId).mockReturnValue(null);
 
     const result = await confirmAdmissionTerminated(mockConfig, makeCandidate());
 
+    expect(result).toBe(false);
+  });
+});
+
+describe("confirmAdmissionTerminated — local-docker", () => {
+  it("holds the reservation when a job row exists but no containerId was ever recorded", async () => {
+    const job = makeJob({ executionMode: "local-docker", machineId: null });
+    vi.mocked(getJobByDispatchId).mockReturnValue(job);
+
+    const result = await confirmAdmissionTerminated(mockConfig, makeCandidate({ backend: "local-docker" }));
+
+    expect(result).toBe(false);
+  });
+
+  it("confirms terminated once the container is observed stopped", async () => {
+    const job = makeJob({ executionMode: "local-docker", machineId: "c-1" });
+    vi.mocked(getJobByDispatchId).mockReturnValue(job);
+    vi.mocked(inspectLocalContainer).mockResolvedValue({ status: "exited", running: false, exitCode: 0 });
+
+    const result = await confirmAdmissionTerminated(mockConfig, makeCandidate({ backend: "local-docker" }));
+
     expect(result).toBe(true);
+  });
+
+  it("holds the reservation while the container is still observed running", async () => {
+    const job = makeJob({ executionMode: "local-docker", machineId: "c-1" });
+    vi.mocked(getJobByDispatchId).mockReturnValue(job);
+    vi.mocked(inspectLocalContainer).mockResolvedValue({ status: "running", running: true, exitCode: null });
+
+    const result = await confirmAdmissionTerminated(mockConfig, makeCandidate({ backend: "local-docker" }));
+
+    expect(result).toBe(false);
+  });
+
+  it("confirms terminated when docker inspect reports the container already gone", async () => {
+    const job = makeJob({ executionMode: "local-docker", machineId: "c-1" });
+    vi.mocked(getJobByDispatchId).mockReturnValue(job);
+    vi.mocked(inspectLocalContainer).mockRejectedValue(new Error("No such container: c-1"));
+
+    const result = await confirmAdmissionTerminated(mockConfig, makeCandidate({ backend: "local-docker" }));
+
+    expect(result).toBe(true);
+  });
+
+  it("holds the reservation when docker inspect fails for an unrelated reason (daemon unreachable)", async () => {
+    const job = makeJob({ executionMode: "local-docker", machineId: "c-1" });
+    vi.mocked(getJobByDispatchId).mockReturnValue(job);
+    vi.mocked(inspectLocalContainer).mockRejectedValue(new Error("Cannot connect to the Docker daemon"));
+
+    const result = await confirmAdmissionTerminated(mockConfig, makeCandidate({ backend: "local-docker" }));
+
+    expect(result).toBe(false);
   });
 });

@@ -442,7 +442,7 @@ describe("dispatch entry points — pre-launch failure releases the reservation 
     expect(retry.ok).toBe(true);
   });
 
-  it("dispatchLocalDocker: a throw after markLaunchAttempted (container launch failure) also releases — local-docker has no ambiguous-launch window", async () => {
+  it("dispatchLocalDocker: a throw after markLaunchAttempted (container launch failure) holds the reservation — docker's CLI response can be lost after the container was actually created (AII-783 review, second round, on PR #681)", async () => {
     vi.mocked(githubAppAuth.getInstallationToken).mockResolvedValue("gh-token");
     vi.mocked(localDocker.startLocalRunnerContainer).mockRejectedValue(new Error("docker run failed"));
     const config = {
@@ -459,6 +459,9 @@ describe("dispatch entry points — pre-launch failure releases the reservation 
 
     expect(localDocker.startLocalRunnerContainer).toHaveBeenCalledOnce();
 
+    // The original reservation is still occupying the issue's slot — a same-issue
+    // retry must not be admitted a second time until the matching Legacy monitor
+    // (or the stale-admission sweep) confirms the backend actually never launched.
     const retry = gate.acquireDispatch({
       dispatchId: "retry-local-after",
       issueId: issue.id,
@@ -468,7 +471,7 @@ describe("dispatch entry points — pre-launch failure releases the reservation 
       maxInProgressAiIssues: 1,
       backend: "local-docker",
     });
-    expect(retry.ok).toBe(true);
+    expect(retry.ok).toBe(false);
   });
 });
 
@@ -832,5 +835,105 @@ describe("dispatchPlanning defers buildPlanningContextInputs until after admissi
 
     expect(planningContext.buildPlanningContextInputs).not.toHaveBeenCalled();
     expect(vi.mocked(localDocker.startLocalRunnerContainer)).not.toHaveBeenCalled();
+  });
+});
+
+// AII-783 review, third round, on PR #681: the planning callback marks its job row
+// "completed" with skipAdmissionRelease, which removes the job from getInFlightJobs()'s
+// dispatched/running set — so the normal per-poll GHA/Fly/local monitor never checks it
+// again. tryFastReleasePlanningAdmission is the fast path that takes the monitor's place:
+// one immediate confirmAdmissionTerminated check, right after the callback, instead of
+// stranding an already-finished planning run's capacity slot behind the 6-hour
+// stale-admission-sweep floor. Exercised here against the real dispatch_admissions table
+// with a mocked local-docker backend (no network calls needed to observe termination).
+describe("tryFastReleasePlanningAdmission — fast release path for the planning callback (AII-783 review, third round, on PR #681)", () => {
+  let dbPath: string;
+  let dedup: typeof DedupModule;
+  let dispatchAdmission: typeof import("../dispatch-admission.js");
+  let log: typeof import("../log.js");
+  let indexModule: typeof import("../index.js");
+  let localDocker: typeof import("../local-docker.js");
+
+  const config = { githubAppId: "id", githubAppPrivateKey: "key" } as unknown as AppConfig;
+
+  beforeEach(async () => {
+    vi.resetModules();
+    dbPath = path.join(
+      os.tmpdir(),
+      `fast-release-admission-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
+    );
+    process.env.DEDUP_DB_PATH = dbPath;
+    dedup = await import("../dedup.js");
+    dispatchAdmission = await import("../dispatch-admission.js");
+    log = await import("../log.js");
+    log.initLogTable();
+    localDocker = await import("../local-docker.js");
+    indexModule = await import("../index.js");
+    vi.mocked(localDocker.inspectLocalContainer).mockClear();
+  });
+
+  afterEach(() => {
+    dedup.closeDb();
+    try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+  });
+
+  function acquireAndLog(dispatchId: string): void {
+    const admitted = dispatchAdmission.acquire({
+      dispatchId,
+      mappingKey: "AII",
+      scope: { kind: "issue", issueScope: "AII", issueId: "issue-1" },
+      kind: "planning",
+      backend: "local-docker",
+      lifecycleOwner: { kind: "legacy" },
+      cap: 1,
+    });
+    expect(admitted.ok).toBe(true);
+    log.appendLog({
+      issueId: "issue-1",
+      issueIdentifier: "AII-1",
+      issueTitle: "Plan it",
+      teamKey: "AII",
+      repo: "o/r",
+      dispatchId,
+      executionMode: "local-docker",
+      phase: "planning",
+      machineId: "container-1",
+    });
+  }
+
+  it("releases the reservation once the backend is confirmed stopped", async () => {
+    acquireAndLog("dispatch-fast-1");
+    vi.mocked(localDocker.inspectLocalContainer).mockResolvedValue({ status: "exited", running: false, exitCode: 0 });
+
+    await indexModule.tryFastReleasePlanningAdmission(config, "dispatch-fast-1");
+
+    const record = dispatchAdmission.read("dispatch-fast-1");
+    expect(record?.releasedAt).not.toBeNull();
+    expect(dispatchAdmission.count("AII")).toBe(0);
+  });
+
+  it("leaves the reservation held while the backend is still observed running", async () => {
+    acquireAndLog("dispatch-fast-2");
+    vi.mocked(localDocker.inspectLocalContainer).mockResolvedValue({ status: "running", running: true, exitCode: null });
+
+    await indexModule.tryFastReleasePlanningAdmission(config, "dispatch-fast-2");
+
+    const record = dispatchAdmission.read("dispatch-fast-2");
+    expect(record?.releasedAt).toBeNull();
+    expect(dispatchAdmission.count("AII")).toBe(1);
+  });
+
+  it("is a no-op when no reservation exists for the dispatch id", async () => {
+    await expect(indexModule.tryFastReleasePlanningAdmission(config, "never-reserved")).resolves.toBeUndefined();
+    expect(localDocker.inspectLocalContainer).not.toHaveBeenCalled();
+  });
+
+  it("is a no-op when the reservation was already released", async () => {
+    acquireAndLog("dispatch-fast-3");
+    dispatchAdmission.releaseByDispatchId("dispatch-fast-3", "finalized");
+
+    await indexModule.tryFastReleasePlanningAdmission(config, "dispatch-fast-3");
+
+    expect(localDocker.inspectLocalContainer).not.toHaveBeenCalled();
   });
 });

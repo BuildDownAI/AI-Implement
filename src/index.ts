@@ -11,7 +11,13 @@ import {
 import type { RepoMapping } from "./config.js";
 import { markDispatched, closeDb, getDispatchedIds, deleteDispatched } from "./dedup.js";
 import { canDispatch, acquireDispatch, type DispatchKind, type AcquireDispatchOutcome } from "./dispatch-gate.js";
-import { count as countAdmissionReservations, sweepStaleAdmissions, type StaleAdmissionCandidate } from "./dispatch-admission.js";
+import {
+  count as countAdmissionReservations,
+  sweepStaleAdmissions,
+  read as readAdmission,
+  releaseByDispatchId as releaseAdmissionByDispatchId,
+  type StaleAdmissionCandidate,
+} from "./dispatch-admission.js";
 import { reconcileFilesystemFailures } from "./filesystem-ticket-lifecycle.js";
 import { dispatchWorkflow, postWorkflowDispatch, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, getPullRequestState, buildEnvelopeDispatchInputs, postPrComment, defaultFetchSignal, getRepoDefaultBranch, buildKgRefreshGhaDispatchBody, pollForKgWorkflowRunId } from "./github.js";
 import { resolveWorkflowCapabilities, resolveWorkflowContract } from "./workflow-probe.js";
@@ -1751,12 +1757,16 @@ function isDefinitiveFlyRejectionError(err: unknown): boolean {
 }
 
 // startLocalRunnerContainer runs `docker run -d` over the local Docker socket and awaits
-// its exit before returning — unlike Fly's remote HTTP API, there is no "the request
-// reached the server but the response was lost" window: the CLI call either completes
-// with a container id or fails before one was ever created. Any throw from the backend
-// after markLaunchAttempted() is therefore always a definitive non-launch.
+// its exit before returning. That is not immune to a lost response the way a remote HTTP
+// call is not immune either: the daemon can create the container and the CLI process can
+// still fail to report success back to us (killed, socket dropped, daemon restart mid-call).
+// Unlike Fly's HTTP status, the docker CLI gives no structured signal that distinguishes
+// "rejected before creation" from "created but the response was lost", so — mirroring the
+// conservative default `shouldReleaseAdmissionOnDispatchError` already applies when no
+// classifier is given — every post-`markLaunchAttempted` throw here stays uncertain rather
+// than being treated as proof nothing launched (AII-783 review, second round, on PR #681).
 function isDefinitiveLocalDockerLaunchFailure(): boolean {
-  return true;
+  return false;
 }
 
 interface SessionBackendResult {
@@ -2400,9 +2410,16 @@ function ttlStopRunnerForJob(config: AppConfig, job: Job): (() => Promise<boolea
  * rather than letting the sweep infer death from age alone. Looks up the matching
  * `dispatch_log` row by `dispatchId` and, per execution mode, asks the backend itself:
  *
- * - No matching job row at all: the reservation's launch response/process was lost
- *   before anything was ever dispatched (the crash-before-`appendLog` case this sweep
- *   originally existed for) — nothing can still be running, so this is confirmed.
+ * - No matching job row at all: this is genuinely ambiguous, not proof of anything. It
+ *   covers both "the launch was never attempted" (safe to confirm) AND "GitHub/Fly/local
+ *   accepted the launch but the process crashed before `appendLog` recorded the job row"
+ *   (a live run with no way to look it up — the exact gap the second review round on PR
+ *   #681 flagged: `dispatchGitHubActions` calls `dispatchWorkflow` before `appendLog`, and
+ *   the Fly/local session backends create the machine/container before returning the ID
+ *   `appendLog` records). The admission row alone carries no owner/repo/workflow/machine
+ *   identity to check against a backend directly, so there is no way to tell these two
+ *   cases apart here — this resolves to unconfirmed rather than risk freeing a live run's
+ *   capacity slot.
  * - github-actions: confirmed only once the run's own status is `completed` — a prior
  *   cancellation request being accepted (202/409) is not by itself proof of termination.
  *   A job that never got its runId linked is NOT treated as "never launched": the
@@ -2412,15 +2429,17 @@ function ttlStopRunnerForJob(config: AppConfig, job: Job): (() => Promise<boolea
  *   after a resync — so a missing runId gets one more lookup attempt here before this
  *   resolves to unconfirmed rather than confirmed (AII-783 PR #681 second review round).
  * - fly-machines / local-docker: confirmed once the machine/container is actually
- *   observed stopped, or (404 / "no such container") already gone. A machineId is
- *   always recorded in the same write as the job row for these backends (never a later
- *   best-effort attach), so a missing machineId does mean nothing was ever launched —
- *   but missing Fly credentials mean the backend simply cannot be asked right now, which
- *   is uncertain, not confirmed-dead.
+ *   observed stopped, or (404 / "no such container") already gone. A missing machineId on
+ *   an existing job row is treated the same way as the no-job-row case above — unconfirmed,
+ *   not proof nothing launched — since a lost launch response could just as easily have
+ *   left the ID unrecorded on the row as left the row itself unwritten. Missing Fly
+ *   credentials mean the backend simply cannot be asked right now, which is also uncertain,
+ *   not confirmed-dead.
  *
- * An unrecognized execution mode means nothing was ever launched under this
- * reservation, so it is also confirmed — but any other lookup failure (network error,
- * unexpected state) resolves to unconfirmed, since an error here must never read as
+ * An unrecognized execution mode resolves to unconfirmed for the same reason — this
+ * function never has enough information to prove a negative, only a positive (an
+ * explicitly observed terminal backend state). Any other lookup failure (network error,
+ * unexpected state) also resolves to unconfirmed, since an error here must never read as
  * proof the backend is dead.
  */
 export async function confirmAdmissionTerminated(
@@ -2428,7 +2447,7 @@ export async function confirmAdmissionTerminated(
   candidate: StaleAdmissionCandidate,
 ): Promise<boolean> {
   const job = getJobByDispatchId(candidate.dispatchId);
-  if (!job) return true;
+  if (!job) return false;
 
   if (job.executionMode === "github-actions") {
     if (!job.repo) return false;
@@ -2477,7 +2496,7 @@ export async function confirmAdmissionTerminated(
   }
 
   if (job.executionMode === "fly-machines") {
-    if (!job.machineId) return true;
+    if (!job.machineId) return false;
     if (!config.flySessionsToken || !config.flySessionsApp) return false;
     try {
       const machine = await getMachine(config.flySessionsToken, config.flySessionsApp, job.machineId);
@@ -2490,7 +2509,7 @@ export async function confirmAdmissionTerminated(
   }
 
   if (job.executionMode === "local-docker") {
-    if (!job.machineId) return true;
+    if (!job.machineId) return false;
     try {
       const state = await inspectLocalContainer(job.machineId);
       return !state.running;
@@ -2502,6 +2521,49 @@ export async function confirmAdmissionTerminated(
   }
 
   return false;
+}
+
+/**
+ * Fast-path companion to `confirmAdmissionTerminated` for the planning callback
+ * (AII-783 review, third round, on PR #681): the callback marks the job row
+ * `completed` with `skipAdmissionRelease` because its own self-report is not proof the
+ * backend has exited, but that write also drops the job out of `getInFlightJobs()`'s
+ * `dispatched`/`running` set — the set every per-poll-cycle monitor (GHA run-status
+ * poll, Fly/local monitor) reads from. Relying solely on `sweepStaleAdmissions`'s
+ * 6-hour floor to eventually notice an already-finished backend would strand the common
+ * case — a planning run that finishes in minutes — at full team capacity for hours,
+ * reversing the very "accelerate the planning→implementation handoff" optimization the
+ * callback exists for.
+ *
+ * This runs the same termination oracle once, immediately, right after the callback
+ * records the job as completed. A backend already confirmed terminal releases the
+ * reservation right away; a still-running or unconfirmable backend is a no-op here —
+ * the reservation then stays held exactly as `skipAdmissionRelease` left it, for a
+ * later monitor tick or the stale-admission sweep to resolve.
+ */
+export async function tryFastReleasePlanningAdmission(config: AppConfig, dispatchId: string): Promise<void> {
+  const record = readAdmission(dispatchId);
+  if (!record || record.releasedAt !== null) return;
+
+  let confirmed: boolean;
+  try {
+    confirmed = await confirmAdmissionTerminated(config, {
+      dispatchId: record.dispatchId,
+      mappingKey: record.mappingKey,
+      backend: record.backend,
+      lifecycleOwner: record.lifecycleOwner,
+      ageMs: Date.now() - record.createdAt,
+    });
+  } catch (err) {
+    console.error(`[admission] Fast-path confirmAdmissionTerminated threw for dispatch=${dispatchId}:`, err);
+    return;
+  }
+  if (!confirmed) return;
+
+  const outcome = releaseAdmissionByDispatchId(dispatchId, "finalized");
+  if (outcome.status === "released") {
+    console.log(`[admission] Fast-released planning admission dispatch=${dispatchId} mapping=${record.mappingKey}`);
+  }
 }
 
 const TTL_STALE_CONCLUSIONS = new Set(["operator_cancelled", "runner_approved"]);
@@ -4415,6 +4477,7 @@ function startServer(
             notifyWebhookUrl: config.notifyWebhookUrl,
           },
           onKgRefreshRunnerComplete: kgRefresh.onRunnerComplete.bind(kgRefresh),
+          checkPlanningAdmissionTermination: (dispatchId) => tryFastReleasePlanningAdmission(config, dispatchId),
         });
         res.writeHead(result.status, { "Content-Type": "application/json" });
         res.end(JSON.stringify(result.body));
