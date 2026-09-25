@@ -46,6 +46,10 @@ import {
   type ReviewFixWorkerTransport,
 } from "../../review-fix-worker.js";
 import { acceptDelivery } from "../../review-fix-inbox.js";
+import { appendReviewFixActivityBatch, getReviewFixActivityGaps, getReviewFixCycleSummary, listReviewFixActivity, recordReviewFixCycleSummary } from "../../review-fix-evidence.js";
+import { handleRunnerActivity, type RunnerActivityBody } from "../../runner-callback.js";
+import { mintPreparedReviewFixToken } from "../../runner-tokens.js";
+import type { ReviewFixActivityEvent } from "../../review-fix-contract.js";
 import { acquire as acquireDispatchAdmission, release as releaseDispatchAdmission } from "../../dispatch-admission.js";
 import { createRestateReviewFixFacade, ReviewFixDeliveryPump } from "../../restate/review-fix-client.js";
 import { createReviewFixAttempt, type ReviewFixAttemptCompletion } from "../../restate/review-fix-attempt.js";
@@ -937,6 +941,70 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     admission = getDb().prepare(`SELECT released_at FROM dispatch_admissions WHERE dispatch_id = ?`).get(fixture.attemptId!) as { released_at: number | null };
     expect(admission.released_at).not.toBeNull();
   }, 25_000);
+
+  it("authenticated activity intake preserves gaps, enforces both byte caps, and leaves cycle evidence independent", async () => {
+    const env = envFor("alwaysReplay");
+    const secret = "activity-fault-matrix-secret";
+    const producerId = "runner-tools";
+    const overhead = Buffer.byteLength(JSON.stringify({ payload: "", truncated: false }), "utf8");
+    const remaining = 16 * 1024 - overhead;
+    const maxPayload = "€".repeat(Math.floor(remaining / 3)) + "a".repeat(remaining % 3);
+    const event = (attemptId: string, sequence: number, payload: string): ReviewFixActivityEvent => ({
+      version: 1, attemptId, producerId, sequence, cycle: 1, kind: "tool_result",
+      timestamp: Date.now(), payload, truncated: false,
+    });
+    const post = async (attemptId: string, events: ReviewFixActivityEvent[], finalSequence?: number) => {
+      const token = mintPreparedReviewFixToken({ attemptId, audience: "progress", secret }).token;
+      const response = await handleRunnerActivity({
+        authorization: `Bearer ${token}`, secret,
+        body: { version: 1, attemptId, producerId, events, finalSequence },
+        onReviewFixActivity: (batch: RunnerActivityBody) => {
+          const stored = appendReviewFixActivityBatch(batch);
+          if (stored.rejectedInvalid.length > 0) throw new Error("validated activity was rejected by SQLite");
+          return { status: "accepted", attemptId: batch.attemptId };
+        },
+      });
+      expect(response.status).toBe(200);
+    };
+
+    const gapFixture = freshScenario("activity-gaps");
+    await admitOne(env, gapFixture, [{ findingKey: "f1", version: 1 }]);
+    const gapAttemptId = gapFixture.attemptId!;
+    await post(gapAttemptId, [event(gapAttemptId, 0, "first"), event(gapAttemptId, 2, maxPayload + "a")], 4);
+    expect(getReviewFixActivityGaps(gapAttemptId, producerId)).toMatchObject({
+      ranges: [{ from: 1, to: 1 }, { from: 3, to: 4 }], finalSequence: 4, tailComplete: false,
+    });
+    const truncated = listReviewFixActivity(gapAttemptId, { pageSize: 10 }).events.find((row) => row.sequence === 2);
+    expect(truncated).toMatchObject({ truncated: true, payload: null });
+    await post(gapAttemptId, [1, 3, 4].map((sequence) => event(gapAttemptId, sequence, `event-${sequence}`)));
+    expect(getReviewFixActivityGaps(gapAttemptId, producerId)).toMatchObject({
+      ranges: [], finalSequence: 4, tailComplete: true,
+    });
+
+    const capFixture = freshScenario("activity-cap");
+    await admitOne(env, capFixture, [{ findingKey: "f1", version: 1 }]);
+    const capAttemptId = capFixture.attemptId!;
+    for (let start = 0; start < 640; start += 64) {
+      await post(capAttemptId, Array.from({ length: 64 }, (_, i) => event(capAttemptId, start + i, maxPayload)));
+    }
+    const beforeLimit = getDb().prepare(`SELECT accepted_bytes, limit_reached_at FROM review_fix_activity_streams WHERE attempt_id = ?`)
+      .get(capAttemptId) as { accepted_bytes: number; limit_reached_at: number | null };
+    expect(beforeLimit).toMatchObject({ accepted_bytes: 10 * 1024 * 1024, limit_reached_at: null });
+    await post(capAttemptId, [event(capAttemptId, 640, "over the attempt cap")]);
+    const afterLimit = getDb().prepare(`SELECT accepted_bytes, limit_reached_at FROM review_fix_activity_streams WHERE attempt_id = ?`)
+      .get(capAttemptId) as { accepted_bytes: number; limit_reached_at: number | null };
+    expect(afterLimit.accepted_bytes).toBe(10 * 1024 * 1024);
+    expect(afterLimit.limit_reached_at).not.toBeNull();
+    const storedCount = getDb().prepare(`SELECT COUNT(*) AS n FROM review_fix_activity WHERE attempt_id = ?`)
+      .get(capAttemptId) as { n: number };
+    expect(storedCount.n).toBe(640);
+    const summary = recordReviewFixCycleSummary({
+      attemptId: capAttemptId, cycle: 1, inputCommit: capFixture.headSha, outputCommit: capFixture.headSha,
+      dispositions: [], tests: { passed: 1 }, verdict: "passed", usage: { tokens: 10 }, completedAt: Date.now(),
+    });
+    expect(summary.status).toBe("recorded");
+    expect(getReviewFixCycleSummary(capAttemptId, 1)).toMatchObject({ verdict: "passed" });
+  }, 40_000);
 
   it("a lost cancellation acknowledgement and endpoint restart retain occupancy until the exact run stops", async () => {
     const fixture = freshScenario("cancel-lost-ack");
