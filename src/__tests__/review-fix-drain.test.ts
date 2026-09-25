@@ -314,6 +314,31 @@ describe("processReviewFixQueue — dispatch gate", () => {
     expect(localGapfillMocks.dispatchLocalGapfill).toHaveBeenCalledTimes(1);
     expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(0);
   });
+
+  it("keeps a review fix pending through a PR-state network failure, then skips it if merged", async () => {
+    configModule.upsertMapping("TEAM", makeMapping());
+    const queueId = reviewFixQueue.enqueueReviewFix({
+      issueId: "issue-network-failure",
+      issueIdentifier: "AII-998",
+      repo: "acme/billing",
+      prNumber: 42,
+      reason: "late review comment",
+    });
+    vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("connection reset"); }));
+
+    await indexModule.processReviewFixQueue(mockConfig, mockRegistry);
+
+    expect(localGapfillMocks.dispatchLocalGapfill).not.toHaveBeenCalled();
+    expect(reviewFixQueue.getPendingReviewFixes()).toMatchObject([{ id: queueId, status: "pending" }]);
+
+    vi.stubGlobal("fetch", vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ merged: true, state: "closed", head: { ref: "old-branch" } }),
+    }) as Response));
+    await indexModule.processReviewFixQueue(mockConfig, mockRegistry);
+    expect(localGapfillMocks.dispatchLocalGapfill).not.toHaveBeenCalled();
+    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(0);
+  });
 });
 
 describe("processReviewFixQueue — PR dispatch budget", () => {

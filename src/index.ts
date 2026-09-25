@@ -3178,7 +3178,16 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
       const [owner] = fix.repo.split("/");
       const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
 
-      const prState = await getPullRequestState(ghToken, mapping.owner, mapping.repo, fix.prNumber);
+      let prState: Awaited<ReturnType<typeof getPullRequestState>>;
+      try {
+        prState = await getPullRequestState(ghToken, mapping.owner, mapping.repo, fix.prNumber);
+      } catch {
+        // A transport error or timeout is as inconclusive as an HTTP error.
+        // The outer catch marks items failed, so handle lookup failures here
+        // to preserve this item for a later poll.
+        console.warn(`[review-fix] PR state lookup failed for #${fix.prNumber}; deferring review fix #${fix.id}`);
+        continue;
+      }
       if (prState === null) {
         // A transient GitHub lookup failure is not evidence that this PR is
         // still open. Leave the item pending for a later poll instead of
