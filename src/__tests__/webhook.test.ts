@@ -1231,6 +1231,46 @@ describe("review feedback ingestion", () => {
     ]);
   });
 
+  it("increments the finding's revision when the same review body is reported again", async () => {
+    const jobId = log.appendLog({
+      issueId: "issue-revision",
+      issueIdentifier: "AII-REV",
+      repo: "org/repo",
+    });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/50");
+
+    const makeReviewRequest = () =>
+      makeRequest(SECRET, "pull_request_review", {
+        action: "submitted",
+        review: {
+          state: "changes_requested",
+          body: "Please fix the callback race.",
+          html_url: "https://github.com/org/repo/pull/50#pullrequestreview-1",
+          user: { login: "claude[bot]" },
+        },
+        pull_request: {
+          number: 50,
+          html_url: "https://github.com/org/repo/pull/50",
+          head: { ref: "ai-implement/AII-REV-fix" },
+        },
+        repository: { full_name: "org/repo" },
+      });
+
+    const first = makeReviewRequest();
+    webhook.handleGitHubWebhook(first.req as never, first.res as never, SECRET);
+    await first.res.done;
+    const firstResponse = JSON.parse(first.res.body) as { findingId: number };
+    expect(reviewStore.getReviewFindingById(firstResponse.findingId)?.revision).toBe(1);
+
+    const second = makeReviewRequest();
+    webhook.handleGitHubWebhook(second.req as never, second.res as never, SECRET);
+    await second.res.done;
+    const secondResponse = JSON.parse(second.res.body) as { findingId: number };
+
+    expect(secondResponse.findingId).toBe(firstResponse.findingId);
+    expect(reviewStore.getReviewFindingById(firstResponse.findingId)?.revision).toBe(2);
+  });
+
   it("ignores AI-Implement native request-changes reviews to avoid self-triggered fix loops", async () => {
     const jobId = log.appendLog({
       issueId: "issue-self",
