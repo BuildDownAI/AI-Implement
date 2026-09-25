@@ -71,7 +71,7 @@ function capChars(text: string, max: number): string {
  * Neutralise every such line rather than escaping it — the reader still sees the
  * original characters, just not interpreted as a fence boundary.
  */
-function neutralizeFences(text: string): string {
+export function neutralizeFences(text: string): string {
   return text
     .split("\n")
     .map((line) => (/^\s*```/.test(line) ? line.replace(/```/, "'''") : line))

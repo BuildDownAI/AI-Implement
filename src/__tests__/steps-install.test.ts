@@ -13,6 +13,7 @@ vi.mock("node:fs", () => ({
     existsSync: vi.fn(),
     readFileSync: vi.fn(),
     mkdtempSync: vi.fn(),
+    mkdirSync: vi.fn(),
     writeFileSync: vi.fn(),
     rmSync: vi.fn(),
   },
@@ -537,6 +538,68 @@ describe("installStep", () => {
 
       expect(outputs.installFailed).toBe(true);
       expect(typeof outputs.installError).toBe("string");
+    });
+
+    it("writes 70-dependency-install.md with the success wording when the retry succeeds", async () => {
+      mockSpawnSuccess();
+
+      await installStep.run(
+        makeContext(),
+        { workspaceDir: "/tmp/test", retry: true, packageManager: "npm" },
+        new NoopStepReporter(),
+      );
+
+      expect(fs.mkdirSync).toHaveBeenCalledWith("/tmp/test/ai-output/comments", { recursive: true });
+      const [[commentPath, body]] = vi.mocked(fs.writeFileSync).mock.calls;
+      expect(commentPath).toBe("/tmp/test/ai-output/comments/70-dependency-install.md");
+      expect(body).toBe(
+        "Dependency install (`npm ci`) failed before the agent ran and succeeded after its change.",
+      );
+    });
+
+    it("writes 70-dependency-install.md with the failure wording and installError tail when the retry also fails", async () => {
+      mockSpawnExit(1, { stdout: ["ERESOLVE unable to resolve dependency tree\n"] });
+
+      await installStep.run(
+        makeContext(),
+        { workspaceDir: "/tmp/test", retry: true, packageManager: "npm" },
+        new NoopStepReporter(),
+      );
+
+      const [[commentPath, body]] = vi.mocked(fs.writeFileSync).mock.calls;
+      expect(commentPath).toBe("/tmp/test/ai-output/comments/70-dependency-install.md");
+      expect(body as string).toContain(
+        "Dependency install (`npm ci`) failed before and after the agent ran. Build and tests did not run.",
+      );
+      expect(body as string).toContain("ERESOLVE unable to resolve dependency tree");
+    });
+
+    it("neutralizes an embedded fence in installError so the comment's code block is not broken", async () => {
+      mockSpawnExit(1, { stdout: ["some output\n```\nmalicious markdown injected here\n```\nmore output\n"] });
+
+      await installStep.run(
+        makeContext(),
+        { workspaceDir: "/tmp/test", retry: true, packageManager: "npm" },
+        new NoopStepReporter(),
+      );
+
+      const [[, body]] = vi.mocked(fs.writeFileSync).mock.calls;
+      const fenceCount = ((body as string).match(/^```$/gm) ?? []).length;
+      expect(fenceCount).toBe(2);
+      expect(body as string).toContain("'''\nmalicious markdown injected here\n'''");
+    });
+
+    it("never writes a comment file on the first (non-retry) attempt, success or failure", async () => {
+      mockRootPackageJson();
+      mockSpawnSuccess();
+      await installStep.run(makeContext(), { workspaceDir: "/tmp/test" }, new NoopStepReporter());
+      expect(fs.writeFileSync).not.toHaveBeenCalled();
+
+      vi.clearAllMocks();
+      mockRootPackageJson();
+      mockSpawnExit(1);
+      await installStep.run(makeContext(), { workspaceDir: "/tmp/test" }, new NoopStepReporter());
+      expect(fs.writeFileSync).not.toHaveBeenCalled();
     });
   });
 
