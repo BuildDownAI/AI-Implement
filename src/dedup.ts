@@ -195,6 +195,46 @@ export function getDb(): Database.Database {
       )
     `);
     db.exec(`CREATE INDEX IF NOT EXISTS idx_review_fix_dispatches_pr ON review_fix_dispatches(repo, pr_number, created_at)`);
+    // AII-771: additive admission ledger. Consumers and cutover follow in AII-775;
+    // old dispatch history is deliberately not backfilled into active occupancy.
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS dispatch_admissions (
+        dispatch_id TEXT PRIMARY KEY,
+        mapping_key TEXT NOT NULL,
+        issue_scope TEXT NOT NULL,
+        issue_id TEXT NOT NULL,
+        installation_id TEXT,
+        repository TEXT,
+        pr_number INTEGER,
+        lifecycle_owner TEXT NOT NULL,
+        phase TEXT NOT NULL,
+        backend TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        released_at INTEGER,
+        release_reason TEXT,
+        execution_id TEXT,
+        CHECK (pr_number IS NULL OR (installation_id IS NOT NULL AND repository IS NOT NULL))
+      )
+    `);
+    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_dispatch_admissions_active_issue
+      ON dispatch_admissions(issue_scope, issue_id)
+      WHERE released_at IS NULL AND pr_number IS NULL`);
+    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_dispatch_admissions_active_pr
+      ON dispatch_admissions(installation_id, repository, pr_number)
+      WHERE released_at IS NULL AND pr_number IS NOT NULL`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_dispatch_admissions_active_mapping
+      ON dispatch_admissions(mapping_key) WHERE released_at IS NULL`);
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS dispatch_budget_entries (
+        dispatch_id TEXT PRIMARY KEY,
+        repository TEXT NOT NULL,
+        pr_number INTEGER NOT NULL,
+        request_kind TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_dispatch_budget_entries_pr_window
+      ON dispatch_budget_entries(repository, pr_number, created_at)`);
     db.exec(`
       CREATE TABLE IF NOT EXISTS comment_gapfill_queue (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
