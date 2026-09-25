@@ -888,6 +888,7 @@ describe("tryFastReleasePlanningAdmission — fast release path for the planning
       cap: 1,
     });
     expect(admitted.ok).toBe(true);
+    if (!admitted.ok) throw new Error("test admission unexpectedly deferred");
     log.appendLog({
       issueId: "issue-1",
       issueIdentifier: "AII-1",
@@ -895,6 +896,7 @@ describe("tryFastReleasePlanningAdmission — fast release path for the planning
       teamKey: "AII",
       repo: "o/r",
       dispatchId,
+      admissionGeneration: admitted.record.generation,
       executionMode: "local-docker",
       phase: "planning",
       machineId: "container-1",
@@ -935,6 +937,33 @@ describe("tryFastReleasePlanningAdmission — fast release path for the planning
     await indexModule.tryFastReleasePlanningAdmission(config, "dispatch-fast-3");
 
     expect(localDocker.inspectLocalContainer).not.toHaveBeenCalled();
+  });
+
+  it("does not release a replacement generation after a slow terminal check", async () => {
+    const dispatchId = "dispatch-fast-race";
+    acquireAndLog(dispatchId);
+    const original = dispatchAdmission.read(dispatchId);
+    expect(original).not.toBeNull();
+    if (!original) throw new Error("test admission missing");
+    vi.mocked(localDocker.inspectLocalContainer).mockImplementation(async () => {
+      dispatchAdmission.release(dispatchId, original.lifecycleOwner, original.generation, "finalized");
+      const replacement = dispatchAdmission.acquire({
+        dispatchId,
+        mappingKey: "AII",
+        scope: { kind: "issue", issueScope: "AII", issueId: "issue-2" },
+        kind: "planning",
+        backend: "local-docker",
+        lifecycleOwner: { kind: "legacy" },
+        cap: 1,
+      });
+      expect(replacement.ok).toBe(true);
+      return { status: "exited", running: false, exitCode: 0 };
+    });
+
+    await indexModule.tryFastReleasePlanningAdmission(config, dispatchId);
+
+    expect(dispatchAdmission.read(dispatchId)).toMatchObject({ generation: original.generation + 1, releasedAt: null });
+    expect(dispatchAdmission.count("AII")).toBe(1);
   });
 });
 
@@ -992,6 +1021,7 @@ describe("reconcileTerminalCallbackAdmissions — per-poll reconciliation for te
       cap: 1,
     });
     expect(admitted.ok).toBe(true);
+    if (!admitted.ok) throw new Error("test admission unexpectedly deferred");
     const jobId = log.appendLog({
       issueId,
       issueIdentifier: issueId,
@@ -999,6 +1029,7 @@ describe("reconcileTerminalCallbackAdmissions — per-poll reconciliation for te
       teamKey: "AII",
       repo: "o/r",
       dispatchId,
+      admissionGeneration: admitted.record.generation,
       executionMode: "local-docker",
       phase: conclusion === "planning_callback" ? "planning" : "implementation",
       machineId: "container-1",

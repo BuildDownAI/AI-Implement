@@ -97,7 +97,7 @@ export interface AcquireDispatchInput {
 }
 
 export type AcquireDispatchOutcome =
-  | { ok: true; release: (reason: DispatchAdmissionReleaseReason) => void }
+  | { ok: true; admissionGeneration: number; release: (reason: DispatchAdmissionReleaseReason) => void }
   | { ok: false; reason: DispatchAdmissionDeferReason; count: number; cap: number };
 
 const ADMISSION_BREAKER_PHASE: Record<AcquireDispatchKind, string> = {
@@ -144,6 +144,7 @@ export function acquireDispatch(input: AcquireDispatchInput): AcquireDispatchOut
   const { dispatchId: recordDispatchId, lifecycleOwner, generation } = decision.record;
   return {
     ok: true,
+    admissionGeneration: generation,
     release: (reason: DispatchAdmissionReleaseReason) => {
       releaseAdmission(recordDispatchId, lifecycleOwner, generation, reason);
     },

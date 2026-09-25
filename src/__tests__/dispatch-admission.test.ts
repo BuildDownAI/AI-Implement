@@ -608,12 +608,14 @@ describe("reconcileTerminalCallbackAdmissions", () => {
   ): void {
     const admitted = admission.acquire(issueRequest({ dispatchId, ...overrides }));
     expect(admitted.ok).toBe(true);
+    if (!admitted.ok) throw new Error("test admission unexpectedly deferred");
     const jobId = log.appendLog({
       issueId: overrides.scope && overrides.scope.kind === "issue" ? overrides.scope.issueId : "AII-1",
       issueIdentifier: "AII-1",
       teamKey: "AII",
       repo: "o/r",
       dispatchId,
+      admissionGeneration: admitted.record.generation,
       executionMode: "local-docker",
       phase: conclusion === "planning_callback" ? "planning" : "implementation",
     });
@@ -705,6 +707,56 @@ describe("reconcileTerminalCallbackAdmissions", () => {
     const second = await admission.reconcileTerminalCallbackAdmissions(CONFIRM_ALL);
     expect(second).toEqual([]);
     expect(admission.count("AII")).toBe(0);
+  });
+
+  it("does not release a replacement generation when an old terminal check finishes late", async () => {
+    const dispatchId = "dispatch-generation-race";
+    acquireAndLogTerminal(dispatchId, "planning_callback");
+    const original = admission.read(dispatchId);
+    expect(original).not.toBeNull();
+    if (!original) throw new Error("test admission missing");
+
+    const released = await admission.reconcileTerminalCallbackAdmissions(async () => {
+      expect(admission.release(dispatchId, original.lifecycleOwner, original.generation, "finalized")).toEqual({ status: "released" });
+      const replacement = admission.acquire(issueRequest({
+        dispatchId,
+        scope: { kind: "issue", issueScope: "team-a", issueId: "AII-2" },
+      }));
+      expect(replacement.ok).toBe(true);
+      return true; // stale observation of the original backend
+    });
+
+    expect(released).toEqual([]);
+    expect(admission.read(dispatchId)).toMatchObject({ generation: original.generation + 1, releasedAt: null });
+    // The old dispatch_log row is still present, but belongs to generation 0.
+    expect(await admission.reconcileTerminalCallbackAdmissions(CONFIRM_ALL)).toEqual([]);
+    expect(admission.count("AII")).toBe(1);
+  });
+
+  it("does not release a replacement generation on a delayed duplicate terminal job update", () => {
+    const dispatchId = "dispatch-monitor-race";
+    const original = admission.acquire(issueRequest({ dispatchId }));
+    expect(original.ok).toBe(true);
+    if (!original.ok) throw new Error("test admission unexpectedly deferred");
+    const oldJobId = log.appendLog({
+      issueId: "AII-1",
+      dispatchId,
+      admissionGeneration: original.record.generation,
+      executionMode: "local-docker",
+    });
+    log.updateJobStatus(oldJobId, "completed", "success");
+    expect(admission.read(dispatchId)?.releasedAt).not.toBeNull();
+
+    const replacement = admission.acquire(issueRequest({
+      dispatchId,
+      scope: { kind: "issue", issueScope: "team-a", issueId: "AII-2" },
+    }));
+    expect(replacement.ok).toBe(true);
+    if (!replacement.ok) throw new Error("replacement admission unexpectedly deferred");
+    log.updateJobStatus(oldJobId, "completed", "success");
+
+    expect(admission.read(dispatchId)).toMatchObject({ generation: replacement.record.generation, releasedAt: null });
+    expect(admission.count("AII")).toBe(1);
   });
 
   it("frees team capacity for a subsequent acquire once released", async () => {

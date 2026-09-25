@@ -1,7 +1,7 @@
 import { getDb } from "./dedup.js";
 import { markCommentGapfillRunTerminal } from "./comment-gapfill-queue.js";
 import { isFailureRecord, type FailureRecord } from "./pipeline/failure-classification.js";
-import { releaseByDispatchId } from "./dispatch-admission.js";
+import { read as readAdmission, release as releaseAdmission } from "./dispatch-admission.js";
 
 const MAX_LOG_ENTRIES = 500;
 
@@ -112,6 +112,9 @@ function ensureLogColumns(): void {
     db.exec("ALTER TABLE dispatch_log ADD COLUMN dispatch_id TEXT");
     db.exec("CREATE INDEX IF NOT EXISTS idx_dispatch_log_dispatch_id ON dispatch_log(dispatch_id)");
   }
+  if (!names.has("admission_generation")) {
+    db.exec("ALTER TABLE dispatch_log ADD COLUMN admission_generation INTEGER");
+  }
   if (!names.has("status")) {
     db.exec("ALTER TABLE dispatch_log ADD COLUMN status TEXT NOT NULL DEFAULT 'unknown'");
   }
@@ -191,6 +194,8 @@ export function appendLog(entry: {
   repo?: string;
   issueState?: string;
   dispatchId?: string;
+  /** Generation of the admission that owns this exact backend launch. */
+  admissionGeneration?: number | null;
   dispatchNumber?: number;
   machineNonce?: string;
   executionMode?: string;
@@ -211,7 +216,7 @@ export function appendLog(entry: {
   const dispatchNumber = entry.dispatchNumber ?? countPriorDispatches(entry.issueId, entry.phase ?? "implementation").count + 1;
 
   const result = db.prepare(
-    "INSERT INTO dispatch_log (issue_id, issue_identifier, issue_title, team_key, repo, dispatched_at, dispatch_id, dispatch_number, issue_state, status, machine_nonce, execution_mode, machine_id, runner_mode, session_image, phase, contract, trigger, grouping_parent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    "INSERT INTO dispatch_log (issue_id, issue_identifier, issue_title, team_key, repo, dispatched_at, dispatch_id, admission_generation, dispatch_number, issue_state, status, machine_nonce, execution_mode, machine_id, runner_mode, session_image, phase, contract, trigger, grouping_parent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
   ).run(
     entry.issueId,
     entry.issueIdentifier ?? null,
@@ -220,6 +225,7 @@ export function appendLog(entry: {
     entry.repo ?? null,
     Date.now(),
     entry.dispatchId ?? null,
+    entry.admissionGeneration ?? null,
     dispatchNumber,
     entry.issueState ?? null,
     entry.status ?? "dispatched",
@@ -406,8 +412,8 @@ export function updateJobStatus(
   // terminalize its queue row, or hasPendingConflictResolution stays true
   // forever and conflict-recovery attempt 2 is unreachable (observed livelock).
   if (isTerminal) {
-    const job = getDb().prepare("SELECT repo, trigger, pr_url, dispatch_id FROM dispatch_log WHERE id = ?").get(jobId) as
-      | { repo: string; trigger: string | null; pr_url: string | null; dispatch_id: string | null } | undefined;
+    const job = getDb().prepare("SELECT repo, trigger, pr_url, dispatch_id, admission_generation FROM dispatch_log WHERE id = ?").get(jobId) as
+      | { repo: string; trigger: string | null; pr_url: string | null; dispatch_id: string | null; admission_generation: number | null } | undefined;
     const prUrlForRow = prUrl ?? job?.pr_url ?? null;
     const m = prUrlForRow ? /\/pull\/(\d+)$/.exec(prUrlForRow) : null;
     if (job?.trigger === "comment" && m) {
@@ -425,8 +431,9 @@ export function updateJobStatus(
     // `skipAdmissionRelease` is the escape hatch for a caller that cannot vouch for the
     // backend actually being dead (AII-783 review: reaper/stuck-watchdog give-up paths
     // swallow their own stop/destroy failures and still write a terminal status here).
-    if (job?.dispatch_id && !opts?.skipAdmissionRelease) {
-      releaseByDispatchId(job.dispatch_id, "finalized");
+    if (job?.dispatch_id && job.admission_generation !== null && !opts?.skipAdmissionRelease) {
+      const current = readAdmission(job.dispatch_id);
+      if (current) releaseAdmission(job.dispatch_id, current.lifecycleOwner, job.admission_generation, "finalized");
     }
   }
   // COALESCE keeps a pr_url recorded earlier (e.g. by the runner callback) when the

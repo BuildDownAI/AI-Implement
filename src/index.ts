@@ -16,7 +16,7 @@ import {
   sweepStaleAdmissions,
   reconcileTerminalCallbackAdmissions,
   read as readAdmission,
-  releaseByDispatchId as releaseAdmissionByDispatchId,
+  release as releaseAdmission,
   type StaleAdmissionCandidate,
 } from "./dispatch-admission.js";
 import { reconcileFilesystemFailures } from "./filesystem-ticket-lifecycle.js";
@@ -1214,6 +1214,7 @@ export async function dispatchGitHubActions(
     repo: `${mapping.owner}/${mapping.repo}`,
     issueState: issue.nativeStatus,
     dispatchId,
+    admissionGeneration: admission.admissionGeneration,
     dispatchNumber: prior.count + 1,
     executionMode: "github-actions",
     runnerMode,
@@ -1724,6 +1725,7 @@ export async function dispatchPlanning(
     repo: `${mapping.owner}/${mapping.repo}`,
     issueState: issue.nativeStatus,
     dispatchId,
+    admissionGeneration: planningAdmission.admissionGeneration,
     executionMode: "github-actions",
     phase: "planning",
     sessionImage: runnerImage ?? null,
@@ -1928,6 +1930,7 @@ async function dispatchSession(
       repo: `${mapping.owner}/${mapping.repo}`,
       issueState: issue.nativeStatus,
       dispatchId,
+      admissionGeneration: admission?.admissionGeneration ?? null,
       dispatchNumber: prior.count + 1,
       executionMode: result.executionMode,
       machineNonce,
@@ -2575,7 +2578,7 @@ export async function tryFastReleasePlanningAdmission(config: AppConfig, dispatc
   }
   if (!confirmed) return;
 
-  const outcome = releaseAdmissionByDispatchId(dispatchId, "finalized");
+  const outcome = releaseAdmission(record.dispatchId, record.lifecycleOwner, record.generation, "finalized");
   if (outcome.status === "released") {
     console.log(`[admission] Fast-released planning admission dispatch=${dispatchId} mapping=${record.mappingKey}`);
   }

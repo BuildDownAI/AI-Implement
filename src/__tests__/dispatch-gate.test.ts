@@ -485,7 +485,8 @@ describe("updateJobStatus — releases the admission reservation on verified ter
       { dispatchId: "run-a", issueId: "issue-a", issueIdentifier: "AII-a", kind: "implementation", teamKey: "AII", maxInProgressAiIssues: 1, backend: "github-actions" },
     );
     expect(acquired.ok).toBe(true);
-    const jobId = log.appendLog({ issueId: "issue-a", teamKey: "AII", phase: "implementation", status: "dispatched", dispatchId: "run-a" });
+    if (!acquired.ok) throw new Error("expected admission");
+    const jobId = log.appendLog({ issueId: "issue-a", teamKey: "AII", phase: "implementation", status: "dispatched", dispatchId: "run-a", admissionGeneration: acquired.admissionGeneration });
 
     // A second candidate is blocked while the first run is still in flight — mirrors the
     // "one free slot survives two simultaneous claimants" acceptance bar.
@@ -510,7 +511,8 @@ describe("updateJobStatus — releases the admission reservation on verified ter
       { dispatchId: "run-c", issueId: "issue-c", issueIdentifier: "AII-c", kind: "implementation", teamKey: "AII", maxInProgressAiIssues: 1, backend: "github-actions" },
     );
     expect(acquired.ok).toBe(true);
-    const jobId = log.appendLog({ issueId: "issue-c", teamKey: "AII", phase: "implementation", status: "dispatched", dispatchId: "run-c" });
+    if (!acquired.ok) throw new Error("expected admission");
+    const jobId = log.appendLog({ issueId: "issue-c", teamKey: "AII", phase: "implementation", status: "dispatched", dispatchId: "run-c", admissionGeneration: acquired.admissionGeneration });
 
     // Mirrors a monitor tick that only confirms the backend is still running (GHA
     // queued/in_progress, a live Fly machine, a running local container) — not a
@@ -528,7 +530,8 @@ describe("updateJobStatus — releases the admission reservation on verified ter
       { dispatchId: "run-e", issueId: "issue-e", issueIdentifier: "AII-e", kind: "implementation", teamKey: "AII", maxInProgressAiIssues: 1, backend: "github-actions" },
     );
     expect(acquired.ok).toBe(true);
-    const jobId = log.appendLog({ issueId: "issue-e", teamKey: "AII", phase: "implementation", status: "dispatched", dispatchId: "run-e" });
+    if (!acquired.ok) throw new Error("expected admission");
+    const jobId = log.appendLog({ issueId: "issue-e", teamKey: "AII", phase: "implementation", status: "dispatched", dispatchId: "run-e", admissionGeneration: acquired.admissionGeneration });
 
     log.updateJobStatus(jobId, "failed", "failure");
 
@@ -548,7 +551,8 @@ describe("updateJobStatus — releases the admission reservation on verified ter
       { dispatchId: "run-h", issueId: "issue-h", issueIdentifier: "AII-h", kind: "implementation", teamKey: "AII", maxInProgressAiIssues: 1, backend: "fly-machines" },
     );
     expect(acquired.ok).toBe(true);
-    const jobId = log.appendLog({ issueId: "issue-h", teamKey: "AII", phase: "implementation", status: "dispatched", dispatchId: "run-h" });
+    if (!acquired.ok) throw new Error("expected admission");
+    const jobId = log.appendLog({ issueId: "issue-h", teamKey: "AII", phase: "implementation", status: "dispatched", dispatchId: "run-h", admissionGeneration: acquired.admissionGeneration });
 
     // Mirrors reaper.ts/stuck-watchdog.ts writing "timed_out" after a best-effort
     // stop/destroy whose own outcome is unknown (error swallowed, or a non-404 failure).
@@ -590,6 +594,7 @@ describe("remediateStuckJob — admission release only on confirmed stop (AII-78
       backend: "fly-machines",
     });
     expect(acquired.ok).toBe(true);
+    if (!acquired.ok) throw new Error("expected admission");
     const jobId = log.appendLog({
       issueId: "issue-stuck-a",
       issueIdentifier: "AII-sa",
@@ -597,6 +602,7 @@ describe("remediateStuckJob — admission release only on confirmed stop (AII-78
       phase: "implementation",
       status: "dispatched",
       dispatchId: "stuck-a",
+      admissionGeneration: acquired.admissionGeneration,
     });
     const job = log.getJobById(jobId)!;
 
@@ -633,6 +639,7 @@ describe("remediateStuckJob — admission release only on confirmed stop (AII-78
       backend: "fly-machines",
     });
     expect(acquired.ok).toBe(true);
+    if (!acquired.ok) throw new Error("expected admission");
     const jobId = log.appendLog({
       issueId: "issue-stuck-b",
       issueIdentifier: "AII-sb",
@@ -640,6 +647,7 @@ describe("remediateStuckJob — admission release only on confirmed stop (AII-78
       phase: "implementation",
       status: "dispatched",
       dispatchId: "stuck-b",
+      admissionGeneration: acquired.admissionGeneration,
     });
     const job = log.getJobById(jobId)!;
 
@@ -676,6 +684,7 @@ describe("remediateStuckJob — admission release only on confirmed stop (AII-78
       backend: "local-docker",
     });
     expect(acquired.ok).toBe(true);
+    if (!acquired.ok) throw new Error("expected admission");
     const jobId = log.appendLog({
       issueId: "issue-stuck-c",
       issueIdentifier: "AII-sc",
@@ -683,6 +692,7 @@ describe("remediateStuckJob — admission release only on confirmed stop (AII-78
       phase: "implementation",
       status: "dispatched",
       dispatchId: "stuck-c",
+      admissionGeneration: acquired.admissionGeneration,
     });
     const job = log.getJobById(jobId)!;
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});

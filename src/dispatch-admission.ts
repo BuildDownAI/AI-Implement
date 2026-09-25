@@ -532,6 +532,7 @@ interface TerminalCallbackCandidateRow {
   mapping_key: string;
   backend: string;
   lifecycle_owner: string;
+  generation: number;
   created_at: number;
   conclusion: string;
 }
@@ -575,10 +576,14 @@ export async function reconcileTerminalCallbackAdmissions(
   const rows = db
     .prepare(
       `SELECT da.dispatch_id AS dispatch_id, da.mapping_key AS mapping_key, da.backend AS backend,
-              da.lifecycle_owner AS lifecycle_owner, da.created_at AS created_at, dl.conclusion AS conclusion
+              da.lifecycle_owner AS lifecycle_owner, da.generation AS generation,
+              da.created_at AS created_at, dl.conclusion AS conclusion
        FROM dispatch_admissions da
        JOIN dispatch_log dl ON dl.dispatch_id = da.dispatch_id
-       WHERE da.released_at IS NULL AND dl.conclusion IN (${placeholders})`,
+           AND dl.admission_generation = da.generation
+       WHERE da.released_at IS NULL
+         AND dl.status IN ('completed', 'failed')
+         AND dl.conclusion IN (${placeholders})`,
     )
     .all(...TERMINAL_CALLBACK_CONCLUSIONS) as TerminalCallbackCandidateRow[];
 
@@ -601,11 +606,15 @@ export async function reconcileTerminalCallbackAdmissions(
       confirmed = false;
     }
     if (!confirmed) continue;
-    // releaseByDispatchId re-reads the row rather than trusting this query's generation,
-    // so a race that already released it between the select above and here (another poll's
-    // call to this function, or the planning fast path) safely no-ops instead of double-
-    // releasing.
-    const outcome = releaseByDispatchId(row.dispatch_id, releaseReasonForConclusion(row.conclusion));
+    // The backend check awaited above can race a release and reacquire of this same
+    // dispatch ID. Release only the generation observed before the check; a stale
+    // terminal result must not clear its replacement reservation.
+    const outcome = release(
+      row.dispatch_id,
+      candidate.lifecycleOwner,
+      row.generation,
+      releaseReasonForConclusion(row.conclusion),
+    );
     if (outcome.status === "released") {
       results.push({
         dispatchId: row.dispatch_id,
