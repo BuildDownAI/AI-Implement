@@ -171,6 +171,15 @@ describe("review-fix attempt and inbox schema", () => {
       .toThrow(/UNIQUE/);
     expect(() => db.prepare("UPDATE review_fix_attempts SET owner = ? WHERE attempt_id = ?")
       .run("attempt-2", "attempt-1")).toThrow(/immutable/);
+    expect(() => db.prepare("UPDATE review_fix_attempts SET github_run_id = 99 WHERE attempt_id = 'attempt-1'").run())
+      .toThrow(/CHECK/);
+    db.prepare(`UPDATE review_fix_attempts SET github_run_id = 99, github_run_attempt = 1
+      WHERE attempt_id = 'attempt-1'`).run();
+    expect(() => db.prepare(`UPDATE review_fix_attempts SET accepted_result_hash = 'hash-1'
+      WHERE attempt_id = 'attempt-1'`).run()).toThrow(/CHECK/);
+    db.prepare(`UPDATE review_fix_attempts
+      SET accepted_result_json = '{}', accepted_result_hash = 'hash-1'
+      WHERE attempt_id = 'attempt-1'`).run();
 
     const insertEvent = db.prepare(`INSERT INTO review_fix_inbox
       (authenticated_source, event_id, installation_id, repository, pr_number,
