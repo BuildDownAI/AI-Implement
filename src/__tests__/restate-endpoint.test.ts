@@ -106,15 +106,29 @@ describe("register", () => {
     expect(result).toEqual({ outcome: "registered-no-force" });
   });
 
-  it("an already-registered endpoint (200, unchanged) is success — no second call", async () => {
-    const fetchImpl = vi.fn(async () => jsonResponse(200, { id: "dp_1" }));
+  it("an existing URI (200) is re-discovered with force after a zero drain count", async () => {
+    const fetchImpl = vi.fn(async (_url: string, _init: RequestInit) => jsonResponse(200, { id: "dp_1" }));
     const result = await register({
       adminBaseUrl: "http://127.0.0.1:9070",
       fetchImpl: fetchImpl as unknown as typeof fetch,
+      queryNonCompletedInvocations: async () => 0,
+    });
+
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(fetchImpl.mock.calls[1][1].body as string)).toEqual({ uri: "http://127.0.0.1:9080", force: true });
+    expect(result).toEqual({ outcome: "registered-drained-force" });
+  });
+
+  it("an existing URI (200) with active work declines force", async () => {
+    const fetchImpl = vi.fn(async (_url: string, _init: RequestInit) => jsonResponse(200, { id: "dp_1" }));
+    const result = await register({
+      adminBaseUrl: "http://127.0.0.1:9070",
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      queryNonCompletedInvocations: async () => 1,
     });
 
     expect(fetchImpl).toHaveBeenCalledTimes(1);
-    expect(result).toEqual({ outcome: "registered-no-force" });
+    expect(result.outcome).toBe("declined-conflict");
   });
 
   it("META0004 conflict with zero non-completed invocations on the old deployment retries with force:true and succeeds", async () => {

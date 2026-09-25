@@ -173,19 +173,14 @@ export async function queryNonCompletedInvocations(
 }
 
 /**
- * Registers the SDK endpoint with the Restate admin API's POST /deployments, once,
- * at boot, without `force`. Verified against the Restate admin API (2026-09-14): an
- * unchanged endpoint at the same URI answers 200/201, which is success — the server
- * does not require a diff for that to happen. A changed service set at the same URI
- * that the server refuses to apply outright answers a META0004 conflict; `force: true`
- * overrides the deployment at that URI and "can lead inflight invocations to an
- * unrecoverable error state" per Restate's own guidance, so `register()` only retries
- * with `force` after confirming zero non-completed invocations on the deployment it
- * would replace, via queryNonCompletedInvocations() above (AII-721) — the self-deploy
- * interlock has already drained them before a redeploy replaces this process, so the
- * check is a guard against calling this function outside that path, not against a race
- * it needs to win. A caller that finds registration declined should retry on a timer
- * (createRestateRegistrationGate, src/index.ts) rather than treat the decline as final.
+ * Registers the SDK endpoint with Restate. On pinned server 1.7.10, the first
+ * registration answers 201, but re-registering an existing URI answers 200
+ * without re-discovering the endpoint at all — even if its service set changed.
+ * Treat that duplicate 200 like META0004: only force discovery after confirming
+ * zero non-completed invocations on the deployment it would replace. A forced
+ * replacement with active invocations could strand their journals. The deploy
+ * interlock normally drains them first; a caller that finds registration
+ * declined should retry on a timer (createRestateRegistrationGate, src/index.ts).
  * Every path is logged once. Boot never fails on the result: the kg-refresh trigger seam
  * (AII-683) answers 503 restate-unavailable while no successful registration has completed.
  */
@@ -205,15 +200,15 @@ export async function register(deps: RegisterDeps = {}): Promise<RestateRegister
     return { outcome: "unreachable", detail: message };
   }
 
-  if (response.ok) {
+  if (response.ok && response.status !== 200) {
     console.error(`[restate] endpoint registered at ${uri} (no-force, HTTP ${response.status})`);
     return { outcome: "registered-no-force" };
   }
 
-  const body = await safeJson(response);
+  const body = response.ok ? undefined : await safeJson(response);
   const code = typeof body?.restate_code === "string" ? body.restate_code : undefined;
 
-  if (code !== META0004_CONFLICT) {
+  if (!response.ok && code !== META0004_CONFLICT) {
     const message = typeof body?.message === "string" ? body.message : `HTTP ${response.status}`;
     console.error(`[restate] endpoint registration failed: ${message}`);
     return { outcome: "unreachable", detail: message };
