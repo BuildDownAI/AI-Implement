@@ -66,7 +66,6 @@ export async function dispatchLocalGapfill(input: DispatchLocalGapfillInput): Pr
     throw new Error("Local gap-fill envelope did not include run_config");
   }
   const runConfig = decodeRunConfig(envelope.run_config);
-  input.onBeforeLaunch?.();
   const container = await startLocalRunnerContainer({
     image: input.image,
     issueId: input.issue.id,
@@ -86,6 +85,7 @@ export async function dispatchLocalGapfill(input: DispatchLocalGapfillInput): Pr
     orchestratorUrl: input.orchestratorUrl,
     runnerCallbackUrl: input.runnerCallbackUrl || undefined,
     runToken: input.runToken || undefined,
+    onBeforeLaunch: input.onBeforeLaunch,
     extraEnv: (() => {
       const merged = {
         ...input.mapping.extraEnv,

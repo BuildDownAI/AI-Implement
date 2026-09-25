@@ -5,7 +5,8 @@
     "src/__tests__/review-fix-drain.test.ts",
     "src/__tests__/comment-gapfill-dispatch.test.ts",
     "src/__tests__/filesystem-ticket-flow.test.ts",
-    "src/__tests__/github-app-auth.test.ts"
+    "src/__tests__/github-app-auth.test.ts",
+    "src/__tests__/local-docker.test.ts"
   ],
   "exclude": []
 }
