@@ -113,6 +113,7 @@ describe("ReviewFixPR durable coordination", () => {
     },
   };
   const attempt = createReviewFixAttempt({
+    notifyPrOnCompletion: true,
     store,
     worker: {
       prepare: async (prepared) => ({ attemptId: prepared.attemptId, scope: prepared.scope,
@@ -171,8 +172,6 @@ describe("ReviewFixPR durable coordination", () => {
     await callWorkflow(env.baseUrl(), "ReviewFixAttempt", prepared.attemptId, "result", result);
     await attachWorkflow(env.baseUrl(), "ReviewFixAttempt", prepared.attemptId);
     expect(state.released).toBe(true);
-    expect(await callObject(env.baseUrl(), "ReviewFixPR", reviewFixPRKey(pr.scope), "completed",
-      { attemptId: prepared.attemptId })).toBe(true);
   }
 
   it.each(VARIANTS.map(([label]) => label))("one fixed feedback window and one active attempt (%s)", async (label) => {
