@@ -360,6 +360,44 @@ describe("projects page review-fix lifecycle field", () => {
     expect((doc.getElementById("md-review-fix-lifecycle") as HTMLSelectElement).value).toBe("restate");
   });
 
+  it("recovers from a rejected save request (network failure) without leaving the button stuck", async () => {
+    const { win, doc, posts } = mountProjects(baseMapping({ reviewFixLifecycle: "legacy" }));
+    await win.loadMappings();
+    win.openMappingDialog("AII");
+
+    (doc.getElementById("md-review-fix-lifecycle") as HTMLSelectElement).value = "restate";
+    (doc.getElementById("md-branch") as HTMLInputElement).value = "development";
+
+    const calls: Array<{ url: string; method?: string }> = [];
+    const origApi = win.api;
+    win.api = async (url: string, init?: { method?: string; body?: string }) => {
+      calls.push({ url, method: init?.method });
+      if (url === "/api/mappings" && init?.method === "POST") {
+        return Promise.reject(new Error("network error"));
+      }
+      return origApi(url, init);
+    };
+
+    const saveBtn = doc.getElementById("md-save") as HTMLButtonElement;
+    await expect(save(win)).resolves.toBeUndefined();
+
+    expect(posts).toEqual([]);
+    expect(calls.filter((c) => c.method === "POST")).toHaveLength(1);
+
+    expect(saveBtn.disabled).toBe(false);
+    expect(saveBtn.textContent).toBe("Save Mapping");
+
+    const dialog = doc.getElementById("mapping-dialog") as unknown as { open: boolean };
+    expect(dialog.open).toBe(true);
+    expect((doc.getElementById("md-review-fix-lifecycle") as HTMLSelectElement).value).toBe("restate");
+    expect((doc.getElementById("md-branch") as HTMLInputElement).value).toBe("development");
+
+    const errEl = doc.getElementById("md-error");
+    expect(errEl?.classList.contains("hidden")).toBe(false);
+    expect(errEl?.textContent).toBeTruthy();
+    expect(errEl?.textContent).not.toMatch(/^Server error:/);
+  });
+
   it("renders a distinct cause for an unsupported execution mode vs. an unavailable registration", async () => {
     const { win, doc, posts } = mountProjects(baseMapping({ reviewFixLifecycle: "legacy", executionMode: "fly-machines" }));
     await win.loadMappings();
