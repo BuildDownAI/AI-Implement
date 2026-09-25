@@ -1118,6 +1118,50 @@ describe("runAutonomous", () => {
     }
   });
 
+  it("reports INSTALL_FAILED with gap-fill wording (no literal 'undefined') when a gap-fill run's dependencies never installed", async () => {
+    vi.stubEnv("PR_NUMBER", "42");
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    const { pipeline, runner } = makeStepsPipeline([
+      ["install", { run: vi.fn().mockResolvedValue({ installFailed: true, installMethod: "npm ci", installError: "npm ci failed: dependency conflict" }) }],
+      ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true, iterations: 2, terminationReason: "approved", passes: [] }) }],
+      ["install-retry", { run: vi.fn().mockResolvedValue({ installFailed: true, installMethod: "npm ci", installError: "npm ci failed again: dependency conflict" }) }],
+      ["push", { run: vi.fn().mockResolvedValue({ prUrl: null, prNumber: 42, branchPushed: true }) }],
+    ]);
+
+    try {
+      const result = await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeMockExecutor(0),
+        fetchImpl: mockFetch,
+      });
+
+      expect(result.exitCode).toBe(0);
+      const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
+        outcome: string;
+        failureCode: string;
+        prUrl: string | null | undefined;
+      };
+      expect(body.outcome).toBe("failure");
+      expect(body.failureCode).toBe("INSTALL_FAILED");
+      expect(body.prUrl).toBeFalsy();
+
+      const warnings = warn.mock.calls.map((call) => call.join(" ")).join("\n");
+      expect(warnings).toContain(
+        "::warning::AI-Implement: dependency install failed — gap-fill on PR #42",
+      );
+      expect(warnings).not.toContain("undefined");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it("keeps REVIEW_UNAPPROVED (not INSTALL_FAILED) when an unapproved run's dependencies also never installed", async () => {
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
     vi.stubEnv("RUN_TOKEN", "run-token");

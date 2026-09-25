@@ -703,9 +703,15 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
         const failureReason =
           `Dependency install failed twice (${installMethod}); the change was approved by review but never built or tested.\n\n` +
           installError.slice(0, 500);
-        disposition = `${prKind} ${prUrl} — dependency install failed; not verified`;
+        const prDisposition = prUrl
+          ? `${prKind} ${prUrl}`
+          : prNumber
+          ? `gap-fill on PR #${prNumber}`
+          : "local (mounted mode)";
+        disposition = `${prDisposition} — dependency install failed; not verified`;
         console.warn(
-          `::warning::AI-Implement: dependency install failed — ${prKind} opened: ${prUrl}`,
+          `::warning::AI-Implement: dependency install failed — ` +
+            (prUrl ? `${prKind} opened: ${prUrl}` : prNumber ? `gap-fill on PR #${prNumber}` : "no PR opened"),
         );
         await postRunnerResult({
           workspaceDir,
