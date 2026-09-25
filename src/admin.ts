@@ -38,7 +38,7 @@ import {
 import { listDispatched, deleteDispatched, getReaperSummary, listReaperActions, getDispatchedIds } from "./dedup.js";
 import { listParked, unpark } from "./dispatch-breaker.js";
 import { createSession, accessCodeMatches, authenticateAdminRequest, type AdminGate, type SessionIdentity } from "./admin-session.js";
-import { getEffectiveAllowlist, getEnvAllowlist, listAccessEntries, parseAccessEntries, saveAccessEntries } from "./access-entries.js";
+import { getEffectiveAllowlist, getEnvAllowlist, listAccessEntries, parseAccessEntries, saveAccessEntries, type AccessRole } from "./access-entries.js";
 import { listAccessChanges } from "./access-audit.js";
 import { listGrantedPages, PAGE_ROUTES, savePageGrants } from "./access-page-grants.js";
 import type { DeployStart } from "./deploy.js";
@@ -457,6 +457,135 @@ export interface AdminDeps {
    * Absent only in tests that don't exercise reviewFixLifecycle="restate" enablement.
    */
   getRestateStatus?: () => RestateStatus;
+  /**
+   * The review-fix attempt lifecycle facade (AII-806) — attempt detail/activity reads
+   * and the reconcile/adopt/cancel recovery actions. A narrow injected interface
+   * mirroring `deps.kgRefresh`: its concrete implementation composes the storage
+   * (AII-786), delivery (AII-802/803), and lifecycle-setting (AII-804) contract work,
+   * plus a real call into the Restate `ReviewFixAttempt` workflow — this file cannot
+   * make that last call itself, since it may only import `src/restate/*` as types
+   * (src/__tests__/restate-boundary.test.ts). Absent only in tests/deployments that
+   * don't exercise the five `/api/review-fix/attempts/*` routes, which then answer 501.
+   */
+  reviewFixAttempts?: ReviewFixAttemptsFacade;
+}
+
+/** Caller identity passed into every `reviewFixAttempts` facade call, so scope and
+ *  ownership enforcement happens inside the injected facade — never by trusting the
+ *  URL — mirroring the `tool()` wrapper's own role check (src/restate/tools.ts). */
+export interface ReviewFixAttemptCaller {
+  role: AccessRole;
+  email: string | null;
+}
+
+export interface ReviewFixAttemptExecutionRef {
+  githubRunId: string;
+  githubRunAttempt: number;
+}
+
+export interface ReviewFixAttemptCycleSummary {
+  cycle: number;
+  inputCommit: string | null;
+  outputCommit: string | null;
+  dispositions: { key: string; disposition: string }[];
+  tests: { name: string; status: string }[];
+  verdict: { approved: boolean | null; reason: string; summary?: string };
+  usage: { tokensIn: number | null; tokensOut: number | null; costUsd: number | null };
+  completedAt: number;
+}
+
+/** The full read model for `GET /api/review-fix/attempts/:attemptId`. */
+export interface ReviewFixAttemptDetail {
+  attemptId: string;
+  owner: Record<string, unknown> | null;
+  execution: ReviewFixAttemptExecutionRef | null;
+  deadlineAt: number | null;
+  pendingFeedback: boolean;
+  snapshot: { taskText: string; findings: { findingKey: string; version: number }[] } | null;
+  state: string;
+  /** False whenever activity or cycle evidence is missing, truncated past its cap, or
+   *  expired past the retention window — an explicit field rather than an absent one
+   *  (AII-806's "missing evidence... explicit response states"). */
+  evidenceComplete: boolean;
+  /** False whenever a requested cancellation or deadline has not yet been confirmed
+   *  stopped on GitHub's side — explicit, never inferred from an absent field. */
+  terminationConfirmed: boolean;
+  cycles: ReviewFixAttemptCycleSummary[];
+}
+
+export type ReviewFixAttemptReadResult =
+  | { status: "ok"; attempt: ReviewFixAttemptDetail }
+  | { status: "not_found" }
+  | { status: "unavailable" };
+
+export interface ReviewFixActivityCursor {
+  producerId: string;
+  sequence: number;
+}
+
+export interface ReviewFixActivityEvent {
+  producerId: string;
+  sequence: number;
+  cycle: number | null;
+  kind: string;
+  occurredAt: number;
+  payload: string | null;
+  truncated: boolean;
+  byteCount: number;
+}
+
+export interface ReviewFixActivityPage {
+  events: ReviewFixActivityEvent[];
+  nextCursor: ReviewFixActivityCursor | null;
+  /** True once this attempt's stream has hit the 10 MiB attempt cap or has a known gap
+   *  in its sequence — passed through from the store untouched, never summarized away. */
+  truncated: boolean;
+}
+
+export type ReviewFixActivityReadResult =
+  | { status: "ok"; page: ReviewFixActivityPage }
+  | { status: "not_found" }
+  | { status: "unavailable" };
+
+/**
+ * Outcome of a mutating action. `not_found` covers an unknown/out-of-scope attempt id,
+ * matching the read routes' not-found shape. `unverified` is specific to `adopt`: the
+ * caller-supplied execution reference did not match a verified GitHub run, so ownership
+ * was never granted. `unavailable` means Restate could not be reached — the action is
+ * durably queued, not lost, and this must never collapse into a generic failure.
+ */
+export type ReviewFixActionOutcome =
+  | { status: "accepted" }
+  | { status: "not_found" }
+  | { status: "rejected"; reason: string }
+  | { status: "unverified" }
+  | { status: "unavailable" };
+
+/**
+ * The review-fix attempt lifecycle facade (AII-806). A narrow, injected interface —
+ * mirroring `deps.kgRefresh` — over capabilities whose concrete implementation is the
+ * blocked contract work in AII-786/802/803/804/569.
+ */
+export interface ReviewFixAttemptsFacade {
+  getAttempt(attemptId: string, caller: ReviewFixAttemptCaller): Promise<ReviewFixAttemptReadResult>;
+  getActivity(
+    attemptId: string,
+    opts: { cursor?: ReviewFixActivityCursor; pageSize?: number },
+    caller: ReviewFixAttemptCaller,
+  ): Promise<ReviewFixActivityReadResult>;
+  reconcile(attemptId: string, caller: ReviewFixAttemptCaller): Promise<ReviewFixActionOutcome>;
+  /** Succeeds only when `execution` verifies as a genuine match for this attempt — an
+   *  unverified reference must never flip ownership. */
+  adopt(attemptId: string, execution: ReviewFixAttemptExecutionRef, caller: ReviewFixAttemptCaller): Promise<ReviewFixActionOutcome>;
+  /**
+   * Cancel is two explicit steps, called by the route handler in this order and never
+   * collapsed into one call: authority is revoked before termination is even requested,
+   * and occupancy is retained until termination is independently confirmed elsewhere
+   * (AII-806's requirements table). There is deliberately no combined, unconditional
+   * force-release operation on this interface.
+   */
+  revokeAuthority(attemptId: string, caller: ReviewFixAttemptCaller): Promise<ReviewFixActionOutcome>;
+  requestCancellation(attemptId: string, caller: ReviewFixAttemptCaller): Promise<ReviewFixActionOutcome>;
 }
 
 /**
@@ -472,6 +601,14 @@ function grantedRouteAllows(url: string, method: string, grantedPages: string[])
 
 /** Matches POST /api/tools/<name> — the tools-service entry point (AII-712). */
 const TOOL_CALL_ROUTE = /^\/api\/tools\/([^/]+)$/;
+
+/** Review-fix attempt routes (AII-806). Matched against the path with any query string
+ *  stripped — the activity route takes cursor/pageSize as query params. */
+const REVIEW_FIX_ATTEMPT_ROUTE = /^\/api\/review-fix\/attempts\/([^/]+)$/;
+const REVIEW_FIX_ACTIVITY_ROUTE = /^\/api\/review-fix\/attempts\/([^/]+)\/activity$/;
+const REVIEW_FIX_RECONCILE_ROUTE = /^\/api\/review-fix\/attempts\/([^/]+)\/reconcile$/;
+const REVIEW_FIX_ADOPT_ROUTE = /^\/api\/review-fix\/attempts\/([^/]+)\/adopt$/;
+const REVIEW_FIX_CANCEL_ROUTE = /^\/api\/review-fix\/attempts\/([^/]+)\/cancel$/;
 
 /** Authorization for every `/api/` route: authenticate, answer the identity probe, then require Admin or a grant — except the tools route, which defers to the tool's own role check. Null means the response is already sent. */
 function authorizeApiRequest(
@@ -505,6 +642,17 @@ function authorizeApiRequest(
   // role — not by a blanket admin requirement here. Reusing that check is the point: a
   // second, route-local write list here would drift from the one the wrapper enforces.
   if (TOOL_CALL_ROUTE.test(url) && method === "POST") {
+    return gate;
+  }
+
+  // Review-fix attempt reads mirror /mcp's read-open model: every authenticated identity
+  // may read attempt detail/activity, with scope and ownership enforced inside the
+  // injected facade via gate.identity/gate.role — not by trusting the URL (AII-806). The
+  // three mutating actions are POST, so they never match here: grantedRouteAllows always
+  // refuses a non-GET method, and they fall through to the blanket admin-or-grant rule
+  // below, staying admin-only.
+  const reviewFixReadPath = url.split("?")[0];
+  if (method === "GET" && (REVIEW_FIX_ATTEMPT_ROUTE.test(reviewFixReadPath) || REVIEW_FIX_ACTIVITY_ROUTE.test(reviewFixReadPath))) {
     return gate;
   }
 
@@ -1057,6 +1205,38 @@ export function handleAdminRequest(
         console.error("[admin] template-status failed:", err);
         if (!res.headersSent) json(res, 500, { error: "internal_error" });
       });
+      return true;
+    }
+
+    const reviewFixPath = url.split("?")[0];
+
+    const reviewFixActivityMatch = REVIEW_FIX_ACTIVITY_ROUTE.exec(reviewFixPath);
+    if (reviewFixActivityMatch && method === "GET") {
+      handleReviewFixActivity(res, gate, deps, decodeURIComponent(reviewFixActivityMatch[1]), url);
+      return true;
+    }
+
+    const reviewFixAttemptMatch = REVIEW_FIX_ATTEMPT_ROUTE.exec(reviewFixPath);
+    if (reviewFixAttemptMatch && method === "GET") {
+      handleReviewFixAttemptGet(res, gate, deps, decodeURIComponent(reviewFixAttemptMatch[1]));
+      return true;
+    }
+
+    const reviewFixReconcileMatch = REVIEW_FIX_RECONCILE_ROUTE.exec(reviewFixPath);
+    if (reviewFixReconcileMatch && method === "POST") {
+      handleReviewFixReconcile(res, gate, deps, decodeURIComponent(reviewFixReconcileMatch[1]));
+      return true;
+    }
+
+    const reviewFixAdoptMatch = REVIEW_FIX_ADOPT_ROUTE.exec(reviewFixPath);
+    if (reviewFixAdoptMatch && method === "POST") {
+      handleReviewFixAdopt(req, res, gate, deps, decodeURIComponent(reviewFixAdoptMatch[1]));
+      return true;
+    }
+
+    const reviewFixCancelMatch = REVIEW_FIX_CANCEL_ROUTE.exec(reviewFixPath);
+    if (reviewFixCancelMatch && method === "POST") {
+      handleReviewFixCancel(res, gate, deps, decodeURIComponent(reviewFixCancelMatch[1]));
       return true;
     }
 
@@ -1861,6 +2041,212 @@ async function handleToolCall(
     json(res, 200, { content: result.content, isError: result.isError });
   } catch (err) {
     console.error("[admin] tool call failed:", err);
+    json(res, 500, { error: "Internal server error" });
+  }
+}
+
+function reviewFixCaller(gate: Extract<AdminGate, { ok: true }>): ReviewFixAttemptCaller {
+  return { role: gate.role, email: gate.identity?.email ?? null };
+}
+
+/** Maps a `ReviewFixActionOutcome` to its HTTP status/body — shared by reconcile,
+ *  adopt, and both steps of cancel. `unavailable` answers 202 with an explicit
+ *  durable-acceptance body rather than a 503/500: Restate could not be reached, but the
+ *  action is durably queued (AII-806) and this must read as "queued", not "failed". */
+function reviewFixActionResponse(outcome: ReviewFixActionOutcome): [number, Record<string, unknown>] {
+  switch (outcome.status) {
+    case "accepted":
+      return [202, { status: "accepted" }];
+    case "not_found":
+      return [404, { error: "not_found" }];
+    case "rejected":
+      return [409, { error: outcome.reason, status: "rejected" }];
+    case "unverified":
+      return [422, { error: "unverified", status: "unverified" }];
+    case "unavailable":
+      return [202, {
+        status: "durable-accepted",
+        detail: "Restate is temporarily unavailable; the action is durably queued and will be applied once it recovers.",
+      }];
+  }
+}
+
+function handleReviewFixAttemptGet(
+  res: http.ServerResponse,
+  gate: Extract<AdminGate, { ok: true }>,
+  deps: AdminDeps,
+  attemptId: string,
+): void {
+  if (!deps.reviewFixAttempts) {
+    json(res, 501, { error: "Review-fix attempts are not configured" });
+    return;
+  }
+  deps.reviewFixAttempts.getAttempt(attemptId, reviewFixCaller(gate)).then(
+    (result) => {
+      if (result.status === "not_found") { json(res, 404, { error: "not_found" }); return; }
+      if (result.status === "unavailable") { json(res, 503, { error: "restate-unavailable" }); return; }
+      json(res, 200, result.attempt);
+    },
+    (err) => {
+      console.error("[admin] review-fix attempt read failed:", err);
+      json(res, 500, { error: "Internal server error" });
+    },
+  );
+}
+
+function handleReviewFixActivity(
+  res: http.ServerResponse,
+  gate: Extract<AdminGate, { ok: true }>,
+  deps: AdminDeps,
+  attemptId: string,
+  url: string,
+): void {
+  if (!deps.reviewFixAttempts) {
+    json(res, 501, { error: "Review-fix attempts are not configured" });
+    return;
+  }
+  const qs = url.includes("?") ? url.slice(url.indexOf("?") + 1) : "";
+  const params = new URLSearchParams(qs);
+  const pageSizeRaw = params.get("pageSize");
+  const requestedPageSize = pageSizeRaw === null ? 100 : Number(pageSizeRaw);
+  if (!Number.isSafeInteger(requestedPageSize) || requestedPageSize < 1) {
+    json(res, 400, { error: "pageSize must be a positive integer" });
+    return;
+  }
+  const pageSize = Math.min(requestedPageSize, 500);
+  const cursorProducerId = params.get("cursorProducerId");
+  const cursorSequenceRaw = params.get("cursorSequence");
+  let cursor: ReviewFixActivityCursor | undefined;
+  if (cursorProducerId !== null || cursorSequenceRaw !== null) {
+    const sequence = Number(cursorSequenceRaw);
+    if (!cursorProducerId || cursorSequenceRaw === null || !Number.isSafeInteger(sequence) || sequence < 0) {
+      json(res, 400, { error: "cursorProducerId and a non-negative integer cursorSequence are required together" });
+      return;
+    }
+    cursor = { producerId: cursorProducerId, sequence };
+  }
+  deps.reviewFixAttempts.getActivity(attemptId, { cursor, pageSize }, reviewFixCaller(gate)).then(
+    (result) => {
+      if (result.status === "not_found") { json(res, 404, { error: "not_found" }); return; }
+      if (result.status === "unavailable") { json(res, 503, { error: "restate-unavailable" }); return; }
+      // Passed through untouched — including its own `truncated` marker — never
+      // summarized or re-derived here.
+      json(res, 200, result.page);
+    },
+    (err) => {
+      console.error("[admin] review-fix activity read failed:", err);
+      json(res, 500, { error: "Internal server error" });
+    },
+  );
+}
+
+function handleReviewFixReconcile(
+  res: http.ServerResponse,
+  gate: Extract<AdminGate, { ok: true }>,
+  deps: AdminDeps,
+  attemptId: string,
+): void {
+  if (!deps.reviewFixAttempts) {
+    json(res, 501, { error: "Review-fix attempts are not configured" });
+    return;
+  }
+  deps.reviewFixAttempts.reconcile(attemptId, reviewFixCaller(gate)).then(
+    (outcome) => { const [status, body] = reviewFixActionResponse(outcome); json(res, status, body); },
+    (err) => {
+      console.error("[admin] review-fix reconcile failed:", err);
+      json(res, 500, { error: "Internal server error" });
+    },
+  );
+}
+
+async function handleReviewFixAdopt(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  gate: Extract<AdminGate, { ok: true }>,
+  deps: AdminDeps,
+  attemptId: string,
+): Promise<void> {
+  if (!deps.reviewFixAttempts) {
+    json(res, 501, { error: "Review-fix attempts are not configured" });
+    return;
+  }
+  let raw: string;
+  try {
+    raw = await readBody(req);
+  } catch {
+    json(res, 400, { error: "Could not read request body" });
+    return;
+  }
+  let execution: ReviewFixAttemptExecutionRef;
+  try {
+    const parsed = JSON.parse(raw) as { githubRunId?: unknown; githubRunAttempt?: unknown };
+    if (typeof parsed.githubRunId !== "string" || !parsed.githubRunId || typeof parsed.githubRunAttempt !== "number" || !Number.isSafeInteger(parsed.githubRunAttempt) || parsed.githubRunAttempt < 1) {
+      json(res, 400, { error: "Body must include githubRunId (string) and githubRunAttempt (positive integer)" });
+      return;
+    }
+    execution = { githubRunId: parsed.githubRunId, githubRunAttempt: parsed.githubRunAttempt };
+  } catch {
+    json(res, 400, { error: "Invalid JSON body" });
+    return;
+  }
+  try {
+    const outcome = await deps.reviewFixAttempts.adopt(attemptId, execution, reviewFixCaller(gate));
+    const [status, body] = reviewFixActionResponse(outcome);
+    json(res, status, body);
+  } catch (err) {
+    console.error("[admin] review-fix adopt failed:", err);
+    json(res, 500, { error: "Internal server error" });
+  }
+}
+
+/** Cancel is two explicit facade calls, made in this order: authority is revoked before
+ *  termination is even requested, and a revoke that fails or finds nothing short-circuits
+ *  before requestCancellation is ever called (AII-806 — "revoke authority then follows
+ *  workflow termination", no unconditional force-release). */
+async function handleReviewFixCancel(
+  res: http.ServerResponse,
+  gate: Extract<AdminGate, { ok: true }>,
+  deps: AdminDeps,
+  attemptId: string,
+): Promise<void> {
+  if (!deps.reviewFixAttempts) {
+    json(res, 501, { error: "Review-fix attempts are not configured" });
+    return;
+  }
+  const caller = reviewFixCaller(gate);
+  try {
+    const revoked = await deps.reviewFixAttempts.revokeAuthority(attemptId, caller);
+    if (revoked.status === "unavailable") {
+      json(res, 503, {
+        status: "partial",
+        authorityRevocation: "durable-accepted",
+        cancellation: "not-requested",
+        detail: "Authority revocation is queued, but termination has not been requested. Retry cancellation after recovery.",
+      });
+      return;
+    }
+    if (revoked.status !== "accepted") {
+      const [status, body] = reviewFixActionResponse(revoked);
+      json(res, status, body);
+      return;
+    }
+    let cancelled: ReviewFixActionOutcome;
+    try {
+      cancelled = await deps.reviewFixAttempts.requestCancellation(attemptId, caller);
+    } catch {
+      console.error("[admin] review-fix cancellation request failed");
+      json(res, 503, {
+        status: "partial",
+        authorityRevocation: "accepted",
+        cancellation: "unconfirmed",
+        detail: "Authority was revoked, but termination could not be confirmed. Reconcile before retrying cancellation.",
+      });
+      return;
+    }
+    const [status, body] = reviewFixActionResponse(cancelled);
+    json(res, status, body);
+  } catch (err) {
+    console.error("[admin] review-fix cancel failed:", err);
     json(res, 500, { error: "Internal server error" });
   }
 }
