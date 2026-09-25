@@ -4386,20 +4386,22 @@ async function dispatchKgRefreshRun(
 const reviewFixAttemptStore = new SqliteReviewFixAttemptStore();
 
 async function onReviewFixResult(result: ReviewFixResultMetadataV1): Promise<ResultIntakeOutcome> {
-  const outcome = await reviewFixAttemptStore.recordResult(result.attemptId, result);
-  if (outcome.status === "stored") {
-    // Durable outbox entry for the async delivery pump — never a synchronous
-    // Restate call. Idempotent: acceptDelivery with the same identity and
-    // payload is a harmless no-op even if this ever ran twice.
-    acceptReviewFixDelivery({
+  // The accepted result and its delivery entry commit together. The callback
+  // also runs on an identical retry, repairing an older result that somehow
+  // lacks its inbox row; a rejected or conflicted identity aborts the write.
+  // This callback performs synchronous SQLite work only, never a Restate call.
+  return reviewFixAttemptStore.recordResult(result.attemptId, result, () => {
+    const delivery = acceptReviewFixDelivery({
       authenticatedSource: "runner-callback",
       deliveryId: `${result.attemptId}.result`,
       kind: "result",
       destination: { installationId: result.installationId, repository: result.repository, prNumber: result.prNumber },
       payload: result,
     });
-  }
-  return outcome;
+    if (delivery.status !== "accepted") {
+      throw new Error(`review-fix result delivery was ${delivery.status}`);
+    }
+  });
 }
 
 function onReviewFixActivity(batch: RunnerActivityBody): ActivityIntakeOutcome {

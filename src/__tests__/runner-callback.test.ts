@@ -3832,7 +3832,7 @@ describe("handleRunnerResult — reviewFix pilot marker (AII-777)", () => {
     expect(onReviewFixResult).not.toHaveBeenCalled();
   });
 
-  it("authenticates a valid reviewFix marker via its prepared credential and never touches Legacy processing when no seam is provided", async () => {
+  it("fails closed without a result persistence seam and never touches Legacy processing", async () => {
     const fake = new FakeProvider({ recordCalls: true });
     const token = preparedResultToken(validReviewFix.attemptId);
 
@@ -3849,8 +3849,8 @@ describe("handleRunnerResult — reviewFix pilot marker (AII-777)", () => {
       resolveProvider: makeResolve(fake),
     });
 
-    expect(res.status).toBe(200);
-    expect(res.body).toMatchObject({ acknowledged: true, outcome: "stored" });
+    expect(res.status).toBe(503);
+    expect(res.body.error).toBe("reviewfix_result_intake_unavailable");
     expect(fake.recordedCalls()).toEqual([]);
     expect(fake.getPhase("i")).toBeUndefined();
   });
@@ -4121,6 +4121,7 @@ describe("handleRunnerResult — reviewFix pilot marker (AII-777)", () => {
       body: { ...legacyBody, reviewFix: validReviewFix },
       secret: SECRET,
       resolveProvider: makeResolve(fake),
+      onReviewFixResult: (result) => ({ status: "stored", result }),
     });
     expect(pilotRes.status).toBe(200);
   });
@@ -4200,6 +4201,7 @@ describe("handleRunnerResult — cycle summary durable evidence (AII-801)", () =
       body: { phase: "implementation", outcome: "success", comments: [], prUrl: "https://github.com/o/r/pull/1", ...body },
       secret: SECRET,
       resolveProvider: makeResolve(fake),
+      onReviewFixResult: body.reviewFix ? (result) => ({ status: "stored", result }) : undefined,
     });
   }
 
@@ -4484,7 +4486,7 @@ describe("handleRunnerActivity (AII-777/AII-803)", () => {
     expect(res.body.error).toBe("activity_wrong_attempt");
   });
 
-  it("accepts a well-formed activity body authenticated with its prepared progress credential, defaulting to 'accepted' with no seam", async () => {
+  it("fails closed for a well-formed activity body when no persistence seam is provided", async () => {
     const token = preparedProgressToken("attempt-1");
     const res = await runnerCallback.handleRunnerActivity({
       authorization: `Bearer ${token}`,
@@ -4496,10 +4498,8 @@ describe("handleRunnerActivity (AII-777/AII-803)", () => {
         events: [activityEvent()],
       },
     });
-    expect(res).toEqual({
-      status: 200,
-      body: { acknowledged: true, outcome: "accepted", attemptId: "attempt-1", retryable: false },
-    });
+    expect(res.status).toBe(503);
+    expect(res.body.error).toBe("reviewfix_activity_intake_unavailable");
   });
 
   it("accepts a body with a finalSequence at or beyond the last event's sequence", async () => {
@@ -4514,6 +4514,7 @@ describe("handleRunnerActivity (AII-777/AII-803)", () => {
         events: [activityEvent({ sequence: 0 }), activityEvent({ sequence: 1 })],
         finalSequence: 1,
       },
+      onReviewFixActivity: (batch) => ({ status: "accepted", attemptId: batch.attemptId }),
     });
     expect(res.status).toBe(200);
   });

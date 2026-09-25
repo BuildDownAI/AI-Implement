@@ -182,8 +182,8 @@ export interface HandleRunnerResultInput {
    * call, so every classification ("stored"/"duplicate"/"conflict"/"stale") is
    * fully side-effect-free with respect to Legacy. A "stored" classification
    * never falls through into Legacy phase handling either — see
-   * `handleRunnerResult`'s reviewFix branch, which returns directly. Absent,
-   * defaults to a synthetic "stored" classification (no attempt store wired).
+   * `handleRunnerResult`'s reviewFix branch, which returns directly. An absent
+   * seam fails closed: a pilot result cannot be acknowledged without storage.
    */
   onReviewFixResult?: (result: ReviewFixResultMetadataV1) => ResultIntakeOutcome | Promise<ResultIntakeOutcome>;
   /**
@@ -654,9 +654,8 @@ export async function handleRunnerResult(
       return bad(401, reason);
     }
 
-    const outcome = input.onReviewFixResult
-      ? await input.onReviewFixResult(validated.value)
-      : ({ status: "stored", result: validated.value } as const);
+    if (!input.onReviewFixResult) return bad(503, "reviewfix_result_intake_unavailable");
+    const outcome = await input.onReviewFixResult(validated.value);
 
     // The result marker may have committed just before a process crash, leaving
     // its attached cycles unwritten. A byte-identical duplicate may repair only
@@ -1135,8 +1134,8 @@ export interface HandleRunnerActivityInput {
   body: unknown;
   /**
    * Injectable seam that durably stores a validated activity batch
-   * (AII-769/AII-803) — e.g. `appendReviewFixActivityBatch`. Absent means
-   * "accepted" without further action.
+   * (AII-769/AII-803) — e.g. `appendReviewFixActivityBatch`. An absent
+   * seam fails closed rather than acknowledging an unstored activity batch.
    */
   onReviewFixActivity?: (batch: RunnerActivityBody) => ActivityIntakeOutcome | Promise<ActivityIntakeOutcome>;
 }
@@ -1158,9 +1157,8 @@ export async function handleRunnerActivity(input: HandleRunnerActivityInput): Pr
   if (!validated.ok) return bad(400, validated.error);
   if (validated.value.attemptId !== verified.claims.attemptId) return bad(401, "activity_wrong_attempt");
 
-  const outcome = input.onReviewFixActivity
-    ? await input.onReviewFixActivity(validated.value)
-    : ({ status: "accepted", attemptId: validated.value.attemptId } as const);
+  if (!input.onReviewFixActivity) return bad(503, "reviewfix_activity_intake_unavailable");
+  const outcome = await input.onReviewFixActivity(validated.value);
   return activityIntakeResponse(outcome);
 }
 
