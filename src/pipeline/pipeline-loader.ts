@@ -98,6 +98,18 @@ function nonEmptyString(value: unknown): string | undefined {
 }
 
 /**
+ * True only when both the first install attempt and its retry (after
+ * feedback-loop) failed. A skipped install-retry (first install succeeded)
+ * leaves empty outputs, so this is false in that case.
+ */
+export function dependenciesMissing(ctx: PipelineContext): boolean {
+  return (
+    ctx.getOutputs("install").installFailed === true &&
+    ctx.getOutputs("install-retry").installFailed === true
+  );
+}
+
+/**
  * Standard input wiring for the autonomous pipeline steps. Applied by step ID
  * so the YAML only needs to declare IDs, types, and optional moduleIds.
  */
@@ -164,6 +176,18 @@ function applyWiring(step: YamlStep): StepDefinition {
         }),
       };
 
+    case "install-retry":
+      return {
+        ...step,
+        inputs: (ctx: PipelineContext) => ({
+          workspaceDir: ctx.getOutputs("clone").workspaceDir,
+          packageManager: ctx.getOutputs("install").packageManager,
+          retry: true,
+        }),
+        skip: (ctx: PipelineContext) =>
+          ctx.getOutputs("install").installFailed === true ? false : "first install succeeded",
+      };
+
     case "setup":
       return {
         ...step,
@@ -178,7 +202,8 @@ function applyWiring(step: YamlStep): StepDefinition {
       return {
         ...step,
         inputs: (ctx: PipelineContext) => {
-          const repoModels = ctx.getOutputs("install").repoModels as
+          const installOutputs = ctx.getOutputs("install");
+          const repoModels = installOutputs.repoModels as
             | { implement?: string; review?: string }
             | undefined;
           const referenceRepoOutputs = ctx.getOutputs("reference-repos") as { results?: ReferenceRepoResult[] };
@@ -195,6 +220,11 @@ function applyWiring(step: YamlStep): StepDefinition {
             maxTurns: ctx.data.maxTurns,
             maxIterations: ctx.data.maxIterations,
             reviewRubric: ctx.data.reviewRubric,
+            installFailed: installOutputs.installFailed === true,
+            installMethod:
+              typeof installOutputs.installMethod === "string" ? installOutputs.installMethod : undefined,
+            installError:
+              typeof installOutputs.installError === "string" ? installOutputs.installError : undefined,
           };
         },
       };
@@ -206,7 +236,11 @@ function applyWiring(step: YamlStep): StepDefinition {
           workspaceDir: ctx.getOutputs("clone").workspaceDir,
           packageManager: ctx.getOutputs("install").packageManager,
         }),
-        skip: (ctx: PipelineContext) => ctx.getOutputs("feedback-loop").approved !== true,
+        skip: (ctx: PipelineContext) => {
+          if (ctx.getOutputs("feedback-loop").approved !== true) return true;
+          if (dependenciesMissing(ctx)) return "dependency install failed";
+          return false;
+        },
       };
 
     case "push":
@@ -250,7 +284,7 @@ function applyWiring(step: YamlStep): StepDefinition {
               : `${ctx.data.issueIdentifier}: ${ctx.data.issueTitle}`,
             sensitiveFiles: ctx.data.sensitiveFiles,
             groupingParent: ctx.data.groupingParent,
-            draft: !approved,
+            draft: !approved || dependenciesMissing(ctx),
             reviewSummary: approved
               ? undefined
               : {
@@ -273,7 +307,8 @@ function applyWiring(step: YamlStep): StepDefinition {
         }),
         skip: (ctx: PipelineContext) => {
           if (!ctx.data.hooks?.verify) return true;
-          return ctx.getOutputs("feedback-loop").approved !== true;
+          if (ctx.getOutputs("feedback-loop").approved !== true) return true;
+          return dependenciesMissing(ctx);
         },
       };
 
@@ -298,6 +333,9 @@ function applyWiring(step: YamlStep): StepDefinition {
           // Never run further review/force-push cycles against an unapproved
           // draft — the review budget is already exhausted.
           if (ctx.getOutputs("feedback-loop").approved !== true) return true;
+          // The run is not verified when dependencies never installed; leave the PR
+          // for a human rather than running a review cycle against it.
+          if (dependenciesMissing(ctx)) return true;
           const pushOutputs = ctx.getOutputs("push");
           return pushOutputs.branchPushed !== true || !pushOutputs.prNumber;
         },

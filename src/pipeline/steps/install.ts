@@ -8,6 +8,8 @@ import type { ReviewerSelection } from "../../config.js";
 import { repoProcessEnv } from "../process-env.js";
 import { resolveTrustedReviewer, type ReviewerDefinition } from "../reviewers/registry.js";
 import { REVIEWER_VERDICT_SCHEMA } from "../reviewers/schema.js";
+import { redactAndCap } from "../failure-classification.js";
+import { neutralizeFences } from "../../completion-classification.js";
 
 interface RepoModels {
   implement?: string;
@@ -34,17 +36,24 @@ interface TrustedConfigReviewersInput {
 interface InstallInputs extends Record<string, unknown> {
   workspaceDir: string;
   fetchImpl?: typeof fetch;
+  /** Second-attempt mode: reuses the first attempt's packageManager and skips config reads. */
+  retry?: boolean;
+  packageManager?: string;
 }
 
 interface InstallOutputs extends Record<string, unknown> {
   packageManager: string;
   installMethod: string;
   durationMs: number;
-  repoModels: RepoModels;
+  installFailed: boolean;
+  /** Tail of the install output, redacted and capped, set only when installFailed is true. */
+  installError?: string;
+  /** Omitted in retry mode — downstream steps read config only from the first "install" step id. */
+  repoModels?: RepoModels;
   reviewProviders?: string[];
   reviewCheckNames?: string[];
   reviewers?: ReviewerDefinition[];
-  trustedConfigReviewers: ReviewerDefinition[];
+  trustedConfigReviewers?: ReviewerDefinition[];
 }
 
 const KNOWN_REVIEW_PROVIDERS = new Set(["github-claude-code-review"]);
@@ -347,6 +356,105 @@ function buildInstallCommand(packageManager: string): string {
   return "npm ci";
 }
 
+/** Combined stdout+stderr tail retained for `installError` — long enough to catch the cause
+ *  npm/yarn/pnpm print at the end (ERESOLVE, the peer-conflict tree), short enough that it
+ *  never dominates the agent prompt or step_log. */
+const INSTALL_TAIL_CHARS = 4096;
+
+function makeTailCollector(limit: number) {
+  let buffer = "";
+  return {
+    push(chunk: string): void {
+      buffer += chunk;
+      if (buffer.length > limit) buffer = buffer.slice(buffer.length - limit);
+    },
+    get value(): string {
+      return buffer;
+    },
+  };
+}
+
+interface SpawnInstallResult {
+  durationMs: number;
+  installFailed: boolean;
+  installError?: string;
+}
+
+/**
+ * Retry mode always follows a failed first attempt (install-retry's skip condition
+ * guarantees that), so this reports the retry's own outcome without re-checking the
+ * first attempt. Comments are posted in filename order; 70- sorts ahead of the 80-
+ * reviewer-feedback and 90-/95- run-autopsy/run-stats files.
+ */
+function writeDependencyInstallComment(
+  workspaceDir: string,
+  installMethod: string,
+  result: SpawnInstallResult,
+): void {
+  const body = result.installFailed
+    ? [
+        `Dependency install (\`${installMethod}\`) failed before and after the agent ran. Build and tests did not run.`,
+        "",
+        "```",
+        result.installError ? neutralizeFences(result.installError) : "(no output captured)",
+        "```",
+      ].join("\n")
+    : `Dependency install (\`${installMethod}\`) failed before the agent ran and succeeded after its change.`;
+  try {
+    const commentsDir = path.join(workspaceDir, "ai-output", "comments");
+    fs.mkdirSync(commentsDir, { recursive: true });
+    fs.writeFileSync(path.join(commentsDir, "70-dependency-install.md"), body, "utf-8");
+  } catch (err) {
+    console.warn(`[install] could not write dependency install comment file (non-fatal): ${String(err)}`);
+  }
+}
+
+/**
+ * Runs `installMethod` in `workspaceDir`, streaming stdout/stderr through to the process
+ * streams (so live log tailing is unaffected) while keeping a rolling tail for `installError`.
+ * Never rejects: a non-zero exit or a spawn `error` event both resolve with `installFailed: true`
+ * so the pipeline can continue without dependencies rather than aborting the run.
+ */
+async function runInstallCommand(
+  workspaceDir: string,
+  installMethod: string,
+  env: NodeJS.ProcessEnv,
+): Promise<SpawnInstallResult> {
+  const [cmd, ...cmdArgs] = installMethod.split(/\s+/);
+  const tail = makeTailCollector(INSTALL_TAIL_CHARS);
+  const start = Date.now();
+
+  const outcome = await new Promise<{ ok: true } | { ok: false; detail: string }>((resolve) => {
+    const proc = spawn(cmd!, cmdArgs, {
+      cwd: workspaceDir,
+      stdio: ["ignore", "pipe", "pipe"],
+      env,
+    });
+    proc.stdout?.on("data", (chunk: Buffer) => {
+      process.stdout.write(chunk);
+      tail.push(chunk.toString("utf-8"));
+    });
+    proc.stderr?.on("data", (chunk: Buffer) => {
+      process.stderr.write(chunk);
+      tail.push(chunk.toString("utf-8"));
+    });
+    proc.on("close", (code) => {
+      if (code === 0) resolve({ ok: true });
+      else resolve({ ok: false, detail: `${installMethod} exited with code ${code ?? "unknown"}` });
+    });
+    proc.on("error", (err) => {
+      resolve({ ok: false, detail: `${installMethod} failed to start: ${err.message}` });
+    });
+  });
+
+  const durationMs = Date.now() - start;
+  if (outcome.ok) return { durationMs, installFailed: false };
+
+  tail.push(`\n${outcome.detail}`);
+  console.warn(`[install] ${installMethod} failed; continuing without dependencies`);
+  return { durationMs, installFailed: true, installError: redactAndCap(tail.value, INSTALL_TAIL_CHARS) };
+}
+
 export const installStep: StepModule<InstallInputs, InstallOutputs> = {
   async run(
     context: PipelineContext,
@@ -354,6 +462,28 @@ export const installStep: StepModule<InstallInputs, InstallOutputs> = {
     _reporter: StepReporter,
   ): Promise<InstallOutputs> {
     const { workspaceDir } = inputs;
+
+    if (inputs.retry) {
+      const packageManager = inputs.packageManager ?? "npm";
+      const installMethod = buildInstallCommand(packageManager);
+      const npmAuth = configureNpmAuth();
+      const env = repoProcessEnv();
+      if (npmAuth) env.NPM_CONFIG_USERCONFIG = npmAuth.userconfigPath;
+      let result: SpawnInstallResult;
+      try {
+        result = await runInstallCommand(workspaceDir, installMethod, env);
+      } finally {
+        removeNpmAuth(npmAuth);
+      }
+      writeDependencyInstallComment(workspaceDir, installMethod, result);
+      return {
+        packageManager,
+        installMethod,
+        durationMs: result.durationMs,
+        installFailed: result.installFailed,
+        ...(result.installError !== undefined ? { installError: result.installError } : {}),
+      };
+    }
 
     const config = readAiImplementConfig(workspaceDir);
     const cloneOutputs = context.getOutputs("clone");
@@ -367,16 +497,21 @@ export const installStep: StepModule<InstallInputs, InstallOutputs> = {
     });
     const hasPackageJson = fs.existsSync(path.join(workspaceDir, "package.json"));
 
+    const configOutputs = {
+      repoModels: config.models ?? {},
+      reviewProviders: config.reviewProviders,
+      reviewCheckNames: config.reviewCheckNames,
+      reviewers: config.reviewers,
+      trustedConfigReviewers,
+    };
+
     if (process.env.AI_IMPLEMENT_WORKSPACE_MODE === "mounted") {
       return {
         packageManager: config.packageManager ?? (hasPackageJson ? detectPackageManager(workspaceDir) : "none"),
         installMethod: "skipped: mounted workspace",
         durationMs: 0,
-        repoModels: config.models ?? {},
-        reviewProviders: config.reviewProviders,
-        reviewCheckNames: config.reviewCheckNames,
-        reviewers: config.reviewers,
-        trustedConfigReviewers,
+        installFailed: false,
+        ...configOutputs,
       };
     }
 
@@ -385,50 +520,41 @@ export const installStep: StepModule<InstallInputs, InstallOutputs> = {
         packageManager: config.packageManager ?? "none",
         installMethod: "skipped: no package.json",
         durationMs: 0,
-        repoModels: config.models ?? {},
-        reviewProviders: config.reviewProviders,
-        reviewCheckNames: config.reviewCheckNames,
-        reviewers: config.reviewers,
-        trustedConfigReviewers,
+        installFailed: false,
+        ...configOutputs,
       };
     }
 
     const packageManager = config.packageManager ?? detectPackageManager(workspaceDir);
-    const installMethod = buildInstallCommand(packageManager);
+    if (packageManager === "none") {
+      return {
+        packageManager,
+        installMethod: "skipped: packageManager none",
+        durationMs: 0,
+        installFailed: false,
+        ...configOutputs,
+      };
+    }
 
+    const installMethod = buildInstallCommand(packageManager);
     const npmAuth = configureNpmAuth();
     const env = repoProcessEnv();
     if (npmAuth) env.NPM_CONFIG_USERCONFIG = npmAuth.userconfigPath;
 
-    const start = Date.now();
-    const [cmd, ...cmdArgs] = installMethod.split(/\s+/);
+    let result: SpawnInstallResult;
     try {
-      await new Promise<void>((resolve, reject) => {
-        const proc = spawn(cmd!, cmdArgs, {
-          cwd: workspaceDir,
-          stdio: "inherit",
-          env,
-        });
-        proc.on("close", (code) => {
-          if (code === 0) resolve();
-          else reject(new Error(`${installMethod} exited with code ${code ?? "unknown"}`));
-        });
-        proc.on("error", reject);
-      });
+      result = await runInstallCommand(workspaceDir, installMethod, env);
     } finally {
       removeNpmAuth(npmAuth);
     }
-    const durationMs = Date.now() - start;
 
     return {
       packageManager,
       installMethod,
-      durationMs,
-      repoModels: config.models ?? {},
-      reviewProviders: config.reviewProviders,
-      reviewCheckNames: config.reviewCheckNames,
-      reviewers: config.reviewers,
-      trustedConfigReviewers,
+      durationMs: result.durationMs,
+      installFailed: result.installFailed,
+      ...(result.installError !== undefined ? { installError: result.installError } : {}),
+      ...configOutputs,
     };
   },
 };

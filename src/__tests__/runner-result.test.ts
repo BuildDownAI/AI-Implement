@@ -1,7 +1,29 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { fetchPlanningContextFromOrchestrator, postRunnerResult } from "../runner-result.js";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fetchPlanningContextFromOrchestrator, postRunnerResult, collectRunnerComments } from "../runner-result.js";
 import type { ReferenceRepoResult } from "../reference-repos.js";
 import type { FindingDisposition } from "../pipeline/finding-dispositions.js";
+
+describe("collectRunnerComments", () => {
+  it("sorts the dependency-install comment ahead of reviewer feedback and run autopsy/stats files", () => {
+    const workspaceDir = mkdtempSync(join(tmpdir(), "ai-implement-comments-"));
+    try {
+      const commentsDir = join(workspaceDir, "ai-output", "comments");
+      mkdirSync(commentsDir, { recursive: true });
+      writeFileSync(join(commentsDir, "95-run-stats.md"), "stats");
+      writeFileSync(join(commentsDir, "80-reviewer-feedback.md"), "feedback");
+      writeFileSync(join(commentsDir, "90-run-autopsy.md"), "autopsy");
+      writeFileSync(join(commentsDir, "70-dependency-install.md"), "install");
+
+      const bodies = collectRunnerComments(workspaceDir).map((c) => c.body);
+      expect(bodies).toEqual(["install", "feedback", "autopsy", "stats"]);
+    } finally {
+      rmSync(workspaceDir, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("fetchPlanningContextFromOrchestrator", () => {
   it("GETs /runner/planning-context with the progress token and returns the context", async () => {

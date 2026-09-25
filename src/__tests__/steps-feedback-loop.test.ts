@@ -233,6 +233,82 @@ describe("feedbackLoopStep", () => {
     expect(secondImplementCall[1].prompt).toContain("The implementation is close");
   });
 
+  it("includes the dependency install failure block, method, and error on the first iteration when installFailed is true", async () => {
+    vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
+
+    await feedbackLoopStep.run(
+      makeContext(),
+      {
+        ...BASE_INPUTS,
+        installFailed: true,
+        installMethod: "npm ci",
+        installError: "npm ERR! could not resolve dependency",
+      },
+      new NoopStepReporter(),
+    );
+
+    const firstImplementCall = vi.mocked(implementStep.run).mock.calls[0];
+    expect(firstImplementCall[1].prompt).toContain("## Dependency install failed");
+    expect(firstImplementCall[1].prompt).toContain("npm ci");
+    expect(firstImplementCall[1].prompt).toContain("npm ERR! could not resolve dependency");
+  });
+
+  it("includes the dependency install failure block on a review-feedback iteration too", async () => {
+    vi.mocked(reviewStep.run)
+      .mockResolvedValueOnce(REJECTED_REVIEW)
+      .mockResolvedValueOnce(APPROVED_REVIEW);
+
+    await feedbackLoopStep.run(
+      makeContext(),
+      {
+        ...BASE_INPUTS,
+        maxIterations: 3,
+        installFailed: true,
+        installMethod: "npm ci",
+        installError: "npm ERR! could not resolve dependency",
+      },
+      new NoopStepReporter(),
+    );
+
+    const secondImplementCall = vi.mocked(implementStep.run).mock.calls[1];
+    expect(secondImplementCall[1].prompt).toContain("## Dependency install failed");
+    expect(secondImplementCall[1].prompt).toContain("npm ci");
+    expect(secondImplementCall[1].prompt).toContain("npm ERR! could not resolve dependency");
+    // The review-feedback block must still be present alongside it.
+    expect(secondImplementCall[1].prompt).toContain("Needs improvement");
+  });
+
+  it("omits the dependency install failure block when installFailed is false or absent", async () => {
+    vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
+
+    await feedbackLoopStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+
+    const firstImplementCall = vi.mocked(implementStep.run).mock.calls[0];
+    expect(firstImplementCall[1].prompt).not.toContain("## Dependency install failed");
+  });
+
+  it("passes installFailed through to the in-loop reviewer", async () => {
+    vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
+
+    await feedbackLoopStep.run(
+      makeContext(),
+      { ...BASE_INPUTS, installFailed: true },
+      new NoopStepReporter(),
+    );
+
+    const reviewCall = vi.mocked(reviewStep.run).mock.calls[0];
+    expect(reviewCall[1]).toMatchObject({ installFailed: true });
+  });
+
+  it("does not pass installFailed to the in-loop reviewer when absent", async () => {
+    vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
+
+    await feedbackLoopStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+
+    const reviewCall = vi.mocked(reviewStep.run).mock.calls[0];
+    expect(reviewCall[1]).toMatchObject({ installFailed: false });
+  });
+
   it("reports implement and review sub-steps via reporter", async () => {
     vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
 

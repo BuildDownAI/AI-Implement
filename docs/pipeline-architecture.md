@@ -37,13 +37,18 @@ The `context` argument carries `PipelineContextData` — the issue fields, works
 | 2 | `reference-repos` | the envelope declares no `referenceRepos` entries |
 | 3 | `install-skills` | no `skillsRepo` configured |
 | 4 | `dependency-auth` | the mapping has no Dependency Token Scope set |
-| 5 | `install` | never (internally no-ops for a mounted workspace or a repo with no `package.json`) |
+| 5 | `install` | never (internally no-ops for a mounted workspace, a repo with no `package.json`, or `packageManager: none`) |
 | 6 | `setup` | no `setup:` hook in `WORKFLOW.md` front matter |
 | 7 | `feedback-loop` | never |
-| 8 | `preflight` | the feedback loop did not approve |
-| 9 | `push` | never (initial runs create the branch and PR; gap-fill runs commit remaining changes and force-push to the existing PR branch) |
-| 10 | `verify` | no `verify:` hook, or the feedback loop did not approve |
-| 11 | `post-push-review` | not approved, or nothing was pushed, or no PR number |
+| 8 | `install-retry` | `install`'s `installFailed` output is not `true` |
+| 9 | `preflight` | the feedback loop did not approve, or `dependenciesMissing` (skip reason `"dependency install failed"`) |
+| 10 | `push` | never (initial runs create the branch and PR; gap-fill runs commit remaining changes and force-push to the existing PR branch); `draft` is set when the feedback loop did not approve **or** `dependenciesMissing` |
+| 11 | `verify` | no `verify:` hook, the feedback loop did not approve, or `dependenciesMissing` |
+| 12 | `post-push-review` | not approved, `dependenciesMissing`, nothing was pushed, or no PR number |
+
+`install` never fails the run: a non-zero exit or a spawn error from `npm ci`/`yarn install`/`pnpm install` resolves rather than throws, setting `installFailed: true` and `installError` (a redacted, 4096-char tail of combined stdout/stderr) instead of stopping the pipeline. `packageManager: none` in `.ai-implement/config.yml` skips the install entirely (`installFailed: false`) when a `package.json` is present. `install-retry` reruns the same built-in `install` module — registered under the `install` key, resolved through the `install-retry` step id — with `retry: true` and the first attempt's `packageManager`, skipping the `.ai-implement/config.yml` read and the trusted-reviewer fetch since those outputs already came from the first `install` step.
+
+**Changing install behaviour.** The `setup:` hook is the supported way to customize how dependencies install — `install` has already run by the time `setup` executes, so a hook cannot rescue a failing first attempt, but it can run its own install (different flags, a monorepo bootstrap script, …) afterward. Set `packageManager: none` in `.ai-implement/config.yml` to turn the built-in install off entirely and do the real install from `setup` instead.
 
 `reference-repos` runs immediately after `clone` to populate the workspace with any declared reference repositories before any hook or install step runs. It fetches per-owner installation tokens from the orchestrator's `/api/runner/reference-token` endpoint (gated on the mapping's `referenceRepos` field), then clones each entry shallow. The credential is passed via `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_0`/`GIT_CONFIG_VALUE_0` environment variables — the only form that does not persist the token into the clone's `.git/config` or `remote.origin.url`. After each clone, the path is appended to `.git/info/exclude` so `git add -A` can never stage it. A clone failure is logged and reported in the step outputs but never fails the run.
 
@@ -56,6 +61,8 @@ The `context` argument carries `PipelineContextData` — the issue fields, works
 Two consequences worth internalising:
 
 **`preflight` does not gate the push.** It is skipped unless the review already approved, and `push` runs regardless of what it found. It records `typecheck`/`lint`/`test` results; it does not block a pull request on them. Work that fails preflight still ships.
+
+**`dependenciesMissing` gates the steps that need `node_modules`.** `dependenciesMissing` (exported from `src/pipeline/pipeline-loader.ts`) is `true` only when both `install`'s `installFailed` output and `install-retry`'s `installFailed` output are `true` — a skipped `install-retry` (the first install succeeded) leaves empty outputs, so `dependenciesMissing` is `false` in that case. When it is `true`, `preflight` and `verify` skip (their `typecheck`/`lint`/`test`/hook commands would fail for reasons unrelated to the change) and `post-push-review` skips (the run was never verified). `push` still runs and opens the PR, but as a draft: its `draft` input is `!approved || dependenciesMissing`, so an approved run with a failed install still ships a draft rather than a normal PR. This only widens the initial-run `draft` condition — the gap-fill `push` skip (`existingPrNumber && !approved`) is untouched by `dependenciesMissing`, so a gap-fill run with a failed install still pushes to the existing PR whenever `feedback-loop` approved.
 
 **The pipeline owns all repository writes.** `push` runs for both initial and gap-fill runs: an initial run creates the implementation branch and opens a PR, while a gap-fill run commits any remaining uncommitted changes and force-pushes to the existing PR branch. `WORKFLOW.md` must instruct the agent to leave changes uncommitted in both modes — the pipeline always handles the commit and push.
 
@@ -113,7 +120,7 @@ Adding a step therefore means two edits, not one: the YAML entry and the `applyW
 
 ## Steps are coupled by step id
 
-Steps communicate through `context.getOutputs("<step id>")`. The ids in that call are string literals scattered across `applyWiring` and the step modules — `clone` supplies `workspaceDir` and `githubToken` to nearly everything, `install` supplies `packageManager` and `repoModels`, `feedback-loop` supplies `approved` and the termination reason, `push` supplies `prNumber` and `branchPushed`.
+Steps communicate through `context.getOutputs("<step id>")`. The ids in that call are string literals scattered across `applyWiring` and the step modules — `clone` supplies `workspaceDir` and `githubToken` to nearly everything, `install` supplies `packageManager`, `repoModels`, and `installFailed`/`installError` (set when the dependency install itself failed, without failing the step), `feedback-loop` supplies `approved` and the termination reason, `push` supplies `prNumber` and `branchPushed`. `install-retry` reads `install`'s `packageManager` and `installFailed` outputs to decide whether to run and what to reinstall, but is skipped by default and downstream steps still read config (`repoModels`, `reviewProviders`, etc.) from the `install` step id, not `install-retry`.
 
 **Renaming a step id in the YAML breaks every reader of its outputs**, and does so silently: `getOutputs` on an unknown id returns an empty object rather than throwing. Treat step ids as a published interface.
 

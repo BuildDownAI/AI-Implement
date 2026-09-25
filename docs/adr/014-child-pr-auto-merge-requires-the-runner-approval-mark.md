@@ -2,7 +2,7 @@
 
 **Status:** Accepted
 **Date:** 2026-09-06
-**References:** AII-560 (merge-ordering umbrella), AII-460 (gate consolidation), AII-553 (in-flight window), AII-471, AII-453 (benign terminals), `docs/feature-branch-grouping.md`, `docs/review-fix-rail.md`
+**References:** AII-560 (merge-ordering umbrella), AII-460 (gate consolidation), AII-553 (in-flight window), AII-471, AII-453 (benign terminals), AII-827 (`INSTALL_FAILED` policy code), `docs/feature-branch-grouping.md`, `docs/review-fix-rail.md`
 
 ## Context
 
@@ -64,7 +64,10 @@ apply the same PR-state read to skip a merged PR instead of dispatching a fix ru
 
 Harder: a human-opened PR into a grouping branch no longer auto-merges; a person merges it. An
 unapproved child is held rather than landed, so a capped child stalls its cascade on purpose;
-AII-263 remains the issue for automating that recovery. Every new benign terminal on the runner
+AII-263 remains the issue for automating that recovery. The same hold applies to a child whose
+review approved the change but whose dependency install never succeeded (`INSTALL_FAILED`,
+AII-827): the run reports failure instead of stamping the approval mark, so the PR is held on the
+same terms as `REVIEW_UNAPPROVED` rather than merging code that was never built or tested. Every new benign terminal on the runner
 side must be reported through the result callback, and the runner's own PR writes must go through
 one guarded path so a merge mid-review becomes `pr_merged` rather than a failed run (the AII-453
 pattern, extended under AII-560).
