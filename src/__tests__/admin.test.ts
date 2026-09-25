@@ -1538,6 +1538,110 @@ describe("admin mappings", () => {
     }
   });
 
+  it("treats absent reviewFixLifecycle as null on a new mapping", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "RFL1", owner: "org", repo: "app",
+    }, token);
+    expect(res.statusCode).toBe(202);
+    expect(JSON.parse(res.body).reviewFixLifecycle).toBeNull();
+
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    expect(JSON.parse(list.body).RFL1.reviewFixLifecycle).toBeNull();
+  });
+
+  it("treats null and empty-string reviewFixLifecycle as null", async () => {
+    const token = await login("secret");
+    for (const [teamKey, value] of [["RFL2", null], ["RFL3", ""]] as const) {
+      const res = await request("/api/mappings", "POST", "secret", {
+        teamKey, owner: "org", repo: "app",
+        reviewFixLifecycle: value,
+      }, token);
+      expect(res.statusCode).toBe(202);
+      expect(JSON.parse(res.body).reviewFixLifecycle).toBeNull();
+    }
+  });
+
+  it("accepts an explicit reviewFixLifecycle='legacy'", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "RFL4", owner: "org", repo: "app",
+      reviewFixLifecycle: "legacy",
+    }, token);
+    expect(res.statusCode).toBe(202);
+    expect(JSON.parse(res.body).reviewFixLifecycle).toBe("legacy");
+  });
+
+  it("preserves existing reviewFixLifecycle when omitted from an unrelated update", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", {
+      teamKey: "RFL5", owner: "org", repo: "app",
+      reviewFixLifecycle: "legacy",
+    }, token);
+
+    const update = await request("/api/mappings", "POST", "secret", {
+      teamKey: "RFL5", owner: "org", repo: "app-updated",
+    }, token);
+    expect(update.statusCode).toBe(202);
+    expect(JSON.parse(update.body).reviewFixLifecycle).toBe("legacy");
+  });
+
+  it("rejects invalid reviewFixLifecycle values with 400", async () => {
+    const token = await login("secret");
+    for (const invalid of ["bogus", "RESTATE", "true"]) {
+      const res = await request("/api/mappings", "POST", "secret", {
+        teamKey: "RFLBAD", owner: "org", repo: "app",
+        reviewFixLifecycle: invalid,
+      }, token);
+      expect(res.statusCode).toBe(400);
+      expect(JSON.parse(res.body).error).toContain("reviewFixLifecycle");
+    }
+  });
+
+  it("rejects reviewFixLifecycle='restate' with an actionable, fail-closed 400 naming the missing execution-mode prerequisite", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "RFLFLY", owner: "org", repo: "app",
+      executionMode: "fly-machines",
+      reviewFixLifecycle: "restate",
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toContain("github-actions");
+  });
+
+  it("rejects reviewFixLifecycle='restate' on github-actions with an actionable 400 — no Restate endpoint/capability signal is wired yet (fail closed, not a live enablement)", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "RFLGHA", owner: "org", repo: "app",
+      executionMode: "github-actions",
+      reviewFixLifecycle: "restate",
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toContain("Restate endpoint");
+
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    expect(JSON.parse(list.body).RFLGHA).toBeUndefined();
+  });
+
+  it("does not write reviewFixLifecycle='restate' when a save is rejected — the mapping keeps its prior Legacy selection", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", {
+      teamKey: "RFLKEEP", owner: "org", repo: "app",
+      reviewFixLifecycle: "legacy",
+    }, token);
+
+    const rejected = await request("/api/mappings", "POST", "secret", {
+      teamKey: "RFLKEEP", owner: "org", repo: "app",
+      executionMode: "fly-machines",
+      reviewFixLifecycle: "restate",
+    }, token);
+    expect(rejected.statusCode).toBe(400);
+
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    expect(JSON.parse(list.body).RFLKEEP.reviewFixLifecycle).toBe("legacy");
+    expect(JSON.parse(list.body).RFLKEEP.executionMode).toBe("github-actions");
+  });
+
   it("round-trips a reviewers array, including an empty one", async () => {
     const token = await login("secret");
     const selection = [

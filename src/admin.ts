@@ -168,6 +168,28 @@ function validReviewerMaxTurns(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 200;
 }
 
+/**
+ * Returns the reason enabling reviewFixLifecycle="restate" is refused, or null when it may
+ * proceed. Only automatic GitHub Actions review-fix runs ever move to Restate — local
+ * review-fix and human comment-triggered runs stay on Legacy admission regardless.
+ *
+ * Fails closed on unknown support (AII-804): this validator has no admin-safe signal yet for
+ * either "registered, healthy Restate endpoint" (src/restate/status.ts's registration state,
+ * set only by AII-807's boot wiring, not yet implemented) or "installed template/runner
+ * capability on the dispatch ref" (src/workflow-probe.ts's live, async GitHub probe, which
+ * this synchronous validator cannot call — and src/admin.ts may only import src/restate/* as
+ * types, per src/__tests__/restate-boundary.test.ts). Both prerequisites are therefore
+ * reported as unavailable rather than guessed at; a later issue wires a real signal in and
+ * narrows this message once one exists. This issue carries the storage/validation shape, not
+ * permission to enable the live pilot.
+ */
+function reviewFixLifecycleEnablementError(executionMode: ExecutionMode): string | null {
+  if (executionMode !== "github-actions") {
+    return `reviewFixLifecycle "restate" requires executionMode "github-actions"`;
+  }
+  return `reviewFixLifecycle "restate" requires a registered, healthy Restate endpoint and installed template/runner capability on the dispatch ref, neither of which is available yet`;
+}
+
 let _adminJiraClient: JiraClient | null = null;
 function getAdminJiraClient(): JiraClient | null {
   if (_adminJiraClient) return _adminJiraClient;
@@ -2429,6 +2451,7 @@ export interface UpsertMappingBody {
   dependencyTokenScope?: string | null;
   reviewers?: unknown;
   prDispatchBudget?: number | null;
+  reviewFixLifecycle?: string | null;
 }
 
 export function upsertMappingAction(
@@ -2620,6 +2643,26 @@ export function upsertMappingAction(
     return { status: 400, body: { error: `dependencyTokenScope invalid: must be null or "installation"` } };
   }
 
+  let reviewFixLifecycle: "legacy" | "restate" | null;
+  const rawLifecycle = body.reviewFixLifecycle;
+  if (rawLifecycle === undefined) {
+    // Preserve stored value on omit — an unrelated project edit must not silently move which
+    // lifecycle coordinates this project's automatic review-fix runs.
+    reviewFixLifecycle = existingMapping?.reviewFixLifecycle ?? null;
+  } else if (rawLifecycle === null || rawLifecycle === "") {
+    reviewFixLifecycle = null;
+  } else if (rawLifecycle === "legacy") {
+    reviewFixLifecycle = "legacy";
+  } else if (rawLifecycle === "restate") {
+    const enablementError = reviewFixLifecycleEnablementError(executionMode);
+    if (enablementError) {
+      return { status: 400, body: { error: enablementError } };
+    }
+    reviewFixLifecycle = "restate";
+  } else {
+    return { status: 400, body: { error: `reviewFixLifecycle invalid: must be null, "legacy", or "restate"` } };
+  }
+
   let reviewers: ReviewerSelection[] | null;
   if (body.reviewers === undefined) {
     // Preserve stored value on omit — a PATCH-style save must not silently strip a project's reviewer list.
@@ -2671,6 +2714,7 @@ export function upsertMappingAction(
     memoryProviderId: existingMapping?.memoryProviderId ?? null,
     reviewers,
     prDispatchBudget,
+    reviewFixLifecycle,
   };
 
   upsertMapping(body.teamKey, mapping);
