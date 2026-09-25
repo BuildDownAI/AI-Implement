@@ -148,7 +148,7 @@ describe("GHA workflow shims", () => {
       expect(yaml).not.toMatch(/^run-name:.*(?:run_token|run_progress_token|run_publication_token)/m);
       const doc = parse(yaml) as any;
       expect(doc.on.workflow_dispatch.inputs.run_attempt_token).toMatchObject({ required: false, type: "string", default: "" });
-      expect(doc.run__name ?? doc["run-name"]).toContain("inputs.run_attempt_token");
+      expect(doc["run-name"]).toContain("inputs.run_attempt_token");
     });
   }
 
