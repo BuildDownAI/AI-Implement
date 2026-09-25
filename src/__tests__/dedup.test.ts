@@ -116,6 +116,88 @@ describe("dispatch admission schema", () => {
   });
 });
 
+describe("review-fix attempt and inbox schema", () => {
+  it("upgrades old findings and queue history twice without rewriting legacy rows", () => {
+    const old = new Database(dbPath);
+    old.exec(`
+      CREATE TABLE review_findings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, repo TEXT NOT NULL, pr_number INTEGER NOT NULL,
+        finding_key TEXT NOT NULL, source TEXT NOT NULL, severity TEXT NOT NULL,
+        body TEXT NOT NULL, path TEXT, line INTEGER, url TEXT,
+        status TEXT NOT NULL DEFAULT 'open', first_seen_at INTEGER NOT NULL,
+        last_seen_at INTEGER NOT NULL, resolved_at INTEGER,
+        UNIQUE (repo, pr_number, finding_key)
+      );
+      CREATE TABLE review_fix_queue (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, issue_id TEXT NOT NULL, issue_identifier TEXT,
+        repo TEXT NOT NULL, pr_number INTEGER NOT NULL, reason TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending', created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL, dispatched_at INTEGER, UNIQUE (repo, pr_number)
+      );
+    `);
+    old.prepare(`INSERT INTO review_findings
+      (repo, pr_number, finding_key, source, severity, body, first_seen_at, last_seen_at)
+      VALUES ('acme/app', 42, 'f-1', 'review', 'high', 'keep this body', 10, 11)`).run();
+    old.prepare(`INSERT INTO review_fix_queue
+      (issue_id, repo, pr_number, reason, created_at, updated_at)
+      VALUES ('issue-1', 'acme/app', 42, 'feedback', 12, 13)`).run();
+    old.close();
+
+    dedup.getDb();
+    dedup.closeDb();
+    const db = dedup.getDb();
+    expect(db.prepare("SELECT finding_key, body, revision FROM review_findings").all())
+      .toEqual([{ finding_key: "f-1", body: "keep this body", revision: 1 }]);
+    expect(db.prepare("SELECT issue_id, reason, created_at FROM review_fix_queue").all())
+      .toEqual([{ issue_id: "issue-1", reason: "feedback", created_at: 12 }]);
+    expect((db.prepare("PRAGMA table_info(review_findings)").all() as Array<{ name: string }>)
+      .filter((column) => column.name === "revision")).toHaveLength(1);
+    expect((db.prepare("SELECT COUNT(*) AS n FROM review_fix_attempts").get() as { n: number }).n).toBe(0);
+    expect((db.prepare("SELECT COUNT(*) AS n FROM review_fix_inbox").get() as { n: number }).n).toBe(0);
+  });
+
+  it("keeps attempt ownership immutable and duplicate identities from allocating another record", () => {
+    const db = dedup.getDb();
+    const insertAttempt = db.prepare(`INSERT INTO review_fix_attempts
+      (attempt_id, dispatch_id, mapping_key, installation_id, repository, pr_number,
+       issue_scope, issue_id, owner, state, created_at, deadline_at,
+       task_snapshot_json, finding_versions_json)
+      VALUES (@attemptId, @dispatchId, 'APP', '7', 'acme/app', 42,
+              'team', 'issue-1', @owner, 'prepared', 10, 1000, '{}', '[]')`);
+    insertAttempt.run({ attemptId: "attempt-1", dispatchId: "dispatch-1", owner: "attempt-1" });
+    expect(() => insertAttempt.run({ attemptId: "attempt-1", dispatchId: "dispatch-2", owner: "attempt-1" }))
+      .toThrow(/UNIQUE/);
+    expect(() => insertAttempt.run({ attemptId: "attempt-2", dispatchId: "dispatch-1", owner: "attempt-2" }))
+      .toThrow(/UNIQUE/);
+    expect(() => db.prepare("UPDATE review_fix_attempts SET owner = ? WHERE attempt_id = ?")
+      .run("attempt-2", "attempt-1")).toThrow(/immutable/);
+    expect(() => db.prepare("UPDATE review_fix_attempts SET github_run_id = 99 WHERE attempt_id = 'attempt-1'").run())
+      .toThrow(/CHECK/);
+    db.prepare(`UPDATE review_fix_attempts SET github_run_id = 99, github_run_attempt = 1
+      WHERE attempt_id = 'attempt-1'`).run();
+    expect(() => db.prepare(`UPDATE review_fix_attempts SET accepted_result_hash = 'hash-1'
+      WHERE attempt_id = 'attempt-1'`).run()).toThrow(/CHECK/);
+    db.prepare(`UPDATE review_fix_attempts
+      SET accepted_result_json = '{}', accepted_result_hash = 'hash-1'
+      WHERE attempt_id = 'attempt-1'`).run();
+
+    const insertEvent = db.prepare(`INSERT INTO review_fix_inbox
+      (authenticated_source, event_id, installation_id, repository, pr_number,
+       kind, payload_json, payload_hash, accepted_at)
+      VALUES (?, ?, '7', 'acme/app', 42, ?, '{}', 'hash-1', 20)`);
+    insertEvent.run("github", "event-1", "feedback");
+    db.prepare("UPDATE review_fix_inbox SET delivery_state = 'delivered', delivered_at = 30 WHERE event_id = 'event-1'").run();
+    expect(() => insertEvent.run("github", "event-1", "feedback")).toThrow(/UNIQUE/);
+    insertEvent.run("runner", "event-1", "result");
+    expect(db.prepare("SELECT authenticated_source, event_id, kind FROM review_fix_inbox ORDER BY authenticated_source").all())
+      .toEqual([
+        { authenticated_source: "github", event_id: "event-1", kind: "feedback" },
+        { authenticated_source: "runner", event_id: "event-1", kind: "result" },
+      ]);
+    expect((db.prepare("SELECT COUNT(*) AS n FROM review_fix_dispatches").get() as { n: number }).n).toBe(0);
+  });
+});
+
 describe("reaper actions", () => {
   it("recordReaperAction persists a row and listReaperActions returns it", () => {
     dedup.recordReaperAction({
