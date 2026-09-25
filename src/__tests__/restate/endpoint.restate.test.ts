@@ -107,6 +107,10 @@ describe("startRestateEndpoint() / register() against a real server 1.7.10 (AII-
       throw new Error("expected the endpoint to bind a TCP port");
     }
     port = address.port;
+    // restateBindAddress() is re-read inside register() itself to build the registered
+    // `uri` — the initial "0" stub (needed only so the OS would assign a free port above)
+    // would otherwise still be in effect there and register() would advertise port 0.
+    vi.stubEnv("RESTATE_ENDPOINT_PORT", String(port));
     bindHost = restateBindAddress().host;
 
     await TestContainers.exposeHostPorts(port);
