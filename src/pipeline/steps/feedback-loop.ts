@@ -365,6 +365,7 @@ async function runPostMortem(
       tools: READ_ONLY_ALLOWED_TOOLS,
       stage: `feedback-loop/post-mortem-${params.iteration}`,
       expectsStructuredOutput: false,
+      cycle: params.iteration,
     });
     if (result.exitCode !== 0 || !result.stdout.trim()) {
       throw new Error(`post-mortem invocation exited ${result.exitCode}`);
@@ -509,6 +510,7 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
               maxTurns: effectiveMaxTurns,
               planningContext: implementPlanningContext,
               referenceRepoResults: inputs.referenceRepoResults,
+              iteration,
             },
             reporter,
           );

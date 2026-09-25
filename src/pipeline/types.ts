@@ -337,6 +337,14 @@ export interface InvokeParams {
    * No built-in `LLMExecutor` reads it yet.
    */
   activitySink?: ActivitySink;
+  /**
+   * The feedback-loop iteration this invocation belongs to, stamped onto every
+   * `ActivityToolStart`/`ActivityToolResult` this call emits (AII-798) so a
+   * `CycleActivitySummary.cycle` can be matched back to the tool events that
+   * produced it. Defaults to 1 for a bare/non-loop caller (e.g. the dev
+   * harness), matching single-pass behavior.
+   */
+  cycle?: number;
 }
 
 export interface LLMExecutor {

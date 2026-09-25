@@ -1,12 +1,23 @@
 import { readFileSync, existsSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
-import { ClaudeCliExecutor } from "./pipeline/executor.js";
+import { ClaudeCliExecutor, type ActivityReportingConfig } from "./pipeline/executor.js";
 import { getPublicationCredential } from "./publication-credential.js";
 import { DefaultPipelineContext } from "./pipeline/context.js";
 import { PipelineRunner } from "./pipeline/runner.js";
 import { DEFAULT_PIPELINE, createDefaultRunner } from "./pipeline/default-pipeline.js";
-import type { LLMExecutor, LogLevel, PipelineContext, PipelineDefinition, StepReporter } from "./pipeline/types.js";
+import type {
+  LLMExecutor,
+  LogLevel,
+  PipelineContext,
+  PipelineDefinition,
+  StepReporter,
+  ActivitySink,
+  ActivityIdentity,
+  ActivityToolStart,
+  ActivityToolResult,
+  CycleActivitySummary,
+} from "./pipeline/types.js";
 import { HttpStepReporter, NoopStepReporter, TokenStepReporter } from "./pipeline/reporter.js";
 import { TimingCollector, TimingStepReporter, runWithTiming, formatSummary } from "./pipeline/timing.js";
 import { runHookScript } from "./pipeline/steps/hooks.js";
@@ -18,6 +29,7 @@ import { OperatorCancelledError } from "./pipeline/operator-cancelled.js";
 import { classifyThrown, isFailureRecord } from "./pipeline/failure-classification.js";
 import { decodeRunConfig, type RunConfigV1 } from "./run-config.js";
 import type { ReviewFixMetadataV1, ReviewFixResultMetadataV1 } from "./review-fix-contract.js";
+import { ActivityReporter, type ActivityDetailValue } from "./pipeline/activity-reporter.js";
 import { DEFAULT_RETRY_POLICY, normalizeRetryPolicy, type RetryPolicy } from "./pipeline/retry-backoff.js";
 import { writeRunAutopsy, writeRunStats } from "./run-autopsy.js";
 import { parsePlanningBlock } from "./planning-block.js";
@@ -33,6 +45,112 @@ import {
   type FindingDisposition,
 } from "./pipeline/finding-dispositions.js";
 import type { GhSpawn } from "./pipeline/review-ledger.js";
+
+/**
+ * Runner-activity wiring for one autonomous run (AII-798). `sink` is handed to the
+ * `ClaudeCliExecutor` so its stream parser can report observable tool start/result
+ * events; `shutdown()` is the bounded best-effort flush attempted in `runAutonomous`'s
+ * outer `finally` (mirroring the teardown-hook-always-runs pattern already there), so
+ * delivery is attempted on both the success and failure exit paths.
+ */
+export interface RunnerActivityReporting {
+  readonly attemptId: string;
+  readonly sink: ActivitySink;
+  shutdown(): Promise<void>;
+}
+
+/** JSON-safe copy of an observable tool detail/output value, for `ActivityReporter.record()`'s
+ *  `ActivityDetailValue` input. Falls back to a stringified value rather than throwing on a
+ *  non-serializable input (e.g. a circular structure) — reporting is always best-effort. */
+function toActivityDetail(value: unknown): ActivityDetailValue | undefined {
+  if (value === undefined) return undefined;
+  try {
+    return JSON.parse(JSON.stringify(value)) as ActivityDetailValue;
+  } catch {
+    return String(value);
+  }
+}
+
+/**
+ * Adapts one or more `ActivityReporter` instances (AII-784 — buffering, redaction,
+ * size caps, batching/retry over the `/runner/activity` callback) to the pipeline's
+ * `ActivitySink` contract (AII-788). One `ActivityReporter` per distinct producerId,
+ * created lazily on first use — a run that never dispatches a retried spawn attempt
+ * or more than one stage never creates more than it needs. `cycleSummary` is not
+ * wired yet: no pipeline step reports one through this sink, and delivering it is a
+ * separate concern (out of this issue's scope — see AII-790).
+ */
+export class RunnerActivitySink implements ActivitySink {
+  private readonly reporters = new Map<string, ActivityReporter>();
+
+  constructor(
+    private readonly callbackUrl: string,
+    private readonly progressToken: string,
+    private readonly attemptId: string,
+    private readonly fetchImpl?: typeof fetch,
+  ) {}
+
+  private reporterFor(producerId: string): ActivityReporter {
+    let reporter = this.reporters.get(producerId);
+    if (!reporter) {
+      reporter = new ActivityReporter(this.callbackUrl, this.progressToken, this.attemptId, producerId, {
+        ...(this.fetchImpl ? { fetchImpl: this.fetchImpl } : {}),
+      });
+      this.reporters.set(producerId, reporter);
+    }
+    return reporter;
+  }
+
+  toolStart(identity: ActivityIdentity, input: ActivityToolStart): void {
+    this.reporterFor(identity.producerId).record({
+      cycle: input.cycle,
+      kind: "tool_start",
+      action: input.action,
+      detail: toActivityDetail(input.detail),
+    });
+  }
+
+  toolResult(identity: ActivityIdentity, result: ActivityToolResult): void {
+    this.reporterFor(identity.producerId).record({
+      cycle: result.cycle,
+      kind: "tool_result",
+      action: result.action,
+      detail: { text: result.output.text, truncated: result.output.truncated },
+    });
+  }
+
+  cycleSummary(_identity: ActivityIdentity, _summary: CycleActivitySummary): void {
+    // Not wired yet — see class doc comment.
+  }
+
+  final(identity: ActivityIdentity, _lastSequence: number): void {
+    this.reporterFor(identity.producerId).finalize();
+  }
+
+  /** Bounded best-effort flush of every producer this run ever touched. Never throws. */
+  async shutdown(): Promise<void> {
+    await Promise.all([...this.reporters.values()].map((r) => r.shutdown()));
+  }
+}
+
+/**
+ * Resolves runner-activity reporting for this run: present only for a Restate
+ * review-fix pilot attempt (`reviewFix`, AII-776) with a callback URL and progress
+ * token to report through — the same gating `reportRunnerResult` already applies to
+ * result delivery. Absent for every Legacy (non-pilot) dispatch, which is what keeps
+ * `ClaudeCliExecutor`'s stream parsing and legacy telemetry byte-identical when no
+ * sink is supplied.
+ */
+export function resolveActivityReporting(
+  reviewFix: ReviewFixMetadataV1 | undefined,
+  callbackUrl: string | null,
+  progressToken: string | null,
+  fetchImpl?: typeof fetch,
+): RunnerActivityReporting | undefined {
+  if (!reviewFix || !callbackUrl || !progressToken) return undefined;
+  const sink = new RunnerActivitySink(callbackUrl, progressToken, reviewFix.attemptId, fetchImpl);
+  return { attemptId: reviewFix.attemptId, sink, shutdown: () => sink.shutdown() };
+}
 
 type RunAutopsyPasses = Array<{
   iteration: number;
@@ -54,6 +172,10 @@ export interface RunAutonomousOptions {
   /** Injectable `gh` CLI spawner for finding-disposition thread replies. Defaults to a
    *  real `gh` spawn scoped to `workspaceDir`, mirroring post-push-review.ts's own default. */
   ghSpawn?: GhSpawn;
+  /** Injectable runner-activity reporting (AII-798). Defaults to `resolveActivityReporting`'s
+   *  decision from the resolved reviewFix identity/callback/progress token; tests can supply a
+   *  fake here instead of exercising the real `ActivityReporter` transport. */
+  activityReporting?: RunnerActivityReporting;
 }
 
 export interface RunAutonomousResult {
@@ -632,7 +754,12 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
   );
   implementationPrompt = appendOperatorInstruction(implementationPrompt, commentInstruction);
   const model = claudeModel || workflowModel || "claude-sonnet-5";
-  const llmExecutor = opts.llmExecutor ?? new ClaudeCliExecutor(workspaceDir, logLevel);
+  const activityReporting = opts.activityReporting ?? resolveActivityReporting(reviewFix, callbackUrl, progressToken, opts.fetchImpl);
+  const activityReportingConfig: ActivityReportingConfig | undefined = activityReporting
+    ? { attemptId: activityReporting.attemptId, sink: activityReporting.sink }
+    : undefined;
+  const llmExecutor =
+    opts.llmExecutor ?? new ClaudeCliExecutor(workspaceDir, logLevel, false, undefined, undefined, activityReportingConfig);
   const orchestratorUrl = process.env.ORCHESTRATOR_URL;
   const nonce = process.env.MACHINE_NONCE ?? "";
   if (orchestratorUrl && !nonce) {
@@ -981,6 +1108,16 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
         }
       } catch (teardownErr) {
         console.error(`teardown hook error: ${teardownErr}`);
+      }
+    }
+    if (activityReporting) {
+      // Bounded best-effort, attempted on every exit path (success, coded failure,
+      // and a caught pipeline exception) — mirrors the teardown hook immediately
+      // above, which runs unconditionally for the same reason.
+      try {
+        await activityReporting.shutdown();
+      } catch (activityErr) {
+        console.error(`[activity] shutdown failed: ${activityErr instanceof Error ? activityErr.message : String(activityErr)}`);
       }
     }
     if (shellMode) {
