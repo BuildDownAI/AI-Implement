@@ -1,8 +1,14 @@
+import crypto from "node:crypto";
 import type { RepoMapping } from "./config.js";
 import { resolvePrDispatchBudget } from "./config.js";
 import type { DispatchFailureContext } from "./dispatch-failure.js";
 import { canDispatch } from "./dispatch-gate.js";
-import { parkIssue, prBudgetParkMessage } from "./dispatch-breaker.js";
+import { parkIssue, prBudgetParkMessage, isParked } from "./dispatch-breaker.js";
+import {
+  acquire as acquireAdmission,
+  release as releaseAdmission,
+  type DispatchAdmissionBackend,
+} from "./dispatch-admission.js";
 import { claimPendingCommentGapfills, markCommentGapfillProcessed } from "./comment-gapfill-queue.js";
 import { getLatestDispatchForPr, getLatestDispatchForIssueIdentifier, appendLog, countPriorDispatches, updateJobPrUrl, suppressStaleNotifications, type Job } from "./log.js";
 import { resolveExecutionPath, getFlySecretsMinVersion, getFlyProcessLevelSecrets, type RunnerMode } from "./runner-mode.js";
@@ -117,6 +123,46 @@ async function firePrBudgetPark(
   } catch (err) {
     console.error(`[comment-gapfill] Failed to post tracker comment for PR budget park (${issueId}):`, err);
   }
+}
+
+/**
+ * Final admission authority for gap-fill dispatch: one transaction reserves per-team
+ * capacity and PR-scoped occupancy, and records the dispatch identity, before any
+ * credential mint or launch call. `canDispatch` (checked earlier by the caller) is only
+ * the non-transactional preview — this closes the race window between that preview and
+ * the actual launch (AII-787). Scoped to the GHA and Fly-machines backends; local-docker
+ * dispatch stays on the legacy `canDispatch`-only path.
+ */
+function acquireGapfillAdmission(input: {
+  dispatchId: string;
+  issueId: string;
+  teamKey: string;
+  maxInProgressAiIssues: number;
+  backend: DispatchAdmissionBackend;
+  installationId: string;
+  repository: string;
+  prNumber: number;
+  prDispatchBudget?: number;
+  humanRequested?: boolean;
+}): ReturnType<typeof acquireAdmission> {
+  return acquireAdmission({
+    dispatchId: input.dispatchId,
+    mappingKey: input.teamKey,
+    scope: {
+      kind: "pr",
+      issueId: input.issueId,
+      installationId: input.installationId,
+      repository: input.repository,
+      prNumber: input.prNumber,
+    },
+    kind: "gap-fill",
+    backend: input.backend,
+    lifecycleOwner: { kind: "legacy" },
+    cap: input.maxInProgressAiIssues,
+    prDispatchBudget: input.prDispatchBudget,
+    humanRequested: input.humanRequested,
+    parked: isParked(input.issueId, "gap-analysis"),
+  });
 }
 
 function normalizeContractProbeResult(result: ContractProbeResult): WorkflowCapabilities {
@@ -314,6 +360,31 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
           continue;
         }
 
+        // Final admission authority: one transaction reserves team capacity and PR-scoped
+        // occupancy before any credential mint or launch call. gateDecision (checked above)
+        // is only the preview. Reuse a dispatchId already minted above (callback configured);
+        // otherwise mint one now so the reservation and this launch share one stable identity.
+        if (!dispatchId) dispatchId = crypto.randomUUID();
+        const admission = acquireGapfillAdmission({
+          dispatchId,
+          issueId: prLog.issueId,
+          teamKey: scopeKey,
+          maxInProgressAiIssues: mapping.maxInProgressAiIssues,
+          backend: "fly-machines",
+          installationId: item.owner,
+          repository: fullRepo,
+          prNumber: item.prNumber,
+          prDispatchBudget: prBudget,
+          humanRequested,
+        });
+        if (!admission.ok) {
+          if (admission.reason === "budget_exhausted") {
+            await firePrBudgetPark(opts, mapping, prLog.issueId, item.owner, item.repo, item.prNumber, prBudget);
+          }
+          console.log(`[comment-gapfill] Deferring item #${item.id} for PR #${item.prNumber}: ${admission.reason}`);
+          continue;
+        }
+
         const flyToken = opts.flySessionsToken;
         const flyApp = opts.flySessionsApp;
         const minSecretsVersion = getFlySecretsMinVersion();
@@ -414,6 +485,7 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
           teamKey: scopeKey,
           repo: fullRepo,
           dispatchId,
+          admissionGeneration: admission.record.generation,
           dispatchNumber: prior.count + 1,
           executionMode: "fly-machines",
           machineNonce,
@@ -430,58 +502,96 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
 
       } else {
         // GitHub Actions path (includes "both" shadow mode — GHA is primary)
-        const runnerImage = await opts.resolveRunnerImage(mapping, ghToken);
-        const capabilities = normalizeContractProbeResult(await opts.checkContract({
-          owner: mapping.owner,
-          repo: mapping.repo,
-          workflowFile: mapping.workflowFile,
-          token: ghToken,
-          ref: mapping.defaultBranch,
-        }));
-        const { contract } = capabilities;
-        const runPublicationToken = dispatchId && opts.runnerCallbackBaseUrl && opts.runnerTokenSecret && capabilities.contract === "envelope" && capabilities.supportsRunPublicationToken
-          ? mintRunToken({
-              issueId: prLog.issueId,
-              mappingTeamKey: scopeKey,
-              phase: "gap-analysis",
-              audience: "publication",
-              dispatchId,
-              repository: `${mapping.owner}/${mapping.repo}`,
-              ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
-              secret: opts.runnerTokenSecret,
-            }).token
-          : undefined;
+        // Final admission authority: one transaction reserves team capacity and PR-scoped
+        // occupancy before any credential mint or launch call. gateDecision (checked above)
+        // is only the preview. Reuse a dispatchId already minted above (callback configured);
+        // otherwise mint one now so the reservation and this launch share one stable identity.
+        if (!dispatchId) dispatchId = crypto.randomUUID();
+        const admission = acquireGapfillAdmission({
+          dispatchId,
+          issueId: prLog.issueId,
+          teamKey: scopeKey,
+          maxInProgressAiIssues: mapping.maxInProgressAiIssues,
+          backend: "github-actions",
+          installationId: item.owner,
+          repository: fullRepo,
+          prNumber: item.prNumber,
+          prDispatchBudget: prBudget,
+          humanRequested,
+        });
+        if (!admission.ok) {
+          if (admission.reason === "budget_exhausted") {
+            await firePrBudgetPark(opts, mapping, prLog.issueId, item.owner, item.repo, item.prNumber, prBudget);
+          }
+          console.log(`[comment-gapfill] Deferring item #${item.id} for PR #${item.prNumber}: ${admission.reason}`);
+          continue;
+        }
 
-        const gapFillInputs = contract === "envelope"
-          ? buildEnvelopeDispatchInputs(mapping, gapFillIssue, {
-              runnerPhase: "gap-analysis",
-              prNumber: String(item.prNumber),
-              commentInstruction: item.instruction || undefined,
-              runnerCallbackUrl: runnerCallbackUrl || undefined,
-              runToken,
-              runProgressToken,
-              runPublicationToken,
-              runnerImage,
-              retryPolicy: getRetryPolicy(),
-            })
-          : {
-              issue_id: prLog.issueId,
-              issue_identifier: prLog.issueIdentifier ?? prLog.issueId,
-              issue_title: prLog.issueTitle ?? prLog.issueId,
-              issue_description: prLog.issueTitle ?? prLog.issueId,
-              pr_number: String(item.prNumber),
-              runner_phase: "gap-analysis" as const,
-              ...providerDispatchFields(mapping),
-              ...capDispatchFields(mapping),
-              ...skillsRepoDispatchFields(mapping),
-              runner_callback_url: runnerCallbackUrl,
-              run_token: runToken,
-              run_progress_token: runProgressToken,
-              ...(item.instruction ? { comment_instruction: item.instruction } : {}),
-              ...(runnerImage ? { runner_image: runnerImage } : {}),
-            };
+        // Everything below is pure prep — no launch call has fired yet. A throw anywhere in
+        // here (e.g. a workflow-capabilities probe failure) is by construction a definitive
+        // non-launch, so it releases the reservation and rethrows for the outer per-item catch
+        // to log and mark the item failed, unlike opts.dispatch below, whose failure is
+        // handled explicitly (release only on !result.success, held otherwise).
+        let runnerImage: string | undefined;
+        let contract: WorkflowContract;
+        let gapFillInputs: Record<string, string | undefined>;
+        try {
+          runnerImage = await opts.resolveRunnerImage(mapping, ghToken);
+          const capabilities = normalizeContractProbeResult(await opts.checkContract({
+            owner: mapping.owner,
+            repo: mapping.repo,
+            workflowFile: mapping.workflowFile,
+            token: ghToken,
+            ref: mapping.defaultBranch,
+          }));
+          contract = capabilities.contract;
+          const runPublicationToken = dispatchId && opts.runnerCallbackBaseUrl && opts.runnerTokenSecret && capabilities.contract === "envelope" && capabilities.supportsRunPublicationToken
+            ? mintRunToken({
+                issueId: prLog.issueId,
+                mappingTeamKey: scopeKey,
+                phase: "gap-analysis",
+                audience: "publication",
+                dispatchId,
+                repository: `${mapping.owner}/${mapping.repo}`,
+                ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
+                secret: opts.runnerTokenSecret,
+              }).token
+            : undefined;
 
-        const result = await opts.dispatch(ghToken, mapping, gapFillInputs as Record<string, string | undefined>);
+          gapFillInputs = (contract === "envelope"
+            ? buildEnvelopeDispatchInputs(mapping, gapFillIssue, {
+                runnerPhase: "gap-analysis",
+                prNumber: String(item.prNumber),
+                commentInstruction: item.instruction || undefined,
+                runnerCallbackUrl: runnerCallbackUrl || undefined,
+                runToken,
+                runProgressToken,
+                runPublicationToken,
+                runnerImage,
+                retryPolicy: getRetryPolicy(),
+              })
+            : {
+                issue_id: prLog.issueId,
+                issue_identifier: prLog.issueIdentifier ?? prLog.issueId,
+                issue_title: prLog.issueTitle ?? prLog.issueId,
+                issue_description: prLog.issueTitle ?? prLog.issueId,
+                pr_number: String(item.prNumber),
+                runner_phase: "gap-analysis" as const,
+                ...providerDispatchFields(mapping),
+                ...capDispatchFields(mapping),
+                ...skillsRepoDispatchFields(mapping),
+                runner_callback_url: runnerCallbackUrl,
+                run_token: runToken,
+                run_progress_token: runProgressToken,
+                ...(item.instruction ? { comment_instruction: item.instruction } : {}),
+                ...(runnerImage ? { runner_image: runnerImage } : {}),
+              }) as Record<string, string | undefined>;
+        } catch (err) {
+          releaseAdmission(admission.record.dispatchId, admission.record.lifecycleOwner, admission.record.generation, "launch_rejected");
+          throw err;
+        }
+
+        const result = await opts.dispatch(ghToken, mapping, gapFillInputs);
 
         if (!result.success) {
           await opts.onDispatchFailure(
@@ -500,6 +610,9 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
               phase: "gap-analysis",
             },
           );
+          // A definitive dispatch failure means the launch never happened — release the
+          // reservation immediately, keeping the budget-entry history intact.
+          releaseAdmission(admission.record.dispatchId, admission.record.lifecycleOwner, admission.record.generation, "launch_rejected");
           markCommentGapfillProcessed(item.id, "failed");
           continue;
         }
@@ -512,6 +625,7 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
           teamKey: scopeKey,
           repo: fullRepo,
           dispatchId,
+          admissionGeneration: admission.record.generation,
           dispatchNumber: prior.count + 1,
           executionMode: "github-actions",
           runnerMode: "default",

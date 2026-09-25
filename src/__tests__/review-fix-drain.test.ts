@@ -9,6 +9,7 @@ import type * as ConfigModule from "../config.js";
 import type * as IndexModule from "../index.js";
 import type * as ReviewFixQueueModule from "../review-fix-queue.js";
 import type * as LocalGapfillModule from "../local-gapfill.js";
+import type * as AdmissionModule from "../dispatch-admission.js";
 import type { RepoMapping } from "../config.js";
 import type { TicketIssue } from "../providers/types.js";
 
@@ -45,6 +46,7 @@ let breaker: typeof BreakerModule;
 let configModule: typeof ConfigModule;
 let indexModule: typeof IndexModule;
 let reviewFixQueue: typeof ReviewFixQueueModule;
+let admission: typeof AdmissionModule;
 
 // processReviewFixQueue only reads githubAppId/githubAppPrivateKey (forwarded verbatim to the
 // mocked getInstallationToken) off this config in the paths these tests exercise.
@@ -126,6 +128,7 @@ beforeEach(async () => {
   breaker = await import("../dispatch-breaker.js");
   configModule = await import("../config.js");
   reviewFixQueue = await import("../review-fix-queue.js");
+  admission = await import("../dispatch-admission.js");
   indexModule = await import("../index.js");
 
   dedup.getDb();
@@ -903,5 +906,216 @@ describe("processReviewFixQueue — task description wiring", () => {
     const stillOpen = reviewLedgerStore.listOpenReviewFindings("acme/billing", 62);
     expect(stillOpen).toHaveLength(1);
     expect(stillOpen[0]!.id).toBe(omittedId);
+  });
+});
+
+// AII-787: processReviewFixQueue's GHA path now reserves team capacity and PR-scoped
+// occupancy through dispatch-admission.ts's transactional acquire() before any launch
+// call, closing the race window the old read-only canDispatch preview left open between
+// its own check and the eventual appendLog/dispatchWorkflow call. These tests simulate a
+// concurrent competitor (another poll tick, or drainCommentGapfillQueue racing on the same
+// PR) by pre-acquiring a reservation directly — the same scope/mappingKey shape
+// processReviewFixQueue's own acquisition uses — rather than requiring true thread
+// concurrency, which a single-threaded test runner cannot produce.
+describe("processReviewFixQueue — admission (AII-787)", () => {
+  async function setupGha(overrides: Partial<RepoMapping> = {}): Promise<{
+    mapping: RepoMapping;
+    dispatchWorkflowSpy: ReturnType<typeof vi.spyOn>;
+  }> {
+    process.env.RUNNER_MODE = "default";
+    const mapping = makeMapping({ executionMode: "github-actions", ...overrides });
+    configModule.upsertMapping("TEAM", mapping);
+
+    const githubModule = await import("../github.js");
+    const workflowProbeModule = await import("../workflow-probe.js");
+    const repoImageModule = await import("../repo-image.js");
+    const dispatchWorkflowSpy = vi.spyOn(githubModule, "dispatchWorkflow").mockResolvedValue({ success: true, status: 204 });
+    vi.spyOn(workflowProbeModule, "resolveWorkflowCapabilities").mockResolvedValue({
+      contract: "legacy",
+      supportsRunPublicationToken: false,
+      supportsAttemptCorrelation: false,
+    });
+    vi.spyOn(repoImageModule, "resolveRunnerImageForDispatch").mockResolvedValue(undefined);
+
+    return { mapping, dispatchWorkflowSpy };
+  }
+
+  it("defers (one runner, not two) when a concurrent acquisition already holds the same PR's occupancy", async () => {
+    const { dispatchWorkflowSpy } = await setupGha();
+
+    reviewFixQueue.enqueueReviewFix({
+      issueId: "issue-race-1",
+      issueIdentifier: "AII-30",
+      repo: "acme/billing",
+      prNumber: 70,
+      reason: "late review comment",
+    });
+
+    // Simulates a competing dispatch (e.g. a human /ai-implement comment gap-fill) that
+    // already reserved this exact PR's occupancy in the same transaction our own
+    // acquisition would use.
+    const competitor = admission.acquire({
+      dispatchId: "competitor-dispatch",
+      mappingKey: "TEAM",
+      scope: { kind: "pr", issueId: "issue-race-1", installationId: "acme", repository: "acme/billing", prNumber: 70 },
+      kind: "gap-fill",
+      backend: "github-actions",
+      lifecycleOwner: { kind: "legacy" },
+      cap: 3,
+    });
+    expect(competitor.ok).toBe(true);
+
+    const consoleLogSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    await indexModule.processReviewFixQueue(mockConfig, mockRegistry);
+
+    expect(dispatchWorkflowSpy).not.toHaveBeenCalled();
+    expect(
+      consoleLogSpy.mock.calls.some(
+        ([msg]) => typeof msg === "string" && msg.includes("Deferring review fix") && msg.includes("occupied"),
+      ),
+    ).toBe(true);
+    const pending = reviewFixQueue.getPendingReviewFixes();
+    expect(pending).toHaveLength(1);
+    expect(pending[0]!.status).toBe("pending");
+    consoleLogSpy.mockRestore();
+  });
+
+  it("defers with at_capacity when a concurrent acquisition already holds the team's last slot, even though the dispatch_log preview would allow it", async () => {
+    const { dispatchWorkflowSpy } = await setupGha({ maxInProgressAiIssues: 1 });
+
+    reviewFixQueue.enqueueReviewFix({
+      issueId: "issue-race-2",
+      issueIdentifier: "AII-31",
+      repo: "acme/billing",
+      prNumber: 71,
+      reason: "late review comment",
+    });
+
+    // A different PR under the same team already holds the (only) slot — no dispatch_log
+    // row exists for it, so the old canDispatch preview would see zero in-flight jobs and
+    // let this through; only the transactional check catches it.
+    const filler = admission.acquire({
+      dispatchId: "filler-dispatch",
+      mappingKey: "TEAM",
+      scope: { kind: "pr", issueId: "other-issue", installationId: "acme", repository: "acme/billing", prNumber: 72 },
+      kind: "gap-fill",
+      backend: "github-actions",
+      lifecycleOwner: { kind: "legacy" },
+      cap: 1,
+    });
+    expect(filler.ok).toBe(true);
+
+    const consoleLogSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    await indexModule.processReviewFixQueue(mockConfig, mockRegistry);
+
+    expect(dispatchWorkflowSpy).not.toHaveBeenCalled();
+    expect(
+      consoleLogSpy.mock.calls.some(
+        ([msg]) => typeof msg === "string" && msg.includes("Deferring review fix") && msg.includes("at_capacity"),
+      ),
+    ).toBe(true);
+    expect(reviewFixQueue.getPendingReviewFixes()[0]!.status).toBe("pending");
+    consoleLogSpy.mockRestore();
+  });
+
+  it("a definitive dispatch failure releases capacity (a subsequent acquisition succeeds) while the budget entry is preserved", async () => {
+    const { mapping, dispatchWorkflowSpy } = await setupGha({ maxInProgressAiIssues: 1 });
+    dispatchWorkflowSpy.mockResolvedValue({ success: false, status: 422, error: "Workflow not found" });
+
+    reviewFixQueue.enqueueReviewFix({
+      issueId: "issue-release-1",
+      issueIdentifier: "AII-32",
+      repo: "acme/billing",
+      prNumber: 73,
+      reason: "late review comment",
+    });
+
+    await indexModule.processReviewFixQueue(mockConfig, mockRegistry);
+
+    expect(dispatchWorkflowSpy).toHaveBeenCalledTimes(1);
+    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(0); // marked failed, not pending
+
+    // The failed attempt's budget entry survives the release (history, not undone).
+    const budgetRowsAfterFailure = dedup.getDb().prepare("SELECT COUNT(*) as n FROM dispatch_budget_entries WHERE repository = ? AND pr_number = ?").get("acme/billing", 73) as { n: number };
+    expect(budgetRowsAfterFailure.n).toBe(1);
+
+    // Capacity was released: a fresh acquisition for the same team now succeeds, and its
+    // own launch spends a second, distinct budget entry (a genuine replacement, not a retry
+    // of the same reservation).
+    const retry = admission.acquire({
+      dispatchId: "post-failure-dispatch",
+      mappingKey: "TEAM",
+      scope: { kind: "pr", issueId: "issue-release-1", installationId: "acme", repository: "acme/billing", prNumber: 73 },
+      kind: "gap-fill",
+      backend: "github-actions",
+      lifecycleOwner: { kind: "legacy" },
+      cap: mapping.maxInProgressAiIssues,
+    });
+    expect(retry.ok).toBe(true);
+
+    const budgetRowsAfterRetry = dedup.getDb().prepare("SELECT COUNT(*) as n FROM dispatch_budget_entries WHERE repository = ? AND pr_number = ?").get("acme/billing", 73) as { n: number };
+    expect(budgetRowsAfterRetry.n).toBe(2);
+
+    // Retrying the SAME dispatchId again (the true "retry" case) returns the same
+    // reservation without spending a third budget entry.
+    const sameRetry = admission.acquire({
+      dispatchId: "post-failure-dispatch",
+      mappingKey: "TEAM",
+      scope: { kind: "pr", issueId: "issue-release-1", installationId: "acme", repository: "acme/billing", prNumber: 73 },
+      kind: "gap-fill",
+      backend: "github-actions",
+      lifecycleOwner: { kind: "legacy" },
+      cap: mapping.maxInProgressAiIssues,
+    });
+    expect(sameRetry.ok).toBe(true);
+    const budgetRowsAfterSameRetry = dedup.getDb().prepare("SELECT COUNT(*) as n FROM dispatch_budget_entries WHERE repository = ? AND pr_number = ?").get("acme/billing", 73) as { n: number };
+    expect(budgetRowsAfterSameRetry.n).toBe(2);
+  });
+
+  it("a successful GHA dispatch retains capacity — a subsequent acquisition for the team is denied at_capacity", async () => {
+    await setupGha({ maxInProgressAiIssues: 1 });
+
+    reviewFixQueue.enqueueReviewFix({
+      issueId: "issue-retain-1",
+      issueIdentifier: "AII-33",
+      repo: "acme/billing",
+      prNumber: 74,
+      reason: "late review comment",
+    });
+
+    await indexModule.processReviewFixQueue(mockConfig, mockRegistry);
+
+    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(0); // dispatched, not pending
+
+    const blocked = admission.acquire({
+      dispatchId: "post-success-dispatch",
+      mappingKey: "TEAM",
+      scope: { kind: "pr", issueId: "other-issue-2", installationId: "acme", repository: "acme/billing", prNumber: 75 },
+      kind: "gap-fill",
+      backend: "github-actions",
+      lifecycleOwner: { kind: "legacy" },
+      cap: 1,
+    });
+    expect(blocked).toEqual(expect.objectContaining({ ok: false, reason: "at_capacity" }));
+  });
+
+  it("local-docker dispatch (Legacy) never writes to the admission table", async () => {
+    // RUNNER_MODE stays "local" (this file's default) — the local branch is untouched by
+    // the acquisition wiring.
+    const mapping = makeMapping();
+    configModule.upsertMapping("TEAM", mapping);
+
+    reviewFixQueue.enqueueReviewFix({
+      issueId: "issue-local-admission",
+      issueIdentifier: "AII-34",
+      repo: "acme/billing",
+      prNumber: 76,
+      reason: "late review comment",
+    });
+
+    await indexModule.processReviewFixQueue(mockConfig, mockRegistry);
+
+    expect(localGapfillMocks.dispatchLocalGapfill).toHaveBeenCalledTimes(1);
+    expect(admission.count("TEAM")).toBe(0);
   });
 });
