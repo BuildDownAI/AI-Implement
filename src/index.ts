@@ -12,6 +12,7 @@ import type { RepoMapping } from "./config.js";
 import { markDispatched, closeDb, getDispatchedIds, deleteDispatched } from "./dedup.js";
 import { canDispatch, acquireDispatch, type DispatchKind, type AcquireDispatchOutcome } from "./dispatch-gate.js";
 import {
+  acquire as acquireAdmission,
   count as countAdmissionReservations,
   sweepStaleAdmissions,
   reconcileTerminalCallbackAdmissions,
@@ -20,8 +21,8 @@ import {
   type StaleAdmissionCandidate,
 } from "./dispatch-admission.js";
 import { reconcileFilesystemFailures } from "./filesystem-ticket-lifecycle.js";
-import { dispatchWorkflow, postWorkflowDispatch, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, getPullRequestState, buildEnvelopeDispatchInputs, postPrComment, defaultFetchSignal, getRepoDefaultBranch, buildKgRefreshGhaDispatchBody, pollForKgWorkflowRunId } from "./github.js";
-import { resolveWorkflowCapabilities, resolveWorkflowContract } from "./workflow-probe.js";
+import { dispatchWorkflow, postWorkflowDispatch, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, getPullRequestState, buildEnvelopeDispatchInputs, postPrComment, defaultFetchSignal, getRepoDefaultBranch, buildKgRefreshGhaDispatchBody, pollForKgWorkflowRunId, type DispatchInputs } from "./github.js";
+import { resolveWorkflowCapabilities, resolveWorkflowContract, type WorkflowContract } from "./workflow-probe.js";
 import { surfaceDispatchFailure } from "./dispatch-failure.js";
 import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
 import { dispatchLocalGapfill } from "./local-gapfill.js";
@@ -40,9 +41,9 @@ import { remediateStuckJob, remediateFailedJob } from "./stuck-watchdog.js";
 import type { StuckWatchdogConfig } from "./stuck-watchdog.js";
 import { handleAdminRequest } from "./admin.js";
 import { initLogTable, appendLog, countPriorDispatches, completeOrphanedPlanningJobs, attachJobRunIdIfMissing, updateJobRunId, updateJobStatus, updateJobPrUrl, updateJobMachineDetails, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobById, getJobByMachineId, getJobByDispatchId, resetStuckAttempts, getRecentFailedRunUrls } from "./log.js";
-import { recordDispatchFailure, recordDispatchSuccess, shouldCountFailure, initDispatchBreakerTable, parkIssue, prBudgetParkMessage } from "./dispatch-breaker.js";
+import { recordDispatchFailure, recordDispatchSuccess, shouldCountFailure, initDispatchBreakerTable, parkIssue, prBudgetParkMessage, isParked } from "./dispatch-breaker.js";
 import type { Job, JobStatus } from "./log.js";
-import { getInstallationToken, getAppSlug } from "./github-app-auth.js";
+import { getInstallationToken, getInstallationId, getAppSlug } from "./github-app-auth.js";
 import { configureLinearAuth } from "./linear-app-auth.js";
 import { configureOAuthProviders, isOAuthConfigured, providersFromEnv } from "./oauth/providers.js";
 import { handleOAuthCallback, handleOAuthLogout, handleOAuthProviders, handleOAuthStart } from "./oauth/routes.js";
@@ -852,6 +853,7 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
       runnerCallbackBaseUrl: config.runnerCallbackBaseUrl,
       runnerTokenSecret: config.runnerTokenSecret,
       getInstallationToken: (owner) => getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner),
+      getInstallationId: (owner) => getInstallationId(config.githubAppId, config.githubAppPrivateKey, owner),
       resolveRunnerImage: (mapping, ghToken) => resolveDispatchRunnerImage(config, mapping, ghToken),
       checkContract: (params) => resolveWorkflowCapabilities(params),
       dispatch: dispatchWorkflow,
@@ -3587,6 +3589,45 @@ async function processReconciliations(config: AppConfig, registry: ProviderRegis
 
 // ---------- Late Review Fix Queue ----------
 
+/**
+ * Final admission authority for gap-fill dispatch (review-fix and comment gap-fill):
+ * one transaction reserves per-team capacity and PR-scoped occupancy, and records the
+ * dispatch identity, before any credential mint or launch call. `canDispatch` (checked
+ * earlier by both callers) is only the non-transactional preview — this closes the race
+ * window between that preview and the actual launch (AII-787).
+ */
+function acquireGapfillAdmission(input: {
+  dispatchId: string;
+  issueId: string;
+  teamKey: string;
+  maxInProgressAiIssues: number;
+  backend: "github-actions" | "fly-machines" | "local-docker";
+  installationId: string;
+  repository: string;
+  prNumber: number;
+  prDispatchBudget?: number;
+  humanRequested?: boolean;
+}): ReturnType<typeof acquireAdmission> {
+  return acquireAdmission({
+    dispatchId: input.dispatchId,
+    mappingKey: input.teamKey,
+    scope: {
+      kind: "pr",
+      issueId: input.issueId,
+      installationId: input.installationId,
+      repository: input.repository,
+      prNumber: input.prNumber,
+    },
+    kind: "gap-fill",
+    backend: input.backend,
+    lifecycleOwner: { kind: "legacy" },
+    cap: input.maxInProgressAiIssues,
+    prDispatchBudget: input.prDispatchBudget,
+    humanRequested: input.humanRequested,
+    parked: isParked(input.issueId, "gap-analysis"),
+  });
+}
+
 export async function processReviewFixQueue(config: AppConfig, registry: ProviderRegistry): Promise<void> {
   const pending = getPendingReviewFixes();
   if (pending.length === 0) return;
@@ -3657,6 +3698,7 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
 
       const [owner] = fix.repo.split("/");
       const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
+      const installationId = String(await getInstallationId(config.githubAppId, config.githubAppPrivateKey, owner));
 
       let prState: Awaited<ReturnType<typeof getPullRequestState>>;
       try {
@@ -3740,25 +3782,53 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
           updateReviewFixStatus(fix.id, "failed");
           continue;
         }
-        const container = await dispatchLocalGapfill({
-          mapping,
-          issue: {
-            id: fix.issueId,
-            identifier: fix.issueIdentifier ?? fix.issueId,
-            title: `Review feedback fix for PR #${fix.prNumber}`,
-            description: taskDescription,
-          },
+        if (!dispatchId) dispatchId = crypto.randomUUID();
+        const admission = acquireGapfillAdmission({
+          dispatchId,
+          issueId: fix.issueId,
+          teamKey: scopeKey,
+          maxInProgressAiIssues: mapping.maxInProgressAiIssues,
+          backend: "local-docker",
+          installationId,
+          repository: fix.repo,
           prNumber: fix.prNumber,
-          githubToken: ghToken,
-          image: config.localRunnerImage,
-          orchestratorUrl: config.localRunnerOrchestratorUrl ?? config.runnerCallbackBaseUrl ?? `http://host.docker.internal:${config.healthPort}`,
-          runnerCallbackUrl: runnerCallbackUrl || undefined,
-          runToken: runToken || undefined,
-          runProgressToken: runProgressToken || undefined,
-          anthropicApiKey: config.anthropicApiKey,
-          claudeOAuthToken: config.claudeOAuthToken,
-          retryPolicy: getRetryPolicy(),
+          prDispatchBudget: prBudget,
+          humanRequested: false,
         });
+        if (!admission.ok) {
+          if (admission.reason === "budget_exhausted") {
+            await firePrBudgetPark(config, registry, mapping, fix.issueId, fix.repo, fix.prNumber, prBudget);
+          }
+          console.log(`[review-fix] Deferring local review fix #${fix.id} for PR #${fix.prNumber}: ${admission.reason}`);
+          continue;
+        }
+        let launchStarted = false;
+        let container: Awaited<ReturnType<typeof dispatchLocalGapfill>>;
+        try {
+          container = await dispatchLocalGapfill({
+            mapping,
+            issue: {
+              id: fix.issueId,
+              identifier: fix.issueIdentifier ?? fix.issueId,
+              title: `Review feedback fix for PR #${fix.prNumber}`,
+              description: taskDescription,
+            },
+            prNumber: fix.prNumber,
+            githubToken: ghToken,
+            image: config.localRunnerImage,
+            orchestratorUrl: config.localRunnerOrchestratorUrl ?? config.runnerCallbackBaseUrl ?? `http://host.docker.internal:${config.healthPort}`,
+            runnerCallbackUrl: runnerCallbackUrl || undefined,
+            runToken: runToken || undefined,
+            runProgressToken: runProgressToken || undefined,
+            anthropicApiKey: config.anthropicApiKey,
+            claudeOAuthToken: config.claudeOAuthToken,
+            retryPolicy: getRetryPolicy(),
+            onBeforeLaunch: () => { launchStarted = true; },
+          });
+        } catch (err) {
+          if (!launchStarted) releaseAdmission(admission.record.dispatchId, admission.record.lifecycleOwner, admission.record.generation, "launch_rejected");
+          throw err;
+        }
         const prior = countPriorDispatches(fix.issueId, "implementation");
         const jobId = appendLog({
           issueId: fix.issueId,
@@ -3767,6 +3837,7 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
           teamKey: scopeKey,
           repo: fix.repo,
           dispatchId,
+          admissionGeneration: admission.record.generation,
           dispatchNumber: prior.count + 1,
           executionMode: "local-docker",
           runnerMode,
@@ -3786,91 +3857,159 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
         continue;
       }
 
-      const runnerImage = await resolveDispatchRunnerImage(config, mapping, ghToken);
-
-      const reviewFixCapabilities = await resolveWorkflowCapabilities({
-        owner: mapping.owner,
-        repo: mapping.repo,
-        workflowFile: mapping.workflowFile,
-        token: ghToken,
-        ref: mapping.defaultBranch,
+      // Final admission authority: one transaction reserves team capacity and PR-scoped
+      // occupancy before any credential mint or launch call. gateDecision (checked above)
+      // is only the preview. Reuse a dispatchId already minted above (callback configured);
+      // otherwise mint one now so the reservation and this launch share one stable identity.
+      if (!dispatchId) dispatchId = crypto.randomUUID();
+      const admission = acquireGapfillAdmission({
+        dispatchId,
+        issueId: fix.issueId,
+        teamKey: scopeKey,
+        maxInProgressAiIssues: mapping.maxInProgressAiIssues,
+        backend: "github-actions",
+        installationId,
+        repository: fix.repo,
+        prNumber: fix.prNumber,
+        prDispatchBudget: prBudget,
+        humanRequested: false,
       });
-      const reviewFixContract = reviewFixCapabilities.contract;
-      const runPublicationToken = reviewFixContract === "envelope"
-        && reviewFixCapabilities.supportsRunPublicationToken
-        && dispatchId
-        && config.runnerCallbackBaseUrl
-        && config.runnerTokenSecret
-        ? mintRunToken({
-            issueId: fix.issueId,
-            mappingTeamKey: scopeKey,
-            phase: "gap-analysis",
-            audience: "publication",
-            dispatchId,
-            repository: `${mapping.owner}/${mapping.repo}`,
-            ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
-            secret: config.runnerTokenSecret,
-          }).token
-        : undefined;
+      if (!admission.ok) {
+        if (admission.reason === "budget_exhausted") {
+          await firePrBudgetPark(config, registry, mapping, fix.issueId, fix.repo, fix.prNumber, prBudget);
+        }
+        console.log(`[review-fix] Deferring review fix #${fix.id} for PR #${fix.prNumber}: ${admission.reason}`);
+        continue;
+      }
 
-      const fixIssue = {
-        id: fix.issueId,
-        identifier: fix.issueIdentifier ?? fix.issueId,
-        title: `Review feedback fix for PR #${fix.prNumber}`,
-        description: taskDescription,
-      };
+      // Everything below is pure prep — no launch call has fired yet. A throw anywhere in
+      // here (e.g. a workflow-capabilities probe failure) is by construction a definitive
+      // non-launch, so it releases the reservation and rethrows for the outer per-item catch
+      // to log and mark the item failed, unlike dispatchWorkflow below, whose failure is
+      // handled explicitly (release only on !result.success, held otherwise).
+      let runnerImage: string | undefined;
+      let reviewFixContract: WorkflowContract;
+      let reviewFixInputs: DispatchInputs;
+      try {
+        runnerImage = await resolveDispatchRunnerImage(config, mapping, ghToken);
 
-      const reviewFixInputs = reviewFixContract === "envelope"
-        ? buildEnvelopeDispatchInputs(mapping, fixIssue, {
-            runnerPhase: "gap-analysis",
-            prNumber: String(fix.prNumber),
-            runnerCallbackUrl: runnerCallbackUrl || undefined,
-            runToken,
-            runProgressToken,
-            runPublicationToken,
-            runnerImage,
-            retryPolicy: getRetryPolicy(),
-          })
-        : {
-            issue_id: fix.issueId,
-            issue_identifier: fix.issueIdentifier ?? fix.issueId,
-            issue_title: `Review feedback fix for PR #${fix.prNumber}`,
-            issue_description: taskDescription,
-            pr_number: String(fix.prNumber),
-            runner_phase: "gap-analysis" as const,
-            ...providerDispatchFields(mapping),
-            ...capDispatchFields(mapping),
-            ...skillsRepoDispatchFields(mapping),
-            // No profilesDispatchFields here: profiles are per-issue (read off the fresh
-            // TicketIssue at poll time), and review-fix queue entries only persist the
-            // issue id — re-fetching the ticket just for profiles isn't worth it for a
-            // gap-fill pass on a PR the profile-aware initial run already produced.
-            runner_callback_url: runnerCallbackUrl,
-            run_token: runToken,
-            run_progress_token: runProgressToken,
-            ...(runnerImage ? { runner_image: runnerImage } : {}),
-          };
+        const reviewFixCapabilities = await resolveWorkflowCapabilities({
+          owner: mapping.owner,
+          repo: mapping.repo,
+          workflowFile: mapping.workflowFile,
+          token: ghToken,
+          ref: mapping.defaultBranch,
+        });
+        reviewFixContract = reviewFixCapabilities.contract;
+        const runPublicationToken = reviewFixContract === "envelope"
+          && reviewFixCapabilities.supportsRunPublicationToken
+          && dispatchId
+          && config.runnerCallbackBaseUrl
+          && config.runnerTokenSecret
+          ? mintRunToken({
+              issueId: fix.issueId,
+              mappingTeamKey: scopeKey,
+              phase: "gap-analysis",
+              audience: "publication",
+              dispatchId,
+              repository: `${mapping.owner}/${mapping.repo}`,
+              ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
+              secret: config.runnerTokenSecret,
+            }).token
+          : undefined;
 
-      const result = await dispatchWorkflow(ghToken, mapping, reviewFixInputs);
+        const fixIssue = {
+          id: fix.issueId,
+          identifier: fix.issueIdentifier ?? fix.issueId,
+          title: `Review feedback fix for PR #${fix.prNumber}`,
+          description: taskDescription,
+        };
+
+        reviewFixInputs = reviewFixContract === "envelope"
+          ? buildEnvelopeDispatchInputs(mapping, fixIssue, {
+              runnerPhase: "gap-analysis",
+              prNumber: String(fix.prNumber),
+              runnerCallbackUrl: runnerCallbackUrl || undefined,
+              runToken,
+              runProgressToken,
+              runPublicationToken,
+              runnerImage,
+              retryPolicy: getRetryPolicy(),
+            })
+          : {
+              issue_id: fix.issueId,
+              issue_identifier: fix.issueIdentifier ?? fix.issueId,
+              issue_title: `Review feedback fix for PR #${fix.prNumber}`,
+              issue_description: taskDescription,
+              pr_number: String(fix.prNumber),
+              runner_phase: "gap-analysis" as const,
+              ...providerDispatchFields(mapping),
+              ...capDispatchFields(mapping),
+              ...skillsRepoDispatchFields(mapping),
+              // No profilesDispatchFields here: profiles are per-issue (read off the fresh
+              // TicketIssue at poll time), and review-fix queue entries only persist the
+              // issue id — re-fetching the ticket just for profiles isn't worth it for a
+              // gap-fill pass on a PR the profile-aware initial run already produced.
+              runner_callback_url: runnerCallbackUrl,
+              run_token: runToken,
+              run_progress_token: runProgressToken,
+              ...(runnerImage ? { runner_image: runnerImage } : {}),
+            };
+      } catch (err) {
+        releaseAdmission(admission.record.dispatchId, admission.record.lifecycleOwner, admission.record.generation, "launch_rejected");
+        throw err;
+      }
+
+      const result = await dispatchWorkflow(ghToken, mapping, reviewFixInputs, { returnRunDetails: true });
 
       if (!result.success) {
-        await surfaceDispatchFailure(
-          result,
-          config.notifyType,
-          config.notifyWebhookUrl,
-          {
-            site: "review-fix",
+        if (result.outcome !== "rejected") {
+          // GitHub may have started the run despite a lost/5xx response. Leave a job
+          // identity for the monitor and stale-admission oracle to reconcile.
+          const prior = countPriorDispatches(fix.issueId, "gap-analysis");
+          const jobId = appendLog({
             issueId: fix.issueId,
             issueIdentifier: fix.issueIdentifier ?? undefined,
             issueTitle: `Review feedback fix for PR #${fix.prNumber}`,
             teamKey: scopeKey,
             repo: fix.repo,
-            workflowFile: mapping.workflowFile,
+            dispatchId,
+            admissionGeneration: admission.record.generation,
+            dispatchNumber: prior.count + 1,
+            executionMode: "github-actions",
+            runnerMode: "default",
             contract: reviewFixContract,
             phase: "gap-analysis",
-          },
-        );
-        updateReviewFixStatus(fix.id, "failed");
+          });
+          updateJobPrUrl(jobId, `https://github.com/${fix.repo}/pull/${fix.prNumber}`);
+          recordReviewFixDispatch({ queueId: fix.id, dispatchId, repo: fix.repo,
+            prNumber: fix.prNumber, findingIds: dispatchFindingIds });
+          suppressStaleNotifications(fix.issueId, jobId);
+          console.warn(`[review-fix] Unknown GitHub launch outcome for PR #${fix.prNumber}; retained dispatch ${dispatchId} for reconciliation`);
+        }
+        if (result.outcome === "rejected") {
+          try {
+            await surfaceDispatchFailure(
+              result, config.notifyType, config.notifyWebhookUrl,
+              {
+                site: "review-fix",
+                issueId: fix.issueId,
+                issueIdentifier: fix.issueIdentifier ?? undefined,
+                issueTitle: `Review feedback fix for PR #${fix.prNumber}`,
+                teamKey: scopeKey,
+                repo: fix.repo,
+                workflowFile: mapping.workflowFile,
+                contract: reviewFixContract,
+                phase: "gap-analysis",
+              },
+            );
+          } catch (err) {
+            console.error(`[review-fix] Failed to report rejected dispatch for PR #${fix.prNumber}:`, err);
+          } finally {
+            releaseAdmission(admission.record.dispatchId, admission.record.lifecycleOwner, admission.record.generation, "launch_rejected");
+          }
+        }
+        updateReviewFixStatus(fix.id, result.outcome === "rejected" ? "failed" : "dispatched");
         continue;
       }
 
@@ -3882,6 +4021,7 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
         teamKey: scopeKey,
         repo: fix.repo,
         dispatchId,
+        admissionGeneration: admission.record.generation,
         dispatchNumber: prior.count + 1,
         executionMode: "github-actions",
         runnerMode: "default",
