@@ -5175,10 +5175,15 @@ export function createRestateRegistrationGate(
       attempted = true;
       try {
         await deps.startRestateEndpoint();
+        // Shutdown may begin while the endpoint is opening. Never start a registration
+        // after that await if the process is already draining.
+        if (isShuttingDown()) return;
         const result = await deps.registerRestateEndpoint();
+        if (isShuttingDown()) return;
         setRestateStatus({ registration: restateRegistrationStatusFor(result.outcome) });
         console.log(`[restate] boot registration: ${result.outcome}${result.detail ? ` (${result.detail})` : ""}`);
       } catch (err) {
+        if (isShuttingDown()) return;
         setRestateStatus({ registration: { state: "unreachable" } });
         console.error(`[restate] SDK endpoint failed to start: ${err instanceof Error ? err.message : String(err)}`);
       }

@@ -607,6 +607,23 @@ describe("createRestateRegistrationGate", () => {
     expect(registerRestateEndpoint).not.toHaveBeenCalled();
   });
 
+  it("does not register if shutdown begins while endpoint startup is pending", async () => {
+    let finishStart!: () => void;
+    const startRestateEndpoint = vi.fn(() => new Promise<void>((resolve) => { finishStart = resolve; }));
+    const registerRestateEndpoint = vi.fn(async () => ({ outcome: "registered-no-force" as const }));
+    let shuttingDown = false;
+    const gate = createRestateRegistrationGate(() => shuttingDown, { startRestateEndpoint, registerRestateEndpoint });
+
+    const attempt = gate.attempt();
+    expect(startRestateEndpoint).toHaveBeenCalledTimes(1);
+    shuttingDown = true;
+    finishStart();
+    await attempt;
+
+    expect(registerRestateEndpoint).not.toHaveBeenCalled();
+    expect(getRestateStatus().registration).toEqual({ state: "not-attempted" });
+  });
+
   it.each([
     ["registered-no-force", { state: "registered" }],
     ["registered-drained-force", { state: "registered" }],
