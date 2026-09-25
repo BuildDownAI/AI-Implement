@@ -17,7 +17,7 @@ import { SensitiveFilesError } from "./pipeline/sensitive-files.js";
 import { OperatorCancelledError } from "./pipeline/operator-cancelled.js";
 import { classifyThrown, isFailureRecord } from "./pipeline/failure-classification.js";
 import { decodeRunConfig, type RunConfigV1 } from "./run-config.js";
-import type { ReviewFixMetadataV1 } from "./review-fix-contract.js";
+import type { ReviewFixMetadataV1, ReviewFixResultMetadataV1 } from "./review-fix-contract.js";
 import { DEFAULT_RETRY_POLICY, normalizeRetryPolicy, type RetryPolicy } from "./pipeline/retry-backoff.js";
 import { writeRunAutopsy, writeRunStats } from "./run-autopsy.js";
 import { parsePlanningBlock } from "./planning-block.js";
@@ -304,6 +304,86 @@ function safeBranchPrefix(raw: string | undefined): string | undefined {
   }
 }
 
+/** Mirrors pipeline/reporter.ts's parseGithubRunId (not exported there): a bounded positive-integer
+ *  parse used for both GITHUB_RUN_ID and GITHUB_RUN_ATTEMPT, which share the same shape. */
+function parsePositiveIntEnv(value: string | undefined): number | null {
+  if (value === undefined) return null;
+  if (!/^[1-9]\d*$/.test(value)) return null;
+  const n = Number(value);
+  return Number.isSafeInteger(n) ? n : null;
+}
+
+/**
+ * What `resolveReviewFixResult` could establish for a terminal call site: `legacy` for a
+ * non-pilot dispatch (no marker was ever in play), `attached` when the full wire marker was
+ * assembled, and `no-result` when a pilot attempt's identity is present but the evidence needed
+ * to complete it isn't — the caller must never treat `no-result` as `legacy`.
+ */
+type ReviewFixResultResolution =
+  | { readonly kind: "legacy" }
+  | { readonly kind: "attached"; readonly reviewFix: ReviewFixResultMetadataV1 }
+  | { readonly kind: "no-result"; readonly reason: string };
+
+/**
+ * Folds the actual GitHub Actions execution identity and the real published output commit onto
+ * a pilot attempt's resolved identity (run_config.reviewFix, AII-776) into the full result
+ * marker the callback validates (ReviewFixResultMetadataV1, AII-794). Undefined `identity` means
+ * a Legacy (non-pilot) dispatch — no marker is ever in play. `outputCommit` and
+ * githubRunId/githubRunAttempt are all required by the wire contract (ReviewFixResultMetadataV1
+ * has no optional-evidence variant), so when any of them can't be resolved (no push happened on
+ * this path, or the process isn't actually running under GHA) this reports `no-result` rather
+ * than a fabricated or partial marker. The caller must not then send an unmarked Legacy POST for
+ * this attempt: the server's `classifyLifecycleOwner` (review-fix-contract.ts) would read a
+ * missing `reviewFix` field as "this was never a pilot attempt" and process it on the Legacy
+ * path, which is exactly the silent downgrade the contract is designed to forbid on malformed
+ * input — omitting the field entirely has the same effect as sending a malformed one.
+ */
+function resolveReviewFixResult(
+  identity: ReviewFixMetadataV1 | undefined,
+  outputCommit: string | null,
+  env: NodeJS.ProcessEnv,
+): ReviewFixResultResolution {
+  if (!identity) return { kind: "legacy" };
+  const githubRunId = parsePositiveIntEnv(env.GITHUB_RUN_ID);
+  const githubRunAttempt = parsePositiveIntEnv(env.GITHUB_RUN_ATTEMPT);
+  if (githubRunId === null || githubRunAttempt === null) {
+    return {
+      kind: "no-result",
+      reason: `missing/invalid GITHUB_RUN_ID or GITHUB_RUN_ATTEMPT for attempt ${identity.attemptId}`,
+    };
+  }
+  if (!outputCommit) {
+    return { kind: "no-result", reason: `no published output commit for attempt ${identity.attemptId}` };
+  }
+  return { kind: "attached", reviewFix: { ...identity, githubRunId, githubRunAttempt, outputCommit } };
+}
+
+/**
+ * Delivers a run's terminal result, attaching the pilot marker (AII-794) when `identity`
+ * resolves cleanly. A pilot dispatch whose evidence can't be completed skips the network call
+ * entirely and logs an explicit no-result outcome — see resolveReviewFixResult's doc comment for
+ * why a partial or unmarked delivery is never sent instead.
+ */
+async function reportRunnerResult(
+  identity: ReviewFixMetadataV1 | undefined,
+  outputCommit: string | null,
+  env: NodeJS.ProcessEnv,
+  params: Omit<Parameters<typeof postRunnerResult>[0], "reviewFix">,
+): Promise<void> {
+  const resolution = resolveReviewFixResult(identity, outputCommit, env);
+  if (resolution.kind === "no-result") {
+    console.error(
+      `[runner] pilot result delivery skipped for attempt ${identity?.attemptId}: ${resolution.reason} — ` +
+        "refusing to send an unmarked Legacy result for a pilot-owned attempt",
+    );
+    return;
+  }
+  await postRunnerResult({
+    ...params,
+    reviewFix: resolution.kind === "attached" ? resolution.reviewFix : undefined,
+  });
+}
+
 
 const EXTERNAL_REVIEWER_POLICY_IDS = new Set(["claude-review-summary"]);
 
@@ -499,6 +579,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     claudeModel,
     groupingParent,
     retryPolicy,
+    reviewFix,
   } = resolveRunnerInputs(process.env);
   const branch = resolveBranch(workspaceDir, baseBranch, prNumber);
   const trustedReviewerDefinitions = await resolveTrustedReviewerDefinitions(reviewers);
@@ -639,6 +720,9 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     const pushOutputs = context.getOutputs("push");
     const postPushReviewOutputs = context.getOutputs("post-push-review");
     const prUrl = typeof pushOutputs.prUrl === "string" ? pushOutputs.prUrl : undefined;
+    // The actual published output commit, not GITHUB_SHA/the initial checkout — null on a
+    // no-op/no-push path (grouping parent with no own work, mounted dev-harness runs).
+    const outputCommit = typeof pushOutputs.commitSha === "string" ? pushOutputs.commitSha : null;
     // Mirror the post-push-review skip contract: a statically registered step is
     // authoritative only when the internal review approved and push produced the
     // branch/PR inputs that cause the step to run. Otherwise its outputs are empty.
@@ -674,7 +758,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     // existing-PR update path below.)
     if (context.data.groupingParent && pushOutputs.branchPushed === false && !prUrl) {
       disposition = "no-op (grouping parent: no own work; finalized for roll-up)";
-      await postRunnerResult({
+      await reportRunnerResult(reviewFix, outputCommit, process.env, {
         workspaceDir,
         phase: runnerPhase,
         outcome: "success",
@@ -682,6 +766,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
         referenceRepoResults,
         findingDispositions,
         callbackUrl,
+        retryPolicy,
         fetchImpl: opts.fetchImpl,
       });
       return { exitCode: 0 };
@@ -722,7 +807,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
         : prNumber
         ? `gap-fill on PR #${prNumber} (approved after ${iterations} iteration(s))`
         : `local: approved after ${iterations} iteration(s) (mounted mode)`;
-      await postRunnerResult({
+      await reportRunnerResult(reviewFix, outputCommit, process.env, {
         workspaceDir,
         phase: runnerPhase,
         outcome: "success",
@@ -730,6 +815,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
         referenceRepoResults,
         findingDispositions,
         callbackUrl,
+        retryPolicy,
         fetchImpl: opts.fetchImpl,
       });
       return { exitCode: 0 };
@@ -829,7 +915,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
             : `::warning::AI-Implement: review did not approve after ${iterations} iteration(s) (${terminationReason}) — ` +
               (prUrl ? `${prKind} opened: ${prUrl}` : "no PR opened"),
     );
-    await postRunnerResult({
+    await reportRunnerResult(reviewFix, outputCommit, process.env, {
       workspaceDir,
       phase: runnerPhase,
       outcome: "failure",
@@ -840,6 +926,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       referenceRepoResults,
       findingDispositions,
       callbackUrl,
+      retryPolicy,
       fetchImpl: opts.fetchImpl,
     });
     return { exitCode: 0 };
@@ -853,11 +940,16 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     // the push step itself threw: a `fixed`/`follow-up` reply would assert a code change that
     // did not land. Any other step failing (push never having run) does not suppress replies.
     const { valid: findingDispositions } = readFindingDispositions(workspaceDir);
-    const pushFailed = Boolean(context.getOutputs("push").error);
+    const pushOutputsOnError = context.getOutputs("push");
+    const pushFailed = Boolean(pushOutputsOnError.error);
     if (prNumber && !pushFailed) {
       replyToDispositionThreads(ghSpawn, prNumber, findingDispositions);
     }
-    await postRunnerResult({
+    // A step can throw after push already ran and published a commit (e.g. post-push-review
+    // erroring out) — read the real commit here too rather than assume no-op, same as the
+    // success/rejected paths above.
+    const outputCommitOnError = typeof pushOutputsOnError.commitSha === "string" ? pushOutputsOnError.commitSha : null;
+    await reportRunnerResult(reviewFix, outputCommitOnError, process.env, {
       workspaceDir,
       phase: runnerPhase,
       outcome: "failure",
@@ -869,6 +961,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       referenceRepoResults,
       findingDispositions,
       callbackUrl,
+      retryPolicy,
       fetchImpl: opts.fetchImpl,
     });
     return { exitCode: 1 };

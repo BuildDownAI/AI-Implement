@@ -14,6 +14,7 @@ import type { LLMExecutor, PipelineDefinition, StepModule } from "../pipeline/ty
 import { __resetPublicationCredentialForTests } from "../publication-credential.js";
 import { DISPOSITIONS_FILE, stableReviewFindingKey, type FindingDisposition } from "../pipeline/finding-dispositions.js";
 import type { GhSpawn } from "../pipeline/review-ledger.js";
+import type { ReviewFixMetadataV1 } from "../review-fix-contract.js";
 
 const REQUIRED_ENV: Record<string, string> = {
   ISSUE_ID: "issue-abc",
@@ -900,6 +901,246 @@ describe("runAutonomous", () => {
     // step's id) onto the rethrown error; without that, this would read
     // back stage: "pipeline" instead of the actual failing step.
     expect(body.failure?.stage).toBe("push");
+  });
+
+  describe("reviewFix result metadata (AII-794)", () => {
+    const REVIEW_FIX_IDENTITY: ReviewFixMetadataV1 = {
+      version: 1,
+      attemptId: "attempt-1",
+      installationId: 12345,
+      repository: "acme/app",
+      prNumber: 42,
+      deadlineAt: Date.now() + 60 * 60_000,
+    };
+
+    function stubReviewFixEnvelope(
+      overrides: Partial<ReviewFixMetadataV1> = {},
+      configOverrides: { groupingParent?: boolean } = {},
+    ) {
+      vi.stubEnv(
+        "AI_IMPLEMENT_RUN_CONFIG",
+        encodeRunConfig({
+          v: 1,
+          issue: { id: "issue-abc", identifier: "AII-1", title: "Test issue", description: "Issue description" },
+          reviewFix: { ...REVIEW_FIX_IDENTITY, ...overrides },
+          ...configOverrides,
+        }),
+      );
+    }
+
+    it("attaches the full reviewFix result marker on success, reporting the actual published commit (not GITHUB_SHA)", async () => {
+      stubReviewFixEnvelope();
+      vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+      vi.stubEnv("RUN_TOKEN", "run-token");
+      vi.stubEnv("GITHUB_RUN_ID", "999888");
+      vi.stubEnv("GITHUB_RUN_ATTEMPT", "2");
+      vi.stubEnv("GITHUB_SHA", "0".repeat(40));
+
+      const publishedCommit = "b".repeat(40);
+      const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+      const { pipeline, runner } = makeStepsPipeline([
+        ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true }) }],
+        [
+          "push",
+          {
+            run: vi.fn().mockResolvedValue({
+              prUrl: "https://github.com/acme/app/pull/42",
+              prNumber: 42,
+              branchPushed: true,
+              commitSha: publishedCommit,
+              draft: false,
+            }),
+          },
+        ],
+      ]);
+
+      const result = await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeMockExecutor(0),
+        fetchImpl: mockFetch,
+      });
+
+      expect(result.exitCode).toBe(0);
+      const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as { reviewFix?: Record<string, unknown> };
+      expect(body.reviewFix).toEqual({
+        version: 1,
+        attemptId: "attempt-1",
+        installationId: 12345,
+        repository: "acme/app",
+        prNumber: 42,
+        deadlineAt: REVIEW_FIX_IDENTITY.deadlineAt,
+        githubRunId: 999888,
+        githubRunAttempt: 2,
+        outputCommit: publishedCommit,
+      });
+    });
+
+    it("skips delivery and logs an explicit no-result outcome on a grouping-parent no-op success — never an unmarked Legacy POST for a pilot attempt", async () => {
+      stubReviewFixEnvelope({}, { groupingParent: true });
+      vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+      vi.stubEnv("RUN_TOKEN", "run-token");
+      vi.stubEnv("GITHUB_RUN_ID", "1");
+      vi.stubEnv("GITHUB_RUN_ATTEMPT", "1");
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+      const { pipeline, runner } = makeStepsPipeline([
+        ["push", { run: vi.fn().mockResolvedValue({ prUrl: null, prNumber: null, branchPushed: false, commitSha: null, draft: false }) }],
+      ]);
+
+      const result = await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeMockExecutor(0),
+        fetchImpl: mockFetch,
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(mockFetch).not.toHaveBeenCalled();
+      expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("pilot result delivery skipped"));
+      expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("attempt-1"));
+      errSpy.mockRestore();
+    });
+
+    it("skips delivery and logs an explicit no-result outcome when GITHUB_RUN_ID/GITHUB_RUN_ATTEMPT cannot be parsed — never an unmarked Legacy POST for a pilot attempt", async () => {
+      stubReviewFixEnvelope();
+      vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+      vi.stubEnv("RUN_TOKEN", "run-token");
+      vi.stubEnv("GITHUB_RUN_ID", "");
+      vi.stubEnv("GITHUB_RUN_ATTEMPT", "");
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+      const { pipeline, runner } = makeStepsPipeline([
+        ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true }) }],
+        [
+          "push",
+          {
+            run: vi.fn().mockResolvedValue({
+              prUrl: "https://github.com/acme/app/pull/42",
+              prNumber: 42,
+              branchPushed: true,
+              commitSha: "c".repeat(40),
+              draft: false,
+            }),
+          },
+        ],
+      ]);
+
+      const result = await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeMockExecutor(0),
+        fetchImpl: mockFetch,
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(mockFetch).not.toHaveBeenCalled();
+      expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("pilot result delivery skipped"));
+      errSpy.mockRestore();
+    });
+
+    it("skips delivery and logs an explicit no-result outcome on a caught pipeline failure with no push at all — never an unmarked Legacy POST for a pilot attempt", async () => {
+      stubReviewFixEnvelope();
+      vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+      vi.stubEnv("RUN_TOKEN", "run-token");
+      vi.stubEnv("GITHUB_RUN_ID", "42");
+      vi.stubEnv("GITHUB_RUN_ATTEMPT", "1");
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+      const { pipeline, runner } = makeStepsPipeline([
+        ["setup", { run: vi.fn().mockRejectedValue(new Error("setup exploded before push ran")) }],
+      ]);
+
+      const result = await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeMockExecutor(0),
+        fetchImpl: mockFetch,
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(mockFetch).not.toHaveBeenCalled();
+      expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("pilot result delivery skipped"));
+      errSpy.mockRestore();
+    });
+
+    it("attaches the reviewFix marker on a caught pipeline failure once push already published a commit", async () => {
+      stubReviewFixEnvelope();
+      vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+      vi.stubEnv("RUN_TOKEN", "run-token");
+      vi.stubEnv("GITHUB_RUN_ID", "42");
+      vi.stubEnv("GITHUB_RUN_ATTEMPT", "1");
+
+      const publishedCommit = "d".repeat(40);
+      const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+      const { pipeline, runner } = makeStepsPipeline([
+        [
+          "push",
+          {
+            run: vi.fn().mockResolvedValue({
+              prUrl: "https://github.com/acme/app/pull/42",
+              prNumber: 42,
+              branchPushed: true,
+              commitSha: publishedCommit,
+              draft: false,
+            }),
+          },
+        ],
+        ["post-push-review", { run: vi.fn().mockRejectedValue(new Error("post-push review exploded")) }],
+      ]);
+
+      const result = await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeMockExecutor(0),
+        fetchImpl: mockFetch,
+      });
+
+      expect(result.exitCode).toBe(1);
+      const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
+        outcome: string;
+        reviewFix?: Record<string, unknown>;
+      };
+      expect(body.outcome).toBe("failure");
+      expect(body.reviewFix).toMatchObject({ attemptId: "attempt-1", outputCommit: publishedCommit });
+    });
+
+    it("never attaches a reviewFix marker for a Legacy (non-pilot) dispatch", async () => {
+      vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+      vi.stubEnv("RUN_TOKEN", "run-token");
+
+      const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+      const { pipeline, runner } = makeStepsPipeline([
+        ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true }) }],
+        ["push", { run: vi.fn().mockResolvedValue({ prUrl: "https://github.com/acme/app/pull/1", commitSha: "e".repeat(40) }) }],
+      ]);
+
+      const result = await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeMockExecutor(0),
+        fetchImpl: mockFetch,
+      });
+
+      expect(result.exitCode).toBe(0);
+      const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as Record<string, unknown>;
+      expect(body).not.toHaveProperty("reviewFix");
+    });
   });
 
   it("posts gap-analysis callback phase for PR_NUMBER runs", async () => {
