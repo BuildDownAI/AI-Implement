@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { RestateService } from "../restate/endpoint.js";
 import { restateBindAddress, register, queryNonCompletedInvocations, RESTATE_SERVICES } from "../restate/endpoint.js";
 
 // AII-727: a static pin, unit-tier only. Dropping either service from RESTATE_SERVICES
@@ -111,6 +112,63 @@ describe("register", () => {
     const result = await register({
       adminBaseUrl: "http://127.0.0.1:9070",
       fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({ outcome: "registered-no-force" });
+  });
+
+  it("a success response whose registered service set matches the intended services stays a single no-force call", async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse(200, { id: "dp_1", services: [{ name: "Operator" }, { name: "orchestratorTools" }] }));
+    const result = await register({
+      adminBaseUrl: "http://127.0.0.1:9070",
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      services: [{ name: "Operator" } as RestateService, { name: "orchestratorTools" } as RestateService],
+    });
+
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({ outcome: "registered-no-force" });
+  });
+
+  it("a success response whose registered service set no longer matches the intended services (AII-843) is treated as a conflict — drains then force-registers", async () => {
+    const fetchImpl = vi
+      .fn<(url: string, init: RequestInit) => Promise<Response>>()
+      .mockResolvedValueOnce(jsonResponse(200, { id: "dp_1", services: [{ name: "Operator" }, { name: "orchestratorTools" }] }))
+      .mockResolvedValueOnce(jsonResponse(200, { id: "dp_1" }));
+
+    const result = await register({
+      adminBaseUrl: "http://127.0.0.1:9070",
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      services: [{ name: "orchestratorTools" } as RestateService],
+      queryNonCompletedInvocations: async () => 0,
+    });
+
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    const [, secondInit] = fetchImpl.mock.calls[1];
+    expect(JSON.parse(secondInit.body as string)).toEqual({ uri: "http://127.0.0.1:9080", force: true });
+    expect(result).toEqual({ outcome: "registered-drained-force" });
+  });
+
+  it("a success response whose registered service set no longer matches the intended services, with non-completed invocations still pinned, declines force — no second call", async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse(200, { id: "dp_1", services: [{ name: "Operator" }, { name: "orchestratorTools" }] }));
+
+    const result = await register({
+      adminBaseUrl: "http://127.0.0.1:9070",
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      services: [{ name: "orchestratorTools" } as RestateService],
+      queryNonCompletedInvocations: async () => 1,
+    });
+
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(result.outcome).toBe("declined-conflict");
+  });
+
+  it("a success response with an unrecognized `services` shape is treated as no drift — no escalation", async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse(200, { id: "dp_1", services: "not-an-array" }));
+    const result = await register({
+      adminBaseUrl: "http://127.0.0.1:9070",
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      services: [{ name: "orchestratorTools" } as RestateService],
     });
 
     expect(fetchImpl).toHaveBeenCalledTimes(1);

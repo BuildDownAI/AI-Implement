@@ -148,11 +148,11 @@ describe("queryNonCompletedInvocations against a real pinned 1.7.10 admin API (A
       // states that must block drain, so either is an acceptable stopping point here.
       void callObject(env.baseUrl(), "DrainProbeTest", key, "block", {}).catch(() => {});
       await waitForInvocation(env.adminAPIBaseUrl(), key, "block", ["running", "suspended"]);
-      expect(await queryNonCompletedInvocations(fetch, env.adminAPIBaseUrl(), uri)).toBeGreaterThan(0);
+      expect(await queryNonCompletedInvocations(fetch, env.adminAPIBaseUrl(), uri)).toBe(1);
 
       void callObject(env.baseUrl(), "DrainProbeTest", key, "follow", {}).catch(() => {});
       await waitForInvocation(env.adminAPIBaseUrl(), key, "follow", ["pending"]);
-      expect(await queryNonCompletedInvocations(fetch, env.adminAPIBaseUrl(), uri)).toBeGreaterThan(0);
+      expect(await queryNonCompletedInvocations(fetch, env.adminAPIBaseUrl(), uri)).toBe(2);
       expect(await queryNonCompletedInvocations(fetch, env.adminAPIBaseUrl(), "http://127.0.0.1:1")).toBe(0);
     },
   );

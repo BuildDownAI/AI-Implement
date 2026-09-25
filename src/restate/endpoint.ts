@@ -77,11 +77,30 @@ export type QueryNonCompletedInvocations = (
   uri: string,
 ) => Promise<number | null>;
 
-/** For testing: override the admin API base URL, the fetch implementation, and the drain check. */
+/** For testing: override the admin API base URL, the fetch implementation, the drain check,
+ *  and the intended service set (see `RegisterDeps.services` below). */
 export interface RegisterDeps {
   adminBaseUrl?: string;
   fetchImpl?: typeof fetch;
   queryNonCompletedInvocations?: QueryNonCompletedInvocations;
+  /**
+   * The services this process actually intends to serve at `uri` — defaults to
+   * RESTATE_SERVICES. `register()` compares this against the admin API's already-registered
+   * manifest on every successful no-force call (AII-843): verified directly against the
+   * pinned `@restatedev/restate-server` 1.7.10 platform binary this repo already depends on
+   * (same version string and git commit the pinned Docker image reports — see
+   * queryNonCompletedInvocations()'s own doc for why that substitutes for Docker access), a
+   * no-force `POST /deployments` to an already-registered URI is accepted unconditionally —
+   * HTTP 200/201, no live discovery performed at all — no matter how far the live endpoint's
+   * manifest has drifted from what is on file, including a dropped service with a genuinely
+   * in-flight invocation pinned to it, and even an endpoint that is not reachable at all.
+   * `force: true` is the only path that performs live discovery and applies a changed
+   * manifest. A real META0004 conflict is therefore never produced by re-registering the
+   * same URI in this repo's actual redeploy pattern (a fixed, reused loopback URI), so
+   * `register()` cannot rely on the admin API's HTTP status to signal drift and must detect
+   * it itself from the returned manifest.
+   */
+  services?: RestateService[];
 }
 
 const META0004_CONFLICT = "META0004";
@@ -174,17 +193,22 @@ export async function queryNonCompletedInvocations(
 
 /**
  * Registers the SDK endpoint with the Restate admin API's POST /deployments, once,
- * at boot, without `force`. Verified against the Restate admin API (2026-09-14): an
- * unchanged endpoint at the same URI answers 200/201, which is success — the server
- * does not require a diff for that to happen. A changed service set at the same URI
- * that the server refuses to apply outright answers a META0004 conflict; `force: true`
- * overrides the deployment at that URI and "can lead inflight invocations to an
- * unrecoverable error state" per Restate's own guidance, so `register()` only retries
- * with `force` after confirming zero non-completed invocations on the deployment it
- * would replace, via queryNonCompletedInvocations() above (AII-721) — the self-deploy
- * interlock has already drained them before a redeploy replaces this process, so the
- * check is a guard against calling this function outside that path, not against a race
- * it needs to win. A caller that finds registration declined should retry on a timer
+ * at boot, without `force`. An unchanged endpoint at the same URI answers 200/201, which is
+ * success. A *changed* service set at an already-registered URI, without `force`, also
+ * answers 200/201 on restate-server 1.7.10 (AII-843) — the admin API accepts a repeat
+ * no-force registration of a known URI unconditionally, without re-discovering the live
+ * endpoint, so it never itself reports the META0004 conflict this function was originally
+ * written expecting. `register()` therefore compares the manifest the admin API just
+ * confirmed (`RegisterDeps.services`, see there) against what this process actually intends
+ * to serve, and treats a mismatch the same as a real META0004 conflict (still handled below,
+ * in case a future server version or a different registration path does surface one). Either
+ * way, `force: true` overrides the deployment at that URI and "can lead inflight invocations
+ * to an unrecoverable error state" per Restate's own guidance, so `register()` only retries
+ * with `force` after confirming zero non-completed invocations on the deployment it would
+ * replace, via queryNonCompletedInvocations() above (AII-721) — the self-deploy interlock
+ * has already drained them before a redeploy replaces this process, so the check is a guard
+ * against calling this function outside that path, not against a race it needs to win. A
+ * caller that finds registration declined should retry on a timer
  * (createRestateRegistrationGate, src/index.ts) rather than treat the decline as final.
  * Every path is logged once. Boot never fails on the result: the kg-refresh trigger seam
  * (AII-683) answers 503 restate-unavailable while no successful registration has completed.
@@ -193,6 +217,7 @@ export async function register(deps: RegisterDeps = {}): Promise<RestateRegister
   const adminBaseUrl = deps.adminBaseUrl ?? RESTATE_ADMIN_BASE_URL;
   const fetchImpl = deps.fetchImpl ?? fetch;
   const queryInvocations = deps.queryNonCompletedInvocations ?? queryNonCompletedInvocations;
+  const intendedServices = deps.services ?? RESTATE_SERVICES;
   const { host, port } = restateBindAddress();
   const uri = `http://${host}:${port}`;
 
@@ -206,8 +231,20 @@ export async function register(deps: RegisterDeps = {}): Promise<RestateRegister
   }
 
   if (response.ok) {
-    console.error(`[restate] endpoint registered at ${uri} (no-force, HTTP ${response.status})`);
-    return { outcome: "registered-no-force" };
+    const body = await safeJson(response);
+    const registeredNames = extractServiceNames(body);
+    const intendedNames = intendedServices.map((service) => service.name);
+    if (registeredNames === null || sameNameSet(registeredNames, intendedNames)) {
+      console.error(`[restate] endpoint registered at ${uri} (no-force, HTTP ${response.status})`);
+      return { outcome: "registered-no-force" };
+    }
+    console.error(
+      `[restate] endpoint registration at ${uri} answered success (HTTP ${response.status}) but the ` +
+        `admin API's registered service set [${registeredNames.join(", ")}] no longer matches this ` +
+        `process's own [${intendedNames.join(", ")}] — a no-force re-registration at an already-known ` +
+        "URI does not re-discover on restate-server 1.7.10 (AII-843), so this is treated as a conflict",
+    );
+    return attemptForcedRegistration(fetchImpl, adminBaseUrl, uri, queryInvocations, "service-set mismatch");
   }
 
   const body = await safeJson(response);
@@ -219,27 +256,62 @@ export async function register(deps: RegisterDeps = {}): Promise<RestateRegister
     return { outcome: "unreachable", detail: message };
   }
 
+  return attemptForcedRegistration(fetchImpl, adminBaseUrl, uri, queryInvocations, "META0004 conflict");
+}
+
+/** `RegisterDeps.services`' expected shape from the admin API's own success-response body: a
+ *  `services` array of `{ name, ... }` entries. Returns `null` (treat as "cannot tell, don't
+ *  escalate") on any shape this function doesn't recognize, so a fake or partial test fixture
+ *  that omits `services` entirely (every existing register() fixture, pre-AII-843) keeps its
+ *  original single-call, no-escalation behavior. */
+function extractServiceNames(body: Record<string, unknown> | undefined): string[] | null {
+  if (!body || !Array.isArray(body.services)) return null;
+  const names: string[] = [];
+  for (const entry of body.services) {
+    const name = entry && typeof entry === "object" ? (entry as { name?: unknown }).name : undefined;
+    if (typeof name !== "string") return null;
+    names.push(name);
+  }
+  return names;
+}
+
+function sameNameSet(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) return false;
+  const setA = new Set(a);
+  return b.every((name) => setA.has(name));
+}
+
+/** Shared by both conflict triggers (a real META0004, and the synthetic AII-843 service-set
+ *  mismatch above): confirm the old deployment has drained before forcing, per the doc on
+ *  register() itself. */
+async function attemptForcedRegistration(
+  fetchImpl: typeof fetch,
+  adminBaseUrl: string,
+  uri: string,
+  queryInvocations: QueryNonCompletedInvocations,
+  reason: string,
+): Promise<RestateRegisterResult> {
   let nonCompleted: number | null;
   try {
     nonCompleted = await queryInvocations(fetchImpl, adminBaseUrl, uri);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error(
-      `[restate] endpoint registration conflict at ${uri} — invocation query threw (${message}), declining force`,
+      `[restate] endpoint registration ${reason} at ${uri} — invocation query threw (${message}), declining force`,
     );
     return { outcome: "declined-conflict", detail: "invocation count unknown" };
   }
 
   if (nonCompleted === null) {
     console.error(
-      `[restate] endpoint registration conflict at ${uri} — could not determine non-completed invocations on the old deployment, declining force`,
+      `[restate] endpoint registration ${reason} at ${uri} — could not determine non-completed invocations on the old deployment, declining force`,
     );
     return { outcome: "declined-conflict", detail: "invocation count unknown" };
   }
 
   if (nonCompleted > 0) {
     console.error(
-      `[restate] endpoint registration conflict at ${uri} — ${nonCompleted} non-completed invocation(s) on the old deployment, declining force`,
+      `[restate] endpoint registration ${reason} at ${uri} — ${nonCompleted} non-completed invocation(s) on the old deployment, declining force`,
     );
     return { outcome: "declined-conflict", detail: `${nonCompleted} non-completed invocation(s)` };
   }

@@ -33,8 +33,9 @@ import { createEndpointHandler } from "@restatedev/restate-sdk/node";
 import { RestateContainer } from "@restatedev/restate-sdk-testcontainers";
 import { TestContainers } from "testcontainers";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import type { RestateService } from "../../restate/endpoint.js";
 import { RESTATE_SERVICES, register, restateBindAddress, startRestateEndpoint } from "../../restate/endpoint.js";
-import { operatorObject } from "../../restate/operator-object.js";
+import { orchestratorTools } from "../../restate/tools.js";
 import * as dedup from "../../dedup.js";
 import { initSettingsTable } from "../../runner-mode.js";
 import { RESTATE_IMAGE_VERSION, callObject, callService } from "./harness.js";
@@ -68,6 +69,39 @@ async function waitForPartitionsReady(adminBaseUrl: string, timeoutMs = 60_000):
   throw new Error(`Restate admin API partitions not ready after ${timeoutMs}ms`);
 }
 
+interface InvocationStatusRow {
+  status: string;
+}
+
+/**
+ * Polls the admin API for the `refresh` invocation's own recorded status, rather than a
+ * fixed delay (AII-843): register()'s conflict/drain decision, and the assertions below that
+ * depend on the invocation genuinely being in flight, race a fixed sleep under CI load. This
+ * mirrors `waitForInvocation` in endpoint-registration.restate.test.ts, inlined here since
+ * that helper is scoped to the `DrainProbeTest` fixture, not `Operator`.
+ */
+async function waitForRefreshRunning(adminBaseUrl: string, key: string, timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  let lastRows: InvocationStatusRow[] = [];
+  while (Date.now() < deadline) {
+    const response = await fetch(`${adminBaseUrl}/query`, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json" },
+      body: JSON.stringify({
+        query:
+          "SELECT status FROM sys_invocation WHERE target_service_name = 'Operator' AND " +
+          `target_service_key = '${key}' AND target_handler_name = 'refresh'`,
+      }),
+    });
+    if (!response.ok) throw new Error(`POST /query failed: HTTP ${response.status}`);
+    const body = (await response.json()) as { rows: InvocationStatusRow[] };
+    lastRows = body.rows;
+    if (body.rows.some((row) => row.status === "running" || row.status === "suspended")) return;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(`Operator/${key}/refresh did not reach running or suspended: ${JSON.stringify(lastRows)}`);
+}
+
 /**
  * Rewrites the one literal `realHostPort` substring in an outgoing request body to
  * `tunnelHostPort` — see the file header for why register()'s own `uri` and this process's
@@ -92,6 +126,20 @@ describe("startRestateEndpoint() / register() against a real server 1.7.10 (AII-
   let adminBaseUrl: string;
   let ingressBaseUrl: string;
   let registerFetch: typeof fetch;
+
+  /**
+   * Replaces this process's own SDK endpoint with a different service set at the same
+   * port/URI — mirrors harness.ts's replaceEndpoint(), inlined here since there is no
+   * RestateTestEnvironment to attach it to in this file.
+   */
+  async function swapEndpoint(services: RestateService[]): Promise<void> {
+    server.close();
+    server = http2.createServer(createEndpointHandler({ services }));
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(port, bindHost, resolve);
+    });
+  }
 
   beforeAll(async () => {
     dedup.getDb();
@@ -179,7 +227,12 @@ describe("startRestateEndpoint() / register() against a real server 1.7.10 (AII-
 
       // A genuinely in-flight, non-completed invocation against that deployment — held open
       // by the refresh test seam (AII-727, src/restate/operator-object.ts's sleepMs), not a
-      // fake — so queryNonCompletedInvocations() has something real to count.
+      // fake — so queryNonCompletedInvocations() has something real to count. It targets
+      // Operator specifically: the swap below must make Operator itself — the service this
+      // invocation is pinned to — absent from the proposed deployment (AII-843). The original
+      // version of this test dropped the unrelated, uninvoked orchestratorTools service
+      // instead; nothing was pinned to what it removed, so the real admin API accepted the
+      // change outright (registered-no-force) rather than declining it.
       const key = randomUUID();
       const hash = sha256(randomUUID());
       await callObject(ingressBaseUrl, "Operator", key, "issue", {
@@ -191,28 +244,57 @@ describe("startRestateEndpoint() / register() against a real server 1.7.10 (AII-
       });
       const sleepMs = 8_000;
       const inFlight = callObject(ingressBaseUrl, "Operator", key, "refresh", { presentedHash: hash, sleepMs });
-      // Give the exclusive invocation a moment to be admitted and start sleeping before the
-      // swap below, so it is genuinely non-completed by the time register() queries for it.
-      await new Promise((resolve) => setTimeout(resolve, 1_000));
+      // Attach a handler immediately: an assertion below can throw before this settles (e.g.
+      // if `declined` below is not what's expected), and its eventual settlement during
+      // afterAll's teardown must not also surface as an unhandled rejection (AII-843).
+      inFlight.catch(() => {});
 
-      // Swap this process's own SDK endpoint for a changed service set at the same URI —
-      // mirrors harness.ts's replaceEndpoint(), inlined here since there is no
-      // RestateTestEnvironment to attach it to in this file.
-      server.close();
-      server = http2.createServer(createEndpointHandler({ services: [operatorObject] }));
-      await new Promise<void>((resolve, reject) => {
-        server.once("error", reject);
-        server.listen(port, bindHost, resolve);
-      });
+      // Wait for the invocation to actually be recorded as running/suspended against the old
+      // deployment, rather than a fixed delay that could race register()'s own drain query
+      // below (AII-843).
+      await waitForRefreshRunning(adminBaseUrl, key);
 
-      const declined = await register({ adminBaseUrl, fetchImpl: registerFetch });
+      // Swap this process's own SDK endpoint for a changed service set at the same URI: drop
+      // Operator — the service the in-flight invocation above is pinned to — keeping only
+      // orchestratorTools, so the proposed deployment is genuinely incompatible with that
+      // active invocation.
+      await swapEndpoint([orchestratorTools]);
+
+      // AII-843: a no-force POST /deployments to an already-registered URI is accepted
+      // unconditionally on restate-server 1.7.10 — HTTP 200, no live discovery performed at
+      // all — no matter how far the live endpoint has drifted from the stored manifest,
+      // including this exact case (an actively-invoked service dropped entirely). Confirmed
+      // directly against the pinned `@restatedev/restate-server` 1.7.10 platform binary this
+      // repo already depends on (same version string and git commit the pinned Docker image
+      // reports), across dropping the actively-invoked service, dropping an idle one, a fully
+      // unreachable endpoint, and an incompatible handler-type swap — every one of them still
+      // answered success. `register()` (src/restate/endpoint.ts) therefore no longer waits for
+      // the admin API to report a META0004 conflict on its own: it compares the manifest the
+      // admin API just confirmed against `RegisterDeps.services` (defaulting to
+      // RESTATE_SERVICES; passed explicitly here as the post-swap set, since the module-level
+      // default no longer reflects what this test's swapped endpoint actually serves) and
+      // treats a mismatch the same as a real conflict, before running the same drain check and
+      // force-escalation this function already had. That is what actually produces
+      // `declined-conflict` below, then `registered-drained-force` once the invocation drains.
+      const declined = await register({ adminBaseUrl, fetchImpl: registerFetch, services: [orchestratorTools] });
       expect(declined.outcome).toBe("declined-conflict");
+
+      // Restore Operator at the same URI before awaiting the in-flight call: a declined
+      // attempt changes nothing server-side, so the admin API still expects the original
+      // full manifest here, and the invocation can only be delivered its resume if Operator
+      // is actually being served when its sleep ends (confirmed above: with Operator left
+      // absent, the engine retries the redelivery indefinitely rather than failing fast).
+      await swapEndpoint(RESTATE_SERVICES);
 
       // Let the in-flight invocation complete — the old deployment now has zero
       // non-completed invocations pinned to it.
       await inFlight;
 
-      const forced = await register({ adminBaseUrl, fetchImpl: registerFetch });
+      // Swap to the changed service set again: this is what the subsequent force-registration
+      // attempt should now be able to apply, since nothing is pinned to Operator anymore.
+      await swapEndpoint([orchestratorTools]);
+
+      const forced = await register({ adminBaseUrl, fetchImpl: registerFetch, services: [orchestratorTools] });
       expect(forced).toEqual({ outcome: "registered-drained-force" });
     },
     45_000,
