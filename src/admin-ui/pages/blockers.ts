@@ -15,7 +15,7 @@ export const blockersHtml = `
     <div class="kpi-grid" id="blockers-kpis" hidden>
       <div class="kpi"><div class="kpi-label">Total blocked</div><div class="kpi-value" id="kpi-blocked-total">0</div></div>
       <div class="kpi"><div class="kpi-label">Teams affected</div><div class="kpi-value" id="kpi-blocked-teams">0</div></div>
-      <div class="kpi"><div class="kpi-label">By concurrency cap</div><div class="kpi-value" id="kpi-blocked-concurrency">0</div></div>
+      <div class="kpi"><div class="kpi-label">Teams at cap</div><div class="kpi-value" id="kpi-blocked-concurrency">0</div></div>
       <div class="kpi"><div class="kpi-label">By dedup</div><div class="kpi-value" id="kpi-blocked-dedup">0</div></div>
     </div>
 
@@ -74,10 +74,20 @@ export const blockersScript = `
     }
   }
 
-  function renderKpis(totals) {
+  // Teams at capacity, sourced from the same reservation-backed capacityByMapping
+  // projection overview.ts reads off this same /api/blockers response — never
+  // recomputed from a tracker label or the job log, so the two pages agree by
+  // construction. A missing/malformed projection renders unavailable, never 0.
+  function renderKpis(totals, capacityByMapping) {
     document.getElementById('kpi-blocked-total').textContent = totals.issues;
     document.getElementById('kpi-blocked-teams').textContent = totals.teams;
-    document.getElementById('kpi-blocked-concurrency').textContent = totals.byReason.concurrency ?? 0;
+    const concurrencyEl = document.getElementById('kpi-blocked-concurrency');
+    if (!capacityByMapping) {
+      concurrencyEl.textContent = '—';
+    } else {
+      const atCapCount = Object.values(capacityByMapping).filter(function (c) { return c.used >= c.cap; }).length;
+      concurrencyEl.textContent = String(atCapCount);
+    }
     document.getElementById('kpi-blocked-dedup').textContent = totals.byReason.dedup ?? 0;
     document.getElementById('blockers-kpis').hidden = false;
   }
@@ -95,13 +105,20 @@ export const blockersScript = `
   async function loadBlockers() {
     const errorEl = document.getElementById('blockers-error');
     errorEl.hidden = true;
-    const res = await window.api('/api/blockers');
-    if (!res.ok) {
-      let errorMsg = 'Unknown error';
-      try {
-        const errBody = await res.json();
-        errorMsg = errBody.error || errorMsg;
-      } catch (_) { /* ignore parse errors */ }
+    let res;
+    try {
+      res = await window.api('/api/blockers');
+    } catch (_) {
+      res = null;
+    }
+    if (!res || !res.ok) {
+      let errorMsg = 'Capacity data unavailable';
+      if (res) {
+        try {
+          const errBody = await res.json();
+          errorMsg = errBody.error || errorMsg;
+        } catch (_) { /* ignore parse errors */ }
+      }
       errorEl.innerHTML = '<div style="flex:1"><div class="alert-title">Failed to load blockers</div><div class="alert-desc">' + window.esc(errorMsg) + '</div></div>';
       errorEl.hidden = false;
       document.getElementById('blockers-kpis').hidden = true;
@@ -111,7 +128,10 @@ export const blockersScript = `
       return;
     }
     const data = await res.json();
-    renderKpis(data.totals);
+    const capacityByMapping = data && typeof data.capacityByMapping === 'object' && data.capacityByMapping !== null
+      ? data.capacityByMapping
+      : null;
+    renderKpis(data.totals, capacityByMapping);
     renderRows(data.blockers);
     renderSubtitle(data.blockers, data.totals);
   }
