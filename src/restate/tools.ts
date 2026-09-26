@@ -681,7 +681,7 @@ export const addProjectArgsSchema = z.object({
     "Which reviewers run on this project's PRs. Omit to keep the stored value; pass null to reset to the default (gap-analysis and code-review, both gating).",
   ),
   trustedReviewAuthors: z.array(z.string()).nullable().optional().describe(
-    "Extra GitHub logins trusted as review authors for this project, additive to the built-in trusted authors (github-actions[bot] and the Claude logins). Omit to keep the stored value; pass null to reset to built-ins only.",
+    "Extra GitHub logins trusted as review authors for this project, additive to the built-in trusted authors (ai-implement, ai-implement[bot], and the Claude logins — github-actions[bot] is trusted separately). Omit to keep the stored value; pass null to reset to built-ins only.",
   ),
 });
 
