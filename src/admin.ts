@@ -167,6 +167,38 @@ function validReviewerMaxTurns(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 200;
 }
 
+const TRUSTED_REVIEW_AUTHOR_RE = /^[a-z0-9][a-z0-9-]*(\[bot\])?$/;
+
+function normalizeTrustedReviewAuthors(raw: unknown): string[] | null {
+  if (raw === null || raw === undefined) return null;
+  if (!Array.isArray(raw)) {
+    throw new Error("must be an array of strings or null");
+  }
+  if (raw.length > 20) {
+    throw new Error(`too many entries (${raw.length}); maximum is 20`);
+  }
+  const seen = new Set<string>();
+  const result: string[] = [];
+  raw.forEach((entry, index) => {
+    if (typeof entry !== "string") {
+      throw new Error(`[${index}] must be a string`);
+    }
+    const normalized = entry.trim().toLowerCase();
+    if (normalized.length === 0) {
+      throw new Error(`[${index}] must not be empty`);
+    }
+    if (!TRUSTED_REVIEW_AUTHOR_RE.test(normalized)) {
+      throw new Error(`[${index}] "${entry}" is not a valid GitHub login`);
+    }
+    if (seen.has(normalized)) {
+      throw new Error(`duplicate entry "${normalized}"`);
+    }
+    seen.add(normalized);
+    result.push(normalized);
+  });
+  return result.length > 0 ? result : null;
+}
+
 let _adminJiraClient: JiraClient | null = null;
 function getAdminJiraClient(): JiraClient | null {
   if (_adminJiraClient) return _adminJiraClient;
@@ -2397,6 +2429,7 @@ export interface UpsertMappingBody {
   dependencyTokenScope?: string | null;
   reviewers?: unknown;
   prDispatchBudget?: number | null;
+  trustedReviewAuthors?: unknown;
 }
 
 export function upsertMappingAction(
@@ -2603,6 +2636,21 @@ export function upsertMappingAction(
     }
   }
 
+  let trustedReviewAuthors: string[] | null;
+  if (body.trustedReviewAuthors === undefined) {
+    // Preserve stored value on omit — a PATCH-style save must not silently strip a project's trusted-author grant.
+    trustedReviewAuthors = existingMapping?.trustedReviewAuthors ?? null;
+  } else if (body.trustedReviewAuthors === null) {
+    // Explicit null resets to the NULL default (built-ins only), mirroring reviewers above.
+    trustedReviewAuthors = null;
+  } else {
+    try {
+      trustedReviewAuthors = normalizeTrustedReviewAuthors(body.trustedReviewAuthors);
+    } catch (err) {
+      return { status: 400, body: { error: `trustedReviewAuthors invalid: ${err instanceof Error ? err.message : String(err)}` } };
+    }
+  }
+
   const mapping: RepoMapping = {
     owner: body.owner,
     repo: body.repo,
@@ -2639,6 +2687,7 @@ export function upsertMappingAction(
     memoryProviderId: existingMapping?.memoryProviderId ?? null,
     reviewers,
     prDispatchBudget,
+    trustedReviewAuthors,
   };
 
   upsertMapping(body.teamKey, mapping);
