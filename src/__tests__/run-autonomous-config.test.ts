@@ -561,4 +561,61 @@ describe("resolveRunnerInputs", () => {
       expect(inputs.reviewers).toEqual(DEFAULT_REVIEWER_SELECTION);
     });
   });
+
+  describe("(k) reviewFix", () => {
+    const validReviewFix = {
+      version: 1 as const,
+      attemptId: "attempt-1",
+      installationId: 123,
+      repository: "acme/widgets",
+      prNumber: 42,
+      deadlineAt: Date.parse("2026-01-01T00:00:00.000Z"),
+    };
+
+    it("mirrors the envelope's reviewFix when present", () => {
+      const env = {
+        AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig({
+          v: 1,
+          issue: { id: "e", identifier: "AII-9", title: "t", description: "d" },
+          reviewFix: validReviewFix,
+        }),
+        ...BASE_ENV,
+      };
+      const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
+      expect(inputs.reviewFix).toEqual(validReviewFix);
+    });
+
+    it("is undefined when the envelope omits reviewFix", () => {
+      const env = {
+        AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig({
+          v: 1,
+          issue: { id: "e", identifier: "AII-9", title: "t", description: "d" },
+        }),
+        ...BASE_ENV,
+      };
+      const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
+      expect(inputs.reviewFix).toBeUndefined();
+    });
+
+    it("is undefined in legacy-env mode (no env-var equivalent)", () => {
+      const env = {
+        ISSUE_ID: "i", ISSUE_IDENTIFIER: "AII-1", ISSUE_TITLE: "t", ISSUE_DESCRIPTION: "d",
+        ...BASE_ENV,
+      };
+      const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
+      expect(inputs.reviewFix).toBeUndefined();
+    });
+
+    it("throws (fails closed) when the envelope's reviewFix is malformed, never falling back to Legacy", () => {
+      const env = {
+        AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig({
+          v: 1,
+          issue: { id: "e", identifier: "AII-9", title: "t", description: "d" },
+          reviewFix: { ...validReviewFix, installationId: -1 } as never,
+        }),
+        ...BASE_ENV,
+      };
+      expect(() => resolveRunnerInputs(env as NodeJS.ProcessEnv)).toThrow(/reviewFix/);
+    });
+  });
 });

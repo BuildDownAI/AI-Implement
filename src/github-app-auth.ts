@@ -5,12 +5,12 @@ import { defaultFetchSignal } from "./github.js";
 export interface InstallationDetails {
   token: string;
   expiresAt: number; // Epoch milliseconds; 0 when GitHub omits a valid expiry.
-  installationId: number; // Currently inert — no caller reads this yet. Reserved for an OAuth follow-up (if approved), which will add a repo to a "selected repositories" install via the API and needs the installation id to target it
+  installationId: number;
   repositorySelection: "all" | "selected";
 }
 
-// Cache: owner → { token, expiresAt }
-const tokenCache = new Map<string, { token: string; expiresAt: number }>();
+// Cache the installation identity with the token so admission and dispatch use the same install.
+const tokenCache = new Map<string, { token: string; expiresAt: number; installationId: number }>();
 // Cache: scopedCacheKey(owner, options) → { token, real expiresAt (ISO), staleAt (cache cutoff, ms) }
 const scopedTokenCache = new Map<string, { token: string; expiresAt: string; staleAt: number }>();
 let cachedAppSlug: string | null = null;
@@ -375,6 +375,18 @@ export async function getInstallationToken(
   return refreshInstallationToken(appId, privateKey, owner);
 }
 
+/** Return the numeric GitHub installation identity used by PR-scoped admission. */
+export async function getInstallationId(
+  appId: string,
+  privateKey: string,
+  owner: string,
+): Promise<number> {
+  const cached = tokenCache.get(owner);
+  if (cached && Date.now() < cached.expiresAt) return cached.installationId;
+  await refreshInstallationToken(appId, privateKey, owner);
+  return tokenCache.get(owner)!.installationId;
+}
+
 /**
  * Mint and cache a new installation token even when an older cached token is
  * still within the dispatch cache window. Runner vending uses this path so a
@@ -385,9 +397,9 @@ export async function refreshInstallationToken(
   privateKey: string,
   owner: string,
 ): Promise<string> {
-  const { token, expiresAt } = await getInstallation(appId, privateKey, owner);
+  const { token, expiresAt, installationId } = await getInstallation(appId, privateKey, owner);
   const cacheExpiry = expiresAt > 0 ? expiresAt - 5 * 60 * 1000 : Date.now() + TOKEN_CACHE_TTL_MS;
-  tokenCache.set(owner, { token, expiresAt: cacheExpiry });
+  tokenCache.set(owner, { token, expiresAt: cacheExpiry, installationId });
   return token;
 }
 

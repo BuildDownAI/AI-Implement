@@ -3,6 +3,7 @@ import {
   buildDockerEnvFileContent,
   buildDockerRunArgs,
   buildLocalRunnerEnv,
+  startLocalRunnerContainer,
   selectSweepableContainers,
   splitLocalRunnerEnv,
 } from "../local-docker.js";
@@ -189,7 +190,7 @@ describe("buildLocalRunnerEnv", () => {
         ...baseInput,
         extraEnv: { AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(runConfig) },
       });
-      const decoded = decodeRunConfig(env.AI_IMPLEMENT_RUN_CONFIG) as Record<string, unknown>;
+      const decoded = decodeRunConfig(env.AI_IMPLEMENT_RUN_CONFIG) as unknown as Record<string, unknown>;
       expect(decoded.SESSION_TOKEN).toBeUndefined();
       expect(decoded.GITHUB_TOKEN).toBeUndefined();
       expect(decoded.ANTHROPIC_API_KEY).toBeUndefined();
@@ -220,6 +221,17 @@ describe("buildDockerRunArgs", () => {
     expect(args).not.toContain("LINEAR_API_KEY=lin_api_test");
     expect(args).not.toContain("ANTHROPIC_API_KEY=sk-ant-test");
     expect(args.at(-1)).toBe("ai-implement-runner:local");
+  });
+});
+
+describe("startLocalRunnerContainer", () => {
+  it("calls the launch marker only after local preparation succeeds", async () => {
+    let marked = false;
+    await expect(startLocalRunnerContainer({
+      ...baseInput,
+      onBeforeLaunch: () => { marked = true; throw new Error("stop before docker"); },
+    })).rejects.toThrow("stop before docker");
+    expect(marked).toBe(true);
   });
 });
 

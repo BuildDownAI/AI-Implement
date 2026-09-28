@@ -89,3 +89,48 @@ for (const file of files) {
     });
   });
 }
+
+for (const file of files.slice(0, 2)) {
+  describe(`${file} review-fix correlation`, () => {
+    const workflow = parse(readFileSync(file, "utf8"));
+    const steps = workflow.jobs.implement.steps;
+    const validate = steps.find((step: { name: string }) => step.name === "Validate attempt correlation");
+
+    function execute(reviewFix: unknown, attemptToken: string) {
+      const config = { v: 1, issue: { id: "issue-1", identifier: "AII-782", title: "test", description: "" },
+        ...(reviewFix === undefined ? {} : { reviewFix }) };
+      return spawnSync("sh", ["-e", "-c", validate.run], {
+        env: {
+          PATH: process.env.PATH,
+          RUN_CONFIG: Buffer.from(JSON.stringify(config)).toString("base64"),
+          RUN_ATTEMPT_TOKEN: attemptToken,
+        },
+        encoding: "utf8",
+      });
+    }
+
+    const valid = { version: 1, attemptId: "attempt-782", installationId: 12,
+      repository: "BuildDownAI/AI-Implement", prNumber: 42, deadlineAt: 1_800_000_000_000 };
+
+    it("accepts legacy dispatches and exact pilot identity before exposing the envelope", () => {
+      expect(execute(undefined, "").status).toBe(0);
+      expect(execute(valid, valid.attemptId).status).toBe(0);
+      expect(steps.indexOf(validate)).toBeGreaterThan(0);
+      expect(steps.indexOf(validate)).toBeLessThan(steps.findIndex((step: { name: string }) => step.name === "Print dispatch inputs"));
+    });
+
+    it("rejects mismatched, malformed, and unsupported pilot markers without echoing their contents", () => {
+      for (const [metadata, token] of [
+        [valid, "other-attempt"], [undefined, "attempt-782"],
+        [{ ...valid, attemptId: "attempt-782; echo private-sentinel" }, "attempt-782"],
+        [{ ...valid, version: 2 }, "attempt-782"],
+        [{ ...valid, deadlineAt: "tomorrow" }, "attempt-782"],
+      ] as const) {
+        const result = execute(metadata, token);
+        expect(result.status).not.toBe(0);
+        expect(result.stdout).not.toContain("private-sentinel");
+        expect(result.stderr).not.toContain("private-sentinel");
+      }
+    });
+  });
+}

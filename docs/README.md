@@ -12,6 +12,7 @@ Two tiers, distinguished by what a file *is* rather than what it covers.
 |----------|--------|
 | [pipeline-architecture.md](pipeline-architecture.md) | The step contract, the built-in steps, how `applyWiring` supplies inputs, and how a fork overrides steps or the pipeline |
 | [review-fix-rail.md](review-fix-rail.md) | The finding ledger, the four `review_*` tables, the webhook events that feed the fix queue, and the drain loop |
+| [restate-review-fix-pilot.md](restate-review-fix-pilot.md) | Pilot setup, attempt recovery, drain and rollback procedures, automated evidence and remaining SAN checks |
 | [feature-branch-grouping.md](feature-branch-grouping.md) | Parent/child issue grouping, cascade branch creation, and automatic roll-up |
 | [workflow-envelope.md](workflow-envelope.md) | The `RunConfigV1` dispatch envelope and the legacy per-field contract |
 | [runner-images.md](runner-images.md) | The image resolution ladder, publishing channels, and why a private image constrains the execution mode |

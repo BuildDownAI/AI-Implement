@@ -9,6 +9,8 @@ import type * as ConfigModule from "../config.js";
 import type * as IndexModule from "../index.js";
 import type * as ReviewFixQueueModule from "../review-fix-queue.js";
 import type * as LocalGapfillModule from "../local-gapfill.js";
+import type * as AdmissionModule from "../dispatch-admission.js";
+import type * as RestateStatusModule from "../restate/status.js";
 import type { RepoMapping } from "../config.js";
 import type { TicketIssue } from "../providers/types.js";
 
@@ -28,6 +30,7 @@ vi.mock("../local-gapfill.js", async (importOriginal) => {
 
 const githubAppAuthMocks = vi.hoisted(() => ({
   getInstallationToken: vi.fn<(appId: string, privateKey: string, owner: string) => Promise<string>>(),
+  getInstallationId: vi.fn<(appId: string, privateKey: string, owner: string) => Promise<number>>(),
 }));
 
 vi.mock("../github-app-auth.js", async (importOriginal) => {
@@ -35,6 +38,7 @@ vi.mock("../github-app-auth.js", async (importOriginal) => {
   return {
     ...actual,
     getInstallationToken: githubAppAuthMocks.getInstallationToken,
+    getInstallationId: githubAppAuthMocks.getInstallationId,
   };
 });
 
@@ -45,6 +49,8 @@ let breaker: typeof BreakerModule;
 let configModule: typeof ConfigModule;
 let indexModule: typeof IndexModule;
 let reviewFixQueue: typeof ReviewFixQueueModule;
+let admission: typeof AdmissionModule;
+let restateStatus: typeof RestateStatusModule;
 
 // processReviewFixQueue only reads githubAppId/githubAppPrivateKey (forwarded verbatim to the
 // mocked getInstallationToken) off this config in the paths these tests exercise.
@@ -100,6 +106,7 @@ function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
     dependencyTokenScope: null,
     memoryProviderId: null,
     reviewers: null,
+    reviewFixLifecycle: null,
     ...overrides,
   };
 }
@@ -126,6 +133,8 @@ beforeEach(async () => {
   breaker = await import("../dispatch-breaker.js");
   configModule = await import("../config.js");
   reviewFixQueue = await import("../review-fix-queue.js");
+  admission = await import("../dispatch-admission.js");
+  restateStatus = await import("../restate/status.js");
   indexModule = await import("../index.js");
 
   dedup.getDb();
@@ -134,6 +143,7 @@ beforeEach(async () => {
   configModule.initMappingsTable();
 
   githubAppAuthMocks.getInstallationToken.mockResolvedValue("gh-token");
+  githubAppAuthMocks.getInstallationId.mockResolvedValue(778899);
   findByKeyMock.mockReset();
   findByKeyMock.mockResolvedValue(null);
   localGapfillMocks.dispatchLocalGapfill.mockResolvedValue({
@@ -155,11 +165,82 @@ afterEach(() => {
     /* ignore */
   }
   delete process.env.RUNNER_MODE;
+  restateStatus.resetRestateStatus();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
   localGapfillMocks.dispatchLocalGapfill.mockReset();
   githubAppAuthMocks.getInstallationToken.mockReset();
+  githubAppAuthMocks.getInstallationId.mockReset();
   trackerPostCommentMock.mockClear();
+});
+
+describe("processReviewFixQueue — owner selection", () => {
+  function queueOne(): number {
+    return reviewFixQueue.enqueueReviewFix({ issueId: "issue-pilot", issueIdentifier: "AII-42",
+      repo: "acme/billing", prNumber: 42, reason: "review_feedback", sourceEventId: "event-pilot" });
+  }
+
+  it("signals the durable inbox for selected automatic GHA work and leaves Legacy dispatch inert", async () => {
+    process.env.RUNNER_MODE = "gha";
+    configModule.upsertMapping("TEAM", makeMapping({ reviewFixLifecycle: "restate" }));
+    restateStatus.setRestateStatus({ sidecar: { state: "ready" }, registration: { state: "registered" } });
+    const queueId = queueOne();
+    const pilotConfig = { ...mockConfig, runnerCallbackBaseUrl: "https://callback.example",
+      runnerTokenSecret: "test-secret" };
+
+    await indexModule.processReviewFixQueue(pilotConfig, mockRegistry);
+
+    expect(reviewFixQueue.getPendingReviewFixes().map((item) => item.id)).toContain(queueId);
+    expect(localGapfillMocks.dispatchLocalGapfill).not.toHaveBeenCalled();
+    expect((dedup.getDb().prepare("SELECT COUNT(*) AS n FROM dispatch_admissions").get() as { n: number }).n).toBe(0);
+    const rows = dedup.getDb().prepare("SELECT kind, authenticated_source FROM review_fix_inbox").all() as
+      Array<{ kind: string; authenticated_source: string }>;
+    expect(rows).toEqual([{ kind: "feedback", authenticated_source: "review-fix-queue" }]);
+  });
+
+  it("keeps selected work pending when registration or the runner mode is unavailable", async () => {
+    process.env.RUNNER_MODE = "gha";
+    configModule.upsertMapping("TEAM", makeMapping({ reviewFixLifecycle: "restate" }));
+    queueOne();
+    const pilotConfig = { ...mockConfig, runnerCallbackBaseUrl: "https://callback.example",
+      runnerTokenSecret: "test-secret" };
+    await indexModule.processReviewFixQueue(pilotConfig, mockRegistry);
+    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(1);
+    expect((dedup.getDb().prepare("SELECT COUNT(*) AS n FROM review_fix_inbox").get() as { n: number }).n).toBe(0);
+
+    restateStatus.setRestateStatus({ sidecar: { state: "ready" }, registration: { state: "registered" } });
+    process.env.RUNNER_MODE = "fly";
+    await indexModule.processReviewFixQueue(pilotConfig, mockRegistry);
+    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(1);
+    expect((dedup.getDb().prepare("SELECT COUNT(*) AS n FROM review_fix_inbox").get() as { n: number }).n).toBe(0);
+  });
+
+  it("keeps a local review-fix run on Legacy even when the project selects Restate for GHA", async () => {
+    process.env.RUNNER_MODE = "local";
+    configModule.upsertMapping("TEAM", makeMapping({ reviewFixLifecycle: "restate" }));
+    restateStatus.setRestateStatus({ sidecar: { state: "ready" }, registration: { state: "registered" } });
+    queueOne();
+
+    await indexModule.processReviewFixQueue(mockConfig, mockRegistry);
+
+    expect(localGapfillMocks.dispatchLocalGapfill).toHaveBeenCalledTimes(1);
+    expect((dedup.getDb().prepare("SELECT COUNT(*) AS n FROM review_fix_inbox").get() as { n: number }).n).toBe(0);
+  });
+
+  it("retires selected automatic feedback when GitHub confirms the PR is closed", async () => {
+    process.env.RUNNER_MODE = "gha";
+    configModule.upsertMapping("TEAM", makeMapping({ reviewFixLifecycle: "restate" }));
+    restateStatus.setRestateStatus({ sidecar: { state: "ready" }, registration: { state: "registered" } });
+    queueOne();
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ merged: false, state: "closed", head: { ref: "branch" } })));
+    const pilotConfig = { ...mockConfig, runnerCallbackBaseUrl: "https://callback.example",
+      runnerTokenSecret: "test-secret" };
+
+    await indexModule.processReviewFixQueue(pilotConfig, mockRegistry);
+
+    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(0);
+    expect((dedup.getDb().prepare("SELECT COUNT(*) AS n FROM review_fix_inbox").get() as { n: number }).n).toBe(0);
+  });
 });
 
 describe("processReviewFixQueue — dispatch gate", () => {
@@ -291,6 +372,53 @@ describe("processReviewFixQueue — dispatch gate", () => {
     expect(localGapfillMocks.dispatchLocalGapfill).toHaveBeenCalledTimes(1);
     const pending = reviewFixQueue.getPendingReviewFixes();
     expect(pending).toHaveLength(0);
+  });
+
+  it("keeps a review fix pending when GitHub cannot confirm the PR is open", async () => {
+    configModule.upsertMapping("TEAM", makeMapping());
+    const queueId = reviewFixQueue.enqueueReviewFix({
+      issueId: "issue-unknown-pr",
+      issueIdentifier: "AII-999",
+      repo: "acme/billing",
+      prNumber: 42,
+      reason: "late review comment",
+    });
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: false, status: 503 }) as Response));
+
+    await indexModule.processReviewFixQueue(mockConfig, mockRegistry);
+
+    expect(localGapfillMocks.dispatchLocalGapfill).not.toHaveBeenCalled();
+    expect(reviewFixQueue.getPendingReviewFixes()).toMatchObject([{ id: queueId, status: "pending" }]);
+
+    stubOpenPrLookup();
+    await indexModule.processReviewFixQueue(mockConfig, mockRegistry);
+    expect(localGapfillMocks.dispatchLocalGapfill).toHaveBeenCalledTimes(1);
+    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(0);
+  });
+
+  it("keeps a review fix pending through a PR-state network failure, then skips it if merged", async () => {
+    configModule.upsertMapping("TEAM", makeMapping());
+    const queueId = reviewFixQueue.enqueueReviewFix({
+      issueId: "issue-network-failure",
+      issueIdentifier: "AII-998",
+      repo: "acme/billing",
+      prNumber: 42,
+      reason: "late review comment",
+    });
+    vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("connection reset"); }));
+
+    await indexModule.processReviewFixQueue(mockConfig, mockRegistry);
+
+    expect(localGapfillMocks.dispatchLocalGapfill).not.toHaveBeenCalled();
+    expect(reviewFixQueue.getPendingReviewFixes()).toMatchObject([{ id: queueId, status: "pending" }]);
+
+    vi.stubGlobal("fetch", vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ merged: true, state: "closed", head: { ref: "old-branch" } }),
+    }) as Response));
+    await indexModule.processReviewFixQueue(mockConfig, mockRegistry);
+    expect(localGapfillMocks.dispatchLocalGapfill).not.toHaveBeenCalled();
+    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(0);
   });
 });
 
@@ -531,9 +659,12 @@ describe("guardOpenPrBeforeImplementationDispatch", () => {
     stubPrLookup({ merged: false, state: "open" });
 
     await indexModule.guardOpenPrBeforeImplementationDispatch("gh-token", issue);
+    const [queued] = reviewFixQueue.getPendingReviewFixes();
+    reviewFixQueue.updateReviewFixStatus(queued!.id, "dispatched");
     await indexModule.guardOpenPrBeforeImplementationDispatch("gh-token", issue);
 
-    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(1);
+    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(0);
+    expect(reviewFixQueue.listReviewFixEvents(queued!.id)).toHaveLength(1);
   });
 
   it("dispatches (returns false) when the PR is closed and not merged", async () => {
@@ -608,6 +739,7 @@ describe("processReviewFixQueue — GHA phase fix", () => {
     vi.spyOn(workflowProbeModule, "resolveWorkflowCapabilities").mockResolvedValue({
       contract: "legacy",
       supportsRunPublicationToken: false,
+      supportsAttemptCorrelation: false,
     });
     vi.spyOn(repoImageModule, "resolveRunnerImageForDispatch").mockResolvedValue(undefined);
 
@@ -728,6 +860,7 @@ describe("processReviewFixQueue — task description wiring", () => {
     vi.spyOn(workflowProbeModule, "resolveWorkflowCapabilities").mockResolvedValue({
       contract: "legacy",
       supportsRunPublicationToken: false,
+      supportsAttemptCorrelation: false,
     });
     vi.spyOn(repoImageModule, "resolveRunnerImageForDispatch").mockResolvedValue(undefined);
 
@@ -854,5 +987,244 @@ describe("processReviewFixQueue — task description wiring", () => {
     const stillOpen = reviewLedgerStore.listOpenReviewFindings("acme/billing", 62);
     expect(stillOpen).toHaveLength(1);
     expect(stillOpen[0]!.id).toBe(omittedId);
+  });
+});
+
+// AII-787: processReviewFixQueue's GHA path now reserves team capacity and PR-scoped
+// occupancy through dispatch-admission.ts's transactional acquire() before any launch
+// call, closing the race window the old read-only canDispatch preview left open between
+// its own check and the eventual appendLog/dispatchWorkflow call. These tests simulate a
+// concurrent competitor (another poll tick, or drainCommentGapfillQueue racing on the same
+// PR) by pre-acquiring a reservation directly — the same scope/mappingKey shape
+// processReviewFixQueue's own acquisition uses — rather than requiring true thread
+// concurrency, which a single-threaded test runner cannot produce.
+describe("processReviewFixQueue — admission (AII-787)", () => {
+  async function setupGha(overrides: Partial<RepoMapping> = {}): Promise<{
+    mapping: RepoMapping;
+    dispatchWorkflowSpy: ReturnType<typeof vi.spyOn>;
+  }> {
+    process.env.RUNNER_MODE = "default";
+    const mapping = makeMapping({ executionMode: "github-actions", ...overrides });
+    configModule.upsertMapping("TEAM", mapping);
+
+    const githubModule = await import("../github.js");
+    const workflowProbeModule = await import("../workflow-probe.js");
+    const repoImageModule = await import("../repo-image.js");
+    const dispatchWorkflowSpy = vi.spyOn(githubModule, "dispatchWorkflow").mockResolvedValue({ success: true, status: 204 });
+    vi.spyOn(workflowProbeModule, "resolveWorkflowCapabilities").mockResolvedValue({
+      contract: "legacy",
+      supportsRunPublicationToken: false,
+      supportsAttemptCorrelation: false,
+    });
+    vi.spyOn(repoImageModule, "resolveRunnerImageForDispatch").mockResolvedValue(undefined);
+
+    return { mapping, dispatchWorkflowSpy };
+  }
+
+  it("defers (one runner, not two) when a concurrent acquisition already holds the same PR's occupancy", async () => {
+    const { dispatchWorkflowSpy } = await setupGha();
+
+    reviewFixQueue.enqueueReviewFix({
+      issueId: "issue-race-1",
+      issueIdentifier: "AII-30",
+      repo: "acme/billing",
+      prNumber: 70,
+      reason: "late review comment",
+    });
+
+    // Simulates a competing dispatch (e.g. a human /ai-implement comment gap-fill) that
+    // already reserved this exact PR's occupancy in the same transaction our own
+    // acquisition would use.
+    const competitor = admission.acquire({
+      dispatchId: "competitor-dispatch",
+      mappingKey: "TEAM",
+      scope: { kind: "pr", issueId: "issue-race-1", installationId: "778899", repository: "acme/billing", prNumber: 70 },
+      kind: "gap-fill",
+      backend: "github-actions",
+      lifecycleOwner: { kind: "legacy" },
+      cap: 3,
+    });
+    expect(competitor.ok).toBe(true);
+
+    const consoleLogSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    await indexModule.processReviewFixQueue(mockConfig, mockRegistry);
+
+    expect(dispatchWorkflowSpy).not.toHaveBeenCalled();
+    expect(
+      consoleLogSpy.mock.calls.some(
+        ([msg]) => typeof msg === "string" && msg.includes("Deferring review fix") && msg.includes("occupied"),
+      ),
+    ).toBe(true);
+    const pending = reviewFixQueue.getPendingReviewFixes();
+    expect(pending).toHaveLength(1);
+    expect(pending[0]!.status).toBe("pending");
+    consoleLogSpy.mockRestore();
+  });
+
+  it("defers with at_capacity when a concurrent acquisition already holds the team's last slot, even though the dispatch_log preview would allow it", async () => {
+    const { dispatchWorkflowSpy } = await setupGha({ maxInProgressAiIssues: 1 });
+
+    reviewFixQueue.enqueueReviewFix({
+      issueId: "issue-race-2",
+      issueIdentifier: "AII-31",
+      repo: "acme/billing",
+      prNumber: 71,
+      reason: "late review comment",
+    });
+
+    // A different PR under the same team already holds the (only) slot — no dispatch_log
+    // row exists for it, so the old canDispatch preview would see zero in-flight jobs and
+    // let this through; only the transactional check catches it.
+    const filler = admission.acquire({
+      dispatchId: "filler-dispatch",
+      mappingKey: "TEAM",
+      scope: { kind: "pr", issueId: "other-issue", installationId: "778899", repository: "acme/billing", prNumber: 72 },
+      kind: "gap-fill",
+      backend: "github-actions",
+      lifecycleOwner: { kind: "legacy" },
+      cap: 1,
+    });
+    expect(filler.ok).toBe(true);
+
+    const consoleLogSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    await indexModule.processReviewFixQueue(mockConfig, mockRegistry);
+
+    expect(dispatchWorkflowSpy).not.toHaveBeenCalled();
+    expect(
+      consoleLogSpy.mock.calls.some(
+        ([msg]) => typeof msg === "string" && msg.includes("Deferring review fix") && msg.includes("at_capacity"),
+      ),
+    ).toBe(true);
+    expect(reviewFixQueue.getPendingReviewFixes()[0]!.status).toBe("pending");
+    consoleLogSpy.mockRestore();
+  });
+
+  it("a definitive dispatch failure releases capacity (a subsequent acquisition succeeds) while the budget entry is preserved", async () => {
+    const { mapping, dispatchWorkflowSpy } = await setupGha({ maxInProgressAiIssues: 1 });
+    dispatchWorkflowSpy.mockResolvedValue({ success: false, status: 422, error: "Workflow not found", outcome: "rejected" });
+
+    reviewFixQueue.enqueueReviewFix({
+      issueId: "issue-release-1",
+      issueIdentifier: "AII-32",
+      repo: "acme/billing",
+      prNumber: 73,
+      reason: "late review comment",
+    });
+
+    await indexModule.processReviewFixQueue(mockConfig, mockRegistry);
+
+    expect(dispatchWorkflowSpy).toHaveBeenCalledTimes(1);
+    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(0); // marked failed, not pending
+
+    // The failed attempt's budget entry survives the release (history, not undone).
+    const budgetRowsAfterFailure = dedup.getDb().prepare("SELECT COUNT(*) as n FROM dispatch_budget_entries WHERE repository = ? AND pr_number = ?").get("acme/billing", 73) as { n: number };
+    expect(budgetRowsAfterFailure.n).toBe(1);
+
+    // Capacity was released: a fresh acquisition for the same team now succeeds, and its
+    // own launch spends a second, distinct budget entry (a genuine replacement, not a retry
+    // of the same reservation).
+    const retry = admission.acquire({
+      dispatchId: "post-failure-dispatch",
+      mappingKey: "TEAM",
+      scope: { kind: "pr", issueId: "issue-release-1", installationId: "778899", repository: "acme/billing", prNumber: 73 },
+      kind: "gap-fill",
+      backend: "github-actions",
+      lifecycleOwner: { kind: "legacy" },
+      cap: mapping.maxInProgressAiIssues,
+    });
+    expect(retry.ok).toBe(true);
+
+    const budgetRowsAfterRetry = dedup.getDb().prepare("SELECT COUNT(*) as n FROM dispatch_budget_entries WHERE repository = ? AND pr_number = ?").get("acme/billing", 73) as { n: number };
+    expect(budgetRowsAfterRetry.n).toBe(2);
+
+    // Retrying the SAME dispatchId again (the true "retry" case) returns the same
+    // reservation without spending a third budget entry.
+    const sameRetry = admission.acquire({
+      dispatchId: "post-failure-dispatch",
+      mappingKey: "TEAM",
+      scope: { kind: "pr", issueId: "issue-release-1", installationId: "778899", repository: "acme/billing", prNumber: 73 },
+      kind: "gap-fill",
+      backend: "github-actions",
+      lifecycleOwner: { kind: "legacy" },
+      cap: mapping.maxInProgressAiIssues,
+    });
+    expect(sameRetry.ok).toBe(true);
+    const budgetRowsAfterSameRetry = dedup.getDb().prepare("SELECT COUNT(*) as n FROM dispatch_budget_entries WHERE repository = ? AND pr_number = ?").get("acme/billing", 73) as { n: number };
+    expect(budgetRowsAfterSameRetry.n).toBe(2);
+  });
+
+  it("a successful GHA dispatch retains capacity — a subsequent acquisition for the team is denied at_capacity", async () => {
+    await setupGha({ maxInProgressAiIssues: 1 });
+
+    reviewFixQueue.enqueueReviewFix({
+      issueId: "issue-retain-1",
+      issueIdentifier: "AII-33",
+      repo: "acme/billing",
+      prNumber: 74,
+      reason: "late review comment",
+    });
+
+    await indexModule.processReviewFixQueue(mockConfig, mockRegistry);
+
+    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(0); // dispatched, not pending
+
+    const blocked = admission.acquire({
+      dispatchId: "post-success-dispatch",
+      mappingKey: "TEAM",
+      scope: { kind: "pr", issueId: "other-issue-2", installationId: "778899", repository: "acme/billing", prNumber: 75 },
+      kind: "gap-fill",
+      backend: "github-actions",
+      lifecycleOwner: { kind: "legacy" },
+      cap: 1,
+    });
+    expect(blocked).toEqual(expect.objectContaining({ ok: false, reason: "at_capacity" }));
+  });
+
+  it("local-docker dispatch reserves capacity under the Legacy lifecycle owner", async () => {
+    const mapping = makeMapping();
+    configModule.upsertMapping("TEAM", mapping);
+
+    reviewFixQueue.enqueueReviewFix({
+      issueId: "issue-local-admission",
+      issueIdentifier: "AII-34",
+      repo: "acme/billing",
+      prNumber: 76,
+      reason: "late review comment",
+    });
+
+    await indexModule.processReviewFixQueue(mockConfig, mockRegistry);
+
+    expect(localGapfillMocks.dispatchLocalGapfill).toHaveBeenCalledTimes(1);
+    expect(admission.count("TEAM")).toBe(1);
+  });
+
+  it("keeps capacity reserved when GitHub returns an unknown 5xx launch outcome", async () => {
+    const { dispatchWorkflowSpy } = await setupGha({ maxInProgressAiIssues: 1 });
+    dispatchWorkflowSpy.mockResolvedValue({ success: false, status: 500, outcome: "unknown" });
+    reviewFixQueue.enqueueReviewFix({ issueId: "issue-unknown", issueIdentifier: "AII-35", repo: "acme/billing", prNumber: 77, reason: "late review" });
+
+    await indexModule.processReviewFixQueue(mockConfig, mockRegistry);
+
+    expect(dispatchWorkflowSpy).toHaveBeenCalledWith(expect.anything(), expect.anything(), expect.anything(), { returnRunDetails: true });
+    expect(admission.count("TEAM")).toBe(1);
+    const recorded = dedup.getDb().prepare("SELECT admission_generation, status FROM dispatch_log WHERE issue_id = ? AND phase = 'gap-analysis'").get("issue-unknown") as { admission_generation: number; status: string };
+    expect(recorded).toEqual({ admission_generation: 0, status: "dispatched" });
+    expect((dedup.getDb().prepare("SELECT COUNT(*) AS n FROM dispatch_log WHERE issue_id = ? AND status = 'dispatch-failed'").get("issue-unknown") as { n: number }).n).toBe(0);
+    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(0);
+  });
+
+  it("defers a local launch when another owner already reserved the same PR", async () => {
+    configModule.upsertMapping("TEAM", makeMapping());
+    reviewFixQueue.enqueueReviewFix({ issueId: "issue-local-race", issueIdentifier: "AII-36", repo: "acme/billing", prNumber: 78, reason: "late review" });
+    expect(admission.acquire({
+      dispatchId: "other-owner", mappingKey: "TEAM",
+      scope: { kind: "pr", issueId: "issue-local-race", installationId: "778899", repository: "acme/billing", prNumber: 78 },
+      kind: "gap-fill", backend: "github-actions", lifecycleOwner: { kind: "legacy" }, cap: 3,
+    }).ok).toBe(true);
+
+    await indexModule.processReviewFixQueue(mockConfig, mockRegistry);
+
+    expect(localGapfillMocks.dispatchLocalGapfill).not.toHaveBeenCalled();
+    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(1);
   });
 });

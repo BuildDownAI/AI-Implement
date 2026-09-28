@@ -1,7 +1,14 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
+import os from "node:os";
+import path from "node:path";
+import fs from "node:fs";
 import { selectIssuesToDispatch, selectBlockers, parseDeclaredFiles, selectFileOverlapDeferrals, rememberCandidates, resolveInFlightSiblings, resetSeenCandidates, getCachedPlanningContext, setCachedPlanningContext, resetPlanningContextCache, needsPlanningContextFetch, getPlanningContextCacheSize, PLANNING_CONTEXT_CACHE_MAX } from "../poll-selection.js";
 import type { RepoMapping } from "../config.js";
 import type { TicketIssue } from "../providers/types.js";
+import type * as DedupModule from "../dedup.js";
+import type * as GateModule from "../dispatch-gate.js";
+import type * as AdmissionModule from "../dispatch-admission.js";
+import type * as BreakerModule from "../dispatch-breaker.js";
 
 function makeIssue(id: string, identifier: string, teamKey: string, overrides?: Partial<TicketIssue>): TicketIssue {
   return {
@@ -47,12 +54,24 @@ function makeMapping(maxInProgressAiIssues = 3): RepoMapping {
     planningEnabled: false,
     planningWorkflowFile: "",
     autoApprovePlans: true,
+    autoMerge: false,
     extraEnv: {},
     provider: "anthropic",
     ticketingProvider: "linear",
     ticketingConfig: { kind: "linear" },
     awsRegion: null,
     paused: false,
+    maxTurns: null,
+    maxIterations: null,
+    maxJobMinutes: null,
+    branchPrefix: null,
+    skillsRepo: null,
+    referenceRepos: null,
+    sensitiveAddPatterns: null,
+    sensitiveAllowPatterns: null,
+    dependencyTokenScope: null,
+    memoryProviderId: null,
+    reviewers: null,
   };
 }
 
@@ -190,6 +209,110 @@ describe("selectBlockers", () => {
     expect(blockers[1]).toMatchObject({ reason: "concurrency", issueIdentifier: "APP-3" });
     expect(blockers[2]).toMatchObject({ reason: "dedup", issueIdentifier: "APP-1" });
     expect(blockers[3]).toMatchObject({ reason: "no-mapping", issueIdentifier: "API-1" });
+  });
+
+  it("logs the exclusion with issue, team, count, and cap when a concurrency blocker fires", () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    selectBlockers(
+      [makeIssue("1", "APP-1", "APP")],
+      { APP: makeMapping(2) },
+      { APP: 2 },
+      () => false,
+    );
+    expect(logSpy).toHaveBeenCalledWith(
+      "[poll-selection] Capacity exclusion: issue=APP-1 team=APP count=2 cap=2",
+    );
+    logSpy.mockRestore();
+  });
+
+  it("does not log an exclusion for an issue that clears the cap", () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    selectBlockers(
+      [makeIssue("1", "APP-1", "APP")],
+      { APP: makeMapping(3) },
+      { APP: 1 },
+      () => false,
+    );
+    expect(logSpy).not.toHaveBeenCalled();
+    logSpy.mockRestore();
+  });
+});
+
+// AII-569: selectBlockers's concurrency check is fed the same DB-backed
+// dispatch_admissions reservation count acquireDispatch checks capacity against
+// (src/dispatch-admission.ts#count), never a tracker-label count — a stranded label
+// (never advanced, or advanced late) must not hide a real reservation, and a
+// reservation with no run ID yet (acquireDispatch's transaction commits before the
+// external launch call returns) must still count as used.
+describe("selectBlockers — reservation-backed concurrency, not tracker labels", () => {
+  let dbPath: string;
+  let dedup: typeof DedupModule;
+  let gate: typeof GateModule;
+  let admission: typeof AdmissionModule;
+  let breaker: typeof BreakerModule;
+
+  beforeEach(async () => {
+    vi.resetModules();
+    dbPath = path.join(
+      os.tmpdir(),
+      `poll-selection-blockers-admission-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
+    );
+    process.env.DEDUP_DB_PATH = dbPath;
+    dedup = await import("../dedup.js");
+    gate = await import("../dispatch-gate.js");
+    admission = await import("../dispatch-admission.js");
+    breaker = await import("../dispatch-breaker.js");
+    breaker.initDispatchBreakerTable();
+  });
+
+  afterEach(() => {
+    dedup.closeDb();
+    try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+  });
+
+  it("a prepared reservation with no run ID yet still blocks, even when the tracker label is stranded (idle)", () => {
+    const held = gate.acquireDispatch({
+      dispatchId: "prepared-1",
+      issueId: "AII-held",
+      issueIdentifier: "AII-held",
+      kind: "implementation",
+      teamKey: "AII",
+      maxInProgressAiIssues: 1,
+      backend: "fly-machines",
+    });
+    expect(held.ok).toBe(true);
+
+    // Tracker label snapshot says idle (0) — a stale/never-advanced label must not mask
+    // the live reservation.
+    const staleTrackerCounts = { AII: 0 };
+    const reservedCounts = { AII: admission.count("AII") };
+    expect(reservedCounts.AII).toBe(1);
+
+    const candidate = makeIssue("AII-2", "AII-2", "AII");
+    const usingStaleTracker = selectBlockers([candidate], { AII: makeMapping(1) }, staleTrackerCounts, () => false);
+    const usingReservations = selectBlockers([candidate], { AII: makeMapping(1) }, reservedCounts, () => false);
+
+    expect(usingStaleTracker).toHaveLength(0);
+    expect(usingReservations).toHaveLength(1);
+    expect(usingReservations[0].reason).toBe("concurrency");
+  });
+
+  it("releasing the reservation frees the slot for the next blocker check", () => {
+    const held = gate.acquireDispatch({
+      dispatchId: "prepared-2",
+      issueId: "AII-held-2",
+      issueIdentifier: "AII-held-2",
+      kind: "planning",
+      teamKey: "AII",
+      maxInProgressAiIssues: 1,
+      backend: "github-actions",
+    });
+    expect(held.ok).toBe(true);
+    if (held.ok) held.release("finalized");
+
+    const candidate = makeIssue("AII-3", "AII-3", "AII");
+    const blockers = selectBlockers([candidate], { AII: makeMapping(1) }, { AII: admission.count("AII") }, () => false);
+    expect(blockers).toHaveLength(0);
   });
 });
 
@@ -602,5 +725,86 @@ describe("planning context cache (AII-390)", () => {
     // The last entry (issue-PLANNING_CONTEXT_CACHE_MAX) should still be present.
     expect(getCachedPlanningContext(`issue-${PLANNING_CONTEXT_CACHE_MAX}`)).toBe(`ctx-${PLANNING_CONTEXT_CACHE_MAX}`);
     resetPlanningContextCache();
+  });
+});
+
+// AII-783: selectIssuesToDispatch stays a pure sizing function — these tests show that
+// poll() must feed it the DB-backed dispatch_admissions count (src/dispatch-admission.ts)
+// rather than the tracker-label snapshot, by exercising both against a real acquired
+// reservation. The tracker-label count remains available as a diagnostic only.
+describe("selectIssuesToDispatch — sized from DB-backed admission reservations, not tracker-label counts", () => {
+  let dbPath: string;
+  let dedup: typeof DedupModule;
+  let gate: typeof GateModule;
+  let admission: typeof AdmissionModule;
+  let breaker: typeof BreakerModule;
+
+  beforeEach(async () => {
+    vi.resetModules();
+    dbPath = path.join(
+      os.tmpdir(),
+      `poll-selection-admission-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
+    );
+    process.env.DEDUP_DB_PATH = dbPath;
+    dedup = await import("../dedup.js");
+    gate = await import("../dispatch-gate.js");
+    admission = await import("../dispatch-admission.js");
+    breaker = await import("../dispatch-breaker.js");
+    breaker.initDispatchBreakerTable();
+  });
+
+  afterEach(() => {
+    dedup.closeDb();
+    try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+  });
+
+  it("a live reservation excludes a candidate even when the tracker-label snapshot reports the team idle", () => {
+    const mapping = makeMapping(1);
+    const teamRepoMap = { AII: mapping };
+
+    const held = gate.acquireDispatch({
+      dispatchId: "held-1",
+      issueId: "AII-held",
+      issueIdentifier: "AII-held",
+      kind: "implementation",
+      teamKey: "AII",
+      maxInProgressAiIssues: 1,
+      backend: "fly-machines",
+    });
+    expect(held.ok).toBe(true);
+
+    // A stale/lagging tracker-label snapshot (e.g. the label hasn't propagated yet)
+    // reports the team as idle — selection must not trust it.
+    const staleTrackerCounts = { AII: 0 };
+    const admissionCounts = { AII: admission.count("AII") };
+    expect(admissionCounts.AII).toBe(1);
+
+    const candidate = makeIssue("AII-2", "AII-2", "AII");
+    const selectedUsingStaleTracker = selectIssuesToDispatch([candidate], teamRepoMap, staleTrackerCounts, () => false);
+    const selectedUsingAdmission = selectIssuesToDispatch([candidate], teamRepoMap, admissionCounts, () => false);
+
+    expect(selectedUsingStaleTracker).toEqual([candidate]);
+    expect(selectedUsingAdmission).toEqual([]);
+  });
+
+  it("releasing a reservation frees the DB-backed count for the next selection", () => {
+    const mapping = makeMapping(1);
+    const teamRepoMap = { AII: mapping };
+
+    const held = gate.acquireDispatch({
+      dispatchId: "held-2",
+      issueId: "AII-held-2",
+      issueIdentifier: "AII-held-2",
+      kind: "planning",
+      teamKey: "AII",
+      maxInProgressAiIssues: 1,
+      backend: "github-actions",
+    });
+    expect(held.ok).toBe(true);
+    if (held.ok) held.release("finalized");
+
+    const candidate = makeIssue("AII-3", "AII-3", "AII");
+    const selected = selectIssuesToDispatch([candidate], teamRepoMap, { AII: admission.count("AII") }, () => false);
+    expect(selected).toEqual([candidate]);
   });
 });

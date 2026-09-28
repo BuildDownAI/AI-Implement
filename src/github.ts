@@ -68,12 +68,37 @@ export interface DispatchInputs {
   runner_image?: string;
   /** Operator instruction forwarded from the /ai-implement PR comment. Legacy mode only; envelope mode carries this inside run_config. */
   comment_instruction?: string;
+  /**
+   * Secret-free Restate review-fix pilot attempt id (AII-782/AII-793), read by the workflow's
+   * `run-name:` before any step runs and cross-validated there against `run_config.reviewFix.attemptId`
+   * (`workflows/claude-implement.yml` "Validate attempt correlation" step). Must match exactly —
+   * absent on every non-pilot dispatch. See `src/workflow-probe.ts`'s `supportsAttemptCorrelation`
+   * for detecting whether a target repo's synced workflow declares this input.
+   */
+  run_attempt_token?: string;
 }
+
+/**
+ * Identity-resolution confidence for a `workflow_dispatch` POST, populated only when the
+ * caller opts in via `returnRunDetails` (AII-778). `"accepted"` means GitHub started (or, on
+ * a plain 204, plausibly started) the run. `"rejected"` is a definite 4xx application-level
+ * refusal — safe to treat as "did not happen". `"unknown"` covers everything in between: a
+ * transport failure before any response arrived, an unparseable or repo-mismatched 200 body,
+ * or a 5xx — GitHub may or may not have started the run, so a caller must not blindly retry
+ * the same POST on this outcome.
+ */
+export type DispatchOutcome = "accepted" | "rejected" | "unknown";
 
 export interface DispatchResult {
   success: boolean;
   status: number;
   error?: string;
+  /** Only set when the dispatch was made with `returnRunDetails: true`. */
+  outcome?: DispatchOutcome;
+  /** Exact run id, populated only for a 200 response whose body validated against the requested repo. */
+  runId?: number;
+  /** Exact run URL, populated only for a 200 response whose body validated against the requested repo. */
+  runUrl?: string;
 }
 
 /**
@@ -115,6 +140,66 @@ function extractUnexpectedInputNames(body: string): Set<string> {
   return names;
 }
 
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Validates a parsed 200 run-details body against the repo the dispatch actually targeted,
+ * per the issue's "validate response IDs/URLs against requested repo" requirement. `html_url`
+ * must always match `https://github.com/{owner}/{repo}/actions/runs/{id}`; if the body also
+ * carries a `repository` field (string `"owner/repo"` or an object with `full_name`), that
+ * must agree too. Either signal disagreeing is treated as an unresolved identity rather than
+ * a trusted one — GitHub's `return_run_details` response shape isn't documented today, so this
+ * stays deliberately tolerant of fields it doesn't recognise and strict only about the ones it
+ * uses to prove repo ownership.
+ */
+function extractDispatchRunIdentity(
+  body: unknown,
+  owner: string,
+  repo: string,
+): { runId: number; runUrl: string } | null {
+  if (!isPlainRecord(body)) return null;
+  const run = isPlainRecord(body.run) ? body.run : body;
+
+  const id = run.id;
+  const htmlUrl = run.html_url;
+  if (typeof id !== "number" || !Number.isSafeInteger(id) || id <= 0) return null;
+  if (typeof htmlUrl !== "string") return null;
+
+  const expectedRepo = `${owner}/${repo}`;
+  if (!htmlUrl.startsWith(`https://github.com/${expectedRepo}/actions/runs/`)) return null;
+
+  const repository = run.repository;
+  if (repository !== undefined) {
+    const fullName = typeof repository === "string"
+      ? repository
+      : (isPlainRecord(repository) && typeof repository.full_name === "string" ? repository.full_name : undefined);
+    if (fullName !== expectedRepo) return null;
+  }
+
+  return { runId: id, runUrl: htmlUrl };
+}
+
+async function parseDispatchRunDetails(res: Response, owner: string, repo: string): Promise<DispatchResult> {
+  let body: unknown;
+  try {
+    body = await res.json();
+  } catch {
+    return { success: true, status: 200, outcome: "unknown" };
+  }
+  const identity = extractDispatchRunIdentity(body, owner, repo);
+  if (!identity) return { success: true, status: 200, outcome: "unknown" };
+  return { success: true, status: 200, outcome: "accepted", runId: identity.runId, runUrl: identity.runUrl };
+}
+
+/**
+ * Posts one `workflow_dispatch` request. `returnRunDetails` is opt-in (default off) so every
+ * existing caller of `dispatchWorkflow`/`postWorkflowDispatch` keeps its established
+ * `success`/`status`/`error` shape and throw-on-transport-failure behavior byte-for-byte
+ * (AII-778 constraint) — the new `return_run_details` body field and `outcome`/`runId`/`runUrl`
+ * fields only appear when a caller explicitly asks for them.
+ */
 async function postDispatchOnce(
   token: string,
   owner: string,
@@ -122,22 +207,49 @@ async function postDispatchOnce(
   workflowFile: string,
   ref: string,
   inputs: DispatchInputs,
+  opts?: { returnRunDetails?: boolean },
 ): Promise<DispatchResult> {
+  const returnRunDetails = opts?.returnRunDetails === true;
   const url = `https://api.github.com/repos/${owner}/${repo}/actions/workflows/${workflowFile}/dispatches`;
 
-  const res = await fetch(url, {
-    method: "POST",
-    headers: ghHeaders(token),
-    body: JSON.stringify({ ref, inputs }),
-    signal: defaultFetchSignal(),
-  });
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      headers: ghHeaders(token),
+      body: JSON.stringify({ ref, inputs, ...(returnRunDetails ? { return_run_details: true } : {}) }),
+      signal: defaultFetchSignal(),
+    });
+  } catch (err) {
+    // Legacy callers (returnRunDetails unset) keep the established behavior of letting a
+    // transport failure propagate as a rejected promise. A pilot caller that opted into
+    // returnRunDetails gets it back as outcome: "unknown" instead — a lost response is not
+    // proof of rejection, so a caller guarding against a repeat POST must see "unknown", not
+    // a thrown error indistinguishable from any other failure.
+    if (!returnRunDetails) throw err;
+    return {
+      success: false,
+      status: 0,
+      error: err instanceof Error ? err.message : String(err),
+      outcome: "unknown",
+    };
+  }
 
-  if (res.status === 204 || res.status === 200) {
-    return { success: true, status: res.status };
+  if (res.status === 204) {
+    return returnRunDetails ? { success: true, status: 204, outcome: "accepted" } : { success: true, status: 204 };
+  }
+
+  if (res.status === 200) {
+    return returnRunDetails ? parseDispatchRunDetails(res, owner, repo) : { success: true, status: 200 };
   }
 
   const body = await res.text();
-  return { success: false, status: res.status, error: body };
+  if (!returnRunDetails) return { success: false, status: res.status, error: body };
+  // A definite 4xx application rejection is "rejected" — safe to treat as "did not happen".
+  // Anything else (5xx, or an unrecognised status) is "unknown": GitHub may have started the
+  // run before failing to report it cleanly.
+  const outcome: DispatchOutcome = res.status >= 400 && res.status < 500 ? "rejected" : "unknown";
+  return { success: false, status: res.status, error: body, outcome };
 }
 
 const GH_HEADERS = {
@@ -400,8 +512,11 @@ export async function postWorkflowDispatch(opts: {
   workflowFile: string;
   ref: string;
   inputs: DispatchInputs;
+  /** Opt-in: requests `return_run_details` and populates `outcome`/`runId`/`runUrl` (AII-778). */
+  returnRunDetails?: boolean;
 }): Promise<DispatchResult> {
-  const first = await postDispatchOnce(opts.token, opts.owner, opts.repo, opts.workflowFile, opts.ref, opts.inputs);
+  const dispatchOnceOpts = { returnRunDetails: opts.returnRunDetails };
+  const first = await postDispatchOnce(opts.token, opts.owner, opts.repo, opts.workflowFile, opts.ref, opts.inputs, dispatchOnceOpts);
   if (first.success) return first;
   if (first.status !== 422 || !/unexpected inputs/i.test(first.error ?? "")) return first;
   if (!opts.inputs.run_config) return first;
@@ -417,13 +532,14 @@ export async function postWorkflowDispatch(opts: {
   console.log(
     `[dispatch] ${opts.owner}/${opts.repo}/${opts.workflowFile} does not declare ${namesToStrip.join(", ")} (re-sync workflows); retrying without`,
   );
-  return postDispatchOnce(opts.token, opts.owner, opts.repo, opts.workflowFile, opts.ref, strippedInputs);
+  return postDispatchOnce(opts.token, opts.owner, opts.repo, opts.workflowFile, opts.ref, strippedInputs, dispatchOnceOpts);
 }
 
 export async function dispatchWorkflow(
   token: string,
   mapping: RepoMapping,
   inputs: DispatchInputs,
+  opts?: { returnRunDetails?: boolean },
 ): Promise<DispatchResult> {
   return postWorkflowDispatch({
     token,
@@ -432,6 +548,7 @@ export async function dispatchWorkflow(
     workflowFile: mapping.workflowFile,
     ref: mapping.defaultBranch,
     inputs,
+    returnRunDetails: opts?.returnRunDetails,
   });
 }
 

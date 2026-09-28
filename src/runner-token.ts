@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { clearPublicationCredential } from "./publication-credential.js";
+import { decodeRunConfig } from "./run-config.js";
 
 const DEFAULT_TOKEN_REQUEST_TIMEOUT_MS = 5_000;
 /** Backoff for the fail-closed exchange, mirroring push.ts's LS_REMOTE_RETRY_DELAYS_MS. */
@@ -12,6 +13,7 @@ interface RefreshRunnerGithubTokenInputs {
   callbackUrl?: string;
   publicationToken?: string;
   owner: string;
+  repo?: string;
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
   /** Fail instead of retaining the current token. Intended for the explicit refresh CLI. */
@@ -21,6 +23,41 @@ interface RefreshRunnerGithubTokenInputs {
 interface RefreshRunnerGithubCredentialsInputs extends RefreshRunnerGithubTokenInputs {
   repo: string;
   workspaceDir: string;
+}
+
+function executionHeaders(owner: string, repo: string): Record<string, string> {
+  return {
+    "x-run-repository": `${owner}/${repo}`,
+    "x-github-run-id": process.env.GITHUB_RUN_ID ?? "",
+    "x-github-run-attempt": process.env.GITHUB_RUN_ATTEMPT ?? "",
+  };
+}
+
+/** Pilot marker comes from the validated runner envelope. A malformed marker must
+ * fail closed rather than silently falling through to Legacy publication. */
+function isPilotRun(): boolean {
+  const encoded = process.env.AI_IMPLEMENT_RUN_CONFIG;
+  return Boolean(encoded && decodeRunConfig(encoded).reviewFix);
+}
+
+export async function assertRunnerPublicationAuthority(input: {
+  callbackUrl?: string; owner: string; repo: string; fetchImpl?: typeof fetch;
+}): Promise<void> {
+  if (!isPilotRun()) return;
+  const resultToken = process.env.RUN_TOKEN;
+  const callbackUrl = input.callbackUrl?.trim();
+  if (!resultToken || !callbackUrl) throw new Error("[runner-token] Pilot publication authority unavailable");
+  let response: Response;
+  try {
+    response = await (input.fetchImpl ?? fetch)(`${callbackUrl.replace(/\/$/, "")}/api/runner/publication-authority`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${resultToken}`, ...executionHeaders(input.owner, input.repo) },
+      signal: AbortSignal.timeout(DEFAULT_TOKEN_REQUEST_TIMEOUT_MS),
+    });
+  } catch {
+    throw new Error("[runner-token] Pilot publication authority unavailable");
+  }
+  if (!response.ok) throw new Error(`[runner-token] Pilot publication authority rejected with HTTP ${response.status}`);
 }
 
 /**
@@ -62,7 +99,10 @@ export async function refreshRunnerGithubToken(
         })
       : fetchImpl(`${callbackUrl!.replace(/\/$/, "")}/api/runner/publication-token`, {
           method: "POST",
-          headers: { Authorization: `Bearer ${publicationToken}` },
+          headers: {
+            Authorization: `Bearer ${publicationToken}`,
+            ...(isPilotRun() ? executionHeaders(inputs.owner, inputs.repo ?? "") : {}),
+          },
           signal: AbortSignal.timeout(timeoutMs),
         });
 
@@ -147,6 +187,9 @@ export async function refreshRunnerGithubToken(
 export async function refreshRunnerGithubCredentials(
   inputs: RefreshRunnerGithubCredentialsInputs,
 ): Promise<string> {
+  await assertRunnerPublicationAuthority({
+    callbackUrl: inputs.callbackUrl, owner: inputs.owner, repo: inputs.repo, fetchImpl: inputs.fetchImpl,
+  });
   const canVend = Boolean(
     (inputs.orchestratorUrl?.trim() && inputs.machineNonce?.trim())
       || (inputs.callbackUrl?.trim() && inputs.publicationToken?.trim()),

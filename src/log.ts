@@ -1,6 +1,8 @@
 import { getDb } from "./dedup.js";
 import { markCommentGapfillRunTerminal } from "./comment-gapfill-queue.js";
 import { isFailureRecord, type FailureRecord } from "./pipeline/failure-classification.js";
+import { read as readAdmission, release as releaseAdmission } from "./dispatch-admission.js";
+import { REVIEW_FIX_EVIDENCE_RETENTION_MS } from "./review-fix-evidence.js";
 
 const MAX_LOG_ENTRIES = 500;
 
@@ -23,6 +25,7 @@ export interface Job {
   repo: string | null;
   dispatchedAt: number;
   dispatchId: string | null;
+  admissionGeneration: number | null;
   dispatchNumber: number;
   issueState: string | null;
   runId: number | null;
@@ -111,6 +114,9 @@ function ensureLogColumns(): void {
     db.exec("ALTER TABLE dispatch_log ADD COLUMN dispatch_id TEXT");
     db.exec("CREATE INDEX IF NOT EXISTS idx_dispatch_log_dispatch_id ON dispatch_log(dispatch_id)");
   }
+  if (!names.has("admission_generation")) {
+    db.exec("ALTER TABLE dispatch_log ADD COLUMN admission_generation INTEGER");
+  }
   if (!names.has("status")) {
     db.exec("ALTER TABLE dispatch_log ADD COLUMN status TEXT NOT NULL DEFAULT 'unknown'");
   }
@@ -190,6 +196,8 @@ export function appendLog(entry: {
   repo?: string;
   issueState?: string;
   dispatchId?: string;
+  /** Generation of the admission that owns this exact backend launch. */
+  admissionGeneration?: number | null;
   dispatchNumber?: number;
   machineNonce?: string;
   executionMode?: string;
@@ -210,7 +218,7 @@ export function appendLog(entry: {
   const dispatchNumber = entry.dispatchNumber ?? countPriorDispatches(entry.issueId, entry.phase ?? "implementation").count + 1;
 
   const result = db.prepare(
-    "INSERT INTO dispatch_log (issue_id, issue_identifier, issue_title, team_key, repo, dispatched_at, dispatch_id, dispatch_number, issue_state, status, machine_nonce, execution_mode, machine_id, runner_mode, session_image, phase, contract, trigger, grouping_parent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    "INSERT INTO dispatch_log (issue_id, issue_identifier, issue_title, team_key, repo, dispatched_at, dispatch_id, admission_generation, dispatch_number, issue_state, status, machine_nonce, execution_mode, machine_id, runner_mode, session_image, phase, contract, trigger, grouping_parent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
   ).run(
     entry.issueId,
     entry.issueIdentifier ?? null,
@@ -219,6 +227,7 @@ export function appendLog(entry: {
     entry.repo ?? null,
     Date.now(),
     entry.dispatchId ?? null,
+    entry.admissionGeneration ?? null,
     dispatchNumber,
     entry.issueState ?? null,
     entry.status ?? "dispatched",
@@ -234,13 +243,35 @@ export function appendLog(entry: {
   );
 
   // Keep only the most recent MAX_LOG_ENTRIES rows, but never evict a row while
-  // its machine nonce is active. Token vending and callbacks depend on that row
-  // for the run lifetime; invalidateNonce() makes it prunable when terminal.
+  // its machine nonce is active (token vending and callbacks depend on that row
+  // for the run lifetime; invalidateNonce() makes it prunable when terminal), and
+  // never evict a row correlated to a Restate review-fix pilot attempt (via
+  // dispatch_id) that is still unresolved (review_fix_attempts.completed_at IS
+  // NULL) or completed within the last 7 days (AII-795). A terminal attempt
+  // stays exempt while delivery, reservation, result conflict, or execution
+  // identity is unresolved, matching review-fix-evidence's retention guard.
   db.prepare(
     `DELETE FROM dispatch_log
      WHERE machine_nonce IS NULL
-       AND id NOT IN (SELECT id FROM dispatch_log ORDER BY dispatched_at DESC LIMIT ?)`,
-  ).run(MAX_LOG_ENTRIES);
+       AND id NOT IN (SELECT id FROM dispatch_log ORDER BY dispatched_at DESC LIMIT ?)
+       AND (
+         dispatch_id IS NULL
+         OR NOT EXISTS (
+           SELECT 1 FROM review_fix_attempts a
+           WHERE a.dispatch_id = dispatch_log.dispatch_id
+             AND (
+               a.completed_at IS NULL OR a.completed_at >= ?
+               OR a.result_conflict_at IS NOT NULL OR a.github_run_id IS NULL
+               OR EXISTS (SELECT 1 FROM dispatch_admissions d
+                          WHERE d.dispatch_id = a.dispatch_id AND d.released_at IS NULL)
+               OR EXISTS (SELECT 1 FROM review_fix_inbox i
+                          WHERE i.installation_id = a.installation_id
+                            AND i.repository = a.repository AND i.pr_number = a.pr_number
+                            AND i.delivery_state != 'delivered')
+             )
+         )
+       )`,
+  ).run(MAX_LOG_ENTRIES, Date.now() - REVIEW_FIX_EVIDENCE_RETENTION_MS);
 
   return Number(result.lastInsertRowid);
 }
@@ -390,20 +421,42 @@ export function updateJobStatus(
   status: JobStatus,
   conclusion?: string | null,
   prUrl?: string | null,
+  opts?: {
+    /** The caller observed the exact backend execution in a terminal state. A
+     * callback, timeout, or cancellation request must leave this unset. */
+    backendTerminated?: boolean;
+    /** Set by a caller that reached this terminal status through a best-effort stop/
+     *  destroy that may itself have failed silently (the reaper's machine sweeps,
+     *  stuck-watchdog's remediation paths) — i.e. "terminal status string" without
+     *  "verified backend termination". Skips the admission-release hook below so the
+     *  reservation stays held for `dispatch-admission.ts`'s stale-reservation sweep to
+     *  resolve later, instead of releasing a slot whose backend might still be running. */
+    skipAdmissionRelease?: boolean;
+  },
 ): void {
   const isTerminal = status === "completed" || status === "review_failed" || status === "failed" || status === "timed_out" || status === "dispatch-failed";
   // AII-277: a comment-triggered (gap-fill) run reaching a terminal state must
   // terminalize its queue row, or hasPendingConflictResolution stays true
   // forever and conflict-recovery attempt 2 is unreachable (observed livelock).
   if (isTerminal) {
-    const job = getDb().prepare("SELECT repo, trigger, pr_url FROM dispatch_log WHERE id = ?").get(jobId) as
-      | { repo: string; trigger: string | null; pr_url: string | null } | undefined;
+    const job = getDb().prepare("SELECT repo, trigger, pr_url, dispatch_id, admission_generation, execution_mode FROM dispatch_log WHERE id = ?").get(jobId) as
+      | { repo: string; trigger: string | null; pr_url: string | null; dispatch_id: string | null; admission_generation: number | null; execution_mode: string | null } | undefined;
     const prUrlForRow = prUrl ?? job?.pr_url ?? null;
     const m = prUrlForRow ? /\/pull\/(\d+)$/.exec(prUrlForRow) : null;
     if (job?.trigger === "comment" && m) {
       const outcome = status === "completed" ? "completed" : "failed";
       const n = markCommentGapfillRunTerminal(job.repo, Number(m[1]), outcome);
       if (n > 0) console.log(`[gapfill] terminalized ${n} queue row(s) for ${job.repo}#${m[1]} -> ${outcome}`);
+    }
+    // A terminal business status does not prove that the backend has exited: callbacks
+    // and watchdogs can write it from inside a live run. Only an exact backend monitor
+    // observation may opt in to immediate release. Other rows are reconciled against
+    // the backend on the next poll, with owner and generation fences.
+    if (job?.dispatch_id && job.admission_generation !== null && opts?.backendTerminated && !opts.skipAdmissionRelease) {
+      const current = readAdmission(job.dispatch_id);
+      if (current?.lifecycleOwner.kind === "legacy" && current.backend === job.execution_mode) {
+        releaseAdmission(job.dispatch_id, current.lifecycleOwner, job.admission_generation, "finalized");
+      }
     }
   }
   // COALESCE keeps a pr_url recorded earlier (e.g. by the runner callback) when the
@@ -676,6 +729,7 @@ interface RawRow {
   repo: string | null;
   dispatched_at: number;
   dispatch_id: string | null;
+  admission_generation: number | null;
   dispatch_number: number;
   issue_state: string | null;
   run_id: number | null;
@@ -708,6 +762,7 @@ function mapRows(rows: RawRow[]): Job[] {
     repo: row.repo,
     dispatchedAt: row.dispatched_at,
     dispatchId: row.dispatch_id ?? null,
+    admissionGeneration: row.admission_generation ?? null,
     dispatchNumber: row.dispatch_number ?? 1,
     issueState: row.issue_state ?? null,
     runId: row.run_id ?? null,

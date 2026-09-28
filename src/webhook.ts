@@ -3,9 +3,8 @@ import http from "node:http";
 import { listLog, getLatestDispatchForPr } from "./log.js";
 import { enqueueReconciliation, hasReconciliationForPr } from "./reconciliation.js";
 import { branchMatchesIssueIdentifier } from "./pipeline/branch-name.js";
-import { enqueueReviewFix } from "./review-fix-queue.js";
-import { AI_IMPLEMENT_NATIVE_REVIEW_MARKER, extractClaudeSummaryFindings } from "./pipeline/review-ledger.js";
-import { upsertReviewFinding } from "./review-ledger-store.js";
+import { acceptReviewFixWebhookEvent } from "./review-fix-queue.js";
+import { AI_IMPLEMENT_NATIVE_REVIEW_MARKER, extractClaudeSummaryFindings, type ReviewLedgerFinding } from "./pipeline/review-ledger.js";
 import { getMappings } from "./config.js";
 import { getInstallationToken } from "./github-app-auth.js";
 import { resolveWorkflowContract } from "./workflow-probe.js";
@@ -335,6 +334,7 @@ async function handleKgPrCheckWebhook(
 interface ReviewPayload {
   action?: string;
   review?: {
+    id?: number;
     state?: string;
     body?: string | null;
     html_url?: string;
@@ -355,6 +355,7 @@ interface ReviewPayload {
 interface ReviewCommentPayload {
   action?: string;
   comment?: {
+    id?: number;
     body?: string;
     html_url?: string;
     path?: string;
@@ -450,6 +451,7 @@ export async function handleGitHubWebhook(
   privateKey?: string,
   selfDeploy?: SelfDeployTarget,
   kgPrCheck?: KgPrCheckConfig,
+  onReviewFixPrClosed?: (repository: string, prNumber: number) => void | Promise<void>,
 ): Promise<void> {
   const body = await readRawBody(req);
   const signature = req.headers["x-hub-signature-256"] as string | undefined;
@@ -461,6 +463,7 @@ export async function handleGitHubWebhook(
   }
 
   const event = req.headers["x-github-event"] as string | undefined;
+  const deliveryId = req.headers["x-github-delivery"] as string | undefined;
 
   let payload: PullRequestPayload;
   try {
@@ -472,17 +475,17 @@ export async function handleGitHubWebhook(
   }
 
   if (event === "pull_request_review") {
-    handleReviewWebhook(payload as ReviewPayload, res);
+    handleReviewWebhook(payload as ReviewPayload, res, deliveryId);
     return;
   }
 
   if (event === "pull_request_review_comment") {
-    handleReviewCommentWebhook(payload as ReviewCommentPayload, res);
+    handleReviewCommentWebhook(payload as ReviewCommentPayload, res, deliveryId);
     return;
   }
 
   if (event === "issue_comment") {
-    await handleIssueCommentWebhook(payload as IssueCommentPayload, res, appId, privateKey);
+    await handleIssueCommentWebhook(payload as IssueCommentPayload, res, appId, privateKey, deliveryId);
     return;
   }
 
@@ -524,6 +527,9 @@ export async function handleGitHubWebhook(
     const kgPrNumber = payload.pull_request?.number;
     if (kgRepoFullName && kgPrNumber && (kgRepoFullName === kgPrCheck?.kgSourceRepo || kgRepoFullName === kgPrCheck?.kgBaseRepo)) {
       forgetKgPr(kgPrCheck, kgRepoFullName, kgPrNumber);
+    }
+    if (kgRepoFullName && kgPrNumber && onReviewFixPrClosed) {
+      await onReviewFixPrClosed(kgRepoFullName, kgPrNumber);
     }
   }
 
@@ -577,7 +583,7 @@ export async function handleGitHubWebhook(
   res.end(JSON.stringify({ queued: true, reconciliationId }));
 }
 
-function handleReviewWebhook(payload: ReviewPayload, res: http.ServerResponse): void {
+function handleReviewWebhook(payload: ReviewPayload, res: http.ServerResponse, deliveryId: string | undefined): void {
   if (payload.action !== "submitted" || payload.review?.state?.toUpperCase() !== "CHANGES_REQUESTED") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ignored: true }));
@@ -609,12 +615,13 @@ function handleReviewWebhook(payload: ReviewPayload, res: http.ServerResponse): 
   }
 
   const [reviewOwner, reviewRepo] = repoFullName.split("/");
+  const eventAt = parseEventTimestamp(payload.review?.submitted_at);
   const gate = shouldEnqueueReviewEvent({
     authorType: payload.review?.user?.type,
     body,
     commitId: payload.review?.commit_id,
     headSha: payload.pull_request?.head?.sha,
-    eventAt: parseEventTimestamp(payload.review?.submitted_at),
+    eventAt,
     latestRunDispatchedAt: getLatestDispatchForPr(reviewOwner, reviewRepo, prNumber)?.dispatchedAt ?? null,
   });
   if (!gate.enqueue) {
@@ -624,15 +631,23 @@ function handleReviewWebhook(payload: ReviewPayload, res: http.ServerResponse): 
     return;
   }
 
-  const findingId = upsertReviewFinding({
-    repo: repoFullName,
-    prNumber,
+  const finding: ReviewLedgerFinding = {
     source: "github-review",
     severity: "blocking",
     body,
     ...(payload.review?.html_url ? { url: payload.review.html_url } : {}),
-  });
-  const reviewFixId = enqueueReviewFix({
+  };
+  const outcome = acceptReviewFixWebhookEvent({
+    eventId: resolveReviewFixEventId(deliveryId, {
+      repo: repoFullName,
+      prNumber,
+      kind: "pull_request_review",
+      sourceId: payload.review?.id,
+      actor: payload.review?.user?.login,
+      body,
+      commitId: payload.review?.commit_id,
+      eventAt,
+    }),
     issueId: match.issueId,
     issueIdentifier: match.issueIdentifier,
     repo: repoFullName,
@@ -640,14 +655,19 @@ function handleReviewWebhook(payload: ReviewPayload, res: http.ServerResponse): 
     reason: "changes_requested",
     sourceUrl: payload.review?.html_url,
     actor: payload.review?.user?.login,
-    findingIds: [findingId],
+    findings: [finding],
   });
 
   res.writeHead(200, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ queued: true, findingId, reviewFixId }));
+  res.end(JSON.stringify({
+    queued: true,
+    duplicate: outcome.status === "duplicate",
+    findingId: outcome.findingIds[0],
+    reviewFixId: outcome.reviewFixId,
+  }));
 }
 
-function handleReviewCommentWebhook(payload: ReviewCommentPayload, res: http.ServerResponse): void {
+function handleReviewCommentWebhook(payload: ReviewCommentPayload, res: http.ServerResponse, deliveryId: string | undefined): void {
   if (payload.action !== "created") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ignored: true }));
@@ -673,12 +693,13 @@ function handleReviewCommentWebhook(payload: ReviewCommentPayload, res: http.Ser
   }
 
   const [commentOwner, commentRepo] = repoFullName.split("/");
+  const eventAt = parseEventTimestamp(payload.comment?.created_at);
   const gate = shouldEnqueueReviewEvent({
     authorType: payload.comment?.user?.type,
     body,
     commitId: payload.comment?.commit_id,
     headSha: payload.pull_request?.head?.sha,
-    eventAt: parseEventTimestamp(payload.comment?.created_at),
+    eventAt,
     latestRunDispatchedAt: getLatestDispatchForPr(commentOwner, commentRepo, prNumber)?.dispatchedAt ?? null,
   });
   if (!gate.enqueue) {
@@ -698,17 +719,27 @@ function handleReviewCommentWebhook(payload: ReviewCommentPayload, res: http.Ser
   // genuine "changes requested" verdict arrives separately via handleReviewWebhook
   // (state=CHANGES_REQUESTED), which records the blocking finding. This keeps tool
   // feedback flowing to the fixer without overriding an approving reviewer.
-  const findingId = upsertReviewFinding({
-    repo: repoFullName,
-    prNumber,
+  const finding: ReviewLedgerFinding = {
     source: "github-review-thread",
     severity: "medium",
     body,
     ...(payload.comment?.path ? { path: payload.comment.path } : {}),
     ...(typeof line === "number" ? { line } : {}),
     ...(payload.comment?.html_url ? { url: payload.comment.html_url } : {}),
-  });
-  const reviewFixId = enqueueReviewFix({
+  };
+  const outcome = acceptReviewFixWebhookEvent({
+    eventId: resolveReviewFixEventId(deliveryId, {
+      repo: repoFullName,
+      prNumber,
+      kind: "pull_request_review_comment",
+      sourceId: payload.comment?.id,
+      path: payload.comment?.path,
+      line,
+      actor: payload.comment?.user?.login,
+      body,
+      commitId: payload.comment?.commit_id,
+      eventAt,
+    }),
     issueId: match.issueId,
     issueIdentifier: match.issueIdentifier,
     repo: repoFullName,
@@ -716,11 +747,16 @@ function handleReviewCommentWebhook(payload: ReviewCommentPayload, res: http.Ser
     reason: "review_comment",
     sourceUrl: payload.comment?.html_url,
     actor: payload.comment?.user?.login,
-    findingIds: [findingId],
+    findings: [finding],
   });
 
   res.writeHead(200, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ queued: true, findingId, reviewFixId }));
+  res.end(JSON.stringify({
+    queued: true,
+    duplicate: outcome.status === "duplicate",
+    findingId: outcome.findingIds[0],
+    reviewFixId: outcome.reviewFixId,
+  }));
 }
 
 function handlePullRequestSynchronize(payload: PullRequestPayload, res: http.ServerResponse): void {
@@ -820,6 +856,7 @@ async function handleIssueCommentWebhook(
   res: http.ServerResponse,
   appId?: string,
   privateKey?: string,
+  deliveryId?: string,
 ): Promise<void> {
   if (payload.action !== "created") {
     res.writeHead(200, { "Content-Type": "application/json" });
@@ -944,12 +981,13 @@ async function handleIssueCommentWebhook(
   }
 
   const [issueCommentOwner, issueCommentRepo] = repoFullName.split("/");
+  const eventAt = parseEventTimestamp(payload.comment?.created_at);
   const gate = shouldEnqueueReviewEvent({
     authorType: payload.comment?.user?.type,
     body,
     commitId: undefined,
     headSha: undefined,
-    eventAt: parseEventTimestamp(payload.comment?.created_at),
+    eventAt,
     latestRunDispatchedAt: getLatestDispatchForPr(issueCommentOwner, issueCommentRepo, prNumber)?.dispatchedAt ?? null,
   });
   if (!gate.enqueue) {
@@ -959,8 +997,17 @@ async function handleIssueCommentWebhook(
     return;
   }
 
-  const findingIds = findings.map((finding) => upsertReviewFinding({ repo: repoFullName, prNumber, ...finding }));
-  const reviewFixId = enqueueReviewFix({
+  const outcome = acceptReviewFixWebhookEvent({
+    eventId: resolveReviewFixEventId(deliveryId, {
+      repo: repoFullName,
+      prNumber,
+      kind: "issue_comment",
+      sourceId: payload.comment?.id,
+      actor: payload.comment?.user?.login,
+      body,
+      commitId: undefined,
+      eventAt,
+    }),
     issueId: match.issueId,
     issueIdentifier: match.issueIdentifier,
     repo: repoFullName,
@@ -968,11 +1015,16 @@ async function handleIssueCommentWebhook(
     reason: "claude_review_summary",
     sourceUrl: payload.comment?.html_url,
     actor: payload.comment?.user?.login,
-    findingIds,
+    findings,
   });
 
   res.writeHead(200, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ queued: true, findingIds, reviewFixId }));
+  res.end(JSON.stringify({
+    queued: true,
+    duplicate: outcome.status === "duplicate",
+    findingIds: outcome.findingIds,
+    reviewFixId: outcome.reviewFixId,
+  }));
 }
 
 function isAiImplementNativeReviewBody(body: string): boolean {
@@ -986,6 +1038,50 @@ function parseEventTimestamp(value: string | undefined): number | undefined {
   if (!value) return undefined;
   const ms = Date.parse(value);
   return Number.isNaN(ms) ? undefined : ms;
+}
+
+/**
+ * A stable identity for one webhook-sourced review event, scoped to `acceptReviewFixWebhookEvent`'s
+ * per-repo dedup key (AII-792). GitHub's delivery id (`x-github-delivery`) is preferred — a genuine
+ * redelivery of the same webhook carries the identical GUID. When it is absent (a caller without that
+ * header, a GitHub review/comment id identifies the source object. If neither exists,
+ * a deterministic hash of the fields that
+ * make two events "the same" stands in: two calls with identical repo/PR/kind/actor/body/commit/eventAt/path/line
+ * synthesize to the same id, while a genuinely distinct event (different timestamp, different body, ...)
+ * does not.
+ */
+function resolveReviewFixEventId(
+  deliveryId: string | undefined,
+  parts: {
+    repo: string;
+    prNumber: number;
+    kind: "pull_request_review" | "pull_request_review_comment" | "issue_comment";
+    sourceId?: number;
+    path?: string;
+    line?: number;
+    actor: string | undefined;
+    body: string;
+    commitId: string | undefined;
+    eventAt: number | undefined;
+  },
+): string {
+  if (deliveryId) return `gh-delivery:${deliveryId}`;
+  if (parts.sourceId !== undefined) return `gh-object:${parts.kind}:${parts.sourceId}`;
+  const digest = crypto
+    .createHash("sha256")
+    .update(JSON.stringify([
+      parts.repo,
+      parts.prNumber,
+      parts.kind,
+      parts.actor ?? null,
+      parts.body,
+      parts.commitId ?? null,
+      parts.eventAt ?? null,
+      parts.path ?? null,
+      parts.line ?? null,
+    ]))
+    .digest("hex");
+  return `synthesized:${digest}`;
 }
 
 /**

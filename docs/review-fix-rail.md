@@ -60,6 +60,14 @@ Two consequences worth knowing:
 
 Collection additionally dedupes in memory by normalized body before anything is stored, keeping the variant that carries a file and line over one that does not.
 
+### Revisions
+
+Every row also carries a `revision`, starting at 1 on insert (`upsertReviewFinding`, `src/review-ledger-store.ts`). Every re-report of an existing `(repo, pr_number, finding_key)` row reaches the `ON CONFLICT` branch, regardless of the row's current status, and that branch increments the revision by exactly 1 unconditionally — even when the key and body are byte-identical to the previous report, and even when the row is currently `deferred`. There is no "no-op" re-report that leaves the revision unchanged. Only the `status` and `resolved_at` columns are conditional on the current status (a separate `CASE WHEN` preserves `deferred` rather than reopening them); the revision bump is not gated by it. This is a change from the pre-revision behavior described above: the row still collapses to one, but its revision now moves on every accepted repeat, not just on a substantive edit.
+
+The revision exists so a caller can hold a stale snapshot and detect that the finding moved under it. `markReviewFindingResolvedIfRevision` and `markReviewFindingDeferredIfRevision` (`src/review-ledger-store.ts`) each take an `(id, revision)` pair and update only when the row's current revision still matches — a disposition keyed by an older `(id, revision)` is a no-op against the row, and the newer open report (from the re-report that bumped the revision past the caller's snapshot) is left untouched, still `open`, for the next pass to see. This is what protects a fix run's disposition from silently resolving or deferring a finding that was re-reported after the run took its snapshot.
+
+**These conditional helpers have no current caller.** The legacy disposition path (`markReviewFindingsDeferredByKeys`, used from `src/runner-callback.ts`) still dispositions by key alone, unaware of revisions, and is unchanged by their addition. `markReviewFindingResolvedIfRevision` and `markReviewFindingDeferredIfRevision` exist as the contract surface for a later revision-aware pilot consumer, not as something wired into today's resolution or disposition flow.
+
 ## The four tables
 
 | Table | Grain | Purpose |
@@ -70,6 +78,18 @@ Collection additionally dedupes in memory by normalized body before anything is 
 | `review_fix_dispatches` | one per dispatch id | Snapshot of which finding ids a given dispatch is allowed to resolve |
 
 The queue's one-row-per-PR grain is deliberate. Enqueuing coalesces: a second event for a PR already queued updates the existing row rather than adding another, and if the new reason differs from the stored one the reason becomes `multiple`. Three reviewers commenting in quick succession produce one fix run, not three. The `review_fix_events` table is what preserves the individual triggers, since the queue row itself is overwritten.
+
+## Webhook intake: atomic acceptance and redelivery (AII-792)
+
+The three post-run webhook handlers (`handleReviewWebhook`, `handleReviewCommentWebhook`, and the `claude_review_summary` branch of `handleIssueCommentWebhook`, all in `src/webhook.ts`) do not call `upsertReviewFinding` and `enqueueReviewFix` directly. They go through `acceptReviewFixWebhookEvent` (`src/review-fix-queue.ts`), which wraps both in one `db.transaction()` and writes it to `review_fix_events.source_event_id` before the handler's `res.writeHead(200, ...)` runs — so a process restart between the durable write and the HTTP ACK loses no accepted feedback, and a caller that never sees the ACK (GitHub redelivers on timeout or 5xx) is safe to retry.
+
+Identity is `(repo, source_event_id)`, computed by `resolveReviewFixEventId` in `src/webhook.ts`: GitHub's `x-github-delivery` header when present (`gh-delivery:<id>`), else the GitHub review/comment ID (`gh-object:<kind>:<id>`), else a SHA-256 over `[repo, prNumber, kind, actor, body, commitId, eventAt, path, line]` (`synthesized:<hex>`). `kind` is one of `pull_request_review` / `pull_request_review_comment` / `issue_comment`, so identically-worded feedback on different event types never collides. `acceptReviewFixWebhookEvent` checks this identity first, inside the transaction: a hit returns the originally accepted `findingIds`/`reviewFixId` without touching `review_findings.revision` or inserting a second `review_fix_events`/`review_fix_queue` row — a second delivery is a no-op, not a second fix run. A miss upserts the finding(s) (bumping `revision`, per "Revisions" above) and enqueues, then records the identity on the new `review_fix_events` row. The handler's JSON response carries `duplicate: outcome.status === "duplicate"` so a caller can tell the two cases apart. The unique index is `idx_review_fix_events_source_event` on `review_fix_events(repo, source_event_id) WHERE source_event_id IS NOT NULL` (`src/dedup.ts`) — scoped by repo, so the same id in two different repos is two distinct events.
+
+The gate (`shouldEnqueueReviewEvent`, below) runs before this seam, not inside it: a bot event rejected by the gate (`self`, `stale_head`, `run_after_review`, `missing_fields`) never reaches `acceptReviewFixWebhookEvent` and so never occupies an identity slot. A thrown DB error (e.g. the sqlite handle is unavailable) propagates out of the handler uncaught — no `{ ignored: true }` 200 is written — and the endpoint's caller in `src/index.ts` turns that rejection into a 500, which is what tells GitHub the delivery failed and should be retried. GitHub does not automatically retry a failed delivery on its own; a human (or an operator script) must trigger redelivery from the repo's webhook settings, which reuses the original `x-github-delivery` GUID — this is what makes the delivery-id path effective for that path in particular.
+
+The internal automatic producers use the same transactional acceptance seam with no findings: `guardOpenPrBeforeImplementationDispatch` (`open_pr`) identifies the PR and its most recent source dispatch, while `handleLeaseRejectedFailure` (`lease_rejected`) identifies the failed dispatch. Retrying the same source event does not reset a dispatched queue row; a later dispatch has a new identity and can requeue it. `/ai-implement` (`enqueueCommentGapfill`, `src/comment-gapfill-queue.ts`) uses a separate queue.
+
+This is the "Restate review-fix pilot" webhook intake described in CLAUDE.md's issue-tracker bindings. It durably accepts feedback before choosing a lifecycle owner. A project still defaults to Legacy; when its review-fix lifecycle is set to Restate and its runner mode is GitHub Actions, `processReviewFixQueue` delivers automatic work to the durable inbox and `ReviewFixPR`. Local and human-comment runs remain on the Legacy path.
 
 ## Source, severity, and why an inline comment does not block
 
@@ -203,7 +223,7 @@ A blocked dispatch is a **deferral, not a failure**: the review-fix and comment 
 
 **Open-PR routing** is what gets a selected issue with an existing PR into a `gap-fill` dispatch in the first place, so it reaches `canDispatch` at all instead of racing a fresh implementation onto the same branch — see "A non-webhook enqueue source" just below, `reason: open_pr`.
 
-**Lease rejection.** A push that loses its optimistic-concurrency lease fails as `GIT_LEASE_REJECTED`. `handleLeaseRejectedFailure` (`src/runner-callback.ts:299-345`) asks GitHub who authored the PR's current head commit: a **bot** head re-enqueues a review-fix (`enqueueReviewFix({ ..., reason: "lease_rejected" })`); a **human** head — and an indeterminate/unknown author, since guessing "bot" would race a human mid-edit — instead posts a sticky comment saying a human pushed and that `/ai-implement` resumes the run, and the run stops without retrying.
+**Lease rejection.** A push that loses its optimistic-concurrency lease fails as `GIT_LEASE_REJECTED`. `handleLeaseRejectedFailure` asks GitHub who authored the PR's current head commit: a **bot** head accepts one review-fix event for the failed dispatch (`reason: "lease_rejected"`); a **human** head — and an indeterminate/unknown author, since guessing "bot" would race a human mid-edit — instead posts a sticky comment saying a human pushed and that `/ai-implement` resumes the run, and the run stops without retrying.
 
 **Time limit for in-flight records.** The `in_flight` reason blocks a dispatch for as long as the run record says `running`, so a run that died without reporting would otherwise block its PR forever. `jobTtlDecision` (`src/github-actions-watchdog.ts:56`) and `remediateStuckJob` (`src/stuck-watchdog.ts`) detect a job that has outlived its time limit and close it out with conclusion `ttl_expired` (`src/index.ts:2152-2176`). This is the general job watchdog, not machinery the rail owns — it matters here only because it is what keeps a stuck record from permanently defeating the `in_flight` check.
 
@@ -218,6 +238,16 @@ When `canDispatch` returns `pr_budget` for a gap-fill dispatch, the caller parks
 A human is not stuck once a PR is parked. A `/ai-implement` comment sets `humanRequested`, which bypasses both the budget check and the `parked` check in `canDispatch` (`src/dispatch-gate.ts:43` and `:50`) — so a human can always run one more pass, and that pass still counts against the budget. Parking otherwise persists until a human calls **Unpark** at `/admin` (`unpark`, `src/dispatch-breaker.ts:137-151`), which clears `parked_at` and resets the consecutive-failure counter so a fresh run of failures is required to re-park.
 
 See the glossary's [PR dispatch budget](../CONTEXT.md#pr-dispatch-budget) entry.
+
+## Reported capacity: reservations, not tracker labels or running-job displays
+
+`GET /api/blockers` (`handleListBlockers`, `src/admin.ts`) reports `capacityByMapping`, one entry per mapping key: `{ used, cap, source: "reservations" }`. `used` is `count(mappingKey)` from `src/dispatch-admission.ts` — the unreleased, non-`kg-refresh` row count in `dispatch_admissions`, the exact same read `acquireDispatch` (`src/dispatch-gate.ts`) checks against `cap` before reserving a slot for a planning/implementation dispatch. `cap` is the mapping's own `maxInProgressAiIssues`. `selectBlockers` (`src/poll-selection.ts`) is fed this same per-team count for its `concurrency` reason, so the blocker preview's `used`/`cap` never drifts from the projection: both read `dispatch_admissions`, never a tracker-provider's business-status label.
+
+This is a deliberate authority split, not an oversight:
+
+- **Planning/implementation capacity** (this projection, and `acquireDispatch`'s own check) is reservation-backed: a slot is spent the instant `acquireDispatch`'s transaction commits — before the external launch call — and freed only by an explicit `release` once a launch is confirmed rejected, cancelled, or a run's termination is verified (see AII-783/AII-791). A reservation with no `dispatch_log` `run_id` yet (the launch call hasn't returned) still counts as used; a tracker label that hasn't advanced (or never will, because the provider write failed) never masks it.
+- **`gap-fill`'s `team_capacity` reason** in `canDispatch` (`src/dispatch-gate.ts`, "One writer per PR" above) is a separate, older predicate over `dispatch_log`'s `dispatched`/`running` rows, excluding `kg-refresh` the same way. It is not sourced from `capacityByMapping` and is out of scope for this projection — gap-fill's own migration onto `dispatch_admissions` is a later issue (AII-787).
+- **The Admin UI's own capacity display** (`src/admin-ui/pages/overview.ts`) still independently recomputes an in-progress count client-side from `/api/log` + `/api/mappings` — a *running-job* view, not this reservation authority. The two can disagree in the interim: a reservation is held (and shows in `capacityByMapping`) from the moment `acquireDispatch` commits, while a `dispatch_log` row (and so the overview's count) only exists once the dispatch is actually appended, and only reflects `dispatched`/`running` status, not "reserved". Wiring the overview and blocker views onto `capacityByMapping` is [AII-797](https://linear.app/eudoxus/issue/AII-797/show-reserved-capacity-in-admin-views); until it lands, treat the overview page's number as a display of recent activity, not the admission authority.
 
 ## A non-webhook enqueue source: an issue selected for dispatch that already has an open PR
 
@@ -240,7 +270,7 @@ This check only applies to implementation dispatches, never planning.
 1. Find the mapping whose `owner/repo` matches. **No mapping → `skipped`.**
 2. **Paused project → `skipped`.**
 3. **Snapshot the currently-open finding ids.** This is what the dispatch is permitted to resolve.
-4. Fetch an installation token, then call `getPullRequestState`. **PR merged or closed → `skipped`** with one `[review-fix]` log line; no dispatch is made (`shouldSkipReviewFix` in `src/review-fix-queue.ts`).
+4. Fetch an installation token, then call `getPullRequestState`. **PR merged or closed → `skipped`** with one `[review-fix]` log line; no dispatch is made (`shouldSkipReviewFix` in `src/review-fix-queue.ts`). **PR state unavailable (HTTP error, network failure, or timeout) → keep `pending`** and retry on a later poll. Only a confirmed open PR proceeds to dispatch.
 5. Mint result and progress tokens (only when a runner callback is configured).
 6. Dispatch a `gap-analysis` phase run against the existing PR.
 7. Record the dispatch with its snapshot, then mark the queue row `dispatched`.

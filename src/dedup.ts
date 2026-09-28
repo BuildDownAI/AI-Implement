@@ -44,6 +44,40 @@ function ensureAdminSessionColumns(): void {
   if (!names.has("name")) db.exec("ALTER TABLE admin_sessions ADD COLUMN name TEXT");
 }
 
+/** AII-781: tombstones are tracked independently of payload retention — a delivery
+ *  can be tombstoned without its payload_json being purged, and a later payload-purge
+ *  path (if one is ever added) must not clear this column. `conflict_at` /
+ *  `conflict_count` mark that an identity was reused with different content
+ *  (rejected, not overwritten) without disturbing the originally accepted row. */
+function ensureReviewFixInboxColumns(): void {
+  if (!db) return;
+  const info = db.prepare("PRAGMA table_info(review_fix_inbox)").all() as Array<{ name: string }>;
+  const names = new Set(info.map((c) => c.name));
+  if (!names.has("tombstoned_at")) {
+    db.exec("ALTER TABLE review_fix_inbox ADD COLUMN tombstoned_at INTEGER");
+  }
+  if (!names.has("conflict_at")) {
+    db.exec("ALTER TABLE review_fix_inbox ADD COLUMN conflict_at INTEGER");
+  }
+  if (!names.has("conflict_count")) {
+    db.exec("ALTER TABLE review_fix_inbox ADD COLUMN conflict_count INTEGER NOT NULL DEFAULT 0");
+  }
+}
+
+/** AII-792: the source event identity a webhook-intake caller supplies to
+ *  `acceptReviewFixWebhookEvent` (review-fix-queue.ts) — the GitHub delivery id when
+ *  present, else a synthesized hash. NULL for the pre-existing internal producers
+ *  (open_pr, lease_rejected) that never carry one, so the partial unique index below
+ *  never conflicts across them. */
+function ensureReviewFixEventsColumns(): void {
+  if (!db) return;
+  const info = db.prepare("PRAGMA table_info(review_fix_events)").all() as Array<{ name: string }>;
+  const names = new Set(info.map((c) => c.name));
+  if (!names.has("source_event_id")) {
+    db.exec("ALTER TABLE review_fix_events ADD COLUMN source_event_id TEXT");
+  }
+}
+
 function createRunnerTokensTable(): void {
   if (!db) return;
   db.exec(`
@@ -143,12 +177,20 @@ export function getDb(): Database.Database {
         line INTEGER,
         url TEXT,
         status TEXT NOT NULL DEFAULT 'open',
+        revision INTEGER NOT NULL DEFAULT 1,
         first_seen_at INTEGER NOT NULL,
         last_seen_at INTEGER NOT NULL,
         resolved_at INTEGER,
         UNIQUE (repo, pr_number, finding_key)
       )
     `);
+    // Existing finding identities and history remain untouched. SQLite fills
+    // the new version field as 1 for old rows without a rewrite or backfill.
+    const findingColumns = new Set((db.prepare("PRAGMA table_info(review_findings)").all() as Array<{ name: string }>)
+      .map((column) => column.name));
+    if (!findingColumns.has("revision")) {
+      db.exec("ALTER TABLE review_findings ADD COLUMN revision INTEGER NOT NULL DEFAULT 1");
+    }
     db.exec(`CREATE INDEX IF NOT EXISTS idx_review_findings_open ON review_findings(repo, pr_number, status)`);
     db.exec(`
       CREATE TABLE IF NOT EXISTS review_fix_queue (
@@ -181,8 +223,17 @@ export function getDb(): Database.Database {
         created_at INTEGER NOT NULL
       )
     `);
+    ensureReviewFixEventsColumns();
     db.exec(`CREATE INDEX IF NOT EXISTS idx_review_fix_events_queue ON review_fix_events(queue_id, created_at)`);
     db.exec(`CREATE INDEX IF NOT EXISTS idx_review_fix_events_pr ON review_fix_events(repo, pr_number, created_at)`);
+    // A webhook-intake source event is accepted at most once per repo: a second
+    // insert attempt for the same (repo, source_event_id) is exactly the "duplicate
+    // delivery" case acceptReviewFixWebhookEvent checks for before it ever reaches
+    // this INSERT. NULL source_event_id (the legacy open_pr/lease_rejected producers)
+    // is excluded from the index, since SQLite would otherwise treat repeated NULLs
+    // as distinct anyway — the WHERE clause just makes that explicit.
+    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_review_fix_events_source_event
+      ON review_fix_events(repo, source_event_id) WHERE source_event_id IS NOT NULL`);
     db.exec(`
       CREATE TABLE IF NOT EXISTS review_fix_dispatches (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -195,6 +246,213 @@ export function getDb(): Database.Database {
       )
     `);
     db.exec(`CREATE INDEX IF NOT EXISTS idx_review_fix_dispatches_pr ON review_fix_dispatches(repo, pr_number, created_at)`);
+    // AII-771: additive admission ledger. Consumers and cutover follow in AII-775;
+    // old dispatch history is deliberately not backfilled into active occupancy.
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS dispatch_admissions (
+        dispatch_id TEXT PRIMARY KEY,
+        mapping_key TEXT NOT NULL,
+        issue_scope TEXT NOT NULL,
+        issue_id TEXT NOT NULL,
+        installation_id TEXT,
+        repository TEXT,
+        pr_number INTEGER,
+        lifecycle_owner TEXT NOT NULL,
+        phase TEXT NOT NULL,
+        backend TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        released_at INTEGER,
+        release_reason TEXT,
+        execution_id TEXT,
+        generation INTEGER NOT NULL DEFAULT 0,
+        CHECK (pr_number IS NULL OR (installation_id IS NOT NULL AND repository IS NOT NULL))
+      )
+    `);
+    // AII-775 review fix: a released dispatch_id can be reacquired by a new
+    // owner-equivalent reservation (e.g. two "legacy" holders), so matching
+    // release() on (dispatch_id, lifecycle_owner) alone lets a delayed release
+    // from the first holder clear its replacement. generation disambiguates
+    // successive reservations under the same dispatch_id.
+    const dispatchAdmissionColumns = new Set(
+      (db.prepare("PRAGMA table_info(dispatch_admissions)").all() as Array<{ name: string }>).map(
+        (column) => column.name,
+      ),
+    );
+    if (!dispatchAdmissionColumns.has("generation")) {
+      db.exec("ALTER TABLE dispatch_admissions ADD COLUMN generation INTEGER NOT NULL DEFAULT 0");
+    }
+    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_dispatch_admissions_active_issue
+      ON dispatch_admissions(issue_scope, issue_id)
+      WHERE released_at IS NULL AND pr_number IS NULL`);
+    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_dispatch_admissions_active_pr
+      ON dispatch_admissions(installation_id, repository, pr_number)
+      WHERE released_at IS NULL AND pr_number IS NOT NULL`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_dispatch_admissions_active_mapping
+      ON dispatch_admissions(mapping_key) WHERE released_at IS NULL`);
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS dispatch_budget_entries (
+        dispatch_id TEXT PRIMARY KEY,
+        repository TEXT NOT NULL,
+        pr_number INTEGER NOT NULL,
+        request_kind TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_dispatch_budget_entries_pr_window
+      ON dispatch_budget_entries(repository, pr_number, created_at)`);
+    // AII-774: immutable attempt snapshots and authenticated event inbox. No
+    // consumer is wired here; accepted deliveries retain identity tombstones.
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS review_fix_attempts (
+        attempt_id TEXT PRIMARY KEY,
+        dispatch_id TEXT NOT NULL UNIQUE,
+        mapping_key TEXT NOT NULL,
+        installation_id TEXT NOT NULL,
+        repository TEXT NOT NULL,
+        pr_number INTEGER NOT NULL,
+        issue_scope TEXT NOT NULL,
+        issue_id TEXT NOT NULL,
+        owner TEXT NOT NULL,
+        state TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        deadline_at INTEGER NOT NULL,
+        authority_revoked_at INTEGER,
+        github_run_id INTEGER,
+        github_run_attempt INTEGER,
+        task_snapshot_json TEXT NOT NULL,
+        finding_versions_json TEXT NOT NULL,
+        accepted_result_json TEXT,
+        accepted_result_hash TEXT,
+        result_conflict_at INTEGER,
+        terminal_outcome_json TEXT,
+        completed_at INTEGER,
+        CHECK ((github_run_id IS NULL) = (github_run_attempt IS NULL)),
+        CHECK ((accepted_result_json IS NULL) = (accepted_result_hash IS NULL))
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_review_fix_attempts_pr_history
+      ON review_fix_attempts(installation_id, repository, pr_number, created_at)`);
+    db.exec(`CREATE TRIGGER IF NOT EXISTS trg_review_fix_attempt_owner_immutable
+      BEFORE UPDATE OF owner ON review_fix_attempts
+      WHEN NEW.owner <> OLD.owner
+      BEGIN SELECT RAISE(ABORT, 'review-fix attempt owner is immutable'); END`);
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS review_fix_inbox (
+        authenticated_source TEXT NOT NULL,
+        event_id TEXT NOT NULL,
+        installation_id TEXT NOT NULL,
+        repository TEXT NOT NULL,
+        pr_number INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        payload_hash TEXT NOT NULL,
+        accepted_at INTEGER NOT NULL,
+        delivery_state TEXT NOT NULL DEFAULT 'pending',
+        retry_at INTEGER,
+        delivered_at INTEGER,
+        PRIMARY KEY (authenticated_source, event_id)
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_review_fix_inbox_due
+      ON review_fix_inbox(delivery_state, retry_at, accepted_at)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_review_fix_inbox_pr
+      ON review_fix_inbox(installation_id, repository, pr_number, accepted_at)`);
+    ensureReviewFixInboxColumns();
+    // AII-779: retain bounded redacted activity independently from completed
+    // cycle evidence. The byte tally is updated only after a new event insert,
+    // so replayed identities cannot consume the allowance again.
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS review_fix_activity_streams (
+        attempt_id TEXT PRIMARY KEY,
+        accepted_bytes INTEGER NOT NULL DEFAULT 0
+          CHECK (accepted_bytes BETWEEN 0 AND 10485760),
+        limit_reached_at INTEGER,
+        truncated_at INTEGER,
+        conflict_at INTEGER
+      )
+    `);
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS review_fix_activity_producers (
+        attempt_id TEXT NOT NULL,
+        producer_id TEXT NOT NULL,
+        highest_contiguous_sequence INTEGER NOT NULL DEFAULT -1,
+        final_sequence INTEGER,
+        gap_detected_at INTEGER,
+        limit_reached_at INTEGER,
+        conflict_at INTEGER,
+        PRIMARY KEY (attempt_id, producer_id),
+        CHECK (highest_contiguous_sequence >= -1),
+        CHECK (final_sequence IS NULL OR final_sequence >= 0)
+      )
+    `);
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS review_fix_activity (
+        attempt_id TEXT NOT NULL,
+        producer_id TEXT NOT NULL,
+        sequence INTEGER NOT NULL CHECK (sequence >= 0),
+        payload_hash TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        cycle INTEGER NOT NULL CHECK (cycle > 0),
+        occurred_at INTEGER NOT NULL,
+        redacted_payload_json TEXT NOT NULL,
+        byte_count INTEGER NOT NULL
+          CHECK (byte_count = length(CAST(redacted_payload_json AS BLOB))
+            AND byte_count BETWEEN 0 AND 16384),
+        PRIMARY KEY (attempt_id, producer_id, sequence)
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_review_fix_activity_cycle
+      ON review_fix_activity(attempt_id, cycle, occurred_at)`);
+    db.exec(`CREATE TRIGGER IF NOT EXISTS trg_review_fix_activity_conflicting_replay
+      BEFORE INSERT ON review_fix_activity
+      WHEN EXISTS (
+        SELECT 1 FROM review_fix_activity AS existing
+        WHERE existing.attempt_id = NEW.attempt_id
+          AND existing.producer_id = NEW.producer_id
+          AND existing.sequence = NEW.sequence
+          AND (existing.payload_hash <> NEW.payload_hash
+            OR existing.kind <> NEW.kind OR existing.cycle <> NEW.cycle
+            OR existing.occurred_at <> NEW.occurred_at
+            OR existing.redacted_payload_json <> NEW.redacted_payload_json
+            OR existing.byte_count <> NEW.byte_count)
+      )
+      BEGIN SELECT RAISE(ABORT, 'conflicting review-fix activity replay'); END`);
+    db.exec(`CREATE TRIGGER IF NOT EXISTS trg_review_fix_activity_immutable
+      BEFORE UPDATE ON review_fix_activity
+      BEGIN SELECT RAISE(ABORT, 'review-fix activity is immutable'); END`);
+    db.exec(`CREATE TRIGGER IF NOT EXISTS trg_review_fix_activity_bytes_monotonic
+      BEFORE UPDATE OF accepted_bytes ON review_fix_activity_streams
+      WHEN NEW.accepted_bytes < OLD.accepted_bytes
+      BEGIN SELECT RAISE(ABORT, 'review-fix activity byte count cannot decrease'); END`);
+    db.exec(`CREATE TRIGGER IF NOT EXISTS trg_review_fix_activity_count_bytes
+      AFTER INSERT ON review_fix_activity
+      BEGIN
+        INSERT OR IGNORE INTO review_fix_activity_streams (attempt_id)
+          VALUES (NEW.attempt_id);
+        UPDATE review_fix_activity_streams
+          SET accepted_bytes = accepted_bytes + NEW.byte_count
+          WHERE attempt_id = NEW.attempt_id;
+      END`);
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS review_fix_cycles (
+        attempt_id TEXT NOT NULL,
+        cycle INTEGER NOT NULL CHECK (cycle > 0),
+        summary_id TEXT NOT NULL UNIQUE,
+        summary_hash TEXT NOT NULL,
+        input_commit TEXT,
+        output_commit TEXT,
+        dispositions_json TEXT NOT NULL,
+        tests_json TEXT NOT NULL,
+        verdict TEXT NOT NULL,
+        usage_json TEXT NOT NULL,
+        completed_at INTEGER NOT NULL,
+        PRIMARY KEY (attempt_id, cycle)
+      )
+    `);
+    db.exec(`CREATE TRIGGER IF NOT EXISTS trg_review_fix_cycle_identity_immutable
+      BEFORE UPDATE OF summary_id ON review_fix_cycles
+      WHEN NEW.summary_id <> OLD.summary_id
+      BEGIN SELECT RAISE(ABORT, 'review-fix cycle identity is immutable'); END`);
     db.exec(`
       CREATE TABLE IF NOT EXISTS comment_gapfill_queue (
         id INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -5,6 +5,7 @@ import { createRequire } from "node:module";
 import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
 import { stopChildWithBackstop } from "../process-stop.js";
+import { setRestateStatus } from "./status.js";
 
 const require = createRequire(import.meta.url);
 
@@ -43,6 +44,32 @@ export function restateDataDir(
   return path.join(path.dirname(dedupDbPath), "restate");
 }
 
+/**
+ * Every operator-set `RESTATE_*` key in the given environment, forwarded by prefix match so
+ * a future override (not one of the fixed constants below) still reaches the child. Callers
+ * apply this first, then overwrite with the fixed constants so those always win on collision.
+ */
+function restateEnvOverrides(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const overrides: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(env)) {
+    if (key.startsWith("RESTATE_") && value !== undefined) overrides[key] = value;
+  }
+  return overrides;
+}
+
+interface Deferred<T> {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+}
+
+function createDeferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
+}
+
 /** For testing: override internal I/O without touching the real filesystem, process table, or network. */
 interface RestateSidecarDeps {
   httpGet?: (url: string) => Promise<boolean>;
@@ -74,6 +101,16 @@ export interface RestateSidecarOptions {
  * Wire-up in main() (src/index.ts): construct once, call start() before loadConfig(); on
  * success start the SDK endpoint and register it. Call stop() inside the shutdown closure
  * before server.close() — same two points as KgSidecar.
+ *
+ * Late readiness: a readiness timeout no longer gives up. start() still resolves its
+ * original boolean at the timeout deadline (main()'s existing call sites are unchanged),
+ * but polling continues in the background against the same child — whenReady() exposes
+ * that continuation, resolving true if the child later answers healthy, or false once the
+ * child exits. Sidecar lifecycle state is reported through the shared status contract
+ * (./status.js, AII-773); this class writes to it, AII-807 wires it into a route.
+ *
+ * restart() is the only re-spawn path — mirrors KgSidecar.restart() (stop() then start()).
+ * There is no automatic restart when the child exits unexpectedly.
  */
 export class RestateSidecar {
   private readonly _dataDir: string;
@@ -85,6 +122,8 @@ export class RestateSidecar {
   private readonly _resolveBinary: () => string | null;
   private _child: ChildProcess | null = null;
   private _stopPromise: Promise<void> | null = null;
+  private _readyDeferred: Deferred<boolean> | null = null;
+  private _backgroundPollTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(opts?: RestateSidecarOptions, _deps?: RestateSidecarDeps) {
     this._dataDir = opts?.dataDir ?? restateDataDir();
@@ -97,16 +136,32 @@ export class RestateSidecar {
   }
 
   /**
+   * Resolves once the sidecar spawned by the most recent start() either becomes ready
+   * (immediately, or later via background polling after a readiness timeout) or exits.
+   * Resolves false if start() has never been called.
+   */
+  whenReady(): Promise<boolean> {
+    return this._readyDeferred ? this._readyDeferred.promise : Promise.resolve(false);
+  }
+
+  /**
    * Spawns the sidecar and polls its admin API for up to pollTimeoutMs. Resolves to
-   * whether the sidecar is ready. All failure modes (missing binary, early exit,
-   * readiness timeout) are logged once and non-fatal.
+   * whether the sidecar is ready by that deadline. All failure modes (missing binary,
+   * early exit, readiness timeout) are logged once and non-fatal. A readiness timeout
+   * does not stop the sidecar — polling continues in the background; see whenReady().
    */
   async start(): Promise<boolean> {
+    const deferred = createDeferred<boolean>();
+    this._readyDeferred = deferred;
+    setRestateStatus({ sidecar: { state: "starting" } });
+
     const bin = this._resolveBinary();
     if (!bin) {
       console.error(
         `[restate] no @restatedev/restate-server platform binary for ${os.platform()}-${os.arch()} — continuing without sidecar`,
       );
+      setRestateStatus({ sidecar: { state: "missing-binary" } });
+      deferred.resolve(false);
       return false;
     }
 
@@ -116,15 +171,27 @@ export class RestateSidecar {
     // server's config-rs double-underscore env convention (RESTATE_INGRESS__BIND_ADDRESS /
     // RESTATE_ADMIN__BIND_ADDRESS); the embedded store's location is the top-level
     // `base-dir` key, RESTATE_BASE_DIR.
-    const childEnv: NodeJS.ProcessEnv = {
-      ...process.env,
+    //
+    // childEnv is an explicit allowlist (AII-728), never `...process.env`: the sidecar is a
+    // separate binary that has no business seeing the orchestrator's full environment (GitHub
+    // App keys, ticketing tokens, etc). PATH/HOME/TMPDIR/TZ are the process-hygiene basics a
+    // spawned binary needs; every RESTATE_* key already set as a fixed constant below is
+    // forwarded explicitly, and any operator-set RESTATE_* override in process.env (for
+    // example a future knob) is forwarded by prefix match, with the fixed constants winning
+    // on key collision.
+    const childEnv: NodeJS.ProcessEnv = { ...restateEnvOverrides(process.env) };
+    for (const key of ["PATH", "HOME", "TMPDIR", "TZ"] as const) {
+      const value = process.env[key];
+      if (value !== undefined) childEnv[key] = value;
+    }
+    Object.assign(childEnv, {
       RESTATE_INGRESS__BIND_ADDRESS: RESTATE_INGRESS_BIND_ADDRESS,
       RESTATE_ADMIN__BIND_ADDRESS: RESTATE_ADMIN_BIND_ADDRESS,
       RESTATE_BASE_DIR: this._dataDir,
       RESTATE_BIND_ADDRESS: RESTATE_BIND_ADDRESS,
       RESTATE_DEFAULT_NUM_PARTITIONS: RESTATE_DEFAULT_NUM_PARTITIONS,
       RESTATE_ROCKSDB_TOTAL_MEMORY_SIZE: RESTATE_ROCKSDB_TOTAL_MEMORY_SIZE,
-    };
+    });
 
     const child = this._spawn(bin, ["--no-logo"], {
       stdio: ["ignore", "inherit", "inherit"],
@@ -133,19 +200,33 @@ export class RestateSidecar {
     this._child = child;
 
     let childDead = false;
+    let exitLogged = false;
     child.on("error", (err) => {
       console.error(`[restate] sidecar process error: ${err.message}`);
       childDead = true;
       if (this._child === child) this._child = null;
+      setRestateStatus({ sidecar: { state: "exited", code: null, signal: null } });
+      deferred.resolve(false);
+    });
+    child.on("exit", (code, signal) => {
+      childDead = true;
+      if (exitLogged) return;
+      exitLogged = true;
+      console.error(`[restate] sidecar exited (code=${code ?? "null"}, signal=${signal ?? "null"})`);
+      setRestateStatus({ sidecar: { state: "exited", code, signal } });
+      deferred.resolve(false);
     });
     child.on("close", () => {
       childDead = true;
       if (this._child === child) this._child = null;
     });
 
-    const ready = await this._pollReadiness(child, () => childDead);
+    const ready = await this._pollReadiness(child, () => childDead, deferred);
 
-    if (!ready) {
+    if (ready) {
+      setRestateStatus({ sidecar: { state: "ready" } });
+      deferred.resolve(true);
+    } else {
       console.error("[restate] continuing without sidecar; restate-dependent routes answer 503");
     }
 
@@ -156,8 +237,15 @@ export class RestateSidecar {
    * Stops the sidecar with a bounded wait.
    * Re-entrant: concurrent calls return the same in-flight promise.
    * A child that does not exit within stopTimeoutMs is SIGKILLed.
+   * Clears any background readiness polling and settles a pending whenReady() to false.
    */
   stop(): Promise<void> {
+    if (this._backgroundPollTimer !== null) {
+      clearTimeout(this._backgroundPollTimer);
+      this._backgroundPollTimer = null;
+    }
+    this._readyDeferred?.resolve(false);
+
     if (this._stopPromise !== null) return this._stopPromise;
     if (this._child === null) return Promise.resolve();
     this._stopPromise = this._doStop().finally(() => {
@@ -166,7 +254,20 @@ export class RestateSidecar {
     return this._stopPromise;
   }
 
-  private async _pollReadiness(child: ChildProcess, isDead: () => boolean): Promise<boolean> {
+  /**
+   * Stops then starts the sidecar — the only re-spawn path. Mirrors KgSidecar.restart()
+   * (src/kg-sidecar.ts); there is no automatic restart when the child exits unexpectedly.
+   */
+  async restart(): Promise<boolean> {
+    await this.stop();
+    return this.start();
+  }
+
+  private async _pollReadiness(
+    child: ChildProcess,
+    isDead: () => boolean,
+    deferred: Deferred<boolean>,
+  ): Promise<boolean> {
     const deadline = Date.now() + this._pollTimeoutMs;
 
     console.error(`[restate] sidecar starting (pid ${child.pid ?? "?"}) — polling ${RESTATE_HEALTH_URL}`);
@@ -194,7 +295,46 @@ export class RestateSidecar {
     console.error(
       `[restate] sidecar readiness timeout after ${this._pollTimeoutMs / 1_000} s — degraded mode`,
     );
+
+    // The child may have died in the instant between the loop's last check and the
+    // deadline; if so its own "exit" handler already logged and settled whenReady().
+    if (!isDead()) {
+      setRestateStatus({ sidecar: { state: "timeout" } });
+      this._pollInBackground(child, isDead, deferred);
+    }
+
     return false;
+  }
+
+  /**
+   * Continues polling the same child after a readiness timeout, resolving `deferred`
+   * true the first time it answers healthy. Self-terminates — without touching
+   * `deferred` — once `child` is no longer the current child (stop()/restart() swapped
+   * it out) or it has exited (its own "exit" handler already settled `deferred`).
+   */
+  private _pollInBackground(child: ChildProcess, isDead: () => boolean, deferred: Deferred<boolean>): void {
+    const attempt = async (): Promise<void> => {
+      this._backgroundPollTimer = null;
+
+      if (this._child !== child || isDead()) return;
+
+      const ready = await this._httpGet(RESTATE_HEALTH_URL);
+
+      if (this._child !== child || isDead()) return;
+
+      if (ready) {
+        console.error(`[restate] sidecar ready after degraded period (pid ${child.pid ?? "?"})`);
+        setRestateStatus({ sidecar: { state: "ready" } });
+        deferred.resolve(true);
+        return;
+      }
+
+      this._backgroundPollTimer = setTimeout(() => {
+        void attempt();
+      }, this._pollIntervalMs);
+    };
+
+    void attempt();
   }
 
   private async _doStop(): Promise<void> {

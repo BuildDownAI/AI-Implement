@@ -40,6 +40,8 @@ export interface LocalRunnerInput {
 
 export interface StartLocalContainerInput extends LocalRunnerInput {
   containerName?: string;
+  /** Called after preparation, immediately before the Docker command can launch a container. */
+  onBeforeLaunch?: () => void;
 }
 
 export interface LocalContainerState {
@@ -135,6 +137,7 @@ export async function startLocalRunnerContainer(input: StartLocalContainerInput)
   const containerName = nameIndex >= 0 ? args[nameIndex + 1] : "";
 
   try {
+    input.onBeforeLaunch?.();
     const { stdout } = await execFile("docker", args);
     return { containerId: stdout.trim(), containerName };
   } catch (err) {

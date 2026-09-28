@@ -1,5 +1,6 @@
 import type {
   AIImplementSnapshot,
+  FeatureNodeRollUp,
   IssueLifecycleState,
   TicketIssue,
   TicketingProvider,
@@ -76,7 +77,12 @@ export class FakeProvider implements TicketingProvider {
         inProgressCountsByScope[issue.scopeKey] = (inProgressCountsByScope[issue.scopeKey] ?? 0) + 1;
       }
     }
-    return { needsPlanning, readyForImplementation, inProgressCountsByScope };
+    return { needsPlanning, readyForImplementation, inProgressCountsByScope, parentsToFinalize: [] };
+  }
+
+  async fetchFeatureNodeRollUps(): Promise<FeatureNodeRollUp[]> {
+    await this.tick("fetchFeatureNodeRollUps", []);
+    return [];
   }
 
   async fetchLifecycleStates(issueIds: string[]): Promise<Map<string, IssueLifecycleState>> {
@@ -123,6 +129,11 @@ export class FakeProvider implements TicketingProvider {
     await this.tick("clearWorkingState", [issueId, scopeKey]);
     this.transition(issueId, "cleared");
     return true;
+  }
+  async markMerged(issueId: string, scopeKey: string): Promise<void> {
+    await this.tick("markMerged", [issueId, scopeKey]);
+    this.transition(issueId, "cleared");
+    this.setLifecycle(issueId, "completed");
   }
   async postComment(issueId: string, body: string): Promise<void> {
     await this.tick("postComment", [issueId, body]);

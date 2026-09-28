@@ -33,7 +33,9 @@ describe("dependency direction: the main pipeline never reaches into Restate (AI
 // for a *type* import (its `callTool` reference is used purely for a parameter type, never
 // invoked), so it carries no runtime dependency on Restate — that's checked separately below.
 describe("import allowlist: only the door adapters may import Restate from outside src/restate/ (AII-717)", () => {
-  const ALLOWLIST = new Set(["src/mcp.ts", "src/mcp-oauth.ts", "src/admin.ts", "src/index.ts"]);
+  // deploy.ts is the self-deployment door: it probes the old Restate endpoint
+  // before replacing the process (AII-810), without importing the SDK itself.
+  const ALLOWLIST = new Set(["src/mcp.ts", "src/mcp-oauth.ts", "src/admin.ts", "src/index.ts", "src/deploy.ts"]);
 
   function listTsFiles(dir: string): string[] {
     const entries = readdirSync(dir, { withFileTypes: true });
@@ -91,12 +93,20 @@ describe("import allowlist: only the door adapters may import Restate from outsi
     }
   });
 
+  it("src/deploy.ts imports only the endpoint drain adapters, never the SDK", () => {
+    const imports = extractImportSpecifiers(readFileSync("src/deploy.ts", "utf8"))
+      .filter((entry) => isRestateSpecifier(entry.source))
+      .map((entry) => entry.source)
+      .sort();
+    expect(imports).toEqual(["./restate/drain.js", "./restate/endpoint.js", "./restate/server.js"]);
+  });
+
   // Regression proof for the allowlist test itself (acceptance criterion): temporarily adding
   // `import "./restate/tools-client.js";` to src/stuck-watchdog.ts and rerunning `npm test`
   // makes the first test above fail with that file listed in `violations`, confirmed by hand
   // and reverted before this PR — see the PR description for the before/after transcript.
-  it("sanity: the allowlist actually contains the four documented adapters, nothing else", () => {
-    expect([...ALLOWLIST].sort()).toEqual(["src/admin.ts", "src/index.ts", "src/mcp-oauth.ts", "src/mcp.ts"]);
+  it("sanity: the allowlist contains only the documented door and deployment adapters", () => {
+    expect([...ALLOWLIST].sort()).toEqual(["src/admin.ts", "src/deploy.ts", "src/index.ts", "src/mcp-oauth.ts", "src/mcp.ts"]);
   });
 });
 

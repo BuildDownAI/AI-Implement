@@ -157,3 +157,15 @@ The PR dispatch budget is the number of gap-fill runs the orchestrator may start
 The pickup label is the one Linear label whose presence makes an issue a dispatch candidate for an orchestrator. It defaults to `AI-Implement` and is set once per orchestrator.
 
 **Not to be confused with:** The lifecycle labels (`AI-Planning`, `AI-Working`, `Plan-Complete`, `Ready for Review`), which the orchestrator writes to record run state and which are not configurable.
+
+## Review-fix attempt
+
+A review-fix attempt is one authorized runner execution that addresses review feedback on an existing PR. An infrastructure retry keeps the attempt's identity; a replacement runner starts a new attempt.
+
+**Not to be confused with:** A review-fix run, which is the orchestrator dispatch that may contain a Restate-tracked attempt; or an internal review/fix cycle within the runner.
+
+## Lifecycle owner
+
+The lifecycle owner is the system responsible for coordinating one attempt from admission to its final outcome. An attempt keeps its owner when an operator changes the setting for future attempts.
+
+**Not to be confused with:** The execution backend that runs the code-changing process.

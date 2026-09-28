@@ -169,20 +169,76 @@ Docker must be running. The first run pulls `restatedev/restate:1.7.10`. Things 
 - A deployment's handler metadata is empty until a handler has been invoked once in that environment. Call the handler, then read `GET <adminAPIBaseUrl>/services/<name>`.
 - The `disableRetries` variant fails a throwing handler at once. A scenario that needs a retry to succeed runs against `alwaysReplay` only, with a comment.
 - Module-level setters (`setKgMemoryProvider`, `setActiveKgRefresh`, `setProviderRegistry`, `setRefreshAuthority`) are process globals. Set them in `beforeAll` or the test, and reset them in `afterEach` where a test changes them.
-- `RestateTestEnvironment.start` hosts the services on its own endpoint. `src/restate/endpoint.ts` (`startRestateEndpoint`, `register`, `RESTATE_SERVICES`) is not exercised by this tier; `register()` is unit-tested against a faked admin API only.
+- `RestateTestEnvironment.start` hosts the services on its own endpoint and is what every other file in this folder uses. `src/restate/endpoint.ts` (`startRestateEndpoint`, `register`, `RESTATE_SERVICES`) is the one exception: `endpoint.restate.test.ts` (AII-727, below) manages its own `RestateContainer` specifically so it can call those functions directly, rather than going through the harness's own internal registration.
 
-## Coverage as of the AII-687 tree (2026-09-17)
+## Container-to-host reachability for a real `startRestateEndpoint()` / `register()` test (AII-727)
+
+`endpoint.restate.test.ts` is the one file in this folder that does not call `startVariants()` — it needs to invoke `startRestateEndpoint()` and `register()` itself, against a container it manages directly, and `RestateTestEnvironment.start()` offers no way to boot a container without also auto-registering its own internal endpoint. This surfaces a reachability problem none of the other files hit: `restate-server`, running inside the container, must open an HTTP/2 connection back out to this process's SDK endpoint to complete registration (the admin API's `POST /deployments` runs service discovery against the given URI synchronously), and a loopback bind on the host side is not reachable from inside a container's own network namespace.
+
+The fix carries no change to `src/restate/endpoint.ts`: this process's SDK endpoint keeps the production bind, `127.0.0.1` (`restateBindAddress()`'s default — ADR 023's loopback-only rule is never relaxed for this test), and the test calls `TestContainers.exposeHostPorts(port)` before starting the container. That is the same `"testcontainers"` service-endpoint-access mode `@restatedev/restate-sdk-testcontainers`'s own `RestateTestEnvironment.start()` offers (its other mode, `"docker-host"`, is the default every other file in this folder uses indirectly, via the harness) — it starts a small proxy container and tunnels `host.testcontainers.internal:<port>`, as seen from any container in the test run, back to `127.0.0.1:<port>` on the host.
+
+One wrinkle remains, specific to calling `register()` directly: `restateBindAddress()` supplies both this process's bind address and, inside `register()`, the registered `uri` — a single value serving two different purposes here (the interface this process listens on, and the address the container must be told to dial). The test's `tunnelingFetch` helper rewrites that one literal `host:port` substring in the outgoing request body, from the real bind address to the tunnel address, using the `fetchImpl` seam `register()` already exposes for testing — nothing in `src/restate/endpoint.ts` changes. The same rewrite also fixes up the internal `/query` call `queryNonCompletedInvocations()` makes on a conflict, since its SQL embeds the identical `uri` text in a `WHERE endpoint = '...'` clause that must match whatever `register()` actually sent to the admin API.
+
+This mechanism runs in the `restate-tests` CI job like every other file in this folder (Docker required); it was not exercised against a live container in the session that wrote it, for lack of a local Docker daemon — see the file's own header comment for the full reasoning trail.
+
+## Coverage as of the AII-727 tree (2026-09-25)
 
 What the Restate tier proves today: exclusive-handler serialisation, the in-window grace path, unknown-hash and expired handling, `revoke`, `describe`, replay determinism across both variants, the `tool()` wrapper's role, error, and suspension behaviour over the real wire, the migrated read handlers through the ingress, the ingress serde 4xx, discovery metadata and projected schemas for reads and writes, a user refused a write over the wire, idempotency-key dedup on `pause_project`, and engine retry on a raw handler. The write tools' business logic has a full fake-backed unit tier.
+
+AII-727 closes five of the gaps this section used to list:
+
+- **The stale-hash `clearAll` branch** now runs against the real `refresh` handler (`operatorObject.object.refresh`, called through a fake `ObjectContext` — the SDK's own public `VirtualObjectDefinition` type only declares `name`; the registered handler functions live on a runtime-only `object` property) in `operator-object.test.ts`, one tick past `GRACE_MS` and again exactly at the boundary. Deleting `if (decision.clear) ctx.clearAll()` fails this suite.
+- **`startRestateEndpoint()` and `RESTATE_SERVICES`** are exercised end to end against a real server 1.7.10 in `endpoint.restate.test.ts` (both bound services answer through the container ingress after a real registration), plus a static unit-tier pin in `restate-endpoint.test.ts` (`RESTATE_SERVICES.map(s => s.name)`).
+- **`register()` itself has met a real admin API.** `endpoint-registration.restate.test.ts` (AII-721, already in the tree before this issue) proved the drain-check helper, `queryNonCompletedInvocations()`, against a real admin API in isolation — zero, a suspended-plus-queued pair, and persistent Virtual Object state not counting. `endpoint.restate.test.ts` (AII-727) is what proves `register()`'s own orchestration around that already-proven helper: an unchanged re-registration stays success, and a changed service set at the same URI is `declined-conflict` while a non-completed invocation is pinned to the old deployment and `registered-drained-force` once it drains — using a genuinely in-flight invocation (the `refresh` test seam below), not a fake invocation count.
+- **`RestateRefreshAuthority` has met a real ingress**: `operator-object.restate.test.ts` runs `rotate()` with the allowlist mocked to deny, against the real container — `denied`, exactly one `POST .../revoke` (a spy wrapping the real `fetchImpl`), and a subsequent `describe` returning all-null.
+- **`describe` during an in-flight exclusive `refresh`**: `operator-object.restate.test.ts` starts a `refresh` call carrying a new, test-only `sleepMs` field (`src/restate/operator-object.ts`) that makes the handler durably sleep — still holding the exclusive lock — before deciding; a concurrent `describe` on the same key answers well before the sleep's own deadline. `sleepMs` is inert whenever omitted, which is every production call path, so it never touches `decideRefresh`'s branch or the alwaysReplay-vs-disableRetries equivalence check in the same file.
 
 Known gaps, for the next issue that touches the area:
 
 | Gap | Why it matters |
 |---|---|
-| `refresh` with a stale previous hash (outside the grace window) never runs against a real or fake context; only `decideRefresh` is tested for that branch | The `if (decision.clear) ctx.clearAll()` line is the theft-revocation path. Deleting it passes the suite |
-| `startRestateEndpoint()` and the `RESTATE_SERVICES` list have no test | Dropping a service from the list passes every test; in production `register()` succeeds against an endpoint that does not serve it |
-| `register()` has never met a real admin API | A Restate release that changes the `META0004` code or the no-op semantics leaves the unit tests green |
-| `RestateRefreshAuthority` has never met a real ingress | The production client's URL, body, and empty-body handling are checked against a faked `fetch` only |
-| `describe` during an in-flight exclusive `refresh` | The `shared` handler's non-blocking claim is asserted nowhere |
-| The real `restate-server` binary is never spawned in a test | The `RESTATE_*__*` env keys are verified by hand with `--dump-config`, not by a test |
+| The real `restate-server` binary is never spawned in a test | The `RESTATE_*__*` env keys are verified by hand with `--dump-config`, not by a test. (`endpoint.restate.test.ts`'s container runs the Docker *image*, not the `@restatedev/restate-server` platform binary `RestateSidecar` spawns in production — a different artifact) |
 | `restate-tests` is not a required check on `testing` | A red job does not block a merge until an operator marks the check required |
+
+## `review-fix-pilot.restate.test.ts`: the production-composition fault matrix (AII-813)
+
+`review-fix-attempt.restate.test.ts` (AII-796) and `review-fix-pr.restate.test.ts` (AII-800)
+prove the durable workflow and PR coordinator against fully in-memory `store`/`worker`/
+`finalizer` doubles — fast, but they never exercise `SqliteReviewFixAttemptStore`'s real
+admission SQL, `review-fix-finalize.ts`'s real approval-effect idempotency, `review-fix-inbox.ts`'s
+real delivery ledger, or `GithubReviewFixWorker`/`createReviewFixGithubAdapter`'s real
+reconciliation logic. `review-fix-pilot.restate.test.ts` composes those production modules for
+real — the same `createReviewFixPR` / `createReviewFixAttempt` / `SqliteReviewFixAttemptStore` /
+`createReviewFixFinalizer` / `GithubReviewFixWorker` / `createReviewFixGithubAdapter` /
+`ReviewFixDeliveryPump` a live pilot would run — and fakes only the external GitHub transport,
+the GitHub REST fetch layer, and the PR coordinator's admission-eligibility/pending-feedback
+reads (the same seams `review-fix-production.ts` itself calls out to GitHub for). Both files stay
+in the tree; this one does not re-prove the fixed 5-second coalescing window's exact timing,
+which AII-800's suite already covers precisely against a faster-to-assert fake.
+
+**What this file's assertions are proof of, by claim type:**
+
+| Claim | Kind | Where |
+|---|---|---|
+| Admission SQL (capacity, PR budget, pause, 30-finding cap, re-admission of a re-reported finding) is race-free and idempotent under real `dispatch_admissions`/`dispatch_budget_entries`/`review_fix_attempts` writes | Real engine + real SQLite | every "Admission:" scenario |
+| A crashed `ctx.run` step (admission commit before journal, result commit before ACK) converges to exactly one durable effect on engine retry | Real engine + real SQLite | the two `alwaysReplay`-only "crash window" scenarios, `crashAfterFirstCall` |
+| A crashed inbox delivery (HTTP ack lost after the real handler ran) redelivers to exactly one outcome | Real engine + real SQLite + real `ReviewFixDeliveryPump`/facade | "inbox commit before ACK" |
+| Authenticated runner activity enforces the 16 KiB event and 10 MiB attempt caps, records sequence gaps/final markers, and still accepts cycle evidence after the stream limit | Real callback validator + real SQLite activity/evidence stores; admission uses the real engine, while runner payloads are simulated | "authenticated activity intake preserves gaps" |
+| Authenticated runner result intake commits one durable inbox delivery, acknowledges identical retries, and records conflicting retries without approval | Real callback validator + real SQLite result/inbox stores + real delivery pump and engine; runner result payloads are simulated | "authenticated result ingress commits one inbox delivery" |
+| A crashed approval-effect write reconciles via `retryApprovalEffect` without a second GitHub write | Real engine + real SQLite + real finalizer, simulated GitHub write (fake `fetch`) | "final approval effect before acknowledgement" |
+| Cancellation whose accepted GitHub stop response is lost preserves occupancy across SDK endpoint and Restate container restart until the exact run is verified stopped | Real engine + real SQLite, simulated GitHub Actions cancel/status API | "a lost cancellation acknowledgement and endpoint restart" |
+| Launch response loss, uncertain-launch reconciliation (including the two-minute-equivalent unknown-launch alert actually firing), definitive rejection, duplicate/conflicting result intake, a stale result delivered after the attempt's final outcome (alerts, never rewrites the recorded outcome), GitHub-success-without-result, cancel/closed-PR/unverifiable-termination | Real engine + real SQLite + real worker/finalizer adapters, simulated GitHub Actions API (fake transport/fetch) | the matching named scenarios |
+| GitHub-success-without-result specifically never approves *before* the deadline, not just *at* it | Real engine + real SQLite, checked directly against `review_fix_attempts.terminal_outcome_json`/`accepted_result_json` and `dispatch_admissions.released_at` partway through a real (short) deadline window — `RestateTestEnvironment` has no virtual-clock/timer-control API to fast-forward past the wait instead (confirmed against its type declarations), so this mid-window SQLite read, not a simulated clock, is the deterministic "not yet" proof | "GitHub success without a stored result never approves and stops without approval at the deadline" |
+| A restart (replaced SDK endpoint + restarted, disk-backed Restate container) resumes the same attempt from the same SQLite row and the same journal | Real engine + real SQLite, across a genuine container restart | the final "restart" scenario |
+| GitHub's actual dispatch/reconcile/check-run/review/merge-policy behavior, its actual rate limits, and its actual eventual consistency (e.g. `workflow_dispatch` run-listing lag) | **Not proven here** — simulated by hand-built fixtures | needs live evidence |
+| The literal two real minutes of `REVIEW_FIX_UNKNOWN_LAUNCH_ALERT_MINUTES` elapsing in production | **Not proven here** — `review-fix-attempt.ts`'s workflow now accepts an optional `unknownLaunchAlertMs` override (defaulting to the real two minutes; production composition leaves it unset), and this suite's shared `attemptWorkflow` supplies a one-second value so the uncertain-launch scenario asserts the `alert-unknown-launch` callback actually fires (reason including "launch identity still unresolved") without a 120s+ test. This proves the alert-firing code path — the same comparison and callback production uses — end to end against the real engine; it does not independently exercise the production constant's literal value, which is a one-line arithmetic input to that same path | a long-running live/soak test is the only way to observe the real two-minute constant elapse; not required for AII-813 |
+| Deployment drain (`register()`'s conflict/force-registration path) and the workflow/journal/idempotency retention configuration | Already proven elsewhere, not duplicated here | `endpoint.restate.test.ts` / `endpoint-registration.restate.test.ts` (drain); `REVIEW_FIX_RETENTION_MS` metadata assertion in `review-fix-attempt.restate.test.ts` (retention) |
+| Real Fly Machines/GitHub Actions runner container behavior under the pilot | **Not proven anywhere in this repo's test tree** | needs live evidence — this is the same class of gap the "real `restate-server` binary" row above already names for the engine itself |
+
+This file was authored in a session with no local Docker daemon (`docker info` failed), the same
+constraint `endpoint.restate.test.ts` (AII-727) recorded in its own header comment and in this
+doc's "Container-to-host reachability" section above. CI has since run `npm run test:restate`
+against pinned server 1.7.10; this is container evidence, not a live pilot rollout, and
+its pass/fail there — not this document — is the authoritative evidence for AII-813's "both
+container variants and SDK boundary suite pass" acceptance criterion. `npx tsc --noEmit --project
+tsconfig.restate-tests.json` passes as of the commit that added this section.

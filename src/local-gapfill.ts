@@ -26,6 +26,8 @@ export interface DispatchLocalGapfillInput {
   claudeOAuthToken?: string | null;
   commentInstruction?: string;
   retryPolicy: RetryPolicy | null;
+  /** Called after all local preparation, immediately before the potentially ambiguous Docker launch. */
+  onBeforeLaunch?: () => void;
 }
 
 export interface DispatchLocalGapfillResult {
@@ -83,6 +85,7 @@ export async function dispatchLocalGapfill(input: DispatchLocalGapfillInput): Pr
     orchestratorUrl: input.orchestratorUrl,
     runnerCallbackUrl: input.runnerCallbackUrl || undefined,
     runToken: input.runToken || undefined,
+    onBeforeLaunch: input.onBeforeLaunch,
     extraEnv: (() => {
       const merged = {
         ...input.mapping.extraEnv,

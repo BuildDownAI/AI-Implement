@@ -42,6 +42,11 @@ jobs:
           unset GITHUB_RUN_ID GITHUB_ENV GITHUB_REPOSITORY GITHUB_REF_NAME                 GITHUB_EVENT_NAME GITHUB_SHA GITHUB_ACTIONS GITHUB_ACTION
           npm test
       - run: npm run typecheck
+      - run: npx tsc --noEmit --project tsconfig.review-fix-ports-tests.json
+      - run: npx tsc --noEmit --project tsconfig.dispatch-admission-tests.json
+      - run: npx tsc --noEmit --project tsconfig.review-fix-attempt-store-tests.json
+      - run: npx tsc --noEmit --project tsconfig.review-fix-finalize-tests.json
+      - run: npx tsc --noEmit --project tsconfig.aii-806-tests.json
 
   # Restate harness (AII-612): src/__tests__/restate/**/*.restate.test.ts, isolated from
   # `unit-tests` above because it needs Docker for testcontainers. No `on:` block
