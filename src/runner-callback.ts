@@ -190,9 +190,9 @@ export function boundStatusText(text: string): string {
  * When the runner reports a known `failureCode`, makes use of the helper's structured description so the ticket reader has actionable context.
  * Passes along the raw `failureReason` string for all other failures.
  *
- * SENSITIVE_FILES_BLOCKED, REVIEW_UNAPPROVED and MAX_TURNS_EXHAUSTED are not part of the
- * BAC-27111 failure taxonomy (they are guardrail/policy outcomes, not classified failures),
- * so they are checked first and keep their existing wording regardless of `failure`.
+ * SENSITIVE_FILES_BLOCKED, REVIEW_UNAPPROVED, MAX_TURNS_EXHAUSTED and INSTALL_FAILED are not
+ * part of the BAC-27111 failure taxonomy (they are guardrail/policy outcomes, not classified
+ * failures), so they are checked first and keep their existing wording regardless of `failure`.
  * The stage-retry rail's REVIEWER_TURNS_EXHAUSTED and PROVIDER_UNAVAILABLE codes, by
  * contrast, always arrive with a real `FailureRecord` carrying that exact `code` — their
  * bespoke wording lives inside `classificationForFailure` itself (keyed on `failure.code`,
@@ -241,6 +241,23 @@ export function formatFailureComment(
         .join("\n\n"),
       remediation:
         "Review the draft PR and the run autopsy comment. Likely causes: over-broad issue scope, missing prerequisites, or thin context — split the ticket or add context, then re-dispatch.",
+      docsUrl: TROUBLESHOOTING_URL,
+    };
+  } else if (failureCode === "INSTALL_FAILED") {
+    c = {
+      summary: "🟡 Implementation finished, but dependencies did not install — build and tests never ran.",
+      detail: [
+        prUrl
+          ? isInitialRun === false
+            ? "The existing PR was updated by this run."
+            : `The work is in a draft PR: ${prUrl}`
+          : "No PR could be opened (no code changes were produced).",
+        failureReason ?? "",
+      ]
+        .filter(Boolean)
+        .join("\n\n"),
+      remediation:
+        "Fix the install (lockfile, peer ranges, registry access), or set packageManager: none in .ai-implement/config.yml and install in a setup hook. Then re-dispatch or review the PR by hand.",
       docsUrl: TROUBLESHOOTING_URL,
     };
   } else if (failure) {

@@ -225,7 +225,7 @@ Non-obvious behaviour:
 - **Model IDs pass through verbatim**, and nothing validates them against the provider. A Bedrock mapping with an Anthropic-style `model:` fails at Claude invocation time rather than at dispatch. Per-phase model selection lives in `.ai-implement/config.yml`, not front matter.
 - **Prompt assembly** — the runner uses `WORKFLOW.md`'s body with front matter and HTML comments stripped and `${UPPER_SNAKE}` substituted, then appends its own blocks. Any *unrecognised* `${TOKEN}` becomes an empty string, so a shell example containing one is silently blanked. Never put `${PLANNING_CONTEXT}` in the body: it is substituted *and* appended, emitting the block twice.
 - **The pipeline owns repository writes on every autonomous run.** Initial runs create the branch, commit, push, and PR. Gap-fill runs leave the existing PR branch checked out, then the pipeline commits and pushes reviewed changes to it. Templates must tell the agent to leave changes uncommitted in both modes.
-- **Unapproved runs still ship** as a draft PR carrying the reviewer's final feedback and per-pass stats, reported as a coded failure (`REVIEW_UNAPPROVED` / `MAX_TURNS_EXHAUSTED`) so the ticket updates and notifications fire, while the GHA job stays green with a `::warning::`. If the repo plan rejects draft PRs (422), it opens normally prefixed `[NEEDS REVIEW — unapproved]`.
+- **Unapproved runs still ship** as a draft PR carrying the reviewer's final feedback and per-pass stats, reported as a coded failure (`REVIEW_UNAPPROVED` / `MAX_TURNS_EXHAUSTED` / `INSTALL_FAILED`) so the ticket updates and notifications fire, while the GHA job stays green with a `::warning::`. If the repo plan rejects draft PRs (422), it opens normally prefixed `[NEEDS REVIEW — unapproved]`.
 - **Hooks work in every execution mode.** `setup` / `verify` / `teardown` front-matter paths run around the implement loop — setup failure aborts early, teardown always runs. All three modes enter through `session/entrypoint.sh`, which populates the workspace before the runner starts.
 - **Planning writes files, it does not post.** A planning run writes `ai-output/comments/NN-*.md`; the orchestrator posts them to the ticket. Runner-written files are collected in lexicographic order — avoid the `90-` prefix, which the run autopsy uses.
 
@@ -263,7 +263,7 @@ Optional, in the target repo. Parsed with a real YAML parser; a missing file, ma
 
 | Key | Effect |
 |---|---|
-| `packageManager` | Overrides the install step's lockfile detection |
+| `packageManager` | Overrides the install step's lockfile detection; `none` turns off the built-in install entirely (do the real install from a `setup:` hook instead) |
 | `models.implement` / `models.review` | Per-phase models |
 | `reviewProviders` | External review sources; `github-claude-code-review` is the only recognised value |
 | `reviewCheckNames` | Check-run names that identify the external review gate. Defaults to `review`, `code-review-plugin`, `claude-review`, `claude code review`, `claude-code-review`, plus any name containing both `claude` and `review`. A target repo with an unrelated CI job named `review` should set this to avoid that job becoming the review gate |
@@ -279,7 +279,7 @@ The two `.ai-implement/` files read from different refs: `image.yml` from the **
 
 A file at `custom/<path>` overrides the corresponding built-in. Resolution searches the workspace root, then `AI_IMPLEMENT_CUSTOM_ROOT`, then the package root — see [docs/pipeline-architecture.md](docs/pipeline-architecture.md) for the mechanics and the step contract.
 
-Built-in step keys, in pipeline order: `clone`, `reference-repos`, `install-skills`, `dependency-auth`, `install`, `setup`, `feedback-loop`, `preflight`, `push`, `verify`, `post-push-review`.
+Built-in step keys, in pipeline order: `clone`, `reference-repos`, `install-skills`, `dependency-auth`, `install`, `setup`, `feedback-loop`, `install-retry`, `preflight`, `push`, `verify`, `post-push-review`.
 
 - `custom/` belongs to an AI-Implement **fork**, not a target repo; sync never creates it there.
 - **Place client-specific behaviour in `custom/`** rather than editing built-in modules — that is what keeps a fork rebasing cleanly.

@@ -6,7 +6,9 @@ How the built-in `install` step authenticates to a private npm registry, why the
 
 A target repo whose `package.json` depends on packages from a private registry (Artifactory, GitHub Packages, Verdaccio, …) fails inside the runner at `npm ci` / `yarn install --frozen-lockfile` / `pnpm install --frozen-lockfile` with a 403, because the runner container has no registry credentials and the clone carries none.
 
-The obvious fix — export the token from a `setup:` hook — does not work. The pipeline order is `clone → reference-repos → install-skills → dependency-auth → install → setup → feedback-loop` (see `pipelines/autonomous.yml`), so `install` has already failed by the time any hook runs. That is why this lives in the install step itself (`configureNpmAuth()` in `src/pipeline/steps/install.ts`).
+Exporting the token from a `setup:` hook does not help the **first** install: the pipeline order is `clone → reference-repos → install-skills → dependency-auth → install → setup → feedback-loop → install-retry → preflight → push → verify → post-push-review` (see `pipelines/autonomous.yml`), so `install` has already run — and failed, with no registry credential — by the time any hook executes. That is why this lives in the install step itself (`configureNpmAuth()` in `src/pipeline/steps/install.ts`).
+
+It does help the retry, though. `setup` hook `$GITHUB_ENV` lines are merged into `process.env` (`src/pipeline/steps/hooks.ts`), and `install-retry` — which reruns the same `install` module after `setup` and `feedback-loop`, only when the first attempt failed — reads `NPM_TOKEN`/`AI_IMPLEMENT_NPM_REGISTRY` from `process.env` the same way the first `install` does. So a `setup` hook that exports `NPM_TOKEN=...` on a repo whose first install 403'd against a private registry lets `configureNpmAuth()` pick the token up on the retry.
 
 ## Configuration
 
@@ -36,6 +38,8 @@ When **both** `NPM_TOKEN` and `AI_IMPLEMENT_NPM_REGISTRY` are present and there 
 4. Removes the temp directory in a `finally`, whether or not the install succeeded.
 
 When either value is missing the step behaves exactly as before. In mounted-workspace mode (`npm run dev:run`) the install step no-ops, so nothing is written.
+
+**A `setup`-hook install must write its own config.** `configureNpmAuth()` writes the temporary `.npmrc` for the built-in `install` (and `install-retry`) step only, and removes it in a `finally` before `setup` or any later hook runs. A repo that disables the built-in install (`packageManager: none`) and installs from `setup` instead — or a hook that reinstalls with extra flags like `--legacy-peer-deps` — must write its own `.npmrc` (or set `NPM_CONFIG_USERCONFIG` itself) from `NPM_TOKEN` and `AI_IMPLEMENT_NPM_REGISTRY`. Both are already in the hook environment: `repoProcessEnv()` (used for `setup`/`verify`/`teardown`) strips only model credentials, not forwarded secrets like `NPM_TOKEN` (`src/pipeline/process-env.ts`). Public registries need nothing extra.
 
 ## Where the token exists — and where it does not
 
