@@ -32,7 +32,7 @@ import type { ReviewFixMetadataV1, ReviewFixResultMetadataV1 } from "./review-fi
 import { ActivityReporter, type ActivityDetailValue } from "./pipeline/activity-reporter.js";
 import { DEFAULT_RETRY_POLICY, normalizeRetryPolicy, type RetryPolicy } from "./pipeline/retry-backoff.js";
 import { writeRunAutopsy, writeRunStats } from "./run-autopsy.js";
-import { dependenciesMissing } from "./pipeline/pipeline-loader.js";
+import { dependenciesMissing, shouldSkipPostPushReview } from "./pipeline/pipeline-loader.js";
 import { parsePlanningBlock } from "./planning-block.js";
 import type { LocalRunTokenSummary } from "./local/run-result.js";
 import { prepareScratchExclusionIfGit } from "./pipeline/scratch-exclude.js";
@@ -873,14 +873,11 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     // The actual published output commit, not GITHUB_SHA/the initial checkout — null on a
     // no-op/no-push path (grouping parent with no own work, mounted dev-harness runs).
     const outputCommit = typeof pushOutputs.commitSha === "string" ? pushOutputs.commitSha : null;
-    // Mirror the post-push-review skip contract: a statically registered step is
-    // authoritative only when the internal review approved and push produced the
-    // branch/PR inputs that cause the step to run. Otherwise its outputs are empty.
-    const postPushReviewRequired = fbOutputs.approved === true
-      && pushOutputs.branchPushed === true
-      && Boolean(pushOutputs.prNumber)
-      && Boolean(prUrl)
-      && pipeline.steps.some((step) => step.id === "post-push-review");
+    // A statically registered step is authoritative only when it would not have
+    // skipped: shouldSkipPostPushReview mirrors the step's own skip contract, so
+    // there is exactly one copy of that decision (AII-886).
+    const postPushReviewRequired = pipeline.steps.some((step) => step.id === "post-push-review")
+      && !shouldSkipPostPushReview(context);
     const approved = fbOutputs.approved === true
       && (!postPushReviewRequired || postPushReviewOutputs.approved === true);
 

@@ -110,6 +110,26 @@ export function dependenciesMissing(ctx: PipelineContext): boolean {
 }
 
 /**
+ * Whether the registered post-push-review step would skip for this context.
+ * Shared by the step's own `skip` wiring below and by run-autonomous.ts's
+ * "is post-push-review authoritative" check, so the same skip contract
+ * cannot go stale in one copy while the other is updated (AII-886).
+ */
+export function shouldSkipPostPushReview(ctx: PipelineContext): boolean {
+  // Gap-fill runs update an existing PR and retain their established
+  // review flow; do not start a second post-push review cycle here.
+  if (ctx.data.prNumber) return true;
+  // Never run further review/force-push cycles against an unapproved
+  // draft — the review budget is already exhausted.
+  if (ctx.getOutputs("feedback-loop").approved !== true) return true;
+  // The run is not verified when dependencies never installed; leave the PR
+  // for a human rather than running a review cycle against it.
+  if (dependenciesMissing(ctx)) return true;
+  const pushOutputs = ctx.getOutputs("push");
+  return pushOutputs.branchPushed !== true || !pushOutputs.prNumber;
+}
+
+/**
  * Standard input wiring for the autonomous pipeline steps. Applied by step ID
  * so the YAML only needs to declare IDs, types, and optional moduleIds.
  */
@@ -326,19 +346,7 @@ function applyWiring(step: YamlStep): StepDefinition {
           trustedConfigReviewerDefinitions: ctx.getOutputs("install").trustedConfigReviewers,
           pushedSha: ctx.getOutputs("push").commitSha ?? undefined,
         }),
-        skip: (ctx: PipelineContext) => {
-          // Gap-fill runs update an existing PR and retain their established
-          // review flow; do not start a second post-push review cycle here.
-          if (ctx.data.prNumber) return true;
-          // Never run further review/force-push cycles against an unapproved
-          // draft — the review budget is already exhausted.
-          if (ctx.getOutputs("feedback-loop").approved !== true) return true;
-          // The run is not verified when dependencies never installed; leave the PR
-          // for a human rather than running a review cycle against it.
-          if (dependenciesMissing(ctx)) return true;
-          const pushOutputs = ctx.getOutputs("push");
-          return pushOutputs.branchPushed !== true || !pushOutputs.prNumber;
-        },
+        skip: shouldSkipPostPushReview,
       };
 
     case "kg-tracker-data":
