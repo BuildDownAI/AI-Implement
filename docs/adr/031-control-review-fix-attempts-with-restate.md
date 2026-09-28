@@ -1,4 +1,4 @@
-# 030. Control review-fix attempts with Restate
+# 031. Control review-fix attempts with Restate
 
 **Status:** Accepted — design approved on 2026-09-24; live pilot evaluation pending.
 **Date:** 2026-09-24

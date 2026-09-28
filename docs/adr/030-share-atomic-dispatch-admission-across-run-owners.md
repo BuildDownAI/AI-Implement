@@ -1,4 +1,4 @@
-# 029. Share atomic dispatch admission across run owners
+# 030. Share atomic dispatch admission across run owners
 
 **Status:** Accepted — design approved on 2026-09-24; live pilot evaluation pending.
 **Date:** 2026-09-23

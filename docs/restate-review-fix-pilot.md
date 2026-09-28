@@ -2,7 +2,7 @@
 
 **Status:** Live evaluation pending. No live pilot success or operating-period evidence has been recorded. Complete the preflight and the separate [AII-815 live evaluation](https://linear.app/eudoxus/issue/AII-815/run-and-evaluate-the-san-review-fix-pilot) before wider enablement.
 
-This pilot moves **automatic GitHub Actions review-fix attempts** to Restate. The runner's internal review/fix cycles, local review-fix runs, and human comment-triggered gap-fill runs stay on their existing lifecycle. SQLite owns accepted feedback, finding versions, attempt snapshots, reservations, and final outcomes. Restate owns durable coordination and waits. A project defaults to Legacy; a change selects only future automatic attempts. An active attempt keeps its recorded owner. See [ADR 029](./adr/029-share-atomic-dispatch-admission-across-run-owners.md), [ADR 030](./adr/030-control-review-fix-attempts-with-restate.md), and [ADR 018](./adr/018-adopt-restate-one-run-kind-at-a-time.md).
+This pilot moves **automatic GitHub Actions review-fix attempts** to Restate. The runner's internal review/fix cycles, local review-fix runs, and human comment-triggered gap-fill runs stay on their existing lifecycle. SQLite owns accepted feedback, finding versions, attempt snapshots, reservations, and final outcomes. Restate owns durable coordination and waits. A project defaults to Legacy; a change selects only future automatic attempts. An active attempt keeps its recorded owner. See [ADR 030](./adr/030-share-atomic-dispatch-admission-across-run-owners.md), [ADR 031](./adr/031-control-review-fix-attempts-with-restate.md), and [ADR 018](./adr/018-adopt-restate-one-run-kind-at-a-time.md).
 
 ## Before enabling SAN
 
