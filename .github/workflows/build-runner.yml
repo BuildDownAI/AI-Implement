@@ -103,6 +103,23 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Smoke-test — verify pinned Claude Code version in built digest
+        # The CLI version alone decides the API request shape (e.g.
+        # thinking config), so a new model can require a minimum CLI. Fail the
+        # build if the image's `claude` does not run or is not the pinned ARG.
+        run: |
+          digest_ref="${{ steps.meta.outputs.image }}@${{ steps.build.outputs.digest }}"
+          docker pull "$digest_ref"
+          pinned=$(sed -n 's/^ARG CLAUDE_CODE_VERSION=//p' Dockerfile.session)
+          if ! version=$(docker run --rm --entrypoint claude "$digest_ref" --version 2>&1); then
+            echo "ERROR: claude --version failed in the session image"
+            echo "$version"
+            exit 1
+          fi
+          echo "claude --version: $version (pinned: $pinned)"
+          [ -n "$pinned" ] && [ "${version%% *}" = "$pinned" ] || \
+            { echo "ERROR: image ships Claude Code '$version', Dockerfile.session pins '$pinned'"; exit 1; }
+
       - name: Smoke-test — verify TS dist is present in built digest
         run: |
           digest_ref="${{ steps.meta.outputs.image }}@${{ steps.build.outputs.digest }}"
