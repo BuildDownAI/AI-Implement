@@ -924,7 +924,7 @@ describe("runAutonomous", () => {
 
     function stubReviewFixEnvelope(
       overrides: Partial<ReviewFixMetadataV1> = {},
-      configOverrides: { groupingParent?: boolean } = {},
+      configOverrides: { groupingParent?: boolean; prNumber?: string } = {},
     ) {
       vi.stubEnv(
         "AI_IMPLEMENT_RUN_CONFIG",
@@ -1251,6 +1251,46 @@ describe("runAutonomous", () => {
       };
       expect(body.outcome).toBe("failure");
       expect(body.reviewFix).toMatchObject({ attemptId: "attempt-1", outputCommit: publishedCommit });
+    });
+
+    it("reports INSTALL_FAILED under the Restate attempt identity after a published gap-fill", async () => {
+      stubReviewFixEnvelope({}, { prNumber: "42" });
+      vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+      vi.stubEnv("RUN_TOKEN", "run-token");
+      vi.stubEnv("GITHUB_RUN_ID", "999888");
+      vi.stubEnv("GITHUB_RUN_ATTEMPT", "2");
+
+      const publishedCommit = "f".repeat(40);
+      const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+      const { pipeline, runner } = makeStepsPipeline([
+        ["install", { run: vi.fn().mockResolvedValue({ installFailed: true, installMethod: "npm ci" }) }],
+        ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true }) }],
+        ["install-retry", { run: vi.fn().mockResolvedValue({ installFailed: true, installMethod: "npm ci", installError: "dependency conflict" }) }],
+        ["push", { run: vi.fn().mockResolvedValue({ prNumber: 42, branchPushed: true, commitSha: publishedCommit }) }],
+      ]);
+
+      const result = await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeMockExecutor(0),
+        fetchImpl: mockFetch,
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as Record<string, unknown>;
+      expect(body).toMatchObject({
+        outcome: "failure",
+        failureCode: "INSTALL_FAILED",
+        reviewFix: {
+          attemptId: "attempt-1",
+          githubRunId: 999888,
+          githubRunAttempt: 2,
+          outputCommit: publishedCommit,
+        },
+      });
     });
 
     it("never attaches a reviewFix marker for a Legacy (non-pilot) dispatch", async () => {

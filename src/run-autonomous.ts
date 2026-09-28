@@ -954,7 +954,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
           `::warning::AI-Implement: dependency install failed — ` +
             (prUrl ? `${prKind} opened: ${prUrl}` : prNumber ? `gap-fill on PR #${prNumber}` : "no PR opened"),
         );
-        await postRunnerResult({
+        await reportRunnerResult(reviewFix, outputCommit, process.env, {
           workspaceDir,
           phase: runnerPhase,
           outcome: "failure",
@@ -964,6 +964,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
           referenceRepoResults,
           findingDispositions,
           callbackUrl,
+          retryPolicy,
           fetchImpl: opts.fetchImpl,
         });
         return { exitCode: 0 };
