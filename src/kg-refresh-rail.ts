@@ -25,7 +25,13 @@ import { extractSource, parseKgSourceRepo } from "./deploy.js";
 import { COMPLETION_MARKER } from "./kg-sidecar.js";
 import { getKgMaterializeDirect } from "./runner-mode.js";
 import type { RefreshGate, RefreshOutcome, KgRefreshStage, KgDryRunReportTarget } from "./kg-refresh.js";
-import { KG_DRY_RUN_COMMENT_MARKER, KG_DRY_RUN_STATUS_CONTEXT } from "./kg-refresh.js";
+
+/** Heading prefix used to find and update the sticky dry-run PR comment across pushes (AII-633).
+ *  Re-exported from kg-refresh.ts so every existing importer keeps its import path. */
+export const KG_DRY_RUN_COMMENT_MARKER = "## kg-refresh dry-run";
+
+/** Commit-status context for the PR-triggered dry-run check (AII-633). */
+export const KG_DRY_RUN_STATUS_CONTEXT = "kg-refresh/dry-run";
 
 /**
  * Everything the rail's gates and PR-facing functions read that used to come from
@@ -81,15 +87,20 @@ function railPaths(dataRoot: string) {
 }
 
 /** Thrown by a gate on a permanent failure. `gate` identifies which of the four failed; `revertRail` and the
- *  final `RefreshOutcome` both key off it exactly the way `runRefresh`'s inline `revert(...)` calls used to. */
+ *  final `RefreshOutcome` both key off it exactly the way `runRefresh`'s inline `revert(...)` calls used to.
+ *  `context` carries whatever partial `RailContext` the failing gate had already assembled — e.g. the
+ *  served stamp `fetchGate` read before a later step in the same gate failed — so `runRail` can report it
+ *  instead of always falling back to `null`. */
 export class RailGateError extends Error {
   readonly gate: RefreshGate;
   readonly detail: string;
-  constructor(gate: RefreshGate, detail: string) {
+  readonly context: Partial<RailContext>;
+  constructor(gate: RefreshGate, detail: string, context: Partial<RailContext> = {}) {
     super(detail);
     this.name = "RailGateError";
     this.gate = gate;
     this.detail = detail;
+    this.context = context;
   }
 }
 
@@ -153,6 +164,9 @@ function materializeDirectEnabled(): boolean {
 export async function fetchGate(deps: KgRailDeps, _input: RailContext = {}): Promise<RailContext> {
   const { fetchDir } = railPaths(deps.dataRoot);
   const repo = parseKgSourceRepo(deps.kgSourceRepo);
+  // Populated once readServedStamp resolves, so a failure in a later step can report the
+  // stamp already read — matching `runRefresh`'s old catch instead of always reporting null.
+  let readContext: Partial<RailContext> | undefined;
   try {
     const { token } = await deps.mintToken(deps.githubAppId, deps.githubAppPrivateKey, repo.owner, {
       permissions: { contents: "read" },
@@ -165,6 +179,7 @@ export async function fetchGate(deps: KgRailDeps, _input: RailContext = {}): Pro
 
     const namespace = await readNamespace(source);
     const stampBefore = await readServedStamp(deps, namespace);
+    readContext = { namespace, stampBefore };
 
     const snapshotCommitSha = await deps.fetchSnapshotCommitSha(token, repo.owner, repo.repo, branch);
     const recordedSha = deps.loadSnapshotSha();
@@ -178,7 +193,7 @@ export async function fetchGate(deps: KgRailDeps, _input: RailContext = {}): Pro
 
     return { gate: "ok", namespace, stampBefore, snapshotCommitSha, wasFirstRun, sourceDir: source };
   } catch (err) {
-    throw new RailGateError("staging", `staging failed before any swap: ${String(err)}`);
+    throw new RailGateError("staging", `staging failed before any swap: ${String(err)}`, readContext);
   }
 }
 
@@ -189,7 +204,8 @@ export async function fetchGate(deps: KgRailDeps, _input: RailContext = {}): Pro
  */
 export async function stageGate(deps: KgRailDeps, input: RailContext): Promise<RailContext> {
   const { stagingDir } = railPaths(deps.dataRoot);
-  const sourceDir = input.sourceDir!;
+  if (!input.sourceDir) throw new RailGateError("staging", "staging failed before any swap: no fetched source directory");
+  const sourceDir = input.sourceDir;
   try {
     // KGB-9's contract: this copies committed vectors and hard-fails on a stamp mismatch
     // or missing artifact. Nothing embeds — ever.
@@ -343,13 +359,14 @@ export async function runRail(deps: KgRailDeps, input: RailContext = {}): Promis
   } catch (err) {
     if (err instanceof RailGateError) {
       await rm(stagingDir, { recursive: true, force: true });
+      const stampBefore = err.context?.stampBefore ?? null;
       const outcome: RefreshOutcome = {
         ok: false,
         at: Date.now(),
         gate: err.gate,
         detail: err.detail,
-        stampBefore: null,
-        stampAfter: null,
+        stampBefore,
+        stampAfter: stampBefore,
       };
       console.error(`[kg-refresh] ${outcome.detail}`);
       return outcome;

@@ -119,11 +119,10 @@ export interface KgDryRunReportTarget {
 /** One entry of the persisted `dryRunOutcomesByPr` cache — `[repo#prNumber, {sha, outcome}]` (AII-640). */
 export type DryRunOutcomeEntry = [string, { sha: string; outcome: RefreshOutcome }];
 
-/** Heading prefix used to find and update the sticky dry-run PR comment across pushes (AII-633). */
-export const KG_DRY_RUN_COMMENT_MARKER = "## kg-refresh dry-run";
-
-/** Commit-status context for the PR-triggered dry-run check (AII-633). */
-export const KG_DRY_RUN_STATUS_CONTEXT = "kg-refresh/dry-run";
+/** Heading prefix used to find and update the sticky dry-run PR comment across pushes (AII-633).
+ *  Defined in kg-refresh-rail.ts (postDryRunReport's home) and re-exported here so every
+ *  existing importer keeps this import path. */
+export { KG_DRY_RUN_COMMENT_MARKER, KG_DRY_RUN_STATUS_CONTEXT } from "./kg-refresh-rail.js";
 
 /** Advisory hint attached to a failing `statuses:write` preflight row (AII-633). */
 const STATUSES_WRITE_HINT =

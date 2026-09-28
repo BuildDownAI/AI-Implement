@@ -167,6 +167,12 @@ describe("kg-refresh-rail", () => {
       await expect(stageGate(deps, input)).rejects.toBeInstanceOf(RailGateError);
       await expect(stageGate(deps, input)).rejects.toMatchObject({ gate: "staging" });
     });
+
+    it("permanent failure: no sourceDir throws RailGateError(staging) without calling materialize", async () => {
+      const deps = makeDeps();
+      await expect(stageGate(deps, {})).rejects.toMatchObject({ gate: "staging" });
+      expect(materialize).not.toHaveBeenCalled();
+    });
   });
 
   // ── swapGate ─────────────────────────────────────────────────────────────
@@ -324,6 +330,31 @@ describe("kg-refresh-rail", () => {
       expect(outcome.ok).toBe(false);
       expect(outcome.gate).toBe("staging");
       expect(restart).not.toHaveBeenCalled();
+    });
+
+    it("a fetchGate failure after the served stamp was read reports that stamp, not null", async () => {
+      const deps = makeDeps({
+        fetchSnapshotCommitSha: vi.fn(async () => {
+          throw new Error("commit lookup failed");
+        }) as never,
+      });
+      const outcome = await runRail(deps);
+      expect(outcome.ok).toBe(false);
+      expect(outcome.gate).toBe("staging");
+      expect(outcome.stampBefore).toBe(OLD_STAMP);
+      expect(outcome.stampAfter).toBe(OLD_STAMP);
+      expect(restart).not.toHaveBeenCalled();
+    });
+
+    it("a plain Error thrown from swapGate propagates out of runRail unchanged, without reverting", async () => {
+      const failingRestart = vi.fn(async () => {
+        throw new Error("sidecar restart failed");
+      });
+      const deps = makeDeps({ sidecar: { restart: failingRestart } });
+      await expect(runRail(deps)).rejects.toThrow("sidecar restart failed");
+      // A single call means only swapGate's restart ran — a second call would mean
+      // revertRail (which also calls sidecar.restart) incorrectly ran too.
+      expect(failingRestart).toHaveBeenCalledTimes(1);
     });
 
     it("a stageGate failure resolves to a staging outcome and cleans up staging/", async () => {
