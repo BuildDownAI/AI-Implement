@@ -62,7 +62,7 @@ export interface LocalArtifactInput {
   endedAt: Date;
   passes: LocalRunPass[];
   tokenSummary?: LocalRunTokenSummary | null;
-  /** Machine-readable failure code, e.g. "REVIEW_UNAPPROVED" or "MAX_TURNS_EXHAUSTED". */
+  /** Machine-readable failure code, e.g. "REVIEW_UNAPPROVED", "MAX_TURNS_EXHAUSTED", or "INSTALL_FAILED". */
   failureCode?: string | null;
   /** Single human-readable repair action for failed, capped, or unapproved runs. */
   repairAction?: string | null;
