@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, rename, writeFile, copyFile, readFile, cp } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { existsSync, statfsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -13,7 +13,7 @@ import {
 } from "./github.js";
 import { extractSource, parseKgSourceRepo } from "./deploy.js";
 import { isDeployHeld } from "./deploy-hold.js";
-import { COMPLETION_MARKER, KG_DIR } from "./kg-sidecar.js";
+import { KG_DIR } from "./kg-sidecar.js";
 import { isKgDegraded } from "./deploy-notify.js";
 import { parseSidecarRpcResponse, sidecarHealthFields } from "./kg-provider.js";
 import type { SidecarHealth } from "./kg-provider.js";
@@ -29,6 +29,11 @@ import {
   readBaseRepoFromSourcesYml,
   DEFAULT_BASE_REPO,
 } from "./pipeline/steps/kg-tracker-data.js";
+import {
+  runRail, outcomeToStage, readServedStamp, readNamespace,
+  mergeSnapshotPr, deleteSnapshotBranch, closeSnapshotPr, postDryRunReport,
+} from "./kg-refresh-rail.js";
+import type { KgRailDeps } from "./kg-refresh-rail.js";
 
 const execFile = promisify(execFileCb);
 
@@ -914,212 +919,33 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
   }
 
   const currentDir = join(dataRoot, "current");
-  const previousDir = join(dataRoot, "previous");
-  const stagingDir = join(dataRoot, "staging");
-  const fetchDir = join(dataRoot, "fetch");
 
-  async function readServedStamp(namespace: string | null): Promise<string | null> {
-    if (!namespace) return null;
-    try {
-      const spineIri = `${namespace.replace(/\/?$/, "/")}resource/graph/spine`;
-      const result = (await mcpToolCall(mcpUrl, "kg_neighbors", { iri: spineIri, limit: 30 })) as {
-        edges?: Array<{ predicate_iri?: string; neighbor?: string }>;
-      };
-      const edge = result?.edges?.find((e) => e.predicate_iri === "http://purl.org/dc/terms/modified");
-      return edge?.neighbor ?? null;
-    } catch {
-      return null;
-    }
-  }
-
-  async function readNamespace(sourceDir: string): Promise<string | null> {
-    try {
-      const raw = await readFile(join(sourceDir, "sources.yml"), "utf8");
-      const match = raw.match(/^namespace:\s*(\S+)\s*$/m);
-      return match ? match[1] : null;
-    } catch {
-      return null;
-    }
-  }
-
-  async function revert(namespace: string | null, gate: RefreshGate, detail: string, stampBefore: string | null): Promise<RefreshOutcome> {
-    // The failed overlay must stop serving before this reports. With no previous
-    // overlay, deleting current falls back to the baked graph — today's behaviour.
-    const rejected = join(dataRoot, "rejected");
-    await rm(rejected, { recursive: true, force: true });
-    if (existsSync(currentDir)) await rename(currentDir, rejected);
-    if (existsSync(previousDir)) await rename(previousDir, currentDir);
-    await input.sidecar.restart();
-    const servedNow = await readServedStamp(namespace);
-    const outcome: RefreshOutcome = {
-      ok: false,
-      at: Date.now(),
-      gate,
-      detail: `${detail}; reverted, serving stamp ${servedNow ?? "unknown"}`,
-      stampBefore,
-      stampAfter: servedNow,
-    };
-    console.error(`[kg-refresh] gate '${gate}' failed: ${outcome.detail}`);
-    return outcome;
-  }
-
-  async function runRefresh(): Promise<RefreshOutcome> {
-    const repo = parseKgSourceRepo(input.kgSourceRepo);
-    let stampBefore: string | null = null;
-    let namespace: string | null = null;
-    let snapshotCommitSha: string | null = null;
-    let wasFirstRun = false;
-
-    // ---- fetch (no swap yet; any failure here leaves current untouched) ----
-    try {
-      const { token } = await mintToken(input.githubAppId, input.githubAppPrivateKey, repo.owner, {
-        permissions: { contents: "read" },
-        repositories: [repo.repo],
-      });
-      const branch = await fetchDefaultBranch(token, repo.owner, repo.repo);
-      await rm(fetchDir, { recursive: true, force: true });
-      await mkdir(fetchDir, { recursive: true });
-      const source = await extractSource(await fetchTarball(token, repo.owner, repo.repo, branch), fetchDir);
-
-      namespace = await readNamespace(source);
-      stampBefore = await readServedStamp(namespace);
-
-      // Pre-check: if the source repo's snapshot/ head SHA matches the last-recorded SHA
-      // (set whenever the rail staged this exact snapshot), no new data has landed and we
-      // can skip the full rail cycle. A null SHA falls through so the stamp gate handles it.
-      snapshotCommitSha = await fetchSnapshotCommitSha(token, repo.owner, repo.repo, branch);
-      const recordedSha = loadSnapshotShaFn();
-      wasFirstRun = recordedSha === null;
-      if (snapshotCommitSha !== null && snapshotCommitSha === recordedSha) {
-        await rm(fetchDir, { recursive: true, force: true });
-        const outcome: RefreshOutcome = {
-          ok: false,
-          at: Date.now(),
-          gate: "ingest-needed",
-          detail: "Graph is current — a new ingest is required to refresh",
-          stampBefore,
-          stampAfter: stampBefore,
-        };
-        console.log(`[kg-refresh] ${outcome.detail}`);
-        return outcome;
-      }
-
-      // ---- stage: materialize in the fetched tree with the image's venv.
-      // KGB-9's contract: this copies committed vectors and hard-fails on a
-      // stamp mismatch or missing artifact. Nothing embeds — ever.
-      await materialize(join(kgDir, ".venv", "bin", "python"), source);
-
-      await rm(stagingDir, { recursive: true, force: true });
-      await mkdir(stagingDir, { recursive: true });
-      if (materializeDirectEnabled()) {
-        // KG_MATERIALIZE_DIRECT (AII-599): `--direct` copies snapshot/parts/*.nt straight to
-        // out/parts/ with no rdflib re-serialization. Flatten to stagingDir/parts, matching
-        // the embeddings.npz flattening below rather than the source's out/ prefix.
-        await cp(join(source, "out", "parts"), join(stagingDir, "parts"), { recursive: true });
-      } else {
-        await copyFile(join(source, "out", "graph.trig"), join(stagingDir, "graph.trig"));
-      }
-      await copyFile(join(source, "out", "embeddings.npz"), join(stagingDir, "embeddings.npz"));
-      if (existsSync(join(source, "sources.yml"))) {
-        await copyFile(join(source, "sources.yml"), join(stagingDir, "sources.yml"));
-      }
-      // The marker is written LAST — the atomic-overlay invariant.
-      await writeFile(join(stagingDir, COMPLETION_MARKER), new Date().toISOString());
-    } catch (err) {
-      const outcome: RefreshOutcome = {
-        ok: false,
-        at: Date.now(),
-        gate: "staging",
-        detail: `staging failed before any swap: ${String(err)}`,
-        stampBefore,
-        stampAfter: stampBefore,
-      };
-      console.error(`[kg-refresh] ${outcome.detail}`);
-      await rm(stagingDir, { recursive: true, force: true });
-      return outcome;
-    }
-
-    // ---- swap: current only ever changes by rename of a fully staged dir ----
-    await rm(previousDir, { recursive: true, force: true });
-    if (existsSync(currentDir)) await rename(currentDir, previousDir);
-    await rename(stagingDir, currentDir);
-
-    await input.sidecar.restart();
-
-    // ---- gates, on the graph that is actually serving ----
-    if (!process.env.KG_SIDECAR_URL) {
-      return revert(namespace, "answers", "sidecar did not come back after restart", stampBefore);
-    }
-
-    if (!existsSync(join(currentDir, "embeddings.npz"))) {
-      return revert(namespace, "vectors", "no vectors in the serving overlay", stampBefore);
-    }
-
-    // The first semantic query after a restart pays the sidecar's lazy loads:
-    // graph parse plus the fastembed ONNX model, tens of seconds on a 512 MB
-    // machine. Retry within a deadline instead of failing on cold start —
-    // found live on the first production refresh (canary timeout -> revert).
-    {
-      const canaryDeadline = Date.now() + canaryDeadlineMs;
-      let lastErr = "";
-      let passed = false;
-      while (Date.now() < canaryDeadline) {
-        try {
-          const canary = (await mcpToolCall(mcpUrl, "kg_hybrid_search", { query: "knowledge graph", limit: 3 })) as {
-            count?: number;
-            degraded?: boolean;
-          };
-          if (canary && canary.degraded === false && (canary.count ?? 0) >= 1) {
-            passed = true;
-            break;
-          }
-          lastErr = `degraded=${String(canary?.degraded)} count=${String(canary?.count)}`;
-        } catch (err) {
-          lastErr = String(err);
-        }
-        await new Promise((r) => setTimeout(r, canaryRetryMs));
-      }
-      if (!passed) {
-        return revert(namespace, "canary", `canary query failed after ${canaryDeadlineMs / 1000}s: ${lastErr}`, stampBefore);
-      }
-    }
-
-    const stampAfter = await readServedStamp(namespace);
-    if (!stampAfter || (stampBefore !== null && stampAfter <= stampBefore)) {
-      if (snapshotCommitSha !== null) persistSnapshotShaFn(snapshotCommitSha);
-      const coldStartHint =
-        wasFirstRun && snapshotCommitSha !== null
-          ? "; snapshot recorded — click Refresh again to dispatch an ingest"
-          : "";
-      return revert(
-        namespace,
-        "stamp",
-        `served stamp ${stampAfter ?? "unknown"} is not newer than ${stampBefore ?? "unknown"}${coldStartHint}`,
-        stampBefore,
-      );
-    }
-
-    await rm(fetchDir, { recursive: true, force: true });
-    if (snapshotCommitSha !== null) persistSnapshotShaFn(snapshotCommitSha);
-    const outcome: RefreshOutcome = {
-      ok: true,
-      at: Date.now(),
-      detail: `refreshed: ${stampBefore ?? "baked"} -> ${stampAfter}`,
-      stampBefore,
-      stampAfter,
-    };
-    console.log(`[kg-refresh] ${outcome.detail}`);
-    return outcome;
-  }
-
-  /** Derive the terminal stage from a completed refresh outcome. */
-  function outcomeToStage(outcome: RefreshOutcome): KgRefreshStage {
-    if (outcome.ok) return "serving";
-    if (!outcome.gate || outcome.gate === "staging") return "failed";
-    if (outcome.gate === "ingest-needed") return "idle";
-    // answers/vectors/canary/stamp all result in a revert
-    return "reverted";
-  }
+  /** Everything the rail's gates read, built once from this handle's resolved config. */
+  const railDeps: KgRailDeps = {
+    sidecar: input.sidecar,
+    githubAppId: input.githubAppId,
+    githubAppPrivateKey: input.githubAppPrivateKey,
+    kgSourceRepo: input.kgSourceRepo,
+    dataRoot,
+    kgDir,
+    sidecarMcpUrl: mcpUrl,
+    canaryDeadlineMs,
+    canaryRetryMs,
+    mintToken,
+    fetchTarball,
+    fetchDefaultBranch,
+    fetchSnapshotCommitSha,
+    materialize,
+    mcpToolCall,
+    persistSnapshotSha: persistSnapshotShaFn,
+    loadSnapshotSha: loadSnapshotShaFn,
+    mergePullRequestFn,
+    closePullRequestFn,
+    deleteBranchFn,
+    postPrCommentFn,
+    postOrUpdateStickyCommentFn,
+    setCommitStatusFn,
+  };
 
   /**
    * Run the local refresh rail, updating `stage` as it progresses.
@@ -1129,7 +955,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
   async function runRefreshAndSettle(): Promise<void> {
     stage = "staging";
     persistStageFn("staging", Date.now());
-    const outcome = await runRefresh().catch((err): RefreshOutcome => ({
+    const outcome = await runRail(railDeps).catch((err): RefreshOutcome => ({
       ok: false,
       at: Date.now(),
       gate: "staging",
@@ -1154,116 +980,6 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
     }
     if (savedJobId !== null) input.closeJobLog?.(savedJobId, outcome.ok ? "completed" : "failed");
     notifyRefreshSettled();
-  }
-
-  /** Merges the runner-opened snapshot PR with the "merge" method — never squash/rebase, so `sha` (snapshotCommit) is verifiable as an ancestor of the resulting default-branch head. */
-  async function mergeSnapshotPr(owner: string, repoName: string, prNumber: number, sha: string): Promise<"merged" | "blocked" | "conflict"> {
-    const { token } = await mintToken(input.githubAppId, input.githubAppPrivateKey, owner, {
-      permissions: { contents: "write", pull_requests: "write" },
-      repositories: [repoName],
-    });
-    return mergePullRequestFn(token, owner, repoName, prNumber, sha, "merge");
-  }
-
-  /** Closes the snapshot PR with a comment naming the failing gate. Called only when the callback carries a snapshotPr. */
-  /** Best-effort: delete the per-refresh branch so the KG repo does not accumulate one branch per refresh. Never fails the refresh. */
-  async function deleteSnapshotBranch(owner: string, repoName: string, branch: string): Promise<void> {
-    try {
-      const { token } = await mintToken(input.githubAppId, input.githubAppPrivateKey, owner, {
-        permissions: { contents: "write" },
-        repositories: [repoName],
-      });
-      await deleteBranchFn(token, owner, repoName, branch);
-      console.log(`[kg-refresh] deleted snapshot branch ${branch}`);
-    } catch (err) {
-      console.warn(`[kg-refresh] could not delete snapshot branch ${branch}: ${String(err)}`);
-    }
-  }
-
-  async function closeSnapshotPr(owner: string, repoName: string, prNumber: number, gate: string, branch?: string): Promise<void> {
-    const { token } = await mintToken(input.githubAppId, input.githubAppPrivateKey, owner, {
-      permissions: { contents: "write", pull_requests: "write" },
-      repositories: [repoName],
-    });
-    await postPrCommentFn(
-      token, owner, repoName, prNumber,
-      `AI-Implement: closing this refresh PR — the run failed (\`${gate}\`). The default branch was left untouched.`,
-    );
-    await closePullRequestFn(token, owner, repoName, prNumber);
-    console.log(`[kg-refresh] closed snapshot PR #${prNumber} (gate=${gate})`);
-    if (branch) await deleteSnapshotBranch(owner, repoName, branch);
-  }
-
-  /** Renders the per-part {part, prev, new} rows as a markdown table, or a placeholder when absent. */
-  function renderPartTable(partTable?: Array<{ part: string; prev: string; new: string }>): string {
-    if (!partTable || partTable.length === 0) return "_no per-part counts reported_";
-    const rows = partTable.map((p) => `| ${p.part} | ${p.prev} | ${p.new} |`).join("\n");
-    return `| part | prev | new |\n| --- | --- | --- |\n${rows}`;
-  }
-
-  /** True when the outcome represents a dry-run guard refusal (as opposed to a plain runner failure). */
-  function isDryRunRefusal(outcome: RefreshOutcome): boolean {
-    return outcome.dryRun === true && !outcome.ok && outcome.detail.includes("guard refused");
-  }
-
-  /** Builds the sticky comment body for a dry-run outcome. */
-  function buildDryRunCommentBody(report: KgDryRunReportTarget, outcome: RefreshOutcome): string {
-    const acceptedByLabel = isDryRunRefusal(outcome) && report.acceptBaseline === true;
-    const verdict = acceptedByLabel
-      ? `refused, accepted by label \`accept-baseline\` — ${outcome.detail}`
-      : outcome.detail;
-    const note = acceptedByLabel
-      ? "\n\n_The label only changes what this check reports — a real refresh still refuses this shrink unless an admin accepts the new baseline at refresh time._"
-      : "";
-    return `${KG_DRY_RUN_COMMENT_MARKER} — ${report.sha}\n\n${verdict}\n\n${renderPartTable(outcome.partTable)}${note}`;
-  }
-
-  /**
-   * Posts (or updates) the sticky dry-run comment on `report`'s PR, and — only when
-   * the App has been granted `statuses: write` on that repo — sets the
-   * `kg-refresh/dry-run` commit status (AII-633). Best-effort: a failure here is
-   * logged, never thrown, so a PR-reporting problem cannot fail the refresh itself.
-   */
-  async function postDryRunReport(report: KgDryRunReportTarget, outcome: RefreshOutcome): Promise<void> {
-    let owner: string;
-    let repoName: string;
-    try {
-      const parsed = parseKgSourceRepo(report.repo);
-      owner = parsed.owner;
-      repoName = parsed.repo;
-    } catch (err) {
-      console.error(`[kg-refresh] dry-run report: invalid repo "${report.repo}": ${String(err)}`);
-      return;
-    }
-
-    const body = buildDryRunCommentBody(report, outcome);
-    try {
-      const { token } = await mintToken(input.githubAppId, input.githubAppPrivateKey, owner, {
-        permissions: { pull_requests: "write" },
-        repositories: [repoName],
-      });
-      await postOrUpdateStickyCommentFn(token, owner, repoName, report.prNumber, KG_DRY_RUN_COMMENT_MARKER, body);
-    } catch (err) {
-      console.error(`[kg-refresh] failed to post dry-run comment on ${report.repo}#${report.prNumber}: ${String(err)}`);
-    }
-
-    const acceptedByLabel = isDryRunRefusal(outcome) && report.acceptBaseline === true;
-    const statusOk = outcome.ok || acceptedByLabel;
-    try {
-      const { token: statusToken } = await mintToken(input.githubAppId, input.githubAppPrivateKey, owner, {
-        permissions: { statuses: "write" },
-        repositories: [repoName],
-      });
-      await setCommitStatusFn(statusToken, owner, repoName, report.sha, {
-        state: statusOk ? "success" : "failure",
-        context: KG_DRY_RUN_STATUS_CONTEXT,
-        description: outcome.detail.slice(0, 140),
-      });
-    } catch (err) {
-      // Not granted, or the mint/status call failed — the comment above already
-      // carries the verdict, so this degrades to comment-only rather than failing.
-      console.log(`[kg-refresh] dry-run commit status not set for ${report.repo}#${report.prNumber}: ${String(err)}`);
-    }
   }
 
   /** Shared terminal path for lost/timed-out ingest runners. No-op when stage ≠ ingest-running. */
@@ -1406,10 +1122,10 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
       void (async () => {
         try {
           // Run the check-and-refresh cycle. If the source repo snapshot SHA
-          // differs from the last recorded SHA, runRefresh() stages it locally
+          // differs from the last recorded SHA, runRail() stages it locally
           // and returns success. If the SHA matches, it returns ingest-needed —
           // and with dispatch configured we fire the runner to produce a new snapshot.
-          const outcome = await runRefresh();
+          const outcome = await runRail(railDeps);
 
           if (outcome.gate === "ingest-needed" && input.dispatchRun && input.runnerCallbackBaseUrl && input.runnerTokenSecret) {
             // Source repo doesn't have a newer snapshot yet. Dispatch the runner.
@@ -1602,7 +1318,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
         console.log(`[kg-refresh] ${detail}`);
         if (savedReport) {
           recordDryRunOutcome(savedReport, lastRefresh);
-          void postDryRunReport(savedReport, lastRefresh);
+          void postDryRunReport(railDeps, savedReport, lastRefresh);
         }
         void input.onOutcome?.(ok ? "success" : "failure", {
           failureReason: ok ? undefined : detail,
@@ -1666,7 +1382,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
         // close the dangling PR rather than leaving it open and unmerged.
         if (data.snapshotPr && input.kgSourceRepo) {
           const repoForClose = parseKgSourceRepo(input.kgSourceRepo);
-          void closeSnapshotPr(repoForClose.owner, repoForClose.repo, data.snapshotPr, detail, data.snapshotBranch).catch((err) => {
+          void closeSnapshotPr(railDeps, repoForClose.owner, repoForClose.repo, data.snapshotPr, detail, data.snapshotBranch).catch((err) => {
             console.error(`[kg-refresh] failed to close snapshot PR #${data.snapshotPr}: ${String(err)}`);
           });
         }
@@ -1745,7 +1461,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
             return;
           }
           try {
-            const mergeResult = await mergeSnapshotPr(repo.owner, repo.repo, snapshotPr, snapshotCommit);
+            const mergeResult = await mergeSnapshotPr(railDeps, repo.owner, repo.repo, snapshotPr, snapshotCommit);
             if (mergeResult !== "merged") {
               failSnapshotPrStep(`merging snapshot PR #${snapshotPr} returned '${mergeResult}'`);
               return;
@@ -1755,7 +1471,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
             failSnapshotPrStep(`merging snapshot PR #${snapshotPr} failed: ${String(err)}`);
             return;
           }
-          if (snapshotBranch) await deleteSnapshotBranch(repo.owner, repo.repo, snapshotBranch);
+          if (snapshotBranch) await deleteSnapshotBranch(railDeps, repo.owner, repo.repo, snapshotBranch);
         }
 
         if (snapshotCommit) {
@@ -1821,7 +1537,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
         deployHeld: deployHeld(),
         kgDegraded: isKgDegraded(),
         ...sidecarHealthFields(),
-        servedStamp: await readServedStamp(await readNamespace(servedDir)),
+        servedStamp: await readServedStamp(railDeps, await readNamespace(servedDir)),
         lastRefresh,
         stage,
         materialize: materializeDirectEnabled() ? "direct" : "rdflib",
@@ -1841,7 +1557,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
         console.debug(`[kg-refresh] dry-run report skipped: no outcome for ${report.repo}#${report.prNumber}`);
         return false;
       }
-      await postDryRunReport(report, stored.outcome);
+      await postDryRunReport(railDeps, report, stored.outcome);
       return true;
     },
 
