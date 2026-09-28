@@ -39,7 +39,7 @@ export interface ExternalReviewFindingsResult {
   verdictSource?: ReviewLedgerSource;
 }
 
-const TRUSTED_REVIEW_COMMENT_AUTHORS = new Set([
+export const TRUSTED_REVIEW_COMMENT_AUTHORS = new Set([
   "ai-implement",
   "ai-implement[bot]",
   "claude",
@@ -617,6 +617,56 @@ function collectChangesRequestedReviews(ghSpawn: GhSpawn, prNumber: string, find
   return blockingReviewerLogins;
 }
 
+export interface ReviewCommentResult {
+  findings: ReviewLedgerFinding[];
+  findingsUnavailable: boolean;
+  verdict?: ReviewFindingsVerdict;
+  verdictSource?: ReviewLedgerSource;
+}
+
+/**
+ * Classifies a single PR comment (REST issue-comment shape: `body`, `html_url`, `user.login`,
+ * `user.type`) as a review verdict, or returns null when it is not a recognized review from an
+ * eligible author. Shared by the post-push-review ledger collector and the `issue_comment`
+ * webhook so both read the same fenced `review-findings` contract and the same author rule.
+ */
+export function classifyReviewIssueComment(comment: Record<string, unknown>): ReviewCommentResult | null {
+  if (typeof comment.body !== "string" || isAiImplementComment(comment.body)) return null;
+
+  const url = typeof comment.html_url === "string" ? comment.html_url : undefined;
+
+  // Verdict marker path: accept only from the GitHub Actions bot or an
+  // already-trusted Claude author. Other integrations must not be able to
+  // supersede the latest Claude review by emitting a lookalike marker.
+  if (isVerdictEligibleAuthor(comment)) {
+    const result = extractReviewFindingsBlock(comment.body, url);
+    if (result !== null) {
+      return {
+        findings: result.findings,
+        findingsUnavailable: result.findingsUnavailable,
+        ...(result.verdict !== undefined ? { verdict: result.verdict, verdictSource: "review-contract" as const } : {}),
+      };
+    }
+  }
+
+  // Heading-based extraction (backward compat with target repos using trusted-author
+  // Claude App identity that posts without a verdict marker).
+  if (isLikelyClaudeReviewComment(comment)) {
+    return { findings: extractClaudeSummaryFindings(comment.body, url), findingsUnavailable: false };
+  }
+
+  if (isGithubActionsClaudeReviewComment(comment)) {
+    const ghResult = extractGithubActionsClaudeReviewFindings(comment.body, url);
+    return {
+      findings: ghResult.findings,
+      findingsUnavailable: ghResult.findingsUnavailable,
+      ...(ghResult.verdict !== undefined ? { verdict: ghResult.verdict, verdictSource: "claude-review-summary" as const } : {}),
+    };
+  }
+
+  return null;
+}
+
 function collectClaudeIssueComments(
   ghSpawn: GhSpawn,
   prNumber: string,
@@ -641,43 +691,18 @@ function collectClaudeIssueComments(
   // sticky comment, so the newest recognized verdict supersedes older review summaries.
   // Formal CHANGES_REQUESTED reviews and unresolved threads remain independently collected.
   for (const comment of comments) {
-    if (!isRecord(comment) || typeof comment.body !== "string" || isAiImplementComment(comment.body)) continue;
+    if (!isRecord(comment)) continue;
 
-    const url = typeof comment.html_url === "string" ? comment.html_url : undefined;
+    const classified = classifyReviewIssueComment(comment);
+    if (classified === null) continue;
 
-    // Verdict marker path: accept only from the GitHub Actions bot or an
-    // already-trusted Claude author. Other integrations must not be able to
-    // supersede the latest Claude review by emitting a lookalike marker.
-    if (isVerdictEligibleAuthor(comment)) {
-      const result = extractReviewFindingsBlock(comment.body, url);
-      if (result !== null) {
-        findings.push(...result.findings);
-        if (result.findingsUnavailable) out.findingsUnavailable = true;
-        if (result.verdict !== undefined) {
-          out.verdict = result.verdict;
-          out.verdictSource = "review-contract";
-        }
-        return;
-      }
+    findings.push(...classified.findings);
+    if (classified.findingsUnavailable) out.findingsUnavailable = true;
+    if (classified.verdict !== undefined) {
+      out.verdict = classified.verdict;
+      out.verdictSource = classified.verdictSource;
     }
-
-    // Heading-based extraction (backward compat with target repos using trusted-author
-    // Claude App identity that posts without a verdict marker).
-    if (isLikelyClaudeReviewComment(comment)) {
-      findings.push(...extractClaudeSummaryFindings(comment.body, url));
-      return;
-    }
-
-    if (isGithubActionsClaudeReviewComment(comment)) {
-      const ghResult = extractGithubActionsClaudeReviewFindings(comment.body, url);
-      findings.push(...ghResult.findings);
-      if (ghResult.findingsUnavailable) out.findingsUnavailable = true;
-      if (ghResult.verdict !== undefined) {
-        out.verdict = ghResult.verdict;
-        out.verdictSource = "claude-review-summary";
-      }
-      return;
-    }
+    return;
   }
 }
 

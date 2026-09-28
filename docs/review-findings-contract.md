@@ -160,3 +160,14 @@ fenced block) and calls `gh pr comment`. Nothing about `probeExternalReviewCheck
 (`src/pipeline/steps/post-push-review.ts`) cares which reviewer produced the
 check run — it matches on the check-run **name**, configurable via
 `reviewCheckNames` in `.ai-implement/config.yml` (see the root `CLAUDE.md`).
+
+## Who reads the block
+
+Two readers share one parser and one author rule, both via
+`classifyReviewIssueComment` in `src/pipeline/review-ledger.ts`: the in-run
+`post-push-review` step, and the `issue_comment` webhook handler
+(`src/webhook.ts`), which reads the block from a comment posted *after* the
+run already ended — a reviewer that finishes late still starts a review-fix
+run instead of being silently dropped. See
+[docs/review-fix-rail.md](review-fix-rail.md) for the post-run half of the
+rail and the full author-eligibility and dispatch-gating rules.

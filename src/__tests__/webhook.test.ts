@@ -1512,6 +1512,199 @@ describe("review feedback ingestion", () => {
     expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
   });
 
+  // ---------- AII-817: webhook reads the review-findings block, shared author rule ----------
+
+  it("ignores a review-findings block from an author outside the trusted allowlist", async () => {
+    const jobId = log.appendLog({ issueId: "issue-60", issueIdentifier: "AII-60", repo: "org/repo" });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/60");
+
+    const { req, res } = makeRequest(SECRET, "issue_comment", {
+      action: "created",
+      comment: {
+        body: "```json review-findings\n{\"schema\":\"review-findings/v1\",\"verdict\":\"changes_requested\",\"findings\":[{\"severity\":\"blocking\",\"body\":\"Should not be trusted from this author.\"}]}\n```",
+        html_url: "https://github.com/org/repo/issues/60#issuecomment-10",
+        user: { login: "random-user", type: "User" },
+      },
+      issue: {
+        number: 60,
+        html_url: "https://github.com/org/repo/pull/60",
+        pull_request: { url: "https://api.github.com/repos/org/repo/pulls/60" },
+      },
+      repository: { full_name: "org/repo" },
+    });
+
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    await res.done;
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ ignored: true });
+    expect(reviewStore.listOpenReviewFindings("org/repo", 60)).toEqual([]);
+    expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
+  });
+
+  it("ignores a github-actions[bot] issue_comment with no findings block and no Claude review heading", async () => {
+    const jobId = log.appendLog({ issueId: "issue-61", issueIdentifier: "AII-61", repo: "org/repo" });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/61");
+
+    const { req, res } = makeRequest(SECRET, "issue_comment", {
+      action: "created",
+      comment: {
+        body: "Deployed a preview environment for this PR: https://preview.example.com",
+        html_url: "https://github.com/org/repo/issues/61#issuecomment-11",
+        user: { login: "github-actions[bot]", type: "Bot" },
+        created_at: new Date().toISOString(),
+      },
+      issue: {
+        number: 61,
+        html_url: "https://github.com/org/repo/pull/61",
+        pull_request: { url: "https://api.github.com/repos/org/repo/pulls/61" },
+      },
+      repository: { full_name: "org/repo" },
+    });
+
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    await res.done;
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ ignored: true });
+    expect(reviewStore.listOpenReviewFindings("org/repo", 61)).toEqual([]);
+    expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
+  });
+
+  it("ignores an approve verdict block with no findings as approved, without enqueueing", async () => {
+    const jobId = log.appendLog({ issueId: "issue-62", issueIdentifier: "AII-62", repo: "org/repo" });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/62");
+
+    const { req, res } = makeRequest(SECRET, "issue_comment", {
+      action: "created",
+      comment: {
+        body: "## Review\n\nLooks good, no notes.\n\n```json review-findings\n{\"schema\":\"review-findings/v1\",\"verdict\":\"approve\",\"findings\":[]}\n```",
+        html_url: "https://github.com/org/repo/issues/62#issuecomment-12",
+        user: { login: "github-actions[bot]", type: "Bot" },
+        created_at: new Date().toISOString(),
+      },
+      issue: {
+        number: 62,
+        html_url: "https://github.com/org/repo/pull/62",
+        pull_request: { url: "https://api.github.com/repos/org/repo/pulls/62" },
+      },
+      repository: { full_name: "org/repo" },
+    });
+
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    await res.done;
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ ignored: true, reason: "approved" });
+    expect(reviewStore.listOpenReviewFindings("org/repo", 62)).toEqual([]);
+    expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
+  });
+
+  it("upserts review-contract findings and enqueues a review-fix (reason=review_contract) from a findings block", async () => {
+    const jobId = log.appendLog({ issueId: "issue-63", issueIdentifier: "AII-63", repo: "org/repo" });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/63");
+
+    const { req, res } = makeRequest(SECRET, "issue_comment", {
+      action: "created",
+      comment: {
+        body: "## Review\n\nBlocking issue found.\n\n```json review-findings\n{\"schema\":\"review-findings/v1\",\"verdict\":\"changes_requested\",\"findings\":[{\"severity\":\"blocking\",\"path\":\"src/x.ts\",\"line\":10,\"body\":\"Missing null check.\"}]}\n```",
+        html_url: "https://github.com/org/repo/issues/63#issuecomment-13",
+        user: { login: "github-actions[bot]", type: "Bot" },
+        created_at: new Date().toISOString(),
+      },
+      issue: {
+        number: 63,
+        html_url: "https://github.com/org/repo/pull/63",
+        pull_request: { url: "https://api.github.com/repos/org/repo/pulls/63" },
+      },
+      repository: { full_name: "org/repo" },
+    });
+
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    await res.done;
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toMatchObject({ queued: true });
+    expect(reviewStore.listOpenReviewFindings("org/repo", 63)).toMatchObject([
+      {
+        source: "review-contract",
+        severity: "blocking",
+        path: "src/x.ts",
+        line: 10,
+        body: "Missing null check.",
+      },
+    ]);
+    expect(reviewFixQueue.getPendingReviewFixes()).toMatchObject([
+      {
+        issueId: "issue-63",
+        issueIdentifier: "AII-63",
+        repo: "org/repo",
+        prNumber: 63,
+        reason: "review_contract",
+      },
+    ]);
+  });
+
+  it("ignores an unclosed review-findings block as findings_unavailable and logs it", async () => {
+    const jobId = log.appendLog({ issueId: "issue-64", issueIdentifier: "AII-64", repo: "org/repo" });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/64");
+
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { req, res } = makeRequest(SECRET, "issue_comment", {
+      action: "created",
+      comment: {
+        body: "## Review\n\n```json review-findings\n{\"schema\":\"review-findings/v1\",\"verdict\":\"changes_requested\",\"findings\":[",
+        html_url: "https://github.com/org/repo/issues/64#issuecomment-14",
+        user: { login: "github-actions[bot]", type: "Bot" },
+        created_at: new Date().toISOString(),
+      },
+      issue: {
+        number: 64,
+        html_url: "https://github.com/org/repo/pull/64",
+        pull_request: { url: "https://api.github.com/repos/org/repo/pulls/64" },
+      },
+      repository: { full_name: "org/repo" },
+    });
+
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    await res.done;
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ ignored: true, reason: "findings_unavailable" });
+    expect(reviewStore.listOpenReviewFindings("org/repo", 64)).toEqual([]);
+    expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
+    expect(warnSpy.mock.calls.some((c) => String(c[0]).includes("findings unavailable"))).toBe(true);
+    warnSpy.mockRestore();
+  });
+
+  it("ignores an explicit incomplete verdict with no findings as findings_unavailable", async () => {
+    const jobId = log.appendLog({ issueId: "issue-65", issueIdentifier: "AII-65", repo: "org/repo" });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/65");
+
+    const { req, res } = makeRequest(SECRET, "issue_comment", {
+      action: "created",
+      comment: {
+        body: "```json review-findings\n{\"schema\":\"review-findings/v1\",\"verdict\":\"incomplete\",\"findings\":[]}\n```",
+        html_url: "https://github.com/org/repo/issues/65#issuecomment-15",
+        user: { login: "github-actions[bot]", type: "Bot" },
+        created_at: new Date().toISOString(),
+      },
+      issue: {
+        number: 65,
+        html_url: "https://github.com/org/repo/pull/65",
+        pull_request: { url: "https://api.github.com/repos/org/repo/pulls/65" },
+      },
+      repository: { full_name: "org/repo" },
+    });
+
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    await res.done;
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ ignored: true, reason: "findings_unavailable" });
+    expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
+  });
+
   it("does not resolve stored findings when a matching PR receives a new synchronize event", async () => {
     const jobId = log.appendLog({
       issueId: "issue-3",
@@ -1875,8 +2068,12 @@ describe("bot review gate integration (AII-745)", () => {
     webhook.handleGitHubWebhook(req as never, res as never, SECRET);
     await res.done;
 
+    // classifyReviewIssueComment's isAiImplementComment self-guard rejects this comment
+    // before it is ever classified as a review, so it lands in the generic "not a
+    // recognized review" bucket rather than reaching shouldEnqueueReviewEvent's own
+    // (redundant, for this path) self check.
     expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body)).toEqual({ ignored: true, reason: "self" });
+    expect(JSON.parse(res.body)).toEqual({ ignored: true });
     expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
   });
 });
