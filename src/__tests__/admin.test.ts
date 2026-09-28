@@ -1677,6 +1677,110 @@ describe("admin mappings", () => {
     expect(res.statusCode).toBe(400);
     expect(JSON.parse(res.body).error).toContain("gap-analysis");
   });
+
+  it("round-trips trustedReviewAuthors, trimmed and lowercased", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "TRA1", owner: "org", repo: "app",
+      trustedReviewAuthors: ["  Codex-Reviewer[bot]  "],
+    }, token);
+    expect(res.statusCode).toBe(202);
+    expect(JSON.parse(res.body).trustedReviewAuthors).toEqual(["codex-reviewer[bot]"]);
+
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    expect(JSON.parse(list.body).TRA1.trustedReviewAuthors).toEqual(["codex-reviewer[bot]"]);
+  });
+
+  it("treats absent trustedReviewAuthors as null on a new mapping", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "TRA2", owner: "org", repo: "app",
+    }, token);
+    expect(res.statusCode).toBe(202);
+    expect(JSON.parse(res.body).trustedReviewAuthors).toBeNull();
+  });
+
+  it("preserves existing trustedReviewAuthors when omitted from update", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", {
+      teamKey: "TRA3", owner: "org", repo: "app",
+      trustedReviewAuthors: ["codex-reviewer[bot]"],
+    }, token);
+
+    const update = await request("/api/mappings", "POST", "secret", {
+      teamKey: "TRA3", owner: "org", repo: "app-updated",
+    }, token);
+    expect(update.statusCode).toBe(202);
+    expect(JSON.parse(update.body).trustedReviewAuthors).toEqual(["codex-reviewer[bot]"]);
+  });
+
+  it("resets trustedReviewAuthors to the null default via an explicit null", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", {
+      teamKey: "TRA4", owner: "org", repo: "app",
+      trustedReviewAuthors: ["codex-reviewer[bot]"],
+    }, token);
+
+    const reset = await request("/api/mappings", "POST", "secret", {
+      teamKey: "TRA4", owner: "org", repo: "app",
+      trustedReviewAuthors: null,
+    }, token);
+    expect(reset.statusCode).toBe(202);
+    expect(JSON.parse(reset.body).trustedReviewAuthors).toBeNull();
+  });
+
+  it("rejects a non-array, non-null trustedReviewAuthors with the exact error prefix", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "TRABAD1", owner: "org", repo: "app",
+      trustedReviewAuthors: "codex-reviewer[bot]",
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toBe("trustedReviewAuthors invalid: must be an array of strings or null");
+  });
+
+  it("rejects an empty-string entry (post-trim) with the exact error prefix", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "TRABAD2", owner: "org", repo: "app",
+      trustedReviewAuthors: ["   "],
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toBe("trustedReviewAuthors invalid: [0] must not be empty");
+  });
+
+  it("rejects an entry that fails the login regex with the exact error prefix", async () => {
+    const token = await login("secret");
+    for (const bad of ["Codex Reviewer", "-bad", "bot]"]) {
+      const res = await request("/api/mappings", "POST", "secret", {
+        teamKey: "TRABAD3", owner: "org", repo: "app",
+        trustedReviewAuthors: [bad],
+      }, token);
+      expect(res.statusCode).toBe(400);
+      expect(JSON.parse(res.body).error).toBe(`trustedReviewAuthors invalid: [0] "${bad}" is not a valid GitHub login`);
+    }
+  });
+
+  it("rejects more than 20 entries with the exact error prefix", async () => {
+    const token = await login("secret");
+    const many = Array.from({ length: 21 }, (_, i) => `bot-${i}`);
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "TRABAD4", owner: "org", repo: "app",
+      trustedReviewAuthors: many,
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toBe("trustedReviewAuthors invalid: too many entries (21); maximum is 20");
+  });
+
+  it("rejects a duplicate entry, including a duplicate created by lowercasing, with the exact error prefix", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "TRABAD5", owner: "org", repo: "app",
+      trustedReviewAuthors: ["Foo", "foo"],
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toBe('trustedReviewAuthors invalid: duplicate entry "foo"');
+  });
 });
 
 describe("admin runner-mode", () => {

@@ -561,6 +561,48 @@ describe("config", () => {
     expect(config.DEFAULT_PR_DISPATCH_BUDGET).toBe(4);
   });
 
+  it("round-trips trustedReviewAuthors (including null)", () => {
+    config.initMappingsTable();
+    config.upsertMapping("TRUSTED", mapping({ owner: "org", repo: "repo", trustedReviewAuthors: ["codex-reviewer[bot]"] }));
+    config.upsertMapping("UNTRUSTED", mapping({ owner: "org", repo: "repo", trustedReviewAuthors: null }));
+
+    const all = config.getMappings();
+    expect(all.TRUSTED.trustedReviewAuthors).toEqual(["codex-reviewer[bot]"]);
+    expect(all.UNTRUSTED.trustedReviewAuthors).toBeNull();
+  });
+
+  it("migrates a pre-existing mappings table to include the trusted_review_authors column, reading back null", () => {
+    const db = new Database(dbPath);
+    db.exec(`
+      CREATE TABLE mappings (
+        team_key TEXT PRIMARY KEY,
+        owner TEXT NOT NULL,
+        repo TEXT NOT NULL,
+        workflow_file TEXT NOT NULL,
+        default_branch TEXT NOT NULL,
+        max_in_progress_ai_issues INTEGER NOT NULL DEFAULT 3,
+        execution_mode TEXT NOT NULL DEFAULT 'github-actions',
+        session_mode TEXT NOT NULL DEFAULT 'autonomous',
+        machine_cpus INTEGER NOT NULL DEFAULT 2,
+        machine_memory_mb INTEGER NOT NULL DEFAULT 4096,
+        planning_enabled INTEGER NOT NULL DEFAULT 0,
+        planning_workflow_file TEXT NOT NULL DEFAULT 'claude-plan.yml',
+        auto_approve_plans INTEGER NOT NULL DEFAULT 1,
+        extra_env TEXT,
+        provider TEXT NOT NULL DEFAULT 'anthropic',
+        ticketing_provider TEXT NOT NULL DEFAULT 'linear',
+        ticketing_config TEXT NOT NULL DEFAULT '{"kind":"linear"}',
+        aws_region TEXT
+      )
+    `);
+    db.prepare("INSERT INTO mappings (team_key, owner, repo, workflow_file, default_branch) VALUES (?, ?, ?, ?, ?)")
+      .run("LEG", "org", "legacy", "claude-implement.yml", "main");
+    db.close();
+
+    config.initMappingsTable();
+    expect(config.getMappings().LEG.trustedReviewAuthors).toBeNull();
+  });
+
   it("round-trips branchPrefix (including null)", () => {
     config.initMappingsTable();
     config.upsertMapping("PFX", mapping({ owner: "org", repo: "repo", branchPrefix: "pr" }));
