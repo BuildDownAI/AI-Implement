@@ -1,9 +1,0 @@
-{
-  "extends": "./tsconfig.json",
-  "include": ["src/kg-refresh-rail.ts", "src/kg-refresh.ts", "src/__tests__/kg-refresh-rail.test.ts"],
-  "exclude": ["node_modules", "dist"],
-  "compilerOptions": {
-    "noEmit": true,
-    "types": ["vitest/globals", "node"]
-  }
-}
