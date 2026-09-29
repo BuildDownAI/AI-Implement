@@ -580,6 +580,14 @@ export function getDispatchedIds(): string[] {
   ).map((row) => row.issue_id);
 }
 
+export function getDispatchedRows(): Array<{ issueId: string; teamKey: string | null }> {
+  return (
+    getDb()
+      .prepare("SELECT issue_id, team_key FROM dispatched")
+      .all() as Array<{ issue_id: string; team_key: string | null }>
+  ).map((row) => ({ issueId: row.issue_id, teamKey: row.team_key ?? null }));
+}
+
 export function deleteDispatched(issueId: string): boolean {
   const result = getDb()
     .prepare("DELETE FROM dispatched WHERE issue_id = ?")
