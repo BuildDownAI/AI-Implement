@@ -660,31 +660,29 @@ export class LinearProvider implements TicketingProvider {
     );
   }
 
-  private async addLabelToIssue(issueId: string, labelId: string): Promise<void> {
-    const getData = await this.linearMutation<{
-      issue: { labels: { nodes: Array<{ id: string }> } };
-    }>(
-      `query($issueId: String!) {
-        issue(id: $issueId) {
-          labels { nodes { id } }
-        }
-      }`,
-      { issueId },
-    );
-    const currentIds = getData.issue.labels.nodes.map((l) => l.id);
-    if (currentIds.includes(labelId)) return;
+  // Label writes are additive/subtractive (addedLabelIds / removedLabelIds), never a
+  // full-set `labelIds` replacement: a stale read or an overlapping write can then at
+  // worst skip a removal, and can no longer restore a label another writer removed.
+  private async updateIssueLabels(
+    issueId: string,
+    change: { addedLabelIds?: string[]; removedLabelIds?: string[] },
+  ): Promise<void> {
+    const input: { addedLabelIds?: string[]; removedLabelIds?: string[] } = {};
+    if (change.addedLabelIds?.length) input.addedLabelIds = change.addedLabelIds;
+    if (change.removedLabelIds?.length) input.removedLabelIds = change.removedLabelIds;
+    if (!input.addedLabelIds && !input.removedLabelIds) return;
 
     await this.linearMutation<{ issueUpdate: { success: boolean } }>(
-      `mutation($issueId: String!, $labelIds: [String!]!) {
-        issueUpdate(id: $issueId, input: { labelIds: $labelIds }) {
+      `mutation($issueId: String!, $input: IssueUpdateInput!) {
+        issueUpdate(id: $issueId, input: $input) {
           success
         }
       }`,
-      { issueId, labelIds: [...currentIds, labelId] },
+      { issueId, input },
     );
   }
 
-  private async removeLabelByName(issueId: string, name: string): Promise<void> {
+  private async getIssueLabels(issueId: string): Promise<Array<{ id: string; name: string }>> {
     const getData = await this.linearMutation<{
       issue: { labels: { nodes: Array<{ id: string; name: string }> } };
     }>(
@@ -695,17 +693,22 @@ export class LinearProvider implements TicketingProvider {
       }`,
       { issueId },
     );
-    const remaining = getData.issue.labels.nodes.filter((l) => l.name !== name);
-    if (remaining.length === getData.issue.labels.nodes.length) return;
+    return getData.issue.labels.nodes;
+  }
 
-    await this.linearMutation<{ issueUpdate: { success: boolean } }>(
-      `mutation($issueId: String!, $labelIds: [String!]!) {
-        issueUpdate(id: $issueId, input: { labelIds: $labelIds }) {
-          success
-        }
-      }`,
-      { issueId, labelIds: remaining.map((l) => l.id) },
-    );
+  private async labelIdsByName(issueId: string, names: string[]): Promise<string[]> {
+    const labels = await this.getIssueLabels(issueId);
+    return labels.filter((l) => names.includes(l.name)).map((l) => l.id);
+  }
+
+  private async addLabelToIssue(issueId: string, labelId: string): Promise<void> {
+    await this.updateIssueLabels(issueId, { addedLabelIds: [labelId] });
+  }
+
+  private async removeLabelByName(issueId: string, name: string): Promise<void> {
+    await this.updateIssueLabels(issueId, {
+      removedLabelIds: await this.labelIdsByName(issueId, [name]),
+    });
   }
 
   private async transitionToInProgressIfMovable(issueId: string, scopeKey: string): Promise<void> {
@@ -746,7 +749,6 @@ export class LinearProvider implements TicketingProvider {
   }
 
   async markPlanComplete(issueId: string, _scopeKey: string): Promise<void> {
-    await this.removeLabelByName(issueId, "AI-Planning");
     const teamKey = await this.getTeamKeyForIssue(issueId);
     const labelId = await this.ensureTeamLabel(
       teamKey,
@@ -754,7 +756,11 @@ export class LinearProvider implements TicketingProvider {
       "#10B981",
       this.planCompleteLabelCache,
     );
-    await this.addLabelToIssue(issueId, labelId);
+    // One write for the swap so nothing can interleave between remove and add.
+    await this.updateIssueLabels(issueId, {
+      removedLabelIds: await this.labelIdsByName(issueId, ["AI-Planning"]),
+      addedLabelIds: [labelId],
+    });
   }
 
   async markPlanningFailed(issueId: string, _scopeKey: string, reason: string): Promise<boolean> {
@@ -778,34 +784,11 @@ export class LinearProvider implements TicketingProvider {
   async markPrReady(issueId: string, _scopeKey: string, prUrl: string): Promise<boolean> {
     const readyLabelId = await this.ensureWorkspaceReadyForReviewLabel();
 
-    // Atomic label swap: remove AI-Working, add Ready for Review in a single
-    // issueUpdate (matches legacy markIssueReadyForReview behaviour).
-    const getData = await this.linearMutation<{
-      issue: { labels: { nodes: Array<{ id: string; name: string }> } };
-    }>(
-      `query($issueId: String!) {
-        issue(id: $issueId) {
-          labels { nodes { id name } }
-        }
-      }`,
-      { issueId },
-    );
-    const currentLabels = getData.issue.labels.nodes;
-    const newLabelIds = currentLabels
-      .filter((l) => l.name !== "AI-Working")
-      .map((l) => l.id);
-    if (!newLabelIds.includes(readyLabelId)) {
-      newLabelIds.push(readyLabelId);
-    }
-
-    await this.linearMutation<{ issueUpdate: { success: boolean } }>(
-      `mutation($issueId: String!, $labelIds: [String!]!) {
-        issueUpdate(id: $issueId, input: { labelIds: $labelIds }) {
-          success
-        }
-      }`,
-      { issueId, labelIds: newLabelIds },
-    );
+    // Atomic label swap: remove AI-Working, add Ready for Review in a single issueUpdate.
+    await this.updateIssueLabels(issueId, {
+      removedLabelIds: await this.labelIdsByName(issueId, ["AI-Working"]),
+      addedLabelIds: [readyLabelId],
+    });
 
     await this.postComment(issueId, `AI implementation PR: ${prUrl}`);
     // Label swaps have no Merged-regression hazard (Done is a state, not a label),
@@ -834,16 +817,18 @@ export class LinearProvider implements TicketingProvider {
     if (!issue) return;
     if (issue.state.type === "completed" || issue.state.type === "canceled") return;
     const stateId = await this.getCompletedStateId(issue.team.key);
-    const labelIds = issue.labels.nodes
-      .filter((l) => l.name !== "Ready for Review")
+    const readyIds = issue.labels.nodes
+      .filter((l) => l.name === "Ready for Review")
       .map((l) => l.id);
+    const input: { stateId: string; removedLabelIds?: string[] } = { stateId };
+    if (readyIds.length) input.removedLabelIds = readyIds;
     await this.linearMutation<{ issueUpdate: { success: boolean } }>(
-      `mutation($issueId: String!, $stateId: String!, $labelIds: [String!]!) {
-        issueUpdate(id: $issueId, input: { stateId: $stateId, labelIds: $labelIds }) {
+      `mutation($issueId: String!, $input: IssueUpdateInput!) {
+        issueUpdate(id: $issueId, input: $input) {
           success
         }
       }`,
-      { issueId, stateId, labelIds },
+      { issueId, input },
     );
   }
 
@@ -854,8 +839,9 @@ export class LinearProvider implements TicketingProvider {
   }
 
   async clearWorkingState(issueId: string, _scopeKey: string): Promise<boolean> {
-    await this.removeLabelByName(issueId, "AI-Working");
-    await this.removeLabelByName(issueId, "AI-Planning");
+    await this.updateIssueLabels(issueId, {
+      removedLabelIds: await this.labelIdsByName(issueId, ["AI-Working", "AI-Planning"]),
+    });
     return true;
   }
   async postComment(issueId: string, body: string): Promise<void> {
