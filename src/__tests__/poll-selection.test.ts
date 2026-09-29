@@ -2,9 +2,9 @@ import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
-import { selectIssuesToDispatch, selectBlockers, parseDeclaredFiles, selectFileOverlapDeferrals, rememberCandidates, resolveInFlightSiblings, resetSeenCandidates, getCachedPlanningContext, setCachedPlanningContext, resetPlanningContextCache, needsPlanningContextFetch, getPlanningContextCacheSize, PLANNING_CONTEXT_CACHE_MAX } from "../poll-selection.js";
+import { selectIssuesToDispatch, selectBlockers, mappingForProvider, mergeProviderSnapshots, selectForeignTrackerBlockers, parseDeclaredFiles, selectFileOverlapDeferrals, rememberCandidates, resolveInFlightSiblings, resetSeenCandidates, getCachedPlanningContext, setCachedPlanningContext, resetPlanningContextCache, needsPlanningContextFetch, getPlanningContextCacheSize, PLANNING_CONTEXT_CACHE_MAX } from "../poll-selection.js";
 import type { RepoMapping } from "../config.js";
-import type { TicketIssue } from "../providers/types.js";
+import type { AIImplementSnapshot, TicketIssue } from "../providers/types.js";
 import type * as DedupModule from "../dedup.js";
 import type * as GateModule from "../dispatch-gate.js";
 import type * as AdmissionModule from "../dispatch-admission.js";
@@ -806,5 +806,108 @@ describe("selectIssuesToDispatch — sized from DB-backed admission reservations
     const candidate = makeIssue("AII-3", "AII-3", "AII");
     const selected = selectIssuesToDispatch([candidate], teamRepoMap, { AII: admission.count("AII") }, () => false);
     expect(selected).toEqual([candidate]);
+  });
+});
+
+describe("tracker-scoped mapping match", () => {
+  const jiraEng: RepoMapping = { ...makeMapping(), ticketingProvider: "jira", ticketingConfig: { kind: "jira", jql: "project = ENG", repoFieldValue: "org/repo" } as RepoMapping["ticketingConfig"] };
+  const mappings = { ENG: jiraEng, APP: makeMapping() };
+  const snap = (over: Partial<AIImplementSnapshot> = {}): AIImplementSnapshot => ({
+    needsPlanning: [],
+    readyForImplementation: [],
+    inProgressCountsByScope: {},
+    parentsToFinalize: [],
+    ...over,
+  });
+
+  it("mappingForProvider returns the mapping only for its own tracker", () => {
+    expect(mappingForProvider("jira", "ENG", mappings)).toBe(jiraEng);
+    expect(mappingForProvider("linear", "ENG", mappings)).toBeNull();
+    expect(mappingForProvider("linear", "NOPE", mappings)).toBeNull();
+  });
+
+  it("drops a Linear issue that shares a key with a Jira mapping and reports it as foreign", () => {
+    const foreignReady = makeIssue("1", "ENG-1", "ENG");
+    const foreignPlan = makeIssue("2", "ENG-2", "ENG");
+    const { snapshot, foreign } = mergeProviderSnapshots(
+      [{ providerId: "linear", snapshot: snap({ readyForImplementation: [foreignReady], needsPlanning: [foreignPlan] }) }],
+      mappings,
+    );
+    expect(snapshot.readyForImplementation).toEqual([]);
+    expect(snapshot.needsPlanning).toEqual([]);
+    expect(foreign).toEqual([
+      { issue: foreignPlan, providerId: "linear", mappingProvider: "jira" },
+      { issue: foreignReady, providerId: "linear", mappingProvider: "jira" },
+    ]);
+  });
+
+  it("keeps the Jira mapping's own issues and unmapped keys", () => {
+    const own = makeIssue("1", "ENG-1", "ENG");
+    const unmapped = makeIssue("2", "UNK-1", "UNK");
+    const { snapshot, foreign } = mergeProviderSnapshots(
+      [
+        { providerId: "jira", snapshot: snap({ readyForImplementation: [own] }) },
+        { providerId: "linear", snapshot: snap({ readyForImplementation: [unmapped] }) },
+      ],
+      mappings,
+    );
+    expect(snapshot.readyForImplementation).toEqual([own, unmapped]);
+    expect(foreign).toEqual([]);
+  });
+
+  it("drops foreign parentsToFinalize and count keys, still summing same-tracker counts", () => {
+    const { snapshot, foreign } = mergeProviderSnapshots(
+      [
+        {
+          providerId: "linear",
+          snapshot: snap({
+            inProgressCountsByScope: { ENG: 2, APP: 1 },
+            parentsToFinalize: [
+              { issueId: "p1", identifier: "ENG-9", scopeKey: "ENG" },
+              { issueId: "p2", identifier: "APP-9", scopeKey: "APP" },
+            ],
+          }),
+        },
+        { providerId: "linear", snapshot: snap({ inProgressCountsByScope: { APP: 2 } }) },
+        { providerId: "jira", snapshot: snap({ inProgressCountsByScope: { ENG: 3 } }) },
+      ],
+      mappings,
+    );
+    expect(snapshot.inProgressCountsByScope).toEqual({ APP: 3, ENG: 3 });
+    expect(snapshot.parentsToFinalize).toEqual([{ issueId: "p2", identifier: "APP-9", scopeKey: "APP" }]);
+    expect(foreign).toEqual([]);
+  });
+
+  it("leaves a single-tracker snapshot unchanged", () => {
+    const a = makeIssue("1", "APP-1", "APP");
+    const b = makeIssue("2", "APP-2", "APP");
+    const { snapshot, foreign } = mergeProviderSnapshots(
+      [
+        { providerId: "linear", snapshot: snap({ readyForImplementation: [a], inProgressCountsByScope: { APP: 1 } }) },
+        { providerId: "linear", snapshot: snap({ readyForImplementation: [b], needsPlanning: [a], inProgressCountsByScope: { APP: 2 } }) },
+      ],
+      { APP: makeMapping() },
+    );
+    expect(snapshot).toEqual({
+      readyForImplementation: [a, b],
+      needsPlanning: [a],
+      inProgressCountsByScope: { APP: 3 },
+      parentsToFinalize: [],
+    });
+    expect(foreign).toEqual([]);
+  });
+
+  it("selectForeignTrackerBlockers emits one no-mapping blocker per foreign issue", () => {
+    const issue = makeIssue("1", "ENG-1", "ENG");
+    expect(selectForeignTrackerBlockers([{ issue, providerId: "linear", mappingProvider: "jira" }])).toEqual([
+      {
+        issueId: "1",
+        issueIdentifier: "ENG-1",
+        issueTitle: "ENG-1",
+        teamKey: "ENG",
+        reason: "no-mapping",
+        detail: "Mapping ENG is a jira mapping; this linear issue has no linear mapping.",
+      },
+    ]);
   });
 });
