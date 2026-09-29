@@ -23,14 +23,14 @@ afterEach(() => {
 describe("dedup", () => {
   it("markDispatched and isAlreadyDispatched", () => {
     expect(dedup.isAlreadyDispatched("issue-1")).toBe(false);
-    dedup.markDispatched("issue-1");
+    dedup.markDispatched("issue-1", "TEAM");
     expect(dedup.isAlreadyDispatched("issue-1")).toBe(true);
     expect(dedup.isAlreadyDispatched("issue-2")).toBe(false);
   });
 
   it("listDispatched returns entries", () => {
-    dedup.markDispatched("issue-a", "A-1", "Fix foo");
-    dedup.markDispatched("issue-b", "A-2", "Fix bar");
+    dedup.markDispatched("issue-a", "TEAM", "A-1", "Fix foo");
+    dedup.markDispatched("issue-b", "TEAM", "A-2", "Fix bar");
 
     const entries = dedup.listDispatched();
     expect(entries).toHaveLength(2);
@@ -45,7 +45,7 @@ describe("dedup", () => {
   });
 
   it("deleteDispatched removes an entry", () => {
-    dedup.markDispatched("issue-x");
+    dedup.markDispatched("issue-x", "TEAM");
     expect(dedup.isAlreadyDispatched("issue-x")).toBe(true);
     expect(dedup.deleteDispatched("issue-x")).toBe(true);
     expect(dedup.isAlreadyDispatched("issue-x")).toBe(false);
@@ -53,8 +53,8 @@ describe("dedup", () => {
   });
 
   it("getDispatchedIds returns all tracked issue IDs", () => {
-    dedup.markDispatched("id-1");
-    dedup.markDispatched("id-2");
+    dedup.markDispatched("id-1", "TEAM");
+    dedup.markDispatched("id-2", "TEAM");
     const ids = dedup.getDispatchedIds();
     expect(ids.sort()).toEqual(["id-1", "id-2"]);
   });
@@ -76,6 +76,29 @@ describe("dispatch admission schema", () => {
     expect((second.prepare("SELECT COUNT(*) AS n FROM dispatch_admissions").get() as { n: number }).n).toBe(0);
     expect((second.prepare("SELECT COUNT(*) AS n FROM dispatch_budget_entries").get() as { n: number }).n).toBe(0);
     expect(second.prepare("SELECT issue_id FROM dispatched").all()).toEqual([{ issue_id: "old-issue" }]);
+  });
+
+  it("adds team_key to the old dispatched schema, keeps rows with NULL, and writes the key", () => {
+    const old = new Database(dbPath);
+    old.exec("CREATE TABLE dispatched (issue_id TEXT PRIMARY KEY, dispatched_at INTEGER NOT NULL, issue_identifier TEXT, issue_title TEXT)");
+    old.prepare("INSERT INTO dispatched (issue_id, dispatched_at, issue_identifier, issue_title) VALUES (?, ?, ?, ?)")
+      .run("old-issue", 123, "OLD-1", "Old title");
+    old.close();
+
+    const columns = () => (dedup.getDb().prepare("PRAGMA table_info(dispatched)").all() as Array<{ name: string }>)
+      .map((c) => c.name);
+    expect(columns()).toContain("team_key");
+    dedup.closeDb();
+    expect(columns().filter((n) => n === "team_key")).toHaveLength(1);
+
+    dedup.markDispatched("new-issue", "TEAM", "T-1", "title");
+    const rows = dedup.getDb()
+      .prepare("SELECT issue_id, issue_identifier, issue_title, team_key FROM dispatched ORDER BY issue_id")
+      .all();
+    expect(rows).toEqual([
+      { issue_id: "new-issue", issue_identifier: "T-1", issue_title: "title", team_key: "TEAM" },
+      { issue_id: "old-issue", issue_identifier: "OLD-1", issue_title: "Old title", team_key: null },
+    ]);
   });
 
   it("enforces one active scoped issue and PR while retaining released history and budget identity", () => {

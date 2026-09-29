@@ -44,7 +44,7 @@ function parkAt(issueId: string, phase: string): void {
 describe("canDispatch — reason ordering", () => {
   it("returns in_flight even when a dedup row also exists for the same issue", () => {
     log.appendLog({ issueId: "issue-1", teamKey: "AII", phase: "implementation", status: "running" });
-    dedup.markDispatched("issue-1");
+    dedup.markDispatched("issue-1", "TEAM");
 
     const decision = gate.canDispatch({
       issueId: "issue-1",
@@ -56,7 +56,7 @@ describe("canDispatch — reason ordering", () => {
   });
 
   it("planning/implementation check dedup when no in-flight run exists", () => {
-    dedup.markDispatched("issue-2");
+    dedup.markDispatched("issue-2", "TEAM");
 
     expect(
       gate.canDispatch({ issueId: "issue-2", kind: "implementation", teamKey: "AII", maxInProgressAiIssues: 5 }),
@@ -70,7 +70,7 @@ describe("canDispatch — reason ordering", () => {
 
 describe("canDispatch — gap-fill never checks dedup", () => {
   it("a dispatched row with no in-flight run returns ok:true for gap-fill", () => {
-    dedup.markDispatched("issue-3");
+    dedup.markDispatched("issue-3", "TEAM");
 
     const decision = gate.canDispatch({
       issueId: "issue-3",

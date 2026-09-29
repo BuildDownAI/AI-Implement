@@ -3230,7 +3230,7 @@ describe("admin local job logs endpoint", () => {
 describe("admin dedup", () => {
   it("lists dedup entries", async () => {
     const token = await login("secret");
-    dedup.markDispatched("issue-1", "T-1", "Test issue");
+    dedup.markDispatched("issue-1", "TEAM", "T-1", "Test issue");
     const res = await request("/api/dedup", "GET", "secret", undefined, token);
     expect(res.statusCode).toBe(200);
     const entries = JSON.parse(res.body);
@@ -3240,7 +3240,7 @@ describe("admin dedup", () => {
 
   it("deletes a dedup entry", async () => {
     const token = await login("secret");
-    dedup.markDispatched("issue-del");
+    dedup.markDispatched("issue-del", "TEAM");
     const del = await request("/api/dedup/issue-del", "DELETE", "secret", undefined, token);
     expect(del.statusCode).toBe(200);
     expect(dedup.isAlreadyDispatched("issue-del")).toBe(false);
@@ -3441,7 +3441,7 @@ describe("admin blockers endpoint", () => {
     await request("/api/mappings", "POST", "secret", { teamKey: "CORE", owner: "org", repo: "core", planningWorkflowFile: "claude-plan.yml" }, token);
     const dedupBlocked: TicketIssue = { id: "issue-1", identifier: "CORE-100", title: "Already dispatched", description: null, scopeKey: "CORE", nativeStatus: "Todo" };
     const unmapped: TicketIssue = { id: "issue-2", identifier: "ZZZ-1", title: "No mapping", description: null, scopeKey: "ZZZ", nativeStatus: "Todo" };
-    dedup.markDispatched("issue-1", "CORE-100", "Already dispatched");
+    dedup.markDispatched("issue-1", "TEAM", "CORE-100", "Already dispatched");
     vi.spyOn(provider, "fetchAIImplementSnapshot").mockResolvedValueOnce({
       readyForImplementation: [dedupBlocked, unmapped],
       needsPlanning: [],
