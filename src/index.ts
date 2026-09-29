@@ -104,7 +104,7 @@ import { clearPrNotFoundGrace, decideCleanExitOutcome, shouldSkipCompletionNotic
 import type { RunPrCandidate, RunPrMatch } from "./monitor-status.js";
 import { pickPrForRun } from "./monitor-status.js";
 import { type RunConfigV1, encodeRunConfig, decodeRunConfig, buildImplRunConfig } from "./run-config.js";
-import { resolveBaseBranch, findOpenRollUpPr } from "./feature-branch.js";
+import { resolveBaseBranch, findOpenRollUpPr, resolvePlanningBranch } from "./feature-branch.js";
 import { validateIssueBaseBranch, postBranchComment } from "./base-branch.js";
 import { runMergeUps, clearRollUpHandledMarkersByIdentifier } from "./merge-up.js";
 import { runGroupingBranchAutoMerge } from "./auto-merge.js";
@@ -1292,10 +1292,13 @@ export async function dispatchGitHubActions(
 export type PlanningDispatchContext = {
   execPath: ReturnType<typeof resolvePlanningExecutionPath>;
   runnerMode: string;
-  /** Validated "AI-Implement Base Branch" field value, or the mapping default. */
+  /** Validated "AI-Implement Base Branch" field value, the resolved feature-branch
+   *  chain target (when the field is unset and the chain's branch already exists),
+   *  or the mapping default — in that precedence order. */
   resolvedPlanningBranch: string;
   /** The validated field value itself, or null when unset — distinct from
-   *  resolvedPlanningBranch, which falls back to the mapping default. */
+   *  resolvedPlanningBranch, which may instead resolve to the feature-branch chain
+   *  target or fall back to the mapping default. */
   planningFieldValue: string | null;
 };
 
@@ -1316,7 +1319,7 @@ export type PlanningDispatchContext = {
  * Returns null when the issue must not be dispatched this tick — every reason is
  * already logged/marked by this function, so the caller only needs to skip.
  */
-async function preparePlanningDispatch(
+export async function preparePlanningDispatch(
   config: AppConfig,
   provider: TicketingProvider,
   issue: DispatchableIssue,
@@ -1373,9 +1376,23 @@ async function preparePlanningDispatch(
   });
   if (planningValidated.refused) return null;
 
-  // featureBranchChain is NOT consulted for planning — that grouping applies only to
-  // implementation dispatches. Planning clones the validated field value or the default.
-  const resolvedPlanningBranch = planningValidated.branch ?? mapping.defaultBranch;
+  // Resolve the planning base the same way the implementation base is resolved
+  // (AII-898): the Jira per-issue field wins when set (validateIssueBaseBranch already
+  // refuses the field+chain combination above, so branch !== null here implies an empty
+  // chain); otherwise a non-empty featureBranchChain resolves to the feature branch the
+  // implementation run will build on, read-only (resolvePlanningBranch never creates
+  // branches — only resolveBaseBranch, on the implementation path, does that). The token
+  // is only minted when there's a chain to check, keeping this a no-op for flat issues.
+  let resolvedPlanningBranch: string;
+  if (planningValidated.branch) {
+    resolvedPlanningBranch = planningValidated.branch;
+  } else if ((issue.featureBranchChain ?? []).length > 0) {
+    const chainGhToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
+    resolvedPlanningBranch =
+      (await resolvePlanningBranch({ ghToken: chainGhToken, issue, mapping })) ?? mapping.defaultBranch;
+  } else {
+    resolvedPlanningBranch = mapping.defaultBranch;
+  }
 
   return { execPath, runnerMode, resolvedPlanningBranch, planningFieldValue: planningValidated.branch };
 }

@@ -132,6 +132,29 @@ branch (Fly machines / local Docker). The target repo's `claude-implement.yml` m
 the `base_branch` input, so **re-sync workflows to the target repo before relying on
 grouping**.
 
+### Planning clones the same branch (AII-898)
+
+A planning run for a child of a feature node clones the feature branch its implementation
+will build on — not unconditionally the repo default. `preparePlanningDispatch`
+(`src/index.ts`) resolves the planning base the same way as above, with one difference:
+`resolvePlanningBranch` (`src/feature-branch.ts`) is **read-only** and never creates a
+branch, since planning must not mutate the repo.
+
+- Jira's per-issue `AI-Implement Base Branch` field wins when set, exactly as for
+  implementation (and exactly as before this change — the field and a grouping chain
+  are a refused combination, so this case never also has a chain).
+- Otherwise, a non-empty `featureBranchChain` resolves to the chain's target branch when
+  it already exists on GitHub — e.g. an earlier sibling has merged into it.
+- If that branch doesn't exist yet — a parent labelled before any child has merged into
+  it — planning falls back to `mapping.defaultBranch`, and `resolvePlanningBranch` logs
+  one `[poll]` line naming the issue and the branch that was missing.
+- No chain and no field: planning clones `mapping.defaultBranch`, as always.
+
+Before this, planning ignored `featureBranchChain` entirely and always cloned the field
+value or the default — so from the second child in a sequential chain onward, planning
+saw a tree missing whatever the previous sibling had merged into the feature branch, and
+could hand the implementer a plan built on a false premise (observed on AII-894).
+
 ---
 
 ## 5. `ai-implement.yml` — per-issue grouping config
@@ -276,6 +299,7 @@ Recovery for a capped or unapproved child is tracked in [AII-263](https://linear
 | Per-issue config (`ai-implement.yml` mode selector) | `src/issue-config.ts` (`parseIssueConfig`) |
 | Branch names | `src/pipeline/branch-name.ts` (`buildGroupingBranchName`, `FeatureBranchMode`) |
 | Cascade branch creation + PR-base resolution | `src/feature-branch.ts` (`resolveBaseBranch`) |
+| Planning-base resolution (read-only, no branch creation) | `src/feature-branch.ts` (`resolvePlanningBranch`), wired in `src/index.ts` (`preparePlanningDispatch`) |
 | Roll-up (direct merge / human PR) | `src/merge-up.ts` (`runMergeUps`) |
 | GitHub helpers (branch/compare/merge/PR/merged-state) | `src/github.ts` (`ensureBranchExists`, `compareBranches`, `getBranchSha`, `mergeBranch`, `createPullRequest`, `findOpenPullRequest`, `findPullRequestByBranches`, `deleteBranch`) — `findPullRequestByBranches` detects the top-of-tree PR's merged state (robust to any merge method) and returns its head SHA; `getBranchSha` fetches the branch's current tip for the SHA-equality safety check; `deleteBranch` removes the feature branch after merge |
 | Plan-Complete transition | `src/runner-callback.ts` → `markPlanComplete` |

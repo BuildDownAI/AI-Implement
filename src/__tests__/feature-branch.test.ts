@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { resolveBaseBranch, nonTerminalDesignatedChildren, type FeatureChildState } from "../feature-branch.js";
+import { resolveBaseBranch, resolvePlanningBranch, nonTerminalDesignatedChildren, type FeatureChildState } from "../feature-branch.js";
 import type { RepoMapping } from "../config.js";
 import type { FeatureBranchChainEntry, TicketIssue } from "../providers/types.js";
 
@@ -129,6 +129,61 @@ describe("resolveBaseBranch", () => {
       issue: makeIssue([{ identifier: "OOL-78", mode: "feature" }]),
       mapping: makeMapping(),
     })).rejects.toThrow(/refusing to dispatch against "testing"/);
+  });
+});
+
+// AII-898: read-only counterpart used by planning dispatch — must never create a branch.
+describe("resolvePlanningBranch", () => {
+  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  it("returns the chain's target branch when it already exists", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ object: { sha: "tip-sha" } }) } as Response);
+
+    const branch = await resolvePlanningBranch({
+      ghToken: "t",
+      issue: makeIssue([{ identifier: "OOL-78", mode: "feature" }]),
+      mapping: makeMapping(),
+    });
+
+    expect(branch).toBe("ai-implement/feature/ool-78");
+    expect(vi.mocked(fetch).mock.calls.length).toBe(1); // one existence check, no branch creation
+  });
+
+  it("only checks the chain's last entry for a multi-entry chain", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ object: { sha: "tip-sha" } }) } as Response);
+
+    const branch = await resolvePlanningBranch({
+      ghToken: "t",
+      issue: makeIssue([{ identifier: "OOL-78", mode: "feature" }, { identifier: "OOL-96", mode: "feature" }]),
+      mapping: makeMapping(),
+    });
+
+    expect(branch).toBe("ai-implement/feature/ool-96");
+    expect(vi.mocked(fetch).mock.calls.length).toBe(1);
+  });
+
+  it("returns null and logs once when the chain's branch does not exist yet", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.mocked(fetch).mockResolvedValueOnce({ ok: false, status: 404 } as Response);
+
+    const branch = await resolvePlanningBranch({
+      ghToken: "t",
+      issue: makeIssue([{ identifier: "OOL-78", mode: "feature" }]),
+      mapping: makeMapping(),
+    });
+
+    expect(branch).toBeNull();
+    expect(logSpy).toHaveBeenCalledTimes(1);
+    expect(logSpy.mock.calls[0][0]).toContain("OOL-87");
+    expect(logSpy.mock.calls[0][0]).toContain("ai-implement/feature/ool-78");
+    expect(logSpy.mock.calls[0][0]).toContain("testing"); // the fallback (mapping.defaultBranch)
+  });
+
+  it("returns null and makes no request when there is no chain", async () => {
+    const branch = await resolvePlanningBranch({ ghToken: "t", issue: makeIssue(undefined), mapping: makeMapping() });
+    expect(branch).toBeNull();
+    expect(vi.mocked(fetch).mock.calls.length).toBe(0);
   });
 });
 
