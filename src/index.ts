@@ -1292,10 +1292,13 @@ export async function dispatchGitHubActions(
 export type PlanningDispatchContext = {
   execPath: ReturnType<typeof resolvePlanningExecutionPath>;
   runnerMode: string;
-  /** Validated "AI-Implement Base Branch" field value, or the mapping default. */
+  /** Validated "AI-Implement Base Branch" field value, the resolved feature-branch
+   *  chain target (when the field is unset and the chain's branch already exists),
+   *  or the mapping default — in that precedence order. */
   resolvedPlanningBranch: string;
   /** The validated field value itself, or null when unset — distinct from
-   *  resolvedPlanningBranch, which falls back to the mapping default. */
+   *  resolvedPlanningBranch, which may instead resolve to the feature-branch chain
+   *  target or fall back to the mapping default. */
   planningFieldValue: string | null;
 };
 
