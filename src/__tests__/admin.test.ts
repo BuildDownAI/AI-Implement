@@ -98,6 +98,8 @@ vi.mock("../workflow-probe.js", async (importOriginal) => ({
 }));
 
 function makeFakeRegistry(provider: FakeProvider): ProviderRegistry {
+  // Mappings default to the linear tracker; snapshot merging matches on provider id.
+  Object.defineProperty(provider, "id", { value: "linear", configurable: true });
   return {
     forMapping: async () => provider,
     forAllMappings: async () => [provider],
@@ -1053,6 +1055,24 @@ describe("admin mappings", () => {
       profilesFieldOverride: null,
       baseBranchFieldOverride: null,
     });
+  });
+
+  it("warns, but still saves, when a Jira mapping replaces a Linear mapping's key", async () => {
+    const token = await login("secret");
+    const jira = { ticketingProvider: "jira", ticketingConfig: { kind: "jira", jql: "project = ACME", repoFieldValue: "org/clash" } };
+    const fresh = await request("/api/mappings", "POST", "secret", { teamKey: "CLASH0", owner: "org", repo: "clash", ...jira }, token);
+    expect(fresh.statusCode).toBe(202);
+    expect(JSON.parse(fresh.body).warnings).toBeUndefined();
+
+    await request("/api/mappings", "POST", "secret", { teamKey: "CLASH", owner: "org", repo: "clash" }, token);
+    const clash = await request("/api/mappings", "POST", "secret", { teamKey: "CLASH", owner: "org", repo: "clash", ...jira }, token);
+    expect(clash.statusCode).toBe(202);
+    expect(JSON.parse(clash.body).warnings).toHaveLength(1);
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    expect(JSON.parse(list.body).CLASH.ticketingProvider).toBe("jira");
+
+    const again = await request("/api/mappings", "POST", "secret", { teamKey: "CLASH", owner: "org", repo: "clash", ...jira }, token);
+    expect(JSON.parse(again.body).warnings).toBeUndefined();
   });
 
   it("persists filesystem project settings and reviewer selection in local mode", async () => {
@@ -3230,7 +3250,7 @@ describe("admin local job logs endpoint", () => {
 describe("admin dedup", () => {
   it("lists dedup entries", async () => {
     const token = await login("secret");
-    dedup.markDispatched("issue-1", "T-1", "Test issue");
+    dedup.markDispatched("issue-1", "TEAM", "T-1", "Test issue");
     const res = await request("/api/dedup", "GET", "secret", undefined, token);
     expect(res.statusCode).toBe(200);
     const entries = JSON.parse(res.body);
@@ -3240,7 +3260,7 @@ describe("admin dedup", () => {
 
   it("deletes a dedup entry", async () => {
     const token = await login("secret");
-    dedup.markDispatched("issue-del");
+    dedup.markDispatched("issue-del", "TEAM");
     const del = await request("/api/dedup/issue-del", "DELETE", "secret", undefined, token);
     expect(del.statusCode).toBe(200);
     expect(dedup.isAlreadyDispatched("issue-del")).toBe(false);
@@ -3436,12 +3456,37 @@ describe("admin blockers endpoint", () => {
     expect(body.totals.issues).toBe(1);
   });
 
+  it("lists a Linear issue whose key belongs to a Jira mapping as no-mapping, and keeps it off /api/issues", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", {
+      teamKey: "ENG", owner: "org", repo: "eng",
+      ticketingProvider: "jira",
+      ticketingConfig: { kind: "jira", jql: "project = ENG", repoFieldValue: "org/eng" },
+    }, token);
+    const linearIssue: TicketIssue = { id: "lin-1", identifier: "ENG-7", title: "Linear issue", description: null, scopeKey: "ENG", nativeStatus: "Todo" };
+    const snapshot = { readyForImplementation: [linearIssue], needsPlanning: [], inProgressCountsByScope: {}, parentsToFinalize: [] };
+    vi.spyOn(provider, "fetchAIImplementSnapshot").mockResolvedValue(snapshot);
+    const res = await request("/api/blockers", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.blockers).toHaveLength(1);
+    expect(body.blockers[0]).toMatchObject({
+      issueIdentifier: "ENG-7",
+      teamKey: "ENG",
+      reason: "no-mapping",
+      detail: "Mapping ENG is a jira mapping; this linear issue has no linear mapping.",
+      issueUrl: null,
+    });
+    const issues = await request("/api/issues", "GET", "secret", undefined, token);
+    expect(JSON.parse(issues.body).issues).toEqual([]);
+  });
+
   it("resolves issueUrl through the team's ticketing provider; a no-mapping blocker has none", async () => {
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "CORE", owner: "org", repo: "core", planningWorkflowFile: "claude-plan.yml" }, token);
     const dedupBlocked: TicketIssue = { id: "issue-1", identifier: "CORE-100", title: "Already dispatched", description: null, scopeKey: "CORE", nativeStatus: "Todo" };
     const unmapped: TicketIssue = { id: "issue-2", identifier: "ZZZ-1", title: "No mapping", description: null, scopeKey: "ZZZ", nativeStatus: "Todo" };
-    dedup.markDispatched("issue-1", "CORE-100", "Already dispatched");
+    dedup.markDispatched("issue-1", "TEAM", "CORE-100", "Already dispatched");
     vi.spyOn(provider, "fetchAIImplementSnapshot").mockResolvedValueOnce({
       readyForImplementation: [dedupBlocked, unmapped],
       needsPlanning: [],

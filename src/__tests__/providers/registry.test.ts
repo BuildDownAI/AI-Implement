@@ -114,3 +114,48 @@ describe("ProviderRegistry", () => {
     expect(p1).not.toBe(p2);
   });
 });
+
+describe("ProviderRegistry.findByKeyInAnyTracker", () => {
+  const issue = { id: "i1", identifier: "KEY-1" } as never;
+  function stub(id: string, behavior: "issue" | "null" | "throw") {
+    const findByKey = vi.fn(async () => {
+      if (behavior === "throw") throw new Error("boom");
+      return behavior === "issue" ? issue : null;
+    });
+    return { id, findByKey } as never as { id: string; findByKey: ReturnType<typeof vi.fn> };
+  }
+  function setup(stubs: ReturnType<typeof stub>[]) {
+    const reg = new ProviderRegistry({}, () => ({ A: linearMapping }));
+    vi.spyOn(reg, "forAllMappings").mockResolvedValue(stubs as never);
+    return reg;
+  }
+
+  it("found: exactly one issue, none throw", async () => {
+    const r = await setup([stub("linear", "null"), stub("jira", "issue")]).findByKeyInAnyTracker("KEY-1");
+    expect(r).toMatchObject({ kind: "found", failedProviderIds: [] });
+    expect((r as { provider: { id: string } }).provider.id).toBe("jira");
+  });
+
+  it("found with failures: one issue, one throws", async () => {
+    const r = await setup([stub("linear", "throw"), stub("jira", "issue")]).findByKeyInAnyTracker("KEY-1");
+    expect(r).toMatchObject({ kind: "found", failedProviderIds: ["linear"] });
+  });
+
+  it("ambiguous: queries every provider and sorts ids", async () => {
+    const stubs = [stub("linear", "issue"), stub("jira", "issue"), stub("filesystem", "throw")];
+    const r = await setup(stubs).findByKeyInAnyTracker("KEY-1");
+    expect(r).toEqual({ kind: "ambiguous", providerIds: ["jira", "linear"] });
+    for (const s of stubs) expect(s.findByKey).toHaveBeenCalledWith("KEY-1");
+  });
+
+  it("none: all return null", async () => {
+    const r = await setup([stub("linear", "null"), stub("jira", "null")]).findByKeyInAnyTracker("KEY-1");
+    expect(r).toEqual({ kind: "none", failedProviderIds: [] });
+  });
+
+  it("none: mix of null and throws lists failed ids sorted", async () => {
+    const r = await setup([stub("linear", "throw"), stub("jira", "null"), stub("filesystem", "throw")]).findByKeyInAnyTracker("KEY-1");
+    expect(r).toEqual({ kind: "none", failedProviderIds: ["filesystem", "linear"] });
+  });
+});
+

@@ -1316,6 +1316,9 @@ export const projectsScript = `
     closeMappingDialog();
     await loadMappings();
     pollSyncStatus(teamKey, data.syncJobId);
+    if (Array.isArray(data.warnings) && data.warnings.length) {
+      setTimeout(function () { alert('Saved with warnings:\\n\\n' + data.warnings.join('\\n\\n')); }, 100);
+    }
   }
   window.saveMappingDialog = saveMappingDialog;
 

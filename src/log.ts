@@ -660,6 +660,14 @@ export function getLatestPrUrlForIssue(issueId: string): string | null {
   return row?.pr_url ?? null;
 }
 
+/** Newest non-null mapping key recorded for an issue; placement fallback for legacy dedup rows. */
+export function getLatestTeamKeyForIssue(issueId: string): string | null {
+  const row = getDb()
+    .prepare("SELECT team_key FROM dispatch_log WHERE issue_id = ? AND team_key IS NOT NULL ORDER BY id DESC LIMIT 1")
+    .get(issueId) as { team_key: string } | undefined;
+  return row?.team_key ?? null;
+}
+
 /** Latest dispatch for an issue in a repo, matched case-insensitively on the tracker
  *  identifier. Recovery path for PRs the orchestrator opened WITHOUT a dispatch —
  *  a grouping roll-up PR encodes its feature-node parent's key in the head branch,
