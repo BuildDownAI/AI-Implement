@@ -37,7 +37,7 @@ export interface PipelineContextData {
   issueDescription: string;
   nonce: string;
   orchestratorUrl: string;
-  /** Optional model override for Claude invocations (e.g. "claude-opus-4-5"). */
+  /** Optional model override for Claude invocations (e.g. claude-opus-5-5). */
   model?: string;
   /** Autonomous runner: absolute path to the cloned workspace. */
   workspaceDir?: string;
