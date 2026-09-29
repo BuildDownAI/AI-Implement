@@ -194,14 +194,6 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
     const dispatchId = ctx.rand.uuidv4();
     const jobId = dispatchId;
 
-    await ctx.run("reserve", () => deps.appendJobLog({ dispatchId, jobId }));
-
-    const ttlSeconds = Math.ceil(totalDeadlineMs / 1000);
-    const { runToken, progressToken } = await ctx.run("mint-tokens", () =>
-      deps.mintRunTokens({ dispatchId, ttlSeconds }));
-
-    const issueIdentifier = `KG-REFRESH · ${triggerId}`;
-
     async function finish(outcome: RefreshOutcome): Promise<RefreshOutcome> {
       ctx.set("completed", true);
       await ctx.run("settled", () => deps.fireSettled());
@@ -228,256 +220,311 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       return outcome;
     }
 
-    ctx.set("step", "dispatch");
-    const dispatchResult = await ctx.run("dispatch", () =>
-      deps.dispatch({ runConfig: input, tokens: { runToken, progressToken }, issueIdentifier }));
+    // Every escape from here on — a non-gate error surfacing after a bounded ctx.run
+    // exhausts its retries (dispatch, a rail gate's own ctx.run rethrow), or any other
+    // unexpected throw — still owes KgRepo a release. A path that has already reasoned
+    // about its own failure (dispatch rejection, a timeout, a gate revert, a cancel, a
+    // merge/delete-branch failure) returns through `finish` normally and never reaches
+    // this catch.
+    try {
+      await ctx.run("reserve", () => deps.appendJobLog({ dispatchId, jobId }));
 
-    if (dispatchResult.runId !== undefined) ctx.set("runId", dispatchResult.runId);
+      const ttlSeconds = Math.ceil(totalDeadlineMs / 1000);
+      const { runToken, progressToken } = await ctx.run("mint-tokens", () =>
+        deps.mintRunTokens({ dispatchId, ttlSeconds }));
 
-    if (dispatchResult.outcome === "rejected") {
-      ctx.set("step", "failed");
-      const at = await ctx.date.now();
-      const outcome = await failurePath(buildFailureOutcome(at, "dispatch was rejected"), "dispatch_rejected");
-      return finish(outcome);
-    }
+      const issueIdentifier = `KG-REFRESH · ${triggerId}`;
 
-    const isGha = dispatchResult.executionMode === GHA_EXECUTION_MODE;
-    let runId = dispatchResult.runId;
-    const dispatchedAt = await ctx.date.now();
-    const bootstrapDeadlineAt = dispatchedAt + bootstrapDeadlineMs;
-    const totalDeadlineAt = dispatchedAt + totalDeadlineMs;
+      ctx.set("step", "dispatch");
+      const dispatchResult = await ctx.run(
+        "dispatch",
+        () => deps.dispatch({ runConfig: input, tokens: { runToken, progressToken }, issueIdentifier }),
+        { maxRetryAttempts: 3 },
+      );
 
-    async function waitForOutcome(): Promise<WaitOutcome> {
-      let progressSeen = false;
-      let watchIndex = 0;
-      let reconcileIndex = 0;
+      if (dispatchResult.runId !== undefined) ctx.set("runId", dispatchResult.runId);
 
-      for (;;) {
-        if (isGha) {
-          if (runId === undefined) {
-            const found = await ctx.run(`reconcile-${reconcileIndex++}`, () => deps.findRunByTitle(issueIdentifier));
-            if (found) {
-              runId = found.runId;
-              ctx.set("runId", runId);
-            }
-          } else {
-            const status = await ctx.run(`watch-${watchIndex++}`, () => deps.getWorkflowRunStatus(runId!));
-            if (status.status === "completed") {
-              const reportNow = await ctx.promise<KgRefreshReportBody>("report").peek();
-              if (reportNow !== undefined) return { kind: "report", value: reportNow };
-              return { kind: "dispatch_lost", conclusion: status.conclusion };
-            }
-          }
-        }
-
-        const now = await ctx.date.now();
-        const deadlineAt = progressSeen ? totalDeadlineAt : bootstrapDeadlineAt;
-        if (now >= deadlineAt) {
-          return progressSeen ? { kind: "total_timeout" } : { kind: "bootstrap_timeout" };
-        }
-        const tick = Math.min(deadlineAt - now, watchIntervalMs);
-
-        const reportArm = ctx.promise<KgRefreshReportBody>("report").get()
-          .map((value): WaitArm => ({ kind: "report", value: value! }));
-        const cancelArm = ctx.promise<string>("cancel").get()
-          .map((reason): WaitArm => ({ kind: "cancel", reason: reason! }));
-        const tickArm = ctx.sleep(tick).map((): WaitArm => ({ kind: "tick" }));
-        const arms = [reportArm, cancelArm, tickArm];
-        if (!progressSeen) {
-          arms.push(ctx.promise<boolean>("progress").get().map((): WaitArm => ({ kind: "progress" })));
-        }
-
-        const winner = await restate.RestatePromise.race(arms);
-        if (winner.kind === "report") return { kind: "report", value: winner.value };
-        if (winner.kind === "cancel") return { kind: "cancel", reason: winner.reason };
-        if (winner.kind === "progress") progressSeen = true;
-        // "tick": loop again, re-checking watch/reconcile and the deadline.
+      if (dispatchResult.outcome === "rejected") {
+        ctx.set("step", "failed");
+        const at = await ctx.date.now();
+        const outcome = await failurePath(buildFailureOutcome(at, "dispatch was rejected"), "dispatch_rejected");
+        return finish(outcome);
       }
-    }
 
-    ctx.set("step", "await-progress");
-    const waitResult = await waitForOutcome();
+      const isGha = dispatchResult.executionMode === GHA_EXECUTION_MODE;
+      let runId = dispatchResult.runId;
+      const dispatchedAt = await ctx.date.now();
+      const bootstrapDeadlineAt = dispatchedAt + bootstrapDeadlineMs;
+      const totalDeadlineAt = dispatchedAt + totalDeadlineMs;
 
-    if (waitResult.kind === "bootstrap_timeout" || waitResult.kind === "total_timeout") {
-      ctx.set("step", "failed");
-      const at = await ctx.date.now();
-      const code = waitResult.kind === "bootstrap_timeout" ? "bootstrap_timeout" : "timed_out";
-      const detail = waitResult.kind === "bootstrap_timeout"
-        ? "no progress signal within the bootstrap deadline"
-        : "no report within the total deadline";
-      const outcome = await failurePath(buildFailureOutcome(at, detail), code, { timedOut: true });
-      return finish(outcome);
-    }
-
-    if (waitResult.kind === "dispatch_lost") {
-      ctx.set("step", "failed");
-      const at = await ctx.date.now();
-      const detail = `run concluded ${waitResult.conclusion ?? "unknown"} with no report`;
-      const outcome = await failurePath(buildFailureOutcome(at, detail), "dispatch_lost");
-      return finish(outcome);
-    }
-
-    if (waitResult.kind === "cancel") {
-      ctx.set("step", "cancelling");
-      if (runId !== undefined) {
-        await ctx.run("cancel-run", () => deps.cancelWorkflowRun(runId!));
-      }
-      if (isGha) {
+      async function waitForOutcome(): Promise<WaitOutcome> {
+        let progressSeen = false;
         let watchIndex = 0;
         let reconcileIndex = 0;
+
         for (;;) {
-          if (runId === undefined) {
-            const found = await ctx.run(`reconcile-cancel-${reconcileIndex++}`, () => deps.findRunByTitle(issueIdentifier));
-            if (found) {
-              runId = found.runId;
-              ctx.set("runId", runId);
-              continue;
+          if (isGha) {
+            if (runId === undefined) {
+              const found = await ctx.run(`reconcile-${reconcileIndex++}`, () => deps.findRunByTitle(issueIdentifier));
+              if (found) {
+                runId = found.runId;
+                ctx.set("runId", runId);
+              }
+            } else {
+              const status = await ctx.run(`watch-${watchIndex++}`, () => deps.getWorkflowRunStatus(runId!));
+              if (status.status === "completed") {
+                const reportNow = await ctx.promise<KgRefreshReportBody>("report").peek();
+                if (reportNow !== undefined) return { kind: "report", value: reportNow };
+                return { kind: "dispatch_lost", conclusion: status.conclusion };
+              }
             }
-          } else {
-            const status = await ctx.run(`watch-cancel-${watchIndex++}`, () => deps.getWorkflowRunStatus(runId!));
-            if (status.status === "completed") break;
           }
+
           const now = await ctx.date.now();
-          if (now >= totalDeadlineAt) break;
-          await ctx.sleep(watchIntervalMs);
+          const deadlineAt = progressSeen ? totalDeadlineAt : bootstrapDeadlineAt;
+          if (now >= deadlineAt) {
+            return progressSeen ? { kind: "total_timeout" } : { kind: "bootstrap_timeout" };
+          }
+          const tick = Math.min(deadlineAt - now, watchIntervalMs);
+
+          const reportArm = ctx.promise<KgRefreshReportBody>("report").get()
+            .map((value): WaitArm => ({ kind: "report", value: value! }));
+          const cancelArm = ctx.promise<string>("cancel").get()
+            .map((reason): WaitArm => ({ kind: "cancel", reason: reason! }));
+          const tickArm = ctx.sleep(tick).map((): WaitArm => ({ kind: "tick" }));
+          const arms = [reportArm, cancelArm, tickArm];
+          if (!progressSeen) {
+            arms.push(ctx.promise<boolean>("progress").get().map((): WaitArm => ({ kind: "progress" })));
+          }
+
+          const winner = await restate.RestatePromise.race(arms);
+          if (winner.kind === "report") return { kind: "report", value: winner.value };
+          if (winner.kind === "cancel") return { kind: "cancel", reason: winner.reason };
+          if (winner.kind === "progress") progressSeen = true;
+          // "tick": loop again, re-checking watch/reconcile and the deadline.
         }
       }
-      ctx.set("step", "failed");
-      const at = await ctx.date.now();
-      const outcome = await failurePath(
-        buildFailureOutcome(at, "cancelled by operator"),
-        "operator_cancelled",
-        { skipOutcome: true },
-      );
-      return finish(outcome);
-    }
 
-    // waitResult.kind === "report"
-    const report = waitResult.value;
+      ctx.set("step", "await-progress");
+      const waitResult = await waitForOutcome();
 
-    if (input.dryRun) {
-      ctx.set("step", "dry-run-report");
-      const at = await ctx.date.now();
-      const outcome: RefreshOutcome = {
-        ok: report.ok, at, detail: report.failureReason ?? (report.ok ? "dry run passed" : "dry run guard refused"),
-        stampBefore: null, stampAfter: null, dryRun: true, partTable: report.partTable,
-      };
-      if (input.report) {
-        await ctx.run("dry-run-report", () => postDryRunReport(deps.rail, input.report!, outcome));
+      if (waitResult.kind === "bootstrap_timeout" || waitResult.kind === "total_timeout") {
+        ctx.set("step", "failed");
+        const at = await ctx.date.now();
+        const code = waitResult.kind === "bootstrap_timeout" ? "bootstrap_timeout" : "timed_out";
+        const detail = waitResult.kind === "bootstrap_timeout"
+          ? "no progress signal within the bootstrap deadline"
+          : "no report within the total deadline";
+        const outcome = await failurePath(buildFailureOutcome(at, detail), code, { timedOut: true });
+        return finish(outcome);
       }
-      ctx.set("step", "closed");
-      await ctx.run("close-row", () => deps.closeJobLog(jobId, "completed"));
-      return finish(outcome);
-    }
 
-    if (report.failureCode === "KG_SNAPSHOT_STALE") {
-      ctx.set("step", "no-new-data");
-      const at = await ctx.date.now();
-      const outcome: RefreshOutcome = {
-        ok: true, at, detail: report.failureReason ?? "Graph is current — a new ingest is required to refresh",
-        stampBefore: null, stampAfter: null,
-      };
-      await ctx.run("close-row", () => deps.closeJobLog(jobId, "completed"));
-      await ctx.run("outcome", () => deps.onOutcome("success", outcome));
-      return finish(outcome);
-    }
-
-    if (!report.ok || report.snapshotPr === undefined || report.snapshotCommit === undefined) {
-      ctx.set("step", "failed");
-      const at = await ctx.date.now();
-      const outcome = await failurePath(
-        buildFailureOutcome(at, report.failureReason ?? "runner reported failure"),
-        report.failureCode ?? "report_failed",
-      );
-      if (report.snapshotPr !== undefined) {
-        await ctx.run("close-snapshot-pr", () =>
-          closeSnapshotPr(deps.rail, owner, repoName, report.snapshotPr!, report.failureCode ?? "failed", report.snapshotBranch));
+      if (waitResult.kind === "dispatch_lost") {
+        ctx.set("step", "failed");
+        const at = await ctx.date.now();
+        const detail = `run concluded ${waitResult.conclusion ?? "unknown"} with no report`;
+        const outcome = await failurePath(buildFailureOutcome(at, detail), "dispatch_lost");
+        return finish(outcome);
       }
-      return finish(outcome);
-    }
 
-    // Success: a fresh snapshot landed. Merge it, then run the four rail gates one at a time.
-    ctx.set("step", "merge");
-    await ctx.run("merge", () => mergeSnapshotPr(deps.rail, owner, repoName, report.snapshotPr!, report.snapshotCommit!));
-    ctx.set("step", "delete-branch");
-    await ctx.run("delete-branch", () => deleteSnapshotBranch(deps.rail, owner, repoName, report.snapshotBranch ?? ""));
-
-    let railCtx: RailContext = {};
-    let gateFailure: { gate: RefreshGate; detail: string } | null = null;
-    const gates: Array<[string, (rail: KgRailDeps, input: RailContext) => Promise<RailContext>]> = [
-      ["fetch", fetchGate],
-      ["stage", stageGate],
-      ["swap", swapGate],
-      ["verify", verifyGate],
-    ];
-    for (const [name, gate] of gates) {
-      ctx.set("step", name);
-      try {
-        railCtx = await runGate(ctx, name, gate, railCtx);
-      } catch (err) {
-        if (err instanceof restate.TerminalError) {
-          gateFailure = parseGateFailure(err.message);
-          break;
+      if (waitResult.kind === "cancel") {
+        ctx.set("step", "cancelling");
+        if (runId !== undefined) {
+          await ctx.run("cancel-run", () => deps.cancelWorkflowRun(runId!));
         }
-        throw err;
+        if (isGha) {
+          let watchIndex = 0;
+          let reconcileIndex = 0;
+          for (;;) {
+            if (runId === undefined) {
+              const found = await ctx.run(`reconcile-cancel-${reconcileIndex++}`, () => deps.findRunByTitle(issueIdentifier));
+              if (found) {
+                runId = found.runId;
+                ctx.set("runId", runId);
+                continue;
+              }
+            } else {
+              const status = await ctx.run(`watch-cancel-${watchIndex++}`, () => deps.getWorkflowRunStatus(runId!));
+              if (status.status === "completed") break;
+            }
+            const now = await ctx.date.now();
+            if (now >= totalDeadlineAt) break;
+            await ctx.sleep(watchIntervalMs);
+          }
+        }
+        ctx.set("step", "failed");
+        const at = await ctx.date.now();
+        const outcome = await failurePath(
+          buildFailureOutcome(at, "cancelled by operator"),
+          "operator_cancelled",
+          { skipOutcome: true },
+        );
+        return finish(outcome);
       }
 
-      // fetchGate's documented short-circuit (kg-refresh-rail.ts:164-196): the just-fetched
-      // source's snapshot/-touching commit already matches the persisted SHA, so there is
-      // nothing to stage/swap/verify — mirrors `runRail`'s own early return
-      // (kg-refresh-rail.ts:377) rather than feeding a `sourceDir`-less context into
-      // `stageGate`, which would throw and trigger a spurious revert of a healthy overlay.
-      if (name === "fetch" && railCtx.gate === "ingest-needed") {
+      // waitResult.kind === "report"
+      const report = waitResult.value;
+
+      if (input.dryRun) {
+        ctx.set("step", "dry-run-report");
+        const at = await ctx.date.now();
+        const outcome: RefreshOutcome = {
+          ok: report.ok, at, detail: report.failureReason ?? (report.ok ? "dry run passed" : "dry run guard refused"),
+          stampBefore: null, stampAfter: null, dryRun: true, partTable: report.partTable,
+        };
+        if (input.report) {
+          await ctx.run("dry-run-report", () => postDryRunReport(deps.rail, input.report!, outcome));
+        }
+        ctx.set("step", "closed");
+        await ctx.run("close-row", () => deps.closeJobLog(jobId, "completed"));
+        return finish(outcome);
+      }
+
+      if (report.failureCode === "KG_SNAPSHOT_STALE") {
         ctx.set("step", "no-new-data");
         const at = await ctx.date.now();
         const outcome: RefreshOutcome = {
-          ok: true, at,
-          detail: railCtx.detail ?? "Graph is current — a new ingest is required to refresh",
-          stampBefore: railCtx.stampBefore ?? null, stampAfter: railCtx.stampBefore ?? null,
+          ok: true, at, detail: report.failureReason ?? "Graph is current — a new ingest is required to refresh",
+          stampBefore: null, stampAfter: null,
         };
         await ctx.run("close-row", () => deps.closeJobLog(jobId, "completed"));
         await ctx.run("outcome", () => deps.onOutcome("success", outcome));
         return finish(outcome);
       }
-    }
 
-    if (gateFailure) {
-      ctx.set("step", "revert");
-      const revertOutcome = await ctx.run("revert", () => revertRail(deps.rail, {
-        namespace: railCtx.namespace ?? null,
-        gate: gateFailure!.gate,
-        detail: gateFailure!.detail,
-        stampBefore: railCtx.stampBefore ?? null,
-      }));
+      if (!report.ok || report.snapshotPr === undefined || report.snapshotCommit === undefined) {
+        ctx.set("step", "failed");
+        const at = await ctx.date.now();
+        const outcome = await failurePath(
+          buildFailureOutcome(at, report.failureReason ?? "runner reported failure"),
+          report.failureCode ?? "report_failed",
+        );
+        if (report.snapshotPr !== undefined) {
+          await ctx.run("close-snapshot-pr", () =>
+            closeSnapshotPr(deps.rail, owner, repoName, report.snapshotPr!, report.failureCode ?? "failed", report.snapshotBranch));
+        }
+        return finish(outcome);
+      }
+
+      // Success: a fresh snapshot landed. Merge it, then run the four rail gates one at a time.
+      // mergeSnapshotPr resolves "blocked"/"conflict" rather than throwing (the same contract
+      // src/kg-refresh.ts's pre-migration caller checks explicitly) — a merge conflict or an
+      // already-closed PR must fail the run, not be treated as a silent success, and must not
+      // retry forever. Neither step has staged or swapped anything yet, so `revertRail` does
+      // not apply to either failure.
+      ctx.set("step", "merge");
+      try {
+        const mergeResult = await ctx.run(
+          "merge",
+          () => mergeSnapshotPr(deps.rail, owner, repoName, report.snapshotPr!, report.snapshotCommit!),
+          { maxRetryAttempts: 3 },
+        );
+        if (mergeResult !== "merged") {
+          throw new Error(`merging snapshot PR #${report.snapshotPr} returned '${mergeResult}'`);
+        }
+        ctx.set("step", "delete-branch");
+        await ctx.run(
+          "delete-branch",
+          () => deleteSnapshotBranch(deps.rail, owner, repoName, report.snapshotBranch ?? ""),
+          { maxRetryAttempts: 3 },
+        );
+      } catch (err) {
+        ctx.set("step", "failed");
+        const at = await ctx.date.now();
+        const detail = err instanceof Error ? err.message : String(err);
+        const outcome = await failurePath(buildFailureOutcome(at, detail), "merge_failed");
+        return finish(outcome);
+      }
+
+      let railCtx: RailContext = {};
+      let gateFailure: { gate: RefreshGate; detail: string } | null = null;
+      const gates: Array<[string, (rail: KgRailDeps, input: RailContext) => Promise<RailContext>]> = [
+        ["fetch", fetchGate],
+        ["stage", stageGate],
+        ["swap", swapGate],
+        ["verify", verifyGate],
+      ];
+      for (const [name, gate] of gates) {
+        ctx.set("step", name);
+        try {
+          railCtx = await runGate(ctx, name, gate, railCtx);
+        } catch (err) {
+          if (err instanceof restate.TerminalError) {
+            gateFailure = parseGateFailure(err.message);
+            break;
+          }
+          throw err;
+        }
+
+        // fetchGate's documented short-circuit (kg-refresh-rail.ts:164-196): the just-fetched
+        // source's snapshot/-touching commit already matches the persisted SHA, so there is
+        // nothing to stage/swap/verify — mirrors `runRail`'s own early return
+        // (kg-refresh-rail.ts:377) rather than feeding a `sourceDir`-less context into
+        // `stageGate`, which would throw and trigger a spurious revert of a healthy overlay.
+        if (name === "fetch" && railCtx.gate === "ingest-needed") {
+          ctx.set("step", "no-new-data");
+          const at = await ctx.date.now();
+          const outcome: RefreshOutcome = {
+            ok: true, at,
+            detail: railCtx.detail ?? "Graph is current — a new ingest is required to refresh",
+            stampBefore: railCtx.stampBefore ?? null, stampAfter: railCtx.stampBefore ?? null,
+          };
+          await ctx.run("close-row", () => deps.closeJobLog(jobId, "completed"));
+          await ctx.run("outcome", () => deps.onOutcome("success", outcome));
+          return finish(outcome);
+        }
+      }
+
+      if (gateFailure) {
+        ctx.set("step", "revert");
+        const revertOutcome = await ctx.run("revert", () => revertRail(deps.rail, {
+          namespace: railCtx.namespace ?? null,
+          gate: gateFailure!.gate,
+          detail: gateFailure!.detail,
+          stampBefore: railCtx.stampBefore ?? null,
+        }));
+        ctx.set("step", "failed");
+        const outcome = await failurePath(revertOutcome, gateFailure.gate);
+        return finish(outcome);
+      }
+
+      ctx.set("step", "persist");
+      const at = await ctx.date.now();
+      const successOutcome: RefreshOutcome = {
+        ok: true, at,
+        detail: `refreshed: ${railCtx.stampBefore ?? "baked"} -> ${railCtx.stampAfter}`,
+        stampBefore: railCtx.stampBefore ?? null, stampAfter: railCtx.stampAfter ?? null,
+      };
+      await ctx.run("persist", () => deps.persistLastRefresh(successOutcome));
+      ctx.set("step", "close-row");
+      await ctx.run("close-row", () => deps.closeJobLog(jobId, "completed"));
+      ctx.set("step", "outcome");
+      await ctx.run("outcome", () => deps.onOutcome("success", successOutcome));
+      return finish(successOutcome);
+    } catch (err) {
+      if (await ctx.get<boolean>("completed")) throw err;
       ctx.set("step", "failed");
-      const outcome = await failurePath(revertOutcome, gateFailure.gate);
+      const at = await ctx.date.now();
+      const detail = err instanceof Error ? err.message : String(err);
+      const outcome = await failurePath(buildFailureOutcome(at, detail), "workflow_error");
       return finish(outcome);
     }
-
-    ctx.set("step", "persist");
-    const at = await ctx.date.now();
-    const successOutcome: RefreshOutcome = {
-      ok: true, at,
-      detail: `refreshed: ${railCtx.stampBefore ?? "baked"} -> ${railCtx.stampAfter}`,
-      stampBefore: railCtx.stampBefore ?? null, stampAfter: railCtx.stampAfter ?? null,
-    };
-    await ctx.run("persist", () => deps.persistLastRefresh(successOutcome));
-    ctx.set("step", "close-row");
-    await ctx.run("close-row", () => deps.closeJobLog(jobId, "completed"));
-    ctx.set("step", "outcome");
-    await ctx.run("outcome", () => deps.onOutcome("success", successOutcome));
-    return finish(successOutcome);
   }
 
   async function report(ctx: WorkflowSharedContext, raw: unknown): Promise<{ status: "accepted" | "duplicate" }> {
     const body = raw as KgRefreshReportBody;
-    if (await ctx.get<boolean>("completed")) {
-      throw new restate.TerminalError("kg-refresh report received after run completed");
-    }
     const promise = ctx.promise<KgRefreshReportBody>("report");
     const existing = await promise.peek();
+    const isDuplicate = existing !== undefined && JSON.stringify(existing) === JSON.stringify(body);
+
+    if (await ctx.get<boolean>("completed")) {
+      // A retried callback delivering the same body it already delivered is not an error —
+      // only a body that conflicts with what the run actually consumed is.
+      if (isDuplicate) return { status: "duplicate" };
+      throw new restate.TerminalError("kg-refresh report received after run completed");
+    }
     if (existing !== undefined) {
-      if (JSON.stringify(existing) !== JSON.stringify(body)) {
+      if (!isDuplicate) {
         throw new restate.TerminalError(
           `conflicting report: existing=${JSON.stringify(existing)} incoming=${JSON.stringify(body)}`,
         );

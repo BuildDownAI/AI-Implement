@@ -4,7 +4,7 @@
 import { randomUUID } from "node:crypto";
 import * as restate from "@restatedev/restate-sdk";
 import type { RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { createKgRepo, type KgRepoTriggerResult } from "../../restate/kg-repo.js";
 import { KG_REFRESH_TOTAL_DEADLINE_MS } from "../../restate/kg-refresh-workflow.js";
 import { VARIANTS, callObject, startVariants, stopAll } from "./harness.js";
@@ -57,6 +57,18 @@ describe("KgRepo durable single-flight lock", () => {
     return callObject<KgRepoTriggerResult>(baseUrl, "KgRepo", key, "trigger", {});
   }
 
+  /** `trigger`'s send to the fake workflow is a one-way `ctx.genericSend` — the HTTP
+   *  response for `trigger` itself does not wait for delivery, so a `runSends` count
+   *  checked immediately afterward can observe the send before it lands. Poll instead
+   *  of asserting synchronously. */
+  async function until(predicate: () => boolean, timeoutMs = 10_000): Promise<void> {
+    const stop = Date.now() + timeoutMs;
+    while (!predicate()) {
+      if (Date.now() > stop) throw new Error("timed out waiting for a durable send to be delivered");
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+
   it.each(VARIANTS.map(([label]) => label))(
     "R1/R2: trigger mints once and sends once; a second trigger while in flight returns the same id with no second send (%s)",
     async (label) => {
@@ -73,6 +85,7 @@ describe("KgRepo durable single-flight lock", () => {
       const second = await trigger(env.baseUrl(), key);
       expect(second).toEqual({ status: "refresh-in-progress", triggerId });
 
+      await until(() => runSends.length - before >= 1);
       expect(runSends.length - before).toBe(1);
       expect(runSends[runSends.length - 1]).toEqual({ key: triggerId, parameter: { triggerId } });
     },
@@ -95,6 +108,7 @@ describe("KgRepo durable single-flight lock", () => {
       const third = await trigger(env.baseUrl(), key);
       expect(third).toEqual({ status: "refresh-in-progress", triggerId });
 
+      await until(() => runSends.length - before >= 1);
       expect(runSends.length - before).toBe(1);
     },
   );
@@ -112,6 +126,7 @@ describe("KgRepo durable single-flight lock", () => {
       await callObject(env.baseUrl(), "KgRepo", key, "release", { triggerId: "not-the-right-id" });
       const stillInFlight = await trigger(env.baseUrl(), key);
       expect(stillInFlight).toEqual({ status: "refresh-in-progress", triggerId });
+      await until(() => runSends.length - before >= 1);
       expect(runSends.length - before).toBe(1);
 
       await callObject(env.baseUrl(), "KgRepo", key, "release", { triggerId });
@@ -121,6 +136,7 @@ describe("KgRepo durable single-flight lock", () => {
       const next = await trigger(env.baseUrl(), key);
       const nextTriggerId = (next as { triggerId: string }).triggerId;
       expect(nextTriggerId).not.toBe(triggerId);
+      await until(() => runSends.length - before >= 2);
       expect(runSends.length - before).toBe(2);
     },
   );
@@ -139,12 +155,25 @@ describe("KgRepo durable single-flight lock", () => {
       const stillFresh = await trigger(env.baseUrl(), key);
       expect(stillFresh).toEqual({ status: "refresh-in-progress", triggerId });
 
-      await new Promise((resolve) => setTimeout(resolve, FRESH_WINDOW_MS + 750));
+      await new Promise((resolve) => setTimeout(resolve, FRESH_WINDOW_MS + 1_500));
 
-      const afterStale = await trigger(env.baseUrl(), key);
-      const staleTriggerId = (afterStale as { triggerId: string }).triggerId;
-      expect(staleTriggerId).not.toBe(triggerId);
-      expect(runSends.length - before).toBe(2);
+      // kg-repo.ts logs the stale-marker warning through `ctx.console.warn`, which the
+      // Restate SDK excludes from replay — this spy proves that holds for real, in both
+      // harness variants, rather than trusting the SDK's documented behavior blind. A
+      // second stale trigger before `warnSpy` is inspected would double-count, so this
+      // scenario only ever ages the marker past staleness once.
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const afterStale = await trigger(env.baseUrl(), key);
+        const staleTriggerId = (afterStale as { triggerId: string }).triggerId;
+        expect(staleTriggerId).not.toBe(triggerId);
+        await until(() => runSends.length - before >= 2);
+        expect(runSends.length - before).toBe(2);
+        expect(warnSpy).toHaveBeenCalledTimes(1);
+        expect(warnSpy.mock.calls[0][1]).toContain("stale in-flight marker");
+      } finally {
+        warnSpy.mockRestore();
+      }
     },
     15_000,
   );
