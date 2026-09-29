@@ -46,9 +46,12 @@ vi.mock("../workflow-probe.js", async (importOriginal) => {
   };
 });
 
+// getBranchSha is additionally mocked for the "preparePlanningDispatch" describe block
+// below (AII-898) — resolvePlanningBranch calls it to check whether a feature branch
+// already exists, and those tests need to control that answer without hitting GitHub.
 vi.mock("../github.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../github.js")>();
-  return { ...actual, postWorkflowDispatch: vi.fn() };
+  return { ...actual, postWorkflowDispatch: vi.fn(), getBranchSha: vi.fn(actual.getBranchSha) };
 });
 
 // Only mocked (as a spy wrapping the real implementation) for the "defers
@@ -835,6 +838,150 @@ describe("dispatchPlanning defers buildPlanningContextInputs until after admissi
 
     expect(planningContext.buildPlanningContextInputs).not.toHaveBeenCalled();
     expect(vi.mocked(localDocker.startLocalRunnerContainer)).not.toHaveBeenCalled();
+  });
+});
+
+// AII-898: preparePlanningDispatch must resolve the planning base the same way the
+// implementation base is resolved — a child of a feature node plans against the feature
+// branch its implementation will build on, not unconditionally the repo default.
+describe("preparePlanningDispatch — feature-branch chain resolution (AII-898)", () => {
+  let dbPath: string;
+  let dedup: typeof DedupModule;
+  let log: typeof import("../log.js");
+  let indexModule: typeof import("../index.js");
+  let githubAppAuth: typeof import("../github-app-auth.js");
+  let github: typeof import("../github.js");
+
+  const mapping = {
+    owner: "eudoxus",
+    repo: "AI-Implement",
+    workflowFile: "claude-implement.yml",
+    planningWorkflowFile: "claude-plan.yml",
+    defaultBranch: "testing",
+    maxInProgressAiIssues: 1,
+    executionMode: "github-actions",
+    provider: "anthropic",
+    sessionMode: "default",
+    machineCpus: 1,
+    machineMemoryMb: 512,
+    extraEnv: {},
+  } as unknown as RepoMapping;
+
+  const provider = {
+    id: "jira",
+    issueUrl: vi.fn().mockReturnValue("https://example.atlassian.net/browse/AII-930"),
+    markImplementationFailed: vi.fn(),
+    markPlanningFailed: vi.fn().mockResolvedValue(true),
+    markPlanningStarted: vi.fn().mockResolvedValue(undefined),
+    postComment: vi.fn().mockResolvedValue(undefined),
+  } as unknown as TicketingProvider;
+
+  const config = {
+    githubAppId: "id",
+    githubAppPrivateKey: "key",
+    runnerCallbackBaseUrl: "https://orchestrator.example",
+    runnerTokenSecret: "secret",
+  } as unknown as AppConfig;
+
+  beforeEach(async () => {
+    vi.resetModules();
+    dbPath = path.join(
+      os.tmpdir(),
+      `prepare-planning-dispatch-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
+    );
+    process.env.DEDUP_DB_PATH = dbPath;
+    dedup = await import("../dedup.js");
+    log = await import("../log.js");
+    log.initLogTable();
+    githubAppAuth = await import("../github-app-auth.js");
+    github = await import("../github.js");
+    indexModule = await import("../index.js");
+
+    vi.mocked(githubAppAuth.getInstallationToken).mockResolvedValue("gh-token");
+    vi.mocked(github.getBranchSha).mockClear();
+  });
+
+  afterEach(() => {
+    dedup.closeDb();
+    try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+    vi.restoreAllMocks();
+  });
+
+  const chainIssue: TicketIssue = {
+    id: "issue-chain-1",
+    identifier: "AII-931",
+    title: "Child of a feature node",
+    description: "desc",
+    scopeKey: "AII",
+    nativeStatus: "Todo",
+    featureBranchChain: [{ identifier: "AII-682", mode: "feature" }],
+  };
+
+  it("resolves to the feature branch when the chain's target branch already exists", async () => {
+    vi.mocked(github.getBranchSha).mockResolvedValue("tip-sha");
+
+    const ctx = await indexModule.preparePlanningDispatch(config, provider, chainIssue, mapping);
+
+    expect(ctx).not.toBeNull();
+    expect(ctx!.resolvedPlanningBranch).toBe("ai-implement/feature/aii-682");
+    expect(ctx!.planningFieldValue).toBeNull();
+  });
+
+  it("falls back to the default branch and logs once when the feature branch does not exist yet", async () => {
+    vi.mocked(github.getBranchSha).mockResolvedValue(null);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    const ctx = await indexModule.preparePlanningDispatch(config, provider, chainIssue, mapping);
+
+    expect(ctx).not.toBeNull();
+    expect(ctx!.resolvedPlanningBranch).toBe("testing");
+    const fallbackLines = logSpy.mock.calls.filter((call) =>
+      typeof call[0] === "string" && call[0].includes("does not exist yet"),
+    );
+    expect(fallbackLines).toHaveLength(1);
+    expect(fallbackLines[0][0]).toContain("AII-931");
+    expect(fallbackLines[0][0]).toContain("ai-implement/feature/aii-682");
+  });
+
+  it("a Jira per-issue base field still wins over the chain, with no getBranchSha call", async () => {
+    const fieldIssue: TicketIssue = {
+      id: "issue-field-1",
+      identifier: "AII-932",
+      title: "Issue with a base branch field",
+      description: "desc",
+      scopeKey: "AII",
+      nativeStatus: "Todo",
+      baseBranch: "release/foo",
+    };
+    vi.mocked(github.getBranchSha).mockResolvedValue("field-branch-sha");
+
+    const ctx = await indexModule.preparePlanningDispatch(config, provider, fieldIssue, mapping);
+
+    expect(ctx).not.toBeNull();
+    expect(ctx!.resolvedPlanningBranch).toBe("release/foo");
+    expect(ctx!.planningFieldValue).toBe("release/foo");
+    // The only getBranchSha call is validateIssueBaseBranch's own lookup of the field
+    // value itself — the chain-resolution path (resolvePlanningBranch) must not run.
+    expect(vi.mocked(github.getBranchSha)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(github.getBranchSha)).toHaveBeenCalledWith(expect.anything(), mapping.owner, mapping.repo, "release/foo");
+  });
+
+  it("no chain and no field: resolves to the default branch, unchanged", async () => {
+    const flatIssue: TicketIssue = {
+      id: "issue-flat-1",
+      identifier: "AII-933",
+      title: "Flat issue",
+      description: "desc",
+      scopeKey: "AII",
+      nativeStatus: "Todo",
+    };
+
+    const ctx = await indexModule.preparePlanningDispatch(config, provider, flatIssue, mapping);
+
+    expect(ctx).not.toBeNull();
+    expect(ctx!.resolvedPlanningBranch).toBe("testing");
+    expect(ctx!.planningFieldValue).toBeNull();
+    expect(vi.mocked(github.getBranchSha)).not.toHaveBeenCalled();
   });
 });
 
