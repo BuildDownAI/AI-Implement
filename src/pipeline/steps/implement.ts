@@ -76,7 +76,7 @@ export const implementStep: StepModule<ImplementInputs, ImplementOutputs> = {
     const { retryPolicy } = context.data;
     const result = await context.llmExecutor.invoke({
       prompt: fullPrompt,
-      model: model ?? "claude-sonnet-5",
+      model: model ?? "claude-sonnet-5-5",
       maxTurns,
       stage: "implement",
       expectsStructuredOutput: false,

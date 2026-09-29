@@ -1813,7 +1813,7 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
     const ghSpawn = inputs.ghSpawn ?? makeDefaultGhSpawn(inputs.workspaceDir);
     const gitSpawn = inputs.gitSpawn ?? makeDefaultGitSpawn(inputs.workspaceDir);
     const maxIterations = inputs.maxIterations ?? DEFAULT_MAX_ITERATIONS;
-    const model = inputs.model ?? context.data.model ?? "claude-sonnet-5";
+    const model = inputs.model ?? context.data.model ?? "claude-sonnet-5-5";
     const prNumber = String(inputs.prNumber ?? "");
     if (!prNumber) throw new Error("post-push-review requires a PR number");
     const retryPolicy = normalizeRetryPolicy(context.data.retryPolicy);
