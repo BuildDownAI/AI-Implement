@@ -284,7 +284,10 @@ export function formatFailureComment(
         ? "the implementation hit its turn cap before completing"
         : "the automated reviewer did not approve within the allotted iterations";
     c = {
-      summary: `🟡 Implementation finished without review approval — ${cause}.`,
+      summary:
+        failureCode === "MAX_TURNS_EXHAUSTED"
+          ? "🟡 Implementation did not finish — it used its full turn budget."
+          : `🟡 Implementation finished without review approval — ${cause}.`,
       detail: [
         prUrl
           ? isInitialRun === false
