@@ -111,7 +111,7 @@ export const reviewStep: StepModule<ReviewInputs, ReviewOutputs> = {
     const { retryPolicy } = context.data;
     const result = await context.llmExecutor.invoke({
       prompt,
-      model: model ?? "claude-sonnet-5",
+      model: model ?? "claude-sonnet-5-5",
       tools: READ_ONLY_ALLOWED_TOOLS,
       jsonSchema: REVIEW_VERDICT_JSON_SCHEMA,
       stage: "review",

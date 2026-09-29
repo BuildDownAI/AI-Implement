@@ -14,7 +14,7 @@ import { computeBackoffMs, normalizeRetryPolicy } from "../retry-backoff.js";
 import { inferTestResults, sumUsage, toolTraceLines, writeCycleSummary } from "../cycle-summary.js";
 
 const DEFAULT_MAX_ITERATIONS = 3;
-const DEFAULT_MODEL = "claude-sonnet-5";
+const DEFAULT_MODEL = "claude-sonnet-5-5";
 
 const ACCEPTANCE_BAR_HEADER = "## ✅ AI Planning: Acceptance Bar";
 const MAP_HEADER = "## 🗺 AI Planning: Implementation Map";

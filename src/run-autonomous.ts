@@ -776,7 +776,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     appendPipelineOwnedGitInstructions(implementationPrompt, prNumber),
   );
   implementationPrompt = appendOperatorInstruction(implementationPrompt, commentInstruction);
-  const model = claudeModel || workflowModel || "claude-sonnet-5";
+  const model = claudeModel || workflowModel || "claude-sonnet-5-5";
   const activityReporting = opts.activityReporting ?? resolveActivityReporting(reviewFix, callbackUrl, progressToken, opts.fetchImpl);
   const activityReportingConfig: ActivityReportingConfig | undefined = activityReporting
     ? { attemptId: activityReporting.attemptId, sink: activityReporting.sink }
@@ -1323,7 +1323,7 @@ export async function runAutonomousLocally(
   implementationPrompt = appendValidationCommandDiscipline(
     appendPipelineOwnedGitInstructions(implementationPrompt, ""),
   );
-  const model = opts.model ?? workflowModel ?? "claude-sonnet-5";
+  const model = opts.model ?? workflowModel ?? "claude-sonnet-5-5";
   const llmExecutor = opts.llmExecutor ?? new ClaudeCliExecutor(workspaceDir, "summary");
   const reporter = opts.reporter ?? new NoopStepReporter();
 
