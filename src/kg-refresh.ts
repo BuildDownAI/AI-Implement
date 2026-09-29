@@ -900,7 +900,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
       // is needed to expire an adopted run that never receives a new trigger() call.
       const remaining = KG_REFRESH_TTL_MS - ageMs;
       ttlWatchdogTimer = setTimeout(() => {
-        failIngestRunner("ingest runner timed out — no callback received within TTL");
+        failIngestRunner("ingest runner timed out — no callback received within TTL", true);
       }, remaining);
     } else {
       // TTL expired — clear the stale lock so a new dispatch can proceed.
@@ -1266,8 +1266,8 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
     }
   }
 
-  /** Shared terminal path for lost/timed-out ingest runners. No-op when stage ≠ ingest-running. */
-  function failIngestRunner(reason: string, failureCode?: string): void {
+  /** Shared terminal path for lost/timed-out ingest runners. `timedOut` is true only for an expired TTL; a runner that ended without a callback is a failure. No-op when stage ≠ ingest-running. */
+  function failIngestRunner(reason: string, timedOut: boolean, failureCode?: string): void {
     if (stage !== "ingest-running") return;
     if (ttlWatchdogTimer !== null) { clearTimeout(ttlWatchdogTimer); ttlWatchdogTimer = null; }
     lastRefresh = {
@@ -1290,10 +1290,10 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
     void input.onOutcome?.("failure", {
       failureReason: reason,
       dispatchId: savedId ?? undefined,
-      timedOut: true,
+      timedOut,
       failureCode,
     });
-    if (savedJobId !== null) input.closeJobLog?.(savedJobId, "timed_out");
+    if (savedJobId !== null) input.closeJobLog?.(savedJobId, timedOut ? "timed_out" : "failed");
     notifyRefreshSettled();
   }
 
@@ -1303,7 +1303,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
       // in the live process, expire the lock so the operator can trigger a new refresh.
       if (running && stage === "ingest-running" && ingestStartedAt !== null &&
           Date.now() - ingestStartedAt >= KG_REFRESH_TTL_MS) {
-        failIngestRunner("ingest runner timed out — no callback received within TTL");
+        failIngestRunner("ingest runner timed out — no callback received within TTL", true);
       }
       if (running) return { status: 409, body: { error: "refresh-in-progress" } };
       if (deployHeld()) {
@@ -1831,7 +1831,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
     onMachineLost(opts?: { failureCode?: string; detail?: string }) {
       if (stage !== "ingest-running") return;
       console.log("[kg-refresh] machine absent — reaper closed the ingest runner job");
-      failIngestRunner(opts?.detail ?? "ingest runner machine absent — closed by reaper sweep", opts?.failureCode);
+      failIngestRunner(opts?.detail ?? "ingest runner machine absent — closed by reaper sweep", false, opts?.failureCode);
     },
 
     async reportDryRun(report: KgDryRunReportTarget): Promise<boolean> {
