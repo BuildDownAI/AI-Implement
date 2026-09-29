@@ -93,7 +93,7 @@ Entry points for areas that are easy to miss. Each names the module to start fro
 | KG sidecar, its OAuth flow, and the image build | `src/mcp.ts`, `src/mcp-oauth.ts` | [docs/kg-sidecar.md](docs/kg-sidecar.md) |
 | MCP door, identity contract, tools service, entry points, roles | `src/restate/tools.ts`, `src/mcp.ts`, `src/mcp-oauth.ts`, `src/mcp-identity.ts` | [docs/mcp-server.md](docs/mcp-server.md), [ADR 025](docs/adr/025-mcp-tools-are-restate-handlers-and-the-operator-object-is-the-refresh-authority.md) |
 | Deploying, clients, Bedrock | `src/deploy.ts` and its `deploy-*` siblings | [docs/deployment.md](docs/deployment.md) |
-| Ticketing provider abstraction | `src/providers/` — `linear.ts`, `jira.ts`, `registry.ts` | |
+| Ticketing provider abstraction | `src/providers/` — `linear.ts`, `jira.ts`, `registry.ts` | [docs/ticketing-providers.md](docs/ticketing-providers.md) |
 | Jira base branch (per-issue PR target) | `src/base-branch.ts` | [docs/jira-base-branch.md](docs/jira-base-branch.md) |
 | Execution backends | `src/fly-machines.ts`, `src/local-docker.ts`, `src/github.ts` | |
 | Runner callbacks and tokens | `src/runner-callback.ts`, `src/runner-token.ts`, `src/token-vending.ts` | [docs/runner-callbacks.md](docs/runner-callbacks.md) |
