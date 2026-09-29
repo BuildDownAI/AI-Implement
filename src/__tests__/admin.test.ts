@@ -98,6 +98,8 @@ vi.mock("../workflow-probe.js", async (importOriginal) => ({
 }));
 
 function makeFakeRegistry(provider: FakeProvider): ProviderRegistry {
+  // Mappings default to the linear tracker; snapshot merging matches on provider id.
+  Object.defineProperty(provider, "id", { value: "linear", configurable: true });
   return {
     forMapping: async () => provider,
     forAllMappings: async () => [provider],
@@ -3434,6 +3436,31 @@ describe("admin blockers endpoint", () => {
     expect(body.blockers[0].reason).toBe("no-mapping");
     expect(body.totals.byReason["no-mapping"]).toBe(1);
     expect(body.totals.issues).toBe(1);
+  });
+
+  it("lists a Linear issue whose key belongs to a Jira mapping as no-mapping, and keeps it off /api/issues", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", {
+      teamKey: "ENG", owner: "org", repo: "eng",
+      ticketingProvider: "jira",
+      ticketingConfig: { kind: "jira", jql: "project = ENG", repoFieldValue: "org/eng" },
+    }, token);
+    const linearIssue: TicketIssue = { id: "lin-1", identifier: "ENG-7", title: "Linear issue", description: null, scopeKey: "ENG", nativeStatus: "Todo" };
+    const snapshot = { readyForImplementation: [linearIssue], needsPlanning: [], inProgressCountsByScope: {}, parentsToFinalize: [] };
+    vi.spyOn(provider, "fetchAIImplementSnapshot").mockResolvedValue(snapshot);
+    const res = await request("/api/blockers", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.blockers).toHaveLength(1);
+    expect(body.blockers[0]).toMatchObject({
+      issueIdentifier: "ENG-7",
+      teamKey: "ENG",
+      reason: "no-mapping",
+      detail: "Mapping ENG is a jira mapping; this linear issue has no linear mapping.",
+      issueUrl: null,
+    });
+    const issues = await request("/api/issues", "GET", "secret", undefined, token);
+    expect(JSON.parse(issues.body).issues).toEqual([]);
   });
 
   it("resolves issueUrl through the team's ticketing provider; a no-mapping blocker has none", async () => {

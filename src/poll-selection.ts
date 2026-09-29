@@ -1,5 +1,5 @@
 import type { RepoMapping } from "./config.js";
-import type { TicketIssue } from "./providers/types.js";
+import type { AIImplementSnapshot, TicketIssue } from "./providers/types.js";
 import type { ProviderRegistry } from "./providers/registry.js";
 import { parsePlanningBlock } from "./planning-block.js";
 
@@ -308,4 +308,78 @@ export function selectIssuesToDispatch(
   }
 
   return selected;
+}
+
+/**
+ * The mapping for scopeKey, only when it belongs to providerId's tracker. Mapping keys are one
+ * namespace across trackers, so a bare key lookup can return another tracker's mapping.
+ *
+ * providerId is compared with the mapping's `ticketingProvider`. The built-in ids (`linear`,
+ * `jira`, `filesystem`) equal those values; a `custom/providers/<id>` factory must return the
+ * same `id` it is registered under, or all its issues are dropped as foreign.
+ */
+export function mappingForProvider(
+  providerId: string,
+  scopeKey: string,
+  mappings: Record<string, RepoMapping>,
+): RepoMapping | null {
+  const mapping = mappings[scopeKey];
+  return mapping && mapping.ticketingProvider === providerId ? mapping : null;
+}
+
+export interface ForeignTrackerIssue {
+  issue: TicketIssue;
+  /** Tracker the issue came from. */
+  providerId: string;
+  /** ticketingProvider of the mapping holding its key. */
+  mappingProvider: string;
+}
+
+/** Merge per-provider snapshots, dropping every entry whose scopeKey belongs to another tracker's mapping. */
+export function mergeProviderSnapshots(
+  entries: Array<{ providerId: string; snapshot: AIImplementSnapshot }>,
+  mappings: Record<string, RepoMapping>,
+): { snapshot: AIImplementSnapshot; foreign: ForeignTrackerIssue[] } {
+  const foreign: ForeignTrackerIssue[] = [];
+  const merged: AIImplementSnapshot = {
+    needsPlanning: [],
+    readyForImplementation: [],
+    inProgressCountsByScope: {},
+    parentsToFinalize: [],
+  };
+  // Unmapped keys are kept; only a mapping of a different tracker makes an entry foreign.
+  const isForeign = (providerId: string, scopeKey: string): boolean => {
+    const m = mappings[scopeKey];
+    return !!m && m.ticketingProvider !== providerId;
+  };
+  const keepIssues = (providerId: string, issues: TicketIssue[]): TicketIssue[] =>
+    issues.filter((issue) => {
+      if (!isForeign(providerId, issue.scopeKey)) return true;
+      foreign.push({ issue, providerId, mappingProvider: mappings[issue.scopeKey].ticketingProvider });
+      return false;
+    });
+  for (const { providerId, snapshot } of entries) {
+    merged.needsPlanning.push(...keepIssues(providerId, snapshot.needsPlanning));
+    merged.readyForImplementation.push(...keepIssues(providerId, snapshot.readyForImplementation));
+    for (const [k, v] of Object.entries(snapshot.inProgressCountsByScope)) {
+      if (isForeign(providerId, k)) continue;
+      merged.inProgressCountsByScope[k] = (merged.inProgressCountsByScope[k] ?? 0) + v;
+    }
+    merged.parentsToFinalize.push(
+      ...snapshot.parentsToFinalize.filter((e) => !isForeign(providerId, e.scopeKey)),
+    );
+  }
+  return { snapshot: merged, foreign };
+}
+
+/** One `no-mapping` Blocker per foreign issue. */
+export function selectForeignTrackerBlockers(foreign: ForeignTrackerIssue[]): Blocker[] {
+  return foreign.map(({ issue, providerId, mappingProvider }) => ({
+    issueId: issue.id,
+    issueIdentifier: issue.identifier,
+    issueTitle: issue.title,
+    teamKey: issue.scopeKey,
+    reason: "no-mapping" as const,
+    detail: `Mapping ${issue.scopeKey} is a ${mappingProvider} mapping; this ${providerId} issue has no ${providerId} mapping.`,
+  }));
 }

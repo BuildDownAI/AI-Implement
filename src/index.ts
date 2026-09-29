@@ -30,7 +30,7 @@ import { dispatchLocalGapfill } from "./local-gapfill.js";
 import { getLatestDispatchForPr, getLatestPrUrlForIssue } from "./log.js";
 import type { TicketingProvider, IssueLifecycleState, FeatureNodeRollUp } from "./providers/types.js";
 import type { TicketIssue } from "./providers/types.js";
-import { rememberCandidates, resolveInFlightSiblings, selectIssuesToDispatch, selectFileOverlapDeferrals, getOrFetchPlanningContexts } from "./poll-selection.js";
+import { rememberCandidates, mappingForProvider, mergeProviderSnapshots, resolveInFlightSiblings, selectIssuesToDispatch, selectFileOverlapDeferrals, getOrFetchPlanningContexts } from "./poll-selection.js";
 import { notify, notifyCompletion, notifyText, notifyKgRefreshOutcome } from "./notify.js";
 import type { KgRefreshOutcomeNotification } from "./notify.js";
 import { isKgDegraded, postAvailableNotice, postBootNotice, postShutdownNotice, recordDeployOutcome, recordShutdown } from "./deploy-notify.js";
@@ -500,10 +500,14 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
       ? []
       : await Promise.all(providers.map((p) => p.fetchAIImplementSnapshot()));
 
+    const entries = providers.map((p, i) => ({ providerId: p.id, snapshot: snapshots[i] }));
+
     // Finalize empty grouping parents (all children terminal, blank spec) — markMerged so the
     // existing roll-up path opens the top-of-tree PR without dispatching a junk implement pass.
     for (let i = 0; i < providers.length; i++) {
       for (const entry of snapshots[i].parentsToFinalize) {
+        // An entry whose key belongs to another tracker's mapping must not touch that repo.
+        if (getMappings()[entry.scopeKey] && !mappingForProvider(providers[i].id, entry.scopeKey, getMappings())) continue;
         console.log(`[${providers[i].id}] Finalizing empty grouping parent ${entry.identifier} (no own work)`);
         // AII-349 reopen re-arm: clear any stale handled markers so merge-up re-runs and opens
         // a new roll-up PR when the parent was previously finalized and then reopened.
@@ -515,14 +519,11 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
       }
     }
 
-    const needsPlanning = snapshots.flatMap((s) => s.needsPlanning);
-    const readyForImplementation = snapshots.flatMap((s) => s.readyForImplementation);
-    const inProgressCountsByScope = snapshots.reduce<Record<string, number>>((acc, s) => {
-      for (const [k, v] of Object.entries(s.inProgressCountsByScope)) {
-        acc[k] = (acc[k] ?? 0) + v;
-      }
-      return acc;
-    }, {});
+    const { snapshot: mergedSnapshot, foreign } = mergeProviderSnapshots(entries, getMappings());
+    for (const f of foreign) {
+      console.log(`[poll] ${f.issue.identifier} (${f.providerId}) matches ${f.mappingProvider} mapping ${f.issue.scopeKey}; skipped`);
+    }
+    const { needsPlanning, readyForImplementation, inProgressCountsByScope } = mergedSnapshot;
     // Tracker-label counts are retained as a diagnostic only — see the poll() call to
     // selectIssuesToDispatch below, which now sizes slots from the DB-backed
     // dispatch_admissions count (src/dispatch-admission.ts) rather than this snapshot.
@@ -560,7 +561,7 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
             await runMergeUps(rollUps, {
               githubAppId: config.githubAppId,
               githubAppPrivateKey: config.githubAppPrivateKey,
-              resolveMapping: (scopeKey) => teamRepoMap[scopeKey] ?? null,
+              resolveMapping: (scopeKey) => mappingForProvider(provider.id, scopeKey, teamRepoMap),
               finalizeMerged: (id, scopeKey) => provider.markMerged(id, scopeKey),
             });
           }
