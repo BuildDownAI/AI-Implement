@@ -1846,7 +1846,7 @@ describe("kg-refresh", () => {
       expect(s.running).toBe(false);
     });
 
-    it("onMachineLost calls onOutcome with failure and timedOut=true", async () => {
+    it("onMachineLost calls onOutcome with failure and timedOut=false", async () => {
       const onOutcome = vi.fn();
       buildDispatch({ onOutcome });
       await handle.trigger();
@@ -1855,10 +1855,10 @@ describe("kg-refresh", () => {
       await new Promise((r) => setTimeout(r, 20));
       const failCall = onOutcome.mock.calls.find(([outcome]) => outcome === "failure");
       expect(failCall).toBeDefined();
-      expect(failCall![1]).toMatchObject({ timedOut: true });
+      expect(failCall![1]).toMatchObject({ timedOut: false });
     });
 
-    it("onMachineLost calls closeJobLog with timed_out", async () => {
+    it("onMachineLost calls closeJobLog with failed", async () => {
       const closeJobLog = vi.fn();
       const appendJobLog = vi.fn(() => 55);
       buildDispatch({ appendJobLog, closeJobLog });
@@ -1866,7 +1866,7 @@ describe("kg-refresh", () => {
       await waitForStage("ingest-running");
       handle.onMachineLost();
       await new Promise((r) => setTimeout(r, 20));
-      expect(closeJobLog).toHaveBeenCalledWith(55, "timed_out");
+      expect(closeJobLog).toHaveBeenCalledWith(55, "failed");
     });
 
     it("onMachineLost logs the machine-absent message", async () => {
@@ -2194,10 +2194,10 @@ describe("kg-refresh", () => {
 
     // ---- AII-523: operator-cancel -----------------------------------------------
 
-    it("operator-cancel: onMachineLost({ failureCode }) is the shared close path — closeJobLog called once with timed_out and failureCode forwarded", async () => {
+    it("operator-cancel: onMachineLost({ failureCode }) is the shared close path — closeJobLog called once with failed and failureCode forwarded", async () => {
       // The admin cancel stamps operator_cancelled on the DB row (tested at the
       // updateJobStatus layer) then calls onMachineLost({ failureCode: "operator_cancelled" })
-      // to close the chain. Verify closeJobLog is called exactly once with "timed_out", and
+      // to close the chain. Verify closeJobLog is called exactly once with "failed", and
       // that failureCode is forwarded through onOutcome so handleKgRefreshOutcome can suppress
       // its notification (leaving the admin notifyText as the single alert).
       const closeJobLog = vi.fn();
@@ -2211,10 +2211,10 @@ describe("kg-refresh", () => {
       await new Promise((r) => setTimeout(r, 20));
 
       expect(closeJobLog).toHaveBeenCalledOnce();
-      expect(closeJobLog).toHaveBeenCalledWith(55, "timed_out");
+      expect(closeJobLog).toHaveBeenCalledWith(55, "failed");
       const failCalls = onOutcome.mock.calls.filter(([o]) => o === "failure");
       expect(failCalls).toHaveLength(1);
-      expect(failCalls[0]![1]).toMatchObject({ failureCode: "operator_cancelled", timedOut: true });
+      expect(failCalls[0]![1]).toMatchObject({ failureCode: "operator_cancelled", timedOut: false });
     });
 
     it("operator-cancel: TTL watchdog does not fire again after onMachineLost (no alert storm)", async () => {
