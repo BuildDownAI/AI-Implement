@@ -3170,6 +3170,16 @@ export async function upsertMappingAction(
     if (enablementError) return { status: 400, body: { error: enablementError } };
   }
 
+  // Advisory only: a Linear mapping already holding this key is the one signal we have that it
+  // is a Linear team key (no provider method lists teams). Selection drops that team's issues
+  // as foreign once a Jira mapping holds the key.
+  const warnings: string[] = [];
+  if (ticketing.ticketingProvider === "jira" && existingMapping?.ticketingProvider === "linear") {
+    warnings.push(
+      `Key "${body.teamKey}" is a Linear mapping today. Saving it as a Jira mapping means Linear issues with team key "${body.teamKey}" will no longer be dispatched. Use a different key unless that is intended.`,
+    );
+  }
+
   upsertMapping(body.teamKey, mapping);
   registry.invalidate();
 
@@ -3181,7 +3191,7 @@ export async function upsertMappingAction(
     console.error(`[admin] workflow sync failed for ${body.teamKey}:`, err),
   );
 
-  return { status: 202, body: { teamKey: body.teamKey, ...mapping, syncJobId: id } };
+  return { status: 202, body: { teamKey: body.teamKey, ...mapping, syncJobId: id, ...(warnings.length ? { warnings } : {}) } };
 }
 
 async function handleUpsertMapping(
