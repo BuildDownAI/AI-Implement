@@ -112,6 +112,21 @@ export interface KgRefreshWorkflowDependencies {
   totalDeadlineMs?: number;
   /** Overrides `KG_REFRESH_WATCH_INTERVAL_MS` for a deterministic watch-loop test. Production leaves this unset. */
   watchIntervalMs?: number;
+  /** Invoked, via its own `ctx.run` entry, once the "stage" gate's own result is already
+   *  durable — before "swap" begins. A fault-injection test uses this to simulate a process
+   *  crash in that exact window: the four gate functions convert any dependency throw into a
+   *  definitive `RailGateError`/`TerminalError` (correct for a real staging failure, wrong for
+   *  simulating an infra crash), so the injected fault needs a step of its own, positioned
+   *  after "stage" is already committed, to get a genuine (retryable) engine failure instead.
+   *  Production leaves this unset. */
+  afterStageCommitted?(): void | Promise<void>;
+  /** Invoked, and awaited, immediately before a gate's own function runs — after `step` is
+   *  already set to that gate's name. Lets a fault-injection test hold a gate open long
+   *  enough for a concurrent `status()` poll to observe the step: a gate's own first check
+   *  can be a synchronous failure with no natural suspension point, so without this hook the
+   *  step is set and the gate fails within the same tick, under most polling granularities.
+   *  Production leaves this unset. */
+  beforeGate?(name: string): void | Promise<void>;
 }
 
 type WaitOutcome =
@@ -171,6 +186,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       name,
       async () => {
         try {
+          await deps.beforeGate?.(name);
           return await gate(deps.rail, input);
         } catch (err) {
           if (err instanceof RailGateError) {
@@ -251,6 +267,9 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         return finish(outcome);
       }
 
+      // "unknown" (dispatch's own ack was lost) falls through to the same path as "accepted":
+      // the GHA branch below reconciles the real runId via findRunByTitle, and fly-machines
+      // has no such backend to reconcile against, so it simply proceeds without one.
       const isGha = dispatchResult.executionMode === GHA_EXECUTION_MODE;
       let runId = dispatchResult.runId;
       const dispatchedAt = await ctx.date.now();
@@ -473,6 +492,10 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           await ctx.run("outcome", () => deps.onOutcome("success", outcome));
           return finish(outcome);
         }
+
+        if (name === "stage") {
+          await ctx.run("stage-committed", () => deps.afterStageCommitted?.());
+        }
       }
 
       if (gateFailure) {
@@ -503,6 +526,16 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       return finish(successOutcome);
     } catch (err) {
       if (await ctx.get<boolean>("completed")) throw err;
+      // Sent before failurePath, not after: an invocation cancel can make failurePath's own
+      // ctx.run throw, which would otherwise skip finish() and leak KgRepo's lock forever.
+      // A second release from finish() below (the normal case) is a harmless no-op re-send.
+      ctx.genericSend({
+        service: "KgRepo",
+        method: "release",
+        key: deps.kgSourceRepo,
+        parameter: { triggerId },
+        inputSerde: restate.serde.json,
+      });
       ctx.set("step", "failed");
       const at = await ctx.date.now();
       const detail = err instanceof Error ? err.message : String(err);

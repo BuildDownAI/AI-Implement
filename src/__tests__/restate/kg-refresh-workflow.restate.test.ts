@@ -15,6 +15,7 @@ import { execSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import * as restate from "@restatedev/restate-sdk";
 import type { RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { RefreshOutcome } from "../../kg-refresh.js";
@@ -29,7 +30,8 @@ import {
   type KgRefreshReportBody,
 } from "../../restate/kg-refresh-workflow.js";
 import {
-  VARIANTS, attachWorkflow, callObject, callWorkflow, replaceEndpoint, startRetryEnabled, startVariants, stopAll,
+  VARIANTS, attachWorkflow, callObject, callWorkflow, crashAfterFirstCall, replaceEndpoint, startRetryEnabled,
+  startVariants, stopAll,
 } from "./harness.js";
 
 const NAMESPACE = "https://kg.test.example/";
@@ -92,6 +94,14 @@ describe("KgRefresh durable workflow", () => {
   let mintTokenImpl: () => Promise<{ token: string; expiresAt: string }>;
   let loadSnapshotShaImpl: () => string | null;
   let mergeDelayMs: number;
+  // Reassigned per-test (W13) to hold a gate open for a concurrent status() poll; a no-op
+  // default keeps every other scenario's gates running with no added latency.
+  let beforeGateImpl: (name: string) => void | Promise<void> = () => {};
+  // Reassigned per-test for the release-leak regression: forces `reserve` (and, once
+  // failurePath is reached, `persist`) to fail terminally, so the outer catch's KgRepo
+  // release is the only thing standing between a forced double-failure and a leaked lock.
+  let forceReserveFailure = false;
+  let forcePersistFailure = false;
 
   const mcpToolCall = async (_url: string, tool: string): Promise<unknown> => {
     if (!sidecarUp) throw new Error("ECONNREFUSED");
@@ -167,6 +177,9 @@ describe("KgRefresh durable workflow", () => {
     restartCallCount = 0;
     materializeCallCount = 0;
     fetchTarballCallCount = 0;
+    beforeGateImpl = () => {};
+    forceReserveFailure = false;
+    forcePersistFailure = false;
 
     mergePullRequestFn.mockClear();
     closePullRequestFn.mockClear();
@@ -260,14 +273,21 @@ describe("KgRefresh durable workflow", () => {
     kgSourceRepo: KG_SOURCE_REPO,
     mintRunTokens: () => ({ runToken: "run-token", progressToken: "progress-token" }),
     dispatch: dispatchFn,
-    appendJobLog: (input) => { appendJobLogCalls.push(input); },
+    appendJobLog: (input) => {
+      appendJobLogCalls.push(input);
+      if (forceReserveFailure) throw new restate.TerminalError("forced reserve failure for the outer-catch release test");
+    },
     closeJobLog: (jobId, status, conclusion) => { closeRowCalls.push({ jobId, status, conclusion }); },
     getWorkflowRunStatus: getWorkflowRunStatusFn,
     findRunByTitle: findRunByTitleFn,
     cancelWorkflowRun: cancelWorkflowRunFn,
-    persistLastRefresh: (outcome) => { persistCalls.push(outcome); },
+    persistLastRefresh: (outcome) => {
+      persistCalls.push(outcome);
+      if (forcePersistFailure) throw new restate.TerminalError("forced persist failure for the outer-catch release test");
+    },
     onOutcome: (kind, outcome) => { onOutcomeCalls.push({ kind, outcome }); },
     fireSettled: () => { settledCalls++; },
+    beforeGate: (name) => beforeGateImpl(name),
     bootstrapDeadlineMs: BOOTSTRAP_DEADLINE_MS,
     totalDeadlineMs: TOTAL_DEADLINE_MS,
     watchIntervalMs: WATCH_INTERVAL_MS,
@@ -462,6 +482,39 @@ describe("KgRefresh durable workflow", () => {
     15_000,
   );
 
+  // ---- Outer-catch release-leak regression (reviewer feedback on 3ea3aad, round 2): `run`'s
+  // outer catch must send KgRepo's release before calling failurePath, precisely because
+  // failurePath's own ctx.run calls (persist/close-row/outcome) can themselves fail — an
+  // invocation-level cancel mid-failurePath is the scenario the code comment describes, and
+  // is not reproducible in this harness, so this forces the same shape instead: `reserve`
+  // fails terminally before any gate ever runs, landing squarely in the outer catch, and
+  // failurePath's own `persist` step is forced to fail too. A fix that only released KgRepo
+  // from inside or after failurePath (rather than ahead of it) would still leak the marker
+  // here, since failurePath never returns. ----
+  it.each(VARIANTS.map(([label]) => label))(
+    "the outer catch releases KgRepo before failurePath, even when failurePath's own steps also fail (%s)",
+    async (label) => {
+      const env = envFor(label);
+      forceReserveFailure = true;
+      forcePersistFailure = true;
+
+      const triggered = await triggerViaKgRepo(env.baseUrl());
+      expect(triggered).not.toHaveProperty("status");
+
+      // KgRepo.trigger sets the marker synchronously, before the genericSend to KgRefresh.run
+      // that goes on to fail — it must already be visible here.
+      expect(await kgRepoStatus(env.baseUrl())).not.toBeNull();
+
+      // `reserve` fails terminally before dispatch is ever attempted, landing in the outer
+      // catch; failurePath's own `persist` step then fails too, so `run` never reaches
+      // `finish()` — its invocation fails outright instead of completing. The outer catch's
+      // pre-emptive release must fire regardless: this is the assertion that times out
+      // without the fix's genericSend ahead of failurePath.
+      await untilAsync(async () => (await kgRepoStatus(env.baseUrl())) === null);
+    },
+    15_000,
+  );
+
   // ---- W2: idempotency-key semantics on `report` ----
   it.each(VARIANTS.map(([label]) => label))(
     "W2: a duplicate report under the same key is absorbed by Restate; a conflicting report under a new key is refused (%s)",
@@ -526,11 +579,15 @@ describe("KgRefresh durable workflow", () => {
     "W3: no progress within the bootstrap deadline fails with a timed_out row and one outcome call (%s)",
     async (label) => {
       const env = envFor(label);
+      // Captured before the trigger (not after): the trigger's genericSend dispatches the
+      // run immediately, and with a 1s bootstrap deadline a call recorded even a moment
+      // late risks folding an already-fired outcome into the "before" snapshot instead of
+      // the "after" delta.
+      const beforeOutcome = onOutcomeCalls.length;
       const triggered = await triggerViaKgRepo(env.baseUrl());
       const triggerId = (triggered as { triggerId: string }).triggerId;
       makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
 
-      const beforeOutcome = onOutcomeCalls.length;
       const outcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
 
       expect(outcome.ok).toBe(false);
@@ -724,6 +781,16 @@ describe("KgRefresh durable workflow", () => {
       const done = runWorkflow(env.baseUrl(), triggerId);
       await until(() => scenarios.get(triggerId)!.dispatchCalls === 1);
 
+      // verifyGate's first check (the "answers" gate) is a synchronous env-var read with no
+      // suspension point of its own, so the step is set and the gate fails within the same
+      // tick — well under a 10ms poll's granularity. Hold it open via beforeGate until the
+      // poll has actually observed "verify", then release it to fail exactly as before.
+      let releaseVerifyGate: () => void = () => {};
+      const verifyGateLatch = new Promise<void>((resolve) => { releaseVerifyGate = resolve; });
+      beforeGateImpl = async (name) => {
+        if (name === "verify") await verifyGateLatch;
+      };
+
       // Poll `status` concurrently with the run so it observes the "verify" step while the
       // workflow is still executing it — a single point-in-time check would race the failure
       // path, which reverts and completes soon after. Collecting every observed step over
@@ -736,6 +803,7 @@ describe("KgRefresh durable workflow", () => {
           try {
             const status = await callWorkflow<{ step: string | null }>(env.baseUrl(), "KgRefresh", triggerId, "status", {});
             observedSteps.add(status.step);
+            if (status.step === "verify") releaseVerifyGate();
           } catch {
             // the workflow may be mid-transition between invocations; retry on the next tick.
           }
@@ -746,6 +814,7 @@ describe("KgRefresh durable workflow", () => {
       await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
       const outcome = await done;
       polling = false;
+      releaseVerifyGate(); // no-op if already released; unblocks the poll loop regardless
       await statusPoll;
 
       expect(outcome.ok).toBe(false);
@@ -868,9 +937,7 @@ describe("KgRefresh durable workflow", () => {
 
   // ---- W12: a crash after `stage`, then replay — fetch/stage do not re-run; swap/verify do ----
   it("W12: a crash injected after stage replays without re-running fetch or stage", async () => {
-    const triggerId = newTriggerId();
     const runId = runIdCounter++;
-    makeScenario(triggerId, { dispatchOutcome: "accepted", runId, executionMode: "fly-machines" });
 
     let fetchTarballCalls = 0;
     let materializeCalls = 0;
@@ -886,6 +953,15 @@ describe("KgRefresh durable workflow", () => {
         return tarball;
       }) as unknown as KgRailDeps["fetchTarball"],
     };
+
+    // The four gate functions convert any dependency throw into a definitive
+    // RailGateError/TerminalError (correct for a real staging failure, wrong for
+    // simulating a process crash), so the fault lives in its own durable checkpoint,
+    // positioned right after "stage" is already committed — fetch/stage never re-run
+    // regardless of how many times this checkpoint itself is retried.
+    let stageCommittedCalls = 0;
+    const afterStageCommitted = crashAfterFirstCall(async () => { stageCommittedCalls++; });
+
     const crashWorkflow = createKgRefreshWorkflow({
       rail: railWithCounter,
       kgSourceRepo: KG_SOURCE_REPO,
@@ -899,6 +975,7 @@ describe("KgRefresh durable workflow", () => {
       persistLastRefresh: (outcome) => { persistCalls.push(outcome); },
       onOutcome: (kind, outcome) => { onOutcomeCalls.push({ kind, outcome }); },
       fireSettled: () => { settledCalls++; },
+      afterStageCommitted,
       bootstrapDeadlineMs: BOOTSTRAP_DEADLINE_MS,
       totalDeadlineMs: TOTAL_DEADLINE_MS,
       watchIntervalMs: WATCH_INTERVAL_MS,
@@ -907,21 +984,34 @@ describe("KgRefresh durable workflow", () => {
     const env = await startRetryEnabled([crashWorkflow, kgRepo]);
     let replacement: Awaited<ReturnType<typeof replaceEndpoint>> | undefined;
     try {
-      const done = callWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId, "run", { triggerId });
+      // Dispatches through the real KgRepo.trigger (not a direct KgRefresh.run call) so the
+      // replacement endpoint registers the same object the resumed run releases to.
+      const triggered = await triggerViaKgRepo(env.baseUrl());
+      expect(triggered).not.toHaveProperty("status");
+      const triggerId = (triggered as { triggerId: string }).triggerId;
+      makeScenario(triggerId, { dispatchOutcome: "accepted", runId, executionMode: "fly-machines" });
+
+      const done = attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
       await until(() => scenarios.get(triggerId)!.dispatchCalls === 1);
       await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
 
-      // stageGate writes COMPLETION_MARKER into staging/ as its last action.
+      // stageGate writes COMPLETION_MARKER into staging/ as its last action; the checkpoint
+      // fires (and crashes, once) immediately afterward.
       const stagingMarker = join(dataRoot, "staging", COMPLETION_MARKER);
-      await until(() => existsSync(stagingMarker), 12_000);
+      await until(() => existsSync(stagingMarker) && stageCommittedCalls === 1, 12_000);
 
       replacement = await replaceEndpoint(env, [crashWorkflow, kgRepo]);
       await env.startedRestateContainer.restart();
+
+      // A real container restart can take longer than this file's default 10s `until`
+      // window — give the resumed retry room to actually land on the replacement endpoint.
+      await until(() => stageCommittedCalls === 2, 30_000);
 
       const outcome = await done;
       expect(outcome.ok).toBe(true);
       expect(fetchTarballCalls).toBe(1);
       expect(materializeCalls).toBe(1);
+      await untilAsync(async () => (await kgRepoStatus(env.baseUrl())) === null);
     } finally {
       replacement?.close();
       await env.stop();
@@ -935,6 +1025,7 @@ const DURATION_UNIT_MS: Record<string, number> = {
   s: 1_000, sec: 1_000, secs: 1_000,
   m: 60_000, min: 60_000, mins: 60_000,
   h: 3_600_000, hour: 3_600_000, hours: 3_600_000,
+  d: 86_400_000, w: 604_800_000,
 };
 
 function durationStringToMs(value: string): number {
