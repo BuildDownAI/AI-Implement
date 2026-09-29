@@ -10,7 +10,8 @@ import {
   resolveReviewFixLifecycle,
 } from "./config.js";
 import type { RepoMapping } from "./config.js";
-import { markDispatched, closeDb, getDispatchedIds, deleteDispatched } from "./dedup.js";
+import { markDispatched, closeDb, getDispatchedRows, deleteDispatched } from "./dedup.js";
+import { reconcileDispatched } from "./dedup-reconcile.js";
 import { canDispatch, acquireDispatch, type DispatchKind, type AcquireDispatchOutcome } from "./dispatch-gate.js";
 import {
   acquire as acquireAdmission,
@@ -27,8 +28,8 @@ import { resolveWorkflowCapabilities, resolveWorkflowContract, type WorkflowCont
 import { surfaceDispatchFailure } from "./dispatch-failure.js";
 import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
 import { dispatchLocalGapfill } from "./local-gapfill.js";
-import { getLatestDispatchForPr, getLatestPrUrlForIssue } from "./log.js";
-import type { TicketingProvider, IssueLifecycleState, FeatureNodeRollUp } from "./providers/types.js";
+import { getLatestDispatchForPr, getLatestPrUrlForIssue, getLatestTeamKeyForIssue } from "./log.js";
+import type { TicketingProvider, FeatureNodeRollUp } from "./providers/types.js";
 import type { TicketIssue } from "./providers/types.js";
 import { rememberCandidates, mappingForProvider, mergeProviderSnapshots, resolveInFlightSiblings, selectIssuesToDispatch, selectFileOverlapDeferrals, getOrFetchPlanningContexts } from "./poll-selection.js";
 import { notify, notifyCompletion, notifyText, notifyKgRefreshOutcome } from "./notify.js";
@@ -453,46 +454,26 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
   const allMappings = Object.values(getMappings());
   const providers = await registry.forAllMappings(allMappings);
 
-  // Reconcile dedup table: clear entries only for issues that are completed/cancelled/not found.
-  // Each provider only knows its own issues; we ask all providers and clear an
-  // entry only when no provider claims it as still-active.
-  const dispatchedIds = getDispatchedIds();
-  if (dispatchedIds.length > 0 && providers.length > 0) {
-    try {
-      const allStateMaps = await Promise.all(
-        providers.map((p) => p.fetchLifecycleStates(dispatchedIds).catch((err) => {
-          console.error("[reconcile] Provider fetchLifecycleStates failed:", err);
-          return new Map<string, IssueLifecycleState>();
-        })),
-      );
-      for (const id of dispatchedIds) {
-        let observedActive = false;
-        let observedTerminal = false;
-        for (const m of allStateMaps) {
-          const state = m.get(id);
-          if (state === undefined) continue;
-          if (state === "active") { observedActive = true; break; }
-          if (state === "completed" || state === "cancelled") observedTerminal = true;
+  // Reconcile dedup table: each tracker is asked only about the rows it owns (docs/dispatch-dedup.md).
+  try {
+    const r = await reconcileDispatched({
+      rows: getDispatchedRows(),
+      mappings: getMappings(),
+      latestJobTeamKey: getLatestTeamKeyForIssue,
+      providerFor: (m) => registry.forMapping(m),
+      clear: (id) => { deleteDispatched(id); },
+      recordNotFound: async (id) => {
+        const br = recordDispatchFailure(id, "implementation", "reconcile_not found");
+        if (br.tripped) {
+          await fireBreakerTrip(config, null, id, null, "implementation", br.failures, "reconcile_not found");
         }
-        if (observedActive) continue;
-        // Clear dedup if any provider reports terminal, or no provider knows about it.
-        if (observedTerminal || allStateMaps.every((m) => m.get(id) === undefined)) {
-          deleteDispatched(id);
-          const reason = observedTerminal ? "terminal" : "not found";
-          console.log(`[reconcile] Cleared dedup for ${id} (state: ${reason})`);
-          // observedTerminal means the tracker issue reached completed/cancelled —
-          // a success signal, not a dispatch failure. Only count failures for not-found entries.
-          if (!observedTerminal) {
-            const _brReconcile = recordDispatchFailure(id, "implementation", `reconcile_${reason}`);
-            if (_brReconcile.tripped) {
-              await fireBreakerTrip(config, null, id, null, "implementation", _brReconcile.failures, `reconcile_${reason}`);
-            }
-          }
-        }
-      }
-    } catch (err) {
-      console.error("[reconcile] Failed to fetch issue states, skipping reconciliation:", err);
+      },
+    });
+    if (Object.values(r).some((n) => n > 0)) {
+      console.log(`[reconcile] kept=${r.kept} terminal=${r.clearedTerminal} notFound=${r.clearedNotFound} mappingRemoved=${r.clearedMappingRemoved} unplaced=${r.keptUnplaced} providerError=${r.keptProviderError}`);
     }
+  } catch (err) {
+    console.error("[reconcile] Failed, skipping reconciliation:", err);
   }
 
   try {
