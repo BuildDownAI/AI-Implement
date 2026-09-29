@@ -359,7 +359,7 @@ export async function guardOpenPrBeforeImplementationDispatch(
       reason: "open_pr",
       actor: null,
     });
-    markDispatched(issue.id, issue.identifier, issue.title);
+    markDispatched(issue.id, issue.scopeKey, issue.identifier, issue.title);
     console.log(`[poll] ${issue.identifier} has open PR #${parsed.prNumber}; routed to a review-fix run`);
     return true;
   }
@@ -1248,7 +1248,7 @@ export async function dispatchGitHubActions(
     return;
   }
 
-  markDispatched(issue.id, issue.identifier, issue.title);
+  markDispatched(issue.id, issue.scopeKey, issue.identifier, issue.title);
   const jobId = appendLog({
     issueId: issue.id,
     issueIdentifier: issue.identifier,
@@ -1976,7 +1976,7 @@ async function dispatchSession(
   }
 
   if (opts.doMarkDispatched) {
-    markDispatched(issue.id, issue.identifier, issue.title);
+    markDispatched(issue.id, issue.scopeKey, issue.identifier, issue.title);
   }
 
   // AII-194: if anything after markDispatched throws, clean up the orphaned dedup row
