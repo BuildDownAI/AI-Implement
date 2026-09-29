@@ -35,6 +35,8 @@ Selection is tracker-scoped. `mappingForProvider` and `mergeProviderSnapshots` d
 
 **Do not reuse a Linear team key as a Jira mapping key.** While the Jira mapping holds the key, that Linear team cannot be mapped: its issues are dropped as foreign.
 
+The admin UI warns about this on save, without blocking it: `POST /api/mappings` returns a `warnings` array when a Jira mapping is saved over a key a Linear mapping holds today. The check is advisory — no provider method lists Linear teams, so an unmapped Linear team key is not detected.
+
 ## Mixed deployments
 
 One instance can run Linear and Jira mappings together. Limits:

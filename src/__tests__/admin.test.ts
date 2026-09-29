@@ -1057,6 +1057,24 @@ describe("admin mappings", () => {
     });
   });
 
+  it("warns, but still saves, when a Jira mapping replaces a Linear mapping's key", async () => {
+    const token = await login("secret");
+    const jira = { ticketingProvider: "jira", ticketingConfig: { kind: "jira", jql: "project = ACME", repoFieldValue: "org/clash" } };
+    const fresh = await request("/api/mappings", "POST", "secret", { teamKey: "CLASH0", owner: "org", repo: "clash", ...jira }, token);
+    expect(fresh.statusCode).toBe(202);
+    expect(JSON.parse(fresh.body).warnings).toBeUndefined();
+
+    await request("/api/mappings", "POST", "secret", { teamKey: "CLASH", owner: "org", repo: "clash" }, token);
+    const clash = await request("/api/mappings", "POST", "secret", { teamKey: "CLASH", owner: "org", repo: "clash", ...jira }, token);
+    expect(clash.statusCode).toBe(202);
+    expect(JSON.parse(clash.body).warnings).toHaveLength(1);
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    expect(JSON.parse(list.body).CLASH.ticketingProvider).toBe("jira");
+
+    const again = await request("/api/mappings", "POST", "secret", { teamKey: "CLASH", owner: "org", repo: "clash", ...jira }, token);
+    expect(JSON.parse(again.body).warnings).toBeUndefined();
+  });
+
   it("persists filesystem project settings and reviewer selection in local mode", async () => {
     const previousMode = process.env.RUNNER_MODE;
     process.env.RUNNER_MODE = "local";
