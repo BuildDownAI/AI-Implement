@@ -4246,22 +4246,21 @@ async function handleKgRefreshOutcome(
   if (!reportIssue) return;
 
   try {
-    const mappings = getMappings();
-    // Sort by project key for stable selection when multiple Linear mappings exist.
-    const linearMapping = Object.entries(mappings)
-      .sort(([a], [b]) => a.localeCompare(b))
-      .find(([, m]) => m.ticketingProvider === "linear")?.[1];
-    if (!linearMapping) {
-      console.warn("[kg-refresh] kg_refresh_report_issue is set but no Linear mapping is configured — skipping failure comment");
+    const result = await registry.findByKeyInAnyTracker(reportIssue);
+    if (result.kind === "ambiguous") {
+      console.warn(`[kg-refresh] report issue ${reportIssue} exists in ${result.providerIds.join(", ")} — skipping failure comment`);
       return;
     }
-
-    const provider = await registry.forMapping(linearMapping);
-    const reportTicket = await provider.findByKey(reportIssue);
-    if (!reportTicket) {
-      console.warn(`[kg-refresh] Could not find report issue ${reportIssue} — skipping failure comment`);
+    if (result.kind === "none") {
+      const failed = result.failedProviderIds.length > 0 ? ` (could not check ${result.failedProviderIds.join(", ")})` : "";
+      console.warn(`[kg-refresh] Could not find report issue ${reportIssue}${failed} — skipping failure comment`);
       return;
     }
+    if (result.failedProviderIds.length > 0) {
+      console.warn(`[kg-refresh] report issue ${reportIssue} found in ${result.provider.id}; could not check ${result.failedProviderIds.join(", ")}`);
+    }
+    const provider = result.provider;
+    const reportTicket = result.issue;
 
     const syntheticJob = {
       status: data.timedOut ? "timed_out" : "failed",
