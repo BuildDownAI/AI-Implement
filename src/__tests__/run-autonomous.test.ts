@@ -24,6 +24,7 @@ import { DISPOSITIONS_FILE, stableReviewFindingKey, type FindingDisposition } fr
 import { CYCLE_SUMMARY_FILE, type CycleSummary } from "../pipeline/cycle-summary.js";
 import type { GhSpawn } from "../pipeline/review-ledger.js";
 import type { ReviewFixMetadataV1 } from "../review-fix-contract.js";
+import { DEFAULT_MODEL } from "../pipeline/default-model.js";
 
 const REQUIRED_ENV: Record<string, string> = {
   ISSUE_ID: "issue-abc",
@@ -542,7 +543,7 @@ describe("runAutonomous", () => {
     expect(capturedModel).toBe("claude-haiku-4-5");
   });
 
-  it("falls back to claude-sonnet-5-5 when no model configured", async () => {
+  it("falls back to DEFAULT_MODEL when no model configured", async () => {
     let capturedModel: string | undefined;
     const mod: StepModule = {
       run: vi.fn(async (ctx) => {
@@ -560,7 +561,7 @@ describe("runAutonomous", () => {
       llmExecutor: makeMockExecutor(0),
     });
 
-    expect(capturedModel).toBe("claude-sonnet-5-5");
+    expect(capturedModel).toBe(DEFAULT_MODEL);
   });
 
   it("invokes the provided llmExecutor when step calls it", async () => {
@@ -582,7 +583,7 @@ describe("runAutonomous", () => {
     });
 
     expect(executor.invoke).toHaveBeenCalledOnce();
-    expect((executor.invoke as ReturnType<typeof vi.fn>).mock.calls[0][0].model).toBe("claude-sonnet-5-5");
+    expect((executor.invoke as ReturnType<typeof vi.fn>).mock.calls[0][0].model).toBe(DEFAULT_MODEL);
   });
 
   it("fetches planning context from the orchestrator using the progress token", async () => {

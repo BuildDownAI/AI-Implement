@@ -3,6 +3,7 @@ import type { PipelineContext, StepModule, StepReporter, RunTelemetry } from "..
 import { formatLlmResultDetail } from "../step-utils.js";
 import { classifyLlmResult, type FailureRecord } from "../failure-classification.js";
 import { describeReferenceRepoCause, type ReferenceRepoResult } from "../../reference-repos.js";
+import { DEFAULT_MODEL } from "../default-model.js";
 
 interface ImplementInputs extends Record<string, unknown> {
   workspaceDir: string;
@@ -76,7 +77,7 @@ export const implementStep: StepModule<ImplementInputs, ImplementOutputs> = {
     const { retryPolicy } = context.data;
     const result = await context.llmExecutor.invoke({
       prompt: fullPrompt,
-      model: model ?? "claude-sonnet-5-5",
+      model: model ?? DEFAULT_MODEL,
       maxTurns,
       stage: "implement",
       expectsStructuredOutput: false,
