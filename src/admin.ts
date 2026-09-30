@@ -72,7 +72,7 @@ import {
 } from "./orchestrator-settings.js";
 import { getInstallationToken, mintSourceTokenOrJwt, getScopedInstallationToken } from "./github-app-auth.js";
 import { GitHubApiError } from "./github-errors.js";
-import { listRepoBranchesAndTags, getRepoDefaultBranch, cancelWorkflowRun, fetchRepoTarball } from "./github.js";
+import { listRepoBranchesAndTags, getRepoDefaultBranch, fetchRepoTarball } from "./github.js";
 import { probeInstallState } from "./github-install-state.js";
 import { listCustomizations } from "./customizations.js";
 import { getFleetReport } from "./report-card.js";
@@ -84,7 +84,6 @@ import { JiraClient, JiraFieldNotSelectError } from "./providers/jira-client.js"
 import { readLocalJobLogs } from "./local-job-logs.js";
 import { enqueueWorkflowSync, runWorkflowSync, getWorkflowSyncById } from "./workflow-sync-queue.js";
 import { isBareWorkflowFileName, workflowFileNamesCollide } from "./workflow-sync.js";
-import type { KgRefreshStatus } from "./kg-refresh.js";
 import { normalizeBranchPrefix } from "./pipeline/branch-name.js";
 import { normalizeGitHubRepo, normalizeReferenceRepos, type ReferenceRepo } from "./reference-repos.js";
 import { fetchTrackerIssuesPage } from "./runner-callback.js";
@@ -457,9 +456,9 @@ export interface AdminDeps {
   /** The KG refresh rail (AII-426). Absent when no KG source repo is configured. */
   kgRefresh?: {
     trigger(opts?: { dryRun?: boolean; acceptNewBaseline?: boolean; actorEmail?: string }): Promise<{ status: number; body: Record<string, unknown> }>;
-    status(): Promise<KgRefreshStatus>;
-    /** Called by the operator-cancel path to close the ingest chain cleanly. */
-    onMachineLost(opts?: { failureCode?: string }): void;
+    status(): Promise<{ status: number; body: unknown }>;
+    /** The operator-cancel path: asks the KgRefresh workflow to cancel and confirm termination (AII-901). */
+    cancel(opts: { jobId: number; reason: string }): Promise<{ status: number; body: Record<string, unknown> }>;
   };
   /** The tools-service ingress caller (src/restate/tools-client.ts, AII-710). Absent only in tests that don't exercise POST /api/tools/<name>. */
   callTool?: typeof callTool;
@@ -763,7 +762,7 @@ export function handleAdminRequest(
           }
           const pending = (dryRun || acceptNewBaseline) ? kgRefresh.trigger(opts) : kgRefresh.trigger();
           return pending.then(
-            (r) => json(res, r.status, { ...r.body, dryRun, acceptNewBaseline }),
+            (r) => json(res, r.status, r.status === 503 ? r.body : { ...r.body, dryRun, acceptNewBaseline }),
             (err) => json(res, 500, { error: String(err) }),
           );
         },
@@ -778,7 +777,7 @@ export function handleAdminRequest(
         return true;
       }
       deps.kgRefresh.status().then(
-        (body) => json(res, 200, body),
+        (r) => json(res, r.status, r.body),
         (err) => json(res, 500, { error: String(err) }),
       );
       return true;
@@ -1740,21 +1739,25 @@ async function handleDestroySession(
   // Kg-refresh cancel: issue-less run, shared close path via onMachineLost (AII-522).
   if (job?.phase === "kg-refresh") {
     if (job.executionMode === "github-actions") {
-      if (!job.runId || !job.repo) {
-        json(res, 422, { error: "GHA run ID or repo missing on kg-refresh job" });
+      // The KgRefresh workflow requests the GitHub cancellation and waits for confirmed
+      // termination (AII-901); the Fly branch below also keeps destroyMachine because the
+      // workflow has no Fly dep.
+      if (!deps.kgRefresh) {
+        json(res, 501, { error: "KG refresh is not configured" });
         return;
       }
-      const [owner, repoName] = job.repo.split("/");
+      // Cancel first, stamp after: a 409/503 answer leaves the row as it was because the
+      // GitHub run may still be going. The updateJobStatus guard preserves this
+      // conclusion when the workflow's close-row later writes a coarser terminal status.
       try {
-        const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
-        const cancelled = await cancelWorkflowRun(ghToken, owner, repoName, job.runId);
-        if (!cancelled) {
-          console.error(`[admin] GHA did not accept cancellation for run ${job.runId}`);
-          json(res, 502, { error: "GHA did not accept cancellation" });
+        const r = await deps.kgRefresh.cancel({ jobId: job.id, reason: "operator_cancelled" });
+        if (r.status !== 200) {
+          json(res, r.status, r.body);
           return;
         }
+        updateJobStatus(job.id, "failed", "operator_cancelled");
       } catch (err) {
-        console.error(`[admin] Failed to cancel GHA workflow run ${job.runId}:`, err);
+        console.error(`[admin] Failed to cancel kg-refresh job ${job.id}:`, err);
         json(res, 500, { error: err instanceof Error ? err.message : String(err) });
         return;
       }
@@ -1773,15 +1776,23 @@ async function handleDestroySession(
           return;
         }
       }
+      // The machine is gone; still tell the workflow so it stops tracking the run.
+      // Best-effort: a 409 (no refresh in flight) or 503 must not undo the destroy.
+      if (deps.kgRefresh) {
+        updateJobStatus(job.id, "failed", "operator_cancelled");
+        try {
+          const r = await deps.kgRefresh.cancel({ jobId: job.id, reason: "operator_cancelled" });
+          if (r.status !== 200) {
+            console.warn(`[admin] kg-refresh workflow cancel for Fly job ${job.id} answered ${r.status}`);
+          }
+        } catch (err) {
+          console.error(`[admin] Failed to cancel kg-refresh workflow for Fly job ${job.id}:`, err);
+        }
+      }
     }
 
-    // Stamp operator_cancelled before closing the chain. The updateJobStatus guard
-    // (CASE WHEN conclusion IN ('operator_cancelled') THEN conclusion ELSE ?) preserves
-    // this conclusion when onMachineLost() later calls closeJobLog with "timed_out".
+    // Stamp operator_cancelled (idempotent for the GHA branch, which stamped it on cancel success).
     updateJobStatus(job.id, "failed", "operator_cancelled");
-
-    // Close the ingest chain via the shared reaper path (AII-522).
-    deps.kgRefresh?.onMachineLost({ failureCode: "operator_cancelled" });
 
     // One operator-cancel notification; mark notified to prevent the poll loop duplicate.
     if (config.notifyWebhookUrl) {
