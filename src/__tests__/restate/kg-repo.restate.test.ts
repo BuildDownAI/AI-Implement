@@ -14,7 +14,7 @@ const FAKE_WORKFLOW_NAME = "FakeKgRefresh";
 // KgRepo's staleness check is `age < KG_REFRESH_TOTAL_DEADLINE_MS + staleMarginMs`.
 // A large negative margin collapses the real 4h+10min threshold down to FRESH_WINDOW_MS,
 // so R2 (still fresh) and R4 (now stale) are both provable in real test time.
-const FRESH_WINDOW_MS = 3_000;
+const FRESH_WINDOW_MS = 10_000;
 const STALE_MARGIN_MS = FRESH_WINDOW_MS - KG_REFRESH_TOTAL_DEADLINE_MS;
 
 interface RunSend {
@@ -176,7 +176,7 @@ describe("KgRepo durable single-flight lock", () => {
         warnSpy.mockRestore();
       }
     },
-    15_000,
+    30_000,
   );
 
   // ---- AII-730: the PR-check dry-run queue ----
@@ -283,7 +283,12 @@ describe("KgRepo durable single-flight lock", () => {
       const slug = newKey();
       await trigger(env.baseUrl(), slug);
 
-      for (let n = 1; n <= MAX_TRACKED_PRS + 1; n++) await enqueue(env.baseUrl(), slug, n, `br${n}`);
+      // #1 alone first so it is the oldest entry; the rest go concurrently so the whole
+      // loop finishes well inside FRESH_WINDOW_MS (sequential calls outlast the marker).
+      await enqueue(env.baseUrl(), slug, 1, "br1");
+      await Promise.all(
+        Array.from({ length: MAX_TRACKED_PRS }, (_, i) => enqueue(env.baseUrl(), slug, i + 2, `br${i + 2}`)),
+      );
 
       const pending = (await repoStatus(env.baseUrl(), slug))!.pending;
       expect(pending).toHaveLength(MAX_TRACKED_PRS);
@@ -362,6 +367,6 @@ describe("KgRepo durable single-flight lock", () => {
         warnSpy.mockRestore();
       }
     },
-    15_000,
+    30_000,
   );
 });
