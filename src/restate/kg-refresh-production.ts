@@ -246,7 +246,9 @@ export function createProductionKgRefreshServices(
     onOutcome: (kind, outcome) => {
       // The workflow reports "graph is current" as a success; the notifier distinguishes it.
       const mapped = kind === "success" && /^Graph is current/i.test(outcome.detail) ? "no-new-data" : kind;
-      void input.handleKgRefreshOutcome(mapped, kind === "failure" ? { failureReason: outcome.detail } : {});
+      Promise.resolve(input.handleKgRefreshOutcome(mapped, kind === "failure" ? { failureReason: outcome.detail } : {})).catch(
+        (err) => console.error("[kg-refresh] outcome handler failed", err),
+      );
     },
     fireSettled: input.fireSettled,
   };

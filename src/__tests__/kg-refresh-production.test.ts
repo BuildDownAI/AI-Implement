@@ -103,6 +103,19 @@ describe("createProductionKgRefreshServices", () => {
   });
 });
 
+describe("onOutcome", () => {
+  it("does not throw or leak an unhandled rejection when the outcome handler rejects", async () => {
+    const err = new Error("boom");
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const handleKgRefreshOutcome = vi.fn(async () => { throw err; });
+    createProductionKgRefreshServices(makeInput({ handleKgRefreshOutcome }));
+    expect(() => capturedWorkflowDeps.current!.onOutcome("failure", { ok: false, detail: "x" } as never)).not.toThrow();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(spy).toHaveBeenCalledWith("[kg-refresh] outcome handler failed", err);
+    spy.mockRestore();
+  });
+});
+
 describe("dispatch_log job row lifecycle", () => {
   it("closes the row on a fresh composer that never saw appendJobLog (restart replay)", () => {
     const updateJobStatus = vi.fn();
