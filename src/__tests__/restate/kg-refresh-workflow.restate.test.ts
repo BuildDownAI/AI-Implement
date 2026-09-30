@@ -28,6 +28,7 @@ import {
   type KgDispatchInput,
   type KgDispatchResult,
   type KgRefreshReportBody,
+  KG_REPO_STALE_MARGIN_MS,
 } from "../../restate/kg-refresh-workflow.js";
 import {
   VARIANTS, attachWorkflow, callObject, callWorkflow, replaceEndpoint, startRetryEnabled,
@@ -228,6 +229,8 @@ describe("KgRefresh durable workflow", () => {
   const runIdIndex = new Map<number, string>();
   const appendJobLogCalls: Array<{ dispatchId: string; jobId: string }> = [];
   const dispatchedIds: string[] = [];
+  /** triggerId -> the run the backend "committed" before the ack was lost. */
+  const dispatchThrowAfterCommit = new Map<string, number>();
   const dispatchedTokens: KgDispatchInput["tokens"][] = [];
   const mintedDispatchIds: string[] = [];
   const closeRowCalls: Array<{ jobId: string; status: string; conclusion?: string }> = [];
@@ -265,6 +268,12 @@ describe("KgRefresh durable workflow", () => {
     scenario.dispatchCalls++;
     dispatchedIds.push(input.dispatchId);
     dispatchedTokens.push(input.tokens);
+    const committedRunId = dispatchThrowAfterCommit.get(triggerId);
+    if (committedRunId !== undefined) {
+      dispatchThrowAfterCommit.delete(triggerId);
+      scenario.findByTitleResult = { runId: committedRunId }; // visible to the retry's title lookup
+      throw new Error("dispatch ack lost after commit");
+    }
     return {
       outcome: scenario.dispatchOutcome, runId: scenario.runId,
       jobId: `job-${triggerId}`, executionMode: scenario.executionMode,
@@ -677,6 +686,25 @@ describe("KgRefresh durable workflow", () => {
     20_000,
   );
 
+  it.each(VARIANTS.map(([label]) => label))(
+    "status and progress carry no retention override; report and cancel keep theirs (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const meta = async (handler: string) =>
+        (await (await fetch(`${env.adminAPIBaseUrl()}/services/KgRefresh/handlers/${handler}`)).json()) as Record<string, unknown>;
+      for (const handler of ["status", "progress"]) {
+        const m = await meta(handler);
+        expect(m.journal_retention ?? m.journalRetention).toBeUndefined();
+        expect(m.idempotency_retention ?? m.idempotencyRetention).toBeUndefined();
+      }
+      for (const handler of ["report", "cancel"]) {
+        const m = await meta(handler);
+        expectDurationMs(m.journal_retention ?? m.journalRetention, KG_REFRESH_RETENTION_MS, `${handler} journal_retention`);
+        expectDurationMs(m.idempotency_retention ?? m.idempotencyRetention, KG_REFRESH_RETENTION_MS, `${handler} idempotency_retention`);
+      }
+    },
+  );
+
   // ---- W3: no progress within the bootstrap deadline ----
   it.each(VARIANTS.map(([label]) => label))(
     "W3: no progress within the bootstrap deadline fails with a timed_out row and one outcome call (%s)",
@@ -784,7 +812,8 @@ describe("KgRefresh durable workflow", () => {
 
       expect(outcome.ok).toBe(true);
       expect(scenarios.get(triggerId)!.runStatusCalls).toBe(0);
-      expect(scenarios.get(triggerId)!.findByTitleCalls).toBe(0);
+      // only dispatch's own pre-attempt reconcile lookup; the watch loop never looks up a Fly run
+      expect(scenarios.get(triggerId)!.findByTitleCalls).toBe(1);
     },
     15_000,
   );
@@ -803,7 +832,8 @@ describe("KgRefresh durable workflow", () => {
       });
 
       const done = runWorkflow(env.baseUrl(), triggerId);
-      await until(() => scenarios.get(triggerId)!.findByTitleCalls >= 1);
+      // findByTitleCalls 1 is dispatch's reconcile-first lookup; >= 2 is the post-dispatch reconcile.
+      await until(() => scenarios.get(triggerId)!.findByTitleCalls >= 2);
       expect(scenarios.get(triggerId)!.dispatchCalls).toBe(1);
 
       const scenario = scenarios.get(triggerId)!;
@@ -820,7 +850,7 @@ describe("KgRefresh durable workflow", () => {
   );
 
   it.each(VARIANTS.map(([label]) => label))(
-    "W9: a rejected dispatch fails immediately and never calls findRunByTitle (%s)",
+    "W9: a rejected dispatch fails immediately and never reconciles after the dispatch (%s)",
     async (label) => {
       const env = envFor(label);
       const triggerId = newTriggerId();
@@ -829,7 +859,7 @@ describe("KgRefresh durable workflow", () => {
       const outcome = await runWorkflow(env.baseUrl(), triggerId);
       expect(outcome.ok).toBe(false);
       expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("dispatch_rejected");
-      expect(scenarios.get(triggerId)!.findByTitleCalls).toBe(0);
+      expect(scenarios.get(triggerId)!.findByTitleCalls).toBe(1);
     },
     15_000,
   );
@@ -870,6 +900,76 @@ describe("KgRefresh durable workflow", () => {
       void outcome;
     },
     15_000,
+  );
+
+  // ---- AII-973: reconcile-first dispatch, workflow-owned expiry, tokens out of the journal ----
+  async function adminQuery(adminUrl: string, query: string): Promise<Array<Record<string, unknown>>> {
+    const response = await fetch(`${adminUrl}/query`, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json" },
+      body: JSON.stringify({ query }),
+    });
+    if (!response.ok) throw new Error(`POST /query failed: HTTP ${response.status}`);
+    return ((await response.json()) as { rows: Array<Record<string, unknown>> }).rows;
+  }
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "a delayed KgRepo.expire is sent for the run, and no journal entry holds a token (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+      const beforeDispatched = dispatchedTokens.length;
+
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      await until(() => scenarios.get(triggerId)!.dispatchCalls === 1);
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      expect((await done).ok).toBe(true);
+
+      // dispatch received all three tokens ...
+      expect(dispatchedTokens.slice(beforeDispatched)).toEqual([
+        { runToken: "run-token", progressToken: "progress-token", publicationToken: "publication-token" },
+      ]);
+
+      // ... and the run's own journal carries none of them, nor a mint-tokens step
+      const adminUrl = env.adminAPIBaseUrl();
+      const [invocation] = await adminQuery(adminUrl,
+        `SELECT id FROM sys_invocation WHERE target_service_name = 'KgRefresh' AND target_service_key = '${triggerId}' AND target_handler_name = 'run'`);
+      const journal = JSON.stringify(await adminQuery(adminUrl, `SELECT * FROM sys_journal WHERE id = '${invocation.id}'`));
+      expect(journal).toContain("dispatch");
+      expect(journal).not.toContain("mint-tokens");
+      for (const token of ["run-token", "progress-token", "publication-token"]) {
+        expect(journal).not.toContain(token);
+        expect(journal).not.toContain(Buffer.from(token).toString("base64"));
+      }
+
+      // one delayed expire send for this repo, scheduled totalDeadline + margin out
+      const expires = await adminQuery(adminUrl,
+        `SELECT * FROM sys_invocation WHERE target_service_name = 'KgRepo' AND target_service_key = '${KG_SOURCE_REPO}' AND target_handler_name = 'expire'`);
+      expect(expires.length).toBeGreaterThanOrEqual(1);
+      const delays = expires.map((r) => Date.parse(String(r.scheduled_start_at)) - Date.parse(String(r.created_at)));
+      expect(delays.some((d) => Math.abs(d - (TOTAL_DEADLINE_MS + KG_REPO_STALE_MARGIN_MS)) < 5_000)).toBe(true);
+    },
+    20_000,
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "a dispatch that throws after committing is adopted by the retry's title lookup, dispatching once (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      const runId = runIdCounter++;
+      const scenario = makeScenario(triggerId, { dispatchOutcome: "accepted", executionMode: "github-actions", runId: undefined });
+      dispatchThrowAfterCommit.set(triggerId, runId);
+
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      await until(() => scenario.dispatchCalls === 1);
+      await until(() => scenario.runId === runId);
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      expect((await done).ok).toBe(true);
+      expect(scenario.dispatchCalls).toBe(1);
+    },
+    30_000,
   );
 
   // ---- W13/W14: RailGateError conversion and revert ----
@@ -980,6 +1080,31 @@ describe("KgRefresh durable workflow", () => {
       expect(observedSteps.has("swap"), `step "swap" was not observed within the ${STATUS_LATCH_MAX_MS}ms latch bound`).toBe(true);
       expect(restartCallCount).toBe(2);
       expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("staging");
+    },
+    15_000,
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "a TerminalError thrown by the swap gate still reverts and takes the failure path; the suspension guard does not swallow it (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+      let swapAttempts = 0;
+      restartImpl = async () => {
+        swapAttempts++;
+        if (swapAttempts === 1) throw new restate.TerminalError("forced terminal swap failure");
+      };
+
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      await until(() => scenarios.get(triggerId)!.dispatchCalls === 1);
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      const outcome = await done;
+
+      expect(outcome.ok).toBe(false);
+      // swap's own failing restart (1) plus revertRail's restart while reverting (1).
+      expect(restartCallCount).toBe(2);
+      expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "failed" });
     },
     15_000,
   );

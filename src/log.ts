@@ -188,6 +188,19 @@ function ensureLogColumns(): void {
   `);
 }
 
+/** Newest dispatch_log row id for a dispatch id, if any. */
+export function findLogIdByDispatchId(dispatchId: string): number | undefined {
+  const row = getDb()
+    .prepare("SELECT id FROM dispatch_log WHERE dispatch_id = ? ORDER BY id DESC LIMIT 1")
+    .get(dispatchId) as { id: number } | undefined;
+  return row?.id;
+}
+
+/** Idempotent on dispatchId: returns the existing row's id instead of inserting a duplicate. */
+export function appendLogIfAbsent(entry: Parameters<typeof appendLog>[0] & { dispatchId: string }): number {
+  return findLogIdByDispatchId(entry.dispatchId) ?? appendLog(entry);
+}
+
 export function appendLog(entry: {
   issueId: string;
   issueIdentifier?: string;

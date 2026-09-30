@@ -142,18 +142,53 @@ describe("mintRunTokens", () => {
       vi.useRealTimers();
     }
   });
+
+  it("is idempotent across processes: minting twice for one dispatch id succeeds", () => {
+    createProductionKgRefreshServices(makeInput());
+    const mint = capturedWorkflowDeps.current!.mintRunTokens;
+    mint({ dispatchId: "d-twice", ttlSeconds: 600 });
+    const second = mint({ dispatchId: "d-twice", ttlSeconds: 600 });
+    expect(verifyRunToken(second.runToken, "secret", "result", { consume: false }).ok).toBe(true);
+  });
 });
 
 describe("onOutcome", () => {
-  it("does not throw or leak an unhandled rejection when the outcome handler rejects", async () => {
-    const err = new Error("boom");
-    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
-    const handleKgRefreshOutcome = vi.fn(async () => { throw err; });
+  it("resolves only after the outcome handler resolves", async () => {
+    let release!: () => void;
+    const handleKgRefreshOutcome = vi.fn(() => new Promise<void>((r) => { release = r; }));
     createProductionKgRefreshServices(makeInput({ handleKgRefreshOutcome }));
-    expect(() => capturedWorkflowDeps.current!.onOutcome("failure", { ok: false, detail: "x" } as never)).not.toThrow();
+    let settled = false;
+    const p = Promise.resolve(capturedWorkflowDeps.current!.onOutcome("failure", { ok: false, detail: "x" } as never)).then(() => { settled = true; });
     await new Promise((r) => setTimeout(r, 0));
-    expect(spy).toHaveBeenCalledWith("[kg-refresh] outcome handler failed", err);
-    spy.mockRestore();
+    expect(settled).toBe(false);
+    release();
+    await p;
+    expect(settled).toBe(true);
+  });
+
+  it("rejects when the outcome handler rejects, so the workflow step can retry", async () => {
+    const handleKgRefreshOutcome = vi.fn(async () => { throw new Error("boom"); });
+    createProductionKgRefreshServices(makeInput({ handleKgRefreshOutcome }));
+    await expect(capturedWorkflowDeps.current!.onOutcome("failure", { ok: false, detail: "x" } as never)).rejects.toThrow("boom");
+  });
+});
+
+describe("appendJobLog idempotency", () => {
+  it("inserts one row and returns the same id for a repeated dispatch id", () => {
+    const appendLog = vi.fn(() => 9);
+    const findJobId = vi.fn((): number | undefined => undefined);
+    createProductionKgRefreshServices(makeInput({ appendLog, findJobId }));
+    const deps = capturedWorkflowDeps.current!;
+    expect(deps.appendJobLog({ dispatchId: "d-idem", jobId: "d-idem" })).toBe(9);
+    expect(deps.appendJobLog({ dispatchId: "d-idem", jobId: "d-idem" })).toBe(9);
+    expect(appendLog).toHaveBeenCalledTimes(1);
+  });
+
+  it("reuses a row that an earlier process already inserted", () => {
+    const appendLog = vi.fn(() => 9);
+    createProductionKgRefreshServices(makeInput({ appendLog, findJobId: () => 5 }));
+    expect(capturedWorkflowDeps.current!.appendJobLog({ dispatchId: "d-x", jobId: "d-x" })).toBe(5);
+    expect(appendLog).not.toHaveBeenCalled();
   });
 });
 
@@ -173,6 +208,7 @@ describe("dispatch_log job row lifecycle", () => {
     const findJobId = vi.fn();
     createProductionKgRefreshServices(makeInput({ updateJobStatus, findJobId, appendLog: vi.fn(() => 7) }));
     capturedWorkflowDeps.current!.appendJobLog({ dispatchId: "d-2", jobId: "d-2" });
+    findJobId.mockClear();
     capturedWorkflowDeps.current!.closeJobLog("d-2", "failed", "x");
     expect(updateJobStatus).toHaveBeenCalledWith(7, "failed", "x");
     expect(findJobId).not.toHaveBeenCalled();
@@ -183,7 +219,7 @@ describe("appendJobLog execution mode", () => {
   it("records the resolved execution mode rather than github-actions", () => {
     resolvedPath.current = "fly-machines";
     const appendLog = vi.fn(() => 1);
-    createProductionKgRefreshServices(makeInput({ appendLog }));
+    createProductionKgRefreshServices(makeInput({ appendLog, findJobId: () => undefined }));
     capturedWorkflowDeps.current!.appendJobLog({ dispatchId: "d-3", jobId: "d-3" });
     expect(appendLog).toHaveBeenCalledWith(expect.objectContaining({ dispatchId: "d-3", executionMode: "fly-machines" }));
   });
