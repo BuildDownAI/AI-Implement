@@ -2040,7 +2040,7 @@ describe("admin runner-mode", () => {
 });
 
 describe("admin kg materialize-mode", () => {
-  const kgRefreshDeps = { trigger: vi.fn(), status: vi.fn(), onMachineLost: vi.fn() };
+  const kgRefreshDeps = { trigger: vi.fn(), status: vi.fn(), cancel: vi.fn() };
 
   beforeEach(() => {
     delete process.env.KG_MATERIALIZE_DIRECT;
@@ -2147,11 +2147,12 @@ describe("admin kg refresh dry-run (AII-635)", () => {
   const kgRefreshDeps = {
     trigger: vi.fn(async (_opts?: { dryRun?: boolean }) => ({ status: 202, body: { accepted: true } })),
     status: vi.fn(),
-    onMachineLost: vi.fn(),
+    cancel: vi.fn(),
   };
 
   beforeEach(() => {
     kgRefreshDeps.trigger.mockClear();
+    kgRefreshDeps.status.mockReset();
   });
 
   // The listed SSO admin the suite seeds (see adminConfig): an identity-bearing session.
@@ -2234,6 +2235,60 @@ describe("admin kg refresh dry-run (AII-635)", () => {
     expect(res.statusCode).toBe(202);
     expect(kgRefreshDeps.trigger).toHaveBeenCalledWith({ dryRun: true, acceptNewBaseline: true, actorEmail: "ada@eudoxus.ai" });
     expect(JSON.parse(res.body)).toMatchObject({ dryRun: true, acceptNewBaseline: true });
+  });
+
+  it.each([
+    [409, { error: "refresh-in-progress" }],
+    [501, { error: "kg-source-not-configured" }],
+    [422, { error: "preflight-failed", detail: "x" }],
+    [507, { error: "insufficient-storage" }],
+  ])("POST /api/kg/refresh passes a %i tool answer through with its body (AII-901)", async (status, body) => {
+    kgRefreshDeps.trigger.mockResolvedValueOnce({ status, body } as never);
+    const token = await login("secret");
+    const res = await kgRequest("/api/kg/refresh", "POST", token);
+    expect(res.statusCode).toBe(status);
+    expect(JSON.parse(res.body)).toMatchObject(body);
+  });
+
+  it("POST /api/kg/refresh answers 202 { refreshing, triggerId } after a submit", async () => {
+    kgRefreshDeps.trigger.mockResolvedValueOnce({ status: 202, body: { refreshing: true, triggerId: "t-1" } } as never);
+    const token = await login("secret");
+    const res = await kgRequest("/api/kg/refresh", "POST", token);
+    expect(res.statusCode).toBe(202);
+    expect(JSON.parse(res.body)).toMatchObject({ refreshing: true, triggerId: "t-1" });
+  });
+
+  it("POST /api/kg/refresh answers 503 restate-unavailable with the body untouched", async () => {
+    kgRefreshDeps.trigger.mockResolvedValueOnce({ status: 503, body: { error: "restate-unavailable" } } as never);
+    const token = await login("secret");
+    const res = await kgRequest("/api/kg/refresh", "POST", token, { dryRun: true });
+    expect(res.statusCode).toBe(503);
+    expect(JSON.parse(res.body)).toEqual({ error: "restate-unavailable" });
+  });
+
+  it("a second quick POST /api/kg/refresh answers 409 refresh-in-progress (one workflow: KgRepo.trigger's live-refresh answer, pinned in tools.test.ts)", async () => {
+    kgRefreshDeps.trigger
+      .mockResolvedValueOnce({ status: 202, body: { refreshing: true, triggerId: "t-1" } } as never)
+      .mockResolvedValueOnce({ status: 409, body: { error: "refresh-in-progress" } } as never);
+    const token = await login("secret");
+    const first = await kgRequest("/api/kg/refresh", "POST", token);
+    const second = await kgRequest("/api/kg/refresh", "POST", token);
+    expect(first.statusCode).toBe(202);
+    expect(second.statusCode).toBe(409);
+    expect(JSON.parse(second.body)).toMatchObject({ error: "refresh-in-progress" });
+  });
+
+  it("GET /api/kg/status keeps the status body shape, and answers 503 when unavailable", async () => {
+    kgRefreshDeps.status
+      .mockResolvedValueOnce({ status: 200, body: { stage: "idle", lastRefresh: null } })
+      .mockResolvedValueOnce({ status: 503, body: { error: "restate-unavailable" } });
+    const token = await login("secret");
+    const ok = await kgRequest("/api/kg/status", "GET", token);
+    expect(ok.statusCode).toBe(200);
+    expect(JSON.parse(ok.body)).toEqual({ stage: "idle", lastRefresh: null });
+    const down = await kgRequest("/api/kg/status", "GET", token);
+    expect(down.statusCode).toBe(503);
+    expect(JSON.parse(down.body)).toEqual({ error: "restate-unavailable" });
   });
 
   it("the Deployments page carries the Dry-run refresh button and the last-dry-run block", async () => {
@@ -5352,7 +5407,7 @@ describe("admin sessions — kg-refresh destroy", () => {
     );
     const res = new MockResponse();
     admin.handleAdminRequest(req as never, res as never, sessionsConfig(), makeFakeRegistry(provider), {
-      kgRefresh: kgRefresh ?? { trigger: vi.fn(), status: vi.fn(), onMachineLost: vi.fn() },
+      kgRefresh: kgRefresh ?? { trigger: vi.fn(), status: vi.fn(), cancel: vi.fn() },
     });
     await res.done;
     return { statusCode: res.statusCode, body: res.body };
@@ -5380,20 +5435,7 @@ describe("admin sessions — kg-refresh destroy", () => {
     expect(destroyMachineMock).toHaveBeenCalledWith(FLY_TOKEN, FLY_APP, "m-kg-cancel");
   });
 
-  it("calls kgRefresh.onMachineLost with operator_cancelled failureCode", async () => {
-    const token = await login("secret");
-    const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "fly-machines" });
-    log.updateJobMachineDetails(jobId, { machineNonce: "nonce-kg", machineId: "m-kg-cancel2" });
-    log.updateJobMachineId(jobId, "m-kg-cancel2");
-
-    const onMachineLost = vi.fn();
-    await deleteSession("m-kg-cancel2", token, { trigger: vi.fn(), status: vi.fn(), onMachineLost });
-
-    expect(onMachineLost).toHaveBeenCalledOnce();
-    expect(onMachineLost).toHaveBeenCalledWith({ failureCode: "operator_cancelled" });
-  });
-
-  it("stamps the job row operator_cancelled before calling onMachineLost", async () => {
+  it("stamps the job row operator_cancelled", async () => {
     const token = await login("secret");
     const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "fly-machines" });
     log.updateJobMachineDetails(jobId, { machineNonce: "nonce-kg", machineId: "m-kg-cancel3" });
@@ -5419,36 +5461,63 @@ describe("admin sessions — kg-refresh destroy", () => {
     expect(clearWorkingState).not.toHaveBeenCalled();
   });
 
-  it("GHA-mode kg-refresh cancel reaches cancelWorkflowRun and returns 200 (not 422)", async () => {
+  it("Fly-mode kg-refresh cancel destroys the machine and also calls the workflow cancel, tolerating a non-200", async () => {
     const token = await login("secret");
-    const jobId = log.appendLog({
-      issueId: "kg-refresh",
-      phase: "kg-refresh",
-      executionMode: "github-actions",
-      repo: "TestOrg/test-kg",
-    });
-    log.updateJobRunId(jobId, 12345);
-    // GHA jobs have no machineId; pass the numeric jobId so handleDestroySession
-    // falls back to getJobById (Number.isFinite path in admin.ts).
-    const res = await deleteSession(String(jobId), token);
+    const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "fly-machines" });
+    log.updateJobMachineDetails(jobId, { machineNonce: "nonce-kg", machineId: "m-kg-cancel5" });
+    log.updateJobMachineId(jobId, "m-kg-cancel5");
+    const cancel = vi.fn(async () => ({ status: 409, body: { error: "no-refresh-in-flight" } }));
+    const res = await deleteSession("m-kg-cancel5", token, { trigger: vi.fn(), status: vi.fn(), cancel });
 
     expect(res.statusCode).toBe(200);
-    expect(cancelWorkflowRunMock).toHaveBeenCalledWith("gh-token-mock", "TestOrg", "test-kg", 12345);
+    expect(destroyMachineMock).toHaveBeenCalledWith(FLY_TOKEN, FLY_APP, "m-kg-cancel5");
+    expect(cancel).toHaveBeenCalledWith({ jobId, reason: "operator_cancelled" });
+    expect(log.getJobById(jobId)?.conclusion).toBe("operator_cancelled");
   });
 
-  it("GHA-mode kg-refresh cancel returns 422 when repo is absent on the row", async () => {
-    const token = await login("secret");
-    const jobId = log.appendLog({
-      issueId: "kg-refresh",
-      phase: "kg-refresh",
-      executionMode: "github-actions",
-      // repo intentionally omitted to confirm the guard fires
-    });
-    log.updateJobRunId(jobId, 99999);
-    const res = await deleteSession(String(jobId), token);
+  async function ghaKgJob(): Promise<number> {
+    const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "github-actions", repo: "TestOrg/test-kg" });
+    log.updateJobRunId(jobId, 12345);
+    return jobId;
+  }
 
-    expect(res.statusCode).toBe(422);
+  it("GHA-mode kg-refresh cancel calls the workflow cancel, then stamps the row, and never cancels the run itself", async () => {
+    const token = await login("secret");
+    const jobId = await ghaKgJob();
+    const cancel = vi.fn(async () => ({ status: 200, body: { cancelled: true } }));
+    const res = await deleteSession(String(jobId), token, { trigger: vi.fn(), status: vi.fn(), cancel });
+
+    expect(res.statusCode).toBe(200);
+    expect(cancel).toHaveBeenCalledWith({ jobId, reason: "operator_cancelled" });
     expect(cancelWorkflowRunMock).not.toHaveBeenCalled();
+    expect(destroyMachineMock).not.toHaveBeenCalled();
+    expect(log.getJobById(jobId)?.conclusion).toBe("operator_cancelled");
+  });
+
+  it("GHA-mode kg-refresh cancel answers 503 when the workflow is unavailable, without notifying", async () => {
+    const token = await login("secret");
+    const jobId = await ghaKgJob();
+    const cancel = vi.fn(async () => ({ status: 503, body: { error: "restate-unavailable" } }));
+    const res = await deleteSession(String(jobId), token, { trigger: vi.fn(), status: vi.fn(), cancel });
+
+    expect(res.statusCode).toBe(503);
+    expect(JSON.parse(res.body)).toEqual({ error: "restate-unavailable" });
+    expect(notifyTextMock).not.toHaveBeenCalled();
+    expect(log.getJobById(jobId)?.conclusion).not.toBe("operator_cancelled");
+  });
+
+  it("GHA-mode kg-refresh cancel passes a 409 no-refresh-in-flight through and leaves the row untouched", async () => {
+    const token = await login("secret");
+    const jobId = await ghaKgJob();
+    const before = log.getJobById(jobId);
+    const cancel = vi.fn(async () => ({ status: 409, body: { error: "no-refresh-in-flight" } }));
+    const res = await deleteSession(String(jobId), token, { trigger: vi.fn(), status: vi.fn(), cancel });
+
+    expect(res.statusCode).toBe(409);
+    const after = log.getJobById(jobId);
+    expect(after?.status).toBe(before?.status);
+    expect(after?.conclusion).toBe(before?.conclusion);
+    expect(notifyTextMock).not.toHaveBeenCalled();
   });
 
   it("issue-keyed session destroy still calls provider.clearWorkingState (regression pin)", async () => {
