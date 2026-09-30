@@ -427,7 +427,7 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
   }, 90_000);
 
   // P5 -------------------------------------------------------------------------------
-  it.each(VARIANTS.map(([label]) => label))("P5: a duplicate report is absorbed; a late retry after release answers 409 (%s)", async (label) => {
+  it.each(VARIANTS.map(([label]) => label))("P5: a duplicate report is absorbed; a late identical retry after release is still a duplicate (%s)", async (label) => {
     const env = envFor(label);
     const client = clientFor(env);
     let releaseGate!: () => void;
@@ -452,11 +452,10 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
     expect(kgRows()).toHaveLength(1);
     expect(resultTokenConsumedAt(dispatchId)).toBeNull();
 
-    // Late variant: KgRepo.release cleared the marker, so resolveKgRefreshTrigger has no
-    // triggerId to report to. Observed today: 409 no-refresh-in-flight (recorded in
-    // docs/runner-callbacks.md; the callback is deliberately not changed here).
+    // Late variant: the callback addresses KgRefresh/{dispatchId} directly, so the completed
+    // workflow answers rather than the cleared marker.
     const late = await postReport(env, runToken(), SUCCESS_REPORT);
-    expect(late).toEqual({ status: 409, body: { error: "no-refresh-in-flight" } });
+    expect(late).toEqual({ status: 200, body: { acknowledged: true } });
     expect(railFetchCalls).toBe(1);
     expect(persistCalls).toBe(1);
     expect(resultTokenConsumedAt(dispatchId)).toBeNull();
@@ -484,7 +483,9 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
     expect(gh.cancelCalls).toHaveLength(1);
     expect(kgRows()).toMatchObject([{ status: "failed", conclusion: "operator_cancelled" }]);
 
-    expect(await postReport(env, runToken(), SUCCESS_REPORT)).toEqual({ status: 409, body: { error: "no-refresh-in-flight" } });
+    // The completed workflow refuses a report it did not consume; the workflow's own
+    // terminal error is not a conflict marker, so the callback answers 503.
+    expect(await postReport(env, runToken(), SUCCESS_REPORT)).toEqual({ status: 503, body: { error: "kg_refresh_unavailable" } });
     expect(mergeCalls).toBe(0);
     expect(persistCalls).toBe(1); // the cancelled run's own failure record, nothing from the report
   }, 40_000);

@@ -327,6 +327,8 @@ The callback is verify-only: it checks the signature and row but never consumes 
 
 ## 6. Lifecycle
 
+The workflow key is the dispatch id (`KgRepo` mints it as the trigger id), so the runner callback addresses `KgRefresh/{dispatchId}` directly from the verified token claims.
+
 The three run tokens (result, progress, publication) are minted in the workflow's one journaled `mint-tokens` step, so a replay or restart reuses them rather than minting again; the publication token is bound to the KG source repo and exchanged for a scoped GitHub token at push time.
 
 ### Reserve and dispatch

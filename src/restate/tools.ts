@@ -688,7 +688,7 @@ export const triggerKgRefreshTool = tool(
     const opts = {
       dryRun: input.args.dryRun === true,
       acceptNewBaseline: input.args.acceptNewBaseline === true,
-      ...(input.args.ref !== undefined ? { ref: input.args.ref } : {}),
+      ...(input.args.ref !== undefined ? { kgSourceRef: input.args.ref } : {}),
       actorEmail: input.caller.email ?? undefined,
     };
     const result = await ctx.objectClient(KgRepo, toolDeps.kgSourceRepo).trigger(opts);

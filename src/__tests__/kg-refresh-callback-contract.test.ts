@@ -167,9 +167,9 @@ describe("kg-refresh callback is verify-only and reports to the KgRefresh workfl
     expect(consumedAt(dispatchId)).toBeNull();
     expect(await run(token, c)).toEqual({ status: 200, body: { acknowledged: true } });
     expect(consumedAt(dispatchId)).toBeNull();
-    expect(c.repoStatus).toHaveBeenCalledWith("acme/kg-source");
+    expect(c.repoStatus).not.toHaveBeenCalled();
     expect(c.report).toHaveBeenCalledWith(
-      "trg-1",
+      dispatchId,
       expect.objectContaining({ ok: true, snapshotPr: 7, snapshotCommit: "abc" }),
       { idempotencyKey: dispatchId },
     );
@@ -191,15 +191,12 @@ describe("kg-refresh callback is verify-only and reports to the KgRefresh workfl
     const { token } = mint();
     expect((await run(token, client({ report: vi.fn(async () => ({ status: "unavailable" })) }))).status).toBe(503);
     expect((await run(token, client({ report: vi.fn(async () => ({ status: "conflict" })) }))).status).toBe(409);
-    expect((await run(token, client({ repoStatus: vi.fn(async () => ({ status: "unavailable" })) }))).status).toBe(503);
   });
 
-  it("answers 409 no-refresh-in-flight when no marker exists, without reporting", async () => {
+  it("answers 409 no-refresh-in-flight when the workflow has no such key", async () => {
     const { token } = mint();
-    const c = client({ repoStatus: vi.fn(async () => ({ status: "accepted", value: null })) });
-    const out = await run(token, c);
-    expect(out).toEqual({ status: 409, body: { error: "no-refresh-in-flight" } });
-    expect(c.report).not.toHaveBeenCalled();
+    const c = client({ report: vi.fn(async () => ({ status: "not-found" })) });
+    expect(await run(token, c)).toEqual({ status: 409, body: { error: "no-refresh-in-flight" } });
   });
 
   it("answers 503 when the client or source repo is not configured", async () => {
@@ -210,24 +207,22 @@ describe("kg-refresh callback is verify-only and reports to the KgRefresh workfl
     expect(out.status).toBe(503);
   });
 
-  it("progress resolves the triggerId then calls progress(triggerId)", async () => {
-    const { token } = mint("progress");
+  it("progress calls progress(dispatchId) and maps not-found, conflict and unavailable", async () => {
+    const { token, dispatchId } = mint("progress");
     const c = client();
     const out = await callback.handleRunnerProgress({
       authorization: `Bearer ${token}`, body: {}, secret: SECRET, kgRefreshClient: c as never, kgSourceRepo: SLUG,
     });
     expect(out).toEqual({ status: 200, body: { acknowledged: true } });
-    expect(c.progress).toHaveBeenCalledWith("trg-1");
+    expect(c.progress).toHaveBeenCalledWith(dispatchId);
+    expect(c.repoStatus).not.toHaveBeenCalled();
 
-    const none = client({ repoStatus: vi.fn(async () => ({ status: "accepted", value: null })) });
-    const out2 = await callback.handleRunnerProgress({
-      authorization: `Bearer ${token}`, body: {}, secret: SECRET, kgRefreshClient: none as never, kgSourceRepo: SLUG,
-    });
-    expect(out2.status).toBe(409);
-    const down = client({ progress: vi.fn(async () => ({ status: "unavailable" })) });
-    const out3 = await callback.handleRunnerProgress({
-      authorization: `Bearer ${token}`, body: {}, secret: SECRET, kgRefreshClient: down as never, kgSourceRepo: SLUG,
-    });
-    expect(out3.status).toBe(503);
+    const statusFor = async (status: string) => (await callback.handleRunnerProgress({
+      authorization: `Bearer ${token}`, body: {}, secret: SECRET, kgSourceRepo: SLUG,
+      kgRefreshClient: client({ progress: vi.fn(async () => ({ status })) }) as never,
+    })).status;
+    expect(await statusFor("not-found")).toBe(409);
+    expect(await statusFor("conflict")).toBe(409);
+    expect(await statusFor("unavailable")).toBe(503);
   });
 });
