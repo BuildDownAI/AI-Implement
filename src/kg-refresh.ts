@@ -38,18 +38,18 @@ import type { KgRailDeps } from "./kg-refresh-rail.js";
 const execFile = promisify(execFileCb);
 
 /** Root of the runtime graph overlay. `current/` under it is what the sidecar serves. */
-const DATA_ROOT = "/data/kg";
-const SIDECAR_MCP_URL = "http://127.0.0.1:8765/mcp";
+export const DATA_ROOT = "/data/kg";
+export const SIDECAR_MCP_URL = "http://127.0.0.1:8765/mcp";
 
 /**
  * Refuse to stage below this much free space on the volume. The volume also
  * holds the SQLite database; a full disk corrupts more than a failed refresh.
  */
-const MIN_FREE_BYTES = 200 * 1024 * 1024;
+export const MIN_FREE_BYTES = 200 * 1024 * 1024;
 
 /** Canary warm-up budget: the sidecar's first semantic query loads the model. */
-const CANARY_DEADLINE_MS = 120_000;
-const CANARY_RETRY_MS = 5_000;
+export const CANARY_DEADLINE_MS = 120_000;
+export const CANARY_RETRY_MS = 5_000;
 
 /** TTL for the ingest-running stage: matches the GHA job timeout ceiling. */
 const KG_REFRESH_TTL_MS = 4 * 60 * 60 * 1000;
@@ -1579,7 +1579,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
   };
 }
 
-function defaultFreeBytes(path: string): number {
+export function defaultFreeBytes(path: string): number {
   const target = existsSync(path) ? path : tmpdir();
   const s = statfsSync(target);
   return s.bavail * s.bsize;
@@ -1638,7 +1638,7 @@ async function defaultFetchSnapshotCommitSha(token: string, owner: string, repo:
   }
 }
 
-function defaultPersistSnapshotSha(sha: string): void {
+export function defaultPersistSnapshotSha(sha: string): void {
   try {
     getDb()
       .prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)")
@@ -1648,7 +1648,7 @@ function defaultPersistSnapshotSha(sha: string): void {
   }
 }
 
-function defaultLoadSnapshotSha(): string | null {
+export function defaultLoadSnapshotSha(): string | null {
   try {
     const row = getDb()
       .prepare("SELECT value FROM settings WHERE key = ?")
