@@ -2,6 +2,34 @@ import type { ReferenceRepo } from "./reference-repos.js";
 import type { RetryPolicy } from "./pipeline/retry-backoff.js";
 import type { RepoMapping, ReviewerSelection } from "./config.js";
 import { validateReviewFixMetadata, type ReviewFixMetadataV1 } from "./review-fix-contract.js";
+import {
+  STAGE_NAMES,
+  STAGE_SELECTION_FIELDS,
+  type AccountAuthMode,
+  type ConfiguredStageResolution,
+  type FieldSource,
+  type StageName,
+  type StageSelection,
+  type StageSelectionField,
+} from "./agent-config.js";
+
+export const RESOLVED_AGENT_SNAPSHOT_VERSION = 1;
+
+/**
+ * Frozen, already-resolved stage configuration carried on the envelope. Distinct from the
+ * unresolved `StageAgentConfigurationV1`: decoding never re-resolves defaults or permissions.
+ * It is data, not proof of authorization, and never carries a credential value — credential
+ * grants belong to the protected bootstrap namespace (AII-680), not this field.
+ */
+export interface ResolvedAgentSnapshotV1 {
+  version: 1;
+  snapshotId: string;
+  /** Revisions of the configuration layers the snapshot was resolved from. */
+  configRevisions: { orchestratorDefault: number; project: number };
+  stages: ConfiguredStageResolution["stages"];
+  sources: ConfiguredStageResolution["sources"];
+  profiles: ConfiguredStageResolution["profiles"];
+}
 
 /**
  * Versioned orchestrator→runner config envelope. Travels as ONE
@@ -56,12 +84,138 @@ export interface RunConfigV1 {
    *  Carries no credential; repository/PR/execution authority is verified downstream against
    *  stored state, not trusted from this field. */
   reviewFix?: ReviewFixMetadataV1;
+  /** Resolved per-stage agent/model snapshot (AII-944). Absent = legacy Claude behavior.
+   *  Present-but-invalid fails closed from encode/decode/builder. Old runners drop this field
+   *  silently (see docs/workflow-envelope.md mixed-version matrix), so no writer may set it
+   *  until a readiness gate rejects configured work on runners lacking support. */
+  agentConfig?: ResolvedAgentSnapshotV1;
 }
 
 const MAX_DESCRIPTION_CHARS = 40_000;
 const TRUNCATION_MARKER = "\n\n[truncated by ai-implement: description exceeded envelope cap]";
 
+const AUTH_MODES: readonly AccountAuthMode[] = [
+  "anthropic-api-key", "bedrock", "claude-subscription", "openai-api-key", "codex-subscription",
+];
+const FIELD_SOURCES: readonly FieldSource[] = ["orchestrator-default", "project", "job-deadline"];
+const PROFILE_KEYS = ["id", "identity", "revision", "agent", "provider", "authMode"] as const;
+const MAX_SNAPSHOT_STRING = 256;
+
+type Rec = Record<string, unknown>;
+
+function isRec(v: unknown): v is Rec {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+function snapshotFail(path: string, problem: string): never {
+  throw new Error(`run_config.agentConfig${path} ${problem}`);
+}
+
+function snapshotKeys(v: Rec, known: readonly string[], path: string): void {
+  // Report the count only: key names may themselves be attacker-chosen or credential-shaped.
+  if (Object.keys(v).some((k) => !known.includes(k))) snapshotFail(path, "contains unknown field(s)");
+}
+
+function snapshotObject(v: unknown, path: string): Rec {
+  if (!isRec(v)) snapshotFail(path, "must be an object");
+  return v;
+}
+
+function snapshotString(v: unknown, path: string): string {
+  if (typeof v !== "string" || v.trim() === "" || v.length > MAX_SNAPSHOT_STRING) {
+    snapshotFail(path, "must be a non-empty bounded string");
+  }
+  return v;
+}
+
+function snapshotPositiveInt(v: unknown, path: string): number {
+  if (typeof v !== "number" || !Number.isSafeInteger(v) || v <= 0) snapshotFail(path, "must be a positive integer");
+  return v;
+}
+
+function snapshotEnum<T extends string>(v: unknown, allowed: readonly T[], path: string): T {
+  if (typeof v !== "string" || !(allowed as readonly string[]).includes(v)) snapshotFail(path, "is unsupported");
+  return v as T;
+}
+
+function supportedCombination(agent: string, provider: string, authMode: string): boolean {
+  if (agent === "claude") {
+    return (provider === "anthropic" && (authMode === "anthropic-api-key" || authMode === "claude-subscription"))
+      || (provider === "bedrock" && authMode === "bedrock");
+  }
+  return provider === "openai" && (authMode === "openai-api-key" || authMode === "codex-subscription");
+}
+
+/**
+ * Pure structural validation of a resolved snapshot. Returns a rebuilt copy containing only
+ * known fields; throws with path-only, bounded diagnostics that never echo input values.
+ * Checks internal consistency only — it does not re-resolve defaults or check permissions.
+ */
+export function validateResolvedAgentSnapshot(value: unknown): ResolvedAgentSnapshotV1 {
+  const root = snapshotObject(value, "");
+  snapshotKeys(root, ["version", "snapshotId", "configRevisions", "stages", "sources", "profiles"], "");
+  if (root.version !== RESOLVED_AGENT_SNAPSHOT_VERSION) snapshotFail(".version", "is unsupported");
+  const snapshotId = snapshotString(root.snapshotId, ".snapshotId");
+  const revs = snapshotObject(root.configRevisions, ".configRevisions");
+  snapshotKeys(revs, ["orchestratorDefault", "project"], ".configRevisions");
+  const configRevisions = {
+    orchestratorDefault: snapshotPositiveInt(revs.orchestratorDefault, ".configRevisions.orchestratorDefault"),
+    project: snapshotPositiveInt(revs.project, ".configRevisions.project"),
+  };
+  const stagesIn = snapshotObject(root.stages, ".stages");
+  const sourcesIn = snapshotObject(root.sources, ".sources");
+  const profilesIn = snapshotObject(root.profiles, ".profiles");
+  for (const [name, obj] of [["stages", stagesIn], ["sources", sourcesIn], ["profiles", profilesIn]] as const) {
+    snapshotKeys(obj, STAGE_NAMES, `.${name}`);
+    for (const stage of STAGE_NAMES) if (obj[stage] === undefined) snapshotFail(`.${name}.${stage}`, "is required");
+  }
+  const stages = {} as Record<StageName, StageSelection>;
+  const sources = {} as Record<StageName, Record<StageSelectionField, FieldSource>>;
+  const profiles = {} as ConfiguredStageResolution["profiles"];
+  for (const stage of STAGE_NAMES) {
+    const sp = `.stages.${stage}`;
+    const sel = snapshotObject(stagesIn[stage], sp);
+    snapshotKeys(sel, STAGE_SELECTION_FIELDS, sp);
+    const selection: StageSelection = {
+      agent: snapshotEnum(sel.agent, ["claude", "codex"], `${sp}.agent`),
+      provider: snapshotEnum(sel.provider, ["anthropic", "bedrock", "openai"], `${sp}.provider`),
+      model: snapshotString(sel.model, `${sp}.model`),
+      accountProfileId: snapshotString(sel.accountProfileId, `${sp}.accountProfileId`),
+      invocationTimeoutMs: snapshotPositiveInt(sel.invocationTimeoutMs, `${sp}.invocationTimeoutMs`),
+    };
+    const srp = `.sources.${stage}`;
+    const src = snapshotObject(sourcesIn[stage], srp);
+    snapshotKeys(src, STAGE_SELECTION_FIELDS, srp);
+    const fieldSources = {} as Record<StageSelectionField, FieldSource>;
+    for (const field of STAGE_SELECTION_FIELDS) {
+      fieldSources[field] = snapshotEnum(src[field], FIELD_SOURCES, `${srp}.${field}`);
+    }
+    const pp = `.profiles.${stage}`;
+    const prof = snapshotObject(profilesIn[stage], pp);
+    snapshotKeys(prof, PROFILE_KEYS, pp);
+    const profile = {
+      id: snapshotString(prof.id, `${pp}.id`),
+      identity: snapshotString(prof.identity, `${pp}.identity`),
+      revision: snapshotPositiveInt(prof.revision, `${pp}.revision`),
+      agent: snapshotEnum(prof.agent, ["claude", "codex"], `${pp}.agent`),
+      provider: snapshotEnum(prof.provider, ["anthropic", "bedrock", "openai"], `${pp}.provider`),
+      authMode: snapshotEnum(prof.authMode, AUTH_MODES, `${pp}.authMode`),
+    };
+    if (profile.id !== selection.accountProfileId) snapshotFail(pp, "does not match the stage accountProfileId");
+    if (profile.agent !== selection.agent) snapshotFail(pp, "agent does not match the stage agent");
+    if (profile.provider !== selection.provider) snapshotFail(pp, "provider does not match the stage provider");
+    if (!supportedCombination(profile.agent, profile.provider, profile.authMode)) {
+      snapshotFail(pp, "has an unsupported agent/provider/authMode combination");
+    }
+    stages[stage] = selection;
+    sources[stage] = fieldSources;
+    profiles[stage] = profile;
+  }
+  return { version: 1, snapshotId, configRevisions, stages, sources, profiles };
+}
+
 export function encodeRunConfig(config: RunConfigV1): string {
+  if (config.agentConfig !== undefined) validateResolvedAgentSnapshot(config.agentConfig);
   const description = config.issue.description.length > MAX_DESCRIPTION_CHARS
     ? config.issue.description.slice(0, MAX_DESCRIPTION_CHARS) + TRUNCATION_MARKER
     : config.issue.description;
@@ -92,6 +246,8 @@ export function decodeRunConfig(encoded: string): RunConfigV1 {
     if (!result.ok) throw new Error(`run_config.reviewFix is invalid: ${result.error}`);
     cfg.reviewFix = result.value;
   }
+  // agentConfig fails closed like reviewFix: a malformed snapshot must never degrade to legacy.
+  if (cfg.agentConfig !== undefined) cfg.agentConfig = validateResolvedAgentSnapshot(cfg.agentConfig);
   return pickKnownKeys(cfg as RunConfigV1);
 }
 
@@ -135,6 +291,8 @@ export interface ImplRunConfigInput {
   runnerCallbackUrl?: string;
   groupingParent?: boolean;
   retryPolicy: RetryPolicy;
+  /** Already-resolved snapshot, validated and copied as-is; the builder never resolves settings. */
+  agentConfig?: ResolvedAgentSnapshotV1;
 }
 
 /**
@@ -145,7 +303,7 @@ export interface ImplRunConfigInput {
  * is otherwise identical between them.
  */
 export function buildImplRunConfig(input: ImplRunConfigInput): RunConfigV1 {
-  const { issue, mapping, baseBranch, runnerCallbackUrl, groupingParent, retryPolicy } = input;
+  const { issue, mapping, baseBranch, runnerCallbackUrl, groupingParent, retryPolicy, agentConfig } = input;
   return {
     v: 1,
     issue: {
@@ -166,6 +324,7 @@ export function buildImplRunConfig(input: ImplRunConfigInput): RunConfigV1 {
     ...(mapping.dependencyTokenScope != null ? { dependencyTokenScope: mapping.dependencyTokenScope } : {}),
     ...(mapping.reviewers != null ? { reviewers: mapping.reviewers } : {}),
     retryPolicy,
+    ...(agentConfig !== undefined ? { agentConfig: validateResolvedAgentSnapshot(agentConfig) } : {}),
   };
 }
 
@@ -193,7 +352,7 @@ function pickKnownKeys(cfg: RunConfigV1): RunConfigV1 {
     runnerCallbackUrl, maxTurns, maxIterations, commentInstruction, sensitiveFiles,
     profiles, assigneeName, planningContext, groupingParent, dependencyTokenScope, kgSourceRepo,
     kgDryRun, kgSourceRef, kgAcceptNewBaseline, kgBaselineActor, referenceRepos,
-    reviewers, retryPolicy, reviewFix } = cfg;
+    reviewers, retryPolicy, reviewFix, agentConfig } = cfg;
   const out: RunConfigV1 = { v, issue };
   if (prNumber !== undefined) out.prNumber = prNumber;
   if (baseBranch !== undefined) out.baseBranch = baseBranch;
@@ -225,5 +384,6 @@ function pickKnownKeys(cfg: RunConfigV1): RunConfigV1 {
   }
   if (retryPolicy !== undefined) out.retryPolicy = retryPolicy;
   if (reviewFix !== undefined) out.reviewFix = reviewFix;
+  if (agentConfig !== undefined) out.agentConfig = validateResolvedAgentSnapshot(agentConfig);
   return out;
 }
