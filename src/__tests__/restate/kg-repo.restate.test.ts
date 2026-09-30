@@ -370,6 +370,20 @@ describe("KgRepo durable single-flight lock", () => {
   );
 
   it.each(VARIANTS.map(([label]) => label))(
+    "trigger with an unknown option is a terminal error and leaves no marker (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const slug = newKey();
+      const before = runSends.length;
+      await expect(
+        callObject(env.baseUrl(), "KgRepo", slug, "trigger", { ref: "x" }),
+      ).rejects.toThrow();
+      expect(await repoStatus(env.baseUrl(), slug)).toBeNull();
+      expect(runSends.length).toBe(before);
+    },
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
     "a stale in-flight marker lets enqueueDryRun submit now, leaving the pending entries for the next release (%s)",
     async (label) => {
       const env = envFor(label);

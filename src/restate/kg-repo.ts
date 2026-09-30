@@ -58,7 +58,7 @@ const enqueueInputSchema = z.object({
   key: z.string().min(1),
   ref: z.string().min(1),
   report: kgDryRunReportSchema,
-});
+}).strict();
 
 export type KgRepoTriggerInput = z.infer<typeof kgRefreshOptionsSchema>;
 export type KgRepoEnqueueInput = z.infer<typeof enqueueInputSchema> & { report: KgDryRunReportTarget };

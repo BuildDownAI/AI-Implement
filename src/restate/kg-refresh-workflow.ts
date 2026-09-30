@@ -65,13 +65,13 @@ export const kgRefreshOptionsSchema = z.object({
   kgSourceRef: z.string().optional(),
   acceptNewBaseline: z.boolean().optional(),
   actorEmail: z.string().optional(),
-});
+}).strict();
 
 /** The `KgRefresh.run` input — `KgRepo.submit` sends `{ ...options, triggerId }`. */
 export const kgRefreshRunInputSchema = kgRefreshOptionsSchema.extend({
   triggerId: z.string(),
   report: kgDryRunReportSchema.optional(),
-});
+}).strict();
 
 export type KgRefreshRunInput = z.infer<typeof kgRefreshRunInputSchema> & { report?: KgDryRunReportTarget };
 
@@ -613,6 +613,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
   }
 
   async function cancel(ctx: WorkflowSharedContext, raw: { reason?: string }): Promise<void> {
+    await requireStarted(ctx);
     const reason = raw?.reason ?? "cancelled";
     const promise = ctx.promise<string>("cancel");
     if (await promise.peek() === undefined) await promise.resolve(reason);
