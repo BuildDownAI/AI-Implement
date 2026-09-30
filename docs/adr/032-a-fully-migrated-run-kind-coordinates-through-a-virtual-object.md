@@ -29,3 +29,5 @@ The rule for later run kinds: shared admission is the mechanism for a run kind t
 ## Consequences
 
 Easier: one fewer table on the kg-refresh path, no owner fence to maintain, and the object's `status` handler is the one place that knows whether a refresh is in flight. Harder: the stale-marker age check is a rule the object carries itself; ADR 030's census for later run kinds must ask which side of this rule each run kind falls on.
+
+Release order: when a `KgRefresh` run escapes through its outer `catch`, it sends `KgRepo.release` only after `failurePath` has written its `persist` and `close-row` entries, inside a `finally` so a throw (an invocation cancel) still releases. The invariant: no new refresh can start while a failed run has a last-refresh write pending, so a late `persist` from the failed run cannot overwrite a newer run's outcome. Scenario `a trigger during the failure path is rejected until it finishes` in `kg-refresh-workflow.restate.test.ts` covers it, including the final persisted outcome.

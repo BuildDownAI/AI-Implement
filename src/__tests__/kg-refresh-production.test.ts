@@ -20,9 +20,10 @@ vi.mock("../restate/kg-refresh-workflow.js", async (importOriginal) => {
   };
 });
 vi.mock("../repo-image.js", () => ({ resolveRunnerImageForDispatch: vi.fn(async () => "runner:test") }));
+const resolvedPath = { current: "github-actions" };
 vi.mock("../runner-mode.js", () => ({
   getRunnerMode: () => ({ mode: "default" }),
-  resolveExecutionPath: () => "github-actions",
+  resolveExecutionPath: () => resolvedPath.current,
   getKgMaterializeDirect: () => ({ enabled: false }),
 }));
 vi.mock("../config.js", async (importOriginal) => ({
@@ -79,9 +80,13 @@ const dispatchInput = {
   runConfig: { triggerId: "t-1", kgSourceRef: "feature/x" },
   tokens: { runToken: "rt", progressToken: "pt" },
   issueIdentifier: "KG-REFRESH · t-1",
+  dispatchId: "d-workflow",
 };
 
-beforeEach(() => postWorkflowDispatch.mockReset());
+beforeEach(() => {
+  postWorkflowDispatch.mockReset();
+  resolvedPath.current = "github-actions";
+});
 
 describe("createProductionKgRefreshServices", () => {
   it("returns the KgRepo and KgRefresh services and the eight tool deps", () => {
@@ -93,6 +98,15 @@ describe("createProductionKgRefreshServices", () => {
     ]);
     expect(toolDeps.callbackConfigured()).toBe(true);
     expect(toolDeps.mappingExists()).toBe(true);
+  });
+
+  it("leaves every test-only workflow hook unset", () => {
+    createProductionKgRefreshServices(makeInput());
+    const deps = capturedWorkflowDeps.current!;
+    expect(deps.afterStageCommitted).toBeUndefined();
+    expect(deps.bootstrapDeadlineMs).toBeUndefined();
+    expect(deps.totalDeadlineMs).toBeUndefined();
+    expect(deps.watchIntervalMs).toBeUndefined();
   });
 
   it("persists a failed preflight as a preflight-gate outcome", () => {
@@ -138,7 +152,33 @@ describe("dispatch_log job row lifecycle", () => {
   });
 });
 
+describe("appendJobLog execution mode", () => {
+  it("records the resolved execution mode rather than github-actions", () => {
+    resolvedPath.current = "fly-machines";
+    const appendLog = vi.fn(() => 1);
+    createProductionKgRefreshServices(makeInput({ appendLog }));
+    capturedWorkflowDeps.current!.appendJobLog({ dispatchId: "d-3", jobId: "d-3" });
+    expect(appendLog).toHaveBeenCalledWith(expect.objectContaining({ dispatchId: "d-3", executionMode: "fly-machines" }));
+  });
+});
+
+describe("non-GHA dispatch", () => {
+  it("passes the workflow's dispatch id through and reports an unknown job id when the backend gave none", async () => {
+    resolvedPath.current = "fly-machines";
+    const dispatchKgRefreshRun = vi.fn(async () => ({}));
+    const result = await createKgRefreshDispatch(makeInput({ dispatchKgRefreshRun }))(dispatchInput);
+    expect(dispatchKgRefreshRun).toHaveBeenCalledWith(expect.objectContaining({ dispatchId: "d-workflow", executionPath: "fly-machines" }));
+    expect(result).toMatchObject({ outcome: "accepted", jobId: null, executionMode: "fly-machines" });
+  });
+});
+
 describe("GHA dispatch wrapper", () => {
+  it("reports an unknown job id, not an empty string, when the dispatch result has no runId", async () => {
+    postWorkflowDispatch.mockResolvedValue({ success: false, status: 0, error: "boom", outcome: "unknown" });
+    const result = await createKgRefreshDispatch(makeInput())(dispatchInput);
+    expect(result.jobId).toBeNull();
+  });
+
   it("requests run details, passes the title through, and returns the run identity", async () => {
     postWorkflowDispatch.mockResolvedValue({ success: true, status: 200, outcome: "accepted", runId: 99, runUrl: "https://gh/run/99" });
     const result = await createKgRefreshDispatch(makeInput())(dispatchInput);
@@ -186,6 +226,17 @@ describe("createKgRefreshIngressClient", () => {
     expect(await clientWith(respond(409, "conflicting report: x")).report("t-1", { ok: true })).toEqual({ status: "conflict" });
     // A TerminalError with no code surfaces as HTTP 500.
     expect(await clientWith(respond(500, "conflicting report: x")).report("t-1", { ok: true })).toEqual({ status: "conflict" });
+  });
+
+  it("parses the Restate JSON error message for the conflict case", async () => {
+    const conflict = JSON.stringify({ code: 500, message: 'conflicting report: existing={"ok":true} incoming={"ok":false}' });
+    expect(await clientWith(respond(500, conflict)).report("t-1", { ok: true })).toEqual({ status: "conflict" });
+    // A Restate-prefixed message (e.g. the handler name) is still a conflict.
+    const prefixed = JSON.stringify({ code: 500, message: "KgRefresh/report: conflicting report: x" });
+    expect(await clientWith(respond(500, prefixed)).report("t-1", { ok: true })).toEqual({ status: "conflict" });
+    // A different failure whose message does not mention the phrase is not a conflict.
+    const other = JSON.stringify({ code: 500, message: "kg-refresh report received after run completed" });
+    expect(await clientWith(respond(500, other)).report("t-1", { ok: true })).toEqual({ status: "unavailable" });
   });
 
   it("maps other 4xx (including a missing handler) and 5xx to unavailable", async () => {
