@@ -93,3 +93,23 @@ jobs:
           unset GITHUB_RUN_ID GITHUB_ENV GITHUB_REPOSITORY GITHUB_REF_NAME                 GITHUB_EVENT_NAME GITHUB_SHA GITHUB_ACTIONS GITHUB_ACTION
           npm run test:restate
       - run: npx tsc --noEmit --project tsconfig.restate-tests.json
+
+  # Binary runtime (AII-915): the same suite on the runtime a dispatched runner
+  # uses — restate-server from node_modules, no Docker. Sibling of
+  # `restate-tests` so a PR proves both runtimes.
+  restate-tests-binary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: npm run test:restate on the binary runtime (ambient CI vars scrubbed)
+        env:
+          RESTATE_TEST_RUNTIME: binary
+        run: |
+          unset GITHUB_RUN_ID GITHUB_ENV GITHUB_REPOSITORY GITHUB_REF_NAME                 GITHUB_EVENT_NAME GITHUB_SHA GITHUB_ACTIONS GITHUB_ACTION
+          npm run test:restate
