@@ -317,6 +317,9 @@ describe("installSkillsStep git subprocess environment", () => {
     AI_IMPLEMENT_RUN_CONFIG: "sentinel-run-config",
     AI_IMPLEMENT_FORWARDED_SECRETS: "SENTINEL_FORWARDED",
     SENTINEL_FORWARDED: "sentinel-forwarded",
+    GIT_DEPENDENCY_TOKEN_FILE: "/sentinel/dependency-cache.json",
+    GIT_DEPENDENCY_CALLBACK_URL: "https://sentinel.invalid",
+    COMPOSER_AUTH: '{"sentinel":"composer"}',
   };
   const saved: Record<string, string | undefined> = {};
   let dir: string;
