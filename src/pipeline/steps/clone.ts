@@ -4,7 +4,7 @@ import path from "node:path";
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
 import { prepareScratchExclusion } from "../scratch-exclude.js";
 import { refreshRunnerGithubCredentials } from "../../runner-token.js";
-import { gitProcessEnv } from "../process-env.js";
+import { gitProcessEnv, gitDependencyProcessEnv } from "../process-env.js";
 import { classifyGitFailure, type FailureRecord } from "../failure-classification.js";
 
 interface CloneInputs extends Record<string, unknown> {
@@ -93,7 +93,7 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
               const unshallowResult = spawnSync(
                 "git",
                 ["fetch", "--unshallow", "origin"],
-                { cwd: effectiveDir, stdio: ["ignore", "pipe", "pipe"], env: gitProcessEnv() },
+                { cwd: effectiveDir, stdio: ["ignore", "pipe", "pipe"], env: gitDependencyProcessEnv() },
               );
               if (unshallowResult.status !== 0) {
                 const stderr = (unshallowResult.stderr?.toString() ?? "").trim();
@@ -109,7 +109,7 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
             const fetchResult = spawnSync(
               "git",
               ["fetch", "origin", ...branchArgs],
-              { cwd: effectiveDir, stdio: ["ignore", "pipe", "pipe"], env: gitProcessEnv() },
+              { cwd: effectiveDir, stdio: ["ignore", "pipe", "pipe"], env: gitDependencyProcessEnv() },
             );
             if (fetchResult.status !== 0) {
               const stderr = (fetchResult.stderr?.toString() ?? "").trim();
@@ -123,7 +123,7 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
             const fetchResult = spawnSync(
               "git",
               ["fetch", "--depth", String(depth ?? 1), "origin", ...branchArgs],
-              { cwd: effectiveDir, stdio: ["ignore", "pipe", "pipe"], env: gitProcessEnv() },
+              { cwd: effectiveDir, stdio: ["ignore", "pipe", "pipe"], env: gitDependencyProcessEnv() },
             );
             if (fetchResult.status !== 0) {
               const stderr = (fetchResult.stderr?.toString() ?? "").trim();
@@ -154,7 +154,7 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
           const cloneResult = spawnSync(
             "git",
             ["clone", ...depthArgs, ...branchArgs, bareRemote, effectiveDir],
-            { stdio: ["ignore", "pipe", "pipe"], env: gitProcessEnv() },
+            { stdio: ["ignore", "pipe", "pipe"], env: gitDependencyProcessEnv() },
           );
           if (cloneResult.status !== 0) {
             const stderr = (cloneResult.stderr?.toString() ?? "").trim();
@@ -200,7 +200,7 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
             const unshallowResult = spawnSync(
               "git",
               ["fetch", "--unshallow", "origin"],
-              { cwd: effectiveDir, stdio: ["ignore", "pipe", "pipe"], env: gitProcessEnv() },
+              { cwd: effectiveDir, stdio: ["ignore", "pipe", "pipe"], env: gitDependencyProcessEnv() },
             );
             if (unshallowResult.status !== 0) {
               const stderr = unshallowResult.stderr?.toString() ?? "";
@@ -214,7 +214,7 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
           const fetchResult = spawnSync(
             "git",
             ["fetch", "origin", ...branchArgs],
-            { cwd: effectiveDir, stdio: ["ignore", "pipe", "pipe"], env: gitProcessEnv() },
+            { cwd: effectiveDir, stdio: ["ignore", "pipe", "pipe"], env: gitDependencyProcessEnv() },
           );
           if (fetchResult.status !== 0) {
             const stderr = fetchResult.stderr?.toString() ?? "";
@@ -229,7 +229,7 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
           const fetchResult = spawnSync(
             "git",
             ["fetch", "--depth", depthVal, "origin", ...branchArgs],
-            { cwd: effectiveDir, stdio: ["ignore", "pipe", "pipe"], env: gitProcessEnv() },
+            { cwd: effectiveDir, stdio: ["ignore", "pipe", "pipe"], env: gitDependencyProcessEnv() },
           );
           if (fetchResult.status !== 0) {
             const stderr = fetchResult.stderr?.toString() ?? "";
@@ -263,7 +263,7 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
         const cloneResult = spawnSync(
           "git",
           ["clone", ...depthArgs, ...branchArgs, bareRemote, effectiveDir],
-          { stdio: ["ignore", "pipe", "pipe"], env: gitProcessEnv() },
+          { stdio: ["ignore", "pipe", "pipe"], env: gitDependencyProcessEnv() },
         );
         if (cloneResult.status !== 0) {
           const stderr = cloneResult.stderr?.toString() ?? "";

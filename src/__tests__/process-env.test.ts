@@ -1,5 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { repoProcessEnv, modelProcessEnv, gitProcessEnv } from "../pipeline/process-env.js";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { repoProcessEnv, modelProcessEnv, gitProcessEnv, gitDependencyProcessEnv } from "../pipeline/process-env.js";
 
 const SAVED: Record<string, string | undefined> = {};
 
@@ -187,5 +191,72 @@ describe("gitProcessEnv", () => {
     expect(process.env.GH_TOKEN).toBe("sentinel-GH_TOKEN");
     expect(process.env.AI_IMPLEMENT_RUN_CONFIG).toBe("sentinel-AI_IMPLEMENT_RUN_CONFIG");
     expect(process.env.MY_FORWARDED_SECRET).toBe("sentinel-MY_FORWARDED_SECRET");
+  });
+});
+
+describe("gitProcessEnv dependency credentials", () => {
+  const DEP = {
+    GIT_DEPENDENCY_TOKEN_FILE: "/sentinel/cache.json",
+    GIT_DEPENDENCY_CALLBACK_URL: "https://sentinel.invalid",
+    COMPOSER_AUTH: '{"sentinel":"composer"}',
+  };
+
+  beforeEach(() => {
+    for (const [k, v] of Object.entries(DEP)) saveAndSet(k, v);
+    saveAndSet("RUN_PROGRESS_TOKEN", "sentinel-progress");
+    saveAndSet("RUN_TOKEN", "sentinel-run");
+    saveAndSet("NPM_TOKEN", "sentinel-npm");
+    saveAndSet("GITHUB_TOKEN", "sentinel-github");
+    saveAndSet("AI_IMPLEMENT_RUN_CONFIG", "sentinel-run-config");
+  });
+
+  it("strips the three derived dependency variables and leaves process.env intact", () => {
+    const env = gitProcessEnv();
+    for (const k of Object.keys(DEP)) expect(env[k], k).toBeUndefined();
+    for (const [k, v] of Object.entries(DEP)) expect(process.env[k]).toBe(v);
+  });
+
+  it("gitDependencyProcessEnv restores only the helper handle, callback URL and progress bearer", () => {
+    const env = gitDependencyProcessEnv();
+    expect(env.GIT_DEPENDENCY_TOKEN_FILE).toBe(DEP.GIT_DEPENDENCY_TOKEN_FILE);
+    expect(env.GIT_DEPENDENCY_CALLBACK_URL).toBe(DEP.GIT_DEPENDENCY_CALLBACK_URL);
+    expect(env.RUN_PROGRESS_TOKEN).toBe("sentinel-progress");
+    for (const k of ["COMPOSER_AUTH", "RUN_TOKEN", "NPM_TOKEN", "GITHUB_TOKEN", "AI_IMPLEMENT_RUN_CONFIG"]) {
+      expect(env[k], k).toBeUndefined();
+    }
+    expect(env.PATH).toBe(process.env.PATH);
+  });
+
+  it("gitDependencyProcessEnv applies extras and omits unset variables", () => {
+    saveAndSet("GIT_DEPENDENCY_CALLBACK_URL", undefined);
+    const env = gitDependencyProcessEnv({ GIT_TERMINAL_PROMPT: "0" });
+    expect(env.GIT_TERMINAL_PROMPT).toBe("0");
+    expect(env).not.toHaveProperty("GIT_DEPENDENCY_CALLBACK_URL");
+  });
+
+  describe("git-credential-helper.sh cache", () => {
+    let dir: string;
+    afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+    function runHelper(env: NodeJS.ProcessEnv) {
+      return spawnSync("bash", [join(process.cwd(), "session", "git-credential-helper.sh"), "get"], {
+        input: "protocol=https\nhost=github.com\n\n",
+        env,
+        encoding: "utf8",
+      });
+    }
+
+    it("a missing progress bearer alone does not fence the cached token; gitProcessEnv does", () => {
+      dir = mkdtempSync(join(tmpdir(), "helper-cache-"));
+      const cache = join(dir, "cache.json");
+      writeFileSync(cache, JSON.stringify({ token: "SENTINEL-CACHED", expires_at: "2999-01-01T00:00:00Z" }));
+      process.env.GIT_DEPENDENCY_TOKEN_FILE = cache;
+      delete process.env.RUN_PROGRESS_TOKEN;
+
+      const bearerOnly = { ...process.env };
+      expect(runHelper(bearerOnly).stdout).toContain("password=SENTINEL-CACHED");
+
+      expect(runHelper(gitProcessEnv()).stdout).not.toContain("SENTINEL-CACHED");
+    });
   });
 });
