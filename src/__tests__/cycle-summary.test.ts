@@ -278,3 +278,71 @@ describe("cycle-summary", () => {
     expect(toolTraceLines(undefined)).toEqual([]);
   });
 });
+
+import { sanitizeAttribution, type InvocationAttributionV1 } from "../pipeline/types.js";
+import { isCycleSummary, sanitizeCycleSummaries } from "../pipeline/cycle-summary.js";
+
+describe("attribution contract (AII-946)", () => {
+  const attr = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+    version: 1, invocationId: "inv-1", stage: "planning", snapshotId: "snap-1", agent: "codex",
+    provider: "openai", model: "gpt-synthetic", profileId: "prof-1", authMode: "openai-api-key",
+    limit: { kind: "timeout_ms", value: 1000 }, outcome: "success",
+    usage: { availability: "complete", tokensIn: 1, tokensOut: 2, costUsd: 0.5, costStatus: "reported" },
+    ...over,
+  });
+
+  it("round-trips a valid value, every stage and every auth mode", () => {
+    expect(sanitizeAttribution(attr())).toEqual(attr());
+    for (const stage of ["planning", "implementation", "review"]) expect(sanitizeAttribution(attr({ stage }))?.stage).toBe(stage);
+    for (const authMode of ["anthropic-api-key", "bedrock", "claude-subscription", "openai-api-key", "codex-subscription"]) {
+      expect(sanitizeAttribution(attr({ authMode }))?.authMode).toBe(authMode);
+    }
+  });
+
+  it("keeps null usage and null cost null", () => {
+    expect(sanitizeAttribution(attr({ usage: null }))?.usage).toBeNull();
+    const u = sanitizeAttribution(attr({ usage: { availability: "unavailable", tokensIn: null, tokensOut: null, costUsd: null, costStatus: "unavailable" } }));
+    expect(u?.usage?.costUsd).toBeNull();
+    expect(u?.usage?.tokensIn).toBeNull();
+  });
+
+  it("enforces cost honesty", () => {
+    const usage = (over: Record<string, unknown>) => ({ availability: "complete", tokensIn: 1, tokensOut: 1, costUsd: null, costStatus: "unavailable", ...over });
+    expect(sanitizeAttribution(attr({ usage: usage({}) }))).not.toBeNull();
+    expect(sanitizeAttribution(attr({ usage: usage({ costStatus: "reported" }) }))).toBeNull();
+    expect(sanitizeAttribution(attr({ usage: usage({ costUsd: 0 }) }))).toBeNull();
+  });
+
+  it("enforces usage availability against token presence", () => {
+    const usage = (availability: string, tokensIn: number | null, tokensOut: number | null) =>
+      ({ availability, tokensIn, tokensOut, costUsd: null, costStatus: "unavailable" });
+    expect(sanitizeAttribution(attr({ usage: usage("complete", 1, null) }))).toBeNull();
+    expect(sanitizeAttribution(attr({ usage: usage("partial", 1, null) }))).not.toBeNull();
+    expect(sanitizeAttribution(attr({ usage: usage("partial", 1, 1) }))).toBeNull();
+    expect(sanitizeAttribution(attr({ usage: usage("unavailable", 1, null) }))).toBeNull();
+  });
+
+  it("rejects oversized, unknown-key, negative, non-finite and credential-shaped input", () => {
+    expect(sanitizeAttribution(attr({ model: "m".repeat(200) }))).toBeNull();
+    expect(sanitizeAttribution(attr({ extra: 1 }))).toBeNull();
+    expect(sanitizeAttribution(attr({ token: "x" }))).toBeNull();
+    expect(sanitizeAttribution(attr({ limit: { kind: "timeout_ms", value: -1 } }))).toBeNull();
+    expect(sanitizeAttribution(attr({ usage: { availability: "partial", tokensIn: Infinity, tokensOut: null, costUsd: null, costStatus: "unavailable" } }))).toBeNull();
+    expect(sanitizeAttribution(attr({ model: "sk-SYNTHETICSECRET123456" }))).toBeNull();
+    expect(sanitizeAttribution(attr({ model: "claude-opus-4[1m]" }))?.model).toBe("claude-opus-4[1m]");
+    expect(sanitizeAttribution(attr({ version: 2 }))).toBeNull();
+    expect(sanitizeAttribution(attr({ outcome: "timeout" }))).toBeNull();
+    expect(sanitizeAttribution(undefined)).toBeNull();
+  });
+
+  it("strips a bad attribution from a cycle summary without dropping the summary", () => {
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const base = { ...baseInput(), completedAt: 1, truncated: false, limitReached: false, usage: { tokensIn: null, tokensOut: null, costUsd: null } };
+    expect(isCycleSummary({ ...base, attribution: { bogus: 1 } })).toBe(false);
+    const { valid, dropped } = sanitizeCycleSummaries([{ ...base, attribution: { bogus: 1 } }, { ...base, id: "feedback-loop.2", attribution: attr() }]);
+    expect(dropped).toBe(0);
+    expect(valid).toHaveLength(2);
+    expect(valid[0]).not.toHaveProperty("attribution");
+    expect((valid[1].attribution as InvocationAttributionV1).invocationId).toBe("inv-1");
+  });
+});

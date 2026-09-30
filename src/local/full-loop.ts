@@ -9,7 +9,7 @@ import {
   type RunLocalAutonomousOptions,
 } from "../run-autonomous.js";
 import type { LocalRunPass, LocalRunTokenSummary } from "./run-result.js";
-import type { LLMExecutor, PipelineDefinition, StepReporter } from "../pipeline/types.js";
+import type { InvocationAttributionV1, LLMExecutor, PipelineDefinition, StepReporter } from "../pipeline/types.js";
 import type { PipelineRunner } from "../pipeline/runner.js";
 import type { ResolvedAgentSnapshotV1 } from "../run-config.js";
 
@@ -49,6 +49,8 @@ export interface LocalFullLoopOptions {
 
 export interface LocalFullLoopResult {
   exitCode: number;
+  /** Optional diagnostic attribution (AII-946); emission is AII-971. */
+  attribution?: InvocationAttributionV1;
   classification: LocalExitClassification;
   planningExitCode: number;
   planningContext: string;

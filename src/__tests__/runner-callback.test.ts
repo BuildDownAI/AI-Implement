@@ -161,6 +161,21 @@ const STEP: Step = {
   logs_url: null,
 };
 
+const validAttribution = () => ({
+  version: 1,
+  invocationId: "inv-1",
+  stage: "implementation",
+  snapshotId: "snap-1",
+  agent: "codex",
+  provider: "openai",
+  model: "gpt-synthetic",
+  profileId: null,
+  authMode: "codex-subscription",
+  limit: { kind: "timeout_ms", value: 60000 },
+  outcome: "error",
+  usage: { availability: "unavailable", tokensIn: null, tokensOut: null, costUsd: null, costStatus: "unavailable" },
+});
+
 describe("handleRunnerResult — auth", () => {
   it("returns 401 when Authorization header is missing", async () => {
     const res = await runnerCallback.handleRunnerResult({
@@ -4385,6 +4400,38 @@ describe("handleRunnerResult — cycle summary durable evidence (AII-801)", () =
     warnSpy.mockRestore();
   });
 
+  it("keeps terminal delivery when attribution is malformed, oversized or of unknown version, warning by count only", async () => {
+    const planted = "sk-SYNTHETICSECRET123456";
+    const bad = [
+      { ...validAttribution(), version: 2 },
+      { ...validAttribution(), apiKey: planted },
+      { ...validAttribution(), model: "x".repeat(5000) },
+      "not-an-object",
+    ];
+    for (const attribution of bad) {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      const res = await postResult({ attribution: attribution as never });
+      expect(res.status).toBe(200);
+      const warned = warnSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+      expect(warned).toContain("Dropped 1 invalid attribution record(s)");
+      expect(warned).not.toContain(planted);
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("accepts valid attribution without warning", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const res = await postResult({ attribution: validAttribution() as never });
+    expect(res.status).toBe(200);
+    expect(warnSpy.mock.calls.join(" ")).not.toContain("attribution");
+    warnSpy.mockRestore();
+  });
+
+  it("accepts INVOCATION_TIMEOUT as a failure code with the existing error outcome", async () => {
+    const res = await postResult({ outcome: "failure", failureCode: "INVOCATION_TIMEOUT", prUrl: undefined });
+    expect(res.status).toBe(200);
+  });
+
   it("never records a cycle summary for a Legacy result with no reviewFix marker", async () => {
     const summary = baseCycleSummary();
 
@@ -4455,6 +4502,18 @@ describe("handleRunnerCycleSummary — independent pilot evidence", () => {
     expect(post(summary)).toMatchObject({ status: 200, body: { outcome: "duplicate" } });
     expect(post({ ...summary, completedAt: summary.completedAt + 1 }).status).toBe(409);
     expect(reviewFixEvidence.getReviewFixCycleSummary(attemptId, 1)?.completedAt).toBe(summary.completedAt);
+  });
+
+  it("strips malformed attribution and still records the cycle summary", () => {
+    const token = preparedToken();
+    const res = runnerCallback.handleRunnerCycleSummary({
+      authorization: `Bearer ${token}`, secret: SECRET,
+      body: { summary: { ...summary, attribution: { version: 99, model: "sk-SYNTHETICSECRET123456" } } },
+    });
+    expect(res).toMatchObject({ status: 200, body: { outcome: "recorded" } });
+    const stored = reviewFixEvidence.getReviewFixCycleSummary(attemptId, 1);
+    expect(stored?.tests).toEqual(summary.tests);
+    expect(stored?.attribution).toBeUndefined();
   });
 
   it("rejects unprepared credentials and oversized evidence", () => {

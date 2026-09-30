@@ -1,3 +1,4 @@
+import type { InvocationAttributionV1 } from "./pipeline/types.js";
 import { readFileSync, existsSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
@@ -183,6 +184,8 @@ export interface RunAutonomousOptions {
 
 export interface RunAutonomousResult {
   exitCode: number;
+  /** Optional diagnostic attribution (AII-946); emission is AII-971. */
+  attribution?: InvocationAttributionV1;
 }
 
 function optionalEnv(n: string): string | null {
@@ -1241,6 +1244,8 @@ export interface RunLocalAutonomousOptions {
 
 export interface RunLocalAutonomousResult {
   exitCode: number;
+  /** Optional diagnostic attribution (AII-946); emission is AII-971. */
+  attribution?: InvocationAttributionV1;
   approved: boolean;
   terminationReason: string;
   iterations: number;

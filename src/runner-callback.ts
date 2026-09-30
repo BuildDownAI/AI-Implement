@@ -37,7 +37,8 @@ import {
 import { isLinearAuthConfigured, withLinearToken } from "./linear-app-auth.js";
 import { isFailureRecord, projectFailureRecord, type FailureRecord } from "./pipeline/failure-classification.js";
 import { sanitizeFindingDispositions, type FindingDisposition } from "./pipeline/finding-dispositions.js";
-import { isCycleSummary, sanitizeCycleSummaries, type CycleSummary, type CycleDisposition } from "./pipeline/cycle-summary.js";
+import { sanitizeAttribution, type InvocationAttributionV1 } from "./pipeline/types.js";
+import { isCycleSummary, stripCycleAttribution, sanitizeCycleSummaries, type CycleSummary, type CycleDisposition } from "./pipeline/cycle-summary.js";
 import { recordReviewFixCycleSummary, type ReviewFixCycleSummaryOutcome } from "./review-fix-evidence.js";
 import type { ReviewFixFindingDisposition } from "./review-fix-ports.js";
 import {
@@ -143,6 +144,14 @@ export interface RunnerResultBody {
    * against, so its cycle summaries (if any were even forwarded) are acknowledged and dropped.
    */
   cycleSummaries?: CycleSummary[];
+  /**
+   * Optional diagnostic attribution (AII-946). Sanitized and stripped-on-invalid in
+   * handleRunnerResult; never fails the callback. Older orchestrators ignore the unknown key.
+   * Census (AII-971 wires emission/persistence): API job/report readers, reviewer result
+   * handling and failure validators do not read this field yet. `INVOCATION_TIMEOUT` is an
+   * ordinary open-ended `failure.code` reported with the existing error outcome.
+   */
+  attribution?: InvocationAttributionV1;
   /**
    * Optional pilot marker (AII-769 Restate review-fix pilot; shape defined by
    * AII-770's review-fix-contract.ts). Present only on a result reported by a
@@ -509,7 +518,8 @@ export function handleRunnerCycleSummary(input: {
   const verified = verifyPreparedReviewFixToken(bearer, input.secret, "progress");
   if (!verified.ok || !verified.claims.attemptId) return bad(401, verified.ok ? "wrong_scope" : verified.reason);
   if (!input.body || typeof input.body !== "object" || Array.isArray(input.body)) return bad(400, "invalid_cycle_body");
-  const summary = (input.body as { summary?: unknown }).summary;
+  const { value: summary, stripped } = stripCycleAttribution((input.body as { summary?: unknown }).summary);
+  if (stripped) console.warn("[runner-callback] dropped malformed cycle summary attribution (count=1)");
   if (!isCycleSummary(summary)) return bad(400, "invalid_cycle_summary");
 
   const outcome = recordOneCycleSummary(verified.claims.attemptId, summary);
@@ -617,6 +627,7 @@ export async function handleRunnerResult(
     failure?: unknown;
     findingDispositions?: unknown;
     cycleSummaries?: unknown;
+    attribution?: unknown;
     reviewFix?: unknown;
   } | null | undefined;
   if (!body || typeof body !== "object") return bad(400, "invalid_body");
@@ -747,6 +758,17 @@ export async function handleRunnerResult(
   input.body.findingDispositions = sanitizedFindingDispositions;
   if (droppedFindingDispositions > 0) {
     console.warn(`[runner-callback] Dropped ${droppedFindingDispositions} invalid finding disposition(s)`);
+  }
+
+  // Optional diagnostic attribution: an invalid value is stripped (count-only warn, no payload)
+  // and the terminal outcome is still delivered. Unlike invalid agentConfig, this never fails closed.
+  if (body.attribution !== undefined) {
+    const attribution = sanitizeAttribution(body.attribution);
+    if (attribution) input.body.attribution = attribution;
+    else {
+      delete input.body.attribution;
+      console.warn("[runner-callback] Dropped 1 invalid attribution record(s)");
+    }
   }
 
   // Same sanitize-and-drop treatment again: a Legacy run (no reviewFix marker —
