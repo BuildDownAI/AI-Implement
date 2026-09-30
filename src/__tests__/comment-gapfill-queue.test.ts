@@ -335,4 +335,36 @@ describe("startup sweep for pre-fix orphaned rows (AII-279)", () => {
     expect(queue.hasPendingConflictResolution("o", "ra", 1)).toBe(true);   // untouched
     expect(queue.hasPendingConflictResolution("o", "rb", 2)).toBe(false);  // failed
   });
+
+  describe("requeueGapfillAfterPushFailure (AII-922)", () => {
+    const seed = () => {
+      const id = queue.enqueueCommentGapfill({
+        owner: "org", repo: "repo", prNumber: 7, commentId: 2001, commenter: "alice", instruction: "fix it",
+      });
+      queue.markCommentGapfillProcessed(id, "dispatched");
+    };
+
+    it("re-enqueues the dispatched instruction exactly once", () => {
+      seed();
+      expect(queue.requeueGapfillAfterPushFailure("org/repo", 7)).toBe(true);
+      queue.markCommentGapfillRunTerminal("org/repo", 7, "failed");
+      const [retry] = queue.claimPendingCommentGapfills();
+      expect(retry.instruction).toBe("fix it");
+      expect(retry.commenter).toBe(queue.PUSH_RETRY_COMMENTER);
+
+      // The retry runs and fails at push too: it is not retried again.
+      queue.markCommentGapfillProcessed(retry.id, "dispatched");
+      expect(queue.requeueGapfillAfterPushFailure("org/repo", 7)).toBe(false);
+      queue.markCommentGapfillRunTerminal("org/repo", 7, "failed");
+      expect(queue.claimPendingCommentGapfills()).toHaveLength(0);
+    });
+
+    it("does nothing without a dispatched row and does not count as a conflict attempt", () => {
+      expect(queue.requeueGapfillAfterPushFailure("org/repo", 7)).toBe(false);
+      seed();
+      queue.requeueGapfillAfterPushFailure("org/repo", 7);
+      expect(queue.countConflictAttempts("org", "repo", 7)).toBe(0);
+      expect(queue.hasPendingConflictResolution("org", "repo", 7)).toBe(false);
+    });
+  });
 });

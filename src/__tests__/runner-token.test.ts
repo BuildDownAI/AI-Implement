@@ -67,6 +67,26 @@ describe("refreshRunnerGithubToken", () => {
     );
   });
 
+  it("logs the credential source without the token (AII-922)", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const fetchImpl = vi.fn().mockResolvedValue({
+      ok: true, status: 200, json: async () => ({ token: "secret-fresh-token" }),
+    } as Response);
+    await refreshRunnerGithubToken({
+      currentToken: "boot-token", orchestratorUrl: "https://orchestrator.example",
+      machineNonce: "machine-nonce", owner: "BuildDownAI", fetchImpl,
+    });
+    await refreshRunnerGithubToken({
+      currentToken: "boot-token", callbackUrl: "https://orchestrator.example",
+      publicationToken: "one-use", owner: "BuildDownAI", repo: "AI-Implement", fetchImpl,
+    });
+    const lines = log.mock.calls.map((c) => c.join(" "));
+    log.mockRestore();
+    expect(lines.some((l) => l.includes("(source: machine-nonce)"))).toBe(true);
+    expect(lines.some((l) => l.includes("(source: publication-token)"))).toBe(true);
+    expect(lines.join("\n")).not.toMatch(/secret-fresh-token|one-use/);
+  });
+
   it("keeps the boot token when vending is unavailable", async () => {
     const fetchImpl = vi.fn().mockRejectedValue(new Error("connection refused"));
 
