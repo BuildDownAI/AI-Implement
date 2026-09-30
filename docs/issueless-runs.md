@@ -328,6 +328,8 @@ This returns before the code that resolves the ticketing provider, posts comment
 
 ## 6. Lifecycle
 
+The three run tokens (result, progress, publication) are minted in the workflow's one journaled `mint-tokens` step, so a replay or restart reuses them rather than minting again; the publication token is bound to the KG source repo and exchanged for a scoped GitHub token at push time.
+
 ### State machine
 
 `makeKgRefresh()` maintains an in-process `KgRefreshStage` state:

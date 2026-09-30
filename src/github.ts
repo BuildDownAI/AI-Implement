@@ -866,6 +866,7 @@ export function buildKgRefreshGhaDispatchBody(opts: {
   runConfig: string;
   runToken: string;
   runProgressToken: string;
+  runPublicationToken?: string;
   runnerImage: string | undefined;
   runnerCallbackUrl?: string | undefined;
   runnerPhase?: DispatchInputs["runner_phase"];
@@ -876,6 +877,7 @@ export function buildKgRefreshGhaDispatchBody(opts: {
     run_config: opts.runConfig,
     run_token: opts.runToken,
     run_progress_token: opts.runProgressToken,
+    ...(opts.runPublicationToken !== undefined ? { run_publication_token: opts.runPublicationToken } : {}),
     ...(opts.runnerPhase ? { runner_phase: opts.runnerPhase } : {}),
     ...(opts.jobTimeoutMinutes ? { job_timeout_minutes: opts.jobTimeoutMinutes } : {}),
     ...(opts.runnerImage ? { runner_image: opts.runnerImage } : {}),
