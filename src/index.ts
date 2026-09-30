@@ -45,7 +45,7 @@ import { handleAdminRequest } from "./admin.js";
 import { initLogTable, appendLog, countPriorDispatches, completeOrphanedPlanningJobs, attachJobRunIdIfMissing, updateJobRunId, updateJobStatus, updateJobPrUrl, updateJobMachineDetails, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobById, getJobByMachineId, getJobByDispatchId, resetStuckAttempts, getRecentFailedRunUrls } from "./log.js";
 import { recordDispatchFailure, recordDispatchSuccess, shouldCountFailure, initDispatchBreakerTable, parkIssue, prBudgetParkMessage, isParked } from "./dispatch-breaker.js";
 import type { Job, JobStatus } from "./log.js";
-import { getInstallationToken, getInstallationId, getAppSlug } from "./github-app-auth.js";
+import { getInstallationToken, getScopedInstallationToken, getInstallationId, getAppSlug } from "./github-app-auth.js";
 import { configureLinearAuth } from "./linear-app-auth.js";
 import { configureOAuthProviders, isOAuthConfigured, providersFromEnv } from "./oauth/providers.js";
 import { handleOAuthCallback, handleOAuthLogout, handleOAuthProviders, handleOAuthStart } from "./oauth/routes.js";
@@ -367,6 +367,22 @@ export async function guardOpenPrBeforeImplementationDispatch(
 
   // Closed, not merged — a human closed the PR to start over. Today's behavior: dispatch.
   return false;
+}
+
+/**
+ * Mint the GitHub token a Fly or local-Docker child runner boots with, scoped to the
+ * mapping's target repository alone. Throws on failure so the launch aborts; there is
+ * deliberately no fallback to the installation-wide token.
+ */
+async function getTargetRepoToken(
+  config: Pick<AppConfig, "githubAppId" | "githubAppPrivateKey">,
+  owner: string,
+  repo: string,
+): Promise<string> {
+  const scoped = await getScopedInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner, {
+    repositories: [repo],
+  });
+  return scoped.token;
 }
 
 async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void> {
@@ -876,6 +892,7 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
       runnerCallbackBaseUrl: config.runnerCallbackBaseUrl,
       runnerTokenSecret: config.runnerTokenSecret,
       getInstallationToken: (owner) => getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner),
+      getTargetRepoToken: (owner, repo) => getTargetRepoToken(config, owner, repo),
       getInstallationId: (owner) => getInstallationId(config.githubAppId, config.githubAppPrivateKey, owner),
       resolveRunnerImage: (mapping, ghToken) => resolveDispatchRunnerImage(config, mapping, ghToken),
       checkContract: (params) => resolveWorkflowCapabilities(params),
@@ -1461,7 +1478,7 @@ export async function dispatchPlanning(
         };
 
         // both fly-machines and local-docker require a GitHub token now, so it's extracted here for convenience/readability
-        const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
+        const ghToken = await getTargetRepoToken(config, mapping.owner, mapping.repo);
         if (execPath === "fly-machines") {
           const minSecretsVersion = getFlySecretsMinVersion();
           let allSecretNames: string[] = [];
@@ -2025,7 +2042,7 @@ async function dispatchSession(
 
 // ---------- Dispatch: Fly Machines ----------
 
-async function dispatchFlyMachine(
+export async function dispatchFlyMachine(
   config: AppConfig,
   provider: TicketingProvider,
   issue: DispatchableIssue,
@@ -2081,7 +2098,7 @@ async function dispatchFlyMachine(
         console.warn(`[poll] Failed to fetch app secrets for ${issue.identifier}, proceeding without team secrets:`, err);
       }
 
-      const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
+      const ghToken = await getTargetRepoToken(config, mapping.owner, mapping.repo);
 
       const { image: resolvedImage, source: imageSource } = await resolveSessionImage({
         owner: mapping.owner,
@@ -2196,7 +2213,7 @@ export async function dispatchLocalDocker(
         config.runnerCallbackBaseUrl ??
         `http://host.docker.internal:${config.healthPort}`;
 
-      const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
+      const ghToken = await getTargetRepoToken(config, mapping.owner, mapping.repo);
 
       const localImplRunConfig: RunConfigV1 = buildImplRunConfig({
         issue,
