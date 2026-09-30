@@ -539,7 +539,10 @@ describe("agentConfig resolved snapshot", () => {
     return {
       version: 1,
       snapshotId: "snap-1",
-      configRevisions: { orchestratorDefault: 1, project: 3 },
+      configRevisions: {
+        orchestratorDefault: { configRevisionId: "11111111-1111-4111-8111-111111111111", revision: 1 },
+        project: { configRevisionId: "22222222-2222-4222-8222-222222222222", revision: 3 },
+      },
       stages: { planning: p.sel, implementation: i.sel, review: r.sel },
       sources: { planning: p.src, implementation: i.src, review: r.src },
       profiles: { planning: p.prof, implementation: i.prof, review: r.prof },
@@ -577,7 +580,15 @@ describe("agentConfig resolved snapshot", () => {
     ["missing stage", (s) => { delete s.stages.review; }],
     ["extra stage", (s) => { s.stages.extra = s.stages.review; }],
     ["zero revision", (s) => { s.profiles.review.revision = 0; }],
-    ["string config revision", (s) => { s.configRevisions.project = "3"; }],
+    ["numeric-only config revisions", (s) => { s.configRevisions = { orchestratorDefault: 1, project: 3 }; }],
+    ["string config revision", (s) => { s.configRevisions.project.revision = "3"; }],
+    ["zero config revision", (s) => { s.configRevisions.project.revision = 0; }],
+    ["negative config revision", (s) => { s.configRevisions.project.revision = -1; }],
+    ["fractional config revision", (s) => { s.configRevisions.orchestratorDefault.revision = 1.5; }],
+    ["empty config revision id", (s) => { s.configRevisions.project.configRevisionId = ""; }],
+    ["non-string config revision id", (s) => { s.configRevisions.project.configRevisionId = 7; }],
+    ["oversized config revision id", (s) => { s.configRevisions.project.configRevisionId = "x".repeat(10_000); }],
+    ["missing config layer", (s) => { delete s.configRevisions.project; }],
     ["negative timeout", (s) => { s.stages.review.invocationTimeoutMs = -1; }],
     ["fractional timeout", (s) => { s.stages.review.invocationTimeoutMs = 1.5; }],
     ["string timeout", (s) => { s.stages.review.invocationTimeoutMs = "5"; }],
@@ -609,6 +620,7 @@ describe("agentConfig resolved snapshot", () => {
       (s) => { s.profiles.planning.accessToken = secret; },
       (s) => { s.sources.review.apiKey = secret; },
       (s) => { s.configRevisions.token = secret; },
+      (s) => { s.configRevisions.project.token = secret; },
     ];
     for (const fn of inject) {
       const s = build();
