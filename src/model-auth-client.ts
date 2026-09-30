@@ -274,6 +274,40 @@ const STRIPPED_PREFIXES: readonly string[] = [
   "CLAUDE_CODE_USE_",
 ];
 
+/** Exact names of safe ambient context a model child may inherit; everything else is dropped. */
+const INHERITED_CONTEXT_KEYS: ReadonlySet<string> = new Set([
+  "PATH",
+  "HOME",
+  "USER",
+  "LOGNAME",
+  "SHELL",
+  "TERM",
+  "TMPDIR",
+  "TMP",
+  "TEMP",
+  "TZ",
+  "LANG",
+  "LANGUAGE",
+  "SSL_CERT_FILE",
+  "SSL_CERT_DIR",
+  "NODE_EXTRA_CA_CERTS",
+  "REQUESTS_CA_BUNDLE",
+  "CURL_CA_BUNDLE",
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "ALL_PROXY",
+  "NO_PROXY",
+  "http_proxy",
+  "https_proxy",
+  "all_proxy",
+  "no_proxy",
+]);
+
+/** Locale categories (`LC_ALL`, `LC_CTYPE`, ...) are safe context too. */
+function isInheritableContext(name: string): boolean {
+  return INHERITED_CONTEXT_KEYS.has(name) || /^LC_[A-Z]+$/.test(name);
+}
+
 /** Forwarded secret names come from the env being filtered, never from `process.env`. */
 function forwardedNames(env: Readonly<Record<string, string | undefined>>): Set<string> {
   const out = new Set<string>();
@@ -291,7 +325,8 @@ export interface ModelInvocationEnv {
 }
 
 /**
- * Builds the model child's environment for exactly one selected mode. Credentials
+ * Builds the model child's environment for exactly one selected mode. Inheritance is a bounded
+ * allowlist of safe context (PATH/HOME, temp/locale, TLS and proxy names); unknown variables are dropped. Credentials
  * are only ever environment/file based; nothing here produces command arguments.
  * Unknown modes throw; there is no inherited-credential fallback.
  */
@@ -314,7 +349,12 @@ export function buildModelInvocationEnv(input: {
   for (const [k, v] of Object.entries(input.inheritedEnv)) {
     if (v === undefined) continue;
     if (protectedKeys.includes(k)) continue;
-    if (STRIPPED_EXACT_KEYS.has(k) || forwarded.has(k) || STRIPPED_PREFIXES.some((p) => k.startsWith(p))) {
+    if (
+      !isInheritableContext(k) ||
+      STRIPPED_EXACT_KEYS.has(k) ||
+      forwarded.has(k) ||
+      STRIPPED_PREFIXES.some((p) => k.startsWith(p))
+    ) {
       strippedKeys.push(k);
       continue;
     }

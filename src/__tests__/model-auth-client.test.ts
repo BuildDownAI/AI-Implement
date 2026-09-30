@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { createCipheriv, randomBytes } from "node:crypto";
-import { mkdirSync, mkdtempSync, symlinkSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, mkdtempSync, symlinkSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync, existsSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -280,7 +280,7 @@ describe("client", () => {
     const file = join(full, "auth.json");
     expect(statSync(file).mode & 0o777).toBe(0o600);
     expect(readdirSync(full)).toEqual(["auth.json"]); // no leftover temp file
-    expect(full.startsWith(workspace)).toBe(false);
+    expect(realpathSync(full).startsWith(realpathSync(workspace))).toBe(false);
 
     let argvSeen = "";
     const result = await client.invoke("sub", async (inv) => {
@@ -701,7 +701,13 @@ describe("client", () => {
           AI_IMPLEMENT_FORWARDED_SECRETS: "MY_FWD, OTHER_FWD",
           MY_FWD: leak,
           OTHER_FWD: leak,
-          UNRELATED: "kept",
+          UNRELATED: "dropped",
+          DATABASE_URL: leak,
+          LINEAR_API_KEY: leak,
+          STRIPE_KEY: leak,
+          COMPOSER_AUTH: leak,
+          GIT_DEPENDENCY_TOKEN_FILE: leak,
+          GIT_DEPENDENCY_CALLBACK_URL: leak,
           MODEL_AUTH_KEY: leak,
           OPENAI_BASE_URL: leak,
           ANTHROPIC_BASE_URL: leak,
@@ -724,11 +730,37 @@ describe("client", () => {
           expect(env).not.toHaveProperty("CLAUDE_CODE_USE_VERTEX");
           expect(env).not.toHaveProperty("OPENAI_BASE_URL");
           expect(env).not.toHaveProperty("MODEL_AUTH_KEY");
-          expect(env).toMatchObject({ PATH: "/bin", HOME: "/home/x", SSL_CERT_FILE: "/etc/ca.pem", HTTPS_PROXY: "http://proxy:3128", UNRELATED: "kept" });
+          for (const k of ["UNRELATED", "DATABASE_URL", "LINEAR_API_KEY", "STRIPE_KEY", "COMPOSER_AUTH", "GIT_DEPENDENCY_TOKEN_FILE", "GIT_DEPENDENCY_CALLBACK_URL"]) {
+            expect(env).not.toHaveProperty(k);
+            expect(strippedKeys).toContain(k);
+          }
+          expect(env).toMatchObject({ PATH: "/bin", HOME: "/home/x", SSL_CERT_FILE: "/etc/ca.pem", HTTPS_PROXY: "http://proxy:3128" });
         }
       } finally {
         if (prev === undefined) delete process.env.AI_IMPLEMENT_FORWARDED_SECRETS;
         else process.env.AI_IMPLEMENT_FORWARDED_SECRETS = prev;
+      }
+    });
+
+    it("client defaults to process.env without leaking unlisted secrets", async () => {
+      const prev = { D: process.env.DATABASE_URL, C: process.env.COMPOSER_AUTH, P: process.env.HTTPS_PROXY };
+      process.env.DATABASE_URL = "SENTINEL-db-0009";
+      process.env.COMPOSER_AUTH = "SENTINEL-db-0009";
+      process.env.HTTPS_PROXY = "http://proxy:3128";
+      try {
+        const client = local({ load: async () => ({ kind: "api-key", apiKey: S_API }) }, { inheritedEnv: undefined });
+        await client.checkout({ profileId: "api", authMode: "openai-api-key" });
+        await client.invoke("api", async (inv) => {
+          expect(JSON.stringify(inv.env)).not.toContain("SENTINEL-db-0009");
+          expect(inv.env.HTTPS_PROXY).toBe("http://proxy:3128");
+          expect(inv.env.CODEX_API_KEY).toBe(S_API);
+          expect(JSON.stringify(inv.strippedKeys)).not.toContain("SENTINEL");
+        });
+      } finally {
+        for (const [k, v] of [["DATABASE_URL", prev.D], ["COMPOSER_AUTH", prev.C], ["HTTPS_PROXY", prev.P]] as const) {
+          if (v === undefined) delete process.env[k];
+          else process.env[k] = v;
+        }
       }
     });
 
