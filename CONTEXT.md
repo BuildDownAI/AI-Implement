@@ -169,3 +169,15 @@ A review-fix attempt is one authorized runner execution that addresses review fe
 The lifecycle owner is the system responsible for coordinating one attempt from admission to its final outcome. An attempt keeps its owner when an operator changes the setting for future attempts.
 
 **Not to be confused with:** The execution backend that runs the code-changing process.
+
+## Coordinator object
+
+A coordinator object is the Restate virtual object that holds the single in-flight marker for one resource of a run kind and starts that run kind's workflow. Its exclusive handler is the lock: a second trigger while the marker is live is refused, and the workflow's last step releases it.
+
+**Not to be confused with:** The workflow itself, which owns one run's position and never holds the lock; or the `Operator` object, which issues and refreshes credentials.
+
+## Rail gate
+
+A rail gate is one journaled step of the kg-refresh rail (fetch, stage, swap, verify) that either passes or fails the refresh. A failed gate triggers the `revert` compensation, and `status` names the gate that did not finish.
+
+**Not to be confused with:** The auto-merge gate, which decides whether a child PR merges; or the review gate, which is the check that holds a PR until review approves.
