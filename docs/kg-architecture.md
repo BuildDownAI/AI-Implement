@@ -318,9 +318,10 @@ Outcomes are stored per PR, keyed by `repo#prNumber` and pinned to the head sha 
 — and is a no-op once a new push supersedes the stored sha. The cache is bounded (`MAX_TRACKED_PRS`),
 evicted immediately on PR close, and persisted as one JSON blob under the `kg_refresh_dry_run_outcomes`
 settings key on every record and eviction, so a restart between a dry run and a later `labeled` /
-`unlabeled` event still finds the outcome (AII-640). A webhook head queued behind a 409 is woken by
-`onRefreshSettled` on every `running → false` transition, not only a dry-run's — a real refresh, a
-failure, a revert, TTL expiry, or a deploy hold clearing all wake it.
+`unlabeled` event still finds the outcome (AII-640). A PR dry-run queued behind a
+running refresh is held in the `KgRepo` object's `pending` state and submitted by its `release`
+handler when the in-flight refresh lets go — a real refresh, a failure, a revert, or a stale marker
+clearing all release it.
 
 **Manual step — granting the status.** The commit status needs the GitHub App to hold the
 **Commit statuses: Read and write** repository permission. GitHub App permissions live on the App
