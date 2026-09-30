@@ -30,6 +30,7 @@ import type { JobStatus } from "../log.js";
 import type { RestateService } from "./endpoint.js";
 import {
   createKgRefreshWorkflow,
+  KG_CONFLICTING_REPORT_MESSAGE_PREFIX,
   type KgDispatchInput,
   type KgDispatchResult,
   type KgRefreshReportBody,
@@ -116,14 +117,20 @@ function findKgMapping(kgSourceRepo: string) {
   return Object.entries(getMappings()).find(([, m]) => `${m.owner}/${m.repo}` === kgSourceRepo);
 }
 
+/** The execution mode a kg-refresh dispatch resolves to under the current runner mode.
+ *  `createKgRefreshDispatch` acts on it and `appendJobLog` records it, so both read one answer. */
+export function resolveKgExecutionMode(): string {
+  const { mode } = getRunnerMode();
+  const resolved = resolveExecutionPath(mode, GHA_EXECUTION_MODE);
+  return resolved === "both" ? GHA_EXECUTION_MODE : resolved;
+}
+
 /** Builds the GHA-first dispatch the workflow calls inside `ctx.run`. */
 export function createKgRefreshDispatch(input: KgRefreshProductionInput): (dispatch: KgDispatchInput) => Promise<KgDispatchResult> {
   const { config } = input;
   const repo = parseKgSourceRepo(input.kgSourceRepo);
-  return async ({ runConfig, tokens, issueIdentifier }) => {
-    const { mode } = getRunnerMode();
-    const resolved = resolveExecutionPath(mode, GHA_EXECUTION_MODE);
-    const executionMode = resolved === "both" ? GHA_EXECUTION_MODE : resolved;
+  return async ({ runConfig, tokens, issueIdentifier, dispatchId }) => {
+    const executionMode = resolveKgExecutionMode();
     const mapping = findKgMapping(input.kgSourceRepo)?.[1];
     const envelope: RunConfigV1 = {
       v: 1,
@@ -140,10 +147,10 @@ export function createKgRefreshDispatch(input: KgRefreshProductionInput): (dispa
     if (executionMode !== GHA_EXECUTION_MODE) {
       const legacy = await input.dispatchKgRefreshRun({
         runToken: tokens.runToken, runProgressToken: tokens.progressToken,
-        dispatchId: crypto.randomUUID(), runConfig: encoded, executionPath: executionMode,
+        dispatchId, runConfig: encoded, executionPath: executionMode,
       });
       return { outcome: "accepted", runId: legacy.workflowRunId, runUrl: legacy.logsUrl,
-        jobId: legacy.machineId ?? legacy.machineNonce ?? "", executionMode };
+        jobId: legacy.machineId ?? legacy.machineNonce ?? null, executionMode };
     }
 
     const { token } = await input.mintToken(config.githubAppId, config.githubAppPrivateKey, repo.owner);
@@ -166,7 +173,7 @@ export function createKgRefreshDispatch(input: KgRefreshProductionInput): (dispa
       runId: result.runId,
       runUrl: result.runUrl,
       // The GitHub run id once known; the workflow keys its own job row by dispatch id.
-      jobId: result.runId !== undefined ? String(result.runId) : "",
+      jobId: result.runId !== undefined ? String(result.runId) : null,
       executionMode,
     };
   };
@@ -229,7 +236,7 @@ export function createProductionKgRefreshServices(
     dispatch: createKgRefreshDispatch(input),
     appendJobLog: ({ dispatchId }) => {
       jobIds.set(dispatchId, input.appendLog({
-        issueId: "kg-refresh", phase: "kg-refresh", dispatchId, executionMode: GHA_EXECUTION_MODE,
+        issueId: "kg-refresh", phase: "kg-refresh", dispatchId, executionMode: resolveKgExecutionMode(),
         repo: parseKgSourceRepo(input.kgSourceRepo).fullName,
       }));
     },
@@ -308,7 +315,17 @@ export interface KgRefreshIngressClientDeps {
 }
 
 const INGRESS_TIMEOUT_MS = 10_000;
-const CONFLICT_MARKER = "conflicting report";
+const CONFLICT_MARKER = KG_CONFLICTING_REPORT_MESSAGE_PREFIX;
+
+/** Restate answers a handler `TerminalError` with a JSON body `{ code, message }`; anything else is not parseable. */
+function restateErrorMessage(text: string): string | null {
+  try {
+    const parsed = JSON.parse(text) as { message?: unknown };
+    return typeof parsed?.message === "string" ? parsed.message : null;
+  } catch {
+    return null;
+  }
+}
 
 /** Real client for the Restate ingress. Never throws: any failure resolves `unavailable`. */
 export function createKgRefreshIngressClient(
@@ -334,9 +351,12 @@ export function createKgRefreshIngressClient(
       });
       const text = await response.text();
       if (!response.ok) {
-        // A workflow TerminalError without a code surfaces as HTTP 500, so the marker is
-        // matched on the body rather than on a 4xx status alone.
-        return text.includes(CONFLICT_MARKER) ? { status: "conflict" } : { status: "unavailable" };
+        // A workflow TerminalError without a code surfaces as HTTP 500, so the message is
+        // matched rather than a 4xx status. The JSON `message` is authoritative; a body that
+        // is not Restate's JSON error falls back to a substring match.
+        const message = restateErrorMessage(text);
+        const conflict = message !== null ? message.startsWith(CONFLICT_MARKER) : text.includes(CONFLICT_MARKER);
+        return conflict ? { status: "conflict" } : { status: "unavailable" };
       }
       if (text.trim() === "") return { status: "accepted" };
       return { status: "accepted", value: JSON.parse(text) as T };

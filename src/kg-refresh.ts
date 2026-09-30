@@ -37,6 +37,7 @@ import type { KgRailDeps } from "./kg-refresh-rail.js";
 
 const execFile = promisify(execFileCb);
 
+// Shared with the Restate composer in src/restate/kg-refresh-production.ts — keep its imports in step when renaming or moving these.
 /** Root of the runtime graph overlay. `current/` under it is what the sidecar serves. */
 export const DATA_ROOT = "/data/kg";
 export const SIDECAR_MCP_URL = "http://127.0.0.1:8765/mcp";
@@ -1638,6 +1639,7 @@ export async function defaultFetchSnapshotCommitSha(token: string, owner: string
   }
 }
 
+// Shared (with defaultLoadSnapshotSha) with the Restate composer in src/restate/kg-refresh-production.ts — keep its imports in step when renaming or moving these.
 export function defaultPersistSnapshotSha(sha: string): void {
   try {
     getDb()

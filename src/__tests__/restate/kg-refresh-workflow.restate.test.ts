@@ -94,16 +94,39 @@ describe("KgRefresh durable workflow", () => {
   let mintTokenImpl: () => Promise<{ token: string; expiresAt: string }>;
   let loadSnapshotShaImpl: () => string | null;
   let mergeDelayMs: number;
-  // Reassigned per-test (W13) to hold a gate open for a concurrent status() poll; a no-op
-  // default keeps every other scenario's gates running with no added latency.
-  let beforeGateImpl: (name: string) => void | Promise<void> = () => {};
+  // Set per-test (W13) to hold the next sidecar call open, inside verify's own ctx.run, for a
+  // concurrent status() poll; null keeps every other scenario running with no added latency.
+  let holdNextMcpCall: Promise<void> | null = null;
   // Reassigned per-test for the release-leak regression: forces `reserve` (and, once
   // failurePath is reached, `persist`) to fail terminally, so the outer catch's KgRepo
   // release is the only thing standing between a forced double-failure and a leaked lock.
   let forceReserveFailure = false;
   let forcePersistFailure = false;
+  // Fail the next N `reserve` steps (a one-shot version of forceReserveFailure), and hold the
+  // next `persist` open until the promise settles, to stage the failure-path overlap scenario.
+  let reserveFailuresRemaining = 0;
+  let persistHold: Promise<void> | null = null;
+
+  /** A latch that releases itself after `maxMs`, so a missed observation fails fast at the
+   *  assertion instead of hanging until the test timeout. */
+  function boundedLatch(maxMs: number): { promise: Promise<void>; release: () => void } {
+    let release: () => void = () => {};
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const promise = new Promise<void>((resolve) => {
+      release = () => { clearTimeout(timer); resolve(); };
+      timer = setTimeout(resolve, maxMs);
+    });
+    return { promise, release };
+  }
+  const STATUS_LATCH_MAX_MS = 5_000;
 
   const mcpToolCall = async (_url: string, tool: string): Promise<unknown> => {
+    if (holdNextMcpCall) {
+      const held = holdNextMcpCall;
+      holdNextMcpCall = null;
+      await held;
+      sidecarUp = false; // the held call and every canary retry after it find a dead sidecar
+    }
     if (!sidecarUp) throw new Error("ECONNREFUSED");
     if (tool === "kg_neighbors") {
       return { edges: [{ predicate_iri: "http://purl.org/dc/terms/modified", neighbor: servedStamp }] };
@@ -179,7 +202,9 @@ describe("KgRefresh durable workflow", () => {
     restartCallCount = 0;
     materializeCallCount = 0;
     fetchTarballCallCount = 0;
-    beforeGateImpl = () => {};
+    holdNextMcpCall = null;
+    reserveFailuresRemaining = 0;
+    persistHold = null;
     forceReserveFailure = false;
     forcePersistFailure = false;
 
@@ -202,6 +227,8 @@ describe("KgRefresh durable workflow", () => {
   const scenarios = new Map<string, RunScenario>();
   const runIdIndex = new Map<number, string>();
   const appendJobLogCalls: Array<{ dispatchId: string; jobId: string }> = [];
+  const dispatchedIds: string[] = [];
+  const mintedDispatchIds: string[] = [];
   const closeRowCalls: Array<{ jobId: string; status: string; conclusion?: string }> = [];
   const persistCalls: RefreshOutcome[] = [];
   const onOutcomeCalls: Array<{ kind: "success" | "failure"; outcome: RefreshOutcome }> = [];
@@ -235,6 +262,7 @@ describe("KgRefresh durable workflow", () => {
     const scenario = scenarios.get(triggerId);
     if (!scenario) throw new Error(`no scenario registered for trigger ${triggerId}`);
     scenario.dispatchCalls++;
+    dispatchedIds.push(input.dispatchId);
     return {
       outcome: scenario.dispatchOutcome, runId: scenario.runId,
       jobId: `job-${triggerId}`, executionMode: scenario.executionMode,
@@ -273,23 +301,34 @@ describe("KgRefresh durable workflow", () => {
   const workflow = createKgRefreshWorkflow({
     rail,
     kgSourceRepo: KG_SOURCE_REPO,
-    mintRunTokens: () => ({ runToken: "run-token", progressToken: "progress-token" }),
+    mintRunTokens: (input) => {
+      mintedDispatchIds.push(input.dispatchId);
+      return { runToken: "run-token", progressToken: "progress-token" };
+    },
     dispatch: dispatchFn,
     appendJobLog: (input) => {
       appendJobLogCalls.push(input);
+      if (reserveFailuresRemaining > 0) {
+        reserveFailuresRemaining--;
+        throw new restate.TerminalError("forced one-shot reserve failure for the release-order test");
+      }
       if (forceReserveFailure) throw new restate.TerminalError("forced reserve failure for the outer-catch release test");
     },
     closeJobLog: (jobId, status, conclusion) => { closeRowCalls.push({ jobId, status, conclusion }); },
     getWorkflowRunStatus: getWorkflowRunStatusFn,
     findRunByTitle: findRunByTitleFn,
     cancelWorkflowRun: cancelWorkflowRunFn,
-    persistLastRefresh: (outcome) => {
+    persistLastRefresh: async (outcome) => {
+      if (persistHold) {
+        const held = persistHold;
+        persistHold = null;
+        await held;
+      }
       persistCalls.push(outcome);
       if (forcePersistFailure) throw new restate.TerminalError("forced persist failure for the outer-catch release test");
     },
     onOutcome: (kind, outcome) => { onOutcomeCalls.push({ kind, outcome }); },
     fireSettled: () => { settledCalls++; },
-    beforeGate: (name) => beforeGateImpl(name),
     bootstrapDeadlineMs: BOOTSTRAP_DEADLINE_MS,
     totalDeadlineMs: TOTAL_DEADLINE_MS,
     watchIntervalMs: WATCH_INTERVAL_MS,
@@ -366,6 +405,9 @@ describe("KgRefresh durable workflow", () => {
       const beforeFetchTarball = fetchTarballCallCount;
       const beforeMaterialize = materializeCallCount;
       const beforeRestart = restartCallCount;
+      const beforeDispatched = dispatchedIds.length;
+      const beforeMinted = mintedDispatchIds.length;
+      const beforeJobLog = appendJobLogCalls.length;
 
       const done = attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
       await until(() => scenarios.get(triggerId)!.dispatchCalls === 1);
@@ -373,6 +415,11 @@ describe("KgRefresh durable workflow", () => {
 
       const outcome = await done;
       expect(outcome.ok).toBe(true);
+      // one dispatch id names the token mint, the job-log row, and the dispatch itself
+      const dispatchedId = dispatchedIds[beforeDispatched];
+      expect(dispatchedIds.length - beforeDispatched).toBe(1);
+      expect(mintedDispatchIds.slice(beforeMinted)).toEqual([dispatchedId]);
+      expect(appendJobLogCalls.slice(beforeJobLog).map((c) => c.dispatchId)).toEqual([dispatchedId]);
       expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(1);
       expect(deleteBranchFn.mock.calls.length - beforeDeleteBranch).toBe(1);
       // one run of each rail gate's own side effect: fetchGate calls fetchTarball once,
@@ -515,6 +562,55 @@ describe("KgRefresh durable workflow", () => {
       await untilAsync(async () => (await kgRepoStatus(env.baseUrl())) === null);
     },
     15_000,
+  );
+
+  // ---- release order: `release` follows failurePath (ADR 032, Consequences) ----
+  it.each(VARIANTS.map(([label]) => label))(
+    "a trigger during the failure path is rejected until it finishes, and the last persist is the new run's (%s)",
+    async (label) => {
+      const env = envFor(label);
+      reserveFailuresRemaining = 1;
+      const hold = boundedLatch(STATUS_LATCH_MAX_MS);
+      persistHold = hold.promise;
+      const persistsBefore = persistCalls.length;
+
+      try {
+        const first = await triggerViaKgRepo(env.baseUrl());
+        expect(first).not.toHaveProperty("status");
+        const firstId = (first as { triggerId: string }).triggerId;
+
+        // The first run failed at `reserve` and is parked inside failurePath's `persist`.
+        // It has not released, so a second trigger must be refused, not start a run.
+        await until(() => appendJobLogCalls.length > 0);
+        const during = await triggerViaKgRepo(env.baseUrl());
+        expect(during, "release must wait for failurePath").toHaveProperty("status");
+        expect(persistCalls.length).toBe(persistsBefore);
+
+        hold.release();
+        await until(() => persistCalls.length === persistsBefore + 1);
+        await untilAsync(async () => (await kgRepoStatus(env.baseUrl())) === null);
+
+        const second = await triggerViaKgRepo(env.baseUrl());
+        expect(second).not.toHaveProperty("status");
+        const secondId = (second as { triggerId: string }).triggerId;
+        expect(secondId).not.toBe(firstId);
+        makeScenario(secondId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+        await until(() => scenarios.get(secondId)!.dispatchCalls === 1);
+        await callWorkflow(env.baseUrl(), "KgRefresh", secondId, "cancel", { reason: "test cleanup" });
+        await attachWorkflow(env.baseUrl(), "KgRefresh", secondId);
+        await untilAsync(async () => (await kgRepoStatus(env.baseUrl())) === null);
+
+        // The failed run's persist landed first; the new run's outcome is the final record.
+        expect(persistCalls.length).toBe(persistsBefore + 2);
+        const [failed, latest] = persistCalls.slice(persistsBefore);
+        expect(failed.detail).toContain("forced one-shot reserve failure");
+        expect(latest.detail).not.toContain("forced one-shot reserve failure");
+        expect(latest.at).toBeGreaterThanOrEqual(failed.at);
+      } finally {
+        hold.release();
+      }
+    },
+    30_000,
   );
 
   // ---- W2: idempotency-key semantics on `report` ----
@@ -778,20 +874,18 @@ describe("KgRefresh durable workflow", () => {
       const env = envFor(label);
       const triggerId = newTriggerId();
       makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
-      delete process.env.KG_SIDECAR_URL; // verifyGate's first check throws RailGateError("answers", ...) immediately
 
       const done = runWorkflow(env.baseUrl(), triggerId);
       await until(() => scenarios.get(triggerId)!.dispatchCalls === 1);
 
       // verifyGate's first check (the "answers" gate) is a synchronous env-var read with no
       // suspension point of its own, so the step is set and the gate fails within the same
-      // tick — well under a 10ms poll's granularity. Hold it open via beforeGate until the
-      // poll has actually observed "verify", then release it to fail exactly as before.
-      let releaseVerifyGate: () => void = () => {};
-      const verifyGateLatch = new Promise<void>((resolve) => { releaseVerifyGate = resolve; });
-      beforeGateImpl = async (name) => {
-        if (name === "verify") await verifyGateLatch;
-      };
+      // tick — well under a 10ms poll's granularity. Verify's canary is its first call into
+      // the rail fakes, so hold that sidecar call open until the poll has actually observed
+      // "verify", then let the sidecar die so the gate fails, at the canary, as a real one would.
+      const verifyLatch = boundedLatch(STATUS_LATCH_MAX_MS);
+      const releaseVerifyGate = verifyLatch.release;
+      holdNextMcpCall = verifyLatch.promise;
 
       // Poll `status` concurrently with the run so it observes the "verify" step while the
       // workflow is still executing it — a single point-in-time check would race the failure
@@ -820,11 +914,11 @@ describe("KgRefresh durable workflow", () => {
       await statusPoll;
 
       expect(outcome.ok).toBe(false);
-      expect(outcome.gate).toBe("answers");
-      expect(observedSteps.has("verify")).toBe(true);
+      expect(outcome.gate).toBe("canary");
+      expect(observedSteps.has("verify"), `step "verify" was not observed within the ${STATUS_LATCH_MAX_MS}ms latch bound`).toBe(true);
       // swap's own restart (1) plus revertRail's restart while reverting (1).
       expect(restartCallCount).toBe(2);
-      expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("answers");
+      expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("canary");
     },
     15_000,
   );
@@ -835,21 +929,20 @@ describe("KgRefresh durable workflow", () => {
       const env = envFor(label);
       const triggerId = newTriggerId();
       makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
-      // Fail only the first restart (inside swapGate itself); revertRail's own restart call
+      // swapGate's restart call fails with no suspension point of its own, so hold it open
+      // until a concurrent status poll has actually observed "swap", then fail it exactly as
+      // before. The latch is bounded: if the poll never sees "swap" the restart proceeds after
+      // STATUS_LATCH_MAX_MS and the assertion below fails with a named message.
+      // Only the first restart fails (inside swapGate itself); revertRail's own restart call
       // afterward must still succeed so the workflow can report a reverted outcome.
+      const swapLatch = boundedLatch(STATUS_LATCH_MAX_MS);
+      const releaseSwapGate = swapLatch.release;
       let swapAttempts = 0;
       restartImpl = async () => {
         swapAttempts++;
-        if (swapAttempts === 1) throw new RailGateError("staging", "forced swap failure for W14");
-      };
-
-      // swapGate's restart call is a synchronous-looking failure with no suspension point of
-      // its own, so (as in W13) hold it open via beforeGate until a concurrent status poll has
-      // actually observed "swap", then release it to fail exactly as before.
-      let releaseSwapGate: () => void = () => {};
-      const swapGateLatch = new Promise<void>((resolve) => { releaseSwapGate = resolve; });
-      beforeGateImpl = async (name) => {
-        if (name === "swap") await swapGateLatch;
+        if (swapAttempts !== 1) return;
+        await swapLatch.promise;
+        throw new RailGateError("staging", "forced swap failure for W14");
       };
 
       const done = runWorkflow(env.baseUrl(), triggerId);
@@ -879,7 +972,7 @@ describe("KgRefresh durable workflow", () => {
       await statusPoll;
 
       expect(outcome.ok).toBe(false);
-      expect(observedSteps.has("swap")).toBe(true);
+      expect(observedSteps.has("swap"), `step "swap" was not observed within the ${STATUS_LATCH_MAX_MS}ms latch bound`).toBe(true);
       expect(restartCallCount).toBe(2);
       expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("staging");
     },
@@ -999,18 +1092,21 @@ describe("KgRefresh durable workflow", () => {
     // a restart at all. Blocking holds the first attempt open until the restart itself
     // severs it, which is the only way to guarantee the retry lands on the replacement
     // endpoint.
-    let stageCommittedCalls = 0;
+    //
+    // Each endpoint gets its own workflow object, built with the id of the endpoint that
+    // serves it, and the checkpoint records that id on every attempt. A timeout retry on the
+    // original endpoint would record "original" twice; only a real restart can record
+    // "replacement", so the assertion below tells the two apart exactly.
+    const stageCommittedAttempts: string[] = [];
     let releaseLatch: () => void = () => {};
     const latch = new Promise<void>((resolve) => { releaseLatch = resolve; });
-    const afterStageCommitted = async (): Promise<void> => {
-      stageCommittedCalls++;
-      if (stageCommittedCalls === 1) await latch;
-    };
-
-    const crashWorkflow = createKgRefreshWorkflow({
+    const buildCrashWorkflow = (endpointId: string) => createKgRefreshWorkflow({
       rail: railWithCounter,
       kgSourceRepo: KG_SOURCE_REPO,
-      mintRunTokens: () => ({ runToken: "run-token", progressToken: "progress-token" }),
+      mintRunTokens: (input) => {
+      mintedDispatchIds.push(input.dispatchId);
+      return { runToken: "run-token", progressToken: "progress-token" };
+    },
       dispatch: dispatchFn,
       appendJobLog: (input) => { appendJobLogCalls.push(input); },
       closeJobLog: (jobId, status, conclusion) => { closeRowCalls.push({ jobId, status, conclusion }); },
@@ -1020,11 +1116,16 @@ describe("KgRefresh durable workflow", () => {
       persistLastRefresh: (outcome) => { persistCalls.push(outcome); },
       onOutcome: (kind, outcome) => { onOutcomeCalls.push({ kind, outcome }); },
       fireSettled: () => { settledCalls++; },
-      afterStageCommitted,
+      afterStageCommitted: async () => {
+        stageCommittedAttempts.push(endpointId);
+        if (stageCommittedAttempts.length === 1) await latch;
+      },
       bootstrapDeadlineMs: BOOTSTRAP_DEADLINE_MS,
       totalDeadlineMs: TOTAL_DEADLINE_MS,
       watchIntervalMs: WATCH_INTERVAL_MS,
     });
+    const crashWorkflow = buildCrashWorkflow("original");
+    const replacementWorkflow = buildCrashWorkflow("replacement");
 
     const env = await startRetryEnabled([crashWorkflow, kgRepo]);
     let replacement: Awaited<ReturnType<typeof replaceEndpoint>> | undefined;
@@ -1042,16 +1143,17 @@ describe("KgRefresh durable workflow", () => {
       // stageGate writes COMPLETION_MARKER into staging/ as its last action; the checkpoint
       // fires immediately afterward and blocks on the latch.
       const stagingMarker = join(dataRoot, "staging", COMPLETION_MARKER);
-      await until(() => existsSync(stagingMarker) && stageCommittedCalls >= 1, 12_000);
+      await until(() => existsSync(stagingMarker) && stageCommittedAttempts.length >= 1, 12_000);
 
-      replacement = await replaceEndpoint(env, [crashWorkflow, kgRepo]);
+      replacement = await replaceEndpoint(env, [replacementWorkflow, kgRepo]);
       await env.startedRestateContainer.restart();
 
       // The restart severs the blocked first attempt's connection; Restate retries the
       // step on the replacement endpoint, which is the not-yet-blocked second call.
       // A real container restart can take longer than this file's default 10s `until`
       // window — give the resumed retry room to actually land there.
-      await until(() => stageCommittedCalls >= 2, 30_000);
+      await until(() => stageCommittedAttempts.length >= 2, 30_000);
+      expect(stageCommittedAttempts).toEqual(["original", "replacement"]);
 
       // No request may be open against the ingress while the container restarts, so
       // attach only now — after the restart has returned and the resumed step has run.

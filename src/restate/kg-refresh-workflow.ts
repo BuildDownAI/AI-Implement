@@ -70,6 +70,8 @@ export interface KgDispatchInput {
   runConfig: KgRefreshRunInput;
   tokens: { runToken: string; progressToken: string };
   issueIdentifier: string;
+  /** The workflow's own dispatch id — the one its run tokens and `dispatch_log` row carry. */
+  dispatchId: string;
 }
 
 export interface KgRefreshStatusResult {
@@ -84,7 +86,8 @@ export interface KgDispatchResult {
   outcome: "accepted" | "rejected" | "unknown";
   runId?: number;
   runUrl?: string;
-  jobId: string;
+  /** The backend's job id when it reported one; `null` means unknown (the workflow keys its own row by dispatch id). */
+  jobId: string | null;
   executionMode: string;
 }
 
@@ -118,15 +121,10 @@ export interface KgRefreshWorkflowDependencies {
    *  definitive `RailGateError`/`TerminalError` (correct for a real staging failure, wrong for
    *  simulating an infra crash), so the injected fault needs a step of its own, positioned
    *  after "stage" is already committed, to get a genuine (retryable) engine failure instead.
-   *  Production leaves this unset. */
+   *  It cannot move onto a rail fake: "swap" is not idempotent (it renames staging into
+   *  current), so a crash inside "swap" cannot be retried, and "stage" itself would re-run.
+   *  Production leaves this unset; `createProductionKgRefreshServices` is asserted to. */
   afterStageCommitted?(): void | Promise<void>;
-  /** Invoked, and awaited, immediately before a gate's own function runs — after `step` is
-   *  already set to that gate's name. Lets a fault-injection test hold a gate open long
-   *  enough for a concurrent `status()` poll to observe the step: a gate's own first check
-   *  can be a synchronous failure with no natural suspension point, so without this hook the
-   *  step is set and the gate fails within the same tick, under most polling granularities.
-   *  Production leaves this unset. */
-  beforeGate?(name: string): void | Promise<void>;
 }
 
 type WaitOutcome =
@@ -170,6 +168,9 @@ function parseGateFailure(message: string): { gate: RefreshGate; detail: string 
   return { gate: "preflight", detail: message };
 }
 
+/** Prefix of the `TerminalError` `report` throws for a second, different body; the ingress client matches on it. */
+export const KG_CONFLICTING_REPORT_MESSAGE_PREFIX = "conflicting report";
+
 export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
   const { owner, repo: repoName } = parseKgSourceRepo(deps.kgSourceRepo);
   const bootstrapDeadlineMs = deps.bootstrapDeadlineMs ?? KG_REFRESH_BOOTSTRAP_DEADLINE_MS;
@@ -186,7 +187,6 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       name,
       async () => {
         try {
-          await deps.beforeGate?.(name);
           return await gate(deps.rail, input);
         } catch (err) {
           if (err instanceof RailGateError) {
@@ -254,7 +254,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       ctx.set("step", "dispatch");
       const dispatchResult = await ctx.run(
         "dispatch",
-        () => deps.dispatch({ runConfig: input, tokens: { runToken, progressToken }, issueIdentifier }),
+        () => deps.dispatch({ runConfig: input, tokens: { runToken, progressToken }, issueIdentifier, dispatchId }),
         { maxRetryAttempts: 3 },
       );
 
@@ -526,21 +526,27 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       return finish(successOutcome);
     } catch (err) {
       if (await ctx.get<boolean>("completed")) throw err;
-      // Sent before failurePath, not after: an invocation cancel can make failurePath's own
-      // ctx.run throw, which would otherwise skip finish() and leak KgRepo's lock forever.
-      // A second release from finish() below (the normal case) is a harmless no-op re-send.
-      ctx.genericSend({
-        service: "KgRepo",
-        method: "release",
-        key: deps.kgSourceRepo,
-        parameter: { triggerId },
-        inputSerde: restate.serde.json,
-      });
+      // Release order (ADR 032, Consequences): `release` is sent only after failurePath has
+      // written `persist` and `close-row`, so a new refresh can never start while this failed
+      // run still has a last-refresh write pending — a late `persist` cannot overwrite a newer
+      // run's outcome. The `finally` still releases when failurePath itself throws (an
+      // invocation cancel), so the lock cannot leak. finish()'s own release is a harmless
+      // duplicate no-op.
       ctx.set("step", "failed");
       const at = await ctx.date.now();
       const detail = err instanceof Error ? err.message : String(err);
-      const outcome = await failurePath(buildFailureOutcome(at, detail), "workflow_error");
-      return finish(outcome);
+      try {
+        const outcome = await failurePath(buildFailureOutcome(at, detail), "workflow_error");
+        return await finish(outcome);
+      } finally {
+        ctx.genericSend({
+          service: "KgRepo",
+          method: "release",
+          key: deps.kgSourceRepo,
+          parameter: { triggerId },
+          inputSerde: restate.serde.json,
+        });
+      }
     }
   }
 
@@ -559,7 +565,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
     if (existing !== undefined) {
       if (!isDuplicate) {
         throw new restate.TerminalError(
-          `conflicting report: existing=${JSON.stringify(existing)} incoming=${JSON.stringify(body)}`,
+          `${KG_CONFLICTING_REPORT_MESSAGE_PREFIX}: existing=${JSON.stringify(existing)} incoming=${JSON.stringify(body)}`,
         );
       }
       return { status: "duplicate" };
