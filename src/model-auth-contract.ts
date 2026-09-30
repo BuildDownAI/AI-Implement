@@ -442,10 +442,54 @@ export function parseModelAuthCheckoutRequest(raw: unknown): ValidationResult<Mo
   return ok({ version: 1, profileId: profileId.value });
 }
 
-/** API credential (API-key and Bedrock modes). Secret-bearing. */
+/** API credential (Anthropic/OpenAI API-key modes). Secret-bearing. */
 export interface ApiCredentialSecret {
   readonly kind: "api-key";
   readonly apiKey: string;
+}
+
+/** AWS credential bundle (Bedrock mode only). Secret-bearing. */
+export interface AwsBedrockSecret {
+  readonly kind: "aws-bedrock";
+  readonly region: string;
+  readonly accessKeyId: string;
+  readonly secretAccessKey: string;
+  readonly sessionToken?: string;
+}
+
+export const MAX_AWS_REGION_LENGTH = 32;
+export const MAX_AWS_ACCESS_KEY_ID_LENGTH = 128;
+export const MAX_AWS_SECRET_ACCESS_KEY_LENGTH = MAX_API_CREDENTIAL_LENGTH;
+export const MAX_AWS_SESSION_TOKEN_LENGTH = MAX_API_CREDENTIAL_LENGTH;
+
+const AWS_REGION_PATTERN = /^[a-z]{2,4}(?:-[a-z0-9]+)+$/;
+
+/** Strict shape check; errors name fields only, never values. */
+function parseAwsBedrockSecret(s: Record<string, unknown>): ValidationResult<AwsBedrockSecret> {
+  const unknown = rejectUnknownKeys(
+    s,
+    ["kind", "region", "accessKeyId", "secretAccessKey", "sessionToken"],
+    "checkout secret",
+  );
+  if (!unknown.ok) return unknown;
+  if (s.kind !== "aws-bedrock") return err("checkout secret kind must be 'aws-bedrock' for Bedrock mode");
+  const region = validateBoundedSecret(s.region, "region", MAX_AWS_REGION_LENGTH);
+  if (!region.ok) return region;
+  if (!AWS_REGION_PATTERN.test(region.value)) return err("region is not a valid AWS region identifier");
+  const accessKeyId = validateBoundedSecret(s.accessKeyId, "accessKeyId", MAX_AWS_ACCESS_KEY_ID_LENGTH);
+  if (!accessKeyId.ok) return accessKeyId;
+  const secretAccessKey = validateBoundedSecret(s.secretAccessKey, "secretAccessKey", MAX_AWS_SECRET_ACCESS_KEY_LENGTH);
+  if (!secretAccessKey.ok) return secretAccessKey;
+  const base = {
+    kind: "aws-bedrock" as const,
+    region: region.value,
+    accessKeyId: accessKeyId.value,
+    secretAccessKey: secretAccessKey.value,
+  };
+  if (s.sessionToken === undefined) return ok(base);
+  const sessionToken = validateBoundedSecret(s.sessionToken, "sessionToken", MAX_AWS_SESSION_TOKEN_LENGTH);
+  if (!sessionToken.ok) return sessionToken;
+  return ok({ ...base, sessionToken: sessionToken.value });
 }
 
 /** Subscription session state (Claude and Codex). Secret-bearing. */
@@ -455,7 +499,7 @@ export interface SessionStateSecret {
   readonly stateSequence: number;
 }
 
-export type ModelAuthSecret = ApiCredentialSecret | SessionStateSecret;
+export type ModelAuthSecret = ApiCredentialSecret | AwsBedrockSecret | SessionStateSecret;
 
 /** Secret-bearing; send only over authenticated transport. Never persist, log, or project. */
 export interface ModelAuthCheckoutResponseV1 {
@@ -532,9 +576,20 @@ export function parseModelAuthCheckoutResponse(raw: unknown): ValidationResult<M
     });
   }
   if (r.ownerGeneration !== undefined) return err("ownerGeneration is only allowed for subscription auth modes");
+  if (authMode.value === "bedrock") {
+    const bedrock = parseAwsBedrockSecret(s);
+    if (!bedrock.ok) return bedrock;
+    return ok({
+      version: 1,
+      ok: true,
+      profileId: profileId.value,
+      authMode: authMode.value,
+      secret: bedrock.value,
+    });
+  }
   const su = rejectUnknownKeys(s, ["kind", "apiKey"], "checkout secret");
   if (!su.ok) return su;
-  if (s.kind !== "api-key") return err("checkout secret kind must be 'api-key' for API-key and Bedrock modes");
+  if (s.kind !== "api-key") return err("checkout secret kind must be 'api-key' for API-key modes");
   const apiKey = validateBoundedSecret(s.apiKey, "apiKey", MAX_API_CREDENTIAL_LENGTH);
   if (!apiKey.ok) return apiKey;
   return ok({
@@ -544,6 +599,33 @@ export function parseModelAuthCheckoutResponse(raw: unknown): ValidationResult<M
     authMode: authMode.value,
     secret: { kind: "api-key", apiKey: apiKey.value },
   });
+}
+
+/**
+ * Pure: verifies a parsed checkout response against the profile the client
+ * requested and the authenticated grant's bindings. The checkout client MUST
+ * call this before using the secret.
+ */
+export function checkCheckoutResponseAgainstBindings(
+  requestedProfileId: string,
+  response: Pick<ModelAuthCheckoutResponseV1, "profileId" | "authMode" | "ownerGeneration">,
+  bindings: readonly ModelAuthGrantBinding[],
+): ValidationResult<ModelAuthGrantBinding> {
+  if (response.profileId !== requestedProfileId) return err("checkout response profile does not match the request");
+  const binding = bindings.find((b) => b.profileId === requestedProfileId);
+  if (!binding) return err("profile is not allowed by the grant");
+  if (binding.authMode !== response.authMode) return err("checkout auth mode does not match the grant binding");
+  const subscription = isSubscriptionAuthMode(binding.authMode);
+  if (subscription !== (binding.ownerGeneration !== undefined)) return err("grant binding owner generation is inconsistent");
+  if (subscription) {
+    if (response.ownerGeneration === undefined) return err("checkout response is missing the owner generation");
+    if (response.ownerGeneration !== binding.ownerGeneration) {
+      return err("checkout owner generation does not match the grant binding");
+    }
+  } else if (response.ownerGeneration !== undefined) {
+    return err("checkout owner generation is not allowed for this binding");
+  }
+  return ok(binding);
 }
 
 // ---------------------------------------------------------------------------

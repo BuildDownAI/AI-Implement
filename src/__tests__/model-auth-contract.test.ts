@@ -3,6 +3,7 @@ import {
   MAX_API_CREDENTIAL_LENGTH,
   MAX_SESSION_DATA_LENGTH,
   MODEL_AUTH_FAILURE_CATEGORIES,
+  checkCheckoutResponseAgainstBindings,
   checkCheckpointAgainstBindings,
   checkSealedBinding,
   classifyCheckpointSequence,
@@ -197,6 +198,85 @@ describe("checkout", () => {
     );
     expect(oversize).not.toContain(SECRET);
     expect(parseModelAuthCheckoutResponse({ ...api, extra: 1 }).ok).toBe(false);
+  });
+});
+
+describe("bedrock checkout secret", () => {
+  const AKID = "AKIASYNTHETICKEY0001";
+  const ASK = "synthetic-aws-secret-key-xyz";
+  const TOKEN = "synthetic-session-token-abc";
+  const bundle = { kind: "aws-bedrock", region: "us-east-1", accessKeyId: AKID, secretAccessKey: ASK };
+  const resp = (secret: unknown, extra: Record<string, unknown> = {}) => ({
+    version: 1, ok: true, profileId: "prof-bed", authMode: "bedrock", secret, ...extra,
+  });
+
+  it("round-trips with and without a session token", () => {
+    for (const secret of [bundle, { ...bundle, sessionToken: TOKEN }]) {
+      const input = resp(secret);
+      const result = parseModelAuthCheckoutResponse(input);
+      expect(result.ok).toBe(true);
+      expect(result.ok && result.value).toEqual(input);
+    }
+  });
+
+  it("rejects wrong discriminants and owner generation", () => {
+    expect(parseModelAuthCheckoutResponse(resp({ kind: "api-key", apiKey: SECRET })).ok).toBe(false);
+    expect(parseModelAuthCheckoutResponse(resp({ kind: "session", sessionData: SECRET, stateSequence: 0 })).ok).toBe(false);
+    expect(parseModelAuthCheckoutResponse(resp(bundle, { ownerGeneration: 1 })).ok).toBe(false);
+    for (const authMode of ["anthropic-api-key", "openai-api-key"]) {
+      expect(parseModelAuthCheckoutResponse(resp(bundle, { authMode })).ok).toBe(false);
+    }
+    expect(
+      parseModelAuthCheckoutResponse(resp(bundle, { authMode: "codex-subscription", ownerGeneration: 1 })).ok,
+    ).toBe(false);
+  });
+
+  it("rejects malformed fields without echoing values", () => {
+    const bad: unknown[] = [
+      { ...bundle, extra: ASK },
+      { ...bundle, region: "" },
+      { ...bundle, region: "Not A Region" },
+      { ...bundle, accessKeyId: "" },
+      { ...bundle, accessKeyId: AKID + "x".repeat(200) },
+      { ...bundle, secretAccessKey: ASK + "x".repeat(MAX_API_CREDENTIAL_LENGTH) },
+      { ...bundle, sessionToken: TOKEN + "x".repeat(MAX_API_CREDENTIAL_LENGTH) },
+      { ...bundle, sessionToken: "" },
+      { ...bundle, sessionToken: 5 },
+      { ...bundle, secretAccessKey: 5 },
+      { kind: "aws-bedrock", region: "us-east-1", accessKeyId: AKID },
+    ];
+    for (const secret of bad) {
+      const error = errorOf(parseModelAuthCheckoutResponse(resp(secret)));
+      for (const v of [AKID, ASK, TOKEN]) expect(error).not.toContain(v);
+    }
+  });
+});
+
+describe("checkout binding check", () => {
+  const bindings = [apiBinding, subBinding];
+  const apiResp = { profileId: "prof-api", authMode: "openai-api-key" as const };
+  const subResp = { profileId: "prof-sub", authMode: "codex-subscription" as const, ownerGeneration: 3 };
+
+  it("passes on exact matches", () => {
+    expect(checkCheckoutResponseAgainstBindings("prof-api", apiResp, bindings).ok).toBe(true);
+    expect(checkCheckoutResponseAgainstBindings("prof-sub", subResp, bindings).ok).toBe(true);
+  });
+
+  it("fails on wrong profile, auth mode, or generation", () => {
+    expect(checkCheckoutResponseAgainstBindings("prof-sub", apiResp, bindings).ok).toBe(false);
+    expect(checkCheckoutResponseAgainstBindings("prof-none", { ...apiResp, profileId: "prof-none" }, bindings).ok).toBe(false);
+    expect(checkCheckoutResponseAgainstBindings("prof-api", { ...apiResp, authMode: "bedrock" }, bindings).ok).toBe(false);
+    expect(checkCheckoutResponseAgainstBindings("prof-sub", { ...subResp, authMode: "claude-subscription" }, bindings).ok).toBe(false);
+    expect(checkCheckoutResponseAgainstBindings("prof-sub", { ...subResp, ownerGeneration: 4 }, bindings).ok).toBe(false);
+    expect(checkCheckoutResponseAgainstBindings("prof-sub", { ...subResp, ownerGeneration: undefined }, bindings).ok).toBe(false);
+    expect(checkCheckoutResponseAgainstBindings("prof-api", { ...apiResp, ownerGeneration: 1 }, bindings).ok).toBe(false);
+  });
+
+  it("fails on conflicting bindings", () => {
+    const noGen = { ...subBinding, ownerGeneration: undefined };
+    const strayGen = { ...apiBinding, ownerGeneration: 1 };
+    expect(checkCheckoutResponseAgainstBindings("prof-sub", subResp, [noGen]).ok).toBe(false);
+    expect(checkCheckoutResponseAgainstBindings("prof-api", { ...apiResp, ownerGeneration: 1 }, [strayGen]).ok).toBe(false);
   });
 });
 
