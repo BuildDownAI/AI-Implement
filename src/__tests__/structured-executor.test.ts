@@ -48,7 +48,7 @@ describe("structured Claude CLI results", () => {
       { type: "result", subtype: "success", is_error: false, result: "```json\nnot valid JSON\n```", structured_output: verdict,
         usage: { input_tokens: 20, output_tokens: 5 } },
     ]);
-    const result = await executor.invoke({ prompt: "Review this", model: "claude-sonnet-5", jsonSchema: schema });
+    const result = await executor.invoke({ prompt: "Review this", model: "claude-sonnet-5-5", jsonSchema: schema });
     const call: unknown[] = spawnMock.mock.calls[0];
     const args = call[1] as string[];
     expect(args[args.indexOf("--output-format") + 1]).toBe("stream-json");

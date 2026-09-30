@@ -1,6 +1,6 @@
 ---
 # Set a model ID accepted by this repository's configured provider.
-model: claude-sonnet-5
+model: claude-sonnet-5-5
 ---
 
 <!--

@@ -1790,6 +1790,9 @@ describe("kg-refresh", () => {
       try {
         await handle.trigger();
         await waitForStage("ingest-running");
+        // Settle the re-dispatched refresh before the handle is rebuilt on the same dataRoot.
+        handle.onMachineLost();
+        await waitDone();
       } finally {
         spy.mockRestore();
       }
@@ -1809,7 +1812,7 @@ describe("kg-refresh", () => {
       // stage="failed" is not "ingest-running", so onRunnerComplete must return immediately.
       handle.onRunnerComplete("failure", { failureCode: "TIMEOUT" });
       // Give any async paths a chance to run.
-      await new Promise((r) => setTimeout(r, 50));
+      await waitDone();
       expect(onOutcome2).not.toHaveBeenCalled();
     });
 
@@ -1824,9 +1827,11 @@ describe("kg-refresh", () => {
       const spy = vi.spyOn(Date, "now").mockReturnValue(advancedNow);
       try {
         await handle.trigger();
-        // The synchronous TTL block in trigger() fires onOutcome before returning.
-        // Wait briefly for the async void call to resolve.
-        await new Promise((r) => setTimeout(r, 20));
+        // The synchronous TTL block in trigger() fires onOutcome before it re-dispatches.
+        // Settle the re-dispatched refresh so it stops writing to dataRoot before afterEach.
+        await waitForStage("ingest-running");
+        handle.onMachineLost();
+        await waitDone();
       } finally {
         spy.mockRestore();
       }
@@ -1854,7 +1859,7 @@ describe("kg-refresh", () => {
       await handle.trigger();
       await waitForStage("ingest-running");
       handle.onMachineLost();
-      await new Promise((r) => setTimeout(r, 20));
+      await waitDone();
       const failCall = onOutcome.mock.calls.find(([outcome]) => outcome === "failure");
       expect(failCall).toBeDefined();
       expect(failCall![1]).toMatchObject({ timedOut: true });
@@ -1867,7 +1872,7 @@ describe("kg-refresh", () => {
       await handle.trigger();
       await waitForStage("ingest-running");
       handle.onMachineLost();
-      await new Promise((r) => setTimeout(r, 20));
+      await waitDone();
       expect(closeJobLog).toHaveBeenCalledWith(55, "timed_out");
     });
 
@@ -1877,7 +1882,7 @@ describe("kg-refresh", () => {
       await handle.trigger();
       await waitForStage("ingest-running");
       handle.onMachineLost();
-      await new Promise((r) => setTimeout(r, 20));
+      await waitDone();
       expect(consoleSpy).toHaveBeenCalledWith(
         "[kg-refresh] machine absent — reaper closed the ingest runner job",
       );
@@ -2080,7 +2085,7 @@ describe("kg-refresh", () => {
       await handle.trigger();
       await waitForStage("ingest-running");
       handle.onRunnerComplete("failure", { failureCode: "KG_SNAPSHOT_STALE" });
-      await new Promise((r) => setTimeout(r, 50));
+      await waitDone();
       expect(closeJobLog).toHaveBeenCalledWith(99, "completed");
     });
 
@@ -2210,7 +2215,7 @@ describe("kg-refresh", () => {
       await waitForStage("ingest-running");
 
       handle.onMachineLost({ failureCode: "operator_cancelled" });
-      await new Promise((r) => setTimeout(r, 20));
+      await waitDone();
 
       expect(closeJobLog).toHaveBeenCalledOnce();
       expect(closeJobLog).toHaveBeenCalledWith(55, "timed_out");
@@ -2235,7 +2240,7 @@ describe("kg-refresh", () => {
 
       // Admin cancel fires onMachineLost — chain closes, job id cleared internally.
       handle.onMachineLost();
-      await new Promise((r) => setTimeout(r, 20));
+      await waitDone();
       expect(closeJobLog).toHaveBeenCalledOnce();
 
       // Advance clock past TTL and call trigger() again — watchdog check runs but

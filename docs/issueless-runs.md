@@ -484,7 +484,7 @@ There is no automatic re-dispatch on failure. The rail advances only when an ope
 
 ### Report-issue posting
 
-On `"failure"` outcomes, if `kgRefreshReportIssue` is configured (DB setting editable at `/admin#settings`), `handleKgRefreshOutcome()` looks up that Linear issue identifier and posts a failure comment to it via the orchestrator's own credentials. This is the only tracker write an issueless run kind ever makes — and it uses the orchestrator's credentials, not the runner's.
+On `"failure"` outcomes, if `kgRefreshReportIssue` is configured (DB setting editable at `/admin#settings`), `handleKgRefreshOutcome()` looks that issue key up in every configured tracker (`ProviderRegistry.findByKeyInAnyTracker`) and posts a failure comment to the single tracker that holds it via the orchestrator's own credentials. This is the only tracker write an issueless run kind ever makes — and it uses the orchestrator's credentials, not the runner's. A key found in two trackers is ambiguous: nothing is posted and a warning is logged.
 
 The comment includes the failure code and dispatch ID for correlation.
 

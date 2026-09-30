@@ -1481,6 +1481,9 @@ export const stepperScript = `
     if (secretFailures > 0) {
       notices.push(secretFailures + ' secret(s) failed to save. Add them via the Secrets button on the Projects page.');
     }
+    if (Array.isArray(resData.warnings)) {
+      resData.warnings.forEach(function (w) { notices.push(String(w)); });
+    }
     if (notices.length) {
       // Use a brief timeout so the modal closes first
       setTimeout(function () { alert('Project created.\\n\\n' + notices.join('\\n\\n')); }, 100);

@@ -30,6 +30,9 @@ function ensureDispatchedColumns(): void {
   if (!names.has("issue_title")) {
     db.exec("ALTER TABLE dispatched ADD COLUMN issue_title TEXT");
   }
+  if (!names.has("team_key")) {
+    db.exec("ALTER TABLE dispatched ADD COLUMN team_key TEXT");
+  }
 }
 
 function ensureAdminSessionColumns(): void {
@@ -531,14 +534,15 @@ export function isAlreadyDispatched(issueId: string): boolean {
 
 export function markDispatched(
   issueId: string,
+  teamKey: string,
   issueIdentifier?: string,
   issueTitle?: string,
 ): void {
   getDb()
     .prepare(
-      "INSERT OR REPLACE INTO dispatched (issue_id, dispatched_at, issue_identifier, issue_title) VALUES (?, ?, ?, ?)",
+      "INSERT OR REPLACE INTO dispatched (issue_id, dispatched_at, issue_identifier, issue_title, team_key) VALUES (?, ?, ?, ?, ?)",
     )
-    .run(issueId, Date.now(), issueIdentifier ?? null, issueTitle ?? null);
+    .run(issueId, Date.now(), issueIdentifier ?? null, issueTitle ?? null, teamKey);
 }
 
 export interface DedupEntry {
@@ -574,6 +578,14 @@ export function getDispatchedIds(): string[] {
       .prepare("SELECT issue_id FROM dispatched")
       .all() as Array<{ issue_id: string }>
   ).map((row) => row.issue_id);
+}
+
+export function getDispatchedRows(): Array<{ issueId: string; teamKey: string | null }> {
+  return (
+    getDb()
+      .prepare("SELECT issue_id, team_key FROM dispatched")
+      .all() as Array<{ issue_id: string; team_key: string | null }>
+  ).map((row) => ({ issueId: row.issue_id, teamKey: row.team_key ?? null }));
 }
 
 export function deleteDispatched(issueId: string): boolean {

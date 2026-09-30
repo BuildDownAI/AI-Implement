@@ -4,6 +4,7 @@ import { REVIEW_VERDICT_JSON_SCHEMA, parseReviewVerdict, plainIssueText } from "
 import { wrapWithPlanningGuard } from "../../planning-context-assembly.js";
 import { READ_ONLY_ALLOWED_TOOLS } from "./read-only-tools.js";
 import { classifyLlmResult, envSecrets, oneLinerMessage, type FailureRecord } from "../failure-classification.js";
+import { DEFAULT_MODEL } from "../default-model.js";
 
 interface ReviewInputs extends Record<string, unknown> {
   model?: string;
@@ -111,7 +112,7 @@ export const reviewStep: StepModule<ReviewInputs, ReviewOutputs> = {
     const { retryPolicy } = context.data;
     const result = await context.llmExecutor.invoke({
       prompt,
-      model: model ?? "claude-sonnet-5",
+      model: model ?? DEFAULT_MODEL,
       tools: READ_ONLY_ALLOWED_TOOLS,
       jsonSchema: REVIEW_VERDICT_JSON_SCHEMA,
       stage: "review",

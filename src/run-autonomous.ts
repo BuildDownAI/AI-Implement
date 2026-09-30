@@ -47,6 +47,7 @@ import {
 } from "./pipeline/finding-dispositions.js";
 import { readCycleSummaries } from "./pipeline/cycle-summary.js";
 import type { GhSpawn } from "./pipeline/review-ledger.js";
+import { DEFAULT_MODEL } from "./pipeline/default-model.js";
 
 /**
  * Runner-activity wiring for one autonomous run (AII-798). `sink` is handed to the
@@ -776,7 +777,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     appendPipelineOwnedGitInstructions(implementationPrompt, prNumber),
   );
   implementationPrompt = appendOperatorInstruction(implementationPrompt, commentInstruction);
-  const model = claudeModel || workflowModel || "claude-sonnet-5";
+  const model = claudeModel || workflowModel || DEFAULT_MODEL;
   const activityReporting = opts.activityReporting ?? resolveActivityReporting(reviewFix, callbackUrl, progressToken, opts.fetchImpl);
   const activityReportingConfig: ActivityReportingConfig | undefined = activityReporting
     ? { attemptId: activityReporting.attemptId, sink: activityReporting.sink }
@@ -1323,7 +1324,7 @@ export async function runAutonomousLocally(
   implementationPrompt = appendValidationCommandDiscipline(
     appendPipelineOwnedGitInstructions(implementationPrompt, ""),
   );
-  const model = opts.model ?? workflowModel ?? "claude-sonnet-5";
+  const model = opts.model ?? workflowModel ?? DEFAULT_MODEL;
   const llmExecutor = opts.llmExecutor ?? new ClaudeCliExecutor(workspaceDir, "summary");
   const reporter = opts.reporter ?? new NoopStepReporter();
 

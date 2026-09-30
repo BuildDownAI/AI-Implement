@@ -479,10 +479,17 @@ describe("late readiness", () => {
     await sidecar.start();
     expect(getRestateStatus().sidecar).toEqual({ state: "timeout" });
 
+    const pid = (sidecar as unknown as { _child: { pid?: number } })._child?.pid;
+
     await sidecar.stop(); // SIGTERM ignored → SIGKILL backstop exits the child before it ever answers ready
 
     await expect(sidecar.whenReady()).resolves.toBe(false);
-    expect(getRestateStatus().sidecar).toEqual({ state: "exited", code: null, signal: "SIGKILL" });
+    const sidecarStatus = getRestateStatus().sidecar;
+    // Whether the SIGKILL backstop also fires is shell-dependent, see the note at line 355.
+    expect(sidecarStatus).toMatchObject({ state: "exited", code: null });
+    if (sidecarStatus.state !== "exited") throw new Error("unreachable");
+    expect(["SIGKILL", "SIGTERM"]).toContain(sidecarStatus.signal);
+    expect(() => process.kill(pid!, 0)).toThrow();
   }, 10_000);
 
   it("stop() clears background polling — httpGet call count stabilizes", async () => {

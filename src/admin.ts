@@ -55,7 +55,7 @@ import { getStepsByJobId } from "./step-log.js";
 import { listMachines, destroyMachine, listAppSecrets, setAppSecrets, unsetAppSecret, fetchMachineLogs } from "./fly-machines.js";
 import type { TicketIssue, AIImplementSnapshot } from "./providers/types.js";
 import type { ProviderRegistry } from "./providers/registry.js";
-import { resolveInFlightSiblings, selectBlockers, selectFileOverlapDeferrals, getOrFetchPlanningContexts } from "./poll-selection.js";
+import { resolveInFlightSiblings, selectBlockers, mergeProviderSnapshots, selectForeignTrackerBlockers, type ForeignTrackerIssue, selectFileOverlapDeferrals, getOrFetchPlanningContexts } from "./poll-selection.js";
 import { count as countReservedCapacity } from "./dispatch-admission.js";
 import { read as readDispatchAdmission } from "./dispatch-admission.js";
 import { RESTATE_WRITE_TOOL_NAMES, IDEMPOTENCY_KEY_SHAPE, scopeIdempotencyKey } from "./mcp.js";
@@ -1275,24 +1275,22 @@ async function handleUnparkIssue(req: http.IncomingMessage, res: http.ServerResp
   }
 }
 
-async function fetchMergedSnapshot(registry: ProviderRegistry): Promise<AIImplementSnapshot> {
+async function fetchMergedSnapshot(
+  registry: ProviderRegistry,
+): Promise<{ snapshot: AIImplementSnapshot; foreign: ForeignTrackerIssue[] }> {
   const allMappings = Object.values(getMappings());
   const providers = await registry.forAllMappings(allMappings);
   if (providers.length === 0) {
-    return { needsPlanning: [], readyForImplementation: [], inProgressCountsByScope: {}, parentsToFinalize: [] };
+    return {
+      snapshot: { needsPlanning: [], readyForImplementation: [], inProgressCountsByScope: {}, parentsToFinalize: [] },
+      foreign: [],
+    };
   }
   const snapshots = await Promise.all(providers.map((p) => p.fetchAIImplementSnapshot()));
-  return {
-    needsPlanning: snapshots.flatMap((s) => s.needsPlanning),
-    readyForImplementation: snapshots.flatMap((s) => s.readyForImplementation),
-    inProgressCountsByScope: snapshots.reduce<Record<string, number>>((acc, s) => {
-      for (const [k, v] of Object.entries(s.inProgressCountsByScope)) {
-        acc[k] = (acc[k] ?? 0) + v;
-      }
-      return acc;
-    }, {}),
-    parentsToFinalize: snapshots.flatMap((s) => s.parentsToFinalize),
-  };
+  return mergeProviderSnapshots(
+    providers.map((p, i) => ({ providerId: p.id, snapshot: snapshots[i] })),
+    getMappings(),
+  );
 }
 
 async function resolveIssueUrl(
@@ -1406,7 +1404,7 @@ async function handleListBlockers(
   registry: ProviderRegistry,
 ): Promise<void> {
   try {
-    const snapshot = await fetchMergedSnapshot(registry);
+    const { snapshot, foreign } = await fetchMergedSnapshot(registry);
     const allIssues = [...snapshot.readyForImplementation, ...snapshot.needsPlanning];
     const teamRepoMap = getMappings();
     const dispatchedSet = new Set(getDispatchedIds());
@@ -1433,7 +1431,9 @@ async function handleListBlockers(
       registry,
     );
     const fileOverlapBlockers = selectFileOverlapDeferrals(fileOverlapCandidates, inFlightSiblings, planningContexts);
-    const sorted = [...baseBlockers, ...fileOverlapBlockers].sort(
+    const foreignBlockers = selectForeignTrackerBlockers(foreign);
+    const foreignIds = new Set(foreignBlockers.map((b) => b.issueId));
+    const sorted = [...baseBlockers, ...fileOverlapBlockers, ...foreignBlockers].sort(
       (a, b) =>
         a.reason.localeCompare(b.reason) ||
         a.teamKey.localeCompare(b.teamKey) ||
@@ -1442,7 +1442,10 @@ async function handleListBlockers(
     const blockers = await Promise.all(
       sorted.map(async (b) => ({
         ...b,
-        issueUrl: await resolveIssueUrl(registry, b.teamKey, null, b.issueIdentifier),
+        // The mapping under a foreign blocker's key belongs to another tracker; its URL would be wrong.
+        issueUrl: foreignIds.has(b.issueId)
+          ? null
+          : await resolveIssueUrl(registry, b.teamKey, null, b.issueIdentifier),
       })),
     );
     const teams = new Set(blockers.map((b) => b.teamKey));
@@ -1463,7 +1466,7 @@ async function handleListIssues(
   registry: ProviderRegistry,
 ): Promise<void> {
   try {
-    const snapshot = await fetchMergedSnapshot(registry);
+    const { snapshot } = await fetchMergedSnapshot(registry);
     const allIssues: { issue: TicketIssue; bucket: "ready" | "needs-planning" }[] = [
       ...snapshot.readyForImplementation.map((i) => ({ issue: i, bucket: "ready" as const })),
       ...snapshot.needsPlanning.map((i) => ({ issue: i, bucket: "needs-planning" as const })),
@@ -3167,6 +3170,16 @@ export async function upsertMappingAction(
     if (enablementError) return { status: 400, body: { error: enablementError } };
   }
 
+  // Advisory only: a Linear mapping already holding this key is the one signal we have that it
+  // is a Linear team key (no provider method lists teams). Selection drops that team's issues
+  // as foreign once a Jira mapping holds the key.
+  const warnings: string[] = [];
+  if (ticketing.ticketingProvider === "jira" && existingMapping?.ticketingProvider === "linear") {
+    warnings.push(
+      `Key "${body.teamKey}" is a Linear mapping today. Saving it as a Jira mapping means Linear issues with team key "${body.teamKey}" will no longer be dispatched. Use a different key unless that is intended.`,
+    );
+  }
+
   upsertMapping(body.teamKey, mapping);
   registry.invalidate();
 
@@ -3178,7 +3191,7 @@ export async function upsertMappingAction(
     console.error(`[admin] workflow sync failed for ${body.teamKey}:`, err),
   );
 
-  return { status: 202, body: { teamKey: body.teamKey, ...mapping, syncJobId: id } };
+  return { status: 202, body: { teamKey: body.teamKey, ...mapping, syncJobId: id, ...(warnings.length ? { warnings } : {}) } };
 }
 
 async function handleUpsertMapping(
