@@ -100,6 +100,25 @@ describe("normalizeInvocation", () => {
     expect(normalizeInvocation(snap, { stage: "planning", attribution: 42 })!.attribution).toBe("rejected");
   });
 
+  it("prefers telemetry over claimed usage and flags disagreement", () => {
+    const row = normalizeInvocation(snap, {
+      attribution: claim("review"),
+      telemetry: tel({ tokensIn: 200, tokensOut: 20, costUsd: 1 }),
+    })!;
+    expect([row.usage.tokensIn, row.usage.tokensOut, row.usage.costUsd]).toEqual([200, 20, 1]);
+    expect(row.mismatches).toContain("usage");
+    expect(row.attribution).toBe("mismatch");
+  });
+
+  it("fills gaps from claimed usage when telemetry is null, without flagging", () => {
+    const row = normalizeInvocation(snap, {
+      attribution: claim("review"),
+      telemetry: tel({ tokensIn: 100 }),
+    })!;
+    expect([row.usage.tokensIn, row.usage.tokensOut, row.usage.costUsd]).toEqual([100, 10, 0.5]);
+    expect(row.mismatches).toEqual([]);
+  });
+
   it("returns null when no stage is determinable", () => {
     expect(normalizeInvocation(snap, { attribution: "junk" })).toBeNull();
   });
