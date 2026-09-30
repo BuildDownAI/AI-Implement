@@ -438,14 +438,19 @@ describe("KgRepo object-owned lease expiry", () => {
       const env = pick(production, label);
       const slug = slugOf();
       await callObject(env.baseUrl(), "KgRepo", slug, "trigger", {});
-      const response = await fetch(`${env.adminAPIBaseUrl()}/query`, {
-        method: "POST",
-        headers: { "content-type": "application/json", accept: "application/json" },
-        body: JSON.stringify({
-          query: `SELECT * FROM sys_invocation WHERE target_service_name = 'KgRepo' AND target_service_key = '${slug}' AND target_handler_name = 'expire'`,
-        }),
-      });
-      const rows = ((await response.json()) as { rows: Array<Record<string, unknown>> }).rows;
+      const expireRows = async (): Promise<Array<Record<string, unknown>>> => {
+        const response = await fetch(`${env.adminAPIBaseUrl()}/query`, {
+          method: "POST",
+          headers: { "content-type": "application/json", accept: "application/json" },
+          body: JSON.stringify({
+            query: `SELECT * FROM sys_invocation WHERE target_service_name = 'KgRepo' AND target_service_key = '${slug}' AND target_handler_name = 'expire'`,
+          }),
+        });
+        return ((await response.json()) as { rows: Array<Record<string, unknown>> }).rows;
+      };
+      // The scheduled send is not always visible in sys_invocation the moment trigger returns.
+      await untilAsync(async () => (await expireRows()).length >= 1, 30_000);
+      const rows = await expireRows();
       expect(rows).toHaveLength(1);
       const delay = Date.parse(String(rows[0].scheduled_start_at)) - Date.parse(String(rows[0].created_at));
       expect(Math.abs(delay - (KG_REFRESH_TOTAL_DEADLINE_MS + KG_REPO_STALE_MARGIN_MS))).toBeLessThan(5_000);
