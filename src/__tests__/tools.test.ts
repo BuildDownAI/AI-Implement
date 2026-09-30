@@ -982,6 +982,11 @@ describe("migrated write handlers (AII-713)", () => {
       expect(trigger).toHaveBeenCalledWith({ dryRun: true, acceptNewBaseline: true, ref: "feature/x", actorEmail: "user@example.com" });
     });
 
+    it("passes ref through to KgRepo.trigger", async () => {
+      await call({ ref: "release/1.2" });
+      expect(trigger).toHaveBeenCalledWith(expect.objectContaining({ ref: "release/1.2" }));
+    });
+
     it("defaults dryRun and acceptNewBaseline to false, omits ref, and leaves actorEmail undefined for a null-email caller", async () => {
       await call();
       expect(trigger).toHaveBeenCalledWith({ dryRun: false, acceptNewBaseline: false, actorEmail: undefined });

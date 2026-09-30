@@ -10,7 +10,7 @@ import {
   resolveReviewFixLifecycle,
 } from "./config.js";
 import type { RepoMapping } from "./config.js";
-import { markDispatched, closeDb, getDispatchedRows, deleteDispatched } from "./dedup.js";
+import { markDispatched, closeDb, getDb, getDispatchedRows, deleteDispatched } from "./dedup.js";
 import { reconcileDispatched } from "./dedup-reconcile.js";
 import { canDispatch, acquireDispatch, type DispatchKind, type AcquireDispatchOutcome } from "./dispatch-gate.js";
 import {
@@ -42,6 +42,7 @@ import { canSelfDeploy, makeStartDeploy, readKgSourceRepo, parseKgSourceRepo } f
 import { remediateStuckJob, remediateFailedJob } from "./stuck-watchdog.js";
 import type { StuckWatchdogConfig } from "./stuck-watchdog.js";
 import { handleAdminRequest } from "./admin.js";
+import type { AdminDeps } from "./admin.js";
 import { initLogTable, appendLog, countPriorDispatches, completeOrphanedPlanningJobs, attachJobRunIdIfMissing, updateJobRunId, updateJobStatus, updateJobPrUrl, updateJobMachineDetails, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobById, getJobByMachineId, getJobByDispatchId, resetStuckAttempts, getRecentFailedRunUrls } from "./log.js";
 import { recordDispatchFailure, recordDispatchSuccess, shouldCountFailure, initDispatchBreakerTable, parkIssue, prBudgetParkMessage, isParked } from "./dispatch-breaker.js";
 import type { Job, JobStatus } from "./log.js";
@@ -62,6 +63,7 @@ import { postStatusComment } from "./status-events.js";
 import { buildRunUrl, classifyCompletion, deriveLastSuccessfulStage, monitorFailureCommentPrefix, renderClassification, shouldPostMonitorClassificationComment } from "./completion-classification.js";
 import { createMachine, getMachine, listMachines, destroyMachine, generateSessionToken, generateMachineNonce, buildSessionMachineConfig, listAppSecrets, fetchMachineLogs, updateMachineMetadata, readMachineExitCode } from "./fly-machines.js";
 import { safeDestroyMachine, sweepOrphanedMachines, SWEEP_MACHINE_MAX_AGE_MS } from "./reaper.js";
+import type { ReaperHelpers } from "./reaper.js";
 import { getRunnerMode, getFlySecretsMinVersion, getFlyProcessLevelSecrets, initSettingsTable, resolveExecutionPath, resolvePlanningExecutionPath, resolveRunnerCallbackBaseUrl, checkForcedPathEligibility } from "./runner-mode.js";
 import { handleGitHubWebhook } from "./webhook.js";
 import { enqueueReconciliation, hasReconciliationForPr, initReconciliationTable } from "./reconciliation.js";
@@ -118,6 +120,7 @@ import { listOpenReviewFindings } from "./review-ledger-store.js";
 import { detectMergedPrs, prNumberFromUrl } from "./poll-merged-prs.js";
 import { githubActionsWatchdogDecision, jobTtlDecision } from "./github-actions-watchdog.js";
 import { KgSidecar } from "./kg-sidecar.js";
+import type { KgRefreshIngressClient } from "./restate/kg-refresh-production.js";
 import { createKgRefreshIngressClient } from "./restate/kg-refresh-production.js";
 import { RestateSidecar } from "./restate/server.js";
 import { startRestateEndpoint, register as registerRestateEndpoint, RESTATE_SERVICES } from "./restate/endpoint.js";
@@ -128,11 +131,30 @@ import type { RestateRegisterOutcome, RestateRegisterResult } from "./restate/en
 import { getRestateStatus, setRestateStatus } from "./restate/status.js";
 import type { RestateRegistrationStatus } from "./restate/status.js";
 import { setProviderRegistry } from "./restate/tools.js";
-import { callTool } from "./restate/tools-client.js";
+import { callTool, callToolAsSystem } from "./restate/tools-client.js";
 import { makeKgRefresh, setActiveKgRefresh, runKgRefreshPreflight, defaultFetchDefaultBranch, defaultFetchSnapshotCommitSha, defaultMaterialize, defaultMcpToolCall, defaultPersistLastRefresh, defaultLoadLastRefresh } from "./kg-refresh.js";
 import type { KgRefreshHandle } from "./kg-refresh.js";
 import { beginCycle, isCurrentCycle, getPollStats, runWithDeadline } from "./poll-cycle.js";
-import { monitorKgRefreshGhaJob } from "./monitor-gha.js";
+
+/**
+ * The reaper's helper callbacks. `failKgRefreshMachine` is deliberately absent: the
+ * KgRefresh workflow owns kg-refresh rows, so the reaper's kg-refresh branches are
+ * inert (AII-901).
+ */
+export function makeReaperHelpers(config: AppConfig, registry: ProviderRegistry): ReaperHelpers {
+  return {
+    resetTicket: async (job) => {
+      const provider = await providerForJob(registry, job);
+      if (provider) await resetTicket(provider, job);
+    },
+    postSessionLogs: async (job, context) => {
+      const provider = await providerForJob(registry, job);
+      if (provider) await postSessionLogs(config, provider, job, context);
+    },
+    findPrForIssue: async (repo, issueIdentifier) =>
+      (await findPrForIssue(config, repo, issueIdentifier))?.url ?? null,
+  };
+}
 
 /** Set by startServer(); read by poll() to wire the reaper's kg-refresh failure callback. */
 let activeKgRefresh: KgRefreshHandle | null = null;
@@ -787,19 +809,7 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
   }
 
   // Sweep for orphaned/stale/aged-out Fly machines
-  await sweepOrphanedMachines(reaperConfig(config, registry), {
-    resetTicket: async (job) => {
-      const provider = await providerForJob(registry, job);
-      if (provider) await resetTicket(provider, job);
-    },
-    postSessionLogs: async (job, context) => {
-      const provider = await providerForJob(registry, job);
-      if (provider) await postSessionLogs(config, provider, job, context);
-    },
-    findPrForIssue: async (repo, issueIdentifier) =>
-      (await findPrForIssue(config, repo, issueIdentifier))?.url ?? null,
-    failKgRefreshMachine: (_job, opts) => { activeKgRefresh?.onMachineLost(opts); },
-  });
+  await sweepOrphanedMachines(reaperConfig(config, registry), makeReaperHelpers(config, registry));
 
   // Reconciliation for admission reservations whose launch response or process was lost
   // (AII-783 review): a committed reservation with no confirmed release eventually frees
@@ -2668,7 +2678,7 @@ export async function monitorJobs(config: AppConfig, registry: ProviderRegistry)
 
   for (const job of inFlightJobs) {
     try {
-      // kg-refresh has its own lifecycle (monitorKgRefreshGhaJob) — never TTL it here.
+      // kg-refresh has its own lifecycle (the KgRefresh workflow) — never TTL it here.
       // A Restate-owned job is never TTL-finalized here either (AII-791) — it falls
       // through to the per-mode monitor below, which carries the same owner fence at
       // its own terminal branch.
@@ -2775,12 +2785,8 @@ async function monitorGitHubActionsJob(
     notifyWebhookUrl: config.notifyWebhookUrl,
   };
 
-  // kg-refresh GHA rows are handled by their own monitor (no teamRepoMap entry, no issue).
-  if (job.phase === "kg-refresh") {
-    await monitorKgRefreshGhaJob(ghToken, owner, repo, job, claimedRunIds,
-      (opts) => activeKgRefresh?.onMachineLost(opts));
-    return;
-  }
+  // kg-refresh GHA rows are owned by the KgRefresh workflow, which watches the run (AII-901).
+  if (job.phase === "kg-refresh") return;
 
   // If we don't have a run ID yet, try to find it
   if (!job.runId) {
@@ -4459,6 +4465,70 @@ async function dispatchKgRefreshRun(
 const reviewFixAttemptStore = new SqliteReviewFixAttemptStore();
 const kgRefreshIngressClient = createKgRefreshIngressClient();
 
+/** Maps a `callToolAsSystem` result carrying `{ status, body }` text onto the REST shape (AII-901). */
+function kgToolAnswer(result: Awaited<ReturnType<typeof callToolAsSystem>>): { status: number; body: Record<string, unknown> } {
+  if (result.status === "unavailable") return { status: 503, body: { error: "restate-unavailable" } };
+  const text = result.content[0]?.text ?? "";
+  if (result.isError) return { status: 500, body: { error: text } };
+  try {
+    return JSON.parse(text) as { status: number; body: Record<string, unknown> };
+  } catch {
+    return { status: 500, body: { error: text } };
+  }
+}
+
+/**
+ * `AdminDeps.kgRefresh` over the Restate services: trigger and status go through the tool
+ * handlers as the in-process system caller, cancel resolves the in-flight `triggerId` from
+ * the `KgRepo` marker (no job row carries it) and calls the workflow's `cancel`.
+ */
+export function makeKgRefreshAdminDeps(
+  kgSourceRepo: string,
+  client: KgRefreshIngressClient,
+  callAsSystem: typeof callToolAsSystem = callToolAsSystem,
+): NonNullable<AdminDeps["kgRefresh"]> {
+  return {
+    trigger: async (opts) => kgToolAnswer(await callAsSystem("trigger_kg_refresh", { ...opts })),
+    status: async () => {
+      const r = await callAsSystem("get_kg_status", {});
+      if (r.status === "unavailable") return { status: 503, body: { error: "restate-unavailable" } };
+      const text = r.content[0]?.text ?? "";
+      try {
+        return { status: r.isError ? 500 : 200, body: JSON.parse(text) };
+      } catch {
+        return { status: 500, body: { error: text } };
+      }
+    },
+    cancel: async ({ reason }) => {
+      const marker = await client.repoStatus(parseKgSourceRepo(kgSourceRepo).fullName);
+      if (marker.status === "unavailable") return { status: 503, body: { error: "restate-unavailable" } };
+      if (marker.status !== "accepted" || !marker.value) return { status: 409, body: { error: "no-refresh-in-flight" } };
+      const out = await client.cancel(marker.value.triggerId, reason);
+      if (out.status === "unavailable") return { status: 503, body: { error: "restate-unavailable" } };
+      return { status: 200, body: { cancelled: true } };
+    },
+  };
+}
+
+// Duplicates KG_STAGE_SETTINGS_KEY (src/kg-refresh.ts, unexported): keep the literal in step.
+const LEGACY_KG_STAGE_SETTINGS_KEY = "kg_refresh_stage";
+
+/**
+ * One-shot boot sweep (AII-901): the legacy state machine persisted its stage under a
+ * settings key. Its presence means legacy-owned rows may linger, so close every in-flight
+ * kg-refresh row and delete the key. With the key absent this does nothing.
+ */
+export function sweepLegacyKgRefreshRows(): number {
+  const db = getDb();
+  const key = db.prepare("SELECT 1 FROM settings WHERE key = ?").get(LEGACY_KG_STAGE_SETTINGS_KEY);
+  if (!key) return 0;
+  const rows = getInFlightJobs().filter((j) => j.phase === "kg-refresh");
+  for (const job of rows) updateJobStatus(job.id, "timed_out", "legacy row closed at migration boot");
+  db.prepare("DELETE FROM settings WHERE key = ?").run(LEGACY_KG_STAGE_SETTINGS_KEY);
+  console.log(`[kg-refresh] boot sweep closed ${rows.length} legacy row(s) and removed ${LEGACY_KG_STAGE_SETTINGS_KEY}`);
+  return rows.length;
+}
+
 async function onReviewFixResult(result: ReviewFixResultMetadataV1): Promise<ResultIntakeOutcome> {
   // The accepted result and its delivery entry commit together. The callback
   // also runs on an identical retry, repairing an older result that somehow
@@ -5183,7 +5253,7 @@ function startServer(
           return { started: getPollStats().pollCount > before };
         },
         notifyWebhookUrl: config.notifyWebhookUrl,
-      }, registry, { startDeploy, selfDeployTarget: config.selfDeployTarget, kgRefresh, callTool, getRestateStatus,
+      }, registry, { startDeploy, selfDeployTarget: config.selfDeployTarget, kgRefresh: config.kgSourceRepo ? makeKgRefreshAdminDeps(config.kgSourceRepo, kgRefreshIngressClient) : undefined, callTool, getRestateStatus,
         reviewFixAttempts })) return;
     }
 
@@ -5338,6 +5408,11 @@ async function main(): Promise<void> {
   initAccessPageGrantsTable();
   initAuthEventsTable();
   initReviewFixEvidenceTable();
+  try {
+    sweepLegacyKgRefreshRows();
+  } catch (err) {
+    console.error("[kg-refresh] boot sweep failed; continuing boot:", err);
+  }
 
   // A process that died mid-deploy must not leave dispatch paused forever.
   const holdWasSet = clearDeployHold();
@@ -5429,7 +5504,10 @@ async function main(): Promise<void> {
           `https://api.github.com/repos/${kgSlug.owner}/${kgSlug.repo}/actions/workflows/${KG_REFRESH_WORKFLOW_FILE}/runs?event=workflow_dispatch&per_page=20`,
           { headers: { Authorization: `Bearer ${await kgWorkflowToken()}`, Accept: "application/vnd.github+json" }, signal: defaultFetchSignal() },
         );
-        if (!res.ok) return null;
+        if (!res.ok) {
+          console.warn(`[kg-refresh] findRunByTitle: workflow runs lookup answered HTTP ${res.status}`);
+          return null;
+        }
         const data = (await res.json()) as { workflow_runs: Array<{ id: number; display_title?: string }> };
         const match = data.workflow_runs.find((r) => r.display_title === `${RUN_TITLE_PREFIX}${title}`);
         return match ? { runId: match.id } : null;

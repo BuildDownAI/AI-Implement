@@ -3300,3 +3300,89 @@ describe("kg-refresh", () => {
     });
   });
 });
+
+describe("kg-refresh production wiring (AII-901)", () => {
+  type IndexModule = typeof import("../index.js");
+  let idx: IndexModule;
+  let logMod: typeof import("../log.js");
+  let dedupMod: typeof import("../dedup.js");
+  let dbPath: string;
+
+  beforeEach(async () => {
+    vi.resetModules();
+    dbPath = join(tmpdir(), `kg-wiring-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
+    process.env.DEDUP_DB_PATH = dbPath;
+    idx = await import("../index.js");
+    logMod = await import("../log.js");
+    dedupMod = await import("../dedup.js");
+    logMod.initLogTable();
+    dedupMod.getDb().exec("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+  });
+
+  afterEach(() => {
+    dedupMod.closeDb();
+    rmSync(dbPath, { force: true });
+  });
+
+  const text = (v: unknown) => ({ status: "ok" as const, content: [{ type: "text", text: JSON.stringify(v) }] });
+  const idle = { status: "accepted" as const, value: null };
+
+  it("trigger and status map the tool result, and unavailable to 503 restate-unavailable", async () => {
+    const client = { repoStatus: vi.fn(), cancel: vi.fn() } as never;
+    const call = vi.fn()
+      .mockResolvedValueOnce(text({ status: 409, body: { error: "refresh-in-progress" } }))
+      .mockResolvedValueOnce({ status: "unavailable" })
+      .mockResolvedValueOnce(text({ stage: "idle" }))
+      .mockResolvedValueOnce({ status: "unavailable" });
+    const deps = idx.makeKgRefreshAdminDeps("Org/kg", client, call as never);
+    expect(await deps.trigger({ dryRun: true })).toEqual({ status: 409, body: { error: "refresh-in-progress" } });
+    expect(call).toHaveBeenCalledWith("trigger_kg_refresh", { dryRun: true });
+    expect(await deps.trigger()).toEqual({ status: 503, body: { error: "restate-unavailable" } });
+    expect(await deps.status()).toEqual({ status: 200, body: { stage: "idle" } });
+    expect(await deps.status()).toEqual({ status: 503, body: { error: "restate-unavailable" } });
+  });
+
+  it("cancel resolves the triggerId from the KgRepo marker", async () => {
+    const client = {
+      repoStatus: vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1", startedAt: 1 } }),
+      cancel: vi.fn().mockResolvedValue({ status: "accepted" }),
+    };
+    const deps = idx.makeKgRefreshAdminDeps("Org/kg", client as never, vi.fn() as never);
+    expect((await deps.cancel({ jobId: 1, reason: "operator_cancelled" })).status).toBe(200);
+    expect(client.repoStatus).toHaveBeenCalledWith("Org/kg");
+    expect(client.cancel).toHaveBeenCalledWith("t-1", "operator_cancelled");
+  });
+
+  it("cancel answers 409 with no marker and 503 when unavailable", async () => {
+    const client = { repoStatus: vi.fn().mockResolvedValue(idle), cancel: vi.fn() };
+    const deps = idx.makeKgRefreshAdminDeps("Org/kg", client as never, vi.fn() as never);
+    expect(await deps.cancel({ jobId: 1, reason: "r" })).toEqual({ status: 409, body: { error: "no-refresh-in-flight" } });
+    client.repoStatus.mockResolvedValue({ status: "unavailable" });
+    expect((await deps.cancel({ jobId: 1, reason: "r" })).status).toBe(503);
+    expect(client.cancel).not.toHaveBeenCalled();
+  });
+
+  it("boot sweep closes in-flight kg-refresh rows and deletes the key; a second run is a no-op", () => {
+    const kgJob = logMod.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "github-actions" });
+    const otherJob = logMod.appendLog({ issueId: "i-1", phase: "implementation" });
+    dedupMod.getDb().prepare("INSERT INTO settings (key, value) VALUES ('kg_refresh_stage', '{}')").run();
+    expect(idx.sweepLegacyKgRefreshRows()).toBe(1);
+    expect(logMod.getJobById(kgJob)).toMatchObject({ status: "timed_out", conclusion: "legacy row closed at migration boot" });
+    expect(logMod.getJobById(otherJob)?.status).not.toBe("timed_out");
+    expect(dedupMod.getDb().prepare("SELECT 1 FROM settings WHERE key = 'kg_refresh_stage'").get()).toBeUndefined();
+    expect(idx.sweepLegacyKgRefreshRows()).toBe(0);
+  });
+
+  it("the reaper helpers no longer carry failKgRefreshMachine, so a kg-refresh row sweep makes no call", () => {
+    const helpers = idx.makeReaperHelpers({} as never, {} as never);
+    expect(Object.keys(helpers).sort()).toEqual(["findPrForIssue", "postSessionLogs", "resetTicket"]);
+    const job = { id: 1, phase: "kg-refresh" } as never;
+    expect(helpers.failKgRefreshMachine?.(job)).toBeUndefined();
+  });
+
+  it("boot sweep does nothing when the key is absent", () => {
+    const kgJob = logMod.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "github-actions" });
+    expect(idx.sweepLegacyKgRefreshRows()).toBe(0);
+    expect(logMod.getJobById(kgJob)?.status).not.toBe("timed_out");
+  });
+});
