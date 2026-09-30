@@ -26,6 +26,7 @@ import {
   KG_REPO_STALE_MARGIN_MS,
   kgDryRunReportSchema,
   kgRefreshOptionsSchema,
+  type KgRefreshRunInput,
 } from "./kg-refresh-workflow.js";
 
 interface InFlightMarker {
@@ -71,6 +72,14 @@ function oldestPendingKey(pending: Record<string, PendingDryRun>): string | unde
   return oldest;
 }
 
+/** The `KgRefresh.run` send parameter; typed so it cannot drift from `kgRefreshRunInputSchema`. */
+export function buildRunParameter(
+  opts: KgRepoTriggerInput & { report?: KgDryRunReportTarget },
+  triggerId: string,
+): KgRefreshRunInput {
+  return { ...opts, triggerId };
+}
+
 export function createKgRepo(deps: KgRepoDependencies) {
   const staleMarginMs = deps.staleMarginMs ?? KG_REPO_STALE_MARGIN_MS;
 
@@ -100,7 +109,7 @@ export function createKgRepo(deps: KgRepoDependencies) {
       service: deps.workflowName,
       method: "run",
       key: triggerId,
-      parameter: { ...opts, triggerId },
+      parameter: buildRunParameter(opts, triggerId),
       inputSerde: restate.serde.json,
     });
     return triggerId;
