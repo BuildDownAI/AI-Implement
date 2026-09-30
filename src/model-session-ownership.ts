@@ -79,6 +79,7 @@ export type RejectionReason =
   | "invalid_input"
   | "stale_owner"
   | "dispatch_released"
+  | "reservation_set_changed"
   | "invalid_state"
   | "checkpoint_missing"
   | "persistence_failed";
@@ -298,6 +299,18 @@ export function createModelSessionOwnership(options: ModelSessionOwnershipOption
       ].sort();
       return guard(() =>
         tx((db): ReserveResult => {
+          // The set is immutable once any row exists for this dispatch (released rows included).
+          const established = (
+            db.prepare("SELECT profile_id FROM model_profile_reservations WHERE dispatch_id = ?").all(dispatchId) as {
+              profile_id: string;
+            }[]
+          ).map((r) => r.profile_id);
+          if (
+            established.length > 0 &&
+            (established.length !== wanted.length || !established.every((id) => wanted.includes(id)))
+          ) {
+            throw new Reject("reservation_set_changed");
+          }
           const held: ReservedProfile[] = [];
           const busy: string[] = [];
           const toInsert: string[] = [];
