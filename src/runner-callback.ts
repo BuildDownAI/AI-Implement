@@ -164,19 +164,6 @@ export interface HandleRunnerResultInput {
   /** When provided, bounded failure cleanup (remediateFailedJob) runs after markImplementationFailed. */
   watchdogConfig?: StuckWatchdogConfig;
   /**
-   * Called when a kg-refresh runner job completes. Wired to KgRefreshHandle.onRunnerComplete
-   * in index.ts. When absent, kg-refresh callbacks are acknowledged without further action.
-   */
-  onKgRefreshRunnerComplete?: (
-    outcome: "success" | "failure",
-    data: {
-      snapshotCommit?: string; snapshotPr?: number; snapshotBranch?: string;
-      failureCode?: string; failureReason?: string;
-      guardVerdict?: "clean" | "refused";
-      partTable?: Array<{ part: string; prev: string; new: string }>;
-    },
-  ) => void;
-  /**
    * Injectable seam that durably records a validated `reviewFix` result marker
    * (AII-769/AII-803) — e.g. `SqliteReviewFixAttemptStore.recordResult`, composed
    * with queuing the accepted result for Restate delivery. Authenticated and
@@ -828,24 +815,6 @@ export async function handleRunnerResult(
   input.body.cycleSummaries = sanitizedCycleSummaries;
   if (droppedCycleSummaries > 0) {
     console.warn(`[runner-callback] Dropped ${droppedCycleSummaries} invalid cycle summary record(s)`);
-  }
-
-  // kg-refresh runs have no mapping and no tracker issue to update.
-  // Route the callback directly to the refresh rail and return early.
-  if (input.body.phase === "kg-refresh") {
-    if (!input.onKgRefreshRunnerComplete) {
-      console.warn("[runner-callback] kg-refresh callback received but no handler is registered — result will not be propagated");
-    }
-    input.onKgRefreshRunnerComplete?.(input.body.outcome, {
-      snapshotCommit: input.body.snapshotCommit,
-      snapshotPr: input.body.snapshotPr,
-      snapshotBranch: input.body.snapshotBranch,
-      failureCode: input.body.failureCode,
-      failureReason: input.body.failureReason,
-      guardVerdict: input.body.guardVerdict,
-      partTable: input.body.partTable,
-    });
-    return { status: 200, body: { acknowledged: true } };
   }
 
   if (
