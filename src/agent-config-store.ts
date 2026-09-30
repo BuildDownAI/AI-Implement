@@ -79,9 +79,22 @@ export interface CredentialReferenceResolver {
   lookup(profileId: string, revision: number): string | null;
 }
 
+/** Exact immutable config row id plus its human revision number. */
+export interface ConfigReference {
+  configRevisionId: string;
+  revision: number;
+}
+
+export interface ConfigReferences {
+  orchestratorDefault: ConfigReference;
+  project: ConfigReference;
+}
+
 export interface ProjectStageResolution {
   resolution: StageConfigResolution;
-  /** Config revision ids the resolution was derived from (orchestrator, then project). */
+  /** Keyed references to the config rows the resolution was derived from; absent when legacy. */
+  configReferences?: ConfigReferences;
+  /** Compatibility projection of `configReferences` ids (orchestrator, then project); empty when legacy. */
   configRevisionIds: string[];
 }
 
@@ -561,11 +574,16 @@ export function resolveProjectStageConfig(projectKey: string, remainingJobMs?: n
       accountProfiles: loadProfiles(db),
       remainingJobMs,
     });
-    const configRevisionIds: string[] = [];
-    if (resolution.mode === "configured") {
-      if (defaultsRow) configRevisionIds.push(defaultsRow.config_revision_id);
-      if (projectRow) configRevisionIds.push(projectRow.config_revision_id);
-    }
-    return { resolution, configRevisionIds };
+    if (resolution.mode !== "configured") return { resolution, configRevisionIds: [] };
+    if (!defaultsRow || !projectRow) throw new Error("configured resolution requires orchestrator and project config rows");
+    const configReferences: ConfigReferences = {
+      orchestratorDefault: { configRevisionId: defaultsRow.config_revision_id, revision: defaultsRow.revision },
+      project: { configRevisionId: projectRow.config_revision_id, revision: projectRow.revision },
+    };
+    return {
+      resolution,
+      configReferences,
+      configRevisionIds: [configReferences.orchestratorDefault.configRevisionId, configReferences.project.configRevisionId],
+    };
   })();
 }
