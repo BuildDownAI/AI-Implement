@@ -1,5 +1,10 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  return { ...actual, spawnSync: vi.fn(actual.spawnSync) };
+});
+
 const isWindows = process.platform === "win32";
 import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -296,5 +301,62 @@ describe("installSkillsStep", () => {
     expect(existsSync(join(homeDir, ".claude", "skills", "alpha", "SKILL.md"))).toBe(true);
     expect(existsSync(join(homeDir, ".claude", "skills", "beta", "SKILL.md"))).toBe(true);
     expect(existsSync(join(homeDir, ".claude", "skills", "gamma", "SKILL.md"))).toBe(true);
+  });
+});
+
+describe("installSkillsStep git subprocess environment", () => {
+  const SENTINELS: Record<string, string> = {
+    ANTHROPIC_API_KEY: "sentinel-anthropic",
+    CLAUDE_CODE_OAUTH_TOKEN: "sentinel-oauth",
+    RUN_PROGRESS_TOKEN: "sentinel-progress",
+    RUN_PUBLICATION_TOKEN: "sentinel-publication",
+    RUN_TOKEN: "sentinel-run",
+    NPM_TOKEN: "sentinel-npm",
+    GH_TOKEN: "sentinel-gh",
+    GITHUB_TOKEN: "sentinel-github",
+    AI_IMPLEMENT_RUN_CONFIG: "sentinel-run-config",
+    AI_IMPLEMENT_FORWARDED_SECRETS: "SENTINEL_FORWARDED",
+    SENTINEL_FORWARDED: "sentinel-forwarded",
+  };
+  const saved: Record<string, string | undefined> = {};
+  let dir: string;
+  let home: string;
+
+  beforeEach(() => {
+    dir = "";
+    home = mkdtempSync(join(tmpdir(), "skills-home-env-"));
+    for (const [k, v] of Object.entries(SENTINELS)) {
+      saved[k] = process.env[k];
+      process.env[k] = v;
+    }
+  });
+  afterEach(() => {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    try {
+      rmSync(home, { recursive: true, force: true });
+      if (dir) rmSync(dir, { recursive: true, force: true });
+    } catch { /* ignore */ }
+  });
+
+  it("passes a sentinel-free env to the clone and rev-parse spawns", async () => {
+    dir = makeSkillsRepo({ "alpha/SKILL.md": "# Alpha" });
+    vi.mocked(spawnSync).mockClear();
+    await installSkillsStep.run(
+      ctx(),
+      { skillsRepoUrl: dir, githubToken: "x", homeDir: home },
+      new NoopStepReporter(),
+    );
+    const calls = vi.mocked(spawnSync).mock.calls.filter((c) => c[0] === "git");
+    const subcommands = calls.map((c) => (c[1] as string[])[0]);
+    expect(subcommands).toContain("clone");
+    expect(subcommands).toContain("rev-parse");
+    for (const call of calls) {
+      const env = (call[2] as { env?: NodeJS.ProcessEnv }).env;
+      expect(env, `git ${(call[1] as string[])[0]} must pass an explicit env`).toBeDefined();
+      for (const key of Object.keys(SENTINELS)) expect(env![key], key).toBeUndefined();
+    }
   });
 });

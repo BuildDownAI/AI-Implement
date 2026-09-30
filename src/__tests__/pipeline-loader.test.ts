@@ -1,4 +1,6 @@
 import { describe, it, expect } from "vitest";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { loadPipelineDefinition, dependenciesMissing } from "../pipeline/pipeline-loader.js";
 import { DefaultPipelineContext } from "../pipeline/context.js";
 import { PipelineRunner } from "../pipeline/runner.js";
@@ -874,5 +876,17 @@ describe("loadPipelineDefinition", () => {
       // of dependenciesMissing.
       expect(pipeline.steps.find((s) => s.id === "post-push-review")!.skip?.(ctx)).toBe(true);
     });
+  });
+});
+
+describe("autonomous pipeline step order", () => {
+  it("runs reference-repos before dependency-auth", () => {
+    // Load-bearing: a reference clone that got a 401 would otherwise fall through to
+    // the global credential helper dependency-auth installs (installation-wide token).
+    const yml = readFileSync(join(process.cwd(), "pipelines", "autonomous.yml"), "utf8");
+    const ids = [...yml.matchAll(/^\s*- id: (\S+)/gm)].map((m) => m[1]);
+    expect(ids).toContain("reference-repos");
+    expect(ids).toContain("dependency-auth");
+    expect(ids.indexOf("reference-repos")).toBeLessThan(ids.indexOf("dependency-auth"));
   });
 });

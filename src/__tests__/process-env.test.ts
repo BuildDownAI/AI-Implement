@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { repoProcessEnv, modelProcessEnv } from "../pipeline/process-env.js";
+import { repoProcessEnv, modelProcessEnv, gitProcessEnv } from "../pipeline/process-env.js";
 
 const SAVED: Record<string, string | undefined> = {};
 
@@ -141,5 +141,51 @@ describe("modelProcessEnv", () => {
     modelProcessEnv(false);
     expect(process.env.ANTHROPIC_API_KEY).toBe("sentinel-api-key");
     expect(process.env.CLAUDE_CODE_OAUTH_TOKEN).toBe("sentinel-oauth-token");
+  });
+});
+
+describe("gitProcessEnv", () => {
+  const SENTINEL_KEYS = [
+    "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN",
+    "RUN_PROGRESS_TOKEN", "RUN_PUBLICATION_TOKEN", "RUN_TOKEN",
+    "NPM_TOKEN", "GITHUB_TOKEN", "GH_TOKEN", "GITHUB_ENTERPRISE_TOKEN",
+    "GH_ENTERPRISE_TOKEN", "GIT_PASSWORD", "MY_FORWARDED_SECRET",
+    "AI_IMPLEMENT_RUN_CONFIG", "AI_IMPLEMENT_FORWARDED_SECRETS",
+  ];
+  const KEEP_KEYS = [
+    "PATH", "HOME", "SSL_CERT_FILE", "GIT_SSL_CAINFO", "GIT_SSL_NO_VERIFY",
+    "NODE_EXTRA_CA_CERTS", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+    "http_proxy", "https_proxy", "no_proxy", "XDG_CONFIG_HOME",
+    "GIT_CONFIG_GLOBAL",
+  ];
+
+  beforeEach(() => {
+    for (const key of [...SENTINEL_KEYS, ...KEEP_KEYS]) saveAndSet(key, `sentinel-${key}`);
+    process.env.AI_IMPLEMENT_FORWARDED_SECRETS = "MY_FORWARDED_SECRET";
+  });
+  afterEach(restoreAll);
+
+  it("strips every runner, model, install, GitHub and forwarded credential", () => {
+    const env = gitProcessEnv();
+    for (const key of SENTINEL_KEYS) expect(env[key], key).toBeUndefined();
+  });
+
+  it("keeps PATH, HOME, TLS, proxy and git config discovery variables", () => {
+    const env = gitProcessEnv();
+    for (const key of KEEP_KEYS) expect(env[key], key).toBe(`sentinel-${key}`);
+  });
+
+  it("applies operation-scoped extras after stripping", () => {
+    const env = gitProcessEnv({ GIT_PASSWORD: "scoped", GIT_CONFIG_COUNT: "1" });
+    expect(env.GIT_PASSWORD).toBe("scoped");
+    expect(env.GIT_CONFIG_COUNT).toBe("1");
+    expect(env.GH_TOKEN).toBeUndefined();
+  });
+
+  it("does not mutate process.env", () => {
+    gitProcessEnv();
+    expect(process.env.GH_TOKEN).toBe("sentinel-GH_TOKEN");
+    expect(process.env.AI_IMPLEMENT_RUN_CONFIG).toBe("sentinel-AI_IMPLEMENT_RUN_CONFIG");
+    expect(process.env.MY_FORWARDED_SECRET).toBe("sentinel-MY_FORWARDED_SECRET");
   });
 });

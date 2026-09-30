@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import type { SpawnSyncOptions, SpawnSyncReturns } from "node:child_process";
 import path from "node:path";
+import { gitProcessEnv } from "../process-env.js";
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
 import { normalizeReferenceRepos, type ReferenceRepo, type ReferenceRepoResult, type ReferenceRepoResultCause } from "../../reference-repos.js";
 import type { ReferenceTokenOwnerEntry } from "../../reference-token-vending.js";
@@ -66,7 +67,7 @@ function cloneRepo(params: {
 
   // Build the env for the clone — credential via GIT_CONFIG_* env vars so it never
   // persists into the clone's .git/config or remote.origin.url.
-  const baseEnv = { ...process.env, GIT_TERMINAL_PROMPT: "0" };
+  const baseEnv = gitProcessEnv({ GIT_TERMINAL_PROMPT: "0" });
   const credEnv = token
     ? {
         ...baseEnv,
