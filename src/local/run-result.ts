@@ -1,3 +1,5 @@
+import { sanitizeAttribution, type InvocationAttributionV1 } from "../pipeline/types.js";
+
 export type LocalRunOutcome = "success" | "unapproved" | "capped" | "failed";
 
 export interface LocalRunTokenSummary {
@@ -18,6 +20,8 @@ export interface LocalRunPass {
   tokensOut?: number | null;
   cacheReadTokens?: number | null;
   cacheCreationTokens?: number | null;
+  /** Optional diagnostic attribution (AII-946); absent on legacy artifacts. */
+  attribution?: InvocationAttributionV1 | null;
 }
 
 /**
@@ -39,6 +43,8 @@ export interface LocalRunSummary {
   failureCode: string | null;
   repairAction: string | null;
   artifactDir: string;
+  /** Optional final-result attribution (AII-946); absent on legacy summaries — use readSummaryAttribution. */
+  attribution?: InvocationAttributionV1 | null;
 }
 
 /**
@@ -62,6 +68,8 @@ export interface LocalArtifactInput {
   endedAt: Date;
   passes: LocalRunPass[];
   tokenSummary?: LocalRunTokenSummary | null;
+  /** Optional final-result attribution (AII-946); not written by writeRunArtifacts until AII-971. */
+  attribution?: InvocationAttributionV1 | null;
   /** Machine-readable failure code, e.g. "REVIEW_UNAPPROVED", "MAX_TURNS_EXHAUSTED", or "INSTALL_FAILED". */
   failureCode?: string | null;
   /** Single human-readable repair action for failed, capped, or unapproved runs. */
@@ -84,4 +92,9 @@ export interface LocalArtifactInput {
   autopsy?: string | null;
   /** Override the output root. Defaults to /output/runs. */
   outputRoot?: string;
+}
+
+/** Safe reader for a parsed summary.json (or pass): a legacy or malformed attribution yields `null`. */
+export function readSummaryAttribution(parsed: { attribution?: unknown } | null | undefined): InvocationAttributionV1 | null {
+  return sanitizeAttribution(parsed?.attribution);
 }

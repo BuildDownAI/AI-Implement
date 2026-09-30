@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { parseWorkflowMd } from "./workflow-md.js";
 import { postRunnerResult } from "./runner-result.js";
 import { decodeRunConfig, type ResolvedAgentSnapshotV1 } from "./run-config.js";
-import type { InvokeParams, LLMResult } from "./pipeline/types.js";
+import type { InvocationAttributionV1, InvokeParams, LLMResult } from "./pipeline/types.js";
 import { DEFAULT_MODEL } from "./pipeline/default-model.js";
 
 export type PlanningExecutor = (
@@ -104,6 +104,8 @@ export interface RunPlanningLocalOptions {
 
 export interface RunPlanningLocalResult {
   exitCode: number;
+  /** Optional diagnostic attribution (AII-946); emission is AII-971. */
+  attribution?: InvocationAttributionV1;
   planningContext: string;
   /** True when at least one readable Markdown plan file was produced. */
   planFound: boolean;

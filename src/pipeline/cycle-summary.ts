@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { envSecrets, redactAndCap, redactEvidence } from "./failure-classification.js";
-import { ACTIVITY_MAX_EVENT_BYTES, type RunTelemetry } from "./types.js";
+import { ACTIVITY_MAX_EVENT_BYTES, sanitizeAttribution, type InvocationAttributionV1, type RunTelemetry } from "./types.js";
 
 /**
  * Per-review-cycle evidence contract (AII-801). Emitted once per feedback-loop
@@ -77,6 +77,8 @@ export interface CycleSummary {
    *  value that changed each time it was read would turn an idempotent replay into a spurious
    *  conflict. */
   completedAt: number;
+  /** Optional diagnostic attribution (AII-946). Stripped, never rejecting, when malformed — see `stripCycleAttribution`. */
+  attribution?: InvocationAttributionV1;
 }
 
 export type CycleSummaryInput = Omit<CycleSummary, "truncated" | "limitReached" | "completedAt">;
@@ -170,6 +172,7 @@ export function isCycleSummary(value: unknown): value is CycleSummary {
   for (const field of [value.usage.tokensIn, value.usage.tokensOut, value.usage.costUsd]) {
     if (field !== null && (typeof field !== "number" || !Number.isFinite(field))) return false;
   }
+  if (value.attribution !== undefined && sanitizeAttribution(value.attribution) === null) return false;
   if (typeof value.truncated !== "boolean" || typeof value.limitReached !== "boolean") return false;
   if (!Number.isSafeInteger(value.completedAt) || (value.completedAt as number) <= 0) return false;
   try {
@@ -177,6 +180,17 @@ export function isCycleSummary(value: unknown): value is CycleSummary {
   } catch {
     return false;
   }
+}
+
+/** Strips a malformed optional `attribution` from a cycle-summary-shaped value so the rest of the
+ *  evidence record survives validation (AII-946). A valid attribution is re-projected to its
+ *  allowlisted fields; everything else is returned unchanged. `stripped` is true when one was dropped. */
+export function stripCycleAttribution(value: unknown): { value: unknown; stripped: boolean } {
+  if (!isRecord(value) || value.attribution === undefined) return { value, stripped: false };
+  const { attribution, ...rest } = value as Record<string, unknown>;
+  const clean = sanitizeAttribution(attribution);
+  if (clean) return { value: { ...rest, attribution: clean }, stripped: false };
+  return { value: rest, stripped: true };
 }
 
 /** Filters `value` down to well-formed `CycleSummary` entries, same fail-safe convention as
@@ -187,7 +201,9 @@ export function sanitizeCycleSummaries(value: unknown): { valid: CycleSummary[];
   if (!Array.isArray(value)) return { valid: [], dropped: 0 };
   const valid: CycleSummary[] = [];
   let dropped = 0;
-  for (const entry of value) {
+  for (const raw of value) {
+    const { value: entry, stripped } = stripCycleAttribution(raw);
+    if (stripped) console.warn("[cycle-summary] Dropped 1 invalid attribution record(s) from a cycle summary");
     if (isCycleSummary(entry)) valid.push(entry);
     else dropped++;
   }
@@ -210,7 +226,7 @@ export function readCycleSummaries(workspaceDir: string): CycleSummary[] {
     const trimmed = line.trim();
     if (!trimmed) continue;
     try {
-      const parsed: unknown = JSON.parse(trimmed);
+      const { value: parsed } = stripCycleAttribution(JSON.parse(trimmed));
       if (isCycleSummary(parsed)) out.push(parsed);
     } catch {
       // Skip a malformed line rather than failing the whole read.

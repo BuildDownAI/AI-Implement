@@ -161,6 +161,21 @@ const STEP: Step = {
   logs_url: null,
 };
 
+const validAttribution = () => ({
+  version: 1,
+  invocationId: "inv-1",
+  stage: "implementation",
+  snapshotId: "snap-1",
+  agent: "codex",
+  provider: "openai",
+  model: "gpt-synthetic",
+  profileId: null,
+  authMode: "codex-subscription",
+  limit: { kind: "timeout_ms", value: 60000 },
+  outcome: "error",
+  usage: { availability: "unavailable", tokensIn: null, tokensOut: null, costUsd: null, costStatus: "unavailable" },
+});
+
 describe("handleRunnerResult — auth", () => {
   it("returns 401 when Authorization header is missing", async () => {
     const res = await runnerCallback.handleRunnerResult({
@@ -4488,6 +4503,38 @@ describe("handleRunnerResult — cycle summary durable evidence (AII-801)", () =
     expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("Dropped 1 invalid cycle summary record(s)"));
     expect(reviewFixEvidence.getReviewFixCycleSummary(validReviewFix.attemptId, 1)).not.toBeNull();
     warnSpy.mockRestore();
+  });
+
+  it("keeps terminal delivery when attribution is malformed, oversized or of unknown version, warning by count only", async () => {
+    const planted = "sk-SYNTHETICSECRET123456";
+    const bad = [
+      { ...validAttribution(), version: 2 },
+      { ...validAttribution(), apiKey: planted },
+      { ...validAttribution(), model: "x".repeat(5000) },
+      "not-an-object",
+    ];
+    for (const attribution of bad) {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      const res = await postResult({ attribution: attribution as never });
+      expect(res.status).toBe(200);
+      const warned = warnSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+      expect(warned).toContain("Dropped 1 invalid attribution record(s)");
+      expect(warned).not.toContain(planted);
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("accepts valid attribution without warning", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const res = await postResult({ attribution: validAttribution() as never });
+    expect(res.status).toBe(200);
+    expect(warnSpy.mock.calls.join(" ")).not.toContain("attribution");
+    warnSpy.mockRestore();
+  });
+
+  it("accepts INVOCATION_TIMEOUT as a failure code with the existing error outcome", async () => {
+    const res = await postResult({ outcome: "failure", failureCode: "INVOCATION_TIMEOUT", prUrl: undefined });
+    expect(res.status).toBe(200);
   });
 
   it("never records a cycle summary for a Legacy result with no reviewFix marker", async () => {

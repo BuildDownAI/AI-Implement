@@ -1,3 +1,4 @@
+import type { InvocationAttributionV1 } from "./pipeline/types.js";
 import { getDb } from "./dedup.js";
 import { getMappings } from "./config.js";
 import { markCommentGapfillRunTerminal, requeueGapfillAfterPushFailure } from "./comment-gapfill-queue.js";
@@ -68,6 +69,9 @@ export interface Job {
    *  🟡 one. Distinct from `failure`, which is persisted for every phase (including
    *  gap-analysis, which the callback never comments for and so never stamps this field). */
   failureCommentedAt: number | null;
+  /** Diagnostic attribution (AII-946). No column exists yet (AII-971 persists it): legacy reads
+   *  project `null`. Optional so undeclared `Job` literals keep compiling. */
+  attribution?: InvocationAttributionV1 | null;
 }
 
 // Keep old name exported for backwards compat with admin.ts
@@ -831,6 +835,7 @@ function mapRows(rows: RawRow[]): Job[] {
     approved: row.approved === 1,
     failure: parseFailureJson(row.failure_json),
     failureCommentedAt: row.failure_commented_at ?? null,
+    attribution: null,
   }));
 }
 
