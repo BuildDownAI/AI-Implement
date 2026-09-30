@@ -14,7 +14,7 @@
 // `../../github.js#postWorkflowDispatch` (the simulated GitHub) and
 // `../../restate/kg-refresh-workflow.js#createKgRefreshWorkflow`, wrapped only to point
 // `deps.rail` at the temp tree and to shorten the 60s watch interval; the wrapper adds the
-// workflow's own `beforeGate`/`afterStageCommitted` test hooks and touches nothing else.
+// workflow's own `afterStageCommitted` test hook and touches nothing else.
 import { execSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -25,7 +25,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 const sim = vi.hoisted(() => ({
   dataRoot: "",
   postWorkflowDispatch: (async () => { throw new Error("sim not initialised"); }) as (opts: { inputs: Record<string, string | undefined> }) => Promise<unknown>,
-  beforeGate: undefined as undefined | ((name: string) => void | Promise<void>),
+  fetchGate: undefined as undefined | Promise<void>,
   afterStage: undefined as undefined | (() => void | Promise<void>),
 }));
 
@@ -46,7 +46,6 @@ vi.mock("../../restate/kg-refresh-workflow.js", async (importOriginal) => {
         ...deps,
         rail: { ...deps.rail, dataRoot: sim.dataRoot, kgDir: "/nonexistent-kg-dir" },
         watchIntervalMs: WATCH_INTERVAL_MS,
-        beforeGate: (name) => sim.beforeGate?.(name),
         afterStageCommitted: () => sim.afterStage?.(),
       }),
   };
@@ -169,7 +168,13 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
     process.env.KG_SIDECAR_URL = "http://127.0.0.1:1/mcp";
     const railFakes = {
       mintToken: (async () => ({ token: "tok", expiresAt: "" })) as unknown as KgRailDeps["mintToken"],
-      fetchTarball: (async () => { railFetchCalls++; return tarball; }) as unknown as KgRailDeps["fetchTarball"],
+      fetchTarball: (async () => {
+        railFetchCalls++;
+        const gate = sim.fetchGate;
+        sim.fetchGate = undefined; // latch only the first call
+        if (gate) await gate;
+        return tarball;
+      }) as unknown as KgRailDeps["fetchTarball"],
       fetchDefaultBranch: (async () => "main") as unknown as KgRailDeps["fetchDefaultBranch"],
       fetchSnapshotCommitSha: (async () => SNAPSHOT_SHA) as unknown as KgRailDeps["fetchSnapshotCommitSha"],
       materialize: (async (_python: string, cwd: string) => {
@@ -237,14 +242,14 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
     gh = freshGithub();
     railFetchCalls = 0; railMaterializeCalls = 0; mergeCalls = 0; persistCalls = 0; settledCalls = 0;
     servedStamp = OLD_STAMP;
-    sim.beforeGate = undefined;
+    sim.fetchGate = undefined;
     sim.afterStage = undefined;
     rmSync(sim.dataRoot, { recursive: true, force: true });
     mkdirSync(sim.dataRoot, { recursive: true });
     getDb().prepare("DELETE FROM dispatch_log").run();
     getDb().prepare("DELETE FROM settings WHERE key LIKE 'kg_%'").run();
   });
-  afterEach(() => { sim.beforeGate = undefined; sim.afterStage = undefined; });
+  afterEach(() => { sim.fetchGate = undefined; sim.afterStage = undefined; });
 
   function envFor(label: string): RestateTestEnvironment {
     const env = environments.get(label);
@@ -428,8 +433,8 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
     const client = clientFor(env);
     let releaseGate!: () => void;
     const gate = new Promise<void>((resolve) => { releaseGate = resolve; });
-    // Hold the run at its first rail gate so the duplicate arrives while the run is live.
-    sim.beforeGate = async (name) => { if (name === "fetch") await gate; };
+    // Hold the run inside the simulated rail's first fetchTarball so the duplicate arrives while the run is live.
+    sim.fetchGate = gate;
     await triggerRefresh(env);
     await until(dispatched);
     const dispatchId = kgRows()[0].dispatch_id;
