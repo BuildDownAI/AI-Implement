@@ -4,7 +4,41 @@
 
 **Date:** 2026-08-18
 
-**Implementation status (verified 2026-08-24, branch `testing`):** **Not yet integrated.** No credential-stripping logic exists in `src/`. `src/dev-harness/index.ts` passes `ANTHROPIC_API_KEY` and `CLAUDE_CODE_OAUTH_TOKEN` straight into the container environment. **The exposure limit described here is not a guarantee that holds today.**
+**Implementation status (verified 2026-09-30, branch `ai-implement/feature/aii-846`):** **Partially enforced.** The boundaries below are in the source and covered by synthetic tests that need no real credentials. The model credential still reaches Claude Code and anything it spawns, and the private run envelope is not implemented.
+
+| Boundary | Enforced by | Covered by |
+|---|---|---|
+| Repo-owned processes (install, setup, verify, teardown) never see model credentials | `repoProcessEnv` in `src/pipeline/process-env.ts` | `src/__tests__/process-env.test.ts` |
+| The model process never sees runner callback tokens, `NPM_TOKEN` or forwarded secrets; GitHub write tokens only on gap-fill | `modelProcessEnv` (same file) | `src/__tests__/process-env.test.ts` |
+| By default, Git subprocesses get no runner token, model credential, install credential, forwarded secret or dependency-helper variable; each operation's credential is passed as `extra`. Exception: the explicit `targetDir`/`targets` dependency clone/fetch network operations in `clone.ts` use `gitDependencyProcessEnv`, which restores only what the registered git-credential-helper needs — `GIT_DEPENDENCY_TOKEN_FILE` (the cache handle), `GIT_DEPENDENCY_CALLBACK_URL` and the `RUN_PROGRESS_TOKEN` bearer. `COMPOSER_AUTH` is never restored, and local (non-network) Git operations stay fully stripped | `gitProcessEnv` and `gitDependencyProcessEnv` (same file), used by `clone.ts`, `install-skills.ts`, `reference-repos.ts` (the last two use `gitProcessEnv` only) | `process-env.test.ts`, `steps-clone.test.ts` |
+| Result token is validated (non-consuming preflight), then consumed atomically before any provider call | `handleRunnerResult` in `src/runner-callback.ts`, `verifyRunToken` in `src/runner-token.ts` | `runner-callback.test.ts`, `runner-token.test.ts` |
+| Review and post-mortem passes get `Read,Glob,Grep` only: no shell, MCP, skills or delegation; unsafe tool use blocks a retry | `src/pipeline/steps/read-only-tools.ts`, `claude-stream.ts`, `executor.ts` | `read-only-tools.test.ts` |
+| Planning may write only Markdown under `ai-output/comments/`; the guard and settings file live outside the workspace and no user, project or local settings load | `src/planning-write-policy.ts`, `src/run-planning.ts` | `planning-write-policy.test.ts`, `planning-callback-guard.test.ts` |
+| Fly and local-Docker runs boot with a token scoped to the target repository, with no fallback to the installation-wide token; KG workspaces mint per-repository tokens | `getTargetRepoToken` in `src/index.ts`, `src/token-vending.ts`, `src/kg-refresh.ts` | `publication-token-vending.test.ts`, `dependency-token-vending.test.ts`, `refresh-runner-github-credentials.test.ts`, `fly-machines.test.ts`, `local-docker.test.ts` |
+
+**Limits that still hold.**
+
+- Claude Code receives the model credential, and commands it starts may inherit it.
+- Nothing isolates hostile code running as the same OS principal as the runner. The env builders remove variables; they are not a sandbox, and the planning guard is a tool-boundary check, not a filesystem sandbox.
+- Repositories and task documents stay trusted, and containers keep normal network access.
+- A private run envelope, credential isolation and the model-auth bootstrap are not implemented: [AII-680](https://linear.app/eudoxus/issue/AII-680/make-the-run-envelope-private-isolate-credentials-and-enforce-the-gha) and [AII-951](https://linear.app/eudoxus/issue/AII-951/isolate-model-bootstrap-from-repository-processes).
+
+**Ancestry.** Verified on the full history of `ai-implement/feature/aii-846` (2bfc8a6) with `git merge-base --is-ancestor`; each merge commit below is an ancestor of the branch head.
+
+| Issue | Merge commit |
+|---|---|
+| AII-854 (Git subprocess env) | 5410d48 (#774) |
+| AII-985 (cached dependency credentials) | 692bb13 (#777) |
+| AII-855 (result-token validation) | 84c8dcd (#778) |
+| AII-988 (credential-client env and disposal) | ad972ec (#779) |
+| AII-853 (Fly/local boot token) | 5f81aed (#781) |
+| AII-990 (KG boot tokens) | 0c9be34 (#782) |
+| AII-986 (read-only reviewer tools, conservative retry) | 99299af (#784) |
+| AII-987 (planning write policy) | 56a28cd (#788) |
+
+AII-852 is the umbrella for 986 and 987 and has no commit of its own.
+
+**Evidence (2026-09-30, Node 24, no real credentials).** `npm run typecheck` passed. The 13 test files in the table above passed (468 tests), and the full `npm test` passed (256 files, 7677 tests). Remote CI status was not readable from this environment and must be confirmed on the PR before roll-up.
 
 ---
 
@@ -22,13 +56,12 @@ The first local release supports trusted repositories and trusted task documents
 
 AI-Implement removes the model credential from repository setup, test, verification, and teardown processes that it starts directly. Claude Code receives the credential. Commands started by Claude Code may inherit it.
 
-Repository commands keep normal container network access in version one. The container receives no host Docker socket and no GitHub credential. The selected repository mount is read-only, and all modifications happen in the isolated working copy.
+Repository commands keep normal container network access in version one. The container receives no host Docker socket. It does receive a GitHub token, scoped to the target repository (see the status table). The selected repository mount is read-only, and all modifications happen in the isolated working copy.
 
 ## Alternatives considered
 
 - **Pass the full runner environment to every AI-Implement child process** — rejected because setup and test code do not need the model credential.
 - **Disable container networking** — rejected because the model call and common dependency installation need network access.
-- **Give the container a GitHub token for future publication** — rejected because publication is outside the local release.
 - **Claim isolation from hostile repository code** — rejected because the current Claude Code process model cannot support that guarantee.
 - **Build a credential broker and command sandbox now** — deferred because it materially expands the local release and needs a separate security design.
 
