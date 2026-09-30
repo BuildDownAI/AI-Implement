@@ -443,7 +443,19 @@ export interface InvokeParams {
   prompt: string;
   model: string;
   maxTurns?: number;
+  /**
+   * Permission patterns passed as `--allowed-tools`. This PREAPPROVES tools; it
+   * does not restrict availability, and a pattern (e.g. `Bash(curl *)`) is not a
+   * built-in tool name. Use `builtinTools` to restrict what a session can use.
+   */
   tools?: string[];
+  /**
+   * Built-in tool NAMES (e.g. `Read`) that are the only tools available to the
+   * session. When set, the executor passes `--tools` plus flags that deny MCP
+   * tools, skills and delegates, and denies Bash/Edit/Write. Absent = the
+   * ordinary unrestricted tool set (implementation).
+   */
+  builtinTools?: string[];
   jsonSchema?: Record<string, unknown>;
   /**
    * Stage identifier used to tag a classified failure (e.g. "implement" or
@@ -479,10 +491,10 @@ export interface InvokeParams {
     policy: RetryPolicy;
     /**
      * True when a tool call made during a failed attempt cannot have mutated the
-     * workspace (review runs read-only tools) — EXCEPT a Bash-prefixed tool use
-     * (e.g. review's allowed `Bash(curl *)`), which can still write files or POST
-     * despite the read-only allowlist and so still blocks a retry regardless of
-     * this flag. See `effectiveSawToolUse`/`sawUnsafeToolUse`.
+     * workspace (review runs read-only tools) — but only a proven read-only
+     * built-in (Read/Glob/Grep) counts as safe; any other, unknown or malformed
+     * tool use still blocks a retry regardless of this flag. See
+     * `effectiveSawToolUse`/`sawUnsafeToolUse`.
      */
     toolUseIsSafe: boolean;
   };

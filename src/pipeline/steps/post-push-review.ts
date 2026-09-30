@@ -27,7 +27,7 @@ import {
   stableReviewFindingKey,
   type FindingDisposition,
 } from "../finding-dispositions.js";
-import { READ_ONLY_ALLOWED_TOOLS } from "./read-only-tools.js";
+import { READ_ONLY_TOOL_PARAMS } from "./read-only-tools.js";
 import { REVIEWER_VERDICT_SCHEMA, resolveTrustedReviewer, type ReviewerDefinition, type ReviewerFinding, type ReviewerVerdict } from "../reviewers/registry.js";
 import { isChecksPermissionError } from "../../checks-permission.js";
 import { inferTestResults, sumUsage, toolTraceLines, writeCycleSummary, type CycleDisposition } from "../cycle-summary.js";
@@ -1544,7 +1544,7 @@ async function runSelectedInternalReviewers(params: {
       prompt,
       model: definition.model ?? params.model,
       maxTurns,
-      tools: READ_ONLY_ALLOWED_TOOLS,
+      ...READ_ONLY_TOOL_PARAMS,
       jsonSchema: definition.outputSchema,
       stage,
       expectsStructuredOutput: true,

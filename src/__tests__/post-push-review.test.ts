@@ -266,7 +266,8 @@ describe("postPushReviewStep", () => {
       1,
       expect.objectContaining({
         maxTurns: 30,
-        tools: ["Read", "Glob", "Grep", "Bash(curl *)"],
+        tools: ["Read", "Glob", "Grep"],
+        builtinTools: ["Read", "Glob", "Grep"],
       }),
     );
     expect(ctx.llmExecutor.invoke).toHaveBeenNthCalledWith(
