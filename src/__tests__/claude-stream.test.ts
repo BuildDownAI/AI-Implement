@@ -277,23 +277,48 @@ describe("sawToolUse", () => {
 });
 
 describe("sawUnsafeToolUse", () => {
-  it("returns true for a Bash tool_use (e.g. review's allowed Bash(curl *), which can still write files or POST)", () => {
-    expect(sawUnsafeToolUse([initEvent, toolEvent])).toBe(true);
+  const asst = (content: unknown): StreamEvent => ({ type: "assistant", message: { content } });
+  const use = (name?: unknown) => ({ type: "tool_use", ...(name === undefined ? {} : { name }), input: {} });
+
+  it.each(["Read", "Glob", "Grep"])("returns false for a proven read-only %s tool_use", (name) => {
+    expect(sawUnsafeToolUse([initEvent, asst([use(name)])])).toBe(false);
   });
 
-  it("returns false for a non-Bash tool_use (e.g. Read/Glob/Grep)", () => {
-    const readEvent: StreamEvent = {
-      type: "assistant",
-      message: { content: [{ type: "tool_use", name: "Read", input: { file_path: "/tmp/x" } }] },
-    };
-    expect(sawUnsafeToolUse([initEvent, readEvent])).toBe(false);
+  it.each(["Bash", "Bash(curl *)", "Edit", "Write", "NotebookEdit", "Task", "Agent", "Skill", "mcp__srv__tool", "Mystery", "read"])(
+    "returns true for %s tool_use",
+    (name) => {
+      expect(sawUnsafeToolUse([initEvent, asst([use(name)])])).toBe(true);
+    },
+  );
+
+  it("returns true for a nameless or non-string-named tool_use", () => {
+    expect(sawUnsafeToolUse([asst([use()])])).toBe(true);
+    expect(sawUnsafeToolUse([asst([use(42)])])).toBe(true);
   });
 
-  it("returns false for text-only assistant events", () => {
+  it("returns true when an unsafe tool_use is mixed with a safe one", () => {
+    expect(sawUnsafeToolUse([asst([use("Read"), use("Write")])])).toBe(true);
+  });
+
+  it("finds tool_use nested inside non-top-level content or a non-array content", () => {
+    expect(sawUnsafeToolUse([asst([{ type: "wrapper", content: [use("Bash")] }])])).toBe(true);
+    expect(sawUnsafeToolUse([asst({ nested: use("Edit") })])).toBe(true);
+    expect(sawUnsafeToolUse([asst({ type: "tool_use", name: "Write" })])).toBe(true);
+  });
+
+  it("treats structure too deep to scan as unsafe", () => {
+    let deep: unknown = use("Read");
+    for (let i = 0; i < 20; i++) deep = { next: deep };
+    expect(sawUnsafeToolUse([asst([deep])])).toBe(true);
+  });
+
+  it("returns false for text-only, string-content and empty events", () => {
     expect(sawUnsafeToolUse([initEvent, textEvent])).toBe(false);
+    expect(sawUnsafeToolUse([asst("just a string")])).toBe(false);
+    expect(sawUnsafeToolUse([])).toBe(false);
   });
 
-  it("returns false for an empty event list", () => {
-    expect(sawUnsafeToolUse([])).toBe(false);
+  it("sawToolUse also sees nested tool_use", () => {
+    expect(sawToolUse([asst([{ type: "wrapper", content: [use("Read")] }])])).toBe(true);
   });
 });

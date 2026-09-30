@@ -2,7 +2,7 @@ import type { PipelineContext, StepModule, StepReporter, RunTelemetry } from "..
 import { formatLlmResultDetail, terminalResultFailureMessage } from "../step-utils.js";
 import { REVIEW_VERDICT_JSON_SCHEMA, parseReviewVerdict, plainIssueText } from "../review-verdict.js";
 import { wrapWithPlanningGuard } from "../../planning-context-assembly.js";
-import { READ_ONLY_ALLOWED_TOOLS } from "./read-only-tools.js";
+import { READ_ONLY_TOOL_PARAMS } from "./read-only-tools.js";
 import { classifyLlmResult, envSecrets, oneLinerMessage, type FailureRecord } from "../failure-classification.js";
 import { DEFAULT_MODEL } from "../default-model.js";
 
@@ -113,7 +113,7 @@ export const reviewStep: StepModule<ReviewInputs, ReviewOutputs> = {
     const result = await context.llmExecutor.invoke({
       prompt,
       model: model ?? DEFAULT_MODEL,
-      tools: READ_ONLY_ALLOWED_TOOLS,
+      ...READ_ONLY_TOOL_PARAMS,
       jsonSchema: REVIEW_VERDICT_JSON_SCHEMA,
       stage: "review",
       expectsStructuredOutput: true,
