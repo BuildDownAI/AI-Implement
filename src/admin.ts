@@ -455,7 +455,7 @@ export interface AdminDeps {
   selfDeployTarget?: SelfDeployTarget | null;
   /** The KG refresh rail (AII-426). Absent when no KG source repo is configured. */
   kgRefresh?: {
-    trigger(opts?: { dryRun?: boolean; acceptNewBaseline?: boolean; actorEmail?: string }): Promise<{ status: number; body: Record<string, unknown> }>;
+    trigger(opts?: { dryRun?: boolean; ref?: string; acceptNewBaseline?: boolean; actorEmail?: string }): Promise<{ status: number; body: Record<string, unknown> }>;
     status(): Promise<{ status: number; body: unknown }>;
     /** The operator-cancel path: asks the KgRefresh workflow to cancel and confirm termination (AII-901). */
     cancel(opts: { jobId: number; reason: string }): Promise<{ status: number; body: Record<string, unknown> }>;
@@ -1736,7 +1736,7 @@ async function handleDestroySession(
     getInFlightJobs().find((j) => j.machineId === machineId) ??
     (Number.isFinite(Number(machineId)) ? getJobById(Number(machineId)) : null);
 
-  // Kg-refresh cancel: issue-less run, shared close path via onMachineLost (AII-522).
+  // Kg-refresh cancel: issue-less run, closed through deps.kgRefresh.cancel (AII-522).
   if (job?.phase === "kg-refresh") {
     if (job.executionMode === "github-actions") {
       // The KgRefresh workflow requests the GitHub cancellation and waits for confirmed

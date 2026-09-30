@@ -1,5 +1,4 @@
 import crypto from "node:crypto";
-import { execSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import os from "node:os";
@@ -373,85 +372,25 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
     };
   }
 
-  /** A minimal `sources.yml`-only tarball, sufficient for kg-refresh's preflight and fetch steps to read a namespace and fail cleanly past that (no `out/` to materialize from). */
-  function makeMinimalKgTarball(): Buffer {
-    const wrap = fs.mkdtempSync(path.join(os.tmpdir(), "kg-webhook-tar-"));
-    const top = path.join(wrap, "repo");
-    fs.mkdirSync(top, { recursive: true });
-    fs.writeFileSync(path.join(top, "sources.yml"), "namespace: https://kg.test.example/\n");
-    fs.mkdirSync(path.join(top, "snapshot"), { recursive: true });
-    const out = path.join(wrap, "src.tar.gz");
-    execSync(`tar -czf ${out} -C ${wrap} repo`);
-    return fs.readFileSync(out) as Buffer;
-  }
-
   /**
-   * Builds a real (non-mocked) KgRefreshHandle wired the same way index.ts wires one,
-   * with every network/filesystem-touching dependency injected so the handle can
-   * dispatch and settle real (non-dry-run) and dry-run refreshes without hitting the
-   * network. Used to prove the webhook's queue wakes on a real settle, not a hand-fired
-   * mock callback (AII-636).
+   * Builds a real (non-mocked) KgRefreshHandle wired the way index.ts wires one, so the
+   * webhook's supersession queue is proven against the handle's real settle listeners
+   * rather than a hand-fired mock callback (AII-636).
    */
-  function makeRealKgRefreshHandle(): { handle: KgRefreshHandle; dispatchRun: ReturnType<typeof vi.fn> } {
-    const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), "kg-webhook-root-"));
-    const tarball = makeMinimalKgTarball();
-    let stageStore: { stage: string; startedAt: number } | null = null;
-    const dispatchRun = vi.fn(async () => ({ machineNonce: "nonce" }));
-    const mintRunTokenFn = vi.fn()
-      .mockReturnValueOnce({ token: "run-tok", dispatchId: "disp-1" })
-      .mockReturnValue({ token: "progress-tok", dispatchId: "disp-1" });
-    // fetchSnapshotCommitSha() drives which gate runRefresh() takes on each call:
-    // the 1st (initial real trigger()) and 3rd (queued dry-run redispatch) calls
-    // match the recorded SHA below, so trigger() takes the "ingest-needed" gate and
-    // dispatches instead of running the local rail synchronously; the 2nd call
-    // (runRefreshAndSettle()'s rail, after the real runner's callback) returns a
-    // different SHA, so the rail actually runs — and fails cleanly at the
-    // materialize step, since this fixture has no `out/` directory to stage from.
-    const RECORDED_SHA = "abc123def456abc123def456abc123def456abc1";
-    const fetchSnapshotCommitSha = vi.fn()
-      .mockResolvedValueOnce(RECORDED_SHA)
-      .mockResolvedValueOnce("999newsha000999newsha000999newsha000999n")
-      .mockResolvedValue(RECORDED_SHA);
-    const handle = makeKgRefresh({
+  function makeRealKgRefreshHandle(): KgRefreshHandle {
+    return makeKgRefresh({
       sidecar: { restart: vi.fn(async () => {}) },
       githubAppId: "1",
       githubAppPrivateKey: "key",
       kgSourceRepo: KG_SOURCE_REPO,
-      dataRoot,
+      dataRoot: "/nonexistent-kg-root",
       kgDir: "/nonexistent-kg",
-      sidecarMcpUrl: "http://127.0.0.1:1/mcp",
-      minFreeBytes: 1000,
-      deployHeld: () => false,
-      freeBytes: () => 10_000_000,
       mintToken: vi.fn(async () => ({ token: "tok", expiresAt: "" })) as never,
-      fetchTarball: vi.fn(async () => tarball) as never,
+      fetchTarball: vi.fn() as never,
       fetchDefaultBranch: vi.fn(async () => "main") as never,
-      fetchWorkflowFile: vi.fn(async () => ({
-        status: 200,
-        content: "on:\n  workflow_dispatch:\n    inputs:\n      run_config:\n        required: true\n      runner_phase:\n        required: false\n",
-      })) as never,
-      fetchSnapshotCommitSha: fetchSnapshotCommitSha as never,
-      persistSnapshotSha: vi.fn() as never,
-      loadSnapshotSha: vi.fn(() => RECORDED_SHA) as never,
-      materialize: vi.fn(async () => {}) as never,
-      mcpToolCall: vi.fn(async () => { throw new Error("no sidecar in this test"); }) as never,
-      canaryDeadlineMs: 50,
-      canaryRetryMs: 10,
-      runnerCallbackBaseUrl: "http://localhost:8080",
-      runnerTokenSecret: "secret",
-      resolveMappingTeamKey: () => ({ teamKey: "KGA", dependencyTokenScope: null }),
-      mintRunTokenFn: mintRunTokenFn as never,
-      dispatchRun: dispatchRun as never,
-      fetchCommitVisible: vi.fn(async () => true) as never,
-      snapshotCommitRetryMs: 0,
-      persistStage: (s, t) => { stageStore = { stage: s, startedAt: t } as never; },
-      loadStage: () => stageStore as never,
-      persistLastRefresh: vi.fn() as never,
-      loadLastRefresh: vi.fn(() => null) as never,
-      postOrUpdateStickyCommentFn: vi.fn(async () => {}) as never,
-      setCommitStatusFn: vi.fn(async () => {}) as never,
+      persistDryRunOutcomes: vi.fn() as never,
+      loadDryRunOutcomes: vi.fn(() => null) as never,
     });
-    return { handle, dispatchRun };
   }
 
   it("dispatches a dry-run when a KG source repo PR touches kg_ingest/", async () => {
@@ -935,29 +874,24 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
     });
   });
 
-  it("a 409 from a real (non-dry-run) refresh queues the head, and a real onRunnerComplete settle dispatches it — not a hand-fired mock (AII-636)", async () => {
-    const { handle, dispatchRun } = makeRealKgRefreshHandle();
+  it("a 409 while a refresh is running queues the head, and the real handle's settle listener dispatches it — not a hand-fired mock (AII-636)", async () => {
+    const handle = makeRealKgRefreshHandle();
+    const trigger = vi.fn()
+      .mockResolvedValueOnce({ status: 409, body: { error: "refresh-in-progress" } })
+      .mockResolvedValue({ status: 202, body: {} });
     const kgPrCheck: KgPrCheckConfig = {
       kgSourceRepo: KG_SOURCE_REPO,
       kgBaseRepo: KG_BASE_REPO,
       githubAppId: "app-id",
       githubAppPrivateKey: "app-key",
-      trigger: (opts) => handle.trigger(opts),
+      trigger,
       reportDryRun: (report) => handle.reportDryRun(report),
       onRefreshSettled: (cb) => handle.onRefreshSettled(cb),
     };
     mockPrFiles(["kg_ingest/loader.py"]);
 
-    // A real (non-dry-run, non-webhook) refresh is already dispatched and running.
-    const realTrigger = await handle.trigger();
-    expect(realTrigger.status).toBe(202);
-    await vi.waitFor(async () => {
-      expect((await handle.status()).stage).toBe("ingest-running");
-    });
-    expect(dispatchRun).toHaveBeenCalledTimes(1);
-
-    // A guard-relevant PR event arrives while that real refresh (not a dry-run) is
-    // running — trigger() 409s, so the webhook queues the head.
+    // A guard-relevant PR event arrives while a refresh is running — the trigger 409s,
+    // so the webhook queues the head.
     const { req, res } = makeRequest(
       SECRET,
       "pull_request",
@@ -967,19 +901,18 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
     await res.done;
     expect(res.statusCode).toBe(200); // AII-639: answered by the normal pull_request handling
     expect(JSON.parse(res.body).reason).toBe("no matching dispatch");
-    expect(dispatchRun).toHaveBeenCalledTimes(1); // still only the real refresh
+    expect(trigger).toHaveBeenCalledTimes(1);
 
-    // The real refresh settles (successfully or not — here it fails cleanly, since
-    // the fixture tarball has no `out/` to materialize from). Before AII-636, only
-    // a dry-run completion fired the settled listeners, so this would never wake
-    // the queued head.
-    handle.onRunnerComplete("success", {});
+    // The refresh settles: the handle fires its real listeners, which wakes the queued head.
+    handle.fireRefreshSettled();
 
-    // The queued head now dispatches through the real listener wiring end to end —
-    // webhook.ts's queue, kg-refresh.ts's broadened settled firing, and trigger()
-    // itself all wired together, not a hand-fired mock callback.
     await vi.waitFor(() => {
-      expect(dispatchRun).toHaveBeenCalledTimes(2);
+      expect(trigger).toHaveBeenCalledTimes(2);
+    });
+    expect(trigger).toHaveBeenNthCalledWith(2, {
+      dryRun: true,
+      ref: "feature/real",
+      report: { repo: KG_SOURCE_REPO, prNumber: 50, sha: "sha-real", acceptBaseline: false },
     });
   });
 

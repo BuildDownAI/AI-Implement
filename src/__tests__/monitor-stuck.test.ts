@@ -57,11 +57,6 @@ vi.mock("../config.js", () => ({
   initMappingsTable: vi.fn(),
 }));
 
-vi.mock("../monitor-gha.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../monitor-gha.js")>()),
-  monitorKgRefreshGhaJob: vi.fn().mockResolvedValue(undefined),
-}));
-
 vi.mock("../filesystem-ticket-lifecycle.js", () => ({
   reconcileFilesystemFailures: vi.fn().mockResolvedValue(undefined),
 }));
@@ -90,7 +85,6 @@ import { notifyStuckGiveUp } from "../notify.js";
 import { getMappings } from "../config.js";
 import { destroyMachine } from "../fly-machines.js";
 import { removeLocalContainer } from "../local-docker.js";
-import { monitorKgRefreshGhaJob } from "../monitor-gha.js";
 import { monitorJobs } from "../index.js";
 import type { AppConfig } from "../index.js";
 
@@ -424,7 +418,7 @@ describe("monitorJobs TTL check (AII-743)", () => {
     vi.mocked(getMappings).mockReturnValue({});
   });
 
-  it("leaves a kg-refresh GHA row to the workflow: no legacy monitor, no GitHub call, no status write (AII-901)", async () => {
+  it("leaves a kg-refresh GHA row to the workflow: no GitHub call, no status write (AII-901)", async () => {
     const job = makeJob({ issueId: "kg-refresh", phase: "kg-refresh", repo: "org/kg", runId: 4242, dispatchedAt: Date.now() - 200 * 60 * 1000 });
     vi.mocked(getInFlightJobs).mockReturnValue([job]);
     vi.mocked(updateJobStatus).mockClear();
@@ -432,7 +426,6 @@ describe("monitorJobs TTL check (AII-743)", () => {
 
     await monitorJobs(mockAppConfig, makeRegistry(null));
 
-    expect(monitorKgRefreshGhaJob).not.toHaveBeenCalled();
     expect(cancelWorkflowRun).not.toHaveBeenCalled();
     expect(updateJobStatus).not.toHaveBeenCalled();
   });

@@ -40,7 +40,7 @@ import { parseKgSourceRepo } from "../deploy.js";
 export const KG_REFRESH_TOTAL_DEADLINE_MS = 4 * 60 * 60 * 1000;
 /** Grace added on top of the total deadline before `KgRepo` treats an in-flight marker as stale rather than live. */
 export const KG_REPO_STALE_MARGIN_MS = 10 * 60 * 1000;
-/** The value of `GHA_DISPATCH_GRACE_MS` in `src/monitor-gha.ts:8` — how long a dispatch may run with no `progress` signal. */
+/** How long a dispatch may run with no `progress` signal before the workflow treats it as lost. */
 export const KG_REFRESH_BOOTSTRAP_DEADLINE_MS = 10 * 60 * 1000;
 /** One shared retention constant, the same pattern as `REVIEW_FIX_RETENTION_MS` (`src/restate/review-fix-attempt.ts:28`). */
 export const KG_REFRESH_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;

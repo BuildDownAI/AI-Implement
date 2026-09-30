@@ -43,7 +43,7 @@ import { remediateStuckJob, remediateFailedJob } from "./stuck-watchdog.js";
 import type { StuckWatchdogConfig } from "./stuck-watchdog.js";
 import { handleAdminRequest } from "./admin.js";
 import type { AdminDeps } from "./admin.js";
-import { initLogTable, appendLog, countPriorDispatches, completeOrphanedPlanningJobs, attachJobRunIdIfMissing, updateJobRunId, updateJobStatus, updateJobPrUrl, updateJobMachineDetails, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobById, getJobByMachineId, getJobByDispatchId, resetStuckAttempts, getRecentFailedRunUrls } from "./log.js";
+import { initLogTable, appendLog, countPriorDispatches, completeOrphanedPlanningJobs, attachJobRunIdIfMissing, updateJobRunId, updateJobStatus, updateJobPrUrl, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobById, getJobByMachineId, getJobByDispatchId, resetStuckAttempts, getRecentFailedRunUrls } from "./log.js";
 import { recordDispatchFailure, recordDispatchSuccess, shouldCountFailure, initDispatchBreakerTable, parkIssue, prBudgetParkMessage, isParked } from "./dispatch-breaker.js";
 import type { Job, JobStatus } from "./log.js";
 import { getInstallationToken, getInstallationId, getAppSlug, getScopedInstallationToken } from "./github-app-auth.js";
@@ -132,14 +132,13 @@ import { getRestateStatus, setRestateStatus } from "./restate/status.js";
 import type { RestateRegistrationStatus } from "./restate/status.js";
 import { setProviderRegistry } from "./restate/tools.js";
 import { callTool, callToolAsSystem } from "./restate/tools-client.js";
-import { makeKgRefresh, setActiveKgRefresh, runKgRefreshPreflight, defaultFetchDefaultBranch, defaultFetchSnapshotCommitSha, defaultMaterialize, defaultMcpToolCall, defaultPersistLastRefresh, defaultLoadLastRefresh } from "./kg-refresh.js";
+import { makeKgRefresh, runKgRefreshPreflight, defaultFetchDefaultBranch, defaultFetchSnapshotCommitSha, defaultMaterialize, defaultMcpToolCall, defaultPersistLastRefresh, defaultLoadLastRefresh } from "./kg-refresh.js";
 import type { KgRefreshHandle } from "./kg-refresh.js";
 import { beginCycle, isCurrentCycle, getPollStats, runWithDeadline } from "./poll-cycle.js";
 
 /**
- * The reaper's helper callbacks. `failKgRefreshMachine` is deliberately absent: the
- * KgRefresh workflow owns kg-refresh rows, so the reaper's kg-refresh branches are
- * inert (AII-901).
+ * The reaper's helper callbacks. The KgRefresh workflow owns kg-refresh rows, so the
+ * reaper has no kg-refresh hook (AII-901).
  */
 export function makeReaperHelpers(config: AppConfig, registry: ProviderRegistry): ReaperHelpers {
   return {
@@ -156,7 +155,7 @@ export function makeReaperHelpers(config: AppConfig, registry: ProviderRegistry)
   };
 }
 
-/** Set by startServer(); read by poll() to wire the reaper's kg-refresh failure callback. */
+/** Set by startServer(); read by the deploy-hold and settle wiring. */
 let activeKgRefresh: KgRefreshHandle | null = null;
 
 // ---------- Configuration ----------
@@ -4512,7 +4511,7 @@ export function makeKgRefreshAdminDeps(
   };
 }
 
-// Duplicates KG_STAGE_SETTINGS_KEY (src/kg-refresh.ts, unexported): keep the literal in step.
+// The settings key the deleted legacy state machine persisted its stage under.
 const LEGACY_KG_STAGE_SETTINGS_KEY = "kg_refresh_stage";
 
 /**
@@ -4597,56 +4596,10 @@ function startServer(
     githubAppId: config.githubAppId,
     githubAppPrivateKey: config.githubAppPrivateKey,
     kgSourceRepo: config.kgSourceRepo,
-    getKgBaseRepo: () => getOrchestratorSettings().kgBaseRepo,
-    runnerCallbackBaseUrl: config.runnerCallbackBaseUrl,
-    runnerTokenSecret: config.runnerTokenSecret,
-    resolveMappingTeamKey: (ownerRepo) => {
-      const entry = Object.entries(getMappings()).find(([, m]) => `${m.owner}/${m.repo}` === ownerRepo);
-      if (!entry) return undefined;
-      const [teamKey, mapping] = entry;
-      return { teamKey, dependencyTokenScope: mapping.dependencyTokenScope };
-    },
-    dispatchRun: (opts) => dispatchKgRefreshRun(config, opts),
-    onOutcome: (outcome, data) => {
-      void handleKgRefreshOutcome(config, registry, outcome, data);
-    },
-    resolveExecutionMode: () => {
-      const { mode: runnerMode } = getRunnerMode();
-      const resolved = resolveExecutionPath(runnerMode, KG_REFRESH_DEFAULT_EXECUTION_MODE);
-      return resolved === "both" ? "github-actions" : resolved;
-    },
-    appendJobLog: (opts) => {
-      return appendLog({
-        issueId: "kg-refresh",
-        phase: "kg-refresh",
-        dispatchId: opts.dispatchId,
-        executionMode: opts.executionMode,
-        repo: config.kgSourceRepo ? parseKgSourceRepo(config.kgSourceRepo).fullName : undefined,
-      });
-    },
-    updateJobMachine: (jobId, opts) => {
-      if (opts.machineNonce !== undefined) {
-        updateJobMachineDetails(jobId, {
-          machineNonce: opts.machineNonce,
-          machineId: opts.machineId,
-          logsUrl: opts.logsUrl,
-        });
-      } else if (opts.logsUrl) {
-        updateJobPrUrl(jobId, opts.logsUrl);
-      }
-      if (opts.workflowRunId !== undefined) {
-        updateJobRunId(jobId, opts.workflowRunId);
-      }
-    },
-    closeJobLog: (jobId, status) => {
-      updateJobStatus(jobId, status);
-    },
   });
   activeKgRefresh = kgRefresh;
-  setActiveKgRefresh(kgRefresh);
-  // A deploy hold clearing is not a `running` transition inside kgRefresh (trigger()'s
-  // deployHeld() check answers 409 before running is ever set) — wake any webhook head
-  // queued behind that refusal explicitly (AII-636).
+  // A deploy hold answers a trigger with 409 before any refresh runs — wake any webhook
+  // head queued behind that refusal explicitly (AII-636).
   onDeployHoldCleared(() => activeKgRefresh?.fireRefreshSettled());
 
   const handleRequest: http.RequestListener = (req, res) => {
@@ -4874,7 +4827,9 @@ function startServer(
         kgBaseRepo: getOrchestratorSettings().kgBaseRepo,
         githubAppId: config.githubAppId,
         githubAppPrivateKey: config.githubAppPrivateKey,
-        trigger: (opts) => kgRefresh.trigger(opts),
+        trigger: async (opts) => kgRefreshAdminDeps
+          ? kgRefreshAdminDeps.trigger({ dryRun: opts.dryRun, ref: opts.ref })
+          : { status: 501, body: { error: "kg-source-repo-not-configured" } },
         reportDryRun: (report) => kgRefresh.reportDryRun(report),
         onRefreshSettled: (cb) => kgRefresh.onRefreshSettled(cb),
         forgetKgPr: (repo, prNumber) => kgRefresh.forgetPr(repo, prNumber),
@@ -4963,7 +4918,6 @@ function startServer(
             notifyType: config.notifyType,
             notifyWebhookUrl: config.notifyWebhookUrl,
           },
-          onKgRefreshRunnerComplete: kgRefresh.onRunnerComplete.bind(kgRefresh),
           checkPlanningAdmissionTermination: (dispatchId) => tryFastReleasePlanningAdmission(config, dispatchId),
           onReviewFixResult,
           kgRefreshClient: kgRefreshIngressClient,
