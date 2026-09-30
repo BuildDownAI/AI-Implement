@@ -26,7 +26,7 @@ import {
  */
 
 export type UsageMismatchField =
-  | "stage" | "agent" | "provider" | "model" | "profileId" | "authMode" | "limit" | "outcome";
+  | "stage" | "agent" | "provider" | "model" | "profileId" | "authMode" | "limit" | "outcome" | "usage";
 
 /** `verified`: attribution accepted; `mismatch`: accepted but a claim disagreed with the snapshot;
  *  `rejected`: present but malformed or from another snapshot; `absent`: none supplied. */
@@ -131,11 +131,17 @@ export function normalizeInvocation(
   const outcome = telemetry?.outcome ?? claim?.outcome ?? "unknown";
   if (claim && telemetry && claim.outcome !== telemetry.outcome) flag("outcome");
 
-  // Usage: claimed usage is primary for tokens/cost when present; telemetry supplies the rest.
+  // Usage: observed telemetry is authoritative; claimed usage only fills fields telemetry lacks.
   const cu = claim?.usage ?? null;
-  const tokensIn = cu ? cu.tokensIn : count(telemetry?.tokensIn);
-  const tokensOut = cu ? cu.tokensOut : count(telemetry?.tokensOut);
-  const costUsd = cu ? cu.costUsd : count(telemetry?.costUsd);
+  const pick = (observed: unknown, claimed: number | null | undefined): number | null => {
+    const o = count(observed);
+    const c = count(claimed);
+    if (o !== null && c !== null && o !== c) flag("usage");
+    return o ?? c;
+  };
+  const tokensIn = pick(telemetry?.tokensIn, cu?.tokensIn);
+  const tokensOut = pick(telemetry?.tokensOut, cu?.tokensOut);
+  const costUsd = pick(telemetry?.costUsd, cu?.costUsd);
   const cacheReadTokens = count(telemetry?.cacheReadTokens);
   const cacheCreationTokens = count(telemetry?.cacheCreationTokens);
 
