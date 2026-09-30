@@ -1,5 +1,5 @@
 import { getDb } from "./dedup.js";
-import { markCommentGapfillRunTerminal } from "./comment-gapfill-queue.js";
+import { markCommentGapfillRunTerminal, requeueGapfillAfterPushFailure } from "./comment-gapfill-queue.js";
 import { isFailureRecord, type FailureRecord } from "./pipeline/failure-classification.js";
 import { read as readAdmission, release as releaseAdmission } from "./dispatch-admission.js";
 import { REVIEW_FIX_EVIDENCE_RETENTION_MS } from "./review-fix-evidence.js";
@@ -439,12 +439,19 @@ export function updateJobStatus(
   // terminalize its queue row, or hasPendingConflictResolution stays true
   // forever and conflict-recovery attempt 2 is unreachable (observed livelock).
   if (isTerminal) {
-    const job = getDb().prepare("SELECT repo, trigger, pr_url, dispatch_id, admission_generation, execution_mode FROM dispatch_log WHERE id = ?").get(jobId) as
-      | { repo: string; trigger: string | null; pr_url: string | null; dispatch_id: string | null; admission_generation: number | null; execution_mode: string | null } | undefined;
+    const job = getDb().prepare("SELECT repo, trigger, pr_url, dispatch_id, admission_generation, execution_mode, failure_json FROM dispatch_log WHERE id = ?").get(jobId) as
+      | { failure_json: string | null; repo: string; trigger: string | null; pr_url: string | null; dispatch_id: string | null; admission_generation: number | null; execution_mode: string | null } | undefined;
     const prUrlForRow = prUrl ?? job?.pr_url ?? null;
     const m = prUrlForRow ? /\/pull\/(\d+)$/.exec(prUrlForRow) : null;
     if (job?.trigger === "comment" && m) {
       const outcome = status === "completed" ? "completed" : "failed";
+      // AII-922: retry once when the run died at push (transient or auth failure; a
+      // conflict has its own rail). Must run before the row leaves 'dispatched'.
+      const pushFailure = outcome === "failed" ? parseFailureJson(job.failure_json) : null;
+      if (pushFailure && pushFailure.stage === "push" && (pushFailure.category === "transient" || pushFailure.category === "auth")
+        && requeueGapfillAfterPushFailure(job.repo, Number(m[1]))) {
+        console.log(`[gapfill] push failure (${pushFailure.code}) on ${job.repo}#${m[1]}; re-enqueued once`);
+      }
       const n = markCommentGapfillRunTerminal(job.repo, Number(m[1]), outcome);
       if (n > 0) console.log(`[gapfill] terminalized ${n} queue row(s) for ${job.repo}#${m[1]} -> ${outcome}`);
     }
