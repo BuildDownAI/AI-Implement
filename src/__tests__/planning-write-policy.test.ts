@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync, existsSync, readFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync, existsSync, readFileSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -48,6 +48,26 @@ describe("planning write policy", () => {
       join(tmpdir(), "planning-guard-x", "guard.mjs"),
     ]) {
       expect(allow(p), p).toBe(false);
+    }
+  });
+
+  it("allows valid writes through a symlinked workspace alias and its canonical spelling", () => {
+    const aliasParent = mkdtempSync(join(tmpdir(), "pwp-alias-"));
+    try {
+      const alias = join(aliasParent, "ws-link");
+      symlinkSync(ws, alias);
+      const real = realpathSync(ws);
+      for (const workspaceDir of [ws, alias, real]) {
+        for (const base of [ws, alias, real]) {
+          const p = join(base, "ai-output", "comments", "01-a.md");
+          expect(decidePlanningWrite({ file_path: p }, workspaceDir).allow, `${workspaceDir} <- ${p}`).toBe(true);
+        }
+        expect(decidePlanningWrite({ file_path: "ai-output/comments/01-a.md" }, workspaceDir).allow).toBe(true);
+        expect(decidePlanningWrite({ file_path: join(alias, "src", "a.md") }, workspaceDir).allow).toBe(false);
+        expect(decidePlanningWrite({ file_path: join(real, "ai-output", "comments-evil", "a.md") }, workspaceDir).allow).toBe(false);
+      }
+    } finally {
+      rmSync(aliasParent, { recursive: true, force: true });
     }
   });
 
@@ -107,6 +127,7 @@ describe("planning write policy", () => {
           JSON.stringify({ tool_name: tool, tool_input: { file_path } });
         expect(run(settingsPath, call("Write", "ai-output/comments/01-a.md")).status).toBe(0);
         expect(run(settingsPath, call("Write", join(ws, "ai-output", "comments", "01-a.md"))).status).toBe(0);
+        expect(run(settingsPath, call("Write", join(realpathSync(ws), "ai-output", "comments", "01-a.md"))).status).toBe(0);
         expect(run(settingsPath, call("Write", "src/a.ts")).status).toBe(2);
         expect(run(settingsPath, call("Write", "ai-output/comments/../../src/a.ts")).status).toBe(2);
         expect(run(settingsPath, call("Write", join(dirname(settingsPath), "guard.mjs"))).status).toBe(2);
@@ -115,6 +136,41 @@ describe("planning write policy", () => {
         expect(run(settingsPath, "not json").status).toBe(2);
         expect(run(settingsPath, "null").status).toBe(2);
         expect(run(settingsPath, "").status).toBe(2);
+      } finally {
+        policy.cleanup();
+      }
+    });
+
+    it("runs with lexical and canonical workspace spellings when the workspace is a symlink alias", () => {
+      const aliasParent = mkdtempSync(join(tmpdir(), "pwp-alias-"));
+      const alias = join(aliasParent, "ws-link");
+      symlinkSync(ws, alias);
+      const policy = setupPlanningWritePolicy(alias);
+      try {
+        const settingsPath = policy.args[policy.args.indexOf("--settings") + 1];
+        const call = (file_path: string) => JSON.stringify({ tool_name: "Write", tool_input: { file_path } });
+        for (const base of [alias, ws, realpathSync(ws)]) {
+          expect(run(settingsPath, call(join(base, "ai-output", "comments", "01-a.md"))).status).toBe(0);
+          expect(run(settingsPath, call(join(base, "src", "a.md"))).status).toBe(2);
+        }
+      } finally {
+        policy.cleanup();
+        rmSync(aliasParent, { recursive: true, force: true });
+      }
+    });
+
+    it("makes the trusted settings authoritative: hooks enabled and no file-based setting sources", () => {
+      const policy = setupPlanningWritePolicy(ws);
+      try {
+        const args = policy.args;
+        const i = args.indexOf("--setting-sources");
+        expect(i).toBeGreaterThanOrEqual(0);
+        expect(args[i + 1]).toBe("");
+        expect(args.indexOf("--settings")).toBeGreaterThan(-1);
+        const settings = JSON.parse(readFileSync(args[args.indexOf("--settings") + 1], "utf-8"));
+        expect(settings.disableAllHooks).toBe(false);
+        expect(settings.hooks.PreToolUse).toHaveLength(1);
+        expect(settings.hooks.PreToolUse[0].hooks[0].command).not.toContain(ws + "/.claude");
       } finally {
         policy.cleanup();
       }

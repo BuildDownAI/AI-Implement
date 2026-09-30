@@ -6,6 +6,9 @@
  * The hook script and settings file are created in a fresh temp directory outside the
  * workspace, so neither repository content nor the planning model's own tools can
  * rewrite them (the guard denies every Write except into the approved directory).
+ * `--setting-sources ""` loads no user/project/local settings, so repository or user
+ * config can neither disable hooks (`disableAllHooks`) nor add competing ones; the
+ * `--settings` file is the only file-based configuration and sets `disableAllHooks: false`.
  * This is a tool-boundary guard, not a filesystem sandbox: a check-then-write race
  * and anything outside the exposed tools are out of scope.
  */
@@ -42,9 +45,9 @@ function decide(payload, workspaceDir) {
     return deny("workspace could not be resolved");
   }
   const approvedDir = path.join(wsReal, "ai-output", "comments");
-  const target = path.resolve(wsReal, filePath);
-  if (path.dirname(target) !== approvedDir) return deny("writes are limited to ai-output/comments/");
-  if (!target.endsWith(".md") || path.basename(target) === ".md") return deny("only Markdown files may be written");
+  const target = path.resolve(workspaceDir, filePath);
+  const base = path.basename(target);
+  if (!base.endsWith(".md") || base === ".md") return deny("only Markdown files may be written");
   // Canonicalize the deepest existing ancestor, then re-append the missing suffix.
   let existing = target;
   const suffix = [];
@@ -67,7 +70,7 @@ function decide(payload, workspaceDir) {
   } catch {
     return deny("path could not be verified");
   }
-  if (resolved !== target) return deny("path resolves outside ai-output/comments/ (symlink)");
+  if (path.dirname(resolved) !== approvedDir) return deny("writes are limited to ai-output/comments/");
   return { allow: true, reason: "" };
 }
 `;
@@ -143,6 +146,7 @@ export function setupPlanningWritePolicy(workspaceDir: string): PlanningWritePol
     const settingsPath = path.join(dirReal, "settings.json");
     fs.writeFileSync(guardPath, GUARD_MAIN, { mode: 0o400 });
     const settings = {
+      disableAllHooks: false,
       hooks: {
         PreToolUse: [
           {
@@ -158,7 +162,7 @@ export function setupPlanningWritePolicy(workspaceDir: string): PlanningWritePol
       },
     };
     fs.writeFileSync(settingsPath, JSON.stringify(settings), { mode: 0o400 });
-    return { args: [...buildPlanningToolArgs(), "--settings", settingsPath], cleanup };
+    return { args: [...buildPlanningToolArgs(), "--setting-sources", "", "--settings", settingsPath], cleanup };
   } catch (err) {
     cleanup();
     throw err;
