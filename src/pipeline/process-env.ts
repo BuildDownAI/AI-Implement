@@ -81,3 +81,25 @@ export function modelProcessEnv(allowRepositoryWrites: boolean): NodeJS.ProcessE
   delete env.AI_IMPLEMENT_FORWARDED_SECRETS;
   return env;
 }
+
+/**
+ * Environment for git subprocesses spawned by the clone, install-skills and
+ * reference-repos steps. Git needs PATH, HOME (global config and credential
+ * helpers), and TLS/proxy variables, and nothing else from the runner's
+ * credential surface: callback tokens, model credentials, install credentials,
+ * ambient GitHub tokens, forwarded secrets, and the credential-bearing run
+ * config are all removed. Operation-scoped credentials (GIT_ASKPASS/GIT_PASSWORD,
+ * GIT_CONFIG_* headers) are passed as `extra` and applied after stripping.
+ * process.env is never mutated.
+ */
+export function gitProcessEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  for (const key of MODEL_CREDENTIAL_KEYS) delete env[key];
+  for (const key of RUNNER_CREDENTIAL_KEYS) delete env[key];
+  for (const key of INSTALL_CREDENTIAL_KEYS) delete env[key];
+  for (const key of GITHUB_WRITE_CREDENTIAL_KEYS) delete env[key];
+  for (const key of parseForwardedSecrets()) delete env[key];
+  delete env.AI_IMPLEMENT_FORWARDED_SECRETS;
+  delete env.AI_IMPLEMENT_RUN_CONFIG;
+  return { ...env, ...extra };
+}
