@@ -219,6 +219,63 @@ describe("aggregateUsage", () => {
   });
 });
 
+describe("frozen configuration provenance", () => {
+  it("copies snapshot id, config revision refs and profile revision onto rows", () => {
+    const row = normalizeInvocation(snap, { attribution: claim("review") })!;
+    expect(row.snapshotId).toBe("snap-1");
+    expect(row.configRevisions).toEqual({
+      orchestratorDefault: { configRevisionId: "r1", revision: 1 },
+      project: { configRevisionId: "r2", revision: 1 },
+    });
+    expect(row.profileRevision).toBe(2);
+    const agg = aggregateUsage([row]);
+    expect(agg.rows[0].configRevisions).toEqual(row.configRevisions);
+    expect(agg.rows[0].profileRevision).toBe(2);
+  });
+
+  it("cannot be replaced by forged claimed references", () => {
+    const forged = {
+      ...claim("review"),
+      configRevisions: { orchestratorDefault: { configRevisionId: "evil", revision: 9 }, project: { configRevisionId: "evil2", revision: 9 } },
+      profileRevision: 99,
+    };
+    const row = normalizeInvocation(snap, { stage: "review", attribution: forged })!;
+    expect(row.attribution).toBe("rejected");
+    expect(row.configRevisions.project.configRevisionId).toBe("r2");
+    expect(row.profileRevision).toBe(2);
+    expect(JSON.stringify(row)).not.toContain("evil");
+    const other = normalizeInvocation(snap, { stage: "review", attribution: claim("review", { snapshotId: "other" }) })!;
+    expect(other.snapshotId).toBe("snap-1");
+  });
+
+  it("keeps identical invocation ids under different snapshots distinct", () => {
+    const snap2 = { ...snap, snapshotId: "snap-2", configRevisions: { ...snap.configRevisions, project: { configRevisionId: "r3", revision: 4 } } };
+    const a = normalizeInvocation(snap, { stage: "review", invocationId: "same", telemetry: tel({ tokensIn: 10, tokensOut: 1 }) })!;
+    const b = normalizeInvocation(snap2, { stage: "review", invocationId: "same", telemetry: tel({ tokensIn: 10, tokensOut: 1 }) })!;
+    const agg = aggregateUsage([a, b]);
+    expect(agg.invocations).toBe(2);
+    expect(agg.duplicatesIgnored).toBe(0);
+    expect(agg.conflicts).toBe(0);
+    expect(agg.totals.tokensIn).toBe(20);
+    expect(agg.rows.map((r) => r.configRevisions.project.configRevisionId)).toEqual(["r2", "r3"]);
+  });
+
+  it("distinguishes same-snapshot duplicates from conflicts", () => {
+    const a = normalizeInvocation(snap, { stage: "review", invocationId: "dup", telemetry: tel({ tokensIn: 10, tokensOut: 1 }) })!;
+    const b = normalizeInvocation(snap, { stage: "review", invocationId: "dup", telemetry: tel({ tokensIn: 10, tokensOut: 1 }) })!;
+    const c = normalizeInvocation(snap, { stage: "review", invocationId: "dup", telemetry: tel({ tokensIn: 11, tokensOut: 1 }) })!;
+    const agg = aggregateUsage([a, b, c]);
+    expect(agg).toMatchObject({ invocations: 1, duplicatesIgnored: 1, conflicts: 1 });
+    expect(agg.totals.tokensIn).toBe(10);
+  });
+
+  it("treats a same-snapshot record with different config refs as a conflict", () => {
+    const a = normalizeInvocation(snap, { stage: "review", invocationId: "x" })!;
+    const b = { ...a, profileRevision: 3 };
+    expect(aggregateUsage([a, b])).toMatchObject({ invocations: 1, conflicts: 1 });
+  });
+});
+
 describe("summarizeInvocations", () => {
   it("counts unattributable observations instead of throwing", () => {
     const out = summarizeInvocations(snap, [{ attribution: claim("planning") }, { attribution: null }]);
