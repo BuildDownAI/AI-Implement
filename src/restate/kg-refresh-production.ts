@@ -28,6 +28,7 @@ import { encodeRunConfig, type RunConfigV1 } from "../run-config.js";
 import { getRunnerMode, resolveExecutionPath } from "../runner-mode.js";
 import { mintRunToken } from "../runner-tokens.js";
 import type { JobStatus } from "../log.js";
+import { findLogIdByDispatchId } from "../log.js";
 import type { RestateService } from "./endpoint.js";
 import {
   createKgRefreshWorkflow,
@@ -222,12 +223,7 @@ export function createProductionKgRefreshServices(
 
   // dispatch_log ids are numeric; the workflow keys its row by dispatch id string.
   const jobIds = new Map<string, number>();
-  const findJobId = input.findJobId ?? ((dispatchId: string): number | undefined => {
-    const row = getDb()
-      .prepare("SELECT id FROM dispatch_log WHERE dispatch_id = ? ORDER BY id DESC LIMIT 1")
-      .get(dispatchId) as { id: number } | undefined;
-    return row?.id;
-  });
+  const findJobId = input.findJobId ?? findLogIdByDispatchId;
 
   const deps: KgRefreshWorkflowDependencies = {
     rail,
@@ -236,6 +232,9 @@ export function createProductionKgRefreshServices(
       if (!config.runnerTokenSecret) throw new Error("RUNNER_TOKEN_SECRET is not configured");
       const mappingTeamKey = findKgMapping(input.kgSourceRepo)?.[0];
       if (mappingTeamKey === undefined) throw new Error(`no project mapping found for kgSourceRepo=${input.kgSourceRepo}`);
+      // Idempotent across processes: a replay after a crash before the dispatch step journaled re-mints for the same
+      // dispatch id, so clear any unconsumed rows first (the primary key is (dispatch_id, audience)).
+      getDb().prepare("DELETE FROM runner_tokens WHERE dispatch_id = ? AND consumed_at IS NULL").run(dispatchId);
       const base = { issueId: "kg-refresh", mappingTeamKey, phase: "kg-refresh" as const, dispatchId, ttlSeconds, secret: config.runnerTokenSecret };
       return {
         runToken: mintRunToken({ ...base, audience: "result" }).token,

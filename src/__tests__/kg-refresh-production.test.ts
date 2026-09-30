@@ -142,6 +142,14 @@ describe("mintRunTokens", () => {
       vi.useRealTimers();
     }
   });
+
+  it("is idempotent across processes: minting twice for one dispatch id succeeds", () => {
+    createProductionKgRefreshServices(makeInput());
+    const mint = capturedWorkflowDeps.current!.mintRunTokens;
+    mint({ dispatchId: "d-twice", ttlSeconds: 600 });
+    const second = mint({ dispatchId: "d-twice", ttlSeconds: 600 });
+    expect(verifyRunToken(second.runToken, "secret", "result", { consume: false }).ok).toBe(true);
+  });
 });
 
 describe("onOutcome", () => {
