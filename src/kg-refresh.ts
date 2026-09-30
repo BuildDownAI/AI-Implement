@@ -58,7 +58,7 @@ const KG_DRY_RUN_OUTCOMES_SETTINGS_KEY = "kg_refresh_dry_run_outcomes";
 
 /**
  * Default bound on the per-PR caches tracking KG PR-check state — this module's
- * `dryRunOutcomesByPr` and webhook.ts's `kgDryRunLastSha`/`kgDryRunPending` (AII-636).
+ * `dryRunOutcomesByPr` and webhook.ts's `kgDryRunLastSha` (AII-636).
  * Exported so webhook.ts's
  * caches, which have no natural expiry either, share the same bound.
  */
@@ -211,23 +211,10 @@ export interface KgRefreshHandle {
    */
   forgetPr(repo: string, prNumber: number): void;
   /**
-   * Registers a listener fired whenever an in-flight kg-refresh dispatch settles, for
-   * any reason — a dry-run completion, a real refresh completion, a failure, a revert,
-   * or TTL expiry (AII-636; previously fired only for a dry-run). Used by the webhook
-   * module's PR-triggered supersession queue (AII-633): a `synchronize` that finds
-   * its trigger returning 409 (a refresh already running) queues its head and waits
-   * for this signal to dispatch it. Returns an unregister function; the webhook module
-   * self-unregisters after each fire (one-shot per queue).
+   * Stores `outcome` as the dry-run verdict for `report`'s PR and sha and persists the cache
+   * (AII-730), so a later `reportDryRun` for that PR and sha can re-post it.
    */
-  onRefreshSettled(cb: () => void): () => void;
-  /**
-   * Fires every registered onRefreshSettled listener immediately, with no completed
-   * run (AII-636). A deploy hold answers the trigger with 409 before any refresh runs,
-   * so nothing else would wake a webhook head queued behind that refusal — the caller
-   * (index.ts, wired to deploy-hold.ts's onDeployHoldCleared) invokes this once the
-   * hold actually clears.
-   */
-  fireRefreshSettled(): void;
+  recordDryRunOutcome(report: KgDryRunReportTarget, outcome: RefreshOutcome): void;
 }
 
 interface KgRefreshInput {
@@ -600,8 +587,6 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
   const persistDryRunOutcomesFn = input.persistDryRunOutcomes ?? defaultPersistDryRunOutcomes;
   const loadDryRunOutcomesFn = input.loadDryRunOutcomes ?? defaultLoadDryRunOutcomes;
 
-  /** Listeners registered via onRefreshSettled(), fired by fireRefreshSettled() (AII-636). */
-  const refreshSettledListeners: Array<() => void> = [];
   /**
    * Dry-run outcomes keyed by `repo#prNumber` (AII-636), so a `labeled` webhook event
    * can only ever re-post the verdict computed for that same PR — never another PR's.
@@ -610,20 +595,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
    * re-post. Bounded to MAX_TRACKED_PRS entries, oldest evicted first; a PR-scoped
    * cache has no other natural expiry.
    */
-  // Nothing writes this map after AII-685, so `reportDryRun` always returns false
-  // until AII-730 restores the write.
   const dryRunOutcomesByPr = new Map<string, { sha: string; outcome: RefreshOutcome }>();
-
-  /** Fires every registered onRefreshSettled listener; a listener's own error never stops the others. */
-  function notifyRefreshSettled(): void {
-    for (const cb of [...refreshSettledListeners]) {
-      try {
-        cb();
-      } catch (err) {
-        console.error("[kg-refresh] onRefreshSettled listener failed:", err);
-      }
-    }
-  }
 
   // Guarded like the other boot-time restores: an injected loader returning a wrong shape
   // must not abort makeKgRefresh() (it runs synchronously from startServer()).
@@ -664,6 +636,17 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
   };
 
   return {
+    recordDryRunOutcome(report: KgDryRunReportTarget, outcome: RefreshOutcome): void {
+      const key = `${report.repo}#${report.prNumber}`;
+      dryRunOutcomesByPr.delete(key);
+      dryRunOutcomesByPr.set(key, { sha: report.sha, outcome });
+      if (dryRunOutcomesByPr.size > MAX_TRACKED_PRS) {
+        const oldestKey = dryRunOutcomesByPr.keys().next().value;
+        if (oldestKey !== undefined) dryRunOutcomesByPr.delete(oldestKey);
+      }
+      persistDryRunOutcomesFn(Array.from(dryRunOutcomesByPr.entries()));
+    },
+
     async reportDryRun(report: KgDryRunReportTarget): Promise<boolean> {
       const key = `${report.repo}#${report.prNumber}`;
       const stored = dryRunOutcomesByPr.get(key);
@@ -678,18 +661,6 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
     forgetPr(repo: string, prNumber: number): void {
       dryRunOutcomesByPr.delete(`${repo}#${prNumber}`);
       persistDryRunOutcomesFn(Array.from(dryRunOutcomesByPr.entries()));
-    },
-
-    onRefreshSettled(cb: () => void): () => void {
-      refreshSettledListeners.push(cb);
-      return () => {
-        const idx = refreshSettledListeners.indexOf(cb);
-        if (idx !== -1) refreshSettledListeners.splice(idx, 1);
-      };
-    },
-
-    fireRefreshSettled(): void {
-      notifyRefreshSettled();
     },
   };
 }

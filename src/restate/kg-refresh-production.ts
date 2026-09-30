@@ -35,11 +35,10 @@ import {
   type KgDispatchInput,
   type KgDispatchResult,
   type KgRefreshReportBody,
-  type KgRefreshRunInput,
   type KgRefreshStatusResult,
   type KgRefreshWorkflowDependencies,
 } from "./kg-refresh-workflow.js";
-import { createKgRepo, type KgRepoTriggerResult } from "./kg-repo.js";
+import { createKgRepo, type KgRepoEnqueueInput, type KgRepoEnqueueResult, type KgRepoTriggerResult } from "./kg-repo.js";
 import { RESTATE_INGRESS_BASE_URL } from "./server.js";
 
 /** Workflow file dispatched in the KG source repo (same value as `KG_REFRESH_WORKFLOW_FILE` in `src/index.ts`). */
@@ -94,7 +93,7 @@ export interface KgRefreshProductionInput {
     outcome: "success" | "no-new-data" | "failure",
     data: { failureCode?: string; failureReason?: string; dispatchId?: string; timedOut?: boolean },
   ) => void | Promise<void>;
-  fireSettled: () => void;
+  recordDryRunOutcome: KgRefreshWorkflowDependencies["recordDryRunOutcome"];
   isDeployHeld: () => boolean;
   readStatusRecord: () => RefreshOutcome | null;
   runPreflight: () => Promise<PreflightCheckResult>;
@@ -266,7 +265,7 @@ export function createProductionKgRefreshServices(
         (err) => console.error("[kg-refresh] outcome handler failed", err),
       );
     },
-    fireSettled: input.fireSettled,
+    recordDryRunOutcome: input.recordDryRunOutcome,
   };
 
   const toolDeps: KgRefreshToolDeps = {
@@ -314,8 +313,12 @@ export interface KgRefreshIngressClient {
   cancel(triggerId: string, reason: string): Promise<KgIngressResult>;
   status(triggerId: string): Promise<KgIngressResult<KgRefreshStatusResult>>;
   repoStatus(slug: string): Promise<KgIngressResult<{ triggerId: string; startedAt: number } | null>>;
-  /** Awaiting AII-730: `KgRepo` registers no `enqueueDryRun` handler yet, so today this resolves `unavailable`. */
-  enqueueDryRun(slug: string, entry: KgRefreshRunInput): Promise<KgIngressResult>;
+  /** Hands a PR-check dry-run to the `KgRepo` object: it runs now (`{ triggerId }`) or is held (`{ queued }`). */
+  enqueueDryRun(
+    slug: string,
+    entry: KgRepoEnqueueInput,
+    opts?: { idempotencyKey?: string },
+  ): Promise<KgIngressResult<KgRepoEnqueueResult>>;
 }
 
 export interface KgRefreshIngressClientDeps {
@@ -381,7 +384,7 @@ export function createKgRefreshIngressClient(
     cancel: (triggerId, reason) => invoke("KgRefresh", triggerId, "cancel", { reason }),
     status: (triggerId) => invoke("KgRefresh", triggerId, "status", {}),
     repoStatus: (slug) => invoke("KgRepo", slug, "status", {}),
-    enqueueDryRun: (slug, entry) => invoke("KgRepo", slug, "enqueueDryRun", entry),
+    enqueueDryRun: (slug, entry, opts) => invoke("KgRepo", slug, "enqueueDryRun", entry, opts?.idempotencyKey),
   };
 }
 

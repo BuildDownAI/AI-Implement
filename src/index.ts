@@ -1,4 +1,3 @@
-import { makeKgWebhookTrigger } from "./kg-webhook-trigger.js";
 import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -37,7 +36,7 @@ import { notify, notifyCompletion, notifyText, notifyKgRefreshOutcome } from "./
 import type { KgRefreshOutcomeNotification } from "./notify.js";
 import { isKgDegraded, postAvailableNotice, postBootNotice, postShutdownNotice, recordDeployOutcome, recordShutdown } from "./deploy-notify.js";
 import { refreshAvailability, readStampedTarget, resolveDeployTarget, type SelfDeployTarget, getAvailability } from "./deploy-availability.js";
-import { clearDeployHold, isDeployHeld, onDeployHoldCleared } from "./deploy-hold.js";
+import { clearDeployHold, isDeployHeld } from "./deploy-hold.js";
 import { decideAvailabilityAction, getDeployPolicy, getLastActedCommit, setLastActedCommit } from "./deploy-policy.js";
 import { canSelfDeploy, makeStartDeploy, readKgSourceRepo, parseKgSourceRepo } from "./deploy.js";
 import { remediateStuckJob, remediateFailedJob } from "./stuck-watchdog.js";
@@ -4599,9 +4598,6 @@ function startServer(
     kgSourceRepo: config.kgSourceRepo,
   });
   activeKgRefresh = kgRefresh;
-  // A deploy hold answers a trigger with 409 before any refresh runs — wake any webhook
-  // head queued behind that refusal explicitly (AII-636).
-  onDeployHoldCleared(() => activeKgRefresh?.fireRefreshSettled());
 
   const handleRequest: http.RequestListener = (req, res) => {
     const url = req.url || "/";
@@ -4828,9 +4824,11 @@ function startServer(
         kgBaseRepo: getOrchestratorSettings().kgBaseRepo,
         githubAppId: config.githubAppId,
         githubAppPrivateKey: config.githubAppPrivateKey,
-        trigger: makeKgWebhookTrigger(() => kgRefreshAdminDeps),
         reportDryRun: (report) => kgRefresh.reportDryRun(report),
-        onRefreshSettled: (cb) => kgRefresh.onRefreshSettled(cb),
+        enqueueDryRun: (key, entry, opts) =>
+          config.kgSourceRepo
+            ? kgRefreshIngressClient.enqueueDryRun(parseKgSourceRepo(config.kgSourceRepo).fullName, { key, ...entry }, opts)
+            : Promise.resolve({ status: "unavailable" as const }),
         forgetKgPr: (repo, prNumber) => kgRefresh.forgetPr(repo, prNumber),
       }, (repository, prNumber) => { queueReviewFixCancellationForClosedPr(repository, prNumber); }).catch((err) => {
         console.error("[webhook] Unhandled error:", err);
@@ -5471,7 +5469,7 @@ async function main(): Promise<void> {
       cancelWorkflowRun: async (runId) => cancelWorkflowRun(await kgWorkflowToken(), kgSlug.owner, kgSlug.repo, runId),
       persistLastRefresh: defaultPersistLastRefresh,
       handleKgRefreshOutcome: (outcome, data) => handleKgRefreshOutcome(config, registry, outcome, data),
-      fireSettled: () => activeKgRefresh?.fireRefreshSettled(),
+      recordDryRunOutcome: (report, outcome) => activeKgRefresh?.recordDryRunOutcome(report, outcome),
       isDeployHeld,
       readStatusRecord: defaultLoadLastRefresh,
       runPreflight: () => runKgRefreshPreflight({
