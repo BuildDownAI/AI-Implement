@@ -246,3 +246,17 @@ against pinned server 1.7.10; this is container evidence, not a live pilot rollo
 its pass/fail there — not this document — is the authoritative evidence for AII-813's "both
 container variants and SDK boundary suite pass" acceptance criterion. `npx tsc --noEmit --project
 tsconfig.restate-tests.json` passes as of the commit that added this section.
+
+## `feedback-loop-workflow.restate.test.ts`: the implement/review loop replayed (AII-626, AII-629)
+
+The loop's control flow lives in `src/pipeline/feedback-loop-core.ts` (`runFeedbackLoop`), with every
+effect — model calls, git reads, cycle-summary write, reporting, sleeping, clocks — injected as
+`LoopEffects`. The test defines a `FeedbackLoopTest` workflow **in the test file only** and journals
+each effect, then runs the production control flow against fake effects on both harness variants. No
+model, callback or credential is involved.
+
+Boundaries: the workflow is never registered in `src/restate/endpoint.ts`; nothing under
+`src/pipeline/` imports `src/restate/*` or `@restatedev/*` (guarded by
+`src/__tests__/restate-boundary.test.ts` in the default suite); the `*.restate.test.ts` file is excluded
+from `npm test` and runs under `npm run test:restate` (container variant needs Docker; set
+`RESTATE_TEST_RUNTIME=binary` for the binary variant).
