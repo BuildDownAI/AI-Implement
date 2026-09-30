@@ -156,6 +156,8 @@ describe("KgRefresh durable workflow", () => {
     fixtureRepo = mkdtempSync(join(tmpdir(), "kgwfrepo-"));
     writeFileSync(join(fixtureRepo, "sources.yml"), `namespace: ${NAMESPACE}\n`);
     mkdirSync(join(fixtureRepo, "snapshot"), { recursive: true });
+    writeFileSync(join(fixtureRepo, "snapshot", "embeddings.npz"), "vectors");
+    writeFileSync(join(fixtureRepo, "snapshot", "embeddings.meta.json"), "{}");
     tarball = makeTarball(fixtureRepo);
 
     servedStamp = OLD_STAMP;

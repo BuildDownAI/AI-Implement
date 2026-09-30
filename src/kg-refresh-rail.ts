@@ -191,6 +191,15 @@ export async function fetchGate(deps: KgRailDeps, _input: RailContext = {}): Pro
       return { gate: "ingest-needed", namespace, stampBefore, detail };
     }
 
+    const hasEmbeddings =
+      existsSync(join(source, "snapshot", "embeddings.npz")) && existsSync(join(source, "snapshot", "embeddings.meta.json"));
+    if (!hasEmbeddings) {
+      await rm(fetchDir, { recursive: true, force: true });
+      const detail = "Snapshot has no committed embeddings — a new ingest is required";
+      console.log(`[kg-refresh] ${detail}`);
+      return { gate: "ingest-needed", namespace, stampBefore, detail };
+    }
+
     return { gate: "ok", namespace, stampBefore, snapshotCommitSha, wasFirstRun, sourceDir: source };
   } catch (err) {
     throw new RailGateError("staging", `staging failed before any swap: ${String(err)}`, readContext);

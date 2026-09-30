@@ -120,6 +120,8 @@ describe("kg-refresh callback-URL contract", () => {
     fixtureRepo = mkdtempSync(join(tmpdir(), "kgrepo-"));
     writeFileSync(join(fixtureRepo, "sources.yml"), `namespace: https://kg.test.example/\n`);
     mkdirSync(join(fixtureRepo, "snapshot"), { recursive: true });
+    writeFileSync(join(fixtureRepo, "snapshot", "embeddings.npz"), "vectors");
+    writeFileSync(join(fixtureRepo, "snapshot", "embeddings.meta.json"), "{}");
     tarball = makeTarball(fixtureRepo);
     servedStamp = OLD_STAMP;
     canary = { count: 3, degraded: false };
