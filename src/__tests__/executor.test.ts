@@ -11,6 +11,7 @@ import { EventEmitter } from "node:events";
 import { ClaudeCliExecutor, readTelemetryFlag, type ActivityReportingConfig } from "../pipeline/executor.js";
 import { computeBackoffMs, DEFAULT_RETRY_POLICY, type RetryPolicy } from "../pipeline/retry-backoff.js";
 import type { ActivitySink, ActivityIdentity, ActivityToolResult } from "../pipeline/types.js";
+import { READ_ONLY_TOOL_PARAMS } from "../pipeline/steps/read-only-tools.js";
 
 interface FakeAttempt {
   stdoutLines?: string[];
@@ -858,6 +859,93 @@ describe.skipIf(isWindows)("ClaudeCliExecutor request-level retry (BAC-27114)", 
     expect(result.attempts).toBe(1);
     expect(result.failure?.category).toBe("transient");
     expect(result.failure?.code).toBe("PROVIDER_OVERLOADED");
+  });
+
+  it.each([
+    ["Edit", "Edit"],
+    ["Write", "Write"],
+    ["an MCP tool", "mcp__srv__do"],
+    ["an unknown tool", "Mystery"],
+  ])("does not retry a toolUseIsSafe failure after %s tool_use", async (_label, name) => {
+    const line = JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", name, input: {} }] } });
+    const { spawnImpl, callCount } = makeFakeSpawn([{ stdoutLines: [line], stderr: OVERLOAD_STDERR, exitCode: 1 }]);
+    const exec = new ClaudeCliExecutor("/tmp", "summary", false, spawnImpl, makeFakeSleep().sleepImpl);
+    const result = await exec.invoke({
+      prompt: "p", model: "m", stage: "review", expectsStructuredOutput: true,
+      retry: { policy: basePolicy, toolUseIsSafe: true },
+    });
+    expect(callCount()).toBe(1);
+    expect(result.attempts).toBe(1);
+  });
+
+  it("does not retry a toolUseIsSafe failure when a tool_use is hidden in a nameless nested block", async () => {
+    const line = JSON.stringify({ type: "assistant", message: { content: [{ type: "x", content: [{ type: "tool_use" }] }] } });
+    const { spawnImpl, callCount } = makeFakeSpawn([{ stdoutLines: [line], stderr: OVERLOAD_STDERR, exitCode: 1 }]);
+    const exec = new ClaudeCliExecutor("/tmp", "summary", false, spawnImpl, makeFakeSleep().sleepImpl);
+    await exec.invoke({
+      prompt: "p", model: "m", stage: "review", expectsStructuredOutput: true,
+      retry: { policy: basePolicy, toolUseIsSafe: true },
+    });
+    expect(callCount()).toBe(1);
+  });
+
+  it("still retries a toolUseIsSafe failure when content is a malformed string", async () => {
+    const line = JSON.stringify({ type: "assistant", message: { content: "oops" } });
+    const { spawnImpl, callCount } = makeFakeSpawn([{ stdoutLines: [line], stderr: OVERLOAD_STDERR, exitCode: 1 }, { exitCode: 0 }]);
+    const exec = new ClaudeCliExecutor("/tmp", "summary", false, spawnImpl, makeFakeSleep().sleepImpl);
+    await exec.invoke({
+      prompt: "p", model: "m", stage: "review", expectsStructuredOutput: true,
+      retry: { policy: basePolicy, toolUseIsSafe: true },
+    });
+    expect(callCount()).toBe(2);
+  });
+
+  describe("restricted tool spawn args", () => {
+    function capture(): { spawnImpl: typeof spawn; argv: () => string[] } {
+      let captured: string[] = [];
+      const inner = makeFakeSpawn([{ exitCode: 0 }]).spawnImpl;
+      const spawnImpl = ((cmd: string, args: readonly string[], opts: unknown) => {
+        captured = [...args];
+        return (inner as unknown as (...a: unknown[]) => unknown)(cmd, args, opts);
+      }) as unknown as typeof spawn;
+      return { spawnImpl, argv: () => captured };
+    }
+    const flagValue = (argv: string[], flag: string): string | undefined => argv[argv.indexOf(flag) + 1];
+
+    it("limits a builtinTools session to Read/Glob/Grep and denies shell, writes, MCP, skills and delegates", async () => {
+      const { spawnImpl, argv } = capture();
+      const exec = new ClaudeCliExecutor("/tmp", "summary", false, spawnImpl, makeFakeSleep().sleepImpl);
+      await exec.invoke({ prompt: "p", model: "m", ...READ_ONLY_TOOL_PARAMS });
+      const args = argv();
+      expect(flagValue(args, "--tools")).toBe("Read,Glob,Grep");
+      expect(args).toContain("--strict-mcp-config");
+      expect(args).not.toContain("--mcp-config");
+      expect(args).toContain("--disable-slash-commands");
+      const denied = flagValue(args, "--disallowed-tools")!.split(",");
+      for (const t of ["Bash", "Edit", "Write", "NotebookEdit", "Task", "Agent", "Skill", "mcp__*"]) {
+        expect(denied).toContain(t);
+      }
+      expect(flagValue(args, "--allowed-tools")).toBe("Read,Glob,Grep");
+      expect(args.join(" ")).not.toContain("curl");
+    });
+
+    it("leaves an implementation-style invocation unrestricted", async () => {
+      const { spawnImpl, argv } = capture();
+      const exec = new ClaudeCliExecutor("/tmp", "summary", false, spawnImpl, makeFakeSleep().sleepImpl);
+      await exec.invoke({ prompt: "p", model: "m", maxTurns: 5 });
+      const args = argv();
+      for (const f of ["--tools", "--disallowed-tools", "--strict-mcp-config", "--disable-slash-commands", "--allowed-tools"]) {
+        expect(args).not.toContain(f);
+      }
+    });
+
+    it("emits --allowed-tools alone for an implementation invocation with configured tools", async () => {
+      const { spawnImpl, argv } = capture();
+      const exec = new ClaudeCliExecutor("/tmp", "summary", false, spawnImpl, makeFakeSleep().sleepImpl);
+      await exec.invoke({ prompt: "p", model: "m", tools: ["Bash(npm test)"] });
+      expect(flagValue(argv(), "--allowed-tools")).toBe("Bash(npm test)");
+      expect(argv()).not.toContain("--tools");
+    });
   });
 
   it("classifies (but does not retry) a structural exit-0 review failure — missing structured output is not transient", async () => {
