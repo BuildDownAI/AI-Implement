@@ -64,6 +64,8 @@ The `context` argument carries `PipelineContextData` — the issue fields, works
 
 `feedback-loop` is where Claude actually runs — it drives the implement/review cycle up to `maxIterations`. Everything before it prepares the workspace; everything after it reacts to the result.
 
+**The loop's control flow is an I/O-free function.** `runFeedbackLoop` in `src/pipeline/feedback-loop-core.ts` owns the pass sequence, the `approved` / `iterations_exhausted` / `max_turns` / `review_error` / `provider_unavailable` gates, stage retry, and the post-mortem branch. Every effect (implement, review, post-mortem, diff read, dirty check, cycle-summary write, reporting, sleep, clock, logging) is injected as `LoopEffects`; `feedbackLoopStep` builds the real ones. `src/__tests__/restate/feedback-loop-workflow.restate.test.ts` runs the same core as a test-only Restate workflow (never registered in `src/restate/endpoint.ts`) to prove replay and exactly-once behavior. Nothing under `src/pipeline/` may import `src/restate/` or `@restatedev/*`; `steps-feedback-loop.test.ts` enforces it.
+
 Two consequences worth internalising:
 
 **`preflight` does not gate the push.** It is skipped unless the review already approved, and `push` runs regardless of what it found. It records `typecheck`/`lint`/`test` results; it does not block a pull request on them. Work that fails preflight still ships.
