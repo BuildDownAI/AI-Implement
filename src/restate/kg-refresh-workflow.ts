@@ -532,10 +532,10 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       // run's outcome. The `finally` still releases when failurePath itself throws (an
       // invocation cancel), so the lock cannot leak. finish()'s own release is a harmless
       // duplicate no-op.
-      ctx.set("step", "failed");
-      const at = await ctx.date.now();
-      const detail = err instanceof Error ? err.message : String(err);
       try {
+        ctx.set("step", "failed");
+        const at = await ctx.date.now();
+        const detail = err instanceof Error ? err.message : String(err);
         const outcome = await failurePath(buildFailureOutcome(at, detail), "workflow_error");
         return await finish(outcome);
       } finally {
