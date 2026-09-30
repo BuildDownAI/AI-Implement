@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, existsSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -1460,5 +1460,32 @@ describe("feedbackLoopStep stage-level retry (BAC-27134)", () => {
     expect((thrown as Error).message).toBe("boom");
     expect(implementStep.run).toHaveBeenCalledTimes(1);
     expect(reviewStep.run).not.toHaveBeenCalled();
+  });
+});
+
+describe("feedback-loop core isolation (AII-626)", () => {
+  const pipelineDir = join(__dirname, "..", "pipeline");
+  const sources = (dir: string): string[] =>
+    readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+      const path = join(dir, entry.name);
+      if (entry.isDirectory()) return sources(path);
+      return entry.name.endsWith(".ts") ? [path] : [];
+    });
+
+  it("no file under src/pipeline/ imports src/restate/ or @restatedev/*", () => {
+    const importRe = /(?:from\s+|import\s*\(\s*|import\s+)["']([^"']+)["']/g;
+    const offenders: string[] = [];
+    for (const file of sources(pipelineDir)) {
+      for (const match of readFileSync(file, "utf-8").matchAll(importRe)) {
+        if (match[1].startsWith("@restatedev/") || /(^|\/)restate\//.test(match[1])) offenders.push(`${file}: ${match[1]}`);
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it("the extracted core does no I/O of its own", () => {
+    const core = readFileSync(join(pipelineDir, "feedback-loop-core.ts"), "utf-8");
+    expect(core).not.toMatch(/from\s+["']node:/);
+    expect(core).not.toMatch(/new Date\(|Date\.now|setTimeout|console\./);
   });
 });
