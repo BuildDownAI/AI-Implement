@@ -341,4 +341,62 @@ describe("stale owners", () => {
     o.markRecoveryRequired(r);
     expect(store.checkpoint({ profileId: "p1", ownerGeneration: r.generation, stateSequence: 1, sessionData: SENTINEL }).ok).toBe(true);
   });
+
+  describe("immutable reservation set per dispatch", () => {
+    const api = (profileId: string): OwnershipModule.ProfileRequest => ({ profileId, authMode: "api_key" });
+    const allRows = () => dedup.getDb().prepare("SELECT profile_id, owner_generation, released_at FROM model_profile_reservations ORDER BY profile_id").all();
+    const changed = { status: "rejected", reason: "reservation_set_changed" };
+
+    it("rejects expansion and reduction without writes", () => {
+      expect(o.reserve({ dispatchId: "d1", profiles: [sub("pa")] }).status).toBe("reserved");
+      const before = allRows();
+      expect(o.reserve({ dispatchId: "d1", profiles: [sub("pa"), sub("pb")] })).toEqual(changed);
+      expect(allRows()).toEqual(before);
+      expect(o.reserve({ dispatchId: "d2", profiles: [sub("pc"), sub("pd")] }).status).toBe("reserved");
+      const before2 = allRows();
+      expect(o.reserve({ dispatchId: "d2", profiles: [sub("pc")] })).toEqual(changed);
+      expect(allRows()).toEqual(before2);
+    });
+
+    it("retries the same set idempotently in any order, also after restart", async () => {
+      const first = o.reserve({ dispatchId: "d1", profiles: [sub("pa"), sub("pb")] });
+      const before = allRows();
+      expect(o.reserve({ dispatchId: "d1", profiles: [sub("pb"), sub("pa"), sub("pa")] })).toEqual(first);
+      expect(allRows()).toEqual(before);
+      dedup.closeDb();
+      o = await boot();
+      expect(o.reserve({ dispatchId: "d1", profiles: [sub("pb"), sub("pa")] })).toEqual(first);
+      expect(o.reserve({ dispatchId: "d1", profiles: [sub("pa")] })).toEqual(changed);
+      expect(allRows()).toEqual(before);
+    });
+
+    it("mixed mode cannot hide an owned subscription profile", () => {
+      o.reserve({ dispatchId: "d1", profiles: [sub("pa")] });
+      expect(o.reserve({ dispatchId: "d1", profiles: [api("pa")] })).toEqual(changed);
+      expect(o.reserve({ dispatchId: "d1", profiles: [sub("pa"), api("pb")] })).toMatchObject({
+        status: "reserved",
+        skipped: ["pb"],
+      });
+      expect(allRows()).toHaveLength(1);
+    });
+
+    it("released history cannot be bypassed by changing the set", () => {
+      const r = reserve1("d1");
+      o.releaseLaunchRejected(r);
+      const before = allRows();
+      expect(o.reserve({ dispatchId: "d1", profiles: [sub("p1")] })).toEqual({ status: "rejected", reason: "dispatch_released" });
+      expect(o.reserve({ dispatchId: "d1", profiles: [sub("p1"), sub("p2")] })).toEqual(changed);
+      expect(o.reserve({ dispatchId: "d1", profiles: [api("p1")] })).toEqual(changed);
+      expect(allRows()).toEqual(before);
+    });
+
+    it("a queued zero-write attempt has no established set; api-key-only needs no rows", () => {
+      const d0 = reserve1("d0");
+      expect(o.reserve({ dispatchId: "d1", profiles: [sub("p1")] }).status).toBe("queued");
+      expect(o.releaseLaunchRejected(d0).status).toBe("ok");
+      expect(o.reserve({ dispatchId: "d1", profiles: [sub("p1"), sub("p2")] }).status).toBe("reserved");
+      expect(o.reserve({ dispatchId: "d3", profiles: [api("px")] })).toEqual({ status: "reserved", reservations: [], skipped: ["px"] });
+      expect(dbRows("px")).toHaveLength(0);
+    });
+  });
 });
