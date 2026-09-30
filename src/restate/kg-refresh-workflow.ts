@@ -68,7 +68,7 @@ export interface KgRefreshReportBody {
 
 export interface KgDispatchInput {
   runConfig: KgRefreshRunInput;
-  tokens: { runToken: string; progressToken: string };
+  tokens: { runToken: string; progressToken: string; publicationToken: string };
   issueIdentifier: string;
   /** The workflow's own dispatch id — the one its run tokens and `dispatch_log` row carry. */
   dispatchId: string;
@@ -95,7 +95,7 @@ export interface KgDispatchResult {
 export interface KgRefreshWorkflowDependencies {
   rail: KgRailDeps;
   kgSourceRepo: string;
-  mintRunTokens(input: { dispatchId: string; ttlSeconds: number }): { runToken: string; progressToken: string };
+  mintRunTokens(input: { dispatchId: string; ttlSeconds: number }): { runToken: string; progressToken: string; publicationToken: string };
   dispatch(input: KgDispatchInput): Promise<KgDispatchResult>;
   appendJobLog(input: { dispatchId: string; jobId: string }): void;
   closeJobLog(jobId: string, status: "completed" | "failed" | "timed_out", conclusion?: string): void;
@@ -246,7 +246,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       await ctx.run("reserve", () => deps.appendJobLog({ dispatchId, jobId }));
 
       const ttlSeconds = Math.ceil(totalDeadlineMs / 1000);
-      const { runToken, progressToken } = await ctx.run("mint-tokens", () =>
+      const { runToken, progressToken, publicationToken } = await ctx.run("mint-tokens", () =>
         deps.mintRunTokens({ dispatchId, ttlSeconds }));
 
       const issueIdentifier = `KG-REFRESH · ${triggerId}`;
@@ -254,7 +254,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       ctx.set("step", "dispatch");
       const dispatchResult = await ctx.run(
         "dispatch",
-        () => deps.dispatch({ runConfig: input, tokens: { runToken, progressToken }, issueIdentifier, dispatchId }),
+        () => deps.dispatch({ runConfig: input, tokens: { runToken, progressToken, publicationToken }, issueIdentifier, dispatchId }),
         { maxRetryAttempts: 3 },
       );
 

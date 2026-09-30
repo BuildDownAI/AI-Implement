@@ -228,6 +228,7 @@ describe("KgRefresh durable workflow", () => {
   const runIdIndex = new Map<number, string>();
   const appendJobLogCalls: Array<{ dispatchId: string; jobId: string }> = [];
   const dispatchedIds: string[] = [];
+  const dispatchedTokens: KgDispatchInput["tokens"][] = [];
   const mintedDispatchIds: string[] = [];
   const closeRowCalls: Array<{ jobId: string; status: string; conclusion?: string }> = [];
   const persistCalls: RefreshOutcome[] = [];
@@ -263,6 +264,7 @@ describe("KgRefresh durable workflow", () => {
     if (!scenario) throw new Error(`no scenario registered for trigger ${triggerId}`);
     scenario.dispatchCalls++;
     dispatchedIds.push(input.dispatchId);
+    dispatchedTokens.push(input.tokens);
     return {
       outcome: scenario.dispatchOutcome, runId: scenario.runId,
       jobId: `job-${triggerId}`, executionMode: scenario.executionMode,
@@ -303,7 +305,7 @@ describe("KgRefresh durable workflow", () => {
     kgSourceRepo: KG_SOURCE_REPO,
     mintRunTokens: (input) => {
       mintedDispatchIds.push(input.dispatchId);
-      return { runToken: "run-token", progressToken: "progress-token" };
+      return { runToken: "run-token", progressToken: "progress-token", publicationToken: "publication-token" };
     },
     dispatch: dispatchFn,
     appendJobLog: (input) => {
@@ -419,6 +421,10 @@ describe("KgRefresh durable workflow", () => {
       const dispatchedId = dispatchedIds[beforeDispatched];
       expect(dispatchedIds.length - beforeDispatched).toBe(1);
       expect(mintedDispatchIds.slice(beforeMinted)).toEqual([dispatchedId]);
+      // one journaled mint; dispatch received exactly the values the mint returned
+      expect(dispatchedTokens.slice(beforeDispatched)).toEqual([
+        { runToken: "run-token", progressToken: "progress-token", publicationToken: "publication-token" },
+      ]);
       expect(appendJobLogCalls.slice(beforeJobLog).map((c) => c.dispatchId)).toEqual([dispatchedId]);
       expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(1);
       expect(deleteBranchFn.mock.calls.length - beforeDeleteBranch).toBe(1);
@@ -1105,7 +1111,7 @@ describe("KgRefresh durable workflow", () => {
       kgSourceRepo: KG_SOURCE_REPO,
       mintRunTokens: (input) => {
       mintedDispatchIds.push(input.dispatchId);
-      return { runToken: "run-token", progressToken: "progress-token" };
+      return { runToken: "run-token", progressToken: "progress-token", publicationToken: "publication-token" };
     },
       dispatch: dispatchFn,
       appendJobLog: (input) => { appendJobLogCalls.push(input); },

@@ -22,6 +22,7 @@ import type { KgRailDeps } from "../kg-refresh-rail.js";
 import { KG_DIR } from "../kg-sidecar.js";
 import { parseKgSourceRepo } from "../deploy.js";
 import { buildKgRefreshGhaDispatchBody, postWorkflowDispatch } from "../github.js";
+import { resolveWorkflowCapabilities } from "../workflow-probe.js";
 import { resolveRunnerImageForDispatch } from "../repo-image.js";
 import { encodeRunConfig, type RunConfigV1 } from "../run-config.js";
 import { getRunnerMode, resolveExecutionPath } from "../runner-mode.js";
@@ -75,6 +76,8 @@ export interface KgRefreshProductionInput {
    *  resolved execution path is not GitHub Actions; the GHA path is dispatched by this
    *  module so it can request `return_run_details`. */
   dispatchKgRefreshRun: LegacyDispatch;
+  /** Probes the KG source repo's dispatch workflow for `run_publication_token` support. Defaults to `resolveWorkflowCapabilities`. */
+  resolveWorkflowCapabilities?: typeof resolveWorkflowCapabilities;
   /** `appendLog` — the numeric dispatch_log id is kept per dispatchId for `updateJobStatus`. */
   appendLog: (entry: { issueId: string; phase: string; dispatchId: string; executionMode: string; repo?: string }) => number;
   updateJobStatus: (jobId: number, status: JobStatus, conclusion?: string | null) => void;
@@ -159,14 +162,19 @@ export function createKgRefreshDispatch(input: KgRefreshProductionInput): (dispa
       owner: repo.owner, repo: repo.repo, token,
       defaultImage: config.sessionImage, runnerImageExplicit: config.runnerImageExplicit,
     });
+    const ref = runConfig.kgSourceRef ?? defaultBranch;
+    const { supportsRunPublicationToken } = await (input.resolveWorkflowCapabilities ?? resolveWorkflowCapabilities)({
+      owner: repo.owner, repo: repo.repo, workflowFile: KG_REFRESH_WORKFLOW_FILE, token, ref,
+    });
     const inputs = buildKgRefreshGhaDispatchBody({
       runConfig: encoded, runToken: tokens.runToken, runProgressToken: tokens.progressToken,
+      ...(supportsRunPublicationToken ? { runPublicationToken: tokens.publicationToken } : {}),
       runnerImage, runnerCallbackUrl: config.runnerCallbackBaseUrl ?? undefined,
       runnerPhase: "kg-refresh", jobTimeoutMinutes: "240", issueIdentifier,
     });
     const result = await postWorkflowDispatch({
       token, owner: repo.owner, repo: repo.repo, workflowFile: KG_REFRESH_WORKFLOW_FILE,
-      ref: runConfig.kgSourceRef ?? defaultBranch, inputs, returnRunDetails: true,
+      ref, inputs, returnRunDetails: true,
     });
     return {
       outcome: result.outcome ?? (result.success ? "accepted" : "unknown"),
@@ -231,6 +239,7 @@ export function createProductionKgRefreshServices(
       return {
         runToken: mintRunToken({ ...base, audience: "result" }).token,
         progressToken: mintRunToken({ ...base, audience: "progress" }).token,
+        publicationToken: mintRunToken({ ...base, audience: "publication", repository: input.kgSourceRepo }).token,
       };
     },
     dispatch: createKgRefreshDispatch(input),

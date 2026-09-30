@@ -38,6 +38,7 @@ import {
   type KgRefreshProductionInput,
 } from "../restate/kg-refresh-production.js";
 import { decodeRunConfig } from "../run-config.js";
+import { verifyRunToken } from "../runner-tokens.js";
 
 function makeInput(overrides: Partial<KgRefreshProductionInput> = {}): KgRefreshProductionInput {
   const noop = vi.fn();
@@ -78,7 +79,7 @@ function makeInput(overrides: Partial<KgRefreshProductionInput> = {}): KgRefresh
 
 const dispatchInput = {
   runConfig: { triggerId: "t-1", kgSourceRef: "feature/x" },
-  tokens: { runToken: "rt", progressToken: "pt" },
+  tokens: { runToken: "rt", progressToken: "pt", publicationToken: "pub" },
   issueIdentifier: "KG-REFRESH · t-1",
   dispatchId: "d-workflow",
 };
@@ -114,6 +115,32 @@ describe("createProductionKgRefreshServices", () => {
     const { toolDeps } = createProductionKgRefreshServices(makeInput({ persistLastRefresh }));
     toolDeps.persistPreflightFailure({ ok: false, checkedAt: 5, results: [{ repo: "acme/kg", grant: "contents", ok: false, status: 403 }] });
     expect(persistLastRefresh).toHaveBeenCalledWith(expect.objectContaining({ ok: false, at: 5, gate: "preflight" }));
+  });
+});
+
+describe("mintRunTokens", () => {
+  it("mints result, progress, and a KG-repo-bound publication token sharing one dispatch id and expiry", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-30T00:00:00Z"));
+    try {
+      createProductionKgRefreshServices(makeInput());
+      const tokens = capturedWorkflowDeps.current!.mintRunTokens({ dispatchId: "d-mint", ttlSeconds: 600 });
+      const claims = (token: string, audience: "result" | "progress" | "publication") => {
+        const verified = verifyRunToken(token, "secret", audience, { consume: false });
+        if (!verified.ok) throw new Error(`token for ${audience} did not verify: ${verified.reason}`);
+        return verified.claims;
+      };
+      const result = claims(tokens.runToken, "result");
+      const progress = claims(tokens.progressToken, "progress");
+      const publication = claims(tokens.publicationToken, "publication");
+      expect(publication).toMatchObject({ audience: "publication", phase: "kg-refresh", repository: "acme/kg", dispatchId: "d-mint" });
+      expect(publication.exp).toBe(result.exp);
+      expect(publication.exp).toBe(progress.exp);
+      expect(publication.dispatchId).toBe(result.dispatchId);
+      expect(publication.dispatchId).toBe(progress.dispatchId);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -188,6 +215,21 @@ describe("GHA dispatch wrapper", () => {
     expect(call.inputs.issue_identifier).toBe("KG-REFRESH · t-1");
     expect(decodeRunConfig(call.inputs.run_config).issue.identifier).toBe("KG-REFRESH · t-1");
     expect(result).toEqual({ outcome: "accepted", runId: 99, runUrl: "https://gh/run/99", jobId: "99", executionMode: "github-actions" });
+  });
+
+  it("sends run_publication_token when the probe reports support", async () => {
+    postWorkflowDispatch.mockResolvedValue({ success: true, status: 200, outcome: "accepted", runId: 1 });
+    const probe = vi.fn(async () => ({ contract: "envelope", supportsRunPublicationToken: true, supportsAttemptCorrelation: false }));
+    await createKgRefreshDispatch(makeInput({ resolveWorkflowCapabilities: probe as never }))(dispatchInput);
+    expect(probe).toHaveBeenCalledWith(expect.objectContaining({ owner: "acme", repo: "kg", workflowFile: "claude-implement.yml", ref: "feature/x" }));
+    expect(postWorkflowDispatch.mock.calls[0][0].inputs.run_publication_token).toBe("pub");
+  });
+
+  it("omits run_publication_token when the probe reports no support", async () => {
+    postWorkflowDispatch.mockResolvedValue({ success: true, status: 200, outcome: "accepted", runId: 1 });
+    const probe = vi.fn(async () => ({ contract: "envelope", supportsRunPublicationToken: false, supportsAttemptCorrelation: false }));
+    await createKgRefreshDispatch(makeInput({ resolveWorkflowCapabilities: probe as never }))(dispatchInput);
+    expect(postWorkflowDispatch.mock.calls[0][0].inputs).not.toHaveProperty("run_publication_token");
   });
 
   it("maps a definite rejection to rejected", async () => {
