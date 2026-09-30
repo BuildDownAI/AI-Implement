@@ -231,8 +231,11 @@ describe("createKgRefreshIngressClient", () => {
   it("parses the Restate JSON error message for the conflict case", async () => {
     const conflict = JSON.stringify({ code: 500, message: 'conflicting report: existing={"ok":true} incoming={"ok":false}' });
     expect(await clientWith(respond(500, conflict)).report("t-1", { ok: true })).toEqual({ status: "conflict" });
-    // A different failure whose message merely mentions the phrase is not a conflict.
-    const other = JSON.stringify({ code: 500, message: "kg-refresh report received after run completed (was: conflicting report)" });
+    // A Restate-prefixed message (e.g. the handler name) is still a conflict.
+    const prefixed = JSON.stringify({ code: 500, message: "KgRefresh/report: conflicting report: x" });
+    expect(await clientWith(respond(500, prefixed)).report("t-1", { ok: true })).toEqual({ status: "conflict" });
+    // A different failure whose message does not mention the phrase is not a conflict.
+    const other = JSON.stringify({ code: 500, message: "kg-refresh report received after run completed" });
     expect(await clientWith(respond(500, other)).report("t-1", { ok: true })).toEqual({ status: "unavailable" });
   });
 

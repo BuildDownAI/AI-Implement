@@ -352,10 +352,11 @@ export function createKgRefreshIngressClient(
       const text = await response.text();
       if (!response.ok) {
         // A workflow TerminalError without a code surfaces as HTTP 500, so the message is
-        // matched rather than a 4xx status. The JSON `message` is authoritative; a body that
+        // matched rather than a 4xx status. The JSON `message` is authoritative (matched with includes, so a Restate-added prefix such as the handler name
+        // does not hide a real conflict); a body that
         // is not Restate's JSON error falls back to a substring match.
         const message = restateErrorMessage(text);
-        const conflict = message !== null ? message.startsWith(CONFLICT_MARKER) : text.includes(CONFLICT_MARKER);
+        const conflict = message !== null ? message.includes(CONFLICT_MARKER) : text.includes(CONFLICT_MARKER);
         return conflict ? { status: "conflict" } : { status: "unavailable" };
       }
       if (text.trim() === "") return { status: "accepted" };
