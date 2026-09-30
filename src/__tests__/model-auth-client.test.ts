@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { createCipheriv, randomBytes } from "node:crypto";
-import { mkdirSync, mkdtempSync, symlinkSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, mkdtempSync, symlinkSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync, existsSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -136,6 +136,17 @@ describe("bootstrap", () => {
   });
 });
 
+const UNLISTED = [
+  "DATABASE_URL", "LINEAR_API_KEY", "STRIPE_KEY", "MY_APP_SECRET",
+  "COMPOSER_AUTH", "GIT_DEPENDENCY_TOKEN_FILE", "GIT_DEPENDENCY_CALLBACK_URL",
+  "LC_SECRET", "LC_TOKEN",
+];
+const SAFE = {
+  PATH: "/bin", HOME: "/home/x", TMPDIR: "/tmp", LANG: "C", LC_ALL: "C", LC_CTYPE: "C", LC_PAPER: "C",
+  SSL_CERT_FILE: "/ca.pem", NODE_EXTRA_CA_CERTS: "/ca2.pem", HTTPS_PROXY: "http://proxy:3128",
+};
+const sentinelEnv = () => ({ ...SAFE, ...Object.fromEntries(UNLISTED.map((k) => [k, "synthetic-" + k])) });
+
 describe("buildModelInvocationEnv", () => {
   const inheritedEnv = {
     PATH: "/bin",
@@ -203,6 +214,35 @@ describe("buildModelInvocationEnv", () => {
     expect(env.CODEX_HOME).toBe("/private");
     expect(env).not.toHaveProperty("OPENAI_API_KEY");
   });
+
+  it("drops unlisted inherited names, records names only, keeps safe context", () => {
+    const out = buildModelInvocationEnv({
+      authMode: "anthropic-api-key",
+      secret: { kind: "api-key", apiKey: S_API },
+      inheritedEnv: sentinelEnv(),
+    });
+    for (const k of UNLISTED) {
+      expect(out.env).not.toHaveProperty(k);
+      expect(out.strippedKeys).toContain(k);
+    }
+    expect(JSON.stringify(out.env)).not.toContain("synthetic-");
+    expect(JSON.stringify(out.strippedKeys)).not.toContain("synthetic-");
+    for (const [k, v] of Object.entries(SAFE)) expect(out.env[k]).toBe(v);
+  });
+
+  it("protected and forwarded names override safe-context names", () => {
+    const out = buildModelInvocationEnv({
+      authMode: "anthropic-api-key",
+      secret: { kind: "api-key", apiKey: S_API },
+      inheritedEnv: { ...SAFE, AI_IMPLEMENT_FORWARDED_SECRETS: "HOME, LANG" },
+      protectedKeys: ["HTTPS_PROXY"],
+    });
+    expect(out.env).not.toHaveProperty("HOME");
+    expect(out.env).not.toHaveProperty("LANG");
+    expect(out.env).not.toHaveProperty("HTTPS_PROXY");
+    expect(out.env.PATH).toBe("/bin");
+  });
+
 });
 
 describe("client", () => {
@@ -224,6 +264,35 @@ describe("client", () => {
   afterEach(() => rmSync(root, { recursive: true, force: true }));
 
   type Handler = (route: string, body: Record<string, unknown>) => { status: number; body: unknown } | Promise<never>;
+  it("applies the allowlist to the process.env default", async () => {
+    const saved = { ...process.env };
+    Object.assign(process.env, sentinelEnv());
+    try {
+      const dir = mkdtempSync(join(tmpdir(), "model-auth-default-"));
+      try {
+        const { transport } = fakeTransport((route) => reply(route, ack()));
+        const client = createModelAuthClient({
+          source: { kind: "hosted", grant: grant(), transport },
+          authRoot: dir,
+          forbiddenRoots: [],
+          now: () => NOW,
+          sleep: async () => {},
+        });
+        await client.checkout({ profileId: "sub", authMode: "codex-subscription" as const });
+        await client.invoke("sub", async (inv) => {
+          for (const k of UNLISTED) expect(inv.env).not.toHaveProperty(k);
+          expect(JSON.stringify(inv.env)).not.toContain("synthetic-");
+          expect(inv.env.PATH).toBe(process.env.PATH);
+        });
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    } finally {
+      for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];
+      Object.assign(process.env, saved);
+    }
+  });
+
   function fakeTransport(handler: Handler) {
     const calls: Array<{ route: string; raw: string }> = [];
     const transport: ModelAuthTransport = {
@@ -284,7 +353,7 @@ describe("client", () => {
 
     let argvSeen = "";
     const result = await client.invoke("sub", async (inv) => {
-      expect(inv.env.CODEX_HOME).toBe(full);
+      expect(realpathSync(inv.env.CODEX_HOME!)).toBe(realpathSync(full));
       expect(JSON.stringify(inv.env)).not.toContain(S_INHERITED);
       argvSeen = JSON.stringify(process.argv);
       writeFileSync(file, S_REFRESHED);
@@ -724,7 +793,8 @@ describe("client", () => {
           expect(env).not.toHaveProperty("CLAUDE_CODE_USE_VERTEX");
           expect(env).not.toHaveProperty("OPENAI_BASE_URL");
           expect(env).not.toHaveProperty("MODEL_AUTH_KEY");
-          expect(env).toMatchObject({ PATH: "/bin", HOME: "/home/x", SSL_CERT_FILE: "/etc/ca.pem", HTTPS_PROXY: "http://proxy:3128", UNRELATED: "kept" });
+          expect(env).toMatchObject({ PATH: "/bin", HOME: "/home/x", SSL_CERT_FILE: "/etc/ca.pem", HTTPS_PROXY: "http://proxy:3128" });
+          expect(env).not.toHaveProperty("UNRELATED");
         }
       } finally {
         if (prev === undefined) delete process.env.AI_IMPLEMENT_FORWARDED_SECRETS;

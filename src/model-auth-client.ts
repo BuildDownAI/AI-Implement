@@ -274,6 +274,20 @@ const STRIPPED_PREFIXES: readonly string[] = [
   "CLAUDE_CODE_USE_",
 ];
 
+/**
+ * Positive allowlist of safe process context. Exact names only: no prefix or
+ * pattern wildcards, so an unlisted name (LC_SECRET, COMPOSER_AUTH, ...) never inherits.
+ */
+const SAFE_CONTEXT_KEYS: ReadonlySet<string> = new Set([
+  "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "TMPDIR", "TMP", "TEMP", "TZ",
+  "LANG", "LANGUAGE",
+  "LC_ALL", "LC_COLLATE", "LC_CTYPE", "LC_MESSAGES", "LC_MONETARY", "LC_NUMERIC", "LC_TIME",
+  "LC_ADDRESS", "LC_IDENTIFICATION", "LC_MEASUREMENT", "LC_NAME", "LC_PAPER", "LC_TELEPHONE",
+  "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+  "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
+  "http_proxy", "https_proxy", "no_proxy", "all_proxy",
+]);
+
 /** Forwarded secret names come from the env being filtered, never from `process.env`. */
 function forwardedNames(env: Readonly<Record<string, string | undefined>>): Set<string> {
   const out = new Set<string>();
@@ -315,6 +329,11 @@ export function buildModelInvocationEnv(input: {
     if (v === undefined) continue;
     if (protectedKeys.includes(k)) continue;
     if (STRIPPED_EXACT_KEYS.has(k) || forwarded.has(k) || STRIPPED_PREFIXES.some((p) => k.startsWith(p))) {
+      strippedKeys.push(k);
+      continue;
+    }
+    if (!SAFE_CONTEXT_KEYS.has(k)) {
+      // Unknown names never inherit; only the name is recorded.
       strippedKeys.push(k);
       continue;
     }
