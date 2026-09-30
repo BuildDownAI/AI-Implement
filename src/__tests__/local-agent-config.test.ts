@@ -1,7 +1,7 @@
-import { mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, writeFile, chmod } from "node:fs/promises";
+import { open as fsOpen, mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, writeFile, chmod } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   LocalAgentConfigError,
   LocalSessionOwnership,
@@ -281,6 +281,23 @@ describe("ownership and port", () => {
     await expectCategory(ownership.release(lease, { confirmTermination: async () => "confirmed" }), "persistence_missing");
     expect(lease.status).toBe("held");
     await expectCategory(ownership.acquire(sub), "session_busy");
+  });
+
+  it("flushes the hold record to disk before renaming it over the lock", async () => {
+    const { ownership, sub } = await setup();
+    const lease = await ownership.acquire(sub);
+    const probe = await fsOpen(join(outside, "probe"), "w");
+    const proto = Object.getPrototypeOf(probe) as { sync: () => Promise<void> };
+    await probe.close();
+    const spy = vi.spyOn(proto, "sync");
+    try {
+      await expectCategory(ownership.release(lease, { confirmTermination: async () => "confirmed" }), "persistence_missing");
+      expect(spy).toHaveBeenCalled();
+    } finally {
+      spy.mockRestore();
+    }
+    expect(JSON.parse(await readFile(join(outside, LOCK), "utf8")).holdReason).toBe("persistence_missing");
+    expect((await readdir(outside)).filter((n) => n.endsWith(".tmp"))).toEqual([]);
   });
 
   it("holds ownership when termination is unknown, throws, or persistence is missing", async () => {

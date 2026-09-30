@@ -631,13 +631,19 @@ export class LocalSessionOwnership {
         holdReason: reason,
       };
       const temp = `${state.lockPath}.${randomBytes(6).toString("hex")}.tmp`;
-      const handle = await open(temp, "wx", 0o600);
       try {
-        await handle.writeFile(JSON.stringify(record));
-      } finally {
-        await handle.close();
+        const handle = await open(temp, "wx", 0o600);
+        try {
+          await handle.writeFile(JSON.stringify(record));
+          await handle.sync();
+        } finally {
+          await handle.close();
+        }
+        await rename(temp, state.lockPath);
+      } catch (error) {
+        await unlink(temp).catch(() => undefined);
+        throw error;
       }
-      await rename(temp, state.lockPath);
       await (this.options.io?.syncDir ?? syncDirectory)(dirname(state.lockPath));
     } catch {
       // the existing lock still blocks competitors
