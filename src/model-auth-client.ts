@@ -22,8 +22,8 @@
  */
 
 import { createDecipheriv } from "node:crypto";
-import { chmod, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
-import { join, relative, resolve, isAbsolute, sep } from "node:path";
+import { chmod, lstat, mkdtemp, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { basename, dirname, join, relative, resolve, isAbsolute, sep } from "node:path";
 import type { AccountAuthMode, StageName } from "./agent-config.js";
 import {
   MODEL_AUTH_AUTH_MODES,
@@ -51,6 +51,11 @@ import {
   type ModelAuthSecret,
   type SafeModelAuthDiagnostic,
 } from "./model-auth-contract.js";
+import {
+  GITHUB_WRITE_CREDENTIAL_KEYS,
+  INSTALL_CREDENTIAL_KEYS,
+  RUNNER_CREDENTIAL_KEYS,
+} from "./pipeline/process-env.js";
 import { computeBackoffMs, DEFAULT_RETRY_POLICY, type RetryPolicy } from "./pipeline/retry-backoff.js";
 
 // ---------------------------------------------------------------------------
@@ -83,6 +88,7 @@ export const MODEL_AUTH_CLIENT_ERROR_CATEGORIES = [
   "server_rejected",
   "finish_failed",
   "cleanup_failed",
+  "client_disposed",
 ] as const;
 export type ModelAuthClientErrorCategory = (typeof MODEL_AUTH_CLIENT_ERROR_CATEGORIES)[number];
 
@@ -225,8 +231,57 @@ const INHERITED_CREDENTIAL_KEYS: readonly string[] = [
   "CODEX_HOME",
 ];
 
-function isInheritedCredentialKey(name: string): boolean {
-  return INHERITED_CREDENTIAL_KEYS.includes(name) || name.startsWith("AWS_");
+/**
+ * Other exact names that must never reach a model child: runner callback and
+ * result channels, encoded run config, forwarded-secret plumbing, unselected
+ * provider routing (a selected key must not be redirected by ambient endpoints).
+ */
+const STRIPPED_EXACT_KEYS: ReadonlySet<string> = new Set([
+  ...INHERITED_CREDENTIAL_KEYS,
+  ...RUNNER_CREDENTIAL_KEYS,
+  ...GITHUB_WRITE_CREDENTIAL_KEYS,
+  ...INSTALL_CREDENTIAL_KEYS,
+  "RUNNER_CALLBACK_URL",
+  "RUNNER_CALLBACK_BASE_URL",
+  "RUNNER_TOKEN_SECRET",
+  "AI_IMPLEMENT_RUN_CONFIG",
+  "AI_IMPLEMENT_DEP_TOKEN_OVERRIDE",
+  "AI_IMPLEMENT_FORWARDED_SECRETS",
+  "OPENAI_BASE_URL",
+  "OPENAI_API_BASE",
+  "OPENAI_ORG_ID",
+  "OPENAI_ORGANIZATION",
+  "OPENAI_PROJECT_ID",
+  "ANTHROPIC_BASE_URL",
+  "ANTHROPIC_BEDROCK_BASE_URL",
+  "CLAUDE_CODE_USE_VERTEX",
+  "CLAUDE_CODE_USE_FOUNDRY",
+  "CLOUD_ML_REGION",
+  "GOOGLE_APPLICATION_CREDENTIALS",
+]);
+
+/** Name prefixes removed wholesale: cloud credentials, run/runner/orchestrator channels and provider routing. */
+const STRIPPED_PREFIXES: readonly string[] = [
+  "AWS_",
+  "AI_IMPLEMENT_",
+  "RUN_",
+  "RUNNER_",
+  "OPENAI_",
+  "CODEX_",
+  "ANTHROPIC_VERTEX_",
+  "ANTHROPIC_FOUNDRY_",
+  "ANTHROPIC_BEDROCK_",
+  "CLAUDE_CODE_USE_",
+];
+
+/** Forwarded secret names come from the env being filtered, never from `process.env`. */
+function forwardedNames(env: Readonly<Record<string, string | undefined>>): Set<string> {
+  const out = new Set<string>();
+  for (const n of (env.AI_IMPLEMENT_FORWARDED_SECRETS ?? "").split(",")) {
+    const t = n.trim();
+    if (t) out.add(t);
+  }
+  return out;
 }
 
 export interface ModelInvocationEnv {
@@ -255,10 +310,11 @@ export function buildModelInvocationEnv(input: {
   const env: Record<string, string> = {};
   const strippedKeys: string[] = [];
   const protectedKeys = input.protectedKeys ?? [];
+  const forwarded = forwardedNames(input.inheritedEnv);
   for (const [k, v] of Object.entries(input.inheritedEnv)) {
     if (v === undefined) continue;
     if (protectedKeys.includes(k)) continue;
-    if (isInheritedCredentialKey(k)) {
+    if (STRIPPED_EXACT_KEYS.has(k) || forwarded.has(k) || STRIPPED_PREFIXES.some((p) => k.startsWith(p))) {
       strippedKeys.push(k);
       continue;
     }
@@ -272,7 +328,8 @@ export function buildModelInvocationEnv(input: {
       break;
     case "openai-api-key":
       if (secret.kind !== "api-key") fail("credential_source_mismatch");
-      env.OPENAI_API_KEY = secret.apiKey;
+      // `codex exec` automation authenticates per invocation through CODEX_API_KEY (verified against 0.159.2).
+      env.CODEX_API_KEY = secret.apiKey;
       break;
     case "bedrock":
       if (secret.kind !== "aws-bedrock") fail("credential_source_mismatch");
@@ -450,6 +507,21 @@ export function createModelAuthClient(options: ModelAuthClientOptions): ModelAut
   const protectedKeys = options.protectedEnvKeys ?? [];
   const entries = new Map<string, ProfileEntry>();
   const createdDirs = new Set<string>();
+  let disposed = false;
+  let inFlight = 0;
+
+  function requireLive(profileId?: string): void {
+    if (disposed) fail("client_disposed", profileId ? { profileId } : {});
+  }
+
+  async function tracked<T>(fn: () => Promise<T>): Promise<T> {
+    inFlight++;
+    try {
+      return await fn();
+    } finally {
+      inFlight--;
+    }
+  }
 
   function diagnose(
     operation: "checkout" | "checkpoint" | "finish",
@@ -477,21 +549,55 @@ export function createModelAuthClient(options: ModelAuthClientOptions): ModelAut
     }
   }
 
-  async function makePrivateDir(): Promise<string> {
-    const root = resolve(options.authRoot);
-    if (!isAbsolute(options.authRoot)) fail("auth_dir_unsafe");
-    for (const forbidden of options.forbiddenRoots) {
-      const f = resolve(forbidden);
-      if (isWithin(root, f)) fail("auth_dir_unsafe");
+  /** Canonical path; a missing tail is resolved against its nearest existing ancestor. */
+  async function canonical(path: string): Promise<string> {
+    const tail: string[] = [];
+    let p = path;
+    for (;;) {
+      try {
+        return resolve(await realpath(p), ...tail);
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== "ENOENT" || dirname(p) === p) return fail("auth_dir_unsafe");
+        tail.unshift(basename(p));
+        p = dirname(p);
+      }
     }
+  }
+
+  async function makePrivateDir(): Promise<string> {
+    if (!isAbsolute(options.authRoot)) fail("auth_dir_unsafe");
+    const root = await canonical(options.authRoot);
+    const forbidden: string[] = [];
+    for (const f of options.forbiddenRoots) forbidden.push(await canonical(resolve(f)));
+    if (forbidden.some((f) => isWithin(root, f))) fail("auth_dir_unsafe");
+    let dir: string | undefined;
     try {
-      const dir = await mkdtemp(join(root, "model-auth-"));
+      dir = await mkdtemp(join(root, "model-auth-"));
       createdDirs.add(dir);
       await chmod(dir, 0o700);
-      return dir;
     } catch {
       return fail("credential_write_failed");
     }
+    // Validate what was actually created, not what was asked for.
+    let safe = false;
+    try {
+      const st = await lstat(dir);
+      const real = await realpath(dir);
+      safe =
+        st.isDirectory() &&
+        !st.isSymbolicLink() &&
+        (st.mode & 0o077) === 0 &&
+        (typeof process.getuid !== "function" || st.uid === process.getuid()) &&
+        isWithin(real, root) &&
+        !forbidden.some((f) => isWithin(real, f));
+    } catch {
+      safe = false;
+    }
+    if (!safe) {
+      await removeTracked(dir);
+      return fail("auth_dir_unsafe");
+    }
+    return dir;
   }
 
   /** Atomic write: private temp file in the same directory, then rename. */
@@ -581,7 +687,7 @@ export function createModelAuthClient(options: ModelAuthClientOptions): ModelAut
     }
     if (options.source.kind === "local") {
       try {
-        await options.source.port.persistSession?.({ profileId: entry.profileId, sessionData });
+        await options.source.port.persistSession!({ profileId: entry.profileId, sessionData });
       } catch {
         entry.state = "rejected";
         fail("credential_source_failed", { profileId: entry.profileId });
@@ -643,10 +749,56 @@ export function createModelAuthClient(options: ModelAuthClientOptions): ModelAut
 
   return {
     async checkout(request) {
+      requireLive(request.profileId);
+      return tracked(() => checkoutImpl(request));
+    },
+
+    async invoke<T>(profileId: string, run: (invocation: ModelInvocation) => Promise<T>): Promise<T> {
+      requireLive(profileId);
+      return tracked(() => invokeImpl(profileId, run));
+    },
+
+    async reconcile(profileId) {
+      requireLive(profileId);
+      return tracked(() => reconcileImpl(profileId));
+    },
+
+    async finish(profileId, handling) {
+      requireLive(profileId);
+      return tracked(() => finishImpl(profileId, handling));
+    },
+
+    async dispose() {
+      if (inFlight > 0) fail("invocation_in_progress");
+      disposed = true;
+      // Only ready entries are marked; uncertain/rejected state and pending payloads stay intact.
+      for (const e of entries.values()) if (e.state === "ready") e.state = "finished";
+      let failed = false;
+      for (const dir of [...createdDirs]) {
+        if (!(await removeTracked(dir))) failed = true;
+      }
+      if (failed) fail("cleanup_failed");
+    },
+
+    status(profileId) {
+      return entries.get(profileId)?.state ?? "unknown";
+    },
+  };
+
+  async function checkoutImpl(request: { profileId: string; authMode: AccountAuthMode }): Promise<void> {
+    {
       if (!(MODEL_AUTH_AUTH_MODES as readonly string[]).includes(request.authMode)) {
         fail("unsupported_auth_mode", { profileId: request.profileId });
       }
       if (entries.has(request.profileId)) fail("already_checked_out", { profileId: request.profileId });
+      // A refreshed subscription session with nowhere to go would be silently lost.
+      if (
+        options.source.kind === "local" &&
+        isSubscriptionAuthMode(request.authMode) &&
+        typeof options.source.port.persistSession !== "function"
+      ) {
+        fail("credential_source_failed", { profileId: request.profileId });
+      }
       let binding: ModelAuthGrantBinding | undefined;
       if (options.source.kind === "hosted") {
         const { grant } = options.source;
@@ -685,9 +837,11 @@ export function createModelAuthClient(options: ModelAuthClientOptions): ModelAut
       }
       entries.set(request.profileId, entry);
       if (options.source.kind === "hosted") diagnose("checkout", request.profileId, entry.stage);
-    },
+    }
+  }
 
-    async invoke<T>(profileId: string, run: (invocation: ModelInvocation) => Promise<T>): Promise<T> {
+  async function invokeImpl<T>(profileId: string, run: (invocation: ModelInvocation) => Promise<T>): Promise<T> {
+    {
       const entry = requireEntry(profileId);
       if (entry.state === "invoking") fail("invocation_in_progress", { profileId });
       if (entry.state === "uncertain" || entry.state === "rejected") fail("checkpoint_uncertain", { profileId });
@@ -714,9 +868,11 @@ export function createModelAuthClient(options: ModelAuthClientOptions): ModelAut
       await checkpointAfterInvocation(entry);
       if (runFailed) throw runError;
       return result;
-    },
+    }
+  }
 
-    async reconcile(profileId) {
+  async function reconcileImpl(profileId: string): Promise<void> {
+    {
       const entry = requireEntry(profileId);
       if (entry.state !== "uncertain" || !entry.pending) return;
       if (!options.reconcile) return;
@@ -738,9 +894,11 @@ export function createModelAuthClient(options: ModelAuthClientOptions): ModelAut
       } else if (verdict === "not_accepted") {
         await sendCheckpoint(entry);
       }
-    },
+    }
+  }
 
-    async finish(profileId, handling) {
+  async function finishImpl(profileId: string, handling: ModelAuthFinishHandling): Promise<void> {
+    {
       const entry = requireEntry(profileId);
       if (entry.state === "invoking") fail("invocation_in_progress", { profileId });
       if (entry.state === "uncertain" || entry.state === "rejected") fail("checkpoint_uncertain", { profileId });
@@ -762,18 +920,6 @@ export function createModelAuthClient(options: ModelAuthClientOptions): ModelAut
         throw new ModelAuthClientError("cleanup_failed", { profileId });
       }
       if (failure) throw failure;
-    },
-
-    async dispose() {
-      let failed = false;
-      for (const dir of [...createdDirs]) {
-        if (!(await removeTracked(dir))) failed = true;
-      }
-      if (failed) fail("cleanup_failed");
-    },
-
-    status(profileId) {
-      return entries.get(profileId)?.state ?? "unknown";
-    },
-  };
+    }
+  }
 }
