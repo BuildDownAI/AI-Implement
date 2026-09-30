@@ -128,6 +128,26 @@ describe("handlePublicationTokenRequest", () => {
     );
   });
 
+  it("logs one line per mint without the token value (AII-922)", async () => {
+    const token = mintPublicationToken("implementation", "acme/app");
+    mockGetScopedToken.mockResolvedValueOnce({
+      token: "ghs_secret_value",
+      expiresAt: "2030-01-01T00:00:00Z",
+      installationId: 4242,
+    });
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await callHandler(token);
+
+    const lines = log.mock.calls.map((c) => c.join(" ")).filter((l) => l.includes("[publication-token] minted"));
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("repo=acme/app");
+    expect(lines[0]).toContain("installation=4242");
+    expect(lines[0]).toContain("expires_at=2030-01-01T00:00:00Z");
+    expect(lines[0]).toMatch(/dispatch=\S+/);
+    expect(lines[0]).not.toContain("ghs_secret_value");
+  });
+
   it("is single-use", async () => {
     const token = mintPublicationToken();
     mockGetScopedToken.mockResolvedValue({

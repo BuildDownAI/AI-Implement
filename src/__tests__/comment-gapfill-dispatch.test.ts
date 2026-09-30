@@ -979,6 +979,40 @@ describe("drainCommentGapfillQueue — PR dispatch budget", () => {
   });
 });
 
+describe("drainCommentGapfillQueue — push retry (AII-922)", () => {
+  const setup = (budget: number, priorDispatches: number) => {
+    seedDispatchLog("issue-30", "AII-300", "Push retry", "acme", "billing", 42);
+    for (let i = 0; i < priorDispatches; i++) seedGapAnalysisDispatch("issue-30", "acme", "billing", 42);
+    const id = queue.enqueueCommentGapfill({
+      owner: "acme", repo: "billing", prNumber: 42, commentId: 7001, commenter: "alice", instruction: "fix it",
+    });
+    queue.markCommentGapfillProcessed(id, "dispatched");
+    expect(queue.requeueGapfillAfterPushFailure("acme/billing", 42)).toBe(true);
+    queue.markCommentGapfillRunTerminal("acme/billing", 42, "failed");
+    return makeMapping({ owner: "acme", repo: "billing", prDispatchBudget: budget });
+  };
+
+  it("dispatches the push-retry row once when the PR has budget left", async () => {
+    const mapping = setup(4, 1);
+    const dispatchSpy = vi.fn<DrainInput["dispatch"]>(async () => ({ success: true, status: 204 }));
+    await drain.drainCommentGapfillQueue(makeBaseDrainOpts({ getMappings: () => ({ TEAM: mapping }), dispatch: dispatchSpy }));
+    expect(dispatchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("parks the PR instead of dispatching the push-retry row when the dispatch budget is spent", async () => {
+    const mapping = setup(2, 2);
+    const dispatchSpy = vi.fn<DrainInput["dispatch"]>(async () => ({ success: true, status: 204 }));
+    const postCommentSpy = vi.fn<DrainInput["postComment"]>(async () => undefined);
+    await drain.drainCommentGapfillQueue(makeBaseDrainOpts({
+      getMappings: () => ({ TEAM: mapping }), dispatch: dispatchSpy, postComment: postCommentSpy,
+    }));
+    expect(dispatchSpy).not.toHaveBeenCalled();
+    expect(postCommentSpy).toHaveBeenCalledTimes(1);
+    expect(postCommentSpy.mock.calls[0]![4]).toContain("<!-- ai-implement pr-budget -->");
+    expect(breaker.isParked("issue-30", "gap-analysis")).toBe(true);
+  });
+});
+
 describe("parseGroupingBranchIdentifier", () => {
   it("parses feature and multi-issue grouping branches", () => {
     expect(drain.parseGroupingBranchIdentifier("ai-implement/feature/tsai-196")).toBe("tsai-196");

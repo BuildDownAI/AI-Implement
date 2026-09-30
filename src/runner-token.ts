@@ -176,7 +176,9 @@ export async function refreshRunnerGithubToken(
     return inputs.currentToken;
   }
 
-  console.log("[runner-token] Obtained a current GitHub token from the orchestrator.");
+  console.log(
+    `[runner-token] Obtained a current GitHub token from the orchestrator (source: ${canUseMachineNonce ? "machine-nonce" : "publication-token"}).`,
+  );
   return body.token;
 }
 

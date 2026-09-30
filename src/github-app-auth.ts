@@ -12,7 +12,7 @@ export interface InstallationDetails {
 // Cache the installation identity with the token so admission and dispatch use the same install.
 const tokenCache = new Map<string, { token: string; expiresAt: number; installationId: number }>();
 // Cache: scopedCacheKey(owner, options) → { token, real expiresAt (ISO), staleAt (cache cutoff, ms) }
-const scopedTokenCache = new Map<string, { token: string; expiresAt: string; staleAt: number }>();
+const scopedTokenCache = new Map<string, { token: string; expiresAt: string; staleAt: number; installationId: number }>();
 let cachedAppSlug: string | null = null;
 const TOKEN_CACHE_TTL_MS = 50 * 60 * 1000;
 
@@ -187,6 +187,8 @@ export interface ScopedInstallationToken {
   token: string;
   /** GitHub's actual expiry for this token (ISO 8601), passed through verbatim. */
   expiresAt: string;
+  /** The GitHub App installation the token was minted from. */
+  installationId: number;
 }
 
 function scopedCacheKey(owner: string, options?: ScopedTokenOptions): string {
@@ -221,7 +223,7 @@ export async function getScopedInstallationToken(
   const cacheKey = scopedCacheKey(owner, options);
   const cached = scopedTokenCache.get(cacheKey);
   if (!options?.forceRefresh && cached && Date.now() < cached.staleAt) {
-    return { token: cached.token, expiresAt: cached.expiresAt };
+    return { token: cached.token, expiresAt: cached.expiresAt, installationId: cached.installationId };
   }
 
   const normalizedKey = privateKey.replace(/\\n/g, "\n");
@@ -261,8 +263,8 @@ export async function getScopedInstallationToken(
     ? tokenData.expires_at
     : new Date(Date.now() + 55 * 60 * 1000).toISOString();
   const staleAt = Number.isFinite(expMs) ? expMs - 5 * 60 * 1000 : Date.now() + 50 * 60 * 1000;
-  scopedTokenCache.set(cacheKey, { token: tokenData.token, expiresAt, staleAt });
-  return { token: tokenData.token, expiresAt };
+  scopedTokenCache.set(cacheKey, { token: tokenData.token, expiresAt, staleAt, installationId: install.id });
+  return { token: tokenData.token, expiresAt, installationId: install.id };
 }
 
 /**

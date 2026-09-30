@@ -35,6 +35,59 @@ describe("jobs table", () => {
     expect(child?.groupingParent).toBe(false);
   });
 
+  it("re-enqueues a gap-fill run that failed at push, once (AII-922)", async () => {
+    const queue = await import("../comment-gapfill-queue.js");
+    const prUrl = "https://github.com/org/repo/pull/7";
+    const fail = (jobId: number) => {
+      log.updateJobFailure(jobId, {
+        category: "auth", code: "GIT_AUTH", stage: "push", attempt: 1, retryable: false,
+        message: "denied", evidence: { truncated: false },
+      });
+      log.updateJobStatus(jobId, "failed", "failure", prUrl);
+    };
+    const dispatch = (rowId: number) => {
+      queue.markCommentGapfillProcessed(rowId, "dispatched");
+      return log.appendLog({ issueId: "i", repo: "org/repo", trigger: "comment", prUrl } as Parameters<typeof log.appendLog>[0]);
+    };
+
+    const rowId = queue.enqueueCommentGapfill({
+      owner: "org", repo: "repo", prNumber: 7, commentId: 3001, commenter: "alice", instruction: "fix it",
+    });
+    fail(dispatch(rowId));
+    const [retry] = queue.claimPendingCommentGapfills();
+    expect(retry.commenter).toBe(queue.PUSH_RETRY_COMMENTER);
+
+    fail(dispatch(retry.id));
+    expect(queue.claimPendingCommentGapfills()).toHaveLength(0);
+  });
+
+  it("does not re-enqueue a gap-fill run that failed outside push or with a conflict (AII-922)", async () => {
+    const queue = await import("../comment-gapfill-queue.js");
+    const prUrl = "https://github.com/org/repo/pull/8";
+    const failAt = (rowId: number, stage: "push" | "implement", category: "auth" | "transient" | "conflict") => {
+      queue.markCommentGapfillProcessed(rowId, "dispatched");
+      const jobId = log.appendLog({ issueId: "i", repo: "org/repo", trigger: "comment", prUrl } as Parameters<typeof log.appendLog>[0]);
+      log.updateJobFailure(jobId, {
+        category, code: "X", stage, attempt: 1, retryable: false, message: "m", evidence: { truncated: false },
+      });
+      log.updateJobStatus(jobId, "failed", "failure", prUrl);
+    };
+    const row = () => queue.enqueueCommentGapfill({
+      owner: "org", repo: "repo", prNumber: 8, commentId: 4001 + Math.floor(Math.random() * 1e6), commenter: "alice", instruction: "fix",
+    });
+    failAt(row(), "implement", "transient");
+    expect(queue.claimPendingCommentGapfills()).toHaveLength(0);
+    failAt(row(), "push", "conflict");
+    expect(queue.claimPendingCommentGapfills()).toHaveLength(0);
+
+    // A conflict-resolution row that dies at push is not replayed as a push retry either.
+    const conflictId = queue.enqueueConflictResolution({
+      owner: "org", repo: "repo", prNumber: 8, featureBranch: "ai-implement/feature/x",
+    });
+    failAt(conflictId, "push", "auth");
+    expect(queue.claimPendingCommentGapfills()).toHaveLength(0);
+  });
+
   it("appendLog creates a job with dispatched status and returns an id", () => {
     const jobId = log.appendLog({
       issueId: "issue-1",

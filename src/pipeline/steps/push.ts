@@ -208,6 +208,14 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
       timeoutMs: 15_000,
     });
 
+    // AII-922: name the credential the push goes out with, so a 403 can be told apart from a
+    // boot-token fallback. Never the token itself.
+    const freshToken = activeGithubToken !== githubToken;
+    const credentialSource = !freshToken
+      ? "boot-token"
+      : inputs.orchestratorUrl?.trim() && inputs.machineNonce?.trim() ? "machine-nonce" : "publication-token";
+    console.log(`[push] credential source: ${credentialSource}`);
+
     // Embed token in URL but use stdio: "pipe" so it is never printed to inherited
     // stdout/stderr. Token is redacted from any error messages.
     const buildRemoteUrl = (token: string): string =>
@@ -302,7 +310,18 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
       if (pushResult.status === 0) break;
 
       const stderr = (pushResult.stderr?.toString() ?? "").replaceAll(pushToken, "***");
-      const failure = classifyGitFailure(stderr, pushResult.status ?? null, { stage: "push", attempt });
+      let failure = classifyGitFailure(stderr, pushResult.status ?? null, { stage: "push", attempt });
+      // AII-922: GitHub has refused pushes made with an installation token minted seconds
+      // earlier (about one in three), and the same token succeeds on a later attempt. A 403
+      // on a freshly minted token is therefore retried with backoff like a transient error;
+      // a boot-token 403 stays a plain auth failure. The single-use credential cannot be
+      // re-minted, so the retry reuses the token — it delays, it does not re-authenticate.
+      // The final attempt keeps the original auth / GIT_AUTH classification, so a permanent
+      // credential problem (missing Workflows permission, revoked installation) that outlasts
+      // the retries still points the autopsy and the tracker comment at credentials.
+      if (failure.category === "auth" && failure.code === "GIT_AUTH" && freshToken && attempt < maxPushAttempts) {
+        failure = { ...failure, category: "transient", code: "GIT_AUTH_FRESH_TOKEN", retryable: true };
+      }
       const err = new Error(`git push failed (exit ${pushResult.status ?? "null"}): ${stderr}`) as Error & {
         failure?: FailureRecord;
       };

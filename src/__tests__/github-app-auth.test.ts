@@ -487,6 +487,8 @@ describe("getScopedInstallationToken", () => {
     expect(t1.token).toBe("ghs_hit");
     expect(t2.token).toBe("ghs_hit");
     expect(t2.expiresAt).toBe(t1.expiresAt); // cache hit carries the real expiry through
+    expect(t1.installationId).toBe(1);
+    expect(t2.installationId).toBe(1); // and the installation id
     expect(fetch).toHaveBeenCalledTimes(2); // install + token, then served from cache
   });
 
