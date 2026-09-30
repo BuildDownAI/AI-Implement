@@ -30,7 +30,7 @@ import {
   type KgRefreshReportBody,
 } from "../../restate/kg-refresh-workflow.js";
 import {
-  VARIANTS, attachWorkflow, callObject, callWorkflow, crashAfterFirstCall, replaceEndpoint, startRetryEnabled,
+  VARIANTS, attachWorkflow, callObject, callWorkflow, replaceEndpoint, startRetryEnabled,
   startVariants, stopAll,
 } from "./harness.js";
 
@@ -828,7 +828,7 @@ describe("KgRefresh durable workflow", () => {
   );
 
   it.each(VARIANTS.map(([label]) => label))(
-    "W14: a RailGateError at swap reverts once (%s)",
+    "W14: a RailGateError at swap reverts once, status named swap beforehand (%s)",
     async (label) => {
       const env = envFor(label);
       const triggerId = newTriggerId();
@@ -841,12 +841,43 @@ describe("KgRefresh durable workflow", () => {
         if (swapAttempts === 1) throw new RailGateError("staging", "forced swap failure for W14");
       };
 
+      // swapGate's restart call is a synchronous-looking failure with no suspension point of
+      // its own, so (as in W13) hold it open via beforeGate until a concurrent status poll has
+      // actually observed "swap", then release it to fail exactly as before.
+      let releaseSwapGate: () => void = () => {};
+      const swapGateLatch = new Promise<void>((resolve) => { releaseSwapGate = resolve; });
+      beforeGateImpl = async (name) => {
+        if (name === "swap") await swapGateLatch;
+      };
+
       const done = runWorkflow(env.baseUrl(), triggerId);
       await until(() => scenarios.get(triggerId)!.dispatchCalls === 1);
-      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
 
+      // Poll `status` concurrently with the run so it observes the "swap" step while the
+      // workflow is still executing it, mirroring W13's polling pattern.
+      const observedSteps = new Set<string | null>();
+      let polling = true;
+      const statusPoll = (async () => {
+        while (polling) {
+          try {
+            const status = await callWorkflow<{ step: string | null }>(env.baseUrl(), "KgRefresh", triggerId, "status", {});
+            observedSteps.add(status.step);
+            if (status.step === "swap") releaseSwapGate();
+          } catch {
+            // the workflow may be mid-transition between invocations; retry on the next tick.
+          }
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+      })();
+
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
       const outcome = await done;
+      polling = false;
+      releaseSwapGate(); // no-op if already released; unblocks the poll loop regardless
+      await statusPoll;
+
       expect(outcome.ok).toBe(false);
+      expect(observedSteps.has("swap")).toBe(true);
       expect(restartCallCount).toBe(2);
       expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("staging");
     },
@@ -959,8 +990,20 @@ describe("KgRefresh durable workflow", () => {
     // simulating a process crash), so the fault lives in its own durable checkpoint,
     // positioned right after "stage" is already committed — fetch/stage never re-run
     // regardless of how many times this checkpoint itself is retried.
+    //
+    // The checkpoint blocks its first call on a latch instead of throwing: a thrown
+    // crash retries within milliseconds on the still-live endpoint, racing (and usually
+    // losing to) the container restart below, so the scenario would end up not testing
+    // a restart at all. Blocking holds the first attempt open until the restart itself
+    // severs it, which is the only way to guarantee the retry lands on the replacement
+    // endpoint.
     let stageCommittedCalls = 0;
-    const afterStageCommitted = crashAfterFirstCall(async () => { stageCommittedCalls++; });
+    let releaseLatch: () => void = () => {};
+    const latch = new Promise<void>((resolve) => { releaseLatch = resolve; });
+    const afterStageCommitted = async (): Promise<void> => {
+      stageCommittedCalls++;
+      if (stageCommittedCalls === 1) await latch;
+    };
 
     const crashWorkflow = createKgRefreshWorkflow({
       rail: railWithCounter,
@@ -991,28 +1034,32 @@ describe("KgRefresh durable workflow", () => {
       const triggerId = (triggered as { triggerId: string }).triggerId;
       makeScenario(triggerId, { dispatchOutcome: "accepted", runId, executionMode: "fly-machines" });
 
-      const done = attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
       await until(() => scenarios.get(triggerId)!.dispatchCalls === 1);
       await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
 
       // stageGate writes COMPLETION_MARKER into staging/ as its last action; the checkpoint
-      // fires (and crashes, once) immediately afterward.
+      // fires immediately afterward and blocks on the latch.
       const stagingMarker = join(dataRoot, "staging", COMPLETION_MARKER);
-      await until(() => existsSync(stagingMarker) && stageCommittedCalls === 1, 12_000);
+      await until(() => existsSync(stagingMarker) && stageCommittedCalls >= 1, 12_000);
 
       replacement = await replaceEndpoint(env, [crashWorkflow, kgRepo]);
       await env.startedRestateContainer.restart();
 
+      // The restart severs the blocked first attempt's connection; Restate retries the
+      // step on the replacement endpoint, which is the not-yet-blocked second call.
       // A real container restart can take longer than this file's default 10s `until`
-      // window — give the resumed retry room to actually land on the replacement endpoint.
-      await until(() => stageCommittedCalls === 2, 30_000);
+      // window — give the resumed retry room to actually land there.
+      await until(() => stageCommittedCalls >= 2, 30_000);
 
-      const outcome = await done;
+      // No request may be open against the ingress while the container restarts, so
+      // attach only now — after the restart has returned and the resumed step has run.
+      const outcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
       expect(outcome.ok).toBe(true);
       expect(fetchTarballCalls).toBe(1);
       expect(materializeCalls).toBe(1);
       await untilAsync(async () => (await kgRepoStatus(env.baseUrl())) === null);
     } finally {
+      releaseLatch();
       replacement?.close();
       await env.stop();
     }
