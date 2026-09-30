@@ -22,10 +22,13 @@ import { serde } from "@restatedev/restate-sdk-zod";
 import { z } from "zod";
 import { MAX_TRACKED_PRS, type KgDryRunReportTarget } from "../kg-refresh.js";
 import {
+  KG_REFRESH_TOTAL_DEADLINE_MS,
+  KG_REPO_STALE_MARGIN_MS,
   kgDryRunReportSchema,
   kgRefreshOptionsSchema,
   type KgRefreshRunInput,
 } from "./kg-refresh-workflow.js";
+import type { KgRefreshDefinition, KgRepoDefinition } from "./kg-refresh-types.js";
 
 interface InFlightMarker {
   triggerId: string;
@@ -42,6 +45,10 @@ interface PendingDryRun {
 export interface KgRepoDependencies {
   /** The Restate service name of the workflow this object starts — "KgRefresh" in production. */
   workflowName: string;
+  /** Overrides `KG_REPO_STALE_MARGIN_MS` for a deterministic expiry test. Production leaves this unset. */
+  staleMarginMs?: number;
+  /** Overrides `KG_REFRESH_TOTAL_DEADLINE_MS` in the expiry delay for a deterministic test. Production leaves this unset. */
+  totalDeadlineMs?: number;
 }
 
 export type KgRepoTriggerResult = { triggerId: string } | { status: "refresh-in-progress"; triggerId: string };
@@ -55,6 +62,8 @@ const enqueueInputSchema = z.object({
   ref: z.string().min(1),
   report: kgDryRunReportSchema,
 }).strict();
+
+const leaseInputSchema = z.object({ triggerId: z.string().min(1) }).strict();
 
 export type KgRepoTriggerInput = z.infer<typeof kgRefreshOptionsSchema>;
 export type KgRepoEnqueueInput = z.infer<typeof enqueueInputSchema> & { report: KgDryRunReportTarget };
@@ -86,13 +95,14 @@ export function createKgRepo(deps: KgRepoDependencies) {
   function submit(ctx: ObjectContext, now: number, opts: KgRepoTriggerInput & { report?: KgDryRunReportTarget }): string {
     const triggerId = ctx.rand.uuidv4();
     ctx.set<InFlightMarker>("inFlight", { triggerId, startedAt: now });
-    ctx.genericSend({
-      service: deps.workflowName,
-      method: "run",
-      key: triggerId,
-      parameter: buildRunParameter(opts, triggerId),
-      inputSerde: restate.serde.json,
-    });
+    ctx.workflowSendClient<KgRefreshDefinition>({ name: deps.workflowName as "KgRefresh" }, triggerId).run(buildRunParameter(opts, triggerId));
+    // The object owns the lease's expiry: a run that never reaches the workflow's dispatch step
+    // still clears at the deadline plus margin. A normal `release` clears it first, and the
+    // later `expire` no longer matches the trigger id.
+    ctx.objectSendClient<KgRepoDefinition>({ name: "KgRepo" }, ctx.key).expire(
+      { triggerId },
+      restate.rpc.sendOpts({ delay: (deps.totalDeadlineMs ?? KG_REFRESH_TOTAL_DEADLINE_MS) + (deps.staleMarginMs ?? KG_REPO_STALE_MARGIN_MS) }),
+    );
     return triggerId;
   }
 
@@ -138,12 +148,12 @@ export function createKgRepo(deps: KgRepoDependencies) {
   }
 
   async function release(ctx: ObjectContext, input: { triggerId: string }): Promise<void> {
-    await clearAndDrain(ctx, input?.triggerId);
+    await clearAndDrain(ctx, input.triggerId);
   }
 
   /** The workflow's own deadline-plus-margin backstop for a run that never released. */
   async function expire(ctx: ObjectContext, input: { triggerId: string }): Promise<void> {
-    if (await clearAndDrain(ctx, input?.triggerId)) {
+    if (await clearAndDrain(ctx, input.triggerId)) {
       ctx.console.warn(`[KgRepo] expired in-flight marker for ${ctx.key} (triggerId=${input.triggerId})`);
     }
   }
@@ -160,8 +170,8 @@ export function createKgRepo(deps: KgRepoDependencies) {
     handlers: {
       trigger: restate.handlers.object.exclusive({ input: serde.zod(triggerInputSchema) }, trigger),
       enqueueDryRun: restate.handlers.object.exclusive({ input: serde.zod(enqueueInputSchema) }, enqueueDryRun),
-      release,
-      expire,
+      release: restate.handlers.object.exclusive({ input: serde.zod(leaseInputSchema) }, release),
+      expire: restate.handlers.object.exclusive({ input: serde.zod(leaseInputSchema) }, expire),
       status: restate.handlers.object.shared(status),
     },
   });

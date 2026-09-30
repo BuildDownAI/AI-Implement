@@ -19,6 +19,11 @@ vi.mock("../restate/kg-refresh-workflow.js", async (importOriginal) => {
     },
   };
 });
+const appendLogIfAbsent = vi.fn((_entry: unknown) => 1);
+vi.mock("../log.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../log.js")>()),
+  appendLogIfAbsent: (entry: unknown) => appendLogIfAbsent(entry),
+}));
 vi.mock("../repo-image.js", () => ({ resolveRunnerImageForDispatch: vi.fn(async () => "runner:test") }));
 const resolvedPath = { current: "github-actions" };
 vi.mock("../runner-mode.js", () => ({
@@ -62,7 +67,6 @@ function makeInput(overrides: Partial<KgRefreshProductionInput> = {}): KgRefresh
     closePullRequestFn: noop as never,
     deleteBranchFn: noop as never,
     dispatchKgRefreshRun: vi.fn(async () => ({})),
-    appendLog: vi.fn(() => 1),
     updateJobStatus: noop,
     getWorkflowRunStatus: vi.fn(async () => ({ status: "completed", conclusion: "success" })),
     findRunByTitle: vi.fn(async () => null),
@@ -174,21 +178,14 @@ describe("onOutcome", () => {
 });
 
 describe("appendJobLog idempotency", () => {
-  it("inserts one row and returns the same id for a repeated dispatch id", () => {
-    const appendLog = vi.fn(() => 9);
-    const findJobId = vi.fn((): number | undefined => undefined);
-    createProductionKgRefreshServices(makeInput({ appendLog, findJobId }));
+  it("goes through appendLogIfAbsent and returns the same id for a repeated dispatch id", () => {
+    appendLogIfAbsent.mockReset().mockReturnValue(9);
+    createProductionKgRefreshServices(makeInput());
     const deps = capturedWorkflowDeps.current!;
     expect(deps.appendJobLog({ dispatchId: "d-idem", jobId: "d-idem" })).toBe(9);
     expect(deps.appendJobLog({ dispatchId: "d-idem", jobId: "d-idem" })).toBe(9);
-    expect(appendLog).toHaveBeenCalledTimes(1);
-  });
-
-  it("reuses a row that an earlier process already inserted", () => {
-    const appendLog = vi.fn(() => 9);
-    createProductionKgRefreshServices(makeInput({ appendLog, findJobId: () => 5 }));
-    expect(capturedWorkflowDeps.current!.appendJobLog({ dispatchId: "d-x", jobId: "d-x" })).toBe(5);
-    expect(appendLog).not.toHaveBeenCalled();
+    expect(appendLogIfAbsent).toHaveBeenCalledTimes(2);
+    expect(appendLogIfAbsent).toHaveBeenCalledWith(expect.objectContaining({ dispatchId: "d-idem", issueId: "kg-refresh" }));
   });
 });
 
@@ -206,7 +203,8 @@ describe("dispatch_log job row lifecycle", () => {
   it("prefers the in-memory id from appendJobLog", () => {
     const updateJobStatus = vi.fn();
     const findJobId = vi.fn();
-    createProductionKgRefreshServices(makeInput({ updateJobStatus, findJobId, appendLog: vi.fn(() => 7) }));
+    appendLogIfAbsent.mockReset().mockReturnValue(7);
+    createProductionKgRefreshServices(makeInput({ updateJobStatus, findJobId }));
     capturedWorkflowDeps.current!.appendJobLog({ dispatchId: "d-2", jobId: "d-2" });
     findJobId.mockClear();
     capturedWorkflowDeps.current!.closeJobLog("d-2", "failed", "x");
@@ -218,10 +216,10 @@ describe("dispatch_log job row lifecycle", () => {
 describe("appendJobLog execution mode", () => {
   it("records the resolved execution mode rather than github-actions", () => {
     resolvedPath.current = "fly-machines";
-    const appendLog = vi.fn(() => 1);
-    createProductionKgRefreshServices(makeInput({ appendLog, findJobId: () => undefined }));
+    appendLogIfAbsent.mockReset().mockReturnValue(1);
+    createProductionKgRefreshServices(makeInput({ findJobId: () => undefined }));
     capturedWorkflowDeps.current!.appendJobLog({ dispatchId: "d-3", jobId: "d-3" });
-    expect(appendLog).toHaveBeenCalledWith(expect.objectContaining({ dispatchId: "d-3", executionMode: "fly-machines" }));
+    expect(appendLogIfAbsent).toHaveBeenCalledWith(expect.objectContaining({ dispatchId: "d-3", executionMode: "fly-machines" }));
   });
 });
 
@@ -321,21 +319,12 @@ describe("createKgRefreshIngressClient", () => {
     expect(result).toEqual({ status: "accepted", value: { status: "duplicate" } });
   });
 
-  it("maps a conflicting-report failure to conflict", async () => {
-    expect(await clientWith(respond(409, "conflicting report: x")).report("t-1", { ok: true })).toEqual({ status: "conflict" });
-    // A TerminalError with no code surfaces as HTTP 500.
-    expect(await clientWith(respond(500, "conflicting report: x")).report("t-1", { ok: true })).toEqual({ status: "conflict" });
-  });
-
-  it("parses the Restate JSON error message for the conflict case", async () => {
-    const conflict = JSON.stringify({ code: 500, message: 'conflicting report: existing={"ok":true} incoming={"ok":false}' });
-    expect(await clientWith(respond(500, conflict)).report("t-1", { ok: true })).toEqual({ status: "conflict" });
-    // A Restate-prefixed message (e.g. the handler name) is still a conflict.
-    const prefixed = JSON.stringify({ code: 500, message: "KgRefresh/report: conflicting report: x" });
-    expect(await clientWith(respond(500, prefixed)).report("t-1", { ok: true })).toEqual({ status: "conflict" });
-    // A different failure whose message does not mention the phrase is not a conflict.
-    const other = JSON.stringify({ code: 500, message: "kg-refresh report received after run completed" });
-    expect(await clientWith(respond(500, other)).report("t-1", { ok: true })).toEqual({ status: "unavailable" });
+  it("maps a 409 from report to conflict, and only from report", async () => {
+    const body = JSON.stringify({ code: 409, message: "report rejected" });
+    expect(await clientWith(respond(409, body)).report("t-1", { ok: true })).toEqual({ status: "conflict" });
+    expect(await clientWith(respond(409, body)).cancel("t-1", "stop")).toEqual({ status: "unavailable" });
+    // A 500 carrying the same body is not a conflict.
+    expect(await clientWith(respond(500, body)).report("t-1", { ok: true })).toEqual({ status: "unavailable" });
   });
 
   it("maps other 4xx (including a missing handler) and 5xx to unavailable", async () => {
@@ -354,6 +343,21 @@ describe("createKgRefreshIngressClient", () => {
     expect(await clientWith(refused).progress("t-1")).toEqual({ status: "unavailable" });
     expect(await clientWith(timedOut).progress("t-1")).toEqual({ status: "unavailable" });
     expect(await clientWith(respond(200, "not json")).status("t-1")).toEqual({ status: "unavailable" });
+  });
+
+  it("answers unavailable within the timeout when the sidecar hangs or is down", async () => {
+    const hung = vi.fn((_url: unknown, init?: RequestInit) => new Promise<Response>((_, reject) => {
+      init?.signal?.addEventListener("abort", () => reject(init.signal!.reason));
+    })) as unknown as typeof fetch;
+    const started = Date.now();
+    expect(await createKgRefreshIngressClient(BASE, { fetchImpl: hung, timeoutMs: 50 }).progress("t-1")).toEqual({ status: "unavailable" });
+    expect(Date.now() - started).toBeLessThan(2000);
+    // Nothing listening: a real connection refusal.
+    expect(await createKgRefreshIngressClient("http://127.0.0.1:1", { timeoutMs: 500 }).progress("t-1")).toEqual({ status: "unavailable" });
+  });
+
+  it("maps a 404 from report to not-found", async () => {
+    expect(await clientWith(respond(404, "{}")).report("t-1", { ok: true })).toEqual({ status: "not-found" });
   });
 
   it("encodes every dynamic segment", async () => {
@@ -385,6 +389,6 @@ describe("createKgRefreshIngressClient", () => {
     const [url, init] = (fetchImpl as unknown as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit];
     expect(url).toBe(`${BASE}/KgRepo/acme%2Fkg/enqueueDryRun`);
     expect((init.headers as Record<string, string>)["idempotency-key"]).toBe("delivery-1");
-    expect(JSON.parse(init.body as string)).toEqual(entry);
+    expect(JSON.parse(new TextDecoder().decode(init.body as Uint8Array))).toEqual(entry);
   });
 });

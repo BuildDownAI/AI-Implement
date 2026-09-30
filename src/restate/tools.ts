@@ -26,8 +26,7 @@ import { getRestateStatus } from "./status.js";
 import { readKgSourceRepo } from "../deploy.js";
 import { runKgRefreshPreflight, MIN_FREE_BYTES, type KgRefreshStage, type KgRefreshStatus } from "../kg-refresh.js";
 import type { KgRefreshToolDeps } from "./kg-refresh-production.js";
-import type { createKgRepo } from "./kg-repo.js";
-import type { createKgRefreshWorkflow } from "./kg-refresh-workflow.js";
+import type { KgRefreshDefinition, KgRepoDefinition } from "./kg-refresh-types.js";
 import { getOrchestratorSettings, getLinearPickupLabel } from "../orchestrator-settings.js";
 import { getIssueReportCard, getFleetReport } from "../report-card.js";
 import { getDeployPosture } from "../deploy-posture.js";
@@ -444,8 +443,8 @@ export const GET_KG_STATUS_DESCRIPTION =
 
 // Type-only client handles: the real definitions are built with dependencies at boot
 // (createProductionKgRefreshServices); a client needs only the service name and handler types.
-const KgRepo = { name: "KgRepo" } as unknown as ReturnType<typeof createKgRepo>;
-const KgRefresh = { name: "KgRefresh" } as unknown as ReturnType<typeof createKgRefreshWorkflow>;
+const KgRepo: KgRepoDefinition = { name: "KgRepo" } as KgRepoDefinition;
+const KgRefresh: KgRefreshDefinition = { name: "KgRefresh" } as KgRefreshDefinition;
 
 let kgRefreshToolDeps: KgRefreshToolDeps | null = null;
 
@@ -461,8 +460,7 @@ export function setKgRefreshToolDeps(deps: KgRefreshToolDeps | null): void {
 /** Maps the in-flight workflow step onto the stage vocabulary `get_kg_status` has always used. */
 export function kgStageForStep(step: string | null): KgRefreshStage {
   if (step === null || step === "reserve" || step === "dispatch") return "checking";
-  if (step === "await-progress" || step === "cancelling" || step === "dry-run-report"
-    || step.startsWith("watch-") || step.startsWith("reconcile-")) return "ingest-running";
+  if (step === "await-progress" || step === "cancelling" || step === "dry-run-report") return "ingest-running";
   if (step === "merge" || step === "delete-branch") return "snapshot-landed";
   // fetch, stage, swap, verify, revert, persist, close-row, outcome, settled, and the
   // short-lived terminal steps (failed, closed, no-new-data) whose marker is about to clear.

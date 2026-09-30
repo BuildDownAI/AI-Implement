@@ -654,7 +654,7 @@ describe("migrated read handlers (AII-711)", () => {
 
     it.each([
       ["reserve", "checking"], ["dispatch", "checking"],
-      ["await-progress", "ingest-running"], ["watch-0", "ingest-running"], ["reconcile-2", "ingest-running"],
+      ["await-progress", "ingest-running"], ["cancelling", "ingest-running"], ["dry-run-report", "ingest-running"],
       ["merge", "snapshot-landed"], ["delete-branch", "snapshot-landed"],
       ["fetch", "staging"], ["stage", "staging"], ["swap", "staging"], ["verify", "staging"], ["revert", "staging"],
       ["persist", "staging"], ["close-row", "staging"], ["outcome", "staging"], ["settled", "staging"],

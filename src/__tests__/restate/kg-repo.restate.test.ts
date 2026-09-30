@@ -6,6 +6,7 @@ import * as restate from "@restatedev/restate-sdk";
 import type { RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { MAX_TRACKED_PRS } from "../../kg-refresh.js";
+import { KG_REFRESH_TOTAL_DEADLINE_MS, KG_REPO_STALE_MARGIN_MS } from "../../restate/kg-refresh-workflow.js";
 import { createKgRepo, type KgRepoEnqueueResult, type KgRepoTriggerResult } from "../../restate/kg-repo.js";
 import { VARIANTS, callObject, startVariants, stopAll } from "./harness.js";
 
@@ -388,6 +389,109 @@ describe("KgRepo durable single-flight lock", () => {
       await until(() => runSends.length - before >= 2);
       expect(runSends[runSends.length - 1].parameter).toMatchObject({ kgSourceRef: "first" });
       expect((await repoStatus(env.baseUrl(), slug))?.pending).toEqual(["org/kg-source#2"]);
+    },
+    30_000,
+  );
+});
+
+describe("KgRepo object-owned lease expiry", () => {
+  const SHORT_TOTAL_MS = 400;
+  const SHORT_MARGIN_MS = 400;
+  const fakeKgRefresh = restate.object({
+    name: FAKE_WORKFLOW_NAME,
+    handlers: { run: async (): Promise<void> => {} },
+  });
+
+  let production: Map<string, RestateTestEnvironment>;
+  let short: Map<string, RestateTestEnvironment>;
+  beforeAll(async () => {
+    production = await startVariants([createKgRepo({ workflowName: FAKE_WORKFLOW_NAME }), fakeKgRefresh]);
+    short = await startVariants([
+      createKgRepo({ workflowName: FAKE_WORKFLOW_NAME, totalDeadlineMs: SHORT_TOTAL_MS, staleMarginMs: SHORT_MARGIN_MS }),
+      fakeKgRefresh,
+    ]);
+  }, 120_000);
+  afterAll(async () => {
+    if (production) await stopAll(production);
+    if (short) await stopAll(short);
+  });
+
+  const pick = (envs: Map<string, RestateTestEnvironment>, label: string): RestateTestEnvironment => {
+    const env = envs.get(label);
+    if (!env) throw new Error(`missing Restate variant ${label}`);
+    return env;
+  };
+  const slugOf = () => `buildDownAI/kg-source-${randomUUID()}`;
+  const markerOf = (env: RestateTestEnvironment, slug: string) =>
+    callObject<{ triggerId: string } | null>(env.baseUrl(), "KgRepo", slug, "status", {});
+  async function untilAsync(predicate: () => Promise<boolean>, timeoutMs = 15_000): Promise<void> {
+    const stop = Date.now() + timeoutMs;
+    while (!(await predicate())) {
+      if (Date.now() > stop) throw new Error("timed out");
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "trigger records one delayed expire self-send (%s)",
+    async (label) => {
+      const env = pick(production, label);
+      const slug = slugOf();
+      await callObject(env.baseUrl(), "KgRepo", slug, "trigger", {});
+      const response = await fetch(`${env.adminAPIBaseUrl()}/query`, {
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "application/json" },
+        body: JSON.stringify({
+          query: `SELECT * FROM sys_invocation WHERE target_service_name = 'KgRepo' AND target_service_key = '${slug}' AND target_handler_name = 'expire'`,
+        }),
+      });
+      const rows = ((await response.json()) as { rows: Array<Record<string, unknown>> }).rows;
+      expect(rows).toHaveLength(1);
+      const delay = Date.parse(String(rows[0].scheduled_start_at)) - Date.parse(String(rows[0].created_at));
+      expect(Math.abs(delay - (KG_REFRESH_TOTAL_DEADLINE_MS + KG_REPO_STALE_MARGIN_MS))).toBeLessThan(5_000);
+    },
+    30_000,
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "with a short margin, expire clears the marker when no release arrives (%s)",
+    async (label) => {
+      const env = pick(short, label);
+      const slug = slugOf();
+      await callObject(env.baseUrl(), "KgRepo", slug, "trigger", {});
+      await untilAsync(async () => (await markerOf(env, slug)) === null);
+    },
+    30_000,
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "expire after release is a no-op: it leaves a newer marker alone (%s)",
+    async (label) => {
+      const env = pick(short, label);
+      const slug = slugOf();
+      const startedAt = Date.now();
+      const { triggerId } = await callObject<{ triggerId: string }>(env.baseUrl(), "KgRepo", slug, "trigger", {});
+      await callObject(env.baseUrl(), "KgRepo", slug, "release", { triggerId });
+      // Stagger the second lease so the first expire fires while the second marker is still live.
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      const next = await callObject<{ triggerId: string }>(env.baseUrl(), "KgRepo", slug, "trigger", {});
+      expect(next.triggerId).not.toBe(triggerId);
+      // Wait past the first lease's expire (startedAt + 800 ms) but before the second's (>= startedAt + 1200 ms).
+      const wait = startedAt + SHORT_TOTAL_MS + SHORT_MARGIN_MS + 200 - Date.now();
+      await new Promise((resolve) => setTimeout(resolve, Math.max(wait, 0)));
+      expect(Date.now()).toBeLessThan(startedAt + SHORT_TOTAL_MS + SHORT_MARGIN_MS + 400);
+      expect((await markerOf(env, slug))?.triggerId).toBe(next.triggerId);
+    },
+    30_000,
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "release and expire reject an unknown key or an empty trigger id (%s)",
+    async (label) => {
+      const env = pick(production, label);
+      const slug = slugOf();
+      await expect(callObject(env.baseUrl(), "KgRepo", slug, "release", { triggerId: "t", extra: 1 })).rejects.toThrow();
+      await expect(callObject(env.baseUrl(), "KgRepo", slug, "expire", { triggerId: "" })).rejects.toThrow();
     },
     30_000,
   );
