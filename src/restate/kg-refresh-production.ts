@@ -86,6 +86,8 @@ export interface KgRefreshProductionInput {
   /** Already bound to the KG source repo (the workflow only knows a run id). */
   getWorkflowRunStatus: KgRefreshWorkflowDependencies["getWorkflowRunStatus"];
   findRunByTitle: KgRefreshWorkflowDependencies["findRunByTitle"];
+  /** Defaults to a `settings` row per run id (`runWatchKey`). */
+  registerRunWatch?: KgRefreshWorkflowDependencies["registerRunWatch"];
   cancelWorkflowRun: KgRefreshWorkflowDependencies["cancelWorkflowRun"];
   persistLastRefresh: (outcome: RefreshOutcome) => void;
   /** `handleKgRefreshOutcome` with `config` and the provider registry already applied. */
@@ -188,6 +190,49 @@ export function createKgRefreshDispatch(input: KgRefreshProductionInput): (dispa
   };
 }
 
+// ---------------------------------------------------------------------------
+// Run watch: GitHub run id -> awakeable id, for the `workflow_run` webhook
+// ---------------------------------------------------------------------------
+
+const runWatchKey = (runId: number) => `kg-refresh-run-watch:${runId}`;
+
+/** Idempotent upsert — the workflow journals the call, but a retry may repeat it. */
+export function registerRunWatch({ runId, awakeableId }: { runId: number; awakeableId: string }): void {
+  getDb().prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").run(runWatchKey(runId), awakeableId);
+}
+
+export function lookupRunWatch(runId: number): string | null {
+  const row = getDb().prepare("SELECT value FROM settings WHERE key = ?").get(runWatchKey(runId)) as { value: string } | undefined;
+  return row?.value ?? null;
+}
+
+export function forgetRunWatch(runId: number): void {
+  getDb().prepare("DELETE FROM settings WHERE key = ?").run(runWatchKey(runId));
+}
+
+/** Resolves the awakeable over the loopback ingress; the delivery id is the idempotency key. Never throws. */
+export async function resolveRunWatchAwakeable(
+  awakeableId: string,
+  conclusion: string | null,
+  idempotencyKey?: string,
+  deps: { baseUrl?: string; fetchImpl?: typeof fetch; timeoutMs?: number } = {},
+): Promise<boolean> {
+  try {
+    const res = await (deps.fetchImpl ?? fetch)(
+      `${deps.baseUrl ?? RESTATE_INGRESS_BASE_URL}/restate/awakeables/${encodeURIComponent(awakeableId)}/resolve`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json", ...(idempotencyKey ? { "idempotency-key": idempotencyKey } : {}) },
+        body: JSON.stringify({ conclusion }),
+        signal: AbortSignal.timeout(deps.timeoutMs ?? INGRESS_TIMEOUT_MS),
+      },
+    );
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
 export function createProductionKgRefreshServices(
   input: KgRefreshProductionInput,
 ): { services: RestateService[]; toolDeps: KgRefreshToolDeps } {
@@ -259,6 +304,7 @@ export function createProductionKgRefreshServices(
     },
     getWorkflowRunStatus: input.getWorkflowRunStatus,
     findRunByTitle: input.findRunByTitle,
+    registerRunWatch: input.registerRunWatch ?? registerRunWatch,
     cancelWorkflowRun: input.cancelWorkflowRun,
     persistLastRefresh: input.persistLastRefresh,
     onOutcome: (kind, outcome) => {

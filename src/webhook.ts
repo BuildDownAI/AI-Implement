@@ -391,6 +391,51 @@ function findMatchingDispatch(repo: string, branch?: string, prUrl?: string, prN
   return null;
 }
 
+/** The kg-refresh run watch: GitHub run id -> the `KgRefresh` awakeable waiting on it. */
+export interface RunWatchHooks {
+  lookup(runId: number): string | null;
+  /** Resolves the awakeable with the run's conclusion; `idempotencyKey` is the webhook delivery id. */
+  resolve(awakeableId: string, conclusion: string | null, idempotencyKey?: string): Promise<boolean>;
+  forget(runId: number): void;
+}
+
+interface WorkflowRunPayload {
+  action?: string;
+  workflow_run?: { id?: number; conclusion?: string | null };
+}
+
+/**
+ * `workflow_run.completed` ends the `KgRefresh` watch early by resolving its awakeable. Requires the
+ * GitHub App to be subscribed to `workflow_run`; without it the workflow's backstop poll carries the run.
+ * The awakeable id stays inside the orchestrator — the response to GitHub never carries it.
+ */
+async function handleWorkflowRunWebhook(
+  payload: WorkflowRunPayload,
+  res: http.ServerResponse,
+  runWatch: RunWatchHooks | undefined,
+  deliveryId?: string,
+): Promise<void> {
+  const runId = payload.workflow_run?.id;
+  const awakeableId = payload.action === "completed" && runWatch && typeof runId === "number" ? runWatch.lookup(runId) : null;
+  if (!runWatch || typeof runId !== "number" || !awakeableId) {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ignored: true }));
+    return;
+  }
+  const conclusion = payload.workflow_run?.conclusion ?? null;
+  const resolved = await runWatch.resolve(awakeableId, conclusion, deliveryId);
+  console.log(`[webhook] workflow_run ${runId} completed (${conclusion ?? "unknown"}): kg-refresh watch ${resolved ? "resolved" : "resolve failed"}${deliveryId ? ` (delivery ${deliveryId})` : ""}`);
+  if (resolved) {
+    runWatch.forget(runId);
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ resolved: true }));
+  } else {
+    // Keep the row so GitHub's redelivery can retry; the backstop poll still ends the watch meanwhile.
+    res.writeHead(502, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "Could not resolve run watch" }));
+  }
+}
+
 /**
  * Handles incoming GitHub webhook requests at POST /api/github/webhook.
  *
@@ -409,6 +454,7 @@ export async function handleGitHubWebhook(
   selfDeploy?: SelfDeployTarget,
   kgPrCheck?: KgPrCheckConfig,
   onReviewFixPrClosed?: (repository: string, prNumber: number) => void | Promise<void>,
+  runWatch?: RunWatchHooks,
 ): Promise<void> {
   const body = await readRawBody(req);
   const signature = req.headers["x-hub-signature-256"] as string | undefined;
@@ -443,6 +489,11 @@ export async function handleGitHubWebhook(
 
   if (event === "issue_comment") {
     await handleIssueCommentWebhook(payload as IssueCommentPayload, res, appId, privateKey, deliveryId);
+    return;
+  }
+
+  if (event === "workflow_run") {
+    await handleWorkflowRunWebhook(payload as unknown as WorkflowRunPayload, res, runWatch, deliveryId);
     return;
   }
 

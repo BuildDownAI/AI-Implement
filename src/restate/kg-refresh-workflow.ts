@@ -46,8 +46,11 @@ export const KG_REPO_STALE_MARGIN_MS = 10 * 60 * 1000;
 export const KG_REFRESH_BOOTSTRAP_DEADLINE_MS = 10 * 60 * 1000;
 /** One shared retention constant, the same pattern as `REVIEW_FIX_RETENTION_MS` (`src/restate/review-fix-attempt.ts:28`). */
 export const KG_REFRESH_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
-/** How often the GHA backend's watch loop polls the dispatched run's status. */
-export const KG_REFRESH_WATCH_INTERVAL_MS = 60 * 1000;
+/** How often the GHA backend's watch loop polls the dispatched run's status. The run's conclusion
+ *  normally arrives through the `workflow_run` webhook (an awakeable); this tick is the backstop for a lost delivery. */
+export const KG_REFRESH_WATCH_INTERVAL_MS = 10 * 60 * 1000;
+/** Ceiling on the poll interval while confirming a cancelled run ended — no awakeable arm there, so it stays short. */
+const KG_REFRESH_CANCEL_WATCH_INTERVAL_MS = 60 * 1000;
 
 const GHA_EXECUTION_MODE = "github-actions";
 
@@ -121,6 +124,8 @@ export interface KgRefreshWorkflowDependencies {
   closeJobLog(jobId: string, status: "completed" | "failed" | "timed_out", conclusion?: string): void;
   getWorkflowRunStatus(runId: number): Promise<{ status: string; conclusion: string | null }>;
   findRunByTitle(title: string): Promise<{ runId: number } | null>;
+  /** Records which awakeable the `workflow_run` webhook must resolve for this GitHub run. Idempotent on `runId`. */
+  registerRunWatch(input: { runId: number; awakeableId: string }): void | Promise<void>;
   cancelWorkflowRun(runId: number): Promise<boolean>;
   persistLastRefresh(outcome: RefreshOutcome): void;
   onOutcome(kind: "success" | "failure", outcome: RefreshOutcome): void | Promise<void>;
@@ -162,7 +167,8 @@ type WaitArm =
   | { kind: "report"; value: KgRefreshReportBody }
   | { kind: "cancel"; reason: string }
   | { kind: "tick" }
-  | { kind: "progress" };
+  | { kind: "progress" }
+  | { kind: "run_done"; conclusion: string | null };
 
 function validKey(key: string, triggerId: unknown): string {
   if (typeof triggerId !== "string" || triggerId !== key) {
@@ -188,6 +194,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
   const bootstrapDeadlineMs = deps.bootstrapDeadlineMs ?? KG_REFRESH_BOOTSTRAP_DEADLINE_MS;
   const totalDeadlineMs = deps.totalDeadlineMs ?? KG_REFRESH_TOTAL_DEADLINE_MS;
   const watchIntervalMs = deps.watchIntervalMs ?? KG_REFRESH_WATCH_INTERVAL_MS;
+  const cancelWatchIntervalMs = Math.min(watchIntervalMs, KG_REFRESH_CANCEL_WATCH_INTERVAL_MS);
 
   async function runGate(
     ctx: WorkflowContext,
@@ -310,9 +317,18 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         let progressSeen = false;
         let watchIndex = 0;
         let reconcileIndex = 0;
+        let runDoneArm: restate.RestatePromise<WaitArm> | undefined;
 
         for (;;) {
           if (isGha) {
+            // Once the run id is known (straight from dispatch, or found by reconcile), hand the
+            // webhook an awakeable for it — created and registered exactly once per run.
+            if (runId !== undefined && runDoneArm === undefined) {
+              const { id, promise } = ctx.awakeable<{ conclusion: string | null }>();
+              const watchedRunId = runId;
+              await ctx.run("register-run-watch", () => deps.registerRunWatch({ runId: watchedRunId, awakeableId: id }));
+              runDoneArm = promise.map((value): WaitArm => ({ kind: "run_done", conclusion: value?.conclusion ?? null }));
+            }
             if (runId === undefined) {
               const found = await ctx.run(`reconcile-${reconcileIndex++}`, () => deps.findRunByTitle(issueIdentifier));
               if (found) {
@@ -342,6 +358,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
             .map((reason): WaitArm => ({ kind: "cancel", reason: reason! }));
           const tickArm = ctx.sleep(tick).map((): WaitArm => ({ kind: "tick" }));
           const arms = [reportArm, cancelArm, tickArm];
+          if (runDoneArm) arms.push(runDoneArm);
           if (!progressSeen) {
             arms.push(ctx.promise<boolean>("progress").get().map((): WaitArm => ({ kind: "progress" })));
           }
@@ -349,6 +366,11 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           const winner = await restate.RestatePromise.race(arms);
           if (winner.kind === "report") return { kind: "report", value: winner.value };
           if (winner.kind === "cancel") return { kind: "cancel", reason: winner.reason };
+          if (winner.kind === "run_done") {
+            const reportNow = await ctx.promise<KgRefreshReportBody>("report").peek();
+            if (reportNow !== undefined) return { kind: "report", value: reportNow };
+            return { kind: "dispatch_lost", conclusion: winner.conclusion };
+          }
           if (winner.kind === "progress") progressSeen = true;
           // "tick": loop again, re-checking watch/reconcile and the deadline.
         }
@@ -398,7 +420,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
             }
             const now = await ctx.date.now();
             if (now >= totalDeadlineAt) break;
-            await ctx.sleep(watchIntervalMs);
+            await ctx.sleep(cancelWatchIntervalMs);
           }
         }
         ctx.set("step", "failed");
