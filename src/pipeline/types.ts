@@ -4,6 +4,8 @@ import type { ReviewerSelection } from "../config.js";
 import type { RetryPolicy } from "./retry-backoff.js";
 import type { ReviewerDefinition } from "./reviewers/registry.js";
 import type { FailureRecord } from "./failure-classification.js";
+import type { StageName } from "../agent-config.js";
+import type { ResolvedAgentSnapshotV1 } from "../run-config.js";
 
 export type StepStatus = "running" | "passed" | "failed" | "skipped" | "cancelled";
 
@@ -71,6 +73,9 @@ export interface PipelineContextData {
    *  Always set by run-autonomous ([] when the env var is absent). No built-in step reads
    *  it — it is the contract surface for image-baked custom/ steps. */
   profiles?: string[];
+  /** Resolved per-stage agent snapshot from the envelope (AII-944). Absent = legacy behavior.
+   *  Not to be confused with `profiles`, which are workflow profiles, not model account profiles. */
+  agentConfig?: ResolvedAgentSnapshotV1;
   /** Autonomous runner: issue assignee display name (Jira), from the run_config envelope or
    *  AI_IMPLEMENT_ASSIGNEE_NAME env. Used by push.ts to attribute the opened PR's title. */
   assigneeName?: string;
@@ -308,6 +313,16 @@ export interface InvokeParams {
    * failure record even with no retry policy configured.
    */
   stage?: string;
+  /**
+   * Configured agent stage this call belongs to (AII-944). Independent of the diagnostic
+   * `stage` label above. No built-in executor reads it yet; absent = legacy behavior.
+   */
+  agentStage?: StageName;
+  /**
+   * Elapsed-time limit for this one invocation, from the resolved snapshot (AII-944).
+   * Separate from native Claude `maxTurns`; turns are never translated into time.
+   */
+  invocationTimeoutMs?: number;
   /**
    * Whether this call site requires `structuredOutput` (review does; implement
    * never requests it). Read independently of `retry` for the same reason as

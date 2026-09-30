@@ -525,3 +525,116 @@ describe("runConfigFromTaskDocument", () => {
     expect(decoded.maxIterations).toBe(2);
   });
 });
+
+describe("agentConfig resolved snapshot", () => {
+  const mk = (stage: "planning" | "implementation" | "review", agent: "claude" | "codex", provider: "anthropic" | "bedrock" | "openai", authMode: string, src = "project") => ({
+    sel: { agent, provider, model: "m", accountProfileId: `p-${stage}`, invocationTimeoutMs: 60_000 },
+    src: { agent: src, provider: src, model: src, accountProfileId: src, invocationTimeoutMs: "job-deadline" },
+    prof: { id: `p-${stage}`, identity: "acct", revision: 2, agent, provider, authMode },
+  });
+  const build = (): any => {
+    const p = mk("planning", "claude", "anthropic", "claude-subscription");
+    const i = mk("implementation", "codex", "openai", "codex-subscription", "orchestrator-default");
+    const r = mk("review", "codex", "openai", "openai-api-key");
+    return {
+      version: 1,
+      snapshotId: "snap-1",
+      configRevisions: { orchestratorDefault: 1, project: 3 },
+      stages: { planning: p.sel, implementation: i.sel, review: r.sel },
+      sources: { planning: p.src, implementation: i.src, review: r.src },
+      profiles: { planning: p.prof, implementation: i.prof, review: r.prof },
+    };
+  };
+  const base = { v: 1, issue: { id: "1", identifier: "A-1", title: "t", description: "d" } };
+  const decodeWith = (agentConfig: unknown) =>
+    decodeRunConfig(Buffer.from(JSON.stringify({ ...base, agentConfig }), "utf-8").toString("base64"));
+
+  it("legacy envelope has no agentConfig key", () => {
+    expect("agentConfig" in decodeRunConfig(encodeRunConfig(base as RunConfigV1))).toBe(false);
+  });
+
+  it("round-trips a valid snapshot", () => {
+    const cfg = { ...base, agentConfig: build() } as RunConfigV1;
+    expect(decodeRunConfig(encodeRunConfig(cfg)).agentConfig).toEqual(build());
+  });
+
+  it("accepts every auth mode", () => {
+    const combos: Array<["claude" | "codex", "anthropic" | "bedrock" | "openai", string]> = [
+      ["claude", "anthropic", "anthropic-api-key"], ["claude", "bedrock", "bedrock"],
+      ["claude", "anthropic", "claude-subscription"], ["codex", "openai", "openai-api-key"],
+      ["codex", "openai", "codex-subscription"],
+    ];
+    for (const [a, p, m] of combos) {
+      const s = build();
+      const x = mk("review", a, p, m);
+      s.stages.review = x.sel; s.profiles.review = x.prof;
+      expect(() => decodeWith(s)).not.toThrow();
+    }
+  });
+
+  const mutations: Array<[string, (s: any) => void]> = [
+    ["bad version", (s) => { s.version = 2; }],
+    ["missing stage", (s) => { delete s.stages.review; }],
+    ["extra stage", (s) => { s.stages.extra = s.stages.review; }],
+    ["zero revision", (s) => { s.profiles.review.revision = 0; }],
+    ["string config revision", (s) => { s.configRevisions.project = "3"; }],
+    ["negative timeout", (s) => { s.stages.review.invocationTimeoutMs = -1; }],
+    ["fractional timeout", (s) => { s.stages.review.invocationTimeoutMs = 1.5; }],
+    ["string timeout", (s) => { s.stages.review.invocationTimeoutMs = "5"; }],
+    ["bad source", (s) => { s.sources.review.model = "user"; }],
+    ["profile id mismatch", (s) => { s.profiles.review.id = "other"; }],
+    ["profile agent mismatch", (s) => { s.profiles.review.agent = "claude"; }],
+    ["profile provider mismatch", (s) => { s.profiles.review.provider = "anthropic"; }],
+    ["codex with anthropic-api-key", (s) => { s.profiles.review.authMode = "anthropic-api-key"; }],
+  ];
+  for (const [name, mutate] of mutations) {
+    it(`rejects ${name}`, () => {
+      const s = build();
+      mutate(s);
+      expect(() => decodeWith(s)).toThrow(/agentConfig/);
+      expect(() => encodeRunConfig({ ...base, agentConfig: s } as RunConfigV1)).toThrow(/agentConfig/);
+    });
+  }
+
+  it.each([null, [], "x", 5])("rejects non-object agentConfig %#", (v) => {
+    expect(() => decodeWith(v)).toThrow(/agentConfig/);
+  });
+
+  it("rejects credential-shaped fields without echoing values", () => {
+    const secret = "sk-SYNTHETIC-SECRET-VALUE";
+    const inject: Array<(s: any) => void> = [
+      (s) => { s.apiKey = secret; },
+      (s) => { s.stages.review.token = secret; },
+      (s) => { s.profiles.review.credential = secret; },
+      (s) => { s.profiles.planning.accessToken = secret; },
+      (s) => { s.sources.review.apiKey = secret; },
+      (s) => { s.configRevisions.token = secret; },
+    ];
+    for (const fn of inject) {
+      const s = build();
+      fn(s);
+      let msg = "";
+      try { decodeWith(s); } catch (e) { msg = (e as Error).message; }
+      expect(msg).toMatch(/unknown field/);
+      expect(msg).not.toContain(secret);
+      expect(msg).not.toContain("apiKey");
+      expect(msg.length).toBeLessThan(200);
+    }
+  });
+
+  it("whitelist drops unknown top-level keys and keeps the snapshot", () => {
+    const out = decodeRunConfig(Buffer.from(JSON.stringify({ ...base, extra: 1, agentConfig: build() })).toString("base64"));
+    expect("extra" in out).toBe(false);
+    expect(out.agentConfig).toEqual(build());
+  });
+
+  it("builder defaults omit agentConfig, and accept then validate an explicit snapshot", () => {
+    const mapping = makeMapping();
+    const input = { issue: implBaseIssue, mapping, baseBranch: mapping.defaultBranch, retryPolicy: DEFAULT_RETRY_POLICY };
+    expect("agentConfig" in buildImplRunConfig(input)).toBe(false);
+    expect(buildImplRunConfig({ ...input, agentConfig: build() }).agentConfig).toEqual(build());
+    const bad = build();
+    bad.stages.review.invocationTimeoutMs = 0;
+    expect(() => buildImplRunConfig({ ...input, agentConfig: bad })).toThrow(/agentConfig/);
+  });
+});
