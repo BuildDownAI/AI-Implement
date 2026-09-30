@@ -329,6 +329,7 @@ describe("attribution contract (AII-946)", () => {
     expect(sanitizeAttribution(attr({ limit: { kind: "timeout_ms", value: -1 } }))).toBeNull();
     expect(sanitizeAttribution(attr({ usage: { availability: "partial", tokensIn: Infinity, tokensOut: null, costUsd: null, costStatus: "unavailable" } }))).toBeNull();
     expect(sanitizeAttribution(attr({ model: "sk-SYNTHETICSECRET123456" }))).toBeNull();
+    expect(sanitizeAttribution(attr({ model: "claude-opus-4[1m]" }))?.model).toBe("claude-opus-4[1m]");
     expect(sanitizeAttribution(attr({ version: 2 }))).toBeNull();
     expect(sanitizeAttribution(attr({ outcome: "timeout" }))).toBeNull();
     expect(sanitizeAttribution(undefined)).toBeNull();

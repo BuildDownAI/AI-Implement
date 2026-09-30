@@ -308,7 +308,9 @@ const ATTRIBUTION_KEYS = ["version", "invocationId", "stage", "snapshotId", "age
 const ATTRIBUTION_USAGE_KEYS = ["availability", "tokensIn", "tokensOut", "costUsd", "costStatus"];
 const ATTRIBUTION_AUTH_MODES = ["anthropic-api-key", "bedrock", "claude-subscription", "openai-api-key", "codex-subscription"];
 const ATTRIBUTION_ID_RE = /^[\w.:/@-]{1,128}$/;
-const ATTRIBUTION_SECRET_RE = /(sk-[A-Za-z0-9_-]{8,}|bearer\s|eyJ[A-Za-z0-9_-]{10,}|ghp_|gho_|ghs_|xox[bp]-)/i;
+/** Model ids may carry suffixes such as `[1m]` or `+`: printable non-whitespace ASCII, bounded. */
+const ATTRIBUTION_MODEL_RE = /^[\x21-\x7e]{1,128}$/;
+const ATTRIBUTION_SECRET_RE = /(sk-[A-Za-z0-9_-]{8,}|eyJ[A-Za-z0-9_-]{10,}|ghp_|gho_|ghs_|xox[bp]-)/i;
 
 function attrRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
@@ -320,6 +322,10 @@ function onlyKeys(v: Record<string, unknown>, allowed: string[]): boolean {
 
 function attrId(v: unknown): v is string {
   return typeof v === "string" && ATTRIBUTION_ID_RE.test(v) && !ATTRIBUTION_SECRET_RE.test(v);
+}
+
+function attrModel(v: unknown): v is string {
+  return typeof v === "string" && ATTRIBUTION_MODEL_RE.test(v) && !ATTRIBUTION_SECRET_RE.test(v);
 }
 
 function nullableCount(v: unknown): v is number | null {
@@ -340,7 +346,7 @@ export function sanitizeAttribution(value: unknown): InvocationAttributionV1 | n
     return null;
   }
   if (value.version !== INVOCATION_ATTRIBUTION_VERSION) return null;
-  if (!attrId(value.invocationId) || !attrId(value.snapshotId) || !attrId(value.model)) return null;
+  if (!attrId(value.invocationId) || !attrId(value.snapshotId) || !attrModel(value.model)) return null;
   if (!(STAGE_NAMES as readonly unknown[]).includes(value.stage)) return null;
   if (value.agent !== "claude" && value.agent !== "codex") return null;
   if (value.provider !== "anthropic" && value.provider !== "bedrock" && value.provider !== "openai") return null;
