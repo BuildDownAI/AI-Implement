@@ -8,17 +8,15 @@ import type { AttributionUsage, LLMResult, LLMTerminalStatus, RunTelemetry } fro
  * `usage.{input_tokens,cached_input_tokens,output_tokens}`), `turn.failed`, `error`, and
  * `item.started|updated|completed` carrying `agent_message`, `reasoning`, `command_execution`,
  * `file_change`, `mcp_tool_call`, `web_search`, `todo_list` or `error` items. Anything else is an
- * unknown future shape: counted, never fatal, and — for item-shaped data — treated as possibly
- * mutating so it can never authorize an automatic retry.
+ * unknown future shape: counted, invalidates stream integrity (no success or verdict), and is treated as possibly
+ * mutating so it can never authorize an automatic retry. Fatal signals are sticky.
  */
 
 const LINE_MAX_CHARS = 1_000_000;
 const TOOL_TRACE_MAX = 200;
 const EXECUTED_COMMANDS_MAX = 200;
-const TRACE_ENTRY_MAX = 160;
 const STDERR_MAX = 64_000;
 const SEEN_ITEMS_MAX = 5000;
-const COMMAND_TOKENS_MAX = 4;
 
 // Item types that cannot touch the workspace. Everything else is unsafe or uncertain.
 const SAFE_ITEM_TYPES = new Set(["agent_message", "reasoning", "todo_list", "web_search", "error"]);
@@ -58,21 +56,20 @@ export function parseCodexLine(line: string): CodexEvent | null {
 }
 
 /**
- * Compact, redacted command summary: shell wrappers unwrapped, only the first few tokens kept,
- * `KEY=value` and secret-shaped tokens masked. Arguments beyond that never reach a trace.
+ * Compact command label: shell wrappers unwrapped, leading `KEY=value` assignments skipped, and only
+ * the executable basename kept. Argument tokens never reach a trace, so credentials in arguments
+ * (`--token x`, multi-token `Bearer` headers) cannot leak.
  */
 export function summarizeCommand(command: string): string {
   let inner = command.trim();
   const wrapped = /^(?:\S*\/)?(?:ba|z|da)?sh\s+(?:-\w+\s+)*-\w*c\s+(['"]?)([\s\S]*)$/.exec(inner);
   if (wrapped) inner = wrapped[2].replace(/['"]$/, "");
   const tokens = inner.split(/\s+/).filter(Boolean);
-  const kept = tokens.slice(0, COMMAND_TOKENS_MAX).map((t) => {
-    const eq = t.indexOf("=");
-    if (eq > 0) return `${t.slice(0, eq)}=[redacted]`;
-    return redactSecrets(t);
-  });
-  const more = tokens.length > COMMAND_TOKENS_MAX ? " …" : "";
-  return truncate(`${kept.join(" ")}${more}`, TRACE_ENTRY_MAX);
+  let i = 0;
+  while (i < tokens.length && /^[A-Za-z_]\w*=/.test(tokens[i])) i++;
+  const exe = tokens[i]?.split("/").filter(Boolean).pop() ?? "";
+  const label = /^[\w.+-]{1,60}$/.test(exe) ? exe : "?";
+  return label === "?" && tokens.length === 0 ? "" : `${label}${tokens.length > i + 1 ? " …" : ""}`;
 }
 
 function safeLabel(v: unknown): string {
@@ -90,16 +87,22 @@ export class CodexStreamParser {
   private partial = "";
   private discarding = false;
   private sawUnsafe = false;
-  private terminal: Terminal | null = null;
+  /** Sticky fatal signal (`turn.failed` / `error`); a later `turn.completed` never clears it. */
+  private fatal: Terminal | null = null;
+  /** Latest turn reached `turn.completed`; reset by every `turn.started`. */
+  private completed = false;
+  private openTurn = false;
+  /** Stream integrity: any malformed, unknown or dropped input permanently forbids success. */
+  private corrupt = false;
   private lastMessage: string | null = null;
   private seenItems = new Set<string>();
-  private pendingCommands = new Map<string, string>();
   private trace: string[] = [];
   private droppedTrace = 0;
   private commands: Array<{ command: string; failed: boolean }> = [];
   private tokensIn: number | null = null;
   private tokensOut: number | null = null;
   private cachedIn: number | null = null;
+  private cacheWriteIn: number | null = null;
   private cost: number | null = null;
   private stderrText = "";
 
@@ -142,6 +145,7 @@ export class CodexStreamParser {
       this.oversizedLines++;
       // The dropped line may have carried a command or file change we can no longer see.
       this.sawUnsafe = true;
+      this.corrupt = true;
       return;
     }
     this.partial += text;
@@ -152,12 +156,16 @@ export class CodexStreamParser {
     const wasDiscarding = this.discarding;
     this.partial = "";
     this.discarding = false;
-    if (wasDiscarding) return;
+    if (wasDiscarding) {
+      this.corrupt = true;
+      return;
+    }
     const trimmed = line.trim();
     if (!trimmed) return;
     const event = parseCodexLine(trimmed);
     if (!event) {
       this.malformedLines++;
+      this.corrupt = true;
       // A corrupted or truncated JSON object may have been an item event; stay conservative.
       if (trimmed.startsWith("{")) this.sawUnsafe = true;
       return;
@@ -172,16 +180,21 @@ export class CodexStreamParser {
         return;
       case "turn.started":
         this.eventTurns++;
+        this.completed = false;
+        this.openTurn = true;
+        this.lastMessage = null;
         return;
       case "turn.completed":
-        this.terminal = "completed";
+        this.completed = true;
+        this.openTurn = false;
         this.applyUsage(event);
         return;
       case "turn.failed":
-        this.terminal = "failed";
+        this.fatal ??= "failed";
+        this.openTurn = false;
         return;
       case "error":
-        this.terminal = "error";
+        this.fatal ??= "error";
         return;
       case "item.started":
       case "item.updated":
@@ -190,7 +203,8 @@ export class CodexStreamParser {
         return;
       default:
         this.unknownEvents++;
-        if (typeof event.type === "string" && event.type.startsWith("item")) this.sawUnsafe = true;
+        this.corrupt = true;
+        this.sawUnsafe = true;
     }
   }
 
@@ -199,6 +213,7 @@ export class CodexStreamParser {
     this.tokensIn = sumNullable(this.tokensIn, count(usage.input_tokens));
     this.tokensOut = sumNullable(this.tokensOut, count(usage.output_tokens));
     this.cachedIn = sumNullable(this.cachedIn, count(usage.cached_input_tokens));
+    this.cacheWriteIn = sumNullable(this.cacheWriteIn, count(usage.cache_write_input_tokens));
     const cost = count(event.total_cost_usd) ?? count(usage.total_cost_usd) ?? count(usage.cost_usd);
     if (cost != null) this.cost = (this.cost ?? 0) + cost;
   }
@@ -219,6 +234,7 @@ export class CodexStreamParser {
   private applyItem(phase: string, raw: unknown): void {
     if (!record(raw) || typeof raw.type !== "string") {
       this.unknownEvents++;
+      this.corrupt = true;
       this.sawUnsafe = true;
       return;
     }
@@ -226,6 +242,7 @@ export class CodexStreamParser {
     const id = raw.id;
     if (!SAFE_ITEM_TYPES.has(type) && type !== "command_execution" && type !== "file_change" && type !== "mcp_tool_call") {
       this.unknownEvents++;
+      this.corrupt = true;
     }
     if (type === "reasoning") return; // hidden reasoning: never read, never traced
 
@@ -240,16 +257,12 @@ export class CodexStreamParser {
     if (type === "command_execution") {
       const summary = summarizeCommand(typeof raw.command === "string" ? raw.command : "");
       if (first) this.addTrace(`command ${summary}`.trimEnd());
-      const key = typeof id === "string" ? id : "";
       const status = raw.status;
       const exit = typeof raw.exit_code === "number" ? raw.exit_code : null;
       if (phase === "item.completed" && (status === "completed" || status === "failed")) {
         if (this.commands.length < EXECUTED_COMMANDS_MAX) {
           this.commands.push({ command: summary, failed: status === "failed" || (exit != null && exit !== 0) });
         }
-        this.pendingCommands.delete(key);
-      } else if (key) {
-        this.pendingCommands.set(key, summary);
       }
       return;
     }
@@ -280,10 +293,9 @@ export class CodexStreamParser {
   }
 
   get terminalStatus(): LLMTerminalStatus | undefined {
-    if (this.terminal == null) return undefined;
-    return this.terminal === "completed"
-      ? { subtype: "success", isError: false }
-      : { subtype: "error", isError: true };
+    if (this.fatal != null || this.corrupt) return { subtype: "error", isError: true };
+    if (this.completed && !this.openTurn) return { subtype: "success", isError: false };
+    return undefined;
   }
 
   /**
@@ -292,7 +304,7 @@ export class CodexStreamParser {
    * undefined, which `classifyLlmResult` reports as invalid_output.
    */
   get structuredOutput(): Record<string, unknown> | undefined {
-    if (this.terminal !== "completed" || this.lastMessage == null) return undefined;
+    if (this.terminalStatus?.isError !== false || this.lastMessage == null) return undefined;
     try {
       const parsed = JSON.parse(this.lastMessage.trim()) as unknown;
       return record(parsed) ? parsed : undefined;
@@ -304,14 +316,14 @@ export class CodexStreamParser {
   get telemetry(): RunTelemetry {
     const toolTrace = this.droppedTrace > 0 ? [...this.trace, `… ${this.droppedTrace} more tool calls truncated`] : [...this.trace];
     return {
-      outcome: this.terminal === "completed" ? "success" : this.terminal ? "error" : "unknown",
+      outcome: this.terminalStatus ? (this.terminalStatus.isError ? "error" : "success") : "unknown",
       numTurns: null,
       durationMs: null,
       costUsd: this.cost,
       tokensIn: this.tokensIn,
       tokensOut: this.tokensOut,
       cacheReadTokens: this.cachedIn,
-      cacheCreationTokens: null,
+      cacheCreationTokens: this.cacheWriteIn,
       toolTrace,
       ...(this.commands.length > 0 ? { executedCommands: [...this.commands] } : {}),
     };
@@ -319,6 +331,7 @@ export class CodexStreamParser {
 
   /** Assemble an `LLMResult`; call `end()` first. stdout carries the final message only. */
   toResult(proc: { exitCode: number; signal?: string | null }): LLMResult {
+    this.end();
     const telemetry = this.telemetry;
     const structuredOutput = this.structuredOutput;
     return {
