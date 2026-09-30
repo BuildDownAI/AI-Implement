@@ -5461,6 +5461,20 @@ describe("admin sessions — kg-refresh destroy", () => {
     expect(clearWorkingState).not.toHaveBeenCalled();
   });
 
+  it("Fly-mode kg-refresh cancel destroys the machine and also calls the workflow cancel, tolerating a non-200", async () => {
+    const token = await login("secret");
+    const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "fly-machines" });
+    log.updateJobMachineDetails(jobId, { machineNonce: "nonce-kg", machineId: "m-kg-cancel5" });
+    log.updateJobMachineId(jobId, "m-kg-cancel5");
+    const cancel = vi.fn(async () => ({ status: 409, body: { error: "no-refresh-in-flight" } }));
+    const res = await deleteSession("m-kg-cancel5", token, { trigger: vi.fn(), status: vi.fn(), cancel });
+
+    expect(res.statusCode).toBe(200);
+    expect(destroyMachineMock).toHaveBeenCalledWith(FLY_TOKEN, FLY_APP, "m-kg-cancel5");
+    expect(cancel).toHaveBeenCalledWith({ jobId, reason: "operator_cancelled" });
+    expect(log.getJobById(jobId)?.conclusion).toBe("operator_cancelled");
+  });
+
   async function ghaKgJob(): Promise<number> {
     const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "github-actions", repo: "TestOrg/test-kg" });
     log.updateJobRunId(jobId, 12345);

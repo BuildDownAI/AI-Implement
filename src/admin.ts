@@ -1740,7 +1740,7 @@ async function handleDestroySession(
   if (job?.phase === "kg-refresh") {
     if (job.executionMode === "github-actions") {
       // The KgRefresh workflow requests the GitHub cancellation and waits for confirmed
-      // termination (AII-901); the Fly branch below keeps destroyMachine because the
+      // termination (AII-901); the Fly branch below also keeps destroyMachine because the
       // workflow has no Fly dep.
       if (!deps.kgRefresh) {
         json(res, 501, { error: "KG refresh is not configured" });
@@ -1775,9 +1775,22 @@ async function handleDestroySession(
           return;
         }
       }
+      // The machine is gone; still tell the workflow so it stops tracking the run.
+      // Best-effort: a 409 (no refresh in flight) or 503 must not undo the destroy.
+      if (deps.kgRefresh) {
+        updateJobStatus(job.id, "failed", "operator_cancelled");
+        try {
+          const r = await deps.kgRefresh.cancel({ jobId: job.id, reason: "operator_cancelled" });
+          if (r.status !== 200) {
+            console.warn(`[admin] kg-refresh workflow cancel for Fly job ${job.id} answered ${r.status}`);
+          }
+        } catch (err) {
+          console.error(`[admin] Failed to cancel kg-refresh workflow for Fly job ${job.id}:`, err);
+        }
+      }
     }
 
-    // Fly branch: stamp operator_cancelled (idempotent for the GHA branch, which stamped it above).
+    // Stamp operator_cancelled (idempotent for the GHA branch, which stamped it above).
     updateJobStatus(job.id, "failed", "operator_cancelled");
 
     // One operator-cancel notification; mark notified to prevent the poll loop duplicate.
