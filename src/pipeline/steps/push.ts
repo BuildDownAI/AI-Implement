@@ -6,12 +6,15 @@ import { findSensitiveFiles, SensitiveFilesError } from "../sensitive-files.js";
 import { assertRunnerPublicationAuthority, refreshRunnerGithubCredentials } from "../../runner-token.js";
 import { getPublicationCredential } from "../../publication-credential.js";
 import { classifyGitFailure, envSecrets, oneLinerMessage, type FailureRecord } from "../failure-classification.js";
-import { computeBackoffMs, normalizeRetryPolicy } from "../retry-backoff.js";
+import { computeBackoffMs, normalizeRetryPolicy, sleepAsync } from "../retry-backoff.js";
 import { dependenciesMissing } from "../pipeline-loader.js";
 import { neutralizeFences } from "../../completion-classification.js";
 
-const LS_REMOTE_MAX_ATTEMPTS = 3;
+// Waits between ls-remote attempts (attempts = delays + 1). A freshly minted installation
+// token is not accepted by git over HTTPS for a few seconds (AII-936), so a refreshed
+// token gets a ~15 s schedule; the boot token keeps the short one.
 const LS_REMOTE_RETRY_DELAYS_MS = [250, 1000];
+const LS_REMOTE_FRESH_TOKEN_RETRY_DELAYS_MS = [1000, 2000, 4000, 8000];
 
 export { PROVIDER_OUTAGE_TITLE_PREFIX, UNAPPROVED_TITLE_PREFIX };
 
@@ -223,7 +226,7 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
     let remote = buildRemoteUrl(activeGithubToken);
     const remoteRef = `refs/heads/${branchName}`;
     const remoteBranchSha = await span("git-ls-remote", async () =>
-      resolveRemoteBranchSha(workspaceDir, remote, branchName, activeGithubToken),
+      resolveRemoteBranchSha(workspaceDir, remote, branchName, activeGithubToken, { freshToken }),
     );
     let expectedRemoteSha: string | null;
     if (existingPrNumber && remoteBranchSha !== baseRef) {
@@ -355,7 +358,7 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
       if (isRetryableAmbiguous) {
         let remoteShaAfterConflict: string | null;
         try {
-          remoteShaAfterConflict = await resolveRemoteBranchSha(workspaceDir, remote, branchName, pushToken);
+          remoteShaAfterConflict = await resolveRemoteBranchSha(workspaceDir, remote, branchName, pushToken, { freshToken });
         } catch (lsRemoteErr) {
           const reason = oneLinerNote(lsRemoteErr instanceof Error ? lsRemoteErr.message : String(lsRemoteErr));
           failure.message = `${failure.message}${remoteInspectionNote(reason)}${noteSuffix()}`;
@@ -415,7 +418,7 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
 
       let remoteShaAfterFailure: string | null;
       try {
-        remoteShaAfterFailure = await resolveRemoteBranchSha(workspaceDir, remote, branchName, pushToken);
+        remoteShaAfterFailure = await resolveRemoteBranchSha(workspaceDir, remote, branchName, pushToken, { freshToken });
       } catch (lsRemoteErr) {
         // The push record is the evidence that matters here — ls-remote's own
         // failure only means the remote could not be inspected to decide the next
@@ -958,15 +961,19 @@ function resolveCommitSha(workspaceDir: string): string | null {
   return result.stdout.toString().trim() || null;
 }
 
-function resolveRemoteBranchSha(
+async function resolveRemoteBranchSha(
   workspaceDir: string,
   remote: string,
   branchName: string,
   githubToken: string,
-): string | null {
+  options: { freshToken: boolean },
+): Promise<string | null> {
   const remoteRef = `refs/heads/${branchName}`;
+  const delays = options.freshToken ? LS_REMOTE_FRESH_TOKEN_RETRY_DELAYS_MS : LS_REMOTE_RETRY_DELAYS_MS;
+  const maxAttempts = delays.length + 1;
   let lastError = "";
-  for (let attempt = 1; attempt <= LS_REMOTE_MAX_ATTEMPTS; attempt++) {
+  let lastStatus: number | null = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const result = spawnSync("git", ["ls-remote", remote, remoteRef], {
       cwd: workspaceDir,
       stdio: ["ignore", "pipe", "pipe"],
@@ -982,33 +989,29 @@ function resolveRemoteBranchSha(
     }
 
     lastError = (result.stderr?.toString() ?? "").replaceAll(githubToken, "***");
-    if (attempt < LS_REMOTE_MAX_ATTEMPTS) {
-      sleepSync(LS_REMOTE_RETRY_DELAYS_MS[attempt - 1] ?? 1000);
+    lastStatus = result.status ?? null;
+    console.error(`[push] ls-remote attempt ${attempt}/${maxAttempts} failed: ${lastError.trim()}`);
+    if (attempt < maxAttempts) {
+      await sleepAsync(delays[attempt - 1] ?? 1000);
     }
   }
-  throw new Error(`git ls-remote failed after ${LS_REMOTE_MAX_ATTEMPTS} attempts: ${lastError}`);
-}
-
-function sleepSync(ms: number): void {
-  if (process.env.NODE_ENV === "test") return;
-  // Refuse a non-finite or negative duration: Atomics.wait treats NaN as "wait
-  // forever," which is exactly what a non-numeric pushRetries could otherwise
-  // produce a few lines up the call chain.
-  if (!Number.isFinite(ms) || ms < 0) return;
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-}
-
-/**
- * Awaited counterpart to `sleepSync`, used for the push-retry backoff: that
- * delay can reach the retry policy's `backoffMaxMs` (minutes), and blocking
- * the event loop synchronously for that long would also block a SIGTERM
- * handler from ever running. `resolveRemoteBranchSha`'s much shorter ls-remote
- * backoff keeps the synchronous version.
- */
-function sleepAsync(ms: number): Promise<void> {
-  if (process.env.NODE_ENV === "test") return Promise.resolve();
-  if (!Number.isFinite(ms) || ms < 0) return Promise.resolve();
-  return new Promise((resolve) => setTimeout(resolve, ms));
+  const err = new Error(`git ls-remote failed after ${maxAttempts} attempts: ${lastError}`) as Error & {
+    failure?: FailureRecord;
+  };
+  if (options.freshToken) {
+    // AII-936: GitHub answers "Repository not found" (or a 403) for a private repo while a
+    // just-minted installation token has not propagated. Name that cause instead of "unknown".
+    // Not retryable: the push loop that would retry is never reached, and the single-use
+    // credential cannot be re-minted. Other failures (network, 5xx) keep their own record.
+    const failure = classifyGitFailure(lastError, lastStatus, { stage: "push", attempt: maxAttempts });
+    const repoNotFound = failure.code === "UNKNOWN" && /repository\b.*\bnot found/i.test(lastError);
+    if ((failure.category === "auth" && failure.code === "GIT_AUTH") || repoNotFound) {
+      err.failure = { ...failure, category: "transient", code: "GIT_AUTH_FRESH_TOKEN", retryable: false };
+    } else {
+      err.failure = failure;
+    }
+  }
+  throw err;
 }
 
 /**
