@@ -3201,8 +3201,12 @@ describe("handleRunnerResult — call attribution", () => {
     expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("result refused dispatch=unknown"));
   });
 
-  // These two consume the token and then bail, so without a line the burn is invisible.
-  it("logs a burned token on phase_mismatch", async () => {
+  const consumedAt = (dispatchId: string) =>
+    (dedup.getDb().prepare("SELECT consumed_at FROM runner_tokens WHERE dispatch_id = ?").get(dispatchId) as {
+      consumed_at: number | null;
+    }).consumed_at;
+
+  it("rejects phase_mismatch without consuming the token, and a corrected retry consumes once", async () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const { token, dispatchId } = runnerTokens.mintRunToken({
       issueId: "i",
@@ -3211,22 +3215,32 @@ describe("handleRunnerResult — call attribution", () => {
       ttlSeconds: runnerTokens.PLANNING_TTL_SECONDS,
       secret: SECRET,
     });
+    const provider = new FakeProvider();
+    const post = (body: Record<string, unknown>) =>
+      runnerCallback.handleRunnerResult({
+        authorization: `Bearer ${token}`,
+        body: body as never,
+        secret: SECRET,
+        resolveProvider: makeResolve(provider),
+      });
 
-    const res = await runnerCallback.handleRunnerResult({
-      authorization: `Bearer ${token}`,
-      body: { phase: "implementation", outcome: "success", prUrl: "https://github.com/o/r/pull/1", comments: [] },
-      secret: SECRET,
-      resolveProvider: makeResolve(new FakeProvider()),
-    });
-
+    const res = await post({ phase: "implementation", outcome: "success", prUrl: "https://github.com/o/r/pull/1", comments: [] });
     expect(res.status).toBe(400);
     expect(res.body.error).toBe("phase_mismatch");
+    expect(consumedAt(dispatchId)).toBeNull();
     expect(warnSpy).toHaveBeenCalledWith(
-      expect.stringContaining(`result burned dispatch=${dispatchId} reason=phase_mismatch`),
+      expect.stringContaining(`result rejected dispatch=${dispatchId} reason=phase_mismatch`),
     );
+
+    const ok = await post({ phase: "planning", outcome: "success", comments: [] });
+    expect(ok.status).toBe(200);
+    expect(consumedAt(dispatchId)).not.toBeNull();
+    const replay = await post({ phase: "planning", outcome: "success", comments: [] });
+    expect(replay.status).toBe(409);
+    expect(replay.body.error).toBe("already_consumed");
   });
 
-  it("logs a burned token on missing_prUrl", async () => {
+  it("rejects missing_prUrl without consuming the token, and a corrected retry succeeds", async () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const { token, dispatchId } = runnerTokens.mintRunToken({
       issueId: "i",
@@ -3235,19 +3249,66 @@ describe("handleRunnerResult — call attribution", () => {
       ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
       secret: SECRET,
     });
+    const post = (body: Record<string, unknown>) =>
+      runnerCallback.handleRunnerResult({
+        authorization: `Bearer ${token}`,
+        body: body as never,
+        secret: SECRET,
+        resolveProvider: makeResolve(new FakeProvider()),
+      });
+
+    const res = await post({ phase: "implementation", outcome: "success", comments: [] });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("missing_prUrl");
+    expect(consumedAt(dispatchId)).toBeNull();
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining(`result rejected dispatch=${dispatchId} reason=missing_prUrl`),
+    );
+
+    const ok = await post({ phase: "implementation", outcome: "success", prUrl: "https://github.com/o/r/pull/1", comments: [] });
+    expect(ok.status).toBe(200);
+    expect(consumedAt(dispatchId)).not.toBeNull();
+  });
+
+  it("returns 401 missing_row for a valid token whose row was deleted", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "planning",
+      ttlSeconds: runnerTokens.PLANNING_TTL_SECONDS,
+      secret: SECRET,
+    });
+    dedup.getDb().prepare("DELETE FROM runner_tokens WHERE dispatch_id = ?").run(dispatchId);
 
     const res = await runnerCallback.handleRunnerResult({
       authorization: `Bearer ${token}`,
-      body: { phase: "implementation", outcome: "success", comments: [] },
+      body: { phase: "planning", outcome: "success", comments: [] },
       secret: SECRET,
       resolveProvider: makeResolve(new FakeProvider()),
     });
+    expect(res.status).toBe(401);
+    expect(res.body.error).toBe("missing_row");
+  });
 
-    expect(res.status).toBe(400);
-    expect(res.body.error).toBe("missing_prUrl");
-    expect(warnSpy).toHaveBeenCalledWith(
-      expect.stringContaining(`result burned dispatch=${dispatchId} reason=missing_prUrl`),
-    );
+  it("lets only one of two concurrent valid posts win", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "planning",
+      ttlSeconds: runnerTokens.PLANNING_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const post = () =>
+      runnerCallback.handleRunnerResult({
+        authorization: `Bearer ${token}`,
+        body: { phase: "planning", outcome: "success", comments: [] },
+        secret: SECRET,
+        resolveProvider: makeResolve(new FakeProvider()),
+      });
+    const results = await Promise.all([post(), post()]);
+    expect(results.map((r) => r.status).sort()).toEqual([200, 409]);
   });
 });
 

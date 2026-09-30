@@ -31,6 +31,8 @@ export interface DrainCommentGapfillsInput {
   runnerCallbackBaseUrl: string | null;
   runnerTokenSecret: string | null;
   getInstallationToken(owner: string): Promise<string>;
+  /** Token scoped to the target repository alone; the only token a Fly or local child runner boots with. */
+  getTargetRepoToken(owner: string, repo: string): Promise<string>;
   getInstallationId(owner: string): Promise<number>;
   resolveRunnerImage(mapping: RepoMapping, ghToken: string): Promise<string | undefined>;
   checkContract(opts: { owner: string; repo: string; workflowFile: string; token: string; ref: string }): Promise<ContractProbeResult>;
@@ -284,7 +286,13 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
         runProgressToken = progressMinted.token;
       }
 
-      const ghToken = await opts.getInstallationToken(item.owner);
+      // Fly and local children boot with a token scoped to the target repository; a
+      // mint failure throws before any admission reservation and never falls back to
+      // the installation-wide token. GHA dispatch keeps the broad token (its workflow
+      // mints its own).
+      const ghToken = execPath === "github-actions" || execPath === "both"
+        ? await opts.getInstallationToken(item.owner)
+        : await opts.getTargetRepoToken(item.owner, item.repo);
       const installationId = String(await opts.getInstallationId(item.owner));
 
       const gapFillIssue = {

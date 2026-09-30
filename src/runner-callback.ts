@@ -745,6 +745,36 @@ export async function handleRunnerResult(
     return { status: 200, body: { acknowledged: true } };
   }
 
+  // Authenticate without consuming, then run every check that needs only the
+  // claims and body, so a rejected request leaves the single-use token usable
+  // for a corrected retry. The consume below stays atomic and decides races.
+  const preflight = verifyRunToken(bearerToken, input.secret, "result", { consume: false });
+  if (!preflight.ok) {
+    console.warn(
+      `[runner-callback] result refused dispatch=${preflight.claims?.dispatchId ?? "unknown"} ` +
+        `phase=${input.body.phase} outcome=${input.body.outcome} reason=${preflight.reason}`,
+    );
+    return preflight.reason === "already_consumed"
+      ? bad(409, "already_consumed")
+      : bad(401, preflight.reason);
+  }
+  if (preflight.claims.phase !== input.body.phase) {
+    console.warn(
+      `[runner-callback] result rejected dispatch=${preflight.claims.dispatchId} reason=phase_mismatch ` +
+        `token=${preflight.claims.phase} body=${input.body.phase}`,
+    );
+    return bad(400, "phase_mismatch");
+  }
+  if (
+    input.body.outcome === "success" &&
+    input.body.phase === "implementation" &&
+    !input.body.prUrl &&
+    !input.body.noWork
+  ) {
+    console.warn(`[runner-callback] result rejected dispatch=${preflight.claims.dispatchId} reason=missing_prUrl`);
+    return bad(400, "missing_prUrl");
+  }
+
   // Note: token is consumed atomically here BEFORE any provider call. If
   // postComment or a status verb fails downstream, the comments may be lost
   // (orchestrator surfaces the error in warnings[] but the runner has no
@@ -769,13 +799,6 @@ export async function handleRunnerResult(
   );
 
   const { claims, mappingTeamKey } = verified;
-  if (claims.phase !== input.body.phase) {
-    console.warn(
-      `[runner-callback] result burned dispatch=${claims.dispatchId} reason=phase_mismatch ` +
-        `token=${claims.phase} body=${input.body.phase}`,
-    );
-    return bad(400, "phase_mismatch");
-  }
 
   // Shape-validated, but a malformed record is dropped rather than rejected: the
   // token above is already consumed, and postRunnerResult never retries, so
@@ -821,15 +844,7 @@ export async function handleRunnerResult(
     console.warn(`[runner-callback] Dropped ${droppedCycleSummaries} invalid cycle summary record(s)`);
   }
 
-  if (
-    input.body.outcome === "success" &&
-    input.body.phase === "implementation" &&
-    !input.body.prUrl &&
-    !input.body.noWork
-  ) {
-    console.warn(`[runner-callback] result burned dispatch=${claims.dispatchId} reason=missing_prUrl`);
-    return bad(400, "missing_prUrl");
-  }
+
 
   const provider = await input.resolveProvider(mappingTeamKey);
   if (!provider) {
