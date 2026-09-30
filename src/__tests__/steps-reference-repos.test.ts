@@ -652,3 +652,86 @@ describe("referenceReposStep — per-entry validation", () => {
     }
   });
 });
+
+describe("referenceReposStep — git subprocess environment", () => {
+  const SENTINELS: Record<string, string> = {
+    ANTHROPIC_API_KEY: "sentinel-anthropic",
+    CLAUDE_CODE_OAUTH_TOKEN: "sentinel-oauth",
+    RUN_TOKEN: "sentinel-run",
+    RUN_PUBLICATION_TOKEN: "sentinel-publication",
+    NPM_TOKEN: "sentinel-npm",
+    GH_TOKEN: "sentinel-gh",
+    GITHUB_TOKEN: "sentinel-github",
+    AI_IMPLEMENT_RUN_CONFIG: "sentinel-run-config",
+    AI_IMPLEMENT_FORWARDED_SECRETS: "SENTINEL_FORWARDED",
+    SENTINEL_FORWARDED: "sentinel-forwarded",
+  };
+  const saved: Record<string, string | undefined> = {};
+
+  beforeEach(() => {
+    for (const [k, v] of Object.entries(SENTINELS)) {
+      saved[k] = process.env[k];
+      process.env[k] = v;
+    }
+  });
+  afterEach(() => {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  });
+
+  function tokenFetch(token: string | null): typeof fetch {
+    return async () =>
+      new Response(
+        JSON.stringify({
+          owners: [{ owner: "acme", token, expiresAt: null, authMode: token ? "app" : "public" }],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+  }
+
+  async function runRecording(ref: string | undefined, token: string | null) {
+    const recorded: Array<{ args: string[]; env: NodeJS.ProcessEnv | undefined }> = [];
+    const spy: SpawnSyncFn = (_cmd, args, opts) => {
+      recorded.push({ args: [...(args ?? [])], env: (opts as { env?: NodeJS.ProcessEnv } | undefined)?.env });
+      return { status: 0, stdout: Buffer.from(""), stderr: Buffer.from(""), pid: 0, output: [], signal: null } as ReturnType<SpawnSyncFn>;
+    };
+    const repos: ReferenceRepo[] = [{ repo: "acme/lib", path: "ref/lib", ...(ref ? { ref } : {}) } as ReferenceRepo];
+    await referenceReposStep.run(
+      ctx(),
+      { referenceRepos: repos, callbackUrl: "http://localhost:8080", fetchImpl: tokenFetch(token), spawnSyncImpl: spy },
+      new NoopStepReporter(),
+    );
+    return recorded;
+  }
+
+  function expectSanitized(recorded: Array<{ args: string[]; env: NodeJS.ProcessEnv | undefined }>) {
+    const gitCalls = recorded.filter((r) => r.args.length > 0);
+    expect(gitCalls.length).toBeGreaterThan(0);
+    for (const { args, env } of gitCalls) {
+      expect(env, `git ${args[0]} must pass an explicit env`).toBeDefined();
+      for (const key of Object.keys(SENTINELS)) expect(env![key], key).toBeUndefined();
+    }
+  }
+
+  it("branch ref: clone env is sentinel-free and keeps the scoped auth header", async () => {
+    const recorded = await runRecording("main", "scoped-token");
+    expectSanitized(recorded);
+    expect(recorded[0]!.args[0]).toBe("clone");
+    expect(recorded[0]!.env!.GIT_CONFIG_KEY_0).toBe("http.extraHeader");
+    expect(recorded[0]!.env!.GIT_CONFIG_VALUE_0).toContain("Authorization: Basic");
+  });
+
+  it("SHA ref: init, fetch and checkout are sentinel-free", async () => {
+    const recorded = await runRecording("a".repeat(40), "scoped-token");
+    expect(recorded.map((r) => r.args[0])).toEqual(["init", "fetch", "checkout"]);
+    expectSanitized(recorded);
+  });
+
+  it("no token: no auth header is set", async () => {
+    const recorded = await runRecording("main", null);
+    expectSanitized(recorded);
+    expect(recorded[0]!.env!.GIT_CONFIG_COUNT).toBeUndefined();
+  });
+});

@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { gitProcessEnv } from "../process-env.js";
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
 
 interface InstallSkillsInputs extends Record<string, unknown> {
@@ -85,7 +86,7 @@ export const installSkillsStep: StepModule<InstallSkillsInputs, InstallSkillsOut
           timeout: 60_000,
           // Never wait on an interactive credential prompt — fail fast instead of
           // hanging until the timeout when auth is missing/wrong.
-          env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+          env: gitProcessEnv({ GIT_TERMINAL_PROMPT: "0" }),
         },
       );
 
@@ -102,6 +103,7 @@ export const installSkillsStep: StepModule<InstallSkillsInputs, InstallSkillsOut
       const revResult = spawnSync("git", ["rev-parse", "HEAD"], {
         cwd: tmpDir,
         stdio: ["ignore", "pipe", "pipe"],
+        env: gitProcessEnv(),
       });
       const skillsRepoRef =
         revResult.status === 0 ? revResult.stdout.toString().trim() : null;
