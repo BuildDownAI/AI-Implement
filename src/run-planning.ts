@@ -6,6 +6,7 @@ import { postRunnerResult } from "./runner-result.js";
 import { decodeRunConfig, type ResolvedAgentSnapshotV1 } from "./run-config.js";
 import type { InvocationAttributionV1, InvokeParams, LLMResult } from "./pipeline/types.js";
 import { DEFAULT_MODEL } from "./pipeline/default-model.js";
+import { setupPlanningWritePolicy, type PlanningWritePolicy } from "./planning-write-policy.js";
 
 export type PlanningExecutor = (
   prompt: string,
@@ -48,7 +49,7 @@ ${s.ISSUE_DESCRIPTION}
 **Siblings:** ${s.SIBLINGS}
 **Dependencies:** ${s.DEPENDENCIES}
 
-Use Read, Glob, and Grep to explore the codebase, then write structured planning comments as separate Markdown files under ai-output/comments/, prefixed with a two-digit sequence number:
+Use Read, Glob, and Grep to explore the codebase, then use Write to create structured planning comments as separate Markdown files under ai-output/comments/, prefixed with a two-digit sequence number:
   ai-output/comments/01-implementation-map.md  → "## 🗺 AI Planning: Implementation Map"
   ai-output/comments/02-acceptance-bar.md       → "## ✅ AI Planning: Acceptance Bar"
   ai-output/comments/03-risks.md                → "## ⚠️ AI Planning: Risks & Open Questions"
@@ -133,21 +134,32 @@ export async function runPlanningLocally(
     if (parsed.frontMatter.model) model = opts.model ?? parsed.frontMatter.model;
     if (parsed.body.trim()) prompt = parsed.body;
   }
+  let policy: PlanningWritePolicy;
+  try {
+    policy = setupPlanningWritePolicy(opts.workspaceDir);
+  } catch {
+    return {
+      exitCode: 1,
+      planningContext: "",
+      planFound: false,
+      diagnostics: "Planning write policy could not be set up; planning was not started",
+    };
+  }
   const args = [
     "--dangerously-skip-permissions",
     "--model",
     model,
     "--max-turns",
     "50",
-    "--allowedTools",
-    "Read",
-    "--allowedTools",
-    "Glob",
-    "--allowedTools",
-    "Grep",
+    ...policy.args,
   ];
   const executor = opts.executor ?? defaultExecutor;
-  const result = executor(prompt, args, opts.workspaceDir);
+  let result: ReturnType<PlanningExecutor>;
+  try {
+    result = executor(prompt, args, opts.workspaceDir);
+  } finally {
+    policy.cleanup();
+  }
   if (result.status !== 0) {
     return {
       exitCode: 1,
@@ -208,21 +220,35 @@ export async function runPlanning(opts: RunPlanningOptions = {}): Promise<{ exit
     if (parsed.frontMatter.model) model = process.env.CLAUDE_MODEL || parsed.frontMatter.model;
     if (parsed.body.trim()) prompt = parsed.body;
   }
+  let policy: PlanningWritePolicy;
+  try {
+    policy = setupPlanningWritePolicy(workspaceDir);
+  } catch {
+    await postRunnerResult({
+      phase: "planning",
+      workspaceDir,
+      outcome: "failure",
+      failureReason: "Planning write policy could not be set up; planning was not started",
+      callbackUrl,
+      fetchImpl: opts.fetchImpl,
+    });
+    return { exitCode: 1 };
+  }
   const args = [
     "--dangerously-skip-permissions",
     "--model",
     model,
     "--max-turns",
     "50",
-    "--allowedTools",
-    "Read",
-    "--allowedTools",
-    "Glob",
-    "--allowedTools",
-    "Grep",
+    ...policy.args,
   ];
   const executor = opts.executor ?? defaultExecutor;
-  const result = executor(prompt, args, workspaceDir);
+  let result: ReturnType<PlanningExecutor>;
+  try {
+    result = executor(prompt, args, workspaceDir);
+  } finally {
+    policy.cleanup();
+  }
   if (result.status !== 0) {
     await postRunnerResult({
       phase: "planning",

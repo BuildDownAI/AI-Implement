@@ -37,7 +37,7 @@ export interface MintOutput {
 export type VerifyResult =
   | { ok: true; claims: RunTokenClaims; mappingTeamKey: string; consumedAt: number | null }
   // Claims on a refusal so it can be attributed to a dispatch; absent when the payload was never trustworthy.
-  | { ok: false; reason: "malformed" | "bad_signature" | "expired" | "already_consumed" | "wrong_audience" | "wrong_scope" | "revoked"; claims?: RunTokenClaims };
+  | { ok: false; reason: "malformed" | "missing_row" | "bad_signature" | "expired" | "already_consumed" | "wrong_audience" | "wrong_scope" | "revoked"; claims?: RunTokenClaims };
 
 export const PLANNING_TTL_SECONDS = 30 * 60;
 export const IMPLEMENTATION_TTL_SECONDS = 2 * 60 * 60;
@@ -119,8 +119,8 @@ function verifyTokenSignatureAndLoadClaims(token: string, secret: string): Verif
   const row = db
     .prepare("SELECT consumed_at, mapping_team_key FROM runner_tokens WHERE dispatch_id = ? AND audience = ?")
     .get(claims.dispatchId, claims.audience) as { consumed_at: number | null; mapping_team_key: string } | undefined;
-  // Reason stays "malformed" though the payload verified: callers map it to a status.
-  if (!row) return { ok: false, reason: "malformed", claims };
+  // Payload verified but the row is gone (e.g. retry deleted the issue's rows).
+  if (!row) return { ok: false, reason: "missing_row", claims };
 
   return { ok: true, claims, mappingTeamKey: row.mapping_team_key, consumedAt: row.consumed_at };
 }

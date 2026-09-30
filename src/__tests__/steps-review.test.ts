@@ -290,7 +290,8 @@ describe("reviewStep", () => {
     await reviewStep.run(makeContext(executor), {}, new NoopStepReporter());
 
     expect(executor.invoke).toHaveBeenCalledWith(expect.objectContaining({
-      tools: ["Read", "Glob", "Grep", "Bash(curl *)"],
+      tools: ["Read", "Glob", "Grep"],
+      builtinTools: ["Read", "Glob", "Grep"],
     }));
   });
 

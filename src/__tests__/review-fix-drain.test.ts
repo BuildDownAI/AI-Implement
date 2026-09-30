@@ -31,6 +31,7 @@ vi.mock("../local-gapfill.js", async (importOriginal) => {
 const githubAppAuthMocks = vi.hoisted(() => ({
   getInstallationToken: vi.fn<(appId: string, privateKey: string, owner: string) => Promise<string>>(),
   getInstallationId: vi.fn<(appId: string, privateKey: string, owner: string) => Promise<number>>(),
+  getScopedInstallationToken: vi.fn<(appId: string, privateKey: string, owner: string, opts: { repositories: string[] }) => Promise<{ token: string }>>(),
 }));
 
 vi.mock("../github-app-auth.js", async (importOriginal) => {
@@ -39,6 +40,7 @@ vi.mock("../github-app-auth.js", async (importOriginal) => {
     ...actual,
     getInstallationToken: githubAppAuthMocks.getInstallationToken,
     getInstallationId: githubAppAuthMocks.getInstallationId,
+    getScopedInstallationToken: githubAppAuthMocks.getScopedInstallationToken,
   };
 });
 
@@ -144,6 +146,7 @@ beforeEach(async () => {
 
   githubAppAuthMocks.getInstallationToken.mockResolvedValue("gh-token");
   githubAppAuthMocks.getInstallationId.mockResolvedValue(778899);
+  githubAppAuthMocks.getScopedInstallationToken.mockResolvedValue({ token: "scoped-token" });
   findByKeyMock.mockReset();
   findByKeyMock.mockResolvedValue(null);
   localGapfillMocks.dispatchLocalGapfill.mockResolvedValue({
@@ -171,6 +174,7 @@ afterEach(() => {
   localGapfillMocks.dispatchLocalGapfill.mockReset();
   githubAppAuthMocks.getInstallationToken.mockReset();
   githubAppAuthMocks.getInstallationId.mockReset();
+  githubAppAuthMocks.getScopedInstallationToken.mockReset();
   trackerPostCommentMock.mockClear();
 });
 
@@ -372,6 +376,46 @@ describe("processReviewFixQueue — dispatch gate", () => {
     expect(localGapfillMocks.dispatchLocalGapfill).toHaveBeenCalledTimes(1);
     const pending = reviewFixQueue.getPendingReviewFixes();
     expect(pending).toHaveLength(0);
+  });
+
+  it("boots the local review-fix child with a repo-scoped token", async () => {
+    const mapping = makeMapping();
+    configModule.upsertMapping("TEAM", mapping);
+    reviewFixQueue.enqueueReviewFix({
+      issueId: "issue-scoped",
+      issueIdentifier: "AII-90",
+      repo: "acme/billing",
+      prNumber: 42,
+      reason: "late review comment",
+    });
+
+    await indexModule.processReviewFixQueue(mockConfig, mockRegistry);
+
+    expect(githubAppAuthMocks.getScopedInstallationToken).toHaveBeenCalledWith(
+      mockConfig.githubAppId,
+      mockConfig.githubAppPrivateKey,
+      mapping.owner,
+      { repositories: [mapping.repo] },
+    );
+    const [call] = localGapfillMocks.dispatchLocalGapfill.mock.calls[0]!;
+    expect(call.githubToken).toBe("scoped-token");
+  });
+
+  it("aborts the local review-fix launch when the scoped mint fails, with no broad fallback", async () => {
+    const mapping = makeMapping();
+    configModule.upsertMapping("TEAM", mapping);
+    githubAppAuthMocks.getScopedInstallationToken.mockRejectedValue(new Error("mint failed"));
+    reviewFixQueue.enqueueReviewFix({
+      issueId: "issue-mintfail",
+      issueIdentifier: "AII-91",
+      repo: "acme/billing",
+      prNumber: 42,
+      reason: "late review comment",
+    });
+
+    await indexModule.processReviewFixQueue(mockConfig, mockRegistry);
+
+    expect(localGapfillMocks.dispatchLocalGapfill).not.toHaveBeenCalled();
   });
 
   it("keeps a review fix pending when GitHub cannot confirm the PR is open", async () => {

@@ -816,7 +816,9 @@ describe("feedbackLoopStep termination reasons", () => {
     expect(outputs.postMortem).toContain("Ran out of turns");
     // Post-mortem is read-only and capped
     const call = invoke.mock.calls[0][0];
-    expect(call.tools).toEqual(["Read", "Glob", "Grep", "Bash(curl *)"]);
+    expect(call.tools).toEqual(["Read", "Glob", "Grep"]);
+    expect(call.builtinTools).toEqual(["Read", "Glob", "Grep"]);
+    expect(JSON.stringify(call)).not.toContain("curl");
     expect(call.maxTurns).toBe(15);
     expect(call.prompt).toContain("Bash npm test"); // tool trace embedded
   });

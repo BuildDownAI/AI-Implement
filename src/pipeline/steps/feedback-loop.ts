@@ -6,7 +6,7 @@ import type { PipelineContext, Step, StepModule, StepReporter, RunTelemetry } fr
 import { implementStep } from "./implement.js";
 import type { ReferenceRepoResult } from "../../reference-repos.js";
 import { reviewStep } from "./review.js";
-import { READ_ONLY_ALLOWED_TOOLS } from "./read-only-tools.js";
+import { READ_ONLY_TOOL_PARAMS } from "./read-only-tools.js";
 import { capDiff } from "./review.js";
 import { normalizeRetryPolicy } from "../retry-backoff.js";
 import { writeCycleSummary } from "../cycle-summary.js";
@@ -256,7 +256,7 @@ async function runPostMortem(
       prompt: buildPostMortemPrompt(params),
       model: params.model,
       maxTurns: POST_MORTEM_MAX_TURNS,
-      tools: READ_ONLY_ALLOWED_TOOLS,
+      ...READ_ONLY_TOOL_PARAMS,
       stage: `feedback-loop/post-mortem-${params.iteration}`,
       expectsStructuredOutput: false,
       cycle: params.iteration,

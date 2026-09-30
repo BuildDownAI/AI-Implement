@@ -45,7 +45,7 @@ import { handleAdminRequest } from "./admin.js";
 import { initLogTable, appendLog, countPriorDispatches, completeOrphanedPlanningJobs, attachJobRunIdIfMissing, updateJobRunId, updateJobStatus, updateJobPrUrl, updateJobMachineDetails, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobById, getJobByMachineId, getJobByDispatchId, resetStuckAttempts, getRecentFailedRunUrls } from "./log.js";
 import { recordDispatchFailure, recordDispatchSuccess, shouldCountFailure, initDispatchBreakerTable, parkIssue, prBudgetParkMessage, isParked } from "./dispatch-breaker.js";
 import type { Job, JobStatus } from "./log.js";
-import { getInstallationToken, getInstallationId, getAppSlug } from "./github-app-auth.js";
+import { getInstallationToken, getScopedInstallationToken, getInstallationId, getAppSlug } from "./github-app-auth.js";
 import { configureLinearAuth } from "./linear-app-auth.js";
 import { configureOAuthProviders, isOAuthConfigured, providersFromEnv } from "./oauth/providers.js";
 import { handleOAuthCallback, handleOAuthLogout, handleOAuthProviders, handleOAuthStart } from "./oauth/routes.js";
@@ -367,6 +367,22 @@ export async function guardOpenPrBeforeImplementationDispatch(
 
   // Closed, not merged — a human closed the PR to start over. Today's behavior: dispatch.
   return false;
+}
+
+/**
+ * Mint the GitHub token a Fly or local-Docker child runner boots with, scoped to the
+ * mapping's target repository alone. Throws on failure so the launch aborts; there is
+ * deliberately no fallback to the installation-wide token.
+ */
+async function getTargetRepoToken(
+  config: Pick<AppConfig, "githubAppId" | "githubAppPrivateKey">,
+  owner: string,
+  repo: string,
+): Promise<string> {
+  const scoped = await getScopedInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner, {
+    repositories: [repo],
+  });
+  return scoped.token;
 }
 
 async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void> {
@@ -876,6 +892,7 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
       runnerCallbackBaseUrl: config.runnerCallbackBaseUrl,
       runnerTokenSecret: config.runnerTokenSecret,
       getInstallationToken: (owner) => getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner),
+      getTargetRepoToken: (owner, repo) => getTargetRepoToken(config, owner, repo),
       getInstallationId: (owner) => getInstallationId(config.githubAppId, config.githubAppPrivateKey, owner),
       resolveRunnerImage: (mapping, ghToken) => resolveDispatchRunnerImage(config, mapping, ghToken),
       checkContract: (params) => resolveWorkflowCapabilities(params),
@@ -1461,7 +1478,7 @@ export async function dispatchPlanning(
         };
 
         // both fly-machines and local-docker require a GitHub token now, so it's extracted here for convenience/readability
-        const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
+        const ghToken = await getTargetRepoToken(config, mapping.owner, mapping.repo);
         if (execPath === "fly-machines") {
           const minSecretsVersion = getFlySecretsMinVersion();
           let allSecretNames: string[] = [];
@@ -2025,7 +2042,7 @@ async function dispatchSession(
 
 // ---------- Dispatch: Fly Machines ----------
 
-async function dispatchFlyMachine(
+export async function dispatchFlyMachine(
   config: AppConfig,
   provider: TicketingProvider,
   issue: DispatchableIssue,
@@ -2081,7 +2098,7 @@ async function dispatchFlyMachine(
         console.warn(`[poll] Failed to fetch app secrets for ${issue.identifier}, proceeding without team secrets:`, err);
       }
 
-      const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
+      const ghToken = await getTargetRepoToken(config, mapping.owner, mapping.repo);
 
       const { image: resolvedImage, source: imageSource } = await resolveSessionImage({
         owner: mapping.owner,
@@ -2196,7 +2213,7 @@ export async function dispatchLocalDocker(
         config.runnerCallbackBaseUrl ??
         `http://host.docker.internal:${config.healthPort}`;
 
-      const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
+      const ghToken = await getTargetRepoToken(config, mapping.owner, mapping.repo);
 
       const localImplRunConfig: RunConfigV1 = buildImplRunConfig({
         issue,
@@ -3919,6 +3936,8 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
         let launchStarted = false;
         let container: Awaited<ReturnType<typeof dispatchLocalGapfill>>;
         try {
+          // The child boots repo-scoped; a mint failure aborts the launch (no broad fallback).
+          const childToken = await getTargetRepoToken(config, mapping.owner, mapping.repo);
           container = await dispatchLocalGapfill({
             mapping,
             issue: {
@@ -3928,7 +3947,7 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
               description: taskDescription,
             },
             prNumber: fix.prNumber,
-            githubToken: ghToken,
+            githubToken: childToken,
             image: config.localRunnerImage,
             orchestratorUrl: config.localRunnerOrchestratorUrl ?? config.runnerCallbackBaseUrl ?? `http://host.docker.internal:${config.healthPort}`,
             runnerCallbackUrl: runnerCallbackUrl || undefined,
@@ -4277,14 +4296,15 @@ const KG_REFRESH_DEFAULT_EXECUTION_MODE = "github-actions" as const;
 /** Workflow file dispatched in the KG source repo for GHA-backed kg-refresh: the shared implement template, selected by `runner_phase` (AII-556). */
 const KG_REFRESH_WORKFLOW_FILE = "claude-implement.yml";
 
-async function dispatchKgRefreshRun(
+export async function dispatchKgRefreshRun(
   config: AppConfig,
   opts: { runToken: string; runProgressToken: string; dispatchId: string; runConfig: string; executionPath?: string },
 ): Promise<{ machineId?: string; machineNonce?: string; logsUrl?: string; workflowRunId?: number }> {
   if (!config.kgSourceRepo) throw new Error("KG_SOURCE_REPO not configured");
   const repo = parseKgSourceRepo(config.kgSourceRepo);
-  const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, repo.owner);
-  const defaultBranch = (await getRepoDefaultBranch(ghToken, repo.owner, repo.repo)) ?? "main";
+  // Installation-wide: control-plane (default branch, GHA dispatch) only, never a child boot token.
+  const controlToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, repo.owner);
+  const defaultBranch = (await getRepoDefaultBranch(controlToken, repo.owner, repo.repo)) ?? "main";
   const decodedConfig = decodeRunConfig(opts.runConfig);
   // A PR-triggered dry-run (AII-633) carries kgSourceRef — the PR's head branch — so the
   // GHA dispatch runs against that ref instead of the default branch. Absent = unchanged.
@@ -4306,7 +4326,7 @@ async function dispatchKgRefreshRun(
     const runnerImage = await resolveRunnerImageForDispatch({
       owner: repo.owner,
       repo: repo.repo,
-      token: ghToken,
+      token: controlToken,
       defaultImage: config.sessionImage,
       runnerImageExplicit: config.runnerImageExplicit,
     });
@@ -4314,7 +4334,7 @@ async function dispatchKgRefreshRun(
     const dispatchInputs = buildKgRefreshGhaDispatchBody({ runConfig: opts.runConfig, runToken: opts.runToken, runProgressToken: opts.runProgressToken, runnerImage, runnerCallbackUrl, runnerPhase: "kg-refresh", jobTimeoutMinutes: "240", issueIdentifier: decodedConfig.issue.identifier });
     const dispatchedAt = Date.now();
     const dispatchResult = await postWorkflowDispatch({
-      token: ghToken,
+      token: controlToken,
       owner: repo.owner,
       repo: repo.repo,
       workflowFile: KG_REFRESH_WORKFLOW_FILE,
@@ -4342,7 +4362,7 @@ async function dispatchKgRefreshRun(
     // can delay it. The reaper will lazy-bind on its next sweep if polling exhausts.
     const dispatchTime = new Date(dispatchedAt - 30_000);
     const workflowRunId = await pollForKgWorkflowRunId({
-      token: ghToken,
+      token: controlToken,
       owner: repo.owner,
       repo: repo.repo,
       workflowFile: KG_REFRESH_WORKFLOW_FILE,
@@ -4365,6 +4385,8 @@ async function dispatchKgRefreshRun(
         "[kg-refresh] fly-machines execution path selected but FLY_SESSIONS_TOKEN + FLY_SESSIONS_APP are not configured",
       );
     }
+    // Narrow mint first: a failure aborts the launch with no fallback to controlToken.
+    const bootToken = await getTargetRepoToken(config, repo.owner, repo.repo);
     const sessionToken = generateSessionToken();
     const machineNonce = generateMachineNonce();
     const extraEnv: Record<string, string> = {
@@ -4374,7 +4396,7 @@ async function dispatchKgRefreshRun(
     const flySessionImage = await resolveRunnerImageForDispatch({
       owner: repo.owner,
       repo: repo.repo,
-      token: ghToken,
+      token: bootToken,
       defaultImage: config.sessionImage,
       runnerImageExplicit: config.runnerImageExplicit,
     }) ?? config.sessionImage;
@@ -4389,7 +4411,7 @@ async function dispatchKgRefreshRun(
       defaultBranch,
       anthropicApiKey: config.anthropicApiKey ?? undefined,
       claudeOAuthToken: config.claudeOAuthToken ?? undefined,
-      githubToken: ghToken,
+      githubToken: bootToken,
       sessionToken,
       machineNonce,
       phase: "kg-refresh",
@@ -4411,6 +4433,7 @@ async function dispatchKgRefreshRun(
         "[kg-refresh] local-docker execution path selected but LOCAL_RUNNER_IMAGE is not configured",
       );
     }
+    const bootToken = await getTargetRepoToken(config, repo.owner, repo.repo);
     const sessionToken = generateSessionToken();
     const machineNonce = generateMachineNonce();
     const extraEnv: Record<string, string> = { AI_IMPLEMENT_RUN_CONFIG: opts.runConfig, RUN_PROGRESS_TOKEN: opts.runProgressToken };
@@ -4429,7 +4452,7 @@ async function dispatchKgRefreshRun(
       defaultBranch,
       anthropicApiKey: config.anthropicApiKey ?? undefined,
       claudeOAuthToken: config.claudeOAuthToken ?? undefined,
-      githubToken: ghToken,
+      githubToken: bootToken,
       sessionToken,
       machineNonce,
       phase: "kg-refresh",

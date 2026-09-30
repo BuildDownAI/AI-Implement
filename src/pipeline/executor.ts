@@ -28,6 +28,7 @@ import {
   type DerivedToolResult,
 } from "./claude-stream.js";
 import { classifyLlmResult, classifySpawnError, isLlmResultFailure, type FailureRecord } from "./failure-classification.js";
+import { buildRestrictedToolArgs } from "./steps/read-only-tools.js";
 import { computeBackoffMs, type RetryPolicy } from "./retry-backoff.js";
 import { modelProcessEnv, parseForwardedSecrets } from "./process-env.js";
 
@@ -115,9 +116,9 @@ interface RetryDecisionInput {
  * fresh session with no memory of the first attempt, so once a tool has run
  * that could have mutated the workspace, re-spawning risks duplicating or
  * undoing that work. `toolUseIsSafe` sessions are restricted to read-only
- * tools, EXCEPT `Bash(curl *)` — curl can still write files or POST — so only
- * that unsafe subset is checked there; every other tool_use still blocks a
- * non-toolUseIsSafe (implement) retry.
+ * built-ins, so only a tool_use outside the proven read-only allowlist
+ * (Read/Glob/Grep) blocks there — even if telemetry shows a tool the session
+ * should not have had; any tool_use blocks a non-toolUseIsSafe (implement) retry.
  */
 function effectiveSawToolUse(toolUseIsSafe: boolean, sawAnyToolUse: boolean, sawUnsafe: boolean): boolean {
   return toolUseIsSafe ? sawUnsafe : sawAnyToolUse;
@@ -543,6 +544,9 @@ export class ClaudeCliExecutor implements LLMExecutor {
       if (params.maxTurns != null) args.push("--max-turns", String(params.maxTurns));
       if (params.tools && params.tools.length > 0) {
         args.push("--allowed-tools", params.tools.join(","));
+      }
+      if (params.builtinTools) {
+        args.push(...buildRestrictedToolArgs(params.builtinTools));
       }
       if (params.jsonSchema) {
         args.push("--json-schema", JSON.stringify(params.jsonSchema));

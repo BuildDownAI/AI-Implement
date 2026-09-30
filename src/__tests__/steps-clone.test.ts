@@ -1364,3 +1364,237 @@ describe("cloneStep", () => {
     });
   });
 });
+
+describe("cloneStep git subprocess environment", () => {
+  const SENTINELS: Record<string, string> = {
+    ANTHROPIC_API_KEY: "sentinel-anthropic",
+    CLAUDE_CODE_OAUTH_TOKEN: "sentinel-oauth",
+    RUN_PROGRESS_TOKEN: "sentinel-progress",
+    RUN_PUBLICATION_TOKEN: "sentinel-publication",
+    RUN_TOKEN: "sentinel-run",
+    NPM_TOKEN: "sentinel-npm",
+    GH_TOKEN: "sentinel-gh",
+    GITHUB_TOKEN: "sentinel-github",
+    // AI_IMPLEMENT_RUN_CONFIG is read by the step itself (refreshRunnerGithubCredentials)
+    // and must decode; its stripping is covered by the gitProcessEnv helper tests.
+    AI_IMPLEMENT_FORWARDED_SECRETS: "SENTINEL_FORWARDED",
+    SENTINEL_FORWARDED: "sentinel-forwarded",
+  };
+  const saved: Record<string, string | undefined> = {};
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    for (const [k, v] of Object.entries(SENTINELS)) {
+      saved[k] = process.env[k];
+      process.env[k] = v;
+    }
+  });
+  afterEach(() => {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  });
+
+  // Secondary (bare-URL) network ops intentionally restore the progress bearer for the
+  // dependency credential helper; every other call must stay fully sanitized.
+  function expectAllCallsSanitized(opts: { dependencyOptIn?: boolean } = {}): void {
+    const calls = vi.mocked(spawnSync).mock.calls;
+    expect(calls.length).toBeGreaterThan(0);
+    for (const call of calls) {
+      const env = (call[2] as { env?: NodeJS.ProcessEnv } | undefined)?.env;
+      expect(env, `git ${String(call[1]?.[0])} must pass an explicit env`).toBeDefined();
+      const optIn = opts.dependencyOptIn && ["clone", "fetch"].includes(String(call[1]?.[0]));
+      for (const key of Object.keys(SENTINELS)) {
+        if (optIn && key === "RUN_PROGRESS_TOKEN") {
+          expect(env![key]).toBe("sentinel-progress");
+        } else if (key === "AI_IMPLEMENT_FORWARDED_SECRETS" || key === "SENTINEL_FORWARDED") {
+          expect(env![key]).toBeUndefined();
+        } else if (key !== "GIT_PASSWORD") {
+          expect(env![key], key).toBeUndefined();
+        }
+      }
+    }
+  }
+
+  it("fresh clone, gap-fill base fetch, config and rev-parse", async () => {
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+    mockSpawn([]);
+    await cloneStep.run(makeContext(), PR_INPUTS, new NoopStepReporter());
+    expectAllCallsSanitized();
+  });
+
+  it("incremental fetch with full depth (shallow check, unshallow, fetch, reset)", async () => {
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    mockSpawn([{ status: 0, stdout: "true\n" }]);
+    await cloneStep.run(makeContext(), { ...BASE_INPUTS, depth: "full" }, new NoopStepReporter());
+    expectAllCallsSanitized();
+    const fetchCall = vi.mocked(spawnSync).mock.calls.find((c) => c[1]?.[0] === "fetch");
+    expect((fetchCall![2] as { env: NodeJS.ProcessEnv }).env.GIT_PASSWORD).toBe("secret-token");
+  });
+
+  it("secondary clone into a subdirectory, fresh and incremental", async () => {
+    for (const exists of [false, true]) {
+      vi.clearAllMocks();
+      vi.mocked(fs.existsSync).mockReturnValue(exists);
+      mockSpawn([]);
+      await cloneStep.run(
+        makeContext(),
+        { ...BASE_INPUTS, targetDir: "code-repo", depth: "full" },
+        new NoopStepReporter(),
+      );
+      expectAllCallsSanitized({ dependencyOptIn: true });
+    }
+  });
+
+  it("multi-target secondary clones, fresh and incremental", async () => {
+    for (const exists of [false, true]) {
+      vi.clearAllMocks();
+      vi.mocked(fs.existsSync).mockReturnValue(exists);
+      mockSpawn([{ status: 0, stdout: "true\n" }]);
+      await cloneStep.run(
+        makeContext(),
+        {
+          ...BASE_INPUTS,
+          depth: "full",
+          targets: [{ repoOwner: "acme", repoRepo: "lib", targetDir: "lib", branch: "main" }],
+        },
+        new NoopStepReporter(),
+      );
+      expectAllCallsSanitized({ dependencyOptIn: true });
+    }
+  });
+
+  it("mounted mode rev-parse", async () => {
+    process.env.AI_IMPLEMENT_WORKSPACE_MODE = "mounted";
+    try {
+      mockSpawn([{ status: 0, stdout: "abc\n" }]);
+      await cloneStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+      expectAllCallsSanitized();
+    } finally {
+      delete process.env.AI_IMPLEMENT_WORKSPACE_MODE;
+    }
+  });
+
+  describe("dependency credential fencing", () => {
+    const DEP_VARS: Record<string, string> = {
+      GIT_DEPENDENCY_TOKEN_FILE: "/sentinel/cache.json",
+      GIT_DEPENDENCY_CALLBACK_URL: "https://sentinel.invalid",
+      RUN_PROGRESS_TOKEN: "sentinel-progress",
+      COMPOSER_AUTH: '{"sentinel":"composer"}',
+      RUN_TOKEN: "sentinel-run",
+      GH_TOKEN: "sentinel-gh",
+    };
+    const saved: Record<string, string | undefined> = {};
+
+    beforeEach(() => {
+      for (const [k, v] of Object.entries(DEP_VARS)) {
+        saved[k] = process.env[k];
+        process.env[k] = v;
+      }
+    });
+    afterEach(() => {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    });
+
+    function envOf(call: unknown[]): NodeJS.ProcessEnv {
+      return (call[2] as { env: NodeJS.ProcessEnv }).env;
+    }
+
+    function expectDependencyOptIn(env: NodeJS.ProcessEnv) {
+      expect(env.GIT_DEPENDENCY_TOKEN_FILE).toBe("/sentinel/cache.json");
+      expect(env.GIT_DEPENDENCY_CALLBACK_URL).toBe("https://sentinel.invalid");
+      expect(env.RUN_PROGRESS_TOKEN).toBe("sentinel-progress");
+      expect(env.COMPOSER_AUTH).toBeUndefined();
+      expect(env.RUN_TOKEN).toBeUndefined();
+      expect(env.GH_TOKEN).toBeUndefined();
+    }
+
+    function expectFenced(env: NodeJS.ProcessEnv) {
+      for (const k of Object.keys(DEP_VARS)) expect(env[k], k).toBeUndefined();
+    }
+
+    it("targetDir fresh clone opts in; rev-parse does not", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(false);
+      mockSpawn([{ status: 0 }, { status: 0, stdout: "abc\n" }]);
+      await cloneStep.run(
+        makeContext(),
+        { repoOwner: "acme", repoRepo: "code", branch: "", githubToken: "", workspaceDir: "/tmp/workspace", targetDir: "code" },
+        new NoopStepReporter(),
+      );
+      const calls = vi.mocked(spawnSync).mock.calls;
+      expect(calls[0][1]).toContain("clone");
+      expectDependencyOptIn(envOf(calls[0]));
+      expect(calls[1][1]).toContain("rev-parse");
+      expectFenced(envOf(calls[1]));
+    });
+
+    it("targetDir full-depth incremental: fetches opt in; local ops do not", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(true);
+      mockSpawn([
+        { status: 0, stdout: "true\n" },
+        { status: 0 },
+        { status: 0 },
+        { status: 0 },
+        { status: 0, stdout: "abc\n" },
+      ]);
+      await cloneStep.run(
+        makeContext(),
+        { repoOwner: "acme", repoRepo: "code", branch: "main", githubToken: "", workspaceDir: "/tmp/workspace", targetDir: "code", depth: "full" },
+        new NoopStepReporter(),
+      );
+      const calls = vi.mocked(spawnSync).mock.calls;
+      expect(calls).toHaveLength(5);
+      const byKind = (c: unknown[]) => (c[1] as string[]).slice(0, 2).join(" ");
+      for (const c of calls) {
+        const kind = byKind(c);
+        if (kind.startsWith("fetch")) expectDependencyOptIn(envOf(c));
+        else expectFenced(envOf(c));
+      }
+      expect(calls.map(byKind)).toEqual([
+        "rev-parse --is-shallow-repository",
+        "fetch --unshallow",
+        "fetch origin",
+        "reset --hard",
+        "rev-parse HEAD",
+      ]);
+    });
+
+    it("targets: fresh clone and incremental fetch opt in; reset does not", async () => {
+      vi.mocked(fs.existsSync).mockReturnValueOnce(false).mockReturnValue(true);
+      mockSpawn([{ status: 0 }, { status: 0 }, { status: 0 }]);
+      await cloneStep.run(
+        makeContext(),
+        {
+          repoOwner: "", repoRepo: "", branch: "", githubToken: "", workspaceDir: "/tmp/workspace",
+          targets: [
+            { repoOwner: "acme", repoRepo: "a", targetDir: "repos/a" },
+            { repoOwner: "acme", repoRepo: "b", targetDir: "repos/b" },
+          ],
+        },
+        new NoopStepReporter(),
+      );
+      const calls = vi.mocked(spawnSync).mock.calls;
+      expect(calls.map((c) => (c[1] as string[])[0])).toEqual(["clone", "fetch", "reset"]);
+      expectDependencyOptIn(envOf(calls[0]));
+      expectDependencyOptIn(envOf(calls[1]));
+      expectFenced(envOf(calls[2]));
+    });
+
+    it("primary workspace clone path never receives dependency credentials", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(false);
+      mockSpawn([]);
+      await cloneStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+      const calls = vi.mocked(spawnSync).mock.calls;
+      expect(calls.length).toBeGreaterThan(0);
+      for (const c of calls) {
+        const env = envOf(c);
+        expect(env, `git ${(c[1] as string[])[0]} must pass explicit env`).toBeDefined();
+        expectFenced(env);
+      }
+    });
+  });
+});

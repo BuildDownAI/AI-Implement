@@ -39,6 +39,21 @@ export function parseForwardedSecrets(): string[] {
     .filter((k) => k.length > 0);
 }
 
+// Derived by dependency-auth. The git credential helper returns its cached token
+// when these are present even without a progress bearer, so git subprocesses must
+// not inherit them by default.
+export const DEPENDENCY_CREDENTIAL_KEYS = [
+  "GIT_DEPENDENCY_TOKEN_FILE",
+  "GIT_DEPENDENCY_CALLBACK_URL",
+  "COMPOSER_AUTH",
+] as const;
+
+const DEPENDENCY_HELPER_KEYS = [
+  "GIT_DEPENDENCY_TOKEN_FILE",
+  "GIT_DEPENDENCY_CALLBACK_URL",
+  "RUN_PROGRESS_TOKEN",
+] as const;
+
 /**
  * Environment for runner-owned repository processes (install, setup, verify, teardown).
  * Strips model credentials so repository code cannot read the model authorization.
@@ -80,4 +95,43 @@ export function modelProcessEnv(allowRepositoryWrites: boolean): NodeJS.ProcessE
   // The list variable itself must not reach the model — it names what was hidden
   delete env.AI_IMPLEMENT_FORWARDED_SECRETS;
   return env;
+}
+
+/**
+ * Environment for git subprocesses spawned by the clone, install-skills and
+ * reference-repos steps. Git needs PATH, HOME (global config and credential
+ * helpers), and TLS/proxy variables, and nothing else from the runner's
+ * credential surface: callback tokens, model credentials, install credentials,
+ * ambient GitHub tokens, forwarded secrets, and the credential-bearing run
+ * config are all removed. Operation-scoped credentials (GIT_ASKPASS/GIT_PASSWORD,
+ * GIT_CONFIG_* headers) are passed as `extra` and applied after stripping.
+ * process.env is never mutated.
+ */
+export function gitProcessEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  for (const key of MODEL_CREDENTIAL_KEYS) delete env[key];
+  for (const key of RUNNER_CREDENTIAL_KEYS) delete env[key];
+  for (const key of INSTALL_CREDENTIAL_KEYS) delete env[key];
+  for (const key of GITHUB_WRITE_CREDENTIAL_KEYS) delete env[key];
+  for (const key of parseForwardedSecrets()) delete env[key];
+  delete env.AI_IMPLEMENT_FORWARDED_SECRETS;
+  delete env.AI_IMPLEMENT_RUN_CONFIG;
+  for (const key of DEPENDENCY_CREDENTIAL_KEYS) delete env[key];
+  return { ...env, ...extra };
+}
+
+/**
+ * Environment for the explicit dependency clones (clone.ts `targetDir` / `targets`
+ * network operations, bare remote URL). Starts from gitProcessEnv and restores only
+ * what the globally registered git-credential-helper needs: the cache handle, the
+ * callback URL and the progress bearer. COMPOSER_AUTH is never restored. Read from
+ * process.env at call time because dependency-auth sets these mid-pipeline.
+ */
+export function gitDependencyProcessEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+  const restored: NodeJS.ProcessEnv = {};
+  for (const key of DEPENDENCY_HELPER_KEYS) {
+    const value = process.env[key];
+    if (value !== undefined) restored[key] = value;
+  }
+  return gitProcessEnv({ ...restored, ...extra });
 }
