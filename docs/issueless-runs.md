@@ -28,7 +28,7 @@ flowchart TD
     B -->|"refused"| R["409 / 422 / 501 / 507\nno dispatch"]
     B -->|"pass"| O["KgRepo.trigger\nmints triggerId, sets marker"]
     O -->|"marker live"| O2["409 refresh-in-progress"]
-    O -->|"one-way send"| W["KgRefresh.run\nreserve → mint-tokens → dispatch"]
+    O -->|"one-way send"| W["KgRefresh.run\nreserve → dispatch"]
     W --> E["GitHub Actions, Fly Machine,\nor local Docker"]
     E --> F["runner pipeline\nclone → kg-scope-reconcile → dependency-auth → clone-code-repo → clone-secondary-repos\n→ kg-tracker-data → kg-ingest → kg-snapshot-push"]
     W --> T["wait: report | cancel | progress\nbootstrap deadline 10 min, total deadline 4 h\nGHA: watch the run's status"]
@@ -174,7 +174,7 @@ mintRunToken({
 })
 ```
 
-Three tokens are minted at dispatch time, in the workflow's `mint-tokens` step: the result token above (as `runToken`), a progress token, and a publication token (below):
+Three tokens are minted at dispatch time, inside the workflow's `dispatch` step: the result token above (as `runToken`), a progress token, and a publication token (below):
 
 ```typescript
 mintRunToken({
@@ -329,13 +329,13 @@ The callback is verify-only: it checks the signature and row but never consumes 
 
 The workflow key is the dispatch id (`KgRepo` mints it as the trigger id), so the runner callback addresses `KgRefresh/{dispatchId}` directly from the verified token claims.
 
-The three run tokens (result, progress, publication) are minted in the workflow's one journaled `mint-tokens` step, so a replay or restart reuses them rather than minting again; the publication token is bound to the KG source repo and exchanged for a scoped GitHub token at push time.
+The three run tokens (result, progress, publication) are minted inside the workflow's one journaled `dispatch` step, so the mint and the dispatch are one unit and a replay never re-mints for a dispatch that already committed; the tokens never enter the journal; the publication token is bound to the KG source repo and exchanged for a scoped GitHub token at push time.
 
 ### Reserve and dispatch
 
-`trigger_kg_refresh` (the one door; `POST /api/kg/refresh` reaches the same handler through `callToolAsSystem`) runs its synchronous checks and the credential preflight, then calls `KgRepo.trigger`. The object's exclusive handler reads the `inFlight` marker. A marker younger than the total deadline plus a 10-minute stale margin (`KG_REPO_STALE_MARGIN_MS`) answers `refresh-in-progress` (HTTP 409); an older marker is treated as stale and replaced with a logged warning. Otherwise the object mints a `triggerId`, stores `{ triggerId, startedAt }`, and starts `KgRefresh.run` by one-way send. Restate unreachable at the door answers `503 restate-unavailable` rather than hanging.
+`trigger_kg_refresh` (the one door; `POST /api/kg/refresh` reaches the same handler through `callToolAsSystem`) runs its synchronous checks and the credential preflight, then calls `KgRepo.trigger`. The object's exclusive handler reads the `inFlight` marker. A set marker answers `refresh-in-progress` (HTTP 409); the marker has no age. Otherwise the object mints a `triggerId`, stores `{ triggerId, startedAt }`, and starts `KgRefresh.run` by one-way send. The workflow schedules its own expiry instead: once the dispatch step completes it sends a delayed `KgRepo.expire` for its trigger id at the total deadline plus `KG_REPO_STALE_MARGIN_MS` (10 minutes), which clears the marker only if that trigger still holds it (a normal `release` clears it first, making the later `expire` a no-op) and logs `[KgRepo] expired in-flight marker`. Run, progress and publication tokens are minted inside the journaled `dispatch` step, which checks for an existing run by exact title before each attempt and returns only the run identifiers, so no token is written to the Restate journal. Restate unreachable at the door answers `503 restate-unavailable` rather than hanging.
 
-`KgRefresh.run` then runs, each as a named `ctx.run`: `reserve` (inserts the `dispatch_log` row, §4), `mint-tokens` (once, so a replay reuses them), and `dispatch` (up to three attempts). The dispatch uses `returnRunDetails: true`, so the workflow holds the **exact run identity** of the GitHub run; an `unknown` outcome is reconciled by exact run title, never by a second dispatch (§3). A `rejected` outcome ends the run with `dispatch_rejected`.
+`KgRefresh.run` then runs, each as a named `ctx.run`: `reserve` (inserts the `dispatch_log` row, §4) and `dispatch` (mints the tokens, then dispatches, up to three attempts, each preceded by an exact-title lookup). The dispatch uses `returnRunDetails: true`, so the workflow holds the **exact run identity** of the GitHub run; an `unknown` outcome is reconciled by exact run title, never by a second dispatch (§3). A `rejected` outcome ends the run with `dispatch_rejected`.
 
 ### The two deadlines and the watch
 

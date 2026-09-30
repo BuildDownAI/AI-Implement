@@ -245,10 +245,18 @@ export function createProductionKgRefreshServices(
     },
     dispatch: createKgRefreshDispatch(input),
     appendJobLog: ({ dispatchId }) => {
-      jobIds.set(dispatchId, input.appendLog({
+      // Idempotent on dispatch_id: a replay after a crash between the insert and the journal write reuses the row.
+      const existing = jobIds.get(dispatchId) ?? findJobId(dispatchId);
+      if (existing !== undefined) {
+        jobIds.set(dispatchId, existing);
+        return existing;
+      }
+      const id = input.appendLog({
         issueId: "kg-refresh", phase: "kg-refresh", dispatchId, executionMode: resolveKgExecutionMode(),
         repo: parseKgSourceRepo(input.kgSourceRepo).fullName,
-      }));
+      });
+      jobIds.set(dispatchId, id);
+      return id;
     },
     closeJobLog: (jobId, status, conclusion) => {
       const id = jobIds.get(jobId) ?? findJobId(jobId);
@@ -263,9 +271,8 @@ export function createProductionKgRefreshServices(
     onOutcome: (kind, outcome) => {
       // The workflow reports "graph is current" as a success; the notifier distinguishes it.
       const mapped = kind === "success" && /^Graph is current/i.test(outcome.detail) ? "no-new-data" : kind;
-      Promise.resolve(input.handleKgRefreshOutcome(mapped, kind === "failure" ? { failureReason: outcome.detail } : {})).catch(
-        (err) => console.error("[kg-refresh] outcome handler failed", err),
-      );
+      // Returned so the workflow's `outcome` step awaits (and retries) the notification.
+      return Promise.resolve(input.handleKgRefreshOutcome(mapped, kind === "failure" ? { failureReason: outcome.detail } : {}));
     },
     recordDryRunOutcome: input.recordDryRunOutcome,
   };

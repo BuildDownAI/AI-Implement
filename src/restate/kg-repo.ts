@@ -22,8 +22,6 @@ import { serde } from "@restatedev/restate-sdk-zod";
 import { z } from "zod";
 import { MAX_TRACKED_PRS, type KgDryRunReportTarget } from "../kg-refresh.js";
 import {
-  KG_REFRESH_TOTAL_DEADLINE_MS,
-  KG_REPO_STALE_MARGIN_MS,
   kgDryRunReportSchema,
   kgRefreshOptionsSchema,
   type KgRefreshRunInput,
@@ -44,8 +42,6 @@ interface PendingDryRun {
 export interface KgRepoDependencies {
   /** The Restate service name of the workflow this object starts — "KgRefresh" in production. */
   workflowName: string;
-  /** Overrides `KG_REPO_STALE_MARGIN_MS` for a deterministic staleness test. Production leaves this unset. */
-  staleMarginMs?: number;
 }
 
 export type KgRepoTriggerResult = { triggerId: string } | { status: "refresh-in-progress"; triggerId: string };
@@ -81,24 +77,9 @@ export function buildRunParameter(
 }
 
 export function createKgRepo(deps: KgRepoDependencies) {
-  const staleMarginMs = deps.staleMarginMs ?? KG_REPO_STALE_MARGIN_MS;
-
-  /**
-   * The in-flight marker when it is still live; null when there is none or it is stale
-   * (older than the total deadline plus margin). Shared by every handler that decides
-   * whether a refresh may start.
-   */
-  async function liveInFlight(ctx: ObjectContext, now: number): Promise<InFlightMarker | null> {
-    const inFlight = await ctx.get<InFlightMarker>("inFlight");
-    if (!inFlight) return null;
-    const age = now - inFlight.startedAt;
-    if (age < KG_REFRESH_TOTAL_DEADLINE_MS + staleMarginMs) return inFlight;
-    // ctx.console excludes this from replay, so a stale marker logs exactly once
-    // even though the rest of this exclusive handler re-executes deterministically.
-    ctx.console.warn(
-      `[KgRepo] stale in-flight marker for ${ctx.key} (triggerId=${inFlight.triggerId}, age=${age}ms) — starting a new refresh`,
-    );
-    return null;
+  /** The in-flight marker, or null. The marker has no age: the workflow schedules `expire` for its own lease. */
+  async function liveInFlight(ctx: ObjectContext): Promise<InFlightMarker | null> {
+    return (await ctx.get<InFlightMarker>("inFlight")) ?? null;
   }
 
   /** Marks a new refresh in flight and hands it to `KgRefresh.run` by one-way send. */
@@ -117,7 +98,7 @@ export function createKgRepo(deps: KgRepoDependencies) {
 
   async function trigger(ctx: ObjectContext, opts: KgRepoTriggerInput = {}): Promise<KgRepoTriggerResult> {
     const now = await ctx.date.now();
-    const live = await liveInFlight(ctx, now);
+    const live = await liveInFlight(ctx);
     if (live) return { status: "refresh-in-progress", triggerId: live.triggerId };
     return { triggerId: submit(ctx, now, opts) };
   }
@@ -125,7 +106,7 @@ export function createKgRepo(deps: KgRepoDependencies) {
   async function enqueueDryRun(ctx: ObjectContext, input: KgRepoEnqueueInput): Promise<KgRepoEnqueueResult> {
     const { key, ref, report } = input;
     const now = await ctx.date.now();
-    const live = await liveInFlight(ctx, now);
+    const live = await liveInFlight(ctx);
     if (!live) return { triggerId: submit(ctx, now, { dryRun: true, kgSourceRef: ref, report }) };
 
     const pending = (await ctx.get<Record<string, PendingDryRun>>("pending")) ?? {};
@@ -139,19 +120,32 @@ export function createKgRepo(deps: KgRepoDependencies) {
     return { queued: true };
   }
 
-  async function release(ctx: ObjectContext, input: { triggerId: string }): Promise<void> {
+  /** Clears the marker when it belongs to `triggerId`, then submits the oldest held dry-run. Returns whether it cleared. */
+  async function clearAndDrain(ctx: ObjectContext, triggerId: string | undefined): Promise<boolean> {
     const inFlight = await ctx.get<InFlightMarker>("inFlight");
-    if (!inFlight || inFlight.triggerId !== input?.triggerId) return;
+    if (!inFlight || inFlight.triggerId !== triggerId) return false;
     ctx.clear("inFlight");
 
     const pending = await ctx.get<Record<string, PendingDryRun>>("pending");
     const headKey = pending ? oldestPendingKey(pending) : undefined;
-    if (!pending || headKey === undefined) return;
+    if (!pending || headKey === undefined) return true;
     const { ref, report } = pending[headKey];
     delete pending[headKey];
     if (Object.keys(pending).length === 0) ctx.clear("pending");
     else ctx.set("pending", pending);
     submit(ctx, await ctx.date.now(), { dryRun: true, kgSourceRef: ref, report });
+    return true;
+  }
+
+  async function release(ctx: ObjectContext, input: { triggerId: string }): Promise<void> {
+    await clearAndDrain(ctx, input?.triggerId);
+  }
+
+  /** The workflow's own deadline-plus-margin backstop for a run that never released. */
+  async function expire(ctx: ObjectContext, input: { triggerId: string }): Promise<void> {
+    if (await clearAndDrain(ctx, input?.triggerId)) {
+      ctx.console.warn(`[KgRepo] expired in-flight marker for ${ctx.key} (triggerId=${input.triggerId})`);
+    }
   }
 
   async function status(ctx: ObjectSharedContext): Promise<(InFlightMarker & { pending: string[] }) | null> {
@@ -167,6 +161,7 @@ export function createKgRepo(deps: KgRepoDependencies) {
       trigger: restate.handlers.object.exclusive({ input: serde.zod(triggerInputSchema) }, trigger),
       enqueueDryRun: restate.handlers.object.exclusive({ input: serde.zod(enqueueInputSchema) }, enqueueDryRun),
       release,
+      expire,
       status: restate.handlers.object.shared(status),
     },
   });

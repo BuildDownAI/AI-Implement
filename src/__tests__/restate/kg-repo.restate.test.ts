@@ -7,15 +7,10 @@ import type { RestateTestEnvironment } from "@restatedev/restate-sdk-testcontain
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { MAX_TRACKED_PRS } from "../../kg-refresh.js";
 import { createKgRepo, type KgRepoEnqueueResult, type KgRepoTriggerResult } from "../../restate/kg-repo.js";
-import { KG_REFRESH_TOTAL_DEADLINE_MS } from "../../restate/kg-refresh-workflow.js";
 import { VARIANTS, callObject, startVariants, stopAll } from "./harness.js";
 
 const FAKE_WORKFLOW_NAME = "FakeKgRefresh";
-// KgRepo's staleness check is `age < KG_REFRESH_TOTAL_DEADLINE_MS + staleMarginMs`.
-// A large negative margin collapses the real 4h+10min threshold down to FRESH_WINDOW_MS,
-// so R2 (still fresh) and R4 (now stale) are both provable in real test time.
-const FRESH_WINDOW_MS = 10_000;
-const STALE_MARGIN_MS = FRESH_WINDOW_MS - KG_REFRESH_TOTAL_DEADLINE_MS;
+const MARKER_AGE_WAIT_MS = 1_500;
 
 interface RunSend {
   key: string;
@@ -34,7 +29,7 @@ describe("KgRepo durable single-flight lock", () => {
     },
   });
 
-  const kgRepo = createKgRepo({ workflowName: FAKE_WORKFLOW_NAME, staleMarginMs: STALE_MARGIN_MS });
+  const kgRepo = createKgRepo({ workflowName: FAKE_WORKFLOW_NAME });
 
   let envs: Map<string, RestateTestEnvironment>;
   beforeAll(async () => {
@@ -143,7 +138,7 @@ describe("KgRepo durable single-flight lock", () => {
   );
 
   it.each(VARIANTS.map(([label]) => label))(
-    "R4: a marker older than the total deadline plus the margin is treated as stale (%s)",
+    "R4: a marker is never stale; expire clears it only for the matching trigger id (%s)",
     async (label) => {
       const env = envFor(label);
       const key = newKey();
@@ -152,29 +147,24 @@ describe("KgRepo durable single-flight lock", () => {
       const first = await trigger(env.baseUrl(), key);
       const triggerId = (first as { triggerId: string }).triggerId;
 
-      // Still fresh: well inside FRESH_WINDOW_MS.
-      const stillFresh = await trigger(env.baseUrl(), key);
-      expect(stillFresh).toEqual({ status: "refresh-in-progress", triggerId });
+      await new Promise((resolve) => setTimeout(resolve, MARKER_AGE_WAIT_MS));
+      expect(await trigger(env.baseUrl(), key)).toEqual({ status: "refresh-in-progress", triggerId });
 
-      await new Promise((resolve) => setTimeout(resolve, FRESH_WINDOW_MS + 1_500));
+      await callObject(env.baseUrl(), "KgRepo", key, "expire", { triggerId: "not-the-right-id" });
+      expect(await trigger(env.baseUrl(), key)).toEqual({ status: "refresh-in-progress", triggerId });
 
-      // kg-repo.ts logs the stale-marker warning through `ctx.console.warn`, which the
-      // Restate SDK excludes from replay — this spy proves that holds for real, in both
-      // harness variants, rather than trusting the SDK's documented behavior blind. A
-      // second stale trigger before `warnSpy` is inspected would double-count, so this
-      // scenario only ever ages the marker past staleness once.
       const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
       try {
-        const afterStale = await trigger(env.baseUrl(), key);
-        const staleTriggerId = (afterStale as { triggerId: string }).triggerId;
-        expect(staleTriggerId).not.toBe(triggerId);
-        await until(() => runSends.length - before >= 2);
-        expect(runSends.length - before).toBe(2);
-        expect(warnSpy).toHaveBeenCalledTimes(1);
-        expect(warnSpy.mock.calls[0][1]).toContain("stale in-flight marker");
+        await callObject(env.baseUrl(), "KgRepo", key, "expire", { triggerId });
+        expect(warnSpy.mock.calls.filter((c) => String(c[1]).includes("expired in-flight marker"))).toHaveLength(1);
       } finally {
         warnSpy.mockRestore();
       }
+      expect(await callObject(env.baseUrl(), "KgRepo", key, "status", {})).toBeNull();
+      const next = await trigger(env.baseUrl(), key);
+      expect((next as { triggerId: string }).triggerId).not.toBe(triggerId);
+      await until(() => runSends.length - before >= 2);
+      expect(runSends.length - before).toBe(2);
     },
     30_000,
   );
@@ -384,25 +374,20 @@ describe("KgRepo durable single-flight lock", () => {
   );
 
   it.each(VARIANTS.map(([label]) => label))(
-    "a stale in-flight marker lets enqueueDryRun submit now, leaving the pending entries for the next release (%s)",
+    "expire drains exactly one pending head, like release (%s)",
     async (label) => {
       const env = envFor(label);
       const slug = newKey();
       const before = runSends.length;
-      await trigger(env.baseUrl(), slug);
-      await enqueue(env.baseUrl(), slug, 1, "queued");
+      const first = await trigger(env.baseUrl(), slug);
+      const triggerId = (first as { triggerId: string }).triggerId;
+      await enqueue(env.baseUrl(), slug, 1, "first");
+      await enqueue(env.baseUrl(), slug, 2, "second");
 
-      await new Promise((resolve) => setTimeout(resolve, FRESH_WINDOW_MS + 1_500));
-      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-      try {
-        const result = await enqueue(env.baseUrl(), slug, 2, "now");
-        expect(result).toEqual({ triggerId: expect.any(String) });
-        await until(() => runSends.length - before >= 2);
-        expect(runSends[runSends.length - 1].parameter).toMatchObject({ kgSourceRef: "now" });
-        expect((await repoStatus(env.baseUrl(), slug))?.pending).toEqual(["org/kg-source#1"]);
-      } finally {
-        warnSpy.mockRestore();
-      }
+      await callObject(env.baseUrl(), "KgRepo", slug, "expire", { triggerId });
+      await until(() => runSends.length - before >= 2);
+      expect(runSends[runSends.length - 1].parameter).toMatchObject({ kgSourceRef: "first" });
+      expect((await repoStatus(env.baseUrl(), slug))?.pending).toEqual(["org/kg-source#2"]);
     },
     30_000,
   );

@@ -116,13 +116,14 @@ export interface KgRefreshWorkflowDependencies {
   kgSourceRepo: string;
   mintRunTokens(input: { dispatchId: string; ttlSeconds: number }): { runToken: string; progressToken: string; publicationToken: string };
   dispatch(input: KgDispatchInput): Promise<KgDispatchResult>;
-  appendJobLog(input: { dispatchId: string; jobId: string }): void;
+  /** Idempotent on `dispatchId`; returns the dispatch_log row id. */
+  appendJobLog(input: { dispatchId: string; jobId: string }): number | void;
   closeJobLog(jobId: string, status: "completed" | "failed" | "timed_out", conclusion?: string): void;
   getWorkflowRunStatus(runId: number): Promise<{ status: string; conclusion: string | null }>;
   findRunByTitle(title: string): Promise<{ runId: number } | null>;
   cancelWorkflowRun(runId: number): Promise<boolean>;
   persistLastRefresh(outcome: RefreshOutcome): void;
-  onOutcome(kind: "success" | "failure", outcome: RefreshOutcome): void;
+  onOutcome(kind: "success" | "failure", outcome: RefreshOutcome): void | Promise<void>;
   /** Stores a dry-run outcome for its PR so the accept-baseline label can re-report it (AII-730). */
   recordDryRunOutcome(report: KgDryRunReportTarget, outcome: RefreshOutcome): void;
   /** Overrides `KG_REFRESH_BOOTSTRAP_DEADLINE_MS` for a deterministic timeout test.
@@ -244,6 +245,17 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       return outcome;
     }
 
+    /** Awaits the notification in its own retried step; a notifier outage must not turn a finished refresh into a failure. */
+    async function notifyOutcome(kind: "success" | "failure", outcome: RefreshOutcome): Promise<void> {
+      try {
+        await ctx.run("outcome", () => deps.onOutcome(kind, outcome), { maxRetryAttempts: 3 });
+      } catch (err) {
+        if (restate.internal.isSuspendedError(err)) throw err;
+        if (err instanceof restate.TerminalError && err.code === 409) throw err; // invocation cancelled
+        ctx.console.error(`[KgRefresh] outcome notification failed for ${triggerId}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+
     async function failurePath(
       outcome: RefreshOutcome,
       conclusion: string,
@@ -252,7 +264,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       await ctx.run("persist", () => deps.persistLastRefresh(outcome));
       await ctx.run("close-row", () => deps.closeJobLog(jobId, opts.timedOut ? "timed_out" : "failed", conclusion));
       if (!opts.skipOutcome) {
-        await ctx.run("outcome", () => deps.onOutcome("failure", outcome));
+        await notifyOutcome("failure", outcome);
       }
       return outcome;
     }
@@ -267,15 +279,28 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       await ctx.run("reserve", () => deps.appendJobLog({ dispatchId, jobId }));
 
       const ttlSeconds = Math.ceil(totalDeadlineMs / 1000);
-      const { runToken, progressToken, publicationToken } = await ctx.run("mint-tokens", () =>
-        deps.mintRunTokens({ dispatchId, ttlSeconds }));
-
       const issueIdentifier = `KG-REFRESH · ${triggerId}`;
 
+      // Tokens are minted inside the journaled step and never leave it: the step result
+      // carries no secret, so none reaches the Restate journal. Minted at most once per
+      // process (the token rows are keyed by dispatch id + audience, so a second mint would collide).
+      let minted: ReturnType<typeof deps.mintRunTokens> | undefined;
       ctx.set("step", "dispatch");
       const dispatchResult = await ctx.run(
         "dispatch",
-        () => deps.dispatch({ runConfig: input, tokens: { runToken, progressToken, publicationToken }, issueIdentifier, dispatchId }),
+        async (): Promise<KgDispatchResult> => {
+          // Reconcile first: a retry after a committed-but-unacknowledged dispatch must adopt that run.
+          const existing = await deps.findRunByTitle(issueIdentifier).catch(() => null);
+          if (existing) {
+            return { outcome: "accepted", runId: existing.runId, jobId: String(existing.runId), executionMode: GHA_EXECUTION_MODE };
+          }
+          minted ??= deps.mintRunTokens({ dispatchId, ttlSeconds });
+          const result = await deps.dispatch({ runConfig: input, tokens: minted, issueIdentifier, dispatchId });
+          return {
+            outcome: result.outcome, runId: result.runId, runUrl: result.runUrl,
+            jobId: result.jobId, executionMode: result.executionMode,
+          };
+        },
         { maxRetryAttempts: 3 },
       );
 
@@ -296,6 +321,18 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       const dispatchedAt = await ctx.date.now();
       const bootstrapDeadlineAt = dispatchedAt + bootstrapDeadlineMs;
       const totalDeadlineAt = dispatchedAt + totalDeadlineMs;
+
+      // The workflow owns the marker's expiry: if this run never releases (a crash that outlives
+      // Restate's retries), KgRepo clears the marker at the deadline plus margin. A normal release
+      // clears it first, and the later expire no longer matches the trigger id.
+      ctx.genericSend({
+        service: "KgRepo",
+        method: "expire",
+        key: deps.kgSourceRepo,
+        parameter: { triggerId },
+        inputSerde: restate.serde.json,
+        delay: totalDeadlineMs + KG_REPO_STALE_MARGIN_MS,
+      });
 
       async function waitForOutcome(): Promise<WaitOutcome> {
         let progressSeen = false;
@@ -431,7 +468,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           stampBefore: null, stampAfter: null,
         };
         await ctx.run("close-row", () => deps.closeJobLog(jobId, "completed"));
-        await ctx.run("outcome", () => deps.onOutcome("success", outcome));
+        await notifyOutcome("success", outcome);
         return finish(outcome);
       }
 
@@ -472,6 +509,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           { maxRetryAttempts: 3 },
         );
       } catch (err) {
+        if (restate.internal.isSuspendedError(err)) throw err;
         ctx.set("step", "failed");
         const at = await ctx.date.now();
         const detail = err instanceof Error ? err.message : String(err);
@@ -492,6 +530,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         try {
           railCtx = await runGate(ctx, name, gate, railCtx);
         } catch (err) {
+          if (restate.internal.isSuspendedError(err)) throw err;
           if (err instanceof restate.TerminalError) {
             gateFailure = parseGateFailure(err.message);
             break;
@@ -513,7 +552,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
             stampBefore: railCtx.stampBefore ?? null, stampAfter: railCtx.stampBefore ?? null,
           };
           await ctx.run("close-row", () => deps.closeJobLog(jobId, "completed"));
-          await ctx.run("outcome", () => deps.onOutcome("success", outcome));
+          await notifyOutcome("success", outcome);
           return finish(outcome);
         }
 
@@ -546,9 +585,10 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       ctx.set("step", "close-row");
       await ctx.run("close-row", () => deps.closeJobLog(jobId, "completed"));
       ctx.set("step", "outcome");
-      await ctx.run("outcome", () => deps.onOutcome("success", successOutcome));
+      await notifyOutcome("success", successOutcome);
       return finish(successOutcome);
     } catch (err) {
+      if (restate.internal.isSuspendedError(err)) throw err;
       if (await ctx.get<boolean>("completed")) throw err;
       // Release order (ADR 032, Consequences): `release` is sent only after failurePath has
       // written `persist` and `close-row`, so a new refresh can never start while this failed
@@ -641,18 +681,12 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         journalRetention: KG_REFRESH_RETENTION_MS,
         idempotencyRetention: KG_REFRESH_RETENTION_MS,
       }, report),
-      progress: restate.handlers.workflow.shared({
-        journalRetention: KG_REFRESH_RETENTION_MS,
-        idempotencyRetention: KG_REFRESH_RETENTION_MS,
-      }, progress),
+      progress: restate.handlers.workflow.shared(progress),
       cancel: restate.handlers.workflow.shared({
         journalRetention: KG_REFRESH_RETENTION_MS,
         idempotencyRetention: KG_REFRESH_RETENTION_MS,
       }, cancel),
-      status: restate.handlers.workflow.shared({
-        journalRetention: KG_REFRESH_RETENTION_MS,
-        idempotencyRetention: KG_REFRESH_RETENTION_MS,
-      }, status),
+      status: restate.handlers.workflow.shared(status),
     },
     options: {
       workflowRetention: KG_REFRESH_RETENTION_MS,
