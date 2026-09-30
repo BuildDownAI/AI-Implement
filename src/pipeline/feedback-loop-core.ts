@@ -10,8 +10,8 @@ import { inferTestResults, sumUsage, toolTraceLines, type CycleSummaryInput } fr
  * (AII-626). Every effect — model calls, git reads, the cycle-summary write,
  * reporting, sleeping, clocks, logging — arrives through `LoopEffects`, so this
  * module does no I/O of its own and a test-only Restate workflow can run the same
- * production code with journaled effects. Nothing under `src/pipeline/` may import
- * `src/restate/` or `@restatedev/*`.
+ * production code with journaled effects. The pipeline never depends on the
+ * durable-execution runtime or its SDK; the dependency points the other way.
  */
 
 const ACCEPTANCE_BAR_HEADER = "## ✅ AI Planning: Acceptance Bar";
