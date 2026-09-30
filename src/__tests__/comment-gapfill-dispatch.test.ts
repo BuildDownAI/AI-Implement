@@ -179,6 +179,7 @@ function makeBaseDrainOpts(overrides: Partial<DrainInput> = {}): DrainInput {
     runnerCallbackBaseUrl: null,
     runnerTokenSecret: null,
     getInstallationToken: vi.fn<DrainInput["getInstallationToken"]>(async () => "gh-token"),
+    getTargetRepoToken: vi.fn<DrainInput["getTargetRepoToken"]>(async () => "scoped-token"),
     getInstallationId: vi.fn<DrainInput["getInstallationId"]>(async () => 778899),
     resolveRunnerImage: vi.fn<DrainInput["resolveRunnerImage"]>(async () => undefined),
     checkContract: vi.fn<DrainInput["checkContract"]>(async () => "envelope"),
@@ -867,6 +868,8 @@ describe("drainCommentGapfillQueue — PR dispatch budget", () => {
     ).toBe(true);
 
     expect(postCommentSpy).toHaveBeenCalledTimes(1);
+    // orchestrator-internal comment duty keeps the broad token
+    expect(postCommentSpy.mock.calls[0]![0]).toBe("gh-token");
     const [, owner, repo, prNumber, body] = postCommentSpy.mock.calls[0]!;
     expect(owner).toBe("acme");
     expect(repo).toBe("billing");
@@ -1227,6 +1230,118 @@ describe("drainCommentGapfillQueue — admission (AII-787)", () => {
 
     expect(localGapfillMocks.dispatchLocalGapfill).toHaveBeenCalledTimes(1);
     expect(admission.count("TEAM")).toBe(1);
+  });
+
+  it("local-docker gap-fill boots with the target-repo scoped token, not the broad one", async () => {
+    const mapping = makeMapping({ owner: "acme", repo: "billing" });
+    seedDispatchLog("issue-scoped-local", "AII-307", "Scoped local", "acme", "billing", 90);
+    queue.enqueueCommentGapfill({ owner: "acme", repo: "billing", prNumber: 90, commentId: 0, commenter: "", instruction: "" });
+    const getTargetRepoToken = vi.fn<DrainInput["getTargetRepoToken"]>(async () => "scoped-token");
+
+    await drain.drainCommentGapfillQueue(makeBaseDrainOpts({
+      getMappings: () => ({ TEAM: mapping }),
+      runnerMode: "local",
+      anthropicApiKey: "anthropic-key",
+      getTargetRepoToken,
+    }));
+
+    expect(getTargetRepoToken).toHaveBeenCalledWith("acme", "billing");
+    expect(localGapfillMocks.dispatchLocalGapfill).toHaveBeenCalledWith(
+      expect.objectContaining({ githubToken: "scoped-token" }),
+    );
+  });
+
+  it("fly gap-fill boots with the scoped token, never the broad one", async () => {
+    const mapping = makeMapping({ owner: "acme", repo: "billing", executionMode: "fly-machines", maxInProgressAiIssues: 1 });
+    seedDispatchLog("issue-scoped-fly", "AII-308", "Scoped fly", "acme", "billing", 91);
+    queue.enqueueCommentGapfill({ owner: "acme", repo: "billing", prNumber: 91, commentId: 0, commenter: "", instruction: "" });
+    const getInstallationToken = vi.fn<DrainInput["getInstallationToken"]>(async () => "broad-token");
+    const getTargetRepoToken = vi.fn<DrainInput["getTargetRepoToken"]>(async () => "scoped-token");
+
+    await drain.drainCommentGapfillQueue(makeBaseDrainOpts({
+      getMappings: () => ({ TEAM: mapping }),
+      flySessionsToken: "fly-token",
+      flySessionsApp: "fly-app",
+      anthropicApiKey: "anthropic-key",
+      getInstallationToken,
+      getTargetRepoToken,
+    }));
+
+    expect(getTargetRepoToken).toHaveBeenCalledWith("acme", "billing");
+    expect(flyMocks.createMachine).toHaveBeenCalledTimes(1);
+    const env = flyMocks.createMachine.mock.calls[0]![2].config.env ?? {};
+    expect(env.GITHUB_TOKEN).toBe("scoped-token");
+    expect(JSON.stringify(flyMocks.createMachine.mock.calls[0])).not.toContain("broad-token");
+  });
+
+  it("fly gap-fill: a narrow-mint failure launches nothing and the broad token never reaches the launch", async () => {
+    const mapping = makeMapping({ owner: "acme", repo: "billing", executionMode: "fly-machines", maxInProgressAiIssues: 1 });
+    seedDispatchLog("issue-scoped-fly-fail", "AII-309", "Scoped fly fail", "acme", "billing", 92);
+    queue.enqueueCommentGapfill({ owner: "acme", repo: "billing", prNumber: 92, commentId: 0, commenter: "", instruction: "" });
+    const getInstallationToken = vi.fn<DrainInput["getInstallationToken"]>(async () => "broad-token");
+    const getTargetRepoToken = vi.fn<DrainInput["getTargetRepoToken"]>(async () => {
+      throw new Error("narrow mint failed");
+    });
+
+    await drain.drainCommentGapfillQueue(makeBaseDrainOpts({
+      getMappings: () => ({ TEAM: mapping }),
+      flySessionsToken: "fly-token",
+      flySessionsApp: "fly-app",
+      anthropicApiKey: "anthropic-key",
+      getInstallationToken,
+      getTargetRepoToken,
+    }));
+
+    expect(getTargetRepoToken).toHaveBeenCalledWith("acme", "billing");
+    expect(flyMocks.createMachine).not.toHaveBeenCalled();
+    expect(localGapfillMocks.dispatchLocalGapfill).not.toHaveBeenCalled();
+    expect(admission.count("TEAM")).toBe(0);
+  });
+
+  it("the no-record comment uses the broad token and never mints a target-repo token", async () => {
+    const mapping = makeMapping({ owner: "acme", repo: "billing" });
+    queue.enqueueCommentGapfill({ owner: "acme", repo: "billing", prNumber: 93, commentId: 0, commenter: "", instruction: "" });
+    const getInstallationToken = vi.fn<DrainInput["getInstallationToken"]>(async () => "broad-token");
+    const getTargetRepoToken = vi.fn<DrainInput["getTargetRepoToken"]>(async () => "scoped-token");
+    const postComment = vi.fn<DrainInput["postComment"]>(async () => undefined);
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    await drain.drainCommentGapfillQueue(makeBaseDrainOpts({
+      getMappings: () => ({ TEAM: mapping }),
+      getInstallationToken,
+      getTargetRepoToken,
+      postComment,
+    }));
+
+    expect(getInstallationToken).toHaveBeenCalledWith("acme");
+    expect(postComment).toHaveBeenCalledTimes(1);
+    expect(postComment.mock.calls[0]![0]).toBe("broad-token");
+    expect(postComment.mock.calls[0]![4]).toContain("no record of this PR");
+    expect(getTargetRepoToken).not.toHaveBeenCalled();
+    expect(localGapfillMocks.dispatchLocalGapfill).not.toHaveBeenCalled();
+  });
+
+  it("local gap-fill: a narrow-mint failure launches nothing, uses no broad fallback and releases the reservation", async () => {
+    const mapping = makeMapping({ owner: "acme", repo: "billing" });
+    seedDispatchLog("issue-scoped-local-fail", "AII-310", "Scoped local failure", "acme", "billing", 94);
+    queue.enqueueCommentGapfill({ owner: "acme", repo: "billing", prNumber: 94, commentId: 0, commenter: "", instruction: "" });
+    const getTargetRepoToken = vi.fn<DrainInput["getTargetRepoToken"]>(async () => {
+      throw new Error("narrow mint failed");
+    });
+    const resolveRunnerImage = vi.fn<DrainInput["resolveRunnerImage"]>(async () => undefined);
+
+    await drain.drainCommentGapfillQueue(makeBaseDrainOpts({
+      getMappings: () => ({ TEAM: mapping }),
+      runnerMode: "local",
+      anthropicApiKey: "anthropic-key",
+      getTargetRepoToken,
+      resolveRunnerImage,
+    }));
+
+    expect(getTargetRepoToken).toHaveBeenCalledWith("acme", "billing");
+    expect(localGapfillMocks.dispatchLocalGapfill).not.toHaveBeenCalled();
+    expect(resolveRunnerImage).not.toHaveBeenCalled();
+    expect(admission.count("TEAM")).toBe(0);
   });
 
   it("holds capacity after an unknown GitHub 5xx outcome", async () => {

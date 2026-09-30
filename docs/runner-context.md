@@ -89,7 +89,7 @@ Each skill directory is copied to `$HOME/.claude/skills/<name>` with `force: tru
 
 **How it reaches the runner — the envelope only.** There is no dispatch input and no environment variable. The runner's legacy-env branch hardcodes the value to `undefined`, so a repository still on the legacy workflow contract cannot receive this setting no matter what the mapping says.
 
-**The two-token split** is what makes the feature safe to offer at all. The run's primary token carries the App's full grants but is narrowed to the target repository alone. The dependency token is the mirror image: installation-wide, but read-only on contents.
+**The two-token split** is what makes the feature safe to offer at all. The run's primary token carries the App's full grants but is narrowed to the target repository alone — from boot, not only at the mid-run refresh: Fly and local-Docker implementation, planning and comment gap-fill dispatches mint it with a repository-scoped request, and a failed mint aborts the launch rather than falling back to an installation-wide token. A planning run therefore never holds a token wider than its target repository. The dependency token is the mirror image: installation-wide, but read-only on contents.
 
 So the implementer can read the sibling repositories it needs, and can never push to any of them.
 
