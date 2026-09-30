@@ -327,6 +327,26 @@ describe("createKgRefreshIngressClient", () => {
     expect(await clientWith(respond(500, body)).report("t-1", { ok: true })).toEqual({ status: "unavailable" });
   });
 
+  it("does not map a 409 from enqueueDryRun to conflict", async () => {
+    const entry = { key: "acme/kg#1", ref: "br", report: { repo: "acme/kg", prNumber: 1, sha: "s" } };
+    const body = JSON.stringify({ code: 409, message: "conflict" });
+    expect(await clientWith(respond(409, body)).enqueueDryRun("acme/kg", entry)).toEqual({ status: "unavailable" });
+  });
+
+  it("answers unavailable from every handler on a connection error and on a timeout", async () => {
+    const refused = vi.fn(async () => { throw new TypeError("fetch failed"); }) as unknown as typeof fetch;
+    const timedOut = vi.fn(async () => { throw new DOMException("timed out", "TimeoutError"); }) as unknown as typeof fetch;
+    const entry = { key: "acme/kg#1", ref: "br", report: { repo: "acme/kg", prNumber: 1, sha: "s" } };
+    for (const f of [refused, timedOut]) {
+      const c = clientWith(f);
+      const results = await Promise.all([
+        c.report("t-1", { ok: true }), c.progress("t-1"), c.cancel("t-1", "stop"),
+        c.status("t-1"), c.repoStatus("acme/kg"), c.enqueueDryRun("acme/kg", entry),
+      ]);
+      for (const r of results) expect(r).toEqual({ status: "unavailable" });
+    }
+  });
+
   it("maps other 4xx (including a missing handler) and 5xx to unavailable", async () => {
     expect(await clientWith(respond(404, "no such handler")).enqueueDryRun("acme/kg", { key: "acme/kg#1", ref: "br", report: { repo: "acme/kg", prNumber: 1, sha: "s" } })).toEqual({ status: "unavailable" });
     expect(await clientWith(respond(503, "down")).status("t-1")).toEqual({ status: "unavailable" });

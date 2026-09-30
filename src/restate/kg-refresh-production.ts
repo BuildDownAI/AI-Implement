@@ -344,13 +344,14 @@ export function createKgRefreshIngressClient(
   const repo = (slug: string) => ingress.objectClient<KgRepoDefinition>({ name: "KgRepo" }, slug);
 
   /** 404 is `not-found` for the workflow only; 409 is `conflict` where the caller asked for it. */
-  async function invoke<T>(
-    call: () => PromiseLike<T>,
+  async function invoke<T = undefined>(
+    call: () => PromiseLike<unknown>,
     statuses: { notFound?: boolean; conflict?: boolean } = {},
   ): Promise<KgIngressResult<T>> {
     try {
       const value = await call();
-      return value === undefined ? { status: "accepted" } : { status: "accepted", value };
+      // `T` is the caller's declared result; a handler returning nothing yields no `value`.
+      return value === undefined ? { status: "accepted" } : { status: "accepted", value: value as T };
     } catch (err) {
       if (err instanceof restateClients.HttpCallError) {
         if (statuses.notFound && err.status === 404) return { status: "not-found" };
@@ -362,13 +363,13 @@ export function createKgRefreshIngressClient(
 
   return {
     report: (triggerId, body, opts) =>
-      invoke(() => refresh(triggerId).report(body, callOpts(opts?.idempotencyKey)) as PromiseLike<{ status: "accepted" | "duplicate" }>, { notFound: true, conflict: true }),
-    progress: (triggerId) => invoke(() => refresh(triggerId).progress(callOpts()), { notFound: true }) as Promise<KgIngressResult>,
-    cancel: (triggerId, reason) => invoke(() => refresh(triggerId).cancel({ reason }, callOpts()), { notFound: true }) as Promise<KgIngressResult>,
-    status: (triggerId) => invoke(() => refresh(triggerId).status(callOpts()), { notFound: true }),
-    repoStatus: (slug) => invoke(() => repo(slug).status(callOpts())),
+      invoke<{ status: "accepted" | "duplicate" }>(() => refresh(triggerId).report(body, callOpts(opts?.idempotencyKey)), { notFound: true, conflict: true }),
+    progress: (triggerId) => invoke(() => refresh(triggerId).progress(callOpts()), { notFound: true }),
+    cancel: (triggerId, reason) => invoke(() => refresh(triggerId).cancel({ reason }, callOpts()), { notFound: true }),
+    status: (triggerId) => invoke<KgRefreshStatusResult>(() => refresh(triggerId).status(callOpts()), { notFound: true }),
+    repoStatus: (slug) => invoke<{ triggerId: string; startedAt: number } | null>(() => repo(slug).status(callOpts())),
     enqueueDryRun: (slug, entry, opts) =>
-      invoke(() => repo(slug).enqueueDryRun(entry, callOpts(opts?.idempotencyKey))) as ReturnType<KgRefreshIngressClient["enqueueDryRun"]>,
+      invoke<KgRepoEnqueueResult>(() => repo(slug).enqueueDryRun(entry, callOpts(opts?.idempotencyKey))) as ReturnType<KgRefreshIngressClient["enqueueDryRun"]>,
   };
 }
 
