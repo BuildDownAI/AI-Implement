@@ -31,7 +31,8 @@ describe("codex stream parsing", () => {
     expect(p.unknownEvents).toBe(1);
     expect(p.malformedLines).toBe(3);
     expect(p.sawUnsafeActivity).toBe(true); // truncated JSON object may have been a command
-    expect(p.telemetry.outcome).toBe("unknown");
+    expect(p.telemetry.outcome).toBe("error");
+    expect(p.structuredOutput).toBeUndefined();
   });
 
   it("bounds an oversized line and stays unsafe", () => {
@@ -41,7 +42,7 @@ describe("codex stream parsing", () => {
     p.end();
     expect(p.oversizedLines).toBe(1);
     expect(p.sawUnsafeActivity).toBe(true);
-    expect(p.terminalStatus?.isError).toBe(false);
+    expect(p.terminalStatus?.isError).toBe(true);
   });
 
   it("caps the trace at 200 with a marker", () => {
@@ -128,8 +129,85 @@ describe("usage and terminal semantics", () => {
     }
     expect(parseCodexStream(j({ type: "turn.started" })).terminalStatus).toBeUndefined();
   });
-  it("a later turn.completed supersedes a transient error", () => {
-    expect(parseCodexStream(j({ type: "error", message: "Reconnecting" }, done())).telemetry.outcome).toBe("success");
+});
+
+const started = { type: "turn.started" };
+const approved = msg('{"approved":true}');
+
+describe("stream integrity", () => {
+  const bad: Array<[string, string]> = [
+    ["turn.failed", j(started, { type: "turn.failed" }, approved, done())],
+    ["error", j(started, { type: "error", message: "x" }, approved, done())],
+    ["malformed", j(started, approved) + "{oops\n" + j(done())],
+    ["unknown top-level", j(started, { type: "foo.bar" }, approved, done())],
+    ["unknown item", j(started, { type: "item.completed", item: { id: "z", type: "zzz" } }, approved, done())],
+    ["shapeless item", j(started, { type: "item.completed" }, approved, done())],
+    ["oversized", j(started, approved) + "x".repeat(1_100_000) + "\n" + j(done())],
+  ];
+  for (const [name, text] of bad) {
+    it(`${name} then valid completion never succeeds`, () => {
+      const p = parseCodexStream(text);
+      const r = p.toResult({ exitCode: 0 });
+      expect(p.terminalStatus?.isError).toBe(true);
+      expect(r.telemetry?.outcome).toBe("error");
+      expect(r.structuredOutput).toBeUndefined();
+      expect(classifyLlmResult(r, { stage: "review", attempt: 1, expectsStructuredOutput: true })).not.toBeNull();
+    });
+  }
+  const noText = { type: "item.completed", item: { id: "m2", type: "agent_message" } };
+  const numText = { type: "item.completed", item: { id: "m2", type: "agent_message", text: 7 } };
+  const invalid: Array<[string, string]> = [
+    ["plain text line", j(started, approved) + "not-json\n" + j(done())],
+    ["JSON array line", j(started, approved) + "[1,2]\n" + j(done())],
+    ["agent_message missing text", j(started, approved, noText, done())],
+    ["agent_message non-string text", j(started, approved, numText, done())],
+  ];
+  for (const [name, text] of invalid) {
+    it(`${name} then valid completion is an error with unsafe replay`, () => {
+      const p = parseCodexStream(text);
+      const r = p.toResult({ exitCode: 0 });
+      expect(p.sawUnsafeActivity).toBe(true);
+      expect(p.terminalStatus?.isError).toBe(true);
+      expect(r.telemetry?.outcome).toBe("error");
+      expect(r.structuredOutput).toBeUndefined();
+      expect(classifyLlmResult(r, { stage: "review", attempt: 1, expectsStructuredOutput: true })).not.toBeNull();
+    });
+  }
+  it("a malformed final message drops the earlier verdict", () => {
+    expect(parseCodexStream(j(started, approved, noText)).finalMessage).toBeNull();
+  });
+  it("unknown non-item events make replay unsafe", () => {
+    expect(parseCodexStream(j({ type: "foo.bar" })).sawUnsafeActivity).toBe(true);
+  });
+  it("a completed turn cannot approve an interrupted later turn", () => {
+    const p = parseCodexStream(j(started, approved, done({ input_tokens: 3 }), started));
+    expect(p.structuredOutput).toBeUndefined();
+    expect(p.finalMessage).toBeNull();
+    expect(p.telemetry.outcome).toBe("unknown");
+    expect(p.terminalStatus).toBeUndefined();
+  });
+  it("valid multi-turn stream keeps verdict and summed usage", () => {
+    const p = parseCodexStream(j(started, msg("{}"), done({ input_tokens: 3 }), started, approved, done({ input_tokens: 4 })));
+    expect(p.structuredOutput).toEqual({ approved: true });
+    expect(p.telemetry.tokensIn).toBe(7);
+    expect(p.telemetry.outcome).toBe("success");
+  });
+  it("maps cache_write_input_tokens", () => {
+    expect(parseCodexStream(j(done({ cache_write_input_tokens: 5 }))).telemetry.cacheCreationTokens).toBe(5);
+    expect(parseCodexStream(j(done({ cache_write_input_tokens: 0 }))).telemetry.cacheCreationTokens).toBe(0);
+    expect(parseCodexStream(j(done({ input_tokens: 1 }))).telemetry.cacheCreationTokens).toBeNull();
+  });
+  it("does not leak argument credentials and stays bounded", () => {
+    const cmds = ["curl -H 'Authorization: Bearer scheme tok123' x", "curl --token abc123 x"];
+    const events = cmds.flatMap((command, i) => [
+      { type: "item.started", item: { id: `a${i}`, type: "command_execution", command } },
+      { type: "item.completed", item: { id: `a${i}`, type: "command_execution", command, status: "completed", exit_code: 0 } },
+    ]);
+    const out = JSON.stringify(parseCodexStream(j(...events)).telemetry);
+    for (const s of ["tok123", "abc123", "scheme"]) expect(out).not.toContain(s);
+    const many = Array.from({ length: 3000 }, (_, i) => ({ type: "item.started", item: { id: `u${i}`, type: "command_execution", command: "ls" } }));
+    const t = parseCodexStream(j(...many)).telemetry;
+    expect(t.toolTrace?.length).toBeLessThanOrEqual(201);
   });
 });
 
@@ -148,7 +226,7 @@ describe("trace hygiene", () => {
     for (const s of [sentinel, SK, GH]) expect(out).not.toContain(s);
     expect(p.telemetry.toolTrace).toContain("mcp srv/t");
   });
-  it("summarizes only leading command tokens", () => {
-    expect(summarizeCommand("bash -lc 'git log --oneline -n 5 --all extra'")).toBe("git log --oneline -n …");
+  it("keeps only the executable name", () => {
+    expect(summarizeCommand("bash -lc 'git log --oneline -n 5 --all extra'")).toBe("git …");
   });
 });
