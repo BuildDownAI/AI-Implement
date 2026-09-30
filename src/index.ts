@@ -1,3 +1,4 @@
+import { makeKgWebhookTrigger } from "./kg-webhook-trigger.js";
 import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -4827,9 +4828,7 @@ function startServer(
         kgBaseRepo: getOrchestratorSettings().kgBaseRepo,
         githubAppId: config.githubAppId,
         githubAppPrivateKey: config.githubAppPrivateKey,
-        trigger: async (opts) => kgRefreshAdminDeps
-          ? kgRefreshAdminDeps.trigger({ dryRun: opts.dryRun, ref: opts.ref })
-          : { status: 501, body: { error: "kg-source-repo-not-configured" } },
+        trigger: makeKgWebhookTrigger(() => kgRefreshAdminDeps),
         reportDryRun: (report) => kgRefresh.reportDryRun(report),
         onRefreshSettled: (cb) => kgRefresh.onRefreshSettled(cb),
         forgetKgPr: (repo, prNumber) => kgRefresh.forgetPr(repo, prNumber),

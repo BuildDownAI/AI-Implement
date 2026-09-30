@@ -1,7 +1,7 @@
 /**
  * `KgRefresh` — the workflow that runs one kg-refresh dispatch end to end (AII-894).
- * It replaces the state machine, TTL watchdog, and GHA monitor in `src/kg-refresh.ts` /
- * `src/reaper.ts` / `src/monitor-gha.ts`: Restate owns the waits, the deadlines, and the
+ * It replaces the state machine, TTL watchdog, and GHA monitor that used to live in
+ * `src/kg-refresh.ts` / `src/reaper.ts` / `src/monitor-gha.ts` (all since deleted): Restate owns the waits, the deadlines, and the
  * replay, while this module owns only the sequencing of already-pure functions —
  * `deps.rail`'s gates (`src/kg-refresh-rail.ts`, AII-684) run the same fetch/stage/swap/
  * verify steps the orchestrator runs today, one activity at a time, so a Restate replay
