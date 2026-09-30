@@ -15,11 +15,11 @@ vi.mock("../pipeline/retry-backoff.js", async (importOriginal) => {
   // Wraps the real implementation (so backoff math and every other test's timing-
   // insensitive behavior is unchanged) purely so a test can assert what it was called
   // with, rather than inferring timing from NODE_ENV=test's sleepSync no-op.
-  return { ...actual, computeBackoffMs: vi.fn(actual.computeBackoffMs) };
+  return { ...actual, computeBackoffMs: vi.fn(actual.computeBackoffMs), sleepAsync: vi.fn(actual.sleepAsync) };
 });
 
 import { spawnSync } from "node:child_process";
-import { computeBackoffMs } from "../pipeline/retry-backoff.js";
+import { computeBackoffMs, sleepAsync } from "../pipeline/retry-backoff.js";
 
 function makeContext(overrides: Record<string, unknown> = {}): DefaultPipelineContext {
   return new DefaultPipelineContext({
@@ -1913,6 +1913,111 @@ describe("pushStep — push failure classification and retry (BAC-27116)", () =>
     }
     expect(pushCalls).toBe(3);
     expect(caught?.failure).toMatchObject({ category: "auth", code: "GIT_AUTH" });
+  });
+
+  describe("ls-remote retry after a token refresh (AII-936)", () => {
+    const NOT_FOUND = "remote: Repository not found.\nfatal: repository 'https://x-access-token:fresh-tok@github.com/acme/app.git/' not found";
+    const FRESH_INPUTS = { ...BASE_INPUTS, orchestratorUrl: "https://orchestrator.example", machineNonce: "n" };
+
+    const mockLsRemote = (failures: number, stderr = NOT_FOUND) => {
+      let calls = 0;
+      vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+        const gitArgs = args as string[];
+        if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n");
+        if (gitArgs[0] === "rev-parse") return spawnResult(0, "abc123\n");
+        if (gitArgs[0] === "show") return spawnResult(0, "M\tsrc/app.ts\n");
+        if (gitArgs[0] === "ls-remote") {
+          calls++;
+          return calls <= failures ? spawnResult(128, "", stderr) : spawnResult(0, `beadfeed\t${gitArgs.at(-1)}\n`);
+        }
+        return spawnResult(0);
+      });
+      return () => calls;
+    };
+    const vend = () => {
+      vi.mocked(fetch).mockReset();
+      vi.mocked(fetch).mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ token: "fresh-tok" }) } as Response);
+      vi.mocked(fetch).mockResolvedValue({
+        ok: true, status: 201,
+        json: async () => ({ html_url: "https://github.com/acme/app/pull/7", number: 7 }),
+        text: async () => "",
+      } as Response);
+    };
+    const sleeps = () => vi.mocked(sleepAsync).mock.calls.map((c) => c[0]);
+
+    it("continues when ls-remote fails twice then succeeds, logging each failed attempt", async () => {
+      vend();
+      const calls = mockLsRemote(2);
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        await expect(pushStep.run(makeContext(), FRESH_INPUTS, new NoopStepReporter())).resolves.toMatchObject({ prNumber: 7 });
+        const lines = errSpy.mock.calls.map((c) => String(c[0])).filter((l) => l.startsWith("[push] ls-remote attempt"));
+        expect(lines).toHaveLength(2);
+        expect(lines[0]).toContain("attempt 1/5 failed: remote: Repository not found");
+        expect(lines.join("\n")).not.toContain("fresh-tok");
+        expect(lines.join("\n")).toContain("***");
+      } finally {
+        errSpy.mockRestore();
+      }
+      expect(calls()).toBe(3);
+      expect(sleeps()).toEqual([1000, 2000]);
+    });
+
+    it("throws GIT_AUTH_FRESH_TOKEN after five failed attempts on the 1/2/4/8 s schedule", async () => {
+      vend();
+      const calls = mockLsRemote(99);
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      let caught: (Error & { failure?: FailureRecord }) | undefined;
+      try {
+        await pushStep.run(makeContext(), FRESH_INPUTS, new NoopStepReporter());
+      } catch (e) {
+        caught = e as typeof caught;
+      } finally {
+        errSpy.mockRestore();
+      }
+      expect(calls()).toBe(5);
+      expect(sleeps()).toEqual([1000, 2000, 4000, 8000]);
+      expect(caught?.message).toMatch(/git ls-remote failed after 5 attempts/);
+      expect(caught?.message).not.toContain("fresh-tok");
+      expect(caught?.failure).toMatchObject({
+        category: "transient",
+        code: "GIT_AUTH_FRESH_TOKEN",
+        stage: "push",
+        retryable: false,
+      });
+    });
+
+    it("keeps the classifier's record for a non-auth failure after a refresh", async () => {
+      vend();
+      mockLsRemote(99, "fatal: unable to access: Could not resolve host: github.com");
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      let caught: (Error & { failure?: FailureRecord }) | undefined;
+      try {
+        await pushStep.run(makeContext(), FRESH_INPUTS, new NoopStepReporter());
+      } catch (e) {
+        caught = e as typeof caught;
+      } finally {
+        errSpy.mockRestore();
+      }
+      expect(caught?.failure?.code).toBe("GIT_REMOTE_TRANSIENT");
+    });
+
+    it("keeps the short schedule and the unclassified error on the boot token", async () => {
+      const calls = mockLsRemote(99);
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      let caught: (Error & { failure?: FailureRecord }) | undefined;
+      try {
+        await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+      } catch (e) {
+        caught = e as typeof caught;
+      } finally {
+        errSpy.mockRestore();
+      }
+      expect(calls()).toBe(3);
+      expect(sleeps()).toEqual([250, 1000]);
+      expect(caught?.message).toMatch(/git ls-remote failed after 3 attempts/);
+      expect(caught?.failure).toBeUndefined();
+    });
   });
 
   it("logs the credential source of the push and never the token (AII-922)", async () => {
