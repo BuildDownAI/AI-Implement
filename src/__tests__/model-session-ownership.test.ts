@@ -149,7 +149,9 @@ describe("state transitions", () => {
     importFor(r);
     expect(o.markRunning(r)).toEqual({ status: "ok", state: "running", idempotent: false });
     expect(o.markRunning(r)).toEqual({ status: "ok", state: "running", idempotent: true });
-    expect(o.markCheckpointed(r)).toMatchObject({ status: "ok" }); // import at seq 0 by this generation counts
+    expect(o.markCheckpointed(r)).toEqual({ status: "rejected", reason: "checkpoint_missing" }); // an import is not a runner checkpoint
+    expect(store.checkpoint({ profileId: r.profileId, ownerGeneration: r.generation, stateSequence: 1, sessionData: `${SENTINEL}-1` }).ok).toBe(true);
+    expect(o.markCheckpointed(r)).toMatchObject({ status: "ok", state: "checkpointed", idempotent: false });
     expect(o.markCheckpointed(r)).toEqual({ status: "ok", state: "checkpointed", idempotent: true });
     expect(o.beginStop(r).status).toBe("ok");
     expect(o.beginStop(r)).toEqual({ status: "ok", state: "stopping", idempotent: true });
@@ -267,6 +269,17 @@ describe("release after termination", () => {
     expect(await o.releaseAfterTermination(r2)).toEqual({ status: "held", cause: "checkpoint_missing" });
     expect(o.snapshot("p1")?.state).toBe("recovery_required");
     expect(o.reserve({ dispatchId: "d3", profiles: [sub("p1")] }).status).toBe("queued");
+  });
+
+  it("import-only state at the current generation is not a checkpoint", async () => {
+    const r = reserve1("d1");
+    importFor(r);
+    o.markRunning(r);
+    expect(o.markCheckpointed(r)).toEqual({ status: "rejected", reason: "checkpoint_missing" });
+    o.beginStop(r);
+    expect(await o.releaseAfterTermination(r)).toEqual({ status: "held", cause: "checkpoint_missing" });
+    expect(o.snapshot("p1")?.state).toBe("recovery_required");
+    expect(o.reserve({ dispatchId: "d2", profiles: [sub("p1")] }).status).toBe("queued");
   });
 
   it("an unusable key requires reauthentication, not release", async () => {
