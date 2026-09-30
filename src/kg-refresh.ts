@@ -609,6 +609,8 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
    * re-post. Bounded to MAX_TRACKED_PRS entries, oldest evicted first; a PR-scoped
    * cache has no other natural expiry.
    */
+  // Nothing writes this map after AII-685, so `reportDryRun` always returns false
+  // until AII-730 restores the write.
   const dryRunOutcomesByPr = new Map<string, { sha: string; outcome: RefreshOutcome }>();
 
   /** Fires every registered onRefreshSettled listener; a listener's own error never stops the others. */
