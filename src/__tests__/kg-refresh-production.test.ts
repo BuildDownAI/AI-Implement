@@ -420,7 +420,7 @@ describe("resolveRunWatchAwakeable", () => {
     const ok = await resolveRunWatchAwakeable("sign_1abc/def", "success", "delivery-7", {
       baseUrl: "http://ingress.test", fetchImpl: fetchImpl as unknown as typeof fetch,
     });
-    expect(ok).toBe(true);
+    expect(ok).toBe("resolved");
     const [url, init] = fetchImpl.mock.calls[0] as unknown as [string, RequestInit];
     expect(url).toBe("http://ingress.test/restate/awakeables/sign_1abc%2Fdef/resolve");
     expect(init.method).toBe("POST");
@@ -428,8 +428,10 @@ describe("resolveRunWatchAwakeable", () => {
     expect(JSON.parse(init.body as string)).toEqual({ conclusion: "success" });
   });
 
-  it("returns false on a non-2xx answer or a network failure", async () => {
-    expect(await resolveRunWatchAwakeable("a", "success", "d", { fetchImpl: (async () => new Response("", { status: 500 })) as typeof fetch })).toBe(false);
-    expect(await resolveRunWatchAwakeable("a", "success", "d", { fetchImpl: (async () => { throw new Error("down"); }) as typeof fetch })).toBe(false);
+  it("returns failed on a 5xx answer or a network failure, gone on 404/409", async () => {
+    expect(await resolveRunWatchAwakeable("a", "success", "d", { fetchImpl: (async () => new Response("", { status: 500 })) as typeof fetch })).toBe("failed");
+    expect(await resolveRunWatchAwakeable("a", "success", "d", { fetchImpl: (async () => { throw new Error("down"); }) as typeof fetch })).toBe("failed");
+    expect(await resolveRunWatchAwakeable("a", "success", "d", { fetchImpl: (async () => new Response("", { status: 404 })) as typeof fetch })).toBe("gone");
+    expect(await resolveRunWatchAwakeable("a", "success", "d", { fetchImpl: (async () => new Response("", { status: 409 })) as typeof fetch })).toBe("gone");
   });
 });

@@ -49,6 +49,8 @@ export const KG_REFRESH_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 /** How often the GHA backend's watch loop polls the dispatched run's status. The run's conclusion
  *  normally arrives through the `workflow_run` webhook (an awakeable); this tick is the backstop for a lost delivery. */
 export const KG_REFRESH_WATCH_INTERVAL_MS = 10 * 60 * 1000;
+/** Tick while the run id is still unknown: each one is a `reconcile-N` attempt, so the bootstrap deadline allows about ten of them. */
+export const KG_REFRESH_RECONCILE_INTERVAL_MS = 60 * 1000;
 /** Ceiling on the poll interval while confirming a cancelled run ended — no awakeable arm there, so it stays short. */
 const KG_REFRESH_CANCEL_WATCH_INTERVAL_MS = 60 * 1000;
 
@@ -126,6 +128,8 @@ export interface KgRefreshWorkflowDependencies {
   findRunByTitle(title: string): Promise<{ runId: number } | null>;
   /** Records which awakeable the `workflow_run` webhook must resolve for this GitHub run. Idempotent on `runId`. */
   registerRunWatch(input: { runId: number; awakeableId: string }): void | Promise<void>;
+  /** Drops the run-watch row; idempotent. The webhook deletes it on resolve, but an unsubscribed App never delivers. */
+  forgetRunWatch(runId: number): void | Promise<void>;
   cancelWorkflowRun(runId: number): Promise<boolean>;
   persistLastRefresh(outcome: RefreshOutcome): void;
   onOutcome(kind: "success" | "failure", outcome: RefreshOutcome): void | Promise<void>;
@@ -140,6 +144,8 @@ export interface KgRefreshWorkflowDependencies {
   totalDeadlineMs?: number;
   /** Overrides `KG_REFRESH_WATCH_INTERVAL_MS` for a deterministic watch-loop test. Production leaves this unset. */
   watchIntervalMs?: number;
+  /** Overrides `KG_REFRESH_RECONCILE_INTERVAL_MS` for a deterministic cadence test. Production leaves this unset. */
+  reconcileIntervalMs?: number;
   /** Invoked, via its own `ctx.run` entry, once the "stage" gate's own result is already
    *  durable — before "swap" begins. A fault-injection test uses this to simulate a process
    *  crash in that exact window: the four gate functions convert any dependency throw into a
@@ -195,6 +201,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
   const totalDeadlineMs = deps.totalDeadlineMs ?? KG_REFRESH_TOTAL_DEADLINE_MS;
   const watchIntervalMs = deps.watchIntervalMs ?? KG_REFRESH_WATCH_INTERVAL_MS;
   const cancelWatchIntervalMs = Math.min(watchIntervalMs, KG_REFRESH_CANCEL_WATCH_INTERVAL_MS);
+  const reconcileIntervalMs = Math.min(watchIntervalMs, deps.reconcileIntervalMs ?? KG_REFRESH_RECONCILE_INTERVAL_MS);
 
   async function runGate(
     ctx: WorkflowContext,
@@ -230,7 +237,14 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
     const dispatchId = triggerId;
     const jobId = dispatchId;
 
+    /** The run whose watch row this invocation registered; `finish` forgets it on every terminal path. */
+    let registeredRunId: number | undefined;
+
     async function finish(outcome: RefreshOutcome): Promise<RefreshOutcome> {
+      if (registeredRunId !== undefined) {
+        const forgetId = registeredRunId;
+        await ctx.run("forget-run-watch", () => deps.forgetRunWatch(forgetId));
+      }
       ctx.set("completed", true);
       ctx.objectSendClient<KgRepoDefinition>({ name: "KgRepo" }, deps.kgSourceRepo).release({ triggerId });
       return outcome;
@@ -323,17 +337,21 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           if (isGha) {
             // Once the run id is known (straight from dispatch, or found by reconcile), hand the
             // webhook an awakeable for it — created and registered exactly once per run.
-            if (runId !== undefined && runDoneArm === undefined) {
-              const { id, promise } = ctx.awakeable<{ conclusion: string | null }>();
-              const watchedRunId = runId;
-              await ctx.run("register-run-watch", () => deps.registerRunWatch({ runId: watchedRunId, awakeableId: id }));
+            const watchRunId = runId;
+            async function ensureRunWatch(id: number): Promise<void> {
+              if (runDoneArm !== undefined) return;
+              const { id: awakeableId, promise } = ctx.awakeable<{ conclusion: string | null }>();
+              await ctx.run("register-run-watch", () => deps.registerRunWatch({ runId: id, awakeableId }));
+              registeredRunId = id;
               runDoneArm = promise.map((value): WaitArm => ({ kind: "run_done", conclusion: value?.conclusion ?? null }));
             }
+            if (watchRunId !== undefined) await ensureRunWatch(watchRunId);
             if (runId === undefined) {
               const found = await ctx.run(`reconcile-${reconcileIndex++}`, () => deps.findRunByTitle(issueIdentifier));
               if (found) {
                 runId = found.runId;
                 ctx.set("runId", runId);
+                await ensureRunWatch(runId);
               }
             } else {
               const status = await ctx.run(`watch-${watchIndex++}`, () => deps.getWorkflowRunStatus(runId!));
@@ -350,7 +368,8 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           if (now >= deadlineAt) {
             return progressSeen ? { kind: "total_timeout" } : { kind: "bootstrap_timeout" };
           }
-          const tick = Math.min(deadlineAt - now, watchIntervalMs);
+          // Until the awakeable is registered nothing else ends the wait early, so stay on the reconcile cadence.
+          const tick = Math.min(deadlineAt - now, isGha && runDoneArm === undefined ? reconcileIntervalMs : watchIntervalMs);
 
           const reportArm = ctx.promise<KgRefreshReportBody>("report").get()
             .map((value): WaitArm => ({ kind: "report", value: value! }));

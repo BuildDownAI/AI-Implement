@@ -4834,6 +4834,7 @@ function startServer(
         lookup: lookupRunWatch,
         resolve: resolveRunWatchAwakeable,
         forget: forgetRunWatch,
+        kgSourceRepo: config.kgSourceRepo ?? undefined,
       }).catch((err) => {
         console.error("[webhook] Unhandled error:", err);
         if (!res.headersSent) {

@@ -88,6 +88,7 @@ export interface KgRefreshProductionInput {
   findRunByTitle: KgRefreshWorkflowDependencies["findRunByTitle"];
   /** Defaults to a `settings` row per run id (`runWatchKey`). */
   registerRunWatch?: KgRefreshWorkflowDependencies["registerRunWatch"];
+  forgetRunWatch?: KgRefreshWorkflowDependencies["forgetRunWatch"];
   cancelWorkflowRun: KgRefreshWorkflowDependencies["cancelWorkflowRun"];
   persistLastRefresh: (outcome: RefreshOutcome) => void;
   /** `handleKgRefreshOutcome` with `config` and the provider registry already applied. */
@@ -216,7 +217,7 @@ export async function resolveRunWatchAwakeable(
   conclusion: string | null,
   idempotencyKey?: string,
   deps: { baseUrl?: string; fetchImpl?: typeof fetch; timeoutMs?: number } = {},
-): Promise<boolean> {
+): Promise<"resolved" | "gone" | "failed"> {
   try {
     const res = await (deps.fetchImpl ?? fetch)(
       `${deps.baseUrl ?? RESTATE_INGRESS_BASE_URL}/restate/awakeables/${encodeURIComponent(awakeableId)}/resolve`,
@@ -227,9 +228,10 @@ export async function resolveRunWatchAwakeable(
         signal: AbortSignal.timeout(deps.timeoutMs ?? INGRESS_TIMEOUT_MS),
       },
     );
-    return res.ok;
+    if (res.ok) return "resolved";
+    return res.status === 404 || res.status === 409 ? "gone" : "failed";
   } catch {
-    return false;
+    return "failed";
   }
 }
 
@@ -305,6 +307,7 @@ export function createProductionKgRefreshServices(
     getWorkflowRunStatus: input.getWorkflowRunStatus,
     findRunByTitle: input.findRunByTitle,
     registerRunWatch: input.registerRunWatch ?? registerRunWatch,
+    forgetRunWatch: input.forgetRunWatch ?? forgetRunWatch,
     cancelWorkflowRun: input.cancelWorkflowRun,
     persistLastRefresh: input.persistLastRefresh,
     onOutcome: (kind, outcome) => {

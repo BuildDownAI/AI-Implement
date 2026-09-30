@@ -394,13 +394,18 @@ function findMatchingDispatch(repo: string, branch?: string, prUrl?: string, prN
 /** The kg-refresh run watch: GitHub run id -> the `KgRefresh` awakeable waiting on it. */
 export interface RunWatchHooks {
   lookup(runId: number): string | null;
-  /** Resolves the awakeable with the run's conclusion; `idempotencyKey` is the webhook delivery id. */
-  resolve(awakeableId: string, conclusion: string | null, idempotencyKey?: string): Promise<boolean>;
+  /** Resolves the awakeable with the run's conclusion; `idempotencyKey` is the webhook delivery id.
+   *  `gone` means ingress answered 404/409: the awakeable is already resolved or its workflow has ended.
+   *  `failed` is a connection failure or any other error — worth a redelivery. */
+  resolve(awakeableId: string, conclusion: string | null, idempotencyKey?: string): Promise<"resolved" | "gone" | "failed">;
   forget(runId: number): void;
+  /** `owner/repo` of the KG source; a delivery from any other repository is ignored. */
+  kgSourceRepo?: string;
 }
 
 interface WorkflowRunPayload {
   action?: string;
+  repository?: { full_name?: string };
   workflow_run?: { id?: number; conclusion?: string | null };
 }
 
@@ -416,7 +421,11 @@ async function handleWorkflowRunWebhook(
   deliveryId?: string,
 ): Promise<void> {
   const runId = payload.workflow_run?.id;
-  const awakeableId = payload.action === "completed" && runWatch && typeof runId === "number" ? runWatch.lookup(runId) : null;
+  const fromKgSource = !!runWatch?.kgSourceRepo
+    && payload.repository?.full_name?.toLowerCase() === runWatch.kgSourceRepo.toLowerCase();
+  const awakeableId = payload.action === "completed" && runWatch && fromKgSource && typeof runId === "number"
+    ? runWatch.lookup(runId)
+    : null;
   if (!runWatch || typeof runId !== "number" || !awakeableId) {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ignored: true }));
@@ -424,11 +433,12 @@ async function handleWorkflowRunWebhook(
   }
   const conclusion = payload.workflow_run?.conclusion ?? null;
   const resolved = await runWatch.resolve(awakeableId, conclusion, deliveryId);
-  console.log(`[webhook] workflow_run ${runId} completed (${conclusion ?? "unknown"}): kg-refresh watch ${resolved ? "resolved" : "resolve failed"}${deliveryId ? ` (delivery ${deliveryId})` : ""}`);
-  if (resolved) {
+  console.log(`[webhook] workflow_run ${runId} completed (${conclusion ?? "unknown"}): kg-refresh watch ${resolved === "failed" ? "resolve failed" : resolved}${deliveryId ? ` (delivery ${deliveryId})` : ""}`);
+  if (resolved !== "failed") {
+    // "gone": already resolved or the workflow ended — nothing left to wake, and a redelivery could not help.
     runWatch.forget(runId);
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ resolved: true }));
+    res.end(JSON.stringify(resolved === "resolved" ? { resolved: true } : { resolved: false, gone: true }));
   } else {
     // Keep the row so GitHub's redelivery can retry; the backstop poll still ends the watch meanwhile.
     res.writeHead(502, { "Content-Type": "application/json" });
