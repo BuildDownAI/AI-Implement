@@ -19,7 +19,7 @@ const STALE_MARGIN_MS = FRESH_WINDOW_MS - KG_REFRESH_TOTAL_DEADLINE_MS;
 
 interface RunSend {
   key: string;
-  parameter: { triggerId: string; dryRun?: boolean; ref?: string; report?: { repo: string; prNumber: number; sha: string } };
+  parameter: { triggerId: string; dryRun?: boolean; kgSourceRef?: string; acceptNewBaseline?: boolean; report?: { repo: string; prNumber: number; sha: string } };
 }
 
 describe("KgRepo durable single-flight lock", () => {
@@ -212,7 +212,7 @@ describe("KgRepo durable single-flight lock", () => {
       expect(runSends.length - before).toBe(1);
       expect(runSends[runSends.length - 1]).toEqual({
         key: triggerId,
-        parameter: { dryRun: true, ref: "br1", report: reportFor(1, "sha-br1"), triggerId },
+        parameter: { dryRun: true, kgSourceRef: "br1", report: reportFor(1, "sha-br1"), triggerId },
       });
     },
   );
@@ -236,7 +236,7 @@ describe("KgRepo durable single-flight lock", () => {
       await until(() => runSends.length - before >= 2);
       expect(runSends.length - before).toBe(2);
       const head = runSends[runSends.length - 1].parameter;
-      expect(head).toMatchObject({ dryRun: true, ref: "new", report: reportFor(5, "sha-new") });
+      expect(head).toMatchObject({ dryRun: true, kgSourceRef: "new", report: reportFor(5, "sha-new") });
       // the drained head is now the in-flight refresh under a fresh id, with nothing pending
       expect(head.triggerId).not.toBe(triggerId);
       expect(await repoStatus(env.baseUrl(), slug)).toMatchObject({ triggerId: head.triggerId, pending: [] });
@@ -262,12 +262,12 @@ describe("KgRepo durable single-flight lock", () => {
       await release(env.baseUrl(), slug, (first as { triggerId: string }).triggerId);
       await until(() => runSends.length - before >= 2);
       const second = runSends[runSends.length - 1].parameter;
-      expect(second.ref).toBe("a");
+      expect(second.kgSourceRef).toBe("a");
 
       await release(env.baseUrl(), slug, second.triggerId);
       await until(() => runSends.length - before >= 3);
       const third = runSends[runSends.length - 1].parameter;
-      expect(third.ref).toBe("b");
+      expect(third.kgSourceRef).toBe("b");
 
       await release(env.baseUrl(), slug, third.triggerId);
       await new Promise((resolve) => setTimeout(resolve, 500));
@@ -337,12 +337,49 @@ describe("KgRepo durable single-flight lock", () => {
   );
 
   it.each(VARIANTS.map(([label]) => label))(
-    "enqueueDryRun rejects input missing its key, ref, or report (%s)",
+    "enqueueDryRun rejects input missing its key, ref, or report, leaving no state (%s)",
     async (label) => {
       const env = envFor(label);
+      const slug = newKey();
+      const before = runSends.length;
       await expect(
-        callObject(env.baseUrl(), "KgRepo", newKey(), "enqueueDryRun", { key: "org/kg-source#1", ref: "br" }),
+        callObject(env.baseUrl(), "KgRepo", slug, "enqueueDryRun", { ref: "br", report: reportFor(1) }),
       ).rejects.toThrow();
+      await expect(
+        callObject(env.baseUrl(), "KgRepo", slug, "enqueueDryRun", { key: "org/kg-source#1", ref: "br" }),
+      ).rejects.toThrow();
+      expect(await repoStatus(env.baseUrl(), slug)).toBeNull();
+      expect(runSends.length).toBe(before);
+    },
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "trigger forwards acceptNewBaseline and kgSourceRef to the run (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const before = runSends.length;
+      const result = await callObject<{ triggerId: string }>(env.baseUrl(), "KgRepo", newKey(), "trigger", {
+        acceptNewBaseline: true, kgSourceRef: "x",
+      });
+      await until(() => runSends.length - before >= 1);
+      expect(runSends[runSends.length - 1]).toEqual({
+        key: result.triggerId,
+        parameter: { acceptNewBaseline: true, kgSourceRef: "x", triggerId: result.triggerId },
+      });
+    },
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "trigger with an unknown option is a terminal error and leaves no marker (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const slug = newKey();
+      const before = runSends.length;
+      await expect(
+        callObject(env.baseUrl(), "KgRepo", slug, "trigger", { ref: "x" }),
+      ).rejects.toThrow();
+      expect(await repoStatus(env.baseUrl(), slug)).toBeNull();
+      expect(runSends.length).toBe(before);
     },
   );
 
@@ -361,7 +398,7 @@ describe("KgRepo durable single-flight lock", () => {
         const result = await enqueue(env.baseUrl(), slug, 2, "now");
         expect(result).toEqual({ triggerId: expect.any(String) });
         await until(() => runSends.length - before >= 2);
-        expect(runSends[runSends.length - 1].parameter).toMatchObject({ ref: "now" });
+        expect(runSends[runSends.length - 1].parameter).toMatchObject({ kgSourceRef: "now" });
         expect((await repoStatus(env.baseUrl(), slug))?.pending).toEqual(["org/kg-source#1"]);
       } finally {
         warnSpy.mockRestore();

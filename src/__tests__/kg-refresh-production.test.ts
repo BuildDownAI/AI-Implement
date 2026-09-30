@@ -217,6 +217,27 @@ describe("GHA dispatch wrapper", () => {
     expect(result).toEqual({ outcome: "accepted", runId: 99, runUrl: "https://gh/run/99", jobId: "99", executionMode: "github-actions" });
   });
 
+  it("carries kgSourceRef, accept-baseline and the actor into the envelope, and the ref into the GHA dispatch", async () => {
+    postWorkflowDispatch.mockResolvedValue({ success: true, status: 200, outcome: "accepted", runId: 5 });
+    await createKgRefreshDispatch(makeInput())({
+      ...dispatchInput,
+      runConfig: { triggerId: "t-1", kgSourceRef: "pr-head", acceptNewBaseline: true, actorEmail: "a@b" },
+    });
+    const call = postWorkflowDispatch.mock.calls[0][0];
+    expect(call.ref).toBe("pr-head");
+    expect(decodeRunConfig(call.inputs.run_config)).toMatchObject({
+      kgSourceRef: "pr-head", kgAcceptNewBaseline: true, kgBaselineActor: "a@b",
+    });
+  });
+
+  it("omits the accept-baseline keys when the options are unset", async () => {
+    postWorkflowDispatch.mockResolvedValue({ success: true, status: 200, outcome: "accepted", runId: 5 });
+    await createKgRefreshDispatch(makeInput())({ ...dispatchInput, runConfig: { triggerId: "t-1" } });
+    const decoded = decodeRunConfig(postWorkflowDispatch.mock.calls[0][0].inputs.run_config);
+    expect(decoded).not.toHaveProperty("kgAcceptNewBaseline");
+    expect(decoded).not.toHaveProperty("kgBaselineActor");
+  });
+
   it("sends run_publication_token when the probe reports support", async () => {
     postWorkflowDispatch.mockResolvedValue({ success: true, status: 200, outcome: "accepted", runId: 1 });
     const probe = vi.fn(async () => ({ contract: "envelope", supportsRunPublicationToken: true, supportsAttemptCorrelation: false }));
@@ -284,6 +305,11 @@ describe("createKgRefreshIngressClient", () => {
   it("maps other 4xx (including a missing handler) and 5xx to unavailable", async () => {
     expect(await clientWith(respond(404, "no such handler")).enqueueDryRun("acme/kg", { key: "acme/kg#1", ref: "br", report: { repo: "acme/kg", prNumber: 1, sha: "s" } })).toEqual({ status: "unavailable" });
     expect(await clientWith(respond(503, "down")).status("t-1")).toEqual({ status: "unavailable" });
+  });
+
+  it("maps a 404 from KgRefresh to not-found but keeps a KgRepo 404 unavailable", async () => {
+    expect(await clientWith(respond(404, "{}")).progress("t-1")).toEqual({ status: "not-found" });
+    expect(await clientWith(respond(404, "{}")).repoStatus("acme/kg")).toEqual({ status: "unavailable" });
   });
 
   it("maps a rejected fetch, a timeout, and a bad body to unavailable without throwing", async () => {

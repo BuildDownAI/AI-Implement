@@ -68,9 +68,9 @@ What one stray use of each credential destroys, and where the symptom appears.
 
 ## kg-refresh report retried after the run finished (AII-896)
 
-The kg-refresh callback resolves the `KgRefresh` workflow key from the `KgRepo` marker (`resolveKgRefreshTrigger`, `src/runner-callback.ts`). A report retried after the run finished and `KgRepo.release` cleared the marker answers **`409 no-refresh-in-flight`**, observed in `kg-refresh-pilot.restate.test.ts` (P5). A duplicate while the run is live answers 200 and consumes nothing.
+The workflow key is the dispatch id: the kg-refresh callback addresses `KgRefresh/{dispatchId}` directly, with the dispatch id taken from the verified run-token claims, and never consults the `KgRepo` marker. A key no `run` has started under answers `404` from `report`/`progress`, which the callback maps to **`409 no-refresh-in-flight`**. A report retried after the run finished reaches the completed workflow: an identical body is a duplicate and answers 200, a different body is refused. A late report from an older run can therefore only address its own workflow, never the run that is current.
 
-**Acceptable for a runner retry after a lost 200.** A kg-refresh runner posts `/runner/result` once (`postRunnerResult` retries only pilot review-fix results), and by the time the marker is gone the workflow has already consumed the first report and recorded the outcome, so the 409 hides no lost data. If a future runner retry treats a non-2xx as failure, the callback should answer 200 when the token verifies and no marker exists. That is a callback change, deliberately not made in AII-896; it is flagged for the AII-685 gap analysis as an option, not a requirement.
+**Acceptable for a runner retry after a lost 200.** A kg-refresh runner posts `/runner/result` once (`postRunnerResult` retries only pilot review-fix results), and the workflow has already consumed the first report and recorded the outcome by the time a retry could arrive.
 
 ## Pilot result retries (AII-794)
 

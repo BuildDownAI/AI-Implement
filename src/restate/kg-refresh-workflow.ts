@@ -19,6 +19,8 @@
  */
 import * as restate from "@restatedev/restate-sdk";
 import type { WorkflowContext, WorkflowSharedContext } from "@restatedev/restate-sdk";
+import { serde } from "@restatedev/restate-sdk-zod";
+import { z } from "zod";
 import type { KgDryRunReportTarget, RefreshGate, RefreshOutcome } from "../kg-refresh.js";
 import {
   type KgRailDeps,
@@ -49,12 +51,29 @@ export const KG_REFRESH_WATCH_INTERVAL_MS = 60 * 1000;
 
 const GHA_EXECUTION_MODE = "github-actions";
 
-export interface KgRefreshRunInput {
-  triggerId: string;
-  dryRun?: boolean;
-  kgSourceRef?: string;
-  report?: KgDryRunReportTarget;
-}
+/** The PR a dry-run reports back to — the wire shape of `KgDryRunReportTarget` (`src/webhook.ts`), `acceptBaseline` included so it is not stripped. */
+export const kgDryRunReportSchema = z.object({
+  repo: z.string(),
+  prNumber: z.number(),
+  sha: z.string(),
+  acceptBaseline: z.boolean().optional(),
+});
+
+/** Options a caller may set on one refresh; `KgRepo.trigger` validates exactly these. */
+export const kgRefreshOptionsSchema = z.object({
+  dryRun: z.boolean().optional(),
+  kgSourceRef: z.string().optional(),
+  acceptNewBaseline: z.boolean().optional(),
+  actorEmail: z.string().optional(),
+}).strict();
+
+/** The `KgRefresh.run` input — `KgRepo.submit` sends `{ ...options, triggerId }`. */
+export const kgRefreshRunInputSchema = kgRefreshOptionsSchema.extend({
+  triggerId: z.string(),
+  report: kgDryRunReportSchema.optional(),
+}).strict();
+
+export type KgRefreshRunInput = z.infer<typeof kgRefreshRunInputSchema> & { report?: KgDryRunReportTarget };
 
 export interface KgRefreshReportBody {
   ok: boolean;
@@ -170,6 +189,8 @@ function parseGateFailure(message: string): { gate: RefreshGate; detail: string 
 
 /** Prefix of the `TerminalError` `report` throws for a second, different body; the ingress client matches on it. */
 export const KG_CONFLICTING_REPORT_MESSAGE_PREFIX = "conflicting report";
+/** Message of the 404 `TerminalError` `report`/`progress` throw for a key no `run` has started under. */
+export const KG_REFRESH_NOT_FOUND_MESSAGE = "kg-refresh workflow not found";
 
 export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
   const { owner, repo: repoName } = parseKgSourceRepo(deps.kgSourceRepo);
@@ -207,7 +228,8 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
     ctx.set("dryRun", input.dryRun === true);
     ctx.set("step", "reserve");
 
-    const dispatchId = ctx.rand.uuidv4();
+    // The workflow key is the dispatch id, so a runner callback addresses `KgRefresh/{dispatchId}` directly.
+    const dispatchId = triggerId;
     const jobId = dispatchId;
 
     async function finish(outcome: RefreshOutcome): Promise<RefreshOutcome> {
@@ -552,8 +574,16 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
     }
   }
 
+  /** A callback for a key whose `run` never started must not pre-resolve a promise a later `run` would consume. */
+  async function requireStarted(ctx: WorkflowSharedContext): Promise<void> {
+    if ((await ctx.get<string>("triggerId")) == null) {
+      throw new restate.TerminalError(KG_REFRESH_NOT_FOUND_MESSAGE, { errorCode: 404 });
+    }
+  }
+
   async function report(ctx: WorkflowSharedContext, raw: unknown): Promise<{ status: "accepted" | "duplicate" }> {
     const body = raw as KgRefreshReportBody;
+    await requireStarted(ctx);
     const promise = ctx.promise<KgRefreshReportBody>("report");
     const existing = await promise.peek();
     const isDuplicate = existing !== undefined && JSON.stringify(existing) === JSON.stringify(body);
@@ -577,11 +607,13 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
   }
 
   async function progress(ctx: WorkflowSharedContext): Promise<void> {
+    await requireStarted(ctx);
     const promise = ctx.promise<boolean>("progress");
     if (await promise.peek() === undefined) await promise.resolve(true);
   }
 
   async function cancel(ctx: WorkflowSharedContext, raw: { reason?: string }): Promise<void> {
+    await requireStarted(ctx);
     const reason = raw?.reason ?? "cancelled";
     const promise = ctx.promise<string>("cancel");
     if (await promise.peek() === undefined) await promise.resolve(reason);
@@ -601,7 +633,10 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
   return restate.workflow({
     name: "KgRefresh",
     handlers: {
-      run: restate.handlers.workflow.workflow({ journalRetention: KG_REFRESH_RETENTION_MS }, run),
+      run: restate.handlers.workflow.workflow({
+        input: serde.zod(kgRefreshRunInputSchema),
+        journalRetention: KG_REFRESH_RETENTION_MS,
+      }, run),
       report: restate.handlers.workflow.shared({
         journalRetention: KG_REFRESH_RETENTION_MS,
         idempotencyRetention: KG_REFRESH_RETENTION_MS,

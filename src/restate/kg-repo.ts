@@ -18,8 +18,16 @@
  */
 import * as restate from "@restatedev/restate-sdk";
 import type { ObjectContext, ObjectSharedContext } from "@restatedev/restate-sdk";
+import { serde } from "@restatedev/restate-sdk-zod";
+import { z } from "zod";
 import { MAX_TRACKED_PRS, type KgDryRunReportTarget } from "../kg-refresh.js";
-import { KG_REFRESH_TOTAL_DEADLINE_MS, KG_REPO_STALE_MARGIN_MS } from "./kg-refresh-workflow.js";
+import {
+  KG_REFRESH_TOTAL_DEADLINE_MS,
+  KG_REPO_STALE_MARGIN_MS,
+  kgDryRunReportSchema,
+  kgRefreshOptionsSchema,
+  type KgRefreshRunInput,
+} from "./kg-refresh-workflow.js";
 
 interface InFlightMarker {
   triggerId: string;
@@ -44,23 +52,16 @@ export type KgRepoTriggerResult = { triggerId: string } | { status: "refresh-in-
 
 export type KgRepoEnqueueResult = { triggerId: string } | { queued: true };
 
-export interface KgRepoEnqueueInput {
-  key: string;
-  ref: string;
-  report: KgDryRunReportTarget;
-}
+const triggerInputSchema = kgRefreshOptionsSchema.optional();
 
-function validateEnqueueInput(input: unknown): KgRepoEnqueueInput {
-  const i = input as Partial<KgRepoEnqueueInput> | null | undefined;
-  const r = i?.report;
-  if (
-    !i || typeof i.key !== "string" || i.key === "" || typeof i.ref !== "string" || i.ref === "" ||
-    !r || typeof r.repo !== "string" || typeof r.prNumber !== "number" || typeof r.sha !== "string"
-  ) {
-    throw new restate.TerminalError("enqueueDryRun requires { key, ref, report: { repo, prNumber, sha } }");
-  }
-  return i as KgRepoEnqueueInput;
-}
+const enqueueInputSchema = z.object({
+  key: z.string().min(1),
+  ref: z.string().min(1),
+  report: kgDryRunReportSchema,
+}).strict();
+
+export type KgRepoTriggerInput = z.infer<typeof kgRefreshOptionsSchema>;
+export type KgRepoEnqueueInput = z.infer<typeof enqueueInputSchema> & { report: KgDryRunReportTarget };
 
 /** The key of the oldest held entry; insertion order breaks an `enqueuedAt` tie. */
 function oldestPendingKey(pending: Record<string, PendingDryRun>): string | undefined {
@@ -69,6 +70,14 @@ function oldestPendingKey(pending: Record<string, PendingDryRun>): string | unde
     if (oldest === undefined || pending[k].enqueuedAt < pending[oldest].enqueuedAt) oldest = k;
   }
   return oldest;
+}
+
+/** The `KgRefresh.run` send parameter; typed so it cannot drift from `kgRefreshRunInputSchema`. */
+export function buildRunParameter(
+  opts: KgRepoTriggerInput & { report?: KgDryRunReportTarget },
+  triggerId: string,
+): KgRefreshRunInput {
+  return { ...opts, triggerId };
 }
 
 export function createKgRepo(deps: KgRepoDependencies) {
@@ -93,31 +102,31 @@ export function createKgRepo(deps: KgRepoDependencies) {
   }
 
   /** Marks a new refresh in flight and hands it to `KgRefresh.run` by one-way send. */
-  function submit(ctx: ObjectContext, now: number, opts: Record<string, unknown>): string {
+  function submit(ctx: ObjectContext, now: number, opts: KgRepoTriggerInput & { report?: KgDryRunReportTarget }): string {
     const triggerId = ctx.rand.uuidv4();
     ctx.set<InFlightMarker>("inFlight", { triggerId, startedAt: now });
     ctx.genericSend({
       service: deps.workflowName,
       method: "run",
       key: triggerId,
-      parameter: { ...opts, triggerId },
+      parameter: buildRunParameter(opts, triggerId),
       inputSerde: restate.serde.json,
     });
     return triggerId;
   }
 
-  async function trigger(ctx: ObjectContext, opts: Record<string, unknown> = {}): Promise<KgRepoTriggerResult> {
+  async function trigger(ctx: ObjectContext, opts: KgRepoTriggerInput = {}): Promise<KgRepoTriggerResult> {
     const now = await ctx.date.now();
     const live = await liveInFlight(ctx, now);
     if (live) return { status: "refresh-in-progress", triggerId: live.triggerId };
     return { triggerId: submit(ctx, now, opts) };
   }
 
-  async function enqueueDryRun(ctx: ObjectContext, raw: KgRepoEnqueueInput): Promise<KgRepoEnqueueResult> {
-    const { key, ref, report } = validateEnqueueInput(raw);
+  async function enqueueDryRun(ctx: ObjectContext, input: KgRepoEnqueueInput): Promise<KgRepoEnqueueResult> {
+    const { key, ref, report } = input;
     const now = await ctx.date.now();
     const live = await liveInFlight(ctx, now);
-    if (!live) return { triggerId: submit(ctx, now, { dryRun: true, ref, report }) };
+    if (!live) return { triggerId: submit(ctx, now, { dryRun: true, kgSourceRef: ref, report }) };
 
     const pending = (await ctx.get<Record<string, PendingDryRun>>("pending")) ?? {};
     // A newer head for the same PR replaces the held one and takes the back of the line.
@@ -142,7 +151,7 @@ export function createKgRepo(deps: KgRepoDependencies) {
     delete pending[headKey];
     if (Object.keys(pending).length === 0) ctx.clear("pending");
     else ctx.set("pending", pending);
-    submit(ctx, await ctx.date.now(), { dryRun: true, ref, report });
+    submit(ctx, await ctx.date.now(), { dryRun: true, kgSourceRef: ref, report });
   }
 
   async function status(ctx: ObjectSharedContext): Promise<(InFlightMarker & { pending: string[] }) | null> {
@@ -155,8 +164,8 @@ export function createKgRepo(deps: KgRepoDependencies) {
   return restate.object({
     name: "KgRepo",
     handlers: {
-      trigger,
-      enqueueDryRun,
+      trigger: restate.handlers.object.exclusive({ input: serde.zod(triggerInputSchema) }, trigger),
+      enqueueDryRun: restate.handlers.object.exclusive({ input: serde.zod(enqueueInputSchema) }, enqueueDryRun),
       release,
       status: restate.handlers.object.shared(status),
     },

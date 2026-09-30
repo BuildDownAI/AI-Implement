@@ -418,6 +418,7 @@ describe("KgRefresh durable workflow", () => {
       expect(outcome.ok).toBe(true);
       // one dispatch id names the token mint, the job-log row, and the dispatch itself
       const dispatchedId = dispatchedIds[beforeDispatched];
+      expect(dispatchedId).toBe(triggerId);
       expect(dispatchedIds.length - beforeDispatched).toBe(1);
       expect(mintedDispatchIds.slice(beforeMinted)).toEqual([dispatchedId]);
       // one journaled mint; dispatch received exactly the values the mint returned
@@ -1053,6 +1054,24 @@ describe("KgRefresh durable workflow", () => {
   );
 
   // ---- W18: registered deployment options ----
+  it.each(VARIANTS.map(([label]) => label))("a run call with a non-object input is rejected by the schema (%s)", async (label) => {
+    const env = envFor(label);
+    const response = await fetch(`${env.baseUrl()}/KgRefresh/bad-input/run`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify("nope"),
+    });
+    expect(response.ok).toBe(false);
+  });
+
+  it.each(VARIANTS.map(([label]) => label))("report and progress on a key no run started under answer 404 (%s)", async (label) => {
+    const env = envFor(label);
+    for (const handler of ["report", "progress"]) {
+      const response = await fetch(`${env.baseUrl()}/KgRefresh/never-started/${handler}`, {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(handler === "report" ? SUCCESS_REPORT : {}),
+      });
+      expect(response.status).toBe(404);
+    }
+  });
+
   it("W18: the registered workflow advertises seven-day retention and the two timeouts", async () => {
     const env = envFor("alwaysReplay");
     // Deploy metadata is only populated once the service has been invoked at least once.

@@ -143,6 +143,8 @@ export function createKgRefreshDispatch(input: KgRefreshProductionInput): (dispa
       ...(mapping?.dependencyTokenScope != null ? { dependencyTokenScope: mapping.dependencyTokenScope } : {}),
       ...(runConfig.dryRun ? { kgDryRun: true as const } : {}),
       ...(runConfig.kgSourceRef ? { kgSourceRef: runConfig.kgSourceRef } : {}),
+      ...(runConfig.acceptNewBaseline ? { kgAcceptNewBaseline: true as const } : {}),
+      ...(runConfig.actorEmail ? { kgBaselineActor: runConfig.actorEmail } : {}),
     };
     const encoded = encodeRunConfig(envelope);
 
@@ -305,6 +307,7 @@ export function createProductionKgRefreshServices(
 export type KgIngressResult<T = undefined> =
   | { readonly status: "accepted"; readonly value?: T }
   | { readonly status: "conflict" }
+  | { readonly status: "not-found" }
   | { readonly status: "unavailable" };
 
 export interface KgRefreshIngressClient {
@@ -318,7 +321,7 @@ export interface KgRefreshIngressClient {
     slug: string,
     entry: KgRepoEnqueueInput,
     opts?: { idempotencyKey?: string },
-  ): Promise<KgIngressResult<KgRepoEnqueueResult>>;
+  ): Promise<Exclude<KgIngressResult<KgRepoEnqueueResult>, { readonly status: "not-found" }>>;
 }
 
 export interface KgRefreshIngressClientDeps {
@@ -367,6 +370,7 @@ export function createKgRefreshIngressClient(
         // matched rather than a 4xx status. The JSON `message` is authoritative (matched with includes, so a Restate-added prefix such as the handler name
         // does not hide a real conflict); a body that
         // is not Restate's JSON error falls back to a substring match.
+        if (response.status === 404 && service === "KgRefresh") return { status: "not-found" };
         const message = restateErrorMessage(text);
         const conflict = message !== null ? message.includes(CONFLICT_MARKER) : text.includes(CONFLICT_MARKER);
         return conflict ? { status: "conflict" } : { status: "unavailable" };
@@ -384,7 +388,8 @@ export function createKgRefreshIngressClient(
     cancel: (triggerId, reason) => invoke("KgRefresh", triggerId, "cancel", { reason }),
     status: (triggerId) => invoke("KgRefresh", triggerId, "status", {}),
     repoStatus: (slug) => invoke("KgRepo", slug, "status", {}),
-    enqueueDryRun: (slug, entry, opts) => invoke("KgRepo", slug, "enqueueDryRun", entry, opts?.idempotencyKey),
+    enqueueDryRun: (slug, entry, opts) =>
+      invoke<KgRepoEnqueueResult>("KgRepo", slug, "enqueueDryRun", entry, opts?.idempotencyKey) as ReturnType<KgRefreshIngressClient["enqueueDryRun"]>,
   };
 }
 
