@@ -346,7 +346,7 @@ export class RestateSidecar {
 }
 
 /** Resolves the platform-specific @restatedev/restate-server-<os>-<arch> optional dependency's binary, if installed. */
-function resolvePlatformBinary(): string | null {
+export function resolvePlatformBinary(): string | null {
   const platformPackage = `@restatedev/restate-server-${os.platform()}-${os.arch()}`;
   try {
     return require.resolve(`${platformPackage}/bin/restate-server`);

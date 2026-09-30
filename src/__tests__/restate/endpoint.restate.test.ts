@@ -37,7 +37,7 @@ import { RESTATE_SERVICES, queryNonCompletedInvocations, register, restateBindAd
 import { orchestratorTools } from "../../restate/tools.js";
 import * as dedup from "../../dedup.js";
 import { initSettingsTable } from "../../runner-mode.js";
-import { RESTATE_IMAGE_VERSION, callObject, callService } from "./harness.js";
+import { RESTATE_IMAGE_VERSION, callObject, callService, restateTestRuntime } from "./harness.js";
 
 function sha256(value: string): string {
   return crypto.createHash("sha256").update(value).digest("hex");
@@ -84,7 +84,8 @@ function tunnelingFetch(realHostPort: string, tunnelHostPort: string): typeof fe
   }) as typeof fetch;
 }
 
-describe("startRestateEndpoint() / register() against a real server 1.7.10 (AII-727)", () => {
+// Builds its own RestateContainer, so it needs Docker (AII-914).
+describe.skipIf(restateTestRuntime() === "binary")("startRestateEndpoint() / register() against a real server 1.7.10 (AII-727)", () => {
   let server: http2.Http2Server;
   let port: number;
   let bindHost: string;

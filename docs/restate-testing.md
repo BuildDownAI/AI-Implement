@@ -8,7 +8,7 @@ A reference for the two test tiers that cover the Restate code under `src/restat
 |---|---|---|
 | Where | `src/__tests__/<module>.test.ts` | `src/__tests__/restate/<module>.restate.test.ts` |
 | Runs with | `npm test` (vitest, default config) | `npm run test:restate` (`vitest.restate.config.ts`) |
-| Needs Docker | No | Yes (`@restatedev/restate-sdk-testcontainers` boots `restatedev/restate:1.7.10`) |
+| Needs Docker | No | No, unless the container runtime is selected (see § "Running and debugging"). Only `endpoint.restate.test.ts` always needs it |
 | Engine present | No. The handler is called as a plain function | Yes. A real `restate-server` journals the call and delivers it over HTTP/2 to the in-process SDK endpoint |
 | What it proves | The branch logic, the error mapping, the wire shapes, the time boundaries | What the engine does with the handler: serialisation, retry, idempotency, suspension, discovery metadata, ingress serde |
 | Cost | Milliseconds per test | About a second per scenario, plus one container boot per variant per file (seconds) |
@@ -164,7 +164,12 @@ npm run test:restate
 npx tsc --noEmit --project tsconfig.restate-tests.json
 ```
 
-Docker must be running. The first run pulls `restatedev/restate:1.7.10`. Things that trip a first-time author:
+Two runtimes serve the same scenario files (AII-914):
+
+- **`container`**: `@restatedev/restate-sdk-testcontainers` boots `restatedev/restate:1.7.10`. Needs Docker; the first run pulls the image.
+- **`binary`**: `src/__tests__/restate/binary-environment.ts` spawns the `@restatedev/restate-server` platform binary that `RestateSidecar` runs in production, on three loopback ports with a temp base directory. No Docker, so it works in a dispatched runner.
+
+`restateTestRuntime()` (`harness.ts`) picks one: `RESTATE_TEST_RUNTIME=container|binary` wins when set; otherwise `container` when a usable container socket is found (`DOCKER_HOST`, or a readable/writable docker socket), else `binary`. It logs the choice once per process. A missing platform binary throws `RestateBinaryNotFoundError`; there is no silent fallback. `startedRestateContainer.restart()` works on both, so scenarios are unchanged. `endpoint.restate.test.ts` builds its own `RestateContainer`, so it is the one file that still needs Docker and is skipped under `binary`. Things that trip a first-time author:
 
 - A deployment's handler metadata is empty until a handler has been invoked once in that environment. Call the handler, then read `GET <adminAPIBaseUrl>/services/<name>`.
 - The `disableRetries` variant fails a throwing handler at once. A scenario that needs a retry to succeed runs against `alwaysReplay` only, with a comment.
@@ -197,7 +202,6 @@ Known gaps, for the next issue that touches the area:
 
 | Gap | Why it matters |
 |---|---|
-| The real `restate-server` binary is never spawned in a test | The `RESTATE_*__*` env keys are verified by hand with `--dump-config`, not by a test. (`endpoint.restate.test.ts`'s container runs the Docker *image*, not the `@restatedev/restate-server` platform binary `RestateSidecar` spawns in production — a different artifact) |
 | `restate-tests` is not a required check on `testing` | A red job does not block a merge until an operator marks the check required |
 
 ## `review-fix-pilot.restate.test.ts`: the production-composition fault matrix (AII-813)

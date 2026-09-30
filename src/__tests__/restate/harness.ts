@@ -6,6 +6,10 @@ import type { ServiceDefinition, VirtualObjectDefinition, WorkflowDefinition } f
 import { createEndpointHandler } from "@restatedev/restate-sdk/node";
 import * as http2 from "node:http2";
 import type { AddressInfo } from "node:net";
+import { accessSync, constants } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { startBinaryEnvironment } from "./binary-environment.js";
 
 // Pinned (not `latest`) to match the image cached by .github/workflows/unit-tests.yml's
 // restate-tests job (`RESTATE_IMAGE_TAG`), which keys its image cache on this same value.
@@ -26,9 +30,53 @@ export const VARIANTS = [
   ["disableRetries", (container: RestateContainer) => container.disableRetries()],
 ] satisfies Array<[string, (container: RestateContainer) => RestateContainer]>;
 
+export type RestateTestRuntime = "container" | "binary";
+
+function containerRuntimeReachable(): boolean {
+  if (process.env.DOCKER_HOST) return true;
+  const candidates = [
+    "/var/run/docker.sock",
+    path.join(os.homedir(), ".docker", "run", "docker.sock"),
+    ...(process.env.XDG_RUNTIME_DIR ? [path.join(process.env.XDG_RUNTIME_DIR, "docker.sock")] : []),
+  ];
+  // The socket must be usable by this user: a runner mounts it but `coder` cannot open it.
+  return candidates.some((socket) => {
+    try {
+      accessSync(socket, constants.R_OK | constants.W_OK);
+      return true;
+    } catch {
+      return false;
+    }
+  });
+}
+
+let loggedRuntime = false;
+
+/** `RESTATE_TEST_RUNTIME` wins when it is `container` or `binary`; otherwise the container
+ * runtime when a container socket is usable (a synchronous probe of what testcontainers
+ * looks for), else the `restate-server` binary. Logs the choice once per process. */
+export function restateTestRuntime(): RestateTestRuntime {
+  const forced = process.env.RESTATE_TEST_RUNTIME;
+  const runtime: RestateTestRuntime =
+    forced === "container" || forced === "binary" ? forced : containerRuntimeReachable() ? "container" : "binary";
+  if (!loggedRuntime) {
+    loggedRuntime = true;
+    console.error(`[restate-tests] runtime: ${runtime}${forced === runtime ? " (RESTATE_TEST_RUNTIME)" : ""}`);
+  }
+  return runtime;
+}
+
+// The binary environment implements only the members the scenario files use, so it is
+// typed as RestateTestEnvironment here and the scenario files compile unchanged.
+function asTestEnvironment(env: Awaited<ReturnType<typeof startBinaryEnvironment>>): RestateTestEnvironment {
+  return env as unknown as RestateTestEnvironment;
+}
+
 export async function startVariants(services: RestateServices): Promise<Map<string, RestateTestEnvironment>> {
+  const binary = restateTestRuntime() === "binary";
   const started = await Promise.all(
     VARIANTS.map(async ([label, configure]) => {
+      if (binary) return [label, asTestEnvironment(await startBinaryEnvironment({ services, variant: label as "alwaysReplay" | "disableRetries" }))] as const;
       const env = await RestateTestEnvironment.start({
         services,
         container: () => configure(new RestateContainer(RESTATE_IMAGE_VERSION)),
@@ -41,7 +89,8 @@ export async function startVariants(services: RestateServices): Promise<Map<stri
 
 /** Fault-injection scenarios need the engine's normal retry policy. Disk storage
  * keeps the same journal across a restart of the pinned sidecar container. */
-export function startRetryEnabled(services: RestateServices): Promise<RestateTestEnvironment> {
+export async function startRetryEnabled(services: RestateServices): Promise<RestateTestEnvironment> {
+  if (restateTestRuntime() === "binary") return asTestEnvironment(await startBinaryEnvironment({ services, storage: "disk" }));
   return RestateTestEnvironment.start({
     services,
     storage: "disk",
