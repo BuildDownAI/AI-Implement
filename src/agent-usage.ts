@@ -33,7 +33,16 @@ export type UsageMismatchField =
 export type AttributionStatus = "verified" | "mismatch" | "rejected" | "absent";
 
 export interface InvocationUsageRow {
-  /** Stable identity used for dedup; null when no valid identity was supplied (never deduplicated). */
+  /** Trusted: copied from the frozen snapshot, never from a claimed attribution. */
+  snapshotId: string;
+  /** Trusted immutable configuration row id + revision of each layer the snapshot resolved from. */
+  configRevisions: {
+    orchestratorDefault: { configRevisionId: string; revision: number };
+    project: { configRevisionId: string; revision: number };
+  };
+  /** Trusted revision of the selected account profile row. */
+  profileRevision: number;
+  /** Stable identity, scoped by `snapshotId` for dedup; null when none was supplied (never deduplicated). */
   invocationId: string | null;
   stage: StageName;
   agent: "claude" | "codex";
@@ -149,7 +158,14 @@ export function normalizeInvocation(
 
   if (attribution === "verified" && mismatches.length > 0) attribution = "mismatch";
 
+  const revs = snapshot.configRevisions;
   return {
+    snapshotId: snapshot.snapshotId,
+    configRevisions: {
+      orchestratorDefault: { configRevisionId: revs.orchestratorDefault.configRevisionId, revision: revs.orchestratorDefault.revision },
+      project: { configRevisionId: revs.project.configRevisionId, revision: revs.project.revision },
+    },
+    profileRevision: profile.revision,
     invocationId: safeId(obs.invocationId) ?? claim?.invocationId ?? null,
     stage,
     agent: selection.agent,
@@ -218,8 +234,9 @@ function sum(values: Array<number | null>): number | null {
 
 const isSubscription = (m: AccountAuthMode): boolean => m === "claude-subscription" || m === "codex-subscription";
 
-/** Deduplicates by invocation identity and aggregates. Byte-equivalent repeats are ignored; a
- *  repeated identity with different content is counted in `conflicts` and the first record wins. */
+/** Deduplicates by snapshot-scoped invocation identity and aggregates. Byte-equivalent repeats are
+ *  ignored; a repeated identity within one snapshot with different content is counted in
+ *  `conflicts` and the first record wins. Identical ids under different snapshots stay distinct. */
 export function aggregateUsage(input: readonly InvocationUsageRow[]): AgentUsageAggregate {
   const seen = new Map<string, string>();
   const rows: InvocationUsageRow[] = [];
@@ -228,13 +245,14 @@ export function aggregateUsage(input: readonly InvocationUsageRow[]): AgentUsage
   for (const row of input) {
     if (row.invocationId !== null) {
       const fp = canonical(row);
-      const prior = seen.get(row.invocationId);
+      const key = canonical([row.snapshotId, row.invocationId]);
+      const prior = seen.get(key);
       if (prior !== undefined) {
         if (prior === fp) duplicatesIgnored++;
         else conflicts++;
         continue;
       }
-      seen.set(row.invocationId, fp);
+      seen.set(key, fp);
     }
     rows.push(row);
   }
