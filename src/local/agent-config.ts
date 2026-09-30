@@ -1,6 +1,6 @@
-import { createHash, randomBytes } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
-import { lstat, mkdir, open, readFile, realpath, rename, stat, unlink } from "node:fs/promises";
+import { lstat, open, readFile, realpath, rename, stat, unlink } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
   resolveStageAgentConfig,
@@ -461,15 +461,29 @@ interface LockRecord {
 }
 
 export interface LocalSessionOwnershipOptions {
-  /** Private directory that holds lock records. Absolute; must sit outside every forbidden root. */
-  lockDir: string;
   forbiddenRoots: readonly string[];
   now?: () => Date;
   onDiagnostic?: (diagnostic: LocalAgentConfigDiagnostic) => void;
+  /** Test seam for failure injection. */
+  io?: { syncDir?: (dir: string) => Promise<void> };
 }
 
-function lockKey(canonicalPath: string): string {
-  return createHash("sha256").update(canonicalPath).digest("hex");
+/** Flushes a directory entry change (create/rename) to stable storage. Any failure propagates. */
+async function syncDirectory(dir: string): Promise<void> {
+  const handle = await open(dir, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY);
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
+ * The lock is a sibling of the canonical session file, so its location derives only from the
+ * session itself: no caller-selected directory can create a second ownership authority.
+ */
+function sessionLockPath(canonicalPath: string): string {
+  return join(dirname(canonicalPath), `.${basename(canonicalPath)}.ai-lock`);
 }
 
 /**
@@ -487,22 +501,6 @@ export class LocalSessionOwnership {
     this.options.onDiagnostic?.({ operation, category, ...(profileId ? { profileId } : {}) });
   }
 
-  private async prepareLockDir(): Promise<string> {
-    const dir = this.options.lockDir;
-    if (typeof dir !== "string" || !isAbsolute(dir) || dir.includes("\0")) fail("unsafe_path", "lock directory must be absolute");
-    const roots = await prepareForbiddenRoots(this.options.forbiddenRoots);
-    assertOutside(resolve(dir), resolve(dir), roots, "lock directory");
-    await mkdir(dir, { recursive: true, mode: 0o700 });
-    const canonical = await realpath(dir);
-    assertOutside(resolve(dir), canonical, roots, "lock directory");
-    const info = await stat(canonical);
-    const uid = currentUid();
-    if (!info.isDirectory() || (uid !== undefined && info.uid !== uid) || (info.mode & 0o077) !== 0) {
-      fail("unsafe_permissions", "lock directory must be private to the current user");
-    }
-    return canonical;
-  }
-
   /** Atomically takes the session, or throws `session_busy` without launching a competitor. */
   async acquire(reference: LocalCredentialReference): Promise<LocalSessionLease> {
     try {
@@ -512,8 +510,7 @@ export class LocalSessionOwnership {
       }
       const roots = await prepareForbiddenRoots(this.options.forbiddenRoots);
       const file = await validateProtectedFile(reference.canonicalPath, roots, "session reference", { singleLink: true });
-      const lockDir = await this.prepareLockDir();
-      const lockPath = join(lockDir, `${lockKey(file.canonicalPath)}.lock`);
+      const lockPath = sessionLockPath(file.canonicalPath);
       const token = randomBytes(24).toString("hex");
       const record: LockRecord = {
         version: 1,
@@ -531,21 +528,33 @@ export class LocalSessionOwnership {
         }
         return fail("ownership_failed", "local session ownership could not be recorded");
       }
+      let durable = true;
       try {
         await handle.writeFile(JSON.stringify(record));
         await handle.sync();
+      } catch {
+        durable = false;
       } finally {
         await handle.close();
+      }
+      if (durable) {
+        try {
+          await (this.options.io?.syncDir ?? syncDirectory)(dirname(lockPath));
+        } catch {
+          durable = false;
+        }
       }
       const lease = new LocalSessionLease({
         profileId: reference.profileId,
         token,
         lockPath,
         canonicalPath: file.canonicalPath,
-        status: "owned",
+        status: durable ? "owned" : "held",
         refreshed: false,
       });
       this.leases.set(reference.profileId, lease);
+      // A lock that may not be durable is never removed: it stays as a recovery hold.
+      if (!durable) fail("ownership_failed", "local session ownership could not be recorded durably");
       return lease;
     } catch (error) {
       const safe = toSafeError(error, "ownership_failed", "local session ownership failed");
@@ -622,13 +631,20 @@ export class LocalSessionOwnership {
         holdReason: reason,
       };
       const temp = `${state.lockPath}.${randomBytes(6).toString("hex")}.tmp`;
-      const handle = await open(temp, "wx", 0o600);
       try {
-        await handle.writeFile(JSON.stringify(record));
-      } finally {
-        await handle.close();
+        const handle = await open(temp, "wx", 0o600);
+        try {
+          await handle.writeFile(JSON.stringify(record));
+          await handle.sync();
+        } finally {
+          await handle.close();
+        }
+        await rename(temp, state.lockPath);
+      } catch (error) {
+        await unlink(temp).catch(() => undefined);
+        throw error;
       }
-      await rename(temp, state.lockPath);
+      await (this.options.io?.syncDir ?? syncDirectory)(dirname(state.lockPath));
     } catch {
       // the existing lock still blocks competitors
     }
@@ -650,7 +666,7 @@ export interface LocalCredentialPortOptions {
   ownership?: LocalSessionOwnership;
   onDiagnostic?: (diagnostic: LocalAgentConfigDiagnostic) => void;
   /** Test seam for failure injection. */
-  io?: { rename?: typeof rename };
+  io?: { rename?: typeof rename; syncDir?: (dir: string) => Promise<void> };
 }
 
 /**
@@ -660,6 +676,7 @@ export interface LocalCredentialPortOptions {
  */
 export function createLocalCredentialPort(options: LocalCredentialPortOptions): LocalCredentialPort {
   const renameFile = options.io?.rename ?? rename;
+  const syncDir = options.io?.syncDir ?? syncDirectory;
 
   function referenceFor(profileId: string, authMode: AccountAuthMode): LocalCredentialReference {
     const reference = options.references.get(profileId);
@@ -752,6 +769,8 @@ export function createLocalCredentialPort(options: LocalCredentialPortOptions): 
         await options.ownership!.verifyOwner(lease);
         await renameFile(tempPath, target);
         tempPath = undefined;
+        // Not acknowledged until the rename itself is durable.
+        await syncDir(dirname(target));
         state.refreshed = true;
       } catch (error) {
         if (tempPath) await unlink(tempPath).catch(() => undefined);
