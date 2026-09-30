@@ -1,7 +1,7 @@
 // The SDK endpoint for the run lifecycle's durable-execution engine (ADR 017, ADR 018),
 // the `Operator` Virtual Object (AII-709), and the `orchestratorTools` service /mcp
-// discovers and calls tools through (AII-710). No run kind has migrated onto Restate yet,
-// so a workflow module joins the service set here once one does. The Restate server
+// discovers and calls tools through (AII-710). kg-refresh is migrated: `src/index.ts`
+// composes the `KgRepo` / `KgRefresh` services and registers them here. The Restate server
 // (RestateSidecar, ../restate/server.ts, AII-627) reaches this endpoint by push, over
 // HTTP/2 — nothing else calls it, which is why the bind address defaults to loopback and
 // never leaves it (ADR 023).

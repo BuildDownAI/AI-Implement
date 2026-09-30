@@ -7,9 +7,8 @@
  * verify steps the orchestrator runs today, one activity at a time, so a Restate replay
  * proves the real rail rather than a copy of it.
  *
- * Nothing in production calls this workflow yet (that is AII-683); it is exercised only
- * by its own testcontainers scenarios, which register it directly rather than through
- * `src/restate/endpoint.ts`.
+ * kg-refresh is migrated: `src/index.ts` composes this workflow through
+ * `createProductionKgRefreshServices` and registers it on the endpoint (`src/restate/endpoint.ts`).
  *
  * Modeled on `createReviewFixAttempt` (`src/restate/review-fix-attempt.ts:88`): a factory
  * over a plain-function dependency object, one retention constant, `ctx.run` around every
@@ -37,6 +36,7 @@ import {
   verifyGate,
 } from "../kg-refresh-rail.js";
 import { parseKgSourceRepo } from "../deploy.js";
+import type { KgRepoDefinition } from "./kg-refresh-types.js";
 
 /** The value of `KG_REFRESH_TTL_MS` in `src/kg-refresh.ts:50` — how long a dispatch may run before it is treated as lost. */
 export const KG_REFRESH_TOTAL_DEADLINE_MS = 4 * 60 * 60 * 1000;
@@ -138,7 +138,7 @@ export interface KgRefreshWorkflowDependencies {
   /** Invoked, via its own `ctx.run` entry, once the "stage" gate's own result is already
    *  durable — before "swap" begins. A fault-injection test uses this to simulate a process
    *  crash in that exact window: the four gate functions convert any dependency throw into a
-   *  definitive `RailGateError`/`TerminalError` (correct for a real staging failure, wrong for
+   *  definitive gate-failure result (correct for a real staging failure, wrong for
    *  simulating an infra crash), so the injected fault needs a step of its own, positioned
    *  after "stage" is already committed, to get a genuine (retryable) engine failure instead.
    *  It cannot move onto a rail fake: "swap" is not idempotent (it renames staging into
@@ -175,21 +175,11 @@ function buildFailureOutcome(at: number, detail: string, stampBefore: string | n
   return { ok: false, at, detail, stampBefore, stampAfter: stampBefore };
 }
 
-/** `RailGateError` is converted to a `TerminalError` inside the `ctx.run` closure (so the
- *  engine's `maxRetryAttempts` never retries a definitive gate failure) and the gate name
- *  plus detail travel across that boundary JSON-encoded in the error message. */
-function parseGateFailure(message: string): { gate: RefreshGate; detail: string } {
-  try {
-    const parsed = JSON.parse(message) as { gate?: string; detail?: string };
-    if (parsed.gate && parsed.detail) return { gate: parsed.gate as RefreshGate, detail: parsed.detail };
-  } catch {
-    // fall through to the generic case below
-  }
-  return { gate: "preflight", detail: message };
-}
+/** A gate step's result: the next rail context, or a definitive gate failure. A returned
+ *  failure is journaled as a success, so the engine never retries it; any other throw still
+ *  retries up to `maxRetryAttempts`. */
+type GateResult = { ok: true; railCtx: RailContext } | { ok: false; gate: RefreshGate; detail: string };
 
-/** Prefix of the `TerminalError` `report` throws for a second, different body; the ingress client matches on it. */
-export const KG_CONFLICTING_REPORT_MESSAGE_PREFIX = "conflicting report";
 /** Message of the 404 `TerminalError` `report`/`progress` throw for a key no `run` has started under. */
 export const KG_REFRESH_NOT_FOUND_MESSAGE = "kg-refresh workflow not found";
 
@@ -204,16 +194,16 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
     name: string,
     gate: (rail: KgRailDeps, input: RailContext) => Promise<RailContext>,
     input: RailContext,
-  ): Promise<RailContext> {
+  ): Promise<GateResult> {
     return ctx.run(
       name,
-      async () => {
+      async (): Promise<GateResult> => {
         try {
-          return await gate(deps.rail, input);
+          return { ok: true, railCtx: await gate(deps.rail, input) };
         } catch (err) {
-          if (err instanceof RailGateError) {
-            throw new restate.TerminalError(JSON.stringify({ gate: err.gate, detail: err.detail }));
-          }
+          if (err instanceof RailGateError) return { ok: false, gate: err.gate, detail: err.detail };
+          // A terminal error from a rail dependency is as definitive as a gate error; it was never retried.
+          if (err instanceof restate.TerminalError) return { ok: false, gate: "preflight", detail: err.message };
           throw err;
         }
       },
@@ -235,13 +225,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
 
     async function finish(outcome: RefreshOutcome): Promise<RefreshOutcome> {
       ctx.set("completed", true);
-      ctx.genericSend({
-        service: "KgRepo",
-        method: "release",
-        key: deps.kgSourceRepo,
-        parameter: { triggerId },
-        inputSerde: restate.serde.json,
-      });
+      ctx.objectSendClient<KgRepoDefinition>({ name: "KgRepo" }, deps.kgSourceRepo).release({ triggerId });
       return outcome;
     }
 
@@ -321,18 +305,6 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       const dispatchedAt = await ctx.date.now();
       const bootstrapDeadlineAt = dispatchedAt + bootstrapDeadlineMs;
       const totalDeadlineAt = dispatchedAt + totalDeadlineMs;
-
-      // The workflow owns the marker's expiry: if this run never releases (a crash that outlives
-      // Restate's retries), KgRepo clears the marker at the deadline plus margin. A normal release
-      // clears it first, and the later expire no longer matches the trigger id.
-      ctx.genericSend({
-        service: "KgRepo",
-        method: "expire",
-        key: deps.kgSourceRepo,
-        parameter: { triggerId },
-        inputSerde: restate.serde.json,
-        delay: totalDeadlineMs + KG_REPO_STALE_MARGIN_MS,
-      });
 
       async function waitForOutcome(): Promise<WaitOutcome> {
         let progressSeen = false;
@@ -527,16 +499,12 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       ];
       for (const [name, gate] of gates) {
         ctx.set("step", name);
-        try {
-          railCtx = await runGate(ctx, name, gate, railCtx);
-        } catch (err) {
-          if (restate.internal.isSuspendedError(err)) throw err;
-          if (err instanceof restate.TerminalError) {
-            gateFailure = parseGateFailure(err.message);
-            break;
-          }
-          throw err;
+        const result = await runGate(ctx, name, gate, railCtx);
+        if (!result.ok) {
+          gateFailure = { gate: result.gate, detail: result.detail };
+          break;
         }
+        railCtx = result.railCtx;
 
         // fetchGate's documented short-circuit (kg-refresh-rail.ts:164-196): the just-fetched
         // source's snapshot/-touching commit already matches the persisted SHA, so there is
@@ -603,13 +571,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         const outcome = await failurePath(buildFailureOutcome(at, detail), "workflow_error");
         return await finish(outcome);
       } finally {
-        ctx.genericSend({
-          service: "KgRepo",
-          method: "release",
-          key: deps.kgSourceRepo,
-          parameter: { triggerId },
-          inputSerde: restate.serde.json,
-        });
+        ctx.objectSendClient<KgRepoDefinition>({ name: "KgRepo" }, deps.kgSourceRepo).release({ triggerId });
       }
     }
   }
@@ -637,7 +599,8 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
     if (existing !== undefined) {
       if (!isDuplicate) {
         throw new restate.TerminalError(
-          `${KG_CONFLICTING_REPORT_MESSAGE_PREFIX}: existing=${JSON.stringify(existing)} incoming=${JSON.stringify(body)}`,
+          `conflicting report: existing=${JSON.stringify(existing)} incoming=${JSON.stringify(body)}`,
+          { errorCode: 409 },
         );
       }
       return { status: "duplicate" };

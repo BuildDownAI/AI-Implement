@@ -3,7 +3,7 @@
 // (src/restate/kg-refresh-production.ts). Real: the `KgRepo` object, the `KgRefresh`
 // workflow, the `orchestratorTools` service (`trigger_kg_refresh`, `get_kg_status`), the rail
 // gates of src/kg-refresh-rail.ts against a temp-directory data root and a fixture tarball,
-// SQLite (`appendLog`, `updateJobStatus`, the `settings` keys, `getInFlightWork`, the
+// SQLite (`appendLogIfAbsent`, `updateJobStatus`, the `settings` keys, `getInFlightWork`, the
 // `runner_tokens` table), `mintRunToken`, `handleRunnerResult` with the production ingress
 // client, `runKgRefreshPreflight`, `makeKgRefreshAdminDeps`, and `sweepLegacyKgRefreshRows`.
 // Simulated: GitHub (`postWorkflowDispatch`, `getWorkflowRunStatus`, `findRunByTitle`,
@@ -204,7 +204,6 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
       },
       ...railFakes,
       dispatchKgRefreshRun: async () => { throw new Error("the legacy dispatcher must not run on the GHA path"); },
-      appendLog,
       updateJobStatus,
       getWorkflowRunStatus: async (runId) => { gh.statusCalls.push(runId); return { ...gh.runState }; },
       findRunByTitle: async () => gh.findResult(++gh.findCalls),
@@ -461,6 +460,33 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
     expect(resultTokenConsumedAt(dispatchId)).toBeNull();
   }, 40_000);
 
+  // P5b ------------------------------------------------------------------------------
+  it.each(VARIANTS.map(([label]) => label))("P5b: a second report with a different body answers conflict through the client and HTTP 409 on the raw ingress (%s)", async (label) => {
+    const env = envFor(label);
+    const client = clientFor(env);
+    let releaseGate!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseGate = resolve; });
+    sim.fetchGate = gate; // hold the run live so the first report is unconsumed-or-consumed-but-not-complete
+    await triggerRefresh(env);
+    await until(dispatched);
+    const dispatchId = kgRows()[0].dispatch_id;
+
+    expect(await postReport(env, runToken(), SUCCESS_REPORT)).toEqual({ status: 200, body: { acknowledged: true } });
+
+    const different = { ...SUCCESS_REPORT, comments: ["a different body"] } as never;
+    expect(await client.report(dispatchId, different, { idempotencyKey: "conflict-1" })).toEqual({ status: "conflict" });
+    const raw = await fetch(`${env.baseUrl()}/KgRefresh/${encodeURIComponent(dispatchId)}/report`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "idempotency-key": "conflict-2" },
+      body: JSON.stringify(different),
+    });
+    expect(raw.status).toBe(409);
+
+    releaseGate();
+    await until(() => kgRows().some((r) => r.status === "completed"));
+    await untilMarkerClear(client);
+  }, 40_000);
+
   // P6 -------------------------------------------------------------------------------
   it.each(VARIANTS.map(([label]) => label))("P6: cancel holds the marker until the run reads completed; a late report is refused (%s)", async (label) => {
     const env = envFor(label);
@@ -484,7 +510,7 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
     expect(kgRows()).toMatchObject([{ status: "failed", conclusion: "operator_cancelled" }]);
 
     // The completed workflow refuses a report it did not consume; the workflow's own
-    // terminal error is not a conflict marker, so the callback answers 503.
+    // terminal error carries no 409, so the callback answers 503.
     expect(await postReport(env, runToken(), SUCCESS_REPORT)).toEqual({ status: 503, body: { error: "kg_refresh_unavailable" } });
     expect(mergeCalls).toBe(0);
     expect(persistCalls).toBe(1); // the cancelled run's own failure record, nothing from the report

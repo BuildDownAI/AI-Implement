@@ -1,9 +1,10 @@
 /** Production composition for the `KgRepo` / `KgRefresh` services (AII-895), plus the
  * ingress client the runner callback and the admin cancel path use to reach the
  * `KgRefresh` workflow from outside a Restate handler. Sibling of
- * `review-fix-production.ts` and `review-fix-client.ts`. Nothing imports this module yet
- * (AII-683 does); this file is the allowed SDK boundary where the orchestrator's existing
+ * `review-fix-production.ts` and `review-fix-client.ts`. `src/index.ts` composes and registers
+ * the services; this file is the allowed SDK boundary where the orchestrator's existing
  * kg-refresh closures become Restate services. */
+import * as restateClients from "@restatedev/restate-sdk-clients";
 import { getMappings } from "../config.js";
 import { getDb } from "../dedup.js";
 import type { AppConfig } from "../index.js";
@@ -28,11 +29,10 @@ import { encodeRunConfig, type RunConfigV1 } from "../run-config.js";
 import { getRunnerMode, resolveExecutionPath } from "../runner-mode.js";
 import { mintRunToken } from "../runner-tokens.js";
 import type { JobStatus } from "../log.js";
-import { findLogIdByDispatchId } from "../log.js";
+import { appendLogIfAbsent, findLogIdByDispatchId } from "../log.js";
 import type { RestateService } from "./endpoint.js";
 import {
   createKgRefreshWorkflow,
-  KG_CONFLICTING_REPORT_MESSAGE_PREFIX,
   type KgDispatchInput,
   type KgDispatchResult,
   type KgRefreshReportBody,
@@ -40,6 +40,7 @@ import {
   type KgRefreshWorkflowDependencies,
 } from "./kg-refresh-workflow.js";
 import { createKgRepo, type KgRepoEnqueueInput, type KgRepoEnqueueResult, type KgRepoTriggerResult } from "./kg-repo.js";
+import type { KgRefreshDefinition, KgRepoDefinition } from "./kg-refresh-types.js";
 import { RESTATE_INGRESS_BASE_URL } from "./server.js";
 
 /** Workflow file dispatched in the KG source repo (same value as `KG_REFRESH_WORKFLOW_FILE` in `src/index.ts`). */
@@ -78,8 +79,6 @@ export interface KgRefreshProductionInput {
   dispatchKgRefreshRun: LegacyDispatch;
   /** Probes the KG source repo's dispatch workflow for `run_publication_token` support. Defaults to `resolveWorkflowCapabilities`. */
   resolveWorkflowCapabilities?: typeof resolveWorkflowCapabilities;
-  /** `appendLog` — the numeric dispatch_log id is kept per dispatchId for `updateJobStatus`. */
-  appendLog: (entry: { issueId: string; phase: string; dispatchId: string; executionMode: string; repo?: string }) => number;
   updateJobStatus: (jobId: number, status: JobStatus, conclusion?: string | null) => void;
   /** Recovers the dispatch_log id after a restart (journaled `reserve` does not re-run).
    *  Defaults to a `dispatch_log.dispatch_id` lookup. */
@@ -243,14 +242,9 @@ export function createProductionKgRefreshServices(
       };
     },
     dispatch: createKgRefreshDispatch(input),
+    // Idempotent on dispatch_id: a replay after a crash between the insert and the journal write reuses the row.
     appendJobLog: ({ dispatchId }) => {
-      // Idempotent on dispatch_id: a replay after a crash between the insert and the journal write reuses the row.
-      const existing = jobIds.get(dispatchId) ?? findJobId(dispatchId);
-      if (existing !== undefined) {
-        jobIds.set(dispatchId, existing);
-        return existing;
-      }
-      const id = input.appendLog({
+      const id = appendLogIfAbsent({
         issueId: "kg-refresh", phase: "kg-refresh", dispatchId, executionMode: resolveKgExecutionMode(),
         repo: parseKgSourceRepo(input.kgSourceRepo).fullName,
       });
@@ -336,66 +330,46 @@ export interface KgRefreshIngressClientDeps {
 }
 
 const INGRESS_TIMEOUT_MS = 10_000;
-const CONFLICT_MARKER = KG_CONFLICTING_REPORT_MESSAGE_PREFIX;
 
-/** Restate answers a handler `TerminalError` with a JSON body `{ code, message }`; anything else is not parseable. */
-function restateErrorMessage(text: string): string | null {
-  try {
-    const parsed = JSON.parse(text) as { message?: unknown };
-    return typeof parsed?.message === "string" ? parsed.message : null;
-  } catch {
-    return null;
-  }
-}
-
-/** Real client for the Restate ingress. Never throws: any failure resolves `unavailable`. */
+/** Real client for the Restate ingress, on the SDK's typed client. Never throws: a connection error or timeout resolves `unavailable`. */
 export function createKgRefreshIngressClient(
   baseUrl: string = RESTATE_INGRESS_BASE_URL,
   deps: KgRefreshIngressClientDeps = {},
 ): KgRefreshIngressClient {
-  const fetchImpl = deps.fetchImpl ?? fetch;
-  const timeoutMs = deps.timeoutMs ?? INGRESS_TIMEOUT_MS;
+  const ingress = restateClients.connect({ url: baseUrl, ...(deps.fetchImpl ? { fetch: deps.fetchImpl } : {}) });
+  const timeout = deps.timeoutMs ?? INGRESS_TIMEOUT_MS;
+  const callOpts = <I, O>(idempotencyKey?: string) => restateClients.rpc.opts<I, O>({ timeout, ...(idempotencyKey ? { idempotencyKey } : {}) });
 
-  async function invoke<T>(
-    service: "KgRefresh" | "KgRepo",
-    key: string,
-    handler: string,
-    body: unknown,
-    idempotencyKey?: string,
+  const refresh = (triggerId: string) => ingress.workflowClient<KgRefreshDefinition>({ name: "KgRefresh" }, triggerId);
+  const repo = (slug: string) => ingress.objectClient<KgRepoDefinition>({ name: "KgRepo" }, slug);
+
+  /** 404 is `not-found` for the workflow only; 409 is `conflict` where the caller asked for it. */
+  async function invoke<T = undefined>(
+    call: () => PromiseLike<unknown>,
+    statuses: { notFound?: boolean; conflict?: boolean } = {},
   ): Promise<KgIngressResult<T>> {
     try {
-      const response = await fetchImpl(`${baseUrl}/${service}/${encodeURIComponent(key)}/${encodeURIComponent(handler)}`, {
-        method: "POST",
-        headers: { "content-type": "application/json", ...(idempotencyKey ? { "idempotency-key": idempotencyKey } : {}) },
-        body: JSON.stringify(body ?? {}),
-        signal: AbortSignal.timeout(timeoutMs),
-      });
-      const text = await response.text();
-      if (!response.ok) {
-        // A workflow TerminalError without a code surfaces as HTTP 500, so the message is
-        // matched rather than a 4xx status. The JSON `message` is authoritative (matched with includes, so a Restate-added prefix such as the handler name
-        // does not hide a real conflict); a body that
-        // is not Restate's JSON error falls back to a substring match.
-        if (response.status === 404 && service === "KgRefresh") return { status: "not-found" };
-        const message = restateErrorMessage(text);
-        const conflict = message !== null ? message.includes(CONFLICT_MARKER) : text.includes(CONFLICT_MARKER);
-        return conflict ? { status: "conflict" } : { status: "unavailable" };
+      const value = await call();
+      // `T` is the caller's declared result; a handler returning nothing yields no `value`.
+      return value === undefined ? { status: "accepted" } : { status: "accepted", value: value as T };
+    } catch (err) {
+      if (err instanceof restateClients.HttpCallError) {
+        if (statuses.notFound && err.status === 404) return { status: "not-found" };
+        if (statuses.conflict && err.status === 409) return { status: "conflict" };
       }
-      if (text.trim() === "") return { status: "accepted" };
-      return { status: "accepted", value: JSON.parse(text) as T };
-    } catch {
       return { status: "unavailable" };
     }
   }
 
   return {
-    report: (triggerId, body, opts) => invoke("KgRefresh", triggerId, "report", body, opts?.idempotencyKey),
-    progress: (triggerId) => invoke("KgRefresh", triggerId, "progress", {}),
-    cancel: (triggerId, reason) => invoke("KgRefresh", triggerId, "cancel", { reason }),
-    status: (triggerId) => invoke("KgRefresh", triggerId, "status", {}),
-    repoStatus: (slug) => invoke("KgRepo", slug, "status", {}),
+    report: (triggerId, body, opts) =>
+      invoke<{ status: "accepted" | "duplicate" }>(() => refresh(triggerId).report(body, callOpts(opts?.idempotencyKey)), { notFound: true, conflict: true }),
+    progress: (triggerId) => invoke(() => refresh(triggerId).progress(callOpts()), { notFound: true }),
+    cancel: (triggerId, reason) => invoke(() => refresh(triggerId).cancel({ reason }, callOpts()), { notFound: true }),
+    status: (triggerId) => invoke<KgRefreshStatusResult>(() => refresh(triggerId).status(callOpts()), { notFound: true }),
+    repoStatus: (slug) => invoke<{ triggerId: string; startedAt: number } | null>(() => repo(slug).status(callOpts())),
     enqueueDryRun: (slug, entry, opts) =>
-      invoke<KgRepoEnqueueResult>("KgRepo", slug, "enqueueDryRun", entry, opts?.idempotencyKey) as ReturnType<KgRefreshIngressClient["enqueueDryRun"]>,
+      invoke<KgRepoEnqueueResult>(() => repo(slug).enqueueDryRun(entry, callOpts(opts?.idempotencyKey))) as ReturnType<KgRefreshIngressClient["enqueueDryRun"]>,
   };
 }
 

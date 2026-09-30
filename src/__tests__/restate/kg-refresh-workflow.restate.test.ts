@@ -28,7 +28,6 @@ import {
   type KgDispatchInput,
   type KgDispatchResult,
   type KgRefreshReportBody,
-  KG_REPO_STALE_MARGIN_MS,
 } from "../../restate/kg-refresh-workflow.js";
 import {
   VARIANTS, attachWorkflow, callObject, callWorkflow, replaceEndpoint, startRetryEnabled,
@@ -629,7 +628,7 @@ describe("KgRefresh durable workflow", () => {
 
   // ---- W2: idempotency-key semantics on `report` ----
   it.each(VARIANTS.map(([label]) => label))(
-    "W2: a duplicate report under the same key is absorbed by Restate; a conflicting report under a new key is refused (%s)",
+    "W2: a duplicate report under the same key is absorbed by Restate; a differing report under a new key is refused (%s)",
     async (label) => {
       const env = envFor(label);
       const triggerId = newTriggerId();
@@ -656,9 +655,8 @@ describe("KgRefresh durable workflow", () => {
       expect(await duplicate.json()).toEqual({ status: "accepted" });
 
       const conflicting = await post(GENERIC_FAILURE_REPORT, "w2-key-2");
-      expect(conflicting.ok).toBe(false);
+      expect(conflicting.status).toBe(409);
       const conflictBody = await conflicting.text();
-      expect(conflictBody).toContain("conflicting report");
       expect(conflictBody).toContain("deadbeef1234");
       expect(conflictBody).toContain("runner_crashed");
 
@@ -914,7 +912,7 @@ describe("KgRefresh durable workflow", () => {
   }
 
   it.each(VARIANTS.map(([label]) => label))(
-    "a delayed KgRepo.expire is sent for the run, and no journal entry holds a token (%s)",
+    "the workflow sends no KgRepo.expire (KgRepo owns the lease expiry), and no journal entry holds a token (%s)",
     async (label) => {
       const env = envFor(label);
       const triggerId = newTriggerId();
@@ -943,12 +941,10 @@ describe("KgRefresh durable workflow", () => {
         expect(journal).not.toContain(Buffer.from(token).toString("base64"));
       }
 
-      // one delayed expire send for this repo, scheduled totalDeadline + margin out
+      // the workflow never schedules the lease expiry; `KgRepo.submit` does
       const expires = await adminQuery(adminUrl,
-        `SELECT * FROM sys_invocation WHERE target_service_name = 'KgRepo' AND target_service_key = '${KG_SOURCE_REPO}' AND target_handler_name = 'expire'`);
-      expect(expires.length).toBeGreaterThanOrEqual(1);
-      const delays = expires.map((r) => Date.parse(String(r.scheduled_start_at)) - Date.parse(String(r.created_at)));
-      expect(delays.some((d) => Math.abs(d - (TOTAL_DEADLINE_MS + KG_REPO_STALE_MARGIN_MS)) < 5_000)).toBe(true);
+        `SELECT * FROM sys_invocation WHERE target_service_name = 'KgRepo' AND target_service_key = '${KG_SOURCE_REPO}' AND target_handler_name = 'expire' AND invoked_by_target LIKE 'KgRefresh/${triggerId}/%'`);
+      expect(expires).toHaveLength(0);
     },
     20_000,
   );

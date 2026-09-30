@@ -5446,7 +5446,6 @@ async function main(): Promise<void> {
       closePullRequestFn: closePullRequest,
       deleteBranchFn: deleteBranch,
       dispatchKgRefreshRun: (opts) => dispatchKgRefreshRun(config, opts),
-      appendLog,
       updateJobStatus,
       getWorkflowRunStatus: async (runId) => {
         const run = await getWorkflowRunStatus(await kgWorkflowToken(), kgSlug.owner, kgSlug.repo, runId);
