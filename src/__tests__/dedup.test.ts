@@ -139,6 +139,174 @@ describe("dispatch admission schema", () => {
   });
 });
 
+describe("agent configuration and account ownership schema", () => {
+  it("initializes additive tables twice without changing legacy dispatch, token, or settings rows", () => {
+    const old = new Database(dbPath);
+    old.exec(`
+      CREATE TABLE dispatched (issue_id TEXT PRIMARY KEY, dispatched_at INTEGER NOT NULL);
+      CREATE TABLE runner_tokens (
+        dispatch_id TEXT NOT NULL,
+        audience TEXT NOT NULL DEFAULT 'result',
+        issue_id TEXT NOT NULL,
+        phase TEXT NOT NULL,
+        expires_at INTEGER NOT NULL,
+        consumed_at INTEGER,
+        mapping_team_key TEXT NOT NULL,
+        PRIMARY KEY (dispatch_id, audience)
+      );
+      CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+    `);
+    old.prepare("INSERT INTO dispatched (issue_id, dispatched_at) VALUES (?, ?)").run("legacy-issue", 123);
+    old.prepare(`INSERT INTO runner_tokens
+      (dispatch_id, audience, issue_id, phase, expires_at, consumed_at, mapping_team_key)
+      VALUES ('dispatch-1', 'result', 'issue-1', 'implementation', 999, NULL, 'AII')`).run();
+    old.prepare("INSERT INTO settings (key, value) VALUES ('linear_pickup_label', 'AI-Implement')").run();
+    old.close();
+
+    dedup.getDb();
+    dedup.closeDb();
+    const db = dedup.getDb();
+    const tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>;
+    const tableNames = new Set(tables.map((table) => table.name));
+    expect(tableNames).toContain("model_account_profiles");
+    expect(tableNames).toContain("model_account_profile_revisions");
+    expect(tableNames).toContain("stage_agent_config_revisions");
+    expect(tableNames).toContain("run_agent_config_snapshots");
+    expect(tableNames).toContain("model_profile_reservations");
+    expect(tableNames).toContain("model_session_generations");
+    expect(tableNames).toContain("model_credential_grants");
+    expect(tableNames).toContain("model_credential_grant_profiles");
+    expect(tableNames).toContain("model_invocation_attribution");
+    expect(db.prepare("SELECT issue_id, dispatched_at FROM dispatched").all())
+      .toEqual([{ issue_id: "legacy-issue", dispatched_at: 123 }]);
+    expect(db.prepare("SELECT dispatch_id, mapping_team_key FROM runner_tokens").all())
+      .toEqual([{ dispatch_id: "dispatch-1", mapping_team_key: "AII" }]);
+    expect(db.prepare("SELECT key, value FROM settings").all())
+      .toEqual([{ key: "linear_pickup_label", value: "AI-Implement" }]);
+    expect((db.prepare("SELECT COUNT(*) AS n FROM stage_agent_config_revisions").get() as { n: number }).n).toBe(0);
+  });
+
+  it("enforces one active reservation per profile and monotonically fenced owner generations", () => {
+    const db = dedup.getDb();
+    const reserve = db.prepare(`INSERT INTO model_profile_reservations
+      (reservation_id, profile_id, dispatch_id, owner_generation, owner_kind,
+       recovery_status, reserved_at, heartbeat_at)
+      VALUES (?, 'profile-openai', ?, ?, 'dispatch', ?, ?, ?)`);
+    reserve.run("reservation-1", "dispatch-1", 1, "reserved", 10, 11);
+    expect(() => reserve.run("reservation-conflict", "dispatch-2", 2, "reserved", 12, 12)).toThrow(/UNIQUE/);
+    db.prepare(`UPDATE model_profile_reservations
+      SET released_at = 20, release_reason = 'terminal', recovery_status = 'released'
+      WHERE reservation_id = 'reservation-1'`).run();
+    expect(() => db.prepare("UPDATE model_profile_reservations SET owner_generation = 9 WHERE reservation_id = 'reservation-1'").run())
+      .toThrow(/immutable/);
+    expect(() => reserve.run("reservation-stale", "dispatch-3", 1, "reserved", 21, 21)).toThrow(/generation/);
+    reserve.run("reservation-2", "dispatch-4", 2, "held", 22, 22);
+    expect(db.prepare(`SELECT reservation_id, owner_generation, recovery_status
+      FROM model_profile_reservations ORDER BY owner_generation`).all()).toEqual([
+      { reservation_id: "reservation-1", owner_generation: 1, recovery_status: "released" },
+      { reservation_id: "reservation-2", owner_generation: 2, recovery_status: "held" },
+    ]);
+  });
+
+  it("keeps snapshots immutable and credential material in encrypted or hashed tables only", () => {
+    const db = dedup.getDb();
+    db.prepare(`INSERT INTO model_account_profiles
+      (profile_id, current_profile_revision, status, created_at, updated_at)
+      VALUES ('profile-openai', 2, 'active', 10, 20)`).run();
+    db.prepare(`INSERT INTO model_account_profile_revisions
+      (profile_id, profile_revision, agent, provider, auth_mode, display_name,
+       created_at, metadata_json)
+      VALUES ('profile-openai', 1, 'codex', 'openai', 'openai-api-key',
+              'Testing API key', 10, '{"label":"api"}')`).run();
+    db.prepare(`INSERT INTO model_account_profile_revisions
+      (profile_id, profile_revision, agent, provider, auth_mode, display_name,
+       created_at, metadata_json)
+      VALUES ('profile-openai', 2, 'codex', 'openai', 'codex-subscription',
+              'Testing subscription', 20, '{"email":"operator@example.com"}')`).run();
+    expect(() => db.prepare(`UPDATE model_account_profile_revisions
+      SET display_name = 'rewrite' WHERE profile_id = 'profile-openai' AND profile_revision = 1`).run())
+      .toThrow(/immutable/);
+    db.prepare(`INSERT INTO model_account_profile_project_permissions
+      (profile_id, project_key, permission_revision, status, created_at, updated_at)
+      VALUES ('profile-openai', 'AII', 1, 'allowed', 10, 10)`).run();
+    db.prepare(`INSERT INTO stage_agent_config_revisions
+      (config_revision_id, scope_kind, scope_key, version, revision, config_json, created_at)
+      VALUES ('cfg-1', 'project', 'AII', 1, 1, '{"mode":"configured"}', 11)`).run();
+    db.prepare(`INSERT INTO run_agent_config_snapshots
+      (snapshot_id, dispatch_id, project_key, resolved_config_json, source_map_json,
+       config_revision_ids_json, created_at)
+      VALUES ('snapshot-1', 'dispatch-1', 'AII', '{"stages":{}}', '{}', '["cfg-1"]', 12)`).run();
+    expect(() => db.prepare(`UPDATE run_agent_config_snapshots
+      SET resolved_config_json = '{}' WHERE snapshot_id = 'snapshot-1'`).run()).toThrow(/immutable/);
+    db.prepare(`INSERT INTO model_session_generations
+      (profile_id, owner_generation, checkpoint_sequence, encrypted_session_state, encryption_key_id,
+       nonce, auth_tag, checkpointed_at, valid_until_at, state_status)
+      VALUES ('profile-openai', 1, 0, X'CAFE', 'key-1', X'01', X'02', 13, 100, 'checkpointed')`).run();
+    db.prepare(`INSERT INTO model_session_generations
+      (profile_id, owner_generation, checkpoint_sequence, encrypted_session_state, encryption_key_id,
+       nonce, auth_tag, checkpointed_at, valid_until_at, state_status)
+      VALUES ('profile-openai', 1, 1, X'BEEF', 'key-1', X'03', X'04', 14, 100, 'checkpointed')`).run();
+    db.prepare(`INSERT INTO model_credential_grants
+      (grant_id, dispatch_id, snapshot_id, project_key, backend, audience,
+       bearer_hash, scope_json, expires_at)
+      VALUES ('grant-1', 'dispatch-1', 'snapshot-1', 'AII', 'github-actions',
+              'codex-exec', 'sha256:abc123', '{"repo":"BuildDownAI/AI-Implement"}', 14)`).run();
+    db.prepare(`INSERT INTO model_credential_grant_profiles
+      (grant_id, stage, profile_id, profile_revision, owner_generation)
+      VALUES ('grant-1', 'implementation', 'profile-openai', 2, 1)`).run();
+    db.prepare(`INSERT INTO model_credential_grant_profiles
+      (grant_id, stage, profile_id, profile_revision, owner_generation)
+      VALUES ('grant-1', 'planning', 'profile-openai', 1, NULL)`).run();
+    db.prepare(`INSERT INTO model_invocation_attribution
+      (invocation_id, dispatch_id, stage, profile_id, profile_revision, agent,
+       provider, model, auth_mode, config_revision_id, snapshot_id, status,
+       started_at, completed_at, usage_json)
+      VALUES ('invocation-1', 'dispatch-1', 'implementation', 'profile-openai', 1,
+              'codex', 'openai', 'gpt-5.6-sol', 'codex-subscription', 'cfg-1',
+              'snapshot-1', 'succeeded', 15, 16, '{"inputTokens":1}')`).run();
+
+    const ordinaryColumns = db.prepare(`
+      SELECT m.name AS table_name, p.name AS column_name
+      FROM sqlite_master AS m, pragma_table_info(m.name) AS p
+      WHERE m.type = 'table'
+        AND m.name IN (
+          'model_account_profiles',
+          'model_account_profile_revisions',
+          'model_account_profile_project_permissions',
+          'stage_agent_config_revisions',
+          'run_agent_config_snapshots',
+          'model_profile_reservations',
+          'model_invocation_attribution'
+        )
+      ORDER BY m.name, p.name
+    `).all() as Array<{ table_name: string; column_name: string }>;
+    expect(ordinaryColumns.filter((column) => /credential|secret|token|bearer|session/i.test(column.column_name))).toEqual([]);
+    expect(db.prepare("SELECT checkpoint_sequence, length(encrypted_session_state) AS n FROM model_session_generations ORDER BY checkpoint_sequence").all()).toEqual([
+      { checkpoint_sequence: 0, n: 2 },
+      { checkpoint_sequence: 1, n: 2 },
+    ]);
+    expect(db.prepare("SELECT dispatch_id, snapshot_id, project_key, backend, bearer_hash FROM model_credential_grants").get()).toEqual({
+      dispatch_id: "dispatch-1",
+      snapshot_id: "snapshot-1",
+      project_key: "AII",
+      backend: "github-actions",
+      bearer_hash: "sha256:abc123",
+    });
+    expect(db.prepare(`SELECT stage, profile_revision, owner_generation
+      FROM model_credential_grant_profiles ORDER BY stage`).all()).toEqual([
+      { stage: "implementation", profile_revision: 2, owner_generation: 1 },
+      { stage: "planning", profile_revision: 1, owner_generation: null },
+    ]);
+    expect(db.prepare(`SELECT agent, provider, model, auth_mode, usage_json FROM model_invocation_attribution`).get()).toEqual({
+      agent: "codex",
+      provider: "openai",
+      model: "gpt-5.6-sol",
+      auth_mode: "codex-subscription",
+      usage_json: "{\"inputTokens\":1}",
+    });
+  });
+});
+
 describe("review-fix attempt and inbox schema", () => {
   it("upgrades old findings and queue history twice without rewriting legacy rows", () => {
     const old = new Database(dbPath);
