@@ -118,6 +118,7 @@ import { listOpenReviewFindings } from "./review-ledger-store.js";
 import { detectMergedPrs, prNumberFromUrl } from "./poll-merged-prs.js";
 import { githubActionsWatchdogDecision, jobTtlDecision } from "./github-actions-watchdog.js";
 import { KgSidecar } from "./kg-sidecar.js";
+import { createKgRefreshIngressClient } from "./restate/kg-refresh-production.js";
 import { RestateSidecar } from "./restate/server.js";
 import { startRestateEndpoint, register as registerRestateEndpoint, RESTATE_SERVICES } from "./restate/endpoint.js";
 import { createProductionReviewFixServices } from "./restate/review-fix-production.js";
@@ -4454,6 +4455,7 @@ async function dispatchKgRefreshRun(
 // ---------------------------------------------------------------------------
 
 const reviewFixAttemptStore = new SqliteReviewFixAttemptStore();
+const kgRefreshIngressClient = createKgRefreshIngressClient();
 
 async function onReviewFixResult(result: ReviewFixResultMetadataV1): Promise<ResultIntakeOutcome> {
   // The accepted result and its delivery entry commit together. The callback
@@ -4889,6 +4891,8 @@ function startServer(
           onKgRefreshRunnerComplete: kgRefresh.onRunnerComplete.bind(kgRefresh),
           checkPlanningAdmissionTermination: (dispatchId) => tryFastReleasePlanningAdmission(config, dispatchId),
           onReviewFixResult,
+          kgRefreshClient: kgRefreshIngressClient,
+          kgSourceRepo: config.kgSourceRepo,
         });
         res.writeHead(result.status, { "Content-Type": "application/json" });
         res.end(JSON.stringify(result.body));
@@ -4961,6 +4965,8 @@ function startServer(
           authorization: req.headers.authorization,
           body: parsed,
           secret: config.runnerTokenSecret,
+          kgRefreshClient: kgRefreshIngressClient,
+          kgSourceRepo: config.kgSourceRepo,
         });
         res.writeHead(result.status, { "Content-Type": "application/json" });
         res.end(JSON.stringify(result.body));
