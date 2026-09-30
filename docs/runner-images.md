@@ -61,21 +61,6 @@ Pair the runner channel with the orchestrator's channel — a testing orchestrat
 
 kg-refresh dispatches (both GitHub Actions and Fly Machines) resolve the runner image through the same `resolveRunnerImageForDispatch` path as every other run kind — per-repo `image.yml` override, then the orchestrator default, then the built-in channel tag.
 
-## Baked agent CLIs
-
-The shared session image installs both supported agent CLIs in one image:
-
-| Tool | Package | Pin | Build-time smoke |
-|------|---------|-----|------------------|
-| Claude Code | `@anthropic-ai/claude-code` | `2.1.284` | `claude --version` as `coder` |
-| Codex CLI | `@openai/codex` | `0.159.2` | `codex --version` and `codex exec --help` as `coder` |
-
-The Codex pin comes from the current `latest` dist-tag for `@openai/codex` at the time this runner support was added. Upgrade it by changing `CODEX_CLI_VERSION` in `Dockerfile.session`, rebuilding the image, and re-running the non-root version/help smoke checks before promoting a channel tag.
-
-The runner does not add an OpenAI application SDK dependency for Codex execution. The CLI is installed for stage executors that need `codex`; customer API-key and subscription/session authentication are supplied at run time by the orchestrator rather than baked into the image.
-
-The supported local automation surface is `codex exec`. Per official OpenAI documentation, `codex exec --json` writes a JSONL stream of structured events to stdout, including `item.started` and `item.completed` events for command executions. The installed CLI help exposes `codex exec --output-schema <FILE>` for constraining the final response to a JSON Schema when a later stage needs a stable machine-checked result.
-
 **Promotion order.** Commit SHA tags are pushed first, then the build digest is smoke-tested, and only then is any mutable channel tag promoted. Channel-scoped date tags follow `base-<channel>-vYYYYMMDD-<12-char-sha>` (e.g. `base-next-v20260526-abc123def456`) so `latest` and `next` never collide and same-day builds do not overwrite one another.
 
 **Promotion rule.** A channel is promoted for the newest branch head whose image content equals a tested build. If the branch advances between when a build starts and when its smoke tests pass (for example, a docs-only push lands after the triggering code push), the promotion step runs `scripts/image-equiv-check.sh` to diff the tested SHA against the current head. When the diff is empty for the paths that affect the runner image (`Dockerfile.session`, `session/**`, `src/**`, `pipelines/**`, `custom/**`, and the workflow file itself), the build's tested digest is promoted for the current head: the channel tag is updated, the usual date tag for the tested SHA is pushed, and an additional date tag for the head SHA is pushed (`base-<channel>-vYYYYMMDD-<head12>`). This extra tag is what lets the deploy-posture check confirm the channel is current for the actual branch head. When the diff is non-empty — the head includes image-relevant changes — promotion is skipped and the build that covers those changes will promote the channel when it completes.
