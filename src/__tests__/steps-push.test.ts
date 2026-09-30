@@ -1883,6 +1883,38 @@ describe("pushStep — push failure classification and retry (BAC-27116)", () =>
     expect(boot.pushCalls()).toBe(1);
   });
 
+  it("keeps the auth classification when a fresh-token 403 survives the final attempt (AII-922)", async () => {
+    let pushCalls = 0;
+    vi.mocked(fetch).mockReset();
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true, status: 200, json: async () => ({ token: "fresh-tok" }),
+    } as Response);
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n");
+      if (gitArgs[0] === "rev-parse") return spawnResult(0, "abc123\n");
+      if (gitArgs[0] === "show") return spawnResult(0, "M\tsrc/app.ts\n");
+      if (gitArgs[0] === "ls-remote") return spawnResult(0, `beadfeed\t${gitArgs.at(-1)}\n`);
+      if (gitArgs[0] === "push") {
+        pushCalls++;
+        return spawnResult(128, "", "remote: Permission to acme/app.git denied to bot[bot].\nfatal: unable to access: The requested URL returned error: 403");
+      }
+      return spawnResult(0);
+    });
+    let caught: (Error & { failure?: { category: string; code: string } }) | undefined;
+    try {
+      await pushStep.run(
+        makeContext({ retryPolicy: { ...DEFAULT_RETRY_POLICY, pushRetries: 2 } }),
+        { ...BASE_INPUTS, orchestratorUrl: "https://orchestrator.example", machineNonce: "n" },
+        new NoopStepReporter(),
+      );
+    } catch (e) {
+      caught = e as typeof caught;
+    }
+    expect(pushCalls).toBe(3);
+    expect(caught?.failure).toMatchObject({ category: "auth", code: "GIT_AUTH" });
+  });
+
   it("logs the credential source of the push and never the token (AII-922)", async () => {
     const run = async (label: string, inputs: Record<string, unknown>, vended?: Partial<Response> | Error, env?: string) => {
       vi.mocked(fetch).mockReset();

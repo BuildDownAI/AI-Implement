@@ -196,6 +196,16 @@ describe("conflict resolution helpers", () => {
     expect(queue.countConflictAttempts("org", "repo", 2)).toBe(1);
   });
 
+  it("a push-retry row does not count as a conflict attempt or a pending conflict resolution", () => {
+    queue.enqueueCommentGapfill({
+      owner: "org", repo: "repo", prNumber: 42, commentId: -777,
+      commenter: queue.PUSH_RETRY_COMMENTER, instruction: "retry",
+    });
+
+    expect(queue.countConflictAttempts("org", "repo", 42)).toBe(0);
+    expect(queue.hasPendingConflictResolution("org", "repo", 42)).toBe(false);
+  });
+
   it("hasPendingConflictResolution returns false when no synthetic rows exist", () => {
     expect(queue.hasPendingConflictResolution("org", "repo", 42)).toBe(false);
   });

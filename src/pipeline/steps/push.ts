@@ -316,7 +316,10 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
       // on a freshly minted token is therefore retried with backoff like a transient error;
       // a boot-token 403 stays a plain auth failure. The single-use credential cannot be
       // re-minted, so the retry reuses the token — it delays, it does not re-authenticate.
-      if (failure.category === "auth" && failure.code === "GIT_AUTH" && freshToken) {
+      // The final attempt keeps the original auth / GIT_AUTH classification, so a permanent
+      // credential problem (missing Workflows permission, revoked installation) that outlasts
+      // the retries still points the autopsy and the tracker comment at credentials.
+      if (failure.category === "auth" && failure.code === "GIT_AUTH" && freshToken && attempt < maxPushAttempts) {
         failure = { ...failure, category: "transient", code: "GIT_AUTH_FRESH_TOKEN", retryable: true };
       }
       const err = new Error(`git push failed (exit ${pushResult.status ?? "null"}): ${stderr}`) as Error & {
