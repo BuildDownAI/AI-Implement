@@ -154,6 +154,28 @@ describe("stream integrity", () => {
       expect(classifyLlmResult(r, { stage: "review", attempt: 1, expectsStructuredOutput: true })).not.toBeNull();
     });
   }
+  const noText = { type: "item.completed", item: { id: "m2", type: "agent_message" } };
+  const numText = { type: "item.completed", item: { id: "m2", type: "agent_message", text: 7 } };
+  const invalid: Array<[string, string]> = [
+    ["plain text line", j(started, approved) + "not-json\n" + j(done())],
+    ["JSON array line", j(started, approved) + "[1,2]\n" + j(done())],
+    ["agent_message missing text", j(started, approved, noText, done())],
+    ["agent_message non-string text", j(started, approved, numText, done())],
+  ];
+  for (const [name, text] of invalid) {
+    it(`${name} then valid completion is an error with unsafe replay`, () => {
+      const p = parseCodexStream(text);
+      const r = p.toResult({ exitCode: 0 });
+      expect(p.sawUnsafeActivity).toBe(true);
+      expect(p.terminalStatus?.isError).toBe(true);
+      expect(r.telemetry?.outcome).toBe("error");
+      expect(r.structuredOutput).toBeUndefined();
+      expect(classifyLlmResult(r, { stage: "review", attempt: 1, expectsStructuredOutput: true })).not.toBeNull();
+    });
+  }
+  it("a malformed final message drops the earlier verdict", () => {
+    expect(parseCodexStream(j(started, approved, noText)).finalMessage).toBeNull();
+  });
   it("unknown non-item events make replay unsafe", () => {
     expect(parseCodexStream(j({ type: "foo.bar" })).sawUnsafeActivity).toBe(true);
   });

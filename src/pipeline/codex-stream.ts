@@ -166,8 +166,8 @@ export class CodexStreamParser {
     if (!event) {
       this.malformedLines++;
       this.corrupt = true;
-      // A corrupted or truncated JSON object may have been an item event; stay conservative.
-      if (trimmed.startsWith("{")) this.sawUnsafe = true;
+      // Any unreadable nonblank line may have hidden an item event; stay conservative.
+      this.sawUnsafe = true;
       return;
     }
     this.apply(event);
@@ -247,7 +247,15 @@ export class CodexStreamParser {
     if (type === "reasoning") return; // hidden reasoning: never read, never traced
 
     if (type === "agent_message") {
-      if (phase === "item.completed" && typeof raw.text === "string") this.lastMessage = raw.text;
+      if (typeof raw.text !== "string") {
+        // `AgentMessageItem.text` is a required string; a payload without it is malformed.
+        this.malformedLines++;
+        this.corrupt = true;
+        this.sawUnsafe = true;
+        this.lastMessage = null;
+        return;
+      }
+      if (phase === "item.completed") this.lastMessage = raw.text;
       return;
     }
 
