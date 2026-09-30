@@ -5,6 +5,7 @@
  * (AII-683 does); this file is the allowed SDK boundary where the orchestrator's existing
  * kg-refresh closures become Restate services. */
 import { getMappings } from "../config.js";
+import { getDb } from "../dedup.js";
 import type { AppConfig } from "../index.js";
 import {
   CANARY_DEADLINE_MS,
@@ -76,6 +77,9 @@ export interface KgRefreshProductionInput {
   /** `appendLog` — the numeric dispatch_log id is kept per dispatchId for `updateJobStatus`. */
   appendLog: (entry: { issueId: string; phase: string; dispatchId: string; executionMode: string; repo?: string }) => number;
   updateJobStatus: (jobId: number, status: JobStatus, conclusion?: string | null) => void;
+  /** Recovers the dispatch_log id after a restart (journaled `reserve` does not re-run).
+   *  Defaults to a `dispatch_log.dispatch_id` lookup. */
+  findJobId?: (dispatchId: string) => number | undefined;
   /** Already bound to the KG source repo (the workflow only knows a run id). */
   getWorkflowRunStatus: KgRefreshWorkflowDependencies["getWorkflowRunStatus"];
   findRunByTitle: KgRefreshWorkflowDependencies["findRunByTitle"];
@@ -202,6 +206,12 @@ export function createProductionKgRefreshServices(
 
   // dispatch_log ids are numeric; the workflow keys its row by dispatch id string.
   const jobIds = new Map<string, number>();
+  const findJobId = input.findJobId ?? ((dispatchId: string): number | undefined => {
+    const row = getDb()
+      .prepare("SELECT id FROM dispatch_log WHERE dispatch_id = ? ORDER BY id DESC LIMIT 1")
+      .get(dispatchId) as { id: number } | undefined;
+    return row?.id;
+  });
 
   const deps: KgRefreshWorkflowDependencies = {
     rail,
@@ -224,7 +234,7 @@ export function createProductionKgRefreshServices(
       }));
     },
     closeJobLog: (jobId, status, conclusion) => {
-      const id = jobIds.get(jobId);
+      const id = jobIds.get(jobId) ?? findJobId(jobId);
       if (id === undefined) return;
       jobIds.delete(jobId);
       input.updateJobStatus(id, status, conclusion);

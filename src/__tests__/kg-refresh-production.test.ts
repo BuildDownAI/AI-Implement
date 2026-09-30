@@ -8,6 +8,17 @@ vi.mock("../github.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../github.js")>()),
   postWorkflowDispatch: (...args: unknown[]) => postWorkflowDispatch(...args),
 }));
+const capturedWorkflowDeps: { current?: import("../restate/kg-refresh-workflow.js").KgRefreshWorkflowDependencies } = {};
+vi.mock("../restate/kg-refresh-workflow.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../restate/kg-refresh-workflow.js")>();
+  return {
+    ...actual,
+    createKgRefreshWorkflow: (deps: never) => {
+      capturedWorkflowDeps.current = deps;
+      return actual.createKgRefreshWorkflow(deps);
+    },
+  };
+});
 vi.mock("../repo-image.js", () => ({ resolveRunnerImageForDispatch: vi.fn(async () => "runner:test") }));
 vi.mock("../runner-mode.js", () => ({
   getRunnerMode: () => ({ mode: "default" }),
@@ -89,6 +100,28 @@ describe("createProductionKgRefreshServices", () => {
     const { toolDeps } = createProductionKgRefreshServices(makeInput({ persistLastRefresh }));
     toolDeps.persistPreflightFailure({ ok: false, checkedAt: 5, results: [{ repo: "acme/kg", grant: "contents", ok: false, status: 403 }] });
     expect(persistLastRefresh).toHaveBeenCalledWith(expect.objectContaining({ ok: false, at: 5, gate: "preflight" }));
+  });
+});
+
+describe("dispatch_log job row lifecycle", () => {
+  it("closes the row on a fresh composer that never saw appendJobLog (restart replay)", () => {
+    const updateJobStatus = vi.fn();
+    const findJobId = vi.fn((id: string) => (id === "d-1" ? 42 : undefined));
+    createProductionKgRefreshServices(makeInput({ updateJobStatus, findJobId }));
+    capturedWorkflowDeps.current!.closeJobLog("d-1", "completed");
+    expect(updateJobStatus).toHaveBeenCalledWith(42, "completed", undefined);
+    capturedWorkflowDeps.current!.closeJobLog("unknown", "failed");
+    expect(updateJobStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it("prefers the in-memory id from appendJobLog", () => {
+    const updateJobStatus = vi.fn();
+    const findJobId = vi.fn();
+    createProductionKgRefreshServices(makeInput({ updateJobStatus, findJobId, appendLog: vi.fn(() => 7) }));
+    capturedWorkflowDeps.current!.appendJobLog({ dispatchId: "d-2", jobId: "d-2" });
+    capturedWorkflowDeps.current!.closeJobLog("d-2", "failed", "x");
+    expect(updateJobStatus).toHaveBeenCalledWith(7, "failed", "x");
+    expect(findJobId).not.toHaveBeenCalled();
   });
 });
 
