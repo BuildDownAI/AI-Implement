@@ -266,6 +266,7 @@ Two seams are mocked because the composer hard-codes them: `postWorkflowDispatch
 300 ms, and pass the workflow's own `beforeGate` / `afterStageCommitted` test hooks. Restart scenarios (P3, P4)
 run on the retry-enabled disk environment (`startRetryEnabled`, then `replaceEndpoint` and a container restart),
 as the review-fix restart scenarios do, not on the two harness variants.
+On the container runtime a restart remaps the ingress port, so every client must be rebuilt (or resolve `env.baseUrl()` per call) after `restart()`.
 
 | # | Scenario | Real | Simulated | Asserts |
 |---|---|---|---|---|

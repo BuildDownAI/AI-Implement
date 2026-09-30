@@ -357,7 +357,7 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
     const env = await startRetryEnabled(services);
     let replacement: Awaited<ReturnType<typeof replaceEndpoint>> | undefined;
     try {
-      const client = clientFor(env);
+      let client = clientFor(env);
       const triggerId = await triggerRefresh(env);
       await until(dispatched);
       // "await-progress" is set only after the dispatch step's result is journaled.
@@ -368,6 +368,8 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
 
       replacement = await replaceEndpoint(env, services);
       await env.startedRestateContainer.restart();
+      // A container restart remaps the ingress port; the old client would keep the stale one.
+      client = clientFor(env);
       await until(async () => (await client.repoStatus(KG_SOURCE_REPO)).status === "accepted", 30_000);
 
       expect(await postReport(env, runToken(), SUCCESS_REPORT)).toEqual({ status: 200, body: { acknowledged: true } });
@@ -392,7 +394,7 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
     const env = await startRetryEnabled(services);
     let replacement: Awaited<ReturnType<typeof replaceEndpoint>> | undefined;
     try {
-      const client = clientFor(env);
+      let client = clientFor(env);
       await triggerRefresh(env);
       await until(dispatched);
       expect(await postReport(env, runToken(), SUCCESS_REPORT)).toMatchObject({ status: 200 });
@@ -400,6 +402,8 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
 
       replacement = await replaceEndpoint(env, services);
       await env.startedRestateContainer.restart();
+      // A container restart remaps the ingress port; the old client would keep the stale one.
+      client = clientFor(env);
       await until(() => stageCommittedCalls >= 2, 30_000);
       await until(() => kgRows().some((r) => r.status === "completed"), 30_000);
       await untilMarkerClear(client, 30_000);
