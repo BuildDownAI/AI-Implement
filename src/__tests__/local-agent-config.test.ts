@@ -18,7 +18,7 @@ const PROJECT = "local-proj";
 let root: string;
 let repo: string;
 let outside: string;
-let lockDir: string;
+const LOCK = ".session.json.ai-lock";
 let diagnostics: LocalAgentConfigDiagnostic[];
 
 async function privateFile(path: string, content: string): Promise<string> {
@@ -84,7 +84,6 @@ beforeEach(async () => {
   await chmod(root, 0o700);
   repo = join(root, "repo");
   outside = join(root, "outside");
-  lockDir = join(root, "locks");
   await mkdir(repo);
   await mkdir(outside, { mode: 0o700 });
   await chmod(outside, 0o700);
@@ -199,7 +198,7 @@ describe("loadLocalAgentConfig", () => {
 describe("ownership and port", () => {
   async function setup(extraOutsideAlias = false) {
     const loaded = await loadLocalAgentConfig(opts(await writeConfig(baseConfig())));
-    const ownership = new LocalSessionOwnership({ lockDir, forbiddenRoots: [repo], onDiagnostic: (d) => diagnostics.push(d) });
+    const ownership = new LocalSessionOwnership({ forbiddenRoots: [repo], onDiagnostic: (d) => diagnostics.push(d) });
     const port = createLocalCredentialPort({
       references: loaded.references,
       forbiddenRoots: [repo],
@@ -239,7 +238,7 @@ describe("ownership and port", () => {
       if (r.status === "rejected") expect((r.reason as LocalAgentConfigError).category).toBe("session_busy");
     }
     // A second instance (another process) is also refused.
-    const other = new LocalSessionOwnership({ lockDir, forbiddenRoots: [repo] });
+    const other = new LocalSessionOwnership({ forbiddenRoots: [repo] });
     await expectCategory(other.acquire(sub), "session_busy");
   });
 
@@ -266,7 +265,7 @@ describe("ownership and port", () => {
 
   it("keeps the old content and the hold when persistence fails", async () => {
     const loaded = await loadLocalAgentConfig(opts(await writeConfig(baseConfig())));
-    const ownership = new LocalSessionOwnership({ lockDir, forbiddenRoots: [repo] });
+    const ownership = new LocalSessionOwnership({ forbiddenRoots: [repo] });
     const port = createLocalCredentialPort({
       references: loaded.references,
       forbiddenRoots: [repo],
@@ -296,33 +295,86 @@ describe("ownership and port", () => {
     );
     await expectCategory(ownership.release(lease, { confirmTermination: async () => "exited" as never }), "termination_unconfirmed");
     expect(lease.status).toBe("held");
-    const lockFiles = await readdir(lockDir);
-    expect(lockFiles).toHaveLength(1);
-    expect(JSON.parse(await readFile(join(lockDir, lockFiles[0]), "utf8")).holdReason).toBe("termination_unconfirmed");
+    expect(JSON.parse(await readFile(join(outside, LOCK), "utf8")).holdReason).toBe("termination_unconfirmed");
     await expectCategory(ownership.acquire(sub), "session_busy");
     // Retry with confirmation releases the same held lease.
     await ownership.release(lease, { confirmTermination: async () => "confirmed" });
-    expect(await readdir(lockDir)).toEqual([]);
+    expect((await readdir(outside)).filter((n) => n.endsWith(".ai-lock"))).toEqual([]);
   });
 
   it("fences a stale owner whose lock was replaced or removed", async () => {
     const { ownership, port, sub } = await setup();
     const lease = await ownership.acquire(sub);
-    const [file] = await readdir(lockDir);
-    await rm(join(lockDir, file));
+    await rm(join(outside, LOCK));
     await expectCategory(port.persistSession!({ profileId: "sub-a", sessionData: "x" }), "stale_owner");
     await expectCategory(ownership.release(lease, { confirmTermination: async () => "confirmed" }), "stale_owner");
     expect(await readFile(join(outside, "session.json"), "utf8")).toBe(SESSION_SECRET);
   });
 
-  it("rejects lock directories inside the repository or with loose permissions", async () => {
+  it("uses one session-derived lock regardless of configuration, process or alias", async () => {
+    const { ownership, sub } = await setup();
+    await ownership.acquire(sub);
+    expect((await readdir(outside)).filter((n) => n.endsWith(".ai-lock"))).toEqual([LOCK]);
+    // Second configuration/instance (different io seam) sees the same authority.
+    const other = new LocalSessionOwnership({ forbiddenRoots: [repo], io: { syncDir: async () => undefined } });
+    await expectCategory(other.acquire(sub), "session_busy");
+    // A caller-supplied lockDir is ignored and cannot create a second authority.
+    const legacy = new LocalSessionOwnership({ lockDir: join(root, "other-locks"), forbiddenRoots: [repo] } as never);
+    await expectCategory(legacy.acquire(sub), "session_busy");
+    await expect(readdir(join(root, "other-locks"))).rejects.toThrow();
+    // A symlinked alias resolves to the same canonical lock under another profile id.
+    await symlink(join(outside, "session.json"), join(outside, "alias.json"));
+    await expectCategory(other.acquire({ ...sub, profileId: "alias", canonicalPath: join(outside, "alias.json") }), "session_busy");
+  });
+
+  it("rejects sessions inside the repository or in a group-writable directory", async () => {
     const { sub } = await setup();
+    await mkdir(join(repo, "s"));
+    await privateFile(join(repo, "s", "session.json"), "x");
     await expectCategory(
-      new LocalSessionOwnership({ lockDir: join(repo, "locks"), forbiddenRoots: [repo] }).acquire(sub),
+      new LocalSessionOwnership({ forbiddenRoots: [repo] }).acquire({ ...sub, canonicalPath: join(repo, "s", "session.json") }),
       "unsafe_path",
     );
-    await mkdir(lockDir, { mode: 0o777 });
-    await chmod(lockDir, 0o777);
-    await expectCategory(new LocalSessionOwnership({ lockDir, forbiddenRoots: [repo] }).acquire(sub), "unsafe_permissions");
+    await chmod(outside, 0o770);
+    await expectCategory(new LocalSessionOwnership({ forbiddenRoots: [repo] }).acquire(sub), "unsafe_permissions");
+  });
+
+  it("fails closed when the directory sync after persistence fails, then recovers on retry", async () => {
+    const loaded = await loadLocalAgentConfig(opts(await writeConfig(baseConfig())));
+    const ownership = new LocalSessionOwnership({ forbiddenRoots: [repo] });
+    let failSync = true;
+    const port = createLocalCredentialPort({
+      references: loaded.references,
+      forbiddenRoots: [repo],
+      ownership,
+      onDiagnostic: (d) => diagnostics.push(d),
+      io: { syncDir: async () => { if (failSync) throw new Error(`sync ${SESSION_SECRET}`); } },
+    });
+    const sub = loaded.references.get("sub-a")!;
+    const lease = await ownership.acquire(sub);
+    await expectCategory(port.persistSession!({ profileId: "sub-a", sessionData: "fresh-1" }), "persistence_failed");
+    expect(lease.refreshed).toBe(false);
+    await expectCategory(ownership.release(lease, { confirmTermination: async () => "confirmed" }), "persistence_missing");
+    expect(lease.status).toBe("held");
+    expect((await readdir(outside)).filter((n) => n.endsWith(".ai-lock"))).toEqual([LOCK]);
+    await expectCategory(ownership.acquire(sub), "session_busy");
+
+    failSync = false;
+    await port.persistSession!({ profileId: "sub-a", sessionData: "fresh-2" });
+    expect(await readFile(join(outside, "session.json"), "utf8")).toBe("fresh-2");
+    expect((await stat(join(outside, "session.json"))).mode & 0o777).toBe(0o600);
+    expect(lease.refreshed).toBe(true);
+    await ownership.release(lease, { confirmTermination: async () => "confirmed" });
+    expect(lease.status).toBe("released");
+    expect((await readdir(outside)).filter((n) => n.endsWith(".ai-lock"))).toEqual([]);
+  });
+
+  it("keeps the lock as a hold when directory sync fails on acquisition", async () => {
+    const { sub } = await setup();
+    const failing = new LocalSessionOwnership({ forbiddenRoots: [repo], io: { syncDir: async () => { throw new Error("nope"); } } });
+    await expectCategory(failing.acquire(sub), "ownership_failed");
+    expect(failing.leaseFor("sub-a")?.status).toBe("held");
+    expect((await readdir(outside)).filter((n) => n.endsWith(".ai-lock"))).toEqual([LOCK]);
+    await expectCategory(new LocalSessionOwnership({ forbiddenRoots: [repo] }).acquire(sub), "session_busy");
   });
 });
