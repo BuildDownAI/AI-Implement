@@ -1,6 +1,7 @@
 import {
   runPlanningLocally,
   type PlanningExecutor,
+  type PlanningStageExecutor,
   type RunPlanningLocalOptions,
 } from "../run-planning.js";
 import {
@@ -10,6 +11,7 @@ import {
 import type { LocalRunPass, LocalRunTokenSummary } from "./run-result.js";
 import type { LLMExecutor, PipelineDefinition, StepReporter } from "../pipeline/types.js";
 import type { PipelineRunner } from "../pipeline/runner.js";
+import type { ResolvedAgentSnapshotV1 } from "../run-config.js";
 
 export type LocalExitClassification =
   | "success"
@@ -36,6 +38,10 @@ export interface LocalFullLoopOptions {
   model?: string;
   planningExecutor?: PlanningExecutor;
   llmExecutor?: LLMExecutor;
+  /** Resolved stage snapshot (AII-944). Not consumed yet; absent = legacy behavior. */
+  agentConfig?: ResolvedAgentSnapshotV1;
+  /** Asynchronous stage executor for configured planning (AII-944). Not consumed yet. */
+  stageExecutor?: PlanningStageExecutor;
   reporter?: StepReporter;
   pipeline?: PipelineDefinition;
   runner?: PipelineRunner;

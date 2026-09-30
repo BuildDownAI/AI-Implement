@@ -141,6 +141,7 @@ interface RunConfigV1 {
     prNumber: number;
     deadlineAt: number;
   };
+  agentConfig?: ResolvedAgentSnapshotV1; // AII-944, see "Resolved agent snapshot"
 }
 ```
 
@@ -163,6 +164,60 @@ Field notes:
 | `reviewers` | Project reviewer selection copied from the mapping when non-null. Each entry carries a reviewer `id` and whether that reviewer `gates` merge readiness. Absent means the runner uses `DEFAULT_REVIEWER_SELECTION` (`gap-analysis` and `code-review`, both gating), not an empty list; this keeps older orchestrators and already-dispatched runs from silently losing their review gate. Malformed values are dropped during decode with one warning and then resolve to the same default. The runner forwards the selection to the post-push review step, which runs selected internal reviewers, applies their gating policy, and fails closed for an empty selection. The external `claude-review-summary` id controls prose gating rather than resolving executable reviewer code. |
 | `retryPolicy` | Global retry/backoff policy and reviewer turn cap, edited on the admin Settings page and stored in the orchestrator's `settings` table (never an env var). Absent means the runner uses `DEFAULT_RETRY_POLICY` (`src/pipeline/retry-backoff.ts`). Populated by `getRetryPolicy()` on every implementation-phase and gap-analysis-phase dispatch across all three execution modes — the initial dispatch, the `/ai-implement` comment gap-fill drain, the PR-comment gap-fill trigger, and the review-fix re-dispatch — because `pushRetries` and `reviewMaxTurns` apply to those re-dispatches exactly as to initial runs. Never sent on planning or kg-refresh dispatches, which have no retry loop. On the GHA path, `buildEnvelopeDispatchInputs`'s `retryPolicy` option is required (nullable), not optional — a caller can no longer omit it silently, it must state intent: planning passes `null` explicitly, implementation/gap-analysis pass the real policy from `getRetryPolicy()`. The function itself only stamps the field into `run_config` when `runnerPhase` is neither `planning` nor `kg-refresh`, substituting `DEFAULT_RETRY_POLICY` only if the passed value is `null`, so all three backends agree that every implementation/gap-analysis dispatch carries this field. The runner runs the decoded value through `normalizeRetryPolicy` (an out-of-range or malformed field degrades to the default for that field alone; an unknown key is dropped). The `push` step consumes `pushRetries` and the backoff fields (see [pipeline-architecture.md](pipeline-architecture.md), "Push retry and remote reconciliation"); the remaining fields are stored and transported so the retry rails built on top of them read one source of truth. |
 | `reviewFix` | The Restate review-fix pilot's explicit attempt-identity marker (AII-776), shaped by the canonical AII-770 contract (`src/review-fix-contract.ts`'s `ReviewFixMetadataV1`): `attemptId` identifies one Restate attempt, `installationId`/`repository`/`prNumber` scope it to one PR under one GitHub App installation, and `deadlineAt` is an epoch-ms timestamp (not ISO) so it compares with plain `<`/`>`. Absent means Legacy (non-pilot) dispatch, the only path the legacy flat-env contract can produce — there is no environment-variable equivalent. Unlike every other optional field on this envelope, a **present but malformed or unsupported** `reviewFix` fails closed: `decodeRunConfig` throws rather than dropping the field and falling back to Legacy, because a bad pilot marker must never be silently treated as a non-pilot dispatch. Carries no credential or token — repository/PR/execution authority is verified downstream against stored state, never trusted from this field alone. This slice only carries the field through `RunConfigV1` and `ResolvedRunnerInputs`; no pipeline step reads it yet. |
+
+## Resolved agent snapshot (`agentConfig`, AII-944)
+
+`agentConfig` is an optional, frozen, already-resolved stage configuration: `{ version: 1, snapshotId, configRevisions: { orchestratorDefault, project }, stages, sources, profiles }`. `stages`, `sources` and `profiles` each hold exactly `planning`, `implementation` and `review`. Each stage carries `agent`, `provider`, `model`, `accountProfileId` and `invocationTimeoutMs` (the actual limit; `maxTurns`/`maxIterations` stay separate envelope fields and turns are never converted to time). `sources` holds a `FieldSource` per field; `profiles` holds the safe projection `id/identity/revision/agent/provider/authMode`. All five `AccountAuthMode` values are valid, including `claude-subscription`. The snapshot `version` is independent of envelope `v`. The types come from `src/agent-config.ts`, which is unchanged.
+
+- **Validation** is `validateResolvedAgentSnapshot` in `src/run-config.ts` (pure, no SQLite). It runs on `encodeRunConfig`, `decodeRunConfig`, `pickKnownKeys` and `buildImplRunConfig`. It checks structure, version, required stages, positive integer revisions/timeouts, allowed sources, stage/profile consistency (id, agent, provider) and the supported agent/provider/authMode combinations, and rejects unknown fields at every level (including credential-shaped ones). Diagnostics name the path only and never echo values.
+- **Fail closed.** A present-but-invalid `agentConfig` throws, like `reviewFix`; it never falls back to legacy. Absent means legacy behavior, byte-for-byte unchanged.
+- **Data, not authorization.** Decoding does not re-resolve defaults or check profile permissions. Trusted preparation and dispatch authorization come later. Credential grant values belong only to the protected bootstrap namespace (AII-680), never this field.
+- **Builder.** `buildImplRunConfig` accepts an optional `agentConfig`, validates it and copies it; it never resolves settings.
+- **Not to be confused with** `profiles` (workflow profiles) or `InvokeParams.stage` (a diagnostic label). `InvokeParams.agentStage` (`StageName`) and `invocationTimeoutMs` are new optional fields; `LLMExecutor` and `PlanningExecutor` are unchanged. `RunPlanningLocalOptions` and `LocalFullLoopOptions` gain optional `agentConfig` and async `stageExecutor` inputs, not yet consumed.
+
+### Writer census (no writer sets the field in this wave)
+
+Verified by grep: the only `src/` files mentioning `agentConfig`, `agentStage` or `invocationTimeoutMs` are `run-config.ts`, `pipeline/types.ts`, `run-planning.ts`, `local/full-loop.ts` and `agent-config.ts` (definitions only). No caller below is edited.
+
+| File | Role | Status |
+|---|---|---|
+| `src/run-config.ts` | `encodeRunConfig` / `decodeRunConfig` / `pickKnownKeys` / `buildImplRunConfig` | Validates and passes through when present; absent stays absent |
+| `src/github.ts` (dispatch builders, `RunConfigV1` literal, `encodeRunConfig`) | GHA writer | Does not set `agentConfig` |
+| `src/index.ts` (planning `RunConfigV1` literal, `buildImplRunConfig` call, KG writers) | Orchestrator writers | Do not set `agentConfig`; builder call omits the new input |
+| `src/local-gapfill.ts` | `decodeRunConfig` then `encodeRunConfig` | Passes through a present snapshot (re-validated); does not set it |
+| `src/dev-harness/index.ts` | `encodeRunConfig` of a literal | Does not set `agentConfig` |
+| `src/run-autonomous.ts` | `decodeRunConfig` (reader of the envelope) | Does not set it |
+| `src/run-planning.ts` | `decodeRunConfig`; `RunPlanningLocalOptions` gains optional `agentConfig` / `stageExecutor` | Does not set it; new options unconsumed |
+| `src/run-local-planning.ts`, `src/run-local-full-loop.ts` | `decodeRunConfig` of the encoded envelope | Do not set it |
+| `src/local/full-loop.ts` | `LocalFullLoopOptions` gains optional `agentConfig` / `stageExecutor` | Does not set it; new options unconsumed |
+| `src/pipeline/kg-refresh-run.ts` | `decodeRunConfig` | Does not set it |
+
+### Reader census
+
+`InvokeParams` readers (none reads `agentStage` or `invocationTimeoutMs`; all ignore them today):
+
+| File | Use |
+|---|---|
+| `src/pipeline/executor.ts` | `ClaudeCliExecutor.invoke` / `spawnOnce` consume existing params only |
+| `src/run-planning.ts` | `PlanningStageExecutor` type takes `InvokeParams`; fields not read |
+| `src/pipeline/steps/implement.ts`, `feedback-loop.ts`, `review.ts`, `post-push-review.ts` | Build `InvokeParams` for `llmExecutor.invoke`; do not set the new fields |
+| `src/pipeline/context.ts` | No-op default executor; ignores params |
+| `src/run-autonomous.ts`, `src/pipeline/kg-refresh-run.ts`, `src/local/full-loop.ts` | Accept an optional custom `LLMExecutor`; do not inspect params |
+
+`PipelineContextData` readers (none reads `agentConfig`): `src/pipeline/context.ts` (holds `data`), `src/pipeline/pipeline-loader.ts`, `src/pipeline/steps/kg-ingest.ts`, `src/pipeline/kg-refresh-run.ts`, `src/run-autonomous.ts` (constructs it from the decoded envelope without copying the snapshot). The `PipelineContextData.agentConfig` field is new and unread.
+
+`decodeRunConfig` consumers are the files listed in the writer census that import it.
+
+### Mixed-version matrix
+
+| Orchestrator | Runner | Result |
+|---|---|---|
+| old (no field) | new | Field absent, legacy behavior |
+| new, legacy project | old or new | Field absent, legacy behavior |
+| new, opted-in project | new | Snapshot validated; consumed once dispatch wiring lands |
+| new, opted-in project | old | **Unsafe:** `pickKnownKeys` silently drops the field and the run executes legacy |
+
+The last row must never happen. No production writer sets `agentConfig` in this wave. The readiness gate that rejects configured work on runners lacking snapshot support ships with dispatch wiring and must land before any writer enables the field; it must reject, not silently run legacy. Rollback: keep project opt-in disabled for new attempts; the schema addition is harmless to mixed versions.
 
 Below the TS runner layer, `session/entrypoint.sh` picks the phase (and, for kg-refresh, the callback URL it re-exports) via `resolve_envelope_field` in `session/lib.sh`: when `RUNNER_PHASE` (or `RUNNER_CALLBACK_URL`) is already set in the container env, that value wins and the envelope is not consulted; only when the env var is empty does the shell decode `AI_IMPLEMENT_RUN_CONFIG` and fill it from `runnerPhase` / `runnerCallbackUrl`, falling back to the `implementation` default (no fallback for the callback URL) if the envelope is absent, malformed, or lacks the field. Env-wins matters because Fly Machines and local Docker set `RUNNER_PHASE`/`RUNNER_CALLBACK_URL` directly in the container env, and the local dev harness (`npm run dev:run`) sets `RUNNER_PHASE=full` or `local-planning` while its envelope still carries `runnerPhase: implementation` — if the envelope won, a local dev run would silently switch to the autonomous loop instead of the local full loop it asked for.
 

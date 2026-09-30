@@ -3,7 +3,8 @@ import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { parseWorkflowMd } from "./workflow-md.js";
 import { postRunnerResult } from "./runner-result.js";
-import { decodeRunConfig } from "./run-config.js";
+import { decodeRunConfig, type ResolvedAgentSnapshotV1 } from "./run-config.js";
+import type { InvokeParams, LLMResult } from "./pipeline/types.js";
 import { DEFAULT_MODEL } from "./pipeline/default-model.js";
 
 export type PlanningExecutor = (
@@ -11,6 +12,10 @@ export type PlanningExecutor = (
   args: string[],
   cwd: string,
 ) => { status: number | null; stdout: string; stderr: string };
+
+/** Asynchronous stage executor for configured runs (AII-944). Separate from the synchronous
+ *  `PlanningExecutor`, which is unchanged. Not wired yet. */
+export type PlanningStageExecutor = (params: InvokeParams) => Promise<LLMResult>;
 
 const defaultExecutor: PlanningExecutor = (prompt, args, cwd) => {
   const r = spawnSync("claude", [...args, "-p", prompt], {
@@ -91,6 +96,10 @@ export interface RunPlanningLocalOptions {
   dependencies?: string;
   model?: string;
   executor?: PlanningExecutor;
+  /** Resolved stage snapshot (AII-944). Not consumed yet; absent = legacy behavior. */
+  agentConfig?: ResolvedAgentSnapshotV1;
+  /** Asynchronous stage executor for configured runs (AII-944). Not consumed yet. */
+  stageExecutor?: PlanningStageExecutor;
 }
 
 export interface RunPlanningLocalResult {
