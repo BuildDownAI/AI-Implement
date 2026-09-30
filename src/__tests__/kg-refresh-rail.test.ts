@@ -82,6 +82,8 @@ describe("kg-refresh-rail", () => {
     fixtureRepo = mkdtempSync(join(tmpdir(), "kgrepo-"));
     writeFileSync(join(fixtureRepo, "sources.yml"), `namespace: ${NAMESPACE}\n`);
     mkdirSync(join(fixtureRepo, "snapshot"), { recursive: true });
+    writeFileSync(join(fixtureRepo, "snapshot", "embeddings.npz"), "vectors");
+    writeFileSync(join(fixtureRepo, "snapshot", "embeddings.meta.json"), "{}");
     tarball = makeTarball(fixtureRepo);
 
     servedStamp = OLD_STAMP;
@@ -126,6 +128,43 @@ describe("kg-refresh-rail", () => {
       expect(result.gate).toBe("ingest-needed");
       expect(result.detail).toContain("Graph is current");
       expect(existsSync(join(dataRoot, "fetch"))).toBe(false);
+    });
+
+    it("short-circuits to ingest-needed when the recorded SHA is null and the snapshot has no committed embeddings", async () => {
+      rmSync(join(fixtureRepo, "snapshot", "embeddings.npz"));
+      rmSync(join(fixtureRepo, "snapshot", "embeddings.meta.json"));
+      const noEmbeddingsTarball = makeTarball(fixtureRepo);
+      const deps = makeDeps({ fetchTarball: vi.fn(async () => noEmbeddingsTarball) as never });
+      const result = await fetchGate(deps, {});
+      expect(result.gate).toBe("ingest-needed");
+      expect(result.detail).toBe("Snapshot has no committed embeddings — a new ingest is required");
+      expect(existsSync(join(dataRoot, "fetch"))).toBe(false);
+      expect(persistSnapshotSha).not.toHaveBeenCalled();
+    });
+
+    it("short-circuits to ingest-needed when the recorded SHA differs and only embeddings.npz is present (no .meta.json)", async () => {
+      rmSync(join(fixtureRepo, "snapshot", "embeddings.meta.json"));
+      const npzOnlyTarball = makeTarball(fixtureRepo);
+      const deps = makeDeps({
+        fetchTarball: vi.fn(async () => npzOnlyTarball) as never,
+        loadSnapshotSha: vi.fn(() => "0000000000000000000000000000000000000000") as never,
+      });
+      const result = await fetchGate(deps, {});
+      expect(result.gate).toBe("ingest-needed");
+      expect(result.detail).toBe("Snapshot has no committed embeddings — a new ingest is required");
+    });
+
+    it("still reports 'Graph is current' on a matching SHA even when embeddings are missing — the SHA check wins", async () => {
+      rmSync(join(fixtureRepo, "snapshot", "embeddings.npz"));
+      rmSync(join(fixtureRepo, "snapshot", "embeddings.meta.json"));
+      const noEmbeddingsTarball = makeTarball(fixtureRepo);
+      const deps = makeDeps({
+        fetchTarball: vi.fn(async () => noEmbeddingsTarball) as never,
+        loadSnapshotSha: vi.fn(() => SNAPSHOT_SHA) as never,
+      });
+      const result = await fetchGate(deps, {});
+      expect(result.gate).toBe("ingest-needed");
+      expect(result.detail).toContain("Graph is current");
     });
 
     it("permanent failure: a mint failure throws RailGateError(staging)", async () => {
@@ -316,6 +355,19 @@ describe("kg-refresh-rail", () => {
       const outcome = await runRail(deps);
       expect(outcome.ok).toBe(false);
       expect(outcome.gate).toBe("ingest-needed");
+      expect(materialize).not.toHaveBeenCalled();
+      expect(restart).not.toHaveBeenCalled();
+    });
+
+    it("a snapshot with no committed embeddings resolves to ingest-needed without calling materialize", async () => {
+      rmSync(join(fixtureRepo, "snapshot", "embeddings.npz"));
+      rmSync(join(fixtureRepo, "snapshot", "embeddings.meta.json"));
+      const noEmbeddingsTarball = makeTarball(fixtureRepo);
+      const deps = makeDeps({ fetchTarball: vi.fn(async () => noEmbeddingsTarball) as never });
+      const outcome = await runRail(deps);
+      expect(outcome.ok).toBe(false);
+      expect(outcome.gate).toBe("ingest-needed");
+      expect(outcome.detail).toContain("no committed embeddings");
       expect(materialize).not.toHaveBeenCalled();
       expect(restart).not.toHaveBeenCalled();
     });
