@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { createCipheriv, randomBytes } from "node:crypto";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, mkdtempSync, symlinkSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -155,7 +155,9 @@ describe("buildModelInvocationEnv", () => {
       inheritedEnv,
       protectedKeys: ["MODEL_AUTH_KEY"],
     });
-    expect(env.OPENAI_API_KEY).toBe(S_API);
+    expect(env.CODEX_API_KEY).toBe(S_API);
+    expect(env).not.toHaveProperty("OPENAI_API_KEY");
+    expect(env).not.toHaveProperty("CODEX_HOME");
     expect(env.PATH).toBe("/bin");
     expect(JSON.stringify(env)).not.toContain(S_INHERITED);
     expect(env).not.toHaveProperty("ANTHROPIC_API_KEY");
@@ -395,7 +397,8 @@ describe("client", () => {
     await client.checkout({ profileId: "api", authMode: "openai-api-key" });
     expect(readdirSync(authRoot)).toEqual([]);
     await client.invoke("api", async (inv) => {
-      expect(inv.env.OPENAI_API_KEY).toBe(S_API);
+      expect(inv.env.CODEX_API_KEY).toBe(S_API);
+      expect(inv.env).not.toHaveProperty("OPENAI_API_KEY");
       expect(inv.env).not.toHaveProperty("ANTHROPIC_API_KEY");
     });
     await client.finish("api", "completed");
@@ -597,7 +600,7 @@ describe("client", () => {
 
   it("local credential port failure and kind mismatch use safe categories", async () => {
     const mk = (load: LocalCredentialPort["load"]) =>
-      createModelAuthClient({ source: { kind: "local", port: { load } }, authRoot, forbiddenRoots: [workspace] });
+      createModelAuthClient({ source: { kind: "local", port: { load, persistSession: async () => undefined } }, authRoot, forbiddenRoots: [workspace] });
     expect(
       await categoryAsync(
         mk(async () => {
@@ -609,6 +612,178 @@ describe("client", () => {
       await categoryAsync(mk(async () => ({ kind: "api-key", apiKey: S_API })).checkout(sub)),
     ).toBe("credential_source_mismatch");
     expect(readdirSync(authRoot)).toEqual([]);
+  });
+
+  describe("AII-988 hardening", () => {
+    const localPort = (over: Partial<LocalCredentialPort> = {}): LocalCredentialPort => ({
+      load: async () => ({ kind: "session", sessionData: S_SESSION, stateSequence: 0 }),
+      persistSession: async () => undefined,
+      ...over,
+    });
+    const local = (port: LocalCredentialPort, extra: Partial<ModelAuthClientOptions> = {}) =>
+      createModelAuthClient({
+        source: { kind: "local", port },
+        authRoot,
+        forbiddenRoots: [workspace],
+        inheritedEnv: { PATH: "/bin" },
+        ...extra,
+      });
+
+    it("local subscription without persistSession fails before any file or model call", async () => {
+      const load = vi.fn(localPort().load);
+      const client = local({ load });
+      expect(await categoryAsync(client.checkout(sub))).toBe("credential_source_failed");
+      expect(load).not.toHaveBeenCalled();
+      expect(readdirSync(authRoot)).toEqual([]);
+    });
+
+    it("local API-only ports may omit persistSession", async () => {
+      const client = local({ load: async () => ({ kind: "api-key", apiKey: S_API }) });
+      await client.checkout({ profileId: "api", authMode: "openai-api-key" });
+      await client.invoke("api", async (inv) => expect(inv.env.CODEX_API_KEY).toBe(S_API));
+    });
+
+    it("failed persistence blocks further calls with a category-only error", async () => {
+      const client = local(localPort({ persistSession: async () => Promise.reject(new Error(S_REFRESHED)) }));
+      await client.checkout(sub);
+      const err = (await client.invoke("sub", async () => 1).catch((e) => e)) as ModelAuthClientError;
+      expect(err.category).toBe("credential_source_failed");
+      expect(err.message).not.toContain("SENTINEL");
+      expect(client.status("sub")).toBe("rejected");
+      const spy = vi.fn(async () => 1);
+      expect(await categoryAsync(client.invoke("sub", spy))).toBe("checkpoint_uncertain");
+      expect(spy).not.toHaveBeenCalled();
+    });
+
+    it("rejects symlinked authRoot, symlinked parent, traversal; allows prefix collisions", async () => {
+      const link = join(root, "link-to-workspace");
+      symlinkSync(workspace, link);
+      const parentLink = join(root, "parent-link");
+      symlinkSync(workspace, parentLink);
+      mkdirSync(join(workspace, "inner"));
+      const { transport } = fakeTransport(() => okCheckout());
+      for (const bad of [link, join(parentLink, "inner"), join(authRoot, "..", "workspace"), join(root, "auth", "..", "workspace", "inner")]) {
+        const client = make(transport, { authRoot: bad });
+        expect(await categoryAsync(client.checkout(sub))).toBe("auth_dir_unsafe");
+      }
+      expect(readdirSync(join(workspace, "inner"))).toEqual([]);
+      expect(readdirSync(workspace)).toEqual(["inner"]);
+      // prefix collision: sibling "workspace-auth" is not inside "workspace"
+      const sibling = join(root, "workspace-auth");
+      mkdirSync(sibling);
+      const ok = make(transport, { authRoot: sibling });
+      await ok.checkout(sub);
+      const dir = join(sibling, readdirSync(sibling)[0]!);
+      expect(statSync(dir).mode & 0o777).toBe(0o700);
+    });
+
+    it("strips every authority leak by default and from the passed env only", () => {
+      const prev = process.env.AI_IMPLEMENT_FORWARDED_SECRETS;
+      process.env.AI_IMPLEMENT_FORWARDED_SECRETS = "UNRELATED";
+      try {
+        const leak = "SENTINEL-leak-0007";
+        const inheritedEnv = {
+          PATH: "/bin",
+          HOME: "/home/x",
+          SSL_CERT_FILE: "/etc/ca.pem",
+          HTTPS_PROXY: "http://proxy:3128",
+          RUNNER_CALLBACK_URL: leak,
+          RUNNER_CALLBACK_BASE_URL: leak,
+          RUN_TOKEN: leak,
+          RUN_PROGRESS_TOKEN: leak,
+          RUN_PUBLICATION_TOKEN: leak,
+          RUN_RESULT_TOKEN: leak,
+          GITHUB_TOKEN: leak,
+          GH_TOKEN: leak,
+          NPM_TOKEN: leak,
+          AI_IMPLEMENT_DEP_TOKEN_OVERRIDE: leak,
+          AI_IMPLEMENT_RUN_CONFIG: leak,
+          AI_IMPLEMENT_FORWARDED_SECRETS: "MY_FWD, OTHER_FWD",
+          MY_FWD: leak,
+          OTHER_FWD: leak,
+          UNRELATED: "kept",
+          MODEL_AUTH_KEY: leak,
+          OPENAI_BASE_URL: leak,
+          ANTHROPIC_BASE_URL: leak,
+          ANTHROPIC_BEDROCK_BASE_URL: leak,
+          CLAUDE_CODE_USE_VERTEX: "1",
+          ANTHROPIC_VERTEX_PROJECT_ID: leak,
+        };
+        for (const [authMode, secret] of [
+          ["openai-api-key", { kind: "api-key", apiKey: S_API }],
+          ["anthropic-api-key", { kind: "api-key", apiKey: S_API }],
+        ] as const) {
+          const { env, strippedKeys } = buildModelInvocationEnv({
+            authMode,
+            secret,
+            inheritedEnv,
+            protectedKeys: ["MODEL_AUTH_KEY"],
+          });
+          expect(JSON.stringify(env)).not.toContain(leak);
+          expect(JSON.stringify(strippedKeys)).not.toContain(leak);
+          expect(env).not.toHaveProperty("CLAUDE_CODE_USE_VERTEX");
+          expect(env).not.toHaveProperty("OPENAI_BASE_URL");
+          expect(env).not.toHaveProperty("MODEL_AUTH_KEY");
+          expect(env).toMatchObject({ PATH: "/bin", HOME: "/home/x", SSL_CERT_FILE: "/etc/ca.pem", HTTPS_PROXY: "http://proxy:3128", UNRELATED: "kept" });
+        }
+      } finally {
+        if (prev === undefined) delete process.env.AI_IMPLEMENT_FORWARDED_SECRETS;
+        else process.env.AI_IMPLEMENT_FORWARDED_SECRETS = prev;
+      }
+    });
+
+    it("codex subscription ignores inherited API keys and points at the private dir", () => {
+      const { env } = buildModelInvocationEnv({
+        authMode: "codex-subscription",
+        secret: { kind: "session", sessionData: S_SESSION, stateSequence: 0 },
+        authDir: "/private",
+        inheritedEnv: { OPENAI_API_KEY: S_INHERITED, CODEX_API_KEY: S_INHERITED, CODEX_HOME: "/x" },
+      });
+      expect(env).toEqual({ CODEX_HOME: "/private" });
+    });
+
+    it("dispose fails without deleting while an invocation is active, then succeeds", async () => {
+      const client = local(localPort());
+      await client.checkout(sub);
+      let release!: () => void;
+      const running = client.invoke("sub", () => new Promise<void>((r) => (release = r)));
+      await Promise.resolve();
+      expect(await categoryAsync(client.dispose())).toBe("invocation_in_progress");
+      expect(readdirSync(authRoot)).toHaveLength(1);
+      release();
+      await running;
+      await client.dispose();
+      expect(readdirSync(authRoot)).toEqual([]);
+    });
+
+    it("no use after disposal, for API and subscription profiles", async () => {
+      const client = local(localPort());
+      await client.dispose();
+      const spy = vi.fn(async () => 1);
+      expect(await categoryAsync(client.checkout(sub))).toBe("client_disposed");
+      expect(await categoryAsync(client.checkout({ profileId: "api", authMode: "openai-api-key" }))).toBe("client_disposed");
+      expect(await categoryAsync(client.invoke("sub", spy))).toBe("client_disposed");
+      expect(await categoryAsync(client.invoke("api", spy))).toBe("client_disposed");
+      expect(spy).not.toHaveBeenCalled();
+
+      const used = local(localPort());
+      await used.checkout(sub);
+      await used.dispose();
+      expect(await categoryAsync(used.invoke("sub", spy))).toBe("client_disposed");
+      expect(spy).not.toHaveBeenCalled();
+    });
+
+    it("dispose preserves uncertain state and pending payload and makes no transport call", async () => {
+      const f = fakeTransport((route) => (route === MODEL_AUTH_ROUTES.checkout ? okCheckout() : Promise.reject(new Error("down"))));
+      const reconcile = vi.fn(async () => "unknown" as const);
+      const client = make(f.transport, { maxTransportAttempts: 1, reconcile });
+      await client.checkout(sub);
+      await client.invoke("sub", async () => undefined).catch(() => undefined);
+      const before = f.calls.length;
+      await client.dispose();
+      expect(f.calls.length).toBe(before);
+      expect(client.status("sub")).toBe("uncertain");
+    });
   });
 
   it("diagnostics carry no bearer or secret", async () => {
