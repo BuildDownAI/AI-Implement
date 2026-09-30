@@ -200,6 +200,7 @@ describe("stage configuration", () => {
     expect(r.resolution.stages.implementation.accountProfileId).toBe("codex-alt");
     expect(r.resolution.sources.implementation.model).toBe("project");
     expect(r.configRevisionIds).toHaveLength(2);
+    expect(r.configRevisionIds).toEqual([r.configReferences!.orchestratorDefault.configRevisionId, r.configReferences!.project.configRevisionId]);
 
     const cleared = store.clearProjectStageField("AII", "implementation", "accountProfileId");
     expect(cleared.revision).toBe(3);
@@ -279,5 +280,73 @@ describe("stage configuration", () => {
     const json = JSON.stringify(store.resolveProjectStageConfig("AII"));
     expect(json).not.toContain("vault/claude-main");
     expect(json).not.toContain("metadata");
+  });
+});
+
+describe("config references and frozen snapshots", () => {
+  const rowById = (id: string) =>
+    dedup.getDb().prepare("SELECT config_revision_id, revision, config_json FROM stage_agent_config_revisions WHERE config_revision_id = ?").get(id) as
+      | { config_revision_id: string; revision: number; config_json: string }
+      | undefined;
+
+  function optIn(): void {
+    seed();
+    store.setProjectOptIn("AII", true);
+  }
+
+  it("legacy resolution has no references or ids", () => {
+    expect(store.resolveProjectStageConfig("AII")).toEqual({ resolution: { mode: "legacy" }, configRevisionIds: [] });
+    seed();
+    expect(store.resolveProjectStageConfig("AII").configReferences).toBeUndefined();
+  });
+
+  it("returns exact row ids and revisions for both layers", () => {
+    optIn();
+    const r = store.resolveProjectStageConfig("AII");
+    const d = store.getOrchestratorDefaults()!;
+    const p = store.getProjectStageConfig("AII")!;
+    expect(r.configReferences).toEqual({
+      orchestratorDefault: { configRevisionId: d.configRevisionId, revision: d.revision },
+      project: { configRevisionId: p.configRevisionId, revision: p.revision },
+    });
+    expect(r.configRevisionIds).toEqual([d.configRevisionId, p.configRevisionId]);
+  });
+
+  it("builds a snapshot from real resolution that validates and round-trips", async () => {
+    optIn();
+    const r = store.resolveProjectStageConfig("AII");
+    if (r.resolution.mode !== "configured" || !r.configReferences) throw new Error("expected configured");
+    const snapshot = {
+      version: 1 as const,
+      snapshotId: "snap-store",
+      configRevisions: r.configReferences,
+      stages: r.resolution.stages,
+      sources: r.resolution.sources,
+      profiles: r.resolution.profiles,
+    };
+    const rc = await import("../run-config.js");
+    expect(rc.validateResolvedAgentSnapshot(snapshot)).toEqual(snapshot);
+    const cfg = { v: 1, issue: { id: "1", identifier: "A-1", title: "t", description: "d" }, agentConfig: snapshot } as unknown as Parameters<typeof rc.encodeRunConfig>[0];
+    expect(rc.decodeRunConfig(rc.encodeRunConfig(cfg)).agentConfig).toEqual(snapshot);
+  });
+
+  it("referenced rows keep identity after later edits", () => {
+    optIn();
+    const before = store.resolveProjectStageConfig("AII").configReferences!;
+    const frozen = {
+      d: rowById(before.orchestratorDefault.configRevisionId)!,
+      p: rowById(before.project.configRevisionId)!,
+    };
+    store.setOrchestratorDefaults({ ...defaults(), stages: { ...defaults().stages, review: stage("codex-main", "codex", "openai") } });
+    store.setProjectStageConfig("AII", { version: 1, mode: "configured", stages: { review: { model: "m-9" } } });
+    const after = store.resolveProjectStageConfig("AII").configReferences!;
+    expect(after.orchestratorDefault.configRevisionId).not.toBe(before.orchestratorDefault.configRevisionId);
+    expect(after.orchestratorDefault.revision).toBeGreaterThan(before.orchestratorDefault.revision);
+    expect(after.project.configRevisionId).not.toBe(before.project.configRevisionId);
+    expect(after.project.revision).toBeGreaterThan(before.project.revision);
+    expect(rowById(before.orchestratorDefault.configRevisionId)).toEqual(frozen.d);
+    expect(rowById(before.project.configRevisionId)).toEqual(frozen.p);
+    expect(frozen.d.revision).toBe(before.orchestratorDefault.revision);
+    expect(frozen.p.revision).toBe(before.project.revision);
   });
 });

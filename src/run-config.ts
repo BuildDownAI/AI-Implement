@@ -21,11 +21,16 @@ export const RESOLVED_AGENT_SNAPSHOT_VERSION = 1;
  * It is data, not proof of authorization, and never carries a credential value — credential
  * grants belong to the protected bootstrap namespace (AII-680), not this field.
  */
+export interface ConfigRevisionRef {
+  configRevisionId: string;
+  revision: number;
+}
+
 export interface ResolvedAgentSnapshotV1 {
   version: 1;
   snapshotId: string;
-  /** Revisions of the configuration layers the snapshot was resolved from. */
-  configRevisions: { orchestratorDefault: number; project: number };
+  /** Immutable row id and positive revision of each configuration layer the snapshot was resolved from. */
+  configRevisions: { orchestratorDefault: ConfigRevisionRef; project: ConfigRevisionRef };
   stages: ConfiguredStageResolution["stages"];
   sources: ConfiguredStageResolution["sources"];
   profiles: ConfiguredStageResolution["profiles"];
@@ -158,9 +163,17 @@ export function validateResolvedAgentSnapshot(value: unknown): ResolvedAgentSnap
   const snapshotId = snapshotString(root.snapshotId, ".snapshotId");
   const revs = snapshotObject(root.configRevisions, ".configRevisions");
   snapshotKeys(revs, ["orchestratorDefault", "project"], ".configRevisions");
+  const revisionRef = (raw: unknown, path: string): ConfigRevisionRef => {
+    const ref = snapshotObject(raw, path);
+    snapshotKeys(ref, ["configRevisionId", "revision"], path);
+    return {
+      configRevisionId: snapshotString(ref.configRevisionId, `${path}.configRevisionId`),
+      revision: snapshotPositiveInt(ref.revision, `${path}.revision`),
+    };
+  };
   const configRevisions = {
-    orchestratorDefault: snapshotPositiveInt(revs.orchestratorDefault, ".configRevisions.orchestratorDefault"),
-    project: snapshotPositiveInt(revs.project, ".configRevisions.project"),
+    orchestratorDefault: revisionRef(revs.orchestratorDefault, ".configRevisions.orchestratorDefault"),
+    project: revisionRef(revs.project, ".configRevisions.project"),
   };
   const stagesIn = snapshotObject(root.stages, ".stages");
   const sourcesIn = snapshotObject(root.sources, ".sources");
