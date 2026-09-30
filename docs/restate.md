@@ -26,7 +26,7 @@ Cancellation and deadlines revoke approval authority but retain the occupied slo
 
 ## Testing
 
-`npm run test:restate` runs the `src/__tests__/restate/**/*.restate.test.ts` files and nothing else. The default `npm test` excludes the whole `src/__tests__/restate/` folder in `vitest.config.ts`, so the default suite needs no Docker on any machine or inside a dispatched runner, where the agent runs `npm test` during implement passes. CI runs them in the `restate-tests` job of `.github/workflows/unit-tests.yml`, which inherits the `pull_request` triggers including `ai-implement/feature/**`.
+`npm run test:restate` runs the `src/__tests__/restate/**/*.restate.test.ts` files and nothing else. The default `npm test` excludes the whole `src/__tests__/restate/` folder in `vitest.config.ts`, so the default suite needs no Docker on any machine or inside a dispatched runner, where the agent runs `npm test` during implement passes. The scenarios run on two runtimes: the container runtime (Docker) and the binary runtime (`restate-server` from `node_modules`, no Docker). A dispatched runner runs `npm run test:restate` on the binary runtime, and an issue that adds a scenario states that result in its gap analysis. CI runs both, in the `restate-tests` (container) and `restate-tests-binary` jobs of `.github/workflows/unit-tests.yml`, which inherit the `pull_request` triggers including `ai-implement/feature/**`.
 
 Every Restate test lives under `src/__tests__/restate/` and is told apart from a unit test by that folder, not only by the `.restate.test.ts` suffix — a reader never has to check the suffix alone. A test never declares its own container, variants, start/stop hooks, or fetch helper: `src/__tests__/restate/harness.ts` exports `RESTATE_IMAGE_VERSION`, `VARIANTS`, `startVariants(services)` / `stopAll(environments)`, and the three call helpers `callService`, `callObject`, `callWorkflow`, and every test file imports them from there (AII-716).
 
@@ -269,7 +269,7 @@ The orchestrator, the server, the admin API, and the SDK endpoint are same-machi
 
 ### Test with two environment variants, and assert observable effects
 
-A Restate scenario registers only the services it needs and runs two environments from the shared harness: `alwaysReplay: true` forces replay at every suspension for the happy paths, `disableRetries: true` surfaces error paths at once (§ "Testing"). Assert an observable effect — a call count on a fake, a state read through a shared handler, a returned value — never a journal internal. Keep the pure decision logic (for example `decideRefresh`'s grace-window branch) in the default unit suite so it runs with no Docker; the container scenario proves the wiring, not the arithmetic.
+A Restate scenario registers only the services it needs and runs two environments from the shared harness: `alwaysReplay: true` forces replay at every suspension for the happy paths, `disableRetries: true` surfaces error paths at once (§ "Testing"). Assert an observable effect — a call count on a fake, a state read through a shared handler, a returned value — never a journal internal. Keep the pure decision logic (for example `decideRefresh`'s grace-window branch) in the default unit suite so it runs with no Docker; the scenario proves the wiring, not the arithmetic.
 
 ### A passthrough tool that gains a zod schema gains a new validation layer — test it against the downstream contract
 
