@@ -41,7 +41,7 @@ import { isLinearAuthConfigured, withLinearToken } from "./linear-app-auth.js";
 import { isFailureRecord, projectFailureRecord, type FailureRecord } from "./pipeline/failure-classification.js";
 import { sanitizeFindingDispositions, type FindingDisposition } from "./pipeline/finding-dispositions.js";
 import { sanitizeAttribution, type InvocationAttributionV1 } from "./pipeline/types.js";
-import { isCycleSummary, sanitizeCycleSummaries, type CycleSummary, type CycleDisposition } from "./pipeline/cycle-summary.js";
+import { isCycleSummary, stripCycleAttribution, sanitizeCycleSummaries, type CycleSummary, type CycleDisposition } from "./pipeline/cycle-summary.js";
 import { recordReviewFixCycleSummary, type ReviewFixCycleSummaryOutcome } from "./review-fix-evidence.js";
 import type { ReviewFixFindingDisposition } from "./review-fix-ports.js";
 import {
@@ -523,7 +523,8 @@ export function handleRunnerCycleSummary(input: {
   const verified = verifyPreparedReviewFixToken(bearer, input.secret, "progress");
   if (!verified.ok || !verified.claims.attemptId) return bad(401, verified.ok ? "wrong_scope" : verified.reason);
   if (!input.body || typeof input.body !== "object" || Array.isArray(input.body)) return bad(400, "invalid_cycle_body");
-  const summary = (input.body as { summary?: unknown }).summary;
+  const { value: summary, stripped } = stripCycleAttribution((input.body as { summary?: unknown }).summary);
+  if (stripped) console.warn("[runner-callback] dropped malformed cycle summary attribution (count=1)");
   if (!isCycleSummary(summary)) return bad(400, "invalid_cycle_summary");
 
   const outcome = recordOneCycleSummary(verified.claims.attemptId, summary);

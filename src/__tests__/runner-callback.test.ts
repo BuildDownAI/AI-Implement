@@ -4609,6 +4609,18 @@ describe("handleRunnerCycleSummary — independent pilot evidence", () => {
     expect(reviewFixEvidence.getReviewFixCycleSummary(attemptId, 1)?.completedAt).toBe(summary.completedAt);
   });
 
+  it("strips malformed attribution and still records the cycle summary", () => {
+    const token = preparedToken();
+    const res = runnerCallback.handleRunnerCycleSummary({
+      authorization: `Bearer ${token}`, secret: SECRET,
+      body: { summary: { ...summary, attribution: { version: 99, model: "sk-SYNTHETICSECRET123456" } } },
+    });
+    expect(res).toMatchObject({ status: 200, body: { outcome: "recorded" } });
+    const stored = reviewFixEvidence.getReviewFixCycleSummary(attemptId, 1);
+    expect(stored?.tests).toEqual(summary.tests);
+    expect(stored?.attribution).toBeUndefined();
+  });
+
   it("rejects unprepared credentials and oversized evidence", () => {
     const token = preparedToken();
     const legacy = runnerTokens.mintRunToken({ issueId: "i", mappingTeamKey: "AII", phase: "implementation",
