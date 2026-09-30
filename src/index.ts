@@ -4296,14 +4296,15 @@ const KG_REFRESH_DEFAULT_EXECUTION_MODE = "github-actions" as const;
 /** Workflow file dispatched in the KG source repo for GHA-backed kg-refresh: the shared implement template, selected by `runner_phase` (AII-556). */
 const KG_REFRESH_WORKFLOW_FILE = "claude-implement.yml";
 
-async function dispatchKgRefreshRun(
+export async function dispatchKgRefreshRun(
   config: AppConfig,
   opts: { runToken: string; runProgressToken: string; dispatchId: string; runConfig: string; executionPath?: string },
 ): Promise<{ machineId?: string; machineNonce?: string; logsUrl?: string; workflowRunId?: number }> {
   if (!config.kgSourceRepo) throw new Error("KG_SOURCE_REPO not configured");
   const repo = parseKgSourceRepo(config.kgSourceRepo);
-  const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, repo.owner);
-  const defaultBranch = (await getRepoDefaultBranch(ghToken, repo.owner, repo.repo)) ?? "main";
+  // Installation-wide: control-plane (default branch, GHA dispatch) only, never a child boot token.
+  const controlToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, repo.owner);
+  const defaultBranch = (await getRepoDefaultBranch(controlToken, repo.owner, repo.repo)) ?? "main";
   const decodedConfig = decodeRunConfig(opts.runConfig);
   // A PR-triggered dry-run (AII-633) carries kgSourceRef — the PR's head branch — so the
   // GHA dispatch runs against that ref instead of the default branch. Absent = unchanged.
@@ -4325,7 +4326,7 @@ async function dispatchKgRefreshRun(
     const runnerImage = await resolveRunnerImageForDispatch({
       owner: repo.owner,
       repo: repo.repo,
-      token: ghToken,
+      token: controlToken,
       defaultImage: config.sessionImage,
       runnerImageExplicit: config.runnerImageExplicit,
     });
@@ -4333,7 +4334,7 @@ async function dispatchKgRefreshRun(
     const dispatchInputs = buildKgRefreshGhaDispatchBody({ runConfig: opts.runConfig, runToken: opts.runToken, runProgressToken: opts.runProgressToken, runnerImage, runnerCallbackUrl, runnerPhase: "kg-refresh", jobTimeoutMinutes: "240", issueIdentifier: decodedConfig.issue.identifier });
     const dispatchedAt = Date.now();
     const dispatchResult = await postWorkflowDispatch({
-      token: ghToken,
+      token: controlToken,
       owner: repo.owner,
       repo: repo.repo,
       workflowFile: KG_REFRESH_WORKFLOW_FILE,
@@ -4361,7 +4362,7 @@ async function dispatchKgRefreshRun(
     // can delay it. The reaper will lazy-bind on its next sweep if polling exhausts.
     const dispatchTime = new Date(dispatchedAt - 30_000);
     const workflowRunId = await pollForKgWorkflowRunId({
-      token: ghToken,
+      token: controlToken,
       owner: repo.owner,
       repo: repo.repo,
       workflowFile: KG_REFRESH_WORKFLOW_FILE,
@@ -4384,6 +4385,8 @@ async function dispatchKgRefreshRun(
         "[kg-refresh] fly-machines execution path selected but FLY_SESSIONS_TOKEN + FLY_SESSIONS_APP are not configured",
       );
     }
+    // Narrow mint first: a failure aborts the launch with no fallback to controlToken.
+    const bootToken = await getTargetRepoToken(config, repo.owner, repo.repo);
     const sessionToken = generateSessionToken();
     const machineNonce = generateMachineNonce();
     const extraEnv: Record<string, string> = {
@@ -4393,7 +4396,7 @@ async function dispatchKgRefreshRun(
     const flySessionImage = await resolveRunnerImageForDispatch({
       owner: repo.owner,
       repo: repo.repo,
-      token: ghToken,
+      token: bootToken,
       defaultImage: config.sessionImage,
       runnerImageExplicit: config.runnerImageExplicit,
     }) ?? config.sessionImage;
@@ -4408,7 +4411,7 @@ async function dispatchKgRefreshRun(
       defaultBranch,
       anthropicApiKey: config.anthropicApiKey ?? undefined,
       claudeOAuthToken: config.claudeOAuthToken ?? undefined,
-      githubToken: ghToken,
+      githubToken: bootToken,
       sessionToken,
       machineNonce,
       phase: "kg-refresh",
@@ -4430,6 +4433,7 @@ async function dispatchKgRefreshRun(
         "[kg-refresh] local-docker execution path selected but LOCAL_RUNNER_IMAGE is not configured",
       );
     }
+    const bootToken = await getTargetRepoToken(config, repo.owner, repo.repo);
     const sessionToken = generateSessionToken();
     const machineNonce = generateMachineNonce();
     const extraEnv: Record<string, string> = { AI_IMPLEMENT_RUN_CONFIG: opts.runConfig, RUN_PROGRESS_TOKEN: opts.runProgressToken };
@@ -4448,7 +4452,7 @@ async function dispatchKgRefreshRun(
       defaultBranch,
       anthropicApiKey: config.anthropicApiKey ?? undefined,
       claudeOAuthToken: config.claudeOAuthToken ?? undefined,
-      githubToken: ghToken,
+      githubToken: bootToken,
       sessionToken,
       machineNonce,
       phase: "kg-refresh",
