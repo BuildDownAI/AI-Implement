@@ -382,3 +382,17 @@ This is the gated race test pattern. A scenario of an owned-run wait sets the or
 ## FlyMachineProfile kept-machine scenarios
 
 `fly-machine-profile.restate.test.ts` drives `claim` / `attach` / `release` / `expire` (ADR 037) through a forwarding service (the handlers are ingress-private) with a fake Fly. The scheduled `expire` is asserted with `queryInvocations` inside `eventually`; a stale-timer scenario calls `expire` with the earlier `releasedAt` itself rather than racing a clock, and one scenario uses `idleTimeoutMsOverride` to see the engine deliver the timer.
+
+## `feedback-loop-workflow.restate.test.ts`: the implement/review loop replayed (AII-626, AII-629)
+
+The loop's control flow lives in `src/pipeline/feedback-loop-core.ts` (`runFeedbackLoop`), with every
+effect — model calls, git reads, cycle-summary write, reporting, sleeping, clocks — injected as
+`LoopEffects`. The test defines a `FeedbackLoopTest` workflow **in the test file only** and journals
+each effect, then runs the production control flow against fake effects on both harness variants. No
+model, callback or credential is involved.
+
+Boundaries: the workflow is never registered in `src/restate/endpoint.ts`; nothing under
+`src/pipeline/` imports `src/restate/*` or `@restatedev/*` (guarded by
+`src/__tests__/restate-boundary.test.ts` in the default suite); the `*.restate.test.ts` file is excluded
+from `npm test` and runs under `npm run test:restate` (container variant needs Docker; set
+`RESTATE_TEST_RUNTIME=binary` for the binary variant).
