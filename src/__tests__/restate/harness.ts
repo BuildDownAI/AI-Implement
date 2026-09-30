@@ -113,7 +113,8 @@ export async function replaceEndpoint(env: RestateTestEnvironment, services: Res
   return replacement;
 }
 
-export async function stopAll(environments: Map<string, RestateTestEnvironment>): Promise<void> {
+export async function stopAll(environments: Map<string, RestateTestEnvironment> | undefined): Promise<void> {
+  if (!environments) return;
   await Promise.all([...environments.values()].map((env) => env.stop()));
 }
 

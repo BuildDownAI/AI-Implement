@@ -30,6 +30,8 @@ export interface BinaryEnvironmentOptions {
   variant?: "alwaysReplay" | "disableRetries";
   /** Accepted for parity with RestateTestEnvironment; the binary always keeps its state on disk. */
   storage?: "disk";
+  /** Seam for the missing-binary path; defaults to the resolver RestateSidecar uses. */
+  resolveBinary?: () => string | null;
 }
 
 export interface BinaryEnvironment {
@@ -84,7 +86,7 @@ async function ok(url: string, init?: RequestInit): Promise<boolean> {
 }
 
 export async function startBinaryEnvironment(options: BinaryEnvironmentOptions): Promise<BinaryEnvironment> {
-  const bin = resolvePlatformBinary();
+  const bin = (options.resolveBinary ?? resolvePlatformBinary)();
   if (!bin) throw new RestateBinaryNotFoundError();
 
   const [ingressPort, adminPort, nodePort] = [await freePort(), await freePort(), await freePort()];
@@ -104,6 +106,9 @@ export async function startBinaryEnvironment(options: BinaryEnvironmentOptions):
     RESTATE_ADMIN__BIND_ADDRESS: `127.0.0.1:${adminPort}`,
     RESTATE_BIND_ADDRESS: `127.0.0.1:${nodePort}`,
     RESTATE_BASE_DIR: baseDir,
+    // TCP only: the default unix sockets live under <base dir>/<node name>/ and macOS's long
+    // os.tmpdir() overflows SUN_LEN (104), so the server would fail to bind at startup.
+    RESTATE_LISTEN_MODE: "tcp",
     RESTATE_DEFAULT_NUM_PARTITIONS,
     RESTATE_ROCKSDB_TOTAL_MEMORY_SIZE,
   });

@@ -3,10 +3,10 @@
 process.env.RESTATE_TEST_RUNTIME = "binary";
 
 import { randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import * as restate from "@restatedev/restate-sdk";
 import { afterAll, describe, expect, it, vi } from "vitest";
-import { startBinaryEnvironment, type BinaryEnvironment } from "./binary-environment.js";
+import { RestateBinaryNotFoundError, startBinaryEnvironment, type BinaryEnvironment } from "./binary-environment.js";
 import { attachWorkflow, callService, callWorkflow, restateTestRuntime } from "./harness.js";
 
 const echo = restate.service({
@@ -66,6 +66,8 @@ describe("binary Restate environment (AII-914)", () => {
 
   it("answers a service handler through the ingress", async () => {
     const env = await start({ services: [echo] });
+    // RESTATE_LISTEN_MODE=tcp: no unix socket may be created under the base directory.
+    expect(readdirSync(env.baseDir(), { recursive: true }).map(String).filter((f) => f.endsWith(".sock"))).toEqual([]);
     expect(await callService(env.baseUrl(), "binaryEcho", "ping", { value: "hi" })).toEqual({ echoed: "hi" });
   }, 120_000);
 
@@ -94,6 +96,12 @@ describe("binary Restate environment (AII-914)", () => {
     await callWorkflow(base, "binaryWaiter", key, "release", "resumed");
     await vi.waitFor(async () => expect(await attachWorkflow(base, "binaryWaiter", key)).toBe("resumed"), { timeout: 30_000, interval: 250 });
   }, 180_000);
+
+  it("rejects with RestateBinaryNotFoundError when no platform binary resolves", async () => {
+    await expect(startBinaryEnvironment({ services: [echo], resolveBinary: () => null })).rejects.toBeInstanceOf(
+      RestateBinaryNotFoundError,
+    );
+  });
 
   it("stop() ends the child, removes the base directory, and is idempotent", async () => {
     const env = await startBinaryEnvironment({ services: [echo] });

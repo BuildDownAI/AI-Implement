@@ -167,7 +167,7 @@ npx tsc --noEmit --project tsconfig.restate-tests.json
 Two runtimes serve the same scenario files (AII-914):
 
 - **`container`**: `@restatedev/restate-sdk-testcontainers` boots `restatedev/restate:1.7.10`. Needs Docker; the first run pulls the image.
-- **`binary`**: `src/__tests__/restate/binary-environment.ts` spawns the `@restatedev/restate-server` platform binary that `RestateSidecar` runs in production, on three loopback ports with a temp base directory. No Docker, so it works in a dispatched runner.
+- **`binary`**: `src/__tests__/restate/binary-environment.ts` spawns the `@restatedev/restate-server` platform binary that `RestateSidecar` runs in production, on three loopback ports with a temp base directory, with `RESTATE_LISTEN_MODE=tcp` because the default unix sockets under that directory overflow macOS's 104-byte `SUN_LEN` with its long `os.tmpdir()`. No Docker, so it works in a dispatched runner.
 
 `restateTestRuntime()` (`harness.ts`) picks one: `RESTATE_TEST_RUNTIME=container|binary` wins when set; otherwise `container` when a usable container socket is found (`DOCKER_HOST`, or a readable/writable docker socket), else `binary`. It logs the choice once per process. A missing platform binary throws `RestateBinaryNotFoundError`; there is no silent fallback. `startedRestateContainer.restart()` works on both, so scenarios are unchanged. `endpoint.restate.test.ts` builds its own `RestateContainer`, so it is the one file that still needs Docker and is skipped under `binary`. Things that trip a first-time author:
 
