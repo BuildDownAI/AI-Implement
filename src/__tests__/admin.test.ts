@@ -5481,7 +5481,7 @@ describe("admin sessions — kg-refresh destroy", () => {
     return jobId;
   }
 
-  it("GHA-mode kg-refresh cancel stamps the row, calls the workflow cancel, and never cancels the run itself", async () => {
+  it("GHA-mode kg-refresh cancel calls the workflow cancel, then stamps the row, and never cancels the run itself", async () => {
     const token = await login("secret");
     const jobId = await ghaKgJob();
     const cancel = vi.fn(async () => ({ status: 200, body: { cancelled: true } }));
@@ -5503,15 +5503,21 @@ describe("admin sessions — kg-refresh destroy", () => {
     expect(res.statusCode).toBe(503);
     expect(JSON.parse(res.body)).toEqual({ error: "restate-unavailable" });
     expect(notifyTextMock).not.toHaveBeenCalled();
+    expect(log.getJobById(jobId)?.conclusion).not.toBe("operator_cancelled");
   });
 
-  it("GHA-mode kg-refresh cancel passes a 409 no-refresh-in-flight through", async () => {
+  it("GHA-mode kg-refresh cancel passes a 409 no-refresh-in-flight through and leaves the row untouched", async () => {
     const token = await login("secret");
     const jobId = await ghaKgJob();
+    const before = log.getJobById(jobId);
     const cancel = vi.fn(async () => ({ status: 409, body: { error: "no-refresh-in-flight" } }));
     const res = await deleteSession(String(jobId), token, { trigger: vi.fn(), status: vi.fn(), cancel });
 
     expect(res.statusCode).toBe(409);
+    const after = log.getJobById(jobId);
+    expect(after?.status).toBe(before?.status);
+    expect(after?.conclusion).toBe(before?.conclusion);
+    expect(notifyTextMock).not.toHaveBeenCalled();
   });
 
   it("issue-keyed session destroy still calls provider.clearWorkingState (regression pin)", async () => {

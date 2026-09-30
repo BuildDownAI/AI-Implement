@@ -4500,6 +4500,8 @@ export function makeKgRefreshAdminDeps(
       }
     },
     cancel: async ({ reason }) => {
+      // KgRepo holds one in-flight marker per repo, so its triggerId is the only refresh
+      // that can be in flight; jobId is not needed to find it.
       const marker = await client.repoStatus(parseKgSourceRepo(kgSourceRepo).fullName);
       if (marker.status === "unavailable") return { status: 503, body: { error: "restate-unavailable" } };
       if (marker.status !== "accepted" || !marker.value) return { status: 409, body: { error: "no-refresh-in-flight" } };
@@ -4585,6 +4587,7 @@ function startServer(
   memoryProviderDiagnostic: string | null,
 ): http.Server {
   const startDeploy = makeStartDeploy({ ...config, onBuildFailure: onDeployBuildFailure });
+  const kgRefreshAdminDeps = config.kgSourceRepo ? makeKgRefreshAdminDeps(config.kgSourceRepo, kgRefreshIngressClient) : undefined;
   const reviewFixAttempts = createReviewFixAdminFacade(reviewFixAttemptStore, new GithubReviewFixWorker({
     credentials: createGithubAppCredentialResolver(config.githubAppId, config.githubAppPrivateKey),
     scopeStore: reviewFixAttemptStoreScopeStore(reviewFixAttemptStore),
@@ -5253,7 +5256,7 @@ function startServer(
           return { started: getPollStats().pollCount > before };
         },
         notifyWebhookUrl: config.notifyWebhookUrl,
-      }, registry, { startDeploy, selfDeployTarget: config.selfDeployTarget, kgRefresh: config.kgSourceRepo ? makeKgRefreshAdminDeps(config.kgSourceRepo, kgRefreshIngressClient) : undefined, callTool, getRestateStatus,
+      }, registry, { startDeploy, selfDeployTarget: config.selfDeployTarget, kgRefresh: kgRefreshAdminDeps, callTool, getRestateStatus,
         reviewFixAttempts })) return;
     }
 

@@ -1746,15 +1746,16 @@ async function handleDestroySession(
         json(res, 501, { error: "KG refresh is not configured" });
         return;
       }
-      // Stamp operator_cancelled first: the updateJobStatus guard preserves this
+      // Cancel first, stamp after: a 409/503 answer leaves the row as it was because the
+      // GitHub run may still be going. The updateJobStatus guard preserves this
       // conclusion when the workflow's close-row later writes a coarser terminal status.
-      updateJobStatus(job.id, "failed", "operator_cancelled");
       try {
         const r = await deps.kgRefresh.cancel({ jobId: job.id, reason: "operator_cancelled" });
         if (r.status !== 200) {
           json(res, r.status, r.body);
           return;
         }
+        updateJobStatus(job.id, "failed", "operator_cancelled");
       } catch (err) {
         console.error(`[admin] Failed to cancel kg-refresh job ${job.id}:`, err);
         json(res, 500, { error: err instanceof Error ? err.message : String(err) });
@@ -1790,7 +1791,7 @@ async function handleDestroySession(
       }
     }
 
-    // Stamp operator_cancelled (idempotent for the GHA branch, which stamped it above).
+    // Stamp operator_cancelled (idempotent for the GHA branch, which stamped it on cancel success).
     updateJobStatus(job.id, "failed", "operator_cancelled");
 
     // One operator-cancel notification; mark notified to prevent the poll loop duplicate.
