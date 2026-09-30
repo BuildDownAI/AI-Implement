@@ -1585,7 +1585,7 @@ export function defaultFreeBytes(path: string): number {
   return s.bavail * s.bsize;
 }
 
-async function defaultFetchDefaultBranch(token: string, owner: string, repo: string): Promise<string> {
+export async function defaultFetchDefaultBranch(token: string, owner: string, repo: string): Promise<string> {
   const res = await fetch(`https://api.github.com/repos/${owner}/${repo}`, {
     headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json" },
   });
@@ -1623,7 +1623,7 @@ async function fetchBranchOrStatus(
   }
 }
 
-async function defaultFetchSnapshotCommitSha(token: string, owner: string, repo: string, branch: string): Promise<string | null> {
+export async function defaultFetchSnapshotCommitSha(token: string, owner: string, repo: string, branch: string): Promise<string | null> {
   try {
     const res = await fetch(
       `https://api.github.com/repos/${owner}/${repo}/commits?sha=${branch}&path=snapshot/&per_page=1`,
@@ -1703,7 +1703,7 @@ function defaultLoadStage(): { stage: KgRefreshStage; startedAt: number; dispatc
   }
 }
 
-function defaultPersistLastRefresh(outcome: RefreshOutcome): void {
+export function defaultPersistLastRefresh(outcome: RefreshOutcome): void {
   try {
     getDb()
       .prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)")
@@ -1713,7 +1713,7 @@ function defaultPersistLastRefresh(outcome: RefreshOutcome): void {
   }
 }
 
-function defaultLoadLastRefresh(): RefreshOutcome | null {
+export function defaultLoadLastRefresh(): RefreshOutcome | null {
   try {
     const row = getDb()
       .prepare("SELECT value FROM settings WHERE key = ?")
@@ -1778,7 +1778,7 @@ export function materializeArgs(): string[] {
   return materializeDirectEnabled() ? [...MATERIALIZE_ARGS, "--direct"] : [...MATERIALIZE_ARGS];
 }
 
-async function defaultMaterialize(python: string, cwd: string): Promise<void> {
+export async function defaultMaterialize(python: string, cwd: string): Promise<void> {
   await execFile(python, materializeArgs(), {
     cwd,
     env: { ...process.env, PYTHONPATH: cwd },
@@ -1792,7 +1792,7 @@ async function defaultMaterialize(python: string, cwd: string): Promise<void> {
  * SSE; parseSidecarRpcResponse handles both encodings. Tool results arrive as
  * JSON text in content[0].text.
  */
-async function defaultMcpToolCall(url: string, tool: string, args: Record<string, unknown>): Promise<unknown> {
+export async function defaultMcpToolCall(url: string, tool: string, args: Record<string, unknown>): Promise<unknown> {
   const init = await mcpPost(url, null, {
     jsonrpc: "2.0",
     id: 1,

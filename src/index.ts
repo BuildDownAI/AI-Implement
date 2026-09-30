@@ -23,7 +23,7 @@ import {
   type StaleAdmissionCandidate,
 } from "./dispatch-admission.js";
 import { reconcileFilesystemFailures } from "./filesystem-ticket-lifecycle.js";
-import { dispatchWorkflow, postWorkflowDispatch, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, getPullRequestState, buildEnvelopeDispatchInputs, postPrComment, defaultFetchSignal, getRepoDefaultBranch, buildKgRefreshGhaDispatchBody, pollForKgWorkflowRunId, type DispatchInputs } from "./github.js";
+import { dispatchWorkflow, postWorkflowDispatch, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, getPullRequestState, buildEnvelopeDispatchInputs, postPrComment, defaultFetchSignal, getRepoDefaultBranch, buildKgRefreshGhaDispatchBody, pollForKgWorkflowRunId, fetchRepoTarball, mergePullRequest, closePullRequest, deleteBranch, postOrUpdateStickyComment, setCommitStatus, cancelWorkflowRun, RUN_TITLE_PREFIX, type DispatchInputs } from "./github.js";
 import { resolveWorkflowCapabilities, resolveWorkflowContract, type WorkflowContract } from "./workflow-probe.js";
 import { surfaceDispatchFailure } from "./dispatch-failure.js";
 import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
@@ -45,7 +45,7 @@ import { handleAdminRequest } from "./admin.js";
 import { initLogTable, appendLog, countPriorDispatches, completeOrphanedPlanningJobs, attachJobRunIdIfMissing, updateJobRunId, updateJobStatus, updateJobPrUrl, updateJobMachineDetails, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobById, getJobByMachineId, getJobByDispatchId, resetStuckAttempts, getRecentFailedRunUrls } from "./log.js";
 import { recordDispatchFailure, recordDispatchSuccess, shouldCountFailure, initDispatchBreakerTable, parkIssue, prBudgetParkMessage, isParked } from "./dispatch-breaker.js";
 import type { Job, JobStatus } from "./log.js";
-import { getInstallationToken, getInstallationId, getAppSlug } from "./github-app-auth.js";
+import { getInstallationToken, getInstallationId, getAppSlug, getScopedInstallationToken } from "./github-app-auth.js";
 import { configureLinearAuth } from "./linear-app-auth.js";
 import { configureOAuthProviders, isOAuthConfigured, providersFromEnv } from "./oauth/providers.js";
 import { handleOAuthCallback, handleOAuthLogout, handleOAuthProviders, handleOAuthStart } from "./oauth/routes.js";
@@ -122,12 +122,14 @@ import { createKgRefreshIngressClient } from "./restate/kg-refresh-production.js
 import { RestateSidecar } from "./restate/server.js";
 import { startRestateEndpoint, register as registerRestateEndpoint, RESTATE_SERVICES } from "./restate/endpoint.js";
 import { createProductionReviewFixServices } from "./restate/review-fix-production.js";
+import { createProductionKgRefreshServices } from "./restate/kg-refresh-production.js";
+import { setKgRefreshToolDeps } from "./restate/tools.js";
 import type { RestateRegisterOutcome, RestateRegisterResult } from "./restate/endpoint.js";
 import { getRestateStatus, setRestateStatus } from "./restate/status.js";
 import type { RestateRegistrationStatus } from "./restate/status.js";
 import { setProviderRegistry } from "./restate/tools.js";
 import { callTool } from "./restate/tools-client.js";
-import { makeKgRefresh, setActiveKgRefresh } from "./kg-refresh.js";
+import { makeKgRefresh, setActiveKgRefresh, runKgRefreshPreflight, defaultFetchDefaultBranch, defaultFetchSnapshotCommitSha, defaultMaterialize, defaultMcpToolCall, defaultPersistLastRefresh, defaultLoadLastRefresh } from "./kg-refresh.js";
 import type { KgRefreshHandle } from "./kg-refresh.js";
 import { beginCycle, isCurrentCycle, getPollStats, runWithDeadline } from "./poll-cycle.js";
 import { monitorKgRefreshGhaJob } from "./monitor-gha.js";
@@ -5392,8 +5394,64 @@ async function main(): Promise<void> {
   // services are registered even with every mapping on the Legacy default;
   // selecting Restate later only changes ownership of *new* automatic GHA work.
   const reviewFixServices = createProductionReviewFixServices(config, registry, reviewFixAttemptStore);
+  // The KgRepo object and KgRefresh workflow (AII-683). Skipped without KG_SOURCE_REPO: the
+  // tool handlers then answer 501 from their unset deps.
+  const kgSourceRepo = config.kgSourceRepo;
+  const kgSlug = kgSourceRepo ? parseKgSourceRepo(kgSourceRepo) : null;
+  const kgWorkflowToken = () => getInstallationToken(config.githubAppId, config.githubAppPrivateKey, kgSlug!.owner);
+  const kgComposition = kgSourceRepo && kgSlug
+    ? createProductionKgRefreshServices({
+      kgSourceRepo,
+      config,
+      mintToken: getScopedInstallationToken,
+      fetchTarball: fetchRepoTarball,
+      fetchDefaultBranch: defaultFetchDefaultBranch,
+      fetchSnapshotCommitSha: defaultFetchSnapshotCommitSha,
+      materialize: defaultMaterialize,
+      mcpToolCall: defaultMcpToolCall,
+      sidecar,
+      postPrCommentFn: postPrComment,
+      postOrUpdateStickyCommentFn: postOrUpdateStickyComment,
+      setCommitStatusFn: setCommitStatus,
+      mergePullRequestFn: mergePullRequest,
+      closePullRequestFn: closePullRequest,
+      deleteBranchFn: deleteBranch,
+      dispatchKgRefreshRun: (opts) => dispatchKgRefreshRun(config, opts),
+      appendLog,
+      updateJobStatus,
+      getWorkflowRunStatus: async (runId) => {
+        const run = await getWorkflowRunStatus(await kgWorkflowToken(), kgSlug.owner, kgSlug.repo, runId);
+        if (!run) throw new Error(`workflow run ${runId} status unavailable`);
+        return { status: run.status, conclusion: run.conclusion };
+      },
+      findRunByTitle: async (title) => {
+        const res = await fetch(
+          `https://api.github.com/repos/${kgSlug.owner}/${kgSlug.repo}/actions/workflows/${KG_REFRESH_WORKFLOW_FILE}/runs?event=workflow_dispatch&per_page=20`,
+          { headers: { Authorization: `Bearer ${await kgWorkflowToken()}`, Accept: "application/vnd.github+json" }, signal: defaultFetchSignal() },
+        );
+        if (!res.ok) return null;
+        const data = (await res.json()) as { workflow_runs: Array<{ id: number; display_title?: string }> };
+        const match = data.workflow_runs.find((r) => r.display_title === `${RUN_TITLE_PREFIX}${title}`);
+        return match ? { runId: match.id } : null;
+      },
+      cancelWorkflowRun: async (runId) => cancelWorkflowRun(await kgWorkflowToken(), kgSlug.owner, kgSlug.repo, runId),
+      persistLastRefresh: defaultPersistLastRefresh,
+      handleKgRefreshOutcome: (outcome, data) => handleKgRefreshOutcome(config, registry, outcome, data),
+      fireSettled: () => activeKgRefresh?.fireRefreshSettled(),
+      isDeployHeld,
+      readStatusRecord: defaultLoadLastRefresh,
+      runPreflight: () => runKgRefreshPreflight({
+        githubAppId: config.githubAppId,
+        githubAppPrivateKey: config.githubAppPrivateKey,
+        kgSourceRepo,
+        kgBaseRepo: getOrchestratorSettings().kgBaseRepo,
+      }),
+    })
+    : null;
+  setKgRefreshToolDeps(kgComposition?.toolDeps ?? null);
+  const kgServices = kgComposition?.services ?? [];
   const restateRegistration = createRestateRegistrationGate(() => shuttingDown, {
-    startRestateEndpoint: () => startRestateEndpoint([...RESTATE_SERVICES, ...reviewFixServices]),
+    startRestateEndpoint: () => startRestateEndpoint([...RESTATE_SERVICES, ...reviewFixServices, ...kgServices]),
     registerRestateEndpoint,
   });
   // A sidecar which becomes ready after its initial timeout still registers the
