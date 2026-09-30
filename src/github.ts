@@ -800,7 +800,7 @@ export async function ensureBranchExists(
  * runs list for a recent run on the expected branch with a "workflow_dispatch" event.
  * We filter to runs created after `dispatchedAfter` to avoid matching old runs.
  */
-const RUN_TITLE_PREFIX = "Claude AI Implementation — ";
+export const RUN_TITLE_PREFIX = "Claude AI Implementation — ";
 
 /**
  * Finds the workflow run dispatched for a given job. Without `issueIdentifier`, the first
