@@ -10,6 +10,7 @@ import type { TicketIssue, TicketingProvider } from "../providers/types.js";
 import type { RepoMapping } from "../config.js";
 import type { AppConfig } from "../index.js";
 import { shouldReleaseAdmissionOnDispatchError } from "../index.js";
+import { encodeRunConfig } from "../run-config.js";
 
 // Mocked only for the "pre-launch failure releases the reservation" describe block below —
 // dedup.js/log.js/dispatch-breaker.js/dispatch-admission.js/dispatch-gate.js stay real
@@ -57,7 +58,15 @@ vi.mock("../workflow-probe.js", async (importOriginal) => {
 // already exists, and those tests need to control that answer without hitting GitHub.
 vi.mock("../github.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../github.js")>();
-  return { ...actual, postWorkflowDispatch: vi.fn(), getBranchSha: vi.fn(actual.getBranchSha) };
+  // getRepoDefaultBranch / pollForKgWorkflowRunId are mocked for the dispatchKgRefreshRun
+  // tests in the "scoped boot" describe block (AII-990) — both hit GitHub over real HTTP.
+  return {
+    ...actual,
+    postWorkflowDispatch: vi.fn(),
+    getBranchSha: vi.fn(actual.getBranchSha),
+    getRepoDefaultBranch: vi.fn(),
+    pollForKgWorkflowRunId: vi.fn(),
+  };
 });
 
 // Only mocked (as a spy wrapping the real implementation) for the "defers
@@ -763,6 +772,75 @@ describe("Fly and local boot tokens are scoped to the target repository (AII-853
     expect(localDocker.startLocalRunnerContainer).not.toHaveBeenCalled();
     expect(githubAppAuth.getInstallationToken).not.toHaveBeenCalled();
     expectFreeSlot("local-docker", "planning");
+  });
+  describe("dispatchKgRefreshRun (AII-990)", () => {
+    const kgConfig = { ...config, kgSourceRepo: "eudoxus/AI-Implement" } as unknown as AppConfig;
+    const kgOpts = (executionPath: "fly-machines" | "local-docker" | "github-actions") => ({
+      runToken: "run-token",
+      runProgressToken: "progress-token",
+      dispatchId: "kg-dispatch-1",
+      runConfig: encodeRunConfig({ v: 1, issue: { id: "kg-refresh", identifier: "KG-REFRESH", title: "KG ingest", description: "" } }),
+      executionPath,
+    });
+    let github: typeof import("../github.js");
+
+    beforeEach(async () => {
+      github = await import("../github.js");
+      vi.mocked(github.getRepoDefaultBranch).mockReset().mockResolvedValue("main");
+      vi.mocked(github.postWorkflowDispatch).mockReset().mockResolvedValue({ success: true } as never);
+      vi.mocked(github.pollForKgWorkflowRunId).mockReset().mockResolvedValue(42 as never);
+      vi.mocked(repoImage.resolveRunnerImageForDispatch).mockReset().mockResolvedValue("runner-image" as never);
+    });
+
+    function expectBroadControlPlaneOnly() {
+      expect(githubAppAuth.getInstallationToken).toHaveBeenCalledWith("id", "key", "eudoxus");
+      expect(github.getRepoDefaultBranch).toHaveBeenCalledWith("broad-token", "eudoxus", "AI-Implement");
+    }
+
+    it("Fly KG boot uses the scoped token and keeps the broad token for control-plane work", async () => {
+      await indexModule.dispatchKgRefreshRun(kgConfig, kgOpts("fly-machines"));
+
+      expect(githubAppAuth.getScopedInstallationToken).toHaveBeenCalledWith("id", "key", "eudoxus", SCOPED_REQUEST);
+      expectBroadControlPlaneOnly();
+      const json = flyConfigJson();
+      expect(json).toContain("scoped-token");
+      expect(json).not.toContain("broad-token");
+      expect(repoImage.resolveRunnerImageForDispatch).toHaveBeenCalledWith(expect.objectContaining({ token: "scoped-token" }));
+    });
+
+    it("local KG boot uses the scoped token", async () => {
+      await indexModule.dispatchKgRefreshRun(kgConfig, kgOpts("local-docker"));
+
+      expect(githubAppAuth.getScopedInstallationToken).toHaveBeenCalledWith("id", "key", "eudoxus", SCOPED_REQUEST);
+      expectBroadControlPlaneOnly();
+      expect(vi.mocked(localDocker.startLocalRunnerContainer).mock.calls[0]![0]).toEqual(
+        expect.objectContaining({ githubToken: "scoped-token", phase: "kg-refresh" }),
+      );
+    });
+
+    it("Fly KG: a narrow-mint failure launches nothing and never uses the broad token", async () => {
+      vi.mocked(githubAppAuth.getScopedInstallationToken).mockRejectedValue(new Error("mint failed"));
+
+      await expect(indexModule.dispatchKgRefreshRun(kgConfig, kgOpts("fly-machines"))).rejects.toThrow("mint failed");
+
+      expect(flyMachines.createMachine).not.toHaveBeenCalled();
+      expect(repoImage.resolveRunnerImageForDispatch).not.toHaveBeenCalled();
+    });
+
+    it("local KG: a narrow-mint failure launches nothing and never uses the broad token", async () => {
+      vi.mocked(githubAppAuth.getScopedInstallationToken).mockRejectedValue(new Error("mint failed"));
+
+      await expect(indexModule.dispatchKgRefreshRun(kgConfig, kgOpts("local-docker"))).rejects.toThrow("mint failed");
+
+      expect(localDocker.startLocalRunnerContainer).not.toHaveBeenCalled();
+    });
+
+    it("GHA KG dispatch keeps the broad token and mints no scoped token", async () => {
+      await indexModule.dispatchKgRefreshRun(kgConfig, kgOpts("github-actions"));
+
+      expect(githubAppAuth.getScopedInstallationToken).not.toHaveBeenCalled();
+      expect(github.postWorkflowDispatch).toHaveBeenCalledWith(expect.objectContaining({ token: "broad-token", owner: "eudoxus", repo: "AI-Implement" }));
+    });
   });
 });
 

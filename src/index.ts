@@ -4049,6 +4049,8 @@ async function dispatchKgRefreshRun(
         "[kg-refresh] fly-machines execution path selected but FLY_SESSIONS_TOKEN + FLY_SESSIONS_APP are not configured",
       );
     }
+    // Narrow mint first: a failure aborts the launch with no fallback to controlToken.
+    const bootToken = await getTargetRepoToken(config, repo.owner, repo.repo);
     const sessionToken = generateSessionToken();
     const machineNonce = generateMachineNonce();
     const extraEnv: Record<string, string> = {
@@ -4058,7 +4060,7 @@ async function dispatchKgRefreshRun(
     const flySessionImage = await resolveRunnerImageForDispatch({
       owner: repo.owner,
       repo: repo.repo,
-      token: ghToken,
+      token: bootToken,
       defaultImage: config.sessionImage,
       runnerImageExplicit: config.runnerImageExplicit,
     }) ?? config.sessionImage;
@@ -4073,7 +4075,7 @@ async function dispatchKgRefreshRun(
       defaultBranch,
       anthropicApiKey: config.anthropicApiKey ?? undefined,
       claudeOAuthToken: config.claudeOAuthToken ?? undefined,
-      githubToken: ghToken,
+      githubToken: bootToken,
       sessionToken,
       machineNonce,
       phase: "kg-refresh",
@@ -4106,6 +4108,7 @@ async function dispatchKgRefreshRun(
         "[kg-refresh] local-docker execution path selected but LOCAL_RUNNER_IMAGE is not configured",
       );
     }
+    const bootToken = await getTargetRepoToken(config, repo.owner, repo.repo);
     const sessionToken = generateSessionToken();
     const machineNonce = generateMachineNonce();
     const extraEnv: Record<string, string> = { AI_IMPLEMENT_RUN_CONFIG: opts.runConfig, RUN_PROGRESS_TOKEN: opts.runProgressToken };
@@ -4124,7 +4127,7 @@ async function dispatchKgRefreshRun(
       defaultBranch,
       anthropicApiKey: config.anthropicApiKey ?? undefined,
       claudeOAuthToken: config.claudeOAuthToken ?? undefined,
-      githubToken: ghToken,
+      githubToken: bootToken,
       sessionToken,
       machineNonce,
       phase: "kg-refresh",
