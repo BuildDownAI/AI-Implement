@@ -312,4 +312,4 @@ A run kind's services live in `src/restate/<kind>-workflow.ts` and `src/restate/
 - **The callback is verify-only.** The HTTP handler validates the runner token and never consumes it, then invokes `report` with the dispatch id as idempotency key. Restate absorbs a duplicate; the handler refuses only a conflicting report. Restate down answers 503 and the runner retries.
 - **SQLite stays the system of record.** The workflow writes the dispatch row, the run record, and the conclusion. Restate holds position and the in-flight marker.
 - **Retention.** One constant per run kind for workflow, journal, and idempotency retention (7 days for kg-refresh).
-- **Tests.** Two scenario files on the shared harness with fakes, plus one production-composed file with real SQLite and simulated GitHub (`src/__tests__/restate/kg-refresh-pilot.restate.test.ts`), before the delete slice.
+- **Tests.** Two scenario files on the shared harness with fakes, plus one production-composed file with real SQLite and simulated GitHub (`src/__tests__/restate/kg-refresh-pilot.restate.test.ts`).
