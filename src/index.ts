@@ -3936,6 +3936,8 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
         let launchStarted = false;
         let container: Awaited<ReturnType<typeof dispatchLocalGapfill>>;
         try {
+          // The child boots repo-scoped; a mint failure aborts the launch (no broad fallback).
+          const childToken = await getTargetRepoToken(config, mapping.owner, mapping.repo);
           container = await dispatchLocalGapfill({
             mapping,
             issue: {
@@ -3945,7 +3947,7 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
               description: taskDescription,
             },
             prNumber: fix.prNumber,
-            githubToken: ghToken,
+            githubToken: childToken,
             image: config.localRunnerImage,
             orchestratorUrl: config.localRunnerOrchestratorUrl ?? config.runnerCallbackBaseUrl ?? `http://host.docker.internal:${config.healthPort}`,
             runnerCallbackUrl: runnerCallbackUrl || undefined,
