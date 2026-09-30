@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "nod
 import { execSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { makeKgRefresh, runKgRefreshPreflight, materializeArgs, type KgRefreshHandle, type RefreshOutcome, type DryRunOutcomeEntry } from "../kg-refresh.js";
+import { makeKgRefresh, runKgRefreshPreflight, materializeArgs, type KgRefreshHandle, type RefreshOutcome, type DryRunOutcomeEntry, MAX_TRACKED_PRS } from "../kg-refresh.js";
 
 const NAMESPACE = "https://kg.test.example/";
 
@@ -54,9 +54,8 @@ describe("kg-refresh", () => {
 
   // ---- The dry-run PR-check surface (AII-633, AII-636, AII-640) -----------------
   // The refresh lifecycle runs in the KgRefresh workflow; what the handle keeps is the
-  // per-PR outcome cache behind reportDryRun/forgetPr and the settle listeners. Outcomes
-  // reach the cache through the persisted store, so these tests seed it the same way a
-  // restarted handle finds it.
+  // per-PR outcome cache behind recordDryRunOutcome/reportDryRun/forgetPr. Most tests seed
+  // the cache through the persisted store, the way a restarted handle finds it.
 
   describe("dry-run report surface", () => {
     const REPORT = { repo: "TestOrg/test-kg", prNumber: 42, sha: "deadbeef" };
@@ -210,36 +209,47 @@ describe("kg-refresh", () => {
       }
     });
 
-    describe("onRefreshSettled (AII-636)", () => {
-      it("fireRefreshSettled() fires registered listeners directly — the deploy-hold-clearing path", () => {
+    describe("recordDryRunOutcome (AII-730)", () => {
+      it("makes reportDryRun re-post for the same PR and sha, and persists the cache", async () => {
         const handle = buildHandle();
-        const listener = vi.fn();
-        handle.onRefreshSettled(listener);
-        handle.fireRefreshSettled();
-        expect(listener).toHaveBeenCalledTimes(1);
+
+        handle.recordDryRunOutcome(REPORT, okOutcome);
+
+        expect(persistDryRunOutcomes).toHaveBeenCalledWith([entryFor(REPORT, okOutcome)]);
+        await expect(handle.reportDryRun(REPORT)).resolves.toBe(true);
+        expect(postOrUpdateStickyCommentFn).toHaveBeenCalledTimes(1);
+        expect(setCommitStatusFn).toHaveBeenCalledTimes(1);
       });
 
-      it("an unregistered listener does not fire on a later settle", () => {
+      it("does not re-post for another PR or another sha", async () => {
         const handle = buildHandle();
-        const listener = vi.fn();
-        const unregister = handle.onRefreshSettled(listener);
-        unregister();
-        handle.fireRefreshSettled();
-        expect(listener).not.toHaveBeenCalled();
+
+        handle.recordDryRunOutcome(REPORT, okOutcome);
+
+        await expect(handle.reportDryRun({ repo: REPORT.repo, prNumber: 99, sha: REPORT.sha })).resolves.toBe(false);
+        await expect(handle.reportDryRun({ ...REPORT, sha: "a-newer-sha" })).resolves.toBe(false);
+        expect(postOrUpdateStickyCommentFn).not.toHaveBeenCalled();
       });
 
-      it("a throwing listener does not stop the others", () => {
-        const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-        try {
-          const handle = buildHandle();
-          const later = vi.fn();
-          handle.onRefreshSettled(() => { throw new Error("boom"); });
-          handle.onRefreshSettled(later);
-          handle.fireRefreshSettled();
-          expect(later).toHaveBeenCalledTimes(1);
-        } finally {
-          errSpy.mockRestore();
+      it("a newer outcome for the same PR replaces the older one", async () => {
+        const handle = buildHandle();
+
+        handle.recordDryRunOutcome(REPORT, okOutcome);
+        handle.recordDryRunOutcome({ ...REPORT, sha: "newer" }, refusedOutcome);
+
+        await expect(handle.reportDryRun(REPORT)).resolves.toBe(false);
+        await expect(handle.reportDryRun({ ...REPORT, sha: "newer" })).resolves.toBe(true);
+      });
+
+      it("evicts the oldest PR past MAX_TRACKED_PRS", async () => {
+        const handle = buildHandle();
+
+        for (let n = 1; n <= MAX_TRACKED_PRS + 1; n++) {
+          handle.recordDryRunOutcome({ ...REPORT, prNumber: n }, okOutcome);
         }
+
+        await expect(handle.reportDryRun({ ...REPORT, prNumber: 1 })).resolves.toBe(false);
+        await expect(handle.reportDryRun({ ...REPORT, prNumber: MAX_TRACKED_PRS + 1 })).resolves.toBe(true);
       });
     });
   });

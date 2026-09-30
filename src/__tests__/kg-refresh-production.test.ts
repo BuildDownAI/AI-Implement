@@ -69,7 +69,7 @@ function makeInput(overrides: Partial<KgRefreshProductionInput> = {}): KgRefresh
     cancelWorkflowRun: vi.fn(async () => true),
     persistLastRefresh: noop,
     handleKgRefreshOutcome: noop,
-    fireSettled: noop,
+    recordDryRunOutcome: noop,
     isDeployHeld: () => false,
     readStatusRecord: () => null,
     runPreflight: vi.fn(async () => ({ ok: true, checkedAt: 1, results: [] })),
@@ -282,7 +282,7 @@ describe("createKgRefreshIngressClient", () => {
   });
 
   it("maps other 4xx (including a missing handler) and 5xx to unavailable", async () => {
-    expect(await clientWith(respond(404, "no such handler")).enqueueDryRun("acme/kg", { triggerId: "x" })).toEqual({ status: "unavailable" });
+    expect(await clientWith(respond(404, "no such handler")).enqueueDryRun("acme/kg", { key: "acme/kg#1", ref: "br", report: { repo: "acme/kg", prNumber: 1, sha: "s" } })).toEqual({ status: "unavailable" });
     expect(await clientWith(respond(503, "down")).status("t-1")).toEqual({ status: "unavailable" });
   });
 
@@ -313,5 +313,16 @@ describe("createKgRefreshIngressClient", () => {
     expect(calls[1][1].headers as Record<string, string>).not.toHaveProperty("idempotency-key");
     expect(calls[0][1].signal).toBeInstanceOf(AbortSignal);
     expect(calls[0][1].method).toBe("POST");
+  });
+
+  it("forwards the delivery id to KgRepo.enqueueDryRun as the idempotency-key header (AII-730)", async () => {
+    const fetchImpl = respond(200, JSON.stringify({ queued: true }));
+    const client = clientWith(fetchImpl);
+    const entry = { key: "acme/kg#1", ref: "br", report: { repo: "acme/kg", prNumber: 1, sha: "s" } };
+    expect(await client.enqueueDryRun("acme/kg", entry, { idempotencyKey: "delivery-1" })).toEqual({ status: "accepted", value: { queued: true } });
+    const [url, init] = (fetchImpl as unknown as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit];
+    expect(url).toBe(`${BASE}/KgRepo/acme%2Fkg/enqueueDryRun`);
+    expect((init.headers as Record<string, string>)["idempotency-key"]).toBe("delivery-1");
+    expect(JSON.parse(init.body as string)).toEqual(entry);
   });
 });

@@ -73,24 +73,27 @@ export interface KgPrCheckConfig {
   kgBaseRepo: string | null;
   githubAppId?: string;
   githubAppPrivateKey?: string;
-  trigger: (opts: {
-    dryRun?: boolean;
-    ref?: string;
-    report?: KgDryRunReportTarget;
-  }) => Promise<{ status: number; body: Record<string, unknown> }>;
+  /**
+   * Hands a PR-check dry-run to the `KgRepo` object (AII-730), which runs it now or holds it
+   * until the in-flight refresh releases. `idempotencyKey` is the delivery id, so Restate
+   * absorbs a redelivered event. Never throws in production; `unavailable` and `conflict`
+   * are reported, not retried.
+   */
+  enqueueDryRun: (
+    key: string,
+    entry: { ref: string; report: KgDryRunReportTarget },
+    opts?: { idempotencyKey?: string },
+  ) => Promise<
+    | { status: "accepted"; value?: { triggerId: string } | { queued: true } }
+    | { status: "conflict" }
+    | { status: "unavailable" }
+  >;
   /** Returns whether it actually posted — false on a silent no-op (AII-636). */
   reportDryRun: (report: KgDryRunReportTarget) => Promise<boolean>;
   /**
-   * Registers a listener fired whenever a kg-refresh dispatch settles for any reason —
-   * a dry-run completion, a real refresh completion, a failure, or a deploy hold
-   * clearing (`KgRefreshHandle.onRefreshSettled`, AII-636). Used to dispatch a
-   * superseding head queued while some refresh was already in flight (AII-633).
-   */
-  onRefreshSettled?: (cb: () => void) => () => void;
-  /**
    * Evicts `KgRefreshHandle`'s stored dry-run outcome for `repo`#`prNumber` (AII-636).
    * Called from this module's own `closed` handling below, alongside its own
-   * `kgDryRunLastSha`/`kgDryRunPending` eviction for the same PR.
+   * `kgDryRunLastSha` eviction for the same PR.
    */
   forgetKgPr?: (repo: string, prNumber: number) => void;
 }
@@ -118,21 +121,8 @@ function hasAcceptBaselineLabel(payload: PullRequestPayload): boolean {
  */
 const kgDryRunLastSha = new Map<string, string>();
 
-interface KgDryRunPendingEntry {
-  ref: string;
-  report: KgDryRunReportTarget;
-}
-
 /**
- * Heads queued while a dry-run was already in flight for the same PR, keyed by
- * `repo#prNumber` (AII-633). At most one entry per PR — a newer head replaces the
- * pending one rather than queuing alongside it, so only the latest ever dispatches.
- * Bounded and evicted the same way as kgDryRunLastSha (AII-636).
- */
-const kgDryRunPending = new Map<string, KgDryRunPendingEntry>();
-
-/**
- * Evicts `repo`#`prNumber`'s entries from both webhook-local caches, plus the
+ * Evicts `repo`#`prNumber`'s entries from the webhook-local cache, plus the
  * kg-refresh handle's own stored dry-run outcome for the same PR when
  * `kgPrCheck.forgetKgPr` is wired (AII-636). Called on `pull_request` `closed` — a
  * closed PR can never legitimately receive another `labeled` re-report, so there is
@@ -141,50 +131,7 @@ const kgDryRunPending = new Map<string, KgDryRunPendingEntry>();
 function forgetKgPr(kgPrCheck: KgPrCheckConfig | undefined, repoFullName: string, prNumber: number): void {
   const key = `${repoFullName}#${prNumber}`;
   kgDryRunLastSha.delete(key);
-  kgDryRunPending.delete(key);
   kgPrCheck?.forgetKgPr?.(repoFullName, prNumber);
-}
-
-/**
- * Queues `entry` as the pending dispatch for `key`, replacing any earlier pending
- * head, and arms a one-shot listener that dispatches it on the next dry-run
- * completion. Called both when a fresh webhook delivery collides with an in-flight
- * dry-run (trigger() → 409) and when a queued dispatch itself races into another
- * in-flight run.
- */
-function queueKgDryRun(kgPrCheck: KgPrCheckConfig, key: string, entry: KgDryRunPendingEntry): void {
-  kgDryRunPending.delete(key);
-  kgDryRunPending.set(key, entry);
-  if (kgDryRunPending.size > MAX_TRACKED_PRS) {
-    const oldestKey = kgDryRunPending.keys().next().value;
-    if (oldestKey !== undefined) kgDryRunPending.delete(oldestKey);
-  }
-  if (!kgPrCheck.onRefreshSettled) return;
-  const unregister = kgPrCheck.onRefreshSettled(() => {
-    unregister();
-    void dispatchPendingKgDryRun(kgPrCheck, key);
-  });
-}
-
-/** Dispatches the pending head for `key`, if any, once the in-flight dry-run has settled. */
-async function dispatchPendingKgDryRun(kgPrCheck: KgPrCheckConfig, key: string): Promise<void> {
-  const entry = kgDryRunPending.get(key);
-  if (!entry) return;
-  kgDryRunPending.delete(key);
-
-  const result = await kgPrCheck.trigger({ dryRun: true, ref: entry.ref, report: entry.report }).catch((err) => {
-    console.error(`[webhook] kg-refresh dry-run: failed to dispatch queued head for ${key}:`, err);
-    return { status: 500, body: {} as Record<string, unknown> };
-  });
-
-  if (result.status === 409) {
-    // Still busy — another dispatch raced in ahead of this one. Re-queue and wait
-    // for the next completion rather than dropping the superseding head.
-    queueKgDryRun(kgPrCheck, key, entry);
-    return;
-  }
-
-  console.log(`[kg-refresh] dry-run for ${entry.report.repo}@${entry.report.sha} (queued dispatch)`);
 }
 
 /**
@@ -198,6 +145,7 @@ async function handleKgPrCheckWebhook(
   payload: PullRequestPayload,
   res: http.ServerResponse,
   kgPrCheck: KgPrCheckConfig | undefined,
+  deliveryId?: string,
 ): Promise<boolean> {
   if (!kgPrCheck) return false;
   if (
@@ -315,20 +263,29 @@ async function handleKgPrCheckWebhook(
     acceptBaseline: hasAcceptBaselineLabel(payload),
   };
 
-  const result = await kgPrCheck.trigger({ dryRun: true, ref: headRef, report }).catch((err) => {
-    console.error(`[webhook] kg-refresh dry-run trigger failed for ${repoFullName}#${prNumber}:`, err);
-    return { status: 500, body: {} as Record<string, unknown> };
-  });
+  const result = await kgPrCheck
+    .enqueueDryRun(key, { ref: headRef, report }, deliveryId ? { idempotencyKey: deliveryId } : undefined)
+    .catch((err) => {
+      console.error(`[webhook] kg-refresh dry-run enqueue failed for ${repoFullName}#${prNumber}:`, err);
+      return { status: "unavailable" as const };
+    });
 
-  if (result.status === 409) {
-    // A refresh is already running — supersede any previously queued head for this
-    // PR with this one and dispatch it once the in-flight dry-run completes.
-    queueKgDryRun(kgPrCheck, key, { ref: headRef, report });
-    return answer(202, { queued: true }, "queued behind the running refresh");
+  if (result.status !== "accepted") {
+    // No inbox, queue, or retry loop here: a lost delivery leaves the required check
+    // pending, and a re-push or manual redelivery recovers it. Clear the dedup so that
+    // same sha is not wrongly skipped.
+    if (kgDryRunLastSha.get(key) === sha) kgDryRunLastSha.delete(key);
+    console.warn(`[webhook] kg-refresh dry-run enqueue ${result.status} for ${repoFullName}#${prNumber}`);
+    return answer(502, { error: "kg_refresh_enqueue_failed", status: result.status }, `enqueue ${result.status}`);
   }
 
-  console.log(`[kg-refresh] dry-run for ${repoFullName}@${sha}`);
-  return answer(result.status === 202 ? 202 : 200, { triggered: result.status === 202, status: result.status }, `dispatched (status ${result.status})`);
+  const value = result.value;
+  if (value && "queued" in value) {
+    console.log(`[kg-refresh] dry-run for ${repoFullName}@${sha} (queued dispatch)`);
+    return answer(202, { queued: true }, "queued behind the running refresh");
+  }
+  console.log(`[kg-refresh] dry-run for ${repoFullName}@${sha}${value ? ` (trigger ${value.triggerId})` : ""}`);
+  return answer(202, { triggered: true, ...(value ? { triggerId: value.triggerId } : {}) }, "dispatched");
 }
 
 interface ReviewPayload {
@@ -509,7 +466,7 @@ export async function handleGitHubWebhook(
     // The KG PR check owns `opened`, `labeled`, and `unlabeled` responses; on `synchronize`
     // it runs as a side effect and returns false so handlePullRequestSynchronize below
     // still runs (AII-639).
-    const handled = await handleKgPrCheckWebhook(payload, res, kgPrCheck);
+    const handled = await handleKgPrCheckWebhook(payload, res, kgPrCheck, deliveryId);
     if (handled) return;
   }
 

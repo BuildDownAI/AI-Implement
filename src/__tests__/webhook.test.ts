@@ -13,7 +13,6 @@ import type * as ReviewFixQueueModule from "../review-fix-queue.js";
 import type * as CommentGapfillQueueModule from "../comment-gapfill-queue.js";
 import type { RepoMapping } from "../config.js";
 import type { KgPrCheckConfig, KgDryRunReportTarget } from "../webhook.js";
-import { makeKgRefresh, type KgRefreshHandle } from "../kg-refresh.js";
 
 // ---------- Hoisted mocks for /ai-implement path ----------
 
@@ -331,7 +330,7 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
       kgBaseRepo: KG_BASE_REPO,
       githubAppId: "app-id",
       githubAppPrivateKey: "app-key",
-      trigger: vi.fn().mockResolvedValue({ status: 202, body: {} }),
+      enqueueDryRun: vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } }),
       reportDryRun: vi.fn().mockResolvedValue(true),
       ...overrides,
     };
@@ -372,30 +371,9 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
     };
   }
 
-  /**
-   * Builds a real (non-mocked) KgRefreshHandle wired the way index.ts wires one, so the
-   * webhook's supersession queue is proven against the handle's real settle listeners
-   * rather than a hand-fired mock callback (AII-636).
-   */
-  function makeRealKgRefreshHandle(): KgRefreshHandle {
-    return makeKgRefresh({
-      sidecar: { restart: vi.fn(async () => {}) },
-      githubAppId: "1",
-      githubAppPrivateKey: "key",
-      kgSourceRepo: KG_SOURCE_REPO,
-      dataRoot: "/nonexistent-kg-root",
-      kgDir: "/nonexistent-kg",
-      mintToken: vi.fn(async () => ({ token: "tok", expiresAt: "" })) as never,
-      fetchTarball: vi.fn() as never,
-      fetchDefaultBranch: vi.fn(async () => "main") as never,
-      persistDryRunOutcomes: vi.fn() as never,
-      loadDryRunOutcomes: vi.fn(() => null) as never,
-    });
-  }
-
   it("dispatches a dry-run when a KG source repo PR touches kg_ingest/", async () => {
-    const trigger = vi.fn().mockResolvedValue({ status: 202, body: {} });
-    const kgPrCheck = makeKgPrCheck({ trigger });
+    const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } });
+    const kgPrCheck = makeKgPrCheck({ enqueueDryRun });
     mockPrFiles(["kg_ingest/loader.py"]);
 
     const { req, res } = makeRequest(
@@ -406,18 +384,18 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
     webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
     await res.done;
 
-    expect(trigger).toHaveBeenCalledTimes(1);
-    expect(trigger).toHaveBeenCalledWith({
-      dryRun: true,
-      ref: "feature/x",
-      report: { repo: KG_SOURCE_REPO, prNumber: 42, sha: "sha-42", acceptBaseline: false },
-    });
+    expect(enqueueDryRun).toHaveBeenCalledTimes(1);
+    expect(enqueueDryRun).toHaveBeenCalledWith(
+      `${KG_SOURCE_REPO}#42`,
+      { ref: "feature/x", report: { repo: KG_SOURCE_REPO, prNumber: 42, sha: "sha-42", acceptBaseline: false } },
+      undefined,
+    );
     expect(res.statusCode).toBe(202);
   });
 
   it("dispatches on the base template repo when the head branch matches an upstream-merge pattern, even with no guard-path change", async () => {
-    const trigger = vi.fn().mockResolvedValue({ status: 202, body: {} });
-    const kgPrCheck = makeKgPrCheck({ trigger });
+    const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } });
+    const kgPrCheck = makeKgPrCheck({ enqueueDryRun });
     mockPrFiles(["README.md"]);
 
     const { req, res } = makeRequest(
@@ -434,18 +412,18 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
     webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
     await res.done;
 
-    expect(trigger).toHaveBeenCalledTimes(1);
-    expect(trigger).toHaveBeenCalledWith({
-      dryRun: true,
-      ref: "kg-upstream/2026-09-13",
-      report: { repo: KG_BASE_REPO, prNumber: 5, sha: "sha-5", acceptBaseline: false },
-    });
+    expect(enqueueDryRun).toHaveBeenCalledTimes(1);
+    expect(enqueueDryRun).toHaveBeenCalledWith(
+      `${KG_BASE_REPO}#5`,
+      { ref: "kg-upstream/2026-09-13", report: { repo: KG_BASE_REPO, prNumber: 5, sha: "sha-5", acceptBaseline: false } },
+      undefined,
+    );
     expect(res.statusCode).toBe(202);
   });
 
   it("does not trigger a synchronize touching only unrelated files", async () => {
-    const trigger = vi.fn().mockResolvedValue({ status: 202, body: {} });
-    const kgPrCheck = makeKgPrCheck({ trigger });
+    const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } });
+    const kgPrCheck = makeKgPrCheck({ enqueueDryRun });
     mockPrFiles(["docs/README.md"]);
 
     const { req, res } = makeRequest(
@@ -456,14 +434,14 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
     webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
     await res.done;
 
-    expect(trigger).not.toHaveBeenCalled();
+    expect(enqueueDryRun).not.toHaveBeenCalled();
     expect(JSON.parse(res.body).ignored).toBe(true);
   });
 
   it("re-reports without re-triggering when the accept-baseline label is applied", async () => {
-    const trigger = vi.fn().mockResolvedValue({ status: 202, body: {} });
+    const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } });
     const reportDryRun = vi.fn().mockResolvedValue(true);
-    const kgPrCheck = makeKgPrCheck({ trigger, reportDryRun });
+    const kgPrCheck = makeKgPrCheck({ enqueueDryRun, reportDryRun });
 
     const { req, res } = makeRequest(
       SECRET,
@@ -481,7 +459,7 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
     webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
     await res.done;
 
-    expect(trigger).not.toHaveBeenCalled();
+    expect(enqueueDryRun).not.toHaveBeenCalled();
     expect(reportDryRun).toHaveBeenCalledTimes(1);
     expect(reportDryRun).toHaveBeenCalledWith({
       repo: KG_SOURCE_REPO,
@@ -493,9 +471,9 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
   });
 
   it("an accept-baseline label on a PR with no stored dry-run outcome answers ignored, not reported (AII-636)", async () => {
-    const trigger = vi.fn().mockResolvedValue({ status: 202, body: {} });
+    const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } });
     const reportDryRun = vi.fn().mockResolvedValue(false);
-    const kgPrCheck = makeKgPrCheck({ trigger, reportDryRun });
+    const kgPrCheck = makeKgPrCheck({ enqueueDryRun, reportDryRun });
 
     const { req, res } = makeRequest(
       SECRET,
@@ -513,15 +491,15 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
     webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
     await res.done;
 
-    expect(trigger).not.toHaveBeenCalled();
+    expect(enqueueDryRun).not.toHaveBeenCalled();
     expect(reportDryRun).toHaveBeenCalledTimes(1);
     expect(JSON.parse(res.body)).toEqual({ ignored: true, reason: "no_dry_run_outcome" });
   });
 
   it("a non-accept-baseline label is ignored, even on a PR that never ran a dry-run (AII-636)", async () => {
-    const trigger = vi.fn().mockResolvedValue({ status: 202, body: {} });
+    const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } });
     const reportDryRun = vi.fn().mockResolvedValue(undefined);
-    const kgPrCheck = makeKgPrCheck({ trigger, reportDryRun });
+    const kgPrCheck = makeKgPrCheck({ enqueueDryRun, reportDryRun });
 
     const { req, res } = makeRequest(
       SECRET,
@@ -539,15 +517,15 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
     webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
     await res.done;
 
-    expect(trigger).not.toHaveBeenCalled();
+    expect(enqueueDryRun).not.toHaveBeenCalled();
     expect(reportDryRun).not.toHaveBeenCalled();
     expect(JSON.parse(res.body)).toEqual({ ignored: true, reason: "not_accept_baseline_label" });
   });
 
   it("removing the accept-baseline label re-reports with acceptBaseline:false, reverting the wording (AII-640)", async () => {
-    const trigger = vi.fn().mockResolvedValue({ status: 202, body: {} });
+    const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } });
     const reportDryRun = vi.fn().mockResolvedValue(true);
-    const kgPrCheck = makeKgPrCheck({ trigger, reportDryRun });
+    const kgPrCheck = makeKgPrCheck({ enqueueDryRun, reportDryRun });
 
     const { req, res } = makeRequest(
       SECRET,
@@ -565,7 +543,7 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
     webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
     await res.done;
 
-    expect(trigger).not.toHaveBeenCalled();
+    expect(enqueueDryRun).not.toHaveBeenCalled();
     expect(reportDryRun).toHaveBeenCalledTimes(1);
     expect(reportDryRun).toHaveBeenCalledWith({
       repo: KG_SOURCE_REPO,
@@ -577,9 +555,9 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
   });
 
   it("an unlabeled event for a label other than accept-baseline is ignored", async () => {
-    const trigger = vi.fn().mockResolvedValue({ status: 202, body: {} });
+    const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } });
     const reportDryRun = vi.fn().mockResolvedValue(true);
-    const kgPrCheck = makeKgPrCheck({ trigger, reportDryRun });
+    const kgPrCheck = makeKgPrCheck({ enqueueDryRun, reportDryRun });
 
     const { req, res } = makeRequest(
       SECRET,
@@ -597,14 +575,14 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
     webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
     await res.done;
 
-    expect(trigger).not.toHaveBeenCalled();
+    expect(enqueueDryRun).not.toHaveBeenCalled();
     expect(reportDryRun).not.toHaveBeenCalled();
     expect(JSON.parse(res.body)).toEqual({ ignored: true, reason: "not_accept_baseline_label" });
   });
 
   it("a transient listPullRequestFiles failure is reported distinctly from a genuine no-guard-relevant-change ignore", async () => {
-    const trigger = vi.fn().mockResolvedValue({ status: 202, body: {} });
-    const kgPrCheck = makeKgPrCheck({ trigger });
+    const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } });
+    const kgPrCheck = makeKgPrCheck({ enqueueDryRun });
     mockFetch.mockImplementation((url: string | URL | Request) => {
       const urlStr = String(url);
       if (urlStr.includes("/files")) return Promise.resolve(new Response("", { status: 500 }));
@@ -620,7 +598,7 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
     webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
     await res.done;
 
-    expect(trigger).not.toHaveBeenCalled();
+    expect(enqueueDryRun).not.toHaveBeenCalled();
     // AII-639: on `synchronize` the KG check never owns the response — the normal
     // pull_request handling answers — so the distinct reason is in the log instead.
     expect(JSON.parse(res.body)).toEqual({ ignored: true, reason: "no matching dispatch" });
@@ -629,8 +607,8 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
   });
 
   it("a branch-pattern match still dispatches when the files fetch fails, since the branch alone is guard-relevant", async () => {
-    const trigger = vi.fn().mockResolvedValue({ status: 202, body: {} });
-    const kgPrCheck = makeKgPrCheck({ trigger });
+    const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } });
+    const kgPrCheck = makeKgPrCheck({ enqueueDryRun });
     mockFetch.mockImplementation(() => Promise.resolve(new Response("", { status: 500 })));
 
     const { req, res } = makeRequest(
@@ -641,14 +619,14 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
     webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
     await res.done;
 
-    expect(trigger).toHaveBeenCalledTimes(1);
-    // AII-639: the dispatch is asserted on `trigger`; the response belongs to the normal handling.
+    expect(enqueueDryRun).toHaveBeenCalledTimes(1);
+    // AII-639: the dispatch is asserted on `enqueueDryRun`; the response belongs to the normal handling.
     expect(JSON.parse(res.body).reason).toBe("no matching dispatch");
   });
 
   it("ignores a redelivery carrying the same head sha and does not re-trigger", async () => {
-    const trigger = vi.fn().mockResolvedValue({ status: 202, body: {} });
-    const kgPrCheck = makeKgPrCheck({ trigger });
+    const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } });
+    const kgPrCheck = makeKgPrCheck({ enqueueDryRun });
     mockPrFiles(["sources.yml"]);
     const payload = prPayload({
       action: "synchronize",
@@ -666,14 +644,14 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
     webhook.handleGitHubWebhook(second.req as never, second.res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
     await second.res.done;
 
-    expect(trigger).toHaveBeenCalledTimes(1);
+    expect(enqueueDryRun).toHaveBeenCalledTimes(1);
     // AII-639: the duplicate is logged; both deliveries are answered by the normal handling.
     expect(JSON.parse(second.res.body).reason).toBe("no matching dispatch");
   });
 
   it("a guard-relevant synchronize on the KG source repo runs both rails: the dry-run dispatches and the normal pull_request handling answers (AII-639)", async () => {
-    const trigger = vi.fn().mockResolvedValue({ status: 202, body: {} });
-    const kgPrCheck = makeKgPrCheck({ trigger });
+    const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } });
+    const kgPrCheck = makeKgPrCheck({ enqueueDryRun });
     mockPrFiles(["kg_ingest/tracker.py"]);
 
     const { req, res } = makeRequest(
@@ -684,16 +662,16 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
     webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
     await res.done;
 
-    expect(trigger).toHaveBeenCalledTimes(1);
-    expect(trigger.mock.calls[0][0]).toMatchObject({ dryRun: true, ref: "feature/kgb-x" });
+    expect(enqueueDryRun).toHaveBeenCalledTimes(1);
+    expect(enqueueDryRun.mock.calls[0][1]).toMatchObject({ ref: "feature/kgb-x" });
     // The KG repos are ordinary onboarded projects too: gap-fill matching still ran.
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body)).toEqual({ ignored: true, reason: "no matching dispatch" });
   });
 
   it("a KG-repo PR with a live dispatch_log match gets both the dry-run trigger and the gap-fill acknowledgement (AII-639/AII-640)", async () => {
-    const trigger = vi.fn().mockResolvedValue({ status: 202, body: {} });
-    const kgPrCheck = makeKgPrCheck({ trigger });
+    const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } });
+    const kgPrCheck = makeKgPrCheck({ enqueueDryRun });
     mockPrFiles(["kg_ingest/tracker.py"]);
 
     const jobId = log.appendLog({ issueId: "issue-kg-1", issueIdentifier: "AII-900", repo: KG_SOURCE_REPO });
@@ -708,8 +686,8 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
     await res.done;
 
     // The dry-run side effect still fires...
-    expect(trigger).toHaveBeenCalledTimes(1);
-    expect(trigger.mock.calls[0][0]).toMatchObject({ dryRun: true, ref: "feature/kgb-y" });
+    expect(enqueueDryRun).toHaveBeenCalledTimes(1);
+    expect(enqueueDryRun.mock.calls[0][1]).toMatchObject({ ref: "feature/kgb-y" });
     // ...and the normal pull_request handling still owns the response, finding the
     // real dispatch_log row rather than falling back to "no matching dispatch".
     expect(res.statusCode).toBe(200);
@@ -717,8 +695,8 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
   });
 
   it("a synchronize on the KG source repo touching only docs does not dispatch and still reaches the normal pull_request handling (AII-639)", async () => {
-    const trigger = vi.fn().mockResolvedValue({ status: 202, body: {} });
-    const kgPrCheck = makeKgPrCheck({ trigger });
+    const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } });
+    const kgPrCheck = makeKgPrCheck({ enqueueDryRun });
     mockPrFiles(["docs/README.md"]);
 
     const { req, res } = makeRequest(
@@ -729,13 +707,13 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
     webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
     await res.done;
 
-    expect(trigger).not.toHaveBeenCalled();
+    expect(enqueueDryRun).not.toHaveBeenCalled();
     expect(JSON.parse(res.body)).toEqual({ ignored: true, reason: "no matching dispatch" });
   });
 
   it("an opened event on the KG source repo is still answered by the KG check (nothing else handles opened)", async () => {
-    const trigger = vi.fn().mockResolvedValue({ status: 202, body: {} });
-    const kgPrCheck = makeKgPrCheck({ trigger });
+    const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } });
+    const kgPrCheck = makeKgPrCheck({ enqueueDryRun });
     mockPrFiles(["docs/README.md"]);
 
     const { req, res } = makeRequest(
@@ -746,13 +724,13 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
     webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
     await res.done;
 
-    expect(trigger).not.toHaveBeenCalled();
+    expect(enqueueDryRun).not.toHaveBeenCalled();
     expect(JSON.parse(res.body)).toEqual({ ignored: true, reason: "no_guard_relevant_change" });
   });
 
   it("falls through to the existing pull_request handling for a repo that is neither the KG source nor base repo", async () => {
-    const trigger = vi.fn().mockResolvedValue({ status: 202, body: {} });
-    const kgPrCheck = makeKgPrCheck({ trigger });
+    const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } });
+    const kgPrCheck = makeKgPrCheck({ enqueueDryRun });
 
     const { req, res } = makeRequest(
       SECRET,
@@ -762,158 +740,78 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
     webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
     await res.done;
 
-    expect(trigger).not.toHaveBeenCalled();
+    expect(enqueueDryRun).not.toHaveBeenCalled();
     expect(res.statusCode).toBe(200);
     const body = JSON.parse(res.body);
     expect(body.ignored).toBe(true);
     expect(body.reason).toBe("no matching dispatch");
   });
 
-  it("queues a superseding head when trigger reports 409 (a refresh is already running), and dispatches it exactly once on completion", async () => {
-    const trigger = vi
-      .fn()
-      .mockResolvedValueOnce({ status: 202, body: {} })
-      .mockResolvedValueOnce({ status: 409, body: { error: "refresh-in-progress" } })
-      .mockResolvedValueOnce({ status: 202, body: {} });
-    let settledCb: (() => void) | undefined;
-    const onRefreshSettled = vi.fn((cb: () => void) => {
-      settledCb = cb;
-      return vi.fn();
-    });
-    const kgPrCheck = makeKgPrCheck({ trigger, onRefreshSettled });
+  it("a dry-run held behind a running refresh answers queued and logs the queued dispatch", async () => {
+    const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { queued: true } });
+    const kgPrCheck = makeKgPrCheck({ enqueueDryRun });
     mockPrFiles(["kg_ingest/loader.py"]);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 
-    const first = makeRequest(
-      SECRET,
-      "pull_request",
-      prPayload({ action: "synchronize", number: 20, ref: "br1", sha: "sha-1", repo: KG_SOURCE_REPO }),
-    );
-    webhook.handleGitHubWebhook(first.req as never, first.res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
-    await first.res.done;
-    expect(first.res.statusCode).toBe(200); // AII-639: answered by the normal pull_request handling
-
-    const second = makeRequest(
-      SECRET,
-      "pull_request",
-      prPayload({ action: "synchronize", number: 20, ref: "br2", sha: "sha-2", repo: KG_SOURCE_REPO }),
-    );
-    webhook.handleGitHubWebhook(second.req as never, second.res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
-    await second.res.done;
-
-    expect(second.res.statusCode).toBe(200); // AII-639: `queued` is logged; the queue is proven by the dispatch on settle below
-    expect(JSON.parse(second.res.body).reason).toBe("no matching dispatch");
-    expect(trigger).toHaveBeenCalledTimes(2);
-    expect(settledCb).toBeTypeOf("function");
-
-    // The in-flight dry-run settles — the queued (newer) head dispatches exactly once.
-    settledCb!();
-    await new Promise((resolve) => setTimeout(resolve, 0));
-
-    expect(trigger).toHaveBeenCalledTimes(3);
-    expect(trigger).toHaveBeenNthCalledWith(3, {
-      dryRun: true,
-      ref: "br2",
-      report: { repo: KG_SOURCE_REPO, prNumber: 20, sha: "sha-2", acceptBaseline: false },
-    });
-
-    // Firing the (already-consumed) listener again must not double-dispatch.
-    settledCb!();
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(trigger).toHaveBeenCalledTimes(3);
-  });
-
-  it("supersedes an already-queued head with a newer one arriving before completion — only the newest dispatches", async () => {
-    const trigger = vi
-      .fn()
-      .mockResolvedValueOnce({ status: 202, body: {} })
-      .mockResolvedValueOnce({ status: 409, body: {} })
-      .mockResolvedValueOnce({ status: 409, body: {} })
-      .mockResolvedValueOnce({ status: 202, body: {} });
-    const settledCbs: Array<() => void> = [];
-    const onRefreshSettled = vi.fn((cb: () => void) => {
-      settledCbs.push(cb);
-      return vi.fn();
-    });
-    const kgPrCheck = makeKgPrCheck({ trigger, onRefreshSettled });
-    mockPrFiles(["kg_ingest/loader.py"]);
-
-    const heads = [
-      { ref: "br1", sha: "sha-1" },
-      { ref: "br2", sha: "sha-2" },
-      { ref: "br3", sha: "sha-3" },
-    ];
-    const responses = [];
-    for (const head of heads) {
-      const { req, res } = makeRequest(
-        SECRET,
-        "pull_request",
-        prPayload({ action: "synchronize", number: 30, ref: head.ref, sha: head.sha, repo: KG_SOURCE_REPO }),
-      );
-      webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
-      await res.done;
-      responses.push(res);
-    }
-
-    expect(responses[0]!.statusCode).toBe(200); // AII-639
-    // AII-639: synchronize responses come from the normal handling; queuing is proven by the dispatch below.
-    expect(JSON.parse(responses[1]!.body).reason).toBe("no matching dispatch");
-    expect(JSON.parse(responses[2]!.body).reason).toBe("no matching dispatch");
-    expect(trigger).toHaveBeenCalledTimes(3);
-    expect(settledCbs.length).toBe(2);
-
-    // Both listeners fire for the single dry-run completion; only the latest queued
-    // head (br3) may dispatch, and only once.
-    settledCbs.forEach((cb) => cb());
-    await new Promise((resolve) => setTimeout(resolve, 0));
-
-    expect(trigger).toHaveBeenCalledTimes(4);
-    expect(trigger).toHaveBeenNthCalledWith(4, {
-      dryRun: true,
-      ref: "br3",
-      report: { repo: KG_SOURCE_REPO, prNumber: 30, sha: "sha-3", acceptBaseline: false },
-    });
-  });
-
-  it("a 409 while a refresh is running queues the head, and the real handle's settle listener dispatches it — not a hand-fired mock (AII-636)", async () => {
-    const handle = makeRealKgRefreshHandle();
-    const trigger = vi.fn()
-      .mockResolvedValueOnce({ status: 409, body: { error: "refresh-in-progress" } })
-      .mockResolvedValue({ status: 202, body: {} });
-    const kgPrCheck: KgPrCheckConfig = {
-      kgSourceRepo: KG_SOURCE_REPO,
-      kgBaseRepo: KG_BASE_REPO,
-      githubAppId: "app-id",
-      githubAppPrivateKey: "app-key",
-      trigger,
-      reportDryRun: (report) => handle.reportDryRun(report),
-      onRefreshSettled: (cb) => handle.onRefreshSettled(cb),
-    };
-    mockPrFiles(["kg_ingest/loader.py"]);
-
-    // A guard-relevant PR event arrives while a refresh is running — the trigger 409s,
-    // so the webhook queues the head.
     const { req, res } = makeRequest(
       SECRET,
       "pull_request",
-      prPayload({ action: "synchronize", number: 50, ref: "feature/real", sha: "sha-real", repo: KG_SOURCE_REPO }),
+      prPayload({ action: "opened", number: 20, ref: "br2", sha: "sha-2", repo: KG_SOURCE_REPO }),
     );
     webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
     await res.done;
-    expect(res.statusCode).toBe(200); // AII-639: answered by the normal pull_request handling
-    expect(JSON.parse(res.body).reason).toBe("no matching dispatch");
-    expect(trigger).toHaveBeenCalledTimes(1);
 
-    // The refresh settles: the handle fires its real listeners, which wakes the queued head.
-    handle.fireRefreshSettled();
+    expect(res.statusCode).toBe(202);
+    expect(JSON.parse(res.body)).toEqual({ queued: true });
+    expect(logSpy.mock.calls.some((c) => String(c[0]).includes("(queued dispatch)"))).toBe(true);
+    logSpy.mockRestore();
+  });
 
-    await vi.waitFor(() => {
-      expect(trigger).toHaveBeenCalledTimes(2);
-    });
-    expect(trigger).toHaveBeenNthCalledWith(2, {
-      dryRun: true,
-      ref: "feature/real",
-      report: { repo: KG_SOURCE_REPO, prNumber: 50, sha: "sha-real", acceptBaseline: false },
-    });
+  it("passes the x-github-delivery header as the idempotency key (Q6)", async () => {
+    const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } });
+    const kgPrCheck = makeKgPrCheck({ enqueueDryRun });
+    mockPrFiles(["kg_ingest/loader.py"]);
+
+    const { req, res } = makeRequest(
+      SECRET,
+      "pull_request",
+      prPayload({ action: "opened", number: 21, ref: "br1", sha: "sha-1", repo: KG_SOURCE_REPO }),
+      undefined,
+      { "x-github-delivery": "delivery-abc" },
+    );
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
+    await res.done;
+
+    expect(enqueueDryRun).toHaveBeenCalledTimes(1);
+    expect(enqueueDryRun).toHaveBeenCalledWith(
+      `${KG_SOURCE_REPO}#21`,
+      { ref: "br1", report: { repo: KG_SOURCE_REPO, prNumber: 21, sha: "sha-1", acceptBaseline: false } },
+      { idempotencyKey: "delivery-abc" },
+    );
+    expect(JSON.parse(res.body)).toEqual({ triggered: true, triggerId: "t-1" });
+  });
+
+  it("an unavailable enqueue answers 502 and clears the sha dedup so a redelivery of the same sha retries", async () => {
+    const enqueueDryRun = vi
+      .fn()
+      .mockResolvedValueOnce({ status: "unavailable" })
+      .mockResolvedValueOnce({ status: "accepted", value: { triggerId: "t-2" } });
+    const kgPrCheck = makeKgPrCheck({ enqueueDryRun });
+    mockPrFiles(["kg_ingest/loader.py"]);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const payload = prPayload({ action: "opened", number: 22, ref: "br1", sha: "sha-22", repo: KG_SOURCE_REPO });
+
+    const first = makeRequest(SECRET, "pull_request", payload);
+    webhook.handleGitHubWebhook(first.req as never, first.res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
+    await first.res.done;
+    expect(first.res.statusCode).toBe(502);
+
+    const second = makeRequest(SECRET, "pull_request", payload);
+    webhook.handleGitHubWebhook(second.req as never, second.res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
+    await second.res.done;
+    expect(second.res.statusCode).toBe(202);
+    expect(enqueueDryRun).toHaveBeenCalledTimes(2);
+    warnSpy.mockRestore();
   });
 
   it("a closed event evicts this PR's stored dry-run state, so a later accept-baseline label finds nothing to re-report (AII-636)", async () => {
@@ -921,14 +819,14 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
     const storeKey = (repo: string, prNumber: number) => `${repo}#${prNumber}`;
     outcomeStore.add(storeKey(KG_SOURCE_REPO, 55));
 
-    const trigger = vi.fn().mockResolvedValue({ status: 202, body: {} });
+    const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } });
     const forgetKgPr = vi.fn((repo: string, prNumber: number) => {
       outcomeStore.delete(storeKey(repo, prNumber));
     });
     const reportDryRun = vi.fn((report: KgDryRunReportTarget) =>
       Promise.resolve(outcomeStore.has(storeKey(report.repo, report.prNumber))),
     );
-    const kgPrCheck = makeKgPrCheck({ trigger, forgetKgPr, reportDryRun });
+    const kgPrCheck = makeKgPrCheck({ enqueueDryRun, forgetKgPr, reportDryRun });
 
     const closed = makeRequest(SECRET, "pull_request", {
       action: "closed",

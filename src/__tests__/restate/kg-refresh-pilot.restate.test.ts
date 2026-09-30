@@ -131,7 +131,6 @@ let railFetchCalls = 0;
 let railMaterializeCalls = 0;
 let mergeCalls = 0;
 let persistCalls = 0;
-let settledCalls = 0;
 let servedStamp = OLD_STAMP;
 let tarball: Buffer;
 let fixtureRepo: string;
@@ -212,7 +211,7 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
       cancelWorkflowRun: async (runId) => { gh.cancelCalls.push(runId); return true; },
       persistLastRefresh: (outcome: RefreshOutcome) => { persistCalls++; defaultPersistLastRefresh(outcome); },
       handleKgRefreshOutcome: () => {},
-      fireSettled: () => { settledCalls++; },
+      recordDryRunOutcome: () => {},
       isDeployHeld: () => false,
       readStatusRecord: defaultLoadLastRefresh,
       runPreflight: () => runKgRefreshPreflight({
@@ -240,7 +239,7 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
 
   beforeEach(() => {
     gh = freshGithub();
-    railFetchCalls = 0; railMaterializeCalls = 0; mergeCalls = 0; persistCalls = 0; settledCalls = 0;
+    railFetchCalls = 0; railMaterializeCalls = 0; mergeCalls = 0; persistCalls = 0;
     servedStamp = OLD_STAMP;
     sim.fetchGate = undefined;
     sim.afterStage = undefined;
@@ -450,7 +449,6 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
     expect(railMaterializeCalls).toBe(1);
     expect(mergeCalls).toBe(1);
     expect(persistCalls).toBe(1);
-    expect(settledCalls).toBe(1);
     expect(kgRows()).toHaveLength(1);
     expect(resultTokenConsumedAt(dispatchId)).toBeNull();
 

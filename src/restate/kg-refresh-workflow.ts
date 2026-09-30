@@ -104,8 +104,8 @@ export interface KgRefreshWorkflowDependencies {
   cancelWorkflowRun(runId: number): Promise<boolean>;
   persistLastRefresh(outcome: RefreshOutcome): void;
   onOutcome(kind: "success" | "failure", outcome: RefreshOutcome): void;
-  /** The dry-run queue signal, until AII-730 replaces it. */
-  fireSettled(): void;
+  /** Stores a dry-run outcome for its PR so the accept-baseline label can re-report it (AII-730). */
+  recordDryRunOutcome(report: KgDryRunReportTarget, outcome: RefreshOutcome): void;
   /** Overrides `KG_REFRESH_BOOTSTRAP_DEADLINE_MS` for a deterministic timeout test.
    *  Production composition must leave this unset so the real ten-minute deadline applies —
    *  the same test-seam shape as `ReviewFixAttemptDependencies.unknownLaunchAlertMs`
@@ -212,7 +212,6 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
 
     async function finish(outcome: RefreshOutcome): Promise<RefreshOutcome> {
       ctx.set("completed", true);
-      await ctx.run("settled", () => deps.fireSettled());
       ctx.genericSend({
         service: "KgRepo",
         method: "release",
@@ -392,7 +391,10 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           stampBefore: null, stampAfter: null, dryRun: true, partTable: report.partTable,
         };
         if (input.report) {
-          await ctx.run("dry-run-report", () => postDryRunReport(deps.rail, input.report!, outcome));
+          await ctx.run("dry-run-report", async () => {
+            deps.recordDryRunOutcome(input.report!, outcome);
+            await postDryRunReport(deps.rail, input.report!, outcome);
+          });
         }
         ctx.set("step", "closed");
         await ctx.run("close-row", () => deps.closeJobLog(jobId, "completed"));
