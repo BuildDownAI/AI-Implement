@@ -265,10 +265,10 @@ export function createModelSessionOwnership(options: ModelSessionOwnershipOption
     ) as TransitionResult;
   }
 
-  /** True when the store's latest state was written by exactly this owner generation. */
+  /** Valid only when the latest state is a runner checkpoint (sequence > 0) by exactly this generation; an operator import is sequence 0. */
   function currentOwnerCheckpoint(ref: OwnerRef): "valid" | "reauthentication_required" | "missing" {
     const read = options.store.read(ref.profileId, ref.generation);
-    if (read.ok) return read.ownerGeneration === ref.generation ? "valid" : "missing";
+    if (read.ok) return read.ownerGeneration === ref.generation && read.stateSequence > 0 ? "valid" : "missing";
     return read.category === "authentication_required" ? "reauthentication_required" : "missing";
   }
 
