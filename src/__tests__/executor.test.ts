@@ -8,7 +8,7 @@ import { execFileSync, spawn } from "node:child_process";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { PassThrough } from "node:stream";
 import { EventEmitter } from "node:events";
-import { ClaudeCliExecutor, readTelemetryFlag, type ActivityReportingConfig } from "../pipeline/executor.js";
+import { ClaudeCliExecutor, readTelemetryFlag, suspendOriginWriteCredential, type ActivityReportingConfig } from "../pipeline/executor.js";
 import { computeBackoffMs, DEFAULT_RETRY_POLICY, type RetryPolicy } from "../pipeline/retry-backoff.js";
 import type { ActivitySink, ActivityIdentity, ActivityToolResult } from "../pipeline/types.js";
 import { READ_ONLY_TOOL_PARAMS } from "../pipeline/steps/read-only-tools.js";
@@ -2644,5 +2644,42 @@ describe.skipIf(isWindows)("ClaudeCliExecutor runner-activity reporting (AII-798
     const output = (toolResultCall!.payload as ActivityToolResult).output;
     expect(output.truncated).toBe(true);
     expect(Buffer.byteLength(output.text, "utf8")).toBeLessThanOrEqual(16 * 1024);
+  });
+});
+
+describe("suspendOriginWriteCredential (shared publication-credential guard)", () => {
+  let repo: string;
+  const originOf = (): string => execFileSync("git", ["remote", "get-url", "origin"], { cwd: repo, encoding: "utf-8" }).trim();
+
+  beforeEach(() => {
+    repo = mkdtempSync(join(tmpdir(), "guard-"));
+    execFileSync("git", ["init", "-q"], { cwd: repo });
+  });
+  afterEach(() => rmSync(repo, { recursive: true, force: true }));
+
+  it("strips http(s) origin credentials and restores them exactly", () => {
+    const tokenized = "https://x-access-token:secret-token@github.com/acme/app.git";
+    execFileSync("git", ["remote", "add", "origin", tokenized], { cwd: repo });
+    const restore = suspendOriginWriteCredential(repo);
+    expect(restore).toBeTypeOf("function");
+    expect(originOf()).toBe("https://github.com/acme/app.git");
+    restore?.();
+    expect(originOf()).toBe(tokenized);
+  });
+
+  it("is a no-op for SSH origins, credential-free http origins and a missing origin", () => {
+    expect(suspendOriginWriteCredential(repo)).toBeNull();
+    execFileSync("git", ["remote", "add", "origin", "git@github.com:acme/app.git"], { cwd: repo });
+    expect(suspendOriginWriteCredential(repo)).toBeNull();
+    expect(originOf()).toBe("git@github.com:acme/app.git");
+    execFileSync("git", ["remote", "set-url", "origin", "https://github.com/acme/app.git"], { cwd: repo });
+    expect(suspendOriginWriteCredential(repo)).toBeNull();
+  });
+
+  it("throws when the credential cannot be removed", () => {
+    execFileSync("git", ["remote", "add", "origin", "https://u:p@github.com/acme/app.git"], { cwd: repo });
+    const lock = join(repo, ".git", "config.lock");
+    writeFileSync(lock, "");
+    expect(() => suspendOriginWriteCredential(repo)).toThrow(/Failed to remove the repository write credential/);
   });
 });
