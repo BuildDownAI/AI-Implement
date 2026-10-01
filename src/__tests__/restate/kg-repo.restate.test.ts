@@ -323,6 +323,25 @@ describe("KgRepo durable single-flight lock", () => {
   );
 
   it.each(VARIANTS.map(([label]) => label))(
+    "AII-1010: an evicted PR's sha key is cleared, so the same head is queued again, not duplicate (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const slug = newKey();
+      await trigger(env.baseUrl(), slug);
+      await enqueue(env.baseUrl(), slug, 1, "br1");
+      await Promise.all(
+        Array.from({ length: MAX_TRACKED_PRS }, (_, i) => enqueue(env.baseUrl(), slug, i + 2, `br${i + 2}`)),
+      );
+      expect((await repoStatus(env.baseUrl(), slug))!.pending).not.toContain("org/kg-source#1");
+
+      expect(await enqueue(env.baseUrl(), slug, 1, "br1")).not.toHaveProperty("duplicate");
+      // A PR that was not evicted still answers duplicate for its head.
+      expect(await enqueue(env.baseUrl(), slug, MAX_TRACKED_PRS + 1, `br${MAX_TRACKED_PRS + 1}`)).toEqual({ duplicate: true });
+    },
+    120_000,
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
     "Q6: the same idempotency key and body is absorbed — one queue entry, one submit (%s)",
     async (label) => {
       const env = envFor(label);

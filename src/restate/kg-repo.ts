@@ -147,7 +147,11 @@ export function createKgRepo(deps: KgRepoDependencies) {
     delete pending[key];
     pending[key] = { ref, report, enqueuedAt: now };
     while (Object.keys(pending).length > MAX_TRACKED_PRS) {
-      delete pending[oldestPendingKey(pending)!];
+      const evictedKey = oldestPendingKey(pending)!;
+      const evicted = pending[evictedKey].report;
+      delete pending[evictedKey];
+      // The evicted head never ran, so its dedup key must not turn a later event for it into `duplicate`.
+      ctx.clear(shaStateKey(evicted.repo, evicted.prNumber));
     }
     ctx.set("pending", pending);
     return { queued: true };
