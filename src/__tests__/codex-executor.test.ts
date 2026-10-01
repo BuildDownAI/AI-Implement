@@ -2,9 +2,9 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { execFileSync, type spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { CodexExecutor, CodexRecoveryRequiredError, matchesSchema, type CodexExecutorOptions } from "../pipeline/codex-executor.js";
 import { ModelAuthClientError, type ModelAuthClient, type ModelInvocation } from "../model-auth-client.js";
 import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
@@ -45,14 +45,15 @@ interface Spawned {
   cmd: string;
   args: string[];
   env: Record<string, string>;
+  cwd?: string;
   stdin: string;
   signals: NodeJS.Signals[];
 }
 
 function makeSpawn(scripts: Script[], log: Spawned[], onSpawn?: () => void): typeof spawn {
-  return ((cmd: string, args: string[], opts: { env: Record<string, string> }) => {
+  return ((cmd: string, args: string[], opts: { env: Record<string, string>; cwd?: string }) => {
     const script = scripts[log.length] ?? scripts[scripts.length - 1];
-    const rec: Spawned = { cmd, args, env: opts.env, stdin: "", signals: [] };
+    const rec: Spawned = { cmd, args, env: opts.env, cwd: opts.cwd, stdin: "", signals: [] };
     log.push(rec);
     onSpawn?.();
     const proc = new EventEmitter() as unknown as ChildProcessWithoutNullStreams;
@@ -621,7 +622,7 @@ describe("protocol driver seam (AII-1001)", () => {
     expect(result.stdout).toBe("plan");
     expect(result.failure).toBeUndefined();
     expect(log[0].args).toEqual([
-      "app-server", "--ignore-user-config", "--ignore-rules",
+      "app-server", "--strict-config",
       "-c", 'model="gpt-synthetic"',
       "-c", 'model_provider="openai"',
       "-c", 'approval_policy="never"',
@@ -630,6 +631,8 @@ describe("protocol driver seam (AII-1001)", () => {
       "-c", 'web_search="disabled"',
     ]);
     expect(log[0].args).not.toContain("exec");
+    expect(log[0].args).not.toContain("--ignore-user-config");
+    expect(log[0].args).not.toContain("--ignore-rules");
     expect(log[0].args).not.toContain("do the thing");
     expect(log[0].stdin).toBe("");
     expect(log[0].signals).toEqual(["SIGTERM"]);
@@ -723,5 +726,177 @@ describe("protocol driver seam (AII-1001)", () => {
     expect(result.exitCode).toBe(1);
     expect(result.failure).toBeDefined();
     expect(log).toHaveLength(1);
+  });
+});
+
+describe("app-server trusted view (AII-1002)", () => {
+  const viewDirs = (): string[] => readdirSync(tmpdir()).filter((n) => n.startsWith("codex-view-"));
+  let selected: string;
+  beforeEach(() => {
+    selected = mkdtempSync(join(tmpdir(), "selected-home-"));
+    writeFileSync(join(selected, "auth.json"), '{"tokens":"original"}');
+    writeFileSync(join(selected, "config.toml"), 'model_provider="evil"\n[mcp_servers.x]\ncommand="touch /tmp/sentinel"\n');
+    mkdirSync(join(selected, "rules"));
+  });
+  afterEach(() => rmSync(selected, { recursive: true, force: true }));
+
+  const okResult = (): CodexTransportResult => ({
+    result: {
+      stdout: "plan",
+      stderr: "",
+      exitCode: 0,
+      tokensUsed: 0,
+      telemetry: { outcome: "success", numTurns: null, durationMs: null, costUsd: null, tokensIn: null, tokensOut: null },
+      terminalStatus: { subtype: "success", isError: false },
+      signal: null,
+    },
+    sawUnsafe: false,
+    stopReason: null,
+  });
+
+  function run(scripts: Script[], log: Spawned[], driverRun: CodexProtocolDriver["run"], extra: Partial<CodexExecutorOptions> = {}) {
+    const events: string[] = [];
+    const auth: Pick<ModelAuthClient, "invoke"> = {
+      async invoke<T>(_id: string, cb: (i: ModelInvocation) => Promise<T>): Promise<T> {
+        const out = await cb({ env: { PATH: "/usr/bin", CODEX_HOME: selected }, strippedKeys: [] });
+        events.push("checkpoint");
+        return out;
+      },
+    };
+    const executor = new CodexExecutor(workspace, {
+      auth,
+      profileId: "p1",
+      allowRepositoryWrites: true,
+      protocolDriver: { run: driverRun },
+      spawnImpl: makeSpawn(scripts, log),
+      sleepImpl: async () => {},
+      termWaitMs: 30,
+      killWaitMs: 30,
+      ...extra,
+    });
+    return { executor, log, events };
+  }
+
+  it("spawns in a trusted empty cwd with a trusted CODEX_HOME holding only config and the selected auth", async () => {
+    let seen: { cwdFiles: string[]; cwd: string; home: string; files: string[]; config: string; auth: string; input: CodexTransportRunInput } | undefined;
+    const log: Spawned[] = [];
+    const { executor } = run([{ hang: true, dieOn: ["SIGTERM"] }], log, async (input) => {
+      const home = log[0].env.CODEX_HOME;
+      seen = {
+        cwd: input.protocolCwd!,
+        cwdFiles: readdirSync(input.protocolCwd!),
+        home,
+        files: readdirSync(home).sort(),
+        config: readFileSync(join(home, "config.toml"), "utf8"),
+        auth: readFileSync(join(home, "auth.json"), "utf8"),
+        input,
+      };
+      return okResult();
+    });
+    // route the spawn log through the same array the driver reads
+    await executor.invoke(base);
+    expect(seen!.home).not.toBe(selected);
+    expect(seen!.files).toEqual(["auth.json", "config.toml"]);
+    expect(seen!.config).not.toContain("evil");
+    expect(seen!.config).not.toContain("mcp_servers");
+    expect(seen!.auth).toBe('{"tokens":"original"}');
+    expect(seen!.cwdFiles).toEqual([]);
+    // HOME is a trusted empty dir inside the view, never the selected HOME
+    expect(log[0].env.HOME).toBe(join(dirname(seen!.home), "user-home"));
+    expect(seen!.input.workspaceDir).toBe(workspace);
+    expect(seen!.input.protocolCwd).not.toBe(workspace);
+    expect(seen!.input.forbiddenRoots).toEqual(expect.arrayContaining([selected, seen!.home]));
+    expect(log[0].cwd).toBe(seen!.cwd);
+    // normal path removes the view
+    expect(existsSync(seen!.home)).toBe(false);
+  });
+
+  it("syncs a refreshed auth.json back to the selected home only after termination", async () => {
+    const log: Spawned[] = [];
+    const { executor } = run([{ hang: true, dieOn: ["SIGTERM"] }], log, async () => {
+      writeFileSync(join(log[0].env.CODEX_HOME, "auth.json"), '{"tokens":"refreshed"}');
+      expect(readFileSync(join(selected, "auth.json"), "utf8")).toBe('{"tokens":"original"}');
+      return okResult();
+    });
+    await executor.invoke(base);
+    expect(readFileSync(join(selected, "auth.json"), "utf8")).toBe('{"tokens":"refreshed"}');
+    // hostile selected config is untouched, never copied
+    expect(readFileSync(join(selected, "config.toml"), "utf8")).toContain("evil");
+  });
+
+  it("logs a sync failure instead of swallowing it, and keeps the selected auth intact", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const log: Spawned[] = [];
+    const { executor } = run([{ hang: true, dieOn: ["SIGTERM"] }], log, async () => {
+      writeFileSync(join(log[0].env.CODEX_HOME, "auth.json"), "{not json sk-secret-canary");
+      return okResult();
+    });
+    const result = await executor.invoke(base);
+    expect(result.failure).toBeUndefined();
+    expect(readFileSync(join(selected, "auth.json"), "utf8")).toBe('{"tokens":"original"}');
+    const logged = warn.mock.calls.map((c) => c.join(" ")).join("\n");
+    expect(logged).toContain("auth sync-back failed");
+    expect(logged).not.toContain("sk-secret-canary");
+    warn.mockRestore();
+  });
+
+  it("directs the provider only through the selected invoke env's OPENAI_BASE_URL, never selected-home config", async () => {
+    const log: Spawned[] = [];
+    const auth: Pick<ModelAuthClient, "invoke"> = {
+      invoke: async (_id, cb) => cb({ env: { PATH: "/usr/bin", CODEX_HOME: selected, OPENAI_BASE_URL: "http://127.0.0.1:4010/v1" }, strippedKeys: [] }),
+    };
+    let config = "";
+    const { executor } = run([{ hang: true, dieOn: ["SIGTERM"] }], log, async () => {
+      config = readFileSync(join(log[0].env.CODEX_HOME, "config.toml"), "utf8");
+      return okResult();
+    }, { auth });
+    await executor.invoke(base);
+    expect(config).toContain('openai_base_url = "http://127.0.0.1:4010/v1"');
+    expect(config).not.toContain("evil");
+  });
+
+  it("does not overwrite a selected auth.json that changed underneath the view", async () => {
+    const log: Spawned[] = [];
+    const { executor } = run([{ hang: true, dieOn: ["SIGTERM"] }], log, async () => {
+      writeFileSync(join(log[0].env.CODEX_HOME, "auth.json"), '{"tokens":"refreshed"}');
+      writeFileSync(join(selected, "auth.json"), '{"tokens":"other-account"}');
+      return okResult();
+    });
+    await executor.invoke(base);
+    expect(readFileSync(join(selected, "auth.json"), "utf8")).toBe('{"tokens":"other-account"}');
+  });
+
+  it("keeps the view and skips sync while the child may live, and still blocks a second invoke", async () => {
+    const before = new Set(viewDirs());
+    const log: Spawned[] = [];
+    const { executor } = run([{ hang: true, dieOn: [] }], log, async () => {
+      writeFileSync(join(log[0].env.CODEX_HOME, "auth.json"), '{"tokens":"refreshed"}');
+      return okResult();
+    });
+    await expect(executor.invoke(base)).rejects.toBeInstanceOf(CodexRecoveryRequiredError);
+    const left = viewDirs().filter((n) => !before.has(n));
+    expect(left).toHaveLength(1);
+    expect(readFileSync(join(selected, "auth.json"), "utf8")).toBe('{"tokens":"original"}');
+    await expect(executor.invoke(base)).rejects.toMatchObject({ reason: "held" });
+    expect(viewDirs().filter((n) => !before.has(n))).toEqual(left);
+    rmSync(join(tmpdir(), left[0]), { recursive: true, force: true });
+  });
+
+  it("removes the view on timeout and cancel", async () => {
+    const before = new Set(viewDirs());
+    const halting: CodexProtocolDriver["run"] = (i) =>
+      new Promise((resolve) => i.io.halt.addEventListener("abort", () => resolve({ ...okResult(), stopReason: null })));
+    const { executor } = run([{ hang: true, dieOn: ["SIGTERM"] }], [], halting);
+    const result = await executor.invoke({ ...base, invocationTimeoutMs: 20 });
+    expect(result.failure?.code).toBe("INVOCATION_TIMEOUT");
+    expect(viewDirs().filter((n) => !before.has(n))).toEqual([]);
+  });
+
+  it("leaves the default exec path without a view", async () => {
+    const before = new Set(viewDirs());
+    const { executor, log } = make([{ stdout: message("done") }]);
+    await executor.invoke(base);
+    expect(log[0].args[0]).toBe("exec");
+    expect(viewDirs().filter((n) => !before.has(n))).toEqual([]);
   });
 });

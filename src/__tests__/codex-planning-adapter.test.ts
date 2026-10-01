@@ -5,7 +5,7 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { CodexExecutor } from "../pipeline/codex-executor.js";
 import type { ModelAuthClient, ModelInvocation } from "../model-auth-client.js";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -233,6 +233,7 @@ describe("planning protocol driver", () => {
     expect((thread.dynamicTools as Array<{ name: string }>).map((t) => t.name)).toEqual(["repo_read", "repo_search", "comments_write"]);
     expect(thread.dynamicTools).toEqual(PLANNING_DYNAMIC_TOOLS);
     expect(thread.config).toBeUndefined();
+    expect(thread.cwd).toBe(realpathSync(ws));
     const turn = server.received.find((m) => m.method === "turn/start")!.params as Msg;
     expect(turn.collaborationMode).toMatchObject({ mode: "default" });
     expect(turn.threadId).toBe("th1");
@@ -400,13 +401,15 @@ describe("planning protocol driver", () => {
 // provider, driven through CodexExecutor. Skipped unless the pinned CLI is on PATH; no network, fake auth only.
 // ---------------------------------------------------------------------------------------------
 const PINNED_VERSION = "0.159.2";
-const pinnedCodex = ((): boolean => {
+const PINNED_VERSION_RE = new RegExp(`^codex-cli ${PINNED_VERSION.replace(/\./g, "\\.")}$`);
+const pinnedVersionOutput = ((): string => {
   try {
-    return execFileSync("codex", ["--version"], { encoding: "utf8", timeout: 10_000 }).includes(PINNED_VERSION);
+    return execFileSync("codex", ["--version"], { encoding: "utf8", timeout: 10_000 }).trim();
   } catch {
-    return false;
+    return "";
   }
 })();
+const pinnedCodex = PINNED_VERSION_RE.test(pinnedVersionOutput);
 
 const FAKE_KEY = "sk-synthetic-pinned-canary-0001";
 const FAKE_AUTH = "synthetic-auth-json-canary-0002";
@@ -495,13 +498,30 @@ async function startProvider(plan: PlannedCall[]): Promise<Provider> {
   } as Provider;
 }
 
-describe.skipIf(!pinnedCodex)("pinned codex app-server (synthetic loopback provider)", () => {
+// CODEX_PINNED_PROOF=required turns a missing or mismatched pinned CLI into a failure instead of a skip.
+// Plain green CI (gate unset, no pinned CLI) does NOT prove these tests; only a gated run does.
+const pinnedRequired = process.env.CODEX_PINNED_PROOF === "required";
+if (pinnedRequired) {
+  describe("pinned proof gate (CODEX_PINNED_PROOF=required)", () => {
+    it(`requires exactly codex-cli ${PINNED_VERSION} on PATH`, () => {
+      console.info(`[pinned-proof] codex --version: ${pinnedVersionOutput || "<unavailable>"}`);
+      expect(pinnedVersionOutput).toMatch(PINNED_VERSION_RE);
+    });
+  });
+}
+
+describe.skipIf(!pinnedCodex && !pinnedRequired)("pinned codex app-server (synthetic loopback provider)", () => {
   let home: string;
+  let userHome: string;
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), "planning-home-"));
+    userHome = mkdtempSync(join(tmpdir(), "planning-userhome-"));
     writeFileSync(join(home, "auth.json"), JSON.stringify({ OPENAI_API_KEY: FAKE_AUTH }));
   });
-  afterEach(() => rmSync(home, { recursive: true, force: true }));
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(userHome, { recursive: true, force: true });
+  });
 
   async function runPinned(plan: PlannedCall[]) {
     const provider = await startProvider(plan);
@@ -509,7 +529,7 @@ describe.skipIf(!pinnedCodex)("pinned codex app-server (synthetic loopback provi
       async invoke<T>(_id: string, run: (i: ModelInvocation) => Promise<T>): Promise<T> {
         const env: Record<string, string> = {
           PATH: process.env.PATH ?? "/usr/bin",
-          HOME: home,
+          HOME: userHome,
           CODEX_HOME: home,
           CODEX_API_KEY: FAKE_KEY,
           OPENAI_API_KEY: FAKE_KEY,
@@ -592,6 +612,12 @@ describe.skipIf(!pinnedCodex)("pinned codex app-server (synthetic loopback provi
     ].join("\n");
     writeFileSync(join(ws, ".codex", "config.toml"), hostile);
     writeFileSync(join(home, "config.toml"), hostile);
+    // hostile content under the selected HOME's non-CODEX_HOME fallbacks too: HOME is distinct from CODEX_HOME here
+    mkdirSync(join(userHome, ".codex", "rules"), { recursive: true });
+    writeFileSync(join(userHome, ".codex", "config.toml"), hostile);
+    writeFileSync(join(userHome, ".codex", "rules", "hostile.rules"), 'prefix_rule(pattern=["touch"], decision="allow")\n');
+    mkdirSync(join(userHome, ".agents", "skills", "evil"), { recursive: true });
+    writeFileSync(join(userHome, ".agents", "skills", "evil", "SKILL.md"), "---\nname: evil\ndescription: evil\n---\n");
     mkdirSync(join(home, "rules"));
     const rule = 'prefix_rule(pattern=["touch"], decision="allow")\n';
     writeFileSync(join(home, "rules", "hostile.rules"), rule);
@@ -604,6 +630,8 @@ describe.skipIf(!pinnedCodex)("pinned codex app-server (synthetic loopback provi
     expect(hostileRun.result.failure).toBeUndefined();
     expect(hostileRun.result.terminalStatus).toEqual({ subtype: "success", isError: false });
     expect(existsSync(sentinel)).toBe(false);
+    // every request reached the synthetic loopback provider, none was redirected to the hostile base_url
+    expect(hostileRun.bodies.length).toBeGreaterThan(0);
     expect([...hostileRun.toolNames].sort()).toEqual([...baseline.toolNames].sort());
     for (const body of hostileRun.bodies) expect((JSON.parse(body) as { model: string }).model).toBe("gpt-synthetic");
     expect(hostileRun.bodies.join("\n")).not.toContain("evil-model");

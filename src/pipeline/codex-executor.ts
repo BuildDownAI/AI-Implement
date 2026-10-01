@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { InvokeParams, LLMExecutor, LLMResult, RunTelemetry } from "./types.js";
@@ -57,6 +57,16 @@ export interface CodexExecutorOptions {
    * recovery; the driver only speaks JSON-RPC over the child's stdio and returns a bounded result.
    */
   protocolDriver?: CodexProtocolDriver;
+}
+
+interface AppServerView {
+  root: string;
+  home: string;
+  /** Trusted empty HOME so user-level fallbacks (~/.codex, ~/.agents, skills, rules) cannot load. */
+  userHome: string;
+  cwd: string;
+  authSource: string | null;
+  initialAuth: string | null;
 }
 
 type StopReason = "timeout" | "cancel" | "stdin";
@@ -375,10 +385,12 @@ export class CodexExecutor implements LLMExecutor {
 
   /** Trusted app-server argv. Nothing here is model- or repository-controlled; config comes only from argv. */
   private buildAppServerArgs(params: InvokeParams): string[] {
+    // The pinned app-server accepts only --stdio/--strict-config/-c: no --ignore-* flags. Isolation comes
+    // from the executor-owned trusted CODEX_HOME and empty cwd (see createAppServerView); --strict-config
+    // only rejects unknown settings, it does not ignore configuration.
     return [
       "app-server",
-      "--ignore-user-config",
-      "--ignore-rules",
+      "--strict-config",
       "-c",
       `model=${JSON.stringify(params.model)}`,
       "-c",
@@ -394,7 +406,73 @@ export class CodexExecutor implements LLMExecutor {
     ];
   }
 
-  private async runChild(params: InvokeParams, env: Record<string, string>): Promise<Attempt> {
+  /**
+   * Trusted per-invoke view for the app-server: a CODEX_HOME holding only our config.toml plus a copy of
+   * the SELECTED profile's auth.json, an empty HOME, and an empty protocol cwd. Nothing else from the selected home,
+   * the user home or the repository is visible to the child's config/rules/MCP loaders.
+   */
+  private createAppServerView(selectedHome: string | undefined, model: string, baseUrl?: string): AppServerView {
+    const root = mkdtempSync(join(tmpdir(), "codex-view-"));
+    const home = join(root, "home");
+    const cwd = join(root, "cwd");
+    const userHome = join(root, "user-home");
+    mkdirSync(home, { mode: 0o700 });
+    mkdirSync(userHome, { mode: 0o700 });
+    mkdirSync(cwd, { mode: 0o700 });
+    writeFileSync(
+      join(home, "config.toml"),
+      [
+        `model = ${JSON.stringify(model)}`,
+        `model_provider = "${CODEX_PROVIDER}"`,
+        'approval_policy = "never"',
+        'sandbox_mode = "read-only"',
+        // The only sanctioned provider redirect: the SELECTED invoke env's OPENAI_BASE_URL (trusted, set by
+        // the auth client or a synthetic test), never the selected home's or repository's config.
+        ...(baseUrl ? [`openai_base_url = ${JSON.stringify(baseUrl)}`] : []),
+        "",
+      ].join("\n"),
+      { mode: 0o600 },
+    );
+    let source: string | null = null;
+    let initial: string | null = null;
+    if (selectedHome) {
+      const candidate = join(selectedHome, "auth.json");
+      if (existsSync(candidate)) {
+        copyFileSync(candidate, join(home, "auth.json"));
+        chmodSync(join(home, "auth.json"), 0o600);
+        source = candidate;
+        initial = readFileSync(candidate, "utf8");
+      }
+    }
+    return { root, home, userHome, cwd, authSource: source, initialAuth: initial };
+  }
+
+  /**
+   * Called only after the group is proven terminated. Persists a refreshed auth.json into the selected
+   * profile's home, never overwriting a file that changed underneath us and never for another account.
+   */
+  private syncAuthBack(view: AppServerView): void {
+    if (!view.authSource || view.initialAuth === null) return;
+    const viewAuth = join(view.home, "auth.json");
+    try {
+      if (!existsSync(viewAuth)) return;
+      const refreshed = readFileSync(viewAuth, "utf8");
+      if (refreshed === view.initialAuth) return;
+      JSON.parse(refreshed);
+      if (readFileSync(view.authSource, "utf8") !== view.initialAuth) return;
+      const tmp = `${view.authSource}.sync-${process.pid}`;
+      writeFileSync(tmp, refreshed, { mode: 0o600 });
+      renameSync(tmp, view.authSource);
+    } catch (err) {
+      // The client checkpoint treats a missing refresh as the pre-invoke session, so this is not fatal,
+      // but a lost refresh must be visible. Log the error class only: messages may carry paths or content.
+      console.warn(`[codex] auth sync-back failed (${err instanceof Error ? err.name : "error"}); refreshed session state not persisted`);
+    }
+  }
+
+  private async runChild(params: InvokeParams, selectedEnv: Record<string, string>): Promise<Attempt> {
+    let env = selectedEnv;
+    let view: AppServerView | null = null;
     let restoreOrigin: (() => void) | null = null;
     if (!this.options.allowRepositoryWrites) {
       try {
@@ -412,10 +490,19 @@ export class CodexExecutor implements LLMExecutor {
         schemaPath = join(schemaDir, "output-schema.json");
         writeFileSync(schemaPath, JSON.stringify(params.jsonSchema), { mode: 0o600 });
       }
+      if (this.options.protocolDriver) {
+        view = this.createAppServerView(selectedEnv.CODEX_HOME, params.model, selectedEnv.OPENAI_BASE_URL);
+        env = { ...selectedEnv, CODEX_HOME: view.home, HOME: view.userHome };
+      }
       const args = this.options.protocolDriver ? this.buildAppServerArgs(params) : this.buildArgs(params, schemaPath);
-      return await this.spawnAndWait(params, args, env);
+      const attempt = await this.spawnAndWait(params, args, env, view ?? undefined, selectedEnv.CODEX_HOME);
+      // spawnAndWait throws rather than returning while a child may live; the explicit guard keeps that invariant local.
+      if (view && !this.held) this.syncAuthBack(view);
+      return attempt;
     } finally {
       if (schemaDir) rmSync(schemaDir, { recursive: true, force: true });
+      // The view stays in place while a child may live: its auth must not be synced or removed.
+      if (view && !this.held) rmSync(view.root, { recursive: true, force: true });
       if (this.held) {
         // A child that may still be alive must never regain the publication credential.
         console.log("[codex] origin left protected: child not confirmed terminated");
@@ -433,6 +520,8 @@ export class CodexExecutor implements LLMExecutor {
     params: InvokeParams,
     args: string[],
     env: Record<string, string>,
+    view?: AppServerView,
+    selectedHome?: string,
   ): Promise<Attempt> {
     const termWaitMs = this.options.termWaitMs ?? DEFAULT_TERM_WAIT_MS;
     const killWaitMs = this.options.killWaitMs ?? DEFAULT_KILL_WAIT_MS;
@@ -449,7 +538,7 @@ export class CodexExecutor implements LLMExecutor {
     let proc: ChildProcessWithoutNullStreams;
     try {
       proc = this.spawnImpl("codex", args, {
-        cwd: this.workspaceDir,
+        cwd: view ? view.cwd : this.workspaceDir,
         stdio: ["pipe", "pipe", "pipe"],
         env,
         // Own process group, so termination reaches every descendant the CLI forks.
@@ -528,8 +617,9 @@ export class CodexExecutor implements LLMExecutor {
           prompt: params.prompt,
           model: params.model,
           workspaceDir: this.workspaceDir,
+          ...(view ? { protocolCwd: view.cwd } : {}),
           ...(params.jsonSchema ? { jsonSchema: params.jsonSchema } : {}),
-          forbiddenRoots: env.CODEX_HOME ? [env.CODEX_HOME] : [],
+          forbiddenRoots: [env.CODEX_HOME, selectedHome, view?.root].filter((p): p is string => !!p),
           redact: (text) => redactValues(text, secrets),
         })
         .then(onDriverDone, () => {

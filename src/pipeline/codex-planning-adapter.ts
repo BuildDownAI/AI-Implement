@@ -89,6 +89,8 @@ export interface CodexTransportRunInput {
   prompt: string;
   model: string;
   workspaceDir: string;
+  /** Executor-generated trusted empty cwd for the protocol thread; host tools still root at `workspaceDir`. */
+  protocolCwd?: string;
   jsonSchema?: Record<string, unknown>;
   /** Absolute directories (selected auth/session paths) the host tools must never touch. */
   forbiddenRoots: readonly string[];
@@ -438,7 +440,7 @@ function runSession(input: CodexTransportRunInput): Promise<CodexTransportResult
         request("thread", "thread/start", {
           model: input.model,
           modelProvider: "openai",
-          cwd: ctx.root,
+          cwd: input.protocolCwd ?? ctx.root,
           approvalPolicy: "never",
           sandbox: "read-only",
           ephemeral: true,
