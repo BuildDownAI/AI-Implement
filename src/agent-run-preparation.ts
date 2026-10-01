@@ -462,6 +462,7 @@ interface GrantRow {
   snapshot_id: string;
   project_key: string;
   backend: string;
+  audience: string;
   expires_at: number;
   revoked_at: number | null;
 }
@@ -472,7 +473,7 @@ function readGrant(dispatchId: string): { row: GrantRow; bindings: StoredBinding
   const db = getDb();
   const row = db
     .prepare(
-      `SELECT grant_id, snapshot_id, project_key, backend, expires_at, revoked_at
+      `SELECT grant_id, snapshot_id, project_key, backend, audience, expires_at, revoked_at
        FROM model_credential_grants WHERE dispatch_id = ? ORDER BY expires_at DESC, rowid DESC LIMIT 1`,
     )
     .get(dispatchId) as GrantRow | undefined;
@@ -644,6 +645,10 @@ export async function prepareAgentRun(request: AgentRunRequest, deps: AgentRunPr
   const reuseGrant = (existing: { row: GrantRow; bindings: StoredBinding[] }): AgentRunPreparation => {
     const { row } = existing;
     if (row.snapshot_id !== snapshot.snapshotId) return { status: "recovery-required", code: "grant_mismatch" };
+    // The stored request identity is immutable: a retry for another backend, project or audience never inherits it.
+    if (row.backend !== GRANT_BACKENDS[request.backend] || row.project_key !== request.projectKey || row.audience !== MODEL_AUTH_AUDIENCE) {
+      return { status: "recovery-required", code: "grant_mismatch" };
+    }
     if (row.revoked_at !== null) return { status: "recovery-required", code: "grant_revoked" };
     if (row.expires_at <= now()) return { status: "recovery-required", code: "grant_expired" };
     if (!sameBindings(existing.bindings, bindings)) return { status: "recovery-required", code: "grant_mismatch" };
@@ -731,6 +736,25 @@ function revokeGrants(dispatchId: string, at: number): void {
 }
 
 /**
+ * Cleanup may claim completion only for the dispatch's full persisted owner set: the
+ * grant's subscription bindings, with exact generations. No grant means no established
+ * identity, so nothing is released. An API-only grant has no owners and expects `[]`.
+ */
+function ownersMatchGrant(dispatchId: string, owners: readonly ReservedProfile[]): boolean {
+  const grant = readGrant(dispatchId);
+  if (!grant) return false;
+  const persisted = new Map<string, number>();
+  for (const b of grant.bindings) {
+    if (b.ownerGeneration === undefined) continue;
+    if (persisted.get(b.profileId) !== undefined && persisted.get(b.profileId) !== b.ownerGeneration) return false;
+    persisted.set(b.profileId, b.ownerGeneration);
+  }
+  const supplied = new Set(owners.map((o) => o.profileId));
+  if (supplied.size !== owners.length || owners.length !== persisted.size) return false;
+  return owners.every((o) => persisted.get(o.profileId) === o.generation);
+}
+
+/**
  * Release after a launch rejection known with certainty (nothing started). Only the exact
  * owner generation releases; a stale generation is rejected by the ownership layer.
  */
@@ -739,6 +763,7 @@ export function releaseRejectedLaunch(
   owners: readonly ReservedProfile[],
   deps: Pick<AgentRunPreparationDeps, "ownership" | "now">,
 ): CleanupOutcome {
+  if (!ownersMatchGrant(dispatchId, owners)) return { complete: false, results: [] };
   const results = owners.map((o) => ({
     profileId: o.profileId,
     result: deps.ownership.releaseLaunchRejected({ dispatchId, profileId: o.profileId, generation: o.generation } satisfies OwnerRef) as
@@ -759,6 +784,7 @@ export async function releaseTerminated(
   owners: readonly ReservedProfile[],
   deps: Pick<AgentRunPreparationDeps, "ownership" | "now">,
 ): Promise<CleanupOutcome> {
+  if (!ownersMatchGrant(dispatchId, owners)) return { complete: false, results: [] };
   const results: { profileId: string; result: ReleaseResult }[] = [];
   for (const o of owners) {
     const result = await deps.ownership.releaseAfterTermination({ dispatchId, profileId: o.profileId, generation: o.generation });
