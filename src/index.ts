@@ -2288,6 +2288,7 @@ async function postDispatch(
         mapping.defaultBranch,
         dispatchTime,
         getClaimedRunIds(),
+        issue.identifier,
       );
       if (runId) {
         if (attachJobRunIdIfMissing(jobId, runId)) {
