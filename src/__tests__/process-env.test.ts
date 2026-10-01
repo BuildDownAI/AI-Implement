@@ -3,7 +3,7 @@ import { spawnSync } from "node:child_process";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { repoProcessEnv, modelProcessEnv, gitProcessEnv, gitDependencyProcessEnv } from "../pipeline/process-env.js";
+import { repoProcessEnv, modelProcessEnv, gitProcessEnv, gitDependencyProcessEnv, MODEL_SESSION_KEYS } from "../pipeline/process-env.js";
 
 const SAVED: Record<string, string | undefined> = {};
 
@@ -172,6 +172,15 @@ describe("gitProcessEnv", () => {
   it("strips every runner, model, install, GitHub and forwarded credential", () => {
     const env = gitProcessEnv();
     for (const key of SENTINEL_KEYS) expect(env[key], key).toBeUndefined();
+  });
+
+  it("strips ambient model session and cloud credentials", () => {
+    const keys = [...MODEL_SESSION_KEYS, "AI_IMPLEMENT_MODEL_AUTH_GRANT", "AI_IMPLEMENT_MODEL_AUTH_BEARER"];
+    for (const key of keys) saveAndSet(key, `sentinel-${key}`);
+    for (const env of [gitProcessEnv(), gitDependencyProcessEnv()]) {
+      for (const key of keys) expect(env[key], key).toBeUndefined();
+    }
+    for (const key of keys) expect(process.env[key]).toBe(`sentinel-${key}`);
   });
 
   it("keeps PATH, HOME, TLS, proxy and git config discovery variables", () => {

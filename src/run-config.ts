@@ -304,14 +304,12 @@ function boundedDescription(config: RunConfigV1): RunConfigV1["issue"] {
 
 /**
  * Generic encoder (logging, persistence, diagnostics-adjacent paths). Never emits credentials:
- * the namespace is dropped, not rejected, so a config object that happens to carry one cannot
- * leak it through this function. Use `encodeTrustedRunConfig` for private transport.
+ * the payload is built from the known-key allowlist, so the namespace and any unknown field
+ * (including an encoded private envelope on a spread config) are dropped, not rejected. Use `encodeTrustedRunConfig` for private transport.
  */
 export function encodeRunConfig(config: RunConfigV1): string {
   if (config.agentConfig !== undefined) validateResolvedAgentSnapshot(config.agentConfig);
-  const { credentials: _credentials, ...rest } = config;
-  void _credentials;
-  const payload = { ...rest, issue: boundedDescription(config) };
+  const payload = { ...pickKnownKeys(config), issue: boundedDescription(config) };
   return Buffer.from(JSON.stringify(payload), "utf-8").toString("base64");
 }
 

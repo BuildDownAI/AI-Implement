@@ -735,6 +735,20 @@ describe("private credentials namespace (AII-981)", () => {
     expect(text).not.toContain(private_);
     expect(text).not.toContain("encodedPrivate");
     expect(JSON.parse(text).credentialFields).toEqual(["resultToken", "modelAuthGrant"]);
-    expect(Buffer.from(encodeRunConfig(spread), "base64").toString()).not.toContain("SENTINEL");
+    const generic = encodeRunConfig(spread);
+    const genericText = Buffer.from(generic, "base64").toString();
+    expect(genericText).not.toContain("SENTINEL");
+    expect(genericText).not.toContain(private_);
+    expect(genericText).not.toContain("encodedPrivate");
+    expect(genericText).not.toContain("AI_IMPLEMENT_RUN_CONFIG");
+    expect(generic).not.toContain(private_);
+    expect(Object.keys(JSON.parse(genericText)).sort()).toEqual(Object.keys(base).sort());
+  });
+
+  it("generic encode keeps description truncation and agentConfig while dropping unknown keys", () => {
+    const long = { ...base, issue: { ...base.issue, description: "x".repeat(200_000) }, extra: "nope" } as RunConfigV1;
+    const decoded = JSON.parse(Buffer.from(encodeRunConfig(long), "base64").toString());
+    expect(decoded.issue.description.length).toBeLessThan(200_000);
+    expect(decoded).not.toHaveProperty("extra");
   });
 });

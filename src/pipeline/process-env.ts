@@ -146,6 +146,7 @@ export function modelProcessEnv(allowRepositoryWrites: boolean): NodeJS.ProcessE
 export function gitProcessEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   const env = { ...process.env };
   for (const key of MODEL_CREDENTIAL_KEYS) delete env[key];
+  for (const key of MODEL_SESSION_KEYS) delete env[key];
   for (const key of RUNNER_CREDENTIAL_KEYS) delete env[key];
   for (const key of INSTALL_CREDENTIAL_KEYS) delete env[key];
   for (const key of GITHUB_WRITE_CREDENTIAL_KEYS) delete env[key];
