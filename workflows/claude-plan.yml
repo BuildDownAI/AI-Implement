@@ -1,4 +1,5 @@
 # Synced to target repos by sync-workflow.yml.
+# ai-implement-capability: private-run-config-v1
 # All pipeline logic lives in the runner image (ghcr.io/builddownai/ai-implement-runner).
 # Do not edit in target repos.
 #
@@ -190,6 +191,42 @@ jobs:
             | "::add-mask::" + .
           ' "$GITHUB_EVENT_PATH"
 
+          # Private envelope (AII-982): mask the whole encoded run_config, then every
+          # extracted credential, before any step prints metadata or output. Failures
+          # print fixed text only; jq stderr is discarded because it can echo input.
+          jq -r '
+            (.inputs // {}).run_config // ""
+            | if type == "string" then . else error("x") end
+            | select(. != "")
+            | gsub("%"; "%25") | gsub("\r"; "%0D") | gsub("\n"; "%0A")
+            | "::add-mask::" + .
+          ' "$GITHUB_EVENT_PATH" 2>/dev/null || {
+            echo "::error::Private run_config bootstrap failed" >&2
+            exit 1
+          }
+          jq -r '
+            def mask: gsub("%"; "%25") | gsub("\r"; "%0D") | gsub("\n"; "%0A") | "::add-mask::" + .;
+            (.inputs // {}).run_config // ""
+            | if type == "string" then . else error("x") end
+            | select(. != "")
+            | (try (@base64d | fromjson) catch error("x"))
+            | if type == "object" then . else error("x") end
+            | (.credentials // empty)
+            | if type == "object" then . else error("x") end
+            | if (keys - ["version", "resultToken", "progressToken", "publicationToken", "attemptToken", "modelAuthGrant"] | length) == 0
+                 and .version == 1
+                 and all(.resultToken, .progressToken, .publicationToken, .attemptToken;
+                         . == null or (type == "string" and length > 0 and length <= 4096 and (test("\\s") | not)))
+                 and (.modelAuthGrant == null or (.modelAuthGrant | type == "object"))
+              then . else error("x") end
+            | [ (.resultToken, .progressToken, .publicationToken, .attemptToken | select(. != null)),
+                (.modelAuthGrant // empty | .. | strings | select(length >= 8)) ]
+            | unique | .[] | mask
+          ' "$GITHUB_EVENT_PATH" 2>/dev/null || {
+            echo "::error::Private run_config bootstrap failed" >&2
+            exit 1
+          }
+
       - name: Print dispatch inputs
         env:
           RUN_CONFIG: ${{ inputs.run_config }}
@@ -206,14 +243,24 @@ jobs:
           echo "[dispatch-inputs] runner_image: $RUNNER_IMAGE"
           echo "[dispatch-inputs] run_token: $( [ "$HAS_RUN_TOKEN" = "true" ] && echo "<redacted>" || echo "(empty)" )"
           echo "[dispatch-inputs] run_progress_token: $( [ "$HAS_RUN_PROGRESS_TOKEN" = "true" ] && echo "<redacted>" || echo "(empty)" )"
-          # The run_config envelope is documented secret-free: run_token and
-          # run_progress_token deliberately stay top-level inputs so this workflow
-          # can ::add-mask:: them before the runner starts (src/run-config.ts and
-          # docs/workflow-envelope.md), so decoding it here cannot leak a credential.
+          # Diagnostic projection only (AII-982): known envelope keys, credentials
+          # replaced by field names. The raw and decoded envelope are never printed.
           # jq quotes and indents every value, so no decoded line can begin with
           # "::" and forge a workflow command.
           echo "[dispatch-inputs] run_config:"
-          printf '%s' "$RUN_CONFIG" | base64 -d | jq . \
+          printf '%s' "$RUN_CONFIG" | base64 -d 2>/dev/null | jq '
+            (.credentials // null) as $c
+            | with_entries(select(.key | IN("v", "issue", "prNumber", "baseBranch", "runnerPhase",
+                "branchPrefix", "skillsRepo", "runnerCallbackUrl", "maxTurns", "maxIterations",
+                "commentInstruction", "sensitiveFiles", "profiles", "assigneeName", "planningContext",
+                "groupingParent", "dependencyTokenScope", "kgSourceRepo", "kgDryRun", "kgSourceRef",
+                "kgAcceptNewBaseline", "kgBaselineActor", "referenceRepos", "reviewers",
+                "retryPolicy", "reviewFix", "agentConfig")))
+            | if ($c | type) == "object"
+              then . + {credentialFields: [$c | keys_unsorted[]
+                  | select(. as $k | ["resultToken", "progressToken", "publicationToken", "attemptToken", "modelAuthGrant"] | index($k))]}
+              else . end
+          ' 2>/dev/null \
             || echo "[dispatch-inputs] run_config could not be decoded"
 
       - name: Generate GitHub App token

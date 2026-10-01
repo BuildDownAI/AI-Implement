@@ -81,6 +81,63 @@ for (const file of files) {
       }
     });
 
+    const enc = (cfg: unknown) => Buffer.from(JSON.stringify(cfg)).toString("base64");
+    const base = { v: 1, issue: { id: "i", identifier: "AII-982", title: "t", description: "d" } };
+    const sentinels = {
+      resultToken: "AII982-result-sentinel",
+      progressToken: "AII982-progress-sentinel",
+      publicationToken: "AII982-publication-sentinel",
+      attemptToken: "AII982-attempt-sentinel",
+    };
+
+    it("masks the encoded envelope first, then every extracted credential, including nested grant leaves", () => {
+      const run_config = enc({ ...base, credentials: { version: 1, ...sentinels,
+        modelAuthGrant: { nested: { bearer: "AII982-grant-leaf-sentinel" }, short: "x" } } });
+      const result = execute(JSON.stringify({ inputs: { run_config } }));
+      expect(result.status).toBe(0);
+      const lines = result.stdout.trim().split("\n");
+      expect(lines.every((l) => l.startsWith("::add-mask::"))).toBe(true);
+      expect(lines[0]).toBe(`::add-mask::${run_config}`);
+      for (const v of [...Object.values(sentinels), "AII982-grant-leaf-sentinel"]) {
+        expect(lines).toContain(`::add-mask::${v}`);
+      }
+      expect(result.stdout).not.toContain("::add-mask::x\n");
+      expect(result.stderr).toBe("");
+    });
+
+    it("accepts a legacy envelope without credentials", () => {
+      const run_config = enc(base);
+      const result = execute(JSON.stringify({ inputs: { run_config, run_token: "AII982-legacy" } }));
+      expect(result.status).toBe(0);
+      expect(result.stdout.trim().split("\n")).toEqual([`::add-mask::AII982-legacy`, `::add-mask::${run_config}`]);
+    });
+
+    it("fails closed on malformed private data without echoing it", () => {
+      const bad: unknown[] = [
+        "!!not-base64!!",
+        Buffer.from("not json AII982-leak").toString("base64"),
+        enc({ ...base, credentials: { version: 1, resultToken: 42 } }),
+        enc({ ...base, credentials: { version: 1, AII982leakkey: "AII982-leak-value" } }),
+        enc({ ...base, credentials: { version: 2, resultToken: "AII982-leak-value" } }),
+        enc({ ...base, credentials: { version: 1, resultToken: "has space AII982-leak" } }),
+        enc({ ...base, credentials: "AII982-leak-value" }),
+        { not: "a string" },
+      ];
+      for (const run_config of bad) {
+        const result = execute(JSON.stringify({ inputs: { run_config } }));
+        expect(result.status).not.toBe(0);
+        const out = result.stdout.replace(/^::add-mask::.*$/gm, "");
+        expect(out + result.stderr).not.toMatch(/AII982/);
+        expect(result.stderr).not.toContain(String(run_config));
+        expect(result.stderr).toContain("Private run_config bootstrap failed");
+      }
+    });
+
+    it("never traces or dumps the envelope", () => {
+      expect(mask.run).not.toMatch(/set -[a-z]*x/);
+      expect(mask.run).toContain("set +x");
+    });
+
     it("rejects non-string token values without logging their contents", () => {
       const result = execute(JSON.stringify({ inputs: { run_token: { value: "private-sentinel" } } }));
       expect(result.status).not.toBe(0);
@@ -131,6 +188,37 @@ for (const file of files.slice(0, 2)) {
         expect(result.stdout).not.toContain("private-sentinel");
         expect(result.stderr).not.toContain("private-sentinel");
       }
+    });
+  });
+}
+
+for (const file of files) {
+  describe(`${file} print step diagnostic projection`, () => {
+    const workflow = parse(readFileSync(file, "utf8"));
+    const job = workflow.jobs.implement ?? workflow.jobs.plan;
+    const print = job.steps.find((step: { name: string }) => step.name === "Print dispatch inputs");
+
+    it("prints only the credential-free projection with credential field names", () => {
+      const run_config = Buffer.from(JSON.stringify({
+        v: 1, issue: { id: "i", identifier: "AII-982", title: "t", description: "d" },
+        unknownKey: "AII982-unknown-sentinel",
+        credentials: { version: 1, resultToken: "AII982-result-sentinel", modelAuthGrant: { bearer: "AII982-grant-sentinel" } },
+      })).toString("base64");
+      const result = spawnSync("sh", ["-e", "-c", print.run], {
+        env: { PATH: process.env.PATH, RUN_CONFIG: run_config, HAS_RUN_TOKEN: "true", HAS_RUN_PROGRESS_TOKEN: "false", HAS_PUBLICATION_TOKEN: "false" },
+        encoding: "utf8",
+      });
+      expect(result.status).toBe(0);
+      expect(result.stdout).not.toMatch(/AII982/);
+      expect(result.stdout).not.toContain(run_config);
+      expect(result.stdout).toContain('"credentialFields"');
+      expect(result.stdout).toContain('"resultToken"');
+      expect(result.stdout).toContain('"modelAuthGrant"');
+    });
+
+    it("contains no raw or decoded envelope dump", () => {
+      expect(print.run).not.toMatch(/jq \.(\s|$)/);
+      expect(print.run).not.toMatch(/echo[^\n]*\$RUN_CONFIG/);
     });
   });
 }

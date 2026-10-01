@@ -11,12 +11,20 @@ const RUN_PUBLICATION_TOKEN_RE = /^\s{2,}run_publication_token:\s*$/m;
  */
 const RUN_ATTEMPT_TOKEN_RE = /^\s{2,}run_attempt_token:\s*$/m;
 
+/**
+ * Static private-envelope marker (AII-982): a YAML comment, not a workflow_dispatch input.
+ * Distinct from the stage-agent-config-v1 capability, which this must never imply.
+ */
+const PRIVATE_RUN_CONFIG_RE = /^#\s*ai-implement-capability:\s*private-run-config-v1\s*$/m;
+
 export type WorkflowContract = "envelope" | "legacy";
 export interface WorkflowCapabilities {
   contract: WorkflowContract;
   supportsRunPublicationToken: boolean;
   /** True when the workflow declares `run_attempt_token`, gating attempt-correlation / versioned-callback support. */
   supportsAttemptCorrelation: boolean;
+  /** True when an envelope workflow carries the private-envelope marker. Absent (older fixtures) = false. */
+  supportsPrivateRunConfig?: boolean;
 }
 
 type CacheEntry = { expiresAt: number; capabilities: WorkflowCapabilities };
@@ -78,6 +86,7 @@ async function probeCapabilities(
     contract: "legacy",
     supportsRunPublicationToken: false,
     supportsAttemptCorrelation: false,
+    supportsPrivateRunConfig: false,
   });
   let res: Response;
   try {
@@ -121,5 +130,6 @@ async function probeCapabilities(
     contract,
     supportsRunPublicationToken: contract === "envelope" && RUN_PUBLICATION_TOKEN_RE.test(yamlText),
     supportsAttemptCorrelation: contract === "envelope" && RUN_ATTEMPT_TOKEN_RE.test(yamlText),
+    supportsPrivateRunConfig: contract === "envelope" && PRIVATE_RUN_CONFIG_RE.test(yamlText),
   };
 }

@@ -10,7 +10,7 @@ import {
   buildKgRefreshGhaDispatchBody,
   ENVELOPE_OPTIONAL_INPUTS,
 } from "../github.js";
-import { decodeRunConfig } from "../run-config.js";
+import { decodeRunConfig, decodeTrustedRunConfig, type RunCredentialsV1 } from "../run-config.js";
 import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
 import { surfaceDispatchFailure } from "../dispatch-failure.js";
 import { notify } from "../notify.js";
@@ -1176,5 +1176,53 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
     expect(secondBody.inputs.job_timeout_minutes).toBe("240");
     expect(secondBody.inputs.issue_identifier).toBe("AII-656");
     expect(result).toEqual({ success: true, status: 204 });
+  });
+});
+
+describe("buildEnvelopeDispatchInputs — private credentials (AII-982)", () => {
+  const credentials: RunCredentialsV1 = {
+    version: 1,
+    resultToken: "sentinel-result-token",
+    progressToken: "sentinel-progress-token",
+    publicationToken: "sentinel-publication-token",
+  };
+  const impl = { runnerPhase: "implementation" as const, runToken: "rt", runProgressToken: "rp", runPublicationToken: "rpub", retryPolicy: null };
+
+  it("without credentials output is unchanged and carries no credentials namespace", () => {
+    const inputs = buildEnvelopeDispatchInputs(makeMapping(), baseIssue, impl);
+    expect(Buffer.from(inputs.run_config!, "base64").toString()).not.toContain("credentials");
+  });
+
+  it("with credentials the trusted decoder recovers them while legacy token inputs stay", () => {
+    const inputs = buildEnvelopeDispatchInputs(makeMapping(), baseIssue, { ...impl, credentials });
+    expect(decodeTrustedRunConfig(inputs.run_config!).credentials).toEqual(credentials);
+    expect(decodeRunConfig(inputs.run_config!).credentials).toBeUndefined();
+    expect(inputs).toMatchObject({ run_token: "rt", run_progress_token: "rp", run_publication_token: "rpub" });
+    expect(decodeTrustedRunConfig(inputs.run_config!).agentConfig).toBeUndefined();
+  });
+
+  it("still omits run_publication_token for planning", () => {
+    const inputs = buildEnvelopeDispatchInputs(makeMapping(), baseIssue, {
+      runnerPhase: "planning", runToken: "rt", runPublicationToken: "rpub", credentials: { version: 1, resultToken: "sentinel-result-token" }, retryPolicy: null,
+    });
+    expect("run_publication_token" in inputs).toBe(false);
+  });
+
+  it("retry keeps run_config and tokens untouched and sends at most two requests", async () => {
+    const inputs = buildEnvelopeDispatchInputs(makeMapping(), baseIssue, { ...impl, credentials });
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response('Unexpected inputs provided: ["issue_identifier"]', { status: 422 }))
+      .mockResolvedValueOnce(new Response('Unexpected inputs provided: ["runner_phase"]', { status: 422 }));
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      await postWorkflowDispatch({ token: "t", owner: "o", repo: "r", workflowFile: "w.yml", ref: "main", inputs });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const second = JSON.parse(String((fetchMock.mock.calls[1][1] as RequestInit).body)).inputs;
+    expect(second.run_config).toBe(inputs.run_config);
+    expect(second).toMatchObject({ run_token: "rt", run_progress_token: "rp", run_publication_token: "rpub" });
+    expect("issue_identifier" in second).toBe(false);
   });
 });
