@@ -17,7 +17,7 @@ Columns: **KG** is kg-refresh (`src/restate/kg-refresh-workflow.ts`, `src/restat
 | Delayed sends (`delay`) | yes (`expire` self-send) | yes (`genericSend`) | no |
 | Object state (`ctx.set` / `ctx.get`) | yes | yes | yes |
 | Deterministic time (`ctx.date.now`) | yes | yes | yes |
-| `orTimeout` | yes | no (`RestatePromise.race` with a sleep arm) | no |
+| `orTimeout` | no (`RestatePromise.race` with a tick arm) | yes | no |
 
 ## 2. Feature matrix: contracts and clients
 
