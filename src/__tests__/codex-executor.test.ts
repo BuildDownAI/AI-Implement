@@ -5,10 +5,11 @@ import { execFileSync, type spawn, type ChildProcessWithoutNullStreams } from "n
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { CodexExecutor, CodexRecoveryRequiredError, matchesSchema, type CodexExecutorOptions } from "../pipeline/codex-executor.js";
+import { CodexExecutor, CodexRecoveryRequiredError, CodexStageTransportError, matchesSchema, type CodexExecutorOptions } from "../pipeline/codex-executor.js";
 import { ModelAuthClientError, type ModelAuthClient, type ModelInvocation } from "../model-auth-client.js";
 import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
 import { READ_ONLY_TOOL_PARAMS } from "../pipeline/steps/read-only-tools.js";
+import type { InvokeParams } from "../pipeline/types.js";
 import type { CodexProtocolDriver, CodexTransportResult, CodexTransportRunInput } from "../pipeline/codex-planning-adapter.js";
 
 const SYNTHETIC_KEY = "synthetic-codex-api-key-0000";
@@ -274,6 +275,36 @@ describe("pinned configuration and sandbox", () => {
     const rw = make([{ stdout: message("ok") }]);
     await rw.executor.invoke(base);
     expect(rw.log[0].args[rw.log[0].args.indexOf("--sandbox") + 1]).toBe("workspace-write");
+  });
+
+  it("derives the exec sandbox from the fixed agentStage, not from builtinTools or caller args", async () => {
+    const argsFor = async (extra: Partial<InvokeParams>): Promise<string[]> => {
+      const { executor, log } = make([{ stdout: message("ok") }]);
+      await executor.invoke({ ...base, ...extra });
+      return log[0].args;
+    };
+    const impl = await argsFor({ agentStage: "implementation", ...READ_ONLY_TOOL_PARAMS });
+    expect(impl[impl.indexOf("--sandbox") + 1]).toBe("workspace-write");
+    const review = await argsFor({ agentStage: "review" });
+    expect(review[review.indexOf("--sandbox") + 1]).toBe("read-only");
+  });
+
+  it("refuses planning on the exec transport, and a write-capable stage on the native transport, before auth or spawn", async () => {
+    const exec = make([{ stdout: message("ok") }]);
+    const planErr = await exec.executor.invoke({ ...base, agentStage: "planning" }).catch((e) => e);
+    expect(planErr).toBeInstanceOf(CodexStageTransportError);
+    expect(planErr.code).toBe("CODEX_STAGE_TRANSPORT_MISMATCH");
+    expect(exec.log).toHaveLength(0);
+    expect(exec.auth.events).toEqual([]);
+
+    const run = vi.fn();
+    const native = make([{ stdout: message("ok") }], { protocolDriver: { run } });
+    for (const agentStage of ["implementation", "review"] as const) {
+      await expect(native.executor.invoke({ ...base, agentStage })).rejects.toBeInstanceOf(CodexStageTransportError);
+    }
+    expect(run).not.toHaveBeenCalled();
+    expect(native.log).toHaveLength(0);
+    expect(native.auth.events).toEqual([]);
   });
 
   it("maps a rejected pinned option to a config failure without a second spawn", async () => {

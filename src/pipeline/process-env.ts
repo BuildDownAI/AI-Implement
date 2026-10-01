@@ -147,6 +147,8 @@ export function isConfiguredModelRun(env: NodeJS.ProcessEnv): boolean {
  * secrets named in AI_IMPLEMENT_FORWARDED_SECRETS are also stripped — they are
  * available to hooks but must never reach the model process — as is the
  * install step's NPM_TOKEN regardless of how it was injected.
+ *
+ * With `selectedAuth`, the process environment is not consulted; see selectedModelEnv.
  */
 export function modelProcessEnv(
   allowRepositoryWrites: boolean,

@@ -74,6 +74,19 @@ function authIdentity(auth: Record<string, unknown>): string | null {
   return parts.every((p) => p === null) ? null : JSON.stringify(parts);
 }
 
+/**
+ * Planning runs only on the restricted native transport and implementation/review only on `codex exec`.
+ * A mismatch is refused before any auth checkout or spawn so planning can never run with implementation
+ * write authority and a write-capable stage can never run on the read-only app-server transport.
+ */
+export class CodexStageTransportError extends Error {
+  readonly code = "CODEX_STAGE_TRANSPORT_MISMATCH";
+  constructor() {
+    super("Codex agent stage does not match this executor's transport");
+    this.name = "CodexStageTransportError";
+  }
+}
+
 export interface CodexExecutorOptions {
   /** Auth client whose `invoke` supplies the isolated, selected environment and checkpoints afterward. */
   auth: Pick<ModelAuthClient, "invoke">;
@@ -257,6 +270,10 @@ export class CodexExecutor implements LLMExecutor {
 
   async invoke(params: InvokeParams): Promise<LLMResult> {
     if (this.held) throw new CodexRecoveryRequiredError("held");
+    const planning = params.agentStage === "planning";
+    if (planning !== (this.options.protocolDriver !== undefined) && (planning || params.agentStage !== undefined)) {
+      throw new CodexStageTransportError();
+    }
     const startedAt = Date.now();
     const expectsStructuredOutput = params.expectsStructuredOutput ?? false;
     const stage = params.stage ?? "unknown";
@@ -402,6 +419,22 @@ export class CodexExecutor implements LLMExecutor {
     }
   }
 
+  /**
+   * Sandbox argv from the fixed `agentStage` only, never repository config or caller flags:
+   * implementation -> workspace-write, review -> read-only. An absent stage keeps the legacy
+   * `builtinTools` mapping. Planning never reaches here (it runs on the native transport).
+   */
+  private sandboxArgs(params: InvokeParams): string[] {
+    switch (params.agentStage) {
+      case "review":
+        return ["--sandbox", "read-only"];
+      case "implementation":
+        return ["--sandbox", "workspace-write"];
+      default:
+        return ["--sandbox", params.builtinTools ? "read-only" : "workspace-write"];
+    }
+  }
+
   private buildArgs(params: InvokeParams, schemaPath: string | null): string[] {
     // Pinned selection is placed on argv, after the ignore flags, so user or project config
     // cannot change it. No Claude-only flag and no bypass or approve-all flag is ever passed.
@@ -414,8 +447,7 @@ export class CodexExecutor implements LLMExecutor {
       params.model,
       "-c",
       `model_provider="${CODEX_PROVIDER}"`,
-      "--sandbox",
-      params.builtinTools ? "read-only" : "workspace-write",
+      ...this.sandboxArgs(params),
     ];
     if (schemaPath) args.push("--output-schema", schemaPath);
     // `-` reads the prompt from stdin: no argv size ceiling and nothing sensitive on the command line.

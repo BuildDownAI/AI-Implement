@@ -237,6 +237,67 @@ describe.skipIf(isWindows)("ClaudeCliExecutor", () => {
     expect(result.tokensUsed).toBe(120);
   });
 
+  describe("legacy and selected environments (synthetic fixtures, no host auth)", () => {
+    const captureEnvs = () => {
+      const envs: Array<Record<string, string | undefined>> = [];
+      const fakeSpawn = (_c: string, _a: string[], o: { env: Record<string, string | undefined> }) => {
+        envs.push(o.env);
+        return makeTestProcess(SUCCESS_LINES.join("\n") + "\n", 0);
+      };
+      return { envs, fakeSpawn: fakeSpawn as unknown as typeof spawn };
+    };
+    const isolate = () => {
+      vi.spyOn(console, "log").mockImplementation(() => {});
+      for (const k of ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "AI_IMPLEMENT_FORWARDED_SECRETS", "AI_IMPLEMENT_RUN_CONFIG", "RUN_TOKEN", "GITHUB_TOKEN", "NPM_TOKEN"]) {
+        vi.stubEnv(k, undefined);
+      }
+    };
+
+    it("legacy invoke strips runner secrets and keeps the ambient API key when no OAuth token is present", async () => {
+      isolate();
+      vi.stubEnv("ANTHROPIC_API_KEY", "ambient-synthetic-key-0000");
+      vi.stubEnv("RUN_TOKEN", "runner-token-0000");
+      const before = { ...process.env };
+      const { envs, fakeSpawn } = captureEnvs();
+      await new ClaudeCliExecutor("/tmp", "summary", true, fakeSpawn).invoke({ prompt: "p", model: "m" });
+      expect(envs[0].ANTHROPIC_API_KEY).toBe("ambient-synthetic-key-0000");
+      expect(envs[0].RUN_TOKEN).toBeUndefined();
+      expect(process.env).toEqual(before);
+    });
+
+    it("legacy invoke keeps OAuth-wins: the OAuth token is kept and the API key removed", async () => {
+      isolate();
+      vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-synthetic-token-0000");
+      vi.stubEnv("ANTHROPIC_API_KEY", "ambient-synthetic-key-0000");
+      vi.stubEnv("AI_IMPLEMENT_FORWARDED_SECRETS", "HOOK_ONLY");
+      vi.stubEnv("HOOK_ONLY", "forwarded-synthetic-0000");
+      const { envs, fakeSpawn } = captureEnvs();
+      await new ClaudeCliExecutor("/tmp", "summary", true, fakeSpawn).invoke({ prompt: "p", model: "m" });
+      expect(envs[0].CLAUDE_CODE_OAUTH_TOKEN).toBe("oauth-synthetic-token-0000");
+      expect(envs[0].ANTHROPIC_API_KEY).toBeUndefined();
+      expect(envs[0].HOOK_ONLY).toBeUndefined();
+      expect(envs[0].AI_IMPLEMENT_FORWARDED_SECRETS).toBeUndefined();
+    });
+
+    it("a selected env replaces process.env for that call only and is never merged with ambient credentials", async () => {
+      isolate();
+      vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-synthetic-token-0000");
+      vi.stubEnv("ANTHROPIC_API_KEY", "ambient-synthetic-key-0000");
+      vi.stubEnv("GITHUB_TOKEN", "ambient-gh-0000");
+      const before = { ...process.env };
+      const { envs, fakeSpawn } = captureEnvs();
+      const exec = new ClaudeCliExecutor("/tmp", "summary", true, fakeSpawn);
+      await exec.invoke(
+        { prompt: "p", model: "m" },
+        { env: { PATH: "/bin", ANTHROPIC_API_KEY: "selected-synthetic-key", RUN_TOKEN: "still-stripped-0000" } },
+      );
+      await exec.invoke({ prompt: "p", model: "m" });
+      expect(envs[0]).toEqual({ PATH: "/bin", ANTHROPIC_API_KEY: "selected-synthetic-key" });
+      expect(envs[1].CLAUDE_CODE_OAUTH_TOKEN).toBe("oauth-synthetic-token-0000");
+      expect(process.env).toEqual(before);
+    });
+  });
+
   it("does NOT print per-event lines at summary level, but prints the summary", async () => {
     const fakeProc = makeTestProcess(SUCCESS_LINES.join("\n") + "\n", 0);
     const fakeSpawn = () => fakeProc;
@@ -1491,6 +1552,7 @@ describe.skipIf(isWindows)("ClaudeCliExecutor request-level retry (BAC-27114)", 
       // The stdio handles must be destroyed (not merely unlistened-to) so a container
       // whose only remaining work was this invocation can still exit.
       expect(destroyCalls.sort()).toEqual(["stderr", "stdin", "stdout"]);
+      expect((err as { possiblyLive?: boolean }).possiblyLive).toBe(true);
     } finally {
       vi.useRealTimers();
     }
@@ -2681,5 +2743,86 @@ describe("suspendOriginWriteCredential (shared publication-credential guard)", (
     const lock = join(repo, ".git", "config.lock");
     writeFileSync(lock, "");
     expect(() => suspendOriginWriteCredential(repo)).toThrow(/Failed to remove the repository write credential/);
+  });
+});
+
+describe.skipIf(isWindows)("ClaudeCliExecutor invocation deadline (real processes)", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "claude-deadline-"));
+    vi.spyOn(console, "log").mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.restoreAllMocks();
+    // Best-effort cleanup of any group left by a test that deliberately outlives its deadline.
+    try {
+      const [leader] = readFileSync(join(dir, "pids"), "utf8").trim().split(" ").map(Number);
+      process.kill(-leader, "SIGKILL");
+    } catch {
+      // already gone
+    }
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const stateOf = (pid: number): string => {
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      return stat.slice(stat.lastIndexOf(")") + 2, stat.lastIndexOf(")") + 3);
+    } catch {
+      return "gone";
+    }
+  };
+
+  function scriptSpawn(body: string): { spawnImpl: typeof spawn; calls: () => number } {
+    const script = join(dir, "fake-claude");
+    writeFileSync(script, `#!/bin/sh\n${body}\n`, { mode: 0o755 });
+    let calls = 0;
+    const spawnImpl = ((_c: string, args: string[], o: object) => {
+      calls++;
+      return spawn(script, args, o as never);
+    }) as unknown as typeof spawn;
+    return { spawnImpl, calls: () => calls };
+  }
+  const pids = () => readFileSync(join(dir, "pids"), "utf8").trim().split(" ").map(Number);
+
+  it("TERMs the whole group at the deadline and settles as INVOCATION_TIMEOUT only after the stop is confirmed", async () => {
+    const { spawnImpl, calls } = scriptSpawn(`sleep 30 &\necho "$$ $!" > "${join(dir, "pids")}"\nwait`);
+    const exec = new ClaudeCliExecutor(dir, "summary", true, spawnImpl, undefined, undefined, { termMs: 1000, killMs: 1000 });
+    const started = Date.now();
+    const res = await exec.invoke({ prompt: "p", model: "m", invocationTimeoutMs: 300, retry: { policy: DEFAULT_RETRY_POLICY, toolUseIsSafe: false } });
+    expect(Date.now() - started).toBeLessThan(4000);
+    expect(res.failure?.code).toBe("INVOCATION_TIMEOUT");
+    expect(calls()).toBe(1);
+    for (const pid of pids()) expect(["gone", "Z"]).toContain(stateOf(pid));
+  });
+
+  it("escalates to SIGKILL for a group that ignores SIGTERM, still confirming the stop before settling", async () => {
+    const { spawnImpl } = scriptSpawn(`trap '' TERM\n(trap '' TERM; sleep 30) &\necho "$$ $!" > "${join(dir, "pids")}"\nwhile :; do sleep 1; done`);
+    const exec = new ClaudeCliExecutor(dir, "summary", true, spawnImpl, undefined, undefined, { termMs: 300, killMs: 2000 });
+    const res = await exec.invoke({ prompt: "p", model: "m", invocationTimeoutMs: 300 });
+    expect(res.failure?.code).toBe("INVOCATION_TIMEOUT");
+    for (const pid of pids()) expect(["gone", "Z"]).toContain(stateOf(pid));
+  });
+
+  it("holds as PROCESS_UNRESPONSIVE (possiblyLive) when no stop can be confirmed after TERM and KILL", async () => {
+    // A fake child that never closes: nothing proves the group stopped, so the invocation must not settle as stopped.
+    const spawnImpl = (() => {
+      const proc = makeDestroyableEmitter() as unknown as ChildProcessWithoutNullStreams;
+      Object.assign(proc, { stdin: Object.assign(makeDestroyableEmitter(), { end: () => {} }), stdout: makeDestroyableEmitter(), stderr: makeDestroyableEmitter(), kill: () => true, unref: () => {} });
+      return proc;
+    }) as unknown as typeof spawn;
+    const exec = new ClaudeCliExecutor(dir, "summary", true, spawnImpl, undefined, undefined, { termMs: 20, killMs: 20 });
+    const err = await exec.invoke({ prompt: "p", model: "m", invocationTimeoutMs: 20 }).catch((e: unknown) => e);
+    expect((err as { failure?: { code?: string } }).failure?.code).toBe("PROCESS_UNRESPONSIVE");
+    expect((err as { possiblyLive?: boolean }).possiblyLive).toBe(true);
+  });
+
+  it("does not enforce a deadline when none is configured (legacy behaviour is unchanged)", async () => {
+    const { spawnImpl } = scriptSpawn(`echo '{"type":"result","subtype":"success","is_error":false,"result":"done","usage":{"input_tokens":1,"output_tokens":1}}'`);
+    const exec = new ClaudeCliExecutor(dir, "summary", true, spawnImpl);
+    const res = await exec.invoke({ prompt: "p", model: "m" });
+    expect(res.failure).toBeUndefined();
+    expect(res.stdout).toBe("done");
   });
 });
