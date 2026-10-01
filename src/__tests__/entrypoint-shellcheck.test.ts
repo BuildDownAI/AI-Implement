@@ -370,6 +370,7 @@ describe("session/entrypoint.sh", () => {
         WORKSPACE_DIR: workspace,
         AI_IMPLEMENT_MODE: "local",
         AI_IMPLEMENT_WORKSPACE_MODE: "mounted",
+        AI_IMPLEMENT_RUN_CONFIG: "",
         AI_IMPLEMENT_HOST_UID: "1234",
         AI_IMPLEMENT_HOST_GID: "2345",
         ANTHROPIC_API_KEY: "test-key",
@@ -775,8 +776,17 @@ describe("session/entrypoint.sh configured model-auth bootstrap", () => {
       }
       expect(s).not.toMatch(/^AI_IMPLEMENT_/m);
     }
-    // GitHub credential only for gh; git children use the token embedded in the clone URL.
-    expect(sections.filter((s) => s.startsWith("git ") && !s.startsWith("git clone")).every((s) => !s.includes("SENTINEL-gh-token"))).toBe(true);
+    // The configured clone URL and every git argv are credential-free: the token reaches only the
+    // clone child's environment (as GIT_PASSWORD), and only gh receives GH_TOKEN.
+    const clone = sections.find((s) => s.startsWith("git clone "));
+    expect(clone, output).toBeDefined();
+    expect(clone!.split("\n")[0]).toContain("https://github.com/BuildDownAI/fixture.git");
+    expect(clone!.split("\n")[0]).not.toContain("SENTINEL-gh-token");
+    expect(clone).toContain("GIT_PASSWORD=SENTINEL-gh-token");
+    for (const s of sections.filter((c) => c.startsWith("git ") && !c.startsWith("git clone "))) {
+      expect(s, s.split("\n")[0]).not.toContain("SENTINEL-gh-token");
+    }
+    for (const s of sections) expect(s.split("\n")[0]).not.toContain("SENTINEL-gh-token");
     expect(sections.find((s) => s.startsWith("gh pr checkout"))).toContain("GH_TOKEN=SENTINEL-gh-token");
     // The trusted runner handoff keeps the protected payload.
     const handoff = sections.find((s) => s.startsWith("dbus-run-session "));
@@ -808,6 +818,19 @@ describe("session/entrypoint.sh configured model-auth bootstrap", () => {
     });
     expect(result.status, output).toBe(0);
     expect(sections.find((s) => s.startsWith("git "))).toContain("ANTHROPIC_API_KEY=legacy-key");
+    expect(sections.find((s) => s.startsWith("git clone "))!.split("\n")[0]).toContain("x-access-token:SENTINEL-gh-token@github.com");
+  });
+
+  it("a valid private callback/publication-only credentials namespace stays legacy and keeps the provider requirement", () => {
+    const envelope = encode({ v: 1, issue, credentials: { version: 1, resultToken: "tok-a", publicationToken: "tok-b" } });
+    const missing = run({ AI_IMPLEMENT_RUN_CONFIG: envelope });
+    expect(missing.result.status).toBe(1);
+    expect(missing.output).toContain("At least one of ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN must be set");
+    expect(missing.output).not.toContain("Configured model-auth bootstrap");
+    expect(missing.children).toBe("");
+    const ok = run({ AI_IMPLEMENT_RUN_CONFIG: envelope, ANTHROPIC_API_KEY: "legacy-key" });
+    expect(ok.result.status, ok.output).toBe(0);
+    expect(ok.sections.find((s) => s.startsWith("git "))).toContain("ANTHROPIC_API_KEY=legacy-key");
   });
 
   it.each([
@@ -815,6 +838,13 @@ describe("session/entrypoint.sh configured model-auth bootstrap", () => {
     ["missing snapshot", () => encode({ v: 1, issue, credentials: { version: 1, modelAuthGrant: grant } })],
     ["malformed grant", () => encode({ v: 1, issue, agentConfig: agentConfig(), credentials: { version: 1, modelAuthGrant: { ...grant, audience: "other" } } })],
     ["malformed snapshot", () => encode({ v: 1, issue, agentConfig: { version: 1 }, credentials: { version: 1, modelAuthGrant: grant } })],
+    ["invalid base64/JSON", () => "%%%not-base64-json%%%"],
+    ["truncated JSON", () => configuredEnvelope().slice(0, -16)],
+    ["non-object JSON", () => encode("a string")],
+    ["null JSON", () => encode(null)],
+    ["array JSON", () => encode([issue])],
+    ["unsupported version", () => encode({ v: 2, issue, agentConfig: agentConfig(), credentials: { version: 1, modelAuthGrant: grant } })],
+    ["unsupported credentials version", () => encode({ v: 1, issue, credentials: { version: 2, resultToken: "t" } })],
   ])("fails closed with a fixed value-free message before git or setup: %s", (_name, make) => {
     const envelope = make();
     const { result, children, output } = run({

@@ -3,7 +3,7 @@ import { spawnSync } from "node:child_process";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { repoProcessEnv, modelProcessEnv, gitProcessEnv, gitDependencyProcessEnv, MODEL_SESSION_KEYS } from "../pipeline/process-env.js";
+import { repoProcessEnv, modelProcessEnv, gitProcessEnv, gitDependencyProcessEnv, isConfiguredModelRun, MODEL_SESSION_KEYS } from "../pipeline/process-env.js";
 
 const SAVED: Record<string, string | undefined> = {};
 
@@ -303,6 +303,7 @@ describe("private envelope and model-auth bootstrap stripping (AII-981)", () => 
 
   it("repoProcessEnv keeps a forwarded secret that shares a model key name", () => {
     process.env.AI_IMPLEMENT_FORWARDED_SECRETS = "AWS_ACCESS_KEY_ID";
+    delete process.env.AI_IMPLEMENT_RUN_CONFIG;
     expect(repoProcessEnv().AWS_ACCESS_KEY_ID).toBe("SENTINEL-aws-id");
   });
 
@@ -371,9 +372,39 @@ describe("configured runs and selected authentication (AII-951)", () => {
     expect(env.CODEX_HOME).toBe("/sentinel/codex");
     expect(env).not.toHaveProperty("ANTHROPIC_API_KEY");
     // An envelope without agentConfig/credentials is legacy too.
-    process.env.AI_IMPLEMENT_RUN_CONFIG = encode({ v: 1, issue: {} });
+    process.env.AI_IMPLEMENT_RUN_CONFIG = encode({ v: 1, issue: { id: "1", identifier: "A-1", title: "t", description: "d" } });
     expect(repoProcessEnv().OPENAI_API_KEY).toBe("SENTINEL-openai");
     expect(repoProcessEnv({ configured: true })).not.toHaveProperty("OPENAI_API_KEY");
+  });
+
+  describe("isConfiguredModelRun classification (fail closed on bad protected input)", () => {
+    const issue = { id: "1", identifier: "A-1", title: "t", description: "d" };
+    it.each([
+      ["invalid base64/JSON", "not-base64-json!!"],
+      ["truncated JSON", configuredEnvelope.slice(0, -12)],
+      ["non-object JSON", encode("just a string")],
+      ["null JSON", encode(null)],
+      ["array JSON", encode([])],
+      ["unsupported version", encode({ v: 2, issue })],
+      ["invalid credentials namespace", encode({ v: 1, issue, credentials: { version: 9 } })],
+      ["agentConfig without grant", encode({ v: 1, issue, agentConfig: { version: 1 } })],
+    ])("treats %s as configured so forwarded model-name collisions are stripped", (_n, envelope) => {
+      process.env.AI_IMPLEMENT_RUN_CONFIG = envelope;
+      expect(isConfiguredModelRun(process.env)).toBe(true);
+      const env = repoProcessEnv();
+      expect(env).not.toHaveProperty("OPENAI_API_KEY");
+      expect(env).not.toHaveProperty("CODEX_HOME");
+      expect(env).not.toHaveProperty("AI_IMPLEMENT_RUN_CONFIG");
+      expect(env.REPO_HOOK_SECRET).toBe("approved-forwarded");
+    });
+
+    it("keeps a valid callback/publication-only private credentials namespace legacy", () => {
+      process.env.AI_IMPLEMENT_RUN_CONFIG = encode({ v: 1, issue, credentials: { version: 1, resultToken: "tok-a", publicationToken: "tok-b" } });
+      expect(isConfiguredModelRun(process.env)).toBe(false);
+      const env = repoProcessEnv();
+      expect(env.OPENAI_API_KEY).toBe("SENTINEL-openai");
+      expect(env).not.toHaveProperty("AI_IMPLEMENT_RUN_CONFIG");
+    });
   });
 
   it("git, dependency-git and repository envs never contain the encoded envelope or decoded bootstrap values", () => {

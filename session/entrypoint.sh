@@ -88,9 +88,14 @@ if [ "$WORKSPACE_MODE" = "mounted" ]; then
   run_scoped "" git config --global --add safe.directory "$WORKSPACE_DIR"
   cd "$WORKSPACE_DIR"
 else
-  REPO_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_OWNER}/${GITHUB_REPO}.git"
   log "Cloning ${GITHUB_OWNER}/${GITHUB_REPO}..."
-  run_scoped "" git clone --depth=1 --branch "$GITHUB_DEFAULT_BRANCH" "$REPO_URL" "$WORKSPACE_DIR"
+  if [ "$CONFIGURED" = "1" ]; then
+    configure_scoped_git_auth
+    git_authed clone --depth=1 --branch "$GITHUB_DEFAULT_BRANCH" "https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}.git" "$WORKSPACE_DIR"
+  else
+    REPO_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_OWNER}/${GITHUB_REPO}.git"
+    git clone --depth=1 --branch "$GITHUB_DEFAULT_BRANCH" "$REPO_URL" "$WORKSPACE_DIR"
+  fi
   run_scoped "" git config --global --add safe.directory "$WORKSPACE_DIR"
   cd "$WORKSPACE_DIR"
   if [ -n "$PR_NUMBER" ]; then

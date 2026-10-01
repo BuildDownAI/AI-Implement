@@ -2,7 +2,7 @@ import { afterEach, describe, it, expect } from "vitest";
 
 const isWindows = process.platform === "win32";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -339,6 +339,42 @@ describe.skipIf(isWindows)("session/lib.sh configured-run helpers (AII-951)", ()
     const r = run('CONFIGURED=1; on_err 1 9 "git clone https://x:SECRET@h"');
     expect(r.stdout).toContain("line 9 failed (exit 1)");
     expect(r.stdout).not.toContain("SECRET");
+  });
+
+  describe("scoped git credential helper", () => {
+    const fill = (env: Record<string, string>) =>
+      run('git -c credential.helper= -c "credential.helper=$SCOPED_GIT_HELPER" credential fill <<< $\'protocol=https\\nhost=github.com\\n\\n\'', { HOME: "/tmp", GIT_TERMINAL_PROMPT: "0", ...env });
+
+    it("answers from the operation-scoped GIT_PASSWORD only", () => {
+      const withToken = fill({ GIT_PASSWORD: "SYNTHETIC-token" });
+      expect(withToken.status, withToken.stderr).toBe(0);
+      expect(withToken.stdout).toContain("username=x-access-token");
+      expect(withToken.stdout).toContain("password=SYNTHETIC-token");
+      const without = fill({});
+      expect(without.status).not.toBe(0);
+      expect(without.stdout).not.toContain("password=");
+    });
+
+    it("git_authed puts the token only in the git child's environment, never in argv", () => {
+      const dir = mkdtempSync(join(tmpdir(), "git-authed-"));
+      const log = join(dir, "log");
+      writeFileSync(join(dir, "git"), `#!/bin/sh\n{ echo "argv: $*"; env; } > '${log}'\n`);
+      chmodSync(join(dir, "git"), 0o755);
+      try {
+        const r = run('CONFIGURED=1; git_authed clone https://github.com/o/r.git /w', {
+          PATH: `${dir}:${process.env.PATH}`, HOME: "/h", GITHUB_TOKEN: "SYNTHETIC-token", OPENAI_API_KEY: "SENTINEL-openai",
+        });
+        expect(r.status, r.stderr).toBe(0);
+        const seen = readFileSync(log, "utf-8");
+        expect(seen).toContain("argv: clone https://github.com/o/r.git /w");
+        expect(seen.split("\n")[0]).not.toContain("SYNTHETIC-token");
+        expect(seen).toContain("GIT_PASSWORD=SYNTHETIC-token");
+        expect(seen).not.toContain("GITHUB_TOKEN");
+        expect(seen).not.toContain("SENTINEL-openai");
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
   });
 
   describe("remap_team_secrets reservation", () => {

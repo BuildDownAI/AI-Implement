@@ -106,26 +106,42 @@ resolve_envelope_field() {
 }
 
 # Classify AI_IMPLEMENT_RUN_CONFIG for model-auth bootstrap. Prints exactly one fixed word:
-#   legacy      no envelope, or an envelope without agentConfig/credentials (legacy startup)
-#   configured  trusted decoder accepts it, it carries a resolved agentConfig snapshot and a
-#               credentials.modelAuthGrant bootstrap
-#   invalid     configured intent (agentConfig or credentials present) that fails the trusted
-#               decoder or lacks the grant; callers fail closed, never fall back to legacy
+#   legacy      no envelope, or a trusted-decodable envelope with neither a resolved agentConfig
+#               nor a credentials.modelAuthGrant (a callback/publication-only credentials
+#               namespace stays legacy stage selection)
+#   configured  trusted decoder accepts it and it carries both agentConfig and modelAuthGrant
+#   invalid     any nonempty envelope the trusted decoder rejects (bad base64/JSON, non-object,
+#               bad version, bad credentials) or configured intent with only one of the two;
+#               callers fail closed, never fall back to legacy
 # Never prints decoded values or decoder error text. AI_IMPLEMENT_DIST_DIR is a test seam.
 classify_run_config() {
   [ -z "${AI_IMPLEMENT_RUN_CONFIG:-}" ] && { echo legacy; return 0; }
   node --input-type=module -e '
     const out = (w) => process.stdout.write(w);
-    let raw;
-    try { raw = JSON.parse(Buffer.from(process.env.AI_IMPLEMENT_RUN_CONFIG, "base64").toString("utf-8")); } catch { out("legacy"); process.exit(0); }
-    if (raw === null || typeof raw !== "object" || (raw.agentConfig === undefined && raw.credentials === undefined)) { out("legacy"); process.exit(0); }
     try {
       const dir = process.env.AI_IMPLEMENT_DIST_DIR || "/app/dist";
       const { decodeTrustedRunConfig } = await import(dir + "/run-config.js");
       const c = decodeTrustedRunConfig(process.env.AI_IMPLEMENT_RUN_CONFIG);
-      out(c.agentConfig !== undefined && c.credentials && c.credentials.modelAuthGrant !== undefined ? "configured" : "invalid");
+      const snapshot = c.agentConfig !== undefined;
+      const grant = c.credentials !== undefined && c.credentials.modelAuthGrant !== undefined;
+      out(snapshot && grant ? "configured" : snapshot || grant ? "invalid" : "legacy");
     } catch { out("invalid"); }
   ' 2>/dev/null || echo invalid
+}
+
+# Credential helper that answers only from the GIT_PASSWORD of the git child it serves, so the
+# remote URL and argv stay credential-free and nothing is written to disk. Registered for
+# configured runs only; the TS clone step already supplies GIT_PASSWORD per operation.
+# shellcheck disable=SC2016 # expanded by the helper's own shell, not here
+SCOPED_GIT_HELPER='!f() { [ "$1" = get ] && [ -n "${GIT_PASSWORD:-}" ] || exit 0; echo username=x-access-token; echo "password=$GIT_PASSWORD"; }; f'
+
+configure_scoped_git_auth() {
+  run_scoped "" git config --global credential.helper "$SCOPED_GIT_HELPER" || return $?
+}
+
+# Run one git network operation (clone/fetch) with the GitHub token in that child's environment only.
+git_authed() {
+  GIT_PASSWORD="$GITHUB_TOKEN" GIT_TERMINAL_PROMPT=0 run_scoped "GIT_PASSWORD GIT_TERMINAL_PROMPT" git "$@" || return $?
 }
 
 # Run a command with a minimal, scrubbed environment when the run is configured

@@ -121,24 +121,18 @@ const CONFIGURED_MODEL_PREFIXES = ["OPENAI_", "CODEX_", "ANTHROPIC_", "CLAUDE_CO
 
 /**
  * True when the encoded run config selects per-stage agent configuration (opt-in). Mirrors
- * session/lib.sh classify_run_config: an envelope that is not parseable JSON, or carries neither
- * `agentConfig` nor `credentials`, is legacy; configured intent that fails the trusted decoder
- * still counts as configured so the stricter stripping applies (fail closed).
+ * session/lib.sh classify_run_config: an empty value, or an envelope the trusted decoder accepts
+ * with neither `agentConfig` nor `credentials.modelAuthGrant` (e.g. a callback/publication-only
+ * credentials namespace), is legacy. Everything else is configured so the stricter stripping
+ * applies: configured intent, and any nonempty envelope the decoder rejects (fail closed, so bad
+ * protected input can never fall into the legacy forwarded-model-name exception).
  */
 export function isConfiguredModelRun(env: NodeJS.ProcessEnv): boolean {
   const encoded = env.AI_IMPLEMENT_RUN_CONFIG;
   if (!encoded) return false;
-  let raw: unknown;
   try {
-    raw = JSON.parse(Buffer.from(encoded, "base64").toString("utf-8"));
-  } catch {
-    return false;
-  }
-  if (raw === null || typeof raw !== "object") return false;
-  const { agentConfig, credentials } = raw as Record<string, unknown>;
-  if (agentConfig === undefined && credentials === undefined) return false;
-  try {
-    return decodeTrustedRunConfig(encoded).agentConfig !== undefined;
+    const decoded = decodeTrustedRunConfig(encoded);
+    return decoded.agentConfig !== undefined || decoded.credentials?.modelAuthGrant !== undefined;
   } catch {
     return true;
   }
