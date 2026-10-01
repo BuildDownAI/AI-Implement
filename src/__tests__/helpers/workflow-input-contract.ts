@@ -56,11 +56,50 @@ export function checkInputs(key: WorkflowKey, yaml: string): string[] {
   return out;
 }
 
+/**
+ * Receiving audience for the encoded envelope: job -> step name -> env keys. Only the bootstrap
+ * mask step reads it from the event file (no env), so the audience is the steps that decode it
+ * for validation / the selected diagnostic projection, and the trusted runner step.
+ */
+export const ENVELOPE_AUDIENCE: Record<WorkflowKey, Record<string, Record<string, string[]>>> = {
+  implement: {
+    implement: {
+      "Validate attempt correlation": ["RUN_CONFIG"],
+      "Print dispatch inputs": ["RUN_CONFIG"],
+      "Run pipeline": ["AI_IMPLEMENT_RUN_CONFIG"],
+    },
+  },
+  plan: {
+    plan: {
+      "Print dispatch inputs": ["RUN_CONFIG"],
+      "Run planning": ["AI_IMPLEMENT_RUN_CONFIG"],
+    },
+  },
+};
+
+const ENVELOPE_REF = /\binputs\s*(\.\s*run_config\b|\[\s*['"]run_config['"]\s*\])|github\.event\.inputs\b/;
+const PAYLOAD_DUMP = /toJSON\(\s*(inputs|github\.event|github)\b/;
+const RAW_TOKEN_INPUT = /inputs\.run_(token|progress_token|publication_token)\s*\}\}/;
+
 /** Flags steps that could print or forward the encoded envelope or a decoded credential. */
-export function checkDiagnostics(yaml: string): string[] {
+export function checkDiagnostics(yaml: string, key: WorkflowKey): string[] {
   const doc = parse(yaml) as any;
   const out: string[] = [];
+  const audience = ENVELOPE_AUDIENCE[key];
+
+  // Workflow- and job-level env reach every step in scope, so they may never carry the envelope.
+  const scoped = (label: string, env: Record<string, unknown> | undefined) => {
+    for (const [k, v] of Object.entries(env ?? {})) {
+      const val = String(v);
+      if (ENVELOPE_REF.test(val)) out.push(`${label}: forwards the envelope to every step as ${k}`);
+      if (PAYLOAD_DUMP.test(val)) out.push(`${label}: serializes the dispatch payload`);
+      if (RAW_TOKEN_INPUT.test(val) && !/!=\s*''/.test(val)) out.push(`${label}: forwards raw runner token input via ${k}`);
+    }
+  };
+  scoped("workflow env", doc.env);
+
   for (const [jobName, job] of Object.entries<any>(doc.jobs ?? {})) {
+    scoped(`${jobName} job env`, job.env);
     for (const step of job.steps ?? []) {
       const label = `${jobName}/${step.name ?? "(unnamed)"}`;
       const run: string = step.run ?? "";
@@ -75,19 +114,20 @@ export function checkDiagnostics(yaml: string): string[] {
         if (/\bset\s+-\w*x/.test(l) || /\bxtrace\b/.test(l)) out.push(`${label}: shell tracing enabled`);
         if (/\b(echo|printf)\b[^\n]*\$\{?(CREDENTIALS|RESULT_TOKEN|PROGRESS_TOKEN|PUBLICATION_TOKEN|RUN_TOKEN)\b/.test(l)) out.push(`${label}: prints a credential value`);
       }
-      if (/toJSON\(\s*(inputs|github\.event)/.test(run) || Object.values(env).some((v) => /toJSON\(\s*(inputs|github\.event)/.test(String(v)))) {
-        out.push(`${label}: serializes the dispatch payload`);
+      const sinks: Array<[string, string]> = [
+        ...Object.entries<unknown>(env).map(([k, v]) => [k, String(v)] as [string, string]),
+        ...Object.entries<unknown>(step.with ?? {}).map(([k, v]) => [`with.${k}`, String(v)] as [string, string]),
+      ];
+      if (PAYLOAD_DUMP.test(run) || sinks.some(([, v]) => PAYLOAD_DUMP.test(v))) out.push(`${label}: serializes the dispatch payload`);
+      if (ENVELOPE_REF.test(run)) out.push(`${label}: interpolates the envelope into the script`);
+      // Only the receiving job/step/key triples in ENVELOPE_AUDIENCE may receive the encoded envelope.
+      for (const [k, v] of sinks) {
+        if (!ENVELOPE_REF.test(v)) continue;
+        const allowed = audience[jobName]?.[step.name ?? ""] ?? [];
+        if (!allowed.includes(k)) out.push(`${label}: forwards the envelope as ${k} (not a trusted receiving step/key)`);
       }
-      // Only the bootstrap step and the trusted runner step may receive the encoded envelope.
-      const forwards = Object.entries(env).filter(([, v]) => /inputs\.run_config\b/.test(String(v))).map(([k]) => k);
-      for (const k of forwards) {
-        const trusted = ["RUN_CONFIG", "AI_IMPLEMENT_RUN_CONFIG"].includes(k);
-        if (!trusted) out.push(`${label}: forwards the envelope as ${k}`);
-      }
-      for (const [k, v] of Object.entries(env)) {
-        if (/inputs\.run_(token|progress_token|publication_token)\s*\}\}/.test(String(v)) && !/!=\s*''/.test(String(v))) {
-          out.push(`${label}: forwards raw runner token input via ${k}`);
-        }
+      for (const [k, v] of sinks) {
+        if (RAW_TOKEN_INPUT.test(v) && !/!=\s*''/.test(v)) out.push(`${label}: forwards raw runner token input via ${k}`);
       }
     }
   }

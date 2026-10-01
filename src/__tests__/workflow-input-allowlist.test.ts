@@ -28,7 +28,7 @@ describe("workflow input allowlist (ADR 032)", () => {
     });
 
     it(`${key}: diagnostic and forwarding paths are credential-free`, () => {
-      expect(checkDiagnostics(canonical)).toEqual([]);
+      expect(checkDiagnostics(canonical, key)).toEqual([]);
     });
   }
 
@@ -52,7 +52,7 @@ describe("workflow input allowlist (ADR 032)", () => {
         { name: "Unsafe", env: { RUN_CONFIG: "${{ inputs.run_config }}" }, run: 'set -x\necho "$RUN_CONFIG"\nprintf \'%s\' "$RUN_CONFIG" | base64 -d | jq .\n' },
       );
       
-      const found = checkDiagnostics(stringify(doc));
+      const found = checkDiagnostics(stringify(doc), "implement");
       expect(found).toEqual(expect.arrayContaining([
         expect.stringContaining("prints the raw envelope"),
         expect.stringContaining("unfiltered jq dump"),
@@ -68,11 +68,66 @@ describe("workflow input allowlist (ADR 032)", () => {
         run: "true",
       });
       
-      const found = checkDiagnostics(stringify(doc));
+      const found = checkDiagnostics(stringify(doc), "implement");
       expect(found).toEqual(expect.arrayContaining([
         expect.stringContaining("forwards the envelope as SOMETHING"),
         expect.stringContaining("forwards raw runner token input via TOKEN"),
         expect.stringContaining("serializes the dispatch payload"),
+      ]));
+    });
+
+    it.each(["RUN_CONFIG", "AI_IMPLEMENT_RUN_CONFIG"])("rejects an untrusted step receiving the envelope as reserved key %s", (reserved) => {
+      const doc = parse(base) as any;
+      doc.jobs.implement.steps.push({ name: "Brand new step", env: { [reserved]: "${{ inputs.run_config }}" }, run: "true" });
+      expect(checkDiagnostics(stringify(doc), "implement")).toEqual([
+        `implement/Brand new step: forwards the envelope as ${reserved} (not a trusted receiving step/key)`,
+      ]);
+    });
+
+    it("rejects a trusted step receiving the envelope under the wrong key", () => {
+      const doc = parse(base) as any;
+      const step = doc.jobs.implement.steps.find((s: any) => s.name === "Run pipeline");
+      step.env.RUN_CONFIG = "${{ inputs.run_config }}";
+      expect(checkDiagnostics(stringify(doc), "implement")).toEqual([
+        "implement/Run pipeline: forwards the envelope as RUN_CONFIG (not a trusted receiving step/key)",
+      ]);
+    });
+
+    it("rejects a trusted step name in the wrong job", () => {
+      const doc = parse(base) as any;
+      doc.jobs["validate-runner-image"].steps.push({ name: "Run pipeline", env: { AI_IMPLEMENT_RUN_CONFIG: "${{ inputs.run_config }}" }, run: "true" });
+      expect(checkDiagnostics(stringify(doc), "implement")).toEqual([
+        "validate-runner-image/Run pipeline: forwards the envelope as AI_IMPLEMENT_RUN_CONFIG (not a trusted receiving step/key)",
+      ]);
+    });
+
+    it("rejects workflow-level envelope forwarding", () => {
+      const doc = parse(base) as any;
+      doc.env = { AI_IMPLEMENT_RUN_CONFIG: "${{ inputs.run_config }}" };
+      expect(checkDiagnostics(stringify(doc), "implement")).toEqual([
+        "workflow env: forwards the envelope to every step as AI_IMPLEMENT_RUN_CONFIG",
+      ]);
+    });
+
+    it("rejects job-level envelope forwarding", () => {
+      for (const key of Object.keys(INPUT_CONTRACT) as WorkflowKey[]) {
+        const doc = parse(readFileSync(INPUT_CONTRACT[key].canonical, "utf-8")) as any;
+        const job = key === "implement" ? "implement" : "plan";
+        doc.jobs[job].env = { ...(doc.jobs[job].env ?? {}), RUN_CONFIG: "${{ inputs.run_config }}" };
+        expect(checkDiagnostics(stringify(doc), key)).toEqual([
+          `${job} job env: forwards the envelope to every step as RUN_CONFIG`,
+        ]);
+      }
+    });
+
+    it("rejects inline envelope interpolation into a script and bracket-form references", () => {
+      const doc = parse(base) as any;
+      doc.jobs.implement.steps.push({ name: "Inline", run: "echo ${{ inputs.run_config }}" });
+      doc.jobs.implement.steps.push({ name: "Bracket", env: { X: "${{ inputs['run_config'] }}" }, run: "true" });
+      const found = checkDiagnostics(stringify(doc), "implement");
+      expect(found).toEqual(expect.arrayContaining([
+        "implement/Inline: interpolates the envelope into the script",
+        "implement/Bracket: forwards the envelope as X (not a trusted receiving step/key)",
       ]));
     });
 
