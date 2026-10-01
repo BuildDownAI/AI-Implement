@@ -92,6 +92,10 @@ The handler validates and stores a bounded activity batch under the token's
 attempt identity before ACK. A missing store, forged attempt, or storage failure
 cannot produce a success ACK. Legacy runs do not use this route.
 
+## GitHub `workflow_run` subscription (AII-974)
+
+The GitHub App must subscribe to **`workflow_run`** (alongside `issue_comment`, `pull_request` and the review events) so the orchestrator webhook can resolve the `KgRefresh` run-watch awakeable when a kg-refresh run completes. It is optional: without the subscription the workflow's 10 min backstop poll ends the watch. Deliveries are HMAC-checked like every other event, and the awakeable id never leaves the orchestrator. See `docs/issueless-runs.md` § 6.
+
 ## Rules
 
 1. A test that touches a runner entry point (`runKgRefresh`, `runAutonomous`, `postRunnerResult`) runs disarmed: `RUN_TOKEN`, `RUNNER_CALLBACK_URL`, and `RUN_PROGRESS_TOKEN` are cleared. The file-level hook from PR #467 does this for one file. AII-588 moves it to a vitest setup file so every suite starts disarmed.

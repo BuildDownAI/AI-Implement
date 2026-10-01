@@ -40,6 +40,7 @@ import {
   createKgRefreshDispatch,
   createKgRefreshIngressClient,
   createProductionKgRefreshServices,
+  resolveRunWatchAwakeable,
   type KgRefreshProductionInput,
 } from "../restate/kg-refresh-production.js";
 import { decodeRunConfig } from "../run-config.js";
@@ -410,5 +411,27 @@ describe("createKgRefreshIngressClient", () => {
     expect(url).toBe(`${BASE}/KgRepo/acme%2Fkg/enqueueDryRun`);
     expect((init.headers as Record<string, string>)["idempotency-key"]).toBe("delivery-1");
     expect(JSON.parse(new TextDecoder().decode(init.body as Uint8Array))).toEqual(entry);
+  });
+});
+
+describe("resolveRunWatchAwakeable", () => {
+  it("POSTs the conclusion to the awakeable resolve URL with the delivery id as idempotency key", async () => {
+    const fetchImpl = vi.fn(async () => new Response("", { status: 200 }));
+    const ok = await resolveRunWatchAwakeable("sign_1abc/def", "success", "delivery-7", {
+      baseUrl: "http://ingress.test", fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    expect(ok).toBe("resolved");
+    const [url, init] = fetchImpl.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe("http://ingress.test/restate/awakeables/sign_1abc%2Fdef/resolve");
+    expect(init.method).toBe("POST");
+    expect((init.headers as Record<string, string>)["idempotency-key"]).toBe("delivery-7");
+    expect(JSON.parse(init.body as string)).toEqual({ conclusion: "success" });
+  });
+
+  it("returns failed on a 5xx answer or a network failure, gone on 404/409", async () => {
+    expect(await resolveRunWatchAwakeable("a", "success", "d", { fetchImpl: (async () => new Response("", { status: 500 })) as typeof fetch })).toBe("failed");
+    expect(await resolveRunWatchAwakeable("a", "success", "d", { fetchImpl: (async () => { throw new Error("down"); }) as typeof fetch })).toBe("failed");
+    expect(await resolveRunWatchAwakeable("a", "success", "d", { fetchImpl: (async () => new Response("", { status: 404 })) as typeof fetch })).toBe("gone");
+    expect(await resolveRunWatchAwakeable("a", "success", "d", { fetchImpl: (async () => new Response("", { status: 409 })) as typeof fetch })).toBe("gone");
   });
 });

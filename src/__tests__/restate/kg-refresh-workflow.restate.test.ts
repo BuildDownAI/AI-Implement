@@ -25,6 +25,8 @@ import { createKgRepo, type KgRepoTriggerResult } from "../../restate/kg-repo.js
 import {
   createKgRefreshWorkflow,
   KG_REFRESH_RETENTION_MS,
+  KG_REFRESH_TOTAL_DEADLINE_MS,
+  KG_REFRESH_WATCH_INTERVAL_MS,
   type KgDispatchInput,
   type KgDispatchResult,
   type KgRefreshReportBody,
@@ -226,6 +228,10 @@ describe("KgRefresh durable workflow", () => {
   // ---- non-rail deps: recorded in-process, per-run scenarios keyed by triggerId ----
   const scenarios = new Map<string, RunScenario>();
   const runIdIndex = new Map<number, string>();
+  /** GitHub run id -> the awakeable id the workflow registered for the webhook to resolve. */
+  const runWatches = new Map<number, string>();
+  const registerRunWatchCalls: number[] = [];
+  const forgetRunWatchCalls: number[] = [];
   const appendJobLogCalls: Array<{ dispatchId: string; jobId: string }> = [];
   const dispatchedIds: string[] = [];
   /** triggerId -> the run the backend "committed" before the ack was lost. */
@@ -301,6 +307,16 @@ describe("KgRefresh durable workflow", () => {
     return scenario.findByTitleResult;
   }
 
+  async function registerRunWatchFn({ runId, awakeableId }: { runId: number; awakeableId: string }): Promise<void> {
+    registerRunWatchCalls.push(runId);
+    runWatches.set(runId, awakeableId);
+  }
+
+  async function forgetRunWatchFn(runId: number): Promise<void> {
+    forgetRunWatchCalls.push(runId);
+    runWatches.delete(runId);
+  }
+
   async function cancelWorkflowRunFn(runId: number): Promise<boolean> {
     const triggerId = runIdIndex.get(runId);
     const scenario = triggerId ? scenarios.get(triggerId) : undefined;
@@ -327,6 +343,8 @@ describe("KgRefresh durable workflow", () => {
     closeJobLog: (jobId, status, conclusion) => { closeRowCalls.push({ jobId, status, conclusion }); },
     getWorkflowRunStatus: getWorkflowRunStatusFn,
     findRunByTitle: findRunByTitleFn,
+    registerRunWatch: registerRunWatchFn,
+    forgetRunWatch: forgetRunWatchFn,
     cancelWorkflowRun: cancelWorkflowRunFn,
     persistLastRefresh: async (outcome) => {
       if (persistHold) {
@@ -792,9 +810,144 @@ describe("KgRefresh durable workflow", () => {
       const outcome = await done;
       expect(outcome.ok).toBe(true);
       expect(scenarios.get(triggerId)!.runStatusCalls).toBe(1);
+      // the run ended by report with no workflow_run webhook: the row must not outlive the workflow
+      expect(registerRunWatchCalls).toContain(runId);
+      await until(() => !runWatches.has(runId));
+      expect(forgetRunWatchCalls.filter((id) => id === runId)).toHaveLength(1);
     },
     15_000,
   );
+
+  async function resolveAwakeable(baseUrl: string, awakeableId: string, body: unknown): Promise<void> {
+    const res = await fetch(`${baseUrl}/restate/awakeables/${awakeableId}/resolve`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(`awakeable resolve failed: ${res.status} ${await res.text()}`);
+  }
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "W6b: GHA backend — resolving the run-watch awakeable ends the watch with no further run-status call (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      const runId = runIdCounter++;
+      makeScenario(triggerId, {
+        dispatchOutcome: "accepted", runId, executionMode: "github-actions",
+        runStatusSequence: [{ status: "in_progress", conclusion: null }],
+      });
+
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      await until(() => runWatches.has(runId));
+      await until(() => scenarios.get(triggerId)!.runStatusCalls >= 1);
+      const callsBefore = scenarios.get(triggerId)!.runStatusCalls;
+      await resolveAwakeable(env.baseUrl(), runWatches.get(runId)!, { conclusion: "success" });
+
+      const outcome = await done;
+      expect(outcome.ok).toBe(false);
+      expect(outcome.detail).toContain("success");
+      expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("dispatch_lost");
+      expect(scenarios.get(triggerId)!.runStatusCalls).toBe(callsBefore);
+      expect(registerRunWatchCalls.filter((id) => id === runId)).toHaveLength(1);
+    },
+    15_000,
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "W6c: GHA backend — with the webhook lost, the backstop poll still ends the watch (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      const runId = runIdCounter++;
+      makeScenario(triggerId, {
+        dispatchOutcome: "accepted", runId, executionMode: "github-actions",
+        runStatusSequence: [
+          { status: "in_progress", conclusion: null },
+          { status: "completed", conclusion: "success" },
+        ],
+      });
+
+      const outcome = await runWorkflow(env.baseUrl(), triggerId);
+      expect(outcome.ok).toBe(false);
+      expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("dispatch_lost");
+      expect(scenarios.get(triggerId)!.runStatusCalls).toBe(2);
+      // no webhook ever arrived, so the workflow itself must drop the row
+      await until(() => !runWatches.has(runId));
+      expect(forgetRunWatchCalls.filter((id) => id === runId)).toHaveLength(1);
+    },
+    15_000,
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "W6d: GHA backend — a report already in hand when the awakeable fires wins over dispatch_lost (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      const runId = runIdCounter++;
+      makeScenario(triggerId, {
+        dispatchOutcome: "accepted", runId, executionMode: "github-actions",
+        runStatusSequence: [{ status: "in_progress", conclusion: null }],
+      });
+
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      await until(() => runWatches.has(runId));
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      await resolveAwakeable(env.baseUrl(), runWatches.get(runId)!, { conclusion: "success" });
+
+      const outcome = await done;
+      expect(outcome.ok).toBe(true);
+      expect(closeRowCalls[closeRowCalls.length - 1].conclusion).not.toBe("dispatch_lost");
+    },
+    15_000,
+  );
+
+  // Same 24:1 deadline-to-tick ratio as the production constants (4 h / 10 min), scaled to milliseconds.
+  it("a 4 h-equivalent run makes about 24 watch calls (24 ticks + the first read) and stays under 50 journaled steps", async () => {
+    expect(KG_REFRESH_TOTAL_DEADLINE_MS / KG_REFRESH_WATCH_INTERVAL_MS).toBe(24);
+    const scaledTick = 100;
+    const scaledWorkflow = createKgRefreshWorkflow({
+      rail,
+      kgSourceRepo: KG_SOURCE_REPO,
+      mintRunTokens: () => ({ runToken: "run-token", progressToken: "progress-token", publicationToken: "publication-token" }),
+      dispatch: dispatchFn,
+      appendJobLog: (input) => { appendJobLogCalls.push(input); },
+      closeJobLog: (jobId, status, conclusion) => { closeRowCalls.push({ jobId, status, conclusion }); },
+      getWorkflowRunStatus: getWorkflowRunStatusFn,
+      findRunByTitle: findRunByTitleFn,
+      registerRunWatch: registerRunWatchFn,
+    forgetRunWatch: forgetRunWatchFn,
+      cancelWorkflowRun: cancelWorkflowRunFn,
+      persistLastRefresh: (outcome) => { persistCalls.push(outcome); },
+      onOutcome: (kind, outcome) => { onOutcomeCalls.push({ kind, outcome }); },
+      recordDryRunOutcome: (report, outcome) => { recordedDryRuns.push({ report, outcome }); },
+      bootstrapDeadlineMs: scaledTick * 4,
+      totalDeadlineMs: scaledTick * 24,
+      watchIntervalMs: scaledTick,
+    });
+    const scaledEnv = await startRetryEnabled([scaledWorkflow, kgRepo]);
+    try {
+      const triggerId = newTriggerId();
+      const runId = runIdCounter++;
+      makeScenario(triggerId, {
+        dispatchOutcome: "accepted", runId, executionMode: "github-actions",
+        runStatusSequence: [{ status: "in_progress", conclusion: null }],
+      });
+      const done = runWorkflow(scaledEnv.baseUrl(), triggerId);
+      await until(() => scenarios.get(triggerId)!.dispatchCalls === 1);
+      await callWorkflow(scaledEnv.baseUrl(), "KgRefresh", triggerId, "progress", {});
+
+      const outcome = await done;
+      expect(outcome.ok).toBe(false);
+      const scenario = scenarios.get(triggerId)!;
+      expect(scenario.runStatusCalls).toBeGreaterThan(0);
+      // 24 ticks plus the immediate read before the first sleep
+      expect(scenario.runStatusCalls).toBeLessThanOrEqual(25);
+      const registrations = registerRunWatchCalls.filter((id) => id === runId).length;
+      expect(registrations).toBe(1);
+      expect(scenario.runStatusCalls + scenario.findByTitleCalls + registrations).toBeLessThan(50);
+    } finally {
+      await scaledEnv.stop();
+    }
+  }, 60_000);
 
   it.each(VARIANTS.map(([label]) => label))(
     "W7: Fly backend never calls the GHA run reader (%s)",
@@ -843,9 +996,77 @@ describe("KgRefresh durable workflow", () => {
       const outcome = await done;
       expect(outcome.ok).toBe(true);
       expect(scenario.dispatchCalls).toBe(1);
+      // the run id was found late, so the watch is registered then — once
+      expect(registerRunWatchCalls.filter((id) => id === runId)).toHaveLength(1);
     },
     15_000,
   );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "W8b: a run id found by reconcile is registered in the same iteration, before the next tick sleep (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      const runId = runIdCounter++;
+      makeScenario(triggerId, {
+        dispatchOutcome: "unknown", runId: undefined, executionMode: "github-actions",
+        findByTitleResult: null,
+        runStatusSequence: [{ status: "in_progress", conclusion: null }],
+      });
+
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      await until(() => scenarios.get(triggerId)!.findByTitleCalls >= 2);
+      const scenario = scenarios.get(triggerId)!;
+      scenario.findByTitleResult = { runId };
+      // Registered by the reconcile iteration itself, not by the top of a later one: no run-status read has happened yet.
+      await until(() => registerRunWatchCalls.includes(runId));
+      expect(scenario.runStatusCalls).toBeLessThanOrEqual(1);
+
+      await resolveAwakeable(env.baseUrl(), runWatches.get(runId)!, { conclusion: "failure" });
+      const outcome = await done;
+      expect(outcome.ok).toBe(false);
+      expect(registerRunWatchCalls.filter((id) => id === runId)).toHaveLength(1);
+    },
+    15_000,
+  );
+
+  it("W8c: with the run id unknown the tick stays on the reconcile cadence, not the watch interval", async () => {
+    const cadenceWorkflow = createKgRefreshWorkflow({
+      rail,
+      kgSourceRepo: KG_SOURCE_REPO,
+      mintRunTokens: () => ({ runToken: "run-token", progressToken: "progress-token", publicationToken: "publication-token" }),
+      dispatch: dispatchFn,
+      appendJobLog: (input) => { appendJobLogCalls.push(input); },
+      closeJobLog: (jobId, status, conclusion) => { closeRowCalls.push({ jobId, status, conclusion }); },
+      getWorkflowRunStatus: getWorkflowRunStatusFn,
+      findRunByTitle: findRunByTitleFn,
+      registerRunWatch: registerRunWatchFn,
+      forgetRunWatch: forgetRunWatchFn,
+      cancelWorkflowRun: cancelWorkflowRunFn,
+      persistLastRefresh: (outcome) => { persistCalls.push(outcome); },
+      onOutcome: (kind, outcome) => { onOutcomeCalls.push({ kind, outcome }); },
+      recordDryRunOutcome: (report, outcome) => { recordedDryRuns.push({ report, outcome }); },
+      bootstrapDeadlineMs: 1_000,
+      totalDeadlineMs: 5_000,
+      watchIntervalMs: 10_000,
+      reconcileIntervalMs: 100,
+    });
+    const cadenceEnv = await startRetryEnabled([cadenceWorkflow, kgRepo]);
+    try {
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, {
+        dispatchOutcome: "unknown", runId: undefined, executionMode: "github-actions", findByTitleResult: null,
+      });
+      const outcome = await runWorkflow(cadenceEnv.baseUrl(), triggerId);
+      expect(outcome.ok).toBe(false);
+      expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("bootstrap_timeout");
+      // One lookup inside dispatch plus about ten reconcile attempts across the deadline; a 10 s tick would allow one.
+      expect(scenarios.get(triggerId)!.findByTitleCalls).toBeGreaterThanOrEqual(6);
+      expect(registerRunWatchCalls).not.toContain(undefined);
+    } finally {
+      await cadenceEnv.stop();
+    }
+  }, 30_000);
 
   it.each(VARIANTS.map(([label]) => label))(
     "W9: a rejected dispatch fails immediately and never reconciles after the dispatch (%s)",
@@ -1260,6 +1481,8 @@ describe("KgRefresh durable workflow", () => {
       closeJobLog: (jobId, status, conclusion) => { closeRowCalls.push({ jobId, status, conclusion }); },
       getWorkflowRunStatus: getWorkflowRunStatusFn,
       findRunByTitle: findRunByTitleFn,
+      registerRunWatch: registerRunWatchFn,
+    forgetRunWatch: forgetRunWatchFn,
       cancelWorkflowRun: cancelWorkflowRunFn,
       persistLastRefresh: (outcome) => { persistCalls.push(outcome); },
       onOutcome: (kind, outcome) => { onOutcomeCalls.push({ kind, outcome }); },

@@ -262,7 +262,7 @@ data root and a fixture tarball. **Always simulated:** GitHub (`postWorkflowDisp
 cancel, tarball, PR merge, commit status), the runner (the test posts the report itself), and the sidecar.
 
 Two seams are mocked because the composer hard-codes them: `postWorkflowDispatch` (the simulated GitHub) and
-`createKgRefreshWorkflow`, wrapped only to point `deps.rail` at the temp tree, shorten the 60 s watch interval to
+`createKgRefreshWorkflow`, wrapped only to point `deps.rail` at the temp tree, shorten the 10 min watch interval to
 300 ms, and pass the workflow's own `beforeGate` / `afterStageCommitted` test hooks. Restart scenarios (P3, P4)
 run on the retry-enabled disk environment (`startRetryEnabled`, then `replaceEndpoint` and a container restart),
 as the review-fix restart scenarios do, not on the two harness variants.
