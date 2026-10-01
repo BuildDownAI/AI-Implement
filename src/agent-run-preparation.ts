@@ -509,7 +509,7 @@ function mintGrant(
   bindings: readonly ModelAuthGrantBinding[],
   now: number,
   ttlMs: number,
-): { grant: ModelAuthGrantBootstrapV1 } | null {
+): { grant: ModelAuthGrantBootstrapV1 } | "exists" | null {
   const bearer = crypto.randomBytes(32).toString("base64url");
   const candidate = {
     version: 1,
@@ -527,7 +527,9 @@ function mintGrant(
   if (!parsed.ok) return null;
   const grant = parsed.value;
   const db = getDb();
-  db.transaction(() => {
+  const inserted = db.transaction(() => {
+    // An overlapping preparation of the same dispatch may have minted while this one awaited.
+    if (db.prepare("SELECT 1 FROM model_credential_grants WHERE dispatch_id = ? LIMIT 1").get(request.dispatchId)) return false;
     db.prepare(
       `INSERT INTO model_credential_grants
          (grant_id, dispatch_id, snapshot_id, project_key, backend, audience, bearer_hash, scope_json, expires_at)
@@ -548,8 +550,9 @@ function mintGrant(
        VALUES (?, ?, ?, ?, ?)`,
     );
     for (const b of grant.bindings) insert.run(grant.grantId, b.stage, b.profileId, b.profileRevision, b.ownerGeneration ?? null);
+    return true;
   }).immediate();
-  return { grant };
+  return inserted ? { grant } : "exists";
 }
 
 /** Ownership states a live dispatch may be in while still ready; a fresh preparation requires `reserved`. */
@@ -638,11 +641,12 @@ export async function prepareAgentRun(request: AgentRunRequest, deps: AgentRunPr
   }
 
   const bindings = expectedBindings(snapshot, reservations);
-  if (existingGrant) {
-    const { row } = existingGrant;
+  const reuseGrant = (existing: { row: GrantRow; bindings: StoredBinding[] }): AgentRunPreparation => {
+    const { row } = existing;
+    if (row.snapshot_id !== snapshot.snapshotId) return { status: "recovery-required", code: "grant_mismatch" };
     if (row.revoked_at !== null) return { status: "recovery-required", code: "grant_revoked" };
     if (row.expires_at <= now()) return { status: "recovery-required", code: "grant_expired" };
-    if (!sameBindings(existingGrant.bindings, bindings)) return { status: "recovery-required", code: "grant_mismatch" };
+    if (!sameBindings(existing.bindings, bindings)) return { status: "recovery-required", code: "grant_mismatch" };
     return ready(request, snapshot, reservations, true, {
       version: 1,
       audience: MODEL_AUTH_AUDIENCE,
@@ -654,13 +658,18 @@ export async function prepareAgentRun(request: AgentRunRequest, deps: AgentRunPr
       expiresAt: row.expires_at,
       bindings,
     });
-  }
+  };
+  if (existingGrant) return reuseGrant(existingGrant);
 
-  let minted: { grant: ModelAuthGrantBootstrapV1 } | null = null;
+  let minted: { grant: ModelAuthGrantBootstrapV1 } | "exists" | null = null;
   try {
     minted = mintGrant(request, snapshot, bindings, now(), deps.grantTtlMs ?? DEFAULT_GRANT_TTL_MS);
   } catch {
     minted = null;
+  }
+  if (minted === "exists") {
+    const winner = readGrant(request.dispatchId);
+    return winner ? reuseGrant(winner) : { status: "recovery-required", code: "grant_mismatch" };
   }
   if (!minted) {
     if (!releaseAll(deps.ownership, request.dispatchId, reservations)) return { status: "recovery-required", code: "release_failed" };

@@ -251,6 +251,17 @@ describe("snapshot immutability and idempotence", () => {
     expect(again.takeBootstrap()).toBeUndefined();
   });
 
+  it("mints exactly one grant when two preparations of one dispatch overlap", async () => {
+    const [a, b] = await Promise.all([prep.prepareAgentRun(request(), deps), prep.prepareAgentRun(request(), deps)]);
+    const ra = ready(a);
+    const rb = ready(b);
+    expect(rows("model_credential_grants").filter((x) => x.dispatch_id === "d1")).toHaveLength(1);
+    expect(ra.grant.grantId).toBe(rb.grant.grantId);
+    const bootstraps = [ra.takeBootstrap(), rb.takeBootstrap()].filter((x) => x !== undefined);
+    expect(bootstraps).toHaveLength(1);
+    expect([ra.reused, rb.reused].sort()).toEqual([false, true]);
+  });
+
   it("reuses a stored snapshot even after the project is opted out", async () => {
     const first = ready(await prep.prepareAgentRun(request(), deps));
     store.setProjectOptIn("AII", false);
