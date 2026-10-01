@@ -65,11 +65,11 @@ describe("claude-implement.yml template — runner_phase and runner_callback_url
     expect(inputs.run_progress_token.required).toBe(false);
   });
 
-  it("delivers RUN_PROGRESS_TOKEN via $GITHUB_ENV, not a shadowing step env (regression guard)", () => {
-    expect(getPipelineStep().env).not.toHaveProperty("RUN_PROGRESS_TOKEN");
+  it("delivers RUN_PROGRESS_TOKEN to the Run pipeline step from the bootstrap step output (regression guard)", () => {
+    expect(getPipelineStep().env.RUN_PROGRESS_TOKEN).toContain("steps.bootstrap.outputs.run_progress_token");
     const mask = getMaskStep();
     expect(mask.run).toContain("RUN_PROGRESS_TOKEN");
-    expect(mask.run).toContain("GITHUB_ENV");
+    expect(mask.run).toContain("GITHUB_OUTPUT");
   });
 
   it("masks run_progress_token in the Mask runner callback tokens step (regression guard)", () => {
