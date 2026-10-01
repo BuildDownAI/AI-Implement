@@ -860,6 +860,64 @@ describe("session/entrypoint.sh configured model-auth bootstrap", () => {
     }
   });
 
+  describe("node preload/module-path controls", () => {
+    const probe = () => {
+      const dir = mkdtempSync(join(tmpdir(), "entrypoint-preload-"));
+      tempDirs.push(dir);
+      const marker = join(dir, "marker");
+      const preload = join(dir, "preload.cjs");
+      writeFileSync(preload, `require("node:fs").appendFileSync(${JSON.stringify(marker)}, "ran\\n");\n`);
+      return { marker, nodeEnv: { NODE_OPTIONS: `--require=${preload}`, NODE_PATH: "/sentinel/node-path" } };
+    };
+    const alias = (nodeEnv: Record<string, string>) => ({
+      AI_IMPLEMENT_TEAM_SECRET_PREFIX: "SAN_",
+      SAN_NODE_OPTIONS: nodeEnv.NODE_OPTIONS,
+      SAN_NODE_PATH: nodeEnv.NODE_PATH,
+      SAN_REPO_SAFE_SECRET: "safe-repo-value",
+    });
+
+    it("never runs a preload for a valid configured run, and the handoff carries neither bare nor aliased controls", () => {
+      const { marker, nodeEnv } = probe();
+      const envelope = configuredEnvelope();
+      const { result, sections, output } = run({ AI_IMPLEMENT_RUN_CONFIG: envelope, ...nodeEnv, ...alias(nodeEnv) });
+      expect(result.status, output).toBe(0);
+      expect(existsSync(marker)).toBe(false);
+      const handoff = sections.find((s) => s.startsWith("dbus-run-session "))!;
+      expect(handoff).toContain(`AI_IMPLEMENT_RUN_CONFIG=${envelope}`);
+      expect(handoff).not.toMatch(/^NODE_OPTIONS=/m);
+      expect(handoff).not.toMatch(/^NODE_PATH=/m);
+      expect(handoff).not.toMatch(/^SAN_NODE_/m);
+      expect(handoff).toMatch(/^AI_IMPLEMENT_FORWARDED_SECRETS=REPO_SAFE_SECRET$/m);
+      expect(handoff).toContain("REPO_SAFE_SECRET=safe-repo-value");
+      for (const s of sections.filter((c) => /^(git|gh) /.test(c))) expect(s).not.toMatch(/^NODE_(OPTIONS|PATH)=/m);
+    });
+
+    it.each([
+      ["truncated JSON", () => configuredEnvelope().slice(0, -16)],
+      ["invalid base64/JSON", () => "%%%not-base64-json%%%"],
+    ])("never runs a preload for a malformed envelope (%s) and stops before git", (_n, make) => {
+      const { marker, nodeEnv } = probe();
+      const { result, children, output } = run({ AI_IMPLEMENT_RUN_CONFIG: make(), ...nodeEnv, ...alias(nodeEnv) });
+      expect(result.status).toBe(1);
+      expect(output).toContain("FATAL: Configured model-auth bootstrap is invalid or incomplete");
+      expect(children).toBe("");
+      expect(existsSync(marker)).toBe(false);
+    });
+
+    it("legacy runs keep their node controls at the handoff but still decode without running a preload", () => {
+      const { marker, nodeEnv } = probe();
+      const envelope = encode({ v: 1, issue, prNumber: "7" });
+      const { result, sections, output } = run({
+        AI_IMPLEMENT_RUN_CONFIG: envelope, ANTHROPIC_API_KEY: "legacy-key", ...nodeEnv, ...alias(nodeEnv),
+      });
+      expect(result.status, output).toBe(0);
+      expect(existsSync(marker)).toBe(false);
+      const handoff = sections.find((s) => s.startsWith("dbus-run-session "))!;
+      expect(handoff).toContain(`NODE_OPTIONS=${nodeEnv.NODE_OPTIONS}`);
+      expect(handoff).toContain("NODE_PATH=/sentinel/node-path");
+    });
+  });
+
   it("logs a fixed ERR-trap message, without the failing command text, on configured runs", () => {
     const envelope = configuredEnvelope();
     const configured = run({ AI_IMPLEMENT_RUN_CONFIG: envelope }, { failClone: true });

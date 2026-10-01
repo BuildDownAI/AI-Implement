@@ -438,10 +438,24 @@ describe("configured runs and selected authentication (AII-951)", () => {
     expect(modelProcessEnv(false, { env: { CODEX_API_KEY: "SYNTHETIC-selected" } }).CODEX_API_KEY).toBe("SYNTHETIC-selected");
   });
 
-  it("selected auth restores GitHub write tokens only for repository-owning sessions", () => {
+  it("selected auth never restores ambient GitHub or runner credentials for either write flag", () => {
+    process.env.GH_TOKEN = "SENTINEL-ambient-gh";
+    process.env.RUN_PUBLICATION_TOKEN = "SENTINEL-publication";
+    process.env.RUN_PROGRESS_TOKEN = "SENTINEL-progress";
     const selected = { PATH: "/usr/bin", CODEX_API_KEY: "SYNTHETIC-selected" };
+    for (const allow of [false, true]) {
+      const env = modelProcessEnv(allow, { env: selected });
+      expect(env).toEqual(selected);
+      expect(JSON.stringify(env)).not.toContain("SENTINEL");
+    }
+  });
+
+  it("selected auth keeps a GitHub write token only when the trusted selected env carries it and writes are allowed", () => {
+    const selected = { PATH: "/usr/bin", CODEX_API_KEY: "SYNTHETIC-selected", GITHUB_TOKEN: "SYNTHETIC-selected-gh", RUN_TOKEN: "x" };
     expect(modelProcessEnv(false, { env: selected })).not.toHaveProperty("GITHUB_TOKEN");
-    expect(modelProcessEnv(true, { env: selected }).GITHUB_TOKEN).toBe("SENTINEL-gh");
+    const env = modelProcessEnv(true, { env: selected });
+    expect(env.GITHUB_TOKEN).toBe("SYNTHETIC-selected-gh");
+    expect(env).not.toHaveProperty("RUN_TOKEN");
   });
 
   it("without selected auth modelProcessEnv keeps its legacy output", () => {

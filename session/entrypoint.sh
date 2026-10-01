@@ -61,9 +61,9 @@ else
   require_env GITHUB_TOKEN GITHUB_OWNER GITHUB_REPO
 fi
 export GITHUB_OWNER GITHUB_REPO
-[ -z "${PR_NUMBER:-}" ] && [ -n "${AI_IMPLEMENT_RUN_CONFIG:-}" ] && PR_NUMBER="$(node -e "try{const c=JSON.parse(Buffer.from(process.env.AI_IMPLEMENT_RUN_CONFIG,'base64').toString());process.stdout.write(String(c.prNumber||''))}catch{}" 2>/dev/null||true)"
+[ -z "${PR_NUMBER:-}" ] && [ -n "${AI_IMPLEMENT_RUN_CONFIG:-}" ] && PR_NUMBER="$(run_node -e "try{const c=JSON.parse(Buffer.from(process.env.AI_IMPLEMENT_RUN_CONFIG,'base64').toString());process.stdout.write(String(c.prNumber||''))}catch{}" 2>/dev/null||true)"
 export PR_NUMBER="${PR_NUMBER:-}"
-_kg_r="$(if [ -n "${AI_IMPLEMENT_RUN_CONFIG:-}" ]; then node -e "try{const c=JSON.parse(Buffer.from(process.env.AI_IMPLEMENT_RUN_CONFIG,'base64').toString());process.stdout.write(c.kgSourceRepo||'')}catch{}" 2>/dev/null; fi)"
+_kg_r="$(if [ -n "${AI_IMPLEMENT_RUN_CONFIG:-}" ]; then run_node -e "try{const c=JSON.parse(Buffer.from(process.env.AI_IMPLEMENT_RUN_CONFIG,'base64').toString());process.stdout.write(c.kgSourceRepo||'')}catch{}" 2>/dev/null; fi)"
 [ -n "${_kg_r:-}" ] && { GITHUB_OWNER="${_kg_r%%/*}"; GITHUB_REPO="${_kg_r#*/}"; }
 # ── 3. Token acquisition ─────────────────────────────────────────────────────
 export GH_TOKEN="$GITHUB_TOKEN"
@@ -77,8 +77,8 @@ if [ -z "${GITHUB_DEFAULT_BRANCH:-}" ]; then
   fi
 fi
 export GITHUB_DEFAULT_BRANCH
-[ -n "${_kg_r:-}" ] && _kg_ref="$(node -e 'try{const c=JSON.parse(Buffer.from(process.env.AI_IMPLEMENT_RUN_CONFIG,"base64").toString());process.stdout.write(c.kgSourceRef||"")}catch(e){}' 2>/dev/null||true)" && [ -n "$_kg_ref" ] && { log "run_config.kgSourceRef=${_kg_ref}"; GITHUB_DEFAULT_BRANCH="$_kg_ref"; export GITHUB_DEFAULT_BRANCH; }
-[ -z "${PR_NUMBER:-}" ] && [ -n "${AI_IMPLEMENT_RUN_CONFIG:-}" ] && _rb="$(node -e 'try{const c=JSON.parse(Buffer.from(process.env.AI_IMPLEMENT_RUN_CONFIG,"base64").toString());process.stdout.write(c.baseBranch||"")}catch(e){}' 2>/dev/null||true)" && [ -n "$_rb" ] && { log "run_config.baseBranch=${_rb}"; GITHUB_DEFAULT_BRANCH="$_rb"; }
+[ -n "${_kg_r:-}" ] && _kg_ref="$(run_node -e 'try{const c=JSON.parse(Buffer.from(process.env.AI_IMPLEMENT_RUN_CONFIG,"base64").toString());process.stdout.write(c.kgSourceRef||"")}catch(e){}' 2>/dev/null||true)" && [ -n "$_kg_ref" ] && { log "run_config.kgSourceRef=${_kg_ref}"; GITHUB_DEFAULT_BRANCH="$_kg_ref"; export GITHUB_DEFAULT_BRANCH; }
+[ -z "${PR_NUMBER:-}" ] && [ -n "${AI_IMPLEMENT_RUN_CONFIG:-}" ] && _rb="$(run_node -e 'try{const c=JSON.parse(Buffer.from(process.env.AI_IMPLEMENT_RUN_CONFIG,"base64").toString());process.stdout.write(c.baseBranch||"")}catch(e){}' 2>/dev/null||true)" && [ -n "$_rb" ] && { log "run_config.baseBranch=${_rb}"; GITHUB_DEFAULT_BRANCH="$_rb"; }
 run_scoped "" git config --global user.name "ai-implement-bot"
 run_scoped "" git config --global user.email "ai-implement-bot@users.noreply.github.com"
 run_scoped "" git config --global init.defaultBranch "$GITHUB_DEFAULT_BRANCH"
@@ -133,4 +133,6 @@ export RUNNER_PHASE
 RUNNER_ENTRY="$(select_runner_entry "$RUNNER_PHASE")"
 [ "$RUNNER_PHASE" = "kg-refresh" ] && export RUNNER_CALLBACK_URL RUN_PROGRESS_TOKEN
 log "Invoking TS pipeline (node /app/dist/$RUNNER_ENTRY, phase=$RUNNER_PHASE, source=$RUNNER_PHASE_SOURCE)..."
+# Configured: no ambient node preload/module path (bare or alias-restored) may meet the protected envelope.
+[ "$CONFIGURED" != "1" ] || unset NODE_OPTIONS NODE_PATH
 exec dbus-run-session -- su -p coder -c "HOME=/home/coder exec node /app/dist/$RUNNER_ENTRY"

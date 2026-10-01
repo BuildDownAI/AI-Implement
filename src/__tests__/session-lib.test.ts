@@ -412,5 +412,77 @@ describe.skipIf(isWindows)("session/lib.sh configured-run helpers (AII-951)", ()
       expect(r.stdout).toContain("AI_IMPLEMENT_MODEL_AUTH_BEARER=UNSET");
       expect(r.stdout).toContain("AI_IMPLEMENT_RUN_CONFIG=UNSET");
     });
+
+    it("configured runs reserve NODE_OPTIONS/NODE_PATH aliases; legacy runs keep forwarding them", () => {
+      const env = {
+        AI_IMPLEMENT_TEAM_SECRET_PREFIX: "SAN_",
+        SAN_NODE_OPTIONS: "--require=/sentinel/preload.cjs",
+        SAN_NODE_PATH: "/sentinel/modules",
+        SAN_DB_URL: "safe-value",
+      };
+      const script = (c: boolean) =>
+        `${c ? "CONFIGURED=1\n" : ""}remap_team_secrets\necho "F=$AI_IMPLEMENT_FORWARDED_SECRETS"\necho "NO=\${NODE_OPTIONS:-UNSET}"\necho "NP=\${NODE_PATH:-UNSET}"\necho "DB=$DB_URL"`;
+      const configured = run(script(true), env);
+      expect(configured.stdout).toContain("F=DB_URL\n");
+      expect(configured.stdout).toContain("NO=UNSET");
+      expect(configured.stdout).toContain("NP=UNSET");
+      expect(configured.stdout).toContain("DB=safe-value");
+      const legacy = run(script(false), env);
+      expect(legacy.stdout).toContain("NO=--require=/sentinel/preload.cjs");
+      expect(legacy.stdout).toContain("NP=/sentinel/modules");
+    });
+  });
+
+  describe("node decoders never start with ambient preload controls", () => {
+    const withFixture = (fn: (fx: { dist: string; preload: string; marker: string }) => void) => {
+      const dir = mkdtempSync(join(tmpdir(), "session-node-"));
+      try {
+        const dist = join(dir, "dist");
+        mkdirSync(dist);
+        const marker = join(dir, "marker");
+        const preload = join(dir, "preload.cjs");
+        writeFileSync(preload, `require("node:fs").writeFileSync(${JSON.stringify(marker)}, String(Boolean(process.env.AI_IMPLEMENT_RUN_CONFIG)));\n`);
+        // Stand-in trusted decoder: this suite probes launch hygiene, not decoding.
+        writeFileSync(join(dist, "run-config.js"),
+          'export function decodeTrustedRunConfig(e){ if (e === "BAD") throw new Error("bad"); return { agentConfig: {}, credentials: { modelAuthGrant: {} } }; }\n');
+        fn({ dist, preload, marker });
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    };
+    const run = (script: string, env: Record<string, string>) =>
+      spawnSync("bash", ["-c", `source session/lib.sh\n${script}`], { encoding: "utf-8", env: { PATH: process.env.PATH ?? "", ...env } });
+
+    it("control: the preload does execute when node is launched bare", () => {
+      withFixture(({ preload, marker }) => {
+        spawnSync("node", ["-e", ""], { env: { PATH: process.env.PATH ?? "", NODE_OPTIONS: `--require=${preload}`, AI_IMPLEMENT_RUN_CONFIG: "X" } });
+        expect(existsSync(marker)).toBe(true);
+      });
+    });
+
+    it.each([["valid configured", "OK", "configured"], ["malformed", "BAD", "invalid"]])(
+      "classify_run_config (%s) runs no NODE_OPTIONS preload and ignores NODE_PATH",
+      (_n, envelope, expected) => {
+        withFixture(({ dist, preload, marker }) => {
+          const r = run("classify_run_config", {
+            AI_IMPLEMENT_DIST_DIR: dist, AI_IMPLEMENT_RUN_CONFIG: envelope,
+            NODE_OPTIONS: `--require=${preload}`, NODE_PATH: "/sentinel/modules",
+          });
+          expect(r.stdout.trim()).toBe(expected);
+          expect(existsSync(marker)).toBe(false);
+        });
+      },
+    );
+
+    it("resolve_envelope_field runs no NODE_OPTIONS preload", () => {
+      withFixture(({ preload, marker }) => {
+        const envelope = Buffer.from(JSON.stringify({ v: 1, runnerPhase: "planning" })).toString("base64");
+        const r = run("resolve_envelope_field RUNNER_PHASE runnerPhase\necho \"P=$RUNNER_PHASE\"", {
+          AI_IMPLEMENT_RUN_CONFIG: envelope, NODE_OPTIONS: `--require=${preload}`,
+        });
+        expect(r.stdout).toContain("P=planning");
+        expect(existsSync(marker)).toBe(false);
+      });
+    });
   });
 });

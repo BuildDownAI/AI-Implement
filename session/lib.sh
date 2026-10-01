@@ -6,6 +6,13 @@ log() {
   echo "[session] $(date -u +%Y-%m-%dT%H:%M:%SZ) $*"
 }
 
+# Launch node without ambient preload/module-path controls. Every shell-owned node child
+# (envelope decoders) goes through this: a NODE_OPTIONS=--require preload would otherwise run
+# with the protected envelope in its environment before any classification happened.
+run_node() {
+  env -u NODE_OPTIONS -u NODE_PATH node "$@"
+}
+
 fail() {
   log "FATAL: $*" >&2
   exit 1
@@ -92,7 +99,7 @@ resolve_envelope_field() {
   # substitution strips trailing newlines — putting the (possibly empty)
   # value last would make it indistinguishable from a value that never had
   # a separator.
-  out="$(node -e "try{const c=JSON.parse(Buffer.from(process.env.AI_IMPLEMENT_RUN_CONFIG,'base64').toString());const v=c['$key'];process.stdout.write((typeof v==='string'?v:'')+'\nok')}catch(e){process.stdout.write('\nerr')}" 2>/dev/null || echo $'\nerr')"
+  out="$(run_node -e "try{const c=JSON.parse(Buffer.from(process.env.AI_IMPLEMENT_RUN_CONFIG,'base64').toString());const v=c['$key'];process.stdout.write((typeof v==='string'?v:'')+'\nok')}catch(e){process.stdout.write('\nerr')}" 2>/dev/null || echo $'\nerr')"
   status="${out##*$'\n'}"
   val="${out%$'\n'*}"
   if [ "$status" != "ok" ]; then
@@ -116,7 +123,7 @@ resolve_envelope_field() {
 # Never prints decoded values or decoder error text. AI_IMPLEMENT_DIST_DIR is a test seam.
 classify_run_config() {
   [ -z "${AI_IMPLEMENT_RUN_CONFIG:-}" ] && { echo legacy; return 0; }
-  node --input-type=module -e '
+  run_node --input-type=module -e '
     const out = (w) => process.stdout.write(w);
     try {
       const dir = process.env.AI_IMPLEMENT_DIST_DIR || "/app/dist";
@@ -200,11 +207,12 @@ _remap_is_reserved() {
     ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN|SESSION_TOKEN|MACHINE_NONCE) return 0 ;;
     RUN_TOKEN|ORCHESTRATOR_URL|RUNNER_CALLBACK_URL|WORKSPACE_DIR|PATH|HOME) return 0 ;;
   esac
-  # Configured (opted-in) runs also reserve every model credential, session/auth-directory
-  # and provider-routing name. Legacy runs keep the narrower list above on purpose.
+  # Configured (opted-in) runs also reserve every model credential, session/auth-directory,
+  # provider-routing and node preload/module-path name. Legacy runs keep the narrower list above on purpose.
   if [ "${CONFIGURED:-0}" = "1" ]; then
     case "$1" in
       OPENAI_*|CODEX_*|ANTHROPIC_*|CLAUDE_*|AWS_*|RUN_*|RUNNER_*|NPM_TOKEN|CLOUD_ML_REGION|GOOGLE_APPLICATION_CREDENTIALS) return 0 ;;
+      NODE_OPTIONS|NODE_PATH) return 0 ;;
     esac
   fi
   return 1

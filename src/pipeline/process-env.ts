@@ -175,6 +175,8 @@ export function modelProcessEnv(
  * safe context plus that credential). It is copied, never merged with process.env, so no
  * other profile's credential, bootstrap, callback or install secret can ride along.
  * Defensive deletes repeat the protected names in case a caller hands in a wider map.
+ * `allowRepositoryWrites` only decides whether GitHub write tokens already present in
+ * `selected` survive; ambient process.env GitHub credentials are never restored.
  * Forwarded-secret names are deliberately not stripped here: a forwarded secret that
  * collides with the selected credential's name must not remove the selection.
  *
@@ -188,15 +190,11 @@ function selectedModelEnv(
   const env: NodeJS.ProcessEnv = { ...selected };
   for (const key of RUNNER_CREDENTIAL_KEYS) delete env[key];
   for (const key of INSTALL_CREDENTIAL_KEYS) delete env[key];
-  for (const key of GITHUB_WRITE_CREDENTIAL_KEYS) delete env[key];
+  if (!allowRepositoryWrites) {
+    for (const key of GITHUB_WRITE_CREDENTIAL_KEYS) delete env[key];
+  }
   delete env.AI_IMPLEMENT_FORWARDED_SECRETS;
   deleteBootstrapKeys(env);
-  if (allowRepositoryWrites) {
-    for (const key of GITHUB_WRITE_CREDENTIAL_KEYS) {
-      const value = process.env[key];
-      if (value !== undefined) env[key] = value;
-    }
-  }
   return env;
 }
 
