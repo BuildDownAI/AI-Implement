@@ -23,7 +23,7 @@ import {
   type StaleAdmissionCandidate,
 } from "./dispatch-admission.js";
 import { reconcileFilesystemFailures } from "./filesystem-ticket-lifecycle.js";
-import { dispatchWorkflow, postWorkflowDispatch, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, getPullRequestState, buildEnvelopeDispatchInputs, postPrComment, defaultFetchSignal, getRepoDefaultBranch, fetchRepoTarball, mergePullRequest, closePullRequest, deleteBranch, postOrUpdateStickyComment, setCommitStatus, cancelWorkflowRun, type DispatchInputs } from "./github.js";
+import { dispatchWorkflow, postWorkflowDispatch, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, getPullRequestState, buildEnvelopeDispatchInputs, assertPrivateTransportForCredentials, postPrComment, defaultFetchSignal, getRepoDefaultBranch, fetchRepoTarball, mergePullRequest, closePullRequest, deleteBranch, postOrUpdateStickyComment, setCommitStatus, cancelWorkflowRun, type DispatchInputs } from "./github.js";
 import { resolveWorkflowCapabilities, type WorkflowContract } from "./workflow-probe.js";
 import { surfaceDispatchFailure } from "./dispatch-failure.js";
 import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
@@ -107,7 +107,7 @@ import {
 import { clearPrNotFoundGrace, decideCleanExitOutcome, shouldSkipCompletionNotice, workflowFileForJob } from "./monitor-status.js";
 import type { RunPrCandidate, RunPrMatch } from "./monitor-status.js";
 import { pickPrForRun } from "./monitor-status.js";
-import { type RunConfigV1, encodeRunConfig, buildImplRunConfig } from "./run-config.js";
+import { type RunConfigV1, type RunCredentialsV1, encodeRunConfig, decodeRunConfig, decodeTrustedRunConfig, buildImplRunConfig } from "./run-config.js";
 import { resolveBaseBranch, findOpenRollUpPr, resolvePlanningBranch } from "./feature-branch.js";
 import { validateIssueBaseBranch, postBranchComment } from "./base-branch.js";
 import { runMergeUps, clearRollUpHandledMarkersByIdentifier } from "./merge-up.js";
@@ -1114,6 +1114,10 @@ export async function dispatchGitHubActions(
   /** The validated "AI-Implement Base Branch" field value, or null when unset. Distinct
    *  from baseBranch, which also covers the feature-branch-grouping fallback. */
   baseBranchFieldValue: string | null,
+  /** Typed trusted-preparation seam (AII-958 composes it): private credentials such as a
+   *  model-auth grant. Requires supportsPrivateRunConfig at the exact workflow/ref; an
+   *  unsupported reader fails before launch rather than dropping them. */
+  trustedCredentials?: RunCredentialsV1,
 ): Promise<void> {
   // Final admission authority: one transaction reserves team capacity and per-issue
   // occupancy before any credential mint or launch call. canDispatch (checked earlier,
@@ -1180,6 +1184,10 @@ export async function dispatchGitHubActions(
         ref: mapping.defaultBranch,
       });
       const { contract } = workflowCapabilities;
+      assertPrivateTransportForCredentials(
+        trustedCredentials, workflowCapabilities,
+        `${mapping.owner}/${mapping.repo}/${mapping.workflowFile}@${mapping.defaultBranch}`,
+      );
       const runPublicationToken = contract === "envelope"
         && workflowCapabilities.supportsRunPublicationToken
         && dispatchId
@@ -1205,6 +1213,8 @@ export async function dispatchGitHubActions(
             runToken,
             runProgressToken,
             runPublicationToken,
+            privateTransport: workflowCapabilities.supportsPrivateRunConfig === true,
+            credentials: trustedCredentials,
             runnerImage,
             groupingParent: isGroupingParentDispatch(issue) || undefined,
             retryPolicy: getRetryPolicy(),
@@ -1346,6 +1356,9 @@ export type PlanningDispatchContext = {
    *  resolvedPlanningBranch, which may instead resolve to the feature-branch chain
    *  target or fall back to the mapping default. */
   planningFieldValue: string | null;
+  /** Typed trusted-preparation seam (AII-958): private credentials for the planning run. Planning
+   *  never receives publication authority; requires supportsPrivateRunConfig or fails pre-launch. */
+  trustedCredentials?: RunCredentialsV1;
 };
 
 /**
@@ -3814,6 +3827,7 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
               runToken,
               runProgressToken,
               runPublicationToken,
+              privateTransport: reviewFixCapabilities.supportsPrivateRunConfig === true,
               runnerImage,
               retryPolicy: getRetryPolicy(),
             })
