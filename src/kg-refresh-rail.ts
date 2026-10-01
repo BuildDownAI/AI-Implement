@@ -117,6 +117,8 @@ export interface RailContext {
   snapshotCommitSha?: string | null;
   wasFirstRun?: boolean;
   sourceDir?: string;
+  /** The exact `COMPLETION_MARKER` content `stageGate` wrote — the identity of this run's overlay. */
+  stagedAt?: string;
   detail?: string;
 }
 
@@ -215,6 +217,7 @@ export async function stageGate(deps: KgRailDeps, input: RailContext): Promise<R
   const { stagingDir } = railPaths(deps.dataRoot);
   if (!input.sourceDir) throw new RailGateError("staging", "staging failed before any swap: no fetched source directory");
   const sourceDir = input.sourceDir;
+  const stagedAt = new Date().toISOString();
   try {
     // KGB-9's contract: this copies committed vectors and hard-fails on a stamp mismatch
     // or missing artifact. Nothing embeds — ever.
@@ -234,24 +237,48 @@ export async function stageGate(deps: KgRailDeps, input: RailContext): Promise<R
     if (existsSync(join(sourceDir, "sources.yml"))) {
       await copyFile(join(sourceDir, "sources.yml"), join(stagingDir, "sources.yml"));
     }
-    await writeFile(join(stagingDir, COMPLETION_MARKER), new Date().toISOString());
+    await writeFile(join(stagingDir, COMPLETION_MARKER), stagedAt);
   } catch (err) {
     throw new RailGateError("staging", `staging failed before any swap: ${String(err)}`);
   }
-  return input;
+  return { ...input, stagedAt };
+}
+
+/** Removes `staging/` (the compensation for a failed fetch or stage). Safe to run twice. */
+export async function discardStaging(deps: Pick<KgRailDeps, "dataRoot">): Promise<void> {
+  await rm(railPaths(deps.dataRoot).stagingDir, { recursive: true, force: true });
+}
+
+/** The `COMPLETION_MARKER` content of an overlay directory, or `null` when absent or unreadable. */
+async function readMarker(dir: string): Promise<string | null> {
+  try {
+    return await readFile(join(dir, COMPLETION_MARKER), "utf8");
+  } catch {
+    return null;
+  }
 }
 
 /**
- * `current` → `previous`, `staging` → `current`, then restart the sidecar. `current` only
- * ever changes by renaming a fully staged directory — no failure handling here is
- * deliberate: a thrown error propagates uncaught out of `runRail`, exactly as it did out of
- * `runRefresh` (the caller's generic catch-all classifies it, matching production today).
+ * `current` → `previous`, `staging` → `current`, then restart the sidecar. Safe to replay: a
+ * step that ran partway (or fully, then failed at the restart) is run again by Restate, so each
+ * move is skipped once its effect is visible. With `staging/` gone, a `current/` whose marker
+ * equals `input.stagedAt` means the swap already happened; any other `current/` means the
+ * staged overlay is lost and a plain `Error` is thrown (not a `RailGateError`, so no revert).
+ * `previous/` is removed only immediately before the `current` → `previous` rename, so a replay
+ * between the two renames does not delete the old overlay.
  */
 export async function swapGate(deps: KgRailDeps, input: RailContext): Promise<RailContext> {
   const { currentDir, previousDir, stagingDir } = railPaths(deps.dataRoot);
-  await rm(previousDir, { recursive: true, force: true });
-  if (existsSync(currentDir)) await rename(currentDir, previousDir);
-  await rename(stagingDir, currentDir);
+  if (existsSync(stagingDir)) {
+    if (existsSync(currentDir)) {
+      await rm(previousDir, { recursive: true, force: true });
+      await rename(currentDir, previousDir);
+    }
+    await rename(stagingDir, currentDir);
+  } else {
+    const marker = await readMarker(currentDir);
+    if (marker === null || marker !== input.stagedAt) throw new Error("staged overlay is missing");
+  }
   await deps.sidecar.restart();
   return input;
 }
@@ -329,16 +356,23 @@ export async function verifyGate(deps: KgRailDeps, input: RailContext): Promise<
 /**
  * Compensation for a reverted rail: the failed overlay must stop serving before this
  * reports. With no previous overlay, deleting current falls back to the baked graph —
- * today's behaviour. Mirrors `runRefresh`'s inline `revert(...)` exactly.
+ * today's behaviour. Safe to replay: only an overlay whose marker equals `stagedAt` (this
+ * run's) is ever moved, and one already in `rejected/` is left there. A `current/` that is
+ * not this run's overlay (or a null `stagedAt`) is never moved.
  */
 export async function revertRail(
   deps: KgRailDeps,
-  input: { namespace: string | null; gate: RefreshGate; detail: string; stampBefore: string | null },
+  input: { namespace: string | null; gate: RefreshGate; detail: string; stampBefore: string | null; stagedAt: string | null },
 ): Promise<RefreshOutcome> {
   const { currentDir, previousDir, rejectedDir } = railPaths(deps.dataRoot);
-  await rm(rejectedDir, { recursive: true, force: true });
-  if (existsSync(currentDir)) await rename(currentDir, rejectedDir);
-  if (existsSync(previousDir)) await rename(previousDir, currentDir);
+  const { stagedAt } = input;
+  if (stagedAt !== null && (await readMarker(rejectedDir)) === stagedAt) {
+    // already rejected by an earlier attempt
+  } else if (stagedAt !== null && (await readMarker(currentDir)) === stagedAt) {
+    await rm(rejectedDir, { recursive: true, force: true });
+    await rename(currentDir, rejectedDir);
+  }
+  if (!existsSync(currentDir) && existsSync(previousDir)) await rename(previousDir, currentDir);
   await deps.sidecar.restart();
   const servedNow = await readServedStamp(deps, input.namespace);
   const outcome: RefreshOutcome = {
@@ -419,6 +453,7 @@ export async function runRail(deps: KgRailDeps, input: RailContext = {}): Promis
         gate: err.gate,
         detail: err.detail,
         stampBefore: ctx.stampBefore ?? null,
+        stagedAt: ctx.stagedAt ?? null,
       });
     }
     throw err;

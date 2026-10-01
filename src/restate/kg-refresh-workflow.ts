@@ -28,6 +28,7 @@ import {
   closeSnapshotPr,
   deleteSnapshotBranch,
   fetchGate,
+  discardStaging,
   mergeSnapshotPr,
   postDryRunReport,
   revertRail,
@@ -150,8 +151,8 @@ export interface KgRefreshWorkflowDependencies {
    *  definitive gate-failure result (correct for a real staging failure, wrong for
    *  simulating an infra crash), so the injected fault needs a step of its own, positioned
    *  after "stage" is already committed, to get a genuine (retryable) engine failure instead.
-   *  It cannot move onto a rail fake: "swap" is not idempotent (it renames staging into
-   *  current), so a crash inside "swap" cannot be retried, and "stage" itself would re-run.
+   *  It cannot move onto a rail fake: a crash inside "stage" would re-run "stage" itself.
+   *  ("swap" and "revert" are safe to replay — they key off the marker `stageGate` wrote.)
    *  Production leaves this unset; `createProductionKgRefreshServices` is asserted to. */
   afterStageCommitted?(): void | Promise<void>;
 }
@@ -529,6 +530,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
 
       let railCtx: RailContext = {};
       let gateFailure: { gate: RefreshGate; detail: string } | null = null;
+      let failedGate: string | null = null;
       const gates: Array<[string, (rail: KgRailDeps, input: RailContext) => Promise<RailContext>]> = [
         ["fetch", fetchGate],
         ["stage", stageGate],
@@ -540,6 +542,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         const result = await runGate(ctx, name, gate, railCtx);
         if (!result.ok) {
           gateFailure = { gate: result.gate, detail: result.detail };
+          failedGate = name;
           break;
         }
         railCtx = result.railCtx;
@@ -567,6 +570,21 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         }
       }
 
+      if (gateFailure && (failedGate === "fetch" || failedGate === "stage")) {
+        // Nothing was swapped: only staging/ needs removing. Reverting here would move the
+        // healthy current/ aside and put an older overlay into service.
+        ctx.set("step", "discard-staging");
+        await ctx.run("discard-staging", () => discardStaging(deps.rail));
+        ctx.set("step", "failed");
+        const at = await ctx.date.now();
+        const stampBefore = railCtx.stampBefore ?? null;
+        const outcome = await failurePath(
+          { ok: false, at, gate: gateFailure.gate, detail: gateFailure.detail, stampBefore, stampAfter: stampBefore },
+          gateFailure.gate,
+        );
+        return finish(outcome);
+      }
+
       if (gateFailure) {
         ctx.set("step", "revert");
         const revertOutcome = await ctx.run("revert", () => revertRail(deps.rail, {
@@ -574,6 +592,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           gate: gateFailure!.gate,
           detail: gateFailure!.detail,
           stampBefore: railCtx.stampBefore ?? null,
+          stagedAt: railCtx.stagedAt ?? null,
         }));
         ctx.set("step", "failed");
         const outcome = await failurePath(revertOutcome, gateFailure.gate);
