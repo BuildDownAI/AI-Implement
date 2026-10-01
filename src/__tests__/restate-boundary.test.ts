@@ -188,11 +188,19 @@ function definitionBlockFor(identifier: string, source: string): string {
 // ---- AII-717: a static proxy for "this write's side effect is journaled and can't be
 // re-delivered" — reading the actual retryPolicy/ctx.run wiring back out of a compiled Restate
 // handler isn't practical from a unit test, so this checks the source text directly. It fails
-// if either `ctx.run(` or `retryPolicy` is removed from any one `role: "admin"` handler's
-// definition (the acceptance-criterion regression this test exists to catch).
-describe("every role: \"admin\" handler wraps its side effect in ctx.run under a retryPolicy (AII-717)", () => {
+// if either `ctx.run(` or `retryPolicy` is removed from any one declared write handler's
+// definition (the acceptance-criterion regression this test exists to catch). Admin reads are
+// explicit `operation: "read"` handlers and intentionally excluded from this write rail.
+describe("every declared write handler wraps its side effect in ctx.run under a retryPolicy (AII-717)", () => {
   const handlerEntries = extractHandlerEntries(TOOLS_SOURCE);
-  const writeEntries = handlerEntries.filter(({ identifier }) => /role:\s*"admin"/.test(definitionBlockFor(identifier, TOOLS_SOURCE)));
+  const writeEntries = handlerEntries.filter(({ identifier }) => {
+    const block = definitionBlockFor(identifier, TOOLS_SOURCE);
+    return /role:\s*"admin"/.test(block) && !/operation:\s*"read"/.test(block);
+  });
+  const adminReadEntries = handlerEntries.filter(({ identifier }) => {
+    const block = definitionBlockFor(identifier, TOOLS_SOURCE);
+    return /role:\s*"admin"/.test(block) && /operation:\s*"read"/.test(block);
+  });
 
   it("found the six documented write handlers as role: \"admin\" (not zero, not accidentally all of them)", () => {
     expect(writeEntries.map((e) => e.toolName).sort()).toEqual(
@@ -209,7 +217,17 @@ describe("every role: \"admin\" handler wraps its side effect in ctx.run under a
     },
   );
 
-  it("no role: \"user\" handler declares a retryPolicy", () => {
+  it("the two review-fix admin reads are explicitly marked read-only and declare no retryPolicy", () => {
+    expect(adminReadEntries.map((e) => e.toolName).sort()).toEqual(["get_review_fix_activity", "get_review_fix_attempt"]);
+    for (const { identifier } of adminReadEntries) {
+      const block = definitionBlockFor(identifier, TOOLS_SOURCE);
+      expect(block).toContain('operation: "read"');
+      expect(block).not.toContain("ctx.run(");
+      expect(block).not.toMatch(/retryPolicy\s*:/);
+    }
+  });
+
+  it("no read handler declares a retryPolicy", () => {
     const readEntries = handlerEntries.filter((e) => !writeEntries.some((w) => w.identifier === e.identifier));
     for (const { identifier } of readEntries) {
       const block = definitionBlockFor(identifier, TOOLS_SOURCE);

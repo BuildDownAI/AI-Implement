@@ -26,6 +26,9 @@ import {
   triggerWorkflowSyncTool,
   clearDispatchDedupTool,
   setProviderRegistry,
+  getReviewFixAttemptTool,
+  getReviewFixActivityTool,
+  setReviewFixAttemptsFacade,
 } from "../restate/tools.js";
 import { discoverTools, callTool, callToolAsSystem, toolCatalog } from "../restate/tools-client.js";
 import type { Caller } from "../mcp-identity.js";
@@ -266,6 +269,119 @@ describe("tool()", () => {
 
       expect(logSpy).not.toHaveBeenCalled();
     });
+
+    it("does not log write audit lines for an explicit admin read", async () => {
+      const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+      const handlerBody = vi.fn(async () => ({ content: [{ type: "text", text: "done" }] }));
+      const myAdminRead = tool({ description: "d", input: z.object({}), role: "admin", operation: "read" }, handlerBody);
+
+      await myAdminRead(fakeContext("my_admin_read"), { caller: SYSTEM_ADMIN, args: {} });
+
+      expect(handlerBody).toHaveBeenCalledOnce();
+      expect(logSpy).not.toHaveBeenCalled();
+    });
+  });
+});
+
+describe("review-fix read tools", () => {
+  afterEach(() => {
+    setReviewFixAttemptsFacade(null);
+    vi.restoreAllMocks();
+  });
+
+  it("forwards get_review_fix_attempt to the injected facade and preserves status/detail fields", async () => {
+    const getAttempt = vi.fn(async () => ({
+      status: "ok" as const,
+      attempt: {
+        attemptId: "attempt-1",
+        owner: { kind: "restate", attemptId: "attempt-1" },
+        execution: { githubRunId: "123", githubRunAttempt: 1 },
+        deadlineAt: 123456,
+        pendingFeedback: false,
+        snapshot: { taskText: "fix it", findings: [{ findingKey: "F1", version: 2 }] },
+        state: "succeeded",
+        evidenceComplete: true,
+        terminationConfirmed: true,
+        cycles: [],
+      },
+    }));
+    setReviewFixAttemptsFacade({ getAttempt, getActivity: vi.fn() });
+
+    const result = await getReviewFixAttemptTool(fakeContext("get_review_fix_attempt"), {
+      caller: SYSTEM_ADMIN,
+      args: { attemptId: "attempt-1" },
+    });
+
+    expect(JSON.parse(result.content[0].text)).toEqual({
+      status: "ok",
+      attempt: expect.objectContaining({
+        attemptId: "attempt-1",
+        evidenceComplete: true,
+        terminationConfirmed: true,
+      }),
+    });
+    expect(getAttempt).toHaveBeenCalledWith("attempt-1", { role: "admin", email: null });
+  });
+
+  it("forwards get_review_fix_activity pagination and preserves cursor/truncated status", async () => {
+    const getActivity = vi.fn(async () => ({
+      status: "ok" as const,
+      page: {
+        events: [
+          {
+            producerId: "runner",
+            sequence: 7,
+            cycle: 1,
+            kind: "tool",
+            occurredAt: 1700000000000,
+            payload: "{}",
+            truncated: false,
+            byteCount: 2,
+          },
+        ],
+        nextCursor: { producerId: "runner", sequence: 7 },
+        truncated: true,
+      },
+    }));
+    setReviewFixAttemptsFacade({ getAttempt: vi.fn(), getActivity });
+
+    const result = await getReviewFixActivityTool(fakeContext("get_review_fix_activity"), {
+      caller: { kind: "human", email: "admin@example.com", role: "admin" },
+      args: { attemptId: "attempt-1", pageSize: 2, cursor: { producerId: "runner", sequence: 6 } },
+    });
+
+    expect(JSON.parse(result.content[0].text)).toEqual({
+      status: "ok",
+      page: {
+        events: [expect.objectContaining({ producerId: "runner", sequence: 7 })],
+        nextCursor: { producerId: "runner", sequence: 7 },
+        truncated: true,
+      },
+    });
+    expect(getActivity).toHaveBeenCalledWith(
+      "attempt-1",
+      { pageSize: 2, cursor: { producerId: "runner", sequence: 6 } },
+      { role: "admin", email: "admin@example.com" },
+    );
+  });
+
+  it("uses activity pageSize 100 by default and preserves unavailable/not_found envelopes", async () => {
+    const getActivity = vi.fn(async () => ({ status: "unavailable" as const }));
+    const getAttempt = vi.fn(async () => ({ status: "not_found" as const }));
+    setReviewFixAttemptsFacade({ getAttempt, getActivity });
+
+    const attempt = await getReviewFixAttemptTool(fakeContext("get_review_fix_attempt"), {
+      caller: SYSTEM_ADMIN,
+      args: { attemptId: "attempt-1" },
+    });
+    const activity = await getReviewFixActivityTool(fakeContext("get_review_fix_activity"), {
+      caller: SYSTEM_ADMIN,
+      args: { attemptId: "attempt-1" },
+    });
+
+    expect(JSON.parse(attempt.content[0].text)).toEqual({ status: "not_found" });
+    expect(JSON.parse(activity.content[0].text)).toEqual({ status: "unavailable" });
+    expect(getActivity).toHaveBeenCalledWith("attempt-1", { pageSize: 100, cursor: undefined }, { role: "admin", email: null });
   });
 });
 

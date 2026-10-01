@@ -124,7 +124,7 @@ import { createProductionReviewFixServices } from "./restate/review-fix-producti
 import type { RestateRegisterOutcome, RestateRegisterResult } from "./restate/endpoint.js";
 import { getRestateStatus, setRestateStatus } from "./restate/status.js";
 import type { RestateRegistrationStatus } from "./restate/status.js";
-import { setProviderRegistry } from "./restate/tools.js";
+import { setProviderRegistry, setReviewFixAttemptsFacade } from "./restate/tools.js";
 import { callTool } from "./restate/tools-client.js";
 import { makeKgRefresh, setActiveKgRefresh } from "./kg-refresh.js";
 import type { KgRefreshHandle } from "./kg-refresh.js";
@@ -4515,6 +4515,7 @@ function startServer(
     credentials: createGithubAppCredentialResolver(config.githubAppId, config.githubAppPrivateKey),
     scopeStore: reviewFixAttemptStoreScopeStore(reviewFixAttemptStore),
   }));
+  setReviewFixAttemptsFacade(reviewFixAttempts);
   const kgRefresh: KgRefreshHandle = makeKgRefresh({
     sidecar,
     githubAppId: config.githubAppId,
