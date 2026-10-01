@@ -980,6 +980,43 @@ describe("request identity key", () => {
     expect(identityKeyFromPem(pem)).toBe("publickeyv1_FAe4sisG95oZ42w7buUn5qEE4TAnfTTFPiguZUHmhiF");
   });
 
+  it("replaces a corrupt PEM, returns the matching key, and reuses it afterwards", () => {
+    const dataDir = makeTmpDir();
+    const pemPath = join(dataDir, "request-identity-private.pem");
+    writeFileSync(pemPath, "not a pem");
+    const warn = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const first = ensureRequestIdentityKey(dataDir);
+    const pem = readFileSync(pemPath, "utf8");
+    expect(pem).toContain("BEGIN PRIVATE KEY");
+    expect(first.publicKey).toBe(identityKeyFromPem(pem));
+    expect(statSync(pemPath).mode & 0o777).toBe(0o600);
+    expect(warn.mock.calls.filter((c) => String(c[0]).includes("regenerated"))).toHaveLength(1);
+
+    const second = ensureRequestIdentityKey(dataDir);
+    expect(second.publicKey).toBe(first.publicKey);
+    expect(readFileSync(pemPath, "utf8")).toBe(pem);
+  });
+
+  it("does not spawn the child and reports the degraded state when the key cannot be prepared", async () => {
+    const dataDir = makeTmpDir();
+    // A file where the data directory should be makes the key write fail regardless of uid.
+    const blocker = join(dataDir, "not-a-dir");
+    writeFileSync(blocker, "");
+    const spawnFn = vi.fn();
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const sidecar = new RestateSidecar(
+      { dataDir: blocker, pollIntervalMs: 10, pollTimeoutMs: 200 },
+      { spawn: spawnFn, httpGet: async () => true, resolveBinary: () => "/bin/true" },
+    );
+
+    expect(await sidecar.start()).toBe(false);
+    expect(await sidecar.whenReady()).toBe(false);
+    expect(spawnFn).not.toHaveBeenCalled();
+    expect(sidecar.identityKey).toBeUndefined();
+    expect(getRestateStatus().sidecar.state).toBe("exited");
+  });
+
   it("derives a stable key from the PEM", () => {
     const dataDir = makeTmpDir();
     expect(ensureRequestIdentityKey(dataDir).publicKey).toBe(ensureRequestIdentityKey(dataDir).publicKey);

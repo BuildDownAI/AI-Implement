@@ -3,7 +3,7 @@ import path from "node:path";
 import os from "node:os";
 import { createRequire } from "node:module";
 import { createPrivateKey, createPublicKey, generateKeyPairSync } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
 import { stopChildWithBackstop } from "../process-stop.js";
@@ -84,16 +84,27 @@ export function identityKeyFromPem(privatePem: string): string {
 /**
  * Ensures an ED25519 request-identity key pair exists under `dataDir` (private PEM, mode
  * 0600, written once and reused on later boots) and returns the private key's path with
- * the public key in the SDK's compact format.
+ * the public key in the SDK's compact format. A file that exists but cannot be read or
+ * parsed as an ED25519 private key is deleted and replaced with a new pair (one warning):
+ * the key has no consumer outside this process tree, both halves being read at boot.
  */
 export function ensureRequestIdentityKey(dataDir: string): { privateKeyPath: string; publicKey: string } {
   const privateKeyPath = path.join(dataDir, "request-identity-private.pem");
-  if (!existsSync(privateKeyPath)) {
-    mkdirSync(dataDir, { recursive: true });
-    const { privateKey } = generateKeyPairSync("ed25519");
-    writeFileSync(privateKeyPath, privateKey.export({ type: "pkcs8", format: "pem" }), { mode: 0o600, flag: "wx" });
+  if (existsSync(privateKeyPath)) {
+    try {
+      return { privateKeyPath, publicKey: identityKeyFromPem(readFileSync(privateKeyPath, "utf8")) };
+    } catch (err) {
+      console.error(
+        `[restate] request identity key at ${privateKeyPath} is unreadable (${err instanceof Error ? err.message : String(err)}) — regenerated`,
+      );
+      rmSync(privateKeyPath, { force: true });
+    }
   }
-  return { privateKeyPath, publicKey: identityKeyFromPem(readFileSync(privateKeyPath, "utf8")) };
+  mkdirSync(dataDir, { recursive: true });
+  const { privateKey } = generateKeyPairSync("ed25519");
+  const pem = privateKey.export({ type: "pkcs8", format: "pem" });
+  writeFileSync(privateKeyPath, pem, { mode: 0o600, flag: "wx" });
+  return { privateKeyPath, publicKey: identityKeyFromPem(pem.toString()) };
 }
 
 interface Deferred<T> {
@@ -177,8 +188,8 @@ export class RestateSidecar {
 
   /**
    * Public half (`publickeyv1_…`) of the request-identity key the server signs with, for the
-   * SDK endpoint's `identityKeys`. Undefined until start() has generated or loaded it, and
-   * when the key could not be prepared (the endpoint then accepts unsigned requests).
+   * SDK endpoint's `identityKeys`. Undefined until start() has generated or loaded it; a key
+   * that cannot be prepared keeps the sidecar down, so there is no unsigned sidecar.
    */
   get identityKey(): string | undefined {
     return this._identityKey;
@@ -234,8 +245,8 @@ export class RestateSidecar {
       if (value !== undefined) childEnv[key] = value;
     }
     // Request identity (AII-976): the server signs every call to the endpoint with this key;
-    // the endpoint verifies with the public half. A key failure is non-fatal like any other
-    // sidecar failure — the sidecar starts unsigned and the endpoint warns.
+    // the endpoint verifies with the public half. The sidecar never runs unsigned: a key that
+    // cannot be prepared is a sidecar start failure, same degraded state as a dead child.
     this._identityKey = undefined;
     try {
       const { privateKeyPath, publicKey } = ensureRequestIdentityKey(this._dataDir);
@@ -244,8 +255,11 @@ export class RestateSidecar {
       console.error(`[restate] request identity key ${publicKey}`);
     } catch (err) {
       console.error(
-        `[restate] could not prepare the request identity key (${err instanceof Error ? err.message : String(err)}) — requests are not signed`,
+        `[restate] could not prepare the request identity key (${err instanceof Error ? err.message : String(err)}) — not starting the sidecar; restate-dependent routes answer 503`,
       );
+      setRestateStatus({ sidecar: { state: "exited", code: null, signal: null } });
+      deferred.resolve(false);
+      return false;
     }
     Object.assign(childEnv, {
       RESTATE_INGRESS__BIND_ADDRESS: RESTATE_INGRESS_BIND_ADDRESS,
