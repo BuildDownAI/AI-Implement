@@ -179,6 +179,7 @@ jobs:
       # Read the event file without exposing token-valued env/script metadata: GitHub
       # prints those headers before executing the first add-mask command (AII-676).
       - name: Mask runner callback tokens
+        id: bootstrap
         run: |
           set +x
           jq -r '
@@ -205,7 +206,7 @@ jobs:
             echo "::error::Private run_config bootstrap failed" >&2
             exit 1
           }
-          jq -r '
+          bootstrap="$(jq -r '
             def mask: gsub("%"; "%25") | gsub("\r"; "%0D") | gsub("\n"; "%0A") | "::add-mask::" + .;
             def isobj: type == "object";
             def only($k): ((keys - $k) | length) == 0;
@@ -281,14 +282,48 @@ jobs:
             | if (has("agentConfig") | not) or (.agentConfig | snapshot) then . else error("x") end
             | if has("credentials") then .credentials else empty end
             | if creds then . else error("x") end
-            | [ (.resultToken, .progressToken, .publicationToken, .attemptToken | select(. != null)),
+            | . as $c
+            | ([ (.resultToken, .progressToken, .publicationToken, .attemptToken | select(. != null)),
                 (.modelAuthGrant // empty
                   | if has("algorithm") then (.nonce, .ciphertext, .tag | select(length >= 8)) else .bearer end) ]
-            | unique | .[] | mask
-          ' "$GITHUB_EVENT_PATH" 2>/dev/null || {
+            | unique | .[] | mask),
+              ("RUN_TOKEN=" + ($c.resultToken // "")),
+              ("RUN_PROGRESS_TOKEN=" + ($c.progressToken // ""))
+          ' "$GITHUB_EVENT_PATH" 2>/dev/null)" || {
             echo "::error::Private run_config bootstrap failed" >&2
             exit 1
           }
+
+          # Deliver the validated credentials as step outputs (AII-1000), mapped into the Run step's env only, never $GITHUB_ENV, so no other step sees them. A private
+          # namespace is the single authority: a field it omits stays empty and is never
+          # backfilled from the public inputs. Without one, the legacy inputs are
+          # exported unchanged. Values travel through $GITHUB_OUTPUT only, under a random
+          # delimiter, and are never echoed or placed in command text.
+          printf '%s\n' "$bootstrap" | sed -n '/^::add-mask::/p'
+          export_env() {
+            case "$2" in
+              *"$3"*) echo "::error::Private run_config bootstrap failed" >&2; exit 1 ;;
+            esac
+            printf '%s<<%s\n%s\n%s\n' "$(printf '%s' "$1" | tr 'A-Z' 'a-z')" "$3" "$2" "$3" >> "${GITHUB_OUTPUT:-/dev/null}"
+          }
+          delim="$(openssl rand -hex 16)"
+          private="$(printf '%s\n' "$bootstrap" | sed -n '/^RUN_/p')"
+          if [ -n "$private" ]; then
+            # Tokens hold no whitespace, so newline splitting is exact; globbing stays off.
+            set -f
+            IFS="$(printf '\n_')"
+            IFS="${IFS%_}"
+            for line in $private; do
+              export_env "${line%%=*}" "${line#*=}" "$delim"
+            done
+            unset IFS
+            set +f
+          else
+            for pair in RUN_TOKEN:run_token RUN_PROGRESS_TOKEN:run_progress_token; do
+              val="$(jq -r --arg k "${pair#*:}" '(.inputs // {})[$k] // ""' "$GITHUB_EVENT_PATH")"
+              if [ -n "$val" ]; then export_env "${pair%%:*}" "$val" "$delim"; fi
+            done
+          fi
 
       - name: Print dispatch inputs
         env:
@@ -425,8 +460,9 @@ jobs:
           AI_IMPLEMENT_LOG_LEVEL: ${{ vars.AI_IMPLEMENT_LOG_LEVEL }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          RUN_TOKEN: ${{ inputs.run_token }}
-          RUN_PROGRESS_TOKEN: ${{ inputs.run_progress_token }}
+          # Private credentials arrive as masked outputs of the bootstrap step.
+          RUN_TOKEN: ${{ steps.bootstrap.outputs.run_token }}
+          RUN_PROGRESS_TOKEN: ${{ steps.bootstrap.outputs.run_progress_token }}
           AI_IMPLEMENT_NPM_REGISTRY: ${{ vars.AI_IMPLEMENT_NPM_REGISTRY }}
           AI_IMPLEMENT_NPM_SCOPE: ${{ vars.AI_IMPLEMENT_NPM_SCOPE }}
         run: /opt/ai-implement/entrypoint.sh
