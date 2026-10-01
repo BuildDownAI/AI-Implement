@@ -4,7 +4,8 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { InvokeParams, LLMExecutor, LLMResult, RunTelemetry } from "./types.js";
-import { CodexStreamParser } from "./codex-stream.js";
+import { CodexStreamParser, redactSecrets } from "./codex-stream.js";
+import type { CodexProtocolDriver, CodexTransportResult } from "./codex-planning-adapter.js";
 import { classifyLlmResult, classifySpawnError, isLlmResultFailure, type FailureRecord } from "./failure-classification.js";
 import { computeBackoffMs } from "./retry-backoff.js";
 import { suspendOriginWriteCredential } from "./executor.js";
@@ -50,6 +51,12 @@ export interface CodexExecutorOptions {
   termWaitMs?: number;
   /** Bounded wait for exit after SIGKILL before declaring the child unterminated. */
   killWaitMs?: number;
+  /**
+   * Optional native app-server transport (AII-1001). Absent = the default `codex exec` path, byte for
+   * byte. Present, the executor still owns auth, argv, spawn, timeout, cancel, termination and held
+   * recovery; the driver only speaks JSON-RPC over the child's stdio and returns a bounded result.
+   */
+  protocolDriver?: CodexProtocolDriver;
 }
 
 type StopReason = "timeout" | "cancel" | "stdin";
@@ -366,6 +373,27 @@ export class CodexExecutor implements LLMExecutor {
     return args;
   }
 
+  /** Trusted app-server argv. Nothing here is model- or repository-controlled; config comes only from argv. */
+  private buildAppServerArgs(params: InvokeParams): string[] {
+    return [
+      "app-server",
+      "--ignore-user-config",
+      "--ignore-rules",
+      "-c",
+      `model=${JSON.stringify(params.model)}`,
+      "-c",
+      `model_provider="${CODEX_PROVIDER}"`,
+      "-c",
+      'approval_policy="never"',
+      "-c",
+      'sandbox_mode="read-only"',
+      "-c",
+      "features.shell_tool=false",
+      "-c",
+      'web_search="disabled"',
+    ];
+  }
+
   private async runChild(params: InvokeParams, env: Record<string, string>): Promise<Attempt> {
     let restoreOrigin: (() => void) | null = null;
     if (!this.options.allowRepositoryWrites) {
@@ -384,7 +412,8 @@ export class CodexExecutor implements LLMExecutor {
         schemaPath = join(schemaDir, "output-schema.json");
         writeFileSync(schemaPath, JSON.stringify(params.jsonSchema), { mode: 0o600 });
       }
-      return await this.spawnAndWait(params, this.buildArgs(params, schemaPath), env);
+      const args = this.options.protocolDriver ? this.buildAppServerArgs(params) : this.buildArgs(params, schemaPath);
+      return await this.spawnAndWait(params, args, env);
     } finally {
       if (schemaDir) rmSync(schemaDir, { recursive: true, force: true });
       if (this.held) {
@@ -408,6 +437,11 @@ export class CodexExecutor implements LLMExecutor {
     const termWaitMs = this.options.termWaitMs ?? DEFAULT_TERM_WAIT_MS;
     const killWaitMs = this.options.killWaitMs ?? DEFAULT_KILL_WAIT_MS;
     const parser = new CodexStreamParser();
+    const driver = this.options.protocolDriver;
+    const haltController = new AbortController();
+    let stderrText = "";
+    let transport: CodexTransportResult | null = null;
+    let driverRun: Promise<void> = Promise.resolve();
     const secrets = Object.entries(env)
       .filter(([k, v]) => /KEY|TOKEN|SECRET|PASSWORD|AUTH/i.test(k) && v.length >= 8)
       .map(([, v]) => v);
@@ -444,12 +478,16 @@ export class CodexExecutor implements LLMExecutor {
     const requestStop = (r: StopReason): void => {
       if (st.reason) return;
       st.reason = r;
+      haltController.abort();
       st.terminating = terminate();
       wake();
     };
 
-    proc.stdout.on("data", (d: Buffer) => parser.push(d.toString()));
-    proc.stderr.on("data", (d: Buffer) => parser.pushStderr(d.toString()));
+    if (!driver) proc.stdout.on("data", (d: Buffer) => parser.push(d.toString()));
+    proc.stderr.on("data", (d: Buffer) => {
+      parser.pushStderr(d.toString());
+      if (driver && stderrText.length < 64_000) stderrText += d.toString().slice(0, 64_000 - stderrText.length);
+    });
     proc.on("close", (code, signal) => {
       st.closed = true;
       st.exit = { code, signal };
@@ -463,10 +501,57 @@ export class CodexExecutor implements LLMExecutor {
       wake();
     });
     proc.stdin.on("error", () => requestStop("stdin"));
-    try {
-      proc.stdin.end(params.prompt);
-    } catch {
-      requestStop("stdin");
+    let stopFlowDone = false;
+    if (driver) {
+      // The driver gets stream handles only: never the process, so it cannot signal, wait on or reap it.
+      const onDriverDone = (outcome: CodexTransportResult): void => {
+        transport = outcome;
+        if (stopFlowDone || st.reason) return;
+        if (outcome.stopReason) {
+          requestStop(outcome.stopReason);
+          return;
+        }
+        // A finished protocol exchange is not proof the group stopped: end stdin and run the same termination proof.
+        try {
+          proc.stdin.end();
+        } catch {
+          // best-effort
+        }
+        if (!st.terminating) {
+          st.terminating = terminate();
+          wake();
+        }
+      };
+      driverRun = driver
+        .run({
+          io: { stdin: proc.stdin, stdout: proc.stdout, halt: haltController.signal },
+          prompt: params.prompt,
+          model: params.model,
+          workspaceDir: this.workspaceDir,
+          ...(params.jsonSchema ? { jsonSchema: params.jsonSchema } : {}),
+          forbiddenRoots: env.CODEX_HOME ? [env.CODEX_HOME] : [],
+          redact: (text) => redactValues(text, secrets),
+        })
+        .then(onDriverDone, () => {
+          onDriverDone({
+            result: {
+              stdout: "",
+              stderr: "codex app-server transport: protocol_error",
+              exitCode: 1,
+              tokensUsed: 0,
+              terminalStatus: { subtype: "error", isError: true },
+              signal: null,
+            },
+            sawUnsafe: true,
+            stopReason: null,
+          });
+        });
+    } else {
+      try {
+        proc.stdin.end(params.prompt);
+      } catch {
+        requestStop("stdin");
+      }
     }
 
     const timer =
@@ -487,6 +572,7 @@ export class CodexExecutor implements LLMExecutor {
         if (!stopped) stopped = await terminate();
       }
     } finally {
+      stopFlowDone = true;
       if (timer) clearTimeout(timer);
       signal?.removeEventListener("abort", onAbort);
     }
@@ -504,12 +590,33 @@ export class CodexExecutor implements LLMExecutor {
       throw this.held;
     }
 
-    parser.end();
-    const sawUnsafe = parser.sawUnsafeActivity;
-    if (st.spawnError && typeof proc.pid !== "number") {
-      throw spawnFailure(st.spawnError, sawUnsafe);
+    let sawUnsafe: boolean;
+    let result: LLMResult;
+    if (driver) {
+      haltController.abort();
+      await driverRun;
+      const outcome = transport as CodexTransportResult | null;
+      sawUnsafe = outcome?.sawUnsafe ?? true;
+      if (st.spawnError && typeof proc.pid !== "number") {
+        throw spawnFailure(st.spawnError, sawUnsafe);
+      }
+      // The child was stopped by the executor, so its exit status says nothing about the exchange.
+      const base: LLMResult = outcome?.result ?? {
+        stdout: "",
+        exitCode: 1,
+        tokensUsed: 0,
+        terminalStatus: { subtype: "error", isError: true },
+      };
+      const stderr = [base.stderr ?? "", redactSecrets(stderrText)].filter(Boolean).join("\n");
+      result = { ...base, stderr, signal: null };
+    } else {
+      parser.end();
+      sawUnsafe = parser.sawUnsafeActivity;
+      if (st.spawnError && typeof proc.pid !== "number") {
+        throw spawnFailure(st.spawnError, sawUnsafe);
+      }
+      result = parser.toResult({ exitCode: st.exit.code ?? 1, signal: st.exit.signal ?? null });
     }
-    const result = parser.toResult({ exitCode: st.exit.code ?? 1, signal: st.exit.signal ?? null });
     if (st.reason === "stdin" && !this.isDefinitiveRejection(result, params)) {
       // The prompt never reached the CLI intact; surface it through the spawn rail (EPIPE is transient).
       throw spawnFailure(Object.assign(new Error("codex stdin closed before the prompt was delivered"), { code: "EPIPE" }), sawUnsafe);
