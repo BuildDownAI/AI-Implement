@@ -1,6 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
+  assertPrivateTransportForCredentials,
   buildEnvelopeDispatchInputs,
+  buildPrivateKgRefreshGhaDispatchBody,
   providerDispatchFields,
   capDispatchFields,
   branchPrefixDispatchFields,
@@ -10,7 +12,7 @@ import {
   buildKgRefreshGhaDispatchBody,
   ENVELOPE_OPTIONAL_INPUTS,
 } from "../github.js";
-import { decodeRunConfig } from "../run-config.js";
+import { decodeRunConfig, decodeTrustedRunConfig } from "../run-config.js";
 import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
 import { surfaceDispatchFailure } from "../dispatch-failure.js";
 import { notify } from "../notify.js";
@@ -1176,5 +1178,125 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
     expect(secondBody.inputs.job_timeout_minutes).toBe("240");
     expect(secondBody.inputs.issue_identifier).toBe("AII-656");
     expect(result).toEqual({ success: true, status: 204 });
+  });
+});
+
+describe("buildEnvelopeDispatchInputs — private transport (AII-983)", () => {
+  const impl = { runnerPhase: "implementation" as const, runToken: "rt", runProgressToken: "rp", runPublicationToken: "rpub", retryPolicy: null };
+
+  it("legacy (no capability): generic envelope, masked top-level tokens, no credentials", () => {
+    for (const privateTransport of [undefined, false]) {
+      const inputs = buildEnvelopeDispatchInputs(makeMapping(), baseIssue, { ...impl, privateTransport });
+      expect(Buffer.from(inputs.run_config!, "base64").toString()).not.toContain("credentials");
+      expect(inputs).toMatchObject({ run_token: "rt", run_progress_token: "rp", run_publication_token: "rpub" });
+    }
+  });
+
+  it("private: exact audiences in credentials, no top-level bearer duplicates", () => {
+    const inputs = buildEnvelopeDispatchInputs(makeMapping(), baseIssue, { ...impl, privateTransport: true });
+    const creds = decodeTrustedRunConfig(inputs.run_config!).credentials;
+    expect(creds).toEqual({ version: 1, resultToken: "rt", progressToken: "rp", publicationToken: "rpub" });
+    expect(creds?.attemptToken).toBeUndefined();
+    expect(decodeRunConfig(inputs.run_config!).credentials).toBeUndefined();
+    expect(inputs.run_token).toBe("");
+    expect("run_progress_token" in inputs).toBe(false);
+    expect("run_publication_token" in inputs).toBe(false);
+    expect(JSON.stringify(inputs).match(/"rt"|"rp"|"rpub"/g)).toBeNull();
+  });
+
+  it.each(["planning", "kg-refresh"] as const)("%s never carries publication authority on either path", (runnerPhase) => {
+    const o = { runnerPhase, runToken: "rt", runPublicationToken: "rpub", retryPolicy: null };
+    const priv = buildEnvelopeDispatchInputs(makeMapping(), baseIssue, { ...o, privateTransport: true });
+    expect(decodeTrustedRunConfig(priv.run_config!).credentials).toEqual({ version: 1, resultToken: "rt" });
+    expect("run_publication_token" in priv).toBe(false);
+    const legacy = buildEnvelopeDispatchInputs(makeMapping(), baseIssue, o);
+    expect("run_publication_token" in legacy).toBe(false);
+  });
+
+  it("explicit private credentials without capability throw instead of being dropped", () => {
+    expect(() => buildEnvelopeDispatchInputs(makeMapping(), baseIssue, {
+      ...impl, credentials: { version: 1, resultToken: "x" },
+    })).toThrow(/supportsPrivateRunConfig/);
+  });
+
+  it("explicit credentials merge over derived bearers on the private path", () => {
+    const inputs = buildEnvelopeDispatchInputs(makeMapping(), baseIssue, {
+      ...impl, privateTransport: true, credentials: { version: 1, attemptToken: "at" },
+    });
+    expect(decodeTrustedRunConfig(inputs.run_config!).credentials).toMatchObject({ resultToken: "rt", attemptToken: "at" });
+  });
+
+  it.each(["planning", "kg-refresh"] as const)("%s drops a supplied publicationToken and supplied bearers", (runnerPhase) => {
+    const inputs = buildEnvelopeDispatchInputs(makeMapping(), baseIssue, {
+      runnerPhase, runToken: "rt", retryPolicy: null, privateTransport: true,
+      credentials: { version: 1, publicationToken: "supplied-pub", resultToken: "supplied-res", progressToken: "supplied-prog", attemptToken: "at" },
+    });
+    expect(decodeTrustedRunConfig(inputs.run_config!).credentials).toEqual({ version: 1, resultToken: "rt", attemptToken: "at" });
+    expect(JSON.stringify(inputs)).not.toMatch(/supplied-/);
+  });
+
+  it("implementation: minted bearers stay authoritative over supplied ones", () => {
+    const inputs = buildEnvelopeDispatchInputs(makeMapping(), baseIssue, {
+      ...impl, privateTransport: true,
+      credentials: { version: 1, publicationToken: "supplied-pub", resultToken: "supplied-res", progressToken: "supplied-prog" },
+    });
+    expect(decodeTrustedRunConfig(inputs.run_config!).credentials).toEqual({ version: 1, resultToken: "rt", progressToken: "rp", publicationToken: "rpub" });
+  });
+
+  it("private retry sends two requests with byte-identical run_config and no bearer inputs", async () => {
+    const inputs = buildEnvelopeDispatchInputs(makeMapping(), baseIssue, { ...impl, privateTransport: true });
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response('Unexpected inputs provided: ["issue_identifier"]', { status: 422 }))
+      .mockResolvedValueOnce(new Response('Unexpected inputs provided: ["runner_phase"]', { status: 422 }));
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      await postWorkflowDispatch({ token: "t", owner: "o", repo: "r", workflowFile: "w.yml", ref: "main", inputs });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const first = JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body)).inputs;
+    const second = JSON.parse(String((fetchMock.mock.calls[1][1] as RequestInit).body)).inputs;
+    expect(second.run_config).toBe(first.run_config);
+    expect(second.run_token).toBe("");
+    expect("issue_identifier" in second).toBe(false);
+  });
+});
+
+describe("assertPrivateTransportForCredentials — mixed-version matrix (AII-680)", () => {
+  const creds = { version: 1 as const, resultToken: "rt" };
+
+  it.each([[{}], [{ supportsPrivateRunConfig: false }]])("refuses to send credentials to an unsupported or unprobed template (%j)", (caps) => {
+    expect(() => assertPrivateTransportForCredentials(creds, caps, "o/r claude-implement.yml")).toThrow(/refusing to drop or downgrade/);
+  });
+
+  it("allows a private-capable template, and legacy dispatch with no credentials", () => {
+    expect(() => assertPrivateTransportForCredentials(creds, { supportsPrivateRunConfig: true }, "t")).not.toThrow();
+    expect(() => assertPrivateTransportForCredentials(undefined, {}, "t")).not.toThrow();
+  });
+});
+
+describe("buildPrivateKgRefreshGhaDispatchBody (AII-983)", () => {
+  it("moves result/progress into credentials, keeps config, omits top-level bearers", () => {
+    const trustedConfig = { v: 1 as const, issue: { id: "i", identifier: "KG-1", title: "t", description: "d" }, runnerPhase: "kg-refresh" as const };
+    const body = buildPrivateKgRefreshGhaDispatchBody({
+      trustedConfig, runConfig: "ignored", runToken: "rt", runProgressToken: "rp", runnerImage: undefined, issueIdentifier: "KG-1",
+    });
+    expect(decodeTrustedRunConfig(body.run_config!).credentials).toEqual({ version: 1, resultToken: "rt", progressToken: "rp" });
+    expect(decodeRunConfig(body.run_config!).issue.identifier).toBe("KG-1");
+    expect(body.run_token).toBe("");
+    expect("run_progress_token" in body).toBe(false);
+  });
+
+  it("discards supplied publication/result/progress tokens, keeping grant-class fields and minted bearers", () => {
+    const trustedConfig = {
+      v: 1 as const, issue: { id: "i", identifier: "KG-1", title: "t", description: "d" }, runnerPhase: "kg-refresh" as const,
+      credentials: { version: 1 as const, publicationToken: "supplied-pub", resultToken: "supplied-res", progressToken: "supplied-prog", attemptToken: "at" },
+    };
+    const body = buildPrivateKgRefreshGhaDispatchBody({
+      trustedConfig, runConfig: "ignored", runToken: "rt", runProgressToken: "rp", runnerImage: undefined, issueIdentifier: "KG-1",
+    });
+    expect(decodeTrustedRunConfig(body.run_config!).credentials).toEqual({ version: 1, attemptToken: "at", resultToken: "rt", progressToken: "rp" });
+    expect(JSON.stringify(body)).not.toMatch(/supplied-/);
   });
 });

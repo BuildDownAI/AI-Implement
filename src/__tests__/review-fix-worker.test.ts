@@ -185,6 +185,130 @@ describe("GithubReviewFixWorker.prepare", () => {
   });
 });
 
+const caps = (over: Record<string, unknown> = {}) => ({
+  contract: "envelope" as const, supportsRunPublicationToken: true, supportsAttemptCorrelation: true, ...over,
+});
+const legacyProbe = async () => caps({ supportsPrivateRunConfig: false });
+const privateProbe = async () => caps({ supportsPrivateRunConfig: true });
+
+describe("GithubReviewFixWorker.launch private envelope capability", () => {
+  const CALLBACK_URL = "https://callback.example/runner";
+  const tokens = async () => ({
+    run_token: "secret-result", run_progress_token: "secret-progress", run_publication_token: "secret-publication",
+    runner_callback_url: CALLBACK_URL,
+  });
+
+  async function run(probe: (i: any) => Promise<any>, extra: Record<string, unknown> = {}) {
+    seedMapping({ workflowFile: "custom-flow.yml", defaultBranch: "release" });
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    t.setDispatchImpl(async () => ({ success: true, status: 200, outcome: "accepted", runId: 9100 }));
+    const scopeStore = workerModule.inMemoryReviewFixWorkerScopeStore();
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport, callbackInputs: tokens, resolveCapabilities: probe, scopeStore, ...extra });
+    const plan = await worker.prepare(makeAttempt());
+    const outcome = await worker.launch(plan);
+    const sent = t.dispatchCalls[0] as { inputs: Record<string, string> } | undefined;
+    return { t, plan, outcome, sent, scopeStore };
+  }
+
+  it("probes the exact dispatch target with the dispatch token", async () => {
+    const probe = vi.fn(privateProbe);
+    const { t } = await run(probe);
+    const dispatched = t.dispatchCalls[0] as any;
+    expect(probe).toHaveBeenCalledTimes(1);
+    expect(probe).toHaveBeenCalledWith({
+      owner: dispatched.owner, repo: dispatched.repo, workflowFile: "custom-flow.yml", ref: "release", token: dispatched.token,
+    });
+    expect(dispatched.workflowFile).toBe("custom-flow.yml");
+    expect(dispatched.ref).toBe("release");
+  });
+
+  it("private path: trusted decoder returns bearers, generic omits them, no top-level bearers", async () => {
+    const { sent, plan, outcome, scopeStore } = await run(privateProbe);
+    const { decodeRunConfig, decodeTrustedRunConfig } = await import("../run-config.js");
+    const inputs = sent!.inputs;
+    expect(decodeRunConfig(inputs.run_config).credentials).toBeUndefined();
+    const trusted = decodeTrustedRunConfig(inputs.run_config);
+    expect(trusted.credentials).toEqual({
+      version: 1, resultToken: "secret-result", progressToken: "secret-progress", publicationToken: "secret-publication",
+    });
+    expect(trusted.credentials?.attemptToken).toBeUndefined();
+    expect(trusted.runnerCallbackUrl).toBe(CALLBACK_URL);
+    expect(inputs.run_attempt_token).toBe(plan.attemptId);
+    for (const k of ["run_token", "run_progress_token", "run_publication_token", "runner_callback_url"]) {
+      expect(inputs[k] ?? "").toBe("");
+    }
+    for (const surface of [JSON.stringify(plan), JSON.stringify(outcome), JSON.stringify(await scopeStore.scopeForAttempt(plan.attemptId))]) {
+      expect(surface).not.toContain("secret-");
+    }
+  });
+
+  it.each([
+    ["absent", async () => caps()],
+    ["false", legacyProbe],
+    ["legacy contract", async () => ({ contract: "legacy", supportsRunPublicationToken: false, supportsAttemptCorrelation: false, supportsPrivateRunConfig: false })],
+    ["rejected probe", async () => { throw new Error("probe down"); }],
+  ])("%s capability keeps the generic envelope and masked top-level bearers", async (_n, probe) => {
+    const { sent, plan } = await run(probe as any);
+    const { decodeTrustedRunConfig } = await import("../run-config.js");
+    const inputs = sent!.inputs;
+    const decoded = decodeTrustedRunConfig(inputs.run_config);
+    expect(decoded.credentials).toBeUndefined();
+    expect(decoded.runnerCallbackUrl).toBe(CALLBACK_URL);
+    expect(Buffer.from(inputs.run_config, "base64").toString("utf8")).not.toContain("secret-");
+    expect(inputs.run_token).toBe("secret-result");
+    expect(inputs.run_progress_token).toBe("secret-progress");
+    expect(inputs.run_publication_token).toBe("secret-publication");
+    expect(inputs.run_attempt_token).toBe(plan.attemptId);
+  });
+
+  it("fails before dispatch when protected transport is required but unavailable", async () => {
+    const { outcome, t } = await run(legacyProbe, { requiresProtectedTransport: () => true });
+    expect(outcome).toEqual({ status: "unknown" });
+    expect(t.dispatchCalls).toHaveLength(0);
+  });
+
+  it("dispatches protected work over the private path when capable", async () => {
+    const { outcome, t } = await run(privateProbe, { requiresProtectedTransport: () => true });
+    expect(outcome.status).toBe("accepted");
+    expect(t.dispatchCalls).toHaveLength(1);
+  });
+
+  it("does not probe or dispatch on installation mismatch", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials({ installationId: 99 });
+    const t = makeTransport();
+    const probe = vi.fn(privateProbe);
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport, callbackInputs: tokens, resolveCapabilities: probe });
+    expect(await worker.launch(await worker.prepare(makeAttempt()))).toEqual({ status: "unknown" });
+    expect(probe).not.toHaveBeenCalled();
+    expect(t.dispatchCalls).toHaveLength(0);
+  });
+
+  it("keeps the private run_config byte-identical through the real optional-input retry", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const bodies: Array<{ inputs: Record<string, string> }> = [];
+    vi.stubGlobal("fetch", vi.fn(async (_u: unknown, init?: { body?: string }) => {
+      bodies.push(JSON.parse(init!.body as string));
+      if (bodies.length === 1) return new Response(JSON.stringify({ message: 'Unexpected inputs provided: ["issue_identifier"]' }), { status: 422 });
+      return new Response(JSON.stringify({ workflow_run_id: 9101, run_url: "https://api.github.com/repos/eudoxus/ai-implement/actions/runs/9101", html_url: "https://github.com/eudoxus/ai-implement/actions/runs/9101" }), { status: 200 });
+    }));
+    try {
+      const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, callbackInputs: tokens, resolveCapabilities: privateProbe });
+      await worker.launch(await worker.prepare(makeAttempt()));
+    } finally {
+      vi.unstubAllGlobals();
+    }
+    expect(bodies).toHaveLength(2);
+    expect(bodies[1].inputs).not.toHaveProperty("issue_identifier");
+    expect(bodies[1].inputs.run_config).toBe(bodies[0].inputs.run_config);
+    const { decodeTrustedRunConfig } = await import("../run-config.js");
+    expect(decodeTrustedRunConfig(bodies[1].inputs.run_config).credentials?.resultToken).toBe("secret-result");
+    expect(bodies[1].inputs.run_attempt_token).toBe("attempt-1");
+  });
+});
+
 describe("GithubReviewFixWorker.launch", () => {
   it("adds callback credentials only at dispatch and keeps them out of the outcome", async () => {
     seedMapping();
@@ -195,7 +319,7 @@ describe("GithubReviewFixWorker.launch", () => {
       run_token: "secret-result", run_progress_token: "secret-progress", run_publication_token: "secret-publication",
       runner_callback_url: "https://callback.example/runner",
     }));
-    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport, callbackInputs });
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport, callbackInputs, resolveCapabilities: legacyProbe });
     const plan = await worker.prepare(makeAttempt());
     expect(callbackInputs).not.toHaveBeenCalled();
 
@@ -221,7 +345,7 @@ describe("GithubReviewFixWorker.launch", () => {
     const t = makeTransport();
     t.setDispatchImpl(async () => ({ success: true, status: 200, outcome: "accepted", runId: 9010 }));
     const scopeStore = workerModule.inMemoryReviewFixWorkerScopeStore();
-    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport, callbackInputs: tokenInputs(), scopeStore });
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport, callbackInputs: tokenInputs(), scopeStore, resolveCapabilities: legacyProbe });
     const plan = await worker.prepare(makeAttempt());
     const outcome = await worker.launch(plan);
 
@@ -243,7 +367,7 @@ describe("GithubReviewFixWorker.launch", () => {
     const { resolver } = makeCredentials();
     const t = makeTransport();
     t.setDispatchImpl(async () => ({ success: true, status: 200, outcome: "accepted", runId: 9011 }));
-    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport, callbackInputs: tokenInputs() });
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport, callbackInputs: tokenInputs(), resolveCapabilities: legacyProbe });
     await worker.launch(await worker.prepare(makeAttempt()));
 
     const { parse } = await import("yaml");
@@ -270,7 +394,7 @@ describe("GithubReviewFixWorker.launch", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
     try {
-      const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, callbackInputs: tokenInputs() });
+      const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, callbackInputs: tokenInputs(), resolveCapabilities: legacyProbe });
       await worker.launch(await worker.prepare(makeAttempt()));
     } finally {
       vi.unstubAllGlobals();
@@ -292,7 +416,7 @@ describe("GithubReviewFixWorker.launch", () => {
     seedMapping();
     const { resolver } = makeCredentials();
     const t = makeTransport();
-    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport, callbackInputs: callbackInputs as any });
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport, callbackInputs: callbackInputs as any, resolveCapabilities: legacyProbe });
     const outcome = await worker.launch(await worker.prepare(makeAttempt()));
     expect(outcome).toEqual({ status: "unknown" });
     expect(t.dispatchCalls).toHaveLength(0);

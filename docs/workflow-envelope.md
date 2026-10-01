@@ -28,13 +28,13 @@ A top-level `workflow_dispatch` input is reserved for a value GitHub must evalua
 | `run_progress_token` | No | string | HMAC bearer token for in-progress callbacks; empty skips progress posts. **Masked.** |
 | `run_publication_token` | No | string | Dedicated, single-use bearer token that may be exchanged immediately before repository publication for a fresh repo-scoped GitHub credential. **Masked. Implementation and gap-analysis only.** |
 
-The three runner tokens remain separate inputs under the current dispatch contract; the envelope remains secret-free. The first container-job step reads the token values from GitHub's `GITHUB_EVENT_PATH` event file and registers `::add-mask::` commands before any diagnostics or credential consumers run. It has no token-valued `env:` entries or input interpolation in its script: GitHub prints both script and environment headers before executing the step, so either would expose values before masking. Later runner steps retain their token environment mappings after masks are registered. Mask command data escapes percent signs and line endings; malformed event data fails the bootstrap before consumers run. The publication token remains restricted to the pipeline process and is never forwarded to model child processes or persisted step inputs.
+The three runner tokens remain separate inputs under the current dispatch contract (a private `credentials` namespace, when present, supersedes them at the runner; see AII-1000 below); the envelope remains secret-free. The first container-job step reads the token values from GitHub's `GITHUB_EVENT_PATH` event file and registers `::add-mask::` commands before any diagnostics or credential consumers run. It has no token-valued `env:` entries or input interpolation in its script: GitHub prints both script and environment headers before executing the step, so either would expose values before masking. Later runner steps retain their token environment mappings after masks are registered. Mask command data escapes percent signs and line endings; malformed event data fails the bootstrap before consumers run. The publication token remains restricted to the pipeline process and is never forwarded to model child processes or persisted step inputs.
 
 These are live credentials in the runner's environment; `src/__tests__/setup/clear-runner-credentials.ts` (registered as a Vitest `setupFile`) deletes all five credential variables before every test so no suite can burn a single-use token against the live orchestrator. A test that needs a credential value may set it in the test body — the global `beforeEach` ensures it is cleared again before the next test. Tests that exercise callback or fetch paths should inject a mock `fetchImpl` (or equivalent dependency-injection point) rather than letting code reach a live URL.
 
 Headroom note: GitHub caps `workflow_dispatch` at 10 inputs; 9 of 10 used; one slot free. That ceiling is part of why the envelope exists; a new field must ride inside `run_config` unless the workflow itself has to read it before the runner starts (masking, routing), in which case an existing input has to make room. `claude-plan.yml` declares eight of these (no `run_publication_token`).
 
-The first step of the container job prints every input (`[dispatch-inputs] …`), with the three tokens reduced to `<redacted>`/`(empty)` and `run_config` base64-decoded through `jq`, so a run's log opens with the exact envelope it was dispatched with. `provider` and `aws_region` are also forwarded into the entrypoint env as `PROVIDER`/`AWS_REGION`: the runner reads the provider from env, not from the envelope, so a template that drops them silently downgrades Bedrock repos to the anthropic provider.
+The first step of the container job prints every input (`[dispatch-inputs] …`), with the three tokens reduced to `<redacted>`/`(empty)` and `run_config` shown as the credential-free diagnostic projection (see "Workflow bootstrap and capability"). `provider` and `aws_region` are also forwarded into the entrypoint env as `PROVIDER`/`AWS_REGION`: the runner reads the provider from env, not from the envelope, so a template that drops them silently downgrades Bedrock repos to the anthropic provider.
 
 ---
 
@@ -223,6 +223,68 @@ Below the TS runner layer, `session/entrypoint.sh` picks the phase (and, for kg-
 
 ---
 
+## Private credentials namespace (`credentials`, AII-981)
+
+`RunConfigV1.credentials` is an optional, versioned `{ version: 1, resultToken?, progressToken?, publicationToken?, attemptToken?, modelAuthGrant? }` for trusted transport. `modelAuthGrant` is the plain grant or sealed Fly form from `src/model-auth-contract.ts` and is never part of `agentConfig`. `validateRunCredentials` rejects unknown fields, bad types, oversized tokens and invalid grants with path-only errors that never echo values or key names.
+
+| Function | Credentials |
+|---|---|
+| `encodeRunConfig` | Dropped |
+| `decodeRunConfig` | Validated (fail closed), not returned |
+| `encodeTrustedRunConfig` / `decodeTrustedRunConfig` | Carried |
+| `diagnosticProjection` | Field names only |
+
+### Workflow bootstrap and capability (AII-982)
+
+The first container-job step of `claude-implement.yml` and `claude-plan.yml` (identical in `workflows/` and `.github/workflows/`) reads `GITHUB_EVENT_PATH` and registers `::add-mask::` for the legacy token inputs, then for the **entire encoded `run_config`**, then for each extracted secret, one per line with `%`, CR and LF escaped: every `credentials.*` token, the plain grant's `bearer`, and a sealed grant's `nonce`, `ciphertext` and `tag` (8+ characters). Masks are emitted only after the namespace and any `agentConfig` validated; recursive masking is never a substitute for validation. The bootstrap re-implements `validateRunCredentials` (including the plain and sealed `modelAuthGrant` variants of `src/model-auth-contract.ts`, discriminated by an `algorithm` key) and `validateResolvedAgentSnapshot` in jq, and `workflow-token-masking.test.ts` checks it against the TypeScript validators on valid and malformed fixtures. Base64 is not protection; masking is a log layer verified against real logs in AII-984. Present-but-invalid private data (a `null` namespace, token or grant counts as present; also bad base64/JSON, wrong types, unknown keys, version, whitespace in a token, an invalid grant or snapshot) exits non-zero with a fixed message — jq stderr is discarded because it can echo input — before any consumer runs. After validation the same step delivers the credentials (AII-1000): the private namespace is the **single authority**, so `RUN_TOKEN`, `RUN_PROGRESS_TOKEN` and (implementation only) `RUN_PUBLICATION_TOKEN` are written as step outputs (`$GITHUB_OUTPUT`, step id `bootstrap`) from `credentials.resultToken` / `progressToken` / `publicationToken`, using a random heredoc delimiter, with no value in command text or output. They are mapped into the env of the `Run pipeline` / `Run planning` step only via `${{ steps.bootstrap.outputs.* }}` — never `$GITHUB_ENV`, which every later step (including third-party actions such as AWS credential configuration) would inherit, so the publication token stays restricted to the pipeline process. A field the namespace omits is exported empty and is **never** backfilled from the public `run_*` inputs, and conflicting public values are ignored. Planning exports result and progress only; a `publicationToken` in a planning envelope is dropped, not rejected, so planning never gains publication authority. When no `credentials` namespace exists, the legacy `run_token` / `run_progress_token` / `run_publication_token` inputs are exported unchanged through the same path. The `Run pipeline` / `Run planning` steps therefore read `RUN_*TOKEN` solely from those outputs. `attemptToken` stays the public `run_attempt_token` marker and `modelAuthGrant` is never exported (AII-958); `decodeRunConfig` still strips credentials. `workflow-token-masking.test.ts` runs the real bootstrap and Run step against a stub entrypoint to prove delivery, the planning audience, metacharacter safety and fail-before-entrypoint.
+
+"Print dispatch inputs" no longer dumps the decoded envelope. It prints the diagnostic projection: known envelope keys only, `credentials` replaced by `credentialFields` (names only), and `agentConfig` replaced by the fixed marker `"<omitted>"` — the nested snapshot is validated by the bootstrap but never copied raw into logs.
+
+A workflow advertises private-envelope support with the static comment `# ai-implement-capability: private-run-config-v1` — not a `workflow_dispatch` input. `resolveWorkflowCapabilities` sets `supportsPrivateRunConfig` only for an envelope workflow carrying it; missing or unprobed means `false`. It is unrelated to the `stage-agent-config-v1` capability, which a later slice installs.
+
+`buildEnvelopeDispatchInputs` takes `privateTransport` (AII-983) and an optional extra `credentials`; see below. The two-request optional-input retry never strips `run_config` or the tokens, and resends `run_config` byte-identical.
+
+### Private writers and the compatibility matrix (AII-983)
+
+Every GHA writer (implementation, planning, the legacy index.ts review-fix writer, comment-triggered gap-fill and `dispatchKgRefreshRun`) probes the **exact workflow file at the exact ref it dispatches** (planning: `planningWorkflowFile`; KG: `claude-implement.yml` at `kgSourceRef` or the default branch, using the control token) and selects private transport only when `supportsPrivateRunConfig === true`. `contract === "envelope"` alone is never sufficient. The Restate-owned review-fix writer (`src/review-fix-worker.ts`, AII-999) follows the same rule.
+
+| Writer | Reader | Transport |
+|---|---|---|
+| new | new (`supportsPrivateRunConfig === true`) | Bearers in `run_config.credentials` (`encodeTrustedRunConfig`); `run_token` is `""`; no `run_progress_token` / `run_publication_token` inputs |
+| new | old (envelope without the marker, or probe `false`/failed) | Generic `encodeRunConfig` envelope plus masked top-level tokens |
+| new | legacy contract | Legacy per-field inputs plus top-level tokens |
+| old | new | Reader falls back to the top-level `run_*` inputs when no `credentials` namespace exists |
+
+Audiences are unchanged: result for every kind, progress for implementation/gap-fill/KG, publication only for implementation/gap-fill where the reader advertises it. Planning and KG never receive publication authority. `credentials.attemptToken` is never filled from the public `run_attempt_token`. The orchestrator-minted result/progress/publication bearers are authoritative and phase-scoped: of the caller-supplied `credentials` (planning `trustedCredentials`, the KG config's own namespace, `buildEnvelopeDispatchInputs` `credentials`) only `modelAuthGrant` and `attemptToken` are carried, and any supplied result/progress/publication token is discarded, so a supplied `publicationToken` can never reach a planning or KG envelope.
+
+Protected transport fails closed: explicitly supplied private `credentials` (e.g. a `modelAuthGrant`) passed to `buildEnvelopeDispatchInputs` without capability throw, and `dispatchKgRefreshRun` throws when the trusted KG config carries `credentials` or `agentConfig` and the reader lacks capability or the probe fails. The implementation (`dispatchGitHubActions`), planning (`PlanningDispatchContext.trustedCredentials`) and GHA gap-fill (`DrainCommentGapfillsInput.getTrustedCredentials`) writers expose the same typed trusted-preparation seam and call `assertPrivateTransportForCredentials` right after the probe, so an unsupported reader, a legacy-contract reader or a failed probe throws inside the pre-launch block: no `postWorkflowDispatch`, no fetch, admission released. Both happen before any dispatch request; nothing is stripped or downgraded and there is no provider/account fallback. An unprotected KG config whose probe fails uses the legacy masked path. Wiring real stage-snapshot/model-auth preparation into these builders remains AII-958.
+
+**Fleet sync requirement:** a repo receives private transport only after its synced `claude-implement.yml` / `claude-plan.yml` carry the AII-982/AII-1000 bootstrap. This change performs no sync, deploy or project activation. **Rollback:** private writers stay capability-gated; an older workflow reports no capability and the writers revert to the masked top-level path. Never re-enable credential dumps into generic envelopes or logs.
+
+An absent namespace decodes as the legacy envelope. No writer sets it in this slice; the exact input allowlists, rollout order and rollback are in [ADR 032](adr/032-private-run-envelope-and-credential-bootstrap.md). Statements above that the envelope is "secret-free" describe the generic envelope. `repoProcessEnv`, `modelProcessEnv` and `gitProcessEnv` strip `AI_IMPLEMENT_RUN_CONFIG` and `AI_IMPLEMENT_MODEL_AUTH_*` bootstrap handles.
+
+### Verifying masking in real Actions logs (AII-984)
+
+`workflow-token-masking.test.ts` runs the bootstrap under `sh`, where `::add-mask::` is inert, so it proves delivery and validation but not log masking. `.github/workflows/private-envelope-smoke.yml` (not a synced template; sync never distributes it) proves masking on the real runner. It triggers on `pull_request` into `ai-implement/feature/**`, so a feature PR (including a child PR into `ai-implement/feature/aii-680`) verifies itself with no default-branch deployment. It holds only `contents: read` (verifier also `actions: read`), references no secret, uploads no artifact and makes no model, AWS or tracker call.
+
+| Job | Role | Expected result |
+|---|---|---|
+| `private-envelope-implement` | Canonical `claude-implement.yml` bootstrap; delivers result, progress, publication | `success` |
+| `private-envelope-plan` | Canonical `claude-plan.yml` bootstrap; delivers result, progress only (planning publication exclusion) | `success` |
+| `private-envelope-failure` | Implementation bootstrap, then a deliberately failing trusted consumer (`continue-on-error`, so the check stays green) | `success` |
+| `private-envelope-verifier` | Runs after all three (`if: always()`), reads their complete logs | `success` |
+
+`scripts/check-private-envelope-gha-logs.mjs` extracts the `id: bootstrap` run block and the Run step's `steps.bootstrap.outputs.*` env mapping from `workflows/claude-*.yml` at run time (it fails if the step is missing; no jq or mask logic is copied). Each consumer job builds a synthetic event inside the process — encoded `run_config`, result/progress/publication/attempt tokens, a plain grant bearer or sealed grant nonce/ciphertext/tag, and hostile public `run_*` inputs that must be ignored — derived from the run id so the verifier can rebuild them independently. The values never appear in step `env`/`with`/`run` text before the masks register. The bootstrap's stdout goes straight to the runner; the job then prints every value after masking (the log must show `***`), maps the outputs into a trusted consumer env exactly as the Run step does (the header prints masked, the consumer compares exact values and prints fixed `PROOF ...` markers), runs an untrusted step that must see no callback env, no grant promotion, and finally the failing consumer.
+
+The verifier cannot use a running job's own log, so it waits (bounded) for the consumer jobs, requires each `needs.*.result` to equal its expectation (a skipped job or an unexpected success fails), fetches each job's complete log via `actions/jobs/<id>/logs` with bounded retries, and fails on: an unavailable or incomplete log (no cleanup end marker), any raw synthetic value, a missing or out-of-order proof marker, a `MISMATCH` proof, or a missing/duplicate job. Failure messages name labels only, never values. `--self-test` proves each of those paths fails (exposure of every value, truncated/empty/cut logs, each missing marker, wrong or missing consumer proof, skipped/cancelled/missing jobs, wrong conclusion, unbounded retry) and also checks the workflow's shape (triggers, permissions, no secrets or artifacts, trusted env matching the canonical Run step).
+
+Run it locally with `node scripts/check-private-envelope-gha-logs.mjs --self-test` (needs `npm ci`, `jq`, `openssl`). To run it on Actions, open or update a PR targeting `ai-implement/feature/<key>`; the `private-envelope-smoke` workflow starts automatically.
+
+**Evidence required before the parent (AII-680) is completed:** record in the PR description or the parent ticket the actual run URL and attempt, the four job IDs with their conclusions, the verifier's `OK <job> job=<id> ... checkedValues=<n>` lines (also in the run's step summary), and the local `--self-test` result. Source review alone is not evidence. If the end-of-log marker or a log format assumption fails on the first real run, fix the checker; never relax it to pass.
+
+
+---
+
 ## Probe Semantics and TTL
 
 Before every dispatch the orchestrator calls `resolveWorkflowCapabilities` (`src/workflow-probe.ts`; `resolveWorkflowContract` remains the backward-compatible contract-only wrapper). The probe:
@@ -275,6 +337,12 @@ To revert to the legacy contract, revert the sync PR. The probe detects the abse
 ### Verification
 
 After the sync PR merges, trigger a test dispatch (add the `AI-Implement` label to a test issue). In the GitHub Actions run, the "Run pipeline" step should show `AI_IMPLEMENT_RUN_CONFIG` in the environment rather than the legacy `ISSUE_ID`, `ISSUE_TITLE`, etc. variables.
+
+---
+
+## Input allowlist guard (AII-680)
+
+Each synced workflow's `workflow_dispatch` inputs are pinned exactly, with a reason per input, in `src/__tests__/workflow-input-allowlist.test.ts` and [ADR 032](adr/032-private-run-envelope-and-credential-bootstrap.md). The same test checks canonical/synced byte identity and scans diagnostic and forwarding steps for envelope or credential leaks, with negative fixtures. Adding an input means changing both the test contract and the ADR. `provider` and `aws_region` are retained top-level nonsecret inputs. Rollout evidence (run 36867304479) and the future sync gate are recorded in the ADR; no sync has been performed.
 
 ---
 
