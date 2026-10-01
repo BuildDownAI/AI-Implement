@@ -1,6 +1,9 @@
 // Unit tests for the kg-refresh production composer and ingress client (AII-895).
 // No Docker and no Restate runtime: the services are only constructed, the GHA dispatch
 // is exercised against a mocked postWorkflowDispatch, and the client against a faked fetch.
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const postWorkflowDispatch = vi.fn();
@@ -69,6 +72,7 @@ function makeInput(overrides: Partial<KgRefreshProductionInput> = {}): KgRefresh
     deleteBranchFn: noop as never,
     dispatchKgRefreshRun: vi.fn(async () => ({})),
     updateJobStatus: noop,
+    recordDispatch: vi.fn(),
     getWorkflowRunStatus: vi.fn(async () => ({ status: "completed", conclusion: "success" })),
     findRunByTitle: vi.fn(async () => null),
     cancelWorkflowRun: vi.fn(async () => true),
@@ -230,6 +234,67 @@ describe("non-GHA dispatch", () => {
     const result = await createKgRefreshDispatch(makeInput({ dispatchKgRefreshRun }))(dispatchInput);
     expect(dispatchKgRefreshRun).toHaveBeenCalledWith(expect.objectContaining({ dispatchId: "d-workflow", executionPath: "fly-machines" }));
     expect(result).toMatchObject({ outcome: "accepted", jobId: null, executionMode: "fly-machines" });
+  });
+});
+
+describe("recordDispatch", () => {
+  it("records machine id, nonce and logs URL on a non-GHA dispatch and keeps the nonce out of the result", async () => {
+    resolvedPath.current = "fly-machines";
+    const recordDispatch = vi.fn();
+    const dispatchKgRefreshRun = vi.fn(async () => ({ machineId: "m-1", machineNonce: "nonce-secret", logsUrl: "https://fly/m-1" }));
+    const result = await createKgRefreshDispatch(makeInput({ dispatchKgRefreshRun, recordDispatch }))(dispatchInput);
+    expect(recordDispatch).toHaveBeenCalledWith("d-workflow", expect.objectContaining({ machineId: "m-1", machineNonce: "nonce-secret", logsUrl: "https://fly/m-1" }));
+    expect(JSON.stringify(result)).not.toContain("nonce-secret");
+    expect(result.jobId).toBe("m-1");
+  });
+
+  it("does not leak the nonce through jobId when no machine id came back", async () => {
+    resolvedPath.current = "fly-machines";
+    const dispatchKgRefreshRun = vi.fn(async () => ({ machineNonce: "nonce-secret" }));
+    const result = await createKgRefreshDispatch(makeInput({ dispatchKgRefreshRun }))(dispatchInput);
+    expect(JSON.stringify(result)).not.toContain("nonce-secret");
+  });
+
+  it("records the run id and URL on a GHA dispatch that returned them, and nothing otherwise", async () => {
+    const recordDispatch = vi.fn();
+    postWorkflowDispatch.mockResolvedValue({ success: true, status: 200, outcome: "accepted", runId: 99, runUrl: "https://gh/run/99" });
+    await createKgRefreshDispatch(makeInput({ recordDispatch }))(dispatchInput);
+    expect(recordDispatch).toHaveBeenCalledWith("d-workflow", { workflowRunId: 99, logsUrl: "https://gh/run/99" });
+    recordDispatch.mockClear();
+    postWorkflowDispatch.mockResolvedValue({ success: false, status: 422, outcome: "rejected" });
+    await createKgRefreshDispatch(makeInput({ recordDispatch }))(dispatchInput);
+    expect(recordDispatch).not.toHaveBeenCalled();
+  });
+});
+
+describe("job row after a non-GHA dispatch (real log.ts, scratch database)", () => {
+  it("lets getJobByMachineId and getJobByNonce resolve the kg-refresh row", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kg-record-"));
+    const previous = process.env.DEDUP_DB_PATH;
+    process.env.DEDUP_DB_PATH = path.join(dir, "dedup.sqlite");
+    vi.resetModules();
+    const dedup = await vi.importActual<typeof import("../dedup.js")>("../dedup.js");
+    const log = await vi.importActual<typeof import("../log.js")>("../log.js");
+    try {
+      log.initLogTable();
+      const id = log.appendLogIfAbsent({ issueId: "kg-refresh", phase: "kg-refresh", dispatchId: "d-workflow", executionMode: "fly-machines", repo: "acme/kg" });
+      // The same calls, in the same order, as `recordDispatch` in src/index.ts.
+      const recordDispatch = (dispatchId: string, d: { machineId?: string; machineNonce?: string; logsUrl?: string }) => {
+        const jobId = log.findLogIdByDispatchId(dispatchId);
+        if (jobId === undefined) return;
+        if (d.machineNonce) log.updateJobMachineDetails(jobId, { machineNonce: d.machineNonce, machineId: d.machineId, logsUrl: d.logsUrl });
+      };
+      resolvedPath.current = "fly-machines";
+      const dispatchKgRefreshRun = vi.fn(async () => ({ machineId: "m-7", machineNonce: "nonce-7", logsUrl: "https://fly/m-7" }));
+      await createKgRefreshDispatch(makeInput({ dispatchKgRefreshRun, recordDispatch }))(dispatchInput);
+      expect(log.getJobByMachineId("m-7")?.id).toBe(id);
+      expect(log.getJobByNonce("nonce-7")?.id).toBe(id);
+    } finally {
+      dedup.closeDb();
+      if (previous === undefined) delete process.env.DEDUP_DB_PATH;
+      else process.env.DEDUP_DB_PATH = previous;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

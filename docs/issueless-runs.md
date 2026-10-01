@@ -149,6 +149,8 @@ The `dispatch_log` row (schema in `src/log.ts`, `initLogTable`) written by `appe
 | `run_id` | GHA workflow run ID | Set via `updateJobRunId()` when `findWorkflowRunId` succeeds; null for Fly/local |
 | `pr_url` | Fly machine URL or GHA run URL | Stored via `updateJobPrUrl(jobId, logsUrl)` on dispatch; used as the logs link |
 
+The row gets its machine and run details from the workflow's `dispatch` step: the dispatch closure calls `recordDispatch` (`src/index.ts`) after the backend accepts, so the nonce reaches the row and never the journaled step result, and the reconcile by title records the run id and URL when it later finds the run.
+
 The row lifecycle:
 1. Inserted with `status = "dispatched"` by the workflow's `reserve` step, before the dispatch; the workflow's own dispatch id is the job id
 2. Closed to `"completed"`, `"failed"`, or `"timed_out"` by the workflow's `close-row` step on every terminal outcome

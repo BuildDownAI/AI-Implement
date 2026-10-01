@@ -21,6 +21,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import type { RefreshOutcome } from "../../kg-refresh.js";
 import { RailGateError, type KgRailDeps } from "../../kg-refresh-rail.js";
 import { COMPLETION_MARKER } from "../../kg-sidecar.js";
+import { createKgRefreshIngressClient } from "../../restate/kg-refresh-production.js";
 import { createKgRepo, type KgRepoTriggerResult } from "../../restate/kg-repo.js";
 import {
   createKgRefreshWorkflow,
@@ -1435,7 +1436,12 @@ describe("KgRefresh durable workflow", () => {
       const outcome = await runWorkflow(env.baseUrl(), triggerId);
       expect(outcome.ok).toBe(false);
 
-      await expect(callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT)).rejects.toThrow();
+      const response = await fetch(`${env.baseUrl()}/KgRefresh/${triggerId}/report`, {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(SUCCESS_REPORT),
+      });
+      expect(response.status).toBe(409);
+      const client = createKgRefreshIngressClient(env.baseUrl());
+      expect(await client.report(triggerId, SUCCESS_REPORT)).toEqual({ status: "conflict" });
     },
     15_000,
   );

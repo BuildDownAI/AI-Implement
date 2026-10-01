@@ -55,6 +55,13 @@ type LegacyDispatch = (opts: {
   executionPath?: string;
 }) => Promise<{ machineId?: string; machineNonce?: string; logsUrl?: string; workflowRunId?: number }>;
 
+export interface KgDispatchDetails {
+  machineId?: string;
+  machineNonce?: string;
+  logsUrl?: string;
+  workflowRunId?: number;
+}
+
 export interface KgRefreshProductionInput {
   kgSourceRepo: string;
   config: Pick<AppConfig,
@@ -80,6 +87,9 @@ export interface KgRefreshProductionInput {
   /** Probes the KG source repo's dispatch workflow for `run_publication_token` support. Defaults to `resolveWorkflowCapabilities`. */
   resolveWorkflowCapabilities?: typeof resolveWorkflowCapabilities;
   updateJobStatus: (jobId: number, status: JobStatus, conclusion?: string | null) => void;
+  /** Writes the backend's machine and run details onto the job row for `dispatchId` (a missing row is a no-op).
+   *  Called inside the dispatch closure so `machineNonce` reaches SQLite and never the journal. */
+  recordDispatch: (dispatchId: string, details: KgDispatchDetails) => void;
   /** Recovers the dispatch_log id after a restart (journaled `reserve` does not re-run).
    *  Defaults to a `dispatch_log.dispatch_id` lookup. */
   findJobId?: (dispatchId: string) => number | undefined;
@@ -155,8 +165,13 @@ export function createKgRefreshDispatch(input: KgRefreshProductionInput): (dispa
         runToken: tokens.runToken, runProgressToken: tokens.progressToken,
         dispatchId, runConfig: encoded, executionPath: executionMode,
       });
+      input.recordDispatch(dispatchId, {
+        machineId: legacy.machineId, machineNonce: legacy.machineNonce,
+        logsUrl: legacy.logsUrl, workflowRunId: legacy.workflowRunId,
+      });
+      // The nonce authenticates the machine to /api/token: it goes to the row above, never into the journaled result.
       return { outcome: "accepted", runId: legacy.workflowRunId, runUrl: legacy.logsUrl,
-        jobId: legacy.machineId ?? legacy.machineNonce ?? null, executionMode };
+        jobId: legacy.machineId ?? null, executionMode };
     }
 
     const { token } = await input.mintToken(config.githubAppId, config.githubAppPrivateKey, repo.owner);
@@ -179,6 +194,9 @@ export function createKgRefreshDispatch(input: KgRefreshProductionInput): (dispa
       token, owner: repo.owner, repo: repo.repo, workflowFile: KG_REFRESH_WORKFLOW_FILE,
       ref, inputs, returnRunDetails: true,
     });
+    if (result.runId !== undefined) {
+      input.recordDispatch(dispatchId, { workflowRunId: result.runId, logsUrl: result.runUrl });
+    }
     return {
       outcome: result.outcome ?? (result.success ? "accepted" : "unknown"),
       runId: result.runId,
