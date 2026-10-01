@@ -13,8 +13,8 @@ import { claimPendingCommentGapfills, markCommentGapfillProcessed } from "./comm
 import { getLatestDispatchForPr, getLatestDispatchForIssueIdentifier, appendLog, countPriorDispatches, updateJobPrUrl, suppressStaleNotifications, type Job } from "./log.js";
 import { resolveExecutionPath, getFlySecretsMinVersion, getFlyProcessLevelSecrets, type RunnerMode } from "./runner-mode.js";
 import { mintRunToken, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
-import { buildEnvelopeDispatchInputs, providerDispatchFields, capDispatchFields, skillsRepoDispatchFields, capRunnerEnv, branchPrefixRunnerEnv, skillsRepoRunnerEnv, getPullRequestState, type DispatchResult } from "./github.js";
-import { encodeRunConfig, type RunConfigV1 } from "./run-config.js";
+import { buildEnvelopeDispatchInputs, assertPrivateTransportForCredentials, providerDispatchFields, capDispatchFields, skillsRepoDispatchFields, capRunnerEnv, branchPrefixRunnerEnv, skillsRepoRunnerEnv, getPullRequestState, type DispatchResult } from "./github.js";
+import { encodeRunConfig, type RunConfigV1, type RunCredentialsV1 } from "./run-config.js";
 import { getRetryPolicy } from "./orchestrator-settings.js";
 import { createMachine, listAppSecrets, generateSessionToken, generateMachineNonce, buildSessionMachineConfig } from "./fly-machines.js";
 import { resolveSessionImage } from "./repo-image.js";
@@ -51,6 +51,9 @@ export interface DrainCommentGapfillsInput {
   sessionImage: string;
   localRunnerImage?: string;
   localRunnerOrchestratorUrl?: string | null;
+  /** Typed trusted-preparation seam (AII-958): private credentials for GHA gap-fill dispatch.
+   *  Requires supportsPrivateRunConfig at the exact workflow/ref or the item fails pre-launch. */
+  getTrustedCredentials?(item: { owner: string; repo: string; prNumber: number }): RunCredentialsV1 | undefined;
 }
 
 /** Grouping branch → the feature-node parent's identifier slug, or null for any other
@@ -591,6 +594,11 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
             ref: mapping.defaultBranch,
           }));
           contract = capabilities.contract;
+          const trustedCredentials = opts.getTrustedCredentials?.({ owner: item.owner, repo: item.repo, prNumber: item.prNumber });
+          assertPrivateTransportForCredentials(
+            trustedCredentials, capabilities,
+            `${mapping.owner}/${mapping.repo}/${mapping.workflowFile}@${mapping.defaultBranch}`,
+          );
           const runPublicationToken = dispatchId && opts.runnerCallbackBaseUrl && opts.runnerTokenSecret && capabilities.contract === "envelope" && capabilities.supportsRunPublicationToken
             ? mintRunToken({
                 issueId: prLog.issueId,
@@ -613,6 +621,8 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
                 runToken,
                 runProgressToken,
                 runPublicationToken,
+                privateTransport: capabilities.supportsPrivateRunConfig === true,
+                credentials: trustedCredentials,
                 runnerImage,
                 retryPolicy: getRetryPolicy(),
               })
