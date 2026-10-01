@@ -197,6 +197,30 @@ describe("KgRepo durable single-flight lock", () => {
   );
 
   it.each(VARIANTS.map(([label]) => label))(
+    "D1: the same key and sha twice submits one workflow; a new sha is accepted; after forgetPr the same sha is accepted again (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const slug = newKey();
+      const before = runSends.length;
+
+      expect(await enqueue(env.baseUrl(), slug, 9, "x")).toEqual({ triggerId: expect.any(String) });
+      await eventually(() => runSends.length - before >= 1, (ok) => ok, { label: "durable effect" });
+      // a same-sha event while that run is in flight neither queues nor submits
+      expect(await enqueue(env.baseUrl(), slug, 9, "x")).toEqual({ duplicate: true });
+      expect((await repoStatus(env.baseUrl(), slug))?.pending).toEqual([]);
+      expect(runSends.length - before).toBe(1);
+
+      // a new sha for the same PR is accepted (queued behind the in-flight run)
+      expect(await enqueue(env.baseUrl(), slug, 9, "y")).toEqual({ queued: true });
+
+      await callObject(env.baseUrl(), "KgRepo", slug, "forgetPr", { repo: "org/kg-source", prNumber: 9 });
+      expect((await repoStatus(env.baseUrl(), slug))?.pending).toEqual([]);
+      expect(await enqueue(env.baseUrl(), slug, 9, "y")).toEqual({ queued: true });
+      expect(runSends.length - before).toBe(1);
+    },
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
     "Q2/Q4: a busy object queues; the newer ref for the same key wins; release submits exactly one workflow (%s)",
     async (label) => {
       const env = envFor(label);

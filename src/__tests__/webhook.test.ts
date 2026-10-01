@@ -712,10 +712,14 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
     expect(JSON.parse(res.body).reason).toBe("no matching dispatch");
   });
 
-  it("hands two deliveries for the same head sha to the object, each with its own delivery id (AII-977)", async () => {
-    const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } });
+  it("hands two deliveries for the same head sha to the object, each with its own delivery id; a duplicate answers 200 (AII-977)", async () => {
+    const enqueueDryRun = vi
+      .fn()
+      .mockResolvedValueOnce({ status: "accepted", value: { triggerId: "t-1" } })
+      .mockResolvedValueOnce({ status: "accepted", value: { duplicate: true } });
     const kgPrCheck = makeKgPrCheck({ enqueueDryRun });
     mockPrFiles(["sources.yml"]);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     const payload = prPayload({
       action: "synchronize",
       number: 7,
@@ -732,12 +736,14 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
     webhook.handleGitHubWebhook(second.req as never, second.res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
     await second.res.done;
 
-    // The webhook keeps no sha dedup: the KgRepo object absorbs a redelivery by idempotency key.
+    // The webhook keeps no sha dedup: the KgRepo object absorbs a same-sha event.
     expect(enqueueDryRun).toHaveBeenCalledTimes(2);
     expect(enqueueDryRun.mock.calls.map((c) => c[2])).toEqual([
       { idempotencyKey: "delivery-1" },
       { idempotencyKey: "delivery-2" },
     ]);
+    // the duplicate is logged as skipped, not dispatched
+    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("skipped (duplicate sha)"));
   });
 
   it("a guard-relevant synchronize on the KG source repo runs both rails: the dry-run dispatches and the normal pull_request handling answers (AII-639)", async () => {

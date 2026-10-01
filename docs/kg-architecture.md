@@ -321,8 +321,9 @@ stored sha. The `dry-run-report` step sends `recordDryRunOutcome`; the webhook r
 eviction order), and `forgetPr` on PR close drops the outcome and any held head. Outcomes survive a
 restart in Restate state; the old `kg_refresh_dry_run_outcomes` settings row is deleted at boot, and
 its live outcomes are re-posted by the next push. The webhook keeps no sha dedup: the delivery id is
-the `enqueueDryRun` idempotency key, and a same-key held entry is replaced, so a redelivery is
-absorbed (a same-sha re-push with a new delivery id may run a second dry run). A PR dry-run queued behind a
+the `enqueueDryRun` idempotency key, and the object keeps one `sha:<repo>#<pr>` state key holding the
+last head sha it accepted for the PR — a second event for that sha (any delivery id) returns
+`{ duplicate: true }`, neither submitting nor queuing, and the webhook answers 200. `forgetPr` clears the key. A PR dry-run queued behind a
 running refresh is held in the `KgRepo` object's `pending` state and submitted by its `release`
 handler when the in-flight refresh lets go — a real refresh, a failure, a revert, or a stale marker
 clearing all release it.

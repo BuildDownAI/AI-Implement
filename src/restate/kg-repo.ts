@@ -59,7 +59,7 @@ export interface KgRepoDependencies {
 
 export type KgRepoTriggerResult = { triggerId: string } | { status: "refresh-in-progress"; triggerId: string };
 
-export type KgRepoEnqueueResult = { triggerId: string } | { queued: true };
+export type KgRepoEnqueueResult = { triggerId: string } | { queued: true } | { duplicate: true };
 
 const triggerInputSchema = kgRefreshOptionsSchema.optional();
 
@@ -85,6 +85,7 @@ export type KgRepoRecordOutcomeInput = { report: KgDryRunReportTarget; outcome: 
 export type KgRepoEnqueueInput = z.infer<typeof enqueueInputSchema> & { report: KgDryRunReportTarget };
 
 const outcomeStateKey = (repo: string, prNumber: number): string => `outcome:${repo}#${prNumber}`;
+const shaStateKey = (repo: string, prNumber: number): string => `sha:${repo}#${prNumber}`;
 
 /** The key of the oldest held entry; insertion order breaks an `enqueuedAt` tie. */
 function oldestPendingKey(pending: Record<string, PendingDryRun>): string | undefined {
@@ -133,6 +134,10 @@ export function createKgRepo(deps: KgRepoDependencies) {
 
   async function enqueueDryRun(ctx: ObjectContext, input: KgRepoEnqueueInput): Promise<KgRepoEnqueueResult> {
     const { key, ref, report } = input;
+    // The last head sha accepted for this PR: a second event for it (any delivery id) is absorbed here.
+    const shaKey = shaStateKey(report.repo, report.prNumber);
+    if ((await ctx.get<string>(shaKey)) === report.sha) return { duplicate: true };
+    ctx.set(shaKey, report.sha);
     const now = await ctx.date.now();
     const live = await liveInFlight(ctx);
     if (!live) return { triggerId: submit(ctx, now, { dryRun: true, kgSourceRef: ref, report }) };
@@ -195,6 +200,7 @@ export function createKgRepo(deps: KgRepoDependencies) {
   async function forgetPr(ctx: ObjectContext, input: KgRepoPrInput): Promise<void> {
     const stateKey = outcomeStateKey(input.repo, input.prNumber);
     ctx.clear(stateKey);
+    ctx.clear(shaStateKey(input.repo, input.prNumber));
     const order = (await ctx.get<string[]>("outcomeKeys")) ?? [];
     if (order.includes(stateKey)) ctx.set("outcomeKeys", order.filter((k) => k !== stateKey));
 

@@ -18,7 +18,7 @@ import { join } from "node:path";
 import * as restate from "@restatedev/restate-sdk";
 import type { RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import type { KgDryRunReportTarget, RefreshOutcome } from "../../kg-refresh.js";
+import type { RefreshOutcome } from "../../kg-refresh.js";
 import { RailGateError, type KgRailDeps } from "../../kg-refresh-rail.js";
 import { COMPLETION_MARKER } from "../../kg-sidecar.js";
 import { createKgRepo, type KgRepoTriggerResult } from "../../restate/kg-repo.js";

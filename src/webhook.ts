@@ -83,7 +83,7 @@ export interface KgPrCheckConfig {
     entry: { ref: string; report: KgDryRunReportTarget },
     opts?: { idempotencyKey?: string },
   ) => Promise<
-    | { status: "accepted"; value?: { triggerId: string } | { queued: true } }
+    | { status: "accepted"; value?: { triggerId: string } | { queued: true } | { duplicate: true } }
     | { status: "conflict" }
     | { status: "unavailable" }
   >;
@@ -252,6 +252,10 @@ async function handleKgPrCheckWebhook(
   }
 
   const value = result.value;
+  if (value && "duplicate" in value) {
+    console.log(`[kg-refresh] dry-run for ${repoFullName}@${sha} skipped (duplicate sha)`);
+    return answer(200, { ignored: true, reason: "duplicate_sha" }, "duplicate head sha");
+  }
   if (value && "queued" in value) {
     console.log(`[kg-refresh] dry-run for ${repoFullName}@${sha} (queued dispatch)`);
     return answer(202, { queued: true }, "queued behind the running refresh");
