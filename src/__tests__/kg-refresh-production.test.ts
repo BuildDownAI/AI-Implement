@@ -74,7 +74,6 @@ function makeInput(overrides: Partial<KgRefreshProductionInput> = {}): KgRefresh
     cancelWorkflowRun: vi.fn(async () => true),
     persistLastRefresh: noop,
     handleKgRefreshOutcome: noop,
-    recordDryRunOutcome: noop,
     isDeployHeld: () => false,
     readStatusRecord: () => null,
     runPreflight: vi.fn(async () => ({ ok: true, checkedAt: 1, results: [] })),

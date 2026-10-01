@@ -380,6 +380,85 @@ describe("KgRepo durable single-flight lock", () => {
     },
     30_000,
   );
+
+  // ---- AII-977: the per-PR dry-run outcome ----
+
+  const outcomeFor = (n: number) => ({
+    ok: true, at: n, detail: `dry run passed ${n}`, stampBefore: null, stampAfter: null, dryRun: true,
+  });
+  const record = (baseUrl: string, slug: string, prNumber: number, sha = `sha-${prNumber}`) =>
+    callObject(baseUrl, "KgRepo", slug, "recordDryRunOutcome", { report: reportFor(prNumber, sha), outcome: outcomeFor(prNumber) });
+  const readOutcome = (baseUrl: string, slug: string, prNumber: number) =>
+    callObject<{ sha: string; outcome: unknown } | null>(baseUrl, "KgRepo", slug, "dryRunOutcome", { repo: "org/kg-source", prNumber });
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "O1: recordDryRunOutcome then dryRunOutcome returns the same sha and outcome; an unknown PR is null (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const slug = newKey();
+      await record(env.baseUrl(), slug, 3, "sha-a");
+      expect(await readOutcome(env.baseUrl(), slug, 3)).toEqual({ sha: "sha-a", outcome: outcomeFor(3) });
+      expect(await readOutcome(env.baseUrl(), slug, 4)).toBeNull();
+
+      // A newer head for the same PR replaces it.
+      await record(env.baseUrl(), slug, 3, "sha-b");
+      expect((await readOutcome(env.baseUrl(), slug, 3))?.sha).toBe("sha-b");
+    },
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "O2: forgetPr clears the outcome and the PR's pending entry, and leaves other PRs (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const slug = newKey();
+      await trigger(env.baseUrl(), slug);
+      await enqueue(env.baseUrl(), slug, 1, "one");
+      await enqueue(env.baseUrl(), slug, 2, "two");
+      await record(env.baseUrl(), slug, 1);
+      await record(env.baseUrl(), slug, 2);
+
+      await callObject(env.baseUrl(), "KgRepo", slug, "forgetPr", { repo: "org/kg-source", prNumber: 1 });
+
+      expect(await readOutcome(env.baseUrl(), slug, 1)).toBeNull();
+      expect(await readOutcome(env.baseUrl(), slug, 2)).not.toBeNull();
+      expect((await repoStatus(env.baseUrl(), slug))?.pending).toEqual(["org/kg-source#2"]);
+    },
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "O3: MAX_TRACKED_PRS + 1 outcomes evict the oldest; re-recording moves a PR to the back (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const slug = newKey();
+      for (let n = 1; n <= MAX_TRACKED_PRS; n++) await record(env.baseUrl(), slug, n);
+      // PR 1 is re-recorded, so PR 2 is now the oldest.
+      await record(env.baseUrl(), slug, 1);
+      await record(env.baseUrl(), slug, MAX_TRACKED_PRS + 1);
+
+      expect(await readOutcome(env.baseUrl(), slug, 2)).toBeNull();
+      expect(await readOutcome(env.baseUrl(), slug, 1)).not.toBeNull();
+      expect(await readOutcome(env.baseUrl(), slug, MAX_TRACKED_PRS + 1)).not.toBeNull();
+    },
+    120_000,
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "the outcome handlers reject unknown fields (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const slug = newKey();
+      await expect(
+        callObject(env.baseUrl(), "KgRepo", slug, "recordDryRunOutcome", { report: reportFor(1), outcome: outcomeFor(1), extra: 1 }),
+      ).rejects.toThrow();
+      await expect(
+        callObject(env.baseUrl(), "KgRepo", slug, "dryRunOutcome", { repo: "org/kg-source", prNumber: 1, extra: 1 }),
+      ).rejects.toThrow();
+      await expect(
+        callObject(env.baseUrl(), "KgRepo", slug, "forgetPr", { repo: "org/kg-source", prNumber: 1, extra: 1 }),
+      ).rejects.toThrow();
+      expect(await readOutcome(env.baseUrl(), slug, 1)).toBeNull();
+    },
+  );
 });
 
 describe("KgRepo object-owned lease expiry", () => {

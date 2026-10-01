@@ -313,12 +313,16 @@ is a distinct mechanism from an admin accepting a new baseline at refresh time (
 refresh against that same source still refuses the shrink unless that refresh-time acceptance has
 happened. Treat the label as "we've seen this and it's expected," not as a bypass.
 
-Outcomes are stored per PR, keyed by `repo#prNumber` and pinned to the head sha they ran against
-(AII-636), so a `labeled` re-report can only ever surface that PR's own verdict — never another PR's
-— and is a no-op once a new push supersedes the stored sha. The cache is bounded (`MAX_TRACKED_PRS`),
-evicted immediately on PR close, and persisted as one JSON blob under the `kg_refresh_dry_run_outcomes`
-settings key on every record and eviction, so a restart between a dry run and a later `labeled` /
-`unlabeled` event still finds the outcome (AII-640). A PR dry-run queued behind a
+Outcomes are stored per PR on the `KgRepo` object, one `outcome:<repo>#<prNumber>` state key each,
+pinned to the head sha they ran against (AII-636, AII-977), so a `labeled` re-report can only ever
+surface that PR's own verdict — never another PR's — and is a no-op once a new push supersedes the
+stored sha. The `dry-run-report` step sends `recordDryRunOutcome`; the webhook reads it back with
+`dryRunOutcome`. At most `MAX_TRACKED_PRS` outcomes are kept (an `outcomeKeys` list gives the
+eviction order), and `forgetPr` on PR close drops the outcome and any held head. Outcomes survive a
+restart in Restate state; the old `kg_refresh_dry_run_outcomes` settings row is deleted at boot, and
+its live outcomes are re-posted by the next push. The webhook keeps no sha dedup: the delivery id is
+the `enqueueDryRun` idempotency key, and a same-key held entry is replaced, so a redelivery is
+absorbed (a same-sha re-push with a new delivery id may run a second dry run). A PR dry-run queued behind a
 running refresh is held in the `KgRepo` object's `pending` state and submitted by its `release`
 handler when the in-flight refresh lets go — a real refresh, a failure, a revert, or a stale marker
 clearing all release it.

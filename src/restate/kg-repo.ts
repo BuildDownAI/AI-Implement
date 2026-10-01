@@ -20,7 +20,7 @@ import * as restate from "@restatedev/restate-sdk";
 import type { ObjectContext, ObjectSharedContext } from "@restatedev/restate-sdk";
 import { serde } from "@restatedev/restate-sdk-zod";
 import { z } from "zod";
-import { MAX_TRACKED_PRS, type KgDryRunReportTarget } from "../kg-refresh.js";
+import { MAX_TRACKED_PRS, type KgDryRunReportTarget, type RefreshOutcome } from "../kg-refresh.js";
 import {
   KG_REFRESH_TOTAL_DEADLINE_MS,
   KG_REPO_STALE_MARGIN_MS,
@@ -40,6 +40,12 @@ interface PendingDryRun {
   ref: string;
   report: KgDryRunReportTarget;
   enqueuedAt: number;
+}
+
+/** The stored verdict of one PR's last dry run, in state under `outcome:<repo>#<prNumber>`. */
+export interface StoredDryRunOutcome {
+  sha: string;
+  outcome: RefreshOutcome;
 }
 
 export interface KgRepoDependencies {
@@ -63,10 +69,22 @@ const enqueueInputSchema = z.object({
   report: kgDryRunReportSchema,
 }).strict();
 
+const prInputSchema = z.object({ repo: z.string().min(1), prNumber: z.number() }).strict();
+
+const recordOutcomeInputSchema = z.object({
+  report: kgDryRunReportSchema,
+  // The workflow built it; the object stores it verbatim and never reads inside it.
+  outcome: z.custom<RefreshOutcome>((v) => typeof v === "object" && v !== null),
+}).strict();
+
 const leaseInputSchema = z.object({ triggerId: z.string().min(1) }).strict();
 
 export type KgRepoTriggerInput = z.infer<typeof kgRefreshOptionsSchema>;
+export type KgRepoPrInput = z.infer<typeof prInputSchema>;
+export type KgRepoRecordOutcomeInput = { report: KgDryRunReportTarget; outcome: RefreshOutcome };
 export type KgRepoEnqueueInput = z.infer<typeof enqueueInputSchema> & { report: KgDryRunReportTarget };
+
+const outcomeStateKey = (repo: string, prNumber: number): string => `outcome:${repo}#${prNumber}`;
 
 /** The key of the oldest held entry; insertion order breaks an `enqueuedAt` tie. */
 function oldestPendingKey(pending: Record<string, PendingDryRun>): string | undefined {
@@ -158,6 +176,37 @@ export function createKgRepo(deps: KgRepoDependencies) {
     }
   }
 
+  /** Stores the PR's verdict; one state key per PR, with `outcomeKeys` holding the insertion order for the cap. */
+  async function recordDryRunOutcome(ctx: ObjectContext, input: KgRepoRecordOutcomeInput): Promise<void> {
+    const { report, outcome } = input;
+    const stateKey = outcomeStateKey(report.repo, report.prNumber);
+    const order = ((await ctx.get<string[]>("outcomeKeys")) ?? []).filter((k) => k !== stateKey);
+    order.push(stateKey);
+    while (order.length > MAX_TRACKED_PRS) ctx.clear(order.shift()!);
+    ctx.set("outcomeKeys", order);
+    ctx.set<StoredDryRunOutcome>(stateKey, { sha: report.sha, outcome });
+  }
+
+  async function dryRunOutcome(ctx: ObjectSharedContext, input: KgRepoPrInput): Promise<StoredDryRunOutcome | null> {
+    return (await ctx.get<StoredDryRunOutcome>(outcomeStateKey(input.repo, input.prNumber))) ?? null;
+  }
+
+  /** A closed PR can never be re-reported: drops its verdict and any held dry-run head. */
+  async function forgetPr(ctx: ObjectContext, input: KgRepoPrInput): Promise<void> {
+    const stateKey = outcomeStateKey(input.repo, input.prNumber);
+    ctx.clear(stateKey);
+    const order = (await ctx.get<string[]>("outcomeKeys")) ?? [];
+    if (order.includes(stateKey)) ctx.set("outcomeKeys", order.filter((k) => k !== stateKey));
+
+    const pending = await ctx.get<Record<string, PendingDryRun>>("pending");
+    const pendingKey = `${input.repo}#${input.prNumber}`;
+    if (pending && pendingKey in pending) {
+      delete pending[pendingKey];
+      if (Object.keys(pending).length === 0) ctx.clear("pending");
+      else ctx.set("pending", pending);
+    }
+  }
+
   async function status(ctx: ObjectSharedContext): Promise<(InFlightMarker & { pending: string[] }) | null> {
     const inFlight = await ctx.get<InFlightMarker>("inFlight");
     if (!inFlight) return null;
@@ -172,6 +221,9 @@ export function createKgRepo(deps: KgRepoDependencies) {
       enqueueDryRun: restate.handlers.object.exclusive({ input: serde.zod(enqueueInputSchema) }, enqueueDryRun),
       release: restate.handlers.object.exclusive({ input: serde.zod(leaseInputSchema) }, release),
       expire: restate.handlers.object.exclusive({ input: serde.zod(leaseInputSchema) }, expire),
+      recordDryRunOutcome: restate.handlers.object.exclusive({ input: serde.zod(recordOutcomeInputSchema) }, recordDryRunOutcome),
+      dryRunOutcome: restate.handlers.object.shared({ input: serde.zod(prInputSchema) }, dryRunOutcome),
+      forgetPr: restate.handlers.object.exclusive({ input: serde.zod(prInputSchema) }, forgetPr),
       status: restate.handlers.object.shared(status),
     },
   });

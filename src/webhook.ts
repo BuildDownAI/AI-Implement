@@ -11,7 +11,6 @@ import { resolveWorkflowContract } from "./workflow-probe.js";
 import { enqueueCommentGapfill } from "./comment-gapfill-queue.js";
 import { addCommentReaction, listPullRequestFiles } from "./github.js";
 import { refreshAvailability, type SelfDeployTarget } from "./deploy-availability.js";
-import { MAX_TRACKED_PRS } from "./kg-refresh.js";
 
 function readRawBody(req: http.IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
@@ -90,12 +89,8 @@ export interface KgPrCheckConfig {
   >;
   /** Returns whether it actually posted — false on a silent no-op (AII-636). */
   reportDryRun: (report: KgDryRunReportTarget) => Promise<boolean>;
-  /**
-   * Evicts `KgRefreshHandle`'s stored dry-run outcome for `repo`#`prNumber` (AII-636).
-   * Called from this module's own `closed` handling below, alongside its own
-   * `kgDryRunLastSha` eviction for the same PR.
-   */
-  forgetKgPr?: (repo: string, prNumber: number) => void;
+  /** Evicts the `KgRepo` object's stored dry-run outcome for `repo`#`prNumber` (AII-636), on `closed`. */
+  forgetKgPr?: (repo: string, prNumber: number) => void | Promise<void>;
 }
 
 /** Paths whose change on a KG repo PR proves the dry-run rail before merge (AII-633). */
@@ -114,24 +109,16 @@ function hasAcceptBaselineLabel(payload: PullRequestPayload): boolean {
 }
 
 /**
- * Tracks the last sha a dry-run was dispatched for, per PR, so a redelivered/duplicate
- * webhook does not re-dispatch. Bounded to MAX_TRACKED_PRS entries (shared with
- * kg-refresh.ts's own per-PR cache, AII-636) — oldest evicted first on insert past the
- * cap — and cleared per-PR on PR close via forgetKgPr().
- */
-const kgDryRunLastSha = new Map<string, string>();
-
-/**
- * Evicts `repo`#`prNumber`'s entries from the webhook-local cache, plus the
- * kg-refresh handle's own stored dry-run outcome for the same PR when
- * `kgPrCheck.forgetKgPr` is wired (AII-636). Called on `pull_request` `closed` — a
+ * Evicts the `KgRepo` object's stored dry-run outcome and held head for `repo`#`prNumber`
+ * when `kgPrCheck.forgetKgPr` is wired (AII-636, AII-977); a rejection is logged, not thrown.
+ * Called on `pull_request` `closed` — a
  * closed PR can never legitimately receive another `labeled` re-report, so there is
- * no reason to wait for the MAX_TRACKED_PRS cap to evict it naturally.
+ * no reason to wait for the MAX_TRACKED_PRS cap to evict it.
  */
 function forgetKgPr(kgPrCheck: KgPrCheckConfig | undefined, repoFullName: string, prNumber: number): void {
-  const key = `${repoFullName}#${prNumber}`;
-  kgDryRunLastSha.delete(key);
-  kgPrCheck?.forgetKgPr?.(repoFullName, prNumber);
+  Promise.resolve(kgPrCheck?.forgetKgPr?.(repoFullName, prNumber)).catch((err) => {
+    console.warn(`[webhook] kg-refresh forgetPr failed for ${repoFullName}#${prNumber}:`, err);
+  });
 }
 
 /**
@@ -217,10 +204,6 @@ async function handleKgPrCheckWebhook(
   }
 
   const key = `${repoFullName}#${prNumber}`;
-  if (kgDryRunLastSha.get(key) === sha) {
-    return answer(200, { ignored: true, reason: "duplicate_sha" }, "duplicate sha");
-  }
-
   if (!kgPrCheck.githubAppId || !kgPrCheck.githubAppPrivateKey) {
     return answer(200, { ignored: true, reason: "no_app_credentials" }, "no App credentials");
   }
@@ -247,15 +230,6 @@ async function handleKgPrCheckWebhook(
     return answer(200, { ignored: true, reason: "no_guard_relevant_change" }, "no guard-relevant change");
   }
 
-  // Record before dispatch (not after) so a burst of redeliveries for the same sha
-  // while the trigger call is in flight still collapses to one dispatch.
-  kgDryRunLastSha.delete(key);
-  kgDryRunLastSha.set(key, sha);
-  if (kgDryRunLastSha.size > MAX_TRACKED_PRS) {
-    const oldestKey = kgDryRunLastSha.keys().next().value;
-    if (oldestKey !== undefined) kgDryRunLastSha.delete(oldestKey);
-  }
-
   const report: KgDryRunReportTarget = {
     repo: repoFullName,
     prNumber,
@@ -272,9 +246,7 @@ async function handleKgPrCheckWebhook(
 
   if (result.status !== "accepted") {
     // No inbox, queue, or retry loop here: a lost delivery leaves the required check
-    // pending, and a re-push or manual redelivery recovers it. Clear the dedup so that
-    // same sha is not wrongly skipped.
-    if (kgDryRunLastSha.get(key) === sha) kgDryRunLastSha.delete(key);
+    // pending, and a re-push or manual redelivery recovers it.
     console.warn(`[webhook] kg-refresh dry-run enqueue ${result.status} for ${repoFullName}#${prNumber}`);
     return answer(502, { error: "kg_refresh_enqueue_failed", status: result.status }, `enqueue ${result.status}`);
   }
