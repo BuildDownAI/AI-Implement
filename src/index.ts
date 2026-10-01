@@ -23,8 +23,8 @@ import {
   type StaleAdmissionCandidate,
 } from "./dispatch-admission.js";
 import { reconcileFilesystemFailures } from "./filesystem-ticket-lifecycle.js";
-import { dispatchWorkflow, postWorkflowDispatch, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, getPullRequestState, buildEnvelopeDispatchInputs, postPrComment, defaultFetchSignal, getRepoDefaultBranch, buildKgRefreshGhaDispatchBody, pollForKgWorkflowRunId, type DispatchInputs } from "./github.js";
-import { resolveWorkflowCapabilities, resolveWorkflowContract, type WorkflowContract } from "./workflow-probe.js";
+import { dispatchWorkflow, postWorkflowDispatch, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, getPullRequestState, buildEnvelopeDispatchInputs, assertPrivateTransportForCredentials, postPrComment, defaultFetchSignal, getRepoDefaultBranch, buildKgRefreshGhaDispatchBody, buildPrivateKgRefreshGhaDispatchBody, pollForKgWorkflowRunId, type DispatchInputs } from "./github.js";
+import { resolveWorkflowCapabilities, type WorkflowContract } from "./workflow-probe.js";
 import { surfaceDispatchFailure } from "./dispatch-failure.js";
 import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
 import { dispatchLocalGapfill } from "./local-gapfill.js";
@@ -104,7 +104,7 @@ import {
 import { clearPrNotFoundGrace, decideCleanExitOutcome, shouldSkipCompletionNotice, workflowFileForJob } from "./monitor-status.js";
 import type { RunPrCandidate, RunPrMatch } from "./monitor-status.js";
 import { pickPrForRun } from "./monitor-status.js";
-import { type RunConfigV1, encodeRunConfig, decodeRunConfig, buildImplRunConfig } from "./run-config.js";
+import { type RunConfigV1, type RunCredentialsV1, encodeRunConfig, decodeRunConfig, decodeTrustedRunConfig, buildImplRunConfig } from "./run-config.js";
 import { resolveBaseBranch, findOpenRollUpPr, resolvePlanningBranch } from "./feature-branch.js";
 import { validateIssueBaseBranch, postBranchComment } from "./base-branch.js";
 import { runMergeUps, clearRollUpHandledMarkersByIdentifier } from "./merge-up.js";
@@ -1067,6 +1067,10 @@ export async function dispatchGitHubActions(
   /** The validated "AI-Implement Base Branch" field value, or null when unset. Distinct
    *  from baseBranch, which also covers the feature-branch-grouping fallback. */
   baseBranchFieldValue: string | null,
+  /** Typed trusted-preparation seam (AII-958 composes it): private credentials such as a
+   *  model-auth grant. Requires supportsPrivateRunConfig at the exact workflow/ref; an
+   *  unsupported reader fails before launch rather than dropping them. */
+  trustedCredentials?: RunCredentialsV1,
 ): Promise<void> {
   // Final admission authority: one transaction reserves team capacity and per-issue
   // occupancy before any credential mint or launch call. canDispatch (checked earlier,
@@ -1133,6 +1137,10 @@ export async function dispatchGitHubActions(
         ref: mapping.defaultBranch,
       });
       const { contract } = workflowCapabilities;
+      assertPrivateTransportForCredentials(
+        trustedCredentials, workflowCapabilities,
+        `${mapping.owner}/${mapping.repo}/${mapping.workflowFile}@${mapping.defaultBranch}`,
+      );
       const runPublicationToken = contract === "envelope"
         && workflowCapabilities.supportsRunPublicationToken
         && dispatchId
@@ -1158,6 +1166,8 @@ export async function dispatchGitHubActions(
             runToken,
             runProgressToken,
             runPublicationToken,
+            privateTransport: workflowCapabilities.supportsPrivateRunConfig === true,
+            credentials: trustedCredentials,
             runnerImage,
             groupingParent: isGroupingParentDispatch(issue) || undefined,
             retryPolicy: getRetryPolicy(),
@@ -1299,6 +1309,9 @@ export type PlanningDispatchContext = {
    *  resolvedPlanningBranch, which may instead resolve to the feature-branch chain
    *  target or fall back to the mapping default. */
   planningFieldValue: string | null;
+  /** Typed trusted-preparation seam (AII-958): private credentials for the planning run. Planning
+   *  never receives publication authority; requires supportsPrivateRunConfig or fails pre-launch. */
+  trustedCredentials?: RunCredentialsV1;
 };
 
 /**
@@ -1680,13 +1693,18 @@ export async function dispatchPlanning(
       // Legacy contract only; under the envelope the branch rides inside run_config.
       const planningSentBaseBranch = resolvedPlanningBranch !== mapping.defaultBranch;
 
-      const planningContract = await resolveWorkflowContract({
+      const planningCapabilities = await resolveWorkflowCapabilities({
         owner: mapping.owner,
         repo: mapping.repo,
         workflowFile: mapping.planningWorkflowFile,
         token: ghToken,
         ref: mapping.defaultBranch,
       });
+      const planningContract = planningCapabilities.contract;
+      assertPrivateTransportForCredentials(
+        ctx.trustedCredentials, planningCapabilities,
+        `${mapping.owner}/${mapping.repo}/${mapping.planningWorkflowFile}@${mapping.defaultBranch}`,
+      );
 
       const planningDispatchInputs = planningContract === "envelope"
         ? buildEnvelopeDispatchInputs(planningMapping, issue, {
@@ -1695,7 +1713,9 @@ export async function dispatchPlanning(
             baseBranch: planningSentBaseBranch ? resolvedPlanningBranch : undefined,
             runnerCallbackUrl: runnerCallbackUrl || undefined,
             runToken,
-            // No runProgressToken: planning dispatches don't mint progress tokens.
+            // No runProgressToken or publication token: planning mints the result audience only.
+            privateTransport: planningCapabilities.supportsPrivateRunConfig === true,
+            credentials: ctx.trustedCredentials,
             runnerImage,
             planningContext: planningContextInputs,
             // Planning has no retry loop, so nothing is stamped — but retryPolicy is
@@ -4066,6 +4086,7 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
               runToken,
               runProgressToken,
               runPublicationToken,
+              privateTransport: reviewFixCapabilities.supportsPrivateRunConfig === true,
               runnerImage,
               retryPolicy: getRetryPolicy(),
             })
@@ -4331,7 +4352,34 @@ export async function dispatchKgRefreshRun(
       runnerImageExplicit: config.runnerImageExplicit,
     });
     const runnerCallbackUrl = config.runnerCallbackBaseUrl ?? undefined;
-    const dispatchInputs = buildKgRefreshGhaDispatchBody({ runConfig: opts.runConfig, runToken: opts.runToken, runProgressToken: opts.runProgressToken, runnerImage, runnerCallbackUrl, runnerPhase: "kg-refresh", jobTimeoutMinutes: "240", issueIdentifier: decodedConfig.issue.identifier });
+    // Inspect the trusted form first: the generic decode above drops credentials. Any supplied
+    // private credentials or resolved snapshot must reach a reader that can protect them, so an
+    // unsupported or unprobeable workflow fails before launch instead of stripping/downgrading.
+    const trustedConfig = decodeTrustedRunConfig(opts.runConfig);
+    const requiresProtected = trustedConfig.credentials !== undefined || trustedConfig.agentConfig !== undefined;
+    let privateTransport = false;
+    try {
+      const capabilities = await resolveWorkflowCapabilities({
+        owner: repo.owner,
+        repo: repo.repo,
+        workflowFile: KG_REFRESH_WORKFLOW_FILE,
+        token: controlToken,
+        ref: dispatchRef,
+      });
+      privateTransport = capabilities.supportsPrivateRunConfig === true;
+    } catch (err) {
+      if (requiresProtected) throw err;
+    }
+    if (requiresProtected && !privateTransport) {
+      throw new Error(
+        `[kg-refresh] ${repo.owner}/${repo.repo}/${KG_REFRESH_WORKFLOW_FILE}@${dispatchRef} does not support private run config; ` +
+        "refusing to dispatch protected configuration — re-sync workflows",
+      );
+    }
+    const kgBodyOpts = { runConfig: opts.runConfig, runToken: opts.runToken, runProgressToken: opts.runProgressToken, runnerImage, runnerCallbackUrl, runnerPhase: "kg-refresh" as const, jobTimeoutMinutes: "240", issueIdentifier: decodedConfig.issue.identifier };
+    const dispatchInputs = privateTransport
+      ? buildPrivateKgRefreshGhaDispatchBody({ ...kgBodyOpts, trustedConfig })
+      : buildKgRefreshGhaDispatchBody(kgBodyOpts);
     const dispatchedAt = Date.now();
     const dispatchResult = await postWorkflowDispatch({
       token: controlToken,

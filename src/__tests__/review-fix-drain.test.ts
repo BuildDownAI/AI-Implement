@@ -1272,3 +1272,64 @@ describe("processReviewFixQueue — admission (AII-787)", () => {
     expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(1);
   });
 });
+
+describe("processReviewFixQueue — legacy GHA writer private transport (AII-983)", () => {
+  const tokenConfig = {
+    ...mockConfig,
+    runnerCallbackBaseUrl: "https://callback.example",
+    runnerTokenSecret: "runner-token-secret-with-enough-entropy",
+  } as unknown as IndexModule.AppConfig;
+
+  async function run(caps: Record<string, unknown>, issueId: string) {
+    process.env.RUNNER_MODE = "default";
+    configModule.upsertMapping("TEAM", makeMapping({ executionMode: "github-actions" }));
+    reviewFixQueue.enqueueReviewFix({
+      issueId, issueIdentifier: `AII-${issueId}`, repo: "acme/billing", prNumber: 77, reason: "late review comment",
+    });
+    const githubModule = await import("../github.js");
+    const workflowProbeModule = await import("../workflow-probe.js");
+    const repoImageModule = await import("../repo-image.js");
+    const dispatchWorkflowSpy = vi.spyOn(githubModule, "dispatchWorkflow").mockResolvedValue({ success: true, status: 204 });
+    vi.spyOn(workflowProbeModule, "resolveWorkflowCapabilities").mockResolvedValue(caps as never);
+    vi.spyOn(repoImageModule, "resolveRunnerImageForDispatch").mockResolvedValue(undefined);
+    await indexModule.processReviewFixQueue(tokenConfig, mockRegistry);
+    expect(dispatchWorkflowSpy).toHaveBeenCalledTimes(1);
+    return dispatchWorkflowSpy.mock.calls[0]![2] as Record<string, string | undefined>;
+  }
+
+  const envelope = (extra: Record<string, unknown> = {}) => ({
+    contract: "envelope", supportsRunPublicationToken: true, supportsAttemptCorrelation: false, ...extra,
+  });
+
+  it("capable reader: bearers only in credentials, none top-level", async () => {
+    const { decodeTrustedRunConfig, decodeRunConfig } = await import("../run-config.js");
+    const inputs = await run(envelope({ supportsPrivateRunConfig: true }), "rf-private");
+    const creds = decodeTrustedRunConfig(inputs.run_config!).credentials!;
+    expect(creds.resultToken).toBeTruthy();
+    expect(creds.progressToken).toBeTruthy();
+    expect(creds.publicationToken).toBeTruthy();
+    expect(decodeRunConfig(inputs.run_config!).credentials).toBeUndefined();
+    expect(inputs.run_token).toBe("");
+    expect("run_progress_token" in inputs).toBe(false);
+    expect("run_publication_token" in inputs).toBe(false);
+  });
+
+  it.each([
+    ["envelope without the marker", envelope(), "rf-nomark"],
+    ["explicit false", envelope({ supportsPrivateRunConfig: false }), "rf-false"],
+  ])("%s keeps masked top-level tokens (new writer / old reader)", async (_n, caps, id) => {
+    const { decodeTrustedRunConfig } = await import("../run-config.js");
+    const inputs = await run(caps, id);
+    expect(decodeTrustedRunConfig(inputs.run_config!).credentials).toBeUndefined();
+    expect(inputs.run_token).toBeTruthy();
+    expect(inputs.run_progress_token).toBeTruthy();
+    expect(inputs.run_publication_token).toBeTruthy();
+  });
+
+  it("legacy-contract reader keeps the top-level legacy inputs and never gets run_config", async () => {
+    const inputs = await run({ contract: "legacy", supportsRunPublicationToken: false, supportsAttemptCorrelation: false }, "rf-legacy");
+    expect(inputs.run_config).toBeUndefined();
+    expect(inputs.run_token).toBeTruthy();
+    expect(inputs.run_progress_token).toBeTruthy();
+  });
+});

@@ -242,7 +242,24 @@ The first container-job step of `claude-implement.yml` and `claude-plan.yml` (id
 
 A workflow advertises private-envelope support with the static comment `# ai-implement-capability: private-run-config-v1` — not a `workflow_dispatch` input. `resolveWorkflowCapabilities` sets `supportsPrivateRunConfig` only for an envelope workflow carrying it; missing or unprobed means `false`. It is unrelated to the `stage-agent-config-v1` capability, which a later slice installs.
 
-`buildEnvelopeDispatchInputs` accepts an optional `credentials` and then encodes with `encodeTrustedRunConfig`; legacy `run_token`/`run_progress_token`/`run_publication_token` inputs and the planning/kg-refresh publication exclusion are unchanged. The two-request optional-input retry never strips `run_config` or the tokens. No production writer passes `credentials` until AII-983.
+`buildEnvelopeDispatchInputs` takes `privateTransport` (AII-983) and an optional extra `credentials`; see below. The two-request optional-input retry never strips `run_config` or the tokens, and resends `run_config` byte-identical.
+
+### Private writers and the compatibility matrix (AII-983)
+
+Every GHA writer (implementation, planning, the legacy index.ts review-fix writer, comment-triggered gap-fill and `dispatchKgRefreshRun`) probes the **exact workflow file at the exact ref it dispatches** (planning: `planningWorkflowFile`; KG: `claude-implement.yml` at `kgSourceRef` or the default branch, using the control token) and selects private transport only when `supportsPrivateRunConfig === true`. `contract === "envelope"` alone is never sufficient. The Restate-owned review-fix writer (`src/review-fix-worker.ts`, AII-999) follows the same rule.
+
+| Writer | Reader | Transport |
+|---|---|---|
+| new | new (`supportsPrivateRunConfig === true`) | Bearers in `run_config.credentials` (`encodeTrustedRunConfig`); `run_token` is `""`; no `run_progress_token` / `run_publication_token` inputs |
+| new | old (envelope without the marker, or probe `false`/failed) | Generic `encodeRunConfig` envelope plus masked top-level tokens |
+| new | legacy contract | Legacy per-field inputs plus top-level tokens |
+| old | new | Reader falls back to the top-level `run_*` inputs when no `credentials` namespace exists |
+
+Audiences are unchanged: result for every kind, progress for implementation/gap-fill/KG, publication only for implementation/gap-fill where the reader advertises it. Planning and KG never receive publication authority. `credentials.attemptToken` is never filled from the public `run_attempt_token`.
+
+Protected transport fails closed: explicitly supplied private `credentials` (e.g. a `modelAuthGrant`) passed to `buildEnvelopeDispatchInputs` without capability throw, and `dispatchKgRefreshRun` throws when the trusted KG config carries `credentials` or `agentConfig` and the reader lacks capability or the probe fails. The implementation (`dispatchGitHubActions`), planning (`PlanningDispatchContext.trustedCredentials`) and GHA gap-fill (`DrainCommentGapfillsInput.getTrustedCredentials`) writers expose the same typed trusted-preparation seam and call `assertPrivateTransportForCredentials` right after the probe, so an unsupported reader, a legacy-contract reader or a failed probe throws inside the pre-launch block: no `postWorkflowDispatch`, no fetch, admission released. Both happen before any dispatch request; nothing is stripped or downgraded and there is no provider/account fallback. An unprotected KG config whose probe fails uses the legacy masked path. Wiring real stage-snapshot/model-auth preparation into these builders remains AII-958.
+
+**Fleet sync requirement:** a repo receives private transport only after its synced `claude-implement.yml` / `claude-plan.yml` carry the AII-982/AII-1000 bootstrap. This change performs no sync, deploy or project activation. **Rollback:** private writers stay capability-gated; an older workflow reports no capability and the writers revert to the masked top-level path. Never re-enable credential dumps into generic envelopes or logs.
 
 An absent namespace decodes as the legacy envelope. No writer sets it in this slice; the exact input allowlists, rollout order and rollback are in [ADR 032](adr/032-private-run-envelope-and-credential-bootstrap.md). Statements above that the envelope is "secret-free" describe the generic envelope. `repoProcessEnv`, `modelProcessEnv` and `gitProcessEnv` strip `AI_IMPLEMENT_RUN_CONFIG` and `AI_IMPLEMENT_MODEL_AUTH_*` bootstrap handles.
 
