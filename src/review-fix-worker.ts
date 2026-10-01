@@ -359,6 +359,17 @@ function buildLaunchInputs(
   return { run_config: encodeRunConfig(runConfig), run_token: "", ...common };
 }
 
+function envelopeCarriesTaskText(encoded: string | undefined, taskText: string): boolean {
+  if (!encoded) return false;
+  try {
+    const decoded = JSON.parse(Buffer.from(encoded, "base64").toString("utf-8")) as
+      { issue?: { description?: unknown }; commentInstruction?: unknown };
+    return decoded.issue?.description === taskText && decoded.commentInstruction === taskText;
+  } catch {
+    return false;
+  }
+}
+
 const FULL_SHA_PATTERN = /^[0-9a-f]{40}$/;
 
 // ---------------------------------------------------------------------------
@@ -551,6 +562,11 @@ export class GithubReviewFixWorker implements ReviewFixWorkerPort {
       // A missing/expired prepared credential is not proof that an earlier
       // dispatch did not happen. The workflow reconciles under its launch intent.
       return { status: "unknown" };
+    }
+    // Backstop: the outer envelope silently truncates oversized descriptions, so prove the
+    // encoded payload still carries the admitted task text in both fields before any dispatch.
+    if (!envelopeCarriesTaskText(inputs.run_config, plan.taskText)) {
+      return { status: "rejected", reason: "rendered review-fix task does not fit the run envelope intact" };
     }
     let result: DispatchResult;
     try {

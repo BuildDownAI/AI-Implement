@@ -8,7 +8,7 @@ import { getPullRequestState } from "../github.js";
 import { listReviewFixCycleSummaries } from "../review-fix-evidence.js";
 import { createReviewFixFinalizer, retryApprovalEffect } from "../review-fix-finalize.js";
 import { createReviewFixGithubAdapter } from "../review-fix-github-adapter.js";
-import { loadPendingReviewFixFeedback } from "../review-fix-pending.js";
+import { inspectPendingReviewFixFeedback } from "../review-fix-pending.js";
 import { SqliteReviewFixAttemptStore } from "../review-fix-attempt-store.js";
 import { GithubReviewFixWorker, createGithubAppCredentialResolver, reviewFixAttemptStoreScopeStore } from "../review-fix-worker.js";
 import { DEFAULT_REVIEW_FIX_JOB_TIMEOUT_MINUTES, type ReviewFixFindingDisposition } from "../review-fix-ports.js";
@@ -134,7 +134,14 @@ export function createProductionReviewFixServices(
           issueDescription = (await provider.findByKey(row.issue_identifier))?.description ?? null;
         } catch { /* Legacy's fallback text is also valid when the tracker is unavailable. */ }
       }
-      return { closed, pending: loadPendingReviewFixFeedback(scope, issueDescription),
+      // Over-budget feedback is a non-launch outcome: leave every finding pending, admit
+      // nothing, and log only the bounded category. Throwing here would put the journaled
+      // ctx.run into Restate's unbounded retry of a deterministic failure.
+      const inspected = inspectPendingReviewFixFeedback(scope, issueDescription);
+      if (inspected.status === "incomplete") {
+        console.warn(`[review-fix] ${scope.repository}#${scope.prNumber} not launched: ${inspected.reason}`);
+      }
+      return { closed, pending: inspected.status === "ready" ? inspected.feedback : null,
         jobTimeoutMinutes: mapping.maxJobMinutes ?? DEFAULT_REVIEW_FIX_JOB_TIMEOUT_MINUTES };
     },
   });

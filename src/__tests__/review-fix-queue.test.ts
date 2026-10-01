@@ -386,31 +386,77 @@ describe("buildReviewFixTaskDescription", () => {
     expect(result).toContain("No structured findings are recorded. Read the PR discussion.");
   });
 
-  it("caps at 30 findings and states the exact number left out", () => {
-    const findings = Array.from({ length: 31 }, (_, i) => makeFinding({ finding_key: `finding-${i}` }));
-    const result = queue.buildReviewFixTaskDescription({
-      prNumber: 7,
-      reason: "r",
-      findings,
-      issueDescription: null,
-    });
+  const prepare = (findings: ReviewFixQueueModule.ReviewFixTaskFinding[], issueDescription: string | null = null) =>
+    queue.prepareReviewFixTask({ prNumber: 7, reason: "r", findings, issueDescription });
 
-    const headingCount = (result.match(/### finding-/g) ?? []).length;
-    expect(headingCount).toBe(30);
-    expect(result).toContain("1 additional finding was left out of this task");
+  it("admits exactly 30 findings and rejects 31 with the count category, rendering nothing partial", () => {
+    const make = (n: number) => Array.from({ length: n }, (_, i) => makeFinding({ finding_key: `finding-${i}`, body: "ok" }));
+    const ok = prepare(make(30));
+    expect(ok.status).toBe("complete");
+    if (ok.status === "complete") {
+      expect((ok.text.match(/### finding-/g) ?? []).length).toBe(30);
+      expect(ok.findings).toHaveLength(30);
+    }
+    const over = prepare(make(31));
+    expect(over).toMatchObject({ status: "incomplete", category: "count" });
+    expect(over).not.toHaveProperty("text");
   });
 
-  it("truncates a finding body to 2000 characters plus an ellipsis", () => {
-    const longBody = "x".repeat(3000);
-    const result = queue.buildReviewFixTaskDescription({
-      prNumber: 7,
-      reason: "r",
-      findings: [makeFinding({ body: longBody })],
-      issueDescription: null,
-    });
+  it("delivers a four-finding multi-paragraph review of 4,387 characters in full", () => {
+    const tail = (n: number) => `Required test ${n}: assert the end of finding ${n}.`;
+    const bodies = [1, 2, 3, 4].map((n) => `Finding ${n} summary.\n\n${"context ".repeat(130)}\n\n${tail(n)}`);
+    const pad = 4387 - bodies.join("").length;
+    bodies[3] = bodies[3]!.replace("context ", `context ${"z".repeat(Math.max(0, pad))}`);
+    const findings = bodies.map((body, i) => makeFinding({ finding_key: `f${i + 1}`, body }));
+    const result = prepare(findings, "Do the thing.");
+    expect(result.status).toBe("complete");
+    if (result.status !== "complete") return;
+    for (const n of [1, 2, 3, 4]) expect(result.text).toContain(tail(n));
+    expect(result.text).not.toContain("…");
+    expect(result.findings.map((f) => f.finding_key)).toEqual(["f1", "f2", "f3", "f4"]);
+  });
 
-    expect(result).toContain(`> ${"x".repeat(2000)}…`);
-    expect(result).not.toContain("x".repeat(2001));
+  it("admits a body at the per-body limit and rejects one over it", () => {
+    expect(prepare([makeFinding({ body: "x".repeat(queue.MAX_FINDING_BODY_LENGTH) })]).status).toBe("complete");
+    expect(prepare([makeFinding({ body: "x".repeat(queue.MAX_FINDING_BODY_LENGTH + 1) })]))
+      .toMatchObject({ status: "incomplete", category: "body" });
+  });
+
+  it("rejects when the rendered feedback exceeds the aggregate budget", () => {
+    const findings = Array.from({ length: 3 }, (_, i) => makeFinding({ finding_key: `k${i}`, body: "w".repeat(7000) }));
+    expect(prepare(findings)).toMatchObject({ status: "incomplete", category: "aggregate" });
+    // Quote prefixes count toward the rendered budget, not just raw body length.
+    const lines = (n: number) => Array.from({ length: n }, () => "a").join("\n");
+    expect(prepare([makeFinding({ body: lines(3900) })]).status).toBe("complete");
+    expect(prepare([0, 1].map((i) => makeFinding({ finding_key: `q${i}`, body: lines(3000) }))))
+      .toMatchObject({ status: "incomplete", category: "aggregate" });
+  });
+
+  it("keeps the worst admitted task, with maximum issue context, inside the 40,000-character envelope", () => {
+    const findings = Array.from({ length: 2 }, (_, i) => makeFinding({ finding_key: `k${i}`, body: "line\n".repeat(1200) }));
+    const result = prepare(findings, "y".repeat(50000));
+    expect(result.status).toBe("complete");
+    if (result.status === "complete") expect(result.text.length).toBeLessThanOrEqual(queue.MAX_ENVELOPE_DESCRIPTION_LENGTH);
+  });
+
+  it("builds the string form or throws a classified error that carries no finding text", () => {
+    expect(() => queue.buildReviewFixTaskDescription({
+      prNumber: 7, reason: "r", findings: [makeFinding({ body: "SECRET".repeat(2000) })], issueDescription: null,
+    })).toThrow(queue.ReviewFixFeedbackIncompleteError);
+    try {
+      queue.buildReviewFixTaskDescription({ prNumber: 7, reason: "r", findings: [makeFinding({ body: "SECRET".repeat(2000) })], issueDescription: null });
+    } catch (error) {
+      expect((error as Error).message).not.toContain("SECRET");
+    }
+  });
+
+  it("keeps previews bounded and separate from complete execution text", () => {
+    const body = "p".repeat(5000);
+    const result = prepare([makeFinding({ body })]);
+    expect(result.status).toBe("complete");
+    if (result.status !== "complete") return;
+    expect(result.text).toContain(body);
+    expect(queue.previewReviewFixText(result.text).length).toBeLessThanOrEqual(201);
   });
 
   it("truncates the issue description to 20,000 characters with a truncation marker", () => {

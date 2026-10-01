@@ -4,7 +4,7 @@
  * of that finding is a different version and remains eligible. */
 import { getDb } from "./dedup.js";
 import { listOpenReviewFindings, type StoredReviewFinding } from "./review-ledger-store.js";
-import { buildReviewFixTaskDescription, MAX_TASK_FINDINGS } from "./review-fix-queue.js";
+import { prepareReviewFixTask, ReviewFixFeedbackIncompleteError } from "./review-fix-queue.js";
 import type { ScopedPrIdentity } from "./review-fix-contract.js";
 import type { ReviewFixPendingFeedback } from "./review-fix-ports.js";
 
@@ -40,19 +40,44 @@ export function loadPendingReviewFixFeedback(
     .get(queue.id) as { id: number | null };
   if (event.id === null) return null;
 
-  const findings = unprocessedOpenReviewFindings(scope).slice(0, MAX_TASK_FINDINGS);
+  // No pre-slice: the builder sees the complete set and rejects an over-budget one whole.
+  // The throw precedes admit(), so nothing is snapshotted, no attempt is created and every
+  // finding version stays pending. On success the rendered set is exactly `stored`.
+  const stored = unprocessedOpenReviewFindings(scope);
+  const prepared = prepareReviewFixTask({
+    prNumber: scope.prNumber,
+    reason: queue.reason,
+    findings: stored.map((finding) => ({
+      finding_key: finding.findingKey, source: finding.source, severity: finding.severity,
+      path: finding.path ?? null, line: finding.line ?? null, body: finding.body,
+      url: finding.url ?? null,
+    })),
+    issueDescription,
+  });
+  if (prepared.status === "incomplete") throw new ReviewFixFeedbackIncompleteError(prepared.category, prepared.reason);
   return {
-    taskText: buildReviewFixTaskDescription({
-      prNumber: scope.prNumber,
-      reason: queue.reason,
-      findings: findings.map((finding) => ({
-        finding_key: finding.findingKey, source: finding.source, severity: finding.severity,
-        path: finding.path ?? null, line: finding.line ?? null, body: finding.body,
-        url: finding.url ?? null,
-      })),
-      issueDescription,
-    }),
-    findings: findings.map((finding) => ({ findingKey: finding.findingKey, version: finding.revision })),
+    taskText: prepared.text,
+    findings: stored.map((finding) => ({ findingKey: finding.findingKey, version: finding.revision })),
     queueCursor: { queueId: queue.id, eventId: event.id },
   };
+}
+
+/** Non-throwing read for callers that are not launching (dashboard, durable load): an
+ * over-budget set is reported as incomplete, never as "nothing pending". */
+export type InspectedPendingFeedback =
+  | { status: "ready"; feedback: ReviewFixPendingFeedback | null }
+  | { status: "incomplete"; category: string; reason: string };
+
+export function inspectPendingReviewFixFeedback(
+  scope: ScopedPrIdentity,
+  issueDescription: string | null,
+): InspectedPendingFeedback {
+  try {
+    return { status: "ready", feedback: loadPendingReviewFixFeedback(scope, issueDescription) };
+  } catch (error) {
+    if (error instanceof ReviewFixFeedbackIncompleteError) {
+      return { status: "incomplete", category: error.category, reason: error.message };
+    }
+    throw error;
+  }
 }

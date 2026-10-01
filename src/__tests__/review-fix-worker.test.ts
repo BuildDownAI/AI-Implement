@@ -192,6 +192,32 @@ const legacyProbe = async () => caps({ supportsPrivateRunConfig: false });
 const privateProbe = async () => caps({ supportsPrivateRunConfig: true });
 
 describe("GithubReviewFixWorker.launch private envelope capability", () => {
+  it("dispatches a run_config whose description and commentInstruction both equal the admitted task text", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    t.setDispatchImpl(async () => ({ success: true, status: 200, outcome: "accepted", runId: 9100 }));
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
+    const taskText = `${"a".repeat(30_000)}\nLAST-LINE`;
+    const outcome = await worker.launch(await worker.prepare(makeAttempt({ taskText })));
+    expect(outcome.status).toBe("accepted");
+    const inputs = (t.dispatchCalls[0] as { inputs: { run_config: string } }).inputs;
+    const decoded = JSON.parse(Buffer.from(inputs.run_config, "base64").toString("utf-8"));
+    expect(decoded.issue.description).toBe(taskText);
+    expect(decoded.commentInstruction).toBe(taskText);
+  });
+
+  it("never dispatches when the outer envelope would shorten the task text", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
+    const plan = await worker.prepare(makeAttempt({ taskText: `${"a".repeat(40_001)}\nLAST-LINE` }));
+    const outcome = await worker.launch(plan);
+    expect(outcome).toEqual({ status: "rejected", reason: expect.stringContaining("envelope") });
+    expect(t.dispatchCalls).toHaveLength(0);
+  });
+
   const CALLBACK_URL = "https://callback.example/runner";
   const tokens = async () => ({
     run_token: "secret-result", run_progress_token: "secret-progress", run_publication_token: "secret-publication",
@@ -210,6 +236,34 @@ describe("GithubReviewFixWorker.launch private envelope capability", () => {
     const sent = t.dispatchCalls[0] as { inputs: Record<string, string> } | undefined;
     return { t, plan, outcome, sent, scopeStore };
   }
+
+  it("private transport: the trusted-encoded run_config carries the admitted task text in both fields", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    t.setDispatchImpl(async () => ({ success: true, status: 200, outcome: "accepted", runId: 9100 }));
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport,
+      callbackInputs: tokens, resolveCapabilities: privateProbe });
+    const taskText = `${"a".repeat(30_000)}\nLAST-LINE`;
+    const outcome = await worker.launch(await worker.prepare(makeAttempt({ taskText })));
+    expect(outcome.status).toBe("accepted");
+    const { decodeTrustedRunConfig } = await import("../run-config.js");
+    const trusted = decodeTrustedRunConfig((t.dispatchCalls[0] as { inputs: { run_config: string } }).inputs.run_config);
+    expect(trusted.credentials).toBeDefined();
+    expect(trusted.issue.description).toBe(taskText);
+    expect(trusted.commentInstruction).toBe(taskText);
+  });
+
+  it("private transport: never dispatches when the envelope would shorten the task text", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport,
+      callbackInputs: tokens, resolveCapabilities: privateProbe });
+    const plan = await worker.prepare(makeAttempt({ taskText: `${"a".repeat(40_001)}\nLAST-LINE` }));
+    expect(await worker.launch(plan)).toEqual({ status: "rejected", reason: expect.stringContaining("envelope") });
+    expect(t.dispatchCalls).toHaveLength(0);
+  });
 
   it("probes the exact dispatch target with the dispatch token", async () => {
     const probe = vi.fn(privateProbe);
