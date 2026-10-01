@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
+  assertPrivateTransportForCredentials,
   buildEnvelopeDispatchInputs,
   buildPrivateKgRefreshGhaDispatchBody,
   providerDispatchFields,
@@ -1259,6 +1260,19 @@ describe("buildEnvelopeDispatchInputs — private transport (AII-983)", () => {
     expect(second.run_config).toBe(first.run_config);
     expect(second.run_token).toBe("");
     expect("issue_identifier" in second).toBe(false);
+  });
+});
+
+describe("assertPrivateTransportForCredentials — mixed-version matrix (AII-680)", () => {
+  const creds = { version: 1 as const, resultToken: "rt" };
+
+  it.each([[{}], [{ supportsPrivateRunConfig: false }]])("refuses to send credentials to an unsupported or unprobed template (%j)", (caps) => {
+    expect(() => assertPrivateTransportForCredentials(creds, caps, "o/r claude-implement.yml")).toThrow(/refusing to drop or downgrade/);
+  });
+
+  it("allows a private-capable template, and legacy dispatch with no credentials", () => {
+    expect(() => assertPrivateTransportForCredentials(creds, { supportsPrivateRunConfig: true }, "t")).not.toThrow();
+    expect(() => assertPrivateTransportForCredentials(undefined, {}, "t")).not.toThrow();
   });
 });
 

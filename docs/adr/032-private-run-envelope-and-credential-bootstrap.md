@@ -1,6 +1,6 @@
 # 032. Private run envelope and credential bootstrap
 
-**Status:** Accepted — contract slice only (AII-981); no writer or workflow reader switches in this change.
+**Status:** Accepted — contract (AII-981), private bootstrap (AII-982), capability-gated writers (AII-983), synthetic log verification (AII-984) and the closing input guards (AII-680) have landed. The private transport is opt-in per project and inactive until a target re-syncs.
 **Date:** 2026-10-01
 **References:** AII-680, AII-854, AII-944; ADR 025; [workflow envelope](../workflow-envelope.md)
 
@@ -26,13 +26,31 @@ Inputs a runner could not otherwise read before bootstrap, or that GitHub evalua
 | `run_attempt_token` | yes | yes | `run-name:` attempt marker and correlation; an identifier, not an authorization (the credential `attemptToken` is separate) |
 | `runner_image` | yes | yes | Resolved before bootstrap by `validate-runner-image` |
 | `job_timeout_minutes` | yes | yes | `timeout-minutes` is evaluated before bootstrap |
-| `provider` | yes | no (moves to envelope) | Usable after bootstrap; decided separately from image/timeout |
-| `aws_region` | yes | no (moves to envelope) | Same as `provider`; credential configuration runs after bootstrap |
+| `provider` | yes | **yes (retained)** | Provider setup and the Bedrock steps run after bootstrap, but deployed readers and `providerDispatchFields` still consume the input, and no model credential accompanies it |
+| `aws_region` | yes | **yes (retained)** | Same as `provider`; a nonsecret region, validated by the Bedrock step after bootstrap |
 | `run_token` | yes | no | Becomes `credentials.resultToken` |
 | `run_progress_token` | yes | no | Becomes `credentials.progressToken` |
 | `run_publication_token` | yes | no | Becomes `credentials.publicationToken` |
 
-Legacy inputs stay optional and supported for repos that have not re-synced; they are not removed fleet-wide. Whether `provider`/`aws_region` actually move is evaluated at the reader slice, independently of image/timeout.
+Legacy inputs stay optional and supported for repos that have not re-synced; they are not removed fleet-wide. The earlier plan to move `provider`/`aws_region` into the envelope is **withdrawn**: they remain nonsecret top-level compatibility inputs for the reasons above. Moving them would need another reader and writer migration and is not part of AII-680.
+
+### Exact contract per workflow
+
+Enforced by `src/__tests__/workflow-input-allowlist.test.ts` (`INPUT_CONTRACT`, exact keys in order, with a reason for each) and `workflow-shim-structure.test.ts`. KG refresh and gap-analysis dispatch through the implementation template; there is no separate workflow.
+
+| Workflow | Inputs, in order |
+|---|---|
+| `claude-implement.yml` | `run_config`, `issue_identifier`, `run_attempt_token`, `runner_image`, `job_timeout_minutes`, `provider`, `aws_region`, `run_token`, `run_progress_token`, `run_publication_token` |
+| `claude-plan.yml` | `run_config`, `issue_identifier`, `runner_image`, `job_timeout_minutes`, `provider`, `aws_region`, `run_token`, `run_progress_token` |
+
+The three token inputs are kept only so templates still serve legacy writers; on the private transport they are blank or absent. Planning has no publication-token input.
+
+### CI guards
+
+- Exact input list per workflow (an extra, missing or reordered input fails; a count check would not catch a swap).
+- Canonical `workflows/*.yml` and `.github/workflows/*.yml` byte identity.
+- Diagnostic/forwarding scan: no raw envelope echo, unfiltered `jq .`, shell tracing, `toJSON(inputs)`, raw token input forwarded to an env var, or the envelope forwarded under any name other than `RUN_CONFIG` / `AI_IMPLEMENT_RUN_CONFIG`.
+- Negative fixtures in the same test file prove each guard fails on a representative violation.
 
 ## Rollout order
 
@@ -43,3 +61,33 @@ Legacy inputs stay optional and supported for repos that have not re-synced; the
 ## Rollback
 
 Disable the writer capability per project to return to the legacy inputs. Rollback must never re-enable credential dumps: the diagnostic dump keeps redacting tokens and decodes only the credential-free projection, and generic encode/decode keep excluding `credentials` regardless of writer state.
+
+Limits of rollback: capability probe results are cached for 5 minutes (`CACHE_TTL_MS`), so a template re-synced backwards stays marked private-capable for up to that window. The dispatch writer refuses (`assertPrivateTransportForCredentials`) rather than downgrading when the probe reports no capability, but within the cache window it can still send a private envelope to a reverted template. Rolling a template back to a dump-capable version is therefore not supported; disable the per-project writer capability first and let the cache expire. No rollback restores envelope dumps.
+
+## Compatibility matrix
+
+| Orchestrator | Template | Result |
+|---|---|---|
+| Old (legacy inputs) | Old | Legacy inputs; unchanged |
+| Old | New | Legacy inputs; the new template still reads them |
+| New | Old (no `private-run-config-v1`) | Legacy inputs; supplied private credentials make the dispatch fail, never a silent downgrade |
+| New | New | Private envelope; bearers in `credentials`, no top-level token inputs |
+
+The optional-input 422 retry (`ENVELOPE_OPTIONAL_INPUTS`) makes at most two requests and never strips `run_config` or token inputs.
+
+## Evidence
+
+Run [36867304479](https://github.com/BuildDownAI/AI-Implement/actions/runs/36867304479) (AII-984, `private-envelope-smoke`, head `e3bc264`): three consumer jobs plus a separate verifier, all concluding `success`. Complete logs of 236, 237 and 248 lines contained 9, 10 and 9 synthetic sentinels respectively, none leaked, and each trusted consumer received exact values.
+
+| Job | ID | Conclusion |
+|---|---|---|
+| `private-envelope-plan` | 110385907270 | success |
+| `private-envelope-failure` | 110385907431 | success |
+| `private-envelope-implement` | 110385907461 | success |
+| `private-envelope-verifier` | 110386053579 | success |
+
+The input guard (`workflow-input-allowlist.test.ts`) self-tests with negative fixtures: a dummy extra input, an unsafe diagnostic, raw token forwarding and copy drift each fail the matching check; the targeted allowlist and shim-structure tests pass. Any new or changed template must repeat the smoke run on its PR.
+
+## Future rollout gate
+
+No fleet sync, activation, testing promotion or deployment happens under AII-680. Before enabling the private transport for a project: sync its workflow files, confirm the probe reports `supportsPrivateRunConfig`, re-run the smoke workflow, and only then allow credential-bearing writers.
