@@ -1273,3 +1273,132 @@ describe("reconcileTerminalCallbackAdmissions — per-poll reconciliation for te
     expect(dispatchAdmission.read("dispatch-running")?.releasedAt).toBeNull();
   });
 });
+
+// AII-1023: the run lookup that follows an implementation dispatch must send the issue key,
+// so a run titled for another issue is never linked to this job. Only global fetch (the
+// simulated GitHub run listing) and postWorkflowDispatch are stubbed; findWorkflowRunId,
+// dedup and the job table are real.
+describe("dispatchGitHubActions — run lookup is keyed by issue identifier (AII-1023)", () => {
+  let dbPath: string;
+  let dedup: typeof DedupModule;
+  let log: typeof import("../log.js");
+  let indexModule: typeof import("../index.js");
+  let githubAppAuth: typeof import("../github-app-auth.js");
+  let repoImage: typeof import("../repo-image.js");
+  let workflowProbe: typeof import("../workflow-probe.js");
+  let github: typeof import("../github.js");
+  const realFetch = globalThis.fetch;
+
+  const issueA = "TOP-1";
+  const issueB: TicketIssue = {
+    id: "issue-lookup-b",
+    identifier: "TOP-2",
+    title: "Issue B",
+    description: "desc",
+    scopeKey: "TOP",
+    nativeStatus: "Todo",
+  };
+
+  const mapping = {
+    owner: "eudoxus",
+    repo: "AI-Implement",
+    workflowFile: "claude-implement.yml",
+    planningWorkflowFile: "claude-plan.yml",
+    defaultBranch: "main",
+    maxInProgressAiIssues: 5,
+    provider: "anthropic",
+    sessionMode: "default",
+    machineCpus: 1,
+    machineMemoryMb: 512,
+    extraEnv: {},
+  } as unknown as RepoMapping;
+
+  const provider = {
+    id: "jira",
+    issueUrl: vi.fn().mockReturnValue("https://example.atlassian.net/browse/TOP-2"),
+    markImplementing: vi.fn().mockResolvedValue(undefined),
+    markImplementationFailed: vi.fn(),
+    postComment: vi.fn().mockResolvedValue(undefined),
+  } as unknown as TicketingProvider;
+
+  const prior = { count: 0, lastDispatchedAt: null };
+  const config = { githubAppId: "id", githubAppPrivateKey: "key" } as unknown as AppConfig;
+
+  type ListedRun = { id: number; display_title?: string };
+  function listRuns(runs: ListedRun[]) {
+    const created_at = new Date().toISOString();
+    globalThis.fetch = vi.fn(async (input: unknown) => {
+      if (String(input).includes("/actions/workflows/claude-implement.yml/runs")) {
+        return new Response(
+          JSON.stringify({ workflow_runs: runs.map((r) => ({ ...r, created_at })) }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response("{}", { status: 404 });
+    }) as unknown as typeof fetch;
+  }
+
+  async function dispatchB(): Promise<number | null> {
+    await indexModule.dispatchGitHubActions(config, provider, issueB, mapping, prior, "default", mapping.defaultBranch, null);
+    const job = log.getInFlightJobs().find((j) => j.issueIdentifier === issueB.identifier);
+    expect(job).toBeTruthy();
+    return job!.runId ?? null;
+  }
+
+  beforeEach(async () => {
+    vi.resetModules();
+    dbPath = path.join(
+      os.tmpdir(),
+      `dispatch-lookup-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
+    );
+    process.env.DEDUP_DB_PATH = dbPath;
+    dedup = await import("../dedup.js");
+    (await import("../dispatch-breaker.js")).initDispatchBreakerTable();
+    log = await import("../log.js");
+    log.initLogTable();
+    githubAppAuth = await import("../github-app-auth.js");
+    repoImage = await import("../repo-image.js");
+    workflowProbe = await import("../workflow-probe.js");
+    github = await import("../github.js");
+    indexModule = await import("../index.js");
+
+    vi.mocked(githubAppAuth.getInstallationToken).mockResolvedValue("gh-token");
+    vi.mocked(repoImage.resolveRunnerImageForDispatch).mockResolvedValue(undefined);
+    vi.mocked(workflowProbe.resolveWorkflowCapabilities).mockResolvedValue({
+      contract: "legacy",
+      supportsRunPublicationToken: false,
+      supportsAttemptCorrelation: false,
+    });
+    vi.mocked(workflowProbe.resolveWorkflowContract).mockResolvedValue("legacy");
+    vi.mocked(github.postWorkflowDispatch).mockResolvedValue({ success: true, status: 204, outcome: "accepted" } as never);
+  });
+
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    dedup.closeDb();
+    try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+  });
+
+  it("does not link a run titled for another issue", async () => {
+    listRuns([{ id: 111, display_title: `Claude AI Implementation — ${issueA}` }]);
+    expect(await dispatchB()).toBeNull();
+  });
+
+  it("links the run titled for this issue", async () => {
+    listRuns([{ id: 222, display_title: `Claude AI Implementation — ${issueB.identifier}` }]);
+    expect(await dispatchB()).toBe(222);
+  });
+
+  it("falls back to an untitled run (old template)", async () => {
+    listRuns([{ id: 333 }]);
+    expect(await dispatchB()).toBe(333);
+  });
+
+  it("prefers its own run over another issue's run listed first", async () => {
+    listRuns([
+      { id: 111, display_title: `Claude AI Implementation — ${issueA}` },
+      { id: 222, display_title: `Claude AI Implementation — ${issueB.identifier}` },
+    ]);
+    expect(await dispatchB()).toBe(222);
+  });
+});
