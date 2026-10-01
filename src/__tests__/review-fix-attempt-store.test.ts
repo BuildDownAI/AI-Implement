@@ -227,13 +227,13 @@ describe("SqliteReviewFixAttemptStore: admission", () => {
     expect(close.listActiveRestateReviewFixPrs()).toEqual([]);
   });
 
-  it("consumes exactly one queue snapshot while preserving overflow and new finding revisions", async () => {
+  it("consumes exactly one queue snapshot while preserving new finding revisions", async () => {
     seedMapping();
     const queueId = queue.enqueueReviewFix({
       issueId: "issue-42", issueIdentifier: "AII-42", repo: SCOPE.repository,
       prNumber: SCOPE.prNumber, reason: "review_feedback", sourceEventId: "event-1",
     });
-    const records = Array.from({ length: 35 }, (_, i) => ({
+    const records = Array.from({ length: 30 }, (_, i) => ({
       repo: SCOPE.repository, prNumber: SCOPE.prNumber,
       source: "github-review-thread" as const, severity: "medium" as const,
       body: `finding ${i}`, path: `file${i}.ts`, line: i,
@@ -244,20 +244,118 @@ describe("SqliteReviewFixAttemptStore: admission", () => {
     expect(firstFeedback?.findings).toHaveLength(30);
     const first = await store.admit(admissionRequest({ feedback: firstFeedback! }));
     if (first.status !== "prepared") throw new Error("expected prepared");
-    expect(queue.getPendingReviewFixes().map((item) => item.id)).toContain(queueId);
+    expect(queue.getPendingReviewFixes().map((item) => item.id)).not.toContain(queueId);
 
-    // Re-reporting an included finding increments its version. It must join
-    // the five overflow findings in the next attempt after exact-owner release.
+    // Re-reporting an included finding increments its version; only that new
+    // version is offered in the next attempt after exact-owner release.
     ledger.upsertReviewFinding(records[0]);
+    queue.enqueueReviewFix({ issueId: "issue-42", issueIdentifier: "AII-42", repo: SCOPE.repository,
+      prNumber: SCOPE.prNumber, reason: "review_feedback", sourceEventId: "event-2" });
     await store.releaseOwner(first.attempt.owner, "finalized");
     const secondFeedback = pending.loadPendingReviewFixFeedback(SCOPE, "issue text");
-    expect(secondFeedback?.findings).toHaveLength(6);
+    expect(secondFeedback?.findings).toHaveLength(1);
     expect(secondFeedback?.findings).toContainEqual({
       findingKey: first.attempt.findings[0].findingKey, version: 2,
     });
     const second = await store.admit(admissionRequest({ feedback: secondFeedback! }));
     expect(second.status).toBe("prepared");
     expect(queue.getPendingReviewFixes().map((item) => item.id)).not.toContain(queueId);
+  });
+
+  const queueModuleError = () => queue.ReviewFixFeedbackIncompleteError;
+
+  it("delivers a 4,387-character four-finding review in full with exact finding versions", () => {
+    seedMapping();
+    queue.enqueueReviewFix({ issueId: "issue-42", issueIdentifier: "AII-42", repo: SCOPE.repository,
+      prNumber: SCOPE.prNumber, reason: "review_feedback", sourceEventId: "event-1" });
+    const bodies = [1, 2, 3, 4].map((n) => `Finding ${n}.\n\n${"detail ".repeat(150)}\n\nRequired test ${n}: assert-end-${n}`);
+    expect(bodies.join("").length).toBeGreaterThan(3500);
+    bodies.forEach((body, i) => ledger.upsertReviewFinding({
+      repo: SCOPE.repository, prNumber: SCOPE.prNumber, source: "github-review-thread",
+      severity: "medium", body, path: `f${i}.ts`, line: i + 1,
+    }));
+    const feedback = pending.loadPendingReviewFixFeedback(SCOPE, "issue text")!;
+    expect(feedback.findings).toHaveLength(4);
+    expect(feedback.taskText).toContain("Required test 4: assert-end-4");
+    expect(feedback.taskText).not.toContain("…");
+  });
+
+  it.each([
+    ["count", () => Array.from({ length: 31 }, (_, i) => `finding ${i}`)],
+    ["body", () => ["x".repeat(8001)]],
+    ["aggregate", () => Array.from({ length: 4 }, () => "y".repeat(7000))],
+  ])("rejects over-%s feedback before admission and leaves everything pending", (category, makeBodies) => {
+    seedMapping();
+    const queueId = queue.enqueueReviewFix({ issueId: "issue-42", issueIdentifier: "AII-42", repo: SCOPE.repository,
+      prNumber: SCOPE.prNumber, reason: "review_feedback", sourceEventId: "event-1" });
+    makeBodies().forEach((body, i) => ledger.upsertReviewFinding({
+      repo: SCOPE.repository, prNumber: SCOPE.prNumber, source: "github-review-thread",
+      severity: "medium", body, path: `f${i}.ts`, line: i + 1,
+    }));
+    const openBefore = ledger.listOpenReviewFindings(SCOPE.repository, SCOPE.prNumber).length;
+    let error: unknown;
+    try { pending.loadPendingReviewFixFeedback(SCOPE, "issue text"); } catch (e) { error = e; }
+    expect(error).toBeInstanceOf(queueModuleError());
+    expect((error as { category: string }).category).toBe(category);
+    expect((error as Error).message).not.toContain("xxxx");
+    expect(queue.getPendingReviewFixes().map((item) => item.id)).toContain(queueId);
+    expect(ledger.listOpenReviewFindings(SCOPE.repository, SCOPE.prNumber)).toHaveLength(openBefore);
+    expect((dedup.getDb().prepare("SELECT COUNT(*) AS n FROM review_fix_attempts").get() as { n: number }).n).toBe(0);
+  });
+
+  it("keeps over-budget feedback pending and visible without throwing on the non-launch reads", async () => {
+    seedMapping();
+    const queueId = queue.enqueueReviewFix({ issueId: "issue-42", issueIdentifier: "AII-42", repo: SCOPE.repository,
+      prNumber: SCOPE.prNumber, reason: "review_feedback", sourceEventId: "event-1" });
+    ledger.upsertReviewFinding({ repo: SCOPE.repository, prNumber: SCOPE.prNumber, source: "github-review-thread",
+      severity: "medium", body: "x".repeat(8001), path: "f.ts", line: 1 });
+    // Non-throwing inspection used by the dashboard and the durable load.
+    const inspected = pending.inspectPendingReviewFixFeedback(SCOPE, "issue text");
+    expect(inspected).toMatchObject({ status: "incomplete", category: "body" });
+    expect(JSON.stringify(inspected)).not.toContain("xxxx");
+
+    // Admin facade: an attempt on a PR whose newer feedback is over budget still reads, pendingFeedback true.
+    const store = new storeModule.SqliteReviewFixAttemptStore();
+    const admitted = await store.admit(admissionRequest({ feedback: { taskText: "t", findings: [{ findingKey: "f1", version: 1 }] } }));
+    if (admitted.status !== "prepared") throw new Error("expected prepared");
+    const facade = adminFacade.createReviewFixAdminFacade(store, { reconcile: async () => ({ status: "unknown" }) });
+    const detail = await facade.getAttempt(admitted.attempt.attemptId, { role: "admin", email: "operator@example.com" });
+    expect(detail.status).toBe("ok");
+    if (detail.status === "ok") expect(detail.attempt.pendingFeedback).toBe(true);
+  });
+
+  it("production load() leaves over-budget feedback pending, admits nothing and logs only the category", async () => {
+    seedMapping({ reviewFixLifecycle: "restate" } as Partial<RepoMapping>);
+    const queueId = queue.enqueueReviewFix({ issueId: "issue-42", issueIdentifier: "AII-42", repo: SCOPE.repository,
+      prNumber: SCOPE.prNumber, reason: "review_feedback", sourceEventId: "event-1" });
+    ledger.upsertReviewFinding({ repo: SCOPE.repository, prNumber: SCOPE.prNumber, source: "github-review-thread",
+      severity: "medium", body: "x".repeat(8001), path: "f.ts", line: 1 });
+    let deps: { load(scope: ScopedPrIdentity): Promise<{ closed: boolean; pending: unknown }> } | undefined;
+    vi.doMock("../restate/review-fix-pr.js", () => ({ createReviewFixPR: (d: typeof deps) => { deps = d; return {}; } }));
+    vi.doMock("../restate/review-fix-attempt.js", () => ({ createReviewFixAttempt: () => ({}) }));
+    vi.doMock("../github-app-auth.js", () => ({ getInstallationToken: async () => "t", getInstallationId: async () => 1 }));
+    vi.doMock("../github.js", () => ({ getPullRequestState: async () => ({ state: "open", merged: false }) }));
+    vi.doMock("../config.js", async (orig) => ({ ...(await orig<typeof ConfigModule>()),
+      getMappings: () => ({ AII: { owner: "eudoxus", repo: "ai-implement" } }),
+      resolveReviewFixLifecycle: () => "restate" }));
+    vi.doMock("../runner-mode.js", async (orig) => ({ ...(await orig<Record<string, unknown>>()),
+      getRunnerMode: () => ({ mode: "default" }), resolveExecutionPath: () => "github-actions" }));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const production = await import("../restate/review-fix-production.js");
+    production.createProductionReviewFixServices({ githubAppId: "1", githubAppPrivateKey: "k",
+      runnerCallbackBaseUrl: null, runnerTokenSecret: null }, { forMapping: async () => null } as never);
+    const snapshot = await deps!.load(SCOPE);
+    expect(snapshot.closed).toBe(false);
+    expect(snapshot.pending).toBeNull(); // resolves, so no Restate retry of the journaled step
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0][0])).toContain("incomplete (body)");
+    expect(String(warn.mock.calls[0][0])).not.toContain("xxxx");
+    expect(queue.getPendingReviewFixes().map((item) => item.id)).toContain(queueId);
+    expect((dedup.getDb().prepare("SELECT COUNT(*) AS n FROM review_fix_attempts").get() as { n: number }).n).toBe(0);
+    warn.mockRestore();
+    vi.doUnmock("../restate/review-fix-pr.js"); vi.doUnmock("../restate/review-fix-attempt.js");
+    vi.doUnmock("../github-app-auth.js"); vi.doUnmock("../github.js");
+    vi.doUnmock("../config.js"); vi.doUnmock("../runner-mode.js");
   });
 
   it("defers a stale queue snapshot after a finding revision changes before admission", async () => {

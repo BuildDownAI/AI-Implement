@@ -66,6 +66,12 @@ describe("run-config envelope", () => {
     expect(decoded.issue.description).toContain("[truncated by ai-implement");
   });
 
+  it("round-trips a description exactly at the envelope limit without truncation", () => {
+    const exact = "x".repeat(40_000);
+    const decoded = decodeRunConfig(encodeRunConfig({ ...full, issue: { ...full.issue, description: exact } }));
+    expect(decoded.issue.description).toBe(exact);
+  });
+
   it("round-trips profiles", () => {
     const cfg: RunConfigV1 = {
       v: 1,
