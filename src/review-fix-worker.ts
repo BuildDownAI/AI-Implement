@@ -288,7 +288,7 @@ function matchesAttemptMarker(displayTitle: string, attemptId: AttemptId): boole
   return displayTitle.endsWith(` · attempt ${attemptId}`);
 }
 
-function buildLaunchInputs(plan: WorkerLaunchPlan, mapping: RepoMapping): DispatchInputs {
+function buildLaunchInputs(plan: WorkerLaunchPlan, mapping: RepoMapping, runnerCallbackUrl?: string): DispatchInputs {
   const identifier = `review-fix-${plan.scope.prNumber}`;
   const runConfig: RunConfigV1 = {
     v: 1,
@@ -312,6 +312,9 @@ function buildLaunchInputs(plan: WorkerLaunchPlan, mapping: RepoMapping): Dispat
       prNumber: plan.scope.prNumber,
       deadlineAt: plan.deadlineAt,
     },
+    // The URL is not a secret; it rides the envelope because the canonical workflow declares no
+    // top-level runner_callback_url input and session/entrypoint.sh reads run_config.runnerCallbackUrl.
+    ...(runnerCallbackUrl ? { runnerCallbackUrl } : {}),
     ...(mapping.branchPrefix ? { branchPrefix: mapping.branchPrefix } : {}),
     ...(mapping.skillsRepo ? { skillsRepo: mapping.skillsRepo } : {}),
     ...(mapping.referenceRepos != null ? { referenceRepos: mapping.referenceRepos } : {}),
@@ -483,9 +486,18 @@ export class GithubReviewFixWorker implements ReviewFixWorkerPort {
     // under is not evidence the dispatch was rejected — it is unresolved identity.
     if (credential.installationId !== plan.scope.installationId) return { status: "unknown" };
 
-    let inputs = buildLaunchInputs(plan, mapping);
+    let inputs: DispatchInputs;
     try {
-      if (this.callbackInputs) inputs = { ...inputs, ...await this.callbackInputs(plan.attemptId) };
+      if (this.callbackInputs) {
+        const { run_token, run_progress_token, run_publication_token, runner_callback_url } = await this.callbackInputs(plan.attemptId);
+        // A run with no callback URL can never report its result, so do not dispatch it.
+        if (!runner_callback_url) return { status: "unknown" };
+        // Destructured explicitly: only the three credentials join the inputs, and the URL
+        // goes into the envelope rather than a top-level input.
+        inputs = { ...buildLaunchInputs(plan, mapping, runner_callback_url), run_token, run_progress_token, run_publication_token };
+      } else {
+        inputs = buildLaunchInputs(plan, mapping);
+      }
     } catch {
       // A missing/expired prepared credential is not proof that an earlier
       // dispatch did not happen. The workflow reconciles under its launch intent.
