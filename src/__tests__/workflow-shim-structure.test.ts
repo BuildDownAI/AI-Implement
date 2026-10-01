@@ -443,11 +443,9 @@ describe("GHA workflow shims", () => {
       expect(maskStep.run).not.toContain("inputs.run_publication_token");
 
       const pipelineStep = doc.jobs.implement.steps.find((step: any) => step.name === "Run pipeline");
-      expect(pipelineStep.env.RUN_PUBLICATION_TOKEN).toBe("${{ inputs.run_publication_token }}");
-      const otherSteps = doc.jobs.implement.steps.filter(
-        (step: any) => step.name !== "Run pipeline",
-      );
-      expect(JSON.stringify(otherSteps)).not.toContain("RUN_PUBLICATION_TOKEN");
+      // Delivered through $GITHUB_ENV by the bootstrap step; a step-level value would shadow it.
+      expect(pipelineStep.env.RUN_PUBLICATION_TOKEN).toBeUndefined();
+      expect(maskStep.run).toContain("RUN_PUBLICATION_TOKEN");
     });
 
     it(`${f} validates Bedrock config before configuring AWS credentials`, () => {
@@ -584,8 +582,11 @@ describe("GHA workflow shims", () => {
 
     it(`${f} wires run tokens to the entrypoint env`, () => {
       const yaml = readFileSync(f, "utf-8");
-      expect(yaml).toMatch(/RUN_TOKEN:\s*\$\{\{\s*inputs\.run_token\s*\}\}/);
-      expect(yaml).toMatch(/RUN_PROGRESS_TOKEN:\s*\$\{\{\s*inputs\.run_progress_token\s*\}\}/);
+      expect(yaml).not.toMatch(/^\s+RUN_(PROGRESS_)?TOKEN:/m);
+      const doc = parse(yaml);
+      const bootstrap = doc.jobs.plan.steps.find((s: any) => s.name === "Mask runner callback tokens");
+      expect(bootstrap.run).toContain("RUN_TOKEN");
+      expect(bootstrap.run).toContain("RUN_PROGRESS_TOKEN");
       expect(yaml).not.toMatch(/run_publication_token/);
       expect(yaml).not.toMatch(/RUN_PUBLICATION_TOKEN/);
     });

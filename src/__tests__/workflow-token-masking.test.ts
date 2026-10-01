@@ -363,3 +363,112 @@ for (const file of files) {
     });
   });
 }
+
+for (const file of files) {
+  const isPlan = file.endsWith("claude-plan.yml");
+  describe(`${file} private credential handoff (AII-1000)`, () => {
+    const workflow = parse(readFileSync(file, "utf8"));
+    const job = workflow.jobs.implement ?? workflow.jobs.plan;
+    const mask = job.steps.find((step: { name: string }) => step.name === "Mask runner callback tokens");
+    const run = job.steps.find((step: { name: string }) => step.name === "Run pipeline" || step.name === "Run planning");
+    const enc = (cfg: unknown) => Buffer.from(JSON.stringify(cfg)).toString("base64");
+    const base = { v: 1, issue: { id: "i", identifier: "AII-1000", title: "t", description: "d" } };
+
+    // Runs the bootstrap step, then the Run step against a stub entrypoint that dumps its env.
+    function handoff(inputs: Record<string, unknown>) {
+      const dir = mkdtempSync(join(tmpdir(), "handoff-"));
+      try {
+        const eventPath = join(dir, "event.json");
+        const envPath = join(dir, "github.env");
+        const dump = join(dir, "env.json");
+        const stub = join(dir, "entrypoint.sh");
+        writeFileSync(eventPath, JSON.stringify({ inputs }));
+        writeFileSync(envPath, "");
+        writeFileSync(stub, `#!/bin/sh\nnode -e 'require("fs").writeFileSync(process.argv[1], JSON.stringify(process.env))' "${dump}"\n`, { mode: 0o755 });
+        const boot = spawnSync("sh", ["-e", "-c", mask.run], {
+          env: { PATH: process.env.PATH, GITHUB_EVENT_PATH: eventPath, GITHUB_ENV: envPath },
+          encoding: "utf8",
+        });
+        if (boot.status !== 0) return { boot, env: undefined, githubEnv: "" };
+        // Parse the $GITHUB_ENV heredoc format the way the Actions runner does.
+        const githubEnv = readFileSync(envPath, "utf8");
+        const lines = githubEnv.split("\n");
+        const exported: Record<string, string> = {};
+        for (let i = 0; i < lines.length; i++) {
+          const m = /^([A-Z_]+)<<(.+)$/.exec(lines[i]);
+          if (!m) continue;
+          const end = lines.indexOf(m[2], i + 1);
+          exported[m[1]] = lines.slice(i + 1, end).join("\n");
+          i = end;
+        }
+        // Step-level env overrides $GITHUB_ENV; keep only literal (non-expression) entries.
+        const stepEnv = Object.fromEntries(Object.entries(run.env ?? {})
+          .filter(([, v]) => typeof v === "string" && !v.includes("${{")) as [string, string][]);
+        const done = spawnSync("sh", ["-e", "-c", run.run.replace("/opt/ai-implement/entrypoint.sh", stub)], {
+          env: { PATH: process.env.PATH, ...exported, ...stepEnv },
+          encoding: "utf8",
+        });
+        const env = done.status === 0 ? JSON.parse(readFileSync(dump, "utf8")) : undefined;
+        return { boot, done, env, githubEnv };
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+
+    const tokens = { resultToken: "res-$(touch${IFS}/tmp/pwn1000)-`x`-%0A-\"'-<<EOF", progressToken: "prog_%25_$HOME_\\n", publicationToken: "pub-sentinel-1000" };
+
+    it("delivers private credentials with empty public inputs and keeps grants out of env", () => {
+      const run_config = enc({ ...base, credentials: { version: 1, ...tokens, attemptToken: "att-1" } });
+      const r = handoff({ run_config, run_token: "", run_progress_token: "", run_attempt_token: "att-1" });
+      expect(r.boot.status).toBe(0);
+      expect(r.env.RUN_TOKEN).toBe(tokens.resultToken);
+      expect(r.env.RUN_PROGRESS_TOKEN).toBe(tokens.progressToken);
+      expect(r.env.RUN_PUBLICATION_TOKEN).toBe(isPlan ? undefined : tokens.publicationToken);
+      expect(JSON.stringify(r.env)).not.toContain("att-1");
+      expect(r.boot.stderr).toBe("");
+    });
+
+    it("lets the private namespace win over conflicting public values and never backfills", () => {
+      const run_config = enc({ ...base, credentials: { version: 1, resultToken: "private-result" } });
+      const r = handoff({ run_config, run_token: "public-result", run_progress_token: "public-progress", run_publication_token: "public-pub" });
+      expect(r.env.RUN_TOKEN).toBe("private-result");
+      expect(r.env.RUN_PROGRESS_TOKEN).toBe("");
+      expect(r.env.RUN_PUBLICATION_TOKEN ?? "").toBe("");
+    });
+
+    it("never prints the delivered values outside the mask commands", () => {
+      const run_config = enc({ ...base, credentials: { version: 1, ...tokens } });
+      const r = handoff({ run_config });
+      const unmasked = r.boot.stdout.split("\n").filter((l: string) => !l.startsWith("::add-mask::")).join("\n");
+      for (const v of Object.values(tokens)) {
+        expect(unmasked).not.toContain(v);
+        expect(r.boot.stderr).not.toContain(v);
+      }
+    });
+
+    it("keeps legacy inputs when no private namespace exists", () => {
+      const r = handoff({ run_config: enc(base), run_token: "legacy-r", run_progress_token: "legacy-p", run_publication_token: "legacy-u" });
+      expect(r.env.RUN_TOKEN).toBe("legacy-r");
+      expect(r.env.RUN_PROGRESS_TOKEN).toBe("legacy-p");
+      expect(r.env.RUN_PUBLICATION_TOKEN).toBe(isPlan ? undefined : "legacy-u");
+    });
+
+    it("fails before the entrypoint on malformed private data without echoing it", () => {
+      const bad = [
+        "!!not-base64!!",
+        enc({ ...base, credentials: { version: 1, resultToken: "has white space" } }),
+        enc({ ...base, credentials: { version: 1, resultToken: 5 } }),
+        enc({ ...base, credentials: { version: 1, bogus: "SECRET-SENTINEL" } }),
+        enc({ ...base, credentials: { version: 1, modelAuthGrant: { version: 1, bearer: "SECRET-SENTINEL" } } }),
+      ];
+      for (const run_config of bad) {
+        const r = handoff({ run_config, run_token: "public" });
+        expect(r.boot.status).not.toBe(0);
+        expect(r.env).toBeUndefined();
+        expect(r.githubEnv).toBe("");
+        expect(r.boot.stderr).toContain("Private run_config bootstrap failed");
+        expect(r.boot.stdout + r.boot.stderr).not.toContain("SECRET-SENTINEL");
+      }
+    });
+  });
+}
