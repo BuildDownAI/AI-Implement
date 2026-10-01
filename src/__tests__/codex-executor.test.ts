@@ -734,11 +734,14 @@ describe("protocol driver seam (AII-1001)", () => {
 });
 
 describe("app-server trusted view (AII-1002)", () => {
+  const AUTH_ORIGINAL = '{"tokens":{"account_id":"acct-S","refresh_token":"original"}}';
+  const AUTH_REFRESHED = '{"tokens":{"account_id":"acct-S","refresh_token":"refreshed"}}';
+  const AUTH_OTHER = '{"tokens":{"account_id":"acct-X","refresh_token":"other"}}';
   const viewDirs = (): string[] => readdirSync(tmpdir()).filter((n) => n.startsWith("codex-view-"));
   let selected: string;
   beforeEach(() => {
     selected = mkdtempSync(join(tmpdir(), "selected-home-"));
-    writeFileSync(join(selected, "auth.json"), '{"tokens":"original"}');
+    writeFileSync(join(selected, "auth.json"), AUTH_ORIGINAL);
     writeFileSync(join(selected, "config.toml"), 'model_provider="evil"\n[mcp_servers.x]\ncommand="touch /tmp/sentinel"\n');
     mkdirSync(join(selected, "rules"));
   });
@@ -829,7 +832,7 @@ describe("app-server trusted view (AII-1002)", () => {
     expect(seen!.files).toEqual(["auth.json", "config.toml"]);
     expect(seen!.config).not.toContain("evil");
     expect(seen!.config).not.toContain("mcp_servers");
-    expect(seen!.auth).toBe('{"tokens":"original"}');
+    expect(seen!.auth).toBe(AUTH_ORIGINAL);
     expect(seen!.cwdFiles).toEqual([]);
     // HOME is a trusted empty dir inside the view, never the selected HOME
     expect(log[0].env.HOME).toBe(join(dirname(seen!.home), "user-home"));
@@ -844,12 +847,12 @@ describe("app-server trusted view (AII-1002)", () => {
   it("syncs a refreshed auth.json back to the selected home only after termination", async () => {
     const log: Spawned[] = [];
     const { executor } = run([{ hang: true, dieOn: ["SIGTERM"] }], log, async () => {
-      writeFileSync(join(log[0].env.CODEX_HOME, "auth.json"), '{"tokens":"refreshed"}');
-      expect(readFileSync(join(selected, "auth.json"), "utf8")).toBe('{"tokens":"original"}');
+      writeFileSync(join(log[0].env.CODEX_HOME, "auth.json"), AUTH_REFRESHED);
+      expect(readFileSync(join(selected, "auth.json"), "utf8")).toBe(AUTH_ORIGINAL);
       return okResult();
     });
     await executor.invoke(base);
-    expect(readFileSync(join(selected, "auth.json"), "utf8")).toBe('{"tokens":"refreshed"}');
+    expect(readFileSync(join(selected, "auth.json"), "utf8")).toBe(AUTH_REFRESHED);
     // hostile selected config is untouched, never copied
     expect(readFileSync(join(selected, "config.toml"), "utf8")).toContain("evil");
   });
@@ -889,21 +892,21 @@ describe("app-server trusted view (AII-1002)", () => {
       [
         "a selected source changed underneath the view",
         (home) => {
-          writeFileSync(join(home, "auth.json"), '{"tokens":"refreshed"}');
-          writeFileSync(join(selected, "auth.json"), '{"tokens":"other-account"}');
+          writeFileSync(join(home, "auth.json"), AUTH_REFRESHED);
+          writeFileSync(join(selected, "auth.json"), AUTH_OTHER);
         },
       ],
       [
         "a selected source removed underneath the view",
         (home) => {
-          writeFileSync(join(home, "auth.json"), '{"tokens":"refreshed"}');
+          writeFileSync(join(home, "auth.json"), AUTH_REFRESHED);
           rmSync(join(selected, "auth.json"));
         },
       ],
       [
         "a sync write failure",
         (home) => {
-          writeFileSync(join(home, "auth.json"), '{"tokens":"refreshed"}');
+          writeFileSync(join(home, "auth.json"), AUTH_REFRESHED);
           mkdirSync(join(selected, `auth.json.sync-${process.pid}`));
         },
       ],
@@ -928,7 +931,7 @@ describe("app-server trusted view (AII-1002)", () => {
       expect(invocations()).toEqual({ started: 1, settled: 0 });
       // the selected source was never replaced by anything this run produced
       const unchangedOrExternal = sourceAfterRun();
-      expect([initial ?? '{"tokens":"original"}', '{"tokens":"other-account"}', null]).toContain(unchangedOrExternal);
+      expect([initial ?? AUTH_ORIGINAL, AUTH_OTHER, null]).toContain(unchangedOrExternal);
 
       // the view survives as the only copy of the refreshed session
       const left = viewDirs().filter((n) => !before.has(n));
@@ -961,6 +964,111 @@ describe("app-server trusted view (AII-1002)", () => {
     });
   });
 
+  describe("selected auth validation before spawn", () => {
+    it.each([
+      ["malformed JSON", "{not json sk-secret-canary"],
+      ["a non-object JSON value", "[1,2]"],
+    ])("holds with the callback pending, no spawn and no checkpoint on %s", async (_name, text) => {
+      writeFileSync(join(selected, "auth.json"), text);
+      const before = new Set(viewDirs());
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const log: Spawned[] = [];
+      const { client, checkpoints, invocations } = checkpointingAuth();
+      const driver = vi.fn(async () => okResult());
+      const { executor } = run([{ hang: true, dieOn: ["SIGTERM"] }], log, driver, { auth: client });
+
+      await expect(executor.invoke(base)).rejects.toMatchObject({ code: "CODEX_RECOVERY_REQUIRED", reason: "auth_sync_failed" });
+
+      expect(log).toHaveLength(0);
+      expect(driver).not.toHaveBeenCalled();
+      expect(checkpoints).toEqual([]);
+      expect(invocations()).toEqual({ started: 1, settled: 0 });
+      // the selected profile is untouched and the half-built view (config only, no auth) is gone
+      expect(readFileSync(join(selected, "auth.json"), "utf8")).toBe(text);
+      expect(viewDirs().filter((n) => !before.has(n))).toEqual([]);
+
+      await expect(executor.invoke(base)).rejects.toMatchObject({ reason: "held" });
+      expect(log).toHaveLength(0);
+      expect(invocations().started).toBe(1);
+
+      const logged = warn.mock.calls.map((c) => c.join(" ")).join("\n");
+      expect(logged).not.toContain("sk-secret-canary");
+      warn.mockRestore();
+    });
+  });
+
+  describe("auth identity comparison", () => {
+    const idToken = (claims: Record<string, unknown>): string =>
+      `h.${Buffer.from(JSON.stringify(claims)).toString("base64url")}.s`;
+
+    async function refresh(initial: string, refreshed: string) {
+      writeFileSync(join(selected, "auth.json"), initial);
+      const before = new Set(viewDirs());
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const log: Spawned[] = [];
+      const { client, checkpoints, invocations } = checkpointingAuth();
+      const { executor } = run([{ hang: true, dieOn: ["SIGTERM"] }], log, async () => {
+        writeFileSync(join(log[0].env.CODEX_HOME, "auth.json"), refreshed);
+        return okResult();
+      }, { auth: client });
+      const outcome = await executor.invoke(base).then(
+        () => "ok",
+        (e: unknown) => (e as { reason?: string }).reason ?? "error",
+      );
+      warn.mockRestore();
+      const left = viewDirs().filter((n) => !before.has(n));
+      for (const n of left) rmSync(join(tmpdir(), n), { recursive: true, force: true });
+      return { outcome, checkpoints, invocations: invocations(), source: readFileSync(join(selected, "auth.json"), "utf8") };
+    }
+
+    it.each([
+      ["a valid object with no identity fields", '{"tokens":{"refresh_token":"r1"}}', '{"tokens":{"refresh_token":"r2"}}'],
+      ["empty identity strings", '{"OPENAI_API_KEY":"","tokens":{"account_id":""}}', '{"OPENAI_API_KEY":"","tokens":{"account_id":"","refresh_token":"r2"}}'],
+      [
+        "an undecodable id_token",
+        '{"tokens":{"id_token":"not-a-jwt","refresh_token":"r1"}}',
+        '{"tokens":{"id_token":"not-a-jwt","refresh_token":"r2"}}',
+      ],
+      ["an id_token subject that is not a string", `{"tokens":{"id_token":"${idToken({ sub: 7 })}"}}`, `{"tokens":{"id_token":"${idToken({ sub: 7 })}","x":1}}`],
+    ])("rejects a refresh when selected and refreshed identity are unknown: %s", async (_n, initial, refreshed) => {
+      const r = await refresh(initial, refreshed);
+      expect(r.outcome).toBe("auth_sync_failed");
+      expect(r.checkpoints).toEqual([]);
+      expect(r.invocations).toEqual({ started: 1, settled: 0 });
+      expect(r.source).toBe(initial);
+    });
+
+    it("rejects a refresh that drops a known selected identity", async () => {
+      const r = await refresh('{"tokens":{"account_id":"acct-A"}}', '{"tokens":{"refresh_token":"r2"}}');
+      expect(r.outcome).toBe("auth_sync_failed");
+      expect(r.checkpoints).toEqual([]);
+    });
+
+    it("accepts a refreshed API-key account", async () => {
+      const refreshed = '{"OPENAI_API_KEY":"sk-synthetic-1","last_refresh":"later"}';
+      const r = await refresh('{"OPENAI_API_KEY":"sk-synthetic-1"}', refreshed);
+      expect(r.outcome).toBe("ok");
+      expect(r.source).toBe(refreshed);
+      expect(r.checkpoints).toEqual([refreshed]);
+    });
+
+    it("accepts a refreshed session whose identity is the id_token subject", async () => {
+      const initial = `{"tokens":{"id_token":"${idToken({ sub: "user-1" })}","refresh_token":"r1"}}`;
+      const refreshed = `{"tokens":{"id_token":"${idToken({ sub: "user-1" })}","refresh_token":"r2"}}`;
+      const r = await refresh(initial, refreshed);
+      expect(r.outcome).toBe("ok");
+      expect(r.source).toBe(refreshed);
+    });
+
+    it("rejects a refresh for a different id_token subject", async () => {
+      const r = await refresh(
+        `{"tokens":{"id_token":"${idToken({ sub: "user-1" })}"}}`,
+        `{"tokens":{"id_token":"${idToken({ sub: "user-2" })}"}}`,
+      );
+      expect(r.outcome).toBe("auth_sync_failed");
+    });
+  });
+
   it("directs the provider only through the selected invoke env's OPENAI_BASE_URL, never selected-home config", async () => {
     const log: Spawned[] = [];
     const auth: Pick<ModelAuthClient, "invoke"> = {
@@ -980,13 +1088,13 @@ describe("app-server trusted view (AII-1002)", () => {
     const before = new Set(viewDirs());
     const log: Spawned[] = [];
     const { executor } = run([{ hang: true, dieOn: [] }], log, async () => {
-      writeFileSync(join(log[0].env.CODEX_HOME, "auth.json"), '{"tokens":"refreshed"}');
+      writeFileSync(join(log[0].env.CODEX_HOME, "auth.json"), AUTH_REFRESHED);
       return okResult();
     });
     await expect(executor.invoke(base)).rejects.toBeInstanceOf(CodexRecoveryRequiredError);
     const left = viewDirs().filter((n) => !before.has(n));
     expect(left).toHaveLength(1);
-    expect(readFileSync(join(selected, "auth.json"), "utf8")).toBe('{"tokens":"original"}');
+    expect(readFileSync(join(selected, "auth.json"), "utf8")).toBe(AUTH_ORIGINAL);
     await expect(executor.invoke(base)).rejects.toMatchObject({ reason: "held" });
     expect(viewDirs().filter((n) => !before.has(n))).toEqual(left);
     rmSync(join(tmpdir(), left[0]), { recursive: true, force: true });

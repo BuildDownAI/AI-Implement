@@ -51,26 +51,27 @@ function parseAuth(text: string): Record<string, unknown> | null {
   }
 }
 
-/** Account-identifying fields of an auth.json: API key, token account id and id_token subject. */
-function authIdentity(auth: Record<string, unknown>): string {
+/**
+ * Account-identifying fields of an auth.json: API key, token account id and id_token subject. Null when
+ * none yields a nonempty stable identity, so two unknown identities can never compare equal.
+ */
+function authIdentity(auth: Record<string, unknown>): string | null {
   const tokens = isObject(auth.tokens) ? auth.tokens : {};
+  const nonEmpty = (v: unknown): string | null => (typeof v === "string" && v.length > 0 ? v : null);
   let subject: string | null = null;
   if (typeof tokens.id_token === "string") {
     const payload = tokens.id_token.split(".")[1];
     if (payload) {
       try {
         const claims: unknown = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
-        if (isObject(claims) && typeof claims.sub === "string") subject = claims.sub;
+        if (isObject(claims)) subject = nonEmpty(claims.sub);
       } catch {
         // an undecodable id_token carries no identity to compare
       }
     }
   }
-  return JSON.stringify([
-    typeof auth.OPENAI_API_KEY === "string" ? auth.OPENAI_API_KEY : null,
-    typeof tokens.account_id === "string" ? tokens.account_id : null,
-    subject,
-  ]);
+  const parts = [nonEmpty(auth.OPENAI_API_KEY), nonEmpty(tokens.account_id), subject];
+  return parts.every((p) => p === null) ? null : JSON.stringify(parts);
 }
 
 export interface CodexExecutorOptions {
@@ -501,9 +502,14 @@ export class CodexExecutor implements LLMExecutor {
       const candidate = join(selectedHome, "auth.json");
       if (existsSync(candidate)) {
         // Read once and write that exact text, so the baseline and the view cannot diverge. A malformed
-        // selected auth fails before any child exists: nothing could be refreshed or compared safely.
+        // selected auth fails before any child exists: nothing could be refreshed or compared safely. The
+        // hold keeps the auth callback pending so the client cannot checkpoint over the selected profile.
         initial = readFileSync(candidate, "utf8");
-        if (!parseAuth(initial)) throw Object.assign(new Error("selected auth.json is malformed"), { notASpawnFailure: true });
+        if (!parseAuth(initial)) {
+          this.held = new CodexRecoveryRequiredError("auth_sync_failed");
+          console.warn("[codex] selected auth.json is malformed; no child spawned; executor held for recovery");
+          throw this.held;
+        }
         writeFileSync(join(home, "auth.json"), initial, { mode: 0o600 });
         source = candidate;
       }
@@ -526,7 +532,9 @@ export class CodexExecutor implements LLMExecutor {
       if (refreshed === view.initialAuth) return;
       const next = parseAuth(refreshed);
       const prev = parseAuth(view.initialAuth);
-      if (!next || !prev || authIdentity(next) !== authIdentity(prev)) throw new AuthSyncRejected("invalid_or_foreign_auth");
+      const nextId = next ? authIdentity(next) : null;
+      const prevId = prev ? authIdentity(prev) : null;
+      if (nextId === null || prevId === null || nextId !== prevId) throw new AuthSyncRejected("invalid_or_foreign_auth");
       if (readFileSync(view.authSource, "utf8") !== view.initialAuth) throw new AuthSyncRejected("source_changed");
       // "wx": a pre-existing file at the temp path is a collision, never silently overwritten.
       writeFileSync(tmp, refreshed, { mode: 0o600, flag: "wx" });
