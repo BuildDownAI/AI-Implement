@@ -202,7 +202,6 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
       cancelWorkflowRun: async (runId) => { gh.cancelCalls.push(runId); return true; },
       persistLastRefresh: (outcome: RefreshOutcome) => { persistCalls++; defaultPersistLastRefresh(outcome); },
       handleKgRefreshOutcome: () => {},
-      recordDryRunOutcome: () => {},
       isDeployHeld: () => false,
       readStatusRecord: defaultLoadLastRefresh,
       runPreflight: () => runKgRefreshPreflight({

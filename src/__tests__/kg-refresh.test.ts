@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "nod
 import { execSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { makeKgRefresh, runKgRefreshPreflight, materializeArgs, type KgRefreshHandle, type RefreshOutcome, type DryRunOutcomeEntry, MAX_TRACKED_PRS } from "../kg-refresh.js";
+import { makeKgRefresh, runKgRefreshPreflight, materializeArgs, type KgRefreshHandle, type RefreshOutcome, migrateLegacyDryRunOutcomes } from "../kg-refresh.js";
 
 const NAMESPACE = "https://kg.test.example/";
 
@@ -52,10 +52,9 @@ describe("kg-refresh", () => {
     expect(dockerfile).toMatch(/KG_BACKEND="\$\{KG_BACKEND:-rdflib\}"/);
   });
 
-  // ---- The dry-run PR-check surface (AII-633, AII-636, AII-640) -----------------
-  // The refresh lifecycle runs in the KgRefresh workflow; what the handle keeps is the
-  // per-PR outcome cache behind recordDryRunOutcome/reportDryRun/forgetPr. Most tests seed
-  // the cache through the persisted store, the way a restarted handle finds it.
+  // ---- The dry-run PR-check surface (AII-633, AII-636, AII-640, AII-977) --------
+  // The refresh lifecycle runs in the KgRefresh workflow; the outcome lives on the KgRepo
+  // object. The handle reads and evicts it through the ingress client, faked here.
 
   describe("dry-run report surface", () => {
     const REPORT = { repo: "TestOrg/test-kg", prNumber: 42, sha: "deadbeef" };
@@ -79,12 +78,15 @@ describe("kg-refresh", () => {
     };
     let postOrUpdateStickyCommentFn: ReturnType<typeof vi.fn>;
     let setCommitStatusFn: ReturnType<typeof vi.fn>;
-    let persistDryRunOutcomes: ReturnType<typeof vi.fn>;
+    let dryRunOutcome: ReturnType<typeof vi.fn>;
+    let forgetPrCall: ReturnType<typeof vi.fn>;
 
-    function buildHandle(stored: DryRunOutcomeEntry[] | null | (() => never) = null): KgRefreshHandle {
+    /** `result` is what the KgRepo object answers `dryRunOutcome` with, whatever the PR asked. */
+    function buildHandle(result: unknown = { status: "accepted", value: null }): KgRefreshHandle {
       postOrUpdateStickyCommentFn = vi.fn(async () => {});
       setCommitStatusFn = vi.fn(async () => {});
-      persistDryRunOutcomes = vi.fn();
+      dryRunOutcome = vi.fn(async () => result);
+      forgetPrCall = vi.fn(async () => ({ status: "accepted" }));
       return makeKgRefresh({
         sidecar: { restart: vi.fn(async () => {}) },
         githubAppId: "1",
@@ -97,19 +99,18 @@ describe("kg-refresh", () => {
         fetchDefaultBranch: vi.fn(async () => "main") as never,
         postOrUpdateStickyCommentFn: postOrUpdateStickyCommentFn as never,
         setCommitStatusFn: setCommitStatusFn as never,
-        persistDryRunOutcomes: persistDryRunOutcomes as never,
-        loadDryRunOutcomes: (() => (typeof stored === "function" ? stored() : stored)) as never,
+        dryRunOutcomes: { dryRunOutcome, forgetPr: forgetPrCall } as never,
       });
     }
 
-    const entryFor = (report: { repo: string; prNumber: number; sha: string }, outcome: RefreshOutcome): DryRunOutcomeEntry =>
-      [`${report.repo}#${report.prNumber}`, { sha: report.sha, outcome }];
+    const stored = (sha: string, outcome: RefreshOutcome) => ({ status: "accepted", value: { sha, outcome } });
 
     it("reportDryRun() re-posts the stored outcome's comment and status", async () => {
-      const handle = buildHandle([entryFor(REPORT, okOutcome)]);
+      const handle = buildHandle(stored(REPORT.sha, okOutcome));
 
-      await handle.reportDryRun({ ...REPORT, acceptBaseline: true });
+      await expect(handle.reportDryRun({ ...REPORT, acceptBaseline: true })).resolves.toBe(true);
 
+      expect(dryRunOutcome).toHaveBeenCalledWith("TestOrg/test-kg", { repo: REPORT.repo, prNumber: 42 });
       expect(postOrUpdateStickyCommentFn).toHaveBeenCalledTimes(1);
       const [, owner, repo, prNumber, marker, body] = postOrUpdateStickyCommentFn.mock.calls[0] as [string, string, string, number, string, string];
       expect(owner).toBe("TestOrg");
@@ -123,40 +124,20 @@ describe("kg-refresh", () => {
       expect(setCommitStatusFn).toHaveBeenCalledTimes(1);
     });
 
-    it("reportDryRun() never re-posts another PR's dry-run outcome (AII-636)", async () => {
-      const handle = buildHandle([entryFor(REPORT, okOutcome)]);
-
-      // PR B (a different PR number) never ran a dry-run — must never receive PR A's verdict.
-      await handle.reportDryRun({ repo: REPORT.repo, prNumber: 99, sha: "sha-for-pr-b" });
-      expect(postOrUpdateStickyCommentFn).not.toHaveBeenCalled();
-      expect(setCommitStatusFn).not.toHaveBeenCalled();
-
-      // PR A's own report still works.
-      await handle.reportDryRun(REPORT);
-      expect(postOrUpdateStickyCommentFn).toHaveBeenCalledTimes(1);
-    });
-
     it("reportDryRun() is a no-op when the stored outcome ran against a different sha", async () => {
-      const handle = buildHandle([entryFor(REPORT, okOutcome)]);
+      const handle = buildHandle(stored(REPORT.sha, okOutcome));
 
       // A label applied after a new push superseded the stored outcome's sha.
-      await handle.reportDryRun({ ...REPORT, sha: "a-newer-sha" });
+      await expect(handle.reportDryRun({ ...REPORT, sha: "a-newer-sha" })).resolves.toBe(false);
       expect(postOrUpdateStickyCommentFn).not.toHaveBeenCalled();
       expect(setCommitStatusFn).not.toHaveBeenCalled();
     });
 
-    it("reportDryRun() resolves true when it posts and false on a no-op (AII-636)", async () => {
-      const handle = buildHandle([entryFor(REPORT, okOutcome)]);
-
-      await expect(handle.reportDryRun(REPORT)).resolves.toBe(true);
-      await expect(handle.reportDryRun({ repo: REPORT.repo, prNumber: 999, sha: "nope" })).resolves.toBe(false);
-    });
-
-    it("reportDryRun() logs a debug line and posts nothing when no outcome is stored for the PR", async () => {
-      const handle = buildHandle();
+    it("reportDryRun() logs a debug line and posts nothing when the object holds no outcome", async () => {
+      const handle = buildHandle({ status: "accepted", value: null });
       const debugSpy = vi.spyOn(console, "debug").mockImplementation(() => {});
       try {
-        await handle.reportDryRun({ repo: "TestOrg/test-kg", prNumber: 999, sha: "nope" });
+        await expect(handle.reportDryRun({ repo: "TestOrg/test-kg", prNumber: 999, sha: "nope" })).resolves.toBe(false);
         expect(postOrUpdateStickyCommentFn).not.toHaveBeenCalled();
         expect(setCommitStatusFn).not.toHaveBeenCalled();
         expect(debugSpy).toHaveBeenCalledWith(
@@ -167,18 +148,23 @@ describe("kg-refresh", () => {
       }
     });
 
-    it("forgetPr() evicts a PR's stored outcome and persists the eviction (AII-636)", async () => {
-      const handle = buildHandle([entryFor(REPORT, okOutcome)]);
+    it("reportDryRun() reports false when Restate is unavailable", async () => {
+      const handle = buildHandle({ status: "unavailable" });
 
-      handle.forgetPr(REPORT.repo, REPORT.prNumber);
-
-      expect(persistDryRunOutcomes).toHaveBeenCalledWith([]);
       await expect(handle.reportDryRun(REPORT)).resolves.toBe(false);
       expect(postOrUpdateStickyCommentFn).not.toHaveBeenCalled();
     });
 
+    it("forgetPr() asks the KgRepo object to drop the PR", async () => {
+      const handle = buildHandle();
+
+      await handle.forgetPr(REPORT.repo, REPORT.prNumber);
+
+      expect(forgetPrCall).toHaveBeenCalledWith("TestOrg/test-kg", { repo: REPORT.repo, prNumber: 42 });
+    });
+
     it("reportDryRun({ acceptBaseline: false }) reports plain-refusal wording, even for a PR the label was previously applied to (AII-640)", async () => {
-      const handle = buildHandle([entryFor(REPORT, refusedOutcome)]);
+      const handle = buildHandle(stored(REPORT.sha, refusedOutcome));
 
       // Simulates the webhook's `unlabeled` branch: it always forces acceptBaseline:false.
       await handle.reportDryRun({ ...REPORT, acceptBaseline: false });
@@ -190,67 +176,48 @@ describe("kg-refresh", () => {
       const statusCall = setCommitStatusFn.mock.calls[0] as [string, string, string, string, { state: string }];
       expect(statusCall[4].state).toBe("failure");
     });
+  });
 
-    it("a wrong-shaped persisted blob (valid JSON, not an entry list) is ignored at boot instead of throwing", async () => {
-      let handle: KgRefreshHandle | undefined;
-      expect(() => { handle = buildHandle(({ not: "an array" }) as never); }).not.toThrow();
+  describe("migrateLegacyDryRunOutcomes (AII-977)", () => {
+    function fakeDb(value?: string) {
+      const rows = new Map<string, string>(value === undefined ? [] : [["kg_refresh_dry_run_outcomes", value]]);
+      return {
+        rows,
+        db: {
+          prepare: (sql: string) => ({
+            get: (key: string) => (rows.has(key) ? { value: rows.get(key)! } : undefined),
+            run: (key: string) => { if (/DELETE/.test(sql)) rows.delete(key); },
+          }),
+        } as never,
+      };
+    }
 
-      await expect(handle!.reportDryRun(REPORT)).resolves.toBe(false);
-      expect(postOrUpdateStickyCommentFn).not.toHaveBeenCalled();
-    });
-
-    it("a loader that throws is ignored at boot instead of aborting the handle", async () => {
-      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    it("deletes a present row and logs its entry count", () => {
+      const { db, rows } = fakeDb(JSON.stringify([["a#1", {}], ["a#2", {}]]));
+      const log = vi.spyOn(console, "log").mockImplementation(() => {});
       try {
-        const handle = buildHandle(() => { throw new Error("db locked"); });
-        await expect(handle.reportDryRun(REPORT)).resolves.toBe(false);
+        expect(migrateLegacyDryRunOutcomes(db)).toBe(2);
+        expect(rows.size).toBe(0);
+        expect(log).toHaveBeenCalledWith(expect.stringContaining("(2 entries)"));
       } finally {
-        warnSpy.mockRestore();
+        log.mockRestore();
       }
     });
 
-    describe("recordDryRunOutcome (AII-730)", () => {
-      it("makes reportDryRun re-post for the same PR and sha, and persists the cache", async () => {
-        const handle = buildHandle();
+    it("deletes an unparsable row, counting zero", () => {
+      const { db, rows } = fakeDb("not json");
+      const log = vi.spyOn(console, "log").mockImplementation(() => {});
+      try {
+        expect(migrateLegacyDryRunOutcomes(db)).toBe(0);
+        expect(rows.size).toBe(0);
+      } finally {
+        log.mockRestore();
+      }
+    });
 
-        handle.recordDryRunOutcome(REPORT, okOutcome);
-
-        expect(persistDryRunOutcomes).toHaveBeenCalledWith([entryFor(REPORT, okOutcome)]);
-        await expect(handle.reportDryRun(REPORT)).resolves.toBe(true);
-        expect(postOrUpdateStickyCommentFn).toHaveBeenCalledTimes(1);
-        expect(setCommitStatusFn).toHaveBeenCalledTimes(1);
-      });
-
-      it("does not re-post for another PR or another sha", async () => {
-        const handle = buildHandle();
-
-        handle.recordDryRunOutcome(REPORT, okOutcome);
-
-        await expect(handle.reportDryRun({ repo: REPORT.repo, prNumber: 99, sha: REPORT.sha })).resolves.toBe(false);
-        await expect(handle.reportDryRun({ ...REPORT, sha: "a-newer-sha" })).resolves.toBe(false);
-        expect(postOrUpdateStickyCommentFn).not.toHaveBeenCalled();
-      });
-
-      it("a newer outcome for the same PR replaces the older one", async () => {
-        const handle = buildHandle();
-
-        handle.recordDryRunOutcome(REPORT, okOutcome);
-        handle.recordDryRunOutcome({ ...REPORT, sha: "newer" }, refusedOutcome);
-
-        await expect(handle.reportDryRun(REPORT)).resolves.toBe(false);
-        await expect(handle.reportDryRun({ ...REPORT, sha: "newer" })).resolves.toBe(true);
-      });
-
-      it("evicts the oldest PR past MAX_TRACKED_PRS", async () => {
-        const handle = buildHandle();
-
-        for (let n = 1; n <= MAX_TRACKED_PRS + 1; n++) {
-          handle.recordDryRunOutcome({ ...REPORT, prNumber: n }, okOutcome);
-        }
-
-        await expect(handle.reportDryRun({ ...REPORT, prNumber: 1 })).resolves.toBe(false);
-        await expect(handle.reportDryRun({ ...REPORT, prNumber: MAX_TRACKED_PRS + 1 })).resolves.toBe(true);
-      });
+    it("is a no-op when the row is absent", () => {
+      const { db } = fakeDb();
+      expect(migrateLegacyDryRunOutcomes(db)).toBeNull();
     });
   });
 

@@ -712,10 +712,14 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
     expect(JSON.parse(res.body).reason).toBe("no matching dispatch");
   });
 
-  it("ignores a redelivery carrying the same head sha and does not re-trigger", async () => {
-    const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } });
+  it("hands two deliveries for the same head sha to the object, each with its own delivery id; a duplicate answers 200 (AII-977)", async () => {
+    const enqueueDryRun = vi
+      .fn()
+      .mockResolvedValueOnce({ status: "accepted", value: { triggerId: "t-1" } })
+      .mockResolvedValueOnce({ status: "accepted", value: { duplicate: true } });
     const kgPrCheck = makeKgPrCheck({ enqueueDryRun });
     mockPrFiles(["sources.yml"]);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     const payload = prPayload({
       action: "synchronize",
       number: 7,
@@ -724,17 +728,22 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
       repo: KG_SOURCE_REPO,
     });
 
-    const first = makeRequest(SECRET, "pull_request", payload);
+    const first = makeRequest(SECRET, "pull_request", payload, undefined, { "x-github-delivery": "delivery-1" });
     webhook.handleGitHubWebhook(first.req as never, first.res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
     await first.res.done;
 
-    const second = makeRequest(SECRET, "pull_request", payload);
+    const second = makeRequest(SECRET, "pull_request", payload, undefined, { "x-github-delivery": "delivery-2" });
     webhook.handleGitHubWebhook(second.req as never, second.res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
     await second.res.done;
 
-    expect(enqueueDryRun).toHaveBeenCalledTimes(1);
-    // AII-639: the duplicate is logged; both deliveries are answered by the normal handling.
-    expect(JSON.parse(second.res.body).reason).toBe("no matching dispatch");
+    // The webhook keeps no sha dedup: the KgRepo object absorbs a same-sha event.
+    expect(enqueueDryRun).toHaveBeenCalledTimes(2);
+    expect(enqueueDryRun.mock.calls.map((c) => c[2])).toEqual([
+      { idempotencyKey: "delivery-1" },
+      { idempotencyKey: "delivery-2" },
+    ]);
+    // the duplicate is logged as skipped, not dispatched
+    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("skipped (duplicate sha)"));
   });
 
   it("a guard-relevant synchronize on the KG source repo runs both rails: the dry-run dispatches and the normal pull_request handling answers (AII-639)", async () => {
@@ -879,7 +888,7 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
     expect(JSON.parse(res.body)).toEqual({ triggered: true, triggerId: "t-1" });
   });
 
-  it("an unavailable enqueue answers 502 and clears the sha dedup so a redelivery of the same sha retries", async () => {
+  it("an unavailable enqueue answers 502, and a redelivery of the same sha is enqueued again", async () => {
     const enqueueDryRun = vi
       .fn()
       .mockResolvedValueOnce({ status: "unavailable" })

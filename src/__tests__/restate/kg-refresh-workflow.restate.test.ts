@@ -18,7 +18,7 @@ import { join } from "node:path";
 import * as restate from "@restatedev/restate-sdk";
 import type { RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import type { KgDryRunReportTarget, RefreshOutcome } from "../../kg-refresh.js";
+import type { RefreshOutcome } from "../../kg-refresh.js";
 import { RailGateError, type KgRailDeps } from "../../kg-refresh-rail.js";
 import { COMPLETION_MARKER } from "../../kg-sidecar.js";
 import { createKgRepo, type KgRepoTriggerResult } from "../../restate/kg-repo.js";
@@ -241,7 +241,6 @@ describe("KgRefresh durable workflow", () => {
   const closeRowCalls: Array<{ jobId: string; status: string; conclusion?: string }> = [];
   const persistCalls: RefreshOutcome[] = [];
   const onOutcomeCalls: Array<{ kind: "success" | "failure"; outcome: RefreshOutcome }> = [];
-  const recordedDryRuns: Array<{ report: KgDryRunReportTarget; outcome: RefreshOutcome }> = [];
   let runIdCounter = 9_000;
 
   function newTriggerId(): string {
@@ -356,7 +355,6 @@ describe("KgRefresh durable workflow", () => {
       if (forcePersistFailure) throw new restate.TerminalError("forced persist failure for the outer-catch release test");
     },
     onOutcome: (kind, outcome) => { onOutcomeCalls.push({ kind, outcome }); },
-    recordDryRunOutcome: (report, outcome) => { recordedDryRuns.push({ report, outcome }); },
     bootstrapDeadlineMs: BOOTSTRAP_DEADLINE_MS,
     totalDeadlineMs: TOTAL_DEADLINE_MS,
     watchIntervalMs: WATCH_INTERVAL_MS,
@@ -898,7 +896,6 @@ describe("KgRefresh durable workflow", () => {
       cancelWorkflowRun: cancelWorkflowRunFn,
       persistLastRefresh: (outcome) => { persistCalls.push(outcome); },
       onOutcome: (kind, outcome) => { onOutcomeCalls.push({ kind, outcome }); },
-      recordDryRunOutcome: (report, outcome) => { recordedDryRuns.push({ report, outcome }); },
       bootstrapDeadlineMs: scaledTick * 4,
       totalDeadlineMs: scaledTick * 24,
       watchIntervalMs: scaledTick,
@@ -1025,7 +1022,6 @@ describe("KgRefresh durable workflow", () => {
       cancelWorkflowRun: cancelWorkflowRunFn,
       persistLastRefresh: (outcome) => { persistCalls.push(outcome); },
       onOutcome: (kind, outcome) => { onOutcomeCalls.push({ kind, outcome }); },
-      recordDryRunOutcome: (report, outcome) => { recordedDryRuns.push({ report, outcome }); },
       bootstrapDeadlineMs: 1_000,
       totalDeadlineMs: 5_000,
       watchIntervalMs: 10_000,
@@ -1315,7 +1311,11 @@ describe("KgRefresh durable workflow", () => {
       makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
       const beforeMerge = mergePullRequestFn.mock.calls.length;
       const beforeSticky = postOrUpdateStickyCommentFn.mock.calls.length;
-      const beforeRecorded = recordedDryRuns.length;
+      const recordSends = () => queryInvocations(
+        env.adminAPIBaseUrl(),
+        `target_service_name = 'KgRepo' AND target_service_key = '${KG_SOURCE_REPO}' AND target_handler_name = 'recordDryRunOutcome'`,
+      );
+      const beforeRecorded = (await recordSends()).length;
       const report = { repo: KG_SOURCE_REPO, prNumber: 7, sha: "a".repeat(40) };
 
       const done = runWorkflow(env.baseUrl(), triggerId, { dryRun: true, report });
@@ -1326,11 +1326,16 @@ describe("KgRefresh durable workflow", () => {
       expect(outcome.dryRun).toBe(true);
       expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(0);
       expect(postOrUpdateStickyCommentFn.mock.calls.length - beforeSticky).toBe(1);
-      // Q7: the outcome is recorded for the PR's label path, once, with the same outcome the report carried.
-      const recorded = recordedDryRuns.slice(beforeRecorded);
-      expect(recorded).toHaveLength(1);
-      expect(recorded[0].report).toEqual(report);
-      expect(recorded[0].outcome).toEqual(outcome);
+      // Q7: the outcome goes to KgRepo for the PR's label path — one send, holding the outcome the report carried.
+      const stored = await eventually(
+        () => callObject<{ sha: string; outcome: unknown } | null>(env.baseUrl(), "KgRepo", KG_SOURCE_REPO, "dryRunOutcome", { repo: report.repo, prNumber: report.prNumber }),
+        (v) => v !== null,
+        { label: "durable effect" },
+      );
+      expect(stored).toEqual({ sha: report.sha, outcome });
+      await eventually(async () => (await recordSends()).length - beforeRecorded, (n) => n >= 1, { label: "durable effect" });
+      await settle(300);
+      expect((await recordSends()).length - beforeRecorded).toBe(1);
       expect(closeRowCalls[closeRowCalls.length - 1].status).toBe("completed");
     },
     15_000,
@@ -1466,7 +1471,6 @@ describe("KgRefresh durable workflow", () => {
       cancelWorkflowRun: cancelWorkflowRunFn,
       persistLastRefresh: (outcome) => { persistCalls.push(outcome); },
       onOutcome: (kind, outcome) => { onOutcomeCalls.push({ kind, outcome }); },
-      recordDryRunOutcome: (report, outcome) => { recordedDryRuns.push({ report, outcome }); },
       afterStageCommitted: async () => {
         stageCommittedAttempts.push(endpointId);
         if (stageCommittedAttempts.length === 1) await latch;

@@ -53,14 +53,9 @@ const KG_SNAPSHOT_SHA_SETTINGS_KEY = "kg_refresh_snapshot_sha";
 /** DB settings key for persisting the last terminal refresh outcome across restarts. */
 const KG_LAST_REFRESH_SETTINGS_KEY = "kg_refresh_last_refresh";
 
-/** DB settings key for persisting per-PR dry-run outcomes across restarts (AII-640). */
-const KG_DRY_RUN_OUTCOMES_SETTINGS_KEY = "kg_refresh_dry_run_outcomes";
-
 /**
- * Default bound on the per-PR caches tracking KG PR-check state — this module's
- * `dryRunOutcomesByPr` and webhook.ts's `kgDryRunLastSha` (AII-636).
- * Exported so webhook.ts's
- * caches, which have no natural expiry either, share the same bound.
+ * Bound on the per-PR state `KgRepo` keeps for KG PR-check dry runs — stored outcomes and
+ * held heads (AII-636, AII-977). Exported for `src/restate/kg-repo.ts`.
  */
 export const MAX_TRACKED_PRS = 200;
 
@@ -98,9 +93,6 @@ export interface KgDryRunReportTarget {
   sha: string;
   acceptBaseline?: boolean;
 }
-
-/** One entry of the persisted `dryRunOutcomesByPr` cache — `[repo#prNumber, {sha, outcome}]` (AII-640). */
-export type DryRunOutcomeEntry = [string, { sha: string; outcome: RefreshOutcome }];
 
 /** Heading prefix used to find and update the sticky dry-run PR comment across pushes (AII-633).
  *  Defined in kg-refresh-rail.ts (postDryRunReport's home) and re-exported here so every
@@ -195,8 +187,8 @@ export interface KgRefreshStatus {
 export interface KgRefreshHandle {
   /**
    * Re-posts a dry-run outcome's comment/status to `report` without triggering a new
-   * run (AII-633). Looks up the outcome stored for `report.repo`#`report.prNumber`
-   * (AII-636) and posts only that PR's own outcome — never another PR's — and only
+   * run (AII-633). Reads the outcome `KgRepo` holds for `report.repo`#`report.prNumber`
+   * (AII-636, AII-977) and posts only that PR's own outcome — never another PR's — and only
    * when it ran against `report.sha`; otherwise a no-op (with a debug log line).
    * Called on a `labeled` PR event (e.g. `accept-baseline` applied after the fact) so
    * the report's wording updates without spending another dispatch. Returns whether
@@ -205,16 +197,20 @@ export interface KgRefreshHandle {
    */
   reportDryRun(report: KgDryRunReportTarget): Promise<boolean>;
   /**
-   * Evicts any stored dry-run outcome for `repo`#`prNumber` (AII-636), called when the
+   * Evicts any stored dry-run outcome (and held head) for `repo`#`prNumber` (AII-636), called when the
    * webhook observes that PR close — a closed PR's outcome can never be legitimately
    * re-reported, so there is no reason to hold it until the cap evicts it naturally.
    */
-  forgetPr(repo: string, prNumber: number): void;
-  /**
-   * Stores `outcome` as the dry-run verdict for `report`'s PR and sha and persists the cache
-   * (AII-730), so a later `reportDryRun` for that PR and sha can re-post it.
-   */
-  recordDryRunOutcome(report: KgDryRunReportTarget, outcome: RefreshOutcome): void;
+  forgetPr(repo: string, prNumber: number): Promise<void>;
+}
+
+/** The two `KgRepo` calls the report surface needs; structural, so this module imports nothing from `src/restate/`. */
+export interface KgDryRunOutcomeStore {
+  dryRunOutcome(
+    slug: string,
+    pr: { repo: string; prNumber: number },
+  ): Promise<{ status: string; value?: { sha: string; outcome: RefreshOutcome } | null }>;
+  forgetPr(slug: string, pr: { repo: string; prNumber: number }): Promise<{ status: string }>;
 }
 
 interface KgRefreshInput {
@@ -253,14 +249,8 @@ interface KgRefreshInput {
   postOrUpdateStickyCommentFn?: typeof postOrUpdateStickyComment;
   /** Set the dry-run commit status (AII-633). Injectable for tests; defaults to setCommitStatus from github.ts. */
   setCommitStatusFn?: typeof setCommitStatus;
-  /**
-   * Persist the per-PR dry-run outcome cache across restarts (AII-640). Injectable for
-   * tests. Called with the full, already-capped entry list on every record/evict so the
-   * persisted blob never lags `dryRunOutcomesByPr`. Default: writes to the DB settings table.
-   */
-  persistDryRunOutcomes?: (entries: DryRunOutcomeEntry[]) => void;
-  /** Load the persisted per-PR dry-run outcome cache. Injectable for tests; returns null when absent. */
-  loadDryRunOutcomes?: () => DryRunOutcomeEntry[] | null;
+  /** The `KgRepo` ingress calls the dry-run report surface reads and evicts through (AII-977). */
+  dryRunOutcomes: KgDryRunOutcomeStore;
 }
 
 async function defaultProbeRepo(
@@ -559,10 +549,9 @@ export async function runKgRefreshPreflight(input: KgPreflightInput): Promise<Pr
 }
 
 /**
- * The dry-run PR-check surface of the KG refresh: the per-PR outcome cache behind
- * `reportDryRun`/`forgetPr`, and the settle listeners the webhook's supersession queue
- * waits on. The refresh lifecycle itself (dispatch, waits, deadlines, the local rail)
- * runs in the `KgRefresh` workflow; AII-730 moves this remainder onto the `KgRepo` object.
+ * The dry-run PR-check surface of the KG refresh: `reportDryRun`/`forgetPr`, which read and
+ * evict the per-PR outcome `KgRepo` holds. The refresh lifecycle itself (dispatch, waits,
+ * deadlines, the local rail) runs in the `KgRefresh` workflow.
  */
 export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
   const dataRoot = input.dataRoot ?? DATA_ROOT;
@@ -584,29 +573,6 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
   const postPrCommentFn = input.postPrCommentFn ?? postPrComment;
   const postOrUpdateStickyCommentFn = input.postOrUpdateStickyCommentFn ?? postOrUpdateStickyComment;
   const setCommitStatusFn = input.setCommitStatusFn ?? setCommitStatus;
-  const persistDryRunOutcomesFn = input.persistDryRunOutcomes ?? defaultPersistDryRunOutcomes;
-  const loadDryRunOutcomesFn = input.loadDryRunOutcomes ?? defaultLoadDryRunOutcomes;
-
-  /**
-   * Dry-run outcomes keyed by `repo#prNumber` (AII-636), so a `labeled` webhook event
-   * can only ever re-post the verdict computed for that same PR — never another PR's.
-   * Each entry pins the head `sha` the outcome ran against, so a label applied after a
-   * new push (which supersedes the stored outcome) is a no-op rather than a stale
-   * re-post. Bounded to MAX_TRACKED_PRS entries, oldest evicted first; a PR-scoped
-   * cache has no other natural expiry.
-   */
-  const dryRunOutcomesByPr = new Map<string, { sha: string; outcome: RefreshOutcome }>();
-
-  // Guarded like the other boot-time restores: an injected loader returning a wrong shape
-  // must not abort makeKgRefresh() (it runs synchronously from startServer()).
-  try {
-    const persistedDryRunOutcomes = loadDryRunOutcomesFn();
-    if (Array.isArray(persistedDryRunOutcomes)) {
-      for (const [key, value] of persistedDryRunOutcomes) dryRunOutcomesByPr.set(key, value);
-    }
-  } catch (err) {
-    console.warn("[kg-refresh] ignoring unreadable persisted dry-run outcomes:", err);
-  }
 
   /** Everything the rail's PR-facing functions read, built once from this handle's resolved config. */
   const railDeps: KgRailDeps = {
@@ -635,21 +601,16 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
     setCommitStatusFn,
   };
 
-  return {
-    recordDryRunOutcome(report: KgDryRunReportTarget, outcome: RefreshOutcome): void {
-      const key = `${report.repo}#${report.prNumber}`;
-      dryRunOutcomesByPr.delete(key);
-      dryRunOutcomesByPr.set(key, { sha: report.sha, outcome });
-      if (dryRunOutcomesByPr.size > MAX_TRACKED_PRS) {
-        const oldestKey = dryRunOutcomesByPr.keys().next().value;
-        if (oldestKey !== undefined) dryRunOutcomesByPr.delete(oldestKey);
-      }
-      persistDryRunOutcomesFn(Array.from(dryRunOutcomesByPr.entries()));
-    },
+  /** The `KgRepo` object key — the bound KG source repo, the same one `enqueueDryRun` uses. */
+  const reportSlug = (): string | null => (input.kgSourceRepo ? parseKgSourceRepo(input.kgSourceRepo).fullName : null);
 
+  return {
     async reportDryRun(report: KgDryRunReportTarget): Promise<boolean> {
-      const key = `${report.repo}#${report.prNumber}`;
-      const stored = dryRunOutcomesByPr.get(key);
+      const slug = reportSlug();
+      const result = slug
+        ? await input.dryRunOutcomes.dryRunOutcome(slug, { repo: report.repo, prNumber: report.prNumber })
+        : null;
+      const stored = result?.status === "accepted" ? result.value : null;
       if (!stored || stored.sha !== report.sha) {
         console.debug(`[kg-refresh] dry-run report skipped: no outcome for ${report.repo}#${report.prNumber}`);
         return false;
@@ -658,9 +619,11 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
       return true;
     },
 
-    forgetPr(repo: string, prNumber: number): void {
-      dryRunOutcomesByPr.delete(`${repo}#${prNumber}`);
-      persistDryRunOutcomesFn(Array.from(dryRunOutcomesByPr.entries()));
+    async forgetPr(repo: string, prNumber: number): Promise<void> {
+      const slug = reportSlug();
+      if (!slug) return;
+      const result = await input.dryRunOutcomes.forgetPr(slug, { repo, prNumber });
+      if (result.status !== "accepted") console.warn(`[kg-refresh] forgetPr ${result.status} for ${repo}#${prNumber}`);
     },
   };
 }
@@ -768,32 +731,28 @@ export function defaultLoadLastRefresh(): RefreshOutcome | null {
   }
 }
 
-function defaultPersistDryRunOutcomes(entries: DryRunOutcomeEntry[]): void {
+/**
+ * Boot-time migration (AII-977): per-PR dry-run outcomes now live on `KgRepo`, so the old
+ * `kg_refresh_dry_run_outcomes` settings blob is dead. Logs its entry count and deletes the
+ * row; live outcomes are re-posted by the next push. Returns the count, or null when absent.
+ */
+export function migrateLegacyDryRunOutcomes(db: Pick<ReturnType<typeof getDb>, "prepare"> = getDb()): number | null {
+  const key = "kg_refresh_dry_run_outcomes";
   try {
-    getDb()
-      .prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)")
-      .run(KG_DRY_RUN_OUTCOMES_SETTINGS_KEY, JSON.stringify(entries));
-  } catch {
-    // DB unavailable — the dry-run outcome cache will be lost on restart, which is acceptable.
-  }
-}
-
-function defaultLoadDryRunOutcomes(): DryRunOutcomeEntry[] | null {
-  try {
-    const row = getDb()
-      .prepare("SELECT value FROM settings WHERE key = ?")
-      .get(KG_DRY_RUN_OUTCOMES_SETTINGS_KEY) as { value: string } | undefined;
+    const row = db.prepare("SELECT value FROM settings WHERE key = ?").get(key) as { value: string } | undefined;
     if (!row) return null;
-    const parsed: unknown = JSON.parse(row.value);
-    // A blob that is valid JSON but not the persisted shape (roll-up #538 review): treat it
-    // like every other bad persisted blob in this module — acceptable to lose, never a boot
-    // failure. The restore loop below iterates entries, so a bare object would throw there.
-    if (!Array.isArray(parsed)) return null;
-    return parsed.filter(
-      (e): e is DryRunOutcomeEntry =>
-        Array.isArray(e) && e.length === 2 && typeof e[0] === "string" && e[1] !== null && typeof e[1] === "object",
-    );
-  } catch {
+    let count = 0;
+    try {
+      const parsed: unknown = JSON.parse(row.value);
+      if (Array.isArray(parsed)) count = parsed.length;
+    } catch {
+      // An unreadable blob is still deleted; it counts as zero entries.
+    }
+    db.prepare("DELETE FROM settings WHERE key = ?").run(key);
+    console.log(`[kg-refresh] removed legacy dry-run outcome cache (${count} entries); KgRepo holds outcomes now`);
+    return count;
+  } catch (err) {
+    console.warn("[kg-refresh] legacy dry-run outcome cache migration failed:", err);
     return null;
   }
 }

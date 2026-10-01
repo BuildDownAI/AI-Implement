@@ -132,7 +132,7 @@ import { getRestateStatus, setRestateStatus } from "./restate/status.js";
 import type { RestateRegistrationStatus } from "./restate/status.js";
 import { setProviderRegistry } from "./restate/tools.js";
 import { callTool, callToolAsSystem } from "./restate/tools-client.js";
-import { makeKgRefresh, runKgRefreshPreflight, defaultFetchDefaultBranch, defaultFetchSnapshotCommitSha, defaultMaterialize, defaultMcpToolCall, defaultPersistLastRefresh, defaultLoadLastRefresh } from "./kg-refresh.js";
+import { makeKgRefresh, migrateLegacyDryRunOutcomes, runKgRefreshPreflight, defaultFetchDefaultBranch, defaultFetchSnapshotCommitSha, defaultMaterialize, defaultMcpToolCall, defaultPersistLastRefresh, defaultLoadLastRefresh } from "./kg-refresh.js";
 import type { KgRefreshHandle } from "./kg-refresh.js";
 import { beginCycle, isCurrentCycle, getPollStats, runWithDeadline } from "./poll-cycle.js";
 
@@ -154,9 +154,6 @@ export function makeReaperHelpers(config: AppConfig, registry: ProviderRegistry)
       (await findPrForIssue(config, repo, issueIdentifier))?.url ?? null,
   };
 }
-
-/** Set by startServer(); read by the deploy-hold and settle wiring. */
-let activeKgRefresh: KgRefreshHandle | null = null;
 
 // ---------- Configuration ----------
 
@@ -4596,8 +4593,9 @@ function startServer(
     githubAppId: config.githubAppId,
     githubAppPrivateKey: config.githubAppPrivateKey,
     kgSourceRepo: config.kgSourceRepo,
+    dryRunOutcomes: kgRefreshIngressClient,
   });
-  activeKgRefresh = kgRefresh;
+  migrateLegacyDryRunOutcomes();
 
   const handleRequest: http.RequestListener = (req, res) => {
     const url = req.url || "/";
@@ -5473,7 +5471,6 @@ async function main(): Promise<void> {
       cancelWorkflowRun: async (runId) => cancelWorkflowRun(await kgWorkflowToken(), kgSlug.owner, kgSlug.repo, runId),
       persistLastRefresh: defaultPersistLastRefresh,
       handleKgRefreshOutcome: (outcome, data) => handleKgRefreshOutcome(config, registry, outcome, data),
-      recordDryRunOutcome: (report, outcome) => activeKgRefresh?.recordDryRunOutcome(report, outcome),
       isDeployHeld,
       readStatusRecord: defaultLoadLastRefresh,
       runPreflight: () => runKgRefreshPreflight({
