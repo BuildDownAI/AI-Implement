@@ -235,7 +235,8 @@ jobs:
           # extracted credential, before any step prints metadata or output. Failures
           # print fixed text only; jq stderr is discarded because it can echo input.
           jq -r '
-            (.inputs // {}).run_config // ""
+            (.inputs // {}).run_config
+            | if . == null then "" else . end
             | if type == "string" then . else error("x") end
             | select(. != "")
             | gsub("%"; "%25") | gsub("\r"; "%0D") | gsub("\n"; "%0A")
@@ -246,21 +247,83 @@ jobs:
           }
           jq -r '
             def mask: gsub("%"; "%25") | gsub("\r"; "%0D") | gsub("\n"; "%0A") | "::add-mask::" + .;
-            (.inputs // {}).run_config // ""
+            def isobj: type == "object";
+            def only($k): ((keys - $k) | length) == 0;
+            def idstr: type == "string" and length >= 1 and length <= 128 and test("\\A[A-Za-z0-9][A-Za-z0-9._-]*\\z");
+            def posint: type == "number" and . > 0 and . <= 9007199254740991 and . == floor;
+            def b64u($min; $max): type == "string" and length >= $min and length <= $max and test("\\A[A-Za-z0-9_-]+\\z");
+            def token: type == "string" and length >= 1 and length <= 4096 and (test("\\s") | not);
+            def modes: ["anthropic-api-key", "bedrock", "claude-subscription", "openai-api-key", "codex-subscription"];
+            def stage_names: ["planning", "implementation", "review"];
+            def binding:
+              isobj and only(["stage", "profileId", "profileRevision", "authMode", "ownerGeneration"])
+              and (.stage | IN(stage_names[])) and (.profileId | idstr) and (.profileRevision | posint)
+              and (.authMode | IN(modes[]))
+              and (if (.authMode | IN("claude-subscription", "codex-subscription"))
+                   then (.ownerGeneration | posint) else (has("ownerGeneration") | not) end);
+            def plain_grant:
+              isobj and only(["version", "audience", "grantId", "dispatchId", "snapshotId", "projectKey", "backend", "expiresAt", "bearer", "bindings"])
+              and .version == 1 and .audience == "model-auth"
+              and (.grantId | idstr) and (.dispatchId | idstr) and (.snapshotId | idstr) and (.projectKey | idstr)
+              and (.backend | IN("fly", "gha", "local")) and (.expiresAt | posint)
+              and (.bearer | b64u(32; 256))
+              and (.bindings | type == "array" and length >= 1 and length <= 16 and all(.[]; binding)
+                   and (group_by(.profileId) | all(.[]; ((map(.stage) | unique | length) == length)
+                        and ((map([.profileRevision, .authMode, .ownerGeneration]) | unique | length) <= 1))));
+            def sealed_grant:
+              isobj and only(["version", "algorithm", "dispatchId", "backend", "nonce", "ciphertext", "tag"])
+              and .version == 1 and .algorithm == "aes-256-gcm" and (.dispatchId | idstr) and .backend == "fly"
+              and (.nonce | b64u(16; 16)) and (.ciphertext | b64u(1; 65536)) and (.tag | b64u(22; 22));
+            def grant: if isobj and has("algorithm") then sealed_grant else plain_grant end;
+            def creds:
+              isobj and only(["version", "resultToken", "progressToken", "publicationToken", "attemptToken", "modelAuthGrant"])
+              and .version == 1
+              and (. as $c | all("resultToken", "progressToken", "publicationToken", "attemptToken";
+                     . as $f | ($c | has($f) | not) or ($c[$f] | token)))
+              and (if has("modelAuthGrant") then (.modelAuthGrant | grant) else true end);
+            def snapstr: type == "string" and test("\\S") and length <= 256;
+            def revref: isobj and only(["configRevisionId", "revision"]) and (.configRevisionId | snapstr) and (.revision | posint);
+            def sel:
+              isobj and only(["agent", "provider", "model", "accountProfileId", "invocationTimeoutMs"])
+              and (.agent | IN("claude", "codex")) and (.provider | IN("anthropic", "bedrock", "openai"))
+              and (.model | snapstr) and (.accountProfileId | snapstr) and (.invocationTimeoutMs | posint);
+            def src:
+              isobj and only(["agent", "provider", "model", "accountProfileId", "invocationTimeoutMs"])
+              and (. as $o | all("agent", "provider", "model", "accountProfileId", "invocationTimeoutMs";
+                     . as $f | $o[$f] | IN("orchestrator-default", "project", "job-deadline")));
+            def prof:
+              isobj and only(["id", "identity", "revision", "agent", "provider", "authMode"])
+              and (.id | snapstr) and (.identity | snapstr) and (.revision | posint)
+              and (.agent | IN("claude", "codex")) and (.provider | IN("anthropic", "bedrock", "openai"))
+              and (.authMode | IN(modes[]));
+            def combo($a; $p; $m):
+              if $a == "claude"
+              then ($p == "anthropic" and ($m == "anthropic-api-key" or $m == "claude-subscription"))
+                   or ($p == "bedrock" and $m == "bedrock")
+              else $p == "openai" and ($m == "openai-api-key" or $m == "codex-subscription") end;
+            def snapshot:
+              isobj and only(["version", "snapshotId", "configRevisions", "stages", "sources", "profiles"])
+              and .version == 1 and (.snapshotId | snapstr)
+              and (.configRevisions | isobj and only(["orchestratorDefault", "project"])
+                   and (.orchestratorDefault | revref) and (.project | revref))
+              and ([.stages, .sources, .profiles] | all(.[]; isobj and (keys == (stage_names | sort))))
+              and (. as $r | all(stage_names[]; . as $s
+                   | $r.stages[$s] as $a | $r.sources[$s] as $b | $r.profiles[$s] as $p
+                   | ($a | sel) and ($b | src) and ($p | prof)
+                     and $p.id == $a.accountProfileId and $p.agent == $a.agent and $p.provider == $a.provider
+                     and combo($p.agent; $p.provider; $p.authMode)));
+            (.inputs // {}).run_config
+            | if . == null then "" else . end
             | if type == "string" then . else error("x") end
             | select(. != "")
             | (try (@base64d | fromjson) catch error("x"))
             | if type == "object" then . else error("x") end
-            | (.credentials // empty)
-            | if type == "object" then . else error("x") end
-            | if (keys - ["version", "resultToken", "progressToken", "publicationToken", "attemptToken", "modelAuthGrant"] | length) == 0
-                 and .version == 1
-                 and all(.resultToken, .progressToken, .publicationToken, .attemptToken;
-                         . == null or (type == "string" and length > 0 and length <= 4096 and (test("\\s") | not)))
-                 and (.modelAuthGrant == null or (.modelAuthGrant | type == "object"))
-              then . else error("x") end
+            | if (has("agentConfig") | not) or (.agentConfig | snapshot) then . else error("x") end
+            | if has("credentials") then .credentials else empty end
+            | if creds then . else error("x") end
             | [ (.resultToken, .progressToken, .publicationToken, .attemptToken | select(. != null)),
-                (.modelAuthGrant // empty | .. | strings | select(length >= 8)) ]
+                (.modelAuthGrant // empty
+                  | if has("algorithm") then (.nonce, .ciphertext, .tag | select(length >= 8)) else .bearer end) ]
             | unique | .[] | mask
           ' "$GITHUB_EVENT_PATH" 2>/dev/null || {
             echo "::error::Private run_config bootstrap failed" >&2
@@ -317,18 +380,20 @@ jobs:
           echo "[dispatch-inputs] run_progress_token: $( [ "$HAS_RUN_PROGRESS_TOKEN" = "true" ] && echo "<redacted>" || echo "(empty)" )"
           echo "[dispatch-inputs] run_publication_token: $( [ "$HAS_PUBLICATION_TOKEN" = "true" ] && echo "<redacted>" || echo "(empty)" )"
           # Diagnostic projection only (AII-982): known envelope keys, credentials
-          # replaced by field names. The raw and decoded envelope are never printed.
+          # replaced by field names, agentConfig omitted. The raw and decoded envelope are never printed.
           # jq quotes and indents every value, so no decoded line can begin with
           # "::" and forge a workflow command.
           echo "[dispatch-inputs] run_config:"
           printf '%s' "$RUN_CONFIG" | base64 -d 2>/dev/null | jq '
             (.credentials // null) as $c
+            | has("agentConfig") as $hasAgent
             | with_entries(select(.key | IN("v", "issue", "prNumber", "baseBranch", "runnerPhase",
                 "branchPrefix", "skillsRepo", "runnerCallbackUrl", "maxTurns", "maxIterations",
                 "commentInstruction", "sensitiveFiles", "profiles", "assigneeName", "planningContext",
                 "groupingParent", "dependencyTokenScope", "kgSourceRepo", "kgDryRun", "kgSourceRef",
                 "kgAcceptNewBaseline", "kgBaselineActor", "referenceRepos", "reviewers",
-                "retryPolicy", "reviewFix", "agentConfig")))
+                "retryPolicy", "reviewFix")))
+            | if $hasAgent then . + {agentConfig: "<omitted>"} else . end
             | if ($c | type) == "object"
               then . + {credentialFields: [$c | keys_unsorted[]
                   | select(. as $k | ["resultToken", "progressToken", "publicationToken", "attemptToken", "modelAuthGrant"] | index($k))]}
