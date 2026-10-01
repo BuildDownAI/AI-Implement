@@ -42,17 +42,40 @@ export function restateBindAddress(): RestateBindAddress {
   return { host, port };
 }
 
-export function createRestateEndpointHandler(services: RestateService[] = RESTATE_SERVICES) {
-  return createEndpointHandler({ services });
+let warnedUnsigned = false;
+
+/**
+ * Request-identity keys for the endpoint (AII-976): the sidecar's own key, else
+ * RESTATE_IDENTITY_KEY for an external server. With neither, the SDK accepts unsigned
+ * requests and the warning is logged once.
+ */
+export function resolveIdentityKeys(sidecarKey?: string, env: NodeJS.ProcessEnv = process.env): string[] | undefined {
+  const key = sidecarKey || env.RESTATE_IDENTITY_KEY?.trim();
+  if (key) return [key];
+  if (!warnedUnsigned) {
+    warnedUnsigned = true;
+    console.error("[restate] no request identity key — the endpoint accepts unsigned requests (loopback binding is the only control)");
+  }
+  return undefined;
+}
+
+export function createRestateEndpointHandler(
+  services: RestateService[] = RESTATE_SERVICES,
+  identityKeys?: string[],
+) {
+  return createEndpointHandler(identityKeys ? { services, identityKeys } : { services });
 }
 
 // Starts the SDK endpoint as an HTTP/2 server. Called from orchestrator boot
 // (src/index.ts) once the RestateSidecar reports readiness, then followed by register().
 export function startRestateEndpoint(
   services: RestateService[] = RESTATE_SERVICES,
+  sidecarIdentityKey?: string,
 ): Promise<http2.Http2Server> {
   const { host, port } = restateBindAddress();
-  const server = http2.createServer(createRestateEndpointHandler(services));
+  const server = http2.createServer(
+    createRestateEndpointHandler(services, resolveIdentityKeys(sidecarIdentityKey)),
+  );
   return new Promise((resolve, reject) => {
     server.once("error", reject);
     server.listen(port, host, () => resolve(server));

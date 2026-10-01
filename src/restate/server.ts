@@ -2,6 +2,8 @@ import http from "node:http";
 import path from "node:path";
 import os from "node:os";
 import { createRequire } from "node:module";
+import { createPrivateKey, createPublicKey, generateKeyPairSync } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
 import { stopChildWithBackstop } from "../process-stop.js";
@@ -55,6 +57,43 @@ function restateEnvOverrides(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
     if (key.startsWith("RESTATE_") && value !== undefined) overrides[key] = value;
   }
   return overrides;
+}
+
+const BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+function base58Encode(bytes: Buffer): string {
+  let n = BigInt(`0x${bytes.toString("hex") || "0"}`);
+  let out = "";
+  while (n > 0n) {
+    out = BASE58_ALPHABET[Number(n % 58n)] + out;
+    n /= 58n;
+  }
+  for (const b of bytes) {
+    if (b !== 0) break;
+    out = `1${out}`;
+  }
+  return out;
+}
+
+/** The compact `publickeyv1_<base58>` form the SDK takes as an identity key, derived from an ED25519 private-key PEM. */
+export function identityKeyFromPem(privatePem: string): string {
+  const jwk = createPublicKey(createPrivateKey(privatePem)).export({ format: "jwk" });
+  return `publickeyv1_${base58Encode(Buffer.from(jwk.x ?? "", "base64url"))}`;
+}
+
+/**
+ * Ensures an ED25519 request-identity key pair exists under `dataDir` (private PEM, mode
+ * 0600, written once and reused on later boots) and returns the private key's path with
+ * the public key in the SDK's compact format.
+ */
+export function ensureRequestIdentityKey(dataDir: string): { privateKeyPath: string; publicKey: string } {
+  const privateKeyPath = path.join(dataDir, "request-identity-private.pem");
+  if (!existsSync(privateKeyPath)) {
+    mkdirSync(dataDir, { recursive: true });
+    const { privateKey } = generateKeyPairSync("ed25519");
+    writeFileSync(privateKeyPath, privateKey.export({ type: "pkcs8", format: "pem" }), { mode: 0o600, flag: "wx" });
+  }
+  return { privateKeyPath, publicKey: identityKeyFromPem(readFileSync(privateKeyPath, "utf8")) };
 }
 
 interface Deferred<T> {
@@ -124,6 +163,7 @@ export class RestateSidecar {
   private _stopPromise: Promise<void> | null = null;
   private _readyDeferred: Deferred<boolean> | null = null;
   private _backgroundPollTimer: ReturnType<typeof setTimeout> | null = null;
+  private _identityKey: string | undefined;
 
   constructor(opts?: RestateSidecarOptions, _deps?: RestateSidecarDeps) {
     this._dataDir = opts?.dataDir ?? restateDataDir();
@@ -133,6 +173,15 @@ export class RestateSidecar {
     this._httpGet = _deps?.httpGet ?? defaultHttpGet;
     this._spawn = _deps?.spawn ?? ((cmd, args, spawnOpts) => spawn(cmd, args, spawnOpts as Parameters<typeof spawn>[2]));
     this._resolveBinary = _deps?.resolveBinary ?? resolvePlatformBinary;
+  }
+
+  /**
+   * Public half (`publickeyv1_…`) of the request-identity key the server signs with, for the
+   * SDK endpoint's `identityKeys`. Undefined until start() has generated or loaded it, and
+   * when the key could not be prepared (the endpoint then accepts unsigned requests).
+   */
+  get identityKey(): string | undefined {
+    return this._identityKey;
   }
 
   /**
@@ -183,6 +232,20 @@ export class RestateSidecar {
     for (const key of ["PATH", "HOME", "TMPDIR", "TZ"] as const) {
       const value = process.env[key];
       if (value !== undefined) childEnv[key] = value;
+    }
+    // Request identity (AII-976): the server signs every call to the endpoint with this key;
+    // the endpoint verifies with the public half. A key failure is non-fatal like any other
+    // sidecar failure — the sidecar starts unsigned and the endpoint warns.
+    this._identityKey = undefined;
+    try {
+      const { privateKeyPath, publicKey } = ensureRequestIdentityKey(this._dataDir);
+      childEnv.RESTATE_REQUEST_IDENTITY_PRIVATE_KEY_PEM_FILE = privateKeyPath;
+      this._identityKey = publicKey;
+      console.error(`[restate] request identity key ${publicKey}`);
+    } catch (err) {
+      console.error(
+        `[restate] could not prepare the request identity key (${err instanceof Error ? err.message : String(err)}) — requests are not signed`,
+      );
     }
     Object.assign(childEnv, {
       RESTATE_INGRESS__BIND_ADDRESS: RESTATE_INGRESS_BIND_ADDRESS,

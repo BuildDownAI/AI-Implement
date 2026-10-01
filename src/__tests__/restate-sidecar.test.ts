@@ -1,10 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { spawn as realSpawn, type ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { mkdtempSync, rmSync, writeFileSync, chmodSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, chmodSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { RestateSidecar, restateDataDir, RESTATE_ADMIN_BASE_URL, RESTATE_INGRESS_BIND_ADDRESS } from "../restate/server.js";
+import { RestateSidecar, restateDataDir, ensureRequestIdentityKey, RESTATE_ADMIN_BASE_URL, RESTATE_INGRESS_BIND_ADDRESS } from "../restate/server.js";
 import { getRestateStatus, resetRestateStatus } from "../restate/status.js";
 import { createRestateRegistrationGate, stopSidecarsConcurrently } from "../index.js";
 
@@ -933,5 +933,45 @@ describe("main() wiring: whenReady() drives the registration gate end to end", (
     } finally {
       await sidecar.stop();
     }
+  });
+});
+
+describe("request identity key", () => {
+  function fakeSpawn(envs: NodeJS.ProcessEnv[]) {
+    return (_cmd: string, _args: string[], opts: object) => {
+      envs.push((opts as { env: NodeJS.ProcessEnv }).env);
+      return testSpawn("/bin/sh", ["-c", "sleep 5"], opts);
+    };
+  }
+
+  it("writes the pair once on first boot and reuses it on the next", async () => {
+    const dataDir = makeTmpDir();
+    const envs: NodeJS.ProcessEnv[] = [];
+    const mk = () =>
+      new RestateSidecar(
+        { dataDir, pollIntervalMs: 10, pollTimeoutMs: 1_000, stopTimeoutMs: 500 },
+        { spawn: fakeSpawn(envs), httpGet: async () => true, resolveBinary: () => "/bin/true" },
+      );
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const first = mk();
+    await first.start();
+    const pemPath = envs[0].RESTATE_REQUEST_IDENTITY_PRIVATE_KEY_PEM_FILE!;
+    expect(pemPath.startsWith(dataDir)).toBe(true);
+    expect(first.identityKey).toMatch(/^publickeyv1_[1-9A-HJ-NP-Za-km-z]+$/);
+    expect(statSync(pemPath).mode & 0o777).toBe(0o600);
+    const pem = readFileSync(pemPath, "utf8");
+    await first.stop();
+
+    const second = mk();
+    await second.start();
+    expect(readFileSync(pemPath, "utf8")).toBe(pem);
+    expect(second.identityKey).toBe(first.identityKey);
+    await second.stop();
+  });
+
+  it("derives a stable key from the PEM", () => {
+    const dataDir = makeTmpDir();
+    expect(ensureRequestIdentityKey(dataDir).publicKey).toBe(ensureRequestIdentityKey(dataDir).publicKey);
   });
 });

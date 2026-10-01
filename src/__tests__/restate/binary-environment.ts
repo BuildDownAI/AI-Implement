@@ -18,6 +18,7 @@ import { stopChildWithBackstop } from "../../process-stop.js";
 import {
   RESTATE_DEFAULT_NUM_PARTITIONS,
   RESTATE_ROCKSDB_TOTAL_MEMORY_SIZE,
+  ensureRequestIdentityKey,
   resolvePlatformBinary,
 } from "../../restate/server.js";
 
@@ -30,6 +31,8 @@ export interface BinaryEnvironmentOptions {
   variant?: "alwaysReplay" | "disableRetries";
   /** Accepted for parity with RestateTestEnvironment; the binary always keeps its state on disk. */
   storage?: "disk";
+  /** Sign the server's calls with a fresh request identity key and have the endpoint verify it (AII-976). */
+  requestIdentity?: boolean;
   /** Seam for the missing-binary path; defaults to the resolver RestateSidecar uses. */
   resolveBinary?: () => string | null;
 }
@@ -40,6 +43,10 @@ export interface BinaryEnvironment {
   stop(): Promise<void>;
   startedRestateHttpServer: http2.Http2Server;
   startedRestateContainer: { restart(): Promise<void> };
+  /** Port the SDK endpoint listens on (loopback). */
+  endpointPort(): number;
+  /** Public request identity key the endpoint verifies, when `requestIdentity` was set. */
+  identityKey(): string | undefined;
   /** Pid of the current child (test seam for the cleanup assertion). */
   childPid(): number | undefined;
   /** Base directory holding the Restate store (test seam for the cleanup assertion). */
@@ -112,6 +119,12 @@ export async function startBinaryEnvironment(options: BinaryEnvironmentOptions):
     RESTATE_DEFAULT_NUM_PARTITIONS,
     RESTATE_ROCKSDB_TOTAL_MEMORY_SIZE,
   });
+  let identityKey: string | undefined;
+  if (options.requestIdentity) {
+    const identity = ensureRequestIdentityKey(baseDir);
+    identityKey = identity.publicKey;
+    childEnv.RESTATE_REQUEST_IDENTITY_PRIVATE_KEY_PEM_FILE = identity.privateKeyPath;
+  }
   // Same values RestateContainer.alwaysReplay() / .disableRetries() set.
   if (options.variant === "alwaysReplay") {
     childEnv.RESTATE_WORKER__INVOKER__INACTIVITY_TIMEOUT = "0s";
@@ -170,7 +183,7 @@ export async function startBinaryEnvironment(options: BinaryEnvironmentOptions):
     throw new Error("restate-server ingress not ready");
   };
 
-  const endpoint = http2.createServer(createEndpointHandler({ services: options.services }));
+  const endpoint = http2.createServer(createEndpointHandler(identityKey ? { services: options.services, identityKeys: [identityKey] } : { services: options.services }));
   // Restate holds HTTP/2 sessions open; close() alone would wait on them forever.
   const sessions = new Set<http2.ServerHttp2Session>();
   endpoint.on("session", (session) => {
@@ -229,6 +242,8 @@ export async function startBinaryEnvironment(options: BinaryEnvironmentOptions):
         await waitForIngress();
       },
     },
+    endpointPort: () => (endpoint.address() as net.AddressInfo).port,
+    identityKey: () => identityKey,
     childPid: () => (child as ChildProcess | null)?.pid,
     baseDir: () => baseDir,
   };

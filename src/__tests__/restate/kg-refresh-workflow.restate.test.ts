@@ -32,7 +32,7 @@ import {
   type KgRefreshReportBody,
 } from "../../restate/kg-refresh-workflow.js";
 import {
-  VARIANTS, attachWorkflow, callObject, callWorkflow, eventually, queryInvocations, replaceEndpoint, settle,
+  VARIANTS, attachWorkflow, callObject, callService, callWorkflow, eventually, queryInvocations, replaceEndpoint, settle,
   startRetryEnabled, startVariants, stopAll,
 } from "./harness.js";
 
@@ -361,6 +361,20 @@ describe("KgRefresh durable workflow", () => {
   });
 
   const kgRepo = createKgRepo({ workflowName: "KgRefresh" });
+  const starter = restate.service({
+    name: "KgRefreshStarter",
+    handlers: {
+      start: async (ctx: restate.Context, req: { triggerId: string; input: unknown }): Promise<RefreshOutcome> =>
+        ctx.genericCall({
+          service: "KgRefresh",
+          method: "run",
+          key: req.triggerId,
+          parameter: req.input,
+          inputSerde: restate.serde.json as restate.Serde<unknown>,
+          outputSerde: restate.serde.json as restate.Serde<unknown>,
+        }) as Promise<RefreshOutcome>,
+    },
+  });
 
   async function triggerViaKgRepo(baseUrl: string, opts: Record<string, unknown> = {}): Promise<KgRepoTriggerResult> {
     return callObject<KgRepoTriggerResult>(baseUrl, "KgRepo", KG_SOURCE_REPO, "trigger", opts);
@@ -372,7 +386,7 @@ describe("KgRefresh durable workflow", () => {
 
   let envs: Map<string, RestateTestEnvironment>;
   beforeAll(async () => {
-    envs = await startVariants([workflow, kgRepo]);
+    envs = await startVariants([workflow, kgRepo, starter]);
   }, 60_000);
   afterAll(async () => {
     if (envs) await stopAll(envs);
@@ -384,9 +398,24 @@ describe("KgRefresh durable workflow", () => {
     return env;
   }
 
+  // KgRefresh.run is ingressPrivate (AII-976): production starts it by a send from KgRepo. This
+  // forwarder stands in for that caller so a scenario can start a run with its own trigger id.
   async function runWorkflow(baseUrl: string, triggerId: string, extra: Record<string, unknown> = {}): Promise<Promise<RefreshOutcome>> {
-    return callWorkflow<RefreshOutcome>(baseUrl, "KgRefresh", triggerId, "run", { triggerId, ...extra });
+    return callService<RefreshOutcome>(baseUrl, "KgRefreshStarter", "start", { triggerId, input: { triggerId, ...extra } });
   }
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "KgRefresh.run is ingress-private: a direct ingress call answers 400 (%s)",
+    async (label) => {
+      const response = await fetch(`${envFor(label).baseUrl()}/KgRefresh/ingress-private-check/run`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ triggerId: "ingress-private-check" }),
+      });
+      expect(response.status).toBe(400);
+    },
+    30_000,
+  );
 
   // ---- W1 / W11: success report runs merge, delete-branch, the four real gates, persist,
   // close-row, one outcome call, settled, one release — each exactly once. it.each already
@@ -900,7 +929,7 @@ describe("KgRefresh durable workflow", () => {
       totalDeadlineMs: scaledTick * 24,
       watchIntervalMs: scaledTick,
     });
-    const scaledEnv = await startRetryEnabled([scaledWorkflow, kgRepo]);
+    const scaledEnv = await startRetryEnabled([scaledWorkflow, kgRepo, starter]);
     try {
       const triggerId = newTriggerId();
       const runId = runIdCounter++;
@@ -1027,7 +1056,7 @@ describe("KgRefresh durable workflow", () => {
       watchIntervalMs: 10_000,
       reconcileIntervalMs: 100,
     });
-    const cadenceEnv = await startRetryEnabled([cadenceWorkflow, kgRepo]);
+    const cadenceEnv = await startRetryEnabled([cadenceWorkflow, kgRepo, starter]);
     try {
       const triggerId = newTriggerId();
       makeScenario(triggerId, {
