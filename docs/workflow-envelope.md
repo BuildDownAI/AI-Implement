@@ -34,7 +34,7 @@ These are live credentials in the runner's environment; `src/__tests__/setup/cle
 
 Headroom note: GitHub caps `workflow_dispatch` at 10 inputs; 9 of 10 used; one slot free. That ceiling is part of why the envelope exists; a new field must ride inside `run_config` unless the workflow itself has to read it before the runner starts (masking, routing), in which case an existing input has to make room. `claude-plan.yml` declares eight of these (no `run_publication_token`).
 
-The first step of the container job prints every input (`[dispatch-inputs] …`), with the three tokens reduced to `<redacted>`/`(empty)` and `run_config` base64-decoded through `jq`, so a run's log opens with the exact envelope it was dispatched with. `provider` and `aws_region` are also forwarded into the entrypoint env as `PROVIDER`/`AWS_REGION`: the runner reads the provider from env, not from the envelope, so a template that drops them silently downgrades Bedrock repos to the anthropic provider.
+The first step of the container job prints every input (`[dispatch-inputs] …`), with the three tokens reduced to `<redacted>`/`(empty)` and `run_config` shown as the credential-free diagnostic projection (see "Workflow bootstrap and capability"). `provider` and `aws_region` are also forwarded into the entrypoint env as `PROVIDER`/`AWS_REGION`: the runner reads the provider from env, not from the envelope, so a template that drops them silently downgrades Bedrock repos to the anthropic provider.
 
 ---
 
@@ -234,7 +234,17 @@ Below the TS runner layer, `session/entrypoint.sh` picks the phase (and, for kg-
 | `encodeTrustedRunConfig` / `decodeTrustedRunConfig` | Carried |
 | `diagnosticProjection` | Field names only |
 
-An absent namespace decodes as the legacy envelope. No writer sets it and no workflow template reads it in this slice; the exact input allowlists, rollout order and rollback are in [ADR 032](adr/032-private-run-envelope-and-credential-bootstrap.md). Statements above that the envelope is "secret-free" describe the generic envelope. `repoProcessEnv`, `modelProcessEnv` and `gitProcessEnv` strip `AI_IMPLEMENT_RUN_CONFIG` and `AI_IMPLEMENT_MODEL_AUTH_*` bootstrap handles.
+### Workflow bootstrap and capability (AII-982)
+
+The first container-job step of `claude-implement.yml` and `claude-plan.yml` (identical in `workflows/` and `.github/workflows/`) reads `GITHUB_EVENT_PATH` and registers `::add-mask::` for the legacy token inputs, then for the **entire encoded `run_config`**, then for each extracted secret, one per line with `%`, CR and LF escaped: every `credentials.*` token, the plain grant's `bearer`, and a sealed grant's `nonce`, `ciphertext` and `tag` (8+ characters). Masks are emitted only after the namespace and any `agentConfig` validated; recursive masking is never a substitute for validation. The bootstrap re-implements `validateRunCredentials` (including the plain and sealed `modelAuthGrant` variants of `src/model-auth-contract.ts`, discriminated by an `algorithm` key) and `validateResolvedAgentSnapshot` in jq, and `workflow-token-masking.test.ts` checks it against the TypeScript validators on valid and malformed fixtures. Base64 is not protection; masking is a log layer verified against real logs in AII-984. Present-but-invalid private data (a `null` namespace, token or grant counts as present; also bad base64/JSON, wrong types, unknown keys, version, whitespace in a token, an invalid grant or snapshot) exits non-zero with a fixed message — jq stderr is discarded because it can echo input — before any consumer runs. This step only masks: it exports nothing, and trusted decoding stays in later slices.
+
+"Print dispatch inputs" no longer dumps the decoded envelope. It prints the diagnostic projection: known envelope keys only, `credentials` replaced by `credentialFields` (names only), and `agentConfig` replaced by the fixed marker `"<omitted>"` — the nested snapshot is validated by the bootstrap but never copied raw into logs.
+
+A workflow advertises private-envelope support with the static comment `# ai-implement-capability: private-run-config-v1` — not a `workflow_dispatch` input. `resolveWorkflowCapabilities` sets `supportsPrivateRunConfig` only for an envelope workflow carrying it; missing or unprobed means `false`. It is unrelated to the `stage-agent-config-v1` capability, which a later slice installs.
+
+`buildEnvelopeDispatchInputs` accepts an optional `credentials` and then encodes with `encodeTrustedRunConfig`; legacy `run_token`/`run_progress_token`/`run_publication_token` inputs and the planning/kg-refresh publication exclusion are unchanged. The two-request optional-input retry never strips `run_config` or the tokens. No production writer passes `credentials` until AII-983.
+
+An absent namespace decodes as the legacy envelope. No writer sets it in this slice; the exact input allowlists, rollout order and rollback are in [ADR 032](adr/032-private-run-envelope-and-credential-bootstrap.md). Statements above that the envelope is "secret-free" describe the generic envelope. `repoProcessEnv`, `modelProcessEnv` and `gitProcessEnv` strip `AI_IMPLEMENT_RUN_CONFIG` and `AI_IMPLEMENT_MODEL_AUTH_*` bootstrap handles.
 
 ---
 

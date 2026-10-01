@@ -1,6 +1,6 @@
 import type { RepoMapping } from "./config.js";
 import { GitHubApiError } from "./github-errors.js";
-import { type RunConfigV1, encodeRunConfig } from "./run-config.js";
+import { type RunConfigV1, type RunCredentialsV1, encodeRunConfig, encodeTrustedRunConfig } from "./run-config.js";
 import { DEFAULT_RETRY_POLICY, type RetryPolicy } from "./pipeline/retry-backoff.js";
 import { isChecksPermissionError } from "./checks-permission.js";
 
@@ -405,6 +405,9 @@ export interface EnvelopeDispatchOpts {
   runProgressToken?: string;
   /** Include only when the target workflow advertises publication-token support. */
   runPublicationToken?: string;
+  /** Private credential namespace (AII-982). When present the envelope is encoded with the trusted
+   *  encoder; the legacy token inputs are still sent. No production writer sets it before AII-983. */
+  credentials?: RunCredentialsV1;
   runnerImage?: string | null;
   prNumber?: string;
   /** Operator instruction forwarded from an /ai-implement PR comment. Rides inside run_config. */
@@ -462,13 +465,14 @@ export function buildEnvelopeDispatchInputs(
     ...(issue.assigneeName ? { assigneeName: issue.assigneeName } : {}),
     ...(opts.planningContext ? { planningContext: opts.planningContext } : {}),
     ...(opts.groupingParent ? { groupingParent: true } : {}),
+    ...(opts.credentials !== undefined ? { credentials: opts.credentials } : {}),
     ...(opts.runnerPhase !== "planning" && opts.runnerPhase !== "kg-refresh"
       ? { retryPolicy: opts.retryPolicy ?? DEFAULT_RETRY_POLICY }
       : {}),
   };
 
   return {
-    run_config: encodeRunConfig(runConfig),
+    run_config: opts.credentials !== undefined ? encodeTrustedRunConfig(runConfig) : encodeRunConfig(runConfig),
     // Display-only duplicate: run-name: is evaluated before any step runs, so it cannot
     // decode run_config. The shared 422 retry (ENVELOPE_OPTIONAL_INPUTS) strips this on a
     // template that predates the declaration.
