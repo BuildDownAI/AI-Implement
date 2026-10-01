@@ -2,6 +2,10 @@ import { describe, expect, it, vi } from "vitest";
 import {
   encodeRunConfig,
   decodeRunConfig,
+  decodeTrustedRunConfig,
+  encodeTrustedRunConfig,
+  diagnosticProjection,
+  validateRunCredentials,
   runConfigFromTaskDocument,
   buildImplRunConfig,
   type RunConfigV1,
@@ -648,5 +652,89 @@ describe("agentConfig resolved snapshot", () => {
     const bad = build();
     bad.stages.review.invocationTimeoutMs = 0;
     expect(() => buildImplRunConfig({ ...input, agentConfig: bad })).toThrow(/agentConfig/);
+  });
+});
+
+describe("private credentials namespace (AII-981)", () => {
+  const base: RunConfigV1 = { v: 1, issue: { id: "i", identifier: "AII-1", title: "T", description: "D" } };
+  const S = (n: string) => `SENTINEL-${n}-` + "x".repeat(24);
+  const grant = {
+    version: 1, audience: "model-auth", grantId: "g1", dispatchId: "d1", snapshotId: "s1",
+    projectKey: "p", backend: "fly", expiresAt: 1_800_000_000_000, bearer: S("bearer") + "B".repeat(32),
+    bindings: [{ stage: "planning", profileId: "pp", profileRevision: 1, authMode: "openai-api-key" }],
+  };
+  const sealed = {
+    version: 1, algorithm: "aes-256-gcm", dispatchId: "d1", backend: "fly",
+    nonce: "A".repeat(16), ciphertext: "Zm9vYmFy", tag: "B".repeat(22),
+  };
+  const creds = (extra: Record<string, unknown> = {}) => ({ version: 1, ...extra }) as never;
+  const b64 = (o: unknown) => Buffer.from(JSON.stringify(o)).toString("base64");
+
+  it("legacy envelopes without credentials decode unchanged", () => {
+    const decoded = decodeRunConfig(encodeRunConfig(base));
+    expect(decoded).toEqual(base);
+    expect(decodeTrustedRunConfig(encodeRunConfig(base))).toEqual(base);
+    expect(decoded).not.toHaveProperty("credentials");
+  });
+
+  it.each([
+    ["resultToken"], ["progressToken"], ["publicationToken"], ["attemptToken"],
+  ])("round-trips %s through trusted transport only", (field) => {
+    const config = { ...base, credentials: creds({ [field]: S(field) }) };
+    const trusted = decodeTrustedRunConfig(encodeTrustedRunConfig(config));
+    expect(trusted.credentials).toEqual({ version: 1, [field]: S(field) });
+    expect(decodeRunConfig(encodeTrustedRunConfig(config))).not.toHaveProperty("credentials");
+    expect(Buffer.from(encodeRunConfig(config), "base64").toString()).not.toContain(S(field));
+  });
+
+  it("accepts plain and sealed modelAuthGrant", () => {
+    for (const g of [grant, sealed]) {
+      const out = decodeTrustedRunConfig(encodeTrustedRunConfig({ ...base, credentials: creds({ modelAuthGrant: g }) }));
+      expect(out.credentials?.modelAuthGrant).toEqual(g);
+    }
+  });
+
+  it("rejects malformed credentials with value-free, key-free errors", () => {
+    const unknownKey = "ATTACKER_KEY_" + S("k");
+    const cases: unknown[] = [
+      { version: 2, resultToken: S("a") },
+      { version: 1, resultToken: 42 },
+      { version: 1, resultToken: "" },
+      { version: 1, progressToken: S("a") + " space" },
+      { version: 1, publicationToken: "y".repeat(5000) },
+      { version: 1, resultToken: S("a"), [unknownKey]: S("u") },
+      { version: 1, modelAuthGrant: { ...grant, extra: S("g") } },
+      { version: 1, modelAuthGrant: { ...sealed, bearer: S("s") } },
+      { version: 1, modelAuthGrant: "string" },
+      "nope",
+      [],
+    ];
+    for (const c of cases) {
+      let message = "";
+      try { validateRunCredentials(c); } catch (e) { message = (e as Error).message; }
+      expect(message).not.toBe("");
+      expect(message.length).toBeLessThan(120);
+      expect(message).not.toContain("SENTINEL");
+      expect(message).not.toContain("ATTACKER");
+    }
+    expect(() => decodeRunConfig(b64({ ...base, credentials: { version: 1, [unknownKey]: 1 } }))).toThrow(/credentials/);
+  });
+
+  it("keeps modelAuthGrant out of agentConfig", () => {
+    expect(() => decodeRunConfig(b64({ ...base, agentConfig: { version: 1, modelAuthGrant: grant } }))).toThrow(/agentConfig/);
+  });
+
+  it("diagnostic projection and generic encode never contain credentials or encoded envelopes", () => {
+    const private_ = encodeTrustedRunConfig({
+      ...base, credentials: creds({ resultToken: S("r"), modelAuthGrant: grant }),
+    });
+    const spread = { ...base, credentials: creds({ resultToken: S("r"), modelAuthGrant: grant }),
+      encodedPrivate: private_, AI_IMPLEMENT_RUN_CONFIG: private_ } as RunConfigV1;
+    const text = JSON.stringify(diagnosticProjection(spread));
+    expect(text).not.toContain("SENTINEL");
+    expect(text).not.toContain(private_);
+    expect(text).not.toContain("encodedPrivate");
+    expect(JSON.parse(text).credentialFields).toEqual(["resultToken", "modelAuthGrant"]);
+    expect(Buffer.from(encodeRunConfig(spread), "base64").toString()).not.toContain("SENTINEL");
   });
 });

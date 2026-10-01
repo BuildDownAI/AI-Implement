@@ -223,6 +223,21 @@ Below the TS runner layer, `session/entrypoint.sh` picks the phase (and, for kg-
 
 ---
 
+## Private credentials namespace (`credentials`, AII-981)
+
+`RunConfigV1.credentials` is an optional, versioned `{ version: 1, resultToken?, progressToken?, publicationToken?, attemptToken?, modelAuthGrant? }` for trusted transport. `modelAuthGrant` is the plain grant or sealed Fly form from `src/model-auth-contract.ts` and is never part of `agentConfig`. `validateRunCredentials` rejects unknown fields, bad types, oversized tokens and invalid grants with path-only errors that never echo values or key names.
+
+| Function | Credentials |
+|---|---|
+| `encodeRunConfig` | Dropped |
+| `decodeRunConfig` | Validated (fail closed), not returned |
+| `encodeTrustedRunConfig` / `decodeTrustedRunConfig` | Carried |
+| `diagnosticProjection` | Field names only |
+
+An absent namespace decodes as the legacy envelope. No writer sets it and no workflow template reads it in this slice; the exact input allowlists, rollout order and rollback are in [ADR 032](adr/032-private-run-envelope-and-credential-bootstrap.md). Statements above that the envelope is "secret-free" describe the generic envelope. `repoProcessEnv`, `modelProcessEnv` and `gitProcessEnv` strip `AI_IMPLEMENT_RUN_CONFIG` and `AI_IMPLEMENT_MODEL_AUTH_*` bootstrap handles.
+
+---
+
 ## Probe Semantics and TTL
 
 Before every dispatch the orchestrator calls `resolveWorkflowCapabilities` (`src/workflow-probe.ts`; `resolveWorkflowContract` remains the backward-compatible contract-only wrapper). The probe:

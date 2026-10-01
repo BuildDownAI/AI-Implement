@@ -12,6 +12,12 @@ import {
   type StageSelection,
   type StageSelectionField,
 } from "./agent-config.js";
+import {
+  parseModelAuthGrantBootstrap,
+  parseSealedModelAuthBootstrap,
+  type ModelAuthGrantBootstrapV1,
+  type SealedModelAuthBootstrapV1,
+} from "./model-auth-contract.js";
 
 export const RESOLVED_AGENT_SNAPSHOT_VERSION = 1;
 
@@ -39,9 +45,12 @@ export interface ResolvedAgentSnapshotV1 {
 /**
  * Versioned orchestrator→runner config envelope. Travels as ONE
  * workflow_dispatch input (`run_config`) on GHA and as the
- * AI_IMPLEMENT_RUN_CONFIG env var on Fly/local. Never carries secrets:
- * run_token / run_progress_token stay separate inputs so the workflow
- * can ::add-mask:: them.
+ * AI_IMPLEMENT_RUN_CONFIG env var on Fly/local. The generic envelope never carries
+ * secrets: run_token / run_progress_token stay separate inputs so the workflow can
+ * ::add-mask:: them. The optional `credentials` namespace (AII-981) is the only
+ * credential-bearing field; it is reachable solely through the trusted transport
+ * helpers (`encodeTrustedRunConfig` / `decodeTrustedRunConfig`), never through
+ * `encodeRunConfig`, `decodeRunConfig`, `pickKnownKeys` or `diagnosticProjection`.
  */
 export interface RunConfigV1 {
   v: 1;
@@ -94,6 +103,29 @@ export interface RunConfigV1 {
    *  silently (see docs/workflow-envelope.md mixed-version matrix), so no writer may set it
    *  until a readiness gate rejects configured work on runners lacking support. */
   agentConfig?: ResolvedAgentSnapshotV1;
+  /** Private credential namespace (AII-981), validated independently of `agentConfig`. Only the
+   *  trusted transport helpers read or write it; absent = legacy envelope. No writer sets it yet. */
+  credentials?: RunCredentialsV1;
+}
+
+export const RUN_CREDENTIALS_VERSION = 1;
+const MAX_CREDENTIAL_TOKEN_CHARS = 4096;
+const CREDENTIAL_TOKEN_FIELDS = ["resultToken", "progressToken", "publicationToken", "attemptToken"] as const;
+const CREDENTIAL_FIELDS = ["version", ...CREDENTIAL_TOKEN_FIELDS, "modelAuthGrant"] as const;
+
+/**
+ * Versioned typed credentials for trusted transport. Token fields mirror the synthetic audiences
+ * run_token (result), run_progress_token, run_publication_token and run_attempt_token.
+ * `modelAuthGrant` reuses the model-auth contract (plain grant or sealed Fly form); it is
+ * never part of `agentConfig`.
+ */
+export interface RunCredentialsV1 {
+  version: 1;
+  resultToken?: string;
+  progressToken?: string;
+  publicationToken?: string;
+  attemptToken?: string;
+  modelAuthGrant?: ModelAuthGrantBootstrapV1 | SealedModelAuthBootstrapV1;
 }
 
 const MAX_DESCRIPTION_CHARS = 40_000;
@@ -227,16 +259,99 @@ export function validateResolvedAgentSnapshot(value: unknown): ResolvedAgentSnap
   return { version: 1, snapshotId, configRevisions, stages, sources, profiles };
 }
 
-export function encodeRunConfig(config: RunConfigV1): string {
-  if (config.agentConfig !== undefined) validateResolvedAgentSnapshot(config.agentConfig);
+function credentialsFail(path: string, problem: string): never {
+  throw new Error(`run_config.credentials${path} ${problem}`);
+}
+
+/**
+ * Pure validation of the credentials namespace. Rebuilds a copy from known fields only; errors are
+ * path-only and bounded, and never echo values or key names (both may be attacker-chosen). Grant
+ * parser errors are replaced by a fixed message for the same reason.
+ */
+export function validateRunCredentials(value: unknown): RunCredentialsV1 {
+  if (!isRec(value)) credentialsFail("", "must be an object");
+  if (Object.keys(value).some((k) => !(CREDENTIAL_FIELDS as readonly string[]).includes(k))) {
+    credentialsFail("", "contains unknown field(s)");
+  }
+  if (value.version !== RUN_CREDENTIALS_VERSION) credentialsFail(".version", "is unsupported");
+  const out: RunCredentialsV1 = { version: 1 };
+  for (const field of CREDENTIAL_TOKEN_FIELDS) {
+    const token = value[field];
+    if (token === undefined) continue;
+    if (typeof token !== "string" || token.length === 0 || token.length > MAX_CREDENTIAL_TOKEN_CHARS
+        || /\s/.test(token)) {
+      credentialsFail(`.${field}`, "must be a non-empty bounded token");
+    }
+    out[field] = token;
+  }
+  if (value.modelAuthGrant !== undefined) {
+    const grant = value.modelAuthGrant;
+    const parsed = isRec(grant) && "algorithm" in grant
+      ? parseSealedModelAuthBootstrap(grant)
+      : parseModelAuthGrantBootstrap(grant);
+    if (!parsed.ok) credentialsFail(".modelAuthGrant", "is invalid");
+    out.modelAuthGrant = parsed.value;
+  }
+  return out;
+}
+
+function boundedDescription(config: RunConfigV1): RunConfigV1["issue"] {
   const description = config.issue.description.length > MAX_DESCRIPTION_CHARS
     ? config.issue.description.slice(0, MAX_DESCRIPTION_CHARS) + TRUNCATION_MARKER
     : config.issue.description;
-  const payload = { ...config, issue: { ...config.issue, description } };
+  return { ...config.issue, description };
+}
+
+/**
+ * Generic encoder (logging, persistence, diagnostics-adjacent paths). Never emits credentials:
+ * the namespace is dropped, not rejected, so a config object that happens to carry one cannot
+ * leak it through this function. Use `encodeTrustedRunConfig` for private transport.
+ */
+export function encodeRunConfig(config: RunConfigV1): string {
+  if (config.agentConfig !== undefined) validateResolvedAgentSnapshot(config.agentConfig);
+  const { credentials: _credentials, ...rest } = config;
+  void _credentials;
+  const payload = { ...rest, issue: boundedDescription(config) };
   return Buffer.from(JSON.stringify(payload), "utf-8").toString("base64");
 }
 
+/** Trusted-transport encoder: generic payload plus the validated credentials namespace when present. */
+export function encodeTrustedRunConfig(config: RunConfigV1): string {
+  const generic = JSON.parse(Buffer.from(encodeRunConfig(config), "base64").toString("utf-8")) as Rec;
+  if (config.credentials !== undefined) generic.credentials = validateRunCredentials(config.credentials);
+  return Buffer.from(JSON.stringify(generic), "utf-8").toString("base64");
+}
+
+/**
+ * Credential-free projection safe to log or persist. Built from the known-key allowlist, so
+ * unknown keys (including any encoded private envelope held on a spread config) are dropped;
+ * credential presence is reported by field name only.
+ */
+export function diagnosticProjection(config: RunConfigV1): RunConfigV1 & { credentialFields?: string[] } {
+  const projected: RunConfigV1 & { credentialFields?: string[] } = pickKnownKeys(config);
+  const creds: unknown = config.credentials;
+  if (isRec(creds)) {
+    const present = CREDENTIAL_TOKEN_FIELDS.filter((f) => creds[f] !== undefined) as string[];
+    if (creds.modelAuthGrant !== undefined) present.push("modelAuthGrant");
+    projected.credentialFields = present;
+  }
+  return projected;
+}
+
+/**
+ * Generic decoder. A present `credentials` namespace is validated (fail closed) but never
+ * returned; `decodeTrustedRunConfig` is the only reader.
+ */
 export function decodeRunConfig(encoded: string): RunConfigV1 {
+  return decodeEnvelope(encoded, false);
+}
+
+/** Trusted-transport decoder: also returns the validated credentials namespace when present. */
+export function decodeTrustedRunConfig(encoded: string): RunConfigV1 {
+  return decodeEnvelope(encoded, true);
+}
+
+function decodeEnvelope(encoded: string, trusted: boolean): RunConfigV1 {
   let parsed: unknown;
   try {
     parsed = JSON.parse(Buffer.from(encoded, "base64").toString("utf-8"));
@@ -261,7 +376,11 @@ export function decodeRunConfig(encoded: string): RunConfigV1 {
   }
   // agentConfig fails closed like reviewFix: a malformed snapshot must never degrade to legacy.
   if (cfg.agentConfig !== undefined) cfg.agentConfig = validateResolvedAgentSnapshot(cfg.agentConfig);
-  return pickKnownKeys(cfg as RunConfigV1);
+  // Independent of agentConfig; validated whenever present so malformed credentials never pass silently.
+  const credentials = cfg.credentials === undefined ? undefined : validateRunCredentials(cfg.credentials);
+  const known = pickKnownKeys(cfg as RunConfigV1);
+  if (trusted && credentials !== undefined) known.credentials = credentials;
+  return known;
 }
 
 /** Parameters accepted by a portable task document (subset of RunConfigV1). */

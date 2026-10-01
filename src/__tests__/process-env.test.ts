@@ -260,3 +260,56 @@ describe("gitProcessEnv dependency credentials", () => {
     });
   });
 });
+
+describe("private envelope and model-auth bootstrap stripping (AII-981)", () => {
+  const SENTINELS: Record<string, string> = {
+    AI_IMPLEMENT_RUN_CONFIG: "SENTINEL-encoded-envelope",
+    AI_IMPLEMENT_MODEL_AUTH_GRANT: "SENTINEL-grant",
+    AI_IMPLEMENT_MODEL_AUTH_BEARER: "SENTINEL-bearer",
+    AI_IMPLEMENT_MODEL_AUTH_PROTECTION_KEY: "SENTINEL-protection",
+    ANTHROPIC_API_KEY: "SENTINEL-claude-api",
+    CLAUDE_CODE_OAUTH_TOKEN: "SENTINEL-claude-sub",
+    CLAUDE_CONFIG_DIR: "/sentinel/claude",
+    OPENAI_API_KEY: "SENTINEL-openai",
+    CODEX_API_KEY: "SENTINEL-codex",
+    CODEX_HOME: "/sentinel/codex-home",
+    CLAUDE_CODE_USE_BEDROCK: "1",
+    AWS_ACCESS_KEY_ID: "SENTINEL-aws-id",
+    AWS_SECRET_ACCESS_KEY: "SENTINEL-aws-secret",
+    AWS_SESSION_TOKEN: "SENTINEL-aws-session",
+  };
+  beforeEach(() => {
+    for (const [k, v] of Object.entries(SENTINELS)) saveAndSet(k, v);
+    saveAndSet("AI_IMPLEMENT_FORWARDED_SECRETS", "REPO_HOOK_SECRET");
+    saveAndSet("REPO_HOOK_SECRET", "approved-forwarded");
+  });
+  afterEach(() => restoreAll());
+
+  it("repoProcessEnv removes envelope, bootstrap and every model-mode credential, keeping forwarded secrets", () => {
+    const env = repoProcessEnv();
+    for (const k of Object.keys(SENTINELS)) expect(env).not.toHaveProperty(k);
+    expect(JSON.stringify(env)).not.toContain("SENTINEL");
+    expect(env.REPO_HOOK_SECRET).toBe("approved-forwarded");
+  });
+
+  it("repoProcessEnv keeps a forwarded secret that shares a model key name", () => {
+    process.env.AI_IMPLEMENT_FORWARDED_SECRETS = "AWS_ACCESS_KEY_ID";
+    expect(repoProcessEnv().AWS_ACCESS_KEY_ID).toBe("SENTINEL-aws-id");
+  });
+
+  it("modelProcessEnv removes the envelope, bootstrap keys and forwarded secrets", () => {
+    for (const allow of [false, true]) {
+      const env = modelProcessEnv(allow);
+      for (const k of ["AI_IMPLEMENT_RUN_CONFIG", "AI_IMPLEMENT_MODEL_AUTH_GRANT",
+        "AI_IMPLEMENT_MODEL_AUTH_BEARER", "AI_IMPLEMENT_MODEL_AUTH_PROTECTION_KEY", "REPO_HOOK_SECRET"]) {
+        expect(env).not.toHaveProperty(k);
+      }
+    }
+  });
+
+  it("gitProcessEnv also drops bootstrap keys", () => {
+    const env = gitProcessEnv();
+    expect(env).not.toHaveProperty("AI_IMPLEMENT_MODEL_AUTH_GRANT");
+    expect(env).not.toHaveProperty("AI_IMPLEMENT_RUN_CONFIG");
+  });
+});

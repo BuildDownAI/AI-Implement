@@ -19,6 +19,36 @@ export const RUNNER_CREDENTIAL_KEYS = [
 // Docker env) still never reaches the model.
 export const INSTALL_CREDENTIAL_KEYS = ["NPM_TOKEN"] as const;
 
+/**
+ * Private-envelope and model-auth bootstrap material (AII-981). The encoded run config may
+ * carry a `credentials` namespace, so it is credential-bearing; the model-auth names are the
+ * protected bootstrap handles (grant, sealed blob, protection key, bearer). Neither may reach
+ * a model or repository child. The selected model credential is delivered separately by
+ * ModelAuthClient's invocation environment, which this module does not touch.
+ */
+export const PROTECTED_BOOTSTRAP_KEYS = ["AI_IMPLEMENT_RUN_CONFIG"] as const;
+export const PROTECTED_BOOTSTRAP_PREFIXES = ["AI_IMPLEMENT_MODEL_AUTH_"] as const;
+
+/** Model credential and session-handle names beyond MODEL_CREDENTIAL_KEYS that repository code must not inherit. */
+export const MODEL_SESSION_KEYS = [
+  "ANTHROPIC_AUTH_TOKEN",
+  "CLAUDE_CONFIG_DIR",
+  "CLAUDE_CODE_USE_BEDROCK",
+  "OPENAI_API_KEY",
+  "CODEX_API_KEY",
+  "CODEX_HOME",
+  "AWS_ACCESS_KEY_ID",
+  "AWS_SECRET_ACCESS_KEY",
+  "AWS_SESSION_TOKEN",
+] as const;
+
+function deleteBootstrapKeys(env: NodeJS.ProcessEnv): void {
+  for (const key of PROTECTED_BOOTSTRAP_KEYS) delete env[key];
+  for (const key of Object.keys(env)) {
+    if (PROTECTED_BOOTSTRAP_PREFIXES.some((p) => key.startsWith(p))) delete env[key];
+  }
+}
+
 export const GITHUB_WRITE_CREDENTIAL_KEYS = [
   "GITHUB_TOKEN",
   "GH_TOKEN",
@@ -56,7 +86,8 @@ const DEPENDENCY_HELPER_KEYS = [
 
 /**
  * Environment for runner-owned repository processes (install, setup, verify, teardown).
- * Strips model credentials so repository code cannot read the model authorization.
+ * Strips model credentials, session handles, the encoded run config and model-auth
+ * bootstrap material so repository code cannot read the model authorization.
  * Forwarded secrets (AI_IMPLEMENT_FORWARDED_SECRETS) are kept so hooks can use them.
  *
  * Note: a hook that exports ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN into
@@ -67,7 +98,11 @@ const DEPENDENCY_HELPER_KEYS = [
  */
 export function repoProcessEnv(): NodeJS.ProcessEnv {
   const env = { ...process.env };
+  const forwarded = new Set(parseForwardedSecrets());
   for (const key of MODEL_CREDENTIAL_KEYS) delete env[key];
+  // An explicitly approved forwarded secret keeps its name even if it collides with a model key.
+  for (const key of MODEL_SESSION_KEYS) if (!forwarded.has(key)) delete env[key];
+  deleteBootstrapKeys(env);
   return env;
 }
 
@@ -92,6 +127,7 @@ export function modelProcessEnv(allowRepositoryWrites: boolean): NodeJS.ProcessE
   }
   for (const key of INSTALL_CREDENTIAL_KEYS) delete env[key];
   for (const key of parseForwardedSecrets()) delete env[key];
+  deleteBootstrapKeys(env);
   // The list variable itself must not reach the model — it names what was hidden
   delete env.AI_IMPLEMENT_FORWARDED_SECRETS;
   return env;
@@ -115,7 +151,7 @@ export function gitProcessEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv 
   for (const key of GITHUB_WRITE_CREDENTIAL_KEYS) delete env[key];
   for (const key of parseForwardedSecrets()) delete env[key];
   delete env.AI_IMPLEMENT_FORWARDED_SECRETS;
-  delete env.AI_IMPLEMENT_RUN_CONFIG;
+  deleteBootstrapKeys(env);
   for (const key of DEPENDENCY_CREDENTIAL_KEYS) delete env[key];
   return { ...env, ...extra };
 }
