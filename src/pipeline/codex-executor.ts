@@ -28,12 +28,49 @@ const CONFIG_REJECTION_RE =
  */
 export class CodexRecoveryRequiredError extends Error {
   readonly code = "CODEX_RECOVERY_REQUIRED";
-  readonly reason: "child_not_terminated" | "checkpoint_uncertain" | "held";
-  constructor(reason: "child_not_terminated" | "checkpoint_uncertain" | "held") {
+  readonly reason: "child_not_terminated" | "checkpoint_uncertain" | "auth_sync_failed" | "held";
+  /** For `auth_sync_failed`: the preserved trusted view that still holds the refreshed session. */
+  readonly viewRoot?: string;
+  constructor(reason: CodexRecoveryRequiredError["reason"], viewRoot?: string) {
     super(`Codex invocation requires recovery: ${reason}`);
     this.name = "CodexRecoveryRequiredError";
     this.reason = reason;
+    if (viewRoot) this.viewRoot = viewRoot;
   }
+}
+
+/** Fixed-message rejection of a refreshed session; never carries file content. */
+class AuthSyncRejected extends Error {}
+
+function parseAuth(text: string): Record<string, unknown> | null {
+  try {
+    const parsed: unknown = JSON.parse(text);
+    return isObject(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Account-identifying fields of an auth.json: API key, token account id and id_token subject. */
+function authIdentity(auth: Record<string, unknown>): string {
+  const tokens = isObject(auth.tokens) ? auth.tokens : {};
+  let subject: string | null = null;
+  if (typeof tokens.id_token === "string") {
+    const payload = tokens.id_token.split(".")[1];
+    if (payload) {
+      try {
+        const claims: unknown = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+        if (isObject(claims) && typeof claims.sub === "string") subject = claims.sub;
+      } catch {
+        // an undecodable id_token carries no identity to compare
+      }
+    }
+  }
+  return JSON.stringify([
+    typeof auth.OPENAI_API_KEY === "string" ? auth.OPENAI_API_KEY : null,
+    typeof tokens.account_id === "string" ? tokens.account_id : null,
+    subject,
+  ]);
 }
 
 export interface CodexExecutorOptions {
@@ -333,26 +370,28 @@ export class CodexExecutor implements LLMExecutor {
 
   /** One spawn inside one `ModelAuthClient.invoke`, so authentication is checkpointed even on failure. */
   private async invokeOnce(params: InvokeParams): Promise<Attempt> {
-    let signalUnterminated: (err: CodexRecoveryRequiredError) => void = () => {};
-    const unterminated = new Promise<never>((_, reject) => (signalUnterminated = reject));
+    let signalRecovery: (err: CodexRecoveryRequiredError) => void = () => {};
+    const recovery = new Promise<never>((_, reject) => (signalRecovery = reject));
     try {
-      // If the child cannot be proven dead the callback must never settle: a rejection would make the
-      // client read and persist session state a live child may still be writing, and mark the profile
-      // ready. The pending invoke keeps the profile "invoking" (no second invocation, no dispose), while
-      // the race below surfaces the recovery-required error to the caller.
+      // If the child cannot be proven dead, or its refreshed session could not be safely persisted, the
+      // callback must never settle: the client checkpoints on both return and throw, so settling would
+      // persist stale or foreign session state and mark the profile ready. The pending invoke keeps the
+      // profile "invoking" (no second invocation, no dispose), while the race below surfaces the
+      // recovery-required error to the caller.
       const invocation = this.options.auth.invoke(this.options.profileId, async (selected) => {
         try {
           return await this.runChild(params, selected.env);
         } catch (err) {
-          if (err instanceof CodexRecoveryRequiredError && err.reason === "child_not_terminated") {
-            signalUnterminated(err);
+          const held = this.held;
+          if (held && (held.reason === "child_not_terminated" || held.reason === "auth_sync_failed")) {
+            signalRecovery(held);
             return new Promise<Attempt>(() => {});
           }
           throw err;
         }
       });
       invocation.catch(() => {});
-      return await Promise.race([invocation, unterminated]);
+      return await Promise.race([invocation, recovery]);
     } catch (err) {
       const category = (err as { category?: unknown } | null)?.category;
       if (category === "checkpoint_uncertain" || category === "checkpoint_rejected") {
@@ -424,6 +463,21 @@ export class CodexExecutor implements LLMExecutor {
     const home = join(root, "home");
     const cwd = join(root, "cwd");
     const userHome = join(root, "user-home");
+    try {
+      return this.populateAppServerView({ root, home, cwd, userHome }, selectedHome, model, baseUrl);
+    } catch (err) {
+      // No child exists yet, so removing a half-built view cannot race a live process.
+      rmSync(root, { recursive: true, force: true });
+      throw err;
+    }
+  }
+
+  private populateAppServerView(
+    { root, home, cwd, userHome }: Pick<AppServerView, "root" | "home" | "cwd" | "userHome">,
+    selectedHome: string | undefined,
+    model: string,
+    baseUrl?: string,
+  ): AppServerView {
     mkdirSync(home, { mode: 0o700 });
     mkdirSync(userHome, { mode: 0o700 });
     mkdirSync(cwd, { mode: 0o700 });
@@ -458,23 +512,33 @@ export class CodexExecutor implements LLMExecutor {
   /**
    * Called only after the group is proven terminated. Persists a refreshed auth.json into the selected
    * profile's home, never overwriting a file that changed underneath us and never for another account.
+   * Fail-closed: a missing, malformed, foreign-account or uncommittable refresh holds the executor and
+   * throws, leaving the view (the only copy of the refreshed session) in place for recovery. The caller
+   * must then keep the auth callback pending, because the client would checkpoint a stale session.
    */
   private syncAuthBack(view: AppServerView): void {
     if (!view.authSource || view.initialAuth === null) return;
-    const viewAuth = join(view.home, "auth.json");
+    const tmp = `${view.authSource}.sync-${process.pid}`;
     try {
-      if (!existsSync(viewAuth)) return;
-      const refreshed = readFileSync(viewAuth, "utf8");
+      const refreshed = readFileSync(join(view.home, "auth.json"), "utf8");
       if (refreshed === view.initialAuth) return;
-      JSON.parse(refreshed);
-      if (readFileSync(view.authSource, "utf8") !== view.initialAuth) return;
-      const tmp = `${view.authSource}.sync-${process.pid}`;
+      const next = parseAuth(refreshed);
+      const prev = parseAuth(view.initialAuth);
+      if (!next || !prev || authIdentity(next) !== authIdentity(prev)) throw new AuthSyncRejected("invalid_or_foreign_auth");
+      if (readFileSync(view.authSource, "utf8") !== view.initialAuth) throw new AuthSyncRejected("source_changed");
       writeFileSync(tmp, refreshed, { mode: 0o600 });
       renameSync(tmp, view.authSource);
     } catch (err) {
-      // The client checkpoint treats a missing refresh as the pre-invoke session, so this is not fatal,
-      // but a lost refresh must be visible. Log the error class only: messages may carry paths or content.
-      console.warn(`[codex] auth sync-back failed (${err instanceof Error ? err.name : "error"}); refreshed session state not persisted`);
+      try {
+        rmSync(tmp, { force: true });
+      } catch {
+        // best-effort: the temp file holds the same content as the preserved view
+      }
+      this.held = new CodexRecoveryRequiredError("auth_sync_failed", view.root);
+      // Class or errno code only: messages may carry paths or credential content.
+      const why = err instanceof AuthSyncRejected ? err.message : ((err as NodeJS.ErrnoException)?.code ?? "io_error");
+      console.warn(`[codex] auth sync-back failed (${why}); refreshed session preserved at ${view.root}; executor held for recovery`);
+      throw this.held;
     }
   }
 
@@ -511,7 +575,7 @@ export class CodexExecutor implements LLMExecutor {
       if (schemaDir) rmSync(schemaDir, { recursive: true, force: true });
       // The view stays in place while a child may live: its auth must not be synced or removed.
       if (view && !this.held) rmSync(view.root, { recursive: true, force: true });
-      if (this.held) {
+      if (this.held?.reason === "child_not_terminated") {
         // A child that may still be alive must never regain the publication credential.
         console.log("[codex] origin left protected: child not confirmed terminated");
       } else {

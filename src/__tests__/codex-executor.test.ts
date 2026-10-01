@@ -758,6 +758,32 @@ describe("app-server trusted view (AII-1002)", () => {
     stopReason: null,
   });
 
+  /** Mirrors ModelAuthClient: checkpoints (reads the selected source) after the callback returns OR throws, then settles. */
+  function checkpointingAuth() {
+    const checkpoints: string[] = [];
+    let started = 0;
+    let settled = 0;
+    const client: Pick<ModelAuthClient, "invoke"> = {
+      async invoke<T>(_id: string, cb: (i: ModelInvocation) => Promise<T>): Promise<T> {
+        started++;
+        let out: T | undefined;
+        let failure: unknown;
+        let failed = false;
+        try {
+          out = await cb({ env: { PATH: "/usr/bin", CODEX_HOME: selected }, strippedKeys: [] });
+        } catch (e) {
+          failed = true;
+          failure = e;
+        }
+        checkpoints.push(readFileSync(join(selected, "auth.json"), "utf8"));
+        settled++;
+        if (failed) throw failure;
+        return out as T;
+      },
+    };
+    return { client, checkpoints, invocations: () => ({ started, settled }) };
+  }
+
   function run(scripts: Script[], log: Spawned[], driverRun: CodexProtocolDriver["run"], extra: Partial<CodexExecutorOptions> = {}) {
     const events: string[] = [];
     const auth: Pick<ModelAuthClient, "invoke"> = {
@@ -828,20 +854,111 @@ describe("app-server trusted view (AII-1002)", () => {
     expect(readFileSync(join(selected, "config.toml"), "utf8")).toContain("evil");
   });
 
-  it("logs a sync failure instead of swallowing it, and keeps the selected auth intact", async () => {
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  it("syncs a refreshed session for the same account and checkpoints only afterwards", async () => {
+    writeFileSync(join(selected, "auth.json"), '{"tokens":{"account_id":"acct-A","refresh_token":"r1"}}');
     const log: Spawned[] = [];
+    const { client, checkpoints } = checkpointingAuth();
     const { executor } = run([{ hang: true, dieOn: ["SIGTERM"] }], log, async () => {
-      writeFileSync(join(log[0].env.CODEX_HOME, "auth.json"), "{not json sk-secret-canary");
+      writeFileSync(join(log[0].env.CODEX_HOME, "auth.json"), '{"tokens":{"account_id":"acct-A","refresh_token":"r2"}}');
       return okResult();
+    }, { auth: client });
+    await executor.invoke(base);
+    expect(checkpoints).toEqual(['{"tokens":{"account_id":"acct-A","refresh_token":"r2"}}']);
+  });
+
+  describe("fail-closed auth sync-back", () => {
+    const cleanupViews = (before: Set<string>): void => {
+      for (const n of viewDirs().filter((d) => !before.has(d))) rmSync(join(tmpdir(), n), { recursive: true, force: true });
+    };
+
+    // Each case: what the child leaves in the view, what happens to the selected source meanwhile.
+    const cases: Array<[string, (home: string) => void, string?]> = [
+      ["malformed JSON", (home) => writeFileSync(join(home, "auth.json"), "{not json sk-secret-canary")],
+      ["a non-object JSON value", (home) => writeFileSync(join(home, "auth.json"), "[1,2]")],
+      ["a deleted view auth.json", (home) => rmSync(join(home, "auth.json"))],
+      [
+        "a different account identity",
+        (home) => writeFileSync(join(home, "auth.json"), '{"tokens":{"account_id":"acct-B"}}'),
+        '{"tokens":{"account_id":"acct-A"}}',
+      ],
+      [
+        "a lost account identity",
+        (home) => writeFileSync(join(home, "auth.json"), '{"tokens":{}}'),
+        '{"tokens":{"account_id":"acct-A"}}',
+      ],
+      [
+        "a selected source changed underneath the view",
+        (home) => {
+          writeFileSync(join(home, "auth.json"), '{"tokens":"refreshed"}');
+          writeFileSync(join(selected, "auth.json"), '{"tokens":"other-account"}');
+        },
+      ],
+      [
+        "a selected source removed underneath the view",
+        (home) => {
+          writeFileSync(join(home, "auth.json"), '{"tokens":"refreshed"}');
+          rmSync(join(selected, "auth.json"));
+        },
+      ],
+      [
+        "a sync write failure",
+        (home) => {
+          writeFileSync(join(home, "auth.json"), '{"tokens":"refreshed"}');
+          mkdirSync(join(selected, `auth.json.sync-${process.pid}`));
+        },
+      ],
+    ];
+
+    it.each(cases)("holds, preserves the view and never checkpoints on %s", async (_name, mutate, initial) => {
+      if (initial) writeFileSync(join(selected, "auth.json"), initial);
+      const before = new Set(viewDirs());
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const log: Spawned[] = [];
+      const { client, checkpoints, invocations } = checkpointingAuth();
+      const { executor } = run([{ hang: true, dieOn: ["SIGTERM"] }], log, async () => {
+        mutate(log[0].env.CODEX_HOME);
+        return okResult();
+      }, { auth: client });
+      const sourceAfterRun = (): string | null => (existsSync(join(selected, "auth.json")) ? readFileSync(join(selected, "auth.json"), "utf8") : null);
+
+      await expect(executor.invoke(base)).rejects.toMatchObject({ code: "CODEX_RECOVERY_REQUIRED", reason: "auth_sync_failed" });
+
+      // the callback never settled: no success, no checkpoint (stale or otherwise), profile still "invoking"
+      expect(checkpoints).toEqual([]);
+      expect(invocations()).toEqual({ started: 1, settled: 0 });
+      // the selected source was never replaced by anything this run produced
+      const unchangedOrExternal = sourceAfterRun();
+      expect([initial ?? '{"tokens":"original"}', '{"tokens":"other-account"}', null]).toContain(unchangedOrExternal);
+
+      // the view survives as the only copy of the refreshed session
+      const left = viewDirs().filter((n) => !before.has(n));
+      expect(left).toHaveLength(1);
+      const err = await executor.invoke(base).catch((e: unknown) => e);
+      expect(err).toMatchObject({ reason: "held" });
+      expect(log).toHaveLength(1);
+      expect(invocations().started).toBe(1);
+      expect(viewDirs().filter((n) => !before.has(n))).toEqual(left);
+
+      const logged = warn.mock.calls.map((c) => c.join(" ")).join("\n");
+      expect(logged).toContain("auth sync-back failed");
+      expect(logged).not.toContain("sk-secret-canary");
+      warn.mockRestore();
+      cleanupViews(before);
     });
-    const result = await executor.invoke(base);
-    expect(result.failure).toBeUndefined();
-    expect(readFileSync(join(selected, "auth.json"), "utf8")).toBe('{"tokens":"original"}');
-    const logged = warn.mock.calls.map((c) => c.join(" ")).join("\n");
-    expect(logged).toContain("auth sync-back failed");
-    expect(logged).not.toContain("sk-secret-canary");
-    warn.mockRestore();
+
+    it("carries the preserved view location on the recovery error and still restores the origin credential", async () => {
+      const before = new Set(viewDirs());
+      const log: Spawned[] = [];
+      const { client } = checkpointingAuth();
+      const { executor } = run([{ hang: true, dieOn: ["SIGTERM"] }], log, async () => {
+        writeFileSync(join(log[0].env.CODEX_HOME, "auth.json"), "garbage");
+        return okResult();
+      }, { auth: client });
+      const err = (await executor.invoke(base).catch((e: unknown) => e)) as CodexRecoveryRequiredError;
+      expect(err).toBeInstanceOf(CodexRecoveryRequiredError);
+      expect(readFileSync(join(err.viewRoot!, "home", "auth.json"), "utf8")).toBe("garbage");
+      cleanupViews(before);
+    });
   });
 
   it("directs the provider only through the selected invoke env's OPENAI_BASE_URL, never selected-home config", async () => {
@@ -857,17 +974,6 @@ describe("app-server trusted view (AII-1002)", () => {
     await executor.invoke(base);
     expect(config).toContain('openai_base_url = "http://127.0.0.1:4010/v1"');
     expect(config).not.toContain("evil");
-  });
-
-  it("does not overwrite a selected auth.json that changed underneath the view", async () => {
-    const log: Spawned[] = [];
-    const { executor } = run([{ hang: true, dieOn: ["SIGTERM"] }], log, async () => {
-      writeFileSync(join(log[0].env.CODEX_HOME, "auth.json"), '{"tokens":"refreshed"}');
-      writeFileSync(join(selected, "auth.json"), '{"tokens":"other-account"}');
-      return okResult();
-    });
-    await executor.invoke(base);
-    expect(readFileSync(join(selected, "auth.json"), "utf8")).toBe('{"tokens":"other-account"}');
   });
 
   it("keeps the view and skips sync while the child may live, and still blocks a second invoke", async () => {
