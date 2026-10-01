@@ -231,7 +231,7 @@ dispatch so a parent's own work clones a branch that already contains its childr
   child issue identifiers that were merged into the branch. This applies to both `feature`
   and `multi-issue` mode.
 
-The step is **idempotent** and **fails soft** per roll-up — one failure never aborts the others or the poll loop. It scans only feature nodes completed in a recent window to stay cheap.
+The step is **idempotent** and **fails soft** per roll-up — one failure never aborts the others or the poll loop. It scans only feature nodes completed in a recent window (14 days) to stay cheap; the Linear scan pages through every match (100 per page, up to 20 pages, with a warning at the cap).
 
 Idempotency is handled differently per path:
 - **Internal level:** `compareBranches` returning 0 (branch already merged into parent) or `null` (branch missing) causes an early return.
