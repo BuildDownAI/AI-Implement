@@ -279,3 +279,41 @@ On the container runtime a restart remaps the ingress port, so every client must
 | P7 | Dispatch outcome `unknown`, found by title on the second reconcile | Composer, workflow reconcile loop | GitHub dispatch, title search, run status | One dispatch; the watch reads only the found run id |
 | P8 | Ingress unreachable at trigger time | `makeKgRefreshAdminDeps(...).trigger`, `callToolAsSystem`, SQLite | Nothing listens on `UNROUTABLE_INGRESS` | `{ status: 503, body: { error: "restate-unavailable" } }`; no row |
 | P9 | Boot sweep of a legacy row | `sweepLegacyKgRefreshRows`, SQLite | Seeded legacy row and stage key | Returns 1; row `timed_out`; `kg_refresh_stage` gone. Involves no Restate call, so it runs once, not per variant |
+
+## Timing rules
+
+Three flakes cost gap-fill rounds (a base URL captured before a restart, a scenario that outran a shortened
+wall-clock window, a `sys_invocation` read before a scheduled send was visible). Scenarios follow three rules, and
+`src/__tests__/restate-test-hygiene.test.ts` (default suite) fails on the patterns that break them in every
+`*.restate.test.ts` file not named in its `ALLOWLISTED_FILES`.
+
+1. **State produced by a one-way send, a schedule, or a resolve is read with `eventually`.** The harness exports
+   `eventually(read, accept, { timeoutMs, intervalMs, label })`; on timeout it throws naming `label` and the last value
+   read. Admin reads go through `queryInvocations`, never a direct `fetch` of `/query`:
+
+   ```ts
+   const rows = await eventually(
+     () => queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'KgRepo' AND target_handler_name = 'expire'`),
+     (found) => found.length === 1,
+     { label: "one scheduled KgRepo.expire" },
+   );
+   ```
+
+2. **A scenario never depends on wall-clock speed.** A shortened window is passed through the deps and asserted on the
+   recorded delay, and a loop inside a window must be O(1) calls or concurrent (`Promise.all`), as Q5 in
+   `kg-repo.restate.test.ts` does for its enqueues.
+
+   ```ts
+   await Promise.all(Array.from({ length: MAX_TRACKED_PRS }, (_, i) => enqueue(env.baseUrl(), slug, i + 2, `br${i + 2}`)));
+   ```
+
+3. **`env.baseUrl()` and `env.adminAPIBaseUrl()` are read at the point of use**, never stored in a `const` that outlives
+   a `restart()` (a container restart remaps the port):
+
+   ```ts
+   await eventually(() => clientFor(env).repoStatus(slug), (marker) => marker.status === "accepted");
+   ```
+
+`settle(ms)` is the only permitted wait, and only before a **negative** assertion ("nothing more happens"). A raw
+`setTimeout(` is allowed only inside a fake dependency that simulates a slow call, carrying a
+`// restate-test-allow: <reason>` marker on the same or the previous line.

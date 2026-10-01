@@ -64,7 +64,7 @@ import { orchestratorTools, setKgRefreshToolDeps } from "../../restate/tools.js"
 import { callToolAsSystem } from "../../restate/tools-client.js";
 import { makeKgRefreshAdminDeps, sweepLegacyKgRefreshRows } from "../../index.js";
 import type { RestateService } from "../../restate/endpoint.js";
-import { VARIANTS, replaceEndpoint, startRetryEnabled, startVariants, stopAll } from "./harness.js";
+import { VARIANTS, eventually, replaceEndpoint, startRetryEnabled, startVariants, stopAll } from "./harness.js";
 
 const KG_SOURCE_REPO = "TestOrg/test-kg-source";
 const NAMESPACE = "https://kg.test.example/";
@@ -92,14 +92,6 @@ function makeTarball(dir: string): Buffer {
   const out = join(wrap, "src.tar.gz");
   execSync(`tar -czf ${out} -C ${wrap} repo`);
   return readFileSync(out) as Buffer;
-}
-
-async function until(predicate: () => boolean | Promise<boolean>, timeoutMs = 15_000): Promise<void> {
-  const stop = Date.now() + timeoutMs;
-  while (!(await predicate())) {
-    if (Date.now() > stop) throw new Error("timed out waiting for a durable kg-refresh effect");
-    await new Promise((resolve) => setTimeout(resolve, 25));
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -294,7 +286,7 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
     return marker.status === "accepted" ? (marker.value ?? null) : undefined;
   }
   async function untilMarkerClear(client: KgRefreshIngressClient, timeoutMs = 20_000): Promise<void> {
-    await until(async () => (await markerOf(client)) === null, timeoutMs);
+    await eventually(() => markerOf(client), (marker) => marker === null, { label: "KgRepo marker cleared", timeoutMs });
   }
 
   function kgRows(): Array<{ dispatch_id: string; status: string; conclusion: string | null }> {
@@ -321,9 +313,9 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
     const env = envFor(label);
     const client = clientFor(env);
     const triggerId = await triggerRefresh(env);
-    await until(dispatched);
+    await eventually(dispatched, (ok) => ok, { label: "dispatch", timeoutMs: 15_000 });
     expect(await postReport(env, runToken(), SUCCESS_REPORT)).toEqual({ status: 200, body: { acknowledged: true } });
-    await until(() => kgRows().some((r) => r.status === "completed"));
+    await eventually(() => kgRows().some((r) => r.status === "completed"), (ok) => ok, { label: "durable effect", timeoutMs: 15_000 });
     await untilMarkerClear(client);
 
     const rows = kgRows();
@@ -344,7 +336,7 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
   it.each(VARIANTS.map(([label]) => label))("P2: a second trigger while in flight answers refresh-in-progress (%s)", async (label) => {
     const env = envFor(label);
     await triggerRefresh(env);
-    await until(dispatched);
+    await eventually(dispatched, (ok) => ok, { label: "dispatch", timeoutMs: 15_000 });
     expect(await toolAnswer(env, "trigger_kg_refresh")).toEqual({ status: 409, body: { error: "refresh-in-progress" } });
     expect(getInFlightWork().filter((w) => w.kind === "kg-refresh")).toEqual([{ kind: "kg-refresh", count: 1 }]);
     expect(gh.dispatches).toHaveLength(1);
@@ -362,21 +354,22 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
     try {
       let client = clientFor(env);
       const triggerId = await triggerRefresh(env);
-      await until(dispatched);
+      await eventually(dispatched, (ok) => ok, { label: "dispatch", timeoutMs: 15_000 });
       // "await-progress" is set only after the dispatch step's result is journaled.
-      await until(async () => {
-        const s = await client.status(triggerId);
-        return s.status === "accepted" && s.value?.step === "await-progress";
-      });
+      await eventually(
+        () => clientFor(env).status(triggerId),
+        (s) => s.status === "accepted" && s.value?.step === "await-progress",
+        { label: "step await-progress", timeoutMs: 15_000 },
+      );
 
       replacement = await replaceEndpoint(env, services);
       await env.startedRestateContainer.restart();
       // A container restart remaps the ingress port; the old client would keep the stale one.
       client = clientFor(env);
-      await until(async () => (await client.repoStatus(KG_SOURCE_REPO)).status === "accepted", 30_000);
+      await eventually(() => clientFor(env).repoStatus(KG_SOURCE_REPO), (marker) => marker.status === "accepted", { label: "ingress reachable after restart", timeoutMs: 30_000 });
 
       expect(await postReport(env, runToken(), SUCCESS_REPORT)).toEqual({ status: 200, body: { acknowledged: true } });
-      await until(() => kgRows().some((r) => r.status === "completed"), 30_000);
+      await eventually(() => kgRows().some((r) => r.status === "completed"), (ok) => ok, { label: "durable effect", timeoutMs: 30_000 });
       await untilMarkerClear(client, 30_000);
       expect(gh.dispatches).toHaveLength(1);
       expect(kgRows()).toHaveLength(1);
@@ -399,16 +392,16 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
     try {
       let client = clientFor(env);
       await triggerRefresh(env);
-      await until(dispatched);
+      await eventually(dispatched, (ok) => ok, { label: "dispatch", timeoutMs: 15_000 });
       expect(await postReport(env, runToken(), SUCCESS_REPORT)).toMatchObject({ status: 200 });
-      await until(() => stageCommittedCalls >= 1, 30_000);
+      await eventually(() => stageCommittedCalls >= 1, (ok) => ok, { label: "durable effect", timeoutMs: 30_000 });
 
       replacement = await replaceEndpoint(env, services);
       await env.startedRestateContainer.restart();
       // A container restart remaps the ingress port; the old client would keep the stale one.
       client = clientFor(env);
-      await until(() => stageCommittedCalls >= 2, 30_000);
-      await until(() => kgRows().some((r) => r.status === "completed"), 30_000);
+      await eventually(() => stageCommittedCalls >= 2, (ok) => ok, { label: "durable effect", timeoutMs: 30_000 });
+      await eventually(() => kgRows().some((r) => r.status === "completed"), (ok) => ok, { label: "durable effect", timeoutMs: 30_000 });
       await untilMarkerClear(client, 30_000);
 
       expect(railFetchCalls).toBe(1);
@@ -434,7 +427,7 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
     // Hold the run inside the simulated rail's first fetchTarball so the duplicate arrives while the run is live.
     sim.fetchGate = gate;
     await triggerRefresh(env);
-    await until(dispatched);
+    await eventually(dispatched, (ok) => ok, { label: "dispatch", timeoutMs: 15_000 });
     const dispatchId = kgRows()[0].dispatch_id;
 
     expect(await postReport(env, runToken(), SUCCESS_REPORT)).toEqual({ status: 200, body: { acknowledged: true } });
@@ -442,7 +435,7 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
     expect(resultTokenConsumedAt(dispatchId)).toBeNull();
 
     releaseGate();
-    await until(() => kgRows().some((r) => r.status === "completed"));
+    await eventually(() => kgRows().some((r) => r.status === "completed"), (ok) => ok, { label: "durable effect", timeoutMs: 15_000 });
     await untilMarkerClear(client);
     expect(railFetchCalls).toBe(1);
     expect(railMaterializeCalls).toBe(1);
@@ -468,7 +461,7 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
     const gate = new Promise<void>((resolve) => { releaseGate = resolve; });
     sim.fetchGate = gate; // hold the run live so the first report is unconsumed-or-consumed-but-not-complete
     await triggerRefresh(env);
-    await until(dispatched);
+    await eventually(dispatched, (ok) => ok, { label: "dispatch", timeoutMs: 15_000 });
     const dispatchId = kgRows()[0].dispatch_id;
 
     expect(await postReport(env, runToken(), SUCCESS_REPORT)).toEqual({ status: 200, body: { acknowledged: true } });
@@ -483,7 +476,7 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
     expect(raw.status).toBe(409);
 
     releaseGate();
-    await until(() => kgRows().some((r) => r.status === "completed"));
+    await eventually(() => kgRows().some((r) => r.status === "completed"), (ok) => ok, { label: "durable effect", timeoutMs: 15_000 });
     await untilMarkerClear(client);
   }, 40_000);
 
@@ -493,12 +486,12 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
     const client = clientFor(env);
     const admin = makeKgRefreshAdminDeps(KG_SOURCE_REPO, client, asSystem(env) as typeof callToolAsSystem);
     await triggerRefresh(env);
-    await until(dispatched);
+    await eventually(dispatched, (ok) => ok, { label: "dispatch", timeoutMs: 15_000 });
 
     expect(await admin.cancel({ jobId: 0, reason: "operator" })).toEqual({ status: 200, body: { cancelled: true } });
-    await until(() => gh.cancelCalls.length === 1);
+    await eventually(() => gh.cancelCalls.length === 1, (ok) => ok, { label: "durable effect", timeoutMs: 15_000 });
     const polled = gh.statusCalls.length;
-    await until(() => gh.statusCalls.length >= polled + 2); // the cancel watch keeps reading in_progress
+    await eventually(() => gh.statusCalls.length >= polled + 2, (ok) => ok, { label: "durable effect", timeoutMs: 15_000 }); // the cancel watch keeps reading in_progress
 
     expect(gh.cancelCalls).toEqual([9_001]);
     expect(await markerOf(client)).not.toBeNull();
@@ -522,7 +515,7 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
     const client = clientFor(env);
     gh = freshGithub({ dispatchOutcome: "unknown", dispatchRunId: undefined, findResult: (call) => (call >= 2 ? { runId: 7_007 } : null) });
     const triggerId = await triggerRefresh(env);
-    await until(() => gh.findCalls >= 2 && gh.statusCalls.length >= 1);
+    await eventually(() => gh.findCalls >= 2 && gh.statusCalls.length >= 1, (ok) => ok, { label: "durable effect", timeoutMs: 15_000 });
 
     expect(gh.dispatches).toHaveLength(1);
     expect(gh.statusCalls.every((id) => id === 7_007)).toBe(true);

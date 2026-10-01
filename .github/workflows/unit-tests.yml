@@ -107,9 +107,9 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci
-      - name: npm run test:restate on the binary runtime (ambient CI vars scrubbed)
+      - name: npm run test:restate on the binary runtime, three passes (ambient CI vars scrubbed)
         env:
           RESTATE_TEST_RUNTIME: binary
         run: |
           unset GITHUB_RUN_ID GITHUB_ENV GITHUB_REPOSITORY GITHUB_REF_NAME                 GITHUB_EVENT_NAME GITHUB_SHA GITHUB_ACTIONS GITHUB_ACTION
-          npm run test:restate
+          for i in 1 2 3; do npm run test:restate || exit 1; done
