@@ -313,6 +313,8 @@ describe("SqliteReviewFixAttemptStore: admission", () => {
     const inspected = pending.inspectPendingReviewFixFeedback(SCOPE, "issue text");
     expect(inspected).toMatchObject({ status: "incomplete", category: "body" });
     expect(JSON.stringify(inspected)).not.toContain("xxxx");
+    expect(queue.getPendingReviewFixes().map((item) => item.id)).toContain(queueId);
+    expect(ledger.listOpenReviewFindings(SCOPE.repository, SCOPE.prNumber)).toHaveLength(1);
 
     // Admin facade: an attempt on a PR whose newer feedback is over budget still reads, pendingFeedback true.
     const store = new storeModule.SqliteReviewFixAttemptStore();

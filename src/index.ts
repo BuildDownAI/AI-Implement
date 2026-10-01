@@ -3880,7 +3880,8 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
       }
 
       // One admission contract shared with the durable path: every open finding is rendered
-      // in full or the item stays pending. This precedes token minting and admission, so an
+      // in full or the item stays pending. The installation token above is for repository
+      // reads only; preparation precedes admission and runner launch-token minting, so an
       // overflow leaks neither, and dispatchFindingIds is exactly the rendered set.
       const prepared = prepareReviewFixTask({
         prNumber: fix.prNumber,
