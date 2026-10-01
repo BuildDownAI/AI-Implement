@@ -380,36 +380,44 @@ for (const file of files) {
       try {
         const eventPath = join(dir, "event.json");
         const envPath = join(dir, "github.env");
+        const outPath = join(dir, "github.output");
         const dump = join(dir, "env.json");
         const stub = join(dir, "entrypoint.sh");
         writeFileSync(eventPath, JSON.stringify({ inputs }));
         writeFileSync(envPath, "");
+        writeFileSync(outPath, "");
         writeFileSync(stub, `#!/bin/sh\nnode -e 'require("fs").writeFileSync(process.argv[1], JSON.stringify(process.env))' "${dump}"\n`, { mode: 0o755 });
         const boot = spawnSync("sh", ["-e", "-c", mask.run], {
-          env: { PATH: process.env.PATH, GITHUB_EVENT_PATH: eventPath, GITHUB_ENV: envPath },
+          env: { PATH: process.env.PATH, GITHUB_EVENT_PATH: eventPath, GITHUB_ENV: envPath, GITHUB_OUTPUT: outPath },
           encoding: "utf8",
         });
-        if (boot.status !== 0) return { boot, env: undefined, githubEnv: "" };
-        // Parse the $GITHUB_ENV heredoc format the way the Actions runner does.
+        if (boot.status !== 0) return { boot, env: undefined, githubEnv: readFileSync(envPath, "utf8"), outputs: readFileSync(outPath, "utf8") };
+        // Nothing may reach later steps through $GITHUB_ENV; credentials are step outputs.
         const githubEnv = readFileSync(envPath, "utf8");
-        const lines = githubEnv.split("\n");
-        const exported: Record<string, string> = {};
+        // Parse the $GITHUB_OUTPUT heredoc format the way the Actions runner does.
+        const lines = readFileSync(outPath, "utf8").split("\n");
+        const outputs: Record<string, string> = {};
         for (let i = 0; i < lines.length; i++) {
-          const m = /^([A-Z_]+)<<(.+)$/.exec(lines[i]);
+          const m = /^([a-z_]+)<<(.+)$/.exec(lines[i]);
           if (!m) continue;
           const end = lines.indexOf(m[2], i + 1);
-          exported[m[1]] = lines.slice(i + 1, end).join("\n");
+          outputs[m[1]] = lines.slice(i + 1, end).join("\n");
           i = end;
         }
-        // Step-level env overrides $GITHUB_ENV; keep only literal (non-expression) entries.
-        const stepEnv = Object.fromEntries(Object.entries(run.env ?? {})
-          .filter(([, v]) => typeof v === "string" && !v.includes("${{")) as [string, string][]);
+        // Resolve the Run step's env: only bootstrap outputs are expressible; skip other expressions.
+        const stepEnv: Record<string, string> = {};
+        for (const [k, v] of Object.entries(run.env ?? {})) {
+          if (typeof v !== "string") continue;
+          const o = /^\$\{\{\s*steps\.bootstrap\.outputs\.(\w+)\s*\}\}$/.exec(v);
+          if (o) stepEnv[k] = outputs[o[1]] ?? "";
+          else if (!v.includes("${{")) stepEnv[k] = v;
+        }
         const done = spawnSync("sh", ["-e", "-c", run.run.replace("/opt/ai-implement/entrypoint.sh", stub)], {
-          env: { PATH: process.env.PATH, ...exported, ...stepEnv },
+          env: { PATH: process.env.PATH, ...stepEnv },
           encoding: "utf8",
         });
         const env = done.status === 0 ? JSON.parse(readFileSync(dump, "utf8")) : undefined;
-        return { boot, done, env, githubEnv };
+        return { boot, done, env, githubEnv, outputs };
       } finally {
         rmSync(dir, { recursive: true, force: true });
       }
@@ -426,6 +434,18 @@ for (const file of files) {
       expect(r.env.RUN_PUBLICATION_TOKEN).toBe(isPlan ? undefined : tokens.publicationToken);
       expect(JSON.stringify(r.env)).not.toContain("att-1");
       expect(r.boot.stderr).toBe("");
+      // Credentials never enter $GITHUB_ENV, which every later step (incl. third-party actions) inherits.
+      expect(r.githubEnv).toBe("");
+    });
+
+    it("maps credentials only into the Run step env, not any other step", () => {
+      const idx = job.steps.indexOf(mask);
+      for (const step of job.steps) {
+        if (step === run || step === mask) continue;
+        expect(JSON.stringify(step)).not.toMatch(/steps\.bootstrap\.outputs|\bRUN_(PROGRESS_|PUBLICATION_)?TOKEN\b/);
+      }
+      expect(job.steps.indexOf(run)).toBeGreaterThan(idx);
+      expect(mask.run).not.toMatch(/>>\s*"?\$\{?GITHUB_ENV/);
     });
 
     it("lets the private namespace win over conflicting public values and never backfills", () => {
@@ -466,6 +486,7 @@ for (const file of files) {
         expect(r.boot.status).not.toBe(0);
         expect(r.env).toBeUndefined();
         expect(r.githubEnv).toBe("");
+        expect(r.outputs).toBe("");
         expect(r.boot.stderr).toContain("Private run_config bootstrap failed");
         expect(r.boot.stdout + r.boot.stderr).not.toContain("SECRET-SENTINEL");
       }
