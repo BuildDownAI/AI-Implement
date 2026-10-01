@@ -549,10 +549,11 @@ function runSession(input: CodexTransportRunInput): Promise<CodexTransportResult
       }
       if (method === "thread/tokenUsage/updated") {
         const total = isRecord(params.tokenUsage) && isRecord(params.tokenUsage.total) ? params.tokenUsage.total : null;
-        if (total) {
-          tokensIn = count(total.inputTokens);
-          tokensOut = count(total.outputTokens);
-        }
+        const used = total ? count(total.inputTokens) : null;
+        const generated = total ? count(total.outputTokens) : null;
+        if (!total || used === null || generated === null) return fail("malformed_message", true);
+        tokensIn = used;
+        tokensOut = generated;
         return;
       }
       const turn = params.turn as Record<string, unknown>;

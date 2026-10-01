@@ -511,6 +511,22 @@ describe("planning protocol driver", () => {
       }
     });
 
+    it("rejects malformed token usage instead of ignoring it", async () => {
+      for (const note of [tokens(900, 900, { tokenUsage: { total: { inputTokens: "9", outputTokens: 1 } } }), tokens(900, 900, { tokenUsage: {} })]) {
+        const server = new FakeServer((m, s) => {
+          if (handshake(m, s)) return;
+          if (m.method === "turn/start") {
+            ack(m, s);
+            s.send(note);
+            s.send(completed());
+          }
+        });
+        const out = await drive(server);
+        expect(out.result.exitCode).toBe(1);
+        expect(out.result.stderr).toContain("malformed_message");
+      }
+    });
+
     it("rejects a bound notification whose params are not an object", async () => {
       const server = new FakeServer((m, s) => {
         if (handshake(m, s)) return;

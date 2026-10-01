@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { InvokeParams, LLMExecutor, LLMResult, RunTelemetry } from "./types.js";
@@ -500,10 +500,12 @@ export class CodexExecutor implements LLMExecutor {
     if (selectedHome) {
       const candidate = join(selectedHome, "auth.json");
       if (existsSync(candidate)) {
-        copyFileSync(candidate, join(home, "auth.json"));
-        chmodSync(join(home, "auth.json"), 0o600);
-        source = candidate;
+        // Read once and write that exact text, so the baseline and the view cannot diverge. A malformed
+        // selected auth fails before any child exists: nothing could be refreshed or compared safely.
         initial = readFileSync(candidate, "utf8");
+        if (!parseAuth(initial)) throw Object.assign(new Error("selected auth.json is malformed"), { notASpawnFailure: true });
+        writeFileSync(join(home, "auth.json"), initial, { mode: 0o600 });
+        source = candidate;
       }
     }
     return { root, home, userHome, cwd, authSource: source, initialAuth: initial };
@@ -526,11 +528,13 @@ export class CodexExecutor implements LLMExecutor {
       const prev = parseAuth(view.initialAuth);
       if (!next || !prev || authIdentity(next) !== authIdentity(prev)) throw new AuthSyncRejected("invalid_or_foreign_auth");
       if (readFileSync(view.authSource, "utf8") !== view.initialAuth) throw new AuthSyncRejected("source_changed");
-      writeFileSync(tmp, refreshed, { mode: 0o600 });
+      // "wx": a pre-existing file at the temp path is a collision, never silently overwritten.
+      writeFileSync(tmp, refreshed, { mode: 0o600, flag: "wx" });
       renameSync(tmp, view.authSource);
     } catch (err) {
       try {
-        rmSync(tmp, { force: true });
+        // On a collision the file at `tmp` is not ours to delete.
+        if ((err as NodeJS.ErrnoException)?.code !== "EEXIST") rmSync(tmp, { force: true });
       } catch {
         // best-effort: the temp file holds the same content as the preserved view
       }
