@@ -71,6 +71,13 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+const MAX_START_ATTEMPTS = 3;
+
+/** Whether a startup failure is a lost port race (a free port taken between pick and bind), which a fresh port set fixes. */
+export function isAddressInUse(startupOutput: string): boolean {
+  return startupOutput.includes("Address in use");
+}
+
 async function freePort(): Promise<number> {
   return new Promise((resolve, reject) => {
     const server = net.createServer();
@@ -96,10 +103,9 @@ export async function startBinaryEnvironment(options: BinaryEnvironmentOptions):
   const bin = (options.resolveBinary ?? resolvePlatformBinary)();
   if (!bin) throw new RestateBinaryNotFoundError();
 
-  const [ingressPort, adminPort, nodePort] = [await freePort(), await freePort(), await freePort()];
   const baseDir = await mkdtemp(path.join(os.tmpdir(), "restate-binary-env-"));
-  const adminUrl = `http://127.0.0.1:${adminPort}`;
-  const ingressUrl = `http://127.0.0.1:${ingressPort}`;
+  let adminUrl = "";
+  let ingressUrl = "";
 
   // Explicit allowlist, never process.env: an ambient RESTATE_* override in CI must not
   // change a variant. Keys mirror RestateSidecar.start().
@@ -108,10 +114,19 @@ export async function startBinaryEnvironment(options: BinaryEnvironmentOptions):
     const value = process.env[key];
     if (value !== undefined) childEnv[key] = value;
   }
+  // The ports are picked, released, then bound by the child, so another process can take one
+  // in between; startup retries with a fresh set (see spawnChild's caller).
+  const pickPorts = async (): Promise<void> => {
+    const [ingressPort, adminPort, nodePort] = [await freePort(), await freePort(), await freePort()];
+    adminUrl = `http://127.0.0.1:${adminPort}`;
+    ingressUrl = `http://127.0.0.1:${ingressPort}`;
+    Object.assign(childEnv, {
+      RESTATE_INGRESS__BIND_ADDRESS: `127.0.0.1:${ingressPort}`,
+      RESTATE_ADMIN__BIND_ADDRESS: `127.0.0.1:${adminPort}`,
+      RESTATE_BIND_ADDRESS: `127.0.0.1:${nodePort}`,
+    });
+  };
   Object.assign(childEnv, {
-    RESTATE_INGRESS__BIND_ADDRESS: `127.0.0.1:${ingressPort}`,
-    RESTATE_ADMIN__BIND_ADDRESS: `127.0.0.1:${adminPort}`,
-    RESTATE_BIND_ADDRESS: `127.0.0.1:${nodePort}`,
     RESTATE_BASE_DIR: baseDir,
     // TCP only: the default unix sockets live under <base dir>/<node name>/ and macOS's long
     // os.tmpdir() overflows SUN_LEN (104), so the server would fail to bind at startup.
@@ -131,6 +146,12 @@ export async function startBinaryEnvironment(options: BinaryEnvironmentOptions):
   } else if (options.variant === "disableRetries") {
     childEnv.RESTATE_DEFAULT_RETRY_POLICY__MAX_ATTEMPTS = "1";
     childEnv.RESTATE_DEFAULT_RETRY_POLICY__ON_MAX_ATTEMPTS = "kill";
+  }
+
+  class StartupExitError extends Error {
+    constructor(readonly output: string) {
+      super(`restate-server exited during startup: ${output}`);
+    }
   }
 
   let child: ChildProcess | null = null;
@@ -156,7 +177,7 @@ export async function startBinaryEnvironment(options: BinaryEnvironmentOptions):
 
     const deadline = Date.now() + READY_TIMEOUT_MS;
     while (Date.now() < deadline) {
-      if (dead) throw new Error(`restate-server exited during startup: ${spawnError || stderrTail}`);
+      if (dead) throw new StartupExitError(spawnError || stderrTail);
       // /health answers before the partitions are queryable; wait for both.
       if (
         (await ok(`${adminUrl}/health`)) &&
@@ -209,7 +230,15 @@ export async function startBinaryEnvironment(options: BinaryEnvironmentOptions):
     });
     const endpointPort = (endpoint.address() as net.AddressInfo).port;
 
-    await spawnChild();
+    for (let attempt = 1; ; attempt++) {
+      await pickPorts();
+      try {
+        await spawnChild();
+        break;
+      } catch (error) {
+        if (!(error instanceof StartupExitError) || !isAddressInUse(error.output) || attempt >= MAX_START_ATTEMPTS) throw error;
+      }
+    }
 
     // The admin API can answer /health before the partitions accept a deployment; retry.
     const deadline = Date.now() + READY_TIMEOUT_MS;

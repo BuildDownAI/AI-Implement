@@ -4,7 +4,7 @@ import { EventEmitter } from "node:events";
 import { mkdtempSync, rmSync, writeFileSync, chmodSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { RestateSidecar, restateDataDir, ensureRequestIdentityKey, RESTATE_ADMIN_BASE_URL, RESTATE_INGRESS_BIND_ADDRESS } from "../restate/server.js";
+import { RestateSidecar, restateDataDir, ensureRequestIdentityKey, identityKeyFromPem, RESTATE_ADMIN_BASE_URL, RESTATE_INGRESS_BIND_ADDRESS } from "../restate/server.js";
 import { getRestateStatus, resetRestateStatus } from "../restate/status.js";
 import { createRestateRegistrationGate, stopSidecarsConcurrently } from "../index.js";
 
@@ -968,6 +968,16 @@ describe("request identity key", () => {
     expect(readFileSync(pemPath, "utf8")).toBe(pem);
     expect(second.identityKey).toBe(first.identityKey);
     await second.stop();
+  });
+
+  it("encodes a known ED25519 public key to its compact publickeyv1_ form", () => {
+    // Seed 00 01 .. 1f, wrapped as PKCS#8; the public key is
+    // 03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8 and the base58 string below
+    // was computed independently of src/restate/server.ts.
+    const seed = Buffer.from(Array.from({ length: 32 }, (_, i) => i));
+    const der = Buffer.concat([Buffer.from("302e020100300506032b657004220420", "hex"), seed]);
+    const pem = `-----BEGIN PRIVATE KEY-----\n${der.toString("base64")}\n-----END PRIVATE KEY-----\n`;
+    expect(identityKeyFromPem(pem)).toBe("publickeyv1_FAe4sisG95oZ42w7buUn5qEE4TAnfTTFPiguZUHmhiF");
   });
 
   it("derives a stable key from the PEM", () => {
