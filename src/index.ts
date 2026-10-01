@@ -112,7 +112,7 @@ import { resolveBaseBranch, findOpenRollUpPr, resolvePlanningBranch } from "./fe
 import { validateIssueBaseBranch, postBranchComment } from "./base-branch.js";
 import { runMergeUps, clearRollUpHandledMarkersByIdentifier } from "./merge-up.js";
 import { runGroupingBranchAutoMerge } from "./auto-merge.js";
-import { getPendingReviewFixes, listReviewFixEvents, recordReviewFixDispatch, updateReviewFixStatus, shouldSkipReviewFix, acceptReviewFixWebhookEvent, buildReviewFixTaskDescription, MAX_TASK_FINDINGS } from "./review-fix-queue.js";
+import { getPendingReviewFixes, listReviewFixEvents, recordReviewFixDispatch, updateReviewFixStatus, shouldSkipReviewFix, acceptReviewFixWebhookEvent, prepareReviewFixTask, previewReviewFixText } from "./review-fix-queue.js";
 import { initReviewFixEvidenceTable, sweepExpiredReviewFixEvidence } from "./review-fix-evidence.js";
 import { drainCommentGapfillQueue } from "./comment-gapfill-drain.js";
 import { sweepOrphanedGapfillRows } from "./comment-gapfill-queue.js";
@@ -3582,12 +3582,6 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
       // allowed to resolve. Findings that arrive after the snapshot remain open
       // for a later queue event rather than being cleared by an older run.
       const openFindings = listOpenReviewFindings(fix.repo, fix.prNumber);
-      // Must match the slice buildReviewFixTaskDescription renders into the task text
-      // below: a finding beyond MAX_TASK_FINDINGS is never shown to the agent, so it
-      // has to stay "open" rather than being resolved by this dispatch's callback.
-      const taskFindings = openFindings.slice(0, MAX_TASK_FINDINGS);
-      const dispatchFindingIds = taskFindings.map((finding) => finding.id);
-
       const [owner] = fix.repo.split("/");
       const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
       const installationId = String(await getInstallationId(config.githubAppId, config.githubAppPrivateKey, owner));
@@ -3626,7 +3620,11 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
         }
       }
 
-      const taskDescription = buildReviewFixTaskDescription({
+      // One admission contract shared with the durable path: every open finding is rendered
+      // in full or the item stays pending. The installation token above is for repository
+      // reads only; preparation precedes admission and runner launch-token minting, so an
+      // overflow leaks neither, and dispatchFindingIds is exactly the rendered set.
+      const prepared = prepareReviewFixTask({
         prNumber: fix.prNumber,
         reason: fix.reason,
         findings: openFindings.map((finding) => ({
@@ -3640,6 +3638,12 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
         })),
         issueDescription,
       });
+      if (prepared.status === "incomplete") {
+        console.warn(`[review-fix] Incomplete feedback (${prepared.category}) for PR #${fix.prNumber}; keeping review fix #${fix.id} pending: ${previewReviewFixText(prepared.reason)}`);
+        continue;
+      }
+      const taskDescription = prepared.text;
+      const dispatchFindingIds = openFindings.map((finding) => finding.id);
 
       if (config.runnerCallbackBaseUrl && config.runnerTokenSecret) {
         // Gap-fill dispatches run the implementation workflow and can take as

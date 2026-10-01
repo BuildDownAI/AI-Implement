@@ -862,6 +862,59 @@ describe("processReviewFixQueue — task description wiring", () => {
     expect(expected).toContain("Implement the widget.");
   });
 
+  it("keeps an over-budget review pending: no dispatch, no dispatch record, no status change", async () => {
+    configModule.upsertMapping("TEAM", makeMapping());
+    const queueId = reviewFixQueue.enqueueReviewFix({
+      issueId: "issue-over", issueIdentifier: "AII-12", repo: "acme/billing", prNumber: 62, reason: "late review comment",
+    });
+    const reviewLedgerStore = await import("../review-ledger-store.js");
+    for (let i = 0; i < 31; i++) {
+      reviewLedgerStore.upsertReviewFinding({
+        repo: "acme/billing", prNumber: 62, source: "github-review", severity: "blocking",
+        body: `Finding ${i}`, path: `src/f${i}.ts`, line: i + 1,
+      });
+    }
+    findByKeyMock.mockResolvedValue({
+      id: "issue-over", identifier: "AII-12", title: "T", description: "d", scopeKey: "TEAM", nativeStatus: "In Progress",
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    await indexModule.processReviewFixQueue(mockConfig, mockRegistry);
+
+    expect(localGapfillMocks.dispatchLocalGapfill).not.toHaveBeenCalled();
+    expect(reviewFixQueue.getPendingReviewFixes().map((item) => item.id)).toEqual([queueId]);
+    expect((dedup.getDb().prepare("SELECT COUNT(*) AS n FROM review_fix_dispatches").get() as { n: number }).n).toBe(0);
+    expect(reviewLedgerStore.listOpenReviewFindings("acme/billing", 62)).toHaveLength(31);
+    expect(warn.mock.calls.some((call) => String(call[0]).includes("Incomplete feedback (count)"))).toBe(true);
+  });
+
+  it("dispatches a full admitted set and records exactly the rendered finding ids", async () => {
+    configModule.upsertMapping("TEAM", makeMapping());
+    reviewFixQueue.enqueueReviewFix({
+      issueId: "issue-full", issueIdentifier: "AII-13", repo: "acme/billing", prNumber: 63, reason: "late review comment",
+    });
+    const reviewLedgerStore = await import("../review-ledger-store.js");
+    for (let i = 0; i < 4; i++) {
+      reviewLedgerStore.upsertReviewFinding({
+        repo: "acme/billing", prNumber: 63, source: "github-review", severity: "blocking",
+        body: `Finding ${i}\n\n${"detail ".repeat(150)}\nEND-${i}`, path: `src/f${i}.ts`, line: i + 1,
+      });
+    }
+    findByKeyMock.mockResolvedValue({
+      id: "issue-full", identifier: "AII-13", title: "T", description: "d", scopeKey: "TEAM", nativeStatus: "In Progress",
+    });
+    localGapfillMocks.dispatchLocalGapfill.mockResolvedValue({ containerId: "c", machineNonce: "n" } as never);
+
+    await indexModule.processReviewFixQueue(mockConfig, mockRegistry);
+
+    const [call] = localGapfillMocks.dispatchLocalGapfill.mock.calls[0]!;
+    for (let i = 0; i < 4; i++) expect(call.issue.description).toContain(`END-${i}`);
+    const open = reviewLedgerStore.listOpenReviewFindings("acme/billing", 63).map((f) => f.id).sort();
+    const row = dedup.getDb().prepare("SELECT finding_ids_json FROM review_fix_dispatches").get() as { finding_ids_json: string };
+    expect((JSON.parse(row.finding_ids_json) as number[]).sort()).toEqual(open);
+    expect(open).toHaveLength(4);
+  });
+
   it("uses buildReviewFixTaskDescription for the legacy issue_description dispatch field on the GHA path", async () => {
     process.env.RUNNER_MODE = "default";
     const mapping = makeMapping({ executionMode: "github-actions" });
@@ -959,78 +1012,6 @@ describe("processReviewFixQueue — task description wiring", () => {
     expect(pending).toHaveLength(0);
 
     consoleErrorSpy.mockRestore();
-  });
-
-  it("caps the dispatch snapshot at the first 30 findings shown in the task text, leaving finding 31 open after resolution", async () => {
-    const mapping = makeMapping();
-    configModule.upsertMapping("TEAM", mapping);
-
-    reviewFixQueue.enqueueReviewFix({
-      issueId: "issue-cap",
-      issueIdentifier: "AII-12",
-      repo: "acme/billing",
-      prNumber: 62,
-      reason: "late review comment",
-    });
-
-    const reviewLedgerStore = await import("../review-ledger-store.js");
-    for (let i = 0; i < 31; i++) {
-      reviewLedgerStore.upsertReviewFinding({
-        repo: "acme/billing",
-        prNumber: 62,
-        source: "github-review",
-        severity: "blocking",
-        body: `Finding number ${i}`,
-        path: "src/foo.ts",
-        line: i,
-      });
-    }
-
-    findByKeyMock.mockResolvedValue({
-      id: "issue-cap",
-      identifier: "AII-12",
-      title: "Some issue",
-      description: "Implement the widget.",
-      scopeKey: "TEAM",
-      nativeStatus: "In Progress",
-    });
-
-    // Only with a runner callback configured does processReviewFixQueue mint a dispatchId
-    // and record a dispatch snapshot (recordReviewFixDispatch) at all.
-    const configWithCallback = {
-      ...mockConfig,
-      runnerCallbackBaseUrl: "https://callback.example.com",
-      runnerTokenSecret: "test-runner-secret",
-    } as IndexModule.AppConfig;
-
-    await indexModule.processReviewFixQueue(configWithCallback, mockRegistry);
-
-    expect(localGapfillMocks.dispatchLocalGapfill).toHaveBeenCalledTimes(1);
-    const [call] = localGapfillMocks.dispatchLocalGapfill.mock.calls[0]!;
-    const description = call.issue.description ?? "";
-    const headingCount = (description.match(/^### /gm) ?? []).length;
-    expect(headingCount).toBe(30);
-    expect(description).toContain("1 additional finding was left out of this task");
-
-    const openFindings = reviewLedgerStore.listOpenReviewFindings("acme/billing", 62);
-    expect(openFindings).toHaveLength(31);
-    const expectedIds = openFindings.slice(0, 30).map((f) => f.id);
-    const omittedId = openFindings[30]!.id;
-
-    const job = log.getInFlightJobs().find((j) => j.issueId === "issue-cap");
-    expect(job?.dispatchId).toBeTruthy();
-    const snapshot = reviewFixQueue.getReviewFixDispatchSnapshot(job!.dispatchId!);
-    expect(snapshot).not.toBeNull();
-    expect(snapshot!.findingIds).toEqual(expectedIds);
-    expect(snapshot!.findingIds).not.toContain(omittedId);
-
-    // Simulate the runner-callback success path, which resolves exactly the snapshot's ids.
-    const reviewLedgerStoreModule = await import("../review-ledger-store.js");
-    reviewLedgerStoreModule.markReviewFindingsResolvedByIds("acme/billing", 62, snapshot!.findingIds);
-
-    const stillOpen = reviewLedgerStore.listOpenReviewFindings("acme/billing", 62);
-    expect(stillOpen).toHaveLength(1);
-    expect(stillOpen[0]!.id).toBe(omittedId);
   });
 });
 

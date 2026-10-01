@@ -36,7 +36,7 @@ import {
 import { SqliteReviewFixAttemptStore } from "../../review-fix-attempt-store.js";
 import { upsertReviewFinding } from "../../review-ledger-store.js";
 import { enqueueReviewFix } from "../../review-fix-queue.js";
-import { loadPendingReviewFixFeedback } from "../../review-fix-pending.js";
+import { inspectPendingReviewFixFeedback, loadPendingReviewFixFeedback } from "../../review-fix-pending.js";
 import { createReviewFixFinalizer, retryApprovalEffect } from "../../review-fix-finalize.js";
 import type { ReviewFixGitHubAdapter } from "../../review-fix-finalize.js";
 import { createReviewFixGithubAdapter } from "../../review-fix-github-adapter.js";
@@ -137,6 +137,8 @@ interface GithubFixture {
    *  `review_fix_queue`/`review_findings` tables via `loadPendingReviewFixFeedback`
    *  (including its `queueCursor`), instead of the hand-supplied fixture value. */
   useProductionPending: boolean;
+  /** Incomplete-feedback outcomes the production-shaped `load()` resolved as pending:null. */
+  incompleteLoads: Array<{ category: string; reason: string }>;
   windowMs: number;
   jobTimeoutMinutes: number;
   blockAdmission: "paused" | "occupied" | "at_capacity" | "budget_exhausted" | null;
@@ -177,7 +179,7 @@ function freshScenario(prefix: string, opts: { cap?: number; budget?: number; pa
     open: true, draft: false, merged: false, mergeable: true, mergeableState: "clean",
     headSha: sha(`${owner}-initial`),
     checks: [], statusState: "success", statusCount: 0, reviews: [], comments: [], commentPosts: 0,
-    pending: null, useProductionPending: false, windowMs: 200, jobTimeoutMinutes: LONG_DEADLINE_JOB_TIMEOUT_MINUTES,
+    pending: null, useProductionPending: false, incompleteLoads: [], windowMs: 200, jobTimeoutMinutes: LONG_DEADLINE_JOB_TIMEOUT_MINUTES,
     blockAdmission: null, admitOverride: null, recordResultOverride: null, applyApprovalEffectOverride: null,
     dispatchImpl: () => { throw new Error("unset"); },
     dispatchCalls: 0, listRunsVisible: true, runId: null, runAttempt: 1, runDetail: null,
@@ -405,7 +407,14 @@ const pr = createReviewFixPR({
   },
   load: async (scope) => {
     const fixture = findFixture(scope.repository);
-    const pending = fixture.useProductionPending ? loadPendingReviewFixFeedback(scope, null) : fixture.pending;
+    // Mirrors review-fix-production.ts load(): over-budget feedback resolves as pending:null
+    // (a non-launch outcome) instead of throwing into Restate's unbounded journaled retry.
+    let pending = fixture.pending;
+    if (fixture.useProductionPending) {
+      const inspected = inspectPendingReviewFixFeedback(scope, null);
+      if (inspected.status === "incomplete") fixture.incompleteLoads.push({ category: inspected.category, reason: inspected.reason });
+      pending = inspected.status === "ready" ? inspected.feedback : null;
+    }
     return { closed: fixture.merged || !fixture.open, jobTimeoutMinutes: fixture.jobTimeoutMinutes, pending };
   },
   collectionWindowMs: async (scope) => findFixture(scope.repository).windowMs,
@@ -556,34 +565,46 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     expect(budgetEntryCount(fixture.scope.repository, fixture.scope.prNumber)).toBe(0);
   }, 20_000);
 
-  it.each(VARIANTS.map(([label]) => label))("more than 30 finding versions admits the oldest 30 and preserves the rest pending, per the production pending-feedback projection (%s)", async (label) => {
+  it.each(VARIANTS.map(([label]) => label))("more than 30 finding versions is rejected whole and every version stays pending, per the production non-launch adapter (%s)", async (label) => {
     const env = envFor(label);
     const fixture = freshScenario("overflow");
     fixture.useProductionPending = true;
     // Real review_findings rows (distinct body per finding, so each gets its own
     // content-addressed finding_key) plus one real review_fix_queue/events row —
-    // the exact tables loadPendingReviewFixFeedback (and admit()'s cursor
-    // re-validation) read, not a hand-built ReviewFixPendingFeedback.
+    // the exact tables the production pending-feedback projection reads.
     const findingIds = Array.from({ length: 35 }, (_, i) => seedOpenFinding(fixture, `Overflow finding number ${i}`));
     seedQueueEvent(fixture, "automatic review-fix findings", findingIds);
-    const beforeAdmission = loadPendingReviewFixFeedback(fixture.scope, null);
-    expect(beforeAdmission?.findings).toHaveLength(30);
-    expect(beforeAdmission?.queueCursor).toMatchObject({ queueId: expect.any(Number), eventId: expect.any(Number) });
+    expect(() => loadPendingReviewFixFeedback(fixture.scope, null)).toThrow(/count|30/);
+    const inspected = inspectPendingReviewFixFeedback(fixture.scope, null);
+    expect(inspected).toMatchObject({ status: "incomplete", category: "count" });
+    fixture.incompleteLoads.length = 0;
 
     await triggerFeedback(env, fixture.scope);
-    await eventually(() => latestAttemptRow(fixture.scope) !== undefined, Boolean, { timeoutMs: 8_000, label: "latestAttemptRow(fixture.scope) !== undefined" });
-    const attemptId = latestAttemptRow(fixture.scope)!.attemptId;
-    fixture.attemptId = attemptId;
-    fixtureByAttempt.set(attemptId, fixture);
+    await eventually(() => fixture.incompleteLoads.length > 0, Boolean, { timeoutMs: 8_000, label: "incomplete feedback detected" });
+    await settle(fixture.windowMs + 300);
 
-    const prepared = await sqliteStore.getPreparedAttempt(attemptId);
-    expect(prepared?.findings).toHaveLength(30);
+    // The coordinator resolved the journaled load as pending:null (no throw), so Restate
+    // does not retry the deterministic failure: a bounded number of loads, one category.
+    expect(fixture.incompleteLoads.length).toBeLessThanOrEqual(3);
+    expect(new Set(fixture.incompleteLoads.map((load) => load.category))).toEqual(new Set(["count"]));
+    expect(fixture.incompleteLoads[0].reason).toContain("35 findings exceed the 30-finding limit");
+    expect(fixture.incompleteLoads[0].reason).not.toContain("Overflow finding number");
 
-    // The 31st-35th finding versions were never offered to admission and remain
-    // open and unprocessed in the real ledger/queue projection after the first
-    // admission committed — not merely "not yet admitted" but re-derivable on demand.
-    const stillPending = loadPendingReviewFixFeedback(fixture.scope, null);
-    expect(stillPending?.findings).toHaveLength(5);
+    // Nothing admitted, no budget consumed, no worker dispatch.
+    const teamKey = fixture.scope.repository.split("/")[0];
+    expect(latestAttemptRow(fixture.scope)).toBeUndefined();
+    expect(activeAdmissionCount(teamKey)).toBe(0);
+    expect(budgetEntryCount(fixture.scope.repository, fixture.scope.prNumber)).toBe(0);
+    expect(fixture.dispatchCalls).toBe(0);
+
+    // All 35 finding versions remain open, unattempted, and in the pending queue row.
+    const open = getDb().prepare(`SELECT COUNT(*) AS n FROM review_findings WHERE repo = ? AND pr_number = ? AND status = 'open'`)
+      .get(fixture.scope.repository, fixture.scope.prNumber) as { n: number };
+    expect(open.n).toBe(35);
+    const queued = getDb().prepare(`SELECT status FROM review_fix_queue WHERE repo = ? AND pr_number = ?`)
+      .get(fixture.scope.repository, fixture.scope.prNumber) as { status: string };
+    expect(queued.status).toBe("pending");
+    expect(inspectPendingReviewFixFeedback(fixture.scope, null)).toMatchObject({ status: "incomplete", category: "count" });
   }, 20_000);
 
   it.each(VARIANTS.map(([label]) => label))("a new/re-reported finding after a snapshot stays open for the next attempt, per the production pending-feedback projection (%s)", async (label) => {

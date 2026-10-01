@@ -7,7 +7,7 @@ import { getDb } from "./dedup.js";
 import { getReviewFixActivityGaps, isReviewFixEvidenceTombstoned,
   listReviewFixActivity, listReviewFixCycleSummaries } from "./review-fix-evidence.js";
 import { acceptDelivery } from "./review-fix-inbox.js";
-import { loadPendingReviewFixFeedback } from "./review-fix-pending.js";
+import { inspectPendingReviewFixFeedback } from "./review-fix-pending.js";
 import type { SqliteReviewFixAttemptStore } from "./review-fix-attempt-store.js";
 import type { ReviewFixImmutableOutcome, ReviewFixWorkerPort } from "./review-fix-ports.js";
 
@@ -91,7 +91,9 @@ export function createReviewFixAdminFacade(store: SqliteReviewFixAttemptStore, w
         execution: row.github_run_id === null || row.github_run_attempt === null ? null
           : { githubRunId: String(row.github_run_id), githubRunAttempt: row.github_run_attempt },
         deadlineAt: row.deadline_at,
-        pendingFeedback: loadPendingReviewFixFeedback(scope, null) !== null,
+        // An over-budget set is still pending feedback; the dashboard read must not throw on it.
+        pendingFeedback: (() => { const found = inspectPendingReviewFixFeedback(scope, null);
+          return found.status === "incomplete" || found.feedback !== null; })(),
         snapshot: { taskText: snapshot.taskText, findings },
         state: terminal ? terminal.terminal.status : row.result_conflict_at !== null ? "conflict" : row.state,
         evidenceComplete: evidenceComplete(attemptId, cycles),

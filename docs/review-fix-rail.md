@@ -319,3 +319,18 @@ See [ADR 028](adr/028-the-fixing-agent-dispositions-each-finding-and-may-defer-o
 - **`review_findings` has no retention policy.** Rows persist for merged and closed PRs alike.
 - **`pull_request_target` resolves the workflow file from the repository's default branch (`main`), not from the PR base branch or the PR head.** A rename of a job in a workflow triggered by `pull_request_target` (such as `claude-review.yml`) is not in force until it lands on the default branch — regardless of which branch the PR targets. For example, a PR targeting `testing` will still use the workflow as declared on `main`, so a rename committed only to `testing` does not change the check-run name the gate sees. When the gate logs "No external review check matched", compare the present names against what the **default branch** workflow file declares.
 - **Renaming a review job name is a silent gate change.** If no check matches the configured or default names, the gate fails open (logs a warning, then approves). Use `reviewCheckNames` in `.ai-implement/config.yml` to pin the expected name and make mismatches visible rather than silently bypassed.
+
+## Task-text admission budgets (AII-1006)
+
+`prepareReviewFixTask` (`src/review-fix-queue.ts`) is the one admission contract for both the durable loader (`loadPendingReviewFixFeedback`) and the legacy `processReviewFixQueue` path. Review feedback is never clipped: a set over any budget is rejected whole, with a category.
+
+| Budget | Limit | Category |
+|---|---|---|
+| Findings per task | 30 | `count` |
+| Raw body per finding | 8,000 chars | `body` |
+| Rendered feedback (headings, metadata, quote prefixes, URLs) | 19,000 chars | `aggregate` |
+| Whole rendered task, including up to 20,000 chars of issue context | 40,000 chars (run-config's description cap) | `envelope` |
+
+On overflow the durable loader throws `ReviewFixFeedbackIncompleteError` before `admit`, so no snapshot, attempt, token or dispatch exists and every finding version stays pending. The legacy loop logs a bounded warning and leaves the queue item `pending`. An over-limit set needs source reduction or a later batching capability. `GithubReviewFixWorker.launch` also decodes the encoded `run_config` and refuses to dispatch unless `issue.description` and `commentInstruction` equal the admitted task text. `dispatchFindingIds` and the durable snapshot are exactly the rendered findings (AII-758 invariant).
+
+Non-launch reads of over-budget feedback (`inspectPendingReviewFixFeedback`) report `incomplete` instead of throwing: the admin attempt detail shows `pendingFeedback: true`, and the Restate `load()` resolves with no pending feedback and logs only the bounded category, so nothing is admitted, nothing is retried in a tight loop, and every finding stays pending until the set is reduced.
