@@ -98,6 +98,7 @@ interface FakeAuth {
 function makeAuth(opts: { mode?: "api" | "subscription"; checkpointFails?: boolean } = {}): FakeAuth {
   const events: string[] = [];
   let uncertain = false;
+  let busy = false;
   const state: FakeAuth = {
     events,
     checkpointFails: opts.checkpointFails ?? false,
@@ -105,6 +106,8 @@ function makeAuth(opts: { mode?: "api" | "subscription"; checkpointFails?: boole
       async invoke<T>(profileId: string, run: (i: ModelInvocation) => Promise<T>): Promise<T> {
         events.push(`invoke:${profileId}`);
         if (uncertain) throw new ModelAuthClientError("checkpoint_uncertain", { profileId });
+        if (busy) throw new ModelAuthClientError("invocation_in_progress", { profileId });
+        busy = true;
         const env: Record<string, string> =
           opts.mode === "subscription" ? { PATH: "/usr/bin", CODEX_HOME: "/tmp/synthetic-auth" } : { PATH: "/usr/bin", CODEX_API_KEY: SYNTHETIC_KEY };
         let result: T | undefined;
@@ -117,6 +120,7 @@ function makeAuth(opts: { mode?: "api" | "subscription"; checkpointFails?: boole
           failure = e;
         }
         events.push("checkpoint");
+        busy = false;
         if (state.checkpointFails) {
           uncertain = true;
           throw new ModelAuthClientError("checkpoint_uncertain", { profileId });
@@ -208,6 +212,22 @@ describe("structured verdict validation", () => {
     expect(matchesSchema({ xs: ["a"] }, schema)).toBe(true);
     expect(matchesSchema({ xs: ["c"] }, schema)).toBe(false);
     expect(matchesSchema({}, schema)).toBe(false);
+  });
+
+  it.each(["constructor", "toString", "valueOf", "hasOwnProperty"])("rejects own property %s under additionalProperties", (key) => {
+    const strict = { type: "object", properties: { a: { type: "string" } }, additionalProperties: false };
+    expect(matchesSchema({ a: "x" }, strict)).toBe(true);
+    expect(matchesSchema({ a: "x", [key]: "y" }, strict)).toBe(false);
+    const typed = { type: "object", properties: { a: { type: "string" } }, additionalProperties: { type: "number" } };
+    expect(matchesSchema({ a: "x", [key]: 1 }, typed)).toBe(true);
+    expect(matchesSchema({ a: "x", [key]: "y" }, typed)).toBe(false);
+  });
+
+  it.each(["constructor", "toString", "valueOf"])("rejects a verdict carrying own key %s", async (key) => {
+    const { executor } = make([{ stdout: verdict({ approved: true, summary: "ok", [key]: "x" }) }]);
+    const result = await executor.invoke(params);
+    expect(result.failure?.category).toBe("invalid_output");
+    expect(result.structuredOutput).toBeUndefined();
   });
 
   it("writes the output schema outside the workspace and removes it afterwards", async () => {
@@ -381,10 +401,20 @@ describe("timeout, cancellation and termination", () => {
     const { executor, log, auth } = make([{ hang: true, dieOn: [] }]);
     await expect(executor.invoke({ ...base, invocationTimeoutMs: 10 })).rejects.toBeInstanceOf(CodexRecoveryRequiredError);
     expect(log[0].signals).toEqual(["SIGTERM", "SIGKILL"]);
-    // Checkpoint still ran after the failed run.
-    expect(auth.events).toEqual(["invoke:profile-1", "checkpoint"]);
+    // No session read/checkpoint while the child may still be alive.
+    expect(auth.events).toEqual(["invoke:profile-1"]);
     await expect(executor.invoke(base)).rejects.toMatchObject({ reason: "held" });
     expect(log).toHaveLength(1);
+  });
+
+  it("keeps the shared profile held so no second executor can invoke while the child may live", async () => {
+    const auth = makeAuth({ mode: "subscription" });
+    const first = make([{ hang: true, dieOn: [] }], {}, auth);
+    await expect(first.executor.invoke({ ...base, invocationTimeoutMs: 10 })).rejects.toMatchObject({ reason: "child_not_terminated" });
+    const second = make([{ stdout: message("ok") }], {}, auth);
+    await expect(second.executor.invoke(base)).rejects.toMatchObject({ category: "invocation_in_progress" });
+    expect(second.log).toHaveLength(0);
+    expect(auth.events.filter((e) => e === "checkpoint")).toHaveLength(0);
   });
 
   it("signals the whole process group when the child has a pid", async () => {

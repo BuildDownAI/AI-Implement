@@ -115,10 +115,10 @@ export function matchesSchema(value: unknown, schema: unknown, depth = 0): boole
       if (Object.prototype.hasOwnProperty.call(value, key) && !matchesSchema(value[key], sub, depth + 1)) return false;
     }
     if (schema.additionalProperties === false) {
-      for (const key of Object.keys(value)) if (!(key in props)) return false;
+      for (const key of Object.keys(value)) if (!Object.prototype.hasOwnProperty.call(props, key)) return false;
     } else if (isObject(schema.additionalProperties)) {
       for (const [key, v] of Object.entries(value)) {
-        if (!(key in props) && !matchesSchema(v, schema.additionalProperties, depth + 1)) return false;
+        if (!Object.prototype.hasOwnProperty.call(props, key) && !matchesSchema(v, schema.additionalProperties, depth + 1)) return false;
       }
     }
   }
@@ -309,8 +309,26 @@ export class CodexExecutor implements LLMExecutor {
 
   /** One spawn inside one `ModelAuthClient.invoke`, so authentication is checkpointed even on failure. */
   private async invokeOnce(params: InvokeParams): Promise<Attempt> {
+    let signalUnterminated: (err: CodexRecoveryRequiredError) => void = () => {};
+    const unterminated = new Promise<never>((_, reject) => (signalUnterminated = reject));
     try {
-      return await this.options.auth.invoke(this.options.profileId, (invocation) => this.runChild(params, invocation.env));
+      // If the child cannot be proven dead the callback must never settle: a rejection would make the
+      // client read and persist session state a live child may still be writing, and mark the profile
+      // ready. The pending invoke keeps the profile "invoking" (no second invocation, no dispose), while
+      // the race below surfaces the recovery-required error to the caller.
+      const invocation = this.options.auth.invoke(this.options.profileId, async (selected) => {
+        try {
+          return await this.runChild(params, selected.env);
+        } catch (err) {
+          if (err instanceof CodexRecoveryRequiredError && err.reason === "child_not_terminated") {
+            signalUnterminated(err);
+            return new Promise<Attempt>(() => {});
+          }
+          throw err;
+        }
+      });
+      invocation.catch(() => {});
+      return await Promise.race([invocation, unterminated]);
     } catch (err) {
       const category = (err as { category?: unknown } | null)?.category;
       if (category === "checkpoint_uncertain" || category === "checkpoint_rejected") {
