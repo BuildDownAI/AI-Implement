@@ -8,7 +8,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { MAX_TRACKED_PRS } from "../../kg-refresh.js";
 import { KG_REFRESH_TOTAL_DEADLINE_MS, KG_REPO_STALE_MARGIN_MS } from "../../restate/kg-refresh-workflow.js";
 import { createKgRepo, type KgRepoEnqueueResult, type KgRepoTriggerResult } from "../../restate/kg-repo.js";
-import { VARIANTS, callObject, startVariants, stopAll } from "./harness.js";
+import { VARIANTS, callObject, eventually, queryInvocations, settle, startVariants, stopAll } from "./harness.js";
 
 const FAKE_WORKFLOW_NAME = "FakeKgRefresh";
 const MARKER_AGE_WAIT_MS = 1_500;
@@ -54,18 +54,6 @@ describe("KgRepo durable single-flight lock", () => {
     return callObject<KgRepoTriggerResult>(baseUrl, "KgRepo", key, "trigger", {});
   }
 
-  /** `trigger`'s send to the fake workflow is a one-way `ctx.genericSend` — the HTTP
-   *  response for `trigger` itself does not wait for delivery, so a `runSends` count
-   *  checked immediately afterward can observe the send before it lands. Poll instead
-   *  of asserting synchronously. */
-  async function until(predicate: () => boolean, timeoutMs = 10_000): Promise<void> {
-    const stop = Date.now() + timeoutMs;
-    while (!predicate()) {
-      if (Date.now() > stop) throw new Error("timed out waiting for a durable send to be delivered");
-      await new Promise((resolve) => setTimeout(resolve, 25));
-    }
-  }
-
   it.each(VARIANTS.map(([label]) => label))(
     "R1/R2: trigger mints once and sends once; a second trigger while in flight returns the same id with no second send (%s)",
     async (label) => {
@@ -82,7 +70,7 @@ describe("KgRepo durable single-flight lock", () => {
       const second = await trigger(env.baseUrl(), key);
       expect(second).toEqual({ status: "refresh-in-progress", triggerId });
 
-      await until(() => runSends.length - before >= 1);
+      await eventually(() => runSends.length - before >= 1, (ok) => ok, { label: "durable effect" });
       expect(runSends.length - before).toBe(1);
       expect(runSends[runSends.length - 1]).toEqual({ key: triggerId, parameter: { triggerId } });
     },
@@ -105,7 +93,7 @@ describe("KgRepo durable single-flight lock", () => {
       const third = await trigger(env.baseUrl(), key);
       expect(third).toEqual({ status: "refresh-in-progress", triggerId });
 
-      await until(() => runSends.length - before >= 1);
+      await eventually(() => runSends.length - before >= 1, (ok) => ok, { label: "durable effect" });
       expect(runSends.length - before).toBe(1);
     },
   );
@@ -123,7 +111,7 @@ describe("KgRepo durable single-flight lock", () => {
       await callObject(env.baseUrl(), "KgRepo", key, "release", { triggerId: "not-the-right-id" });
       const stillInFlight = await trigger(env.baseUrl(), key);
       expect(stillInFlight).toEqual({ status: "refresh-in-progress", triggerId });
-      await until(() => runSends.length - before >= 1);
+      await eventually(() => runSends.length - before >= 1, (ok) => ok, { label: "durable effect" });
       expect(runSends.length - before).toBe(1);
 
       await callObject(env.baseUrl(), "KgRepo", key, "release", { triggerId });
@@ -133,7 +121,7 @@ describe("KgRepo durable single-flight lock", () => {
       const next = await trigger(env.baseUrl(), key);
       const nextTriggerId = (next as { triggerId: string }).triggerId;
       expect(nextTriggerId).not.toBe(triggerId);
-      await until(() => runSends.length - before >= 2);
+      await eventually(() => runSends.length - before >= 2, (ok) => ok, { label: "durable effect" });
       expect(runSends.length - before).toBe(2);
     },
   );
@@ -148,7 +136,7 @@ describe("KgRepo durable single-flight lock", () => {
       const first = await trigger(env.baseUrl(), key);
       const triggerId = (first as { triggerId: string }).triggerId;
 
-      await new Promise((resolve) => setTimeout(resolve, MARKER_AGE_WAIT_MS));
+      await settle(MARKER_AGE_WAIT_MS);
       expect(await trigger(env.baseUrl(), key)).toEqual({ status: "refresh-in-progress", triggerId });
 
       await callObject(env.baseUrl(), "KgRepo", key, "expire", { triggerId: "not-the-right-id" });
@@ -164,7 +152,7 @@ describe("KgRepo durable single-flight lock", () => {
       expect(await callObject(env.baseUrl(), "KgRepo", key, "status", {})).toBeNull();
       const next = await trigger(env.baseUrl(), key);
       expect((next as { triggerId: string }).triggerId).not.toBe(triggerId);
-      await until(() => runSends.length - before >= 2);
+      await eventually(() => runSends.length - before >= 2, (ok) => ok, { label: "durable effect" });
       expect(runSends.length - before).toBe(2);
     },
     30_000,
@@ -199,7 +187,7 @@ describe("KgRepo durable single-flight lock", () => {
       expect(result).toEqual({ triggerId: expect.any(String) });
       const triggerId = (result as { triggerId: string }).triggerId;
 
-      await until(() => runSends.length - before >= 1);
+      await eventually(() => runSends.length - before >= 1, (ok) => ok, { label: "durable effect" });
       expect(runSends.length - before).toBe(1);
       expect(runSends[runSends.length - 1]).toEqual({
         key: triggerId,
@@ -217,14 +205,14 @@ describe("KgRepo durable single-flight lock", () => {
 
       const first = await trigger(env.baseUrl(), slug);
       const triggerId = (first as { triggerId: string }).triggerId;
-      await until(() => runSends.length - before >= 1);
+      await eventually(() => runSends.length - before >= 1, (ok) => ok, { label: "durable effect" });
 
       expect(await enqueue(env.baseUrl(), slug, 5, "old")).toEqual({ queued: true });
       expect(await enqueue(env.baseUrl(), slug, 5, "new")).toEqual({ queued: true });
       expect((await repoStatus(env.baseUrl(), slug))?.pending).toEqual(["org/kg-source#5"]);
 
       await release(env.baseUrl(), slug, triggerId);
-      await until(() => runSends.length - before >= 2);
+      await eventually(() => runSends.length - before >= 2, (ok) => ok, { label: "durable effect" });
       expect(runSends.length - before).toBe(2);
       const head = runSends[runSends.length - 1].parameter;
       expect(head).toMatchObject({ dryRun: true, kgSourceRef: "new", report: reportFor(5, "sha-new") });
@@ -242,7 +230,7 @@ describe("KgRepo durable single-flight lock", () => {
       const before = runSends.length;
 
       const first = await trigger(env.baseUrl(), slug);
-      await until(() => runSends.length - before >= 1);
+      await eventually(() => runSends.length - before >= 1, (ok) => ok, { label: "durable effect" });
       await enqueue(env.baseUrl(), slug, 1, "a");
       await enqueue(env.baseUrl(), slug, 2, "b");
 
@@ -251,17 +239,17 @@ describe("KgRepo durable single-flight lock", () => {
       expect((await repoStatus(env.baseUrl(), slug))?.pending).toEqual(["org/kg-source#1", "org/kg-source#2"]);
 
       await release(env.baseUrl(), slug, (first as { triggerId: string }).triggerId);
-      await until(() => runSends.length - before >= 2);
+      await eventually(() => runSends.length - before >= 2, (ok) => ok, { label: "durable effect" });
       const second = runSends[runSends.length - 1].parameter;
       expect(second.kgSourceRef).toBe("a");
 
       await release(env.baseUrl(), slug, second.triggerId);
-      await until(() => runSends.length - before >= 3);
+      await eventually(() => runSends.length - before >= 3, (ok) => ok, { label: "durable effect" });
       const third = runSends[runSends.length - 1].parameter;
       expect(third.kgSourceRef).toBe("b");
 
       await release(env.baseUrl(), slug, third.triggerId);
-      await new Promise((resolve) => setTimeout(resolve, 500));
+      await settle(500);
       expect(runSends.length - before).toBe(3);
       expect(await repoStatus(env.baseUrl(), slug)).toBeNull();
     },
@@ -308,8 +296,8 @@ describe("KgRepo durable single-flight lock", () => {
       const first = await post();
       const second = await post();
       expect(second).toEqual(first);
-      await until(() => runSends.length - before >= 1);
-      await new Promise((resolve) => setTimeout(resolve, 300));
+      await eventually(() => runSends.length - before >= 1, (ok) => ok, { label: "durable effect" });
+      await settle(300);
       expect(runSends.length - before).toBe(1);
 
       // The same key while busy: a redelivery adds no second entry either.
@@ -352,7 +340,7 @@ describe("KgRepo durable single-flight lock", () => {
       const result = await callObject<{ triggerId: string }>(env.baseUrl(), "KgRepo", newKey(), "trigger", {
         acceptNewBaseline: true, kgSourceRef: "x",
       });
-      await until(() => runSends.length - before >= 1);
+      await eventually(() => runSends.length - before >= 1, (ok) => ok, { label: "durable effect" });
       expect(runSends[runSends.length - 1]).toEqual({
         key: result.triggerId,
         parameter: { acceptNewBaseline: true, kgSourceRef: "x", triggerId: result.triggerId },
@@ -386,7 +374,7 @@ describe("KgRepo durable single-flight lock", () => {
       await enqueue(env.baseUrl(), slug, 2, "second");
 
       await callObject(env.baseUrl(), "KgRepo", slug, "expire", { triggerId });
-      await until(() => runSends.length - before >= 2);
+      await eventually(() => runSends.length - before >= 2, (ok) => ok, { label: "durable effect" });
       expect(runSends[runSends.length - 1].parameter).toMatchObject({ kgSourceRef: "first" });
       expect((await repoStatus(env.baseUrl(), slug))?.pending).toEqual(["org/kg-source#2"]);
     },
@@ -424,13 +412,6 @@ describe("KgRepo object-owned lease expiry", () => {
   const slugOf = () => `buildDownAI/kg-source-${randomUUID()}`;
   const markerOf = (env: RestateTestEnvironment, slug: string) =>
     callObject<{ triggerId: string } | null>(env.baseUrl(), "KgRepo", slug, "status", {});
-  async function untilAsync(predicate: () => Promise<boolean>, timeoutMs = 15_000): Promise<void> {
-    const stop = Date.now() + timeoutMs;
-    while (!(await predicate())) {
-      if (Date.now() > stop) throw new Error("timed out");
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-  }
 
   it.each(VARIANTS.map(([label]) => label))(
     "trigger records one delayed expire self-send (%s)",
@@ -438,20 +419,12 @@ describe("KgRepo object-owned lease expiry", () => {
       const env = pick(production, label);
       const slug = slugOf();
       await callObject(env.baseUrl(), "KgRepo", slug, "trigger", {});
-      const expireRows = async (): Promise<Array<Record<string, unknown>>> => {
-        const response = await fetch(`${env.adminAPIBaseUrl()}/query`, {
-          method: "POST",
-          headers: { "content-type": "application/json", accept: "application/json" },
-          body: JSON.stringify({
-            query: `SELECT * FROM sys_invocation WHERE target_service_name = 'KgRepo' AND target_service_key = '${slug}' AND target_handler_name = 'expire'`,
-          }),
-        });
-        return ((await response.json()) as { rows: Array<Record<string, unknown>> }).rows;
-      };
       // The scheduled send is not always visible in sys_invocation the moment trigger returns.
-      await untilAsync(async () => (await expireRows()).length >= 1, 30_000);
-      const rows = await expireRows();
-      expect(rows).toHaveLength(1);
+      const rows = await eventually(
+        () => queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'KgRepo' AND target_service_key = '${slug}' AND target_handler_name = 'expire'`),
+        (found) => found.length === 1,
+        { label: "one scheduled KgRepo.expire", timeoutMs: 30_000 },
+      );
       const delay = Date.parse(String(rows[0].scheduled_start_at)) - Date.parse(String(rows[0].created_at));
       expect(Math.abs(delay - (KG_REFRESH_TOTAL_DEADLINE_MS + KG_REPO_STALE_MARGIN_MS))).toBeLessThan(5_000);
     },
@@ -464,7 +437,7 @@ describe("KgRepo object-owned lease expiry", () => {
       const env = pick(short, label);
       const slug = slugOf();
       await callObject(env.baseUrl(), "KgRepo", slug, "trigger", {});
-      await untilAsync(async () => (await markerOf(env, slug)) === null);
+      await eventually(() => markerOf(env, slug), (marker) => marker === null, { label: "KgRepo marker cleared", timeoutMs: 15_000, intervalMs: 50 });
     },
     30_000,
   );
@@ -478,12 +451,12 @@ describe("KgRepo object-owned lease expiry", () => {
       const { triggerId } = await callObject<{ triggerId: string }>(env.baseUrl(), "KgRepo", slug, "trigger", {});
       await callObject(env.baseUrl(), "KgRepo", slug, "release", { triggerId });
       // Stagger the second lease so the first expire fires while the second marker is still live.
-      await new Promise((resolve) => setTimeout(resolve, 400));
+      await settle(400);
       const next = await callObject<{ triggerId: string }>(env.baseUrl(), "KgRepo", slug, "trigger", {});
       expect(next.triggerId).not.toBe(triggerId);
       // Wait past the first lease's expire (startedAt + 800 ms) but before the second's (>= startedAt + 1200 ms).
       const wait = startedAt + SHORT_TOTAL_MS + SHORT_MARGIN_MS + 200 - Date.now();
-      await new Promise((resolve) => setTimeout(resolve, Math.max(wait, 0)));
+      await settle(Math.max(wait, 0));
       expect(Date.now()).toBeLessThan(startedAt + SHORT_TOTAL_MS + SHORT_MARGIN_MS + 400);
       expect((await markerOf(env, slug))?.triggerId).toBe(next.triggerId);
     },
