@@ -628,6 +628,10 @@ describe("protocol driver seam (AII-1001)", () => {
       "-c", 'approval_policy="never"',
       "-c", 'sandbox_mode="read-only"',
       "-c", "features.shell_tool=false",
+      "-c", "features.view_image=false",
+      "-c", "features.multi_agent=false",
+      "-c", "features.goals=false",
+      "-c", "features.unified_exec=false",
       "-c", 'web_search="disabled"',
     ]);
     expect(log[0].args).not.toContain("exec");

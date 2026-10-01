@@ -402,6 +402,14 @@ export class CodexExecutor implements LLMExecutor {
       "-c",
       "features.shell_tool=false",
       "-c",
+      "features.view_image=false",
+      "-c",
+      "features.multi_agent=false",
+      "-c",
+      "features.goals=false",
+      "-c",
+      "features.unified_exec=false",
+      "-c",
       'web_search="disabled"',
     ];
   }
