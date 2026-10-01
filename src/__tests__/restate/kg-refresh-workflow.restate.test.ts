@@ -79,6 +79,8 @@ interface RunScenario {
   cancelCalls: number;
   runStatusSequence: Array<{ status: string; conclusion: string | null }>;
   findByTitleResult: { runId: number } | null;
+  /** Holds the first title lookup this long, so the deadline passes inside one loop iteration. */
+  firstFindByTitleDelayMs?: number;
 }
 
 describe("KgRefresh durable workflow", () => {
@@ -300,6 +302,9 @@ describe("KgRefresh durable workflow", () => {
     const scenario = triggerId ? scenarios.get(triggerId) : undefined;
     if (!scenario) throw new Error(`no scenario registered for title "${title}"`);
     scenario.findByTitleCalls++;
+    if (scenario.findByTitleCalls === 1 && scenario.firstFindByTitleDelayMs) {
+      await new Promise((resolve) => setTimeout(resolve, scenario.firstFindByTitleDelayMs)); // restate-test-allow: fake dependency simulating a slow call
+    }
     if (scenario.findByTitleResult) {
       scenario.runId = scenario.findByTitleResult.runId;
       runIdIndex.set(scenario.findByTitleResult.runId, triggerId!);
@@ -317,7 +322,10 @@ describe("KgRefresh durable workflow", () => {
     runWatches.delete(runId);
   }
 
+  let cancelTerminalFailure = false;
+
   async function cancelWorkflowRunFn(runId: number): Promise<boolean> {
+    if (cancelTerminalFailure) throw new restate.TerminalError("forced cancel failure");
     const triggerId = runIdIndex.get(runId);
     const scenario = triggerId ? scenarios.get(triggerId) : undefined;
     if (scenario) scenario.cancelCalls++;
@@ -385,6 +393,11 @@ describe("KgRefresh durable workflow", () => {
     return callObject(baseUrl, "KgRepo", KG_SOURCE_REPO, "status", {});
   }
 
+  /** `triggerViaKgRepo` starts the workflow by a one-way send; attach answers 404 until it is delivered. */
+  async function workflowDispatched(triggerId: string): Promise<void> {
+    await eventually(() => scenarios.get(triggerId)!.dispatchCalls >= 1, (ok) => ok, { label: "workflow started" });
+  }
+
   let envs: Map<string, RestateTestEnvironment>;
   beforeAll(async () => {
     envs = await startVariants([workflow, kgRepo, starter]);
@@ -444,6 +457,7 @@ describe("KgRefresh durable workflow", () => {
       const beforeMinted = mintedDispatchIds.length;
       const beforeJobLog = appendJobLogCalls.length;
 
+      await workflowDispatched(triggerId);
       const done = attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
       await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
       await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
@@ -484,6 +498,7 @@ describe("KgRefresh durable workflow", () => {
       // (via attach) so it neither dangles past this test nor pollutes a later test's
       // "before" counters with an out-of-band dispatch/persist/outcome/release.
       makeScenario(retriggerId, { dispatchOutcome: "rejected", executionMode: "fly-machines" });
+      await workflowDispatched(retriggerId);
       await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", retriggerId);
       await eventually(() => kgRepoStatus(env.baseUrl()), (marker) => marker === null, { label: "KgRepo marker cleared" });
     },
@@ -550,6 +565,7 @@ describe("KgRefresh durable workflow", () => {
       const beforeMaterialize = materializeCallCount;
       const beforeRestart = restartCallCount;
 
+      await workflowDispatched(triggerId);
       const done = attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
       await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
       await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
@@ -743,6 +759,7 @@ describe("KgRefresh durable workflow", () => {
       const triggerId = (triggered as { triggerId: string }).triggerId;
       makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
 
+      await workflowDispatched(triggerId);
       const outcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
 
       expect(outcome.ok).toBe(false);
@@ -1108,6 +1125,7 @@ describe("KgRefresh durable workflow", () => {
 
       const beforeOutcome = onOutcomeCalls.length;
 
+      await workflowDispatched(triggerId);
       const done = attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
       await eventually(() => scenarios.get(triggerId)!.runStatusCalls >= 1, (ok) => ok, { label: "durable effect" });
       await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "cancel", { reason: "operator requested" });
@@ -1123,6 +1141,192 @@ describe("KgRefresh durable workflow", () => {
       expect(onOutcomeCalls.length - beforeOutcome).toBe(0);
       await eventually(() => kgRepoStatus(env.baseUrl()), (marker) => marker === null, { label: "KgRepo marker cleared" });
       void outcome;
+    },
+    15_000,
+  );
+
+  // ---- AII-1010: failure paths stop the run, keep a reported result, and give a dry-run a verdict ----
+  it.each(VARIANTS.map(([label]) => label))(
+    "AII-1010: a total timeout with a known run id cancels that run once, ends timed_out and releases the lock (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const triggered = await triggerViaKgRepo(env.baseUrl());
+      const triggerId = (triggered as { triggerId: string }).triggerId;
+      const runId = runIdCounter++;
+      makeScenario(triggerId, { dispatchOutcome: "accepted", runId, executionMode: "github-actions" });
+      const beforePersist = persistCalls.length;
+      const beforeOutcome = onOutcomeCalls.length;
+
+      await workflowDispatched(triggerId);
+      const done = attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "progress", {});
+      const outcome = await done;
+
+      expect(outcome.ok).toBe(false);
+      expect(scenarios.get(triggerId)!.cancelCalls).toBe(1);
+      expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "timed_out", conclusion: "timed_out" });
+      // A real (non-dry-run) timeout still persists and notifies.
+      expect(persistCalls.length - beforePersist).toBe(1);
+      expect(onOutcomeCalls.length - beforeOutcome).toBe(1);
+      await eventually(() => kgRepoStatus(env.baseUrl()), (marker) => marker === null, { label: "KgRepo marker cleared" });
+    },
+    15_000,
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "AII-1010: a terminal failure of the timeout's cancel call does not change the outcome (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "github-actions" });
+      const beforeOutcome = onOutcomeCalls.length;
+      cancelTerminalFailure = true;
+      try {
+        const done = runWorkflow(env.baseUrl(), triggerId);
+        await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "progress", {});
+        const outcome = await done;
+        expect(outcome.ok).toBe(false);
+        expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "timed_out", conclusion: "timed_out" });
+        expect(onOutcomeCalls.length - beforeOutcome).toBe(1);
+      } finally {
+        cancelTerminalFailure = false;
+      }
+    },
+    15_000,
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "AII-1010: a report that is already there is taken as the result, not recorded as a timeout (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+      const done = runWorkflow(env.baseUrl(), triggerId, { dryRun: true });
+      await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", { ok: true });
+      const outcome = await done;
+      expect(outcome.ok).toBe(true);
+      expect(closeRowCalls[closeRowCalls.length - 1].status).toBe("completed");
+    },
+    15_000,
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "AII-1010: a report resolved while the bootstrap deadline passes wins over bootstrap_timeout (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, {
+        dispatchOutcome: "unknown", runId: undefined, executionMode: "github-actions", findByTitleResult: null,
+        firstFindByTitleDelayMs: BOOTSTRAP_DEADLINE_MS + 500,
+      });
+      const done = runWorkflow(env.baseUrl(), triggerId, { dryRun: true });
+      await eventually(() => scenarios.get(triggerId)!.findByTitleCalls >= 1, (ok) => ok, { label: "durable effect" });
+      // The deadline expires while this lookup is held; the next deadline check finds the report already resolved.
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", { ok: true });
+      const outcome = await done;
+      expect(outcome.ok).toBe(true);
+      expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "completed" });
+      expect(closeRowCalls[closeRowCalls.length - 1].conclusion).not.toBe("bootstrap_timeout");
+    },
+    15_000,
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "AII-1010: progress resolved while the bootstrap deadline passes continues the wait instead of bootstrap_timeout (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, {
+        dispatchOutcome: "unknown", runId: undefined, executionMode: "github-actions", findByTitleResult: null,
+        firstFindByTitleDelayMs: BOOTSTRAP_DEADLINE_MS + 500,
+      });
+      const done = runWorkflow(env.baseUrl(), triggerId, { dryRun: true });
+      await eventually(() => scenarios.get(triggerId)!.findByTitleCalls >= 1, (ok) => ok, { label: "durable effect" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "progress", {});
+      // A second reconcile means the loop went on past the expired bootstrap deadline.
+      await eventually(() => scenarios.get(triggerId)!.findByTitleCalls >= 2, (ok) => ok, { label: "durable effect" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", { ok: true });
+      const outcome = await done;
+      expect(outcome.ok).toBe(true);
+      expect(closeRowCalls[closeRowCalls.length - 1].conclusion).not.toBe("bootstrap_timeout");
+    },
+    15_000,
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "AII-1010: cancel with a run found only by reconcile cancels that run once (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      const runId = runIdCounter++;
+      makeScenario(triggerId, {
+        dispatchOutcome: "accepted", executionMode: "github-actions",
+        runStatusSequence: [{ status: "in_progress", conclusion: null }, { status: "completed", conclusion: "cancelled" }],
+      });
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      await eventually(() => scenarios.get(triggerId)!.findByTitleCalls >= 1, (ok) => ok, { label: "durable effect" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "cancel", { reason: "operator requested" });
+      await eventually(
+        () => callWorkflow<{ step: string | null }>(env.baseUrl(), "KgRefresh", triggerId, "status"),
+        (st) => st.step === "cancelling",
+        { label: "cancel branch entered" },
+      );
+      expect(scenarios.get(triggerId)!.cancelCalls).toBe(0);
+      scenarios.get(triggerId)!.findByTitleResult = { runId };
+      await done;
+      expect(scenarios.get(triggerId)!.cancelCalls).toBe(1);
+      expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("operator_cancelled");
+    },
+    15_000,
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "AII-1010: cancel with no run ever found completes within the bootstrap window, not the total deadline (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, { dispatchOutcome: "accepted", executionMode: "github-actions" });
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "cancel", { reason: "operator requested" });
+      const started = Date.now();
+      await done;
+      expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("operator_cancelled");
+      expect(scenarios.get(triggerId)!.cancelCalls).toBe(0);
+      // Bounded by cancel time + BOOTSTRAP_DEADLINE_MS (1s); the total deadline is 2.6s after dispatch.
+      expect(Date.now() - started).toBeLessThan(TOTAL_DEADLINE_MS);
+    },
+    15_000,
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "AII-1010: a dry-run with a report target that ends by bootstrap_timeout gets a failure verdict and no persist or notify (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+      const report = { repo: KG_SOURCE_REPO, prNumber: 11, sha: "b".repeat(40) };
+      const beforePersist = persistCalls.length;
+      const beforeOutcome = onOutcomeCalls.length;
+      const beforeStatus = setCommitStatusFn.mock.calls.length;
+
+      const outcome = await (await runWorkflow(env.baseUrl(), triggerId, { dryRun: true, report }));
+
+      expect(outcome.ok).toBe(false);
+      expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "timed_out", conclusion: "bootstrap_timeout" });
+      expect(setCommitStatusFn.mock.calls.length - beforeStatus).toBe(1);
+      expect((setCommitStatusFn.mock.calls[beforeStatus] as unknown[])[4]).toMatchObject({ state: "failure" });
+      const stored = await eventually(
+        () => callObject<{ sha: string; outcome: RefreshOutcome } | null>(env.baseUrl(), "KgRepo", KG_SOURCE_REPO, "dryRunOutcome", { repo: report.repo, prNumber: report.prNumber }),
+        (v) => v !== null,
+        { label: "durable effect" },
+      );
+      expect(stored!.sha).toBe(report.sha);
+      expect(stored!.outcome.ok).toBe(false);
+      expect(persistCalls.length - beforePersist).toBe(0);
+      expect(onOutcomeCalls.length - beforeOutcome).toBe(0);
     },
     15_000,
   );

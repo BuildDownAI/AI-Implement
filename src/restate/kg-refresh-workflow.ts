@@ -265,9 +265,16 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       conclusion: string,
       opts: { timedOut?: boolean; skipOutcome?: boolean } = {},
     ): Promise<RefreshOutcome> {
-      await ctx.run("persist", () => deps.persistLastRefresh(outcome));
+      // A dry-run is not a refresh: it never writes the last-refresh record or notifies the operator.
+      if (!input.dryRun) await ctx.run("persist", () => deps.persistLastRefresh(outcome));
       await ctx.run("close-row", () => deps.closeJobLog(jobId, opts.timedOut ? "timed_out" : "failed", conclusion));
-      if (!opts.skipOutcome) {
+      if (input.dryRun) {
+        if (input.report) {
+          const dryOutcome: RefreshOutcome = { ...outcome, dryRun: true };
+          ctx.objectSendClient<KgRepoDefinition>({ name: "KgRepo" }, deps.kgSourceRepo).recordDryRunOutcome({ report: input.report, outcome: dryOutcome });
+          await ctx.run("dry-run-report", () => postDryRunReport(deps.rail, input.report!, dryOutcome));
+        }
+      } else if (!opts.skipOutcome) {
         await notifyOutcome("failure", outcome);
       }
       return outcome;
@@ -365,6 +372,12 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           const now = await ctx.date.now();
           const deadlineAt = progressSeen ? totalDeadlineAt : bootstrapDeadlineAt;
           if (now >= deadlineAt) {
+            const reportNow = await ctx.promise<KgRefreshReportBody>("report").peek();
+            if (reportNow !== undefined) return { kind: "report", value: reportNow };
+            if (!progressSeen && (await ctx.promise<boolean>("progress").peek()) !== undefined) {
+              progressSeen = true;
+              continue;
+            }
             return progressSeen ? { kind: "total_timeout" } : { kind: "bootstrap_timeout" };
           }
           // Until the awakeable is registered nothing else ends the wait early, so stay on the reconcile cadence.
@@ -398,6 +411,15 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       const waitResult = await waitForOutcome();
 
       if (waitResult.kind === "bootstrap_timeout" || waitResult.kind === "total_timeout") {
+        if (isGha && runId !== undefined) {
+          try {
+            await ctx.run("cancel-run", () => deps.cancelWorkflowRun(runId!), { maxRetryAttempts: 3 });
+          } catch (err) {
+            if (restate.internal.isSuspendedError(err)) throw err;
+            if (!(err instanceof restate.TerminalError) || err.code === 409) throw err;
+            ctx.console.error(`[KgRefresh] cancelling run ${runId} after timeout failed for ${triggerId}: ${err.message}`);
+          }
+        }
         ctx.set("step", "failed");
         const at = await ctx.date.now();
         const code = waitResult.kind === "bootstrap_timeout" ? "bootstrap_timeout" : "timed_out";
@@ -424,12 +446,17 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         if (isGha) {
           let watchIndex = 0;
           let reconcileIndex = 0;
+          const cancelAt = await ctx.date.now();
+          // With no run id the wait is bounded by the bootstrap window rather than the total deadline.
+          const noRunDeadlineAt = Math.min(totalDeadlineAt, cancelAt + bootstrapDeadlineMs);
           for (;;) {
             if (runId === undefined) {
               const found = await ctx.run(`reconcile-cancel-${reconcileIndex++}`, () => deps.findRunByTitle(issueIdentifier));
               if (found) {
                 runId = found.runId;
                 ctx.set("runId", runId);
+                const foundId = runId;
+                await ctx.run("cancel-run-found", () => deps.cancelWorkflowRun(foundId));
                 continue;
               }
             } else {
@@ -437,7 +464,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
               if (status.status === "completed") break;
             }
             const now = await ctx.date.now();
-            if (now >= totalDeadlineAt) break;
+            if (now >= (runId === undefined ? noRunDeadlineAt : totalDeadlineAt)) break;
             await ctx.sleep(cancelWatchIntervalMs);
           }
         }

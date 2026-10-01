@@ -350,7 +350,7 @@ The workflow waits on a race of durable promises and timers: `report`, `cancel`,
 | Bootstrap | 10 min (`KG_REFRESH_BOOTSTRAP_DEADLINE_MS`) | dispatch, until the first `progress` heartbeat | `bootstrap_timeout` |
 | Total | 4 h (`KG_REFRESH_TOTAL_DEADLINE_MS`) | dispatch, until the `report` | `timed_out` |
 
-A `progress` heartbeat from the runner moves the workflow from the bootstrap deadline to the total deadline. Both expiries close the row as `timed_out` and notify with "KG Refresh hit the time limit." (§8).
+A `progress` heartbeat from the runner moves the workflow from the bootstrap deadline to the total deadline. Both expiries close the row as `timed_out` and notify with "KG Refresh hit the time limit." (§8). Before it gives up, the wait takes a `report` that is already resolved (and, for the bootstrap deadline, a `progress` that is) over the timeout, and on GitHub Actions a timeout with a known run id cancels that run (`cancel-run`, bounded to three attempts, a failure only logged) so the lock does not open beside a live run.
 
 On the GitHub Actions backend the workflow also **watches the run itself**, and the watch is event-driven: once the run id is known it creates an awakeable and journals `(runId → awakeable id)` in a `register-run-watch` step (a `kg-refresh-run-watch:<runId>` row in `settings`). The orchestrator's `workflow_run` webhook (`src/webhook.ts`) looks the row up on a `completed` delivery, resolves the awakeable over the loopback ingress with the delivery id as idempotency key, and deletes the row; the awakeable is a fourth arm of the wait race. The poll remains as a **backstop** for a lost or unsubscribed webhook: every tick (`KG_REFRESH_WATCH_INTERVAL_MS`, 10 min, about 24 per 4 h run) it reads the run's status inside a `watch-N` step, or reconciles the run by title inside a `reconcile-N` step while no run id is known. A run that concludes with no report in hand ends as `dispatch_lost` and carries the GitHub conclusion in its detail. No reaper rule and no monitor module exist for this run kind, and the only settings-backed state is that transient run-watch row, deleted when the webhook resolves the awakeable (if the webhook never arrives the row stays, a few bytes, and the backstop poll still ends the run); the stuck-watchdog and reaper skip kg-refresh rows (below).
 
@@ -360,24 +360,24 @@ The runner's result callback reaches `KgRefresh.report` (§5, Callback). The fir
 
 | Report | Result |
 |---|---|
-| dry run (`dryRun` on the trigger) | `dry-run-report`, then `closed`; nothing is merged and the served graph is untouched |
+| dry run (`dryRun` on the trigger) | `dry-run-report`, then `closed`; nothing is merged and the served graph is untouched. A dry run that fails before a report (rejected dispatch, timeout, lost run, cancel, workflow error) still records and posts a failure verdict for its PR, and writes neither the last-refresh record nor the operator notification |
 | `KG_SNAPSHOT_STALE` | `no-new-data`, a success outcome |
 | failure, or no `snapshotPr` / `snapshotCommit` | `failed`; a reported `snapshotPr` is closed unmerged and its branch deleted |
 | success with a snapshot | `merge` (merge commit, never squash), `delete-branch`, then the four rail gates |
 
 ### The rail is a saga
 
-After the merge, `fetch`, `stage`, `swap`, and `verify` each run as one `ctx.run`. A gate that fails throws a terminal error carrying the gate name; the workflow runs `revert` as the compensation and ends as `failed` with that gate. If `fetch` finds the served snapshot already current, the run ends as `no-new-data` without staging. Replay resumes at the gate that did not finish, never at one that did, and the workflow's `step` names the gate in flight. Every terminal path runs `persist` (the last-refresh outcome, SQLite), `close-row`, and `outcome` (the notification and the report-issue comment, §8), and ends by sending `release` to `KgRepo`, which clears the marker only when the trigger id matches.
+After the merge, `fetch`, `stage`, `swap`, and `verify` each run as one `ctx.run`. A gate that fails throws a terminal error carrying the gate name; the workflow runs `revert` as the compensation and ends as `failed` with that gate. If `fetch` finds the served snapshot already current, the run ends as `no-new-data` without staging. Replay resumes at the gate that did not finish, never at one that did, and the workflow's `step` names the gate in flight. Every terminal path of a real refresh runs `persist` (the last-refresh outcome, SQLite), `close-row`, and `outcome` (the notification and the report-issue comment, §8), and ends by sending `release` to `KgRepo`, which clears the marker only when the trigger id matches.
 
 ### Cancel
 
-`cancel` resolves the workflow's `cancel` promise and revokes nothing by itself. The workflow sets `step = cancelling`, asks the backend to cancel the run (`cancel-run`), and on GitHub Actions keeps watching until the run concludes. It holds the marker until then, so a new refresh cannot start beside a run that is still going. The run ends with `conclusion = operator_cancelled`, which suppresses the failure notification.
+`cancel` resolves the workflow's `cancel` promise and revokes nothing by itself. The workflow sets `step = cancelling`, asks the backend to cancel the run (`cancel-run`), and on GitHub Actions keeps watching until the run concludes; a run that only the reconcile finds is cancelled once when found, and while no run id is known the wait ends at the earlier of the total deadline and the cancel time plus the bootstrap deadline. It holds the marker until then, so a new refresh cannot start beside a run that is still going. The run ends with `conclusion = operator_cancelled`, which suppresses the failure notification.
 
 ### Replay and crash recovery
 
 Restate re-delivers an invocation whose attempt died and replays the journal, so a restart mid-run resumes at the step that did not finish instead of dispatching a second runner. No boot-time recovery of a settings-backed stage exists. The one boot step is a one-shot sweep of rows left by the previous owner: if the old stage settings key is present, every in-flight kg-refresh row is closed `timed_out` and the key deleted. The workflow, journal, and idempotency retention is 7 days (`KG_REFRESH_RETENTION_MS`).
 
-The last refresh outcome is persisted under the `kg_refresh_last_refresh` settings key on every terminal outcome (success, no-new-data, failure) and survives restarts.
+The last refresh outcome is persisted under the `kg_refresh_last_refresh` settings key on every terminal outcome of a real refresh (success, no-new-data, failure), never for a dry-run, and survives restarts.
 
 **Token validation survives restarts** because `verifyAndConsumeRunToken` and `verifyRunToken` are DB-only — they read `runner_tokens` rows written at dispatch time.
 
