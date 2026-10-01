@@ -1225,6 +1225,23 @@ describe("buildEnvelopeDispatchInputs — private transport (AII-983)", () => {
     expect(decodeTrustedRunConfig(inputs.run_config!).credentials).toMatchObject({ resultToken: "rt", attemptToken: "at" });
   });
 
+  it.each(["planning", "kg-refresh"] as const)("%s drops a supplied publicationToken and supplied bearers", (runnerPhase) => {
+    const inputs = buildEnvelopeDispatchInputs(makeMapping(), baseIssue, {
+      runnerPhase, runToken: "rt", retryPolicy: null, privateTransport: true,
+      credentials: { version: 1, publicationToken: "supplied-pub", resultToken: "supplied-res", progressToken: "supplied-prog", attemptToken: "at" },
+    });
+    expect(decodeTrustedRunConfig(inputs.run_config!).credentials).toEqual({ version: 1, resultToken: "rt", attemptToken: "at" });
+    expect(JSON.stringify(inputs)).not.toMatch(/supplied-/);
+  });
+
+  it("implementation: minted bearers stay authoritative over supplied ones", () => {
+    const inputs = buildEnvelopeDispatchInputs(makeMapping(), baseIssue, {
+      ...impl, privateTransport: true,
+      credentials: { version: 1, publicationToken: "supplied-pub", resultToken: "supplied-res", progressToken: "supplied-prog" },
+    });
+    expect(decodeTrustedRunConfig(inputs.run_config!).credentials).toEqual({ version: 1, resultToken: "rt", progressToken: "rp", publicationToken: "rpub" });
+  });
+
   it("private retry sends two requests with byte-identical run_config and no bearer inputs", async () => {
     const inputs = buildEnvelopeDispatchInputs(makeMapping(), baseIssue, { ...impl, privateTransport: true });
     const fetchMock = vi.fn()
@@ -1255,5 +1272,17 @@ describe("buildPrivateKgRefreshGhaDispatchBody (AII-983)", () => {
     expect(decodeRunConfig(body.run_config!).issue.identifier).toBe("KG-1");
     expect(body.run_token).toBe("");
     expect("run_progress_token" in body).toBe(false);
+  });
+
+  it("discards supplied publication/result/progress tokens, keeping grant-class fields and minted bearers", () => {
+    const trustedConfig = {
+      v: 1 as const, issue: { id: "i", identifier: "KG-1", title: "t", description: "d" }, runnerPhase: "kg-refresh" as const,
+      credentials: { version: 1 as const, publicationToken: "supplied-pub", resultToken: "supplied-res", progressToken: "supplied-prog", attemptToken: "at" },
+    };
+    const body = buildPrivateKgRefreshGhaDispatchBody({
+      trustedConfig, runConfig: "ignored", runToken: "rt", runProgressToken: "rp", runnerImage: undefined, issueIdentifier: "KG-1",
+    });
+    expect(decodeTrustedRunConfig(body.run_config!).credentials).toEqual({ version: 1, attemptToken: "at", resultToken: "rt", progressToken: "rp" });
+    expect(JSON.stringify(body)).not.toMatch(/supplied-/);
   });
 });

@@ -410,9 +410,10 @@ export interface EnvelopeDispatchOpts {
    *  encoder) and are NOT duplicated as top-level inputs; `run_token` is sent as "". Absent/false
    *  keeps the generic envelope plus masked top-level token inputs. */
   privateTransport?: boolean;
-  /** Extra typed private credentials (e.g. a model-auth grant), merged over the bearers derived
-   *  from the token options. Requires `privateTransport: true`; supplying it without capability
-   *  throws rather than dropping or downgrading it. */
+  /** Extra typed private credentials. Only `modelAuthGrant` and `attemptToken` are carried; supplied
+   *  result/progress/publication bearers are ignored in favour of the minted token options.
+   *  Requires `privateTransport: true`; supplying it without capability throws rather than
+   *  dropping or downgrading it. */
   credentials?: RunCredentialsV1;
   runnerImage?: string | null;
   prNumber?: string;
@@ -453,6 +454,15 @@ export function assertPrivateTransportForCredentials(
   }
 }
 
+/** Only the non-callback private fields a caller may supply. Result/progress/publication bearers are
+ *  orchestrator-minted and phase-scoped, so a supplied copy is never carried over. */
+function suppliedNonBearerCredentials(credentials: RunCredentialsV1 | undefined): Partial<RunCredentialsV1> {
+  return {
+    ...(credentials?.attemptToken !== undefined ? { attemptToken: credentials.attemptToken } : {}),
+    ...(credentials?.modelAuthGrant !== undefined ? { modelAuthGrant: credentials.modelAuthGrant } : {}),
+  };
+}
+
 export function buildEnvelopeDispatchInputs(
   mapping: RepoMapping,
   issue: { id: string; identifier: string; title: string; description?: string | null; profiles?: string[]; assigneeName?: string },
@@ -471,7 +481,7 @@ export function buildEnvelopeDispatchInputs(
         ...(opts.runToken ? { resultToken: opts.runToken } : {}),
         ...(opts.runProgressToken ? { progressToken: opts.runProgressToken } : {}),
         ...(issuesPublication && opts.runPublicationToken ? { publicationToken: opts.runPublicationToken } : {}),
-        ...opts.credentials,
+        ...suppliedNonBearerCredentials(opts.credentials),
       }
     : undefined;
   const runConfig: RunConfigV1 = {
@@ -929,14 +939,15 @@ export function buildKgRefreshGhaDispatchBody(opts: {
 /**
  * Private-transport KG body (AII-983): re-encodes the decoded trusted config with the result and
  * progress bearers inside `credentials` and omits them as top-level inputs. KG never receives a
- * publication token. Any credentials already on the config (e.g. a model-auth grant) are kept.
+ * publication token, and supplied bearers are discarded; only the model-auth grant and attempt
+ * token already on the config are kept.
  */
 export function buildPrivateKgRefreshGhaDispatchBody(
   opts: Parameters<typeof buildKgRefreshGhaDispatchBody>[0] & { trustedConfig: RunConfigV1 },
 ): DispatchInputs {
   const { trustedConfig, ...rest } = opts;
   const credentials: RunCredentialsV1 = {
-    ...trustedConfig.credentials,
+    ...suppliedNonBearerCredentials(trustedConfig.credentials),
     version: 1,
     resultToken: opts.runToken,
     progressToken: opts.runProgressToken,

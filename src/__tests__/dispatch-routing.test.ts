@@ -831,6 +831,28 @@ describe("Fly and local boot tokens are scoped to the target repository (AII-853
         expect(github.postWorkflowDispatch).not.toHaveBeenCalled();
       });
 
+      it("supplied publication/result/progress tokens never survive the private KG dispatch; grant and attempt do", async () => {
+        const probe = await import("../workflow-probe.js");
+        vi.mocked(probe.resolveWorkflowCapabilities).mockReset().mockResolvedValue(caps(true));
+        const { encodeTrustedRunConfig, decodeTrustedRunConfig } = await import("../run-config.js");
+        const runConfig = encodeTrustedRunConfig({
+          v: 1, issue: { id: "kg-refresh", identifier: "KG-REFRESH", title: "KG ingest", description: "" },
+          credentials: {
+            version: 1, publicationToken: "supplied-pub", resultToken: "supplied-res", progressToken: "supplied-prog",
+            attemptToken: "supplied-attempt",
+          },
+        });
+        await indexModule.dispatchKgRefreshRun(kgConfig, { ...kgOpts("github-actions"), runConfig });
+        const inputs = sentInputs();
+        expect(decodeTrustedRunConfig(inputs.run_config!).credentials).toEqual({
+          version: 1, attemptToken: "supplied-attempt", resultToken: "run-token", progressToken: "progress-token",
+        });
+        expect(inputs.run_token).toBe("");
+        expect("run_progress_token" in inputs).toBe(false);
+        expect("run_publication_token" in inputs).toBe(false);
+        expect(JSON.stringify(inputs)).not.toMatch(/supplied-pub|supplied-res|supplied-prog/);
+      });
+
       it("private KG dispatch resends the same body on the shared 422 retry (byte-identical run_config)", async () => {
         const probe = await import("../workflow-probe.js");
         vi.mocked(probe.resolveWorkflowCapabilities).mockReset().mockResolvedValue(caps(true));
@@ -1157,6 +1179,26 @@ describe("dispatchGitHubActions / dispatchPlanning GHA path — result.outcome a
       const creds = decodeTrustedRunConfig(inputs.run_config!).credentials!;
       expect(creds.attemptToken).toBe("private-attempt-secret");
       expect(creds.publicationToken).toBeUndefined();
+    });
+
+    it("planning: a supplied publication/result token is never carried; minted result token and no top-level bearers remain", async () => {
+      const { decodeTrustedRunConfig } = await import("../run-config.js");
+      vi.mocked(workflowProbe.resolveWorkflowCapabilities).mockResolvedValue(caps({ supportsPrivateRunConfig: true }));
+      await indexModule.dispatchPlanning(tokenConfig, provider, issue, mapping, {
+        ...planningCtx,
+        trustedCredentials: { version: 1, publicationToken: "supplied-pub", resultToken: "supplied-res", attemptToken: "private-attempt-secret" },
+      });
+      const inputs = vi.mocked(github.postWorkflowDispatch).mock.calls[0]![0].inputs;
+      const creds = decodeTrustedRunConfig(inputs.run_config!).credentials!;
+      expect(creds.publicationToken).toBeUndefined();
+      expect(creds.progressToken).toBeUndefined();
+      expect(creds.resultToken).toBeTruthy();
+      expect(creds.resultToken).not.toBe("supplied-res");
+      expect(creds.attemptToken).toBe("private-attempt-secret");
+      expect(inputs.run_token).toBe("");
+      expect("run_progress_token" in inputs).toBe(false);
+      expect("run_publication_token" in inputs).toBe(false);
+      expect(JSON.stringify(inputs)).not.toMatch(/supplied-pub|supplied-res/);
     });
 
     it.each([
