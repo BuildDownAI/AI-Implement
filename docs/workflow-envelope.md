@@ -263,6 +263,26 @@ Protected transport fails closed: explicitly supplied private `credentials` (e.g
 
 An absent namespace decodes as the legacy envelope. No writer sets it in this slice; the exact input allowlists, rollout order and rollback are in [ADR 032](adr/032-private-run-envelope-and-credential-bootstrap.md). Statements above that the envelope is "secret-free" describe the generic envelope. `repoProcessEnv`, `modelProcessEnv` and `gitProcessEnv` strip `AI_IMPLEMENT_RUN_CONFIG` and `AI_IMPLEMENT_MODEL_AUTH_*` bootstrap handles.
 
+### Verifying masking in real Actions logs (AII-984)
+
+`workflow-token-masking.test.ts` runs the bootstrap under `sh`, where `::add-mask::` is inert, so it proves delivery and validation but not log masking. `.github/workflows/private-envelope-smoke.yml` (not a synced template; sync never distributes it) proves masking on the real runner. It triggers on `pull_request` into `ai-implement/feature/**`, so a feature PR (including a child PR into `ai-implement/feature/aii-680`) verifies itself with no default-branch deployment. It holds only `contents: read` (verifier also `actions: read`), references no secret, uploads no artifact and makes no model, AWS or tracker call.
+
+| Job | Role | Expected result |
+|---|---|---|
+| `private-envelope-implement` | Canonical `claude-implement.yml` bootstrap; delivers result, progress, publication | `success` |
+| `private-envelope-plan` | Canonical `claude-plan.yml` bootstrap; delivers result, progress only (planning publication exclusion) | `success` |
+| `private-envelope-failure` | Implementation bootstrap, then a deliberately failing trusted consumer | `failure` |
+| `private-envelope-verifier` | Runs after all three (`if: always()`), reads their complete logs | `success` |
+
+`scripts/check-private-envelope-gha-logs.mjs` extracts the `id: bootstrap` run block and the Run step's `steps.bootstrap.outputs.*` env mapping from `workflows/claude-*.yml` at run time (it fails if the step is missing; no jq or mask logic is copied). Each consumer job builds a synthetic event inside the process — encoded `run_config`, result/progress/publication/attempt tokens, a plain grant bearer or sealed grant nonce/ciphertext/tag, and hostile public `run_*` inputs that must be ignored — derived from the run id so the verifier can rebuild them independently. The values never appear in step `env`/`with`/`run` text before the masks register. The bootstrap's stdout goes straight to the runner; the job then prints every value after masking (the log must show `***`), maps the outputs into a trusted consumer env exactly as the Run step does (the header prints masked, the consumer compares exact values and prints fixed `PROOF ...` markers), runs an untrusted step that must see no callback env, no grant promotion, and finally the failing consumer.
+
+The verifier cannot use a running job's own log, so it waits (bounded) for the consumer jobs, requires each `needs.*.result` to equal its expectation (a skipped job or an unexpected success fails), fetches each job's complete log via `actions/jobs/<id>/logs` with bounded retries, and fails on: an unavailable or incomplete log (no cleanup end marker), any raw synthetic value, a missing or out-of-order proof marker, a `MISMATCH` proof, or a missing/duplicate job. Failure messages name labels only, never values. `--self-test` proves each of those paths fails (exposure of every value, truncated/empty/cut logs, each missing marker, wrong or missing consumer proof, skipped/cancelled/missing jobs, wrong conclusion, unbounded retry) and also checks the workflow's shape (triggers, permissions, no secrets or artifacts, trusted env matching the canonical Run step).
+
+Run it locally with `node scripts/check-private-envelope-gha-logs.mjs --self-test` (needs `npm ci`, `jq`, `openssl`). To run it on Actions, open or update a PR targeting `ai-implement/feature/<key>`; the `private-envelope-smoke` workflow starts automatically.
+
+**Evidence required before the parent (AII-680) is completed:** record in the PR description or the parent ticket the actual run URL and attempt, the four job IDs with their conclusions, the verifier's `OK <job> job=<id> ... checkedValues=<n>` lines (also in the run's step summary), and the local `--self-test` result. Source review alone is not evidence. If the end-of-log marker or a log format assumption fails on the first real run, fix the checker; never relax it to pass.
+
+
 ---
 
 ## Probe Semantics and TTL

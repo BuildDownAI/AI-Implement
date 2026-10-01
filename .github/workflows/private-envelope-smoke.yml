@@ -1,0 +1,154 @@
+# Synthetic verification that the private run_config bootstrap's masking holds in REAL
+# GitHub Actions logs (AII-984). Named like unit-tests.yml: this is not a synced template
+# and sync must never distribute it.
+#
+# Consumer jobs run the actual `id: bootstrap` step extracted from workflows/claude-*.yml
+# against synthetic values built inside the test process, then a separate verifier job
+# fetches the COMPLETE logs of the finished jobs and fails on any exposure, missing marker,
+# incomplete log, skipped job or wrong consumer value. Nothing here dispatches a model run,
+# touches credentials or uploads a payload. See docs/workflow-envelope.md.
+#
+# Runs on PRs into ai-implement/feature/** so a feature PR verifies itself without any
+# default-branch deployment.
+name: private-envelope-smoke
+
+on:
+  pull_request:
+    branches: ["ai-implement/feature/**"]
+
+permissions: {}
+
+jobs:
+  implement-consumer:
+    name: private-envelope-implement
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci --ignore-scripts
+      # Real bootstrap shell extracted from the canonical workflow; its mask commands go straight to the runner.
+      - name: Mask runner callback tokens
+        id: bootstrap
+        run: node scripts/check-private-envelope-gha-logs.mjs bootstrap implement
+      - name: Emit synthetic values after masking
+        run: node scripts/check-private-envelope-gha-logs.mjs normal implement
+      - name: Trusted consumer
+        env:
+          RUN_TOKEN: ${{ steps.bootstrap.outputs.run_token }}
+          RUN_PROGRESS_TOKEN: ${{ steps.bootstrap.outputs.run_progress_token }}
+          RUN_PUBLICATION_TOKEN: ${{ steps.bootstrap.outputs.run_publication_token }}
+        run: node scripts/check-private-envelope-gha-logs.mjs consume implement
+      - name: Untrusted intermediate step
+        run: node scripts/check-private-envelope-gha-logs.mjs untrusted implement
+      - name: Boundary marker
+        if: always()
+        run: node scripts/check-private-envelope-gha-logs.mjs end implement
+
+  plan-consumer:
+    name: private-envelope-plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci --ignore-scripts
+      # Real bootstrap shell extracted from the canonical workflow; its mask commands go straight to the runner.
+      - name: Mask runner callback tokens
+        id: bootstrap
+        run: node scripts/check-private-envelope-gha-logs.mjs bootstrap plan
+      - name: Emit synthetic values after masking
+        run: node scripts/check-private-envelope-gha-logs.mjs normal plan
+      - name: Trusted consumer
+        env:
+          RUN_TOKEN: ${{ steps.bootstrap.outputs.run_token }}
+          RUN_PROGRESS_TOKEN: ${{ steps.bootstrap.outputs.run_progress_token }}
+        run: node scripts/check-private-envelope-gha-logs.mjs consume plan
+      - name: Untrusted intermediate step
+        run: node scripts/check-private-envelope-gha-logs.mjs untrusted plan
+      - name: Boundary marker
+        if: always()
+        run: node scripts/check-private-envelope-gha-logs.mjs end plan
+
+  failure-consumer:
+    name: private-envelope-failure
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci --ignore-scripts
+      # Real bootstrap shell extracted from the canonical workflow; its mask commands go straight to the runner.
+      - name: Mask runner callback tokens
+        id: bootstrap
+        run: node scripts/check-private-envelope-gha-logs.mjs bootstrap failure
+      - name: Emit synthetic values after masking
+        run: node scripts/check-private-envelope-gha-logs.mjs normal failure
+      - name: Trusted consumer
+        env:
+          RUN_TOKEN: ${{ steps.bootstrap.outputs.run_token }}
+          RUN_PROGRESS_TOKEN: ${{ steps.bootstrap.outputs.run_progress_token }}
+          RUN_PUBLICATION_TOKEN: ${{ steps.bootstrap.outputs.run_publication_token }}
+        run: node scripts/check-private-envelope-gha-logs.mjs consume failure
+      - name: Untrusted intermediate step
+        run: node scripts/check-private-envelope-gha-logs.mjs untrusted failure
+      - name: Trusted consumer (deliberate failure)
+        env:
+          RUN_TOKEN: ${{ steps.bootstrap.outputs.run_token }}
+          RUN_PROGRESS_TOKEN: ${{ steps.bootstrap.outputs.run_progress_token }}
+          RUN_PUBLICATION_TOKEN: ${{ steps.bootstrap.outputs.run_publication_token }}
+        run: node scripts/check-private-envelope-gha-logs.mjs fail failure
+      - name: Boundary marker
+        if: always()
+        run: node scripts/check-private-envelope-gha-logs.mjs end failure
+
+  # Runs after every consumer finished; its own log is not the evidence, the consumers' are.
+  verifier:
+    name: private-envelope-verifier
+    needs: [implement-consumer, plan-consumer, failure-consumer]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - name: Checker self-tests (exposure, truncation, wrong proof, skipped jobs)
+        run: node scripts/check-private-envelope-gha-logs.mjs --self-test
+      - name: Inspect complete consumer job logs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMPLEMENT_RESULT: ${{ needs.implement-consumer.result }}
+          PLAN_RESULT: ${{ needs.plan-consumer.result }}
+          # Expected to be `failure`: the deliberate-failure boundary.
+          FAILURE_RESULT: ${{ needs.failure-consumer.result }}
+        run: node scripts/check-private-envelope-gha-logs.mjs verify
