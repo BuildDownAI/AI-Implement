@@ -8,8 +8,9 @@
  * ownership reader, and transport gate are all injected.
  *
  * Order per request, failing closed at each step: method/route -> transport gate ->
- * bearer -> persisted grant (audience, expiry, dispatch/snapshot/project/backend) ->
- * bounded body -> shape -> profile in the grant's bindings -> frozen snapshot selection
+ * bearer -> persisted grant (audience, revocation, expiry, dispatch/snapshot/project/backend) ->
+ * bounded body -> the same grant authentication again (the read is asynchronous, so the
+ * grant may have expired or been revoked meanwhile) -> shape -> profile in the grant's bindings -> frozen snapshot selection
  * -> current owner (subscription only) -> store or resolver. Revision, provider, auth
  * mode, and owner generation come from the persisted grant and the frozen snapshot,
  * never from the body.
@@ -20,7 +21,7 @@
  * data never reach a response or the injected logger (which only receives
  * `SafeModelAuthDiagnostic`).
  *
- * The deadline bounds reading the body. Everything after it is synchronous, so a
+ * The deadline bounds reading the body. Everything after the post-body recheck is synchronous, so a
  * timeout can never pre-empt a store write that has started; a client that times out
  * after the commit retries safely through sequence idempotence.
  *
@@ -69,6 +70,8 @@ export const DEFAULT_BODY_DEADLINE_MS = 10_000;
 /** The persisted form of a grant: metadata plus a hash of the bearer, never the bearer. */
 export interface PersistedModelAuthGrant extends SafeGrantMetadata {
   readonly bearerHash: string;
+  /** Revocation time (the `revoked_at` projection); `null` only for an active grant. Anything else is rejected. */
+  readonly revokedAt: number | null;
 }
 
 /** The persisted dispatch a grant must belong to. */
@@ -265,6 +268,8 @@ export function createModelAuthHandlers(deps: ModelAuthHandlerDeps): ModelAuthHa
     if (grant.version !== MODEL_AUTH_PROTOCOL_VERSION || grant.audience !== MODEL_AUTH_AUDIENCE) {
       return failure("unauthorized");
     }
+    // Fail closed: only an explicit null means active; missing, undefined, or any timestamp is revoked.
+    if (grant.revokedAt !== null) return failure("unauthorized");
     if (!Number.isSafeInteger(grant.expiresAt) || deps.now() >= grant.expiresAt) return failure("unauthorized");
     if (!Array.isArray(grant.bindings) || grant.bindings.length === 0) return failure("unauthorized");
     for (const binding of grant.bindings) {
@@ -518,12 +523,18 @@ export function createModelAuthHandlers(deps: ModelAuthHandlerDeps): ModelAuthHa
         }
         if (!trusted) return failure("unauthorized", 403);
 
-        const auth = authenticateGrant(request);
-        if (!("grant" in auth)) return auth;
+        // Cheap pre-read gate: do not read a body for a grant that is already invalid.
+        const pre = authenticateGrant(request);
+        if (!("grant" in pre)) return pre;
 
         const limit = route === MODEL_AUTH_ROUTES.checkpoint ? checkpointLimit : smallLimit;
         const json = await readJson(request, limit);
         if (!("value" in json)) return json;
+
+        // Re-authenticate after the asynchronous read. No await may sit between this and the
+        // protected call below: expiry, revocation, and dispatch changes during the read count.
+        const auth = authenticateGrant(request);
+        if (!("grant" in auth)) return auth;
 
         if (route === MODEL_AUTH_ROUTES.checkout) return checkout(auth, json.value);
         if (route === MODEL_AUTH_ROUTES.checkpoint) return checkpoint(auth, json.value);

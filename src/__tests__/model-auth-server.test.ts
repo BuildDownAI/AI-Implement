@@ -39,6 +39,8 @@ let dispatchOverrides: Partial<ServerModule.PersistedDispatchContext>;
 let selections: Record<string, ServerModule.SnapshotProfileSelection | undefined>;
 let profileOverrides: Record<string, Partial<{ status: "active" | "disabled" | "archived"; allowedProjectKeys: string[]; revision: number }>>;
 let trusted: boolean;
+let nowValue: number;
+let grantMissing: boolean;
 let secretValue: unknown;
 let handlers: ServerModule.ModelAuthHandlers;
 let storeWrap: Partial<StoreModule.ModelSessionStore>;
@@ -85,7 +87,7 @@ function depsFrom(): ServerModule.ModelAuthHandlerDeps {
     isTrustedTransport: () => { transportSpy(); return trusted; },
     lookupGrant: (hash) => {
       lookupSpy(hash);
-      return hash === server.hashModelAuthBearer(BEARER)
+      return !grantMissing && hash === server.hashModelAuthBearer(BEARER)
         ? {
             version: 1,
             audience: "model-auth",
@@ -97,6 +99,7 @@ function depsFrom(): ServerModule.ModelAuthHandlerDeps {
             expiresAt: NOW + 60_000,
             bindings,
             bearerHash: hash,
+            revokedAt: null,
             ...grantOverrides,
           }
         : undefined;
@@ -118,7 +121,7 @@ function depsFrom(): ServerModule.ModelAuthHandlerDeps {
     },
     sessionStore,
     ownership,
-    now: () => NOW,
+    now: () => nowValue,
     log: (d) => logs.push(d),
     bodyDeadlineMs: 50,
     maxSmallBodyBytes: 512,
@@ -171,6 +174,8 @@ beforeEach(async () => {
   selections = {};
   profileOverrides = {};
   trusted = true;
+  nowValue = NOW;
+  grantMissing = false;
   secretValue = API_KEY;
   storeWrap = {};
   resolveSpy = vi.fn();
@@ -239,6 +244,8 @@ describe("checkout", () => {
   it.each<[string, () => void, boolean?]>([
     ["wrong audience", () => { grantOverrides = { audience: "runner" as never }; }],
     ["expired", () => { grantOverrides = { expiresAt: NOW }; }],
+    ["revoked", () => { grantOverrides = { revokedAt: NOW - 1 }; }],
+    ["revocation state missing", () => { grantOverrides = { revokedAt: undefined as never }; }],
     ["wrong dispatch", () => { dispatchOverrides = { dispatchId: "other" }; }],
     ["wrong snapshot", () => { dispatchOverrides = { snapshotId: "other" }; }],
     ["wrong project", () => { dispatchOverrides = { projectKey: "other" }; }],
@@ -472,5 +479,56 @@ describe("transport limits", () => {
     const noisy = server.createModelAuthHandlers({ ...depsFrom(), log: () => { throw new Error(STORE_ERROR); } });
     const res = await noisy.handle(req("checkout", { version: 1, profileId: "key1" }));
     expect(res.status).toBe(200);
+  });
+});
+
+describe("revalidation after the asynchronous body read", () => {
+  /** A body whose read completes only after `mutate` has changed the persisted state. */
+  const delayed = (body: unknown, mutate: () => void): AsyncIterable<string> => ({
+    async *[Symbol.asyncIterator]() {
+      await Promise.resolve();
+      mutate();
+      yield JSON.stringify(body);
+    },
+  });
+  const bodies = {
+    checkout: { version: 1, profileId: "key1" },
+    checkpoint: { version: 1, profileId: "sub1", ownerGeneration: 1, stateSequence: 1, sessionData: `${SESSION}-1` },
+    finish: { version: 1, profileId: "key1" },
+  } as const;
+  const mutations: [string, () => void][] = [
+    ["expiry", () => { nowValue = NOW + 60_000; }],
+    ["lookup miss", () => { grantMissing = true; }],
+    ["revocation", () => { grantOverrides = { revokedAt: nowValue }; }],
+    ["snapshot change", () => { dispatchOverrides = { snapshotId: "other" }; }],
+    ["project change", () => { dispatchOverrides = { projectKey: "other" }; }],
+    ["backend change", () => { dispatchOverrides = { backend: "gha" }; }],
+    ["dispatch change", () => { dispatchOverrides = { dispatchId: "other" }; }],
+  ];
+
+  for (const route of ["checkout", "checkpoint", "finish"] as const) {
+    it.each(mutations)(`${route} is rejected after %s during the body read`, async (_name, mutate) => {
+      const res = await handlers.handle(req(route, "", { body: delayed(bodies[route], mutate) }));
+      expect([401, 403]).toContain(res.status);
+      expect(res.body).toEqual({ version: 1, ok: false, category: "unauthorized" });
+      expect(res.headers["Cache-Control"]).toBe("no-store");
+      expect(resolveSpy).not.toHaveBeenCalled();
+      expect(readSpy).not.toHaveBeenCalled();
+      expect(checkpointSpy).not.toHaveBeenCalled();
+      expectNoLeak(res);
+    });
+  }
+
+  it("authenticates before and after the read, and serves an unchanged grant", async () => {
+    const res = await handlers.handle(req("checkout", "", { body: delayed(bodies.checkout, () => undefined) }));
+    expect(res.status).toBe(200);
+    expect(lookupSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps an exact-owner final checkpoint for a recovery_required owner and stays idempotent", async () => {
+    ownership.markRecoveryRequired({ dispatchId: "d1", profileId: "sub1", generation: 1 });
+    const first = await checkpoint(1);
+    expect(first.status).toBe(200);
+    expect((await checkpoint(1)).status).toBe(200);
   });
 });
