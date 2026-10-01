@@ -29,6 +29,7 @@
 import * as http2 from "node:http2";
 import crypto from "node:crypto";
 import { randomUUID } from "node:crypto";
+import * as restate from "@restatedev/restate-sdk";
 import { createEndpointHandler } from "@restatedev/restate-sdk/node";
 import { RestateContainer } from "@restatedev/restate-sdk-testcontainers";
 import { TestContainers } from "testcontainers";
@@ -37,6 +38,7 @@ import { RESTATE_SERVICES, queryNonCompletedInvocations, register, restateBindAd
 import { orchestratorTools } from "../../restate/tools.js";
 import * as dedup from "../../dedup.js";
 import { initSettingsTable } from "../../runner-mode.js";
+import { startBinaryEnvironment, type BinaryEnvironment } from "./binary-environment.js";
 import { RESTATE_IMAGE_VERSION, callObject, callService, restateTestRuntime } from "./harness.js";
 
 function sha256(value: string): string {
@@ -245,4 +247,39 @@ describe.skipIf(restateTestRuntime() === "binary")("startRestateEndpoint() / reg
     },
     45_000,
   );
+});
+
+// Request identity (AII-976) runs on the binary runtime: it spawns a real server given the
+// private key, with the endpoint given the public one. Skipped on the container runtime.
+describe.skipIf(restateTestRuntime() !== "binary")("request identity (AII-976)", () => {
+  const echo = restate.service({
+    name: "identityEcho",
+    handlers: { ping: async (_ctx: restate.Context, input: { value: string }) => ({ echoed: input.value }) },
+  });
+  let env: BinaryEnvironment;
+  beforeAll(async () => {
+    env = await startBinaryEnvironment({ services: [echo], requestIdentity: true });
+  }, 60_000);
+  afterAll(async () => {
+    if (env) await env.stop();
+  });
+
+  it("rejects an unsigned direct request to the endpoint, while an ingress call succeeds", async () => {
+    expect(env.identityKey()).toMatch(/^publickeyv1_/);
+    const client = http2.connect(`http://127.0.0.1:${env.endpointPort()}`);
+    try {
+      const status = await new Promise<number>((resolve, reject) => {
+        const req = client.request({ ":method": "GET", ":path": "/discover", accept: "application/vnd.restate.endpointmanifest.v3+json" });
+        req.on("response", (headers) => resolve(Number(headers[":status"])));
+        req.on("error", reject);
+        req.resume();
+        req.end();
+      });
+      expect(status).toBe(401);
+    } finally {
+      client.close();
+    }
+    // The server signs its own calls: an ingress call reaches a handler through the endpoint.
+    expect(await callService(env.baseUrl(), "identityEcho", "ping", { value: "x" })).toEqual({ echoed: "x" });
+  });
 });

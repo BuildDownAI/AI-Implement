@@ -8,7 +8,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { MAX_TRACKED_PRS } from "../../kg-refresh.js";
 import { KG_REFRESH_TOTAL_DEADLINE_MS, KG_REPO_STALE_MARGIN_MS } from "../../restate/kg-refresh-workflow.js";
 import { createKgRepo, type KgRepoEnqueueResult, type KgRepoTriggerResult } from "../../restate/kg-repo.js";
-import { VARIANTS, callObject, eventually, queryInvocations, settle, startVariants, stopAll } from "./harness.js";
+import { VARIANTS, callObject, callService, eventually, queryInvocations, settle, startVariants, stopAll } from "./harness.js";
 
 const FAKE_WORKFLOW_NAME = "FakeKgRefresh";
 const MARKER_AGE_WAIT_MS = 1_500;
@@ -16,6 +16,26 @@ const MARKER_AGE_WAIT_MS = 1_500;
 interface RunSend {
   key: string;
   parameter: { triggerId: string; dryRun?: boolean; kgSourceRef?: string; acceptNewBaseline?: boolean; report?: { repo: string; prNumber: number; sha: string } };
+}
+
+// release, expire and recordDryRunOutcome are ingressPrivate (AII-976): only another handler
+// may call them. This forwarder plays the workflow's part so scenarios can still drive them.
+const privateCaller = restate.service({
+  name: "KgRepoPrivateCaller",
+  handlers: {
+    call: async (ctx: restate.Context, input: { slug: string; handler: string; body: unknown }): Promise<unknown> =>
+      ctx.genericCall({
+        service: "KgRepo",
+        method: input.handler,
+        key: input.slug,
+        parameter: input.body,
+        inputSerde: restate.serde.json as restate.Serde<unknown>,
+        outputSerde: restate.serde.json as restate.Serde<unknown>,
+      }),
+  },
+});
+async function callPrivate(baseUrl: string, slug: string, handler: "release" | "expire" | "recordDryRunOutcome", body: unknown): Promise<unknown> {
+  return callService<unknown>(baseUrl, "KgRepoPrivateCaller", "call", { slug, handler, body });
 }
 
 describe("KgRepo durable single-flight lock", () => {
@@ -32,9 +52,10 @@ describe("KgRepo durable single-flight lock", () => {
 
   const kgRepo = createKgRepo({ workflowName: FAKE_WORKFLOW_NAME });
 
+
   let envs: Map<string, RestateTestEnvironment>;
   beforeAll(async () => {
-    envs = await startVariants([kgRepo, fakeKgRefresh]);
+    envs = await startVariants([kgRepo, fakeKgRefresh, privateCaller]);
   }, 60_000);
   afterAll(async () => {
     if (envs) await stopAll(envs);
@@ -108,13 +129,13 @@ describe("KgRepo durable single-flight lock", () => {
       const first = await trigger(env.baseUrl(), key);
       const triggerId = (first as { triggerId: string }).triggerId;
 
-      await callObject(env.baseUrl(), "KgRepo", key, "release", { triggerId: "not-the-right-id" });
+      await callPrivate(env.baseUrl(), key, "release", { triggerId: "not-the-right-id" });
       const stillInFlight = await trigger(env.baseUrl(), key);
       expect(stillInFlight).toEqual({ status: "refresh-in-progress", triggerId });
       await eventually(() => runSends.length - before >= 1, (ok) => ok, { label: "durable effect" });
       expect(runSends.length - before).toBe(1);
 
-      await callObject(env.baseUrl(), "KgRepo", key, "release", { triggerId });
+      await callPrivate(env.baseUrl(), key, "release", { triggerId });
       const status = await callObject<{ triggerId: string; startedAt: number } | null>(env.baseUrl(), "KgRepo", key, "status", {});
       expect(status).toBeNull();
 
@@ -139,12 +160,12 @@ describe("KgRepo durable single-flight lock", () => {
       await settle(MARKER_AGE_WAIT_MS);
       expect(await trigger(env.baseUrl(), key)).toEqual({ status: "refresh-in-progress", triggerId });
 
-      await callObject(env.baseUrl(), "KgRepo", key, "expire", { triggerId: "not-the-right-id" });
+      await callPrivate(env.baseUrl(), key, "expire", { triggerId: "not-the-right-id" });
       expect(await trigger(env.baseUrl(), key)).toEqual({ status: "refresh-in-progress", triggerId });
 
       const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
       try {
-        await callObject(env.baseUrl(), "KgRepo", key, "expire", { triggerId });
+        await callPrivate(env.baseUrl(), key, "expire", { triggerId });
         expect(warnSpy.mock.calls.filter((c) => String(c[1]).includes("expired in-flight marker"))).toHaveLength(1);
       } finally {
         warnSpy.mockRestore();
@@ -169,7 +190,7 @@ describe("KgRepo durable single-flight lock", () => {
   }
 
   async function release(baseUrl: string, slug: string, triggerId: string): Promise<void> {
-    await callObject(baseUrl, "KgRepo", slug, "release", { triggerId });
+    await callPrivate(baseUrl, slug, "release", { triggerId });
   }
 
   async function repoStatus(baseUrl: string, slug: string) {
@@ -397,7 +418,7 @@ describe("KgRepo durable single-flight lock", () => {
       await enqueue(env.baseUrl(), slug, 1, "first");
       await enqueue(env.baseUrl(), slug, 2, "second");
 
-      await callObject(env.baseUrl(), "KgRepo", slug, "expire", { triggerId });
+      await callPrivate(env.baseUrl(), slug, "expire", { triggerId });
       await eventually(() => runSends.length - before >= 2, (ok) => ok, { label: "durable effect" });
       expect(runSends[runSends.length - 1].parameter).toMatchObject({ kgSourceRef: "first" });
       expect((await repoStatus(env.baseUrl(), slug))?.pending).toEqual(["org/kg-source#2"]);
@@ -411,7 +432,7 @@ describe("KgRepo durable single-flight lock", () => {
     ok: true, at: n, detail: `dry run passed ${n}`, stampBefore: null, stampAfter: null, dryRun: true,
   });
   const record = (baseUrl: string, slug: string, prNumber: number, sha = `sha-${prNumber}`) =>
-    callObject(baseUrl, "KgRepo", slug, "recordDryRunOutcome", { report: reportFor(prNumber, sha), outcome: outcomeFor(prNumber) });
+    callPrivate(baseUrl, slug, "recordDryRunOutcome", { report: reportFor(prNumber, sha), outcome: outcomeFor(prNumber) });
   const readOutcome = (baseUrl: string, slug: string, prNumber: number) =>
     callObject<{ sha: string; outcome: unknown } | null>(baseUrl, "KgRepo", slug, "dryRunOutcome", { repo: "org/kg-source", prNumber });
 
@@ -472,7 +493,7 @@ describe("KgRepo durable single-flight lock", () => {
       const env = envFor(label);
       const slug = newKey();
       await expect(
-        callObject(env.baseUrl(), "KgRepo", slug, "recordDryRunOutcome", { report: reportFor(1), outcome: outcomeFor(1), extra: 1 }),
+        callPrivate(env.baseUrl(), slug, "recordDryRunOutcome", { report: reportFor(1), outcome: outcomeFor(1), extra: 1 }),
       ).rejects.toThrow();
       await expect(
         callObject(env.baseUrl(), "KgRepo", slug, "dryRunOutcome", { repo: "org/kg-source", prNumber: 1, extra: 1 }),
@@ -496,10 +517,11 @@ describe("KgRepo object-owned lease expiry", () => {
   let production: Map<string, RestateTestEnvironment>;
   let short: Map<string, RestateTestEnvironment>;
   beforeAll(async () => {
-    production = await startVariants([createKgRepo({ workflowName: FAKE_WORKFLOW_NAME }), fakeKgRefresh]);
+    production = await startVariants([createKgRepo({ workflowName: FAKE_WORKFLOW_NAME }), fakeKgRefresh, privateCaller]);
     short = await startVariants([
       createKgRepo({ workflowName: FAKE_WORKFLOW_NAME, totalDeadlineMs: SHORT_TOTAL_MS, staleMarginMs: SHORT_MARGIN_MS }),
       fakeKgRefresh,
+      privateCaller,
     ]);
   }, 120_000);
   afterAll(async () => {
@@ -552,7 +574,7 @@ describe("KgRepo object-owned lease expiry", () => {
       const slug = slugOf();
       const startedAt = Date.now();
       const { triggerId } = await callObject<{ triggerId: string }>(env.baseUrl(), "KgRepo", slug, "trigger", {});
-      await callObject(env.baseUrl(), "KgRepo", slug, "release", { triggerId });
+      await callPrivate(env.baseUrl(), slug, "release", { triggerId });
       // Stagger the second lease so the first expire fires while the second marker is still live.
       await settle(400);
       const next = await callObject<{ triggerId: string }>(env.baseUrl(), "KgRepo", slug, "trigger", {});
@@ -571,8 +593,30 @@ describe("KgRepo object-owned lease expiry", () => {
     async (label) => {
       const env = pick(production, label);
       const slug = slugOf();
-      await expect(callObject(env.baseUrl(), "KgRepo", slug, "release", { triggerId: "t", extra: 1 })).rejects.toThrow();
-      await expect(callObject(env.baseUrl(), "KgRepo", slug, "expire", { triggerId: "" })).rejects.toThrow();
+      await expect(callPrivate(env.baseUrl(), slug, "release", { triggerId: "t", extra: 1 })).rejects.toThrow();
+      await expect(callPrivate(env.baseUrl(), slug, "expire", { triggerId: "" })).rejects.toThrow();
+    },
+    30_000,
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "release, expire and recordDryRunOutcome are ingress-private; trigger and status stay public (%s)",
+    async (label) => {
+      const env = pick(production, label);
+      const slug = slugOf();
+      for (const handler of ["release", "expire", "recordDryRunOutcome"]) {
+        const response = await fetch(`${env.baseUrl()}/KgRepo/${encodeURIComponent(slug)}/${handler}`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: "{}",
+        });
+        expect(response.status, handler).toBe(400);
+      }
+      const triggered = await callObject<{ triggerId: string }>(env.baseUrl(), "KgRepo", slug, "trigger", {});
+      expect(typeof triggered.triggerId).toBe("string");
+      // The workflow's own path still works: a forwarded release clears the marker.
+      await callPrivate(env.baseUrl(), slug, "release", { triggerId: triggered.triggerId });
+      expect(await callObject(env.baseUrl(), "KgRepo", slug, "status", {})).toBeNull();
     },
     30_000,
   );

@@ -225,9 +225,9 @@ export function createKgRepo(deps: KgRepoDependencies) {
     handlers: {
       trigger: restate.handlers.object.exclusive({ input: serde.zod(triggerInputSchema) }, trigger),
       enqueueDryRun: restate.handlers.object.exclusive({ input: serde.zod(enqueueInputSchema) }, enqueueDryRun),
-      release: restate.handlers.object.exclusive({ input: serde.zod(leaseInputSchema) }, release),
-      expire: restate.handlers.object.exclusive({ input: serde.zod(leaseInputSchema) }, expire),
-      recordDryRunOutcome: restate.handlers.object.exclusive({ input: serde.zod(recordOutcomeInputSchema) }, recordDryRunOutcome),
+      release: restate.handlers.object.exclusive({ input: serde.zod(leaseInputSchema), ingressPrivate: true }, release),
+      expire: restate.handlers.object.exclusive({ input: serde.zod(leaseInputSchema), ingressPrivate: true }, expire),
+      recordDryRunOutcome: restate.handlers.object.exclusive({ input: serde.zod(recordOutcomeInputSchema), ingressPrivate: true }, recordDryRunOutcome),
       dryRunOutcome: restate.handlers.object.shared({ input: serde.zod(prInputSchema) }, dryRunOutcome),
       forgetPr: restate.handlers.object.exclusive({ input: serde.zod(prInputSchema) }, forgetPr),
       status: restate.handlers.object.shared(status),

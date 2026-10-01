@@ -1,10 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { spawn as realSpawn, type ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { mkdtempSync, rmSync, writeFileSync, chmodSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, chmodSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { RestateSidecar, restateDataDir, RESTATE_ADMIN_BASE_URL, RESTATE_INGRESS_BIND_ADDRESS } from "../restate/server.js";
+import { RestateSidecar, restateDataDir, ensureRequestIdentityKey, identityKeyFromPem, RESTATE_ADMIN_BASE_URL, RESTATE_INGRESS_BIND_ADDRESS } from "../restate/server.js";
 import { getRestateStatus, resetRestateStatus } from "../restate/status.js";
 import { createRestateRegistrationGate, stopSidecarsConcurrently } from "../index.js";
 
@@ -933,5 +933,92 @@ describe("main() wiring: whenReady() drives the registration gate end to end", (
     } finally {
       await sidecar.stop();
     }
+  });
+});
+
+describe("request identity key", () => {
+  function fakeSpawn(envs: NodeJS.ProcessEnv[]) {
+    return (_cmd: string, _args: string[], opts: object) => {
+      envs.push((opts as { env: NodeJS.ProcessEnv }).env);
+      return testSpawn("/bin/sh", ["-c", "sleep 5"], opts);
+    };
+  }
+
+  it("writes the pair once on first boot and reuses it on the next", async () => {
+    const dataDir = makeTmpDir();
+    const envs: NodeJS.ProcessEnv[] = [];
+    const mk = () =>
+      new RestateSidecar(
+        { dataDir, pollIntervalMs: 10, pollTimeoutMs: 1_000, stopTimeoutMs: 500 },
+        { spawn: fakeSpawn(envs), httpGet: async () => true, resolveBinary: () => "/bin/true" },
+      );
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const first = mk();
+    await first.start();
+    const pemPath = envs[0].RESTATE_REQUEST_IDENTITY_PRIVATE_KEY_PEM_FILE!;
+    expect(pemPath.startsWith(dataDir)).toBe(true);
+    expect(first.identityKey).toMatch(/^publickeyv1_[1-9A-HJ-NP-Za-km-z]+$/);
+    expect(statSync(pemPath).mode & 0o777).toBe(0o600);
+    const pem = readFileSync(pemPath, "utf8");
+    await first.stop();
+
+    const second = mk();
+    await second.start();
+    expect(readFileSync(pemPath, "utf8")).toBe(pem);
+    expect(second.identityKey).toBe(first.identityKey);
+    await second.stop();
+  });
+
+  it("encodes a known ED25519 public key to its compact publickeyv1_ form", () => {
+    // Seed 00 01 .. 1f, wrapped as PKCS#8; the public key is
+    // 03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8 and the base58 string below
+    // was computed independently of src/restate/server.ts.
+    const seed = Buffer.from(Array.from({ length: 32 }, (_, i) => i));
+    const der = Buffer.concat([Buffer.from("302e020100300506032b657004220420", "hex"), seed]);
+    const pem = `-----BEGIN PRIVATE KEY-----\n${der.toString("base64")}\n-----END PRIVATE KEY-----\n`;
+    expect(identityKeyFromPem(pem)).toBe("publickeyv1_FAe4sisG95oZ42w7buUn5qEE4TAnfTTFPiguZUHmhiF");
+  });
+
+  it("replaces a corrupt PEM, returns the matching key, and reuses it afterwards", () => {
+    const dataDir = makeTmpDir();
+    const pemPath = join(dataDir, "request-identity-private.pem");
+    writeFileSync(pemPath, "not a pem");
+    const warn = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const first = ensureRequestIdentityKey(dataDir);
+    const pem = readFileSync(pemPath, "utf8");
+    expect(pem).toContain("BEGIN PRIVATE KEY");
+    expect(first.publicKey).toBe(identityKeyFromPem(pem));
+    expect(statSync(pemPath).mode & 0o777).toBe(0o600);
+    expect(warn.mock.calls.filter((c) => String(c[0]).includes("regenerated"))).toHaveLength(1);
+
+    const second = ensureRequestIdentityKey(dataDir);
+    expect(second.publicKey).toBe(first.publicKey);
+    expect(readFileSync(pemPath, "utf8")).toBe(pem);
+  });
+
+  it("does not spawn the child and reports the degraded state when the key cannot be prepared", async () => {
+    const dataDir = makeTmpDir();
+    // A file where the data directory should be makes the key write fail regardless of uid.
+    const blocker = join(dataDir, "not-a-dir");
+    writeFileSync(blocker, "");
+    const spawnFn = vi.fn();
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const sidecar = new RestateSidecar(
+      { dataDir: blocker, pollIntervalMs: 10, pollTimeoutMs: 200 },
+      { spawn: spawnFn, httpGet: async () => true, resolveBinary: () => "/bin/true" },
+    );
+
+    expect(await sidecar.start()).toBe(false);
+    expect(await sidecar.whenReady()).toBe(false);
+    expect(spawnFn).not.toHaveBeenCalled();
+    expect(sidecar.identityKey).toBeUndefined();
+    expect(getRestateStatus().sidecar.state).toBe("exited");
+  });
+
+  it("derives a stable key from the PEM", () => {
+    const dataDir = makeTmpDir();
+    expect(ensureRequestIdentityKey(dataDir).publicKey).toBe(ensureRequestIdentityKey(dataDir).publicKey);
   });
 });

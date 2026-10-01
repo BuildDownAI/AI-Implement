@@ -5484,7 +5484,7 @@ async function main(): Promise<void> {
   setKgRefreshToolDeps(kgComposition?.toolDeps ?? null);
   const kgServices = kgComposition?.services ?? [];
   const restateRegistration = createRestateRegistrationGate(() => shuttingDown, {
-    startRestateEndpoint: () => startRestateEndpoint([...RESTATE_SERVICES, ...reviewFixServices, ...kgServices]),
+    startRestateEndpoint: () => startRestateEndpoint([...RESTATE_SERVICES, ...reviewFixServices, ...kgServices], restateSidecar.identityKey),
     registerRestateEndpoint,
   });
   // A sidecar which becomes ready after its initial timeout still registers the

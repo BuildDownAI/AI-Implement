@@ -677,6 +677,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       run: restate.handlers.workflow.workflow({
         input: serde.zod(kgRefreshRunInputSchema),
         journalRetention: KG_REFRESH_RETENTION_MS,
+        ingressPrivate: true,
       }, run),
       report: restate.handlers.workflow.shared({
         journalRetention: KG_REFRESH_RETENTION_MS,

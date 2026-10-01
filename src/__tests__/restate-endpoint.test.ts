@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { restateBindAddress, register, queryNonCompletedInvocations, RESTATE_SERVICES } from "../restate/endpoint.js";
+import { resolveIdentityKeys, restateBindAddress, register, queryNonCompletedInvocations, RESTATE_SERVICES } from "../restate/endpoint.js";
 import { createProductionReviewFixServices } from "../restate/review-fix-production.js";
 
 // AII-727: a static pin, unit-tier only. Dropping either service from RESTATE_SERVICES
@@ -326,5 +326,20 @@ describe("queryNonCompletedInvocations", () => {
     });
     const result = await queryNonCompletedInvocations(fetchImpl as unknown as typeof fetch, "http://127.0.0.1:9070", "http://127.0.0.1:9080");
     expect(result).toBeNull();
+  });
+});
+
+describe("resolveIdentityKeys", () => {
+  it("prefers the sidecar key, then RESTATE_IDENTITY_KEY", () => {
+    expect(resolveIdentityKeys("publickeyv1_a", { RESTATE_IDENTITY_KEY: "publickeyv1_b" })).toEqual(["publickeyv1_a"]);
+    expect(resolveIdentityKeys(undefined, { RESTATE_IDENTITY_KEY: "publickeyv1_b" })).toEqual(["publickeyv1_b"]);
+  });
+
+  it("warns once and returns undefined with neither", () => {
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    expect(resolveIdentityKeys(undefined, {})).toBeUndefined();
+    resolveIdentityKeys(undefined, {});
+    expect(err.mock.calls.length).toBeLessThanOrEqual(1);
+    err.mockRestore();
   });
 });

@@ -49,3 +49,7 @@ Use the Restate primitive in place of a hand-built one: the idempotency key in p
 **A webhook may be the only trigger** when the sender retries (the runner does) or when a lost event is visible and recoverable (a required check that stays pending, a poll detector). Otherwise the run kind keeps a poll backstop.
 
 **Alternatives rejected.** A public ingress (no caller authentication; every public service exposed; the payload is journaled before any check). An inbox table in front of every handler (a second durable log beside Restate's).
+
+## Amendment (2026-10-01): request identity is the second control beside loopback binding
+
+The Consequences note above, that none of the three listeners needs authentication while loopback-bound, no longer stands alone. `RestateSidecar` generates an ED25519 key pair under the data directory on first boot and gives the private key to the server; the SDK endpoint receives the public key as `identityKeys` and rejects unsigned requests. `RESTATE_IDENTITY_KEY` supplies the public key when the server is external (test runtimes). The key applies to the whole endpoint. Separately, handlers only other services call (`KgRefresh.run`, `KgRepo.release`/`expire`/`recordDryRunOutcome`) are `ingressPrivate`. A corrupt key is regenerated; an unpreparable key keeps the sidecar down; there is no unsigned mode on the sidecar path. Loopback binding stays. Rollback is a revert. See docs/restate.md § "Request identity".
