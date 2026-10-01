@@ -29,7 +29,7 @@ const END_MARKER = "Cleaning up orphan processes";
 export const JOBS = [
   { kind: "implement", name: "private-envelope-implement", workflow: "workflows/claude-implement.yml", needs: "IMPLEMENT_RESULT", expected: "success" },
   { kind: "plan", name: "private-envelope-plan", workflow: "workflows/claude-plan.yml", needs: "PLAN_RESULT", expected: "success" },
-  { kind: "failure", name: "private-envelope-failure", workflow: "workflows/claude-implement.yml", needs: "FAILURE_RESULT", expected: "failure" },
+  { kind: "failure", name: "private-envelope-failure", workflow: "workflows/claude-implement.yml", needs: "FAILURE_RESULT", expected: "success" },
 ];
 const jobFor = (kind) => {
   const job = JOBS.find((j) => j.kind === kind);
@@ -476,11 +476,11 @@ function selfTest() {
   check("fixture differs per run id", buildFixture(ctx("implement")).secrets[1].value !== buildFixture({ ...ctx("implement"), runId: "999" }).secrets[1].value);
 
   // 3. Job/needs evaluation: skipped, failed, unexpected-success and missing jobs never pass.
-  const goodNeeds = { IMPLEMENT_RESULT: "success", PLAN_RESULT: "success", FAILURE_RESULT: "failure" };
+  const goodNeeds = { IMPLEMENT_RESULT: "success", PLAN_RESULT: "success", FAILURE_RESULT: "success" };
   check("expected needs pass", evaluateNeeds(goodNeeds).length === 0);
   fail("skipped consumer fails", evaluateNeeds({ ...goodNeeds, IMPLEMENT_RESULT: "skipped" }));
   fail("cancelled consumer fails", evaluateNeeds({ ...goodNeeds, PLAN_RESULT: "cancelled" }));
-  fail("deliberate failure that succeeded fails", evaluateNeeds({ ...goodNeeds, FAILURE_RESULT: "success" }));
+  fail("failure consumer that failed fails", evaluateNeeds({ ...goodNeeds, FAILURE_RESULT: "failure" }));
   fail("deliberate failure skipped fails", evaluateNeeds({ ...goodNeeds, FAILURE_RESULT: "skipped" }));
   fail("missing needs result fails", evaluateNeeds({}));
   const apiJobs = JOBS.map((j, i) => ({ id: i + 1, name: j.name }));
@@ -488,8 +488,8 @@ function selfTest() {
   fail("missing job fails", selectJobs(apiJobs.slice(1)).problems);
   fail("duplicate job fails", selectJobs([...apiJobs, apiJobs[0]]).problems);
   check("in-progress job is pending", jobState({ status: "in_progress" }, JOBS[0]) === "pending");
-  check("wrong conclusion is not ready", jobState({ status: "completed", conclusion: "success" }, JOBS[2]) !== "ready");
-  check("expected conclusion is ready", jobState({ status: "completed", conclusion: "failure" }, JOBS[2]) === "ready");
+  check("wrong conclusion is not ready", jobState({ status: "completed", conclusion: "failure" }, JOBS[2]) !== "ready");
+  check("expected conclusion is ready", jobState({ status: "completed", conclusion: "success" }, JOBS[2]) === "ready");
 
   // 4. Bounded retries.
   let calls = 0;

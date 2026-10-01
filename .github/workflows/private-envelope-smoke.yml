@@ -113,7 +113,10 @@ jobs:
         run: node scripts/check-private-envelope-gha-logs.mjs consume failure
       - name: Untrusted intermediate step
         run: node scripts/check-private-envelope-gha-logs.mjs untrusted failure
+      # The step fails for real (so the failure-path log is genuine) but continue-on-error keeps the
+      # job, and therefore the PR check, green; the verifier requires this step's PROOF marker and error.
       - name: Trusted consumer (deliberate failure)
+        continue-on-error: true
         env:
           RUN_TOKEN: ${{ steps.bootstrap.outputs.run_token }}
           RUN_PROGRESS_TOKEN: ${{ steps.bootstrap.outputs.run_progress_token }}
