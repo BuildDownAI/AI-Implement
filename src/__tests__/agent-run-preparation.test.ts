@@ -262,6 +262,36 @@ describe("snapshot immutability and idempotence", () => {
     expect([ra.reused, rb.reused].sort()).toEqual([false, true]);
   });
 
+  it("fails closed when a retry changes backend or project, without reminting or touching reservations", async () => {
+    deps = { ...deps, checkRunnerCapability: async () => true };
+    const first = ready(await prep.prepareAgentRun(request(), deps));
+    const before = counts();
+    const reservationsBefore = rows("model_profile_reservations");
+    for (const backend of ["local-docker", "fly-machines"] as const) {
+      expect(await prep.prepareAgentRun(request({ backend }), deps)).toEqual({ status: "recovery-required", code: "grant_mismatch" });
+    }
+    expect(counts()).toEqual(before);
+    expect(rows("model_profile_reservations")).toEqual(reservationsBefore);
+    expect(rows("model_credential_grants")[0]!.revoked_at).toBeNull();
+    const again = ready(await prep.prepareAgentRun(request(), deps));
+    expect(again.reused).toBe(true);
+    expect(again.grant.grantId).toBe(first.grant.grantId);
+    expect(again.reservations).toEqual(first.reservations);
+    expect(again.takeBootstrap()).toBeUndefined();
+  });
+
+  it("fails closed on a backend change in the concurrent-winner path", async () => {
+    deps = { ...deps, checkRunnerCapability: async () => true };
+    const results = await Promise.all([
+      prep.prepareAgentRun(request(), deps),
+      prep.prepareAgentRun(request({ backend: "fly-machines" }), deps),
+    ]);
+    expect(results.map((r) => r.status).sort()).toEqual(["ready", "recovery-required"]);
+    const failed = results.find((r) => r.status !== "ready");
+    expect(failed).toEqual({ status: "recovery-required", code: "grant_mismatch" });
+    expect(rows("model_credential_grants").filter((x) => x.dispatch_id === "d1")).toHaveLength(1);
+  });
+
   it("reuses a stored snapshot even after the project is opted out", async () => {
     const first = ready(await prep.prepareAgentRun(request(), deps));
     store.setProjectOptIn("AII", false);
@@ -507,6 +537,84 @@ describe("cleanup", () => {
     expect(done.complete).toBe(true);
     expect(rows("model_credential_grants")[0]!.revoked_at).not.toBeNull();
   });
+});
+
+describe("cleanup ownership completeness", () => {
+  function twoOwners() {
+    store.setOrchestratorDefaults({
+      version: 1, mode: "configured",
+      stages: { planning: stage("api", "claude", "anthropic"), implementation: stage("sub", "codex", "openai"), review: stage("sub2", "codex", "openai") },
+    });
+  }
+  const entries = [
+    ["releaseRejectedLaunch", async (o: readonly OwnershipModule.ReservedProfile[]) => prep.releaseRejectedLaunch("d1", o, deps)],
+    ["releaseTerminated", async (o: readonly OwnershipModule.ReservedProfile[]) => prep.releaseTerminated("d1", o, deps)],
+  ] as const;
+
+  for (const [name, release] of entries) {
+    it(`${name}: empty or subset selections are incomplete and leave grant and owners intact`, async () => {
+      twoOwners();
+      const r = ready(await prep.prepareAgentRun(request(), deps));
+      expect(r.reservations).toHaveLength(2);
+      for (const owners of [[], [r.reservations[0]!]]) {
+        expect((await release(owners)).complete).toBe(false);
+        expect(rows("model_credential_grants")[0]!.revoked_at).toBeNull();
+      }
+      for (const o of r.reservations) {
+        expect(ownership.snapshot(o.profileId)).toMatchObject({ dispatchId: "d1", generation: o.generation, state: "reserved" });
+      }
+    });
+
+    it(`${name}: extra, wrong and duplicate owner selections are rejected`, async () => {
+      const r = ready(await prep.prepareAgentRun(request(), deps));
+      const owner = r.reservations[0]!;
+      for (const owners of [
+        [owner, { profileId: "sub2", generation: 1 }],
+        [{ profileId: owner.profileId, generation: owner.generation + 1 }],
+        [owner, owner],
+      ]) {
+        expect((await release(owners)).complete).toBe(false);
+        expect(rows("model_credential_grants")[0]!.revoked_at).toBeNull();
+        expect(ownership.snapshot("sub")).toMatchObject({ dispatchId: "d1", generation: owner.generation });
+      }
+    });
+
+    it(`${name}: a stale selection cannot release a newer owner`, async () => {
+      const r = ready(await prep.prepareAgentRun(request(), deps));
+      const old = r.reservations;
+      expect(prep.releaseRejectedLaunch("d1", old, deps).complete).toBe(true);
+      const next = ownership.reserve({ dispatchId: "d2", profiles: [{ profileId: "sub", authMode: "subscription" }] });
+      expect(next.status).toBe("reserved");
+      await release(old);
+      expect(ownership.snapshot("sub")).toMatchObject({ dispatchId: "d2", state: "reserved" });
+    });
+
+    it(`${name}: the full set completes, revokes, and repeats idempotently`, async () => {
+      twoOwners();
+      const r = ready(await prep.prepareAgentRun(request(), deps));
+      if (name === "releaseTerminated") {
+        for (const o of r.reservations) {
+          const ref = { dispatchId: "d1", profileId: o.profileId, generation: o.generation };
+          ownership.markRunning(ref);
+          ownership.beginStop(ref);
+          expect(sessions.checkpoint({ profileId: o.profileId, ownerGeneration: o.generation, stateSequence: 1, sessionData: "synthetic-next" }).ok).toBe(true);
+        }
+      }
+      expect((await release(r.reservations)).complete).toBe(true);
+      expect(rows("model_credential_grants")[0]!.revoked_at).not.toBeNull();
+      expect((await release(r.reservations)).complete).toBe(true);
+    });
+
+    it(`${name}: an API-only dispatch completes with no owners`, async () => {
+      store.setOrchestratorDefaults({
+        version: 1, mode: "configured",
+        stages: { planning: stage("api", "claude", "anthropic"), implementation: stage("api", "claude", "anthropic"), review: stage("api", "claude", "anthropic") },
+      });
+      ready(await prep.prepareAgentRun(request(), deps));
+      expect((await release([])).complete).toBe(true);
+      expect(rows("model_credential_grants")[0]!.revoked_at).not.toBeNull();
+    });
+  }
 });
 
 describe("inspectAgentReadiness", () => {
