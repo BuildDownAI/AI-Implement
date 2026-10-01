@@ -340,6 +340,12 @@ After the sync PR merges, trigger a test dispatch (add the `AI-Implement` label 
 
 ---
 
+## Input allowlist guard (AII-680)
+
+Each synced workflow's `workflow_dispatch` inputs are pinned exactly, with a reason per input, in `src/__tests__/workflow-input-allowlist.test.ts` and [ADR 032](adr/032-private-run-envelope-and-credential-bootstrap.md). The same test checks canonical/synced byte identity and scans diagnostic and forwarding steps for envelope or credential leaks, with negative fixtures. Adding an input means changing both the test contract and the ADR. `provider` and `aws_region` are retained top-level nonsecret inputs. Rollout evidence (run 36867304479) and the future sync gate are recorded in the ADR; no sync has been performed.
+
+---
+
 ## Dual-Mode Retirement Criteria
 
 The orchestrator will continue to support both contracts indefinitely until all mapped repos have migrated. Retirement of the legacy path (removing the probe + fallback) will only be considered when:
