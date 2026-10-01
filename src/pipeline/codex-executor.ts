@@ -267,6 +267,13 @@ export class CodexExecutor implements LLMExecutor {
     return base;
   }
 
+  /** True when the child's own exit output proves a configuration or authentication rejection, which outranks a synthetic stdin failure. */
+  private isDefinitiveRejection(result: LLMResult, params: InvokeParams): boolean {
+    if (result.signal || result.exitCode === 0) return false;
+    const failure = this.classify(result, params.stage ?? "unknown", 1, params.expectsStructuredOutput ?? false);
+    return failure.category === "config" || failure.category === "auth";
+  }
+
   private stopFailure(kind: "timeout" | "cancel", result: LLMResult, stage: string, attempt: number, startedAt: number): FailureRecord {
     const base = classifyLlmResult(result, { stage, attempt, expectsStructuredOutput: false, elapsedMs: Date.now() - startedAt });
     if (kind === "timeout") {
@@ -502,12 +509,11 @@ export class CodexExecutor implements LLMExecutor {
     if (st.spawnError && typeof proc.pid !== "number") {
       throw spawnFailure(st.spawnError, sawUnsafe);
     }
-    if (st.reason === "stdin") {
+    const result = parser.toResult({ exitCode: st.exit.code ?? 1, signal: st.exit.signal ?? null });
+    if (st.reason === "stdin" && !this.isDefinitiveRejection(result, params)) {
       // The prompt never reached the CLI intact; surface it through the spawn rail (EPIPE is transient).
       throw spawnFailure(Object.assign(new Error("codex stdin closed before the prompt was delivered"), { code: "EPIPE" }), sawUnsafe);
     }
-
-    const result = parser.toResult({ exitCode: st.exit.code ?? 1, signal: st.exit.signal ?? null });
     if (result.structuredOutput !== undefined && params.expectsStructuredOutput && params.jsonSchema) {
       if (!matchesSchema(result.structuredOutput, params.jsonSchema)) delete result.structuredOutput;
     }

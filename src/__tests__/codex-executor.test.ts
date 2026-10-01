@@ -358,6 +358,26 @@ describe("failure classification and retry safety", () => {
     const result = await executor.invoke({ ...base, ...retry });
     expect(result.attempts).toBe(2);
   });
+
+  it.each([
+    ["configuration", "error: unexpected argument '--ignore-user-config' found", "config"],
+    ["authentication", "401 invalid x-api-key", "auth"],
+  ])("fails closed on %s rejection combined with stdin EPIPE without retrying", async (_name, stderr, category) => {
+    const log: Spawned[] = [];
+    const inner = makeSpawn([{ exitCode: 2, stderr }, { stdout: message("ok") }], log);
+    const spawnImpl = ((c: string, a: string[], o: { env: Record<string, string> }) => {
+      const proc = inner(c, a, o as never) as unknown as ChildProcessWithoutNullStreams;
+      setImmediate(() => proc.stdin.emit("error", Object.assign(new Error("EPIPE"), { code: "EPIPE" })));
+      return proc;
+    }) as unknown as typeof spawn;
+    const auth = makeAuth();
+    const executor = new CodexExecutor(workspace, { auth: auth.client, profileId: "p", allowRepositoryWrites: true, spawnImpl, sleepImpl: async () => {}, termWaitMs: 40, killWaitMs: 40 });
+    const result = await executor.invoke({ ...base, ...retry });
+    expect(log).toHaveLength(1);
+    expect(result.failure?.category).toBe(category);
+    expect(result.attempts).toBe(1);
+    expect(auth.events).toEqual(["invoke:p", "checkpoint"]);
+  });
 });
 
 describe("timeout, cancellation and termination", () => {
