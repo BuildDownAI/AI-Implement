@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { parse } from "yaml";
+import { INPUT_CONTRACT } from "./helpers/workflow-input-contract.js";
 import { GITHUB_WRITE_CREDENTIAL_KEYS } from "../pipeline/process-env.js";
 
 const IMPLEMENT_WORKFLOWS = [
@@ -137,18 +138,7 @@ describe("GHA workflow shims", () => {
   for (const f of IMPLEMENT_WORKFLOWS) {
     it(`${f} declares the optional attempt correlation input alongside the legacy envelope inputs`, () => {
       const doc = parse(readFileSync(f, "utf-8")) as any;
-      expect(Object.keys(doc.on.workflow_dispatch.inputs)).toEqual([
-        "run_config",
-        "issue_identifier",
-        "run_attempt_token",
-        "runner_image",
-        "job_timeout_minutes",
-        "provider",
-        "aws_region",
-        "run_token",
-        "run_progress_token",
-        "run_publication_token",
-      ]);
+      expect(Object.keys(doc.on.workflow_dispatch.inputs)).toEqual(Object.keys(INPUT_CONTRACT.implement.inputs));
     });
 
     it(`${f} declares issue_identifier as an optional, display-only string input`, () => {
@@ -173,16 +163,7 @@ describe("GHA workflow shims", () => {
   for (const f of PLANNING_WORKFLOWS) {
     it(`${f} declares exactly the 8 envelope inputs, in order`, () => {
       const doc = parse(readFileSync(f, "utf-8")) as any;
-      expect(Object.keys(doc.on.workflow_dispatch.inputs)).toEqual([
-        "run_config",
-        "issue_identifier",
-        "runner_image",
-        "job_timeout_minutes",
-        "provider",
-        "aws_region",
-        "run_token",
-        "run_progress_token",
-      ]);
+      expect(Object.keys(doc.on.workflow_dispatch.inputs)).toEqual(Object.keys(INPUT_CONTRACT.plan.inputs));
     });
 
     it(`${f} declares issue_identifier as an optional, display-only string input`, () => {
