@@ -651,7 +651,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       // A retried callback delivering the same body it already delivered is not an error —
       // only a body that conflicts with what the run actually consumed is.
       if (isDuplicate) return { status: "duplicate" };
-      throw new restate.TerminalError("kg-refresh report received after run completed");
+      throw new restate.TerminalError("kg-refresh report received after run completed", { errorCode: 409 });
     }
     if (existing !== undefined) {
       if (!isDuplicate) {

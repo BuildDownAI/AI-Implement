@@ -197,6 +197,7 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
       ...railFakes,
       dispatchKgRefreshRun: async () => { throw new Error("the legacy dispatcher must not run on the GHA path"); },
       updateJobStatus,
+      recordDispatch: () => {},
       getWorkflowRunStatus: async (runId) => { gh.statusCalls.push(runId); return { ...gh.runState }; },
       findRunByTitle: async () => gh.findResult(++gh.findCalls),
       cancelWorkflowRun: async (runId) => { gh.cancelCalls.push(runId); return true; },
@@ -501,9 +502,9 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
     expect(gh.cancelCalls).toHaveLength(1);
     expect(kgRows()).toMatchObject([{ status: "failed", conclusion: "operator_cancelled" }]);
 
-    // The completed workflow refuses a report it did not consume; the workflow's own
-    // terminal error carries no 409, so the callback answers 503.
-    expect(await postReport(env, runToken(), SUCCESS_REPORT)).toEqual({ status: 503, body: { error: "kg_refresh_unavailable" } });
+    // The completed workflow refuses a report it did not consume with a 409, so the callback
+    // answers a permanent conflict rather than a retryable 503.
+    expect(await postReport(env, runToken(), SUCCESS_REPORT)).toEqual({ status: 409, body: { error: "conflicting_report" } });
     expect(mergeCalls).toBe(0);
     expect(persistCalls).toBe(1); // the cancelled run's own failure record, nothing from the report
   }, 40_000);

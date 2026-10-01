@@ -125,7 +125,7 @@ import { createKgRefreshIngressClient } from "./restate/kg-refresh-production.js
 import { RestateSidecar } from "./restate/server.js";
 import { startRestateEndpoint, register as registerRestateEndpoint, RESTATE_SERVICES } from "./restate/endpoint.js";
 import { createProductionReviewFixServices } from "./restate/review-fix-production.js";
-import { createProductionKgRefreshServices, forgetRunWatch, lookupRunWatch, resolveRunWatchAwakeable } from "./restate/kg-refresh-production.js";
+import { createProductionKgRefreshServices, recordKgDispatchDetails, forgetRunWatch, lookupRunWatch, resolveRunWatchAwakeable } from "./restate/kg-refresh-production.js";
 import { setKgRefreshToolDeps } from "./restate/tools.js";
 import type { RestateRegisterOutcome, RestateRegisterResult } from "./restate/endpoint.js";
 import { getRestateStatus, setRestateStatus } from "./restate/status.js";
@@ -5451,6 +5451,7 @@ async function main(): Promise<void> {
       deleteBranchFn: deleteBranch,
       dispatchKgRefreshRun: (opts) => dispatchKgRefreshRun(config, opts),
       updateJobStatus,
+      recordDispatch: recordKgDispatchDetails,
       getWorkflowRunStatus: async (runId) => {
         const run = await getWorkflowRunStatus(await kgWorkflowToken(), kgSlug.owner, kgSlug.repo, runId);
         if (!run) throw new Error(`workflow run ${runId} status unavailable`);
@@ -5465,9 +5466,15 @@ async function main(): Promise<void> {
           console.warn(`[kg-refresh] findRunByTitle: workflow runs lookup answered HTTP ${res.status}`);
           return null;
         }
-        const data = (await res.json()) as { workflow_runs: Array<{ id: number; display_title?: string }> };
+        const data = (await res.json()) as { workflow_runs: Array<{ id: number; display_title?: string; html_url?: string }> };
         const match = data.workflow_runs.find((r) => r.display_title === `${RUN_TITLE_PREFIX}${title}`);
-        return match ? { runId: match.id } : null;
+        if (!match) return null;
+        // The title is `KG-REFRESH · <dispatchId>`; a bare identifier carries no dispatch id to record against.
+        const dispatchIdPrefix = "KG-REFRESH · ";
+        if (title.startsWith(dispatchIdPrefix)) {
+          recordKgDispatchDetails(title.slice(dispatchIdPrefix.length), { workflowRunId: match.id, logsUrl: match.html_url });
+        }
+        return { runId: match.id };
       },
       cancelWorkflowRun: async (runId) => cancelWorkflowRun(await kgWorkflowToken(), kgSlug.owner, kgSlug.repo, runId),
       persistLastRefresh: defaultPersistLastRefresh,
