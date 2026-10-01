@@ -9,6 +9,7 @@ import { CodexExecutor, CodexRecoveryRequiredError, matchesSchema, type CodexExe
 import { ModelAuthClientError, type ModelAuthClient, type ModelInvocation } from "../model-auth-client.js";
 import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
 import { READ_ONLY_TOOL_PARAMS } from "../pipeline/steps/read-only-tools.js";
+import type { CodexProtocolDriver, CodexTransportResult, CodexTransportRunInput } from "../pipeline/codex-planning-adapter.js";
 
 const SYNTHETIC_KEY = "synthetic-codex-api-key-0000";
 const VERDICT_SCHEMA = {
@@ -572,4 +573,155 @@ describe("publication credential guard", () => {
     execFileSync("touch", [join(workspace, ".git", "config.lock")]);
     expect(readFileSync(join(workspace, ".git", "config.lock"), "utf-8")).toBe("");
   }
+});
+
+describe("default exec path is unchanged (AII-1001)", () => {
+  it("passes the exact pinned exec argv and never selects the app-server transport", async () => {
+    const { executor, log } = make([{ stdout: message("done") }]);
+    await executor.invoke({ ...base, builtinTools: ["Read"] });
+    expect(log[0].cmd).toBe("codex");
+    expect(log[0].args).toEqual([
+      "exec", "--json", "--ignore-user-config", "--ignore-rules", "--model", "gpt-synthetic", "-c", 'model_provider="openai"', "--sandbox", "read-only", "-",
+    ]);
+  });
+});
+
+describe("protocol driver seam (AII-1001)", () => {
+  const okTransport = (over: Partial<CodexTransportResult> = {}): CodexTransportResult => ({
+    result: {
+      stdout: "plan",
+      stderr: "",
+      exitCode: 0,
+      tokensUsed: 0,
+      telemetry: { outcome: "success", numTurns: null, durationMs: null, costUsd: null, tokensIn: null, tokensOut: null },
+      terminalStatus: { subtype: "success", isError: false },
+      signal: null,
+    },
+    sawUnsafe: false,
+    stopReason: null,
+    ...over,
+  });
+
+  function withDriver(
+    scripts: Script[],
+    run: CodexProtocolDriver["run"],
+    extra: Partial<CodexExecutorOptions> = {},
+    auth = makeAuth(),
+  ) {
+    return make(scripts, { protocolDriver: { run }, ...extra }, auth);
+  }
+
+  it("builds trusted app-server argv, hands the driver streams only, and terminates the group after completion", async () => {
+    let input: CodexTransportRunInput | undefined;
+    const { executor, log, auth } = withDriver([{ hang: true, dieOn: ["SIGTERM"] }], async (i) => {
+      input = i;
+      return okTransport();
+    });
+    const result = await executor.invoke({ ...base, jsonSchema: VERDICT_SCHEMA });
+    expect(result.stdout).toBe("plan");
+    expect(result.failure).toBeUndefined();
+    expect(log[0].args).toEqual([
+      "app-server", "--ignore-user-config", "--ignore-rules",
+      "-c", 'model="gpt-synthetic"',
+      "-c", 'model_provider="openai"',
+      "-c", 'approval_policy="never"',
+      "-c", 'sandbox_mode="read-only"',
+      "-c", "features.shell_tool=false",
+      "-c", 'web_search="disabled"',
+    ]);
+    expect(log[0].args).not.toContain("exec");
+    expect(log[0].args).not.toContain("do the thing");
+    expect(log[0].stdin).toBe("");
+    expect(log[0].signals).toEqual(["SIGTERM"]);
+    expect(Object.keys(input!.io).sort()).toEqual(["halt", "stdin", "stdout"]);
+    expect(input!.prompt).toBe("do the thing");
+    expect(input!.redact(`x ${SYNTHETIC_KEY} y`)).toBe("x [redacted] y");
+    // checkpoint happens only after the child was proven stopped
+    expect(auth.events).toEqual(["invoke:profile-1", "checkpoint"]);
+  });
+
+  it("never settles the auth callback when the child outlives the completed turn", async () => {
+    const { executor, auth } = withDriver([{ hang: true, dieOn: [] }], async () => okTransport());
+    await expect(executor.invoke(base)).rejects.toBeInstanceOf(CodexRecoveryRequiredError);
+    expect(auth.events).toEqual(["invoke:profile-1"]);
+    await expect(executor.invoke(base)).rejects.toMatchObject({ reason: "held" });
+  });
+
+  it("never retries an unsafe transport outcome even when it classifies transient", async () => {
+    let runs = 0;
+    const { executor, log } = withDriver([{ hang: true, dieOn: ["SIGTERM"] }], async () => {
+      runs++;
+      const t = okTransport({ sawUnsafe: true });
+      return { ...t, result: { ...t.result, exitCode: 1, stderr: "rate limit exceeded 429", terminalStatus: { subtype: "error", isError: true } } };
+    });
+    const result = await executor.invoke({ ...base, ...retry });
+    expect(result.failure).toBeDefined();
+    expect(runs).toBe(1);
+    expect(log).toHaveLength(1);
+  });
+
+  it("lets the executor own timeout and aborts the driver's halt signal", async () => {
+    let halted = false;
+    const { executor, log } = withDriver([{ hang: true, dieOn: ["SIGTERM"] }], (i) => {
+      return new Promise((resolve) => {
+        i.io.halt.addEventListener("abort", () => {
+          halted = true;
+          resolve(okTransport({ result: { ...okTransport().result, exitCode: 1, terminalStatus: { subtype: "error", isError: true } } }));
+        });
+      });
+    });
+    const result = await executor.invoke({ ...base, invocationTimeoutMs: 20 });
+    expect(halted).toBe(true);
+    expect(result.failure?.code).toBe("INVOCATION_TIMEOUT");
+    expect(log[0].signals).toContain("SIGTERM");
+  });
+
+  it("lets the executor own cancellation", async () => {
+    const ctl = new AbortController();
+    const { executor } = withDriver(
+      [{ hang: true, dieOn: ["SIGTERM"] }],
+      (i) => new Promise((resolve) => i.io.halt.addEventListener("abort", () => resolve(okTransport({ sawUnsafe: false })))),
+      { cancelSignal: ctl.signal },
+    );
+    setTimeout(() => ctl.abort(), 10);
+    const result = await executor.invoke(base);
+    expect(result.failure?.code).toBe("INVOCATION_CANCELLED");
+  });
+
+  it("routes a driver-reported stdin failure through the spawn rail", async () => {
+    const { executor } = withDriver([{ hang: true, dieOn: ["SIGTERM"] }], async () => okTransport({ stopReason: "stdin" }));
+    await expect(executor.invoke(base)).rejects.toMatchObject({ codexSpawnFailure: true });
+  });
+
+  it("validates structured output from the driver against the schema", async () => {
+    const t = okTransport();
+    const { executor } = withDriver([{ hang: true, dieOn: ["SIGTERM"] }], async () => ({
+      ...t,
+      result: { ...t.result, stdout: '{"approved":"yes"}', structuredOutput: { approved: "yes", summary: "s" } },
+    }));
+    const result = await executor.invoke({ ...base, jsonSchema: VERDICT_SCHEMA, expectsStructuredOutput: true });
+    expect(result.structuredOutput).toBeUndefined();
+    expect(result.failure?.category).toBe("invalid_output");
+  });
+
+  it("redacts selected credentials from driver output and child stderr", async () => {
+    const t = okTransport();
+    const { executor } = withDriver([{ hang: true, dieOn: ["SIGTERM"], stderr: `leaked ${SYNTHETIC_KEY}` }], async () => {
+      await new Promise((r) => setTimeout(r, 15));
+      return { ...t, result: { ...t.result, stdout: `out ${SYNTHETIC_KEY}` } };
+    });
+    const result = await executor.invoke(base);
+    expect(result.stdout).not.toContain(SYNTHETIC_KEY);
+    expect(result.stderr).not.toContain(SYNTHETIC_KEY);
+  });
+
+  it("converts a throwing driver into an unsafe, non-retried failure", async () => {
+    const { executor, log } = withDriver([{ hang: true, dieOn: ["SIGTERM"] }], async () => {
+      throw new Error("boom");
+    });
+    const result = await executor.invoke({ ...base, ...retry });
+    expect(result.exitCode).toBe(1);
+    expect(result.failure).toBeDefined();
+    expect(log).toHaveLength(1);
+  });
 });
