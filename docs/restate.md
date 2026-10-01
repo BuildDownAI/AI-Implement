@@ -304,6 +304,8 @@ Restate re-delivers an invocation whose attempt died: a process crash, a dropped
 
 ## Writing a workflow for a run kind
 
+The feature inventory, with which run kinds use each Restate feature, is [restate-feature-map.md](restate-feature-map.md).
+
 A run kind's services live in `src/restate/<kind>-workflow.ts` and `src/restate/<kind>-<resource>.ts`, built by factory functions that take one deps object, composed once in `src/restate/<kind>-production.ts`, and passed to `startRestateEndpoint` from `src/index.ts`. The pattern is `src/restate/kg-refresh-workflow.ts`, `src/restate/kg-repo.ts`, and `src/restate/kg-refresh-production.ts`.
 
 - **Two services.** A coordinator object per resource (`KgRepo`, keyed by the KG source repo) and a workflow per trigger (`KgRefresh`, keyed by a trigger id the object mints). The object's exclusive handler is the lock: it holds the in-flight marker and submits the workflow by one-way send; the workflow's terminal step sends `release`. Shared admission (`dispatch_admissions`) is for run kinds that compete for team capacity with another owner; a run kind with one owner uses the object (ADR 032).
