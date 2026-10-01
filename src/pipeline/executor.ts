@@ -289,7 +289,7 @@ function markNotASpawnFailure(err: unknown): Error & { notASpawnFailure: true } 
   return Object.assign(errOut, { notASpawnFailure: true as const });
 }
 
-function suspendOriginWriteCredential(workspaceDir: string): (() => void) | null {
+export function suspendOriginWriteCredential(workspaceDir: string): (() => void) | null {
   const current = spawnSync("git", ["remote", "get-url", "origin"], {
     cwd: workspaceDir,
     stdio: ["ignore", "pipe", "pipe"],
