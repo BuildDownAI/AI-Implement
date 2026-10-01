@@ -96,6 +96,9 @@ describe("KgRefresh durable workflow", () => {
   let materializeImpl: (python: string, cwd: string) => Promise<void>;
   let materializeCallCount = 0;
   let fetchTarballCallCount = 0;
+  let fetchTarballFailure = false;
+  /** The order the rail fakes ran in: fetch, stage, swap, verify. Reset per test. */
+  let gateOrder: string[] = [];
   let mintTokenImpl: () => Promise<{ token: string; expiresAt: string }>;
   let loadSnapshotShaImpl: () => string | null;
   let mergeDelayMs: number;
@@ -136,6 +139,7 @@ describe("KgRefresh durable workflow", () => {
     if (tool === "kg_neighbors") {
       return { edges: [{ predicate_iri: "http://purl.org/dc/terms/modified", neighbor: servedStamp }] };
     }
+    if (tool === "kg_hybrid_search") gateOrder.push("verify");
     if (tool === "kg_hybrid_search") return { count: canary.count, degraded: canary.degraded, results: [] };
     throw new Error(`unexpected tool ${tool}`);
   };
@@ -154,7 +158,7 @@ describe("KgRefresh durable workflow", () => {
   // Stable wrapper object registered once at describe scope, delegating to the mutable
   // `...Impl` closures above so each test's `beforeEach` can reconfigure behavior freely.
   const rail: KgRailDeps = {
-    sidecar: { restart: () => { restartCallCount++; return restartImpl(); } },
+    sidecar: { restart: () => { restartCallCount++; gateOrder.push("swap"); return restartImpl(); } },
     githubAppId: "test-app-id",
     githubAppPrivateKey: "test-private-key",
     kgSourceRepo: KG_SOURCE_REPO,
@@ -164,10 +168,15 @@ describe("KgRefresh durable workflow", () => {
     canaryDeadlineMs: 300,
     canaryRetryMs: 30,
     mintToken: (() => mintTokenImpl()) as unknown as KgRailDeps["mintToken"],
-    fetchTarball: (async () => { fetchTarballCallCount++; return tarball; }) as unknown as KgRailDeps["fetchTarball"],
+    fetchTarball: (async () => {
+      fetchTarballCallCount++;
+      gateOrder.push("fetch");
+      if (fetchTarballFailure) throw new Error("tarball download failed");
+      return tarball;
+    }) as unknown as KgRailDeps["fetchTarball"],
     fetchDefaultBranch: (async () => "main") as unknown as KgRailDeps["fetchDefaultBranch"],
     fetchSnapshotCommitSha: (async () => SNAPSHOT_SHA) as unknown as KgRailDeps["fetchSnapshotCommitSha"],
-    materialize: (python: string, cwd: string) => { materializeCallCount++; return materializeImpl(python, cwd); },
+    materialize: (python: string, cwd: string) => { materializeCallCount++; gateOrder.push("stage"); return materializeImpl(python, cwd); },
     mcpToolCall,
     persistSnapshotSha: persistSnapshotShaFn,
     loadSnapshotSha: () => loadSnapshotShaImpl(),
@@ -207,6 +216,8 @@ describe("KgRefresh durable workflow", () => {
     restartCallCount = 0;
     materializeCallCount = 0;
     fetchTarballCallCount = 0;
+    fetchTarballFailure = false;
+    gateOrder = [];
     holdNextMcpCall = null;
     reserveFailuresRemaining = 0;
     persistHold = null;
@@ -508,7 +519,7 @@ describe("KgRefresh durable workflow", () => {
   // ---- fetchGate's documented "ingest-needed" short-circuit (kg-refresh-rail.ts:164-196):
   // reachable post-merge whenever the freshly-fetched source's snapshot/-touching commit
   // already matches the persisted SHA (e.g. a prior refresh's verifyGate persisted it on its
-  // stamp-mismatch path). `runRail` treats this as a graceful no-op with no stage/swap/verify
+  // stamp-mismatch path). the workflow treats this as a graceful no-op with no stage/swap/verify
   // and no revert; the workflow's gates loop must do the same instead of feeding a
   // `sourceDir`-less context into stageGate. ----
   it.each(VARIANTS.map(([label]) => label))(
@@ -543,6 +554,103 @@ describe("KgRefresh durable workflow", () => {
       expect(existsSync(join(dataRoot, "staging"))).toBe(false);
     },
     15_000,
+  );
+
+  // ---- The rail scenarios the former single-call rail unit tests covered (AII-1011) ----
+  it.each(VARIANTS.map(([label]) => label))(
+    "the gates run in order fetch, stage, swap, verify on a success report (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      const outcome = await done;
+
+      expect(outcome.ok).toBe(true);
+      expect(outcome.stampBefore).toBe(OLD_STAMP);
+      expect(outcome.stampAfter).toBe(NEW_STAMP);
+      expect(existsSync(join(dataRoot, "current", COMPLETION_MARKER))).toBe(true);
+      // Replay re-reads journaled results rather than re-running a gate, so each fake runs once.
+      expect(gateOrder).toEqual(["fetch", "stage", "swap", "verify"]);
+    },
+    15_000,
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "a snapshot with no committed embeddings ends as a graceful no-op without materialize, swap, or revert (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+      rmSync(join(fixtureRepo, "snapshot", "embeddings.npz"));
+      rmSync(join(fixtureRepo, "snapshot", "embeddings.meta.json"));
+      tarball = makeTarball(fixtureRepo);
+
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      const outcome = await done;
+
+      expect(outcome.ok).toBe(true);
+      expect(outcome.detail).toContain("no committed embeddings");
+      expect(materializeCallCount).toBe(0);
+      expect(restartCallCount).toBe(0);
+    },
+    15_000,
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "a fetch gate failure fails the run as staging and never reverts (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+      fetchTarballFailure = true;
+
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      const outcome = await done;
+
+      expect(outcome.ok).toBe(false);
+      expect(outcome.gate).toBe("staging");
+      expect(materializeCallCount).toBe(0);
+      expect(restartCallCount).toBe(0);
+      expect(existsSync(join(dataRoot, "staging"))).toBe(false);
+      expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("staging");
+    },
+    15_000,
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "a plain Error from the swap gate is retried by the invocation and does not revert (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+      let swapAttempts = 0;
+      restartImpl = async () => {
+        swapAttempts++;
+        if (swapAttempts === 1) throw new Error("sidecar restart failed");
+        servedStamp = NEW_STAMP;
+      };
+
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      const outcome = await done;
+
+      // A non-terminal error is not a RailGateError: nothing reverts, the step retries, and the
+      // run succeeds. A revert would show up as an extra restart before the successful one.
+      expect(outcome.ok).toBe(true);
+      expect(swapAttempts).toBe(2);
+      expect(restartCallCount).toBe(2);
+      expect(existsSync(join(dataRoot, "rejected"))).toBe(false);
+    },
+    30_000,
   );
 
   // ---- W19: mergeSnapshotPr resolving to "blocked"/"conflict" (never throwing — the same

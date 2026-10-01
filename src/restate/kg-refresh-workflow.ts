@@ -39,7 +39,7 @@ import {
 import { parseKgSourceRepo } from "../deploy.js";
 import type { KgRepoDefinition } from "./kg-refresh-types.js";
 
-/** The value of `KG_REFRESH_TTL_MS` in `src/kg-refresh.ts:50` — how long a dispatch may run before it is treated as lost. */
+/** The value of `KG_REFRESH_TTL_MS` of the dispatch watch — how long a dispatch may run before it is treated as lost. */
 export const KG_REFRESH_TOTAL_DEADLINE_MS = 4 * 60 * 60 * 1000;
 /** Grace added on top of the total deadline before `KgRepo` treats an in-flight marker as stale rather than live. */
 export const KG_REPO_STALE_MARGIN_MS = 10 * 60 * 1000;
@@ -57,7 +57,7 @@ const KG_REFRESH_CANCEL_WATCH_INTERVAL_MS = 60 * 1000;
 
 const GHA_EXECUTION_MODE = "github-actions";
 
-/** The PR a dry-run reports back to — the wire shape of `KgDryRunReportTarget` (`src/webhook.ts`), `acceptBaseline` included so it is not stripped. */
+/** The PR a dry-run reports back to — the wire shape of `KgDryRunReportTarget` (`src/kg-refresh.ts`), `acceptBaseline` included so it is not stripped. */
 export const kgDryRunReportSchema = z.object({
   repo: z.string(),
   prNumber: z.number(),
@@ -576,9 +576,8 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
 
         // fetchGate's documented short-circuit (kg-refresh-rail.ts:164-196): the just-fetched
         // source's snapshot/-touching commit already matches the persisted SHA, so there is
-        // nothing to stage/swap/verify — mirrors `runRail`'s own early return
-        // (kg-refresh-rail.ts:377) rather than feeding a `sourceDir`-less context into
-        // `stageGate`, which would throw and trigger a spurious revert of a healthy overlay.
+        // nothing to stage/swap/verify. Feeding a `sourceDir`-less context into
+        // `stageGate` would throw and trigger a spurious revert of a healthy overlay.
         if (name === "fetch" && railCtx.gate === "ingest-needed") {
           ctx.set("step", "no-new-data");
           const at = await ctx.date.now();

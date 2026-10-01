@@ -31,7 +31,7 @@ export interface DispatchInputs {
   base_branch?: string;
   /**
    * Explicit callback phase reported by the runner. In envelope mode rides inside run_config.
-   * `"kg-refresh"` is the GHA-backed kg-refresh dispatch (src/index.ts `dispatchKgRefreshRun`),
+   * `"kg-refresh"` is the GHA-backed kg-refresh dispatch (`createKgRefreshDispatch`),
    * the one dispatch site that still sends this input top-level under the envelope contract.
    */
   runner_phase?: "implementation" | "gap-analysis" | "kg-refresh";
@@ -104,7 +104,7 @@ export interface DispatchResult {
 /**
  * `workflow_dispatch` inputs that an older synced `claude-implement.yml` still declares but a
  * newer template drops, because their values now ride inside `run_config` instead. Only the
- * kg-refresh GHA dispatch (`dispatchKgRefreshRun` in `src/index.ts`) still sends these
+ * kg-refresh GHA dispatch (`createKgRefreshDispatch`) still sends these
  * top-level — every other dispatch site already builds inputs via `buildEnvelopeDispatchInputs`,
  * which never sets them. `postWorkflowDispatch` strips whichever of these a 422 names and
  * retries — **at most once**, regardless of what the retry's own response says — so the
@@ -846,12 +846,6 @@ export async function findWorkflowRunId(
   return fallback;
 }
 
-export const KG_GHA_POLL_DELAYS_MS: readonly number[] = [5_000, 10_000, 20_000, 30_000, 25_000];
-
-/**
- * Polls for a kg-refresh workflow run ID up to ~90 s after dispatch.
- * Injectable findRunId and pollDelaysMs for testability.
- */
 /**
  * Builds the `workflow_dispatch` inputs for a GHA-backed kg-refresh run, for use with
  * `postWorkflowDispatch`. The envelope's `runnerCallbackUrl` is the bare base URL (AII-548);
@@ -859,8 +853,8 @@ export const KG_GHA_POLL_DELAYS_MS: readonly number[] = [5_000, 10_000, 20_000, 
  * (AII-556) — it, `runner_callback_url`, and `issue_identifier` are members of
  * `ENVELOPE_OPTIONAL_INPUTS` and are stripped by the poster on a 422 from a target repo that no
  * longer declares them. `issueIdentifier` is the decoded run_config's `issue.identifier` — the
- * caller (`dispatchKgRefreshRun` in `src/index.ts`) already decodes run_config once for
- * `kgSourceRef` and threads the same decode through here rather than decoding twice.
+ * caller (`createKgRefreshDispatch`) decodes run_config once and
+ * threads `issue.identifier` through here.
  */
 export function buildKgRefreshGhaDispatchBody(opts: {
   runConfig: string;
@@ -884,33 +878,6 @@ export function buildKgRefreshGhaDispatchBody(opts: {
     ...(opts.runnerCallbackUrl ? { runner_callback_url: opts.runnerCallbackUrl } : {}),
     ...(opts.issueIdentifier ? { issue_identifier: opts.issueIdentifier } : {}),
   };
-}
-
-export async function pollForKgWorkflowRunId(opts: {
-  token: string;
-  owner: string;
-  repo: string;
-  workflowFile: string;
-  branch: string;
-  dispatchTime: Date;
-  pollDelaysMs?: readonly number[];
-  findRunId?: (
-    token: string, owner: string, repo: string, workflowFile: string, branch: string, dispatchedAfter: Date,
-  ) => Promise<number | null>;
-}): Promise<number | undefined> {
-  const {
-    token, owner, repo, workflowFile, branch, dispatchTime,
-    pollDelaysMs = KG_GHA_POLL_DELAYS_MS,
-    findRunId = findWorkflowRunId,
-  } = opts;
-  for (const delay of pollDelaysMs) {
-    await new Promise<void>((r) => setTimeout(r, delay));
-    try {
-      const runId = await findRunId(token, owner, repo, workflowFile, branch, dispatchTime);
-      if (runId) return runId;
-    } catch { /* non-fatal — keep polling */ }
-  }
-  return undefined;
 }
 
 export interface WorkflowRunStatus {

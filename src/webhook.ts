@@ -11,6 +11,7 @@ import { resolveWorkflowContract } from "./workflow-probe.js";
 import { enqueueCommentGapfill } from "./comment-gapfill-queue.js";
 import { addCommentReaction, listPullRequestFiles } from "./github.js";
 import { refreshAvailability, type SelfDeployTarget } from "./deploy-availability.js";
+import type { KgDryRunReportTarget } from "./kg-refresh.js";
 
 function readRawBody(req: http.IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
@@ -51,18 +52,6 @@ interface PullRequestPayload {
   repository?: {
     full_name?: string;
   };
-}
-
-/**
- * KG PR-triggered dry-run rail (AII-633): wired by the caller when a kg-refresh handle
- * exists. `trigger`/`reportDryRun` are `KgRefreshHandle` methods; kept as a narrow
- * structural type here to avoid an import cycle with kg-refresh.ts.
- */
-export interface KgDryRunReportTarget {
-  repo: string;
-  prNumber: number;
-  sha: string;
-  acceptBaseline?: boolean;
 }
 
 export interface KgPrCheckConfig {

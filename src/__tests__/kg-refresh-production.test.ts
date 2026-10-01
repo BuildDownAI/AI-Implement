@@ -203,18 +203,6 @@ describe("dispatch_log job row lifecycle", () => {
     capturedWorkflowDeps.current!.closeJobLog("unknown", "failed");
     expect(updateJobStatus).toHaveBeenCalledTimes(1);
   });
-
-  it("prefers the in-memory id from appendJobLog", () => {
-    const updateJobStatus = vi.fn();
-    const findJobId = vi.fn();
-    appendLogIfAbsent.mockReset().mockReturnValue(7);
-    createProductionKgRefreshServices(makeInput({ updateJobStatus, findJobId }));
-    capturedWorkflowDeps.current!.appendJobLog({ dispatchId: "d-2", jobId: "d-2" });
-    findJobId.mockClear();
-    capturedWorkflowDeps.current!.closeJobLog("d-2", "failed", "x");
-    expect(updateJobStatus).toHaveBeenCalledWith(7, "failed", "x");
-    expect(findJobId).not.toHaveBeenCalled();
-  });
 });
 
 describe("appendJobLog execution mode", () => {

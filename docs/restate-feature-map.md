@@ -134,7 +134,7 @@ use them yet.
 | Dead branch: `kgStageForStep` matched `watch-`/`reconcile-` that `step` never holds | — | done (AII-975) |
 | `dryRunOutcomesByPr` (memory + the `kg_refresh_dry_run_outcomes` settings row), `kgDryRunLastSha` (memory) | `KgRepo` state (per-PR keys) | done (AII-977); the settings row is deleted at boot (`src/kg-refresh.ts`) |
 | Own `cancel` promise + poll until GitHub confirms | invocation cancellation | stays, justified: the cancel path must hold the marker until GitHub confirms that the run stopped |
-| Job-row id in a process `Map` with SQL fallback (`jobIds`, `src/restate/kg-refresh-production.ts`) | return the id from `ctx.run("reserve")` | stays; small |
+| Job-row id in a process `Map` with SQL fallback (`jobIds`, `src/restate/kg-refresh-production.ts`) | return the id from `ctx.run("reserve")` | done (AII-1011): the map is gone; `closeJobLog` resolves the row by dispatch id |
 | `kg_refresh_last_refresh` / `kg_refresh_snapshot_sha` settings rows (`src/kg-refresh.ts`) | `KgRepo` state | stays; the served-snapshot record is read outside Restate at boot |
 | Run-watch map from GitHub run id to awakeable id (a `settings` row per run, `runWatchKey`) | — | new with AII-974; the webhook route needs the lookup outside a handler. Cleared by the `forget-run-watch` step on every terminal path |
 

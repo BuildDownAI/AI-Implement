@@ -7,12 +7,8 @@ import { promisify } from "node:util";
 import http from "node:http";
 import { parse as parseYaml } from "yaml";
 import { getScopedInstallationToken } from "./github-app-auth.js";
-import {
-  fetchRepoTarball, mergePullRequest, closePullRequest, postPrComment, deleteBranch,
-  postOrUpdateStickyComment, setCommitStatus,
-} from "./github.js";
+import { fetchRepoTarball, postOrUpdateStickyComment, setCommitStatus } from "./github.js";
 import { extractSource, parseKgSourceRepo } from "./deploy.js";
-import { KG_DIR } from "./kg-sidecar.js";
 import { parseSidecarRpcResponse } from "./kg-provider.js";
 import type { SidecarHealth } from "./kg-provider.js";
 import { getDb } from "./dedup.js";
@@ -24,7 +20,6 @@ import {
   DEFAULT_BASE_REPO,
 } from "./pipeline/steps/kg-tracker-data.js";
 import { postDryRunReport } from "./kg-refresh-rail.js";
-import type { KgRailDeps } from "./kg-refresh-rail.js";
 
 const execFile = promisify(execFileCb);
 
@@ -214,37 +209,12 @@ export interface KgDryRunOutcomeStore {
 }
 
 interface KgRefreshInput {
-  /** The supervised sidecar from AII-425; restart() is the reload mechanism. */
-  sidecar: { restart(): Promise<void> };
   githubAppId: string;
   githubAppPrivateKey: string;
   /** owner/repo of the KG source (config.kgSourceRepo — never hard-code the slug). */
   kgSourceRepo: string | null;
   /** Overrides for tests. */
-  dataRoot?: string;
-  kgDir?: string;
-  sidecarMcpUrl?: string;
   mintToken?: typeof getScopedInstallationToken;
-  fetchTarball?: typeof fetchRepoTarball;
-  fetchDefaultBranch?: (token: string, owner: string, repo: string) => Promise<string>;
-  /** Returns the head commit SHA of the latest commit touching `snapshot/` on the default branch, or null on failure. */
-  fetchSnapshotCommitSha?: (token: string, owner: string, repo: string, branch: string) => Promise<string | null>;
-  /** Persist the head `snapshot/` commit SHA after the rail stages a snapshot. Injectable for tests. */
-  persistSnapshotSha?: (sha: string) => void;
-  /** Load the persisted `snapshot/` commit SHA. Injectable for tests; returns null when absent. */
-  loadSnapshotSha?: () => string | null;
-  materialize?: (python: string, cwd: string) => Promise<void>;
-  mcpToolCall?: (url: string, tool: string, args: Record<string, unknown>) => Promise<unknown>;
-  canaryDeadlineMs?: number;
-  canaryRetryMs?: number;
-  /** Merge the runner-opened snapshot PR. Injectable for tests; defaults to mergePullRequest from github.ts. */
-  mergePullRequestFn?: typeof mergePullRequest;
-  /** Close the snapshot PR on a failed callback. Injectable for tests; defaults to closePullRequest from github.ts. */
-  closePullRequestFn?: typeof closePullRequest;
-  /** Delete the `kg-refresh/<stamp>` branch after merge or close. Injectable for tests; defaults to deleteBranch from github.ts. */
-  deleteBranchFn?: typeof deleteBranch;
-  /** Post the closing comment on the snapshot PR. Injectable for tests; defaults to postPrComment from github.ts. */
-  postPrCommentFn?: typeof postPrComment;
   /** Post or update the sticky dry-run PR comment (AII-633). Injectable for tests; defaults to postOrUpdateStickyComment from github.ts. */
   postOrUpdateStickyCommentFn?: typeof postOrUpdateStickyComment;
   /** Set the dry-run commit status (AII-633). Injectable for tests; defaults to setCommitStatus from github.ts. */
@@ -409,7 +379,7 @@ export async function runKgRefreshPreflight(input: KgPreflightInput): Promise<Pr
   // AII-654): the rail's phase and callback URL only ride the top-level runner_phase/
   // runner_callback_url inputs on the legacy contract, and any envelope template — which
   // declares run_config and reads the phase from it (AII-653) — works regardless of whether
-  // it still declares those two optional inputs (dispatchKgRefreshRun strips them on a 422).
+  // it still declares those two optional inputs (the poster strips them on a 422).
   // Reuses the read token/branch minted above when available.
   try {
     const token = sourcesReadToken ?? (await mintTokenFn(input.githubAppId, input.githubAppPrivateKey, repo.owner, {
@@ -554,51 +524,13 @@ export async function runKgRefreshPreflight(input: KgPreflightInput): Promise<Pr
  * deadlines, the local rail) runs in the `KgRefresh` workflow.
  */
 export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
-  const dataRoot = input.dataRoot ?? DATA_ROOT;
-  const kgDir = input.kgDir ?? KG_DIR;
-  const mcpUrl = input.sidecarMcpUrl ?? SIDECAR_MCP_URL;
-  const mintToken = input.mintToken ?? getScopedInstallationToken;
-  const fetchTarball = input.fetchTarball ?? fetchRepoTarball;
-  const fetchDefaultBranch = input.fetchDefaultBranch ?? defaultFetchDefaultBranch;
-  const fetchSnapshotCommitSha = input.fetchSnapshotCommitSha ?? defaultFetchSnapshotCommitSha;
-  const persistSnapshotShaFn = input.persistSnapshotSha ?? defaultPersistSnapshotSha;
-  const loadSnapshotShaFn = input.loadSnapshotSha ?? defaultLoadSnapshotSha;
-  const materialize = input.materialize ?? defaultMaterialize;
-  const mcpToolCall = input.mcpToolCall ?? defaultMcpToolCall;
-  const canaryDeadlineMs = input.canaryDeadlineMs ?? CANARY_DEADLINE_MS;
-  const canaryRetryMs = input.canaryRetryMs ?? CANARY_RETRY_MS;
-  const mergePullRequestFn = input.mergePullRequestFn ?? mergePullRequest;
-  const closePullRequestFn = input.closePullRequestFn ?? closePullRequest;
-  const deleteBranchFn = input.deleteBranchFn ?? deleteBranch;
-  const postPrCommentFn = input.postPrCommentFn ?? postPrComment;
-  const postOrUpdateStickyCommentFn = input.postOrUpdateStickyCommentFn ?? postOrUpdateStickyComment;
-  const setCommitStatusFn = input.setCommitStatusFn ?? setCommitStatus;
-
-  /** Everything the rail's PR-facing functions read, built once from this handle's resolved config. */
-  const railDeps: KgRailDeps = {
-    sidecar: input.sidecar,
+  /** What `postDryRunReport` reads, built once from this handle's resolved config. */
+  const reportDeps = {
     githubAppId: input.githubAppId,
     githubAppPrivateKey: input.githubAppPrivateKey,
-    kgSourceRepo: input.kgSourceRepo,
-    dataRoot,
-    kgDir,
-    sidecarMcpUrl: mcpUrl,
-    canaryDeadlineMs,
-    canaryRetryMs,
-    mintToken,
-    fetchTarball,
-    fetchDefaultBranch,
-    fetchSnapshotCommitSha,
-    materialize,
-    mcpToolCall,
-    persistSnapshotSha: persistSnapshotShaFn,
-    loadSnapshotSha: loadSnapshotShaFn,
-    mergePullRequestFn,
-    closePullRequestFn,
-    deleteBranchFn,
-    postPrCommentFn,
-    postOrUpdateStickyCommentFn,
-    setCommitStatusFn,
+    mintToken: input.mintToken ?? getScopedInstallationToken,
+    postOrUpdateStickyCommentFn: input.postOrUpdateStickyCommentFn ?? postOrUpdateStickyComment,
+    setCommitStatusFn: input.setCommitStatusFn ?? setCommitStatus,
   };
 
   /** The `KgRepo` object key — the bound KG source repo, the same one `enqueueDryRun` uses. */
@@ -615,7 +547,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
         console.debug(`[kg-refresh] dry-run report skipped: no outcome for ${report.repo}#${report.prNumber}`);
         return false;
       }
-      await postDryRunReport(railDeps, report, stored.outcome);
+      await postDryRunReport(reportDeps, report, stored.outcome);
       return true;
     },
 

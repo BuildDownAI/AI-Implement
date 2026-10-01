@@ -1244,7 +1244,7 @@ export async function handleRunnerProgress(
   const verified = verifyRunToken(bearerToken, input.secret, "progress", { consume: false });
   if (!verified.ok) return bad(401, verified.reason);
 
-  // kg-refresh has no job row; its progress is a heartbeat on the KgRefresh workflow (AII-899).
+  // kg-refresh progress goes to the KgRefresh workflow as a heartbeat (AII-899), not to the job row.
   if (verified.claims.phase === "kg-refresh") {
     if (!input.kgRefreshClient) return bad(503, "kg_refresh_unavailable");
     const progressed = await input.kgRefreshClient.progress(verified.claims.dispatchId);

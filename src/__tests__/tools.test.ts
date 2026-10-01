@@ -760,7 +760,6 @@ describe("migrated read handlers (AII-711)", () => {
       ["canary", failed("canary"), "reverted"],
       ["stamp", failed("stamp"), "reverted"],
       ["ingest-needed", failed("ingest-needed"), "idle"],
-      ["no-new-data", failed("no-new-data"), "idle"],
       ["preflight", failed("preflight"), "failed"],
     ])("idle: %s → %s", async (_name, last, stage) => {
       const status = await stageFor({ last });
