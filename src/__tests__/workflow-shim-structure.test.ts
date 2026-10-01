@@ -116,6 +116,24 @@ describe("GHA workflow shims", () => {
     }
   });
 
+  for (const f of [...IMPLEMENT_WORKFLOWS, ...PLANNING_WORKFLOWS]) {
+    it(`${f} advertises the static private-envelope marker without a dispatch input`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      expect(yaml).toMatch(/^# ai-implement-capability: private-run-config-v1$/m);
+      expect(yaml).not.toMatch(/stage-agent-config/);
+      const doc = parse(yaml) as any;
+      for (const name of Object.keys(doc.on.workflow_dispatch.inputs)) {
+        expect(name).not.toMatch(/private|capab|marker/i);
+      }
+    });
+
+    it(`${f} never decodes or dumps run_config outside the projection`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      expect(yaml).not.toMatch(/base64 -d \| jq \.\s/);
+      expect(yaml).not.toMatch(/set -[a-z]*x/);
+    });
+  }
+
   for (const f of IMPLEMENT_WORKFLOWS) {
     it(`${f} declares the optional attempt correlation input alongside the legacy envelope inputs`, () => {
       const doc = parse(readFileSync(f, "utf-8")) as any;
