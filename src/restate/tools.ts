@@ -35,6 +35,7 @@ import {
   triggerWorkflowSyncAction,
   clearDedupEntryAction,
   type AdminConfig,
+  type ReviewFixAttemptsFacade,
   type UpsertMappingBody,
 } from "../admin.js";
 import { providerConfigFromEnv, ProviderRegistry } from "../providers/index.js";
@@ -62,8 +63,10 @@ interface ToolOptions<I extends z.ZodType> {
   description: string;
   input: I;
   role: AccessRole;
+  /** Declares mutability for wrapper write-audit logging. Defaults preserve the original rule: admin-role tools are writes. */
+  operation?: "read" | "write";
   /**
-   * Only a write (`role: "admin"`) handler sets this — `{ maxAttempts: 1, onMaxAttempts: "kill" }`
+   * Only a declared write handler sets this — `{ maxAttempts: 1, onMaxAttempts: "kill" }`
    * (AII-717, ADR 025 amendment). An attempt that dies with the orchestrator process is killed
    * rather than re-delivered, so a crash can never cause Restate to run the handler body a
    * second time. Paired with `ctx.run` around the handler's own side effect (docs/restate.md
@@ -99,11 +102,12 @@ export type WireInput<I extends z.ZodType> = z.infer<ReturnType<typeof wireInput
  * dropped connection) is not a handler error — `restate.internal.isSuspendedError` detects
  * it and it is rethrown unconverted so the SDK can suspend and resume the invocation.
  *
- * A `role: "admin"` tool is a declared write (ADR 015): every call to one, allowed or
- * refused, is logged here — inside the wrapper, not the `/mcp` adapter — so a call that
- * reaches a handler through `POST /api/tools/<name>` or `callToolAsSystem` (AII-712),
+ * A declared write is audited here — inside the wrapper, not the `/mcp` adapter — so a call
+ * that reaches a handler through `POST /api/tools/<name>` or `callToolAsSystem` (AII-712),
  * which never passes through the adapter, is still audited. `WRITE_TOOLS` in `src/mcp.ts`
- * used to be the only place this line was written (AII-713 retired it).
+ * used to be the only place this line was written (AII-713 retired it). Existing
+ * `role: "admin"` handlers default to writes for compatibility; privileged reads set
+ * `operation: "read"` explicitly.
  */
 export function tool<I extends z.ZodType>(
   opts: ToolOptions<I>,
@@ -120,8 +124,9 @@ export function tool<I extends z.ZodType>(
     },
     async (ctx: restate.Context, input: WireInput<I>): Promise<ToolResponse> => {
       const name = ctx.request().target.handler;
+      const operation = opts.operation ?? (opts.role === "admin" ? "write" : "read");
       const audit = (result: "forbidden" | "ok" | "error"): void => {
-        if (opts.role !== "admin") return;
+        if (operation !== "write") return;
         const actor = input.caller.email ?? "system";
         console.log(
           `[mcp] write tool=${name} actor=${actor} role=${input.caller.role ?? "null"} result=${result} kind=${input.caller.kind}`,
@@ -448,6 +453,83 @@ export const getKgStatusTool = tool(
   },
 );
 
+const REVIEW_FIX_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+const REVIEW_FIX_ID_MAX_LENGTH = 128;
+const ReviewFixIdSchema = z
+  .string()
+  .min(1)
+  .max(REVIEW_FIX_ID_MAX_LENGTH)
+  .regex(REVIEW_FIX_ID_PATTERN);
+
+const ReviewFixCursorSchema = z.object({
+  producerId: ReviewFixIdSchema,
+  sequence: z.number().int().nonnegative().safe(),
+});
+
+const ReviewFixAttemptArgsSchema = z.object({
+  attemptId: ReviewFixIdSchema,
+});
+
+const ReviewFixActivityArgsSchema = z.object({
+  attemptId: ReviewFixIdSchema,
+  pageSize: z.number().int().min(1).max(500).optional(),
+  cursor: ReviewFixCursorSchema.optional(),
+});
+
+type ReviewFixReadFacade = Pick<ReviewFixAttemptsFacade, "getAttempt" | "getActivity">;
+
+let reviewFixAttemptsFacade: ReviewFixReadFacade | null = null;
+
+export function setReviewFixAttemptsFacade(facade: ReviewFixReadFacade | null): void {
+  reviewFixAttemptsFacade = facade;
+}
+
+function reviewFixCaller(input: { caller: { role: AccessRole | null; email: string | null } }) {
+  return { role: input.caller.role ?? "user", email: input.caller.email };
+}
+
+export const GET_REVIEW_FIX_ATTEMPT_DESCRIPTION =
+  "Returns one Restate review-fix attempt detail by attemptId: owner, execution, deadline, pending feedback, snapshot, state, evidenceComplete, terminationConfirmed, and cycle summaries. Admin read.";
+
+export const getReviewFixAttemptTool = tool(
+  {
+    description: GET_REVIEW_FIX_ATTEMPT_DESCRIPTION,
+    input: ReviewFixAttemptArgsSchema,
+    role: "admin",
+    operation: "read",
+  },
+  async (_ctx, input): Promise<ToolResponse> => {
+    if (!reviewFixAttemptsFacade) {
+      return { content: [{ type: "text", text: JSON.stringify({ status: "unavailable" }, null, 2) }] };
+    }
+    const result = await reviewFixAttemptsFacade.getAttempt(input.args.attemptId, reviewFixCaller(input));
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  },
+);
+
+export const GET_REVIEW_FIX_ACTIVITY_DESCRIPTION =
+  "Returns one page of stored Restate review-fix activity for an attempt. Args: attemptId, optional pageSize 1..500 (default 100), optional cursor { producerId, sequence }. Admin read.";
+
+export const getReviewFixActivityTool = tool(
+  {
+    description: GET_REVIEW_FIX_ACTIVITY_DESCRIPTION,
+    input: ReviewFixActivityArgsSchema,
+    role: "admin",
+    operation: "read",
+  },
+  async (_ctx, input): Promise<ToolResponse> => {
+    if (!reviewFixAttemptsFacade) {
+      return { content: [{ type: "text", text: JSON.stringify({ status: "unavailable" }, null, 2) }] };
+    }
+    const result = await reviewFixAttemptsFacade.getActivity(
+      input.args.attemptId,
+      { cursor: input.args.cursor, pageSize: input.args.pageSize ?? 100 },
+      reviewFixCaller(input),
+    );
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  },
+);
+
 const KG_TOOL_DESCRIPTIONS: Record<string, string> = {
   kg_hybrid_search: "Hybrid (lexical + vector) search over the knowledge graph. Falls back to lexical-only when embeddings are degraded (see get_tenant_health's kgDegraded).",
   kg_search: "Lexical search over the knowledge graph.",
@@ -759,6 +841,8 @@ export const orchestratorTools = restate.service({
     get_fleet_report: getFleetReportTool,
     get_deploy_posture: getDeployPostureTool,
     get_kg_status: getKgStatusTool,
+    get_review_fix_attempt: getReviewFixAttemptTool,
+    get_review_fix_activity: getReviewFixActivityTool,
     kg_hybrid_search: kgHybridSearch,
     kg_search: kgSearch,
     kg_semantic_search: kgSemanticSearch,

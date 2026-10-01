@@ -20,6 +20,9 @@ import {
   getFleetReportTool,
   getDeployPostureTool,
   getKgStatusTool,
+  getReviewFixAttemptTool,
+  getReviewFixActivityTool,
+  setReviewFixAttemptsFacade,
   kgHybridSearch,
   kgSearch,
   kgSemanticSearch,
@@ -64,10 +67,12 @@ vi.mock("../admin.js", () => ({
  * real handler bodies too — calling one here exercises the real tool() wrapper's role check
  * and audit line, not just a stub.
  */
-const TOOL_HANDLERS: Record<
-  string,
-  (ctx: restate.Context, input: { caller: Caller; args: Record<string, unknown> }) => Promise<ToolResponse>
-> = {
+// The transport fixture erases individual argument shapes, as the ingress does before
+// each handler's serde validation. Method variance permits that heterogeneous catalog.
+type FixtureToolHandler = {
+  invoke(ctx: restate.Context, input: { caller: Caller; args: Record<string, unknown> }): Promise<ToolResponse>;
+}["invoke"];
+const TOOL_HANDLERS: Record<string, FixtureToolHandler> = {
   get_tenant_health: getTenantHealth,
   get_runner_mode: getRunnerModeTool,
   list_projects: listProjects,
@@ -77,6 +82,8 @@ const TOOL_HANDLERS: Record<
   get_fleet_report: getFleetReportTool,
   get_deploy_posture: getDeployPostureTool,
   get_kg_status: getKgStatusTool,
+  get_review_fix_attempt: getReviewFixAttemptTool,
+  get_review_fix_activity: getReviewFixActivityTool,
   kg_hybrid_search: kgHybridSearch,
   kg_search: kgSearch,
   kg_semantic_search: kgSemanticSearch,
@@ -91,7 +98,7 @@ const TOOL_HANDLERS: Record<
   clear_dispatch_dedup: clearDispatchDedupTool,
 };
 
-/** The six writes declare role: "admin" (src/restate/tools.ts); every other discoverable tool is "user". */
+/** The six writes plus two privileged review-fix reads declare role: "admin"; every other discoverable tool is "user". */
 const WRITE_TOOL_NAMES = new Set([
   "trigger_kg_refresh",
   "set_runner_mode",
@@ -100,12 +107,13 @@ const WRITE_TOOL_NAMES = new Set([
   "trigger_workflow_sync",
   "clear_dispatch_dedup",
 ]);
+const ADMIN_READ_TOOL_NAMES = new Set(["get_review_fix_attempt", "get_review_fix_activity"]);
 
 const DISCOVERED_TOOLS = Object.keys(TOOL_HANDLERS).map((name) => ({
   name,
   description: name === "get_tenant_health" ? GET_TENANT_HEALTH_DESCRIPTION : name,
   inputSchema: { type: "object", properties: {} },
-  role: (WRITE_TOOL_NAMES.has(name) ? "admin" : "user") as "admin" | "user",
+  role: (WRITE_TOOL_NAMES.has(name) || ADMIN_READ_TOOL_NAMES.has(name) ? "admin" : "user") as "admin" | "user",
 }));
 
 // AII-717: every write handler now runs its side effect through ctx.run — this fake just
@@ -357,6 +365,7 @@ beforeEach(async () => {
 
 afterEach(() => {
   vi.restoreAllMocks();
+  setReviewFixAttemptsFacade(null);
 });
 
 /** Set up a successful proxy response mock. */
@@ -1639,6 +1648,124 @@ describe("handleMcpRequest", () => {
         expect(adminNames).toContain(name);
         expect(userNames).toContain(name);
       }
+    });
+
+    it("lists review-fix read tools for admins only", async () => {
+      mockRole("admin");
+      const adminResult = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}',
+      );
+      const adminNames = JSON.parse(adminResult.body).result.tools.map((t: { name: string }) => t.name);
+
+      mockRole("user");
+      const userResult = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}',
+      );
+      const userNames = JSON.parse(userResult.body).result.tools.map((t: { name: string }) => t.name);
+
+      expect(adminNames).toEqual(expect.arrayContaining(["get_review_fix_attempt", "get_review_fix_activity"]));
+      expect(userNames).not.toContain("get_review_fix_attempt");
+      expect(userNames).not.toContain("get_review_fix_activity");
+    });
+  });
+
+  describe("tools/call — review-fix read tools", () => {
+    afterEach(() => {
+      setReviewFixAttemptsFacade(null);
+    });
+
+    it("as admin, calls get_review_fix_attempt and returns the status envelope", async () => {
+      mockRole("admin");
+      setReviewFixAttemptsFacade({
+        getAttempt: vi.fn(async () => ({
+          status: "ok" as const,
+          attempt: {
+            attemptId: "attempt-1",
+            owner: { kind: "restate", attemptId: "attempt-1" },
+            execution: null,
+            deadlineAt: 1,
+            pendingFeedback: false,
+            snapshot: null,
+            state: "running",
+            evidenceComplete: false,
+            terminationConfirmed: false,
+            cycles: [],
+          },
+        })),
+        getActivity: vi.fn(),
+      });
+
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 80,
+          method: "tools/call",
+          params: {
+            name: "get_review_fix_attempt",
+            arguments: { attemptId: "attempt-1" },
+            _meta: { idempotencyKey: "not-validated-for-reads!" },
+          },
+        }),
+      );
+
+      expect(result.statusCode).toBe(200);
+      const parsed = JSON.parse(result.body);
+      expect(parsed.result.isError).not.toBe(true);
+      expect(JSON.parse(parsed.result.content[0].text)).toEqual({
+        status: "ok",
+        attempt: expect.objectContaining({
+          attemptId: "attempt-1",
+          evidenceComplete: false,
+          terminationConfirmed: false,
+        }),
+      });
+      expect(toolsClientMock.callTool).toHaveBeenLastCalledWith(
+        "get_review_fix_attempt",
+        { attemptId: "attempt-1" },
+        { kind: "human", email: "user@example.com", role: "admin" },
+        undefined,
+      );
+    });
+
+    it("as user, refuses get_review_fix_activity before the facade runs", async () => {
+      mockRole("user");
+      const getActivity = vi.fn();
+      setReviewFixAttemptsFacade({ getAttempt: vi.fn(), getActivity });
+
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 81,
+          method: "tools/call",
+          params: { name: "get_review_fix_activity", arguments: { attemptId: "attempt-1" } },
+        }),
+      );
+
+      expect(result.statusCode).toBe(200);
+      const parsed = JSON.parse(result.body);
+      expect(parsed.result.isError).toBe(true);
+      expect(parsed.result.content[0].text).toBe("forbidden: get_review_fix_activity requires the admin role");
+      expect(getActivity).not.toHaveBeenCalled();
     });
   });
 

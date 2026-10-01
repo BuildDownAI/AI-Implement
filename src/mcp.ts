@@ -90,6 +90,8 @@ const RESTATE_TOOL_NAMES = new Set([
   "get_fleet_report",
   "get_deploy_posture",
   "get_kg_status",
+  "get_review_fix_attempt",
+  "get_review_fix_activity",
   "kg_hybrid_search",
   "kg_search",
   "kg_semantic_search",
