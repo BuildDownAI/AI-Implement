@@ -1307,6 +1307,37 @@ describe("KgRefresh durable workflow", () => {
   );
 
   it.each(VARIANTS.map(([label]) => label))(
+    "a RailGateError at stage leaves current/previous alone, discards staging, never restarts, and fails with the lock released (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+      for (const [name, content] of [["current", "CURRENT"], ["previous", "PREVIOUS"]]) {
+        mkdirSync(join(dataRoot, name), { recursive: true });
+        writeFileSync(join(dataRoot, name, "graph.trig"), content);
+      }
+      materializeImpl = async () => { throw new Error("OOM-killed"); };
+
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      const outcome = await done;
+
+      expect(outcome.ok).toBe(false);
+      expect(outcome.gate).toBe("staging");
+      expect(outcome.stampAfter).toBe(outcome.stampBefore);
+      expect(readFileSync(join(dataRoot, "current", "graph.trig"), "utf8")).toBe("CURRENT");
+      expect(readFileSync(join(dataRoot, "previous", "graph.trig"), "utf8")).toBe("PREVIOUS");
+      expect(existsSync(join(dataRoot, "rejected"))).toBe(false);
+      expect(existsSync(join(dataRoot, "staging"))).toBe(false);
+      expect(restartCallCount).toBe(0);
+      expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("staging");
+      await eventually(() => kgRepoStatus(env.baseUrl()), (marker) => marker === null, { label: "KgRepo marker cleared" });
+    },
+    15_000,
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
     "a TerminalError thrown by the swap gate still reverts and takes the failure path; the suspension guard does not swallow it (%s)",
     async (label) => {
       const env = envFor(label);

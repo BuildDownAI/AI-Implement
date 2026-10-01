@@ -109,6 +109,21 @@ describe("kg-refresh-rail", () => {
     vi.clearAllMocks();
   });
 
+  const STAGED_AT = "2026-10-01T00:00:00.000Z";
+
+  /** Writes `<dataRoot>/<name>/graph.trig` = content, plus a COMPLETION_MARKER when `marker` is given. */
+  function writeOverlay(name: string, content: string, marker?: string): void {
+    const dir = join(dataRoot, name);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "graph.trig"), content);
+    if (marker !== undefined) writeFileSync(join(dir, COMPLETION_MARKER), marker);
+  }
+
+  function readOverlay(name: string): string | null {
+    const file = join(dataRoot, name, "graph.trig");
+    return existsSync(file) ? readFileSync(file, "utf8") : null;
+  }
+
   // ── fetchGate ────────────────────────────────────────────────────────────
 
   describe("fetchGate", () => {
@@ -190,8 +205,8 @@ describe("kg-refresh-rail", () => {
     it("succeeds: materializes and copies into staging/, writing COMPLETION_MARKER last", async () => {
       const input = await fetchedInput();
       const result = await stageGate(makeDeps(), input);
-      expect(result).toBe(input);
       const staging = join(dataRoot, "staging");
+      expect(result).toEqual({ ...input, stagedAt: readFileSync(join(staging, COMPLETION_MARKER), "utf8") });
       expect(existsSync(join(staging, "graph.trig"))).toBe(true);
       expect(existsSync(join(staging, "embeddings.npz"))).toBe(true);
       expect(existsSync(join(staging, COMPLETION_MARKER))).toBe(true);
@@ -244,6 +259,47 @@ describe("kg-refresh-rail", () => {
       }
       expect(caught).toBeDefined();
       expect(caught).not.toBeInstanceOf(RailGateError);
+      expect(restart).not.toHaveBeenCalled();
+    });
+
+    it("is safe to replay: three calls with restart throwing on the first end with current = NEW, previous = OLD", async () => {
+      writeOverlay("current", "OLD", "old-marker");
+      writeOverlay("staging", "NEW", STAGED_AT);
+      let calls = 0;
+      restart.mockImplementation(async () => {
+        if (++calls === 1) throw new Error("crash after the renames");
+      });
+      const deps = makeDeps();
+      await expect(swapGate(deps, { stagedAt: STAGED_AT })).rejects.toThrow("crash after the renames");
+      await swapGate(deps, { stagedAt: STAGED_AT });
+      await swapGate(deps, { stagedAt: STAGED_AT });
+      expect(readOverlay("current")).toBe("NEW");
+      expect(readOverlay("previous")).toBe("OLD");
+      expect(existsSync(join(dataRoot, "staging"))).toBe(false);
+    });
+
+    it("is safe to replay after a stop between the two renames (current absent, previous = OLD, staging = NEW)", async () => {
+      writeOverlay("previous", "OLD", "old-marker");
+      writeOverlay("staging", "NEW", STAGED_AT);
+      await swapGate(makeDeps(), { stagedAt: STAGED_AT });
+      expect(readOverlay("current")).toBe("NEW");
+      expect(readOverlay("previous")).toBe("OLD");
+    });
+
+    it("staging absent and a different marker in current: throws a plain Error and moves nothing", async () => {
+      writeOverlay("current", "OTHER", "other-marker");
+      writeOverlay("previous", "OLD", "old-marker");
+      let caught: unknown;
+      try {
+        await swapGate(makeDeps(), { stagedAt: STAGED_AT });
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(Error);
+      expect(caught).not.toBeInstanceOf(RailGateError);
+      expect((caught as Error).message).toContain("staged overlay is missing");
+      expect(readOverlay("current")).toBe("OTHER");
+      expect(readOverlay("previous")).toBe("OLD");
       expect(restart).not.toHaveBeenCalled();
     });
   });
@@ -304,36 +360,63 @@ describe("kg-refresh-rail", () => {
   // ── revertRail ───────────────────────────────────────────────────────────
 
   describe("revertRail", () => {
-    it("withdraws the failed overlay to rejected/, restores previous, and restarts", async () => {
-      const current = join(dataRoot, "current");
-      const previous = join(dataRoot, "previous");
-      mkdirSync(current, { recursive: true });
-      writeFileSync(join(current, "graph.trig"), "FAILED-OVERLAY");
-      mkdirSync(previous, { recursive: true });
-      writeFileSync(join(previous, "graph.trig"), "GOOD-OVERLAY");
+    const revertInput = { namespace: NAMESPACE, gate: "canary" as const, detail: "canary failed", stampBefore: OLD_STAMP, stagedAt: STAGED_AT };
 
-      const deps = makeDeps();
-      const outcome = await revertRail(deps, { namespace: NAMESPACE, gate: "canary", detail: "canary failed", stampBefore: OLD_STAMP });
+    it("withdraws the failed overlay to rejected/, restores previous, and restarts", async () => {
+      writeOverlay("current", "FAILED-OVERLAY", STAGED_AT);
+      writeOverlay("previous", "GOOD-OVERLAY", "old-marker");
+
+      const outcome = await revertRail(makeDeps(), revertInput);
 
       expect(outcome.ok).toBe(false);
       expect(outcome.gate).toBe("canary");
       expect(outcome.detail).toContain("canary failed");
       expect(outcome.detail).toContain("reverted, serving stamp");
-      expect(readFileSync(join(current, "graph.trig"), "utf8")).toBe("GOOD-OVERLAY");
-      expect(readFileSync(join(dataRoot, "rejected", "graph.trig"), "utf8")).toBe("FAILED-OVERLAY");
+      expect(readOverlay("current")).toBe("GOOD-OVERLAY");
+      expect(readOverlay("rejected")).toBe("FAILED-OVERLAY");
       expect(restart).toHaveBeenCalledTimes(1);
     });
 
     it("with no previous overlay, withdraws current and leaves nothing serving (falls back to baked)", async () => {
-      const current = join(dataRoot, "current");
-      mkdirSync(current, { recursive: true });
-      writeFileSync(join(current, "graph.trig"), "FAILED-OVERLAY");
+      writeOverlay("current", "FAILED-OVERLAY", STAGED_AT);
 
+      await revertRail(makeDeps(), { ...revertInput, gate: "stamp", detail: "stamp did not move" });
+
+      expect(existsSync(join(dataRoot, "current"))).toBe(false);
+      expect(readOverlay("rejected")).toBe("FAILED-OVERLAY");
+    });
+
+    it("is safe to replay: two calls with restart throwing on the first end with current = OLD, rejected = NEW", async () => {
+      writeOverlay("current", "NEW", STAGED_AT);
+      writeOverlay("previous", "OLD", "old-marker");
+      let calls = 0;
+      restart.mockImplementation(async () => {
+        if (++calls === 1) throw new Error("crash after the renames");
+      });
       const deps = makeDeps();
-      await revertRail(deps, { namespace: NAMESPACE, gate: "stamp", detail: "stamp did not move", stampBefore: OLD_STAMP });
+      await expect(revertRail(deps, revertInput)).rejects.toThrow("crash after the renames");
+      await revertRail(deps, revertInput);
+      expect(readOverlay("current")).toBe("OLD");
+      expect(readOverlay("rejected")).toBe("NEW");
+    });
 
-      expect(existsSync(current)).toBe(false);
-      expect(readFileSync(join(dataRoot, "rejected", "graph.trig"), "utf8")).toBe("FAILED-OVERLAY");
+    it("moves nothing when current is not this run's overlay", async () => {
+      writeOverlay("current", "OTHER", "other-marker");
+      writeOverlay("previous", "OLD", "old-marker");
+      writeOverlay("rejected", "EARLIER", "earlier-marker");
+
+      await revertRail(makeDeps(), revertInput);
+
+      expect(readOverlay("current")).toBe("OTHER");
+      expect(readOverlay("previous")).toBe("OLD");
+      expect(readOverlay("rejected")).toBe("EARLIER");
+    });
+
+    it("moves nothing when stagedAt is null, even if current has no marker", async () => {
+      writeOverlay("current", "BAKED-FALLBACK");
+      await revertRail(makeDeps(), { ...revertInput, stagedAt: null });
+      expect(readOverlay("current")).toBe("BAKED-FALLBACK");
+      expect(existsSync(join(dataRoot, "rejected"))).toBe(false);
     });
   });
 
