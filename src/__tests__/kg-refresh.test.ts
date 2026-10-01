@@ -88,15 +88,10 @@ describe("kg-refresh", () => {
       dryRunOutcome = vi.fn(async () => result);
       forgetPrCall = vi.fn(async () => ({ status: "accepted" }));
       return makeKgRefresh({
-        sidecar: { restart: vi.fn(async () => {}) },
         githubAppId: "1",
         githubAppPrivateKey: "key",
         kgSourceRepo: "TestOrg/test-kg",
-        dataRoot: "/nonexistent-kg-root",
-        kgDir: "/nonexistent-kg",
         mintToken: vi.fn(async () => ({ token: "tok", expiresAt: "" })) as never,
-        fetchTarball: vi.fn() as never,
-        fetchDefaultBranch: vi.fn(async () => "main") as never,
         postOrUpdateStickyCommentFn: postOrUpdateStickyCommentFn as never,
         setCommitStatusFn: setCommitStatusFn as never,
         dryRunOutcomes: { dryRunOutcome, forgetPr: forgetPrCall } as never,

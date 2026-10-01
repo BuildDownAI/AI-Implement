@@ -43,8 +43,8 @@ import { createKgRepo, type KgRepoEnqueueInput, type KgRepoEnqueueResult, type K
 import type { KgRefreshDefinition, KgRepoDefinition } from "./kg-refresh-types.js";
 import { RESTATE_INGRESS_BASE_URL } from "./server.js";
 
-/** Workflow file dispatched in the KG source repo (same value as `KG_REFRESH_WORKFLOW_FILE` in `src/index.ts`). */
-const KG_REFRESH_WORKFLOW_FILE = "claude-implement.yml";
+/** Workflow file dispatched in the KG source repo: the shared implement template, selected by `runner_phase` (AII-556). */
+export const KG_REFRESH_WORKFLOW_FILE = "claude-implement.yml";
 const GHA_EXECUTION_MODE = "github-actions";
 
 type LegacyDispatch = (opts: {
@@ -297,7 +297,6 @@ export function createProductionKgRefreshServices(
   };
 
   // dispatch_log ids are numeric; the workflow keys its row by dispatch id string.
-  const jobIds = new Map<string, number>();
   const findJobId = input.findJobId ?? findLogIdByDispatchId;
 
   const deps: KgRefreshWorkflowDependencies = {
@@ -320,17 +319,14 @@ export function createProductionKgRefreshServices(
     dispatch: createKgRefreshDispatch(input),
     // Idempotent on dispatch_id: a replay after a crash between the insert and the journal write reuses the row.
     appendJobLog: ({ dispatchId }) => {
-      const id = appendLogIfAbsent({
+      return appendLogIfAbsent({
         issueId: "kg-refresh", phase: "kg-refresh", dispatchId, executionMode: resolveKgExecutionMode(),
         repo: parseKgSourceRepo(input.kgSourceRepo).fullName,
       });
-      jobIds.set(dispatchId, id);
-      return id;
     },
     closeJobLog: (jobId, status, conclusion) => {
-      const id = jobIds.get(jobId) ?? findJobId(jobId);
+      const id = findJobId(jobId);
       if (id === undefined) return;
-      jobIds.delete(jobId);
       input.updateJobStatus(id, status, conclusion);
     },
     getWorkflowRunStatus: input.getWorkflowRunStatus,

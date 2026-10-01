@@ -4,8 +4,8 @@ import { execSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
-  fetchGate, stageGate, swapGate, verifyGate, revertRail, runRail,
-  RailGateError, outcomeToStage, readServedStamp, readNamespace,
+  fetchGate, stageGate, swapGate, verifyGate, revertRail,
+  RailGateError, readServedStamp, readNamespace,
   mergeSnapshotPr, deleteSnapshotBranch, closeSnapshotPr, postDryRunReport,
   type KgRailDeps, type RailContext,
 } from "../kg-refresh-rail.js";
@@ -420,118 +420,9 @@ describe("kg-refresh-rail", () => {
     });
   });
 
-  // ── runRail ──────────────────────────────────────────────────────────────
-
-  describe("runRail", () => {
-    it("runs fetch -> stage -> swap -> verify to a success outcome", async () => {
-      const deps = makeDeps();
-      const outcome = await runRail(deps);
-      expect(outcome.ok).toBe(true);
-      expect(outcome.stampBefore).toBe(OLD_STAMP);
-      expect(outcome.stampAfter).toBe(NEW_STAMP);
-      expect(existsSync(join(dataRoot, "current", COMPLETION_MARKER))).toBe(true);
-      expect(restart).toHaveBeenCalledTimes(1);
-    });
-
-    it("short-circuits to ingest-needed without staging, swapping, or restarting", async () => {
-      const deps = makeDeps({ loadSnapshotSha: vi.fn(() => SNAPSHOT_SHA) as never });
-      const outcome = await runRail(deps);
-      expect(outcome.ok).toBe(false);
-      expect(outcome.gate).toBe("ingest-needed");
-      expect(materialize).not.toHaveBeenCalled();
-      expect(restart).not.toHaveBeenCalled();
-    });
-
-    it("a snapshot with no committed embeddings resolves to ingest-needed without calling materialize", async () => {
-      rmSync(join(fixtureRepo, "snapshot", "embeddings.npz"));
-      rmSync(join(fixtureRepo, "snapshot", "embeddings.meta.json"));
-      const noEmbeddingsTarball = makeTarball(fixtureRepo);
-      const deps = makeDeps({ fetchTarball: vi.fn(async () => noEmbeddingsTarball) as never });
-      const outcome = await runRail(deps);
-      expect(outcome.ok).toBe(false);
-      expect(outcome.gate).toBe("ingest-needed");
-      expect(outcome.detail).toContain("no committed embeddings");
-      expect(materialize).not.toHaveBeenCalled();
-      expect(restart).not.toHaveBeenCalled();
-    });
-
-    it("a fetchGate failure resolves to a staging outcome, never reverts", async () => {
-      const deps = makeDeps({
-        mintToken: vi.fn(async () => {
-          throw new Error("mint failed");
-        }) as never,
-      });
-      const outcome = await runRail(deps);
-      expect(outcome.ok).toBe(false);
-      expect(outcome.gate).toBe("staging");
-      expect(restart).not.toHaveBeenCalled();
-    });
-
-    it("a fetchGate failure after the served stamp was read reports that stamp, not null", async () => {
-      const deps = makeDeps({
-        fetchSnapshotCommitSha: vi.fn(async () => {
-          throw new Error("commit lookup failed");
-        }) as never,
-      });
-      const outcome = await runRail(deps);
-      expect(outcome.ok).toBe(false);
-      expect(outcome.gate).toBe("staging");
-      expect(outcome.stampBefore).toBe(OLD_STAMP);
-      expect(outcome.stampAfter).toBe(OLD_STAMP);
-      expect(restart).not.toHaveBeenCalled();
-    });
-
-    it("a plain Error thrown from swapGate propagates out of runRail unchanged, without reverting", async () => {
-      const failingRestart = vi.fn(async () => {
-        throw new Error("sidecar restart failed");
-      });
-      const deps = makeDeps({ sidecar: { restart: failingRestart } });
-      await expect(runRail(deps)).rejects.toThrow("sidecar restart failed");
-      // A single call means only swapGate's restart ran — a second call would mean
-      // revertRail (which also calls sidecar.restart) incorrectly ran too.
-      expect(failingRestart).toHaveBeenCalledTimes(1);
-    });
-
-    it("a stageGate failure resolves to a staging outcome and cleans up staging/", async () => {
-      const deps = makeDeps({
-        materialize: vi.fn(async () => {
-          throw new Error("OOM-killed");
-        }) as never,
-      });
-      const outcome = await runRail(deps);
-      expect(outcome.ok).toBe(false);
-      expect(outcome.gate).toBe("staging");
-      expect(existsSync(join(dataRoot, "staging"))).toBe(false);
-      expect(restart).not.toHaveBeenCalled();
-    });
-
-    it("calls revertRail exactly once on a verifyGate failure", async () => {
-      // Canary never recovers -> verifyGate throws RailGateError("canary", ...).
-      // swapGate restarts once; a single revertRail call restarts a second time.
-      // Two restarts (not more, not fewer) is only possible if the revert path
-      // ran exactly once — the linear gate sequence has no other way to reach it.
-      canary = { count: 0, degraded: true };
-      const deps = makeDeps({ canaryDeadlineMs: 20, canaryRetryMs: 5 });
-
-      const outcome = await runRail(deps);
-
-      expect(outcome.ok).toBe(false);
-      expect(outcome.gate).toBe("canary");
-      expect(outcome.detail).toContain("reverted, serving stamp");
-      expect(restart).toHaveBeenCalledTimes(2);
-    });
-  });
-
   // ── other exported functions (smoke coverage) ───────────────────────────
 
   describe("other exported functions", () => {
-    it("outcomeToStage maps every outcome shape to its terminal stage", () => {
-      expect(outcomeToStage({ ok: true, at: 0, detail: "", stampBefore: null, stampAfter: null })).toBe("serving");
-      expect(outcomeToStage({ ok: false, at: 0, gate: "staging", detail: "", stampBefore: null, stampAfter: null })).toBe("failed");
-      expect(outcomeToStage({ ok: false, at: 0, gate: "ingest-needed", detail: "", stampBefore: null, stampAfter: null })).toBe("idle");
-      expect(outcomeToStage({ ok: false, at: 0, gate: "canary", detail: "", stampBefore: null, stampAfter: null })).toBe("reverted");
-    });
-
     it("readNamespace and readServedStamp round-trip against a fixture and the sidecar", async () => {
       expect(await readNamespace(fixtureRepo)).toBe(NAMESPACE);
       const deps = makeDeps();

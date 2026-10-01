@@ -479,7 +479,7 @@ function kgStageFromLastRefresh(last: KgRefreshStatus["lastRefresh"]): KgRefresh
   if (last.ok) return "serving";
   const gate: string | undefined = last.gate;
   if (gate && REVERT_GATES.has(gate)) return "reverted";
-  if (gate === "ingest-needed" || gate === "no-new-data") return "idle";
+  if (gate === "ingest-needed") return "idle";
   return "failed";
 }
 

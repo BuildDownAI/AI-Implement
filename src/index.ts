@@ -23,7 +23,7 @@ import {
   type StaleAdmissionCandidate,
 } from "./dispatch-admission.js";
 import { reconcileFilesystemFailures } from "./filesystem-ticket-lifecycle.js";
-import { dispatchWorkflow, postWorkflowDispatch, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, getPullRequestState, buildEnvelopeDispatchInputs, postPrComment, defaultFetchSignal, getRepoDefaultBranch, buildKgRefreshGhaDispatchBody, pollForKgWorkflowRunId, fetchRepoTarball, mergePullRequest, closePullRequest, deleteBranch, postOrUpdateStickyComment, setCommitStatus, cancelWorkflowRun, RUN_TITLE_PREFIX, type DispatchInputs } from "./github.js";
+import { dispatchWorkflow, postWorkflowDispatch, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, getPullRequestState, buildEnvelopeDispatchInputs, postPrComment, defaultFetchSignal, getRepoDefaultBranch, fetchRepoTarball, mergePullRequest, closePullRequest, deleteBranch, postOrUpdateStickyComment, setCommitStatus, cancelWorkflowRun, RUN_TITLE_PREFIX, type DispatchInputs } from "./github.js";
 import { resolveWorkflowCapabilities, resolveWorkflowContract, type WorkflowContract } from "./workflow-probe.js";
 import { surfaceDispatchFailure } from "./dispatch-failure.js";
 import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
@@ -106,7 +106,7 @@ import {
 import { clearPrNotFoundGrace, decideCleanExitOutcome, shouldSkipCompletionNotice, workflowFileForJob } from "./monitor-status.js";
 import type { RunPrCandidate, RunPrMatch } from "./monitor-status.js";
 import { pickPrForRun } from "./monitor-status.js";
-import { type RunConfigV1, encodeRunConfig, decodeRunConfig, buildImplRunConfig } from "./run-config.js";
+import { type RunConfigV1, encodeRunConfig, buildImplRunConfig } from "./run-config.js";
 import { resolveBaseBranch, findOpenRollUpPr, resolvePlanningBranch } from "./feature-branch.js";
 import { validateIssueBaseBranch, postBranchComment } from "./base-branch.js";
 import { runMergeUps, clearRollUpHandledMarkersByIdentifier } from "./merge-up.js";
@@ -125,7 +125,7 @@ import { createKgRefreshIngressClient } from "./restate/kg-refresh-production.js
 import { RestateSidecar } from "./restate/server.js";
 import { startRestateEndpoint, register as registerRestateEndpoint, RESTATE_SERVICES } from "./restate/endpoint.js";
 import { createProductionReviewFixServices } from "./restate/review-fix-production.js";
-import { createProductionKgRefreshServices, recordKgDispatchDetails, forgetRunWatch, lookupRunWatch, resolveRunWatchAwakeable } from "./restate/kg-refresh-production.js";
+import { KG_REFRESH_WORKFLOW_FILE, createProductionKgRefreshServices, recordKgDispatchDetails, forgetRunWatch, lookupRunWatch, resolveRunWatchAwakeable } from "./restate/kg-refresh-production.js";
 import { setKgRefreshToolDeps } from "./restate/tools.js";
 import type { RestateRegisterOutcome, RestateRegisterResult } from "./restate/endpoint.js";
 import { getRestateStatus, setRestateStatus } from "./restate/status.js";
@@ -4272,99 +4272,16 @@ async function handleKgRefreshOutcome(
   }
 }
 
-/**
- * Default per-mapping execution mode for kg-refresh. kg-refresh has no project
- * mapping, so we pass "github-actions" as the fallback: on a GHA-primary
- * orchestrator (runnerMode="default"), resolveExecutionPath returns "github-actions".
- */
-const KG_REFRESH_DEFAULT_EXECUTION_MODE = "github-actions" as const;
-
-/** Workflow file dispatched in the KG source repo for GHA-backed kg-refresh: the shared implement template, selected by `runner_phase` (AII-556). */
-const KG_REFRESH_WORKFLOW_FILE = "claude-implement.yml";
-
 async function dispatchKgRefreshRun(
   config: AppConfig,
   opts: { runToken: string; runProgressToken: string; dispatchId: string; runConfig: string; executionPath?: string },
-): Promise<{ machineId?: string; machineNonce?: string; logsUrl?: string; workflowRunId?: number }> {
+): Promise<{ machineId?: string; machineNonce?: string; logsUrl?: string }> {
   if (!config.kgSourceRepo) throw new Error("KG_SOURCE_REPO not configured");
   const repo = parseKgSourceRepo(config.kgSourceRepo);
   const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, repo.owner);
   const defaultBranch = (await getRepoDefaultBranch(ghToken, repo.owner, repo.repo)) ?? "main";
-  const decodedConfig = decodeRunConfig(opts.runConfig);
-  // A PR-triggered dry-run (AII-633) carries kgSourceRef — the PR's head branch — so the
-  // GHA dispatch runs against that ref instead of the default branch. Absent = unchanged.
-  const dispatchRef = decodedConfig.kgSourceRef ?? defaultBranch;
-
-  // Use the execution path resolved once by resolveExecutionMode in trigger() when
-  // available. Falling back to an independent resolution is only a safety net for
-  // callers that do not thread the pre-resolved value (e.g. ad-hoc tests).
-  const executionPath = opts.executionPath ?? (() => {
-    const { mode: runnerMode } = getRunnerMode();
-    const resolved = resolveExecutionPath(runnerMode, KG_REFRESH_DEFAULT_EXECUTION_MODE);
-    // Shadow mode would dispatch two concurrent ingest runs that race to push the same
-    // snapshot commit. Collapse "both" to "github-actions" (same as planning dispatch).
-    return resolved === "both" ? "github-actions" : resolved;
-  })();
-
-  if (executionPath === "github-actions") {
-    // Dispatch to claude-implement.yml in the KG source repo with runner_phase=kg-refresh.
-    const runnerImage = await resolveRunnerImageForDispatch({
-      owner: repo.owner,
-      repo: repo.repo,
-      token: ghToken,
-      defaultImage: config.sessionImage,
-      runnerImageExplicit: config.runnerImageExplicit,
-    });
-    const runnerCallbackUrl = config.runnerCallbackBaseUrl ?? undefined;
-    const dispatchInputs = buildKgRefreshGhaDispatchBody({ runConfig: opts.runConfig, runToken: opts.runToken, runProgressToken: opts.runProgressToken, runnerImage, runnerCallbackUrl, runnerPhase: "kg-refresh", jobTimeoutMinutes: "240", issueIdentifier: decodedConfig.issue.identifier });
-    const dispatchedAt = Date.now();
-    const dispatchResult = await postWorkflowDispatch({
-      token: ghToken,
-      owner: repo.owner,
-      repo: repo.repo,
-      workflowFile: KG_REFRESH_WORKFLOW_FILE,
-      ref: dispatchRef,
-      inputs: dispatchInputs,
-    });
-
-    if (!dispatchResult.success) {
-      if (dispatchResult.status === 422) {
-        throw new Error(
-          `[kg-refresh] GHA dispatch failed (HTTP 422): claude-implement.yml not found in ` +
-          `${repo.owner}/${repo.repo} — re-run workflow sync for the KG source repo mapping. ` +
-          `Body: ${dispatchResult.error ?? ""}`,
-        );
-      }
-      throw new Error(
-        `[kg-refresh] GHA dispatch failed (HTTP ${dispatchResult.status}): ${dispatchResult.error ?? ""}`,
-      );
-    }
-
-    console.log(`[kg-refresh] dispatched via GitHub Actions (dispatchId=${opts.dispatchId})`);
-
-    // Poll for the workflow run ID for up to ~90 s (5 rounds: 5+10+20+30+25 s).
-    // GitHub typically creates the run within seconds, but queue depth or API lag
-    // can delay it. The reaper will lazy-bind on its next sweep if polling exhausts.
-    const dispatchTime = new Date(dispatchedAt - 30_000);
-    const workflowRunId = await pollForKgWorkflowRunId({
-      token: ghToken,
-      owner: repo.owner,
-      repo: repo.repo,
-      workflowFile: KG_REFRESH_WORKFLOW_FILE,
-      branch: dispatchRef,
-      dispatchTime,
-    });
-    if (!workflowRunId) {
-      console.warn(`[kg-refresh] run ID not resolved within ~90 s of dispatch (dispatchId=${opts.dispatchId}) — reaper will lazy-bind on next sweep`);
-    }
-
-    const logsUrl = workflowRunId
-      ? `https://github.com/${repo.owner}/${repo.repo}/actions/runs/${workflowRunId}`
-      : undefined;
-
-    return { workflowRunId, logsUrl };
-
-  } else if (executionPath === "fly-machines") {
+  const executionPath = opts.executionPath;
+  if (executionPath === "fly-machines") {
     if (!config.flySessionsToken || !config.flySessionsApp) {
       throw new Error(
         "[kg-refresh] fly-machines execution path selected but FLY_SESSIONS_TOKEN + FLY_SESSIONS_APP are not configured",
@@ -4409,8 +4326,7 @@ async function dispatchKgRefreshRun(
     console.log(`[kg-refresh] dispatched via Fly (dispatchId=${opts.dispatchId})`);
     return { machineId: machine.id, machineNonce, logsUrl: `https://fly.io/apps/${config.flySessionsApp}/machines/${machine.id}` };
 
-  } else {
-    // executionPath === "local-docker"
+  } else if (executionPath === "local-docker") {
     if (!config.localRunnerImage) {
       throw new Error(
         "[kg-refresh] local-docker execution path selected but LOCAL_RUNNER_IMAGE is not configured",
@@ -4445,6 +4361,8 @@ async function dispatchKgRefreshRun(
     });
     console.log(`[kg-refresh] dispatched via local Docker (dispatchId=${opts.dispatchId})`);
     return { machineNonce };
+  } else {
+    throw new Error(`[kg-refresh] unsupported execution path "${String(executionPath)}": the GitHub Actions run is dispatched by the KgRefresh workflow`);
   }
 }
 
@@ -4578,7 +4496,6 @@ function onReviewFixActivity(batch: RunnerActivityBody): ActivityIntakeOutcome {
 function startServer(
   config: AppConfig,
   registry: ProviderRegistry,
-  sidecar: KgSidecar,
   memoryProvider: MemoryProvider | null,
   memoryProviderDiagnostic: string | null,
 ): http.Server {
@@ -4590,7 +4507,6 @@ function startServer(
   }));
   setReviewFixAttemptsFacade(reviewFixAttempts);
   const kgRefresh: KgRefreshHandle = makeKgRefresh({
-    sidecar,
     githubAppId: config.githubAppId,
     githubAppPrivateKey: config.githubAppPrivateKey,
     kgSourceRepo: config.kgSourceRepo,
@@ -5541,7 +5457,7 @@ async function main(): Promise<void> {
     }
   }
 
-  const server = startServer(config, registry, sidecar, memoryProvider, memoryProviderDiagnostic);
+  const server = startServer(config, registry, memoryProvider, memoryProviderDiagnostic);
 
   // Fire-and-forget: a hanging webhook must not delay reconciliation or the first poll.
   // Every write postBootNotice makes — LAST_IMAGE_REF_KEY, LAST_SHUTDOWN_AT_KEY and

@@ -1,17 +1,12 @@
 /**
- * The kg-refresh local rail (AII-684): fetch → stage → swap → verify, extracted
- * out of the closures that used to live inside `makeKgRefresh` (`src/kg-refresh.ts`)
- * so a Restate workflow (AII-894) can call the same gates the orchestrator calls
- * today, one activity at a time, instead of a copy that only proves the copy works
- * (the honesty rule from AII-626).
+ * The kg-refresh local rail (AII-684): fetch → stage → swap → verify. The `KgRefresh`
+ * workflow (`src/restate/kg-refresh-workflow.ts`) calls the gates one at a time —
+ * `fetchGate`/`stageGate`/`swapGate`/`verifyGate` — journaling each gate's plain-JSON
+ * return value as its activity result, and calls `revertRail` itself when a gate
+ * after the swap fails.
  *
  * Every function here is a pure function of `KgRailDeps` plus its own arguments —
- * none of them read `makeKgRefresh`'s in-progress-run bookkeeping (its lifecycle
- * flag or its dispatch-tracking fields). `runRail` sequences the four gates
- * exactly the way `makeKgRefresh` used to, and is what it now calls; the future
- * workflow will call `fetchGate`/`stageGate`/`swapGate`/`verifyGate` one at a
- * time instead, journaling each gate's plain-JSON return value as its activity
- * result.
+ * none of them read in-progress-run bookkeeping.
  */
 import { mkdir, rm, rename, writeFile, copyFile, readFile, cp } from "node:fs/promises";
 import { existsSync } from "node:fs";
@@ -24,7 +19,7 @@ import {
 import { extractSource, parseKgSourceRepo } from "./deploy.js";
 import { COMPLETION_MARKER } from "./kg-sidecar.js";
 import { getKgMaterializeDirect } from "./runner-mode.js";
-import type { RefreshGate, RefreshOutcome, KgRefreshStage, KgDryRunReportTarget } from "./kg-refresh.js";
+import type { RefreshGate, RefreshOutcome, KgDryRunReportTarget } from "./kg-refresh.js";
 
 /** Heading prefix used to find and update the sticky dry-run PR comment across pushes (AII-633).
  *  Re-exported from kg-refresh.ts so every existing importer keeps its import path. */
@@ -34,12 +29,9 @@ export const KG_DRY_RUN_COMMENT_MARKER = "## kg-refresh dry-run";
 export const KG_DRY_RUN_STATUS_CONTEXT = "kg-refresh/dry-run";
 
 /**
- * Everything the rail's gates and PR-facing functions read that used to come from
- * `makeKgRefresh`'s closure over its `input: KgRefreshInput` — never from module
- * state. `dataRoot` is resolved into the rail's five working directories
- * (`current`/`previous`/`staging`/`fetch`/`rejected`) by `railPaths` below, the
- * same way `makeKgRefresh` used to derive `currentDir`/`previousDir`/`stagingDir`/
- * `fetchDir` once from `input.dataRoot`.
+ * Everything the rail's gates and PR-facing functions read — never from module state.
+ * `dataRoot` is resolved into the rail's five working directories
+ * (`current`/`previous`/`staging`/`fetch`/`rejected`) by `railPaths` below.
  */
 export interface KgRailDeps {
   /** The supervised sidecar from AII-425; restart() is the reload mechanism. */
@@ -87,9 +79,9 @@ function railPaths(dataRoot: string) {
 }
 
 /** Thrown by a gate on a permanent failure. `gate` identifies which of the four failed; `revertRail` and the
- *  final `RefreshOutcome` both key off it exactly the way `runRefresh`'s inline `revert(...)` calls used to.
+ *  final `RefreshOutcome` both key off it.
  *  `context` carries whatever partial `RailContext` the failing gate had already assembled — e.g. the
- *  served stamp `fetchGate` read before a later step in the same gate failed — so `runRail` can report it
+ *  served stamp `fetchGate` read before a later step in the same gate failed — so the caller can report it
  *  instead of always falling back to `null`. */
 export class RailGateError extends Error {
   readonly gate: RefreshGate;
@@ -150,8 +142,7 @@ export async function readNamespace(sourceDir: string): Promise<string | null> {
 
 /**
  * True when the low-memory `--direct` materialize path is enabled (AII-599, AII-602). Reads a DB-backed,
- * admin-editable setting via `getKgMaterializeDirect` — not any of `makeKgRefresh`'s in-progress-run
- * bookkeeping — imported directly here the same way `makeKgRefresh` used to.
+ * admin-editable setting via `getKgMaterializeDirect` — imported directly here.
  */
 function materializeDirectEnabled(): boolean {
   return getKgMaterializeDirect().enabled;
@@ -161,13 +152,13 @@ function materializeDirectEnabled(): boolean {
  * Fetch the KG source repo's default branch and tarball, read the namespace and served stamp off
  * the fetched tree, and compare the source's `snapshot/` head SHA against the last-recorded one.
  * A SHA match short-circuits to the `ingest-needed` result (not a failure — no gate/swap/revert ran).
- * Any other failure throws `RailGateError("staging", ...)`, matching `runRefresh`'s pre-swap catch.
+ * Any other failure throws `RailGateError("staging", ...)`.
  */
 export async function fetchGate(deps: KgRailDeps, _input: RailContext = {}): Promise<RailContext> {
   const { fetchDir } = railPaths(deps.dataRoot);
   const repo = parseKgSourceRepo(deps.kgSourceRepo);
   // Populated once readServedStamp resolves, so a failure in a later step can report the
-  // stamp already read — matching `runRefresh`'s old catch instead of always reporting null.
+  // stamp already read instead of always reporting null.
   let readContext: Partial<RailContext> | undefined;
   try {
     const { token } = await deps.mintToken(deps.githubAppId, deps.githubAppPrivateKey, repo.owner, {
@@ -211,7 +202,7 @@ export async function fetchGate(deps: KgRailDeps, _input: RailContext = {}): Pro
 /**
  * Materialize the fetched tree with the image's venv and copy its output into `staging/`,
  * writing `COMPLETION_MARKER` last (the atomic-overlay invariant). Any failure throws
- * `RailGateError("staging", ...)` — the caller cleans up `staging/`, matching `runRefresh`.
+ * `RailGateError("staging", ...)` — the caller cleans up `staging/`.
  */
 export async function stageGate(deps: KgRailDeps, input: RailContext): Promise<RailContext> {
   const { stagingDir } = railPaths(deps.dataRoot);
@@ -286,9 +277,9 @@ export async function swapGate(deps: KgRailDeps, input: RailContext): Promise<Ra
 /**
  * Verify the graph that is actually serving: the sidecar answers, the overlay has vectors,
  * a canary query passes within budget, and the served stamp advanced. Each check throws
- * `RailGateError` on failure — `runRail` reverts on any of them. The stamp check also
+ * `RailGateError` on failure — the workflow reverts on any of them. The stamp check also
  * persists the snapshot SHA before throwing (a materialized-but-not-served snapshot must
- * not be re-staged on the next refresh), mirroring `runRefresh`'s stamp-gate branch exactly.
+ * not be re-staged on the next refresh).
  */
 export async function verifyGate(deps: KgRailDeps, input: RailContext): Promise<RailContext> {
   const { fetchDir, currentDir } = railPaths(deps.dataRoot);
@@ -355,9 +346,8 @@ export async function verifyGate(deps: KgRailDeps, input: RailContext): Promise<
 
 /**
  * Compensation for a reverted rail: the failed overlay must stop serving before this
- * reports. With no previous overlay, deleting current falls back to the baked graph —
- * today's behaviour. Safe to replay: only an overlay whose marker equals `stagedAt` (this
- * run's) is ever moved, and one already in `rejected/` is left there. A `current/` that is
+ * reports. With no previous overlay, deleting current falls back to the baked graph.
+ * Safe to replay: only an overlay whose marker equals `stagedAt` (this run's) is ever moved, and one already in `rejected/` is left there. A `current/` that is
  * not this run's overlay (or a null `stagedAt`) is never moved.
  */
 export async function revertRail(
@@ -385,98 +375,6 @@ export async function revertRail(
   };
   console.error(`[kg-refresh] gate '${input.gate}' failed: ${outcome.detail}`);
   return outcome;
-}
-
-/**
- * Runs the four gates in order — fetch, stage, swap, verify — reverting on a `RailGateError`
- * from `verifyGate` and returning the same `RefreshOutcome` shape `runRefresh` used to.
- * This is what `makeKgRefresh` calls today; the future kg-refresh workflow calls the gates
- * one at a time instead, so it can persist each activity's result durably between them.
- */
-export async function runRail(deps: KgRailDeps, input: RailContext = {}): Promise<RefreshOutcome> {
-  const { stagingDir } = railPaths(deps.dataRoot);
-
-  let ctx: RailContext;
-  try {
-    ctx = await fetchGate(deps, input);
-  } catch (err) {
-    if (err instanceof RailGateError) {
-      await rm(stagingDir, { recursive: true, force: true });
-      const stampBefore = err.context?.stampBefore ?? null;
-      const outcome: RefreshOutcome = {
-        ok: false,
-        at: Date.now(),
-        gate: err.gate,
-        detail: err.detail,
-        stampBefore,
-        stampAfter: stampBefore,
-      };
-      console.error(`[kg-refresh] ${outcome.detail}`);
-      return outcome;
-    }
-    throw err;
-  }
-
-  if (ctx.gate === "ingest-needed") {
-    return {
-      ok: false,
-      at: Date.now(),
-      gate: "ingest-needed",
-      detail: ctx.detail ?? "Graph is current — a new ingest is required to refresh",
-      stampBefore: ctx.stampBefore ?? null,
-      stampAfter: ctx.stampBefore ?? null,
-    };
-  }
-
-  try {
-    ctx = await stageGate(deps, ctx);
-    ctx = await swapGate(deps, ctx);
-    ctx = await verifyGate(deps, ctx);
-  } catch (err) {
-    if (err instanceof RailGateError) {
-      if (err.gate === "staging") {
-        await rm(stagingDir, { recursive: true, force: true });
-        const outcome: RefreshOutcome = {
-          ok: false,
-          at: Date.now(),
-          gate: "staging",
-          detail: err.detail,
-          stampBefore: ctx.stampBefore ?? null,
-          stampAfter: ctx.stampBefore ?? null,
-        };
-        console.error(`[kg-refresh] ${outcome.detail}`);
-        return outcome;
-      }
-      // answers / vectors / canary / stamp: the swap already happened — revert it.
-      return revertRail(deps, {
-        namespace: ctx.namespace ?? null,
-        gate: err.gate,
-        detail: err.detail,
-        stampBefore: ctx.stampBefore ?? null,
-        stagedAt: ctx.stagedAt ?? null,
-      });
-    }
-    throw err;
-  }
-
-  const outcome: RefreshOutcome = {
-    ok: true,
-    at: Date.now(),
-    detail: `refreshed: ${ctx.stampBefore ?? "baked"} -> ${ctx.stampAfter}`,
-    stampBefore: ctx.stampBefore ?? null,
-    stampAfter: ctx.stampAfter ?? null,
-  };
-  console.log(`[kg-refresh] ${outcome.detail}`);
-  return outcome;
-}
-
-/** Derive the terminal stage from a completed refresh outcome. */
-export function outcomeToStage(outcome: RefreshOutcome): KgRefreshStage {
-  if (outcome.ok) return "serving";
-  if (!outcome.gate || outcome.gate === "staging") return "failed";
-  if (outcome.gate === "ingest-needed") return "idle";
-  // answers/vectors/canary/stamp all result in a revert
-  return "reverted";
 }
 
 /** Merges the runner-opened snapshot PR with the "merge" method — never squash/rebase, so `sha`
@@ -561,7 +459,11 @@ function buildDryRunCommentBody(report: KgDryRunReportTarget, outcome: RefreshOu
  * status (AII-633). Best-effort: a failure here is logged, never thrown, so a PR-reporting
  * problem cannot fail the refresh itself.
  */
-export async function postDryRunReport(deps: KgRailDeps, report: KgDryRunReportTarget, outcome: RefreshOutcome): Promise<void> {
+export async function postDryRunReport(
+  deps: Pick<KgRailDeps, "githubAppId" | "githubAppPrivateKey" | "mintToken" | "postOrUpdateStickyCommentFn" | "setCommitStatusFn">,
+  report: KgDryRunReportTarget,
+  outcome: RefreshOutcome,
+): Promise<void> {
   let owner: string;
   let repoName: string;
   try {
