@@ -89,6 +89,8 @@ export interface CodexTransportRunInput {
   prompt: string;
   model: string;
   workspaceDir: string;
+  /** Executor-generated trusted empty cwd for the protocol thread; host tools still root at `workspaceDir`. */
+  protocolCwd?: string;
   jsonSchema?: Record<string, unknown>;
   /** Absolute directories (selected auth/session paths) the host tools must never touch. */
   forbiddenRoots: readonly string[];
@@ -340,6 +342,10 @@ export function createHostContext(workspaceDir: string, forbiddenRoots: readonly
 /** Item types that cannot touch the workspace or network; anything else means a non-allowlisted effect. */
 const SAFE_ITEM_TYPES = new Set(["agentMessage", "userMessage", "reasoning", "plan", "dynamicToolCall", "contextCompaction"]);
 
+/** Notifications that can carry output, usage or completion; each must bind to the acknowledged thread and turn. */
+const BOUND_NOTIFICATIONS = new Set(["item/started", "item/completed", "thread/tokenUsage/updated", "turn/completed"]);
+const MAX_DEFERRED = 256;
+
 type FailCode =
   | "protocol_error"
   | "malformed_message"
@@ -376,7 +382,11 @@ function runSession(input: CodexTransportRunInput): Promise<CodexTransportResult
 
     let done = false;
     let buffered: Buffer = Buffer.alloc(0);
+    let initialized = false;
     let threadId: string | null = null;
+    let turnId: string | null = null;
+    // Events for the right thread that outrun the turn/start acknowledgement; replayed once the turn id is known.
+    const deferred: Array<() => void> = [];
     let nextId = 1;
     const pending = new Map<number, "initialize" | "thread" | "turn">();
     let lastMessage: string | null = null;
@@ -434,11 +444,12 @@ function runSession(input: CodexTransportRunInput): Promise<CodexTransportResult
       pending.delete(id as number);
       if (msg.error !== undefined || !isRecord(msg.result)) return fail("protocol_error");
       if (kind === "initialize") {
+        initialized = true;
         send({ method: "initialized" });
         request("thread", "thread/start", {
           model: input.model,
           modelProvider: "openai",
-          cwd: ctx.root,
+          cwd: input.protocolCwd ?? ctx.root,
           approvalPolicy: "never",
           sandbox: "read-only",
           ephemeral: true,
@@ -450,8 +461,37 @@ function runSession(input: CodexTransportRunInput): Promise<CodexTransportResult
         if (!isRecord(thread) || typeof thread.id !== "string" || thread.id.length > 200) return fail("protocol_error");
         threadId = thread.id;
         startTurn();
+      } else {
+        const turn = msg.result.turn;
+        if (!isRecord(turn) || typeof turn.id !== "string" || turn.id.length === 0 || turn.id.length > 200) return fail("protocol_error");
+        turnId = turn.id;
+        for (const replay of deferred.splice(0)) {
+          if (done) return;
+          replay();
+        }
       }
-      // `turn` response only acknowledges; completion arrives as a notification.
+    };
+
+    /**
+     * Binds an inbound message to the acknowledged thread and turn. Returns true only when the message
+     * belongs to the active exchange; otherwise it has already failed the session (premature, foreign or
+     * malformed) or been deferred until the turn acknowledgement supplies the expected turn id.
+     */
+    const bindActive = (turnIdOf: unknown, params: Record<string, unknown>, again: () => void): boolean => {
+      if (!initialized || threadId === null || params.threadId !== threadId) {
+        fail("protocol_error", true);
+        return false;
+      }
+      if (turnId === null) {
+        if (deferred.length >= MAX_DEFERRED) fail("protocol_error", true);
+        else deferred.push(again);
+        return false;
+      }
+      if (typeof turnIdOf !== "string" || turnIdOf !== turnId) {
+        fail("protocol_error", true);
+        return false;
+      }
+      return true;
     };
 
     const deny = (id: unknown): void => {
@@ -460,7 +500,19 @@ function runSession(input: CodexTransportRunInput): Promise<CodexTransportResult
 
     const onServerRequest = (id: unknown, method: string, params: unknown): void => {
       if (method === "item/tool/call" && isRecord(params) && typeof params.tool === "string" && Object.prototype.hasOwnProperty.call(HANDLERS, params.tool)) {
-        if (threadId === null || params.threadId !== threadId) {
+        if (!initialized || threadId === null || params.threadId !== threadId || typeof params.callId !== "string") {
+          deny(id);
+          return fail("denied_request", true);
+        }
+        if (turnId === null) {
+          if (deferred.length >= MAX_DEFERRED) {
+            deny(id);
+            return fail("protocol_error", true);
+          }
+          deferred.push(() => onServerRequest(id, method, params));
+          return;
+        }
+        if (params.turnId !== turnId) {
           deny(id);
           return fail("denied_request", true);
         }
@@ -480,7 +532,10 @@ function runSession(input: CodexTransportRunInput): Promise<CodexTransportResult
     };
 
     const onNotification = (method: string, params: unknown): void => {
-      if (!isRecord(params)) return;
+      if (!BOUND_NOTIFICATIONS.has(method)) return;
+      if (!isRecord(params)) return fail("malformed_message", true);
+      const turnIdOf = method === "turn/completed" ? (isRecord(params.turn) ? params.turn.id : undefined) : params.turnId;
+      if (!bindActive(turnIdOf, params, () => onNotification(method, params))) return;
       if (method === "item/started" || method === "item/completed") {
         const item = params.item;
         if (!isRecord(item) || typeof item.type !== "string") return fail("malformed_message", true);
@@ -494,22 +549,21 @@ function runSession(input: CodexTransportRunInput): Promise<CodexTransportResult
       }
       if (method === "thread/tokenUsage/updated") {
         const total = isRecord(params.tokenUsage) && isRecord(params.tokenUsage.total) ? params.tokenUsage.total : null;
-        if (total) {
-          tokensIn = count(total.inputTokens);
-          tokensOut = count(total.outputTokens);
-        }
+        const used = total ? count(total.inputTokens) : null;
+        const generated = total ? count(total.outputTokens) : null;
+        if (!total || used === null || generated === null) return fail("malformed_message", true);
+        tokensIn = used;
+        tokensOut = generated;
         return;
       }
-      if (method === "turn/completed") {
-        const turn = params.turn;
-        const status = isRecord(turn) ? turn.status : undefined;
-        if (status === "completed") return settle(success());
-        if (status === "failed") {
-          const err = isRecord(turn) && isRecord(turn.error) && typeof turn.error.message === "string" ? turn.error.message : undefined;
-          return fail("turn_failed", false, err);
-        }
-        return fail(status === "interrupted" ? "turn_interrupted" : "protocol_error");
+      const turn = params.turn as Record<string, unknown>;
+      const status = turn.status;
+      if (status === "completed") return settle(success());
+      if (status === "failed") {
+        const err = isRecord(turn.error) && typeof turn.error.message === "string" ? turn.error.message : undefined;
+        return fail("turn_failed", false, err);
       }
+      return fail(status === "interrupted" ? "turn_interrupted" : "protocol_error");
     };
 
     const success = (): CodexTransportResult => {

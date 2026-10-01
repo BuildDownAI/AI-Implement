@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { InvokeParams, LLMExecutor, LLMResult, RunTelemetry } from "./types.js";
@@ -28,12 +28,50 @@ const CONFIG_REJECTION_RE =
  */
 export class CodexRecoveryRequiredError extends Error {
   readonly code = "CODEX_RECOVERY_REQUIRED";
-  readonly reason: "child_not_terminated" | "checkpoint_uncertain" | "held";
-  constructor(reason: "child_not_terminated" | "checkpoint_uncertain" | "held") {
+  readonly reason: "child_not_terminated" | "checkpoint_uncertain" | "auth_sync_failed" | "held";
+  /** For `auth_sync_failed`: the preserved trusted view that still holds the refreshed session. */
+  readonly viewRoot?: string;
+  constructor(reason: CodexRecoveryRequiredError["reason"], viewRoot?: string) {
     super(`Codex invocation requires recovery: ${reason}`);
     this.name = "CodexRecoveryRequiredError";
     this.reason = reason;
+    if (viewRoot) this.viewRoot = viewRoot;
   }
+}
+
+/** Fixed-message rejection of a refreshed session; never carries file content. */
+class AuthSyncRejected extends Error {}
+
+function parseAuth(text: string): Record<string, unknown> | null {
+  try {
+    const parsed: unknown = JSON.parse(text);
+    return isObject(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Account-identifying fields of an auth.json: API key, token account id and id_token subject. Null when
+ * none yields a nonempty stable identity, so two unknown identities can never compare equal.
+ */
+function authIdentity(auth: Record<string, unknown>): string | null {
+  const tokens = isObject(auth.tokens) ? auth.tokens : {};
+  const nonEmpty = (v: unknown): string | null => (typeof v === "string" && v.length > 0 ? v : null);
+  let subject: string | null = null;
+  if (typeof tokens.id_token === "string") {
+    const payload = tokens.id_token.split(".")[1];
+    if (payload) {
+      try {
+        const claims: unknown = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+        if (isObject(claims)) subject = nonEmpty(claims.sub);
+      } catch {
+        // an undecodable id_token carries no identity to compare
+      }
+    }
+  }
+  const parts = [nonEmpty(auth.OPENAI_API_KEY), nonEmpty(tokens.account_id), subject];
+  return parts.every((p) => p === null) ? null : JSON.stringify(parts);
 }
 
 export interface CodexExecutorOptions {
@@ -57,6 +95,16 @@ export interface CodexExecutorOptions {
    * recovery; the driver only speaks JSON-RPC over the child's stdio and returns a bounded result.
    */
   protocolDriver?: CodexProtocolDriver;
+}
+
+interface AppServerView {
+  root: string;
+  home: string;
+  /** Trusted empty HOME so user-level fallbacks (~/.codex, ~/.agents, skills, rules) cannot load. */
+  userHome: string;
+  cwd: string;
+  authSource: string | null;
+  initialAuth: string | null;
 }
 
 type StopReason = "timeout" | "cancel" | "stdin";
@@ -323,26 +371,28 @@ export class CodexExecutor implements LLMExecutor {
 
   /** One spawn inside one `ModelAuthClient.invoke`, so authentication is checkpointed even on failure. */
   private async invokeOnce(params: InvokeParams): Promise<Attempt> {
-    let signalUnterminated: (err: CodexRecoveryRequiredError) => void = () => {};
-    const unterminated = new Promise<never>((_, reject) => (signalUnterminated = reject));
+    let signalRecovery: (err: CodexRecoveryRequiredError) => void = () => {};
+    const recovery = new Promise<never>((_, reject) => (signalRecovery = reject));
     try {
-      // If the child cannot be proven dead the callback must never settle: a rejection would make the
-      // client read and persist session state a live child may still be writing, and mark the profile
-      // ready. The pending invoke keeps the profile "invoking" (no second invocation, no dispose), while
-      // the race below surfaces the recovery-required error to the caller.
+      // If the child cannot be proven dead, or its refreshed session could not be safely persisted, the
+      // callback must never settle: the client checkpoints on both return and throw, so settling would
+      // persist stale or foreign session state and mark the profile ready. The pending invoke keeps the
+      // profile "invoking" (no second invocation, no dispose), while the race below surfaces the
+      // recovery-required error to the caller.
       const invocation = this.options.auth.invoke(this.options.profileId, async (selected) => {
         try {
           return await this.runChild(params, selected.env);
         } catch (err) {
-          if (err instanceof CodexRecoveryRequiredError && err.reason === "child_not_terminated") {
-            signalUnterminated(err);
+          const held = this.held;
+          if (held && (held.reason === "child_not_terminated" || held.reason === "auth_sync_failed")) {
+            signalRecovery(held);
             return new Promise<Attempt>(() => {});
           }
           throw err;
         }
       });
       invocation.catch(() => {});
-      return await Promise.race([invocation, unterminated]);
+      return await Promise.race([invocation, recovery]);
     } catch (err) {
       const category = (err as { category?: unknown } | null)?.category;
       if (category === "checkpoint_uncertain" || category === "checkpoint_rejected") {
@@ -375,10 +425,12 @@ export class CodexExecutor implements LLMExecutor {
 
   /** Trusted app-server argv. Nothing here is model- or repository-controlled; config comes only from argv. */
   private buildAppServerArgs(params: InvokeParams): string[] {
+    // The pinned app-server accepts only --stdio/--strict-config/-c: no --ignore-* flags. Isolation comes
+    // from the executor-owned trusted CODEX_HOME and empty cwd (see createAppServerView); --strict-config
+    // only rejects unknown settings, it does not ignore configuration.
     return [
       "app-server",
-      "--ignore-user-config",
-      "--ignore-rules",
+      "--strict-config",
       "-c",
       `model=${JSON.stringify(params.model)}`,
       "-c",
@@ -390,11 +442,121 @@ export class CodexExecutor implements LLMExecutor {
       "-c",
       "features.shell_tool=false",
       "-c",
+      "features.view_image=false",
+      "-c",
+      "features.multi_agent=false",
+      "-c",
+      "features.goals=false",
+      "-c",
+      "features.unified_exec=false",
+      "-c",
       'web_search="disabled"',
     ];
   }
 
-  private async runChild(params: InvokeParams, env: Record<string, string>): Promise<Attempt> {
+  /**
+   * Trusted per-invoke view for the app-server: a CODEX_HOME holding only our config.toml plus a copy of
+   * the SELECTED profile's auth.json, an empty HOME, and an empty protocol cwd. Nothing else from the selected home,
+   * the user home or the repository is visible to the child's config/rules/MCP loaders.
+   */
+  private createAppServerView(selectedHome: string | undefined, model: string, baseUrl?: string): AppServerView {
+    const root = mkdtempSync(join(tmpdir(), "codex-view-"));
+    const home = join(root, "home");
+    const cwd = join(root, "cwd");
+    const userHome = join(root, "user-home");
+    try {
+      return this.populateAppServerView({ root, home, cwd, userHome }, selectedHome, model, baseUrl);
+    } catch (err) {
+      // No child exists yet, so removing a half-built view cannot race a live process.
+      rmSync(root, { recursive: true, force: true });
+      throw err;
+    }
+  }
+
+  private populateAppServerView(
+    { root, home, cwd, userHome }: Pick<AppServerView, "root" | "home" | "cwd" | "userHome">,
+    selectedHome: string | undefined,
+    model: string,
+    baseUrl?: string,
+  ): AppServerView {
+    mkdirSync(home, { mode: 0o700 });
+    mkdirSync(userHome, { mode: 0o700 });
+    mkdirSync(cwd, { mode: 0o700 });
+    writeFileSync(
+      join(home, "config.toml"),
+      [
+        `model = ${JSON.stringify(model)}`,
+        `model_provider = "${CODEX_PROVIDER}"`,
+        'approval_policy = "never"',
+        'sandbox_mode = "read-only"',
+        // The only sanctioned provider redirect: the SELECTED invoke env's OPENAI_BASE_URL (trusted, set by
+        // the auth client or a synthetic test), never the selected home's or repository's config.
+        ...(baseUrl ? [`openai_base_url = ${JSON.stringify(baseUrl)}`] : []),
+        "",
+      ].join("\n"),
+      { mode: 0o600 },
+    );
+    let source: string | null = null;
+    let initial: string | null = null;
+    if (selectedHome) {
+      const candidate = join(selectedHome, "auth.json");
+      if (existsSync(candidate)) {
+        // Read once and write that exact text, so the baseline and the view cannot diverge. A malformed
+        // selected auth fails before any child exists: nothing could be refreshed or compared safely. The
+        // hold keeps the auth callback pending so the client cannot checkpoint over the selected profile.
+        initial = readFileSync(candidate, "utf8");
+        if (!parseAuth(initial)) {
+          this.held = new CodexRecoveryRequiredError("auth_sync_failed");
+          console.warn("[codex] selected auth.json is malformed; no child spawned; executor held for recovery");
+          throw this.held;
+        }
+        writeFileSync(join(home, "auth.json"), initial, { mode: 0o600 });
+        source = candidate;
+      }
+    }
+    return { root, home, userHome, cwd, authSource: source, initialAuth: initial };
+  }
+
+  /**
+   * Called only after the group is proven terminated. Persists a refreshed auth.json into the selected
+   * profile's home, never overwriting a file that changed underneath us and never for another account.
+   * Fail-closed: a missing, malformed, foreign-account or uncommittable refresh holds the executor and
+   * throws, leaving the view (the only copy of the refreshed session) in place for recovery. The caller
+   * must then keep the auth callback pending, because the client would checkpoint a stale session.
+   */
+  private syncAuthBack(view: AppServerView): void {
+    if (!view.authSource || view.initialAuth === null) return;
+    const tmp = `${view.authSource}.sync-${process.pid}`;
+    try {
+      const refreshed = readFileSync(join(view.home, "auth.json"), "utf8");
+      if (refreshed === view.initialAuth) return;
+      const next = parseAuth(refreshed);
+      const prev = parseAuth(view.initialAuth);
+      const nextId = next ? authIdentity(next) : null;
+      const prevId = prev ? authIdentity(prev) : null;
+      if (nextId === null || prevId === null || nextId !== prevId) throw new AuthSyncRejected("invalid_or_foreign_auth");
+      if (readFileSync(view.authSource, "utf8") !== view.initialAuth) throw new AuthSyncRejected("source_changed");
+      // "wx": a pre-existing file at the temp path is a collision, never silently overwritten.
+      writeFileSync(tmp, refreshed, { mode: 0o600, flag: "wx" });
+      renameSync(tmp, view.authSource);
+    } catch (err) {
+      try {
+        // On a collision the file at `tmp` is not ours to delete.
+        if ((err as NodeJS.ErrnoException)?.code !== "EEXIST") rmSync(tmp, { force: true });
+      } catch {
+        // best-effort: the temp file holds the same content as the preserved view
+      }
+      this.held = new CodexRecoveryRequiredError("auth_sync_failed", view.root);
+      // Class or errno code only: messages may carry paths or credential content.
+      const why = err instanceof AuthSyncRejected ? err.message : ((err as NodeJS.ErrnoException)?.code ?? "io_error");
+      console.warn(`[codex] auth sync-back failed (${why}); refreshed session preserved at ${view.root}; executor held for recovery`);
+      throw this.held;
+    }
+  }
+
+  private async runChild(params: InvokeParams, selectedEnv: Record<string, string>): Promise<Attempt> {
+    let env = selectedEnv;
+    let view: AppServerView | null = null;
     let restoreOrigin: (() => void) | null = null;
     if (!this.options.allowRepositoryWrites) {
       try {
@@ -412,11 +574,20 @@ export class CodexExecutor implements LLMExecutor {
         schemaPath = join(schemaDir, "output-schema.json");
         writeFileSync(schemaPath, JSON.stringify(params.jsonSchema), { mode: 0o600 });
       }
+      if (this.options.protocolDriver) {
+        view = this.createAppServerView(selectedEnv.CODEX_HOME, params.model, selectedEnv.OPENAI_BASE_URL);
+        env = { ...selectedEnv, CODEX_HOME: view.home, HOME: view.userHome };
+      }
       const args = this.options.protocolDriver ? this.buildAppServerArgs(params) : this.buildArgs(params, schemaPath);
-      return await this.spawnAndWait(params, args, env);
+      const attempt = await this.spawnAndWait(params, args, env, view ?? undefined, selectedEnv.CODEX_HOME);
+      // spawnAndWait throws rather than returning while a child may live; the explicit guard keeps that invariant local.
+      if (view && !this.held) this.syncAuthBack(view);
+      return attempt;
     } finally {
       if (schemaDir) rmSync(schemaDir, { recursive: true, force: true });
-      if (this.held) {
+      // The view stays in place while a child may live: its auth must not be synced or removed.
+      if (view && !this.held) rmSync(view.root, { recursive: true, force: true });
+      if (this.held?.reason === "child_not_terminated") {
         // A child that may still be alive must never regain the publication credential.
         console.log("[codex] origin left protected: child not confirmed terminated");
       } else {
@@ -433,6 +604,8 @@ export class CodexExecutor implements LLMExecutor {
     params: InvokeParams,
     args: string[],
     env: Record<string, string>,
+    view?: AppServerView,
+    selectedHome?: string,
   ): Promise<Attempt> {
     const termWaitMs = this.options.termWaitMs ?? DEFAULT_TERM_WAIT_MS;
     const killWaitMs = this.options.killWaitMs ?? DEFAULT_KILL_WAIT_MS;
@@ -449,7 +622,7 @@ export class CodexExecutor implements LLMExecutor {
     let proc: ChildProcessWithoutNullStreams;
     try {
       proc = this.spawnImpl("codex", args, {
-        cwd: this.workspaceDir,
+        cwd: view ? view.cwd : this.workspaceDir,
         stdio: ["pipe", "pipe", "pipe"],
         env,
         // Own process group, so termination reaches every descendant the CLI forks.
@@ -528,8 +701,9 @@ export class CodexExecutor implements LLMExecutor {
           prompt: params.prompt,
           model: params.model,
           workspaceDir: this.workspaceDir,
+          ...(view ? { protocolCwd: view.cwd } : {}),
           ...(params.jsonSchema ? { jsonSchema: params.jsonSchema } : {}),
-          forbiddenRoots: env.CODEX_HOME ? [env.CODEX_HOME] : [],
+          forbiddenRoots: [env.CODEX_HOME, selectedHome, view?.root].filter((p): p is string => !!p),
           redact: (text) => redactValues(text, secrets),
         })
         .then(onDriverDone, () => {
