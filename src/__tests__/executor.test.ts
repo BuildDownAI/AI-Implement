@@ -237,6 +237,28 @@ describe.skipIf(isWindows)("ClaudeCliExecutor", () => {
     expect(result.tokensUsed).toBe(120);
   });
 
+  it("legacy invoke uses a stripped process.env; a selected env replaces it for that call only", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.stubEnv("ANTHROPIC_API_KEY", "ambient-synthetic-key-0000");
+    vi.stubEnv("RUN_TOKEN", "runner-token-0000");
+    const before = { ...process.env };
+    const envs: Array<Record<string, string | undefined>> = [];
+    const fakeSpawn = (_c: string, _a: string[], o: { env: Record<string, string | undefined> }) => {
+      envs.push(o.env);
+      return makeTestProcess(SUCCESS_LINES.join("\n") + "\n", 0);
+    };
+    const exec = new ClaudeCliExecutor("/tmp", "summary", true, fakeSpawn as unknown as typeof spawn);
+    await exec.invoke({ prompt: "p", model: "m" });
+    await exec.invoke(
+      { prompt: "p", model: "m" },
+      { env: { PATH: "/bin", ANTHROPIC_API_KEY: "selected-synthetic-key", RUN_TOKEN: "still-stripped-0000" } },
+    );
+    expect(envs[0].ANTHROPIC_API_KEY).toBe("ambient-synthetic-key-0000");
+    expect(envs[0].RUN_TOKEN).toBeUndefined();
+    expect(envs[1]).toEqual({ PATH: "/bin", ANTHROPIC_API_KEY: "selected-synthetic-key" });
+    expect(process.env).toEqual(before);
+  });
+
   it("does NOT print per-event lines at summary level, but prints the summary", async () => {
     const fakeProc = makeTestProcess(SUCCESS_LINES.join("\n") + "\n", 0);
     const fakeSpawn = () => fakeProc;

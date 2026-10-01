@@ -5,10 +5,11 @@ import { execFileSync, type spawn, type ChildProcessWithoutNullStreams } from "n
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { CodexExecutor, CodexRecoveryRequiredError, matchesSchema, type CodexExecutorOptions } from "../pipeline/codex-executor.js";
+import { CodexExecutor, CodexPlanningPolicyUnprovenError, CodexRecoveryRequiredError, matchesSchema, type CodexExecutorOptions } from "../pipeline/codex-executor.js";
 import { ModelAuthClientError, type ModelAuthClient, type ModelInvocation } from "../model-auth-client.js";
 import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
 import { READ_ONLY_TOOL_PARAMS } from "../pipeline/steps/read-only-tools.js";
+import type { InvokeParams } from "../pipeline/types.js";
 
 const SYNTHETIC_KEY = "synthetic-codex-api-key-0000";
 const VERDICT_SCHEMA = {
@@ -272,6 +273,28 @@ describe("pinned configuration and sandbox", () => {
     const rw = make([{ stdout: message("ok") }]);
     await rw.executor.invoke(base);
     expect(rw.log[0].args[rw.log[0].args.indexOf("--sandbox") + 1]).toBe("workspace-write");
+  });
+
+  it("derives the sandbox from the fixed agentStage, not from builtinTools or caller args", async () => {
+    const argsFor = async (extra: Partial<InvokeParams>): Promise<string[]> => {
+      const { executor, log } = make([{ stdout: message("ok") }]);
+      await executor.invoke({ ...base, ...extra });
+      return log[0].args;
+    };
+    const impl = await argsFor({ agentStage: "implementation", ...READ_ONLY_TOOL_PARAMS });
+    expect(impl[impl.indexOf("--sandbox") + 1]).toBe("workspace-write");
+    const review = await argsFor({ agentStage: "review" });
+    expect(review[review.indexOf("--sandbox") + 1]).toBe("read-only");
+    expect(new Set([impl.join(), review.join()]).size).toBe(2);
+  });
+
+  it("refuses planning before any auth checkout or spawn rather than shipping an unproven policy", async () => {
+    const { executor, log, auth } = make([{ stdout: message("ok") }]);
+    const err = await executor.invoke({ ...base, agentStage: "planning" }).catch((e) => e);
+    expect(err).toBeInstanceOf(CodexPlanningPolicyUnprovenError);
+    expect(err.code).toBe("CODEX_PLANNING_POLICY_UNPROVEN");
+    expect(log).toHaveLength(0);
+    expect(auth.events).toEqual([]);
   });
 
   it("maps a rejected pinned option to a config failure without a second spawn", async () => {

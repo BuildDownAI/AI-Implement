@@ -328,6 +328,11 @@ export function suspendOriginWriteCredential(workspaceDir: string): (() => void)
   };
 }
 
+export interface ClaudeInvokeOptions {
+  /** Selected invocation environment replacing `process.env` as the model env base for this call only. */
+  env?: Readonly<Record<string, string | undefined>>;
+}
+
 /**
  * Shells out to the Claude Code CLI in stream-json mode. Each JSONL event is
  * parsed for live logging (when logLevel="stream") and accumulated for final
@@ -352,7 +357,12 @@ export class ClaudeCliExecutor implements LLMExecutor {
    */
   private invocationSeq = 0;
 
-  async invoke(params: InvokeParams): Promise<LLMResult> {
+  /**
+   * `options.env` is the explicitly selected per-invocation environment (stage executor). It
+   * replaces `process.env` as the base of the model env, still passing through the same
+   * stripping; absent = legacy `process.env` behavior. `process.env` is never mutated.
+   */
+  async invoke(params: InvokeParams, options?: ClaudeInvokeOptions): Promise<LLMResult> {
     const invocationId = ++this.invocationSeq;
     let attempt = 1;
     let totalSleptMs = 0;
@@ -386,7 +396,7 @@ export class ClaudeCliExecutor implements LLMExecutor {
     for (;;) {
       let attemptResult: AttemptResult;
       try {
-        attemptResult = await this.spawnOnce(params, attempt, invocationId);
+        attemptResult = await this.spawnOnce(params, attempt, invocationId, options?.env);
       } catch (err) {
         // A spawn-level failure (ENOENT/EAGAIN/ENOMEM from proc.on("error"), or the
         // stdin EPIPE handler) never produced an LLMResult, but it is by construction
@@ -514,7 +524,12 @@ export class ClaudeCliExecutor implements LLMExecutor {
     }
   }
 
-  private spawnOnce(params: InvokeParams, attempt: number, invocationId: number): Promise<AttemptResult> {
+  private spawnOnce(
+    params: InvokeParams,
+    attempt: number,
+    invocationId: number,
+    selectedEnv?: Readonly<Record<string, string | undefined>>,
+  ): Promise<AttemptResult> {
     let restoreOrigin: (() => void) | null = null;
     if (!this.allowRepositoryWrites) {
       try {
@@ -567,7 +582,7 @@ export class ClaudeCliExecutor implements LLMExecutor {
         proc = this.spawnImpl("claude", args, {
           cwd: this.workspaceDir,
           stdio: ["pipe", "pipe", "pipe"],
-          env: modelProcessEnv(this.allowRepositoryWrites),
+          env: modelProcessEnv(this.allowRepositoryWrites, selectedEnv),
           // Makes the CLI its own process-group leader, which is what makes
           // `process.kill(-pid, …)` in killProcessGroup address the CLI and every
           // subprocess it forks, not just the CLI itself. Side effect: a SIGTERM/SIGINT

@@ -80,9 +80,15 @@ export function repoProcessEnv(): NodeJS.ProcessEnv {
  * secrets named in AI_IMPLEMENT_FORWARDED_SECRETS are also stripped — they are
  * available to hooks but must never reach the model process — as is the
  * install step's NPM_TOKEN regardless of how it was injected.
+ *
+ * `base` defaults to `process.env`; a selected per-invocation environment (stage executor)
+ * is passed instead so the same stripping applies and `process.env` is never consulted for it.
  */
-export function modelProcessEnv(allowRepositoryWrites: boolean): NodeJS.ProcessEnv {
-  const env = { ...process.env };
+export function modelProcessEnv(
+  allowRepositoryWrites: boolean,
+  base: Readonly<Record<string, string | undefined>> = process.env,
+): NodeJS.ProcessEnv {
+  const env = { ...base };
   if (env.CLAUDE_CODE_OAUTH_TOKEN) {
     delete env.ANTHROPIC_API_KEY;
   }

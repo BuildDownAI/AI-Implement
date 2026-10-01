@@ -35,6 +35,22 @@ export class CodexRecoveryRequiredError extends Error {
   }
 }
 
+/**
+ * Planning needs read/search plus writes confined to `ai-output/comments`, with no generic command,
+ * delegate or MCP surface. The pinned Codex CLI offers no verified way to enforce that: a filesystem
+ * profile bounds writes only, and `unified_exec` cannot be disabled by config or `--disable`. Rather
+ * than run planning with implementation write authority or an unproven profile, a Codex planning
+ * selection is refused before any auth checkout or spawn. Enabling it needs a verified boundary
+ * (a real-CLI probe of tool surface, symlink/.git rejection and network) outside the six-file seam.
+ */
+export class CodexPlanningPolicyUnprovenError extends Error {
+  readonly code = "CODEX_PLANNING_POLICY_UNPROVEN";
+  constructor() {
+    super("Codex planning is refused: its restricted-write, no-command policy is not enforceable on the pinned CLI");
+    this.name = "CodexPlanningPolicyUnprovenError";
+  }
+}
+
 export interface CodexExecutorOptions {
   /** Auth client whose `invoke` supplies the isolated, selected environment and checkpoints afterward. */
   auth: Pick<ModelAuthClient, "invoke">;
@@ -202,6 +218,7 @@ export class CodexExecutor implements LLMExecutor {
 
   async invoke(params: InvokeParams): Promise<LLMResult> {
     if (this.held) throw new CodexRecoveryRequiredError("held");
+    if (params.agentStage === "planning") throw new CodexPlanningPolicyUnprovenError();
     const startedAt = Date.now();
     const expectsStructuredOutput = params.expectsStructuredOutput ?? false;
     const stage = params.stage ?? "unknown";
@@ -345,6 +362,23 @@ export class CodexExecutor implements LLMExecutor {
     }
   }
 
+  /**
+   * Sandbox argv from a trusted policy keyed on the fixed `agentStage` only, never on repository
+   * config or caller-supplied flags. An absent stage keeps the legacy `builtinTools` mapping.
+   *   implementation -> workspace-write; review -> read-only.
+   * Planning has no policy here: see `CodexPlanningPolicyUnprovenError`, which refuses it earlier.
+   */
+  private sandboxArgs(params: InvokeParams): string[] {
+    switch (params.agentStage) {
+      case "review":
+        return ["--sandbox", "read-only"];
+      case "implementation":
+        return ["--sandbox", "workspace-write"];
+      default:
+        return ["--sandbox", params.builtinTools ? "read-only" : "workspace-write"];
+    }
+  }
+
   private buildArgs(params: InvokeParams, schemaPath: string | null): string[] {
     // Pinned selection is placed on argv, after the ignore flags, so user or project config
     // cannot change it. No Claude-only flag and no bypass or approve-all flag is ever passed.
@@ -357,8 +391,7 @@ export class CodexExecutor implements LLMExecutor {
       params.model,
       "-c",
       `model_provider="${CODEX_PROVIDER}"`,
-      "--sandbox",
-      params.builtinTools ? "read-only" : "workspace-write",
+      ...this.sandboxArgs(params),
     ];
     if (schemaPath) args.push("--output-schema", schemaPath);
     // `-` reads the prompt from stdin: no argv size ceiling and nothing sensitive on the command line.
