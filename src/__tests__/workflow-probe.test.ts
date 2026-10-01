@@ -427,7 +427,14 @@ describe("resolveWorkflowCapabilities — supportsAttemptCorrelation", () => {
 describe("resolveWorkflowCapabilities — supportsPrivateRunConfig", () => {
   const MARKER = "# ai-implement-capability: private-run-config-v1\n";
   const probe = (fetchImpl: ReturnType<typeof vi.fn>) =>
-    resolveWorkflowCapabilities({ owner: "o", repo: "r", workflowFile: "w.yml", token: "t", ref: "main", fetchImpl });
+    resolveWorkflowCapabilities({
+      owner: "o",
+      repo: "r",
+      workflowFile: "w.yml",
+      token: "t",
+      ref: "main",
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
 
   beforeEach(() => __clearWorkflowProbeCacheForTests());
 
