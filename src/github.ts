@@ -1,6 +1,6 @@
 import type { RepoMapping } from "./config.js";
 import { GitHubApiError } from "./github-errors.js";
-import { type RunConfigV1, encodeRunConfig } from "./run-config.js";
+import { type RunConfigV1, type RunCredentialsV1, encodeRunConfig, encodeTrustedRunConfig } from "./run-config.js";
 import { DEFAULT_RETRY_POLICY, type RetryPolicy } from "./pipeline/retry-backoff.js";
 import { isChecksPermissionError } from "./checks-permission.js";
 
@@ -405,6 +405,16 @@ export interface EnvelopeDispatchOpts {
   runProgressToken?: string;
   /** Include only when the target workflow advertises publication-token support. */
   runPublicationToken?: string;
+  /** True only when the exact workflow/ref reported `supportsPrivateRunConfig === true` (AII-983).
+   *  The result/progress/publication bearers then ride inside `run_config.credentials` (trusted
+   *  encoder) and are NOT duplicated as top-level inputs; `run_token` is sent as "". Absent/false
+   *  keeps the generic envelope plus masked top-level token inputs. */
+  privateTransport?: boolean;
+  /** Extra typed private credentials. Only `modelAuthGrant` and `attemptToken` are carried; supplied
+   *  result/progress/publication bearers are ignored in favour of the minted token options.
+   *  Requires `privateTransport: true`; supplying it without capability throws rather than
+   *  dropping or downgrading it. */
+  credentials?: RunCredentialsV1;
   runnerImage?: string | null;
   prNumber?: string;
   /** Operator instruction forwarded from an /ai-implement PR comment. Rides inside run_config. */
@@ -430,11 +440,50 @@ export interface EnvelopeDispatchOpts {
  * pass-through inputs (tokens, provider, image, timeout) stay top-level so
  * the GHA workflow can ::add-mask:: the tokens before unpacking the envelope.
  */
+/** Fail-closed guard for supplied private credentials (AII-983): protected transport must never be
+ *  dropped or downgraded, so an unsupported/unprobeable reader aborts the dispatch before launch. */
+export function assertPrivateTransportForCredentials(
+  credentials: RunCredentialsV1 | undefined,
+  capabilities: { supportsPrivateRunConfig?: boolean },
+  target: string,
+): void {
+  if (credentials !== undefined && capabilities.supportsPrivateRunConfig !== true) {
+    throw new Error(
+      `protected run transport requires supportsPrivateRunConfig on ${target}; refusing to drop or downgrade private credentials — re-sync workflows`,
+    );
+  }
+}
+
+/** Only the non-callback private fields a caller may supply. Result/progress/publication bearers are
+ *  orchestrator-minted and phase-scoped, so a supplied copy is never carried over. */
+function suppliedNonBearerCredentials(credentials: RunCredentialsV1 | undefined): Partial<RunCredentialsV1> {
+  return {
+    ...(credentials?.attemptToken !== undefined ? { attemptToken: credentials.attemptToken } : {}),
+    ...(credentials?.modelAuthGrant !== undefined ? { modelAuthGrant: credentials.modelAuthGrant } : {}),
+  };
+}
+
 export function buildEnvelopeDispatchInputs(
   mapping: RepoMapping,
   issue: { id: string; identifier: string; title: string; description?: string | null; profiles?: string[]; assigneeName?: string },
   opts: EnvelopeDispatchOpts,
 ): DispatchInputs {
+  const isPrivate = opts.privateTransport === true;
+  if (opts.credentials !== undefined && !isPrivate) {
+    throw new Error(
+      "protected run transport requires supportsPrivateRunConfig on the target workflow; refusing to drop or downgrade private credentials",
+    );
+  }
+  const issuesPublication = opts.runnerPhase !== "planning" && opts.runnerPhase !== "kg-refresh";
+  const credentials: RunCredentialsV1 | undefined = isPrivate
+    ? {
+        version: 1,
+        ...(opts.runToken ? { resultToken: opts.runToken } : {}),
+        ...(opts.runProgressToken ? { progressToken: opts.runProgressToken } : {}),
+        ...(issuesPublication && opts.runPublicationToken ? { publicationToken: opts.runPublicationToken } : {}),
+        ...suppliedNonBearerCredentials(opts.credentials),
+      }
+    : undefined;
   const runConfig: RunConfigV1 = {
     v: 1,
     issue: {
@@ -462,20 +511,23 @@ export function buildEnvelopeDispatchInputs(
     ...(issue.assigneeName ? { assigneeName: issue.assigneeName } : {}),
     ...(opts.planningContext ? { planningContext: opts.planningContext } : {}),
     ...(opts.groupingParent ? { groupingParent: true } : {}),
+    ...(credentials !== undefined ? { credentials } : {}),
     ...(opts.runnerPhase !== "planning" && opts.runnerPhase !== "kg-refresh"
       ? { retryPolicy: opts.retryPolicy ?? DEFAULT_RETRY_POLICY }
       : {}),
   };
 
   return {
-    run_config: encodeRunConfig(runConfig),
+    run_config: credentials !== undefined ? encodeTrustedRunConfig(runConfig) : encodeRunConfig(runConfig),
     // Display-only duplicate: run-name: is evaluated before any step runs, so it cannot
     // decode run_config. The shared 422 retry (ENVELOPE_OPTIONAL_INPUTS) strips this on a
     // template that predates the declaration.
     issue_identifier: issue.identifier,
-    run_token: opts.runToken ?? "",
-    ...(opts.runProgressToken !== undefined ? { run_progress_token: opts.runProgressToken } : {}),
-    ...(opts.runnerPhase !== "planning" && opts.runnerPhase !== "kg-refresh" && opts.runPublicationToken !== undefined
+    // Private transport: bearers live only in run_config.credentials; "" keeps the (required)
+    // top-level input present for readers that predate the private namespace.
+    run_token: isPrivate ? "" : opts.runToken ?? "",
+    ...(!isPrivate && opts.runProgressToken !== undefined ? { run_progress_token: opts.runProgressToken } : {}),
+    ...(!isPrivate && issuesPublication && opts.runPublicationToken !== undefined
       ? { run_publication_token: opts.runPublicationToken }
       : {}),
     ...providerDispatchFields(mapping),
@@ -882,6 +934,31 @@ export function buildKgRefreshGhaDispatchBody(opts: {
     ...(opts.runnerCallbackUrl ? { runner_callback_url: opts.runnerCallbackUrl } : {}),
     ...(opts.issueIdentifier ? { issue_identifier: opts.issueIdentifier } : {}),
   };
+}
+
+/**
+ * Private-transport KG body (AII-983): re-encodes the decoded trusted config with the result and
+ * progress bearers inside `credentials` and omits them as top-level inputs. KG never receives a
+ * publication token, and supplied bearers are discarded; only the model-auth grant and attempt
+ * token already on the config are kept.
+ */
+export function buildPrivateKgRefreshGhaDispatchBody(
+  opts: Parameters<typeof buildKgRefreshGhaDispatchBody>[0] & { trustedConfig: RunConfigV1 },
+): DispatchInputs {
+  const { trustedConfig, ...rest } = opts;
+  const credentials: RunCredentialsV1 = {
+    ...suppliedNonBearerCredentials(trustedConfig.credentials),
+    version: 1,
+    resultToken: opts.runToken,
+    progressToken: opts.runProgressToken,
+  };
+  const body = buildKgRefreshGhaDispatchBody({
+    ...rest,
+    runConfig: encodeTrustedRunConfig({ ...trustedConfig, credentials }),
+    runToken: "",
+  });
+  delete body.run_progress_token;
+  return body;
 }
 
 export async function pollForKgWorkflowRunId(opts: {

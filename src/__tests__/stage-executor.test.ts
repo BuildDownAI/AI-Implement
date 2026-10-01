@@ -1,10 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
-import type { ChildProcessWithoutNullStreams, spawn } from "node:child_process";
-import { AgentStageError, createStageExecutor, safeLimitLabel, safeModelLabel } from "../pipeline/stage-executor.js";
+import { spawn as nodeSpawn, type ChildProcessWithoutNullStreams, type spawn } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { AgentRecoveryRequiredError, AgentStageError, createStageExecutor, safeLimitLabel, safeModelLabel } from "../pipeline/stage-executor.js";
 import { ClaudeCliExecutor } from "../pipeline/executor.js";
-import { CodexRecoveryRequiredError } from "../pipeline/codex-executor.js";
+import { CodexExecutor, CodexRecoveryRequiredError } from "../pipeline/codex-executor.js";
 import { normalizeInvocation } from "../agent-usage.js";
 import type { ResolvedAgentSnapshotV1 } from "../run-config.js";
 import type { ModelAuthClient, ModelInvocation } from "../model-auth-client.js";
@@ -69,13 +72,17 @@ describe("createStageExecutor", () => {
     const auth = fakeAuth(events);
     const claude = fakeExec();
     const codex = new Map<string, ReturnType<typeof fakeExec>>();
+    const transports: string[] = [];
     const ex = createStageExecutor({
       workspaceDir: "/tmp",
       legacy: fakeExec(),
       snapshot,
       auth,
       createClaude: () => claude as never,
-      createCodex: (id) => codex.set(id, fakeExec()).get(id)!,
+      createCodex: (id, transport) => {
+        transports.push(`${id}:${transport}`);
+        return codex.set(id, fakeExec()).get(id)!;
+      },
     });
 
     // Diagnostic labels that look like other stages must not influence selection.
@@ -89,6 +96,8 @@ describe("createStageExecutor", () => {
     const rv = codex.get("p-rev")!.invoke.mock.calls[0][0];
     expect(rv).toMatchObject({ model: "gpt-rev", invocationTimeoutMs: 3000 });
     expect(claude.invoke.mock.calls[0][0]).toMatchObject({ model: "claude-impl", invocationTimeoutMs: 2000, maxTurns: 7 });
+    // Planning uses the native transport; review uses `codex exec`.
+    expect(transports).toEqual(["p-plan:native", "p-rev:exec"]);
     // Codex wraps its own auth; only Claude goes through the selector's single auth.invoke.
     expect(events).toEqual(["invoke:p-impl", "checkpoint"]);
   });
@@ -104,16 +113,37 @@ describe("createStageExecutor", () => {
     expect(createCodex).not.toHaveBeenCalled();
   });
 
-  it("caches one executor per agent/profile across calls", async () => {
-    const createCodex = vi.fn(() => fakeExec());
+  it("caches one executor per agent and per profile+transport across calls", async () => {
+    const createCodex = vi.fn((_id: string, _t: string) => fakeExec());
     const createClaude = vi.fn(() => fakeExec() as never);
     const ex = createStageExecutor({ workspaceDir: "/tmp", legacy: fakeExec(), snapshot, auth: fakeAuth(), createClaude, createCodex });
     for (let i = 0; i < 2; i++) {
       await ex.invoke({ ...base, agentStage: "implementation" });
+      await ex.invoke({ ...base, agentStage: "planning" });
       await ex.invoke({ ...base, agentStage: "review" });
     }
     expect(createClaude).toHaveBeenCalledTimes(1);
-    expect(createCodex).toHaveBeenCalledTimes(1);
+    expect(createCodex.mock.calls).toEqual([["p-plan", "native"], ["p-rev", "exec"]]);
+  });
+
+  it("does not share a Codex executor between planning and review on the same account profile", async () => {
+    const shared = { ...snapshot, stages: { ...snapshot.stages, planning: { ...snapshot.stages.planning, accountProfileId: "p-rev" } }, profiles: { ...snapshot.profiles, planning: { ...snapshot.profiles.review } } };
+    const made = new Map<string, ReturnType<typeof fakeExec>>();
+    const createCodex = vi.fn((id: string, transport: string) => {
+      const e = fakeExec();
+      made.set(`${id}:${transport}`, e);
+      return e;
+    });
+    const ex = createStageExecutor({ workspaceDir: "/tmp", legacy: fakeExec(), snapshot: shared, auth: fakeAuth(), createCodex });
+    await ex.invoke({ ...base, agentStage: "review" });
+    await ex.invoke({ ...base, agentStage: "planning" });
+    await ex.invoke({ ...base, agentStage: "review" });
+    await ex.invoke({ ...base, agentStage: "planning" });
+    expect(createCodex).toHaveBeenCalledTimes(2);
+    expect(made.get("p-rev:exec")!.invoke).toHaveBeenCalledTimes(2);
+    expect(made.get("p-rev:native")!.invoke).toHaveBeenCalledTimes(2);
+    expect(made.get("p-rev:native")!.invoke.mock.calls[0][0]).toMatchObject({ agentStage: "planning", model: "gpt-plan" });
+    expect(made.get("p-rev:exec")!.invoke.mock.calls[0][0]).toMatchObject({ agentStage: "review", model: "gpt-rev" });
   });
 
   it("attaches verified attribution with the actual agent and limit", async () => {
@@ -281,7 +311,8 @@ describe("real CodexExecutor behind the selector", () => {
     expect(auth.dispose).not.toHaveBeenCalled();
     // Held: the next call is refused without another auth checkout.
     const again = await ex.invoke({ ...base, agentStage: "review" }).catch((e) => e);
-    expect(again).toBeInstanceOf(CodexRecoveryRequiredError);
+    expect(again).toBeInstanceOf(AgentRecoveryRequiredError);
+    expect(again.reason).toBe("held");
     expect(auth.invoke).toHaveBeenCalledTimes(1);
   });
 
@@ -293,20 +324,113 @@ describe("real CodexExecutor behind the selector", () => {
     const first = await ex.invoke({ ...base, agentStage: "review" }).catch((e) => e);
     expect(first.category).toBe("checkpoint_uncertain");
     const second = await ex.invoke({ ...base, agentStage: "review" }).catch((e) => e);
-    expect(second).toBeInstanceOf(CodexRecoveryRequiredError);
+    expect(second).toBeInstanceOf(AgentRecoveryRequiredError);
+    expect(second.reason).toBe("held");
     expect(spawnImpl).toHaveBeenCalledTimes(1);
     expect(auth.finish).not.toHaveBeenCalled();
     expect(auth.dispose).not.toHaveBeenCalled();
   });
 
-  it("refuses Codex planning before any auth or spawn", async () => {
+  it("refuses a CodexExecutor whose transport does not match the stage before any auth or spawn", async () => {
     const auth = checkpointAuth();
     const spawnImpl = codexSpawn();
-    const ex = make(auth, spawnImpl);
+    const exec = new CodexExecutor("/tmp", { auth, profileId: "p-plan", spawnImpl, sleepImpl: async () => {} });
+    const ex = createStageExecutor({ workspaceDir: "/tmp", legacy: fakeExec(), snapshot, auth, createCodex: () => exec });
     const err = await ex.invoke({ ...base, agentStage: "planning" }).catch((e) => e);
-    expect(err.code).toBe("CODEX_PLANNING_POLICY_UNPROVEN");
+    expect(err.code).toBe("CODEX_STAGE_TRANSPORT_MISMATCH");
     expect(err.attribution).toMatchObject({ outcome: "error", agent: "codex", stage: "planning" });
     expect(auth.invoke).not.toHaveBeenCalled();
     expect(spawnImpl).not.toHaveBeenCalled();
+  });
+
+  it("runs implementation and review on codex exec with the stage sandbox", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const snap = { ...snapshot, stages: { ...snapshot.stages, implementation: { ...snapshot.stages.implementation, agent: "codex" as const, provider: "openai" as const, accountProfileId: "p-rev", model: "gpt-impl" } }, profiles: { ...snapshot.profiles, implementation: { ...snapshot.profiles.review } } };
+    const log: Spawned[] = [];
+    const auth = checkpointAuth();
+    const ex = createStageExecutor({ workspaceDir: "/tmp", legacy: fakeExec(), snapshot: snap, auth, allowRepositoryWrites: true, codexOptions: { spawnImpl: codexSpawn({}, log), sleepImpl: async () => {} } });
+    await ex.invoke({ ...base, agentStage: "implementation" });
+    await ex.invoke({ ...base, agentStage: "review" });
+    const sandbox = (a: string[]) => a[a.indexOf("--sandbox") + 1];
+    expect(log.map((l) => sandbox(l.args))).toEqual(["workspace-write", "read-only"]);
+  });
+});
+
+describe("Claude unproven-child hold", () => {
+  const live = () => Object.assign(new Error("Process did not exit"), { unresponsive: true, possiblyLive: true, telemetry: { ...ok.telemetry!, outcome: "error" as const } });
+
+  it("gives bounded caller recovery while the auth callback stays pending: no checkpoint, no reuse", async () => {
+    const events: string[] = [];
+    const auth = fakeAuth(events);
+    const claude = fakeExec(live());
+    const ex = createStageExecutor({ workspaceDir: "/tmp", legacy: fakeExec(), snapshot, auth, createClaude: () => claude as never });
+    const err = await ex.invoke({ ...base, agentStage: "implementation" }).catch((e) => e);
+    expect(err).toBeInstanceOf(AgentRecoveryRequiredError);
+    expect(err.reason).toBe("child_not_terminated");
+    expect(err.attribution).toMatchObject({ outcome: "error", agent: "claude", profileId: "p-impl" });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(events).toEqual(["invoke:p-impl"]);
+
+    const again = await ex.invoke({ ...base, agentStage: "implementation" }).catch((e) => e);
+    expect(again).toBeInstanceOf(AgentRecoveryRequiredError);
+    expect(again.reason).toBe("held");
+    expect(claude.invoke).toHaveBeenCalledTimes(1);
+    expect(auth.invoke).toHaveBeenCalledTimes(1);
+    expect(events).toEqual(["invoke:p-impl"]);
+  });
+
+  it("holds the profile for a Codex stage that shares the same account", async () => {
+    const shared = { ...snapshot, stages: { ...snapshot.stages, review: { ...snapshot.stages.review, accountProfileId: "p-impl" } } };
+    const createCodex = vi.fn(() => fakeExec());
+    const ex = createStageExecutor({ workspaceDir: "/tmp", legacy: fakeExec(), snapshot: shared, auth: fakeAuth(), createClaude: () => fakeExec(live()) as never, createCodex });
+    await ex.invoke({ ...base, agentStage: "implementation" }).catch(() => {});
+    const err = await ex.invoke({ ...base, agentStage: "review" }).catch((e) => e);
+    expect(err.reason).toBe("held");
+    expect(createCodex).not.toHaveBeenCalled();
+  });
+
+  it("does not hold on an ordinary Claude failure; the checkpoint still runs", async () => {
+    const events: string[] = [];
+    const ex = createStageExecutor({ workspaceDir: "/tmp", legacy: fakeExec(), snapshot, auth: fakeAuth(events), createClaude: () => fakeExec(new Error("boom")) as never });
+    await expect(ex.invoke({ ...base, agentStage: "implementation" })).rejects.toThrow("boom");
+    expect(events).toEqual(["invoke:p-impl", "checkpoint"]);
+    await expect(ex.invoke({ ...base, agentStage: "implementation" })).rejects.toThrow("boom");
+  });
+});
+
+describe("Claude invocation deadline with real process mechanics", () => {
+  function realExecutor() {
+    // A real `sh` child that ignores nothing: sleeps in its own process group (spawned detached by the executor).
+    const dir = mkdtempSync(join(tmpdir(), "stage-claude-"));
+    return dir;
+  }
+
+  it("terminates the process group at the snapshot deadline, settles only after confirmed stop, then checkpoints", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const dir = realExecutor();
+    const pidFile = join(dir, "pids");
+    const script = join(dir, "claude");
+    writeFileSync(script, `#!/bin/sh\nsleep 30 &\necho "$$ $!" > "${pidFile}"\nwait\n`, { mode: 0o755 });
+    const realSpawn = ((_c: string, args: string[], o: object) => nodeSpawn(script, args, o as never)) as unknown as typeof spawn;
+    const short = { ...snapshot, stages: { ...snapshot.stages, implementation: { ...snapshot.stages.implementation, invocationTimeoutMs: 300 } } };
+    const events: string[] = [];
+    const claude = new ClaudeCliExecutor(dir, "summary", true, realSpawn, undefined, undefined, { termMs: 500, killMs: 500 });
+    const ex = createStageExecutor({ workspaceDir: dir, legacy: fakeExec(), snapshot: short, auth: fakeAuth(events), createClaude: () => claude });
+    const started = Date.now();
+    const res = await ex.invoke({ ...base, agentStage: "implementation" });
+    expect(Date.now() - started).toBeLessThan(5000);
+    expect(res.failure?.code).toBe("INVOCATION_TIMEOUT");
+    expect(events).toEqual(["invoke:p-impl", "checkpoint"]);
+    const [leader, child] = readFileSync(pidFile, "utf8").trim().split(" ").map(Number);
+    for (const pid of [leader, child]) {
+      // Gone, or an unreaped zombie (a container PID 1 may not reap orphans); never a live process.
+      let state = "gone";
+      try {
+        const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+        state = stat.slice(stat.lastIndexOf(")") + 2, stat.lastIndexOf(")") + 3);
+      } catch {}
+      expect(["gone", "Z"]).toContain(state);
+    }
+    rmSync(dir, { recursive: true, force: true });
   });
 });

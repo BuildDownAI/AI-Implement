@@ -3,7 +3,7 @@ import { spawnSync } from "node:child_process";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { repoProcessEnv, modelProcessEnv, gitProcessEnv, gitDependencyProcessEnv } from "../pipeline/process-env.js";
+import { repoProcessEnv, modelProcessEnv, gitProcessEnv, gitDependencyProcessEnv, isConfiguredModelRun, MODEL_SESSION_KEYS } from "../pipeline/process-env.js";
 
 const SAVED: Record<string, string | undefined> = {};
 
@@ -174,6 +174,15 @@ describe("gitProcessEnv", () => {
     for (const key of SENTINEL_KEYS) expect(env[key], key).toBeUndefined();
   });
 
+  it("strips ambient model session and cloud credentials", () => {
+    const keys = [...MODEL_SESSION_KEYS, "AI_IMPLEMENT_MODEL_AUTH_GRANT", "AI_IMPLEMENT_MODEL_AUTH_BEARER"];
+    for (const key of keys) saveAndSet(key, `sentinel-${key}`);
+    for (const env of [gitProcessEnv(), gitDependencyProcessEnv()]) {
+      for (const key of keys) expect(env[key], key).toBeUndefined();
+    }
+    for (const key of keys) expect(process.env[key]).toBe(`sentinel-${key}`);
+  });
+
   it("keeps PATH, HOME, TLS, proxy and git config discovery variables", () => {
     const env = gitProcessEnv();
     for (const key of KEEP_KEYS) expect(env[key], key).toBe(`sentinel-${key}`);
@@ -258,5 +267,202 @@ describe("gitProcessEnv dependency credentials", () => {
 
       expect(runHelper(gitProcessEnv()).stdout).not.toContain("SENTINEL-CACHED");
     });
+  });
+});
+
+describe("private envelope and model-auth bootstrap stripping (AII-981)", () => {
+  const SENTINELS: Record<string, string> = {
+    AI_IMPLEMENT_RUN_CONFIG: "SENTINEL-encoded-envelope",
+    AI_IMPLEMENT_MODEL_AUTH_GRANT: "SENTINEL-grant",
+    AI_IMPLEMENT_MODEL_AUTH_BEARER: "SENTINEL-bearer",
+    AI_IMPLEMENT_MODEL_AUTH_PROTECTION_KEY: "SENTINEL-protection",
+    ANTHROPIC_API_KEY: "SENTINEL-claude-api",
+    CLAUDE_CODE_OAUTH_TOKEN: "SENTINEL-claude-sub",
+    CLAUDE_CONFIG_DIR: "/sentinel/claude",
+    OPENAI_API_KEY: "SENTINEL-openai",
+    CODEX_API_KEY: "SENTINEL-codex",
+    CODEX_HOME: "/sentinel/codex-home",
+    CLAUDE_CODE_USE_BEDROCK: "1",
+    AWS_ACCESS_KEY_ID: "SENTINEL-aws-id",
+    AWS_SECRET_ACCESS_KEY: "SENTINEL-aws-secret",
+    AWS_SESSION_TOKEN: "SENTINEL-aws-session",
+  };
+  beforeEach(() => {
+    for (const [k, v] of Object.entries(SENTINELS)) saveAndSet(k, v);
+    saveAndSet("AI_IMPLEMENT_FORWARDED_SECRETS", "REPO_HOOK_SECRET");
+    saveAndSet("REPO_HOOK_SECRET", "approved-forwarded");
+  });
+  afterEach(() => restoreAll());
+
+  it("repoProcessEnv removes envelope, bootstrap and every model-mode credential, keeping forwarded secrets", () => {
+    const env = repoProcessEnv();
+    for (const k of Object.keys(SENTINELS)) expect(env).not.toHaveProperty(k);
+    expect(JSON.stringify(env)).not.toContain("SENTINEL");
+    expect(env.REPO_HOOK_SECRET).toBe("approved-forwarded");
+  });
+
+  it("repoProcessEnv keeps a forwarded secret that shares a model key name", () => {
+    process.env.AI_IMPLEMENT_FORWARDED_SECRETS = "AWS_ACCESS_KEY_ID";
+    delete process.env.AI_IMPLEMENT_RUN_CONFIG;
+    expect(repoProcessEnv().AWS_ACCESS_KEY_ID).toBe("SENTINEL-aws-id");
+  });
+
+  it("modelProcessEnv removes the envelope, bootstrap keys and forwarded secrets", () => {
+    for (const allow of [false, true]) {
+      const env = modelProcessEnv(allow);
+      for (const k of ["AI_IMPLEMENT_RUN_CONFIG", "AI_IMPLEMENT_MODEL_AUTH_GRANT",
+        "AI_IMPLEMENT_MODEL_AUTH_BEARER", "AI_IMPLEMENT_MODEL_AUTH_PROTECTION_KEY", "REPO_HOOK_SECRET"]) {
+        expect(env).not.toHaveProperty(k);
+      }
+    }
+  });
+
+  it("gitProcessEnv also drops bootstrap keys", () => {
+    const env = gitProcessEnv();
+    expect(env).not.toHaveProperty("AI_IMPLEMENT_MODEL_AUTH_GRANT");
+    expect(env).not.toHaveProperty("AI_IMPLEMENT_RUN_CONFIG");
+  });
+});
+
+describe("configured runs and selected authentication (AII-951)", () => {
+  const encode = (o: unknown) => Buffer.from(JSON.stringify(o)).toString("base64");
+  const SENT = "SENTINEL-bootstrap-bearer";
+  const configuredEnvelope = encode({
+    v: 1,
+    issue: { id: "1", identifier: "A-1", title: "t", description: "d" },
+    agentConfig: { version: 1 }, // invalid on purpose: configured intent still fails closed
+    credentials: { version: 1, modelAuthGrant: { bearer: SENT } },
+  });
+  const AMBIENT: Record<string, string> = {
+    AI_IMPLEMENT_MODEL_AUTH_BEARER: SENT,
+    OPENAI_API_KEY: "SENTINEL-openai",
+    OPENAI_BASE_URL: "https://sentinel.example",
+    CODEX_API_KEY: "SENTINEL-codex",
+    CODEX_HOME: "/sentinel/codex",
+    ANTHROPIC_API_KEY: "SENTINEL-claude",
+    ANTHROPIC_BASE_URL: "https://sentinel.example",
+    CLAUDE_CONFIG_DIR: "/sentinel/claude",
+    CLAUDE_CODE_USE_BEDROCK: "1",
+    AWS_REGION: "us-east-1",
+    AWS_SECRET_ACCESS_KEY: "SENTINEL-aws",
+    RUN_PROGRESS_TOKEN: "SENTINEL-progress",
+    REPO_HOOK_SECRET: "approved-forwarded",
+    GITHUB_TOKEN: "SENTINEL-gh",
+  };
+  beforeEach(() => {
+    for (const [k, v] of Object.entries(AMBIENT)) saveAndSet(k, v);
+    saveAndSet("AI_IMPLEMENT_RUN_CONFIG", configuredEnvelope);
+    saveAndSet("AI_IMPLEMENT_FORWARDED_SECRETS", "REPO_HOOK_SECRET,OPENAI_API_KEY,CODEX_HOME");
+  });
+  afterEach(() => restoreAll());
+
+  it("configured repoProcessEnv drops forwarded model-name collisions, provider routing and bootstrap, keeping ordinary secrets", () => {
+    const env = repoProcessEnv();
+    for (const k of Object.keys(AMBIENT)) if (!["REPO_HOOK_SECRET", "GITHUB_TOKEN", "RUN_PROGRESS_TOKEN"].includes(k)) expect(env).not.toHaveProperty(k);
+    expect(env).not.toHaveProperty("AI_IMPLEMENT_RUN_CONFIG");
+    expect(env.REPO_HOOK_SECRET).toBe("approved-forwarded");
+    expect(JSON.stringify(env)).not.toContain(SENT);
+    expect(JSON.stringify(env)).not.toContain(configuredEnvelope);
+  });
+
+  it("legacy repoProcessEnv keeps the explicit forwarded-collision exception", () => {
+    delete process.env.AI_IMPLEMENT_RUN_CONFIG;
+    const env = repoProcessEnv();
+    expect(env.OPENAI_API_KEY).toBe("SENTINEL-openai");
+    expect(env.CODEX_HOME).toBe("/sentinel/codex");
+    expect(env).not.toHaveProperty("ANTHROPIC_API_KEY");
+    // An envelope without agentConfig/credentials is legacy too.
+    process.env.AI_IMPLEMENT_RUN_CONFIG = encode({ v: 1, issue: { id: "1", identifier: "A-1", title: "t", description: "d" } });
+    expect(repoProcessEnv().OPENAI_API_KEY).toBe("SENTINEL-openai");
+    expect(repoProcessEnv({ configured: true })).not.toHaveProperty("OPENAI_API_KEY");
+  });
+
+  describe("isConfiguredModelRun classification (fail closed on bad protected input)", () => {
+    const issue = { id: "1", identifier: "A-1", title: "t", description: "d" };
+    it.each([
+      ["invalid base64/JSON", "not-base64-json!!"],
+      ["truncated JSON", configuredEnvelope.slice(0, -12)],
+      ["non-object JSON", encode("just a string")],
+      ["null JSON", encode(null)],
+      ["array JSON", encode([])],
+      ["unsupported version", encode({ v: 2, issue })],
+      ["invalid credentials namespace", encode({ v: 1, issue, credentials: { version: 9 } })],
+      ["agentConfig without grant", encode({ v: 1, issue, agentConfig: { version: 1 } })],
+    ])("treats %s as configured so forwarded model-name collisions are stripped", (_n, envelope) => {
+      process.env.AI_IMPLEMENT_RUN_CONFIG = envelope;
+      expect(isConfiguredModelRun(process.env)).toBe(true);
+      const env = repoProcessEnv();
+      expect(env).not.toHaveProperty("OPENAI_API_KEY");
+      expect(env).not.toHaveProperty("CODEX_HOME");
+      expect(env).not.toHaveProperty("AI_IMPLEMENT_RUN_CONFIG");
+      expect(env.REPO_HOOK_SECRET).toBe("approved-forwarded");
+    });
+
+    it("keeps a valid callback/publication-only private credentials namespace legacy", () => {
+      process.env.AI_IMPLEMENT_RUN_CONFIG = encode({ v: 1, issue, credentials: { version: 1, resultToken: "tok-a", publicationToken: "tok-b" } });
+      expect(isConfiguredModelRun(process.env)).toBe(false);
+      const env = repoProcessEnv();
+      expect(env.OPENAI_API_KEY).toBe("SENTINEL-openai");
+      expect(env).not.toHaveProperty("AI_IMPLEMENT_RUN_CONFIG");
+    });
+  });
+
+  it("git, dependency-git and repository envs never contain the encoded envelope or decoded bootstrap values", () => {
+    for (const env of [repoProcessEnv(), gitProcessEnv(), gitDependencyProcessEnv()]) {
+      expect(JSON.stringify(env)).not.toContain(configuredEnvelope);
+      expect(JSON.stringify(env)).not.toContain(SENT);
+      expect(env).not.toHaveProperty("AI_IMPLEMENT_RUN_CONFIG");
+      expect(env).not.toHaveProperty("AI_IMPLEMENT_MODEL_AUTH_BEARER");
+      for (const k of MODEL_SESSION_KEYS) expect(env).not.toHaveProperty(k);
+    }
+  });
+
+  it("modelProcessEnv with selected auth returns only the selected credential and never mutates process.env", () => {
+    const selected = {
+      PATH: "/usr/bin", HOME: "/home/coder", CODEX_API_KEY: "SYNTHETIC-selected",
+      // A wider map must still lose protected material and other secrets.
+      AI_IMPLEMENT_RUN_CONFIG: configuredEnvelope, AI_IMPLEMENT_MODEL_AUTH_BEARER: SENT,
+      RUN_PROGRESS_TOKEN: "x", NPM_TOKEN: "y", GITHUB_TOKEN: "z", AI_IMPLEMENT_FORWARDED_SECRETS: "REPO_HOOK_SECRET",
+    };
+    const before = JSON.stringify(process.env);
+    const env = modelProcessEnv(false, { env: selected });
+    expect(JSON.stringify(process.env)).toBe(before);
+    expect(env).toEqual({ PATH: "/usr/bin", HOME: "/home/coder", CODEX_API_KEY: "SYNTHETIC-selected" });
+    expect(env).not.toHaveProperty("ANTHROPIC_API_KEY");
+    expect(env).not.toHaveProperty("OPENAI_API_KEY");
+    expect(env).not.toHaveProperty("REPO_HOOK_SECRET");
+  });
+
+  it("a forwarded secret named like the selected credential does not remove the selection", () => {
+    process.env.AI_IMPLEMENT_FORWARDED_SECRETS = "CODEX_API_KEY";
+    expect(modelProcessEnv(false, { env: { CODEX_API_KEY: "SYNTHETIC-selected" } }).CODEX_API_KEY).toBe("SYNTHETIC-selected");
+  });
+
+  it("selected auth never restores ambient GitHub or runner credentials for either write flag", () => {
+    process.env.GH_TOKEN = "SENTINEL-ambient-gh";
+    process.env.RUN_PUBLICATION_TOKEN = "SENTINEL-publication";
+    process.env.RUN_PROGRESS_TOKEN = "SENTINEL-progress";
+    const selected = { PATH: "/usr/bin", CODEX_API_KEY: "SYNTHETIC-selected" };
+    for (const allow of [false, true]) {
+      const env = modelProcessEnv(allow, { env: selected });
+      expect(env).toEqual(selected);
+      expect(JSON.stringify(env)).not.toContain("SENTINEL");
+    }
+  });
+
+  it("selected auth keeps a GitHub write token only when the trusted selected env carries it and writes are allowed", () => {
+    const selected = { PATH: "/usr/bin", CODEX_API_KEY: "SYNTHETIC-selected", GITHUB_TOKEN: "SYNTHETIC-selected-gh", RUN_TOKEN: "x" };
+    expect(modelProcessEnv(false, { env: selected })).not.toHaveProperty("GITHUB_TOKEN");
+    const env = modelProcessEnv(true, { env: selected });
+    expect(env.GITHUB_TOKEN).toBe("SYNTHETIC-selected-gh");
+    expect(env).not.toHaveProperty("RUN_TOKEN");
+  });
+
+  it("without selected auth modelProcessEnv keeps its legacy output", () => {
+    delete process.env.AI_IMPLEMENT_RUN_CONFIG;
+    const env = modelProcessEnv(false);
+    expect(env.ANTHROPIC_API_KEY).toBe("SENTINEL-claude");
+    expect(env).not.toHaveProperty("GITHUB_TOKEN");
+    expect(env).not.toHaveProperty("REPO_HOOK_SECRET");
   });
 });

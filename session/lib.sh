@@ -6,6 +6,13 @@ log() {
   echo "[session] $(date -u +%Y-%m-%dT%H:%M:%SZ) $*"
 }
 
+# Launch node without ambient preload/module-path controls. Every shell-owned node child
+# (envelope decoders) goes through this: a NODE_OPTIONS=--require preload would otherwise run
+# with the protected envelope in its environment before any classification happened.
+run_node() {
+  env -u NODE_OPTIONS -u NODE_PATH node "$@"
+}
+
 fail() {
   log "FATAL: $*" >&2
   exit 1
@@ -92,7 +99,7 @@ resolve_envelope_field() {
   # substitution strips trailing newlines — putting the (possibly empty)
   # value last would make it indistinguishable from a value that never had
   # a separator.
-  out="$(node -e "try{const c=JSON.parse(Buffer.from(process.env.AI_IMPLEMENT_RUN_CONFIG,'base64').toString());const v=c['$key'];process.stdout.write((typeof v==='string'?v:'')+'\nok')}catch(e){process.stdout.write('\nerr')}" 2>/dev/null || echo $'\nerr')"
+  out="$(run_node -e "try{const c=JSON.parse(Buffer.from(process.env.AI_IMPLEMENT_RUN_CONFIG,'base64').toString());const v=c['$key'];process.stdout.write((typeof v==='string'?v:'')+'\nok')}catch(e){process.stdout.write('\nerr')}" 2>/dev/null || echo $'\nerr')"
   status="${out##*$'\n'}"
   val="${out%$'\n'*}"
   if [ "$status" != "ok" ]; then
@@ -102,6 +109,77 @@ resolve_envelope_field() {
   if [ -n "$val" ]; then
     export "${var_name}=${val}"
     log "envelope.${key}=${val}"
+  fi
+}
+
+# Classify AI_IMPLEMENT_RUN_CONFIG for model-auth bootstrap. Prints exactly one fixed word:
+#   legacy      no envelope, or a trusted-decodable envelope with neither a resolved agentConfig
+#               nor a credentials.modelAuthGrant (a callback/publication-only credentials
+#               namespace stays legacy stage selection)
+#   configured  trusted decoder accepts it and it carries both agentConfig and modelAuthGrant
+#   invalid     any nonempty envelope the trusted decoder rejects (bad base64/JSON, non-object,
+#               bad version, bad credentials) or configured intent with only one of the two;
+#               callers fail closed, never fall back to legacy
+# Never prints decoded values or decoder error text. AI_IMPLEMENT_DIST_DIR is a test seam.
+classify_run_config() {
+  [ -z "${AI_IMPLEMENT_RUN_CONFIG:-}" ] && { echo legacy; return 0; }
+  run_node --input-type=module -e '
+    const out = (w) => process.stdout.write(w);
+    try {
+      const dir = process.env.AI_IMPLEMENT_DIST_DIR || "/app/dist";
+      const { decodeTrustedRunConfig } = await import(dir + "/run-config.js");
+      const c = decodeTrustedRunConfig(process.env.AI_IMPLEMENT_RUN_CONFIG);
+      const snapshot = c.agentConfig !== undefined;
+      const grant = c.credentials !== undefined && c.credentials.modelAuthGrant !== undefined;
+      out(snapshot && grant ? "configured" : snapshot || grant ? "invalid" : "legacy");
+    } catch { out("invalid"); }
+  ' 2>/dev/null || echo invalid
+}
+
+# Credential helper that answers only from the GIT_PASSWORD of the git child it serves, so the
+# remote URL and argv stay credential-free and nothing is written to disk. Registered for
+# configured runs only; the TS clone step already supplies GIT_PASSWORD per operation.
+# shellcheck disable=SC2016 # expanded by the helper's own shell, not here
+SCOPED_GIT_HELPER='!f() { [ "$1" = get ] && [ -n "${GIT_PASSWORD:-}" ] || exit 0; echo username=x-access-token; echo "password=$GIT_PASSWORD"; }; f'
+
+configure_scoped_git_auth() {
+  run_scoped "" git config --global credential.helper "$SCOPED_GIT_HELPER" || return $?
+}
+
+# Run one git network operation (clone/fetch) with the GitHub token in that child's environment only.
+git_authed() {
+  GIT_PASSWORD="$GITHUB_TOKEN" GIT_TERMINAL_PROMPT=0 run_scoped "GIT_PASSWORD GIT_TERMINAL_PROMPT" git "$@" || return $?
+}
+
+# Run a command with a minimal, scrubbed environment when the run is configured
+# (CONFIGURED=1): only PATH/HOME/locale/TLS/proxy context plus the explicitly named
+# extra variables (e.g. GH_TOKEN for gh). Model, session, bootstrap and forwarded-secret
+# material never reaches the child. Legacy runs (CONFIGURED unset) run unchanged.
+# Usage: run_scoped "EXTRA_VAR ..." command [args...]
+run_scoped() {
+  local extra="$1" k
+  shift
+  # `|| return` keeps the failure visible to the caller's ERR trap (traps are not inherited by functions).
+  if [ "${CONFIGURED:-0}" != "1" ]; then "$@" || return $?; return 0; fi
+  local -a keep=(PATH HOME USER LOGNAME SHELL TERM TMPDIR TMP TEMP TZ LANG LANGUAGE LC_ALL LC_CTYPE
+    SSL_CERT_FILE SSL_CERT_DIR NODE_EXTRA_CA_CERTS REQUESTS_CA_BUNDLE CURL_CA_BUNDLE
+    HTTP_PROXY HTTPS_PROXY NO_PROXY ALL_PROXY http_proxy https_proxy no_proxy all_proxy)
+  local -a pairs=()
+  # shellcheck disable=SC2086 # extra is a space-separated list of names
+  for k in "${keep[@]}" $extra; do
+    [ -n "${!k+x}" ] && pairs+=("$k=${!k}")
+  done
+  env -i "${pairs[@]}" "$@" || return $?
+}
+
+# ERR trap body. Configured runs log a fixed message: the failing command text can carry
+# bootstrap or token material.
+on_err() {
+  local rc="$1" line="$2" cmd="$3"
+  if [ "${CONFIGURED:-0}" = "1" ]; then
+    log "ERROR: line $line failed (exit $rc)"
+  else
+    log "ERROR: line $line failed: $cmd (exit $rc)"
   fi
 }
 
@@ -129,6 +207,14 @@ _remap_is_reserved() {
     ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN|SESSION_TOKEN|MACHINE_NONCE) return 0 ;;
     RUN_TOKEN|ORCHESTRATOR_URL|RUNNER_CALLBACK_URL|WORKSPACE_DIR|PATH|HOME) return 0 ;;
   esac
+  # Configured (opted-in) runs also reserve every model credential, session/auth-directory,
+  # provider-routing and node preload/module-path name. Legacy runs keep the narrower list above on purpose.
+  if [ "${CONFIGURED:-0}" = "1" ]; then
+    case "$1" in
+      OPENAI_*|CODEX_*|ANTHROPIC_*|CLAUDE_*|AWS_*|RUN_*|RUNNER_*|NPM_TOKEN|CLOUD_ML_REGION|GOOGLE_APPLICATION_CREDENTIALS) return 0 ;;
+      NODE_OPTIONS|NODE_PATH) return 0 ;;
+    esac
+  fi
   return 1
 }
 

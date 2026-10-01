@@ -1,5 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
+import { readdirSync, readFileSync } from "node:fs";
 import type {
   InvokeParams,
   LLMExecutor,
@@ -35,7 +36,12 @@ import { modelProcessEnv, parseForwardedSecrets } from "./process-env.js";
 interface AttemptResult extends Omit<LLMResult, "attempts"> {
   sawToolUse: boolean;
   sawUnsafeToolUse: boolean;
+  /** The configured invocation deadline fired and the whole process group was then proven stopped. */
+  timedOut?: boolean;
 }
+
+const DEFAULT_STOP_WAIT_MS = 5000;
+const STOP_POLL_MS = 10;
 
 /**
  * Runner-activity sink wiring for one `ClaudeCliExecutor` (AII-798). `attemptId`
@@ -237,12 +243,57 @@ const UNRESPONSIVE_MESSAGE = "Process did not exit within 5s of SIGKILL after a 
 function markUnresponsive(telemetry?: RunTelemetry): Error & { unresponsive: true; telemetry?: RunTelemetry } {
   return Object.assign(new Error(UNRESPONSIVE_MESSAGE), {
     unresponsive: true as const,
+    possiblyLive: true as const,
     ...(telemetry ? { telemetry } : {}),
   });
 }
 
 function isUnresponsive(err: unknown): boolean {
   return typeof err === "object" && err !== null && (err as Record<string, unknown>).unresponsive === true;
+}
+
+/**
+ * True when a rejected invocation could not prove its child (process group) stopped. The caller must
+ * keep any shared-profile ownership until the stop is proven; nothing may reuse or checkpoint over it.
+ */
+export function isPossiblyLiveChild(err: unknown): boolean {
+  return typeof err === "object" && err !== null && (err as Record<string, unknown>).possiblyLive === true;
+}
+
+/** True when no member of the child's process group remains (a missing pid has no group to wait for). */
+function groupGone(proc: ChildProcessWithoutNullStreams): boolean {
+  const pid = proc.pid;
+  if (typeof pid !== "number") return true;
+  try {
+    process.kill(-pid, 0);
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "ESRCH";
+  }
+  // Signal 0 also succeeds for zombies, and an orphaned killed descendant stays a zombie when the
+  // container's PID 1 does not reap. A dead zombie is not a live member, so only live members block.
+  return onlyZombiesInGroup(pid);
+}
+
+/** Linux only: true when every remaining member of process group `pgid` is a zombie. Unreadable /proc is "not proven". */
+function onlyZombiesInGroup(pgid: number): boolean {
+  let entries: string[];
+  try {
+    entries = readdirSync("/proc");
+  } catch {
+    return false;
+  }
+  for (const entry of entries) {
+    if (!/^\d+$/.test(entry)) continue;
+    let stat: string;
+    try {
+      stat = readFileSync(`/proc/${entry}/stat`, "utf8");
+    } catch {
+      continue; // exited between listing and reading
+    }
+    const rest = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    if (Number(rest[2]) === pgid && rest[0] !== "Z" && rest[0] !== "X") return false;
+  }
+  return true;
 }
 
 /**
@@ -348,6 +399,7 @@ export class ClaudeCliExecutor implements LLMExecutor {
     private readonly spawnImpl: typeof spawn = spawn,
     private readonly sleepImpl: (ms: number) => Promise<void> = defaultSleep,
     private readonly activityReporting?: ActivityReportingConfig,
+    private readonly stopWaits: { termMs?: number; killMs?: number } = {},
   ) {}
 
   /**
@@ -367,6 +419,10 @@ export class ClaudeCliExecutor implements LLMExecutor {
     let attempt = 1;
     let totalSleptMs = 0;
     const invokeStartedAt = Date.now();
+    // A configured ceiling (snapshot invocationTimeoutMs) bounds the whole invocation: each attempt gets
+    // what remains, and no retry is started once it is spent. Absent for legacy callers.
+    const deadlineAt = params.invocationTimeoutMs != null ? invokeStartedAt + params.invocationTimeoutMs : null;
+    const deadlineSpent = (): boolean => deadlineAt !== null && Date.now() >= deadlineAt;
     const runningTelemetry = { tokensIn: 0, tokensOut: 0, costUsd: 0, numTurns: 0, cacheReadTokens: 0, cacheCreationTokens: 0 };
 
     // Builds an error carrying both the classified `failure` and the telemetry
@@ -396,7 +452,13 @@ export class ClaudeCliExecutor implements LLMExecutor {
     for (;;) {
       let attemptResult: AttemptResult;
       try {
-        attemptResult = await this.spawnOnce(params, attempt, invocationId, options?.env);
+        attemptResult = await this.spawnOnce(
+          params,
+          attempt,
+          invocationId,
+          options?.env,
+          deadlineAt === null ? undefined : Math.max(0, deadlineAt - Date.now()),
+        );
       } catch (err) {
         // A spawn-level failure (ENOENT/EAGAIN/ENOMEM from proc.on("error"), or the
         // stdin EPIPE handler) never produced an LLMResult, but it is by construction
@@ -473,7 +535,8 @@ export class ClaudeCliExecutor implements LLMExecutor {
         const errSawUnsafeToolUse = readBoolFlag(err, "sawUnsafeToolUse");
         const attemptSawToolUse = effectiveSawToolUse(toolUseIsSafe, errSawAnyToolUse, errSawUnsafeToolUse);
         const decision = decideRetry({ failure, attempt, attemptSawToolUse, policy, totalSleptMs });
-        if (!decision.retry) {
+        // A child that may still be alive is never raced by a second spawn into the same workspace.
+        if (!decision.retry || isPossiblyLiveChild(err) || deadlineSpent()) {
           throw spawnFailureError(err, failure);
         }
         console.log(
@@ -485,10 +548,23 @@ export class ClaudeCliExecutor implements LLMExecutor {
         continue;
       }
 
-      const { sawToolUse: attemptSawAnyToolUse, sawUnsafeToolUse: attemptSawUnsafeToolUse, ...result } = attemptResult;
+      const { sawToolUse: attemptSawAnyToolUse, sawUnsafeToolUse: attemptSawUnsafeToolUse, timedOut, ...result } = attemptResult;
       const telemetry = aggregateTelemetry(result.telemetry, runningTelemetry, attempt, invokeStartedAt);
       const tokensUsed = telemetry ? (telemetry.tokensIn ?? 0) + (telemetry.tokensOut ?? 0) : result.tokensUsed;
       const settled: LLMResult = { ...result, telemetry, tokensUsed, attempts: attempt };
+
+      if (timedOut) {
+        const base = classifyLlmResult(settled, {
+          stage: params.stage ?? "unknown",
+          attempt,
+          expectsStructuredOutput: false,
+          elapsedMs: Date.now() - invokeStartedAt,
+        });
+        return {
+          ...settled,
+          failure: { ...base, category: "crash", code: "INVOCATION_TIMEOUT", retryable: false, message: "Claude invocation exceeded its time limit" },
+        };
+      }
 
       // Classify on every invocation, not only when `retry` is supplied — the dev
       // harness and any other bare `invoke()` caller should still get a `failure`
@@ -513,7 +589,7 @@ export class ClaudeCliExecutor implements LLMExecutor {
       const attemptSawToolUse = effectiveSawToolUse(toolUseIsSafe, attemptSawAnyToolUse, attemptSawUnsafeToolUse);
       const decision = decideRetry({ failure, attempt, attemptSawToolUse, policy, totalSleptMs });
 
-      if (!decision.retry) {
+      if (!decision.retry || deadlineSpent()) {
         return { ...settled, failure };
       }
 
@@ -529,7 +605,10 @@ export class ClaudeCliExecutor implements LLMExecutor {
     attempt: number,
     invocationId: number,
     selectedEnv?: Readonly<Record<string, string | undefined>>,
+    deadlineMs?: number,
   ): Promise<AttemptResult> {
+    const termWaitMs = this.stopWaits.termMs ?? DEFAULT_STOP_WAIT_MS;
+    const killWaitMs = this.stopWaits.killMs ?? DEFAULT_STOP_WAIT_MS;
     let restoreOrigin: (() => void) | null = null;
     if (!this.allowRepositoryWrites) {
       try {
@@ -582,7 +661,7 @@ export class ClaudeCliExecutor implements LLMExecutor {
         proc = this.spawnImpl("claude", args, {
           cwd: this.workspaceDir,
           stdio: ["pipe", "pipe", "pipe"],
-          env: modelProcessEnv(this.allowRepositoryWrites, selectedEnv),
+          env: modelProcessEnv(this.allowRepositoryWrites, selectedEnv ? { env: selectedEnv } : undefined),
           // Makes the CLI its own process-group leader, which is what makes
           // `process.kill(-pid, …)` in killProcessGroup address the CLI and every
           // subprocess it forks, not just the CLI itself. Side effect: a SIGTERM/SIGINT
@@ -615,6 +694,9 @@ export class ClaudeCliExecutor implements LLMExecutor {
       const selfKillSignals = new Set<string>();
       let killTimer: ReturnType<typeof setTimeout> | null = null;
       let unresponsiveTimer: ReturnType<typeof setTimeout> | null = null;
+      let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
+      let timedOut = false;
+      let leaderExit: { code: number | null; signal: NodeJS.Signals | null } | null = null;
 
       // Runner-activity reporting (AII-798): a fresh producerId per spawnOnce call
       // (see buildProducerId) keeps a retried attempt's sequence from continuing a
@@ -703,6 +785,42 @@ export class ClaudeCliExecutor implements LLMExecutor {
           ...(signal ? { signal } : {}),
         });
 
+      // The child is not proven stopped even after the SIGKILL escalation: it may still be alive.
+      // Restoring the write credential here would hand a possibly-live agent process the ability to
+      // push, so the protected (credential-stripped) origin is left in place and the rejection is
+      // stamped `possiblyLive` so a shared-profile owner keeps its hold.
+      const giveUpUnresponsive = (): void => {
+        if (settled) return;
+        settled = true;
+        if (deadlineTimer) {
+          clearTimeout(deadlineTimer);
+          deadlineTimer = null;
+        }
+        console.log("[claude] origin left protected: child unresponsive after SIGKILL");
+        // Flush a trailing partial line first, mirroring the normal `close` path —
+        // this is the last chance to fold a `result` event that arrived without a
+        // trailing newline into `events` before telemetry is extracted below.
+        if (buf.trim()) handleLine(buf);
+        // This attempt's own usage before it was given up on — never folded into a
+        // settled LLMResult since `close` never arrived, but still real usage the
+        // cross-attempt sums in `invoke` must not silently drop (see `aggregateTelemetry`).
+        const telemetry = extractTelemetry(events);
+        // Destroy (not just unlisten) the stdio handles, then unref the process
+        // handle, so a container whose only remaining work was this invocation
+        // can still exit. Guarded and optionally-chained: a custom/spawn wrapper's
+        // streams may not implement destroy() at all, and this settle must reach
+        // `reject` regardless of whether teardown throws.
+        try {
+          proc.stdout?.destroy?.();
+          proc.stderr?.destroy?.();
+          proc.stdin?.destroy?.();
+          proc.unref?.();
+        } catch {
+          // best-effort teardown — see above
+        }
+        reject(markUnresponsive(telemetry));
+      };
+
       // EPIPE here means the child exited (or is exiting) before consuming the
       // prompt — but the child may still be alive at this instant. Kill it and
       // wait for `close` before rejecting (escalating to SIGKILL after 5s if it
@@ -723,7 +841,7 @@ export class ClaudeCliExecutor implements LLMExecutor {
         // this attempt (e.g. both fire for the same underlying failure), this handler
         // must not call `proc.kill()` or arm a SIGKILL timer that nothing will ever
         // clear — `close` has already fired and won't fire again to clear it.
-        if (settled || stdinFailure) return;
+        if (settled || stdinFailure || timedOut) return;
         stdinFailure = err instanceof Error ? err : new Error(String(err));
         // Record the signal we're about to send so the `close` handler below can
         // tell our own kill apart from an external one landing in the same window
@@ -752,43 +870,9 @@ export class ClaudeCliExecutor implements LLMExecutor {
           // the process table entry can otherwise never report an exit). Rather
           // than hang the invocation indefinitely, settle this attempt as a
           // non-retryable crash once this second window also elapses.
-          unresponsiveTimer = setTimeout(() => {
-            if (settled) return;
-            settled = true;
-            // The child is known not to have exited even after the SIGKILL escalation —
-            // it may still be alive. Restoring the write credential here would hand a
-            // possibly-live agent process the ability to push. Leave the protected
-            // (credential-stripped) origin in place and let the container's exit clean
-            // up rather than calling `restoreProtectedOrigin()`.
-            console.log("[claude] origin left protected: child unresponsive after SIGKILL");
-            // Flush a trailing partial line first, mirroring the normal `close` path —
-            // this is the last chance to fold a `result` event that arrived without a
-            // trailing newline into `events` before telemetry is extracted below.
-            if (buf.trim()) handleLine(buf);
-            // This attempt's own usage before it was given up on — never folded into a
-            // settled LLMResult since `close` never arrived, but still real usage the
-            // cross-attempt sums in `invoke` must not silently drop (see `aggregateTelemetry`).
-            const telemetry = extractTelemetry(events);
-            // Destroy (not just unlisten) the stdio handles, then unref the process
-            // handle, so a container whose only remaining work was this invocation
-            // can still exit — the process may never report `close`, and a merely
-            // unlistened-to pipe still holds its underlying handle ref'd, which would
-            // keep the event loop (and the container) alive waiting on a child this
-            // attempt has given up on. Guarded and optionally-chained: a custom/
-            // spawn wrapper's streams may not implement destroy() at all, and this
-            // settle must reach `reject` regardless of whether teardown throws.
-            try {
-              proc.stdout?.destroy?.();
-              proc.stderr?.destroy?.();
-              proc.stdin?.destroy?.();
-              proc.unref?.();
-            } catch {
-              // best-effort teardown — see above
-            }
-            reject(markUnresponsive(telemetry));
-          }, 5000);
+          unresponsiveTimer = setTimeout(giveUpUnresponsive, killWaitMs);
           killProcessGroup(proc, "SIGKILL");
-        }, 5000);
+        }, termWaitMs);
         killProcessGroup(proc, "SIGTERM");
       };
       proc.stdin.on("error", handleStdinFailure);
@@ -828,9 +912,13 @@ export class ClaudeCliExecutor implements LLMExecutor {
       });
       proc.stderr.on("data", (d: Buffer) => stderrChunks.push(d));
 
-      proc.on("close", (code, signal) => {
+      const settleClosed = (code: number | null, signal: NodeJS.Signals | null): void => {
         if (settled) return;
         settled = true;
+        if (deadlineTimer) {
+          clearTimeout(deadlineTimer);
+          deadlineTimer = null;
+        }
         if (killTimer) {
           clearTimeout(killTimer);
           killTimer = null;
@@ -896,7 +984,19 @@ export class ClaudeCliExecutor implements LLMExecutor {
           signal: signal ?? null,
           sawToolUse: sawToolUse(events),
           sawUnsafeToolUse: sawUnsafeToolUse(events),
+          ...(timedOut ? { timedOut: true } : {}),
         });
+      };
+
+      proc.on("close", (code, signal) => {
+        if (settled) return;
+        // After the deadline the leader's exit alone proves nothing: the stop flow below settles once
+        // the whole process group is gone, and holds if it cannot be proven.
+        if (timedOut) {
+          leaderExit = { code, signal };
+          return;
+        }
+        settleClosed(code, signal);
       });
 
       proc.on("error", (err) => {
@@ -906,6 +1006,10 @@ export class ClaudeCliExecutor implements LLMExecutor {
         // prior settle deliberately withheld because the child may still be alive.
         if (settled) return;
         settled = true;
+        if (deadlineTimer) {
+          clearTimeout(deadlineTimer);
+          deadlineTimer = null;
+        }
         if (killTimer) {
           clearTimeout(killTimer);
           killTimer = null;
@@ -945,7 +1049,7 @@ export class ClaudeCliExecutor implements LLMExecutor {
           } catch {
             // best-effort teardown — see above
           }
-          reject(Object.assign(attachToolUseFlags(err), { telemetry }));
+          reject(Object.assign(attachToolUseFlags(err), { telemetry, possiblyLive: true as const }));
           return;
         }
         try {
@@ -955,6 +1059,39 @@ export class ClaudeCliExecutor implements LLMExecutor {
           reject(markNotASpawnFailure(restoreErr));
         }
       });
+
+      if (deadlineMs !== undefined) {
+        const stopConfirmed = (): boolean => leaderExit !== null && groupGone(proc);
+        const waitForStop = async (ms: number): Promise<boolean> => {
+          const until = Date.now() + ms;
+          while (!settled && !stopConfirmed()) {
+            if (Date.now() >= until) return false;
+            await new Promise((r) => setTimeout(r, STOP_POLL_MS));
+          }
+          return !settled;
+        };
+        const stopAfterDeadline = async (): Promise<void> => {
+          let stopped = await waitForStop(termWaitMs);
+          if (settled) return;
+          if (!stopped) {
+            selfKillSignals.add("SIGKILL");
+            killProcessGroup(proc, "SIGKILL");
+            if (settled) return;
+            stopped = await waitForStop(killWaitMs);
+            if (settled) return;
+          }
+          if (stopped && leaderExit) settleClosed(leaderExit.code, leaderExit.signal);
+          else giveUpUnresponsive();
+        };
+        deadlineTimer = setTimeout(() => {
+          deadlineTimer = null;
+          if (settled || stdinFailure || timedOut) return;
+          timedOut = true;
+          selfKillSignals.add("SIGTERM");
+          killProcessGroup(proc, "SIGTERM");
+          void stopAfterDeadline();
+        }, deadlineMs);
+      }
     });
   }
 }
