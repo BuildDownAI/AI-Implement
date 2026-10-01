@@ -201,11 +201,101 @@ describe("GithubReviewFixWorker.launch", () => {
 
     const outcome = await worker.launch(plan);
     expect(callbackInputs).toHaveBeenCalledWith(plan.attemptId);
-    expect((t.dispatchCalls[0] as { inputs: Record<string, unknown> }).inputs).toEqual(expect.objectContaining({
+    const inputs = (t.dispatchCalls[0] as { inputs: Record<string, unknown> }).inputs;
+    expect(inputs).toEqual(expect.objectContaining({
       run_token: "secret-result", run_progress_token: "secret-progress", run_publication_token: "secret-publication",
-      runner_callback_url: "https://callback.example/runner",
     }));
+    expect(inputs).not.toHaveProperty("runner_callback_url");
     expect(JSON.stringify(outcome)).not.toContain("secret-");
+  });
+
+  const CALLBACK_URL = "https://callback.example/runner";
+  const tokenInputs = (over: Record<string, unknown> = {}) => async () => ({
+    run_token: "secret-result", run_progress_token: "secret-progress", run_publication_token: "secret-publication",
+    runner_callback_url: CALLBACK_URL, ...over,
+  });
+
+  it("carries the callback URL in the envelope and keeps tokens out of the envelope, plan and routing store", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    t.setDispatchImpl(async () => ({ success: true, status: 200, outcome: "accepted", runId: 9010 }));
+    const scopeStore = workerModule.inMemoryReviewFixWorkerScopeStore();
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport, callbackInputs: tokenInputs(), scopeStore });
+    const plan = await worker.prepare(makeAttempt());
+    const outcome = await worker.launch(plan);
+
+    const inputs = (t.dispatchCalls[0] as { inputs: Record<string, string> }).inputs;
+    const { decodeRunConfig } = await import("../run-config.js");
+    expect(decodeRunConfig(inputs.run_config).runnerCallbackUrl).toBe(CALLBACK_URL);
+    expect(inputs).not.toHaveProperty("runner_callback_url");
+    expect(inputs.run_token).toBe("secret-result");
+    expect(inputs.run_progress_token).toBe("secret-progress");
+    expect(inputs.run_publication_token).toBe("secret-publication");
+    const envelopeText = Buffer.from(inputs.run_config, "base64").toString("utf8");
+    for (const surface of [envelopeText, JSON.stringify(plan), JSON.stringify(outcome), JSON.stringify(await scopeStore.scopeForAttempt(plan.attemptId))]) {
+      expect(surface).not.toContain("secret-");
+    }
+  });
+
+  it("dispatches only inputs declared by the canonical workflow, and the entrypoint reads the envelope field", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    t.setDispatchImpl(async () => ({ success: true, status: 200, outcome: "accepted", runId: 9011 }));
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport, callbackInputs: tokenInputs() });
+    await worker.launch(await worker.prepare(makeAttempt()));
+
+    const { parse } = await import("yaml");
+    const root = path.resolve(__dirname, "../..");
+    const workflow = parse(fs.readFileSync(path.join(root, "workflows/claude-implement.yml"), "utf8"));
+    const declared = Object.keys(workflow.on.workflow_dispatch.inputs);
+    const sent = Object.keys((t.dispatchCalls[0] as { inputs: Record<string, unknown> }).inputs);
+    expect(sent.filter((k) => !declared.includes(k))).toEqual([]);
+
+    const entrypoint = fs.readFileSync(path.join(root, "session/entrypoint.sh"), "utf8");
+    expect(entrypoint).toMatch(/resolve_envelope_field RUNNER_CALLBACK_URL runnerCallbackUrl/);
+  });
+
+  it("keeps run_config byte-identical through the real optional-input retry", async () => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const bodies: Array<{ inputs: Record<string, string> }> = [];
+    const fetchMock = vi.fn(async (_url: unknown, init?: { body?: string }) => {
+      bodies.push(JSON.parse(init!.body as string));
+      if (bodies.length === 1) {
+        return new Response(JSON.stringify({ message: 'Unexpected inputs provided: ["issue_identifier"]' }), { status: 422 });
+      }
+      return new Response(JSON.stringify({ workflow_run_id: 9012, run_url: "https://api.github.com/repos/eudoxus/ai-implement/actions/runs/9012", html_url: "https://github.com/eudoxus/ai-implement/actions/runs/9012" }), { status: 200 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, callbackInputs: tokenInputs() });
+      await worker.launch(await worker.prepare(makeAttempt()));
+    } finally {
+      vi.unstubAllGlobals();
+    }
+    expect(bodies).toHaveLength(2);
+    expect(bodies[0].inputs).toHaveProperty("issue_identifier");
+    expect(bodies[1].inputs).not.toHaveProperty("issue_identifier");
+    expect(bodies[1].inputs.run_config).toBe(bodies[0].inputs.run_config);
+    const { decodeRunConfig } = await import("../run-config.js");
+    expect(decodeRunConfig(bodies[1].inputs.run_config).runnerCallbackUrl).toBe(CALLBACK_URL);
+    expect(bodies[1].inputs.run_token).toBe("secret-result");
+  });
+
+  it.each([
+    ["callbackInputs rejects", async () => { throw new Error("no credential"); }],
+    ["the URL is missing", tokenInputs({ runner_callback_url: undefined })],
+    ["the URL is empty", tokenInputs({ runner_callback_url: "" })],
+  ])("does not dispatch when %s", async (_name, callbackInputs) => {
+    seedMapping();
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport, callbackInputs: callbackInputs as any });
+    const outcome = await worker.launch(await worker.prepare(makeAttempt()));
+    expect(outcome).toEqual({ status: "unknown" });
+    expect(t.dispatchCalls).toHaveLength(0);
   });
 
   it("dispatches once, returns accepted with a run_attempt of 1, and carries no secret fields", async () => {
