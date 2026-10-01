@@ -306,3 +306,75 @@ describe.skipIf(isWindows)("verify_workspace_writable", () => {
     expect(existsSync(sentinel)).toBe(false);
   });
 });
+
+describe.skipIf(isWindows)("session/lib.sh configured-run helpers (AII-951)", () => {
+  const run = (script: string, env: Record<string, string> = {}) =>
+    spawnSync("bash", ["-c", `source session/lib.sh\n${script}`], {
+      encoding: "utf-8",
+      env: { PATH: process.env.PATH ?? "", ...env },
+    });
+
+  it("run_scoped passes the environment through unchanged for legacy runs", () => {
+    const r = run('run_scoped "" bash -c \'echo "$OPENAI_API_KEY"\'', { OPENAI_API_KEY: "legacy-value" });
+    expect(r.stdout.trim()).toBe("legacy-value");
+  });
+
+  it("run_scoped hands configured children only minimal context plus named extras", () => {
+    const r = run('CONFIGURED=1; run_scoped "GH_TOKEN" env', {
+      HOME: "/h", GH_TOKEN: "gh", GITHUB_TOKEN: "ghp", OPENAI_API_KEY: "o", CODEX_HOME: "/c",
+      AI_IMPLEMENT_RUN_CONFIG: "enc", AI_IMPLEMENT_MODEL_AUTH_BEARER: "b", FWD: "f", AI_IMPLEMENT_FORWARDED_SECRETS: "FWD",
+    });
+    expect(r.status, r.stderr).toBe(0);
+    const names = r.stdout.trim().split("\n").map((l) => l.split("=")[0]).filter((n) => !["_", "PWD", "SHLVL", "OLDPWD", "SHELL", "TERM"].includes(n));
+    expect(names.sort()).toEqual(["GH_TOKEN", "HOME", "PATH"]);
+  });
+
+  it("run_scoped preserves the child's exit status", () => {
+    expect(run('CONFIGURED=1; run_scoped "" false').status).not.toBe(0);
+    expect(run('run_scoped "" false').status).not.toBe(0);
+  });
+
+  it("on_err includes the command for legacy and omits it for configured runs", () => {
+    expect(run('on_err 1 9 "git clone https://x:SECRET@h"').stdout).toContain("git clone");
+    const r = run('CONFIGURED=1; on_err 1 9 "git clone https://x:SECRET@h"');
+    expect(r.stdout).toContain("line 9 failed (exit 1)");
+    expect(r.stdout).not.toContain("SECRET");
+  });
+
+  describe("remap_team_secrets reservation", () => {
+    const MODEL_NAMES = [
+      "OPENAI_API_KEY", "OPENAI_BASE_URL", "CODEX_API_KEY", "CODEX_HOME", "CLAUDE_CONFIG_DIR",
+      "CLAUDE_CODE_USE_BEDROCK", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "AWS_ACCESS_KEY_ID",
+      "AWS_SECRET_ACCESS_KEY", "AWS_REGION", "AI_IMPLEMENT_MODEL_AUTH_BEARER", "AI_IMPLEMENT_RUN_CONFIG",
+    ];
+    const secrets = (): Record<string, string> => ({
+      AI_IMPLEMENT_TEAM_SECRET_PREFIX: "SAN_",
+      SAN_DB_URL: "safe-value",
+      ...Object.fromEntries(MODEL_NAMES.map((n) => [`SAN_${n}`, `SENTINEL-${n}`])),
+    });
+    const probe = (configured: boolean) =>
+      run(
+        `${configured ? "CONFIGURED=1\n" : ""}remap_team_secrets\n` +
+          `echo "FORWARDED=$AI_IMPLEMENT_FORWARDED_SECRETS"\n` +
+          MODEL_NAMES.map((n) => `echo "${n}=\${${n}:-UNSET}"`).join("\n"),
+        secrets(),
+      );
+
+    it("configured runs reject every model, session and provider-routing alias but forward a normal secret", () => {
+      const r = probe(true);
+      expect(r.status, r.stderr).toBe(0);
+      expect(r.stdout).toContain("FORWARDED=DB_URL\n");
+      for (const n of MODEL_NAMES) expect(r.stdout).toContain(`${n}=UNSET`);
+      expect(r.stdout).not.toContain("SENTINEL-");
+    });
+
+    it("legacy runs keep the narrower reserved list: non-reserved model-looking names still forward", () => {
+      const r = probe(false);
+      expect(r.stdout).toContain("OPENAI_API_KEY=SENTINEL-OPENAI_API_KEY");
+      expect(r.stdout).toContain("CLAUDE_CONFIG_DIR=SENTINEL-CLAUDE_CONFIG_DIR");
+      // AI_IMPLEMENT_* stays reserved in every mode.
+      expect(r.stdout).toContain("AI_IMPLEMENT_MODEL_AUTH_BEARER=UNSET");
+      expect(r.stdout).toContain("AI_IMPLEMENT_RUN_CONFIG=UNSET");
+    });
+  });
+});

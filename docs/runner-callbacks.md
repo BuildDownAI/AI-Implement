@@ -54,6 +54,15 @@ Unmarked Legacy callbacks retain the single-use result token above.
 
 The consequence to remember: any code the repository runs under `preflight` or a hook holds the run's own authority. A test suite is repository code. The model process cannot reach the tokens, so "the agent did it" is the wrong model of this failure.
 
+## Configured-run model bootstrap (AII-951)
+
+A run is *configured* (opted in) when its envelope carries a resolved `agentConfig` snapshot. The shell bootstrap (`session/entrypoint.sh`, `classify_run_config` in `session/lib.sh`) validates the envelope with the compiled trusted decoder (`decodeTrustedRunConfig`, which also validates `credentials.modelAuthGrant`) before it skips the legacy `ANTHROPIC_*`/Bedrock provider check. Configured intent that is malformed or lacks the grant fails closed with a fixed message, before any git, clone or setup, and never falls back to legacy credentials. Runs without `agentConfig`/`credentials` keep the legacy startup and provider requirements unchanged.
+
+- **Shell children.** On configured runs `run_scoped` starts shell `git`/`gh` with a minimal environment (PATH, HOME, locale, TLS/proxy) plus only `GH_TOKEN` for `gh`. Model, session, bootstrap and forwarded-secret variables never reach them, and the ERR trap logs a fixed line instead of the failing command text. The protected envelope stays in the trusted handoff only.
+- **TS children.** `repoProcessEnv` drops the forwarded-secret collision exception and every `OPENAI_`/`CODEX_`/`ANTHROPIC_`/`CLAUDE_CODE_`/`AWS_` name on configured runs (legacy keeps the exception). `modelProcessEnv(allow, selectedAuth)` returns a copy of the environment `ModelAuthClient` built for the selected credential, never merged with `process.env`.
+- **Team-secret remap.** Configured runs additionally reserve model, session and provider-routing names in `_remap_is_reserved`; ordinary secrets still forward.
+- **Trust limit.** This is credential hygiene, not hostile-code isolation: commands the agent starts can read their parent model process's environment. Hosted session-key delivery to the runner is not part of this change.
+
 ## Blast radius
 
 What one stray use of each credential destroys, and where the symptom appears.

@@ -1,3 +1,5 @@
+import { decodeTrustedRunConfig } from "../run-config.js";
+
 // Exported (alongside GITHUB_WRITE_CREDENTIAL_KEYS and parseForwardedSecrets below)
 // so other modules that need to recognise these same credential surfaces — e.g. the
 // activity reporter's redaction pass — can reuse this list instead of maintaining a
@@ -96,14 +98,50 @@ const DEPENDENCY_HELPER_KEYS = [
  * read process.env at call time) but not to subsequent repo-process invocations,
  * because each call to repoProcessEnv() takes a fresh snapshot and strips again.
  */
-export function repoProcessEnv(): NodeJS.ProcessEnv {
+export function repoProcessEnv(options: { configured?: boolean } = {}): NodeJS.ProcessEnv {
   const env = { ...process.env };
+  const configured = options.configured ?? isConfiguredModelRun(process.env);
   const forwarded = new Set(parseForwardedSecrets());
   for (const key of MODEL_CREDENTIAL_KEYS) delete env[key];
-  // An explicitly approved forwarded secret keeps its name even if it collides with a model key.
-  for (const key of MODEL_SESSION_KEYS) if (!forwarded.has(key)) delete env[key];
+  // Legacy only: an explicitly approved forwarded secret keeps its name even if it collides
+  // with a model key. A configured (opted-in) run never keeps one, so a forwarded-secret
+  // alias cannot reintroduce a model credential, auth directory or provider redirect.
+  for (const key of MODEL_SESSION_KEYS) if (configured || !forwarded.has(key)) delete env[key];
+  if (configured) {
+    for (const key of Object.keys(env)) {
+      if (CONFIGURED_MODEL_PREFIXES.some((p) => key.startsWith(p))) delete env[key];
+    }
+  }
   deleteBootstrapKeys(env);
   return env;
+}
+
+/** Extra name prefixes (credentials, auth directories, provider routing) removed from repository children of configured runs. */
+const CONFIGURED_MODEL_PREFIXES = ["OPENAI_", "CODEX_", "ANTHROPIC_", "CLAUDE_CODE_", "CLAUDE_CONFIG_", "AWS_"] as const;
+
+/**
+ * True when the encoded run config selects per-stage agent configuration (opt-in). Mirrors
+ * session/lib.sh classify_run_config: an envelope that is not parseable JSON, or carries neither
+ * `agentConfig` nor `credentials`, is legacy; configured intent that fails the trusted decoder
+ * still counts as configured so the stricter stripping applies (fail closed).
+ */
+export function isConfiguredModelRun(env: NodeJS.ProcessEnv): boolean {
+  const encoded = env.AI_IMPLEMENT_RUN_CONFIG;
+  if (!encoded) return false;
+  let raw: unknown;
+  try {
+    raw = JSON.parse(Buffer.from(encoded, "base64").toString("utf-8"));
+  } catch {
+    return false;
+  }
+  if (raw === null || typeof raw !== "object") return false;
+  const { agentConfig, credentials } = raw as Record<string, unknown>;
+  if (agentConfig === undefined && credentials === undefined) return false;
+  try {
+    return decodeTrustedRunConfig(encoded).agentConfig !== undefined;
+  } catch {
+    return true;
+  }
 }
 
 /**
@@ -116,7 +154,11 @@ export function repoProcessEnv(): NodeJS.ProcessEnv {
  * available to hooks but must never reach the model process — as is the
  * install step's NPM_TOKEN regardless of how it was injected.
  */
-export function modelProcessEnv(allowRepositoryWrites: boolean): NodeJS.ProcessEnv {
+export function modelProcessEnv(
+  allowRepositoryWrites: boolean,
+  selectedAuth?: { readonly env: Readonly<Record<string, string | undefined>> },
+): NodeJS.ProcessEnv {
+  if (selectedAuth) return selectedModelEnv(allowRepositoryWrites, selectedAuth.env);
   const env = { ...process.env };
   if (env.CLAUDE_CODE_OAUTH_TOKEN) {
     delete env.ANTHROPIC_API_KEY;
@@ -130,6 +172,37 @@ export function modelProcessEnv(allowRepositoryWrites: boolean): NodeJS.ProcessE
   deleteBootstrapKeys(env);
   // The list variable itself must not reach the model — it names what was hidden
   delete env.AI_IMPLEMENT_FORWARDED_SECRETS;
+  return env;
+}
+
+/**
+ * Explicit selected-authentication form: `selected` is the environment ModelAuthClient's
+ * buildModelInvocationEnv produced for the one selected credential (positive allowlist of
+ * safe context plus that credential). It is copied, never merged with process.env, so no
+ * other profile's credential, bootstrap, callback or install secret can ride along.
+ * Defensive deletes repeat the protected names in case a caller hands in a wider map.
+ * Forwarded-secret names are deliberately not stripped here: a forwarded secret that
+ * collides with the selected credential's name must not remove the selection.
+ *
+ * Trust limit: this filters what the model process inherits; commands the agent starts can
+ * still read that process's environment, so this is not hostile-code isolation.
+ */
+function selectedModelEnv(
+  allowRepositoryWrites: boolean,
+  selected: Readonly<Record<string, string | undefined>>,
+): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...selected };
+  for (const key of RUNNER_CREDENTIAL_KEYS) delete env[key];
+  for (const key of INSTALL_CREDENTIAL_KEYS) delete env[key];
+  for (const key of GITHUB_WRITE_CREDENTIAL_KEYS) delete env[key];
+  delete env.AI_IMPLEMENT_FORWARDED_SECRETS;
+  deleteBootstrapKeys(env);
+  if (allowRepositoryWrites) {
+    for (const key of GITHUB_WRITE_CREDENTIAL_KEYS) {
+      const value = process.env[key];
+      if (value !== undefined) env[key] = value;
+    }
+  }
   return env;
 }
 

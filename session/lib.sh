@@ -105,6 +105,61 @@ resolve_envelope_field() {
   fi
 }
 
+# Classify AI_IMPLEMENT_RUN_CONFIG for model-auth bootstrap. Prints exactly one fixed word:
+#   legacy      no envelope, or an envelope without agentConfig/credentials (legacy startup)
+#   configured  trusted decoder accepts it, it carries a resolved agentConfig snapshot and a
+#               credentials.modelAuthGrant bootstrap
+#   invalid     configured intent (agentConfig or credentials present) that fails the trusted
+#               decoder or lacks the grant; callers fail closed, never fall back to legacy
+# Never prints decoded values or decoder error text. AI_IMPLEMENT_DIST_DIR is a test seam.
+classify_run_config() {
+  [ -z "${AI_IMPLEMENT_RUN_CONFIG:-}" ] && { echo legacy; return 0; }
+  node --input-type=module -e '
+    const out = (w) => process.stdout.write(w);
+    let raw;
+    try { raw = JSON.parse(Buffer.from(process.env.AI_IMPLEMENT_RUN_CONFIG, "base64").toString("utf-8")); } catch { out("legacy"); process.exit(0); }
+    if (raw === null || typeof raw !== "object" || (raw.agentConfig === undefined && raw.credentials === undefined)) { out("legacy"); process.exit(0); }
+    try {
+      const dir = process.env.AI_IMPLEMENT_DIST_DIR || "/app/dist";
+      const { decodeTrustedRunConfig } = await import(dir + "/run-config.js");
+      const c = decodeTrustedRunConfig(process.env.AI_IMPLEMENT_RUN_CONFIG);
+      out(c.agentConfig !== undefined && c.credentials && c.credentials.modelAuthGrant !== undefined ? "configured" : "invalid");
+    } catch { out("invalid"); }
+  ' 2>/dev/null || echo invalid
+}
+
+# Run a command with a minimal, scrubbed environment when the run is configured
+# (CONFIGURED=1): only PATH/HOME/locale/TLS/proxy context plus the explicitly named
+# extra variables (e.g. GH_TOKEN for gh). Model, session, bootstrap and forwarded-secret
+# material never reaches the child. Legacy runs (CONFIGURED unset) run unchanged.
+# Usage: run_scoped "EXTRA_VAR ..." command [args...]
+run_scoped() {
+  local extra="$1" k
+  shift
+  # `|| return` keeps the failure visible to the caller's ERR trap (traps are not inherited by functions).
+  if [ "${CONFIGURED:-0}" != "1" ]; then "$@" || return $?; return 0; fi
+  local -a keep=(PATH HOME USER LOGNAME SHELL TERM TMPDIR TMP TEMP TZ LANG LANGUAGE LC_ALL LC_CTYPE
+    SSL_CERT_FILE SSL_CERT_DIR NODE_EXTRA_CA_CERTS REQUESTS_CA_BUNDLE CURL_CA_BUNDLE
+    HTTP_PROXY HTTPS_PROXY NO_PROXY ALL_PROXY http_proxy https_proxy no_proxy all_proxy)
+  local -a pairs=()
+  # shellcheck disable=SC2086 # extra is a space-separated list of names
+  for k in "${keep[@]}" $extra; do
+    [ -n "${!k+x}" ] && pairs+=("$k=${!k}")
+  done
+  env -i "${pairs[@]}" "$@" || return $?
+}
+
+# ERR trap body. Configured runs log a fixed message: the failing command text can carry
+# bootstrap or token material.
+on_err() {
+  local rc="$1" line="$2" cmd="$3"
+  if [ "${CONFIGURED:-0}" = "1" ]; then
+    log "ERROR: line $line failed (exit $rc)"
+  else
+    log "ERROR: line $line failed: $cmd (exit $rc)"
+  fi
+}
+
 # Echoes the runner entry file for a given RUNNER_PHASE. Same five arms used
 # by every execution mode; kept here so lib.sh is the one place that maps
 # phase -> entry file.
@@ -129,6 +184,13 @@ _remap_is_reserved() {
     ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN|SESSION_TOKEN|MACHINE_NONCE) return 0 ;;
     RUN_TOKEN|ORCHESTRATOR_URL|RUNNER_CALLBACK_URL|WORKSPACE_DIR|PATH|HOME) return 0 ;;
   esac
+  # Configured (opted-in) runs also reserve every model credential, session/auth-directory
+  # and provider-routing name. Legacy runs keep the narrower list above on purpose.
+  if [ "${CONFIGURED:-0}" = "1" ]; then
+    case "$1" in
+      OPENAI_*|CODEX_*|ANTHROPIC_*|CLAUDE_*|AWS_*|RUN_*|RUNNER_*|NPM_TOKEN|CLOUD_ML_REGION|GOOGLE_APPLICATION_CREDENTIALS) return 0 ;;
+    esac
+  fi
   return 1
 }
 
