@@ -278,17 +278,25 @@ describe("job row after a non-GHA dispatch (real log.ts, scratch database)", () 
     try {
       log.initLogTable();
       const id = log.appendLogIfAbsent({ issueId: "kg-refresh", phase: "kg-refresh", dispatchId: "d-workflow", executionMode: "fly-machines", repo: "acme/kg" });
-      // The same calls, in the same order, as `recordDispatch` in src/index.ts.
-      const recordDispatch = (dispatchId: string, d: { machineId?: string; machineNonce?: string; logsUrl?: string }) => {
-        const jobId = log.findLogIdByDispatchId(dispatchId);
-        if (jobId === undefined) return;
-        if (d.machineNonce) log.updateJobMachineDetails(jobId, { machineNonce: d.machineNonce, machineId: d.machineId, logsUrl: d.logsUrl });
-      };
+      vi.doUnmock("../log.js"); // the fresh module must share the scratch database's log.js instance
+      const { recordKgDispatchDetails } = await import("../restate/kg-refresh-production.js");
+      const recordDispatch = recordKgDispatchDetails;
       resolvedPath.current = "fly-machines";
       const dispatchKgRefreshRun = vi.fn(async () => ({ machineId: "m-7", machineNonce: "nonce-7", logsUrl: "https://fly/m-7" }));
       await createKgRefreshDispatch(makeInput({ dispatchKgRefreshRun, recordDispatch }))(dispatchInput);
       expect(log.getJobByMachineId("m-7")?.id).toBe(id);
       expect(log.getJobByNonce("nonce-7")?.id).toBe(id);
+
+      // A GHA dispatch (no nonce) stores the run id and the URL on the row.
+      const ghaId = log.appendLogIfAbsent({ issueId: "kg-refresh", phase: "kg-refresh", dispatchId: "d-gha", executionMode: "github-actions", repo: "acme/kg" });
+      recordKgDispatchDetails("d-gha", { workflowRunId: 321, logsUrl: "https://gh/run/321" });
+      const ghaRow = log.getJobById(ghaId);
+      expect(ghaRow?.runId).toBe(321);
+      expect(ghaRow?.prUrl).toBe("https://gh/run/321");
+
+      // A dispatch id with no row does nothing and does not throw.
+      expect(() => recordKgDispatchDetails("d-missing", { machineNonce: "n", workflowRunId: 1, logsUrl: "u" })).not.toThrow();
+      expect(log.getJobByNonce("n")).toBeNull();
     } finally {
       dedup.closeDb();
       if (previous === undefined) delete process.env.DEDUP_DB_PATH;

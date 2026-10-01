@@ -29,7 +29,7 @@ import { encodeRunConfig, type RunConfigV1 } from "../run-config.js";
 import { getRunnerMode, resolveExecutionPath } from "../runner-mode.js";
 import { mintRunToken } from "../runner-tokens.js";
 import type { JobStatus } from "../log.js";
-import { appendLogIfAbsent, findLogIdByDispatchId } from "../log.js";
+import { appendLogIfAbsent, findLogIdByDispatchId, updateJobMachineDetails, updateJobPrUrl, updateJobRunId } from "../log.js";
 import type { RestateService } from "./endpoint.js";
 import {
   createKgRefreshWorkflow,
@@ -60,6 +60,18 @@ export interface KgDispatchDetails {
   machineNonce?: string;
   logsUrl?: string;
   workflowRunId?: number;
+}
+
+/**
+ * Writes a kg-refresh dispatch's machine and run details onto its job row (legacy `updateJobMachine`):
+ * the machine nonce wins, else the logs URL, plus the run id. A dispatch id with no row is a no-op.
+ */
+export function recordKgDispatchDetails(dispatchId: string, d: KgDispatchDetails): void {
+  const jobId = findLogIdByDispatchId(dispatchId);
+  if (jobId === undefined) return;
+  if (d.machineNonce) updateJobMachineDetails(jobId, { machineNonce: d.machineNonce, machineId: d.machineId, logsUrl: d.logsUrl });
+  else if (d.logsUrl) updateJobPrUrl(jobId, d.logsUrl);
+  if (d.workflowRunId !== undefined) updateJobRunId(jobId, d.workflowRunId);
 }
 
 export interface KgRefreshProductionInput {

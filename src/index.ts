@@ -43,7 +43,7 @@ import { remediateStuckJob, remediateFailedJob } from "./stuck-watchdog.js";
 import type { StuckWatchdogConfig } from "./stuck-watchdog.js";
 import { handleAdminRequest } from "./admin.js";
 import type { AdminDeps } from "./admin.js";
-import { initLogTable, appendLog, countPriorDispatches, completeOrphanedPlanningJobs, attachJobRunIdIfMissing, updateJobRunId, updateJobStatus, updateJobPrUrl, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobById, getJobByMachineId, getJobByDispatchId, resetStuckAttempts, getRecentFailedRunUrls, findLogIdByDispatchId, updateJobMachineDetails } from "./log.js";
+import { initLogTable, appendLog, countPriorDispatches, completeOrphanedPlanningJobs, attachJobRunIdIfMissing, updateJobRunId, updateJobStatus, updateJobPrUrl, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobById, getJobByMachineId, getJobByDispatchId, resetStuckAttempts, getRecentFailedRunUrls } from "./log.js";
 import { recordDispatchFailure, recordDispatchSuccess, shouldCountFailure, initDispatchBreakerTable, parkIssue, prBudgetParkMessage, isParked } from "./dispatch-breaker.js";
 import type { Job, JobStatus } from "./log.js";
 import { getInstallationToken, getInstallationId, getAppSlug, getScopedInstallationToken } from "./github-app-auth.js";
@@ -125,7 +125,7 @@ import { createKgRefreshIngressClient } from "./restate/kg-refresh-production.js
 import { RestateSidecar } from "./restate/server.js";
 import { startRestateEndpoint, register as registerRestateEndpoint, RESTATE_SERVICES } from "./restate/endpoint.js";
 import { createProductionReviewFixServices } from "./restate/review-fix-production.js";
-import { createProductionKgRefreshServices, type KgDispatchDetails, forgetRunWatch, lookupRunWatch, resolveRunWatchAwakeable } from "./restate/kg-refresh-production.js";
+import { createProductionKgRefreshServices, recordKgDispatchDetails, forgetRunWatch, lookupRunWatch, resolveRunWatchAwakeable } from "./restate/kg-refresh-production.js";
 import { setKgRefreshToolDeps } from "./restate/tools.js";
 import type { RestateRegisterOutcome, RestateRegisterResult } from "./restate/endpoint.js";
 import { getRestateStatus, setRestateStatus } from "./restate/status.js";
@@ -5432,14 +5432,6 @@ async function main(): Promise<void> {
   const kgSourceRepo = config.kgSourceRepo;
   const kgSlug = kgSourceRepo ? parseKgSourceRepo(kgSourceRepo) : null;
   const kgWorkflowToken = () => getInstallationToken(config.githubAppId, config.githubAppPrivateKey, kgSlug!.owner);
-  // Legacy `updateJobMachine`: the machine nonce wins, else the logs URL, plus the run id.
-  const recordDispatch = (dispatchId: string, d: KgDispatchDetails): void => {
-    const jobId = findLogIdByDispatchId(dispatchId);
-    if (jobId === undefined) return;
-    if (d.machineNonce) updateJobMachineDetails(jobId, { machineNonce: d.machineNonce, machineId: d.machineId, logsUrl: d.logsUrl });
-    else if (d.logsUrl) updateJobPrUrl(jobId, d.logsUrl);
-    if (d.workflowRunId !== undefined) updateJobRunId(jobId, d.workflowRunId);
-  };
   const kgComposition = kgSourceRepo && kgSlug
     ? createProductionKgRefreshServices({
       kgSourceRepo,
@@ -5459,7 +5451,7 @@ async function main(): Promise<void> {
       deleteBranchFn: deleteBranch,
       dispatchKgRefreshRun: (opts) => dispatchKgRefreshRun(config, opts),
       updateJobStatus,
-      recordDispatch,
+      recordDispatch: recordKgDispatchDetails,
       getWorkflowRunStatus: async (runId) => {
         const run = await getWorkflowRunStatus(await kgWorkflowToken(), kgSlug.owner, kgSlug.repo, runId);
         if (!run) throw new Error(`workflow run ${runId} status unavailable`);
@@ -5480,7 +5472,7 @@ async function main(): Promise<void> {
         // The title is `KG-REFRESH · <dispatchId>`; a bare identifier carries no dispatch id to record against.
         const dispatchIdPrefix = "KG-REFRESH · ";
         if (title.startsWith(dispatchIdPrefix)) {
-          recordDispatch(title.slice(dispatchIdPrefix.length), { workflowRunId: match.id, logsUrl: match.html_url });
+          recordKgDispatchDetails(title.slice(dispatchIdPrefix.length), { workflowRunId: match.id, logsUrl: match.html_url });
         }
         return { runId: match.id };
       },
