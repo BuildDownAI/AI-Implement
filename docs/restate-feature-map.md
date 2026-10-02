@@ -46,9 +46,9 @@ and handler types that the typed clients use are in `src/restate/kg-refresh-type
 | `ctx.run` retry options | `maxRetryAttempts: 3` on the gate, `dispatch`, `outcome`, `merge` and `delete-branch` steps | none | `maxRetryAttempts: 1` | No `initialRetryInterval`, `maxRetryDuration` anywhere |
 | Handler `retryPolicy` | none | none | `{ maxAttempts: 1, onMaxAttempts: "kill" }` on writes | |
 | `ctx.sleep` | yes (race arm, cancel watch) | yes (1 s polling loops) | test seam only | |
-| `RestatePromise.race` | yes | no | no | KG races report / cancel / progress / run-done awakeable / tick |
+| `RestatePromise.race` | yes | no | no | KG races report / cancel / progress / tick |
 | `.orTimeout` | no | yes (once) | no | |
-| Awakeables (`ctx.awakeable`) | yes: the run watch (AII-974) | no | no | Resolved by the `workflow_run` webhook over the loopback ingress |
+| Awakeables (`ctx.awakeable`) | no (removed by AII-1026, ADR 033) | no | no | |
 | One-way send | yes, typed (`objectSendClient`, `workflowSendClient`; AII-975) | yes, untyped (`genericSend`) | — | |
 | Delayed send | yes: `KgRepo.expire` self-send (AII-973) | yes (`ReviewFixPR.check` self-timer) | no | |
 | Request-response call (`objectClient`, `workflowClient`) | yes (from tools handlers, typed) | no | yes | |
@@ -60,7 +60,7 @@ and handler types that the typed clients use are in `src/restate/kg-refresh-type
 | `TerminalError` with `errorCode` | yes: 404 and 409 (AII-975) | no | no | |
 | Invocation cancellation (`ctx.cancel`, admin cancel) | no (own `cancel` promise) | no (own `cancel` promise) | no | § 5.1 |
 | `ctx.attach` / `/restate/attach` | tests only | no | no | |
-| Ingress `idempotency-key` | yes: runner report (dispatch id), webhook enqueue and run-watch resolve (delivery id) | yes: delivery pump key | when the caller supplies one | |
+| Ingress `idempotency-key` | yes: runner report (dispatch id), webhook enqueue (delivery id) | yes: delivery pump key | when the caller supplies one | |
 | SDK ingress client (`@restatedev/restate-sdk-clients`) | yes: `createKgRefreshIngressClient` (AII-975) | no | no | |
 | Service options: `workflowRetention`, `journalRetention` | yes | yes | no | |
 | Service options: `idempotencyRetention` | on `report`, `cancel` | on `result`, `cancel` | no | KG `status` and `progress` carry no retention (AII-973) |
@@ -86,8 +86,8 @@ mechanism the pilot still carries (§ 5.2).
 | **Object state as the queue** (`pending` map, drained by `release`) | `KgRepo.enqueueDryRun` (AII-730) | `ReviewFixPR` deferred recheck every 30 s; `capacityAvailable` (never called) |
 | **Direct ingress from the authenticated route with an idempotency key** (ADR 023 amendment) | runner callback → `KgRefresh/{id}/report`; webhook → `KgRepo/{slug}/enqueueDryRun` | SQLite inbox + `ReviewFixDeliveryPump` (2 s `setInterval`) |
 | **Request-response calls between services** (`ctx.objectClient`, `ctx.workflowClient`) | tools handlers call `KgRepo.trigger` / `KgRefresh.status` natively | none; the pilot only sends |
-| **Race of durable promises against a timer** (`RestatePromise.race`) | wait loop: report / cancel / progress / run-done / tick | 1 s `ctx.sleep` loop with a GitHub call per tick |
-| **Awakeable resolved by a webhook** (AII-974) | the `workflow_run.completed` delivery resolves the run watch (`registerRunWatch`, `resolveRunWatchAwakeable` in `src/restate/kg-refresh-production.ts`); `KG_REFRESH_WATCH_INTERVAL_MS` is the backstop tick | polling loops |
+| **Race of durable promises against a timer** (`RestatePromise.race`) | wait loop: report / cancel / progress / tick | 1 s `ctx.sleep` loop with a GitHub call per tick |
+| **Awakeables / signals** | A durable external signal into a workflow | Only through a channel every deployment already has (ADR 033); no GitHub App event or setting may be required |
 | **Typed send clients and an SDK ingress client** (AII-975) | `objectSendClient` / `workflowSendClient` over `src/restate/kg-refresh-types.ts`; `createKgRefreshIngressClient` maps 404 and 409 | `genericSend`; hand-written `fetch` wrappers |
 | **Zod `.strict()` inputs** (AII-938) | `KgRefresh.run` and every `KgRepo` handler with an input | none |
 | **Lease expiry owned by the object** (AII-973) | `KgRepo` sends itself a delayed `expire` at the workflow's total deadline plus `KG_REPO_STALE_MARGIN_MS` | missed-close recovery poll |
@@ -114,8 +114,7 @@ mechanism the pilot still carries (§ 5.2).
 | **Kafka / event ingestion** | Not applicable today | — |
 | **Virtual queues, rate-limiting patterns** | Per-key admission with fairness | The `dispatch_admissions` team-capacity table once every dispatch kind is on Restate (a capacity Virtual Object) |
 
-Used by kg-refresh since the first review, and so removed from this list: awakeables (AII-974),
-typed send clients and `@restatedev/restate-sdk-clients` (AII-975), `TerminalError` with
+Used by kg-refresh since the first review, and so removed from this list: typed send clients and `@restatedev/restate-sdk-clients` (AII-975), `TerminalError` with
 `errorCode` (AII-975), `ingressPrivate` and request identity keys (AII-976). The pilot does not
 use them yet.
 
@@ -125,7 +124,7 @@ use them yet.
 
 | Mechanism | Restate primitive | Status |
 |---|---|---|
-| GitHub run watch loop (60 s tick, `watch-N` / `reconcile-N`) | awakeable resolved by the `workflow_run` webhook | done (AII-974). The tick stays as the backstop: 60 s until the run id is known, `KG_REFRESH_WATCH_INTERVAL_MS` after registration |
+| GitHub run watch loop (`watch-N` / `reconcile-N`) | — | poll each 60 s (ADR 033) |
 | Stale-marker age check (4 h 10 m) | delayed self-send `expire` | done (AII-973), § 6 B3 |
 | Callback routed by the current marker | workflow keyed by the dispatch id | done (AII-938), § 6 B4 |
 | Hand-written ingress client sniffing "conflicting report" | sdk-clients + `TerminalError` `errorCode: 409` | done (AII-975) |
@@ -136,7 +135,6 @@ use them yet.
 | Own `cancel` promise + poll until GitHub confirms | invocation cancellation | stays, justified: the cancel path must hold the marker until GitHub confirms that the run stopped |
 | Job-row id in a process `Map` with SQL fallback (`jobIds`, `src/restate/kg-refresh-production.ts`) | return the id from `ctx.run("reserve")` | done (AII-1011): the map is gone; `closeJobLog` resolves the row by dispatch id |
 | `kg_refresh_last_refresh` / `kg_refresh_snapshot_sha` settings rows (`src/kg-refresh.ts`) | `KgRepo` state | stays; the served-snapshot record is read outside Restate at boot |
-| Run-watch map from GitHub run id to awakeable id (a `settings` row per run, `runWatchKey`) | — | new with AII-974; the webhook route needs the lookup outside a handler. Cleared by the `forget-run-watch` step on every terminal path |
 
 ### 5.2 Review-fix pilot (partial) — exists because a Legacy owner runs beside it
 
@@ -184,10 +182,11 @@ Landed on the feature branch, in merge order:
 1. AII-938 — C1 + B4: zod schemas, options forwarded to the dispatch, trigger id = dispatch id.
 2. AII-973 — B3, C2, C3, C4, C5: object-owned lease expiry, reconcile-first `dispatch`, awaited `outcome`, tokens outside the journal, suspension rethrown, retention trimmed.
 3. AII-975 — typed send clients, the SDK ingress client with 404 and 409, the `GateResult` union, dead branch and stale comments removed.
-4. AII-974 — the awakeable run watch resolved by the `workflow_run.completed` webhook. The GitHub App must be subscribed to the `workflow_run` event; without it the backstop tick still ends the wait.
+4. AII-974 — an awakeable run watch resolved by the `workflow_run.completed` webhook. It was never deployed and AII-1026 removed it (ADR 033): it needed a GitHub App event subscription on each deployment.
 5. AII-993 — a test pattern, not a Restate feature: `eventually`, `queryInvocations`, `settle` in `src/__tests__/restate/harness.ts` and the guard `src/__tests__/restate-test-hygiene.test.ts`. AII-994 converts the remaining scenario files.
 6. AII-977 — per-PR dry-run outcome and same-sha dedup on `KgRepo` state.
 7. AII-976 — C9: request identity key and `ingressPrivate`. A corrupt key file is regenerated, a key that cannot be prepared keeps the sidecar down, and the sidecar path has no unsigned mode.
+8. AII-1026 — the `workflow_run` path and awakeable are removed; the run watch is one 60 s status read (ADR 033).
 
 Remains:
 

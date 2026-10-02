@@ -125,7 +125,7 @@ import { createKgRefreshIngressClient } from "./restate/kg-refresh-production.js
 import { RestateSidecar } from "./restate/server.js";
 import { startRestateEndpoint, register as registerRestateEndpoint, RESTATE_SERVICES } from "./restate/endpoint.js";
 import { createProductionReviewFixServices } from "./restate/review-fix-production.js";
-import { KG_REFRESH_WORKFLOW_FILE, createProductionKgRefreshServices, recordKgDispatchDetails, forgetRunWatch, lookupRunWatch, resolveRunWatchAwakeable } from "./restate/kg-refresh-production.js";
+import { KG_REFRESH_WORKFLOW_FILE, createProductionKgRefreshServices, recordKgDispatchDetails } from "./restate/kg-refresh-production.js";
 import { setKgRefreshToolDeps } from "./restate/tools.js";
 import type { RestateRegisterOutcome, RestateRegisterResult } from "./restate/endpoint.js";
 import { getRestateStatus, setRestateStatus } from "./restate/status.js";
@@ -4746,12 +4746,7 @@ function startServer(
             ? kgRefreshIngressClient.enqueueDryRun(parseKgSourceRepo(config.kgSourceRepo).fullName, { key, ...entry }, opts)
             : Promise.resolve({ status: "unavailable" as const }),
         forgetKgPr: (repo, prNumber) => kgRefresh.forgetPr(repo, prNumber),
-      }, (repository, prNumber) => { queueReviewFixCancellationForClosedPr(repository, prNumber); }, {
-        lookup: lookupRunWatch,
-        resolve: resolveRunWatchAwakeable,
-        forget: forgetRunWatch,
-        kgSourceRepo: config.kgSourceRepo ?? undefined,
-      }).catch((err) => {
+      }, (repository, prNumber) => { queueReviewFixCancellationForClosedPr(repository, prNumber); }).catch((err) => {
         console.error("[webhook] Unhandled error:", err);
         if (!res.headersSent) {
           res.writeHead(500, { "Content-Type": "application/json" });

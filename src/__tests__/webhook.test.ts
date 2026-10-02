@@ -273,90 +273,19 @@ describe("event filtering", () => {
   });
 });
 
-describe("workflow_run run watch", () => {
-  const completed = { action: "completed", repository: { full_name: "acme/kg" }, workflow_run: { id: 777, conclusion: "success" } };
+describe("workflow_run delivery", () => {
+  it("is answered like any other event the handler does not use", async () => {
+    const unused = makeRequest(SECRET, "ping", { zen: "Keep it logically awesome." });
+    webhook.handleGitHubWebhook(unused.req as never, unused.res as never, SECRET);
+    await unused.res.done;
 
-  function hooks(known: Record<number, string>) {
-    return {
-      lookup: vi.fn((runId: number) => known[runId] ?? null),
-      resolve: vi.fn(async (): Promise<"resolved" | "gone" | "failed"> => "resolved"),
-      forget: vi.fn(),
-      kgSourceRepo: "acme/kg",
-    };
-  }
-
-  async function send(payload: unknown, runWatch: ReturnType<typeof hooks>, delivery = "delivery-1", secret = SECRET) {
-    const { req, res } = makeRequest(SECRET, "workflow_run", payload, secret);
-    req.headers["x-github-delivery"] = delivery;
-    webhook.handleGitHubWebhook(req as never, res as never, SECRET,
-      undefined, undefined, undefined, undefined, undefined, runWatch);
-    await res.done;
-    return res;
-  }
-
-  it("resolves the awakeable once, with the delivery id as idempotency key", async () => {
-    const runWatch = hooks({ 777: "awk_secret" });
-    const res = await send(completed, runWatch);
-    expect(res.statusCode).toBe(200);
-    expect(runWatch.resolve).toHaveBeenCalledTimes(1);
-    expect(runWatch.resolve).toHaveBeenCalledWith("awk_secret", "success", "delivery-1");
-    expect(runWatch.forget).toHaveBeenCalledWith(777);
-    expect(res.body).not.toContain("awk_secret");
-  });
-
-  it("answers 200 ignored for an unknown run id", async () => {
-    const runWatch = hooks({});
-    const res = await send(completed, runWatch);
-    expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body).ignored).toBe(true);
-    expect(runWatch.resolve).not.toHaveBeenCalled();
-  });
-
-  it("ignores actions other than completed", async () => {
-    const runWatch = hooks({ 777: "awk_secret" });
-    const res = await send({ ...completed, action: "requested" }, runWatch);
-    expect(JSON.parse(res.body).ignored).toBe(true);
-    expect(runWatch.resolve).not.toHaveBeenCalled();
-  });
-
-  it("rejects a bad signature without resolving", async () => {
-    const runWatch = hooks({ 777: "awk_secret" });
-    const res = await send(completed, runWatch, "delivery-1", "wrong-secret");
-    expect(res.statusCode).toBe(401);
-    expect(runWatch.resolve).not.toHaveBeenCalled();
-  });
-
-  it("keeps the row and answers 502 when the resolve fails", async () => {
-    const runWatch = hooks({ 777: "awk_secret" });
-    runWatch.resolve.mockResolvedValueOnce("failed");
-    const res = await send(completed, runWatch);
-    expect(res.statusCode).toBe(502);
-    expect(runWatch.forget).not.toHaveBeenCalled();
-  });
-
-  it.each(["gone"] as const)("treats an already-resolved or ended watch (%s) as success: forgets the row and answers 200", async (answer) => {
-    const runWatch = hooks({ 777: "awk_secret" });
-    runWatch.resolve.mockResolvedValueOnce(answer);
-    const res = await send(completed, runWatch);
-    expect(res.statusCode).toBe(200);
-    expect(runWatch.forget).toHaveBeenCalledWith(777);
-    expect(res.body).not.toContain("awk_secret");
-  });
-
-  it("ignores a delivery from a repository other than the KG source", async () => {
-    const runWatch = hooks({ 777: "awk_secret" });
-    const res = await send({ ...completed, repository: { full_name: "other/repo" } }, runWatch);
-    expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body).ignored).toBe(true);
-    expect(runWatch.resolve).not.toHaveBeenCalled();
-    expect(runWatch.forget).not.toHaveBeenCalled();
-  });
-
-  it("is ignored when no run watch is wired", async () => {
-    const { req, res } = makeRequest(SECRET, "workflow_run", completed);
+    const { req, res } = makeRequest(SECRET, "workflow_run", {
+      action: "completed", repository: { full_name: "acme/kg" }, workflow_run: { id: 777, conclusion: "success" },
+    });
     webhook.handleGitHubWebhook(req as never, res as never, SECRET);
     await res.done;
-    expect(res.statusCode).toBe(200);
+    expect(res.statusCode).toBe(unused.res.statusCode);
+    expect(res.body).toBe(unused.res.body);
     expect(JSON.parse(res.body).ignored).toBe(true);
   });
 });
