@@ -458,7 +458,7 @@ export interface AdminDeps {
     trigger(opts?: { dryRun?: boolean; ref?: string; acceptNewBaseline?: boolean; actorEmail?: string }): Promise<{ status: number; body: Record<string, unknown> }>;
     status(): Promise<{ status: number; body: unknown }>;
     /** The operator-cancel path: asks the KgRefresh workflow to cancel and confirm termination (AII-901). */
-    cancel(opts: { jobId: number; reason: string }): Promise<{ status: number; body: Record<string, unknown> }>;
+    cancel(opts: { jobId: number; dispatchId?: string | null; reason: string }): Promise<{ status: number; body: Record<string, unknown> }>;
   };
   /** The tools-service ingress caller (src/restate/tools-client.ts, AII-710). Absent only in tests that don't exercise POST /api/tools/<name>. */
   callTool?: typeof callTool;
@@ -1750,7 +1750,7 @@ async function handleDestroySession(
       // GitHub run may still be going. The updateJobStatus guard preserves this
       // conclusion when the workflow's close-row later writes a coarser terminal status.
       try {
-        const r = await deps.kgRefresh.cancel({ jobId: job.id, reason: "operator_cancelled" });
+        const r = await deps.kgRefresh.cancel({ jobId: job.id, dispatchId: job.dispatchId, reason: "operator_cancelled" });
         if (r.status !== 200) {
           json(res, r.status, r.body);
           return;
@@ -1781,7 +1781,7 @@ async function handleDestroySession(
       if (deps.kgRefresh) {
         updateJobStatus(job.id, "failed", "operator_cancelled");
         try {
-          const r = await deps.kgRefresh.cancel({ jobId: job.id, reason: "operator_cancelled" });
+          const r = await deps.kgRefresh.cancel({ jobId: job.id, dispatchId: job.dispatchId, reason: "operator_cancelled" });
           if (r.status !== 200) {
             console.warn(`[admin] kg-refresh workflow cancel for Fly job ${job.id} answered ${r.status}`);
           }

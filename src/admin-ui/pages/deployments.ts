@@ -608,6 +608,18 @@ export const deploymentsScript = `
     const card = document.getElementById('kg-refresh-card');
     try {
       const res = await window.api('/api/kg/status');
+      if (res.status === 409) {
+        const held = await res.json().catch(() => ({}));
+        if (held.error === 'deploy-in-progress') {
+          card.hidden = false;
+          document.getElementById('kg-refresh-btn').disabled = true;
+          document.getElementById('kg-dry-run-btn').disabled = true;
+          document.getElementById('kg-accept-baseline-btn').disabled = true;
+          document.getElementById('kg-refresh-last').textContent =
+            'A deploy is in progress \u2014 the refresh status returns after it completes.';
+          return;
+        }
+      }
       if (!res.ok) { card.hidden = true; return; }
       const data = await res.json();
       card.hidden = false;

@@ -103,7 +103,7 @@ describe("kg-refresh", () => {
     it("reportDryRun() re-posts the stored outcome's comment and status", async () => {
       const handle = buildHandle(stored(REPORT.sha, okOutcome));
 
-      await expect(handle.reportDryRun({ ...REPORT, acceptBaseline: true })).resolves.toBe(true);
+      await expect(handle.reportDryRun({ ...REPORT, acceptBaseline: true })).resolves.toBe("reported");
 
       expect(dryRunOutcome).toHaveBeenCalledWith("TestOrg/test-kg", { repo: REPORT.repo, prNumber: 42 });
       expect(postOrUpdateStickyCommentFn).toHaveBeenCalledTimes(1);
@@ -123,7 +123,7 @@ describe("kg-refresh", () => {
       const handle = buildHandle(stored(REPORT.sha, okOutcome));
 
       // A label applied after a new push superseded the stored outcome's sha.
-      await expect(handle.reportDryRun({ ...REPORT, sha: "a-newer-sha" })).resolves.toBe(false);
+      await expect(handle.reportDryRun({ ...REPORT, sha: "a-newer-sha" })).resolves.toBe("no-outcome");
       expect(postOrUpdateStickyCommentFn).not.toHaveBeenCalled();
       expect(setCommitStatusFn).not.toHaveBeenCalled();
     });
@@ -132,7 +132,7 @@ describe("kg-refresh", () => {
       const handle = buildHandle({ status: "accepted", value: null });
       const debugSpy = vi.spyOn(console, "debug").mockImplementation(() => {});
       try {
-        await expect(handle.reportDryRun({ repo: "TestOrg/test-kg", prNumber: 999, sha: "nope" })).resolves.toBe(false);
+        await expect(handle.reportDryRun({ repo: "TestOrg/test-kg", prNumber: 999, sha: "nope" })).resolves.toBe("no-outcome");
         expect(postOrUpdateStickyCommentFn).not.toHaveBeenCalled();
         expect(setCommitStatusFn).not.toHaveBeenCalled();
         expect(debugSpy).toHaveBeenCalledWith(
@@ -143,10 +143,10 @@ describe("kg-refresh", () => {
       }
     });
 
-    it("reportDryRun() reports false when Restate is unavailable", async () => {
+    it("reportDryRun() reports unavailable when the store answers unavailable (AII-1014)", async () => {
       const handle = buildHandle({ status: "unavailable" });
 
-      await expect(handle.reportDryRun(REPORT)).resolves.toBe(false);
+      await expect(handle.reportDryRun(REPORT)).resolves.toBe("unavailable");
       expect(postOrUpdateStickyCommentFn).not.toHaveBeenCalled();
     });
 
@@ -525,26 +525,42 @@ describe("kg-refresh production wiring (AII-901)", () => {
     rmSync(dbPath, { force: true });
   });
 
-  const idle = { status: "accepted" as const, value: null };
 
-  it("cancel resolves the triggerId from the KgRepo marker", async () => {
-    const client = {
-      repoStatus: vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1", startedAt: 1 } }),
-      cancel: vi.fn().mockResolvedValue({ status: "accepted" }),
-    };
-    const deps = idx.makeKgRefreshAdminDeps("Org/kg", client as never, vi.fn() as never);
-    expect((await deps.cancel({ jobId: 1, reason: "operator_cancelled" })).status).toBe(200);
-    expect(client.repoStatus).toHaveBeenCalledWith("Org/kg");
-    expect(client.cancel).toHaveBeenCalledWith("t-1", "operator_cancelled");
+  const unavailable = { status: "unavailable" as const, content: [] };
+  const held = (v: boolean) => () => v;
+
+  it("cancel cancels the clicked row's dispatchId and reads no marker", async () => {
+    const client = { repoStatus: vi.fn(), cancel: vi.fn().mockResolvedValue({ status: "accepted" }) };
+    const deps = idx.makeKgRefreshAdminDeps("Org/kg", client as never, vi.fn() as never, held(false));
+    expect((await deps.cancel({ jobId: 1, dispatchId: "t-old", reason: "operator_cancelled" })).status).toBe(200);
+    expect(client.cancel).toHaveBeenCalledWith("t-old", "operator_cancelled");
+    expect(client.repoStatus).not.toHaveBeenCalled();
   });
 
-  it("cancel answers 409 with no marker and 503 when unavailable", async () => {
-    const client = { repoStatus: vi.fn().mockResolvedValue(idle), cancel: vi.fn() };
-    const deps = idx.makeKgRefreshAdminDeps("Org/kg", client as never, vi.fn() as never);
-    expect(await deps.cancel({ jobId: 1, reason: "r" })).toEqual({ status: 409, body: { error: "no-refresh-in-flight" } });
-    client.repoStatus.mockResolvedValue({ status: "unavailable" });
-    expect((await deps.cancel({ jobId: 1, reason: "r" })).status).toBe(503);
+  it("cancel answers 409 for not-found and for a row without a dispatchId", async () => {
+    const client = { repoStatus: vi.fn(), cancel: vi.fn().mockResolvedValue({ status: "not-found" }) };
+    const deps = idx.makeKgRefreshAdminDeps("Org/kg", client as never, vi.fn() as never, held(false));
+    expect(await deps.cancel({ jobId: 1, dispatchId: "t-1", reason: "r" })).toEqual({ status: 409, body: { error: "no-refresh-in-flight" } });
+    client.cancel.mockClear();
+    expect(await deps.cancel({ jobId: 1, dispatchId: null, reason: "r" })).toEqual({ status: 409, body: { error: "no-refresh-in-flight" } });
     expect(client.cancel).not.toHaveBeenCalled();
+  });
+
+  it("an unavailable Restate answers 409 deploy-in-progress during a hold", async () => {
+    const client = { repoStatus: vi.fn(), cancel: vi.fn().mockResolvedValue({ status: "unavailable" }) };
+    const deps = idx.makeKgRefreshAdminDeps("Org/kg", client as never, vi.fn().mockResolvedValue(unavailable) as never, held(true));
+    expect(await deps.trigger()).toEqual({ status: 409, body: { error: "deploy-in-progress" } });
+    expect(await deps.status()).toEqual({ status: 409, body: { error: "deploy-in-progress", deployHeld: true } });
+    expect(await deps.cancel({ jobId: 1, dispatchId: "t-1", reason: "r" })).toEqual({ status: 409, body: { error: "deploy-in-progress" } });
+  });
+
+  it("an unavailable Restate answers 503 with no hold", async () => {
+    const client = { repoStatus: vi.fn(), cancel: vi.fn().mockResolvedValue({ status: "unavailable" }) };
+    const deps = idx.makeKgRefreshAdminDeps("Org/kg", client as never, vi.fn().mockResolvedValue(unavailable) as never, held(false));
+    const body = { error: "restate-unavailable" };
+    expect(await deps.trigger()).toEqual({ status: 503, body });
+    expect(await deps.status()).toEqual({ status: 503, body });
+    expect(await deps.cancel({ jobId: 1, dispatchId: "t-1", reason: "r" })).toEqual({ status: 503, body });
   });
 
   it("boot sweep closes in-flight kg-refresh rows and deletes the key; a second run is a no-op", () => {

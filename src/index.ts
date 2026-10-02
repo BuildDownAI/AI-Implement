@@ -4381,8 +4381,11 @@ const reviewFixAttemptStore = new SqliteReviewFixAttemptStore();
 const kgRefreshIngressClient = createKgRefreshIngressClient();
 
 /** Maps a `callToolAsSystem` result carrying `{ status, body }` text onto the REST shape (AII-901). */
-function kgToolAnswer(result: Awaited<ReturnType<typeof callToolAsSystem>>): { status: number; body: Record<string, unknown> } {
-  if (result.status === "unavailable") return { status: 503, body: { error: "restate-unavailable" } };
+function kgToolAnswer(
+  result: Awaited<ReturnType<typeof callToolAsSystem>>,
+  isDeployHeld: () => boolean,
+): { status: number; body: Record<string, unknown> } {
+  if (result.status === "unavailable") return kgUnavailableAnswer(isDeployHeld);
   const text = result.content[0]?.text ?? "";
   if (result.isError) return { status: 500, body: { error: text } };
   try {
@@ -4392,21 +4395,34 @@ function kgToolAnswer(result: Awaited<ReturnType<typeof callToolAsSystem>>): { s
   }
 }
 
+/** An unreachable Restate: 409 `deploy-in-progress` while a deploy hold is set (the call is withheld), else 503. */
+function kgUnavailableAnswer(isDeployHeld: () => boolean): { status: number; body: Record<string, unknown> } {
+  return isDeployHeld()
+    ? { status: 409, body: { error: "deploy-in-progress" } }
+    : { status: 503, body: { error: "restate-unavailable" } };
+}
+
 /**
  * `AdminDeps.kgRefresh` over the Restate services: trigger and status go through the tool
- * handlers as the in-process system caller, cancel resolves the in-flight `triggerId` from
- * the `KgRepo` marker (no job row carries it) and calls the workflow's `cancel`.
+ * handlers as the in-process system caller; cancel calls the `cancel` of the workflow keyed
+ * by the clicked row's `dispatchId` (a kg-refresh row's dispatchId is its trigger id) and
+ * reads no marker. While a deploy hold is set, an unreachable Restate answers
+ * `409 deploy-in-progress` instead of `503`.
  */
 export function makeKgRefreshAdminDeps(
-  kgSourceRepo: string,
+  _kgSourceRepo: string,
   client: KgRefreshIngressClient,
   callAsSystem: typeof callToolAsSystem = callToolAsSystem,
+  deployHeld: () => boolean = isDeployHeld,
 ): NonNullable<AdminDeps["kgRefresh"]> {
   return {
-    trigger: async (opts) => kgToolAnswer(await callAsSystem("trigger_kg_refresh", { ...opts })),
+    trigger: async (opts) => kgToolAnswer(await callAsSystem("trigger_kg_refresh", { ...opts }), deployHeld),
     status: async () => {
       const r = await callAsSystem("get_kg_status", {});
-      if (r.status === "unavailable") return { status: 503, body: { error: "restate-unavailable" } };
+      if (r.status === "unavailable") {
+        const answer = kgUnavailableAnswer(deployHeld);
+        return answer.status === 409 ? { status: 409, body: { ...answer.body, deployHeld: true } } : answer;
+      }
       const text = r.content[0]?.text ?? "";
       try {
         return { status: r.isError ? 500 : 200, body: JSON.parse(text) };
@@ -4414,14 +4430,11 @@ export function makeKgRefreshAdminDeps(
         return { status: 500, body: { error: text } };
       }
     },
-    cancel: async ({ reason }) => {
-      // KgRepo holds one in-flight marker per repo, so its triggerId is the only refresh
-      // that can be in flight; jobId is not needed to find it.
-      const marker = await client.repoStatus(parseKgSourceRepo(kgSourceRepo).fullName);
-      if (marker.status === "unavailable") return { status: 503, body: { error: "restate-unavailable" } };
-      if (marker.status !== "accepted" || !marker.value) return { status: 409, body: { error: "no-refresh-in-flight" } };
-      const out = await client.cancel(marker.value.triggerId, reason);
-      if (out.status === "unavailable") return { status: 503, body: { error: "restate-unavailable" } };
+    cancel: async ({ dispatchId, reason }) => {
+      if (!dispatchId) return { status: 409, body: { error: "no-refresh-in-flight" } };
+      const out = await client.cancel(dispatchId, reason);
+      if (out.status === "unavailable") return kgUnavailableAnswer(deployHeld);
+      if (out.status === "not-found") return { status: 409, body: { error: "no-refresh-in-flight" } };
       return { status: 200, body: { cancelled: true } };
     },
   };

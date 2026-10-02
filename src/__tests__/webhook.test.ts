@@ -458,7 +458,7 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
 
   it("re-reports without re-triggering when the accept-baseline label is applied", async () => {
     const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } });
-    const reportDryRun = vi.fn().mockResolvedValue(true);
+    const reportDryRun = vi.fn().mockResolvedValue("reported");
     const kgPrCheck = makeKgPrCheck({ enqueueDryRun, reportDryRun });
 
     const { req, res } = makeRequest(
@@ -488,9 +488,26 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
     expect(JSON.parse(res.body)).toEqual({ reported: true });
   });
 
+  it.each(["labeled", "unlabeled"])("a %s accept-baseline event answers 503 when the outcome store is unavailable (AII-1014)", async (action) => {
+    const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } });
+    const reportDryRun = vi.fn().mockResolvedValue("unavailable");
+    const kgPrCheck = makeKgPrCheck({ enqueueDryRun, reportDryRun });
+
+    const { req, res } = makeRequest(
+      SECRET,
+      "pull_request",
+      prPayload({ action, number: 9, ref: "feature/x", sha: "sha-9", repo: KG_SOURCE_REPO, labels: ["accept-baseline"], label: "accept-baseline" }),
+    );
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
+    await res.done;
+
+    expect(res.statusCode).toBe(503);
+    expect(JSON.parse(res.body)).toEqual({ error: "restate-unavailable" });
+  });
+
   it("an accept-baseline label on a PR with no stored dry-run outcome answers ignored, not reported (AII-636)", async () => {
     const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } });
-    const reportDryRun = vi.fn().mockResolvedValue(false);
+    const reportDryRun = vi.fn().mockResolvedValue("no-outcome");
     const kgPrCheck = makeKgPrCheck({ enqueueDryRun, reportDryRun });
 
     const { req, res } = makeRequest(
@@ -542,7 +559,7 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
 
   it("removing the accept-baseline label re-reports with acceptBaseline:false, reverting the wording (AII-640)", async () => {
     const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } });
-    const reportDryRun = vi.fn().mockResolvedValue(true);
+    const reportDryRun = vi.fn().mockResolvedValue("reported");
     const kgPrCheck = makeKgPrCheck({ enqueueDryRun, reportDryRun });
 
     const { req, res } = makeRequest(
@@ -574,7 +591,7 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
 
   it("an unlabeled event for a label other than accept-baseline is ignored", async () => {
     const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } });
-    const reportDryRun = vi.fn().mockResolvedValue(true);
+    const reportDryRun = vi.fn().mockResolvedValue("reported");
     const kgPrCheck = makeKgPrCheck({ enqueueDryRun, reportDryRun });
 
     const { req, res } = makeRequest(
@@ -851,7 +868,7 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
       outcomeStore.delete(storeKey(repo, prNumber));
     });
     const reportDryRun = vi.fn((report: KgDryRunReportTarget) =>
-      Promise.resolve(outcomeStore.has(storeKey(report.repo, report.prNumber))),
+      Promise.resolve(outcomeStore.has(storeKey(report.repo, report.prNumber)) ? "reported" as const : "no-outcome" as const),
     );
     const kgPrCheck = makeKgPrCheck({ enqueueDryRun, forgetKgPr, reportDryRun });
 
