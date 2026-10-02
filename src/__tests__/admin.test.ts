@@ -5463,7 +5463,7 @@ describe("admin sessions — kg-refresh destroy", () => {
 
   it("Fly-mode kg-refresh cancel destroys the machine and also calls the workflow cancel, tolerating a non-200", async () => {
     const token = await login("secret");
-    const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "fly-machines" });
+    const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "fly-machines", dispatchId: "t-fly" });
     log.updateJobMachineDetails(jobId, { machineNonce: "nonce-kg", machineId: "m-kg-cancel5" });
     log.updateJobMachineId(jobId, "m-kg-cancel5");
     const cancel = vi.fn(async () => ({ status: 409, body: { error: "no-refresh-in-flight" } }));
@@ -5471,12 +5471,12 @@ describe("admin sessions — kg-refresh destroy", () => {
 
     expect(res.statusCode).toBe(200);
     expect(destroyMachineMock).toHaveBeenCalledWith(FLY_TOKEN, FLY_APP, "m-kg-cancel5");
-    expect(cancel).toHaveBeenCalledWith({ jobId, reason: "operator_cancelled" });
+    expect(cancel).toHaveBeenCalledWith({ jobId, dispatchId: "t-fly", reason: "operator_cancelled" });
     expect(log.getJobById(jobId)?.conclusion).toBe("operator_cancelled");
   });
 
   async function ghaKgJob(): Promise<number> {
-    const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "github-actions", repo: "TestOrg/test-kg" });
+    const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "github-actions", repo: "TestOrg/test-kg", dispatchId: "t-gha" });
     log.updateJobRunId(jobId, 12345);
     return jobId;
   }
@@ -5488,7 +5488,7 @@ describe("admin sessions — kg-refresh destroy", () => {
     const res = await deleteSession(String(jobId), token, { trigger: vi.fn(), status: vi.fn(), cancel });
 
     expect(res.statusCode).toBe(200);
-    expect(cancel).toHaveBeenCalledWith({ jobId, reason: "operator_cancelled" });
+    expect(cancel).toHaveBeenCalledWith({ jobId, dispatchId: "t-gha", reason: "operator_cancelled" });
     expect(cancelWorkflowRunMock).not.toHaveBeenCalled();
     expect(destroyMachineMock).not.toHaveBeenCalled();
     expect(log.getJobById(jobId)?.conclusion).toBe("operator_cancelled");

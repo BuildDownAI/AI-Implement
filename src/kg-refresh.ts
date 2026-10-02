@@ -190,7 +190,7 @@ export interface KgRefreshHandle {
    * it actually posted, so a caller can distinguish a real re-report from a silent
    * no-op (AII-636) instead of always answering as if something was posted.
    */
-  reportDryRun(report: KgDryRunReportTarget): Promise<boolean>;
+  reportDryRun(report: KgDryRunReportTarget): Promise<"reported" | "no-outcome" | "unavailable">;
   /**
    * Evicts any stored dry-run outcome (and held head) for `repo`#`prNumber` (AII-636), called when the
    * webhook observes that PR close — a closed PR's outcome can never be legitimately
@@ -537,18 +537,19 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
   const reportSlug = (): string | null => (input.kgSourceRepo ? parseKgSourceRepo(input.kgSourceRepo).fullName : null);
 
   return {
-    async reportDryRun(report: KgDryRunReportTarget): Promise<boolean> {
+    async reportDryRun(report: KgDryRunReportTarget): Promise<"reported" | "no-outcome" | "unavailable"> {
       const slug = reportSlug();
       const result = slug
         ? await input.dryRunOutcomes.dryRunOutcome(slug, { repo: report.repo, prNumber: report.prNumber })
         : null;
+      if (result?.status === "unavailable") return "unavailable";
       const stored = result?.status === "accepted" ? result.value : null;
       if (!stored || stored.sha !== report.sha) {
         console.debug(`[kg-refresh] dry-run report skipped: no outcome for ${report.repo}#${report.prNumber}`);
-        return false;
+        return "no-outcome";
       }
       await postDryRunReport(reportDeps, report, stored.outcome);
-      return true;
+      return "reported";
     },
 
     async forgetPr(repo: string, prNumber: number): Promise<void> {

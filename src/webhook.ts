@@ -77,7 +77,7 @@ export interface KgPrCheckConfig {
     | { status: "unavailable" }
   >;
   /** Returns whether it actually posted — false on a silent no-op (AII-636). */
-  reportDryRun: (report: KgDryRunReportTarget) => Promise<boolean>;
+  reportDryRun: (report: KgDryRunReportTarget) => Promise<"reported" | "no-outcome" | "unavailable">;
   /** Evicts the `KgRepo` object's stored dry-run outcome for `repo`#`prNumber` (AII-636), on `closed`. */
   forgetKgPr?: (repo: string, prNumber: number) => void | Promise<void>;
 }
@@ -179,9 +179,15 @@ async function handleKgPrCheckWebhook(
       // GitHub having already dropped it from `pull_request.labels` by delivery time.
       acceptBaseline: payload.action === "labeled" ? hasAcceptBaselineLabel(payload) : false,
     });
+    if (posted === "unavailable") {
+      // 503 so GitHub redelivers: the outcome store was unreachable, not empty.
+      res.writeHead(503, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "restate-unavailable" }));
+      return true;
+    }
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(
-      posted
+      posted === "reported"
         ? JSON.stringify({ reported: true })
         : JSON.stringify({ ignored: true, reason: "no_dry_run_outcome" }),
     );
