@@ -78,6 +78,8 @@ interface RunScenario {
   cancelCalls: number;
   runStatusSequence: Array<{ status: string; conclusion: string | null }>;
   findByTitleResult: { runId: number } | null;
+  /** Title lookups that throw, by 1-based call number. */
+  findByTitleThrowOn?: Set<number>;
   /** Holds the first title lookup this long, so the deadline passes inside one loop iteration. */
   firstFindByTitleDelayMs?: number;
 }
@@ -96,6 +98,7 @@ describe("KgRefresh durable workflow", () => {
   let materializeCallCount = 0;
   let fetchTarballCallCount = 0;
   let fetchTarballFailure = false;
+  let fetchSnapshotShaFailure = false;
   /** The order the rail fakes ran in: fetch, stage, swap, verify. Reset per test. */
   let gateOrder: string[] = [];
   let mintTokenImpl: () => Promise<{ token: string; expiresAt: string }>;
@@ -174,7 +177,10 @@ describe("KgRefresh durable workflow", () => {
       return tarball;
     }) as unknown as KgRailDeps["fetchTarball"],
     fetchDefaultBranch: (async () => "main") as unknown as KgRailDeps["fetchDefaultBranch"],
-    fetchSnapshotCommitSha: (async () => SNAPSHOT_SHA) as unknown as KgRailDeps["fetchSnapshotCommitSha"],
+    fetchSnapshotCommitSha: (async () => {
+      if (fetchSnapshotShaFailure) throw new Error("snapshot sha lookup failed");
+      return SNAPSHOT_SHA;
+    }) as unknown as KgRailDeps["fetchSnapshotCommitSha"],
     materialize: (python: string, cwd: string) => { materializeCallCount++; gateOrder.push("stage"); return materializeImpl(python, cwd); },
     mcpToolCall,
     persistSnapshotSha: persistSnapshotShaFn,
@@ -216,6 +222,7 @@ describe("KgRefresh durable workflow", () => {
     materializeCallCount = 0;
     fetchTarballCallCount = 0;
     fetchTarballFailure = false;
+    fetchSnapshotShaFailure = false;
     gateOrder = [];
     holdNextMcpCall = null;
     reserveFailuresRemaining = 0;
@@ -310,6 +317,7 @@ describe("KgRefresh durable workflow", () => {
     const scenario = triggerId ? scenarios.get(triggerId) : undefined;
     if (!scenario) throw new Error(`no scenario registered for title "${title}"`);
     scenario.findByTitleCalls++;
+    if (scenario.findByTitleThrowOn?.has(scenario.findByTitleCalls)) throw new Error("workflow runs lookup answered HTTP 500");
     if (scenario.findByTitleCalls === 1 && scenario.firstFindByTitleDelayMs) {
       await new Promise((resolve) => setTimeout(resolve, scenario.firstFindByTitleDelayMs)); // restate-test-allow: fake dependency simulating a slow call
     }
@@ -625,6 +633,29 @@ describe("KgRefresh durable workflow", () => {
       expect(restartCallCount).toBe(0);
       expect(existsSync(join(dataRoot, "staging"))).toBe(false);
       expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("staging");
+    },
+    15_000,
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "a RailGateError at fetch with a read context keeps the served stamp in the outcome (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+      // Throws after fetchGate has read the namespace and the served stamp.
+      fetchSnapshotShaFailure = true;
+
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      const outcome = await done;
+
+      expect(outcome.ok).toBe(false);
+      expect(outcome.gate).toBe("staging");
+      expect(outcome.stampBefore).toBe(OLD_STAMP);
+      expect(outcome.stampAfter).toBe(OLD_STAMP);
+      expect(persistCalls[persistCalls.length - 1]).toMatchObject({ stampBefore: OLD_STAMP, stampAfter: OLD_STAMP });
     },
     15_000,
   );
@@ -1041,6 +1072,35 @@ describe("KgRefresh durable workflow", () => {
       scenario.findByTitleResult = { runId };
       await eventually(() => scenario.runId === runId, (ok) => ok, { label: "durable effect" });
       await eventually(() => scenario.runStatusCalls >= 1, (ok) => ok, { label: "durable effect" });
+
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      const outcome = await done;
+      expect(outcome.ok).toBe(true);
+      expect(scenario.dispatchCalls).toBe(1);
+    },
+    15_000,
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "W8d: a failed title lookup inside dispatch is retried and never leads to a second dispatch (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      const runId = runIdCounter++;
+      makeScenario(triggerId, {
+        dispatchOutcome: "accepted", runId: undefined, executionMode: "github-actions",
+        findByTitleThrowOn: new Set([2]),
+        runStatusSequence: [{ status: "in_progress", conclusion: null }],
+      });
+      // Attempt 1: lookup (no run) then dispatch commits and the ack is lost. Attempt 2: lookup throws.
+      // Attempt 3: lookup finds the committed run.
+      dispatchThrowAfterCommit.set(triggerId, runId);
+
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      const scenario = scenarios.get(triggerId)!;
+      await eventually(() => scenario.runStatusCalls >= 1, (ok) => ok, { label: "durable effect" });
+      expect(scenario.dispatchCalls).toBe(1);
+      expect(scenario.runId).toBe(runId);
 
       await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
       const outcome = await done;

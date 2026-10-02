@@ -23,7 +23,7 @@ import {
   type StaleAdmissionCandidate,
 } from "./dispatch-admission.js";
 import { reconcileFilesystemFailures } from "./filesystem-ticket-lifecycle.js";
-import { dispatchWorkflow, postWorkflowDispatch, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, getPullRequestState, buildEnvelopeDispatchInputs, postPrComment, defaultFetchSignal, getRepoDefaultBranch, fetchRepoTarball, mergePullRequest, closePullRequest, deleteBranch, postOrUpdateStickyComment, setCommitStatus, cancelWorkflowRun, RUN_TITLE_PREFIX, type DispatchInputs } from "./github.js";
+import { dispatchWorkflow, postWorkflowDispatch, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, getPullRequestState, buildEnvelopeDispatchInputs, postPrComment, defaultFetchSignal, getRepoDefaultBranch, fetchRepoTarball, mergePullRequest, closePullRequest, deleteBranch, postOrUpdateStickyComment, setCommitStatus, cancelWorkflowRun, type DispatchInputs } from "./github.js";
 import { resolveWorkflowCapabilities, resolveWorkflowContract, type WorkflowContract } from "./workflow-probe.js";
 import { surfaceDispatchFailure } from "./dispatch-failure.js";
 import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
@@ -125,7 +125,7 @@ import { createKgRefreshIngressClient } from "./restate/kg-refresh-production.js
 import { RestateSidecar } from "./restate/server.js";
 import { startRestateEndpoint, register as registerRestateEndpoint, RESTATE_SERVICES } from "./restate/endpoint.js";
 import { createProductionReviewFixServices } from "./restate/review-fix-production.js";
-import { KG_REFRESH_WORKFLOW_FILE, createProductionKgRefreshServices, recordKgDispatchDetails } from "./restate/kg-refresh-production.js";
+import { createKgFindRunByTitle, createProductionKgRefreshServices, recordKgDispatchDetails } from "./restate/kg-refresh-production.js";
 import { setKgRefreshToolDeps } from "./restate/tools.js";
 import type { RestateRegisterOutcome, RestateRegisterResult } from "./restate/endpoint.js";
 import { getRestateStatus, setRestateStatus } from "./restate/status.js";
@@ -5382,25 +5382,7 @@ async function main(): Promise<void> {
         if (!run) throw new Error(`workflow run ${runId} status unavailable`);
         return { status: run.status, conclusion: run.conclusion };
       },
-      findRunByTitle: async (title) => {
-        const res = await fetch(
-          `https://api.github.com/repos/${kgSlug.owner}/${kgSlug.repo}/actions/workflows/${KG_REFRESH_WORKFLOW_FILE}/runs?event=workflow_dispatch&per_page=20`,
-          { headers: { Authorization: `Bearer ${await kgWorkflowToken()}`, Accept: "application/vnd.github+json" }, signal: defaultFetchSignal() },
-        );
-        if (!res.ok) {
-          console.warn(`[kg-refresh] findRunByTitle: workflow runs lookup answered HTTP ${res.status}`);
-          return null;
-        }
-        const data = (await res.json()) as { workflow_runs: Array<{ id: number; display_title?: string; html_url?: string }> };
-        const match = data.workflow_runs.find((r) => r.display_title === `${RUN_TITLE_PREFIX}${title}`);
-        if (!match) return null;
-        // The title is `KG-REFRESH · <dispatchId>`; a bare identifier carries no dispatch id to record against.
-        const dispatchIdPrefix = "KG-REFRESH · ";
-        if (title.startsWith(dispatchIdPrefix)) {
-          recordKgDispatchDetails(title.slice(dispatchIdPrefix.length), { workflowRunId: match.id, logsUrl: match.html_url });
-        }
-        return { runId: match.id };
-      },
+      findRunByTitle: createKgFindRunByTitle({ owner: kgSlug.owner, repo: kgSlug.repo, getToken: kgWorkflowToken, recordDetails: recordKgDispatchDetails }),
       cancelWorkflowRun: async (runId) => cancelWorkflowRun(await kgWorkflowToken(), kgSlug.owner, kgSlug.repo, runId),
       persistLastRefresh: defaultPersistLastRefresh,
       handleKgRefreshOutcome: (outcome, data) => handleKgRefreshOutcome(config, registry, outcome, data),

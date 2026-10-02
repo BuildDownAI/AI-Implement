@@ -178,7 +178,7 @@ function buildFailureOutcome(at: number, detail: string, stampBefore: string | n
 /** A gate step's result: the next rail context, or a definitive gate failure. A returned
  *  failure is journaled as a success, so the engine never retries it; any other throw still
  *  retries up to `maxRetryAttempts`. */
-type GateResult = { ok: true; railCtx: RailContext } | { ok: false; gate: RefreshGate; detail: string };
+type GateResult = { ok: true; railCtx: RailContext } | { ok: false; gate: RefreshGate; detail: string; stampBefore?: string | null; namespace?: string | null };
 
 /** Message of the 404 `TerminalError` `report`/`progress` throw for a key no `run` has started under. */
 export const KG_REFRESH_NOT_FOUND_MESSAGE = "kg-refresh workflow not found";
@@ -201,7 +201,13 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         try {
           return { ok: true, railCtx: await gate(deps.rail, input) };
         } catch (err) {
-          if (err instanceof RailGateError) return { ok: false, gate: err.gate, detail: err.detail };
+          if (err instanceof RailGateError) {
+            // Keep what the gate had already read: the served graph did not change, so its stamp still stands.
+            const failed: GateResult = { ok: false, gate: err.gate, detail: err.detail };
+            if (err.context.stampBefore !== undefined) failed.stampBefore = err.context.stampBefore;
+            if (err.context.namespace !== undefined) failed.namespace = err.context.namespace;
+            return failed;
+          }
           // A terminal error from a rail dependency is as definitive as a gate error; it was never retried.
           if (err instanceof restate.TerminalError) return { ok: false, gate: "preflight", detail: err.message };
           throw err;
@@ -280,8 +286,9 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       const dispatchResult = await ctx.run(
         "dispatch",
         async (): Promise<KgDispatchResult> => {
+          // A lookup error throws and retries the step; only a definitive "no run" may reach the dispatch.
           // Reconcile first: a retry after a committed-but-unacknowledged dispatch must adopt that run.
-          const existing = await deps.findRunByTitle(issueIdentifier).catch(() => null);
+          const existing = await deps.findRunByTitle(issueIdentifier);
           if (existing) {
             return { outcome: "accepted", runId: existing.runId, jobId: String(existing.runId), executionMode: GHA_EXECUTION_MODE };
           }
@@ -532,6 +539,8 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         if (!result.ok) {
           gateFailure = { gate: result.gate, detail: result.detail };
           failedGate = name;
+          if (result.stampBefore !== undefined) railCtx = { ...railCtx, stampBefore: result.stampBefore };
+          if (result.namespace !== undefined) railCtx = { ...railCtx, namespace: result.namespace };
           break;
         }
         railCtx = result.railCtx;
