@@ -232,3 +232,54 @@ export async function queryInvocations(adminBaseUrl: string, where: string): Pro
 export async function settle(ms: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms)); // restate-test-allow: settle is the sanctioned negative wait
 }
+
+/** Poll a status read until its `step` equals `step`. The read is a status handler that
+ *  returns `{ step }` (for `KgRefresh`, the `status` shared handler). A test that sends a
+ *  signal calls this first, so it acts only after the workflow reached the named step. */
+export async function waitForStep<S extends { step: string | null }>(
+  read: () => S | Promise<S>,
+  step: string,
+  opts: { timeoutMs?: number; intervalMs?: number; label?: string } = {},
+): Promise<S> {
+  return eventually(read, (status) => status.step === step, { label: `step ${step}`, ...opts });
+}
+
+export interface Gate<T = void> {
+  /** Called by a fake. The first call marks the gate reached and parks until `release`;
+   *  every call after `release` resolves at once with the released value. */
+  wait(): Promise<T>;
+  /** Releases every parked `wait()` and every later one. A second call is ignored. */
+  release(value: T): void;
+  /** Resolves once a fake has called `wait()`; rejects naming `label` after `timeoutMs` (default 10 s). */
+  reached(opts?: { timeoutMs?: number; intervalMs?: number }): Promise<void>;
+  isReached(): boolean;
+}
+
+/** A single-use gate that holds a fake dependency until the test releases it. It never
+ *  re-arms: a re-arming gate would park a retried `ctx.run` step again and deadlock the
+ *  scenario with no message. `reached()` polls with `eventually`, so it adds no timer. */
+export function gate<T = void>(label: string): Gate<T> {
+  let reached = false;
+  let released = false;
+  let value: T;
+  let open!: (value: T) => void;
+  const opened = new Promise<T>((resolve) => {
+    open = resolve;
+  });
+  return {
+    wait() {
+      reached = true;
+      return released ? Promise.resolve(value) : opened;
+    },
+    release(next: T) {
+      if (released) return;
+      released = true;
+      value = next;
+      open(next);
+    },
+    async reached(opts = {}) {
+      await eventually(() => reached, Boolean, { ...opts, label: `gate "${label}" to be reached` });
+    },
+    isReached: () => reached,
+  };
+}

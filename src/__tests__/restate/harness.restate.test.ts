@@ -9,7 +9,7 @@ import { randomUUID } from "node:crypto";
 import * as restate from "@restatedev/restate-sdk";
 import { RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { VARIANTS, callService, callWorkflow, startVariants, stopAll } from "./harness.js";
+import { VARIANTS, callService, callWorkflow, gate, settle, startVariants, stopAll, waitForStep } from "./harness.js";
 
 interface EchoInput {
   value: string;
@@ -115,11 +115,35 @@ function expectDurationMs(actual: unknown, expectedMs: number, field: string): v
   throw new Error(`unexpected type for ${field}: ${typeof actual}`);
 }
 
+// Gate fixture (AII-1038): the workflow's `ctx.run` step awaits a gate the test holds. The
+// gate lives in test scope, not in handler state, so a replay or retry reaches the same gate.
+let fixtureGate = gate<string>("unused");
+let fixtureCalls = 0;
+
+const gatedWorkflow = restate.workflow({
+  name: "harnessGated",
+  handlers: {
+    run: async (ctx: restate.WorkflowContext): Promise<string> => {
+      ctx.set("step", "gated");
+      const first = await ctx.run("gated-step", () => fixtureGate.wait());
+      // A later step (what a retried step looks like to the gate) must pass at once.
+      const second = await ctx.run("after-release", async () => {
+        fixtureCalls++;
+        return fixtureGate.wait();
+      });
+      return `${first}:${second}`;
+    },
+    status: restate.handlers.workflow.shared(async (ctx: restate.WorkflowSharedContext): Promise<{ step: string | null }> => ({
+      step: (await ctx.get<string>("step")) ?? null,
+    })),
+  },
+});
+
 describe("Restate harness", () => {
   let environments: Map<string, RestateTestEnvironment>;
 
   beforeAll(async () => {
-    environments = await startVariants([echoService, probeWorkflow]);
+    environments = await startVariants([echoService, probeWorkflow, gatedWorkflow]);
   }, 60_000);
 
   afterAll(async () => {
@@ -183,4 +207,57 @@ describe("Restate harness", () => {
       );
     },
   );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "holds a gated step until release, reaches before release, and passes a later wait at once (%s)",
+    async (label) => {
+      const env = environments.get(label);
+      if (!env) throw new Error(`environment "${label}" did not start`);
+      fixtureGate = gate<string>("harness-gated");
+      fixtureCalls = 0;
+      const key = randomUUID();
+      const output = callWorkflow<string>(env.baseUrl(), "harnessGated", key, "run");
+      let done = false;
+      void output.then(() => { done = true; }, () => { done = true; });
+
+      // (b) reached resolves before release; the status read shows the workflow's step.
+      await fixtureGate.reached();
+      const status = await waitForStep(
+        () => callWorkflow<{ step: string | null }>(env.baseUrl(), "harnessGated", key, "status"),
+        "gated",
+      );
+      expect(status.step).toBe("gated");
+      expect(fixtureGate.isReached()).toBe(true);
+
+      // (a) the workflow does not pass the step before release.
+      await settle(300);
+      expect(done).toBe(false);
+
+      // (c) after release, the later step calls wait() again and passes at once with the value.
+      fixtureGate.release("go");
+      expect(await output).toBe("go:go");
+      expect(fixtureCalls).toBeGreaterThanOrEqual(1);
+    },
+    30_000,
+  );
+
+  it("reached() on a gate nobody calls rejects with the label (d)", async () => {
+    const g = gate("never-called");
+    await expect(g.reached({ timeoutMs: 100 })).rejects.toThrow(/never-called/);
+    expect(g.isReached()).toBe(false);
+  });
+
+  it("a released gate never re-arms and ignores a second release", async () => {
+    const g = gate<number>("single-use");
+    const first = g.wait();
+    await g.reached();
+    g.release(1);
+    g.release(2);
+    expect(await first).toBe(1);
+    expect(await g.wait()).toBe(1);
+  });
+
+  it("waitForStep times out naming the step", async () => {
+    await expect(waitForStep(() => ({ step: "other" }), "wanted", { timeoutMs: 100 })).rejects.toThrow(/step wanted/);
+  });
 });
