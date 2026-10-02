@@ -6,7 +6,8 @@ import { postRunnerResult } from "../runner-result.js";
 import { DefaultPipelineContext } from "./context.js";
 import { PipelineRunner } from "./runner.js";
 import { loadPipelineDefinition } from "./pipeline-loader.js";
-import { NoopStepReporter, TokenStepReporter } from "./reporter.js";
+import { NoopStepReporter } from "./reporter.js";
+import { RunSignalSender, progressOnFirstStep } from "./run-signal.js";
 import { cloneStep } from "./steps/clone.js";
 import { dependencyAuthStep } from "./steps/dependency-auth.js";
 import { kgSnapshotPushStep, KgSnapshotMissingError, KgSnapshotStaleError, KgSnapshotTrackerRegressionError } from "./steps/kg-snapshot-push.js";
@@ -309,7 +310,7 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
   const reporter: StepReporter =
     opts.reporter ??
     (callbackUrl && progressToken
-      ? new TokenStepReporter(callbackUrl, progressToken, { fetchImpl: opts.fetchImpl })
+      ? progressOnFirstStep(new RunSignalSender(callbackUrl, progressToken, { fetchImpl: opts.fetchImpl }))
       : new NoopStepReporter());
 
   try {

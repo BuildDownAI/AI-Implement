@@ -1827,7 +1827,7 @@ describe("handleRunnerProgress", () => {
     expect(stepLog.getStepsByJobId(jobId)).toEqual([]);
   });
 
-  it("contract: a real TokenStepReporter post is accepted by the real handler for a kg-refresh dispatch", async () => {
+  it("contract: KgRefresh.progress — a real RunSignalSender post is accepted by the real handler", async () => {
     const { token, dispatchId } = runnerTokens.mintRunToken({
       issueId: "kg",
       phase: "kg-refresh",
@@ -1850,8 +1850,8 @@ describe("handleRunnerProgress", () => {
       return new Response(JSON.stringify(res.body), { status: res.status });
     }) as unknown as typeof fetch;
 
-    const { TokenStepReporter } = await import("../pipeline/reporter.js");
-    await new TokenStepReporter("http://orchestrator.test", token, { fetchImpl, retryDelaysMs: [] }).report(STEP);
+    const { RunSignalSender } = await import("../pipeline/run-signal.js");
+    await new RunSignalSender("http://orchestrator.test", token, { fetchImpl, retryDelaysMs: [] }).signal("progress");
 
     expect(responses.map((r) => r.status)).toEqual([200]);
     expect(kgRefreshClient.progress).toHaveBeenCalledWith(dispatchId);
