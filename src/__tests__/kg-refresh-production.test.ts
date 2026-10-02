@@ -40,6 +40,7 @@ vi.mock("../config.js", async (importOriginal) => ({
 }));
 
 import {
+  createKgFindRunByTitle,
   createKgRefreshDispatch,
   createKgRefreshIngressClient,
   createProductionKgRefreshServices,
@@ -470,5 +471,32 @@ describe("createKgRefreshIngressClient", () => {
     expect(url).toBe(`${BASE}/KgRepo/acme%2Fkg/enqueueDryRun`);
     expect((init.headers as Record<string, string>)["idempotency-key"]).toBe("delivery-1");
     expect(JSON.parse(new TextDecoder().decode(init.body as Uint8Array))).toEqual(entry);
+  });
+});
+
+describe("createKgFindRunByTitle", () => {
+  const lookup = (recordDetails = vi.fn()) =>
+    ({ find: createKgFindRunByTitle({ owner: "acme", repo: "kg", getToken: async () => "tok", recordDetails }), recordDetails });
+
+  it("throws on an HTTP error instead of answering no run", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("boom", { status: 500 })));
+    try {
+      await expect(lookup().find("KG-REFRESH · d-1")).rejects.toThrow(/HTTP 500/);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("answers null for a 200 with no matching title, and the run id for a match", async () => {
+    const body = { workflow_runs: [{ id: 7, display_title: "Claude AI Implementation — KG-REFRESH · d-1", html_url: "u" }] };
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify(body), { status: 200 })));
+    try {
+      const { find, recordDetails } = lookup();
+      expect(await find("KG-REFRESH · other")).toBeNull();
+      expect(await find("KG-REFRESH · d-1")).toEqual({ runId: 7 });
+      expect(recordDetails).toHaveBeenCalledWith("d-1", { workflowRunId: 7, logsUrl: "u" });
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });
