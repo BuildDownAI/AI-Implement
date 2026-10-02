@@ -130,6 +130,7 @@ function fakeRestateContext(handlerName: string): restate.Context {
     objectClient: () => ({
       trigger: (opts: { dryRun?: boolean; acceptNewBaseline?: boolean; actorEmail?: string }) => kgTriggerFake!(opts),
       status: async () => null,
+      lastAdminDryRun: async () => null,
     }),
     run: async (name: unknown, action?: unknown) => {
       const fn = typeof name === "function" ? (name as () => unknown) : (action as () => unknown);
@@ -450,6 +451,7 @@ async function callMcp(
       runPreflight: async () => ({ ok: true, checkedAt: 0, results: [] }) as PreflightCheckResult,
       persistPreflightFailure: () => {},
       readStatusRecord: () => null,
+      readServedStamp: async () => null,
     });
     kgTriggerFake = async ({ dryRun, acceptNewBaseline, actorEmail }) => {
       await triggerKgRefresh(dryRun, acceptNewBaseline, actorEmail);
@@ -1403,6 +1405,7 @@ describe("handleMcpRequest", () => {
         runPreflight: async () => ({ ok: true, checkedAt: 0, results: [] }) as PreflightCheckResult,
         persistPreflightFailure: () => {},
         readStatusRecord: () => lastRefresh,
+        readServedStamp: async () => null,
       });
       const status = {
         running: false,
@@ -1411,6 +1414,7 @@ describe("handleMcpRequest", () => {
         ...sidecarHealthFields(),
         servedStamp: "b",
         lastRefresh,
+        lastDryRun: null,
         stage: "serving",
         materialize: "direct",
       };

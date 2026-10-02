@@ -1700,6 +1700,64 @@ describe("KgRefresh durable workflow", () => {
     15_000,
   );
 
+  const readAdminDryRun = (baseUrl: string) =>
+    callObject<RefreshOutcome | null>(baseUrl, "KgRepo", KG_SOURCE_REPO, "lastAdminDryRun", undefined);
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "AII-1036: an admin dry run (no report target) that passes stores its outcome under lastAdminDryRun, without the last-refresh record or a notification (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+      const beforePersist = persistCalls.length;
+      const beforeOutcome = onOutcomeCalls.length;
+      const done = runWorkflow(env.baseUrl(), triggerId, { dryRun: true });
+      await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", { ok: true });
+      const outcome = await done;
+      const stored = await eventually(() => readAdminDryRun(env.baseUrl()), (v) => v?.at === outcome.at, { label: "durable effect" });
+      expect(stored).toEqual(outcome);
+      expect(persistCalls.length - beforePersist).toBe(0);
+      expect(onOutcomeCalls.length - beforeOutcome).toBe(0);
+    },
+    15_000,
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "AII-1036: an admin dry run the guard refuses stores ok:false with its part table (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+      const partTable = [{ part: "issues", prev: "10", new: "4" }];
+      const done = runWorkflow(env.baseUrl(), triggerId, { dryRun: true });
+      await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", { ok: false, failureReason: "shrink refused", partTable });
+      const outcome = await done;
+      const stored = await eventually(() => readAdminDryRun(env.baseUrl()), (v) => v?.at === outcome.at, { label: "durable effect" });
+      expect(stored).toMatchObject({ ok: false, detail: "shrink refused", dryRun: true, partTable });
+    },
+    15_000,
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "AII-1036: an admin dry run that fails before a report stores the failure and writes no last-refresh record (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, { dispatchOutcome: "rejected", executionMode: "fly-machines" });
+      const beforePersist = persistCalls.length;
+      const beforeOutcome = onOutcomeCalls.length;
+      const outcome = await runWorkflow(env.baseUrl(), triggerId, { dryRun: true });
+      expect(outcome.ok).toBe(false);
+      const stored = await eventually(() => readAdminDryRun(env.baseUrl()), (v) => v?.at === outcome.at, { label: "durable effect" });
+      expect(stored).toMatchObject({ ok: false, dryRun: true, detail: outcome.detail });
+      expect(persistCalls.length - beforePersist).toBe(0);
+      expect(onOutcomeCalls.length - beforeOutcome).toBe(0);
+    },
+    15_000,
+  );
+
   it.each(VARIANTS.map(([label]) => label))(
     "W16: a KG_SNAPSHOT_STALE report closes the row completed with a success no-new-data outcome, no merge (%s)",
     async (label) => {

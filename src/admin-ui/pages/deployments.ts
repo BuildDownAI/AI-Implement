@@ -659,8 +659,6 @@ export const deploymentsScript = `
       const last = data.lastRefresh;
       const lastText = !last
         ? 'No refresh has run since boot.'
-        : last.dryRun
-        ? 'Last dry-run: ' + last.detail
         : last.gate === 'ingest-needed'
         ? 'Last refresh: ' + last.detail
         : 'Last refresh: ' + (last.ok ? 'ok' : 'failed at gate "' + (last.gate || '?') + '"') + ' \u2014 ' + last.detail;
@@ -677,7 +675,7 @@ export const deploymentsScript = `
       } else {
         sidecarEl.hidden = true;
       }
-      renderKgDryRun(document.getElementById('kg-dry-run-last'), last);
+      renderKgDryRun(document.getElementById('kg-dry-run-last'), data.lastDryRun);
       const busy = !!data.running || !!data.deployHeld;
       document.getElementById('kg-refresh-btn').disabled = busy;
       document.getElementById('kg-dry-run-btn').disabled = busy;
@@ -686,11 +684,11 @@ export const deploymentsScript = `
   }
 
   // AII-635: the last dry-run's verdict and per-part table, shown only when the last
-  // terminal outcome was a dry-run (AII-632 sets lastRefresh.dryRun). Cells are set with
+  // admin dry-run (get_kg_status lastDryRun, never lastRefresh). Cells are set with
   // textContent, never innerHTML.
   function renderKgDryRun(el, last) {
     el.textContent = '';
-    if (!last || !last.dryRun) { el.hidden = true; return; }
+    if (!last) { el.hidden = true; return; }
     el.hidden = false;
     const head = document.createElement('div');
     head.textContent = 'Last dry-run (' + new Date(last.at).toLocaleString() + '): ' + last.detail;

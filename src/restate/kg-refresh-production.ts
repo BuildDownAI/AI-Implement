@@ -19,8 +19,8 @@ import {
   type PreflightCheckResult,
   type RefreshOutcome,
 } from "../kg-refresh.js";
-import type { KgRailDeps } from "../kg-refresh-rail.js";
-import { KG_DIR } from "../kg-sidecar.js";
+import { readServedStamp, type KgRailDeps } from "../kg-refresh-rail.js";
+import { KG_DIR, getServedNamespace } from "../kg-sidecar.js";
 import { parseKgSourceRepo } from "../deploy.js";
 import { RUN_TITLE_PREFIX, buildKgRefreshGhaDispatchBody, defaultFetchSignal, postWorkflowDispatch } from "../github.js";
 import { resolveWorkflowCapabilities } from "../workflow-probe.js";
@@ -160,6 +160,8 @@ export interface KgRefreshToolDeps {
   /** Records a failed preflight as the last refresh, as `trigger()` does today. */
   persistPreflightFailure: (result: PreflightCheckResult) => void;
   readStatusRecord: () => RefreshOutcome | null;
+  /** Reads the stamp of the graph that serves now; `null` when none can be read. */
+  readServedStamp: () => Promise<string | null>;
 }
 
 function findKgMapping(kgSourceRepo: string) {
@@ -344,6 +346,7 @@ export function createProductionKgRefreshServices(
       });
     },
     readStatusRecord: input.readStatusRecord,
+    readServedStamp: async () => readServedStamp(rail, await getServedNamespace()),
   };
 
   return {
