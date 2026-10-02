@@ -113,6 +113,9 @@ export interface KgDispatchResult {
 }
 
 /** Plain functions, every one called inside `ctx.run` — none of them may call `ctx` themselves. */
+export type KgOutcomeKind = "success" | "no-new-data" | "failure";
+export interface KgOutcomeMeta { failureCode?: string; timedOut?: boolean; dispatchId?: string }
+
 export interface KgRefreshWorkflowDependencies {
   rail: KgRailDeps;
   kgSourceRepo: string;
@@ -125,7 +128,8 @@ export interface KgRefreshWorkflowDependencies {
   findRunByTitle(title: string): Promise<{ runId: number } | null>;
   cancelWorkflowRun(runId: number): Promise<boolean>;
   persistLastRefresh(outcome: RefreshOutcome): void;
-  onOutcome(kind: "success" | "failure", outcome: RefreshOutcome): void | Promise<void>;
+  /** The kind is decided by the workflow, never inferred from `outcome.detail`. `meta.dispatchId` is the workflow key. */
+  onOutcome(kind: KgOutcomeKind, outcome: RefreshOutcome, meta: KgOutcomeMeta): void | Promise<void>;
   /** Overrides `KG_REFRESH_BOOTSTRAP_DEADLINE_MS` for a deterministic timeout test.
    *  Production composition must leave this unset so the real ten-minute deadline applies —
    *  the same test-seam shape as `ReviewFixAttemptDependencies.unknownLaunchAlertMs`
@@ -236,9 +240,9 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
     }
 
     /** Awaits the notification in its own retried step; a notifier outage must not turn a finished refresh into a failure. */
-    async function notifyOutcome(kind: "success" | "failure", outcome: RefreshOutcome): Promise<void> {
+    async function notifyOutcome(kind: KgOutcomeKind, outcome: RefreshOutcome, meta: KgOutcomeMeta = {}): Promise<void> {
       try {
-        await ctx.run("outcome", () => deps.onOutcome(kind, outcome), { maxRetryAttempts: 3 });
+        await ctx.run("outcome", () => deps.onOutcome(kind, outcome, { ...meta, dispatchId }), { maxRetryAttempts: 3 });
       } catch (err) {
         if (restate.internal.isSuspendedError(err)) throw err;
         if (err instanceof restate.TerminalError && err.code === 409) throw err; // invocation cancelled
@@ -261,7 +265,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           await ctx.run("dry-run-report", () => postDryRunReport(deps.rail, input.report!, dryOutcome));
         }
       } else if (!opts.skipOutcome) {
-        await notifyOutcome("failure", outcome);
+        await notifyOutcome("failure", outcome, { failureCode: conclusion, ...(opts.timedOut ? { timedOut: true } : {}) });
       }
       return outcome;
     }
@@ -475,7 +479,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           stampBefore: null, stampAfter: null,
         };
         await ctx.run("close-row", () => deps.closeJobLog(jobId, "completed"));
-        await notifyOutcome("success", outcome);
+        await notifyOutcome("no-new-data", outcome, { failureCode: report.failureCode });
         return finish(outcome);
       }
 
@@ -558,7 +562,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
             stampBefore: railCtx.stampBefore ?? null, stampAfter: railCtx.stampBefore ?? null,
           };
           await ctx.run("close-row", () => deps.closeJobLog(jobId, "completed"));
-          await notifyOutcome("success", outcome);
+          await notifyOutcome("no-new-data", outcome, { failureCode: "ingest-needed" });
           return finish(outcome);
         }
 

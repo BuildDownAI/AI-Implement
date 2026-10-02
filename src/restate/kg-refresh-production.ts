@@ -312,11 +312,14 @@ export function createProductionKgRefreshServices(
     findRunByTitle: input.findRunByTitle,
     cancelWorkflowRun: input.cancelWorkflowRun,
     persistLastRefresh: input.persistLastRefresh,
-    onOutcome: (kind, outcome) => {
-      // The workflow reports "graph is current" as a success; the notifier distinguishes it.
-      const mapped = kind === "success" && /^Graph is current/i.test(outcome.detail) ? "no-new-data" : kind;
+    onOutcome: (kind, outcome, meta) => {
       // Returned so the workflow's `outcome` step awaits (and retries) the notification.
-      return Promise.resolve(input.handleKgRefreshOutcome(mapped, kind === "failure" ? { failureReason: outcome.detail } : {}));
+      return Promise.resolve(input.handleKgRefreshOutcome(kind, {
+        ...(meta.failureCode ? { failureCode: meta.failureCode } : {}),
+        ...(kind === "failure" ? { failureReason: outcome.detail } : {}),
+        ...(meta.timedOut ? { timedOut: true } : {}),
+        ...(meta.dispatchId ? { dispatchId: meta.dispatchId } : {}),
+      }));
     },
   };
 

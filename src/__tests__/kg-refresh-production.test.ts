@@ -161,12 +161,33 @@ describe("mintRunTokens", () => {
 });
 
 describe("onOutcome", () => {
+  it("forwards a stale-snapshot outcome as no-new-data whatever the runner's failureReason says", async () => {
+    const handleKgRefreshOutcome = vi.fn(async () => {});
+    createProductionKgRefreshServices(makeInput({ handleKgRefreshOutcome }));
+    await capturedWorkflowDeps.current!.onOutcome("no-new-data", { ok: true, detail: "runner says something else" } as never, { failureCode: "KG_SNAPSHOT_STALE", dispatchId: "d1" });
+    expect(handleKgRefreshOutcome).toHaveBeenCalledWith("no-new-data", { failureCode: "KG_SNAPSHOT_STALE", dispatchId: "d1" });
+  });
+
+  it("forwards a timeout with timedOut and the code", async () => {
+    const handleKgRefreshOutcome = vi.fn(async () => {});
+    createProductionKgRefreshServices(makeInput({ handleKgRefreshOutcome }));
+    await capturedWorkflowDeps.current!.onOutcome("failure", { ok: false, detail: "late" } as never, { failureCode: "bootstrap_timeout", timedOut: true, dispatchId: "d2" });
+    expect(handleKgRefreshOutcome).toHaveBeenCalledWith("failure", { failureCode: "bootstrap_timeout", failureReason: "late", timedOut: true, dispatchId: "d2" });
+  });
+
+  it("forwards operator_cancelled as the failure code", async () => {
+    const handleKgRefreshOutcome = vi.fn(async () => {});
+    createProductionKgRefreshServices(makeInput({ handleKgRefreshOutcome }));
+    await capturedWorkflowDeps.current!.onOutcome("failure", { ok: false, detail: "cancelled by operator" } as never, { failureCode: "operator_cancelled" });
+    expect(handleKgRefreshOutcome).toHaveBeenCalledWith("failure", expect.objectContaining({ failureCode: "operator_cancelled" }));
+  });
+
   it("resolves only after the outcome handler resolves", async () => {
     let release!: () => void;
     const handleKgRefreshOutcome = vi.fn(() => new Promise<void>((r) => { release = r; }));
     createProductionKgRefreshServices(makeInput({ handleKgRefreshOutcome }));
     let settled = false;
-    const p = Promise.resolve(capturedWorkflowDeps.current!.onOutcome("failure", { ok: false, detail: "x" } as never)).then(() => { settled = true; });
+    const p = Promise.resolve(capturedWorkflowDeps.current!.onOutcome("failure", { ok: false, detail: "x" } as never, {})).then(() => { settled = true; });
     await new Promise((r) => setTimeout(r, 0));
     expect(settled).toBe(false);
     release();
@@ -177,7 +198,7 @@ describe("onOutcome", () => {
   it("rejects when the outcome handler rejects, so the workflow step can retry", async () => {
     const handleKgRefreshOutcome = vi.fn(async () => { throw new Error("boom"); });
     createProductionKgRefreshServices(makeInput({ handleKgRefreshOutcome }));
-    await expect(capturedWorkflowDeps.current!.onOutcome("failure", { ok: false, detail: "x" } as never)).rejects.toThrow("boom");
+    await expect(capturedWorkflowDeps.current!.onOutcome("failure", { ok: false, detail: "x" } as never, {})).rejects.toThrow("boom");
   });
 });
 
