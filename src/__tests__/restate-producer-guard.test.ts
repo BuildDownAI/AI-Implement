@@ -3,7 +3,7 @@
 // A scenario in src/__tests__/restate/ resolves promises from the test body, so it is not a producer
 // proof and is not read. There is deliberately no allowlist: that is where a missing sender hides.
 import { readdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import { describe, expect, it } from "vitest";
 
 const RESTATE_SRC_DIR = join(import.meta.dirname, "..", "restate");
@@ -35,8 +35,9 @@ describe("restate producer guard (ADR 034 rule 4)", () => {
   const sources = readdirSync(RESTATE_SRC_DIR)
     .filter((f) => f.endsWith(".ts"))
     .map((f) => ({ file: `src/restate/${f}`, source: readFileSync(join(RESTATE_SRC_DIR, f), "utf8") }));
-  const titles = readdirSync(TESTS_DIR)
-    .filter((f) => f.endsWith(".test.ts") && f !== SELF)
+  const titles = readdirSync(TESTS_DIR, { recursive: true, encoding: "utf8" })
+    .map((f) => f.split(sep).join("/"))
+    .filter((f) => f.endsWith(".test.ts") && f !== SELF && !f.startsWith("restate/"))
     .flatMap((f) => findContractTitles(readFileSync(join(TESTS_DIR, f), "utf8")));
 
   it("finds the promises that exist today", () => {
