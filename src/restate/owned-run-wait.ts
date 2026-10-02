@@ -86,6 +86,15 @@ type Arm = { kind: "signal"; name: string; value: unknown } | { kind: "tick" };
  *   a plain `signal` event. In each case the caller re-calls with `startedSeen: true` to keep
  *   waiting; this call does not continue past that evidence on its own.
  * - The signal arms are created once per call. Each tick races them against a fresh timer.
+ *
+ * Contract for callers:
+ * - Resolve every signal with a value that is not `undefined`. At a deadline the helper peeks,
+ *   and `peek()` cannot tell a void resolution from an unresolved promise, so a signal resolved
+ *   with no value is invisible there and the wait ends as a timeout. Today `report` carries a
+ *   body, `progress` resolves `true`, and `cancel` resolves a reason.
+ * - A `{ kind: "status", status: "ended" }` event is returned before any signal peek. The caller
+ *   must peek the result signal itself after `ended` (AII-1040 maps `ended` to: report if
+ *   present, else `dispatch_lost`).
  */
 export async function awaitOwnedRun(ctx: WorkflowContext, opts: OwnedRunWaitOptions): Promise<OwnedRunEvent> {
   let startedSeen = opts.startedSeen ?? false;
