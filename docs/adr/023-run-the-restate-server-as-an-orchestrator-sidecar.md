@@ -35,3 +35,21 @@ Run `restate-server` as a second child-process sidecar of the orchestrator on th
 ## Amendment (2026-09-17)
 
 The operator gate's image boot check measured `restate-server`'s footprint with `docker run --memory 1g`: 881 MiB container total with Restate's defaults (24 partitions, a 2 GiB RocksDB memory budget), falling to ≈ 480–490 MiB with `RESTATE_DEFAULT_NUM_PARTITIONS=4` and `RESTATE_ROCKSDB_TOTAL_MEMORY_SIZE=256 MB` — both now set in `RestateSidecar`'s child environment (`src/restate/server.ts`), alongside pinning the previously-unbound node/fabric port (`RESTATE_BIND_ADDRESS=127.0.0.1:5122`; default is `0.0.0.0:5122`, reachable over the Fly private network otherwise). The partition count is fixed the first time Restate provisions its data directory, so the env var must be set before an existing deployment's first restart onto this change, not after — a running `RESTATE_BASE_DIR` predating it keeps its original partition count regardless. Choosing the Fly Machine size against these numbers remains the operator's decision, not this ADR's — see docs/restate.md § "Memory" for the full figures and docs/deployment.md § "Local image boot check" for the measurement recipe.
+
+## Amendment (2026-09-29): external events enter through an authenticated route; the Restate handler is the durable processor
+
+**Context.** Restate's durable-webhooks guide points the sender at the ingress URL of a handler. Our ingress is loopback-only with no caller authentication (this ADR), a public ingress exposes every public service, and GitHub does not retry a failed delivery.
+
+**Decision.** An external event (a GitHub webhook, a runner callback, an admin REST call) enters through one orchestrator route. The route authenticates the sender (HMAC signature, run token, or admin session), then forwards to the handler over the loopback ingress with an `idempotency-key` taken from the sender's own identity for the event (`x-github-delivery`, the dispatch id). Restate persists the event, deduplicates it, and runs the handler to completion. The route holds no queue, no table, and no retry loop.
+
+Use the Restate primitive in place of a hand-built one: the idempotency key in place of a consume-once token or a dedup table; object state in place of an in-memory queue; a durable promise in place of a status poll; a journaled step in place of a state-machine row.
+
+**Scope.** This is the rule for run kinds that are fully on Restate. Today those are the MCP tools service (ADR 025) and kg-refresh (AII-682). The review-fix pilot keeps its SQLite inbox and delivery pump while a Legacy owner runs beside it (ADR 031). The main pipeline adopts the rule when it migrates; until then its routes do not change.
+
+**A webhook may be the only trigger** when the sender retries (the runner does) or when a lost event is visible and recoverable (a required check that stays pending, a poll detector). Otherwise the run kind keeps a poll backstop.
+
+**Alternatives rejected.** A public ingress (no caller authentication; every public service exposed; the payload is journaled before any check). An inbox table in front of every handler (a second durable log beside Restate's).
+
+## Amendment (2026-10-01): request identity is the second control beside loopback binding
+
+The Consequences note above, that none of the three listeners needs authentication while loopback-bound, no longer stands alone. `RestateSidecar` generates an ED25519 key pair under the data directory on first boot and gives the private key to the server; the SDK endpoint receives the public key as `identityKeys` and rejects unsigned requests. `RESTATE_IDENTITY_KEY` supplies the public key when the server is external (test runtimes). The key applies to the whole endpoint. Separately, handlers only other services call (`KgRefresh.run`, `KgRepo.release`/`expire`/`recordDryRunOutcome`) are `ingressPrivate`. A corrupt key is regenerated; an unpreparable key keeps the sidecar down; there is no unsigned mode on the sidecar path. Loopback binding stays. Rollback is a revert. See docs/restate.md § "Request identity".

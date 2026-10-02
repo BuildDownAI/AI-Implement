@@ -246,3 +246,79 @@ against pinned server 1.7.10; this is container evidence, not a live pilot rollo
 its pass/fail there — not this document — is the authoritative evidence for AII-813's "both
 container variants and SDK boundary suite pass" acceptance criterion. `npx tsc --noEmit --project
 tsconfig.restate-tests.json` passes as of the commit that added this section.
+
+## `kg-refresh-pilot.restate.test.ts`: the switched kg-refresh path against production services (AII-896)
+
+`kg-refresh-workflow.restate.test.ts` (AII-894) runs `KgRefresh` and `KgRepo` against fakes for every
+dependency. This file composes them through `createProductionKgRefreshServices` and registers them with the
+real `orchestratorTools` service, so the gap between the two is covered before AII-685 deletes the legacy path.
+It adds no production file.
+
+**Always real:** the composer, `KgRepo`, `KgRefresh`, `trigger_kg_refresh` / `get_kg_status` called through
+`callToolAsSystem`, `appendLog` / `updateJobStatus` / the `settings` keys / `getInFlightWork` on an in-memory
+SQLite, `mintRunToken` and the `runner_tokens` table, `handleRunnerResult` with the production ingress client,
+`runKgRefreshPreflight` (with a credential check that passes), and the four rail gates against a temp-directory
+data root and a fixture tarball. **Always simulated:** GitHub (`postWorkflowDispatch`, run status, title search,
+cancel, tarball, PR merge, commit status), the runner (the test posts the report itself), and the sidecar.
+
+Two seams are mocked because the composer hard-codes them: `postWorkflowDispatch` (the simulated GitHub) and
+`createKgRefreshWorkflow`, wrapped only to point `deps.rail` at the temp tree, shorten the 10 min watch interval to
+300 ms, and pass the workflow's own `beforeGate` / `afterStageCommitted` test hooks. Restart scenarios (P3, P4)
+run on the retry-enabled disk environment (`startRetryEnabled`, then `replaceEndpoint` and a container restart),
+as the review-fix restart scenarios do, not on the two harness variants.
+On the container runtime a restart remaps the ingress port, so every client must be rebuilt (or resolve `env.baseUrl()` per call) after `restart()`.
+
+| # | Scenario | Real | Simulated | Asserts |
+|---|---|---|---|---|
+| P1 | Trigger as system caller, report through the callback, success | Everything listed above | GitHub, runner | One `dispatch_log` row `completed`; `kg_refresh_last_refresh` written once; `get_kg_status` reads `serving`; `KgRepo.status` is `null` |
+| P2 | Second trigger while in flight | Tool handler, `KgRepo`, `getInFlightWork` | GitHub, runner | `409 refresh-in-progress` from the handler; one `kg-refresh` in-flight entry; one dispatch |
+| P3 | Restart during dispatch | Engine across a container restart, workflow, SQLite | GitHub, runner | One dispatch in total; the run completes after the restart |
+| P4 | Restart during the rail (after `stage`) | Engine across a container restart, rail gates on a temp tree | GitHub, sidecar, runner | `fetch` and `stage` each ran once; merge and persist once; `get_kg_status` reads `serving` |
+| P5 | Duplicate report, same dispatch id, then a late retry | `handleRunnerResult`, ingress client, `runner_tokens`, workflow | GitHub, runner | Duplicate answers 200, no step twice, `consumed_at` stays null. Late retry after `KgRepo.release`: `409 no-refresh-in-flight` |
+| P6 | Operator cancel, then a late report | `makeKgRefreshAdminDeps(...).cancel`, workflow, `updateJobStatus` | GitHub run status and cancel | `cancelWorkflowRun` once; marker held while the run reads `in_progress`; row `failed` / `operator_cancelled`; late report `409` |
+| P7 | Dispatch outcome `unknown`, found by title on the second reconcile | Composer, workflow reconcile loop | GitHub dispatch, title search, run status | One dispatch; the watch reads only the found run id |
+| P8 | Ingress unreachable at trigger time | `makeKgRefreshAdminDeps(...).trigger`, `callToolAsSystem`, SQLite | Nothing listens on `UNROUTABLE_INGRESS` | `{ status: 503, body: { error: "restate-unavailable" } }`; no row |
+| P9 | Boot sweep of a legacy row | `sweepLegacyKgRefreshRows`, SQLite | Seeded legacy row and stage key | Returns 1; row `timed_out`; `kg_refresh_stage` gone. Involves no Restate call, so it runs once, not per variant |
+
+## Timing rules
+
+Four flakes cost gap-fill rounds (a base URL captured before a restart, a scenario that outran a shortened
+wall-clock window, a `sys_invocation` read before a scheduled send was visible, a scenario that raced a deadline it
+did not test). Scenarios follow four rules, and
+`src/__tests__/restate-test-hygiene.test.ts` (default suite) fails on the patterns that break them in every
+`*.restate.test.ts` file not named in its `ALLOWLISTED_FILES`.
+
+1. **State produced by a one-way send, a schedule, or a resolve is read with `eventually`.** The harness exports
+   `eventually(read, accept, { timeoutMs, intervalMs, label })`; on timeout it throws naming `label` and the last value
+   read. Admin reads go through `queryInvocations`, never a direct `fetch` of `/query`:
+
+   ```ts
+   const rows = await eventually(
+     () => queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'KgRepo' AND target_handler_name = 'expire'`),
+     (found) => found.length === 1,
+     { label: "one scheduled KgRepo.expire" },
+   );
+   ```
+
+2. **A scenario never depends on wall-clock speed.** A shortened window is passed through the deps and asserted on the
+   recorded delay, and a loop inside a window must be O(1) calls or concurrent (`Promise.all`), as Q5 in
+   `kg-repo.restate.test.ts` does for its enqueues.
+
+   ```ts
+   await Promise.all(Array.from({ length: MAX_TRACKED_PRS }, (_, i) => enqueue(env.baseUrl(), slug, i + 2, `br${i + 2}`)));
+   ```
+
+3. **`env.baseUrl()` and `env.adminAPIBaseUrl()` are read at the point of use**, never stored in a `const` that outlives
+   a `restart()` (a container restart remaps the port):
+
+   ```ts
+   await eventually(() => clientFor(env).repoStatus(slug), (marker) => marker.status === "accepted");
+   ```
+
+4. **A scenario that does not test a deadline runs with deadlines that are long against its own work; a scenario that
+   tests a deadline uses its own short-deadline environment.** `kg-refresh-workflow.restate.test.ts` serves both:
+   `envFor(label)` (30 s / 60 s) and `deadlineEnvFor(label)` (the short deadlines).
+
+`settle(ms)` is the only permitted wait, and only before a **negative** assertion ("nothing more happens"). A raw
+`setTimeout(` is allowed only inside a fake dependency that simulates a slow call, carrying a
+`// restate-test-allow: <reason>` marker on the same or the previous line.

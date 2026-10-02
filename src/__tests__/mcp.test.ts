@@ -5,9 +5,9 @@ import type * as restate from "@restatedev/restate-sdk";
 import { handleMcpRequest } from "../mcp.js";
 import { SidecarMemoryProvider, sidecarHealth, sidecarHealthFields, setKgMemoryProvider } from "../kg-provider.js";
 import type { MemoryProvider, KgToolResult } from "../kg-provider.js";
-import { setActiveKgRefresh } from "../kg-refresh.js";
+import { setKgRefreshToolDeps } from "../restate/tools.js";
 import { getIssueReportCard, getFleetReport } from "../report-card.js";
-import type { PreflightCheckResult, KgRefreshStatus } from "../kg-refresh.js";
+import type { PreflightCheckResult } from "../kg-refresh.js";
 import type { Caller } from "../mcp-identity.js";
 import {
   GET_TENANT_HEALTH_DESCRIPTION,
@@ -120,9 +120,17 @@ const DISCOVERED_TOOLS = Object.keys(TOOL_HANDLERS).map((name) => ({
 // invokes the closure immediately and returns its result, the same first-attempt behaviour a
 // real (non-replayed) Restate invocation has. Replay-specific behaviour is exercised only at
 // the Restate tier (tools.restate.test.ts's alwaysReplay counter fixture).
+// AII-683: the kg-refresh handlers call the KgRepo object / KgRefresh workflow natively; these
+// fakes stand in for both clients. Reset in beforeEach.
+let kgTriggerFake: ((opts: { dryRun?: boolean; acceptNewBaseline?: boolean; actorEmail?: string }) => Promise<unknown>) | null = null;
+
 function fakeRestateContext(handlerName: string): restate.Context {
   return {
     request: () => ({ target: { handler: handlerName } }),
+    objectClient: () => ({
+      trigger: (opts: { dryRun?: boolean; acceptNewBaseline?: boolean; actorEmail?: string }) => kgTriggerFake!(opts),
+      status: async () => null,
+    }),
     run: async (name: unknown, action?: unknown) => {
       const fn = typeof name === "function" ? (name as () => unknown) : (action as () => unknown);
       return fn();
@@ -147,6 +155,7 @@ vi.mock("../access-entries.js", () => ({
 vi.mock("../runner-mode.js", () => ({
   VALID_RUNNER_MODES: ["default", "gha", "fly", "local", "shadow"],
   getRunnerMode: vi.fn(),
+  getKgMaterializeDirect: vi.fn(() => true),
 }));
 
 vi.mock("../config.js", () => ({
@@ -343,7 +352,8 @@ beforeEach(async () => {
     },
   );
   setKgMemoryProvider(null);
-  setActiveKgRefresh(null);
+  setKgRefreshToolDeps(null);
+  kgTriggerFake = null;
 
   (mcpOauth.resolveClientPath as ReturnType<typeof vi.fn>).mockReturnValue("unknown");
   (mcpOauth.getRefreshExpiry as ReturnType<typeof vi.fn>).mockResolvedValue(null);
@@ -431,11 +441,20 @@ async function callMcp(
   // cases below still hand their fakes in positionally, so translate them into the module
   // mocks the handlers actually read. The two `_legacy*` slots keep older call sites aligned.
   if (triggerKgRefresh) {
-    setActiveKgRefresh({
-      trigger: ({ dryRun, acceptNewBaseline, actorEmail }: { dryRun?: boolean; acceptNewBaseline?: boolean; actorEmail?: string }) =>
-        triggerKgRefresh(dryRun, acceptNewBaseline, actorEmail),
-      status: async () => ({}),
-    } as never);
+    setKgRefreshToolDeps({
+      kgSourceRepo: "org/kg",
+      isDeployHeld: () => false,
+      callbackConfigured: () => true,
+      mappingExists: () => true,
+      freeBytes: () => Number.MAX_SAFE_INTEGER,
+      runPreflight: async () => ({ ok: true, checkedAt: 0, results: [] }) as PreflightCheckResult,
+      persistPreflightFailure: () => {},
+      readStatusRecord: () => null,
+    });
+    kgTriggerFake = async ({ dryRun, acceptNewBaseline, actorEmail }) => {
+      await triggerKgRefresh(dryRun, acceptNewBaseline, actorEmail);
+      return { triggerId: "trig-1" };
+    };
   }
   if (writeContext?.setRunnerMode) (setRunnerModeAction as ReturnType<typeof vi.fn>).mockImplementation((_cfg: unknown, patch: { mode?: string }) => writeContext.setRunnerMode!(patch));
   if (writeContext?.pauseProject) (pauseProjectAction as ReturnType<typeof vi.fn>).mockImplementation((teamKey: string, paused: boolean) => writeContext.pauseProject!(teamKey, paused));
@@ -1372,22 +1391,29 @@ describe("handleMcpRequest", () => {
       expect(result.statusCode).toBe(401);
     });
 
-    it("handles get_kg_status — returns the active kg-refresh handle's status verbatim", async () => {
-      const status: KgRefreshStatus = {
-        running: true,
+    it("handles get_kg_status — composes the status from the KgRepo marker and the last-refresh record", async () => {
+      const lastRefresh = { ok: true as const, at: 1735689600000, detail: "no diff", stampBefore: "a", stampAfter: "b" };
+      // AII-683: get_kg_status reads the boot-time tool deps and the KgRepo object, not a handle.
+      setKgRefreshToolDeps({
+        kgSourceRepo: "org/kg",
+        isDeployHeld: () => false,
+        callbackConfigured: () => true,
+        mappingExists: () => true,
+        freeBytes: () => Number.MAX_SAFE_INTEGER,
+        runPreflight: async () => ({ ok: true, checkedAt: 0, results: [] }) as PreflightCheckResult,
+        persistPreflightFailure: () => {},
+        readStatusRecord: () => lastRefresh,
+      });
+      const status = {
+        running: false,
         deployHeld: false,
         kgDegraded: false,
-        servedStamp: "2026-09-01T00:00:00Z",
-        lastRefresh: { ok: true, at: 1735689600000, detail: "no diff", stampBefore: "a", stampAfter: "b" },
-        stage: "ingest-running",
+        ...sidecarHealthFields(),
+        servedStamp: "b",
+        lastRefresh,
+        stage: "serving",
         materialize: "direct",
-        kgUnavailable: false,
-        sidecar: { reachable: false, toolsListed: false, lastError: null, checkedAt: null },
       };
-      const statusMock = vi.fn(async () => status);
-      // AII-711: get_kg_status is a Restate handler that reads the boot-time singleton, not a
-      // per-request callback threaded through handleMcpRequest.
-      setActiveKgRefresh({ status: statusMock } as never);
 
       const result = await callMcp(
         { authorization: "Bearer tok" },
@@ -1401,7 +1427,6 @@ describe("handleMcpRequest", () => {
       expect(mockHttpRequest).not.toHaveBeenCalled();
       expect(result.statusCode).toBe(200);
       expect(toolsClientMock.callTool).toHaveBeenCalledWith("get_kg_status", {}, expect.objectContaining({ kind: "human" }), undefined);
-      expect(statusMock).toHaveBeenCalledOnce();
       const parsed = JSON.parse(result.body);
       const data = JSON.parse(parsed.result.content[0].text);
       expect(data).toEqual(status);
@@ -1807,7 +1832,7 @@ describe("handleMcpRequest", () => {
       const parsed = JSON.parse(result.body);
       expect(parsed.result.isError).not.toBe(true);
       const data = JSON.parse(parsed.result.content[0].text);
-      expect(data).toEqual({ status: 202, body: { accepted: true } });
+      expect(data).toEqual({ status: 202, body: { refreshing: true, triggerId: "trig-1" } });
       expect(triggerMock).toHaveBeenCalledOnce();
       expect(logSpy).toHaveBeenCalledWith(
         expect.stringMatching(/\[mcp\] write tool=trigger_kg_refresh actor=user@example\.com role=admin result=ok/),
@@ -1957,7 +1982,7 @@ describe("handleMcpRequest", () => {
       expect(triggerMock).not.toHaveBeenCalled();
     });
 
-    it("when triggerKgRefresh is not wired, returns isError with 'KG refresh is not configured'", async () => {
+    it("when the kg-refresh tool deps are not set, answers 501 kg-source-repo-not-configured", async () => {
       mockRole("admin");
       const result = await callMcp(
         { authorization: "Bearer tok" },
@@ -1970,8 +1995,8 @@ describe("handleMcpRequest", () => {
 
       expect(result.statusCode).toBe(200);
       const parsed = JSON.parse(result.body);
-      expect(parsed.result.isError).toBe(true);
-      expect(parsed.result.content[0].text).toContain("KG refresh is not configured");
+      expect(parsed.result.isError).not.toBe(true);
+      expect(JSON.parse(parsed.result.content[0].text)).toEqual({ status: 501, body: { error: "kg-source-repo-not-configured" } });
     });
 
     it("unauthenticated request returns 401 before any tool dispatch", async () => {

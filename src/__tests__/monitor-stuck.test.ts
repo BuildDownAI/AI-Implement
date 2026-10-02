@@ -418,6 +418,18 @@ describe("monitorJobs TTL check (AII-743)", () => {
     vi.mocked(getMappings).mockReturnValue({});
   });
 
+  it("leaves a kg-refresh GHA row to the workflow: no GitHub call, no status write (AII-901)", async () => {
+    const job = makeJob({ issueId: "kg-refresh", phase: "kg-refresh", repo: "org/kg", runId: 4242, dispatchedAt: Date.now() - 200 * 60 * 1000 });
+    vi.mocked(getInFlightJobs).mockReturnValue([job]);
+    vi.mocked(updateJobStatus).mockClear();
+    vi.mocked(cancelWorkflowRun).mockClear();
+
+    await monitorJobs(mockAppConfig, makeRegistry(null));
+
+    expect(cancelWorkflowRun).not.toHaveBeenCalled();
+    expect(updateJobStatus).not.toHaveBeenCalled();
+  });
+
   it("times out a no-mapping, no-run-id job past 105 minutes with conclusion ttl_expired", async () => {
     vi.mocked(incrementStuckAttempts).mockReturnValue(1);
     const job = makeJob({

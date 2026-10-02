@@ -35,7 +35,7 @@ describe("dependency direction: the main pipeline never reaches into Restate (AI
 describe("import allowlist: only the door adapters may import Restate from outside src/restate/ (AII-717)", () => {
   // deploy.ts is the self-deployment door: it probes the old Restate endpoint
   // before replacing the process (AII-810), without importing the SDK itself.
-  const ALLOWLIST = new Set(["src/mcp.ts", "src/mcp-oauth.ts", "src/admin.ts", "src/index.ts", "src/deploy.ts"]);
+  const ALLOWLIST = new Set(["src/mcp.ts", "src/mcp-oauth.ts", "src/admin.ts", "src/index.ts", "src/deploy.ts", "src/runner-callback.ts"]);
 
   function listTsFiles(dir: string): string[] {
     const entries = readdirSync(dir, { withFileTypes: true });
@@ -106,7 +106,7 @@ describe("import allowlist: only the door adapters may import Restate from outsi
   // makes the first test above fail with that file listed in `violations`, confirmed by hand
   // and reverted before this PR — see the PR description for the before/after transcript.
   it("sanity: the allowlist contains only the documented door and deployment adapters", () => {
-    expect([...ALLOWLIST].sort()).toEqual(["src/admin.ts", "src/deploy.ts", "src/index.ts", "src/mcp-oauth.ts", "src/mcp.ts"]);
+    expect([...ALLOWLIST].sort()).toEqual(["src/admin.ts", "src/deploy.ts", "src/index.ts", "src/mcp-oauth.ts", "src/mcp.ts", "src/runner-callback.ts"]);
   });
 });
 

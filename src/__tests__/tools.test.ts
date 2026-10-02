@@ -7,7 +7,7 @@
 import { readFileSync } from "node:fs";
 import * as restate from "@restatedev/restate-sdk";
 import { z } from "zod";
-import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   tool,
   listProjects,
@@ -26,6 +26,7 @@ import {
   triggerWorkflowSyncTool,
   clearDispatchDedupTool,
   setProviderRegistry,
+  setKgRefreshToolDeps,
   getReviewFixAttemptTool,
   getReviewFixActivityTool,
   setReviewFixAttemptsFacade,
@@ -34,7 +35,8 @@ import { discoverTools, callTool, callToolAsSystem, toolCatalog } from "../resta
 import type { Caller } from "../mcp-identity.js";
 import { setKgMemoryProvider } from "../kg-provider.js";
 import type { MemoryProvider } from "../kg-provider.js";
-import { setActiveKgRefresh, type KgRefreshHandle } from "../kg-refresh.js";
+import type { PreflightCheckResult, RefreshOutcome } from "../kg-refresh.js";
+import type { KgRefreshToolDeps } from "../restate/kg-refresh-production.js";
 import { getMappings } from "../config.js";
 import { setOrchestratorSetting } from "../orchestrator-settings.js";
 import { initSettingsTable } from "../runner-mode.js";
@@ -129,6 +131,22 @@ function stubAbortTimeout(expectedMs: number): ReturnType<typeof vi.spyOn> {
     queueMicrotask(() => controller.abort(new DOMException("The operation was aborted due to timeout", "TimeoutError")));
     return controller.signal;
   });
+}
+
+const PREFLIGHT_OK: PreflightCheckResult = { ok: true, checkedAt: 1, results: [] } as PreflightCheckResult;
+
+function kgToolDeps(overrides: Partial<KgRefreshToolDeps> = {}): KgRefreshToolDeps {
+  return {
+    kgSourceRepo: "org/kg",
+    isDeployHeld: () => false,
+    callbackConfigured: () => true,
+    mappingExists: () => true,
+    freeBytes: () => Number.MAX_SAFE_INTEGER,
+    runPreflight: async () => PREFLIGHT_OK,
+    persistPreflightFailure: () => {},
+    readStatusRecord: () => null,
+    ...overrides,
+  };
 }
 
 const SYSTEM_ADMIN: Caller = { kind: "system", email: null, role: "admin" };
@@ -707,10 +725,74 @@ describe("migrated read handlers (AII-711)", () => {
     setKgMemoryProvider(null);
   });
 
-  it("get_kg_status without an active kg-refresh handle answers the unconfigured error object", async () => {
-    setActiveKgRefresh(null);
+  it("get_kg_status without kg-refresh tool deps answers the unconfigured error object", async () => {
+    setKgRefreshToolDeps(null);
     const result = await getKgStatusTool(fakeContext("get_kg_status"), { caller: system, args: {} });
     expect(JSON.parse(result.content[0].text)).toEqual({ error: "KG refresh is not configured" });
+  });
+
+  describe("get_kg_status stage table (AII-683)", () => {
+    const ok: RefreshOutcome = { ok: true, at: 1, detail: "d", stampBefore: "a", stampAfter: "b" };
+    const failed = (gate: string): RefreshOutcome =>
+      ({ ok: false, at: 1, gate, detail: "d", stampBefore: "a", stampAfter: null }) as RefreshOutcome;
+
+    async function stageFor(opts: { last?: RefreshOutcome | null; inFlight?: { triggerId: string; startedAt: number } | null; step?: string | null; statusThrows?: boolean }) {
+      setKgRefreshToolDeps(kgToolDeps({ readStatusRecord: () => opts.last ?? null }));
+      const ctx = {
+        ...fakeContext("get_kg_status"),
+        objectClient: () => ({ status: async () => opts.inFlight ?? null }),
+        workflowClient: () => ({
+          status: async () => {
+            if (opts.statusThrows) throw new Error("no such workflow");
+            return { step: opts.step ?? null, startedAt: 1, triggerId: "t1", runId: null, dryRun: false };
+          },
+        }),
+      } as unknown as restate.Context;
+      const result = await getKgStatusTool(ctx, { caller: system, args: {} });
+      return JSON.parse(result.content[0].text);
+    }
+
+    it.each([
+      ["no record", null, "idle"],
+      ["ok", ok, "serving"],
+      ["answers", failed("answers"), "reverted"],
+      ["vectors", failed("vectors"), "reverted"],
+      ["canary", failed("canary"), "reverted"],
+      ["stamp", failed("stamp"), "reverted"],
+      ["ingest-needed", failed("ingest-needed"), "idle"],
+      ["preflight", failed("preflight"), "failed"],
+    ])("idle: %s → %s", async (_name, last, stage) => {
+      const status = await stageFor({ last });
+      expect(status.stage).toBe(stage);
+      expect(status.running).toBe(false);
+    });
+
+    it.each([
+      ["reserve", "checking"], ["dispatch", "checking"],
+      ["await-progress", "ingest-running"], ["cancelling", "ingest-running"], ["dry-run-report", "ingest-running"],
+      ["merge", "snapshot-landed"], ["delete-branch", "snapshot-landed"],
+      ["fetch", "staging"], ["stage", "staging"], ["swap", "staging"], ["verify", "staging"], ["revert", "staging"],
+      ["persist", "staging"], ["close-row", "staging"], ["outcome", "staging"], ["settled", "staging"],
+    ])("in flight: step %s → %s", async (step, stage) => {
+      const status = await stageFor({ inFlight: { triggerId: "t1", startedAt: 1 }, step });
+      expect(status.stage).toBe(stage);
+      expect(status.running).toBe(true);
+    });
+
+    it("in flight with a workflow status failure reports ingest-running, still running, no error", async () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const status = await stageFor({ inFlight: { triggerId: "t1", startedAt: 1 }, statusThrows: true });
+      expect(status.stage).toBe("ingest-running");
+      expect(status.running).toBe(true);
+      warn.mockRestore();
+    });
+
+    it("keeps the KgRefreshStatus shape", async () => {
+      const status = await stageFor({ last: ok });
+      expect(Object.keys(status).sort()).toEqual(
+        ["deployHeld", "kgDegraded", "kgUnavailable", "lastRefresh", "materialize", "running", "servedStamp", "sidecar", "stage"].sort(),
+      );
+    });
   });
 });
 
@@ -916,40 +998,121 @@ describe("get_issue_report_card and get_fleet_report thread their arguments (AII
 describe("migrated write handlers (AII-713)", () => {
   const admin: Caller = SYSTEM_ADMIN;
 
-  afterEach(() => {
-    setActiveKgRefresh(null);
-  });
-
   describe("trigger_kg_refresh", () => {
-    it("throws \"KG refresh is not configured\" when no handle is active", async () => {
-      const result = await triggerKgRefreshTool(fakeContext("trigger_kg_refresh"), { caller: admin, args: {} });
-      expect(result.isError).toBe(true);
-      expect(result.content[0].text).toContain("KG refresh is not configured");
+    const answer = (result: { content: { text: string }[] }) => JSON.parse(result.content[0].text);
+    const trigger = vi.fn();
+    function ctxWithKgRepo(runCalls: RunCall[] = []): restate.Context {
+      return { ...fakeContext("trigger_kg_refresh", runCalls), objectClient: () => ({ trigger }) } as unknown as restate.Context;
+    }
+    const call = (args: Record<string, unknown> = {}, caller: Caller = admin, runCalls: RunCall[] = []) =>
+      triggerKgRefreshTool(ctxWithKgRepo(runCalls), { caller, args });
+
+    beforeEach(() => {
+      trigger.mockReset();
+      trigger.mockResolvedValue({ triggerId: "trig-1" });
+      setKgRefreshToolDeps(kgToolDeps());
+    });
+    afterEach(() => setKgRefreshToolDeps(null));
+
+    it("answers 501 when the tool deps are unset", async () => {
+      setKgRefreshToolDeps(null);
+      expect(answer(await call())).toEqual({ status: 501, body: { error: "kg-source-repo-not-configured" } });
     });
 
-    it("forwards dryRun, acceptNewBaseline, and the caller's email to the active handle through ctx.run, and returns its result verbatim", async () => {
-      const triggerMock = vi.fn(async () => ({ status: 202, body: { accepted: true } }));
-      setActiveKgRefresh({ trigger: triggerMock } as unknown as KgRefreshHandle);
-      const runCalls: RunCall[] = [];
-      const result = await triggerKgRefreshTool(fakeContext("trigger_kg_refresh", runCalls), {
-        caller: { kind: "human", email: "user@example.com", role: "admin" },
-        args: { dryRun: true, acceptNewBaseline: true },
+    it("answers 409 deploy-in-progress first, even when every later gate also fails", async () => {
+      setKgRefreshToolDeps(kgToolDeps({
+        isDeployHeld: () => true, callbackConfigured: () => false, mappingExists: () => false, freeBytes: () => 0,
+        runPreflight: async () => ({ ...PREFLIGHT_OK, ok: false }),
+      }));
+      expect(answer(await call())).toEqual({
+        status: 409, body: { error: "deploy-in-progress", detail: "a deploy holds the machine; refresh refused" },
       });
-      expect(triggerMock).toHaveBeenCalledWith({ dryRun: true, acceptNewBaseline: true, actorEmail: "user@example.com" });
-      expect(JSON.parse(result.content[0].text)).toEqual({ status: 202, body: { accepted: true } });
-      expect(runCalls).toEqual([{ name: "kg-refresh-trigger", options: { maxRetryAttempts: 1 }, result: { status: 202, body: { accepted: true } } }]);
+      expect(trigger).not.toHaveBeenCalled();
     });
 
-    it("defaults dryRun and acceptNewBaseline to false when omitted, and actorEmail to undefined for a null-email caller", async () => {
-      const triggerMock = vi.fn(async () => ({ status: 202, body: {} }));
-      setActiveKgRefresh({ trigger: triggerMock } as unknown as KgRefreshHandle);
-      await triggerKgRefreshTool(fakeContext("trigger_kg_refresh"), { caller: admin, args: {} });
-      expect(triggerMock).toHaveBeenCalledWith({ dryRun: false, acceptNewBaseline: false, actorEmail: undefined });
+    it("answers 501 when no KG source repo is configured, before the callback check", async () => {
+      setKgRefreshToolDeps(kgToolDeps({ kgSourceRepo: null as unknown as string, callbackConfigured: () => false }));
+      expect(answer(await call())).toEqual({ status: 501, body: { error: "kg-source-repo-not-configured" } });
+    });
+
+    it("answers 422 callback-unconfigured before the mapping check", async () => {
+      setKgRefreshToolDeps(kgToolDeps({ callbackConfigured: () => false, mappingExists: () => false }));
+      const res = answer(await call());
+      expect(res.status).toBe(422);
+      expect(res.body.error).toBe("callback-unconfigured");
+      expect(res.body.precondition).toBe("callback-unconfigured");
+      expect(res.body.detail).toContain("RUNNER_CALLBACK_BASE_URL and RUNNER_TOKEN_SECRET");
+    });
+
+    it("answers 422 kg-mapping-not-found before the disk check", async () => {
+      setKgRefreshToolDeps(kgToolDeps({ mappingExists: () => false, freeBytes: () => 0 }));
+      const res = answer(await call());
+      expect(res).toEqual({
+        status: 422,
+        body: {
+          error: "kg-mapping-not-found",
+          precondition: "kg-mapping-not-found",
+          detail: "no project mapping found for kgSourceRepo=org/kg — add it at /admin and set dependencyTokenScope=installation",
+        },
+      });
+    });
+
+    it("answers 507 insufficient-storage before the preflight", async () => {
+      const runPreflight = vi.fn(async () => PREFLIGHT_OK);
+      setKgRefreshToolDeps(kgToolDeps({ freeBytes: () => 1, runPreflight }));
+      const res = answer(await call());
+      expect(res.status).toBe(507);
+      expect(res.body.error).toBe("insufficient-storage");
+      expect(res.body.detail).toMatch(/^less than \d+ bytes free on the volume$/);
+      expect(runPreflight).not.toHaveBeenCalled();
+    });
+
+    it("a throwing freeBytes does not refuse", async () => {
+      setKgRefreshToolDeps(kgToolDeps({ freeBytes: () => { throw new Error("statfs"); } }));
+      expect(answer(await call()).status).toBe(202);
+    });
+
+    it("answers 422 preflight-failed and persists the failure inside the same ctx.run step", async () => {
+      const failing = {
+        ok: false, checkedAt: 5,
+        results: [{ repo: "org/dep", grant: "contents", ok: false, status: 404, hint: "grant it" }, { repo: "org/kg", grant: "contents", ok: true, status: 200 }],
+      } as PreflightCheckResult;
+      const persistPreflightFailure = vi.fn();
+      setKgRefreshToolDeps(kgToolDeps({ runPreflight: async () => failing, persistPreflightFailure }));
+      const runCalls: RunCall[] = [];
+      const res = answer(await call({}, admin, runCalls));
+      const detail = "org/dep — contents — HTTP 404 — grant it";
+      expect(res).toEqual({ status: 422, body: { error: "preflight-failed", precondition: "preflight-failed", detail } });
+      expect(persistPreflightFailure).toHaveBeenCalledWith(failing);
+      expect(runCalls.find((c) => c.name === "preflight")).toMatchObject({ options: { maxRetryAttempts: 1 }, result: detail });
+      expect(trigger).not.toHaveBeenCalled();
+    });
+
+    it("answers 202 { refreshing, triggerId } and forwards every option to KgRepo.trigger", async () => {
+      const res = answer(await call(
+        { dryRun: true, acceptNewBaseline: true, ref: "feature/x" },
+        { kind: "human", email: "user@example.com", role: "admin" },
+      ));
+      expect(res).toEqual({ status: 202, body: { refreshing: true, triggerId: "trig-1" } });
+      expect(trigger).toHaveBeenCalledWith({ dryRun: true, acceptNewBaseline: true, kgSourceRef: "feature/x", actorEmail: "user@example.com" });
+    });
+
+    it("passes ref through as kgSourceRef to KgRepo.trigger", async () => {
+      await call({ ref: "release/1.2" });
+      expect(trigger).toHaveBeenCalledWith(expect.objectContaining({ kgSourceRef: "release/1.2" }));
+    });
+
+    it("defaults dryRun and acceptNewBaseline to false, omits ref, and leaves actorEmail undefined for a null-email caller", async () => {
+      await call();
+      expect(trigger).toHaveBeenCalledWith({ dryRun: false, acceptNewBaseline: false, actorEmail: undefined });
+    });
+
+    it("answers 409 refresh-in-progress when KgRepo reports a live refresh", async () => {
+      trigger.mockResolvedValue({ status: "refresh-in-progress", triggerId: "other" });
+      expect(answer(await call())).toEqual({ status: 409, body: { error: "refresh-in-progress" } });
     });
 
     it("answers isError with the wrapper's standard wording when ctx.run rejects with a TerminalError", async () => {
-      const triggerMock = vi.fn(async () => ({ status: 202, body: {} }));
-      setActiveKgRefresh({ trigger: triggerMock } as unknown as KgRefreshHandle);
       const failingCtx = {
         request: () => ({ target: { handler: "trigger_kg_refresh" } }),
         run: async () => {
@@ -963,7 +1126,7 @@ describe("migrated write handlers (AII-713)", () => {
         isError: true,
         content: [{ type: "text", text: "trigger_kg_refresh failed: kg-refresh dispatch rejected" }],
       });
-      expect(triggerMock).not.toHaveBeenCalled();
+      expect(trigger).not.toHaveBeenCalled();
     });
   });
 

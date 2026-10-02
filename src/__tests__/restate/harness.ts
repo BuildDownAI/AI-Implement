@@ -187,3 +187,48 @@ export async function attachWorkflow<T>(baseUrl: string, workflow: string, key: 
     target: "workflow", workflowName: workflow, workflowKey: key,
   });
 }
+
+/** Poll `read` until `accept` approves the value, and return that value. On timeout the
+ *  error names `label` and prints the last value read, so a flake reads as a diagnosis
+ *  rather than a bare assertion diff. State produced by a one-way send, a schedule, or a
+ *  resolve is always read through this, never behind a fixed sleep. */
+export async function eventually<T>(
+  read: () => T | Promise<T>,
+  accept: (value: T) => boolean,
+  opts: { timeoutMs?: number; intervalMs?: number; label?: string } = {},
+): Promise<T> {
+  const { timeoutMs = 10_000, intervalMs = 25, label = "condition" } = opts;
+  const stop = Date.now() + timeoutMs;
+  for (;;) {
+    const value = await read();
+    if (accept(value)) return value;
+    if (Date.now() > stop) {
+      let printed: string;
+      try {
+        printed = JSON.stringify(value) ?? String(value);
+      } catch {
+        printed = String(value);
+      }
+      throw new Error(`eventually timed out after ${timeoutMs}ms waiting for ${label}; last value: ${printed}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs)); // restate-test-allow: the poll interval of eventually itself
+  }
+}
+
+/** One `POST /query` on `sys_invocation` with the given `WHERE` text; returns `rows`.
+ *  Wrap it in `eventually` — a scheduled send is not always visible the moment it is made. */
+export async function queryInvocations(adminBaseUrl: string, where: string): Promise<Array<Record<string, unknown>>> {
+  const response = await fetch(`${adminBaseUrl}/query`, { // restate-test-allow: the one sanctioned admin read
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json" },
+    body: JSON.stringify({ query: `SELECT * FROM sys_invocation WHERE ${where}` }),
+  });
+  if (!response.ok) throw new Error(`POST /query failed: HTTP ${response.status}`);
+  return ((await response.json()) as { rows: Array<Record<string, unknown>> }).rows;
+}
+
+/** The one permitted wait: use it only before a NEGATIVE assertion ("nothing more
+ *  happens"). Waiting for something to become true is `eventually`, never a sleep. */
+export async function settle(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms)); // restate-test-allow: settle is the sanctioned negative wait
+}

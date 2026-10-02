@@ -36,3 +36,7 @@ We adopt Restate one run kind at a time and make the run-ledger program continge
 - Easier: evidence precedes program. Each step deletes hand-rolled lifecycle glue instead of adding a parallel system. A failure at any step is local and reversible: the switch slice reverts alone.
 - Harder: token handling is heterogeneous during the transition — unmigrated paths consume single-use tokens while migrated paths verify only. The evaluation gate must resolve the end state so the split does not become permanent.
 - The run-ledger ADRs stay Proposed longer, and draft PR #495 stays a draft until the gate.
+
+## Amendment (2026-09-28): kg-refresh starts on the pilot's integrated evidence
+
+Rule 8 required the review-fix pilot's live restart recovery and one week of operating evidence before kg-refresh starts. The operator (John, with Cameron) decided on 2026-09-28 to start kg-refresh on the pilot's integrated evidence: PR #722 merged into `testing` as `6f79b09`, the AII-813 fault matrix, and 131 pinned Restate tests green. The SAN live evaluation (AII-815) continues in parallel and no longer gates AII-682. The matching bullet in ADR 031 is amended the same way. Rule 7's evaluation gate after two migrations is unchanged.

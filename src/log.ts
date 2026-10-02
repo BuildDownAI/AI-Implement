@@ -188,6 +188,19 @@ function ensureLogColumns(): void {
   `);
 }
 
+/** Newest dispatch_log row id for a dispatch id, if any. */
+export function findLogIdByDispatchId(dispatchId: string): number | undefined {
+  const row = getDb()
+    .prepare("SELECT id FROM dispatch_log WHERE dispatch_id = ? ORDER BY id DESC LIMIT 1")
+    .get(dispatchId) as { id: number } | undefined;
+  return row?.id;
+}
+
+/** Idempotent on dispatchId: returns the existing row's id instead of inserting a duplicate. */
+export function appendLogIfAbsent(entry: Parameters<typeof appendLog>[0] & { dispatchId: string }): number {
+  return findLogIdByDispatchId(entry.dispatchId) ?? appendLog(entry);
+}
+
 export function appendLog(entry: {
   issueId: string;
   issueIdentifier?: string;
@@ -556,17 +569,6 @@ export function getInFlightJobs(): Job[] {
     getDb()
       .prepare(
         "SELECT * FROM dispatch_log WHERE status IN ('dispatched', 'running') ORDER BY dispatched_at ASC",
-      )
-      .all() as RawRow[],
-  );
-}
-
-/** Returns all kg-refresh jobs in a non-terminal state (for the reaper's inverse sweep). */
-export function getInFlightKgRefreshJobs(): Job[] {
-  return mapRows(
-    getDb()
-      .prepare(
-        "SELECT * FROM dispatch_log WHERE phase = 'kg-refresh' AND status IN ('dispatched', 'running') ORDER BY dispatched_at ASC",
       )
       .all() as RawRow[],
   );

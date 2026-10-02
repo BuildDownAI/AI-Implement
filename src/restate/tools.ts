@@ -16,7 +16,7 @@ import * as restate from "@restatedev/restate-sdk";
 import { serde } from "@restatedev/restate-sdk-zod";
 import { z } from "zod";
 import type { AccessRole } from "../access-entries.js";
-import { getRunnerMode } from "../runner-mode.js";
+import { getRunnerMode, getKgMaterializeDirect } from "../runner-mode.js";
 import { getMappings, type RepoMapping } from "../config.js";
 import { getInFlightJobs, getRunRecordMergeVerdict } from "../log.js";
 import { getDb } from "../dedup.js";
@@ -24,7 +24,9 @@ import { isKgDegraded } from "../deploy-notify.js";
 import { sidecarHealthFields, getKgMemoryProvider, KG_TOOL_CAPABILITY } from "../kg-provider.js";
 import { getRestateStatus } from "./status.js";
 import { readKgSourceRepo } from "../deploy.js";
-import { runKgRefreshPreflight, getActiveKgRefresh } from "../kg-refresh.js";
+import { runKgRefreshPreflight, MIN_FREE_BYTES, type KgRefreshStage, type KgRefreshStatus } from "../kg-refresh.js";
+import type { KgRefreshToolDeps } from "./kg-refresh-production.js";
+import type { KgRefreshDefinition, KgRepoDefinition } from "./kg-refresh-types.js";
 import { getOrchestratorSettings, getLinearPickupLabel } from "../orchestrator-settings.js";
 import { getIssueReportCard, getFleetReport } from "../report-card.js";
 import { getDeployPosture } from "../deploy-posture.js";
@@ -444,14 +446,83 @@ export const getDeployPostureTool = tool(
 export const GET_KG_STATUS_DESCRIPTION =
   "Returns the KG refresh rail state: stage (idle | staging | ingest-running | serving | reverted | failed), the served snapshot stamp, the materialize path the next refresh will stage (rdflib | direct), and the last refresh outcome with its gate. Poll it after `POST /api/kg/refresh`.";
 
+// Type-only client handles: the real definitions are built with dependencies at boot
+// (createProductionKgRefreshServices); a client needs only the service name and handler types.
+const KgRepo: KgRepoDefinition = { name: "KgRepo" } as KgRepoDefinition;
+const KgRefresh: KgRefreshDefinition = { name: "KgRefresh" } as KgRefreshDefinition;
+
+let kgRefreshToolDeps: KgRefreshToolDeps | null = null;
+
+/**
+ * Set once at boot (src/index.ts's main()) from `createProductionKgRefreshServices`. The tools
+ * service stays setter-based, like `setProviderRegistry`, until AII-888. Unset (KG_SOURCE_REPO
+ * absent, tests) leaves both kg-refresh handlers answering "not configured".
+ */
+export function setKgRefreshToolDeps(deps: KgRefreshToolDeps | null): void {
+  kgRefreshToolDeps = deps;
+}
+
+/** Maps the in-flight workflow step onto the stage vocabulary `get_kg_status` has always used. */
+export function kgStageForStep(step: string | null): KgRefreshStage {
+  if (step === null || step === "reserve" || step === "dispatch") return "checking";
+  if (step === "await-progress" || step === "cancelling" || step === "dry-run-report") return "ingest-running";
+  if (step === "merge" || step === "delete-branch") return "snapshot-landed";
+  // fetch, stage, swap, verify, revert, persist, close-row, outcome, settled, and the
+  // short-lived terminal steps (failed, closed, no-new-data) whose marker is about to clear.
+  return "staging";
+}
+
+const REVERT_GATES = new Set(["answers", "vectors", "canary", "stamp"]);
+
+function kgStageFromLastRefresh(last: KgRefreshStatus["lastRefresh"]): KgRefreshStage {
+  if (!last) return "idle";
+  if (last.ok) return "serving";
+  const gate: string | undefined = last.gate;
+  if (gate && REVERT_GATES.has(gate)) return "reverted";
+  if (gate === "ingest-needed") return "idle";
+  return "failed";
+}
+
 export const getKgStatusTool = tool(
   { description: GET_KG_STATUS_DESCRIPTION, input: z.object({}), role: "user" },
-  async (): Promise<ToolResponse> => {
-    const handle = getActiveKgRefresh();
-    const result = handle ? await handle.status() : { error: "KG refresh is not configured" };
+  async (ctx): Promise<ToolResponse> => {
+    const toolDeps = kgRefreshToolDeps;
+    if (!toolDeps) {
+      return { content: [{ type: "text", text: JSON.stringify({ error: "KG refresh is not configured" }, null, 2) }] };
+    }
+    const inFlight = await ctx.objectClient(KgRepo, toolDeps.kgSourceRepo).status();
+    const lastRefresh = toolDeps.readStatusRecord();
+    let stage: KgRefreshStage;
+    if (inFlight === null || inFlight === undefined) {
+      stage = kgStageFromLastRefresh(lastRefresh);
+    } else {
+      try {
+        const wf = await ctx.workflowClient(KgRefresh, inFlight.triggerId).status();
+        stage = kgStageForStep(wf.step);
+      } catch (err) {
+        // A retained-but-finished or unreachable workflow: the marker is the truth.
+        if (!kgStatusFallbackLogged) {
+          kgStatusFallbackLogged = true;
+          console.warn(`[kg-refresh] workflow status unavailable for ${inFlight.triggerId}; reporting ingest-running: ${String(err)}`);
+        }
+        stage = "ingest-running";
+      }
+    }
+    const result: KgRefreshStatus = {
+      running: inFlight !== null && inFlight !== undefined,
+      deployHeld: toolDeps.isDeployHeld(),
+      kgDegraded: isKgDegraded(),
+      ...sidecarHealthFields(),
+      servedStamp: lastRefresh ? (lastRefresh.ok ? lastRefresh.stampAfter : lastRefresh.stampBefore) : null,
+      lastRefresh,
+      stage,
+      materialize: getKgMaterializeDirect() ? "direct" : "rdflib",
+    };
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   },
 );
+
+let kgStatusFallbackLogged = false;
 
 const REVIEW_FIX_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const REVIEW_FIX_ID_MAX_LENGTH = 128;
@@ -638,24 +709,71 @@ export const triggerKgRefreshTool = tool(
       acceptNewBaseline: z.boolean().optional().describe(
         "Push even though a tracked part (issue.nt/comment.nt) shrank or a part dropped below 50% of its previous size — a one-shot override of the zero-shrink guard, applied to this dispatch only.",
       ),
+      ref: z.string().optional().describe(
+        "Dispatch against this branch instead of the KG source repo's default branch (used to run the rail against a PR head).",
+      ),
     }),
     role: "admin",
     retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },
   },
   async (ctx, input): Promise<ToolResponse> => {
-    const handle = getActiveKgRefresh();
-    if (!handle) {
-      throw new Error("KG refresh is not configured");
+    const answer = (status: number, body: Record<string, unknown>): ToolResponse =>
+      ({ content: [{ type: "text", text: JSON.stringify({ status, body }, null, 2) }] });
+    const toolDeps = kgRefreshToolDeps;
+    const deployHeld = await ctx.run("deploy-held", () => toolDeps ? toolDeps.isDeployHeld() : false);
+    if (deployHeld) {
+      return answer(409, { error: "deploy-in-progress", detail: "a deploy holds the machine; refresh refused" });
     }
-    const dryRun = input.args.dryRun === true;
-    const acceptNewBaseline = input.args.acceptNewBaseline === true;
-    const actorEmail = input.caller.email ?? undefined;
-    const result = await ctx.run(
-      "kg-refresh-trigger",
-      () => handle.trigger({ dryRun, acceptNewBaseline, actorEmail }),
-      { maxRetryAttempts: 1 },
-    );
-    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    if (!toolDeps || toolDeps.kgSourceRepo === null) {
+      return answer(501, { error: "kg-source-repo-not-configured" });
+    }
+    if (!toolDeps.callbackConfigured()) {
+      return answer(422, {
+        error: "callback-unconfigured",
+        precondition: "callback-unconfigured",
+        detail: "runner dispatch requires RUNNER_CALLBACK_BASE_URL and RUNNER_TOKEN_SECRET to be set — dispatching without it would stall the refresh with no way to report completion",
+      });
+    }
+    const hasMapping = await ctx.run("mapping", () => toolDeps.mappingExists());
+    if (!hasMapping) {
+      return answer(422, {
+        error: "kg-mapping-not-found",
+        precondition: "kg-mapping-not-found",
+        detail: `no project mapping found for kgSourceRepo=${toolDeps.kgSourceRepo} — add it at /admin and set dependencyTokenScope=installation`,
+      });
+    }
+    const lowDisk = await ctx.run("disk", () => {
+      try {
+        return toolDeps.freeBytes() < MIN_FREE_BYTES;
+      } catch {
+        // statfs failing is not a reason to refuse; disk pressure will surface in staging.
+        return false;
+      }
+    });
+    if (lowDisk) {
+      return answer(507, { error: "insufficient-storage", detail: `less than ${MIN_FREE_BYTES} bytes free on the volume` });
+    }
+    const preflightFailure = await ctx.run("preflight", async () => {
+      const result = await toolDeps.runPreflight();
+      if (result.ok) return null;
+      toolDeps.persistPreflightFailure(result);
+      return result.results
+        .filter((r) => !r.ok)
+        .map((r) => `${r.repo} — ${r.grant} — HTTP ${r.status}${r.hint ? ` — ${r.hint}` : ""}`)
+        .join("\n");
+    }, { maxRetryAttempts: 1 });
+    if (preflightFailure !== null) {
+      return answer(422, { error: "preflight-failed", precondition: "preflight-failed", detail: preflightFailure });
+    }
+    const opts = {
+      dryRun: input.args.dryRun === true,
+      acceptNewBaseline: input.args.acceptNewBaseline === true,
+      ...(input.args.ref !== undefined ? { kgSourceRef: input.args.ref } : {}),
+      actorEmail: input.caller.email ?? undefined,
+    };
+    const result = await ctx.objectClient(KgRepo, toolDeps.kgSourceRepo).trigger(opts);
+    if ("status" in result) return answer(409, { error: "refresh-in-progress" });
+    return answer(202, { refreshing: true, triggerId: result.triggerId });
   },
 );
 
