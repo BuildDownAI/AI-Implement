@@ -1838,7 +1838,9 @@ describe("handleRunnerProgress", () => {
     });
     const kgRefreshClient = { progress: vi.fn(async () => ({ status: "accepted" })) };
     const responses: Array<{ status: number; body: unknown }> = [];
-    const fetchImpl = (async (_url: string, init?: RequestInit) => {
+    const urls: string[] = [];
+    const fetchImpl = (async (url: string, init?: RequestInit) => {
+      urls.push(url);
       const headers = init?.headers as Record<string, string>;
       const res = await runnerCallback.handleRunnerProgress({
         authorization: headers.Authorization,
@@ -1853,6 +1855,7 @@ describe("handleRunnerProgress", () => {
     const { RunSignalSender } = await import("../pipeline/run-signal.js");
     await new RunSignalSender("http://orchestrator.test", token, { fetchImpl, retryDelaysMs: [] }).signal("progress");
 
+    expect(urls).toEqual(["http://orchestrator.test/runner/progress"]);
     expect(responses.map((r) => r.status)).toEqual([200]);
     expect(kgRefreshClient.progress).toHaveBeenCalledWith(dispatchId);
   });
