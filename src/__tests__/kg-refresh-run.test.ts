@@ -2379,6 +2379,87 @@ describe("runKgRefresh", () => {
     expect(result.exitCode).toBe(1);
   });
 
+  describe("step progress reporting", () => {
+    const stepsOverride = () => ({
+      clone: makeStepModule({ workspaceDir: tmpDir, repoOwner: "org", repoRepo: "repo", githubToken: "tok", clonedRef: "abc" }),
+      kgIngest: makeStepModule({ statsFile: null }),
+      kgSnapshotPush: makeStepModule({ snapshotPushed: true, commitSha: "sha123" }),
+    });
+
+    function recorder(progressStatus = 200) {
+      const calls: Array<{ url: string; authorization?: string; kind: "progress" | "result" | "other" }> = [];
+      const fetchImpl = (async (url: string, init?: RequestInit) => {
+        const kind = url.endsWith("/runner/progress") ? "progress" : url.endsWith("/runner/result") ? "result" : "other";
+        calls.push({ url, authorization: (init?.headers as Record<string, string> | undefined)?.Authorization, kind });
+        const status = kind === "progress" ? progressStatus : 200;
+        return new Response(JSON.stringify({ acknowledged: true }), { status });
+      }) as unknown as typeof fetch;
+      return { calls, fetchImpl };
+    }
+
+    beforeEach(() => {
+      process.env.RUNNER_CALLBACK_URL = "http://orch";
+      process.env.RUN_TOKEN = "run-tok";
+      delete process.env.RUN_PROGRESS_TOKEN;
+      delete process.env.AI_IMPLEMENT_RUN_CONFIG;
+    });
+
+    it("posts step progress with the bearer token before the result", async () => {
+      process.env.RUN_PROGRESS_TOKEN = "  prog-tok  ";
+      const { calls, fetchImpl } = recorder();
+      const result = await runKgRefresh({ workspaceDir: tmpDir, stepsOverride: stepsOverride(), fetchImpl });
+      expect(result.exitCode).toBe(0);
+      const progress = calls.filter((c) => c.kind === "progress");
+      expect(progress.length).toBeGreaterThan(0);
+      expect(progress.every((c) => c.url === "http://orch/runner/progress" && c.authorization === "Bearer prog-tok")).toBe(true);
+      expect(calls.findIndex((c) => c.kind === "result")).toBeGreaterThan(calls.findIndex((c) => c.kind === "progress"));
+    });
+
+    it("sends no progress post without a token", async () => {
+      process.env.RUN_PROGRESS_TOKEN = "   ";
+      const { calls, fetchImpl } = recorder();
+      const result = await runKgRefresh({ workspaceDir: tmpDir, stepsOverride: stepsOverride(), fetchImpl });
+      expect(result.exitCode).toBe(0);
+      expect(calls.some((c) => c.kind === "progress")).toBe(false);
+    });
+
+    it("sends no progress post without a callback URL", async () => {
+      process.env.RUN_PROGRESS_TOKEN = "prog-tok";
+      delete process.env.RUNNER_CALLBACK_URL;
+      const { calls, fetchImpl } = recorder();
+      const result = await runKgRefresh({ workspaceDir: tmpDir, stepsOverride: stepsOverride(), fetchImpl });
+      expect(result.exitCode).toBe(0);
+      expect(calls).toEqual([]);
+    });
+
+    it("keeps exit code 0 when the progress post answers 409 no-refresh-in-flight", async () => {
+      process.env.RUN_PROGRESS_TOKEN = "prog-tok";
+      const { calls, fetchImpl } = recorder(409);
+      const result = await runKgRefresh({ workspaceDir: tmpDir, stepsOverride: stepsOverride(), fetchImpl });
+      expect(result.exitCode).toBe(0);
+      expect(calls.some((c) => c.kind === "progress")).toBe(true);
+    });
+
+    it("keeps exit code 0 when the progress post rejects", async () => {
+      process.env.RUN_PROGRESS_TOKEN = "prog-tok";
+      vi.spyOn(console, "error").mockImplementation(() => undefined);
+      // The reporter backs off 250/1000/2500 ms between attempts; collapse the delays.
+      const realSetTimeout = globalThis.setTimeout;
+      const timeoutSpy = vi.spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void, ms?: number) =>
+        realSetTimeout(fn, ms && ms >= 250 ? 0 : ms)) as unknown as typeof setTimeout);
+      const fetchImpl = (async (url: string) => {
+        if (url.endsWith("/runner/progress")) throw new Error("network down");
+        return new Response(JSON.stringify({ acknowledged: true }), { status: 200 });
+      }) as unknown as typeof fetch;
+      try {
+        const result = await runKgRefresh({ workspaceDir: tmpDir, stepsOverride: stepsOverride(), fetchImpl });
+        expect(result.exitCode).toBe(0);
+      } finally {
+        timeoutSpy.mockRestore();
+      }
+    });
+  });
+
   it("envelope kgSourceRepo survives decode and runnerPhase is kg-refresh", () => {
     const encoded = encodeRunConfig({
       v: 1,

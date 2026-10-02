@@ -6,7 +6,7 @@ import { postRunnerResult } from "../runner-result.js";
 import { DefaultPipelineContext } from "./context.js";
 import { PipelineRunner } from "./runner.js";
 import { loadPipelineDefinition } from "./pipeline-loader.js";
-import { NoopStepReporter } from "./reporter.js";
+import { NoopStepReporter, TokenStepReporter } from "./reporter.js";
 import { cloneStep } from "./steps/clone.js";
 import { dependencyAuthStep } from "./steps/dependency-auth.js";
 import { kgSnapshotPushStep, KgSnapshotMissingError, KgSnapshotStaleError, KgSnapshotTrackerRegressionError } from "./steps/kg-snapshot-push.js";
@@ -304,7 +304,13 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
   runner.register("kg-ingest", opts.stepsOverride?.kgIngest ?? kgIngestStep);
   runner.register("kg-snapshot-push", opts.stepsOverride?.kgSnapshotPush ?? kgSnapshotPushStep);
 
-  const reporter: StepReporter = opts.reporter ?? new NoopStepReporter();
+  // The token stays out of context.data: it is a live bearer secret. The local dev harness has none.
+  const progressToken = process.env.RUN_PROGRESS_TOKEN?.trim();
+  const reporter: StepReporter =
+    opts.reporter ??
+    (callbackUrl && progressToken
+      ? new TokenStepReporter(callbackUrl, progressToken, { fetchImpl: opts.fetchImpl })
+      : new NoopStepReporter());
 
   try {
     await runner.run(pipeline, context, reporter);
