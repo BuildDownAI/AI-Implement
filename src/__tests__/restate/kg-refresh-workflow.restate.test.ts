@@ -330,7 +330,7 @@ describe("KgRefresh durable workflow", () => {
     return true;
   }
 
-  const workflow = createKgRefreshWorkflow({
+  const workflowDeps: Omit<Parameters<typeof createKgRefreshWorkflow>[0], "bootstrapDeadlineMs" | "totalDeadlineMs"> = {
     rail,
     kgSourceRepo: KG_SOURCE_REPO,
     mintRunTokens: (input) => {
@@ -360,9 +360,17 @@ describe("KgRefresh durable workflow", () => {
       if (forcePersistFailure) throw new restate.TerminalError("forced persist failure for the outer-catch release test");
     },
     onOutcome: (kind, outcome) => { onOutcomeCalls.push({ kind, outcome }); },
+    watchIntervalMs: WATCH_INTERVAL_MS,
+  };
+  const workflow = createKgRefreshWorkflow({
+    ...workflowDeps,
+    bootstrapDeadlineMs: 30_000,
+    totalDeadlineMs: 60_000,
+  });
+  const deadlineWorkflow = createKgRefreshWorkflow({
+    ...workflowDeps,
     bootstrapDeadlineMs: BOOTSTRAP_DEADLINE_MS,
     totalDeadlineMs: TOTAL_DEADLINE_MS,
-    watchIntervalMs: WATCH_INTERVAL_MS,
   });
 
   const kgRepo = createKgRepo({ workflowName: "KgRefresh" });
@@ -395,16 +403,27 @@ describe("KgRefresh durable workflow", () => {
   }
 
   let envs: Map<string, RestateTestEnvironment>;
+  let deadlineEnvs: Map<string, RestateTestEnvironment>;
   beforeAll(async () => {
     envs = await startVariants([workflow, kgRepo, starter]);
-  }, 60_000);
+    deadlineEnvs = await startVariants([deadlineWorkflow, kgRepo, starter]);
+  }, 120_000);
   afterAll(async () => {
     if (envs) await stopAll(envs);
+    if (deadlineEnvs) await stopAll(deadlineEnvs);
   });
 
+  // A scenario that does not test a deadline runs in envFor, whose deadlines are long against its own work.
+  // A scenario that tests a deadline runs in deadlineEnvFor, which serves the short deadlines.
   function envFor(label: string): RestateTestEnvironment {
     const env = envs.get(label);
     if (!env) throw new Error(`missing Restate variant ${label}`);
+    return env;
+  }
+
+  function deadlineEnvFor(label: string): RestateTestEnvironment {
+    const env = deadlineEnvs.get(label);
+    if (!env) throw new Error(`missing Restate deadline variant ${label}`);
     return env;
   }
 
@@ -842,7 +861,7 @@ describe("KgRefresh durable workflow", () => {
   it.each(VARIANTS.map(([label]) => label))(
     "W3: no progress within the bootstrap deadline fails with a timed_out row and one outcome call (%s)",
     async (label) => {
-      const env = envFor(label);
+      const env = deadlineEnvFor(label);
       // Captured before the trigger (not after): the trigger's genericSend dispatches the
       // run immediately, and with a 1s bootstrap deadline a call recorded even a moment
       // late risks folding an already-fired outcome into the "before" snapshot instead of
@@ -868,7 +887,7 @@ describe("KgRefresh durable workflow", () => {
   it.each(VARIANTS.map(([label]) => label))(
     "W4: progress then no report within the total deadline fails timed out (%s)",
     async (label) => {
-      const env = envFor(label);
+      const env = deadlineEnvFor(label);
       const triggerId = newTriggerId();
       makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
 
@@ -1122,7 +1141,7 @@ describe("KgRefresh durable workflow", () => {
   it.each(VARIANTS.map(([label]) => label))(
     "AII-1010: a total timeout with a known run id cancels that run once, ends timed_out and releases the lock (%s)",
     async (label) => {
-      const env = envFor(label);
+      const env = deadlineEnvFor(label);
       const triggered = await triggerViaKgRepo(env.baseUrl());
       const triggerId = (triggered as { triggerId: string }).triggerId;
       const runId = runIdCounter++;
@@ -1149,7 +1168,7 @@ describe("KgRefresh durable workflow", () => {
   it.each(VARIANTS.map(([label]) => label))(
     "AII-1010: a terminal failure of the timeout's cancel call does not change the outcome (%s)",
     async (label) => {
-      const env = envFor(label);
+      const env = deadlineEnvFor(label);
       const triggerId = newTriggerId();
       makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "github-actions" });
       const beforeOutcome = onOutcomeCalls.length;
@@ -1172,7 +1191,7 @@ describe("KgRefresh durable workflow", () => {
   it.each(VARIANTS.map(([label]) => label))(
     "AII-1010: a report that is already there is taken as the result, not recorded as a timeout (%s)",
     async (label) => {
-      const env = envFor(label);
+      const env = deadlineEnvFor(label);
       const triggerId = newTriggerId();
       makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
       const done = runWorkflow(env.baseUrl(), triggerId, { dryRun: true });
@@ -1188,7 +1207,7 @@ describe("KgRefresh durable workflow", () => {
   it.each(VARIANTS.map(([label]) => label))(
     "AII-1010: a report resolved while the bootstrap deadline passes wins over bootstrap_timeout (%s)",
     async (label) => {
-      const env = envFor(label);
+      const env = deadlineEnvFor(label);
       const triggerId = newTriggerId();
       makeScenario(triggerId, {
         dispatchOutcome: "unknown", runId: undefined, executionMode: "github-actions", findByTitleResult: null,
@@ -1209,7 +1228,7 @@ describe("KgRefresh durable workflow", () => {
   it.each(VARIANTS.map(([label]) => label))(
     "AII-1010: progress resolved while the bootstrap deadline passes continues the wait instead of bootstrap_timeout (%s)",
     async (label) => {
-      const env = envFor(label);
+      const env = deadlineEnvFor(label);
       const triggerId = newTriggerId();
       makeScenario(triggerId, {
         dispatchOutcome: "unknown", runId: undefined, executionMode: "github-actions", findByTitleResult: null,
@@ -1258,7 +1277,7 @@ describe("KgRefresh durable workflow", () => {
   it.each(VARIANTS.map(([label]) => label))(
     "AII-1010: cancel with no run ever found completes within the bootstrap window, not the total deadline (%s)",
     async (label) => {
-      const env = envFor(label);
+      const env = deadlineEnvFor(label);
       const triggerId = newTriggerId();
       makeScenario(triggerId, { dispatchOutcome: "accepted", executionMode: "github-actions" });
       const done = runWorkflow(env.baseUrl(), triggerId);
@@ -1277,7 +1296,7 @@ describe("KgRefresh durable workflow", () => {
   it.each(VARIANTS.map(([label]) => label))(
     "AII-1010: a dry-run with a report target that ends by bootstrap_timeout gets a failure verdict and no persist or notify (%s)",
     async (label) => {
-      const env = envFor(label);
+      const env = deadlineEnvFor(label);
       const triggerId = newTriggerId();
       makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
       const report = { repo: KG_SOURCE_REPO, prNumber: 11, sha: "b".repeat(40) };

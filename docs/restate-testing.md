@@ -282,8 +282,9 @@ On the container runtime a restart remaps the ingress port, so every client must
 
 ## Timing rules
 
-Three flakes cost gap-fill rounds (a base URL captured before a restart, a scenario that outran a shortened
-wall-clock window, a `sys_invocation` read before a scheduled send was visible). Scenarios follow three rules, and
+Four flakes cost gap-fill rounds (a base URL captured before a restart, a scenario that outran a shortened
+wall-clock window, a `sys_invocation` read before a scheduled send was visible, a scenario that raced a deadline it
+did not test). Scenarios follow four rules, and
 `src/__tests__/restate-test-hygiene.test.ts` (default suite) fails on the patterns that break them in every
 `*.restate.test.ts` file not named in its `ALLOWLISTED_FILES`.
 
@@ -313,6 +314,10 @@ wall-clock window, a `sys_invocation` read before a scheduled send was visible).
    ```ts
    await eventually(() => clientFor(env).repoStatus(slug), (marker) => marker.status === "accepted");
    ```
+
+4. **A scenario that does not test a deadline runs with deadlines that are long against its own work; a scenario that
+   tests a deadline uses its own short-deadline environment.** `kg-refresh-workflow.restate.test.ts` serves both:
+   `envFor(label)` (30 s / 60 s) and `deadlineEnvFor(label)` (the short deadlines).
 
 `settle(ms)` is the only permitted wait, and only before a **negative** assertion ("nothing more happens"). A raw
 `setTimeout(` is allowed only inside a fake dependency that simulates a slow call, carrying a
