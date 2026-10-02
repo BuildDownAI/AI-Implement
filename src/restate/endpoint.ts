@@ -158,8 +158,12 @@ function sqlQuote(value: string): string {
  * neither deployment ID yet. For that last case, `sys_service` maps its target service
  * to the deployment currently serving it. Count all three forms, scoped to deployments
  * registered at this URI. `status != 'completed'` covers every other
- * non-terminal state (pending, scheduled, ready, running, backing-off) with one comparison
- * rather than an enumerated allowlist. Persistent Virtual Object state lives in the separate
+ * non-terminal state (pending, ready, running, backing-off, suspended, paused) with one
+ * comparison rather than an enumerated allowlist. `scheduled` is deliberately excluded: it is
+ * a delayed send whose timer has not fired, so it has no journal and no pinned deployment, and
+ * when it fires it starts as a new invocation on whichever deployment then serves the service.
+ * Counting it would hold a deploy for the whole delay — `KgRepo.expire` is scheduled
+ * 4 h 10 min out on every refresh trigger (AII-1031). Persistent Virtual Object state lives in the separate
  * `state` table and never appears in `sys_invocation`, so it is never counted — durable state
  * alone is not active work (AII-721).
  *
@@ -180,7 +184,7 @@ export async function queryNonCompletedInvocations(
     const rows = await runIntrospectionQuery(
       fetchImpl,
       adminBaseUrl,
-      "SELECT COUNT(*) AS count FROM sys_invocation WHERE status != 'completed' AND (" +
+      "SELECT COUNT(*) AS count FROM sys_invocation WHERE status != 'completed' AND status != 'scheduled' AND (" +
         `pinned_deployment_id IN ${oldDeployments} OR ` +
         `last_attempt_deployment_id IN ${oldDeployments} OR ` +
         "(pinned_deployment_id IS NULL AND last_attempt_deployment_id IS NULL AND " +

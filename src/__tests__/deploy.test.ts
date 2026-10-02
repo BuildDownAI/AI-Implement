@@ -181,6 +181,13 @@ describe("endpoint drain barrier", () => {
     await expect(deploy.waitForQuiet(0, 1, drain, () => [])).rejects.toThrow(/did not drain/);
   });
 
+  it("returns when no old-deployment invocation counts and nothing else is in flight", async () => {
+    const drain = coordinator(async () => 0);
+    drain.begin();
+    await deploy.waitForQuiet(1000, 1, drain, () => []);
+    expect(drain.snapshot().state).toBe("drained");
+  });
+
   it("waits for old-deployment invocations separately from runner occupancy", async () => {
     let count = 1;
     const drain = coordinator(async () => count-- > 0 ? 1 : 0);

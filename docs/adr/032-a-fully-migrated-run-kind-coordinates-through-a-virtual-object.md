@@ -17,6 +17,7 @@ We do not. A run kind that migrates whole coordinates through one Restate Virtua
 - `KgRepo`, keyed by the KG source repo slug, holds `inFlight = { triggerId, startedAt }` in object state. Its exclusive `trigger` handler answers `refresh-in-progress` while the marker is live, else mints the trigger id with `ctx.rand.uuidv4()`, sets the marker, and submits the `KgRefresh` workflow by one-way send. The workflow's terminal step sends `release`. A marker older than the total deadline plus a margin, read with `ctx.date.now()`, is stale and is cleared by the next `trigger`.
 - The workflow writes the `dispatch_log` row in one `ctx.run` because the row is run history: the Pipelines page, the in-flight banner, and `waitForQuiet` read it. The row is not the lock.
 - No `dispatch_admissions` row, no lifecycle-owner stamp, no `isRestateOwnedJob` fence for this run kind. The deploy drain already sees a running refresh twice: `waitForQuiet` counts kg-refresh rows, and `queryNonCompletedInvocations` counts the `KgRefresh` invocation itself.
+  - Amendment 2026-10-02 (AII-1031): the delayed `KgRepo.expire` call is not counted by the drain. `queryNonCompletedInvocations` excludes `scheduled` invocations, since a call that has not started has no journal and is not pinned to a deployment; counting it held every self-deploy for 4 h 10 min.
 
 The rule for later run kinds: shared admission is the mechanism for a run kind that competes for team capacity with another owner. A run kind with one owner and its own resource uses a Virtual Object.
 

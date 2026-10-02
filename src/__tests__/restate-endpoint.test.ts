@@ -288,6 +288,8 @@ describe("queryNonCompletedInvocations", () => {
     const body = JSON.parse(init.body as string) as { query: string };
     expect(body.query).toContain("http://127.0.0.1:9080");
     expect(body.query).toContain("status != 'completed'");
+    // A scheduled call has not started: no journal, no pinned deployment (AII-1031).
+    expect(body.query).toContain("status != 'scheduled'");
     expect(body.query).toContain("last_attempt_deployment_id");
     expect(body.query).toContain("target_service_name IN (SELECT name FROM sys_service");
   });
