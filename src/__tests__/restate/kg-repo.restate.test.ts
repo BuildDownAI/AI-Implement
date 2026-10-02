@@ -34,7 +34,7 @@ const privateCaller = restate.service({
       }),
   },
 });
-async function callPrivate(baseUrl: string, slug: string, handler: "release" | "expire" | "recordDryRunOutcome", body: unknown): Promise<unknown> {
+async function callPrivate(baseUrl: string, slug: string, handler: "release" | "expire" | "recordDryRunOutcome" | "recordAdminDryRun", body: unknown): Promise<unknown> {
   return callService<unknown>(baseUrl, "KgRepoPrivateCaller", "call", { slug, handler, body });
 }
 
@@ -454,6 +454,21 @@ describe("KgRepo durable single-flight lock", () => {
     callPrivate(baseUrl, slug, "recordDryRunOutcome", { report: reportFor(prNumber, sha), outcome: outcomeFor(prNumber) });
   const readOutcome = (baseUrl: string, slug: string, prNumber: number) =>
     callObject<{ sha: string; outcome: unknown } | null>(baseUrl, "KgRepo", slug, "dryRunOutcome", { repo: "org/kg-source", prNumber });
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "O0: recordAdminDryRun then lastAdminDryRun returns the outcome, last write wins, null when none; the per-PR key is untouched (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const slug = newKey();
+      const read = () => callObject<unknown>(env.baseUrl(), "KgRepo", slug, "lastAdminDryRun", undefined);
+      expect(await read()).toBeNull();
+      await callPrivate(env.baseUrl(), slug, "recordAdminDryRun", { outcome: outcomeFor(1) });
+      expect(await read()).toEqual(outcomeFor(1));
+      await callPrivate(env.baseUrl(), slug, "recordAdminDryRun", { outcome: outcomeFor(2) });
+      expect(await read()).toEqual(outcomeFor(2));
+      expect(await readOutcome(env.baseUrl(), slug, 1)).toBeNull();
+    },
+  );
 
   it.each(VARIANTS.map(([label]) => label))(
     "O1: recordDryRunOutcome then dryRunOutcome returns the same sha and outcome; an unknown PR is null (%s)",

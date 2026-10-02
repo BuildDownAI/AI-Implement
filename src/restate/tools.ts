@@ -444,7 +444,7 @@ export const getDeployPostureTool = tool(
 );
 
 export const GET_KG_STATUS_DESCRIPTION =
-  "Returns the KG refresh rail state: stage (idle | staging | ingest-running | serving | reverted | failed), the served snapshot stamp, the materialize path the next refresh will stage (rdflib | direct), and the last refresh outcome with its gate. Poll it after `POST /api/kg/refresh`.";
+  "Returns the KG refresh rail state: stage (idle | staging | ingest-running | serving | reverted | failed), the served snapshot stamp, the materialize path the next refresh will stage (rdflib | direct), the last refresh outcome with its gate, and lastDryRun (verdict and part table of the last dry-run with no PR report target, or null). The served stamp falls back to a live read when the last-refresh record carries none. Poll it after `POST /api/kg/refresh`.";
 
 // Type-only client handles: the real definitions are built with dependencies at boot
 // (createProductionKgRefreshServices); a client needs only the service name and handler types.
@@ -492,6 +492,21 @@ export const getKgStatusTool = tool(
     }
     const inFlight = await ctx.objectClient(KgRepo, toolDeps.kgSourceRepo).status();
     const lastRefresh = toolDeps.readStatusRecord();
+    const dryRun = await ctx.objectClient(KgRepo, toolDeps.kgSourceRepo).lastAdminDryRun();
+    const lastDryRun = dryRun
+      ? { ok: dryRun.ok, at: dryRun.at, detail: dryRun.detail, ...(dryRun.partTable ? { partTable: dryRun.partTable } : {}) }
+      : null;
+    let recordStamp = lastRefresh ? (lastRefresh.ok ? lastRefresh.stampAfter : lastRefresh.stampBefore) : null;
+    if (!recordStamp) {
+      // A failure before the rail leaves no stamp on the record while a graph still serves.
+      recordStamp = await ctx.run("read-served-stamp", async () => {
+        try {
+          return await toolDeps.readServedStamp();
+        } catch {
+          return null;
+        }
+      });
+    }
     let stage: KgRefreshStage;
     if (inFlight === null || inFlight === undefined) {
       stage = kgStageFromLastRefresh(lastRefresh);
@@ -513,8 +528,9 @@ export const getKgStatusTool = tool(
       deployHeld: toolDeps.isDeployHeld(),
       kgDegraded: isKgDegraded(),
       ...sidecarHealthFields(),
-      servedStamp: lastRefresh ? (lastRefresh.ok ? lastRefresh.stampAfter : lastRefresh.stampBefore) : null,
+      servedStamp: recordStamp ?? null,
       lastRefresh,
+      lastDryRun,
       stage,
       materialize: getKgMaterializeDirect() ? "direct" : "rdflib",
     };
@@ -697,7 +713,7 @@ function providerRegistryForTools(): ProviderRegistry {
 }
 
 export const TRIGGER_KG_REFRESH_DESCRIPTION =
-  "Trigger the KG refresh rail (admin role). Same handler as POST /api/kg/refresh: runs the credential preflight, then dispatches the refresh. Poll get_kg_status afterwards. dryRun=true runs the same runner job with kg-snapshot-push's push skipped — all guards run and the guard verdict plus per-part table are reported via get_kg_status, but nothing is pushed, no PR opens, and the served graph never changes. acceptNewBaseline=true downgrades the zero-shrink and 50%-shrink content guards to warnings for this one dispatch and pushes anyway — use only after reviewing a guard refusal's part table and confirming the shrink is an intentional reclassification, not data loss; the accepting identity's email is logged and written into the refresh PR's ### Baseline section.";
+  "Trigger the KG refresh rail (admin role). Same handler as POST /api/kg/refresh: runs the credential preflight, then dispatches the refresh. Poll get_kg_status afterwards. dryRun=true runs the same runner job with kg-snapshot-push's push skipped — all guards run and the guard verdict plus per-part table are reported via get_kg_status as lastDryRun (the last dry-run with no PR report target; it never writes lastRefresh), but nothing is pushed, no PR opens, and the served graph never changes. acceptNewBaseline=true downgrades the zero-shrink and 50%-shrink content guards to warnings for this one dispatch and pushes anyway — use only after reviewing a guard refusal's part table and confirming the shrink is an intentional reclassification, not data loss; the accepting identity's email is logged and written into the refresh PR's ### Baseline section.";
 
 export const triggerKgRefreshTool = tool(
   {
