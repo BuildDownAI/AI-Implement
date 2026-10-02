@@ -470,7 +470,7 @@ Three outcomes:
 - `"no-new-data"` → `KG Refresh: graph is current — no new data to ingest`
 - `"failure"` → `:x: KG Refresh failed` + summary/detail from `classifyCompletion`
 
-`KG_SNAPSHOT_STALE` maps to `"no-new-data"` inside the workflow's report handling. The benign `"no-new-data"` outcome still sends a notification (it is informational); only `operator_cancelled` suppresses the notification entirely.
+The workflow passes the kind and a meta object (`failureCode`, `timedOut`, `dispatchId`) to `onOutcome` explicitly; no text match decides the kind. The `KG_SNAPSHOT_STALE` branch and the rail's `ingest-needed` gate send `"no-new-data"` whatever the runner's `failureReason` says; the two timeout conclusions (`bootstrap_timeout`, `timed_out`) send `"failure"` with `timedOut: true`, which `classifyCompletion` turns into the time-limit summary. Every failure carries its conclusion as `failureCode`. The benign `"no-new-data"` outcome still sends a notification (it is informational). The workflow's cancel path skips `onOutcome` altogether, and `handleKgRefreshOutcome` also returns early on `operator_cancelled`; a dry-run sends no operator notification.
 
 ### No retry storm
 

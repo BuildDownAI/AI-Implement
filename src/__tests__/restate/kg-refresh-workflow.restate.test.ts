@@ -256,7 +256,7 @@ describe("KgRefresh durable workflow", () => {
   const mintedDispatchIds: string[] = [];
   const closeRowCalls: Array<{ jobId: string; status: string; conclusion?: string }> = [];
   const persistCalls: RefreshOutcome[] = [];
-  const onOutcomeCalls: Array<{ kind: "success" | "failure"; outcome: RefreshOutcome }> = [];
+  const onOutcomeCalls: Array<{ kind: "success" | "no-new-data" | "failure"; outcome: RefreshOutcome; meta: { failureCode?: string; timedOut?: boolean; dispatchId?: string } }> = [];
   let runIdCounter = 9_000;
 
   function newTriggerId(): string {
@@ -367,7 +367,7 @@ describe("KgRefresh durable workflow", () => {
       persistCalls.push(outcome);
       if (forcePersistFailure) throw new restate.TerminalError("forced persist failure for the outer-catch release test");
     },
-    onOutcome: (kind, outcome) => { onOutcomeCalls.push({ kind, outcome }); },
+    onOutcome: (kind, outcome, meta) => { onOutcomeCalls.push({ kind, outcome, meta }); },
     watchIntervalMs: WATCH_INTERVAL_MS,
   };
   const workflow = createKgRefreshWorkflow({
@@ -558,7 +558,7 @@ describe("KgRefresh durable workflow", () => {
       expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(1);
       expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "completed" });
       expect(onOutcomeCalls.length - beforeOutcome).toBe(1);
-      expect(onOutcomeCalls[onOutcomeCalls.length - 1].kind).toBe("success");
+      expect(onOutcomeCalls[onOutcomeCalls.length - 1]).toMatchObject({ kind: "no-new-data", meta: { failureCode: "ingest-needed" } });
       // no stage/swap/verify/revert: the sidecar never restarts, nothing is persisted again,
       // and no staging directory is ever created.
       expect(restartCallCount - beforeRestart).toBe(0);
@@ -723,7 +723,8 @@ describe("KgRefresh durable workflow", () => {
       expect(materializeCallCount - beforeMaterialize).toBe(0);
       expect(restartCallCount - beforeRestart).toBe(0);
       expect(onOutcomeCalls.length - beforeOutcome).toBe(1);
-      expect(onOutcomeCalls[onOutcomeCalls.length - 1].kind).toBe("failure");
+      expect(onOutcomeCalls[onOutcomeCalls.length - 1]).toMatchObject({ kind: "failure", meta: { failureCode: "merge_failed" } });
+      expect(onOutcomeCalls[onOutcomeCalls.length - 1].meta.timedOut).toBeUndefined();
       await eventually(() => kgRepoStatus(env.baseUrl()), (marker) => marker === null, { label: "KgRepo marker cleared" });
     },
     15_000,
@@ -908,7 +909,7 @@ describe("KgRefresh durable workflow", () => {
       expect(outcome.ok).toBe(false);
       expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "timed_out", conclusion: "bootstrap_timeout" });
       expect(onOutcomeCalls.length - beforeOutcome).toBe(1);
-      expect(onOutcomeCalls[onOutcomeCalls.length - 1].kind).toBe("failure");
+      expect(onOutcomeCalls[onOutcomeCalls.length - 1]).toMatchObject({ kind: "failure", meta: { failureCode: "bootstrap_timeout", timedOut: true } });
       await eventually(() => kgRepoStatus(env.baseUrl()), (marker) => marker === null, { label: "KgRepo marker cleared" });
     },
     15_000,
@@ -997,7 +998,7 @@ describe("KgRefresh durable workflow", () => {
       findRunByTitle: findRunByTitleFn,
       cancelWorkflowRun: cancelWorkflowRunFn,
       persistLastRefresh: (outcome) => { persistCalls.push(outcome); },
-      onOutcome: (kind, outcome) => { onOutcomeCalls.push({ kind, outcome }); },
+      onOutcome: (kind, outcome, meta) => { onOutcomeCalls.push({ kind, outcome, meta }); },
       bootstrapDeadlineMs: scaledTick * 4,
       totalDeadlineMs: scaledTick * 24,
       watchIntervalMs: scaledTick,
@@ -1122,7 +1123,7 @@ describe("KgRefresh durable workflow", () => {
       findRunByTitle: findRunByTitleFn,
       cancelWorkflowRun: cancelWorkflowRunFn,
       persistLastRefresh: (outcome) => { persistCalls.push(outcome); },
-      onOutcome: (kind, outcome) => { onOutcomeCalls.push({ kind, outcome }); },
+      onOutcome: (kind, outcome, meta) => { onOutcomeCalls.push({ kind, outcome, meta }); },
       bootstrapDeadlineMs: 1_000,
       totalDeadlineMs: 5_000,
       watchIntervalMs: 100,
@@ -1717,7 +1718,7 @@ describe("KgRefresh durable workflow", () => {
       expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(0);
       expect(closeRowCalls[closeRowCalls.length - 1].status).toBe("completed");
       expect(onOutcomeCalls.length - beforeOutcome).toBe(1);
-      expect(onOutcomeCalls[onOutcomeCalls.length - 1].kind).toBe("success");
+      expect(onOutcomeCalls[onOutcomeCalls.length - 1]).toMatchObject({ kind: "no-new-data", meta: { failureCode: "KG_SNAPSHOT_STALE" } });
     },
     15_000,
   );
@@ -1831,7 +1832,7 @@ describe("KgRefresh durable workflow", () => {
       findRunByTitle: findRunByTitleFn,
       cancelWorkflowRun: cancelWorkflowRunFn,
       persistLastRefresh: (outcome) => { persistCalls.push(outcome); },
-      onOutcome: (kind, outcome) => { onOutcomeCalls.push({ kind, outcome }); },
+      onOutcome: (kind, outcome, meta) => { onOutcomeCalls.push({ kind, outcome, meta }); },
       afterStageCommitted: async () => {
         stageCommittedAttempts.push(endpointId);
         if (stageCommittedAttempts.length === 1) await latch;
