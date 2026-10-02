@@ -60,3 +60,9 @@ Easier: a new run kind copies one wait with a fixed list of signals. A missing p
 Harder: each new signal costs a producer comment and a contract test. On GitHub Actions the bootstrap deadline now measures "the run left the queue", not "the runner pipeline reported a step"; a run that starts and then stops with no report is found by the status read (`dispatch_lost`) or the total deadline.
 
 Rule for later run kinds: before a workflow waits for a signal, write its row in the signal table, name the producer, and write the contract test. If the orchestrator can read the same fact itself, that read is a source too.
+
+## Amendment (2026-10-02): awakeables, and new signals for later run kinds
+
+**Awakeables.** The alternative "An awakeable for each run" above was rejected for its registry. With the id sent in the `run_config` envelope, no registry is needed (ADR 033, amendment of 2026-10-02). An awakeable resolved through the verify-only runner callback is therefore a permitted primitive for an owned-run wait. Rules 3 and 4 apply to it unchanged: a named producer in production code and a contract test from that producer to the real route handler.
+
+**The signal table.** "These signals and no others" is the contract for kg-refresh. A later run kind may add a signal, for example one per pipeline step, if each new signal has a row in its own signal table, a named producer, and a contract test. Re-check this ADR's rules against the new run kind before relying on them (`docs/standing-rules.md` rule 3).

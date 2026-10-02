@@ -46,3 +46,15 @@ Easier: kg-refresh behaves the same on each deployment with no setup. A dead run
 Harder: the workflow writes one status read to its journal for each minute of a run. A long run (the limit is 4 hours) has a longer journal than with the event. The detection time has a floor of one interval; it is not instant.
 
 Rule for later run kinds: before a design adds a signal, a permission, or a setting on the customer side, name the channel that is already required and use it. If a customer-side step remains, the plan must name it and must state what the design gives with zero setup.
+
+## Amendment (2026-10-02): an awakeable is allowed when it needs no new right
+
+**Context.** The awakeable of AII-974 failed this ADR because its resolver was the `workflow_run` webhook, which needs a GitHub App event subscription at each deployment. The awakeable itself needs no GitHub right. The second alternative above ("keep the awakeable and resolve it from the runner callback") was rejected for a different reason: the `settings` registry that mapped a run id to an awakeable id.
+
+**Decision.** An awakeable is a permitted primitive when its resolver uses a channel from the list above (for a runner signal: the runner callback route, authenticated by the run token). The registry is not needed: the workflow creates the awakeable before the dispatch and sends its id in the `run_config` envelope (a level-2 change in `docs/standing-rules.md`, no template change). The id is not a credential, because the Restate ingress binds loopback (ADR 023) and the authenticated callback route is the only way to reach it.
+
+Use a workflow promise when the sender knows the workflow key (the kg-refresh `report` today). Use an awakeable when the wait is not in a workflow, or when one run has many waits (for example one per pipeline step).
+
+**Evidence.** An experiment against the pinned versions (`restate-server` 1.7.10, `restate-sdk` 1.17.1) on 2026-10-02: a workflow created three awakeables, wrote their ids to a stand-in dispatch envelope, and waited. An outside process resolved each id through `POST /restate/awakeables/{id}/resolve` on the ingress (HTTP 202 for each), and the workflow completed with the three values. No registry was written.
+
+The rule of this ADR does not change: no design may need a new App permission, event subscription, or repository setting. See `docs/standing-rules.md` rule 2.
