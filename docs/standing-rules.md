@@ -24,7 +24,7 @@ Cost order, from the cheapest to the most expensive. Pick the cheapest level tha
 | 1 | Orchestrator code or runner image only | Nobody outside our deploy | `docs/deployment.md` |
 | 2 | A new field inside the `run_config` envelope | Nobody: the synced template already passes the envelope | `docs/workflow-envelope.md` |
 | 3 | A change to a synced workflow template (a new `workflow_dispatch` input, a new step, a new `permissions:` entry) | Each target repo merges a sync PR | `docs/workflow-sync.md` |
-| 4 | A new GitHub App permission or event subscription, or a repository setting | An org owner at each installation accepts the change | `docs/deployment.md` § "GitHub App permissions", ADR 033 |
+| 4 | A new GitHub App permission, a new GitHub App event subscription, or a repository setting | The owner of each orchestrator's GitHub App changes the App settings (one App per orchestrator). A new permission also needs an org owner at each installation to accept it | `docs/deployment.md` § "GitHub App permissions", ADR 033 |
 
 A design at level 3 or 4 needs an explicit decision by the operator before it is planned in detail. ADR 033 is the rule for run signals; this rule applies to every feature.
 
@@ -36,6 +36,6 @@ Many ADRs record a decision for the context of their date: the first run kind on
 
 * Before a new Restate design relies on an ADR rule, or is blocked by one, read the ADR's **Context** and the reason for each rejected alternative. Check that the reason still holds today, in code or by experiment (rule 1).
 * If the reason no longer holds, say so in the plan and add a dated amendment to the ADR. If the reason still holds, a one-line note in the plan is enough.
-* A rejected alternative is rejected for its stated reason only. Example: awakeables were removed from kg-refresh because the resolver needed a GitHub App event subscription (`workflow_run`). An awakeable that needs no new right is allowed (ADR 033 and ADR 034, amendments of 2026-10-02).
+* A rejected alternative is rejected for its stated reason only. Example: awakeables were removed from kg-refresh because the resolver was the `workflow_run` webhook, which needs a new GitHub App event subscription. The permission behind that event (Actions, read) was already held; the event subscription was the only missing right. An awakeable that needs no new right is allowed (ADR 033 and ADR 034, amendments of 2026-10-02).
 
 The Restate-related ADRs today: 017, 018, 023, 025, 030, 031, 032, 033, 034.
