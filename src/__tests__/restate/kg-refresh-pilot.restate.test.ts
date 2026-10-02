@@ -308,6 +308,12 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
     await untilMarkerClear(client);
   }
 
+  // AII-1029 (no scenario here, deliberately): "a GHA run whose status reads `in_progress`, with no progress
+  // callback, is not ended by the bootstrap deadline" cannot run on this composition. The production wiring
+  // leaves `bootstrapDeadlineMs` unset, so the real ten-minute deadline applies and the test environment has
+  // no virtual clock. The scenario is covered with a shortened deadline in kg-refresh-workflow.restate.test.ts
+  // ("in_progress status reads with no progress call outlive the bootstrap deadline").
+
   // P1 -------------------------------------------------------------------------------
   it.each(VARIANTS.map(([label]) => label))("P1: trigger, real callback report, success path (%s)", async (label) => {
     const env = envFor(label);
