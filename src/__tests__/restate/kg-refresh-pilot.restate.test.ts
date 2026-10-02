@@ -491,10 +491,15 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
     const env = envFor(label);
     const client = clientFor(env);
     const admin = makeKgRefreshAdminDeps(KG_SOURCE_REPO, client, asSystem(env) as typeof callToolAsSystem);
-    await triggerRefresh(env);
+    const triggerId = await triggerRefresh(env);
     await eventually(dispatched, (ok) => ok, { label: "dispatch", timeoutMs: 15_000 });
 
-    expect(await admin.cancel({ jobId: 0, reason: "operator" })).toEqual({ status: 200, body: { cancelled: true } });
+    // A dispatch id no workflow has answers 409 and leaves the marker set.
+    expect(await admin.cancel({ jobId: 0, dispatchId: "no-such-dispatch", reason: "operator" })).toEqual({ status: 409, body: { error: "no-refresh-in-flight" } });
+    expect(await markerOf(client)).not.toBeNull();
+    expect(gh.cancelCalls).toHaveLength(0);
+
+    expect(await admin.cancel({ jobId: 0, dispatchId: triggerId, reason: "operator" })).toEqual({ status: 200, body: { cancelled: true } });
     await eventually(() => gh.cancelCalls.length === 1, (ok) => ok, { label: "durable effect", timeoutMs: 15_000 });
     const polled = gh.statusCalls.length;
     await eventually(() => gh.statusCalls.length >= polled + 2, (ok) => ok, { label: "durable effect", timeoutMs: 15_000 }); // the cancel watch keeps reading in_progress
