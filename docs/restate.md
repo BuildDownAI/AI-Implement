@@ -316,7 +316,7 @@ A run kind's services live in `src/restate/<kind>-workflow.ts` and `src/restate/
 - **One door.** The run kind's trigger is one tool handler on `orchestratorTools`. It runs the synchronous checks inside `ctx.run` and calls the object with `ctx.objectClient`. The REST route calls the same handler through `callToolAsSystem` (ADR 025 amendment, 2026-09-28).
 - **No I/O in the body.** Every effect — dispatch, GitHub, SQLite, notify — is a plain function in the deps object, called inside a named `ctx.run` with a bounded retry policy. Replay never repeats a completed step.
 - **Exact run identity.** Dispatch with `returnRunDetails: true`; an `unknown` outcome reconciles by exact run title, never by a second dispatch.
-- **Timers replace sweeps and monitors.** A bootstrap deadline to the first progress signal and a total deadline to the report, with durable promises and `.orTimeout`. On the GHA backend the workflow watches the run's conclusion itself. The run kind adds no reaper rule, no monitor module, and no settings-backed state.
+- **Timers replace sweeps and monitors.** The run kind waits with the owned-run wait: workflow promises raced against a durable timer, two deadlines, and no reaper rule, monitor module, or settings-backed state. See [The owned-run wait](#the-owned-run-wait) and [ADR 034](adr/034-an-owned-run-wait-names-each-signal-and-its-producer.md).
 - **The rail is a saga.** One `ctx.run` per gate and `revert` as the compensation; replay resumes at the gate that did not finish; `status` names the gate.
 - **Cancel waits for termination.** `cancel` revokes nothing by itself: the workflow requests the backend cancellation and holds the marker until the run concludes.
 - **One authenticated route per external event.** A GitHub webhook, a runner callback, or an admin REST call enters through one orchestrator route. The route checks the sender (HMAC signature, run token, or admin session) and forwards to the handler over the loopback ingress, with the sender's own identity for the event as `idempotency-key` (`x-github-delivery`, the dispatch id). Restate persists, deduplicates, and completes. The route holds no inbox table, no queue, and no retry loop (ADR 023 amendment, 2026-09-29). The forward goes through the SDK ingress client (`@restatedev/restate-sdk-clients`, `createKgRefreshIngressClient` for kg-refresh): typed `workflowClient` / `objectClient` handles, `rpc.opts({ idempotencyKey, timeout })`, and the HTTP status decides the outcome — a `409` from `report` is `conflict` (the workflow throws `TerminalError` with `errorCode: 409`), `404` is `not-found`, and a connection error or timeout is `unavailable`.
@@ -325,3 +325,22 @@ A run kind's services live in `src/restate/<kind>-workflow.ts` and `src/restate/
 - **SQLite stays the system of record.** The workflow writes the dispatch row, the run record, and the conclusion. Restate holds position and the in-flight marker.
 - **Retention.** One constant per run kind for workflow, journal, and idempotency retention (7 days for kg-refresh).
 - **Tests.** Two scenario files on the shared harness with fakes, plus one production-composed file with real SQLite and simulated GitHub (`src/__tests__/restate/kg-refresh-pilot.restate.test.ts`).
+
+### The owned-run wait
+
+A workflow that owns a run outside Restate (a GitHub Actions run, a Fly machine) waits with the Restate pattern "workflow promise raced against a durable timer" ([Timers and Scheduling](https://docs.restate.dev/tour/workflows#timers-and-scheduling), [External events](https://docs.restate.dev/develop/ts/external-events#choose-a-primitive)). The contract is [ADR 034](adr/034-an-owned-run-wait-names-each-signal-and-its-producer.md).
+
+| Signal | Primitive | Meaning | Resolved |
+|---|---|---|---|
+| result | workflow promise `report` | the run ended and gave its result | one time, by the verify-only runner callback |
+| started evidence | workflow promise `progress` | the run executes | one time, by the first proof from any source |
+| stop request | workflow promise `cancel` | an operator or a newer trigger stops the run | one time |
+| tick | durable timer (`ctx.sleep`) | time for the next status read or a deadline check | each interval |
+
+Two durable deadlines, both computed from the journaled dispatch time: the bootstrap deadline (10 minutes) to the started evidence, and the total deadline (4 hours) to the result. At a deadline the workflow first peeks at the promises, so a signal that arrived at the same moment wins. A timeout cancels the run on its backend.
+
+Three rules:
+
+1. **Named producer.** Each signal has a named producer in production code. A handler and a route are not a producer. The comment at each promise names the module that resolves it.
+2. **Contract test.** Each producer has one default-suite test that starts from the real producer code and ends at the real route handler. A scenario that resolves the promise from the test body does not count.
+3. **A source the orchestrator owns.** When the backend allows it, started evidence has a source the orchestrator reads itself. For kg-refresh on GitHub Actions, a `watch` status read of `in_progress` counts as started evidence (`queued` does not); on Fly machines the runner's progress callback is the only source.

@@ -31,7 +31,7 @@ flowchart TD
     O -->|"one-way send"| W["KgRefresh.run\nreserve → dispatch"]
     W --> E["GitHub Actions, Fly Machine,\nor local Docker"]
     E --> F["runner pipeline\nclone → kg-scope-reconcile → dependency-auth → clone-code-repo → clone-secondary-repos\n→ kg-tracker-data → kg-ingest → kg-snapshot-push"]
-    W --> T["wait: report | cancel | progress\nbootstrap deadline 10 min, total deadline 4 h\nGHA: watch the run's status"]
+    W --> T["wait: report | cancel | progress\nbootstrap deadline 10 min, total deadline 4 h\nGHA: watch the run's status;\nstarted evidence = status in_progress\nor the runner progress heartbeat, first wins"]
     F -->|"progress heartbeat"| T
     F -->|"POST /api/runner/result"| G["KgRefresh.report\nidempotency key = dispatch id"]
     G --> T
@@ -350,7 +350,7 @@ The workflow waits on a race of durable promises and timers: `report`, `cancel`,
 | Bootstrap | 10 min (`KG_REFRESH_BOOTSTRAP_DEADLINE_MS`) | dispatch, until the first `progress` heartbeat | `bootstrap_timeout` |
 | Total | 4 h (`KG_REFRESH_TOTAL_DEADLINE_MS`) | dispatch, until the `report` | `timed_out` |
 
-A `progress` heartbeat from the runner moves the workflow from the bootstrap deadline to the total deadline. Both expiries close the row as `timed_out` and notify with "KG Refresh hit the time limit." (§8). Before it gives up, the wait takes a `report` that is already resolved (and, for the bootstrap deadline, a `progress` that is) over the timeout, and on GitHub Actions a timeout with a known run id cancels that run (`cancel-run`, bounded to three attempts, a failure only logged) so the lock does not open beside a live run.
+Started evidence moves the workflow from the bootstrap deadline to the total deadline. On GitHub Actions it comes from either of two sources, whichever comes first: the workflow's own status read showing the run `in_progress` (`queued` does not count), or the runner's `progress` heartbeat. On other backends the heartbeat is the source. See [ADR 034](adr/034-an-owned-run-wait-names-each-signal-and-its-producer.md). Both expiries close the row as `timed_out` and notify with "KG Refresh hit the time limit." (§8). Before it gives up, the wait takes a `report` that is already resolved (and, for the bootstrap deadline, a `progress` that is) over the timeout, and on GitHub Actions a timeout with a known run id cancels that run (`cancel-run`, bounded to three attempts, a failure only logged) so the lock does not open beside a live run.
 
 On the GitHub Actions backend the workflow also **watches the run itself**, by one status read of the exact run each 60 seconds (`KG_REFRESH_WATCH_INTERVAL_MS`, about 240 per 4 h run). Each tick it reads the run's status inside a `watch-N` step, or reconciles the run by title inside a `reconcile-N` step while no run id is known. A run whose status is `completed` with no report in hand ends as `dispatch_lost` and carries the GitHub conclusion in its detail. No GitHub App event subscription or other customer-side setup is necessary ([ADR 033](adr/033-a-run-signal-uses-a-channel-every-deployment-already-has.md)). No reaper rule and no monitor module exist for this run kind, and no settings-backed state is kept for the watch; the stuck-watchdog and reaper skip kg-refresh rows (below).
 
