@@ -328,6 +328,8 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
               }
             } else {
               const status = await ctx.run(`watch-${watchIndex++}`, () => deps.getWorkflowRunStatus(runId!));
+              // Started evidence the orchestrator owns (ADR 034): the run left the queue. `queued` does not count.
+              if (status.status === "in_progress") progressSeen = true;
               if (status.status === "completed") {
                 const reportNow = await ctx.promise<KgRefreshReportBody>("report").peek();
                 if (reportNow !== undefined) return { kind: "report", value: reportNow };
@@ -629,6 +631,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
   async function report(ctx: WorkflowSharedContext, raw: unknown): Promise<{ status: "accepted" | "duplicate" }> {
     const body = raw as KgRefreshReportBody;
     await requireStarted(ctx);
+    // Producer: handleRunnerResult in src/runner-callback.ts (the verify-only runner callback).
     const promise = ctx.promise<KgRefreshReportBody>("report");
     const existing = await promise.peek();
     const isDuplicate = existing !== undefined && JSON.stringify(existing) === JSON.stringify(body);
@@ -654,6 +657,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
 
   async function progress(ctx: WorkflowSharedContext): Promise<void> {
     await requireStarted(ctx);
+    // Producers: handleRunnerProgress in src/runner-callback.ts, and the `watch` read in waitForOutcome (this file).
     const promise = ctx.promise<boolean>("progress");
     if (await promise.peek() === undefined) await promise.resolve(true);
   }
@@ -661,6 +665,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
   async function cancel(ctx: WorkflowSharedContext, raw: { reason?: string }): Promise<void> {
     await requireStarted(ctx);
     const reason = raw?.reason ?? "cancelled";
+    // Producer: the callers of this `cancel` handler (operator stop and newer-trigger paths).
     const promise = ctx.promise<string>("cancel");
     if (await promise.peek() === undefined) await promise.resolve(reason);
   }

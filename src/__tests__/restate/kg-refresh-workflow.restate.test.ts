@@ -1137,6 +1137,47 @@ describe("KgRefresh durable workflow", () => {
     15_000,
   );
 
+  // ---- AII-1029: a status read that shows the run executing is started evidence ----
+  it.each(VARIANTS.map(([label]) => label))(
+    "AII-1029: GHA backend — in_progress status reads with no progress call outlive the bootstrap deadline (%s)",
+    async (label) => {
+      const env = deadlineEnvFor(label);
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, {
+        dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "github-actions",
+        runStatusSequence: [{ status: "in_progress", conclusion: null }],
+      });
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
+      // Past the 1s bootstrap deadline and still before the total deadline.
+      await settle(BOOTSTRAP_DEADLINE_MS + 400);
+      expect(scenarios.get(triggerId)!.cancelCalls).toBe(0);
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+
+      const outcome = await done;
+      expect(outcome.ok).toBe(true);
+      expect(closeRowCalls[closeRowCalls.length - 1].conclusion).not.toBe("bootstrap_timeout");
+    },
+    15_000,
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "AII-1029: GHA backend — a run that stays queued with no progress ends bootstrap_timeout and is cancelled once (%s)",
+    async (label) => {
+      const env = deadlineEnvFor(label);
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, {
+        dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "github-actions",
+        runStatusSequence: [{ status: "queued", conclusion: null }],
+      });
+      const outcome = await runWorkflow(env.baseUrl(), triggerId);
+      expect(outcome.ok).toBe(false);
+      expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "timed_out", conclusion: "bootstrap_timeout" });
+      expect(scenarios.get(triggerId)!.cancelCalls).toBe(1);
+    },
+    15_000,
+  );
+
   // ---- AII-1010: failure paths stop the run, keep a reported result, and give a dry-run a verdict ----
   it.each(VARIANTS.map(([label]) => label))(
     "AII-1010: a total timeout with a known run id cancels that run once, ends timed_out and releases the lock (%s)",
