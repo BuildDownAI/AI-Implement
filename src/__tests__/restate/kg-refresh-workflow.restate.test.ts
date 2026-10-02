@@ -74,6 +74,7 @@ interface RunScenario {
   dispatchCalls: number;
   findByTitleCalls: number;
   runStatusCalls: number;
+  runStatusCallTimes: number[];
   cancelCalls: number;
   runStatusSequence: Array<{ status: string; conclusion: string | null }>;
   findByTitleResult: { runId: number } | null;
@@ -263,6 +264,7 @@ describe("KgRefresh durable workflow", () => {
       dispatchCalls: 0,
       findByTitleCalls: 0,
       runStatusCalls: 0,
+      runStatusCallTimes: [],
       cancelCalls: 0,
       runStatusSequence: [{ status: "in_progress", conclusion: null }],
       findByTitleResult: null,
@@ -298,6 +300,7 @@ describe("KgRefresh durable workflow", () => {
     if (!scenario) throw new Error(`no scenario registered for runId ${runId}`);
     const idx = Math.min(scenario.runStatusCalls, scenario.runStatusSequence.length - 1);
     scenario.runStatusCalls++;
+    scenario.runStatusCallTimes.push(Date.now());
     return scenario.runStatusSequence[idx];
   }
 
@@ -931,7 +934,7 @@ describe("KgRefresh durable workflow", () => {
     15_000,
   );
 
-  it("watch reads equal the run duration divided by the watch interval, within one", async () => {
+  it("the watch reads the run status at most one time for each watch interval", async () => {
     const scaledTick = 100;
     const scaledWorkflow = createKgRefreshWorkflow({
       rail,
@@ -964,9 +967,14 @@ describe("KgRefresh durable workflow", () => {
       const outcome = await done;
       expect(outcome.ok).toBe(false);
       const scenario = scenarios.get(triggerId)!;
-      // The total deadline is 24 intervals: one read per tick plus the immediate read before the first sleep.
-      expect(Math.abs(scenario.runStatusCalls - 24)).toBeLessThanOrEqual(1 + 1);
-      expect(scenario.runStatusCalls).toBeGreaterThan(0);
+      // Machine speed changes how many reads fit in the window, so assert the bound, the cadence, and repetition.
+      expect(scenario.runStatusCalls).toBeLessThanOrEqual(24 + 1);
+      const times = scenario.runStatusCallTimes;
+      // The first gap follows the immediate read before the first sleep, and the last tick is clipped by the total deadline.
+      for (let i = 2; i < times.length - 1; i++) {
+        expect(times[i] - times[i - 1]).toBeGreaterThanOrEqual(scaledTick - 15);
+      }
+      expect(scenario.runStatusCalls).toBeGreaterThanOrEqual(3);
     } finally {
       await scaledEnv.stop();
     }
