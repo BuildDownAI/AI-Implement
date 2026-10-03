@@ -2229,6 +2229,59 @@ describe("runAutonomous", () => {
     expect(body.failure).toEqual(providerFailure);
   });
 
+  it("keeps MAX_TURNS_EXHAUSTED but words the run result as unfinished, not unapproved", async () => {
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { pipeline, runner } = makeStepsPipeline([
+      [
+        "feedback-loop",
+        {
+          run: vi.fn().mockResolvedValue({
+            approved: false,
+            iterations: 2,
+            finalFeedback: "Implementation hit the turn cap.",
+            terminationReason: "max_turns",
+            passes: [],
+          }),
+        },
+      ],
+      [
+        "push",
+        {
+          run: vi.fn().mockResolvedValue({
+            prUrl: "https://github.com/o/r/pull/12",
+            prNumber: 12,
+            branchPushed: true,
+            draft: true,
+          }),
+        },
+      ],
+      ["post-push-review", { run: vi.fn().mockResolvedValue({}) }],
+    ]);
+    pipeline.steps[2].skip = () => true;
+
+    const result = await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+      fetchImpl: mockFetch,
+    });
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as { failureCode: string; failureReason: string };
+    expect(body.failureCode).toBe("MAX_TURNS_EXHAUSTED");
+    expect(body.failureReason).toMatch(/^The implementation did not finish within its turn budget \(after 2 iteration\(s\)\)\. /);
+    expect(body.failureReason).not.toContain("did not approve");
+    const warning = warn.mock.calls.map((c) => String(c[0])).find((m) => m.includes("ran out of turns"));
+    expect(warning).toBe("::warning::AI-Implement: implementation ran out of turns after 2 iteration(s) (max_turns) — draft PR opened: https://github.com/o/r/pull/12");
+    expect(result.disposition ?? "").not.toContain("review unapproved");
+    warn.mockRestore();
+  });
+
   it("uses REVIEWER_TURNS_EXHAUSTED with the classified failure when the post-push reviewer exhausts its turn cap", async () => {
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
     vi.stubEnv("RUN_TOKEN", "run-token");
