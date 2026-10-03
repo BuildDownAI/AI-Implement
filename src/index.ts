@@ -24,7 +24,7 @@ import {
 } from "./dispatch-admission.js";
 import { reconcileFilesystemFailures } from "./filesystem-ticket-lifecycle.js";
 import { dispatchWorkflow, postWorkflowDispatch, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, getPullRequestState, buildEnvelopeDispatchInputs, postPrComment, defaultFetchSignal, getRepoDefaultBranch, fetchRepoTarball, mergePullRequest, closePullRequest, deleteBranch, postOrUpdateStickyComment, setCommitStatus, cancelWorkflowRun, type DispatchInputs } from "./github.js";
-import { resolveWorkflowCapabilities, resolveWorkflowContract, type WorkflowContract } from "./workflow-probe.js";
+import { resolveWorkflowCapabilities, type WorkflowContract } from "./workflow-probe.js";
 import { surfaceDispatchFailure } from "./dispatch-failure.js";
 import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
 import { dispatchLocalGapfill } from "./local-gapfill.js";
@@ -96,6 +96,7 @@ import {
   handleMcpTokenRequest,
 } from "./mcp-oauth.js";
 import { buildPlanningContextInputs } from "./planning-context.js";
+import { preparePlanningLaunch, launchPlanningRun } from "./planning-launch.js";
 import {
   fetchLocalContainerLogs,
   inspectLocalContainer,
@@ -1624,189 +1625,28 @@ export async function dispatchPlanning(
   });
   if (!planningAdmission.ok) return;
 
-  const planningMapping = { ...mapping, workflowFile: mapping.planningWorkflowFile };
-
   // Everything below is pure prep — no launch call has fired yet. A throw anywhere in
   // here is by construction a definitive non-launch — see the matching comment in
   // dispatchGitHubActions.
-  const { ghToken, runnerImage, planningSentBaseBranch, planningContract, planningDispatchInputs } =
-    await (async () => {
-      // Build planning context (PARENT/SIBLINGS/DEPENDENCIES) only once admission is
-      // confirmed: this is a real network call (Linear GraphQL lookup) and must not run
-      // before capacity is reserved (AII-783 review on PR #681).
-      const planningContextInputs = await buildPlanningContextInputs({
-        issue,
-        ticketingProviderId: provider.id,
-      });
-
-      const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
-
-      let runnerCallbackUrl = "";
-      let runToken = "";
-      if (config.runnerCallbackBaseUrl && config.runnerTokenSecret) {
-        const minted = mintRunToken({
-          issueId: issue.id,
-          mappingTeamKey: issue.scopeKey,
-          phase: "planning",
-          audience: "result",
-          dispatchId,
-          ttlSeconds: PLANNING_TTL_SECONDS,
-          secret: config.runnerTokenSecret,
-        });
-        runnerCallbackUrl = config.runnerCallbackBaseUrl;
-        runToken = minted.token;
-      }
-
-      // Forward the resolved runner image so GHA planning honors the orchestrator's
-      // channel and per-repo `.ai-implement/image.yml` override, exactly as the
-      // implementation dispatch does. claude-plan.yml's validate-runner-image step
-      // does not read image.yml itself, so this is the only path by which GHA
-      // planning picks up either. Only sent when explicit (override or explicit
-      // SESSION_IMAGE/AI_IMPLEMENT_RUNNER_IMAGE), so repos that haven't re-synced
-      // claude-plan.yml are not rejected with a 422 "unexpected inputs".
-      const runnerImage = await resolveDispatchRunnerImage(config, mapping, ghToken);
-
-      // Only forward base_branch when it differs from the repo default — same guard as the
-      // implementation dispatch: GitHub rejects unknown workflow_dispatch inputs with 422,
-      // so repos that have not re-synced claude-plan.yml keep working on the common path.
-      // Legacy contract only; under the envelope the branch rides inside run_config.
-      const planningSentBaseBranch = resolvedPlanningBranch !== mapping.defaultBranch;
-
-      const planningContract = await resolveWorkflowContract({
-        owner: mapping.owner,
-        repo: mapping.repo,
-        workflowFile: mapping.planningWorkflowFile,
-        token: ghToken,
-        ref: mapping.defaultBranch,
-      });
-
-      const planningDispatchInputs = planningContract === "envelope"
-        ? buildEnvelopeDispatchInputs(planningMapping, issue, {
-            runnerPhase: "planning",
-            // Base branch for the planning clone. Rides inside run_config on the envelope.
-            baseBranch: planningSentBaseBranch ? resolvedPlanningBranch : undefined,
-            runnerCallbackUrl: runnerCallbackUrl || undefined,
-            runToken,
-            // No runProgressToken: planning dispatches don't mint progress tokens.
-            runnerImage,
-            planningContext: planningContextInputs,
-            // Planning has no retry loop, so nothing is stamped — but retryPolicy is
-            // required on EnvelopeDispatchOpts, so every call site must say so explicitly.
-            retryPolicy: null,
-          })
-        : {
-            issue_id: issue.id,
-            issue_identifier: issue.identifier,
-            issue_title: issue.title,
-            issue_description: issue.description || issue.title,
-            ...planningContextInputs,
-            ...providerDispatchFields(planningMapping),
-            // Gated: an empty spread when unset, so legacy repos on the common path still
-            // send no unexpected inputs and cannot 422.
-            ...(planningSentBaseBranch ? { base_branch: resolvedPlanningBranch } : {}),
-            runner_callback_url: runnerCallbackUrl,
-            run_token: runToken,
-            ...(runnerImage ? { runner_image: runnerImage } : {}),
-          };
-
-      return { ghToken, runnerCallbackUrl, runToken, runnerImage, planningSentBaseBranch, planningContract, planningDispatchInputs };
-    })().catch((err) => {
-      planningAdmission.release("launch_rejected");
-      throw err;
-    });
-
-  // returnRunDetails (AII-778): outcome "rejected" is the only signal precise enough to
-  // treat as a definitive non-launch — see the matching comment in dispatchGitHubActions.
-  const result = await postWorkflowDispatch({
-    token: ghToken,
-    owner: planningMapping.owner,
-    repo: planningMapping.repo,
-    workflowFile: planningMapping.workflowFile,
-    ref: planningMapping.defaultBranch,
-    inputs: planningDispatchInputs,
-    returnRunDetails: true,
+  const launch = await preparePlanningLaunch({
+    config, provider, issue, mapping, dispatchId, resolvedPlanningBranch,
+    resolveRunnerImage: resolveDispatchRunnerImage,
+  }).catch((err) => {
+    planningAdmission.release("launch_rejected");
+    throw err;
   });
 
-  if (!result.success) {
-    await surfaceDispatchFailure(
-      result,
-      config.notifyType,
-      config.notifyWebhookUrl,
-      {
-        site: "poll",
-        issueId: issue.id,
-        issueIdentifier: issue.identifier,
-        issueTitle: issue.title,
-        teamKey: issue.scopeKey,
-        repo: `${mapping.owner}/${mapping.repo}`,
-        workflowFile: mapping.planningWorkflowFile,
-        contract: planningContract,
-        issueUrl: provider.issueUrl(issue),
-        issueState: issue.nativeStatus,
-        phase: "planning",
-      },
-    );
-    if (result.outcome === "rejected") {
-      planningAdmission.release("launch_rejected");
-    }
-    // Same legacy-only, content-gated attribution as the implementation path: under the
-    // envelope base_branch is not an input at all, and planningSentBaseBranch alone is
-    // not a reliable signal, so require the error body to mention base_branch before
-    // blaming a stale claude-plan.yml.
-    if (planningContract === "legacy" && result.status === 422 && planningSentBaseBranch && /base_branch/.test(result.error ?? "")) {
-      await provider.markPlanningFailed(
-        issue.id,
-        issue.scopeKey,
-        "dispatch rejected (422): target repo must re-sync claude-plan.yml to accept the base_branch input",
-      );
-    }
-    // Planning never writes a dedup row (intentional), but we still count the failure.
-    const _brPlan = recordDispatchFailure(issue.id, "planning", "workflow_dispatch_failed");
-    if (_brPlan.tripped) {
-      await fireBreakerTrip(config, provider, issue.id, issue.identifier, "planning", _brPlan.failures, "workflow_dispatch_failed");
-    }
-    return;
-  }
-
-  appendLog({
-    issueId: issue.id,
-    issueIdentifier: issue.identifier,
-    issueTitle: issue.title,
-    teamKey: issue.scopeKey,
-    repo: `${mapping.owner}/${mapping.repo}`,
-    issueState: issue.nativeStatus,
-    dispatchId,
+  const launched = await launchPlanningRun({
+    ...launch,
+    config, provider, issue, mapping, dispatchId,
     admissionGeneration: planningAdmission.admissionGeneration,
-    executionMode: "github-actions",
-    phase: "planning",
-    sessionImage: runnerImage ?? null,
-    contract: planningContract,
+    planningFieldValue,
+    fireBreakerTrip,
+    onRejected: () => planningAdmission.release("launch_rejected"),
   });
+  if (launched.outcome !== "accepted") return;
 
-  if (config.notifyWebhookUrl) {
-    notify(config.notifyType, config.notifyWebhookUrl, {
-      issueIdentifier: issue.identifier,
-      issueTitle: issue.title,
-      issueUrl: provider.issueUrl(issue),
-      repoFullName: `${mapping.owner}/${mapping.repo}`,
-      phase: "planning",
-    }).catch((err) => console.error(`[poll] Planning notification failed:`, err));
-  }
-
-  // Intentionally do NOT call markDispatched() so the dedup table stays clear
-  // for the subsequent implementation dispatch.
-  try {
-    await provider.markPlanningStarted(issue.id, issue.scopeKey);
-  } catch (err) {
-    console.warn(
-      `[poll] Planning workflow dispatched for ${issue.identifier} but failed to mark planning started — next poll may re-dispatch planning:`,
-      err,
-    );
-  }
-
-  postBranchComment(provider, issue, planningFieldValue, mapping.defaultBranch, "planning");
-
-  console.log(`[poll] Dispatched planning for ${issue.identifier} -> ${mapping.owner}/${mapping.repo} (${mapping.planningWorkflowFile}, image: ${runnerImage ?? "workflow-default"})`);
+  console.log(`[poll] Dispatched planning for ${issue.identifier} -> ${mapping.owner}/${mapping.repo} (${mapping.planningWorkflowFile}, image: ${launch.runnerImage ?? "workflow-default"})`);
 }
 
 // ---------- Shared session-dispatch core ----------
