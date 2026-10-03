@@ -96,6 +96,7 @@ The app it deploys is never configured: Fly injects `FLY_APP_NAME` into every ma
 
 - **One attempt per commit**, remembered across restarts. A commit is deployed at most once whether the attempt succeeds or fails, so a failed automatic deploy waits for the next push or a manual trigger rather than being retried. Without that rule a persistently failing build would re-take the hold every poll cycle and dispatch would never resume.
 - **The hold is taken by the poll that notices the commit**, before the build starts, so nothing is dispatched into a version that is about to be replaced.
+- **What callers see during a hold.** Every MCP `tools/call` and `POST /api/tools/<name>` answers `409 { "error": "deploy-in-progress", "deployStartedAt": <ms> }` without contacting Restate (admission stays closed so the drain can finish), where a real outage still answers `503 restate-unavailable`. The kg-refresh endpoints answer the same 409. The unauthenticated `GET /` health body carries `deploy: { held, startedAt }` (`false` / `null` when no hold is set), so a deploy is distinguishable from an outage.
 
 Switching it on does not reach back for a commit that has already been announced; that one needs the manual trigger. The trigger itself applies no availability check, so it will rebuild and re-release a commit that is already running — which is how a degraded release gets repaired.
 

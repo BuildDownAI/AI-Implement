@@ -36,7 +36,7 @@ import { notify, notifyCompletion, notifyText, notifyKgRefreshOutcome } from "./
 import type { KgRefreshOutcomeNotification } from "./notify.js";
 import { isKgDegraded, postAvailableNotice, postBootNotice, postShutdownNotice, recordDeployOutcome, recordShutdown } from "./deploy-notify.js";
 import { refreshAvailability, readStampedTarget, resolveDeployTarget, type SelfDeployTarget, getAvailability } from "./deploy-availability.js";
-import { clearDeployHold, isDeployHeld } from "./deploy-hold.js";
+import { clearDeployHold, getDeployStartedAt, isDeployHeld } from "./deploy-hold.js";
 import { decideAvailabilityAction, getDeployPolicy, getLastActedCommit, setLastActedCommit } from "./deploy-policy.js";
 import { canSelfDeploy, makeStartDeploy, readKgSourceRepo, parseKgSourceRepo } from "./deploy.js";
 import { remediateStuckJob, remediateFailedJob } from "./stuck-watchdog.js";
@@ -4385,7 +4385,7 @@ function kgToolAnswer(
   result: Awaited<ReturnType<typeof callToolAsSystem>>,
   isDeployHeld: () => boolean,
 ): { status: number; body: Record<string, unknown> } {
-  if (result.status === "unavailable") return kgUnavailableAnswer(isDeployHeld);
+  if (result.status === "unavailable" || result.status === "deploy-held") return kgUnavailableAnswer(isDeployHeld);
   const text = result.content[0]?.text ?? "";
   if (result.isError) return { status: 500, body: { error: text } };
   try {
@@ -4400,6 +4400,11 @@ function kgUnavailableAnswer(isDeployHeld: () => boolean): { status: number; bod
   return isDeployHeld()
     ? { status: 409, body: { error: "deploy-in-progress" } }
     : { status: 503, body: { error: "restate-unavailable" } };
+}
+
+/** The hold fields on `GET /`; unauthenticated, and neither field holds a secret. */
+export function deployHealth(): { held: boolean; startedAt: number | null } {
+  return { held: isDeployHeld(), startedAt: getDeployStartedAt() };
 }
 
 /**
@@ -4419,7 +4424,7 @@ export function makeKgRefreshAdminDeps(
     trigger: async (opts) => kgToolAnswer(await callAsSystem("trigger_kg_refresh", { ...opts }), deployHeld),
     status: async () => {
       const r = await callAsSystem("get_kg_status", {});
-      if (r.status === "unavailable") {
+      if (r.status === "unavailable" || r.status === "deploy-held") {
         const answer = kgUnavailableAnswer(deployHeld);
         return answer.status === 409 ? { status: 409, body: { ...answer.body, deployHeld: true } } : answer;
       }
@@ -4542,6 +4547,7 @@ function startServer(
         kgDegraded: isKgDegraded(),
         ...sidecarHealthFields(),
         restate: getRestateStatus(),
+        deploy: deployHealth(),
         lastPollStartedAt: lastPollStartedAt?.toISOString() ?? null,
         lastPollFinishedAt: lastPollFinishedAt?.toISOString() ?? null,
       }));
