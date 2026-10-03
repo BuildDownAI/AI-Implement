@@ -7,6 +7,11 @@
 // `launchPlanningRun`, which take the place of the dispatch call and write the `dispatch_log` row as the real
 // one does. The runner callback is the test closing the row and calling the termination hook.
 //
+// The Fly Machines and local Docker backends (AII-1054) run through the same composer. Simulated there: the
+// Fly API (`getMachine`, `destroyMachine`), Docker (`inspectLocalContainer`, `stopLocalContainer`), and
+// `launchPlanningSession`, which creates the simulated machine or container and writes the `dispatch_log` row
+// (with a machine nonce) as the real one does.
+//
 // One seam is mocked because the composer hard-codes it: `createPlanningRunWorkflow`, wrapped only to shorten
 // the tick, confirm and deadline intervals. Each scenario holds the workflow with `gate` and `waitForStep`.
 //
@@ -14,8 +19,24 @@
 import type { RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
+const SLOW = { tickMs: 50, confirmTickMs: 50, confirmWindowMs: 60_000, bootstrapMs: 120_000, totalMs: 240_000, stopMarginMs: 60_000 };
+const DEADLINE = { tickMs: 50, confirmTickMs: 50, confirmWindowMs: 60_000, bootstrapMs: 120_000, totalMs: 1_500, stopMarginMs: 60_000 };
+
 const sim = vi.hoisted(() => ({
   remediateCalls: 0,
+  /** The intervals the next composed workflow uses. */
+  timing: {} as Record<string, number>,
+}));
+
+vi.mock("../../fly-machines.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../fly-machines.js")>()),
+  getMachine: async (_token: string, _app: string, id: string) => backends.flyGet(id),
+  destroyMachine: async (_token: string, _app: string, id: string) => backends.flyDestroy(id),
+}));
+vi.mock("../../local-docker.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../local-docker.js")>()),
+  inspectLocalContainer: async (id: string) => backends.dockerInspect(id),
+  stopLocalContainer: async (id: string) => backends.dockerStop(id),
 }));
 
 vi.mock("../../github-app-auth.js", () => ({ getInstallationToken: async () => "sim-gh-token" }));
@@ -38,7 +59,7 @@ vi.mock("../../restate/planning-run-workflow.js", async (importOriginal) => {
     createPlanningRunWorkflow: (deps: Parameters<typeof actual.createPlanningRunWorkflow>[0]) =>
       actual.createPlanningRunWorkflow({
         ...deps,
-        tickMs: 50, confirmTickMs: 50, confirmWindowMs: 60_000, bootstrapMs: 120_000, totalMs: 240_000, stopMarginMs: 60_000,
+        ...sim.timing,
       }),
   };
 });
@@ -83,7 +104,44 @@ const gh = {
   },
 };
 
-/** Per-scenario launch behaviour, keyed by the issue identifier. */
+/** The simulated Fly API and Docker, reset per scenario. A machine or container runs until it is stopped. */
+const backends = {
+  machines: new Map<string, "started" | "destroyed">(),
+  containers: new Map<string, boolean>(),
+  created: 0,
+  destroyCalls: [] as string[],
+  stopCalls: [] as string[],
+  /** Set to make `docker inspect` fail with this message. */
+  inspectError: undefined as string | undefined,
+  /** The launch writes its row and creates the machine, then throws once (the acknowledgement is lost). */
+  crashNextLaunch: false,
+  async flyGet(id: string) {
+    const state = this.machines.get(id);
+    if (!state) throw new Error(`Failed to get machine ${id} (404): not found`);
+    return { id, state };
+  },
+  async flyDestroy(id: string) {
+    this.destroyCalls.push(id);
+    this.machines.set(id, "destroyed");
+  },
+  async dockerInspect(id: string) {
+    if (this.inspectError) throw new Error(this.inspectError);
+    const running = this.containers.get(id);
+    if (running === undefined) throw new Error(`Failed to inspect local Docker runner ${id}: Error: No such container: ${id}`);
+    return { status: running ? "running" : "exited", running, exitCode: running ? null : 0 };
+  },
+  async dockerStop(id: string) {
+    this.stopCalls.push(id);
+    this.containers.set(id, false);
+  },
+  reset() {
+    this.machines.clear(); this.containers.clear(); this.created = 0; this.destroyCalls = []; this.stopCalls = [];
+    this.inspectError = undefined; this.crashNextLaunch = false;
+  },
+};
+const NONCE = "nonce-must-not-leak";
+
+/** Per-scenario launch behaviour. */
 const launches: string[] = [];
 let launchAckLost = false;
 const clearedIssues: string[] = [];
@@ -91,6 +149,7 @@ const issues = new Map<string, { id: string; identifier: string; title: string; 
 
 describe("Restate PlanningRun pilot: production-composition proof", () => {
   let environments: Map<string, RestateTestEnvironment>;
+  let deadlineEnvironments: Map<string, RestateTestEnvironment>;
   let counter = 0;
 
   beforeAll(async () => {
@@ -117,8 +176,8 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
       findByKey: async (key: string) => issues.get(key) ?? null,
       clearWorkingState: async (issueId: string) => { clearedIssues.push(issueId); return true; },
     };
-    const composed = createProductionPlanningRunServices({
-      config: { githubAppId: "1", githubAppPrivateKey: "k", notifyType: "slack", notifyWebhookUrl: null } as never,
+    const compose = () => createProductionPlanningRunServices({
+      config: { githubAppId: "1", githubAppPrivateKey: "k", notifyType: "slack", notifyWebhookUrl: null, flySessionsToken: "fly-token", flySessionsApp: "fly-app" } as never,
       resolveProvider: async () => provider as never,
       resolveRunnerImage: async () => undefined,
       fireBreakerTrip: async () => {},
@@ -142,17 +201,39 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
         // Acknowledgement lost: the dispatch happened but no run id came back, so the workflow binds by title.
         return launchAckLost ? { outcome: "unknown" } : { outcome: "accepted", runId: run.id };
       }) as never,
+      launchPlanningSession: (async (args: { issue: { id: string; identifier: string; title: string; scopeKey: string }; execPath: "fly-machines" | "local-docker"; reservation: { dispatchId: string; admission: { admissionGeneration: number } } }) => {
+        launches.push(args.issue.identifier);
+        const id = `${args.execPath === "fly-machines" ? "m" : "c"}-${++backends.created}`;
+        if (args.execPath === "fly-machines") backends.machines.set(id, "started");
+        else backends.containers.set(id, true);
+        // The real function writes the row, with the machine id and nonce, once the launch call returned.
+        appendLog({
+          issueId: args.issue.id, issueIdentifier: args.issue.identifier, issueTitle: args.issue.title, teamKey: args.issue.scopeKey,
+          repo: `${OWNER}/${REPO}`, dispatchId: args.reservation.dispatchId, admissionGeneration: args.reservation.admission.admissionGeneration,
+          executionMode: args.execPath, phase: "planning", machineId: id, machineNonce: NONCE,
+        });
+        if (backends.crashNextLaunch) {
+          backends.crashNextLaunch = false;
+          throw new Error("injected crash: the launch committed, the caller never observed it");
+        }
+        return { outcome: "accepted", machineId: id, executionMode: args.execPath };
+      }) as never,
+      sessionDeps: {} as never,
     });
-    environments = await startVariants(composed.services);
+    sim.timing = SLOW;
+    environments = await startVariants(compose().services);
+    sim.timing = DEADLINE;
+    deadlineEnvironments = await startVariants(compose().services);
   }, 60_000);
 
   afterAll(async () => {
     vi.unstubAllGlobals();
-    if (environments) await stopAll(environments);
+    await Promise.all([stopAll(environments), stopAll(deadlineEnvironments)]);
   });
 
   beforeEach(() => {
     gh.reset();
+    backends.reset();
     launches.length = 0;
     clearedIssues.length = 0;
     launchAckLost = false;
@@ -162,26 +243,29 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
 
   const labels = VARIANTS.map(([label]) => label);
 
-  function baseUrl(label: string): string {
-    const env = environments.get(label);
+  function baseUrl(label: string, envs: Map<string, RestateTestEnvironment> = environments): string {
+    const env = envs.get(label);
     if (!env) throw new Error(`missing Restate variant ${label}`);
     return env.baseUrl();
   }
 
   /** Reserves capacity with the workflow as owner, as the switched `dispatchPlanning` will, and submits the run. */
-  async function dispatch(label: string, identifier: string) {
+  async function dispatch(
+    label: string, identifier: string,
+    backend: PlanningRunInput["backend"] = "github-actions", envs: Map<string, RestateTestEnvironment> = environments,
+  ) {
     const dispatchId = `plan-${label}-${counter++}`;
     const issue = { id: `id-${dispatchId}`, identifier, title: `Issue ${identifier}`, scopeKey: TEAM, nativeStatus: "Todo" };
     issues.set(identifier, issue);
     const decision = acquire({
       dispatchId, mappingKey: TEAM, scope: { kind: "issue", issueScope: TEAM, issueId: issue.id }, kind: "planning",
-      backend: "github-actions", lifecycleOwner: { kind: "restate", attemptId: dispatchId }, cap: 10,
+      backend, lifecycleOwner: { kind: "restate", attemptId: dispatchId }, cap: 10,
     });
     if (!decision.ok) throw new Error(`admission deferred: ${decision.reason}`);
-    const url = baseUrl(label);
+    const url = baseUrl(label, envs);
     const client = createPlanningRunIngressClient(url);
     const input: PlanningRunInput = {
-      dispatchId, teamKey: TEAM, issueId: issue.id, issueIdentifier: identifier, planningContext: {}, backend: "github-actions",
+      dispatchId, teamKey: TEAM, issueId: issue.id, issueIdentifier: identifier, planningContext: {}, backend,
     };
     expect(await client.submit(dispatchId, input)).toEqual({ status: "accepted" });
     const read = () => callWorkflow<PlanningRunStatusResult>(url, "PlanningRun", dispatchId, "status");
@@ -264,6 +348,73 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
     expect(gh.statusReads).toContain(Number(bRun.jobId));
     expect(gh.statusReads).not.toContain(1);
     expect(sim.remediateCalls).toBe(0);
+  }, 60_000);
+
+  describe.each(["fly-machines", "local-docker"] as const)("backend %s", (backend) => {
+    const running = (id: string) => (backend === "fly-machines" ? backends.machines.get(id) === "started" : backends.containers.get(id) === true);
+    const stops = () => (backend === "fly-machines" ? backends.destroyCalls : backends.stopCalls);
+    const end = (id: string) => (backend === "fly-machines" ? backends.machines.set(id, "destroyed") : backends.containers.set(id, false));
+
+    it.each(labels)("a report, then the machine stopping, releases the reservation as finalized (%s)", async (label) => {
+      const w = await dispatch(label, "PLT-10", backend);
+      await waitForStep(w.read, "wait");
+      const { jobId } = await w.read();
+      expect(jobId).toBe(backend === "fly-machines" ? "m-1" : "c-1");
+      expect(JSON.stringify(await w.read())).not.toContain(NONCE);
+      expect(getJobByDispatchId(w.dispatchId)).toMatchObject({ executionMode: backend, machineId: jobId, status: "dispatched" });
+
+      // A report while the machine still runs does not release the reservation.
+      updateJobStatus(getJobByDispatchId(w.dispatchId)!.id, "completed", "planning_callback");
+      await w.hook(w.dispatchId);
+      await waitForStep(w.read, "confirm");
+      expect(running(jobId!)).toBe(true);
+      expect(readAdmission(w.dispatchId)).toMatchObject({ releasedAt: null });
+
+      end(jobId!);
+      await untilReleased(w.dispatchId);
+      expect(readAdmission(w.dispatchId)).toMatchObject({ releaseReason: "finalized" });
+      expect(launches).toEqual(["PLT-10"]);
+      expect(sim.remediateCalls).toBe(0);
+    }, 60_000);
+
+    it.each(labels)("a machine still running at the total deadline is stopped by id and released as deadline_exceeded (%s)", async (label) => {
+      const w = await dispatch(label, "PLT-11", backend, deadlineEnvironments);
+      await untilReleased(w.dispatchId);
+      const id = (await w.read()).jobId!;
+      expect(stops()).toEqual([id]);
+      expect(running(id)).toBe(false);
+      expect(readAdmission(w.dispatchId)).toMatchObject({ releaseReason: "deadline_exceeded" });
+      expect(getJobByDispatchId(w.dispatchId)).toMatchObject({ status: "timed_out" });
+    }, 60_000);
+
+    it.each(labels)("a crash after the launch returns adopts the launched machine and creates no second one (%s)", async (label) => {
+      backends.crashNextLaunch = true;
+      const w = await dispatch(label, "PLT-12", backend);
+      const { jobId } = await eventually(() => w.read(), (s) => s.jobId !== null, { label: "bound after the retry" });
+      await waitForStep(w.read, "wait");
+      expect(backends.created).toBe(1);
+      expect(launches).toEqual(["PLT-12"]);
+      expect(jobId).toBe(getJobByDispatchId(w.dispatchId)!.machineId);
+
+      end(jobId!);
+      await untilReleased(w.dispatchId);
+      expect(backends.created).toBe(1);
+    }, 60_000);
+  });
+
+  it.each(labels)("a docker error that is not No such container leaves the run unknown, not ended (%s)", async (label) => {
+    const w = await dispatch(label, "PLT-13", "local-docker");
+    const { jobId } = await eventually(() => w.read(), (s) => s.jobId !== null, { label: "bound" });
+    backends.inspectError = "Cannot connect to the Docker daemon";
+    updateJobStatus(getJobByDispatchId(w.dispatchId)!.id, "completed", "planning_callback");
+    await w.hook(w.dispatchId);
+    await waitForStep(w.read, "confirm");
+    // Status reads keep failing, so the reservation stays held; the container is still running.
+    expect(readAdmission(w.dispatchId)).toMatchObject({ releasedAt: null });
+    backends.inspectError = undefined;
+    backends.containers.set(jobId!, false);
+    await untilReleased(w.dispatchId);
+    expect(readAdmission(w.dispatchId)).toMatchObject({ releaseReason: "finalized" });
   }, 60_000);
 
   it("the stale-admission sweep and the terminal-callback reconcile leave a Restate-owned planning row", async () => {
