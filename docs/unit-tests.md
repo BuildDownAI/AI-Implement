@@ -45,7 +45,9 @@ Three decisions shape it:
 
 A test that needs a variable sets it itself, at its top level or in a hook. An entry belongs in the allowlist only when tests need the machine's own value, and it goes in with the reason that shows it: a test that fails without it, or, for a preventive pin like `TZ`, the machine dependence it closes.
 
-The guard test, `src/__tests__/setup/ambient-env.test.ts`, fails when a test sees any variable outside `BASE_ENV_ALLOWLIST` and names each one. It also tests `scrubAmbientEnv` on an injected environment object and requires every entry to state its reason.
+Each tier has a guard test that fails when a test sees any variable outside that tier's allowlist, and names each one.
+- `src/__tests__/setup/ambient-env.test.ts` guards `BASE_ENV_ALLOWLIST` in the default suite; it also tests `scrubAmbientEnv` on an injected environment object and requires every entry to state its reason.
+- `src/__tests__/restate/ambient-env.restate.test.ts` guards `RESTATE_ENV_ALLOWLIST` under the Restate config, because the default suite's guard never runs there.
 
 The credential `beforeEach` in `clear-runner-credentials.ts` predates the scrub and stays: it deletes the five runner credentials again before every test. It runs after the test file's `beforeAll` hooks and before its `beforeEach` hooks, so a credential a test file sets in `beforeAll` is removed, while one it sets in its own `beforeEach` survives. It exists because a runner's own `npm test` once posted to the live orchestrator with the run's single-use token and consumed it; see [solutions/workflow-patterns/runner-test-suite-burned-the-run-token.md](solutions/workflow-patterns/runner-test-suite-burned-the-run-token.md).
 
