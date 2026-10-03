@@ -23,6 +23,7 @@ import {
   type ReviewFixFindingDisposition,
   type ReviewFixWorkerPort,
 } from "../review-fix-ports.js";
+import { awaitOwnedRun } from "./owned-run-wait.js";
 import { reviewFixPRKey } from "./review-fix-pr.js";
 
 export const REVIEW_FIX_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
@@ -188,11 +189,18 @@ export function createReviewFixAttempt(deps: ReviewFixAttemptDependencies) {
 
     let wake: Wake;
     const remaining = Math.max(1, attempt.deadlineAt - await ctx.date.now());
-    try {
-      wake = await ctx.promise<Wake>("wake").get().orTimeout(remaining);
-    } catch (error) {
-      if (!(error instanceof restate.TimeoutError)) throw error;
+    const event = await awaitOwnedRun(ctx, {
+      signals: ["wake"],
+      resultSignal: "wake",
+      totalDeadlineAt: attempt.deadlineAt,
+      tickMs: remaining,
+    });
+    if (event.kind === "signal" && event.name === "wake") {
+      wake = event.value as Wake;
+    } else if (event.kind === "total_timeout") {
       wake = { kind: "cancel" }; // deadline follows the same stop-and-confirm path
+    } else {
+      throw new restate.TerminalError(`review-fix wait returned unexpected event: ${event.kind}`);
     }
 
     let validResult: ReviewFixResultMetadataV1 | null = null;
