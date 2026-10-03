@@ -189,8 +189,8 @@ describe("awaitOwnedRun (Restate)", () => {
     const held = gate(label);
     return {
       held,
-      script: async (call) => {
-        if (call === 0) await held.wait();
+      script: async (read) => {
+        if (read === 0) await held.wait();
         return "unknown";
       },
     };
@@ -223,9 +223,9 @@ describe("awaitOwnedRun (Restate)", () => {
 
     it.each(labels)("status started moves the wait past the bootstrap deadline (%s)", async (label) => {
       const held = gate("second-call status read");
-      const run = await begin(label, { ...KG, secondCall: true }, async (call) => {
-        if (call === 0) return "started";
-        if (call === 1) await held.wait();
+      const run = await begin(label, { ...KG, secondCall: true }, async (read) => {
+        if (read === 0) return "started";
+        if (read === 1) await held.wait();
         return "unknown";
       });
       // The second call has startedSeen, so the bootstrap deadline no longer applies.
