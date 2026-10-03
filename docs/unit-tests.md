@@ -19,7 +19,7 @@ How the default test suite runs, what isolates it from the machine it runs on, w
 
 `npm run test:restate` uses `vitest.restate.config.ts`: the same database setting, the Restate tier's scrub (`scrub-ambient-env.restate.ts`) followed by `clear-runner-credentials.ts`, only `*.restate.test.ts` files, and 60-second timeouts.
 
-A test file never opts into any of this. Whichever config collects it decides its environment, setup files and timeouts, so a Restate scenario named outside the `*.restate.test.ts` shape is either collected by neither config or run under the default suite's settings.
+A test file never opts into any of this. Whichever config collects it decides its environment, setup files and timeouts, so a Restate scenario named outside the `*.restate.test.ts` shape is either collected by neither config or run under the default suite's settings. `src/__tests__/restate-test-hygiene.test.ts` fails on both: a test file under `restate/` without that suffix, and a test file outside `restate/` that starts a Restate engine.
 
 ## Isolation from the machine
 

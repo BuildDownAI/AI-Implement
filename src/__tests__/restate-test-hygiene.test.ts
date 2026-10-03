@@ -1,8 +1,11 @@
 // Guard for the timing rules in docs/restate-testing.md § Timing rules (AII-993). Default
 // suite, no Docker: scans the Restate scenario sources for the patterns that caused timing
 // flakes — raw sleeps, direct admin `/query` reads, and per-file poll helpers.
+// It also guards Restate-tier membership.
+// A scenario gets that tier's config (allowlist, timeouts) only when it is named *.restate.test.ts under restate/.
+// A misnamed or misplaced one runs under the wrong config, or never runs.
 import { existsSync, readdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, relative, sep } from "node:path";
 import { describe, expect, it } from "vitest";
 import { eventually } from "./restate/harness.js";
 
@@ -71,6 +74,30 @@ describe("restate scenario hygiene (AII-993)", () => {
     expect(found.map((v) => v.split(":").slice(0, 2).join(":"))).toEqual([
       "x.restate.test.ts:1", "x.restate.test.ts:4", "x.restate.test.ts:5", "x.restate.test.ts:6",
     ]);
+  });
+});
+
+describe("restate tier membership", () => {
+  const SRC_DIR = join(import.meta.dirname, "..");
+  // Each of these starts a Restate engine; `eventually` and the other harness helpers do not.
+  const ENGINE_STARTERS = /\b(startVariants|startRetryEnabled|startBinaryEnvironment|RestateTestEnvironment|RestateContainer)\b/;
+
+  it("every test file under restate/ is named *.restate.test.ts", () => {
+    const misnamed = readdirSync(RESTATE_DIR).filter((f) => f.endsWith(".test.ts") && !f.endsWith(".restate.test.ts"));
+    expect(misnamed, "Neither vitest config collects these; rename each to *.restate.test.ts").toEqual([]);
+  });
+
+  it("no test file outside restate/ starts a Restate engine", () => {
+    const restatePrefix = relative(SRC_DIR, RESTATE_DIR) + sep;
+    const offenders = (readdirSync(SRC_DIR, { recursive: true }) as string[])
+      .filter((f) => f.endsWith(".test.ts") && !f.startsWith(restatePrefix))
+      .filter((f) => join(SRC_DIR, f) !== import.meta.filename)
+      .filter((f) => ENGINE_STARTERS.test(readFileSync(join(SRC_DIR, f), "utf8")));
+    expect(
+      offenders,
+      "The default suite collects these, so they run without the Restate tier's allowlist and timeouts; " +
+        "move each under src/__tests__/restate/ as *.restate.test.ts",
+    ).toEqual([]);
   });
 });
 
