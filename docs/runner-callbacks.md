@@ -96,6 +96,10 @@ cannot produce a success ACK. Legacy runs do not use this route.
 
 A run kind that a Restate workflow owns sends its "I started" signal with the run-signal sender (`RunSignalSender` in `src/pipeline/run-signal.ts`). `signal("progress")` posts `{}` to `/runner/progress` with the progress token, and the route forwards it to the workflow's shared handler. The result keeps `postRunnerResult` and `/runner/result` with the result token. The runner never calls the Restate ingress, which binds to loopback (ADR 023). A failed post logs and does not change the outcome of the run. kg-refresh uses this sender; the legacy pipelines keep `TokenStepReporter` and `HttpStepReporter`.
 
+## The planning callback of a pilot project
+
+The planning result callback still marks the planning job complete and still skips the admission release, for both lifecycles. For a project on the `restate` lifecycle, the planning termination hook (`createPlanningAdmissionTerminationHook`) also sends `report` to the `PlanningRun` workflow whose key is the dispatch id (the handler takes no idempotency key; a second `report` is a no-op); a Legacy dispatch keeps the fast release. The `report` only wakes the workflow. The workflow still confirms the run ended with `readStatus` and releases the reservation itself. A lost signal costs at most one tick: 5 seconds in the confirm phase, 30 seconds in the wait (`PLANNING_RUN_CONFIRM_TICK_MS`, `PLANNING_RUN_TICK_MS`). See [restate.md](restate.md#the-planning-run).
+
 ## Rules
 
 1. A test that touches a runner entry point (`runKgRefresh`, `runAutonomous`, `postRunnerResult`) runs disarmed: `RUN_TOKEN`, `RUNNER_CALLBACK_URL`, and `RUN_PROGRESS_TOKEN` are cleared. The file-level hook from PR #467 does this for one file. AII-588 moves it to a vitest setup file so every suite starts disarmed.

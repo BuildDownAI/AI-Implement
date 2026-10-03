@@ -26,8 +26,7 @@ import { RUN_TITLE_PREFIX, buildKgRefreshGhaDispatchBody, defaultFetchSignal, po
 import { resolveWorkflowCapabilities } from "../workflow-probe.js";
 import { resolveRunnerImageForDispatch } from "../repo-image.js";
 import { encodeRunConfig, type RunConfigV1 } from "../run-config.js";
-import { destroyMachine } from "../fly-machines.js";
-import { stopLocalContainer } from "../local-docker.js";
+import { stopBackendRun } from "../backend-run.js";
 import { getRunnerMode, resolveExecutionPath } from "../runner-mode.js";
 import { mintRunToken } from "../runner-tokens.js";
 import type { JobStatus } from "../log.js";
@@ -315,20 +314,7 @@ export function createProductionKgRefreshServices(
     getWorkflowRunStatus: input.getWorkflowRunStatus,
     findRunByTitle: input.findRunByTitle,
     cancelWorkflowRun: input.cancelWorkflowRun,
-    stopMachineRun: async (executionMode, jobId) => {
-      if (executionMode === "fly-machines") {
-        if (!config.flySessionsToken || !config.flySessionsApp) {
-          throw new Error("FLY_SESSIONS_TOKEN + FLY_SESSIONS_APP are not configured; cannot stop the machine");
-        }
-        await destroyMachine(config.flySessionsToken, config.flySessionsApp, jobId);
-        return true;
-      }
-      if (executionMode === "local-docker") {
-        await stopLocalContainer(jobId);
-        return true;
-      }
-      return false;
-    },
+    stopMachineRun: (executionMode, jobId) => stopBackendRun(config, executionMode, jobId),
     persistLastRefresh: input.persistLastRefresh,
     onOutcome: (kind, outcome, meta) => {
       // Returned so the workflow's `outcome` step awaits (and retries) the notification.

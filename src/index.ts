@@ -24,7 +24,7 @@ import {
 } from "./dispatch-admission.js";
 import { reconcileFilesystemFailures } from "./filesystem-ticket-lifecycle.js";
 import { dispatchWorkflow, postWorkflowDispatch, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, getPullRequestState, buildEnvelopeDispatchInputs, postPrComment, defaultFetchSignal, getRepoDefaultBranch, fetchRepoTarball, mergePullRequest, closePullRequest, deleteBranch, postOrUpdateStickyComment, setCommitStatus, cancelWorkflowRun, type DispatchInputs } from "./github.js";
-import { resolveWorkflowCapabilities, resolveWorkflowContract, type WorkflowContract } from "./workflow-probe.js";
+import { resolveWorkflowCapabilities, type WorkflowContract } from "./workflow-probe.js";
 import { surfaceDispatchFailure } from "./dispatch-failure.js";
 import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
 import { dispatchLocalGapfill } from "./local-gapfill.js";
@@ -61,6 +61,7 @@ import { handleReferenceTokenRequest } from "./reference-token-vending.js";
 import { handleStatusUpdate, handleStepReport } from "./session-api.js";
 import { postStatusComment } from "./status-events.js";
 import { buildRunUrl, classifyCompletion, deriveLastSuccessfulStage, monitorFailureCommentPrefix, renderClassification, shouldPostMonitorClassificationComment } from "./completion-classification.js";
+import { classifyFlyMachine, classifyLocalContainer } from "./backend-run.js";
 import { createMachine, getMachine, listMachines, destroyMachine, generateSessionToken, generateMachineNonce, buildSessionMachineConfig, listAppSecrets, fetchMachineLogs, updateMachineMetadata, readMachineExitCode } from "./fly-machines.js";
 import { safeDestroyMachine, sweepOrphanedMachines, SWEEP_MACHINE_MAX_AGE_MS } from "./reaper.js";
 import type { ReaperHelpers } from "./reaper.js";
@@ -74,7 +75,7 @@ import { getOrchestratorSettings, seedKgBaseRepoFromEnv, seedLinearPickupLabelFr
 import { handleRunnerPlanningContext, handleRunnerProgress, handleRunnerCycleSummary, handleRunnerResult, handleRunnerActivity, handleKgTrackerDataRequest, handleKgScopeRequest, planningDispatchBlockReason } from "./runner-callback.js";
 import { CYCLE_SUMMARY_MAX_BYTES } from "./pipeline/cycle-summary.js";
 import type { RunnerProgressBody, RunnerResultBody, RunnerActivityBody, ActivityIntakeOutcome } from "./runner-callback.js";
-import { mintRunToken, PLANNING_TTL_SECONDS, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
+import { mintRunToken, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
 import { SqliteReviewFixAttemptStore } from "./review-fix-attempt-store.js";
 import { createReviewFixAdminFacade } from "./review-fix-admin-facade.js";
 import { GithubReviewFixWorker, createGithubAppCredentialResolver, reviewFixAttemptStoreScopeStore } from "./review-fix-worker.js";
@@ -95,7 +96,7 @@ import {
   handleMcpOidcCallback,
   handleMcpTokenRequest,
 } from "./mcp-oauth.js";
-import { buildPlanningContextInputs } from "./planning-context.js";
+import { preparePlanningLaunch, launchPlanningRun, launchPlanningSession } from "./planning-launch.js";
 import {
   fetchLocalContainerLogs,
   inspectLocalContainer,
@@ -126,6 +127,8 @@ import { RestateSidecar } from "./restate/server.js";
 import { startRestateEndpoint, register as registerRestateEndpoint, RESTATE_SERVICES } from "./restate/endpoint.js";
 import { createProductionReviewFixServices } from "./restate/review-fix-production.js";
 import { createKgFindRunByTitle, createProductionKgRefreshServices, recordKgDispatchDetails } from "./restate/kg-refresh-production.js";
+import { createProductionPlanningRunServices, PLANNING_CONTEXT_BRANCH_KEY, PLANNING_CONTEXT_FIELD_VALUE_KEY } from "./restate/planning-run-production.js";
+import { createPlanningAdmissionTerminationHook, createPlanningRunIngressClient } from "./restate/planning-run-client.js";
 import { setKgRefreshToolDeps } from "./restate/tools.js";
 import type { RestateRegisterOutcome, RestateRegisterResult } from "./restate/endpoint.js";
 import { getRestateStatus, setRestateStatus } from "./restate/status.js";
@@ -1401,211 +1404,49 @@ export async function dispatchPlanning(
 ): Promise<void> {
   const { execPath, runnerMode, resolvedPlanningBranch, planningFieldValue } = ctx;
 
+  // Pilot lifecycle: the PlanningRun workflow owns the reservation and launches the run.
+  if (resolveReviewFixLifecycle(mapping) === "restate") {
+    const restate = getRestateStatus();
+    if (restate.sidecar.state !== "ready" || restate.registration.state !== "registered") {
+      console.log(`[poll] Planning for ${issue.identifier} skipped: Restate unavailable`);
+      return;
+    }
+    const dispatchId = crypto.randomUUID();
+    const backend = execPath === "fly-machines" || execPath === "local-docker" ? execPath : "github-actions";
+    const pilotAdmission = acquireDispatch({
+      dispatchId,
+      issueId: issue.id,
+      issueIdentifier: issue.identifier,
+      kind: "planning",
+      teamKey: issue.scopeKey,
+      maxInProgressAiIssues: mapping.maxInProgressAiIssues,
+      backend,
+      lifecycleOwner: { kind: "restate", attemptId: dispatchId },
+    });
+    if (!pilotAdmission.ok) return;
+    const planningContext: Record<string, string> = { [PLANNING_CONTEXT_BRANCH_KEY]: resolvedPlanningBranch };
+    if (planningFieldValue) planningContext[PLANNING_CONTEXT_FIELD_VALUE_KEY] = planningFieldValue;
+    const submitted = await createPlanningRunIngressClient().submit(dispatchId, {
+      dispatchId,
+      teamKey: issue.scopeKey,
+      issueId: issue.id,
+      issueIdentifier: issue.identifier,
+      backend,
+      planningContext,
+    });
+    if (submitted.status === "unavailable" || submitted.status === "not-found") {
+      pilotAdmission.release("launch_rejected");
+      console.log(`[poll] Planning for ${issue.identifier} skipped: Restate unavailable`);
+      return;
+    }
+    console.log(`[poll] Submitted PlanningRun for ${issue.identifier} dispatch=${dispatchId} backend=${backend} (${submitted.status})`);
+    return;
+  }
+
   if (execPath === "fly-machines" || execPath === "local-docker") {
-    // Bedrock is not supported on container runners.
-    if (mapping.provider === "bedrock") {
-      console.error(
-        `[poll] Cannot dispatch planning for ${issue.identifier} via ${execPath}: provider=bedrock is not supported on fly-machines/local-docker`,
-      );
-      return;
-    }
-
-    if (!config.anthropicApiKey && !config.claudeOAuthToken) {
-      console.error(
-        `[poll] Cannot dispatch planning for ${issue.identifier} via ${execPath}: neither ANTHROPIC_API_KEY nor CLAUDE_CODE_OAUTH_TOKEN is set`,
-      );
-      return;
-    }
-
-    if (execPath === "fly-machines" && (!config.flySessionsToken || !config.flySessionsApp)) {
-      console.error(
-        `[poll] Cannot dispatch planning for ${issue.identifier} via Fly Machines: FLY_SESSIONS_TOKEN or FLY_SESSIONS_APP not set`,
-      );
-      return;
-    }
-
-    // Capture at call time so non-null assertions inside the backend closure are sound.
-    const flyToken = config.flySessionsToken;
-    const flyApp = config.flySessionsApp;
-
-    const prior = countPriorDispatches(issue.id, "planning");
-
-    await dispatchSession(config, provider, issue, mapping, prior, runnerMode, {
-      phase: "planning",
-      tokenTtlSeconds: PLANNING_TTL_SECONDS,
-      doMarkDispatched: false,
-      shadow: false,
-      backendKind: execPath,
-      isDefinitiveLaunchFailure: execPath === "fly-machines" ? isDefinitiveFlyRejectionError : isDefinitiveLocalDockerLaunchFailure,
-      backend: async ({ sessionToken, machineNonce, runnerCallbackUrl, runToken, markLaunchAttempted }) => {
-        // Build planning context (PARENT/SIBLINGS/DEPENDENCIES) here, not before
-        // dispatchSession's admission check above: this is a real network call
-        // (Linear GraphQL lookup) and must not run before capacity is reserved
-        // (AII-783 review on PR #681). `backend` only runs once dispatchSession's
-        // acquireDispatch has already succeeded.
-        const planningContextInputs = await buildPlanningContextInputs({
-          issue,
-          ticketingProviderId: provider.id,
-        });
-
-        const planningEnv = {
-          PARENT: planningContextInputs.parent,
-          SIBLINGS: planningContextInputs.siblings,
-          DEPENDENCIES: planningContextInputs.dependencies,
-        };
-
-        const planningRunConfig: RunConfigV1 = {
-          v: 1,
-          issue: {
-            id: issue.id,
-            identifier: issue.identifier,
-            title: issue.title,
-            description: issue.description || issue.title,
-          },
-          runnerPhase: "planning",
-          ...(mapping.maxTurns != null ? { maxTurns: mapping.maxTurns } : {}),
-          ...(mapping.maxIterations != null ? { maxIterations: mapping.maxIterations } : {}),
-          ...(runnerCallbackUrl ? { runnerCallbackUrl } : {}),
-          planningContext: planningContextInputs,
-        };
-
-        // both fly-machines and local-docker require a GitHub token now, so it's extracted here for convenience/readability
-        const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
-        if (execPath === "fly-machines") {
-          const minSecretsVersion = getFlySecretsMinVersion();
-          let allSecretNames: string[] = [];
-          try {
-            const secrets = await listAppSecrets(flyToken!, flyApp!);
-            allSecretNames = secrets.map((s) => s.name);
-          } catch (err) {
-            console.warn(`[poll] Failed to fetch app secrets for ${issue.identifier}, proceeding without team secrets:`, err);
-          }
-
-          const { image: resolvedImage, source: imageSource } = await resolveSessionImage({
-            owner: mapping.owner,
-            repo: mapping.repo,
-            token: ghToken,
-            defaultImage: config.sessionImage,
-          });
-
-          const machineConfig = buildSessionMachineConfig({
-            image: resolvedImage,
-            issueId: issue.id,
-            issueIdentifier: issue.identifier,
-            issueTitle: issue.title,
-            issueDescription: issue.description || issue.title,
-            owner: mapping.owner,
-            repo: mapping.repo,
-            defaultBranch: resolvedPlanningBranch,
-            anthropicApiKey: config.anthropicApiKey ?? undefined,
-            claudeOAuthToken: config.claudeOAuthToken ?? undefined,
-            githubToken: ghToken,
-            sessionToken,
-            machineNonce,
-            phase: "planning",
-            sessionMode: mapping.sessionMode,
-            region: config.flySessionsRegion ?? undefined,
-            cpus: mapping.machineCpus,
-            memoryMb: mapping.machineMemoryMb,
-            teamKey: issue.scopeKey,
-            teamSecretNames: allSecretNames,
-            allTeamKeys: Object.keys(getMappings()),
-            flyProcessLevelSecrets: getFlyProcessLevelSecrets().enabled,
-            minSecretsVersion: minSecretsVersion ?? undefined,
-            orchestratorUrl: config.runnerCallbackBaseUrl ?? undefined,
-            runnerCallbackUrl: runnerCallbackUrl || undefined,
-            runToken: runToken || undefined,
-            orchestratorApp: config.flyOrchestratorApp ?? undefined,
-            tenantId: config.tenantId ?? undefined,
-            expectedTtlSeconds: Math.round(SWEEP_MACHINE_MAX_AGE_MS / 1000),
-            extraEnv: (() => {
-              const merged = { ...mapping.extraEnv, ...capRunnerEnv(mapping), ...planningEnv, AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(planningRunConfig) };
-              return Object.keys(merged).length > 0 ? merged : undefined;
-            })(),
-          });
-          if (getFlyProcessLevelSecrets().enabled) {
-            const secretNames = machineConfig.config.processes?.[0]?.secrets?.map((s) => s.name ?? s.env_var) ?? [];
-            console.log(`[poll] process-level secrets for ${issue.identifier} planning: [${secretNames.join(", ")}]`);
-          }
-
-          markLaunchAttempted();
-          const machine = await createMachine(flyToken!, flyApp!, machineConfig);
-          const machineLogsUrl = `https://fly.io/apps/${flyApp}/machines/${machine.id}`;
-          console.log(`[poll] Dispatched planning for ${issue.identifier} -> ${mapping.owner}/${mapping.repo} (fly-machines, machine: ${machine.id}, image: ${resolvedImage} [${imageSource}])`);
-          return {
-            machineId: machine.id,
-            sessionImage: resolvedImage,
-            ghToken,
-            executionMode: "fly-machines" as const,
-            statusComment: { machineName: machine.name, logsUrl: machineLogsUrl },
-          };
-        } else {
-          // local-docker
-          const localOrchestratorUrl =
-            config.localRunnerOrchestratorUrl ??
-            config.runnerCallbackBaseUrl ??
-            `http://host.docker.internal:${config.healthPort}`;
-
-          markLaunchAttempted();
-          const container = await startLocalRunnerContainer({
-            image: config.localRunnerImage,
-            issueId: issue.id,
-            issueIdentifier: issue.identifier,
-            issueTitle: issue.title,
-            issueDescription: issue.description || issue.title,
-            owner: mapping.owner,
-            repo: mapping.repo,
-            defaultBranch: resolvedPlanningBranch,
-            anthropicApiKey: config.anthropicApiKey ?? undefined,
-            claudeOAuthToken: config.claudeOAuthToken ?? undefined,
-            githubToken: ghToken,
-            sessionToken,
-            machineNonce,
-            phase: "planning",
-            sessionMode: mapping.sessionMode,
-            orchestratorUrl: localOrchestratorUrl,
-            runnerCallbackUrl: runnerCallbackUrl || undefined,
-            runToken: runToken || undefined,
-            extraEnv: (() => {
-              const merged = { ...mapping.extraEnv, ...capRunnerEnv(mapping), ...planningEnv, AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(planningRunConfig) };
-              return Object.keys(merged).length > 0 ? merged : undefined;
-            })(),
-          });
-
-          return {
-            machineId: container.containerId,
-            sessionImage: config.localRunnerImage,
-            ghToken: "",
-            executionMode: "local-docker" as const,
-            statusComment: {
-              machineName: container.containerName || container.containerId.slice(0, 12),
-            },
-            dispatchedLogLine: `[poll] Dispatched planning for ${issue.identifier} -> ${mapping.owner}/${mapping.repo} (local-docker, container: ${container.containerId}, image: ${config.localRunnerImage})`,
-          };
-        }
-      },
-      onPostDispatch: async (_cfg, _prov, _iss, _map, _ghToken, _jobId, _mode) => {
-        if (config.notifyWebhookUrl) {
-          notify(config.notifyType, config.notifyWebhookUrl, {
-            issueIdentifier: issue.identifier,
-            issueTitle: issue.title,
-            issueUrl: provider.issueUrl(issue),
-            repoFullName: `${mapping.owner}/${mapping.repo}`,
-            phase: "planning",
-          }).catch((err) => console.error(`[poll] Planning notification failed:`, err));
-        }
-        // Intentionally do NOT call markDispatched() — dedup table stays clear
-        // for the subsequent implementation dispatch.
-        try {
-          await provider.markPlanningStarted(issue.id, issue.scopeKey);
-        } catch (err) {
-          console.warn(
-            `[poll] Planning workflow dispatched for ${issue.identifier} but failed to mark planning started — next poll may re-dispatch planning:`,
-            err,
-          );
-        }
-        postBranchComment(provider, issue, planningFieldValue, mapping.defaultBranch, "planning");
-      },
+    await launchPlanningSession({
+      config, provider, issue, mapping, execPath, runnerMode, resolvedPlanningBranch, planningFieldValue,
+      deps: { dispatchSession, isDefinitiveFlyRejectionError, isDefinitiveLocalDockerLaunchFailure, shouldReleaseAdmissionOnDispatchError },
     });
     return;
   }
@@ -1624,189 +1465,28 @@ export async function dispatchPlanning(
   });
   if (!planningAdmission.ok) return;
 
-  const planningMapping = { ...mapping, workflowFile: mapping.planningWorkflowFile };
-
   // Everything below is pure prep — no launch call has fired yet. A throw anywhere in
   // here is by construction a definitive non-launch — see the matching comment in
   // dispatchGitHubActions.
-  const { ghToken, runnerImage, planningSentBaseBranch, planningContract, planningDispatchInputs } =
-    await (async () => {
-      // Build planning context (PARENT/SIBLINGS/DEPENDENCIES) only once admission is
-      // confirmed: this is a real network call (Linear GraphQL lookup) and must not run
-      // before capacity is reserved (AII-783 review on PR #681).
-      const planningContextInputs = await buildPlanningContextInputs({
-        issue,
-        ticketingProviderId: provider.id,
-      });
-
-      const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
-
-      let runnerCallbackUrl = "";
-      let runToken = "";
-      if (config.runnerCallbackBaseUrl && config.runnerTokenSecret) {
-        const minted = mintRunToken({
-          issueId: issue.id,
-          mappingTeamKey: issue.scopeKey,
-          phase: "planning",
-          audience: "result",
-          dispatchId,
-          ttlSeconds: PLANNING_TTL_SECONDS,
-          secret: config.runnerTokenSecret,
-        });
-        runnerCallbackUrl = config.runnerCallbackBaseUrl;
-        runToken = minted.token;
-      }
-
-      // Forward the resolved runner image so GHA planning honors the orchestrator's
-      // channel and per-repo `.ai-implement/image.yml` override, exactly as the
-      // implementation dispatch does. claude-plan.yml's validate-runner-image step
-      // does not read image.yml itself, so this is the only path by which GHA
-      // planning picks up either. Only sent when explicit (override or explicit
-      // SESSION_IMAGE/AI_IMPLEMENT_RUNNER_IMAGE), so repos that haven't re-synced
-      // claude-plan.yml are not rejected with a 422 "unexpected inputs".
-      const runnerImage = await resolveDispatchRunnerImage(config, mapping, ghToken);
-
-      // Only forward base_branch when it differs from the repo default — same guard as the
-      // implementation dispatch: GitHub rejects unknown workflow_dispatch inputs with 422,
-      // so repos that have not re-synced claude-plan.yml keep working on the common path.
-      // Legacy contract only; under the envelope the branch rides inside run_config.
-      const planningSentBaseBranch = resolvedPlanningBranch !== mapping.defaultBranch;
-
-      const planningContract = await resolveWorkflowContract({
-        owner: mapping.owner,
-        repo: mapping.repo,
-        workflowFile: mapping.planningWorkflowFile,
-        token: ghToken,
-        ref: mapping.defaultBranch,
-      });
-
-      const planningDispatchInputs = planningContract === "envelope"
-        ? buildEnvelopeDispatchInputs(planningMapping, issue, {
-            runnerPhase: "planning",
-            // Base branch for the planning clone. Rides inside run_config on the envelope.
-            baseBranch: planningSentBaseBranch ? resolvedPlanningBranch : undefined,
-            runnerCallbackUrl: runnerCallbackUrl || undefined,
-            runToken,
-            // No runProgressToken: planning dispatches don't mint progress tokens.
-            runnerImage,
-            planningContext: planningContextInputs,
-            // Planning has no retry loop, so nothing is stamped — but retryPolicy is
-            // required on EnvelopeDispatchOpts, so every call site must say so explicitly.
-            retryPolicy: null,
-          })
-        : {
-            issue_id: issue.id,
-            issue_identifier: issue.identifier,
-            issue_title: issue.title,
-            issue_description: issue.description || issue.title,
-            ...planningContextInputs,
-            ...providerDispatchFields(planningMapping),
-            // Gated: an empty spread when unset, so legacy repos on the common path still
-            // send no unexpected inputs and cannot 422.
-            ...(planningSentBaseBranch ? { base_branch: resolvedPlanningBranch } : {}),
-            runner_callback_url: runnerCallbackUrl,
-            run_token: runToken,
-            ...(runnerImage ? { runner_image: runnerImage } : {}),
-          };
-
-      return { ghToken, runnerCallbackUrl, runToken, runnerImage, planningSentBaseBranch, planningContract, planningDispatchInputs };
-    })().catch((err) => {
-      planningAdmission.release("launch_rejected");
-      throw err;
-    });
-
-  // returnRunDetails (AII-778): outcome "rejected" is the only signal precise enough to
-  // treat as a definitive non-launch — see the matching comment in dispatchGitHubActions.
-  const result = await postWorkflowDispatch({
-    token: ghToken,
-    owner: planningMapping.owner,
-    repo: planningMapping.repo,
-    workflowFile: planningMapping.workflowFile,
-    ref: planningMapping.defaultBranch,
-    inputs: planningDispatchInputs,
-    returnRunDetails: true,
+  const launch = await preparePlanningLaunch({
+    config, provider, issue, mapping, dispatchId, resolvedPlanningBranch,
+    resolveRunnerImage: resolveDispatchRunnerImage,
+  }).catch((err) => {
+    planningAdmission.release("launch_rejected");
+    throw err;
   });
 
-  if (!result.success) {
-    await surfaceDispatchFailure(
-      result,
-      config.notifyType,
-      config.notifyWebhookUrl,
-      {
-        site: "poll",
-        issueId: issue.id,
-        issueIdentifier: issue.identifier,
-        issueTitle: issue.title,
-        teamKey: issue.scopeKey,
-        repo: `${mapping.owner}/${mapping.repo}`,
-        workflowFile: mapping.planningWorkflowFile,
-        contract: planningContract,
-        issueUrl: provider.issueUrl(issue),
-        issueState: issue.nativeStatus,
-        phase: "planning",
-      },
-    );
-    if (result.outcome === "rejected") {
-      planningAdmission.release("launch_rejected");
-    }
-    // Same legacy-only, content-gated attribution as the implementation path: under the
-    // envelope base_branch is not an input at all, and planningSentBaseBranch alone is
-    // not a reliable signal, so require the error body to mention base_branch before
-    // blaming a stale claude-plan.yml.
-    if (planningContract === "legacy" && result.status === 422 && planningSentBaseBranch && /base_branch/.test(result.error ?? "")) {
-      await provider.markPlanningFailed(
-        issue.id,
-        issue.scopeKey,
-        "dispatch rejected (422): target repo must re-sync claude-plan.yml to accept the base_branch input",
-      );
-    }
-    // Planning never writes a dedup row (intentional), but we still count the failure.
-    const _brPlan = recordDispatchFailure(issue.id, "planning", "workflow_dispatch_failed");
-    if (_brPlan.tripped) {
-      await fireBreakerTrip(config, provider, issue.id, issue.identifier, "planning", _brPlan.failures, "workflow_dispatch_failed");
-    }
-    return;
-  }
-
-  appendLog({
-    issueId: issue.id,
-    issueIdentifier: issue.identifier,
-    issueTitle: issue.title,
-    teamKey: issue.scopeKey,
-    repo: `${mapping.owner}/${mapping.repo}`,
-    issueState: issue.nativeStatus,
-    dispatchId,
+  const launched = await launchPlanningRun({
+    ...launch,
+    config, provider, issue, mapping, dispatchId,
     admissionGeneration: planningAdmission.admissionGeneration,
-    executionMode: "github-actions",
-    phase: "planning",
-    sessionImage: runnerImage ?? null,
-    contract: planningContract,
+    planningFieldValue,
+    fireBreakerTrip,
+    onRejected: () => planningAdmission.release("launch_rejected"),
   });
+  if (launched.outcome !== "accepted") return;
 
-  if (config.notifyWebhookUrl) {
-    notify(config.notifyType, config.notifyWebhookUrl, {
-      issueIdentifier: issue.identifier,
-      issueTitle: issue.title,
-      issueUrl: provider.issueUrl(issue),
-      repoFullName: `${mapping.owner}/${mapping.repo}`,
-      phase: "planning",
-    }).catch((err) => console.error(`[poll] Planning notification failed:`, err));
-  }
-
-  // Intentionally do NOT call markDispatched() so the dedup table stays clear
-  // for the subsequent implementation dispatch.
-  try {
-    await provider.markPlanningStarted(issue.id, issue.scopeKey);
-  } catch (err) {
-    console.warn(
-      `[poll] Planning workflow dispatched for ${issue.identifier} but failed to mark planning started — next poll may re-dispatch planning:`,
-      err,
-    );
-  }
-
-  postBranchComment(provider, issue, planningFieldValue, mapping.defaultBranch, "planning");
-
-  console.log(`[poll] Dispatched planning for ${issue.identifier} -> ${mapping.owner}/${mapping.repo} (${mapping.planningWorkflowFile}, image: ${runnerImage ?? "workflow-default"})`);
+  console.log(`[poll] Dispatched planning for ${issue.identifier} -> ${mapping.owner}/${mapping.repo} (${mapping.planningWorkflowFile}, image: ${launch.runnerImage ?? "workflow-default"})`);
 }
 
 // ---------- Shared session-dispatch core ----------
@@ -1862,7 +1542,20 @@ export function shouldReleaseAdmissionOnDispatchError(
   return !launchAttempted || (isDefinitiveLaunchFailure?.(err) ?? false);
 }
 
-async function dispatchSession(
+/** A reservation the caller of `dispatchSession` already holds. The caller owns it, so
+ * `dispatchSession` neither acquires nor releases it. */
+export interface HeldReservation {
+  dispatchId: string;
+  admission: Extract<AcquireDispatchOutcome, { ok: true }>;
+}
+
+/** What `dispatchSession` reports to a caller that cares (the shadow and implementation
+ * callers ignore it). `admitted: false` means `acquireDispatch` refused and nothing ran. */
+export type DispatchSessionResult =
+  | { admitted: false }
+  | { admitted: true; machineId: string; executionMode: "fly-machines" | "local-docker" };
+
+export async function dispatchSession(
   config: AppConfig,
   provider: TicketingProvider,
   issue: DispatchableIssue,
@@ -1912,16 +1605,19 @@ async function dispatchSession(
      *  for the comment text. */
     branchInfo?: { fieldValue: string | null; defaultBranch: string };
   },
-): Promise<void> {
+  /** A reservation the caller already holds. When given, its dispatch id is used,
+   *  `acquireDispatch` is not called, and the reservation is never released here. */
+  reservation?: HeldReservation,
+): Promise<DispatchSessionResult> {
   const sessionToken = generateSessionToken();
   const machineNonce = generateMachineNonce();
-  const dispatchId = crypto.randomUUID();
+  const dispatchId = reservation?.dispatchId ?? crypto.randomUUID();
 
   // Final admission authority — see the matching comment in dispatchGitHubActions.
   // Skipped for the shadow Fly mirror: the primary (GHA) dispatch already holds the
   // reservation for this issue, and the shadow run is not a competing dispatch path.
   let admission: Extract<AcquireDispatchOutcome, { ok: true }> | null = null;
-  if (!opts.shadow) {
+  if (!opts.shadow && !reservation) {
     const decision = acquireDispatch({
       dispatchId,
       issueId: issue.id,
@@ -1931,7 +1627,7 @@ async function dispatchSession(
       maxInProgressAiIssues: mapping.maxInProgressAiIssues,
       backend: opts.backendKind,
     });
-    if (!decision.ok) return;
+    if (!decision.ok) return { admitted: false };
     admission = decision;
   }
 
@@ -1981,7 +1677,7 @@ async function dispatchSession(
       repo: `${mapping.owner}/${mapping.repo}`,
       issueState: issue.nativeStatus,
       dispatchId,
-      admissionGeneration: admission?.admissionGeneration ?? null,
+      admissionGeneration: (admission ?? reservation?.admission)?.admissionGeneration ?? null,
       dispatchNumber: prior.count + 1,
       executionMode: result.executionMode,
       machineNonce,
@@ -2030,6 +1726,8 @@ async function dispatchSession(
     }
     throw err;
   }
+
+  return { admitted: true, machineId: result.machineId, executionMode: result.executionMode };
 }
 
 // ---------- Dispatch: Fly Machines ----------
@@ -2583,27 +2281,12 @@ export async function confirmAdmissionTerminated(
 
   if (job.executionMode === "fly-machines") {
     if (!job.machineId) return false;
-    if (!config.flySessionsToken || !config.flySessionsApp) return false;
-    try {
-      const machine = await getMachine(config.flySessionsToken, config.flySessionsApp, job.machineId);
-      return machine.state === "destroyed" || machine.state === "stopped";
-    } catch (err) {
-      if (err instanceof Error && err.message.includes("404")) return true; // already gone
-      console.error(`[admission] Failed to check Fly machine state for dispatch=${candidate.dispatchId}:`, err);
-      return false;
-    }
+    return (await classifyFlyMachine(config, job.machineId)) === "ended";
   }
 
   if (job.executionMode === "local-docker") {
     if (!job.machineId) return false;
-    try {
-      const state = await inspectLocalContainer(job.machineId);
-      return !state.running;
-    } catch (err) {
-      // `docker inspect` fails identically for "container gone" and "daemon
-      // unreachable" — only the former is safe to treat as confirmed-terminated.
-      return err instanceof Error && /No such container/i.test(err.message);
-    }
+    return (await classifyLocalContainer(job.machineId)) === "ended";
   }
 
   return false;
@@ -4844,7 +4527,10 @@ function startServer(
             notifyType: config.notifyType,
             notifyWebhookUrl: config.notifyWebhookUrl,
           },
-          checkPlanningAdmissionTermination: (dispatchId) => tryFastReleasePlanningAdmission(config, dispatchId),
+          checkPlanningAdmissionTermination: createPlanningAdmissionTerminationHook({
+            ingress: createPlanningRunIngressClient(),
+            legacy: (dispatchId) => tryFastReleasePlanningAdmission(config, dispatchId),
+          }),
           onReviewFixResult,
           kgRefreshClient: kgRefreshIngressClient,
           kgSourceRepo: config.kgSourceRepo,
@@ -5398,8 +5084,19 @@ async function main(): Promise<void> {
     : null;
   setKgRefreshToolDeps(kgComposition?.toolDeps ?? null);
   const kgServices = kgComposition?.services ?? [];
+  // The PlanningRun workflow (AII-1020, AII-1054): registered; `dispatchPlanning` submits it for a project on the Restate lifecycle.
+  const planningRunServices = createProductionPlanningRunServices({
+    config,
+    resolveProvider: (mapping) => registry.forMapping(mapping),
+    resolveRunnerImage: resolveDispatchRunnerImage,
+    fireBreakerTrip,
+    preparePlanningLaunch,
+    launchPlanningRun,
+    launchPlanningSession,
+    sessionDeps: { dispatchSession, isDefinitiveFlyRejectionError, isDefinitiveLocalDockerLaunchFailure, shouldReleaseAdmissionOnDispatchError },
+  }).services;
   const restateRegistration = createRestateRegistrationGate(() => shuttingDown, {
-    startRestateEndpoint: () => startRestateEndpoint([...RESTATE_SERVICES, ...reviewFixServices, ...kgServices], restateSidecar.identityKey),
+    startRestateEndpoint: () => startRestateEndpoint([...RESTATE_SERVICES, ...reviewFixServices, ...kgServices, ...planningRunServices], restateSidecar.identityKey),
     registerRestateEndpoint,
   });
   // A sidecar which becomes ready after its initial timeout still registers the

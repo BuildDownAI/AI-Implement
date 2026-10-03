@@ -4,6 +4,16 @@
 
 This pilot moves **automatic GitHub Actions review-fix attempts** to Restate. The runner's internal review/fix cycles, local review-fix runs, and human comment-triggered gap-fill runs stay on their existing lifecycle. SQLite owns accepted feedback, finding versions, attempt snapshots, reservations, and final outcomes. Restate owns durable coordination and waits. A project defaults to Legacy; a change selects only future automatic attempts. An active attempt keeps its recorded owner. See [ADR 030](./adr/030-share-atomic-dispatch-admission-across-run-owners.md), [ADR 031](./adr/031-control-review-fix-attempts-with-restate.md), and [ADR 018](./adr/018-adopt-restate-one-run-kind-at-a-time.md).
 
+## The switch also selects the planning lifecycle (AII-1021)
+
+The project's **Review-fix & Planning Lifecycle** switch (`reviewFixLifecycle`) also selects who owns a planning reservation. With `restate`, `dispatchPlanning` reserves with owner `restate:<dispatchId>` and submits `PlanningRun/{dispatchId}` through the loopback ingress; the workflow launches the run, waits, and releases the reservation (at the latest at the planning deadline). `dispatchPlanning` never launches for such a project. With `legacy` or unset, the current path is unchanged on every backend. Implementation, gap-fill, and review-fix dispatch are not affected by this part of the switch.
+
+- **Restate unavailable** (sidecar not `ready` or endpoint not `registered`): no reservation and no dispatch. The poll logs `[poll] Planning for <key> skipped: Restate unavailable` and the ticket stays queued for the next poll. If `submit` answers `unavailable`, the reservation is released as `launch_rejected` with the same line. A `conflict` answer leaves the reservation to the existing workflow.
+- **Fly Machines and local Docker:** the save check still requires execution mode `github-actions`, so a pilot project reaches Fly or local planning only through the global runner mode (`/admin#runners` or `POST /api/runner-mode`). The `PlanningRun` input names the backend from the resolved execution path, and the same workflow owns the reservation there.
+- **Self-deploy drain:** a pilot planning run in flight counts as an active owner, so a drain waits for it (at most the planning deadline).
+- **Rollback:** set the project's switch to `legacy`. A run already submitted keeps its workflow owner until it releases.
+- **Known gap:** a process crash between the reservation and `submit` leaves a Restate-owned row with no workflow; the Legacy sweeps skip it by design, so an operator clears it by hand.
+
 ## Before enabling SAN
 
 1. Confirm the feature branch and all its child checks have landed in the deployment target. Use the [fault-coverage record](./restate-testing.md) to separate real-engine/SQLite evidence from mocked GitHub/tracker behavior. The container suite is a prerequisite, not a live recovery claim.
