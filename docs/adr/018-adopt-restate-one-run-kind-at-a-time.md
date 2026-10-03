@@ -1,7 +1,7 @@
 # 018. Adopt Restate one run kind at a time; the run-ledger program is contingent
 
-**Status:** Proposed
-**Date:** 2026-09-10. Amended 2026-09-14: case order swapped; the three-slice rule added. Amended 2026-09-23: the review-fix pilot becomes the first run lifecycle.
+**Status:** Accepted
+**Date:** 2026-09-10. Amended 2026-09-14: case order swapped; the three-slice rule added. Amended 2026-09-23: the review-fix pilot becomes the first run lifecycle. Amended 2026-10-01: the rule 7 gate is closed.
 
 ## Context
 
@@ -40,3 +40,20 @@ We adopt Restate one run kind at a time and make the run-ledger program continge
 ## Amendment (2026-09-28): kg-refresh starts on the pilot's integrated evidence
 
 Rule 8 required the review-fix pilot's live restart recovery and one week of operating evidence before kg-refresh starts. The operator (John, with Cameron) decided on 2026-09-28 to start kg-refresh on the pilot's integrated evidence: PR #722 merged into `testing` as `6f79b09`, the AII-813 fault matrix, and 131 pinned Restate tests green. The SAN live evaluation (AII-815) continues in parallel and no longer gates AII-682. The matching bullet in ADR 031 is amended the same way. Rule 7's evaluation gate after two migrations is unchanged.
+
+## Amendment (2026-10-01): the rule 7 gate is closed; the main pipeline migrates the same way
+
+**Decision.** The operator (John) closes the evaluation gate of rule 7. The main pipeline migrates to Restate the same way: one run kind, or one bounded slice of a run kind, at a time, under rules 4, 5, and 6. ADR 017, ADR 018, and ADR 023 move to Accepted.
+
+**The two migrations.**
+
+- Review-fix pilot: PR #722 merged into `testing` as `6f79b09`, with the AII-813 fault matrix and 131 pinned Restate tests.
+- kg-refresh (AII-682): top-of-tree PR #820 merged into `testing` as `aad256d`. The legacy state machine, the reaper rules, and the kg-refresh GHA monitor are deleted (AII-685).
+
+**Basis.** The gate closes on integrated test evidence, not on live operating evidence. The SAN live evaluation (AII-815) and the live kg-refresh proof on the testing orchestrator continue. If either fails its criteria, this amendment is reopened.
+
+**The run-ledger program (AII-611) is narrowed.** Verify-only token handling is no longer part of AII-611: each migration flips its own callback branch (rule 4). The signed report payload and credential scoping at the process boundary stay as the scope of AII-611 and get their own decision. Their two design records are in draft PR #495 and are not merged.
+
+**End state for tokens.** The split in "Consequences" is temporary. Each report path becomes verify-only when its run kind migrates. No path stays on single-use tokens after the last migration.
+
+**What this removes.** Later migrations need no amendment to pass rule 7. The GitHub Actions planning run (AII-1018) is the first slice under this decision.
