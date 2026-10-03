@@ -17,7 +17,7 @@ export type PlanningIngressResult =
   | { readonly status: "unavailable" };
 
 export interface PlanningRunIngressClient {
-  /** Starts the workflow keyed by `dispatchId`; the idempotency key is the dispatch id. */
+  /** Starts the workflow keyed by `dispatchId`; the workflow key is the idempotency (Restate rejects an idempotency key on a workflow handler with HTTP 400). */
   submit(dispatchId: string, input: PlanningRunInput): Promise<PlanningIngressResult>;
   /** Resolves the workflow's `report` promise. */
   report(dispatchId: string): Promise<PlanningIngressResult>;
@@ -54,7 +54,7 @@ export function createPlanningRunIngressClient(
 
   return {
     submit: (dispatchId, input) =>
-      invoke(() => workflow(dispatchId).workflowSubmit(input, restateClients.SendOpts.from({ idempotencyKey: dispatchId }))),
+      invoke(() => workflow(dispatchId).workflowSubmit(input)),
     report: (dispatchId) => invoke(() => workflow(dispatchId).report(restateClients.rpc.opts({ timeout }))),
   };
 }

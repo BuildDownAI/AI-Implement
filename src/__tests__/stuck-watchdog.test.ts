@@ -25,6 +25,10 @@ vi.mock("../dedup.js", () => ({
   deleteDispatched: vi.fn(),
 }));
 
+vi.mock("../dispatch-admission.js", () => ({
+  read: vi.fn().mockReturnValue(null),
+}));
+
 vi.mock("../notify.js", () => ({
   notifyStuckGiveUp: vi.fn().mockResolvedValue(undefined),
 }));
@@ -34,6 +38,7 @@ import { incrementStuckAttempts, updateJobStatus, getJobById } from "../log.js";
 import { deleteDispatched } from "../dedup.js";
 import { notifyStuckGiveUp } from "../notify.js";
 import { cancelWorkflowRun, getWorkflowRunStatus } from "../github.js";
+import { read as readAdmission } from "../dispatch-admission.js";
 
 const mockConfig = {
   githubAppId: "12345",
@@ -278,5 +283,35 @@ describe("remediateFailedJob — operator_cancelled guard", () => {
     await remediateFailedJob(mockConfig, provider, job, "failure");
 
     expect(incrementStuckAttempts).toHaveBeenCalled();
+  });
+});
+
+describe("remediateFailedJob — Restate-owned job (AII-1020)", () => {
+  const provider = { clearWorkingState: vi.fn().mockResolvedValue(true) } as unknown as TicketingProvider;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(incrementStuckAttempts).mockReturnValue(1);
+    vi.mocked(getJobById).mockReturnValue(null as never);
+    vi.mocked(readAdmission).mockReturnValue({ lifecycleOwner: { kind: "restate", attemptId: "d-1" } } as never);
+  });
+
+  it("returns early without the owner option", async () => {
+    await remediateFailedJob(mockConfig, provider, makeJob({ dispatchId: "d-1", phase: "planning" }), "failure");
+    expect(incrementStuckAttempts).not.toHaveBeenCalled();
+    expect(provider.clearWorkingState).not.toHaveBeenCalled();
+    expect(deleteDispatched).not.toHaveBeenCalled();
+  });
+
+  it("runs the handling with ownerCall", async () => {
+    await remediateFailedJob(mockConfig, provider, makeJob({ dispatchId: "d-1", phase: "planning" }), "failure", { ownerCall: true });
+    expect(incrementStuckAttempts).toHaveBeenCalledWith("issue-abc");
+    expect(provider.clearWorkingState).toHaveBeenCalledOnce();
+    expect(deleteDispatched).toHaveBeenCalledWith("issue-abc");
+  });
+
+  it("ownerCall still skips kg-refresh jobs", async () => {
+    await remediateFailedJob(mockConfig, provider, makeJob({ dispatchId: "d-1", phase: "kg-refresh" }), "failure", { ownerCall: true });
+    expect(incrementStuckAttempts).not.toHaveBeenCalled();
   });
 });

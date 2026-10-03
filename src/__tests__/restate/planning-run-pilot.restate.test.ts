@@ -1,0 +1,302 @@
+// Production-composition proof for the `PlanningRun` workflow (AII-1020), against real Restate and the
+// *production* composer `createProductionPlanningRunServices` (src/restate/planning-run-production.ts).
+// Real: the composer and its deps, the `PlanningRun` workflow, the ingress client and termination hook of
+// planning-run-client.ts, SQLite (`dispatch_admissions`, `dispatch_log`, the mappings table), the admission
+// functions, and `remediateFailedJob` (wrapped only to count calls). Simulated: GitHub (the run list, run
+// status, cancel, and the installation token) and the launch functions `preparePlanningLaunch` and
+// `launchPlanningRun`, which take the place of the dispatch call and write the `dispatch_log` row as the real
+// one does. The runner callback is the test closing the row and calling the termination hook.
+//
+// One seam is mocked because the composer hard-codes it: `createPlanningRunWorkflow`, wrapped only to shorten
+// the tick, confirm and deadline intervals. Each scenario holds the workflow with `gate` and `waitForStep`.
+//
+// Run with `npm run test:restate`; excluded from `npm test`.
+import type { RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+
+const sim = vi.hoisted(() => ({
+  remediateCalls: 0,
+}));
+
+vi.mock("../../github-app-auth.js", () => ({ getInstallationToken: async () => "sim-gh-token" }));
+vi.mock("../../github.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../github.js")>()),
+  getWorkflowRunStatus: (...args: [string, string, string, number]) => gh.status(args[3]),
+  cancelWorkflowRun: async (...args: [string, string, string, number]) => { gh.cancelCalls.push(args[3]); return true; },
+}));
+vi.mock("../../stuck-watchdog.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../stuck-watchdog.js")>();
+  return {
+    ...actual,
+    remediateFailedJob: (...args: Parameters<typeof actual.remediateFailedJob>) => { sim.remediateCalls++; return actual.remediateFailedJob(...args); },
+  };
+});
+vi.mock("../../restate/planning-run-workflow.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../restate/planning-run-workflow.js")>();
+  return {
+    ...actual,
+    createPlanningRunWorkflow: (deps: Parameters<typeof actual.createPlanningRunWorkflow>[0]) =>
+      actual.createPlanningRunWorkflow({
+        ...deps,
+        tickMs: 50, confirmTickMs: 50, confirmWindowMs: 60_000, bootstrapMs: 120_000, totalMs: 240_000, stopMarginMs: 60_000,
+      }),
+  };
+});
+
+import { getDb } from "../../dedup.js";
+import { initMappingsTable } from "../../config.js";
+import { acquire, read as readAdmission, reconcileTerminalCallbackAdmissions, sweepStaleAdmissions } from "../../dispatch-admission.js";
+import { appendLog, getJobByDispatchId, initLogTable, updateJobStatus } from "../../log.js";
+import { PLANNING_RUN_TITLE_PREFIX, createProductionPlanningRunServices } from "../../restate/planning-run-production.js";
+import { createPlanningAdmissionTerminationHook, createPlanningRunIngressClient } from "../../restate/planning-run-client.js";
+import type { PlanningRunInput, PlanningRunStatusResult } from "../../restate/planning-run-workflow.js";
+import { createReviewFixAdminFacade } from "../../review-fix-admin-facade.js";
+import { SqliteReviewFixAttemptStore } from "../../review-fix-attempt-store.js";
+import { listActiveRestateReviewFixPrs, queueReviewFixCancellationForClosedPr } from "../../review-fix-close.js";
+import { mintPreparedReviewFixToken } from "../../runner-tokens.js";
+import { VARIANTS, callWorkflow, eventually, gate, startVariants, stopAll, waitForStep, type Gate } from "./harness.js";
+
+const OWNER = "TestOrg";
+const REPO = "test-repo";
+const TEAM = "PLT";
+const realFetch = globalThis.fetch;
+
+interface SimRun { id: number; title: string; createdAt: string; status: string }
+
+/** The simulated GitHub, reset per scenario. */
+const gh = {
+  runs: [] as SimRun[],
+  cancelCalls: [] as number[],
+  statusReads: [] as number[],
+  /** Holds the first run-status read of a scenario until the test releases it. */
+  statusGate: undefined as Gate | undefined,
+  nextRunId: 5_000,
+  async status(runId: number): Promise<{ status: string; conclusion: string | null; html_url: string } | null> {
+    this.statusReads.push(runId);
+    const g = this.statusGate;
+    if (g && !g.isReached()) await g.wait();
+    const run = this.runs.find((r) => r.id === runId);
+    return run ? { status: run.status, conclusion: null, html_url: `https://github.test/run/${runId}` } : null;
+  },
+  reset() {
+    this.runs = []; this.cancelCalls = []; this.statusReads = []; this.statusGate = undefined; this.nextRunId = 5_000;
+  },
+};
+
+/** Per-scenario launch behaviour, keyed by the issue identifier. */
+const launches: string[] = [];
+let launchAckLost = false;
+const clearedIssues: string[] = [];
+const issues = new Map<string, { id: string; identifier: string; title: string; scopeKey: string; nativeStatus: string }>();
+
+describe("Restate PlanningRun pilot: production-composition proof", () => {
+  let environments: Map<string, RestateTestEnvironment>;
+  let counter = 0;
+
+  beforeAll(async () => {
+    getDb();
+    initLogTable();
+    initMappingsTable();
+    getDb().prepare(`
+      INSERT OR REPLACE INTO mappings (team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, planning_workflow_file)
+      VALUES (?, ?, ?, 'claude-implement.yml', 'main', 10, 'claude-plan.yml')
+    `).run(TEAM, OWNER, REPO);
+
+    // Only the GitHub REST reads of the composer are simulated; the harness and the ingress client use the real fetch.
+    vi.stubGlobal("fetch", async (url: string | URL | Request, init?: RequestInit) => {
+      const href = typeof url === "string" ? url : url instanceof URL ? url.href : url.url;
+      if (!href.startsWith("https://api.github.com/")) return realFetch(url as never, init);
+      if (!href.includes(`/repos/${OWNER}/${REPO}/actions/workflows/claude-plan.yml/runs`)) throw new Error(`unexpected GitHub call ${href}`);
+      return new Response(JSON.stringify({
+        workflow_runs: gh.runs.map((r) => ({ id: r.id, display_title: r.title, created_at: r.createdAt })),
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    });
+
+    const provider = {
+      id: "linear",
+      findByKey: async (key: string) => issues.get(key) ?? null,
+      clearWorkingState: async (issueId: string) => { clearedIssues.push(issueId); return true; },
+    };
+    const composed = createProductionPlanningRunServices({
+      config: { githubAppId: "1", githubAppPrivateKey: "k", notifyType: "slack", notifyWebhookUrl: null } as never,
+      resolveProvider: async () => provider as never,
+      resolveRunnerImage: async () => undefined,
+      fireBreakerTrip: async () => {},
+      preparePlanningLaunch: (async () => ({
+        ghToken: "sim-gh-token", runnerImage: undefined, planningSentBaseBranch: false, planningContract: "envelope", planningDispatchInputs: {},
+      })) as never,
+      launchPlanningRun: (async (args: { issue: { id: string; identifier: string; title: string; scopeKey: string; nativeStatus: string }; dispatchId: string; admissionGeneration: number }) => {
+        launches.push(args.issue.identifier);
+        // The real function writes the row after the dispatch call succeeds.
+        appendLog({
+          issueId: args.issue.id, issueIdentifier: args.issue.identifier, issueTitle: args.issue.title, teamKey: args.issue.scopeKey,
+          repo: `${OWNER}/${REPO}`, dispatchId: args.dispatchId, admissionGeneration: args.admissionGeneration,
+          executionMode: "github-actions", phase: "planning",
+        });
+        // A GitHub run created by the dispatch, titled by the workflow's run-name.
+        const run: SimRun = {
+          id: gh.nextRunId++, title: `${PLANNING_RUN_TITLE_PREFIX}${args.issue.identifier}`,
+          createdAt: new Date().toISOString(), status: "in_progress",
+        };
+        gh.runs.push(run);
+        // Acknowledgement lost: the dispatch happened but no run id came back, so the workflow binds by title.
+        return launchAckLost ? { outcome: "unknown" } : { outcome: "accepted", runId: run.id };
+      }) as never,
+    });
+    environments = await startVariants(composed.services);
+  }, 60_000);
+
+  afterAll(async () => {
+    vi.unstubAllGlobals();
+    if (environments) await stopAll(environments);
+  });
+
+  beforeEach(() => {
+    gh.reset();
+    launches.length = 0;
+    clearedIssues.length = 0;
+    launchAckLost = false;
+    sim.remediateCalls = 0;
+    getDb().prepare("DELETE FROM dispatch_log").run();
+  });
+
+  const labels = VARIANTS.map(([label]) => label);
+
+  function baseUrl(label: string): string {
+    const env = environments.get(label);
+    if (!env) throw new Error(`missing Restate variant ${label}`);
+    return env.baseUrl();
+  }
+
+  /** Reserves capacity with the workflow as owner, as the switched `dispatchPlanning` will, and submits the run. */
+  async function dispatch(label: string, identifier: string) {
+    const dispatchId = `plan-${label}-${counter++}`;
+    const issue = { id: `id-${dispatchId}`, identifier, title: `Issue ${identifier}`, scopeKey: TEAM, nativeStatus: "Todo" };
+    issues.set(identifier, issue);
+    const decision = acquire({
+      dispatchId, mappingKey: TEAM, scope: { kind: "issue", issueScope: TEAM, issueId: issue.id }, kind: "planning",
+      backend: "github-actions", lifecycleOwner: { kind: "restate", attemptId: dispatchId }, cap: 10,
+    });
+    if (!decision.ok) throw new Error(`admission deferred: ${decision.reason}`);
+    const url = baseUrl(label);
+    const client = createPlanningRunIngressClient(url);
+    const input: PlanningRunInput = {
+      dispatchId, teamKey: TEAM, issueId: issue.id, issueIdentifier: identifier, planningContext: {}, backend: "github-actions",
+    };
+    expect(await client.submit(dispatchId, input)).toEqual({ status: "accepted" });
+    const read = () => callWorkflow<PlanningRunStatusResult>(url, "PlanningRun", dispatchId, "status");
+    const hook = createPlanningAdmissionTerminationHook({
+      ingress: client,
+      legacy: async () => { throw new Error("the Legacy fast release must not run for a Restate-owned reservation"); },
+    });
+    return { dispatchId, issue, read, hook };
+  }
+
+  const released = (dispatchId: string) => readAdmission(dispatchId)?.releasedAt != null;
+  async function untilReleased(dispatchId: string): Promise<void> {
+    await eventually(() => released(dispatchId), (ok) => ok, { label: `reservation ${dispatchId} released`, timeoutMs: 20_000 });
+  }
+
+  it.each(labels)("a callback-closed run releases the reservation and leaves the closed row alone (%s)", async (label) => {
+    gh.statusGate = gate("first status read");
+    const w = await dispatch(label, "PLT-1");
+    await gh.statusGate.reached();
+    await waitForStep(w.read, "wait");
+    expect(readAdmission(w.dispatchId)).toMatchObject({ lifecycleOwner: { kind: "restate", attemptId: w.dispatchId }, releasedAt: null });
+    expect(launches).toEqual(["PLT-1"]);
+
+    // The planning callback: it closes the row, then reports through the termination hook.
+    const rowId = getJobByDispatchId(w.dispatchId)!.id;
+    updateJobStatus(rowId, "completed", "planning_callback");
+    const closed = getJobByDispatchId(w.dispatchId)!;
+    await w.hook(w.dispatchId);
+    gh.runs[0].status = "completed";
+    gh.statusGate.release();
+
+    await untilReleased(w.dispatchId);
+    expect(readAdmission(w.dispatchId)).toMatchObject({ releaseReason: "finalized" });
+    expect(getJobByDispatchId(w.dispatchId)).toEqual(closed);
+    expect(sim.remediateCalls).toBe(0);
+    expect(clearedIssues).toEqual([]);
+  }, 60_000);
+
+  it.each(labels)("a run that ends with no callback closes the row as failed and handles the failure one time (%s)", async (label) => {
+    gh.statusGate = gate("first status read");
+    const w = await dispatch(label, "PLT-2");
+    await gh.statusGate.reached();
+    await waitForStep(w.read, "wait");
+    expect(getJobByDispatchId(w.dispatchId)).toMatchObject({ status: "running" }); // in flight, bound to its run
+
+    gh.runs[0].status = "completed";
+    gh.statusGate.release();
+    await untilReleased(w.dispatchId);
+
+    expect(getJobByDispatchId(w.dispatchId)).toMatchObject({ status: "failed" });
+    expect(readAdmission(w.dispatchId)).toMatchObject({ releaseReason: "finalized" });
+    expect(sim.remediateCalls).toBe(1);
+    expect(clearedIssues).toEqual([w.issue.id]);
+  }, 60_000);
+
+  it.each(labels)("two dispatches seconds apart bind their own runs by title and release their own reservations (%s)", async (label) => {
+    launchAckLost = true;
+    // A stale run for the first issue, created before either dispatch: it must never be bound.
+    gh.runs.push({ id: 1, title: `${PLANNING_RUN_TITLE_PREFIX}PLT-3`, createdAt: new Date(Date.now() - 3_600_000).toISOString(), status: "in_progress" });
+    gh.nextRunId = 6_000;
+    const a = await dispatch(label, "PLT-3");
+    const aRun = await eventually(() => a.read(), (s) => s.jobId !== null, { label: "first workflow bound its run" });
+    const b = await dispatch(label, "PLT-4");
+    const bRun = await eventually(() => b.read(), (s) => s.jobId !== null, { label: "second workflow bound its run" });
+
+    const titleOf = (id: string | null) => gh.runs.find((r) => String(r.id) === id)?.title;
+    expect(titleOf(aRun.jobId)).toBe(`${PLANNING_RUN_TITLE_PREFIX}PLT-3`);
+    expect(titleOf(bRun.jobId)).toBe(`${PLANNING_RUN_TITLE_PREFIX}PLT-4`);
+    expect(aRun.jobId).not.toBe("1");
+    expect(aRun.jobId).not.toBe(bRun.jobId);
+
+    // Each run ends with its own callback; only its own reservation is released.
+    for (const [w, run] of [[a, aRun], [b, bRun]] as const) {
+      updateJobStatus(getJobByDispatchId(w.dispatchId)!.id, "completed", "planning_callback");
+      await w.hook(w.dispatchId);
+      gh.runs.find((r) => String(r.id) === run.jobId)!.status = "completed";
+      await untilReleased(w.dispatchId);
+    }
+    expect(gh.statusReads).toContain(Number(aRun.jobId));
+    expect(gh.statusReads).toContain(Number(bRun.jobId));
+    expect(gh.statusReads).not.toContain(1);
+    expect(sim.remediateCalls).toBe(0);
+  }, 60_000);
+
+  it("the stale-admission sweep and the terminal-callback reconcile leave a Restate-owned planning row", async () => {
+    const dispatchId = "plan-sweep-1";
+    const decision = acquire({
+      dispatchId, mappingKey: TEAM, scope: { kind: "issue", issueScope: TEAM, issueId: "id-sweep" }, kind: "planning",
+      backend: "github-actions", lifecycleOwner: { kind: "restate", attemptId: dispatchId }, cap: 10,
+    });
+    if (!decision.ok) throw new Error("admission deferred");
+    appendLog({
+      issueId: "id-sweep", teamKey: TEAM, repo: `${OWNER}/${REPO}`, dispatchId, admissionGeneration: decision.record.generation,
+      executionMode: "github-actions", phase: "planning", status: "failed",
+    });
+
+    // A negative max age makes every row stale, and the confirm callback vouches for every candidate.
+    expect(await sweepStaleAdmissions(async () => true, -1)).toEqual([]);
+    expect(await reconcileTerminalCallbackAdmissions(async () => true)).toEqual([]);
+    expect(readAdmission(dispatchId)).toMatchObject({ releasedAt: null, lifecycleOwner: { kind: "restate", attemptId: dispatchId } });
+  });
+
+  it("the review-fix readers return no row for a planning dispatch id", async () => {
+    const dispatchId = "plan-readers-1";
+    const decision = acquire({
+      dispatchId, mappingKey: TEAM, scope: { kind: "issue", issueScope: TEAM, issueId: "id-readers" }, kind: "planning",
+      backend: "github-actions", lifecycleOwner: { kind: "restate", attemptId: dispatchId }, cap: 10,
+    });
+    if (!decision.ok) throw new Error("admission deferred");
+
+    expect(listActiveRestateReviewFixPrs()).toEqual([]);
+    expect(queueReviewFixCancellationForClosedPr(`${OWNER}/${REPO}`, 1)).toBe(false);
+    const facade = createReviewFixAdminFacade(new SqliteReviewFixAttemptStore(), { reconcile: async () => ({ status: "unknown" }) });
+    expect(await facade.getAttempt(dispatchId, { role: "admin", email: "operator@example.com" })).toEqual({ status: "not_found" });
+    expect(() => mintPreparedReviewFixToken({ attemptId: dispatchId, audience: "result", secret: "s" })).toThrow(/no current authority/);
+    expect(getDb().prepare("SELECT COUNT(*) AS n FROM runner_tokens WHERE dispatch_id = ?").get(dispatchId)).toEqual({ n: 0 });
+  });
+});
