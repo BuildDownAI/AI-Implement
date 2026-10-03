@@ -17,7 +17,7 @@
 //
 // Run with `npm run test:restate`; excluded from `npm test`.
 import type { RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 const SLOW = { tickMs: 50, confirmTickMs: 50, confirmWindowMs: 60_000, bootstrapMs: 120_000, totalMs: 240_000, stopMarginMs: 60_000 };
 const DEADLINE = { tickMs: 50, confirmTickMs: 50, confirmWindowMs: 60_000, bootstrapMs: 120_000, totalMs: 1_500, stopMarginMs: 60_000 };
@@ -26,6 +26,8 @@ const sim = vi.hoisted(() => ({
   remediateCalls: 0,
   /** The intervals the next composed workflow uses. */
   timing: {} as Record<string, number>,
+  /** The Restate ingress that `dispatchPlanning` (which passes no URL) reaches. */
+  ingressUrl: "",
 }));
 
 vi.mock("../../fly-machines.js", async (importOriginal) => ({
@@ -52,6 +54,14 @@ vi.mock("../../stuck-watchdog.js", async (importOriginal) => {
     remediateFailedJob: (...args: Parameters<typeof actual.remediateFailedJob>) => { sim.remediateCalls++; return actual.remediateFailedJob(...args); },
   };
 });
+vi.mock("../../restate/planning-run-client.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../restate/planning-run-client.js")>();
+  return {
+    ...actual,
+    createPlanningRunIngressClient: (url?: string, deps?: Parameters<typeof actual.createPlanningRunIngressClient>[1]) =>
+      actual.createPlanningRunIngressClient(url ?? sim.ingressUrl, deps),
+  };
+});
 vi.mock("../../restate/planning-run-workflow.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../restate/planning-run-workflow.js")>();
   return {
@@ -65,7 +75,11 @@ vi.mock("../../restate/planning-run-workflow.js", async (importOriginal) => {
 });
 
 import { getDb } from "../../dedup.js";
+import { acquireDispatch } from "../../dispatch-gate.js";
+import { dispatchPlanning } from "../../index.js";
+import { resetRestateStatus, setRestateStatus } from "../../restate/status.js";
 import { initMappingsTable } from "../../config.js";
+import { initDispatchBreakerTable } from "../../dispatch-breaker.js";
 import { acquire, read as readAdmission, reconcileTerminalCallbackAdmissions, sweepStaleAdmissions } from "../../dispatch-admission.js";
 import { appendLog, getJobByDispatchId, initLogTable, updateJobStatus } from "../../log.js";
 import { PLANNING_RUN_TITLE_PREFIX, createProductionPlanningRunServices } from "../../restate/planning-run-production.js";
@@ -156,6 +170,7 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
     getDb();
     initLogTable();
     initMappingsTable();
+    initDispatchBreakerTable();
     getDb().prepare(`
       INSERT OR REPLACE INTO mappings (team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, planning_workflow_file)
       VALUES (?, ?, ?, 'claude-implement.yml', 'main', 10, 'claude-plan.yml')
@@ -416,6 +431,86 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
     await untilReleased(w.dispatchId);
     expect(readAdmission(w.dispatchId)).toMatchObject({ releaseReason: "finalized" });
   }, 60_000);
+
+
+  describe("the switched dispatchPlanning (AII-1021)", () => {
+    const pilotMapping = {
+      owner: OWNER, repo: REPO, workflowFile: "claude-implement.yml", planningWorkflowFile: "claude-plan.yml", defaultBranch: "main",
+      maxInProgressAiIssues: 10, provider: "anthropic", sessionMode: "default", machineCpus: 1, machineMemoryMb: 512, extraEnv: {},
+      reviewFixLifecycle: "restate",
+    } as never;
+    const provider = { id: "jira" } as never;
+    const planningCtx = (execPath: PlanningRunInput["backend"]) =>
+      ({ execPath, runnerMode: "default", resolvedPlanningBranch: "main", planningFieldValue: null }) as never;
+
+    beforeEach(() => setRestateStatus({ sidecar: { state: "ready" }, registration: { state: "registered" } }));
+    afterEach(() => resetRestateStatus());
+
+    /** The planning row `dispatchPlanning` reserved for this issue. */
+    const reservationOf = (issueId: string) => {
+      const row = getDb().prepare("SELECT dispatch_id FROM dispatch_admissions WHERE issue_id = ? AND phase = 'planning' ORDER BY rowid DESC LIMIT 1").get(issueId) as { dispatch_id: string } | undefined;
+      return row ? readAdmission(row.dispatch_id) : null;
+    };
+
+    it.each(labels)("two issues dispatched seconds apart each release their own reservation, and implementation then admits each (%s)", async (label) => {
+      sim.ingressUrl = baseUrl(label);
+      launchAckLost = true;
+      const mk = (identifier: string) => {
+        const issue = { id: `id-${label}-${identifier}`, identifier, title: `Issue ${identifier}`, scopeKey: TEAM, nativeStatus: "Todo" };
+        issues.set(identifier, issue);
+        return issue;
+      };
+      const a = mk("PLT-20");
+      const b = mk("PLT-21");
+      await dispatchPlanning({} as never, provider, a as never, pilotMapping, planningCtx("github-actions"));
+      await dispatchPlanning({} as never, provider, b as never, pilotMapping, planningCtx("github-actions"));
+      const resA = reservationOf(a.id)!;
+      const resB = reservationOf(b.id)!;
+      expect(resA.lifecycleOwner).toEqual({ kind: "restate", attemptId: resA.dispatchId });
+      expect(resB.lifecycleOwner).toEqual({ kind: "restate", attemptId: resB.dispatchId });
+
+      const url = sim.ingressUrl;
+      const read = (id: string) => callWorkflow<PlanningRunStatusResult>(url, "PlanningRun", id, "status");
+      const hook = createPlanningAdmissionTerminationHook({
+        ingress: createPlanningRunIngressClient(url),
+        legacy: async () => { throw new Error("the Legacy fast release must not run for a Restate-owned reservation"); },
+      });
+      const runA = await eventually(() => read(resA.dispatchId), (s) => s.jobId !== null, { label: "first bound" });
+      const runB = await eventually(() => read(resB.dispatchId), (s) => s.jobId !== null, { label: "second bound" });
+      expect(runA.jobId).not.toBe(runB.jobId);
+
+      for (const [res, run] of [[resA, runA], [resB, runB]] as const) {
+        updateJobStatus(getJobByDispatchId(res.dispatchId)!.id, "completed", "planning_callback");
+        await hook(res.dispatchId);
+        gh.runs.find((r) => String(r.id) === run.jobId)!.status = "completed";
+        await untilReleased(res.dispatchId);
+      }
+      for (const issue of [a, b]) {
+        const impl = acquireDispatch({
+          dispatchId: `impl-${issue.id}`, issueId: issue.id, issueIdentifier: issue.identifier, kind: "implementation",
+          teamKey: TEAM, maxInProgressAiIssues: 10, backend: "github-actions",
+        });
+        expect(impl.ok).toBe(true);
+        if (impl.ok) impl.release("finalized");
+      }
+    }, 60_000);
+
+    it.each(["fly-machines", "local-docker"] as const)("a pilot planning row on %s has the workflow as owner", async (backend) => {
+      const label = labels[0];
+      sim.ingressUrl = baseUrl(label);
+      const issue = { id: `id-owner-${backend}`, identifier: `PLT-3${backend.length}`, title: "t", scopeKey: TEAM, nativeStatus: "Todo" };
+      issues.set(issue.identifier, issue);
+      await dispatchPlanning({} as never, provider, issue as never, pilotMapping, planningCtx(backend));
+      const res = reservationOf(issue.id)!;
+      expect(res).toMatchObject({ backend, lifecycleOwner: { kind: "restate", attemptId: res.dispatchId } });
+
+      // Let the workflow finish so no reservation outlives the scenario.
+      const read = () => callWorkflow<PlanningRunStatusResult>(sim.ingressUrl, "PlanningRun", res.dispatchId, "status");
+      const { jobId } = await eventually(() => read(), (st) => st.jobId !== null, { label: "bound" });
+      if (backend === "fly-machines") backends.machines.set(jobId!, "destroyed"); else backends.containers.set(jobId!, false);
+      await untilReleased(res.dispatchId);
+    }, 60_000);
+  });
 
   it("the stale-admission sweep and the terminal-callback reconcile leave a Restate-owned planning row", async () => {
     const dispatchId = "plan-sweep-1";

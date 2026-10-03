@@ -127,7 +127,8 @@ import { RestateSidecar } from "./restate/server.js";
 import { startRestateEndpoint, register as registerRestateEndpoint, RESTATE_SERVICES } from "./restate/endpoint.js";
 import { createProductionReviewFixServices } from "./restate/review-fix-production.js";
 import { createKgFindRunByTitle, createProductionKgRefreshServices, recordKgDispatchDetails } from "./restate/kg-refresh-production.js";
-import { createProductionPlanningRunServices } from "./restate/planning-run-production.js";
+import { createProductionPlanningRunServices, PLANNING_CONTEXT_BRANCH_KEY, PLANNING_CONTEXT_FIELD_VALUE_KEY } from "./restate/planning-run-production.js";
+import { createPlanningAdmissionTerminationHook, createPlanningRunIngressClient } from "./restate/planning-run-client.js";
 import { setKgRefreshToolDeps } from "./restate/tools.js";
 import type { RestateRegisterOutcome, RestateRegisterResult } from "./restate/endpoint.js";
 import { getRestateStatus, setRestateStatus } from "./restate/status.js";
@@ -1402,6 +1403,45 @@ export async function dispatchPlanning(
   ctx: PlanningDispatchContext,
 ): Promise<void> {
   const { execPath, runnerMode, resolvedPlanningBranch, planningFieldValue } = ctx;
+
+  // Pilot lifecycle: the PlanningRun workflow owns the reservation and launches the run.
+  if (resolveReviewFixLifecycle(mapping) === "restate") {
+    const restate = getRestateStatus();
+    if (restate.sidecar.state !== "ready" || restate.registration.state !== "registered") {
+      console.log(`[poll] Planning for ${issue.identifier} skipped: Restate unavailable`);
+      return;
+    }
+    const dispatchId = crypto.randomUUID();
+    const backend = execPath === "fly-machines" || execPath === "local-docker" ? execPath : "github-actions";
+    const pilotAdmission = acquireDispatch({
+      dispatchId,
+      issueId: issue.id,
+      issueIdentifier: issue.identifier,
+      kind: "planning",
+      teamKey: issue.scopeKey,
+      maxInProgressAiIssues: mapping.maxInProgressAiIssues,
+      backend,
+      lifecycleOwner: { kind: "restate", attemptId: dispatchId },
+    });
+    if (!pilotAdmission.ok) return;
+    const planningContext: Record<string, string> = { [PLANNING_CONTEXT_BRANCH_KEY]: resolvedPlanningBranch };
+    if (planningFieldValue) planningContext[PLANNING_CONTEXT_FIELD_VALUE_KEY] = planningFieldValue;
+    const submitted = await createPlanningRunIngressClient().submit(dispatchId, {
+      dispatchId,
+      teamKey: issue.scopeKey,
+      issueId: issue.id,
+      issueIdentifier: issue.identifier,
+      backend,
+      planningContext,
+    });
+    if (submitted.status === "unavailable" || submitted.status === "not-found") {
+      pilotAdmission.release("launch_rejected");
+      console.log(`[poll] Planning for ${issue.identifier} skipped: Restate unavailable`);
+      return;
+    }
+    console.log(`[poll] Submitted PlanningRun for ${issue.identifier} dispatch=${dispatchId} backend=${backend} (${submitted.status})`);
+    return;
+  }
 
   if (execPath === "fly-machines" || execPath === "local-docker") {
     await launchPlanningSession({
@@ -4487,7 +4527,10 @@ function startServer(
             notifyType: config.notifyType,
             notifyWebhookUrl: config.notifyWebhookUrl,
           },
-          checkPlanningAdmissionTermination: (dispatchId) => tryFastReleasePlanningAdmission(config, dispatchId),
+          checkPlanningAdmissionTermination: createPlanningAdmissionTerminationHook({
+            ingress: createPlanningRunIngressClient(),
+            legacy: (dispatchId) => tryFastReleasePlanningAdmission(config, dispatchId),
+          }),
           onReviewFixResult,
           kgRefreshClient: kgRefreshIngressClient,
           kgSourceRepo: config.kgSourceRepo,
@@ -5041,7 +5084,7 @@ async function main(): Promise<void> {
     : null;
   setKgRefreshToolDeps(kgComposition?.toolDeps ?? null);
   const kgServices = kgComposition?.services ?? [];
-  // The PlanningRun workflow (AII-1020, AII-1054): registered, but nothing submits it yet.
+  // The PlanningRun workflow (AII-1020, AII-1054): registered; `dispatchPlanning` submits it for a project on the Restate lifecycle.
   const planningRunServices = createProductionPlanningRunServices({
     config,
     resolveProvider: (mapping) => registry.forMapping(mapping),
