@@ -8,6 +8,8 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 import { describe, expect, it } from "vitest";
 import { eventually } from "./restate/harness.js";
+import * as harnessExports from "./restate/harness.js";
+import * as binaryEnvironmentExports from "./restate/binary-environment.js";
 
 const RESTATE_DIR = join(import.meta.dirname, "restate");
 const MARKER = "restate-test-allow:";
@@ -98,6 +100,12 @@ describe("restate tier membership", () => {
       "The default suite collects these, so they run without the Restate tier's allowlist and timeouts; " +
         "move each under src/__tests__/restate/ as *.restate.test.ts",
     ).toEqual([]);
+  });
+
+  it("ENGINE_STARTERS names every start function the harness exports", () => {
+    const exported = [...Object.keys(harnessExports), ...Object.keys(binaryEnvironmentExports)];
+    const unlisted = exported.filter((name) => name.startsWith("start") && !ENGINE_STARTERS.test(name));
+    expect(unlisted, "Add each to ENGINE_STARTERS, or the check above cannot see a test that calls it").toEqual([]);
   });
 });
 
