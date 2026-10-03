@@ -317,8 +317,10 @@ describe("awaitOwnedRun (Restate)", () => {
     });
 
     it.each(labels)("a second call after report returns ended (%s)", async (label) => {
-      const run = await begin(label, { ...PLANNING, secondCall: true }, async (call) => (call === 0 ? "unknown" : "ended"));
+      let reported = false;
+      const run = await begin(label, { ...PLANNING, secondCall: true }, async () => (reported ? "ended" : "unknown"));
       await run.send("report", { ok: true });
+      reported = true;
       const result = await run.done;
       expect(result.events).toEqual([
         { kind: "signal", name: "report", value: { ok: true } },
