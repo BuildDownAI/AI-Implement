@@ -217,6 +217,11 @@ describe("makeProvider", () => {
 });
 
 describe("makeRegistry", () => {
+  const jiraMapping = makeMapping({
+    ticketingProvider: "jira",
+    ticketingConfig: { kind: "jira", jql: "project = ENG", repoFieldValue: "test-org/test-repo" },
+  });
+
   it("is a real ProviderRegistry", () => {
     expect(makeRegistry()).toBeInstanceOf(ProviderRegistry);
   });
@@ -231,13 +236,43 @@ describe("makeRegistry", () => {
   it("keeps the real forAllMappings: one provider per distinct tracker, none for none", async () => {
     const provider = makeProvider();
     const registry = makeRegistry({ provider });
-    const jira = makeMapping({
-      ticketingProvider: "jira",
-      ticketingConfig: { kind: "jira", jql: "project = ENG", repoFieldValue: "test-org/test-repo" },
-    });
     expect(await registry.forAllMappings([])).toEqual([]);
     expect(await registry.forAllMappings([makeMapping(), makeMapping()])).toEqual([provider]);
-    expect(await registry.forAllMappings([makeMapping(), jira])).toEqual([provider, provider]);
+    expect(await registry.forAllMappings([makeMapping(), jiraMapping])).toEqual([provider, provider]);
+  });
+
+  it("routes each mapping to its tracker's provider when given one per tracker", async () => {
+    const linear = makeProvider();
+    const jira = makeProvider({ id: "jira" });
+    const registry = makeRegistry({ providers: { linear, jira } });
+    expect(await registry.forMapping(makeMapping())).toBe(linear);
+    expect(await registry.forMapping(jiraMapping)).toBe(jira);
+    expect(await registry.forAllMappings([makeMapping(), jiraMapping])).toEqual([linear, jira]);
+  });
+
+  it("fails loudly for a tracker with no provider, which the real forAllMappings skips with a warning", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const linear = makeProvider();
+    const registry = makeRegistry({ providers: { linear } });
+    await expect(registry.forMapping(jiraMapping)).rejects.toThrow('makeRegistry has no provider for tracker "jira"');
+    expect(await registry.forAllMappings([makeMapping(), jiraMapping])).toEqual([linear]);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('Skipping provider "jira"'));
+    warn.mockRestore();
+  });
+
+  it("finds an issue held by two trackers as ambiguous", async () => {
+    const issue = makeIssue();
+    const linear = makeProvider({ findByKey: vi.fn(async () => issue) });
+    const jira = makeProvider({ id: "jira", findByKey: vi.fn(async () => issue) });
+    const registry = makeRegistry({ providers: { linear, jira }, mappings: { ENG: makeMapping(), OPS: jiraMapping } });
+    expect(await registry.findByKeyInAnyTracker("ENG-1")).toEqual({ kind: "ambiguous", providerIds: ["jira", "linear"] });
+  });
+
+  it("refuses one provider and per-tracker providers together, at the type check", () => {
+    // A variable, not a literal: a literal is refused by the excess-property check alone.
+    const both = { provider: makeProvider(), providers: {} };
+    // @ts-expect-error: the two options are mutually exclusive.
+    makeRegistry(both);
   });
 
   it("keeps the real findByKeyInAnyTracker over the given mappings", async () => {

@@ -10,7 +10,7 @@ import type { Job } from "../../log.js";
 import { DefaultPipelineContext } from "../../pipeline/context.js";
 import type { LLMExecutor, LLMResult, PipelineContextData } from "../../pipeline/types.js";
 import { ProviderRegistry } from "../../providers/registry.js";
-import type { TicketIssue, TicketingProvider } from "../../providers/types.js";
+import type { ProviderId, TicketIssue, TicketingProvider } from "../../providers/types.js";
 import type { ReviewFixResultMetadataV1, ScopedPrIdentity } from "../../review-fix-contract.js";
 
 // Matches what getMappings reads back from a stored mapping: an empty planning workflow file returns as
@@ -182,24 +182,40 @@ export function makeProvider(overrides: Partial<TicketingProvider> = {}): Ticket
 
 // ProviderRegistry has private members, so only an instance of it or of a subclass satisfies its type.
 // forMapping is the one method that constructs a real provider, and the others reach providers through it,
-// so overriding it alone routes every lookup to the given provider while the rest stays real.
+// so overriding it alone routes every lookup to the given providers while the rest stays real.
 class StubProviderRegistry extends ProviderRegistry {
   constructor(
-    private readonly provider: TicketingProvider,
+    private readonly providerFor: (mapping: RepoMapping) => TicketingProvider,
     mappings: Record<string, RepoMapping>,
   ) {
     super({}, () => mappings);
   }
 
-  override async forMapping(): Promise<TicketingProvider> {
-    return this.provider;
+  override async forMapping(mapping: RepoMapping): Promise<TicketingProvider> {
+    return this.providerFor(mapping);
   }
 }
 
-export function makeRegistry(
-  { provider = makeProvider(), mappings = {} }: { provider?: TicketingProvider; mappings?: Record<string, RepoMapping> } = {},
-): ProviderRegistry {
-  return new StubProviderRegistry(provider, mappings);
+// One provider for every mapping, or one per tracker id; the `never` members make passing both a type error.
+type RegistryOptions = { mappings?: Record<string, RepoMapping> } & (
+  | { provider?: TicketingProvider; providers?: never }
+  | { providers: Partial<Record<ProviderId, TicketingProvider>>; provider?: never }
+);
+
+// A tracker missing from `providers` throws, as an unconstructable provider does in production,
+// so the real forAllMappings skips it with a warning.
+export function makeRegistry(options: RegistryOptions = {}): ProviderRegistry {
+  const mappings = options.mappings ?? {};
+  if (options.providers) {
+    const providers = options.providers;
+    return new StubProviderRegistry((mapping) => {
+      const provider = providers[mapping.ticketingProvider];
+      if (!provider) throw new Error(`makeRegistry has no provider for tracker "${mapping.ticketingProvider}"`);
+      return provider;
+    }, mappings);
+  }
+  const provider = options.provider ?? makeProvider();
+  return new StubProviderRegistry(() => provider, mappings);
 }
 
 // What loadConfig returns when only the two required variables are set: every optional integration off.
