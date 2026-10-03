@@ -47,7 +47,7 @@ const SIGNALS: Record<Shape, string[]> = {
 
 // In-process fakes the workflow's readStatus reads, keyed by workflow key. The endpoint runs in
 // this process, so a test sets the script before it starts the workflow.
-const statusScripts = new Map<string, (call: number) => Promise<OwnedRunStatus>>();
+const statusScripts = new Map<string, (read: number, call: number) => Promise<OwnedRunStatus>>();
 const statusCalls = new Map<string, number>();
 // Gates a workflow parks on before it calls the helper, keyed by workflow key.
 const holdGates = new Map<string, Gate>();
@@ -79,6 +79,8 @@ const fixture = restate.workflow({
 
       const key = ctx.key;
       let statusIndex = 0;
+      // Which awaitOwnedRun call is reading, so a script can depend on it rather than on timing.
+      let phase = 0;
       const readStatus = input.shape === "review-fix"
         ? undefined
         : async (): Promise<OwnedRunStatus> => {
@@ -86,7 +88,7 @@ const fixture = restate.workflow({
             return ctx.run(`status-${index}`, async () => {
               statusCalls.set(key, (statusCalls.get(key) ?? 0) + 1);
               const script = statusScripts.get(key);
-              return script ? script(index) : "unknown";
+              return script ? script(index, phase) : "unknown";
             });
           };
 
@@ -99,6 +101,7 @@ const fixture = restate.workflow({
       const events: OwnedRunEvent[] = [];
       let startedSeen = input.startedSeen ?? false;
       for (let call = 0; call < (input.secondCall ? 2 : 1); call++) {
+        phase = call;
         const event = await awaitOwnedRun(counting, {
           signals: SIGNALS[input.shape],
           resultSignal: "report",
@@ -156,7 +159,7 @@ describe("awaitOwnedRun (Restate)", () => {
   async function begin(
     label: string,
     input: FixtureInput,
-    script?: (call: number) => Promise<OwnedRunStatus>,
+    script?: (read: number, call: number) => Promise<OwnedRunStatus>,
     // A scenario that ends on its first tick can finish before "waiting" is observed.
     opts: { endsImmediately?: boolean } = {},
   ) {
@@ -182,7 +185,7 @@ describe("awaitOwnedRun (Restate)", () => {
   }
 
   /** A script whose first status read parks on the returned gate, then answers `unknown`. */
-  function gated(label: string): { script: (call: number) => Promise<OwnedRunStatus>; held: Gate } {
+  function gated(label: string): { script: (read: number, call: number) => Promise<OwnedRunStatus>; held: Gate } {
     const held = gate(label);
     return {
       held,
@@ -317,7 +320,8 @@ describe("awaitOwnedRun (Restate)", () => {
     });
 
     it.each(labels)("a second call after report returns ended (%s)", async (label) => {
-      const run = await begin(label, { ...PLANNING, secondCall: true }, async (call) => (call === 0 ? "unknown" : "ended"));
+      // The first call can end only on the report signal; the second sees ended on its first read.
+      const run = await begin(label, { ...PLANNING, secondCall: true }, async (_read, call) => (call === 0 ? "unknown" : "ended"));
       await run.send("report", { ok: true });
       const result = await run.done;
       expect(result.events).toEqual([
