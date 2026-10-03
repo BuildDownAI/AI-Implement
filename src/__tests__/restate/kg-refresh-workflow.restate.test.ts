@@ -78,6 +78,8 @@ interface RunScenario {
   cancelCalls: number;
   runStatusSequence: Array<{ status: string; conclusion: string | null }>;
   findByTitleResult: { runId: number } | null;
+  /** Title lookups that throw, by 1-based call number. */
+  findByTitleThrowOn?: Set<number>;
   /** Holds the first title lookup this long, so the deadline passes inside one loop iteration. */
   firstFindByTitleDelayMs?: number;
 }
@@ -96,6 +98,7 @@ describe("KgRefresh durable workflow", () => {
   let materializeCallCount = 0;
   let fetchTarballCallCount = 0;
   let fetchTarballFailure = false;
+  let fetchSnapshotShaFailure = false;
   /** The order the rail fakes ran in: fetch, stage, swap, verify. Reset per test. */
   let gateOrder: string[] = [];
   let mintTokenImpl: () => Promise<{ token: string; expiresAt: string }>;
@@ -174,7 +177,10 @@ describe("KgRefresh durable workflow", () => {
       return tarball;
     }) as unknown as KgRailDeps["fetchTarball"],
     fetchDefaultBranch: (async () => "main") as unknown as KgRailDeps["fetchDefaultBranch"],
-    fetchSnapshotCommitSha: (async () => SNAPSHOT_SHA) as unknown as KgRailDeps["fetchSnapshotCommitSha"],
+    fetchSnapshotCommitSha: (async () => {
+      if (fetchSnapshotShaFailure) throw new Error("snapshot sha lookup failed");
+      return SNAPSHOT_SHA;
+    }) as unknown as KgRailDeps["fetchSnapshotCommitSha"],
     materialize: (python: string, cwd: string) => { materializeCallCount++; gateOrder.push("stage"); return materializeImpl(python, cwd); },
     mcpToolCall,
     persistSnapshotSha: persistSnapshotShaFn,
@@ -216,6 +222,7 @@ describe("KgRefresh durable workflow", () => {
     materializeCallCount = 0;
     fetchTarballCallCount = 0;
     fetchTarballFailure = false;
+    fetchSnapshotShaFailure = false;
     gateOrder = [];
     holdNextMcpCall = null;
     reserveFailuresRemaining = 0;
@@ -249,7 +256,7 @@ describe("KgRefresh durable workflow", () => {
   const mintedDispatchIds: string[] = [];
   const closeRowCalls: Array<{ jobId: string; status: string; conclusion?: string }> = [];
   const persistCalls: RefreshOutcome[] = [];
-  const onOutcomeCalls: Array<{ kind: "success" | "failure"; outcome: RefreshOutcome }> = [];
+  const onOutcomeCalls: Array<{ kind: "success" | "no-new-data" | "failure"; outcome: RefreshOutcome; meta: { failureCode?: string; timedOut?: boolean; dispatchId?: string } }> = [];
   let runIdCounter = 9_000;
 
   function newTriggerId(): string {
@@ -310,6 +317,7 @@ describe("KgRefresh durable workflow", () => {
     const scenario = triggerId ? scenarios.get(triggerId) : undefined;
     if (!scenario) throw new Error(`no scenario registered for title "${title}"`);
     scenario.findByTitleCalls++;
+    if (scenario.findByTitleThrowOn?.has(scenario.findByTitleCalls)) throw new Error("workflow runs lookup answered HTTP 500");
     if (scenario.findByTitleCalls === 1 && scenario.firstFindByTitleDelayMs) {
       await new Promise((resolve) => setTimeout(resolve, scenario.firstFindByTitleDelayMs)); // restate-test-allow: fake dependency simulating a slow call
     }
@@ -359,7 +367,7 @@ describe("KgRefresh durable workflow", () => {
       persistCalls.push(outcome);
       if (forcePersistFailure) throw new restate.TerminalError("forced persist failure for the outer-catch release test");
     },
-    onOutcome: (kind, outcome) => { onOutcomeCalls.push({ kind, outcome }); },
+    onOutcome: (kind, outcome, meta) => { onOutcomeCalls.push({ kind, outcome, meta }); },
     watchIntervalMs: WATCH_INTERVAL_MS,
   };
   const workflow = createKgRefreshWorkflow({
@@ -550,7 +558,7 @@ describe("KgRefresh durable workflow", () => {
       expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(1);
       expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "completed" });
       expect(onOutcomeCalls.length - beforeOutcome).toBe(1);
-      expect(onOutcomeCalls[onOutcomeCalls.length - 1].kind).toBe("success");
+      expect(onOutcomeCalls[onOutcomeCalls.length - 1]).toMatchObject({ kind: "no-new-data", meta: { failureCode: "ingest-needed" } });
       // no stage/swap/verify/revert: the sidecar never restarts, nothing is persisted again,
       // and no staging directory is ever created.
       expect(restartCallCount - beforeRestart).toBe(0);
@@ -630,6 +638,29 @@ describe("KgRefresh durable workflow", () => {
   );
 
   it.each(VARIANTS.map(([label]) => label))(
+    "a RailGateError at fetch with a read context keeps the served stamp in the outcome (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+      // Throws after fetchGate has read the namespace and the served stamp.
+      fetchSnapshotShaFailure = true;
+
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      const outcome = await done;
+
+      expect(outcome.ok).toBe(false);
+      expect(outcome.gate).toBe("staging");
+      expect(outcome.stampBefore).toBe(OLD_STAMP);
+      expect(outcome.stampAfter).toBe(OLD_STAMP);
+      expect(persistCalls[persistCalls.length - 1]).toMatchObject({ stampBefore: OLD_STAMP, stampAfter: OLD_STAMP });
+    },
+    15_000,
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
     "a plain Error from the swap gate is retried by the invocation and does not revert (%s)",
     async (label) => {
       const env = envFor(label);
@@ -692,7 +723,8 @@ describe("KgRefresh durable workflow", () => {
       expect(materializeCallCount - beforeMaterialize).toBe(0);
       expect(restartCallCount - beforeRestart).toBe(0);
       expect(onOutcomeCalls.length - beforeOutcome).toBe(1);
-      expect(onOutcomeCalls[onOutcomeCalls.length - 1].kind).toBe("failure");
+      expect(onOutcomeCalls[onOutcomeCalls.length - 1]).toMatchObject({ kind: "failure", meta: { failureCode: "merge_failed" } });
+      expect(onOutcomeCalls[onOutcomeCalls.length - 1].meta.timedOut).toBeUndefined();
       await eventually(() => kgRepoStatus(env.baseUrl()), (marker) => marker === null, { label: "KgRepo marker cleared" });
     },
     15_000,
@@ -877,7 +909,7 @@ describe("KgRefresh durable workflow", () => {
       expect(outcome.ok).toBe(false);
       expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "timed_out", conclusion: "bootstrap_timeout" });
       expect(onOutcomeCalls.length - beforeOutcome).toBe(1);
-      expect(onOutcomeCalls[onOutcomeCalls.length - 1].kind).toBe("failure");
+      expect(onOutcomeCalls[onOutcomeCalls.length - 1]).toMatchObject({ kind: "failure", meta: { failureCode: "bootstrap_timeout", timedOut: true } });
       await eventually(() => kgRepoStatus(env.baseUrl()), (marker) => marker === null, { label: "KgRepo marker cleared" });
     },
     15_000,
@@ -966,7 +998,7 @@ describe("KgRefresh durable workflow", () => {
       findRunByTitle: findRunByTitleFn,
       cancelWorkflowRun: cancelWorkflowRunFn,
       persistLastRefresh: (outcome) => { persistCalls.push(outcome); },
-      onOutcome: (kind, outcome) => { onOutcomeCalls.push({ kind, outcome }); },
+      onOutcome: (kind, outcome, meta) => { onOutcomeCalls.push({ kind, outcome, meta }); },
       bootstrapDeadlineMs: scaledTick * 4,
       totalDeadlineMs: scaledTick * 24,
       watchIntervalMs: scaledTick,
@@ -1050,6 +1082,35 @@ describe("KgRefresh durable workflow", () => {
     15_000,
   );
 
+  it.each(VARIANTS.map(([label]) => label))(
+    "W8d: a failed title lookup inside dispatch is retried and never leads to a second dispatch (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      const runId = runIdCounter++;
+      makeScenario(triggerId, {
+        dispatchOutcome: "accepted", runId: undefined, executionMode: "github-actions",
+        findByTitleThrowOn: new Set([2]),
+        runStatusSequence: [{ status: "in_progress", conclusion: null }],
+      });
+      // Attempt 1: lookup (no run) then dispatch commits and the ack is lost. Attempt 2: lookup throws.
+      // Attempt 3: lookup finds the committed run.
+      dispatchThrowAfterCommit.set(triggerId, runId);
+
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      const scenario = scenarios.get(triggerId)!;
+      await eventually(() => scenario.runStatusCalls >= 1, (ok) => ok, { label: "durable effect" });
+      expect(scenario.dispatchCalls).toBe(1);
+      expect(scenario.runId).toBe(runId);
+
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      const outcome = await done;
+      expect(outcome.ok).toBe(true);
+      expect(scenario.dispatchCalls).toBe(1);
+    },
+    15_000,
+  );
+
   it("W8c: with the run id unknown the reconcile read runs at the watch interval", async () => {
     const cadenceWorkflow = createKgRefreshWorkflow({
       rail,
@@ -1062,7 +1123,7 @@ describe("KgRefresh durable workflow", () => {
       findRunByTitle: findRunByTitleFn,
       cancelWorkflowRun: cancelWorkflowRunFn,
       persistLastRefresh: (outcome) => { persistCalls.push(outcome); },
-      onOutcome: (kind, outcome) => { onOutcomeCalls.push({ kind, outcome }); },
+      onOutcome: (kind, outcome, meta) => { onOutcomeCalls.push({ kind, outcome, meta }); },
       bootstrapDeadlineMs: 1_000,
       totalDeadlineMs: 5_000,
       watchIntervalMs: 100,
@@ -1639,6 +1700,64 @@ describe("KgRefresh durable workflow", () => {
     15_000,
   );
 
+  const readAdminDryRun = (baseUrl: string) =>
+    callObject<RefreshOutcome | null>(baseUrl, "KgRepo", KG_SOURCE_REPO, "lastAdminDryRun", undefined);
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "AII-1036: an admin dry run (no report target) that passes stores its outcome under lastAdminDryRun, without the last-refresh record or a notification (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+      const beforePersist = persistCalls.length;
+      const beforeOutcome = onOutcomeCalls.length;
+      const done = runWorkflow(env.baseUrl(), triggerId, { dryRun: true });
+      await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", { ok: true });
+      const outcome = await done;
+      const stored = await eventually(() => readAdminDryRun(env.baseUrl()), (v) => v?.at === outcome.at, { label: "durable effect" });
+      expect(stored).toEqual(outcome);
+      expect(persistCalls.length - beforePersist).toBe(0);
+      expect(onOutcomeCalls.length - beforeOutcome).toBe(0);
+    },
+    15_000,
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "AII-1036: an admin dry run the guard refuses stores ok:false with its part table (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+      const partTable = [{ part: "issues", prev: "10", new: "4" }];
+      const done = runWorkflow(env.baseUrl(), triggerId, { dryRun: true });
+      await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", { ok: false, failureReason: "shrink refused", partTable });
+      const outcome = await done;
+      const stored = await eventually(() => readAdminDryRun(env.baseUrl()), (v) => v?.at === outcome.at, { label: "durable effect" });
+      expect(stored).toMatchObject({ ok: false, detail: "shrink refused", dryRun: true, partTable });
+    },
+    15_000,
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "AII-1036: an admin dry run that fails before a report stores the failure and writes no last-refresh record (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, { dispatchOutcome: "rejected", executionMode: "fly-machines" });
+      const beforePersist = persistCalls.length;
+      const beforeOutcome = onOutcomeCalls.length;
+      const outcome = await runWorkflow(env.baseUrl(), triggerId, { dryRun: true });
+      expect(outcome.ok).toBe(false);
+      const stored = await eventually(() => readAdminDryRun(env.baseUrl()), (v) => v?.at === outcome.at, { label: "durable effect" });
+      expect(stored).toMatchObject({ ok: false, dryRun: true, detail: outcome.detail });
+      expect(persistCalls.length - beforePersist).toBe(0);
+      expect(onOutcomeCalls.length - beforeOutcome).toBe(0);
+    },
+    15_000,
+  );
+
   it.each(VARIANTS.map(([label]) => label))(
     "W16: a KG_SNAPSHOT_STALE report closes the row completed with a success no-new-data outcome, no merge (%s)",
     async (label) => {
@@ -1657,7 +1776,7 @@ describe("KgRefresh durable workflow", () => {
       expect(mergePullRequestFn.mock.calls.length - beforeMerge).toBe(0);
       expect(closeRowCalls[closeRowCalls.length - 1].status).toBe("completed");
       expect(onOutcomeCalls.length - beforeOutcome).toBe(1);
-      expect(onOutcomeCalls[onOutcomeCalls.length - 1].kind).toBe("success");
+      expect(onOutcomeCalls[onOutcomeCalls.length - 1]).toMatchObject({ kind: "no-new-data", meta: { failureCode: "KG_SNAPSHOT_STALE" } });
     },
     15_000,
   );
@@ -1771,7 +1890,7 @@ describe("KgRefresh durable workflow", () => {
       findRunByTitle: findRunByTitleFn,
       cancelWorkflowRun: cancelWorkflowRunFn,
       persistLastRefresh: (outcome) => { persistCalls.push(outcome); },
-      onOutcome: (kind, outcome) => { onOutcomeCalls.push({ kind, outcome }); },
+      onOutcome: (kind, outcome, meta) => { onOutcomeCalls.push({ kind, outcome, meta }); },
       afterStageCommitted: async () => {
         stageCommittedAttempts.push(endpointId);
         if (stageCommittedAttempts.length === 1) await latch;

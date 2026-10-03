@@ -113,6 +113,9 @@ export interface KgDispatchResult {
 }
 
 /** Plain functions, every one called inside `ctx.run` — none of them may call `ctx` themselves. */
+export type KgOutcomeKind = "success" | "no-new-data" | "failure";
+export interface KgOutcomeMeta { failureCode?: string; timedOut?: boolean; dispatchId?: string }
+
 export interface KgRefreshWorkflowDependencies {
   rail: KgRailDeps;
   kgSourceRepo: string;
@@ -125,7 +128,8 @@ export interface KgRefreshWorkflowDependencies {
   findRunByTitle(title: string): Promise<{ runId: number } | null>;
   cancelWorkflowRun(runId: number): Promise<boolean>;
   persistLastRefresh(outcome: RefreshOutcome): void;
-  onOutcome(kind: "success" | "failure", outcome: RefreshOutcome): void | Promise<void>;
+  /** The kind is decided by the workflow, never inferred from `outcome.detail`. `meta.dispatchId` is the workflow key. */
+  onOutcome(kind: KgOutcomeKind, outcome: RefreshOutcome, meta: KgOutcomeMeta): void | Promise<void>;
   /** Overrides `KG_REFRESH_BOOTSTRAP_DEADLINE_MS` for a deterministic timeout test.
    *  Production composition must leave this unset so the real ten-minute deadline applies —
    *  the same test-seam shape as `ReviewFixAttemptDependencies.unknownLaunchAlertMs`
@@ -178,7 +182,7 @@ function buildFailureOutcome(at: number, detail: string, stampBefore: string | n
 /** A gate step's result: the next rail context, or a definitive gate failure. A returned
  *  failure is journaled as a success, so the engine never retries it; any other throw still
  *  retries up to `maxRetryAttempts`. */
-type GateResult = { ok: true; railCtx: RailContext } | { ok: false; gate: RefreshGate; detail: string };
+type GateResult = { ok: true; railCtx: RailContext } | { ok: false; gate: RefreshGate; detail: string; stampBefore?: string | null; namespace?: string | null };
 
 /** Message of the 404 `TerminalError` `report`/`progress` throw for a key no `run` has started under. */
 export const KG_REFRESH_NOT_FOUND_MESSAGE = "kg-refresh workflow not found";
@@ -201,7 +205,13 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         try {
           return { ok: true, railCtx: await gate(deps.rail, input) };
         } catch (err) {
-          if (err instanceof RailGateError) return { ok: false, gate: err.gate, detail: err.detail };
+          if (err instanceof RailGateError) {
+            // Keep what the gate had already read: the served graph did not change, so its stamp still stands.
+            const failed: GateResult = { ok: false, gate: err.gate, detail: err.detail };
+            if (err.context.stampBefore !== undefined) failed.stampBefore = err.context.stampBefore;
+            if (err.context.namespace !== undefined) failed.namespace = err.context.namespace;
+            return failed;
+          }
           // A terminal error from a rail dependency is as definitive as a gate error; it was never retried.
           if (err instanceof restate.TerminalError) return { ok: false, gate: "preflight", detail: err.message };
           throw err;
@@ -230,9 +240,9 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
     }
 
     /** Awaits the notification in its own retried step; a notifier outage must not turn a finished refresh into a failure. */
-    async function notifyOutcome(kind: "success" | "failure", outcome: RefreshOutcome): Promise<void> {
+    async function notifyOutcome(kind: KgOutcomeKind, outcome: RefreshOutcome, meta: KgOutcomeMeta = {}): Promise<void> {
       try {
-        await ctx.run("outcome", () => deps.onOutcome(kind, outcome), { maxRetryAttempts: 3 });
+        await ctx.run("outcome", () => deps.onOutcome(kind, outcome, { ...meta, dispatchId }), { maxRetryAttempts: 3 });
       } catch (err) {
         if (restate.internal.isSuspendedError(err)) throw err;
         if (err instanceof restate.TerminalError && err.code === 409) throw err; // invocation cancelled
@@ -253,9 +263,11 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           const dryOutcome: RefreshOutcome = { ...outcome, dryRun: true };
           ctx.objectSendClient<KgRepoDefinition>({ name: "KgRepo" }, deps.kgSourceRepo).recordDryRunOutcome({ report: input.report, outcome: dryOutcome });
           await ctx.run("dry-run-report", () => postDryRunReport(deps.rail, input.report!, dryOutcome));
+        } else {
+          ctx.objectSendClient<KgRepoDefinition>({ name: "KgRepo" }, deps.kgSourceRepo).recordAdminDryRun({ outcome: { ...outcome, dryRun: true } });
         }
       } else if (!opts.skipOutcome) {
-        await notifyOutcome("failure", outcome);
+        await notifyOutcome("failure", outcome, { failureCode: conclusion, ...(opts.timedOut ? { timedOut: true } : {}) });
       }
       return outcome;
     }
@@ -280,8 +292,9 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       const dispatchResult = await ctx.run(
         "dispatch",
         async (): Promise<KgDispatchResult> => {
+          // A lookup error throws and retries the step; only a definitive "no run" may reach the dispatch.
           // Reconcile first: a retry after a committed-but-unacknowledged dispatch must adopt that run.
-          const existing = await deps.findRunByTitle(issueIdentifier).catch(() => null);
+          const existing = await deps.findRunByTitle(issueIdentifier);
           if (existing) {
             return { outcome: "accepted", runId: existing.runId, jobId: String(existing.runId), executionMode: GHA_EXECUTION_MODE };
           }
@@ -454,6 +467,9 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           // Stored on `KgRepo` so the accept-baseline label can re-report it; journaled, so a replay sends once.
           ctx.objectSendClient<KgRepoDefinition>({ name: "KgRepo" }, deps.kgSourceRepo).recordDryRunOutcome({ report: input.report, outcome });
           await ctx.run("dry-run-report", () => postDryRunReport(deps.rail, input.report!, outcome));
+        } else {
+          // No report target (admin page or tool): the verdict is readable through get_kg_status, never the last-refresh record.
+          ctx.objectSendClient<KgRepoDefinition>({ name: "KgRepo" }, deps.kgSourceRepo).recordAdminDryRun({ outcome });
         }
         ctx.set("step", "closed");
         await ctx.run("close-row", () => deps.closeJobLog(jobId, "completed"));
@@ -468,7 +484,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           stampBefore: null, stampAfter: null,
         };
         await ctx.run("close-row", () => deps.closeJobLog(jobId, "completed"));
-        await notifyOutcome("success", outcome);
+        await notifyOutcome("no-new-data", outcome, { failureCode: report.failureCode });
         return finish(outcome);
       }
 
@@ -532,6 +548,8 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         if (!result.ok) {
           gateFailure = { gate: result.gate, detail: result.detail };
           failedGate = name;
+          if (result.stampBefore !== undefined) railCtx = { ...railCtx, stampBefore: result.stampBefore };
+          if (result.namespace !== undefined) railCtx = { ...railCtx, namespace: result.namespace };
           break;
         }
         railCtx = result.railCtx;
@@ -549,7 +567,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
             stampBefore: railCtx.stampBefore ?? null, stampAfter: railCtx.stampBefore ?? null,
           };
           await ctx.run("close-row", () => deps.closeJobLog(jobId, "completed"));
-          await notifyOutcome("success", outcome);
+          await notifyOutcome("no-new-data", outcome, { failureCode: "ingest-needed" });
           return finish(outcome);
         }
 

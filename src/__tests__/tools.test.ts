@@ -145,6 +145,7 @@ function kgToolDeps(overrides: Partial<KgRefreshToolDeps> = {}): KgRefreshToolDe
     runPreflight: async () => PREFLIGHT_OK,
     persistPreflightFailure: () => {},
     readStatusRecord: () => null,
+    readServedStamp: async () => null,
     ...overrides,
   };
 }
@@ -736,11 +737,17 @@ describe("migrated read handlers (AII-711)", () => {
     const failed = (gate: string): RefreshOutcome =>
       ({ ok: false, at: 1, gate, detail: "d", stampBefore: "a", stampAfter: null }) as RefreshOutcome;
 
-    async function stageFor(opts: { last?: RefreshOutcome | null; inFlight?: { triggerId: string; startedAt: number } | null; step?: string | null; statusThrows?: boolean }) {
-      setKgRefreshToolDeps(kgToolDeps({ readStatusRecord: () => opts.last ?? null }));
+    async function stageFor(opts: {
+      last?: RefreshOutcome | null; inFlight?: { triggerId: string; startedAt: number } | null; step?: string | null; statusThrows?: boolean;
+      dryRun?: RefreshOutcome | null; readServedStamp?: () => Promise<string | null>;
+    }) {
+      setKgRefreshToolDeps(kgToolDeps({
+        readStatusRecord: () => opts.last ?? null,
+        ...(opts.readServedStamp ? { readServedStamp: opts.readServedStamp } : {}),
+      }));
       const ctx = {
         ...fakeContext("get_kg_status"),
-        objectClient: () => ({ status: async () => opts.inFlight ?? null }),
+        objectClient: () => ({ status: async () => opts.inFlight ?? null, lastAdminDryRun: async () => opts.dryRun ?? null }),
         workflowClient: () => ({
           status: async () => {
             if (opts.statusThrows) throw new Error("no such workflow");
@@ -787,10 +794,36 @@ describe("migrated read handlers (AII-711)", () => {
       warn.mockRestore();
     });
 
+    it("returns the last admin dry-run as lastDryRun, null when none", async () => {
+      expect((await stageFor({})).lastDryRun).toBeNull();
+      const partTable = [{ part: "a", prev: "10", new: "9" }];
+      const dry = { ok: false, at: 5, detail: "guard refused", stampBefore: null, stampAfter: null, dryRun: true, partTable } as RefreshOutcome;
+      expect((await stageFor({ dryRun: dry })).lastDryRun).toEqual({ ok: false, at: 5, detail: "guard refused", partTable });
+    });
+
+    it("servedStamp falls back to readServedStamp when the record has no stamp", async () => {
+      const read = vi.fn(async () => "live-stamp");
+      const failedEarly = { ok: false, at: 1, detail: "timed out", stampBefore: null, stampAfter: null } as RefreshOutcome;
+      expect((await stageFor({ last: failedEarly, readServedStamp: read })).servedStamp).toBe("live-stamp");
+      expect((await stageFor({ last: null, readServedStamp: read })).servedStamp).toBe("live-stamp");
+      expect(read).toHaveBeenCalledTimes(2);
+    });
+
+    it("servedStamp does not call readServedStamp when the record has a stamp", async () => {
+      const read = vi.fn(async () => "live-stamp");
+      expect((await stageFor({ last: ok, readServedStamp: read })).servedStamp).toBe("b");
+      expect(read).not.toHaveBeenCalled();
+    });
+
+    it("servedStamp is null when readServedStamp rejects", async () => {
+      const status = await stageFor({ readServedStamp: async () => { throw new Error("sidecar down"); } });
+      expect(status.servedStamp).toBeNull();
+    });
+
     it("keeps the KgRefreshStatus shape", async () => {
       const status = await stageFor({ last: ok });
       expect(Object.keys(status).sort()).toEqual(
-        ["deployHeld", "kgDegraded", "kgUnavailable", "lastRefresh", "materialize", "running", "servedStamp", "sidecar", "stage"].sort(),
+        ["deployHeld", "kgDegraded", "kgUnavailable", "lastDryRun", "lastRefresh", "materialize", "running", "servedStamp", "sidecar", "stage"].sort(),
       );
     });
   });

@@ -40,6 +40,7 @@ vi.mock("../config.js", async (importOriginal) => ({
 }));
 
 import {
+  createKgFindRunByTitle,
   createKgRefreshDispatch,
   createKgRefreshIngressClient,
   createProductionKgRefreshServices,
@@ -97,12 +98,12 @@ beforeEach(() => {
 });
 
 describe("createProductionKgRefreshServices", () => {
-  it("returns the KgRepo and KgRefresh services and the eight tool deps", () => {
+  it("returns the KgRepo and KgRefresh services and the nine tool deps", () => {
     const { services, toolDeps } = createProductionKgRefreshServices(makeInput());
     expect(services.map((s) => s.name)).toEqual(["KgRepo", "KgRefresh"]);
     expect(Object.keys(toolDeps).sort()).toEqual([
       "callbackConfigured", "freeBytes", "isDeployHeld", "kgSourceRepo", "mappingExists",
-      "persistPreflightFailure", "readStatusRecord", "runPreflight",
+      "persistPreflightFailure", "readServedStamp", "readStatusRecord", "runPreflight",
     ]);
     expect(toolDeps.callbackConfigured()).toBe(true);
     expect(toolDeps.mappingExists()).toBe(true);
@@ -160,12 +161,33 @@ describe("mintRunTokens", () => {
 });
 
 describe("onOutcome", () => {
+  it("forwards a stale-snapshot outcome as no-new-data whatever the runner's failureReason says", async () => {
+    const handleKgRefreshOutcome = vi.fn(async () => {});
+    createProductionKgRefreshServices(makeInput({ handleKgRefreshOutcome }));
+    await capturedWorkflowDeps.current!.onOutcome("no-new-data", { ok: true, detail: "runner says something else" } as never, { failureCode: "KG_SNAPSHOT_STALE", dispatchId: "d1" });
+    expect(handleKgRefreshOutcome).toHaveBeenCalledWith("no-new-data", { failureCode: "KG_SNAPSHOT_STALE", dispatchId: "d1" });
+  });
+
+  it("forwards a timeout with timedOut and the code", async () => {
+    const handleKgRefreshOutcome = vi.fn(async () => {});
+    createProductionKgRefreshServices(makeInput({ handleKgRefreshOutcome }));
+    await capturedWorkflowDeps.current!.onOutcome("failure", { ok: false, detail: "late" } as never, { failureCode: "bootstrap_timeout", timedOut: true, dispatchId: "d2" });
+    expect(handleKgRefreshOutcome).toHaveBeenCalledWith("failure", { failureCode: "bootstrap_timeout", failureReason: "late", timedOut: true, dispatchId: "d2" });
+  });
+
+  it("forwards operator_cancelled as the failure code", async () => {
+    const handleKgRefreshOutcome = vi.fn(async () => {});
+    createProductionKgRefreshServices(makeInput({ handleKgRefreshOutcome }));
+    await capturedWorkflowDeps.current!.onOutcome("failure", { ok: false, detail: "cancelled by operator" } as never, { failureCode: "operator_cancelled" });
+    expect(handleKgRefreshOutcome).toHaveBeenCalledWith("failure", expect.objectContaining({ failureCode: "operator_cancelled" }));
+  });
+
   it("resolves only after the outcome handler resolves", async () => {
     let release!: () => void;
     const handleKgRefreshOutcome = vi.fn(() => new Promise<void>((r) => { release = r; }));
     createProductionKgRefreshServices(makeInput({ handleKgRefreshOutcome }));
     let settled = false;
-    const p = Promise.resolve(capturedWorkflowDeps.current!.onOutcome("failure", { ok: false, detail: "x" } as never)).then(() => { settled = true; });
+    const p = Promise.resolve(capturedWorkflowDeps.current!.onOutcome("failure", { ok: false, detail: "x" } as never, {})).then(() => { settled = true; });
     await new Promise((r) => setTimeout(r, 0));
     expect(settled).toBe(false);
     release();
@@ -176,7 +198,7 @@ describe("onOutcome", () => {
   it("rejects when the outcome handler rejects, so the workflow step can retry", async () => {
     const handleKgRefreshOutcome = vi.fn(async () => { throw new Error("boom"); });
     createProductionKgRefreshServices(makeInput({ handleKgRefreshOutcome }));
-    await expect(capturedWorkflowDeps.current!.onOutcome("failure", { ok: false, detail: "x" } as never)).rejects.toThrow("boom");
+    await expect(capturedWorkflowDeps.current!.onOutcome("failure", { ok: false, detail: "x" } as never, {})).rejects.toThrow("boom");
   });
 });
 
@@ -470,5 +492,32 @@ describe("createKgRefreshIngressClient", () => {
     expect(url).toBe(`${BASE}/KgRepo/acme%2Fkg/enqueueDryRun`);
     expect((init.headers as Record<string, string>)["idempotency-key"]).toBe("delivery-1");
     expect(JSON.parse(new TextDecoder().decode(init.body as Uint8Array))).toEqual(entry);
+  });
+});
+
+describe("createKgFindRunByTitle", () => {
+  const lookup = (recordDetails = vi.fn()) =>
+    ({ find: createKgFindRunByTitle({ owner: "acme", repo: "kg", getToken: async () => "tok", recordDetails }), recordDetails });
+
+  it("throws on an HTTP error instead of answering no run", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("boom", { status: 500 })));
+    try {
+      await expect(lookup().find("KG-REFRESH · d-1")).rejects.toThrow(/HTTP 500/);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("answers null for a 200 with no matching title, and the run id for a match", async () => {
+    const body = { workflow_runs: [{ id: 7, display_title: "Claude AI Implementation — KG-REFRESH · d-1", html_url: "u" }] };
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify(body), { status: 200 })));
+    try {
+      const { find, recordDetails } = lookup();
+      expect(await find("KG-REFRESH · other")).toBeNull();
+      expect(await find("KG-REFRESH · d-1")).toEqual({ runId: 7 });
+      expect(recordDetails).toHaveBeenCalledWith("d-1", { workflowRunId: 7, logsUrl: "u" });
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });

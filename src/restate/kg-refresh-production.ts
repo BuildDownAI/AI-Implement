@@ -19,10 +19,10 @@ import {
   type PreflightCheckResult,
   type RefreshOutcome,
 } from "../kg-refresh.js";
-import type { KgRailDeps } from "../kg-refresh-rail.js";
-import { KG_DIR } from "../kg-sidecar.js";
+import { readServedStamp, type KgRailDeps } from "../kg-refresh-rail.js";
+import { KG_DIR, getServedNamespace } from "../kg-sidecar.js";
 import { parseKgSourceRepo } from "../deploy.js";
-import { buildKgRefreshGhaDispatchBody, postWorkflowDispatch } from "../github.js";
+import { RUN_TITLE_PREFIX, buildKgRefreshGhaDispatchBody, defaultFetchSignal, postWorkflowDispatch } from "../github.js";
 import { resolveWorkflowCapabilities } from "../workflow-probe.js";
 import { resolveRunnerImageForDispatch } from "../repo-image.js";
 import { encodeRunConfig, type RunConfigV1 } from "../run-config.js";
@@ -45,6 +45,32 @@ import { RESTATE_INGRESS_BASE_URL } from "./server.js";
 
 /** Workflow file dispatched in the KG source repo: the shared implement template, selected by `runner_phase` (AII-556). */
 export const KG_REFRESH_WORKFLOW_FILE = "claude-implement.yml";
+
+/** Looks a kg-refresh run up by its exact title. `null` means only "GitHub answered, and no run has this
+ *  title"; an HTTP error throws, so the workflow retries the lookup rather than dispatching a second run. */
+export function createKgFindRunByTitle(opts: {
+  owner: string;
+  repo: string;
+  getToken: () => Promise<string>;
+  recordDetails: (dispatchId: string, details: { workflowRunId: number; logsUrl?: string }) => void;
+}): KgRefreshWorkflowDependencies["findRunByTitle"] {
+  return async (title) => {
+    const res = await fetch(
+      `https://api.github.com/repos/${opts.owner}/${opts.repo}/actions/workflows/${KG_REFRESH_WORKFLOW_FILE}/runs?event=workflow_dispatch&per_page=20`,
+      { headers: { Authorization: `Bearer ${await opts.getToken()}`, Accept: "application/vnd.github+json" }, signal: defaultFetchSignal() },
+    );
+    if (!res.ok) throw new Error(`findRunByTitle: workflow runs lookup answered HTTP ${res.status}`);
+    const data = (await res.json()) as { workflow_runs: Array<{ id: number; display_title?: string; html_url?: string }> };
+    const match = data.workflow_runs.find((r) => r.display_title === `${RUN_TITLE_PREFIX}${title}`);
+    if (!match) return null;
+    // The title is `KG-REFRESH · <dispatchId>`; a bare identifier carries no dispatch id to record against.
+    const dispatchIdPrefix = "KG-REFRESH · ";
+    if (title.startsWith(dispatchIdPrefix)) {
+      opts.recordDetails(title.slice(dispatchIdPrefix.length), { workflowRunId: match.id, logsUrl: match.html_url });
+    }
+    return { runId: match.id };
+  };
+}
 const GHA_EXECUTION_MODE = "github-actions";
 
 type LegacyDispatch = (opts: {
@@ -134,6 +160,8 @@ export interface KgRefreshToolDeps {
   /** Records a failed preflight as the last refresh, as `trigger()` does today. */
   persistPreflightFailure: (result: PreflightCheckResult) => void;
   readStatusRecord: () => RefreshOutcome | null;
+  /** Reads the stamp of the graph that serves now; `null` when none can be read. */
+  readServedStamp: () => Promise<string | null>;
 }
 
 function findKgMapping(kgSourceRepo: string) {
@@ -286,11 +314,14 @@ export function createProductionKgRefreshServices(
     findRunByTitle: input.findRunByTitle,
     cancelWorkflowRun: input.cancelWorkflowRun,
     persistLastRefresh: input.persistLastRefresh,
-    onOutcome: (kind, outcome) => {
-      // The workflow reports "graph is current" as a success; the notifier distinguishes it.
-      const mapped = kind === "success" && /^Graph is current/i.test(outcome.detail) ? "no-new-data" : kind;
+    onOutcome: (kind, outcome, meta) => {
       // Returned so the workflow's `outcome` step awaits (and retries) the notification.
-      return Promise.resolve(input.handleKgRefreshOutcome(mapped, kind === "failure" ? { failureReason: outcome.detail } : {}));
+      return Promise.resolve(input.handleKgRefreshOutcome(kind, {
+        ...(meta.failureCode ? { failureCode: meta.failureCode } : {}),
+        ...(kind === "failure" ? { failureReason: outcome.detail } : {}),
+        ...(meta.timedOut ? { timedOut: true } : {}),
+        ...(meta.dispatchId ? { dispatchId: meta.dispatchId } : {}),
+      }));
     },
   };
 
@@ -315,6 +346,7 @@ export function createProductionKgRefreshServices(
       });
     },
     readStatusRecord: input.readStatusRecord,
+    readServedStamp: async () => readServedStamp(rail, await getServedNamespace()),
   };
 
   return {
