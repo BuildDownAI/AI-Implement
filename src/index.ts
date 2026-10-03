@@ -179,6 +179,8 @@ export interface AppConfig {
   sessionImageStatus: SessionImageStatus;
   /** True when an explicit orchestrator-wide default image was set (either runner-image env var); drives GHA dispatch forwarding. */
   runnerImageExplicit: boolean;
+  /** True when the default image was derived from the `testing` source-branch stamp (no image variable set). */
+  runnerImageChannelDefault: boolean;
   anthropicApiKey: string | null;
   claudeOAuthToken: string | null;
   githubWebhookSecret: string | null;
@@ -296,7 +298,8 @@ function loadConfig(): AppConfig {
     tenantId: process.env.CLIENT_SLUG || process.env.FLY_APP_NAME || null,
     sessionImage: defaultRunner.image,
     sessionImageStatus: defaultRunner.sessionImageStatus,
-    runnerImageExplicit: defaultRunner.explicit,
+    runnerImageExplicit: defaultRunner.explicit || defaultRunner.channelDefault,
+    runnerImageChannelDefault: defaultRunner.channelDefault,
     anthropicApiKey: process.env.ANTHROPIC_API_KEY || null,
     claudeOAuthToken: process.env.CLAUDE_CODE_OAUTH_TOKEN || null,
     githubWebhookSecret,
@@ -5429,6 +5432,11 @@ async function main(): Promise<void> {
   } else if (config.sessionImageStatus === "shadowed") {
     console.warn(
       "[main] SESSION_IMAGE is set but ignored because AI_IMPLEMENT_RUNNER_IMAGE takes precedence. Remove SESSION_IMAGE.",
+    );
+  }
+  if (config.runnerImageChannelDefault) {
+    console.log(
+      `[main] Runner image ${config.sessionImage} derived from source branch "testing" (no AI_IMPLEMENT_RUNNER_IMAGE set)`,
     );
   }
   console.log(`[main] Mapped teams: ${Object.keys(teamRepoMap).join(", ")}`);
