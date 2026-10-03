@@ -115,6 +115,7 @@ Placeholder. [AII-702](https://linear.app/eudoxus/issue/AII-702/accept-a-run-cap
 | Allowlist unreadable | 503 |
 | `kg_*` call with no provider, or a capability the provider lacks | tool result `isError: true` with the pre-migration text (`no memory provider is configured` / `Tool not supported by this memory provider: <tool>`); the tool is also absent from `tools/list` |
 | Any handler call — read or write — while Restate is unreachable | 503 `restate-unavailable`; `initialize` and `get_session_identity` still answer, since neither is a Restate handler — `get_session_identity`'s `refresh` field degrades to `null` rather than erroring |
+| Any handler call while a self-deploy hold is set | 409 `{ error: "deploy-in-progress", deployStartedAt }` (ms epoch, from `getDeployStartedAt()`); the ingress is not contacted, because the drain counts old-deployment invocations. Same answer from `POST /api/tools/<name>`. Not an outage: `GET /` reports `deploy.held` and `deploy.startedAt` |
 | GET or DELETE on `/mcp` | 405 with `Allow: POST` |
 | Unknown JSON-RPC method / unknown tool name | JSON-RPC error `-32601` / `-32602` at HTTP 200 |
 | Write call below the required role | tool result `isError: true`, `forbidden: <tool> requires the <role> role`; logged |

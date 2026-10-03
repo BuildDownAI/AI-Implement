@@ -2062,6 +2062,10 @@ async function handleToolCall(
   const caller: Caller = { kind: "human", email: gate.identity?.email ?? null, role: gate.role };
   try {
     const result = await deps.callTool(toolName, args, caller, idempotencyKey ? { idempotencyKey } : undefined);
+    if (result.status === "deploy-held") {
+      json(res, 409, { error: "deploy-in-progress", deployStartedAt: getDeployStartedAt() });
+      return;
+    }
     if (result.status === "unavailable") {
       json(res, 503, { error: "restate-unavailable" });
       return;

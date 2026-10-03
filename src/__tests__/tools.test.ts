@@ -484,13 +484,13 @@ describe("discoverTools", () => {
 });
 
 describe("callTool", () => {
-  it("returns unavailable without an ingress request when drain admission closes", async () => {
+  it("returns deploy-held without an ingress request when drain admission closes", async () => {
     const fetchImpl = vi.fn() as unknown as typeof fetch;
     const result = await callTool("get_widget", {}, HUMAN_USER, {
       ingressBaseUrl: "http://ingress.example", fetchImpl,
       permitsExternalCall: () => false,
     });
-    expect(result).toEqual({ status: "unavailable" });
+    expect(result).toEqual({ status: "deploy-held" });
     expect(fetchImpl).not.toHaveBeenCalled();
   });
   it("maps a 200 ToolResponse body to status: \"ok\"", async () => {
@@ -589,7 +589,7 @@ describe("callToolAsSystem", () => {
     expect(await callToolAsSystem("get_tenant_health", {}, {
       ingressBaseUrl: "http://ingress.example", fetchImpl,
       permitsExternalCall: () => false,
-    })).toEqual({ status: "unavailable" });
+    })).toEqual({ status: "deploy-held" });
     expect(fetchImpl).not.toHaveBeenCalled();
   });
   it("posts with a systemCaller() caller and returns the same result shape as callTool", async () => {
