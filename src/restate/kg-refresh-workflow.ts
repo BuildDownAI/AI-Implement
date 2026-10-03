@@ -128,6 +128,8 @@ export interface KgRefreshWorkflowDependencies {
   getWorkflowRunStatus(runId: number): Promise<{ status: string; conclusion: string | null }>;
   findRunByTitle(title: string): Promise<{ runId: number } | null>;
   cancelWorkflowRun(runId: number): Promise<boolean>;
+  /** Stops a non-GitHub-Actions run (a Fly machine or a local container) by its backend id. */
+  stopMachineRun(executionMode: string, jobId: string): Promise<boolean>;
   persistLastRefresh(outcome: RefreshOutcome): void;
   /** The kind is decided by the workflow, never inferred from `outcome.detail`. `meta.dispatchId` is the workflow key. */
   onOutcome(kind: KgOutcomeKind, outcome: RefreshOutcome, meta: KgOutcomeMeta): void | Promise<void>;
@@ -317,6 +319,25 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       const bootstrapDeadlineAt = dispatchedAt + bootstrapDeadlineMs;
       const totalDeadlineAt = dispatchedAt + totalDeadlineMs;
 
+      // Stops a Fly machine or local container. The run's result is already decided, so a
+      // failed stop is logged and never changes the outcome.
+      async function stopMachine(reason: string): Promise<void> {
+        if (isGha) return;
+        const machineJobId = dispatchResult.jobId;
+        if (!machineJobId) {
+          ctx.console.warn(`[KgRefresh] no machine id to stop after ${reason} for dispatch ${dispatchId}`);
+          return;
+        }
+        try {
+          const stopped = await ctx.run("stop-machine-run", () => deps.stopMachineRun(dispatchResult.executionMode, machineJobId), { maxRetryAttempts: 3 });
+          ctx.console.log(`[KgRefresh] stop after ${reason}: dispatch ${dispatchId} backend ${dispatchResult.executionMode} stopped=${stopped}`);
+        } catch (err) {
+          if (restate.internal.isSuspendedError(err)) throw err;
+          if (!(err instanceof restate.TerminalError)) throw err;
+          ctx.console.error(`[KgRefresh] stop after ${reason} failed: dispatch ${dispatchId} backend ${dispatchResult.executionMode}: ${err.message}`);
+        }
+      }
+
       async function waitForOutcome(): Promise<WaitOutcome> {
         let startedSeen = false;
         let watchIndex = 0;
@@ -390,6 +411,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
             ctx.console.error(`[KgRefresh] cancelling run ${runId} after timeout failed for ${triggerId}: ${err.message}`);
           }
         }
+        await stopMachine("timeout");
         ctx.set("step", "failed");
         const at = await ctx.date.now();
         const code = waitResult.kind === "bootstrap_timeout" ? "bootstrap_timeout" : "timed_out";
@@ -413,6 +435,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         if (runId !== undefined) {
           await ctx.run("cancel-run", () => deps.cancelWorkflowRun(runId!));
         }
+        await stopMachine("cancel");
         if (isGha) {
           let watchIndex = 0;
           let reconcileIndex = 0;
