@@ -329,6 +329,7 @@ This is the gated race test pattern. A scenario of an owned-run wait sets the or
 
 * **Gate a fake.** A fake dependency awaits a gate that the test holds (`gate` in `harness.ts`). The gate reports when the workflow reaches it. The test releases it at the exact point.
 * **Wait for a step, then act.** Before the test sends a signal, it waits for the named step with `waitForStep`.
+* **Order against a fake, not a test-body event.** In a scenario that asserts the order of a signal against a fake's answer, the fake changes its answer only on state the workflow controls (for example, the wait-call number the fixture passes in), or on a gate the test releases after the workflow has acted on the signal. It never changes on a test-body event alone: `send` returning means the signal was delivered, not consumed, and the owned-run wait reads status before it races the signals. Example: [AII-1049](https://linear.app/eudoxus/issue/AII-1049/owned-run-wait-scenario-a-second-call-after-report-returns-ended-can), the `owned-run-wait.restate.test.ts` scenario "a second call after report returns ended", where a flag set after `send` returned still raced.
 * **Deadline scenarios.** Hold the workflow at a gate until the deadline has passed, then release it. Prove the scenario fails when the deadline branch, or the `peek` at the deadline, is removed.
 * **Teardown.** Await the workflow's terminal output before a test ends.
 * **Tiers.** The deadline decision is tested in the unit tier with no timers. The Restate tier proves the journal, replay, and exclusivity.
