@@ -126,6 +126,7 @@ import { RestateSidecar } from "./restate/server.js";
 import { startRestateEndpoint, register as registerRestateEndpoint, RESTATE_SERVICES } from "./restate/endpoint.js";
 import { createProductionReviewFixServices } from "./restate/review-fix-production.js";
 import { createKgFindRunByTitle, createProductionKgRefreshServices, recordKgDispatchDetails } from "./restate/kg-refresh-production.js";
+import { createProductionPlanningRunServices } from "./restate/planning-run-production.js";
 import { setKgRefreshToolDeps } from "./restate/tools.js";
 import type { RestateRegisterOutcome, RestateRegisterResult } from "./restate/endpoint.js";
 import { getRestateStatus, setRestateStatus } from "./restate/status.js";
@@ -5054,8 +5055,17 @@ async function main(): Promise<void> {
     : null;
   setKgRefreshToolDeps(kgComposition?.toolDeps ?? null);
   const kgServices = kgComposition?.services ?? [];
+  // The PlanningRun workflow (AII-1020): registered, but nothing submits it yet.
+  const planningRunServices = createProductionPlanningRunServices({
+    config,
+    resolveProvider: (mapping) => registry.forMapping(mapping),
+    resolveRunnerImage: resolveDispatchRunnerImage,
+    fireBreakerTrip,
+    preparePlanningLaunch,
+    launchPlanningRun,
+  }).services;
   const restateRegistration = createRestateRegistrationGate(() => shuttingDown, {
-    startRestateEndpoint: () => startRestateEndpoint([...RESTATE_SERVICES, ...reviewFixServices, ...kgServices], restateSidecar.identityKey),
+    startRestateEndpoint: () => startRestateEndpoint([...RESTATE_SERVICES, ...reviewFixServices, ...kgServices, ...planningRunServices], restateSidecar.identityKey),
     registerRestateEndpoint,
   });
   // A sidecar which becomes ready after its initial timeout still registers the

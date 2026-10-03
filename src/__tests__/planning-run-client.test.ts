@@ -155,13 +155,13 @@ describe("PlanningRun report sender", () => {
 });
 
 describe("createPlanningRunIngressClient", () => {
-  it("submit sends the dispatch id as the idempotency key", async () => {
+  it("submit sends no idempotency key: the workflow key is the idempotency", async () => {
     const { fetchImpl, requests } = capturingFetch(() => new Response(JSON.stringify({ invocationId: "inv_1", status: "Accepted" }), { status: 200 }));
     const result = await client.createPlanningRunIngressClient(INGRESS, { fetchImpl }).submit("d-1", INPUT);
 
     expect(result).toEqual({ status: "accepted" });
     expect(requests[0].url).toContain("/PlanningRun/d-1/run/send");
-    expect(requests[0].headers["idempotency-key"]).toBe("d-1");
+    expect(requests[0].headers["idempotency-key"]).toBeUndefined();
     expect(JSON.parse(requests[0].body)).toMatchObject({ dispatchId: "d-1" });
   });
 

@@ -67,8 +67,9 @@ export interface PlanningRunResult {
 
 /** Plain functions, every one called inside `ctx.run` — none of them may call `ctx` themselves. */
 export interface PlanningRunDependencies {
-  /** The run or machine id of a launch that already happened for this dispatch, or `null`. */
-  findExistingRun(input: PlanningRunInput): Promise<string | null>;
+  /** The run or machine id of a launch that already happened for this dispatch, or `null`.
+   *  `dispatchedAt` is the journaled dispatch time (epoch ms): a run created before it is not this launch. */
+  findExistingRun(input: PlanningRunInput, dispatchedAt: number): Promise<string | null>;
   launch(input: PlanningRunInput): Promise<PlanningLaunchResult>;
   /** The status of the exact run or machine. */
   readStatus(input: PlanningRunInput, jobId: string): Promise<OwnedRunStatus>;
@@ -120,7 +121,7 @@ export function createPlanningRunWorkflow(deps: PlanningRunDependencies) {
         "dispatch",
         async (): Promise<PlanningLaunchResult> => {
           // Reconcile first: a retry after a committed-but-unacknowledged launch must adopt that run.
-          const existing = await deps.findExistingRun(input);
+          const existing = await deps.findExistingRun(input, dispatchedAt);
           if (existing !== null) return { outcome: "accepted", jobId: existing };
           const result = await deps.launch(input);
           return result.jobId === undefined ? { outcome: result.outcome } : { outcome: result.outcome, jobId: result.jobId };
@@ -148,7 +149,7 @@ export function createPlanningRunWorkflow(deps: PlanningRunDependencies) {
           return "started";
         }
         if (jobId === null) {
-          const found = await ctx.run(`find-${findIndex++}`, () => deps.findExistingRun(input));
+          const found = await ctx.run(`find-${findIndex++}`, () => deps.findExistingRun(input, dispatchedAt));
           if (found !== null) {
             jobId = found;
             ctx.set("jobId", found);
