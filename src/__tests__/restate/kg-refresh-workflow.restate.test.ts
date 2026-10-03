@@ -76,6 +76,8 @@ interface RunScenario {
   runStatusCalls: number;
   runStatusCallTimes: number[];
   cancelCalls: number;
+  /** Dispatch result carries no job id, as when the backend returned no machine or container id. */
+  jobIdUnknown?: boolean;
   runStatusSequence: Array<{ status: string; conclusion: string | null }>;
   findByTitleResult: { runId: number } | null;
   /** Title lookups that throw, by 1-based call number. */
@@ -324,7 +326,7 @@ describe("KgRefresh durable workflow", () => {
     }
     return {
       outcome: scenario.dispatchOutcome, runId: scenario.runId,
-      jobId: `job-${triggerId}`, executionMode: scenario.executionMode,
+      jobId: scenario.jobIdUnknown ? null : `job-${triggerId}`, executionMode: scenario.executionMode,
     };
   }
 
@@ -360,6 +362,14 @@ describe("KgRefresh durable workflow", () => {
   }
 
   let cancelTerminalFailure = false;
+  let stopFailure = false;
+  const stopCalls: Array<{ executionMode: string; jobId: string }> = [];
+
+  async function stopMachineRunFn(executionMode: string, jobId: string): Promise<boolean> {
+    stopCalls.push({ executionMode, jobId });
+    if (stopFailure) throw new restate.TerminalError("forced stop failure");
+    return true;
+  }
 
   async function cancelWorkflowRunFn(runId: number): Promise<boolean> {
     if (cancelTerminalFailure) throw new restate.TerminalError("forced cancel failure");
@@ -389,6 +399,7 @@ describe("KgRefresh durable workflow", () => {
     getWorkflowRunStatus: getWorkflowRunStatusFn,
     findRunByTitle: findRunByTitleFn,
     cancelWorkflowRun: cancelWorkflowRunFn,
+    stopMachineRun: stopMachineRunFn,
     persistLastRefresh: async (outcome) => {
       if (persistHold) {
         const held = persistHold;
@@ -994,6 +1005,119 @@ describe("KgRefresh durable workflow", () => {
     15_000,
   );
 
+  // ---- AII-1046: stop the Fly machine or local container at a timeout and at a cancel ----
+  // No fake runs on a tick on these backends, so a timeout is a pure timeout and the scenario waits on the outcome.
+  const STOP_BACKENDS = ["fly-machines", "local-docker"] as const;
+
+  describe.each(STOP_BACKENDS)("AII-1046: stop on %s", (backend) => {
+    it.each(VARIANTS.map(([label]) => label))("a bootstrap timeout stops the run one time and keeps the timeout outcome (%s)", async (label) => {
+      const env = deadlineEnvFor(label);
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, { dispatchOutcome: "accepted", executionMode: backend });
+      stopCalls.length = 0;
+      const outcome = await runWorkflow(env.baseUrl(), triggerId);
+      expect(outcome.ok).toBe(false);
+      expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "timed_out", conclusion: "bootstrap_timeout" });
+      expect(stopCalls).toEqual([{ executionMode: backend, jobId: `job-${triggerId}` }]);
+    }, 15_000);
+
+    it.each(VARIANTS.map(([label]) => label))("progress then a total timeout stops the run one time (%s)", async (label) => {
+      const env = deadlineEnvFor(label);
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, { dispatchOutcome: "accepted", executionMode: backend });
+      stopCalls.length = 0;
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "progress", {});
+      const outcome = await done;
+      expect(outcome.ok).toBe(false);
+      expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "timed_out", conclusion: "timed_out" });
+      expect(stopCalls).toEqual([{ executionMode: backend, jobId: `job-${triggerId}` }]);
+    }, 15_000);
+
+    it.each(VARIANTS.map(([label]) => label))("a cancel stops the run one time and ends operator_cancelled (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, { dispatchOutcome: "accepted", executionMode: backend });
+      stopCalls.length = 0;
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "cancel", { reason: "operator requested" });
+      await done;
+      expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("operator_cancelled");
+      expect(stopCalls).toEqual([{ executionMode: backend, jobId: `job-${triggerId}` }]);
+    }, 15_000);
+
+    it.each(VARIANTS.map(([label]) => label))("an unknown job id makes no stop call on a timeout (%s)", async (label) => {
+      const env = deadlineEnvFor(label);
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, { dispatchOutcome: "accepted", executionMode: backend, jobIdUnknown: true });
+      stopCalls.length = 0;
+      const outcome = await runWorkflow(env.baseUrl(), triggerId);
+      expect(outcome.ok).toBe(false);
+      expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "timed_out", conclusion: "bootstrap_timeout" });
+      expect(stopCalls).toEqual([]);
+    }, 15_000);
+
+    it.each(VARIANTS.map(([label]) => label))("an unknown job id makes no stop call on a cancel (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, { dispatchOutcome: "accepted", executionMode: backend, jobIdUnknown: true });
+      stopCalls.length = 0;
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "cancel", { reason: "operator requested" });
+      await done;
+      expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("operator_cancelled");
+      expect(stopCalls).toEqual([]);
+    }, 15_000);
+
+    it.each(VARIANTS.map(([label]) => label))("a failed stop does not change a timeout or a cancel outcome (%s)", async (label) => {
+      stopFailure = true;
+      try {
+        const timeoutEnv = deadlineEnvFor(label);
+        const timedOutId = newTriggerId();
+        makeScenario(timedOutId, { dispatchOutcome: "accepted", executionMode: backend });
+        const timedOut = await runWorkflow(timeoutEnv.baseUrl(), timedOutId);
+        expect(timedOut.ok).toBe(false);
+        expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "timed_out", conclusion: "bootstrap_timeout" });
+
+        const env = envFor(label);
+        const cancelledId = newTriggerId();
+        makeScenario(cancelledId, { dispatchOutcome: "accepted", executionMode: backend });
+        const done = runWorkflow(env.baseUrl(), cancelledId);
+        await eventually(() => scenarios.get(cancelledId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
+        await callWorkflow(env.baseUrl(), "KgRefresh", cancelledId, "cancel", { reason: "operator requested" });
+        await done;
+        expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("operator_cancelled");
+      } finally {
+        stopFailure = false;
+      }
+    }, 30_000);
+
+    it.each(VARIANTS.map(([label]) => label))("a report makes no stop call (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, { dispatchOutcome: "accepted", executionMode: backend });
+      stopCalls.length = 0;
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      expect((await done).ok).toBe(true);
+      expect(stopCalls).toEqual([]);
+    }, 15_000);
+  });
+
+  it.each(VARIANTS.map(([label]) => label))("AII-1046: a GitHub Actions timeout never calls stopMachineRun (%s)", async (label) => {
+    const env = deadlineEnvFor(label);
+    const triggerId = newTriggerId();
+    makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "github-actions" });
+    stopCalls.length = 0;
+    const outcome = await runWorkflow(env.baseUrl(), triggerId);
+    expect(outcome.ok).toBe(false);
+    expect(stopCalls).toEqual([]);
+  }, 15_000);
+
   // ---- W5/W6/W7: GHA vs Fly watch behavior ----
   it.each(VARIANTS.map(([label]) => label))(
     "W5: GHA backend — the run concludes with no report: failure with dispatch_lost, no further watch calls (%s)",
@@ -1057,6 +1181,7 @@ describe("KgRefresh durable workflow", () => {
       getWorkflowRunStatus: getWorkflowRunStatusFn,
       findRunByTitle: findRunByTitleFn,
       cancelWorkflowRun: cancelWorkflowRunFn,
+    stopMachineRun: stopMachineRunFn,
       persistLastRefresh: (outcome) => { persistCalls.push(outcome); },
       onOutcome: (kind, outcome, meta) => { onOutcomeCalls.push({ kind, outcome, meta }); },
       bootstrapDeadlineMs: scaledTick * 4,
@@ -1182,6 +1307,7 @@ describe("KgRefresh durable workflow", () => {
       getWorkflowRunStatus: getWorkflowRunStatusFn,
       findRunByTitle: findRunByTitleFn,
       cancelWorkflowRun: cancelWorkflowRunFn,
+    stopMachineRun: stopMachineRunFn,
       persistLastRefresh: (outcome) => { persistCalls.push(outcome); },
       onOutcome: (kind, outcome, meta) => { onOutcomeCalls.push({ kind, outcome, meta }); },
       bootstrapDeadlineMs: 1_000,
@@ -1954,6 +2080,7 @@ describe("KgRefresh durable workflow", () => {
       getWorkflowRunStatus: getWorkflowRunStatusFn,
       findRunByTitle: findRunByTitleFn,
       cancelWorkflowRun: cancelWorkflowRunFn,
+    stopMachineRun: stopMachineRunFn,
       persistLastRefresh: (outcome) => { persistCalls.push(outcome); },
       onOutcome: (kind, outcome, meta) => { onOutcomeCalls.push({ kind, outcome, meta }); },
       afterStageCommitted: async () => {

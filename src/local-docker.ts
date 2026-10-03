@@ -258,6 +258,17 @@ export async function removeLocalContainer(containerId: string): Promise<void> {
   }
 }
 
+/** Force-stops and removes a running container. A container that is already gone counts as stopped. */
+export async function stopLocalContainer(containerId: string): Promise<void> {
+  try {
+    await execFile("docker", ["rm", "-f", containerId]);
+  } catch (err) {
+    const message = errorMessage(err);
+    if (/no such container/i.test(message)) return;
+    throw new Error(`Failed to stop local Docker runner ${containerId}: ${message}`);
+  }
+}
+
 function errorMessage(err: unknown): string {
   if (err && typeof err === "object") {
     const maybe = err as { message?: string; stderr?: string; stdout?: string };
