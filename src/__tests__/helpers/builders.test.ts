@@ -1,6 +1,5 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { getMappings, initMappingsTable, upsertMapping } from "../../config.js";
-import type { LLMExecutor } from "../../pipeline/types.js";
 import { ProviderRegistry } from "../../providers/registry.js";
 import { validateReviewFixResultMetadata, validateScopedPrIdentity } from "../../review-fix-contract.js";
 import { FakeProvider } from "../providers/fake.js";
@@ -30,7 +29,7 @@ describe("makeMapping", () => {
   it("replaces only the overridden field", () => {
     const paused = makeMapping({ paused: true });
     expect(paused.paused).toBe(true);
-    expect({ ...paused, paused: false }).toEqual(makeMapping());
+    expect({ ...paused, paused: makeMapping().paused }).toEqual(makeMapping());
   });
 
   it("returns fresh nested objects on every call", () => {
@@ -59,7 +58,7 @@ describe("makeJob", () => {
   it("replaces only the overridden field", () => {
     const running = makeJob({ status: "running" });
     expect(running.status).toBe("running");
-    expect({ ...running, status: "dispatched" }).toEqual(makeJob());
+    expect({ ...running, status: makeJob().status }).toEqual(makeJob());
   });
 });
 
@@ -74,7 +73,7 @@ describe("makeIssue", () => {
   it("replaces only the overridden field", () => {
     const titled = makeIssue({ title: "Other" });
     expect(titled.title).toBe("Other");
-    expect({ ...titled, title: "Test" }).toEqual(makeIssue());
+    expect({ ...titled, title: makeIssue().title }).toEqual(makeIssue());
   });
 });
 
@@ -87,7 +86,7 @@ describe("makeScopedPrIdentity", () => {
   it("replaces only the overridden field", () => {
     const other = makeScopedPrIdentity({ prNumber: 43 });
     expect(other.prNumber).toBe(43);
-    expect({ ...other, prNumber: 42 }).toEqual(makeScopedPrIdentity());
+    expect({ ...other, prNumber: makeScopedPrIdentity().prNumber }).toEqual(makeScopedPrIdentity());
   });
 });
 
@@ -114,7 +113,7 @@ describe("makeReviewFixResult", () => {
   it("replaces only the overridden field", () => {
     const retried = makeReviewFixResult({ githubRunAttempt: 2 });
     expect(retried.githubRunAttempt).toBe(2);
-    expect({ ...retried, githubRunAttempt: 1 }).toEqual(makeReviewFixResult());
+    expect({ ...retried, githubRunAttempt: makeReviewFixResult().githubRunAttempt }).toEqual(makeReviewFixResult());
   });
 });
 
@@ -147,14 +146,14 @@ describe("makeContext", () => {
   });
 
   it("uses the executor it is given", () => {
-    const executor: LLMExecutor = { invoke: vi.fn<LLMExecutor["invoke"]>() };
+    const executor = makeExecutor();
     expect(makeContext({}, executor).llmExecutor).toBe(executor);
   });
 
   it("replaces only the overridden data field", () => {
     const ctx = makeContext({ issueTitle: "Other" });
     expect(ctx.data.issueTitle).toBe("Other");
-    expect({ ...ctx.data, issueTitle: "Test" }).toEqual(makeContext().data);
+    expect({ ...ctx.data, issueTitle: makeContext().data.issueTitle }).toEqual(makeContext().data);
   });
 
   it("starts with no step outputs, and keeps outputs set on it", () => {
@@ -192,7 +191,7 @@ describe("makeProvider", () => {
     expect(await provider.findByKey("ENG-1")).toBeNull();
   });
 
-  it("records calls on every method", async () => {
+  it("records the calls made to its methods", async () => {
     const provider = makeProvider();
     await provider.markMerged("issue-1", "ENG");
     expect(provider.markMerged).toHaveBeenCalledWith("issue-1", "ENG");
@@ -241,6 +240,15 @@ describe("makeRegistry", () => {
     expect(await registry.forAllMappings([makeMapping(), jiraMapping])).toEqual([provider, provider]);
   });
 
+  it("keeps the real findByKeyInAnyTracker over the given mappings", async () => {
+    const issue = makeIssue();
+    const provider = makeProvider({ findByKey: vi.fn(async () => issue) });
+    expect(await makeRegistry({ provider }).findByKeyInAnyTracker("ENG-1")).toEqual({ kind: "none", failedProviderIds: [] });
+    expect(
+      await makeRegistry({ provider, mappings: { ENG: makeMapping() } }).findByKeyInAnyTracker("ENG-1"),
+    ).toEqual({ kind: "found", provider, issue, failedProviderIds: [] });
+  });
+
   it("routes each mapping to its tracker's provider when given one per tracker", async () => {
     const linear = makeProvider();
     const jira = makeProvider({ id: "jira" });
@@ -252,12 +260,15 @@ describe("makeRegistry", () => {
 
   it("fails loudly for a tracker with no provider, which the real forAllMappings skips with a warning", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const linear = makeProvider();
-    const registry = makeRegistry({ providers: { linear } });
-    await expect(registry.forMapping(jiraMapping)).rejects.toThrow('makeRegistry has no provider for tracker "jira"');
-    expect(await registry.forAllMappings([makeMapping(), jiraMapping])).toEqual([linear]);
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining('Skipping provider "jira"'));
-    warn.mockRestore();
+    try {
+      const linear = makeProvider();
+      const registry = makeRegistry({ providers: { linear } });
+      await expect(registry.forMapping(jiraMapping)).rejects.toThrow('makeRegistry has no provider for tracker "jira"');
+      expect(await registry.forAllMappings([makeMapping(), jiraMapping])).toEqual([linear]);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('Skipping provider "jira"'));
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("finds an issue held by two trackers as ambiguous", async () => {
@@ -273,15 +284,6 @@ describe("makeRegistry", () => {
     const both = { provider: makeProvider(), providers: {} };
     // @ts-expect-error: the two options are mutually exclusive.
     makeRegistry(both);
-  });
-
-  it("keeps the real findByKeyInAnyTracker over the given mappings", async () => {
-    const issue = makeIssue();
-    const provider = makeProvider({ findByKey: vi.fn(async () => issue) });
-    expect(await makeRegistry({ provider }).findByKeyInAnyTracker("ENG-1")).toEqual({ kind: "none", failedProviderIds: [] });
-    expect(
-      await makeRegistry({ provider, mappings: { ENG: makeMapping() } }).findByKeyInAnyTracker("ENG-1"),
-    ).toEqual({ kind: "found", provider, issue, failedProviderIds: [] });
   });
 });
 
@@ -301,6 +303,6 @@ describe("makeAppConfig", () => {
   it("replaces only the overridden field", () => {
     const fly = makeAppConfig({ flySessionsApp: "sessions" });
     expect(fly.flySessionsApp).toBe("sessions");
-    expect({ ...fly, flySessionsApp: null }).toEqual(makeAppConfig());
+    expect({ ...fly, flySessionsApp: makeAppConfig().flySessionsApp }).toEqual(makeAppConfig());
   });
 });
