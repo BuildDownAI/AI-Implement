@@ -21,6 +21,8 @@ vi.mock("../log.js", () => ({
   findLogIdByDispatchId: vi.fn().mockReturnValue(7),
   updateJobRunId: vi.fn(),
 }));
+vi.mock("../fly-machines.js", () => ({ getMachine: vi.fn(), destroyMachine: vi.fn() }));
+vi.mock("../local-docker.js", () => ({ inspectLocalContainer: vi.fn(), stopLocalContainer: vi.fn() }));
 vi.mock("../stuck-watchdog.js", () => ({ remediateFailedJob: vi.fn().mockResolvedValue(undefined) }));
 vi.mock("../dispatch-admission.js", () => ({
   read: vi.fn(),
@@ -31,6 +33,8 @@ import { cancelWorkflowRun, getWorkflowRunStatus } from "../github.js";
 import { getJobByDispatchId, updateJobRunId, updateJobStatus } from "../log.js";
 import { read as readAdmission, releaseByDispatchId } from "../dispatch-admission.js";
 import { remediateFailedJob } from "../stuck-watchdog.js";
+import { destroyMachine, getMachine } from "../fly-machines.js";
+import { inspectLocalContainer, stopLocalContainer } from "../local-docker.js";
 import {
   PLANNING_RUN_TITLE_PREFIX,
   createPlanningFindExistingRun,
@@ -100,8 +104,13 @@ describe("findExistingRun", () => {
     await expect(find(INPUT, DISPATCHED_AT)).rejects.toThrow(/HTTP 502/);
   });
 
-  it("throws a TerminalError for another backend", async () => {
-    await expect(find({ ...INPUT, backend: "fly-machines" }, DISPATCHED_AT)).rejects.toThrow(/not supported yet/);
+  it.each(["fly-machines", "local-docker"] as const)("%s returns the machine id on the dispatch row, or null", async (backend) => {
+    vi.mocked(getJobByDispatchId).mockReturnValueOnce({ machineId: "m-9" } as never);
+    expect(await find({ ...INPUT, backend }, DISPATCHED_AT)).toBe("m-9");
+    vi.mocked(getJobByDispatchId).mockReturnValueOnce({ machineId: null } as never);
+    expect(await find({ ...INPUT, backend }, DISPATCHED_AT)).toBeNull();
+    vi.mocked(getJobByDispatchId).mockReturnValueOnce(null);
+    expect(await find({ ...INPUT, backend }, DISPATCHED_AT)).toBeNull();
   });
 });
 
@@ -113,13 +122,15 @@ describe("production deps", () => {
 
   function deps(overrides: Partial<PlanningRunProductionInput> = {}) {
     const input: PlanningRunProductionInput = {
-      config: { githubAppId: "1", githubAppPrivateKey: "k", notifyType: "slack", notifyWebhookUrl: null } as never,
+      config: { githubAppId: "1", githubAppPrivateKey: "k", notifyType: "slack", notifyWebhookUrl: null, flySessionsToken: "fly-token", flySessionsApp: "fly-app" } as never,
       getMapping,
       resolveProvider: async () => provider as never,
       resolveRunnerImage: async () => undefined,
       fireBreakerTrip: async () => {},
       preparePlanningLaunch: vi.fn().mockResolvedValue(prepared) as never,
       launchPlanningRun: vi.fn().mockResolvedValue(launchResult) as never,
+      launchPlanningSession: vi.fn().mockResolvedValue({ outcome: "accepted", machineId: "m-1", executionMode: "fly-machines" }) as never,
+      sessionDeps: {} as never,
       ...overrides,
     };
     return input;
@@ -169,9 +180,73 @@ describe("production deps", () => {
     expect(updateJobRunId).not.toHaveBeenCalled();
   });
 
-  it("launch throws a TerminalError for another backend", async () => {
-    const { d } = compose();
-    await expect(d.launch({ ...INPUT, backend: "local-docker" })).rejects.toThrow(/not supported yet/);
+  it.each(["fly-machines", "local-docker"] as const)("launch on %s calls launchPlanningSession with the held reservation and returns the machine id", async (backend) => {
+    const { input, d } = compose();
+    const result = await d.launch({ ...INPUT, backend, planningContext: { resolvedPlanningBranch: "dev", planningFieldValue: "dev" } });
+    expect(result).toEqual({ outcome: "accepted", jobId: "m-1" });
+    const args = vi.mocked(input.launchPlanningSession).mock.calls[0][0];
+    expect(args).toMatchObject({ execPath: backend, resolvedPlanningBranch: "dev", planningFieldValue: "dev" });
+    expect(args.reservation).toMatchObject({ dispatchId: "d-1", admission: { ok: true, admissionGeneration: 3 } });
+    expect(input.launchPlanningRun).not.toHaveBeenCalled();
+    expect(input.preparePlanningLaunch).not.toHaveBeenCalled();
+  });
+
+  it("launch on a container backend passes a rejected or unknown outcome through, with no jobId", async () => {
+    const { d } = compose({ launchPlanningSession: vi.fn().mockResolvedValue({ outcome: "unknown", executionMode: "fly-machines" }) as never });
+    expect(await d.launch({ ...INPUT, backend: "fly-machines" })).toEqual({ outcome: "unknown" });
+  });
+
+  it("launch on a container backend maps a missing reservation to rejected", async () => {
+    vi.mocked(readAdmission).mockReturnValue(null);
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const { input, d } = compose();
+    expect(await d.launch({ ...INPUT, backend: "fly-machines" })).toEqual({ outcome: "rejected" });
+    expect(input.launchPlanningSession).not.toHaveBeenCalled();
+  });
+
+  describe("readStatus and stop on the container backends", () => {
+    const fly = { ...INPUT, backend: "fly-machines" as const };
+    const docker = { ...INPUT, backend: "local-docker" as const };
+
+    it.each([["destroyed", "ended"], ["stopped", "ended"], ["started", "started"], ["starting", "unknown"], ["stopping", "unknown"]])(
+      "fly state %s is %s", async (state, expected) => {
+        vi.mocked(getMachine).mockResolvedValue({ id: "m-1", state } as never);
+        expect(await compose().d.readStatus(fly, "m-1")).toBe(expected);
+        expect(getMachine).toHaveBeenCalledWith("fly-token", "fly-app", "m-1");
+      });
+
+    it("a fly 404 is ended and another error is unknown", async () => {
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      const { d } = compose();
+      vi.mocked(getMachine).mockRejectedValueOnce(new Error("Failed to get machine m-1 (404): not found"));
+      expect(await d.readStatus(fly, "m-1")).toBe("ended");
+      vi.mocked(getMachine).mockRejectedValueOnce(new Error("Failed to get machine m-1 (503): down"));
+      expect(await d.readStatus(fly, "m-1")).toBe("unknown");
+    });
+
+    it("docker running is started, not running is ended", async () => {
+      const { d } = compose();
+      vi.mocked(inspectLocalContainer).mockResolvedValueOnce({ status: "running", running: true, exitCode: null });
+      expect(await d.readStatus(docker, "c-1")).toBe("started");
+      vi.mocked(inspectLocalContainer).mockResolvedValueOnce({ status: "exited", running: false, exitCode: 0 });
+      expect(await d.readStatus(docker, "c-1")).toBe("ended");
+    });
+
+    it("docker No such container is ended; any other error is unknown", async () => {
+      const { d } = compose();
+      vi.mocked(inspectLocalContainer).mockRejectedValueOnce(new Error("Failed to inspect local Docker runner c-1: Error: No such container: c-1"));
+      expect(await d.readStatus(docker, "c-1")).toBe("ended");
+      vi.mocked(inspectLocalContainer).mockRejectedValueOnce(new Error("Cannot connect to the Docker daemon"));
+      expect(await d.readStatus(docker, "c-1")).toBe("unknown");
+    });
+
+    it("stop destroys the exact machine and stops the exact container", async () => {
+      const { d } = compose();
+      expect(await d.stop(fly, "m-1")).toBe(true);
+      expect(destroyMachine).toHaveBeenCalledWith("fly-token", "fly-app", "m-1");
+      expect(await d.stop(docker, "c-1")).toBe(true);
+      expect(stopLocalContainer).toHaveBeenCalledWith("c-1");
+    });
   });
 
   it.each([

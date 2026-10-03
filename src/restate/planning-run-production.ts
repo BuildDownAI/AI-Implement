@@ -1,18 +1,19 @@
 /** Production composition for the `PlanningRun` service (AII-1020): the real GitHub Actions deps
  * for `createPlanningRunWorkflow`. Sibling of `kg-refresh-production.ts`; `src/index.ts` composes
  * and registers the service and owns what this file takes as input. Nothing submits the workflow
- * yet — the switch is a later change. Only the `github-actions` backend has deps; another backend
- * throws a `TerminalError` until its deps exist. */
-import * as restate from "@restatedev/restate-sdk";
+ * yet — the switch is a later change. One deps set serves all three backends: each backend-selected dep
+ * switches on `input.backend`. */
 import type { RepoMapping } from "../config.js";
 import { getMappings } from "../config.js";
 import { read as readAdmission, releaseByDispatchId } from "../dispatch-admission.js";
-import type { AppConfig } from "../index.js";
+import type { AppConfig, HeldReservation } from "../index.js";
+import { classifyFlyMachine, classifyLocalContainer, stopBackendRun } from "../backend-run.js";
+import { getRunnerMode } from "../runner-mode.js";
 import type { TicketIssue, TicketingProvider } from "../providers/types.js";
 import { defaultFetchSignal, cancelWorkflowRun, getWorkflowRunStatus } from "../github.js";
 import { getInstallationToken } from "../github-app-auth.js";
 import { findLogIdByDispatchId, getJobByDispatchId, updateJobRunId, updateJobStatus } from "../log.js";
-import type { launchPlanningRun, preparePlanningLaunch } from "../planning-launch.js";
+import type { launchPlanningRun, launchPlanningSession, preparePlanningLaunch } from "../planning-launch.js";
 import { remediateFailedJob, type StuckWatchdogConfig } from "../stuck-watchdog.js";
 import type { RestateService } from "./endpoint.js";
 import type { OwnedRunStatus } from "./owned-run-wait.js";
@@ -48,12 +49,15 @@ export interface PlanningRunProductionInput {
   fireBreakerTrip: Parameters<typeof launchPlanningRun>[0]["fireBreakerTrip"];
   preparePlanningLaunch: typeof preparePlanningLaunch;
   launchPlanningRun: typeof launchPlanningRun;
+  /** The Fly Machines / local Docker launch (AII-1053). */
+  launchPlanningSession: typeof launchPlanningSession;
+  /** The `index.ts` helpers `launchPlanningSession` takes, passed in to avoid an import cycle. */
+  sessionDeps: Parameters<typeof launchPlanningSession>[0]["deps"];
 }
 
-function requireGhaBackend(input: PlanningRunInput): void {
-  if (input.backend !== GHA_BACKEND) {
-    throw new restate.TerminalError(`planning-run backend ${input.backend} is not supported yet`);
-  }
+/** The two container backends; the GitHub Actions path has its own deps. */
+function containerBackend(input: PlanningRunInput): "fly-machines" | "local-docker" | null {
+  return input.backend === GHA_BACKEND ? null : input.backend;
 }
 
 function requireMapping(getMapping: (teamKey: string) => RepoMapping | undefined, teamKey: string): RepoMapping {
@@ -70,7 +74,8 @@ export function createPlanningFindExistingRun(opts: {
   getToken: (owner: string) => Promise<string>;
 }): PlanningRunDependencies["findExistingRun"] {
   return async (input, dispatchedAt) => {
-    requireGhaBackend(input);
+    // A machine or container id is recorded on the dispatch row by the launch itself.
+    if (containerBackend(input)) return getJobByDispatchId(input.dispatchId)?.machineId ?? null;
     const mapping = requireMapping(opts.getMapping, input.teamKey);
     const title = `${PLANNING_RUN_TITLE_PREFIX}${input.issueIdentifier}`;
     const floor = Math.floor(dispatchedAt / 1000) * 1000;
@@ -101,8 +106,36 @@ export function createProductionPlanningRunServices(input: PlanningRunProduction
     notifyWebhookUrl: config.notifyWebhookUrl,
   };
 
+  async function launchSession(run: PlanningRunInput, execPath: "fly-machines" | "local-docker"): Promise<PlanningLaunchResult> {
+    let ctx: { mapping: RepoMapping; provider: TicketingProvider; issue: TicketIssue; reservation: HeldReservation };
+    try {
+      const mapping = requireMapping(getMapping, run.teamKey);
+      const provider = await input.resolveProvider(mapping);
+      const issue = await provider.findByKey(run.issueIdentifier);
+      if (!issue) throw new Error(`issue ${run.issueIdentifier} not found`);
+      const admission = readAdmission(run.dispatchId);
+      if (!admission || admission.releasedAt !== null) throw new Error(`no active reservation for dispatch ${run.dispatchId}`);
+      // The workflow owns the reservation: the `release` here is never called by the launch.
+      ctx = { mapping, provider, issue, reservation: { dispatchId: run.dispatchId, admission: { ok: true, admissionGeneration: admission.generation, release: () => {} } } };
+    } catch (err) {
+      console.error(`[planning-run] launch preparation failed dispatch=${run.dispatchId}:`, err);
+      return { outcome: "rejected" };
+    }
+    const launched = await input.launchPlanningSession({
+      config, provider: ctx.provider, issue: ctx.issue, mapping: ctx.mapping, execPath,
+      runnerMode: getRunnerMode().mode,
+      resolvedPlanningBranch: run.planningContext[PLANNING_CONTEXT_BRANCH_KEY] || ctx.mapping.defaultBranch,
+      planningFieldValue: run.planningContext[PLANNING_CONTEXT_FIELD_VALUE_KEY] || null,
+      reservation: ctx.reservation,
+      deps: input.sessionDeps,
+    });
+    // Only the outcome and the machine id: the step result is journaled, so no nonce or token.
+    return launched.machineId === undefined ? { outcome: launched.outcome } : { outcome: launched.outcome, jobId: launched.machineId };
+  }
+
   async function launch(run: PlanningRunInput): Promise<PlanningLaunchResult> {
-    requireGhaBackend(run);
+    const execPath = containerBackend(run);
+    if (execPath) return launchSession(run, execPath);
     // Everything up to `preparePlanningLaunch` is pure preparation: a throw is a definitive non-launch.
     let prepared: Awaited<ReturnType<typeof preparePlanningLaunch>>;
     let ctx: { mapping: RepoMapping; provider: TicketingProvider; issue: TicketIssue; generation: number };
@@ -141,7 +174,9 @@ export function createProductionPlanningRunServices(input: PlanningRunProduction
   }
 
   async function readStatus(run: PlanningRunInput, jobId: string): Promise<OwnedRunStatus> {
-    requireGhaBackend(run);
+    // The same `ended` rule as the Legacy release (`confirmAdmissionTerminated`).
+    if (run.backend === "fly-machines") return classifyFlyMachine(config, jobId);
+    if (run.backend === "local-docker") return classifyLocalContainer(jobId);
     const mapping = requireMapping(getMapping, run.teamKey);
     const status = await getWorkflowRunStatus(await getToken(mapping.owner), mapping.owner, mapping.repo, Number(jobId));
     if (status?.status === "completed") return "ended";
@@ -150,7 +185,7 @@ export function createProductionPlanningRunServices(input: PlanningRunProduction
   }
 
   async function stop(run: PlanningRunInput, jobId: string): Promise<boolean> {
-    requireGhaBackend(run);
+    if (containerBackend(run)) return stopBackendRun(config, run.backend, jobId);
     const mapping = requireMapping(getMapping, run.teamKey);
     return cancelWorkflowRun(await getToken(mapping.owner), mapping.owner, mapping.repo, Number(jobId));
   }

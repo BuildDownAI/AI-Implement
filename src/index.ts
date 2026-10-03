@@ -61,6 +61,7 @@ import { handleReferenceTokenRequest } from "./reference-token-vending.js";
 import { handleStatusUpdate, handleStepReport } from "./session-api.js";
 import { postStatusComment } from "./status-events.js";
 import { buildRunUrl, classifyCompletion, deriveLastSuccessfulStage, monitorFailureCommentPrefix, renderClassification, shouldPostMonitorClassificationComment } from "./completion-classification.js";
+import { classifyFlyMachine, classifyLocalContainer } from "./backend-run.js";
 import { createMachine, getMachine, listMachines, destroyMachine, generateSessionToken, generateMachineNonce, buildSessionMachineConfig, listAppSecrets, fetchMachineLogs, updateMachineMetadata, readMachineExitCode } from "./fly-machines.js";
 import { safeDestroyMachine, sweepOrphanedMachines, SWEEP_MACHINE_MAX_AGE_MS } from "./reaper.js";
 import type { ReaperHelpers } from "./reaper.js";
@@ -2240,27 +2241,12 @@ export async function confirmAdmissionTerminated(
 
   if (job.executionMode === "fly-machines") {
     if (!job.machineId) return false;
-    if (!config.flySessionsToken || !config.flySessionsApp) return false;
-    try {
-      const machine = await getMachine(config.flySessionsToken, config.flySessionsApp, job.machineId);
-      return machine.state === "destroyed" || machine.state === "stopped";
-    } catch (err) {
-      if (err instanceof Error && err.message.includes("404")) return true; // already gone
-      console.error(`[admission] Failed to check Fly machine state for dispatch=${candidate.dispatchId}:`, err);
-      return false;
-    }
+    return (await classifyFlyMachine(config, job.machineId)) === "ended";
   }
 
   if (job.executionMode === "local-docker") {
     if (!job.machineId) return false;
-    try {
-      const state = await inspectLocalContainer(job.machineId);
-      return !state.running;
-    } catch (err) {
-      // `docker inspect` fails identically for "container gone" and "daemon
-      // unreachable" — only the former is safe to treat as confirmed-terminated.
-      return err instanceof Error && /No such container/i.test(err.message);
-    }
+    return (await classifyLocalContainer(job.machineId)) === "ended";
   }
 
   return false;
@@ -5055,7 +5041,7 @@ async function main(): Promise<void> {
     : null;
   setKgRefreshToolDeps(kgComposition?.toolDeps ?? null);
   const kgServices = kgComposition?.services ?? [];
-  // The PlanningRun workflow (AII-1020): registered, but nothing submits it yet.
+  // The PlanningRun workflow (AII-1020, AII-1054): registered, but nothing submits it yet.
   const planningRunServices = createProductionPlanningRunServices({
     config,
     resolveProvider: (mapping) => registry.forMapping(mapping),
@@ -5063,6 +5049,8 @@ async function main(): Promise<void> {
     fireBreakerTrip,
     preparePlanningLaunch,
     launchPlanningRun,
+    launchPlanningSession,
+    sessionDeps: { dispatchSession, isDefinitiveFlyRejectionError, isDefinitiveLocalDockerLaunchFailure, shouldReleaseAdmissionOnDispatchError },
   }).services;
   const restateRegistration = createRestateRegistrationGate(() => shuttingDown, {
     startRestateEndpoint: () => startRestateEndpoint([...RESTATE_SERVICES, ...reviewFixServices, ...kgServices, ...planningRunServices], restateSidecar.identityKey),
