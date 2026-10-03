@@ -476,6 +476,74 @@ describe("dispatch entry points — pre-launch failure releases the reservation 
     });
     expect(retry.ok).toBe(false);
   });
+
+  describe("launchPlanningSession (AII-1053)", () => {
+    const planningConfig = {
+      githubAppId: "id",
+      githubAppPrivateKey: "key",
+      anthropicApiKey: "sk-test",
+      localRunnerImage: "test-image",
+      localRunnerOrchestratorUrl: "http://localhost:9000",
+      runnerCallbackBaseUrl: "http://localhost:9000",
+      runnerTokenSecret: "secret",
+    } as unknown as AppConfig;
+
+    async function launch(reservation?: import("../index.js").HeldReservation) {
+      const planning = await import("../planning-launch.js");
+      return planning.launchPlanningSession({
+        config: planningConfig, provider, issue, mapping, execPath: "local-docker", runnerMode: "default",
+        resolvedPlanningBranch: "main", planningFieldValue: null, reservation,
+        deps: {
+          dispatchSession: indexModule.dispatchSession,
+          isDefinitiveFlyRejectionError: () => false,
+          isDefinitiveLocalDockerLaunchFailure: () => false,
+          shouldReleaseAdmissionOnDispatchError: indexModule.shouldReleaseAdmissionOnDispatchError,
+        },
+      });
+    }
+
+    beforeEach(async () => {
+      (await import("../log.js")).initLogTable();
+      vi.mocked(githubAppAuth.getInstallationToken).mockResolvedValue("gh-token");
+      vi.mocked(localDocker.startLocalRunnerContainer).mockResolvedValue({ containerId: "c-1", containerName: "n" } as never);
+      (provider as unknown as Record<string, unknown>).markPlanningStarted = vi.fn().mockResolvedValue(undefined);
+    });
+
+    it("no reservation: acquires exactly one Legacy reservation", async () => {
+      const admission = await import("../dispatch-admission.js");
+      const result = await launch();
+      expect(result).toEqual({ outcome: "accepted", machineId: "c-1", executionMode: "local-docker" });
+      const rows = dedup.getDb().prepare("SELECT dispatch_id FROM dispatch_admissions").all() as { dispatch_id: string }[];
+      expect(rows).toHaveLength(1);
+      expect(admission.read(rows[0].dispatch_id)?.lifecycleOwner).toEqual({ kind: "legacy" });
+    });
+
+    it("with a reservation: does not acquire, logs the given dispatch id and generation, never releases it", async () => {
+      const held = gate.acquireDispatch({
+        dispatchId: "held-1", issueId: issue.id, issueIdentifier: issue.identifier, kind: "planning",
+        teamKey: issue.scopeKey, maxInProgressAiIssues: 1, backend: "local-docker",
+      });
+      if (!held.ok) throw new Error("setup");
+      const result = await launch({ dispatchId: "held-1", admission: held });
+      expect(result.outcome).toBe("accepted");
+      const admRows = dedup.getDb().prepare("SELECT COUNT(*) AS n FROM dispatch_admissions").get() as { n: number };
+      expect(admRows.n).toBe(1);
+      const row = dedup.getDb().prepare("SELECT dispatch_id, admission_generation FROM dispatch_log").get() as Record<string, unknown>;
+      expect(row).toEqual({ dispatch_id: "held-1", admission_generation: held.admissionGeneration });
+    });
+
+    it("with a reservation: a pre-launch throw is rejected and leaves the reservation held", async () => {
+      vi.mocked(githubAppAuth.getInstallationToken).mockRejectedValue(new Error("mint failed"));
+      const held = gate.acquireDispatch({
+        dispatchId: "held-2", issueId: issue.id, issueIdentifier: issue.identifier, kind: "planning",
+        teamKey: issue.scopeKey, maxInProgressAiIssues: 1, backend: "local-docker",
+      });
+      if (!held.ok) throw new Error("setup");
+      expect((await launch({ dispatchId: "held-2", admission: held })).outcome).toBe("rejected");
+      const released = dedup.getDb().prepare("SELECT released_at FROM dispatch_admissions WHERE dispatch_id = 'held-2'").get() as { released_at: number | null };
+      expect(released.released_at).toBeNull();
+    });
+  });
 });
 
 // AII-783 review on PR #681 (finding 2): the non-thrown, result.outcome-based release/hold
