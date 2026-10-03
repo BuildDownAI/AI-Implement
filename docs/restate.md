@@ -344,3 +344,11 @@ Three rules:
 1. **Named producer.** Each signal has a named producer in production code. A handler and a route are not a producer. The comment at each promise names the module that resolves it.
 2. **Contract test.** Each producer has one default-suite test that starts from the real producer code and ends at the real route handler. A scenario that resolves the promise from the test body does not count.
 3. **A source the orchestrator owns.** When the backend allows it, started evidence has a source the orchestrator reads itself. For kg-refresh on GitHub Actions, a `watch` status read of `in_progress` counts as started evidence (`queued` does not); on Fly machines the runner's progress callback is the only source.
+
+**A second phase is a second call (`PlanningRun`, `src/restate/planning-run-workflow.ts`).** A workflow that must confirm the run ended after its `report` calls `awaitOwnedRun` again with its own deadline (the confirm window) and its own tick. Three things the helper does not say on its own:
+
+- **A resolved result signal must leave `signals`.** The helper arms every name in `signals`, so a `report` that is already resolved wins the next call at once and the tick never waits. The confirm call passes `signals: []` and keeps `resultSignal: "report"`; the workflow keeps a local `reported` flag and passes `[]` on every later call too.
+- **`resultSignal` is still peeked at a deadline.** With `report` resolved, the end of the confirm window returns as a `signal` event, not a timeout. Treat a `signal` in the confirm phase as "window over" and return to the wait. After a `report`, a `signal` from the wait call at or past the total deadline is that deadline, so the workflow checks `ctx.date.now()` and takes the timeout path.
+- **`ended` with a resolved `report` is not the same as `ended` without one.** Peek `report` after `ended` (the helper's contract): with a report the callback already closed the job row; without one the workflow closes it. A `report` is also started evidence, so set `startedSeen` when it arrives.
+
+The same helper serves a bounded wait for `ended` after a stop (`signals: []`, a deadline of the stop margin); the run's outcome is already decided, so either event ends it.
