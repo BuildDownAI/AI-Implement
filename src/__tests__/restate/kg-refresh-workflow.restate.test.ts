@@ -920,67 +920,9 @@ describe("KgRefresh durable workflow", () => {
     },
   );
 
-  // ---- W3: no progress within the bootstrap deadline ----
+  // ---- W3/W4: Fly backend. No status read exists to gate, and no signal races the deadline, so these wait on the outcome itself ----
   it.each(VARIANTS.map(([label]) => label))(
     "W3: no progress within the bootstrap deadline fails with a timed_out row and one outcome call (%s)",
-    async (label) => {
-      const env = deadlineEnvFor(label);
-      // Captured before the trigger (not after): the trigger's genericSend dispatches the
-      // run immediately, and with a 1s bootstrap deadline a call recorded even a moment
-      // late risks folding an already-fired outcome into the "before" snapshot instead of
-      // the "after" delta.
-      const beforeOutcome = onOutcomeCalls.length;
-      const triggered = await triggerViaKgRepo(env.baseUrl());
-      const triggerId = (triggered as { triggerId: string }).triggerId;
-      // A queued run is no started evidence. The held first status read keeps the workflow at its tick until the deadline has passed.
-      const held = gate("W3 first status read");
-      const scenario = makeScenario(triggerId, {
-        dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "github-actions",
-        runStatusSequence: [{ status: "queued", conclusion: null }], tickGate: held,
-      });
-
-      await workflowDispatched(triggerId);
-      await pastDeadlineAtTick(scenario, BOOTSTRAP_DEADLINE_MS, "bootstrap deadline");
-      held.release();
-      const outcome = await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
-
-      expect(outcome.ok).toBe(false);
-      expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "timed_out", conclusion: "bootstrap_timeout" });
-      expect(onOutcomeCalls.length - beforeOutcome).toBe(1);
-      expect(onOutcomeCalls[onOutcomeCalls.length - 1]).toMatchObject({ kind: "failure", meta: { failureCode: "bootstrap_timeout", timedOut: true } });
-      await eventually(() => kgRepoStatus(env.baseUrl()), (marker) => marker === null, { label: "KgRepo marker cleared" });
-    },
-    15_000,
-  );
-
-  // ---- W4: progress arrives, then no report within the total deadline ----
-  it.each(VARIANTS.map(([label]) => label))(
-    "W4: progress then no report within the total deadline fails timed out (%s)",
-    async (label) => {
-      const env = deadlineEnvFor(label);
-      const triggerId = newTriggerId();
-      const held = gate("W4 first status read");
-      const scenario = makeScenario(triggerId, {
-        dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "github-actions",
-        runStatusSequence: [{ status: "queued", conclusion: null }], tickGate: held,
-      });
-
-      const done = runWorkflow(env.baseUrl(), triggerId);
-      await held.reached();
-      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "progress", {});
-      await pastDeadlineAtTick(scenario, TOTAL_DEADLINE_MS, "total deadline");
-      held.release();
-
-      const outcome = await done;
-      expect(outcome.ok).toBe(false);
-      expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "timed_out", conclusion: "timed_out" });
-    },
-    15_000,
-  );
-
-  // ---- Fly backend: no status read exists to gate, and no signal races the deadline, so these wait on the outcome itself ----
-  it.each(VARIANTS.map(([label]) => label))(
-    "W3: no progress within the bootstrap deadline fails with a timed_out row and one outcome call (fly-machines, no status read, %s)",
     async (label) => {
       const env = deadlineEnvFor(label);
       // Captured before the trigger (not after): the trigger's genericSend dispatches the
@@ -1005,7 +947,7 @@ describe("KgRefresh durable workflow", () => {
   );
 
   it.each(VARIANTS.map(([label]) => label))(
-    "W4: progress then no report within the total deadline fails timed out (fly-machines, no status read, %s)",
+    "W4: progress then no report within the total deadline fails timed out (%s)",
     async (label) => {
       const env = deadlineEnvFor(label);
       const triggerId = newTriggerId();
@@ -1023,7 +965,7 @@ describe("KgRefresh durable workflow", () => {
   );
 
   it.each(VARIANTS.map(([label]) => label))(
-    "AII-1010: a dry-run with a report target that ends by bootstrap_timeout gets a failure verdict and no persist or notify (fly-machines, no status read, %s)",
+    "AII-1010: a dry-run with a report target that ends by bootstrap_timeout gets a failure verdict and no persist or notify (%s)",
     async (label) => {
       const env = deadlineEnvFor(label);
       const triggerId = newTriggerId();
@@ -1544,43 +1486,6 @@ describe("KgRefresh durable workflow", () => {
       expect(scenarios.get(triggerId)!.cancelCalls).toBe(0);
       // Bounded by cancel time + BOOTSTRAP_DEADLINE_MS (1s); the total deadline is 2.6s after dispatch.
       expect(Date.now() - started).toBeLessThan(TOTAL_DEADLINE_MS);
-    },
-    15_000,
-  );
-
-  it.each(VARIANTS.map(([label]) => label))(
-    "AII-1010: a dry-run with a report target that ends by bootstrap_timeout gets a failure verdict and no persist or notify (%s)",
-    async (label) => {
-      const env = deadlineEnvFor(label);
-      const triggerId = newTriggerId();
-      const held = gate("dry-run first status read");
-      const scenario = makeScenario(triggerId, {
-        dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "github-actions",
-        runStatusSequence: [{ status: "queued", conclusion: null }], tickGate: held,
-      });
-      const report = { repo: KG_SOURCE_REPO, prNumber: 11, sha: "b".repeat(40) };
-      const beforePersist = persistCalls.length;
-      const beforeOutcome = onOutcomeCalls.length;
-      const beforeStatus = setCommitStatusFn.mock.calls.length;
-
-      const done = runWorkflow(env.baseUrl(), triggerId, { dryRun: true, report });
-      await pastDeadlineAtTick(scenario, BOOTSTRAP_DEADLINE_MS, "bootstrap deadline");
-      held.release();
-      const outcome = await (await done);
-
-      expect(outcome.ok).toBe(false);
-      expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "timed_out", conclusion: "bootstrap_timeout" });
-      expect(setCommitStatusFn.mock.calls.length - beforeStatus).toBe(1);
-      expect((setCommitStatusFn.mock.calls[beforeStatus] as unknown[])[4]).toMatchObject({ state: "failure" });
-      const stored = await eventually(
-        () => callObject<{ sha: string; outcome: RefreshOutcome } | null>(env.baseUrl(), "KgRepo", KG_SOURCE_REPO, "dryRunOutcome", { repo: report.repo, prNumber: report.prNumber }),
-        (v) => v !== null,
-        { label: "durable effect" },
-      );
-      expect(stored!.sha).toBe(report.sha);
-      expect(stored!.outcome.ok).toBe(false);
-      expect(persistCalls.length - beforePersist).toBe(0);
-      expect(onOutcomeCalls.length - beforeOutcome).toBe(0);
     },
     15_000,
   );
