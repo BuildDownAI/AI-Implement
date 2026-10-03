@@ -32,15 +32,9 @@ jobs:
       # (verified on AII-448: 28 unhandled rejections alone produced exit 1
       # while all tests passed — the exact signal this gate exists to catch).
       #
-      # Ambient Actions vars are scrubbed for the test step: orchestrator code
-      # branches on GITHUB_RUN_ID / GITHUB_ENV / etc., and the suite asserts
-      # the non-CI defaults (first run of this gate proved it: reporter tests
-      # picked up the job's own run id). The suite must see the same env shape
-      # locally and here.
-      - name: npm test (ambient CI vars scrubbed)
-        run: |
-          unset GITHUB_RUN_ID GITHUB_ENV GITHUB_REPOSITORY GITHUB_REF_NAME                 GITHUB_EVENT_NAME GITHUB_SHA GITHUB_ACTIONS GITHUB_ACTION
-          npm test
+      # No unset step: the suite deletes ambient variables itself, the same way here as on any machine.
+      # Its allowlist, with the reason for each entry, is src/__tests__/setup/ambient-env.ts.
+      - run: npm test
       - run: npm run typecheck
       - run: npx tsc --noEmit --project tsconfig.review-fix-ports-tests.json
       - run: npx tsc --noEmit --project tsconfig.dispatch-admission-tests.json
@@ -88,10 +82,7 @@ jobs:
           docker pull "docker.io/restatedev/restate:${RESTATE_IMAGE_TAG}"
           mkdir -p ~/restate-image-cache
           docker save "docker.io/restatedev/restate:${RESTATE_IMAGE_TAG}" -o ~/restate-image-cache/restate.tar
-      - name: npm run test:restate (ambient CI vars scrubbed)
-        run: |
-          unset GITHUB_RUN_ID GITHUB_ENV GITHUB_REPOSITORY GITHUB_REF_NAME                 GITHUB_EVENT_NAME GITHUB_SHA GITHUB_ACTIONS GITHUB_ACTION
-          npm run test:restate
+      - run: npm run test:restate
       - run: npx tsc --noEmit --project tsconfig.restate-tests.json
 
   # Binary runtime (AII-915): the same suite on the runtime a dispatched runner
@@ -107,9 +98,8 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci
-      - name: npm run test:restate on the binary runtime, three passes (ambient CI vars scrubbed)
+      - name: npm run test:restate on the binary runtime, three passes
         env:
           RESTATE_TEST_RUNTIME: binary
         run: |
-          unset GITHUB_RUN_ID GITHUB_ENV GITHUB_REPOSITORY GITHUB_REF_NAME                 GITHUB_EVENT_NAME GITHUB_SHA GITHUB_ACTIONS GITHUB_ACTION
           for i in 1 2 3; do npm run test:restate || exit 1; done

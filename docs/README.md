@@ -32,6 +32,7 @@ Two tiers, distinguished by what a file *is* rather than what it covers.
 | [workflow-sync.md](workflow-sync.md) | Workflow sync: what a sync writes, removes, and seeds; the sync branch and PR; triggers and recovery; failures |
 | [dispatch-dedup.md](dispatch-dedup.md) | The `dispatched` table: schema, who writes, reads and clears a row, and the per-tracker reconcile loop with its case table |
 | [ticketing-providers.md](ticketing-providers.md) | The `TicketingProvider` interface, the built-in and custom providers, per-mapping provider choice, how each provider finds work, mapping-key rules, and the limits of a mixed Linear/Jira deployment |
+| [unit-tests.md](unit-tests.md) | The default test suite: where tests live, what `npm test` runs, isolation from the machine (the environment scrub and its allowlist), how test files are type-checked, fakes and fixtures, and the CI jobs |
 | [bug-fix-tests.md](bug-fix-tests.md) | The bug-fix pattern: reproduce with a failing test before the fix, ship both in one pull request, which tier of test to write, and two worked examples |
 
 Two references live outside this directory because they are consumed directly rather than read: `.env.example` is the canonical list of orchestrator environment variables, and `CLAUDE.md` is the index that points at everything here.
