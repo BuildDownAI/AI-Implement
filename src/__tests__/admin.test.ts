@@ -3976,6 +3976,46 @@ describe("POST /api/tools/<name>", () => {
     });
   }
 
+  it("answers 409 deploy-in-progress with deployStartedAt and never contacts the ingress during a hold", async () => {
+    const { setDeployHold, clearDeployHold } = await import("../deploy-hold.js");
+    const { callTool } = await vi.importActual<typeof import("../restate/tools-client.js")>("../restate/tools-client.js");
+    const fetchImpl = vi.fn();
+    setDeployHold();
+    try {
+      const token = await login("secret");
+      const res = await toolRequest(token, { args: {} }, {
+        callTool: (name, args, caller) => callTool(name, args, caller, { fetchImpl: fetchImpl as unknown as typeof fetch }),
+      });
+      expect(res.statusCode).toBe(409);
+      expect(JSON.parse(res.body)).toEqual({ error: "deploy-in-progress", deployStartedAt: expect.any(Number) });
+      expect(fetchImpl).not.toHaveBeenCalled();
+    } finally {
+      clearDeployHold();
+    }
+  });
+
+  it.each([
+    ["a refused connection", () => Promise.reject(new Error("ECONNREFUSED"))],
+    ["a 5xx answer", () => Promise.resolve(new Response("boom", { status: 503 }))],
+  ])("answers 503 restate-unavailable with no hold and %s", async (_label, fetchResult) => {
+    const { callTool } = await vi.importActual<typeof import("../restate/tools-client.js")>("../restate/tools-client.js");
+    const fetchImpl = vi.fn(fetchResult);
+    const token = await login("secret");
+    const res = await toolRequest(token, { args: {} }, {
+      callTool: (name, args, caller) => callTool(name, args, caller, { fetchImpl: fetchImpl as unknown as typeof fetch, permitsExternalCall: () => true }),
+    });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(res.statusCode).toBe(503);
+    expect(JSON.parse(res.body)).toEqual({ error: "restate-unavailable" });
+  });
+
+  it("answers 503 restate-unavailable when callTool reports an outage", async () => {
+    const token = await login("secret");
+    const res = await toolRequest(token, { args: {} }, { callTool: async () => ({ status: "unavailable" }) });
+    expect(res.statusCode).toBe(503);
+    expect(JSON.parse(res.body)).toEqual({ error: "restate-unavailable" });
+  });
+
   it("rejects an unauthenticated request with the route's existing 401, without calling the tool", async () => {
     const called = vi.fn();
     const res = await toolRequest("not-a-session", { args: {} }, {

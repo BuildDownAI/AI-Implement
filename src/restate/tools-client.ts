@@ -104,7 +104,8 @@ export async function toolCatalog(deps: DiscoverToolsDeps = {}): Promise<Discove
 
 export type CallToolResult =
   | { status: "ok"; content: Array<{ type: string; text: string }>; isError?: boolean }
-  | { status: "unavailable" };
+  | { status: "unavailable" }
+  | { status: "deploy-held" };
 
 /** For testing: override the ingress base URL and the fetch implementation. */
 export interface CallToolDeps {
@@ -126,7 +127,8 @@ export interface CallToolDeps {
 
 /**
  * Posts `{ caller, args }` to the ingress at `<service>/<name>` and returns the handler's
- * ToolResponse. A connection failure or a 5xx response answers `{ status: "unavailable" }`
+ * ToolResponse. While a deploy hold refuses admission it answers `{ status: "deploy-held" }`
+ * without contacting the ingress. A connection failure or a 5xx response answers `{ status: "unavailable" }`
  * — the signal src/mcp.ts maps to `503 { error: "restate-unavailable" }`.
  *
  * `name` is percent-encoded before it reaches the URL: an unencoded `../other-service/x`
@@ -143,7 +145,7 @@ export async function callTool(
 ): Promise<CallToolResult> {
   // Both MCP and POST /api/tools/<name> enter through this seam. Refuse before
   // contacting the old endpoint once deployment has closed external admission.
-  if (!(deps.permitsExternalCall ?? (() => !isDeployHeld()))()) return { status: "unavailable" };
+  if (!(deps.permitsExternalCall ?? (() => !isDeployHeld()))()) return { status: "deploy-held" };
   const ingressBaseUrl = deps.ingressBaseUrl ?? RESTATE_INGRESS_BASE_URL;
   const fetchImpl = deps.fetchImpl ?? fetch;
 

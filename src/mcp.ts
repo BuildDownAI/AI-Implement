@@ -1,4 +1,5 @@
 import http from "node:http";
+import { getDeployStartedAt } from "./deploy-hold.js";
 import { verifyMcpToken, resolveClientPath, getRefreshExpiry } from "./mcp-oauth.js";
 import { recordAuthEvent, type AuthEventCause } from "./mcp-auth-events.js";
 import { recheckIdentity, type AccessRole } from "./access-entries.js";
@@ -308,6 +309,10 @@ export async function handleMcpRequest(
         }
       }
       const callResult = await callTool(toolName, toolArgs, caller, idempotencyKey ? { idempotencyKey } : undefined);
+      if (callResult.status === "deploy-held") {
+        json(res, 409, { error: "deploy-in-progress", deployStartedAt: getDeployStartedAt() });
+        return;
+      }
       if (callResult.status === "unavailable") {
         json(res, 503, { error: "restate-unavailable" });
         return;
