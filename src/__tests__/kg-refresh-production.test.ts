@@ -11,6 +11,16 @@ vi.mock("../github.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../github.js")>()),
   postWorkflowDispatch: (...args: unknown[]) => postWorkflowDispatch(...args),
 }));
+const destroyMachine = vi.fn(async (..._args: unknown[]) => {});
+vi.mock("../fly-machines.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../fly-machines.js")>()),
+  destroyMachine: (...args: unknown[]) => destroyMachine(...args),
+}));
+const stopLocalContainer = vi.fn(async (_id: string) => {});
+vi.mock("../local-docker.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../local-docker.js")>()),
+  stopLocalContainer: (id: string) => stopLocalContainer(id),
+}));
 const capturedWorkflowDeps: { current?: import("../restate/kg-refresh-workflow.js").KgRefreshWorkflowDependencies } = {};
 vi.mock("../restate/kg-refresh-workflow.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../restate/kg-refresh-workflow.js")>();
@@ -56,6 +66,7 @@ function makeInput(overrides: Partial<KgRefreshProductionInput> = {}): KgRefresh
     config: {
       githubAppId: "1", githubAppPrivateKey: "key", sessionImage: "img", runnerImageExplicit: false,
       runnerCallbackBaseUrl: "https://orch.example", runnerTokenSecret: "secret",
+      flySessionsToken: "fly-token", flySessionsApp: "fly-app",
     },
     mintToken: vi.fn(async () => ({ token: "gh-token", expiresAt: "" })),
     fetchTarball: noop as never,
@@ -243,6 +254,39 @@ describe("non-GHA dispatch", () => {
     const result = await createKgRefreshDispatch(makeInput({ dispatchKgRefreshRun }))(dispatchInput);
     expect(dispatchKgRefreshRun).toHaveBeenCalledWith(expect.objectContaining({ dispatchId: "d-workflow", executionPath: "fly-machines" }));
     expect(result).toMatchObject({ outcome: "accepted", jobId: null, executionMode: "fly-machines" });
+  });
+});
+
+describe("stopMachineRun wiring", () => {
+  beforeEach(() => { destroyMachine.mockClear(); stopLocalContainer.mockClear(); });
+
+  it("destroys the Fly machine with the sessions token and app", async () => {
+    createProductionKgRefreshServices(makeInput());
+    await expect(capturedWorkflowDeps.current!.stopMachineRun("fly-machines", "m-1")).resolves.toBe(true);
+    expect(destroyMachine).toHaveBeenCalledWith("fly-token", "fly-app", "m-1");
+    expect(stopLocalContainer).not.toHaveBeenCalled();
+  });
+
+  it("stops the local container", async () => {
+    createProductionKgRefreshServices(makeInput());
+    await expect(capturedWorkflowDeps.current!.stopMachineRun("local-docker", "c-1")).resolves.toBe(true);
+    expect(stopLocalContainer).toHaveBeenCalledWith("c-1");
+    expect(destroyMachine).not.toHaveBeenCalled();
+  });
+
+  it("rejects a Fly stop without the sessions token, and ignores an unknown mode", async () => {
+    const input = makeInput();
+    createProductionKgRefreshServices({ ...input, config: { ...input.config, flySessionsToken: null, flySessionsApp: null } });
+    await expect(capturedWorkflowDeps.current!.stopMachineRun("fly-machines", "m-1")).rejects.toThrow(/not configured/);
+    await expect(capturedWorkflowDeps.current!.stopMachineRun("other", "x")).resolves.toBe(false);
+    expect(destroyMachine).not.toHaveBeenCalled();
+    expect(stopLocalContainer).not.toHaveBeenCalled();
+  });
+
+  it("surfaces a local container id from the dispatch as the job id", async () => {
+    resolvedPath.current = "local-docker";
+    const result = await createKgRefreshDispatch(makeInput({ dispatchKgRefreshRun: vi.fn(async () => ({ machineId: "c-1", machineNonce: "n" })) }))(dispatchInput);
+    expect(result.jobId).toBe("c-1");
   });
 });
 

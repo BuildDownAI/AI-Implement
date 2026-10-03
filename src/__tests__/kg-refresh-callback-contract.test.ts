@@ -225,4 +225,68 @@ describe("kg-refresh callback is verify-only and reports to the KgRefresh workfl
     expect(await statusFor("conflict")).toBe(409);
     expect(await statusFor("unavailable")).toBe(503);
   });
+
+  // ADR 034 rule 4 producer proofs: start at the real sender, end at the real receiver.
+  it("contract: KgRefresh.report — a real postRunnerResult is accepted by handleRunnerResult and reports to the workflow", async () => {
+    const { token, dispatchId } = mint();
+    const c = client();
+    const seen: Array<{ url: string; status: number }> = [];
+    const fetchImpl = vi.fn(async (url: string, init: RequestInit) => {
+      const headers = init.headers as Record<string, string>;
+      const out = await callback.handleRunnerResult({
+        authorization: headers.Authorization,
+        body: JSON.parse(String(init.body)),
+        secret: SECRET,
+        resolveProvider: async () => null,
+        kgRefreshClient: c as never,
+        kgSourceRepo: SLUG,
+      });
+      seen.push({ url, status: out.status });
+      return new Response(JSON.stringify(out.body), { status: out.status });
+    });
+    const workspaceDir = mkdtempSync(join(tmpdir(), "kgreport-"));
+    const savedToken = process.env.RUN_TOKEN;
+    process.env.RUN_TOKEN = token;
+    try {
+      await postRunnerResult({
+        phase: "kg-refresh",
+        workspaceDir,
+        outcome: "success",
+        snapshotPr: 7,
+        snapshotCommit: "abc",
+        callbackUrl: "http://orch.test",
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+      });
+    } finally {
+      if (savedToken === undefined) delete process.env.RUN_TOKEN;
+      else process.env.RUN_TOKEN = savedToken;
+      rmSync(workspaceDir, { recursive: true, force: true });
+    }
+    expect(seen).toEqual([{ url: "http://orch.test/runner/result", status: 200 }]);
+    expect(c.report).toHaveBeenCalledTimes(1);
+    expect(c.report).toHaveBeenCalledWith(
+      dispatchId,
+      expect.objectContaining({ ok: true, snapshotPr: 7, snapshotCommit: "abc" }),
+      { idempotencyKey: dispatchId },
+    );
+  });
+
+  it("contract: KgRefresh.cancel — the real admin cancel dep cancels the clicked row's dispatchId and answers 200", async () => {
+    const idx = await import("../index.js");
+    const ingress = { repoStatus: vi.fn(), cancel: vi.fn().mockResolvedValue({ status: "accepted" }) };
+    const deps = idx.makeKgRefreshAdminDeps(SLUG, ingress as never, vi.fn() as never, () => false);
+    expect(await deps.cancel({ jobId: 1, dispatchId: "t-clicked", reason: "operator_cancelled" })).toEqual({
+      status: 200,
+      body: { cancelled: true },
+    });
+    expect(ingress.cancel).toHaveBeenCalledTimes(1);
+    expect(ingress.cancel).toHaveBeenCalledWith("t-clicked", "operator_cancelled");
+
+    ingress.cancel.mockClear();
+    expect(await deps.cancel({ jobId: 2, dispatchId: null, reason: "operator_cancelled" })).toEqual({
+      status: 409,
+      body: { error: "no-refresh-in-flight" },
+    });
+    expect(ingress.cancel).not.toHaveBeenCalled();
+  });
 });

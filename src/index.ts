@@ -4340,7 +4340,7 @@ async function dispatchKgRefreshRun(
       config.localRunnerOrchestratorUrl ??
       config.runnerCallbackBaseUrl ??
       `http://host.docker.internal:${config.healthPort}`;
-    await startLocalRunnerContainer({
+    const { containerId } = await startLocalRunnerContainer({
       image: config.localRunnerImage,
       issueId: "kg-refresh",
       issueIdentifier: "KG-REFRESH",
@@ -4361,7 +4361,7 @@ async function dispatchKgRefreshRun(
       extraEnv,
     });
     console.log(`[kg-refresh] dispatched via local Docker (dispatchId=${opts.dispatchId})`);
-    return { machineNonce };
+    return { machineId: containerId, machineNonce };
   } else {
     throw new Error(`[kg-refresh] unsupported execution path "${String(executionPath)}": the GitHub Actions run is dispatched by the KgRefresh workflow`);
   }

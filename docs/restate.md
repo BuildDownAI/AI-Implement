@@ -328,7 +328,7 @@ A run kind's services live in `src/restate/<kind>-workflow.ts` and `src/restate/
 
 ### The owned-run wait
 
-A workflow that owns a run outside Restate (a GitHub Actions run, a Fly machine) waits with the Restate pattern "workflow promise raced against a durable timer" ([Timers and Scheduling](https://docs.restate.dev/tour/workflows#timers-and-scheduling), [External events](https://docs.restate.dev/develop/ts/external-events#choose-a-primitive)). The contract is [ADR 034](adr/034-an-owned-run-wait-names-each-signal-and-its-producer.md).
+A workflow that owns a run outside Restate (a GitHub Actions run, a Fly machine) waits with the Restate pattern "workflow promise raced against a durable timer" ([Timers and Scheduling](https://docs.restate.dev/tour/workflows#timers-and-scheduling), [External events](https://docs.restate.dev/develop/ts/external-events#choose-a-primitive)). The contract is [ADR 034](adr/034-an-owned-run-wait-names-each-signal-and-its-producer.md); the helper, the sender, and the test kit are [ADR 035](adr/035-the-owned-run-wait-is-one-helper-one-sender-and-one-test-kit.md). A new run kind follows the checklist in ADR 035. `KgRefresh` and `ReviewFixAttempt` wait through the shared helper `awaitOwnedRun` in `src/restate/owned-run-wait.ts`. The helper creates the promise arms one time for each call and returns the first event (a signal, a status read that shows the run started or ended, or a deadline); the workflow decides what the event means.
 
 | Signal | Primitive | Meaning | Resolved |
 |---|---|---|---|

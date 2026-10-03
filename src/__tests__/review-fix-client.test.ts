@@ -581,6 +581,74 @@ describe("ReviewFixDeliveryPump — routing", () => {
   });
 });
 
+// ADR 034 rule 4 producer proofs: a real pump and facade end at the exact ingress request.
+// The receiving handlers run inside Restate (covered by the Restate tier), so the contract
+// ends at the request and the validator the `result` handler calls first.
+describe("ReviewFixDeliveryPump — producer contract", () => {
+  function recordingPump() {
+    const calls: Array<{ url: string; init: RequestInit }> = [];
+    const fetchImpl = vi.fn(async (url: string, init: RequestInit) => {
+      calls.push({ url: String(url), init });
+      return { ok: true } as Response;
+    });
+    const facade = client.createRestateReviewFixFacade({ ingressBaseUrl: "http://ingress.test", fetchImpl: fetchImpl as unknown as typeof fetch });
+    const pump = new client.ReviewFixDeliveryPump({ facade, now: () => 1_000 });
+    return { calls, pump };
+  }
+
+  it("contract: ReviewFixAttempt.wake — a result delivery posts to the attempt's result handler with a body the handler's validator accepts", async () => {
+    const { validateReviewFixResultMetadata } = await import("../review-fix-contract.js");
+    const destination = makeDestination();
+    inbox.acceptDelivery({
+      authenticatedSource: "runner",
+      deliveryId: "evt-contract-result",
+      kind: "result",
+      destination,
+      payload: {
+        version: 1,
+        attemptId: "attempt-wake",
+        installationId: destination.installationId,
+        repository: destination.repository,
+        prNumber: destination.prNumber,
+        deadlineAt: Date.now() + 60_000,
+        githubRunId: 100,
+        githubRunAttempt: 1,
+        outputCommit: "b".repeat(40),
+      },
+    });
+    const { calls, pump } = recordingPump();
+
+    expect(await pump.tick()).toBe(1);
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.url).toBe("http://ingress.test/ReviewFixAttempt/attempt-wake/result");
+    expect(calls[0]!.init.method).toBe("POST");
+    expect((calls[0]!.init.headers as Record<string, string>)["idempotency-key"]).toBe("result:runner:evt-contract-result");
+    const sent = JSON.parse(String(calls[0]!.init.body));
+    expect(validateReviewFixResultMetadata(sent).ok).toBe(true);
+    expect(sent.attemptId).toBe("attempt-wake");
+  });
+
+  it("contract: ReviewFixAttempt.cancel — a cancellation delivery posts { attemptId } to the attempt's cancel handler", async () => {
+    inbox.acceptDelivery({
+      authenticatedSource: "runner",
+      deliveryId: "evt-contract-cancel",
+      kind: "cancellation",
+      destination: makeDestination(),
+      payload: { attemptId: "attempt-cancel" },
+    });
+    const { calls, pump } = recordingPump();
+
+    expect(await pump.tick()).toBe(1);
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.url).toBe("http://ingress.test/ReviewFixAttempt/attempt-cancel/cancel");
+    expect(calls[0]!.init.method).toBe("POST");
+    expect((calls[0]!.init.headers as Record<string, string>)["idempotency-key"]).toBe("cancellation:runner:evt-contract-cancel");
+    expect(JSON.parse(String(calls[0]!.init.body))).toEqual({ attemptId: "attempt-cancel" });
+  });
+});
+
 describe("no launch/finalize/recovery decisions leak into this module", () => {
   it("imports neither worker/finalizer ports nor dispatch/runner modules", () => {
     const source = fs.readFileSync(path.join(__dirname, "../restate/review-fix-client.ts"), "utf8");

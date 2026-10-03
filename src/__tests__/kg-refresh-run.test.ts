@@ -2387,10 +2387,10 @@ describe("runKgRefresh", () => {
     });
 
     function recorder(progressStatus = 200) {
-      const calls: Array<{ url: string; authorization?: string; kind: "progress" | "result" | "other" }> = [];
+      const calls: Array<{ url: string; authorization?: string; body?: unknown; kind: "progress" | "result" | "other" }> = [];
       const fetchImpl = (async (url: string, init?: RequestInit) => {
         const kind = url.endsWith("/runner/progress") ? "progress" : url.endsWith("/runner/result") ? "result" : "other";
-        calls.push({ url, authorization: (init?.headers as Record<string, string> | undefined)?.Authorization, kind });
+        calls.push({ url, authorization: (init?.headers as Record<string, string> | undefined)?.Authorization, body: init?.body, kind });
         const status = kind === "progress" ? progressStatus : 200;
         return new Response(JSON.stringify({ acknowledged: true }), { status });
       }) as unknown as typeof fetch;
@@ -2404,14 +2404,16 @@ describe("runKgRefresh", () => {
       delete process.env.AI_IMPLEMENT_RUN_CONFIG;
     });
 
-    it("posts step progress with the bearer token before the result", async () => {
+    it("posts one progress signal with the bearer token before the result", async () => {
       process.env.RUN_PROGRESS_TOKEN = "  prog-tok  ";
       const { calls, fetchImpl } = recorder();
       const result = await runKgRefresh({ workspaceDir: tmpDir, stepsOverride: stepsOverride(), fetchImpl });
       expect(result.exitCode).toBe(0);
       const progress = calls.filter((c) => c.kind === "progress");
-      expect(progress.length).toBeGreaterThan(0);
-      expect(progress.every((c) => c.url === "http://orch/runner/progress" && c.authorization === "Bearer prog-tok")).toBe(true);
+      expect(progress).toHaveLength(1);
+      expect(progress[0].url).toBe("http://orch/runner/progress");
+      expect(progress[0].authorization).toBe("Bearer prog-tok");
+      expect(JSON.parse(progress[0].body as string)).toEqual({});
       expect(calls.findIndex((c) => c.kind === "result")).toBeGreaterThan(calls.findIndex((c) => c.kind === "progress"));
     });
 

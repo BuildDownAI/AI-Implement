@@ -193,6 +193,7 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
       config: {
         githubAppId: "test-app-id", githubAppPrivateKey: "test-private-key", sessionImage: "runner:test",
         runnerImageExplicit: false, runnerCallbackBaseUrl: "https://orchestrator.test", runnerTokenSecret: SECRET,
+        flySessionsToken: null, flySessionsApp: null,
       },
       ...railFakes,
       dispatchKgRefreshRun: async () => { throw new Error("the legacy dispatcher must not run on the GHA path"); },
