@@ -238,5 +238,20 @@ describe("production deps", () => {
       expect(updateJobStatus).toHaveBeenCalledWith(7, "timed_out", expect.any(String));
       expect(remediateFailedJob).toHaveBeenCalledTimes(1);
     });
+
+    it("re-runs the failure handling on retry when an earlier attempt closed the row then threw", async () => {
+      vi.mocked(remediateFailedJob).mockRejectedValueOnce(new Error("tracker down"));
+      vi.mocked(getJobByDispatchId).mockReturnValueOnce(row as never);
+      const { d } = compose();
+      await expect(d.finishJob("d-1", { kind: "run_ended" })).rejects.toThrow("tracker down");
+      expect(updateJobStatus).toHaveBeenCalledTimes(1);
+
+      vi.mocked(getJobByDispatchId).mockReturnValueOnce(
+        { ...row, status: "failed", conclusion: "ended_without_callback" } as never,
+      );
+      await d.finishJob("d-1", { kind: "run_ended" });
+      expect(updateJobStatus).toHaveBeenCalledTimes(1);
+      expect(remediateFailedJob).toHaveBeenCalledTimes(2);
+    });
   });
 });

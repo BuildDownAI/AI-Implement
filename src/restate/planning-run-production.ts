@@ -157,11 +157,14 @@ export function createProductionPlanningRunServices(input: PlanningRunProduction
 
   async function finishJob(dispatchId: string, outcome: PlanningFinishOutcome): Promise<void> {
     const job = getJobByDispatchId(dispatchId);
-    // No row, or the planning callback already closed it: nothing to close and no failure to handle.
-    if (!job || TERMINAL_JOB_STATUSES.has(job.status)) return;
+    if (!job) return;
     const status = outcome.kind === "deadline" ? "timed_out" : "failed";
     const conclusion = outcome.kind === "deadline" ? "deadline_exceeded" : "ended_without_callback";
-    updateJobStatus(job.id, status, conclusion);
+    // A terminal row closed by the planning callback needs no handling. A row carrying this function's own marker
+    // means an earlier attempt closed it and then threw before the handling finished, so the retry runs it again.
+    const closedByThisStep = job.conclusion === "deadline_exceeded" || job.conclusion === "ended_without_callback";
+    if (TERMINAL_JOB_STATUSES.has(job.status) && !closedByThisStep) return;
+    if (!TERMINAL_JOB_STATUSES.has(job.status)) updateJobStatus(job.id, status, conclusion);
     const mapping = job.teamKey ? getMapping(job.teamKey) : undefined;
     const provider = mapping ? await input.resolveProvider(mapping) : null;
     await remediateFailedJob(watchdogConfig, provider, { ...job, status, conclusion }, conclusion, { ownerCall: true });
