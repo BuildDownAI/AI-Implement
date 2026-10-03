@@ -9,6 +9,7 @@ How the default test suite runs, what isolates it from the machine it runs on, w
 | `src/__tests__/` | Orchestrator and runner tests, mostly one file per module, with `admin/` and `providers/` subdirectories | `npm test` |
 | `src/__tests__/restate/` | Restate engine scenarios (`*.restate.test.ts`) | `npm run test:restate` only |
 | `src/__tests__/setup/` | The setup files both vitest configs load, the environment allowlist, and their tests | — |
+| `src/__tests__/helpers/` | Shared fixture builders and their tests | — |
 | `src/__tests__/fixtures/` | Static fixture data | — |
 | `src/admin-ui/__tests__/` | The admin SPA's modules: its pages, auth, router and drawer | `npm test` |
 
@@ -67,11 +68,31 @@ The credential `beforeEach` in `clear-runner-credentials.ts` predates the scrub 
 
 ## Fakes and fixtures
 
+### Fixture builders
+
+`src/__tests__/helpers/builders.ts` holds one builder for each commonly built fixture type. Build a test's fixtures with them rather than a new per-file copy.
+
+**When a type gets a builder.** Once it is hand-built as a fixture, an input whose values do not matter to the test, in three or more test files. A value under test, such as a step a pipeline test runs or a failure record a classifier classifies, stays inline however often it repeats.
+
+**What a builder guarantees.** A builder returns a complete object of its type with neutral defaults, takes overrides for the fields a test cares about, and returns its type without a cast, so a field added to the type fails the type check at the builder wherever test files are type-checked (§ Type checking).
+
+**Reading a builder's failure.** A new required field fails the builder's object with TS2322, or with TS2345 where the object is passed to a constructor or a spy (`makeContext`, `makeExecutor`). The error's first line prints the whole object type; the indented lines beneath name the field, as `Types of property '…' are incompatible` rather than missing, because the overrides could supply it. Give the field a default in the builder. A changed `ProviderRegistry` constructor fails at the `super(...)` call in `makeRegistry`'s subclass (TS2554), and a renamed `forMapping` at that subclass's `override` (TS4113).
+
+**Where the defaults come from.** The defaults are literals, not the production `DEFAULT_*` constants: a test of what an unconfigured mapping gets calls the code that applies the default, not a builder. `builders.test.ts` passes each default through the code that consumes it where one exists, such as storing a mapping and reading it back, so a default cannot describe a state production never produces.
+
+**Builders that are not plain data.** `makeProvider` returns a `TicketingProvider` whose every method is a spy typed by its own signature, and `makeExecutor` an `LLMExecutor` whose `invoke` is one, each with a safe default passed as the spy's implementation, so the default survives `mockReset`. `makeRegistry` returns a subclass of the real `ProviderRegistry` that overrides only `forMapping`: the class has private members, so no object literal satisfies its type without a cast, and the registry's other lookups still run their own code against the given provider.
+
+**Per-file copies.** Many test files still define their own builders for the same types, under `make*` names and others such as `mapping`, and the copies do not all share a signature. They move onto the shared builders file by file. Many are typed with `as unknown as <Type>`, and such a fixture compiles whatever the type becomes, so it cannot show drift.
+
+### Fakes
+
 - **Injected seams.** Many modules that call a network or a client take an implementation parameter, such as `fetchImpl` or `getInstallationTokenImpl`, and tests pass a fake. Reuse the fake in the module's existing test file before you write a new one ([bug-fix-tests.md](bug-fix-tests.md), step 1). Several functions that read the environment take it the same way, as an `env` parameter defaulting to `process.env`.
+- **The stateful fake provider.** `FakeProvider` in `src/__tests__/providers/fake.ts` implements `TicketingProvider` in memory: it holds issues, moves them through the lifecycle verbs, and records comments and, when asked, calls. `src/__tests__/providers/contract.ts` is the contract suite it passes. Use it when a test needs a tracker that remembers; use `makeProvider` when a test controls or asserts individual calls.
 - **Module mocks.** `vi.mock` replaces a whole module. The test then exercises the mock, not the real module.
-- **Fixture helpers.** Test files define their own `make*` functions (`makeMapping`, `makeContext`, `makeJob` and others) that return a complete object with overrides. No shared module exists: the same helper name is defined separately in many files, and the copies do not all share a signature.
-- **Per-file harnesses.** Many test files build their own fresh database for each test: they point `DEDUP_DB_PATH` at a temporary file, call `vi.resetModules()`, and import the modules again, so each module reads the new path. Many also build their own fake `fetch` or temporary directories. No shared harness exists.
-- **Casts.** Many fixtures are typed with `as unknown as <Type>`. Such a fixture compiles whatever the type becomes, so it cannot show drift.
+
+### Harnesses
+
+Many test files build their own fresh database for each test: they point `DEDUP_DB_PATH` at a temporary file, call `vi.resetModules()`, and import the modules again, so each module reads the new path. Many also build their own fake `fetch` or temporary directories. No shared harness exists.
 
 ## CI
 
