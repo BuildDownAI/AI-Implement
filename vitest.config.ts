@@ -6,7 +6,10 @@ export default defineConfig({
     // Never inherit a developer or runner application's database by default.
     env: { DEDUP_DB_PATH: ":memory:" },
     pool: "forks",
-    setupFiles: ["src/__tests__/setup/clear-runner-credentials.ts"],
+    // The scrub must finish before any other setup file loads.
+    // "list" is vitest's runtime default, but its bundled types document "parallel", so it is stated here.
+    sequence: { setupFiles: "list" },
+    setupFiles: ["src/__tests__/setup/scrub-ambient-env.ts", "src/__tests__/setup/clear-runner-credentials.ts"],
     include: ["src/**/*.test.ts"],
     // src/__tests__/restate/** needs Docker (testcontainers) and runs separately via
     // `npm run test:restate` / vitest.restate.config.ts — never here, so the
