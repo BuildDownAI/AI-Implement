@@ -30,6 +30,10 @@ export const PLANNING_RUN_CONFIRM_WINDOW_MS = 2 * 60 * 1000;
 export const PLANNING_RUN_BOOTSTRAP_MS = 10 * 60 * 1000;
 /** How long a run may last: the planning token's lifetime. */
 export const PLANNING_RUN_TOTAL_MS = PLANNING_TTL_SECONDS * 1000;
+/** How long the escape path keeps looking for a run whose launch call may still complete after a cancel. */
+export const PLANNING_RUN_ESCAPE_WAIT_MS = 60 * 1000;
+/** How long the escape path sleeps between those lookups. */
+export const PLANNING_RUN_ESCAPE_TICK_MS = 5 * 1000;
 /** How long the workflow waits for `ended` after it stops a run at a deadline. */
 export const PLANNING_RUN_STOP_MARGIN_MS = 10 * 60 * 1000;
 
@@ -93,6 +97,8 @@ export interface PlanningRunDependencies {
   bootstrapMs?: number;
   totalMs?: number;
   stopMarginMs?: number;
+  escapeWaitMs?: number;
+  escapeTickMs?: number;
 }
 
 export function createPlanningRunWorkflow(deps: PlanningRunDependencies) {
@@ -102,6 +108,8 @@ export function createPlanningRunWorkflow(deps: PlanningRunDependencies) {
   const bootstrapMs = deps.bootstrapMs ?? PLANNING_RUN_BOOTSTRAP_MS;
   const totalMs = deps.totalMs ?? PLANNING_RUN_TOTAL_MS;
   const stopMarginMs = deps.stopMarginMs ?? PLANNING_RUN_STOP_MARGIN_MS;
+  const escapeWaitMs = deps.escapeWaitMs ?? PLANNING_RUN_ESCAPE_WAIT_MS;
+  const escapeTickMs = deps.escapeTickMs ?? PLANNING_RUN_ESCAPE_TICK_MS;
 
   async function run(ctx: WorkflowContext, input: PlanningRunInput): Promise<PlanningRunResult> {
     if (input?.dispatchId !== ctx.key) {
@@ -111,9 +119,26 @@ export function createPlanningRunWorkflow(deps: PlanningRunDependencies) {
     ctx.set("dispatchId", dispatchId);
     ctx.set("step", "reserve");
 
-    // The first step. A refusal returns before the `try`, so no `finally` releases a row this dispatch does not hold;
-    // a reserve step that fails every attempt throws here too, with nothing held.
-    const held = await reserveOwnedRun(ctx, () => deps.reserve(input));
+    let releaseStarted = false;
+
+    async function release(reason: DispatchAdmissionReleaseReason): Promise<PlanningRunResult> {
+      releaseStarted = true;
+      ctx.set("step", "release");
+      await ctx.run("release", () => deps.release(dispatchId, reason), { maxRetryAttempts: 5 });
+      ctx.set("step", "released");
+      return { reason };
+    }
+
+    // The first step. A refusal returns before the `try`, so no `finally` releases a row this dispatch does not hold.
+    // A cancel or a failed step after a possible commit releases the row of this dispatch id: the function may have
+    // committed the reservation without the result being journaled, and a release with nothing held is safe.
+    let held: boolean;
+    try {
+      held = await reserveOwnedRun(ctx, () => deps.reserve(input));
+    } catch (err) {
+      if (!restate.internal.isSuspendedError(err)) await release("cancelled");
+      throw err;
+    }
     if (!held) {
       ctx.console.log(`[planning-run] reservation refused dispatch=${dispatchId} issue=${input.issueIdentifier}`);
       ctx.set("step", "refused");
@@ -121,7 +146,6 @@ export function createPlanningRunWorkflow(deps: PlanningRunDependencies) {
     }
     ctx.set("step", "dispatch");
 
-    let releaseStarted = false;
     let suspended = false;
     // Set when the `dispatch` step started and did not return `rejected`: a run may exist.
     let mayHaveLaunched = false;
@@ -131,14 +155,6 @@ export function createPlanningRunWorkflow(deps: PlanningRunDependencies) {
     let wrapStarted = false;
     let dispatchedAtForEscape = 0;
     let pendingReason: DispatchAdmissionReleaseReason | null = null;
-
-    async function release(reason: DispatchAdmissionReleaseReason): Promise<PlanningRunResult> {
-      releaseStarted = true;
-      ctx.set("step", "release");
-      await ctx.run("release", () => deps.release(dispatchId, reason), { maxRetryAttempts: 5 });
-      ctx.set("step", "released");
-      return { reason };
-    }
 
     /** Cleanup, then the outcome one time, for a run that was launched; each step name is journaled once. */
     async function wrapUp(): Promise<void> {
@@ -160,16 +176,25 @@ export function createPlanningRunWorkflow(deps: PlanningRunDependencies) {
     /** An escape after a launch: stop the run when its id is known, close the row, wrap up. Best effort throughout. */
     async function escape(): Promise<void> {
       if (currentJobId === null) {
-        // A `dispatch` step that used all attempts may have launched: one bounded lookup for the id.
-        try {
-          const found = await ctx.run("find-escape", () => deps.findExistingRun(input, dispatchedAtForEscape), { maxRetryAttempts: 3 });
-          if (found !== null) {
-            currentJobId = found;
-            ctx.set("jobId", found);
+        // A `dispatch` step that did not return may have launched, and its function can still complete after a
+        // cancel: look for the run, then sleep and look again for a fixed time.
+        const endAt = (await ctx.date.now()) + escapeWaitMs;
+        for (let i = 0; currentJobId === null; i++) {
+          try {
+            const found = await readBoundedOwnedRun<string | null>(ctx, `find-escape-${i}`, () => deps.findExistingRun(input, dispatchedAtForEscape), null);
+            if (found !== null) {
+              currentJobId = found;
+              ctx.set("jobId", found);
+              ctx.console.log(`[planning-run] found run after escape dispatch=${dispatchId} job=${found}`);
+              break;
+            }
+            if ((await ctx.date.now()) + escapeTickMs > endAt) break;
+            await ctx.sleep(escapeTickMs);
+          } catch (err) {
+            if (restate.internal.isSuspendedError(err)) throw err;
+            ctx.console.error(`[planning-run] find after escape failed dispatch=${dispatchId}`);
+            break;
           }
-        } catch (err) {
-          if (restate.internal.isSuspendedError(err)) throw err;
-          ctx.console.error(`[planning-run] find after escape failed dispatch=${dispatchId}`);
         }
       }
       const id = currentJobId;
