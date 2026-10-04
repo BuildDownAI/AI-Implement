@@ -22,9 +22,9 @@ import {
 } from "./harness.js";
 import { registerOwnedRunContract, type OwnedRunAdapter, type OwnedRunFaults } from "./owned-run-contract.js";
 
-const SLOW = { tickMs: 50, confirmTickMs: 50, confirmWindowMs: 60_000, bootstrapMs: 120_000, totalMs: 240_000, stopMarginMs: 60_000 };
+const SLOW = { tickMs: 50, confirmTickMs: 50, confirmWindowMs: 60_000, bootstrapMs: 120_000, totalMs: 240_000, stopMarginMs: 60_000, escapeWaitMs: 4_000, escapeTickMs: 100 };
 const WINDOW = { ...SLOW, confirmWindowMs: 400 };
-const DEADLINE = { tickMs: 50, confirmTickMs: 50, confirmWindowMs: 60_000, bootstrapMs: 600, totalMs: 1_200, stopMarginMs: 500 };
+const DEADLINE = { tickMs: 50, confirmTickMs: 50, confirmWindowMs: 60_000, bootstrapMs: 600, totalMs: 1_200, stopMarginMs: 500, escapeWaitMs: 4_000, escapeTickMs: 100 };
 
 interface Scenario {
   launchResult: PlanningLaunchResult;
@@ -43,6 +43,11 @@ interface Scenario {
   tickGateReachedAt?: number;
   /** Parks every status read (not the id lookup of the `dispatch` step). */
   readGate?: Gate;
+  /** Parks the launch call before it creates the run (`launched` stays false until it opens). */
+  launchGate?: Gate;
+  /** Parks the `reserve` function after it took the reservation. */
+  reserveGate?: Gate;
+  reserveTaken?: boolean;
   launchImpl?: (input: PlanningRunInput) => Promise<PlanningLaunchResult>;
   /** Every effect call in order, one string per attempt (the shape the contract suite reads). */
   calls: string[];
@@ -73,6 +78,10 @@ function makeDeps(seams: typeof SLOW): PlanningRunDependencies {
     async reserve(input) {
       const sc = scenarioOf(input.dispatchId);
       sc.calls.push("reserve");
+      if (sc.reserveGate) {
+        sc.reserveTaken = true;
+        await sc.reserveGate.wait();
+      }
       return !sc.faults.refuseReservation;
     },
     async findExistingRun(input) {
@@ -86,6 +95,7 @@ function makeDeps(seams: typeof SLOW): PlanningRunDependencies {
       const sc = scenarioOf(input.dispatchId);
       sc.launchCalls++;
       sc.calls.push("launch");
+      if (sc.launchGate) await sc.launchGate.wait();
       sc.launched = true;
       return sc.launchImpl ? sc.launchImpl(input) : sc.launchResult;
     },
@@ -334,6 +344,71 @@ describe("PlanningRun durable workflow", () => {
       expect(w.sc.calls[w.sc.calls.length - 1]).toBe("release");
     } finally {
       w.sc.readGate!.release();
+    }
+  }, 60_000);
+
+  /** Cancels the `run` invocation of a dispatch id. */
+  async function cancelRun(envs: Map<string, RestateTestEnvironment>, label: string, dispatchId: string): Promise<void> {
+    const env = envs.get(label)!;
+    const rows = await eventually(
+      () => queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'PlanningRun' AND target_service_key = '${dispatchId}' AND target_handler_name = 'run'`),
+      (found) => found.length === 1,
+      { label: "the run invocation" },
+    );
+    await cancelInvocation(env.adminAPIBaseUrl(), String(rows[0].id));
+  }
+
+  // The cancel reaches the workflow while the launch call is in flight; the call completes after the
+  // cancel. The escape path must keep looking and stop the run it then finds.
+  it.each(labels)("an invocation cancel during the launch call stops the run that appears later (%s)", async (label) => {
+    const w = begin(slow, label, { launchGate: gate("launch call") });
+    try {
+      await w.sc.launchGate!.reached();
+      await cancelRun(slow, label, w.dispatchId);
+      // The dispatch step's own lookup is one call; the escape path's first lookup is the second.
+      await eventually(() => w.sc.findCalls, (n) => n >= 2, { label: "the first lookup of the escape path" });
+      expect(w.sc.stopCalls).toEqual([]);
+      w.sc.launchGate!.release();
+      await eventually(() => releasesOf(w.dispatchId), (reasons) => reasons.length >= 1, { label: "the release after the cancel" });
+      expect(releasesOf(w.dispatchId)).toEqual(["cancelled"]);
+      expect(w.sc.stopCalls).toEqual([`job-${w.dispatchId}`]);
+      expect(w.sc.finishCalls).toEqual([{ kind: "cancelled" }]);
+      expect(w.sc.calls[w.sc.calls.length - 1]).toBe("release");
+    } finally {
+      w.sc.launchGate!.release();
+    }
+  }, 60_000);
+
+  it.each(labels)("an invocation cancel during a launch that never creates a run ends the escape after the fixed time (%s)", async (label) => {
+    const w = begin(slow, label, { launchGate: gate("launch call"), runId: null });
+    try {
+      await w.sc.launchGate!.reached();
+      await cancelRun(slow, label, w.dispatchId);
+      await eventually(() => w.sc.findCalls, (n) => n >= 2, { label: "the first lookup of the escape path" });
+      w.sc.launchGate!.release();
+      await eventually(() => releasesOf(w.dispatchId), (reasons) => reasons.length >= 1, { label: "the release after the escape time" });
+      expect(releasesOf(w.dispatchId)).toEqual(["cancelled"]);
+      expect(w.sc.stopCalls).toEqual([]);
+      expect(w.sc.finishCalls).toEqual([{ kind: "cancelled" }]);
+      // The escape looked more than one time before it gave up.
+      expect(w.sc.findCalls).toBeGreaterThan(2);
+    } finally {
+      w.sc.launchGate!.release();
+    }
+  }, 60_000);
+
+  // The cancel arrives after the reserve function took the reservation and before its result is journaled.
+  it.each(labels)("an invocation cancel during the reserve step releases the reservation of the dispatch id (%s)", async (label) => {
+    const w = begin(slow, label, { reserveGate: gate("reserve") });
+    try {
+      await w.sc.reserveGate!.reached();
+      expect(w.sc.reserveTaken).toBe(true);
+      await cancelRun(slow, label, w.dispatchId);
+      await eventually(() => releasesOf(w.dispatchId), (reasons) => reasons.length >= 1, { label: "the release after the cancel" });
+      expect(releasesOf(w.dispatchId)).toEqual(["cancelled"]);
+      expect(w.sc.launchCalls).toBe(0);
+    } finally {
+      w.sc.reserveGate!.release();
     }
   }, 60_000);
 

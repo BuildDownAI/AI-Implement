@@ -19,8 +19,8 @@
 import type { RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
-const SLOW = { tickMs: 50, confirmTickMs: 50, confirmWindowMs: 60_000, bootstrapMs: 120_000, totalMs: 240_000, stopMarginMs: 60_000 };
-const DEADLINE = { tickMs: 50, confirmTickMs: 50, confirmWindowMs: 60_000, bootstrapMs: 120_000, totalMs: 1_500, stopMarginMs: 60_000 };
+const SLOW = { tickMs: 50, confirmTickMs: 50, confirmWindowMs: 60_000, bootstrapMs: 120_000, totalMs: 240_000, stopMarginMs: 60_000, escapeWaitMs: 4_000, escapeTickMs: 100 };
+const DEADLINE = { tickMs: 50, confirmTickMs: 50, confirmWindowMs: 60_000, bootstrapMs: 120_000, totalMs: 1_500, stopMarginMs: 60_000, escapeWaitMs: 4_000, escapeTickMs: 100 };
 
 const sim = vi.hoisted(() => ({
   remediateCalls: 0,
@@ -112,7 +112,7 @@ import { createReviewFixAdminFacade } from "../../review-fix-admin-facade.js";
 import { SqliteReviewFixAttemptStore } from "../../review-fix-attempt-store.js";
 import { listActiveRestateReviewFixPrs, queueReviewFixCancellationForClosedPr } from "../../review-fix-close.js";
 import { mintPreparedReviewFixToken } from "../../runner-tokens.js";
-import { VARIANTS, callWorkflow, eventually, gate, startVariants, stopAll, waitForStep, type Gate } from "./harness.js";
+import { VARIANTS, callWorkflow, cancelInvocation, eventually, queryInvocations, gate, startVariants, stopAll, waitForStep, type Gate } from "./harness.js";
 
 const OWNER = "TestOrg";
 const REPO = "test-repo";
@@ -195,6 +195,10 @@ const NONCE = "nonce-must-not-leak";
 /** Per-scenario launch behaviour. */
 const launches: string[] = [];
 let launchAckLost = false;
+/** Parks the launch call of `launchPlanningRun` before it creates the run. */
+let launchGate: Gate | undefined;
+/** Parks the `reserve` step after it took the reservation. */
+let reserveGate: Gate | undefined;
 const clearedIssues: string[] = [];
 const comments: string[] = [];
 const issues = new Map<string, { id: string; identifier: string; title: string; scopeKey: string; nativeStatus: string }>();
@@ -249,6 +253,7 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
       })) as never,
       launchPlanningRun: (async (args: { issue: { id: string; identifier: string; title: string; scopeKey: string; nativeStatus: string }; dispatchId: string; admissionGeneration: number }) => {
         launches.push(args.issue.identifier);
+        if (launchGate) await launchGate.wait();
         // The real function writes the row after the dispatch call succeeds.
         appendLog({
           issueId: args.issue.id, issueIdentifier: args.issue.identifier, issueTitle: args.issue.title, teamKey: args.issue.scopeKey,
@@ -292,6 +297,7 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
         if (sim.failAfterEffect.delete("outcome")) throw new Error("injected: the outcome effect ran, then the step failed");
       },
       sessionDeps: {} as never,
+      afterReserve: async () => { if (reserveGate) await reserveGate.wait(); },
     });
     sim.timing = SLOW;
     environments = await startVariants(compose().services);
@@ -313,6 +319,8 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
     sim.notices = [];
     sim.failAfterEffect = new Set();
     launchAckLost = false;
+    launchGate = undefined;
+    reserveGate = undefined;
     sim.remediateCalls = 0;
     getDb().prepare("DELETE FROM dispatch_log").run();
   });
@@ -715,6 +723,55 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
       gh.statusGate.release();
       await untilReleased(first);
       expect(launches).toEqual(["PLT-61"]);
+    }, 60_000);
+
+    /** Cancels the `run` invocation of a dispatch id. */
+    async function cancelRun(label: string, dispatchId: string): Promise<void> {
+      const env = environments.get(label)!;
+      const rows = await eventually(
+        () => queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'PlanningRun' AND target_service_key = '${dispatchId}' AND target_handler_name = 'run'`),
+        (found) => found.length === 1,
+        { label: "the run invocation" },
+      );
+      await cancelInvocation(env.adminAPIBaseUrl(), String(rows[0].id));
+    }
+
+    it.each(labels)("a cancel during the launch call stops the run that appears later and releases (%s)", async (label) => {
+      launchGate = gate("launch call");
+      const issue = mkIssue(label, "PLT-63");
+      const url = baseUrl(label);
+      const id = `plan-${label}-late-${counter++}`;
+      expect(await createPlanningRunIngressClient(url).submit(id, input(id, issue))).toEqual({ status: "accepted" });
+      try {
+        await launchGate.reached();
+        await cancelRun(label, id);
+        expect(gh.cancelCalls).toEqual([]);
+        launchGate.release();
+        await untilReleased(id);
+        expect(gh.runs).toHaveLength(1);
+        expect(gh.cancelCalls).toEqual([gh.runs[0].id]);
+        expect(readAdmission(id)).toMatchObject({ releaseReason: "cancelled" });
+      } finally {
+        launchGate.release();
+      }
+    }, 60_000);
+
+    it.each(labels)("a cancel during the reserve step releases the reservation of the dispatch id (%s)", async (label) => {
+      reserveGate = gate("reserve");
+      const issue = mkIssue(label, "PLT-64");
+      const url = baseUrl(label);
+      const id = `plan-${label}-reserve-${counter++}`;
+      expect(await createPlanningRunIngressClient(url).submit(id, input(id, issue))).toEqual({ status: "accepted" });
+      try {
+        await reserveGate.reached();
+        expect(readAdmission(id)).toMatchObject({ releasedAt: null });
+        await cancelRun(label, id);
+        await untilReleased(id);
+        expect(readAdmission(id)).toMatchObject({ releaseReason: "cancelled" });
+        expect(launches).toEqual([]);
+      } finally {
+        reserveGate.release();
+      }
     }, 60_000);
 
     it.each(labels)("a team at maxInProgressAiIssues refuses the reserve step (%s)", async (label) => {

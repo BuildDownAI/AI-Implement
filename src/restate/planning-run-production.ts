@@ -58,6 +58,8 @@ export interface PlanningRunProductionInput {
   reportTerminalJob: (job: Job) => Promise<void>;
   /** The `index.ts` helpers `launchPlanningSession` takes, passed in to avoid an import cycle. */
   sessionDeps: Parameters<typeof launchPlanningSession>[0]["deps"];
+  /** Test seam: awaited after the reservation was taken, inside the `reserve` step. Production leaves it unset. */
+  afterReserve?: (run: PlanningRunInput) => Promise<void>;
 }
 
 /** The two container backends; the GitHub Actions path has its own deps. */
@@ -252,9 +254,9 @@ export function createProductionPlanningRunServices(input: PlanningRunProduction
 
   /** Takes the reservation in the workflow's first step. `acquireDispatch` returns the active row of this dispatch id
    *  when a step retry follows a committed reservation, so a retry never takes a second one. */
-  function reserve(run: PlanningRunInput): boolean {
+  async function reserve(run: PlanningRunInput): Promise<boolean> {
     const mapping = requireMapping(getMapping, run.teamKey);
-    return acquireDispatch({
+    const held = acquireDispatch({
       dispatchId: run.dispatchId,
       issueId: run.issueId,
       issueIdentifier: run.issueIdentifier,
@@ -264,6 +266,8 @@ export function createProductionPlanningRunServices(input: PlanningRunProduction
       backend: run.backend,
       lifecycleOwner: { kind: "restate", attemptId: run.dispatchId },
     }).ok;
+    if (held && input.afterReserve) await input.afterReserve(run);
+    return held;
   }
 
   const deps: PlanningRunDependencies = {
