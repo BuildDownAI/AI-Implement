@@ -50,3 +50,15 @@ A Legacy function with no named step is a gap, and it is closed in the workflow 
 Easier: a new run kind calls four functions and runs one suite. A step with no bound cannot be added without a decision.
 
 Harder: an adapter must supply fault injection, and the caller must write each effect to be safe to run twice.
+
+## Status after adoption
+
+Two run kinds adopted the kit and the suite: `PlanningRun` (AII-1064, AII-1065, AII-1068) and `KgRefresh` (AII-1066). `PlanningRun` runs all five scenarios. `KgRefresh` runs scenario 1 only. Four scenarios do not apply to it:
+
+* **Scenario 2** (a crash after the launch adopts the run): the `dispatch` step already looks the run up by title before it dispatches.
+* **Scenario 3** (a normal end runs `cleanup`, `outcome`, then the release): a normal end runs the rail gates, and `KgRefresh` has no `cleanup` step.
+* **Scenario 4** (a refused reservation): `KgRefresh` holds no `dispatch_admissions` reservation. Its marker is the `KgRepo` object (ADR 032).
+* **Scenario 5** (a failed `cleanup` and `outcome` still release): `KgRefresh` has no `cleanup` step to fail.
+
+The AII-1058 gaps are closed in `PlanningRun`. The table above lists each fenced Legacy function by call site in [restate.md](../restate.md#the-owned-run-lifecycle-kit).
+
