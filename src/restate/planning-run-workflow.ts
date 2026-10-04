@@ -15,7 +15,7 @@ import { serde } from "@restatedev/restate-sdk-zod";
 import { z } from "zod";
 import type { DispatchAdmissionReleaseReason } from "../dispatch-admission.js";
 import { PLANNING_TTL_SECONDS } from "../runner-tokens.js";
-import { cleanupOwnedRun, readOwnedRunStatus, reportOwnedRunOutcome } from "./owned-run-lifecycle.js";
+import { cleanupOwnedRun, readBoundedOwnedRun, readOwnedRunStatus, reportOwnedRunOutcome } from "./owned-run-lifecycle.js";
 import { awaitOwnedRun, type OwnedRunStatus } from "./owned-run-wait.js";
 
 /** One shared retention constant, the same pattern as `KG_REFRESH_RETENTION_MS`. */
@@ -224,13 +224,7 @@ export function createPlanningRunWorkflow(deps: PlanningRunDependencies) {
         }
         if (jobId === null) {
           // A find that fails on each attempt counts as "not found yet"; the wait goes on to its deadline.
-          let found: string | null = null;
-          try {
-            found = await ctx.run(`find-${findIndex++}`, () => deps.findExistingRun(input, dispatchedAt), { maxRetryAttempts: 3 });
-          } catch (err) {
-            if (restate.internal.isSuspendedError(err)) throw err;
-            ctx.console.error(`[planning-run] find failed dispatch=${dispatchId}: ${err instanceof Error ? err.message : String(err)}`);
-          }
+          const found = await readBoundedOwnedRun<string | null>(ctx, `find-${findIndex++}`, () => deps.findExistingRun(input, dispatchedAt), null);
           if (found !== null) {
             jobId = found;
             currentJobId = found;

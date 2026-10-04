@@ -305,6 +305,26 @@ describe("PlanningRun durable workflow", () => {
     expect(w.sc.calls[w.sc.calls.length - 1]).toBe("release");
   }, 60_000);
 
+  // The cancel lands while a status read is in flight (the read is parked on a gate). A bounded read
+  // that swallowed the cancellation would answer `unknown` and the workflow would wait on.
+  it.each(labels)("an invocation cancel during a status read still stops the run, closes the row, and releases (%s)", async (label) => {
+    const w = begin(slow, label, { status: "started", tickGate: gate("first read") });
+    await w.sc.tickGate!.reached();
+    const env = slow.get(label)!;
+    const rows = await eventually(
+      () => queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'PlanningRun' AND target_service_key = '${w.dispatchId}' AND target_handler_name = 'run'`),
+      (found) => found.length === 1,
+      { label: "the run invocation" },
+    );
+    await cancelInvocation(env.adminAPIBaseUrl(), String(rows[0].id));
+    w.sc.tickGate!.release();
+    await eventually(() => releasesOf(w.dispatchId), (reasons) => reasons.length >= 1, { label: "the release after the cancel" });
+    expect(releasesOf(w.dispatchId)).toEqual(["cancelled"]);
+    expect(w.sc.stopCalls).toEqual([`job-${w.dispatchId}`]);
+    expect(w.sc.finishCalls).toEqual([{ kind: "cancelled" }]);
+    expect(w.sc.calls[w.sc.calls.length - 1]).toBe("release");
+  }, 60_000);
+
   it.each(labels)("a throw in finishJob still ends with one release (%s)", async (label) => {
     const w = begin(slow, label, { finishThrows: true });
     await waitForStep(w.read, "wait");

@@ -581,7 +581,7 @@ describe("handleRunnerResult — planning", () => {
       expect(dispatchAdmission.read(dispatchId)?.releasedAt).toBeNull();
     });
 
-    it("leaves a Legacy row for its monitor and still calls the hook", async () => {
+    it("leaves a Legacy dispatch unchanged: the row stays for its monitor and the hook is not called", async () => {
       const { token, dispatchId } = seedPlanningRun({ kind: "legacy" });
       const checkPlanningAdmissionTermination = vi.fn(async () => {});
       await runnerCallback.handleRunnerResult({
@@ -591,12 +591,12 @@ describe("handleRunnerResult — planning", () => {
         resolveProvider: makeResolve(new FakeProvider({ recordCalls: true })),
         checkPlanningAdmissionTermination,
       });
-      expect(checkPlanningAdmissionTermination).toHaveBeenCalledWith(dispatchId);
+      expect(checkPlanningAdmissionTermination).not.toHaveBeenCalled();
       expect(log.getJobByDispatchId(dispatchId)?.status).not.toBe("failed");
     });
 
     it("does not fail the callback when the hook throws", async () => {
-      const { token } = seedPlanningRun({ kind: "legacy" });
+      const { token } = seedPlanningRun({ kind: "restate", attemptId: "x" });
       const res = await runnerCallback.handleRunnerResult({
         authorization: `Bearer ${token}`,
         body: { phase: "planning", outcome: "failure", failureReason: "boom", comments: [] },

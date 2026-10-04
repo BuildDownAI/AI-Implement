@@ -905,13 +905,12 @@ export async function handleRunnerResult(
       } catch (err) {
         warn("markPlanningFailed", err);
       }
-      if (job) {
-        // A Restate-owned run has no monitor to close its row, and the workflow takes `report` as proof
-        // the callback closed it, so the callback writes the failure here. The backend may still be
-        // running, so the reservation stays held (as in the success branch below).
-        if (readAdmission(claims.dispatchId)?.lifecycleOwner.kind === "restate") {
-          updateJobStatus(job.id, "failed", failure?.code ?? input.body.failureCode ?? "planning_failed", undefined, { skipAdmissionRelease: true });
-        }
+      // A Restate-owned run has no monitor to close its row, and the workflow takes `report` as proof
+      // the callback closed it, so the callback writes the failure here and then sends `report` through
+      // the hook. The backend may still be running, so the reservation stays held (as in the success
+      // branch below). A Legacy dispatch is unchanged: its monitor closes the row and no hook runs.
+      if (job && readAdmission(claims.dispatchId)?.lifecycleOwner.kind === "restate") {
+        updateJobStatus(job.id, "failed", failure?.code ?? input.body.failureCode ?? "planning_failed", undefined, { skipAdmissionRelease: true });
         if (input.checkPlanningAdmissionTermination) {
           try {
             await input.checkPlanningAdmissionTermination(claims.dispatchId);
