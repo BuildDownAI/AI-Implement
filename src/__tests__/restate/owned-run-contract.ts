@@ -40,6 +40,10 @@ export interface OwnedRunHandle {
 export interface OwnedRunAdapter {
   /** Names the describe block. */
   name: string;
+  /** The scenario numbers that apply to this run kind; all five when absent. The adapter's test file states why each other one does not apply. */
+  scenarios?: number[];
+  /** False when the run kind has no cleanup step (its marker release is the cleanup); scenario 1 then expects no `cleanup:<runId>` call. Default true. */
+  hasCleanup?: boolean;
   /** Starts the workflow under `key` on `baseUrl`, with the faults applied. */
   start(baseUrl: string, key: string, start: OwnedRunStart): OwnedRunHandle;
   /**
@@ -62,18 +66,20 @@ export function registerOwnedRunContract(adapter: OwnedRunAdapter, envFor: (labe
     const handle = adapter.start(envFor(label).baseUrl(), key, start);
     return { key, ...handle };
   }
+  const applies = (n: number) => adapter.scenarios === undefined || adapter.scenarios.includes(n);
+  const cleanupCalls = (runId: string) => (adapter.hasCleanup === false ? [] : [`cleanup:${runId}`]);
   const withoutStatus = (calls: string[]) => calls.filter((call) => call !== "status");
 
   describe(`owned-run contract: ${adapter.name}`, () => {
-    it.each(labels)("1. a status read that fails on each attempt still reaches the deadline, stops the run, and releases (%s)", async (label) => {
+    it.each(applies(1) ? labels : [])("1. a status read that fails on each attempt still reaches the deadline, stops the run, and releases (%s)", async (label) => {
       const run = begin(label, { faults: { failStatusRead: true }, totalMs: DEADLINE_MS });
       await run.done;
       const calls = adapter.calls(run.key);
       expect(calls.filter((call) => call === "status").length).toBeGreaterThanOrEqual(3);
-      expect(withoutStatus(calls)).toEqual(["reserve", "launch", "stop", `cleanup:${run.runId}`, "outcome", "release"]);
+      expect(withoutStatus(calls)).toEqual(["reserve", "launch", "stop", ...cleanupCalls(run.runId), "outcome", "release"]);
     }, 30_000);
 
-    it.each(labels)("2. a crash after the launch step adopts the run and does not launch a second run (%s)", async (label) => {
+    it.each(applies(2) ? labels : [])("2. a crash after the launch step adopts the run and does not launch a second run (%s)", async (label) => {
       const run = begin(label, { faults: { crashAfterLaunch: true }, totalMs: LONG_MS });
       await waitForStep(run.read, "waiting");
       await run.finish();
@@ -83,7 +89,7 @@ export function registerOwnedRunContract(adapter: OwnedRunAdapter, envFor: (labe
       expect(calls).toEqual(["reserve", "launch", `cleanup:${run.runId}`, "outcome", "release"]);
     }, 30_000);
 
-    it.each(labels)("3. a normal end runs cleanup with the run id, the outcome once, then the release (%s)", async (label) => {
+    it.each(applies(3) ? labels : [])("3. a normal end runs cleanup with the run id, the outcome once, then the release (%s)", async (label) => {
       const run = begin(label, { faults: {}, totalMs: LONG_MS });
       await waitForStep(run.read, "waiting");
       await run.finish();
@@ -91,7 +97,7 @@ export function registerOwnedRunContract(adapter: OwnedRunAdapter, envFor: (labe
       expect(withoutStatus(adapter.calls(run.key))).toEqual(["reserve", "launch", `cleanup:${run.runId}`, "outcome", "release"]);
     }, 30_000);
 
-    it.each(labels)("4. a refused reservation launches nothing, cleans up nothing, and releases nothing (%s)", async (label) => {
+    it.each(applies(4) ? labels : [])("4. a refused reservation launches nothing, cleans up nothing, and releases nothing (%s)", async (label) => {
       const run = begin(label, { faults: { refuseReservation: true }, totalMs: LONG_MS });
       await run.done;
       const calls = adapter.calls(run.key);
@@ -99,7 +105,7 @@ export function registerOwnedRunContract(adapter: OwnedRunAdapter, envFor: (labe
       expect(calls.filter((call) => call === "launch" || call === "release" || call.startsWith("cleanup"))).toEqual([]);
     }, 30_000);
 
-    it.each(labels)("5. a failed cleanup and a failed outcome still release (%s)", async (label) => {
+    it.each(applies(5) ? labels : [])("5. a failed cleanup and a failed outcome still release (%s)", async (label) => {
       const run = begin(label, { faults: { failCleanup: true, failOutcome: true }, totalMs: LONG_MS });
       await waitForStep(run.read, "waiting");
       await run.finish();

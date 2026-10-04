@@ -50,6 +50,27 @@ export async function readOwnedRunStatus(
   }
 }
 
+/**
+ * The bounded read for a step whose result is not a run status (a `{ status, conclusion }` pair, a
+ * lookup by title). Same rule as `readOwnedRunStatus`: when all attempts fail it logs one line and
+ * returns `fallback`, "no new evidence", so a failing read never holds the workflow. The step name
+ * is the journal name; keep it stable.
+ */
+export async function readBoundedOwnedRun<T>(
+  ctx: WorkflowContext,
+  stepName: string,
+  read: () => Promise<T> | T,
+  fallback: T,
+): Promise<T> {
+  try {
+    return await ctx.run(stepName, async () => read(), { maxRetryAttempts: STEP_ATTEMPTS });
+  } catch (err) {
+    if (restate.internal.isSuspendedError(err)) throw err;
+    ctx.console.error(`[owned-run] read "${stepName}" failed after ${STEP_ATTEMPTS} attempts: ${describeError(err)}`);
+    return fallback;
+  }
+}
+
 /** Removes the machine or container after the run ended. Best effort: logs and returns when every attempt fails. */
 export async function cleanupOwnedRun(ctx: WorkflowContext, cleanup: () => Promise<void> | void): Promise<void> {
   try {

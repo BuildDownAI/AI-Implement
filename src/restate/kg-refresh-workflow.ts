@@ -38,6 +38,7 @@ import {
 } from "../kg-refresh-rail.js";
 import { parseKgSourceRepo } from "../deploy.js";
 import type { KgRepoDefinition } from "./kg-refresh-types.js";
+import { readBoundedOwnedRun } from "./owned-run-lifecycle.js";
 import { awaitOwnedRun, type OwnedRunStatus } from "./owned-run-wait.js";
 
 /** The value of `KG_REFRESH_TTL_MS` of the dispatch watch — how long a dispatch may run before it is treated as lost. */
@@ -112,6 +113,9 @@ export interface KgDispatchResult {
   jobId: string | null;
   executionMode: string;
 }
+
+/** What a status read that failed every attempt reports: not completed, not started — no new evidence. */
+const NO_EVIDENCE: { status: string; conclusion: string | null } = { status: "unknown", conclusion: null };
 
 /** Plain functions, every one called inside `ctx.run` — none of them may call `ctx` themselves. */
 export type KgOutcomeKind = "success" | "no-new-data" | "failure";
@@ -352,14 +356,14 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
             return "started";
           }
           if (runId === undefined) {
-            const found = await ctx.run(`reconcile-${reconcileIndex++}`, () => deps.findRunByTitle(issueIdentifier));
+            const found = await readBoundedOwnedRun(ctx, `reconcile-${reconcileIndex++}`, () => deps.findRunByTitle(issueIdentifier), null);
             if (found) {
               runId = found.runId;
               ctx.set("runId", runId);
             }
             return "unknown";
           }
-          const status = await ctx.run(`watch-${watchIndex++}`, () => deps.getWorkflowRunStatus(runId!));
+          const status = await readBoundedOwnedRun(ctx, `watch-${watchIndex++}`, () => deps.getWorkflowRunStatus(runId!), NO_EVIDENCE);
           if (status.status === "completed") {
             lastConclusion = status.conclusion;
             return "ended";
@@ -444,7 +448,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           const noRunDeadlineAt = Math.min(totalDeadlineAt, cancelAt + bootstrapDeadlineMs);
           for (;;) {
             if (runId === undefined) {
-              const found = await ctx.run(`reconcile-cancel-${reconcileIndex++}`, () => deps.findRunByTitle(issueIdentifier));
+              const found = await readBoundedOwnedRun(ctx, `reconcile-cancel-${reconcileIndex++}`, () => deps.findRunByTitle(issueIdentifier), null);
               if (found) {
                 runId = found.runId;
                 ctx.set("runId", runId);
@@ -453,7 +457,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
                 continue;
               }
             } else {
-              const status = await ctx.run(`watch-cancel-${watchIndex++}`, () => deps.getWorkflowRunStatus(runId!));
+              const status = await readBoundedOwnedRun(ctx, `watch-cancel-${watchIndex++}`, () => deps.getWorkflowRunStatus(runId!), NO_EVIDENCE);
               if (status.status === "completed") break;
             }
             const now = await ctx.date.now();
