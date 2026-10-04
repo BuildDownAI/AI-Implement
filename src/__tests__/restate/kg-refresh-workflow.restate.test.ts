@@ -31,8 +31,8 @@ import {
   type KgRefreshReportBody,
 } from "../../restate/kg-refresh-workflow.js";
 import {
-  VARIANTS, attachWorkflow, callObject, callService, callWorkflow, eventually, queryInvocations, replaceEndpoint, settle,
-  startRetryEnabled, startVariants, stopAll,
+  VARIANTS, attachWorkflow, callObject, callService, callWorkflow, eventually, gate, queryInvocations, replaceEndpoint, settle,
+  startRetryEnabled, startVariants, stopAll, type Gate,
 } from "./harness.js";
 
 const NAMESPACE = "https://kg.test.example/";
@@ -76,12 +76,41 @@ interface RunScenario {
   runStatusCalls: number;
   runStatusCallTimes: number[];
   cancelCalls: number;
+  /** Dispatch result carries no job id, as when the backend returned no machine or container id. */
+  jobIdUnknown?: boolean;
   runStatusSequence: Array<{ status: string; conclusion: string | null }>;
   findByTitleResult: { runId: number } | null;
   /** Title lookups that throw, by 1-based call number. */
   findByTitleThrowOn?: Set<number>;
-  /** Holds the first title lookup this long, so the deadline passes inside one loop iteration. */
-  firstFindByTitleDelayMs?: number;
+  /** Parks the workflow's first status read or title lookup, which is its first tick, until the test releases it. */
+  tickGate?: Gate;
+  /** When the tick gate was first reached; set after dispatch, so it is later than the workflow's dispatch time. */
+  tickGateReachedAt?: number;
+  /** Parks the first title lookup after the tick gate has been passed, which is the cancel phase's bounded wait. */
+  cancelPhaseGate?: Gate;
+  cancelPhaseGateReachedAt?: number;
+}
+
+/** Parks the first tick of a scenario that carries a tick gate; later ticks pass through. */
+async function holdAtTick(scenario: RunScenario): Promise<void> {
+  if (!scenario.tickGate || scenario.tickGateReachedAt !== undefined) return;
+  scenario.tickGateReachedAt = Date.now();
+  await scenario.tickGate.wait();
+}
+
+/** Parks the first lookup after the tick gate was passed; used to hold the cancel phase's wait. */
+async function holdAtCancelPhase(scenario: RunScenario): Promise<void> {
+  if (!scenario.cancelPhaseGate || scenario.cancelPhaseGateReachedAt !== undefined) return;
+  scenario.cancelPhaseGateReachedAt = Date.now();
+  await scenario.cancelPhaseGate.wait();
+}
+
+/** Waits until the first tick is parked, then until the wall clock is past `deadlineMs` after it.
+ *  The workflow's deadline is counted from its dispatch time, which is earlier than the park. */
+async function pastDeadlineAtTick(scenario: RunScenario, deadlineMs: number, label: string): Promise<void> {
+  await scenario.tickGate!.reached();
+  const at = scenario.tickGateReachedAt! + deadlineMs;
+  await eventually(() => Date.now(), (now) => now > at, { label: `wall clock past ${label}` });
 }
 
 describe("KgRefresh durable workflow", () => {
@@ -297,7 +326,7 @@ describe("KgRefresh durable workflow", () => {
     }
     return {
       outcome: scenario.dispatchOutcome, runId: scenario.runId,
-      jobId: `job-${triggerId}`, executionMode: scenario.executionMode,
+      jobId: scenario.jobIdUnknown ? null : `job-${triggerId}`, executionMode: scenario.executionMode,
     };
   }
 
@@ -308,6 +337,7 @@ describe("KgRefresh durable workflow", () => {
     const idx = Math.min(scenario.runStatusCalls, scenario.runStatusSequence.length - 1);
     scenario.runStatusCalls++;
     scenario.runStatusCallTimes.push(Date.now());
+    await holdAtTick(scenario);
     return scenario.runStatusSequence[idx];
   }
 
@@ -318,8 +348,11 @@ describe("KgRefresh durable workflow", () => {
     if (!scenario) throw new Error(`no scenario registered for title "${title}"`);
     scenario.findByTitleCalls++;
     if (scenario.findByTitleThrowOn?.has(scenario.findByTitleCalls)) throw new Error("workflow runs lookup answered HTTP 500");
-    if (scenario.findByTitleCalls === 1 && scenario.firstFindByTitleDelayMs) {
-      await new Promise((resolve) => setTimeout(resolve, scenario.firstFindByTitleDelayMs)); // restate-test-allow: fake dependency simulating a slow call
+    // The dispatch step's own reconcile-first lookup runs before the deadlines are set; only a later lookup is a tick.
+    if (scenario.dispatchCalls > 0) {
+      const firstTick = scenario.tickGate !== undefined && scenario.tickGateReachedAt === undefined;
+      await holdAtTick(scenario);
+      if (!firstTick) await holdAtCancelPhase(scenario);
     }
     if (scenario.findByTitleResult) {
       scenario.runId = scenario.findByTitleResult.runId;
@@ -329,6 +362,14 @@ describe("KgRefresh durable workflow", () => {
   }
 
   let cancelTerminalFailure = false;
+  let stopFailure = false;
+  const stopCalls: Array<{ executionMode: string; jobId: string }> = [];
+
+  async function stopMachineRunFn(executionMode: string, jobId: string): Promise<boolean> {
+    stopCalls.push({ executionMode, jobId });
+    if (stopFailure) throw new restate.TerminalError("forced stop failure");
+    return true;
+  }
 
   async function cancelWorkflowRunFn(runId: number): Promise<boolean> {
     if (cancelTerminalFailure) throw new restate.TerminalError("forced cancel failure");
@@ -358,6 +399,7 @@ describe("KgRefresh durable workflow", () => {
     getWorkflowRunStatus: getWorkflowRunStatusFn,
     findRunByTitle: findRunByTitleFn,
     cancelWorkflowRun: cancelWorkflowRunFn,
+    stopMachineRun: stopMachineRunFn,
     persistLastRefresh: async (outcome) => {
       if (persistHold) {
         const held = persistHold;
@@ -889,7 +931,7 @@ describe("KgRefresh durable workflow", () => {
     },
   );
 
-  // ---- W3: no progress within the bootstrap deadline ----
+  // ---- W3/W4: Fly backend. No status read exists to gate, and no signal races the deadline, so these wait on the outcome itself ----
   it.each(VARIANTS.map(([label]) => label))(
     "W3: no progress within the bootstrap deadline fails with a timed_out row and one outcome call (%s)",
     async (label) => {
@@ -915,7 +957,6 @@ describe("KgRefresh durable workflow", () => {
     15_000,
   );
 
-  // ---- W4: progress arrives, then no report within the total deadline ----
   it.each(VARIANTS.map(([label]) => label))(
     "W4: progress then no report within the total deadline fails timed out (%s)",
     async (label) => {
@@ -933,6 +974,149 @@ describe("KgRefresh durable workflow", () => {
     },
     15_000,
   );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "AII-1010: a dry-run with a report target that ends by bootstrap_timeout gets a failure verdict and no persist or notify (%s)",
+    async (label) => {
+      const env = deadlineEnvFor(label);
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+      const report = { repo: KG_SOURCE_REPO, prNumber: 11, sha: "b".repeat(40) };
+      const beforePersist = persistCalls.length;
+      const beforeOutcome = onOutcomeCalls.length;
+      const beforeStatus = setCommitStatusFn.mock.calls.length;
+
+      const outcome = await (await runWorkflow(env.baseUrl(), triggerId, { dryRun: true, report }));
+
+      expect(outcome.ok).toBe(false);
+      expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "timed_out", conclusion: "bootstrap_timeout" });
+      expect(setCommitStatusFn.mock.calls.length - beforeStatus).toBe(1);
+      expect((setCommitStatusFn.mock.calls[beforeStatus] as unknown[])[4]).toMatchObject({ state: "failure" });
+      const stored = await eventually(
+        () => callObject<{ sha: string; outcome: RefreshOutcome } | null>(env.baseUrl(), "KgRepo", KG_SOURCE_REPO, "dryRunOutcome", { repo: report.repo, prNumber: report.prNumber }),
+        (v) => v !== null,
+        { label: "durable effect" },
+      );
+      expect(stored!.sha).toBe(report.sha);
+      expect(stored!.outcome.ok).toBe(false);
+      expect(persistCalls.length - beforePersist).toBe(0);
+      expect(onOutcomeCalls.length - beforeOutcome).toBe(0);
+    },
+    15_000,
+  );
+
+  // ---- AII-1046: stop the Fly machine or local container at a timeout and at a cancel ----
+  // No fake runs on a tick on these backends, so a timeout is a pure timeout and the scenario waits on the outcome.
+  const STOP_BACKENDS = ["fly-machines", "local-docker"] as const;
+
+  describe.each(STOP_BACKENDS)("AII-1046: stop on %s", (backend) => {
+    it.each(VARIANTS.map(([label]) => label))("a bootstrap timeout stops the run one time and keeps the timeout outcome (%s)", async (label) => {
+      const env = deadlineEnvFor(label);
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, { dispatchOutcome: "accepted", executionMode: backend });
+      stopCalls.length = 0;
+      const outcome = await runWorkflow(env.baseUrl(), triggerId);
+      expect(outcome.ok).toBe(false);
+      expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "timed_out", conclusion: "bootstrap_timeout" });
+      expect(stopCalls).toEqual([{ executionMode: backend, jobId: `job-${triggerId}` }]);
+    }, 15_000);
+
+    it.each(VARIANTS.map(([label]) => label))("progress then a total timeout stops the run one time (%s)", async (label) => {
+      const env = deadlineEnvFor(label);
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, { dispatchOutcome: "accepted", executionMode: backend });
+      stopCalls.length = 0;
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "progress", {});
+      const outcome = await done;
+      expect(outcome.ok).toBe(false);
+      expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "timed_out", conclusion: "timed_out" });
+      expect(stopCalls).toEqual([{ executionMode: backend, jobId: `job-${triggerId}` }]);
+    }, 15_000);
+
+    it.each(VARIANTS.map(([label]) => label))("a cancel stops the run one time and ends operator_cancelled (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, { dispatchOutcome: "accepted", executionMode: backend });
+      stopCalls.length = 0;
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "cancel", { reason: "operator requested" });
+      await done;
+      expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("operator_cancelled");
+      expect(stopCalls).toEqual([{ executionMode: backend, jobId: `job-${triggerId}` }]);
+    }, 15_000);
+
+    it.each(VARIANTS.map(([label]) => label))("an unknown job id makes no stop call on a timeout (%s)", async (label) => {
+      const env = deadlineEnvFor(label);
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, { dispatchOutcome: "accepted", executionMode: backend, jobIdUnknown: true });
+      stopCalls.length = 0;
+      const outcome = await runWorkflow(env.baseUrl(), triggerId);
+      expect(outcome.ok).toBe(false);
+      expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "timed_out", conclusion: "bootstrap_timeout" });
+      expect(stopCalls).toEqual([]);
+    }, 15_000);
+
+    it.each(VARIANTS.map(([label]) => label))("an unknown job id makes no stop call on a cancel (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, { dispatchOutcome: "accepted", executionMode: backend, jobIdUnknown: true });
+      stopCalls.length = 0;
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "cancel", { reason: "operator requested" });
+      await done;
+      expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("operator_cancelled");
+      expect(stopCalls).toEqual([]);
+    }, 15_000);
+
+    it.each(VARIANTS.map(([label]) => label))("a failed stop does not change a timeout or a cancel outcome (%s)", async (label) => {
+      stopFailure = true;
+      try {
+        const timeoutEnv = deadlineEnvFor(label);
+        const timedOutId = newTriggerId();
+        makeScenario(timedOutId, { dispatchOutcome: "accepted", executionMode: backend });
+        const timedOut = await runWorkflow(timeoutEnv.baseUrl(), timedOutId);
+        expect(timedOut.ok).toBe(false);
+        expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "timed_out", conclusion: "bootstrap_timeout" });
+
+        const env = envFor(label);
+        const cancelledId = newTriggerId();
+        makeScenario(cancelledId, { dispatchOutcome: "accepted", executionMode: backend });
+        const done = runWorkflow(env.baseUrl(), cancelledId);
+        await eventually(() => scenarios.get(cancelledId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
+        await callWorkflow(env.baseUrl(), "KgRefresh", cancelledId, "cancel", { reason: "operator requested" });
+        await done;
+        expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("operator_cancelled");
+      } finally {
+        stopFailure = false;
+      }
+    }, 30_000);
+
+    it.each(VARIANTS.map(([label]) => label))("a report makes no stop call (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, { dispatchOutcome: "accepted", executionMode: backend });
+      stopCalls.length = 0;
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      expect((await done).ok).toBe(true);
+      expect(stopCalls).toEqual([]);
+    }, 15_000);
+  });
+
+  it.each(VARIANTS.map(([label]) => label))("AII-1046: a GitHub Actions timeout never calls stopMachineRun (%s)", async (label) => {
+    const env = deadlineEnvFor(label);
+    const triggerId = newTriggerId();
+    makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "github-actions" });
+    stopCalls.length = 0;
+    const outcome = await runWorkflow(env.baseUrl(), triggerId);
+    expect(outcome.ok).toBe(false);
+    expect(stopCalls).toEqual([]);
+  }, 15_000);
 
   // ---- W5/W6/W7: GHA vs Fly watch behavior ----
   it.each(VARIANTS.map(([label]) => label))(
@@ -997,6 +1181,7 @@ describe("KgRefresh durable workflow", () => {
       getWorkflowRunStatus: getWorkflowRunStatusFn,
       findRunByTitle: findRunByTitleFn,
       cancelWorkflowRun: cancelWorkflowRunFn,
+    stopMachineRun: stopMachineRunFn,
       persistLastRefresh: (outcome) => { persistCalls.push(outcome); },
       onOutcome: (kind, outcome, meta) => { onOutcomeCalls.push({ kind, outcome, meta }); },
       bootstrapDeadlineMs: scaledTick * 4,
@@ -1122,6 +1307,7 @@ describe("KgRefresh durable workflow", () => {
       getWorkflowRunStatus: getWorkflowRunStatusFn,
       findRunByTitle: findRunByTitleFn,
       cancelWorkflowRun: cancelWorkflowRunFn,
+    stopMachineRun: stopMachineRunFn,
       persistLastRefresh: (outcome) => { persistCalls.push(outcome); },
       onOutcome: (kind, outcome, meta) => { onOutcomeCalls.push({ kind, outcome, meta }); },
       bootstrapDeadlineMs: 1_000,
@@ -1204,14 +1390,17 @@ describe("KgRefresh durable workflow", () => {
     async (label) => {
       const env = deadlineEnvFor(label);
       const triggerId = newTriggerId();
-      makeScenario(triggerId, {
+      const held = gate("AII-1029 first status read");
+      const scenario = makeScenario(triggerId, {
         dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "github-actions",
-        runStatusSequence: [{ status: "in_progress", conclusion: null }],
+        runStatusSequence: [{ status: "in_progress", conclusion: null }], tickGate: held,
       });
       const done = runWorkflow(env.baseUrl(), triggerId);
-      await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
       // Past the 1s bootstrap deadline and still before the total deadline.
-      await settle(BOOTSTRAP_DEADLINE_MS + 400);
+      await pastDeadlineAtTick(scenario, BOOTSTRAP_DEADLINE_MS, "bootstrap deadline");
+      held.release();
+      // A second status read means the wait went on past the bootstrap deadline.
+      await eventually(() => scenarios.get(triggerId)!.runStatusCalls >= 2, (ok) => ok, { label: "second status read" });
       expect(scenarios.get(triggerId)!.cancelCalls).toBe(0);
       await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
 
@@ -1227,11 +1416,15 @@ describe("KgRefresh durable workflow", () => {
     async (label) => {
       const env = deadlineEnvFor(label);
       const triggerId = newTriggerId();
-      makeScenario(triggerId, {
+      const held = gate("AII-1029 queued first status read");
+      const scenario = makeScenario(triggerId, {
         dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "github-actions",
-        runStatusSequence: [{ status: "queued", conclusion: null }],
+        runStatusSequence: [{ status: "queued", conclusion: null }], tickGate: held,
       });
-      const outcome = await runWorkflow(env.baseUrl(), triggerId);
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      await pastDeadlineAtTick(scenario, BOOTSTRAP_DEADLINE_MS, "bootstrap deadline");
+      held.release();
+      const outcome = await done;
       expect(outcome.ok).toBe(false);
       expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "timed_out", conclusion: "bootstrap_timeout" });
       expect(scenarios.get(triggerId)!.cancelCalls).toBe(1);
@@ -1247,13 +1440,17 @@ describe("KgRefresh durable workflow", () => {
       const triggered = await triggerViaKgRepo(env.baseUrl());
       const triggerId = (triggered as { triggerId: string }).triggerId;
       const runId = runIdCounter++;
-      makeScenario(triggerId, { dispatchOutcome: "accepted", runId, executionMode: "github-actions" });
+      const held = gate("total timeout first status read");
+      const scenario = makeScenario(triggerId, { dispatchOutcome: "accepted", runId, executionMode: "github-actions", tickGate: held });
       const beforePersist = persistCalls.length;
       const beforeOutcome = onOutcomeCalls.length;
 
       await workflowDispatched(triggerId);
       const done = attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+      await held.reached();
       await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "progress", {});
+      await pastDeadlineAtTick(scenario, TOTAL_DEADLINE_MS, "total deadline");
+      held.release();
       const outcome = await done;
 
       expect(outcome.ok).toBe(false);
@@ -1272,13 +1469,16 @@ describe("KgRefresh durable workflow", () => {
     async (label) => {
       const env = deadlineEnvFor(label);
       const triggerId = newTriggerId();
-      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "github-actions" });
+      const held = gate("cancel failure first status read");
+      const scenario = makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "github-actions", tickGate: held });
       const beforeOutcome = onOutcomeCalls.length;
       cancelTerminalFailure = true;
       try {
         const done = runWorkflow(env.baseUrl(), triggerId);
-        await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
+        await held.reached();
         await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "progress", {});
+        await pastDeadlineAtTick(scenario, TOTAL_DEADLINE_MS, "total deadline");
+        held.release();
         const outcome = await done;
         expect(outcome.ok).toBe(false);
         expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "timed_out", conclusion: "timed_out" });
@@ -1295,10 +1495,17 @@ describe("KgRefresh durable workflow", () => {
     async (label) => {
       const env = deadlineEnvFor(label);
       const triggerId = newTriggerId();
-      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+      // The held first status read keeps the report from winning the race: it is already there when the deadline check runs.
+      const held = gate("report at deadline first status read");
+      const scenario = makeScenario(triggerId, {
+        dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "github-actions",
+        runStatusSequence: [{ status: "queued", conclusion: null }], tickGate: held,
+      });
       const done = runWorkflow(env.baseUrl(), triggerId, { dryRun: true });
-      await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
+      await held.reached();
       await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", { ok: true });
+      await pastDeadlineAtTick(scenario, BOOTSTRAP_DEADLINE_MS, "bootstrap deadline");
+      held.release();
       const outcome = await done;
       expect(outcome.ok).toBe(true);
       expect(closeRowCalls[closeRowCalls.length - 1].status).toBe("completed");
@@ -1311,14 +1518,16 @@ describe("KgRefresh durable workflow", () => {
     async (label) => {
       const env = deadlineEnvFor(label);
       const triggerId = newTriggerId();
-      makeScenario(triggerId, {
-        dispatchOutcome: "unknown", runId: undefined, executionMode: "github-actions", findByTitleResult: null,
-        firstFindByTitleDelayMs: BOOTSTRAP_DEADLINE_MS + 500,
+      const held = gate("report resolved first title lookup");
+      const scenario = makeScenario(triggerId, {
+        dispatchOutcome: "unknown", runId: undefined, executionMode: "github-actions", findByTitleResult: null, tickGate: held,
       });
       const done = runWorkflow(env.baseUrl(), triggerId, { dryRun: true });
-      await eventually(() => scenarios.get(triggerId)!.findByTitleCalls >= 1, (ok) => ok, { label: "durable effect" });
+      await held.reached();
       // The deadline expires while this lookup is held; the next deadline check finds the report already resolved.
       await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", { ok: true });
+      await pastDeadlineAtTick(scenario, BOOTSTRAP_DEADLINE_MS, "bootstrap deadline");
+      held.release();
       const outcome = await done;
       expect(outcome.ok).toBe(true);
       expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "completed" });
@@ -1332,15 +1541,17 @@ describe("KgRefresh durable workflow", () => {
     async (label) => {
       const env = deadlineEnvFor(label);
       const triggerId = newTriggerId();
-      makeScenario(triggerId, {
-        dispatchOutcome: "unknown", runId: undefined, executionMode: "github-actions", findByTitleResult: null,
-        firstFindByTitleDelayMs: BOOTSTRAP_DEADLINE_MS + 500,
+      const held = gate("progress resolved first title lookup");
+      const scenario = makeScenario(triggerId, {
+        dispatchOutcome: "unknown", runId: undefined, executionMode: "github-actions", findByTitleResult: null, tickGate: held,
       });
       const done = runWorkflow(env.baseUrl(), triggerId, { dryRun: true });
-      await eventually(() => scenarios.get(triggerId)!.findByTitleCalls >= 1, (ok) => ok, { label: "durable effect" });
+      await held.reached();
       await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "progress", {});
-      // A second reconcile means the loop went on past the expired bootstrap deadline.
-      await eventually(() => scenarios.get(triggerId)!.findByTitleCalls >= 2, (ok) => ok, { label: "durable effect" });
+      await pastDeadlineAtTick(scenario, BOOTSTRAP_DEADLINE_MS, "bootstrap deadline");
+      held.release();
+      // The dispatch step's lookup and the held reconcile are calls 1 and 2; a third means the loop went on past the expired bootstrap deadline.
+      await eventually(() => scenarios.get(triggerId)!.findByTitleCalls >= 3, (ok) => ok, { label: "durable effect" });
       await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", { ok: true });
       const outcome = await done;
       expect(outcome.ok).toBe(true);
@@ -1381,46 +1592,26 @@ describe("KgRefresh durable workflow", () => {
     async (label) => {
       const env = deadlineEnvFor(label);
       const triggerId = newTriggerId();
-      makeScenario(triggerId, { dispatchOutcome: "accepted", executionMode: "github-actions" });
+      const held = gate("cancel first title lookup");
+      const heldCancelWait = gate("cancel phase title lookup");
+      const scenario = makeScenario(triggerId, {
+        dispatchOutcome: "accepted", executionMode: "github-actions", tickGate: held, cancelPhaseGate: heldCancelWait,
+      });
       const done = runWorkflow(env.baseUrl(), triggerId);
-      await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
+      // The cancel is there before the first tick's race, so the wait ends as a cancel, not a bootstrap timeout.
+      await held.reached();
       await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "cancel", { reason: "operator requested" });
-      const started = Date.now();
+      held.release();
+      // The cancel phase's own lookup is parked until the bootstrap window has passed, so only that window can end it.
+      await heldCancelWait.reached();
+      const started = scenario.cancelPhaseGateReachedAt!;
+      await eventually(() => Date.now(), (now) => now > started + BOOTSTRAP_DEADLINE_MS, { label: "wall clock past bootstrap window" });
+      heldCancelWait.release();
       await done;
       expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("operator_cancelled");
       expect(scenarios.get(triggerId)!.cancelCalls).toBe(0);
       // Bounded by cancel time + BOOTSTRAP_DEADLINE_MS (1s); the total deadline is 2.6s after dispatch.
       expect(Date.now() - started).toBeLessThan(TOTAL_DEADLINE_MS);
-    },
-    15_000,
-  );
-
-  it.each(VARIANTS.map(([label]) => label))(
-    "AII-1010: a dry-run with a report target that ends by bootstrap_timeout gets a failure verdict and no persist or notify (%s)",
-    async (label) => {
-      const env = deadlineEnvFor(label);
-      const triggerId = newTriggerId();
-      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
-      const report = { repo: KG_SOURCE_REPO, prNumber: 11, sha: "b".repeat(40) };
-      const beforePersist = persistCalls.length;
-      const beforeOutcome = onOutcomeCalls.length;
-      const beforeStatus = setCommitStatusFn.mock.calls.length;
-
-      const outcome = await (await runWorkflow(env.baseUrl(), triggerId, { dryRun: true, report }));
-
-      expect(outcome.ok).toBe(false);
-      expect(closeRowCalls[closeRowCalls.length - 1]).toMatchObject({ status: "timed_out", conclusion: "bootstrap_timeout" });
-      expect(setCommitStatusFn.mock.calls.length - beforeStatus).toBe(1);
-      expect((setCommitStatusFn.mock.calls[beforeStatus] as unknown[])[4]).toMatchObject({ state: "failure" });
-      const stored = await eventually(
-        () => callObject<{ sha: string; outcome: RefreshOutcome } | null>(env.baseUrl(), "KgRepo", KG_SOURCE_REPO, "dryRunOutcome", { repo: report.repo, prNumber: report.prNumber }),
-        (v) => v !== null,
-        { label: "durable effect" },
-      );
-      expect(stored!.sha).toBe(report.sha);
-      expect(stored!.outcome.ok).toBe(false);
-      expect(persistCalls.length - beforePersist).toBe(0);
-      expect(onOutcomeCalls.length - beforeOutcome).toBe(0);
     },
     15_000,
   );
@@ -1889,6 +2080,7 @@ describe("KgRefresh durable workflow", () => {
       getWorkflowRunStatus: getWorkflowRunStatusFn,
       findRunByTitle: findRunByTitleFn,
       cancelWorkflowRun: cancelWorkflowRunFn,
+    stopMachineRun: stopMachineRunFn,
       persistLastRefresh: (outcome) => { persistCalls.push(outcome); },
       onOutcome: (kind, outcome, meta) => { onOutcomeCalls.push({ kind, outcome, meta }); },
       afterStageCommitted: async () => {

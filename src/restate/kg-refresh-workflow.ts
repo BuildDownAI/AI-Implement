@@ -38,6 +38,7 @@ import {
 } from "../kg-refresh-rail.js";
 import { parseKgSourceRepo } from "../deploy.js";
 import type { KgRepoDefinition } from "./kg-refresh-types.js";
+import { awaitOwnedRun, type OwnedRunStatus } from "./owned-run-wait.js";
 
 /** The value of `KG_REFRESH_TTL_MS` of the dispatch watch — how long a dispatch may run before it is treated as lost. */
 export const KG_REFRESH_TOTAL_DEADLINE_MS = 4 * 60 * 60 * 1000;
@@ -127,6 +128,8 @@ export interface KgRefreshWorkflowDependencies {
   getWorkflowRunStatus(runId: number): Promise<{ status: string; conclusion: string | null }>;
   findRunByTitle(title: string): Promise<{ runId: number } | null>;
   cancelWorkflowRun(runId: number): Promise<boolean>;
+  /** Stops a non-GitHub-Actions run (a Fly machine or a local container) by its backend id. */
+  stopMachineRun(executionMode: string, jobId: string): Promise<boolean>;
   persistLastRefresh(outcome: RefreshOutcome): void;
   /** The kind is decided by the workflow, never inferred from `outcome.detail`. `meta.dispatchId` is the workflow key. */
   onOutcome(kind: KgOutcomeKind, outcome: RefreshOutcome, meta: KgOutcomeMeta): void | Promise<void>;
@@ -157,16 +160,6 @@ type WaitOutcome =
   | { kind: "bootstrap_timeout" }
   | { kind: "total_timeout" }
   | { kind: "dispatch_lost"; conclusion: string | null };
-
-/** The race arms in `waitForOutcome` are tagged with this union so every `.map()` call
- *  targets the same `RestatePromise<WaitArm>` type — `RestatePromise` is invariant in its
- *  type parameter (`map`'s mapper argument is contravariant), so a plain array literal of
- *  differently-tagged arms will not widen on its own. */
-type WaitArm =
-  | { kind: "report"; value: KgRefreshReportBody }
-  | { kind: "cancel"; reason: string }
-  | { kind: "tick" }
-  | { kind: "progress" };
 
 function validKey(key: string, triggerId: unknown): string {
   if (typeof triggerId !== "string" || triggerId !== key) {
@@ -326,59 +319,82 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       const bootstrapDeadlineAt = dispatchedAt + bootstrapDeadlineMs;
       const totalDeadlineAt = dispatchedAt + totalDeadlineMs;
 
+      // Stops a Fly machine or local container. The run's result is already decided, so a
+      // failed stop is logged and never changes the outcome.
+      async function stopMachine(reason: string): Promise<void> {
+        if (isGha) return;
+        const machineJobId = dispatchResult.jobId;
+        if (!machineJobId) {
+          ctx.console.warn(`[KgRefresh] no machine id to stop after ${reason} for dispatch ${dispatchId}`);
+          return;
+        }
+        try {
+          const stopped = await ctx.run("stop-machine-run", () => deps.stopMachineRun(dispatchResult.executionMode, machineJobId), { maxRetryAttempts: 3 });
+          ctx.console.log(`[KgRefresh] stop after ${reason}: dispatch ${dispatchId} backend ${dispatchResult.executionMode} stopped=${stopped}`);
+        } catch (err) {
+          if (restate.internal.isSuspendedError(err)) throw err;
+          if (!(err instanceof restate.TerminalError)) throw err;
+          ctx.console.error(`[KgRefresh] stop after ${reason} failed: dispatch ${dispatchId} backend ${dispatchResult.executionMode}: ${err.message}`);
+        }
+      }
+
       async function waitForOutcome(): Promise<WaitOutcome> {
-        let progressSeen = false;
+        let startedSeen = false;
         let watchIndex = 0;
         let reconcileIndex = 0;
+        let lastConclusion: string | null = null;
+        // A re-call after a `started` status read must not read again at once: that read just ran.
+        let skipNextRead = false;
+
+        const readStatus = async (): Promise<OwnedRunStatus> => {
+          if (skipNextRead) {
+            skipNextRead = false;
+            return "started";
+          }
+          if (runId === undefined) {
+            const found = await ctx.run(`reconcile-${reconcileIndex++}`, () => deps.findRunByTitle(issueIdentifier));
+            if (found) {
+              runId = found.runId;
+              ctx.set("runId", runId);
+            }
+            return "unknown";
+          }
+          const status = await ctx.run(`watch-${watchIndex++}`, () => deps.getWorkflowRunStatus(runId!));
+          if (status.status === "completed") {
+            lastConclusion = status.conclusion;
+            return "ended";
+          }
+          // Started evidence the orchestrator owns (ADR 034): the run left the queue. `queued` does not count.
+          return status.status === "in_progress" ? "started" : "unknown";
+        };
 
         for (;;) {
-          if (isGha) {
-            if (runId === undefined) {
-              const found = await ctx.run(`reconcile-${reconcileIndex++}`, () => deps.findRunByTitle(issueIdentifier));
-              if (found) {
-                runId = found.runId;
-                ctx.set("runId", runId);
-              }
-            } else {
-              const status = await ctx.run(`watch-${watchIndex++}`, () => deps.getWorkflowRunStatus(runId!));
-              // Started evidence the orchestrator owns (ADR 034): the run left the queue. `queued` does not count.
-              if (status.status === "in_progress") progressSeen = true;
-              if (status.status === "completed") {
-                const reportNow = await ctx.promise<KgRefreshReportBody>("report").peek();
-                if (reportNow !== undefined) return { kind: "report", value: reportNow };
-                return { kind: "dispatch_lost", conclusion: status.conclusion };
-              }
-            }
-          }
+          const event = await awaitOwnedRun(ctx, {
+            signals: ["report", "cancel", "progress"],
+            resultSignal: "report",
+            startedSignal: "progress",
+            bootstrapDeadlineAt,
+            totalDeadlineAt,
+            tickMs: watchIntervalMs,
+            startedSeen,
+            ...(isGha ? { readStatus } : {}),
+          });
 
-          const now = await ctx.date.now();
-          const deadlineAt = progressSeen ? totalDeadlineAt : bootstrapDeadlineAt;
-          if (now >= deadlineAt) {
-            const reportNow = await ctx.promise<KgRefreshReportBody>("report").peek();
-            if (reportNow !== undefined) return { kind: "report", value: reportNow };
-            if (!progressSeen && (await ctx.promise<boolean>("progress").peek()) !== undefined) {
-              progressSeen = true;
-              continue;
-            }
-            return progressSeen ? { kind: "total_timeout" } : { kind: "bootstrap_timeout" };
+          if (event.kind === "bootstrap_timeout" || event.kind === "total_timeout") return { kind: event.kind };
+          if (event.kind === "signal") {
+            if (event.name === "report") return { kind: "report", value: event.value as KgRefreshReportBody };
+            if (event.name === "cancel") return { kind: "cancel", reason: event.value as string };
+            startedSeen = true; // "progress"
+            continue;
           }
-          const tick = Math.min(deadlineAt - now, watchIntervalMs);
-
-          const reportArm = ctx.promise<KgRefreshReportBody>("report").get()
-            .map((value): WaitArm => ({ kind: "report", value: value! }));
-          const cancelArm = ctx.promise<string>("cancel").get()
-            .map((reason): WaitArm => ({ kind: "cancel", reason: reason! }));
-          const tickArm = ctx.sleep(tick).map((): WaitArm => ({ kind: "tick" }));
-          const arms = [reportArm, cancelArm, tickArm];
-          if (!progressSeen) {
-            arms.push(ctx.promise<boolean>("progress").get().map((): WaitArm => ({ kind: "progress" })));
+          if (event.status === "started") {
+            startedSeen = true;
+            skipNextRead = true;
+            continue;
           }
-
-          const winner = await restate.RestatePromise.race(arms);
-          if (winner.kind === "report") return { kind: "report", value: winner.value };
-          if (winner.kind === "cancel") return { kind: "cancel", reason: winner.reason };
-          if (winner.kind === "progress") progressSeen = true;
-          // "tick": loop again, re-checking watch/reconcile and the deadline.
+          const reportNow = await ctx.promise<KgRefreshReportBody>("report").peek();
+          if (reportNow !== undefined) return { kind: "report", value: reportNow };
+          return { kind: "dispatch_lost", conclusion: lastConclusion };
         }
       }
 
@@ -395,6 +411,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
             ctx.console.error(`[KgRefresh] cancelling run ${runId} after timeout failed for ${triggerId}: ${err.message}`);
           }
         }
+        await stopMachine("timeout");
         ctx.set("step", "failed");
         const at = await ctx.date.now();
         const code = waitResult.kind === "bootstrap_timeout" ? "bootstrap_timeout" : "timed_out";
@@ -418,6 +435,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         if (runId !== undefined) {
           await ctx.run("cancel-run", () => deps.cancelWorkflowRun(runId!));
         }
+        await stopMachine("cancel");
         if (isGha) {
           let watchIndex = 0;
           let reconcileIndex = 0;

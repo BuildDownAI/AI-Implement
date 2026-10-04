@@ -554,6 +554,28 @@ describe("kg-refresh production wiring (AII-901)", () => {
     expect(await deps.cancel({ jobId: 1, dispatchId: "t-1", reason: "r" })).toEqual({ status: 409, body: { error: "deploy-in-progress" } });
   });
 
+  it("a deploy-held tool result answers 409 deploy-in-progress with the hold set, 503 without", async () => {
+    const client = { repoStatus: vi.fn(), cancel: vi.fn() };
+    const heldResult = vi.fn().mockResolvedValue({ status: "deploy-held" });
+    const during = idx.makeKgRefreshAdminDeps("Org/kg", client as never, heldResult as never, held(true));
+    expect(await during.trigger()).toEqual({ status: 409, body: { error: "deploy-in-progress" } });
+    expect(await during.status()).toEqual({ status: 409, body: { error: "deploy-in-progress", deployHeld: true } });
+    const after = idx.makeKgRefreshAdminDeps("Org/kg", client as never, heldResult as never, held(false));
+    expect((await after.trigger()).status).toBe(503);
+    expect((await after.status()).status).toBe(503);
+  });
+
+  it("deployHealth reports false/null with no hold and true/number once held", async () => {
+    const hold = await import("../deploy-hold.js");
+    expect(idx.deployHealth()).toEqual({ held: false, startedAt: null });
+    hold.setDeployHold();
+    try {
+      expect(idx.deployHealth()).toEqual({ held: true, startedAt: expect.any(Number) });
+    } finally {
+      hold.clearDeployHold();
+    }
+  });
+
   it("an unavailable Restate answers 503 with no hold", async () => {
     const client = { repoStatus: vi.fn(), cancel: vi.fn().mockResolvedValue({ status: "unavailable" }) };
     const deps = idx.makeKgRefreshAdminDeps("Org/kg", client as never, vi.fn().mockResolvedValue(unavailable) as never, held(false));

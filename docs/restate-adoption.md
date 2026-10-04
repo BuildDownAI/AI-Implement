@@ -24,7 +24,7 @@ Each row below names the cost, whether it can become an advantage, and where the
 
 Unmigrated run kinds consume single-use tokens; migrated kinds verify only and let a Restate idempotency key absorb a duplicate. Token handling is split while the migration runs (`docs/runner-callbacks.md` for the token flow).
 
-The split is temporary by construction. ADR 018 § Decision 7 defines an evaluation gate after the second migration: the main pipeline either migrates the same way and the run-ledger program (AII-611) is cancelled or narrowed, or AII-611 proceeds first. When the gate resolves, token handling converges to one model everywhere. The interim is not drift; it is a bounded state that a written decision closes. **Net: a positive, once the gate is reached** — the split forces the end-state decision to be made on evidence instead of assumed up front.
+The split is temporary by construction. ADR 018 § Decision 7 defines an evaluation gate after the second migration: the gate was closed on 2026-10-01: the main pipeline migrates the same way and the run-ledger program (AII-611) is narrowed. Token handling converges to one model everywhere as each run kind migrates. The interim is not drift; it is a bounded state that a written decision closes. **Net: a positive, once the gate is reached** — the split forces the end-state decision to be made on evidence instead of assumed up front.
 
 ### The journal is durable, readable storage — becomes a positive as enforced guardrails
 
