@@ -354,6 +354,21 @@ Three rules:
 
 The same helper serves a bounded wait for `ended` after a stop (`signals: []`, a deadline of the stop margin); the run's outcome is already decided, so either event ends it.
 
+### The owned-run lifecycle kit
+
+A workflow that owns a run calls four steps from `src/restate/owned-run-lifecycle.ts` around `awaitOwnedRun` ([ADR 036](adr/036-an-owned-run-lifecycle-is-one-kit-and-one-contract-suite.md)). Each takes the workflow context and a plain function, and runs it in one named `ctx.run` with `maxRetryAttempts: 3`. A `ctx.run` with no bound retries without limit; a bounded one throws a `TerminalError` after the last attempt. Each re-throws a suspension.
+
+| Order | Step | Function | When every attempt fails | Replaces in Legacy |
+|---|---|---|---|---|
+| 1 | `reserve` | `reserveOwnedRun` | throws | the reservation the dispatch function took before the launch |
+| 2 | (launch, the caller's own step) | | | the dispatch function |
+| 3 | caller's name, once per tick | `readOwnedRunStatus` | logs, returns `unknown` | the per-backend monitor poll (`src/index.ts`) |
+| 4 | `cleanup` | `cleanupOwnedRun` | logs, returns | the reaper's machine removal (`src/reaper.ts`) |
+| 5 | `outcome` | `reportOwnedRunOutcome` | logs, returns | the terminal-job notice and breaker count (`src/index.ts`, `src/stuck-watchdog.ts`) |
+| 6 | (release, the caller's own step) | | | the admission release |
+
+Step 3 sits inside the wait (it is the `readStatus` of `awaitOwnedRun`); steps 4 to 6 run after the wait ends, in that order, so a failed cleanup or outcome never stops the release. A best-effort step swallows every error except a suspension. The function the caller passes must be safe to run twice: the reservation is check-then-take keyed by the dispatch id, so a retry after a commit returns `true`.
+
 ## The planning run
 
 `PlanningRun` (`src/restate/planning-run-workflow.ts`) is the workflow that owns one planning run of a pilot project, from its `dispatch_admissions` reservation to its release. It exists because Legacy could keep a reservation held: two planning runs started together, the run lookup gave one run to the wrong ticket, the other job never got a run id, and `confirmAdmissionTerminated` could release a GitHub Actions reservation only through a run id. The ticket then stayed in the capacity gate and never started implementation (AII-1018). The reservation row stays in `dispatch_admissions` because planning shares team capacity with Legacy implementation runs (ADR 030); the workflow is the only code that releases it for a pilot project.
