@@ -19,6 +19,7 @@
 import type Database from "better-sqlite3";
 import { getDb } from "./dedup.js";
 import type { DispatchKind } from "./dispatch-gate.js";
+import { getJobByDispatchId, type Job } from "./log.js";
 
 /** Matches `dispatch-gate.ts`'s PR_BUDGET_WINDOW_MS — kept local since that module
  *  does not export its constant, and this table's budget entries are a distinct
@@ -431,6 +432,121 @@ export function releaseByDispatchId(
   const record = read(dispatchId);
   if (!record || record.releasedAt !== null) return { status: "not_owner" };
   return release(record.dispatchId, record.lifecycleOwner, record.generation, reason);
+}
+
+/** One held (unreleased) reservation as an operator sees it, joined to its job row. */
+export interface HeldReservation {
+  readonly dispatchId: string;
+  readonly team: string;
+  readonly issueId: string;
+  readonly issueIdentifier: string | null;
+  readonly phase: DispatchAdmissionKind;
+  readonly backend: DispatchAdmissionBackend;
+  readonly lifecycleOwner: string;
+  readonly ageMs: number;
+  readonly jobStatus: string | null;
+  readonly jobConclusion: string | null;
+}
+
+/** Every unreleased `dispatch_admissions` row, oldest first — the rows `getInFlightWork`
+ *  counts (plus kg-refresh, which that count reports separately). */
+export function listHeldReservations(now: number = Date.now()): HeldReservation[] {
+  const rows = getDb()
+    .prepare("SELECT * FROM dispatch_admissions WHERE released_at IS NULL ORDER BY created_at ASC, dispatch_id ASC")
+    .all() as Row[];
+  return rows.map((row) => {
+    // A job of an earlier generation under the same dispatch id says nothing about this
+    // reservation, so it is not shown (same rule `releaseHeldReservation` applies).
+    const latest = getJobByDispatchId(row.dispatch_id);
+    const job = latest && jobBelongsToGeneration(latest, row.generation) ? latest : null;
+    return {
+      dispatchId: row.dispatch_id,
+      team: row.mapping_key,
+      issueId: row.issue_id,
+      issueIdentifier: job?.issueIdentifier ?? null,
+      phase: row.phase as DispatchAdmissionKind,
+      backend: row.backend as DispatchAdmissionBackend,
+      lifecycleOwner: row.lifecycle_owner,
+      ageMs: Math.max(0, now - row.created_at),
+      jobStatus: job?.status ?? null,
+      jobConclusion: job?.conclusion ?? null,
+    };
+  });
+}
+
+export type ReleaseHeldReservationResult =
+  | { readonly status: "released"; readonly dispatchId: string; readonly lifecycleOwner: string; readonly phase: string; readonly forced: boolean; readonly basis: "forced" | "job_terminal" | "backend_confirmed" }
+  | { readonly status: "nothing_to_release"; readonly dispatchId: string }
+  | { readonly status: "refused"; readonly dispatchId: string; readonly reason: string };
+
+const TERMINAL_JOB_STATUSES: ReadonlySet<string> = new Set(["completed", "review_failed", "failed", "timed_out", "dispatch-failed"]);
+
+function jobBelongsToGeneration(job: Job, generation: number): boolean {
+  return job.admissionGeneration === null || job.admissionGeneration === generation;
+}
+
+function jobIsTerminalFor(job: Job | null, generation: number): boolean {
+  if (!job || !TERMINAL_JOB_STATUSES.has(job.status)) return false;
+  // A terminal job of an earlier reservation under the same dispatch id says nothing
+  // about this one.
+  return jobBelongsToGeneration(job, generation);
+}
+
+/**
+ * The operator release (AII-1069). Reuses `releaseByDispatchId` for the write and the
+ * caller's `confirmTerminated` (the orchestrator's `confirmAdmissionTerminated`) for the
+ * "did the run end" rule. Without `force` it releases only when the job row is terminal
+ * or the backend run is confirmed ended; with `force` it releases unconditionally. An
+ * unknown or already-released id changes nothing.
+ */
+export async function releaseHeldReservation(
+  dispatchId: string,
+  opts: { force: boolean; confirmTerminated: (candidate: StaleAdmissionCandidate) => Promise<boolean> },
+): Promise<ReleaseHeldReservationResult> {
+  const record = read(dispatchId);
+  if (!record || record.releasedAt !== null) return { status: "nothing_to_release", dispatchId };
+
+  let basis: "forced" | "job_terminal" | "backend_confirmed" = "forced";
+  if (!opts.force) {
+    if (jobIsTerminalFor(getJobByDispatchId(dispatchId), record.generation)) {
+      basis = "job_terminal";
+    } else {
+      let confirmed = false;
+      try {
+        confirmed = await opts.confirmTerminated({
+          dispatchId: record.dispatchId,
+          mappingKey: record.mappingKey,
+          backend: record.backend,
+          lifecycleOwner: record.lifecycleOwner,
+          generation: record.generation,
+          ageMs: Math.max(0, Date.now() - record.createdAt),
+        });
+      } catch (err) {
+        console.error(`[admission] confirmTerminated threw for dispatch=${dispatchId}:`, err);
+      }
+      if (!confirmed) {
+        return {
+          status: "refused",
+          dispatchId,
+          reason:
+            "the run is not confirmed ended: its job row is not terminal and the backend did not report it finished (a Restate-owned or job-less reservation can never be confirmed). Pass force to release it anyway",
+        };
+      }
+      basis = "backend_confirmed";
+    }
+  }
+
+  // Release the generation read above, not whatever holds the id after the awaited check.
+  const outcome = release(record.dispatchId, record.lifecycleOwner, record.generation, "cancelled");
+  if (outcome.status !== "released") return { status: "nothing_to_release", dispatchId };
+  return {
+    status: "released",
+    dispatchId,
+    lifecycleOwner: encodeOwner(record.lifecycleOwner),
+    phase: record.kind,
+    forced: opts.force,
+    basis,
+  };
 }
 
 /** Reservations older than this with no confirmed release are swept — the safety net

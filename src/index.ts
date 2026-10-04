@@ -133,7 +133,7 @@ import { setKgRefreshToolDeps } from "./restate/tools.js";
 import type { RestateRegisterOutcome, RestateRegisterResult } from "./restate/endpoint.js";
 import { getRestateStatus, setRestateStatus } from "./restate/status.js";
 import type { RestateRegistrationStatus } from "./restate/status.js";
-import { setProviderRegistry, setReviewFixAttemptsFacade } from "./restate/tools.js";
+import { setAdmissionTerminationCheck, setProviderRegistry, setReviewFixAttemptsFacade } from "./restate/tools.js";
 import { callTool, callToolAsSystem } from "./restate/tools-client.js";
 import { makeKgRefresh, migrateLegacyDryRunOutcomes, runKgRefreshPreflight, defaultFetchDefaultBranch, defaultFetchSnapshotCommitSha, defaultMaterialize, defaultMcpToolCall, defaultPersistLastRefresh, defaultLoadLastRefresh } from "./kg-refresh.js";
 import type { KgRefreshHandle } from "./kg-refresh.js";
@@ -5065,6 +5065,8 @@ async function main(): Promise<void> {
   // The add_project Restate handler (src/restate/tools.ts) must invalidate this registry, not
   // a private one, when a mapping changes (AII-713).
   setProviderRegistry(registry);
+  // release_dispatch_reservation applies the same "did the run end" rule as the stale sweep.
+  setAdmissionTerminationCheck((candidate) => confirmAdmissionTerminated(config, candidate));
 
   // Compose the production adapters after configuration and provider setup. The
   // services are registered even with every mapping on the Legacy default;

@@ -102,7 +102,7 @@ import { dispatchPlanning, reportTerminalJob } from "../../index.js";
 import { resetRestateStatus, setRestateStatus } from "../../restate/status.js";
 import { initMappingsTable } from "../../config.js";
 import { initDispatchBreakerTable, recordDispatchFailure } from "../../dispatch-breaker.js";
-import { acquire, read as readAdmission, reconcileTerminalCallbackAdmissions, sweepStaleAdmissions } from "../../dispatch-admission.js";
+import { acquire, read as readAdmission, releaseHeldReservation, reconcileTerminalCallbackAdmissions, sweepStaleAdmissions } from "../../dispatch-admission.js";
 import { appendLog, getJobByDispatchId, getStuckAttempts, initLogTable, updateJobStatus } from "../../log.js";
 import { planningSessionName } from "../../planning-launch.js";
 import { PLANNING_RUN_TITLE_PREFIX, createProductionPlanningRunServices } from "../../restate/planning-run-production.js";
@@ -384,6 +384,29 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
     expect(getJobByDispatchId(w.dispatchId)).toEqual({ ...closed, notifiedAt: expect.any(Number) });
     expect(sim.remediateCalls).toBe(0);
     expect(clearedIssues).toEqual([]);
+  }, 60_000);
+
+  it.each(labels)("an operator release of the owned row leaves the workflow's later release answering not_owner, and the workflow ends (%s)", async (label) => {
+    gh.statusGate = gate("first status read");
+    const w = await dispatch(label, "PLT-1");
+    await gh.statusGate.reached();
+    await waitForStep(w.read, "wait");
+    expect(readAdmission(w.dispatchId)).toMatchObject({ lifecycleOwner: { kind: "restate" }, releasedAt: null });
+
+    // The operator action (AII-1069), forced: a Restate-owned row is never confirmed ended without a terminal job row.
+    const released = await releaseHeldReservation(w.dispatchId, { force: true, confirmTerminated: async () => false });
+    expect(released).toMatchObject({ status: "released", forced: true, lifecycleOwner: `restate:${w.dispatchId}` });
+    expect(readAdmission(w.dispatchId)).toMatchObject({ releaseReason: "cancelled" });
+
+    updateJobStatus(getJobByDispatchId(w.dispatchId)!.id, "completed", "planning_callback");
+    await w.hook(w.dispatchId);
+    gh.runs[0].status = "completed";
+    gh.statusGate.release();
+
+    // The workflow reaches its release step, which finds the row already released and changes nothing.
+    await waitForStep(w.read, "released");
+    expect(readAdmission(w.dispatchId)).toMatchObject({ releaseReason: "cancelled" });
+    expect(await releaseHeldReservation(w.dispatchId, { force: true, confirmTerminated: async () => false })).toEqual({ status: "nothing_to_release", dispatchId: w.dispatchId });
   }, 60_000);
 
   const breakerFailures = (issueId: string) =>

@@ -20,6 +20,12 @@ import { getRunnerMode, getKgMaterializeDirect } from "../runner-mode.js";
 import { getMappings, type RepoMapping } from "../config.js";
 import { getInFlightJobs, getRunRecordMergeVerdict } from "../log.js";
 import { getDb } from "../dedup.js";
+import {
+  listHeldReservations,
+  read as readDispatchAdmission,
+  releaseHeldReservation,
+  type StaleAdmissionCandidate,
+} from "../dispatch-admission.js";
 import { isKgDegraded } from "../deploy-notify.js";
 import { sidecarHealthFields, getKgMemoryProvider, KG_TOOL_CAPABILITY } from "../kg-provider.js";
 import { getRestateStatus } from "./status.js";
@@ -75,6 +81,8 @@ interface ToolOptions<I extends z.ZodType> {
    * § "Every side effect in a handler goes inside `ctx.run`, and a tool handler never retries").
    */
   retryPolicy?: restate.RetryPolicy;
+  /** Extra `key=value` text appended to this tool's write-audit line, for a write whose audit must name its target. */
+  auditDetail?: (input: WireInput<I>) => string;
 }
 
 function wireInputSchema<I extends z.ZodType>(input: I) {
@@ -130,8 +138,14 @@ export function tool<I extends z.ZodType>(
       const audit = (result: "forbidden" | "ok" | "error"): void => {
         if (operation !== "write") return;
         const actor = input.caller.email ?? "system";
+        let detail = "";
+        try {
+          detail = opts.auditDetail ? ` ${opts.auditDetail(input)}` : "";
+        } catch {
+          detail = "";
+        }
         console.log(
-          `[mcp] write tool=${name} actor=${actor} role=${input.caller.role ?? "null"} result=${result} kind=${input.caller.kind}`,
+          `[mcp] write tool=${name} actor=${actor} role=${input.caller.role ?? "null"} result=${result} kind=${input.caller.kind}${detail}`,
         );
       };
       if (!roleAllows(input.caller.role, opts.role)) {
@@ -962,6 +976,65 @@ export const clearDispatchDedupTool = tool(
   },
 );
 
+// The "did the backend run end" rule is `confirmAdmissionTerminated` (src/index.ts), which needs
+// the orchestrator's AppConfig; tools.ts cannot import index.ts, so main() injects it here (same
+// pattern as setProviderRegistry). Unset (tests, a failed boot) means nothing is ever confirmed.
+type AdmissionTerminationCheck = (candidate: StaleAdmissionCandidate) => Promise<boolean>;
+let admissionTerminationCheck: AdmissionTerminationCheck | null = null;
+
+export function setAdmissionTerminationCheck(check: AdmissionTerminationCheck | null): void {
+  admissionTerminationCheck = check;
+}
+
+export const LIST_DISPATCH_RESERVATIONS_DESCRIPTION =
+  "Lists every held (unreleased) dispatch reservation: dispatch id, team, issue identifier, phase, backend, lifecycle owner, age in seconds, and the status and conclusion of its job row (null when none). These are the rows a self-deploy drain waits on. Pair with release_dispatch_reservation to free a stuck one.";
+
+export const listDispatchReservationsTool = tool(
+  { description: LIST_DISPATCH_RESERVATIONS_DESCRIPTION, input: z.object({}), role: "user" },
+  async (): Promise<ToolResponse> => {
+    const result = listHeldReservations().map(({ ageMs, ...rest }) => ({ ...rest, ageSeconds: Math.round(ageMs / 1000) }));
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  },
+);
+
+export const RELEASE_DISPATCH_RESERVATION_DESCRIPTION =
+  "Release a stuck dispatch reservation (admin role), with reason 'cancelled'. Without force it releases only when the job row is terminal or the backend run is confirmed ended, and otherwise refuses with a reason and leaves the row held. With force=true it releases with no confirmation — use only when you know the run is dead. A missing or already-released dispatch id changes nothing. A Restate-owned row's workflow later answers not_owner on its own release and ends.";
+
+export const releaseDispatchReservationTool = tool(
+  {
+    description: RELEASE_DISPATCH_RESERVATION_DESCRIPTION,
+    input: z.object({
+      dispatchId: z.string().optional().describe("The dispatch id of the held reservation (from list_dispatch_reservations)"),
+      force: z.boolean().optional().describe("Release without confirming the run ended"),
+    }),
+    role: "admin",
+    retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },
+    auditDetail: (input) => {
+      const id = typeof input.args.dispatchId === "string" ? input.args.dispatchId : "";
+      const owner = id ? (() => { const r = readDispatchAdmission(id); return r ? (r.lifecycleOwner.kind === "legacy" ? "legacy" : `restate:${r.lifecycleOwner.attemptId}`) : "none"; })() : "none";
+      return `dispatch=${id} owner=${owner} force=${input.args.force === true}`;
+    },
+  },
+  async (ctx, input): Promise<ToolResponse> => {
+    if (typeof input.args.dispatchId !== "string" || !input.args.dispatchId) {
+      return { isError: true, content: [{ type: "text", text: "dispatchId is required" }] };
+    }
+    const dispatchId = input.args.dispatchId;
+    const force = input.args.force === true;
+    const result = await ctx.run(
+      "release-dispatch-reservation",
+      () =>
+        releaseHeldReservation(dispatchId, {
+          force,
+          confirmTerminated: (candidate) => (admissionTerminationCheck ? admissionTerminationCheck(candidate) : Promise.resolve(false)),
+        }),
+      { maxRetryAttempts: 1 },
+    );
+    const isError = result.status === "refused";
+    return { ...(isError ? { isError: true } : {}), content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  },
+);
+
 export const orchestratorTools = restate.service({
   name: "orchestratorTools",
   handlers: {
@@ -989,5 +1062,7 @@ export const orchestratorTools = restate.service({
     add_project: addProjectTool,
     trigger_workflow_sync: triggerWorkflowSyncTool,
     clear_dispatch_dedup: clearDispatchDedupTool,
+    list_dispatch_reservations: listDispatchReservationsTool,
+    release_dispatch_reservation: releaseDispatchReservationTool,
   },
 });
