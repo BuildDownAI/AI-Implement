@@ -24,6 +24,10 @@ const DEADLINE = { tickMs: 50, confirmTickMs: 50, confirmWindowMs: 60_000, boots
 
 const sim = vi.hoisted(() => ({
   remediateCalls: 0,
+  /** Completion notices the simulated webhook received. */
+  notices: [] as unknown[],
+  /** Effects (`finish`, `outcome`) that run, then throw once: a retry must not count twice. */
+  failAfterEffect: new Set<string>(),
   /** The intervals the next composed workflow uses. */
   timing: {} as Record<string, number>,
   /** The Restate ingress that `dispatchPlanning` (which passes no URL) reaches. */
@@ -41,19 +45,35 @@ vi.mock("../../local-docker.js", async (importOriginal) => ({
   inspectLocalContainer: async (id: string) => backends.dockerInspect(id),
   findLocalContainerIdByName: async (name: string) => backends.names.get(name) ?? null,
   stopLocalContainer: async (id: string) => backends.dockerStop(id),
+  removeLocalContainer: async (id: string) => backends.dockerRemove(id),
+}));
+vi.mock("../../notify.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../notify.js")>()),
+  notifyCompletion: async (_type: string, _url: string, payload: unknown) => { sim.notices.push(payload); },
+  notifyText: async () => {},
 }));
 
 vi.mock("../../github-app-auth.js", () => ({ getInstallationToken: async () => "sim-gh-token" }));
 vi.mock("../../github.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../../github.js")>()),
   getWorkflowRunStatus: (...args: [string, string, string, number]) => gh.status(args[3]),
-  cancelWorkflowRun: async (...args: [string, string, string, number]) => { gh.cancelCalls.push(args[3]); return true; },
+  cancelWorkflowRun: async (...args: [string, string, string, number]) => {
+    gh.cancelCalls.push(args[3]);
+    // A cancelled run completes, as GitHub's does.
+    const run = gh.runs.find((r) => r.id === args[3]);
+    if (run) run.status = "completed";
+    return true;
+  },
 }));
 vi.mock("../../stuck-watchdog.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../stuck-watchdog.js")>();
   return {
     ...actual,
-    remediateFailedJob: (...args: Parameters<typeof actual.remediateFailedJob>) => { sim.remediateCalls++; return actual.remediateFailedJob(...args); },
+    remediateFailedJob: async (...args: Parameters<typeof actual.remediateFailedJob>) => {
+      sim.remediateCalls++;
+      await actual.remediateFailedJob(...args);
+      if (sim.failAfterEffect.delete("finish")) throw new Error("injected: the handling ran, then the step failed");
+    },
   };
 });
 vi.mock("../../restate/planning-run-client.js", async (importOriginal) => {
@@ -78,12 +98,12 @@ vi.mock("../../restate/planning-run-workflow.js", async (importOriginal) => {
 
 import { getDb } from "../../dedup.js";
 import { acquireDispatch } from "../../dispatch-gate.js";
-import { dispatchPlanning } from "../../index.js";
+import { dispatchPlanning, reportTerminalJob } from "../../index.js";
 import { resetRestateStatus, setRestateStatus } from "../../restate/status.js";
 import { initMappingsTable } from "../../config.js";
-import { initDispatchBreakerTable } from "../../dispatch-breaker.js";
+import { initDispatchBreakerTable, recordDispatchFailure } from "../../dispatch-breaker.js";
 import { acquire, read as readAdmission, reconcileTerminalCallbackAdmissions, sweepStaleAdmissions } from "../../dispatch-admission.js";
-import { appendLog, getJobByDispatchId, initLogTable, updateJobStatus } from "../../log.js";
+import { appendLog, getJobByDispatchId, getStuckAttempts, initLogTable, updateJobStatus } from "../../log.js";
 import { planningSessionName } from "../../planning-launch.js";
 import { PLANNING_RUN_TITLE_PREFIX, createProductionPlanningRunServices } from "../../restate/planning-run-production.js";
 import { createPlanningAdmissionTerminationHook, createPlanningRunIngressClient } from "../../restate/planning-run-client.js";
@@ -132,6 +152,7 @@ const backends = {
   crashBeforeRow: false,
   destroyCalls: [] as string[],
   stopCalls: [] as string[],
+  removeCalls: [] as string[],
   /** Set to make `docker inspect` fail with this message. */
   inspectError: undefined as string | undefined,
   /** The launch writes its row and creates the machine, then throws once (the acknowledgement is lost). */
@@ -155,8 +176,13 @@ const backends = {
     this.stopCalls.push(id);
     this.containers.set(id, false);
   },
+  /** `docker rm -f`: the container is gone afterwards, and `docker inspect` says so. */
+  async dockerRemove(id: string) {
+    this.removeCalls.push(id);
+    this.containers.delete(id);
+  },
   reset() {
-    this.machines.clear(); this.containers.clear(); this.created = 0; this.names.clear(); this.crashBeforeRow = false; this.destroyCalls = []; this.stopCalls = [];
+    this.machines.clear(); this.containers.clear(); this.created = 0; this.names.clear(); this.crashBeforeRow = false; this.destroyCalls = []; this.stopCalls = []; this.removeCalls = [];
     this.inspectError = undefined; this.crashNextLaunch = false;
   },
 };
@@ -166,6 +192,7 @@ const NONCE = "nonce-must-not-leak";
 const launches: string[] = [];
 let launchAckLost = false;
 const clearedIssues: string[] = [];
+const comments: string[] = [];
 const issues = new Map<string, { id: string; identifier: string; title: string; scopeKey: string; nativeStatus: string }>();
 
 describe("Restate PlanningRun pilot: production-composition proof", () => {
@@ -197,7 +224,11 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
       id: "linear",
       findByKey: async (key: string) => issues.get(key) ?? null,
       clearWorkingState: async (issueId: string) => { clearedIssues.push(issueId); return true; },
+      issueUrl: (issue: { identifier: string }) => `https://tracker.test/${issue.identifier}`,
+      postComment: async (_issueId: string, body: string) => { comments.push(body); },
     };
+    const outcomeConfig = { notifyType: "slack", notifyWebhookUrl: "https://hooks.test/notify" } as never;
+    const outcomeRegistry = { forMapping: async () => provider } as never;
     const compose = () => createProductionPlanningRunServices({
       config: { githubAppId: "1", githubAppPrivateKey: "k", notifyType: "slack", notifyWebhookUrl: null, flySessionsToken: "fly-token", flySessionsApp: "fly-app" } as never,
       resolveProvider: async () => provider as never,
@@ -246,6 +277,10 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
         }
         return { outcome: "accepted", machineId: id, executionMode: args.execPath };
       }) as never,
+      reportTerminalJob: async (job) => {
+        await reportTerminalJob(outcomeConfig, outcomeRegistry, job, { ownerCall: true });
+        if (sim.failAfterEffect.delete("outcome")) throw new Error("injected: the outcome effect ran, then the step failed");
+      },
       sessionDeps: {} as never,
     });
     sim.timing = SLOW;
@@ -264,6 +299,9 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
     backends.reset();
     launches.length = 0;
     clearedIssues.length = 0;
+    comments.length = 0;
+    sim.notices = [];
+    sim.failAfterEffect = new Set();
     launchAckLost = false;
     sim.remediateCalls = 0;
     getDb().prepare("DELETE FROM dispatch_log").run();
@@ -327,9 +365,56 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
 
     await untilReleased(w.dispatchId);
     expect(readAdmission(w.dispatchId)).toMatchObject({ releaseReason: "finalized" });
-    expect(getJobByDispatchId(w.dispatchId)).toEqual(closed);
+    // The outcome step marks the row notified; nothing else about the closed row changes.
+    expect(getJobByDispatchId(w.dispatchId)).toEqual({ ...closed, notifiedAt: expect.any(Number) });
     expect(sim.remediateCalls).toBe(0);
     expect(clearedIssues).toEqual([]);
+  }, 60_000);
+
+  const breakerFailures = (issueId: string) =>
+    (getDb().prepare("SELECT consecutive_failures AS n FROM dispatch_breaker WHERE issue_id = ? AND phase = 'planning'").get(issueId) as { n: number } | undefined)?.n ?? 0;
+
+  it.each(labels)("a successful run resets the planning breaker count and marks the row notified (%s)", async (label) => {
+    gh.statusGate = gate("first status read");
+    const w = await dispatch(label, "PLT-20");
+    recordDispatchFailure(w.issue.id, "planning", "ended_without_callback");
+    recordDispatchFailure(w.issue.id, "planning", "ended_without_callback");
+    expect(breakerFailures(w.issue.id)).toBe(2);
+    await gh.statusGate.reached();
+    await waitForStep(w.read, "wait");
+
+    updateJobStatus(getJobByDispatchId(w.dispatchId)!.id, "completed", "planning_callback");
+    await w.hook(w.dispatchId);
+    gh.runs[0].status = "completed";
+    gh.statusGate.release();
+    await untilReleased(w.dispatchId);
+
+    expect(breakerFailures(w.issue.id)).toBe(0);
+    expect(getJobByDispatchId(w.dispatchId)).toMatchObject({ status: "completed", notifiedAt: expect.any(Number) });
+    // A clean success is quiet: no failure comment.
+    expect(comments).toEqual([]);
+  }, 60_000);
+
+  it.each(labels)("a run that ends at the deadline adds one to the breaker count, posts one failure comment, and sends one notice (%s)", async (label) => {
+    const w = await dispatch(label, "PLT-21", "github-actions", deadlineEnvironments);
+    await untilReleased(w.dispatchId);
+    expect(readAdmission(w.dispatchId)).toMatchObject({ releaseReason: "deadline_exceeded" });
+    expect(breakerFailures(w.issue.id)).toBe(1);
+    expect(comments).toHaveLength(1);
+    expect(sim.notices).toHaveLength(1);
+    expect(sim.notices[0]).toMatchObject({ status: "timed_out", phase: "planning", issueIdentifier: "PLT-21" });
+    expect(getJobByDispatchId(w.dispatchId)).toMatchObject({ status: "timed_out", notifiedAt: expect.any(Number) });
+  }, 60_000);
+
+  it.each(labels)("a retried outcome step counts one breaker failure and one stuck attempt (%s)", async (label) => {
+    // The first attempt of `finish-job-deadline` and of `outcome` run the real effect and then throw.
+    sim.failAfterEffect = new Set(["finish", "outcome"]);
+    const w = await dispatch(label, "PLT-22", "github-actions", deadlineEnvironments);
+    await untilReleased(w.dispatchId);
+    expect(breakerFailures(w.issue.id)).toBe(1);
+    expect(getStuckAttempts(w.issue.id)).toBe(1);
+    expect(sim.notices).toHaveLength(1);
+    expect(sim.failAfterEffect.size).toBe(0);
   }, 60_000);
 
   it.each(labels)("a run that ends with no callback closes the row as failed and handles the failure one time (%s)", async (label) => {
@@ -381,6 +466,7 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
   describe.each(["fly-machines", "local-docker"] as const)("backend %s", (backend) => {
     const running = (id: string) => (backend === "fly-machines" ? backends.machines.get(id) === "started" : backends.containers.get(id) === true);
     const stops = () => (backend === "fly-machines" ? backends.destroyCalls : backends.stopCalls);
+    const gone = (id: string) => (backend === "fly-machines" ? backends.machines.get(id) === "destroyed" : !backends.containers.has(id));
     const end = (id: string) => (backend === "fly-machines" ? backends.machines.set(id, "destroyed") : backends.containers.set(id, false));
 
     it.each(labels)("a report, then the machine stopping, releases the reservation as finalized (%s)", async (label) => {
@@ -405,12 +491,28 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
       expect(sim.remediateCalls).toBe(0);
     }, 60_000);
 
+    it.each(labels)("after a normal end the simulated backend holds no machine or container for the dispatch (%s)", async (label) => {
+      const w = await dispatch(label, "PLT-14", backend);
+      await waitForStep(w.read, "wait");
+      const { jobId } = await w.read();
+      updateJobStatus(getJobByDispatchId(w.dispatchId)!.id, "completed", "planning_callback");
+      await w.hook(w.dispatchId);
+      // The run exits on its own: the machine stops, the container exits; only the cleanup removes either.
+      if (backend === "fly-machines") backends.machines.set(jobId!, "destroyed");
+      else backends.containers.set(jobId!, false);
+      await untilReleased(w.dispatchId);
+      expect(gone(jobId!)).toBe(true);
+      expect(backend === "fly-machines" ? backends.destroyCalls : backends.removeCalls).toEqual([jobId]);
+      expect(getJobByDispatchId(w.dispatchId)).toMatchObject({ notifiedAt: expect.any(Number) });
+    }, 60_000);
+
     it.each(labels)("a machine still running at the total deadline is stopped by id and released as deadline_exceeded (%s)", async (label) => {
       const w = await dispatch(label, "PLT-11", backend, deadlineEnvironments);
       await untilReleased(w.dispatchId);
       const id = (await w.read()).jobId!;
-      expect(stops()).toEqual([id]);
-      expect(running(id)).toBe(false);
+      // Fly: the deadline stop and the cleanup both destroy the machine by id; Docker: the stop, then the removal.
+      expect(stops()).toEqual(backend === "fly-machines" ? [id, id] : [id]);
+      expect(gone(id)).toBe(true);
       expect(readAdmission(w.dispatchId)).toMatchObject({ releaseReason: "deadline_exceeded" });
       expect(getJobByDispatchId(w.dispatchId)).toMatchObject({ status: "timed_out" });
     }, 60_000);

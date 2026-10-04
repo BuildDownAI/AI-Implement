@@ -939,6 +939,14 @@ export function getStuckAttempts(issueId: string): number {
   return row?.attempts ?? 0;
 }
 
+/** When the latest stuck attempt for an issue was counted (epoch ms), or null if none. */
+export function getStuckAttemptStampedAt(issueId: string): number | null {
+  const row = getDb()
+    .prepare("SELECT last_attempt_at FROM stuck_attempts WHERE issue_id = ?")
+    .get(issueId) as { last_attempt_at: number | null } | undefined;
+  return row?.last_attempt_at ?? null;
+}
+
 /** Increments the stuck-attempt counter, stamps last_attempt_at, and returns the new count. */
 export function incrementStuckAttempts(issueId: string): number {
   const db = getDb();

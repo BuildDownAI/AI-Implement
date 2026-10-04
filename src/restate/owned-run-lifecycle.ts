@@ -4,7 +4,8 @@
 // one named, bounded `ctx.run`. A `ctx.run` with no `maxRetryAttempts` retries without limit, and
 // when a bounded step uses its last attempt `ctx.run` throws a TerminalError.
 //
-// The one error rule: a best-effort step swallows everything except a suspension, because the
+// The one error rule: a best-effort step swallows everything except a suspension and an invocation
+// cancel (a TerminalError with code 409), because the
 // release must run. `reserveOwnedRun` is the one step that does not swallow; a failed reservation
 // is the caller's decision.
 //
@@ -16,6 +17,11 @@ import type { WorkflowContext } from "@restatedev/restate-sdk";
 import type { OwnedRunStatus } from "./owned-run-wait.js";
 
 const STEP_ATTEMPTS = 3;
+
+/** A suspension and an invocation cancel (a TerminalError with code 409) are never swallowed by a best-effort step. */
+function mustPropagate(err: unknown): boolean {
+  return restate.internal.isSuspendedError(err) || (err instanceof restate.TerminalError && err.code === 409);
+}
 
 function describeError(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
@@ -59,7 +65,7 @@ export async function readBoundedOwnedRun<T>(
   try {
     return await ctx.run(stepName, async () => read(), { maxRetryAttempts: STEP_ATTEMPTS });
   } catch (err) {
-    if (restate.internal.isSuspendedError(err)) throw err;
+    if (mustPropagate(err)) throw err;
     ctx.console.error(`[owned-run] read "${stepName}" failed after ${STEP_ATTEMPTS} attempts: ${describeError(err)}`);
     return fallback;
   }
@@ -70,7 +76,7 @@ export async function cleanupOwnedRun(ctx: WorkflowContext, cleanup: () => Promi
   try {
     await ctx.run("cleanup", async () => cleanup(), { maxRetryAttempts: STEP_ATTEMPTS });
   } catch (err) {
-    if (restate.internal.isSuspendedError(err)) throw err;
+    if (mustPropagate(err)) throw err;
     ctx.console.error(`[owned-run] cleanup failed after ${STEP_ATTEMPTS} attempts: ${describeError(err)}`);
   }
 }
@@ -80,7 +86,7 @@ export async function reportOwnedRunOutcome(ctx: WorkflowContext, outcome: () =>
   try {
     await ctx.run("outcome", async () => outcome(), { maxRetryAttempts: STEP_ATTEMPTS });
   } catch (err) {
-    if (restate.internal.isSuspendedError(err)) throw err;
+    if (mustPropagate(err)) throw err;
     ctx.console.error(`[owned-run] outcome failed after ${STEP_ATTEMPTS} attempts: ${describeError(err)}`);
   }
 }

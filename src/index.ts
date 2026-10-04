@@ -3068,175 +3068,201 @@ async function resetTicket(provider: TicketingProvider, job: Job): Promise<void>
 
 // ---------- Completion notifications ----------
 
-export async function reportJobCompletion(config: AppConfig, registry: ProviderRegistry): Promise<void> {
-  const terminalJobs = getUnnotifiedTerminalJobs();
+/**
+ * The completion handling for one terminal job: the breaker count, the failure comment on the ticket,
+ * and the completion notice. `reportJobCompletion` runs it for each Legacy job; the `PlanningRun`
+ * workflow runs it for the job it owns, with `ownerCall` (the same pattern as `remediateFailedJob`).
+ * An owner call throws instead of logging, so the workflow's step retries, and it counts the breaker
+ * and marks the job notified in one transaction, so a retry after the count never counts a second time.
+ */
+export async function reportTerminalJob(
+  config: AppConfig,
+  registry: ProviderRegistry,
+  jobRow: Job,
+  opts?: { ownerCall?: boolean },
+): Promise<void> {
+  let job = jobRow;
+  if (opts?.ownerCall) {
+    const fresh = getJobById(job.id);
+    if (!fresh || fresh.notifiedAt != null) return;
+    job = fresh;
+  }
   const mappings = getMappings();
-  for (const job of terminalJobs) {
-    try {
-      // Restate owns the outcome, breaker, and notification path for its attempts.
-      if (isRestateOwnedJob(job)) continue;
-      // Record dispatch breaker state for every Legacy terminal job before any other
-      // early-continue. This path sees every Legacy backend and result source (GHA callback,
-      // GHA monitor, Fly, local-docker).
-      let pendingBreakerTrip: { phase: string; failures: number; conclusion: string } | null = null;
-      // kg-refresh dispatch never calls isParked(), so breaker bookkeeping here is dead weight that silently mutates DB without notification.
-      if (job.issueId && job.phase !== "kg-refresh") {
-        const breakerPhase = job.phase === "planning" ? "planning" : "implementation";
-        if (job.status === "completed") {
-          recordDispatchSuccess(job.issueId, breakerPhase);
-        } else if (job.status === "failed" || job.status === "timed_out" || job.status === "review_failed") {
-          // Skip the breaker entirely for operator_cancelled — it was a human decision,
-          // not a system failure. Recording it could park the issue and permanently
-          // suppress future genuine-failure alerts even after the breaker trips from
-          // accumulated operator-cancel events (alreadyParked stays true forever).
-          if (job.conclusion !== "operator_cancelled") {
-            const breakerConclusion = job.conclusion ?? job.status;
-            // stuck_giveup already fires notifyStuckGiveUp — don't double-fire.
-            const isStuck = job.conclusion === "stuck_giveup" || job.conclusion === "stuck_requeued";
-            // A classified transient failure (provider overload) is the provider's outage, not
-            // the ticket's — don't count it toward the breaker, or three unlucky retries against
-            // a flaky provider parks the issue (BAC-27134). Jobs with no classified failure at
-            // all (pre-BAC-27112, or a synthetic dispatch-error conclusion) count as before.
-            if (!job.failure || shouldCountFailure(job.failure)) {
-              const br = recordDispatchFailure(job.issueId, breakerPhase, breakerConclusion);
-              if (br.tripped && !isStuck) {
-                pendingBreakerTrip = { phase: breakerPhase, failures: br.failures, conclusion: breakerConclusion };
-              }
+  // Record dispatch breaker state for every Legacy terminal job before any other
+  // early-continue. This path sees every Legacy backend and result source (GHA callback,
+  // GHA monitor, Fly, local-docker).
+  let pendingBreakerTrip = null as { phase: string; failures: number; conclusion: string } | null;
+  // kg-refresh dispatch never calls isParked(), so breaker bookkeeping here is dead weight that silently mutates DB without notification.
+  const recordBreaker = (): void => {
+    if (job.issueId && job.phase !== "kg-refresh") {
+      const breakerPhase = job.phase === "planning" ? "planning" : "implementation";
+      if (job.status === "completed") {
+        recordDispatchSuccess(job.issueId, breakerPhase);
+      } else if (job.status === "failed" || job.status === "timed_out" || job.status === "review_failed") {
+        // Skip the breaker entirely for operator_cancelled — it was a human decision,
+        // not a system failure. Recording it could park the issue and permanently
+        // suppress future genuine-failure alerts even after the breaker trips from
+        // accumulated operator-cancel events (alreadyParked stays true forever).
+        if (job.conclusion !== "operator_cancelled") {
+          const breakerConclusion = job.conclusion ?? job.status;
+          // stuck_giveup already fires notifyStuckGiveUp — don't double-fire.
+          const isStuck = job.conclusion === "stuck_giveup" || job.conclusion === "stuck_requeued";
+          // A classified transient failure (provider overload) is the provider's outage, not
+          // the ticket's — don't count it toward the breaker, or three unlucky retries against
+          // a flaky provider parks the issue (BAC-27134). Jobs with no classified failure at
+          // all (pre-BAC-27112, or a synthetic dispatch-error conclusion) count as before.
+          if (!job.failure || shouldCountFailure(job.failure)) {
+            const br = recordDispatchFailure(job.issueId, breakerPhase, breakerConclusion);
+            if (br.tripped && !isStuck) {
+              pendingBreakerTrip = { phase: breakerPhase, failures: br.failures, conclusion: breakerConclusion };
             }
           }
         }
       }
+    }
+  };
+  if (opts?.ownerCall) getDb().transaction(() => { recordBreaker(); markJobNotified(job.id); })();
+  else recordBreaker();
 
-      // Suppress ordinary completion notice for stuck conclusions — stuck_giveup
-      // already fires notifyStuckGiveUp, and stuck_requeued is a transparent
-      // requeue that will produce its own dispatch notice on the next cycle.
-      if (job.conclusion === "stuck_giveup" || job.conclusion === "stuck_requeued") {
-        markJobNotified(job.id);
-        continue;
-      }
+  // Suppress ordinary completion notice for stuck conclusions — stuck_giveup
+  // already fires notifyStuckGiveUp, and stuck_requeued is a transparent
+  // requeue that will produce its own dispatch notice on the next cycle.
+  if (job.conclusion === "stuck_giveup" || job.conclusion === "stuck_requeued") {
+    markJobNotified(job.id);
+    return;
+  }
 
-      // Operator-cancelled: one informational notice, no failure/stuck/parked triple.
-      if (job.conclusion === "operator_cancelled") {
-        if (config.notifyWebhookUrl) {
-          const identifier = job.issueIdentifier || job.issueId;
-          const prNum = job.prUrl ? job.prUrl.match(/\/pull\/(\d+)/)?.[1] : undefined;
-          const prRef = prNum ? ` (PR #${prNum})` : "";
-          try {
-            await notifyText(
-              config.notifyWebhookUrl,
-              `ℹ️ AI-Implement run cancelled by operator${prRef} — ${identifier}. PR was closed mid-run; ticket label cleared — issue excluded from automatic re-dispatch.`,
-            );
-          } catch (err) {
-            console.error(`[monitor] Failed to send operator-cancelled notice for job ${job.id}:`, err);
-          }
-        }
-        console.log(`[monitor] Job ${job.id} (${job.issueIdentifier}) operator_cancelled — benign terminal, one informational notice sent`);
-        markJobNotified(job.id);
-        continue;
-      }
-
-      // kg-refresh outcome notification is owned by notifyKgRefreshOutcome (AII-496).
-      if (shouldSkipCompletionNotice(job)) {
-        markJobNotified(job.id);
-        continue;
-      }
-
-      const repoFullName = job.repo || "unknown";
-
-      const runUrl = buildRunUrl(job);
-
-      const durationMs =
-        job.completedAt != null ? job.completedAt - job.dispatchedAt : null;
-
-      // Resolve provider via the job's teamKey -> mapping so the URL matches
-      // the issue's ticketing system. Fall back to the legacy Linear URL if
-      // the mapping is gone (orphaned job).
+  // Operator-cancelled: one informational notice, no failure/stuck/parked triple.
+  if (job.conclusion === "operator_cancelled") {
+    if (config.notifyWebhookUrl) {
       const identifier = job.issueIdentifier || job.issueId;
-      let issueUrl = `https://linear.app/issue/${identifier}`;
-      let provider: TicketingProvider | null = null;
-      const mapping = job.teamKey ? mappings[job.teamKey] : undefined;
-      if (mapping) {
-        try {
-          provider = await registry.forMapping(mapping);
-          issueUrl = provider.issueUrl({
-            id: job.issueId,
-            identifier,
-            title: job.issueTitle || "",
-            description: null,
-            scopeKey: job.teamKey ?? "",
-            nativeStatus: "",
-          });
-        } catch (err) {
-          console.warn(`[monitor] Failed to resolve provider for job ${job.id}, using fallback URL:`, err);
-        }
-      }
-
-      // Fire breaker trip notification now that provider is resolved.
-      if (pendingBreakerTrip && job.issueId) {
-        await fireBreakerTrip(
-          config,
-          provider,
-          job.issueId,
-          job.issueIdentifier,
-          pendingBreakerTrip.phase,
-          pendingBreakerTrip.failures,
-          pendingBreakerTrip.conclusion,
+      const prNum = job.prUrl ? job.prUrl.match(/\/pull\/(\d+)/)?.[1] : undefined;
+      const prRef = prNum ? ` (PR #${prNum})` : "";
+      try {
+        await notifyText(
+          config.notifyWebhookUrl,
+          `ℹ️ AI-Implement run cancelled by operator${prRef} — ${identifier}. PR was closed mid-run; ticket label cleared — issue excluded from automatic re-dispatch.`,
         );
+      } catch (err) {
+        console.error(`[monitor] Failed to send operator-cancelled notice for job ${job.id}:`, err);
       }
+    }
+    console.log(`[monitor] Job ${job.id} (${job.issueIdentifier}) operator_cancelled — benign terminal, one informational notice sent`);
+    markJobNotified(job.id);
+    return;
+  }
 
-      // Tracker comment — ALWAYS, independent of the Slack/Teams webhook (failures only)
-      // classifyCompletion returns null on a clean success, so successes stay quiet everywhere
-      const willPostMonitorComment = Boolean(provider) && shouldPostMonitorClassificationComment(job);
-      // getStepsByJobId is a step_log query — worth skipping when nothing downstream will
-      // render the "last successful stage" line: not the monitor comment (already posted by
-      // the callback) and not the webhook notification below (unconfigured).
-      const lastSuccessfulStage =
-        job.failure && (willPostMonitorComment || config.notifyWebhookUrl)
-          ? deriveLastSuccessfulStage(getStepsByJobId(job.id), job.failure.stage)
-          : null;
-      const classification = classifyCompletion(job, lastSuccessfulStage);
-      if (classification && provider && willPostMonitorComment) {
-        try {
-          // The phase-naming prefix mirrors markImplementationFailed/markPlanningFailed's own
-          // comment, so it must only apply where those would have posted the same-shaped
-          // comment: an actual failure (job.status === "failed", including a gap-analysis
-          // failure — the only phase the callback never comments for at all). review_failed
-          // and timed_out are not failures — the run completed and (for review_failed) opened
-          // a PR the ticket already got a "ready for review" comment about — so prepending
-          // "Implementation failed:" there would contradict the run's own outcome.
-          const rendered = renderClassification(classification);
-          const body = job.status === "failed" ? monitorFailureCommentPrefix(job.phase) + rendered : rendered;
-          await provider.postComment(job.issueId, body);
-        } catch (err) {
-          console.warn(`[monitor] Failed to post classification comment for job ${job.id}:`, err);
-        }
-      }
+  // kg-refresh outcome notification is owned by notifyKgRefreshOutcome (AII-496).
+  if (shouldSkipCompletionNotice(job)) {
+    markJobNotified(job.id);
+    return;
+  }
 
-      if (config.notifyWebhookUrl) {
-        try {
-          await notifyCompletion(config.notifyType, config.notifyWebhookUrl, {
-            issueIdentifier: identifier,
-            issueTitle: job.issueTitle || "Unknown",
-            issueUrl,
-            repoFullName,
-            status: job.status as "completed" | "review_failed" | "failed" | "timed_out",
-            conclusion: job.conclusion,
-            prUrl: job.prUrl,
-            runUrl,
-            durationMs,
-            phase: job.phase === "planning" ? "planning" : "implementation", // job.phase is a wider string (planning|implementation|gap-analysis) — narrow, don't cast
-            summary: classification?.summary,
-            detail: classification?.detail,
-            remediation: classification?.remediation,
-            docsUrl: classification?.docsUrl,
-          });
-          console.log(`[monitor] Sent ${job.status} notification for ${job.issueIdentifier} (job #${job.id}, dispatch #${job.dispatchNumber})`);
-        } catch (err) {
-          console.error(`[monitor] Failed to send notification for job ${job.id}:`, err);
-        }
-      }
+  const repoFullName = job.repo || "unknown";
 
-      markJobNotified(job.id);
+  const runUrl = buildRunUrl(job);
+
+  const durationMs =
+    job.completedAt != null ? job.completedAt - job.dispatchedAt : null;
+
+  // Resolve provider via the job's teamKey -> mapping so the URL matches
+  // the issue's ticketing system. Fall back to the legacy Linear URL if
+  // the mapping is gone (orphaned job).
+  const identifier = job.issueIdentifier || job.issueId;
+  let issueUrl = `https://linear.app/issue/${identifier}`;
+  let provider: TicketingProvider | null = null;
+  const mapping = job.teamKey ? mappings[job.teamKey] : undefined;
+  if (mapping) {
+    try {
+      provider = await registry.forMapping(mapping);
+      issueUrl = provider.issueUrl({
+        id: job.issueId,
+        identifier,
+        title: job.issueTitle || "",
+        description: null,
+        scopeKey: job.teamKey ?? "",
+        nativeStatus: "",
+      });
+    } catch (err) {
+      console.warn(`[monitor] Failed to resolve provider for job ${job.id}, using fallback URL:`, err);
+    }
+  }
+
+  // Fire breaker trip notification now that provider is resolved.
+  if (pendingBreakerTrip && job.issueId) {
+    await fireBreakerTrip(
+      config,
+      provider,
+      job.issueId,
+      job.issueIdentifier,
+      pendingBreakerTrip.phase,
+      pendingBreakerTrip.failures,
+      pendingBreakerTrip.conclusion,
+    );
+  }
+
+  // Tracker comment — ALWAYS, independent of the Slack/Teams webhook (failures only)
+  // classifyCompletion returns null on a clean success, so successes stay quiet everywhere
+  const willPostMonitorComment = Boolean(provider) && shouldPostMonitorClassificationComment(job);
+  // getStepsByJobId is a step_log query — worth skipping when nothing downstream will
+  // render the "last successful stage" line: not the monitor comment (already posted by
+  // the callback) and not the webhook notification below (unconfigured).
+  const lastSuccessfulStage =
+    job.failure && (willPostMonitorComment || config.notifyWebhookUrl)
+      ? deriveLastSuccessfulStage(getStepsByJobId(job.id), job.failure.stage)
+      : null;
+  const classification = classifyCompletion(job, lastSuccessfulStage);
+  if (classification && provider && willPostMonitorComment) {
+    try {
+      // The phase-naming prefix mirrors markImplementationFailed/markPlanningFailed's own
+      // comment, so it must only apply where those would have posted the same-shaped
+      // comment: an actual failure (job.status === "failed", including a gap-analysis
+      // failure — the only phase the callback never comments for at all). review_failed
+      // and timed_out are not failures — the run completed and (for review_failed) opened
+      // a PR the ticket already got a "ready for review" comment about — so prepending
+      // "Implementation failed:" there would contradict the run's own outcome.
+      const rendered = renderClassification(classification);
+      const body = job.status === "failed" ? monitorFailureCommentPrefix(job.phase) + rendered : rendered;
+      await provider.postComment(job.issueId, body);
+    } catch (err) {
+      console.warn(`[monitor] Failed to post classification comment for job ${job.id}:`, err);
+    }
+  }
+
+  if (config.notifyWebhookUrl) {
+    try {
+      await notifyCompletion(config.notifyType, config.notifyWebhookUrl, {
+        issueIdentifier: identifier,
+        issueTitle: job.issueTitle || "Unknown",
+        issueUrl,
+        repoFullName,
+        status: job.status as "completed" | "review_failed" | "failed" | "timed_out",
+        conclusion: job.conclusion,
+        prUrl: job.prUrl,
+        runUrl,
+        durationMs,
+        phase: job.phase === "planning" ? "planning" : "implementation", // job.phase is a wider string (planning|implementation|gap-analysis) — narrow, don't cast
+        summary: classification?.summary,
+        detail: classification?.detail,
+        remediation: classification?.remediation,
+        docsUrl: classification?.docsUrl,
+      });
+      console.log(`[monitor] Sent ${job.status} notification for ${job.issueIdentifier} (job #${job.id}, dispatch #${job.dispatchNumber})`);
+    } catch (err) {
+      console.error(`[monitor] Failed to send notification for job ${job.id}:`, err);
+    }
+  }
+
+  markJobNotified(job.id);
+}
+
+export async function reportJobCompletion(config: AppConfig, registry: ProviderRegistry): Promise<void> {
+  const terminalJobs = getUnnotifiedTerminalJobs();
+  for (const job of terminalJobs) {
+    try {
+      // Restate owns the outcome, breaker, and notification path for its attempts.
+      if (isRestateOwnedJob(job)) continue;
+      await reportTerminalJob(config, registry, job);
     } catch (err) {
       console.error(`[monitor] Failed to process completed job #${job.id}:`, err);
     }
@@ -5093,6 +5119,7 @@ async function main(): Promise<void> {
     preparePlanningLaunch,
     launchPlanningRun,
     launchPlanningSession,
+    reportTerminalJob: (job) => reportTerminalJob(config, registry, job, { ownerCall: true }),
     sessionDeps: { dispatchSession, isDefinitiveFlyRejectionError, isDefinitiveLocalDockerLaunchFailure, shouldReleaseAdmissionOnDispatchError },
   }).services;
   const restateRegistration = createRestateRegistrationGate(() => shuttingDown, {
