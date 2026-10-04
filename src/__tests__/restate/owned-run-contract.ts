@@ -40,6 +40,10 @@ export interface OwnedRunHandle {
 export interface OwnedRunAdapter {
   /** Names the describe block. */
   name: string;
+  /** The scenario numbers that apply to this run kind; all five when absent. The adapter's test file states why each other one does not apply. */
+  scenarios?: number[];
+  /** False when the run kind has no cleanup step (its marker release is the cleanup); scenario 1 then expects no `cleanup:<runId>` call. Default true. */
+  hasCleanup?: boolean;
   /** Starts the workflow under `key` on `baseUrl`, with the faults applied. */
   start(baseUrl: string, key: string, start: OwnedRunStart): OwnedRunHandle;
   /**
@@ -71,7 +75,10 @@ export function registerOwnedRunContract(
     const handle = adapter.start(envFor(label).baseUrl(), key, start);
     return { key, ...handle };
   }
-  const scenario = (n: number) => (options.pending?.[n] ? it.skip.each(labels) : it.each(labels));
+  const applies = (n: number) => adapter.scenarios === undefined || adapter.scenarios.includes(n);
+  const cleanupCalls = (runId: string) => (adapter.hasCleanup === false ? [] : [`cleanup:${runId}`]);
+  // A scenario that does not apply registers nothing; one a run kind has not reached yet registers as skipped.
+  const scenario = (n: number) => (!applies(n) ? it.each([] as string[]) : options.pending?.[n] ? it.skip.each(labels) : it.each(labels));
   const withoutStatus = (calls: string[]) => calls.filter((call) => call !== "status");
 
   describe(`owned-run contract: ${adapter.name}`, () => {
@@ -80,7 +87,7 @@ export function registerOwnedRunContract(
       await run.done;
       const calls = adapter.calls(run.key);
       expect(calls.filter((call) => call === "status").length).toBeGreaterThanOrEqual(3);
-      expect(withoutStatus(calls)).toEqual(["reserve", "launch", "stop", `cleanup:${run.runId}`, "outcome", "release"]);
+      expect(withoutStatus(calls)).toEqual(["reserve", "launch", "stop", ...cleanupCalls(run.runId), "outcome", "release"]);
     }, 30_000);
 
     scenario(2)("2. a crash after the launch step adopts the run and does not launch a second run (%s)", async (label) => {
