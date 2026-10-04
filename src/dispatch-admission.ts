@@ -455,7 +455,10 @@ export function listHeldReservations(now: number = Date.now()): HeldReservation[
     .prepare("SELECT * FROM dispatch_admissions WHERE released_at IS NULL ORDER BY created_at ASC, dispatch_id ASC")
     .all() as Row[];
   return rows.map((row) => {
-    const job = getJobByDispatchId(row.dispatch_id);
+    // A job of an earlier generation under the same dispatch id says nothing about this
+    // reservation, so it is not shown (same rule `releaseHeldReservation` applies).
+    const latest = getJobByDispatchId(row.dispatch_id);
+    const job = latest && jobBelongsToGeneration(latest, row.generation) ? latest : null;
     return {
       dispatchId: row.dispatch_id,
       team: row.mapping_key,
@@ -478,11 +481,15 @@ export type ReleaseHeldReservationResult =
 
 const TERMINAL_JOB_STATUSES: ReadonlySet<string> = new Set(["completed", "review_failed", "failed", "timed_out", "dispatch-failed"]);
 
+function jobBelongsToGeneration(job: Job, generation: number): boolean {
+  return job.admissionGeneration === null || job.admissionGeneration === generation;
+}
+
 function jobIsTerminalFor(job: Job | null, generation: number): boolean {
   if (!job || !TERMINAL_JOB_STATUSES.has(job.status)) return false;
   // A terminal job of an earlier reservation under the same dispatch id says nothing
   // about this one.
-  return job.admissionGeneration === null || job.admissionGeneration === generation;
+  return jobBelongsToGeneration(job, generation);
 }
 
 /**

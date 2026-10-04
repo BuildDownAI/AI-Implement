@@ -850,6 +850,8 @@ describe("listHeldReservations / releaseHeldReservation (AII-1069)", () => {
     expect(admission.read("dispatch-1")?.generation).toBe(1);
     const result = await admission.releaseHeldReservation("dispatch-1", { force: false, confirmTerminated: never });
     expect(result.status).toBe("refused");
+    // The list hides the earlier generation's job too.
+    expect(admission.listHeldReservations()[0]).toMatchObject({ jobStatus: null, jobConclusion: null, issueIdentifier: null });
   });
 
   it("releases with force and reports nothing to release afterwards", async () => {
