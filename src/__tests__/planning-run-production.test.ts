@@ -20,9 +20,10 @@ vi.mock("../log.js", () => ({
   updateJobStatus: vi.fn(),
   findLogIdByDispatchId: vi.fn().mockReturnValue(7),
   updateJobRunId: vi.fn(),
+  getStuckAttemptStampedAt: vi.fn().mockReturnValue(null),
 }));
 vi.mock("../fly-machines.js", () => ({ getMachine: vi.fn(), destroyMachine: vi.fn(), listMachines: vi.fn() }));
-vi.mock("../local-docker.js", () => ({ inspectLocalContainer: vi.fn(), stopLocalContainer: vi.fn(), findLocalContainerIdByName: vi.fn() }));
+vi.mock("../local-docker.js", () => ({ inspectLocalContainer: vi.fn(), stopLocalContainer: vi.fn(), findLocalContainerIdByName: vi.fn(), removeLocalContainer: vi.fn() }));
 vi.mock("../stuck-watchdog.js", () => ({ remediateFailedJob: vi.fn().mockResolvedValue(undefined) }));
 vi.mock("../dispatch-admission.js", () => ({
   read: vi.fn(),
@@ -30,11 +31,11 @@ vi.mock("../dispatch-admission.js", () => ({
 }));
 
 import { cancelWorkflowRun, getWorkflowRunStatus } from "../github.js";
-import { getJobByDispatchId, updateJobRunId, updateJobStatus } from "../log.js";
+import { getJobByDispatchId, getStuckAttemptStampedAt, updateJobRunId, updateJobStatus } from "../log.js";
 import { read as readAdmission, releaseByDispatchId } from "../dispatch-admission.js";
 import { remediateFailedJob } from "../stuck-watchdog.js";
 import { destroyMachine, getMachine, listMachines } from "../fly-machines.js";
-import { findLocalContainerIdByName, inspectLocalContainer, stopLocalContainer } from "../local-docker.js";
+import { findLocalContainerIdByName, inspectLocalContainer, removeLocalContainer, stopLocalContainer } from "../local-docker.js";
 import { planningSessionName } from "../planning-launch.js";
 import {
   PLANNING_RUN_TITLE_PREFIX,
@@ -179,6 +180,7 @@ describe("production deps", () => {
       preparePlanningLaunch: vi.fn().mockResolvedValue(prepared) as never,
       launchPlanningRun: vi.fn().mockResolvedValue(launchResult) as never,
       launchPlanningSession: vi.fn().mockResolvedValue({ outcome: "accepted", machineId: "m-1", executionMode: "fly-machines" }) as never,
+      reportTerminalJob: vi.fn().mockResolvedValue(undefined),
       sessionDeps: {} as never,
       ...overrides,
     };
@@ -326,6 +328,66 @@ describe("production deps", () => {
     expect(releaseByDispatchId).toHaveBeenCalledWith("d-1", "finalized");
   });
 
+  describe("cleanup", () => {
+    it("destroys the Fly machine by id", async () => {
+      const { d } = compose();
+      await d.cleanup({ ...INPUT, backend: "fly-machines" }, "m-9");
+      expect(destroyMachine).toHaveBeenCalledWith("fly-token", "fly-app", "m-9");
+      expect(removeLocalContainer).not.toHaveBeenCalled();
+    });
+
+    it("removes the local container by id", async () => {
+      const { d } = compose();
+      await d.cleanup({ ...INPUT, backend: "local-docker" }, "c-9");
+      expect(removeLocalContainer).toHaveBeenCalledWith("c-9");
+      expect(destroyMachine).not.toHaveBeenCalled();
+    });
+
+    it("does nothing on GitHub Actions", async () => {
+      const { d } = compose();
+      await d.cleanup(INPUT, "5000");
+      expect(destroyMachine).not.toHaveBeenCalled();
+      expect(removeLocalContainer).not.toHaveBeenCalled();
+    });
+
+    it("accepts a machine or container that is already gone", async () => {
+      vi.mocked(destroyMachine).mockRejectedValueOnce(new Error("Failed to destroy machine m-9 (404): not found"));
+      vi.mocked(removeLocalContainer).mockRejectedValueOnce(new Error("Failed to remove local Docker runner c-9: No such container: c-9"));
+      const { d } = compose();
+      await expect(d.cleanup({ ...INPUT, backend: "fly-machines" }, "m-9")).resolves.toBeUndefined();
+      await expect(d.cleanup({ ...INPUT, backend: "local-docker" }, "c-9")).resolves.toBeUndefined();
+    });
+
+    it("throws any other failure so the step retries", async () => {
+      vi.mocked(destroyMachine).mockRejectedValueOnce(new Error("Failed to destroy machine m-9 (500): boom"));
+      const { d } = compose();
+      await expect(d.cleanup({ ...INPUT, backend: "fly-machines" }, "m-9")).rejects.toThrow(/500/);
+    });
+  });
+
+  describe("onOutcome", () => {
+    it("reports the job row of the dispatch", async () => {
+      const row = { id: 7, dispatchId: "d-1" };
+      vi.mocked(getJobByDispatchId).mockReturnValue(row as never);
+      const { d, input } = compose();
+      await d.onOutcome("d-1");
+      expect(input.reportTerminalJob).toHaveBeenCalledWith(row);
+    });
+
+    it("does nothing when there is no row", async () => {
+      vi.mocked(getJobByDispatchId).mockReturnValue(null);
+      const { d, input } = compose();
+      await d.onOutcome("d-1");
+      expect(input.reportTerminalJob).not.toHaveBeenCalled();
+    });
+
+    it("lets a failure propagate so the step retries", async () => {
+      vi.mocked(getJobByDispatchId).mockReturnValue({ id: 7 } as never);
+      const { d } = compose({ reportTerminalJob: vi.fn().mockRejectedValue(new Error("notice failed")) });
+      await expect(d.onOutcome("d-1")).rejects.toThrow("notice failed");
+    });
+  });
+
   describe("finishJob", () => {
     const row = { id: 7, issueId: "i-1", teamKey: "ENG", dispatchId: "d-1", status: "dispatched", conclusion: null };
 
@@ -353,6 +415,23 @@ describe("production deps", () => {
       const call = vi.mocked(remediateFailedJob).mock.calls[0];
       expect(call[1]).toBe(provider);
       expect(call[4]).toEqual({ ownerCall: true });
+    });
+
+    it("closes an in-flight row as failed with its own conclusion after an invocation cancel", async () => {
+      vi.mocked(getJobByDispatchId).mockReturnValue(row as never);
+      const { d } = compose();
+      await d.finishJob("d-1", { kind: "cancelled" });
+      expect(updateJobStatus).toHaveBeenCalledWith(7, "failed", "workflow_cancelled");
+    });
+
+    it("does not count a second stuck attempt when a retry finds one stamped since the dispatch began", async () => {
+      vi.mocked(getJobByDispatchId).mockReturnValue(
+        { ...row, status: "failed", conclusion: "ended_without_callback", dispatchedAt: 1_000 } as never,
+      );
+      vi.mocked(getStuckAttemptStampedAt).mockReturnValueOnce(2_000);
+      const { d } = compose();
+      await d.finishJob("d-1", { kind: "run_ended" });
+      expect(remediateFailedJob).not.toHaveBeenCalled();
     });
 
     it("closes an in-flight row as timed_out at a deadline", async () => {

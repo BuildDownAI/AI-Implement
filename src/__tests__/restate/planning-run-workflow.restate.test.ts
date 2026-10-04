@@ -18,8 +18,9 @@ import {
   type PlanningRunStatusResult,
 } from "../../restate/planning-run-workflow.js";
 import {
-  VARIANTS, callWorkflow, crashAfterFirstCall, eventually, gate, startVariants, stopAll, waitForStep, type Gate,
+  VARIANTS, callWorkflow, cancelInvocation, crashAfterFirstCall, eventually, gate, queryInvocations, startVariants, stopAll, waitForStep, type Gate,
 } from "./harness.js";
+import { registerOwnedRunContract, type OwnedRunAdapter, type OwnedRunFaults } from "./owned-run-contract.js";
 
 const SLOW = { tickMs: 50, confirmTickMs: 50, confirmWindowMs: 60_000, bootstrapMs: 120_000, totalMs: 240_000, stopMarginMs: 60_000 };
 const WINDOW = { ...SLOW, confirmWindowMs: 400 };
@@ -41,6 +42,11 @@ interface Scenario {
   tickGate?: Gate;
   tickGateReachedAt?: number;
   launchImpl?: (input: PlanningRunInput) => Promise<PlanningLaunchResult>;
+  /** Every effect call in order, one string per attempt (the shape the contract suite reads). */
+  calls: string[];
+  faults: OwnedRunFaults;
+  /** `findExistingRun` throws on every attempt once the launch happened (the launch step's own lookup runs before). */
+  findThrows?: boolean;
 }
 
 const scenarios = new Map<string, Scenario>();
@@ -66,23 +72,39 @@ function makeDeps(seams: typeof SLOW): PlanningRunDependencies {
       const sc = scenarioOf(input.dispatchId);
       sc.findCalls++;
       await holdAtTick(sc);
+      if (sc.findThrows && sc.launched) throw new Error("injected find failure");
       return sc.launched ? sc.runId : null;
     },
     async launch(input) {
       const sc = scenarioOf(input.dispatchId);
       sc.launchCalls++;
+      sc.calls.push("launch");
       sc.launched = true;
       return sc.launchImpl ? sc.launchImpl(input) : sc.launchResult;
     },
     async readStatus(input) {
       const sc = scenarioOf(input.dispatchId);
       sc.readCalls++;
+      sc.calls.push("status");
       await holdAtTick(sc);
+      if (sc.faults.failStatusRead) throw new Error("injected status read failure");
       return sc.status;
     },
     async stop(input, jobId) {
-      scenarioOf(input.dispatchId).stopCalls.push(jobId);
+      const sc = scenarioOf(input.dispatchId);
+      sc.stopCalls.push(jobId);
+      sc.calls.push("stop");
       return true;
+    },
+    async cleanup(input, jobId) {
+      const sc = scenarioOf(input.dispatchId);
+      sc.calls.push(`cleanup:${jobId}`);
+      if (sc.faults.failCleanup) throw new Error("injected cleanup failure");
+    },
+    async onOutcome(dispatchId) {
+      const sc = scenarioOf(dispatchId);
+      sc.calls.push("outcome");
+      if (sc.faults.failOutcome) throw new Error("injected outcome failure");
     },
     async finishJob(dispatchId, outcome) {
       const sc = scenarioOf(dispatchId);
@@ -90,6 +112,7 @@ function makeDeps(seams: typeof SLOW): PlanningRunDependencies {
       if (sc.finishThrows) throw new Error("injected finishJob failure");
     },
     async release(dispatchId, reason) {
+      scenarios.get(dispatchId)?.calls.push("release");
       releases.push({ dispatchId, reason });
     },
   };
@@ -128,7 +151,7 @@ describe("PlanningRun durable workflow", () => {
       launchResult: { outcome: "accepted", jobId: `job-${dispatchId}` },
       runId: `job-${dispatchId}`,
       launched: false, launchCalls: 0, findCalls: 0, readCalls: 0, stopCalls: [], finishCalls: [], finishThrows: false,
-      status: "unknown",
+      status: "unknown", calls: [], faults: {},
       ...overrides,
     };
     scenarios.set(dispatchId, sc);
@@ -252,6 +275,36 @@ describe("PlanningRun durable workflow", () => {
     expect(releasesOf(w.dispatchId)).toEqual(["deadline_exceeded"]);
   }, 60_000);
 
+  it.each(labels)("a find that fails on each attempt counts as not found and the wait reaches its deadline (%s)", async (label) => {
+    const w = begin(deadline, label, { launchResult: { outcome: "unknown" }, runId: null, findThrows: true });
+    expect(await w.done).toEqual({ reason: "deadline_exceeded" });
+    expect(w.sc.stopCalls).toEqual([]);
+    expect(w.sc.finishCalls).toEqual([{ kind: "deadline" }]);
+    expect(releasesOf(w.dispatchId)).toEqual(["deadline_exceeded"]);
+    // No run id was ever known, so there is nothing to clean up; the outcome still runs once.
+    expect(w.sc.calls.filter((c) => c.startsWith("cleanup"))).toEqual([]);
+    expect(w.sc.calls.filter((c) => c === "outcome")).toHaveLength(1);
+  }, 60_000);
+
+  it.each(labels)("an invocation cancel after a launch stops the run, closes the row, and releases (%s)", async (label) => {
+    const w = begin(slow, label, { status: "started" });
+    await waitForStep(w.read, "wait");
+    const env = slow.get(label)!;
+    const rows = await eventually(
+      () => queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'PlanningRun' AND target_service_key = '${w.dispatchId}' AND target_handler_name = 'run'`),
+      (found) => found.length === 1,
+      { label: "the run invocation" },
+    );
+    await cancelInvocation(env.adminAPIBaseUrl(), String(rows[0].id));
+    await w.done.catch(() => undefined);
+    await eventually(() => releasesOf(w.dispatchId), (reasons) => reasons.length >= 1, { label: "the release after the cancel" });
+    expect(releasesOf(w.dispatchId)).toEqual(["cancelled"]);
+    expect(w.sc.stopCalls).toEqual([`job-${w.dispatchId}`]);
+    expect(w.sc.finishCalls).toEqual([{ kind: "cancelled" }]);
+    expect(w.sc.calls.filter((c) => c === "outcome")).toHaveLength(1);
+    expect(w.sc.calls[w.sc.calls.length - 1]).toBe("release");
+  }, 60_000);
+
   it.each(labels)("a throw in finishJob still ends with one release (%s)", async (label) => {
     const w = begin(slow, label, { finishThrows: true });
     await waitForStep(w.read, "wait");
@@ -261,4 +314,46 @@ describe("PlanningRun durable workflow", () => {
     expect(releasesOf(w.dispatchId)).toEqual(["finalized"]);
     expect((await w.read()).step).toBe("released");
   }, 60_000);
+
+  // The contract suite (ADR 036). `PlanningRun` takes no reservation yet, so the adapter records `reserve` itself
+  // when it starts the run; scenario 4 (a refused reservation) arrives with the issue that moves the reservation in.
+  const contractAdapter: OwnedRunAdapter = {
+    name: "PlanningRun",
+    start(_baseUrl, key, { faults, totalMs }) {
+      const label = labels.find((l) => key.startsWith(`contract-${l}-`));
+      if (!label) throw new Error(`no variant in key ${key}`);
+      const runId = `job-${key}`;
+      const launch = async () => ({ outcome: "accepted", jobId: runId }) as PlanningLaunchResult;
+      const sc: Scenario = {
+        launchResult: { outcome: "accepted", jobId: runId }, runId, launched: false, launchCalls: 0, findCalls: 0, readCalls: 0,
+        stopCalls: [], finishCalls: [], finishThrows: false, status: "started", calls: ["reserve"], faults,
+        launchImpl: faults.crashAfterLaunch ? crashAfterFirstCall(launch) : launch,
+      };
+      scenarios.set(key, sc);
+      // A short total deadline needs the seam set built for it; the others hold the run until `finish`.
+      const envs = totalMs <= 5_000 ? deadline : slow;
+      const input: PlanningRunInput = { dispatchId: key, teamKey: "ENG", issueId: `issue-${key}`, issueIdentifier: "ENG-1", planningContext: {}, backend: "github-actions" };
+      const done = callWorkflow(baseUrl(envs, label), "PlanningRun", key, "run", input);
+      done.catch(() => undefined);
+      return {
+        runId,
+        done,
+        read: async () => {
+          const status = await callWorkflow<PlanningRunStatusResult>(baseUrl(envs, label), "PlanningRun", key, "status");
+          return { step: status.step === "wait" ? "waiting" : status.step };
+        },
+        finish: async () => {
+          sc.status = "ended";
+          await callWorkflow(baseUrl(envs, label), "PlanningRun", key, "report");
+        },
+      };
+    },
+    calls: (key) => [...scenarioOf(key).calls],
+  };
+
+  registerOwnedRunContract(contractAdapter, (label) => {
+    const env = slow.get(label);
+    if (!env) throw new Error(`missing Restate variant ${label}`);
+    return env;
+  }, { pending: { 4: "AII-1065 moves the reservation into the workflow" } });
 });

@@ -12,10 +12,10 @@ import { getRunnerMode } from "../runner-mode.js";
 import type { TicketIssue, TicketingProvider } from "../providers/types.js";
 import { defaultFetchSignal, cancelWorkflowRun, getWorkflowRunStatus } from "../github.js";
 import { getInstallationToken } from "../github-app-auth.js";
-import { findLogIdByDispatchId, getJobByDispatchId, updateJobRunId, updateJobStatus } from "../log.js";
+import { findLogIdByDispatchId, getJobByDispatchId, getStuckAttemptStampedAt, updateJobRunId, updateJobStatus, type Job } from "../log.js";
 import { planningSessionName, type launchPlanningRun, type launchPlanningSession, type preparePlanningLaunch } from "../planning-launch.js";
-import { listMachines } from "../fly-machines.js";
-import { findLocalContainerIdByName } from "../local-docker.js";
+import { destroyMachine, listMachines } from "../fly-machines.js";
+import { findLocalContainerIdByName, removeLocalContainer } from "../local-docker.js";
 import { remediateFailedJob, type StuckWatchdogConfig } from "../stuck-watchdog.js";
 import type { RestateService } from "./endpoint.js";
 import type { OwnedRunStatus } from "./owned-run-wait.js";
@@ -53,6 +53,8 @@ export interface PlanningRunProductionInput {
   launchPlanningRun: typeof launchPlanningRun;
   /** The Fly Machines / local Docker launch (AII-1053). */
   launchPlanningSession: typeof launchPlanningSession;
+  /** `reportTerminalJob` from `src/index.ts`, called as an owner call: the completion notice, failure comment, and breaker count. */
+  reportTerminalJob: (job: Job) => Promise<void>;
   /** The `index.ts` helpers `launchPlanningSession` takes, passed in to avoid an import cycle. */
   sessionDeps: Parameters<typeof launchPlanningSession>[0]["deps"];
 }
@@ -211,15 +213,40 @@ export function createProductionPlanningRunServices(input: PlanningRunProduction
     const job = getJobByDispatchId(dispatchId);
     if (!job) return;
     const status = outcome.kind === "deadline" ? "timed_out" : "failed";
-    const conclusion = outcome.kind === "deadline" ? "deadline_exceeded" : "ended_without_callback";
+    const conclusion =
+      outcome.kind === "deadline" ? "deadline_exceeded" : outcome.kind === "cancelled" ? "workflow_cancelled" : "ended_without_callback";
     // A terminal row closed by the planning callback needs no handling. A row carrying this function's own marker
     // means an earlier attempt closed it and then threw before the handling finished, so the retry runs it again.
-    const closedByThisStep = job.conclusion === "deadline_exceeded" || job.conclusion === "ended_without_callback";
+    const closedByThisStep = job.conclusion === "deadline_exceeded" || job.conclusion === "ended_without_callback" || job.conclusion === "workflow_cancelled";
     if (TERMINAL_JOB_STATUSES.has(job.status) && !closedByThisStep) return;
+    // The handling counts one stuck attempt, and it is the first thing it does: an attempt stamped since this
+    // dispatch began means an earlier attempt of this step already ran it, so a retry must not count a second one.
+    if (closedByThisStep && job.issueId && (getStuckAttemptStampedAt(job.issueId) ?? 0) >= job.dispatchedAt) return;
     if (!TERMINAL_JOB_STATUSES.has(job.status)) updateJobStatus(job.id, status, conclusion);
     const mapping = job.teamKey ? getMapping(job.teamKey) : undefined;
     const provider = mapping ? await input.resolveProvider(mapping) : null;
     await remediateFailedJob(watchdogConfig, provider, { ...job, status, conclusion }, conclusion, { ownerCall: true });
+  }
+
+  async function cleanup(run: PlanningRunInput, jobId: string): Promise<void> {
+    try {
+      if (run.backend === "fly-machines") {
+        if (!config.flySessionsToken || !config.flySessionsApp) throw new Error("FLY_SESSIONS_TOKEN + FLY_SESSIONS_APP are not configured");
+        await destroyMachine(config.flySessionsToken, config.flySessionsApp, jobId);
+      } else if (run.backend === "local-docker") {
+        await removeLocalContainer(jobId);
+      }
+    } catch (err) {
+      // A machine or container that is already gone is the goal of the step, so a retry succeeds.
+      const message = err instanceof Error ? err.message : String(err);
+      if (/\(404\)|no such container/i.test(message)) return;
+      throw err;
+    }
+  }
+
+  async function onOutcome(dispatchId: string): Promise<void> {
+    const job = getJobByDispatchId(dispatchId);
+    if (job) await input.reportTerminalJob(job);
   }
 
   const deps: PlanningRunDependencies = {
@@ -228,6 +255,8 @@ export function createProductionPlanningRunServices(input: PlanningRunProduction
     readStatus,
     stop,
     finishJob,
+    cleanup,
+    onOutcome,
     release: (dispatchId, reason) => {
       releaseByDispatchId(dispatchId, reason);
     },

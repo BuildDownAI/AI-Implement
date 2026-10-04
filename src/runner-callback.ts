@@ -14,6 +14,7 @@ import { describeReferenceRepoCause, type ReferenceRepoResult } from "./referenc
 import type { TicketingProvider } from "./providers/types.js";
 import { remediateFailedJob, type StuckWatchdogConfig } from "./stuck-watchdog.js";
 import { verifyAndConsumeRunToken, verifyPreparedReviewFixToken, verifyRunToken } from "./runner-tokens.js";
+import { read as readAdmission } from "./dispatch-admission.js";
 import { getStepsByJobId, upsertStepRecord } from "./step-log.js";
 import { acceptReviewFixWebhookEvent, getReviewFixDispatchSnapshot } from "./review-fix-queue.js";
 import {
@@ -903,6 +904,21 @@ export async function handleRunnerResult(
         if (job && commented) markJobFailureCommented(job.id);
       } catch (err) {
         warn("markPlanningFailed", err);
+      }
+      if (job) {
+        // A Restate-owned run has no monitor to close its row, and the workflow takes `report` as proof
+        // the callback closed it, so the callback writes the failure here. The backend may still be
+        // running, so the reservation stays held (as in the success branch below).
+        if (readAdmission(claims.dispatchId)?.lifecycleOwner.kind === "restate") {
+          updateJobStatus(job.id, "failed", failure?.code ?? input.body.failureCode ?? "planning_failed", undefined, { skipAdmissionRelease: true });
+        }
+        if (input.checkPlanningAdmissionTermination) {
+          try {
+            await input.checkPlanningAdmissionTermination(claims.dispatchId);
+          } catch (err) {
+            warn("checkPlanningAdmissionTermination", err);
+          }
+        }
       }
     } else if (input.body.phase === "implementation") {
       const isOperatorCancelled = input.body.failureCode === "OPERATOR_CANCELLED";

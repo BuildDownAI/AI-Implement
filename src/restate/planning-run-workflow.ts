@@ -15,6 +15,7 @@ import { serde } from "@restatedev/restate-sdk-zod";
 import { z } from "zod";
 import type { DispatchAdmissionReleaseReason } from "../dispatch-admission.js";
 import { PLANNING_TTL_SECONDS } from "../runner-tokens.js";
+import { cleanupOwnedRun, readOwnedRunStatus, reportOwnedRunOutcome } from "./owned-run-lifecycle.js";
 import { awaitOwnedRun, type OwnedRunStatus } from "./owned-run-wait.js";
 
 /** One shared retention constant, the same pattern as `KG_REFRESH_RETENTION_MS`. */
@@ -53,7 +54,7 @@ export interface PlanningLaunchResult {
   jobId?: string;
 }
 
-export type PlanningFinishOutcome = { kind: "run_ended" } | { kind: "deadline" };
+export type PlanningFinishOutcome = { kind: "run_ended" } | { kind: "deadline" } | { kind: "cancelled" };
 
 export interface PlanningRunStatusResult {
   step: string | null;
@@ -77,6 +78,10 @@ export interface PlanningRunDependencies {
   stop(input: PlanningRunInput, jobId: string): Promise<boolean>;
   /** Closes the job row when the callback did not. */
   finishJob(dispatchId: string, outcome: PlanningFinishOutcome): void | Promise<void>;
+  /** Removes the machine or container of the exact run after it ended (a no-op on GitHub Actions). Safe to run twice. */
+  cleanup(input: PlanningRunInput, jobId: string): void | Promise<void>;
+  /** The completion notice, failure comment, and breaker count for the job row of this dispatch. Once-only per dispatch. */
+  onOutcome(dispatchId: string): void | Promise<void>;
   release(dispatchId: string, reason: DispatchAdmissionReleaseReason): void | Promise<void>;
   /** Test seams: production leaves every one of these unset. */
   tickMs?: number;
@@ -105,6 +110,13 @@ export function createPlanningRunWorkflow(deps: PlanningRunDependencies) {
 
     let releaseStarted = false;
     let suspended = false;
+    // Set when the `dispatch` step started and did not return `rejected`: a run may exist.
+    let mayHaveLaunched = false;
+    let currentJobId: string | null = null;
+    let stopTried = false;
+    let rowCloseTried = false;
+    let wrapStarted = false;
+    let dispatchedAtForEscape = 0;
     let pendingReason: DispatchAdmissionReleaseReason | null = null;
 
     async function release(reason: DispatchAdmissionReleaseReason): Promise<PlanningRunResult> {
@@ -115,8 +127,64 @@ export function createPlanningRunWorkflow(deps: PlanningRunDependencies) {
       return { reason };
     }
 
+    /** Cleanup, then the outcome one time, for a run that was launched; each step name is journaled once. */
+    async function wrapUp(): Promise<void> {
+      wrapStarted = true;
+      const id = currentJobId;
+      if (id !== null) {
+        ctx.set("step", "cleanup");
+        await cleanupOwnedRun(ctx, () => deps.cleanup(input, id));
+      }
+      ctx.set("step", "outcome");
+      await reportOwnedRunOutcome(ctx, () => deps.onOutcome(dispatchId));
+    }
+
+    async function wrapUpAndRelease(reason: DispatchAdmissionReleaseReason): Promise<PlanningRunResult> {
+      await wrapUp();
+      return release(reason);
+    }
+
+    /** An escape after a launch: stop the run when its id is known, close the row, wrap up. Best effort throughout. */
+    async function escape(): Promise<void> {
+      if (currentJobId === null) {
+        // A `dispatch` step that used all attempts may have launched: one bounded lookup for the id.
+        try {
+          const found = await ctx.run("find-escape", () => deps.findExistingRun(input, dispatchedAtForEscape), { maxRetryAttempts: 3 });
+          if (found !== null) {
+            currentJobId = found;
+            ctx.set("jobId", found);
+          }
+        } catch (err) {
+          if (restate.internal.isSuspendedError(err)) throw err;
+          ctx.console.error(`[planning-run] find after escape failed dispatch=${dispatchId}`);
+        }
+      }
+      const id = currentJobId;
+      if (id !== null && !stopTried) {
+        stopTried = true;
+        try {
+          await ctx.run("stop-escape", () => deps.stop(input, id), { maxRetryAttempts: 3 });
+        } catch (err) {
+          if (restate.internal.isSuspendedError(err)) throw err;
+          ctx.console.error(`[planning-run] stop after escape failed dispatch=${dispatchId}`);
+        }
+      }
+      if (!rowCloseTried) {
+        rowCloseTried = true;
+        try {
+          await ctx.run("finish-job-escape", () => deps.finishJob(dispatchId, { kind: "cancelled" }), { maxRetryAttempts: 3 });
+        } catch (err) {
+          if (restate.internal.isSuspendedError(err)) throw err;
+          ctx.console.error(`[planning-run] closing the job row after escape failed dispatch=${dispatchId}`);
+        }
+      }
+      if (!wrapStarted) await wrapUp();
+    }
+
     try {
       const dispatchedAt = await ctx.date.now();
+      dispatchedAtForEscape = dispatchedAt;
+      mayHaveLaunched = true;
       const launched = await ctx.run(
         "dispatch",
         async (): Promise<PlanningLaunchResult> => {
@@ -129,10 +197,16 @@ export function createPlanningRunWorkflow(deps: PlanningRunDependencies) {
         { maxRetryAttempts: 3 },
       );
 
-      if (launched.outcome === "rejected") return await release("launch_rejected");
+      if (launched.outcome === "rejected") {
+        mayHaveLaunched = false;
+        return await release("launch_rejected");
+      }
 
       let jobId: string | null = launched.jobId ?? null;
-      if (jobId !== null) ctx.set("jobId", jobId);
+      if (jobId !== null) {
+        currentJobId = jobId;
+        ctx.set("jobId", jobId);
+      }
       const bootstrapDeadlineAt = dispatchedAt + bootstrapMs;
       const totalDeadlineAt = dispatchedAt + totalMs;
 
@@ -149,15 +223,23 @@ export function createPlanningRunWorkflow(deps: PlanningRunDependencies) {
           return "started";
         }
         if (jobId === null) {
-          const found = await ctx.run(`find-${findIndex++}`, () => deps.findExistingRun(input, dispatchedAt));
+          // A find that fails on each attempt counts as "not found yet"; the wait goes on to its deadline.
+          let found: string | null = null;
+          try {
+            found = await ctx.run(`find-${findIndex++}`, () => deps.findExistingRun(input, dispatchedAt), { maxRetryAttempts: 3 });
+          } catch (err) {
+            if (restate.internal.isSuspendedError(err)) throw err;
+            ctx.console.error(`[planning-run] find failed dispatch=${dispatchId}: ${err instanceof Error ? err.message : String(err)}`);
+          }
           if (found !== null) {
             jobId = found;
+            currentJobId = found;
             ctx.set("jobId", found);
           }
           return "unknown";
         }
         const id = jobId;
-        return ctx.run(`read-${readIndex++}`, () => deps.readStatus(input, id));
+        return readOwnedRunStatus(ctx, `read-${readIndex++}`, () => deps.readStatus(input, id));
       };
 
       /** The run ended: a `report` already in the promise means the callback closed the job row. */
@@ -165,9 +247,10 @@ export function createPlanningRunWorkflow(deps: PlanningRunDependencies) {
         const reportNow = reported || (await ctx.promise<{ ok: true }>("report").peek()) !== undefined;
         if (!reportNow) {
           pendingReason = "finalized";
+          rowCloseTried = true;
           await ctx.run("finish-job", () => deps.finishJob(dispatchId, { kind: "run_ended" }), { maxRetryAttempts: 3 });
         }
-        return release("finalized");
+        return wrapUpAndRelease("finalized");
       }
 
       async function deadlinePath(): Promise<PlanningRunResult> {
@@ -175,6 +258,7 @@ export function createPlanningRunWorkflow(deps: PlanningRunDependencies) {
         ctx.set("step", "stop");
         if (jobId !== null) {
           const id = jobId;
+          stopTried = true;
           try {
             const stopped = await ctx.run("stop", () => deps.stop(input, id), { maxRetryAttempts: 3 });
             ctx.console.log(`[planning-run] stop after deadline dispatch=${dispatchId} stopped=${stopped}`);
@@ -195,8 +279,9 @@ export function createPlanningRunWorkflow(deps: PlanningRunDependencies) {
             readStatus,
           });
         }
+        rowCloseTried = true;
         await ctx.run("finish-job-deadline", () => deps.finishJob(dispatchId, { kind: "deadline" }), { maxRetryAttempts: 3 });
-        return release("deadline_exceeded");
+        return wrapUpAndRelease("deadline_exceeded");
       }
 
       for (;;) {
@@ -253,6 +338,7 @@ export function createPlanningRunWorkflow(deps: PlanningRunDependencies) {
       // Every escape owes the reservation a release; a suspension is not an escape, and a release
       // step that already ran (and failed) is not journaled a second time.
       if (!suspended && !releaseStarted) {
+        if (mayHaveLaunched) await escape();
         await release(pendingReason ?? "cancelled");
       }
     }
