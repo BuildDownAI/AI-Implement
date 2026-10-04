@@ -171,7 +171,7 @@ describe("production deps", () => {
   const launchResult = { outcome: "accepted" as const, runId: 4242 };
   const prepared = { ghToken: "secret-gh-token", runnerImage: undefined, planningSentBaseBranch: false, planningContract: "envelope", planningDispatchInputs: {} };
   const issue = { id: "i-1", identifier: "ENG-1", scopeKey: "ENG" };
-  const provider = { findByKey: vi.fn() };
+  const provider = { findByKey: vi.fn(), clearWorkingState: vi.fn().mockResolvedValue(true) };
 
   function deps(overrides: Partial<PlanningRunProductionInput> = {}) {
     const input: PlanningRunProductionInput = {
@@ -453,12 +453,14 @@ describe("production deps", () => {
       expect(call[4]).toEqual({ ownerCall: true });
     });
 
-    it("closes an in-flight row as operator_cancelled after an invocation cancel, with no failure handling", async () => {
+    it("closes an in-flight row as operator_cancelled after an invocation cancel, clears the working state, and runs no failure handling", async () => {
       vi.mocked(getJobByDispatchId).mockReturnValue(row as never);
       const { d } = compose();
       await d.finishJob("d-1", { kind: "cancelled" });
       expect(updateJobStatus).toHaveBeenCalledWith(7, "failed", "operator_cancelled");
       expect(remediateFailedJob).not.toHaveBeenCalled();
+      // The planning label is cleared, so the ticket does not stay blocked in `AI-Planning`.
+      expect(provider.clearWorkingState).toHaveBeenCalledTimes(1);
     });
 
     it("does not count a second stuck attempt when a retry finds one stamped since the dispatch began", async () => {

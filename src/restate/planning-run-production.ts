@@ -219,6 +219,13 @@ export function createProductionPlanningRunServices(input: PlanningRunProduction
     // exempts from the breaker count, and add no stuck attempt. A retry finds the terminal row and does nothing.
     if (outcome.kind === "cancelled") {
       if (!TERMINAL_JOB_STATUSES.has(job.status)) updateJobStatus(job.id, "failed", "operator_cancelled");
+      // Clear the planning label, as the Legacy operator-cancel path does (`handleRunnerResult`), or the
+      // ticket stays in `AI-Planning` and no poll picks it up again. Safe to run twice; a throw retries the step.
+      const cancelledMapping = job.teamKey ? getMapping(job.teamKey) : undefined;
+      if (cancelledMapping && job.issueId) {
+        const cancelledProvider = await input.resolveProvider(cancelledMapping);
+        await cancelledProvider.clearWorkingState(job.issueId, job.teamKey ?? "");
+      }
       return;
     }
     const status = outcome.kind === "deadline" ? "timed_out" : "failed";

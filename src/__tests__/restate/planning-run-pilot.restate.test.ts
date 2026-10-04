@@ -798,6 +798,8 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
         expect(getJobByDispatchId(w.dispatchId)).toMatchObject({ status: "failed", conclusion: "operator_cancelled" });
         expect(breakerFailures(w.issue.id)).toBe(breakerBefore);
         expect(getStuckAttempts(w.issue.id)).toBe(stuckBefore);
+        // The ticket does not stay in `AI-Planning`: the working state is cleared, so a later poll can plan it again.
+        expect(clearedIssues).toContain(w.issue.id);
       } finally {
         gh.statusGate.release();
       }
