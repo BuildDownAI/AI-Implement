@@ -314,7 +314,7 @@ check that `workflows/claude-plan.yml`'s `run-name` contains `PLANNING_RUN_TITLE
 
 ## The owned-run contract suite (AII-1062)
 
-`src/__tests__/restate/owned-run-contract.ts` (not a `.test.ts` file, so vitest does not collect it) exports `registerOwnedRunContract(adapter, envFor)`. It registers five scenarios on both variants: a status read that fails on each attempt still reaches the deadline, stops the run, and releases; a crash after the launch adopts the run and launches once; a normal end runs `cleanup` with the run id, `outcome` once, then the release; a refused reservation launches, cleans up, and releases nothing; a failed `cleanup` and `outcome` still release. Scenarios hold the workflow with `waitForStep` and never sleep. See [ADR 036](adr/036-an-owned-run-lifecycle-is-one-kit-and-one-contract-suite.md).
+`src/__tests__/restate/owned-run-contract.ts` (not a `.test.ts` file, so vitest does not collect it) exports `registerOwnedRunContract(adapter, envFor)`. It registers five scenarios on both variants: a status read that fails on each attempt still reaches the deadline, stops the run, and releases; a crash after the launch adopts the run and launches once; a normal end runs `cleanup` with the run id, `outcome` once, then the release; a refused reservation launches nothing, cleans up nothing, and releases nothing; a failed `cleanup` and `outcome` still release. Scenarios hold the workflow with `waitForStep` and never sleep. See [ADR 036](adr/036-an-owned-run-lifecycle-is-one-kit-and-one-contract-suite.md).
 
 **What an adapter supplies** (`OwnedRunAdapter`):
 

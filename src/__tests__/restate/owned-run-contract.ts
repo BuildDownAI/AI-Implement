@@ -91,7 +91,7 @@ export function registerOwnedRunContract(adapter: OwnedRunAdapter, envFor: (labe
       expect(withoutStatus(adapter.calls(run.key))).toEqual(["reserve", "launch", `cleanup:${run.runId}`, "outcome", "release"]);
     }, 30_000);
 
-    it.each(labels)("4. a refused reservation launches, cleans up, and releases nothing (%s)", async (label) => {
+    it.each(labels)("4. a refused reservation launches nothing, cleans up nothing, and releases nothing (%s)", async (label) => {
       const run = begin(label, { faults: { refuseReservation: true }, totalMs: LONG_MS });
       await run.done;
       const calls = adapter.calls(run.key);

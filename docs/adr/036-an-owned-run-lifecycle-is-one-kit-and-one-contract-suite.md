@@ -25,7 +25,7 @@ A fact about `ctx.run` (confirmed for SDK 1.17.1): a step with no `maxRetryAttem
 
 **3. The caller's function must be safe to run twice.** The kit fixes the step name and the bound. It cannot make an effect idempotent. The reservation is check-then-take, keyed by the dispatch id, so a retry after a commit returns `true`. The launch checks for an existing run in the same step.
 
-**4. One contract suite proves the lifecycle.** `src/__tests__/restate/owned-run-contract.ts` exports `registerOwnedRunContract(adapter, envFor)`. An adapter says how to start the workflow, how to inject each fault, and how to read the calls it recorded. The five scenarios: a status read that fails on each attempt still reaches the deadline, stops, and releases; a crash after the launch adopts the run; a normal end runs `cleanup` with the run id, `outcome` once, then the release; a refused reservation launches, cleans up, and releases nothing; a failed `cleanup` and `outcome` still release. Each run kind runs the suite against its own workflow.
+**4. One contract suite proves the lifecycle.** `src/__tests__/restate/owned-run-contract.ts` exports `registerOwnedRunContract(adapter, envFor)`. An adapter says how to start the workflow, how to inject each fault, and how to read the calls it recorded. The five scenarios: a status read that fails on each attempt still reaches the deadline, stops, and releases; a crash after the launch adopts the run; a normal end runs `cleanup` with the run id, `outcome` once, then the release; a refused reservation launches nothing, cleans up nothing, and releases nothing; a failed `cleanup` and `outcome` still release. Each run kind runs the suite against its own workflow.
 
 ## The rule for a new run kind
 
