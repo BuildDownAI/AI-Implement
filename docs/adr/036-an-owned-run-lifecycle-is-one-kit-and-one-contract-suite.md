@@ -61,4 +61,3 @@ Two run kinds adopted the kit and the suite: `PlanningRun` (AII-1064, AII-1065, 
 * **Scenario 5** (a failed `cleanup` and `outcome` still release): `KgRefresh` has no `cleanup` step to fail.
 
 The AII-1058 gaps are closed in `PlanningRun`. The table above lists each fenced Legacy function by call site in [restate.md](../restate.md#the-owned-run-lifecycle-kit).
-

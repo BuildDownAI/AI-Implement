@@ -6,8 +6,7 @@ This pilot moves **automatic GitHub Actions review-fix attempts** to Restate. Th
 
 ## The switch also selects the planning lifecycle (AII-1021)
 
-The project's **Review-fix & Planning Lifecycle** switch (`reviewFixLifecycle`) also selects who owns a planning reservation. With `restate`, `dispatchPlanning` checks capacity without a reservation and submits `PlanningRun/{dispatchId}` through the loopback ingress. The workflow's `reserve` step takes the reservation (owner `restate`), launches the run, waits, and releases the reservation (at the latest at the planning deadline). `dispatchPlanning` never launches for such a project. With `legacy` or unset, the current path is unchanged on every backend. Implementation, gap-fill, and review-fix dispatch are not affected by this part of the switch.
-
+The project's **Review-fix & Planning Lifecycle** switch (`reviewFixLifecycle`) also selects who owns a planning reservation. With `restate`, `dispatchPlanning` checks capacity without a reservation and submits `PlanningRun/{dispatchId}` through the loopback ingress. The workflow's `reserve` step takes the reservation (owner `restate:<dispatchId>`), launches the run, waits, and releases the reservation (at the latest at the planning deadline). `dispatchPlanning` never launches for such a project. With `legacy` or unset, the current path is unchanged on every backend. Implementation, gap-fill, and review-fix dispatch are not affected by this part of the switch.
 
 **What an operator sees for a pilot planning run.** The result is the same as for a Legacy planning run:
 
