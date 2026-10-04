@@ -41,13 +41,7 @@ export async function readOwnedRunStatus(
   stepName: string,
   read: () => Promise<OwnedRunStatus> | OwnedRunStatus,
 ): Promise<OwnedRunStatus> {
-  try {
-    return await ctx.run(stepName, async () => read(), { maxRetryAttempts: STEP_ATTEMPTS });
-  } catch (err) {
-    if (restate.internal.isSuspendedError(err)) throw err;
-    ctx.console.error(`[owned-run] status read "${stepName}" failed after ${STEP_ATTEMPTS} attempts: ${describeError(err)}`);
-    return "unknown";
-  }
+  return readBoundedOwnedRun<OwnedRunStatus>(ctx, stepName, read, "unknown");
 }
 
 /**
