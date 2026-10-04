@@ -6,7 +6,17 @@ This pilot moves **automatic GitHub Actions review-fix attempts** to Restate. Th
 
 ## The switch also selects the planning lifecycle (AII-1021)
 
-The project's **Review-fix & Planning Lifecycle** switch (`reviewFixLifecycle`) also selects who owns a planning reservation. With `restate`, `dispatchPlanning` reserves with owner `restate:<dispatchId>` and submits `PlanningRun/{dispatchId}` through the loopback ingress; the workflow launches the run, waits, and releases the reservation (at the latest at the planning deadline). `dispatchPlanning` never launches for such a project. With `legacy` or unset, the current path is unchanged on every backend. Implementation, gap-fill, and review-fix dispatch are not affected by this part of the switch.
+The project's **Review-fix & Planning Lifecycle** switch (`reviewFixLifecycle`) also selects who owns a planning reservation. With `restate`, `dispatchPlanning` checks capacity without a reservation and submits `PlanningRun/{dispatchId}` through the loopback ingress. The workflow's `reserve` step takes the reservation (owner `restate:<dispatchId>`), launches the run, waits, and releases the reservation (at the latest at the planning deadline). `dispatchPlanning` never launches for such a project. With `legacy` or unset, the current path is unchanged on every backend. Implementation, gap-fill, and review-fix dispatch are not affected by this part of the switch.
+
+**What an operator sees for a pilot planning run.** The result is the same as for a Legacy planning run:
+
+- **Completion notice:** one notice when the run ends, from the `outcome` step.
+- **Failure comment:** a failed run gets the failure comment on the ticket.
+- **Breaker count:** one success or one failure is counted for each run, even when a step retries.
+- **No machine left:** the `cleanup` step removes the Fly machine or local container before the release. A cancel during the reserve or launch step is handled too: the escape path looks for a run the launch created, stops it, and releases the reservation (AII-1068).
+- **A stuck reservation:** list it with `list_dispatch_reservations` or the card on `/admin#deployments`, and release it with `release_dispatch_reservation` (AII-1069). A release without `force` needs a terminal job row or a run confirmed ended.
+
+See [restate.md](restate.md#the-planning-run) and [the fenced Legacy functions](restate.md#the-owned-run-lifecycle-kit).
 
 - **Restate unavailable** (sidecar not `ready` or endpoint not `registered`): no reservation and no dispatch. The poll logs `[poll] Planning for <key> skipped: Restate unavailable` and the ticket stays queued for the next poll. The poll loop takes no reservation for planning (the `PlanningRun` workflow reserves in its first step), so a `submit` that answers `unavailable` leaves nothing to release. A `conflict` answer leaves the reservation to the existing workflow.
 - **Fly Machines and local Docker:** the save check still requires execution mode `github-actions`, so a pilot project reaches Fly or local planning only through the global runner mode (`/admin#runners` or `POST /api/runner-mode`). The `PlanningRun` input names the backend from the resolved execution path, and the same workflow owns the reservation there.
