@@ -54,7 +54,7 @@ export function createPlanningRunIngressClient(
 
   return {
     submit: (dispatchId, input) =>
-      invoke(() => workflow(dispatchId).workflowSubmit(input)),
+      invoke(() => workflow(dispatchId).workflowSubmit(input, restateClients.rpc.sendOpts({ timeout }))),
     report: (dispatchId) => invoke(() => workflow(dispatchId).report(restateClients.rpc.opts({ timeout }))),
   };
 }

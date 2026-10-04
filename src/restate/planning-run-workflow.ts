@@ -15,7 +15,7 @@ import { serde } from "@restatedev/restate-sdk-zod";
 import { z } from "zod";
 import type { DispatchAdmissionReleaseReason } from "../dispatch-admission.js";
 import { PLANNING_TTL_SECONDS } from "../runner-tokens.js";
-import { cleanupOwnedRun, readBoundedOwnedRun, readOwnedRunStatus, reportOwnedRunOutcome } from "./owned-run-lifecycle.js";
+import { cleanupOwnedRun, readBoundedOwnedRun, readOwnedRunStatus, reportOwnedRunOutcome, reserveOwnedRun } from "./owned-run-lifecycle.js";
 import { awaitOwnedRun, type OwnedRunStatus } from "./owned-run-wait.js";
 
 /** One shared retention constant, the same pattern as `KG_REFRESH_RETENTION_MS`. */
@@ -63,11 +63,14 @@ export interface PlanningRunStatusResult {
 }
 
 export interface PlanningRunResult {
-  reason: DispatchAdmissionReleaseReason;
+  /** `refused`: the reservation was refused, so nothing launched and nothing was released. */
+  reason: DispatchAdmissionReleaseReason | "refused";
 }
 
 /** Plain functions, every one called inside `ctx.run` — none of them may call `ctx` themselves. */
 export interface PlanningRunDependencies {
+  /** Takes the reservation for this dispatch id: `true` when held, `false` when refused. Idempotent per dispatch id. */
+  reserve(input: PlanningRunInput): boolean | Promise<boolean>;
   /** The run or machine id of a launch that already happened for this dispatch, or `null`.
    *  `dispatchedAt` is the journaled dispatch time (epoch ms): a run created before it is not this launch. */
   findExistingRun(input: PlanningRunInput, dispatchedAt: number): Promise<string | null>;
@@ -106,6 +109,16 @@ export function createPlanningRunWorkflow(deps: PlanningRunDependencies) {
     }
     const dispatchId = input.dispatchId;
     ctx.set("dispatchId", dispatchId);
+    ctx.set("step", "reserve");
+
+    // The first step. A refusal returns before the `try`, so no `finally` releases a row this dispatch does not hold;
+    // a reserve step that fails every attempt throws here too, with nothing held.
+    const held = await reserveOwnedRun(ctx, () => deps.reserve(input));
+    if (!held) {
+      ctx.console.log(`[planning-run] reservation refused dispatch=${dispatchId} issue=${input.issueIdentifier}`);
+      ctx.set("step", "refused");
+      return { reason: "refused" };
+    }
     ctx.set("step", "dispatch");
 
     let releaseStarted = false;

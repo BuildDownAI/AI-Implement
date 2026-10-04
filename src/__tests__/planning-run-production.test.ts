@@ -30,6 +30,9 @@ vi.mock("../dispatch-admission.js", () => ({
   releaseByDispatchId: vi.fn(),
 }));
 
+vi.mock("../dispatch-gate.js", () => ({ acquireDispatch: vi.fn() }));
+
+import { acquireDispatch } from "../dispatch-gate.js";
 import { cancelWorkflowRun, getWorkflowRunStatus } from "../github.js";
 import { getJobByDispatchId, getStuckAttemptStampedAt, updateJobRunId, updateJobStatus } from "../log.js";
 import { read as readAdmission, releaseByDispatchId } from "../dispatch-admission.js";
@@ -197,6 +200,39 @@ describe("production deps", () => {
     vi.clearAllMocks();
     provider.findByKey.mockResolvedValue(issue);
     vi.mocked(readAdmission).mockReturnValue({ dispatchId: "d-1", generation: 3, releasedAt: null } as never);
+  });
+
+  describe("reserve", () => {
+    const grant = { ok: true, admissionGeneration: 1, release: () => {} };
+
+    it("calls acquireDispatch with the dispatch id and the Restate owner", async () => {
+      vi.mocked(acquireDispatch).mockReturnValue(grant as never);
+      const { d } = compose({ getMapping: (team) => (team === "ENG" ? ({ ...MAPPING, maxInProgressAiIssues: 3 } as RepoMapping) : undefined) });
+      expect(await d.reserve({ ...INPUT, backend: "fly-machines" })).toBe(true);
+      expect(acquireDispatch).toHaveBeenCalledWith({
+        dispatchId: "d-1", issueId: "i-1", issueIdentifier: "ENG-1", kind: "planning", teamKey: "ENG",
+        maxInProgressAiIssues: 3, backend: "fly-machines", lifecycleOwner: { kind: "restate", attemptId: "d-1" },
+      });
+    });
+
+    it("answers true on a second call with the same dispatch id (a step retry after a commit)", async () => {
+      vi.mocked(acquireDispatch).mockReturnValue(grant as never);
+      const { d } = compose();
+      expect(await d.reserve(INPUT)).toBe(true);
+      expect(await d.reserve(INPUT)).toBe(true);
+    });
+
+    it("answers false when the reservation is refused, including at team capacity", async () => {
+      vi.mocked(acquireDispatch).mockReturnValue({ ok: false, reason: "team_capacity", count: 1, cap: 1 } as never);
+      const { d } = compose();
+      expect(await d.reserve(INPUT)).toBe(false);
+    });
+
+    it("throws for a team with no mapping, so the step retries rather than refuses", async () => {
+      const { d } = compose();
+      await expect(async () => d.reserve({ ...INPUT, teamKey: "NOPE" })).rejects.toThrow(/no project mapping/);
+      expect(acquireDispatch).not.toHaveBeenCalled();
+    });
   });
 
   it("returns a service", () => {
