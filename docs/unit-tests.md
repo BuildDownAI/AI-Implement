@@ -127,10 +127,11 @@ When the test finishes, the database is closed, the previous `DEDUP_DB_PATH` is 
 **`fakeFetch`.** A route key is `"<METHOD> <path>"`, matched against the request path without its query string. A reply is one of:
 
 - `{ status?, json?, text?, headers? }`, built into a fresh `Response` for each request, with status 200 by default;
-- a function of the recorded request that returns such an object or a `Response` it builds, for state kept between requests or a reply that depends on headers or the query;
-- a list of either, served one per request, in order.
+- a function of the recorded request that returns such an object or a `Response` it builds, for state kept between requests or a reply that depends on headers or the query. A function that throws makes `fetch` reject with what it threw, the way a network failure rejects; the request is still recorded, and the throw alone does not fail the test;
+- `hangUntilAborted`, exported beside `fakeFetch`: a reply that never answers, and rejects with the abort's reason once the caller's signal fires, as `fetch` does. It proves a request is bounded by its timeout;
+- a list of any of these, served one per request, in order.
 
-Pass `fake.fetch` where a module takes `fetchImpl`, or call `fake.install()` when the code calls the global `fetch`; the original global comes back when the test finishes. Prefer `install()` to `vi.stubGlobal`, which stays in place until `vi.unstubAllGlobals()` because the vitest configs leave `unstubGlobals` off. `fake.calls` holds every request as received: method, URL, path, headers and body text. A request no route matches, or one past the end of its route's list, throws to the caller and also fails the test when it finishes, naming the method and path. Production code often catches a failed `fetch`, and the test must not pass because it did.
+Pass `fake.fetch` where a module takes `fetchImpl`, or call `fake.install()` when the code calls the global `fetch`; the original global comes back when the test finishes. Prefer `install()` to `vi.stubGlobal`, which stays in place until `vi.unstubAllGlobals()` because the vitest configs leave `unstubGlobals` off. `fake.calls` holds every request as received: method, URL, path, headers, body text, and the `AbortSignal` the caller passed, if any. A request no route matches, or one past the end of its route's list, throws to the caller and also fails the test when it finishes, naming the method and path. Production code often catches a failed `fetch`, and the test must not pass because it did.
 
 **When a test needs more.** Use what the harness offers first; a function reply covers most needs. Write the rest in the test file. A harness grows once three test files share the same new need, as a type gets a builder once three files build it.
 

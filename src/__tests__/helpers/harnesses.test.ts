@@ -5,7 +5,7 @@ import { dirname, join } from "node:path";
 import type Database from "better-sqlite3";
 import { testDir } from "./test-dir.js";
 import { testDb } from "./test-db.js";
-import { fakeFetch } from "./fake-fetch.js";
+import { fakeFetch, hangUntilAborted } from "./fake-fetch.js";
 
 // Cleanup runs after a test ends, so each "is gone" check lives in the test after the one that
 // created the directory. Tests in a file run in order unless marked concurrent, and none here is.
@@ -247,6 +247,65 @@ describe("fakeFetch", () => {
     const listed = await (await api.fetch(`${API}/issues/42/comments?per_page=100`)).json();
 
     expect(listed).toEqual([{ body: "first" }]);
+  });
+
+  it("records the signal the caller passed, and none when it passed none", async () => {
+    const api = fakeFetch({ "GET /ping": { text: "pong" } });
+    const controller = new AbortController();
+
+    await api.fetch(`${API}/ping`, { signal: controller.signal });
+    await api.fetch(`${API}/ping`);
+
+    expect(api.calls[0].signal).toBe(controller.signal);
+    expect(api.calls[1].signal).toBeUndefined();
+  });
+
+  it("lets a function reply that throws reject the request like a network error, without failing the test", async () => {
+    const api = fakeFetch({
+      "GET /down": () => {
+        throw new TypeError("fetch failed");
+      },
+    });
+
+    await expect(api.fetch(`${API}/down`)).rejects.toThrow(new TypeError("fetch failed"));
+    expect(api.calls).toHaveLength(1);
+  });
+
+  describe("hangUntilAborted", () => {
+    it("rejects with the abort's reason once the caller aborts", async () => {
+      const api = fakeFetch({ "POST /register": hangUntilAborted });
+      const controller = new AbortController();
+      const reason = new Error("deadline");
+
+      const pending = api.fetch(`${API}/register`, { method: "POST", signal: controller.signal });
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      controller.abort(reason);
+
+      await expect(pending).rejects.toBe(reason);
+    });
+
+    it("rejects at once when the signal has already fired, with a timeout's own reason", async () => {
+      const api = fakeFetch({ "GET /slow": hangUntilAborted });
+      const signal = AbortSignal.timeout(1);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      await expect(api.fetch(`${API}/slow`, { signal })).rejects.toBe(signal.reason);
+      expect((signal.reason as Error).name).toBe("TimeoutError");
+    });
+
+    it("stays pending when the caller passed no signal", async () => {
+      const api = fakeFetch({ "GET /stall": hangUntilAborted });
+
+      const outcome = await Promise.race([
+        api.fetch(`${API}/stall`).then(
+          () => "settled",
+          () => "settled",
+        ),
+        new Promise((resolve) => setTimeout(() => resolve("pending"), 20)),
+      ]);
+
+      expect(outcome).toBe("pending");
+    });
   });
 
   describe("a request with no route", () => {

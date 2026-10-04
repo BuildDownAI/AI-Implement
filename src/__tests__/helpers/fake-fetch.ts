@@ -15,6 +15,9 @@ export interface FetchCall {
   headers: Headers;
   /** The request body as text; empty when there is none. */
   body: string;
+  /** The caller's `AbortSignal`: `init.signal`, else the signal of a `Request` passed as input, else undefined.
+   *  Read from the caller's arguments, because the `Request` built here carries a signal even when the caller passed none. */
+  signal: AbortSignal | undefined;
 }
 
 /** A response to build fresh for each request: `json` is serialized, otherwise `text` is sent as is. */
@@ -32,6 +35,15 @@ export type Reply = ReplyInit | ((call: FetchCall) => Response | ReplyInit | Pro
 
 /** Keys are `"<METHOD> <path>"`. A list of replies is served in order, one per request. */
 export type Routes = Partial<Record<`${Method} /${string}`, Reply | Reply[]>>;
+
+/** A reply that never answers on its own, for proving a request is bounded by its timeout.
+ *  It rejects with the signal's reason once the caller aborts, as `fetch` does, and stays pending when no signal was passed. */
+export const hangUntilAborted: Reply = ({ signal }) =>
+  new Promise<never>((_resolve, reject) => {
+    if (!signal) return;
+    if (signal.aborted) return reject(signal.reason);
+    signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+  });
 
 export interface FakeFetch {
   fetch: typeof fetch;
@@ -60,7 +72,8 @@ export function fakeFetch(routes: Routes): FakeFetch {
   const fakeFetchImpl: typeof fetch = async (input, init) => {
     const request = new Request(input, init);
     const url = new URL(request.url);
-    const call: FetchCall = { method: request.method, url, path: url.pathname, headers: request.headers, body: await request.text() };
+    const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
+    const call: FetchCall = { method: request.method, url, path: url.pathname, headers: request.headers, body: await request.text(), signal };
     calls.push(call);
 
     const key = `${call.method} ${call.path}`;
