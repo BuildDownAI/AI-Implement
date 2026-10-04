@@ -152,20 +152,26 @@ export function createPlanningRunWorkflow(deps: PlanningRunDependencies) {
     let currentJobId: string | null = null;
     let stopTried = false;
     let rowCloseTried = false;
-    let wrapStarted = false;
+    let cleanupStarted = false;
+    let outcomeStarted = false;
+    // Set when the run is known to have ended (`endedPath`, `deadlinePath`): an escape then does not stop it.
+    let runEnded = false;
     let dispatchedAtForEscape = 0;
     let pendingReason: DispatchAdmissionReleaseReason | null = null;
 
     /** Cleanup, then the outcome one time, for a run that was launched; each step name is journaled once. */
     async function wrapUp(): Promise<void> {
-      wrapStarted = true;
       const id = currentJobId;
-      if (id !== null) {
+      if (id !== null && !cleanupStarted) {
+        cleanupStarted = true;
         ctx.set("step", "cleanup");
         await cleanupOwnedRun(ctx, () => deps.cleanup(input, id));
       }
-      ctx.set("step", "outcome");
-      await reportOwnedRunOutcome(ctx, () => deps.onOutcome(dispatchId));
+      if (!outcomeStarted) {
+        outcomeStarted = true;
+        ctx.set("step", "outcome");
+        await reportOwnedRunOutcome(ctx, () => deps.onOutcome(dispatchId));
+      }
     }
 
     async function wrapUpAndRelease(reason: DispatchAdmissionReleaseReason): Promise<PlanningRunResult> {
@@ -198,7 +204,7 @@ export function createPlanningRunWorkflow(deps: PlanningRunDependencies) {
         }
       }
       const id = currentJobId;
-      if (id !== null && !stopTried) {
+      if (id !== null && !stopTried && !runEnded) {
         stopTried = true;
         try {
           await ctx.run("stop-escape", () => deps.stop(input, id), { maxRetryAttempts: 3 });
@@ -216,7 +222,7 @@ export function createPlanningRunWorkflow(deps: PlanningRunDependencies) {
           ctx.console.error(`[planning-run] closing the job row after escape failed dispatch=${dispatchId}`);
         }
       }
-      if (!wrapStarted) await wrapUp();
+      await wrapUp();
     }
 
     try {
@@ -276,6 +282,7 @@ export function createPlanningRunWorkflow(deps: PlanningRunDependencies) {
 
       /** The run ended: a `report` already in the promise means the callback closed the job row. */
       async function endedPath(): Promise<PlanningRunResult> {
+        runEnded = true;
         const reportNow = reported || (await ctx.promise<{ ok: true }>("report").peek()) !== undefined;
         if (!reportNow) {
           pendingReason = "finalized";
@@ -290,13 +297,14 @@ export function createPlanningRunWorkflow(deps: PlanningRunDependencies) {
         ctx.set("step", "stop");
         if (jobId !== null) {
           const id = jobId;
-          stopTried = true;
           try {
             const stopped = await ctx.run("stop", () => deps.stop(input, id), { maxRetryAttempts: 3 });
+            stopTried = true;
             ctx.console.log(`[planning-run] stop after deadline dispatch=${dispatchId} stopped=${stopped}`);
           } catch (err) {
             if (restate.internal.isSuspendedError(err)) throw err;
             if (!(err instanceof restate.TerminalError) || err.code === 409) throw err;
+            stopTried = true;
             ctx.console.error(`[planning-run] stop failed dispatch=${dispatchId}: ${err.message}`);
           }
           // The helper returns at `ended` or at the margin; either way the deadline outcome stands.
@@ -312,6 +320,7 @@ export function createPlanningRunWorkflow(deps: PlanningRunDependencies) {
           });
         }
         rowCloseTried = true;
+        runEnded = true;
         await ctx.run("finish-job-deadline", () => deps.finishJob(dispatchId, { kind: "deadline" }), { maxRetryAttempts: 3 });
         return wrapUpAndRelease("deadline_exceeded");
       }
@@ -368,10 +377,22 @@ export function createPlanningRunWorkflow(deps: PlanningRunDependencies) {
       throw err;
     } finally {
       // Every escape owes the reservation a release; a suspension is not an escape, and a release
-      // step that already ran (and failed) is not journaled a second time.
+      // step that already ran (and failed) is not journaled a second time. An error from the escape
+      // (a second cancel) does not skip the release; it is re-thrown after it.
       if (!suspended && !releaseStarted) {
-        if (mayHaveLaunched) await escape();
+        let escapeFailed = false;
+        let escapeError: unknown;
+        if (mayHaveLaunched) {
+          try {
+            await escape();
+          } catch (err) {
+            if (restate.internal.isSuspendedError(err)) throw err;
+            escapeFailed = true;
+            escapeError = err;
+          }
+        }
         await release(pendingReason ?? "cancelled");
+        if (escapeFailed) throw escapeError;
       }
     }
   }

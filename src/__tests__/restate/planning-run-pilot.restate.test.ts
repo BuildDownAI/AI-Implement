@@ -166,8 +166,12 @@ const backends = {
     if (!state) throw new Error(`Failed to get machine ${id} (404): not found`);
     return { id, state };
   },
+  /** Parks the first machine destroy (the `cleanup` step on Fly) until the test releases it. */
+  destroyGate: undefined as Gate | undefined,
   async flyDestroy(id: string) {
     this.destroyCalls.push(id);
+    const g = this.destroyGate;
+    if (g && !g.isReached()) await g.wait();
     this.machines.set(id, "destroyed");
   },
   async dockerInspect(id: string) {
@@ -187,7 +191,7 @@ const backends = {
   },
   reset() {
     this.machines.clear(); this.containers.clear(); this.created = 0; this.names.clear(); this.crashBeforeRow = false; this.destroyCalls = []; this.stopCalls = []; this.removeCalls = [];
-    this.inspectError = undefined; this.crashNextLaunch = false;
+    this.inspectError = undefined; this.crashNextLaunch = false; this.destroyGate = undefined;
   },
 };
 const NONCE = "nonce-must-not-leak";
@@ -777,6 +781,43 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
       } finally {
         launchGate.release();
       }
+    }, 60_000);
+
+    it.each(labels)("an invocation cancel after a launch leaves the planning breaker count and the stuck attempts unchanged (%s)", async (label) => {
+      gh.statusGate = gate("first status read");
+      const w = await dispatch(label, "PLT-65");
+      try {
+        await gh.statusGate.reached();
+        await waitForStep(w.read, "wait");
+        const stuckBefore = getStuckAttempts(w.issue.id);
+        const breakerBefore = breakerFailures(w.issue.id);
+        await cancelRun(label, w.dispatchId);
+        await untilReleased(w.dispatchId);
+        expect(readAdmission(w.dispatchId)).toMatchObject({ releaseReason: "cancelled" });
+        expect(gh.cancelCalls).toEqual([gh.runs[0].id]);
+        expect(getJobByDispatchId(w.dispatchId)).toMatchObject({ status: "failed", conclusion: "operator_cancelled" });
+        expect(breakerFailures(w.issue.id)).toBe(breakerBefore);
+        expect(getStuckAttempts(w.issue.id)).toBe(stuckBefore);
+        // The ticket does not stay in `AI-Planning`: the working state is cleared, so a later poll can plan it again.
+        expect(clearedIssues).toContain(w.issue.id);
+      } finally {
+        gh.statusGate.release();
+      }
+    }, 60_000);
+
+    it.each(labels)("a second cancel during cleanup in the escape path still releases the reservation (%s)", async (label) => {
+      backends.destroyGate = gate("machine destroy");
+      const w = await dispatch(label, "PLT-66", "fly-machines");
+      try {
+        await waitForStep(w.read, "wait");
+        await cancelRun(label, w.dispatchId);
+        await backends.destroyGate.reached();
+        await cancelRun(label, w.dispatchId);
+      } finally {
+        backends.destroyGate.release();
+      }
+      await untilReleased(w.dispatchId);
+      expect(readAdmission(w.dispatchId)).toMatchObject({ releaseReason: "cancelled" });
     }, 60_000);
 
     it.each(labels)("a cancel during the reserve step releases the reservation of the dispatch id (%s)", async (label) => {

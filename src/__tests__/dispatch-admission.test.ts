@@ -854,6 +854,26 @@ describe("listHeldReservations / releaseHeldReservation (AII-1069)", () => {
     expect(admission.listHeldReservations()[0]).toMatchObject({ jobStatus: null, jobConclusion: null, issueIdentifier: null });
   });
 
+  it("refuses a terminal job row without confirmation, releases it once confirmed, and with force either way", async () => {
+    const log = await import("../log.js");
+    log.initLogTable();
+    admission.acquire(issueRequest());
+    const id = log.appendLog({ issueId: "AII-1", dispatchId: "dispatch-1", repo: "o/r" });
+    log.updateJobStatus(id, "completed", "planning_callback");
+    const refused = await admission.releaseHeldReservation("dispatch-1", { force: false, confirmTerminated: never });
+    expect(refused).toMatchObject({ status: "refused" });
+    expect((refused as { reason: string }).reason).toMatch(/completed/);
+    expect((refused as { reason: string }).reason).toMatch(/force/);
+    expect(admission.read("dispatch-1")?.releasedAt).toBeNull();
+
+    const confirmed = await admission.releaseHeldReservation("dispatch-1", { force: false, confirmTerminated: async () => true });
+    expect(confirmed).toMatchObject({ status: "released", forced: false, basis: "backend_confirmed" });
+
+    admission.acquire(issueRequest());
+    const forced = await admission.releaseHeldReservation("dispatch-1", { force: true, confirmTerminated: never });
+    expect(forced).toMatchObject({ status: "released", forced: true, basis: "forced" });
+  });
+
   it("releases with force and reports nothing to release afterwards", async () => {
     admission.acquire(issueRequest());
     const first = await admission.releaseHeldReservation("dispatch-1", { force: true, confirmTerminated: never });

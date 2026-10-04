@@ -998,7 +998,7 @@ export const listDispatchReservationsTool = tool(
 );
 
 export const RELEASE_DISPATCH_RESERVATION_DESCRIPTION =
-  "Release a stuck dispatch reservation (admin role), with reason 'cancelled'. Without force it releases only when the job row is terminal or the backend run is confirmed ended, and otherwise refuses with a reason and leaves the row held. With force=true it releases with no confirmation — use only when you know the run is dead. A missing or already-released dispatch id changes nothing. A Restate-owned row's workflow later answers not_owner on its own release and ends.";
+  "Release a stuck dispatch reservation (admin role), with reason 'cancelled'. Without force it releases only when the backend run is confirmed ended (a terminal job row alone is not enough), and otherwise refuses with a reason and leaves the row held. With force=true it releases with no confirmation — use only when you know the run is dead. A missing or already-released dispatch id changes nothing. A Restate-owned row's workflow later answers not_owner on its own release and ends.";
 
 export const releaseDispatchReservationTool = tool(
   {

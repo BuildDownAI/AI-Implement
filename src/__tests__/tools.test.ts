@@ -1457,14 +1457,17 @@ describe("dispatch reservation tools (AII-1069)", () => {
     expect(await heldNow(id)).toBe(true);
   });
 
-  it("releases a row whose job is terminal without force, and the in-flight count drops", async () => {
+  it("refuses a row whose job is terminal without force, naming the status, and the row stays held", async () => {
     const id = await hold({ kind: "restate", attemptId: "a" }, "completed");
+    setAdmissionTerminationCheck(async () => false);
     const before = await runnerJobCount();
     const result = await releaseDispatchReservationTool(fakeContext("release_dispatch_reservation"), { caller: admin, args: { dispatchId: id } });
-    expect(result.isError).toBeUndefined();
-    expect(parse(result)).toMatchObject({ status: "released", dispatchId: id, lifecycleOwner: "restate:a", basis: "job_terminal", forced: false });
-    expect((await import("../dispatch-admission.js")).read(id)?.releaseReason).toBe("cancelled");
-    expect(await runnerJobCount()).toBe(before - 1);
+    expect(result.isError).toBe(true);
+    expect(parse(result)).toMatchObject({ status: "refused", dispatchId: id });
+    expect(parse(result).reason).toMatch(/completed/);
+    expect(parse(result).reason).toMatch(/force/);
+    expect(await heldNow(id)).toBe(true);
+    expect(await runnerJobCount()).toBe(before);
   });
 
   it("refuses without force while the run executes, then releases with force", async () => {

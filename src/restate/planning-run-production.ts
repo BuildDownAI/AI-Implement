@@ -215,12 +215,24 @@ export function createProductionPlanningRunServices(input: PlanningRunProduction
   async function finishJob(dispatchId: string, outcome: PlanningFinishOutcome): Promise<void> {
     const job = getJobByDispatchId(dispatchId);
     if (!job) return;
+    // An invocation cancel is an operator decision: close the row with the conclusion `reportTerminalJob` already
+    // exempts from the breaker count, and add no stuck attempt. A retry finds the terminal row and does nothing.
+    if (outcome.kind === "cancelled") {
+      if (!TERMINAL_JOB_STATUSES.has(job.status)) updateJobStatus(job.id, "failed", "operator_cancelled");
+      // Clear the planning label, as the Legacy operator-cancel path does (`handleRunnerResult`), or the
+      // ticket stays in `AI-Planning` and no poll picks it up again. Safe to run twice; a throw retries the step.
+      const cancelledMapping = job.teamKey ? getMapping(job.teamKey) : undefined;
+      if (cancelledMapping && job.issueId) {
+        const cancelledProvider = await input.resolveProvider(cancelledMapping);
+        await cancelledProvider.clearWorkingState(job.issueId, job.teamKey ?? "");
+      }
+      return;
+    }
     const status = outcome.kind === "deadline" ? "timed_out" : "failed";
-    const conclusion =
-      outcome.kind === "deadline" ? "deadline_exceeded" : outcome.kind === "cancelled" ? "workflow_cancelled" : "ended_without_callback";
+    const conclusion = outcome.kind === "deadline" ? "deadline_exceeded" : "ended_without_callback";
     // A terminal row closed by the planning callback needs no handling. A row carrying this function's own marker
     // means an earlier attempt closed it and then threw before the handling finished, so the retry runs it again.
-    const closedByThisStep = job.conclusion === "deadline_exceeded" || job.conclusion === "ended_without_callback" || job.conclusion === "workflow_cancelled";
+    const closedByThisStep = job.conclusion === "deadline_exceeded" || job.conclusion === "ended_without_callback";
     if (TERMINAL_JOB_STATUSES.has(job.status) && !closedByThisStep) return;
     // The handling counts one stuck attempt, and it is the first thing it does: an attempt stamped since this
     // dispatch began means an earlier attempt of this step already ran it, so a retry must not count a second one.

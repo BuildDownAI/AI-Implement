@@ -48,6 +48,10 @@ interface Scenario {
   /** Parks the `reserve` function after it took the reservation. */
   reserveGate?: Gate;
   reserveTaken?: boolean;
+  /** Parks the first `cleanup` call. */
+  cleanupGate?: Gate;
+  /** Parks the first `stop` call. */
+  stopGate?: Gate;
   launchImpl?: (input: PlanningRunInput) => Promise<PlanningLaunchResult>;
   /** Every effect call in order, one string per attempt (the shape the contract suite reads). */
   calls: string[];
@@ -112,11 +116,13 @@ function makeDeps(seams: typeof SLOW): PlanningRunDependencies {
       const sc = scenarioOf(input.dispatchId);
       sc.stopCalls.push(jobId);
       sc.calls.push("stop");
+      if (sc.stopGate && sc.stopCalls.length === 1) await sc.stopGate.wait();
       return true;
     },
     async cleanup(input, jobId) {
       const sc = scenarioOf(input.dispatchId);
       sc.calls.push(`cleanup:${jobId}`);
+      if (sc.cleanupGate) await sc.cleanupGate.wait();
       if (sc.faults.failCleanup) throw new Error("injected cleanup failure");
     },
     async onOutcome(dispatchId) {
@@ -357,6 +363,59 @@ describe("PlanningRun durable workflow", () => {
     );
     await cancelInvocation(env.adminAPIBaseUrl(), String(rows[0].id));
   }
+
+  // A second cancel while `cleanup` runs in the escape path ends the escape with an exception; the release still runs once.
+  it.each(labels)("a second cancel during cleanup in the escape path still releases one time (%s)", async (label) => {
+    const w = begin(slow, label, { status: "started", cleanupGate: gate("cleanup") });
+    try {
+      await waitForStep(w.read, "wait");
+      await cancelRun(slow, label, w.dispatchId);
+      await w.sc.cleanupGate!.reached();
+      await cancelRun(slow, label, w.dispatchId);
+    } finally {
+      w.sc.cleanupGate!.release();
+    }
+    await w.done.catch(() => undefined);
+    await eventually(() => releasesOf(w.dispatchId), (reasons) => reasons.length >= 1, { label: "the release after the second cancel" });
+    expect(releasesOf(w.dispatchId)).toEqual(["cancelled"]);
+    expect(w.sc.calls[w.sc.calls.length - 1]).toBe("release");
+  }, 60_000);
+
+  // A cancel while `cleanup` runs on the normal path: the run ended, so the escape does not stop it, and the outcome runs once.
+  it.each(labels)("a cancel during cleanup on the normal path runs the outcome once, does not stop, and releases (%s)", async (label) => {
+    const w = begin(slow, label, { status: "ended", cleanupGate: gate("cleanup") });
+    try {
+      await w.sc.cleanupGate!.reached();
+      await cancelRun(slow, label, w.dispatchId);
+    } finally {
+      w.sc.cleanupGate!.release();
+    }
+    await w.done.catch(() => undefined);
+    await eventually(() => releasesOf(w.dispatchId), (reasons) => reasons.length >= 1, { label: "the release after the cancel" });
+    expect(releasesOf(w.dispatchId)).toEqual(["finalized"]);
+    expect(w.sc.stopCalls).toEqual([]);
+    expect(w.sc.calls.filter((c) => c.startsWith("cleanup"))).toHaveLength(1);
+    expect(w.sc.calls.filter((c) => c === "outcome")).toHaveLength(1);
+    expect(w.sc.calls[w.sc.calls.length - 1]).toBe("release");
+  }, 60_000);
+
+  // A cancel while the deadline `stop` runs: the stop does not count as tried, so the escape stops the run again.
+  it.each(labels)("a cancel during the deadline stop tries the stop again in the escape path and releases (%s)", async (label) => {
+    const w = begin(deadline, label, { status: "started", tickGate: gate("first tick"), stopGate: gate("stop") });
+    try {
+      await pastDeadlineAtTick(w.sc, DEADLINE.totalMs, "the total deadline");
+      w.sc.tickGate!.release();
+      await w.sc.stopGate!.reached();
+      await cancelRun(deadline, label, w.dispatchId);
+    } finally {
+      w.sc.stopGate!.release();
+    }
+    await w.done.catch(() => undefined);
+    await eventually(() => releasesOf(w.dispatchId), (reasons) => reasons.length >= 1, { label: "the release after the cancel" });
+    expect(releasesOf(w.dispatchId)).toEqual(["deadline_exceeded"]);
+    expect(w.sc.stopCalls).toEqual([`job-${w.dispatchId}`, `job-${w.dispatchId}`]);
+    expect(w.sc.calls[w.sc.calls.length - 1]).toBe("release");
+  }, 60_000);
 
   // The cancel reaches the workflow while the launch call is in flight; the call completes after the
   // cancel. The escape path must keep looking and stop the run it then finds.
