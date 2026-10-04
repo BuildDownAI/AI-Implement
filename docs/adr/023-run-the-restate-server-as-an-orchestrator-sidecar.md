@@ -1,6 +1,6 @@
 # 023. Run the Restate server as an orchestrator sidecar
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-09-16
 
 ## Context

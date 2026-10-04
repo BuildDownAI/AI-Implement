@@ -184,6 +184,11 @@ vi.mock("../report-card.js", () => ({
   getFleetReport: vi.fn(),
 }));
 
+vi.mock("../deploy-hold.js", () => ({
+  getDeployStartedAt: vi.fn(() => null),
+  isDeployHeld: vi.fn(() => false),
+}));
+
 vi.mock("../restate/tools-client.js", () => ({
   discoverTools: vi.fn(),
   callTool: vi.fn(),
@@ -945,6 +950,52 @@ describe("handleMcpRequest", () => {
         "POST",
         JSON.stringify({ jsonrpc: "2.0", id: 17, method: "tools/call", params: { name: "get_tenant_health", arguments: {} } }),
       );
+      expect(result.statusCode).toBe(503);
+      expect(JSON.parse(result.body)).toEqual({ error: "restate-unavailable" });
+    });
+
+    it("returns 409 deploy-in-progress with deployStartedAt and never contacts the ingress during a hold", async () => {
+      const { callTool: realCallTool } = await vi.importActual<typeof import("../restate/tools-client.js")>("../restate/tools-client.js");
+      const deployHold = await import("../deploy-hold.js");
+      (deployHold.getDeployStartedAt as ReturnType<typeof vi.fn>).mockReturnValue(1_700_000_000_000);
+      const fetchImpl = vi.fn();
+      (toolsClientMock.callTool as ReturnType<typeof vi.fn>).mockImplementationOnce(
+        (name: string, args: Record<string, unknown>, caller: Caller) =>
+          realCallTool(name, args, caller, { fetchImpl: fetchImpl as unknown as typeof fetch, permitsExternalCall: () => false }),
+      );
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 18, method: "tools/call", params: { name: "get_tenant_health", arguments: {} } }),
+      );
+      expect(result.statusCode).toBe(409);
+      expect(JSON.parse(result.body)).toEqual({ error: "deploy-in-progress", deployStartedAt: 1_700_000_000_000 });
+      expect(fetchImpl).not.toHaveBeenCalled();
+      (deployHold.getDeployStartedAt as ReturnType<typeof vi.fn>).mockReturnValue(null);
+    });
+
+    it.each([
+      ["a refused connection", () => Promise.reject(new Error("ECONNREFUSED"))],
+      ["a 5xx answer", () => Promise.resolve(new Response("boom", { status: 502 }))],
+    ])("keeps 503 restate-unavailable with no hold and %s", async (_label, fetchResult) => {
+      const { callTool: realCallTool } = await vi.importActual<typeof import("../restate/tools-client.js")>("../restate/tools-client.js");
+      const fetchImpl = vi.fn(fetchResult);
+      (toolsClientMock.callTool as ReturnType<typeof vi.fn>).mockImplementationOnce(
+        (name: string, args: Record<string, unknown>, caller: Caller) =>
+          realCallTool(name, args, caller, { fetchImpl: fetchImpl as unknown as typeof fetch, permitsExternalCall: () => true }),
+      );
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 19, method: "tools/call", params: { name: "get_tenant_health", arguments: {} } }),
+      );
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
       expect(result.statusCode).toBe(503);
       expect(JSON.parse(result.body)).toEqual({ error: "restate-unavailable" });
     });

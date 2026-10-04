@@ -1,6 +1,6 @@
 # 017. Move the run lifecycle onto a durable-execution engine, Restate first
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-09-08. Amended 2026-09-14: the order of adoption moved to ADR 018; the deployment shape moved to ADR 023.
 **References:** AII-567 incident report (sections 5 and 6), the plan documents "Plan, Part 1" and "Plan, Part 2" of 2026-09-08, AII-521 and AII-555 (the cost of adding a run kind), ADR 012, ADR 013, ADR 014, ADR 018, ADR 023, AII-614, AII-682
 
