@@ -240,6 +240,18 @@ describe("launchPlanningSession", () => {
     expect(dispatchSession.mock.calls[0][7]).toBe(reservation);
   });
 
+  it("an owned launch names the container from the dispatch id; a Legacy launch passes no name", async () => {
+    vi.mocked(auth.getInstallationToken).mockResolvedValue("GH-TOKEN-SECRET");
+    vi.mocked(docker.startLocalRunnerContainer).mockResolvedValue({ containerId: "c-1", containerName: "n" } as never);
+    await call({ reservation });
+    const name = vi.mocked(docker.startLocalRunnerContainer).mock.calls[0][0].containerName;
+    expect(name).toBe(mod.planningSessionName("d-1"));
+    expect(name).toBe("planning-d-1");
+    for (const secret of ["NONCE", "SESSION", "RUN", "GH-TOKEN-SECRET"]) expect(name).not.toContain(secret);
+    await call();
+    expect(vi.mocked(docker.startLocalRunnerContainer).mock.calls[1][0].containerName).toBeUndefined();
+  });
+
   it("a throw before markLaunchAttempted is rejected", async () => {
     vi.mocked(auth.getInstallationToken).mockRejectedValue(new Error("mint failed"));
     dispatchSession.mockImplementation(async (_c, _p, _i, _m, _pr, _rm, opts) => {

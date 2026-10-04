@@ -33,11 +33,13 @@ const sim = vi.hoisted(() => ({
 vi.mock("../../fly-machines.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../../fly-machines.js")>()),
   getMachine: async (_token: string, _app: string, id: string) => backends.flyGet(id),
+  listMachines: async () => [...backends.names].map(([name, id]) => ({ id, name })),
   destroyMachine: async (_token: string, _app: string, id: string) => backends.flyDestroy(id),
 }));
 vi.mock("../../local-docker.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../../local-docker.js")>()),
   inspectLocalContainer: async (id: string) => backends.dockerInspect(id),
+  findLocalContainerIdByName: async (name: string) => backends.names.get(name) ?? null,
   stopLocalContainer: async (id: string) => backends.dockerStop(id),
 }));
 
@@ -82,6 +84,7 @@ import { initMappingsTable } from "../../config.js";
 import { initDispatchBreakerTable } from "../../dispatch-breaker.js";
 import { acquire, read as readAdmission, reconcileTerminalCallbackAdmissions, sweepStaleAdmissions } from "../../dispatch-admission.js";
 import { appendLog, getJobByDispatchId, initLogTable, updateJobStatus } from "../../log.js";
+import { planningSessionName } from "../../planning-launch.js";
 import { PLANNING_RUN_TITLE_PREFIX, createProductionPlanningRunServices } from "../../restate/planning-run-production.js";
 import { createPlanningAdmissionTerminationHook, createPlanningRunIngressClient } from "../../restate/planning-run-client.js";
 import type { PlanningRunInput, PlanningRunStatusResult } from "../../restate/planning-run-workflow.js";
@@ -123,6 +126,10 @@ const backends = {
   machines: new Map<string, "started" | "destroyed">(),
   containers: new Map<string, boolean>(),
   created: 0,
+  /** Machine / container name to id, as the Fly list and `docker inspect <name>` would answer. */
+  names: new Map<string, string>(),
+  /** The launch creates the machine or container, then throws before the dispatch row records its id. */
+  crashBeforeRow: false,
   destroyCalls: [] as string[],
   stopCalls: [] as string[],
   /** Set to make `docker inspect` fail with this message. */
@@ -149,7 +156,7 @@ const backends = {
     this.containers.set(id, false);
   },
   reset() {
-    this.machines.clear(); this.containers.clear(); this.created = 0; this.destroyCalls = []; this.stopCalls = [];
+    this.machines.clear(); this.containers.clear(); this.created = 0; this.names.clear(); this.crashBeforeRow = false; this.destroyCalls = []; this.stopCalls = [];
     this.inspectError = undefined; this.crashNextLaunch = false;
   },
 };
@@ -221,6 +228,12 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
         const id = `${args.execPath === "fly-machines" ? "m" : "c"}-${++backends.created}`;
         if (args.execPath === "fly-machines") backends.machines.set(id, "started");
         else backends.containers.set(id, true);
+        // Named from the dispatch id, as the real owned launch names it.
+        backends.names.set(planningSessionName(args.reservation.dispatchId), id);
+        if (backends.crashBeforeRow) {
+          backends.crashBeforeRow = false;
+          throw new Error("injected crash: the machine exists, the row never recorded its id");
+        }
         // The real function writes the row, with the machine id and nonce, once the launch call returned.
         appendLog({
           issueId: args.issue.id, issueIdentifier: args.issue.identifier, issueTitle: args.issue.title, teamKey: args.issue.scopeKey,
@@ -400,6 +413,20 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
       expect(running(id)).toBe(false);
       expect(readAdmission(w.dispatchId)).toMatchObject({ releaseReason: "deadline_exceeded" });
       expect(getJobByDispatchId(w.dispatchId)).toMatchObject({ status: "timed_out" });
+    }, 60_000);
+
+    it.each(labels)("a crash before the row records the id adopts the machine found by name and creates no second one (%s)", async (label) => {
+      backends.crashBeforeRow = true;
+      const w = await dispatch(label, "PLT-13", backend);
+      const { jobId } = await eventually(() => w.read(), (s) => s.jobId !== null, { label: "bound after the retry" });
+      await waitForStep(w.read, "wait");
+      expect(backends.created).toBe(1);
+      expect(launches).toEqual(["PLT-13"]);
+      expect(jobId).toBe(backends.names.get(planningSessionName(w.dispatchId)));
+
+      end(jobId!);
+      await untilReleased(w.dispatchId);
+      expect(backends.created).toBe(1);
     }, 60_000);
 
     it.each(labels)("a crash after the launch returns adopts the launched machine and creates no second one (%s)", async (label) => {

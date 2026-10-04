@@ -293,6 +293,12 @@ export interface PlanningSessionResult {
   executionMode: "fly-machines" | "local-docker";
 }
 
+/** The machine or container name of a planning launch the `PlanningRun` workflow owns: a fixed prefix and the
+ * dispatch id, so a retry finds the run by name. Never a nonce or token. Lowercase `[a-z0-9-]` suits Fly and Docker. */
+export function planningSessionName(dispatchId: string): string {
+  return `planning-${dispatchId.toLowerCase().replace(/[^a-z0-9-]/g, "-")}`;
+}
+
 /** The Fly Machines / local Docker planning launch, moved out of `dispatchPlanning`. */
 export async function launchPlanningSession(args: LaunchPlanningSessionArgs): Promise<PlanningSessionResult> {
   const { config, provider, issue, mapping, execPath, runnerMode, resolvedPlanningBranch, planningFieldValue, reservation, deps } = args;
@@ -324,6 +330,8 @@ export async function launchPlanningSession(args: LaunchPlanningSessionArgs): Pr
   const flyApp = config.flySessionsApp;
 
   const prior = countPriorDispatches(issue.id, "planning");
+  // Only an owned launch (a reservation is passed) is named from the dispatch id; Legacy keeps its name.
+  const ownedName = reservation ? planningSessionName(reservation.dispatchId) : undefined;
 
   let launchAttempted = false;
   let session: DispatchSessionResult;
@@ -412,6 +420,7 @@ export async function launchPlanningSession(args: LaunchPlanningSessionArgs): Pr
           teamKey: issue.scopeKey,
           teamSecretNames: allSecretNames,
           allTeamKeys: Object.keys(getMappings()),
+          machineName: ownedName,
           flyProcessLevelSecrets: getFlyProcessLevelSecrets().enabled,
           minSecretsVersion: minSecretsVersion ?? undefined,
           orchestratorUrl: config.runnerCallbackBaseUrl ?? undefined,
@@ -464,6 +473,7 @@ export async function launchPlanningSession(args: LaunchPlanningSessionArgs): Pr
           sessionToken,
           machineNonce,
           phase: "planning",
+          containerName: ownedName,
           sessionMode: mapping.sessionMode,
           orchestratorUrl: localOrchestratorUrl,
           runnerCallbackUrl: runnerCallbackUrl || undefined,
