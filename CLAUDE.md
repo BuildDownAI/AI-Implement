@@ -114,7 +114,7 @@ Entry points for areas that are easy to miss. Each names the module to start fro
 | Admin SSO / OIDC, roles, page grants | `src/oauth/`, `src/admin-session.ts`, `src/access-entries.ts`, `src/access-page-grants.ts` | [docs/access-model.md](docs/access-model.md) |
 | Admin SPA | `src/admin-ui/` | |
 | Restate engine: sidecar, endpoint, workflows, testcontainers job | `src/restate/endpoint.ts`, `src/restate/` | [docs/restate.md](docs/restate.md), [docs/restate-testing.md](docs/restate-testing.md) |
-| Unit test suite: setup files, the environment allowlist, shared fixture builders, type checking, CI jobs | `src/__tests__/setup/`, `src/__tests__/helpers/`, `vitest.config.ts` | [docs/unit-tests.md](docs/unit-tests.md) |
+| Unit test suite: setup files, the environment allowlist, shared fixture builders and harnesses, type checking, CI jobs | `src/__tests__/setup/`, `src/__tests__/helpers/`, `vitest.config.ts` | [docs/unit-tests.md](docs/unit-tests.md) |
 
 **Diagram convention:** flow diagrams in `docs/`, issue bodies, and PR descriptions are mermaid (validated with `mermaid-cli` before commit); tabular data is a table; ASCII only in this file. Full rule: [docs/README.md](docs/README.md).
 
@@ -184,7 +184,7 @@ npm run test:restate # src/__tests__/restate/**/*.restate.test.ts — two runtim
 
 **`typecheck` excludes `src/__tests__`, and vitest strips types without checking them** — so type errors in a test file are caught by nothing. Type-check a new test file explicitly with a throwaway tsconfig. `src/admin-ui/__tests__/` *is* covered and can break the build.
 
-Build test fixtures with the shared builders in `src/__tests__/helpers/builders.ts`, not a new per-file `make*` copy; a type hand-built as a fixture in a third test file gets a builder there ([docs/unit-tests.md](docs/unit-tests.md) § Fakes and fixtures).
+Build test fixtures with the shared builders in `src/__tests__/helpers/builders.ts`, and a test's database, fake `fetch` and temporary directories with the harnesses beside them (`testDb`, `fakeFetch`, `testDir`), not a new per-file copy; a type built as a fixture, or a harness need, that recurs in a third test file goes there ([docs/unit-tests.md](docs/unit-tests.md) § Fakes and fixtures).
 
 Fixing a bug: write the failing test first, then the fix, in one pull request — see [docs/bug-fix-tests.md](docs/bug-fix-tests.md).
 
