@@ -176,3 +176,14 @@ describe("createPlanningRunIngressClient", () => {
     expect(await sender.submit("d-1", INPUT)).toEqual({ status: expected });
   });
 });
+
+describe("createPlanningRunIngressClient timeouts", () => {
+  it("submit answers unavailable when the ingress does not answer within the timeout", async () => {
+    const stalled = ((_url: string | URL | Request, init?: RequestInit) =>
+      new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(init.signal?.reason ?? new Error("aborted")));
+      })) as unknown as typeof fetch;
+    const sender = client.createPlanningRunIngressClient(INGRESS, { fetchImpl: stalled, timeoutMs: 50 });
+    expect(await sender.submit("d-1", INPUT)).toEqual({ status: "unavailable" });
+  });
+});

@@ -1413,17 +1413,14 @@ export async function dispatchPlanning(
     }
     const dispatchId = crypto.randomUUID();
     const backend = execPath === "fly-machines" || execPath === "local-docker" ? execPath : "github-actions";
-    const pilotAdmission = acquireDispatch({
-      dispatchId,
+    // Non-binding pre-check only: the workflow takes the reservation in its first step, so a crash here leaves no row.
+    const decision = canDispatch({
       issueId: issue.id,
-      issueIdentifier: issue.identifier,
       kind: "planning",
       teamKey: issue.scopeKey,
       maxInProgressAiIssues: mapping.maxInProgressAiIssues,
-      backend,
-      lifecycleOwner: { kind: "restate", attemptId: dispatchId },
     });
-    if (!pilotAdmission.ok) return;
+    if (!decision.ok) return;
     const planningContext: Record<string, string> = { [PLANNING_CONTEXT_BRANCH_KEY]: resolvedPlanningBranch };
     if (planningFieldValue) planningContext[PLANNING_CONTEXT_FIELD_VALUE_KEY] = planningFieldValue;
     const submitted = await createPlanningRunIngressClient().submit(dispatchId, {
@@ -1434,9 +1431,12 @@ export async function dispatchPlanning(
       backend,
       planningContext,
     });
-    if (submitted.status === "unavailable" || submitted.status === "not-found") {
-      pilotAdmission.release("launch_rejected");
+    if (submitted.status === "unavailable") {
       console.log(`[poll] Planning for ${issue.identifier} skipped: Restate unavailable`);
+      return;
+    }
+    if (submitted.status === "not-found") {
+      console.log(`[poll] Planning for ${issue.identifier} skipped: the PlanningRun service is not registered`);
       return;
     }
     console.log(`[poll] Submitted PlanningRun for ${issue.identifier} dispatch=${dispatchId} backend=${backend} (${submitted.status})`);

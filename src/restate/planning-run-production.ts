@@ -5,6 +5,7 @@
  * switches on `input.backend`. */
 import type { RepoMapping } from "../config.js";
 import { getMappings } from "../config.js";
+import { acquireDispatch } from "../dispatch-gate.js";
 import { read as readAdmission, releaseByDispatchId } from "../dispatch-admission.js";
 import type { AppConfig, HeldReservation } from "../index.js";
 import { classifyFlyMachine, classifyLocalContainer, stopBackendRun } from "../backend-run.js";
@@ -249,7 +250,24 @@ export function createProductionPlanningRunServices(input: PlanningRunProduction
     if (job) await input.reportTerminalJob(job);
   }
 
+  /** Takes the reservation in the workflow's first step. `acquireDispatch` returns the active row of this dispatch id
+   *  when a step retry follows a committed reservation, so a retry never takes a second one. */
+  function reserve(run: PlanningRunInput): boolean {
+    const mapping = requireMapping(getMapping, run.teamKey);
+    return acquireDispatch({
+      dispatchId: run.dispatchId,
+      issueId: run.issueId,
+      issueIdentifier: run.issueIdentifier,
+      kind: "planning",
+      teamKey: run.teamKey,
+      maxInProgressAiIssues: mapping.maxInProgressAiIssues,
+      backend: run.backend,
+      lifecycleOwner: { kind: "restate", attemptId: run.dispatchId },
+    }).ok;
+  }
+
   const deps: PlanningRunDependencies = {
+    reserve,
     findExistingRun: createPlanningFindExistingRun({ getMapping, getToken, flySessionsToken: config.flySessionsToken, flySessionsApp: config.flySessionsApp }),
     launch,
     readStatus,

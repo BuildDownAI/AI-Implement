@@ -8,11 +8,10 @@ This pilot moves **automatic GitHub Actions review-fix attempts** to Restate. Th
 
 The project's **Review-fix & Planning Lifecycle** switch (`reviewFixLifecycle`) also selects who owns a planning reservation. With `restate`, `dispatchPlanning` reserves with owner `restate:<dispatchId>` and submits `PlanningRun/{dispatchId}` through the loopback ingress; the workflow launches the run, waits, and releases the reservation (at the latest at the planning deadline). `dispatchPlanning` never launches for such a project. With `legacy` or unset, the current path is unchanged on every backend. Implementation, gap-fill, and review-fix dispatch are not affected by this part of the switch.
 
-- **Restate unavailable** (sidecar not `ready` or endpoint not `registered`): no reservation and no dispatch. The poll logs `[poll] Planning for <key> skipped: Restate unavailable` and the ticket stays queued for the next poll. If `submit` answers `unavailable`, the reservation is released as `launch_rejected` with the same line. A `conflict` answer leaves the reservation to the existing workflow.
+- **Restate unavailable** (sidecar not `ready` or endpoint not `registered`): no reservation and no dispatch. The poll logs `[poll] Planning for <key> skipped: Restate unavailable` and the ticket stays queued for the next poll. The poll loop takes no reservation for planning (the `PlanningRun` workflow reserves in its first step), so a `submit` that answers `unavailable` leaves nothing to release. A `conflict` answer leaves the reservation to the existing workflow.
 - **Fly Machines and local Docker:** the save check still requires execution mode `github-actions`, so a pilot project reaches Fly or local planning only through the global runner mode (`/admin#runners` or `POST /api/runner-mode`). The `PlanningRun` input names the backend from the resolved execution path, and the same workflow owns the reservation there.
 - **Self-deploy drain:** a pilot planning run in flight counts as an active owner, so a drain waits for it (at most the planning deadline).
 - **Rollback:** set the project's switch to `legacy`. A run already submitted keeps its workflow owner until it releases.
-- **Known gap:** a process crash between the reservation and `submit` leaves a Restate-owned row with no workflow; the Legacy sweeps skip it by design, so an operator clears it by hand.
 
 ## Before enabling SAN
 

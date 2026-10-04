@@ -129,6 +129,10 @@ const gh = {
   /** Holds the first run-status read of a scenario until the test releases it. */
   statusGate: undefined as Gate | undefined,
   nextRunId: 5_000,
+  /** Holds the first run-list read (the `dispatch` step's lookup, after `reserve`) until the test releases it. */
+  listGate: undefined as Gate | undefined,
+  /** The first run-list read after the gate throws once, as a crash of the step would. */
+  failNextList: false,
   async status(runId: number): Promise<{ status: string; conclusion: string | null; html_url: string } | null> {
     this.statusReads.push(runId);
     const g = this.statusGate;
@@ -137,7 +141,7 @@ const gh = {
     return run ? { status: run.status, conclusion: null, html_url: `https://github.test/run/${runId}` } : null;
   },
   reset() {
-    this.runs = []; this.cancelCalls = []; this.statusReads = []; this.statusGate = undefined; this.nextRunId = 5_000;
+    this.runs = []; this.cancelCalls = []; this.statusReads = []; this.statusGate = undefined; this.listGate = undefined; this.failNextList = false; this.nextRunId = 5_000;
   },
 };
 
@@ -215,6 +219,12 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
       const href = typeof url === "string" ? url : url instanceof URL ? url.href : url.url;
       if (!href.startsWith("https://api.github.com/")) return realFetch(url as never, init);
       if (!href.includes(`/repos/${OWNER}/${REPO}/actions/workflows/claude-plan.yml/runs`)) throw new Error(`unexpected GitHub call ${href}`);
+      const listGate = gh.listGate;
+      if (listGate && !listGate.isReached()) await listGate.wait();
+      if (gh.failNextList) {
+        gh.failNextList = false;
+        throw new Error("injected crash: the dispatch step died after the reservation");
+      }
       return new Response(JSON.stringify({
         workflow_runs: gh.runs.map((r) => ({ id: r.id, display_title: r.title, created_at: r.createdAt })),
       }), { status: 200, headers: { "content-type": "application/json" } });
@@ -315,7 +325,7 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
     return env.baseUrl();
   }
 
-  /** Reserves capacity with the workflow as owner, as the switched `dispatchPlanning` will, and submits the run. */
+  /** Submits the run; the workflow takes the reservation in its first step. */
   async function dispatch(
     label: string, identifier: string,
     backend: PlanningRunInput["backend"] = "github-actions", envs: Map<string, RestateTestEnvironment> = environments,
@@ -323,11 +333,6 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
     const dispatchId = `plan-${label}-${counter++}`;
     const issue = { id: `id-${dispatchId}`, identifier, title: `Issue ${identifier}`, scopeKey: TEAM, nativeStatus: "Todo" };
     issues.set(identifier, issue);
-    const decision = acquire({
-      dispatchId, mappingKey: TEAM, scope: { kind: "issue", issueScope: TEAM, issueId: issue.id }, kind: "planning",
-      backend, lifecycleOwner: { kind: "restate", attemptId: dispatchId }, cap: 10,
-    });
-    if (!decision.ok) throw new Error(`admission deferred: ${decision.reason}`);
     const url = baseUrl(label, envs);
     const client = createPlanningRunIngressClient(url);
     const input: PlanningRunInput = {
@@ -335,6 +340,8 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
     };
     expect(await client.submit(dispatchId, input)).toEqual({ status: "accepted" });
     const read = () => callWorkflow<PlanningRunStatusResult>(url, "PlanningRun", dispatchId, "status");
+    // The reservation exists once the workflow passed `reserve`.
+    await eventually(() => read(), (st) => st.step !== null && st.step !== "reserve", { label: `${dispatchId} past reserve` });
     const hook = createPlanningAdmissionTerminationHook({
       ingress: client,
       legacy: async () => { throw new Error("the Legacy fast release must not run for a Restate-owned reservation"); },
@@ -576,10 +583,13 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
     afterEach(() => resetRestateStatus());
 
     /** The planning row `dispatchPlanning` reserved for this issue. */
-    const reservationOf = (issueId: string) => {
+    const reservationRow = (issueId: string) => {
       const row = getDb().prepare("SELECT dispatch_id FROM dispatch_admissions WHERE issue_id = ? AND phase = 'planning' ORDER BY rowid DESC LIMIT 1").get(issueId) as { dispatch_id: string } | undefined;
       return row ? readAdmission(row.dispatch_id) : null;
     };
+    /** The workflow reserves in its first step, so the row appears after `dispatchPlanning` returns. */
+    const reservationOf = async (issueId: string) =>
+      (await eventually(async () => reservationRow(issueId), (row) => row !== null, { label: `reservation of ${issueId}` }))!;
 
     it.each(labels)("two issues dispatched seconds apart each release their own reservation, and implementation then admits each (%s)", async (label) => {
       sim.ingressUrl = baseUrl(label);
@@ -593,8 +603,8 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
       const b = mk("PLT-21");
       await dispatchPlanning({} as never, provider, a as never, pilotMapping, planningCtx("github-actions"));
       await dispatchPlanning({} as never, provider, b as never, pilotMapping, planningCtx("github-actions"));
-      const resA = reservationOf(a.id)!;
-      const resB = reservationOf(b.id)!;
+      const resA = await reservationOf(a.id);
+      const resB = await reservationOf(b.id);
       expect(resA.lifecycleOwner).toEqual({ kind: "restate", attemptId: resA.dispatchId });
       expect(resB.lifecycleOwner).toEqual({ kind: "restate", attemptId: resB.dispatchId });
 
@@ -630,7 +640,7 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
       const issue = { id: `id-owner-${backend}`, identifier: `PLT-3${backend.length}`, title: "t", scopeKey: TEAM, nativeStatus: "Todo" };
       issues.set(issue.identifier, issue);
       await dispatchPlanning({} as never, provider, issue as never, pilotMapping, planningCtx(backend));
-      const res = reservationOf(issue.id)!;
+      const res = await reservationOf(issue.id);
       expect(res).toMatchObject({ backend, lifecycleOwner: { kind: "restate", attemptId: res.dispatchId } });
 
       // Let the workflow finish so no reservation outlives the scenario.
@@ -638,6 +648,88 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
       const { jobId } = await eventually(() => read(), (st) => st.jobId !== null, { label: "bound" });
       if (backend === "fly-machines") backends.machines.set(jobId!, "destroyed"); else backends.containers.set(jobId!, false);
       await untilReleased(res.dispatchId);
+    }, 60_000);
+
+    it("an unavailable submit leaves no dispatch_admissions row", async () => {
+      sim.ingressUrl = "http://127.0.0.1:1";
+      const issue = { id: "id-unavailable", identifier: "PLT-50", title: "t", scopeKey: TEAM, nativeStatus: "Todo" };
+      issues.set(issue.identifier, issue);
+      await dispatchPlanning({} as never, provider, issue as never, pilotMapping, planningCtx("github-actions"));
+      expect(reservationRow(issue.id)).toBeNull();
+    }, 60_000);
+  });
+
+  describe("the reserve step of PlanningRun (AII-1065)", () => {
+    const rowsOf = (issueId: string) =>
+      (getDb().prepare("SELECT COUNT(*) AS n FROM dispatch_admissions WHERE issue_id = ?").get(issueId) as { n: number }).n;
+    const input = (dispatchId: string, issue: { id: string; identifier: string }): PlanningRunInput =>
+      ({ dispatchId, teamKey: TEAM, issueId: issue.id, issueIdentifier: issue.identifier, planningContext: {}, backend: "github-actions" });
+    const mkIssue = (label: string, identifier: string) => {
+      const issue = { id: `id-${label}-${identifier}`, identifier, title: `Issue ${identifier}`, scopeKey: TEAM, nativeStatus: "Todo" };
+      issues.set(identifier, issue);
+      return issue;
+    };
+
+    it.each(labels)("a crash after reserve and before the launch resumes, launches once, and holds one row (%s)", async (label) => {
+      gh.listGate = gate("dispatch lookup");
+      gh.failNextList = true;
+      const w = await dispatch(label, "PLT-60");
+      await gh.listGate.reached();
+      expect(launches).toEqual([]);
+      expect(rowsOf(w.issue.id)).toBe(1);
+      expect(readAdmission(w.dispatchId)).toMatchObject({ lifecycleOwner: { kind: "restate", attemptId: w.dispatchId }, releasedAt: null });
+      gh.listGate.release();
+
+      await waitForStep(w.read, "wait");
+      expect(launches).toEqual(["PLT-60"]);
+      expect(rowsOf(w.issue.id)).toBe(1);
+      updateJobStatus(getJobByDispatchId(w.dispatchId)!.id, "completed", "planning_callback");
+      await w.hook(w.dispatchId);
+      gh.runs[0].status = "completed";
+      await untilReleased(w.dispatchId);
+      expect(launches).toEqual(["PLT-60"]);
+      expect(rowsOf(w.issue.id)).toBe(1);
+    }, 60_000);
+
+    it.each(labels)("two workflows for one issue: one reserves and launches, the other is refused and ends (%s)", async (label) => {
+      gh.statusGate = gate("first status read");
+      const issue = mkIssue(label, "PLT-61");
+      const url = baseUrl(label);
+      const client = createPlanningRunIngressClient(url);
+      const first = `plan-${label}-first-${counter++}`;
+      const second = `plan-${label}-second-${counter++}`;
+      expect(await client.submit(first, input(first, issue))).toEqual({ status: "accepted" });
+      await gh.statusGate.reached();
+      expect(await client.submit(second, input(second, issue))).toEqual({ status: "accepted" });
+      const refused = await eventually(
+        () => callWorkflow<PlanningRunStatusResult>(url, "PlanningRun", second, "status"),
+        (st) => st.step === "refused",
+        { label: "second workflow refused" },
+      );
+      expect(refused.jobId).toBeNull();
+      expect(launches).toEqual(["PLT-61"]);
+      expect(readAdmission(second)).toBeNull();
+      expect(readAdmission(first)).toMatchObject({ releasedAt: null });
+
+      gh.runs[0].status = "completed";
+      gh.statusGate.release();
+      await untilReleased(first);
+      expect(launches).toEqual(["PLT-61"]);
+    }, 60_000);
+
+    it.each(labels)("a team at maxInProgressAiIssues refuses the reserve step (%s)", async (label) => {
+      getDb().prepare("UPDATE mappings SET max_in_progress_ai_issues = 0 WHERE team_key = ?").run(TEAM);
+      try {
+        const issue = mkIssue(label, "PLT-62");
+        const url = baseUrl(label);
+        const id = `plan-${label}-cap-${counter++}`;
+        expect(await createPlanningRunIngressClient(url).submit(id, input(id, issue))).toEqual({ status: "accepted" });
+        await eventually(() => callWorkflow<PlanningRunStatusResult>(url, "PlanningRun", id, "status"), (st) => st.step === "refused", { label: "refused at capacity" });
+        expect(launches).toEqual([]);
+        expect(readAdmission(id)).toBeNull();
+      } finally {
+        getDb().prepare("UPDATE mappings SET max_in_progress_ai_issues = 10 WHERE team_key = ?").run(TEAM);
+      }
     }, 60_000);
   });
 

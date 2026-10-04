@@ -70,6 +70,11 @@ async function holdAtTick(sc: Scenario): Promise<void> {
 function makeDeps(seams: typeof SLOW): PlanningRunDependencies {
   return {
     ...seams,
+    async reserve(input) {
+      const sc = scenarioOf(input.dispatchId);
+      sc.calls.push("reserve");
+      return !sc.faults.refuseReservation;
+    },
     async findExistingRun(input) {
       const sc = scenarioOf(input.dispatchId);
       sc.findCalls++;
@@ -342,8 +347,7 @@ describe("PlanningRun durable workflow", () => {
     expect((await w.read()).step).toBe("released");
   }, 60_000);
 
-  // The contract suite (ADR 036). `PlanningRun` takes no reservation yet, so the adapter records `reserve` itself
-  // when it starts the run; scenario 4 (a refused reservation) arrives with the issue that moves the reservation in.
+  // The contract suite (ADR 036). `PlanningRun` takes the reservation in its first step, so the `reserve` dep records the call.
   const contractAdapter: OwnedRunAdapter = {
     name: "PlanningRun",
     start(_baseUrl, key, { faults, totalMs }) {
@@ -353,7 +357,7 @@ describe("PlanningRun durable workflow", () => {
       const launch = async () => ({ outcome: "accepted", jobId: runId }) as PlanningLaunchResult;
       const sc: Scenario = {
         launchResult: { outcome: "accepted", jobId: runId }, runId, launched: false, launchCalls: 0, findCalls: 0, readCalls: 0,
-        stopCalls: [], finishCalls: [], finishThrows: false, status: "started", calls: ["reserve"], faults,
+        stopCalls: [], finishCalls: [], finishThrows: false, status: "started", calls: [], faults,
         launchImpl: faults.crashAfterLaunch ? crashAfterFirstCall(launch) : launch,
       };
       scenarios.set(key, sc);
@@ -382,5 +386,5 @@ describe("PlanningRun durable workflow", () => {
     const env = slow.get(label);
     if (!env) throw new Error(`missing Restate variant ${label}`);
     return env;
-  }, { pending: { 4: "AII-1065 moves the reservation into the workflow" } });
+  });
 });
