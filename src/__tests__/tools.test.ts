@@ -25,6 +25,9 @@ import {
   addProjectArgsSchema,
   triggerWorkflowSyncTool,
   clearDispatchDedupTool,
+  listDispatchReservationsTool,
+  releaseDispatchReservationTool,
+  setAdmissionTerminationCheck,
   setProviderRegistry,
   setKgRefreshToolDeps,
   getReviewFixAttemptTool,
@@ -1394,5 +1397,114 @@ describe("add_project uses the registry the boot shares (AII-713 review)", () =>
     } finally {
       setProviderRegistry(null);
     }
+  });
+});
+
+// ---- AII-1069: list_dispatch_reservations / release_dispatch_reservation.
+describe("dispatch reservation tools (AII-1069)", () => {
+  const admin: Caller = { kind: "human", email: "op@example.com", role: "admin" };
+  let seq = 0;
+  const parse = (r: { content: { text: string }[] }) => JSON.parse(r.content[0].text);
+
+  beforeAll(() => {
+    initLogTable();
+  });
+  afterEach(() => {
+    setAdmissionTerminationCheck(null);
+    vi.restoreAllMocks();
+  });
+
+  async function hold(owner: { kind: "legacy" } | { kind: "restate"; attemptId: string } = { kind: "legacy" }, jobStatus?: "running" | "completed") {
+    const { acquire } = await import("../dispatch-admission.js");
+    const { appendLog, updateJobStatus } = await import("../log.js");
+    const dispatchId = `res-${Date.now()}-${seq++}`;
+    const decision = acquire({
+      dispatchId,
+      mappingKey: "AII",
+      scope: { kind: "issue", issueScope: "AII", issueId: dispatchId },
+      kind: "planning",
+      backend: "github-actions",
+      lifecycleOwner: owner,
+      cap: 100,
+    });
+    if (!decision.ok) throw new Error("acquire failed");
+    if (jobStatus) {
+      const id = appendLog({ issueId: dispatchId, issueIdentifier: "AII-1", repo: "o/r", dispatchId, admissionGeneration: decision.record.generation, executionMode: "github-actions" });
+      if (jobStatus === "completed") updateJobStatus(id, "completed", "success");
+    }
+    return dispatchId;
+  }
+  const heldNow = async (dispatchId: string) => (await import("../dispatch-admission.js")).read(dispatchId)?.releasedAt === null;
+  const runnerJobCount = async () =>
+    (await import("../in-flight-work.js")).getInFlightWork().find((w) => w.kind === "runner-job")?.count ?? 0;
+
+  it("lists held rows and not released ones, for a user caller", async () => {
+    const held = await hold({ kind: "legacy" }, "running");
+    const gone = await hold();
+    (await import("../dispatch-admission.js")).releaseByDispatchId(gone, "finalized");
+    const result = await listDispatchReservationsTool(fakeContext("list_dispatch_reservations"), { caller: HUMAN_USER, args: {} });
+    const rows = parse(result) as Array<Record<string, unknown>>;
+    const row = rows.find((r) => r.dispatchId === held);
+    expect(row).toMatchObject({ team: "AII", issueIdentifier: "AII-1", phase: "planning", backend: "github-actions", lifecycleOwner: "legacy", jobStatus: "dispatched", jobConclusion: null });
+    expect(typeof row?.ageSeconds).toBe("number");
+    expect(rows.some((r) => r.dispatchId === gone)).toBe(false);
+  });
+
+  it("refuses a user caller as forbidden and leaves the row held", async () => {
+    const id = await hold();
+    const result = await releaseDispatchReservationTool(fakeContext("release_dispatch_reservation"), { caller: HUMAN_USER, args: { dispatchId: id, force: true } });
+    expect(result.content[0].text).toBe("forbidden: release_dispatch_reservation requires the admin role");
+    expect(await heldNow(id)).toBe(true);
+  });
+
+  it("releases a row whose job is terminal without force, and the in-flight count drops", async () => {
+    const id = await hold({ kind: "restate", attemptId: "a" }, "completed");
+    const before = await runnerJobCount();
+    const result = await releaseDispatchReservationTool(fakeContext("release_dispatch_reservation"), { caller: admin, args: { dispatchId: id } });
+    expect(result.isError).toBeUndefined();
+    expect(parse(result)).toMatchObject({ status: "released", dispatchId: id, lifecycleOwner: "restate:a", basis: "job_terminal", forced: false });
+    expect((await import("../dispatch-admission.js")).read(id)?.releaseReason).toBe("cancelled");
+    expect(await runnerJobCount()).toBe(before - 1);
+  });
+
+  it("refuses without force while the run executes, then releases with force", async () => {
+    const id = await hold({ kind: "legacy" }, "running");
+    setAdmissionTerminationCheck(async () => false);
+    const refused = await releaseDispatchReservationTool(fakeContext("release_dispatch_reservation"), { caller: admin, args: { dispatchId: id } });
+    expect(refused.isError).toBe(true);
+    expect(parse(refused)).toMatchObject({ status: "refused", dispatchId: id });
+    expect(parse(refused).reason).toMatch(/force/);
+    expect(await heldNow(id)).toBe(true);
+
+    const forced = await releaseDispatchReservationTool(fakeContext("release_dispatch_reservation"), { caller: admin, args: { dispatchId: id, force: true } });
+    expect(parse(forced)).toMatchObject({ status: "released", forced: true, basis: "forced" });
+    expect(await heldNow(id)).toBe(false);
+  });
+
+  it("releases without force when the backend run is confirmed ended", async () => {
+    const id = await hold({ kind: "legacy" }, "running");
+    setAdmissionTerminationCheck(async (c) => c.dispatchId === id);
+    const result = await releaseDispatchReservationTool(fakeContext("release_dispatch_reservation"), { caller: admin, args: { dispatchId: id } });
+    expect(parse(result)).toMatchObject({ status: "released", basis: "backend_confirmed" });
+  });
+
+  it("answers nothing_to_release for an unknown or already released id", async () => {
+    const id = await hold();
+    await releaseDispatchReservationTool(fakeContext("release_dispatch_reservation"), { caller: admin, args: { dispatchId: id, force: true } });
+    for (const dispatchId of [id, "no-such-dispatch"]) {
+      const result = await releaseDispatchReservationTool(fakeContext("release_dispatch_reservation"), { caller: admin, args: { dispatchId, force: true } });
+      expect(result.isError).toBeUndefined();
+      expect(parse(result)).toEqual({ status: "nothing_to_release", dispatchId });
+    }
+  });
+
+  it("writes one audit line naming actor, dispatch id, owner and force", async () => {
+    const id = await hold({ kind: "restate", attemptId: "b" });
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    await releaseDispatchReservationTool(fakeContext("release_dispatch_reservation"), { caller: admin, args: { dispatchId: id, force: true } });
+    const lines = log.mock.calls.map((c) => String(c[0])).filter((l) => l.startsWith("[mcp] write tool=release_dispatch_reservation"));
+    expect(lines).toEqual([
+      `[mcp] write tool=release_dispatch_reservation actor=op@example.com role=admin result=ok kind=human dispatch=${id} owner=restate:b force=true`,
+    ]);
   });
 });

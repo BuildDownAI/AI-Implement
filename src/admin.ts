@@ -57,7 +57,7 @@ import type { TicketIssue, AIImplementSnapshot } from "./providers/types.js";
 import type { ProviderRegistry } from "./providers/registry.js";
 import { resolveInFlightSiblings, selectBlockers, mergeProviderSnapshots, selectForeignTrackerBlockers, type ForeignTrackerIssue, selectFileOverlapDeferrals, getOrFetchPlanningContexts } from "./poll-selection.js";
 import { count as countReservedCapacity } from "./dispatch-admission.js";
-import { read as readDispatchAdmission } from "./dispatch-admission.js";
+import { read as readDispatchAdmission, listHeldReservations } from "./dispatch-admission.js";
 import { RESTATE_WRITE_TOOL_NAMES, IDEMPOTENCY_KEY_SHAPE, scopeIdempotencyKey } from "./mcp.js";
 import { adminHtml } from "./admin-html.js";
 import {
@@ -859,6 +859,11 @@ export function handleAdminRequest(
           json(res, 500, { error: String(err) });
         }
       })();
+      return true;
+    }
+
+    if (url === "/api/dispatch-reservations" && method === "GET") {
+      json(res, 200, { reservations: listHeldReservations() });
       return true;
     }
 
