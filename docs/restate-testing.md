@@ -312,6 +312,18 @@ rejects on a workflow handler with HTTP 400; the key was removed because the wor
 `src/__tests__/planning-run-production.test.ts` (default suite, no Docker) covers the deps one by one, including the
 check that `workflows/claude-plan.yml`'s `run-name` contains `PLANNING_RUN_TITLE_PREFIX`.
 
+## The owned-run contract suite (AII-1062)
+
+`src/__tests__/restate/owned-run-contract.ts` (not a `.test.ts` file, so vitest does not collect it) exports `registerOwnedRunContract(adapter, envFor)`. It registers five scenarios on both variants: a status read that fails on each attempt still reaches the deadline, stops the run, and releases; a crash after the launch adopts the run and launches once; a normal end runs `cleanup` with the run id, `outcome` once, then the release; a refused reservation launches, cleans up, and releases nothing; a failed `cleanup` and `outcome` still release. Scenarios hold the workflow with `waitForStep` and never sleep. See [ADR 036](adr/036-an-owned-run-lifecycle-is-one-kit-and-one-contract-suite.md).
+
+**What an adapter supplies** (`OwnedRunAdapter`):
+
+* `name`, for the describe title.
+* `start(baseUrl, key, { faults, totalMs })`: starts the workflow under `key` and returns `{ runId, done, read, finish }`. `read` is the workflow's status read (`step` is `"waiting"` during the wait), `finish` ends the run normally, `runId` is the id the launch gives. `faults` (`failStatusRead`, `refuseReservation`, `crashAfterLaunch`, `failCleanup`, `failOutcome`) is the adapter's to inject, for example with `crashAfterFirstCall` for the launch.
+* `calls(key)`: the calls the effects made, in order, one string per attempt: `reserve`, `launch`, `status`, `stop`, `cleanup:<runId>`, `outcome`, `release`.
+
+**Adding the suite to a run kind's scenario file:** start the environments with `startVariants` in `beforeAll`, write the adapter over the run kind's workflow and its recording fakes, and call `registerOwnedRunContract(adapter, (label) => environments.get(label)!)` at the top level of the file. `owned-run-lifecycle.restate.test.ts` is the worked example, with a small fixture workflow. Each effect the adapter passes must be safe to run twice.
+
 ## Timing rules
 
 Four flakes cost gap-fill rounds (a base URL captured before a restart, a scenario that outran a shortened

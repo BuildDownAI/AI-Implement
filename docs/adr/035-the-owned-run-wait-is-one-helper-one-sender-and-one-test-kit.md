@@ -64,3 +64,5 @@ Harder: the helper reports and does not act, so each run kind writes its own han
 5. Write the race scenarios with `gate` and `waitForStep` from `src/__tests__/restate/harness.ts`. Do not sleep to wait for a step.
 6. Name how a timeout and a cancel stop the run on each backend the run kind uses.
 7. Re-check ADR 034 and this ADR against the new run kind (`docs/standing-rules.md` rule 3), and amend them if a reason no longer holds.
+8. Use the lifecycle kit steps (`reserveOwnedRun`, `readOwnedRunStatus`, `cleanupOwnedRun`, `reportOwnedRunOutcome` in `src/restate/owned-run-lifecycle.ts`) around the wait. [ADR 036](036-an-owned-run-lifecycle-is-one-kit-and-one-contract-suite.md).
+9. Run the contract suite (`registerOwnedRunContract`) against the workflow, and list each `isRestateOwnedJob` fence with the kit step that replaces it. [ADR 036](036-an-owned-run-lifecycle-is-one-kit-and-one-contract-suite.md).
