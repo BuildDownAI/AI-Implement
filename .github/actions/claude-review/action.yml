@@ -1,0 +1,171 @@
+name: Claude review (review-findings/v1)
+description: >
+  Runs a Claude Code review against a pull request and posts a single comment
+  ending in a review-findings/v1 fenced block (ADR 020). The block is posted
+  by this action's own gh pr comment step, never by the underlying action's
+  comment tool, and --json-schema makes a run that returns no schema-valid
+  verdict fail the check rather than pass silently.
+
+inputs:
+  claude_code_oauth_token:
+    description: Claude Code OAuth token. Mutually exclusive with anthropic_api_key / Bedrock / Vertex, per the underlying action.
+    required: false
+  anthropic_api_key:
+    description: Anthropic API key, forwarded verbatim to anthropics/claude-code-action.
+    required: false
+  use_bedrock:
+    description: Forwarded verbatim to anthropics/claude-code-action's use_bedrock input. AWS credentials must already be in the job environment.
+    required: false
+  use_vertex:
+    description: Forwarded verbatim to anthropics/claude-code-action's use_vertex input. GCP credentials must already be in the job environment.
+    required: false
+  github_token:
+    description: Token used both by the nested claude-code-action run and by this action's own `gh pr comment` posting step.
+    required: true
+  pr_number:
+    description: Pull request number to review and comment on.
+    required: true
+  prompt_extra:
+    description: Extra instructions appended to the built-in review prompt.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Prepare review findings schema
+      id: prepare-schema
+      shell: bash
+      run: |
+        set -euo pipefail
+        {
+          echo "json<<EOF"
+          jq -c 'del(.. | .description?)' "${{ github.action_path }}/review-findings-schema.json"
+          echo "EOF"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Run Claude review
+      id: review
+      # Pinned to v1.0.217 (last known-good): floating @v1 moved to a build (0d0e0876) that broke
+      # the native binary install, failing every review within ~15s from 2026-09-08 22:20Z; upstream
+      # issue #1817 is still open and unresolved on later builds. Keep this pin in lockstep with the
+      # one in .github/workflows/claude.yml and claude-code-review.yml.
+      uses: anthropics/claude-code-action@9c5ddab2e6d17b83ea679153b31f1d5f023cf636  # v1.0.217
+      with:
+        allowed_bots: "*"
+        claude_code_oauth_token: ${{ inputs.claude_code_oauth_token }}
+        anthropic_api_key: ${{ inputs.anthropic_api_key }}
+        use_bedrock: ${{ inputs.use_bedrock }}
+        use_vertex: ${{ inputs.use_vertex }}
+        github_token: ${{ inputs.github_token }}
+        track_progress: true
+        prompt: |
+          REPO: ${{ github.repository }}
+          PR NUMBER: ${{ inputs.pr_number }}
+
+          Review the diff for this PR. Focus on:
+          - Correctness, edge cases, and likely bugs
+          - Security issues (especially around the GitHub Actions / secrets surface,
+            SQLite usage, GraphQL inputs, and shell escaping)
+          - Style consistency with the rest of the codebase (see CLAUDE.md)
+          - Test coverage gaps
+
+          Do not post any comment yourself — a later workflow step renders and posts the
+          review from your structured output. Respond only with the JSON object the
+          supplied schema requires: `summary` (your free-text review, carried into the
+          posted comment verbatim), `verdict` (`approve`, `changes_requested`, or
+          `incomplete`), and
+          `findings[]` (empty when the diff looks fine). Set verdict to changes_requested
+          whenever any finding should block merge. Set verdict to incomplete when you
+          cannot reach a trustworthy review verdict for this diff.
+
+          Never write a line consisting of three backticks alone inside a finding's
+          `body` or inside `summary` — the posted comment wraps them in fenced sections,
+          and a bare ``` line inside would close one of those sections early and corrupt
+          the rest of the comment, including the machine-readable block that follows it.
+
+          ${{ inputs.prompt_extra }}
+        claude_args: |
+          --json-schema '${{ steps.prepare-schema.outputs.json }}'
+          --allowedTools "Bash(gh pr diff:*),Bash(gh pr view:*)"
+
+    # The action above enforces the schema: base-action/src/run-claude-sdk.ts calls
+    # core.setFailed() and throws when the model returns no schema-valid structured_output,
+    # so this step never runs on a failed review — there is no `if:` here on purpose, and it
+    # must stay that way. Only this step calls `gh pr comment`; the review step's own
+    # comment tool is deliberately excluded from --allowedTools above.
+    - name: Render and post review comment
+      shell: bash
+      env:
+        STRUCTURED_OUTPUT: ${{ steps.review.outputs.structured_output }}
+        GH_TOKEN: ${{ inputs.github_token }}
+        PR_NUMBER: ${{ inputs.pr_number }}
+      run: |
+        set -euo pipefail
+
+        if ! jq -e . >/dev/null 2>&1 <<<"$STRUCTURED_OUTPUT"; then
+          echo "::error::claude-review: structured_output was not valid JSON"
+          exit 1
+        fi
+
+        if ! jq -e '
+          type == "object"
+          and ((keys_unsorted - ["verdict", "summary", "findings"]) | length == 0)
+          and ((.verdict == "approve") or (.verdict == "changes_requested") or (.verdict == "incomplete"))
+          and (.summary | type == "string")
+          and (.findings | type == "array")
+          and ([.findings[] |
+            type == "object"
+            and ((keys_unsorted - ["severity", "body", "path", "line"]) | length == 0)
+            and ((.severity == "blocking") or (.severity == "minor"))
+            and (.body | type == "string" and (gsub("[[:space:]]"; "") | length > 0))
+            and ((has("path") | not) or (.path | type == "string"))
+            and ((has("line") | not) or (.line | type == "number" and floor == .))
+          ] | all)
+        ' >/dev/null <<<"$STRUCTURED_OUTPUT"; then
+          echo "::error::claude-review: structured_output did not match review-findings/v1"
+          exit 1
+        fi
+
+        findings_count=$(jq -r '.findings | length' <<<"$STRUCTURED_OUTPUT")
+
+        {
+          echo "## Claude review"
+          echo
+          echo "**Verdict:** $(jq -r '.verdict' <<<"$STRUCTURED_OUTPUT")"
+          echo
+          jq -r '.summary' <<<"$STRUCTURED_OUTPUT"
+          echo
+          if [ "$findings_count" -gt 0 ]; then
+            echo "### Findings"
+            echo
+            jq -r '
+              def location:
+                if has("path") and has("line") then .path + ":" + (.line | tostring)
+                elif has("path") then .path
+                else ""
+                end;
+              .findings[] |
+              "- **[" + .severity + "]**"
+                + (if location != "" then " (" + location + ")" else "" end)
+                + ": " + .body
+            ' <<<"$STRUCTURED_OUTPUT"
+          else
+            echo "No findings reported."
+          fi
+          echo
+          echo '```json review-findings'
+          jq -c '{
+            schema: "review-findings/v1",
+            verdict,
+            findings: [
+              .findings[] |
+              {severity, body}
+              + (if has("path") then {path} else {} end)
+              + (if has("line") then {line} else {} end)
+            ]
+          }' <<<"$STRUCTURED_OUTPUT"
+          echo '```'
+        } > "$RUNNER_TEMP/claude-review-comment-body.md"
+
+        gh pr comment "$PR_NUMBER" --body-file "$RUNNER_TEMP/claude-review-comment-body.md"
