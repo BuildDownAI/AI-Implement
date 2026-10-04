@@ -21,8 +21,8 @@ vi.mock("../log.js", () => ({
   findLogIdByDispatchId: vi.fn().mockReturnValue(7),
   updateJobRunId: vi.fn(),
 }));
-vi.mock("../fly-machines.js", () => ({ getMachine: vi.fn(), destroyMachine: vi.fn() }));
-vi.mock("../local-docker.js", () => ({ inspectLocalContainer: vi.fn(), stopLocalContainer: vi.fn() }));
+vi.mock("../fly-machines.js", () => ({ getMachine: vi.fn(), destroyMachine: vi.fn(), listMachines: vi.fn() }));
+vi.mock("../local-docker.js", () => ({ inspectLocalContainer: vi.fn(), stopLocalContainer: vi.fn(), findLocalContainerIdByName: vi.fn() }));
 vi.mock("../stuck-watchdog.js", () => ({ remediateFailedJob: vi.fn().mockResolvedValue(undefined) }));
 vi.mock("../dispatch-admission.js", () => ({
   read: vi.fn(),
@@ -33,8 +33,9 @@ import { cancelWorkflowRun, getWorkflowRunStatus } from "../github.js";
 import { getJobByDispatchId, updateJobRunId, updateJobStatus } from "../log.js";
 import { read as readAdmission, releaseByDispatchId } from "../dispatch-admission.js";
 import { remediateFailedJob } from "../stuck-watchdog.js";
-import { destroyMachine, getMachine } from "../fly-machines.js";
-import { inspectLocalContainer, stopLocalContainer } from "../local-docker.js";
+import { destroyMachine, getMachine, listMachines } from "../fly-machines.js";
+import { findLocalContainerIdByName, inspectLocalContainer, stopLocalContainer } from "../local-docker.js";
+import { planningSessionName } from "../planning-launch.js";
 import {
   PLANNING_RUN_TITLE_PREFIX,
   createPlanningFindExistingRun,
@@ -67,7 +68,7 @@ describe("title prefix", () => {
 });
 
 describe("findExistingRun", () => {
-  const find = createPlanningFindExistingRun({ getMapping, getToken: async () => "tok" });
+  const find = createPlanningFindExistingRun({ getMapping, getToken: async () => "tok", flySessionsToken: "fly-token", flySessionsApp: "fly-app" });
 
   it("returns the run titled for this issue created at or after the dispatch time", async () => {
     const fetchMock = stubRuns([{ id: 5, display_title: title("ENG-1"), created_at: "2026-10-03T12:00:12Z" }]);
@@ -104,13 +105,61 @@ describe("findExistingRun", () => {
     await expect(find(INPUT, DISPATCHED_AT)).rejects.toThrow(/HTTP 502/);
   });
 
-  it.each(["fly-machines", "local-docker"] as const)("%s returns the machine id on the dispatch row, or null", async (backend) => {
+  it.each(["fly-machines", "local-docker"] as const)("%s returns the machine id on the dispatch row, or null when the name lookup finds nothing", async (backend) => {
+    vi.mocked(listMachines).mockReset().mockResolvedValue([]);
+    vi.mocked(findLocalContainerIdByName).mockReset().mockResolvedValue(null);
     vi.mocked(getJobByDispatchId).mockReturnValueOnce({ machineId: "m-9" } as never);
     expect(await find({ ...INPUT, backend }, DISPATCHED_AT)).toBe("m-9");
+    expect(listMachines).not.toHaveBeenCalled();
+    expect(findLocalContainerIdByName).not.toHaveBeenCalled();
     vi.mocked(getJobByDispatchId).mockReturnValueOnce({ machineId: null } as never);
     expect(await find({ ...INPUT, backend }, DISPATCHED_AT)).toBeNull();
     vi.mocked(getJobByDispatchId).mockReturnValueOnce(null);
     expect(await find({ ...INPUT, backend }, DISPATCHED_AT)).toBeNull();
+  });
+
+  describe("lookup by name when the row has no id", () => {
+    const NAME = planningSessionName(INPUT.dispatchId);
+    const fly = { ...INPUT, backend: "fly-machines" as const };
+    const docker = { ...INPUT, backend: "local-docker" as const };
+    beforeEach(() => {
+      vi.mocked(listMachines).mockReset();
+      vi.mocked(findLocalContainerIdByName).mockReset();
+      vi.mocked(getJobByDispatchId).mockReturnValue(null);
+    });
+    afterEach(() => vi.mocked(getJobByDispatchId).mockReset());
+
+    it("the name is the prefix and the dispatch id only", () => {
+      expect(NAME).toBe("planning-d-1");
+    });
+
+    it("fly: finds the machine by exact name, else null", async () => {
+      vi.mocked(listMachines).mockResolvedValue([{ id: "x", name: `${NAME}0` }, { id: "m-7", name: NAME }] as never);
+      expect(await find(fly, DISPATCHED_AT)).toBe("m-7");
+      expect(listMachines).toHaveBeenCalledWith("fly-token", "fly-app");
+      vi.mocked(listMachines).mockResolvedValue([{ id: "x", name: "session-eng-1" }] as never);
+      expect(await find(fly, DISPATCHED_AT)).toBeNull();
+    });
+
+    it("fly: a list error throws rather than answering null", async () => {
+      vi.mocked(listMachines).mockRejectedValue(new Error("Failed to list machines (502)"));
+      await expect(find(fly, DISPATCHED_AT)).rejects.toThrow(/502/);
+    });
+
+    it("fly: missing credentials throw", async () => {
+      const bare = createPlanningFindExistingRun({ getMapping, getToken: async () => "tok" });
+      await expect(bare(fly, DISPATCHED_AT)).rejects.toThrow(/FLY_SESSIONS/);
+    });
+
+    it("docker: returns the container id by name, null when none, and propagates an error", async () => {
+      vi.mocked(findLocalContainerIdByName).mockResolvedValueOnce("c-3");
+      expect(await find(docker, DISPATCHED_AT)).toBe("c-3");
+      expect(findLocalContainerIdByName).toHaveBeenCalledWith(NAME);
+      vi.mocked(findLocalContainerIdByName).mockResolvedValueOnce(null);
+      expect(await find(docker, DISPATCHED_AT)).toBeNull();
+      vi.mocked(findLocalContainerIdByName).mockRejectedValueOnce(new Error("daemon down"));
+      await expect(find(docker, DISPATCHED_AT)).rejects.toThrow(/daemon down/);
+    });
   });
 });
 

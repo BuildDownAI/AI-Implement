@@ -476,6 +476,10 @@ describe("buildSessionMachineConfig", () => {
     expect(result.name).toBe("session-eng-42");
   });
 
+  it("uses an explicit machineName instead of the issue-key name", () => {
+    expect(buildSessionMachineConfig({ ...baseInput, machineName: "planning-d-1" }).name).toBe("planning-d-1");
+  });
+
   it("defaults region to iad", () => {
     const result = buildSessionMachineConfig(baseInput);
     expect(result.region).toBe("iad");

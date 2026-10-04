@@ -13,7 +13,9 @@ import type { TicketIssue, TicketingProvider } from "../providers/types.js";
 import { defaultFetchSignal, cancelWorkflowRun, getWorkflowRunStatus } from "../github.js";
 import { getInstallationToken } from "../github-app-auth.js";
 import { findLogIdByDispatchId, getJobByDispatchId, updateJobRunId, updateJobStatus } from "../log.js";
-import type { launchPlanningRun, launchPlanningSession, preparePlanningLaunch } from "../planning-launch.js";
+import { planningSessionName, type launchPlanningRun, type launchPlanningSession, type preparePlanningLaunch } from "../planning-launch.js";
+import { listMachines } from "../fly-machines.js";
+import { findLocalContainerIdByName } from "../local-docker.js";
 import { remediateFailedJob, type StuckWatchdogConfig } from "../stuck-watchdog.js";
 import type { RestateService } from "./endpoint.js";
 import type { OwnedRunStatus } from "./owned-run-wait.js";
@@ -66,16 +68,31 @@ function requireMapping(getMapping: (teamKey: string) => RepoMapping | undefined
   return mapping;
 }
 
-/** Looks a planning run up by its exact title and creation time. `null` means only "GitHub answered, and
+/** Looks a planning run up: a container backend by the row's id, else by the name derived from the dispatch id;
+ *  GitHub Actions by its exact title and creation time. `null` means only "GitHub answered, and
  *  no run matches"; an HTTP error throws, so the workflow retries the lookup rather than launching a second run.
  *  GitHub stamps `created_at` to the second, so the dispatch time is floored to the second before the compare. */
 export function createPlanningFindExistingRun(opts: {
   getMapping: (teamKey: string) => RepoMapping | undefined;
   getToken: (owner: string) => Promise<string>;
+  /** The Fly sessions credentials for the by-name machine lookup; absent values throw. */
+  flySessionsToken?: string | null;
+  flySessionsApp?: string | null;
 }): PlanningRunDependencies["findExistingRun"] {
   return async (input, dispatchedAt) => {
-    // A machine or container id is recorded on the dispatch row by the launch itself.
-    if (containerBackend(input)) return getJobByDispatchId(input.dispatchId)?.machineId ?? null;
+    const backend = containerBackend(input);
+    if (backend) {
+      // The launch records the id on the dispatch row; a crash before that leaves only the name.
+      const recorded = getJobByDispatchId(input.dispatchId)?.machineId;
+      if (recorded) return recorded;
+      const name = planningSessionName(input.dispatchId);
+      if (backend === "local-docker") return findLocalContainerIdByName(name);
+      if (!opts.flySessionsToken || !opts.flySessionsApp) {
+        throw new Error("findExistingRun: FLY_SESSIONS_TOKEN or FLY_SESSIONS_APP not set");
+      }
+      const machines = await listMachines(opts.flySessionsToken, opts.flySessionsApp);
+      return machines.find((m) => m.name === name)?.id ?? null;
+    }
     const mapping = requireMapping(opts.getMapping, input.teamKey);
     const title = `${PLANNING_RUN_TITLE_PREFIX}${input.issueIdentifier}`;
     const floor = Math.floor(dispatchedAt / 1000) * 1000;
@@ -206,7 +223,7 @@ export function createProductionPlanningRunServices(input: PlanningRunProduction
   }
 
   const deps: PlanningRunDependencies = {
-    findExistingRun: createPlanningFindExistingRun({ getMapping, getToken }),
+    findExistingRun: createPlanningFindExistingRun({ getMapping, getToken, flySessionsToken: config.flySessionsToken, flySessionsApp: config.flySessionsApp }),
     launch,
     readStatus,
     stop,

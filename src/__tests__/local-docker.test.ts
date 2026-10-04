@@ -224,6 +224,13 @@ describe("buildDockerRunArgs", () => {
   });
 });
 
+describe("buildDockerRunArgs default name", () => {
+  it("keeps the issue-key name when no containerName is given", () => {
+    const args = buildDockerRunArgs(baseInput);
+    expect(args[args.indexOf("--name") + 1]).toMatch(/^ai-implement-eng-42-[a-z0-9]+$/);
+  });
+});
+
 describe("startLocalRunnerContainer", () => {
   it("calls the launch marker only after local preparation succeeds", async () => {
     let marked = false;
