@@ -14,7 +14,7 @@ The project's **Review-fix & Planning Lifecycle** switch (`reviewFixLifecycle`) 
 - **Failure comment:** a failed run gets the failure comment on the ticket.
 - **Breaker count:** one success or one failure is counted for each run, even when a step retries.
 - **No machine left:** the `cleanup` step removes the Fly machine or local container before the release. A cancel during the reserve or launch step is handled too: the escape path looks for a run the launch created, stops it, and releases the reservation (AII-1068).
-- **A stuck reservation:** list it with `list_dispatch_reservations` or the card on `/admin#deployments`, and release it with `release_dispatch_reservation` (AII-1069). A release without `force` needs a terminal job row or a run confirmed ended.
+- **A stuck reservation:** list it with `list_dispatch_reservations` or the card on `/admin#deployments`, and release it with `release_dispatch_reservation` (AII-1069). A release without `force` needs a run confirmed ended by the backend; a terminal job row alone is refused.
 
 See [restate.md](restate.md#the-planning-run) and [the fenced Legacy functions](restate.md#the-owned-run-lifecycle-kit).
 

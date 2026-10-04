@@ -453,11 +453,12 @@ describe("production deps", () => {
       expect(call[4]).toEqual({ ownerCall: true });
     });
 
-    it("closes an in-flight row as failed with its own conclusion after an invocation cancel", async () => {
+    it("closes an in-flight row as operator_cancelled after an invocation cancel, with no failure handling", async () => {
       vi.mocked(getJobByDispatchId).mockReturnValue(row as never);
       const { d } = compose();
       await d.finishJob("d-1", { kind: "cancelled" });
-      expect(updateJobStatus).toHaveBeenCalledWith(7, "failed", "workflow_cancelled");
+      expect(updateJobStatus).toHaveBeenCalledWith(7, "failed", "operator_cancelled");
+      expect(remediateFailedJob).not.toHaveBeenCalled();
     });
 
     it("does not count a second stuck attempt when a retry finds one stamped since the dispatch began", async () => {

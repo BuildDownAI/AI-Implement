@@ -121,7 +121,7 @@ export const deploymentsHtml = `
     <div class="card" id="reservations-card">
       <div class="card-header"><h2 class="card-title">Held dispatch reservations <span class="badge neutral" id="reservations-badge">—</span></h2></div>
       <div class="card-body">
-        <div class="kpi-trend text-secondary">Each held reservation counts as in-flight work, so a stuck one makes a deploy wait. Release frees it only when its run is confirmed ended; a refusal offers a forced release.</div>
+        <div class="kpi-trend text-secondary">Each held reservation counts as in-flight work, so a stuck one makes a deploy wait. Release frees it only when the backend confirms its run ended (a finished job row alone is not enough); a refusal offers a forced release.</div>
         <div id="reservations-message" class="kpi-trend" hidden></div>
         <div id="reservations-list" style="margin-top: 8px"></div>
       </div>

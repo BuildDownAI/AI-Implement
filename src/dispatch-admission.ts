@@ -475,28 +475,20 @@ export function listHeldReservations(now: number = Date.now()): HeldReservation[
 }
 
 export type ReleaseHeldReservationResult =
-  | { readonly status: "released"; readonly dispatchId: string; readonly lifecycleOwner: string; readonly phase: string; readonly forced: boolean; readonly basis: "forced" | "job_terminal" | "backend_confirmed" }
+  | { readonly status: "released"; readonly dispatchId: string; readonly lifecycleOwner: string; readonly phase: string; readonly forced: boolean; readonly basis: "forced" | "backend_confirmed" }
   | { readonly status: "nothing_to_release"; readonly dispatchId: string }
   | { readonly status: "refused"; readonly dispatchId: string; readonly reason: string };
-
-const TERMINAL_JOB_STATUSES: ReadonlySet<string> = new Set(["completed", "review_failed", "failed", "timed_out", "dispatch-failed"]);
 
 function jobBelongsToGeneration(job: Job, generation: number): boolean {
   return job.admissionGeneration === null || job.admissionGeneration === generation;
 }
 
-function jobIsTerminalFor(job: Job | null, generation: number): boolean {
-  if (!job || !TERMINAL_JOB_STATUSES.has(job.status)) return false;
-  // A terminal job of an earlier reservation under the same dispatch id says nothing
-  // about this one.
-  return jobBelongsToGeneration(job, generation);
-}
-
 /**
  * The operator release (AII-1069). Reuses `releaseByDispatchId` for the write and the
  * caller's `confirmTerminated` (the orchestrator's `confirmAdmissionTerminated`) for the
- * "did the run end" rule. Without `force` it releases only when the job row is terminal
- * or the backend run is confirmed ended; with `force` it releases unconditionally. An
+ * "did the run end" rule. Without `force` it releases only when the backend run is
+ * confirmed ended; a terminal job row alone is not proof (the planning callback closes the
+ * row while the run may still execute). With `force` it releases unconditionally. An
  * unknown or already-released id changes nothing.
  */
 export async function releaseHeldReservation(
@@ -506,34 +498,32 @@ export async function releaseHeldReservation(
   const record = read(dispatchId);
   if (!record || record.releasedAt !== null) return { status: "nothing_to_release", dispatchId };
 
-  let basis: "forced" | "job_terminal" | "backend_confirmed" = "forced";
+  let basis: "forced" | "backend_confirmed" = "forced";
   if (!opts.force) {
-    if (jobIsTerminalFor(getJobByDispatchId(dispatchId), record.generation)) {
-      basis = "job_terminal";
-    } else {
-      let confirmed = false;
-      try {
-        confirmed = await opts.confirmTerminated({
-          dispatchId: record.dispatchId,
-          mappingKey: record.mappingKey,
-          backend: record.backend,
-          lifecycleOwner: record.lifecycleOwner,
-          generation: record.generation,
-          ageMs: Math.max(0, Date.now() - record.createdAt),
-        });
-      } catch (err) {
-        console.error(`[admission] confirmTerminated threw for dispatch=${dispatchId}:`, err);
-      }
-      if (!confirmed) {
-        return {
-          status: "refused",
-          dispatchId,
-          reason:
-            "the run is not confirmed ended: its job row is not terminal and the backend did not report it finished (a Restate-owned or job-less reservation can never be confirmed). Pass force to release it anyway",
-        };
-      }
-      basis = "backend_confirmed";
+    let confirmed = false;
+    try {
+      confirmed = await opts.confirmTerminated({
+        dispatchId: record.dispatchId,
+        mappingKey: record.mappingKey,
+        backend: record.backend,
+        lifecycleOwner: record.lifecycleOwner,
+        generation: record.generation,
+        ageMs: Math.max(0, Date.now() - record.createdAt),
+      });
+    } catch (err) {
+      console.error(`[admission] confirmTerminated threw for dispatch=${dispatchId}:`, err);
     }
+    if (!confirmed) {
+      const latest = getJobByDispatchId(dispatchId);
+      const job = latest && jobBelongsToGeneration(latest, record.generation) ? latest : null;
+      const jobText = job ? `its job row is ${job.status}, which does not show the run ended` : "it has no job row";
+      return {
+        status: "refused",
+        dispatchId,
+        reason: `the run is not confirmed ended: ${jobText}, and the backend did not report it finished (a Restate-owned or job-less reservation can never be confirmed). Pass force to release it anyway`,
+      };
+    }
+    basis = "backend_confirmed";
   }
 
   // Release the generation read above, not whatever holds the id after the awaited check.
