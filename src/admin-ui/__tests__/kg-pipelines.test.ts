@@ -188,4 +188,13 @@ describe("kg materialize-mode control (AII-602)", () => {
     expect(kgPipelinesScript).toContain("loadKgMaterializeMode();");
     expect(kgPipelinesScript).toContain("setInterval(loadKgMaterializeMode, 15000)");
   });
+
+  it("renders the runs table after the refresh card, filtered to kg-refresh", () => {
+    for (const id of ["kglog-body", "kglog-time-type", "kglog-count", "kglog-empty"]) {
+      expect(kgPipelinesHtml).toContain(`id="${id}"`);
+      expect(kgPipelinesHtml.indexOf(`id="${id}"`)).toBeGreaterThan(kgPipelinesHtml.indexOf('id="kg-refresh-card"'));
+    }
+    expect(kgPipelinesScript).toContain("if (window.createDispatchLog) window.createDispatchLog('kglog'");
+    expect(kgPipelinesScript).toContain("e.phase === 'kg-refresh'");
+  });
 });

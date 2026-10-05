@@ -33,7 +33,8 @@ describe("pipelines page time filter", () => {
       "if (isRange) { stopLogAutoRefresh(); } else { startLogAutoRefresh(); }",
     );
     // registerPage uses the managed auto-refresh, not a bare setInterval
-    expect(pipelinesScript).toMatch(/registerPage\('jobs',[\s\S]*startLogAutoRefresh\(\);/);
+    expect(pipelinesScript).toMatch(/startLogAutoRefresh\(\);\n      }\n    };/);
+    expect(pipelinesScript).toMatch(/registerPage\('jobs',[\s\S]*pipelinesLog\.start\(\);/);
   });
 });
 
@@ -65,7 +66,7 @@ describe("pipelines page — kg-refresh row actions (AII-521)", () => {
   });
 
   it("reload the log after a successful cancel", () => {
-    expect(pipelinesScript).toContain("loadLog()");
+    expect(pipelinesScript).toContain(".then(function () { load(); })");
   });
 });
 

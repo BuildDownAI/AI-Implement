@@ -1,3 +1,55 @@
+// The time filter and Refresh button. Split from the card so the Pipelines page can place them in
+// its header while the KG page renders both together through dispatchLogHtml.
+function dispatchLogControlsHtml(prefix: string): string {
+  return `
+      <fieldset style="border:1px solid var(--border);border-radius:6px;padding:2px 10px 6px;margin:0;display:flex;align-items:center;gap:6px">
+        <legend style="font-size:0.7em;color:var(--fg-tertiary);padding:0 4px;margin-left:2px">Time Filter</legend>
+        <select id="${prefix}-time-type" class="select" style="width:auto;height:30px" onchange="window.dispatchLogs['${prefix}'].onTimeTypeChange()">
+          <option value="relative">Relative</option>
+          <option value="range">Time range</option>
+        </select>
+        <div id="${prefix}-rel-controls" style="display:flex;align-items:center;gap:4px">
+          <input id="${prefix}-rel-n" type="number" class="input" style="width:58px;height:30px;padding:0 7px" min="1" max="999" value="7" onchange="window.dispatchLogs['${prefix}'].load()">
+          <select id="${prefix}-rel-unit" class="select" style="width:auto;height:30px" onchange="window.dispatchLogs['${prefix}'].load()">
+            <option value="h">h</option>
+            <option value="d" selected>d</option>
+            <option value="w">w</option>
+          </select>
+        </div>
+        <div id="${prefix}-range-controls" style="display:none;align-items:center;gap:4px">
+          <input id="${prefix}-range-start" type="datetime-local" class="input" style="width:175px;height:30px;padding:0 7px" onchange="window.dispatchLogs['${prefix}'].load()">
+          <span style="color:var(--fg-tertiary)">&#8594;</span>
+          <input id="${prefix}-range-end" type="datetime-local" class="input" style="width:175px;height:30px;padding:0 7px" onchange="window.dispatchLogs['${prefix}'].load()">
+        </div>
+      </fieldset>
+      <button class="btn btn-sm" onclick="window.dispatchLogs['${prefix}'].load()" style="height:30px;align-self:flex-end;padding:0 12px;margin-bottom:6px">&#8635; Refresh</button>
+`;
+}
+
+function dispatchLogCardHtml(prefix: string, opts: { title: string; emptyText: string }): string {
+  return `
+    <div class="card">
+      <div class="card-header">
+        <h2 class="card-title">${opts.title}</h2>
+        <div class="card-subtitle"><span id="${prefix}-count">&mdash;</span> &middot; <span id="lu-${prefix}" class="text-tertiary"></span></div>
+      </div>
+      <div class="card-body tight">
+        <table class="tbl">
+          <thead><tr><th>Time</th><th>#</th><th>Issue</th><th>State</th><th>Team</th><th>Repo</th><th>Runner</th><th>Image</th><th>Status</th><th>PR</th></tr></thead>
+          <tbody id="${prefix}-body"></tbody>
+        </table>
+        <div id="${prefix}-empty" class="hidden text-tertiary" style="padding:12px">${opts.emptyText}</div>
+      </div>
+    </div>
+`;
+}
+
+// Instance markup for one dispatch log. Every id carries the prefix, and the inline handlers
+// call the instance registered under it, so two logs on one document stay independent.
+export function dispatchLogHtml(prefix: string, opts: { title: string; emptyText: string }): string {
+  return `<div style="display:flex;align-items:stretch;justify-content:flex-end;gap:8px;flex-wrap:wrap;margin-bottom:12px">${dispatchLogControlsHtml(prefix)}</div>${dispatchLogCardHtml(prefix, opts)}`;
+}
+
 export const pipelinesHtml = `
 <section data-page="jobs" hidden>
   <header class="page-header">
@@ -6,290 +58,23 @@ export const pipelinesHtml = `
       <div class="page-subtitle">Recent dispatches — running pipelines appear at the top</div>
     </div>
     <div class="page-header-actions" style="display:flex;align-items:stretch;gap:8px;flex-wrap:wrap">
-      <fieldset style="border:1px solid var(--border);border-radius:6px;padding:2px 10px 6px;margin:0;display:flex;align-items:center;gap:6px">
-        <legend style="font-size:0.7em;color:var(--fg-tertiary);padding:0 4px;margin-left:2px">Time Filter</legend>
-        <select id="log-time-type" class="select" style="width:auto;height:30px" onchange="onTimeTypeChange()">
-          <option value="relative">Relative</option>
-          <option value="range">Time range</option>
-        </select>
-        <div id="log-rel-controls" style="display:flex;align-items:center;gap:4px">
-          <input id="log-rel-n" type="number" class="input" style="width:58px;height:30px;padding:0 7px" min="1" max="999" value="7" onchange="loadLog()">
-          <select id="log-rel-unit" class="select" style="width:auto;height:30px" onchange="loadLog()">
-            <option value="h">h</option>
-            <option value="d" selected>d</option>
-            <option value="w">w</option>
-          </select>
-        </div>
-        <div id="log-range-controls" style="display:none;align-items:center;gap:4px">
-          <input id="log-range-start" type="datetime-local" class="input" style="width:175px;height:30px;padding:0 7px" onchange="loadLog()">
-          <span style="color:var(--fg-tertiary)">&#8594;</span>
-          <input id="log-range-end" type="datetime-local" class="input" style="width:175px;height:30px;padding:0 7px" onchange="loadLog()">
-        </div>
-      </fieldset>
-      <button class="btn btn-sm" onclick="loadLog()" style="height:30px;align-self:flex-end;padding:0 12px;margin-bottom:6px">&#8635; Refresh</button>
+${dispatchLogControlsHtml("log")}
     </div>
   </header>
   <div class="page-body">
-    <div class="card">
-      <div class="card-header">
-        <h2 class="card-title">Jobs</h2>
-        <div class="card-subtitle"><span id="log-count">&mdash;</span> &middot; <span id="lu-log" class="text-tertiary"></span></div>
-      </div>
-      <div class="card-body tight">
-        <table class="tbl">
-          <thead><tr><th>Time</th><th>#</th><th>Issue</th><th>State</th><th>Team</th><th>Repo</th><th>Runner</th><th>Image</th><th>Status</th><th>PR</th></tr></thead>
-          <tbody id="log-body"></tbody>
-        </table>
-        <div id="log-empty" class="hidden text-tertiary" style="padding:12px">No dispatches yet</div>
-      </div>
-    </div>
+${dispatchLogCardHtml("log", { title: "Jobs", emptyText: "No jobs in the selected time range" })}
   </div>
 </section>
 `;
 
 export const pipelinesScript = `
 (function () {
+  window.dispatchLogs = window.dispatchLogs || {};
+
   function setLastUpdated(id) {
     const el = document.getElementById(id);
     if (el) el.textContent = 'updated ' + new Date().toLocaleTimeString();
   }
-
-  function getTimeFilter() {
-    const type = document.getElementById('log-time-type').value;
-    if (type === 'relative') {
-      const n = parseInt(document.getElementById('log-rel-n').value, 10) || 7;
-      const unit = document.getElementById('log-rel-unit').value;
-      const ms = { h: 3600000, d: 86400000, w: 604800000 };
-      return '?since=' + (Date.now() - n * (ms[unit] || ms.d));
-    }
-    const start = document.getElementById('log-range-start').value;
-    const end   = document.getElementById('log-range-end').value;
-    const parts = [];
-    if (start) parts.push('since=' + new Date(start).getTime());
-    if (end)   parts.push('until=' + new Date(end).getTime());
-    return parts.length ? '?' + parts.join('&') : '';
-  }
-
-  function getFilterLabel() {
-    const type = document.getElementById('log-time-type').value;
-    if (type === 'relative') {
-      const n = parseInt(document.getElementById('log-rel-n').value, 10) || 7;
-      const unit = document.getElementById('log-rel-unit').value;
-      return 'last ' + n + unit;
-    }
-    const start = document.getElementById('log-range-start').value;
-    const end   = document.getElementById('log-range-end').value;
-    if (start && end) return new Date(start).toLocaleDateString() + ' → ' + new Date(end).toLocaleDateString();
-    if (start)        return 'from ' + new Date(start).toLocaleDateString();
-    if (end)          return 'until ' + new Date(end).toLocaleDateString();
-    return 'all time';
-  }
-
-  let _logRefreshInterval = null;
-
-  function startLogAutoRefresh() {
-    if (_logRefreshInterval) return;
-    _logRefreshInterval = setInterval(function () { loadLog(); }, 15000);
-  }
-
-  function stopLogAutoRefresh() {
-    if (_logRefreshInterval) { clearInterval(_logRefreshInterval); _logRefreshInterval = null; }
-  }
-
-  function onTimeTypeChange() {
-    const rel   = document.getElementById('log-rel-controls');
-    const range = document.getElementById('log-range-controls');
-    const isRange = document.getElementById('log-time-type').value === 'range';
-    rel.style.display   = isRange ? 'none' : 'flex';
-    range.style.display = isRange ? 'flex' : 'none';
-    if (isRange) { stopLogAutoRefresh(); } else { startLogAutoRefresh(); }
-    loadLog();
-  }
-  window.onTimeTypeChange = onTimeTypeChange;
-
-  async function loadLog() {
-    try {
-      const res = await window.api('/api/log' + getTimeFilter());
-      const data = await res.json();
-      const tbody = document.getElementById('log-body');
-      const empty = document.getElementById('log-empty');
-      const countEl = document.getElementById('log-count');
-      tbody.innerHTML = '';
-      if (data.length === 0) {
-        empty.textContent = 'No jobs in the selected time range';
-        empty.classList.remove('hidden');
-        if (countEl) countEl.textContent = '0 jobs · ' + getFilterLabel();
-        setLastUpdated('lu-log');
-        return;
-      }
-      empty.classList.add('hidden');
-
-      const statusClass = {
-        unknown: 'neutral',
-        dispatched: 'neutral',
-        running: 'running',
-        completed: 'success',
-        review_failed: 'warn',
-        failed: 'fail',
-        'dispatch-failed': 'fail',
-        timed_out: 'warn'
-      };
-
-      function makeBadge(cls, text) {
-        return '<span class="badge tight ' + cls + '">' + window.esc(text) + '</span>';
-      }
-      function isReviewIncomplete(status, conclusion, failure) {
-        if (status !== 'review_failed') return false;
-        const code = failure && typeof failure.code === 'string' ? failure.code : conclusion;
-        const stage = failure && typeof failure.stage === 'string' ? failure.stage : '';
-        return code === 'REVIEWER_TURNS_EXHAUSTED'
-          || code === 'invalid_review'
-          || code === 'review_invalid'
-          || (code === 'PROVIDER_UNAVAILABLE' && (!stage || stage.includes('review')));
-      }
-      function statusBadge(status, conclusion, failure) {
-        if (status === 'timed_out' && conclusion === 'stuck_giveup') {
-          return makeBadge('fail', 'Needs human');
-        }
-        const label = isReviewIncomplete(status, conclusion, failure)
-          ? 'review incomplete'
-          : status === 'review_failed'
-            ? 'review failed'
-            : (status || 'dispatched');
-        return makeBadge(statusClass[status] || 'neutral', label);
-      }
-      function execBadge(mode, runnerMode) {
-        const short = mode === 'local-docker' ? 'docker' : mode === 'fly-machines' ? 'fly' : 'gha';
-        const cls = short === 'fly' ? 'info' : 'neutral';
-        return makeBadge(cls, short)
-          + (runnerMode ? ' <span style="color:var(--fg-tertiary);font-size:0.85em">(' + window.esc(runnerMode) + ')</span>' : '');
-      }
-      function phaseBadge(phase) {
-        if (phase === 'planning') return makeBadge('info', 'plan');
-        if (phase === 'kg-refresh') return makeBadge('info', 'kg');
-        return makeBadge('neutral', 'impl');
-      }
-
-      function logsButton(entry) {
-        if (!entry.machineId) return '';
-        const target = entry.executionMode === 'local-docker'
-          ? 'data-local-job-id="' + window.escAttr(entry.id) + '" data-issue-identifier="' + window.escAttr(entry.issueIdentifier || entry.issueId) + '"'
-          : 'data-machine-id="' + window.escAttr(entry.machineId) + '"';
-        return '<button ' + target + ' style="background:none;border:none;cursor:pointer;padding:0;color:var(--accent);font:inherit">Logs</button>';
-      }
-
-      // Group planning + implement phases that belong to the same job:
-      // a planning dispatch (dn=N) followed by an implement dispatch (dn=N+1) for the same issue.
-      const consumed = new Set();
-      const grouped = [];
-      for (let i = 0; i < data.length; i++) {
-        if (consumed.has(i)) continue;
-        const e = data[i];
-        if (e.phase !== 'planning') {
-          const dn = e.dispatchNumber || 1;
-          const planIdx = data.findIndex(function (p, j) {
-            return !consumed.has(j) && j !== i &&
-              p.issueId === e.issueId &&
-              p.phase === 'planning' &&
-              (p.dispatchNumber || 1) === dn - 1;
-          });
-          if (planIdx !== -1) {
-            grouped.push({ type: 'group', plan: data[planIdx], impl: e });
-            consumed.add(i);
-            consumed.add(planIdx);
-            continue;
-          }
-        }
-        grouped.push({ type: 'single', entry: e });
-        consumed.add(i);
-      }
-
-      if (countEl) countEl.textContent = grouped.length + ' job' + (grouped.length === 1 ? '' : 's') + ' · ' + getFilterLabel();
-
-      for (const item of grouped) {
-        const tr = document.createElement('tr');
-        tr.setAttribute('data-job-id', String(item.type === 'group' ? item.impl.id : item.entry.id));
-        if (item.type === 'group') {
-          const plan = item.plan;
-          const impl = item.impl;
-          const dt = new Date(plan.dispatchedAt).toLocaleString();
-          const issueLabel = (impl.issueIdentifier || impl.issueId) + (impl.issueTitle ? ': ' + window.esc(impl.issueTitle) : '');
-          const dn2 = plan.dispatchNumber || 1;
-          const isRedispatch = dn2 > 1;
-          if (isRedispatch) tr.classList.add('redispatch-row');
-          const dnBadge = isRedispatch
-            ? '<span style="color:#d63384;font-weight:bold" title="Re-dispatch">' + dn2 + '</span>'
-            : '' + dn2;
-          const runnerCell = phaseBadge(plan.phase) + ' ' + execBadge(plan.executionMode, null) + ' <span style="color:#aaa">→</span> ' + phaseBadge(impl.phase) + ' ' + execBadge(impl.executionMode, impl.runnerMode);
-          const imageCell = impl.sessionImage
-            ? '<td class="mono" title="' + window.escAttr(impl.sessionImage) + '">' + window.esc(impl.sessionImage.split('/').pop()) + '</td>'
-            : '<td style="color:#aaa">—</td>';
-          // A grouped row exists only when an implement dispatch followed this plan,
-          // which requires plan approval — so a plan row stranded in a non-terminal
-          // status (e.g. 'unknown' after an orchestrator restart) is known-completed.
-          const planStatus = (plan.status === 'unknown' || plan.status === 'dispatched' || plan.status === 'running')
-            ? 'completed' : plan.status;
-          const combinedStatus = statusBadge(planStatus, plan.conclusion, plan.failure) + ' <span style="color:#aaa;font-size:0.8em">→</span> ' + statusBadge(impl.status, impl.conclusion, impl.failure);
-          const prLink = impl.prUrl ? '<a href="' + window.safeUrl(impl.prUrl) + '" target="_blank">View</a>' : '—';
-          const logs = logsButton(impl);
-          tr.innerHTML = '<td style="white-space:nowrap">' + dt + '</td>'
-            + '<td style="text-align:center">' + dnBadge + '</td>'
-            + '<td class="mono">' + issueLabel + '</td>'
-            + '<td class="mono">' + window.esc(impl.issueState || '—') + '</td>'
-            + '<td class="mono">' + window.esc(impl.teamKey || '—') + '</td>'
-            + '<td class="mono">' + window.esc(impl.repo || '—') + '</td>'
-            + '<td>' + runnerCell + '</td>'
-            + imageCell
-            + '<td>' + combinedStatus + '</td>'
-            + '<td>' + prLink + (logs ? ' ' + logs : '') + '</td>';
-        } else {
-          const entry = item.entry;
-          const dt = new Date(entry.dispatchedAt).toLocaleString();
-          const issueLabel = (entry.issueIdentifier || entry.issueId) + (entry.issueTitle ? ': ' + window.esc(entry.issueTitle) : '');
-          const dn3 = entry.dispatchNumber || 1;
-          const isRedispatch = dn3 > 1;
-          if (isRedispatch) tr.classList.add('redispatch-row');
-          const dnBadge = isRedispatch
-            ? '<span style="color:#d63384;font-weight:bold" title="Re-dispatch">' + dn3 + '</span>'
-            : '' + dn3;
-          const runnerCell = phaseBadge(entry.phase) + ' ' + execBadge(entry.executionMode, entry.runnerMode);
-          const imageCell = entry.sessionImage
-            ? '<td class="mono" title="' + window.escAttr(entry.sessionImage) + '">' + window.esc(entry.sessionImage.split('/').pop()) + '</td>'
-            : '<td style="color:#aaa">—</td>';
-          let logCell;
-          if (entry.machineId) {
-            logCell = logsButton(entry);
-          } else if (entry.prUrl) {
-            logCell = '<a href="' + window.safeUrl(entry.prUrl) + '" target="_blank">View</a>';
-          } else {
-            logCell = '—';
-          }
-          const isInflight = entry.status === 'running' || entry.status === 'dispatched';
-          const isKgRefresh = entry.phase === 'kg-refresh';
-          const cancelId = entry.machineId || (entry.executionMode === 'github-actions' ? String(entry.id) : null);
-          const cancelCell = (isKgRefresh && isInflight && cancelId)
-            ? '<button data-cancel-id="' + window.escAttr(cancelId) + '" title="Cancel this run" style="background:none;border:none;cursor:pointer;padding:0 0 0 8px;color:var(--fail-fg,#dc2626);font:inherit">\u23f9 Stop</button>'
-            : '';
-          tr.innerHTML = '<td style="white-space:nowrap">' + dt + '</td>'
-            + '<td style="text-align:center">' + dnBadge + '</td>'
-            + '<td class="mono">' + issueLabel + '</td>'
-            + '<td class="mono">' + window.esc(entry.issueState || '—') + '</td>'
-            + '<td class="mono">' + window.esc(entry.teamKey || '—') + '</td>'
-            + '<td class="mono">' + window.esc(entry.repo || '—') + '</td>'
-            + '<td>' + runnerCell + '</td>'
-            + imageCell
-            + '<td>' + statusBadge(entry.status, entry.conclusion, entry.failure) + '</td>'
-            + '<td>' + logCell + cancelCell + '</td>';
-        }
-        tbody.appendChild(tr);
-      }
-      wireRowClicks();
-      setLastUpdated('lu-log');
-    } catch (err) {
-      console.error('loadLog failed:', err);
-    }
-  }
-  window.loadLog = loadLog;
 
   async function viewMachineLogs(machineId) {
     const dialog = document.createElement('dialog');
@@ -320,46 +105,303 @@ export const pipelinesScript = `
     }
   }
 
-  function wireRowClicks() {
-    // The job drawer reads the job-steps and mapping endpoints, both Admin-only, so opening it as a
-    // user could only ever report failure. The table itself is the granted read and works.
-    if (!window.isAdmin()) return;
-    const tbody = document.getElementById('log-body');
-    if (!tbody || tbody.dataset.drawerWired) return;
-    tbody.addEventListener('click', function (e) {
-      const target = e.target;
-      if (target.closest('a')) return;
-      const localLogsBtn = target.closest('[data-local-job-id]');
-      if (localLogsBtn) {
-        window.openLocalJobLogs(Number(localLogsBtn.getAttribute('data-local-job-id')), localLogsBtn.getAttribute('data-issue-identifier'));
-        return;
+  window.createDispatchLog = function (prefix, opts) {
+    opts = opts || {};
+    function el(suffix) { return document.getElementById(prefix + '-' + suffix); }
+
+    function getTimeFilter() {
+      const type = el('time-type').value;
+      if (type === 'relative') {
+        const n = parseInt(el('rel-n').value, 10) || 7;
+        const unit = el('rel-unit').value;
+        const ms = { h: 3600000, d: 86400000, w: 604800000 };
+        return '?since=' + (Date.now() - n * (ms[unit] || ms.d));
       }
-      const logsBtn = target.closest('[data-machine-id]');
-      if (logsBtn) {
-        viewMachineLogs(logsBtn.getAttribute('data-machine-id'));
-        return;
+      const start = el('range-start').value;
+      const end   = el('range-end').value;
+      const parts = [];
+      if (start) parts.push('since=' + new Date(start).getTime());
+      if (end)   parts.push('until=' + new Date(end).getTime());
+      return parts.length ? '?' + parts.join('&') : '';
+    }
+
+    function getFilterLabel() {
+      const type = el('time-type').value;
+      if (type === 'relative') {
+        const n = parseInt(el('rel-n').value, 10) || 7;
+        const unit = el('rel-unit').value;
+        return 'last ' + n + unit;
       }
-      const cancelBtn = target.closest('[data-cancel-id]');
-      if (cancelBtn) {
-        const cancelId = cancelBtn.getAttribute('data-cancel-id');
-        if (cancelId && confirm('Stop this KG-refresh run? The machine will be destroyed and the job closed.')) {
-          window.api('/api/sessions/' + encodeURIComponent(cancelId), { method: 'DELETE' })
-            .then(function () { loadLog(); })
-            .catch(function (err) { console.error('cancel failed:', err); });
+      const start = el('range-start').value;
+      const end   = el('range-end').value;
+      if (start && end) return new Date(start).toLocaleDateString() + ' → ' + new Date(end).toLocaleDateString();
+      if (start)        return 'from ' + new Date(start).toLocaleDateString();
+      if (end)          return 'until ' + new Date(end).toLocaleDateString();
+      return 'all time';
+    }
+
+    let _logRefreshInterval = null;
+
+    function startLogAutoRefresh() {
+      if (_logRefreshInterval) return;
+      _logRefreshInterval = setInterval(function () { load(); }, 15000);
+    }
+
+    function stopLogAutoRefresh() {
+      if (_logRefreshInterval) { clearInterval(_logRefreshInterval); _logRefreshInterval = null; }
+    }
+
+    function onTimeTypeChange() {
+      const rel   = el('rel-controls');
+      const range = el('range-controls');
+      const isRange = el('time-type').value === 'range';
+      rel.style.display   = isRange ? 'none' : 'flex';
+      range.style.display = isRange ? 'flex' : 'none';
+      if (isRange) { stopLogAutoRefresh(); } else { startLogAutoRefresh(); }
+      load();
+    }
+
+    async function load() {
+      try {
+        const res = await window.api('/api/log' + getTimeFilter());
+        const rows = await res.json();
+        const data = opts.filter ? rows.filter(opts.filter) : rows;
+        const tbody = el('body');
+        const empty = el('empty');
+        const countEl = el('count');
+        tbody.innerHTML = '';
+        if (data.length === 0) {
+          empty.textContent = opts.emptyText || empty.textContent || 'No jobs in the selected time range';
+          empty.classList.remove('hidden');
+          if (countEl) countEl.textContent = '0 jobs · ' + getFilterLabel();
+          setLastUpdated('lu-' + prefix);
+          return;
         }
-        return;
+        empty.classList.add('hidden');
+
+        const statusClass = {
+          unknown: 'neutral',
+          dispatched: 'neutral',
+          running: 'running',
+          completed: 'success',
+          review_failed: 'warn',
+          failed: 'fail',
+          'dispatch-failed': 'fail',
+          timed_out: 'warn'
+        };
+
+        function makeBadge(cls, text) {
+          return '<span class="badge tight ' + cls + '">' + window.esc(text) + '</span>';
+        }
+        function isReviewIncomplete(status, conclusion, failure) {
+          if (status !== 'review_failed') return false;
+          const code = failure && typeof failure.code === 'string' ? failure.code : conclusion;
+          const stage = failure && typeof failure.stage === 'string' ? failure.stage : '';
+          return code === 'REVIEWER_TURNS_EXHAUSTED'
+            || code === 'invalid_review'
+            || code === 'review_invalid'
+            || (code === 'PROVIDER_UNAVAILABLE' && (!stage || stage.includes('review')));
+        }
+        function statusBadge(status, conclusion, failure) {
+          if (status === 'timed_out' && conclusion === 'stuck_giveup') {
+            return makeBadge('fail', 'Needs human');
+          }
+          const label = isReviewIncomplete(status, conclusion, failure)
+            ? 'review incomplete'
+            : status === 'review_failed'
+              ? 'review failed'
+              : (status || 'dispatched');
+          return makeBadge(statusClass[status] || 'neutral', label);
+        }
+        function execBadge(mode, runnerMode) {
+          const short = mode === 'local-docker' ? 'docker' : mode === 'fly-machines' ? 'fly' : 'gha';
+          const cls = short === 'fly' ? 'info' : 'neutral';
+          return makeBadge(cls, short)
+            + (runnerMode ? ' <span style="color:var(--fg-tertiary);font-size:0.85em">(' + window.esc(runnerMode) + ')</span>' : '');
+        }
+        function phaseBadge(phase) {
+          if (phase === 'planning') return makeBadge('info', 'plan');
+          if (phase === 'kg-refresh') return makeBadge('info', 'kg');
+          return makeBadge('neutral', 'impl');
+        }
+
+        function logsButton(entry) {
+          if (!entry.machineId) return '';
+          const target = entry.executionMode === 'local-docker'
+            ? 'data-local-job-id="' + window.escAttr(entry.id) + '" data-issue-identifier="' + window.escAttr(entry.issueIdentifier || entry.issueId) + '"'
+            : 'data-machine-id="' + window.escAttr(entry.machineId) + '"';
+          return '<button ' + target + ' style="background:none;border:none;cursor:pointer;padding:0;color:var(--accent);font:inherit">Logs</button>';
+        }
+
+        // Group planning + implement phases that belong to the same job:
+        // a planning dispatch (dn=N) followed by an implement dispatch (dn=N+1) for the same issue.
+        const consumed = new Set();
+        const grouped = [];
+        for (let i = 0; i < data.length; i++) {
+          if (consumed.has(i)) continue;
+          const e = data[i];
+          if (e.phase !== 'planning') {
+            const dn = e.dispatchNumber || 1;
+            const planIdx = data.findIndex(function (p, j) {
+              return !consumed.has(j) && j !== i &&
+                p.issueId === e.issueId &&
+                p.phase === 'planning' &&
+                (p.dispatchNumber || 1) === dn - 1;
+            });
+            if (planIdx !== -1) {
+              grouped.push({ type: 'group', plan: data[planIdx], impl: e });
+              consumed.add(i);
+              consumed.add(planIdx);
+              continue;
+            }
+          }
+          grouped.push({ type: 'single', entry: e });
+          consumed.add(i);
+        }
+
+        if (countEl) countEl.textContent = grouped.length + ' job' + (grouped.length === 1 ? '' : 's') + ' · ' + getFilterLabel();
+
+        for (const item of grouped) {
+          const tr = document.createElement('tr');
+          tr.setAttribute('data-job-id', String(item.type === 'group' ? item.impl.id : item.entry.id));
+          if (item.type === 'group') {
+            const plan = item.plan;
+            const impl = item.impl;
+            const dt = new Date(plan.dispatchedAt).toLocaleString();
+            const issueLabel = (impl.issueIdentifier || impl.issueId) + (impl.issueTitle ? ': ' + window.esc(impl.issueTitle) : '');
+            const dn2 = plan.dispatchNumber || 1;
+            const isRedispatch = dn2 > 1;
+            if (isRedispatch) tr.classList.add('redispatch-row');
+            const dnBadge = isRedispatch
+              ? '<span style="color:#d63384;font-weight:bold" title="Re-dispatch">' + dn2 + '</span>'
+              : '' + dn2;
+            const runnerCell = phaseBadge(plan.phase) + ' ' + execBadge(plan.executionMode, null) + ' <span style="color:#aaa">→</span> ' + phaseBadge(impl.phase) + ' ' + execBadge(impl.executionMode, impl.runnerMode);
+            const imageCell = impl.sessionImage
+              ? '<td class="mono" title="' + window.escAttr(impl.sessionImage) + '">' + window.esc(impl.sessionImage.split('/').pop()) + '</td>'
+              : '<td style="color:#aaa">—</td>';
+            // A grouped row exists only when an implement dispatch followed this plan,
+            // which requires plan approval — so a plan row stranded in a non-terminal
+            // status (e.g. 'unknown' after an orchestrator restart) is known-completed.
+            const planStatus = (plan.status === 'unknown' || plan.status === 'dispatched' || plan.status === 'running')
+              ? 'completed' : plan.status;
+            const combinedStatus = statusBadge(planStatus, plan.conclusion, plan.failure) + ' <span style="color:#aaa;font-size:0.8em">→</span> ' + statusBadge(impl.status, impl.conclusion, impl.failure);
+            const prLink = impl.prUrl ? '<a href="' + window.safeUrl(impl.prUrl) + '" target="_blank">View</a>' : '—';
+            const logs = logsButton(impl);
+            tr.innerHTML = '<td style="white-space:nowrap">' + dt + '</td>'
+              + '<td style="text-align:center">' + dnBadge + '</td>'
+              + '<td class="mono">' + issueLabel + '</td>'
+              + '<td class="mono">' + window.esc(impl.issueState || '—') + '</td>'
+              + '<td class="mono">' + window.esc(impl.teamKey || '—') + '</td>'
+              + '<td class="mono">' + window.esc(impl.repo || '—') + '</td>'
+              + '<td>' + runnerCell + '</td>'
+              + imageCell
+              + '<td>' + combinedStatus + '</td>'
+              + '<td>' + prLink + (logs ? ' ' + logs : '') + '</td>';
+          } else {
+            const entry = item.entry;
+            const dt = new Date(entry.dispatchedAt).toLocaleString();
+            const issueLabel = (entry.issueIdentifier || entry.issueId) + (entry.issueTitle ? ': ' + window.esc(entry.issueTitle) : '');
+            const dn3 = entry.dispatchNumber || 1;
+            const isRedispatch = dn3 > 1;
+            if (isRedispatch) tr.classList.add('redispatch-row');
+            const dnBadge = isRedispatch
+              ? '<span style="color:#d63384;font-weight:bold" title="Re-dispatch">' + dn3 + '</span>'
+              : '' + dn3;
+            const runnerCell = phaseBadge(entry.phase) + ' ' + execBadge(entry.executionMode, entry.runnerMode);
+            const imageCell = entry.sessionImage
+              ? '<td class="mono" title="' + window.escAttr(entry.sessionImage) + '">' + window.esc(entry.sessionImage.split('/').pop()) + '</td>'
+              : '<td style="color:#aaa">—</td>';
+            let logCell;
+            if (entry.machineId) {
+              logCell = logsButton(entry);
+            } else if (entry.prUrl) {
+              logCell = '<a href="' + window.safeUrl(entry.prUrl) + '" target="_blank">View</a>';
+            } else {
+              logCell = '—';
+            }
+            const isInflight = entry.status === 'running' || entry.status === 'dispatched';
+            const isKgRefresh = entry.phase === 'kg-refresh';
+            const cancelId = entry.machineId || (entry.executionMode === 'github-actions' ? String(entry.id) : null);
+            const cancelCell = (isKgRefresh && isInflight && cancelId)
+              ? '<button data-cancel-id="' + window.escAttr(cancelId) + '" title="Cancel this run" style="background:none;border:none;cursor:pointer;padding:0 0 0 8px;color:var(--fail-fg,#dc2626);font:inherit">\u23f9 Stop</button>'
+              : '';
+            tr.innerHTML = '<td style="white-space:nowrap">' + dt + '</td>'
+              + '<td style="text-align:center">' + dnBadge + '</td>'
+              + '<td class="mono">' + issueLabel + '</td>'
+              + '<td class="mono">' + window.esc(entry.issueState || '—') + '</td>'
+              + '<td class="mono">' + window.esc(entry.teamKey || '—') + '</td>'
+              + '<td class="mono">' + window.esc(entry.repo || '—') + '</td>'
+              + '<td>' + runnerCell + '</td>'
+              + imageCell
+              + '<td>' + statusBadge(entry.status, entry.conclusion, entry.failure) + '</td>'
+              + '<td>' + logCell + cancelCell + '</td>';
+          }
+          tbody.appendChild(tr);
+        }
+        wireRowClicks();
+        setLastUpdated('lu-' + prefix);
+      } catch (err) {
+        console.error('dispatch log load failed:', err);
       }
-      const tr = target.closest('tr');
-      const id = tr && tr.getAttribute('data-job-id');
-      if (id && window.openJobDrawer) window.openJobDrawer(Number(id));
-    });
-    tbody.dataset.drawerWired = '1';
-  }
+    }
+
+    function wireRowClicks() {
+      // The job drawer reads the job-steps and mapping endpoints, both Admin-only, so opening it as a
+      // user could only ever report failure. The table itself is the granted read and works.
+      if (!window.isAdmin()) return;
+      const tbody = el('body');
+      if (!tbody || tbody.dataset.drawerWired) return;
+      tbody.addEventListener('click', function (e) {
+        const target = e.target;
+        if (target.closest('a')) return;
+        const localLogsBtn = target.closest('[data-local-job-id]');
+        if (localLogsBtn) {
+          window.openLocalJobLogs(Number(localLogsBtn.getAttribute('data-local-job-id')), localLogsBtn.getAttribute('data-issue-identifier'));
+          return;
+        }
+        const logsBtn = target.closest('[data-machine-id]');
+        if (logsBtn) {
+          viewMachineLogs(logsBtn.getAttribute('data-machine-id'));
+          return;
+        }
+        const cancelBtn = target.closest('[data-cancel-id]');
+        if (cancelBtn) {
+          const cancelId = cancelBtn.getAttribute('data-cancel-id');
+          if (cancelId && confirm('Stop this KG-refresh run? The machine will be destroyed and the job closed.')) {
+            window.api('/api/sessions/' + encodeURIComponent(cancelId), { method: 'DELETE' })
+              .then(function () { load(); })
+              .catch(function (err) { console.error('cancel failed:', err); });
+          }
+          return;
+        }
+        const tr = target.closest('tr');
+        const id = tr && tr.getAttribute('data-job-id');
+        if (id && window.openJobDrawer) window.openJobDrawer(Number(id));
+      });
+      tbody.dataset.drawerWired = '1';
+    }
+
+    const instance = {
+      load: load,
+      onTimeTypeChange: onTimeTypeChange,
+      start: function () {
+        load();
+        wireRowClicks();
+        startLogAutoRefresh();
+      }
+    };
+    window.dispatchLogs[prefix] = instance;
+    return instance;
+  };
+
+  // The Pipelines log is created when the script runs, so these aliases exist before the page
+  // is first shown; sessions.ts reloads the table through window.loadLog.
+  const pipelinesLog = window.createDispatchLog('log');
+  window.loadLog = pipelinesLog.load;
+  window.onTimeTypeChange = pipelinesLog.onTimeTypeChange;
 
   window.registerPage('jobs', function () {
-    loadLog();
-    wireRowClicks();
-    startLogAutoRefresh();
+    pipelinesLog.start();
   });
 })();
 `;
