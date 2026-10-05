@@ -32,6 +32,19 @@ here and grant it on the App before the feature is switched on (tracked for auto
 AII-645: one declared table, probed on `get_tenant_health`, shown on the admin page, and an
 App manifest for new installs).
 
+**A missing publication permission degrades the run; it does not kill it.** The minting layer
+(`getScopedInstallationToken`) intersects every requested permission set with what the
+installation grants, so the token carries only the granted set and the orchestrator log gets one
+warning per owner and permission. Any missing permission, Contents and Pull requests included, is
+dropped with a warning and the token carries the rest. The mint fails with a `GitHubApiError`
+(403) naming the owner and the requested permissions only when the installation grants none of
+them. Without Contents: write, a push then fails in GitHub. Per permission:
+
+- **Checks: read** missing: the run continues, and post-push review reports `CHECKS_PERMISSION_DENIED` ("Grant Checks: read to the GitHub App").
+- **Workflows** missing: the token carries the other permissions, and GitHub refuses a push that touches `.github/workflows/`.
+- A level lower than requested (read where write was asked) is lowered the same way.
+- The cache key is the raw request, so a token minted before a grant is reused until it goes stale (up to ~55 minutes).
+
 **Granting or widening a permission is two steps by an org owner, not a per-repository
 setting.** GitHub App permissions live on the App; each installation then has to accept the
 change:

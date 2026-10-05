@@ -110,7 +110,7 @@ function githubAppHeaders(authValue: string): Record<string, string> {
 async function resolveInstallationId(
   headers: Record<string, string>,
   owner: string,
-): Promise<{ id: number; repository_selection?: "all" | "selected" }> {
+): Promise<InstallationLookup> {
   // `path` (…/installation) lets classifySyncError tell a 404-not-installed from a 404-repo-not-found.
   let installPath = `/orgs/${owner}/installation`;
   let installRes = await fetch(`https://api.github.com${installPath}`, { headers, signal: defaultFetchSignal() });
@@ -127,7 +127,70 @@ async function resolveInstallationId(
       message: `GitHub App not installed for owner "${owner}" (${installRes.status}): ${body}`,
     });
   }
-  return installRes.json() as Promise<{ id: number; repository_selection?: "all" | "selected" }>;
+  return installRes.json() as Promise<InstallationLookup>;
+}
+
+interface InstallationLookup {
+  id: number;
+  repository_selection?: "all" | "selected";
+  /** What the installation grants; absent means no restriction is known. */
+  permissions?: Record<string, string>;
+}
+
+const PERMISSION_RANK: Record<string, number> = { read: 1, write: 2, admin: 3 };
+
+/** `owner|permission` pairs already warned about; cleared by clearTokenCache(). */
+const warnedPermissionPairs = new Set<string>();
+
+function warnPermissionOnce(owner: string, permission: string, requested: string, granted: string | undefined): void {
+  const key = `${owner}|${permission}`;
+  if (warnedPermissionPairs.has(key)) return;
+  warnedPermissionPairs.add(key);
+  console.warn(
+    `[github-app-auth] Installation for "${owner}" ${granted ? "lowers" : "does not grant"} permission "${permission}": ` +
+      `requested ${requested}, granted ${granted ?? "none"}; minting without it`,
+  );
+}
+
+/**
+ * Intersects the requested permissions with what the installation grants. Drops ungranted keys,
+ * lowers a level to the granted one when the granted level ranks lower, and passes through any
+ * level the rank does not know. `granted` undefined means no restriction is known.
+ */
+function intersectPermissions(
+  owner: string,
+  installationId: number,
+  requested: Record<string, string>,
+  granted: Record<string, string> | undefined,
+): Record<string, string> {
+  if (!granted) return requested;
+  const result: Record<string, string> = {};
+  const dropped: string[] = [];
+  for (const [name, level] of Object.entries(requested)) {
+    const have = granted[name];
+    if (have === undefined) {
+      dropped.push(`${name}: ${level}`);
+      warnPermissionOnce(owner, name, level, undefined);
+      continue;
+    }
+    const want = PERMISSION_RANK[level];
+    const got = PERMISSION_RANK[have];
+    if (want !== undefined && got !== undefined && got < want) {
+      result[name] = have;
+      warnPermissionOnce(owner, name, level, have);
+    } else {
+      result[name] = level;
+    }
+  }
+  if (Object.keys(result).length === 0 && dropped.length > 0) {
+    throw new GitHubApiError({
+      status: 403,
+      path: `/app/installations/${installationId}/access_tokens`,
+      bodyText: "",
+      message: `GitHub App installation for owner "${owner}" grants none of the requested permissions: ${dropped.join(", ")}`,
+    });
+  }
+  return result;
 }
 
 /**
@@ -213,6 +276,12 @@ function scopedCacheKey(owner: string, options?: ScopedTokenOptions): string {
  * Cache TTL is derived from `expires_at` minus a 5-minute safety margin, so the
  * cache stays accurate regardless of the actual token lifetime.
  * Cached per (owner, permissions, repositories) tuple — distinct option sets never collide.
+ *
+ * The cache key is built from the raw requested permissions, not the intersected set: the lookup
+ * runs before the installation is resolved, so a cache hit stays free of a network call. Only the
+ * mint body uses the intersection with the installation's granted permissions (an ungranted key is
+ * dropped, a level above the grant is lowered, each warned once per owner and permission). A token
+ * minted before the App was granted a permission is reused until it goes stale.
  */
 export async function getScopedInstallationToken(
   appId: string,
@@ -233,7 +302,9 @@ export async function getScopedInstallationToken(
   const install = await resolveInstallationId(headers, owner);
 
   const bodyData: Record<string, unknown> = {};
-  if (options?.permissions && Object.keys(options.permissions).length > 0) bodyData.permissions = options.permissions;
+  if (options?.permissions && Object.keys(options.permissions).length > 0) {
+    bodyData.permissions = intersectPermissions(owner, install.id, options.permissions, install.permissions);
+  }
   if (options?.repositories && options.repositories.length > 0) bodyData.repositories = options.repositories;
   const hasBody = Object.keys(bodyData).length > 0;
 
@@ -409,4 +480,5 @@ export async function refreshInstallationToken(
 export function clearTokenCache(): void {
   tokenCache.clear();
   scopedTokenCache.clear();
+  warnedPermissionPairs.clear();
 }
