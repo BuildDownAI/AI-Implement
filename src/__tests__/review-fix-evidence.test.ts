@@ -1,30 +1,17 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import os from "node:os";
-import path from "node:path";
-import fs from "node:fs";
+import { describe, it, expect, beforeEach } from "vitest";
 import type Database from "better-sqlite3";
 import type * as DedupModule from "../dedup.js";
 import type * as EvidenceModule from "../review-fix-evidence.js";
 import type { ReviewFixActivityEvent } from "../review-fix-contract.js";
+import { testDb } from "./helpers/test-db.js";
 
-let dbPath: string;
 let dedup: typeof DedupModule;
 let evidence: typeof EvidenceModule;
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(
-    os.tmpdir(),
-    `review-fix-evidence-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-  );
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  evidence = await import("../review-fix-evidence.js");
-});
-
-afterEach(() => {
-  dedup.closeDb();
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+  ({ dedup, evidence } = (
+    await testDb({ modules: { dedup: () => import("../dedup.js"), evidence: () => import("../review-fix-evidence.js") } })
+  ).modules);
 });
 
 function makeEvent(input: {

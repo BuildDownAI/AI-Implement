@@ -1,33 +1,18 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import type * as DedupModule from "../dedup.js";
 import type * as CommentGapfillQueueModule from "../comment-gapfill-queue.js";
+import { testDb } from "./helpers/test-db.js";
 
-let dbPath: string;
 let dedup: typeof DedupModule;
 let queue: typeof CommentGapfillQueueModule;
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(
-    os.tmpdir(),
-    `comment-gapfill-queue-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-  );
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  queue = await import("../comment-gapfill-queue.js");
-  dedup.getDb();
+  ({ dedup, queue } = (
+    await testDb({ modules: { dedup: () => import("../dedup.js"), queue: () => import("../comment-gapfill-queue.js") } })
+  ).modules);
 });
 
 afterEach(() => {
-  dedup.closeDb();
-  try {
-    fs.unlinkSync(dbPath);
-  } catch {
-    /* ignore */
-  }
   vi.restoreAllMocks();
 });
 

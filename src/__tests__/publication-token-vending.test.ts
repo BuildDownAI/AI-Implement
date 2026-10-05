@@ -1,10 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import type * as DedupModule from "../dedup.js";
 import type * as PublicationTokenModule from "../publication-token-vending.js";
 import type * as RunnerTokensModule from "../runner-tokens.js";
+import { testDb } from "./helpers/test-db.js";
 
 vi.mock("../github-app-auth.js", () => ({
   getScopedInstallationToken: vi.fn(),
@@ -13,31 +11,26 @@ vi.mock("../github-app-auth.js", () => ({
 
 const SECRET = "test-secret-with-enough-entropy-for-hmac";
 
-let dbPath: string;
 let dedup: typeof DedupModule;
 let runnerTokens: typeof RunnerTokensModule;
 let publicationToken: typeof PublicationTokenModule;
 let mockGetScopedToken: ReturnType<typeof vi.fn>;
 
 beforeEach(async () => {
-  vi.resetModules();
   vi.clearAllMocks();
-  dbPath = path.join(
-    os.tmpdir(),
-    `publication-token-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-  );
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  runnerTokens = await import("../runner-tokens.js");
-  publicationToken = await import("../publication-token-vending.js");
-  const ghAuth = await import("../github-app-auth.js");
-  mockGetScopedToken = vi.mocked(ghAuth.getScopedInstallationToken);
-  dedup.getDb();
+  const { modules } = await testDb({
+    modules: {
+      dedup: () => import("../dedup.js"),
+      runnerTokens: () => import("../runner-tokens.js"),
+      publicationToken: () => import("../publication-token-vending.js"),
+      ghAuth: () => import("../github-app-auth.js"),
+    },
+  });
+  ({ dedup, runnerTokens, publicationToken } = modules);
+  mockGetScopedToken = vi.mocked(modules.ghAuth.getScopedInstallationToken);
 });
 
 afterEach(() => {
-  dedup.closeDb();
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
   vi.restoreAllMocks();
 });
 

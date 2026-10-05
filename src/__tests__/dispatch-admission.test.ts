@@ -1,35 +1,18 @@
 /**
  * Behavioral tests for `src/dispatch-admission.ts` (AII-775). Exercises the module
- * directly against a temp SQLite file, matching `dispatch-gate.test.ts`'s harness.
+ * directly against a temp SQLite file from the shared `testDb` harness.
  * `npm run typecheck` excludes `src/__tests__` and vitest strips types without
  * checking them, so the `prepare` synchronous-only contract is additionally
  * type-checked explicitly via `npx tsc --noEmit -p tsconfig.dispatch-admission-tests.json`.
  */
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import os from "node:os";
-import path from "node:path";
-import fs from "node:fs";
-import type * as DedupModule from "../dedup.js";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import type * as AdmissionModule from "../dispatch-admission.js";
+import { testDb } from "./helpers/test-db.js";
 
-let dbPath: string;
-let dedup: typeof DedupModule;
 let admission: typeof AdmissionModule;
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(
-    os.tmpdir(),
-    `dispatch-admission-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-  );
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  admission = await import("../dispatch-admission.js");
-});
-
-afterEach(() => {
-  dedup.closeDb();
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+  ({ admission } = (await testDb({ modules: { admission: () => import("../dispatch-admission.js") } })).modules);
 });
 
 const LEGACY = { kind: "legacy" as const };

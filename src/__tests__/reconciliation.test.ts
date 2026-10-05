@@ -1,21 +1,11 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
-let dbPath: string;
+import { describe, it, expect, beforeEach } from "vitest";
+import { testDb } from "./helpers/test-db.js";
 let recon: typeof import("../reconciliation.js");
 let dedup: typeof import("../dedup.js");
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(os.tmpdir(), `recon-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  recon = await import("../reconciliation.js");
-  recon.initReconciliationTable();
-});
-afterEach(() => {
-  dedup.closeDb();
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+  ({ recon, dedup } = (
+    await testDb({ modules: { recon: () => import("../reconciliation.js"), dedup: () => import("../dedup.js") } })
+  ).modules);
 });
 describe("reconciliation pr-dedup", () => {
   it("hasReconciliationForPr is false until a row exists, then true", () => {

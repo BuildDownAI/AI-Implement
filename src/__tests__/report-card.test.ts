@@ -1,37 +1,15 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import os from "node:os";
-import path from "node:path";
-import fs from "node:fs";
+import { describe, it, expect, beforeEach } from "vitest";
 import type * as DedupModule from "../dedup.js";
-import type * as LogModule from "../log.js";
-import type * as StepLogModule from "../step-log.js";
-import type * as ReconModule from "../reconciliation.js";
 import type * as RcModule from "../report-card.js";
+import { testDb } from "./helpers/test-db.js";
 
-let dbPath: string;
 let dedup: typeof DedupModule;
-let log: typeof LogModule;
-let stepLog: typeof StepLogModule;
-let recon: typeof ReconModule;
 let rc: typeof RcModule;
 
 beforeEach(async () => {
-  const { vi } = await import("vitest");
-  vi.resetModules();
-  dbPath = path.join(
-    os.tmpdir(),
-    `rc-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-  );
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  log = await import("../log.js");
-  stepLog = await import("../step-log.js");
-  recon = await import("../reconciliation.js");
-  rc = await import("../report-card.js");
-
-  log.initLogTable();
-  stepLog.initStepLogTable();
-  recon.initReconciliationTable();
+  ({ dedup, rc } = (
+    await testDb({ modules: { dedup: () => import("../dedup.js"), rc: () => import("../report-card.js") } })
+  ).modules);
 
   // Initialise pr_merge_capture manually (normally lazy-init inside capturePrMerge)
   dedup.getDb().exec(`
@@ -51,11 +29,6 @@ beforeEach(async () => {
       PRIMARY KEY (repo, pr_number)
     )
   `);
-});
-
-afterEach(() => {
-  dedup.closeDb();
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
 });
 
 // ---- Helpers ----
