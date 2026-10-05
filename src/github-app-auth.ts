@@ -148,7 +148,7 @@ function warnPermissionOnce(owner: string, permission: string, requested: string
   warnedPermissionPairs.add(key);
   console.warn(
     `[github-app-auth] Installation for "${owner}" ${granted ? "lowers" : "does not grant"} permission "${permission}": ` +
-      `requested ${requested}, granted ${granted ?? "none"}; minting without it`,
+      `requested ${requested}, granted ${granted ?? "none"}; ${granted ? "minting at the granted level" : "minting without it"}`,
   );
 }
 
