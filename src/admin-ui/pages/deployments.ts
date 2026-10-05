@@ -118,6 +118,15 @@ export const deploymentsHtml = `
       </div>
     </div>
 
+    <div class="card" id="reservations-card">
+      <div class="card-header"><h2 class="card-title">Held dispatch reservations <span class="badge neutral" id="reservations-badge">—</span></h2></div>
+      <div class="card-body">
+        <div class="kpi-trend text-secondary">Each held reservation counts as in-flight work, so a stuck one makes a deploy wait. Release frees it only when the backend confirms its run ended (a finished job row alone is not enough); a refusal offers a forced release.</div>
+        <div id="reservations-message" class="kpi-trend" hidden></div>
+        <div id="reservations-list" style="margin-top: 8px"></div>
+      </div>
+    </div>
+
     <div id="deployments-not-configured" class="alert warn" hidden>
       <div style="flex:1">
         <div class="alert-title">Self-deploy not configured</div>
@@ -297,8 +306,95 @@ export const deploymentsScript = `
     refreshPolicyDirty();
   }
 
+  function reservationAge(ms) {
+    const s = Math.max(0, Math.floor(ms / 1000));
+    if (s < 60) return s + 's';
+    const m = Math.floor(s / 60);
+    if (m < 60) return m + 'm';
+    const h = Math.floor(m / 60);
+    return h < 24 ? h + 'h ' + (m % 60) + 'm' : Math.floor(h / 24) + 'd ' + (h % 24) + 'h';
+  }
+
+  function setReservationMessage(text, isError) {
+    const el = document.getElementById('reservations-message');
+    el.textContent = text || '';
+    el.style.color = isError ? 'var(--color-warn)' : '';
+    el.hidden = !text;
+  }
+
+  async function loadReservations() {
+    const listEl = document.getElementById('reservations-list');
+    const badgeEl = document.getElementById('reservations-badge');
+    try {
+      const res = await window.api('/api/dispatch-reservations');
+      if (!res.ok) {
+        setReservationMessage('Could not read reservations (' + res.status + ')', true);
+        return;
+      }
+      const rows = (await res.json()).reservations || [];
+      setBadge(badgeEl, rows.length ? 'warn' : 'success', String(rows.length));
+      if (!rows.length) {
+        listEl.innerHTML = '<div class="kpi-trend text-secondary">No held reservations.</div>';
+        return;
+      }
+      let html = '<table class="table"><thead><tr><th>Dispatch</th><th>Team</th><th>Issue</th><th>Phase</th><th>Backend</th><th>Owner</th><th>Age</th><th>Job</th><th></th></tr></thead><tbody>';
+      for (const r of rows) {
+        const job = r.jobStatus ? r.jobStatus + (r.jobConclusion ? ' / ' + r.jobConclusion : '') : 'no job row';
+        html += '<tr>'
+          + '<td style="font-family: var(--font-mono)">' + window.esc(r.dispatchId) + '</td>'
+          + '<td>' + window.esc(r.team) + '</td>'
+          + '<td>' + window.esc(r.issueIdentifier || r.issueId) + '</td>'
+          + '<td>' + window.esc(r.phase) + '</td>'
+          + '<td>' + window.esc(r.backend) + '</td>'
+          + '<td style="font-family: var(--font-mono)">' + window.esc(r.lifecycleOwner) + '</td>'
+          + '<td>' + window.esc(reservationAge(r.ageMs)) + '</td>'
+          + '<td>' + window.esc(job) + '</td>'
+          + '<td><button class="btn btn-sm" data-dispatch-id="' + window.escAttr(r.dispatchId) + '" onclick="window.releaseReservation(this.dataset.dispatchId)">Release</button></td>'
+          + '</tr>';
+      }
+      listEl.innerHTML = html + '</tbody></table>';
+    } catch (err) {
+      setReservationMessage('Could not read reservations — ' + String(err), true);
+    }
+  }
+
+  async function releaseReservation(dispatchId, force) {
+    setReservationMessage('', false);
+    try {
+      const res = await window.api('/api/tools/release_dispatch_reservation', {
+        method: 'POST',
+        body: JSON.stringify({ args: force ? { dispatchId: dispatchId, force: true } : { dispatchId: dispatchId } }),
+      });
+      const body = await res.json().catch(function () { return {}; });
+      if (!res.ok) {
+        setReservationMessage('Release failed — ' + (body.error || res.status), true);
+        return;
+      }
+      let result = null;
+      try { result = JSON.parse(body.content[0].text); } catch (e) { /* plain-text error */ }
+      if (result && result.status === 'refused') {
+        const reason = 'Not released — ' + result.reason;
+        if (confirm(reason + '\\n\\nForce the release of ' + dispatchId + '? Only do this if the run is dead.')) {
+          await releaseReservation(dispatchId, true);
+          return;
+        }
+        setReservationMessage(reason, true);
+      } else if (result && result.status === 'released') {
+        setReservationMessage('Released ' + result.dispatchId + (result.forced ? ' (forced)' : ''), false);
+      } else if (result && result.status === 'nothing_to_release') {
+        setReservationMessage('Nothing to release for ' + result.dispatchId, false);
+      } else {
+        setReservationMessage('Release failed — ' + (body.content && body.content[0] ? body.content[0].text : 'unknown error'), true);
+      }
+    } catch (err) {
+      setReservationMessage('Release failed — ' + String(err), true);
+    }
+    loadDeployments();
+  }
+
   async function loadDeployments() {
     clearMessage();
+    loadReservations();
 
     let data;
     try {
@@ -598,6 +694,7 @@ export const deploymentsScript = `
   }
 
   window.loadDeployments = loadDeployments;
+  window.releaseReservation = releaseReservation;
   window.triggerDeploy = triggerDeploy;
   window.saveDeployPolicy = saveDeployPolicy;
   window.refreshPolicyDirty = refreshPolicyDirty;

@@ -395,6 +395,7 @@ export interface SessionMachineInput {
   tenantId?: string; // client slug (e.g. "acme-corp"), stamped as tenant_id in metadata
   expectedTtlSeconds?: number; // expected machine lifetime in seconds, stamped in metadata for reaper
   extraEnv?: Record<string, string>; // per-mapping env vars injected last, overriding defaults
+  machineName?: string; // overrides the default `session-<issue key>` name
 }
 
 export function buildSessionMachineConfig(input: SessionMachineInput): CreateMachineOpts {
@@ -517,7 +518,7 @@ export function buildSessionMachineConfig(input: SessionMachineInput): CreateMac
   }
 
   return {
-    name: `session-${input.issueIdentifier.toLowerCase().replace(/[^a-z0-9-]/g, "-")}`,
+    name: input.machineName ?? `session-${input.issueIdentifier.toLowerCase().replace(/[^a-z0-9-]/g, "-")}`,
     region: input.region ?? "iad",
     min_secrets_version: input.minSecretsVersion,
     config: machineConfig,

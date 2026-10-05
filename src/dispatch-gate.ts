@@ -7,6 +7,7 @@ import {
   type DispatchAdmissionBackend,
   type DispatchAdmissionDeferReason,
   type DispatchAdmissionReleaseReason,
+  type LifecycleOwner,
 } from "./dispatch-admission.js";
 
 export type DispatchKind = "planning" | "implementation" | "gap-fill";
@@ -94,6 +95,8 @@ export interface AcquireDispatchInput {
   backend: DispatchAdmissionBackend;
   /** Overrides park only, never capacity/occupancy. */
   humanRequested?: boolean;
+  /** Who owns the reservation's release. Defaults to Legacy. */
+  lifecycleOwner?: LifecycleOwner;
 }
 
 export type AcquireDispatchOutcome =
@@ -127,7 +130,7 @@ export function acquireDispatch(input: AcquireDispatchInput): AcquireDispatchOut
     scope: { kind: "issue", issueScope: input.teamKey, issueId: input.issueId },
     kind: input.kind,
     backend: input.backend,
-    lifecycleOwner: { kind: "legacy" },
+    lifecycleOwner: input.lifecycleOwner ?? { kind: "legacy" },
     cap: input.maxInProgressAiIssues,
     humanRequested: input.humanRequested,
     parked,

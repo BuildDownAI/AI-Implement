@@ -446,6 +446,18 @@ describe("acquireDispatch — transactional final authority (AII-783)", () => {
     expect(decision).toEqual({ ok: false, reason: "parked", count: 0, cap: 5 });
   });
 
+  it("writes a Legacy owner when no lifecycleOwner is given, and the given owner otherwise", async () => {
+    const admission = await import("../dispatch-admission.js");
+    expect(gate.acquireDispatch(req({ dispatchId: "owner-default", issueId: "issue-o1" })).ok).toBe(true);
+    expect(admission.read("owner-default")?.lifecycleOwner).toEqual({ kind: "legacy" });
+
+    const owned = gate.acquireDispatch(
+      req({ dispatchId: "owner-restate", issueId: "issue-o2", lifecycleOwner: { kind: "restate", attemptId: "owner-restate" } }),
+    );
+    expect(owned.ok).toBe(true);
+    expect(admission.read("owner-restate")?.lifecycleOwner).toEqual({ kind: "restate", attemptId: "owner-restate" });
+  });
+
   it("logs issue, team, reservation count and cap on a capacity skip", () => {
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     gate.acquireDispatch(req({ dispatchId: "filler", issueId: "issue-filler", maxInProgressAiIssues: 1 }));

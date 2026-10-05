@@ -25,13 +25,21 @@ Companion documents: [restate.md](restate.md) (engine, patterns), [restate-revie
 |---|---|---|---|
 | `KgRefresh` | Workflow | trigger id (= the dispatch id, AII-938) | `src/restate/kg-refresh-workflow.ts` |
 | `KgRepo` | Virtual Object | KG source repo slug | `src/restate/kg-repo.ts` |
+| `PlanningRun` | Workflow | dispatch id | `src/restate/planning-run-workflow.ts` |
 | `ReviewFixAttempt` | Workflow | attempt id | `src/restate/review-fix-attempt.ts` |
 | `ReviewFixPR` | Virtual Object | PR key | `src/restate/review-fix-pr.ts` |
 | `Operator` | Virtual Object | operator identity | `src/restate/operator-object.ts` |
 | `orchestratorTools` | Service | — | `src/restate/tools.ts` |
 
-All six register through one endpoint (`src/restate/endpoint.ts`, `src/index.ts`). The service
+All seven register through one endpoint (`src/restate/endpoint.ts`, `src/index.ts`). The service
 and handler types that the typed clients use are in `src/restate/kg-refresh-types.ts`.
+
+### Lifecycle kit and contract suite
+
+| Module | Role | `PlanningRun` | `KgRefresh` |
+|---|---|---|---|
+| `src/restate/owned-run-lifecycle.ts` | the kit: `reserveOwnedRun`, `readOwnedRunStatus`, `readBoundedOwnedRun`, `cleanupOwnedRun`, `reportOwnedRunOutcome` | all five | `readBoundedOwnedRun` only |
+| `src/__tests__/restate/owned-run-contract.ts` | the contract suite, `registerOwnedRunContract` | scenarios 1 to 5 | scenario 1 |
 
 ## 2. Feature matrix
 
@@ -187,6 +195,8 @@ Landed on the feature branch, in merge order:
 6. AII-977 — per-PR dry-run outcome and same-sha dedup on `KgRepo` state.
 7. AII-976 — C9: request identity key and `ingressPrivate`. A corrupt key file is regenerated, a key that cannot be prepared keeps the sidecar down, and the sidecar path has no unsigned mode.
 8. AII-1026 — the `workflow_run` path and awakeable are removed; the run watch is one 60 s status read (ADR 033).
+9. AII-1018 — `PlanningRun`: one workflow owns each planning run of a `restate` project from reservation to release, on GitHub Actions, Fly Machines, and local Docker, through `awaitOwnedRun` (AII-1052, AII-1053, AII-1019, AII-1020, AII-1054, AII-1021). See [restate.md](restate.md#the-planning-run).
+10. AII-1062 to AII-1069, AII-1067 — the owned-run lifecycle kit (ADR 036). `PlanningRun` uses all steps: `reserveOwnedRun`, `readOwnedRunStatus`, `cleanupOwnedRun`, `reportOwnedRunOutcome`; its reservation moved into the workflow's first step, each machine is named from the dispatch id, and a cancel during the reserve or launch step leaves no run or reservation. `KgRefresh` uses only the bounded read, `readBoundedOwnedRun`. Operators list and release a held reservation (`list_dispatch_reservations`, `release_dispatch_reservation`). See [restate.md](restate.md#the-owned-run-lifecycle-kit).
 
 Remains:
 
