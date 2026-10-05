@@ -195,25 +195,27 @@ async function reviewFixLifecycleEnablementError(
 ): Promise<string | null> {
   const { executionMode, owner, repo, workflowFile, ref } = params;
   if (executionMode !== "github-actions") {
-    return `reviewFixLifecycle "restate" requires executionMode "github-actions"`;
+    return `reviewFixLifecycle "restate" requires executionMode "github-actions". Set the mode to GitHub Actions, or leave the lifecycle on Legacy.`;
   }
 
   const restateStatus = deps.getRestateStatus?.();
   if (!restateStatus || restateStatus.sidecar.state !== "ready" || restateStatus.registration.state !== "registered") {
-    return `reviewFixLifecycle "restate" requires a registered, healthy Restate endpoint, which is not currently available`;
+    return `reviewFixLifecycle "restate" requires a registered, healthy Restate endpoint, which is not currently available. Read the "restate" field of GET / or of the get_tenant_health tool (docs/restate.md, "Health surfaces"). Save again when the sidecar is "ready" and the endpoint is "registered".`;
   }
 
   // The reservation ledger was introduced after some Legacy jobs were launched.
   // Those jobs do not occupy a ledger slot, so admitting Restate work while one
   // remains active could exceed the shared cap or let both owners work on a PR.
-  // Initial activation waits for the whole unreserved Legacy fleet to drain.
-  const unreservedLegacyJob = getInFlightJobs().find((job) => {
+  // Initial activation is refused until those runs end. Every current dispatch takes a
+  // reservation, so this applies only after an upgrade from a version without the ledger.
+  const unreservedLegacyJobs = getInFlightJobs().filter((job) => {
     if (job.phase === "kg-refresh") return false;
     const admission = job.dispatchId ? readDispatchAdmission(job.dispatchId) : null;
     return !admission || admission.releasedAt !== null;
   });
-  if (unreservedLegacyJob) {
-    return `reviewFixLifecycle "restate" requires active unreserved Legacy workers to drain before activation`;
+  if (unreservedLegacyJobs.length > 0) {
+    const count = unreservedLegacyJobs.length;
+    return `reviewFixLifecycle "restate" cannot be enabled while ${count} run${count === 1 ? "" : "s"} in flight ${count === 1 ? "has" : "have"} no dispatch reservation. An older version of the orchestrator started ${count === 1 ? "it" : "them"}. No action is necessary: ${count === 1 ? "this run must" : "these runs must"} end by ${count === 1 ? "itself" : "themselves"}. Save again later.`;
   }
 
   let capabilities: Awaited<ReturnType<typeof resolveWorkflowCapabilities>>;
@@ -221,11 +223,11 @@ async function reviewFixLifecycleEnablementError(
     const token = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
     capabilities = await resolveWorkflowCapabilities({ owner, repo, workflowFile, token, ref });
   } catch {
-    return `reviewFixLifecycle "restate" could not verify the dispatch-ref workflow's capability`;
+    return `reviewFixLifecycle "restate" could not verify the dispatch-ref workflow's capability. The orchestrator could not read "${workflowFile}" on "${ref}". Check the GitHub App installation and the ref.`;
   }
 
   if (capabilities.contract !== "envelope" || !capabilities.supportsAttemptCorrelation || !capabilities.supportsRunPublicationToken) {
-    return `reviewFixLifecycle "restate" requires "${workflowFile}" on "${ref}" to declare run_attempt_token and run_publication_token (installed template/runner capability)`;
+    return `reviewFixLifecycle "restate" requires "${workflowFile}" on "${ref}" to declare run_attempt_token and run_publication_token (installed template/runner capability). Use Sync workflows on this project and merge the PR that it opens on "${ref}". Then save again.`;
   }
 
   return null;
