@@ -1,8 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, writeFileSync, existsSync, readFileSync, rmSync } from "node:fs";
 import { execSync } from "node:child_process";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
 import {
   fetchGate, stageGate, swapGate, verifyGate, revertRail,
   RailGateError, readServedStamp, readNamespace,
@@ -11,6 +10,7 @@ import {
 } from "../kg-refresh-rail.js";
 import { COMPLETION_MARKER } from "../kg-sidecar.js";
 import type { RefreshOutcome, KgDryRunReportTarget } from "../kg-refresh.js";
+import { testDir } from "./helpers/test-dir.js";
 
 const NAMESPACE = "https://kg.test.example/";
 const OLD_STAMP = "2026-08-20T00:10:10+00:00";
@@ -19,7 +19,7 @@ const SNAPSHOT_SHA = "abc123def456abc123def456abc123def456abc1";
 
 /** extractSource strips one leading component, so wrap the fixture in a top-level dir. */
 function makeTarball(dir: string): Buffer {
-  const wrap = mkdtempSync(join(tmpdir(), "kgrailtar-"));
+  const wrap = testDir("kgrailtar");
   const top = join(wrap, "repo");
   mkdirSync(top, { recursive: true });
   execSync(`cp -R ${dir}/. ${top}/`);
@@ -78,8 +78,8 @@ describe("kg-refresh-rail", () => {
   }
 
   beforeEach(() => {
-    dataRoot = mkdtempSync(join(tmpdir(), "kgroot-"));
-    fixtureRepo = mkdtempSync(join(tmpdir(), "kgrepo-"));
+    dataRoot = testDir("kgroot");
+    fixtureRepo = testDir("kgrepo");
     writeFileSync(join(fixtureRepo, "sources.yml"), `namespace: ${NAMESPACE}\n`);
     mkdirSync(join(fixtureRepo, "snapshot"), { recursive: true });
     writeFileSync(join(fixtureRepo, "snapshot", "embeddings.npz"), "vectors");
@@ -103,8 +103,6 @@ describe("kg-refresh-rail", () => {
   });
 
   afterEach(() => {
-    rmSync(dataRoot, { recursive: true, force: true });
-    rmSync(fixtureRepo, { recursive: true, force: true });
     delete process.env.KG_SIDECAR_URL;
     vi.clearAllMocks();
   });

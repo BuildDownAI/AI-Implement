@@ -83,15 +83,20 @@ const FAILURE_REPORT: Partial<RunnerResultBody> = {
   outcome: "failure", failureCode: "runner_crashed", failureReason: "the runner process died",
 };
 
-/** extractSource strips one leading path component, so wrap the fixture in a top-level dir. */
+/** extractSource strips one leading path component, so wrap the fixture in a top-level dir. The
+ *  wrapper is removed once the archive is read: this runs from beforeAll, where testDir() cannot. */
 function makeTarball(dir: string): Buffer {
   const wrap = mkdtempSync(join(tmpdir(), "kgpilottar-"));
-  const top = join(wrap, "repo");
-  mkdirSync(top, { recursive: true });
-  execSync(`cp -R ${dir}/. ${top}/`);
-  const out = join(wrap, "src.tar.gz");
-  execSync(`tar -czf ${out} -C ${wrap} repo`);
-  return readFileSync(out) as Buffer;
+  try {
+    const top = join(wrap, "repo");
+    mkdirSync(top, { recursive: true });
+    execSync(`cp -R ${dir}/. ${top}/`);
+    const out = join(wrap, "src.tar.gz");
+    execSync(`tar -czf ${out} -C ${wrap} repo`);
+    return readFileSync(out) as Buffer;
+  } finally {
+    rmSync(wrap, { recursive: true, force: true });
+  }
 }
 
 // ---------------------------------------------------------------------------
