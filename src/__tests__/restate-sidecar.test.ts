@@ -1,24 +1,16 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { spawn as realSpawn, type ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { mkdtempSync, rmSync, writeFileSync, chmodSync, readFileSync, statSync } from "node:fs";
+import { writeFileSync, chmodSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
 import { RestateSidecar, restateDataDir, ensureRequestIdentityKey, identityKeyFromPem, RESTATE_ADMIN_BASE_URL, RESTATE_INGRESS_BIND_ADDRESS } from "../restate/server.js";
 import { getRestateStatus, resetRestateStatus } from "../restate/status.js";
 import { createRestateRegistrationGate, stopSidecarsConcurrently } from "../index.js";
+import { testDir } from "./helpers/test-dir.js";
 
 // ---------------------------------------------------------------------------
 // Helpers — mirrors src/__tests__/kg-sidecar.test.ts
 // ---------------------------------------------------------------------------
-
-const tempDirs: string[] = [];
-
-function makeTmpDir(): string {
-  const dir = mkdtempSync(join(tmpdir(), "restate-sidecar-test-"));
-  tempDirs.push(dir);
-  return dir;
-}
 
 /** Write a shell script to path and make it executable. */
 function writeScript(path: string, body: string): void {
@@ -32,7 +24,6 @@ function testSpawn(cmd: string, args: string[], opts: object) {
 }
 
 afterEach(() => {
-  for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
   vi.restoreAllMocks();
   resetRestateStatus();
 });
@@ -66,7 +57,7 @@ describe("restateDataDir", () => {
 
 describe("readiness polling", () => {
   it("sidecar answers on first poll → start() resolves true", async () => {
-    const dataDir = makeTmpDir();
+    const dataDir = testDir("restate-sidecar");
     const script = join(dataDir, "fake-server.sh");
     writeScript(script, "sleep 60");
 
@@ -83,7 +74,7 @@ describe("readiness polling", () => {
   });
 
   it("sidecar answers on 5th poll → start() resolves true", async () => {
-    const dataDir = makeTmpDir();
+    const dataDir = testDir("restate-sidecar");
     const script = join(dataDir, "fake-server.sh");
     writeScript(script, "sleep 60");
 
@@ -102,7 +93,7 @@ describe("readiness polling", () => {
   });
 
   it("child exits during startup → logs one warning, start() resolves false", async () => {
-    const dataDir = makeTmpDir();
+    const dataDir = testDir("restate-sidecar");
     const script = join(dataDir, "fake-server.sh");
     writeScript(script, "exit 0"); // exits immediately
 
@@ -127,7 +118,7 @@ describe("readiness polling", () => {
   });
 
   it("readiness timeout → start() resolves false, logs one warning", async () => {
-    const dataDir = makeTmpDir();
+    const dataDir = testDir("restate-sidecar");
     const script = join(dataDir, "fake-server.sh");
     writeScript(script, "sleep 60");
 
@@ -173,7 +164,7 @@ describe("readiness polling", () => {
 
 describe("spawn configuration", () => {
   it("binds ingress and admin listeners to 127.0.0.1 via env", async () => {
-    const dataDir = makeTmpDir();
+    const dataDir = testDir("restate-sidecar");
     const script = join(dataDir, "fake-server.sh");
     writeScript(script, "sleep 60");
 
@@ -213,7 +204,7 @@ describe("spawn configuration", () => {
 
 describe("env allowlist (AII-728)", () => {
   it("forwards only PATH/HOME/TMPDIR/TZ and RESTATE_* keys, excluding an unrelated decoy credential", async () => {
-    const dataDir = makeTmpDir();
+    const dataDir = testDir("restate-sidecar");
     const script = join(dataDir, "fake-server.sh");
     writeScript(script, "sleep 60");
 
@@ -261,7 +252,7 @@ describe("env allowlist (AII-728)", () => {
   });
 
   it("a fixed RESTATE_* constant wins over an operator-set override of the same key", async () => {
-    const dataDir = makeTmpDir();
+    const dataDir = testDir("restate-sidecar");
     const script = join(dataDir, "fake-server.sh");
     writeScript(script, "sleep 60");
 
@@ -293,7 +284,7 @@ describe("env allowlist (AII-728)", () => {
 
 describe("stop / shutdown", () => {
   it("stop() sends SIGTERM to child", async () => {
-    const dataDir = makeTmpDir();
+    const dataDir = testDir("restate-sidecar");
     const script = join(dataDir, "fake-server.sh");
     writeScript(script, "sleep 60");
 
@@ -318,7 +309,7 @@ describe("stop / shutdown", () => {
   });
 
   it("stop() when child already exited → resolves immediately without error", async () => {
-    const dataDir = makeTmpDir();
+    const dataDir = testDir("restate-sidecar");
     const script = join(dataDir, "fake-server.sh");
     writeScript(script, "exit 0");
 
@@ -332,7 +323,7 @@ describe("stop / shutdown", () => {
   });
 
   it("no orphan after stop() resolves (SIGKILL backstop integration test)", async () => {
-    const dataDir = makeTmpDir();
+    const dataDir = testDir("restate-sidecar");
     const script = join(dataDir, "fake-server.sh");
     // Ignores SIGTERM so the SIGKILL backstop fires.
     writeScript(script, "trap '' TERM; sleep 60");
@@ -356,7 +347,7 @@ describe("stop / shutdown", () => {
     // fake exits on SIGTERM under macOS's bash 3.2 /bin/sh but not under Linux's dash/bash),
     // so this only pins the SIGTERM count and the end state. The SIGKILL branch itself is
     // covered by the "no orphan" integration test above.
-    const dataDir = makeTmpDir();
+    const dataDir = testDir("restate-sidecar");
     const script = join(dataDir, "fake-server.sh");
     writeScript(script, "trap '' TERM; sleep 60");
 
@@ -379,7 +370,7 @@ describe("stop / shutdown", () => {
   }, 10_000);
 
   it("concurrent stop() calls run the sequence once (re-entrancy latch)", async () => {
-    const dataDir = makeTmpDir();
+    const dataDir = testDir("restate-sidecar");
     const script = join(dataDir, "fake-server.sh");
     writeScript(script, "sleep 60");
 
@@ -407,7 +398,7 @@ describe("stop / shutdown", () => {
 
 describe("late readiness", () => {
   it("resolves whenReady() true after the initial timeout, without a second spawn", async () => {
-    const dataDir = makeTmpDir();
+    const dataDir = testDir("restate-sidecar");
     const script = join(dataDir, "fake-server.sh");
     writeScript(script, "sleep 60");
 
@@ -442,7 +433,7 @@ describe("late readiness", () => {
   });
 
   it("exit after a ready sidecar logs code/signal exactly once and status becomes 'exited'", async () => {
-    const dataDir = makeTmpDir();
+    const dataDir = testDir("restate-sidecar");
     const script = join(dataDir, "fake-server.sh");
     writeScript(script, "sleep 60");
 
@@ -465,7 +456,7 @@ describe("late readiness", () => {
   });
 
   it("exit while still degraded (never became ready) resolves whenReady() false", async () => {
-    const dataDir = makeTmpDir();
+    const dataDir = testDir("restate-sidecar");
     const script = join(dataDir, "fake-server.sh");
     // Ignores SIGTERM so the SIGKILL backstop fires deterministically (same pattern as
     // the "no orphan" stop/shutdown test above).
@@ -493,7 +484,7 @@ describe("late readiness", () => {
   }, 10_000);
 
   it("stop() clears background polling — httpGet call count stabilizes", async () => {
-    const dataDir = makeTmpDir();
+    const dataDir = testDir("restate-sidecar");
     const script = join(dataDir, "fake-server.sh");
     writeScript(script, "sleep 60");
 
@@ -521,7 +512,7 @@ describe("late readiness", () => {
   });
 
   it("no implicit restart on exit; explicit restart() spawns exactly one new child", async () => {
-    const dataDir = makeTmpDir();
+    const dataDir = testDir("restate-sidecar");
     const script = join(dataDir, "fake-server.sh");
     writeScript(script, "exit 0"); // exits immediately every time
 
@@ -552,7 +543,7 @@ describe("late readiness", () => {
     Object.assign(fakeChild, { pid: 4242, kill: vi.fn() });
 
     const sidecar = new RestateSidecar(
-      { dataDir: "/tmp/restate-fake-child", pollTimeoutMs: 60, pollIntervalMs: 15 },
+      { dataDir: testDir("restate-fake-child"), pollTimeoutMs: 60, pollIntervalMs: 15 },
       {
         httpGet: async () => false,
         spawn: () => fakeChild,
@@ -587,7 +578,7 @@ describe("status contract transitions", () => {
   });
 
   it("early exit during startup → status 'exited' with code/signal", async () => {
-    const dataDir = makeTmpDir();
+    const dataDir = testDir("restate-sidecar");
     const script = join(dataDir, "fake-server.sh");
     writeScript(script, "exit 3");
 
@@ -600,7 +591,7 @@ describe("status contract transitions", () => {
   });
 
   it("readiness timeout without exit → status 'timeout'", async () => {
-    const dataDir = makeTmpDir();
+    const dataDir = testDir("restate-sidecar");
     const script = join(dataDir, "fake-server.sh");
     writeScript(script, "sleep 60");
 
@@ -617,7 +608,7 @@ describe("status contract transitions", () => {
   });
 
   it("ready within the initial timeout → status 'ready'", async () => {
-    const dataDir = makeTmpDir();
+    const dataDir = testDir("restate-sidecar");
     const script = join(dataDir, "fake-server.sh");
     writeScript(script, "sleep 60");
 
@@ -643,7 +634,7 @@ describe("status contract transitions", () => {
     });
 
     const sidecar = new RestateSidecar(
-      { dataDir: "/tmp/restate-fake-child-error", pollTimeoutMs: 200, pollIntervalMs: 20 },
+      { dataDir: testDir("restate-fake-child-error"), pollTimeoutMs: 200, pollIntervalMs: 20 },
       {
         httpGet: async () => false,
         spawn: () => fakeChild,
@@ -853,7 +844,7 @@ describe("stopSidecarsConcurrently", () => {
 
 describe("main() wiring: whenReady() drives the registration gate end to end", () => {
   it("a sidecar that only becomes ready after the initial timeout still gets registered, exactly once", async () => {
-    const dataDir = makeTmpDir();
+    const dataDir = testDir("restate-sidecar");
     const script = join(dataDir, "fake-server.sh");
     writeScript(script, "sleep 60");
 
@@ -893,7 +884,7 @@ describe("main() wiring: whenReady() drives the registration gate end to end", (
   });
 
   it("a late-readiness signal that arrives after shutdown starts does not start or register the endpoint", async () => {
-    const dataDir = makeTmpDir();
+    const dataDir = testDir("restate-sidecar");
     const script = join(dataDir, "fake-server.sh");
     writeScript(script, "sleep 60");
 
@@ -945,7 +936,7 @@ describe("request identity key", () => {
   }
 
   it("writes the pair once on first boot and reuses it on the next", async () => {
-    const dataDir = makeTmpDir();
+    const dataDir = testDir("restate-sidecar");
     const envs: NodeJS.ProcessEnv[] = [];
     const mk = () =>
       new RestateSidecar(
@@ -981,7 +972,7 @@ describe("request identity key", () => {
   });
 
   it("replaces a corrupt PEM, returns the matching key, and reuses it afterwards", () => {
-    const dataDir = makeTmpDir();
+    const dataDir = testDir("restate-sidecar");
     const pemPath = join(dataDir, "request-identity-private.pem");
     writeFileSync(pemPath, "not a pem");
     const warn = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -999,7 +990,7 @@ describe("request identity key", () => {
   });
 
   it("does not spawn the child and reports the degraded state when the key cannot be prepared", async () => {
-    const dataDir = makeTmpDir();
+    const dataDir = testDir("restate-sidecar");
     // A file where the data directory should be makes the key write fail regardless of uid.
     const blocker = join(dataDir, "not-a-dir");
     writeFileSync(blocker, "");
@@ -1018,7 +1009,7 @@ describe("request identity key", () => {
   });
 
   it("derives a stable key from the PEM", () => {
-    const dataDir = makeTmpDir();
+    const dataDir = testDir("restate-sidecar");
     expect(ensureRequestIdentityKey(dataDir).publicKey).toBe(ensureRequestIdentityKey(dataDir).publicKey);
   });
 });
