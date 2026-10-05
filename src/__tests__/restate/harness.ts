@@ -227,6 +227,12 @@ export async function queryInvocations(adminBaseUrl: string, where: string): Pro
   return ((await response.json()) as { rows: Array<Record<string, unknown>> }).rows;
 }
 
+/** Cancels one invocation through the admin API (`PATCH /invocations/<id>/cancel`); `id` is a `sys_invocation` row id. */
+export async function cancelInvocation(adminBaseUrl: string, id: string): Promise<void> {
+  const response = await fetch(`${adminBaseUrl}/invocations/${encodeURIComponent(id)}/cancel`, { method: "PATCH" });
+  if (!response.ok) throw new Error(`cancel of invocation ${id} failed: HTTP ${response.status}`);
+}
+
 /** The one permitted wait: use it only before a NEGATIVE assertion ("nothing more
  *  happens"). Waiting for something to become true is `eventually`, never a sleep. */
 export async function settle(ms: number): Promise<void> {

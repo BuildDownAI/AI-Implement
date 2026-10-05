@@ -802,3 +802,83 @@ describe("reconcileTerminalCallbackAdmissions", () => {
     expect(retry.ok).toBe(true);
   });
 });
+
+describe("listHeldReservations / releaseHeldReservation (AII-1069)", () => {
+  const never = async () => false;
+  beforeEach(async () => {
+    (await import("../log.js")).initLogTable();
+  });
+
+  it("lists only unreleased rows with job status and conclusion", async () => {
+    const log = await import("../log.js");
+    log.initLogTable();
+    admission.acquire(issueRequest({ dispatchId: "held-1", scope: { kind: "issue", issueScope: "t", issueId: "i1" } }));
+    admission.acquire(issueRequest({ dispatchId: "held-2", scope: { kind: "issue", issueScope: "t", issueId: "i2" }, lifecycleOwner: RESTATE_A }));
+    admission.acquire(issueRequest({ dispatchId: "done", scope: { kind: "issue", issueScope: "t", issueId: "i3" } }));
+    admission.releaseByDispatchId("done", "finalized");
+    const jobId = log.appendLog({ issueId: "i1", issueIdentifier: "AII-9", dispatchId: "held-1", repo: "o/r" });
+    log.updateJobStatus(jobId, "failed", "boom");
+
+    const rows = admission.listHeldReservations();
+    expect(rows.map((r) => r.dispatchId)).toEqual(["held-1", "held-2"]);
+    expect(rows[0]).toMatchObject({ team: "AII", issueIdentifier: "AII-9", phase: "implementation", backend: "github-actions", lifecycleOwner: "legacy", jobStatus: "failed", jobConclusion: "boom" });
+    expect(rows[1]).toMatchObject({ lifecycleOwner: "restate:attempt-a", issueIdentifier: null, jobStatus: null, jobConclusion: null });
+  });
+
+  it("refuses without force when unconfirmed and leaves the row held", async () => {
+    admission.acquire(issueRequest());
+    const result = await admission.releaseHeldReservation("dispatch-1", { force: false, confirmTerminated: never });
+    expect(result.status).toBe("refused");
+    expect(admission.read("dispatch-1")?.releasedAt).toBeNull();
+  });
+
+  it("treats a throwing confirmation as unconfirmed", async () => {
+    admission.acquire(issueRequest());
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const result = await admission.releaseHeldReservation("dispatch-1", { force: false, confirmTerminated: async () => { throw new Error("net"); } });
+    expect(result.status).toBe("refused");
+  });
+
+  it("does not trust a terminal job of an earlier generation", async () => {
+    const log = await import("../log.js");
+    log.initLogTable();
+    admission.acquire(issueRequest());
+    const id = log.appendLog({ issueId: "AII-1", dispatchId: "dispatch-1", admissionGeneration: 0, repo: "o/r" });
+    log.updateJobStatus(id, "completed", "success");
+    admission.releaseByDispatchId("dispatch-1", "finalized");
+    admission.acquire(issueRequest());
+    expect(admission.read("dispatch-1")?.generation).toBe(1);
+    const result = await admission.releaseHeldReservation("dispatch-1", { force: false, confirmTerminated: never });
+    expect(result.status).toBe("refused");
+    // The list hides the earlier generation's job too.
+    expect(admission.listHeldReservations()[0]).toMatchObject({ jobStatus: null, jobConclusion: null, issueIdentifier: null });
+  });
+
+  it("refuses a terminal job row without confirmation, releases it once confirmed, and with force either way", async () => {
+    const log = await import("../log.js");
+    log.initLogTable();
+    admission.acquire(issueRequest());
+    const id = log.appendLog({ issueId: "AII-1", dispatchId: "dispatch-1", repo: "o/r" });
+    log.updateJobStatus(id, "completed", "planning_callback");
+    const refused = await admission.releaseHeldReservation("dispatch-1", { force: false, confirmTerminated: never });
+    expect(refused).toMatchObject({ status: "refused" });
+    expect((refused as { reason: string }).reason).toMatch(/completed/);
+    expect((refused as { reason: string }).reason).toMatch(/force/);
+    expect(admission.read("dispatch-1")?.releasedAt).toBeNull();
+
+    const confirmed = await admission.releaseHeldReservation("dispatch-1", { force: false, confirmTerminated: async () => true });
+    expect(confirmed).toMatchObject({ status: "released", forced: false, basis: "backend_confirmed" });
+
+    admission.acquire(issueRequest());
+    const forced = await admission.releaseHeldReservation("dispatch-1", { force: true, confirmTerminated: never });
+    expect(forced).toMatchObject({ status: "released", forced: true, basis: "forced" });
+  });
+
+  it("releases with force and reports nothing to release afterwards", async () => {
+    admission.acquire(issueRequest());
+    const first = await admission.releaseHeldReservation("dispatch-1", { force: true, confirmTerminated: never });
+    expect(first).toMatchObject({ status: "released", forced: true, lifecycleOwner: "legacy" });
+    expect(admission.read("dispatch-1")?.releaseReason).toBe("cancelled");
+    expect(await admission.releaseHeldReservation("dispatch-1", { force: true, confirmTerminated: never })).toEqual({ status: "nothing_to_release", dispatchId: "dispatch-1" });
+  });
+});

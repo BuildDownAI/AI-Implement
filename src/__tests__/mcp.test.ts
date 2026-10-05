@@ -35,6 +35,8 @@ import {
   addProjectTool,
   triggerWorkflowSyncTool,
   clearDispatchDedupTool,
+  listDispatchReservationsTool,
+  releaseDispatchReservationTool,
   tool,
   type ToolResponse,
 } from "../restate/tools.js";
@@ -96,9 +98,11 @@ const TOOL_HANDLERS: Record<string, FixtureToolHandler> = {
   add_project: addProjectTool,
   trigger_workflow_sync: triggerWorkflowSyncTool,
   clear_dispatch_dedup: clearDispatchDedupTool,
+  list_dispatch_reservations: listDispatchReservationsTool,
+  release_dispatch_reservation: releaseDispatchReservationTool,
 };
 
-/** The six writes plus two privileged review-fix reads declare role: "admin"; every other discoverable tool is "user". */
+/** The seven writes plus two privileged review-fix reads declare role: "admin"; every other discoverable tool is "user". */
 const WRITE_TOOL_NAMES = new Set([
   "trigger_kg_refresh",
   "set_runner_mode",
@@ -106,6 +110,7 @@ const WRITE_TOOL_NAMES = new Set([
   "add_project",
   "trigger_workflow_sync",
   "clear_dispatch_dedup",
+  "release_dispatch_reservation",
 ]);
 const ADMIN_READ_TOOL_NAMES = new Set(["get_review_fix_attempt", "get_review_fix_activity"]);
 
@@ -1662,6 +1667,7 @@ describe("handleMcpRequest", () => {
         "add_project",
         "trigger_workflow_sync",
         "clear_dispatch_dedup",
+        "release_dispatch_reservation",
       ]));
     });
 
@@ -1683,6 +1689,7 @@ describe("handleMcpRequest", () => {
         "add_project",
         "trigger_workflow_sync",
         "clear_dispatch_dedup",
+        "release_dispatch_reservation",
       ]) {
         expect(names).not.toContain(writeTool);
       }

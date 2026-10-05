@@ -280,6 +280,50 @@ On the container runtime a restart remaps the ingress port, so every client must
 | P8 | Ingress unreachable at trigger time | `makeKgRefreshAdminDeps(...).trigger`, `callToolAsSystem`, SQLite | Nothing listens on `UNROUTABLE_INGRESS` | `{ status: 503, body: { error: "restate-unavailable" } }`; no row |
 | P9 | Boot sweep of a legacy row | `sweepLegacyKgRefreshRows`, SQLite | Seeded legacy row and stage key | Returns 1; row `timed_out`; `kg_refresh_stage` gone. Involves no Restate call, so it runs once, not per variant |
 
+## `planning-run-pilot.restate.test.ts`: the PlanningRun workflow against its production composer (AII-1020)
+
+`planning-run-workflow.restate.test.ts` (AII-1019) runs `PlanningRun` against fakes for every dependency. This file
+composes it through `createProductionPlanningRunServices` (`src/restate/planning-run-production.ts`) and registers it
+on real Restate. Nothing submits the workflow in production yet; the test submits it through
+`createPlanningRunIngressClient`, after it acquires the reservation with owner `{ kind: "restate", attemptId: dispatchId }`.
+
+**Always real:** the composer and its deps, the workflow, the ingress client and termination hook, SQLite
+(`dispatch_admissions`, `dispatch_log`, the mappings table), the admission functions, and `remediateFailedJob` (wrapped
+only to count calls). **Always simulated:** GitHub (the run list, run status, cancel, the installation token), the
+launch functions `preparePlanningLaunch` and `launchPlanningRun` (the fake writes the `dispatch_log` row as the real one
+does), and the runner callback (the test closes the row and calls the termination hook).
+
+One seam is mocked because the composer hard-codes it: `createPlanningRunWorkflow`, wrapped only to shorten the tick,
+confirm and deadline intervals. The test replaces `fetch` for `api.github.com` only and passes every other URL to the
+real `fetch`. Each scenario holds the first run-status read with `gate` and reads the step with `waitForStep`; none uses a sleep.
+
+| # | Scenario | Real | Simulated | Asserts |
+|---|---|---|---|---|
+| 1 | Callback closes the row, then the run completes | Composer, workflow, hook, SQLite | GitHub, launch | Reservation released as `finalized`; the closed `dispatch_log` row is unchanged; no failure handling |
+| 2 | Run completes with no callback | Composer, workflow, `finishJob`, `remediateFailedJob` | GitHub, launch | Row closed `failed`; failure handling ran one time; reservation released |
+| 3 | Two dispatches seconds apart, acknowledgement lost | Composer, `findExistingRun`, workflow | GitHub run list, launch | Each workflow binds the run with its own title and ignores an older run with the same title; each releases its own reservation |
+| 4 | Sweep and reconcile | `sweepStaleAdmissions`, `reconcileTerminalCallbackAdmissions`, SQLite | Nothing | Both leave the Restate-owned planning row. Involves no Restate call, so it runs once, not per variant |
+| 5 | Review-fix readers | `listActiveRestateReviewFixPrs`, `queueReviewFixCancellationForClosedPr`, the admin facade, `mintPreparedReviewFixToken` | Nothing | No row for a planning dispatch id. Involves no Restate call |
+
+The switch scenarios (AII-1021, `the switched dispatchPlanning`) call the real `dispatchPlanning` for a project with `reviewFixLifecycle: "restate"`, with `getRestateStatus` set to ready and registered. Two issues dispatched seconds apart on one repo bind their own runs, each release frees only its own reservation, and an implementation `acquireDispatch` then admits each issue. A Fly Machines and a local Docker scenario read the `dispatch_admissions` row for owner `restate:<dispatchId>`. What they taught: `dispatchPlanning` passes no URL to `createPlanningRunIngressClient`, so the file wraps that factory to default to the harness variant's ingress; scenarios that take implementation reservations or leave a run in flight must release them, or the sweep scenario below sees the leaked rows; the unit-tier routing tests (`dispatch-routing.test.ts`) cover the not-ready, `unavailable`, `conflict`, and Legacy outcomes without Docker.
+
+The first run of this file found that `PlanningRunIngressClient.submit` sent an `idempotency-key` header, which Restate
+rejects on a workflow handler with HTTP 400; the key was removed because the workflow key is the idempotency.
+`src/__tests__/planning-run-production.test.ts` (default suite, no Docker) covers the deps one by one, including the
+check that `workflows/claude-plan.yml`'s `run-name` contains `PLANNING_RUN_TITLE_PREFIX`.
+
+## The owned-run contract suite (AII-1062)
+
+`src/__tests__/restate/owned-run-contract.ts` (not a `.test.ts` file, so vitest does not collect it) exports `registerOwnedRunContract(adapter, envFor)`. It registers five scenarios on both variants: a status read that fails on each attempt still reaches the deadline, stops the run, and releases; a crash after the launch adopts the run and launches once; a normal end runs `cleanup` with the run id, `outcome` once, then the release; a refused reservation launches nothing, cleans up nothing, and releases nothing; a failed `cleanup` and `outcome` still release. Scenarios hold the workflow with `waitForStep` and never sleep. See [ADR 036](adr/036-an-owned-run-lifecycle-is-one-kit-and-one-contract-suite.md).
+
+**What an adapter supplies** (`OwnedRunAdapter`):
+
+* `name`, for the describe title.
+* `start(baseUrl, key, { faults, totalMs })`: starts the workflow under `key` and returns `{ runId, done, read, finish }`. `read` is the workflow's status read (`step` is `"waiting"` during the wait), `finish` ends the run normally, `runId` is the id the launch gives. `faults` (`failStatusRead`, `refuseReservation`, `crashAfterLaunch`, `failCleanup`, `failOutcome`) is the adapter's to inject, for example with `crashAfterFirstCall` for the launch.
+* `calls(key)`: the calls the effects made, in order, one string per attempt: `reserve`, `launch`, `status`, `stop`, `cleanup:<runId>`, `outcome`, `release`.
+
+**Adding the suite to a run kind's scenario file:** start the environments with `startVariants` in `beforeAll`, write the adapter over the run kind's workflow and its recording fakes, and call `registerOwnedRunContract(adapter, (label) => environments.get(label)!)` at the top level of the file. `owned-run-lifecycle.restate.test.ts` is the worked example, with a small fixture workflow. Each effect the adapter passes must be safe to run twice.
+
 ## Timing rules
 
 Four flakes cost gap-fill rounds (a base URL captured before a restart, a scenario that outran a shortened

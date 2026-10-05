@@ -64,6 +64,13 @@ vi.mock("../planning-context.js", async (importOriginal) => {
   return { ...actual, buildPlanningContextInputs: vi.fn(actual.buildPlanningContextInputs) };
 });
 
+// The pilot lifecycle submits PlanningRun through the ingress client; this file never reaches Restate.
+const planningIngress = vi.hoisted(() => ({ submit: vi.fn(), report: vi.fn() }));
+vi.mock("../restate/planning-run-client.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../restate/planning-run-client.js")>();
+  return { ...actual, createPlanningRunIngressClient: () => planningIngress };
+});
+
 // AII-783 gap-fill (review finding on PR #681): the exact four cases the blocking review
 // comment asked for, tested directly against the pure decision seam dispatchSession's
 // catch block now delegates to, rather than only indirectly through a full dispatch call.
@@ -475,6 +482,74 @@ describe("dispatch entry points — pre-launch failure releases the reservation 
       backend: "local-docker",
     });
     expect(retry.ok).toBe(false);
+  });
+
+  describe("launchPlanningSession (AII-1053)", () => {
+    const planningConfig = {
+      githubAppId: "id",
+      githubAppPrivateKey: "key",
+      anthropicApiKey: "sk-test",
+      localRunnerImage: "test-image",
+      localRunnerOrchestratorUrl: "http://localhost:9000",
+      runnerCallbackBaseUrl: "http://localhost:9000",
+      runnerTokenSecret: "secret",
+    } as unknown as AppConfig;
+
+    async function launch(reservation?: import("../index.js").HeldReservation) {
+      const planning = await import("../planning-launch.js");
+      return planning.launchPlanningSession({
+        config: planningConfig, provider, issue, mapping, execPath: "local-docker", runnerMode: "default",
+        resolvedPlanningBranch: "main", planningFieldValue: null, reservation,
+        deps: {
+          dispatchSession: indexModule.dispatchSession,
+          isDefinitiveFlyRejectionError: () => false,
+          isDefinitiveLocalDockerLaunchFailure: () => false,
+          shouldReleaseAdmissionOnDispatchError: indexModule.shouldReleaseAdmissionOnDispatchError,
+        },
+      });
+    }
+
+    beforeEach(async () => {
+      (await import("../log.js")).initLogTable();
+      vi.mocked(githubAppAuth.getInstallationToken).mockResolvedValue("gh-token");
+      vi.mocked(localDocker.startLocalRunnerContainer).mockResolvedValue({ containerId: "c-1", containerName: "n" } as never);
+      (provider as unknown as Record<string, unknown>).markPlanningStarted = vi.fn().mockResolvedValue(undefined);
+    });
+
+    it("no reservation: acquires exactly one Legacy reservation", async () => {
+      const admission = await import("../dispatch-admission.js");
+      const result = await launch();
+      expect(result).toEqual({ outcome: "accepted", machineId: "c-1", executionMode: "local-docker" });
+      const rows = dedup.getDb().prepare("SELECT dispatch_id FROM dispatch_admissions").all() as { dispatch_id: string }[];
+      expect(rows).toHaveLength(1);
+      expect(admission.read(rows[0].dispatch_id)?.lifecycleOwner).toEqual({ kind: "legacy" });
+    });
+
+    it("with a reservation: does not acquire, logs the given dispatch id and generation, never releases it", async () => {
+      const held = gate.acquireDispatch({
+        dispatchId: "held-1", issueId: issue.id, issueIdentifier: issue.identifier, kind: "planning",
+        teamKey: issue.scopeKey, maxInProgressAiIssues: 1, backend: "local-docker",
+      });
+      if (!held.ok) throw new Error("setup");
+      const result = await launch({ dispatchId: "held-1", admission: held });
+      expect(result.outcome).toBe("accepted");
+      const admRows = dedup.getDb().prepare("SELECT COUNT(*) AS n FROM dispatch_admissions").get() as { n: number };
+      expect(admRows.n).toBe(1);
+      const row = dedup.getDb().prepare("SELECT dispatch_id, admission_generation FROM dispatch_log").get() as Record<string, unknown>;
+      expect(row).toEqual({ dispatch_id: "held-1", admission_generation: held.admissionGeneration });
+    });
+
+    it("with a reservation: a pre-launch throw is rejected and leaves the reservation held", async () => {
+      vi.mocked(githubAppAuth.getInstallationToken).mockRejectedValue(new Error("mint failed"));
+      const held = gate.acquireDispatch({
+        dispatchId: "held-2", issueId: issue.id, issueIdentifier: issue.identifier, kind: "planning",
+        teamKey: issue.scopeKey, maxInProgressAiIssues: 1, backend: "local-docker",
+      });
+      if (!held.ok) throw new Error("setup");
+      expect((await launch({ dispatchId: "held-2", admission: held })).outcome).toBe("rejected");
+      const released = dedup.getDb().prepare("SELECT released_at FROM dispatch_admissions WHERE dispatch_id = 'held-2'").get() as { released_at: number | null };
+      expect(released.released_at).toBeNull();
+    });
   });
 });
 
@@ -1400,5 +1475,144 @@ describe("dispatchGitHubActions — run lookup is keyed by issue identifier (AII
       { id: 222, display_title: `Claude AI Implementation — ${issueB.identifier}` },
     ]);
     expect(await dispatchB()).toBe(222);
+  });
+});
+
+// AII-1021 / AII-1065: a project whose lifecycle switch is `restate` submits `PlanningRun`, which takes the
+// reservation in its first step; `dispatchPlanning` takes none and never launches. A `legacy` project keeps the current owner.
+describe("dispatchPlanning — Restate lifecycle switch (AII-1021)", () => {
+  let dbPath: string;
+  let dedup: typeof DedupModule;
+  let admission: typeof import("../dispatch-admission.js");
+  let gate: typeof GateModule;
+  let indexModule: typeof import("../index.js");
+  let github: typeof import("../github.js");
+  let restateStatus: typeof import("../restate/status.js");
+
+  const issue: TicketIssue = {
+    id: "issue-pilot-1", identifier: "AII-1100", title: "Pilot", description: "d", scopeKey: "AII", nativeStatus: "Todo",
+  };
+  const baseMapping = {
+    owner: "eudoxus", repo: "AI-Implement", workflowFile: "claude-implement.yml", planningWorkflowFile: "claude-plan.yml",
+    defaultBranch: "main", maxInProgressAiIssues: 1, provider: "anthropic", sessionMode: "default",
+    machineCpus: 1, machineMemoryMb: 512, extraEnv: {},
+  };
+  const pilot = { ...baseMapping, reviewFixLifecycle: "restate" } as unknown as RepoMapping;
+  const legacyMapping = { ...baseMapping, reviewFixLifecycle: "legacy" } as unknown as RepoMapping;
+  const provider = {
+    id: "jira",
+    issueUrl: vi.fn().mockReturnValue("https://example.atlassian.net/browse/AII-1100"),
+    markImplementationFailed: vi.fn(), markPlanningFailed: vi.fn(),
+    markPlanningStarted: vi.fn().mockResolvedValue(undefined), postComment: vi.fn().mockResolvedValue(undefined),
+  } as unknown as TicketingProvider;
+  const config = { githubAppId: "id", githubAppPrivateKey: "key" } as unknown as AppConfig;
+  const ctxFor = (execPath: "github-actions" | "fly-machines" | "local-docker") => ({
+    execPath, runnerMode: "default", resolvedPlanningBranch: "main", planningFieldValue: "field-1",
+  });
+  const activeRows = () =>
+    (dedup.getDb().prepare("SELECT dispatch_id FROM dispatch_admissions WHERE released_at IS NULL").all() as { dispatch_id: string }[]);
+  const implementationAcquire = (id: string, issueId: string) =>
+    gate.acquireDispatch({
+      dispatchId: id, issueId, issueIdentifier: "X", kind: "implementation", teamKey: "AII",
+      maxInProgressAiIssues: 5, backend: "github-actions",
+    });
+
+  beforeEach(async () => {
+    vi.resetModules();
+    dbPath = path.join(os.tmpdir(), `dispatch-pilot-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
+    process.env.DEDUP_DB_PATH = dbPath;
+    dedup = await import("../dedup.js");
+    gate = await import("../dispatch-gate.js");
+    admission = await import("../dispatch-admission.js");
+    (await import("../dispatch-breaker.js")).initDispatchBreakerTable();
+    (await import("../log.js")).initLogTable();
+    github = await import("../github.js");
+    restateStatus = await import("../restate/status.js");
+    indexModule = await import("../index.js");
+    restateStatus.setRestateStatus({ sidecar: { state: "ready" }, registration: { state: "registered" } });
+    planningIngress.submit.mockReset().mockResolvedValue({ status: "accepted" });
+    vi.mocked(github.postWorkflowDispatch).mockReset();
+  });
+
+  afterEach(() => {
+    restateStatus.resetRestateStatus();
+    dedup.closeDb();
+    try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+  });
+
+  it.each(["github-actions", "fly-machines", "local-docker"] as const)("submits without taking a reservation, and without launching (%s)", async (backend) => {
+    await indexModule.dispatchPlanning(config, provider, issue, pilot, ctxFor(backend));
+
+    expect(planningIngress.submit).toHaveBeenCalledTimes(1);
+    const [dispatchId, input] = planningIngress.submit.mock.calls[0];
+    expect(input).toEqual({
+      dispatchId, teamKey: "AII", issueId: issue.id, issueIdentifier: issue.identifier, backend,
+      planningContext: { resolvedPlanningBranch: "main", planningFieldValue: "field-1" },
+    });
+    // The workflow reserves in its first step; the poll loop holds nothing.
+    expect(admission.read(dispatchId)).toBeNull();
+    expect(activeRows()).toEqual([]);
+    expect(github.postWorkflowDispatch).not.toHaveBeenCalled();
+  });
+
+  it("with Restate not ready, makes no reservation and no submit, and logs Restate as the cause", async () => {
+    restateStatus.setRestateStatus({ sidecar: { state: "starting" } });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    await indexModule.dispatchPlanning(config, provider, issue, pilot, ctxFor("github-actions"));
+    expect(logSpy.mock.calls.map((c) => c.join(" "))).toContain("[poll] Planning for AII-1100 skipped: Restate unavailable");
+    logSpy.mockRestore();
+    expect(planningIngress.submit).not.toHaveBeenCalled();
+    expect(activeRows()).toEqual([]);
+    expect(github.postWorkflowDispatch).not.toHaveBeenCalled();
+  });
+
+  it("with registration not registered, makes no reservation", async () => {
+    restateStatus.setRestateStatus({ registration: { state: "unreachable" } });
+    await indexModule.dispatchPlanning(config, provider, issue, pilot, ctxFor("fly-machines"));
+    expect(planningIngress.submit).not.toHaveBeenCalled();
+    expect(activeRows()).toEqual([]);
+  });
+
+  it("submit unavailable leaves no dispatch_admissions row", async () => {
+    planningIngress.submit.mockResolvedValue({ status: "unavailable" });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    await indexModule.dispatchPlanning(config, provider, issue, pilot, ctxFor("github-actions"));
+    const lines = logSpy.mock.calls.map((c) => c.join(" "));
+    logSpy.mockRestore();
+    expect(lines).toContain("[poll] Planning for AII-1100 skipped: Restate unavailable");
+    expect(dedup.getDb().prepare("SELECT COUNT(*) AS n FROM dispatch_admissions").get()).toEqual({ n: 0 });
+    expect(github.postWorkflowDispatch).not.toHaveBeenCalled();
+  });
+
+  it("submit not-found logs that the service is not registered, with no row", async () => {
+    planningIngress.submit.mockResolvedValue({ status: "not-found" });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    await indexModule.dispatchPlanning(config, provider, issue, pilot, ctxFor("github-actions"));
+    const lines = logSpy.mock.calls.map((c) => c.join(" "));
+    logSpy.mockRestore();
+    expect(lines).toContain("[poll] Planning for AII-1100 skipped: the PlanningRun service is not registered");
+    expect(activeRows()).toEqual([]);
+  });
+
+  it("an issue the non-binding check refuses is not submitted", async () => {
+    dedup.markDispatched(issue.id, issue.scopeKey);
+    await indexModule.dispatchPlanning(config, provider, issue, pilot, ctxFor("github-actions"));
+    expect(planningIngress.submit).not.toHaveBeenCalled();
+  });
+
+  it.each(["conflict", "accepted"] as const)("submit %s takes no reservation in the poll loop", async (status) => {
+    planningIngress.submit.mockResolvedValue({ status });
+    await indexModule.dispatchPlanning(config, provider, issue, pilot, ctxFor("github-actions"));
+    expect(planningIngress.submit).toHaveBeenCalledTimes(1);
+    expect(activeRows()).toEqual([]);
+  });
+
+  it("a legacy project never submits and reserves with a Legacy owner", async () => {
+    vi.mocked(github.postWorkflowDispatch).mockResolvedValue({ success: false, status: 503, error: "x", outcome: "unknown" });
+    await indexModule.dispatchPlanning(config, provider, issue, legacyMapping, ctxFor("github-actions"));
+    expect(planningIngress.submit).not.toHaveBeenCalled();
+    const rows = activeRows();
+    expect(rows.length).toBeLessThanOrEqual(1);
+    for (const r of rows) expect(admission.read(r.dispatch_id)?.lifecycleOwner).toEqual({ kind: "legacy" });
   });
 });

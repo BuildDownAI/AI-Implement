@@ -547,6 +547,67 @@ describe("handleRunnerResult — planning", () => {
     expect(held?.releasedAt).toBeNull();
   });
 
+  // A planning failure callback also tells the termination hook, so a Restate-owned workflow gets its `report`.
+  describe("planning failure callback", () => {
+    function seedPlanningRun(lifecycleOwner: { kind: "legacy" } | { kind: "restate"; attemptId: string }) {
+      const { token, dispatchId } = runnerTokens.mintRunToken({
+        issueId: "i", mappingTeamKey: "ENG", phase: "planning", ttlSeconds: runnerTokens.PLANNING_TTL_SECONDS, secret: SECRET,
+      });
+      dispatchAdmission.acquire({
+        dispatchId, mappingKey: "ENG", scope: { kind: "issue", issueScope: "ENG", issueId: "i" }, kind: "planning",
+        backend: "github-actions", lifecycleOwner: lifecycleOwner.kind === "restate" ? { kind: "restate", attemptId: dispatchId } : lifecycleOwner, cap: 1,
+      });
+      log.appendLog({
+        issueId: "i", issueIdentifier: "ENG-1", issueTitle: "Plan it", teamKey: "ENG", repo: "o/r", dispatchId,
+        executionMode: "github-actions", phase: "planning",
+      });
+      return { token, dispatchId };
+    }
+
+    it("calls checkPlanningAdmissionTermination and, for a Restate-owned dispatch, writes the failed row it keeps", async () => {
+      const { token, dispatchId } = seedPlanningRun({ kind: "restate", attemptId: "x" });
+      const checkPlanningAdmissionTermination = vi.fn(async () => {});
+      const res = await runnerCallback.handleRunnerResult({
+        authorization: `Bearer ${token}`,
+        body: { phase: "planning", outcome: "failure", failureReason: "boom", failureCode: "PLAN_BOOM", comments: [] },
+        secret: SECRET,
+        resolveProvider: makeResolve(new FakeProvider({ recordCalls: true })),
+        checkPlanningAdmissionTermination,
+      });
+      expect(res.status).toBe(200);
+      expect(checkPlanningAdmissionTermination).toHaveBeenCalledWith(dispatchId);
+      expect(log.getJobByDispatchId(dispatchId)).toMatchObject({ status: "failed", conclusion: "PLAN_BOOM" });
+      // The backend may still be running: the reservation stays held for the workflow to release.
+      expect(dispatchAdmission.read(dispatchId)?.releasedAt).toBeNull();
+    });
+
+    it("leaves a Legacy dispatch unchanged: the row stays for its monitor and the hook is not called", async () => {
+      const { token, dispatchId } = seedPlanningRun({ kind: "legacy" });
+      const checkPlanningAdmissionTermination = vi.fn(async () => {});
+      await runnerCallback.handleRunnerResult({
+        authorization: `Bearer ${token}`,
+        body: { phase: "planning", outcome: "failure", failureReason: "boom", comments: [] },
+        secret: SECRET,
+        resolveProvider: makeResolve(new FakeProvider({ recordCalls: true })),
+        checkPlanningAdmissionTermination,
+      });
+      expect(checkPlanningAdmissionTermination).not.toHaveBeenCalled();
+      expect(log.getJobByDispatchId(dispatchId)?.status).not.toBe("failed");
+    });
+
+    it("does not fail the callback when the hook throws", async () => {
+      const { token } = seedPlanningRun({ kind: "restate", attemptId: "x" });
+      const res = await runnerCallback.handleRunnerResult({
+        authorization: `Bearer ${token}`,
+        body: { phase: "planning", outcome: "failure", failureReason: "boom", comments: [] },
+        secret: SECRET,
+        resolveProvider: makeResolve(new FakeProvider({ recordCalls: true })),
+        checkPlanningAdmissionTermination: async () => { throw new Error("network"); },
+      });
+      expect(res.status).toBe(200);
+    });
+  });
+
   it("calls markPlanningFailed on failure", async () => {
     const { token } = runnerTokens.mintRunToken({
       issueId: "i",
