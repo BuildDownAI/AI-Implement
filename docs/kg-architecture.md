@@ -387,7 +387,7 @@ with nothing to add logs `scope in sync` and leaves the file byte-for-byte uncha
 
 ### Where to watch a refresh
 
-**Where to watch a refresh.** `/admin#kg-pipelines` (admin only) shows the Knowledge graph card above a
+`/admin#kg-pipelines` (admin only) shows the Knowledge graph card above a
 table of kg-refresh runs, which is the dispatch log filtered to `phase: kg-refresh`, with Logs and Stop
 on each row. The same runs also appear on the Pipelines page with the `kg` badge, because that page is
 the complete dispatch log. Deployments keeps only the deploy-side signals: the drain tile counts an
