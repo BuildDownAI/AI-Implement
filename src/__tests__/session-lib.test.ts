@@ -1,10 +1,10 @@
-import { afterEach, describe, it, expect } from "vitest";
+import { describe, it, expect } from "vitest";
 
 const isWindows = process.platform === "win32";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { chmodSync, existsSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { testDir } from "./helpers/test-dir.js";
 
 function runBash(script: string) {
   return spawnSync("bash", ["-lc", script], {
@@ -164,15 +164,8 @@ describe.skipIf(isWindows)("resolve_envelope_field / select_runner_entry", () =>
 });
 
 describe.skipIf(isWindows)("verify_workspace_writable", () => {
-  const cleanupDirs: string[] = [];
-
-  afterEach(() => {
-    for (const dir of cleanupDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
-  });
-
   function makeEnv(): { binDir: string; workspace: string } {
-    const root = mkdtempSync(join(tmpdir(), "lib-ws-test-"));
-    cleanupDirs.push(root);
+    const root = testDir("lib-ws");
     const binDir = join(root, "bin");
     const workspace = join(root, "workspace");
     mkdirSync(binDir);
@@ -251,12 +244,10 @@ describe.skipIf(isWindows)("verify_workspace_writable", () => {
     // cannot contain /), so we reference it via $PROBE_SENTINEL and pass the real
     // path as an env var.  If the trap were to eval the probe path, it would run
     // `touch $PROBE_SENTINEL` and create the sentinel file.
-    const sentinelRoot = mkdtempSync(join(tmpdir(), "sentinel-test-"));
-    cleanupDirs.push(sentinelRoot);
+    const sentinelRoot = testDir("sentinel");
     const sentinel = join(sentinelRoot, "PWNED");
 
-    const wsRoot = mkdtempSync(join(tmpdir(), "hostile-ws-"));
-    cleanupDirs.push(wsRoot);
+    const wsRoot = testDir("hostile-ws");
     // $, (, ), and space are valid filename characters on Linux.
     const hostileWs = join(wsRoot, "ws-$(touch $PROBE_SENTINEL)");
     mkdirSync(hostileWs);
@@ -279,12 +270,10 @@ describe.skipIf(isWindows)("verify_workspace_writable", () => {
   });
 
   it("does not execute backtick syntax embedded in the workspace path during cleanup", () => {
-    const sentinelRoot = mkdtempSync(join(tmpdir(), "sentinel-test-"));
-    cleanupDirs.push(sentinelRoot);
+    const sentinelRoot = testDir("sentinel");
     const sentinel = join(sentinelRoot, "PWNED");
 
-    const wsRoot = mkdtempSync(join(tmpdir(), "hostile-ws-"));
-    cleanupDirs.push(wsRoot);
+    const wsRoot = testDir("hostile-ws");
     // Backtick is a valid filename character on Linux.
     const hostileWs = join(wsRoot, "ws-`touch $PROBE_SENTINEL`");
     mkdirSync(hostileWs);

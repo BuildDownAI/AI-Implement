@@ -1,6 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import {
   DISPOSITIONS_FILE,
@@ -12,6 +11,7 @@ import {
   type FindingDisposition,
 } from "../pipeline/finding-dispositions.js";
 import type { GhSpawn } from "../pipeline/review-ledger.js";
+import { testDir } from "./helpers/test-dir.js";
 
 function hexKey(n: number): string {
   return n.toString(16).padStart(64, "0");
@@ -135,7 +135,7 @@ describe("buildDispositionInstructions", () => {
 
 describe("readFindingDispositions", () => {
   it("returns an empty result without throwing when the file is missing", () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "finding-dispositions-"));
+    const dir = testDir("finding-dispositions");
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     try {
       expect(() => readFindingDispositions(dir)).not.toThrow();
@@ -143,12 +143,11 @@ describe("readFindingDispositions", () => {
       expect(logSpy).toHaveBeenCalled();
     } finally {
       logSpy.mockRestore();
-      fs.rmSync(dir, { recursive: true, force: true });
     }
   });
 
   it("returns an empty result without throwing when the file has invalid JSON", () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "finding-dispositions-"));
+    const dir = testDir("finding-dispositions");
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     try {
       fs.mkdirSync(path.join(dir, "ai-output"), { recursive: true });
@@ -158,25 +157,20 @@ describe("readFindingDispositions", () => {
       expect(logSpy).toHaveBeenCalled();
     } finally {
       logSpy.mockRestore();
-      fs.rmSync(dir, { recursive: true, force: true });
     }
   });
 
   it("reads and sanitizes a valid dispositions file", () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "finding-dispositions-"));
-    try {
-      fs.mkdirSync(path.join(dir, "ai-output"), { recursive: true });
-      fs.writeFileSync(
-        path.join(dir, DISPOSITIONS_FILE),
-        JSON.stringify([{ findingKey: hexKey(1), disposition: "fixed", reason: "done" }]),
-      );
-      expect(readFindingDispositions(dir)).toEqual({
-        valid: [{ findingKey: hexKey(1), disposition: "fixed", reason: "done" }],
-        dropped: 0,
-      });
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
+    const dir = testDir("finding-dispositions");
+    fs.mkdirSync(path.join(dir, "ai-output"), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, DISPOSITIONS_FILE),
+      JSON.stringify([{ findingKey: hexKey(1), disposition: "fixed", reason: "done" }]),
+    );
+    expect(readFindingDispositions(dir)).toEqual({
+      valid: [{ findingKey: hexKey(1), disposition: "fixed", reason: "done" }],
+      dropped: 0,
+    });
   });
 });
 

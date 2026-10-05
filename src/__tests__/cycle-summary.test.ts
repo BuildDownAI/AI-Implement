@@ -1,6 +1,5 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdtempSync, rmSync, appendFileSync, existsSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { describe, it, expect, beforeEach, vi } from "vitest";
+import { appendFileSync, existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   writeCycleSummary,
@@ -13,6 +12,7 @@ import {
   type CycleSummaryInput,
 } from "../pipeline/cycle-summary.js";
 import type { RunTelemetry } from "../pipeline/types.js";
+import { testDir } from "./helpers/test-dir.js";
 
 function baseInput(overrides: Partial<CycleSummaryInput> = {}): CycleSummaryInput {
   return {
@@ -34,11 +34,7 @@ describe("cycle-summary", () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = mkdtempSync(join(tmpdir(), "cycle-summary-"));
-  });
-
-  afterEach(() => {
-    rmSync(tmpDir, { recursive: true, force: true });
+    tmpDir = testDir("cycle-summary");
   });
 
   it("writes and reads back a cycle summary", () => {
