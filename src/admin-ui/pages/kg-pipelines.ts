@@ -1,3 +1,5 @@
+import { dispatchLogHtml } from "./pipelines.js";
+
 export const kgPipelinesHtml = `
 <section data-page="kg-pipelines" hidden>
   <header class="page-header">
@@ -36,6 +38,7 @@ export const kgPipelinesHtml = `
         </div>
       </div>
     </div>
+    ${dispatchLogHtml("kglog", { title: "Runs", emptyText: "No knowledge-graph refresh runs in the selected time range" })}
   </div>
 </section>
 `;
@@ -260,6 +263,8 @@ export const kgPipelinesScript = `
     loadKgMaterializeMode();
     setInterval(loadKgStatus, 15000);
     setInterval(loadKgMaterializeMode, 15000);
+    // createDispatchLog comes from the Pipelines page script; the card works without it.
+    if (window.createDispatchLog) window.createDispatchLog('kglog', { filter: function (e) { return e.phase === 'kg-refresh'; } }).start();
   });
 })();
 `;
