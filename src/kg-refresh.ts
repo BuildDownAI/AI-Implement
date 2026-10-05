@@ -702,7 +702,7 @@ export const MATERIALIZE_ARGS = ["-m", "kg_ingest.materialize"] as const;
 /**
  * True when the low-memory `--direct` materialize path is enabled (AII-599, AII-602).
  * Resolved via the same db | env | default precedence as runner mode — KG_MATERIALIZE_DIRECT
- * seeds the setting, but an admin can flip it from the Deployments page without a redeploy.
+ * seeds the setting, but an admin can flip it from the Knowledge Graph Pipelines page without a redeploy.
  * Off by default until the configured KG_SOURCE_REPO derivative carries base PR #34's
  * `--direct` / `nt_parts` support.
  */

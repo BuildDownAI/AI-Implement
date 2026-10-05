@@ -2303,12 +2303,12 @@ describe("admin kg refresh dry-run (AII-635)", () => {
   });
 
   it("the Deployments page carries the Dry-run refresh button and the last-dry-run block", async () => {
-    const page = await import("../admin-ui/pages/deployments.js");
-    expect(page.deploymentsHtml).toContain('id="kg-dry-run-btn"');
-    expect(page.deploymentsHtml).toContain("window.triggerKgRefresh(true)");
-    expect(page.deploymentsHtml).toContain('id="kg-dry-run-last"');
-    expect(page.deploymentsScript).toContain("JSON.stringify({ dryRun: true })");
-    expect(page.deploymentsScript).toContain("function renderKgDryRun(");
+    const page = await import("../admin-ui/pages/kg-pipelines.js");
+    expect(page.kgPipelinesHtml).toContain('id="kg-dry-run-btn"');
+    expect(page.kgPipelinesHtml).toContain("window.triggerKgRefresh(true)");
+    expect(page.kgPipelinesHtml).toContain('id="kg-dry-run-last"');
+    expect(page.kgPipelinesScript).toContain("JSON.stringify({ dryRun: true })");
+    expect(page.kgPipelinesScript).toContain("function renderKgDryRun(");
   });
 });
 

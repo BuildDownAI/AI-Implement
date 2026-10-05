@@ -19,6 +19,7 @@ import { pipelinesAndStepsScript } from "../pages/pipelines-and-steps.js";
 import { modelsAndProvidersScript } from "../pages/models-and-providers.js";
 import { runnersScript } from "../pages/runners.js";
 import { reportsScript } from "../pages/reports.js";
+import { kgPipelinesScript } from "../pages/kg-pipelines.js";
 import { deploymentsScript } from "../pages/deployments.js";
 import { accessScript } from "../pages/access.js";
 import { drawerScript } from "../drawer.js";
@@ -81,6 +82,7 @@ describe("per-module script parse", () => {
     ["models-and-providers", modelsAndProvidersScript],
     ["runners", runnersScript],
     ["reports", reportsScript],
+    ["kg-pipelines", kgPipelinesScript],
     ["deployments", deploymentsScript],
     ["access", accessScript],
     ["drawer", drawerScript],
