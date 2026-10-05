@@ -70,7 +70,12 @@ When any counter is non-zero, the poll logs
 
 The breaker (`src/dispatch-breaker.ts`) parks an issue once it records
 `DISPATCH_BREAKER_THRESHOLD` (default 3) consecutive failures, and `canDispatch`
-refuses a parked issue.
+refuses a parked issue. The poll logs `[poll] Skipping <key>: parked for <phase> after N failed
+runs — unpark at /admin#runners` once when a candidate's skip reason starts or changes
+(`in_flight` and `dedup` log `[poll] Skipping <key>: <reason>`), and `[poll] <key> is no longer
+blocked` when it clears. The Blockers page lists a parked candidate with reason `parked`, for the
+phase it would run next. The gate checks `dedup` before `parked`, the page the reverse, so an
+issue with both rows logs `dedup` but shows `parked`.
 
 Mappings that share a `ticketingProvider` are asked through one sample mapping, as the
 reaper's sweep does; per-mapping tracker instances of the same provider id are not

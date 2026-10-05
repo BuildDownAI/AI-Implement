@@ -1419,17 +1419,25 @@ async function handleListBlockers(
     const reservedCountsByTeam = Object.fromEntries(
       Object.entries(capacityByMapping).map(([teamKey, capacity]) => [teamKey, capacity.used]),
     );
+    // Park state per (issue, phase), read once; the phase split matches the poll's.
+    const parkedByKey = new Map(listParked().map((p) => [`${p.issueId}:${p.phase}`, p.failures]));
+    const planningIds = new Set(snapshot.needsPlanning.map((i) => i.id));
+    const parkedFor = (issue: TicketIssue) => {
+      const failures = parkedByKey.get(`${issue.id}:${planningIds.has(issue.id) ? "planning" : "implementation"}`);
+      return failures === undefined ? null : { failures };
+    };
     const baseBlockers = selectBlockers(
       allIssues,
       teamRepoMap,
       reservedCountsByTeam,
       (id) => dispatchedSet.has(id),
+      parkedFor,
     );
     // In-flight issues drop out of the snapshot (AI-Working), so resolve them through the
     // shared seen-candidates cache — same as the poll loop (PR #202 review finding #1).
     const inFlightSiblings = resolveInFlightSiblings(inFlightIds);
     const fileOverlapCandidates = allIssues.filter(
-      (i) => !inFlightIds.has(i.id) && !dispatchedSet.has(i.id) && teamRepoMap[i.scopeKey],
+      (i) => !inFlightIds.has(i.id) && !dispatchedSet.has(i.id) && !parkedFor(i) && teamRepoMap[i.scopeKey],
     );
     const planningContexts = await getOrFetchPlanningContexts(
       [...fileOverlapCandidates, ...inFlightSiblings],
