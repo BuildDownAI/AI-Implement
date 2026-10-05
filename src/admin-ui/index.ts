@@ -20,6 +20,7 @@ import { pipelinesAndStepsHtml, pipelinesAndStepsScript } from "./pages/pipeline
 import { modelsAndProvidersHtml, modelsAndProvidersScript } from "./pages/models-and-providers.js";
 import { runnersHtml, runnersScript } from "./pages/runners.js";
 import { reportsHtml, reportsScript } from "./pages/reports.js";
+import { kgPipelinesHtml, kgPipelinesScript } from "./pages/kg-pipelines.js";
 import { deploymentsHtml, deploymentsScript } from "./pages/deployments.js";
 import { stubsHtml } from "./pages/stubs.js";
 import { noAccessHtml } from "./pages/no-access.js";
@@ -58,6 +59,7 @@ const shell = `<div id="admin-page" class="app-shell hidden">
     ${modelsAndProvidersHtml}
     ${runnersHtml}
     ${reportsHtml}
+    ${kgPipelinesHtml}
     ${deploymentsHtml}
     ${accessHtml}
     ${stubsHtml}
@@ -120,6 +122,7 @@ ${pageScript('pipelines', pipelinesAndStepsScript)}
 ${pageScript('models', modelsAndProvidersScript)}
 ${pageScript('runners', runnersScript)}
 ${pageScript('reports', reportsScript)}
+${pageScript('kg-pipelines', kgPipelinesScript)}
 ${pageScript('deployments', deploymentsScript)}
 ${pageScript('access', accessScript)}
 ${pageScript('drawer', drawerScript)}
