@@ -5,6 +5,7 @@ import type * as WorkflowSyncQueueModule from "../workflow-sync-queue.js";
 import type * as InFlightWorkModule from "../in-flight-work.js";
 import type * as ReviewFixQueueModule from "../review-fix-queue.js";
 import type * as ReconciliationModule from "../reconciliation.js";
+import type * as DeployModule from "../deploy.js";
 import { testDb } from "./helpers/test-db.js";
 
 let dedup: typeof DedupModule;
@@ -13,9 +14,10 @@ let queue: typeof WorkflowSyncQueueModule;
 let inFlight: typeof InFlightWorkModule;
 let reviewFix: typeof ReviewFixQueueModule;
 let reconciliation: typeof ReconciliationModule;
+let deploy: typeof DeployModule;
 
 beforeEach(async () => {
-  ({ dedup, log, queue, inFlight, reviewFix, reconciliation } = (
+  ({ dedup, log, queue, inFlight, reviewFix, reconciliation, deploy } = (
     await testDb({
       modules: {
         dedup: () => import("../dedup.js"),
@@ -24,6 +26,7 @@ beforeEach(async () => {
         inFlight: () => import("../in-flight-work.js"),
         reviewFix: () => import("../review-fix-queue.js"),
         reconciliation: () => import("../reconciliation.js"),
+        deploy: () => import("../deploy.js"),
       },
     })
   ).modules);
@@ -91,8 +94,7 @@ describe("getInFlightWork", () => {
        task_snapshot_json, finding_versions_json)
       VALUES ('attempt-1', 'attempt-1', 'AII', '1', 'org/app', 1,
        'AII', 'issue-1', 'attempt-1', 'launch_intent', 1, 9999999999999, '{}', '[]')`).run();
-    const { createRestateDrainProbes } = await import("../deploy.js");
-    const probes = createRestateDrainProbes();
+    const probes = deploy.createRestateDrainProbes();
     expect(await probes.unresolvedLaunches()).toBe(1);
     expect(await probes.unresolvedTerminations()).toBe(0);
     expect(await probes.activeOwners()).toBe(1);

@@ -1,10 +1,8 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
+import { describe, it, expect, vi, beforeEach } from "vitest";
 import type { RepoMapping } from "../config.js";
 import type { TicketIssue, TicketingProvider } from "../providers/types.js";
 import type { AppConfig } from "../index.js";
+import { testDb } from "./helpers/test-db.js";
 
 vi.mock("../github.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../github.js")>();
@@ -18,7 +16,6 @@ vi.mock("../planning-context.js", () => ({
 }));
 
 describe("launchPlanningRun", () => {
-  let dbPath: string;
   let dedup: typeof import("../dedup.js");
   let log: typeof import("../log.js");
   let github: typeof import("../github.js");
@@ -71,21 +68,17 @@ describe("launchPlanningRun", () => {
   }
 
   beforeEach(async () => {
-    vi.resetModules();
     vi.clearAllMocks();
-    dbPath = path.join(os.tmpdir(), `planning-launch-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-    process.env.DEDUP_DB_PATH = dbPath;
-    dedup = await import("../dedup.js");
-    (await import("../dispatch-breaker.js")).initDispatchBreakerTable();
-    log = await import("../log.js");
-    log.initLogTable();
-    github = await import("../github.js");
-    launchModule = await import("../planning-launch.js");
-  });
-
-  afterEach(() => {
-    dedup.closeDb();
-    try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+    ({ dedup, log, github, launchModule } = (
+      await testDb({
+        modules: {
+          dedup: () => import("../dedup.js"),
+          log: () => import("../log.js"),
+          github: () => import("../github.js"),
+          launchModule: () => import("../planning-launch.js"),
+        },
+      })
+    ).modules);
   });
 
   it("accepted: writes one dispatch_log row with the given dispatch id and returns the run details", async () => {
@@ -184,8 +177,6 @@ describe("launchPlanningSession", () => {
   let mod: typeof import("../planning-launch.js");
   let auth: typeof import("../github-app-auth.js");
   let docker: typeof import("../local-docker.js");
-  let dbPath: string;
-  let dedup: typeof import("../dedup.js");
 
   /** Fake dispatchSession: runs the backend like the real one and records the reservation. */
   const dispatchSession = vi.fn();
@@ -202,24 +193,20 @@ describe("launchPlanningSession", () => {
     } as never);
 
   beforeEach(async () => {
-    vi.resetModules();
     vi.clearAllMocks();
-    dbPath = path.join(os.tmpdir(), `planning-session-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-    process.env.DEDUP_DB_PATH = dbPath;
-    dedup = await import("../dedup.js");
-    (await import("../log.js")).initLogTable();
-    auth = await import("../github-app-auth.js");
-    docker = await import("../local-docker.js");
-    mod = await import("../planning-launch.js");
+    ({ auth, docker, mod } = (
+      await testDb({
+        modules: {
+          auth: () => import("../github-app-auth.js"),
+          docker: () => import("../local-docker.js"),
+          mod: () => import("../planning-launch.js"),
+        },
+      })
+    ).modules);
     dispatchSession.mockImplementation(async (_c, _p, _i, _m, _pr, _rm, opts) => {
       const r = await opts.backend({ sessionToken: "SESSION", machineNonce: "NONCE", runnerCallbackUrl: "", runToken: "RUN", markLaunchAttempted: () => {} });
       return { admitted: true, machineId: r.machineId, executionMode: r.executionMode };
     });
-  });
-
-  afterEach(() => {
-    dedup.closeDb();
-    try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
   });
 
   it("config guards return rejected without reaching dispatchSession", async () => {
