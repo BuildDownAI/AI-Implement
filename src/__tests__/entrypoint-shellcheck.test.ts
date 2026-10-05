@@ -1,16 +1,10 @@
-import { afterEach, describe, it, expect } from "vitest";
+import { describe, it, expect } from "vitest";
 import { spawn, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
-
-const tempDirs: string[] = [];
-
-afterEach(() => {
-  for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
-});
+import { testDir } from "./helpers/test-dir.js";
 
 function writeShim(binDir: string, name: string, body: string): void {
   const shim = join(binDir, name);
@@ -60,59 +54,51 @@ describe("session/git-credential-helper.sh", () => {
   });
 
   it("returns x-access-token credentials from a fresh token file", () => {
-    const dir = mkdtempSync(join(tmpdir(), "dep-token-test-"));
+    const dir = testDir("dep-token");
     const tokenFile = join(dir, "token.json");
-    try {
-      const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
-      writeFileSync(tokenFile, JSON.stringify({ token: "ghs_test_tok", expires_at: expiresAt }));
+    const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+    writeFileSync(tokenFile, JSON.stringify({ token: "ghs_test_tok", expires_at: expiresAt }));
 
-      const r = spawnSync("bash", ["session/git-credential-helper.sh", "get"], {
-        stdio: ["pipe", "pipe", "pipe"],
-        input: "protocol=https\nhost=github.com\n\n",
-        env: { ...process.env, GIT_DEPENDENCY_TOKEN_FILE: tokenFile },
-      });
-      expect(r.status).toBe(0);
-      expect(r.stdout.toString()).toContain("username=x-access-token");
-      expect(r.stdout.toString()).toContain("password=ghs_test_tok");
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
+    const r = spawnSync("bash", ["session/git-credential-helper.sh", "get"], {
+      stdio: ["pipe", "pipe", "pipe"],
+      input: "protocol=https\nhost=github.com\n\n",
+      env: { ...process.env, GIT_DEPENDENCY_TOKEN_FILE: tokenFile },
+    });
+    expect(r.status).toBe(0);
+    expect(r.stdout.toString()).toContain("username=x-access-token");
+    expect(r.stdout.toString()).toContain("password=ghs_test_tok");
   });
 
   it("does NOT re-fetch when the cached token has more than 10 minutes remaining", () => {
-    const dir = mkdtempSync(join(tmpdir(), "dep-token-test-"));
+    const dir = testDir("dep-token");
     const tokenFile = join(dir, "token.json");
-    try {
-      const expiresAt = new Date(Date.now() + 30 * 60 * 1000).toISOString(); // 30 min — fresh
-      writeFileSync(tokenFile, JSON.stringify({ token: "fresh-tok", expires_at: expiresAt }));
+    const expiresAt = new Date(Date.now() + 30 * 60 * 1000).toISOString(); // 30 min — fresh
+    writeFileSync(tokenFile, JSON.stringify({ token: "fresh-tok", expires_at: expiresAt }));
 
-      // Provide a callback URL pointing at a port where nothing is listening.
-      // If the helper tries to refresh, curl will fail (connection refused) and
-      // the helper must still return the cached token.  We assert the output is
-      // the cached token (not empty), proving no refresh was attempted.
-      const r = spawnSync("bash", ["session/git-credential-helper.sh", "get"], {
-        stdio: ["pipe", "pipe", "pipe"],
-        input: "protocol=https\nhost=github.com\n\n",
-        env: {
-          ...process.env,
-          GIT_DEPENDENCY_TOKEN_FILE: tokenFile,
-          GIT_DEPENDENCY_CALLBACK_URL: "http://127.0.0.1:19999",
-          RUN_PROGRESS_TOKEN: "progress-tok",
-        },
-      });
-      expect(r.status).toBe(0);
-      // Token is returned immediately without contacting the server.
-      expect(r.stdout.toString()).toContain("password=fresh-tok");
-      // Cache file must not have changed.
-      const cached = JSON.parse(readFileSync(tokenFile, "utf-8")) as { token: string };
-      expect(cached.token).toBe("fresh-tok");
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
+    // Provide a callback URL pointing at a port where nothing is listening.
+    // If the helper tries to refresh, curl will fail (connection refused) and
+    // the helper must still return the cached token.  We assert the output is
+    // the cached token (not empty), proving no refresh was attempted.
+    const r = spawnSync("bash", ["session/git-credential-helper.sh", "get"], {
+      stdio: ["pipe", "pipe", "pipe"],
+      input: "protocol=https\nhost=github.com\n\n",
+      env: {
+        ...process.env,
+        GIT_DEPENDENCY_TOKEN_FILE: tokenFile,
+        GIT_DEPENDENCY_CALLBACK_URL: "http://127.0.0.1:19999",
+        RUN_PROGRESS_TOKEN: "progress-tok",
+      },
+    });
+    expect(r.status).toBe(0);
+    // Token is returned immediately without contacting the server.
+    expect(r.stdout.toString()).toContain("password=fresh-tok");
+    // Cache file must not have changed.
+    const cached = JSON.parse(readFileSync(tokenFile, "utf-8")) as { token: string };
+    expect(cached.token).toBe("fresh-tok");
   });
 
   it("re-fetches and returns the new token when within 10 minutes of expiry", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "dep-token-test-"));
+    const dir = testDir("dep-token");
     const tokenFile = join(dir, "token.json");
 
     let requestedUrl: string | undefined;
@@ -166,7 +152,6 @@ describe("session/git-credential-helper.sh", () => {
       expect(cached.token).toBe("refreshed-tok");
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
-      rmSync(dir, { recursive: true, force: true });
     }
   });
 
@@ -181,33 +166,29 @@ describe("session/git-credential-helper.sh", () => {
     // https://github.com and then calling `git credential fill` with all fields
     // pre-supplied (replicating what git does internally after parsing the URL).
     // The sentinel file must NOT exist after the call.
-    const dir = mkdtempSync(join(tmpdir(), "dep-token-test-"));
-    try {
-      const sentinelFile = join(dir, "sentinel");
-      const helperScript = join(dir, "sentinel-helper.sh");
-      const gitconfigFile = join(dir, ".gitconfig");
+    const dir = testDir("dep-token");
+    const sentinelFile = join(dir, "sentinel");
+    const helperScript = join(dir, "sentinel-helper.sh");
+    const gitconfigFile = join(dir, ".gitconfig");
 
-      writeFileSync(helperScript, `#!/bin/bash\ntouch "${sentinelFile}"\n`);
-      chmodSync(helperScript, 0o755);
+    writeFileSync(helperScript, `#!/bin/bash\ntouch "${sentinelFile}"\n`);
+    chmodSync(helperScript, 0o755);
 
-      // Register sentinel for https://github.com — same scope as the real helper.
-      writeFileSync(gitconfigFile, `[credential "https://github.com"]\n\thelper = ${helperScript}\n`);
+    // Register sentinel for https://github.com — same scope as the real helper.
+    writeFileSync(gitconfigFile, `[credential "https://github.com"]\n\thelper = ${helperScript}\n`);
 
-      // Provide a fully-specified credential (protocol + host + username + password).
-      // git credential fill returns immediately without invoking any helper because
-      // there is nothing left to fill — mirroring the embedded-credential URL path.
-      const r = spawnSync("git", ["credential", "fill"], {
-        stdio: ["pipe", "pipe", "pipe"],
-        input: "protocol=https\nhost=github.com\nusername=x-access-token\npassword=ghs_test_tok\n\n",
-        env: { ...process.env, GIT_CONFIG_GLOBAL: gitconfigFile },
-      });
-      expect(r.status).toBe(0);
-      expect(r.stdout.toString()).toContain("password=ghs_test_tok");
-      // The sentinel must not exist — the helper was never consulted.
-      expect(existsSync(sentinelFile)).toBe(false);
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
+    // Provide a fully-specified credential (protocol + host + username + password).
+    // git credential fill returns immediately without invoking any helper because
+    // there is nothing left to fill — mirroring the embedded-credential URL path.
+    const r = spawnSync("git", ["credential", "fill"], {
+      stdio: ["pipe", "pipe", "pipe"],
+      input: "protocol=https\nhost=github.com\nusername=x-access-token\npassword=ghs_test_tok\n\n",
+      env: { ...process.env, GIT_CONFIG_GLOBAL: gitconfigFile },
+    });
+    expect(r.status).toBe(0);
+    expect(r.stdout.toString()).toContain("password=ghs_test_tok");
+    // The sentinel must not exist — the helper was never consulted.
+    expect(existsSync(sentinelFile)).toBe(false);
   });
 });
 
@@ -347,8 +328,7 @@ describe("session/entrypoint.sh", () => {
   });
 
   it("consumes mounted workspace mode before clone and never changes bind-mount ownership", () => {
-    const root = mkdtempSync(join(tmpdir(), "entrypoint-mounted-"));
-    tempDirs.push(root);
+    const root = testDir("entrypoint-mounted");
     const binDir = join(root, "bin");
     const workspace = join(root, "workspace");
     const commandLog = join(root, "commands.log");
@@ -598,8 +578,7 @@ describe("session/lib.sh verify_workspace_writable", () => {
   }
 
   it("leaves pre-existing probe-like files byte-for-byte unchanged on success", () => {
-    const root = mkdtempSync(join(tmpdir(), "verify-writable-"));
-    tempDirs.push(root);
+    const root = testDir("verify-writable");
     const binDir = join(root, "bin");
     spawnSync("mkdir", [binDir]);
     makeShims(binDir, SU_EXEC_SHIM);
@@ -613,8 +592,7 @@ describe("session/lib.sh verify_workspace_writable", () => {
   });
 
   it("leaves no generated probe files after a successful check", () => {
-    const root = mkdtempSync(join(tmpdir(), "verify-writable-"));
-    tempDirs.push(root);
+    const root = testDir("verify-writable");
     const binDir = join(root, "bin");
     spawnSync("mkdir", [binDir]);
     makeShims(binDir, SU_EXEC_SHIM);
@@ -626,8 +604,7 @@ describe("session/lib.sh verify_workspace_writable", () => {
   });
 
   it("succeeds for a workspace path containing a single quote", () => {
-    const root = mkdtempSync(join(tmpdir(), "verify-writable-"));
-    tempDirs.push(root);
+    const root = testDir("verify-writable");
     const workspace = join(root, "work's-dir");
     spawnSync("mkdir", [workspace]);
     const binDir = join(root, "bin");
@@ -641,8 +618,7 @@ describe("session/lib.sh verify_workspace_writable", () => {
   });
 
   it("fails before the pipeline and reports path and identity on write failure", () => {
-    const root = mkdtempSync(join(tmpdir(), "verify-writable-"));
-    tempDirs.push(root);
+    const root = testDir("verify-writable");
     const binDir = join(root, "bin");
     spawnSync("mkdir", [binDir]);
     makeShims(binDir, "exit 1");
@@ -654,8 +630,7 @@ describe("session/lib.sh verify_workspace_writable", () => {
   });
 
   it("passes workspace dir as a positional argument, not embedded in the -c program text", () => {
-    const root = mkdtempSync(join(tmpdir(), "verify-writable-"));
-    tempDirs.push(root);
+    const root = testDir("verify-writable");
     const binDir = join(root, "bin");
     const cmdLog = join(root, "cmd.log");
     spawnSync("mkdir", [binDir]);

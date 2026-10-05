@@ -1,8 +1,8 @@
-import { describe, it, expect, afterEach } from "vitest";
-import { mkdtempSync, readFileSync, rmSync, existsSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { describe, it, expect } from "vitest";
+import { readFileSync, existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { formatRunAutopsy, writeRunAutopsy, formatRunStats, type RunAutopsy } from "../run-autopsy.js";
+import { testDir } from "./helpers/test-dir.js";
 
 const AUTOPSY: RunAutopsy = {
   issueIdentifier: "DF-6",
@@ -287,11 +287,8 @@ describe("formatRunStats — planned-vs-actual delta", () => {
 });
 
 describe("writeRunAutopsy", () => {
-  let dir: string;
-  afterEach(() => rmSync(dir, { recursive: true, force: true }));
-
   it("writes ai-output/comments/90-run-autopsy.md", () => {
-    dir = mkdtempSync(join(tmpdir(), "autopsy-"));
+    const dir = testDir("autopsy");
     writeRunAutopsy(dir, AUTOPSY);
     const path = join(dir, "ai-output", "comments", "90-run-autopsy.md");
     expect(existsSync(path)).toBe(true);
@@ -299,7 +296,9 @@ describe("writeRunAutopsy", () => {
   });
 
   it("never throws on an unwritable directory", () => {
-    dir = mkdtempSync(join(tmpdir(), "autopsy-"));
-    expect(() => writeRunAutopsy("/nonexistent-root-path/nope", AUTOPSY)).not.toThrow();
+    // A file where the ai-output directory needs to be created makes the mkdir fail.
+    const dir = testDir("autopsy");
+    writeFileSync(join(dir, "ai-output"), "NOT A DIR");
+    expect(() => writeRunAutopsy(dir, AUTOPSY)).not.toThrow();
   });
 });

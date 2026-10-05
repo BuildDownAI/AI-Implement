@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { parse } from "yaml";
+import { testDir } from "./helpers/test-dir.js";
 
 const files = [
   "workflows/claude-implement.yml",
@@ -19,18 +19,13 @@ for (const file of files) {
     const mask = job.steps.find((step: { name: string }) => step.name === "Mask runner callback tokens");
 
     function execute(event: string | undefined) {
-      const dir = mkdtempSync(join(tmpdir(), "mask-event-"));
-      const eventPath = join(dir, "event.json");
+      const eventPath = join(testDir("mask-event"), "event.json");
       if (event !== undefined) writeFileSync(eventPath, event);
-      try {
-        return spawnSync("sh", ["-e", "-c", mask.run], {
-          // Deliberately do not inherit any live runner credentials.
-          env: { PATH: process.env.PATH, GITHUB_EVENT_PATH: eventPath },
-          encoding: "utf8",
-        });
-      } finally {
-        rmSync(dir, { recursive: true, force: true });
-      }
+      return spawnSync("sh", ["-e", "-c", mask.run], {
+        // Deliberately do not inherit any live runner credentials.
+        env: { PATH: process.env.PATH, GITHUB_EVENT_PATH: eventPath },
+        encoding: "utf8",
+      });
     }
 
     it("registers masks before any step header can expose a callback input", () => {

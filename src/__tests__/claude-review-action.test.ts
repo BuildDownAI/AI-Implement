@@ -1,20 +1,13 @@
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { parse } from "yaml";
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { extractReviewFindingsBlock } from "../pipeline/review-ledger.js";
+import { testDir } from "./helpers/test-dir.js";
 
 const action = parse(readFileSync(".github/actions/claude-review/action.yml", "utf8"));
 const steps = action.runs.steps as Array<{ name: string; id?: string; run?: string; with?: { claude_args?: string } }>;
-const tempRoots: string[] = [];
-
-afterEach(() => {
-  for (const root of tempRoots.splice(0)) {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
 
 function getStep(name: string) {
   const step = steps.find((candidate) => candidate.name === name);
@@ -23,8 +16,7 @@ function getStep(name: string) {
 }
 
 function runRenderStep(structuredOutput: string) {
-  const tempRoot = mkdtempSync(join(tmpdir(), "claude-review-action-"));
-  tempRoots.push(tempRoot);
+  const tempRoot = testDir("claude-review-action");
   const binDir = join(tempRoot, "bin");
   const runnerTemp = join(tempRoot, "runner");
   const scriptPath = join(tempRoot, "render.sh");

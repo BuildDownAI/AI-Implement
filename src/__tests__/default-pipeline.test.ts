@@ -1,10 +1,10 @@
 import { describe, it, expect, vi } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createDefaultRunner } from "../pipeline/default-pipeline.js";
 import type { PipelineRunner } from "../pipeline/runner.js";
 import type { StepModule } from "../pipeline/types.js";
+import { testDir } from "./helpers/test-dir.js";
 
 function registeredModule(runner: PipelineRunner, key: string): StepModule | undefined {
   // Read the private modules map for test introspection only.
@@ -55,12 +55,12 @@ describe("DEFAULT_PIPELINE baked custom root", () => {
   // at a real on-disk baked root (no injected fs) to prove an image-baked
   // custom/pipelines/autonomous.yml takes effect at import time.
   it("honors AI_IMPLEMENT_CUSTOM_ROOT at module-import time", async () => {
-    const bakedRoot = mkdtempSync(join(tmpdir(), "ai-implement-baked-"));
+    const bakedRoot = testDir("baked");
     // The workspace (cwd) root outranks the baked root, so run the import from
     // an empty temp cwd — otherwise a repo that actually ships a
     // custom/pipelines/autonomous.yml (any real fork) would win and break this
     // test's baked-root assertion.
-    const emptyCwd = mkdtempSync(join(tmpdir(), "ai-implement-cwd-"));
+    const emptyCwd = testDir("cwd");
     const prevCwd = process.cwd();
     try {
       mkdirSync(join(bakedRoot, "custom", "pipelines"), { recursive: true });
@@ -78,8 +78,6 @@ describe("DEFAULT_PIPELINE baked custom root", () => {
       process.chdir(prevCwd);
       vi.unstubAllEnvs();
       vi.resetModules();
-      rmSync(bakedRoot, { recursive: true, force: true });
-      rmSync(emptyCwd, { recursive: true, force: true });
     }
   });
 });

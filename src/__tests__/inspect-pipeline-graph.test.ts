@@ -1,17 +1,13 @@
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { inspectPipelinesAndSteps } from "../inspect-pipeline-graph.js";
+import { testDir } from "./helpers/test-dir.js";
 
 let tmpDir: string;
 
 beforeEach(() => {
-  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "inspect-"));
-});
-
-afterEach(() => {
-  fs.rmSync(tmpDir, { recursive: true, force: true });
+  tmpDir = testDir("inspect");
 });
 
 function writeFile(rel: string, content: string): void {
