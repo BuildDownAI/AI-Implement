@@ -1,4 +1,5 @@
 import { getDb } from "./dedup.js";
+import { getMappings } from "./config.js";
 import { markCommentGapfillRunTerminal, requeueGapfillAfterPushFailure } from "./comment-gapfill-queue.js";
 import { isFailureRecord, type FailureRecord } from "./pipeline/failure-classification.js";
 import { read as readAdmission, release as releaseAdmission } from "./dispatch-admission.js";
@@ -693,26 +694,55 @@ export function getLatestDispatchForIssueIdentifier(owner: string, repo: string,
 }
 
 /**
- * Returns the latest identifier, title, and repo recorded in dispatch_log for a
- * given issue+phase, or null fields when no log entry exists. Used to enrich
- * parked-issue rows whose metadata lives only in dispatch_log.
+ * Returns the identifier, title, and repo for a parked issue, or null fields when
+ * no record exists. dispatch_log is pruned, so the lookup falls back: newest row
+ * for the issue+phase, newest row for the issue in any phase, then the dispatched
+ * table (repo mapped from its team_key when a mapping exists).
  */
 export function getIssueEnrichment(
   issueId: string,
   phase: string,
 ): { issueIdentifier: string | null; issueTitle: string | null; repo: string | null } {
-  const row = getDb()
-    .prepare(
-      `SELECT issue_identifier, issue_title, repo
-       FROM dispatch_log
-       WHERE issue_id = ? AND phase = ?
-       ORDER BY id DESC LIMIT 1`,
-    )
-    .get(issueId, phase) as
-    | { issue_identifier: string | null; issue_title: string | null; repo: string | null }
+  type LogRow = { issue_identifier: string | null; issue_title: string | null; repo: string | null };
+  const db = getDb();
+  const select = `SELECT issue_identifier, issue_title, repo FROM dispatch_log`;
+  const row =
+    (db.prepare(`${select} WHERE issue_id = ? AND phase = ? ORDER BY id DESC LIMIT 1`).get(issueId, phase) as
+      | LogRow
+      | undefined) ??
+    (db.prepare(`${select} WHERE issue_id = ? ORDER BY id DESC LIMIT 1`).get(issueId) as LogRow | undefined);
+  if (row?.issue_identifier) {
+    return {
+      issueIdentifier: row.issue_identifier,
+      issueTitle: row.issue_title ?? null,
+      repo: row.repo ?? null,
+    };
+  }
+
+  const dispatched = db
+    .prepare("SELECT issue_identifier, issue_title, team_key FROM dispatched WHERE issue_id = ?")
+    .get(issueId) as
+    | { issue_identifier: string | null; issue_title: string | null; team_key: string | null }
     | undefined;
+  if (dispatched?.issue_identifier) {
+    let repo: string | null = null;
+    if (dispatched.team_key) {
+      try {
+        const m = getMappings()[dispatched.team_key];
+        if (m) repo = `${m.owner}/${m.repo}`;
+      } catch {
+        // mappings table unavailable: leave the repo unknown
+      }
+    }
+    return {
+      issueIdentifier: dispatched.issue_identifier,
+      issueTitle: dispatched.issue_title ?? null,
+      repo: repo ?? row?.repo ?? null,
+    };
+  }
+
   return {
-    issueIdentifier: row?.issue_identifier ?? null,
+    issueIdentifier: null,
     issueTitle: row?.issue_title ?? null,
     repo: row?.repo ?? null,
   };
