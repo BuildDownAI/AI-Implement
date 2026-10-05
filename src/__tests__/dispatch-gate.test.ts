@@ -1,37 +1,30 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import os from "node:os";
-import path from "node:path";
-import fs from "node:fs";
 import type * as DedupModule from "../dedup.js";
 import type * as LogModule from "../log.js";
 import type * as BreakerModule from "../dispatch-breaker.js";
 import type * as GateModule from "../dispatch-gate.js";
+import { testDb } from "./helpers/test-db.js";
 
-let dbPath: string;
 let dedup: typeof DedupModule;
 let log: typeof LogModule;
 let breaker: typeof BreakerModule;
 let gate: typeof GateModule;
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(
-    os.tmpdir(),
-    `dispatch-gate-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-  );
-  process.env.DEDUP_DB_PATH = dbPath;
   delete process.env.DISPATCH_BREAKER_THRESHOLD;
-  dedup = await import("../dedup.js");
-  log = await import("../log.js");
-  breaker = await import("../dispatch-breaker.js");
-  gate = await import("../dispatch-gate.js");
-  log.initLogTable();
-  breaker.initDispatchBreakerTable();
+  ({ dedup, log, breaker, gate } = (
+    await testDb({
+      modules: {
+        dedup: () => import("../dedup.js"),
+        log: () => import("../log.js"),
+        breaker: () => import("../dispatch-breaker.js"),
+        gate: () => import("../dispatch-gate.js"),
+      },
+    })
+  ).modules);
 });
 
 afterEach(() => {
-  dedup.closeDb();
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
   delete process.env.DISPATCH_BREAKER_THRESHOLD;
 });
 

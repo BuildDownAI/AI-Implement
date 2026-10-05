@@ -1,13 +1,9 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
+import { describe, it, expect, beforeEach } from "vitest";
 import type { OAuthTransaction } from "../oauth/state-store.js";
+import { testDb } from "./helpers/test-db.js";
 
-// Temp-file DB per test (same isolation pattern as admin-session.test.ts).
 let store: typeof import("../oauth/state-store.js");
 let dedup: typeof import("../dedup.js");
-let dbPath: string;
 
 const tx = (over: Partial<OAuthTransaction> = {}): OAuthTransaction => ({
   state: "state-1",
@@ -19,20 +15,9 @@ const tx = (over: Partial<OAuthTransaction> = {}): OAuthTransaction => ({
 });
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(os.tmpdir(), `state-store-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-  process.env.DEDUP_DB_PATH = dbPath;
-  store = await import("../oauth/state-store.js");
-  dedup = await import("../dedup.js");
-});
-
-afterEach(() => {
-  dedup.closeDb();
-  try {
-    fs.unlinkSync(dbPath);
-  } catch {
-    /* ignore */
-  }
+  ({ store, dedup } = (
+    await testDb({ modules: { store: () => import("../oauth/state-store.js"), dedup: () => import("../dedup.js") } })
+  ).modules);
 });
 
 describe("oauth transaction store", () => {

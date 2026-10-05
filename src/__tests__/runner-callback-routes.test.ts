@@ -13,40 +13,24 @@
 // with real HTTP request tests against that router.
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import os from "node:os";
-import path from "node:path";
-import fs from "node:fs";
-import type * as DedupModule from "../dedup.js";
 import type * as RunnerCallbackModule from "../runner-callback.js";
 import type * as RunnerTokensModule from "../runner-tokens.js";
 import { FakeProvider } from "./providers/fake.js";
 import type { TicketingProvider } from "../providers/types.js";
+import { testDb } from "./helpers/test-db.js";
 
-let dbPath: string;
-let dedup: typeof DedupModule;
 let runnerCallback: typeof RunnerCallbackModule;
 let runnerTokens: typeof RunnerTokensModule;
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(
-    os.tmpdir(),
-    `route-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-  );
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  runnerCallback = await import("../runner-callback.js");
-  runnerTokens = await import("../runner-tokens.js");
-  dedup.getDb();
+  ({ runnerCallback, runnerTokens } = (
+    await testDb({
+      modules: { runnerCallback: () => import("../runner-callback.js"), runnerTokens: () => import("../runner-tokens.js") },
+    })
+  ).modules);
 });
 
 afterEach(() => {
-  dedup.closeDb();
-  try {
-    fs.unlinkSync(dbPath);
-  } catch {
-    /* ignore */
-  }
   vi.restoreAllMocks();
 });
 

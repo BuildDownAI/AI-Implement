@@ -1,29 +1,11 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import os from "node:os";
-import path from "node:path";
-import fs from "node:fs";
-import type * as DedupModule from "../dedup.js";
+import { describe, it, expect, beforeEach } from "vitest";
 import type * as LogModule from "../log.js";
+import { testDb } from "./helpers/test-db.js";
 
-let dbPath: string;
-let dedup: typeof DedupModule;
 let log: typeof LogModule;
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(
-    os.tmpdir(),
-    `log-team-key-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-  );
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  log = await import("../log.js");
-  log.initLogTable();
-});
-
-afterEach(() => {
-  dedup.closeDb();
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+  ({ log } = (await testDb({ modules: { log: () => import("../log.js") } })).modules);
 });
 
 describe("getLatestTeamKeyForIssue", () => {

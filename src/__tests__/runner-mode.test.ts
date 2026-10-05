@@ -1,34 +1,24 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import type * as RunnerModeModule from "../runner-mode.js";
 import type * as DedupModule from "../dedup.js";
+import { testDb } from "./helpers/test-db.js";
 
-let dbPath: string;
 let runnerMode: typeof RunnerModeModule;
 let dedup: typeof DedupModule;
 
 beforeEach(async () => {
-  dbPath = path.join(os.tmpdir(), `runner-mode-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-  process.env.DEDUP_DB_PATH = dbPath;
   delete process.env.RUNNER_MODE;
   delete process.env.FLY_PROCESS_LEVEL_SECRETS;
   delete process.env.KG_MATERIALIZE_DIRECT;
-  // Fresh module imports each test so DB singleton is reset
-  const { vi } = await import("vitest");
-  vi.resetModules();
-  runnerMode = await import("../runner-mode.js");
-  dedup = await import("../dedup.js");
-  runnerMode.initSettingsTable();
+  ({ runnerMode, dedup } = (
+    await testDb({ modules: { runnerMode: () => import("../runner-mode.js"), dedup: () => import("../dedup.js") } })
+  ).modules);
 });
 
 afterEach(() => {
-  dedup.closeDb();
   delete process.env.RUNNER_MODE;
   delete process.env.FLY_PROCESS_LEVEL_SECRETS;
   delete process.env.KG_MATERIALIZE_DIRECT;
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
 });
 
 describe("runner-mode", () => {

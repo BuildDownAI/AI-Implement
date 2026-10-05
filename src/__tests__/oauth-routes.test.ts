@@ -1,10 +1,8 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import type http from "node:http";
 import type { AuthStart, VerifiedIdentity } from "../oauth/oidc.js";
 import type { OidcProviderConfig } from "../oauth/providers.js";
+import { testDb } from "./helpers/test-db.js";
 
 // oidc.ts is the only network-touching module; mock it so we exercise the routes without openid-client.
 vi.mock("../oauth/oidc.js", () => ({
@@ -60,21 +58,22 @@ let oidc: typeof import("../oauth/oidc.js");
 let store: typeof import("../oauth/state-store.js");
 let session: typeof import("../admin-session.js");
 let dedup: typeof import("../dedup.js");
-let dbPath: string;
 
 beforeEach(async () => {
-  vi.resetModules();
   vi.clearAllMocks();
-  dbPath = path.join(os.tmpdir(), `oauth-routes-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-  process.env.DEDUP_DB_PATH = dbPath;
-  routes = await import("../oauth/routes.js");
-  providers = await import("../oauth/providers.js");
-  access = await import("../access-entries.js");
-  oidc = await import("../oauth/oidc.js");
-  store = await import("../oauth/state-store.js");
-  session = await import("../admin-session.js");
-  dedup = await import("../dedup.js");
-  access.initAccessEntriesTable();
+  ({ routes, providers, access, oidc, store, session, dedup } = (
+    await testDb({
+      modules: {
+        routes: () => import("../oauth/routes.js"),
+        providers: () => import("../oauth/providers.js"),
+        access: () => import("../access-entries.js"),
+        oidc: () => import("../oauth/oidc.js"),
+        store: () => import("../oauth/state-store.js"),
+        session: () => import("../admin-session.js"),
+        dedup: () => import("../dedup.js"),
+      },
+    })
+  ).modules);
 });
 
 /** Seed the list in force the way a pre-handover deployment does — from the env. */
@@ -83,15 +82,6 @@ function allowDomain(domain: string): void {
   process.env.OAUTH_ALLOWED_EMAILS = "";
   access.refreshEffectiveAllowlist();
 }
-
-afterEach(() => {
-  dedup.closeDb();
-  try {
-    fs.unlinkSync(dbPath);
-  } catch {
-    /* ignore */
-  }
-});
 
 const START: AuthStart = { authorizationUrl: "https://accounts.google.com/o/oauth2/v2/auth?x=1", state: "st", nonce: "no", codeVerifier: "cv" };
 

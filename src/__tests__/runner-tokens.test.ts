@@ -1,33 +1,21 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import os from "node:os";
-import path from "node:path";
-import fs from "node:fs";
 import crypto from "node:crypto";
 import type * as DedupModule from "../dedup.js";
 import type * as RunnerTokensModule from "../runner-tokens.js";
+import { testDb } from "./helpers/test-db.js";
 
 const SECRET = "test-secret-with-enough-entropy-for-hmac";
 
-let dbPath: string;
 let dedup: typeof DedupModule;
 let runnerTokens: typeof RunnerTokensModule;
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(
-    os.tmpdir(),
-    `runner-tokens-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-  );
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  runnerTokens = await import("../runner-tokens.js");
-  // Force DB init so the runner_tokens table exists for the first test access.
-  dedup.getDb();
+  ({ dedup, runnerTokens } = (
+    await testDb({ modules: { dedup: () => import("../dedup.js"), runnerTokens: () => import("../runner-tokens.js") } })
+  ).modules);
 });
 
 afterEach(() => {
-  dedup.closeDb();
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
   vi.restoreAllMocks();
 });
 

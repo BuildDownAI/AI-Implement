@@ -1,21 +1,13 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
-import os from "node:os";
-import path from "node:path";
+import { describe, it, expect, beforeEach } from "vitest";
 import type { VerifiedIdentity } from "../oauth/oidc.js";
 import type { AccessEntry } from "../access-entries.js";
+import { testDb } from "./helpers/test-db.js";
 
-// authorize.ts imports access-entries.ts, which imports dedup.ts — and dedup resolves (and
-// creates) its directory at module load. Setting the path before the dynamic import keeps this
-// suite off /data. Nothing here calls getDb(), so no database file is ever opened.
+// Nothing here calls getDb(), so no database file is ever opened.
 let authz: typeof import("../oauth/authorize.js");
 
 beforeEach(async () => {
-  vi.resetModules();
-  process.env.DEDUP_DB_PATH = path.join(
-    os.tmpdir(),
-    `authorize-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-  );
-  authz = await import("../oauth/authorize.js");
+  ({ authz } = (await testDb({ tables: "none", modules: { authz: () => import("../oauth/authorize.js") } })).modules);
 });
 
 const identity = (over: Partial<VerifiedIdentity> = {}): VerifiedIdentity => ({
