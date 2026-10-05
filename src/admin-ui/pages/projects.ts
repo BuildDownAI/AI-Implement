@@ -282,7 +282,7 @@ export const projectsHtml = `
               <option value="legacy">Legacy</option>
               <option value="restate">Restate (pilot)</option>
             </select>
-            <div class="field-hint">Also selects the planning lifecycle: with Restate, each planning dispatch (any backend) is owned by a PlanningRun workflow with a deadline. Coordinates this project's automatic GitHub Actions review-fix runs. Local review-fix (the dev harness) and human comment-triggered gap-fill runs always stay on Legacy regardless of this selection &mdash; this control cannot move those paths to Restate. Changing this does not cancel or migrate anything already in flight: an attempt already dispatched keeps the lifecycle that dispatched it, and only future automatic dispatches follow the new selection.</div>
+            <div class="field-hint">Also selects the planning lifecycle: with Restate, each planning dispatch (any backend) is owned by a PlanningRun workflow with a deadline. Coordinates this project's automatic GitHub Actions review-fix runs. Local review-fix (the dev harness) and human comment-triggered gap-fill runs always stay on Legacy regardless of this selection &mdash; this control cannot move those paths to Restate. Changing this does not cancel or migrate anything already in flight: an attempt already dispatched keeps the lifecycle that dispatched it, and only future automatic dispatches follow the new selection. Restate needs the current workflow file in the target repo (use Sync workflows and merge its PR) and the GitHub Actions execution mode.</div>
           </div>
           <div class="field">
             <label class="field-label">Extra Env</label>

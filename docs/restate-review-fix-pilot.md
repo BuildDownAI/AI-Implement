@@ -23,14 +23,23 @@ See [restate.md](restate.md#the-planning-run) and [the fenced Legacy functions](
 - **Self-deploy drain:** a pilot planning run in flight counts as an active owner, so a drain waits for it (at most the planning deadline).
 - **Rollback:** set the project's switch to `legacy`. A run already submitted keeps its workflow owner until it releases.
 
-## Before enabling SAN
+## Enable the lifecycle for a project
+
+Use these steps for any project. The save at `/admin#projects` refuses when a prerequisite is missing, and each refusal names the action.
+
+1. Set the project's execution mode to GitHub Actions.
+2. Use **Sync workflows** on the project. Merge the PR that the sync opens on the dispatch ref. The workflow file must declare `run_attempt_token` and `run_publication_token`.
+3. Check that the Restate sidecar is `ready` and the endpoint is `registered`. Read the `restate` field of `GET /` or of the `get_tenant_health` tool ([Health surfaces](restate.md#health-surfaces)).
+4. Save **Review-fix & Planning Lifecycle = Restate**.
+
+## Before enabling a project (SAN trial steps marked)
 
 1. Confirm the feature branch and all its child checks have landed in the deployment target. Use the [fault-coverage record](./restate-testing.md) to separate real-engine/SQLite evidence from mocked GitHub/tracker behavior. The container suite is a prerequisite, not a live recovery claim.
-2. On the Projects page, find the mapping for `BuildDownAI/AI-Implement-Sandbox` (`SAN`). Set the execution backend to GitHub Actions and the team capacity to **one**. Leave review-fix lifecycle at **Legacy** while preparing. Verify the target repository and dispatch ref; the workflow capability probe checks that ref, not merely the default branch.
+2. SAN only: on the Projects page, find the mapping for `BuildDownAI/AI-Implement-Sandbox` (`SAN`). Set the execution backend to GitHub Actions and the team capacity to **one**. Leave review-fix lifecycle at **Legacy** while preparing. Verify the target repository and dispatch ref; the workflow capability probe checks that ref, not merely the default branch.
 3. Use **Sync workflows** for SAN and merge the resulting workflow PR in the sandbox repository. Confirm the installed workflow and runner declare `run_attempt_token` and `run_publication_token` on the dispatch ref. The Projects save gate verifies these capabilities again.
-4. Drain all active competing Legacy executions that lack a shared admission reservation before first activation. Check Pipelines/Jobs and the capacity view; finish or explicitly cancel and **verify backend termination** for each. The enablement gate refuses activation while an unreserved Legacy worker is active. Do not invent reservations for old jobs or backfill a live attempt.
+4. Know the one refusal about running work. The save is refused only when a run in flight (not `kg-refresh`) has no active reservation. Each run that the current code dispatches takes a reservation, so this can occur only right after an upgrade from a version that had no reservation table. It ends by itself when those runs end. No manual drain is necessary: the refusal names the count, and you save again later. Do not invent reservations for old jobs or backfill a live attempt.
 5. Confirm the Restate sidecar is healthy and its endpoint registered. Check that the selected SAN PR has no active writer, no uncertain launch, and no unconfirmed stop. A green service check does not resolve one of those attempt states.
-6. Save SAN's **Review-fix lifecycle = Restate** on Projects. A rejected save is a preflight failure: read its explicit reason (execution mode, endpoint health, undrained Legacy worker, or missing installed workflow capability) and fix that prerequisite. Do not bypass it by editing SQLite.
+6. Save SAN's **Review-fix lifecycle = Restate** on Projects. A rejected save is a preflight failure: read its explicit reason (execution mode, endpoint health, a run in flight with no reservation, an unreadable workflow file, or a missing installed workflow capability) and fix that prerequisite. Do not bypass it by editing SQLite.
 
 After activation, use one SAN PR and one feedback delivery. Observe the attempt ID, immutable owner, SQLite reservation, exact GitHub run ID and attempt number, runner result, PR head, and finalizer decision in the job drawer and [live evaluation](https://linear.app/eudoxus/issue/AII-815/run-and-evaluate-the-san-review-fix-pilot). The first live trial must include a real restart/recovery window and a week of operating evidence before the next run-kind migration. Approval still requires a matching valid runner result, current authority, output commit matching the current PR head, finding dispositions, and the normal merge gates. GitHub success by itself cannot approve.
 

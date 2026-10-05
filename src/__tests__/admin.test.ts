@@ -1649,7 +1649,9 @@ describe("admin mappings", () => {
       reviewFixLifecycle: "restate",
     }, token);
     expect(res.statusCode).toBe(400);
-    expect(JSON.parse(res.body).error).toContain("github-actions");
+    const error = JSON.parse(res.body).error;
+    expect(error).toContain("github-actions");
+    expect(error).toContain("leave the lifecycle on Legacy");
   });
 
   it("rejects reviewFixLifecycle='restate' on github-actions with an actionable 400 when no Restate endpoint status is available (fail closed, deps.getRestateStatus unset)", async () => {
@@ -1660,7 +1662,10 @@ describe("admin mappings", () => {
       reviewFixLifecycle: "restate",
     }, token);
     expect(res.statusCode).toBe(400);
-    expect(JSON.parse(res.body).error).toContain("Restate endpoint");
+    const error = JSON.parse(res.body).error;
+    expect(error).toContain("Restate endpoint");
+    expect(error).toContain("get_tenant_health");
+    expect(error).toContain('"registered"');
 
     const list = await request("/api/mappings", "GET", "secret", undefined, token);
     expect(JSON.parse(list.body).RFLGHA).toBeUndefined();
@@ -1680,6 +1685,7 @@ describe("admin mappings", () => {
     });
     expect(res.statusCode).toBe(400);
     expect(JSON.parse(res.body).error).toContain("run_attempt_token");
+    expect(JSON.parse(res.body).error).toContain("Sync workflows");
     expect(resolveWorkflowCapabilitiesMock).toHaveBeenCalledWith(expect.objectContaining({
       owner: "org", repo: "app", workflowFile: "claude-implement.yml", ref: "main", token: "gh-token-mock",
     }));
@@ -1718,7 +1724,9 @@ describe("admin mappings", () => {
       executionMode: "github-actions", reviewFixLifecycle: "restate",
     });
     expect(res.statusCode).toBe(400);
-    expect(JSON.parse(res.body).error).toContain("unreserved Legacy workers to drain");
+    const error = JSON.parse(res.body).error;
+    expect(error).toContain("1 run in flight has no dispatch reservation");
+    expect(error).toContain("No action is necessary");
     expect(resolveWorkflowCapabilitiesMock).not.toHaveBeenCalled();
   });
 
@@ -1763,6 +1771,7 @@ describe("admin mappings", () => {
     });
     expect(unsupported.statusCode).toBe(400);
     expect(JSON.parse(unsupported.body).error).toContain("run_publication_token");
+    expect(JSON.parse(unsupported.body).error).toContain("Sync workflows");
 
     resolveWorkflowCapabilitiesMock.mockRejectedValueOnce(new Error("secret probe detail"));
     const failed = await requestWithDeps("/api/mappings", "POST", token, healthy, {
@@ -1771,6 +1780,8 @@ describe("admin mappings", () => {
     });
     expect(failed.statusCode).toBe(400);
     expect(failed.body).not.toContain("secret probe detail");
+    expect(JSON.parse(failed.body).error).toContain("could not read");
+    expect(JSON.parse(failed.body).error).toContain("GitHub App installation");
   });
 
   it("does not write reviewFixLifecycle='restate' when a save is rejected — the mapping keeps its prior Legacy selection", async () => {
