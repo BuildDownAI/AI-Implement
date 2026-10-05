@@ -1,13 +1,23 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import type * as LogModule from "../log.js";
 import type * as DedupModule from "../dedup.js";
+import type * as CommentGapfillQueueModule from "../comment-gapfill-queue.js";
 import { testDb } from "./helpers/test-db.js";
 
 let log: typeof LogModule;
 let dedup: typeof DedupModule;
+let queue: typeof CommentGapfillQueueModule;
 
 beforeEach(async () => {
-  ({ dedup, log } = (await testDb({ modules: { dedup: () => import("../dedup.js"), log: () => import("../log.js") } })).modules);
+  ({ dedup, log, queue } = (
+    await testDb({
+      modules: {
+        dedup: () => import("../dedup.js"),
+        log: () => import("../log.js"),
+        queue: () => import("../comment-gapfill-queue.js"),
+      },
+    })
+  ).modules);
 });
 
 describe("jobs table", () => {
@@ -23,7 +33,6 @@ describe("jobs table", () => {
   });
 
   it("re-enqueues a gap-fill run that failed at push, once (AII-922)", async () => {
-    const queue = await import("../comment-gapfill-queue.js");
     const prUrl = "https://github.com/org/repo/pull/7";
     const fail = (jobId: number) => {
       log.updateJobFailure(jobId, {
@@ -49,7 +58,6 @@ describe("jobs table", () => {
   });
 
   it("does not re-enqueue a gap-fill run that failed outside push or with a conflict (AII-922)", async () => {
-    const queue = await import("../comment-gapfill-queue.js");
     const prUrl = "https://github.com/org/repo/pull/8";
     const failAt = (rowId: number, stage: "push" | "implement", category: "auth" | "transient" | "conflict") => {
       queue.markCommentGapfillProcessed(rowId, "dispatched");

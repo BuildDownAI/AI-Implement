@@ -1,14 +1,22 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as DedupModule from "../dedup.js";
 import type * as CommentGapfillQueueModule from "../comment-gapfill-queue.js";
+import type * as LogModule from "../log.js";
 import { testDb } from "./helpers/test-db.js";
 
 let dedup: typeof DedupModule;
 let queue: typeof CommentGapfillQueueModule;
+let log: typeof LogModule;
 
 beforeEach(async () => {
-  ({ dedup, queue } = (
-    await testDb({ modules: { dedup: () => import("../dedup.js"), queue: () => import("../comment-gapfill-queue.js") } })
+  ({ dedup, queue, log } = (
+    await testDb({
+      modules: {
+        dedup: () => import("../dedup.js"),
+        queue: () => import("../comment-gapfill-queue.js"),
+        log: () => import("../log.js"),
+      },
+    })
   ).modules);
 });
 
@@ -244,8 +252,6 @@ describe("gap-fill run terminalization (AII-277 livelock fix)", () => {
   });
 
   it("updateJobStatus terminal transition on a comment-triggered job terminalizes the queue row (all-paths choke point)", async () => {
-    const log = await import("../log.js");
-    log.initLogTable();
     const rowId = queue.enqueueConflictResolution({ owner: "o", repo: "r2", prNumber: 12, featureBranch: "ai-implement/feature/p-2" });
     queue.markCommentGapfillProcessed(rowId, "dispatched");
     const jobId = log.appendLog({
@@ -263,8 +269,6 @@ describe("gap-fill run terminalization (AII-277 livelock fix)", () => {
   });
 
   it("failed run marks the row failed; non-comment jobs never touch queue rows", async () => {
-    const log = await import("../log.js");
-    log.initLogTable();
     const rowId = queue.enqueueConflictResolution({ owner: "o", repo: "r3", prNumber: 5, featureBranch: "ai-implement/feature/p-3" });
     queue.markCommentGapfillProcessed(rowId, "dispatched");
     const jobId = log.appendLog({
@@ -291,8 +295,6 @@ describe("gap-fill run terminalization (AII-277 livelock fix)", () => {
 
 describe("startup sweep for pre-fix orphaned rows (AII-279)", () => {
   it("terminalizes dispatched rows whose linked comment job is already terminal", async () => {
-    const log = await import("../log.js");
-    log.initLogTable();
     const id = queue.enqueueConflictResolution({ owner: "o", repo: "rs", prNumber: 33, featureBranch: "ai-implement/feature/p" });
     queue.markCommentGapfillProcessed(id, "dispatched");
     // job terminalized BEFORE the AII-277 hook existed (simulated: direct SQL, no hook side-effects)
@@ -310,8 +312,6 @@ describe("startup sweep for pre-fix orphaned rows (AII-279)", () => {
   });
 
   it("leaves rows with in-flight jobs untouched; absent-job rows go failed", async () => {
-    const log = await import("../log.js");
-    log.initLogTable();
     // in-flight
     const a = queue.enqueueConflictResolution({ owner: "o", repo: "ra", prNumber: 1, featureBranch: "ai-implement/feature/p" });
     queue.markCommentGapfillProcessed(a, "dispatched");
