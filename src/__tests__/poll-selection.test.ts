@@ -2,7 +2,7 @@ import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
-import { selectIssuesToDispatch, selectBlockers, mappingForProvider, mergeProviderSnapshots, selectForeignTrackerBlockers, parseDeclaredFiles, selectFileOverlapDeferrals, rememberCandidates, resolveInFlightSiblings, resetSeenCandidates, getCachedPlanningContext, setCachedPlanningContext, resetPlanningContextCache, needsPlanningContextFetch, getPlanningContextCacheSize, PLANNING_CONTEXT_CACHE_MAX } from "../poll-selection.js";
+import { selectIssuesToDispatch, selectBlockers, mappingForProvider, mergeProviderSnapshots, selectForeignTrackerBlockers, parseDeclaredFiles, selectFileOverlapDeferrals, rememberCandidates, diffSkipReasons, logSkipReasons, resetSkipReasons, resolveInFlightSiblings, resetSeenCandidates, getCachedPlanningContext, setCachedPlanningContext, resetPlanningContextCache, needsPlanningContextFetch, getPlanningContextCacheSize, PLANNING_CONTEXT_CACHE_MAX } from "../poll-selection.js";
 import type { RepoMapping } from "../config.js";
 import type { AIImplementSnapshot, TicketIssue } from "../providers/types.js";
 import type * as DedupModule from "../dedup.js";
@@ -150,6 +150,7 @@ describe("selectBlockers", () => {
       { APP: makeMapping(3) },
       {},
       () => false,
+      () => null,
     );
     expect(blockers).toHaveLength(1);
     expect(blockers[0].reason).toBe("no-mapping");
@@ -163,6 +164,7 @@ describe("selectBlockers", () => {
       { APP: makeMapping(1) },
       { APP: 1 }, // at cap
       (id) => id === "1",
+      () => null,
     );
     expect(blockers).toHaveLength(1);
     expect(blockers[0].reason).toBe("dedup");
@@ -174,6 +176,7 @@ describe("selectBlockers", () => {
       { APP: makeMapping(2) },
       { APP: 2 },
       () => false,
+      () => null,
     );
     expect(blockers).toHaveLength(1);
     expect(blockers[0].reason).toBe("concurrency");
@@ -186,6 +189,7 @@ describe("selectBlockers", () => {
       { APP: makeMapping(3) },
       { APP: 1 },
       () => false,
+      () => null,
     );
     expect(blockers).toHaveLength(0);
   });
@@ -201,6 +205,7 @@ describe("selectBlockers", () => {
       { APP: makeMapping(1) },
       { APP: 1 }, // APP at cap
       (id) => id === "2",
+      () => null,
     );
     // issue "2" (APP-1) → dedup; issue "3" (API-1) → no-mapping; issues "1","4" → concurrency
     // sorted: concurrency/APP/APP-2, concurrency/APP/APP-3, dedup/APP/APP-1, no-mapping/API/API-1
@@ -218,6 +223,7 @@ describe("selectBlockers", () => {
       { APP: makeMapping(2) },
       { APP: 2 },
       () => false,
+      () => null,
     );
     expect(logSpy).toHaveBeenCalledWith(
       "[poll-selection] Capacity exclusion: issue=APP-1 team=APP count=2 cap=2",
@@ -232,6 +238,7 @@ describe("selectBlockers", () => {
       { APP: makeMapping(3) },
       { APP: 1 },
       () => false,
+      () => null,
     );
     expect(logSpy).not.toHaveBeenCalled();
     logSpy.mockRestore();
@@ -289,8 +296,8 @@ describe("selectBlockers — reservation-backed concurrency, not tracker labels"
     expect(reservedCounts.AII).toBe(1);
 
     const candidate = makeIssue("AII-2", "AII-2", "AII");
-    const usingStaleTracker = selectBlockers([candidate], { AII: makeMapping(1) }, staleTrackerCounts, () => false);
-    const usingReservations = selectBlockers([candidate], { AII: makeMapping(1) }, reservedCounts, () => false);
+    const usingStaleTracker = selectBlockers([candidate], { AII: makeMapping(1) }, staleTrackerCounts, () => false, () => null);
+    const usingReservations = selectBlockers([candidate], { AII: makeMapping(1) }, reservedCounts, () => false, () => null);
 
     expect(usingStaleTracker).toHaveLength(0);
     expect(usingReservations).toHaveLength(1);
@@ -311,7 +318,7 @@ describe("selectBlockers — reservation-backed concurrency, not tracker labels"
     if (held.ok) held.release("finalized");
 
     const candidate = makeIssue("AII-3", "AII-3", "AII");
-    const blockers = selectBlockers([candidate], { AII: makeMapping(1) }, { AII: admission.count("AII") }, () => false);
+    const blockers = selectBlockers([candidate], { AII: makeMapping(1) }, { AII: admission.count("AII") }, () => false, () => null);
     expect(blockers).toHaveLength(0);
   });
 });
@@ -909,5 +916,62 @@ describe("tracker-scoped mapping match", () => {
         detail: "Mapping ENG is a jira mapping; this linear issue has no linear mapping.",
       },
     ]);
+  });
+});
+
+describe("selectBlockers parked", () => {
+  it("lists a parked issue with its failure count, not also as dedup or concurrency", () => {
+    const blockers = selectBlockers(
+      [makeIssue("1", "APP-1", "APP")],
+      { APP: makeMapping(1) },
+      { APP: 1 },
+      () => true,
+      () => ({ failures: 3 }),
+    );
+    expect(blockers).toEqual([
+      expect.objectContaining({
+        reason: "parked",
+        issueIdentifier: "APP-1",
+        detail: "Parked after 3 failed runs. Unpark it on the Runners page.",
+      }),
+    ]);
+  });
+});
+
+describe("diffSkipReasons", () => {
+  const parked = { id: "1", identifier: "AII-737", phase: "implementation" as const, reason: "parked" as const, failures: 3 };
+
+  it("logs a new parked reason once, not again with the same reason", () => {
+    const last = new Map();
+    expect(diffSkipReasons(last, [parked])).toEqual([
+      "[poll] Skipping AII-737: parked for implementation after 3 failed runs — unpark at /admin#runners",
+    ]);
+    expect(diffSkipReasons(last, [parked])).toEqual([]);
+  });
+
+  it("logs when the reason changes, and when the issue is no longer blocked", () => {
+    const last = new Map();
+    diffSkipReasons(last, [parked]);
+    expect(diffSkipReasons(last, [{ ...parked, reason: "dedup" }])).toEqual(["[poll] Skipping AII-737: dedup"]);
+    expect(diffSkipReasons(last, [{ ...parked, reason: null }])).toEqual(["[poll] AII-737 is no longer blocked"]);
+    expect(last.size).toBe(0);
+    expect(diffSkipReasons(last, [{ ...parked, reason: null }])).toEqual([]);
+  });
+
+  it("drops an issue that left the snapshot silently, then logs again if it returns blocked", () => {
+    const last = new Map();
+    diffSkipReasons(last, [{ ...parked, reason: "in_flight" }]);
+    expect(diffSkipReasons(last, [])).toEqual([]);
+    expect(last.size).toBe(0);
+    expect(diffSkipReasons(last, [{ ...parked, reason: "in_flight" }])).toEqual(["[poll] Skipping AII-737: in_flight"]);
+  });
+
+  it("keeps module-level state until reset", () => {
+    resetSkipReasons();
+    expect(logSkipReasons([parked])).toHaveLength(1);
+    expect(logSkipReasons([parked])).toEqual([]);
+    resetSkipReasons();
+    expect(logSkipReasons([parked])).toHaveLength(1);
+    resetSkipReasons();
   });
 });

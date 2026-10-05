@@ -36,7 +36,7 @@ export const blockersHtml = `
     <div class="alert info" style="margin-top:12px">
       <div style="flex:1">
         <div class="alert-title">More blocker types coming</div>
-        <div class="alert-desc">Today this page surfaces three blocker reasons: no mapping, deduplication, concurrency cap. Future plans will add missing-secret, GitHub App install, Bedrock region, and Linear-dependency blockers.</div>
+        <div class="alert-desc">Today this page surfaces these blocker reasons: no mapping, deduplication, concurrency cap, parked, and file overlap. Future plans will add missing-secret, GitHub App install, Bedrock region, and Linear-dependency blockers.</div>
       </div>
     </div>
   </div>
@@ -49,6 +49,7 @@ export const blockersScript = `
     if (reason === 'no-mapping') return '<span class="badge fail"><span class="dot"></span>No mapping</span>';
     if (reason === 'dedup') return '<span class="badge info"><span class="dot"></span>Dedup</span>';
     if (reason === 'concurrency') return '<span class="badge warn"><span class="dot"></span>Concurrency cap</span>';
+    if (reason === 'parked') return '<span class="badge fail"><span class="dot"></span>Parked</span>';
     return '<span class="badge neutral"><span class="dot"></span>' + window.esc(reason) + '</span>';
   }
 
