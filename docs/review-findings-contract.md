@@ -91,6 +91,14 @@ at
 [`.github/actions/claude-review/review-findings-schema.json`](../.github/actions/claude-review/review-findings-schema.json)
 and passed to Claude as a compact JSON literal via `--json-schema`.
 
+Claude returns the review by calling a structured-output tool whose arguments are `verdict`, `findings` and `summary`. Claude Code checks those arguments against the schema only after the call is made. When they do not match, Claude is told why and tries again; when every retry fails, the check fails with `error_max_structured_output_retries` and no review is posted.
+
+One way a call fails is by losing an argument. Claude writes the arguments in roughly the order the schema lists them, and `summary` is a long free-text review full of Markdown. When Claude does not end the `summary` argument cleanly, the argument it writes next ends up as text inside `summary`, and the call arrives without that argument.
+
+So the schema lists `verdict`, then `findings`, then `summary` last. Both short arguments are complete before the long text starts, and if the end of `summary` goes wrong there is no argument after it to lose; at worst, stray text ends up at the end of the summary itself. This lowers how often the call fails but does not rule it out, because Claude Code does not enforce the order.
+
+The schema's descriptions are stripped before it reaches Claude, so the action's prompt is where a finding's fields are described.
+
 ## Full example comment
 
 ````markdown
