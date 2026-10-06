@@ -249,7 +249,7 @@ Editable per mapping; blank means the default.
 |---|---|---|
 | Max Turns | `50` | Claude turns per implement pass |
 | Max Iterations | bedrock `2`, anthropic `3` | implement/review cycles |
-| Job Timeout (min) | `90` | GHA only |
+| Job Timeout (min) | `90` | All execution modes; the monitor times a Fly or local-docker run out at this limit |
 | Branch Prefix | none | Path segment prepended to the implementation branch |
 | Sensitive Add / Allow Globs | none | Extends or un-blocks the push step's blocklist; **allow always wins** |
 | Dependency Token Scope | off | `installation` lets the run read private sibling repos during dependency install |
