@@ -169,18 +169,29 @@ export function findKgMapping(kgSourceRepo: string) {
   return Object.entries(getMappings()).find(([, m]) => `${m.owner}/${m.repo}` === kgSourceRepo);
 }
 
+/** Fly performance machines need at least this much memory per CPU. */
+const PERFORMANCE_MIN_MB_PER_CPU = 2048;
+
 /** Fly machine size for a kg-refresh run: the KG repo mapping's size and the sessions region,
- *  as issue runs do. With no mapping, nothing is set so the builder's default size applies. */
+ *  as issue runs do. Runs on performance CPUs when the size meets the per-CPU memory minimum. With no mapping, nothing is set so the builder's default size applies. */
 export function kgFlyMachineSizing(
   kgSourceRepo: string,
   region: string | null | undefined,
-): { cpus?: number; memoryMb?: number; region?: string } {
+): { cpus?: number; memoryMb?: number; cpuKind?: "performance"; region?: string } {
   const mapping = findKgMapping(kgSourceRepo)?.[1];
   if (!mapping) {
     console.log(`[kg-refresh] no mapping for ${kgSourceRepo}; Fly machine uses the default size`);
     return { region: region ?? undefined };
   }
-  return { cpus: mapping.machineCpus, memoryMb: mapping.machineMemoryMb, region: region ?? undefined };
+  const sized = { cpus: mapping.machineCpus, memoryMb: mapping.machineMemoryMb, region: region ?? undefined };
+  // Effective values are the builder's defaults (1 CPU / 1024 MB) for unset fields.
+  const cpus = mapping.machineCpus ?? 1;
+  const memoryMb = mapping.machineMemoryMb ?? 1024;
+  if (memoryMb >= PERFORMANCE_MIN_MB_PER_CPU * cpus) return { ...sized, cpuKind: "performance" };
+  console.log(
+    `[kg-refresh] ${kgSourceRepo} mapping is ${cpus} CPU / ${memoryMb} MB, below the ${PERFORMANCE_MIN_MB_PER_CPU} MB-per-CPU minimum for performance CPUs; Fly machine stays on shared CPUs`,
+  );
+  return sized;
 }
 
 /** The execution mode a kg-refresh dispatch resolves to under the current runner mode.

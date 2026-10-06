@@ -383,6 +383,8 @@ export interface SessionMachineInput {
   region?: string;
   cpus?: number;
   memoryMb?: number;
+  /** Defaults to "shared". */
+  cpuKind?: "shared" | "performance";
   teamKey?: string;
   teamSecretNames?: string[]; // full prefixed secret names from the Fly app (e.g. ["ENG_DATABASE_URL"])
   allTeamKeys?: string[]; // all known team keys across all mappings, used to identify foreign secrets
@@ -437,7 +439,7 @@ export function buildSessionMachineConfig(input: SessionMachineInput): CreateMac
     image: input.image,
     env,
     guest: {
-      cpu_kind: "shared",
+      cpu_kind: input.cpuKind ?? "shared",
       cpus: input.cpus ?? 1,
       memory_mb: input.memoryMb ?? 1024,
     },
