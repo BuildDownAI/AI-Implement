@@ -119,7 +119,11 @@ import { sweepOrphanedGapfillRows } from "./comment-gapfill-queue.js";
 import { processPendingWorkflowSyncs } from "./workflow-sync-queue.js";
 import { listOpenReviewFindings } from "./review-ledger-store.js";
 import { detectMergedPrs, prNumberFromUrl } from "./poll-merged-prs.js";
-import { githubActionsWatchdogDecision, jobTtlDecision } from "./github-actions-watchdog.js";
+import {
+  githubActionsWatchdogDecision,
+  jobTtlDecision,
+  normalizeGithubActionsJobTimeoutMinutes,
+} from "./github-actions-watchdog.js";
 import { KgSidecar } from "./kg-sidecar.js";
 import type { KgRefreshIngressClient } from "./restate/kg-refresh-production.js";
 import { createKgRefreshIngressClient } from "./restate/kg-refresh-production.js";
@@ -2036,8 +2040,11 @@ async function postDispatch(
 /** Maximum age (ms) before a dispatched job without a run ID is marked timed_out. */
 const RUN_ID_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 
-/** Maximum age (ms) for a Fly Machine job before it's considered timed out. */
-const FLY_MACHINE_TIMEOUT_MS = 60 * 60 * 1000; // 60 minutes
+/** Job age limit (ms) for the Fly and local-docker monitors: the mapping's Job Timeout, same as GHA. */
+function jobTimeoutMs(job: Job): number {
+  const mapping = mappingForJob(getMappings(), job);
+  return normalizeGithubActionsJobTimeoutMinutes(mapping?.maxJobMinutes) * 60_000;
+}
 
 /** Maximum characters to include in a Linear "Session Logs" comment. */
 const LOG_MAX_CHARS = 5_000;
@@ -2383,15 +2390,10 @@ export async function monitorJobs(config: AppConfig, registry: ProviderRegistry)
       // its own terminal branch.
       if (job.phase !== "kg-refresh" && !isRestateOwnedJob(job)) {
         const mapping = mappingForJob(teamRepoMap, job);
-        // maxJobMinutes is a GHA-only setting (docs/pipeline: Job Timeout (min)); Fly and
-        // local-docker jobs have their own timeout (FLY_MACHINE_TIMEOUT_MS) and must not
-        // inherit a GHA value that could be shorter than their actual machine timeout.
-        const isFlyOrLocal =
-          job.executionMode === "fly-machines" || job.executionMode === "local-docker";
         const ttl = jobTtlDecision({
           dispatchedAtMs: job.dispatchedAt,
           nowMs: Date.now(),
-          maxJobMinutes: isFlyOrLocal ? FLY_MACHINE_TIMEOUT_MS / 60_000 : mapping?.maxJobMinutes,
+          maxJobMinutes: mapping?.maxJobMinutes,
         });
         // A runner callback can set conclusion to operator_cancelled/runner_approved
         // concurrently with this tick reading the (now-stale) in-flight snapshot.
@@ -2676,7 +2678,7 @@ async function monitorFlyMachineJob(
   if (isRestateOwnedJob(job)) return;
 
   // Check machine age timeout — also destroy the machine to stop accruing cost
-  if (Date.now() - job.dispatchedAt > FLY_MACHINE_TIMEOUT_MS) {
+  if (Date.now() - job.dispatchedAt > jobTimeoutMs(job)) {
     // Fetch logs before destroying so the machine is still accessible
     if (job.runnerMode !== "shadow") {
       await postSessionLogs(config, provider, job, "machine_timeout");
@@ -2870,7 +2872,7 @@ async function monitorLocalDockerJob(
   // matter what the container itself reports.
   if (isRestateOwnedJob(job)) return;
 
-  if (Date.now() - job.dispatchedAt > FLY_MACHINE_TIMEOUT_MS) {
+  if (Date.now() - job.dispatchedAt > jobTimeoutMs(job)) {
     await postLocalContainerLogs(provider, job, "container_timeout");
 
     const elapsedMin = Math.round((Date.now() - job.dispatchedAt) / 60000);
