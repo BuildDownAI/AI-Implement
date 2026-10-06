@@ -1,31 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { formatStatusComment, formatDuration, postStatusComment } from "../status-events.js";
 import type { StatusEvent } from "../status-events.js";
-import type { TicketingProvider } from "../providers/types.js";
-
-function makeFakeProvider(): TicketingProvider & {
-  comments: Array<{ issueId: string; body: string }>;
-  postComment: ReturnType<typeof vi.fn>;
-} {
-  const comments: Array<{ issueId: string; body: string }> = [];
-  const postComment = vi.fn(async (issueId: string, body: string) => {
-    comments.push({ issueId, body });
-  });
-  return {
-    id: "fake",
-    fetchAIImplementSnapshot: vi.fn(),
-    fetchLifecycleStates: vi.fn(),
-    markPlanningStarted: vi.fn(),
-    markPlanComplete: vi.fn(),
-    markPlanningFailed: vi.fn(),
-    markImplementing: vi.fn(),
-    markPrReady: vi.fn(),
-    markImplementationFailed: vi.fn(),
-    clearWorkingState: vi.fn(),
-    postComment,
-    comments,
-  } as never;
-}
+import { makeProvider } from "./helpers/builders.js";
 
 describe("formatDuration", () => {
   it("formats sub-minute durations as seconds", () => {
@@ -144,28 +120,29 @@ describe("postStatusComment", () => {
   afterEach(() => { vi.restoreAllMocks(); });
 
   it("calls provider.postComment with formatted body", async () => {
-    const fake = makeFakeProvider();
+    const fake = makeProvider();
 
     await postStatusComment(fake, "issue-123", { type: "setup_complete" });
 
     expect(fake.postComment).toHaveBeenCalledOnce();
-    expect(fake.comments).toHaveLength(1);
-    expect(fake.comments[0].issueId).toBe("issue-123");
-    expect(fake.comments[0].body).toContain("Environment ready");
+    const [issueId, body] = vi.mocked(fake.postComment).mock.calls[0];
+    expect(issueId).toBe("issue-123");
+    expect(body).toContain("Environment ready");
   });
 
   it("includes machine logs URL in the posted comment", async () => {
-    const fake = makeFakeProvider();
+    const fake = makeProvider();
 
     const logsUrl = "https://fly.io/apps/my-app/machines/m123";
     await postStatusComment(fake, "issue-123", { type: "machine_created", machineName: "session-eng-1" }, logsUrl);
 
-    expect(fake.comments[0].body).toContain(logsUrl);
+    const [, body] = vi.mocked(fake.postComment).mock.calls[0];
+    expect(body).toContain(logsUrl);
   });
 
   it("propagates errors from provider.postComment", async () => {
-    const fake = makeFakeProvider();
-    fake.postComment.mockRejectedValueOnce(new Error("Provider API error"));
+    const fake = makeProvider();
+    vi.mocked(fake.postComment).mockRejectedValueOnce(new Error("Provider API error"));
 
     await expect(
       postStatusComment(fake, "issue-123", { type: "setup_complete" }),

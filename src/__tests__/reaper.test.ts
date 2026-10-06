@@ -1,51 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { safeDestroyMachine, sweepOrphanedMachines, getLastSweepAt } from "../reaper.js";
 import type { ReaperConfig, ReaperHelpers } from "../reaper.js";
-import { FakeProvider } from "./providers/fake.js";
-import type { ProviderRegistry } from "../providers/registry.js";
-import type { Job } from "../log.js";
-
-function makeJob(overrides: Partial<Job>): Job {
-  return {
-    id: 0,
-    issueId: "issue",
-    issueIdentifier: null,
-    issueTitle: null,
-    teamKey: null,
-    repo: null,
-    dispatchedAt: Date.now(),
-    dispatchId: null,
-    admissionGeneration: null,
-    dispatchNumber: 1,
-    issueState: null,
-    runId: null,
-    status: "dispatched",
-    conclusion: null,
-    prUrl: null,
-    completedAt: null,
-    notifiedAt: null,
-    machineNonce: null,
-    executionMode: "fly-machines",
-    machineId: null,
-    runnerMode: null,
-    sessionImage: null,
-    phase: "implementation",
-    contract: null,
-    groupingParent: false,
-    approved: false,
-    failure: null,
-    failureCommentedAt: null,
-    ...overrides,
-  };
-}
-
-function makeFakeRegistry(provider: FakeProvider): ProviderRegistry {
-  return {
-    forMapping: async () => provider,
-    forAllMappings: async () => [provider],
-    invalidate: () => {},
-  } as unknown as ProviderRegistry;
-}
+import { makeJob, makeMapping, makeProvider, makeRegistry } from "./helpers/builders.js";
 
 vi.mock("../fly-machines.js", () => ({
   listMachines: vi.fn(),
@@ -87,7 +43,7 @@ function makeConfig(reaperDryRun: boolean, overrides?: Partial<ReaperConfig>): R
     flySessionsToken: TOKEN,
     flySessionsApp: APP,
     flyOrchestratorApp: "my-orchestrator",
-    registry: makeFakeRegistry(new FakeProvider()),
+    registry: makeRegistry(),
     getMappings: () => ({}),
     reaperDryRun,
     ...overrides,
@@ -832,18 +788,16 @@ describe("sweepOrphanedMachines — kg-refresh issue-terminal exclusion", () => 
     const machine = makeMachine("m-kg");
     vi.mocked(listMachines).mockResolvedValueOnce([machine] as never);
     vi.mocked(getJobByMachineId).mockReturnValue(kgRefreshJob);
-    const fakeProv = new FakeProvider();
-    const fetchSpy = vi.spyOn(fakeProv, "fetchLifecycleStates");
-    const registry = makeFakeRegistry(fakeProv);
+    const provider = makeProvider();
     // Configure a mapping so the provider lookup path is reachable for any
     // issue-keyed job — the guard must fire before that path for kg-refresh.
     const config = makeConfig(false, {
-      registry,
-      getMappings: () => ({ ENG: { ticketingProvider: "fake", teamKey: "ENG" } as never }),
+      registry: makeRegistry({ provider }),
+      getMappings: () => ({ ENG: makeMapping() }),
     });
 
     await sweepOrphanedMachines(config, makeHelpers());
 
-    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(provider.fetchLifecycleStates).not.toHaveBeenCalled();
   });
 });
