@@ -1482,7 +1482,7 @@ describe("handleMcpRequest", () => {
         lastDryRun: null,
         stage: "serving",
         materialize: "direct",
-        flyMachine: { cpuKind: "shared", cpus: 1, memoryMb: 1024, source: "default" },
+        flyMachine: { cpuKind: "performance", cpus: 2, memoryMb: 8192, source: "default" },
       };
 
       const result = await callMcp(

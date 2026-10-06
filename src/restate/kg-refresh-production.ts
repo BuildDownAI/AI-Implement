@@ -180,8 +180,13 @@ export interface KgFlyMachineSize {
   source: "override" | "mapping" | "default";
 }
 
-/** The effective Fly machine size for a kg-refresh run: the mapping size (or builder default of
- *  1 CPU / 1024 MB), then each field of the admin override (`set_kg_fly_machine`), then the CPU kind.
+/** KG floors: the ingest dies after the embedding-model load at 4096 MB, so a Fly KG refresh
+ *  defaults to 2 CPUs / 8192 MB unless the mapping is larger or an admin override says otherwise. */
+export const KG_FLY_DEFAULT_MEMORY_MB = 8192;
+export const KG_FLY_DEFAULT_CPUS = 2;
+
+/** The effective Fly machine size for a kg-refresh run: each field of the admin override
+ *  (`set_kg_fly_machine`), else the larger of the mapping size and the KG floor, then the CPU kind.
  *  `log` is false for status reads so only dispatches log. */
 export function resolveKgFlyMachineSize(kgSourceRepo: string, log = true): KgFlyMachineSize {
   const mapping = findKgMapping(kgSourceRepo)?.[1];
@@ -190,9 +195,12 @@ export function resolveKgFlyMachineSize(kgSourceRepo: string, log = true): KgFly
   if (!mapping && log) {
     console.log(`[kg-refresh] no mapping for ${kgSourceRepo}; Fly machine uses the default size`);
   }
-  const cpus = override.cpus ?? mapping?.machineCpus ?? 1;
-  const memoryMb = override.memoryMb ?? mapping?.machineMemoryMb ?? 1024;
-  const source = hasOverride ? "override" : mapping ? "mapping" : "default";
+  const mappingCpus = mapping?.machineCpus ?? 0;
+  const mappingMemoryMb = mapping?.machineMemoryMb ?? 0;
+  const cpus = override.cpus ?? Math.max(mappingCpus, KG_FLY_DEFAULT_CPUS);
+  const memoryMb = override.memoryMb ?? Math.max(mappingMemoryMb, KG_FLY_DEFAULT_MEMORY_MB);
+  const mappingWon = mappingCpus > KG_FLY_DEFAULT_CPUS || mappingMemoryMb > KG_FLY_DEFAULT_MEMORY_MB;
+  const source = hasOverride ? "override" : mappingWon ? "mapping" : "default";
   const below = memoryMb < PERFORMANCE_MIN_MB_PER_CPU * cpus;
   if (override.cpuKind !== "shared" && below && log) {
     console.log(
