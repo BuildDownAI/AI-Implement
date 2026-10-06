@@ -172,6 +172,29 @@ export function readMachineExitCode(machine: Machine): number | null {
   return exit?.exit_code ?? exit?.guest_exit_code ?? null;
 }
 
+export interface MachineExit {
+  exitCode: number | null;
+  signal: number | null;
+  oomKilled: boolean | null;
+  timestamp: number | null;
+}
+
+/**
+ * Terminal exit details from the newest event carrying an exit_event (all null when none exists).
+ * Raw: Fly omits exit_code for a clean exit 0, so `exitCode: null` with an event present is a
+ * clean exit (see readMachineExitCode). Every field is optional-chained and degrades to null.
+ */
+export function readMachineExit(machine: Machine): MachineExit {
+  const event = machine.events?.find((e) => e.request?.exit_event);
+  const exit = event?.request?.exit_event;
+  return {
+    exitCode: exit?.exit_code ?? exit?.guest_exit_code ?? null,
+    signal: exit?.guest_signal ?? exit?.signal ?? null,
+    oomKilled: exit?.oom_killed ?? null,
+    timestamp: event?.timestamp ?? null,
+  };
+}
+
 export async function destroyMachine(
   token: string,
   appName: string,

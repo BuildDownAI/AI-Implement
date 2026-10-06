@@ -18,7 +18,8 @@ import { z } from "zod";
 import type { AccessRole } from "../access-entries.js";
 import { getRunnerMode, getKgMaterializeDirect } from "../runner-mode.js";
 import { getMappings, type RepoMapping } from "../config.js";
-import { getInFlightJobs, getRunRecordMergeVerdict } from "../log.js";
+import { getInFlightJobs, getRunRecordMergeVerdict, getJobById, getJobByMachineId, type Job } from "../log.js";
+import { getMachine, listMachines, fetchMachineLogs, readMachineExit, type Machine } from "../fly-machines.js";
 import { getDb } from "../dedup.js";
 import {
   listHeldReservations,
@@ -342,10 +343,161 @@ export const listInFlightJobs = tool(
       repo: j.repo,
       phase: j.phase,
       status: j.status,
+      machineId: j.machineId,
       dispatchedAt: j.dispatchedAt,
       elapsedSeconds: Math.round((now - j.dispatchedAt) / 1000),
     }));
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  },
+);
+
+const RUNNING_MACHINE_STATES = new Set(["started", "starting", "created"]);
+const MAX_MACHINE_LOG_LINES = 200;
+
+/** A Fly 404 (machine destroyed). fly-machines throws plain Errors, so match the status in the text. */
+function isFlyNotFound(err: unknown): boolean {
+  return err instanceof Error && /\(404\)/.test(err.message);
+}
+
+/**
+ * Exit details for a stopped machine; null while it is still running. `probableOom` covers the
+ * case where Fly does not set oom_killed: a kill shows as signal 9 or exit code -1 / 137.
+ */
+function describeMachineExit(machine: Machine) {
+  if (RUNNING_MACHINE_STATES.has(machine.state)) return null;
+  const exit = readMachineExit(machine);
+  const probableOom =
+    exit.oomKilled === true || exit.signal === 9 || exit.exitCode === -1 || exit.exitCode === 137;
+  return { ...exit, probableOom };
+}
+
+function latestJobForIssue(issueIdentifier: string): Job | null {
+  const row = getDb()
+    .prepare(
+      "SELECT id FROM dispatch_log WHERE issue_identifier = ? AND machine_id IS NOT NULL ORDER BY dispatched_at DESC, id DESC LIMIT 1",
+    )
+    .get(issueIdentifier) as { id: number } | undefined;
+  return row ? getJobById(row.id) : null;
+}
+
+function toolError(text: string): ToolResponse {
+  return { isError: true, content: [{ type: "text", text }] };
+}
+
+export const GET_SESSION_MACHINE_DESCRIPTION =
+  "Reads one session machine from the Fly Machines API. Answers 'did the machine run out of memory' (exit.oomKilled, exit.probableOom, exit signal/code) and 'what memory size did it get' (guest.memoryMb). Also returns state, region, CPUs, and the matching issue, phase, and job status. Pass issueIdentifier (e.g. 'AII-123', newest job) or machineId. exit is null while the machine runs; a destroyed machine returns state 'destroyed'. Optional logLines (0-200) returns the last log lines.";
+
+export const getSessionMachine = tool(
+  {
+    description: GET_SESSION_MACHINE_DESCRIPTION,
+    input: z.object({
+      issueIdentifier: z.string().optional(),
+      machineId: z.string().optional(),
+      logLines: z.number().int().min(0).max(MAX_MACHINE_LOG_LINES).optional(),
+    }),
+    role: "user",
+  },
+  async (_ctx, input): Promise<ToolResponse> => {
+    const { issueIdentifier, machineId: machineIdArg } = input.args;
+    const logLines = Math.min(Math.max(input.args.logLines ?? 0, 0), MAX_MACHINE_LOG_LINES);
+    if (!!issueIdentifier === !!machineIdArg) {
+      return toolError("Provide exactly one of issueIdentifier or machineId");
+    }
+    const config = mcpAdminConfig();
+    if (!config.flySessionsToken || !config.flySessionsApp) {
+      return { content: [{ type: "text", text: JSON.stringify({ error: "Fly sessions app is not configured" }, null, 2) }] };
+    }
+
+    let job: Job | null = null;
+    let machineId = machineIdArg as string | undefined;
+    if (issueIdentifier) {
+      job = latestJobForIssue(issueIdentifier);
+      if (!job?.machineId) return toolError(`No job with a session machine found for ${issueIdentifier}`);
+      machineId = job.machineId;
+    } else if (machineId) {
+      job = getJobByMachineId(machineId);
+    }
+    if (!machineId) return toolError("machineId is required");
+
+    const jobFields = {
+      issueIdentifier: job?.issueIdentifier ?? null,
+      phase: job?.phase ?? null,
+      jobStatus: job?.status ?? null,
+    };
+
+    let machine: Machine;
+    try {
+      machine = await getMachine(config.flySessionsToken, config.flySessionsApp, machineId);
+    } catch (err) {
+      if (isFlyNotFound(err)) {
+        const result = {
+          machineId, name: null, state: "destroyed", region: null, createdAt: null, updatedAt: null,
+          guest: null, exit: null, ...jobFields,
+        };
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
+      return toolError(`Failed to read machine ${machineId}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    const result: Record<string, unknown> = {
+      machineId: machine.id,
+      name: machine.name,
+      state: machine.state,
+      region: machine.region,
+      createdAt: machine.created_at,
+      updatedAt: machine.updated_at,
+      guest: {
+        cpus: machine.config?.guest?.cpus ?? null,
+        cpuKind: machine.config?.guest?.cpu_kind ?? null,
+        memoryMb: machine.config?.guest?.memory_mb ?? null,
+      },
+      exit: describeMachineExit(machine),
+      ...jobFields,
+    };
+    if (logLines > 0) {
+      try {
+        result.logs = await fetchMachineLogs(config.flySessionsToken, config.flySessionsApp, machineId, logLines);
+      } catch (err) {
+        result.logsError = err instanceof Error ? err.message : String(err);
+      }
+    }
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  },
+);
+
+export const LIST_SESSION_MACHINES_DESCRIPTION =
+  "Lists the newest session machines in the Fly sessions app (default 10, newest first) with state, createdAt, memoryMb (the memory size each got), oomKilled (did the machine run out of memory), and the matching issueIdentifier when a job recorded the machine. Use get_session_machine for one machine's full exit details.";
+
+export const listSessionMachines = tool(
+  {
+    description: LIST_SESSION_MACHINES_DESCRIPTION,
+    input: z.object({ limit: z.number().int().min(1).max(50).optional() }),
+    role: "user",
+  },
+  async (_ctx, input): Promise<ToolResponse> => {
+    const limit = input.args.limit ?? 10;
+    const config = mcpAdminConfig();
+    if (!config.flySessionsToken || !config.flySessionsApp) {
+      return { content: [{ type: "text", text: JSON.stringify({ error: "Fly sessions app is not configured" }, null, 2) }] };
+    }
+    let machines: Machine[];
+    try {
+      machines = await listMachines(config.flySessionsToken, config.flySessionsApp);
+    } catch (err) {
+      return toolError(`Failed to list session machines: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    const rows = [...machines]
+      .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))
+      .slice(0, limit)
+      .map((m) => ({
+        machineId: m.id,
+        state: m.state,
+        createdAt: m.created_at,
+        memoryMb: m.config?.guest?.memory_mb ?? null,
+        oomKilled: readMachineExit(m).oomKilled,
+        issueIdentifier: getJobByMachineId(m.id)?.issueIdentifier ?? null,
+      }));
+    return { content: [{ type: "text", text: JSON.stringify(rows, null, 2) }] };
   },
 );
 
@@ -1043,6 +1195,8 @@ export const orchestratorTools = restate.service({
     list_projects: listProjects,
     get_project_binding: getProjectBinding,
     list_in_flight_jobs: listInFlightJobs,
+    get_session_machine: getSessionMachine,
+    list_session_machines: listSessionMachines,
     get_issue_dispatch_status: getIssueDispatchStatus,
     get_issue_report_card: getIssueReportCardTool,
     get_fleet_report: getFleetReportTool,
