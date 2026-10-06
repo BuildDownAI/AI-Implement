@@ -1,26 +1,19 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
-let dbPath: string;
-let dedup: typeof import("../dedup.js");
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { makeMapping } from "./helpers/builders.js";
+import { testDb } from "./helpers/test-db.js";
 let log: typeof import("../log.js");
 let recon: typeof import("../reconciliation.js");
 let mod: typeof import("../poll-merged-prs.js");
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(os.tmpdir(), `pollmerged-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  log = await import("../log.js");
-  recon = await import("../reconciliation.js");
-  mod = await import("../poll-merged-prs.js");
-  log.initLogTable();
-  recon.initReconciliationTable();
-});
-afterEach(() => {
-  dedup.closeDb();
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+  ({ log, recon, mod } = (
+    await testDb({
+      modules: {
+        log: () => import("../log.js"),
+        recon: () => import("../reconciliation.js"),
+        mod: () => import("../poll-merged-prs.js"),
+      },
+    })
+  ).modules);
 });
 
 /**
@@ -53,7 +46,7 @@ describe("detectMergedPrs", () => {
     await mod.detectMergedPrs({
       getPullRequestState: vi.fn(async () => ({ merged: true, state: "closed" as const })),
       tokenForOwner: async () => "tok",
-      mappingForRepo: () => ({ owner: "o", repo: "r" } as never),
+      mappingForRepo: () => makeMapping(),
     });
     expect(recon.getPendingReconciliations()).toHaveLength(1);
     expect(recon.getPendingReconciliations()[0].issueIdentifier).toBe("OOL-183");
@@ -65,7 +58,7 @@ describe("detectMergedPrs", () => {
     await mod.detectMergedPrs({
       getPullRequestState,
       tokenForOwner: async () => "tok",
-      mappingForRepo: () => ({ owner: "o", repo: "r" } as never),
+      mappingForRepo: () => makeMapping(),
     });
     expect(getPullRequestState).not.toHaveBeenCalled();
     expect(recon.getPendingReconciliations()).toHaveLength(0);
@@ -77,7 +70,7 @@ describe("detectMergedPrs", () => {
     await mod.detectMergedPrs({
       getPullRequestState,
       tokenForOwner: async () => "tok",
-      mappingForRepo: () => ({ owner: "o", repo: "r" } as never),
+      mappingForRepo: () => makeMapping(),
     });
     expect(recon.getPendingReconciliations()).toHaveLength(1);
   });
@@ -87,7 +80,7 @@ describe("detectMergedPrs", () => {
     const deps = {
       getPullRequestState,
       tokenForOwner: async () => "tok",
-      mappingForRepo: () => ({ owner: "o", repo: "r" } as never),
+      mappingForRepo: () => makeMapping(),
     };
     await mod.detectMergedPrs(deps);
     expect(recon.hasReconciliationForPr("o/r", 5)).toBe(true);
@@ -101,7 +94,7 @@ describe("detectMergedPrs", () => {
     await mod.detectMergedPrs({
       getPullRequestState,
       tokenForOwner: async () => "tok",
-      mappingForRepo: () => ({ owner: "o", repo: "r" } as never),
+      mappingForRepo: () => makeMapping(),
     });
     expect(recon.hasReconciliationForPr("o/r", 5)).toBe(false);
   });
@@ -117,7 +110,7 @@ describe("detectMergedPrs", () => {
     await mod.detectMergedPrs({
       getPullRequestState,
       tokenForOwner: async () => "tok",
-      mappingForRepo: () => ({ owner: "o", repo: "r" } as never),
+      mappingForRepo: () => makeMapping(),
     });
     expect(recon.getPendingReconciliations()).toHaveLength(1);
   });
@@ -128,7 +121,7 @@ describe("detectMergedPrs", () => {
     await mod.detectMergedPrs({
       getPullRequestState,
       tokenForOwner: async () => "tok",
-      mappingForRepo: () => ({ owner: "o", repo: "r" } as never),
+      mappingForRepo: () => makeMapping(),
     });
     expect(getPullRequestState).not.toHaveBeenCalled();
   });

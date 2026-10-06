@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { resetClosedVetoLogGuard, resetRollUpHandledMarkers, isRollUpHandled, markRollUpHandled, clearRollUpHandledMarkersByIdentifier, runMergeUps } from "../merge-up.js";
 import type { RepoMapping } from "../config.js";
 import type { FeatureNodeRollUp } from "../providers/types.js";
+import { makeMapping } from "./helpers/builders.js";
 
 vi.mock("../dedup.js", async () => {
   const Database = (await import("better-sqlite3")).default;
@@ -23,18 +24,7 @@ vi.mock("../github.js", () => ({
 
 import { compareBranches, createPullRequest, mergeBranch, findOpenPullRequest, findPullRequestByBranches, getBranchSha, deleteBranch } from "../github.js";
 
-function mapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
-  return {
-    owner: "jodwyer", repo: "alpacaWheel", workflowFile: "claude-implement.yml",
-    defaultBranch: "testing", maxInProgressAiIssues: 3, executionMode: "github-actions",
-    sessionMode: "autonomous", machineCpus: 2, machineMemoryMb: 4096, planningEnabled: false,
-    planningWorkflowFile: "", autoApprovePlans: true, extraEnv: {}, provider: "anthropic",
-    ticketingProvider: "linear", ticketingConfig: { kind: "linear" }, awsRegion: null, paused: false,
-    autoMerge: false, maxTurns: null, maxIterations: null, maxJobMinutes: null,
-    branchPrefix: null, skillsRepo: null,
-    ...overrides,
-  };
-}
+const mapping = () => makeMapping({ owner: "jodwyer", repo: "alpacaWheel", defaultBranch: "testing" });
 
 const deps = (resolve: (k: string) => RepoMapping | null, finalizeMerged = vi.fn(async () => {})) => ({
   githubAppId: "1", githubAppPrivateKey: "k", resolveMapping: resolve, finalizeMerged,
