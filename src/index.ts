@@ -130,7 +130,7 @@ import { createKgRefreshIngressClient } from "./restate/kg-refresh-production.js
 import { RestateSidecar } from "./restate/server.js";
 import { startRestateEndpoint, register as registerRestateEndpoint, RESTATE_SERVICES } from "./restate/endpoint.js";
 import { createProductionReviewFixServices } from "./restate/review-fix-production.js";
-import { createKgFindRunByTitle, createProductionKgRefreshServices, recordKgDispatchDetails } from "./restate/kg-refresh-production.js";
+import { kgFlyMachineSizing, createKgFindRunByTitle, createProductionKgRefreshServices, recordKgDispatchDetails } from "./restate/kg-refresh-production.js";
 import { createProductionPlanningRunServices, PLANNING_CONTEXT_BRANCH_KEY, PLANNING_CONTEXT_FIELD_VALUE_KEY } from "./restate/planning-run-production.js";
 import { createPlanningAdmissionTerminationHook, createPlanningRunIngressClient } from "./restate/planning-run-client.js";
 import { setKgRefreshToolDeps } from "./restate/tools.js";
@@ -4052,6 +4052,7 @@ async function dispatchKgRefreshRun(
       orchestratorApp: process.env.FLY_APP_NAME,
       expectedTtlSeconds: 4 * 60 * 60,
       extraEnv,
+      ...kgFlyMachineSizing(config.kgSourceRepo, config.flySessionsRegion),
     });
     const machine = await createMachine(config.flySessionsToken, config.flySessionsApp, machineConfig);
     console.log(`[kg-refresh] dispatched via Fly (dispatchId=${opts.dispatchId})`);
