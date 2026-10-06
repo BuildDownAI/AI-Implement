@@ -33,6 +33,7 @@ import {
   kgProvenance,
   triggerKgRefreshTool,
   setRunnerModeTool,
+  setKgFlyMachineTool,
   pauseProjectTool,
   addProjectTool,
   triggerWorkflowSyncTool,
@@ -98,6 +99,7 @@ const TOOL_HANDLERS: Record<string, FixtureToolHandler> = {
   kg_provenance: kgProvenance,
   trigger_kg_refresh: triggerKgRefreshTool,
   set_runner_mode: setRunnerModeTool,
+  set_kg_fly_machine: setKgFlyMachineTool,
   pause_project: pauseProjectTool,
   add_project: addProjectTool,
   trigger_workflow_sync: triggerWorkflowSyncTool,
@@ -110,6 +112,7 @@ const TOOL_HANDLERS: Record<string, FixtureToolHandler> = {
 const WRITE_TOOL_NAMES = new Set([
   "trigger_kg_refresh",
   "set_runner_mode",
+  "set_kg_fly_machine",
   "pause_project",
   "add_project",
   "trigger_workflow_sync",
@@ -166,10 +169,12 @@ vi.mock("../runner-mode.js", () => ({
   VALID_RUNNER_MODES: ["default", "gha", "fly", "local", "shadow"],
   getRunnerMode: vi.fn(),
   getKgMaterializeDirect: vi.fn(() => true),
+  getKgFlyMachineOverride: vi.fn(() => ({})),
+  setKgFlyMachineOverride: vi.fn(),
 }));
 
 vi.mock("../config.js", () => ({
-  getMappings: vi.fn(),
+  getMappings: vi.fn(() => ({})),
 }));
 
 vi.mock("../log.js", () => ({
@@ -1477,6 +1482,7 @@ describe("handleMcpRequest", () => {
         lastDryRun: null,
         stage: "serving",
         materialize: "direct",
+        flyMachine: { cpuKind: "shared", cpus: 1, memoryMb: 1024, source: "default" },
       };
 
       const result = await callMcp(

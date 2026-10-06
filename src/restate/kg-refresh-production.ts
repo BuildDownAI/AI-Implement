@@ -27,7 +27,7 @@ import { resolveWorkflowCapabilities } from "../workflow-probe.js";
 import { resolveRunnerImageForDispatch } from "../repo-image.js";
 import { encodeRunConfig, type RunConfigV1 } from "../run-config.js";
 import { stopBackendRun } from "../backend-run.js";
-import { getRunnerMode, resolveExecutionPath } from "../runner-mode.js";
+import { getRunnerMode, resolveExecutionPath, getKgFlyMachineOverride } from "../runner-mode.js";
 import { mintRunToken } from "../runner-tokens.js";
 import type { JobStatus } from "../log.js";
 import { appendLogIfAbsent, findLogIdByDispatchId, updateJobMachineDetails, updateJobPrUrl, updateJobRunId } from "../log.js";
@@ -172,26 +172,43 @@ export function findKgMapping(kgSourceRepo: string) {
 /** Fly performance machines need at least this much memory per CPU. */
 const PERFORMANCE_MIN_MB_PER_CPU = 2048;
 
-/** Fly machine size for a kg-refresh run: the KG repo mapping's size and the sessions region,
- *  as issue runs do. Runs on performance CPUs when the size meets the per-CPU memory minimum. With no mapping, nothing is set so the builder's default size applies. */
+export interface KgFlyMachineSize {
+  cpuKind: "shared" | "performance";
+  cpus: number;
+  memoryMb: number;
+  /** Where the size came from: the admin override, the KG repo mapping, or the builder default. */
+  source: "override" | "mapping" | "default";
+}
+
+/** The effective Fly machine size for a kg-refresh run: the mapping size (or builder default of
+ *  1 CPU / 1024 MB), then each field of the admin override (`set_kg_fly_machine`), then the CPU kind.
+ *  `log` is false for status reads so only dispatches log. */
+export function resolveKgFlyMachineSize(kgSourceRepo: string, log = true): KgFlyMachineSize {
+  const mapping = findKgMapping(kgSourceRepo)?.[1];
+  const override = getKgFlyMachineOverride();
+  const hasOverride = override.cpus !== undefined || override.memoryMb !== undefined || override.cpuKind !== undefined;
+  if (!mapping && log) {
+    console.log(`[kg-refresh] no mapping for ${kgSourceRepo}; Fly machine uses the default size`);
+  }
+  const cpus = override.cpus ?? mapping?.machineCpus ?? 1;
+  const memoryMb = override.memoryMb ?? mapping?.machineMemoryMb ?? 1024;
+  const source = hasOverride ? "override" : mapping ? "mapping" : "default";
+  const below = memoryMb < PERFORMANCE_MIN_MB_PER_CPU * cpus;
+  if (override.cpuKind !== "shared" && below && log) {
+    console.log(
+      `[kg-refresh] ${kgSourceRepo} size is ${cpus} CPU / ${memoryMb} MB, below the ${PERFORMANCE_MIN_MB_PER_CPU} MB-per-CPU minimum for performance CPUs; Fly machine stays on shared CPUs`,
+    );
+  }
+  const cpuKind = override.cpuKind === "shared" || below ? "shared" : "performance";
+  return { cpuKind, cpus, memoryMb, source };
+}
+
+/** Fly machine size for a kg-refresh run, plus the sessions region, for spreading into the machine config. */
 export function kgFlyMachineSizing(
   kgSourceRepo: string,
   region: string | null | undefined,
-): { cpus?: number; memoryMb?: number; cpuKind?: "performance"; region?: string } {
-  const mapping = findKgMapping(kgSourceRepo)?.[1];
-  if (!mapping) {
-    console.log(`[kg-refresh] no mapping for ${kgSourceRepo}; Fly machine uses the default size`);
-    return { region: region ?? undefined };
-  }
-  const sized = { cpus: mapping.machineCpus, memoryMb: mapping.machineMemoryMb, region: region ?? undefined };
-  // Effective values are the builder's defaults (1 CPU / 1024 MB) for unset fields.
-  const cpus = mapping.machineCpus ?? 1;
-  const memoryMb = mapping.machineMemoryMb ?? 1024;
-  if (memoryMb >= PERFORMANCE_MIN_MB_PER_CPU * cpus) return { ...sized, cpuKind: "performance" };
-  console.log(
-    `[kg-refresh] ${kgSourceRepo} mapping is ${cpus} CPU / ${memoryMb} MB, below the ${PERFORMANCE_MIN_MB_PER_CPU} MB-per-CPU minimum for performance CPUs; Fly machine stays on shared CPUs`,
-  );
-  return sized;
+): KgFlyMachineSize & { region?: string } {
+  return { ...resolveKgFlyMachineSize(kgSourceRepo), region: region ?? undefined };
 }
 
 /** The execution mode a kg-refresh dispatch resolves to under the current runner mode.
