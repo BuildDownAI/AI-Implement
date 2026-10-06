@@ -580,22 +580,23 @@ describe("kgFlyMachineSizing (AII-1112)", () => {
       ...sizing,
     });
 
-  it("sizes the machine from the mapping and carries the region", () => {
-    kgMappingSize.current = { machineCpus: 2, machineMemoryMb: 4096 };
+  it("sizes the machine from a larger mapping and carries the region", () => {
+    kgMappingSize.current = { machineCpus: 4, machineMemoryMb: 16384 };
     const machine = build(kgFlyMachineSizing("acme/kg", "ord"));
-    expect(machine.config.guest).toMatchObject({ cpus: 2, memory_mb: 4096 });
+    expect(machine.config.guest).toMatchObject({ cpus: 4, memory_mb: 16384 });
     expect(machine.region).toBe("ord");
   });
 
-  it("uses performance CPUs when the mapping meets 2048 MB per CPU", () => {
+  it("raises a mapping below the KG floor to 2 performance CPUs / 8192 MB", () => {
     kgMappingSize.current = { machineCpus: 2, machineMemoryMb: 4096 };
     const machine = build(kgFlyMachineSizing("acme/kg", "ord"));
-    expect(machine.config.guest).toEqual({ cpu_kind: "performance", cpus: 2, memory_mb: 4096 });
+    expect(machine.config.guest).toEqual({ cpu_kind: "performance", cpus: 2, memory_mb: 8192 });
   });
 
   it("stays shared and logs one line below the per-CPU minimum", () => {
     const log = vi.spyOn(console, "log").mockImplementation(() => {});
     try {
+      kgFlyOverride.current = { memoryMb: 2048 };
       kgMappingSize.current = { machineCpus: 2, machineMemoryMb: 2048 };
       const machine = build(kgFlyMachineSizing("acme/kg", "ord"));
       expect(machine.config.guest).toEqual({ cpu_kind: "shared", cpus: 2, memory_mb: 2048 });
@@ -608,14 +609,14 @@ describe("kgFlyMachineSizing (AII-1112)", () => {
   it("falls back per field when the mapping leaves the size unset", () => {
     kgMappingSize.current = {};
     const machine = build(kgFlyMachineSizing("acme/kg", null));
-    expect(machine.config.guest).toMatchObject({ cpus: 1, memory_mb: 1024 });
+    expect(machine.config.guest).toMatchObject({ cpus: 2, memory_mb: 8192 });
   });
 
   it("keeps the default size and logs one line with no mapping", () => {
     const log = vi.spyOn(console, "log").mockImplementation(() => {});
     try {
       const machine = build(kgFlyMachineSizing("other/repo", undefined));
-      expect(machine.config.guest).toEqual({ cpu_kind: "shared", cpus: 1, memory_mb: 1024 });
+      expect(machine.config.guest).toEqual({ cpu_kind: "performance", cpus: 2, memory_mb: 8192 });
       expect(log.mock.calls.filter((c) => String(c[0]).includes("default size"))).toHaveLength(1);
     } finally {
       log.mockRestore();
@@ -625,8 +626,23 @@ describe("kgFlyMachineSizing (AII-1112)", () => {
   describe("admin override (AII-1120)", () => {
     beforeEach(() => { kgMappingSize.current = { machineCpus: 2, machineMemoryMb: 4096 }; });
 
-    it("reports the mapping as the source with no override", () => {
-      expect(kgFlyMachineSizing("acme/kg", null)).toMatchObject({ cpuKind: "performance", cpus: 2, memoryMb: 4096, source: "mapping" });
+    it("reports the default as the source when the floor beats the mapping", () => {
+      expect(kgFlyMachineSizing("acme/kg", null)).toEqual({ cpuKind: "performance", cpus: 2, memoryMb: 8192, source: "default" });
+    });
+
+    it("reports the mapping as the source when it exceeds the floor", () => {
+      kgMappingSize.current = { machineCpus: 4, machineMemoryMb: 16384 };
+      expect(kgFlyMachineSizing("acme/kg", null)).toEqual({ cpuKind: "performance", cpus: 4, memoryMb: 16384, source: "mapping" });
+    });
+
+    it("reports the default for a mapping exactly at the floor", () => {
+      kgMappingSize.current = { machineCpus: 2, machineMemoryMb: 8192 };
+      expect(kgFlyMachineSizing("acme/kg", null).source).toBe("default");
+    });
+
+    it("lets an override go below the default on purpose", () => {
+      kgFlyOverride.current = { memoryMb: 4096 };
+      expect(kgFlyMachineSizing("acme/kg", null)).toMatchObject({ cpus: 2, memoryMb: 4096, source: "override" });
     });
 
     it("applies a memory override on top of the mapping", () => {
@@ -634,9 +650,9 @@ describe("kgFlyMachineSizing (AII-1112)", () => {
       expect(kgFlyMachineSizing("acme/kg", null)).toMatchObject({ cpuKind: "performance", cpus: 2, memoryMb: 8192, source: "override" });
     });
 
-    it("forces shared CPUs at the mapping size", () => {
+    it("forces shared CPUs at the default size", () => {
       kgFlyOverride.current = { cpuKind: "shared" };
-      expect(kgFlyMachineSizing("acme/kg", null)).toMatchObject({ cpuKind: "shared", cpus: 2, memoryMb: 4096 });
+      expect(kgFlyMachineSizing("acme/kg", null)).toMatchObject({ cpuKind: "shared", cpus: 2, memoryMb: 8192 });
     });
 
     it("treats cpuKind auto like unset", () => {
@@ -655,12 +671,12 @@ describe("kgFlyMachineSizing (AII-1112)", () => {
       }
     });
 
-    it("uses builder defaults for unset fields when there is no mapping", () => {
+    it("uses the KG floors for unset fields when there is no mapping", () => {
       const log = vi.spyOn(console, "log").mockImplementation(() => {});
       try {
-        expect(kgFlyMachineSizing("other/repo", null)).toMatchObject({ cpuKind: "shared", cpus: 1, memoryMb: 1024, source: "default" });
-        kgFlyOverride.current = { memoryMb: 2048 };
-        expect(kgFlyMachineSizing("other/repo", null)).toMatchObject({ cpus: 1, memoryMb: 2048, cpuKind: "performance", source: "override" });
+        expect(kgFlyMachineSizing("other/repo", null)).toMatchObject({ cpuKind: "performance", cpus: 2, memoryMb: 8192, source: "default" });
+        kgFlyOverride.current = { memoryMb: 1024 };
+        expect(kgFlyMachineSizing("other/repo", null)).toMatchObject({ cpus: 2, memoryMb: 1024, cpuKind: "shared", source: "override" });
       } finally {
         log.mockRestore();
       }

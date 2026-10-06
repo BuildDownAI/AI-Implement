@@ -1538,10 +1538,10 @@ describe("set_kg_fly_machine / get_kg_status flyMachine (AII-1120)", () => {
     expect(getKgFlyMachineOverride()).toEqual({ cpus: 4, memoryMb: 8192 });
   });
 
-  it("clear deletes the override and returns to the mapping size", async () => {
+  it("clear deletes the override and returns to the KG default size", async () => {
     await call({ memoryMb: 8192 });
     const res = await call({ clear: true });
-    expect(res.effective).toEqual({ cpuKind: "performance", cpus: 2, memoryMb: 4096, source: "mapping" });
+    expect(res.effective).toEqual({ cpuKind: "performance", cpus: 2, memoryMb: 8192, source: "default" });
     expect(getKgFlyMachineOverride()).toEqual({});
   });
 
