@@ -466,6 +466,11 @@ describe("buildSessionMachineConfig", () => {
     expect(result.config.guest).toEqual({ cpu_kind: "shared", cpus: 1, memory_mb: 1024 });
   });
 
+  it("allows performance cpu kind", () => {
+    const result = buildSessionMachineConfig({ ...baseInput, cpus: 2, memoryMb: 4096, cpuKind: "performance" });
+    expect(result.config.guest).toEqual({ cpu_kind: "performance", cpus: 2, memory_mb: 4096 });
+  });
+
   it("allows custom guest spec", () => {
     const result = buildSessionMachineConfig({ ...baseInput, cpus: 2, memoryMb: 2048 });
     expect(result.config.guest).toEqual({ cpu_kind: "shared", cpus: 2, memory_mb: 2048 });

@@ -584,6 +584,24 @@ describe("kgFlyMachineSizing (AII-1112)", () => {
     expect(machine.region).toBe("ord");
   });
 
+  it("uses performance CPUs when the mapping meets 2048 MB per CPU", () => {
+    kgMappingSize.current = { machineCpus: 2, machineMemoryMb: 4096 };
+    const machine = build(kgFlyMachineSizing("acme/kg", "ord"));
+    expect(machine.config.guest).toEqual({ cpu_kind: "performance", cpus: 2, memory_mb: 4096 });
+  });
+
+  it("stays shared and logs one line below the per-CPU minimum", () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      kgMappingSize.current = { machineCpus: 2, machineMemoryMb: 2048 };
+      const machine = build(kgFlyMachineSizing("acme/kg", "ord"));
+      expect(machine.config.guest).toEqual({ cpu_kind: "shared", cpus: 2, memory_mb: 2048 });
+      expect(log.mock.calls.filter((c) => String(c[0]).includes("2048 MB-per-CPU"))).toHaveLength(1);
+    } finally {
+      log.mockRestore();
+    }
+  });
+
   it("falls back per field when the mapping leaves the size unset", () => {
     kgMappingSize.current = {};
     const machine = build(kgFlyMachineSizing("acme/kg", null));
@@ -594,7 +612,7 @@ describe("kgFlyMachineSizing (AII-1112)", () => {
     const log = vi.spyOn(console, "log").mockImplementation(() => {});
     try {
       const machine = build(kgFlyMachineSizing("other/repo", undefined));
-      expect(machine.config.guest).toMatchObject({ cpus: 1, memory_mb: 1024 });
+      expect(machine.config.guest).toEqual({ cpu_kind: "shared", cpus: 1, memory_mb: 1024 });
       expect(log.mock.calls.filter((c) => String(c[0]).includes("default size"))).toHaveLength(1);
     } finally {
       log.mockRestore();
