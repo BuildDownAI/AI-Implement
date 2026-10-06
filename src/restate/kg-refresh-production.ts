@@ -199,6 +199,7 @@ export function resolveKgFlyMachineSize(kgSourceRepo: string, log = true): KgFly
   const mappingMemoryMb = mapping?.machineMemoryMb ?? 0;
   const cpus = override.cpus ?? Math.max(mappingCpus, KG_FLY_DEFAULT_CPUS);
   const memoryMb = override.memoryMb ?? Math.max(mappingMemoryMb, KG_FLY_DEFAULT_MEMORY_MB);
+  // "mapping" means the mapping raised at least one field above its floor; the other field may still be the floor.
   const mappingWon = mappingCpus > KG_FLY_DEFAULT_CPUS || mappingMemoryMb > KG_FLY_DEFAULT_MEMORY_MB;
   const source = hasOverride ? "override" : mappingWon ? "mapping" : "default";
   const below = memoryMb < PERFORMANCE_MIN_MB_PER_CPU * cpus;
