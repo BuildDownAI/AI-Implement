@@ -16,7 +16,7 @@ import * as restate from "@restatedev/restate-sdk";
 import { serde } from "@restatedev/restate-sdk-zod";
 import { z } from "zod";
 import type { AccessRole } from "../access-entries.js";
-import { getRunnerMode, getKgMaterializeDirect } from "../runner-mode.js";
+import { getRunnerMode, getKgMaterializeDirect, getKgFlyMachineOverride, setKgFlyMachineOverride, type KgFlyMachineOverride } from "../runner-mode.js";
 import { getMappings, type RepoMapping } from "../config.js";
 import { getInFlightJobs, getRunRecordMergeVerdict, getJobById, getJobByMachineId, type Job } from "../log.js";
 import { getMachine, listMachines, fetchMachineLogs, readMachineExit, type Machine } from "../fly-machines.js";
@@ -32,7 +32,7 @@ import { sidecarHealthFields, getKgMemoryProvider, KG_TOOL_CAPABILITY } from "..
 import { getRestateStatus } from "./status.js";
 import { readKgSourceRepo } from "../deploy.js";
 import { runKgRefreshPreflight, MIN_FREE_BYTES, type KgRefreshStage, type KgRefreshStatus } from "../kg-refresh.js";
-import type { KgRefreshToolDeps } from "./kg-refresh-production.js";
+import { resolveKgFlyMachineSize, type KgRefreshToolDeps } from "./kg-refresh-production.js";
 import type { KgRefreshDefinition, KgRepoDefinition } from "./kg-refresh-types.js";
 import { getOrchestratorSettings, getLinearPickupLabel } from "../orchestrator-settings.js";
 import { getIssueReportCard, getFleetReport } from "../report-card.js";
@@ -699,6 +699,7 @@ export const getKgStatusTool = tool(
       lastDryRun,
       stage,
       materialize: getKgMaterializeDirect() ? "direct" : "rdflib",
+      flyMachine: resolveKgFlyMachineSize(toolDeps.kgSourceRepo, false),
     };
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   },
@@ -986,6 +987,58 @@ export const setRunnerModeTool = tool(
   },
 );
 
+export const SET_KG_FLY_MACHINE_DESCRIPTION =
+  "Set the Fly KG refresh machine size (admin role): cpus (1, 2, 4, 8, 16), memoryMb (256-65536), cpuKind (auto, shared, performance). Given fields merge into the stored override; clear: true deletes it. Applies to the next Fly KG run, not one in flight. Returns the stored override and the effective size.";
+
+const KG_FLY_CPU_VALUES = [1, 2, 4, 8, 16];
+const KG_FLY_CPU_KINDS = ["auto", "shared", "performance"];
+
+export const setKgFlyMachineTool = tool(
+  {
+    description: SET_KG_FLY_MACHINE_DESCRIPTION,
+    input: z.object({
+      cpus: z.number().optional().describe("CPUs: one of 1, 2, 4, 8, 16"),
+      memoryMb: z.number().optional().describe("Memory in MB: an integer from 256 to 65536"),
+      cpuKind: z.string().optional().describe("CPU kind: auto (performance at 2048 MB per CPU or more), shared, or performance"),
+      clear: z.boolean().optional().describe("Delete the override, restoring the mapping size"),
+    }),
+    role: "admin",
+    retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },
+  },
+  async (ctx, input): Promise<ToolResponse> => {
+    const reply = (value: unknown): ToolResponse => ({ content: [{ type: "text", text: JSON.stringify(value, null, 2) }] });
+    const bad = (error: string): ToolResponse => reply({ status: 400, body: { error } });
+    const { cpus, memoryMb, cpuKind, clear } = input.args;
+    if (cpus !== undefined && !(Number.isInteger(cpus) && KG_FLY_CPU_VALUES.includes(cpus))) {
+      return bad("cpus must be one of 1, 2, 4, 8, 16");
+    }
+    if (memoryMb !== undefined && !(Number.isInteger(memoryMb) && memoryMb >= 256 && memoryMb <= 65536)) {
+      return bad("memoryMb must be an integer from 256 to 65536");
+    }
+    if (cpuKind !== undefined && !KG_FLY_CPU_KINDS.includes(cpuKind)) {
+      return bad("cpuKind must be one of auto, shared, performance");
+    }
+    const toolDeps = kgRefreshToolDeps;
+    if (!toolDeps) return reply({ error: "KG refresh is not configured" });
+    const kgSourceRepo = toolDeps.kgSourceRepo;
+    const stored = await ctx.run("set-kg-fly-machine", () => {
+      if (clear === true) {
+        setKgFlyMachineOverride(null);
+        return {} as KgFlyMachineOverride;
+      }
+      const merged: KgFlyMachineOverride = {
+        ...getKgFlyMachineOverride(),
+        ...(cpus !== undefined ? { cpus } : {}),
+        ...(memoryMb !== undefined ? { memoryMb } : {}),
+        ...(cpuKind !== undefined ? { cpuKind: cpuKind as KgFlyMachineOverride["cpuKind"] } : {}),
+      };
+      setKgFlyMachineOverride(merged);
+      return merged;
+    }, { maxRetryAttempts: 1 });
+    return reply({ override: stored, effective: resolveKgFlyMachineSize(kgSourceRepo, false) });
+  },
+);
+
 export const PAUSE_PROJECT_DESCRIPTION =
   "Pause or resume a project mapping (admin role). Same as the paused update of PATCH /api/mappings/<teamKey>.";
 
@@ -1212,6 +1265,7 @@ export const orchestratorTools = restate.service({
     kg_provenance: kgProvenance,
     trigger_kg_refresh: triggerKgRefreshTool,
     set_runner_mode: setRunnerModeTool,
+    set_kg_fly_machine: setKgFlyMachineTool,
     pause_project: pauseProjectTool,
     add_project: addProjectTool,
     trigger_workflow_sync: triggerWorkflowSyncTool,

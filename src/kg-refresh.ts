@@ -179,6 +179,8 @@ export interface KgRefreshStatus {
   stage: KgRefreshStage;
   /** Which materialize path the next refresh will stage (AII-602). */
   materialize: "rdflib" | "direct";
+  /** The effective Fly KG machine size the next Fly refresh will use (`set_kg_fly_machine`). */
+  flyMachine?: { cpuKind: "shared" | "performance"; cpus: number; memoryMb: number; source: "override" | "mapping" | "default" };
 }
 
 export interface KgRefreshHandle {

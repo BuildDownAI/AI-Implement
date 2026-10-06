@@ -15,6 +15,7 @@ import {
   kgPath,
   kgHybridSearch,
   getKgStatusTool,
+  setKgFlyMachineTool,
   getTenantHealth,
   getIssueReportCardTool,
   getFleetReportTool,
@@ -42,7 +43,7 @@ import type { PreflightCheckResult, RefreshOutcome } from "../kg-refresh.js";
 import type { KgRefreshToolDeps } from "../restate/kg-refresh-production.js";
 import { getMappings } from "../config.js";
 import { setOrchestratorSetting } from "../orchestrator-settings.js";
-import { initSettingsTable } from "../runner-mode.js";
+import { initSettingsTable, getKgFlyMachineOverride, setKgFlyMachineOverride } from "../runner-mode.js";
 import { initLogTable } from "../log.js";
 import { getRestateStatus, setRestateStatus, resetRestateStatus } from "../restate/status.js";
 import { getIssueReportCard, getFleetReport } from "../report-card.js";
@@ -826,7 +827,7 @@ describe("migrated read handlers (AII-711)", () => {
     it("keeps the KgRefreshStatus shape", async () => {
       const status = await stageFor({ last: ok });
       expect(Object.keys(status).sort()).toEqual(
-        ["deployHeld", "kgDegraded", "kgUnavailable", "lastDryRun", "lastRefresh", "materialize", "running", "servedStamp", "sidecar", "stage"].sort(),
+        ["deployHeld", "flyMachine", "kgDegraded", "kgUnavailable", "lastDryRun", "lastRefresh", "materialize", "running", "servedStamp", "sidecar", "stage"].sort(),
       );
     });
   });
@@ -1509,5 +1510,67 @@ describe("dispatch reservation tools (AII-1069)", () => {
     expect(lines).toEqual([
       `[mcp] write tool=release_dispatch_reservation actor=op@example.com role=admin result=ok kind=human dispatch=${id} owner=restate:b force=true`,
     ]);
+  });
+});
+
+describe("set_kg_fly_machine / get_kg_status flyMachine (AII-1120)", () => {
+  const mapping = { AII: { owner: "org", repo: "kg", machineCpus: 2, machineMemoryMb: 4096 } };
+
+  beforeAll(() => initSettingsTable());
+  beforeEach(() => {
+    (getMappings as ReturnType<typeof vi.fn>).mockReturnValue(mapping);
+    setKgRefreshToolDeps(kgToolDeps());
+    setKgFlyMachineOverride(null);
+  });
+  afterEach(() => {
+    setKgRefreshToolDeps(null);
+    setKgFlyMachineOverride(null);
+  });
+
+  const call = async (args: Record<string, unknown>, caller: Caller = SYSTEM_ADMIN) =>
+    JSON.parse((await setKgFlyMachineTool(fakeContext("set_kg_fly_machine"), { caller, args })).content[0].text);
+
+  it("merges fields and reports the effective size", async () => {
+    await call({ cpus: 4 });
+    const res = await call({ memoryMb: 8192 });
+    expect(res.override).toEqual({ cpus: 4, memoryMb: 8192 });
+    expect(res.effective).toEqual({ cpuKind: "performance", cpus: 4, memoryMb: 8192, source: "override" });
+    expect(getKgFlyMachineOverride()).toEqual({ cpus: 4, memoryMb: 8192 });
+  });
+
+  it("clear deletes the override and returns to the mapping size", async () => {
+    await call({ memoryMb: 8192 });
+    const res = await call({ clear: true });
+    expect(res.effective).toEqual({ cpuKind: "performance", cpus: 2, memoryMb: 4096, source: "mapping" });
+    expect(getKgFlyMachineOverride()).toEqual({});
+  });
+
+  it.each([
+    [{ cpus: 3 }, "cpus"],
+    [{ cpus: 1.5 }, "cpus"],
+    [{ memoryMb: 100 }, "memoryMb"],
+    [{ memoryMb: 70000 }, "memoryMb"],
+    [{ cpuKind: "bogus" }, "cpuKind"],
+  ])("rejects %j with 400 naming %s and writes nothing", async (args, field) => {
+    const res = await call(args);
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain(field);
+    expect(getKgFlyMachineOverride()).toEqual({});
+  });
+
+  it("refuses a user caller", async () => {
+    const result = await setKgFlyMachineTool(fakeContext("set_kg_fly_machine"), { caller: HUMAN_USER, args: { cpus: 2 } });
+    expect(result.content[0].text).toBe("forbidden: set_kg_fly_machine requires the admin role");
+    expect(getKgFlyMachineOverride()).toEqual({});
+  });
+
+  it("get_kg_status includes flyMachine", async () => {
+    await call({ memoryMb: 8192 });
+    const ctx = {
+      ...fakeContext("get_kg_status"),
+      objectClient: () => ({ status: async () => null, lastAdminDryRun: async () => null }),
+    } as unknown as restate.Context;
+    const status = JSON.parse((await getKgStatusTool(ctx, { caller: SYSTEM_ADMIN, args: {} })).content[0].text);
+    expect(status.flyMachine).toEqual({ cpuKind: "performance", cpus: 2, memoryMb: 8192, source: "override" });
   });
 });

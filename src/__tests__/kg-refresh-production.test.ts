@@ -43,7 +43,9 @@ vi.mock("../runner-mode.js", () => ({
   getRunnerMode: () => ({ mode: "default" }),
   resolveExecutionPath: () => resolvedPath.current,
   getKgMaterializeDirect: () => ({ enabled: false }),
+  getKgFlyMachineOverride: () => kgFlyOverride.current,
 }));
+const kgFlyOverride: { current: { cpus?: number; memoryMb?: number; cpuKind?: "auto" | "shared" | "performance" } } = { current: {} };
 const kgMappingSize: { current: { machineCpus?: number; machineMemoryMb?: number } } = { current: {} };
 vi.mock("../config.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../config.js")>()),
@@ -570,6 +572,7 @@ describe("createKgFindRunByTitle", () => {
 });
 
 describe("kgFlyMachineSizing (AII-1112)", () => {
+  beforeEach(() => { kgFlyOverride.current = {}; });
   const build = (sizing: ReturnType<typeof kgFlyMachineSizing>) =>
     buildSessionMachineConfig({
       image: "runner:test", issueId: "kg-refresh", issueIdentifier: "KG-REFRESH", issueTitle: "t", issueDescription: "",
@@ -617,5 +620,50 @@ describe("kgFlyMachineSizing (AII-1112)", () => {
     } finally {
       log.mockRestore();
     }
+  });
+
+  describe("admin override (AII-1120)", () => {
+    beforeEach(() => { kgMappingSize.current = { machineCpus: 2, machineMemoryMb: 4096 }; });
+
+    it("reports the mapping as the source with no override", () => {
+      expect(kgFlyMachineSizing("acme/kg", null)).toMatchObject({ cpuKind: "performance", cpus: 2, memoryMb: 4096, source: "mapping" });
+    });
+
+    it("applies a memory override on top of the mapping", () => {
+      kgFlyOverride.current = { memoryMb: 8192 };
+      expect(kgFlyMachineSizing("acme/kg", null)).toMatchObject({ cpuKind: "performance", cpus: 2, memoryMb: 8192, source: "override" });
+    });
+
+    it("forces shared CPUs at the mapping size", () => {
+      kgFlyOverride.current = { cpuKind: "shared" };
+      expect(kgFlyMachineSizing("acme/kg", null)).toMatchObject({ cpuKind: "shared", cpus: 2, memoryMb: 4096 });
+    });
+
+    it("treats cpuKind auto like unset", () => {
+      kgFlyOverride.current = { cpuKind: "auto" };
+      expect(kgFlyMachineSizing("acme/kg", null).cpuKind).toBe("performance");
+    });
+
+    it("falls back to shared with one log line when performance is below the minimum", () => {
+      const log = vi.spyOn(console, "log").mockImplementation(() => {});
+      try {
+        kgFlyOverride.current = { cpuKind: "performance", memoryMb: 2048 };
+        expect(kgFlyMachineSizing("acme/kg", null)).toMatchObject({ cpuKind: "shared", cpus: 2, memoryMb: 2048 });
+        expect(log.mock.calls.filter((c) => String(c[0]).includes("2048"))).toHaveLength(1);
+      } finally {
+        log.mockRestore();
+      }
+    });
+
+    it("uses builder defaults for unset fields when there is no mapping", () => {
+      const log = vi.spyOn(console, "log").mockImplementation(() => {});
+      try {
+        expect(kgFlyMachineSizing("other/repo", null)).toMatchObject({ cpuKind: "shared", cpus: 1, memoryMb: 1024, source: "default" });
+        kgFlyOverride.current = { memoryMb: 2048 };
+        expect(kgFlyMachineSizing("other/repo", null)).toMatchObject({ cpus: 1, memoryMb: 2048, cpuKind: "performance", source: "override" });
+      } finally {
+        log.mockRestore();
+      }
+    });
   });
 });

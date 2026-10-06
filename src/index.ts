@@ -4052,7 +4052,7 @@ async function dispatchKgRefreshRun(
       orchestratorApp: process.env.FLY_APP_NAME,
       expectedTtlSeconds: 4 * 60 * 60,
       extraEnv,
-      ...kgFlyMachineSizing(config.kgSourceRepo, config.flySessionsRegion),
+      ...(({ source: _source, ...sizing }) => sizing)(kgFlyMachineSizing(config.kgSourceRepo, config.flySessionsRegion)),
     });
     const machine = await createMachine(config.flySessionsToken, config.flySessionsApp, machineConfig);
     console.log(`[kg-refresh] dispatched via Fly (dispatchId=${opts.dispatchId})`);

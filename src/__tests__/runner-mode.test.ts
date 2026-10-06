@@ -431,4 +431,32 @@ describe("runner-mode", () => {
       expect(r.reason).toMatch(/bedrock/i);
     });
   });
+
+  describe("getKgFlyMachineOverride / setKgFlyMachineOverride (AII-1120)", () => {
+    const row = () => dedup.getDb().prepare("SELECT value FROM settings WHERE key = 'kg_fly_machine_override'").get();
+
+    it("returns {} with no row", () => {
+      expect(runnerMode.getKgFlyMachineOverride()).toEqual({});
+    });
+
+    it("round-trips a value and deletes the row on null", () => {
+      runnerMode.setKgFlyMachineOverride({ cpus: 4, memoryMb: 8192, cpuKind: "performance" });
+      expect(runnerMode.getKgFlyMachineOverride()).toEqual({ cpus: 4, memoryMb: 8192, cpuKind: "performance" });
+      runnerMode.setKgFlyMachineOverride(null);
+      expect(row()).toBeUndefined();
+      expect(runnerMode.getKgFlyMachineOverride()).toEqual({});
+    });
+
+    it("returns {} for garbage and logs once", () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        dedup.getDb().prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('kg_fly_machine_override', ?)").run("{nope");
+        expect(runnerMode.getKgFlyMachineOverride()).toEqual({});
+        expect(runnerMode.getKgFlyMachineOverride()).toEqual({});
+        expect(warn).toHaveBeenCalledTimes(1);
+      } finally {
+        warn.mockRestore();
+      }
+    });
+  });
 });
