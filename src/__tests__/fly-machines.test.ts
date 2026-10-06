@@ -14,6 +14,7 @@ import {
   unsetAppSecret,
   fetchMachineLogs,
   updateMachineMetadata,
+  readMachineExit,
 } from "../fly-machines.js";
 import type { SessionMachineInput } from "../fly-machines.js";
 import { encodeRunConfig, decodeRunConfig, type RunConfigV1 } from "../run-config.js";
@@ -1036,5 +1037,30 @@ describe("fetchMachineLogs", () => {
 
     await expect(fetchMachineLogs(TOKEN, APP, "machine-123"))
       .rejects.toThrow("Failed to fetch logs for machine machine-123 (404)");
+  });
+});
+
+describe("readMachineExit", () => {
+  const withEvents = (events?: Array<Record<string, unknown>>) =>
+    ({ ...mockMachine, events }) as unknown as Parameters<typeof readMachineExit>[0];
+  const nulls = { exitCode: null, signal: null, oomKilled: null, timestamp: null };
+
+  it("returns all-null for missing or empty events", () => {
+    expect(readMachineExit(withEvents(undefined))).toEqual(nulls);
+    expect(readMachineExit(withEvents([]))).toEqual(nulls);
+  });
+
+  it("reads exit code, signal, oom flag, and timestamp from the first exit event", () => {
+    const m = withEvents([
+      { type: "start", timestamp: 9 },
+      { type: "crash", timestamp: 5, request: { exit_event: { exit_code: -1, guest_signal: 9, oom_killed: true } } },
+      { type: "exit", timestamp: 1, request: { exit_event: { exit_code: 3 } } },
+    ]);
+    expect(readMachineExit(m)).toEqual({ exitCode: -1, signal: 9, oomKilled: true, timestamp: 5 });
+  });
+
+  it("leaves exitCode null for a clean exit", () => {
+    expect(readMachineExit(withEvents([{ type: "exit", timestamp: 2, request: { exit_event: {} } }])))
+      .toEqual({ exitCode: null, signal: null, oomKilled: null, timestamp: 2 });
   });
 });
