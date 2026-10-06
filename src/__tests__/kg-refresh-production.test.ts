@@ -44,9 +44,10 @@ vi.mock("../runner-mode.js", () => ({
   resolveExecutionPath: () => resolvedPath.current,
   getKgMaterializeDirect: () => ({ enabled: false }),
 }));
+const kgMappingSize: { current: { machineCpus?: number; machineMemoryMb?: number } } = { current: {} };
 vi.mock("../config.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../config.js")>()),
-  getMappings: () => ({ AII: { owner: "acme", repo: "kg", dependencyTokenScope: "installation" } }),
+  getMappings: () => ({ AII: { owner: "acme", repo: "kg", dependencyTokenScope: "installation", ...kgMappingSize.current } }),
 }));
 
 import {
@@ -54,8 +55,10 @@ import {
   createKgRefreshDispatch,
   createKgRefreshIngressClient,
   createProductionKgRefreshServices,
+  kgFlyMachineSizing,
   type KgRefreshProductionInput,
 } from "../restate/kg-refresh-production.js";
+import { buildSessionMachineConfig } from "../fly-machines.js";
 import { decodeRunConfig } from "../run-config.js";
 import { verifyRunToken } from "../runner-tokens.js";
 
@@ -562,6 +565,39 @@ describe("createKgFindRunByTitle", () => {
       expect(recordDetails).toHaveBeenCalledWith("d-1", { workflowRunId: 7, logsUrl: "u" });
     } finally {
       vi.unstubAllGlobals();
+    }
+  });
+});
+
+describe("kgFlyMachineSizing (AII-1112)", () => {
+  const build = (sizing: ReturnType<typeof kgFlyMachineSizing>) =>
+    buildSessionMachineConfig({
+      image: "runner:test", issueId: "kg-refresh", issueIdentifier: "KG-REFRESH", issueTitle: "t", issueDescription: "",
+      owner: "acme", repo: "kg", defaultBranch: "main", githubToken: "t", sessionToken: "s", machineNonce: "n",
+      ...sizing,
+    });
+
+  it("sizes the machine from the mapping and carries the region", () => {
+    kgMappingSize.current = { machineCpus: 2, machineMemoryMb: 4096 };
+    const machine = build(kgFlyMachineSizing("acme/kg", "ord"));
+    expect(machine.config.guest).toMatchObject({ cpus: 2, memory_mb: 4096 });
+    expect(machine.region).toBe("ord");
+  });
+
+  it("falls back per field when the mapping leaves the size unset", () => {
+    kgMappingSize.current = {};
+    const machine = build(kgFlyMachineSizing("acme/kg", null));
+    expect(machine.config.guest).toMatchObject({ cpus: 1, memory_mb: 1024 });
+  });
+
+  it("keeps the default size and logs one line with no mapping", () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const machine = build(kgFlyMachineSizing("other/repo", undefined));
+      expect(machine.config.guest).toMatchObject({ cpus: 1, memory_mb: 1024 });
+      expect(log.mock.calls.filter((c) => String(c[0]).includes("default size"))).toHaveLength(1);
+    } finally {
+      log.mockRestore();
     }
   });
 });

@@ -165,8 +165,22 @@ export interface KgRefreshToolDeps {
   readServedStamp: () => Promise<string | null>;
 }
 
-function findKgMapping(kgSourceRepo: string) {
+export function findKgMapping(kgSourceRepo: string) {
   return Object.entries(getMappings()).find(([, m]) => `${m.owner}/${m.repo}` === kgSourceRepo);
+}
+
+/** Fly machine size for a kg-refresh run: the KG repo mapping's size and the sessions region,
+ *  as issue runs do. With no mapping, nothing is set so the builder's default size applies. */
+export function kgFlyMachineSizing(
+  kgSourceRepo: string,
+  region: string | null | undefined,
+): { cpus?: number; memoryMb?: number; region?: string } {
+  const mapping = findKgMapping(kgSourceRepo)?.[1];
+  if (!mapping) {
+    console.log(`[kg-refresh] no mapping for ${kgSourceRepo}; Fly machine uses the default size`);
+    return { region: region ?? undefined };
+  }
+  return { cpus: mapping.machineCpus, memoryMb: mapping.machineMemoryMb, region: region ?? undefined };
 }
 
 /** The execution mode a kg-refresh dispatch resolves to under the current runner mode.

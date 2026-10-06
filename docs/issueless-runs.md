@@ -113,7 +113,7 @@ The kg-refresh runner reads `AI_IMPLEMENT_LOG_LEVEL` the same way the implement 
 **Late-report handling:** A report that arrives after the run has completed is answered by the `KgRefresh.report` handler, not dropped: an identical body is a duplicate and acknowledged, a different body is refused with `409 conflicting_report` (§6).
 
 
-**Fly Machines backend:** creates a session machine with `phase: "kg-refresh"` through `dispatchKgRefreshRun()`. Returns `machineId + machineNonce`.
+**Fly Machines backend:** creates a session machine with `phase: "kg-refresh"` through `dispatchKgRefreshRun()`. The machine is sized from the KG source repo mapping's `machineCpus` and `machineMemoryMb` plus the sessions region (`kgFlyMachineSizing`); with no mapping it keeps the 1 CPU / 1024 MB default and logs one line. Returns `machineId + machineNonce`.
 
 **Local Docker backend:** starts a local container via `startLocalRunnerContainer()`. Returns `machineNonce` only.
 
