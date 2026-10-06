@@ -182,6 +182,7 @@ beforeEach(async () => {
   accessEntries.initAccessEntriesTable();
   accessAudit.initAccessAuditTable();
   accessGrants.initAccessPageGrantsTable();
+  (await import("../dispatch-breaker.js")).initDispatchBreakerTable(); // /api/blockers reads park state
   // Every /api/* request re-checks the signed-in identity and requires Admin, and only a listed
   // address can be one — a domain-only list would admit the suite's identity as a user and 403 it.
   process.env.OAUTH_ALLOWED_DOMAINS = "eudoxus.ai";
@@ -2303,12 +2304,12 @@ describe("admin kg refresh dry-run (AII-635)", () => {
   });
 
   it("the Deployments page carries the Dry-run refresh button and the last-dry-run block", async () => {
-    const page = await import("../admin-ui/pages/deployments.js");
-    expect(page.deploymentsHtml).toContain('id="kg-dry-run-btn"');
-    expect(page.deploymentsHtml).toContain("window.triggerKgRefresh(true)");
-    expect(page.deploymentsHtml).toContain('id="kg-dry-run-last"');
-    expect(page.deploymentsScript).toContain("JSON.stringify({ dryRun: true })");
-    expect(page.deploymentsScript).toContain("function renderKgDryRun(");
+    const page = await import("../admin-ui/pages/kg-pipelines.js");
+    expect(page.kgPipelinesHtml).toContain('id="kg-dry-run-btn"');
+    expect(page.kgPipelinesHtml).toContain("window.triggerKgRefresh(true)");
+    expect(page.kgPipelinesHtml).toContain('id="kg-dry-run-last"');
+    expect(page.kgPipelinesScript).toContain("JSON.stringify({ dryRun: true })");
+    expect(page.kgPipelinesScript).toContain("function renderKgDryRun(");
   });
 });
 
@@ -3520,6 +3521,32 @@ describe("admin blockers endpoint", () => {
     expect(body.blockers[0].reason).toBe("no-mapping");
     expect(body.totals.byReason["no-mapping"]).toBe(1);
     expect(body.totals.issues).toBe(1);
+  });
+
+  it("lists a parked issue as parked for the phase it would run next, and no other phase", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", { teamKey: "CORE", owner: "org", repo: "core", planningWorkflowFile: "claude-plan.yml" }, token);
+    const { initDispatchBreakerTable, parkIssue } = await import("../dispatch-breaker.js");
+    initDispatchBreakerTable();
+    const mk = (id: string, identifier: string): TicketIssue => ({ id, identifier, title: identifier, description: null, scopeKey: "CORE", nativeStatus: "Todo" });
+    parkIssue("impl-1", "implementation", "x");
+    parkIssue("plan-1", "planning", "x");
+    parkIssue("plan-2", "implementation", "x"); // wrong phase for a needsPlanning issue
+    dedup.markDispatched("impl-1", "TEAM", "CORE-1", "t"); // parked wins over dedup
+    vi.spyOn(provider, "fetchAIImplementSnapshot").mockResolvedValueOnce({
+      readyForImplementation: [mk("impl-1", "CORE-1")],
+      needsPlanning: [mk("plan-1", "CORE-2"), mk("plan-2", "CORE-3")],
+      inProgressCountsByScope: {},
+      parentsToFinalize: [],
+    });
+    const res = await request("/api/blockers", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.blockers.map((b: { issueIdentifier: string; reason: string }) => [b.issueIdentifier, b.reason])).toEqual([
+      ["CORE-1", "parked"],
+      ["CORE-2", "parked"],
+    ]);
+    expect(body.totals.byReason.parked).toBe(2);
   });
 
   it("lists a Linear issue whose key belongs to a Jira mapping as no-mapping, and keeps it off /api/issues", async () => {

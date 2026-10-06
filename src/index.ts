@@ -31,7 +31,7 @@ import { dispatchLocalGapfill } from "./local-gapfill.js";
 import { getLatestDispatchForPr, getLatestPrUrlForIssue, getLatestTeamKeyForIssue } from "./log.js";
 import type { TicketingProvider, FeatureNodeRollUp } from "./providers/types.js";
 import type { TicketIssue } from "./providers/types.js";
-import { rememberCandidates, mappingForProvider, mergeProviderSnapshots, resolveInFlightSiblings, selectIssuesToDispatch, selectFileOverlapDeferrals, getOrFetchPlanningContexts } from "./poll-selection.js";
+import { logSkipReasons, rememberCandidates, mappingForProvider, mergeProviderSnapshots, resolveInFlightSiblings, selectIssuesToDispatch, selectFileOverlapDeferrals, getOrFetchPlanningContexts } from "./poll-selection.js";
 import { notify, notifyCompletion, notifyText, notifyKgRefreshOutcome } from "./notify.js";
 import type { KgRefreshOutcomeNotification } from "./notify.js";
 import { isKgDegraded, postAvailableNotice, postBootNotice, postShutdownNotice, recordDeployOutcome, recordShutdown } from "./deploy-notify.js";
@@ -44,7 +44,7 @@ import type { StuckWatchdogConfig } from "./stuck-watchdog.js";
 import { handleAdminRequest } from "./admin.js";
 import type { AdminDeps } from "./admin.js";
 import { initLogTable, appendLog, countPriorDispatches, completeOrphanedPlanningJobs, attachJobRunIdIfMissing, updateJobRunId, updateJobStatus, updateJobPrUrl, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobById, getJobByMachineId, getJobByDispatchId, resetStuckAttempts, getRecentFailedRunUrls } from "./log.js";
-import { recordDispatchFailure, recordDispatchSuccess, shouldCountFailure, initDispatchBreakerTable, parkIssue, prBudgetParkMessage, isParked } from "./dispatch-breaker.js";
+import { listParked, recordDispatchFailure, recordDispatchSuccess, shouldCountFailure, initDispatchBreakerTable, parkIssue, prBudgetParkMessage, isParked } from "./dispatch-breaker.js";
 import type { Job, JobStatus } from "./log.js";
 import { getInstallationToken, getInstallationId, getAppSlug, getScopedInstallationToken } from "./github-app-auth.js";
 import { configureLinearAuth } from "./linear-app-auth.js";
@@ -601,12 +601,13 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
 
     const inFlightIssueIds = getInFlightIssueIds();
     const candidateScopeKeyById = new Map(allCandidates.map((issue) => [issue.id, issue.scopeKey]));
-    const isDispatchBlocked = (issueId: string) => {
+    const dispatchDecision = (issueId: string) => {
       const kind: DispatchKind = needsPlanningIds.has(issueId) ? "planning" : "implementation";
       const teamKey = candidateScopeKeyById.get(issueId) ?? "";
       const maxInProgressAiIssues = teamRepoMap[teamKey]?.maxInProgressAiIssues ?? 0;
-      return !canDispatch({ issueId, kind, teamKey, maxInProgressAiIssues }).ok;
+      return { kind, decision: canDispatch({ issueId, kind, teamKey, maxInProgressAiIssues }) };
     };
+    const isDispatchBlocked = (issueId: string) => !dispatchDecision(issueId).decision.ok;
 
     // A deploy is holding new work back. Skipping selection cannot lose work:
     // selectIssuesToDispatch is pure, and markDispatched runs only after a
@@ -632,6 +633,24 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
           admissionCountsByTeam,
           isDispatchBlocked,
         );
+
+    // Log each candidate's skip reason once, when it starts or changes (and when it clears).
+    {
+      const reasons = allCandidates.map((issue) => {
+        const { kind, decision } = dispatchDecision(issue.id);
+        return { issue, kind, reason: decision.ok ? null : decision.reason };
+      });
+      const parkedRows = reasons.some((r) => r.reason === "parked") ? listParked() : [];
+      for (const line of logSkipReasons(
+        reasons.map(({ issue, kind, reason }) => ({
+          id: issue.id,
+          identifier: issue.identifier,
+          phase: kind === "planning" ? "planning" : "implementation",
+          reason,
+          failures: parkedRows.find((p) => p.issueId === issue.id && p.phase === kind)?.failures,
+        })),
+      )) console.log(line);
+    }
 
     // AII-278 Finding 3: in-flight issues carry AI-Working and drop OUT of the
     // candidate snapshot, so filtering allCandidates made the in-flight set

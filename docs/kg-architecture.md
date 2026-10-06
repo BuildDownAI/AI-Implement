@@ -143,8 +143,8 @@ Every soft failure that skips real work must leave a receipt. The embed step wri
 boot, surfaced as `kgDegraded` on `GET /`, in the deploy notification, and in `get_tenant_health`
 (AII-422). See [deployment.md](deployment.md#kg-embeddings-health).
 Liveness is a second, independent signal: the boot-time probe's result is surfaced as `kgUnavailable` and
-`sidecar` on the same three reads and in the Deployments card (AII-648, AII-650). See
-[deployment.md](deployment.md#kg-sidecar-health).
+`sidecar` on the same three reads and in the Knowledge graph card on the Knowledge Graph Pipelines page
+(`/admin#kg-pipelines`; AII-648, AII-650). See [deployment.md](deployment.md#kg-sidecar-health).
 
 ### Stage 4 — Serve
 
@@ -203,8 +203,8 @@ or these steps by hand.
 
 1. Reconcile scope in `sources.yml` (through a PR on the KG repo when it changes) — the rail runs the ingest and pushes the snapshot itself; no laptop ingest, no laptop push.
 2. **Trigger the refresh**: the `trigger_kg_refresh` MCP tool (admin role; this is what `bd-kg-refresh` calls),
-   `POST /api/kg/refresh` with an admin session token, or the Deployments page's "Refresh graph now" — all three
-   run the same handler. `202` = accepted; `409` = a refresh or a deploy is
+   `POST /api/kg/refresh` with an admin session token, or **Refresh graph now** on the Knowledge Graph
+   Pipelines page (`/admin#kg-pipelines`) — all three run the same handler. `202` = accepted; `409` = a refresh or a deploy is
    already in progress; `422` = callback not configured or credential preflight failed (see below). The orchestrator
    first runs a **credential preflight** (probing the KG write token and the installation-wide
    dependency token against every `code_repo` and `secondary_repos` slug in `sources.yml`) and
@@ -257,9 +257,9 @@ whatever it held before the dispatch rather than advancing through `staging`/`se
 A dry-run and a real run of the same KG head print the same part table. The same dry-run is
 reachable from the admin REST route, `POST /api/kg/refresh` with body `{ "dryRun": true }` (the
 response echoes `dryRun` beside the trigger's fields; no body is the unchanged real refresh), and
-from the Deployments page's **Dry-run refresh** button beside **Refresh graph now** (AII-635). When
-the last terminal outcome was a dry-run, the Knowledge graph card shows its verdict and the
-per-part table (`part | previous | new | delta`). A guard refusal carries the same
+from the **Dry-run refresh** button beside **Refresh graph now** on the Knowledge Graph Pipelines page
+(AII-635). When the last terminal outcome was a dry-run, the Knowledge graph card on that page shows its
+verdict and the per-part table (`part | previous | new | delta`). A guard refusal carries the same
 `lastRefresh.partTable` and a part-naming `detail` on `get_kg_status` whether it came from a
 dry-run or a real (non-dry-run) refresh (AII-638) — only a real success omits `guardVerdict`/
 `partTable`, since it reports a snapshot commit instead.
@@ -385,6 +385,15 @@ prunes it by hand) and **never touches `docs_sites` or `code_repo`'s `docs_url`*
 entirely operator-owned, maintained through `bd-mega-kg-refresh` rather than this rail. A refresh
 with nothing to add logs `scope in sync` and leaves the file byte-for-byte unchanged.
 
+### Where to watch a refresh
+
+`/admin#kg-pipelines` (admin only) shows the Knowledge graph card above a
+table of kg-refresh runs, which is the dispatch log filtered to `phase: kg-refresh`, with Logs and Stop
+on each row. The same runs also appear on the Pipelines page with the `kg` badge, because that page is
+the complete dispatch log. Deployments keeps only the deploy-side signals: the drain tile counts an
+in-flight KG ingest run, and a release whose sidecar does not serve records "Released, but the knowledge
+graph is not serving".
+
 ## Refresh rail implementation (AII-426, AII-495)
 
 [AII-426](https://linear.app/eudoxus/issue/AII-426) shipped the local refresh rail; the "Planned"
@@ -466,8 +475,8 @@ fix be reverted instead of the memory bump.
 the same `db | env | default` precedence as `RUNNER_MODE` (`getKgMaterializeDirect()` /
 `setKgMaterializeDirect()` in `src/runner-mode.ts`): the env var wins outright when set, else the
 `settings` table row, else `false` (rdflib). `materializeDirectEnabled()` in `src/kg-refresh.ts`
-reads the resolved setting rather than `process.env` directly. The Deployments page
-(`/admin#deployments`) exposes a `Materialize: rdflib | direct` control next to "Refresh graph
+reads the resolved setting rather than `process.env` directly. The Knowledge Graph Pipelines page
+(`/admin#kg-pipelines`) exposes a `Materialize: rdflib | direct` control next to "Refresh graph
 now" — `GET`/`POST /api/kg/materialize-mode` — that flips the DB row; while the env var is set,
 the control is disabled and the write comes back `409`, same as the `RUNNER_MODE` /
 `FLY_PROCESS_LEVEL_SECRETS` pattern on the Runners page. The toggle only affects the *next*
@@ -499,8 +508,8 @@ still recognized and handled as a dry run instead of falling through to the real
 ### Accept-new-baseline plumbing (AII-628)
 
 `trigger_kg_refresh { acceptNewBaseline: true }` (the MCP tool, admin role), `POST /api/kg/refresh`
-with body `{ "acceptNewBaseline": true }`, and the Deployments page's **Accept new baseline &
-refresh** button (a separate, confirm-gated control beside **Refresh graph now** and **Dry-run
+with body `{ "acceptNewBaseline": true }`, and the **Accept new baseline & refresh** button on the
+Knowledge Graph Pipelines page (a separate, confirm-gated control beside **Refresh graph now** and **Dry-run
 refresh** — deliberately not a third argument to the existing refresh button, so accepting a shrink
 is always a distinct, deliberate click after reading the guard table, never the default path) all
 carry the same flag through the same envelope path `dryRun` already established: `trigger(opts)`

@@ -237,6 +237,8 @@ When `canDispatch` returns `pr_budget` for a gap-fill dispatch, the caller parks
 
 A human is not stuck once a PR is parked. A `/ai-implement` comment sets `humanRequested`, which bypasses both the budget check and the `parked` check in `canDispatch` (`src/dispatch-gate.ts:43` and `:50`) — so a human can always run one more pass, and that pass still counts against the budget. Parking otherwise persists until a human calls **Unpark** at `/admin` (`unpark`, `src/dispatch-breaker.ts:137-151`), which clears `parked_at` and resets the consecutive-failure counter so a fresh run of failures is required to re-park.
 
+The parked list at `/admin#runners` takes each row's issue name from the dispatch log (same phase first, then any phase) and falls back to the `dispatched` table; a row with no name shows `unknown issue` and the raw issue id.
+
 See the glossary's [PR dispatch budget](../CONTEXT.md#pr-dispatch-budget) entry.
 
 ## Reported capacity: reservations, not tracker labels or running-job displays

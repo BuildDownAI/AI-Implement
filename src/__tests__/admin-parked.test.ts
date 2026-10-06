@@ -218,6 +218,73 @@ describe("GET /api/parked", () => {
     expect(rows[0].repo).toBeNull();
   });
 
+  it("falls back to a dispatch_log row from another phase", async () => {
+    const token = await login();
+    log.appendLog({ issueId: "issue-fb", issueIdentifier: "AII-737", issueTitle: "Mint token", repo: "org/repo", phase: "planning" });
+    parkIssue("issue-fb");
+
+    const res = await makeRequest("/api/parked", "GET", token);
+    const rows = JSON.parse(res.body) as Array<{ issueIdentifier: unknown; issueTitle: unknown; repo: unknown }>;
+    expect(rows).toHaveLength(1);
+    expect(rows[0].issueIdentifier).toBe("AII-737");
+    expect(rows[0].issueTitle).toBe("Mint token");
+    expect(rows[0].repo).toBe("org/repo");
+  });
+
+  it("falls back to the dispatched table and maps team_key to the repo", async () => {
+    const token = await login();
+    config.initMappingsTable();
+    config.upsertMapping("AII", {
+      owner: "org",
+      repo: "mapped",
+      workflowFile: "claude-implement.yml",
+      defaultBranch: "main",
+      maxInProgressAiIssues: 3,
+      executionMode: "github-actions",
+      sessionMode: "autonomous",
+      machineCpus: 2,
+      machineMemoryMb: 4096,
+      planningEnabled: false,
+      planningWorkflowFile: "",
+      autoApprovePlans: true,
+      autoMerge: false,
+      extraEnv: {},
+      provider: "anthropic",
+      ticketingProvider: "linear",
+      ticketingConfig: { kind: "linear" },
+      awsRegion: null,
+      paused: false,
+    } as never);
+    dedup.markDispatched("issue-d1", "AII", "AII-5", "From dispatched");
+    dedup.markDispatched("issue-d2", "NOMAP", "AII-6", "No mapping");
+    parkIssue("issue-d1");
+    parkIssue("issue-d2");
+
+    const res = await makeRequest("/api/parked", "GET", token);
+    const rows = JSON.parse(res.body) as Array<{ issueId: string; issueIdentifier: unknown; issueTitle: unknown; repo: unknown }>;
+    const d1 = rows.find((r) => r.issueId === "issue-d1");
+    const d2 = rows.find((r) => r.issueId === "issue-d2");
+    expect(d1?.issueIdentifier).toBe("AII-5");
+    expect(d1?.issueTitle).toBe("From dispatched");
+    expect(d1?.repo).toBe("org/mapped");
+    expect(d2?.issueIdentifier).toBe("AII-6");
+    expect(d2?.repo).toBeNull();
+  });
+
+  it("prefers the same-phase row over other phases and dispatched", async () => {
+    const token = await login();
+    dedup.markDispatched("issue-p", "AII", "AII-DISP", "dispatched title");
+    log.appendLog({ issueId: "issue-p", issueIdentifier: "AII-PLAN", repo: "org/plan", phase: "planning" });
+    log.appendLog({ issueId: "issue-p", issueIdentifier: "AII-IMPL", repo: "org/impl", phase: "implementation" });
+    log.appendLog({ issueId: "issue-p", issueIdentifier: "AII-PLAN2", repo: "org/plan", phase: "planning" });
+    parkIssue("issue-p");
+
+    const res = await makeRequest("/api/parked", "GET", token);
+    const rows = JSON.parse(res.body) as Array<{ issueIdentifier: unknown; repo: unknown }>;
+    expect(rows[0].issueIdentifier).toBe("AII-IMPL");
+    expect(rows[0].repo).toBe("org/impl");
+  });
+
   it("returns two rows for an issue parked in both planning and implementation phases", async () => {
     const token = await login();
 
