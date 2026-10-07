@@ -2126,6 +2126,127 @@ describe("KgRefresh durable workflow", () => {
     15_000,
   );
 
+  // ---- AII-1127: the runner's steps are durable promises; status names the one in flight ----
+  describe("runner step reports", () => {
+    const stepBody = (id: string, status: string, extra: Record<string, unknown> = {}) => ({
+      step: {
+        id, type: "custom", status, started_at: "2026-10-07T00:00:00.000Z", ended_at: null,
+        parent_step_id: null, inputs: {}, outputs: {}, logs_url: null, ...extra,
+      },
+    });
+    const runnerStep = (baseUrl: string, triggerId: string) =>
+      callWorkflow<{ runnerStep: { id: string; status: string } | null }>(baseUrl, "KgRefresh", triggerId, "status").then((st) => st.runnerStep);
+
+    // `runWorkflow` resolves to a promise; wrapping it keeps `await` from waiting for the whole run.
+    async function parkedRun(baseUrl: string, triggerId: string): Promise<{ done: Promise<RefreshOutcome> }> {
+      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+      const done = runWorkflow(baseUrl, triggerId);
+      await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
+      return { done };
+    }
+
+    it.each(VARIANTS.map(([label]) => label))("status names the last reported runner step; a repeat changes nothing (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      const { done } = await parkedRun(env.baseUrl(), triggerId);
+      expect(await runnerStep(env.baseUrl(), triggerId)).toBeNull();
+
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "progress", stepBody("clone", "running"));
+      expect(await runnerStep(env.baseUrl(), triggerId)).toEqual({ id: "clone", status: "running" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "progress", stepBody("clone", "passed"));
+      expect(await runnerStep(env.baseUrl(), triggerId)).toEqual({ id: "clone", status: "passed" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "progress", stepBody("kg-ingest", "running"));
+      expect(await runnerStep(env.baseUrl(), triggerId)).toEqual({ id: "kg-ingest", status: "running" });
+
+      // A repeated delivery is left alone, and an older step does not move the report backwards.
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "progress", stepBody("clone", "running"));
+      expect(await runnerStep(env.baseUrl(), triggerId)).toEqual({ id: "kg-ingest", status: "running" });
+
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      expect((await done).ok).toBe(true);
+    }, 20_000);
+
+    it.each(VARIANTS.map(([label]) => label))("a step report resolves the progress heartbeat; a body-less progress does too (%s)", async (label) => {
+      const env = envFor(label);
+      const first = newTriggerId();
+      const { done: doneFirst } = await parkedRun(env.baseUrl(), first);
+      await callWorkflow(env.baseUrl(), "KgRefresh", first, "progress", stepBody("clone", "running"));
+      const response = await fetch(`${env.baseUrl()}/KgRefresh/${first}/progress`, { method: "POST" });
+      expect(response.ok).toBe(true);
+      await callWorkflow(env.baseUrl(), "KgRefresh", first, "report", SUCCESS_REPORT);
+      await doneFirst;
+
+      // An old runner image sends no step and no body at all.
+      const second = newTriggerId();
+      const { done: doneSecond } = await parkedRun(env.baseUrl(), second);
+      const bare = await fetch(`${env.baseUrl()}/KgRefresh/${second}/progress`, { method: "POST" });
+      expect(bare.ok).toBe(true);
+      expect(await runnerStep(env.baseUrl(), second)).toBeNull();
+      await callWorkflow(env.baseUrl(), "KgRefresh", second, "report", SUCCESS_REPORT);
+      await doneSecond;
+    }, 30_000);
+
+    it.each(VARIANTS.map(([label]) => label))("a step report after completion answers 2xx and changes nothing (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      const { done } = await parkedRun(env.baseUrl(), triggerId);
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "progress", stepBody("clone", "running"));
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      await done;
+
+      const late = await fetch(`${env.baseUrl()}/KgRefresh/${triggerId}/progress`, {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(stepBody("kg-ingest", "running")),
+      });
+      expect(late.ok).toBe(true);
+      expect(await runnerStep(env.baseUrl(), triggerId)).toEqual({ id: "clone", status: "running" });
+    }, 20_000);
+
+    it.each(VARIANTS.map(([label]) => label))("the callback redacts credentials before the ingress journals the step (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      const { done } = await parkedRun(env.baseUrl(), triggerId);
+      const SENTINEL = "ghs_SENTINEL_credential_value";
+      const secret = "restate-test-secret";
+      // Token verification reads SQLite; this scenario is about the ingress, so verification is stubbed.
+      vi.resetModules();
+      vi.doMock("../../runner-tokens.js", async (importOriginal) => ({
+        ...(await importOriginal<typeof import("../../runner-tokens.js")>()),
+        verifyRunToken: () => ({ ok: true, claims: { phase: "kg-refresh", audience: "progress", dispatchId: triggerId, issueId: "kg" } }),
+      }));
+      const { handleRunnerProgress } = await import("../../runner-callback.js");
+      const token = "stubbed";
+      const res = await handleRunnerProgress({
+        authorization: `Bearer ${token}`,
+        secret,
+        kgRefreshClient: createKgRefreshIngressClient(env.baseUrl()),
+        body: stepBody("clone", "passed", {
+          inputs: { githubToken: SENTINEL, machineNonce: SENTINEL, repoOwner: "org" },
+          outputs: { githubToken: SENTINEL, workspaceDir: "/w" },
+        }) as never,
+      });
+      vi.doUnmock("../../runner-tokens.js");
+      expect(res.status).toBe(200);
+      expect(await runnerStep(env.baseUrl(), triggerId)).toEqual({ id: "clone", status: "passed" });
+
+      const status = await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "status");
+      expect(JSON.stringify(status)).not.toContain(SENTINEL);
+      const promises = await fetch(`${env.adminAPIBaseUrl()}/query`, { // restate-test-allow: the one sanctioned admin read
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "application/json" },
+        body: JSON.stringify({ query: `SELECT * FROM sys_promise WHERE service_name = 'KgRefresh' AND service_key = '${triggerId}'` }),
+      });
+      expect(promises.ok).toBe(true);
+      const rows = ((await promises.json()) as { rows: Array<Record<string, unknown>> }).rows;
+      expect(rows.some((row) => JSON.stringify(row).includes("step:clone:ended"))).toBe(true);
+      expect(JSON.stringify(rows)).not.toContain(SENTINEL);
+      // The value is stored as bytes, so check the encoded sentinel too.
+      expect(JSON.stringify(rows)).not.toContain(JSON.stringify(Array.from(Buffer.from(SENTINEL))).slice(1, -1));
+
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      await done;
+    }, 20_000);
+  });
+
   // ---- W18: registered deployment options ----
   it.each(VARIANTS.map(([label]) => label))("a run call with a non-object input is rejected by the schema (%s)", async (label) => {
     const env = envFor(label);
