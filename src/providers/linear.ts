@@ -408,21 +408,12 @@ export class LinearProvider implements TicketingProvider {
     // own closing work merged and all its children done.
     refreshPickupLabel();
     const since = new Date(Date.now() - ROLLUP_LOOKBACK_MS).toISOString();
-    const data = await this.linearMutation<{
-      issues: {
-        nodes: Array<{
-          id: string;
-          identifier: string;
-          description: string | null;
-          team: { key: string };
-          children: { nodes: Array<{ identifier: string; state: { type: string }; labels: { nodes: Array<{ name: string }> } }> };
-          parent: { identifier: string; description: string | null; labels: { nodes: Array<{ name: string }> } } | null;
-        }>;
-      };
-    }>(
-      `query($since: DateTimeOrDuration!, $label: String!) {
+    const PAGE_SIZE = 100;
+    const MAX_PAGES = 20;
+    const query = `query($first: Int!, $after: String, $since: DateTimeOrDuration!, $label: String!) {
         issues(
-          first: 100
+          first: $first
+          after: $after
           filter: {
             labels: { name: { eq: $label } }
             state: { type: { eq: "completed" } }
@@ -437,13 +428,43 @@ export class LinearProvider implements TicketingProvider {
             children(first: 50) { nodes { identifier state { type } labels { nodes { name } } } }
             parent { identifier description labels { nodes { name } } }
           }
+          pageInfo { hasNextPage endCursor }
         }
-      }`,
-      { since, label: AI_IMPLEMENT_LABEL },
-    );
+      }`;
+    type RollUpNode = {
+      id: string;
+      identifier: string;
+      description: string | null;
+      team: { key: string };
+      children: { nodes: Array<{ identifier: string; state: { type: string }; labels: { nodes: Array<{ name: string }> } }> };
+      parent: { identifier: string; description: string | null; labels: { nodes: Array<{ name: string }> } } | null;
+    };
+    type RollUpPage = {
+      issues?: { nodes?: RollUpNode[]; pageInfo?: { hasNextPage?: boolean; endCursor?: string | null } };
+    };
+
+    const allNodes: RollUpNode[] = [];
+    let cursor: string | null = null;
+    let page = 0;
+    do {
+      const data: RollUpPage = await this.linearMutation<RollUpPage>(query, {
+        first: PAGE_SIZE,
+        after: cursor,
+        since,
+        label: AI_IMPLEMENT_LABEL,
+      });
+      allNodes.push(...(data.issues?.nodes ?? []));
+      cursor = data.issues?.pageInfo?.hasNextPage ? (data.issues?.pageInfo?.endCursor ?? null) : null;
+      if (++page >= MAX_PAGES && cursor !== null) {
+        console.warn(
+          `[linear] fetchFeatureNodeRollUps hit max pages (${MAX_PAGES}), ${allNodes.length} issues fetched`,
+        );
+        break;
+      }
+    } while (cursor !== null);
 
     const rollUps: FeatureNodeRollUp[] = [];
-    for (const node of data.issues?.nodes ?? []) {
+    for (const node of allNodes) {
       const childStates = childFeatureStates(node.children?.nodes ?? []);
       const aiChildren = childStates.filter((c) => c.designated);
       if (aiChildren.length === 0) continue;

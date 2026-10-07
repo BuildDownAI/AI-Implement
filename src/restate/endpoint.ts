@@ -1,7 +1,7 @@
 // The SDK endpoint for the run lifecycle's durable-execution engine (ADR 017, ADR 018),
 // the `Operator` Virtual Object (AII-709), and the `orchestratorTools` service /mcp
-// discovers and calls tools through (AII-710). No run kind has migrated onto Restate yet,
-// so a workflow module joins the service set here once one does. The Restate server
+// discovers and calls tools through (AII-710). kg-refresh is migrated: `src/index.ts`
+// composes the `KgRepo` / `KgRefresh` services and registers them here. The Restate server
 // (RestateSidecar, ../restate/server.ts, AII-627) reaches this endpoint by push, over
 // HTTP/2 — nothing else calls it, which is why the bind address defaults to loopback and
 // never leaves it (ADR 023).
@@ -42,17 +42,40 @@ export function restateBindAddress(): RestateBindAddress {
   return { host, port };
 }
 
-export function createRestateEndpointHandler(services: RestateService[] = RESTATE_SERVICES) {
-  return createEndpointHandler({ services });
+let warnedUnsigned = false;
+
+/**
+ * Request-identity keys for the endpoint (AII-976): the sidecar's own key, else
+ * RESTATE_IDENTITY_KEY for an external server. With neither, the SDK accepts unsigned
+ * requests and the warning is logged once.
+ */
+export function resolveIdentityKeys(sidecarKey?: string, env: NodeJS.ProcessEnv = process.env): string[] | undefined {
+  const key = sidecarKey || env.RESTATE_IDENTITY_KEY?.trim();
+  if (key) return [key];
+  if (!warnedUnsigned) {
+    warnedUnsigned = true;
+    console.error("[restate] no request identity key — the endpoint accepts unsigned requests (loopback binding is the only control)");
+  }
+  return undefined;
+}
+
+export function createRestateEndpointHandler(
+  services: RestateService[] = RESTATE_SERVICES,
+  identityKeys?: string[],
+) {
+  return createEndpointHandler(identityKeys ? { services, identityKeys } : { services });
 }
 
 // Starts the SDK endpoint as an HTTP/2 server. Called from orchestrator boot
 // (src/index.ts) once the RestateSidecar reports readiness, then followed by register().
 export function startRestateEndpoint(
   services: RestateService[] = RESTATE_SERVICES,
+  sidecarIdentityKey?: string,
 ): Promise<http2.Http2Server> {
   const { host, port } = restateBindAddress();
-  const server = http2.createServer(createRestateEndpointHandler(services));
+  const server = http2.createServer(
+    createRestateEndpointHandler(services, resolveIdentityKeys(sidecarIdentityKey)),
+  );
   return new Promise((resolve, reject) => {
     server.once("error", reject);
     server.listen(port, host, () => resolve(server));
@@ -93,7 +116,7 @@ interface IntrospectionRow {
   [column: string]: unknown;
 }
 
-async function runIntrospectionQuery(
+export async function runIntrospectionQuery(
   fetchImpl: typeof fetch,
   adminBaseUrl: string,
   sql: string,
@@ -114,7 +137,7 @@ async function runIntrospectionQuery(
   return body.rows as IntrospectionRow[];
 }
 
-function sqlQuote(value: string): string {
+export function sqlQuote(value: string): string {
   return value.replace(/'/g, "''");
 }
 
@@ -135,8 +158,12 @@ function sqlQuote(value: string): string {
  * neither deployment ID yet. For that last case, `sys_service` maps its target service
  * to the deployment currently serving it. Count all three forms, scoped to deployments
  * registered at this URI. `status != 'completed'` covers every other
- * non-terminal state (pending, scheduled, ready, running, backing-off) with one comparison
- * rather than an enumerated allowlist. Persistent Virtual Object state lives in the separate
+ * non-terminal state (pending, ready, running, backing-off, suspended, paused) with one
+ * comparison rather than an enumerated allowlist. `scheduled` is deliberately excluded: it is
+ * a delayed send whose timer has not fired, so it has no journal and no pinned deployment, and
+ * when it fires it starts as a new invocation on whichever deployment then serves the service.
+ * Counting it would hold a deploy for the whole delay — `KgRepo.expire` is scheduled
+ * 4 h 10 min out on every refresh trigger (AII-1031). Persistent Virtual Object state lives in the separate
  * `state` table and never appears in `sys_invocation`, so it is never counted — durable state
  * alone is not active work (AII-721).
  *
@@ -157,7 +184,7 @@ export async function queryNonCompletedInvocations(
     const rows = await runIntrospectionQuery(
       fetchImpl,
       adminBaseUrl,
-      "SELECT COUNT(*) AS count FROM sys_invocation WHERE status != 'completed' AND (" +
+      "SELECT COUNT(*) AS count FROM sys_invocation WHERE status != 'completed' AND status != 'scheduled' AND (" +
         `pinned_deployment_id IN ${oldDeployments} OR ` +
         `last_attempt_deployment_id IN ${oldDeployments} OR ` +
         "(pinned_deployment_id IS NULL AND last_attempt_deployment_id IS NULL AND " +

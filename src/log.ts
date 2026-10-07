@@ -1,5 +1,6 @@
 import type { InvocationAttributionV1 } from "./pipeline/types.js";
 import { getDb } from "./dedup.js";
+import { getMappings } from "./config.js";
 import { markCommentGapfillRunTerminal, requeueGapfillAfterPushFailure } from "./comment-gapfill-queue.js";
 import { isFailureRecord, type FailureRecord } from "./pipeline/failure-classification.js";
 import { read as readAdmission, release as releaseAdmission } from "./dispatch-admission.js";
@@ -177,7 +178,9 @@ function ensureLogColumns(): void {
   // Migrate legacy rows: jobs that were never actually tracked by the run
   // monitor should show 'unknown', not a misleading terminal status.
   // Exclude fly-machines jobs — they use machine_id, not run_id.
-  db.exec("UPDATE dispatch_log SET status = 'unknown' WHERE run_id IS NULL AND status != 'unknown' AND (execution_mode IS NULL OR execution_mode = 'github-actions')");
+  // Only open rows are rewritten; closed rows (failed, completed, ...) keep
+  // their status and conclusion.
+  db.exec("UPDATE dispatch_log SET status = 'unknown' WHERE run_id IS NULL AND status IN ('dispatched', 'running') AND (execution_mode IS NULL OR execution_mode = 'github-actions')");
 
   // Fix data corruption: when multiple jobs share the same run_id, the
   // matching was wrong (findWorkflowRunId returned the same run for all).
@@ -190,6 +193,19 @@ function ensureLogColumns(): void {
         SELECT MIN(id) FROM dispatch_log WHERE run_id IS NOT NULL GROUP BY run_id
       )
   `);
+}
+
+/** Newest dispatch_log row id for a dispatch id, if any. */
+export function findLogIdByDispatchId(dispatchId: string): number | undefined {
+  const row = getDb()
+    .prepare("SELECT id FROM dispatch_log WHERE dispatch_id = ? ORDER BY id DESC LIMIT 1")
+    .get(dispatchId) as { id: number } | undefined;
+  return row?.id;
+}
+
+/** Idempotent on dispatchId: returns the existing row's id instead of inserting a duplicate. */
+export function appendLogIfAbsent(entry: Parameters<typeof appendLog>[0] & { dispatchId: string }): number {
+  return findLogIdByDispatchId(entry.dispatchId) ?? appendLog(entry);
 }
 
 export function appendLog(entry: {
@@ -565,17 +581,6 @@ export function getInFlightJobs(): Job[] {
   );
 }
 
-/** Returns all kg-refresh jobs in a non-terminal state (for the reaper's inverse sweep). */
-export function getInFlightKgRefreshJobs(): Job[] {
-  return mapRows(
-    getDb()
-      .prepare(
-        "SELECT * FROM dispatch_log WHERE phase = 'kg-refresh' AND status IN ('dispatched', 'running') ORDER BY dispatched_at ASC",
-      )
-      .all() as RawRow[],
-  );
-}
-
 export function getInFlightIssueIds(): Set<string> {
   const rows = getDb()
     .prepare(
@@ -695,26 +700,55 @@ export function getLatestDispatchForIssueIdentifier(owner: string, repo: string,
 }
 
 /**
- * Returns the latest identifier, title, and repo recorded in dispatch_log for a
- * given issue+phase, or null fields when no log entry exists. Used to enrich
- * parked-issue rows whose metadata lives only in dispatch_log.
+ * Returns the identifier, title, and repo for a parked issue, or null fields when
+ * no record exists. dispatch_log is pruned, so the lookup falls back: newest row
+ * for the issue+phase, newest row for the issue in any phase, then the dispatched
+ * table (repo mapped from its team_key when a mapping exists).
  */
 export function getIssueEnrichment(
   issueId: string,
   phase: string,
 ): { issueIdentifier: string | null; issueTitle: string | null; repo: string | null } {
-  const row = getDb()
-    .prepare(
-      `SELECT issue_identifier, issue_title, repo
-       FROM dispatch_log
-       WHERE issue_id = ? AND phase = ?
-       ORDER BY id DESC LIMIT 1`,
-    )
-    .get(issueId, phase) as
-    | { issue_identifier: string | null; issue_title: string | null; repo: string | null }
+  type LogRow = { issue_identifier: string | null; issue_title: string | null; repo: string | null };
+  const db = getDb();
+  const select = `SELECT issue_identifier, issue_title, repo FROM dispatch_log`;
+  const row =
+    (db.prepare(`${select} WHERE issue_id = ? AND phase = ? ORDER BY id DESC LIMIT 1`).get(issueId, phase) as
+      | LogRow
+      | undefined) ??
+    (db.prepare(`${select} WHERE issue_id = ? ORDER BY id DESC LIMIT 1`).get(issueId) as LogRow | undefined);
+  if (row?.issue_identifier) {
+    return {
+      issueIdentifier: row.issue_identifier,
+      issueTitle: row.issue_title ?? null,
+      repo: row.repo ?? null,
+    };
+  }
+
+  const dispatched = db
+    .prepare("SELECT issue_identifier, issue_title, team_key FROM dispatched WHERE issue_id = ?")
+    .get(issueId) as
+    | { issue_identifier: string | null; issue_title: string | null; team_key: string | null }
     | undefined;
+  if (dispatched?.issue_identifier) {
+    let repo: string | null = null;
+    if (dispatched.team_key) {
+      try {
+        const m = getMappings()[dispatched.team_key];
+        if (m) repo = `${m.owner}/${m.repo}`;
+      } catch {
+        // mappings table unavailable: leave the repo unknown
+      }
+    }
+    return {
+      issueIdentifier: dispatched.issue_identifier,
+      issueTitle: dispatched.issue_title ?? null,
+      repo: repo ?? row?.repo ?? null,
+    };
+  }
+
   return {
-    issueIdentifier: row?.issue_identifier ?? null,
+    issueIdentifier: null,
     issueTitle: row?.issue_title ?? null,
     repo: row?.repo ?? null,
   };
@@ -940,6 +974,14 @@ export function getStuckAttempts(issueId: string): number {
     .prepare("SELECT attempts FROM stuck_attempts WHERE issue_id = ?")
     .get(issueId) as { attempts: number } | undefined;
   return row?.attempts ?? 0;
+}
+
+/** When the latest stuck attempt for an issue was counted (epoch ms), or null if none. */
+export function getStuckAttemptStampedAt(issueId: string): number | null {
+  const row = getDb()
+    .prepare("SELECT last_attempt_at FROM stuck_attempts WHERE issue_id = ?")
+    .get(issueId) as { last_attempt_at: number | null } | undefined;
+  return row?.last_attempt_at ?? null;
 }
 
 /** Increments the stuck-attempt counter, stamps last_attempt_at, and returns the new count. */

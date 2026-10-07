@@ -68,7 +68,7 @@ interface PostPushReviewInputs extends Record<string, unknown> {
   pushedSha?: string;
 }
 
-type ExternalReviewState = "skipped" | "absent" | "running" | "completed" | "permission-denied";
+type ExternalReviewState = "skipped" | "absent" | "running" | "completed" | "permission-denied" | "no-real-verdict";
 type PostPushReviewTerminationReason =
   | "approved"
   | "pr_merged"
@@ -124,10 +124,12 @@ const CLAUDE_REVIEW_SUMMARY_ID = "claude-review-summary";
 // "claude-review", "claude code review", and "claude-code-review" cover repos running earlier
 // workflow versions. The heuristic fallback in isExternalReviewCheckName catches other variants.
 const DEFAULT_REVIEW_CHECK_NAMES = ["review", "code-review-plugin", "claude-review", "claude code review", "claude-code-review"];
-// Allowlist of check-run conclusions that represent a reviewer actually producing findings.
-// Anything outside this set — skipped, neutral, cancelled, timed_out, action_required, and any
-// future conclusion GitHub adds — routes to "no-real-verdict" and fails closed.
-const REAL_REVIEW_CONCLUSIONS = new Set(["success", "failure", "stale"]);
+// Allowlist of check-run conclusions that represent a reviewer actually producing a verdict.
+// "failure" is not one: the review-findings/v1 emitter fails its check only when it has no
+// verdict to post, and claude-code-action fails only when its run errors. Everything else —
+// failure, skipped, neutral, cancelled, timed_out, action_required, and any future conclusion
+// GitHub adds — routes to "no-real-verdict" and fails closed.
+const REAL_REVIEW_CONCLUSIONS = new Set(["success", "stale"]);
 
 async function refreshCredentialsBeforePush(
   context: PipelineContext,
@@ -523,6 +525,13 @@ function findingsUnavailableBlock(unavailable: boolean): string {
   return unavailable ? "\n\n⚠️ External review findings could not be parsed — verdict from reviewer summary only." : "";
 }
 
+/** Feedback for the "verdict unavailable" ending. No verdict comes first: the comment the reader found may predate the head. */
+function externalVerdictUnavailableFeedback(cause: { noVerdict: boolean; verdictBlocks: boolean }): string {
+  if (cause.noVerdict) return "External review check finished without a verdict the gate can read (see the PR's checks for its result); not auto-approving.";
+  if (cause.verdictBlocks) return "External review returned a structured verdict that blocks merge without machine-readable findings; not auto-approving.";
+  return "External review findings could not be parsed; not auto-approving.";
+}
+
 function internalReviewSummaryBlock(feedback: string): string {
   const summary = feedback.trim();
   if (!summary) return "";
@@ -720,9 +729,10 @@ function probeExternalReviewCheck(
  * - "completed": the external check finished with a real verdict — read findings and gate normally.
  * - "absent": no external review check exists for this SHA — fail open (repo has none). Settled
  *   only after two consecutive probes agree, since it is the one state that fails open.
- * - "running": the check is still in flight, concluded without a real verdict (cancelled, skipped,
- *   etc.) on two consecutive probes, or could not be read before the wait budget ran out — all
- *   three fail closed.
+ * - "running": the check is still in flight, or could not be read, when the wait budget runs
+ *   out — fails closed as a pending review.
+ * - "no-real-verdict": every matching check finished without a verdict (failed, cancelled, skipped,
+ *   etc.) on two consecutive probes — fails closed as an unavailable verdict.
  *
  * `headSha` is "" when the wait ended before the PR's head SHA could be resolved.
  */
@@ -804,7 +814,7 @@ async function waitForExternalReviewCompletion(
     // local to this code, and nothing fails if it stops holding — a cached verdict, an early
     // exit, or a cheap review model would quietly narrow the real protection to these 5s.
     if (observed === "absent" || observed === "no-real-verdict") {
-      if (pendingSettle === observed) return { state: observed === "absent" ? "absent" : "running", headSha };
+      if (pendingSettle === observed) return { state: observed, headSha };
       pendingSettle = observed;
     } else {
       pendingSettle = null;
@@ -2056,6 +2066,8 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         break;
       }
       const externalReviewPending = externalReviewState === "running";
+      // Findings read below may belong to an older head, so a check without a verdict never approves.
+      const externalReviewNoVerdict = externalReviewState === "no-real-verdict";
       const externalFindingsResult = externalReviewState === "skipped"
         ? { findings: [] as ReviewLedgerFinding[], findingsUnavailable: false }
         : collectExternalReviewFindingsFromGh(ghSpawn, prNumber);
@@ -2130,7 +2142,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       // external review check did not finish within the wait budget. Do not auto-approve
       // against a reviewer that is still in flight — defer to a human.
       const cleanInternalNoGatingFindings = verdict.approved === true && issues.length === 0 && gatingExternalFindings.length === 0;
-      const internalApprovable = cleanInternalNoGatingFindings && !findingsUnavailable && !externalReviewVerdictBlocks;
+      const internalApprovable = cleanInternalNoGatingFindings && !findingsUnavailable && !externalReviewVerdictBlocks && !externalReviewNoVerdict;
       if (gatingIncompleteReviews.length > 0) {
         terminationReason = selectedReviewerResult.terminationReason ?? "invalid_review";
         const lastFinding = reviewHistory.at(-1);
@@ -2207,11 +2219,9 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         break;
       }
 
-      if (cleanInternalNoGatingFindings && (findingsUnavailable || externalReviewVerdictBlocks)) {
+      if (cleanInternalNoGatingFindings && (findingsUnavailable || externalReviewVerdictBlocks || externalReviewNoVerdict)) {
         terminationReason = "invalid_review";
-        feedback = externalReviewVerdictBlocks
-          ? "External review returned a structured verdict that blocks merge without machine-readable findings; not auto-approving."
-          : "External review findings could not be parsed; not auto-approving.";
+        feedback = externalVerdictUnavailableFeedback({ noVerdict: externalReviewNoVerdict, verdictBlocks: externalReviewVerdictBlocks });
         await reporter.report({
           id: `post-push-review.${iteration}`,
           type: "custom",

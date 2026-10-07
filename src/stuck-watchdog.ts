@@ -270,12 +270,18 @@ export async function remediateFailedJob(
   provider: TicketingProvider | null,
   job: Job,
   lastRunStatus: string,
+  opts?: {
+    /** The `PlanningRun` workflow running the handling for the job it owns. A Legacy monitor leaves
+     *  this unset, because it must never re-arm a job that a workflow owns. */
+    ownerCall?: boolean;
+  },
 ): Promise<void> {
   if (!job.issueId) return;
   // kg-refresh jobs have their own outcome rail — never re-arm or clear dedup for them.
   if (job.phase === "kg-refresh") return;
-  // Restate finalizes its own attempts — never re-arm or clear dedup for them (AII-791).
-  if (isRestateOwnedJob(job)) return;
+  // Restate finalizes its own attempts — never re-arm or clear dedup for them (AII-791),
+  // unless the owner workflow itself asks for the handling.
+  if (!opts?.ownerCall && isRestateOwnedJob(job)) return;
   // Re-read conclusion from DB: the runner callback may have set "operator_cancelled"
   // after the monitor tick started reading the job, so the passed-in job may be stale.
   const freshConclusion = getJobById(job.id)?.conclusion;

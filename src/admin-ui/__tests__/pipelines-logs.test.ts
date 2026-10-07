@@ -1,6 +1,7 @@
 import { JSDOM } from "jsdom";
 import { describe, expect, it, vi } from "vitest";
 import { pipelinesHtml, pipelinesScript } from "../pages/pipelines.js";
+import { kgPipelinesHtml } from "../pages/kg-pipelines.js";
 import { localJobLogsHtml, localJobLogsScript } from "../local-job-logs.js";
 
 const job = {
@@ -68,6 +69,74 @@ describe("pipeline list log actions", () => {
       expect(button).not.toBeNull();
       button.click();
       await vi.waitFor(() => expect(api).toHaveBeenCalledWith("/api/jobs/396/logs"));
+    } finally { dom.window.close(); }
+  });
+});
+
+describe("dispatch log instances", () => {
+  const rows = [
+    { ...job, id: 1, issueId: "i1", phase: "implement", dispatchNumber: 2, status: "completed", machineId: undefined },
+    { ...job, id: 2, issueId: "i1", phase: "planning", dispatchNumber: 1, status: "completed", machineId: undefined },
+    { ...job, id: 3, issueId: "kg", phase: "kg-refresh", executionMode: "fly-machines", machineId: "kgm1", status: "running" },
+  ];
+
+  async function setupTwo() {
+    const dom = new JSDOM(pipelinesHtml + kgPipelinesHtml, { runScripts: "outside-only" });
+    const { window } = dom;
+    const api = vi.fn(async (url: string) => ({
+      ok: true, status: 200,
+      json: async () => url.startsWith("/api/log?") ? rows : {},
+    }));
+    window.api = api;
+    window.esc = window.escAttr = (value: unknown) => String(value ?? "").replace(/[&<>"']/g, c => `&#${c.charCodeAt(0)};`);
+    window.safeUrl = (value: string) => value;
+    window.isAdmin = () => true;
+    window.registerPage = vi.fn();
+    window.eval(pipelinesScript);
+    return { dom, window, api, document: window.document };
+  }
+
+  it("filters before grouping when a filter is given, and groups without one", async () => {
+    const { dom, window, document } = await setupTwo();
+    try {
+      await window.createDispatchLog("kglog", { filter: (e: { phase: string }) => e.phase === "kg-refresh" }).load();
+      const kgRows = document.querySelectorAll("#kglog-body tr");
+      expect(kgRows).toHaveLength(1);
+      expect(kgRows[0].querySelector(".badge")?.textContent).toBe("kg");
+      await window.loadLog();
+      expect(document.querySelectorAll("#log-body tr")).toHaveLength(2);
+    } finally { dom.window.close(); }
+  });
+
+  it("each instance writes only to its own elements", async () => {
+    const { dom, window, document } = await setupTwo();
+    try {
+      const kg = window.createDispatchLog("kglog", { filter: (e: { phase: string }) => e.phase === "kg-refresh" });
+      await kg.load();
+      expect(document.getElementById("log-body")?.children).toHaveLength(0);
+      expect(document.getElementById("log-count")?.textContent).toBe("—");
+      expect(document.getElementById("kglog-count")?.textContent).toContain("1 job");
+    } finally { dom.window.close(); }
+  });
+
+  it("Stop on an in-flight kg-refresh row confirms, then DELETEs the session", async () => {
+    const { dom, window, document, api } = await setupTwo();
+    try {
+      window.confirm = () => true;
+      const kg = window.createDispatchLog("kglog", { filter: (e: { phase: string }) => e.phase === "kg-refresh" });
+      await kg.load();
+      const stop = document.querySelector("#kglog-body [data-cancel-id]") as HTMLElement;
+      expect(document.querySelector("#kglog-body [data-machine-id]")).not.toBeNull();
+      stop.click();
+      await vi.waitFor(() => expect(api).toHaveBeenCalledWith("/api/sessions/kgm1", { method: "DELETE" }));
+    } finally { dom.window.close(); }
+  });
+
+  it("defaults both instances to a 7 day relative window, so /api/log gets since", async () => {
+    const { dom, window, api } = await setupTwo();
+    try {
+      await window.createDispatchLog("kglog").load();
+      expect(api.mock.calls[0][0]).toMatch(/^\/api\/log\?since=\d+$/);
     } finally { dom.window.close(); }
   });
 });

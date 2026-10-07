@@ -4,14 +4,42 @@
 
 This pilot moves **automatic GitHub Actions review-fix attempts** to Restate. The runner's internal review/fix cycles, local review-fix runs, and human comment-triggered gap-fill runs stay on their existing lifecycle. SQLite owns accepted feedback, finding versions, attempt snapshots, reservations, and final outcomes. Restate owns durable coordination and waits. A project defaults to Legacy; a change selects only future automatic attempts. An active attempt keeps its recorded owner. See [ADR 030](./adr/030-share-atomic-dispatch-admission-across-run-owners.md), [ADR 031](./adr/031-control-review-fix-attempts-with-restate.md), and [ADR 018](./adr/018-adopt-restate-one-run-kind-at-a-time.md).
 
-## Before enabling SAN
+## The switch also selects the planning lifecycle (AII-1021)
+
+The project's **Review-fix & Planning Lifecycle** switch (`reviewFixLifecycle`) also selects who owns a planning reservation. With `restate`, `dispatchPlanning` checks capacity without a reservation and submits `PlanningRun/{dispatchId}` through the loopback ingress. The workflow's `reserve` step takes the reservation (owner `restate:<dispatchId>`), launches the run, waits, and releases the reservation (at the latest at the planning deadline). `dispatchPlanning` never launches for such a project. With `legacy` or unset, the current path is unchanged on every backend. Implementation, gap-fill, and review-fix dispatch are not affected by this part of the switch.
+
+**What an operator sees for a pilot planning run.** The result is the same as for a Legacy planning run:
+
+- **Completion notice:** one notice when the run ends, from the `outcome` step.
+- **Failure comment:** a failed run gets the failure comment on the ticket.
+- **Breaker count:** one success or one failure is counted for each run, even when a step retries.
+- **No machine left:** the `cleanup` step removes the Fly machine or local container before the release. A cancel during the reserve or launch step is handled too: the escape path looks for a run the launch created, stops it, and releases the reservation (AII-1068).
+- **A stuck reservation:** list it with `list_dispatch_reservations` or the card on `/admin#deployments`, and release it with `release_dispatch_reservation` (AII-1069). A release without `force` needs a run confirmed ended by the backend; a terminal job row alone is refused.
+
+See [restate.md](restate.md#the-planning-run) and [the fenced Legacy functions](restate.md#the-owned-run-lifecycle-kit).
+
+- **Restate unavailable** (sidecar not `ready` or endpoint not `registered`): no reservation and no dispatch. The poll logs `[poll] Planning for <key> skipped: Restate unavailable` and the ticket stays queued for the next poll. The poll loop takes no reservation for planning (the `PlanningRun` workflow reserves in its first step), so a `submit` that answers `unavailable` leaves nothing to release. A `conflict` answer leaves the reservation to the existing workflow.
+- **Fly Machines and local Docker:** the save check still requires execution mode `github-actions`, so a pilot project reaches Fly or local planning only through the global runner mode (`/admin#runners` or `POST /api/runner-mode`). The `PlanningRun` input names the backend from the resolved execution path, and the same workflow owns the reservation there.
+- **Self-deploy drain:** a pilot planning run in flight counts as an active owner, so a drain waits for it (at most the planning deadline).
+- **Rollback:** set the project's switch to `legacy`. A run already submitted keeps its workflow owner until it releases.
+
+## Enable the lifecycle for a project
+
+Use these steps for any project. The save at `/admin#projects` refuses when a prerequisite is missing, and each refusal names the action.
+
+1. Set the project's execution mode to GitHub Actions.
+2. Use **Sync workflows** on the project. Merge the PR that the sync opens on the dispatch ref. The workflow file must declare `run_attempt_token` and `run_publication_token`.
+3. Check that the Restate sidecar is `ready` and the endpoint is `registered`. Read the `restate` field of `GET /` or of the `get_tenant_health` tool ([Health surfaces](restate.md#health-surfaces)).
+4. Save **Review-fix & Planning Lifecycle = Restate**.
+
+## Before enabling a project (SAN trial steps marked)
 
 1. Confirm the feature branch and all its child checks have landed in the deployment target. Use the [fault-coverage record](./restate-testing.md) to separate real-engine/SQLite evidence from mocked GitHub/tracker behavior. The container suite is a prerequisite, not a live recovery claim.
-2. On the Projects page, find the mapping for `BuildDownAI/AI-Implement-Sandbox` (`SAN`). Set the execution backend to GitHub Actions and the team capacity to **one**. Leave review-fix lifecycle at **Legacy** while preparing. Verify the target repository and dispatch ref; the workflow capability probe checks that ref, not merely the default branch.
+2. SAN only: on the Projects page, find the mapping for `BuildDownAI/AI-Implement-Sandbox` (`SAN`). Set the execution backend to GitHub Actions and the team capacity to **one**. Leave review-fix lifecycle at **Legacy** while preparing. Verify the target repository and dispatch ref; the workflow capability probe checks that ref, not merely the default branch.
 3. Use **Sync workflows** for SAN and merge the resulting workflow PR in the sandbox repository. Confirm the installed workflow and runner declare `run_attempt_token` and `run_publication_token` on the dispatch ref. The Projects save gate verifies these capabilities again.
-4. Drain all active competing Legacy executions that lack a shared admission reservation before first activation. Check Pipelines/Jobs and the capacity view; finish or explicitly cancel and **verify backend termination** for each. The enablement gate refuses activation while an unreserved Legacy worker is active. Do not invent reservations for old jobs or backfill a live attempt.
+4. Know the one refusal about running work. The save is refused only when a run in flight (not `kg-refresh`) has no active reservation. Each run that the current code dispatches takes a reservation, so this can occur only right after an upgrade from a version that had no reservation table. It ends by itself when those runs end. No manual drain is necessary: the refusal names the count, and you save again later. Do not invent reservations for old jobs or backfill a live attempt.
 5. Confirm the Restate sidecar is healthy and its endpoint registered. Check that the selected SAN PR has no active writer, no uncertain launch, and no unconfirmed stop. A green service check does not resolve one of those attempt states.
-6. Save SAN's **Review-fix lifecycle = Restate** on Projects. A rejected save is a preflight failure: read its explicit reason (execution mode, endpoint health, undrained Legacy worker, or missing installed workflow capability) and fix that prerequisite. Do not bypass it by editing SQLite.
+6. Save SAN's **Review-fix lifecycle = Restate** on Projects. A rejected save is a preflight failure: read its explicit reason (execution mode, endpoint health, a run in flight with no reservation, an unreadable workflow file, or a missing installed workflow capability) and fix that prerequisite. Do not bypass it by editing SQLite.
 
 After activation, use one SAN PR and one feedback delivery. Observe the attempt ID, immutable owner, SQLite reservation, exact GitHub run ID and attempt number, runner result, PR head, and finalizer decision in the job drawer and [live evaluation](https://linear.app/eudoxus/issue/AII-815/run-and-evaluate-the-san-review-fix-pilot). The first live trial must include a real restart/recovery window and a week of operating evidence before the next run-kind migration. Approval still requires a matching valid runner result, current authority, output commit matching the current PR head, finding dispositions, and the normal merge gates. GitHub success by itself cannot approve.
 
@@ -24,13 +52,17 @@ Open the PR's job drawer. Record the attempt ID, lifecycle owner, deadline, pend
 | Feedback pending while paused, parked, at capacity, or another writer occupies the PR | Keep it pending. Clear the specific policy or occupancy blocker; no runner, deadline, or budget entry should appear before admission. A human request may override park/budget, never capacity or occupancy. |
 | Prepared, no launch identity yet | Inspect the exact attempt. A prepared row holds the reservation and deadline. Do not start a second dispatch by hand. |
 | Launch definitely rejected | Confirm failure is recorded and the matching reservation is released. The budget entry remains history. |
-| Launch uncertain | Use **Reconcile** to search by attempt identity. An empty search is not proof that launch failed. After two minutes, an alert makes the held capacity visible; the alert does not authorize retry or release. |
+| Launch uncertain | Use **Reconcile** to search by attempt identity. An empty search is not proof that launch failed. After two minutes, an alert makes the held capacity visible; the alert does not authorize retry or release. Once the run is confirmed dead, release the row with `release_dispatch_reservation` (Release on `/admin#deployments`). |
 | A matching execution found but not bound | Verify installation, repository, PR, attempt token, run ID and run-attempt number, then use **Adopt**. A mismatched or unverified execution must not be adopted. |
 | Early, duplicate, conflicting, or stale result | Check the stored callback classification. Identical retries acknowledge the stored result; a conflict before finalization blocks approval and needs execution reconciliation/stop. A conflict after finalization alerts without changing the final outcome. Never edit the outcome to match a later callback. |
 | GitHub succeeded without a valid result | Wait until the persisted deadline and stop path. Do not approve from GitHub conclusion. |
 | Cancel, PR closure, or deadline | **Cancel attempt** revokes application authority first, then requests backend cancellation. Check the response: `partial` or `durable-accepted` is not proof of stop. Keep occupancy until the exact GitHub execution is confirmed terminal; then the owner finalizes and releases once. |
-| GitHub unreachable or termination unknown | Keep the reservation and show operator action required. Retry reconciliation/inspection after backend recovery. There is no force-release control. |
+| GitHub unreachable or termination unknown | Keep the reservation and show operator action required. Retry reconciliation/inspection after backend recovery. A reservation that stays held after its run is known dead is released with `release_dispatch_reservation` (Release on `/admin#deployments`); without `force` it refuses a Restate-owned row unless its job row is terminal, and `force` is an operator's claim that the run ended. The workflow's later release answers `not_owner` and ends. Never edit SQLite by hand. |
 | Finalized | Confirm the final outcome and release belong to this attempt. A delayed completion may clear the PR's active attempt only when IDs match. Newer or re-reported finding versions remain open. |
+
+## Credential transport at dispatch
+
+`GithubReviewFixWorker.launch` probes `resolveWorkflowCapabilities` for the exact owner, repo, workflow file and ref it dispatches, using the same installation token. Only a strict `supportsPrivateRunConfig === true` carries the result, progress and publication bearers in the trusted `run_config` credentials namespace (no top-level bearer inputs). An absent, old, or failed probe keeps the generic envelope plus masked top-level bearers. Work that requires protected transport (`requiresProtectedTransport`) returns `unknown` before dispatch instead of downgrading. `run_attempt_token` stays the public correlation marker on both paths, and the callback URL rides the envelope on both. Bearers are built only inside `launch`, never in the plan, scope store, or outcome.
 
 ## Failed webhook or callback delivery
 

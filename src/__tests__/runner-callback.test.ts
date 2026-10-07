@@ -242,67 +242,6 @@ describe("handleRunnerResult — validation", () => {
   });
 });
 
-describe("handleRunnerResult — kg-refresh forwarding (AII-632)", () => {
-  it("forwards guardVerdict and partTable to onKgRefreshRunnerComplete intact", async () => {
-    const { token } = runnerTokens.mintRunToken({
-      issueId: "kg-refresh",
-      mappingTeamKey: "KGA",
-      phase: "kg-refresh",
-      ttlSeconds: 4 * 60 * 60,
-      secret: SECRET,
-    });
-    const onKgRefreshRunnerComplete = vi.fn();
-    const partTable = [
-      { part: "issue.nt", prev: "100", new: "40" },
-      { part: "comment.nt", prev: "200", new: "199" },
-    ];
-    const res = await runnerCallback.handleRunnerResult({
-      authorization: `Bearer ${token}`,
-      body: {
-        phase: "kg-refresh",
-        outcome: "failure",
-        comments: [],
-        failureCode: "KG_SNAPSHOT_TRACKER_REGRESSION",
-        failureReason: "content regression detected",
-        guardVerdict: "refused",
-        partTable,
-      },
-      secret: SECRET,
-      resolveProvider: makeResolve(new FakeProvider()),
-      onKgRefreshRunnerComplete,
-    });
-    expect(res.status).toBe(200);
-    expect(onKgRefreshRunnerComplete).toHaveBeenCalledTimes(1);
-    expect(onKgRefreshRunnerComplete).toHaveBeenCalledWith(
-      "failure",
-      expect.objectContaining({ guardVerdict: "refused", partTable }),
-    );
-  });
-
-  it("forwards guardVerdict and partTable as undefined when the body omits them", async () => {
-    const { token } = runnerTokens.mintRunToken({
-      issueId: "kg-refresh",
-      mappingTeamKey: "KGA",
-      phase: "kg-refresh",
-      ttlSeconds: 4 * 60 * 60,
-      secret: SECRET,
-    });
-    const onKgRefreshRunnerComplete = vi.fn();
-    const res = await runnerCallback.handleRunnerResult({
-      authorization: `Bearer ${token}`,
-      body: { phase: "kg-refresh", outcome: "success", comments: [] },
-      secret: SECRET,
-      resolveProvider: makeResolve(new FakeProvider()),
-      onKgRefreshRunnerComplete,
-    });
-    expect(res.status).toBe(200);
-    expect(onKgRefreshRunnerComplete).toHaveBeenCalledTimes(1);
-    const [, data] = onKgRefreshRunnerComplete.mock.calls[0];
-    expect(data.guardVerdict).toBeUndefined();
-    expect(data.partTable).toBeUndefined();
-  });
-});
-
 describe("handleRunnerResult — mapping resolution", () => {
   it("returns 200 with mapping_deleted warning when provider resolution returns null", async () => {
     const { token } = runnerTokens.mintRunToken({
@@ -621,6 +560,67 @@ describe("handleRunnerResult — planning", () => {
 
     const held = dispatchAdmission.read(dispatchId);
     expect(held?.releasedAt).toBeNull();
+  });
+
+  // A planning failure callback also tells the termination hook, so a Restate-owned workflow gets its `report`.
+  describe("planning failure callback", () => {
+    function seedPlanningRun(lifecycleOwner: { kind: "legacy" } | { kind: "restate"; attemptId: string }) {
+      const { token, dispatchId } = runnerTokens.mintRunToken({
+        issueId: "i", mappingTeamKey: "ENG", phase: "planning", ttlSeconds: runnerTokens.PLANNING_TTL_SECONDS, secret: SECRET,
+      });
+      dispatchAdmission.acquire({
+        dispatchId, mappingKey: "ENG", scope: { kind: "issue", issueScope: "ENG", issueId: "i" }, kind: "planning",
+        backend: "github-actions", lifecycleOwner: lifecycleOwner.kind === "restate" ? { kind: "restate", attemptId: dispatchId } : lifecycleOwner, cap: 1,
+      });
+      log.appendLog({
+        issueId: "i", issueIdentifier: "ENG-1", issueTitle: "Plan it", teamKey: "ENG", repo: "o/r", dispatchId,
+        executionMode: "github-actions", phase: "planning",
+      });
+      return { token, dispatchId };
+    }
+
+    it("calls checkPlanningAdmissionTermination and, for a Restate-owned dispatch, writes the failed row it keeps", async () => {
+      const { token, dispatchId } = seedPlanningRun({ kind: "restate", attemptId: "x" });
+      const checkPlanningAdmissionTermination = vi.fn(async () => {});
+      const res = await runnerCallback.handleRunnerResult({
+        authorization: `Bearer ${token}`,
+        body: { phase: "planning", outcome: "failure", failureReason: "boom", failureCode: "PLAN_BOOM", comments: [] },
+        secret: SECRET,
+        resolveProvider: makeResolve(new FakeProvider({ recordCalls: true })),
+        checkPlanningAdmissionTermination,
+      });
+      expect(res.status).toBe(200);
+      expect(checkPlanningAdmissionTermination).toHaveBeenCalledWith(dispatchId);
+      expect(log.getJobByDispatchId(dispatchId)).toMatchObject({ status: "failed", conclusion: "PLAN_BOOM" });
+      // The backend may still be running: the reservation stays held for the workflow to release.
+      expect(dispatchAdmission.read(dispatchId)?.releasedAt).toBeNull();
+    });
+
+    it("leaves a Legacy dispatch unchanged: the row stays for its monitor and the hook is not called", async () => {
+      const { token, dispatchId } = seedPlanningRun({ kind: "legacy" });
+      const checkPlanningAdmissionTermination = vi.fn(async () => {});
+      await runnerCallback.handleRunnerResult({
+        authorization: `Bearer ${token}`,
+        body: { phase: "planning", outcome: "failure", failureReason: "boom", comments: [] },
+        secret: SECRET,
+        resolveProvider: makeResolve(new FakeProvider({ recordCalls: true })),
+        checkPlanningAdmissionTermination,
+      });
+      expect(checkPlanningAdmissionTermination).not.toHaveBeenCalled();
+      expect(log.getJobByDispatchId(dispatchId)?.status).not.toBe("failed");
+    });
+
+    it("does not fail the callback when the hook throws", async () => {
+      const { token } = seedPlanningRun({ kind: "restate", attemptId: "x" });
+      const res = await runnerCallback.handleRunnerResult({
+        authorization: `Bearer ${token}`,
+        body: { phase: "planning", outcome: "failure", failureReason: "boom", comments: [] },
+        secret: SECRET,
+        resolveProvider: makeResolve(new FakeProvider({ recordCalls: true })),
+        checkPlanningAdmissionTermination: async () => { throw new Error("network"); },
+      });
+      expect(res.status).toBe(200);
+    });
   });
 
   it("calls markPlanningFailed on failure", async () => {
@@ -1878,7 +1878,7 @@ describe("handleRunnerProgress", () => {
     const { token } = runnerTokens.mintRunToken({
       issueId: "i",
       mappingTeamKey: "ENG",
-      phase: "kg-refresh",
+      phase: "implementation",
       audience: "progress",
       dispatchId,
       ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
@@ -1901,6 +1901,111 @@ describe("handleRunnerProgress", () => {
     expect(res.status).toBe(200);
     expect(log.listLog().find((job) => job.id === jobId)?.runId).toBe(98765);
     expect(stepLog.getStepsByJobId(jobId)).toEqual([]);
+  });
+
+  describe("kg-refresh step reports", () => {
+    function kgToken() {
+      return runnerTokens.mintRunToken({
+        issueId: "kg",
+        phase: "kg-refresh",
+        audience: "progress",
+        secret: SECRET,
+        ttlSeconds: 600,
+        mappingTeamKey: "",
+      });
+    }
+    const kgStep = (extra: Record<string, unknown> = {}) => ({
+      id: "kg-ingest",
+      type: "custom",
+      status: "running",
+      started_at: "2026-10-07T00:00:00.000Z",
+      ended_at: null,
+      parent_step_id: null,
+      inputs: {},
+      outputs: {},
+      logs_url: null,
+      ...extra,
+    }) as never;
+
+    it("passes a validated step to the client", async () => {
+      const { token, dispatchId } = kgToken();
+      const kgRefreshClient = { progress: vi.fn(async () => ({ status: "accepted" })) };
+      const res = await runnerCallback.handleRunnerProgress({
+        authorization: `Bearer ${token}`,
+        body: { step: kgStep() },
+        secret: SECRET,
+        kgRefreshClient: kgRefreshClient as never,
+      });
+      expect(res.status).toBe(200);
+      expect(kgRefreshClient.progress).toHaveBeenCalledWith(dispatchId, expect.objectContaining({ id: "kg-ingest", status: "running" }));
+    });
+
+    it("calls the client with no step for a bare heartbeat", async () => {
+      const { token, dispatchId } = kgToken();
+      const kgRefreshClient = { progress: vi.fn(async () => ({ status: "accepted" })) };
+      const res = await runnerCallback.handleRunnerProgress({
+        authorization: `Bearer ${token}`,
+        body: {},
+        secret: SECRET,
+        kgRefreshClient: kgRefreshClient as never,
+      });
+      expect(res.status).toBe(200);
+      expect(kgRefreshClient.progress).toHaveBeenCalledWith(dispatchId);
+    });
+
+    it("answers 400 invalid_step_id for a malformed step", async () => {
+      const { token } = kgToken();
+      const kgRefreshClient = { progress: vi.fn(async () => ({ status: "accepted" })) };
+      const res = await runnerCallback.handleRunnerProgress({
+        authorization: `Bearer ${token}`,
+        body: { step: { id: 1 } } as never,
+        secret: SECRET,
+        kgRefreshClient: kgRefreshClient as never,
+      });
+      expect(res.status).toBe(400);
+      expect(res.body).toMatchObject({ error: "invalid_step_id" });
+      expect(kgRefreshClient.progress).not.toHaveBeenCalled();
+    });
+
+    it("redacts credentials before the client is called", async () => {
+      const { token } = kgToken();
+      const kgRefreshClient = { progress: vi.fn(async (..._args: unknown[]) => ({ status: "accepted" })) };
+      await runnerCallback.handleRunnerProgress({
+        authorization: `Bearer ${token}`,
+        body: { step: kgStep({ inputs: { githubToken: "ghs_secret", machineNonce: "n", repoOwner: "org" } }) },
+        secret: SECRET,
+        kgRefreshClient: kgRefreshClient as never,
+      });
+      const sent = kgRefreshClient.progress.mock.calls[0]![1];
+      expect(JSON.stringify(sent)).not.toContain("ghs_secret");
+      expect((sent as { inputs: unknown }).inputs).toEqual({ repoOwner: "org" });
+    });
+
+    it("contract: KgRefresh.progress — a real TokenStepReporter step post is accepted by the real handler", async () => {
+      const { token, dispatchId } = kgToken();
+      const kgRefreshClient = { progress: vi.fn(async () => ({ status: "accepted" })) };
+      const responses: Array<{ status: number }> = [];
+      const urls: string[] = [];
+      const fetchImpl = (async (url: string, init?: RequestInit) => {
+        urls.push(url);
+        const headers = init?.headers as Record<string, string>;
+        const res = await runnerCallback.handleRunnerProgress({
+          authorization: headers.Authorization,
+          body: JSON.parse(init?.body as string),
+          secret: SECRET,
+          kgRefreshClient: kgRefreshClient as never,
+        });
+        responses.push(res);
+        return new Response(JSON.stringify(res.body), { status: res.status });
+      }) as unknown as typeof fetch;
+
+      const { TokenStepReporter } = await import("../pipeline/reporter.js");
+      await new TokenStepReporter("http://orchestrator.test", token, { fetchImpl, retryDelaysMs: [] }).report(kgStep() as never);
+
+      expect(urls).toEqual(["http://orchestrator.test/runner/progress"]);
+      expect(responses.map((r) => r.status)).toEqual([200]);
+      expect(kgRefreshClient.progress).toHaveBeenCalledWith(dispatchId, expect.objectContaining({ id: "kg-ingest" }));
+    });
   });
 });
 

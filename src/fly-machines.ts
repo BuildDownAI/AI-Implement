@@ -1,5 +1,12 @@
 import crypto from "node:crypto";
 
+import {
+  DURABLE_RUNNER_DISPATCH_ID_KEY,
+  DURABLE_RUNNER_PIPELINE_KEY,
+  DURABLE_RUNNER_PURPOSE_KEY,
+  type DURABLE_RUNNER_PURPOSE_VALUE,
+} from "./durable-runner.js";
+
 // ── Types ────────────────────────────────────────────────────────────────────
 
 export interface MachineGuest {
@@ -38,6 +45,7 @@ export interface MachineConfig {
   restart?: { policy: string };
   metadata?: Record<string, string>;
   processes?: MachineProcess[];
+  init?: { entrypoint?: string[]; cmd?: string[] };
 }
 
 export interface MachineExitEvent {
@@ -76,9 +84,9 @@ export interface CreateMachineOpts {
 
 // ── API Helpers ──────────────────────────────────────────────────────────────
 
-const FLY_API_BASE = "https://api.machines.dev/v1";
+export const FLY_API_BASE = "https://api.machines.dev/v1";
 
-function flyHeaders(token: string): Record<string, string> {
+export function flyHeaders(token: string): Record<string, string> {
   return {
     Authorization: `Bearer ${token}`,
     "Content-Type": "application/json",
@@ -155,6 +163,58 @@ export async function stopMachine(
   }
 }
 
+export async function startMachine(
+  token: string,
+  appName: string,
+  machineId: string,
+): Promise<void> {
+  const url = `${FLY_API_BASE}/apps/${appName}/machines/${machineId}/start`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: flyHeaders(token),
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Failed to start machine ${machineId} (${res.status}): ${body}`);
+  }
+}
+
+/** Replaces the machine's config. Fly takes the whole config (no partial update), so pass a full one. */
+export async function updateMachine(
+  token: string,
+  appName: string,
+  machineId: string,
+  config: MachineConfig,
+): Promise<Machine> {
+  const url = `${FLY_API_BASE}/apps/${appName}/machines/${machineId}`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: flyHeaders(token),
+    body: JSON.stringify({ config }),
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Failed to update machine ${machineId} (${res.status}): ${body}`);
+  }
+
+  return (await res.json()) as Machine;
+}
+
+/**
+ * Reads the machine, then replaces its config with the same one and `env: {}`. Fly's update on a
+ * stopped machine applies the config without starting it (AII-1123), so this never calls `start`.
+ */
+export async function clearMachineEnv(
+  token: string,
+  appName: string,
+  machineId: string,
+): Promise<void> {
+  const machine = await getMachine(token, appName, machineId);
+  await updateMachine(token, appName, machineId, { ...machine.config, env: {} });
+}
+
 /**
  * Process exit code from a stopped machine's terminal event, or null when unreadable.
  * Verified against live Fly machines (2026-07):
@@ -170,6 +230,29 @@ export async function stopMachine(
 export function readMachineExitCode(machine: Machine): number | null {
   const exit = machine.events?.find((e) => e.request?.exit_event)?.request?.exit_event;
   return exit?.exit_code ?? exit?.guest_exit_code ?? null;
+}
+
+export interface MachineExit {
+  exitCode: number | null;
+  signal: number | null;
+  oomKilled: boolean | null;
+  timestamp: number | null;
+}
+
+/**
+ * Terminal exit details from the newest event carrying an exit_event (all null when none exists).
+ * Raw: Fly omits exit_code for a clean exit 0, so `exitCode: null` with an event present is a
+ * clean exit (see readMachineExitCode). Every field is optional-chained and degrades to null.
+ */
+export function readMachineExit(machine: Machine): MachineExit {
+  const event = machine.events?.find((e) => e.request?.exit_event);
+  const exit = event?.request?.exit_event;
+  return {
+    exitCode: exit?.exit_code ?? exit?.guest_exit_code ?? null,
+    signal: exit?.guest_signal ?? exit?.signal ?? null,
+    oomKilled: exit?.oom_killed ?? null,
+    timestamp: event?.timestamp ?? null,
+  };
 }
 
 export async function destroyMachine(
@@ -383,6 +466,8 @@ export interface SessionMachineInput {
   region?: string;
   cpus?: number;
   memoryMb?: number;
+  /** Defaults to "shared". */
+  cpuKind?: "shared" | "performance";
   teamKey?: string;
   teamSecretNames?: string[]; // full prefixed secret names from the Fly app (e.g. ["ENG_DATABASE_URL"])
   allTeamKeys?: string[]; // all known team keys across all mappings, used to identify foreign secrets
@@ -395,6 +480,13 @@ export interface SessionMachineInput {
   tenantId?: string; // client slug (e.g. "acme-corp"), stamped as tenant_id in metadata
   expectedTtlSeconds?: number; // expected machine lifetime in seconds, stamped in metadata for reaper
   extraEnv?: Record<string, string>; // per-mapping env vars injected last, overriding defaults
+  machineName?: string; // overrides the default `session-<issue key>` name
+  /** Stamped as `purpose` metadata; defaults to "session". "durable-runner" marks a machine a pipeline keeps between runs (the reaper skips it). */
+  purpose?: "session" | typeof DURABLE_RUNNER_PURPOSE_VALUE;
+  /** Stamped as `pipeline` metadata when set (e.g. "kg-refresh"). */
+  pipeline?: string;
+  /** Stamped as `dispatch_id` metadata when set; a retried dispatch step compares it to find its own run. */
+  dispatchId?: string;
 }
 
 export function buildSessionMachineConfig(input: SessionMachineInput): CreateMachineOpts {
@@ -436,14 +528,16 @@ export function buildSessionMachineConfig(input: SessionMachineInput): CreateMac
     image: input.image,
     env,
     guest: {
-      cpu_kind: "shared",
+      cpu_kind: input.cpuKind ?? "shared",
       cpus: input.cpus ?? 1,
       memory_mb: input.memoryMb ?? 1024,
     },
     auto_destroy: false,
     restart: { policy: "no" },
     metadata: {
-      purpose: "session",
+      [DURABLE_RUNNER_PURPOSE_KEY]: input.purpose ?? "session",
+      ...(input.pipeline ? { [DURABLE_RUNNER_PIPELINE_KEY]: input.pipeline } : {}),
+      ...(input.dispatchId ? { [DURABLE_RUNNER_DISPATCH_ID_KEY]: input.dispatchId } : {}),
       issue_id: input.issueId,
       issue_identifier: input.issueIdentifier,
       repo: `${input.owner}/${input.repo}`,
@@ -517,7 +611,7 @@ export function buildSessionMachineConfig(input: SessionMachineInput): CreateMac
   }
 
   return {
-    name: `session-${input.issueIdentifier.toLowerCase().replace(/[^a-z0-9-]/g, "-")}`,
+    name: input.machineName ?? `session-${input.issueIdentifier.toLowerCase().replace(/[^a-z0-9-]/g, "-")}`,
     region: input.region ?? "iad",
     min_secrets_version: input.minSecretsVersion,
     config: machineConfig,

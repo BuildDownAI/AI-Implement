@@ -1,10 +1,11 @@
 import { spawn } from "node:child_process";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { InvokeParams, LLMExecutor, LLMResult, RunTelemetry } from "./types.js";
-import { CodexStreamParser } from "./codex-stream.js";
+import { CodexStreamParser, redactSecrets } from "./codex-stream.js";
+import type { CodexProtocolDriver, CodexTransportResult } from "./codex-planning-adapter.js";
 import { classifyLlmResult, classifySpawnError, isLlmResultFailure, type FailureRecord } from "./failure-classification.js";
 import { computeBackoffMs } from "./retry-backoff.js";
 import { suspendOriginWriteCredential } from "./executor.js";
@@ -27,21 +28,58 @@ const CONFIG_REJECTION_RE =
  */
 export class CodexRecoveryRequiredError extends Error {
   readonly code = "CODEX_RECOVERY_REQUIRED";
-  readonly reason: "child_not_terminated" | "checkpoint_uncertain" | "held";
-  constructor(reason: "child_not_terminated" | "checkpoint_uncertain" | "held") {
+  readonly reason: "child_not_terminated" | "checkpoint_uncertain" | "auth_sync_failed" | "held";
+  /** For `auth_sync_failed`: the preserved trusted view that still holds the refreshed session. */
+  readonly viewRoot?: string;
+  constructor(reason: CodexRecoveryRequiredError["reason"], viewRoot?: string) {
     super(`Codex invocation requires recovery: ${reason}`);
     this.name = "CodexRecoveryRequiredError";
     this.reason = reason;
+    if (viewRoot) this.viewRoot = viewRoot;
+  }
+}
+
+/** Fixed-message rejection of a refreshed session; never carries file content. */
+class AuthSyncRejected extends Error {}
+
+function parseAuth(text: string): Record<string, unknown> | null {
+  try {
+    const parsed: unknown = JSON.parse(text);
+    return isObject(parsed) ? parsed : null;
+  } catch {
+    return null;
   }
 }
 
 /**
- * Planning needs read/search plus writes confined to `ai-output/comments`, with no generic command,
- * delegate or MCP surface. The pinned Codex CLI offers no verified way to enforce that: a filesystem
- * profile bounds writes only, and `unified_exec` cannot be disabled by config or `--disable`. Rather
- * than run planning with implementation write authority or an unproven profile, a Codex planning
- * selection is refused before any auth checkout or spawn. Enabling it needs a verified boundary
- * (a real-CLI probe of tool surface, symlink/.git rejection and network) outside the six-file seam.
+ * Account-identifying fields of an auth.json: API key, token account id and id_token subject. Null when
+ * none yields a nonempty stable identity, so two unknown identities can never compare equal.
+ */
+function authIdentity(auth: Record<string, unknown>): string | null {
+  const tokens = isObject(auth.tokens) ? auth.tokens : {};
+  const nonEmpty = (v: unknown): string | null => (typeof v === "string" && v.length > 0 ? v : null);
+  let subject: string | null = null;
+  if (typeof tokens.id_token === "string") {
+    const payload = tokens.id_token.split(".")[1];
+    if (payload) {
+      try {
+        const claims: unknown = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+        if (isObject(claims)) subject = nonEmpty(claims.sub);
+      } catch {
+        // an undecodable id_token carries no identity to compare
+      }
+    }
+  }
+  const parts = [nonEmpty(auth.OPENAI_API_KEY), nonEmpty(tokens.account_id), subject];
+  return parts.every((p) => p === null) ? null : JSON.stringify(parts);
+}
+
+/**
+ * Defense in depth. Planning has its own native argv and tool surface (app-server, read-only sandbox, host
+ * tools confined to `ai-output/comments`); `createStageExecutor` always supplies the protocol driver for it.
+ * An executor reached for planning without one would fall back to the exec path, whose filesystem profile
+ * bounds writes only and cannot disable `unified_exec`, so it throws before any auth checkout or spawn rather
+ * than run planning with implementation write authority.
  */
 export class CodexPlanningPolicyUnprovenError extends Error {
   readonly code = "CODEX_PLANNING_POLICY_UNPROVEN";
@@ -62,10 +100,28 @@ export interface CodexExecutorOptions {
   cancelSignal?: AbortSignal;
   spawnImpl?: typeof spawn;
   sleepImpl?: (ms: number) => Promise<void>;
+  /** Monotonic-enough clock for the invocation deadline; tests inject a deterministic one. */
+  nowImpl?: () => number;
   /** Bounded wait for exit after SIGTERM before escalating to SIGKILL. */
   termWaitMs?: number;
   /** Bounded wait for exit after SIGKILL before declaring the child unterminated. */
   killWaitMs?: number;
+  /**
+   * Optional native app-server transport (AII-1001). Absent = the default `codex exec` path, byte for
+   * byte. Present, the executor still owns auth, argv, spawn, timeout, cancel, termination and held
+   * recovery; the driver only speaks JSON-RPC over the child's stdio and returns a bounded result.
+   */
+  protocolDriver?: CodexProtocolDriver;
+}
+
+interface AppServerView {
+  root: string;
+  home: string;
+  /** Trusted empty HOME so user-level fallbacks (~/.codex, ~/.agents, skills, rules) cannot load. */
+  userHome: string;
+  cwd: string;
+  authSource: string | null;
+  initialAuth: string | null;
 }
 
 type StopReason = "timeout" | "cancel" | "stdin";
@@ -207,6 +263,7 @@ export class CodexExecutor implements LLMExecutor {
   private held: CodexRecoveryRequiredError | null = null;
   private readonly spawnImpl: typeof spawn;
   private readonly sleepImpl: (ms: number) => Promise<void>;
+  private readonly now: () => number;
 
   constructor(
     private readonly workspaceDir: string,
@@ -214,12 +271,15 @@ export class CodexExecutor implements LLMExecutor {
   ) {
     this.spawnImpl = options.spawnImpl ?? spawn;
     this.sleepImpl = options.sleepImpl ?? defaultSleep;
+    this.now = options.nowImpl ?? Date.now;
   }
 
   async invoke(params: InvokeParams): Promise<LLMResult> {
     if (this.held) throw new CodexRecoveryRequiredError("held");
-    if (params.agentStage === "planning") throw new CodexPlanningPolicyUnprovenError();
-    const startedAt = Date.now();
+    if (params.agentStage === "planning" && !this.options.protocolDriver) throw new CodexPlanningPolicyUnprovenError();
+    const startedAt = this.now();
+    // `invocationTimeoutMs` bounds the whole invocation (every attempt and backoff), not each spawn.
+    const deadlineAt = params.invocationTimeoutMs != null ? startedAt + params.invocationTimeoutMs : null;
     const expectsStructuredOutput = params.expectsStructuredOutput ?? false;
     const stage = params.stage ?? "unknown";
     let attempt = 1;
@@ -228,19 +288,24 @@ export class CodexExecutor implements LLMExecutor {
 
     for (;;) {
       let outcome: Attempt;
-      try {
-        outcome = await this.invokeOnce(params);
-      } catch (err) {
-        if (isSpawnFailure(err)) {
-          const failure = classifySpawnError(err, { stage, attempt });
-          const decision = this.retryDecision(params, failure, attempt, err.sawUnsafe, totalSleptMs);
-          if (!decision.retry) throw Object.assign(err, { failure });
-          totalSleptMs += decision.backoffMs;
-          await this.sleepImpl(decision.backoffMs);
-          attempt++;
-          continue;
+      // Recheck at loop entry before EVERY spawn: a backoff, scheduler delay or earlier attempt may have
+      // consumed the budget. An expired budget never reaches auth acquisition or spawn.
+      if (deadlineAt !== null && this.now() >= deadlineAt) {
+        outcome = expiredAttempt();
+      } else {
+        try {
+          outcome = await this.invokeOnce(params, deadlineAt);
+        } catch (err) {
+          if (isSpawnFailure(err)) {
+            const failure = classifySpawnError(err, { stage, attempt });
+            const decision = this.retryDecision(params, failure, attempt, err.sawUnsafe, totalSleptMs);
+            if (!decision.retry) throw Object.assign(err, { failure });
+            totalSleptMs += await this.boundedSleep(decision.backoffMs, deadlineAt);
+            attempt++;
+            continue;
+          }
+          throw err;
         }
-        throw err;
       }
 
       const merged = this.mergeTelemetry(carried, outcome.result.telemetry, startedAt);
@@ -264,10 +329,16 @@ export class CodexExecutor implements LLMExecutor {
       const failure = this.classify(settled, stage, attempt, expectsStructuredOutput);
       const decision = this.retryDecision(params, failure, attempt, outcome.sawUnsafe, totalSleptMs);
       if (!decision.retry) return { ...settled, failure };
-      totalSleptMs += decision.backoffMs;
-      await this.sleepImpl(decision.backoffMs);
+      totalSleptMs += await this.boundedSleep(decision.backoffMs, deadlineAt);
       attempt++;
     }
+  }
+
+  /** Sleeps at most the remaining invocation budget; returns the time actually requested. */
+  private async boundedSleep(backoffMs: number, deadlineAt: number | null): Promise<number> {
+    const ms = deadlineAt === null ? backoffMs : Math.max(0, Math.min(backoffMs, deadlineAt - this.now()));
+    await this.sleepImpl(ms);
+    return ms;
   }
 
   private classify(result: LLMResult, stage: string, attempt: number, expectsStructuredOutput: boolean): FailureRecord {
@@ -292,7 +363,7 @@ export class CodexExecutor implements LLMExecutor {
   }
 
   private stopFailure(kind: "timeout" | "cancel", result: LLMResult, stage: string, attempt: number, startedAt: number): FailureRecord {
-    const base = classifyLlmResult(result, { stage, attempt, expectsStructuredOutput: false, elapsedMs: Date.now() - startedAt });
+    const base = classifyLlmResult(result, { stage, attempt, expectsStructuredOutput: false, elapsedMs: this.now() - startedAt });
     if (kind === "timeout") {
       return { ...base, category: "crash", code: "INVOCATION_TIMEOUT", retryable: false, message: "Codex invocation exceeded its time limit" };
     }
@@ -318,7 +389,7 @@ export class CodexExecutor implements LLMExecutor {
 
   private mergeTelemetry(prev: RunTelemetry | undefined, latest: RunTelemetry | undefined, startedAt: number): RunTelemetry | undefined {
     if (!latest) return prev;
-    const durationMs = Date.now() - startedAt;
+    const durationMs = this.now() - startedAt;
     if (!prev) return { ...latest, durationMs };
     return {
       ...latest,
@@ -332,27 +403,29 @@ export class CodexExecutor implements LLMExecutor {
   }
 
   /** One spawn inside one `ModelAuthClient.invoke`, so authentication is checkpointed even on failure. */
-  private async invokeOnce(params: InvokeParams): Promise<Attempt> {
-    let signalUnterminated: (err: CodexRecoveryRequiredError) => void = () => {};
-    const unterminated = new Promise<never>((_, reject) => (signalUnterminated = reject));
+  private async invokeOnce(params: InvokeParams, deadlineAt: number | null): Promise<Attempt> {
+    let signalRecovery: (err: CodexRecoveryRequiredError) => void = () => {};
+    const recovery = new Promise<never>((_, reject) => (signalRecovery = reject));
     try {
-      // If the child cannot be proven dead the callback must never settle: a rejection would make the
-      // client read and persist session state a live child may still be writing, and mark the profile
-      // ready. The pending invoke keeps the profile "invoking" (no second invocation, no dispose), while
-      // the race below surfaces the recovery-required error to the caller.
+      // If the child cannot be proven dead, or its refreshed session could not be safely persisted, the
+      // callback must never settle: the client checkpoints on both return and throw, so settling would
+      // persist stale or foreign session state and mark the profile ready. The pending invoke keeps the
+      // profile "invoking" (no second invocation, no dispose), while the race below surfaces the
+      // recovery-required error to the caller.
       const invocation = this.options.auth.invoke(this.options.profileId, async (selected) => {
         try {
-          return await this.runChild(params, selected.env);
+          return await this.runChild(params, selected.env, deadlineAt);
         } catch (err) {
-          if (err instanceof CodexRecoveryRequiredError && err.reason === "child_not_terminated") {
-            signalUnterminated(err);
+          const held = this.held;
+          if (held && (held.reason === "child_not_terminated" || held.reason === "auth_sync_failed")) {
+            signalRecovery(held);
             return new Promise<Attempt>(() => {});
           }
           throw err;
         }
       });
       invocation.catch(() => {});
-      return await Promise.race([invocation, unterminated]);
+      return await Promise.race([invocation, recovery]);
     } catch (err) {
       const category = (err as { category?: unknown } | null)?.category;
       if (category === "checkpoint_uncertain" || category === "checkpoint_rejected") {
@@ -365,8 +438,7 @@ export class CodexExecutor implements LLMExecutor {
   /**
    * Sandbox argv from a trusted policy keyed on the fixed `agentStage` only, never on repository
    * config or caller-supplied flags. An absent stage keeps the legacy `builtinTools` mapping.
-   *   implementation -> workspace-write; review -> read-only.
-   * Planning has no policy here: see `CodexPlanningPolicyUnprovenError`, which refuses it earlier.
+   * Planning never reaches here: it runs on the app-server path with its own argv.
    */
   private sandboxArgs(params: InvokeParams): string[] {
     switch (params.agentStage) {
@@ -399,7 +471,140 @@ export class CodexExecutor implements LLMExecutor {
     return args;
   }
 
-  private async runChild(params: InvokeParams, env: Record<string, string>): Promise<Attempt> {
+  /** Trusted app-server argv. Nothing here is model- or repository-controlled; config comes only from argv. */
+  private buildAppServerArgs(params: InvokeParams): string[] {
+    // The pinned app-server accepts only --stdio/--strict-config/-c: no --ignore-* flags. Isolation comes
+    // from the executor-owned trusted CODEX_HOME and empty cwd (see createAppServerView); --strict-config
+    // only rejects unknown settings, it does not ignore configuration.
+    return [
+      "app-server",
+      "--strict-config",
+      "-c",
+      `model=${JSON.stringify(params.model)}`,
+      "-c",
+      `model_provider="${CODEX_PROVIDER}"`,
+      "-c",
+      'approval_policy="never"',
+      "-c",
+      'sandbox_mode="read-only"',
+      "-c",
+      "features.shell_tool=false",
+      "-c",
+      "features.view_image=false",
+      "-c",
+      "features.multi_agent=false",
+      "-c",
+      "features.goals=false",
+      "-c",
+      "features.unified_exec=false",
+      "-c",
+      'web_search="disabled"',
+    ];
+  }
+
+  /**
+   * Trusted per-invoke view for the app-server: a CODEX_HOME holding only our config.toml plus a copy of
+   * the SELECTED profile's auth.json, an empty HOME, and an empty protocol cwd. Nothing else from the selected home,
+   * the user home or the repository is visible to the child's config/rules/MCP loaders.
+   */
+  private createAppServerView(selectedHome: string | undefined, model: string, baseUrl?: string): AppServerView {
+    const root = mkdtempSync(join(tmpdir(), "codex-view-"));
+    const home = join(root, "home");
+    const cwd = join(root, "cwd");
+    const userHome = join(root, "user-home");
+    try {
+      return this.populateAppServerView({ root, home, cwd, userHome }, selectedHome, model, baseUrl);
+    } catch (err) {
+      // No child exists yet, so removing a half-built view cannot race a live process.
+      rmSync(root, { recursive: true, force: true });
+      throw err;
+    }
+  }
+
+  private populateAppServerView(
+    { root, home, cwd, userHome }: Pick<AppServerView, "root" | "home" | "cwd" | "userHome">,
+    selectedHome: string | undefined,
+    model: string,
+    baseUrl?: string,
+  ): AppServerView {
+    mkdirSync(home, { mode: 0o700 });
+    mkdirSync(userHome, { mode: 0o700 });
+    mkdirSync(cwd, { mode: 0o700 });
+    writeFileSync(
+      join(home, "config.toml"),
+      [
+        `model = ${JSON.stringify(model)}`,
+        `model_provider = "${CODEX_PROVIDER}"`,
+        'approval_policy = "never"',
+        'sandbox_mode = "read-only"',
+        // The only sanctioned provider redirect: the SELECTED invoke env's OPENAI_BASE_URL (trusted, set by
+        // the auth client or a synthetic test), never the selected home's or repository's config.
+        ...(baseUrl ? [`openai_base_url = ${JSON.stringify(baseUrl)}`] : []),
+        "",
+      ].join("\n"),
+      { mode: 0o600 },
+    );
+    let source: string | null = null;
+    let initial: string | null = null;
+    if (selectedHome) {
+      const candidate = join(selectedHome, "auth.json");
+      if (existsSync(candidate)) {
+        // Read once and write that exact text, so the baseline and the view cannot diverge. A malformed
+        // selected auth fails before any child exists: nothing could be refreshed or compared safely. The
+        // hold keeps the auth callback pending so the client cannot checkpoint over the selected profile.
+        initial = readFileSync(candidate, "utf8");
+        if (!parseAuth(initial)) {
+          this.held = new CodexRecoveryRequiredError("auth_sync_failed");
+          console.warn("[codex] selected auth.json is malformed; no child spawned; executor held for recovery");
+          throw this.held;
+        }
+        writeFileSync(join(home, "auth.json"), initial, { mode: 0o600 });
+        source = candidate;
+      }
+    }
+    return { root, home, userHome, cwd, authSource: source, initialAuth: initial };
+  }
+
+  /**
+   * Called only after the group is proven terminated. Persists a refreshed auth.json into the selected
+   * profile's home, never overwriting a file that changed underneath us and never for another account.
+   * Fail-closed: a missing, malformed, foreign-account or uncommittable refresh holds the executor and
+   * throws, leaving the view (the only copy of the refreshed session) in place for recovery. The caller
+   * must then keep the auth callback pending, because the client would checkpoint a stale session.
+   */
+  private syncAuthBack(view: AppServerView): void {
+    if (!view.authSource || view.initialAuth === null) return;
+    const tmp = `${view.authSource}.sync-${process.pid}`;
+    try {
+      const refreshed = readFileSync(join(view.home, "auth.json"), "utf8");
+      if (refreshed === view.initialAuth) return;
+      const next = parseAuth(refreshed);
+      const prev = parseAuth(view.initialAuth);
+      const nextId = next ? authIdentity(next) : null;
+      const prevId = prev ? authIdentity(prev) : null;
+      if (nextId === null || prevId === null || nextId !== prevId) throw new AuthSyncRejected("invalid_or_foreign_auth");
+      if (readFileSync(view.authSource, "utf8") !== view.initialAuth) throw new AuthSyncRejected("source_changed");
+      // "wx": a pre-existing file at the temp path is a collision, never silently overwritten.
+      writeFileSync(tmp, refreshed, { mode: 0o600, flag: "wx" });
+      renameSync(tmp, view.authSource);
+    } catch (err) {
+      try {
+        // On a collision the file at `tmp` is not ours to delete.
+        if ((err as NodeJS.ErrnoException)?.code !== "EEXIST") rmSync(tmp, { force: true });
+      } catch {
+        // best-effort: the temp file holds the same content as the preserved view
+      }
+      this.held = new CodexRecoveryRequiredError("auth_sync_failed", view.root);
+      // Class or errno code only: messages may carry paths or credential content.
+      const why = err instanceof AuthSyncRejected ? err.message : ((err as NodeJS.ErrnoException)?.code ?? "io_error");
+      console.warn(`[codex] auth sync-back failed (${why}); refreshed session preserved at ${view.root}; executor held for recovery`);
+      throw this.held;
+    }
+  }
+
+  private async runChild(params: InvokeParams, selectedEnv: Record<string, string>, deadlineAt: number | null): Promise<Attempt> {
+    let env = selectedEnv;
+    let view: AppServerView | null = null;
     let restoreOrigin: (() => void) | null = null;
     if (!this.options.allowRepositoryWrites) {
       try {
@@ -417,10 +622,22 @@ export class CodexExecutor implements LLMExecutor {
         schemaPath = join(schemaDir, "output-schema.json");
         writeFileSync(schemaPath, JSON.stringify(params.jsonSchema), { mode: 0o600 });
       }
-      return await this.spawnAndWait(params, this.buildArgs(params, schemaPath), env);
+      if (this.options.protocolDriver) {
+        view = this.createAppServerView(selectedEnv.CODEX_HOME, params.model, selectedEnv.OPENAI_BASE_URL);
+        env = { ...selectedEnv, CODEX_HOME: view.home, HOME: view.userHome };
+      }
+      const args = this.options.protocolDriver ? this.buildAppServerArgs(params) : this.buildArgs(params, schemaPath);
+      // Auth acquisition and view setup may have consumed the budget: never spawn with an expired timeout.
+      if (deadlineAt !== null && this.now() >= deadlineAt) return expiredAttempt();
+      const attempt = await this.spawnAndWait(params, args, env, view ?? undefined, selectedEnv.CODEX_HOME, deadlineAt);
+      // spawnAndWait throws rather than returning while a child may live; the explicit guard keeps that invariant local.
+      if (view && !this.held) this.syncAuthBack(view);
+      return attempt;
     } finally {
       if (schemaDir) rmSync(schemaDir, { recursive: true, force: true });
-      if (this.held) {
+      // The view stays in place while a child may live: its auth must not be synced or removed.
+      if (view && !this.held) rmSync(view.root, { recursive: true, force: true });
+      if (this.held?.reason === "child_not_terminated") {
         // A child that may still be alive must never regain the publication credential.
         console.log("[codex] origin left protected: child not confirmed terminated");
       } else {
@@ -437,10 +654,18 @@ export class CodexExecutor implements LLMExecutor {
     params: InvokeParams,
     args: string[],
     env: Record<string, string>,
+    view?: AppServerView,
+    selectedHome?: string,
+    deadlineAt: number | null = null,
   ): Promise<Attempt> {
     const termWaitMs = this.options.termWaitMs ?? DEFAULT_TERM_WAIT_MS;
     const killWaitMs = this.options.killWaitMs ?? DEFAULT_KILL_WAIT_MS;
     const parser = new CodexStreamParser();
+    const driver = this.options.protocolDriver;
+    const haltController = new AbortController();
+    let stderrText = "";
+    let transport: CodexTransportResult | null = null;
+    let driverRun: Promise<void> = Promise.resolve();
     const secrets = Object.entries(env)
       .filter(([k, v]) => /KEY|TOKEN|SECRET|PASSWORD|AUTH/i.test(k) && v.length >= 8)
       .map(([, v]) => v);
@@ -448,7 +673,7 @@ export class CodexExecutor implements LLMExecutor {
     let proc: ChildProcessWithoutNullStreams;
     try {
       proc = this.spawnImpl("codex", args, {
-        cwd: this.workspaceDir,
+        cwd: view ? view.cwd : this.workspaceDir,
         stdio: ["pipe", "pipe", "pipe"],
         env,
         // Own process group, so termination reaches every descendant the CLI forks.
@@ -477,12 +702,16 @@ export class CodexExecutor implements LLMExecutor {
     const requestStop = (r: StopReason): void => {
       if (st.reason) return;
       st.reason = r;
+      haltController.abort();
       st.terminating = terminate();
       wake();
     };
 
-    proc.stdout.on("data", (d: Buffer) => parser.push(d.toString()));
-    proc.stderr.on("data", (d: Buffer) => parser.pushStderr(d.toString()));
+    if (!driver) proc.stdout.on("data", (d: Buffer) => parser.push(d.toString()));
+    proc.stderr.on("data", (d: Buffer) => {
+      parser.pushStderr(d.toString());
+      if (driver && stderrText.length < 64_000) stderrText += d.toString().slice(0, 64_000 - stderrText.length);
+    });
     proc.on("close", (code, signal) => {
       st.closed = true;
       st.exit = { code, signal };
@@ -496,14 +725,62 @@ export class CodexExecutor implements LLMExecutor {
       wake();
     });
     proc.stdin.on("error", () => requestStop("stdin"));
-    try {
-      proc.stdin.end(params.prompt);
-    } catch {
-      requestStop("stdin");
+    let stopFlowDone = false;
+    if (driver) {
+      // The driver gets stream handles only: never the process, so it cannot signal, wait on or reap it.
+      const onDriverDone = (outcome: CodexTransportResult): void => {
+        transport = outcome;
+        if (stopFlowDone || st.reason) return;
+        if (outcome.stopReason) {
+          requestStop(outcome.stopReason);
+          return;
+        }
+        // A finished protocol exchange is not proof the group stopped: end stdin and run the same termination proof.
+        try {
+          proc.stdin.end();
+        } catch {
+          // best-effort
+        }
+        if (!st.terminating) {
+          st.terminating = terminate();
+          wake();
+        }
+      };
+      driverRun = driver
+        .run({
+          io: { stdin: proc.stdin, stdout: proc.stdout, halt: haltController.signal },
+          prompt: params.prompt,
+          model: params.model,
+          workspaceDir: this.workspaceDir,
+          ...(view ? { protocolCwd: view.cwd } : {}),
+          ...(params.jsonSchema ? { jsonSchema: params.jsonSchema } : {}),
+          forbiddenRoots: [env.CODEX_HOME, selectedHome, view?.root].filter((p): p is string => !!p),
+          redact: (text) => redactValues(text, secrets),
+        })
+        .then(onDriverDone, () => {
+          onDriverDone({
+            result: {
+              stdout: "",
+              stderr: "codex app-server transport: protocol_error",
+              exitCode: 1,
+              tokensUsed: 0,
+              terminalStatus: { subtype: "error", isError: true },
+              signal: null,
+            },
+            sawUnsafe: true,
+            stopReason: null,
+          });
+        });
+    } else {
+      try {
+        proc.stdin.end(params.prompt);
+      } catch {
+        requestStop("stdin");
+      }
     }
 
-    const timer =
-      params.invocationTimeoutMs != null ? setTimeout(() => requestStop("timeout"), params.invocationTimeoutMs) : null;
+    const timeoutMs = deadlineAt !== null ? Math.max(0, deadlineAt - this.now()) : params.invocationTimeoutMs;
+    const timer = timeoutMs != null ? setTimeout(() => requestStop("timeout"), timeoutMs) : null;
     const onAbort = (): void => requestStop("cancel");
     const signal = this.options.cancelSignal;
     if (signal?.aborted) requestStop("cancel");
@@ -520,6 +797,7 @@ export class CodexExecutor implements LLMExecutor {
         if (!stopped) stopped = await terminate();
       }
     } finally {
+      stopFlowDone = true;
       if (timer) clearTimeout(timer);
       signal?.removeEventListener("abort", onAbort);
     }
@@ -537,12 +815,33 @@ export class CodexExecutor implements LLMExecutor {
       throw this.held;
     }
 
-    parser.end();
-    const sawUnsafe = parser.sawUnsafeActivity;
-    if (st.spawnError && typeof proc.pid !== "number") {
-      throw spawnFailure(st.spawnError, sawUnsafe);
+    let sawUnsafe: boolean;
+    let result: LLMResult;
+    if (driver) {
+      haltController.abort();
+      await driverRun;
+      const outcome = transport as CodexTransportResult | null;
+      sawUnsafe = outcome?.sawUnsafe ?? true;
+      if (st.spawnError && typeof proc.pid !== "number") {
+        throw spawnFailure(st.spawnError, sawUnsafe);
+      }
+      // The child was stopped by the executor, so its exit status says nothing about the exchange.
+      const base: LLMResult = outcome?.result ?? {
+        stdout: "",
+        exitCode: 1,
+        tokensUsed: 0,
+        terminalStatus: { subtype: "error", isError: true },
+      };
+      const stderr = [base.stderr ?? "", redactSecrets(stderrText)].filter(Boolean).join("\n");
+      result = { ...base, stderr, signal: null };
+    } else {
+      parser.end();
+      sawUnsafe = parser.sawUnsafeActivity;
+      if (st.spawnError && typeof proc.pid !== "number") {
+        throw spawnFailure(st.spawnError, sawUnsafe);
+      }
+      result = parser.toResult({ exitCode: st.exit.code ?? 1, signal: st.exit.signal ?? null });
     }
-    const result = parser.toResult({ exitCode: st.exit.code ?? 1, signal: st.exit.signal ?? null });
     if (st.reason === "stdin" && !this.isDefinitiveRejection(result, params)) {
       // The prompt never reached the CLI intact; surface it through the spawn rail (EPIPE is transient).
       throw spawnFailure(Object.assign(new Error("codex stdin closed before the prompt was delivered"), { code: "EPIPE" }), sawUnsafe);
@@ -559,6 +858,22 @@ export class CodexExecutor implements LLMExecutor {
     const stop = st.reason === "timeout" || st.reason === "cancel" ? st.reason : null;
     return { result: clean, sawUnsafe, stop };
   }
+}
+
+/** A stop-by-timeout attempt for a budget that expired before any child was spawned. */
+function expiredAttempt(): Attempt {
+  return {
+    result: {
+      stdout: "",
+      stderr: "",
+      exitCode: 1,
+      tokensUsed: 0,
+      terminalStatus: { subtype: "error", isError: true },
+      signal: null,
+    },
+    sawUnsafe: false,
+    stop: "timeout",
+  };
 }
 
 function spawnFailure(err: unknown, sawUnsafe = false): SpawnFailure {

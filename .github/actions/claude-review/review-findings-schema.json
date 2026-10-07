@@ -1,16 +1,12 @@
 {
   "type": "object",
   "additionalProperties": false,
-  "required": ["verdict", "summary", "findings"],
+  "required": ["verdict", "findings", "summary"],
   "properties": {
     "verdict": {
       "type": "string",
       "enum": ["approve", "changes_requested", "incomplete"],
       "description": "Overall merge-readiness verdict. Use changes_requested when the PR should not merge yet; use incomplete when no trustworthy verdict can be reached."
-    },
-    "summary": {
-      "type": "string",
-      "description": "Free-text reviewer summary. Presentation only — carried into the posted comment verbatim, never parsed by the gate."
     },
     "findings": {
       "type": "array",
@@ -40,6 +36,10 @@
           }
         }
       }
+    },
+    "summary": {
+      "type": "string",
+      "description": "Free-text reviewer summary. Presentation only — carried into the posted comment verbatim, never parsed by the gate."
     }
   }
 }

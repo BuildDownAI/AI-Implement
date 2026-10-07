@@ -329,7 +329,7 @@ export const stepperHtml = `
           <div class="field">
             <label class="field-label">Job Timeout (min) <span style="font-weight:400;color:var(--fg-tertiary)">(optional)</span></label>
             <input class="input" type="number" id="np-maxJobMinutes" min="1" step="1" placeholder="90">
-            <div class="field-hint">GitHub Actions only. Blank = 90.</div>
+            <div class="field-hint">Applies to every execution mode (GitHub Actions, Fly, local Docker). Blank = 90.</div>
           </div>
         </div>
       </div>

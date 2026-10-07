@@ -9,7 +9,8 @@ import * as restate from "@restatedev/restate-sdk";
 import { RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
 import { z } from "zod";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { orchestratorTools, tool, type ToolResponse } from "../../restate/tools.js";
+import { orchestratorTools, tool, setReviewFixAttemptsFacade, type ToolResponse } from "../../restate/tools.js";
+import type { ReviewFixAttemptsFacade, ReviewFixAttemptDetail } from "../../admin.js";
 import * as dedup from "../../dedup.js";
 import { initLogTable } from "../../log.js";
 import { initMappingsTable, getMappings } from "../../config.js";
@@ -228,6 +229,89 @@ describe("orchestratorTools (Restate)", () => {
 
       expect(body?.isError).toBeFalsy();
       expect(body?.content?.[0]?.text).toBe("done");
+    },
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "privileged attempt reads preserve fresh state and activity cursors over ingress (%s)",
+    async (label) => {
+      const env = environments.get(label);
+      if (!env) throw new Error(`environment "${label}" did not start`);
+      let reads = 0;
+      const detail: ReviewFixAttemptDetail = {
+        attemptId: "exact-attempt", owner: { kind: "restate", attemptId: "exact-attempt" },
+        execution: { githubRunId: "123", githubRunAttempt: 2 }, deadlineAt: 42,
+        pendingFeedback: true, snapshot: null, state: "running", evidenceComplete: false,
+        terminationConfirmed: false, cycles: [],
+      };
+      const calls: unknown[] = [];
+      const facade: Pick<ReviewFixAttemptsFacade, "getAttempt" | "getActivity"> = {
+        async getAttempt(id, caller) {
+          calls.push({ id, caller });
+          reads += 1;
+          return { status: "ok", attempt: { ...detail, terminationConfirmed: reads > 1 } };
+        },
+        async getActivity(id, opts, caller) {
+          calls.push({ id, opts, caller });
+          return { status: "ok", page: { events: [],
+            nextCursor: { producerId: "worker", sequence: 4 }, truncated: true } };
+        },
+      };
+      setReviewFixAttemptsFacade(facade);
+      try {
+        for (const name of ["get_review_fix_attempt", "get_review_fix_activity"]) {
+          const denied = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", name, {
+            caller: { kind: "human", email: "reader@example.com", role: "user" },
+            args: { attemptId: "exact-attempt" },
+          });
+          expect(denied.isError).toBe(true);
+          expect(denied.content?.[0]?.text).toBe(`forbidden: ${name} requires the admin role`);
+        }
+        for (const args of [
+          { attemptId: "" },
+          { attemptId: "a".repeat(129) },
+          { attemptId: "../attempt" },
+          { attemptId: "exact-attempt", cursor: { producerId: "p".repeat(129), sequence: 0 } },
+          { attemptId: "exact-attempt", cursor: { producerId: "../worker", sequence: 0 } },
+          { attemptId: "exact-attempt", pageSize: 501 },
+          { attemptId: "exact-attempt", cursor: { producerId: "worker", sequence: -1 } },
+        ]) {
+          const invalid = await fetch(`${env.baseUrl()}/orchestratorTools/get_review_fix_activity`, {
+            method: "POST", headers: { "content-type": "application/json" },
+            body: JSON.stringify({ caller: SYSTEM, args }),
+          });
+          expect(invalid.status).toBe(400);
+          await invalid.arrayBuffer();
+        }
+        expect(calls).toEqual([]);
+        const first = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", "get_review_fix_attempt", {
+          caller: SYSTEM, args: { attemptId: "exact-attempt" },
+        });
+        expect(JSON.parse(first.content?.[0]?.text ?? "null")).toEqual({ status: "ok", attempt: detail });
+        const second = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", "get_review_fix_attempt", {
+          caller: SYSTEM, args: { attemptId: "exact-attempt" },
+        });
+        expect(JSON.parse(second.content?.[0]?.text ?? "null").attempt.terminationConfirmed).toBe(true);
+        const cursor = { producerId: "worker", sequence: 3 };
+        const activity = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", "get_review_fix_activity", {
+          caller: SYSTEM, args: { attemptId: "exact-attempt", pageSize: 2, cursor },
+        });
+        expect(JSON.parse(activity.content?.[0]?.text ?? "null")).toEqual({ status: "ok", page: {
+          events: [], nextCursor: { producerId: "worker", sequence: 4 }, truncated: true,
+        } });
+        expect(calls).toContainEqual({ id: "exact-attempt", opts: { pageSize: 2, cursor },
+          caller: { role: "admin", email: null } });
+        const response = await fetch(`${env.adminAPIBaseUrl()}/services/orchestratorTools`);
+        expect(response.ok).toBe(true);
+        const catalog = await response.json() as { handlers: Array<{ name: string; metadata?: Record<string, string> }> };
+        for (const name of ["get_review_fix_attempt", "get_review_fix_activity"]) {
+          expect(catalog.handlers.find((h) => h.name === name)?.metadata).toMatchObject({
+            "mcp.type": "tool", "mcp.role": "admin",
+          });
+        }
+      } finally {
+        setReviewFixAttemptsFacade(null);
+      }
     },
   );
 

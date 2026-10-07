@@ -8,6 +8,7 @@ import {
   type ClaudeInvokeOptions,
 } from "./executor.js";
 import { CodexExecutor, type CodexExecutorOptions } from "./codex-executor.js";
+import { createCodexPlanningDriver } from "./codex-planning-adapter.js";
 import {
   sanitizeAttribution,
   type InvocationAttributionV1,
@@ -80,19 +81,24 @@ export function createStageExecutor(options: StageExecutorOptions): LLMExecutor 
         undefined,
         options.activityReporting,
       ));
-  const getCodex = (profileId: string): LLMExecutor => {
-    let ex = codexByProfile.get(profileId);
+  // Planning has its own Codex executor and argv: the native app-server path (read-only sandbox, shell and
+  // unified exec disabled, repo_read/repo_search/comments_write host tools confined to ai-output/comments).
+  // Implementation and review keep the `codex exec` path with their own sandbox. Cached per profile and kind.
+  const getCodex = (profileId: string, stage: StageName): LLMExecutor => {
+    const key = `${stage === "planning" ? "planning" : "exec"}:${profileId}`;
+    let ex = codexByProfile.get(key);
     if (!ex) {
       ex =
         options.createCodex?.(profileId) ??
         new CodexExecutor(options.workspaceDir, {
           ...options.codexOptions,
+          ...(stage === "planning" ? { protocolDriver: options.codexOptions?.protocolDriver ?? createCodexPlanningDriver() } : { protocolDriver: undefined }),
           auth,
           profileId,
           allowRepositoryWrites: options.allowRepositoryWrites,
           cancelSignal: options.cancelSignal,
         });
-      codexByProfile.set(profileId, ex);
+      codexByProfile.set(key, ex);
     }
     return ex;
   };
@@ -103,8 +109,12 @@ export function createStageExecutor(options: StageExecutorOptions): LLMExecutor 
       const selection = snapshot.stages[stage];
       const profile = snapshot.profiles[stage];
       const invocationId = `${stage}-${randomUUID()}`;
+      // Validate the static projection before any auth acquisition or spawn: a rejected model, id or limit
+      // fails closed with a fixed message and never reaches a child or a result.
+      const base = sanitizeAttribution(staticAttribution(snapshot, stage, selection, profile, invocationId, limitFor(selection, params)));
+      if (!base) throw new AgentStageError("The stage selection cannot be attributed safely; refusing to run it");
       const attribute = (outcomeHint: InvocationAttributionV1["outcome"], telemetry?: RunTelemetry): InvocationAttributionV1 =>
-        buildAttribution(snapshot, stage, selection, profile, invocationId, limitFor(selection, params), outcomeHint, telemetry);
+        withOutcome(base, outcomeHint, telemetry);
 
       // Snapshot values always win; caller and repository model/timeout values are discarded.
       const call: InvokeParams = { ...params, model: selection.model, invocationTimeoutMs: selection.invocationTimeoutMs };
@@ -115,7 +125,7 @@ export function createStageExecutor(options: StageExecutorOptions): LLMExecutor 
         const result =
           selection.agent === "claude"
             ? await auth.invoke(selection.accountProfileId, (selected) => getClaude().invoke(call, { env: selected.env }))
-            : await getCodex(selection.accountProfileId).invoke(call);
+            : await getCodex(selection.accountProfileId, stage).invoke(call);
         return withAttribution(result, attribute(result.failure ? "error" : "success", result.telemetry));
       } catch (err) {
         if (err instanceof Error || (typeof err === "object" && err !== null)) {
@@ -140,21 +150,15 @@ function limitFor(selection: StageSelection, params: InvokeParams): InvocationAt
   return params.maxTurns != null ? { kind: "max_turns", value: params.maxTurns } : null;
 }
 
-function buildAttribution(
+function staticAttribution(
   snapshot: ResolvedAgentSnapshotV1,
   stage: StageName,
   selection: StageSelection,
   profile: ResolvedAgentSnapshotV1["profiles"][StageName],
   invocationId: string,
   limit: InvocationAttributionV1["limit"],
-  outcomeHint: InvocationAttributionV1["outcome"],
-  telemetry?: RunTelemetry,
 ): InvocationAttributionV1 {
-  const tokensIn = telemetry?.tokensIn ?? null;
-  const tokensOut = telemetry?.tokensOut ?? null;
-  const costUsd = telemetry?.costUsd ?? null;
-  const present = (tokensIn !== null ? 1 : 0) + (tokensOut !== null ? 1 : 0);
-  const attribution: InvocationAttributionV1 = {
+  return {
     version: 1,
     invocationId,
     stage,
@@ -165,6 +169,23 @@ function buildAttribution(
     profileId: profile.id,
     authMode: profile.authMode,
     limit,
+    outcome: "unknown",
+    usage: null,
+  };
+}
+
+/** Adds outcome and usage to an already-validated static projection; unusable usage is stripped, nothing else changes. */
+function withOutcome(
+  base: InvocationAttributionV1,
+  outcomeHint: InvocationAttributionV1["outcome"],
+  telemetry?: RunTelemetry,
+): InvocationAttributionV1 {
+  const tokensIn = telemetry?.tokensIn ?? null;
+  const tokensOut = telemetry?.tokensOut ?? null;
+  const costUsd = telemetry?.costUsd ?? null;
+  const present = (tokensIn !== null ? 1 : 0) + (tokensOut !== null ? 1 : 0);
+  const full: InvocationAttributionV1 = {
+    ...base,
     outcome: telemetry && !(outcomeHint === "error" && telemetry.outcome === "success") ? telemetry.outcome : outcomeHint,
     usage: telemetry
       ? {
@@ -176,8 +197,7 @@ function buildAttribution(
         }
       : null,
   };
-  // Fail safe to a minimal, still-valid projection rather than carrying a rejected value.
-  return sanitizeAttribution(attribution) ?? { ...attribution, usage: null };
+  return sanitizeAttribution(full) ?? { ...base, outcome: outcomeHint, usage: null };
 }
 
 function withAttribution(result: LLMResult, attribution: InvocationAttributionV1): LLMResult {

@@ -54,6 +54,14 @@ The KG is served by the testing orchestrator's `/mcp` (`https://ai-implement-tes
 Project-specific orchestrator instances can override the bundled graph with `KG_SOURCE_REPO=owner/repo`.
 The value is a GitHub repo identifier, not a URL; see `docs/kg-sidecar.md`.
 
+## Standing rules
+
+Three operator rules apply to every plan, issue, ADR, review, and change. **Full reference: [docs/standing-rules.md](docs/standing-rules.md).**
+
+1. Verify each claim in code, or by an experiment against the pinned version, before you present it. A theory is not a finding.
+2. Prefer the design that needs no new GitHub or GitHub Actions right: runner image or orchestrator first, then a `run_config` field, then a template change, then an App permission last.
+3. As Restate use grows, re-check an ADR's rule and its rejection reasons before you rely on them; amend the ADR when a reason no longer holds.
+
 ## Architecture
 
 ```
@@ -95,7 +103,8 @@ Entry points for areas that are easy to miss. Each names the module to start fro
 | Deploying, clients, Bedrock | `src/deploy.ts` and its `deploy-*` siblings | [docs/deployment.md](docs/deployment.md) |
 | Ticketing provider abstraction | `src/providers/` — `linear.ts`, `jira.ts`, `registry.ts` | [docs/ticketing-providers.md](docs/ticketing-providers.md) |
 | Jira base branch (per-issue PR target) | `src/base-branch.ts` | [docs/jira-base-branch.md](docs/jira-base-branch.md) |
-| Execution backends | `src/fly-machines.ts`, `src/local-docker.ts`, `src/github.ts` | |
+| Execution backends | `src/fly-machines.ts`, `src/local-docker.ts`, `src/github.ts` | [docs/fly-machine-lifecycle.md](docs/fly-machine-lifecycle.md) |
+| Durable runner (kept Fly machine per pipeline) | `src/restate/fly-machine-profile.ts` | [docs/fly-machine-lifecycle.md](docs/fly-machine-lifecycle.md), [ADR 037](docs/adr/037-a-durable-runner-is-a-profile-object-that-owns-one-kept-machine.md) |
 | Runner callbacks and tokens | `src/runner-callback.ts`, `src/runner-token.ts`, `src/token-vending.ts` | [docs/runner-callbacks.md](docs/runner-callbacks.md) |
 | Merge reconciliation | `src/reconciliation.ts`, `src/reconcile-merged.ts`, `src/poll-merged-prs.ts` | |
 | Workflow sync to target repos | `src/workflow-sync.ts`, `src/workflow-sync-queue.ts` | [docs/workflow-sync.md](docs/workflow-sync.md) |
@@ -105,7 +114,7 @@ Entry points for areas that are easy to miss. Each names the module to start fro
 | Run classification and autopsy | `src/completion-classification.ts`, `src/run-autopsy.ts` | |
 | Admin SSO / OIDC, roles, page grants | `src/oauth/`, `src/admin-session.ts`, `src/access-entries.ts`, `src/access-page-grants.ts` | [docs/access-model.md](docs/access-model.md) |
 | Admin SPA | `src/admin-ui/` | |
-| Restate engine: sidecar, endpoint, workflows, testcontainers job | `src/restate/endpoint.ts`, `src/restate/` | [docs/restate.md](docs/restate.md), [docs/restate-testing.md](docs/restate-testing.md) |
+| Restate engine: sidecar, endpoint, workflows, testcontainers job | `src/restate/endpoint.ts`, `src/restate/planning-run-workflow.ts`, `src/restate/` | [docs/restate.md](docs/restate.md), [docs/restate-testing.md](docs/restate-testing.md) |
 
 **Diagram convention:** flow diagrams in `docs/`, issue bodies, and PR descriptions are mermaid (validated with `mermaid-cli` before commit); tabular data is a table; ASCII only in this file. Full rule: [docs/README.md](docs/README.md).
 
@@ -241,7 +250,7 @@ Editable per mapping; blank means the default.
 |---|---|---|
 | Max Turns | `50` | Claude turns per implement pass |
 | Max Iterations | bedrock `2`, anthropic `3` | implement/review cycles |
-| Job Timeout (min) | `90` | GHA only |
+| Job Timeout (min) | `90` | All execution modes; the monitor times a Fly or local-docker run out at this limit |
 | Branch Prefix | none | Path segment prepended to the implementation branch |
 | Sensitive Add / Allow Globs | none | Extends or un-blocks the push step's blocklist; **allow always wins** |
 | Dependency Token Scope | off | `installation` lets the run read private sibling repos during dependency install |

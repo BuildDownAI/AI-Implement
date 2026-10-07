@@ -19,6 +19,7 @@
 import type Database from "better-sqlite3";
 import { getDb } from "./dedup.js";
 import type { DispatchKind } from "./dispatch-gate.js";
+import { getJobByDispatchId, type Job } from "./log.js";
 
 /** Matches `dispatch-gate.ts`'s PR_BUDGET_WINDOW_MS — kept local since that module
  *  does not export its constant, and this table's budget entries are a distinct
@@ -433,6 +434,111 @@ export function releaseByDispatchId(
   return release(record.dispatchId, record.lifecycleOwner, record.generation, reason);
 }
 
+/** One held (unreleased) reservation as an operator sees it, joined to its job row. */
+export interface HeldReservation {
+  readonly dispatchId: string;
+  readonly team: string;
+  readonly issueId: string;
+  readonly issueIdentifier: string | null;
+  readonly phase: DispatchAdmissionKind;
+  readonly backend: DispatchAdmissionBackend;
+  readonly lifecycleOwner: string;
+  readonly ageMs: number;
+  readonly jobStatus: string | null;
+  readonly jobConclusion: string | null;
+}
+
+/** Every unreleased `dispatch_admissions` row, oldest first — the rows `getInFlightWork`
+ *  counts (plus kg-refresh, which that count reports separately). */
+export function listHeldReservations(now: number = Date.now()): HeldReservation[] {
+  const rows = getDb()
+    .prepare("SELECT * FROM dispatch_admissions WHERE released_at IS NULL ORDER BY created_at ASC, dispatch_id ASC")
+    .all() as Row[];
+  return rows.map((row) => {
+    // A job of an earlier generation under the same dispatch id says nothing about this
+    // reservation, so it is not shown (same rule `releaseHeldReservation` applies).
+    const latest = getJobByDispatchId(row.dispatch_id);
+    const job = latest && jobBelongsToGeneration(latest, row.generation) ? latest : null;
+    return {
+      dispatchId: row.dispatch_id,
+      team: row.mapping_key,
+      issueId: row.issue_id,
+      issueIdentifier: job?.issueIdentifier ?? null,
+      phase: row.phase as DispatchAdmissionKind,
+      backend: row.backend as DispatchAdmissionBackend,
+      lifecycleOwner: row.lifecycle_owner,
+      ageMs: Math.max(0, now - row.created_at),
+      jobStatus: job?.status ?? null,
+      jobConclusion: job?.conclusion ?? null,
+    };
+  });
+}
+
+export type ReleaseHeldReservationResult =
+  | { readonly status: "released"; readonly dispatchId: string; readonly lifecycleOwner: string; readonly phase: string; readonly forced: boolean; readonly basis: "forced" | "backend_confirmed" }
+  | { readonly status: "nothing_to_release"; readonly dispatchId: string }
+  | { readonly status: "refused"; readonly dispatchId: string; readonly reason: string };
+
+function jobBelongsToGeneration(job: Job, generation: number): boolean {
+  return job.admissionGeneration === null || job.admissionGeneration === generation;
+}
+
+/**
+ * The operator release (AII-1069). Reuses `releaseByDispatchId` for the write and the
+ * caller's `confirmTerminated` (the orchestrator's `confirmAdmissionTerminated`) for the
+ * "did the run end" rule. Without `force` it releases only when the backend run is
+ * confirmed ended; a terminal job row alone is not proof (the planning callback closes the
+ * row while the run may still execute). With `force` it releases unconditionally. An
+ * unknown or already-released id changes nothing.
+ */
+export async function releaseHeldReservation(
+  dispatchId: string,
+  opts: { force: boolean; confirmTerminated: (candidate: StaleAdmissionCandidate) => Promise<boolean> },
+): Promise<ReleaseHeldReservationResult> {
+  const record = read(dispatchId);
+  if (!record || record.releasedAt !== null) return { status: "nothing_to_release", dispatchId };
+
+  let basis: "forced" | "backend_confirmed" = "forced";
+  if (!opts.force) {
+    let confirmed = false;
+    try {
+      confirmed = await opts.confirmTerminated({
+        dispatchId: record.dispatchId,
+        mappingKey: record.mappingKey,
+        backend: record.backend,
+        lifecycleOwner: record.lifecycleOwner,
+        generation: record.generation,
+        ageMs: Math.max(0, Date.now() - record.createdAt),
+      });
+    } catch (err) {
+      console.error(`[admission] confirmTerminated threw for dispatch=${dispatchId}:`, err);
+    }
+    if (!confirmed) {
+      const latest = getJobByDispatchId(dispatchId);
+      const job = latest && jobBelongsToGeneration(latest, record.generation) ? latest : null;
+      const jobText = job ? `its job row is ${job.status}, which does not show the run ended` : "it has no job row";
+      return {
+        status: "refused",
+        dispatchId,
+        reason: `the run is not confirmed ended: ${jobText}, and the backend did not report it finished (a Restate-owned or job-less reservation can never be confirmed). Pass force to release it anyway`,
+      };
+    }
+    basis = "backend_confirmed";
+  }
+
+  // Release the generation read above, not whatever holds the id after the awaited check.
+  const outcome = release(record.dispatchId, record.lifecycleOwner, record.generation, "cancelled");
+  if (outcome.status !== "released") return { status: "nothing_to_release", dispatchId };
+  return {
+    status: "released",
+    dispatchId,
+    lifecycleOwner: encodeOwner(record.lifecycleOwner),
+    phase: record.kind,
+    forced: opts.force,
+    basis,
+  };
+}
+
 /** Reservations older than this with no confirmed release are swept — the safety net
  *  for "a committed reservation whose launch response or process was lost" (a crash
  *  between `acquire` returning and the caller's own `appendLog`, so no `dispatch_log`
@@ -440,7 +546,7 @@ export function releaseByDispatchId(
  *  a reservation `updateJobStatus` deliberately left held pending confirmed termination
  *  (AII-783 review: reaper/stuck-watchdog give-up paths that cannot vouch for the
  *  backend actually being dead). Generous relative to every job timeout in the codebase
- *  (GHA's default 90 min job timeout, Fly/local's FLY_MACHINE_TIMEOUT_MS, and the
+ *  (the mapping's Job Timeout on every backend, default 90 min, and the
  *  stuck-watchdog's own bounded retries on top of that) so this never races a
  *  legitimately long-running attempt.
  *

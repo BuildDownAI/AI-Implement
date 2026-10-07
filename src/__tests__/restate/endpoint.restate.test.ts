@@ -29,6 +29,7 @@
 import * as http2 from "node:http2";
 import crypto from "node:crypto";
 import { randomUUID } from "node:crypto";
+import * as restate from "@restatedev/restate-sdk";
 import { createEndpointHandler } from "@restatedev/restate-sdk/node";
 import { RestateContainer } from "@restatedev/restate-sdk-testcontainers";
 import { TestContainers } from "testcontainers";
@@ -37,7 +38,8 @@ import { RESTATE_SERVICES, queryNonCompletedInvocations, register, restateBindAd
 import { orchestratorTools } from "../../restate/tools.js";
 import * as dedup from "../../dedup.js";
 import { initSettingsTable } from "../../runner-mode.js";
-import { RESTATE_IMAGE_VERSION, callObject, callService, restateTestRuntime } from "./harness.js";
+import { startBinaryEnvironment, type BinaryEnvironment } from "./binary-environment.js";
+import { RESTATE_IMAGE_VERSION, callObject, callService, eventually, queryInvocations, restateTestRuntime } from "./harness.js";
 
 function sha256(value: string): string {
   return crypto.createHash("sha256").update(value).digest("hex");
@@ -51,21 +53,19 @@ function sha256(value: string): string {
  * partitions are queryable yet — register() needs the latter.
  */
 async function waitForPartitionsReady(adminBaseUrl: string, timeoutMs = 60_000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    try {
-      const response = await fetch(`${adminBaseUrl}/query`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ query: "SELECT count(1) FROM sys_invocation" }),
-      });
-      if (response.ok) return;
-    } catch {
-      // Admin API not accepting connections yet.
-    }
-    await new Promise((resolve) => setTimeout(resolve, 200));
-  }
-  throw new Error(`Restate admin API partitions not ready after ${timeoutMs}ms`);
+  await eventually(
+    async () => {
+      try {
+        await queryInvocations(adminBaseUrl, "true LIMIT 1");
+        return true;
+      } catch {
+        // Admin API not accepting connections yet, or partitions not queryable.
+        return false;
+      }
+    },
+    Boolean,
+    { timeoutMs, intervalMs: 200, label: "Restate admin API partitions to be ready" },
+  );
 }
 
 /**
@@ -215,12 +215,11 @@ describe.skipIf(restateTestRuntime() === "binary")("startRestateEndpoint() / reg
       // Observe the actual non-completed invocation before swapping endpoints;
       // a fixed sleep can race Restate's admission on a busy CI host.
       const oldUri = `http://host.testcontainers.internal:${changedPort}`;
-      const admissionDeadline = Date.now() + 10_000;
-      while (Date.now() < admissionDeadline) {
-        const count = await queryNonCompletedInvocations(fetch, adminBaseUrl, oldUri);
-        if (count !== null && count > 0) break;
-        await new Promise((resolve) => setTimeout(resolve, 50));
-      }
+      await eventually(
+        () => queryNonCompletedInvocations(fetch, adminBaseUrl, oldUri),
+        (count) => count !== null && count > 0,
+        { label: `a non-completed invocation at ${oldUri}` },
+      );
       expect(await queryNonCompletedInvocations(fetch, adminBaseUrl, oldUri)).toBeGreaterThan(0);
 
       // Change the live endpoint's discovery manifest at the same URI. Restate's
@@ -245,4 +244,39 @@ describe.skipIf(restateTestRuntime() === "binary")("startRestateEndpoint() / reg
     },
     45_000,
   );
+});
+
+// Request identity (AII-976) runs on the binary runtime: it spawns a real server given the
+// private key, with the endpoint given the public one. Skipped on the container runtime.
+describe.skipIf(restateTestRuntime() !== "binary")("request identity (AII-976)", () => {
+  const echo = restate.service({
+    name: "identityEcho",
+    handlers: { ping: async (_ctx: restate.Context, input: { value: string }) => ({ echoed: input.value }) },
+  });
+  let env: BinaryEnvironment;
+  beforeAll(async () => {
+    env = await startBinaryEnvironment({ services: [echo], requestIdentity: true });
+  }, 60_000);
+  afterAll(async () => {
+    if (env) await env.stop();
+  });
+
+  it("rejects an unsigned direct request to the endpoint, while an ingress call succeeds", async () => {
+    expect(env.identityKey()).toMatch(/^publickeyv1_/);
+    const client = http2.connect(`http://127.0.0.1:${env.endpointPort()}`);
+    try {
+      const status = await new Promise<number>((resolve, reject) => {
+        const req = client.request({ ":method": "GET", ":path": "/discover", accept: "application/vnd.restate.endpointmanifest.v3+json" });
+        req.on("response", (headers) => resolve(Number(headers[":status"])));
+        req.on("error", reject);
+        req.resume();
+        req.end();
+      });
+      expect(status).toBe(401);
+    } finally {
+      client.close();
+    }
+    // The server signs its own calls: an ingress call reaches a handler through the endpoint.
+    expect(await callService(env.baseUrl(), "identityEcho", "ping", { value: "x" })).toEqual({ echoed: "x" });
+  });
 });

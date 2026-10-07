@@ -8,11 +8,14 @@ import {
   updateJobStatus,
   type Job,
 } from "./log.js";
+import { redactStepCredentials } from "./pipeline/step-redaction.js";
 import type { Step } from "./pipeline/types.js";
+import type { KgRefreshIngressClient } from "./restate/kg-refresh-production.js";
 import { describeReferenceRepoCause, type ReferenceRepoResult } from "./reference-repos.js";
 import type { TicketingProvider } from "./providers/types.js";
 import { remediateFailedJob, type StuckWatchdogConfig } from "./stuck-watchdog.js";
 import { verifyAndConsumeRunToken, verifyPreparedReviewFixToken, verifyRunToken } from "./runner-tokens.js";
+import { read as readAdmission } from "./dispatch-admission.js";
 import { getStepsByJobId, upsertStepRecord } from "./step-log.js";
 import { acceptReviewFixWebhookEvent, getReviewFixDispatchSnapshot } from "./review-fix-queue.js";
 import {
@@ -171,19 +174,6 @@ export interface HandleRunnerResultInput {
   /** When provided, bounded failure cleanup (remediateFailedJob) runs after markImplementationFailed. */
   watchdogConfig?: StuckWatchdogConfig;
   /**
-   * Called when a kg-refresh runner job completes. Wired to KgRefreshHandle.onRunnerComplete
-   * in index.ts. When absent, kg-refresh callbacks are acknowledged without further action.
-   */
-  onKgRefreshRunnerComplete?: (
-    outcome: "success" | "failure",
-    data: {
-      snapshotCommit?: string; snapshotPr?: number; snapshotBranch?: string;
-      failureCode?: string; failureReason?: string;
-      guardVerdict?: "clean" | "refused";
-      partTable?: Array<{ part: string; prev: string; new: string }>;
-    },
-  ) => void;
-  /**
    * Injectable seam that durably records a validated `reviewFix` result marker
    * (AII-769/AII-803) — e.g. `SqliteReviewFixAttemptStore.recordResult`, composed
    * with queuing the accepted result for Restate delivery. Authenticated and
@@ -195,6 +185,13 @@ export interface HandleRunnerResultInput {
    * seam fails closed: a pilot result cannot be acknowledged without storage.
    */
   onReviewFixResult?: (result: ReviewFixResultMetadataV1) => ResultIntakeOutcome | Promise<ResultIntakeOutcome>;
+  /**
+   * Ingress client for the `KgRefresh` workflow. The kg-refresh result branch is
+   * verify-only and hands the report here (AII-899). Absent → 503 so the runner retries.
+   */
+  kgRefreshClient?: KgRefreshIngressClient;
+  /** `KG_SOURCE_REPO`, from which the `KgRepo` key is derived. Null/absent → 503. */
+  kgSourceRepo?: string | null;
   /**
    * Immediate one-shot backend-termination check for a planning callback's admission
    * reservation (AII-783 review, third round, on PR #681). The planning branch below
@@ -224,6 +221,8 @@ export interface HandleRunnerProgressInput {
   authorization: string | undefined;
   body: RunnerProgressBody;
   secret: string;
+  kgRefreshClient?: KgRefreshIngressClient;
+  kgSourceRepo?: string | null;
 }
 
 export interface HandleRunnerPlanningContextInput {
@@ -234,6 +233,12 @@ export interface HandleRunnerPlanningContextInput {
 
 function bad(status: number, error: string): HandleRunnerResultOutput {
   return { status, body: { error } };
+}
+
+/** The KgRefresh workflow keyed by the dispatch id has no run — the callback is for a refresh that never started here. */
+function noRefreshInFlight(dispatchId: string): HandleRunnerResultOutput {
+  console.warn(`[runner-callback] kg-refresh callback with no refresh in flight dispatch=${dispatchId}`);
+  return bad(409, "no-refresh-in-flight");
 }
 
 const STATUS_TEXT_MAX_LEN = 200;
@@ -706,6 +711,40 @@ export async function handleRunnerResult(
     return reviewFixResultIntakeResponse(outcome);
   }
 
+  // kg-refresh is verify-only (AII-899): signature and row are checked, the token is never
+  // consumed, and the report goes to the KgRefresh workflow, which absorbs a duplicate under
+  // the dispatch id and refuses a conflicting body. A retried identical body is therefore safe.
+  if (body.phase === "kg-refresh") {
+    const kgVerified = verifyRunToken(bearerToken, input.secret, "result", { consume: false });
+    if (!kgVerified.ok) {
+      console.warn(
+        `[runner-callback] result refused dispatch=${kgVerified.claims?.dispatchId ?? "unknown"} ` +
+          `phase=kg-refresh outcome=${input.body.outcome} reason=${kgVerified.reason}`,
+      );
+      return bad(401, kgVerified.reason);
+    }
+    if (kgVerified.claims.phase !== "kg-refresh") return bad(400, "phase_mismatch");
+    const dispatchId = kgVerified.claims.dispatchId;
+    if (!input.kgRefreshClient) return bad(503, "kg_refresh_unavailable");
+    const reported = await input.kgRefreshClient.report(
+      dispatchId,
+      {
+        ok: input.body.outcome === "success",
+        failureCode: input.body.failureCode,
+        failureReason: input.body.failureReason,
+        snapshotPr: input.body.snapshotPr,
+        snapshotCommit: input.body.snapshotCommit,
+        snapshotBranch: input.body.snapshotBranch,
+        partTable: input.body.partTable,
+      },
+      { idempotencyKey: dispatchId },
+    );
+    if (reported.status === "unavailable") return bad(503, "kg_refresh_unavailable");
+    if (reported.status === "not-found") return noRefreshInFlight(dispatchId);
+    if (reported.status === "conflict") return bad(409, "conflicting_report");
+    return { status: 200, body: { acknowledged: true } };
+  }
+
   // Authenticate without consuming, then run every check that needs only the
   // claims and body, so a rejected request leaves the single-use token usable
   // for a corrected retry. The consume below stays atomic and decides races.
@@ -805,23 +844,7 @@ export async function handleRunnerResult(
     console.warn(`[runner-callback] Dropped ${droppedCycleSummaries} invalid cycle summary record(s)`);
   }
 
-  // kg-refresh runs have no mapping and no tracker issue to update.
-  // Route the callback directly to the refresh rail and return early.
-  if (input.body.phase === "kg-refresh") {
-    if (!input.onKgRefreshRunnerComplete) {
-      console.warn("[runner-callback] kg-refresh callback received but no handler is registered — result will not be propagated");
-    }
-    input.onKgRefreshRunnerComplete?.(input.body.outcome, {
-      snapshotCommit: input.body.snapshotCommit,
-      snapshotPr: input.body.snapshotPr,
-      snapshotBranch: input.body.snapshotBranch,
-      failureCode: input.body.failureCode,
-      failureReason: input.body.failureReason,
-      guardVerdict: input.body.guardVerdict,
-      partTable: input.body.partTable,
-    });
-    return { status: 200, body: { acknowledged: true } };
-  }
+
 
   const provider = await input.resolveProvider(mappingTeamKey);
   if (!provider) {
@@ -919,6 +942,20 @@ export async function handleRunnerResult(
         if (job && commented) markJobFailureCommented(job.id);
       } catch (err) {
         warn("markPlanningFailed", err);
+      }
+      // A Restate-owned run has no monitor to close its row, and the workflow takes `report` as proof
+      // the callback closed it, so the callback writes the failure here and then sends `report` through
+      // the hook. The backend may still be running, so the reservation stays held (as in the success
+      // branch below). A Legacy dispatch is unchanged: its monitor closes the row and no hook runs.
+      if (job && readAdmission(claims.dispatchId)?.lifecycleOwner.kind === "restate") {
+        updateJobStatus(job.id, "failed", failure?.code ?? input.body.failureCode ?? "planning_failed", undefined, { skipAdmissionRelease: true });
+        if (input.checkPlanningAdmissionTermination) {
+          try {
+            await input.checkPlanningAdmissionTermination(claims.dispatchId);
+          } catch (err) {
+            warn("checkPlanningAdmissionTermination", err);
+          }
+        }
       }
     } else if (input.body.phase === "implementation") {
       const isOperatorCancelled = input.body.failureCode === "OPERATOR_CANCELLED";
@@ -1259,6 +1296,26 @@ export async function handleRunnerProgress(
 
   const verified = verifyRunToken(bearerToken, input.secret, "progress", { consume: false });
   if (!verified.ok) return bad(401, verified.reason);
+
+  // kg-refresh progress goes to the KgRefresh workflow as a heartbeat (AII-899), not to the job row.
+  if (verified.claims.phase === "kg-refresh") {
+    if (!input.kgRefreshClient) return bad(503, "kg_refresh_unavailable");
+    // A step body is optional: an old runner image sends `{}`, which stays a bare heartbeat. The ingress
+    // journals what it is sent, so the step is redacted here, before the call.
+    let step: Step | undefined;
+    if (input.body && typeof input.body === "object" && "step" in input.body) {
+      const stepOrError = validateStepBody(input.body);
+      if ("status" in stepOrError && "body" in stepOrError) return stepOrError;
+      step = redactStepCredentials(stepOrError as Step);
+    }
+    const progressed = step
+      ? await input.kgRefreshClient.progress(verified.claims.dispatchId, step)
+      : await input.kgRefreshClient.progress(verified.claims.dispatchId);
+    if (progressed.status === "unavailable") return bad(503, "kg_refresh_unavailable");
+    if (progressed.status === "not-found") return noRefreshInFlight(verified.claims.dispatchId);
+    if (progressed.status === "conflict") return bad(409, "conflict");
+    return { status: 200, body: { acknowledged: true } };
+  }
 
   const githubRunIdOrError = validateGithubRunId(input.body);
   if (githubRunIdOrError && typeof githubRunIdOrError === "object") return githubRunIdOrError;

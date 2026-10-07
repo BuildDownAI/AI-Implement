@@ -418,6 +418,18 @@ describe("monitorJobs TTL check (AII-743)", () => {
     vi.mocked(getMappings).mockReturnValue({});
   });
 
+  it("leaves a kg-refresh GHA row to the workflow: no GitHub call, no status write (AII-901)", async () => {
+    const job = makeJob({ issueId: "kg-refresh", phase: "kg-refresh", repo: "org/kg", runId: 4242, dispatchedAt: Date.now() - 200 * 60 * 1000 });
+    vi.mocked(getInFlightJobs).mockReturnValue([job]);
+    vi.mocked(updateJobStatus).mockClear();
+    vi.mocked(cancelWorkflowRun).mockClear();
+
+    await monitorJobs(mockAppConfig, makeRegistry(null));
+
+    expect(cancelWorkflowRun).not.toHaveBeenCalled();
+    expect(updateJobStatus).not.toHaveBeenCalled();
+  });
+
   it("times out a no-mapping, no-run-id job past 105 minutes with conclusion ttl_expired", async () => {
     vi.mocked(incrementStuckAttempts).mockReturnValue(1);
     const job = makeJob({
@@ -482,10 +494,8 @@ describe("monitorJobs TTL check (AII-743)", () => {
     expect(incrementStuckAttempts).not.toHaveBeenCalled();
   });
 
-  it("does not TTL a Fly job under its own 75-minute limit even when the mapping's GHA-only maxJobMinutes would have expired it", async () => {
-    // maxJobMinutes is a GHA-only setting; a Fly job must use FLY_MACHINE_TIMEOUT_MS (60m) + 15m
-    // grace = 75m, not the mapping's low GHA value (20m + 15m = 35m, which this 40m-old job
-    // would fail under the old, wrong logic).
+  it("TTLs a Fly job at the mapping's Job Timeout plus grace (20m + 15m = 35m), not a fixed 60m", async () => {
+    vi.mocked(incrementStuckAttempts).mockReturnValue(1);
     vi.mocked(getMappings).mockReturnValue({ AII: makeMapping({ maxJobMinutes: 20 }) });
     const job = makeJob({
       teamKey: "AII",
@@ -499,9 +509,64 @@ describe("monitorJobs TTL check (AII-743)", () => {
 
     await monitorJobs(mockAppConfig, makeRegistry(makeProvider()));
 
-    expect(updateJobStatus).not.toHaveBeenCalled();
-    expect(incrementStuckAttempts).not.toHaveBeenCalled();
-    expect(destroyMachine).not.toHaveBeenCalled();
+    const callsForJob = vi.mocked(updateJobStatus).mock.calls.filter(([id]) => id === job.id);
+    expect(callsForJob.at(-1)?.[2]).toBe("ttl_expired");
+    expect(destroyMachine).toHaveBeenCalled();
+  });
+
+  describe.each(["fly-machines", "local-docker"] as const)("%s Job Timeout (AII-1105)", (executionMode) => {
+    const jobAged = (minutes: number) =>
+      makeJob({
+        teamKey: "AII",
+        repo: "org/repo",
+        executionMode,
+        machineId: "machine-456",
+        runId: null,
+        dispatchedAt: Date.now() - minutes * 60 * 1000,
+      });
+    const statusCalls = (job: Job) =>
+      vi.mocked(updateJobStatus).mock.calls.filter(([id]) => id === job.id);
+
+    it("does not time out or TTL a 70m job on a 90m mapping", async () => {
+      vi.mocked(getMappings).mockReturnValue({ AII: makeMapping({ maxJobMinutes: 90 }) });
+      const job = jobAged(70);
+      vi.mocked(getInFlightJobs).mockReturnValue([job]);
+
+      await monitorJobs(mockAppConfig, makeRegistry(makeProvider()));
+
+      expect(updateJobStatus).not.toHaveBeenCalled();
+      expect(destroyMachine).not.toHaveBeenCalled();
+      expect(removeLocalContainer).not.toHaveBeenCalled();
+    });
+
+    it("times out at 31m on a 30m mapping without a TTL, then TTLs at 46m", async () => {
+      vi.mocked(incrementStuckAttempts).mockReturnValue(1);
+      vi.mocked(getMappings).mockReturnValue({ AII: makeMapping({ maxJobMinutes: 30 }) });
+      const timedOut = jobAged(31);
+      vi.mocked(getInFlightJobs).mockReturnValue([timedOut]);
+      await monitorJobs(mockAppConfig, makeRegistry(makeProvider()));
+      expect(statusCalls(timedOut).length).toBeGreaterThan(0);
+      expect(statusCalls(timedOut).some((c) => c[2] === "ttl_expired")).toBe(false);
+
+      vi.mocked(updateJobStatus).mockClear();
+      const ttl = jobAged(46);
+      vi.mocked(getInFlightJobs).mockReturnValue([ttl]);
+      await monitorJobs(mockAppConfig, makeRegistry(makeProvider()));
+      expect(statusCalls(ttl).at(-1)?.[2]).toBe("ttl_expired");
+    });
+
+    it("defaults to 90m with no maxJobMinutes: 89m is left alone, 91m times out", async () => {
+      vi.mocked(getMappings).mockReturnValue({ AII: makeMapping({ maxJobMinutes: undefined }) });
+      const young = jobAged(89);
+      vi.mocked(getInFlightJobs).mockReturnValue([young]);
+      await monitorJobs(mockAppConfig, makeRegistry(makeProvider()));
+      expect(updateJobStatus).not.toHaveBeenCalled();
+
+      const old = jobAged(91);
+      vi.mocked(getInFlightJobs).mockReturnValue([old]);
+      await monitorJobs(mockAppConfig, makeRegistry(makeProvider()));
+      expect(statusCalls(old).length).toBeGreaterThan(0);
+    });
   });
 
   it("never TTLs a kg-refresh job, however old", async () => {

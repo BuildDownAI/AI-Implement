@@ -147,6 +147,18 @@ export async function startLocalRunnerContainer(input: StartLocalContainerInput)
   }
 }
 
+/** Looks a container up by exact name. `null` means only "docker answered, and no container has this
+ *  name"; any other failure throws, so the caller retries rather than launching a second container. */
+export async function findLocalContainerIdByName(name: string): Promise<string | null> {
+  try {
+    const { stdout } = await execFile("docker", ["inspect", "--type", "container", "--format", "{{.Id}}", name]);
+    return stdout.trim() || null;
+  } catch (err) {
+    if (/no such (container|object)/i.test(errorMessage(err))) return null;
+    throw new Error(`Failed to look up local Docker runner ${name}: ${errorMessage(err)}`);
+  }
+}
+
 export async function inspectLocalContainer(containerId: string): Promise<LocalContainerState> {
   try {
     const { stdout } = await execFile("docker", ["inspect", "--format", "{{json .State}}", containerId]);
@@ -255,6 +267,17 @@ export async function removeLocalContainer(containerId: string): Promise<void> {
     await execFile("docker", ["rm", "-f", containerId]);
   } catch (err) {
     throw new Error(`Failed to remove local Docker runner ${containerId}: ${errorMessage(err)}`);
+  }
+}
+
+/** Force-stops and removes a running container. A container that is already gone counts as stopped. */
+export async function stopLocalContainer(containerId: string): Promise<void> {
+  try {
+    await execFile("docker", ["rm", "-f", containerId]);
+  } catch (err) {
+    const message = errorMessage(err);
+    if (/no such container/i.test(message)) return;
+    throw new Error(`Failed to stop local Docker runner ${containerId}: ${message}`);
   }
 }
 

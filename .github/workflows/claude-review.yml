@@ -85,13 +85,18 @@ jobs:
           ref: ${{ steps.pr.outputs.sha }}
           fetch-depth: 0
 
-      # Load the composite action from the repo's own trusted ref, not from the PR-head
-      # checkout above. `actions/checkout` with no `ref:` under pull_request_target checks
-      # out the BASE branch (the ref that triggered the workflow), never the PR head — so a
-      # fork PR (reachable here via the maintainer `/claude-review` comment path) cannot
-      # rewrite the composite action to run arbitrary steps with this job's secrets by
-      # editing .github/actions/claude-review in its own diff. Keep this checkout at a
-      # distinct path from the PR-head checkout above, and after it (see note above).
+      # Load the composite action from the repo's own trusted ref,
+      # not from the PR-head checkout above.
+      # With no `ref:`, actions/checkout gets the triggering event's ref, never the PR head.
+      # On GitHub.com, that is the default branch for both triggers.
+      # So a fork PR, reachable here via the maintainer `/claude-review` comment path,
+      # cannot rewrite the composite action to run arbitrary steps with this job's secrets
+      # by editing .github/actions/claude-review in its own diff.
+      # A change to this workflow or its action likewise reaches PRs only from there.
+      # GitHub Enterprise Server before 3.20 differs:
+      # there, pull_request_target runs from the PR's base branch.
+      # Keep this checkout at a distinct path from the PR-head checkout above,
+      # and after it (see note above).
       - name: Checkout trusted composite action
         uses: actions/checkout@v4
         with:

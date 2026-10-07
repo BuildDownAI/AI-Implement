@@ -28,8 +28,8 @@ sequenceDiagram
 
 | Name | Audience | Minted | Carried by | Read by | Verified by | Consumed |
 |---|---|---|---|---|---|---|
-| `RUN_TOKEN` | `result` | `mintRunToken` at dispatch (`src/runner-tokens.ts`) | GHA: `inputs.run_token` into the step env in `workflows/claude-implement.yml`, `claude-plan.yml`, `claude-kg-refresh.yml`. Fly: machine env in `buildSessionMachineConfig` (`src/fly-machines.ts`). Local: container env (`src/local-docker.ts`) | `postRunnerResult` (`src/runner-result.ts`) | `POST /runner/result` with `verifyRunToken(…, "result", { consume: true })` | Yes, on first use |
-| `RUN_PROGRESS_TOKEN` | `progress` | `mintRunToken` at dispatch | Same three carriers | `src/run-autonomous.ts`, `src/run-planning.ts`, `src/pipeline/kg-refresh-run.ts`, `src/pipeline/steps/dependency-auth.ts`, `reference-repos.ts`, `kg-tracker-data.ts` | `POST /runner/progress`, `GET /runner/planning-context`, `POST /api/runner/dependency-token`, `reference-token`, `kg-push-token`, `kg-tracker-data`, all with `{ consume: false }` | No |
+| `RUN_TOKEN` | `result` | `mintRunToken` at dispatch (`src/runner-tokens.ts`) | GHA: `inputs.run_token` into the step env in `workflows/claude-implement.yml`, `claude-plan.yml`. Fly: machine env in `buildSessionMachineConfig` (`src/fly-machines.ts`). Local: container env (`src/local-docker.ts`) | `postRunnerResult` (`src/runner-result.ts`) | `POST /runner/result` with `verifyRunToken(…, "result", { consume: true })`. The kg-refresh phase verifies with `{ consume: false }` instead and hands the report to the `KgRefresh` workflow's `report` handler with the dispatch id as idempotency key | Yes, on first use; **not** for kg-refresh, which is verify-only (a duplicate is absorbed by the workflow, a conflicting body refused) |
+| `RUN_PROGRESS_TOKEN` | `progress` | `mintRunToken` at dispatch | Same three carriers | `src/run-autonomous.ts`, `src/run-planning.ts`, `src/pipeline/kg-refresh-run.ts`, `src/pipeline/steps/dependency-auth.ts`, `reference-repos.ts`, `kg-tracker-data.ts` | `POST /runner/progress`, `GET /runner/planning-context`, `POST /api/runner/dependency-token`, `reference-token`, `kg-tracker-data`, all with `{ consume: false }` | No |
 | `RUN_PUBLICATION_TOKEN` | `publication` | `mintRunToken` with a repository claim | Runner env | The push path exchanges it | `POST /api/runner/publication-token` returns a repository write credential; Legacy claims before mint, pilot verifies attempt authority and claims after mint | Yes after a successful exchange; a failed Legacy mint releases only its matching claim, while a failed pilot mint leaves the claim unused |
 | `RUNNER_CALLBACK_URL` | none, an address | Envelope `runnerCallbackUrl` or a plain env var | Same carriers | `postRunnerResult` fallback and the progress posters | none | No |
 
@@ -54,6 +54,16 @@ Unmarked Legacy callbacks retain the single-use result token above.
 
 The consequence to remember: any code the repository runs under `preflight` or a hook holds the run's own authority. A test suite is repository code. The model process cannot reach the tokens, so "the agent did it" is the wrong model of this failure.
 
+## Configured-run model bootstrap (AII-951)
+
+A run is *configured* (opted in) when its envelope carries both a resolved `agentConfig` snapshot and a `credentials.modelAuthGrant`. The shell bootstrap (`session/entrypoint.sh`, `classify_run_config` in `session/lib.sh`) validates **every nonempty envelope** with the compiled trusted decoder (`decodeTrustedRunConfig`) before any git, clone or setup. An envelope the decoder rejects (bad base64/JSON, non-object, unsupported version, invalid credentials) or one with only one of snapshot/grant fails closed with a fixed message and never falls back to legacy credentials. A valid envelope with neither — including a private `credentials` namespace holding only callback/publication tokens — is legacy and keeps the legacy `ANTHROPIC_*`/Bedrock provider requirements unchanged. The TS `isConfiguredModelRun` applies the same rule, treating undecodable input as configured so bad protected input can never select the legacy forwarded-collision exception.
+
+- **Shell children.** On configured runs `run_scoped` starts shell `git`/`gh` with a minimal environment (PATH, HOME, locale, TLS/proxy) plus only `GH_TOKEN` for `gh`. The configured clone uses a credential-free remote URL: `git_authed` places the GitHub token in the clone child's environment only (`GIT_PASSWORD`), answered by a global credential helper that reads that variable, so the token is in no argv, no remote URL and no file; the TS clone step's per-operation `GIT_PASSWORD` fetches use the same helper. Legacy runs keep the token-in-URL clone. Model, session, bootstrap and forwarded-secret variables never reach them, and the ERR trap logs a fixed line instead of the failing command text. The protected envelope stays in the trusted handoff only.
+- **TS children.** `repoProcessEnv` drops the forwarded-secret collision exception and every `OPENAI_`/`CODEX_`/`ANTHROPIC_`/`CLAUDE_CODE_`/`AWS_` name on configured runs (legacy keeps the exception). `modelProcessEnv(allow, selectedAuth)` returns a copy of the environment `ModelAuthClient` built for the selected credential, never merged with `process.env`; `allow` only decides whether GitHub write tokens already in that selected environment survive, and ambient `process.env` GitHub or runner credentials are never restored. The legacy form (no `selectedAuth`) is unchanged.
+- **Node launch controls.** Every shell-owned node decoder runs through `run_node` (`env -u NODE_OPTIONS -u NODE_PATH node`), so an ambient `--require` preload cannot execute with the protected envelope in its environment before classification, in any mode. Configured runs also `unset NODE_OPTIONS NODE_PATH` before the final handoff; legacy handoff keeps them.
+- **Team-secret remap.** Configured runs additionally reserve model, session, provider-routing and `NODE_OPTIONS`/`NODE_PATH` names in `_remap_is_reserved`, so an alias cannot restore them; ordinary secrets still forward. Legacy keeps the narrower list.
+- **Trust limit.** This is credential hygiene, not hostile-code isolation: commands the agent starts can read their parent model process's environment. Hosted session-key delivery to the runner is not part of this change.
+
 ## Blast radius
 
 What one stray use of each credential destroys, and where the symptom appears.
@@ -61,9 +71,16 @@ What one stray use of each credential destroys, and where the symptom appears.
 | Credential | One stray use | What is lost | Where the symptom appears | Recovery |
 |---|---|---|---|---|
 | Result token | One extra `POST /runner/result` before the real report | The real report is refused `409 already_consumed`: outcome, PR URL, implementation summary, and the approval mark (ADR 014). On GitHub Actions the tracker transition too: the issue keeps `AI-Working`, holds its dispatch slot, and fills the per-team cap | In other subsystems: the merge gate holds the PR with "no approval mark"; a fix that stamps the mark has nothing to stamp; the cap shows finished runs as in progress; `get_issue_dispatch_status` reads `conclusion: success` with `mergeVerdict: hold` | None for that run. A person merges by hand and clears the labels. Observed 2026-09-04 to 2026-09-07 (AII-567), about three days of build-down |
+| Result token (kg-refresh) | One extra `POST /runner/result` | Nothing: the path verifies without consuming, and the workflow absorbs a duplicate under the same idempotency key (a conflicting body is refused `409`) | Nothing; the real report still lands | None needed |
 | Progress token | A stray progress post or token exchange | Nothing is burned; the token is reusable. A stray exchange mints a dependency or reference token for the run's team, which reads every repository the App installation covers | `step_log` rows that do not match a real step; unexplained token rows | Tokens expire; nothing to repair |
 | Publication token | One stray successful exchange | The real push has no write credential and the run cannot open its PR | The push step fails | Re-dispatch. A failed Legacy GitHub mint releases its stamp-matched claim for retry; the pilot claims only after mint and rechecks authority. A successful exchange remains single-use |
 | Callback URL with a token | A test that reaches the live orchestrator | Whatever the token allows, above | See the result-token row | See above |
+
+## kg-refresh report retried after the run finished (AII-896)
+
+The workflow key is the dispatch id: the kg-refresh callback addresses `KgRefresh/{dispatchId}` directly, with the dispatch id taken from the verified run-token claims, and never consults the `KgRepo` marker. A key no `run` has started under answers `404` from `report`/`progress`, which the callback maps to **`409 no-refresh-in-flight`**. A report retried after the run finished reaches the completed workflow: an identical body is a duplicate and answers 200, a different body is refused. A late report from an older run can therefore only address its own workflow, never the run that is current. The kg-refresh runner reports each pipeline step with `TokenStepReporter` (see [The step reporter as the run signal](#the-step-reporter-as-the-run-signal)), and the first accepted post is one of the two sources of started evidence (ADR 034).
+
+**Acceptable for a runner retry after a lost 200.** A kg-refresh runner posts `/runner/result` once (`postRunnerResult` retries only pilot review-fix results), and the workflow has already consumed the first report and recorded the outcome by the time a retry could arrive.
 
 ## Pilot result retries (AII-794)
 
@@ -84,6 +101,14 @@ resolution, or approval.
 The handler validates and stores a bounded activity batch under the token's
 attempt identity before ACK. A missing store, forged attempt, or storage failure
 cannot produce a success ACK. Legacy runs do not use this route.
+
+## The step reporter as the run signal
+
+A run kind that a Restate workflow owns sends its "I started" signal as a step report: the kg-refresh runner uses `TokenStepReporter` (`src/pipeline/reporter.ts`), which posts `{ step }` to `/runner/progress` with the progress token, and the route forwards the validated, redacted step to the workflow's shared handler (`progress(dispatchId, step)`). A body with no `step` (an old runner image) is still a bare heartbeat. The result keeps `postRunnerResult` and `/runner/result` with the result token. The runner never calls the Restate ingress, which binds to loopback (ADR 023). A failed post logs and does not change the outcome of the run. `TokenStepReporter` removes credential keys from `inputs` and `outputs` with `redactStepCredentials` before the body is serialized.
+
+## The planning callback of a pilot project
+
+The planning result callback still marks the planning job complete and still skips the admission release, for both lifecycles. For a project on the `restate` lifecycle, the planning termination hook (`createPlanningAdmissionTerminationHook`) also sends `report` to the `PlanningRun` workflow whose key is the dispatch id (the handler takes no idempotency key; a second `report` is a no-op); a Legacy dispatch keeps the fast release. The planning failure callback calls the same hook, so it also sends `report`; for a Restate-owned dispatch it first writes the row as `failed` with the failure code as its conclusion, and the workflow keeps that conclusion. The `report` only wakes the workflow. The workflow still confirms the run ended with `readStatus` and releases the reservation itself. A lost signal costs at most one tick: 5 seconds in the confirm phase, 30 seconds in the wait (`PLANNING_RUN_CONFIRM_TICK_MS`, `PLANNING_RUN_TICK_MS`). See [restate.md](restate.md#the-planning-run).
 
 ## Rules
 

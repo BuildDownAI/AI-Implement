@@ -14,7 +14,7 @@ import { RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { queryNonCompletedInvocations } from "../../restate/endpoint.js";
 import { operatorObject } from "../../restate/operator-object.js";
-import { VARIANTS, callObject, startVariants, stopAll } from "./harness.js";
+import { VARIANTS, callObject, eventually, queryInvocations, startVariants, stopAll } from "./harness.js";
 
 // An exclusive handler held on an awakeable leaves a second handler on the same key
 // queued before dispatch. In a direct pinned Restate 1.7.10 probe, the first had
@@ -42,26 +42,13 @@ async function waitForInvocation(
   handler: "block" | "follow",
   statuses: readonly ("running" | "suspended" | "pending")[],
 ): Promise<InvocationRow> {
-  const deadline = Date.now() + 10_000;
-  let lastRows: InvocationRow[] = [];
-  while (Date.now() < deadline) {
-    const response = await fetch(`${adminBaseUrl}/query`, {
-      method: "POST",
-      headers: { "content-type": "application/json", accept: "application/json" },
-      body: JSON.stringify({
-        query: `SELECT status, pinned_deployment_id, last_attempt_deployment_id FROM sys_invocation WHERE target_service_name = 'DrainProbeTest' AND target_service_key = '${key}' AND target_handler_name = '${handler}'`,
-      }),
-    });
-    if (!response.ok) throw new Error(`POST /query failed: HTTP ${response.status}`);
-    const body = (await response.json()) as { rows: InvocationRow[] };
-    lastRows = body.rows;
-    const row = body.rows.find((candidate) => statuses.includes(candidate.status as "running" | "suspended" | "pending"));
-    if (row) return row;
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-  throw new Error(
-    `DrainProbeTest/${key}/${handler} did not reach ${statuses.join(" or ")}: ${JSON.stringify(lastRows)}`,
+  const where = `target_service_name = 'DrainProbeTest' AND target_service_key = '${key}' AND target_handler_name = '${handler}'`;
+  const rows = await eventually(
+    async () => (await queryInvocations(adminBaseUrl, where)) as unknown as InvocationRow[],
+    (found) => found.some((candidate) => statuses.includes(candidate.status as "running" | "suspended" | "pending")),
+    { label: `DrainProbeTest/${key}/${handler} to reach ${statuses.join(" or ")}` },
   );
+  return rows.find((candidate) => statuses.includes(candidate.status as "running" | "suspended" | "pending"))!;
 }
 
 interface DeploymentsResponse {
@@ -154,6 +141,60 @@ describe("queryNonCompletedInvocations against a real pinned 1.7.10 admin API (A
       await waitForInvocation(env.adminAPIBaseUrl(), key, "follow", ["pending"]);
       expect(await queryNonCompletedInvocations(fetch, env.adminAPIBaseUrl(), uri)).toBe(2);
       expect(await queryNonCompletedInvocations(fetch, env.adminAPIBaseUrl(), "http://127.0.0.1:1")).toBe(0);
+    },
+  );
+});
+
+// A delayed one-way send has not started: status `scheduled`, no journal, no pinned
+// deployment. It must not hold a deploy (KgRepo.expire is delayed 4 h 10 min). Own
+// environment: the describe above leaves a suspended invocation behind on purpose.
+describe("queryNonCompletedInvocations ignores a scheduled call that has not started", () => {
+  let environments: Map<string, RestateTestEnvironment>;
+
+  beforeAll(async () => {
+    environments = await startVariants([drainProbe]);
+  }, 60_000);
+
+  afterAll(async () => {
+    await stopAll(environments);
+  });
+
+  async function sendDelayed(baseUrl: string, adminBaseUrl: string, key: string): Promise<void> {
+    const response = await fetch(`${baseUrl}/DrainProbeTest/${key}/follow/send?delay=10m`, { // restate-test-allow: ingress delayed one-way send
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    });
+    if (!response.ok) throw new Error(`delayed send failed: HTTP ${response.status}`);
+    const rows = await eventually(
+      () => queryInvocations(adminBaseUrl, `target_service_name = 'DrainProbeTest' AND target_service_key = '${key}'`),
+      (found) => found.length > 0,
+      { label: "the delayed send row in sys_invocation" },
+    );
+    expect(rows[0].status).toBe("scheduled");
+  }
+
+  it.each(VARIANTS.map(([label]) => label))("a lone scheduled call counts 0 (%s)", async (label) => {
+    const env = environments.get(label);
+    if (!env) throw new Error(`environment "${label}" did not start`);
+    const uri = await registeredDeploymentUri(env.adminAPIBaseUrl());
+    await sendDelayed(env.baseUrl(), env.adminAPIBaseUrl(), randomUUID());
+
+    expect(await queryNonCompletedInvocations(fetch, env.adminAPIBaseUrl(), uri)).toBe(0);
+  });
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "a scheduled call beside a suspended invocation counts only the suspended one (%s)",
+    async (label) => {
+      const env = environments.get(label);
+      if (!env) throw new Error(`environment "${label}" did not start`);
+      const uri = await registeredDeploymentUri(env.adminAPIBaseUrl());
+      await sendDelayed(env.baseUrl(), env.adminAPIBaseUrl(), randomUUID());
+      const key = randomUUID();
+      void callObject(env.baseUrl(), "DrainProbeTest", key, "block", {}).catch(() => {});
+      await waitForInvocation(env.adminAPIBaseUrl(), key, "block", ["running", "suspended"]);
+
+      expect(await queryNonCompletedInvocations(fetch, env.adminAPIBaseUrl(), uri)).toBe(1);
     },
   );
 });

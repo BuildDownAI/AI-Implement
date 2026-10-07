@@ -182,6 +182,7 @@ beforeEach(async () => {
   accessEntries.initAccessEntriesTable();
   accessAudit.initAccessAuditTable();
   accessGrants.initAccessPageGrantsTable();
+  (await import("../dispatch-breaker.js")).initDispatchBreakerTable(); // /api/blockers reads park state
   // Every /api/* request re-checks the signed-in identity and requires Admin, and only a listed
   // address can be one — a domain-only list would admit the suite's identity as a user and 403 it.
   process.env.OAUTH_ALLOWED_DOMAINS = "eudoxus.ai";
@@ -1649,7 +1650,9 @@ describe("admin mappings", () => {
       reviewFixLifecycle: "restate",
     }, token);
     expect(res.statusCode).toBe(400);
-    expect(JSON.parse(res.body).error).toContain("github-actions");
+    const error = JSON.parse(res.body).error;
+    expect(error).toContain("github-actions");
+    expect(error).toContain("leave the lifecycle on Legacy");
   });
 
   it("rejects reviewFixLifecycle='restate' on github-actions with an actionable 400 when no Restate endpoint status is available (fail closed, deps.getRestateStatus unset)", async () => {
@@ -1660,7 +1663,10 @@ describe("admin mappings", () => {
       reviewFixLifecycle: "restate",
     }, token);
     expect(res.statusCode).toBe(400);
-    expect(JSON.parse(res.body).error).toContain("Restate endpoint");
+    const error = JSON.parse(res.body).error;
+    expect(error).toContain("Restate endpoint");
+    expect(error).toContain("get_tenant_health");
+    expect(error).toContain('"registered"');
 
     const list = await request("/api/mappings", "GET", "secret", undefined, token);
     expect(JSON.parse(list.body).RFLGHA).toBeUndefined();
@@ -1680,6 +1686,7 @@ describe("admin mappings", () => {
     });
     expect(res.statusCode).toBe(400);
     expect(JSON.parse(res.body).error).toContain("run_attempt_token");
+    expect(JSON.parse(res.body).error).toContain("Sync workflows");
     expect(resolveWorkflowCapabilitiesMock).toHaveBeenCalledWith(expect.objectContaining({
       owner: "org", repo: "app", workflowFile: "claude-implement.yml", ref: "main", token: "gh-token-mock",
     }));
@@ -1718,7 +1725,9 @@ describe("admin mappings", () => {
       executionMode: "github-actions", reviewFixLifecycle: "restate",
     });
     expect(res.statusCode).toBe(400);
-    expect(JSON.parse(res.body).error).toContain("unreserved Legacy workers to drain");
+    const error = JSON.parse(res.body).error;
+    expect(error).toContain("1 run in flight has no dispatch reservation");
+    expect(error).toContain("No action is necessary");
     expect(resolveWorkflowCapabilitiesMock).not.toHaveBeenCalled();
   });
 
@@ -1763,6 +1772,7 @@ describe("admin mappings", () => {
     });
     expect(unsupported.statusCode).toBe(400);
     expect(JSON.parse(unsupported.body).error).toContain("run_publication_token");
+    expect(JSON.parse(unsupported.body).error).toContain("Sync workflows");
 
     resolveWorkflowCapabilitiesMock.mockRejectedValueOnce(new Error("secret probe detail"));
     const failed = await requestWithDeps("/api/mappings", "POST", token, healthy, {
@@ -1771,6 +1781,8 @@ describe("admin mappings", () => {
     });
     expect(failed.statusCode).toBe(400);
     expect(failed.body).not.toContain("secret probe detail");
+    expect(JSON.parse(failed.body).error).toContain("could not read");
+    expect(JSON.parse(failed.body).error).toContain("GitHub App installation");
   });
 
   it("does not write reviewFixLifecycle='restate' when a save is rejected — the mapping keeps its prior Legacy selection", async () => {
@@ -2040,7 +2052,7 @@ describe("admin runner-mode", () => {
 });
 
 describe("admin kg materialize-mode", () => {
-  const kgRefreshDeps = { trigger: vi.fn(), status: vi.fn(), onMachineLost: vi.fn() };
+  const kgRefreshDeps = { trigger: vi.fn(), status: vi.fn(), cancel: vi.fn() };
 
   beforeEach(() => {
     delete process.env.KG_MATERIALIZE_DIRECT;
@@ -2115,21 +2127,13 @@ describe("admin kg materialize-mode", () => {
     expect(res.statusCode).toBe(400);
   });
 
-  it("POST /api/kg/materialize-mode returns 409 when KG_MATERIALIZE_DIRECT env var is set", async () => {
+  it("POST /api/kg/materialize-mode answers 200 and persists even when KG_MATERIALIZE_DIRECT is set (AII-1109)", async () => {
     process.env.KG_MATERIALIZE_DIRECT = "true";
     const token = await login("secret");
     const res = await kgRequest("/api/kg/materialize-mode", "POST", token, { direct: false });
-    expect(res.statusCode).toBe(409);
-    const body = JSON.parse(res.body);
-    expect(body.error).toContain("KG_MATERIALIZE_DIRECT env var");
-    expect(body.persisted).toBe(false);
-    // Runtime value is still locked by the env var
-    expect(body.direct).toBe(true);
-    expect(body.source).toBe("env");
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ direct: false, source: "db" });
 
-    // And the DB write actually happened — clearing the env var should
-    // surface the persisted value.
-    delete process.env.KG_MATERIALIZE_DIRECT;
     const get = await kgRequest("/api/kg/materialize-mode", "GET", token);
     expect(JSON.parse(get.body).direct).toBe(false);
   });
@@ -2147,11 +2151,12 @@ describe("admin kg refresh dry-run (AII-635)", () => {
   const kgRefreshDeps = {
     trigger: vi.fn(async (_opts?: { dryRun?: boolean }) => ({ status: 202, body: { accepted: true } })),
     status: vi.fn(),
-    onMachineLost: vi.fn(),
+    cancel: vi.fn(),
   };
 
   beforeEach(() => {
     kgRefreshDeps.trigger.mockClear();
+    kgRefreshDeps.status.mockReset();
   });
 
   // The listed SSO admin the suite seeds (see adminConfig): an identity-bearing session.
@@ -2236,13 +2241,67 @@ describe("admin kg refresh dry-run (AII-635)", () => {
     expect(JSON.parse(res.body)).toMatchObject({ dryRun: true, acceptNewBaseline: true });
   });
 
+  it.each([
+    [409, { error: "refresh-in-progress" }],
+    [501, { error: "kg-source-not-configured" }],
+    [422, { error: "preflight-failed", detail: "x" }],
+    [507, { error: "insufficient-storage" }],
+  ])("POST /api/kg/refresh passes a %i tool answer through with its body (AII-901)", async (status, body) => {
+    kgRefreshDeps.trigger.mockResolvedValueOnce({ status, body } as never);
+    const token = await login("secret");
+    const res = await kgRequest("/api/kg/refresh", "POST", token);
+    expect(res.statusCode).toBe(status);
+    expect(JSON.parse(res.body)).toMatchObject(body);
+  });
+
+  it("POST /api/kg/refresh answers 202 { refreshing, triggerId } after a submit", async () => {
+    kgRefreshDeps.trigger.mockResolvedValueOnce({ status: 202, body: { refreshing: true, triggerId: "t-1" } } as never);
+    const token = await login("secret");
+    const res = await kgRequest("/api/kg/refresh", "POST", token);
+    expect(res.statusCode).toBe(202);
+    expect(JSON.parse(res.body)).toMatchObject({ refreshing: true, triggerId: "t-1" });
+  });
+
+  it("POST /api/kg/refresh answers 503 restate-unavailable with the body untouched", async () => {
+    kgRefreshDeps.trigger.mockResolvedValueOnce({ status: 503, body: { error: "restate-unavailable" } } as never);
+    const token = await login("secret");
+    const res = await kgRequest("/api/kg/refresh", "POST", token, { dryRun: true });
+    expect(res.statusCode).toBe(503);
+    expect(JSON.parse(res.body)).toEqual({ error: "restate-unavailable" });
+  });
+
+  it("a second quick POST /api/kg/refresh answers 409 refresh-in-progress (one workflow: KgRepo.trigger's live-refresh answer, pinned in tools.test.ts)", async () => {
+    kgRefreshDeps.trigger
+      .mockResolvedValueOnce({ status: 202, body: { refreshing: true, triggerId: "t-1" } } as never)
+      .mockResolvedValueOnce({ status: 409, body: { error: "refresh-in-progress" } } as never);
+    const token = await login("secret");
+    const first = await kgRequest("/api/kg/refresh", "POST", token);
+    const second = await kgRequest("/api/kg/refresh", "POST", token);
+    expect(first.statusCode).toBe(202);
+    expect(second.statusCode).toBe(409);
+    expect(JSON.parse(second.body)).toMatchObject({ error: "refresh-in-progress" });
+  });
+
+  it("GET /api/kg/status keeps the status body shape, and answers 503 when unavailable", async () => {
+    kgRefreshDeps.status
+      .mockResolvedValueOnce({ status: 200, body: { stage: "idle", lastRefresh: null } })
+      .mockResolvedValueOnce({ status: 503, body: { error: "restate-unavailable" } });
+    const token = await login("secret");
+    const ok = await kgRequest("/api/kg/status", "GET", token);
+    expect(ok.statusCode).toBe(200);
+    expect(JSON.parse(ok.body)).toEqual({ stage: "idle", lastRefresh: null });
+    const down = await kgRequest("/api/kg/status", "GET", token);
+    expect(down.statusCode).toBe(503);
+    expect(JSON.parse(down.body)).toEqual({ error: "restate-unavailable" });
+  });
+
   it("the Deployments page carries the Dry-run refresh button and the last-dry-run block", async () => {
-    const page = await import("../admin-ui/pages/deployments.js");
-    expect(page.deploymentsHtml).toContain('id="kg-dry-run-btn"');
-    expect(page.deploymentsHtml).toContain("window.triggerKgRefresh(true)");
-    expect(page.deploymentsHtml).toContain('id="kg-dry-run-last"');
-    expect(page.deploymentsScript).toContain("JSON.stringify({ dryRun: true })");
-    expect(page.deploymentsScript).toContain("function renderKgDryRun(");
+    const page = await import("../admin-ui/pages/kg-pipelines.js");
+    expect(page.kgPipelinesHtml).toContain('id="kg-dry-run-btn"');
+    expect(page.kgPipelinesHtml).toContain("window.triggerKgRefresh(true)");
+    expect(page.kgPipelinesHtml).toContain('id="kg-dry-run-last"');
+    expect(page.kgPipelinesScript).toContain("JSON.stringify({ dryRun: true })");
+    expect(page.kgPipelinesScript).toContain("function renderKgDryRun(");
   });
 });
 
@@ -3456,6 +3515,32 @@ describe("admin blockers endpoint", () => {
     expect(body.totals.issues).toBe(1);
   });
 
+  it("lists a parked issue as parked for the phase it would run next, and no other phase", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", { teamKey: "CORE", owner: "org", repo: "core", planningWorkflowFile: "claude-plan.yml" }, token);
+    const { initDispatchBreakerTable, parkIssue } = await import("../dispatch-breaker.js");
+    initDispatchBreakerTable();
+    const mk = (id: string, identifier: string): TicketIssue => ({ id, identifier, title: identifier, description: null, scopeKey: "CORE", nativeStatus: "Todo" });
+    parkIssue("impl-1", "implementation", "x");
+    parkIssue("plan-1", "planning", "x");
+    parkIssue("plan-2", "implementation", "x"); // wrong phase for a needsPlanning issue
+    dedup.markDispatched("impl-1", "TEAM", "CORE-1", "t"); // parked wins over dedup
+    vi.spyOn(provider, "fetchAIImplementSnapshot").mockResolvedValueOnce({
+      readyForImplementation: [mk("impl-1", "CORE-1")],
+      needsPlanning: [mk("plan-1", "CORE-2"), mk("plan-2", "CORE-3")],
+      inProgressCountsByScope: {},
+      parentsToFinalize: [],
+    });
+    const res = await request("/api/blockers", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.blockers.map((b: { issueIdentifier: string; reason: string }) => [b.issueIdentifier, b.reason])).toEqual([
+      ["CORE-1", "parked"],
+      ["CORE-2", "parked"],
+    ]);
+    expect(body.totals.byReason.parked).toBe(2);
+  });
+
   it("lists a Linear issue whose key belongs to a Jira mapping as no-mapping, and keeps it off /api/issues", async () => {
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", {
@@ -3920,6 +4005,46 @@ describe("POST /api/tools/<name>", () => {
       name: "Reader",
     });
   }
+
+  it("answers 409 deploy-in-progress with deployStartedAt and never contacts the ingress during a hold", async () => {
+    const { setDeployHold, clearDeployHold } = await import("../deploy-hold.js");
+    const { callTool } = await vi.importActual<typeof import("../restate/tools-client.js")>("../restate/tools-client.js");
+    const fetchImpl = vi.fn();
+    setDeployHold();
+    try {
+      const token = await login("secret");
+      const res = await toolRequest(token, { args: {} }, {
+        callTool: (name, args, caller) => callTool(name, args, caller, { fetchImpl: fetchImpl as unknown as typeof fetch }),
+      });
+      expect(res.statusCode).toBe(409);
+      expect(JSON.parse(res.body)).toEqual({ error: "deploy-in-progress", deployStartedAt: expect.any(Number) });
+      expect(fetchImpl).not.toHaveBeenCalled();
+    } finally {
+      clearDeployHold();
+    }
+  });
+
+  it.each([
+    ["a refused connection", () => Promise.reject(new Error("ECONNREFUSED"))],
+    ["a 5xx answer", () => Promise.resolve(new Response("boom", { status: 503 }))],
+  ])("answers 503 restate-unavailable with no hold and %s", async (_label, fetchResult) => {
+    const { callTool } = await vi.importActual<typeof import("../restate/tools-client.js")>("../restate/tools-client.js");
+    const fetchImpl = vi.fn(fetchResult);
+    const token = await login("secret");
+    const res = await toolRequest(token, { args: {} }, {
+      callTool: (name, args, caller) => callTool(name, args, caller, { fetchImpl: fetchImpl as unknown as typeof fetch, permitsExternalCall: () => true }),
+    });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(res.statusCode).toBe(503);
+    expect(JSON.parse(res.body)).toEqual({ error: "restate-unavailable" });
+  });
+
+  it("answers 503 restate-unavailable when callTool reports an outage", async () => {
+    const token = await login("secret");
+    const res = await toolRequest(token, { args: {} }, { callTool: async () => ({ status: "unavailable" }) });
+    expect(res.statusCode).toBe(503);
+    expect(JSON.parse(res.body)).toEqual({ error: "restate-unavailable" });
+  });
 
   it("rejects an unauthenticated request with the route's existing 401, without calling the tool", async () => {
     const called = vi.fn();
@@ -4816,6 +4941,119 @@ describe("POST /api/deploy-policy", () => {
   });
 });
 
+describe("/api/retention", () => {
+  async function retentionRequest(
+    token: string,
+    method: "GET" | "POST",
+    body: unknown,
+    apply = vi.fn(async (_days: number) => ({ applied: ["vol_1"], skipped: "" })),
+  ): Promise<{ statusCode: number; body: Record<string, unknown>; apply: typeof apply }> {
+    const retention = await import("../restate/retention.js");
+    const deps: Parameters<typeof admin.handleAdminRequest>[4] = {
+      retention: {
+        getRestateDays: retention.getRestateRetentionDays,
+        setRestateDays: retention.setRestateRetentionDays,
+        getVolumeDays: retention.getVolumeSnapshotRetentionDays,
+        setVolumeDays: retention.setVolumeSnapshotRetentionDays,
+        applyVolume: apply,
+        default: retention.RESTATE_RETENTION_DAYS_DEFAULT,
+        min: retention.RESTATE_RETENTION_DAYS_MIN,
+        max: retention.RESTATE_RETENTION_DAYS_MAX,
+      },
+    };
+    const req = new MockRequest("/api/retention", method, { authorization: `Bearer ${token}` }, body === undefined ? undefined : JSON.stringify(body));
+    const res = new MockResponse();
+    admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider), deps);
+    await res.done;
+    return { statusCode: res.statusCode, body: res.body ? JSON.parse(res.body) : {}, apply };
+  }
+
+  it("answers 501 on GET and POST when retention is not configured", async () => {
+    const token = await login("secret");
+    for (const method of ["GET", "POST"] as const) {
+      const req = new MockRequest("/api/retention", method, { authorization: `Bearer ${token}` }, method === "POST" ? JSON.stringify({ restate: 10 }) : undefined);
+      const res = new MockResponse();
+      admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider), {});
+      await res.done;
+      expect(res.statusCode).toBe(501);
+    }
+  });
+
+  it("rejects an unauthenticated request", async () => {
+    expect((await retentionRequest("not-a-session", "POST", { restate: 10 })).statusCode).toBe(401);
+  });
+
+  it("refuses a non-admin session as /api/deploy-policy does", async () => {
+    const user = adminSession.createSession({ email: "reader@eudoxus.ai", sub: "google|reader", provider: "google", name: "Reader" });
+    const policy = new MockRequest("/api/deploy-policy", "POST", { authorization: `Bearer ${user}` }, JSON.stringify({ autoDeploy: true }));
+    const policyRes = new MockResponse();
+    admin.handleAdminRequest(policy as never, policyRes as never, adminConfig("secret"), makeFakeRegistry(provider), {});
+    await policyRes.done;
+
+    const res = await retentionRequest(user, "POST", { volume: 20 });
+    expect(res.statusCode).toBe(policyRes.statusCode);
+    expect(res.statusCode).toBe(403);
+    expect(res.apply).not.toHaveBeenCalled();
+  });
+
+  it("answers the fresh-database shape on GET", async () => {
+    const token = await login("secret");
+    const res = await retentionRequest(token, "GET", undefined);
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toEqual({
+      restate: { days: 14, appliesAt: "next deploy or restart" },
+      volume: { days: 14, lastApplied: null },
+      default: 14,
+      min: 1,
+      max: 60,
+    });
+  });
+
+  it("answers 400 naming restate_retention_days for 61 and stores nothing", async () => {
+    const token = await login("secret");
+    const retention = await import("../restate/retention.js");
+    const res = await retentionRequest(token, "POST", { restate: 61 });
+    expect(res.statusCode).toBe(400);
+    expect(String(res.body.error)).toContain("restate_retention_days");
+    expect(retention.getRestateRetentionDays()).toBe(14);
+  });
+
+  it("stores neither value when one of two is bad, and rejects non-integers", async () => {
+    const token = await login("secret");
+    const retention = await import("../restate/retention.js");
+    const mixed = await retentionRequest(token, "POST", { restate: 10, volume: 99 });
+    expect(mixed.statusCode).toBe(400);
+    expect(String(mixed.body.error)).toContain("volume_snapshot_retention_days");
+    expect(retention.getRestateRetentionDays()).toBe(14);
+    expect(mixed.apply).not.toHaveBeenCalled();
+    expect((await retentionRequest(token, "POST", { restate: "10" })).statusCode).toBe(400);
+    expect((await retentionRequest(token, "POST", { volume: 2.5 })).statusCode).toBe(400);
+  });
+
+  it("stores volume, applies it once, and reports lastApplied", async () => {
+    const token = await login("secret");
+    const retention = await import("../restate/retention.js");
+    const res = await retentionRequest(token, "POST", { volume: 20 });
+    expect(res.statusCode).toBe(200);
+    expect(retention.getVolumeSnapshotRetentionDays()).toBe(20);
+    expect(res.apply).toHaveBeenCalledTimes(1);
+    expect(res.apply).toHaveBeenCalledWith(20);
+    const volume = res.body.volume as { days: number; lastApplied: { at: number; applied: string[]; skipped: string } };
+    expect(volume.days).toBe(20);
+    expect(volume.lastApplied).toMatchObject({ applied: ["vol_1"], skipped: "" });
+    expect(typeof volume.lastApplied.at).toBe("number");
+  });
+
+  it("stores restate without applying the volume", async () => {
+    const token = await login("secret");
+    const retention = await import("../restate/retention.js");
+    const res = await retentionRequest(token, "POST", { restate: 10 });
+    expect(res.statusCode).toBe(200);
+    expect(retention.getRestateRetentionDays()).toBe(10);
+    expect(res.apply).toHaveBeenCalledTimes(0);
+  });
+});
+
 describe("per-page grants", () => {
   /** Admitted by the domain seed, so a `user` rather than an admin. */
   function userSession(): string {
@@ -4899,6 +5137,49 @@ describe("per-page grants", () => {
       accessGrants.savePageGrants(["audit", "reports"], "ada@eudoxus.ai");
       const res = await request("/api/session-identity", "GET", "secret", undefined, userSession());
       expect(JSON.parse(res.body)).toMatchObject({ role: "user", grantedPages: ["audit", "reports"] });
+    });
+  });
+
+  describe("journal grant", () => {
+    const journalFetch = vi.fn();
+    const journalDeps = {
+      readJournal: (query: Record<string, string>) => journalModule.handleJournalRequest(query, { fetchImpl: journalFetch as never }),
+    };
+    let journalModule: typeof import("../restate/journal-query.js");
+    beforeEach(async () => {
+      journalFetch.mockReset();
+      journalModule = await import("../restate/journal-query.js");
+    });
+
+    it("answers 400 on a bad lookup and never calls the admin API", async () => {
+      const res = await requestWithDeps("/api/restate/journal?service=KgRefresh&key=x'y", "GET", adminSsoSession(), journalDeps);
+      expect(res.statusCode).toBe(400);
+      expect(JSON.parse(res.body).error).toMatch(/^key/);
+      expect(journalFetch).not.toHaveBeenCalled();
+    });
+
+    it("refuses a user with no grant, and admits one with the grant despite the query string", async () => {
+      const path = "/api/restate/journal?service=KgRefresh&key=abc";
+      expect((await requestWithDeps(path, "GET", userSession(), journalDeps)).statusCode).toBe(403);
+      accessGrants.savePageGrants(["journal"], "ada@eudoxus.ai");
+      journalFetch.mockResolvedValue(new Response(JSON.stringify({ rows: [] }), { status: 200 }));
+      expect((await requestWithDeps(path, "GET", userSession(), journalDeps)).statusCode).toBe(404);
+      expect(journalFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it("admits an admin without a grant", async () => {
+      journalFetch.mockResolvedValue(new Response(JSON.stringify({ rows: [] }), { status: 200 }));
+      const res = await requestWithDeps("/api/restate/journal?id=inv_1", "GET", adminSsoSession(), journalDeps);
+      expect(res.statusCode).toBe(404);
+      expect(JSON.parse(res.body)).toEqual({ error: "no invocation" });
+    });
+
+    it("answers 503 when the admin API throws", async () => {
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      journalFetch.mockRejectedValue(new Error("down"));
+      const res = await requestWithDeps("/api/restate/journal?id=inv_1", "GET", adminSsoSession(), journalDeps);
+      expect(res.statusCode).toBe(503);
+      expect(JSON.parse(res.body)).toEqual({ error: "restate unavailable" });
     });
   });
 
@@ -5352,7 +5633,7 @@ describe("admin sessions — kg-refresh destroy", () => {
     );
     const res = new MockResponse();
     admin.handleAdminRequest(req as never, res as never, sessionsConfig(), makeFakeRegistry(provider), {
-      kgRefresh: kgRefresh ?? { trigger: vi.fn(), status: vi.fn(), onMachineLost: vi.fn() },
+      kgRefresh: kgRefresh ?? { trigger: vi.fn(), status: vi.fn(), cancel: vi.fn() },
     });
     await res.done;
     return { statusCode: res.statusCode, body: res.body };
@@ -5380,20 +5661,7 @@ describe("admin sessions — kg-refresh destroy", () => {
     expect(destroyMachineMock).toHaveBeenCalledWith(FLY_TOKEN, FLY_APP, "m-kg-cancel");
   });
 
-  it("calls kgRefresh.onMachineLost with operator_cancelled failureCode", async () => {
-    const token = await login("secret");
-    const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "fly-machines" });
-    log.updateJobMachineDetails(jobId, { machineNonce: "nonce-kg", machineId: "m-kg-cancel2" });
-    log.updateJobMachineId(jobId, "m-kg-cancel2");
-
-    const onMachineLost = vi.fn();
-    await deleteSession("m-kg-cancel2", token, { trigger: vi.fn(), status: vi.fn(), onMachineLost });
-
-    expect(onMachineLost).toHaveBeenCalledOnce();
-    expect(onMachineLost).toHaveBeenCalledWith({ failureCode: "operator_cancelled" });
-  });
-
-  it("stamps the job row operator_cancelled before calling onMachineLost", async () => {
+  it("stamps the job row operator_cancelled", async () => {
     const token = await login("secret");
     const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "fly-machines" });
     log.updateJobMachineDetails(jobId, { machineNonce: "nonce-kg", machineId: "m-kg-cancel3" });
@@ -5419,36 +5687,63 @@ describe("admin sessions — kg-refresh destroy", () => {
     expect(clearWorkingState).not.toHaveBeenCalled();
   });
 
-  it("GHA-mode kg-refresh cancel reaches cancelWorkflowRun and returns 200 (not 422)", async () => {
+  it("Fly-mode kg-refresh cancel destroys the machine and also calls the workflow cancel, tolerating a non-200", async () => {
     const token = await login("secret");
-    const jobId = log.appendLog({
-      issueId: "kg-refresh",
-      phase: "kg-refresh",
-      executionMode: "github-actions",
-      repo: "TestOrg/test-kg",
-    });
-    log.updateJobRunId(jobId, 12345);
-    // GHA jobs have no machineId; pass the numeric jobId so handleDestroySession
-    // falls back to getJobById (Number.isFinite path in admin.ts).
-    const res = await deleteSession(String(jobId), token);
+    const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "fly-machines", dispatchId: "t-fly" });
+    log.updateJobMachineDetails(jobId, { machineNonce: "nonce-kg", machineId: "m-kg-cancel5" });
+    log.updateJobMachineId(jobId, "m-kg-cancel5");
+    const cancel = vi.fn(async () => ({ status: 409, body: { error: "no-refresh-in-flight" } }));
+    const res = await deleteSession("m-kg-cancel5", token, { trigger: vi.fn(), status: vi.fn(), cancel });
 
     expect(res.statusCode).toBe(200);
-    expect(cancelWorkflowRunMock).toHaveBeenCalledWith("gh-token-mock", "TestOrg", "test-kg", 12345);
+    expect(destroyMachineMock).toHaveBeenCalledWith(FLY_TOKEN, FLY_APP, "m-kg-cancel5");
+    expect(cancel).toHaveBeenCalledWith({ jobId, dispatchId: "t-fly", reason: "operator_cancelled" });
+    expect(log.getJobById(jobId)?.conclusion).toBe("operator_cancelled");
   });
 
-  it("GHA-mode kg-refresh cancel returns 422 when repo is absent on the row", async () => {
-    const token = await login("secret");
-    const jobId = log.appendLog({
-      issueId: "kg-refresh",
-      phase: "kg-refresh",
-      executionMode: "github-actions",
-      // repo intentionally omitted to confirm the guard fires
-    });
-    log.updateJobRunId(jobId, 99999);
-    const res = await deleteSession(String(jobId), token);
+  async function ghaKgJob(): Promise<number> {
+    const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "github-actions", repo: "TestOrg/test-kg", dispatchId: "t-gha" });
+    log.updateJobRunId(jobId, 12345);
+    return jobId;
+  }
 
-    expect(res.statusCode).toBe(422);
+  it("GHA-mode kg-refresh cancel calls the workflow cancel, then stamps the row, and never cancels the run itself", async () => {
+    const token = await login("secret");
+    const jobId = await ghaKgJob();
+    const cancel = vi.fn(async () => ({ status: 200, body: { cancelled: true } }));
+    const res = await deleteSession(String(jobId), token, { trigger: vi.fn(), status: vi.fn(), cancel });
+
+    expect(res.statusCode).toBe(200);
+    expect(cancel).toHaveBeenCalledWith({ jobId, dispatchId: "t-gha", reason: "operator_cancelled" });
     expect(cancelWorkflowRunMock).not.toHaveBeenCalled();
+    expect(destroyMachineMock).not.toHaveBeenCalled();
+    expect(log.getJobById(jobId)?.conclusion).toBe("operator_cancelled");
+  });
+
+  it("GHA-mode kg-refresh cancel answers 503 when the workflow is unavailable, without notifying", async () => {
+    const token = await login("secret");
+    const jobId = await ghaKgJob();
+    const cancel = vi.fn(async () => ({ status: 503, body: { error: "restate-unavailable" } }));
+    const res = await deleteSession(String(jobId), token, { trigger: vi.fn(), status: vi.fn(), cancel });
+
+    expect(res.statusCode).toBe(503);
+    expect(JSON.parse(res.body)).toEqual({ error: "restate-unavailable" });
+    expect(notifyTextMock).not.toHaveBeenCalled();
+    expect(log.getJobById(jobId)?.conclusion).not.toBe("operator_cancelled");
+  });
+
+  it("GHA-mode kg-refresh cancel passes a 409 no-refresh-in-flight through and leaves the row untouched", async () => {
+    const token = await login("secret");
+    const jobId = await ghaKgJob();
+    const before = log.getJobById(jobId);
+    const cancel = vi.fn(async () => ({ status: 409, body: { error: "no-refresh-in-flight" } }));
+    const res = await deleteSession(String(jobId), token, { trigger: vi.fn(), status: vi.fn(), cancel });
+
+    expect(res.statusCode).toBe(409);
+    const after = log.getJobById(jobId);
+    expect(after?.status).toBe(before?.status);
+    expect(after?.conclusion).toBe(before?.conclusion);
+    expect(notifyTextMock).not.toHaveBeenCalled();
   });
 
   it("issue-keyed session destroy still calls provider.clearWorkingState (regression pin)", async () => {

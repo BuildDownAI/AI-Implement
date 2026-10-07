@@ -145,7 +145,7 @@ describe("createStageExecutor", () => {
 
   it("does not finish or dispose a profile", async () => {
     const auth = { ...fakeAuth(), finish: vi.fn(), dispose: vi.fn() };
-    const ex = createStageExecutor({ workspaceDir: "/tmp", legacy: fakeExec(), snapshot, auth, createClaude: () => fakeExec() as never });
+    const ex = createStageExecutor({ createCodex: () => fakeExec(), workspaceDir: "/tmp", legacy: fakeExec(), snapshot, auth, createClaude: () => fakeExec() as never });
     await ex.invoke({ ...base, agentStage: "implementation" });
     expect(auth.finish).not.toHaveBeenCalled();
     expect(auth.dispose).not.toHaveBeenCalled();
@@ -173,7 +173,7 @@ describe("Claude selected env isolation", () => {
     const events: string[] = [];
     const spawnMock = claudeSpawn(0);
     const claude = new ClaudeCliExecutor("/tmp", "summary", true, spawnMock as unknown as typeof spawn);
-    const ex = createStageExecutor({ workspaceDir: "/tmp", legacy: fakeExec(), snapshot, auth: fakeAuth(events), createClaude: () => claude });
+    const ex = createStageExecutor({ createCodex: () => fakeExec(), workspaceDir: "/tmp", legacy: fakeExec(), snapshot, auth: fakeAuth(events), createClaude: () => claude });
     const res = await ex.invoke({ ...base, agentStage: "implementation" });
     const env = (spawnMock.mock.calls[0] as unknown as [string, string[], { env: Record<string, string> }])[2].env;
     expect(env).toEqual({ PATH: "/bin", ANTHROPIC_API_KEY: "synthetic-selected-key-0000" });
@@ -241,11 +241,18 @@ describe("real CodexExecutor behind the selector", () => {
     return { invoke, finish, dispose, events } as unknown as Pick<ModelAuthClient, "invoke"> & { invoke: typeof invoke; finish: typeof finish; dispose: typeof dispose; events: string[] };
   }
 
+  // Planning is mapped to the implementation selection so these exec-path tests need no protocol driver.
+  const execSnapshot: ResolvedAgentSnapshotV1 = {
+    ...snapshot,
+    stages: { ...snapshot.stages, planning: { ...snapshot.stages.implementation } },
+    profiles: { ...snapshot.profiles, planning: { ...snapshot.profiles.implementation } },
+  };
+
   const make = (auth: ReturnType<typeof checkpointAuth>, spawnImpl: typeof spawn) =>
     createStageExecutor({
       workspaceDir: "/tmp",
       legacy: fakeExec(),
-      snapshot,
+      snapshot: execSnapshot,
       auth,
       allowRepositoryWrites: true,
       codexOptions: { spawnImpl, sleepImpl: async () => {}, termWaitMs: 20, killWaitMs: 20 },
@@ -299,14 +306,94 @@ describe("real CodexExecutor behind the selector", () => {
     expect(auth.dispose).not.toHaveBeenCalled();
   });
 
-  it("refuses Codex planning before any auth or spawn", async () => {
+  it("routes planning=codex to the app-server planning argv, distinct from implementation and review", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const log: Spawned[] = [];
+    const spawnImpl = codexSpawn({ hang: true }, log);
+    const run = vi.fn(async (input: { io: { stdin: { end(): void } } }) => {
+      input.io.stdin.end();
+      return { result: { ...ok, stdout: "plan" }, sawUnsafe: false, stopReason: null as null };
+    });
     const auth = checkpointAuth();
-    const spawnImpl = codexSpawn();
-    const ex = make(auth, spawnImpl);
-    const err = await ex.invoke({ ...base, agentStage: "planning" }).catch((e) => e);
-    expect(err.code).toBe("CODEX_PLANNING_POLICY_UNPROVEN");
-    expect(err.attribution).toMatchObject({ outcome: "error", agent: "codex", stage: "planning" });
+    const driverSnapshot: ResolvedAgentSnapshotV1 = {
+      ...snapshot,
+      stages: { ...snapshot.stages, implementation: { ...snapshot.stages.review, model: "gpt-impl" } },
+      profiles: { ...snapshot.profiles, implementation: { ...snapshot.profiles.review } },
+    };
+    const ex = createStageExecutor({
+      workspaceDir: "/tmp",
+      legacy: fakeExec(),
+      snapshot: driverSnapshot,
+      auth,
+      allowRepositoryWrites: true,
+      codexOptions: { spawnImpl, sleepImpl: async () => {}, termWaitMs: 20, killWaitMs: 20, protocolDriver: { run } as never },
+    });
+    const planning = await ex.invoke({ ...base, agentStage: "planning" }).catch((e) => e);
+    expect(planning.code).not.toBe("CODEX_PLANNING_POLICY_UNPROVEN");
+    const planArgs = log[0]?.args ?? [];
+    // Implementation/review use the exec path; they reuse the review-style spawn mock that completes.
+    const execSpawn = codexSpawn({}, log);
+    const exec = createStageExecutor({
+      workspaceDir: "/tmp",
+      legacy: fakeExec(),
+      snapshot: { ...driverSnapshot, stages: { ...driverSnapshot.stages, planning: { ...driverSnapshot.stages.review } }, profiles: { ...driverSnapshot.profiles, planning: { ...driverSnapshot.profiles.review } } },
+      auth: checkpointAuth(),
+      allowRepositoryWrites: true,
+      codexOptions: { spawnImpl: execSpawn, sleepImpl: async () => {}, termWaitMs: 20, killWaitMs: 20 },
+    });
+    await exec.invoke({ ...base, agentStage: "implementation" });
+    await exec.invoke({ ...base, agentStage: "review" });
+    const implArgs = log[1].args;
+    const reviewArgs = log[2].args;
+    expect(planArgs[0]).toBe("app-server");
+    expect(planArgs).toContain('sandbox_mode="read-only"');
+    expect(planArgs).toContain("features.shell_tool=false");
+    expect(implArgs).toContain("workspace-write");
+    expect(reviewArgs).toContain("read-only");
+    for (const args of [planArgs, implArgs, reviewArgs]) {
+      expect(args.join(" ")).not.toMatch(/bypass|dangerously|--yolo|full-access|--max-turns|--allowedTools/);
+    }
+    expect(planArgs).not.toContain("workspace-write");
+    expect(planArgs).not.toEqual(reviewArgs);
+    expect(planArgs).not.toEqual(implArgs);
+  });
+});
+
+describe("static attribution validation", () => {
+  const withImplModel = (model: string): ResolvedAgentSnapshotV1 => ({
+    ...snapshot,
+    stages: { ...snapshot.stages, implementation: { ...snapshot.stages.implementation, model } },
+  });
+  const withImplProfileId = (id: string): ResolvedAgentSnapshotV1 => ({
+    ...snapshot,
+    profiles: { ...snapshot.profiles, implementation: { ...snapshot.profiles.implementation, id } },
+  });
+  const withSnapshotId = (snapshotId: string): ResolvedAgentSnapshotV1 => ({ ...snapshot, snapshotId });
+
+  it.each([
+    ["overlong model", withImplModel("m".repeat(300)), "m".repeat(50)],
+    ["credential-shaped model", withImplModel("sk-ant-abcdefghijklmnop0123"), "sk-ant-abcdefghijklmnop0123"],
+    ["model with whitespace", withImplModel("bad model\nname"), "bad model"],
+    ["invalid profile id", withImplProfileId("profile id with spaces"), "profile id with spaces"],
+    ["invalid snapshot id", withSnapshotId("snap\u0000id"), "snap"],
+  ])("fails closed before auth or spawn for %s without echoing it", async (_name, bad, leaked) => {
+    const auth = fakeAuth();
+    const claude = fakeExec();
+    const ex = createStageExecutor({ createCodex: () => fakeExec(), workspaceDir: "/tmp", legacy: fakeExec(), snapshot: bad, auth, createClaude: () => claude as never });
+    const err = await ex.invoke({ ...base, agentStage: "implementation" }).catch((e) => e);
+    expect(err).toBeInstanceOf(AgentStageError);
+    expect(String(err.message).length).toBeLessThan(200);
+    expect(String(err.message)).not.toContain(leaked);
+    expect(err.attribution).toBeUndefined();
     expect(auth.invoke).not.toHaveBeenCalled();
-    expect(spawnImpl).not.toHaveBeenCalled();
+    expect(claude.invoke).not.toHaveBeenCalled();
+  });
+
+  it("strips only usage from a valid static projection when usage is unusable", async () => {
+    const bad = { ...ok, telemetry: { ...ok.telemetry!, tokensIn: -5 } } as LLMResult;
+    const ex = createStageExecutor({ createCodex: () => fakeExec(), workspaceDir: "/tmp", legacy: fakeExec(), snapshot, auth: fakeAuth(), createClaude: () => fakeExec(bad) as never });
+    const result = await ex.invoke({ ...base, agentStage: "implementation" });
+    expect(result.attribution).toMatchObject({ agent: "claude", model: "claude-impl", profileId: "p-impl", limit: { kind: "max_turns", value: 7 } });
+    expect(result.attribution?.usage).toBeNull();
   });
 });

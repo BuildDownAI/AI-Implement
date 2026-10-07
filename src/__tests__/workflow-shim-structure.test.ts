@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { parse } from "yaml";
+import { INPUT_CONTRACT } from "./helpers/workflow-input-contract.js";
 import { GITHUB_WRITE_CREDENTIAL_KEYS } from "../pipeline/process-env.js";
 
 const IMPLEMENT_WORKFLOWS = [
@@ -116,21 +117,28 @@ describe("GHA workflow shims", () => {
     }
   });
 
+  for (const f of [...IMPLEMENT_WORKFLOWS, ...PLANNING_WORKFLOWS]) {
+    it(`${f} advertises the static private-envelope marker without a dispatch input`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      expect(yaml).toMatch(/^# ai-implement-capability: private-run-config-v1$/m);
+      expect(yaml).not.toMatch(/stage-agent-config/);
+      const doc = parse(yaml) as any;
+      for (const name of Object.keys(doc.on.workflow_dispatch.inputs)) {
+        expect(name).not.toMatch(/private|capab|marker/i);
+      }
+    });
+
+    it(`${f} never decodes or dumps run_config outside the projection`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      expect(yaml).not.toMatch(/base64 -d \| jq \.\s/);
+      expect(yaml).not.toMatch(/set -[a-z]*x/);
+    });
+  }
+
   for (const f of IMPLEMENT_WORKFLOWS) {
     it(`${f} declares the optional attempt correlation input alongside the legacy envelope inputs`, () => {
       const doc = parse(readFileSync(f, "utf-8")) as any;
-      expect(Object.keys(doc.on.workflow_dispatch.inputs)).toEqual([
-        "run_config",
-        "issue_identifier",
-        "run_attempt_token",
-        "runner_image",
-        "job_timeout_minutes",
-        "provider",
-        "aws_region",
-        "run_token",
-        "run_progress_token",
-        "run_publication_token",
-      ]);
+      expect(Object.keys(doc.on.workflow_dispatch.inputs)).toEqual(Object.keys(INPUT_CONTRACT.implement.inputs));
     });
 
     it(`${f} declares issue_identifier as an optional, display-only string input`, () => {
@@ -155,16 +163,7 @@ describe("GHA workflow shims", () => {
   for (const f of PLANNING_WORKFLOWS) {
     it(`${f} declares exactly the 8 envelope inputs, in order`, () => {
       const doc = parse(readFileSync(f, "utf-8")) as any;
-      expect(Object.keys(doc.on.workflow_dispatch.inputs)).toEqual([
-        "run_config",
-        "issue_identifier",
-        "runner_image",
-        "job_timeout_minutes",
-        "provider",
-        "aws_region",
-        "run_token",
-        "run_progress_token",
-      ]);
+      expect(Object.keys(doc.on.workflow_dispatch.inputs)).toEqual(Object.keys(INPUT_CONTRACT.plan.inputs));
     });
 
     it(`${f} declares issue_identifier as an optional, display-only string input`, () => {
@@ -425,9 +424,10 @@ describe("GHA workflow shims", () => {
       expect(maskStep.run).not.toContain("inputs.run_publication_token");
 
       const pipelineStep = doc.jobs.implement.steps.find((step: any) => step.name === "Run pipeline");
-      expect(pipelineStep.env.RUN_PUBLICATION_TOKEN).toBe("${{ inputs.run_publication_token }}");
+      // Delivered as a masked bootstrap-step output mapped into this step only.
+      expect(pipelineStep.env.RUN_PUBLICATION_TOKEN).toBe("${{ steps.bootstrap.outputs.run_publication_token }}");
       const otherSteps = doc.jobs.implement.steps.filter(
-        (step: any) => step.name !== "Run pipeline",
+        (step: any) => step.name !== "Run pipeline" && step.name !== "Mask runner callback tokens",
       );
       expect(JSON.stringify(otherSteps)).not.toContain("RUN_PUBLICATION_TOKEN");
     });
@@ -566,8 +566,12 @@ describe("GHA workflow shims", () => {
 
     it(`${f} wires run tokens to the entrypoint env`, () => {
       const yaml = readFileSync(f, "utf-8");
-      expect(yaml).toMatch(/RUN_TOKEN:\s*\$\{\{\s*inputs\.run_token\s*\}\}/);
-      expect(yaml).toMatch(/RUN_PROGRESS_TOKEN:\s*\$\{\{\s*inputs\.run_progress_token\s*\}\}/);
+      expect(yaml).toMatch(/RUN_TOKEN:\s*\$\{\{\s*steps\.bootstrap\.outputs\.run_token\s*\}\}/);
+      expect(yaml).toMatch(/RUN_PROGRESS_TOKEN:\s*\$\{\{\s*steps\.bootstrap\.outputs\.run_progress_token\s*\}\}/);
+      const doc = parse(yaml);
+      const bootstrap = doc.jobs.plan.steps.find((s: any) => s.name === "Mask runner callback tokens");
+      expect(bootstrap.run).toContain("RUN_TOKEN");
+      expect(bootstrap.run).toContain("RUN_PROGRESS_TOKEN");
       expect(yaml).not.toMatch(/run_publication_token/);
       expect(yaml).not.toMatch(/RUN_PUBLICATION_TOKEN/);
     });

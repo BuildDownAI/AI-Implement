@@ -582,7 +582,7 @@ export class ClaudeCliExecutor implements LLMExecutor {
         proc = this.spawnImpl("claude", args, {
           cwd: this.workspaceDir,
           stdio: ["pipe", "pipe", "pipe"],
-          env: modelProcessEnv(this.allowRepositoryWrites, selectedEnv),
+          env: modelProcessEnv(this.allowRepositoryWrites, selectedEnv ? { env: selectedEnv } : undefined),
           // Makes the CLI its own process-group leader, which is what makes
           // `process.kill(-pid, …)` in killProcessGroup address the CLI and every
           // subprocess it forks, not just the CLI itself. Side effect: a SIGTERM/SIGINT

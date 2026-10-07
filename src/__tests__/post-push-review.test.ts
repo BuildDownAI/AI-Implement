@@ -4708,7 +4708,7 @@ describe("postPushReviewStep", () => {
     expect(sleep).toHaveBeenCalledTimes(1);
   });
 
-  it("satisfies the gate when a matching check concluded 'failure'", async () => {
+  it("does not satisfy the gate when a matching check concluded 'failure'", async () => {
     const reviewerOutput = { approved: true, blocking_issues: [], feedback: "ok", score: 9, progress_delta: 0 };
     const sleep = vi.fn(async () => undefined);
     let checkProbes = 0;
@@ -4738,10 +4738,114 @@ describe("postPushReviewStep", () => {
       { report: vi.fn(async () => undefined) },
     );
 
-    // A "failure" conclusion is a real reviewer verdict — the gate should proceed to completion.
+    // A failed review check carries no verdict: the review-findings/v1 emitter fails its check
+    // only when it has none to post, and claude-code-action fails only when its run errors.
     expect(sleep).toHaveBeenCalled();
     expect(checkProbes).toBeGreaterThanOrEqual(2);
-    expect(out.approved).toBe(true);
+    expect(out.approved).toBe(false);
+    expect(out.terminationReason).toBe("invalid_review");
+  });
+
+  describe("a review check that finished without a verdict (AII-1103)", () => {
+    const failedRunComment = {
+      user: { login: "github-actions[bot]", type: "Bot" },
+      created_at: "2026-10-06T17:05:53Z",
+      updated_at: "2026-10-06T17:09:51Z",
+      html_url: "https://example.com/progress",
+      body: "**Claude encountered an error after 3m 43s** —— [View job](https://example.com/job)\n\n---\nI'll analyze this and get back to you.",
+    };
+    const contractComment = (createdAt: string, verdict: string, findings: unknown[]) => ({
+      user: { login: "github-actions[bot]", type: "Bot" },
+      created_at: createdAt,
+      updated_at: createdAt,
+      html_url: `https://example.com/review-${createdAt}`,
+      body: ["## Claude review", "", "```json review-findings", JSON.stringify({ schema: "review-findings/v1", verdict, findings }), "```"].join("\n"),
+    });
+    const olderHeadApproval = contractComment("2026-10-06T15:00:00Z", "approve", []);
+
+    async function runGate({ conclusion, comments }: { conclusion: string; comments: unknown[] }) {
+      const reviewerOutput = { approved: true, blocking_issues: [], feedback: "ok", score: 9, progress_delta: 0 };
+      const ghComments: string[] = [];
+      const ghSpawn = vi.fn((args: string[]) => {
+        if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+        if (args[0] === "pr" && args[1] === "comment") {
+          ghComments.push(args[args.indexOf("--body") + 1]);
+          return { stdout: "", exitCode: 0 };
+        }
+        if (args[0] === "api" && args.some((a) => a === "repos/:owner/:repo/pulls/42")) {
+          return { stdout: JSON.stringify({ head: { sha: "deadbeef" } }), exitCode: 0 };
+        }
+        if (args[0] === "api" && args.some((a) => a.includes("commits/deadbeef/check-runs"))) {
+          return { stdout: JSON.stringify({ check_runs: [{ name: "claude-review", status: "completed", conclusion }] }), exitCode: 0 };
+        }
+        if (args[0] === "api" && args.includes("repos/:owner/:repo/pulls/42/reviews?per_page=100")) {
+          return { stdout: "[]", exitCode: 0 };
+        }
+        if (args[0] === "api" && args.includes("repos/:owner/:repo/issues/42/comments?per_page=100")) {
+          return { stdout: JSON.stringify(comments), exitCode: 0 };
+        }
+        return { stdout: JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { nodes: [] } } } } }), exitCode: 0 };
+      });
+      const out = await postPushReviewStep.run(
+        makeCtx(vi.fn(async () => structuredReviewResult(reviewerOutput))),
+        { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: async () => {} },
+        { report: vi.fn(async () => undefined) },
+      );
+      return { out, ghComments };
+    }
+
+    function expectVerdictUnavailableEnding(out: { approved: boolean; terminationReason: string; finalFeedback: string }, ghComments: string[]) {
+      expect(out.approved).toBe(false);
+      expect(out.terminationReason).toBe("invalid_review");
+      expect(out.finalFeedback).toContain("finished without a verdict");
+      const comment = ghComments.find((c) => c.includes("invalid-external-review"));
+      expect(comment).toContain("Manual review required; external review verdict unavailable.");
+      expect(comment).not.toContain("could not be parsed");
+      expect(ghComments.some((c) => c.includes("Ready to merge"))).toBe(false);
+    }
+
+    it("takes the verdict-unavailable ending when the failed run left only its error comment", async () => {
+      const { out, ghComments } = await runGate({ conclusion: "failure", comments: [failedRunComment] });
+      expectVerdictUnavailableEnding(out, ghComments);
+    });
+
+    it("does not approve on an older head's approval below the failed run's error comment", async () => {
+      const { out, ghComments } = await runGate({ conclusion: "failure", comments: [olderHeadApproval, failedRunComment] });
+      expectVerdictUnavailableEnding(out, ghComments);
+    });
+
+    it("does not approve on an approving block when the check itself failed", async () => {
+      const { out, ghComments } = await runGate({ conclusion: "failure", comments: [contractComment("2026-10-06T17:09:00Z", "approve", [])] });
+      expectVerdictUnavailableEnding(out, ghComments);
+    });
+
+    // A reviewer whose check fails on findings still gates through what it posted; only the
+    // approval the failed check used to grant is gone.
+    it("still blocks on a gating finding the reviewer posted before its check failed", async () => {
+      const finding = { severity: "blocking", body: "buildCacheKey collides for an empty tenant." };
+      const { out, ghComments } = await runGate({ conclusion: "failure", comments: [contractComment("2026-10-06T17:09:00Z", "changes_requested", [finding])] });
+      expect(out.approved).toBe(false);
+      expect(out.terminationReason).toBe("iterations_exhausted");
+      expect(ghComments.find((c) => c.includes("Not ready to merge"))).toContain(finding.body);
+    });
+
+    it("names the missing verdict, not an older blocking verdict, when both are present", async () => {
+      const { out, ghComments } = await runGate({ conclusion: "failure", comments: [contractComment("2026-10-06T15:00:00Z", "changes_requested", [])] });
+      expectVerdictUnavailableEnding(out, ghComments);
+      expect(out.finalFeedback).not.toContain("blocks merge");
+    });
+
+    it("reports a cancelled check through the same ending, not as a review still running", async () => {
+      const { out, ghComments } = await runGate({ conclusion: "cancelled", comments: [] });
+      expectVerdictUnavailableEnding(out, ghComments);
+    });
+
+    it("approves on an approving block when the check succeeded", async () => {
+      const { out, ghComments } = await runGate({ conclusion: "success", comments: [contractComment("2026-10-06T17:09:00Z", "approve", [])] });
+      expect(out.approved).toBe(true);
+      expect(out.terminationReason).toBe("approved");
+      expect(ghComments.some((c) => c.includes("Ready to merge"))).toBe(true);
+    });
   });
 
   it("satisfies the gate when a mixed set contains one skipped and one success check", async () => {
@@ -5088,8 +5192,8 @@ describe("postPushReviewStep", () => {
   });
 
   it("T-6: CI gate excludes the external review check's own failure — not double-counted as a CI blocker", async () => {
-    // When the external review check concludes "failure" (reviewer found issues), the CI gate
-    // must not also report it as a failing CI check. The external review path handles it.
+    // A failed external review check belongs to the external review path, which reads it as a
+    // check without a verdict; the CI gate must not also report it as a failing CI check.
     const reviewerOutput = {
       approved: false,
       blocking_issues: [{ title: "Bug", problem: "Null ref in foo method", required_fix: "Guard against null." }],
@@ -5108,7 +5212,7 @@ describe("postPushReviewStep", () => {
         return { stdout: JSON.stringify({ head: { sha: "deadbeef45" } }), exitCode: 0 };
       }
       if (args[0] === "api" && args.some((a) => a.includes("deadbeef45/check-runs"))) {
-        // The external review check itself concluded "failure" — reviewer found issues.
+        // The external review check itself concluded "failure".
         return {
           stdout: JSON.stringify({
             check_runs: [{ name: "review", status: "completed", conclusion: "failure" }],

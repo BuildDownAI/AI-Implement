@@ -232,7 +232,7 @@ export const runnersScript = `
     parkedBody.innerHTML = '';
     for (const p of parkedRows) {
       const tr = document.createElement('tr');
-      tr.innerHTML = '<td class="mono">' + window.esc(p.issueIdentifier || p.issueId || '—') + '</td>'
+      tr.innerHTML = '<td class="mono">' + window.esc(p.issueIdentifier ? p.issueIdentifier : (p.issueId ? 'unknown issue ' + p.issueId : '—')) + '</td>'
         + '<td class="mono">' + window.esc(p.repo || '—') + '</td>'
         + '<td class="mono">' + window.esc(p.phase || '—') + '</td>'
         + '<td class="mono">' + window.esc(String(p.failures)) + '</td>'

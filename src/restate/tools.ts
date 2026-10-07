@@ -16,15 +16,30 @@ import * as restate from "@restatedev/restate-sdk";
 import { serde } from "@restatedev/restate-sdk-zod";
 import { z } from "zod";
 import type { AccessRole } from "../access-entries.js";
-import { getRunnerMode } from "../runner-mode.js";
+import { getRunnerMode, getKgMaterializeDirect } from "../runner-mode.js";
 import { getMappings, type RepoMapping } from "../config.js";
-import { getInFlightJobs, getRunRecordMergeVerdict } from "../log.js";
+import { getInFlightJobs, getRunRecordMergeVerdict, getJobById, getJobByMachineId, type Job } from "../log.js";
+import {
+  getMachine, listMachines, fetchMachineLogs, readMachineExit,
+  type Machine,
+} from "../fly-machines.js";
 import { getDb } from "../dedup.js";
+import {
+  listHeldReservations,
+  read as readDispatchAdmission,
+  releaseHeldReservation,
+  type StaleAdmissionCandidate,
+} from "../dispatch-admission.js";
 import { isKgDegraded } from "../deploy-notify.js";
 import { sidecarHealthFields, getKgMemoryProvider, KG_TOOL_CAPABILITY } from "../kg-provider.js";
+import { getRestateRetentionDays, getVolumeSnapshotRetentionDays } from "./retention.js";
 import { getRestateStatus } from "./status.js";
 import { readKgSourceRepo } from "../deploy.js";
-import { runKgRefreshPreflight, getActiveKgRefresh } from "../kg-refresh.js";
+import { runKgRefreshPreflight, MIN_FREE_BYTES, type KgRefreshStage, type KgRefreshStatus } from "../kg-refresh.js";
+import type { StepStatus } from "../pipeline/types.js";
+import { FlyMachineProfile } from "./fly-machine-profile.js";
+import type { KgRefreshToolDeps } from "./kg-refresh-production.js";
+import type { KgRefreshDefinition, KgRepoDefinition } from "./kg-refresh-types.js";
 import { getOrchestratorSettings, getLinearPickupLabel } from "../orchestrator-settings.js";
 import { getIssueReportCard, getFleetReport } from "../report-card.js";
 import { getDeployPosture } from "../deploy-posture.js";
@@ -35,6 +50,7 @@ import {
   triggerWorkflowSyncAction,
   clearDedupEntryAction,
   type AdminConfig,
+  type ReviewFixAttemptsFacade,
   type UpsertMappingBody,
 } from "../admin.js";
 import { providerConfigFromEnv, ProviderRegistry } from "../providers/index.js";
@@ -62,14 +78,18 @@ interface ToolOptions<I extends z.ZodType> {
   description: string;
   input: I;
   role: AccessRole;
+  /** Declares mutability for wrapper write-audit logging. Defaults preserve the original rule: admin-role tools are writes. */
+  operation?: "read" | "write";
   /**
-   * Only a write (`role: "admin"`) handler sets this — `{ maxAttempts: 1, onMaxAttempts: "kill" }`
+   * Only a declared write handler sets this — `{ maxAttempts: 1, onMaxAttempts: "kill" }`
    * (AII-717, ADR 025 amendment). An attempt that dies with the orchestrator process is killed
    * rather than re-delivered, so a crash can never cause Restate to run the handler body a
    * second time. Paired with `ctx.run` around the handler's own side effect (docs/restate.md
    * § "Every side effect in a handler goes inside `ctx.run`, and a tool handler never retries").
    */
   retryPolicy?: restate.RetryPolicy;
+  /** Extra `key=value` text appended to this tool's write-audit line, for a write whose audit must name its target. */
+  auditDetail?: (input: WireInput<I>) => string;
 }
 
 function wireInputSchema<I extends z.ZodType>(input: I) {
@@ -99,11 +119,12 @@ export type WireInput<I extends z.ZodType> = z.infer<ReturnType<typeof wireInput
  * dropped connection) is not a handler error — `restate.internal.isSuspendedError` detects
  * it and it is rethrown unconverted so the SDK can suspend and resume the invocation.
  *
- * A `role: "admin"` tool is a declared write (ADR 015): every call to one, allowed or
- * refused, is logged here — inside the wrapper, not the `/mcp` adapter — so a call that
- * reaches a handler through `POST /api/tools/<name>` or `callToolAsSystem` (AII-712),
+ * A declared write is audited here — inside the wrapper, not the `/mcp` adapter — so a call
+ * that reaches a handler through `POST /api/tools/<name>` or `callToolAsSystem` (AII-712),
  * which never passes through the adapter, is still audited. `WRITE_TOOLS` in `src/mcp.ts`
- * used to be the only place this line was written (AII-713 retired it).
+ * used to be the only place this line was written (AII-713 retired it). Existing
+ * `role: "admin"` handlers default to writes for compatibility; privileged reads set
+ * `operation: "read"` explicitly.
  */
 export function tool<I extends z.ZodType>(
   opts: ToolOptions<I>,
@@ -120,11 +141,18 @@ export function tool<I extends z.ZodType>(
     },
     async (ctx: restate.Context, input: WireInput<I>): Promise<ToolResponse> => {
       const name = ctx.request().target.handler;
+      const operation = opts.operation ?? (opts.role === "admin" ? "write" : "read");
       const audit = (result: "forbidden" | "ok" | "error"): void => {
-        if (opts.role !== "admin") return;
+        if (operation !== "write") return;
         const actor = input.caller.email ?? "system";
+        let detail = "";
+        try {
+          detail = opts.auditDetail ? ` ${opts.auditDetail(input)}` : "";
+        } catch {
+          detail = "";
+        }
         console.log(
-          `[mcp] write tool=${name} actor=${actor} role=${input.caller.role ?? "null"} result=${result} kind=${input.caller.kind}`,
+          `[mcp] write tool=${name} actor=${actor} role=${input.caller.role ?? "null"} result=${result} kind=${input.caller.kind}${detail}`,
         );
       };
       if (!roleAllows(input.caller.role, opts.role)) {
@@ -187,6 +215,8 @@ export const getTenantHealth = tool(
       kgDegraded: isKgDegraded(),
       ...sidecarHealthFields(),
       restate: getRestateStatus(),
+      restateRetentionDays: getRestateRetentionDays(),
+      volumeSnapshotRetentionDays: getVolumeSnapshotRetentionDays(),
       kgRefreshPreflight,
     };
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
@@ -321,10 +351,161 @@ export const listInFlightJobs = tool(
       repo: j.repo,
       phase: j.phase,
       status: j.status,
+      machineId: j.machineId,
       dispatchedAt: j.dispatchedAt,
       elapsedSeconds: Math.round((now - j.dispatchedAt) / 1000),
     }));
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  },
+);
+
+const RUNNING_MACHINE_STATES = new Set(["started", "starting", "created"]);
+const MAX_MACHINE_LOG_LINES = 200;
+
+/** A Fly 404 (machine destroyed). fly-machines throws plain Errors, so match the status in the text. */
+function isFlyNotFound(err: unknown): boolean {
+  return err instanceof Error && /\(404\)/.test(err.message);
+}
+
+/**
+ * Exit details for a stopped machine; null while it is still running. `probableOom` covers the
+ * case where Fly does not set oom_killed: a kill shows as signal 9 or exit code -1 / 137.
+ */
+function describeMachineExit(machine: Machine) {
+  if (RUNNING_MACHINE_STATES.has(machine.state)) return null;
+  const exit = readMachineExit(machine);
+  const probableOom =
+    exit.oomKilled === true || exit.signal === 9 || exit.exitCode === -1 || exit.exitCode === 137;
+  return { ...exit, probableOom };
+}
+
+function latestJobForIssue(issueIdentifier: string): Job | null {
+  const row = getDb()
+    .prepare(
+      "SELECT id FROM dispatch_log WHERE issue_identifier = ? AND machine_id IS NOT NULL ORDER BY dispatched_at DESC, id DESC LIMIT 1",
+    )
+    .get(issueIdentifier) as { id: number } | undefined;
+  return row ? getJobById(row.id) : null;
+}
+
+function toolError(text: string): ToolResponse {
+  return { isError: true, content: [{ type: "text", text }] };
+}
+
+export const GET_SESSION_MACHINE_DESCRIPTION =
+  "Reads one session machine from the Fly Machines API. Answers 'did the machine run out of memory' (exit.oomKilled, exit.probableOom, exit signal/code) and 'what memory size did it get' (guest.memoryMb). Also returns state, region, CPUs, and the matching issue, phase, and job status. Pass issueIdentifier (e.g. 'AII-123', newest job) or machineId. exit is null while the machine runs; a destroyed machine returns state 'destroyed'. Optional logLines (0-200) returns the last log lines.";
+
+export const getSessionMachine = tool(
+  {
+    description: GET_SESSION_MACHINE_DESCRIPTION,
+    input: z.object({
+      issueIdentifier: z.string().optional(),
+      machineId: z.string().optional(),
+      logLines: z.number().int().min(0).max(MAX_MACHINE_LOG_LINES).optional(),
+    }),
+    role: "user",
+  },
+  async (_ctx, input): Promise<ToolResponse> => {
+    const { issueIdentifier, machineId: machineIdArg } = input.args;
+    const logLines = Math.min(Math.max(input.args.logLines ?? 0, 0), MAX_MACHINE_LOG_LINES);
+    if (!!issueIdentifier === !!machineIdArg) {
+      return toolError("Provide exactly one of issueIdentifier or machineId");
+    }
+    const config = mcpAdminConfig();
+    if (!config.flySessionsToken || !config.flySessionsApp) {
+      return { content: [{ type: "text", text: JSON.stringify({ error: "Fly sessions app is not configured" }, null, 2) }] };
+    }
+
+    let job: Job | null = null;
+    let machineId = machineIdArg as string | undefined;
+    if (issueIdentifier) {
+      job = latestJobForIssue(issueIdentifier);
+      if (!job?.machineId) return toolError(`No job with a session machine found for ${issueIdentifier}`);
+      machineId = job.machineId;
+    } else if (machineId) {
+      job = getJobByMachineId(machineId);
+    }
+    if (!machineId) return toolError("machineId is required");
+
+    const jobFields = {
+      issueIdentifier: job?.issueIdentifier ?? null,
+      phase: job?.phase ?? null,
+      jobStatus: job?.status ?? null,
+    };
+
+    let machine: Machine;
+    try {
+      machine = await getMachine(config.flySessionsToken, config.flySessionsApp, machineId);
+    } catch (err) {
+      if (isFlyNotFound(err)) {
+        const result = {
+          machineId, name: null, state: "destroyed", region: null, createdAt: null, updatedAt: null,
+          guest: null, exit: null, ...jobFields,
+        };
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
+      return toolError(`Failed to read machine ${machineId}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    const result: Record<string, unknown> = {
+      machineId: machine.id,
+      name: machine.name,
+      state: machine.state,
+      region: machine.region,
+      createdAt: machine.created_at,
+      updatedAt: machine.updated_at,
+      guest: {
+        cpus: machine.config?.guest?.cpus ?? null,
+        cpuKind: machine.config?.guest?.cpu_kind ?? null,
+        memoryMb: machine.config?.guest?.memory_mb ?? null,
+      },
+      exit: describeMachineExit(machine),
+      ...jobFields,
+    };
+    if (logLines > 0) {
+      try {
+        result.logs = await fetchMachineLogs(config.flySessionsToken, config.flySessionsApp, machineId, logLines);
+      } catch (err) {
+        result.logsError = err instanceof Error ? err.message : String(err);
+      }
+    }
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  },
+);
+
+export const LIST_SESSION_MACHINES_DESCRIPTION =
+  "Lists the newest session machines in the Fly sessions app (default 10, newest first) with state, createdAt, memoryMb (the memory size each got), oomKilled (did the machine run out of memory), and the matching issueIdentifier when a job recorded the machine. Use get_session_machine for one machine's full exit details.";
+
+export const listSessionMachines = tool(
+  {
+    description: LIST_SESSION_MACHINES_DESCRIPTION,
+    input: z.object({ limit: z.number().int().min(1).max(50).optional() }),
+    role: "user",
+  },
+  async (_ctx, input): Promise<ToolResponse> => {
+    const limit = input.args.limit ?? 10;
+    const config = mcpAdminConfig();
+    if (!config.flySessionsToken || !config.flySessionsApp) {
+      return { content: [{ type: "text", text: JSON.stringify({ error: "Fly sessions app is not configured" }, null, 2) }] };
+    }
+    let machines: Machine[];
+    try {
+      machines = await listMachines(config.flySessionsToken, config.flySessionsApp);
+    } catch (err) {
+      return toolError(`Failed to list session machines: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    const rows = [...machines]
+      .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))
+      .slice(0, limit)
+      .map((m) => ({
+        machineId: m.id,
+        state: m.state,
+        createdAt: m.created_at,
+        memoryMb: m.config?.guest?.memory_mb ?? null,
+        oomKilled: readMachineExit(m).oomKilled,
+        issueIdentifier: getJobByMachineId(m.id)?.issueIdentifier ?? null,
+      }));
+    return { content: [{ type: "text", text: JSON.stringify(rows, null, 2) }] };
   },
 );
 
@@ -437,13 +618,212 @@ export const getDeployPostureTool = tool(
 );
 
 export const GET_KG_STATUS_DESCRIPTION =
-  "Returns the KG refresh rail state: stage (idle | staging | ingest-running | serving | reverted | failed), the served snapshot stamp, the materialize path the next refresh will stage (rdflib | direct), and the last refresh outcome with its gate. Poll it after `POST /api/kg/refresh`.";
+  "Returns the KG refresh rail state: stage (idle | staging | ingest-running | serving | reverted | failed), the served snapshot stamp, the materialize path the next refresh will stage (rdflib | direct), the last refresh outcome with its gate, and lastDryRun (verdict and part table of the last dry-run with no PR report target, or null). The served stamp falls back to a live read when the last-refresh record carries none. Poll it after `POST /api/kg/refresh`.";
+
+// Type-only client handles: the real definitions are built with dependencies at boot
+// (createProductionKgRefreshServices); a client needs only the service name and handler types.
+const KgRepo: KgRepoDefinition = { name: "KgRepo" } as KgRepoDefinition;
+const KgRefresh: KgRefreshDefinition = { name: "KgRefresh" } as KgRefreshDefinition;
+
+let kgRefreshToolDeps: KgRefreshToolDeps | null = null;
+
+/**
+ * Set once at boot (src/index.ts's main()) from `createProductionKgRefreshServices`. The tools
+ * service stays setter-based, like `setProviderRegistry`, until AII-888. Unset (KG_SOURCE_REPO
+ * absent, tests) leaves both kg-refresh handlers answering "not configured".
+ */
+export function setKgRefreshToolDeps(deps: KgRefreshToolDeps | null): void {
+  kgRefreshToolDeps = deps;
+}
+
+/** Maps the in-flight workflow step onto the stage vocabulary `get_kg_status` has always used. */
+export function kgStageForStep(step: string | null): KgRefreshStage {
+  if (step === null || step === "reserve" || step === "dispatch") return "checking";
+  if (step === "await-progress" || step === "cancelling" || step === "dry-run-report") return "ingest-running";
+  if (step === "merge" || step === "delete-branch") return "snapshot-landed";
+  // fetch, stage, swap, verify, revert, persist, close-row, outcome, settled, and the
+  // short-lived terminal steps (failed, closed, no-new-data) whose marker is about to clear.
+  return "staging";
+}
+
+/**
+ * Maps the in-flight runner step onto a stage (AII-1134). Full table (id x status):
+ *   clone, kg-scope-reconcile, dependency-auth, clone-code-repo,
+ *   clone-secondary-repos, kg-tracker-data -> checking, for every status
+ *   kg-ingest                              -> ingest-running, for every status
+ *   kg-snapshot-push                       -> snapshot-landed when passed; ingest-running otherwise
+ *   any other id                           -> ingest-running (the runner phase is in flight)
+ */
+export function kgStageForRunnerStep(id: string, status: StepStatus): KgRefreshStage {
+  switch (id) {
+    case "clone":
+    case "kg-scope-reconcile":
+    case "dependency-auth":
+    case "clone-code-repo":
+    case "clone-secondary-repos":
+    case "kg-tracker-data":
+      return "checking";
+    case "kg-ingest":
+      return "ingest-running";
+    case "kg-snapshot-push":
+      return status === "passed" ? "snapshot-landed" : "ingest-running";
+    default:
+      return "ingest-running";
+  }
+}
+
+const REVERT_GATES = new Set(["answers", "vectors", "canary", "stamp"]);
+
+function kgStageFromLastRefresh(last: KgRefreshStatus["lastRefresh"]): KgRefreshStage {
+  if (!last) return "idle";
+  if (last.ok) return "serving";
+  const gate: string | undefined = last.gate;
+  if (gate && REVERT_GATES.has(gate)) return "reverted";
+  if (gate === "ingest-needed") return "idle";
+  return "failed";
+}
 
 export const getKgStatusTool = tool(
   { description: GET_KG_STATUS_DESCRIPTION, input: z.object({}), role: "user" },
-  async (): Promise<ToolResponse> => {
-    const handle = getActiveKgRefresh();
-    const result = handle ? await handle.status() : { error: "KG refresh is not configured" };
+  async (ctx): Promise<ToolResponse> => {
+    const toolDeps = kgRefreshToolDeps;
+    if (!toolDeps) {
+      return { content: [{ type: "text", text: JSON.stringify({ error: "KG refresh is not configured" }, null, 2) }] };
+    }
+    const inFlight = await ctx.objectClient(KgRepo, toolDeps.kgSourceRepo).status();
+    const flyProfile = await ctx.objectClient(FlyMachineProfile, "kg-refresh").get();
+    const lastRefresh = toolDeps.readStatusRecord();
+    const dryRun = await ctx.objectClient(KgRepo, toolDeps.kgSourceRepo).lastAdminDryRun();
+    const lastDryRun = dryRun
+      ? { ok: dryRun.ok, at: dryRun.at, detail: dryRun.detail, ...(dryRun.partTable ? { partTable: dryRun.partTable } : {}) }
+      : null;
+    let recordStamp = lastRefresh ? (lastRefresh.ok ? lastRefresh.stampAfter : lastRefresh.stampBefore) : null;
+    if (!recordStamp) {
+      // A failure before the rail leaves no stamp on the record while a graph still serves.
+      recordStamp = await ctx.run("read-served-stamp", async () => {
+        try {
+          return await toolDeps.readServedStamp();
+        } catch {
+          return null;
+        }
+      });
+    }
+    let stage: KgRefreshStage;
+    let runnerStep: KgRefreshStatus["runnerStep"];
+    if (inFlight === null || inFlight === undefined) {
+      stage = kgStageFromLastRefresh(lastRefresh);
+    } else {
+      try {
+        const wf = await ctx.workflowClient(KgRefresh, inFlight.triggerId).status();
+        if (wf.runnerStep) {
+          runnerStep = { id: wf.runnerStep.id, status: wf.runnerStep.status as StepStatus };
+          stage = kgStageForRunnerStep(runnerStep.id, runnerStep.status);
+        } else {
+          stage = kgStageForStep(wf.step);
+        }
+      } catch (err) {
+        // A retained-but-finished or unreachable workflow: the marker is the truth.
+        if (!kgStatusFallbackLogged) {
+          kgStatusFallbackLogged = true;
+          console.warn(`[kg-refresh] workflow status unavailable for ${inFlight.triggerId}; reporting ingest-running: ${String(err)}`);
+        }
+        stage = "ingest-running";
+      }
+    }
+    const restateKey = inFlight?.triggerId ?? lastRefresh?.dispatchId;
+    const result: KgRefreshStatus = {
+      running: inFlight !== null && inFlight !== undefined,
+      deployHeld: toolDeps.isDeployHeld(),
+      kgDegraded: isKgDegraded(),
+      ...sidecarHealthFields(),
+      servedStamp: recordStamp ?? null,
+      lastRefresh,
+      lastDryRun,
+      stage,
+      ...(runnerStep ? { runnerStep } : {}),
+      materialize: getKgMaterializeDirect().enabled ? "direct" : "rdflib",
+      ...(flyProfile ? { flyMachine: { ...flyProfile.config, source: flyProfile.source } } : {}),
+      restate: restateKey ? { service: "KgRefresh", key: restateKey } : null,
+    };
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  },
+);
+
+let kgStatusFallbackLogged = false;
+
+const REVIEW_FIX_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+const REVIEW_FIX_ID_MAX_LENGTH = 128;
+const ReviewFixIdSchema = z
+  .string()
+  .min(1)
+  .max(REVIEW_FIX_ID_MAX_LENGTH)
+  .regex(REVIEW_FIX_ID_PATTERN);
+
+const ReviewFixCursorSchema = z.object({
+  producerId: ReviewFixIdSchema,
+  sequence: z.number().int().nonnegative().safe(),
+});
+
+const ReviewFixAttemptArgsSchema = z.object({
+  attemptId: ReviewFixIdSchema,
+});
+
+const ReviewFixActivityArgsSchema = z.object({
+  attemptId: ReviewFixIdSchema,
+  pageSize: z.number().int().min(1).max(500).optional(),
+  cursor: ReviewFixCursorSchema.optional(),
+});
+
+type ReviewFixReadFacade = Pick<ReviewFixAttemptsFacade, "getAttempt" | "getActivity">;
+
+let reviewFixAttemptsFacade: ReviewFixReadFacade | null = null;
+
+export function setReviewFixAttemptsFacade(facade: ReviewFixReadFacade | null): void {
+  reviewFixAttemptsFacade = facade;
+}
+
+function reviewFixCaller(input: { caller: { role: AccessRole | null; email: string | null } }) {
+  return { role: input.caller.role ?? "user", email: input.caller.email };
+}
+
+export const GET_REVIEW_FIX_ATTEMPT_DESCRIPTION =
+  "Returns one Restate review-fix attempt detail by attemptId: owner, execution, deadline, pending feedback, snapshot, state, evidenceComplete, terminationConfirmed, and cycle summaries. Admin read.";
+
+export const getReviewFixAttemptTool = tool(
+  {
+    description: GET_REVIEW_FIX_ATTEMPT_DESCRIPTION,
+    input: ReviewFixAttemptArgsSchema,
+    role: "admin",
+    operation: "read",
+  },
+  async (_ctx, input): Promise<ToolResponse> => {
+    if (!reviewFixAttemptsFacade) {
+      return { content: [{ type: "text", text: JSON.stringify({ status: "unavailable" }, null, 2) }] };
+    }
+    const result = await reviewFixAttemptsFacade.getAttempt(input.args.attemptId, reviewFixCaller(input));
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  },
+);
+
+export const GET_REVIEW_FIX_ACTIVITY_DESCRIPTION =
+  "Returns one page of stored Restate review-fix activity for an attempt. Args: attemptId, optional pageSize 1..500 (default 100), optional cursor { producerId, sequence }. Admin read.";
+
+export const getReviewFixActivityTool = tool(
+  {
+    description: GET_REVIEW_FIX_ACTIVITY_DESCRIPTION,
+    input: ReviewFixActivityArgsSchema,
+    role: "admin",
+    operation: "read",
+  },
+  async (_ctx, input): Promise<ToolResponse> => {
+    if (!reviewFixAttemptsFacade) {
+      return { content: [{ type: "text", text: JSON.stringify({ status: "unavailable" }, null, 2) }] };
+    }
+    const result = await reviewFixAttemptsFacade.getActivity(
+      input.args.attemptId,
+      { cursor: input.args.cursor, pageSize: input.args.pageSize ?? 100 },
+      reviewFixCaller(input),
+    );
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   },
 );
@@ -544,7 +924,7 @@ function providerRegistryForTools(): ProviderRegistry {
 }
 
 export const TRIGGER_KG_REFRESH_DESCRIPTION =
-  "Trigger the KG refresh rail (admin role). Same handler as POST /api/kg/refresh: runs the credential preflight, then dispatches the refresh. Poll get_kg_status afterwards. dryRun=true runs the same runner job with kg-snapshot-push's push skipped — all guards run and the guard verdict plus per-part table are reported via get_kg_status, but nothing is pushed, no PR opens, and the served graph never changes. acceptNewBaseline=true downgrades the zero-shrink and 50%-shrink content guards to warnings for this one dispatch and pushes anyway — use only after reviewing a guard refusal's part table and confirming the shrink is an intentional reclassification, not data loss; the accepting identity's email is logged and written into the refresh PR's ### Baseline section.";
+  "Trigger the KG refresh rail (admin role). Same handler as POST /api/kg/refresh: runs the credential preflight, then dispatches the refresh. Poll get_kg_status afterwards. dryRun=true runs the same runner job with kg-snapshot-push's push skipped — all guards run and the guard verdict plus per-part table are reported via get_kg_status as lastDryRun (the last dry-run with no PR report target; it never writes lastRefresh), but nothing is pushed, no PR opens, and the served graph never changes. acceptNewBaseline=true downgrades the zero-shrink and 50%-shrink content guards to warnings for this one dispatch and pushes anyway — use only after reviewing a guard refusal's part table and confirming the shrink is an intentional reclassification, not data loss; the accepting identity's email is logged and written into the refresh PR's ### Baseline section.";
 
 export const triggerKgRefreshTool = tool(
   {
@@ -556,24 +936,71 @@ export const triggerKgRefreshTool = tool(
       acceptNewBaseline: z.boolean().optional().describe(
         "Push even though a tracked part (issue.nt/comment.nt) shrank or a part dropped below 50% of its previous size — a one-shot override of the zero-shrink guard, applied to this dispatch only.",
       ),
+      ref: z.string().optional().describe(
+        "Dispatch against this branch instead of the KG source repo's default branch (used to run the rail against a PR head).",
+      ),
     }),
     role: "admin",
     retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },
   },
   async (ctx, input): Promise<ToolResponse> => {
-    const handle = getActiveKgRefresh();
-    if (!handle) {
-      throw new Error("KG refresh is not configured");
+    const answer = (status: number, body: Record<string, unknown>): ToolResponse =>
+      ({ content: [{ type: "text", text: JSON.stringify({ status, body }, null, 2) }] });
+    const toolDeps = kgRefreshToolDeps;
+    const deployHeld = await ctx.run("deploy-held", () => toolDeps ? toolDeps.isDeployHeld() : false);
+    if (deployHeld) {
+      return answer(409, { error: "deploy-in-progress", detail: "a deploy holds the machine; refresh refused" });
     }
-    const dryRun = input.args.dryRun === true;
-    const acceptNewBaseline = input.args.acceptNewBaseline === true;
-    const actorEmail = input.caller.email ?? undefined;
-    const result = await ctx.run(
-      "kg-refresh-trigger",
-      () => handle.trigger({ dryRun, acceptNewBaseline, actorEmail }),
-      { maxRetryAttempts: 1 },
-    );
-    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    if (!toolDeps || toolDeps.kgSourceRepo === null) {
+      return answer(501, { error: "kg-source-repo-not-configured" });
+    }
+    if (!toolDeps.callbackConfigured()) {
+      return answer(422, {
+        error: "callback-unconfigured",
+        precondition: "callback-unconfigured",
+        detail: "runner dispatch requires RUNNER_CALLBACK_BASE_URL and RUNNER_TOKEN_SECRET to be set — dispatching without it would stall the refresh with no way to report completion",
+      });
+    }
+    const hasMapping = await ctx.run("mapping", () => toolDeps.mappingExists());
+    if (!hasMapping) {
+      return answer(422, {
+        error: "kg-mapping-not-found",
+        precondition: "kg-mapping-not-found",
+        detail: `no project mapping found for kgSourceRepo=${toolDeps.kgSourceRepo} — add it at /admin and set dependencyTokenScope=installation`,
+      });
+    }
+    const lowDisk = await ctx.run("disk", () => {
+      try {
+        return toolDeps.freeBytes() < MIN_FREE_BYTES;
+      } catch {
+        // statfs failing is not a reason to refuse; disk pressure will surface in staging.
+        return false;
+      }
+    });
+    if (lowDisk) {
+      return answer(507, { error: "insufficient-storage", detail: `less than ${MIN_FREE_BYTES} bytes free on the volume` });
+    }
+    const preflightFailure = await ctx.run("preflight", async () => {
+      const result = await toolDeps.runPreflight();
+      if (result.ok) return null;
+      toolDeps.persistPreflightFailure(result);
+      return result.results
+        .filter((r) => !r.ok)
+        .map((r) => `${r.repo} — ${r.grant} — HTTP ${r.status}${r.hint ? ` — ${r.hint}` : ""}`)
+        .join("\n");
+    }, { maxRetryAttempts: 1 });
+    if (preflightFailure !== null) {
+      return answer(422, { error: "preflight-failed", precondition: "preflight-failed", detail: preflightFailure });
+    }
+    const opts = {
+      dryRun: input.args.dryRun === true,
+      acceptNewBaseline: input.args.acceptNewBaseline === true,
+      ...(input.args.ref !== undefined ? { kgSourceRef: input.args.ref } : {}),
+      actorEmail: input.caller.email ?? undefined,
+    };
+    const result = await ctx.objectClient(KgRepo, toolDeps.kgSourceRepo).trigger(opts);
+    if ("status" in result) return answer(409, { error: "refresh-in-progress" });
+    return answer(202, { refreshing: true, triggerId: result.triggerId });
   },
 );
 
@@ -601,6 +1028,40 @@ export const setRunnerModeTool = tool(
     const mode = input.args.mode;
     const result = await ctx.run("set-runner-mode", () => setRunnerModeAction(config, { mode }), { maxRetryAttempts: 1 });
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  },
+);
+
+export const SET_FLY_MACHINE_PROFILE_DESCRIPTION =
+  "Set a pipeline's Fly machine profile (admin role): pipeline (kg-refresh), cpuKind (shared, performance), cpus (1, 2, 4, 8, 16), memoryMb (256-65536), idleTimeoutMs (at least 60000). Given fields merge into the stored profile; the merged result must be valid (performance needs 2048 MB per CPU). Applies to the next run, not one in flight. Returns the profile as { config, source }.";
+
+export const setFlyMachineProfileTool = tool(
+  {
+    description: SET_FLY_MACHINE_PROFILE_DESCRIPTION,
+    input: z.object({
+      pipeline: z.string().describe("The pipeline phase whose profile to set, e.g. kg-refresh"),
+      cpuKind: z.enum(["shared", "performance"]).optional().describe("CPU kind: shared or performance"),
+      cpus: z.number().optional().describe("CPUs: one of 1, 2, 4, 8, 16"),
+      memoryMb: z.number().optional().describe("Memory in MB: an integer from 256 to 65536"),
+      idleTimeoutMs: z.number().optional().describe("Idle timeout in ms: at least 60000"),
+    }),
+    role: "admin",
+    retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },
+  },
+  async (ctx, input): Promise<ToolResponse> => {
+    const reply = (value: unknown): ToolResponse => ({ content: [{ type: "text", text: JSON.stringify(value, null, 2) }] });
+    const { pipeline, cpuKind, cpus, memoryMb, idleTimeoutMs } = input.args;
+    const fields = {
+      ...(cpuKind !== undefined ? { cpuKind } : {}),
+      ...(cpus !== undefined ? { cpus } : {}),
+      ...(memoryMb !== undefined ? { memoryMb } : {}),
+      ...(idleTimeoutMs !== undefined ? { idleTimeoutMs } : {}),
+    };
+    try {
+      return reply(await ctx.objectClient(FlyMachineProfile, pipeline).set(fields));
+    } catch (err) {
+      if (err instanceof restate.TerminalError && err.code === 400) return reply({ status: 400, body: { error: err.message } });
+      throw err;
+    }
   },
 );
 
@@ -746,6 +1207,65 @@ export const clearDispatchDedupTool = tool(
   },
 );
 
+// The "did the backend run end" rule is `confirmAdmissionTerminated` (src/index.ts), which needs
+// the orchestrator's AppConfig; tools.ts cannot import index.ts, so main() injects it here (same
+// pattern as setProviderRegistry). Unset (tests, a failed boot) means nothing is ever confirmed.
+type AdmissionTerminationCheck = (candidate: StaleAdmissionCandidate) => Promise<boolean>;
+let admissionTerminationCheck: AdmissionTerminationCheck | null = null;
+
+export function setAdmissionTerminationCheck(check: AdmissionTerminationCheck | null): void {
+  admissionTerminationCheck = check;
+}
+
+export const LIST_DISPATCH_RESERVATIONS_DESCRIPTION =
+  "Lists every held (unreleased) dispatch reservation: dispatch id, team, issue identifier, phase, backend, lifecycle owner, age in seconds, and the status and conclusion of its job row (null when none). These are the rows a self-deploy drain waits on. Pair with release_dispatch_reservation to free a stuck one.";
+
+export const listDispatchReservationsTool = tool(
+  { description: LIST_DISPATCH_RESERVATIONS_DESCRIPTION, input: z.object({}), role: "user" },
+  async (): Promise<ToolResponse> => {
+    const result = listHeldReservations().map(({ ageMs, ...rest }) => ({ ...rest, ageSeconds: Math.round(ageMs / 1000) }));
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  },
+);
+
+export const RELEASE_DISPATCH_RESERVATION_DESCRIPTION =
+  "Release a stuck dispatch reservation (admin role), with reason 'cancelled'. Without force it releases only when the backend run is confirmed ended (a terminal job row alone is not enough), and otherwise refuses with a reason and leaves the row held. With force=true it releases with no confirmation — use only when you know the run is dead. A missing or already-released dispatch id changes nothing. A Restate-owned row's workflow later answers not_owner on its own release and ends.";
+
+export const releaseDispatchReservationTool = tool(
+  {
+    description: RELEASE_DISPATCH_RESERVATION_DESCRIPTION,
+    input: z.object({
+      dispatchId: z.string().optional().describe("The dispatch id of the held reservation (from list_dispatch_reservations)"),
+      force: z.boolean().optional().describe("Release without confirming the run ended"),
+    }),
+    role: "admin",
+    retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },
+    auditDetail: (input) => {
+      const id = typeof input.args.dispatchId === "string" ? input.args.dispatchId : "";
+      const owner = id ? (() => { const r = readDispatchAdmission(id); return r ? (r.lifecycleOwner.kind === "legacy" ? "legacy" : `restate:${r.lifecycleOwner.attemptId}`) : "none"; })() : "none";
+      return `dispatch=${id} owner=${owner} force=${input.args.force === true}`;
+    },
+  },
+  async (ctx, input): Promise<ToolResponse> => {
+    if (typeof input.args.dispatchId !== "string" || !input.args.dispatchId) {
+      return { isError: true, content: [{ type: "text", text: "dispatchId is required" }] };
+    }
+    const dispatchId = input.args.dispatchId;
+    const force = input.args.force === true;
+    const result = await ctx.run(
+      "release-dispatch-reservation",
+      () =>
+        releaseHeldReservation(dispatchId, {
+          force,
+          confirmTerminated: (candidate) => (admissionTerminationCheck ? admissionTerminationCheck(candidate) : Promise.resolve(false)),
+        }),
+      { maxRetryAttempts: 1 },
+    );
+    const isError = result.status === "refused";
+    return { ...(isError ? { isError: true } : {}), content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  },
+);
+
 export const orchestratorTools = restate.service({
   name: "orchestratorTools",
   handlers: {
@@ -754,11 +1274,15 @@ export const orchestratorTools = restate.service({
     list_projects: listProjects,
     get_project_binding: getProjectBinding,
     list_in_flight_jobs: listInFlightJobs,
+    get_session_machine: getSessionMachine,
+    list_session_machines: listSessionMachines,
     get_issue_dispatch_status: getIssueDispatchStatus,
     get_issue_report_card: getIssueReportCardTool,
     get_fleet_report: getFleetReportTool,
     get_deploy_posture: getDeployPostureTool,
     get_kg_status: getKgStatusTool,
+    get_review_fix_attempt: getReviewFixAttemptTool,
+    get_review_fix_activity: getReviewFixActivityTool,
     kg_hybrid_search: kgHybridSearch,
     kg_search: kgSearch,
     kg_semantic_search: kgSemanticSearch,
@@ -767,9 +1291,12 @@ export const orchestratorTools = restate.service({
     kg_provenance: kgProvenance,
     trigger_kg_refresh: triggerKgRefreshTool,
     set_runner_mode: setRunnerModeTool,
+    set_fly_machine_profile: setFlyMachineProfileTool,
     pause_project: pauseProjectTool,
     add_project: addProjectTool,
     trigger_workflow_sync: triggerWorkflowSyncTool,
     clear_dispatch_dedup: clearDispatchDedupTool,
+    list_dispatch_reservations: listDispatchReservationsTool,
+    release_dispatch_reservation: releaseDispatchReservationTool,
   },
 });

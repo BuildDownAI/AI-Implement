@@ -2,13 +2,14 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { execFileSync, type spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { CodexExecutor, CodexPlanningPolicyUnprovenError, CodexRecoveryRequiredError, matchesSchema, type CodexExecutorOptions } from "../pipeline/codex-executor.js";
 import { ModelAuthClientError, type ModelAuthClient, type ModelInvocation } from "../model-auth-client.js";
 import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
 import { READ_ONLY_TOOL_PARAMS } from "../pipeline/steps/read-only-tools.js";
+import type { CodexProtocolDriver, CodexTransportResult, CodexTransportRunInput } from "../pipeline/codex-planning-adapter.js";
 import type { InvokeParams } from "../pipeline/types.js";
 
 const SYNTHETIC_KEY = "synthetic-codex-api-key-0000";
@@ -45,14 +46,15 @@ interface Spawned {
   cmd: string;
   args: string[];
   env: Record<string, string>;
+  cwd?: string;
   stdin: string;
   signals: NodeJS.Signals[];
 }
 
 function makeSpawn(scripts: Script[], log: Spawned[], onSpawn?: () => void): typeof spawn {
-  return ((cmd: string, args: string[], opts: { env: Record<string, string> }) => {
+  return ((cmd: string, args: string[], opts: { env: Record<string, string>; cwd?: string }) => {
     const script = scripts[log.length] ?? scripts[scripts.length - 1];
-    const rec: Spawned = { cmd, args, env: opts.env, stdin: "", signals: [] };
+    const rec: Spawned = { cmd, args, env: opts.env, cwd: opts.cwd, stdin: "", signals: [] };
     log.push(rec);
     onSpawn?.();
     const proc = new EventEmitter() as unknown as ChildProcessWithoutNullStreams;
@@ -557,7 +559,8 @@ describe("publication credential guard", () => {
   it("restores on failure, timeout and cancel", async () => {
     await guarded([{ exitCode: 1, stderr: "boom" }]).executor.invoke(base);
     expect(originOf()).toBe(tokenized);
-    await guarded([{ hang: true, dieOn: ["SIGTERM"] }]).executor.invoke({ ...base, invocationTimeoutMs: 10 });
+    // Frozen clock: real startup delay must not consume the 10 ms budget before spawn.
+    await guarded([{ hang: true, dieOn: ["SIGTERM"] }], { nowImpl: () => 0 }).executor.invoke({ ...base, invocationTimeoutMs: 10 });
     expect(originOf()).toBe(tokenized);
     const ac = new AbortController();
     ac.abort();
@@ -572,7 +575,7 @@ describe("publication credential guard", () => {
   });
 
   it("leaves the origin protected when the child cannot be proven stopped", async () => {
-    const { executor } = guarded([{ hang: true, dieOn: [] }]);
+    const { executor } = guarded([{ hang: true, dieOn: [] }], { nowImpl: () => 0 });
     await expect(executor.invoke({ ...base, invocationTimeoutMs: 10 })).rejects.toBeInstanceOf(CodexRecoveryRequiredError);
     expect(originOf()).toBe("https://github.com/acme/app.git");
   });
@@ -595,4 +598,620 @@ describe("publication credential guard", () => {
     execFileSync("touch", [join(workspace, ".git", "config.lock")]);
     expect(readFileSync(join(workspace, ".git", "config.lock"), "utf-8")).toBe("");
   }
+});
+
+describe("default exec path is unchanged (AII-1001)", () => {
+  it("passes the exact pinned exec argv and never selects the app-server transport", async () => {
+    const { executor, log } = make([{ stdout: message("done") }]);
+    await executor.invoke({ ...base, builtinTools: ["Read"] });
+    expect(log[0].cmd).toBe("codex");
+    expect(log[0].args).toEqual([
+      "exec", "--json", "--ignore-user-config", "--ignore-rules", "--model", "gpt-synthetic", "-c", 'model_provider="openai"', "--sandbox", "read-only", "-",
+    ]);
+  });
+});
+
+describe("protocol driver seam (AII-1001)", () => {
+  const okTransport = (over: Partial<CodexTransportResult> = {}): CodexTransportResult => ({
+    result: {
+      stdout: "plan",
+      stderr: "",
+      exitCode: 0,
+      tokensUsed: 0,
+      telemetry: { outcome: "success", numTurns: null, durationMs: null, costUsd: null, tokensIn: null, tokensOut: null },
+      terminalStatus: { subtype: "success", isError: false },
+      signal: null,
+    },
+    sawUnsafe: false,
+    stopReason: null,
+    ...over,
+  });
+
+  function withDriver(
+    scripts: Script[],
+    run: CodexProtocolDriver["run"],
+    extra: Partial<CodexExecutorOptions> = {},
+    auth = makeAuth(),
+  ) {
+    return make(scripts, { protocolDriver: { run }, ...extra }, auth);
+  }
+
+  it("builds trusted app-server argv, hands the driver streams only, and terminates the group after completion", async () => {
+    let input: CodexTransportRunInput | undefined;
+    const { executor, log, auth } = withDriver([{ hang: true, dieOn: ["SIGTERM"] }], async (i) => {
+      input = i;
+      return okTransport();
+    });
+    const result = await executor.invoke({ ...base, jsonSchema: VERDICT_SCHEMA });
+    expect(result.stdout).toBe("plan");
+    expect(result.failure).toBeUndefined();
+    expect(log[0].args).toEqual([
+      "app-server", "--strict-config",
+      "-c", 'model="gpt-synthetic"',
+      "-c", 'model_provider="openai"',
+      "-c", 'approval_policy="never"',
+      "-c", 'sandbox_mode="read-only"',
+      "-c", "features.shell_tool=false",
+      "-c", "features.view_image=false",
+      "-c", "features.multi_agent=false",
+      "-c", "features.goals=false",
+      "-c", "features.unified_exec=false",
+      "-c", 'web_search="disabled"',
+    ]);
+    expect(log[0].args).not.toContain("exec");
+    expect(log[0].args).not.toContain("--ignore-user-config");
+    expect(log[0].args).not.toContain("--ignore-rules");
+    expect(log[0].args).not.toContain("do the thing");
+    expect(log[0].stdin).toBe("");
+    expect(log[0].signals).toEqual(["SIGTERM"]);
+    expect(Object.keys(input!.io).sort()).toEqual(["halt", "stdin", "stdout"]);
+    expect(input!.prompt).toBe("do the thing");
+    expect(input!.redact(`x ${SYNTHETIC_KEY} y`)).toBe("x [redacted] y");
+    // checkpoint happens only after the child was proven stopped
+    expect(auth.events).toEqual(["invoke:profile-1", "checkpoint"]);
+  });
+
+  it("never settles the auth callback when the child outlives the completed turn", async () => {
+    const { executor, auth } = withDriver([{ hang: true, dieOn: [] }], async () => okTransport());
+    await expect(executor.invoke(base)).rejects.toBeInstanceOf(CodexRecoveryRequiredError);
+    expect(auth.events).toEqual(["invoke:profile-1"]);
+    await expect(executor.invoke(base)).rejects.toMatchObject({ reason: "held" });
+  });
+
+  it("never retries an unsafe transport outcome even when it classifies transient", async () => {
+    let runs = 0;
+    const { executor, log } = withDriver([{ hang: true, dieOn: ["SIGTERM"] }], async () => {
+      runs++;
+      const t = okTransport({ sawUnsafe: true });
+      return { ...t, result: { ...t.result, exitCode: 1, stderr: "rate limit exceeded 429", terminalStatus: { subtype: "error", isError: true } } };
+    });
+    const result = await executor.invoke({ ...base, ...retry });
+    expect(result.failure).toBeDefined();
+    expect(runs).toBe(1);
+    expect(log).toHaveLength(1);
+  });
+
+  it("lets the executor own timeout and aborts the driver's halt signal", async () => {
+    let halted = false;
+    const { executor, log } = withDriver([{ hang: true, dieOn: ["SIGTERM"] }], (i) => {
+      return new Promise((resolve) => {
+        i.io.halt.addEventListener("abort", () => {
+          halted = true;
+          resolve(okTransport({ result: { ...okTransport().result, exitCode: 1, terminalStatus: { subtype: "error", isError: true } } }));
+        });
+      });
+    });
+    const result = await executor.invoke({ ...base, invocationTimeoutMs: 20 });
+    expect(halted).toBe(true);
+    expect(result.failure?.code).toBe("INVOCATION_TIMEOUT");
+    expect(log[0].signals).toContain("SIGTERM");
+  });
+
+  it("lets the executor own cancellation", async () => {
+    const ctl = new AbortController();
+    const { executor } = withDriver(
+      [{ hang: true, dieOn: ["SIGTERM"] }],
+      (i) => new Promise((resolve) => i.io.halt.addEventListener("abort", () => resolve(okTransport({ sawUnsafe: false })))),
+      { cancelSignal: ctl.signal },
+    );
+    setTimeout(() => ctl.abort(), 10);
+    const result = await executor.invoke(base);
+    expect(result.failure?.code).toBe("INVOCATION_CANCELLED");
+  });
+
+  it("routes a driver-reported stdin failure through the spawn rail", async () => {
+    const { executor } = withDriver([{ hang: true, dieOn: ["SIGTERM"] }], async () => okTransport({ stopReason: "stdin" }));
+    await expect(executor.invoke(base)).rejects.toMatchObject({ codexSpawnFailure: true });
+  });
+
+  it("validates structured output from the driver against the schema", async () => {
+    const t = okTransport();
+    const { executor } = withDriver([{ hang: true, dieOn: ["SIGTERM"] }], async () => ({
+      ...t,
+      result: { ...t.result, stdout: '{"approved":"yes"}', structuredOutput: { approved: "yes", summary: "s" } },
+    }));
+    const result = await executor.invoke({ ...base, jsonSchema: VERDICT_SCHEMA, expectsStructuredOutput: true });
+    expect(result.structuredOutput).toBeUndefined();
+    expect(result.failure?.category).toBe("invalid_output");
+  });
+
+  it("redacts selected credentials from driver output and child stderr", async () => {
+    const t = okTransport();
+    const { executor } = withDriver([{ hang: true, dieOn: ["SIGTERM"], stderr: `leaked ${SYNTHETIC_KEY}` }], async () => {
+      await new Promise((r) => setTimeout(r, 15));
+      return { ...t, result: { ...t.result, stdout: `out ${SYNTHETIC_KEY}` } };
+    });
+    const result = await executor.invoke(base);
+    expect(result.stdout).not.toContain(SYNTHETIC_KEY);
+    expect(result.stderr).not.toContain(SYNTHETIC_KEY);
+  });
+
+  it("converts a throwing driver into an unsafe, non-retried failure", async () => {
+    const { executor, log } = withDriver([{ hang: true, dieOn: ["SIGTERM"] }], async () => {
+      throw new Error("boom");
+    });
+    const result = await executor.invoke({ ...base, ...retry });
+    expect(result.exitCode).toBe(1);
+    expect(result.failure).toBeDefined();
+    expect(log).toHaveLength(1);
+  });
+});
+
+describe("app-server trusted view (AII-1002)", () => {
+  const AUTH_ORIGINAL = '{"tokens":{"account_id":"acct-S","refresh_token":"original"}}';
+  const AUTH_REFRESHED = '{"tokens":{"account_id":"acct-S","refresh_token":"refreshed"}}';
+  const AUTH_OTHER = '{"tokens":{"account_id":"acct-X","refresh_token":"other"}}';
+  const viewDirs = (): string[] => readdirSync(tmpdir()).filter((n) => n.startsWith("codex-view-"));
+  let selected: string;
+  beforeEach(() => {
+    selected = mkdtempSync(join(tmpdir(), "selected-home-"));
+    writeFileSync(join(selected, "auth.json"), AUTH_ORIGINAL);
+    writeFileSync(join(selected, "config.toml"), 'model_provider="evil"\n[mcp_servers.x]\ncommand="touch /tmp/sentinel"\n');
+    mkdirSync(join(selected, "rules"));
+  });
+  afterEach(() => rmSync(selected, { recursive: true, force: true }));
+
+  const okResult = (): CodexTransportResult => ({
+    result: {
+      stdout: "plan",
+      stderr: "",
+      exitCode: 0,
+      tokensUsed: 0,
+      telemetry: { outcome: "success", numTurns: null, durationMs: null, costUsd: null, tokensIn: null, tokensOut: null },
+      terminalStatus: { subtype: "success", isError: false },
+      signal: null,
+    },
+    sawUnsafe: false,
+    stopReason: null,
+  });
+
+  /** Mirrors ModelAuthClient: checkpoints (reads the selected source) after the callback returns OR throws, then settles. */
+  function checkpointingAuth() {
+    const checkpoints: string[] = [];
+    let started = 0;
+    let settled = 0;
+    const client: Pick<ModelAuthClient, "invoke"> = {
+      async invoke<T>(_id: string, cb: (i: ModelInvocation) => Promise<T>): Promise<T> {
+        started++;
+        let out: T | undefined;
+        let failure: unknown;
+        let failed = false;
+        try {
+          out = await cb({ env: { PATH: "/usr/bin", CODEX_HOME: selected }, strippedKeys: [] });
+        } catch (e) {
+          failed = true;
+          failure = e;
+        }
+        checkpoints.push(readFileSync(join(selected, "auth.json"), "utf8"));
+        settled++;
+        if (failed) throw failure;
+        return out as T;
+      },
+    };
+    return { client, checkpoints, invocations: () => ({ started, settled }) };
+  }
+
+  function run(scripts: Script[], log: Spawned[], driverRun: CodexProtocolDriver["run"], extra: Partial<CodexExecutorOptions> = {}) {
+    const events: string[] = [];
+    const auth: Pick<ModelAuthClient, "invoke"> = {
+      async invoke<T>(_id: string, cb: (i: ModelInvocation) => Promise<T>): Promise<T> {
+        const out = await cb({ env: { PATH: "/usr/bin", CODEX_HOME: selected }, strippedKeys: [] });
+        events.push("checkpoint");
+        return out;
+      },
+    };
+    const executor = new CodexExecutor(workspace, {
+      auth,
+      profileId: "p1",
+      allowRepositoryWrites: true,
+      protocolDriver: { run: driverRun },
+      spawnImpl: makeSpawn(scripts, log),
+      sleepImpl: async () => {},
+      termWaitMs: 30,
+      killWaitMs: 30,
+      ...extra,
+    });
+    return { executor, log, events };
+  }
+
+  it("spawns in a trusted empty cwd with a trusted CODEX_HOME holding only config and the selected auth", async () => {
+    let seen: { cwdFiles: string[]; cwd: string; home: string; files: string[]; config: string; auth: string; input: CodexTransportRunInput } | undefined;
+    const log: Spawned[] = [];
+    const { executor } = run([{ hang: true, dieOn: ["SIGTERM"] }], log, async (input) => {
+      const home = log[0].env.CODEX_HOME;
+      seen = {
+        cwd: input.protocolCwd!,
+        cwdFiles: readdirSync(input.protocolCwd!),
+        home,
+        files: readdirSync(home).sort(),
+        config: readFileSync(join(home, "config.toml"), "utf8"),
+        auth: readFileSync(join(home, "auth.json"), "utf8"),
+        input,
+      };
+      return okResult();
+    });
+    // route the spawn log through the same array the driver reads
+    await executor.invoke(base);
+    expect(seen!.home).not.toBe(selected);
+    expect(seen!.files).toEqual(["auth.json", "config.toml"]);
+    expect(seen!.config).not.toContain("evil");
+    expect(seen!.config).not.toContain("mcp_servers");
+    expect(seen!.auth).toBe(AUTH_ORIGINAL);
+    expect(seen!.cwdFiles).toEqual([]);
+    // HOME is a trusted empty dir inside the view, never the selected HOME
+    expect(log[0].env.HOME).toBe(join(dirname(seen!.home), "user-home"));
+    expect(seen!.input.workspaceDir).toBe(workspace);
+    expect(seen!.input.protocolCwd).not.toBe(workspace);
+    expect(seen!.input.forbiddenRoots).toEqual(expect.arrayContaining([selected, seen!.home]));
+    expect(log[0].cwd).toBe(seen!.cwd);
+    // normal path removes the view
+    expect(existsSync(seen!.home)).toBe(false);
+  });
+
+  it("syncs a refreshed auth.json back to the selected home only after termination", async () => {
+    const log: Spawned[] = [];
+    const { executor } = run([{ hang: true, dieOn: ["SIGTERM"] }], log, async () => {
+      writeFileSync(join(log[0].env.CODEX_HOME, "auth.json"), AUTH_REFRESHED);
+      expect(readFileSync(join(selected, "auth.json"), "utf8")).toBe(AUTH_ORIGINAL);
+      return okResult();
+    });
+    await executor.invoke(base);
+    expect(readFileSync(join(selected, "auth.json"), "utf8")).toBe(AUTH_REFRESHED);
+    // hostile selected config is untouched, never copied
+    expect(readFileSync(join(selected, "config.toml"), "utf8")).toContain("evil");
+  });
+
+  it("syncs a refreshed session for the same account and checkpoints only afterwards", async () => {
+    writeFileSync(join(selected, "auth.json"), '{"tokens":{"account_id":"acct-A","refresh_token":"r1"}}');
+    const log: Spawned[] = [];
+    const { client, checkpoints } = checkpointingAuth();
+    const { executor } = run([{ hang: true, dieOn: ["SIGTERM"] }], log, async () => {
+      writeFileSync(join(log[0].env.CODEX_HOME, "auth.json"), '{"tokens":{"account_id":"acct-A","refresh_token":"r2"}}');
+      return okResult();
+    }, { auth: client });
+    await executor.invoke(base);
+    expect(checkpoints).toEqual(['{"tokens":{"account_id":"acct-A","refresh_token":"r2"}}']);
+  });
+
+  describe("fail-closed auth sync-back", () => {
+    const cleanupViews = (before: Set<string>): void => {
+      for (const n of viewDirs().filter((d) => !before.has(d))) rmSync(join(tmpdir(), n), { recursive: true, force: true });
+    };
+
+    // Each case: what the child leaves in the view, what happens to the selected source meanwhile.
+    const cases: Array<[string, (home: string) => void, string?]> = [
+      ["malformed JSON", (home) => writeFileSync(join(home, "auth.json"), "{not json sk-secret-canary")],
+      ["a non-object JSON value", (home) => writeFileSync(join(home, "auth.json"), "[1,2]")],
+      ["a deleted view auth.json", (home) => rmSync(join(home, "auth.json"))],
+      [
+        "a different account identity",
+        (home) => writeFileSync(join(home, "auth.json"), '{"tokens":{"account_id":"acct-B"}}'),
+        '{"tokens":{"account_id":"acct-A"}}',
+      ],
+      [
+        "a lost account identity",
+        (home) => writeFileSync(join(home, "auth.json"), '{"tokens":{}}'),
+        '{"tokens":{"account_id":"acct-A"}}',
+      ],
+      [
+        "a selected source changed underneath the view",
+        (home) => {
+          writeFileSync(join(home, "auth.json"), AUTH_REFRESHED);
+          writeFileSync(join(selected, "auth.json"), AUTH_OTHER);
+        },
+      ],
+      [
+        "a selected source removed underneath the view",
+        (home) => {
+          writeFileSync(join(home, "auth.json"), AUTH_REFRESHED);
+          rmSync(join(selected, "auth.json"));
+        },
+      ],
+      [
+        "a sync write failure",
+        (home) => {
+          writeFileSync(join(home, "auth.json"), AUTH_REFRESHED);
+          mkdirSync(join(selected, `auth.json.sync-${process.pid}`));
+        },
+      ],
+    ];
+
+    it.each(cases)("holds, preserves the view and never checkpoints on %s", async (_name, mutate, initial) => {
+      if (initial) writeFileSync(join(selected, "auth.json"), initial);
+      const before = new Set(viewDirs());
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const log: Spawned[] = [];
+      const { client, checkpoints, invocations } = checkpointingAuth();
+      const { executor } = run([{ hang: true, dieOn: ["SIGTERM"] }], log, async () => {
+        mutate(log[0].env.CODEX_HOME);
+        return okResult();
+      }, { auth: client });
+      const sourceAfterRun = (): string | null => (existsSync(join(selected, "auth.json")) ? readFileSync(join(selected, "auth.json"), "utf8") : null);
+
+      await expect(executor.invoke(base)).rejects.toMatchObject({ code: "CODEX_RECOVERY_REQUIRED", reason: "auth_sync_failed" });
+
+      // the callback never settled: no success, no checkpoint (stale or otherwise), profile still "invoking"
+      expect(checkpoints).toEqual([]);
+      expect(invocations()).toEqual({ started: 1, settled: 0 });
+      // the selected source was never replaced by anything this run produced
+      const unchangedOrExternal = sourceAfterRun();
+      expect([initial ?? AUTH_ORIGINAL, AUTH_OTHER, null]).toContain(unchangedOrExternal);
+
+      // the view survives as the only copy of the refreshed session
+      const left = viewDirs().filter((n) => !before.has(n));
+      expect(left).toHaveLength(1);
+      const err = await executor.invoke(base).catch((e: unknown) => e);
+      expect(err).toMatchObject({ reason: "held" });
+      expect(log).toHaveLength(1);
+      expect(invocations().started).toBe(1);
+      expect(viewDirs().filter((n) => !before.has(n))).toEqual(left);
+
+      const logged = warn.mock.calls.map((c) => c.join(" ")).join("\n");
+      expect(logged).toContain("auth sync-back failed");
+      expect(logged).not.toContain("sk-secret-canary");
+      warn.mockRestore();
+      cleanupViews(before);
+    });
+
+    it("carries the preserved view location on the recovery error and still restores the origin credential", async () => {
+      const before = new Set(viewDirs());
+      const log: Spawned[] = [];
+      const { client } = checkpointingAuth();
+      const { executor } = run([{ hang: true, dieOn: ["SIGTERM"] }], log, async () => {
+        writeFileSync(join(log[0].env.CODEX_HOME, "auth.json"), "garbage");
+        return okResult();
+      }, { auth: client });
+      const err = (await executor.invoke(base).catch((e: unknown) => e)) as CodexRecoveryRequiredError;
+      expect(err).toBeInstanceOf(CodexRecoveryRequiredError);
+      expect(readFileSync(join(err.viewRoot!, "home", "auth.json"), "utf8")).toBe("garbage");
+      cleanupViews(before);
+    });
+  });
+
+  describe("selected auth validation before spawn", () => {
+    it.each([
+      ["malformed JSON", "{not json sk-secret-canary"],
+      ["a non-object JSON value", "[1,2]"],
+    ])("holds with the callback pending, no spawn and no checkpoint on %s", async (_name, text) => {
+      writeFileSync(join(selected, "auth.json"), text);
+      const before = new Set(viewDirs());
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const log: Spawned[] = [];
+      const { client, checkpoints, invocations } = checkpointingAuth();
+      const driver = vi.fn(async () => okResult());
+      const { executor } = run([{ hang: true, dieOn: ["SIGTERM"] }], log, driver, { auth: client });
+
+      await expect(executor.invoke(base)).rejects.toMatchObject({ code: "CODEX_RECOVERY_REQUIRED", reason: "auth_sync_failed" });
+
+      expect(log).toHaveLength(0);
+      expect(driver).not.toHaveBeenCalled();
+      expect(checkpoints).toEqual([]);
+      expect(invocations()).toEqual({ started: 1, settled: 0 });
+      // the selected profile is untouched and the half-built view (config only, no auth) is gone
+      expect(readFileSync(join(selected, "auth.json"), "utf8")).toBe(text);
+      expect(viewDirs().filter((n) => !before.has(n))).toEqual([]);
+
+      await expect(executor.invoke(base)).rejects.toMatchObject({ reason: "held" });
+      expect(log).toHaveLength(0);
+      expect(invocations().started).toBe(1);
+
+      const logged = warn.mock.calls.map((c) => c.join(" ")).join("\n");
+      expect(logged).not.toContain("sk-secret-canary");
+      warn.mockRestore();
+    });
+  });
+
+  describe("auth identity comparison", () => {
+    const idToken = (claims: Record<string, unknown>): string =>
+      `h.${Buffer.from(JSON.stringify(claims)).toString("base64url")}.s`;
+
+    async function refresh(initial: string, refreshed: string) {
+      writeFileSync(join(selected, "auth.json"), initial);
+      const before = new Set(viewDirs());
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const log: Spawned[] = [];
+      const { client, checkpoints, invocations } = checkpointingAuth();
+      const { executor } = run([{ hang: true, dieOn: ["SIGTERM"] }], log, async () => {
+        writeFileSync(join(log[0].env.CODEX_HOME, "auth.json"), refreshed);
+        return okResult();
+      }, { auth: client });
+      const outcome = await executor.invoke(base).then(
+        () => "ok",
+        (e: unknown) => (e as { reason?: string }).reason ?? "error",
+      );
+      warn.mockRestore();
+      const left = viewDirs().filter((n) => !before.has(n));
+      for (const n of left) rmSync(join(tmpdir(), n), { recursive: true, force: true });
+      return { outcome, checkpoints, invocations: invocations(), source: readFileSync(join(selected, "auth.json"), "utf8") };
+    }
+
+    it.each([
+      ["a valid object with no identity fields", '{"tokens":{"refresh_token":"r1"}}', '{"tokens":{"refresh_token":"r2"}}'],
+      ["empty identity strings", '{"OPENAI_API_KEY":"","tokens":{"account_id":""}}', '{"OPENAI_API_KEY":"","tokens":{"account_id":"","refresh_token":"r2"}}'],
+      [
+        "an undecodable id_token",
+        '{"tokens":{"id_token":"not-a-jwt","refresh_token":"r1"}}',
+        '{"tokens":{"id_token":"not-a-jwt","refresh_token":"r2"}}',
+      ],
+      ["an id_token subject that is not a string", `{"tokens":{"id_token":"${idToken({ sub: 7 })}"}}`, `{"tokens":{"id_token":"${idToken({ sub: 7 })}","x":1}}`],
+    ])("rejects a refresh when selected and refreshed identity are unknown: %s", async (_n, initial, refreshed) => {
+      const r = await refresh(initial, refreshed);
+      expect(r.outcome).toBe("auth_sync_failed");
+      expect(r.checkpoints).toEqual([]);
+      expect(r.invocations).toEqual({ started: 1, settled: 0 });
+      expect(r.source).toBe(initial);
+    });
+
+    it("rejects a refresh that drops a known selected identity", async () => {
+      const r = await refresh('{"tokens":{"account_id":"acct-A"}}', '{"tokens":{"refresh_token":"r2"}}');
+      expect(r.outcome).toBe("auth_sync_failed");
+      expect(r.checkpoints).toEqual([]);
+    });
+
+    it("accepts a refreshed API-key account", async () => {
+      const refreshed = '{"OPENAI_API_KEY":"sk-synthetic-1","last_refresh":"later"}';
+      const r = await refresh('{"OPENAI_API_KEY":"sk-synthetic-1"}', refreshed);
+      expect(r.outcome).toBe("ok");
+      expect(r.source).toBe(refreshed);
+      expect(r.checkpoints).toEqual([refreshed]);
+    });
+
+    it("accepts a refreshed session whose identity is the id_token subject", async () => {
+      const initial = `{"tokens":{"id_token":"${idToken({ sub: "user-1" })}","refresh_token":"r1"}}`;
+      const refreshed = `{"tokens":{"id_token":"${idToken({ sub: "user-1" })}","refresh_token":"r2"}}`;
+      const r = await refresh(initial, refreshed);
+      expect(r.outcome).toBe("ok");
+      expect(r.source).toBe(refreshed);
+    });
+
+    it("rejects a refresh for a different id_token subject", async () => {
+      const r = await refresh(
+        `{"tokens":{"id_token":"${idToken({ sub: "user-1" })}"}}`,
+        `{"tokens":{"id_token":"${idToken({ sub: "user-2" })}"}}`,
+      );
+      expect(r.outcome).toBe("auth_sync_failed");
+    });
+  });
+
+  it("directs the provider only through the selected invoke env's OPENAI_BASE_URL, never selected-home config", async () => {
+    const log: Spawned[] = [];
+    const auth: Pick<ModelAuthClient, "invoke"> = {
+      invoke: async (_id, cb) => cb({ env: { PATH: "/usr/bin", CODEX_HOME: selected, OPENAI_BASE_URL: "http://127.0.0.1:4010/v1" }, strippedKeys: [] }),
+    };
+    let config = "";
+    const { executor } = run([{ hang: true, dieOn: ["SIGTERM"] }], log, async () => {
+      config = readFileSync(join(log[0].env.CODEX_HOME, "config.toml"), "utf8");
+      return okResult();
+    }, { auth });
+    await executor.invoke(base);
+    expect(config).toContain('openai_base_url = "http://127.0.0.1:4010/v1"');
+    expect(config).not.toContain("evil");
+  });
+
+  it("keeps the view and skips sync while the child may live, and still blocks a second invoke", async () => {
+    const before = new Set(viewDirs());
+    const log: Spawned[] = [];
+    const { executor } = run([{ hang: true, dieOn: [] }], log, async () => {
+      writeFileSync(join(log[0].env.CODEX_HOME, "auth.json"), AUTH_REFRESHED);
+      return okResult();
+    });
+    await expect(executor.invoke(base)).rejects.toBeInstanceOf(CodexRecoveryRequiredError);
+    const left = viewDirs().filter((n) => !before.has(n));
+    expect(left).toHaveLength(1);
+    expect(readFileSync(join(selected, "auth.json"), "utf8")).toBe(AUTH_ORIGINAL);
+    await expect(executor.invoke(base)).rejects.toMatchObject({ reason: "held" });
+    expect(viewDirs().filter((n) => !before.has(n))).toEqual(left);
+    rmSync(join(tmpdir(), left[0]), { recursive: true, force: true });
+  });
+
+  it("removes the view on timeout and cancel", async () => {
+    const before = new Set(viewDirs());
+    const halting: CodexProtocolDriver["run"] = (i) =>
+      new Promise((resolve) => i.io.halt.addEventListener("abort", () => resolve({ ...okResult(), stopReason: null })));
+    const { executor } = run([{ hang: true, dieOn: ["SIGTERM"] }], [], halting);
+    const result = await executor.invoke({ ...base, invocationTimeoutMs: 20 });
+    expect(result.failure?.code).toBe("INVOCATION_TIMEOUT");
+    expect(viewDirs().filter((n) => !before.has(n))).toEqual([]);
+  });
+
+  it("leaves the default exec path without a view", async () => {
+    const before = new Set(viewDirs());
+    const { executor, log } = make([{ stdout: message("done") }]);
+    await executor.invoke(base);
+    expect(log[0].args[0]).toBe("exec");
+    expect(viewDirs().filter((n) => !before.has(n))).toEqual([]);
+  });
+});
+
+describe("invocation deadline across attempts", () => {
+  const bigBackoff = { retry: { policy: { ...DEFAULT_RETRY_POLICY, requestRetries: 3, backoffInitialMs: 10_000, backoffMaxMs: 60_000 }, toolUseIsSafe: false } };
+  const transientResult: Script = { exitCode: 1, stderr: "stream error: 503 service unavailable", stdout: [ev({ type: "turn.started" }), ev({ type: "turn.completed", usage: { input_tokens: 4, output_tokens: 2 } })] };
+
+  function clocked(scripts: Script[], opts: { schedulingDelayMs?: number } = {}) {
+    let t = 1_000;
+    const auth = makeAuth();
+    const inner = auth.client.invoke.bind(auth.client);
+    const client: Pick<ModelAuthClient, "invoke"> = {
+      invoke: (async (profileId: string, run: (i: ModelInvocation) => Promise<unknown>) => {
+        t += opts.schedulingDelayMs ?? 0;
+        return inner(profileId, run);
+      }) as ModelAuthClient["invoke"],
+    };
+    const slept: number[] = [];
+    const made = make(scripts, { nowImpl: () => t, sleepImpl: async (ms) => void ((t += ms), slept.push(ms)) }, { ...auth, client });
+    return { ...made, slept, auth, clock: () => t };
+  }
+
+  it("bounds an oversized result-retry backoff by the remaining budget and spawns no extra child", async () => {
+    const { executor, log, slept, auth, clock } = clocked([transientResult, { stdout: message("late") }]);
+    const result = await executor.invoke({ ...base, ...bigBackoff, invocationTimeoutMs: 100 });
+    expect(result.failure).toMatchObject({ code: "INVOCATION_TIMEOUT", retryable: false });
+    expect(log).toHaveLength(1);
+    expect(slept).toHaveLength(1);
+    expect(slept[0]).toBeLessThanOrEqual(100);
+    expect(clock() - 1_000).toBeLessThanOrEqual(100);
+    // Accumulated telemetry from the first attempt survives the timeout result.
+    expect(result.telemetry).toMatchObject({ tokensIn: 4, tokensOut: 2 });
+    expect(auth.events.filter((e) => e.startsWith("invoke:"))).toHaveLength(1);
+    expect(auth.events.filter((e) => e === "checkpoint")).toHaveLength(1);
+  });
+
+  it("bounds an oversized spawn-error backoff and does not spawn again", async () => {
+    const eagain = Object.assign(new Error("spawn codex EAGAIN"), { code: "EAGAIN" });
+    const { executor, log, slept } = clocked([{ error: eagain }, { stdout: message("late") }]);
+    const result = await executor.invoke({ ...base, ...bigBackoff, invocationTimeoutMs: 100 });
+    expect(result.failure).toMatchObject({ code: "INVOCATION_TIMEOUT" });
+    expect(log).toHaveLength(1);
+    expect(slept[0]).toBeLessThanOrEqual(100);
+  });
+
+  it("does not spawn when scheduling delay consumed the budget, and releases auth only through the checkpoint", async () => {
+    const { executor, log, auth } = clocked([{ stdout: message("never") }], { schedulingDelayMs: 500 });
+    const result = await executor.invoke({ ...base, invocationTimeoutMs: 100 });
+    expect(result.failure).toMatchObject({ code: "INVOCATION_TIMEOUT" });
+    expect(log).toHaveLength(0);
+    expect(auth.events).toEqual(["invoke:profile-1", "checkpoint"]);
+  });
+
+  it("does not acquire auth for a retry attempt whose budget expired during scheduling", async () => {
+    let t = 1_000;
+    const auth = makeAuth();
+    const { executor, log } = make(
+      [transientResult, { stdout: message("never") }],
+      { nowImpl: () => t, sleepImpl: async (ms) => void (t += ms + 1_000) },
+      auth,
+    );
+    const result = await executor.invoke({ ...base, ...bigBackoff, invocationTimeoutMs: 100 });
+    expect(result.failure).toMatchObject({ code: "INVOCATION_TIMEOUT" });
+    expect(log).toHaveLength(1);
+    expect(auth.events.filter((e) => e.startsWith("invoke:"))).toHaveLength(1);
+  });
+
+  it("never spawns with a zero or negative timeout", async () => {
+    const { executor, log, auth } = clocked([{ stdout: message("never") }]);
+    const result = await executor.invoke({ ...base, invocationTimeoutMs: 0 });
+    expect(result.failure).toMatchObject({ code: "INVOCATION_TIMEOUT" });
+    expect(log).toHaveLength(0);
+    expect(auth.events).toEqual([]);
+  });
 });

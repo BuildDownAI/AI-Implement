@@ -11,7 +11,7 @@ vi.mock("../local-job-logs.js", () => ({
   archiveLocalContainerLogsBestEffort: archiveLocalContainerLogsBestEffortMock,
 }));
 
-import { removeLocalContainer } from "../local-docker.js";
+import { removeLocalContainer, stopLocalContainer } from "../local-docker.js";
 
 describe("removeLocalContainer", () => {
   beforeEach(() => {
@@ -47,5 +47,38 @@ describe("removeLocalContainer", () => {
     await removeLocalContainer("b".repeat(64));
 
     expect(rawExecFile).toHaveBeenCalledWith("docker", ["rm", "-f", "b".repeat(64)], expect.any(Function));
+  });
+});
+
+describe("stopLocalContainer", () => {
+  beforeEach(() => { vi.clearAllMocks(); });
+
+  function mockExec(err: Error | null) {
+    const calls: string[][] = [];
+    vi.mocked(rawExecFile).mockImplementation(
+      (_cmd: unknown, args: unknown, cb: unknown) => {
+        calls.push(args as string[]);
+        (cb as (e: Error | null, r?: { stdout: string; stderr: string }) => void)(err, err ? undefined : { stdout: "", stderr: "" });
+        return {} as ReturnType<typeof rawExecFile>;
+      },
+    );
+    return calls;
+  }
+
+  it("force-removes the container without archiving logs", async () => {
+    const calls = mockExec(null);
+    await stopLocalContainer("c-1");
+    expect(calls).toEqual([["rm", "-f", "c-1"]]);
+    expect(archiveLocalContainerLogsBestEffortMock).not.toHaveBeenCalled();
+  });
+
+  it("counts a missing container as stopped", async () => {
+    mockExec(Object.assign(new Error("failed"), { stderr: "Error response from daemon: No such container: c-1" }));
+    await expect(stopLocalContainer("c-1")).resolves.toBeUndefined();
+  });
+
+  it("rejects on any other docker error", async () => {
+    mockExec(Object.assign(new Error("failed"), { stderr: "Cannot connect to the Docker daemon" }));
+    await expect(stopLocalContainer("c-1")).rejects.toThrow(/Cannot connect/);
   });
 });

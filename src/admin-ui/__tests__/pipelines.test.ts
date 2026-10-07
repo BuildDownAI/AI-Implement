@@ -33,7 +33,8 @@ describe("pipelines page time filter", () => {
       "if (isRange) { stopLogAutoRefresh(); } else { startLogAutoRefresh(); }",
     );
     // registerPage uses the managed auto-refresh, not a bare setInterval
-    expect(pipelinesScript).toMatch(/registerPage\('jobs',[\s\S]*startLogAutoRefresh\(\);/);
+    expect(pipelinesScript).toMatch(/startLogAutoRefresh\(\);\n      }\n    };/);
+    expect(pipelinesScript).toMatch(/registerPage\('jobs',[\s\S]*pipelinesLog\.start\(\);/);
   });
 });
 
@@ -65,7 +66,7 @@ describe("pipelines page — kg-refresh row actions (AII-521)", () => {
   });
 
   it("reload the log after a successful cancel", () => {
-    expect(pipelinesScript).toContain("loadLog()");
+    expect(pipelinesScript).toContain(".then(function () { load(); })");
   });
 });
 
@@ -75,18 +76,34 @@ describe("stuck job badge", () => {
   const end = pipelinesScript.indexOf("function execBadge(", start);
   const badge = new Function("statusClass", "makeBadge", pipelinesScript.slice(start, end) + "; return statusBadge;")(
     { timed_out: "warn", completed: "success", review_failed: "warn" },
-    (cls: string, label: string) => ({ cls, label }),
+    (cls: string, label: string, title?: string) => (title ? { cls, label, title } : { cls, label }),
   );
+  it("adds the failure code or conclusion as the badge title", () => {
+    expect(badge("failed", "dispatch_rejected")).toEqual({ cls: "neutral", label: "failed", title: "dispatch_rejected" });
+    expect(badge("failed", "dispatch_rejected", { code: "WORKFLOW_ERROR" })).toEqual({ cls: "neutral", label: "failed", title: "WORKFLOW_ERROR" });
+    expect(badge("failed", null)).toEqual({ cls: "neutral", label: "failed" });
+  });
+  it("escapes the title in the real makeBadge", () => {
+    const s = pipelinesScript.indexOf("function makeBadge(");
+    const e = pipelinesScript.indexOf("function isReviewIncomplete(", s);
+    const win = {
+      esc: (v: string) => v,
+      escAttr: (v: string) => v.replace(/"/g, "&quot;"),
+    };
+    const make = new Function("window", pipelinesScript.slice(s, e) + "; return makeBadge;")(win);
+    expect(make("fail", "failed", 'a"b')).toContain('title="a&quot;b"');
+    expect(make("fail", "failed")).not.toContain("title=");
+  });
   it("shows needs-human only for the give-up conclusion", () => {
-    expect(badge("timed_out", "stuck_giveup")).toEqual({ cls: "fail", label: "Needs human" });
-    expect(badge("timed_out", "stuck_requeued")).toEqual({ cls: "warn", label: "timed_out" });
-    expect(badge("completed", "stuck_giveup")).toEqual({ cls: "success", label: "completed" });
+    expect(badge("timed_out", "stuck_giveup")).toEqual({ cls: "fail", label: "Needs human", title: "stuck_giveup" });
+    expect(badge("timed_out", "stuck_requeued")).toEqual({ cls: "warn", label: "timed_out", title: "stuck_requeued" });
+    expect(badge("completed", "stuck_giveup")).toEqual({ cls: "success", label: "completed", title: "stuck_giveup" });
   });
   it("distinguishes incomplete review infrastructure from code rejection", () => {
-    expect(badge("review_failed", "REVIEWER_TURNS_EXHAUSTED", { code: "REVIEWER_TURNS_EXHAUSTED", stage: "post-push-review" })).toEqual({ cls: "warn", label: "review incomplete" });
-    expect(badge("review_failed", "PROVIDER_UNAVAILABLE", { code: "PROVIDER_UNAVAILABLE", stage: "post-push-review" })).toEqual({ cls: "warn", label: "review incomplete" });
-    expect(badge("review_failed", "invalid_review", null)).toEqual({ cls: "warn", label: "review incomplete" });
-    expect(badge("review_failed", "REVIEW_UNAPPROVED", { code: "REVIEW_UNAPPROVED", stage: "post-push-review" })).toEqual({ cls: "warn", label: "review failed" });
+    expect(badge("review_failed", "REVIEWER_TURNS_EXHAUSTED", { code: "REVIEWER_TURNS_EXHAUSTED", stage: "post-push-review" })).toEqual({ cls: "warn", label: "review incomplete", title: "REVIEWER_TURNS_EXHAUSTED" });
+    expect(badge("review_failed", "PROVIDER_UNAVAILABLE", { code: "PROVIDER_UNAVAILABLE", stage: "post-push-review" })).toEqual({ cls: "warn", label: "review incomplete", title: "PROVIDER_UNAVAILABLE" });
+    expect(badge("review_failed", "invalid_review", null)).toEqual({ cls: "warn", label: "review incomplete", title: "invalid_review" });
+    expect(badge("review_failed", "REVIEW_UNAPPROVED", { code: "REVIEW_UNAPPROVED", stage: "post-push-review" })).toEqual({ cls: "warn", label: "review failed", title: "REVIEW_UNAPPROVED" });
   });
   it("keeps grouped plan completion inference and passes each conclusion", () => {
     expect(pipelinesScript).toContain("statusBadge(planStatus, plan.conclusion, plan.failure)");

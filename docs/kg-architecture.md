@@ -143,8 +143,8 @@ Every soft failure that skips real work must leave a receipt. The embed step wri
 boot, surfaced as `kgDegraded` on `GET /`, in the deploy notification, and in `get_tenant_health`
 (AII-422). See [deployment.md](deployment.md#kg-embeddings-health).
 Liveness is a second, independent signal: the boot-time probe's result is surfaced as `kgUnavailable` and
-`sidecar` on the same three reads and in the Deployments card (AII-648, AII-650). See
-[deployment.md](deployment.md#kg-sidecar-health).
+`sidecar` on the same three reads and in the Knowledge graph card on the Knowledge Graph Pipelines page
+(`/admin#kg-pipelines`; AII-648, AII-650). See [deployment.md](deployment.md#kg-sidecar-health).
 
 ### Stage 4 — Serve
 
@@ -203,8 +203,8 @@ or these steps by hand.
 
 1. Reconcile scope in `sources.yml` (through a PR on the KG repo when it changes) — the rail runs the ingest and pushes the snapshot itself; no laptop ingest, no laptop push.
 2. **Trigger the refresh**: the `trigger_kg_refresh` MCP tool (admin role; this is what `bd-kg-refresh` calls),
-   `POST /api/kg/refresh` with an admin session token, or the Deployments page's "Refresh graph now" — all three
-   run the same handler. `202` = accepted; `409` = a refresh or a deploy is
+   `POST /api/kg/refresh` with an admin session token, or **Refresh graph now** on the Knowledge Graph
+   Pipelines page (`/admin#kg-pipelines`) — all three run the same handler. `202` = accepted; `409` = a refresh or a deploy is
    already in progress; `422` = callback not configured or credential preflight failed (see below). The orchestrator
    first runs a **credential preflight** (probing the KG write token and the installation-wide
    dependency token against every `code_repo` and `secondary_repos` slug in `sources.yml`) and
@@ -257,9 +257,9 @@ whatever it held before the dispatch rather than advancing through `staging`/`se
 A dry-run and a real run of the same KG head print the same part table. The same dry-run is
 reachable from the admin REST route, `POST /api/kg/refresh` with body `{ "dryRun": true }` (the
 response echoes `dryRun` beside the trigger's fields; no body is the unchanged real refresh), and
-from the Deployments page's **Dry-run refresh** button beside **Refresh graph now** (AII-635). When
-the last terminal outcome was a dry-run, the Knowledge graph card shows its verdict and the
-per-part table (`part | previous | new | delta`). A guard refusal carries the same
+from the **Dry-run refresh** button beside **Refresh graph now** on the Knowledge Graph Pipelines page
+(AII-635). When the last terminal outcome was a dry-run, the Knowledge graph card on that page shows its
+verdict and the per-part table (`part | previous | new | delta`). A guard refusal carries the same
 `lastRefresh.partTable` and a part-naming `detail` on `get_kg_status` whether it came from a
 dry-run or a real (non-dry-run) refresh (AII-638) — only a real success omits `guardVerdict`/
 `partTable`, since it reports a snapshot commit instead.
@@ -313,14 +313,20 @@ is a distinct mechanism from an admin accepting a new baseline at refresh time (
 refresh against that same source still refuses the shrink unless that refresh-time acceptance has
 happened. Treat the label as "we've seen this and it's expected," not as a bypass.
 
-Outcomes are stored per PR, keyed by `repo#prNumber` and pinned to the head sha they ran against
-(AII-636), so a `labeled` re-report can only ever surface that PR's own verdict — never another PR's
-— and is a no-op once a new push supersedes the stored sha. The cache is bounded (`MAX_TRACKED_PRS`),
-evicted immediately on PR close, and persisted as one JSON blob under the `kg_refresh_dry_run_outcomes`
-settings key on every record and eviction, so a restart between a dry run and a later `labeled` /
-`unlabeled` event still finds the outcome (AII-640). A webhook head queued behind a 409 is woken by
-`onRefreshSettled` on every `running → false` transition, not only a dry-run's — a real refresh, a
-failure, a revert, TTL expiry, or a deploy hold clearing all wake it.
+Outcomes are stored per PR on the `KgRepo` object, one `outcome:<repo>#<prNumber>` state key each,
+pinned to the head sha they ran against (AII-636, AII-977), so a `labeled` re-report can only ever
+surface that PR's own verdict — never another PR's — and is a no-op once a new push supersedes the
+stored sha. The `dry-run-report` step sends `recordDryRunOutcome`; the webhook reads it back with
+`dryRunOutcome`. At most `MAX_TRACKED_PRS` outcomes are kept (an `outcomeKeys` list gives the
+eviction order), and `forgetPr` on PR close drops the outcome and any held head. Outcomes survive a
+restart in Restate state; the old `kg_refresh_dry_run_outcomes` settings row is deleted at boot, and
+its live outcomes are re-posted by the next push. The webhook keeps no sha dedup: the delivery id is
+the `enqueueDryRun` idempotency key, and the object keeps one `sha:<repo>#<pr>` state key holding the
+last head sha it accepted for the PR — a second event for that sha (any delivery id) returns
+`{ duplicate: true }`, neither submitting nor queuing, and the webhook answers 200. `forgetPr` clears the key. A PR dry-run queued behind a
+running refresh is held in the `KgRepo` object's `pending` state and submitted by its `release`
+handler when the in-flight refresh lets go — a real refresh, a failure, a revert, or a stale marker
+clearing all release it.
 
 **Manual step — granting the status.** The commit status needs the GitHub App to hold the
 **Commit statuses: Read and write** repository permission. GitHub App permissions live on the App
@@ -379,6 +385,15 @@ prunes it by hand) and **never touches `docs_sites` or `code_repo`'s `docs_url`*
 entirely operator-owned, maintained through `bd-mega-kg-refresh` rather than this rail. A refresh
 with nothing to add logs `scope in sync` and leaves the file byte-for-byte unchanged.
 
+### Where to watch a refresh
+
+`/admin#kg-pipelines` (admin only) shows the Knowledge graph card above a
+table of kg-refresh runs, which is the dispatch log filtered to `phase: kg-refresh`, with Logs and Stop
+on each row. The same runs also appear on the Pipelines page with the `kg` badge, because that page is
+the complete dispatch log. Deployments keeps only the deploy-side signals: the drain tile counts an
+in-flight KG ingest run, and a release whose sidecar does not serve records "Released, but the knowledge
+graph is not serving".
+
 ## Refresh rail implementation (AII-426, AII-495)
 
 [AII-426](https://linear.app/eudoxus/issue/AII-426) shipped the local refresh rail; the "Planned"
@@ -434,7 +449,7 @@ flowchart TD
 
 ### Two materialize paths (AII-599)
 
-`KG_MATERIALIZE_DIRECT=true` switches the refresh rail to the base repo's low-memory `--direct`
+The materialize-direct setting (seeded by `KG_MATERIALIZE_DIRECT=true` on first boot) switches the refresh rail to the base repo's low-memory `--direct`
 path (KGB-15, base PR #34), gated behind the flag because it requires the configured
 `KG_SOURCE_REPO` derivative to already carry that base change — an image whose venv predates it
 fails the materialize step and the rail reverts safely, same as any other staging failure.
@@ -456,15 +471,14 @@ could not hold on 2026-09-08 with the rdflib path (see the Failure history table
 figure above remains the committed setting, but the direct path is what would let that incident's
 fix be reverted instead of the memory bump.
 
-**The flag is a seed, not the only control (AII-602).** `KG_MATERIALIZE_DIRECT` resolves through
-the same `db | env | default` precedence as `RUNNER_MODE` (`getKgMaterializeDirect()` /
-`setKgMaterializeDirect()` in `src/runner-mode.ts`): the env var wins outright when set, else the
-`settings` table row, else `false` (rdflib). `materializeDirectEnabled()` in `src/kg-refresh.ts`
-reads the resolved setting rather than `process.env` directly. The Deployments page
-(`/admin#deployments`) exposes a `Materialize: rdflib | direct` control next to "Refresh graph
-now" — `GET`/`POST /api/kg/materialize-mode` — that flips the DB row; while the env var is set,
-the control is disabled and the write comes back `409`, same as the `RUNNER_MODE` /
-`FLY_PROCESS_LEVEL_SECRETS` pattern on the Runners page. The toggle only affects the *next*
+**The flag is a seed-once setting (AII-602, AII-1109).** `KG_MATERIALIZE_DIRECT` is read only at
+boot by `seedKgMaterializeDirectFromEnv()` (`src/runner-mode.ts`), which writes the `settings` row
+when none exists and is inert afterward. `getKgMaterializeDirect()` / `setKgMaterializeDirect()`
+resolve the stored row, else `false` (rdflib); the env var is never consulted at runtime. `materializeDirectEnabled()` in `src/kg-refresh.ts`
+reads the resolved setting rather than `process.env` directly. The Knowledge Graph Pipelines page
+(`/admin#kg-pipelines`) exposes a `Materialize: rdflib | direct` control next to "Refresh graph
+now" — `GET`/`POST /api/kg/materialize-mode` — that flips the DB row, which is the only
+runtime control. The toggle only affects the *next*
 refresh, not whatever the sidecar is currently serving — `GET /api/kg/status` and the `get_kg_status`
 MCP tool both report the resolved setting as `materialize: "rdflib" | "direct"` for observability.
 
@@ -493,8 +507,8 @@ still recognized and handled as a dry run instead of falling through to the real
 ### Accept-new-baseline plumbing (AII-628)
 
 `trigger_kg_refresh { acceptNewBaseline: true }` (the MCP tool, admin role), `POST /api/kg/refresh`
-with body `{ "acceptNewBaseline": true }`, and the Deployments page's **Accept new baseline &
-refresh** button (a separate, confirm-gated control beside **Refresh graph now** and **Dry-run
+with body `{ "acceptNewBaseline": true }`, and the **Accept new baseline & refresh** button on the
+Knowledge Graph Pipelines page (a separate, confirm-gated control beside **Refresh graph now** and **Dry-run
 refresh** — deliberately not a third argument to the existing refresh button, so accepting a shrink
 is always a distinct, deliberate click after reading the guard table, never the default path) all
 carry the same flag through the same envelope path `dryRun` already established: `trigger(opts)`
@@ -566,7 +580,7 @@ deleted `snapshot/parts/pr.nt`. AII-494 adds the two
 runner-callback endpoints that give this run kind its privileged access without ever vending a
 long-lived credential to the runner. AII-495 wires `POST /api/kg/refresh` to dispatch the runner
 when the source repo has no newer snapshot: the orchestrator mints a run token, encodes a
-`RunConfigV1` with `runnerPhase: "kg-refresh"`, and dispatches via Fly Machines or local Docker.
+`RunConfigV1` with `runnerPhase: "kg-refresh"`, and dispatches via Fly Machines or local Docker. A KG refresh goes to Fly Machines in every runner mode except `local` (local Docker); with no Fly sessions app configured the dispatch step fails and the run ends `dispatch_rejected` (the GitHub Actions fallback is AII-1110). The machine size comes from the `FlyMachineProfile` object under key `kg-refresh`, which the `KgRefresh` workflow reads once, journaled, before its `dispatch` step, so a replay reuses the same size. The default is 2 performance CPUs / 8192 MB; an admin changes it with `set_fly_machine_profile` or from the KG Pipelines page (the same `kg-refresh` profile), and `get_kg_status` reports it as `flyMachine` (`{ ...config, source }`, `source` `profile` or `default`). The mapping's `machineCpus` / `machineMemoryMb` size issue runs only, not a KG run. At boot, a leftover `kg_fly_machine_override` settings row is seeded into the object once, then deleted.
 When the runner completes, it calls `POST /api/runner/result` which routes to `onRunnerComplete` in
 `src/kg-refresh.ts`. If a `snapshotCommit` SHA is included, the orchestrator verifies the commit is
 visible via the GitHub API (one retry for git-cache lag) before starting the local staging rail.

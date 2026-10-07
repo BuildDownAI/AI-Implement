@@ -1,6 +1,6 @@
 import type { RepoMapping } from "./config.js";
 import { GitHubApiError } from "./github-errors.js";
-import { type RunConfigV1, encodeRunConfig } from "./run-config.js";
+import { type RunConfigV1, type RunCredentialsV1, encodeRunConfig, encodeTrustedRunConfig } from "./run-config.js";
 import { DEFAULT_RETRY_POLICY, type RetryPolicy } from "./pipeline/retry-backoff.js";
 import { isChecksPermissionError } from "./checks-permission.js";
 
@@ -31,7 +31,7 @@ export interface DispatchInputs {
   base_branch?: string;
   /**
    * Explicit callback phase reported by the runner. In envelope mode rides inside run_config.
-   * `"kg-refresh"` is the GHA-backed kg-refresh dispatch (src/index.ts `dispatchKgRefreshRun`),
+   * `"kg-refresh"` is the GHA-backed kg-refresh dispatch (`createKgRefreshDispatch`),
    * the one dispatch site that still sends this input top-level under the envelope contract.
    */
   runner_phase?: "implementation" | "gap-analysis" | "kg-refresh";
@@ -104,7 +104,7 @@ export interface DispatchResult {
 /**
  * `workflow_dispatch` inputs that an older synced `claude-implement.yml` still declares but a
  * newer template drops, because their values now ride inside `run_config` instead. Only the
- * kg-refresh GHA dispatch (`dispatchKgRefreshRun` in `src/index.ts`) still sends these
+ * kg-refresh GHA dispatch (`createKgRefreshDispatch`) still sends these
  * top-level — every other dispatch site already builds inputs via `buildEnvelopeDispatchInputs`,
  * which never sets them. `postWorkflowDispatch` strips whichever of these a 422 names and
  * retries — **at most once**, regardless of what the retry's own response says — so the
@@ -405,6 +405,16 @@ export interface EnvelopeDispatchOpts {
   runProgressToken?: string;
   /** Include only when the target workflow advertises publication-token support. */
   runPublicationToken?: string;
+  /** True only when the exact workflow/ref reported `supportsPrivateRunConfig === true` (AII-983).
+   *  The result/progress/publication bearers then ride inside `run_config.credentials` (trusted
+   *  encoder) and are NOT duplicated as top-level inputs; `run_token` is sent as "". Absent/false
+   *  keeps the generic envelope plus masked top-level token inputs. */
+  privateTransport?: boolean;
+  /** Extra typed private credentials. Only `modelAuthGrant` and `attemptToken` are carried; supplied
+   *  result/progress/publication bearers are ignored in favour of the minted token options.
+   *  Requires `privateTransport: true`; supplying it without capability throws rather than
+   *  dropping or downgrading it. */
+  credentials?: RunCredentialsV1;
   runnerImage?: string | null;
   prNumber?: string;
   /** Operator instruction forwarded from an /ai-implement PR comment. Rides inside run_config. */
@@ -430,11 +440,50 @@ export interface EnvelopeDispatchOpts {
  * pass-through inputs (tokens, provider, image, timeout) stay top-level so
  * the GHA workflow can ::add-mask:: the tokens before unpacking the envelope.
  */
+/** Fail-closed guard for supplied private credentials (AII-983): protected transport must never be
+ *  dropped or downgraded, so an unsupported/unprobeable reader aborts the dispatch before launch. */
+export function assertPrivateTransportForCredentials(
+  credentials: RunCredentialsV1 | undefined,
+  capabilities: { supportsPrivateRunConfig?: boolean },
+  target: string,
+): void {
+  if (credentials !== undefined && capabilities.supportsPrivateRunConfig !== true) {
+    throw new Error(
+      `protected run transport requires supportsPrivateRunConfig on ${target}; refusing to drop or downgrade private credentials — re-sync workflows`,
+    );
+  }
+}
+
+/** Only the non-callback private fields a caller may supply. Result/progress/publication bearers are
+ *  orchestrator-minted and phase-scoped, so a supplied copy is never carried over. */
+function suppliedNonBearerCredentials(credentials: RunCredentialsV1 | undefined): Partial<RunCredentialsV1> {
+  return {
+    ...(credentials?.attemptToken !== undefined ? { attemptToken: credentials.attemptToken } : {}),
+    ...(credentials?.modelAuthGrant !== undefined ? { modelAuthGrant: credentials.modelAuthGrant } : {}),
+  };
+}
+
 export function buildEnvelopeDispatchInputs(
   mapping: RepoMapping,
   issue: { id: string; identifier: string; title: string; description?: string | null; profiles?: string[]; assigneeName?: string },
   opts: EnvelopeDispatchOpts,
 ): DispatchInputs {
+  const isPrivate = opts.privateTransport === true;
+  if (opts.credentials !== undefined && !isPrivate) {
+    throw new Error(
+      "protected run transport requires supportsPrivateRunConfig on the target workflow; refusing to drop or downgrade private credentials",
+    );
+  }
+  const issuesPublication = opts.runnerPhase !== "planning" && opts.runnerPhase !== "kg-refresh";
+  const credentials: RunCredentialsV1 | undefined = isPrivate
+    ? {
+        version: 1,
+        ...(opts.runToken ? { resultToken: opts.runToken } : {}),
+        ...(opts.runProgressToken ? { progressToken: opts.runProgressToken } : {}),
+        ...(issuesPublication && opts.runPublicationToken ? { publicationToken: opts.runPublicationToken } : {}),
+        ...suppliedNonBearerCredentials(opts.credentials),
+      }
+    : undefined;
   const runConfig: RunConfigV1 = {
     v: 1,
     issue: {
@@ -462,20 +511,23 @@ export function buildEnvelopeDispatchInputs(
     ...(issue.assigneeName ? { assigneeName: issue.assigneeName } : {}),
     ...(opts.planningContext ? { planningContext: opts.planningContext } : {}),
     ...(opts.groupingParent ? { groupingParent: true } : {}),
+    ...(credentials !== undefined ? { credentials } : {}),
     ...(opts.runnerPhase !== "planning" && opts.runnerPhase !== "kg-refresh"
       ? { retryPolicy: opts.retryPolicy ?? DEFAULT_RETRY_POLICY }
       : {}),
   };
 
   return {
-    run_config: encodeRunConfig(runConfig),
+    run_config: credentials !== undefined ? encodeTrustedRunConfig(runConfig) : encodeRunConfig(runConfig),
     // Display-only duplicate: run-name: is evaluated before any step runs, so it cannot
     // decode run_config. The shared 422 retry (ENVELOPE_OPTIONAL_INPUTS) strips this on a
     // template that predates the declaration.
     issue_identifier: issue.identifier,
-    run_token: opts.runToken ?? "",
-    ...(opts.runProgressToken !== undefined ? { run_progress_token: opts.runProgressToken } : {}),
-    ...(opts.runnerPhase !== "planning" && opts.runnerPhase !== "kg-refresh" && opts.runPublicationToken !== undefined
+    // Private transport: bearers live only in run_config.credentials; "" keeps the (required)
+    // top-level input present for readers that predate the private namespace.
+    run_token: isPrivate ? "" : opts.runToken ?? "",
+    ...(!isPrivate && opts.runProgressToken !== undefined ? { run_progress_token: opts.runProgressToken } : {}),
+    ...(!isPrivate && issuesPublication && opts.runPublicationToken !== undefined
       ? { run_publication_token: opts.runPublicationToken }
       : {}),
     ...providerDispatchFields(mapping),
@@ -800,7 +852,7 @@ export async function ensureBranchExists(
  * runs list for a recent run on the expected branch with a "workflow_dispatch" event.
  * We filter to runs created after `dispatchedAfter` to avoid matching old runs.
  */
-const RUN_TITLE_PREFIX = "Claude AI Implementation — ";
+export const RUN_TITLE_PREFIX = "Claude AI Implementation — ";
 
 /**
  * Finds the workflow run dispatched for a given job. Without `issueIdentifier`, the first
@@ -846,12 +898,6 @@ export async function findWorkflowRunId(
   return fallback;
 }
 
-export const KG_GHA_POLL_DELAYS_MS: readonly number[] = [5_000, 10_000, 20_000, 30_000, 25_000];
-
-/**
- * Polls for a kg-refresh workflow run ID up to ~90 s after dispatch.
- * Injectable findRunId and pollDelaysMs for testability.
- */
 /**
  * Builds the `workflow_dispatch` inputs for a GHA-backed kg-refresh run, for use with
  * `postWorkflowDispatch`. The envelope's `runnerCallbackUrl` is the bare base URL (AII-548);
@@ -859,13 +905,14 @@ export const KG_GHA_POLL_DELAYS_MS: readonly number[] = [5_000, 10_000, 20_000, 
  * (AII-556) — it, `runner_callback_url`, and `issue_identifier` are members of
  * `ENVELOPE_OPTIONAL_INPUTS` and are stripped by the poster on a 422 from a target repo that no
  * longer declares them. `issueIdentifier` is the decoded run_config's `issue.identifier` — the
- * caller (`dispatchKgRefreshRun` in `src/index.ts`) already decodes run_config once for
- * `kgSourceRef` and threads the same decode through here rather than decoding twice.
+ * caller (`createKgRefreshDispatch`) decodes run_config once and
+ * threads `issue.identifier` through here.
  */
 export function buildKgRefreshGhaDispatchBody(opts: {
   runConfig: string;
   runToken: string;
   runProgressToken: string;
+  runPublicationToken?: string;
   runnerImage: string | undefined;
   runnerCallbackUrl?: string | undefined;
   runnerPhase?: DispatchInputs["runner_phase"];
@@ -876,6 +923,7 @@ export function buildKgRefreshGhaDispatchBody(opts: {
     run_config: opts.runConfig,
     run_token: opts.runToken,
     run_progress_token: opts.runProgressToken,
+    ...(opts.runPublicationToken !== undefined ? { run_publication_token: opts.runPublicationToken } : {}),
     ...(opts.runnerPhase ? { runner_phase: opts.runnerPhase } : {}),
     ...(opts.jobTimeoutMinutes ? { job_timeout_minutes: opts.jobTimeoutMinutes } : {}),
     ...(opts.runnerImage ? { runner_image: opts.runnerImage } : {}),
@@ -884,31 +932,31 @@ export function buildKgRefreshGhaDispatchBody(opts: {
   };
 }
 
-export async function pollForKgWorkflowRunId(opts: {
-  token: string;
-  owner: string;
-  repo: string;
-  workflowFile: string;
-  branch: string;
-  dispatchTime: Date;
-  pollDelaysMs?: readonly number[];
-  findRunId?: (
-    token: string, owner: string, repo: string, workflowFile: string, branch: string, dispatchedAfter: Date,
-  ) => Promise<number | null>;
-}): Promise<number | undefined> {
-  const {
-    token, owner, repo, workflowFile, branch, dispatchTime,
-    pollDelaysMs = KG_GHA_POLL_DELAYS_MS,
-    findRunId = findWorkflowRunId,
-  } = opts;
-  for (const delay of pollDelaysMs) {
-    await new Promise<void>((r) => setTimeout(r, delay));
-    try {
-      const runId = await findRunId(token, owner, repo, workflowFile, branch, dispatchTime);
-      if (runId) return runId;
-    } catch { /* non-fatal — keep polling */ }
-  }
-  return undefined;
+/**
+ * Private-transport KG body (AII-983): re-encodes the decoded trusted config with the result and
+ * progress bearers inside `credentials` and omits them as top-level inputs. Publication
+ * authority comes only from the caller's minted token. Supplied bearers are discarded;
+ * only the model-auth grant and attempt token already on the config are kept.
+ */
+export function buildPrivateKgRefreshGhaDispatchBody(
+  opts: Parameters<typeof buildKgRefreshGhaDispatchBody>[0] & { trustedConfig: RunConfigV1 },
+): DispatchInputs {
+  const { trustedConfig, ...rest } = opts;
+  const credentials: RunCredentialsV1 = {
+    ...suppliedNonBearerCredentials(trustedConfig.credentials),
+    version: 1,
+    resultToken: opts.runToken,
+    progressToken: opts.runProgressToken,
+    ...(opts.runPublicationToken ? { publicationToken: opts.runPublicationToken } : {}),
+  };
+  const body = buildKgRefreshGhaDispatchBody({
+    ...rest,
+    runConfig: encodeTrustedRunConfig({ ...trustedConfig, credentials }),
+    runToken: "",
+  });
+  delete body.run_progress_token;
+  delete body.run_publication_token;
+  return body;
 }
 
 export interface WorkflowRunStatus {

@@ -1,4 +1,5 @@
 import http from "node:http";
+import { getDeployStartedAt } from "./deploy-hold.js";
 import { verifyMcpToken, resolveClientPath, getRefreshExpiry } from "./mcp-oauth.js";
 import { recordAuthEvent, type AuthEventCause } from "./mcp-auth-events.js";
 import { recheckIdentity, type AccessRole } from "./access-entries.js";
@@ -85,11 +86,15 @@ const RESTATE_TOOL_NAMES = new Set([
   "list_projects",
   "get_project_binding",
   "list_in_flight_jobs",
+  "get_session_machine",
+  "list_session_machines",
   "get_issue_dispatch_status",
   "get_issue_report_card",
   "get_fleet_report",
   "get_deploy_posture",
   "get_kg_status",
+  "get_review_fix_attempt",
+  "get_review_fix_activity",
   "kg_hybrid_search",
   "kg_search",
   "kg_semantic_search",
@@ -98,10 +103,13 @@ const RESTATE_TOOL_NAMES = new Set([
   "kg_path",
   "trigger_kg_refresh",
   "set_runner_mode",
+  "set_fly_machine_profile",
   "pause_project",
   "add_project",
   "trigger_workflow_sync",
   "clear_dispatch_dedup",
+  "list_dispatch_reservations",
+  "release_dispatch_reservation",
 ]);
 
 // The subset of RESTATE_TOOL_NAMES that mutates state. Not a role declaration — that lives on
@@ -112,10 +120,12 @@ const RESTATE_TOOL_NAMES = new Set([
 export const RESTATE_WRITE_TOOL_NAMES = new Set([
   "trigger_kg_refresh",
   "set_runner_mode",
+  "set_fly_machine_profile",
   "pause_project",
   "add_project",
   "trigger_workflow_sync",
   "clear_dispatch_dedup",
+  "release_dispatch_reservation",
 ]);
 
 // admin is a strict superset of user (docs/access-model.md § Roles): an entry's role satisfies
@@ -306,6 +316,10 @@ export async function handleMcpRequest(
         }
       }
       const callResult = await callTool(toolName, toolArgs, caller, idempotencyKey ? { idempotencyKey } : undefined);
+      if (callResult.status === "deploy-held") {
+        json(res, 409, { error: "deploy-in-progress", deployStartedAt: getDeployStartedAt() });
+        return;
+      }
       if (callResult.status === "unavailable") {
         json(res, 503, { error: "restate-unavailable" });
         return;

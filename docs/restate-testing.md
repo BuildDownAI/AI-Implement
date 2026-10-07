@@ -236,7 +236,7 @@ which AII-800's suite already covers precisely against a faster-to-assert fake.
 | A restart (replaced SDK endpoint + restarted, disk-backed Restate container) resumes the same attempt from the same SQLite row and the same journal | Real engine + real SQLite, across a genuine container restart | the final "restart" scenario |
 | GitHub's actual dispatch/reconcile/check-run/review/merge-policy behavior, its actual rate limits, and its actual eventual consistency (e.g. `workflow_dispatch` run-listing lag) | **Not proven here** — simulated by hand-built fixtures | needs live evidence |
 | The literal two real minutes of `REVIEW_FIX_UNKNOWN_LAUNCH_ALERT_MINUTES` elapsing in production | **Not proven here** — `review-fix-attempt.ts`'s workflow now accepts an optional `unknownLaunchAlertMs` override (defaulting to the real two minutes; production composition leaves it unset), and this suite's shared `attemptWorkflow` supplies a one-second value so the uncertain-launch scenario asserts the `alert-unknown-launch` callback actually fires (reason including "launch identity still unresolved") without a 120s+ test. This proves the alert-firing code path — the same comparison and callback production uses — end to end against the real engine; it does not independently exercise the production constant's literal value, which is a one-line arithmetic input to that same path | a long-running live/soak test is the only way to observe the real two-minute constant elapse; not required for AII-813 |
-| Deployment drain (`register()`'s conflict/force-registration path) and the workflow/journal/idempotency retention configuration | Already proven elsewhere, not duplicated here | `endpoint.restate.test.ts` / `endpoint-registration.restate.test.ts` (drain); `REVIEW_FIX_RETENTION_MS` metadata assertion in `review-fix-attempt.restate.test.ts` (retention) |
+| Deployment drain (`register()`'s conflict/force-registration path) and the workflow/journal/idempotency retention configuration | Already proven elsewhere, not duplicated here | `endpoint.restate.test.ts` / `endpoint-registration.restate.test.ts` (drain); retention metadata assertion in `review-fix-attempt.restate.test.ts` (retention) |
 | Real Fly Machines/GitHub Actions runner container behavior under the pilot | **Not proven anywhere in this repo's test tree** | needs live evidence — this is the same class of gap the "real `restate-server` binary" row above already names for the engine itself |
 
 This file was authored in a session with no local Docker daemon (`docker info` failed), the same
@@ -246,6 +246,142 @@ against pinned server 1.7.10; this is container evidence, not a live pilot rollo
 its pass/fail there — not this document — is the authoritative evidence for AII-813's "both
 container variants and SDK boundary suite pass" acceptance criterion. `npx tsc --noEmit --project
 tsconfig.restate-tests.json` passes as of the commit that added this section.
+
+## `kg-refresh-pilot.restate.test.ts`: the switched kg-refresh path against production services (AII-896)
+
+`kg-refresh-workflow.restate.test.ts` (AII-894) runs `KgRefresh` and `KgRepo` against fakes for every
+dependency. This file composes them through `createProductionKgRefreshServices` and registers them with the
+real `orchestratorTools` service, so the gap between the two is covered before AII-685 deletes the legacy path.
+It adds no production file.
+
+**Always real:** the composer, `KgRepo`, `KgRefresh`, `trigger_kg_refresh` / `get_kg_status` called through
+`callToolAsSystem`, `appendLog` / `updateJobStatus` / the `settings` keys / `getInFlightWork` on an in-memory
+SQLite, `mintRunToken` and the `runner_tokens` table, `handleRunnerResult` with the production ingress client,
+`runKgRefreshPreflight` (with a credential check that passes), and the four rail gates against a temp-directory
+data root and a fixture tarball. **Always simulated:** GitHub (`postWorkflowDispatch`, run status, title search,
+cancel, tarball, PR merge, commit status), the runner (the test posts the report itself), and the sidecar.
+
+Two seams are mocked because the composer hard-codes them: `postWorkflowDispatch` (the simulated GitHub) and
+`createKgRefreshWorkflow`, wrapped only to point `deps.rail` at the temp tree, shorten the 10 min watch interval to
+300 ms, and pass the workflow's own `beforeGate` / `afterStageCommitted` test hooks. Restart scenarios (P3, P4)
+run on the retry-enabled disk environment (`startRetryEnabled`, then `replaceEndpoint` and a container restart),
+as the review-fix restart scenarios do, not on the two harness variants.
+On the container runtime a restart remaps the ingress port, so every client must be rebuilt (or resolve `env.baseUrl()` per call) after `restart()`.
+
+| # | Scenario | Real | Simulated | Asserts |
+|---|---|---|---|---|
+| P1 | Trigger as system caller, report through the callback, success | Everything listed above | GitHub, runner | One `dispatch_log` row `completed`; `kg_refresh_last_refresh` written once; `get_kg_status` reads `serving`; `KgRepo.status` is `null` |
+| P2 | Second trigger while in flight | Tool handler, `KgRepo`, `getInFlightWork` | GitHub, runner | `409 refresh-in-progress` from the handler; one `kg-refresh` in-flight entry; one dispatch |
+| P3 | Restart during dispatch | Engine across a container restart, workflow, SQLite | GitHub, runner | One dispatch in total; the run completes after the restart |
+| P4 | Restart during the rail (after `stage`) | Engine across a container restart, rail gates on a temp tree | GitHub, sidecar, runner | `fetch` and `stage` each ran once; merge and persist once; `get_kg_status` reads `serving` |
+| P5 | Duplicate report, same dispatch id, then a late retry | `handleRunnerResult`, ingress client, `runner_tokens`, workflow | GitHub, runner | Duplicate answers 200, no step twice, `consumed_at` stays null. Late retry after `KgRepo.release`: `409 no-refresh-in-flight` |
+| P6 | Operator cancel, then a late report | `makeKgRefreshAdminDeps(...).cancel`, workflow, `updateJobStatus` | GitHub run status and cancel | `cancelWorkflowRun` once; marker held while the run reads `in_progress`; row `failed` / `operator_cancelled`; late report `409` |
+| P7 | Dispatch outcome `unknown`, found by title on the second reconcile | Composer, workflow reconcile loop | GitHub dispatch, title search, run status | One dispatch; the watch reads only the found run id |
+| P8 | Ingress unreachable at trigger time | `makeKgRefreshAdminDeps(...).trigger`, `callToolAsSystem`, SQLite | Nothing listens on `UNROUTABLE_INGRESS` | `{ status: 503, body: { error: "restate-unavailable" } }`; no row |
+| P9 | Boot sweep of a legacy row | `sweepLegacyKgRefreshRows`, SQLite | Seeded legacy row and stage key | Returns 1; row `timed_out`; `kg_refresh_stage` gone. Involves no Restate call, so it runs once, not per variant |
+
+## `planning-run-pilot.restate.test.ts`: the PlanningRun workflow against its production composer (AII-1020)
+
+`planning-run-workflow.restate.test.ts` (AII-1019) runs `PlanningRun` against fakes for every dependency. This file
+composes it through `createProductionPlanningRunServices` (`src/restate/planning-run-production.ts`) and registers it
+on real Restate. Nothing submits the workflow in production yet; the test submits it through
+`createPlanningRunIngressClient`, after it acquires the reservation with owner `{ kind: "restate", attemptId: dispatchId }`.
+
+**Always real:** the composer and its deps, the workflow, the ingress client and termination hook, SQLite
+(`dispatch_admissions`, `dispatch_log`, the mappings table), the admission functions, and `remediateFailedJob` (wrapped
+only to count calls). **Always simulated:** GitHub (the run list, run status, cancel, the installation token), the
+launch functions `preparePlanningLaunch` and `launchPlanningRun` (the fake writes the `dispatch_log` row as the real one
+does), and the runner callback (the test closes the row and calls the termination hook).
+
+One seam is mocked because the composer hard-codes it: `createPlanningRunWorkflow`, wrapped only to shorten the tick,
+confirm and deadline intervals. The test replaces `fetch` for `api.github.com` only and passes every other URL to the
+real `fetch`. Each scenario holds the first run-status read with `gate` and reads the step with `waitForStep`; none uses a sleep.
+
+| # | Scenario | Real | Simulated | Asserts |
+|---|---|---|---|---|
+| 1 | Callback closes the row, then the run completes | Composer, workflow, hook, SQLite | GitHub, launch | Reservation released as `finalized`; the closed `dispatch_log` row is unchanged; no failure handling |
+| 2 | Run completes with no callback | Composer, workflow, `finishJob`, `remediateFailedJob` | GitHub, launch | Row closed `failed`; failure handling ran one time; reservation released |
+| 3 | Two dispatches seconds apart, acknowledgement lost | Composer, `findExistingRun`, workflow | GitHub run list, launch | Each workflow binds the run with its own title and ignores an older run with the same title; each releases its own reservation |
+| 4 | Sweep and reconcile | `sweepStaleAdmissions`, `reconcileTerminalCallbackAdmissions`, SQLite | Nothing | Both leave the Restate-owned planning row. Involves no Restate call, so it runs once, not per variant |
+| 5 | Review-fix readers | `listActiveRestateReviewFixPrs`, `queueReviewFixCancellationForClosedPr`, the admin facade, `mintPreparedReviewFixToken` | Nothing | No row for a planning dispatch id. Involves no Restate call |
+
+The switch scenarios (AII-1021, `the switched dispatchPlanning`) call the real `dispatchPlanning` for a project with `reviewFixLifecycle: "restate"`, with `getRestateStatus` set to ready and registered. Two issues dispatched seconds apart on one repo bind their own runs, each release frees only its own reservation, and an implementation `acquireDispatch` then admits each issue. A Fly Machines and a local Docker scenario read the `dispatch_admissions` row for owner `restate:<dispatchId>`. What they taught: `dispatchPlanning` passes no URL to `createPlanningRunIngressClient`, so the file wraps that factory to default to the harness variant's ingress; scenarios that take implementation reservations or leave a run in flight must release them, or the sweep scenario below sees the leaked rows; the unit-tier routing tests (`dispatch-routing.test.ts`) cover the not-ready, `unavailable`, `conflict`, and Legacy outcomes without Docker.
+
+The first run of this file found that `PlanningRunIngressClient.submit` sent an `idempotency-key` header, which Restate
+rejects on a workflow handler with HTTP 400; the key was removed because the workflow key is the idempotency.
+`src/__tests__/planning-run-production.test.ts` (default suite, no Docker) covers the deps one by one, including the
+check that `workflows/claude-plan.yml`'s `run-name` contains `PLANNING_RUN_TITLE_PREFIX`.
+
+## The owned-run contract suite (AII-1062)
+
+`src/__tests__/restate/owned-run-contract.ts` (not a `.test.ts` file, so vitest does not collect it) exports `registerOwnedRunContract(adapter, envFor)`. It registers five scenarios on both variants: a status read that fails on each attempt still reaches the deadline, stops the run, and releases; a crash after the launch adopts the run and launches once; a normal end runs `cleanup` with the run id, `outcome` once, then the release; a refused reservation launches nothing, cleans up nothing, and releases nothing; a failed `cleanup` and `outcome` still release. Scenarios hold the workflow with `waitForStep` and never sleep. See [ADR 036](adr/036-an-owned-run-lifecycle-is-one-kit-and-one-contract-suite.md).
+
+**What an adapter supplies** (`OwnedRunAdapter`):
+
+* `name`, for the describe title.
+* `start(baseUrl, key, { faults, totalMs })`: starts the workflow under `key` and returns `{ runId, done, read, finish }`. `read` is the workflow's status read (`step` is `"waiting"` during the wait), `finish` ends the run normally, `runId` is the id the launch gives. `faults` (`failStatusRead`, `refuseReservation`, `crashAfterLaunch`, `failCleanup`, `failOutcome`) is the adapter's to inject, for example with `crashAfterFirstCall` for the launch.
+* `calls(key)`: the calls the effects made, in order, one string per attempt: `reserve`, `launch`, `status`, `stop`, `cleanup:<runId>`, `outcome`, `release`.
+
+**Adding the suite to a run kind's scenario file:** start the environments with `startVariants` in `beforeAll`, write the adapter over the run kind's workflow and its recording fakes, and call `registerOwnedRunContract(adapter, (label) => environments.get(label)!)` at the top level of the file. `owned-run-lifecycle.restate.test.ts` is the worked example, with a small fixture workflow. Each effect the adapter passes must be safe to run twice.
+
+## Timing rules
+
+Four flakes cost gap-fill rounds (a base URL captured before a restart, a scenario that outran a shortened
+wall-clock window, a `sys_invocation` read before a scheduled send was visible, a scenario that raced a deadline it
+did not test). Scenarios follow four rules, and
+`src/__tests__/restate-test-hygiene.test.ts` (default suite) fails on the patterns that break them in every
+`*.restate.test.ts` file.
+
+1. **State produced by a one-way send, a schedule, or a resolve is read with `eventually`.** The harness exports
+   `eventually(read, accept, { timeoutMs, intervalMs, label })`; on timeout it throws naming `label` and the last value
+   read. Admin reads go through `queryInvocations`, never a direct `fetch` of `/query`:
+
+   ```ts
+   const rows = await eventually(
+     () => queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'KgRepo' AND target_handler_name = 'expire'`),
+     (found) => found.length === 1,
+     { label: "one scheduled KgRepo.expire" },
+   );
+   ```
+
+2. **A scenario never depends on wall-clock speed.** A shortened window is passed through the deps and asserted on the
+   recorded delay, and a loop inside a window must be O(1) calls or concurrent (`Promise.all`), as Q5 in
+   `kg-repo.restate.test.ts` does for its enqueues.
+
+   ```ts
+   await Promise.all(Array.from({ length: MAX_TRACKED_PRS }, (_, i) => enqueue(env.baseUrl(), slug, i + 2, `br${i + 2}`)));
+   ```
+
+3. **`env.baseUrl()` and `env.adminAPIBaseUrl()` are read at the point of use**, never stored in a `const` that outlives
+   a `restart()` (a container restart remaps the port):
+
+   ```ts
+   await eventually(() => clientFor(env).repoStatus(slug), (marker) => marker.status === "accepted");
+   ```
+
+4. **A scenario that does not test a deadline runs with deadlines that are long against its own work; a scenario that
+   tests a deadline uses its own short-deadline environment.** `kg-refresh-workflow.restate.test.ts` serves both:
+   `envFor(label)` (30 s / 60 s) and `deadlineEnvFor(label)` (the short deadlines).
+
+`settle(ms)` is the only permitted wait, and only before a **negative** assertion ("nothing more happens"). A raw
+`setTimeout(` is allowed only inside a fake dependency that simulates a slow call, carrying a
+`// restate-test-allow: <reason>` marker on the same or the previous line.
+
+## Driving the race
+
+This is the gated race test pattern. A scenario of an owned-run wait sets the order of events itself. Restate has no controllable clock, so a scenario never lets the clock decide which arm wins.
+
+* **Gate a fake.** A fake dependency awaits a gate that the test holds (`gate` in `harness.ts`). The gate reports when the workflow reaches it. The test releases it at the exact point.
+* **Wait for a step, then act.** Before the test sends a signal, it waits for the named step with `waitForStep`.
+* **Order against a fake, not a test-body event.** In a scenario that asserts the order of a signal against a fake's answer, the fake changes its answer only on state the workflow controls (for example, the wait-call number the fixture passes in), or on a gate the test releases after the workflow has acted on the signal. It never changes on a test-body event alone: `send` returning means the signal was delivered, not consumed, and the owned-run wait reads status before it races the signals. Example: [AII-1049](https://linear.app/eudoxus/issue/AII-1049/owned-run-wait-scenario-a-second-call-after-report-returns-ended-can), the `owned-run-wait.restate.test.ts` scenario "a second call after report returns ended", where a flag set after `send` returned still raced.
+* **Deadline scenarios.** Hold the workflow at a gate until the deadline has passed, then release it. Prove the scenario fails when the deadline branch, or the `peek` at the deadline, is removed.
+* **Teardown.** Await the workflow's terminal output before a test ends.
+* **Tiers.** The deadline decision is tested in the unit tier with no timers. The Restate tier proves the journal, replay, and exclusivity.
+* **Signals from the test body are not the producer proof.** A scenario may resolve a promise from the test body. Each promise also has a `contract: <Workflow>.<promise>` test in the default suite, and `src/__tests__/restate-producer-guard.test.ts` fails when one is missing.
+
+## FlyMachineProfile kept-machine scenarios
+
+`fly-machine-profile.restate.test.ts` drives `claim` / `attach` / `release` / `expire` (ADR 037) through a forwarding service (the handlers are ingress-private) with a fake Fly. The scheduled `expire` is asserted with `queryInvocations` inside `eventually`; a stale-timer scenario calls `expire` with the earlier `releasedAt` itself rather than racing a clock, and one scenario uses `idleTimeoutMsOverride` to see the engine deliver the timer.
 
 ## `feedback-loop-workflow.restate.test.ts`: the implement/review loop replayed (AII-626, AII-629)
 

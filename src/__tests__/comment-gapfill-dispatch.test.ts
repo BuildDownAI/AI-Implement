@@ -659,6 +659,136 @@ describe("drainCommentGapfillQueue", () => {
     expect("run_publication_token" in inputs).toBe(false);
   });
 
+  describe("private transport capability (AII-983)", () => {
+    async function run(supportsPrivateRunConfig: boolean | undefined, commentId: number) {
+      const mapping = makeMapping({ owner: "acme", repo: "billing" });
+      queue.enqueueCommentGapfill({ owner: "acme", repo: "billing", prNumber: 42, commentId, commenter: "pat", instruction: "go" });
+      seedDispatchLog(`issue-p${commentId}`, `AII-p${commentId}`, "Private transport", "acme", "billing", 42);
+      const dispatchSpy = vi.fn<DrainInput["dispatch"]>(async () => ({ success: true, status: 204 }));
+      await drain.drainCommentGapfillQueue(makeBaseDrainOpts({
+        getMappings: () => ({ TEAM: mapping }),
+        runnerCallbackBaseUrl: "https://orch.example.com",
+        runnerTokenSecret: "runner-token-secret-with-enough-entropy",
+        dispatch: dispatchSpy,
+        checkContract: vi.fn<DrainInput["checkContract"]>(async () => ({
+          contract: "envelope",
+          supportsRunPublicationToken: true,
+          supportsAttemptCorrelation: false,
+          ...(supportsPrivateRunConfig !== undefined ? { supportsPrivateRunConfig } : {}),
+        })),
+      }));
+      return dispatchSpy.mock.calls[0]![2];
+    }
+
+    it("capable reader: bearers only in credentials with exact audiences, none top-level", async () => {
+      const { decodeTrustedRunConfig, decodeRunConfig } = await import("../run-config.js");
+      const inputs = await run(true, 9101);
+      const creds = decodeTrustedRunConfig(inputs.run_config!).credentials!;
+      expect(creds.resultToken).toBeTruthy();
+      expect(creds.progressToken).toBeTruthy();
+      expect(creds.publicationToken).toBeTruthy();
+      expect(new Set([creds.resultToken, creds.progressToken, creds.publicationToken]).size).toBe(3);
+      expect(creds.attemptToken).toBeUndefined();
+      expect(decodeRunConfig(inputs.run_config!).credentials).toBeUndefined();
+      expect(inputs.run_token).toBe("");
+      expect("run_progress_token" in inputs).toBe(false);
+      expect("run_publication_token" in inputs).toBe(false);
+    });
+
+    const priv = { version: 1 as const, attemptToken: "private-attempt-secret" };
+    const openCaps = (extra: Record<string, unknown>) => ({
+      contract: "envelope" as const, supportsRunPublicationToken: true, supportsAttemptCorrelation: false, ...extra,
+    });
+
+    async function runProtected(checkContract: DrainInput["checkContract"], commentId: number, withCreds = true) {
+      const fetchMock = vi.fn();
+      vi.stubGlobal("fetch", fetchMock);
+      const mapping = makeMapping({ owner: "acme", repo: "billing" });
+      queue.enqueueCommentGapfill({ owner: "acme", repo: "billing", prNumber: 42, commentId, commenter: "pat", instruction: "go" });
+      seedDispatchLog(`issue-q${commentId}`, `AII-q${commentId}`, "Protected", "acme", "billing", 42);
+      const dispatchSpy = vi.fn<DrainInput["dispatch"]>(async () => ({ success: true, status: 204 }));
+      await drain.drainCommentGapfillQueue(makeBaseDrainOpts({
+        getMappings: () => ({ TEAM: mapping }),
+        runnerCallbackBaseUrl: "https://orch.example.com",
+        runnerTokenSecret: "runner-token-secret-with-enough-entropy",
+        dispatch: dispatchSpy,
+        checkContract,
+        ...(withCreds ? { getTrustedCredentials: () => priv } : {}),
+      }));
+      return { dispatchSpy, fetchMock };
+    }
+
+    it.each([
+      ["unsupported reader (false)", async () => openCaps({ supportsPrivateRunConfig: false })],
+      ["envelope without the marker", async () => openCaps({})],
+      ["legacy-contract reader", async () => ({ contract: "legacy" as const, supportsRunPublicationToken: false, supportsAttemptCorrelation: false })],
+      ["failed probe", async () => { throw new Error("probe down"); }],
+    ])("supplied credentials on %s: no launch, no fetch, item failed, admission released", async (_n, impl, ) => {
+      const { dispatchSpy, fetchMock } = await runProtected(vi.fn(impl) as unknown as DrainInput["checkContract"], 9200);
+      expect(dispatchSpy).not.toHaveBeenCalled();
+      expect(fetchMock).not.toHaveBeenCalled();
+      const open = (await import("../dedup.js")).getDb()
+        .prepare("SELECT COUNT(*) AS n FROM dispatch_admissions WHERE released_at IS NULL").get() as { n: number };
+      expect(open.n).toBe(0);
+      const row = (await import("../dedup.js")).getDb()
+        .prepare("SELECT status FROM comment_gapfill_queue WHERE comment_id = ?").get(9200) as { status: string };
+      expect(row.status).toBe("failed");
+    });
+
+    it("capable reader carries supplied credentials alongside the bearers", async () => {
+      const { decodeTrustedRunConfig } = await import("../run-config.js");
+      const { dispatchSpy } = await runProtected(vi.fn(async () => openCaps({ supportsPrivateRunConfig: true })) as unknown as DrainInput["checkContract"], 9201);
+      const creds = decodeTrustedRunConfig(dispatchSpy.mock.calls[0]![2].run_config!).credentials!;
+      expect(creds.attemptToken).toBe("private-attempt-secret");
+      expect(creds.resultToken).toBeTruthy();
+      expect(dispatchSpy.mock.calls[0]![2].run_token).toBe("");
+    });
+
+    it("legacy-contract reader with no protected input still dispatches with legacy inputs", async () => {
+      const { dispatchSpy } = await runProtected(
+        vi.fn(async () => ({ contract: "legacy" as const, supportsRunPublicationToken: false, supportsAttemptCorrelation: false })) as unknown as DrainInput["checkContract"],
+        9202, false,
+      );
+      const inputs = dispatchSpy.mock.calls[0]![2];
+      expect(inputs.run_config).toBeUndefined();
+      expect(inputs.run_token).toBeTruthy();
+    });
+
+    it("a 422 retry through the real dispatcher resends the private run_config byte-identical", async () => {
+      const github = await vi.importActual<typeof import("../github.js")>("../github.js");
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce({ status: 422, text: async () => 'Unexpected inputs provided: ["issue_identifier"]' })
+        .mockResolvedValueOnce({ status: 204 });
+      vi.stubGlobal("fetch", fetchMock);
+      const mapping = makeMapping({ owner: "acme", repo: "billing" });
+      queue.enqueueCommentGapfill({ owner: "acme", repo: "billing", prNumber: 42, commentId: 9203, commenter: "pat", instruction: "go" });
+      seedDispatchLog("issue-q9203", "AII-q9203", "Retry", "acme", "billing", 42);
+      await drain.drainCommentGapfillQueue(makeBaseDrainOpts({
+        getMappings: () => ({ TEAM: mapping }),
+        runnerCallbackBaseUrl: "https://orch.example.com",
+        runnerTokenSecret: "runner-token-secret-with-enough-entropy",
+        checkContract: vi.fn(async () => openCaps({ supportsPrivateRunConfig: true })) as unknown as DrainInput["checkContract"],
+        dispatch: (token, m, inputs, o) => github.postWorkflowDispatch({
+          token, owner: m.owner, repo: m.repo, workflowFile: m.workflowFile, ref: m.defaultBranch, inputs, returnRunDetails: o?.returnRunDetails,
+        }),
+      }));
+      const bodies = fetchMock.mock.calls.map((c) => JSON.parse(c[1].body as string).inputs as Record<string, string>);
+      expect(bodies).toHaveLength(2);
+      expect(bodies[1]!.run_config).toBe(bodies[0]!.run_config);
+      expect("issue_identifier" in bodies[1]!).toBe(false);
+      expect(bodies[1]!.run_token).toBe("");
+    });
+
+    it.each([[false], [undefined]])("reader with supportsPrivateRunConfig=%s keeps masked top-level tokens", async (flag) => {
+      const { decodeTrustedRunConfig } = await import("../run-config.js");
+      const inputs = await run(flag, flag === false ? 9102 : 9103);
+      expect(decodeTrustedRunConfig(inputs.run_config!).credentials).toBeUndefined();
+      expect(inputs.run_token).toBeTruthy();
+      expect(inputs.run_progress_token).toBeTruthy();
+      expect(inputs.run_publication_token).toBeTruthy();
+    });
+  });
+
   it("mapping caps are forwarded inside run_config in envelope mode", async () => {
     const { decodeRunConfig } = await import("../run-config.js");
     const mapping = makeMapping({ owner: "acme", repo: "billing", maxTurns: 20, maxIterations: 2 });
