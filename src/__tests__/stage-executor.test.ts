@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import type { ChildProcessWithoutNullStreams, spawn } from "node:child_process";
-import { AgentStageError, createStageExecutor, safeLimitLabel, safeModelLabel } from "../pipeline/stage-executor.js";
+import { AgentRecoveryRequiredError, AgentStageError, createStageExecutor, safeLimitLabel, safeModelLabel } from "../pipeline/stage-executor.js";
 import { ClaudeCliExecutor } from "../pipeline/executor.js";
 import { CodexRecoveryRequiredError } from "../pipeline/codex-executor.js";
 import { normalizeInvocation } from "../agent-usage.js";
@@ -395,5 +395,80 @@ describe("static attribution validation", () => {
     const result = await ex.invoke({ ...base, agentStage: "implementation" });
     expect(result.attribution).toMatchObject({ agent: "claude", model: "claude-impl", profileId: "p-impl", limit: { kind: "max_turns", value: 7 } });
     expect(result.attribution?.usage).toBeNull();
+  });
+});
+
+describe("held profiles across stages", () => {
+  /** A Claude child that never exits and cannot be killed: death stays unproven. */
+  function liveChildSpawn() {
+    return vi.fn(() => {
+      const mk = () => Object.assign(new EventEmitter(), { destroy: () => {} });
+      const proc = Object.assign(new EventEmitter(), { stdout: mk(), stderr: mk(), stdin: Object.assign(new PassThrough(), { destroy: () => {} }), kill: () => true, unref: () => {} });
+      return proc as unknown as ChildProcessWithoutNullStreams;
+    });
+  }
+
+  /** Pending-callback auth: records whether the callback ever settled and when a checkpoint would run. */
+  function pendingAuth() {
+    const events: string[] = [];
+    const invoke = vi.fn(async <T>(profileId: string, run: (i: ModelInvocation) => Promise<T>): Promise<T> => {
+      events.push(`invoke:${profileId}`);
+      try {
+        return await run({ env: { PATH: "/bin", ANTHROPIC_API_KEY: "synthetic-selected-key-0000" }, strippedKeys: [] });
+      } finally {
+        events.push("checkpoint");
+      }
+    });
+    return { invoke, events } as unknown as Pick<ModelAuthClient, "invoke"> & { invoke: typeof invoke; events: string[] };
+  }
+
+  it("keeps the Claude auth callback pending for a possibly-live child and refuses every later Claude call", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const spawnMock = liveChildSpawn();
+    const claude = new ClaudeCliExecutor("/tmp", "summary", true, spawnMock as unknown as typeof spawn, undefined, undefined, undefined, { termWaitMs: 10, killWaitMs: 10 });
+    const auth = pendingAuth();
+    const ex = createStageExecutor({ workspaceDir: "/tmp", legacy: fakeExec(), snapshot, auth, createClaude: () => claude, createCodex: () => fakeExec() });
+    const err = await ex.invoke({ ...base, agentStage: "implementation", invocationTimeoutMs: 1 }).catch((e) => e);
+    expect(err).toBeInstanceOf(AgentRecoveryRequiredError);
+    expect(err.reason).toBe("child_possibly_live");
+    expect(err.attribution).toMatchObject({ outcome: "error", agent: "claude" });
+    // No checkpoint, release or reuse: the callback is still pending.
+    await new Promise((r) => setTimeout(r, 30));
+    expect(auth.events).toEqual(["invoke:p-impl"]);
+    // The profile and the workspace's Claude child are held for every stage.
+    const again = await ex.invoke({ ...base, agentStage: "implementation" }).catch((e) => e);
+    expect(again).toBeInstanceOf(AgentRecoveryRequiredError);
+    expect(auth.invoke).toHaveBeenCalledTimes(1);
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("holds a shared Codex profile for every stage that selects it", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const shared: ResolvedAgentSnapshotV1 = {
+      ...snapshot,
+      stages: { ...snapshot.stages, implementation: { ...snapshot.stages.review } },
+      profiles: { ...snapshot.profiles, implementation: { ...snapshot.profiles.review } },
+    };
+    const held = new CodexRecoveryRequiredError("child_not_terminated");
+    const review = fakeExec(held);
+    const auth = pendingAuth();
+    const ex = createStageExecutor({ workspaceDir: "/tmp", legacy: fakeExec(), snapshot: shared, auth, createClaude: () => ({ invoke: vi.fn() }), createCodex: () => review });
+    // Implementation shares review's profile, so the hold applies to it too.
+    const first = await ex.invoke({ ...base, agentStage: "review" }).catch((e) => e);
+    expect(first).toBe(held);
+    const second = await ex.invoke({ ...base, agentStage: "implementation" }).catch((e) => e);
+    expect(second).toBeInstanceOf(CodexRecoveryRequiredError);
+    expect(second.reason).toBe("held");
+    expect(review.invoke).toHaveBeenCalledTimes(1);
+  });
+
+  it("holds a Claude profile after an uncertain checkpoint", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const auth = { invoke: vi.fn(async () => { throw Object.assign(new Error("uncertain"), { category: "checkpoint_uncertain" }); }) } as unknown as Pick<ModelAuthClient, "invoke"> & { invoke: ReturnType<typeof vi.fn> };
+    const ex = createStageExecutor({ workspaceDir: "/tmp", legacy: fakeExec(), snapshot, auth, createClaude: () => ({ invoke: vi.fn() }), createCodex: () => fakeExec() });
+    await ex.invoke({ ...base, agentStage: "implementation" }).catch(() => {});
+    const again = await ex.invoke({ ...base, agentStage: "implementation" }).catch((e) => e);
+    expect(again).toBeInstanceOf(AgentRecoveryRequiredError);
+    expect(auth.invoke).toHaveBeenCalledTimes(1);
   });
 });

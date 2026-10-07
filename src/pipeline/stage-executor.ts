@@ -5,9 +5,10 @@ import type { ModelAuthClient } from "../model-auth-client.js";
 import {
   ClaudeCliExecutor,
   type ActivityReportingConfig,
+  isPossiblyLiveChild,
   type ClaudeInvokeOptions,
 } from "./executor.js";
-import { CodexExecutor, type CodexExecutorOptions } from "./codex-executor.js";
+import { CodexExecutor, CodexRecoveryRequiredError, type CodexExecutorOptions } from "./codex-executor.js";
 import { createCodexPlanningDriver } from "./codex-planning-adapter.js";
 import {
   sanitizeAttribution,
@@ -31,6 +32,22 @@ export class AgentStageError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "AgentStageError";
+  }
+}
+
+/**
+ * A shared profile or the workspace may still have a live child, or its credential checkpoint is uncertain.
+ * Until a human or the recovery path clears it, no stage may start another invocation on that profile.
+ */
+export class AgentRecoveryRequiredError extends Error {
+  readonly code = "AGENT_RECOVERY_REQUIRED";
+  readonly reason: "child_possibly_live" | "held";
+  readonly profileId: string;
+  constructor(reason: AgentRecoveryRequiredError["reason"], profileId: string) {
+    super(`Agent invocation requires recovery: ${reason}`);
+    this.name = "AgentRecoveryRequiredError";
+    this.reason = reason;
+    this.profileId = profileId;
   }
 }
 
@@ -68,6 +85,10 @@ export function createStageExecutor(options: StageExecutorOptions): LLMExecutor 
   const auth = options.auth;
 
   let claude: ClaudeLike | undefined;
+  // Profiles held for recovery, shared by every stage (and agent) that selects them. The Claude child runs in
+  // the one workspace, so a possibly-live Claude child also blocks every later Claude invocation.
+  const heldProfiles = new Map<string, Error>();
+  let claudeHeld: AgentRecoveryRequiredError | null = null;
   const codexByProfile = new Map<string, LLMExecutor>();
 
   const getClaude = (): ClaudeLike =>
@@ -122,12 +143,50 @@ export function createStageExecutor(options: StageExecutorOptions): LLMExecutor 
       if (selection.agent === "codex") delete call.maxTurns;
 
       try {
-        const result =
-          selection.agent === "claude"
-            ? await auth.invoke(selection.accountProfileId, (selected) => getClaude().invoke(call, { env: selected.env }))
-            : await getCodex(selection.accountProfileId, stage).invoke(call);
+        const profileId = selection.accountProfileId;
+        const heldBy = heldProfiles.get(profileId);
+        if (heldBy) {
+          throw selection.agent === "codex"
+            ? new CodexRecoveryRequiredError("held")
+            : new AgentRecoveryRequiredError("held", profileId);
+        }
+        if (selection.agent === "claude" && claudeHeld) throw claudeHeld;
+        let result: LLMResult;
+        if (selection.agent === "claude") {
+          // If the child cannot be proven dead the callback must never settle: the client checkpoints on both
+          // return and throw, which would persist stale session state, release the profile and let another
+          // child start beside a live one. The pending invoke keeps the profile "invoking"; the race below
+          // gives the caller a bounded recovery-required error instead of waiting on it.
+          let signalRecovery: (err: Error) => void = () => {};
+          const recovery = new Promise<never>((_, reject) => (signalRecovery = reject));
+          const invocation = auth.invoke(profileId, async (selected) => {
+            try {
+              return await getClaude().invoke(call, { env: selected.env });
+            } catch (err) {
+              if (isPossiblyLiveChild(err)) {
+                const held = new AgentRecoveryRequiredError("child_possibly_live", profileId);
+                heldProfiles.set(profileId, held);
+                claudeHeld = held;
+                signalRecovery(Object.assign(held, { cause: err }));
+                return new Promise<LLMResult>(() => {});
+              }
+              throw err;
+            }
+          });
+          invocation.catch(() => {});
+          result = await Promise.race([invocation, recovery]);
+        } else {
+          result = await getCodex(profileId, stage).invoke(call);
+        }
         return withAttribution(result, attribute(result.failure ? "error" : "success", result.telemetry));
       } catch (err) {
+        // A Codex executor that holds (child not terminated, auth sync or checkpoint uncertain) holds the
+        // profile for every stage; the error itself propagates unchanged.
+        if (err instanceof CodexRecoveryRequiredError) heldProfiles.set(selection.accountProfileId, err);
+        const category = (err as { category?: unknown } | null)?.category;
+        if (category === "checkpoint_uncertain" || category === "checkpoint_rejected") {
+          heldProfiles.set(selection.accountProfileId, err as Error);
+        }
         if (err instanceof Error || (typeof err === "object" && err !== null)) {
           const carried = (err as { telemetry?: RunTelemetry }).telemetry;
           const attribution = attribute("error", carried);
