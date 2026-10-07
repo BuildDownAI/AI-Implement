@@ -531,6 +531,18 @@ describe("buildSessionMachineConfig", () => {
     });
   });
 
+  it("stamps purpose, pipeline and dispatch_id for a durable runner", () => {
+    const result = buildSessionMachineConfig({ ...baseInput, purpose: "durable-runner", pipeline: "kg-refresh", dispatchId: "d1" });
+    expect(result.config.metadata).toMatchObject({ purpose: "durable-runner", pipeline: "kg-refresh", dispatch_id: "d1" });
+  });
+
+  it("leaves pipeline and dispatch_id out of a default session machine", () => {
+    const metadata = buildSessionMachineConfig(baseInput).config.metadata!;
+    expect(metadata.purpose).toBe("session");
+    expect(metadata).not.toHaveProperty("pipeline");
+    expect(metadata).not.toHaveProperty("dispatch_id");
+  });
+
   it("includes session_mode in metadata", () => {
     const result = buildSessionMachineConfig({ ...baseInput, sessionMode: "shadow" });
     expect(result.config.metadata!.session_mode).toBe("shadow");

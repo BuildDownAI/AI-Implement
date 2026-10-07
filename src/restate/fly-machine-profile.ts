@@ -48,10 +48,12 @@ const MACHINE_KEY = "machine";
 const ONE_DAY_MS = 24 * 60 * 60 * 1000;
 
 /** Machine metadata the dispatch step stamps and the reaper reads; one definition for both. */
-export const DURABLE_RUNNER_PURPOSE_KEY = "purpose";
-export const DURABLE_RUNNER_PURPOSE_VALUE = "durable-runner";
-export const DURABLE_RUNNER_PIPELINE_KEY = "pipeline";
-export const DURABLE_RUNNER_DISPATCH_ID_KEY = "dispatch_id";
+export {
+  DURABLE_RUNNER_PURPOSE_KEY,
+  DURABLE_RUNNER_PURPOSE_VALUE,
+  DURABLE_RUNNER_PIPELINE_KEY,
+  DURABLE_RUNNER_DISPATCH_ID_KEY,
+} from "../durable-runner.js";
 /** Stamped by `release` as epoch seconds; the reaper destroys a durable-runner machine past it. */
 export const DURABLE_UNTIL_KEY = "durable_until";
 

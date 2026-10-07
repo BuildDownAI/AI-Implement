@@ -31,7 +31,7 @@ import { getRunnerMode, getKgFlyMachineOverride, setKgFlyMachineOverride, type K
 import { mintRunToken } from "../runner-tokens.js";
 import type { JobStatus } from "../log.js";
 import { appendLogIfAbsent, findLogIdByDispatchId, updateJobMachineDetails, updateJobPrUrl, updateJobRunId } from "../log.js";
-import { clearMachineEnv, destroyMachine, getMachine, updateMachineMetadata } from "../fly-machines.js";
+import { clearMachineEnv, createMachine, destroyMachine, getMachine, startMachine, updateMachine, updateMachineMetadata, type CreateMachineOpts, type Machine, type MachineConfig } from "../fly-machines.js";
 import type { RestateService } from "./endpoint.js";
 import {
   createKgRefreshWorkflow,
@@ -41,7 +41,7 @@ import {
   type KgRefreshStatusResult,
   type KgRefreshWorkflowDependencies,
 } from "./kg-refresh-workflow.js";
-import { FLY_MACHINE_PROFILE_DEFAULTS, createFlyMachineProfile, type FlyMachineProfileConfig, type FlyMachineProfileDefinition, type FlyMachineProfileDeps } from "./fly-machine-profile.js";
+import { DURABLE_RUNNER_DISPATCH_ID_KEY, FLY_MACHINE_PROFILE_DEFAULTS, createFlyMachineProfile, type FlyMachineProfileConfig, type FlyMachineProfileDefinition, type FlyMachineProfileDeps } from "./fly-machine-profile.js";
 import { createKgRepo, type KgRepoEnqueueInput, type KgRepoEnqueueResult, type KgRepoPrInput, type KgRepoTriggerResult, type StoredDryRunOutcome } from "./kg-repo.js";
 import type { Step } from "../pipeline/types.js";
 import type { KgRefreshDefinition, KgRepoDefinition } from "./kg-refresh-types.js";
@@ -77,6 +77,67 @@ export function createKgFindRunByTitle(opts: {
 }
 const GHA_EXECUTION_MODE = "github-actions";
 
+/** The Fly calls the kept-machine launch makes; a fake in tests. */
+export interface KeptMachineFly {
+  getMachine(id: string): Promise<Machine>;
+  createMachine(config: CreateMachineOpts): Promise<Machine>;
+  updateMachine(id: string, config: MachineConfig): Promise<unknown>;
+  startMachine(id: string): Promise<void>;
+}
+
+export function bindKeptMachineFly(token: string, app: string): KeptMachineFly {
+  return {
+    getMachine: (id) => getMachine(token, app, id),
+    createMachine: (config) => createMachine(token, app, config),
+    updateMachine: (id, config) => updateMachine(token, app, id, config),
+    startMachine: (id) => startMachine(token, app, id),
+  };
+}
+
+const isFlyNotFound = (err: unknown): boolean => err instanceof Error && /\(404\)/.test(err.message);
+
+/**
+ * The dispatch step's Fly write for a kept machine (AII-1136). With no kept machine id it creates one.
+ * With one it reconciles first: `started` for this dispatch means an earlier try of the step already ran
+ * (return it, no second `update`, which would reboot it); `started` for another dispatch means the hold is
+ * wrong (throw); `destroyed` or 404 falls back to create; anything else is `update` then `start`. A lookup
+ * error throws so the step retries. `machineNonce` is the one the new config carries, or, for an
+ * already-dispatched machine, the one read back from its env.
+ */
+export async function launchKeptMachine(
+  fly: KeptMachineFly,
+  opts: { keptMachineId: string | null; dispatchId: string; machineConfig: CreateMachineOpts; machineNonce: string },
+): Promise<{ machineId: string; machineNonce: string; created: boolean; reused: boolean }> {
+  const { keptMachineId, dispatchId, machineConfig, machineNonce } = opts;
+  const create = async () => {
+    const machine = await fly.createMachine(machineConfig);
+    return { machineId: machine.id, machineNonce, created: true, reused: false };
+  };
+  if (keptMachineId === null) return create();
+
+  let existing: Machine;
+  try {
+    existing = await fly.getMachine(keptMachineId);
+  } catch (err) {
+    if (!isFlyNotFound(err)) throw err;
+    console.log(`[kg-refresh] kept machine ${keptMachineId} is gone (404); creating a new one`);
+    return create();
+  }
+  if (existing.state === "destroyed") {
+    console.log(`[kg-refresh] kept machine ${keptMachineId} is destroyed; creating a new one`);
+    return create();
+  }
+  if (existing.state === "started") {
+    if (existing.config?.metadata?.[DURABLE_RUNNER_DISPATCH_ID_KEY] === dispatchId) {
+      return { machineId: keptMachineId, machineNonce: existing.config.env?.MACHINE_NONCE ?? machineNonce, created: false, reused: true };
+    }
+    throw new Error(`kept machine ${keptMachineId} is started for another dispatch; the hold is wrong`);
+  }
+  await fly.updateMachine(keptMachineId, machineConfig.config);
+  await fly.startMachine(keptMachineId);
+  return { machineId: keptMachineId, machineNonce, created: false, reused: true };
+}
+
 type LegacyDispatch = (opts: {
   runToken: string;
   runProgressToken: string;
@@ -84,7 +145,9 @@ type LegacyDispatch = (opts: {
   runConfig: string;
   executionPath?: string;
   machine: FlyMachineProfileConfig;
-}) => Promise<{ machineId?: string; machineNonce?: string; logsUrl?: string; workflowRunId?: number }>;
+  /** The machine the pipeline keeps (from `FlyMachineProfile.claim`); null when none is kept. */
+  machineId: string | null;
+}) => Promise<{ machineId?: string; machineNonce?: string; logsUrl?: string; workflowRunId?: number; created?: boolean }>;
 
 export interface KgDispatchDetails {
   machineId?: string;
@@ -187,7 +250,7 @@ export function resolveKgExecutionMode(): string {
 export function createKgRefreshDispatch(input: KgRefreshProductionInput): (dispatch: KgDispatchInput) => Promise<KgDispatchResult> {
   const { config } = input;
   const repo = parseKgSourceRepo(input.kgSourceRepo);
-  return async ({ runConfig, tokens, issueIdentifier, dispatchId, machine }) => {
+  return async ({ runConfig, tokens, issueIdentifier, dispatchId, machine, machineId }) => {
     const executionMode = (input.resolveExecutionMode ?? resolveKgExecutionMode)();
     const mapping = findKgMapping(input.kgSourceRepo)?.[1];
     const envelope: RunConfigV1 = {
@@ -212,15 +275,18 @@ export function createKgRefreshDispatch(input: KgRefreshProductionInput): (dispa
       }
       const legacy = await input.dispatchKgRefreshRun({
         runToken: tokens.runToken, runProgressToken: tokens.progressToken,
-        dispatchId, runConfig: encoded, executionPath: executionMode, machine,
+        dispatchId, runConfig: encoded, executionPath: executionMode, machine, machineId,
       });
       input.recordDispatch(dispatchId, {
         machineId: legacy.machineId, machineNonce: legacy.machineNonce,
         logsUrl: legacy.logsUrl, workflowRunId: legacy.workflowRunId,
       });
       // The nonce authenticates the machine to /api/token: it goes to the row above, never into the journaled result.
+      // Only a Fly machine is kept; a local container is always one-shot.
+      const kept = executionMode === "fly-machines" && legacy.machineId !== undefined;
       return { outcome: "accepted", runId: legacy.workflowRunId, runUrl: legacy.logsUrl,
-        jobId: legacy.machineId ?? null, executionMode };
+        jobId: legacy.machineId ?? null, executionMode,
+        machineId: kept ? legacy.machineId! : null, created: kept && legacy.created === true };
     }
 
     const { token } = await input.mintToken(config.githubAppId, config.githubAppPrivateKey, repo.owner);
@@ -326,7 +392,7 @@ export function createProductionKgRefreshServices(
     findRunByTitle: input.findRunByTitle,
     cancelWorkflowRun: input.cancelWorkflowRun,
     readMachineRun: (executionMode, jobId) => readBackendRun(config, executionMode, jobId),
-    stopMachineRun: (executionMode, jobId) => stopBackendRun(config, executionMode, jobId),
+    stopMachineRun: (executionMode, jobId, keep) => stopBackendRun(config, executionMode, jobId, { keep }),
     persistLastRefresh: input.persistLastRefresh,
     onOutcome: (kind, outcome, meta) => {
       // Returned so the workflow's `outcome` step awaits (and retries) the notification.

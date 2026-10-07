@@ -141,7 +141,7 @@ import {
 } from "./restate/retention.js";
 import { applyVolumeSnapshotRetention, applyVolumeSnapshotRetentionAtBoot } from "./fly-volumes.js";
 import { createProductionReviewFixServices } from "./restate/review-fix-production.js";
-import { createKgFindRunByTitle, seedFlyMachineProfileFromOverride, createProductionKgRefreshServices, recordKgDispatchDetails } from "./restate/kg-refresh-production.js";
+import { createKgFindRunByTitle, seedFlyMachineProfileFromOverride, createProductionKgRefreshServices, recordKgDispatchDetails, launchKeptMachine, bindKeptMachineFly } from "./restate/kg-refresh-production.js";
 import { createProductionPlanningRunServices, PLANNING_CONTEXT_BRANCH_KEY, PLANNING_CONTEXT_FIELD_VALUE_KEY } from "./restate/planning-run-production.js";
 import { createPlanningAdmissionTerminationHook, createPlanningRunIngressClient } from "./restate/planning-run-client.js";
 import { setKgRefreshToolDeps } from "./restate/tools.js";
@@ -4017,8 +4017,8 @@ async function handleKgRefreshOutcome(
 
 async function dispatchKgRefreshRun(
   config: AppConfig,
-  opts: { runToken: string; runProgressToken: string; dispatchId: string; runConfig: string; executionPath?: string; machine: FlyMachineProfileConfig },
-): Promise<{ machineId?: string; machineNonce?: string; logsUrl?: string }> {
+  opts: { runToken: string; runProgressToken: string; dispatchId: string; runConfig: string; executionPath?: string; machine: FlyMachineProfileConfig; machineId: string | null },
+): Promise<{ machineId?: string; machineNonce?: string; logsUrl?: string; created?: boolean }> {
   if (!config.kgSourceRepo) throw new Error("KG_SOURCE_REPO not configured");
   const repo = parseKgSourceRepo(config.kgSourceRepo);
   const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, repo.owner);
@@ -4068,10 +4068,18 @@ async function dispatchKgRefreshRun(
       cpus: opts.machine.cpus,
       memoryMb: opts.machine.memoryMb,
       region: config.flySessionsRegion ?? undefined,
+      purpose: "durable-runner",
+      pipeline: "kg-refresh",
+      dispatchId: opts.dispatchId,
     });
-    const machine = await createMachine(config.flySessionsToken, config.flySessionsApp, machineConfig);
-    console.log(`[kg-refresh] dispatched via Fly (dispatchId=${opts.dispatchId})`);
-    return { machineId: machine.id, machineNonce, logsUrl: `https://fly.io/apps/${config.flySessionsApp}/machines/${machine.id}` };
+    const launched = await launchKeptMachine(bindKeptMachineFly(config.flySessionsToken, config.flySessionsApp), {
+      keptMachineId: opts.machineId, dispatchId: opts.dispatchId, machineConfig, machineNonce,
+    });
+    console.log(`[kg-refresh] dispatched via Fly (${launched.reused ? "reused" : "created"} machine ${launched.machineId}) (dispatchId=${opts.dispatchId})`);
+    return {
+      machineId: launched.machineId, machineNonce: launched.machineNonce, created: launched.created,
+      logsUrl: `https://fly.io/apps/${config.flySessionsApp}/machines/${launched.machineId}`,
+    };
 
   } else if (executionPath === "local-docker") {
     if (!config.localRunnerImage) {

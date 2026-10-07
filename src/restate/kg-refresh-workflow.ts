@@ -100,6 +100,8 @@ export interface KgDispatchInput {
   dispatchId: string;
   /** The Fly machine size for this run, read once from `FlyMachineProfile/kg-refresh` before the dispatch step. */
   machine: FlyMachineProfileConfig;
+  /** The pipeline's kept Fly machine from `FlyMachineProfile.claim`; null when none is kept. */
+  machineId: string | null;
 }
 
 export interface KgRefreshStatusResult {
@@ -119,6 +121,10 @@ export interface KgDispatchResult {
   /** The backend's job id when it reported one; `null` means unknown (the workflow keys its own row by dispatch id). */
   jobId: string | null;
   executionMode: string;
+  /** The kept Fly machine the run executes on; null or absent for GHA and local Docker. */
+  machineId?: string | null;
+  /** True when the dispatch created the machine, so the workflow must `attach` it. */
+  created?: boolean;
 }
 
 /** What a status read that failed every attempt reports: not completed, not started — no new evidence. */
@@ -160,8 +166,8 @@ export interface KgRefreshWorkflowDependencies {
   cancelWorkflowRun(runId: number): Promise<boolean>;
   /** One status read of a non-GitHub-Actions run by its backend id: its state, plus the machine's exit. */
   readMachineRun(executionMode: string, jobId: string): Promise<BackendRunRead>;
-  /** Stops a non-GitHub-Actions run (a Fly machine or a local container) by its backend id. */
-  stopMachineRun(executionMode: string, jobId: string): Promise<boolean>;
+  /** Stops a non-GitHub-Actions run (a Fly machine or a local container) by its backend id. `keep` stops a kept Fly machine instead of destroying it. */
+  stopMachineRun(executionMode: string, jobId: string, keep?: boolean): Promise<boolean>;
   persistLastRefresh(outcome: RefreshOutcome): void;
   /** The kind is decided by the workflow, never inferred from `outcome.detail`. `meta.dispatchId` is the workflow key. */
   onOutcome(kind: KgOutcomeKind, outcome: RefreshOutcome, meta: KgOutcomeMeta): void | Promise<void>;
@@ -262,6 +268,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
     async function finish(outcome: RefreshOutcome): Promise<RefreshOutcome> {
       ctx.set("completed", true);
       ctx.objectSendClient<KgRepoDefinition>({ name: "KgRepo" }, deps.kgSourceRepo).release({ triggerId });
+      ctx.objectSendClient(FlyMachineProfile, "kg-refresh").release({ dispatchId });
       return outcome;
     }
 
@@ -324,8 +331,12 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       const profile = await ctx.objectClient(FlyMachineProfile, "kg-refresh").get();
       if (!profile) throw new restate.TerminalError("no FlyMachineProfile default exists for kg-refresh", { errorCode: 500 });
       const machine = profile.config;
+      // The resume path that raises this is AII-1032's; the claim, the step names and `attach` carry it.
+      const attempt = 1;
+      // A journaled call: a replay reuses the claim. The Fly write stays in the dispatch step, which holds the run's tokens.
+      const claim = await ctx.objectClient(FlyMachineProfile, "kg-refresh").claim({ dispatchId, attempt });
       const dispatchResult = await ctx.run(
-        "dispatch",
+        `dispatch-${attempt}`,
         async (): Promise<KgDispatchResult> => {
           // A lookup error throws and retries the step; only a definitive "no run" may reach the dispatch.
           // Reconcile first: a retry after a committed-but-unacknowledged dispatch must adopt that run.
@@ -334,14 +345,20 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
             return { outcome: "accepted", runId: existing.runId, jobId: String(existing.runId), executionMode: GHA_EXECUTION_MODE };
           }
           minted ??= deps.mintRunTokens({ dispatchId, ttlSeconds });
-          const result = await deps.dispatch({ runConfig: input, tokens: minted, issueIdentifier, dispatchId, machine });
+          const result = await deps.dispatch({ runConfig: input, tokens: minted, issueIdentifier, dispatchId, machine, machineId: claim.machineId });
           return {
             outcome: result.outcome, runId: result.runId, runUrl: result.runUrl,
             jobId: result.jobId, executionMode: result.executionMode,
+            machineId: result.machineId ?? null, created: result.created === true,
           };
         },
         { maxRetryAttempts: 3 },
       );
+
+      // One-way and idempotent in the object; a replay after a crash here sends it again.
+      if (dispatchResult.created && dispatchResult.machineId) {
+        ctx.objectSendClient(FlyMachineProfile, "kg-refresh").attach({ dispatchId, machineId: dispatchResult.machineId, attempt });
+      }
 
       if (dispatchResult.runId !== undefined) ctx.set("runId", dispatchResult.runId);
 
@@ -370,8 +387,10 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           ctx.console.warn(`[KgRefresh] no machine id to stop after ${reason} for dispatch ${dispatchId}`);
           return;
         }
+        // A kept Fly machine is stopped, not destroyed: the next refresh reuses it.
+        const keep = !isGha && (dispatchResult.machineId ?? null) !== null;
         try {
-          const stopped = await ctx.run("stop-machine-run", () => deps.stopMachineRun(dispatchResult.executionMode, machineJobId), { maxRetryAttempts: 3 });
+          const stopped = await ctx.run("stop-machine-run", () => deps.stopMachineRun(dispatchResult.executionMode, machineJobId, keep), { maxRetryAttempts: 3 });
           ctx.console.log(`[KgRefresh] stop after ${reason}: dispatch ${dispatchId} backend ${dispatchResult.executionMode} stopped=${stopped}`);
         } catch (err) {
           if (restate.internal.isSuspendedError(err)) throw err;
@@ -716,6 +735,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         return await finish(outcome);
       } finally {
         ctx.objectSendClient<KgRepoDefinition>({ name: "KgRepo" }, deps.kgSourceRepo).release({ triggerId });
+        ctx.objectSendClient(FlyMachineProfile, "kg-refresh").release({ dispatchId });
       }
     }
   }

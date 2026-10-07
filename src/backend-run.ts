@@ -1,7 +1,7 @@
 /** Backend-run rules shared by `confirmAdmissionTerminated` (src/index.ts) and the Restate composers
  * (`planning-run-production.ts`, `kg-refresh-production.ts`), so each rule exists once. */
 import type { AppConfig } from "./index.js";
-import { destroyMachine, getMachine, readMachineExit, type Machine, type MachineExit } from "./fly-machines.js";
+import { destroyMachine, getMachine, readMachineExit, stopMachine, type Machine, type MachineExit } from "./fly-machines.js";
 import { inspectLocalContainer, stopLocalContainer } from "./local-docker.js";
 
 export type BackendRunState = "ended" | "started" | "unknown";
@@ -45,13 +45,15 @@ export async function classifyLocalContainer(containerId: string): Promise<Backe
   }
 }
 
-/** Stops the exact machine or container. `false` for a backend with no machine to stop. */
-export async function stopBackendRun(config: FlyConfig, mode: string, id: string): Promise<boolean> {
+/** Stops the exact machine or container. `false` for a backend with no machine to stop. A Fly machine is
+ *  destroyed, unless `keep` is set: a machine a pipeline keeps between runs is only stopped (AII-1136). */
+export async function stopBackendRun(config: FlyConfig, mode: string, id: string, opts: { keep?: boolean } = {}): Promise<boolean> {
   if (mode === "fly-machines") {
     if (!config.flySessionsToken || !config.flySessionsApp) {
       throw new Error("FLY_SESSIONS_TOKEN + FLY_SESSIONS_APP are not configured; cannot stop the machine");
     }
-    await destroyMachine(config.flySessionsToken, config.flySessionsApp, id);
+    if (opts.keep) await stopMachine(config.flySessionsToken, config.flySessionsApp, id);
+    else await destroyMachine(config.flySessionsToken, config.flySessionsApp, id);
     return true;
   }
   if (mode === "local-docker") {
