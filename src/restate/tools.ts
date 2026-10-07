@@ -694,6 +694,7 @@ export const getKgStatusTool = tool(
         stage = "ingest-running";
       }
     }
+    const restateKey = inFlight?.triggerId ?? lastRefresh?.dispatchId;
     const result: KgRefreshStatus = {
       running: inFlight !== null && inFlight !== undefined,
       deployHeld: toolDeps.isDeployHeld(),
@@ -705,6 +706,7 @@ export const getKgStatusTool = tool(
       stage,
       materialize: getKgMaterializeDirect() ? "direct" : "rdflib",
       flyMachine: resolveKgFlyMachineSize(toolDeps.kgSourceRepo, false),
+      restate: restateKey ? { service: "KgRefresh", key: restateKey } : null,
     };
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   },
