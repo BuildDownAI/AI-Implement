@@ -68,7 +68,7 @@ What one stray use of each credential destroys, and where the symptom appears.
 
 ## kg-refresh report retried after the run finished (AII-896)
 
-The workflow key is the dispatch id: the kg-refresh callback addresses `KgRefresh/{dispatchId}` directly, with the dispatch id taken from the verified run-token claims, and never consults the `KgRepo` marker. A key no `run` has started under answers `404` from `report`/`progress`, which the callback maps to **`409 no-refresh-in-flight`**. A report retried after the run finished reaches the completed workflow: an identical body is a duplicate and answers 200, a different body is refused. A late report from an older run can therefore only address its own workflow, never the run that is current. The kg-refresh runner reports each pipeline step with `TokenStepReporter` (see [The run-signal sender](#the-run-signal-sender)), and the first accepted post is one of the two sources of started evidence (ADR 034).
+The workflow key is the dispatch id: the kg-refresh callback addresses `KgRefresh/{dispatchId}` directly, with the dispatch id taken from the verified run-token claims, and never consults the `KgRepo` marker. A key no `run` has started under answers `404` from `report`/`progress`, which the callback maps to **`409 no-refresh-in-flight`**. A report retried after the run finished reaches the completed workflow: an identical body is a duplicate and answers 200, a different body is refused. A late report from an older run can therefore only address its own workflow, never the run that is current. The kg-refresh runner reports each pipeline step with `TokenStepReporter` (see [The step reporter as the run signal](#the-step-reporter-as-the-run-signal)), and the first accepted post is one of the two sources of started evidence (ADR 034).
 
 **Acceptable for a runner retry after a lost 200.** A kg-refresh runner posts `/runner/result` once (`postRunnerResult` retries only pilot review-fix results), and the workflow has already consumed the first report and recorded the outcome by the time a retry could arrive.
 
@@ -92,7 +92,7 @@ The handler validates and stores a bounded activity batch under the token's
 attempt identity before ACK. A missing store, forged attempt, or storage failure
 cannot produce a success ACK. Legacy runs do not use this route.
 
-## The run-signal sender
+## The step reporter as the run signal
 
 A run kind that a Restate workflow owns sends its "I started" signal as a step report: the kg-refresh runner uses `TokenStepReporter` (`src/pipeline/reporter.ts`), which posts `{ step }` to `/runner/progress` with the progress token, and the route forwards the validated, redacted step to the workflow's shared handler (`progress(dispatchId, step)`). A body with no `step` (an old runner image) is still a bare heartbeat. The result keeps `postRunnerResult` and `/runner/result` with the result token. The runner never calls the Restate ingress, which binds to loopback (ADR 023). A failed post logs and does not change the outcome of the run. `TokenStepReporter` removes credential keys from `inputs` and `outputs` with `redactStepCredentials` before the body is serialized.
 
