@@ -330,7 +330,7 @@ Four flakes cost gap-fill rounds (a base URL captured before a restart, a scenar
 wall-clock window, a `sys_invocation` read before a scheduled send was visible, a scenario that raced a deadline it
 did not test). Scenarios follow four rules, and
 `src/__tests__/restate-test-hygiene.test.ts` (default suite) fails on the patterns that break them in every
-`*.restate.test.ts` file not named in its `ALLOWLISTED_FILES`.
+`*.restate.test.ts` file.
 
 1. **State produced by a one-way send, a schedule, or a resolve is read with `eventually`.** The harness exports
    `eventually(read, accept, { timeoutMs, intervalMs, label })`; on timeout it throws naming `label` and the last value

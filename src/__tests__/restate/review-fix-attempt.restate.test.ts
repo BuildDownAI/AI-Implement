@@ -6,7 +6,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { ReviewFixResultMetadataV1, WorkerTerminalOutcome } from "../../review-fix-contract.js";
 import type { PreparedReviewFixAttempt } from "../../review-fix-ports.js";
 import { createReviewFixAttempt, REVIEW_FIX_RETENTION_MS, type ReviewFixAttemptCompletion } from "../../restate/review-fix-attempt.js";
-import { VARIANTS, attachWorkflow, callWorkflow, replaceEndpoint, startRetryEnabled, startVariants, stopAll } from "./harness.js";
+import { VARIANTS, eventually, gate, type Gate, attachWorkflow, callWorkflow, replaceEndpoint, startRetryEnabled, startVariants, stopAll } from "./harness.js";
 
 const SHA = "a".repeat(40);
 const EXECUTION = { githubRunId: 782, githubRunAttempt: 1 };
@@ -26,7 +26,7 @@ interface FakeAttempt {
   approvalEffects: number;
   releaseEffects: number;
   cancelCalls: number;
-  holdBinding: boolean;
+  holdBinding: Gate | null;
   loadFailures: number;
   loadCalls: number;
 }
@@ -45,7 +45,7 @@ function newFake(mode: LaunchMode, deadlineMs = 4_000): FakeAttempt {
     mode, authority: true, occupied: true, intent: false, bound: false,
     launchEffects: 0, result: null, terminal: null, outcome: null,
     approvalEffects: 0, releaseEffects: 0, cancelCalls: 0,
-    holdBinding: false, loadFailures: 0, loadCalls: 0,
+    holdBinding: null, loadFailures: 0, loadCalls: 0,
   };
 }
 
@@ -55,14 +55,6 @@ function resultOf(fake: FakeAttempt, overrides: Partial<ReviewFixResultMetadataV
     ...fake.prepared.scope, deadlineAt: fake.prepared.deadlineAt,
     ...EXECUTION, outputCommit: SHA, ...overrides,
   };
-}
-
-async function until(predicate: () => boolean, timeoutMs = 8_000): Promise<void> {
-  const stop = Date.now() + timeoutMs;
-  while (!predicate()) {
-    if (Date.now() >= stop) throw new Error("timed out waiting for fake worker effect");
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  }
 }
 
 describe("ReviewFixAttempt durable workflow", () => {
@@ -90,7 +82,7 @@ describe("ReviewFixAttempt durable workflow", () => {
       },
       bindExecution: async (id, execution) => {
         const fake = get(id);
-        while (fake.holdBinding) await new Promise((resolve) => setTimeout(resolve, 20));
+        await fake.holdBinding?.wait();
         if (!fake.occupied) return { status: "not_owner" } as const;
         if (fake.bound) return { status: "already_bound", execution: EXECUTION } as const;
         expect(execution).toEqual(EXECUTION);
@@ -183,7 +175,7 @@ describe("ReviewFixAttempt durable workflow", () => {
     const env = envFor(label);
     const done = callWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", fake.prepared.attemptId,
       "run", { attemptId: fake.prepared.attemptId });
-    await until(() => fake.bound);
+    await eventually(() => fake.bound, Boolean, { label: "fake.bound" });
     fake.terminal = { status: "succeeded", outputCommit: SHA };
     expect(await callWorkflow(env.baseUrl(), "ReviewFixAttempt", fake.prepared.attemptId, "result", resultOf(fake)))
       .toEqual({ status: "stored", result: resultOf(fake) });
@@ -203,18 +195,18 @@ describe("ReviewFixAttempt durable workflow", () => {
 
   it.each(VARIANTS.map(([label]) => label))("an early result waits for exact execution binding before approval (%s)", async (label) => {
     const fake = newFake("accepted");
-    fake.holdBinding = true;
+    fake.holdBinding = gate("execution binding");
     attempts.set(fake.prepared.attemptId, fake);
     const env = envFor(label);
     const done = callWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", fake.prepared.attemptId,
       "run", { attemptId: fake.prepared.attemptId });
-    await until(() => fake.launchEffects === 1);
+    await eventually(() => fake.launchEffects === 1, Boolean, { label: "fake.launchEffects === 1" });
     expect(fake.bound).toBe(false);
     expect(await callWorkflow(env.baseUrl(), "ReviewFixAttempt", fake.prepared.attemptId, "result", resultOf(fake)))
       .toMatchObject({ status: "stored" });
     expect(fake.approvalEffects).toBe(0);
     fake.terminal = { status: "succeeded", outputCommit: SHA };
-    fake.holdBinding = false;
+    fake.holdBinding?.release();
     expect((await done).status).toBe("finalized");
     expect([fake.bound, fake.approvalEffects, fake.launchEffects]).toEqual([true, 1, 1]);
   }, 20_000);
@@ -225,7 +217,7 @@ describe("ReviewFixAttempt durable workflow", () => {
     const env = envFor(label);
     const done = callWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", fake.prepared.attemptId,
       "run", { attemptId: fake.prepared.attemptId });
-    await until(() => fake.bound);
+    await eventually(() => fake.bound, Boolean, { label: "fake.bound" });
     await callWorkflow(env.baseUrl(), "ReviewFixAttempt", fake.prepared.attemptId, "result", resultOf(fake));
     const duplicate = await callWorkflow(env.baseUrl(), "ReviewFixAttempt", fake.prepared.attemptId, "result", resultOf(fake));
     expect(duplicate).toMatchObject({ status: "duplicate" });
@@ -244,10 +236,10 @@ describe("ReviewFixAttempt durable workflow", () => {
     const env = envFor(label);
     const done = callWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", fake.prepared.attemptId,
       "run", { attemptId: fake.prepared.attemptId });
-    await until(() => fake.bound);
+    await eventually(() => fake.bound, Boolean, { label: "fake.bound" });
     await callWorkflow(env.baseUrl(), "ReviewFixAttempt", fake.prepared.attemptId, "cancel",
       { attemptId: fake.prepared.attemptId });
-    await until(() => fake.cancelCalls > 0);
+    await eventually(() => fake.cancelCalls > 0, Boolean, { label: "fake.cancelCalls > 0" });
     expect([fake.authority, fake.occupied, fake.releaseEffects]).toEqual([false, true, 0]);
     fake.terminal = { status: "cancelled" };
     expect((await done).status).toBe("finalized");
@@ -261,7 +253,7 @@ describe("ReviewFixAttempt durable workflow", () => {
     const run = callWorkflow(env.baseUrl(), "ReviewFixAttempt", fake.prepared.attemptId,
       "run", { attemptId: fake.prepared.attemptId });
     void run.catch(() => undefined);
-    await until(() => !fake.authority, 5_000);
+    await eventually(() => !fake.authority, Boolean, { timeoutMs: 5_000, label: "!fake.authority" });
     expect([fake.launchEffects, fake.occupied, fake.releaseEffects]).toEqual([1, true, 0]);
     // Keep the invocation suspended; this fixture has no exact execution to bind.
   }, 10_000);
@@ -277,13 +269,13 @@ describe("ReviewFixAttempt durable workflow", () => {
 
   it.each(VARIANTS.map(([label]) => label))("binding cannot displace a departed owner (%s)", async (label) => {
     const fake = newFake("accepted");
-    fake.holdBinding = true;
+    fake.holdBinding = gate("execution binding");
     attempts.set(fake.prepared.attemptId, fake);
     const done = callWorkflow<ReviewFixAttemptCompletion>(envFor(label).baseUrl(), "ReviewFixAttempt",
       fake.prepared.attemptId, "run", { attemptId: fake.prepared.attemptId });
-    await until(() => fake.launchEffects === 1);
+    await eventually(() => fake.launchEffects === 1, Boolean, { label: "fake.launchEffects === 1" });
     fake.occupied = false; // another owner won the guarded SQLite binding
-    fake.holdBinding = false;
+    fake.holdBinding?.release();
     expect(await done).toEqual({ status: "not_owner" });
     expect([fake.approvalEffects, fake.releaseEffects]).toEqual([0, 0]);
   }, 20_000);
@@ -316,7 +308,7 @@ describe("ReviewFixAttempt durable workflow", () => {
       attempts.set(retry.prepared.attemptId, retry);
       const retried = callWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt",
         retry.prepared.attemptId, "run", { attemptId: retry.prepared.attemptId });
-      await until(() => retry.bound, 20_000);
+      await eventually(() => retry.bound, Boolean, { timeoutMs: 20_000, label: "retry.bound" });
       retry.terminal = { status: "succeeded", outputCommit: SHA };
       await callWorkflow(env.baseUrl(), "ReviewFixAttempt", retry.prepared.attemptId, "result", resultOf(retry));
       expect((await retried).status).toBe("finalized");
@@ -327,7 +319,7 @@ describe("ReviewFixAttempt durable workflow", () => {
       const originalCall = callWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt",
         recovering.prepared.attemptId, "run", { attemptId: recovering.prepared.attemptId });
       void originalCall.catch(() => undefined); // ingress may disconnect during restart
-      await until(() => recovering.bound, 10_000);
+      await eventually(() => recovering.bound, Boolean, { timeoutMs: 10_000, label: "recovering.bound" });
       replacement = await replaceEndpoint(env, [workflow]);
       await env.startedRestateContainer.restart(); // same disk-backed container/journal
       recovering.terminal = { status: "succeeded", outputCommit: SHA };
