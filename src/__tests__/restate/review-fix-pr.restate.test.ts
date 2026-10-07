@@ -7,7 +7,7 @@ import type { ReviewFixResultMetadataV1, ScopedPrIdentity, WorkerTerminalOutcome
 import type { PreparedReviewFixAttempt, ReviewFixFindingVersion } from "../../review-fix-ports.js";
 import { createReviewFixAttempt } from "../../restate/review-fix-attempt.js";
 import { createReviewFixPR, reviewFixPRKey, REVIEW_FIX_COLLECTION_WINDOW_MS } from "../../restate/review-fix-pr.js";
-import { VARIANTS, attachWorkflow, callObject, callWorkflow, startVariants, stopAll } from "./harness.js";
+import { VARIANTS, eventually, settle, attachWorkflow, callObject, callWorkflow, startVariants, stopAll } from "./harness.js";
 
 const SHA = "a".repeat(40);
 interface PRState {
@@ -29,14 +29,6 @@ interface AttemptState {
   authority: boolean;
   released: boolean;
   result: ReviewFixResultMetadataV1 | null;
-}
-
-async function until(predicate: () => boolean, timeoutMs = 12_000): Promise<void> {
-  const stop = Date.now() + timeoutMs;
-  while (!predicate()) {
-    if (Date.now() > stop) throw new Error("timed out waiting for durable coordinator effect");
-    await new Promise((resolve) => setTimeout(resolve, 25));
-  }
 }
 
 describe("ReviewFixPR durable coordination", () => {
@@ -165,7 +157,7 @@ describe("ReviewFixPR durable coordination", () => {
   async function finish(env: RestateTestEnvironment, pr: PRState, index: number): Promise<void> {
     const prepared = pr.prepared[index];
     const state = attemptFor(prepared.attemptId);
-    await until(() => !!state.execution);
+    await eventually(() => !!state.execution, Boolean, { label: "!!state.execution" });
     state.terminal = { status: "succeeded", outputCommit: SHA };
     const result: ReviewFixResultMetadataV1 = { version: 1, attemptId: prepared.attemptId,
       ...prepared.scope, ...state.execution!, deadlineAt: prepared.deadlineAt, outputCommit: SHA };
@@ -183,19 +175,19 @@ describe("ReviewFixPR durable coordination", () => {
     pr.windowMs = 2_000;
     const started = Date.now();
     await feedback(env, pr, 1);
-    await new Promise((resolve) => setTimeout(resolve, 400));
+    await settle(400);
     pr.windowMs = 4_000; // a changed setting cannot extend the scheduled window
     await feedback(env, pr, 2);
-    await new Promise((resolve) => setTimeout(resolve, 700));
+    await settle(700);
     expect(pr.launches).toBe(0);
-    await until(() => pr.launches === 1, 5_000);
+    await eventually(() => pr.launches === 1, Boolean, { timeoutMs: 5_000, label: "pr.launches === 1" });
     expect(Date.now() - started).toBeLessThan(3_500);
     expect(pr.prepared[0].findings).toHaveLength(3);
     expect(pr.admissionCalls).toBe(1);
     await finish(env, pr, 0);
     pr.windowMs = 250;
     await feedback(env, pr);
-    await until(() => pr.launches === 2, 3_000);
+    await eventually(() => pr.launches === 2, Boolean, { timeoutMs: 3_000, label: "pr.launches === 2" });
     await finish(env, pr, 1);
   }, 20_000);
 
@@ -206,13 +198,13 @@ describe("ReviewFixPR durable coordination", () => {
     first.pending.push(...Array.from({ length: 35 }, (_, i) => ({ findingKey: `bulk-${i}`, version: 1 })));
     await callObject(env.baseUrl(), "ReviewFixPR", reviewFixPRKey(first.scope), "feedback", {});
     await feedback(env, second);
-    await until(() => first.launches === 1 && second.launches === 1, 9_000);
+    await eventually(() => first.launches === 1 && second.launches === 1, Boolean, { timeoutMs: 9_000, label: "first.launches === 1 && second.launches === 1" });
     expect(first.prepared[0].findings).toHaveLength(30);
     expect(first.pending).toHaveLength(5);
     await feedback(env, first);
     await finish(env, second, 0);
     await finish(env, first, 0);
-    await until(() => first.launches === 2, 6_000);
+    await eventually(() => first.launches === 2, Boolean, { timeoutMs: 6_000, label: "first.launches === 2" });
     expect(first.prepared[1].findings).toHaveLength(6);
     expect(await callObject(env.baseUrl(), "ReviewFixPR", reviewFixPRKey(first.scope), "completed",
       { attemptId: first.prepared[0].attemptId })).toBe(false);
@@ -227,20 +219,20 @@ describe("ReviewFixPR durable coordination", () => {
       const first = makePR();
       const second = makePR();
       await feedback(env, first);
-      await until(() => first.launches === 1, 8_000);
+      await eventually(() => first.launches === 1, Boolean, { timeoutMs: 8_000, label: "first.launches === 1" });
       await feedback(env, second);
-      await until(() => second.admissionCalls > 0, 8_000);
+      await eventually(() => second.admissionCalls > 0, Boolean, { timeoutMs: 8_000, label: "second.admissionCalls > 0" });
       expect([second.launches, second.pending.length]).toEqual([0, 1]);
       await finish(env, first, 0);
       await callObject(env.baseUrl(), "ReviewFixPR", reviewFixPRKey(second.scope), "capacityAvailable", {});
-      await until(() => second.launches === 1, 5_000);
+      await eventually(() => second.launches === 1, Boolean, { timeoutMs: 5_000, label: "second.launches === 1" });
       await finish(env, second, 0);
 
       const closed = makePR();
       closed.closed = true;
       closed.windowMs = 250;
       await feedback(env, closed);
-      await new Promise((resolve) => setTimeout(resolve, closed.windowMs + 300));
+      await settle(closed.windowMs + 300);
       expect([closed.launches, closed.admissionCalls]).toEqual([0, 0]);
     } finally { capacity = 10; }
   }, 40_000);

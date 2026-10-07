@@ -13,7 +13,7 @@ import { RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { operatorObject, RestateRefreshAuthority } from "../../restate/operator-object.js";
 import { getEffectiveAllowlist, matchAccessEntry } from "../../access-entries.js";
-import { VARIANTS, callObject, startVariants, stopAll } from "./harness.js";
+import { VARIANTS, callObject, eventually, queryInvocations, startVariants, stopAll } from "./harness.js";
 
 // Mocked so RestateRefreshAuthority.rotate's allowlist re-check and auth-event emission
 // don't need the access_entries/mcp_auth_events tables in this container-only suite, which
@@ -296,7 +296,11 @@ describe("Operator object", () => {
       // Give the exclusive invocation a moment to be admitted and start sleeping before
       // racing describe against it — otherwise describe could simply win an admission race
       // that says nothing about concurrency with an in-flight exclusive call.
-      await new Promise((resolve) => setTimeout(resolve, 1_000));
+      await eventually(
+        () => queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'Operator' AND target_service_key = '${key}' AND target_handler_name = 'refresh'`),
+        (rows) => rows.some((row) => row.status === "running" || row.status === "suspended"),
+        { label: "the exclusive refresh to be admitted" },
+      );
 
       const start = Date.now();
       const description = await callObject<DescribeResult>(env.baseUrl(), "Operator", key, "describe", {});
