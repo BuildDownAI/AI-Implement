@@ -934,9 +934,9 @@ export function buildKgRefreshGhaDispatchBody(opts: {
 
 /**
  * Private-transport KG body (AII-983): re-encodes the decoded trusted config with the result and
- * progress bearers inside `credentials` and omits them as top-level inputs. KG never receives a
- * publication token, and supplied bearers are discarded; only the model-auth grant and attempt
- * token already on the config are kept.
+ * progress bearers inside `credentials` and omits them as top-level inputs. Publication
+ * authority comes only from the caller's minted token. Supplied bearers are discarded;
+ * only the model-auth grant and attempt token already on the config are kept.
  */
 export function buildPrivateKgRefreshGhaDispatchBody(
   opts: Parameters<typeof buildKgRefreshGhaDispatchBody>[0] & { trustedConfig: RunConfigV1 },
@@ -947,6 +947,7 @@ export function buildPrivateKgRefreshGhaDispatchBody(
     version: 1,
     resultToken: opts.runToken,
     progressToken: opts.runProgressToken,
+    ...(opts.runPublicationToken ? { publicationToken: opts.runPublicationToken } : {}),
   };
   const body = buildKgRefreshGhaDispatchBody({
     ...rest,
@@ -954,6 +955,7 @@ export function buildPrivateKgRefreshGhaDispatchBody(
     runToken: "",
   });
   delete body.run_progress_token;
+  delete body.run_publication_token;
   return body;
 }
 

@@ -107,7 +107,7 @@ import {
 import { clearPrNotFoundGrace, decideCleanExitOutcome, shouldSkipCompletionNotice, workflowFileForJob } from "./monitor-status.js";
 import type { RunPrCandidate, RunPrMatch } from "./monitor-status.js";
 import { pickPrForRun } from "./monitor-status.js";
-import { type RunConfigV1, type RunCredentialsV1, encodeRunConfig, decodeRunConfig, decodeTrustedRunConfig, buildImplRunConfig } from "./run-config.js";
+import { type RunConfigV1, type RunCredentialsV1, encodeRunConfig, buildImplRunConfig } from "./run-config.js";
 import { resolveBaseBranch, findOpenRollUpPr, resolvePlanningBranch } from "./feature-branch.js";
 import { validateIssueBaseBranch, postBranchComment } from "./base-branch.js";
 import { runMergeUps, clearRollUpHandledMarkersByIdentifier } from "./merge-up.js";
@@ -1535,6 +1535,7 @@ export async function dispatchPlanning(
   // dispatchGitHubActions.
   const launch = await preparePlanningLaunch({
     config, provider, issue, mapping, dispatchId, resolvedPlanningBranch,
+    trustedCredentials: ctx.trustedCredentials,
     resolveRunnerImage: resolveDispatchRunnerImage,
   }).catch((err) => {
     planningAdmission.release("launch_rejected");
@@ -4052,7 +4053,7 @@ async function handleKgRefreshOutcome(
   }
 }
 
-async function dispatchKgRefreshRun(
+export async function dispatchKgRefreshRun(
   config: AppConfig,
   opts: { runToken: string; runProgressToken: string; dispatchId: string; runConfig: string; executionPath?: string; machine: FlyMachineProfileConfig; machineId: string | null },
 ): Promise<{ machineId?: string; machineNonce?: string; logsUrl?: string; created?: boolean }> {

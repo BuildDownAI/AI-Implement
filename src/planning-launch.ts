@@ -5,12 +5,20 @@
 import type { AppConfig, HeldReservation, DispatchSessionResult } from "./index.js";
 import type { RepoMapping } from "./config.js";
 import type { TicketIssue, TicketingProvider } from "./providers/types.js";
-import { postWorkflowDispatch, providerDispatchFields, capRunnerEnv, buildEnvelopeDispatchInputs, type DispatchInputs, type DispatchOutcome } from "./github.js";
-import { resolveWorkflowContract, type WorkflowContract } from "./workflow-probe.js";
+import {
+  postWorkflowDispatch,
+  providerDispatchFields,
+  capRunnerEnv,
+  buildEnvelopeDispatchInputs,
+  assertPrivateTransportForCredentials,
+  type DispatchInputs,
+  type DispatchOutcome,
+} from "./github.js";
+import { resolveWorkflowCapabilities, type WorkflowContract } from "./workflow-probe.js";
 import { surfaceDispatchFailure } from "./dispatch-failure.js";
 import { notify } from "./notify.js";
 import { recordDispatchFailure } from "./dispatch-breaker.js";
-import { getInstallationToken } from "./github-app-auth.js";
+import { getInstallationToken, getScopedInstallationToken } from "./github-app-auth.js";
 import { mintRunToken, PLANNING_TTL_SECONDS } from "./runner-tokens.js";
 import { buildPlanningContextInputs } from "./planning-context.js";
 import { postBranchComment } from "./base-branch.js";
@@ -21,7 +29,7 @@ import { SWEEP_MACHINE_MAX_AGE_MS } from "./reaper.js";
 import { getFlySecretsMinVersion, getFlyProcessLevelSecrets } from "./runner-mode.js";
 import { resolveSessionImage } from "./repo-image.js";
 import { getMappings } from "./config.js";
-import { encodeRunConfig, type RunConfigV1 } from "./run-config.js";
+import { encodeRunConfig, type RunConfigV1, type RunCredentialsV1 } from "./run-config.js";
 
 export interface PreparePlanningLaunchArgs {
   config: AppConfig;
@@ -30,6 +38,8 @@ export interface PreparePlanningLaunchArgs {
   mapping: RepoMapping;
   dispatchId: string;
   resolvedPlanningBranch: string;
+  /** Typed private credentials for trusted planning transport. Requires private-envelope support. */
+  trustedCredentials?: RunCredentialsV1;
   /** `resolveDispatchRunnerImage` from index.ts, passed in to avoid an import cycle. */
   resolveRunnerImage: (config: AppConfig, mapping: RepoMapping, ghToken: string) => Promise<string | undefined>;
 }
@@ -42,10 +52,21 @@ export interface PlanningLaunch {
   planningDispatchInputs: DispatchInputs;
 }
 
+async function getTargetRepoToken(
+  config: Pick<AppConfig, "githubAppId" | "githubAppPrivateKey">,
+  owner: string,
+  repo: string,
+): Promise<string> {
+  const scoped = await getScopedInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner, {
+    repositories: [repo],
+  });
+  return scoped.token;
+}
+
 /** Everything that runs after the reservation and before the launch call. Pure prep: a throw
  * here is by construction a definitive non-launch. */
 export async function preparePlanningLaunch(args: PreparePlanningLaunchArgs): Promise<PlanningLaunch> {
-  const { config, provider, issue, mapping, dispatchId, resolvedPlanningBranch, resolveRunnerImage } = args;
+  const { config, provider, issue, mapping, dispatchId, resolvedPlanningBranch, trustedCredentials, resolveRunnerImage } = args;
   const planningMapping = { ...mapping, workflowFile: mapping.planningWorkflowFile };
 
   // Build planning context (PARENT/SIBLINGS/DEPENDENCIES) only once admission is
@@ -89,13 +110,19 @@ export async function preparePlanningLaunch(args: PreparePlanningLaunchArgs): Pr
   // Legacy contract only; under the envelope the branch rides inside run_config.
   const planningSentBaseBranch = resolvedPlanningBranch !== mapping.defaultBranch;
 
-  const planningContract = await resolveWorkflowContract({
+  const workflowCapabilities = await resolveWorkflowCapabilities({
     owner: mapping.owner,
     repo: mapping.repo,
     workflowFile: mapping.planningWorkflowFile,
     token: ghToken,
     ref: mapping.defaultBranch,
   });
+  const planningContract = workflowCapabilities.contract;
+  assertPrivateTransportForCredentials(
+    trustedCredentials,
+    workflowCapabilities,
+    `${mapping.owner}/${mapping.repo}/${mapping.planningWorkflowFile}@${mapping.defaultBranch}`,
+  );
 
   const planningDispatchInputs = planningContract === "envelope"
     ? buildEnvelopeDispatchInputs(planningMapping, issue, {
@@ -107,6 +134,8 @@ export async function preparePlanningLaunch(args: PreparePlanningLaunchArgs): Pr
         // No runProgressToken: planning dispatches don't mint progress tokens.
         runnerImage,
         planningContext: planningContextInputs,
+        privateTransport: workflowCapabilities.supportsPrivateRunConfig === true,
+        credentials: trustedCredentials,
         // Planning has no retry loop, so nothing is stamped — but retryPolicy is
         // required on EnvelopeDispatchOpts, so every call site must say so explicitly.
         retryPolicy: null,
@@ -379,8 +408,10 @@ export async function launchPlanningSession(args: LaunchPlanningSessionArgs): Pr
         planningContext: planningContextInputs,
       };
 
-      // both fly-machines and local-docker require a GitHub token now, so it's extracted here for convenience/readability
-      const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
+      // Control-plane work keeps the installation-wide token; the runner boots with a
+      // token scoped to the target repository alone.
+      const controlGhToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
+      const targetGhToken = await getTargetRepoToken(config, mapping.owner, mapping.repo);
       if (execPath === "fly-machines") {
         const minSecretsVersion = getFlySecretsMinVersion();
         let allSecretNames: string[] = [];
@@ -394,7 +425,7 @@ export async function launchPlanningSession(args: LaunchPlanningSessionArgs): Pr
         const { image: resolvedImage, source: imageSource } = await resolveSessionImage({
           owner: mapping.owner,
           repo: mapping.repo,
-          token: ghToken,
+          token: targetGhToken,
           defaultImage: config.sessionImage,
         });
 
@@ -409,7 +440,7 @@ export async function launchPlanningSession(args: LaunchPlanningSessionArgs): Pr
           defaultBranch: resolvedPlanningBranch,
           anthropicApiKey: config.anthropicApiKey ?? undefined,
           claudeOAuthToken: config.claudeOAuthToken ?? undefined,
-          githubToken: ghToken,
+          githubToken: targetGhToken,
           sessionToken,
           machineNonce,
           phase: "planning",
@@ -446,7 +477,7 @@ export async function launchPlanningSession(args: LaunchPlanningSessionArgs): Pr
         return {
           machineId: machine.id,
           sessionImage: resolvedImage,
-          ghToken,
+          ghToken: controlGhToken,
           executionMode: "fly-machines" as const,
           statusComment: { machineName: machine.name, logsUrl: machineLogsUrl },
         };
@@ -469,7 +500,7 @@ export async function launchPlanningSession(args: LaunchPlanningSessionArgs): Pr
           defaultBranch: resolvedPlanningBranch,
           anthropicApiKey: config.anthropicApiKey ?? undefined,
           claudeOAuthToken: config.claudeOAuthToken ?? undefined,
-          githubToken: ghToken,
+          githubToken: targetGhToken,
           sessionToken,
           machineNonce,
           phase: "planning",
@@ -487,7 +518,7 @@ export async function launchPlanningSession(args: LaunchPlanningSessionArgs): Pr
         return {
           machineId: container.containerId,
           sessionImage: config.localRunnerImage,
-          ghToken: "",
+          ghToken: controlGhToken,
           executionMode: "local-docker" as const,
           statusComment: {
             machineName: container.containerName || container.containerId.slice(0, 12),

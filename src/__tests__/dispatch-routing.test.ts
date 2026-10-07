@@ -58,14 +58,13 @@ vi.mock("../workflow-probe.js", async (importOriginal) => {
 // already exists, and those tests need to control that answer without hitting GitHub.
 vi.mock("../github.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../github.js")>();
-  // getRepoDefaultBranch / pollForKgWorkflowRunId are mocked for the dispatchKgRefreshRun
-  // tests in the "scoped boot" describe block (AII-990) — both hit GitHub over real HTTP.
+  // getRepoDefaultBranch is mocked for the dispatchKgRefreshRun tests in the
+  // "scoped boot" describe block (AII-990); it hits GitHub over real HTTP.
   return {
     ...actual,
     postWorkflowDispatch: vi.fn(),
     getBranchSha: vi.fn(actual.getBranchSha),
     getRepoDefaultBranch: vi.fn(),
-    pollForKgWorkflowRunId: vi.fn(),
   };
 });
 
@@ -676,6 +675,11 @@ describe("Fly and local boot tokens are scoped to the target repository (AII-853
     expect(githubAppAuth.getInstallationToken).not.toHaveBeenCalled();
   }
 
+  function expectPlanningBootTokenSplit() {
+    expect(githubAppAuth.getInstallationToken).toHaveBeenCalledWith("id", "key", "eudoxus");
+    expect(githubAppAuth.getScopedInstallationToken).toHaveBeenCalledWith("id", "key", "eudoxus", SCOPED_REQUEST);
+  }
+
   function flyConfigJson(): string {
     expect(flyMachines.createMachine).toHaveBeenCalledOnce();
     return JSON.stringify(vi.mocked(flyMachines.createMachine).mock.calls[0]![2]);
@@ -716,7 +720,7 @@ describe("Fly and local boot tokens are scoped to the target repository (AII-853
   it("Fly planning boots with the scoped token", async () => {
     await indexModule.dispatchPlanning(config, provider, issue, mapping, planningCtx("fly-machines"));
 
-    expectScopedOnly();
+    expectPlanningBootTokenSplit();
     const json = flyConfigJson();
     expect(json).toContain("scoped-token");
     expect(json).not.toContain("broad-token");
@@ -734,7 +738,7 @@ describe("Fly and local boot tokens are scoped to the target repository (AII-853
   it("local planning boots with the scoped token", async () => {
     await indexModule.dispatchPlanning(config, provider, issue, mapping, planningCtx("local-docker"));
 
-    expectScopedOnly();
+    expectPlanningBootTokenSplit();
     expect(vi.mocked(localDocker.startLocalRunnerContainer).mock.calls[0]![0]).toEqual(
       expect.objectContaining({ githubToken: "scoped-token", phase: "planning" }),
     );
@@ -759,7 +763,7 @@ describe("Fly and local boot tokens are scoped to the target repository (AII-853
 
     expect(githubAppAuth.getScopedInstallationToken).toHaveBeenCalledWith("id", "key", "eudoxus", SCOPED_REQUEST);
     expect(flyMachines.createMachine).not.toHaveBeenCalled();
-    expect(githubAppAuth.getInstallationToken).not.toHaveBeenCalled();
+    expect(githubAppAuth.getInstallationToken).toHaveBeenCalledWith("id", "key", "eudoxus");
     expectFreeSlot("fly-machines", "planning");
   });
 
@@ -770,7 +774,7 @@ describe("Fly and local boot tokens are scoped to the target repository (AII-853
 
     expect(githubAppAuth.getScopedInstallationToken).toHaveBeenCalledWith("id", "key", "eudoxus", SCOPED_REQUEST);
     expect(localDocker.startLocalRunnerContainer).not.toHaveBeenCalled();
-    expect(githubAppAuth.getInstallationToken).not.toHaveBeenCalled();
+    expect(githubAppAuth.getInstallationToken).toHaveBeenCalledWith("id", "key", "eudoxus");
     expectFreeSlot("local-docker", "planning");
   });
   describe("dispatchKgRefreshRun (AII-990)", () => {
@@ -788,7 +792,6 @@ describe("Fly and local boot tokens are scoped to the target repository (AII-853
       github = await import("../github.js");
       vi.mocked(github.getRepoDefaultBranch).mockReset().mockResolvedValue("main");
       vi.mocked(github.postWorkflowDispatch).mockReset().mockResolvedValue({ success: true } as never);
-      vi.mocked(github.pollForKgWorkflowRunId).mockReset().mockResolvedValue(42 as never);
       vi.mocked(repoImage.resolveRunnerImageForDispatch).mockReset().mockResolvedValue("runner-image" as never);
     });
 
@@ -835,141 +838,9 @@ describe("Fly and local boot tokens are scoped to the target repository (AII-853
       expect(localDocker.startLocalRunnerContainer).not.toHaveBeenCalled();
     });
 
-    it("GHA KG dispatch keeps the broad token and mints no scoped token", async () => {
-      await indexModule.dispatchKgRefreshRun(kgConfig, kgOpts("github-actions"));
-
-      expect(githubAppAuth.getScopedInstallationToken).not.toHaveBeenCalled();
-      expect(github.postWorkflowDispatch).toHaveBeenCalledWith(expect.objectContaining({ token: "broad-token", owner: "eudoxus", repo: "AI-Implement" }));
-    });
-
-    describe("private transport capability (AII-983)", () => {
-      const caps = (supportsPrivateRunConfig?: boolean) => ({
-        contract: "envelope", supportsRunPublicationToken: false, supportsAttemptCorrelation: false,
-        ...(supportsPrivateRunConfig !== undefined ? { supportsPrivateRunConfig } : {}),
-      }) as never;
-      const sentInputs = () => vi.mocked(github.postWorkflowDispatch).mock.calls[0]![0].inputs;
-
-      it("capable reader: bearers move into credentials, probed at the exact file and ref, no publication token", async () => {
-        const probe = await import("../workflow-probe.js");
-        vi.mocked(probe.resolveWorkflowCapabilities).mockReset().mockResolvedValue(caps(true));
-        const { decodeTrustedRunConfig, decodeRunConfig } = await import("../run-config.js");
-        await indexModule.dispatchKgRefreshRun(kgConfig, {
-          ...kgOpts("github-actions"),
-          runConfig: encodeRunConfig({ v: 1, issue: { id: "kg-refresh", identifier: "KG-REFRESH", title: "KG ingest", description: "" }, kgSourceRef: "pr-head" }),
-        });
-        expect(probe.resolveWorkflowCapabilities).toHaveBeenCalledWith(expect.objectContaining({
-          workflowFile: "claude-implement.yml", ref: "pr-head", token: "broad-token",
-        }));
-        const inputs = sentInputs();
-        expect(decodeTrustedRunConfig(inputs.run_config!).credentials).toEqual({ version: 1, resultToken: "run-token", progressToken: "progress-token" });
-        expect(decodeRunConfig(inputs.run_config!).credentials).toBeUndefined();
-        expect(decodeRunConfig(inputs.run_config!).kgSourceRef).toBe("pr-head");
-        expect(inputs.run_token).toBe("");
-        expect("run_progress_token" in inputs).toBe(false);
-        expect("run_publication_token" in inputs).toBe(false);
-      });
-
-      it.each([
-        ["envelope without the private marker", caps(undefined)],
-        ["explicit false", caps(false)],
-      ])("%s keeps the legacy masked top-level path", async (_n, c) => {
-        const probe = await import("../workflow-probe.js");
-        vi.mocked(probe.resolveWorkflowCapabilities).mockReset().mockResolvedValue(c);
-        await indexModule.dispatchKgRefreshRun(kgConfig, kgOpts("github-actions"));
-        const inputs = sentInputs();
-        expect(inputs).toMatchObject({ run_token: "run-token", run_progress_token: "progress-token" });
-        expect(inputs.run_config).toBe(kgOpts("github-actions").runConfig);
-      });
-
-      it("legacy-contract reader keeps the legacy top-level path for an unprotected config", async () => {
-        const probe = await import("../workflow-probe.js");
-        vi.mocked(probe.resolveWorkflowCapabilities).mockReset().mockResolvedValue(
-          { contract: "legacy", supportsRunPublicationToken: false, supportsAttemptCorrelation: false } as never,
-        );
-        await indexModule.dispatchKgRefreshRun(kgConfig, kgOpts("github-actions"));
-        const inputs = sentInputs();
-        expect(inputs).toMatchObject({ run_token: "run-token", run_progress_token: "progress-token" });
-        expect(inputs.run_config).toBe(kgOpts("github-actions").runConfig);
-      });
-
-      it("legacy-contract reader with trusted credentials fails before launch", async () => {
-        const probe = await import("../workflow-probe.js");
-        vi.mocked(probe.resolveWorkflowCapabilities).mockReset().mockResolvedValue(
-          { contract: "legacy", supportsRunPublicationToken: false, supportsAttemptCorrelation: false } as never,
-        );
-        const { encodeTrustedRunConfig } = await import("../run-config.js");
-        const runConfig = encodeTrustedRunConfig({
-          v: 1, issue: { id: "kg-refresh", identifier: "KG-REFRESH", title: "KG ingest", description: "" },
-          credentials: { version: 1, resultToken: "pre-existing" },
-        });
-        await expect(indexModule.dispatchKgRefreshRun(kgConfig, { ...kgOpts("github-actions"), runConfig })).rejects.toThrow();
-        expect(github.postWorkflowDispatch).not.toHaveBeenCalled();
-      });
-
-      it("supplied publication/result/progress tokens never survive the private KG dispatch; grant and attempt do", async () => {
-        const probe = await import("../workflow-probe.js");
-        vi.mocked(probe.resolveWorkflowCapabilities).mockReset().mockResolvedValue(caps(true));
-        const { encodeTrustedRunConfig, decodeTrustedRunConfig } = await import("../run-config.js");
-        const runConfig = encodeTrustedRunConfig({
-          v: 1, issue: { id: "kg-refresh", identifier: "KG-REFRESH", title: "KG ingest", description: "" },
-          credentials: {
-            version: 1, publicationToken: "supplied-pub", resultToken: "supplied-res", progressToken: "supplied-prog",
-            attemptToken: "supplied-attempt",
-          },
-        });
-        await indexModule.dispatchKgRefreshRun(kgConfig, { ...kgOpts("github-actions"), runConfig });
-        const inputs = sentInputs();
-        expect(decodeTrustedRunConfig(inputs.run_config!).credentials).toEqual({
-          version: 1, attemptToken: "supplied-attempt", resultToken: "run-token", progressToken: "progress-token",
-        });
-        expect(inputs.run_token).toBe("");
-        expect("run_progress_token" in inputs).toBe(false);
-        expect("run_publication_token" in inputs).toBe(false);
-        expect(JSON.stringify(inputs)).not.toMatch(/supplied-pub|supplied-res|supplied-prog/);
-      });
-
-      it("private KG dispatch resends the same body on the shared 422 retry (byte-identical run_config)", async () => {
-        const probe = await import("../workflow-probe.js");
-        vi.mocked(probe.resolveWorkflowCapabilities).mockReset().mockResolvedValue(caps(true));
-        const actual = await vi.importActual<typeof import("../github.js")>("../github.js");
-        vi.mocked(github.postWorkflowDispatch).mockImplementation(actual.postWorkflowDispatch);
-        const fetchMock = vi.fn()
-          .mockResolvedValueOnce({ status: 422, text: async () => 'Unexpected inputs provided: ["issue_identifier"]' })
-          .mockResolvedValueOnce({ status: 204 });
-        vi.stubGlobal("fetch", fetchMock);
-        try {
-          await indexModule.dispatchKgRefreshRun(kgConfig, kgOpts("github-actions"));
-        } finally {
-          vi.unstubAllGlobals();
-        }
-        expect(fetchMock).toHaveBeenCalledTimes(2);
-        const bodies = fetchMock.mock.calls.map((c) => JSON.parse(c[1].body as string).inputs as Record<string, string>);
-        expect(bodies[1]!.run_config).toBe(bodies[0]!.run_config);
-        expect(bodies[1]!.run_token).toBe("");
-      });
-
-      it("probe failure on an unprotected config falls back to legacy", async () => {
-        const probe = await import("../workflow-probe.js");
-        vi.mocked(probe.resolveWorkflowCapabilities).mockReset().mockRejectedValue(new Error("probe down"));
-        await indexModule.dispatchKgRefreshRun(kgConfig, kgOpts("github-actions"));
-        expect(sentInputs().run_token).toBe("run-token");
-      });
-
-      it.each([
-        ["unsupported reader", () => Promise.resolve(caps(false))],
-        ["failed probe", () => Promise.reject(new Error("probe down"))],
-      ])("trusted credentials on %s fail before launch", async (_n, impl) => {
-        const probe = await import("../workflow-probe.js");
-        vi.mocked(probe.resolveWorkflowCapabilities).mockReset().mockImplementation(impl as never);
-        const { encodeTrustedRunConfig } = await import("../run-config.js");
-        const runConfig = encodeTrustedRunConfig({
-          v: 1, issue: { id: "kg-refresh", identifier: "KG-REFRESH", title: "KG ingest", description: "" },
-          credentials: { version: 1, resultToken: "pre-existing" },
-        });
-        await expect(indexModule.dispatchKgRefreshRun(kgConfig, { ...kgOpts("github-actions"), runConfig })).rejects.toThrow();
-        expect(github.postWorkflowDispatch).not.toHaveBeenCalled();
-      });
-    });
+    // The legacy direct GitHub Actions KG dispatch path was removed from production.
+    // Private-envelope body composition coverage now lives with the pure KG production
+    // composer tests; this block keeps only the remaining container launch regressions.
   });
 });
 

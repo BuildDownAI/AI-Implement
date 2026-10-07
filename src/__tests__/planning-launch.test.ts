@@ -11,11 +11,124 @@ vi.mock("../github.js", async (importOriginal) => {
   return { ...actual, postWorkflowDispatch: vi.fn() };
 });
 
-vi.mock("../github-app-auth.js", () => ({ getInstallationToken: vi.fn() }));
+vi.mock("../github-app-auth.js", () => ({ getInstallationToken: vi.fn(), getScopedInstallationToken: vi.fn() }));
 vi.mock("../local-docker.js", () => ({ startLocalRunnerContainer: vi.fn() }));
 vi.mock("../planning-context.js", () => ({
   buildPlanningContextInputs: vi.fn().mockResolvedValue({ parent: "", siblings: "", dependencies: "" }),
 }));
+vi.mock("../workflow-probe.js", () => ({ resolveWorkflowCapabilities: vi.fn() }));
+
+describe("preparePlanningLaunch", () => {
+  let dbPath: string;
+  let dedup: typeof import("../dedup.js");
+  let githubAuth: typeof import("../github-app-auth.js");
+  let workflowProbe: typeof import("../workflow-probe.js");
+  let launchModule: typeof import("../planning-launch.js");
+
+  const issue: TicketIssue = {
+    id: "issue-prepare-1",
+    identifier: "AII-1052",
+    title: "Prepare planning",
+    description: "desc",
+    scopeKey: "AII",
+    nativeStatus: "Todo",
+  };
+  const mapping = {
+    owner: "eudoxus",
+    repo: "AI-Implement",
+    workflowFile: "claude-implement.yml",
+    planningWorkflowFile: "claude-plan.yml",
+    defaultBranch: "main",
+  } as unknown as RepoMapping;
+  const config = {
+    githubAppId: "app-id",
+    githubAppPrivateKey: "private-key",
+    runnerCallbackBaseUrl: "https://orch.example.test",
+    runnerTokenSecret: "test-secret-with-enough-entropy-for-hmac",
+  } as unknown as AppConfig;
+  const provider = { id: "jira" } as unknown as TicketingProvider;
+
+  beforeEach(async () => {
+    vi.resetModules();
+    vi.clearAllMocks();
+    dbPath = path.join(os.tmpdir(), `planning-prepare-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
+    process.env.DEDUP_DB_PATH = dbPath;
+    dedup = await import("../dedup.js");
+    dedup.getDb();
+    githubAuth = await import("../github-app-auth.js");
+    workflowProbe = await import("../workflow-probe.js");
+    launchModule = await import("../planning-launch.js");
+    vi.mocked(githubAuth.getInstallationToken).mockResolvedValue("control-token");
+  });
+
+  afterEach(() => {
+    dedup.closeDb();
+    try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+  });
+
+  it("envelope planning probes the planning workflow and carries private result credentials only when supported", async () => {
+    const { decodeTrustedRunConfig, decodeRunConfig } = await import("../run-config.js");
+    vi.mocked(workflowProbe.resolveWorkflowCapabilities).mockResolvedValue({
+      contract: "envelope",
+      supportsRunPublicationToken: false,
+      supportsAttemptCorrelation: false,
+      supportsPrivateRunConfig: true,
+    });
+    const resolveRunnerImage = vi.fn().mockResolvedValue("runner:image");
+
+    const result = await launchModule.preparePlanningLaunch({
+      config,
+      provider,
+      issue,
+      mapping,
+      dispatchId: "dispatch-prepare-1",
+      resolvedPlanningBranch: "feature/base",
+      trustedCredentials: { version: 1, attemptToken: "attempt-private" },
+      resolveRunnerImage,
+    });
+
+    expect(workflowProbe.resolveWorkflowCapabilities).toHaveBeenCalledWith(expect.objectContaining({
+      owner: "eudoxus",
+      repo: "AI-Implement",
+      workflowFile: "claude-plan.yml",
+      token: "control-token",
+      ref: "main",
+    }));
+    expect(resolveRunnerImage).toHaveBeenCalledWith(config, mapping, "control-token");
+    expect(result.planningContract).toBe("envelope");
+    const inputs = result.planningDispatchInputs;
+    const trusted = decodeTrustedRunConfig(inputs.run_config!);
+    expect(decodeRunConfig(inputs.run_config!).credentials).toBeUndefined();
+    expect(trusted.baseBranch).toBe("feature/base");
+    expect(trusted.credentials?.resultToken).toBeTruthy();
+    expect(trusted.credentials?.attemptToken).toBe("attempt-private");
+    expect(trusted.credentials?.progressToken).toBeUndefined();
+    expect(trusted.credentials?.publicationToken).toBeUndefined();
+    expect(inputs.run_token).toBe("");
+    expect("run_progress_token" in inputs).toBe(false);
+    expect("run_publication_token" in inputs).toBe(false);
+  });
+
+  it("supplied private planning credentials fail closed when the planning workflow lacks private-envelope support", async () => {
+    vi.mocked(workflowProbe.resolveWorkflowCapabilities).mockResolvedValue({
+      contract: "envelope",
+      supportsRunPublicationToken: false,
+      supportsAttemptCorrelation: false,
+      supportsPrivateRunConfig: false,
+    });
+
+    await expect(launchModule.preparePlanningLaunch({
+      config,
+      provider,
+      issue,
+      mapping,
+      dispatchId: "dispatch-prepare-2",
+      resolvedPlanningBranch: "main",
+      trustedCredentials: { version: 1, attemptToken: "attempt-private" },
+      resolveRunnerImage: vi.fn().mockResolvedValue(undefined),
+    })).rejects.toThrow(/refusing to drop or downgrade/);
+  });
+});
 
 describe("launchPlanningRun", () => {
   let dbPath: string;
@@ -211,6 +324,8 @@ describe("launchPlanningSession", () => {
     auth = await import("../github-app-auth.js");
     docker = await import("../local-docker.js");
     mod = await import("../planning-launch.js");
+    vi.mocked(auth.getInstallationToken).mockResolvedValue("CONTROL-TOKEN-SECRET");
+    vi.mocked(auth.getScopedInstallationToken).mockResolvedValue({ token: "SCOPED-TOKEN-SECRET" } as never);
     dispatchSession.mockImplementation(async (_c, _p, _i, _m, _pr, _rm, opts) => {
       const r = await opts.backend({ sessionToken: "SESSION", machineNonce: "NONCE", runnerCallbackUrl: "", runToken: "RUN", markLaunchAttempted: () => {} });
       return { admitted: true, machineId: r.machineId, executionMode: r.executionMode };
@@ -236,8 +351,22 @@ describe("launchPlanningSession", () => {
     const result = await call({ reservation });
     expect(result).toEqual({ outcome: "accepted", machineId: "c-1", executionMode: "local-docker" });
     const json = JSON.stringify(result);
-    for (const secret of ["NONCE", "SESSION", "RUN", "GH-TOKEN-SECRET"]) expect(json).not.toContain(secret);
+    for (const secret of ["NONCE", "SESSION", "RUN", "GH-TOKEN-SECRET", "SCOPED-TOKEN-SECRET"]) expect(json).not.toContain(secret);
     expect(dispatchSession.mock.calls[0][7]).toBe(reservation);
+  });
+
+  it("boots the local planning runner with a target-repo scoped token while keeping the installation token for control-plane work", async () => {
+    vi.mocked(auth.getInstallationToken).mockResolvedValue("CONTROL-TOKEN-SECRET");
+    vi.mocked(auth.getScopedInstallationToken).mockResolvedValue({ token: "SCOPED-TOKEN-SECRET" } as never);
+    vi.mocked(docker.startLocalRunnerContainer).mockResolvedValue({ containerId: "c-1", containerName: "n" } as never);
+
+    await call({ reservation });
+
+    expect(auth.getInstallationToken).toHaveBeenCalledWith("id", "k", "o");
+    expect(auth.getScopedInstallationToken).toHaveBeenCalledWith("id", "k", "o", { repositories: ["r"] });
+    expect(vi.mocked(docker.startLocalRunnerContainer).mock.calls[0][0]).toEqual(
+      expect.objectContaining({ githubToken: "SCOPED-TOKEN-SECRET" }),
+    );
   });
 
   it("an owned launch names the container from the dispatch id; a Legacy launch passes no name", async () => {

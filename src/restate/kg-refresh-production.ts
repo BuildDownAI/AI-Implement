@@ -22,7 +22,7 @@ import {
 import { readServedStamp, type KgRailDeps } from "../kg-refresh-rail.js";
 import { KG_DIR, getServedNamespace } from "../kg-sidecar.js";
 import { parseKgSourceRepo } from "../deploy.js";
-import { RUN_TITLE_PREFIX, buildKgRefreshGhaDispatchBody, defaultFetchSignal, postWorkflowDispatch } from "../github.js";
+import { RUN_TITLE_PREFIX, buildKgRefreshGhaDispatchBody, buildPrivateKgRefreshGhaDispatchBody, defaultFetchSignal, postWorkflowDispatch } from "../github.js";
 import { resolveWorkflowCapabilities } from "../workflow-probe.js";
 import { resolveRunnerImageForDispatch } from "../repo-image.js";
 import { encodeRunConfig, type RunConfigV1 } from "../run-config.js";
@@ -296,15 +296,18 @@ export function createKgRefreshDispatch(input: KgRefreshProductionInput): (dispa
       defaultImage: config.sessionImage, runnerImageExplicit: config.runnerImageExplicit,
     });
     const ref = runConfig.kgSourceRef ?? defaultBranch;
-    const { supportsRunPublicationToken } = await (input.resolveWorkflowCapabilities ?? resolveWorkflowCapabilities)({
+    const { supportsRunPublicationToken, supportsPrivateRunConfig } = await (input.resolveWorkflowCapabilities ?? resolveWorkflowCapabilities)({
       owner: repo.owner, repo: repo.repo, workflowFile: KG_REFRESH_WORKFLOW_FILE, token, ref,
     });
-    const inputs = buildKgRefreshGhaDispatchBody({
+    const kgBodyOpts = {
       runConfig: encoded, runToken: tokens.runToken, runProgressToken: tokens.progressToken,
       ...(supportsRunPublicationToken ? { runPublicationToken: tokens.publicationToken } : {}),
       runnerImage, runnerCallbackUrl: config.runnerCallbackBaseUrl ?? undefined,
-      runnerPhase: "kg-refresh", jobTimeoutMinutes: "240", issueIdentifier,
-    });
+      runnerPhase: "kg-refresh" as const, jobTimeoutMinutes: "240", issueIdentifier,
+    };
+    const inputs = supportsPrivateRunConfig
+      ? buildPrivateKgRefreshGhaDispatchBody({ ...kgBodyOpts, trustedConfig: envelope })
+      : buildKgRefreshGhaDispatchBody(kgBodyOpts);
     const result = await postWorkflowDispatch({
       token, owner: repo.owner, repo: repo.repo, workflowFile: KG_REFRESH_WORKFLOW_FILE,
       ref, inputs, returnRunDetails: true,
