@@ -6,11 +6,7 @@
  * without checking them, so this file is additionally type-checked via
  * `npx tsc --noEmit -p tsconfig.review-fix-finalize-tests.json`.
  */
-import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
-import os from "node:os";
-import path from "node:path";
-import fs from "node:fs";
-import type * as DedupModule from "../dedup.js";
+import { describe, expect, it, beforeEach } from "vitest";
 import type * as ConfigModule from "../config.js";
 import type * as StoreModule from "../review-fix-attempt-store.js";
 import type * as FinalizeModule from "../review-fix-finalize.js";
@@ -23,72 +19,28 @@ import type {
 import type { ReviewFixResultMetadataV1, ScopedPrIdentity } from "../review-fix-contract.js";
 import type { RepoMapping } from "../config.js";
 import type { ReviewFixGitHubAdapter, ReviewFixTrackerAdapter } from "../review-fix-finalize.js";
+import { makeMapping, makeReviewFixResult, makeScopedPrIdentity } from "./helpers/builders.js";
+import { testDb } from "./helpers/test-db.js";
 
-let dbPath: string;
-let dedup: typeof DedupModule;
 let config: typeof ConfigModule;
 let storeModule: typeof StoreModule;
 let finalizeModule: typeof FinalizeModule;
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(
-    os.tmpdir(),
-    `review-fix-finalize-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-  );
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  config = await import("../config.js");
-  storeModule = await import("../review-fix-attempt-store.js");
-  finalizeModule = await import("../review-fix-finalize.js");
+  ({ config, storeModule, finalizeModule } = (await testDb({
+    modules: {
+      config: () => import("../config.js"),
+      storeModule: () => import("../review-fix-attempt-store.js"),
+      finalizeModule: () => import("../review-fix-finalize.js"),
+    },
+  })).modules);
 });
 
-afterEach(() => {
-  dedup.closeDb();
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
-});
-
-const SCOPE: ScopedPrIdentity = { installationId: 1, repository: "eudoxus/ai-implement", prNumber: 42 };
+const SCOPE = makeScopedPrIdentity({ repository: "eudoxus/ai-implement" });
 const OUTPUT_COMMIT = "a".repeat(40);
 
-function mapping(overrides: Partial<RepoMapping> & Pick<RepoMapping, "owner" | "repo">): RepoMapping {
-  return {
-    workflowFile: "claude-implement.yml",
-    defaultBranch: "main",
-    maxInProgressAiIssues: 3,
-    executionMode: "github-actions",
-    sessionMode: "autonomous",
-    machineCpus: 2,
-    machineMemoryMb: 4096,
-    planningEnabled: false,
-    planningWorkflowFile: "",
-    autoApprovePlans: true,
-    autoMerge: false,
-    extraEnv: {},
-    provider: "anthropic",
-    ticketingProvider: "linear",
-    ticketingConfig: { kind: "linear" },
-    awsRegion: null,
-    paused: false,
-    maxTurns: null,
-    maxIterations: null,
-    maxJobMinutes: null,
-    branchPrefix: null,
-    skillsRepo: null,
-    sensitiveAddPatterns: null,
-    sensitiveAllowPatterns: null,
-    dependencyTokenScope: null,
-    memoryProviderId: null,
-    referenceRepos: null,
-    reviewers: null,
-    reviewFixLifecycle: null,
-    ...overrides,
-  };
-}
-
 function seedMapping(overrides: Partial<RepoMapping> = {}): void {
-  config.initMappingsTable();
-  config.upsertMapping("AII", mapping({ owner: "eudoxus", repo: "ai-implement", ...overrides }));
+  config.upsertMapping("AII", makeMapping({ owner: "eudoxus", repo: "ai-implement", ...overrides }));
 }
 
 function admissionRequest(overrides: Partial<ReviewFixAdmissionRequest> = {}): ReviewFixAdmissionRequest {
@@ -101,18 +53,7 @@ function admissionRequest(overrides: Partial<ReviewFixAdmissionRequest> = {}): R
 }
 
 function resultFor(attemptId: string, deadlineAt: number, overrides: Partial<ReviewFixResultMetadataV1> = {}): ReviewFixResultMetadataV1 {
-  return {
-    version: 1,
-    attemptId,
-    installationId: SCOPE.installationId,
-    repository: SCOPE.repository,
-    prNumber: SCOPE.prNumber,
-    deadlineAt,
-    githubRunId: 1000,
-    githubRunAttempt: 1,
-    outputCommit: OUTPUT_COMMIT,
-    ...overrides,
-  };
+  return makeReviewFixResult({ attemptId, ...SCOPE, deadlineAt, outputCommit: OUTPUT_COMMIT, ...overrides });
 }
 
 const REACHED_SUCCEEDED: WorkerTerminalInspection = { reached: true, outcome: { status: "succeeded", outputCommit: OUTPUT_COMMIT } };

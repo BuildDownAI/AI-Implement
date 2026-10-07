@@ -1,43 +1,30 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import type * as DedupModule from "../dedup.js";
 import type * as InboxModule from "../review-fix-inbox.js";
 import type { ScopedPrIdentity } from "../review-fix-contract.js";
+import { makeScopedPrIdentity } from "./helpers/builders.js";
+import { testDb } from "./helpers/test-db.js";
 
-let dbPath: string;
 let dedup: typeof DedupModule;
 let inbox: typeof InboxModule;
+let reopen: () => Promise<{ dedup: typeof DedupModule; inbox: typeof InboxModule }>;
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(
-    os.tmpdir(),
-    `review-fix-inbox-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-  );
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  inbox = await import("../review-fix-inbox.js");
-  dedup.getDb();
+  const db = await testDb({
+    modules: {
+      dedup: () => import("../dedup.js"),
+      inbox: () => import("../review-fix-inbox.js"),
+    },
+  });
+  ({ dedup, inbox } = db.modules);
+  reopen = db.reopen;
 });
-
-afterEach(() => {
-  dedup.closeDb();
-  try {
-    fs.unlinkSync(dbPath);
-  } catch {
-    /* ignore */
-  }
-});
-
-function makeDestination(overrides: Partial<ScopedPrIdentity> = {}): ScopedPrIdentity {
-  return { installationId: 7, repository: "acme/app", prNumber: 42, ...overrides };
-}
 
 describe("acceptDelivery", () => {
   it("returns the original acceptance after a restart before the HTTP ack (same payload replayed)", async () => {
-    const destination = makeDestination();
+    const destination = makeScopedPrIdentity();
     const outcome1 = inbox.acceptDelivery({
       authenticatedSource: "github",
       deliveryId: "evt-1",
@@ -47,12 +34,8 @@ describe("acceptDelivery", () => {
     });
     expect(outcome1.status).toBe("accepted");
 
-    // Simulate a process restart: close the handle, reset modules, and re-import
-    // against the SAME durable file rather than a fresh tmp DB.
-    dedup.closeDb();
-    vi.resetModules();
-    dedup = await import("../dedup.js");
-    inbox = await import("../review-fix-inbox.js");
+    // Simulate a process restart against the SAME durable file rather than a fresh database.
+    ({ dedup, inbox } = await reopen());
 
     const outcome2 = inbox.acceptDelivery({
       authenticatedSource: "github",
@@ -71,7 +54,7 @@ describe("acceptDelivery", () => {
   });
 
   it("rejects conflicting reuse of the same identity instead of overwriting the stored row", () => {
-    const destination = makeDestination();
+    const destination = makeScopedPrIdentity();
     const first = inbox.acceptDelivery({
       authenticatedSource: "github",
       deliveryId: "evt-2",
@@ -107,7 +90,7 @@ describe("acceptDelivery", () => {
   });
 
   it("records a conflict marker that survives closing and reopening the database, and increments on repeated conflicting reuse", async () => {
-    const destination = makeDestination();
+    const destination = makeScopedPrIdentity();
     inbox.acceptDelivery({
       authenticatedSource: "github",
       deliveryId: "evt-conflict-durable",
@@ -124,10 +107,7 @@ describe("acceptDelivery", () => {
       payload: { text: "different content" },
     });
 
-    dedup.closeDb();
-    vi.resetModules();
-    dedup = await import("../dedup.js");
-    inbox = await import("../review-fix-inbox.js");
+    ({ dedup, inbox } = await reopen());
 
     const afterReopen = inbox.getDelivery("github", "evt-conflict-durable");
     expect(afterReopen?.conflictCount).toBe(1);
@@ -175,7 +155,7 @@ describe("acceptDelivery", () => {
         authenticatedSource: "github",
         deliveryId: "fail-me",
         kind: "feedback",
-        destination: makeDestination(),
+        destination: makeScopedPrIdentity(),
         payload: { text: "x" },
       }),
     ).toThrow(/forced failure/);
@@ -188,7 +168,7 @@ describe("acceptDelivery", () => {
       authenticatedSource: "github",
       deliveryId: "evt-3",
       kind: "feedback",
-      destination: makeDestination(),
+      destination: makeScopedPrIdentity(),
       payload: { text: "x" },
     });
     expect(outcome.status).toBe("accepted");
@@ -197,7 +177,7 @@ describe("acceptDelivery", () => {
   it("requires and stores an explicit destination for every event kind", () => {
     const kinds = ["feedback", "result", "cancellation", "terminal-effect"] as const;
     for (const kind of kinds) {
-      const destination = makeDestination({ prNumber: 100 + kinds.indexOf(kind) });
+      const destination = makeScopedPrIdentity({ prNumber: 100 + kinds.indexOf(kind) });
       const outcome = inbox.acceptDelivery({
         authenticatedSource: "github",
         deliveryId: `evt-kind-${kind}`,
@@ -230,7 +210,7 @@ describe("acceptDelivery", () => {
       authenticatedSource: "github",
       deliveryId: "evt-bad-kind",
       kind: "not-a-real-kind" as unknown as InboxModule.ReviewFixEventKind,
-      destination: makeDestination(),
+      destination: makeScopedPrIdentity(),
       payload: {},
     });
     expect(outcome.status).toBe("rejected");
@@ -241,7 +221,7 @@ describe("claimDeliveries", () => {
   it("leaves feedback queued while claiming completion deliveries during a deploy drain", () => {
     let order = 0;
     for (const [deliveryId, kind] of [["feedback-1", "feedback"], ["result-1", "result"], ["cancel-1", "cancellation"]] as const) {
-      inbox.acceptDelivery({ authenticatedSource: "github", deliveryId, kind, destination: makeDestination(), payload: { attemptId: "a-1" } });
+      inbox.acceptDelivery({ authenticatedSource: "github", deliveryId, kind, destination: makeScopedPrIdentity(), payload: { attemptId: "a-1" } });
       dedup.getDb().prepare("UPDATE review_fix_inbox SET accepted_at = ? WHERE event_id = ?").run(++order, deliveryId);
     }
     const completion = inbox.claimDeliveries({ now: Date.now(), completionOnly: true });
@@ -249,7 +229,7 @@ describe("claimDeliveries", () => {
     expect(inbox.claimDeliveries({ now: Date.now() }).map((delivery) => delivery.deliveryId)).toEqual(["feedback-1"]);
   });
   it("leases a delivery claim recoverable after a crash, retrying the same destination identity", () => {
-    const destination = makeDestination();
+    const destination = makeScopedPrIdentity();
     inbox.acceptDelivery({
       authenticatedSource: "github",
       deliveryId: "evt-claim",
@@ -283,14 +263,14 @@ describe("claimDeliveries", () => {
       authenticatedSource: "github",
       deliveryId: "evt-old",
       kind: "feedback",
-      destination: makeDestination(),
+      destination: makeScopedPrIdentity(),
       payload: { seq: 1 },
     });
     inbox.acceptDelivery({
       authenticatedSource: "github",
       deliveryId: "evt-new",
       kind: "feedback",
-      destination: makeDestination(),
+      destination: makeScopedPrIdentity(),
       payload: { seq: 2 },
     });
     inbox.ackDelivery("github", "evt-old");
@@ -306,7 +286,7 @@ describe("retryDelivery", () => {
       authenticatedSource: "runner",
       deliveryId: "evt-retry",
       kind: "cancellation",
-      destination: makeDestination(),
+      destination: makeScopedPrIdentity(),
       payload: {},
     });
     const now = 2_000_000;
@@ -327,7 +307,7 @@ describe("retryDelivery", () => {
       authenticatedSource: "runner",
       deliveryId: "evt-done",
       kind: "result",
-      destination: makeDestination(),
+      destination: makeScopedPrIdentity(),
       payload: {},
     });
     inbox.ackDelivery("runner", "evt-done");
@@ -341,7 +321,7 @@ describe("ackDelivery", () => {
       authenticatedSource: "github",
       deliveryId: "evt-ack",
       kind: "terminal-effect",
-      destination: makeDestination(),
+      destination: makeScopedPrIdentity(),
       payload: {},
     });
 
@@ -366,7 +346,7 @@ describe("tombstoneDelivery", () => {
       authenticatedSource: "github",
       deliveryId: "evt-tomb",
       kind: "feedback",
-      destination: makeDestination(),
+      destination: makeScopedPrIdentity(),
       payload: { text: "keep me" },
     });
 

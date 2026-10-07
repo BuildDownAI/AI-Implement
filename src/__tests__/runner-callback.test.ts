@@ -1,7 +1,4 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import os from "node:os";
-import path from "node:path";
-import fs from "node:fs";
 import type * as DedupModule from "../dedup.js";
 import type * as LogModule from "../log.js";
 import type * as DispatchAdmissionModule from "../dispatch-admission.js";
@@ -25,6 +22,8 @@ import type {
   ReviewFixResultMetadataV1,
   ResultIntakeOutcome,
 } from "../review-fix-contract.js";
+import { makeIssue, makeReviewFixResult } from "./helpers/builders.js";
+import { testDb } from "./helpers/test-db.js";
 
 // ---------- Hoisted mocks for AII-749 lease-rejected handling ----------
 // Everything else in these two modules passes through to the real
@@ -58,8 +57,10 @@ vi.mock("../github.js", async (importOriginal) => {
 });
 
 const SECRET = "test-secret-with-enough-entropy-for-hmac";
+// Prepared attempts and their results share one deadline, an hour after the file loads:
+// minting a prepared review-fix credential refuses an attempt whose deadline has passed.
+const DEADLINE_AT = Date.now() + 60 * 60_000;
 
-let dbPath: string;
 let dedup: typeof DedupModule;
 let log: typeof LogModule;
 let dispatchAdmission: typeof DispatchAdmissionModule;
@@ -72,35 +73,27 @@ let commentGapfillQueue: typeof CommentGapfillQueueModule;
 let reviewFixEvidence: typeof ReviewFixEvidenceModule;
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(
-    os.tmpdir(),
-    `runner-callback-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-  );
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  log = await import("../log.js");
-  dispatchAdmission = await import("../dispatch-admission.js");
-  runnerTokens = await import("../runner-tokens.js");
-  runnerCallback = await import("../runner-callback.js");
-  stepLog = await import("../step-log.js");
-  reviewStore = await import("../review-ledger-store.js");
-  reviewFixQueue = await import("../review-fix-queue.js");
-  commentGapfillQueue = await import("../comment-gapfill-queue.js");
-  reviewFixEvidence = await import("../review-fix-evidence.js");
-  dedup.getDb();
-  log.initLogTable();
-  stepLog.initStepLogTable();
+  ({
+    dedup, log, dispatchAdmission, runnerTokens, runnerCallback, stepLog,
+    reviewStore, reviewFixQueue, commentGapfillQueue, reviewFixEvidence,
+  } = (await testDb({
+    modules: {
+      dedup: () => import("../dedup.js"),
+      log: () => import("../log.js"),
+      dispatchAdmission: () => import("../dispatch-admission.js"),
+      runnerTokens: () => import("../runner-tokens.js"),
+      runnerCallback: () => import("../runner-callback.js"),
+      stepLog: () => import("../step-log.js"),
+      reviewStore: () => import("../review-ledger-store.js"),
+      reviewFixQueue: () => import("../review-fix-queue.js"),
+      commentGapfillQueue: () => import("../comment-gapfill-queue.js"),
+      reviewFixEvidence: () => import("../review-fix-evidence.js"),
+    },
+  })).modules);
 });
 
 afterEach(() => {
   vi.useRealTimers();
-  dedup.closeDb();
-  try {
-    fs.unlinkSync(dbPath);
-  } catch {
-    /* ignore */
-  }
   vi.restoreAllMocks();
 });
 
@@ -121,7 +114,7 @@ function preparedResultToken(
   const installationId = String(scope.installationId ?? 1);
   const repository = scope.repository ?? "acme/widgets";
   const prNumber = scope.prNumber ?? 42;
-  const deadlineAt = scope.deadlineAt ?? 1_800_000_000_000;
+  const deadlineAt = scope.deadlineAt ?? DEADLINE_AT;
   const issueId = `${repository}#${prNumber}`;
   const existing = db.prepare("SELECT 1 FROM review_fix_attempts WHERE attempt_id = ?").get(attemptId);
   if (!existing) {
@@ -259,14 +252,7 @@ describe("handleRunnerResult — planning", () => {
     const fake = new FakeProvider({
       recordCalls: true,
       initialIssues: [
-        {
-          id: "i",
-          identifier: "i",
-          title: "",
-          description: null,
-          scopeKey: "",
-          nativeStatus: "",
-        },
+        makeIssue({ id: "i" }),
       ],
     });
     const res = await runnerCallback.handleRunnerResult({
@@ -2402,14 +2388,7 @@ describe("handleRunnerResult — body validation", () => {
   it("does NOT consume the token on body-validation failure", async () => {
     const fake = new FakeProvider({
       initialIssues: [
-        {
-          id: "i",
-          identifier: "ENG-1",
-          title: "t",
-          description: null,
-          scopeKey: "ENG",
-          nativeStatus: "Todo (unstarted)",
-        },
+        makeIssue({ id: "i" }),
       ],
       recordCalls: true,
     });
@@ -3770,17 +3749,7 @@ describe("handleRunnerResult — deferred findings (AII-756)", () => {
 // ── AII-777: reviewFix pilot result marker ─────────────────────────────────
 
 describe("handleRunnerResult — reviewFix pilot marker (AII-777)", () => {
-  const validReviewFix: ReviewFixResultMetadataV1 = {
-    version: 1,
-    attemptId: "attempt-1",
-    installationId: 1,
-    repository: "acme/widgets",
-    prNumber: 42,
-    deadlineAt: 1_800_000_000_000,
-    githubRunId: 555,
-    githubRunAttempt: 1,
-    outputCommit: "a".repeat(40),
-  };
+  const validReviewFix = makeReviewFixResult({ repository: "acme/widgets", deadlineAt: DEADLINE_AT });
 
   it("an unrelated unknown top-level field does not reject an old (no-reviewFix) result", async () => {
     const fake = new FakeProvider({ recordCalls: true });
@@ -4258,17 +4227,7 @@ describe("handleRunnerResult — reviewFix pilot marker (AII-777)", () => {
 });
 
 describe("handleRunnerResult — cycle summary durable evidence (AII-801)", () => {
-  const validReviewFix: ReviewFixResultMetadataV1 = {
-    version: 1,
-    attemptId: "attempt-cycles-1",
-    installationId: 1,
-    repository: "acme/widgets",
-    prNumber: 42,
-    deadlineAt: 1_800_000_000_000,
-    githubRunId: 555,
-    githubRunAttempt: 1,
-    outputCommit: "a".repeat(40),
-  };
+  const validReviewFix = makeReviewFixResult({ attemptId: "attempt-cycles-1", repository: "acme/widgets", deadlineAt: DEADLINE_AT });
 
   function baseCycleSummary(overrides: Partial<CycleSummary> = {}): CycleSummary {
     return {
@@ -4504,17 +4463,7 @@ describe("reviewFixResultIntakeResponse (AII-777)", () => {
   it("maps 'stored' to 200 acknowledged, non-retryable", () => {
     const res = runnerCallback.reviewFixResultIntakeResponse({
       status: "stored",
-      result: {
-        version: 1,
-        attemptId: "a",
-        installationId: 1,
-        repository: "o/r",
-        prNumber: 1,
-        deadlineAt: 1,
-        githubRunId: 1,
-        githubRunAttempt: 1,
-        outputCommit: "a".repeat(40),
-      },
+      result: makeReviewFixResult(),
     });
     expect(res).toEqual({ status: 200, body: { acknowledged: true, outcome: "stored", retryable: false } });
   });
