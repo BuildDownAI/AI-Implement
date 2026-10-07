@@ -31,6 +31,7 @@ import { getRunnerMode, resolveExecutionPath, getKgFlyMachineOverride } from "..
 import { mintRunToken } from "../runner-tokens.js";
 import type { JobStatus } from "../log.js";
 import { appendLogIfAbsent, findLogIdByDispatchId, updateJobMachineDetails, updateJobPrUrl, updateJobRunId } from "../log.js";
+import { clearMachineEnv, destroyMachine, getMachine, updateMachineMetadata } from "../fly-machines.js";
 import type { RestateService } from "./endpoint.js";
 import {
   createKgRefreshWorkflow,
@@ -40,7 +41,7 @@ import {
   type KgRefreshStatusResult,
   type KgRefreshWorkflowDependencies,
 } from "./kg-refresh-workflow.js";
-import { createFlyMachineProfile, PERFORMANCE_MIN_MB_PER_CPU } from "./fly-machine-profile.js";
+import { createFlyMachineProfile, type FlyMachineProfileDeps, PERFORMANCE_MIN_MB_PER_CPU } from "./fly-machine-profile.js";
 import { createKgRepo, type KgRepoEnqueueInput, type KgRepoEnqueueResult, type KgRepoPrInput, type KgRepoTriggerResult, type StoredDryRunOutcome } from "./kg-repo.js";
 import type { KgRefreshDefinition, KgRepoDefinition } from "./kg-refresh-types.js";
 import { RESTATE_INGRESS_BASE_URL } from "./server.js";
@@ -402,8 +403,29 @@ export function createProductionKgRefreshServices(
   };
 
   return {
-    services: [createKgRepo({ workflowName: "KgRefresh" }), createFlyMachineProfile(), createKgRefreshWorkflow(deps)],
+    services: [createKgRepo({ workflowName: "KgRefresh" }), createFlyMachineProfile(buildFlyMachineProfileDeps()), createKgRefreshWorkflow(deps)],
     toolDeps,
+  };
+}
+
+/**
+ * Binds the profile object's Fly calls to FLY_SESSIONS_TOKEN + FLY_SESSIONS_APP. When either is unset
+ * the object still registers (boot stays non-fatal) and a handler that needs Fly fails when it runs.
+ */
+export function buildFlyMachineProfileDeps(env: NodeJS.ProcessEnv = process.env): FlyMachineProfileDeps {
+  const token = env.FLY_SESSIONS_TOKEN;
+  const app = env.FLY_SESSIONS_APP;
+  const bound = <A extends unknown[], R>(fn: (token: string, app: string, ...args: A) => Promise<R>) => async (...args: A): Promise<R> => {
+    if (!token || !app) throw new Error("FLY_SESSIONS_TOKEN + FLY_SESSIONS_APP are not configured");
+    return fn(token, app, ...args);
+  };
+  return {
+    fly: {
+      getMachine: bound(getMachine),
+      clearMachineEnv: bound(clearMachineEnv),
+      updateMachineMetadata: bound(updateMachineMetadata),
+      destroyMachine: bound((t, a, id: string) => destroyMachine(t, a, id)),
+    },
   };
 }
 
