@@ -8,6 +8,7 @@ import {
   updateJobStatus,
   type Job,
 } from "./log.js";
+import { redactStepCredentials } from "./pipeline/step-redaction.js";
 import type { Step } from "./pipeline/types.js";
 import type { KgRefreshIngressClient } from "./restate/kg-refresh-production.js";
 import { describeReferenceRepoCause, type ReferenceRepoResult } from "./reference-repos.js";
@@ -1262,7 +1263,17 @@ export async function handleRunnerProgress(
   // kg-refresh progress goes to the KgRefresh workflow as a heartbeat (AII-899), not to the job row.
   if (verified.claims.phase === "kg-refresh") {
     if (!input.kgRefreshClient) return bad(503, "kg_refresh_unavailable");
-    const progressed = await input.kgRefreshClient.progress(verified.claims.dispatchId);
+    // A step body is optional: an old runner image sends `{}`, which stays a bare heartbeat. The ingress
+    // journals what it is sent, so the step is redacted here, before the call.
+    let step: Step | undefined;
+    if (input.body && typeof input.body === "object" && "step" in input.body) {
+      const stepOrError = validateStepBody(input.body);
+      if ("status" in stepOrError && "body" in stepOrError) return stepOrError;
+      step = redactStepCredentials(stepOrError as Step);
+    }
+    const progressed = step
+      ? await input.kgRefreshClient.progress(verified.claims.dispatchId, step)
+      : await input.kgRefreshClient.progress(verified.claims.dispatchId);
     if (progressed.status === "unavailable") return bad(503, "kg_refresh_unavailable");
     if (progressed.status === "not-found") return noRefreshInFlight(verified.claims.dispatchId);
     if (progressed.status === "conflict") return bad(409, "conflict");

@@ -1,3 +1,4 @@
+import { redactStepCredentials } from "./step-redaction.js";
 import type { Step, StepReporter } from "./types.js";
 
 export interface StepReport {
@@ -70,7 +71,8 @@ export class TokenStepReporter implements StepReporter {
   async report(step: Step): Promise<void> {
     const url = `${this.callbackUrl.replace(/\/$/, "")}/runner/progress`;
     const attempts = this.retryDelaysMs.length + 1;
-    const body = this.githubRunId === null ? { step } : { step, githubRunId: this.githubRunId };
+    const safeStep = redactStepCredentials(step);
+    const body = this.githubRunId === null ? { step: safeStep } : { step: safeStep, githubRunId: this.githubRunId };
 
     for (let attempt = 1; attempt <= attempts; attempt++) {
       try {

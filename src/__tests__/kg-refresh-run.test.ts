@@ -2404,17 +2404,22 @@ describe("runKgRefresh", () => {
       delete process.env.AI_IMPLEMENT_RUN_CONFIG;
     });
 
-    it("posts one progress signal with the bearer token before the result", async () => {
+    it("posts one { step } body per step report with the bearer token, before the result", async () => {
       process.env.RUN_PROGRESS_TOKEN = "  prog-tok  ";
       const { calls, fetchImpl } = recorder();
       const result = await runKgRefresh({ workspaceDir: tmpDir, stepsOverride: stepsOverride(), fetchImpl });
       expect(result.exitCode).toBe(0);
       const progress = calls.filter((c) => c.kind === "progress");
-      expect(progress).toHaveLength(1);
-      expect(progress[0].url).toBe("http://orch/runner/progress");
-      expect(progress[0].authorization).toBe("Bearer prog-tok");
-      expect(JSON.parse(progress[0].body as string)).toEqual({});
-      expect(calls.findIndex((c) => c.kind === "result")).toBeGreaterThan(calls.findIndex((c) => c.kind === "progress"));
+      expect(progress.length).toBeGreaterThan(1);
+      for (const call of progress) {
+        expect(call.url).toBe("http://orch/runner/progress");
+        expect(call.authorization).toBe("Bearer prog-tok");
+        expect(JSON.parse(call.body as string)).toMatchObject({ step: { id: expect.any(String), status: expect.any(String) } });
+      }
+      const clone = progress.map((c) => (JSON.parse(c.body as string) as { step: { id: string; status: string; outputs: object } }).step).filter((s) => s.id === "clone");
+      expect(clone.map((s) => s.status)).toEqual(["running", "passed"]);
+      expect(JSON.stringify(progress.map((c) => c.body))).not.toContain("githubToken");
+      expect(calls.findIndex((c) => c.kind === "result")).toBeGreaterThan(calls.map((c) => c.kind).lastIndexOf("progress"));
     });
 
     it("sends no progress post without a token", async () => {

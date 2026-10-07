@@ -256,6 +256,8 @@ Restate retries a handler that throws until it succeeds. A tool handler that let
 
 `restate-server` records the bytes of every ingress request and response in its journal, and a journaled value outlives the call. A raw refresh token sent as a handler argument would sit in the journal past its own rotation. The `Operator` object accepts only hashes as input and mints the next raw token inside the exclusive handler (`ctx.rand.uuidv4()`), returning it once; the raw value lives in object state only long enough to answer a concurrent caller inside the grace window (`docs/restate.md` § "The Operator object", ADR 025). Treat the journal as durable, readable storage: a credential has no business in it, which is also why `caller` (an already-verified identity) travels with a tool call instead of the bearer token.
 
+The kg-refresh step bodies are redacted by `redactStepCredentials` (`src/pipeline/step-redaction.ts`) on both sides of the callback: in the runner's `TokenStepReporter` before the body leaves the machine, and in `handleRunnerProgress` before `kgRefreshClient.progress` — a handler-side redaction would be too late, because the ingress has already journaled the request.
+
 ### Never interpolate a caller-supplied segment into an ingress URL
 
 `callTool` builds `orchestratorTools/<name>` and the REST route builds an ingress path from `<name>`; `fetch` normalizes `..` path segments, so an unescaped `..%2FOperator%2F<key>%2Frevoke` reaches a sibling service with no role check. Validate the shape first (`POST /api/tools/<name>` rejects anything outside `^[a-z][a-z0-9_]{0,63}$` with a 404 before the ingress is touched) and `encodeURIComponent` every dynamic segment. AII-712's live gate cleared a whole `Operator` family this way before the fix.
@@ -346,6 +348,8 @@ A workflow that owns a run outside Restate (a GitHub Actions run, a Fly machine)
 | started evidence | workflow promise `progress` | the run executes | one time, by the first proof from any source |
 | stop request | workflow promise `cancel` | an operator or a newer trigger stops the run | one time |
 | tick | durable timer (`ctx.sleep`) | time for the next status read or a deadline check | each interval |
+
+Step promises (`step:<id>:running`, `step:<id>:ended`) are evidence for `status`, never wait signals: the wait still ends on `report`, `cancel`, or a deadline (ADR 034).
 
 Two durable deadlines, both computed from the journaled dispatch time: the bootstrap deadline (10 minutes) to the started evidence, and the total deadline (4 hours) to the result. At a deadline the workflow first peeks at the promises, so a signal that arrived at the same moment wins. A timeout cancels the run on its backend.
 
