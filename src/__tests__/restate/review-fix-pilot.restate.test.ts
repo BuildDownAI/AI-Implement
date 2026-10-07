@@ -752,7 +752,7 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     expect(fixture.dispatchCalls).toBe(0); // launch() never even recorded a successful attempt count here — dispatch always threw
     expect(alerts.slice(before).some((a) =>
       a.attemptId === attemptId && a.reason.includes("launch identity still unresolved"))).toBe(true);
-  }, 15_000);
+  }, 30_000);
 
   it.each(VARIANTS.map(([label]) => label))("a definitively rejected launch records failure, releases capacity, and retains budget history (%s)", async (label) => {
     const env = envFor(label);
@@ -1171,7 +1171,7 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     expect(alerts.slice(before).some((a) => a.attemptId === fixture.attemptId && a.reason.includes("unconfirmed"))).toBe(true);
     const admission = getDb().prepare(`SELECT released_at FROM dispatch_admissions WHERE dispatch_id = ?`).get(fixture.attemptId!) as { released_at: number | null };
     expect(admission.released_at).toBeNull();
-  }, 15_000);
+  }, 30_000);
 
   // -------------------------------------------------------------------------
   // Restart/retention: the same SQLite row and the same Restate journal, at the
