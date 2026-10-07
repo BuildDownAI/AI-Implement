@@ -127,6 +127,79 @@ describe("preflightStep", () => {
     expect(typeof outputs.testsRun).toBe("number");
   });
 
+  it("captures output larger than 1 MiB from a passing test script", async () => {
+    vi.mocked(fs.existsSync).mockImplementation((p) => String(p).endsWith("package.json"));
+    vi.mocked(fs.readFileSync).mockReturnValue(JSON.stringify({ scripts: { test: "vitest" } }));
+    const big = "x".repeat(2 * 1024 * 1024);
+    vi.mocked(execSync).mockImplementation((_cmd, opts) => {
+      const max = (opts as { maxBuffer?: number }).maxBuffer ?? 1024 * 1024;
+      if (big.length > max) {
+        throw Object.assign(new Error("spawnSync /bin/sh ENOBUFS"), { code: "ENOBUFS" });
+      }
+      return Buffer.from(big);
+    });
+
+    const outputs = await preflightStep.run(
+      makeContext(),
+      { workspaceDir: "/tmp/test" },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.passed).toBe(true);
+    expect(outputs.summary).toBe("tests: passed (0 assertions)");
+    expect(outputs.testOutput.length).toBeGreaterThan(2 * 1024 * 1024);
+  });
+
+  it("names the exit code and keeps stdout and stderr when tests fail", async () => {
+    vi.mocked(fs.existsSync).mockImplementation((p) => String(p).endsWith("package.json"));
+    vi.mocked(fs.readFileSync).mockReturnValue(JSON.stringify({ scripts: { test: "vitest" } }));
+    vi.mocked(execSync).mockImplementation(() => {
+      throw Object.assign(new Error("Command failed"), {
+        status: 1,
+        stdout: Buffer.from("FAIL some test\n"),
+        stderr: Buffer.from("boom on stderr\n"),
+      });
+    });
+
+    const outputs = await preflightStep.run(
+      makeContext(),
+      { workspaceDir: "/tmp/test" },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.passed).toBe(false);
+    expect(outputs.summary).toBe("tests: failed (exit 1)");
+    expect(outputs.testOutput).toContain("FAIL some test");
+    expect(outputs.testOutput).toContain("boom on stderr");
+    expect(outputs.testOutput.trimEnd().endsWith("[exit 1]")).toBe(true);
+  });
+
+  it("names ENOBUFS when the buffer is still exceeded, and the exit code for typecheck", async () => {
+    vi.mocked(fs.existsSync).mockImplementation((p) => String(p).endsWith("package.json"));
+    vi.mocked(fs.readFileSync).mockReturnValue(JSON.stringify({ scripts: { test: "vitest" } }));
+    vi.mocked(execSync).mockImplementation(() => {
+      throw Object.assign(new Error("spawnSync /bin/sh ENOBUFS"), { code: "ENOBUFS" });
+    });
+    let outputs = await preflightStep.run(
+      makeContext(),
+      { workspaceDir: "/tmp/test" },
+      new NoopStepReporter(),
+    );
+    expect(outputs.summary).toBe("tests: failed (ENOBUFS: output over 64 MiB)");
+    expect(outputs.testOutput.trimEnd().endsWith("[ENOBUFS]")).toBe(true);
+
+    vi.mocked(fs.readFileSync).mockReturnValue(JSON.stringify({ scripts: { typecheck: "tsc" } }));
+    vi.mocked(execSync).mockImplementation(() => {
+      throw Object.assign(new Error("Command failed"), { status: 2 });
+    });
+    outputs = await preflightStep.run(
+      makeContext(),
+      { workspaceDir: "/tmp/test" },
+      new NoopStepReporter(),
+    );
+    expect(outputs.summary).toBe("typecheck: failed (exit 2)");
+  });
+
   it("does not pass model credentials to preflight command environment", async () => {
     vi.stubEnv("ANTHROPIC_API_KEY", "sentinel-a");
     vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "sentinel-b");
