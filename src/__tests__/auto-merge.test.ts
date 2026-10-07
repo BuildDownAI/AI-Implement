@@ -1,11 +1,12 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import os from "node:os";
+import { describe, it, expect, vi, beforeEach } from "vitest";
 import path from "node:path";
 import fs from "node:fs";
 import type * as DedupModule from "../dedup.js";
 import type * as LogModule from "../log.js";
 import type * as AutoMergeModule from "../auto-merge.js";
 import type { RepoMapping } from "../config.js";
+import { makeMapping } from "./helpers/builders.js";
+import { testDb } from "./helpers/test-db.js";
 
 vi.mock("../github-app-auth.js", () => ({
   getInstallationToken: vi.fn(async () => "tok"),
@@ -25,25 +26,21 @@ vi.mock("../comment-gapfill-queue.js", () => ({
 import { listOpenPullRequests, getCombinedChecksState, hasChangesRequestedReview, mergePullRequest } from "../github.js";
 import { hasPendingConflictResolution, countConflictAttempts, enqueueConflictResolution } from "../comment-gapfill-queue.js";
 
-// Dynamic imports so auto-merge shares the same DB instance as the test (follows runner-callback.test.ts pattern)
-let dbPath: string;
 let dedup: typeof DedupModule;
 let log: typeof LogModule;
 let autoMerge: typeof AutoMergeModule;
 
 beforeEach(async () => {
   vi.clearAllMocks();
-  vi.resetModules();
-  dbPath = path.join(
-    os.tmpdir(),
-    `auto-merge-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-  );
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  log = await import("../log.js");
-  autoMerge = await import("../auto-merge.js");
-  dedup.getDb();
-  log.initLogTable();
+  ({ dedup, log, autoMerge } = (
+    await testDb({
+      modules: {
+        dedup: () => import("../dedup.js"),
+        log: () => import("../log.js"),
+        autoMerge: () => import("../auto-merge.js"),
+      },
+    })
+  ).modules);
 
   vi.mocked(listOpenPullRequests).mockResolvedValue([]);
   vi.mocked(getCombinedChecksState).mockResolvedValue("success");
@@ -54,23 +51,8 @@ beforeEach(async () => {
   vi.mocked(enqueueConflictResolution).mockReturnValue(1);
 });
 
-afterEach(() => {
-  dedup.closeDb();
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
-});
-
-function mapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
-  return {
-    owner: "BuildDownAI", repo: "AI-Implement", workflowFile: "claude-implement.yml",
-    defaultBranch: "main", maxInProgressAiIssues: 3, executionMode: "github-actions",
-    sessionMode: "autonomous", machineCpus: 2, machineMemoryMb: 4096, planningEnabled: false,
-    planningWorkflowFile: "", autoApprovePlans: true, extraEnv: {}, provider: "anthropic",
-    ticketingProvider: "linear", ticketingConfig: { kind: "linear" }, awsRegion: null, paused: false,
-    autoMerge: true, maxTurns: null, maxIterations: null, maxJobMinutes: null,
-    branchPrefix: null, skillsRepo: null,
-    ...overrides,
-  };
-}
+const mapping = (overrides: Partial<RepoMapping> = {}) =>
+  makeMapping({ owner: "BuildDownAI", repo: "AI-Implement", autoMerge: true, ...overrides });
 
 const deps = () => ({
   githubAppId: "1",

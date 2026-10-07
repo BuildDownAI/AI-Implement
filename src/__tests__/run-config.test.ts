@@ -8,7 +8,8 @@ import {
   type TaskDocumentParams,
 } from "../run-config.js";
 import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
-import type { RepoMapping, ReviewerSelection } from "../config.js";
+import type { ReviewerSelection } from "../config.js";
+import { makeMapping } from "./helpers/builders.js";
 
 const full: RunConfigV1 = {
   v: 1,
@@ -259,47 +260,6 @@ describe("run-config envelope", () => {
     }
   });
 });
-
-function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
-  const base: RepoMapping = {
-    owner: "test-org",
-    repo: "test-repo",
-    workflowFile: "claude-implement.yml",
-    defaultBranch: "main",
-    maxInProgressAiIssues: 3,
-    executionMode: "fly-machines",
-    sessionMode: "autonomous",
-    machineCpus: 2,
-    machineMemoryMb: 4096,
-    planningEnabled: false,
-    planningWorkflowFile: "",
-    autoApprovePlans: true,
-    extraEnv: {},
-    provider: "anthropic",
-    ticketingProvider: "linear",
-    ticketingConfig: { kind: "linear" },
-    awsRegion: null,
-    paused: false,
-    maxTurns: null,
-    maxIterations: null,
-    maxJobMinutes: null,
-    branchPrefix: null,
-    skillsRepo: null,
-    referenceRepos: null,
-    sensitiveAddPatterns: null,
-    sensitiveAllowPatterns: null,
-    autoMerge: false,
-    dependencyTokenScope: null,
-    memoryProviderId: null,
-    reviewers: null,
-  };
-  return {
-    ...base,
-    ...overrides,
-    referenceRepos: overrides.referenceRepos === undefined ? base.referenceRepos : overrides.referenceRepos,
-    reviewers: overrides.reviewers === undefined ? base.reviewers : overrides.reviewers,
-  };
-}
 
 const implBaseIssue = {
   id: "issue-uuid",

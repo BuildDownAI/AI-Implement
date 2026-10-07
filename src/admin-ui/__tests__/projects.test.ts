@@ -1,27 +1,8 @@
 import { JSDOM } from "jsdom";
 import { describe, expect, it } from "vitest";
 import { projectsHtml, projectsScript } from "../pages/projects.js";
-
-type Mapping = Record<string, unknown>;
-
-const baseMapping = (overrides: Mapping = {}): Mapping => ({
-  owner: "BuildDownAI",
-  repo: "AI-Implement",
-  workflowFile: "claude-implement.yml",
-  defaultBranch: "main",
-  maxInProgressAiIssues: 3,
-  executionMode: "github-actions",
-  sessionMode: "autonomous",
-  machineCpus: 2,
-  machineMemoryMb: 4096,
-  planningEnabled: false,
-  autoApprovePlans: true,
-  autoMerge: false,
-  provider: "anthropic",
-  ticketingProvider: "linear",
-  ticketingConfig: { kind: "linear" },
-  ...overrides,
-});
+import type { RepoMapping } from "../../config.js";
+import { makeMapping } from "../../__tests__/helpers/builders.js";
 
 function escapeText(value: unknown): string {
   return String(value == null ? "" : value)
@@ -36,7 +17,7 @@ function escapeAttr(value: unknown): string {
     .replace(/'/g, "&#x27;");
 }
 
-function mountProjects(mapping: Mapping = baseMapping()): {
+function mountProjects(mapping: RepoMapping = makeMapping()): {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   win: any;
   doc: Document;
@@ -98,7 +79,7 @@ describe("projects page reviewer control", () => {
   });
 
   it("shows the built-in default for a null value and saves null when untouched", async () => {
-    const { win, doc, posts } = mountProjects(baseMapping({ reviewers: null }));
+    const { win, doc, posts } = mountProjects(makeMapping({ reviewers: null }));
     await win.loadMappings();
     win.openMappingDialog("AII");
 
@@ -116,7 +97,7 @@ describe("projects page reviewer control", () => {
   });
 
   it("preserves an explicit empty reviewer list on an unrelated save", async () => {
-    const { win, doc, posts } = mountProjects(baseMapping({ reviewers: [] }));
+    const { win, doc, posts } = mountProjects(makeMapping({ reviewers: [] }));
     await win.loadMappings();
     win.openMappingDialog("AII");
 
@@ -129,7 +110,7 @@ describe("projects page reviewer control", () => {
   });
 
   it("can turn one reviewer off and let another run without gating", async () => {
-    const { win, doc, posts } = mountProjects(baseMapping({ reviewers: null }));
+    const { win, doc, posts } = mountProjects(makeMapping({ reviewers: null }));
     await win.loadMappings();
     win.openMappingDialog("AII");
 
@@ -146,7 +127,7 @@ describe("projects page reviewer control", () => {
   });
 
   it("round-trips reviewer maxTurns and omits blank inherited caps", async () => {
-    const { win, doc, posts } = mountProjects(baseMapping({
+    const { win, doc, posts } = mountProjects(makeMapping({
       reviewers: [
         { id: "gap-analysis", gates: true, maxTurns: 45 },
         { id: "code-review", gates: false },
@@ -175,7 +156,7 @@ describe("projects page reviewer control", () => {
   });
 
   it("blocks reviewer maxTurns outside 1 through 200 before posting", async () => {
-    const { win, doc, posts } = mountProjects(baseMapping({ reviewers: null }));
+    const { win, doc, posts } = mountProjects(makeMapping({ reviewers: null }));
     await win.loadMappings();
     win.openMappingDialog("AII");
 
@@ -190,7 +171,7 @@ describe("projects page reviewer control", () => {
 
   it("adds custom reviewer ids and escapes them as text rather than markup", async () => {
     const dangerousId = 'repo-review"><script>alert(1)</script>';
-    const { win, doc, posts } = mountProjects(baseMapping({ reviewers: null }));
+    const { win, doc, posts } = mountProjects(makeMapping({ reviewers: null }));
     await win.loadMappings();
     win.openMappingDialog("AII");
 
@@ -214,7 +195,7 @@ describe("projects page reviewer control", () => {
 
   it("loads and preserves a stored custom selection when nothing else changes", async () => {
     const custom = 'custom "quoted" reviewer';
-    const { win, doc, posts } = mountProjects(baseMapping({
+    const { win, doc, posts } = mountProjects(makeMapping({
       reviewers: [{ id: custom, gates: false, maxTurns: 33 }],
     }));
     await win.loadMappings();
@@ -242,19 +223,19 @@ describe("projects page PR dispatch budget field", () => {
   });
 
   it("loads the stored budget, and leaves it blank when null", async () => {
-    const { win, doc } = mountProjects(baseMapping({ prDispatchBudget: 6 }));
+    const { win, doc } = mountProjects(makeMapping({ prDispatchBudget: 6 }));
     await win.loadMappings();
     win.openMappingDialog("AII");
     expect((doc.getElementById("md-pr-budget") as HTMLInputElement).value).toBe("6");
 
-    const { win: win2, doc: doc2 } = mountProjects(baseMapping({ prDispatchBudget: null }));
+    const { win: win2, doc: doc2 } = mountProjects(makeMapping({ prDispatchBudget: null }));
     await win2.loadMappings();
     win2.openMappingDialog("AII");
     expect((doc2.getElementById("md-pr-budget") as HTMLInputElement).value).toBe("");
   });
 
   it("saves a changed value as a number and a blank as null", async () => {
-    const { win, doc, posts } = mountProjects(baseMapping({ prDispatchBudget: null }));
+    const { win, doc, posts } = mountProjects(makeMapping({ prDispatchBudget: null }));
     await win.loadMappings();
     win.openMappingDialog("AII");
 
@@ -271,7 +252,7 @@ describe("projects page PR dispatch budget field", () => {
   it("validates the field like the other caps, via CAP_FIELDS", async () => {
     expect(projectsScript).toContain("['PR Dispatch Budget', 'prDispatchBudget']");
 
-    const { win, doc, posts } = mountProjects(baseMapping({ prDispatchBudget: null }));
+    const { win, doc, posts } = mountProjects(makeMapping({ prDispatchBudget: null }));
     await win.loadMappings();
     win.openMappingDialog("AII");
 
@@ -292,7 +273,7 @@ describe("projects page review-fix lifecycle field", () => {
   });
 
   it("defaults a new mapping's visual selection to Legacy when the field is absent", async () => {
-    const { win, doc } = mountProjects(baseMapping());
+    const { win, doc } = mountProjects(makeMapping());
     await win.loadMappings();
     win.openMappingDialog("AII");
 
@@ -300,7 +281,7 @@ describe("projects page review-fix lifecycle field", () => {
   });
 
   it("loads an existing Restate selection as-is regardless of the default", async () => {
-    const { win, doc } = mountProjects(baseMapping({ reviewFixLifecycle: "restate" }));
+    const { win, doc } = mountProjects(makeMapping({ reviewFixLifecycle: "restate" }));
     await win.loadMappings();
     win.openMappingDialog("AII");
 
@@ -308,7 +289,7 @@ describe("projects page review-fix lifecycle field", () => {
   });
 
   it("round-trips a changed selection through save and reload", async () => {
-    const mapping = baseMapping({ reviewFixLifecycle: "legacy" });
+    const mapping = makeMapping({ reviewFixLifecycle: "legacy" });
     const { win, doc, posts } = mountProjects(mapping);
     await win.loadMappings();
     win.openMappingDialog("AII");
@@ -325,7 +306,7 @@ describe("projects page review-fix lifecycle field", () => {
   });
 
   it("leaves a rejected enable visibly unsaved with the backend's cause, and issues no other call", async () => {
-    const { win, doc, posts } = mountProjects(baseMapping({ reviewFixLifecycle: "legacy" }));
+    const { win, doc, posts } = mountProjects(makeMapping({ reviewFixLifecycle: "legacy" }));
     await win.loadMappings();
     win.openMappingDialog("AII");
 
@@ -361,7 +342,7 @@ describe("projects page review-fix lifecycle field", () => {
   });
 
   it("recovers from a rejected save request (network failure) without leaving the button stuck", async () => {
-    const { win, doc, posts } = mountProjects(baseMapping({ reviewFixLifecycle: "legacy" }));
+    const { win, doc, posts } = mountProjects(makeMapping({ reviewFixLifecycle: "legacy" }));
     await win.loadMappings();
     win.openMappingDialog("AII");
 
@@ -404,7 +385,7 @@ describe("projects page review-fix lifecycle field", () => {
   });
 
   it("renders a distinct cause for an unsupported execution mode vs. an unavailable registration", async () => {
-    const { win, doc, posts } = mountProjects(baseMapping({ reviewFixLifecycle: "legacy", executionMode: "fly-machines" }));
+    const { win, doc, posts } = mountProjects(makeMapping({ reviewFixLifecycle: "legacy", executionMode: "fly-machines" }));
     await win.loadMappings();
     win.openMappingDialog("AII");
 

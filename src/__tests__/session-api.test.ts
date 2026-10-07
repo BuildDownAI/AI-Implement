@@ -1,52 +1,16 @@
 import { EventEmitter } from "node:events";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as SessionApiModule from "../session-api.js";
 import type * as LogModule from "../log.js";
-import type * as DedupModule from "../dedup.js";
+import type * as StepLogModule from "../step-log.js";
+import { makeMapping, makeRegistry } from "./helpers/builders.js";
+import { testDb } from "./helpers/test-db.js";
 
 vi.mock("../status-events.js", () => ({
   postStatusComment: vi.fn(),
 }));
 
-import { FakeProvider } from "./providers/fake.js";
-import type { ProviderRegistry } from "../providers/registry.js";
-import type { RepoMapping } from "../config.js";
-
-function makeFakeRegistry(): ProviderRegistry {
-  const fake = new FakeProvider();
-  return {
-    forMapping: async () => fake,
-    forAllMappings: async () => [fake],
-    invalidate: () => {},
-  } as unknown as ProviderRegistry;
-}
-
-function makeMappingsFn(teamKey: string): () => Record<string, RepoMapping> {
-  const mapping = {
-    owner: "acme",
-    repo: "repo",
-    workflowFile: "claude-implement.yml",
-    defaultBranch: "main",
-    maxInProgressAiIssues: 3,
-    executionMode: "fly-machines" as const,
-    sessionMode: "autonomous" as const,
-    machineCpus: 1,
-    machineMemoryMb: 512,
-    planningEnabled: false,
-    planningWorkflowFile: "",
-    autoApprovePlans: true,
-    extraEnv: {},
-    provider: "anthropic" as const,
-    ticketingProvider: "linear" as const,
-    ticketingConfig: { kind: "linear" as const },
-    awsRegion: null,
-    paused: false,
-  };
-  return () => ({ [teamKey]: mapping });
-}
+const mappingsFor = (teamKey: string) => () => ({ [teamKey]: makeMapping() });
 
 class MockRequest extends EventEmitter {
   url?: string;
@@ -84,28 +48,26 @@ class MockResponse {
   }
 }
 
-let dbPath: string;
 let sessionApi: typeof SessionApiModule;
 let log: typeof LogModule;
-let dedup: typeof DedupModule;
+let stepLog: typeof StepLogModule;
 let mockPostStatusComment: ReturnType<typeof vi.fn>;
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(os.tmpdir(), `session-api-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  log = await import("../log.js");
-  sessionApi = await import("../session-api.js");
-  const statusEvents = await import("../status-events.js");
-  mockPostStatusComment = vi.mocked(statusEvents.postStatusComment);
-  log.initLogTable();
+  const { modules } = await testDb({
+    modules: {
+      log: () => import("../log.js"),
+      stepLog: () => import("../step-log.js"),
+      sessionApi: () => import("../session-api.js"),
+      statusEvents: () => import("../status-events.js"),
+    },
+  });
+  ({ log, stepLog, sessionApi } = modules);
+  mockPostStatusComment = vi.mocked(modules.statusEvents.postStatusComment);
 });
 
 afterEach(() => {
   vi.restoreAllMocks();
-  dedup.closeDb();
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
 });
 
 async function callStatusEndpoint(
@@ -114,7 +76,7 @@ async function callStatusEndpoint(
 ): Promise<{ statusCode: number; body: string }> {
   const req = new MockRequest("/api/status", "POST", {}, JSON.stringify(body));
   const res = new MockResponse();
-  sessionApi.handleStatusUpdate(req as never, res as never, makeFakeRegistry(), makeMappingsFn("ENG"), flyAppName);
+  sessionApi.handleStatusUpdate(req as never, res as never, makeRegistry(), mappingsFor("ENG"), flyAppName);
   await res.done;
   return { statusCode: res.statusCode, body: res.body };
 }
@@ -124,7 +86,7 @@ describe("handleStatusUpdate", () => {
     it("returns 400 for invalid JSON", async () => {
       const req = new MockRequest("/api/status", "POST", {}, "not-json");
       const res = new MockResponse();
-      sessionApi.handleStatusUpdate(req as never, res as never, makeFakeRegistry(), makeMappingsFn("ENG"));
+      sessionApi.handleStatusUpdate(req as never, res as never, makeRegistry(), mappingsFor("ENG"));
       await res.done;
       expect(res.statusCode).toBe(400);
       expect(JSON.parse(res.body).error).toContain("Invalid JSON");
@@ -317,10 +279,7 @@ function validStep() {
 describe("handleStepReport", () => {
   let reportJobNonce: string;
 
-  beforeEach(async () => {
-    const stepLog = await import("../step-log.js");
-    stepLog.initStepLogTable();
-
+  beforeEach(() => {
     reportJobNonce = `report-nonce-${Math.random().toString(36).slice(2)}`;
     log.appendLog({
       issueId: "issue-300",
@@ -395,7 +354,6 @@ describe("handleStepReport", () => {
       expect(res.statusCode).toBe(200);
       expect(JSON.parse(res.body).ok).toBe(true);
 
-      const stepLog = await import("../step-log.js");
       const job = log.getJobByNonce(reportJobNonce)!;
       const records = stepLog.getStepsByJobId(job.id);
       expect(records).toHaveLength(1);
@@ -404,7 +362,6 @@ describe("handleStepReport", () => {
     });
 
     it("updates an existing step record on conflict (running → passed)", async () => {
-      const stepLog = await import("../step-log.js");
       const job = log.getJobByNonce(reportJobNonce)!;
 
       // First report: running

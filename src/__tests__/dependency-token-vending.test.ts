@@ -1,11 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import os from "node:os";
-import path from "node:path";
-import fs from "node:fs";
-import type * as DedupModule from "../dedup.js";
 import type * as RunnerTokensModule from "../runner-tokens.js";
 import type * as DepTokenModule from "../dependency-token-vending.js";
 import type { RepoMapping } from "../config.js";
+import { makeMapping } from "./helpers/builders.js";
+import { testDb } from "./helpers/test-db.js";
 
 vi.mock("../github-app-auth.js", () => ({
   getScopedInstallationToken: vi.fn(),
@@ -14,65 +12,28 @@ vi.mock("../github-app-auth.js", () => ({
 
 const SECRET = "test-secret-with-enough-entropy-for-hmac";
 
-let dbPath: string;
-let dedup: typeof DedupModule;
 let runnerTokens: typeof RunnerTokensModule;
 let depToken: typeof DepTokenModule;
 let mockGetScopedToken: ReturnType<typeof vi.fn>;
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(
-    os.tmpdir(),
-    `dep-token-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-  );
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  runnerTokens = await import("../runner-tokens.js");
-  depToken = await import("../dependency-token-vending.js");
-  const ghAuth = await import("../github-app-auth.js");
-  mockGetScopedToken = vi.mocked(ghAuth.getScopedInstallationToken);
-  dedup.getDb();
+  const { modules } = await testDb({
+    modules: {
+      runnerTokens: () => import("../runner-tokens.js"),
+      depToken: () => import("../dependency-token-vending.js"),
+      ghAuth: () => import("../github-app-auth.js"),
+    },
+  });
+  ({ runnerTokens, depToken } = modules);
+  mockGetScopedToken = vi.mocked(modules.ghAuth.getScopedInstallationToken);
 });
 
 afterEach(() => {
-  dedup.closeDb();
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
   vi.restoreAllMocks();
 });
 
-function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
-  return {
-    owner: "acme",
-    repo: "acme/app",
-    workflowFile: "claude-implement.yml",
-    defaultBranch: "main",
-    maxInProgressAiIssues: 3,
-    executionMode: "github-actions",
-    sessionMode: "autonomous",
-    machineCpus: 2,
-    machineMemoryMb: 4096,
-    planningEnabled: true,
-    planningWorkflowFile: "claude-plan.yml",
-    autoApprovePlans: true,
-    autoMerge: false,
-    extraEnv: {},
-    provider: "anthropic",
-    ticketingProvider: "linear",
-    ticketingConfig: { kind: "linear" },
-    awsRegion: null,
-    paused: false,
-    maxTurns: null,
-    maxIterations: null,
-    maxJobMinutes: null,
-    branchPrefix: null,
-    skillsRepo: null,
-    sensitiveAddPatterns: null,
-    sensitiveAllowPatterns: null,
-    dependencyTokenScope: "installation",
-    ...overrides,
-  };
-}
+const mapping = (overrides: Partial<RepoMapping> = {}) =>
+  makeMapping({ owner: "acme", dependencyTokenScope: "installation", ...overrides });
 
 function mintProgressToken(mappingTeamKey = "ENG"): string {
   const { token } = runnerTokens.mintRunToken({
@@ -107,7 +68,7 @@ async function callHandler(opts: {
     secret: SECRET,
     githubAppId: "app-id",
     githubAppPrivateKey: "fake-key",
-    resolveMapping: opts.resolveMapping ?? (() => makeMapping()),
+    resolveMapping: opts.resolveMapping ?? (() => mapping()),
   });
 }
 
@@ -146,7 +107,7 @@ describe("handleDependencyTokenRequest", () => {
 
     await callHandler({
       authorization: `Bearer ${token}`,
-      resolveMapping: () => makeMapping({ owner: "real-owner" }),
+      resolveMapping: () => mapping({ owner: "real-owner" }),
     });
 
     expect(mockGetScopedToken).toHaveBeenCalledWith(
@@ -249,7 +210,7 @@ describe("handleDependencyTokenRequest", () => {
 
     const result = await callHandler({
       authorization: `Bearer ${token}`,
-      resolveMapping: () => makeMapping({ dependencyTokenScope: null }),
+      resolveMapping: () => mapping({ dependencyTokenScope: null }),
     });
 
     expect(result.status).toBe(403);
@@ -275,7 +236,7 @@ describe("handleDependencyTokenRequest", () => {
       callHandler({ authorization: "Bearer bad.token" }),
       callHandler({ authorization: `Bearer ${resultToken}` }),
       callHandler({ authorization: `Bearer ${progressToken}`, resolveMapping: () => undefined }),
-      callHandler({ authorization: `Bearer ${progressToken}`, resolveMapping: () => makeMapping({ dependencyTokenScope: null }) }),
+      callHandler({ authorization: `Bearer ${progressToken}`, resolveMapping: () => mapping({ dependencyTokenScope: null }) }),
     ]);
 
     for (const result of cases) {
@@ -296,7 +257,7 @@ describe("handleDependencyTokenRequest", () => {
     const token = mintProgressToken();
     const result = await callHandler({
       authorization: `Bearer ${token}`,
-      resolveMapping: () => makeMapping({ dependencyTokenScope: null }),
+      resolveMapping: () => mapping({ dependencyTokenScope: null }),
     });
 
     expect(JSON.stringify(result.body)).not.toContain(token);
@@ -309,7 +270,7 @@ describe("handleDependencyTokenRequest", () => {
 
       const result = await callHandler({
         authorization: `Bearer ${token}`,
-        resolveMapping: () => makeMapping({ dependencyTokenScope: "installation" }),
+        resolveMapping: () => mapping({ dependencyTokenScope: "installation" }),
       });
 
       expect(result.status).toBe(200);
@@ -321,7 +282,7 @@ describe("handleDependencyTokenRequest", () => {
 
       const result = await callHandler({
         authorization: `Bearer ${token}`,
-        resolveMapping: () => makeMapping({ dependencyTokenScope: null }),
+        resolveMapping: () => mapping({ dependencyTokenScope: null }),
       });
 
       expect(result.status).toBe(403);
