@@ -91,4 +91,13 @@ describe("FlyMachineProfile", () => {
     expect(await get(label, key)).toEqual({ config: defaults, source: "profile" });
     expect(await set(label, key, { memoryMb: 4096 })).toMatchObject({ config: { memoryMb: 4096 } });
   });
+
+  it.each(labels)("an unknown field is rejected by set and seed, not stripped (%s)", async (label) => {
+    const key = fresh();
+    await expect(seed(label, key, { ...defaults, memoryMB: 4096 })).rejects.toThrow();
+    expect(await get(label, key)).toBeNull();
+    await seed(label, key, defaults);
+    await expect(set(label, key, { memoryMB: 4096 })).rejects.toThrow();
+    expect(await get(label, key)).toEqual({ config: defaults, source: "profile" });
+  });
 });
