@@ -82,7 +82,7 @@ export interface KeptMachineState {
   heldBy: MachineHold | null;
 }
 
-const claimSchema = z.object({ dispatchId: z.string().min(1), attempt: z.number().int().min(1).optional(), replaces: z.string().min(1).optional() }).strict();
+const claimSchema = z.object({ dispatchId: z.string().min(1), attempt: z.number().int().min(1).optional() }).strict();
 const attachSchema = z.object({ dispatchId: z.string().min(1), machineId: z.string().min(1), attempt: z.number().int().min(1).optional(), replaces: z.string().min(1).optional() }).strict();
 const releaseSchema = z.object({ dispatchId: z.string().min(1) }).strict();
 const expireSchema = z.object({ releasedAt: z.number() }).strict();
