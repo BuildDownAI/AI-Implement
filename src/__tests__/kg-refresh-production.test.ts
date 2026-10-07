@@ -614,6 +614,14 @@ describe("seedFlyMachineProfileFromOverride (AII-1130)", () => {
     expect(clearOverride).toHaveBeenCalledTimes(1);
   });
 
+  it("falls back to shared CPUs when performance would be below 2048 MB per CPU", async () => {
+    const sendSeed = vi.fn(async () => {});
+    await seedFlyMachineProfileFromOverride({ getOverride: () => ({ memoryMb: 1024 }), sendSeed, clearOverride: vi.fn() });
+    expect(sendSeed).toHaveBeenCalledWith({ cpuKind: "shared", cpus: 2, memoryMb: 1024, idleTimeoutMs: DAY7 }, "seed:kg-refresh");
+    await seedFlyMachineProfileFromOverride({ getOverride: () => ({ cpus: 8 }), sendSeed, clearOverride: vi.fn() });
+    expect(sendSeed).toHaveBeenLastCalledWith(expect.objectContaining({ cpuKind: "shared", cpus: 8 }), "seed:kg-refresh");
+  });
+
   it("sends nothing with no stored override", async () => {
     const sendSeed = vi.fn(async () => {});
     const clearOverride = vi.fn();
@@ -626,7 +634,7 @@ describe("seedFlyMachineProfileFromOverride (AII-1130)", () => {
     const err = vi.spyOn(console, "error").mockImplementation(() => {});
     const clearOverride = vi.fn();
     await seedFlyMachineProfileFromOverride({
-      getOverride: () => ({ cpus: 4 }), sendSeed: async () => { throw new Error("ingress down"); }, clearOverride,
+      getOverride: () => ({ cpus: 8 }), sendSeed: async () => { throw new Error("ingress down"); }, clearOverride,
     });
     expect(clearOverride).not.toHaveBeenCalled();
     err.mockRestore();

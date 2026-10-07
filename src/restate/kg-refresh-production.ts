@@ -454,12 +454,15 @@ export interface FlyMachineProfileSeedDeps {
 /** The profile a stored `kg_fly_machine_override` becomes: the override merged over the built-in default, `auto` meaning `performance`. */
 export function overrideToProfileConfig(override: KgFlyMachineOverride): FlyMachineProfileConfig {
   const base = FLY_MACHINE_PROFILE_DEFAULTS["kg-refresh"];
-  return {
+  const merged: FlyMachineProfileConfig = {
     ...base,
     ...(override.cpus !== undefined ? { cpus: override.cpus } : {}),
     ...(override.memoryMb !== undefined ? { memoryMb: override.memoryMb } : {}),
     ...(override.cpuKind !== undefined ? { cpuKind: override.cpuKind === "auto" ? "performance" : override.cpuKind } : {}),
   };
+  // The object rejects performance below 2048 MB per CPU; the old dispatch fell back to shared CPUs there.
+  if (merged.cpuKind === "performance" && merged.memoryMb < 2048 * merged.cpus) return { ...merged, cpuKind: "shared" };
+  return merged;
 }
 
 /**
