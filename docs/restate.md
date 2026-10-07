@@ -133,10 +133,10 @@ None of the four is an admin-UI setting — every consumer is a same-machine pee
 
 The admin API is loopback, so `GET /api/restate/journal` reads it for the operator (`src/restate/journal-query.ts`, route in `src/admin.ts`). It reuses `runIntrospectionQuery` and `sqlQuote` from `endpoint.ts` to query `sys_invocation`, `sys_journal` and `sys_promise`. `/query` itself is never exposed: a free SQL endpoint over the introspection tables is a different trust decision.
 
-- **Lookup:** `?service=<name>&key=<key>` (newest invocation by `created_at`) or `?id=<invocation id>`. Each value is 1-128 characters of `[A-Za-z0-9._:-]`, checked by `validateJournalLookup` and then still passed through `sqlQuote`. A bad lookup is a 400 naming the field.
+- **Lookup:** `?service=<name>&key=<key>` (the key's `run` invocation if any, else the newest by `created_at`) or `?id=<invocation id>`. Each value is 1-128 characters of `[A-Za-z0-9._:-]`, checked by `validateJournalLookup` and then still passed through `sqlQuote`. A bad lookup is a 400 naming the field.
 - **Answer:** `{ invocation, entries, promises }`. Entries are trimmed to `index, entryType, name, completed, promiseName, appendedAt, sleepWakeupAt, entry`. `entry` is the parsed `entry_json`, or `null` when it is over 4096 characters or unparseable, so one read stays near 100 KB even with a large `report` body. Promises are scoped by the invocation's own service and key, so the `id` form finds them too; a keyless service has no key (`NULL`), so it has no promise rows and the promises list is empty.
 - **Status codes:** 404 `{ error: "no invocation" }` when nothing matches (rows survive only within the run kind's retention, 7 days today; see "Retention" below), 503 `{ error: "restate unavailable" }` when the admin API call throws.
-- **Access:** an admin, or a user granted the `journal` page (`PAGE_ROUTES.journal`). The page has no UI yet, so it is not in the sidebar.
+- **Access:** an admin, or a user granted the `journal` page (`PAGE_ROUTES.journal`). The Journal page (`/admin#journal`, sidebar entry Journal) and the job drawer's Restate journal section render the endpoint's answer (AII-1135).
 
 ### Sidecar environment is an explicit allowlist, never `...process.env` (AII-728)
 
@@ -444,6 +444,6 @@ The admin UI shows it in two places, both rendered by the drawer's `window.rende
 - **Job drawer, "Restate journal"** — fetched with the job's dispatch id as the key. The service follows the job's phase: `kg-refresh` → `KgRefresh`, `planning` → `PlanningRun`, `implementation` or no dispatch id → no fetch, any other phase → `ReviewFixAttempt`, fetched only when the drawer's attempt read (`/api/review-fix/attempts/<dispatch id>`) just succeeded, so a legacy review-fix job never fetches. A 404 (retention has passed) shows "No journal (retention has passed)"; a 503 shows an "unavailable" alert.
 - **Journal page** (`/admin#journal`) — a form for a journal no drawer row shows. Granting it is a page grant at `/admin#access`.
 
-A lookup by service and key answers the newest invocation for that key, which can be a shared `status` call until AII-1139 lands; the handler name shown next to the status says which invocation it is.
+A lookup by service and key answers the key's `run` invocation when there is one (a workflow) and the newest invocation otherwise (a virtual object); the handler name shown next to the status says which invocation it is.
 
 For Restate's own UI, run `fly proxy 9070:9070 -a <app>` and open `http://127.0.0.1:9070/ui/invocations/<id>`.
