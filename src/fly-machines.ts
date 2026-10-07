@@ -205,14 +205,23 @@ export async function updateMachine(
 /**
  * Reads the machine, then replaces its config with the same one and `env: {}`. Fly's update on a
  * stopped machine applies the config without starting it (AII-1123), so this never calls `start`.
+ * Optional `metadata` is merged into the same update: Fly applies the update after the API
+ * answers, so a separate metadata write afterwards is overwritten by the update's older snapshot.
  */
 export async function clearMachineEnv(
   token: string,
   appName: string,
   machineId: string,
+  metadata?: Record<string, string>,
 ): Promise<void> {
   const machine = await getMachine(token, appName, machineId);
-  await updateMachine(token, appName, machineId, { ...machine.config, env: {} });
+  const config = { ...machine.config, env: {} };
+  await updateMachine(
+    token,
+    appName,
+    machineId,
+    metadata ? { ...config, metadata: { ...machine.config.metadata, ...metadata } } : config,
+  );
 }
 
 /**

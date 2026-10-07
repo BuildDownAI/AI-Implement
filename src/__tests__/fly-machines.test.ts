@@ -1142,6 +1142,32 @@ describe("clearMachineEnv", () => {
     expect(calls.some(([url]) => String(url).endsWith("/start"))).toBe(false);
   });
 
+  it("merges metadata into the one update and never calls the metadata endpoint", async () => {
+    const m = { ...mockMachine, config: { ...mockMachine.config, env: { A: "1" }, metadata: { purpose: "durable-runner", durable_until: "1" } } };
+    vi.mocked(fetch)
+      .mockResolvedValueOnce({ ok: true, json: async () => m } as Response)
+      .mockResolvedValueOnce({ ok: true, json: async () => mockMachine } as Response);
+
+    await clearMachineEnv(TOKEN, APP, "machine-123", { durable_until: "123" });
+
+    const calls = vi.mocked(fetch).mock.calls;
+    expect(calls).toHaveLength(2);
+    expect(calls.some(([url]) => String(url).includes("/metadata"))).toBe(false);
+    expect(JSON.parse((calls[1][1] as RequestInit).body as string)).toEqual({
+      config: { ...m.config, env: {}, metadata: { purpose: "durable-runner", durable_until: "123" } },
+    });
+  });
+
+  it("adds metadata when the machine has none", async () => {
+    const m = { ...mockMachine, config: { ...mockMachine.config, metadata: undefined } };
+    vi.mocked(fetch)
+      .mockResolvedValueOnce({ ok: true, json: async () => m } as Response)
+      .mockResolvedValueOnce({ ok: true, json: async () => mockMachine } as Response);
+    await clearMachineEnv(TOKEN, APP, "m", { durable_until: "5" });
+    const body = JSON.parse((vi.mocked(fetch).mock.calls[1][1] as RequestInit).body as string);
+    expect(body.config.metadata).toEqual({ durable_until: "5" });
+  });
+
   it("throws when the read fails, without posting", async () => {
     vi.mocked(fetch).mockResolvedValueOnce({ ok: false, status: 404, text: async () => "gone" } as Response);
     await expect(clearMachineEnv(TOKEN, APP, "m")).rejects.toThrow("(404)");
