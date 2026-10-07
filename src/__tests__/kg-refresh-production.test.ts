@@ -259,6 +259,33 @@ describe("appendJobLog execution mode", () => {
   });
 });
 
+describe("fly dispatch without a Fly sessions app (AII-1130)", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it.each([
+    ["no app", { flySessionsToken: "fly-token", flySessionsApp: null }],
+    ["no token", { flySessionsToken: null, flySessionsApp: "fly-app" }],
+    ["neither", { flySessionsToken: null, flySessionsApp: null }],
+  ])("rejects without calling the dispatcher (%s)", async (_label, fly) => {
+    resolvedPath.current = "fly-machines";
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    const dispatchKgRefreshRun = vi.fn(async () => ({}));
+    const input = makeInput({ dispatchKgRefreshRun });
+    const result = await createKgRefreshDispatch({ ...input, config: { ...input.config, ...fly } })(dispatchInput);
+    expect(result).toMatchObject({ outcome: "rejected", jobId: null, executionMode: "fly-machines" });
+    expect(dispatchKgRefreshRun).not.toHaveBeenCalled();
+    expect(err).toHaveBeenCalledWith(expect.stringContaining("FLY_SESSIONS_TOKEN + FLY_SESSIONS_APP are not configured"));
+  });
+
+  it("dispatches when both are set", async () => {
+    resolvedPath.current = "fly-machines";
+    const dispatchKgRefreshRun = vi.fn(async () => ({}));
+    const result = await createKgRefreshDispatch(makeInput({ dispatchKgRefreshRun }))(dispatchInput);
+    expect(result.outcome).toBe("accepted");
+    expect(dispatchKgRefreshRun).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("non-GHA dispatch", () => {
   it("passes the workflow's dispatch id through and reports an unknown job id when the backend gave none", async () => {
     resolvedPath.current = "fly-machines";

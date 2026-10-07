@@ -176,8 +176,8 @@ export function findKgMapping(kgSourceRepo: string) {
 }
 
 /** The execution mode a kg-refresh dispatch resolves to: Fly in every runner mode except `local`
- *  (local Docker). Without a Fly sessions app the dispatch step fails with its own "not configured"
- *  error; the GitHub Actions fallback is AII-1110. `createKgRefreshDispatch` acts on it and
+ *  (local Docker). Without a Fly sessions app `createKgRefreshDispatch` rejects with its own "not configured"
+ *  message (the run ends `dispatch_rejected`); the GitHub Actions fallback is AII-1110. `createKgRefreshDispatch` acts on it and
  *  `appendJobLog` records it, so both read one answer. */
 export function resolveKgExecutionMode(): string {
   return getRunnerMode().mode === "local" ? "local-docker" : "fly-machines";
@@ -205,6 +205,11 @@ export function createKgRefreshDispatch(input: KgRefreshProductionInput): (dispa
     const encoded = encodeRunConfig(envelope);
 
     if (executionMode !== GHA_EXECUTION_MODE) {
+      if (executionMode === "fly-machines" && (!config.flySessionsToken || !config.flySessionsApp)) {
+        // A definitive rejection: retrying cannot configure the app, and the workflow ends the run dispatch_rejected.
+        console.error("[kg-refresh] fly-machines execution path selected but FLY_SESSIONS_TOKEN + FLY_SESSIONS_APP are not configured");
+        return { outcome: "rejected", jobId: null, executionMode };
+      }
       const legacy = await input.dispatchKgRefreshRun({
         runToken: tokens.runToken, runProgressToken: tokens.progressToken,
         dispatchId, runConfig: encoded, executionPath: executionMode, machine,
