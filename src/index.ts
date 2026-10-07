@@ -129,7 +129,8 @@ import type { KgRefreshIngressClient } from "./restate/kg-refresh-production.js"
 import { createKgRefreshIngressClient } from "./restate/kg-refresh-production.js";
 import { RestateSidecar } from "./restate/server.js";
 import { startRestateEndpoint, register as registerRestateEndpoint, RESTATE_SERVICES } from "./restate/endpoint.js";
-import { getRestateRetentionDays } from "./restate/retention.js";
+import { getRestateRetentionDays, getVolumeSnapshotRetentionDays } from "./restate/retention.js";
+import { applyVolumeSnapshotRetentionAtBoot } from "./fly-volumes.js";
 import { createProductionReviewFixServices } from "./restate/review-fix-production.js";
 import { kgFlyMachineSizing, createKgFindRunByTitle, createProductionKgRefreshServices, recordKgDispatchDetails } from "./restate/kg-refresh-production.js";
 import { createProductionPlanningRunServices, PLANNING_CONTEXT_BRANCH_KEY, PLANNING_CONTEXT_FIELD_VALUE_KEY } from "./restate/planning-run-production.js";
@@ -137,6 +138,7 @@ import { createPlanningAdmissionTerminationHook, createPlanningRunIngressClient 
 import { setKgRefreshToolDeps } from "./restate/tools.js";
 import type { RestateRegisterOutcome, RestateRegisterResult } from "./restate/endpoint.js";
 import { getRestateStatus, setRestateStatus } from "./restate/status.js";
+import { handleJournalRequest } from "./restate/journal-query.js";
 import type { RestateRegistrationStatus } from "./restate/status.js";
 import { setAdmissionTerminationCheck, setProviderRegistry, setReviewFixAttemptsFacade } from "./restate/tools.js";
 import { callTool, callToolAsSystem } from "./restate/tools-client.js";
@@ -4878,7 +4880,7 @@ function startServer(
         },
         notifyWebhookUrl: config.notifyWebhookUrl,
       }, registry, { startDeploy, selfDeployTarget: config.selfDeployTarget, kgRefresh: kgRefreshAdminDeps, callTool, getRestateStatus,
-        reviewFixAttempts })) return;
+        reviewFixAttempts, readJournal: handleJournalRequest })) return;
     }
 
     res.writeHead(404, { "Content-Type": "application/json" });
@@ -5096,6 +5098,8 @@ async function main(): Promise<void> {
   // services are registered even with every mapping on the Legacy default;
   // selecting Restate later only changes ownership of *new* automatic GHA work.
   console.log(`[restate] retention ${getRestateRetentionDays()} days`);
+  // Fire-and-forget: the helper never throws, and boot must not wait on Fly.
+  void applyVolumeSnapshotRetentionAtBoot(config.flyDeployToken, process.env.FLY_APP_NAME, getVolumeSnapshotRetentionDays);
   const reviewFixServices = createProductionReviewFixServices(config, registry, reviewFixAttemptStore);
   // The KgRepo object and KgRefresh workflow (AII-683). Skipped without KG_SOURCE_REPO: the
   // tool handlers then answer 501 from their unset deps.

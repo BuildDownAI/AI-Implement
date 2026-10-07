@@ -59,7 +59,7 @@ export interface KgRepoDependencies {
 
 export type KgRepoTriggerResult = { triggerId: string } | { status: "refresh-in-progress"; triggerId: string };
 
-export type KgRepoEnqueueResult = { triggerId: string } | { queued: true } | { duplicate: true };
+export type KgRepoEnqueueResult = { triggerId: string } | { queued: true } | { duplicate: true } | { closed: true };
 
 const triggerInputSchema = kgRefreshOptionsSchema.optional();
 
@@ -89,6 +89,7 @@ export type KgRepoRecordOutcomeInput = { report: KgDryRunReportTarget; outcome: 
 export type KgRepoEnqueueInput = z.infer<typeof enqueueInputSchema> & { report: KgDryRunReportTarget };
 
 const outcomeStateKey = (repo: string, prNumber: number): string => `outcome:${repo}#${prNumber}`;
+const closedKey = (repo: string, prNumber: number): string => `${repo}#${prNumber}`;
 const shaStateKey = (repo: string, prNumber: number): string => `sha:${repo}#${prNumber}`;
 
 /** The key of the oldest held entry; insertion order breaks an `enqueuedAt` tie. */
@@ -140,6 +141,11 @@ export function createKgRepo(deps: KgRepoDependencies) {
     const { key, ref, report } = input;
     // The last head sha accepted for this PR: a second event for it (any delivery id) is absorbed here.
     const shaKey = shaStateKey(report.repo, report.prNumber);
+    // A PR already closed (`forgetPr` ran first) must not be held: its branch may be gone by the
+    // time the lease releases. A reopened PR stays closed here until the cap evicts it.
+    if (((await ctx.get<string[]>("closedKeys")) ?? []).includes(closedKey(report.repo, report.prNumber))) {
+      return { closed: true };
+    }
     if ((await ctx.get<string>(shaKey)) === report.sha) return { duplicate: true };
     ctx.set(shaKey, report.sha);
     const now = await ctx.date.now();
@@ -220,6 +226,12 @@ export function createKgRepo(deps: KgRepoDependencies) {
     ctx.clear(shaStateKey(input.repo, input.prNumber));
     const order = (await ctx.get<string[]>("outcomeKeys")) ?? [];
     if (order.includes(stateKey)) ctx.set("outcomeKeys", order.filter((k) => k !== stateKey));
+
+    // Record the closure so an enqueue that lands after this (the `opened` handler awaits GitHub reads first) is refused.
+    const closed = ((await ctx.get<string[]>("closedKeys")) ?? []).filter((k) => k !== closedKey(input.repo, input.prNumber));
+    closed.push(closedKey(input.repo, input.prNumber));
+    while (closed.length > MAX_TRACKED_PRS) closed.shift();
+    ctx.set("closedKeys", closed);
 
     const pending = await ctx.get<Record<string, PendingDryRun>>("pending");
     const pendingKey = `${input.repo}#${input.prNumber}`;

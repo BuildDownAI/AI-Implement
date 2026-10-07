@@ -116,7 +116,7 @@ interface IntrospectionRow {
   [column: string]: unknown;
 }
 
-async function runIntrospectionQuery(
+export async function runIntrospectionQuery(
   fetchImpl: typeof fetch,
   adminBaseUrl: string,
   sql: string,
@@ -137,7 +137,7 @@ async function runIntrospectionQuery(
   return body.rows as IntrospectionRow[];
 }
 
-function sqlQuote(value: string): string {
+export function sqlQuote(value: string): string {
   return value.replace(/'/g, "''");
 }
 

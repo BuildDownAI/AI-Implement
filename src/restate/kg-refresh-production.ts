@@ -26,7 +26,7 @@ import { RUN_TITLE_PREFIX, buildKgRefreshGhaDispatchBody, defaultFetchSignal, po
 import { resolveWorkflowCapabilities } from "../workflow-probe.js";
 import { resolveRunnerImageForDispatch } from "../repo-image.js";
 import { encodeRunConfig, type RunConfigV1 } from "../run-config.js";
-import { stopBackendRun } from "../backend-run.js";
+import { readBackendRun, stopBackendRun } from "../backend-run.js";
 import { getRunnerMode, resolveExecutionPath, getKgFlyMachineOverride } from "../runner-mode.js";
 import { mintRunToken } from "../runner-tokens.js";
 import type { JobStatus } from "../log.js";
@@ -40,6 +40,7 @@ import {
   type KgRefreshStatusResult,
   type KgRefreshWorkflowDependencies,
 } from "./kg-refresh-workflow.js";
+import { createFlyMachineProfile, PERFORMANCE_MIN_MB_PER_CPU } from "./fly-machine-profile.js";
 import { createKgRepo, type KgRepoEnqueueInput, type KgRepoEnqueueResult, type KgRepoPrInput, type KgRepoTriggerResult, type StoredDryRunOutcome } from "./kg-repo.js";
 import type { Step } from "../pipeline/types.js";
 import type { KgRefreshDefinition, KgRepoDefinition } from "./kg-refresh-types.js";
@@ -169,9 +170,6 @@ export interface KgRefreshToolDeps {
 export function findKgMapping(kgSourceRepo: string) {
   return Object.entries(getMappings()).find(([, m]) => `${m.owner}/${m.repo}` === kgSourceRepo);
 }
-
-/** Fly performance machines need at least this much memory per CPU. */
-const PERFORMANCE_MIN_MB_PER_CPU = 2048;
 
 export interface KgFlyMachineSize {
   cpuKind: "shared" | "performance";
@@ -366,6 +364,7 @@ export function createProductionKgRefreshServices(
     getWorkflowRunStatus: input.getWorkflowRunStatus,
     findRunByTitle: input.findRunByTitle,
     cancelWorkflowRun: input.cancelWorkflowRun,
+    readMachineRun: (executionMode, jobId) => readBackendRun(config, executionMode, jobId),
     stopMachineRun: (executionMode, jobId) => stopBackendRun(config, executionMode, jobId),
     persistLastRefresh: input.persistLastRefresh,
     onOutcome: (kind, outcome, meta) => {
@@ -404,7 +403,7 @@ export function createProductionKgRefreshServices(
   };
 
   return {
-    services: [createKgRepo({ workflowName: "KgRefresh" }), createKgRefreshWorkflow(deps)],
+    services: [createKgRepo({ workflowName: "KgRefresh" }), createFlyMachineProfile(), createKgRefreshWorkflow(deps)],
     toolDeps,
   };
 }

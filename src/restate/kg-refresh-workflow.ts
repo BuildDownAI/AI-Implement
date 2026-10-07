@@ -36,6 +36,8 @@ import {
   swapGate,
   verifyGate,
 } from "../kg-refresh-rail.js";
+import type { BackendRunRead } from "../backend-run.js";
+import type { MachineExit } from "../fly-machines.js";
 import { parseKgSourceRepo } from "../deploy.js";
 import type { Step } from "../pipeline/types.js";
 import { KG_REFRESH_RUNNER_STEPS, type KgRepoDefinition } from "./kg-refresh-types.js";
@@ -119,6 +121,23 @@ export interface KgDispatchResult {
 /** What a status read that failed every attempt reports: not completed, not started — no new evidence. */
 const NO_EVIDENCE: { status: string; conclusion: string | null } = { status: "unknown", conclusion: null };
 
+/** What a machine read that failed every attempt reports: no new evidence. */
+const NO_MACHINE_EVIDENCE: BackendRunRead = { state: "unknown", exit: null };
+
+/** The failure detail for a machine that ended with no report. A signal is named as the signal (never
+ *  folded into an exit code); a null exit code and no signal beside an exit event is a clean exit (Fly
+ *  omits it); no event at all names no exit. */
+function describeMachineExit(exit: MachineExit | null): string {
+  const base = "machine stopped with no report";
+  if (!exit || (exit.exitCode === null && exit.signal === null && exit.oomKilled === null && exit.timestamp === null)) return base;
+  const parts: string[] = [];
+  if (exit.exitCode !== null) parts.push(`exit ${exit.exitCode}`);
+  if (exit.signal !== null) parts.push(`signal ${exit.signal}`);
+  if (parts.length === 0) parts.push("exit 0");
+  if (exit.oomKilled) parts.push("oomKilled");
+  return `${base} (${parts.join(", ")})`;
+}
+
 /** Plain functions, every one called inside `ctx.run` — none of them may call `ctx` themselves. */
 export type KgOutcomeKind = "success" | "no-new-data" | "failure";
 export interface KgOutcomeMeta { failureCode?: string; timedOut?: boolean; dispatchId?: string }
@@ -136,6 +155,8 @@ export interface KgRefreshWorkflowDependencies {
   getWorkflowRunStatus(runId: number): Promise<{ status: string; conclusion: string | null }>;
   findRunByTitle(title: string): Promise<{ runId: number } | null>;
   cancelWorkflowRun(runId: number): Promise<boolean>;
+  /** One status read of a non-GitHub-Actions run by its backend id: its state, plus the machine's exit. */
+  readMachineRun(executionMode: string, jobId: string): Promise<BackendRunRead>;
   /** Stops a non-GitHub-Actions run (a Fly machine or a local container) by its backend id. */
   stopMachineRun(executionMode: string, jobId: string): Promise<boolean>;
   persistLastRefresh(outcome: RefreshOutcome): void;
@@ -167,7 +188,7 @@ type WaitOutcome =
   | { kind: "cancel"; reason: string }
   | { kind: "bootstrap_timeout" }
   | { kind: "total_timeout" }
-  | { kind: "dispatch_lost"; conclusion: string | null };
+  | { kind: "dispatch_lost"; conclusion: string | null; exit?: MachineExit | null };
 
 function validKey(key: string, triggerId: unknown): string {
   if (typeof triggerId !== "string" || triggerId !== key) {
@@ -352,6 +373,8 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         let watchIndex = 0;
         let reconcileIndex = 0;
         let lastConclusion: string | null = null;
+        let lastExit: MachineExit | null = null;
+        const machineJobId = !isGha ? dispatchResult.jobId : null;
         // A re-call after a `started` status read must not read again at once: that read just ran.
         let skipNextRead = false;
 
@@ -377,6 +400,17 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           return status.status === "in_progress" ? "started" : "unknown";
         };
 
+        // Fly machine or local container with a known id: one bounded status read per tick.
+        const readMachineStatus = async (): Promise<OwnedRunStatus> => {
+          if (skipNextRead) {
+            skipNextRead = false;
+            return "started";
+          }
+          const read = await readBoundedOwnedRun(ctx, `watch-${watchIndex++}`, () => deps.readMachineRun(dispatchResult.executionMode, machineJobId!), NO_MACHINE_EVIDENCE);
+          if (read.exit) lastExit = read.exit;
+          return read.state;
+        };
+
         for (;;) {
           const event = await awaitOwnedRun(ctx, {
             signals: ["report", "cancel", "progress"],
@@ -386,7 +420,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
             totalDeadlineAt,
             tickMs: watchIntervalMs,
             startedSeen,
-            ...(isGha ? { readStatus } : {}),
+            ...(isGha ? { readStatus } : machineJobId ? { readStatus: readMachineStatus } : {}),
           });
 
           if (event.kind === "bootstrap_timeout" || event.kind === "total_timeout") return { kind: event.kind };
@@ -403,7 +437,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           }
           const reportNow = await ctx.promise<KgRefreshReportBody>("report").peek();
           if (reportNow !== undefined) return { kind: "report", value: reportNow };
-          return { kind: "dispatch_lost", conclusion: lastConclusion };
+          return { kind: "dispatch_lost", conclusion: lastConclusion, exit: lastExit };
         }
       }
 
@@ -434,7 +468,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       if (waitResult.kind === "dispatch_lost") {
         ctx.set("step", "failed");
         const at = await ctx.date.now();
-        const detail = `run concluded ${waitResult.conclusion ?? "unknown"} with no report`;
+        const detail = isGha ? `run concluded ${waitResult.conclusion ?? "unknown"} with no report` : describeMachineExit(waitResult.exit ?? null);
         const outcome = await failurePath(buildFailureOutcome(at, detail), "dispatch_lost");
         return finish(outcome);
       }

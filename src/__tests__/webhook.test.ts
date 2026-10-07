@@ -411,6 +411,43 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
     expect(res.statusCode).toBe(202);
   });
 
+  it("ignores the rail's own kg-refresh/ snapshot PR without fetching files or enqueueing (AII-1107)", async () => {
+    const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } });
+    const kgPrCheck = makeKgPrCheck({ enqueueDryRun });
+    mockPrFiles(["snapshot/parts/doc.nt"]);
+    hoisted.getInstallationToken.mockClear();
+
+    const { req, res } = makeRequest(
+      SECRET,
+      "pull_request",
+      prPayload({ action: "opened", number: 55, ref: "kg-refresh/20261005T142052Z", sha: "sha-55", repo: KG_SOURCE_REPO }),
+    );
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
+    await res.done;
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toContain("rail_snapshot_pr");
+    expect(enqueueDryRun).not.toHaveBeenCalled();
+    expect(hoisted.getInstallationToken).not.toHaveBeenCalled();
+  });
+
+  it("still dispatches a non-rail PR that changes snapshot/** (AII-1107)", async () => {
+    const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } });
+    const kgPrCheck = makeKgPrCheck({ enqueueDryRun });
+    mockPrFiles(["snapshot/parts/doc.nt"]);
+
+    const { req, res } = makeRequest(
+      SECRET,
+      "pull_request",
+      prPayload({ action: "opened", number: 56, ref: "feature/x", sha: "sha-56", repo: KG_SOURCE_REPO }),
+    );
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
+    await res.done;
+
+    expect(enqueueDryRun).toHaveBeenCalledTimes(1);
+    expect(res.statusCode).toBe(202);
+  });
+
   it("dispatches on the base template repo when the head branch matches an upstream-merge pattern, even with no guard-path change", async () => {
     const enqueueDryRun = vi.fn().mockResolvedValue({ status: "accepted", value: { triggerId: "t-1" } });
     const kgPrCheck = makeKgPrCheck({ enqueueDryRun });

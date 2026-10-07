@@ -19,6 +19,7 @@ import { fileURLToPath } from "node:url";
 import * as restate from "@restatedev/restate-sdk";
 import type { RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import type { MachineExit } from "../../fly-machines.js";
 import type { RefreshOutcome } from "../../kg-refresh.js";
 import { RailGateError, type KgRailDeps } from "../../kg-refresh-rail.js";
 import { COMPLETION_MARKER } from "../../kg-sidecar.js";
@@ -396,6 +397,21 @@ describe("KgRefresh durable workflow", () => {
     return true;
   }
 
+  /** Per-trigger `readMachineRun` answers, consumed in order; the last one repeats. */
+  const machineReads = new Map<string, Array<{ state: "ended" | "started" | "unknown"; exit: MachineExit | null }>>();
+  const machineReadCalls: Array<{ executionMode: string; jobId: string }> = [];
+  /** A read for this trigger parks until the promise settles, so a test orders the report before the answer. */
+  const machineReadGates = new Map<string, Promise<void>>();
+
+  async function readMachineRunFn(executionMode: string, jobId: string) {
+    machineReadCalls.push({ executionMode, jobId });
+    const key = jobId.replace(/^job-/, "");
+    await machineReadGates.get(key);
+    const answers = machineReads.get(key) ?? [];
+    const next = answers.length > 1 ? answers.shift()! : answers[0];
+    return next ?? { state: "unknown" as const, exit: null };
+  }
+
   async function cancelWorkflowRunFn(runId: number): Promise<boolean> {
     contractCalls?.push("stop");
     if (cancelTerminalFailure) throw new restate.TerminalError("forced cancel failure");
@@ -428,6 +444,7 @@ describe("KgRefresh durable workflow", () => {
     getWorkflowRunStatus: getWorkflowRunStatusFn,
     findRunByTitle: findRunByTitleFn,
     cancelWorkflowRun: cancelWorkflowRunFn,
+    readMachineRun: readMachineRunFn,
     stopMachineRun: stopMachineRunFn,
     persistLastRefresh: async (outcome) => {
       if (persistHold) {
@@ -1190,7 +1207,7 @@ describe("KgRefresh durable workflow", () => {
     it("every watch-* and reconcile-* step in the workflow source carries a retry bound", () => {
       const source = readFileSync(fileURLToPath(new URL("../../restate/kg-refresh-workflow.ts", import.meta.url)), "utf8");
       const steps = [...source.matchAll(/(ctx\.run|readBoundedOwnedRun)\(\s*(ctx,\s*)?`(watch|reconcile)-/g)];
-      expect(steps.length).toBe(4);
+      expect(steps.length).toBe(5);
       for (const step of steps) expect(step[1]).toBe("readBoundedOwnedRun");
     });
   });
@@ -1247,6 +1264,89 @@ describe("KgRefresh durable workflow", () => {
     const outcome = await runWorkflow(env.baseUrl(), triggerId);
     expect(outcome.ok).toBe(false);
     expect(stopCalls).toEqual([]);
+  }, 15_000);
+
+  // ---- AII-1125: a Fly machine's status read ends a dead run ----
+  it.each(VARIANTS.map(([label]) => label))("AII-1125: a machine that stops with no report ends dispatch_lost naming the exit (%s)", async (label) => {
+    const env = envFor(label);
+    const triggerId = newTriggerId();
+    makeScenario(triggerId, { dispatchOutcome: "accepted", executionMode: "fly-machines" });
+    machineReads.set(triggerId, [
+      { state: "started", exit: null },
+      { state: "ended", exit: { exitCode: 137, signal: 9, oomKilled: true, timestamp: 1 } },
+    ]);
+    const outcome = await runWorkflow(env.baseUrl(), triggerId);
+    expect(outcome.ok).toBe(false);
+    expect(outcome.detail).toBe("machine stopped with no report (exit 137, signal 9, oomKilled)");
+    expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("dispatch_lost");
+    await eventually(() => kgRepoStatus(env.baseUrl()), (marker) => marker === null, { label: "KgRepo marker cleared" });
+  }, 15_000);
+
+  it.each(VARIANTS.map(([label]) => label))("AII-1125: a clean exit with no report ends dispatch_lost naming exit 0 (%s)", async (label) => {
+    const env = envFor(label);
+    const triggerId = newTriggerId();
+    makeScenario(triggerId, { dispatchOutcome: "accepted", executionMode: "fly-machines" });
+    machineReads.set(triggerId, [{ state: "ended", exit: { exitCode: 0, signal: null, oomKilled: false, timestamp: 1 } }]);
+    const outcome = await runWorkflow(env.baseUrl(), triggerId);
+    expect(outcome.ok).toBe(false);
+    expect(outcome.detail).toContain("machine stopped with no report (exit 0)");
+    expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("dispatch_lost");
+  }, 15_000);
+
+  it.each(VARIANTS.map(([label]) => label))("AII-1125: a started read holds off the bootstrap timeout until the machine ends dispatch_lost (%s)", async (label) => {
+    const env = deadlineEnvFor(label);
+    const triggerId = newTriggerId();
+    makeScenario(triggerId, { dispatchOutcome: "accepted", executionMode: "fly-machines" });
+    // Five started reads span more than the 1 s bootstrap deadline (300 ms interval) but not the total.
+    const started = { state: "started" as const, exit: null };
+    machineReads.set(triggerId, [
+      started, started, started, started, started,
+      { state: "ended", exit: { exitCode: 137, signal: 9, oomKilled: true, timestamp: 1 } },
+    ]);
+    const closedBefore = closeRowCalls.length;
+    const outcome = await runWorkflow(env.baseUrl(), triggerId);
+    expect(outcome.ok).toBe(false);
+    expect(outcome.detail).toBe("machine stopped with no report (exit 137, signal 9, oomKilled)");
+    expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("dispatch_lost");
+    expect(closeRowCalls.slice(closedBefore).some((c) => c.conclusion === "bootstrap_timeout")).toBe(false);
+    await eventually(() => kgRepoStatus(env.baseUrl()), (marker) => marker === null, { label: "KgRepo marker cleared" });
+  }, 15_000);
+
+  it.each(VARIANTS.map(([label]) => label))("AII-1125: a null job id makes no readMachineRun call (%s)", async (label) => {
+    const env = deadlineEnvFor(label);
+    const triggerId = newTriggerId();
+    makeScenario(triggerId, { dispatchOutcome: "accepted", executionMode: "fly-machines", jobIdUnknown: true });
+    machineReadCalls.length = 0;
+    const outcome = await runWorkflow(env.baseUrl(), triggerId);
+    expect(outcome.ok).toBe(false);
+    expect(machineReadCalls).toEqual([]);
+  }, 15_000);
+
+  it.each(VARIANTS.map(([label]) => label))("AII-1125: a report delivered before the machine read says ended wins (%s)", async (label) => {
+    const env = envFor(label);
+    const triggerId = newTriggerId();
+    makeScenario(triggerId, { dispatchOutcome: "accepted", executionMode: "fly-machines" });
+    machineReads.set(triggerId, [{ state: "ended", exit: { exitCode: null, signal: null, oomKilled: null, timestamp: 1 } }]);
+    let release!: () => void;
+    machineReadGates.set(triggerId, new Promise<void>((resolve) => { release = resolve; }));
+    const done = runWorkflow(env.baseUrl(), triggerId);
+    await eventually(() => machineReadCalls.some((c) => c.jobId === `job-${triggerId}`), (ok) => ok, { label: "durable effect" });
+    await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+    release();
+    const outcome = await done;
+    expect(outcome.ok).toBe(true);
+  }, 15_000);
+
+  it.each(VARIANTS.map(([label]) => label))("AII-1125: a GitHub Actions dispatch never calls readMachineRun (%s)", async (label) => {
+    const env = envFor(label);
+    const triggerId = newTriggerId();
+    makeScenario(triggerId, {
+      dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "github-actions",
+      runStatusSequence: [{ status: "completed", conclusion: "failure" }],
+    });
+    machineReadCalls.length = 0;
+    await runWorkflow(env.baseUrl(), triggerId);
+    expect(machineReadCalls).toEqual([]);
   }, 15_000);
 
   // ---- W5/W6/W7: GHA vs Fly watch behavior ----
@@ -1313,7 +1413,8 @@ describe("KgRefresh durable workflow", () => {
       getWorkflowRunStatus: getWorkflowRunStatusFn,
       findRunByTitle: findRunByTitleFn,
       cancelWorkflowRun: cancelWorkflowRunFn,
-    stopMachineRun: stopMachineRunFn,
+      readMachineRun: readMachineRunFn,
+      stopMachineRun: stopMachineRunFn,
       persistLastRefresh: (outcome) => { persistCalls.push(outcome); },
       onOutcome: (kind, outcome, meta) => { onOutcomeCalls.push({ kind, outcome, meta }); },
       bootstrapDeadlineMs: scaledTick * 4,
@@ -1440,7 +1541,8 @@ describe("KgRefresh durable workflow", () => {
       getWorkflowRunStatus: getWorkflowRunStatusFn,
       findRunByTitle: findRunByTitleFn,
       cancelWorkflowRun: cancelWorkflowRunFn,
-    stopMachineRun: stopMachineRunFn,
+      readMachineRun: readMachineRunFn,
+      stopMachineRun: stopMachineRunFn,
       persistLastRefresh: (outcome) => { persistCalls.push(outcome); },
       onOutcome: (kind, outcome, meta) => { onOutcomeCalls.push({ kind, outcome, meta }); },
       bootstrapDeadlineMs: 1_000,
@@ -2372,7 +2474,8 @@ describe("KgRefresh durable workflow", () => {
       getWorkflowRunStatus: getWorkflowRunStatusFn,
       findRunByTitle: findRunByTitleFn,
       cancelWorkflowRun: cancelWorkflowRunFn,
-    stopMachineRun: stopMachineRunFn,
+      readMachineRun: readMachineRunFn,
+      stopMachineRun: stopMachineRunFn,
       persistLastRefresh: (outcome) => { persistCalls.push(outcome); },
       onOutcome: (kind, outcome, meta) => { onOutcomeCalls.push({ kind, outcome, meta }); },
       afterStageCommitted: async () => {
