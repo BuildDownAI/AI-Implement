@@ -375,7 +375,7 @@ After the merge, `fetch`, `stage`, `swap`, and `verify` each run as one `ctx.run
 
 ### Replay and crash recovery
 
-Restate re-delivers an invocation whose attempt died and replays the journal, so a restart mid-run resumes at the step that did not finish instead of dispatching a second runner. No boot-time recovery of a settings-backed stage exists. The one boot step is a one-shot sweep of rows left by the previous owner: if the old stage settings key is present, every in-flight kg-refresh row is closed `timed_out` and the key deleted. The workflow, journal, and idempotency retention is 7 days (`KG_REFRESH_RETENTION_MS`).
+Restate re-delivers an invocation whose attempt died and replays the journal, so a restart mid-run resumes at the step that did not finish instead of dispatching a second runner. No boot-time recovery of a settings-backed stage exists. The one boot step is a one-shot sweep of rows left by the previous owner: if the old stage settings key is present, every in-flight kg-refresh row is closed `timed_out` and the key deleted. The workflow, journal, and idempotency retention is the `restate_retention_days` setting, 14 days by default, read at boot.
 
 The last refresh outcome is persisted under the `kg_refresh_last_refresh` settings key on every terminal outcome of a real refresh (success, no-new-data, failure), never for a dry-run, and survives restarts. When the record carries no stamp (a failure before the rail: timeout, rejected dispatch), `get_kg_status` reads the serving stamp live (`readServedStamp` over `getServedNamespace()`, in one `ctx.run`; an error gives `null`).
 

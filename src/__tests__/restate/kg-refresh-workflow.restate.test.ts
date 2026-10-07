@@ -26,7 +26,6 @@ import { createKgRefreshIngressClient } from "../../restate/kg-refresh-productio
 import { createKgRepo, type KgRepoTriggerResult } from "../../restate/kg-repo.js";
 import {
   createKgRefreshWorkflow,
-  KG_REFRESH_RETENTION_MS,
   type KgDispatchInput,
   type KgDispatchResult,
   type KgRefreshReportBody,
@@ -406,7 +405,9 @@ describe("KgRefresh durable workflow", () => {
     return true;
   }
 
+  const TEST_RETENTION_MS = 14 * 24 * 60 * 60 * 1000;
   const workflowDeps: Omit<Parameters<typeof createKgRefreshWorkflow>[0], "bootstrapDeadlineMs" | "totalDeadlineMs"> = {
+    retentionMs: TEST_RETENTION_MS,
     rail,
     kgSourceRepo: KG_SOURCE_REPO,
     mintRunTokens: (input) => {
@@ -917,7 +918,7 @@ describe("KgRefresh durable workflow", () => {
       expect(conflictBody).toContain("runner_crashed");
 
       // The `report` handler itself is registered with journalRetention/idempotencyRetention
-      // set to KG_REFRESH_RETENTION_MS (kg-refresh-workflow.ts's handlers.report) — a
+      // set to TEST_RETENTION_MS (kg-refresh-workflow.ts's handlers.report) — a
       // handler-level introspection, distinct from W18's service-level check, that the
       // idempotency-key behavior just exercised above actually rides that retention.
       const handlerResponse = await fetch(`${env.adminAPIBaseUrl()}/services/KgRefresh/handlers/report`);
@@ -925,12 +926,12 @@ describe("KgRefresh durable workflow", () => {
       const handlerMeta = (await handlerResponse.json()) as Record<string, unknown>;
       expectDurationMs(
         handlerMeta.journal_retention ?? handlerMeta.journalRetention,
-        KG_REFRESH_RETENTION_MS,
+        TEST_RETENTION_MS,
         "report journal_retention",
       );
       expectDurationMs(
         handlerMeta.idempotency_retention ?? handlerMeta.idempotencyRetention,
-        KG_REFRESH_RETENTION_MS,
+        TEST_RETENTION_MS,
         "report idempotency_retention",
       );
 
@@ -953,8 +954,8 @@ describe("KgRefresh durable workflow", () => {
       }
       for (const handler of ["report", "cancel"]) {
         const m = await meta(handler);
-        expectDurationMs(m.journal_retention ?? m.journalRetention, KG_REFRESH_RETENTION_MS, `${handler} journal_retention`);
-        expectDurationMs(m.idempotency_retention ?? m.idempotencyRetention, KG_REFRESH_RETENTION_MS, `${handler} idempotency_retention`);
+        expectDurationMs(m.journal_retention ?? m.journalRetention, TEST_RETENTION_MS, `${handler} journal_retention`);
+        expectDurationMs(m.idempotency_retention ?? m.idempotencyRetention, TEST_RETENTION_MS, `${handler} idempotency_retention`);
       }
     },
   );
@@ -1302,6 +1303,7 @@ describe("KgRefresh durable workflow", () => {
   it("the watch reads the run status at most one time for each watch interval", async () => {
     const scaledTick = 100;
     const scaledWorkflow = createKgRefreshWorkflow({
+      retentionMs: TEST_RETENTION_MS,
       rail,
       kgSourceRepo: KG_SOURCE_REPO,
       mintRunTokens: () => ({ runToken: "run-token", progressToken: "progress-token", publicationToken: "publication-token" }),
@@ -1428,6 +1430,7 @@ describe("KgRefresh durable workflow", () => {
 
   it("W8c: with the run id unknown the reconcile read runs at the watch interval", async () => {
     const cadenceWorkflow = createKgRefreshWorkflow({
+      retentionMs: TEST_RETENTION_MS,
       rail,
       kgSourceRepo: KG_SOURCE_REPO,
       mintRunTokens: () => ({ runToken: "run-token", progressToken: "progress-token", publicationToken: "publication-token" }),
@@ -2142,7 +2145,7 @@ describe("KgRefresh durable workflow", () => {
     }
   });
 
-  it("W18: the registered workflow advertises seven-day retention and the two timeouts", async () => {
+  it("W18: the registered workflow advertises the built retention and the two timeouts", async () => {
     const env = envFor("alwaysReplay");
     // Deploy metadata is only populated once the service has been invoked at least once.
     const triggerId = newTriggerId();
@@ -2152,11 +2155,27 @@ describe("KgRefresh durable workflow", () => {
     const response = await fetch(`${env.adminAPIBaseUrl()}/services/KgRefresh`);
     expect(response.ok).toBe(true);
     const metadata = (await response.json()) as Record<string, unknown>;
-    expectDurationMs(metadata.workflow_completion_retention, KG_REFRESH_RETENTION_MS, "workflow_completion_retention");
-    expectDurationMs(metadata.journal_retention, KG_REFRESH_RETENTION_MS, "journal_retention");
+    expectDurationMs(metadata.workflow_completion_retention, TEST_RETENTION_MS, "workflow_completion_retention");
+    expectDurationMs(metadata.journal_retention, TEST_RETENTION_MS, "journal_retention");
     expectDurationMs(metadata.inactivity_timeout, 15 * 60 * 1000, "inactivity_timeout");
     expectDurationMs(metadata.abort_timeout, 20 * 60 * 1000, "abort_timeout");
   }, 15_000);
+
+  it("W18b: a workflow built with a ten-day retentionMs registers ten days", async () => {
+    const tenDays = 10 * 24 * 60 * 60 * 1000;
+    const tenDayWorkflow = createKgRefreshWorkflow({ ...workflowDeps, retentionMs: tenDays, bootstrapDeadlineMs: 30_000, totalDeadlineMs: 60_000 });
+    const tenDayEnv = await startRetryEnabled([tenDayWorkflow, kgRepo, starter]);
+    try {
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, { dispatchOutcome: "rejected", executionMode: "fly-machines" });
+      await runWorkflow(tenDayEnv.baseUrl(), triggerId);
+      const metadata = (await (await fetch(`${tenDayEnv.adminAPIBaseUrl()}/services/KgRefresh`)).json()) as Record<string, unknown>;
+      expectDurationMs(metadata.workflow_completion_retention, tenDays, "workflow_completion_retention");
+      expectDurationMs(metadata.journal_retention, tenDays, "journal_retention");
+    } finally {
+      await tenDayEnv.stop();
+    }
+  }, 30_000);
 
   // ---- W12: a crash after `stage`, then replay — fetch/stage do not re-run; swap/verify do ----
   it("W12: a crash injected after stage replays without re-running fetch or stage", async () => {
@@ -2198,6 +2217,7 @@ describe("KgRefresh durable workflow", () => {
     let releaseLatch: () => void = () => {};
     const latch = new Promise<void>((resolve) => { releaseLatch = resolve; });
     const buildCrashWorkflow = (endpointId: string) => createKgRefreshWorkflow({
+      retentionMs: TEST_RETENTION_MS,
       rail: railWithCounter,
       kgSourceRepo: KG_SOURCE_REPO,
       mintRunTokens: (input) => {

@@ -17,9 +17,8 @@ import type { DispatchAdmissionReleaseReason } from "../dispatch-admission.js";
 import { PLANNING_TTL_SECONDS } from "../runner-tokens.js";
 import { cleanupOwnedRun, readBoundedOwnedRun, readOwnedRunStatus, reportOwnedRunOutcome, reserveOwnedRun } from "./owned-run-lifecycle.js";
 import { awaitOwnedRun, type OwnedRunStatus } from "./owned-run-wait.js";
+import { restateRetentionMs } from "./retention.js";
 
-/** One shared retention constant, the same pattern as `KG_REFRESH_RETENTION_MS`. */
-export const PLANNING_RUN_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 /** How often the wait reads the run's status. */
 export const PLANNING_RUN_TICK_MS = 30 * 1000;
 /** How often the confirm phase reads the status after a `report`. */
@@ -73,6 +72,8 @@ export interface PlanningRunResult {
 
 /** Plain functions, every one called inside `ctx.run` — none of them may call `ctx` themselves. */
 export interface PlanningRunDependencies {
+  /** Test seam; production leaves it unset and reads `restate_retention_days` at build time. */
+  retentionMs?: number;
   /** Takes the reservation for this dispatch id: `true` when held, `false` when refused. Idempotent per dispatch id. */
   reserve(input: PlanningRunInput): boolean | Promise<boolean>;
   /** The run or machine id of a launch that already happened for this dispatch, or `null`.
@@ -102,6 +103,7 @@ export interface PlanningRunDependencies {
 }
 
 export function createPlanningRunWorkflow(deps: PlanningRunDependencies) {
+  const retentionMs = deps.retentionMs ?? restateRetentionMs();
   const tickMs = deps.tickMs ?? PLANNING_RUN_TICK_MS;
   const confirmTickMs = deps.confirmTickMs ?? PLANNING_RUN_CONFIRM_TICK_MS;
   const confirmWindowMs = deps.confirmWindowMs ?? PLANNING_RUN_CONFIRM_WINDOW_MS;
@@ -425,17 +427,17 @@ export function createPlanningRunWorkflow(deps: PlanningRunDependencies) {
     handlers: {
       run: restate.handlers.workflow.workflow({
         input: serde.zod(planningRunInputSchema),
-        journalRetention: PLANNING_RUN_RETENTION_MS,
+        journalRetention: retentionMs,
       }, run),
       report: restate.handlers.workflow.shared({
-        journalRetention: PLANNING_RUN_RETENTION_MS,
-        idempotencyRetention: PLANNING_RUN_RETENTION_MS,
+        journalRetention: retentionMs,
+        idempotencyRetention: retentionMs,
       }, report),
       status: restate.handlers.workflow.shared(status),
     },
     options: {
-      workflowRetention: PLANNING_RUN_RETENTION_MS,
-      journalRetention: PLANNING_RUN_RETENTION_MS,
+      workflowRetention: retentionMs,
+      journalRetention: retentionMs,
       inactivityTimeout: 15 * 60 * 1000,
       abortTimeout: 20 * 60 * 1000,
     },
