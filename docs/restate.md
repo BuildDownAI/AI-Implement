@@ -434,3 +434,14 @@ The failure branch of the planning callback also calls the termination hook, so 
 **Restate unavailable.** When the sidecar is not ready, the endpoint is not registered, or the submit answers `unavailable` or `not-found`, `dispatchPlanning` logs `Planning for <key> skipped: Restate unavailable` (for `not-found`: `the PlanningRun service is not registered`) and returns. It holds no reservation, so it releases nothing; `submit` has a timeout, and a timeout answers `unavailable`. A pilot project gets no planning dispatch and no fallback to Legacy until Restate is back; the next poll tries again.
 
 **A reservation that stays held.** If a reservation stays held in spite of the workflow, an operator lists it and releases it (AII-1069). The MCP tools `list_dispatch_reservations` and `release_dispatch_reservation` (`src/restate/tools.ts`) call `listHeldReservations` and `releaseHeldReservation` in `src/dispatch-admission.ts`. `GET /api/dispatch-reservations` and the held-reservations card on `/admin#deployments` use the same functions. Without `force`, a release needs a backend run confirmed ended; a terminal job row alone is refused (the planning callback closes the row before the run is known to have ended), and a Restate-owned reservation with no job row needs `force`.
+
+## Reading a run's journal
+
+`GET /api/restate/journal` (AII-1128) answers one invocation's row, journal entries, and promises. Look it up by `service` + `key`, or by `id` (never both); values match `[A-Za-z0-9._:-]{1,128}`. A bad lookup is 400, no match is **404**, and an unreachable Restate admin API is **503**.
+
+The admin UI shows it in two places, both rendered by the drawer's `window.renderRestateJournal`:
+
+- **Job drawer, "Restate journal"** — fetched with the job's dispatch id as the key. The service follows the job's phase: `kg-refresh` → `KgRefresh`, `planning` → `PlanningRun`, `implementation` or no dispatch id → no fetch, any other phase → `ReviewFixAttempt`, fetched only when the drawer's attempt read (`/api/review-fix/attempts/<dispatch id>`) just succeeded, so a legacy review-fix job never fetches. A 404 (retention has passed) shows "No journal (retention has passed)"; a 503 shows an "unavailable" alert.
+- **Journal page** (`/admin#journal`) — a form for a journal no drawer row shows. Granting it is a page grant at `/admin#access`.
+
+For Restate's own UI, run `fly proxy 9070:9070 -a <app>` and open `http://127.0.0.1:9070/ui/invocations/<id>`.

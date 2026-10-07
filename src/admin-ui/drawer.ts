@@ -37,6 +37,8 @@ export const drawerHtml = `
         <div class="section-h"><h3>Recovery actions</h3></div>
         <div id="drawer-pilot-actions" style="margin-bottom:20px"></div>
       </div>
+      <div class="section-h" id="drawer-journal-heading" hidden><h3>Restate journal</h3></div>
+      <div id="drawer-journal" hidden></div>
     </div>
     <div class="drawer-footer">
       <div></div>
@@ -943,6 +945,7 @@ export const drawerScript = `
   }
 
   async function renderPilotAttempt(job, background) {
+    pilotOwnedDispatchId = null;
     if (!job.dispatchId) {
       resetPilotState();
       hidePilotSection();
@@ -965,6 +968,7 @@ export const drawerScript = `
       hidePilotSection();
       return;
     }
+    if (result.kind === 'ok') pilotOwnedDispatchId = job.dispatchId;
     document.getElementById('drawer-pilot-heading').hidden = false;
     document.getElementById('drawer-pilot').hidden = false;
     if (result.kind === 'unavailable') {
@@ -1009,6 +1013,110 @@ export const drawerScript = `
     // renderSteps preserves open evidence panels across its own 5s re-render.
   }
 
+  // ---- Restate journal section (AII-1135) ----
+  //
+  // Same shape as the attempt section: fetch by dispatch id, hide on 404, warn on 503.
+  // The service mirrors restateRefForRow in report-card.ts; a review-fix job is any
+  // other phase counts only when the attempt section just confirmed a Restate attempt
+  // for this dispatch id (pilotOwnedDispatchId), so a legacy job never fetches.
+
+  let journalGeneration = 0;
+  // Set by renderPilotAttempt when the attempt read succeeded; null otherwise.
+  let pilotOwnedDispatchId = null;
+
+  function journalServiceForJob(job) {
+    if (!job.dispatchId || !job.phase || job.phase === 'implementation') return null;
+    if (job.phase === 'kg-refresh') return 'KgRefresh';
+    if (job.phase === 'planning') return 'PlanningRun';
+    return pilotOwnedDispatchId === job.dispatchId ? 'ReviewFixAttempt' : null;
+  }
+
+  function fmtJournalTime(v) {
+    if (v == null || v === '') return '—';
+    const t = typeof v === 'number' ? v : Date.parse(String(v));
+    if (!isNaN(t) && t > 0) return new Date(t).toISOString();
+    return String(v);
+  }
+
+  function renderRestateJournal(container, data) {
+    const inv = (data && data.invocation) || {};
+    const entries = (data && data.entries) || [];
+    let html = '<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px 14px;margin-bottom:14px">'
+      + '<div><div class="field-label">Status</div><div class="mono" style="font-size:12.5px">' + window.esc(String(inv.status == null ? '—' : inv.status)) + '</div></div>'
+      + '<div><div class="field-label">Invocation</div><div class="mono" style="font-size:11px;word-break:break-all">' + window.esc(String(inv.id == null ? '—' : inv.id)) + '</div></div>'
+      + '<div><div class="field-label">Created</div><div style="font-size:12.5px">' + window.esc(fmtJournalTime(inv.created_at)) + '</div></div>'
+      + '<div><div class="field-label">Completed</div><div style="font-size:12.5px">' + window.esc(fmtJournalTime(inv.completed_at)) + '</div></div>'
+      + '</div>';
+    if (inv.last_failure) {
+      html += '<div class="alert warn" style="margin-bottom:14px"><div class="alert-icon">&#9888;</div><div style="flex:1"><div class="alert-title">Last failure'
+        + (inv.last_failure_error_code != null ? ' · ' + window.esc(String(inv.last_failure_error_code)) : '') + '</div><div class="alert-desc">'
+        + window.esc(String(inv.last_failure)) + '</div></div></div>';
+    }
+    html += '<table class="tbl"><thead><tr><th>#</th><th>Type</th><th>Name</th><th>Completed</th><th>Promise</th><th>Appended at</th></tr></thead><tbody>';
+    for (const e of entries) {
+      html += '<tr>'
+        + '<td class="mono">' + window.esc(String(e.index)) + '</td>'
+        + '<td class="mono">' + window.esc(String(e.entryType == null ? '—' : e.entryType)) + '</td>'
+        + '<td class="mono">' + window.esc(String(e.name == null ? '—' : e.name)) + '</td>'
+        + '<td>' + (e.completed ? 'yes' : 'no') + '</td>'
+        + '<td class="mono">' + window.esc(String(e.promiseName == null || e.promiseName === '' ? '—' : e.promiseName)) + '</td>'
+        + '<td title="' + window.escAttr(String(e.appendedAt == null ? '' : e.appendedAt)) + '">' + window.esc(fmtJournalTime(e.appendedAt)) + '</td>'
+        + '</tr>';
+    }
+    if (!entries.length) html += '<tr><td colspan="6" class="text-tertiary">No journal entries</td></tr>';
+    html += '</tbody></table>';
+    container.innerHTML = html;
+  }
+  window.renderRestateJournal = renderRestateJournal;
+
+  function hideJournalSection() {
+    document.getElementById('drawer-journal-heading').hidden = true;
+    document.getElementById('drawer-journal').hidden = true;
+  }
+
+  async function renderJournal(job) {
+    const generation = ++journalGeneration;
+    const service = journalServiceForJob(job);
+    if (!service) {
+      hideJournalSection();
+      return;
+    }
+    let res;
+    try {
+      res = await window.api('/api/restate/journal?service=' + encodeURIComponent(service) + '&key=' + encodeURIComponent(job.dispatchId));
+    } catch (err) {
+      res = null;
+    }
+    if (currentJobId !== job.id || journalGeneration !== generation) return;
+    const box = document.getElementById('drawer-journal');
+    if (res && res.status === 404) {
+      document.getElementById('drawer-journal-heading').hidden = false;
+      box.hidden = false;
+      box.innerHTML = '<div class="text-tertiary" style="font-size:12.5px;margin-bottom:20px">No journal (retention has passed)</div>';
+      return;
+    }
+    if (res && res.status === 503) {
+      document.getElementById('drawer-journal-heading').hidden = false;
+      box.hidden = false;
+      box.innerHTML = '<div class="alert warn" style="margin-bottom:16px"><div class="alert-icon">&#9888;</div><div style="flex:1"><div class="alert-title">Journal unavailable</div><div class="alert-desc">Restate could not be reached for this run. The journal may be stale or missing.</div></div></div>';
+      return;
+    }
+    if (!res || !res.ok) {
+      hideJournalSection();
+      return;
+    }
+    let data;
+    try { data = await res.json(); } catch (err) { data = null; }
+    if (currentJobId !== job.id || journalGeneration !== generation) return;
+    if (!data) {
+      hideJournalSection();
+      return;
+    }
+    document.getElementById('drawer-journal-heading').hidden = false;
+    box.hidden = false;
+    renderRestateJournal(box, data);
+  }
+
   function resetDrawerContent() {
     document.getElementById('drawer-title').textContent = 'Loading…';
     document.getElementById('drawer-issue-row').innerHTML = '';
@@ -1025,6 +1133,8 @@ export const drawerScript = `
     document.getElementById('drawer-local-logs').onclick = null;
     resetPilotState();
     hidePilotSection();
+    journalGeneration++;
+    hideJournalSection();
   }
 
   function stopDrawerAutoRefresh() {
@@ -1071,6 +1181,8 @@ export const drawerScript = `
       renderDrawer(json.job, json.steps, mappings);
       await renderPilotAttempt(json.job, background);
       if (currentJobId !== id) return;
+      await renderJournal(json.job);
+      if (currentJobId !== id) return;
       // A finished job's steps cannot change — stop polling instead of collapsing
       // an open evidence panel and resetting scroll every 5s for no reason.
       currentJobTerminal = isTerminalJobStatus(json.job.status);
@@ -1106,6 +1218,7 @@ export const drawerScript = `
     document.body.style.overflow = '';
     currentJobId = null;
     resetPilotState();
+    journalGeneration++;
   }
 
   document.addEventListener('keydown', function (e) {

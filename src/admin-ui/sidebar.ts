@@ -33,6 +33,7 @@ const groups: NavGroup[] = [
     { key: "deployments", label: "Deployments", icon: "rocket", count: "deploy-available",
       grantBlocker: "Triggers deploys and exposes infrastructure inventory." },
     { key: "reaper",      label: "Reaper",      icon: "broom" },
+    { key: "journal",     label: "Journal",     icon: "layers" },
     { key: "access",      label: "Access",      icon: "shield",
       grantBlocker: "Decides who can sign in and as what." },
     { key: "secrets",     label: "Secrets",     icon: "key",

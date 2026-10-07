@@ -10,6 +10,7 @@ import { settingsHtml, settingsScript } from "./pages/settings.js";
 import { projectsHtml, projectsScript } from "./pages/projects.js";
 import { pipelinesHtml, pipelinesScript } from "./pages/pipelines.js";
 import { reaperHtml, reaperScript } from "./pages/reaper.js";
+import { journalHtml, journalScript } from "./pages/journal.js";
 import { sessionsHtml, sessionsScript } from "./pages/sessions.js";
 import { auditHtml, auditScript } from "./pages/audit.js";
 import { issuesHtml, issuesScript } from "./pages/issues.js";
@@ -49,6 +50,7 @@ const shell = `<div id="admin-page" class="app-shell hidden">
     ${projectsHtml}
     ${pipelinesHtml}
     ${reaperHtml}
+    ${journalHtml}
     ${sessionsHtml}
     ${auditHtml}
     ${issuesHtml}
@@ -112,6 +114,7 @@ ${pageScript('settings', settingsScript)}
 ${pageScript('projects', projectsScript)}
 ${pageScript('jobs', pipelinesScript)}
 ${pageScript('reaper', reaperScript)}
+${pageScript('journal', journalScript)}
 ${pageScript('sessions', sessionsScript)}
 ${pageScript('audit', auditScript)}
 ${pageScript('issues', issuesScript)}

@@ -1055,3 +1055,125 @@ describe("job drawer restate attempt section", () => {
     win.closeJobDrawer();
   });
 });
+
+describe("job drawer restate journal section", () => {
+  const KG_JOB = { ...PILOT_JOB, id: 20, phase: "kg-refresh", dispatchId: "kg-20" };
+  const JOURNAL = {
+    invocation: { id: "inv_1", status: "completed", created_at: 1700000000000, completed_at: 1700000060000 },
+    entries: [
+      { index: 0, entryType: "Command: Run", name: "reserve", completed: true, promiseName: null, appendedAt: 1700000001000 },
+      { index: 1, entryType: "Command: Run", name: "<b>x</b>", completed: true, promiseName: "report", appendedAt: 1700000002000 },
+    ],
+    promises: [],
+  };
+
+  function mountJournal(job: Record<string, unknown>, status: number) {
+    const { win, doc } = mountDrawer(job, []);
+    const calls: string[] = [];
+    win.api = async (url: string) => {
+      calls.push(url);
+      if (url === "/api/mappings") return { ok: true, status: 200, json: async () => ({}) };
+      if (url === "/api/jobs/" + job.id + "/steps") return { ok: true, status: 200, json: async () => ({ job, steps: [] }) };
+      if (url.startsWith("/api/restate/journal")) return { ok: status < 300, status, json: async () => JOURNAL };
+      return { ok: false, status: 404, json: async () => ({}) };
+    };
+    return { win, doc, calls };
+  }
+
+  it("renders a kg-refresh journal with escaped entry names", async () => {
+    const { win, doc, calls } = mountJournal(KG_JOB, 200);
+    await win.openJobDrawer(20);
+    expect(calls).toContain("/api/restate/journal?service=KgRefresh&key=kg-20");
+    const box = doc.getElementById("drawer-journal")!;
+    expect(box.hidden).toBe(false);
+    expect(box.querySelectorAll("tbody tr")).toHaveLength(2);
+    expect(box.querySelector("b")).toBeNull();
+    expect(box.textContent).toContain("<b>x</b>");
+    expect(box.textContent).toContain("completed");
+    win.closeJobDrawer();
+  });
+
+  it("shows the retention line on 404 and no table", async () => {
+    const { win, doc } = mountJournal(KG_JOB, 404);
+    await win.openJobDrawer(20);
+    const box = doc.getElementById("drawer-journal")!;
+    expect(box.textContent).toContain("No journal (retention has passed)");
+    expect(box.querySelector("table")).toBeNull();
+    win.closeJobDrawer();
+  });
+
+  it("shows the unavailable alert on 503", async () => {
+    const { win, doc } = mountJournal(KG_JOB, 503);
+    await win.openJobDrawer(20);
+    expect(doc.getElementById("drawer-journal")!.textContent).toContain("unavailable");
+    win.closeJobDrawer();
+  });
+
+  it("never fetches the journal for a non-Restate job", async () => {
+    const { win, calls } = mountJournal({ ...KG_JOB, phase: "implementation" }, 200);
+    await win.openJobDrawer(20);
+    expect(calls.some((u) => u.startsWith("/api/restate/journal"))).toBe(false);
+    win.closeJobDrawer();
+  });
+
+  it("paints nothing when the drawer closes before the journal fetch resolves", async () => {
+    const { win, doc } = mountJournal(KG_JOB, 200);
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => { release = r; });
+    const api = win.api;
+    win.api = async (url: string, options?: unknown) => {
+      if (url.startsWith("/api/restate/journal")) await gate;
+      return api(url, options);
+    };
+    const opening = win.openJobDrawer(20);
+    await new Promise((r) => setTimeout(r, 0));
+    win.closeJobDrawer();
+    release();
+    await opening;
+    const box = doc.getElementById("drawer-journal")!;
+    expect(box.hidden).toBe(true);
+    expect(box.innerHTML).toBe("");
+  });
+
+  it("paints nothing when another job opens before the journal fetch resolves", async () => {
+    const OTHER = { ...PILOT_JOB, id: 21, phase: "implementation", dispatchId: "impl-21" };
+    const { win, doc } = mountJournal(KG_JOB, 200);
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => { release = r; });
+    const api = win.api;
+    win.api = async (url: string, options?: unknown) => {
+      if (url === "/api/jobs/21/steps") return { ok: true, status: 200, json: async () => ({ job: OTHER, steps: [] }) };
+      if (url.startsWith("/api/restate/journal")) await gate;
+      return api(url, options);
+    };
+    const first = win.openJobDrawer(20);
+    await new Promise((r) => setTimeout(r, 0));
+    const second = win.openJobDrawer(21);
+    release();
+    await Promise.all([first, second]);
+    const box = doc.getElementById("drawer-journal")!;
+    expect(box.hidden).toBe(true);
+    expect(box.innerHTML).toBe("");
+    win.closeJobDrawer();
+  });
+
+  it("does not fetch the journal for a review-fix job without a Restate attempt", async () => {
+    const { win, calls } = mountJournal({ ...PILOT_JOB, id: 22, phase: "review-fix", dispatchId: "legacy-22" }, 200);
+    await win.openJobDrawer(22);
+    expect(calls.some((u) => u.startsWith("/api/restate/journal"))).toBe(false);
+    win.closeJobDrawer();
+  });
+
+  it("fetches the ReviewFixAttempt journal when the attempt read confirms Restate", async () => {
+    const job = { ...PILOT_JOB, id: 23, phase: "review-fix", dispatchId: "attempt-23" };
+    const { win, calls } = mountJournal(job, 200);
+    const api = win.api;
+    win.api = async (url: string, options?: unknown) => {
+      if (url === "/api/review-fix/attempts/attempt-23") return { ok: true, status: 200, json: async () => pilotAttemptFixture() };
+      return api(url, options);
+    };
+    await win.openJobDrawer(23);
+    expect(calls).toContain("/api/restate/journal?service=ReviewFixAttempt&key=attempt-23");
+    win.closeJobDrawer();
+  });
+});
