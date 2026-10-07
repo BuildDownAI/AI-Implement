@@ -10,7 +10,7 @@ describe("kg pipelines page", () => {
   });
 
   it("carries every card id, and Deployments carries none", () => {
-    for (const id of ["kg-refresh-card", "kg-refresh-badge", "kg-refresh-stamp", "kg-refresh-last", "kg-sidecar-status", "kg-refresh-btn", "kg-dry-run-btn", "kg-accept-baseline-btn", "kg-dry-run-last", "kg-materialize-env-warning", "kg-materialize-controls", "btn-kg-materialize-rdflib", "btn-kg-materialize-direct", "kg-materialize-source"]) {
+    for (const id of ["kg-refresh-card", "kg-refresh-badge", "kg-refresh-stamp", "kg-refresh-last", "kg-sidecar-status", "kg-refresh-btn", "kg-dry-run-btn", "kg-accept-baseline-btn", "kg-dry-run-last", "kg-materialize-controls", "btn-kg-materialize-rdflib", "btn-kg-materialize-direct", "kg-materialize-source"]) {
       expect(kgPipelinesHtml).toContain(`id="${id}"`);
       expect(deploymentsHtml).not.toContain(id);
     }
@@ -148,7 +148,6 @@ describe("kg refresh card", () => {
 describe("kg materialize-mode control (AII-602)", () => {
   it("declares the materialize control element ids", () => {
     for (const id of [
-      "kg-materialize-env-warning",
       "kg-materialize-controls",
       "btn-kg-materialize-rdflib",
       "btn-kg-materialize-direct",
@@ -156,12 +155,6 @@ describe("kg materialize-mode control (AII-602)", () => {
     ]) {
       expect(kgPipelinesHtml).toContain(`id="${id}"`);
     }
-  });
-
-  it("shows the env-pinned warning with the standard house wording", () => {
-    expect(kgPipelinesHtml).toContain('class="warning hidden"');
-    expect(kgPipelinesHtml).toContain("KG_MATERIALIZE_DIRECT env var is set");
-    expect(kgPipelinesHtml).toContain("UI toggle has no effect until it is unset.");
   });
 
   it("fetches /api/kg/materialize-mode for the current mode", () => {
@@ -178,10 +171,10 @@ describe("kg materialize-mode control (AII-602)", () => {
     expect(kgPipelinesHtml).toContain("onclick=\"window.setKgMaterializeDirect(true)\"");
   });
 
-  it("disables both buttons and shows the warning when source is env", () => {
-    expect(kgPipelinesScript).toContain("envPinned = data.source === 'env'");
-    expect(kgPipelinesScript).toContain("btn-kg-materialize-rdflib').disabled = envPinned");
-    expect(kgPipelinesScript).toContain("btn-kg-materialize-direct').disabled = envPinned");
+  it("has no env-pinned warning or disabled handling (AII-1109)", () => {
+    expect(kgPipelinesHtml).not.toContain("kg-materialize-env-warning");
+    expect(kgPipelinesScript).not.toContain("kg-materialize-env-warning");
+    expect(kgPipelinesScript).not.toContain("envPinned");
   });
 
   it("registers loadKgMaterializeMode on page load and on a poll interval", () => {

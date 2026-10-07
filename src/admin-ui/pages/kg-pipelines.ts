@@ -27,7 +27,6 @@ export const kgPipelinesHtml = `
           <span class="kpi-trend text-secondary" style="margin-left: 8px">Refresh fetches the KG source repo's committed snapshot and restarts the sidecar — no deploy, no dispatch pause. Dry-run runs the same job with the push skipped and reports the guard table below; the served graph never changes. Accept new baseline pushes even if the guard table above shows a shrink — review it first.</span>
         </div>
         <div class="kpi-trend text-secondary" id="kg-dry-run-last" style="margin-top: 8px" hidden></div>
-        <div id="kg-materialize-env-warning" class="warning hidden">&#x26A0; KG_MATERIALIZE_DIRECT env var is set &#x2014; UI toggle has no effect until it is unset.</div>
         <div style="margin-top: 12px; display:flex; align-items:center; gap:12px; flex-wrap:wrap">
           <span class="kpi-trend text-secondary">Materialize:</span>
           <span class="seg" id="kg-materialize-controls">
@@ -227,18 +226,9 @@ export const kgPipelinesScript = `
       if (!res.ok) return;
       const data = await res.json();
       const direct = !!data.direct;
-      const envPinned = data.source === 'env';
       document.getElementById('btn-kg-materialize-rdflib').classList.toggle('btn-primary', !direct);
       document.getElementById('btn-kg-materialize-direct').classList.toggle('btn-primary', direct);
-      document.getElementById('btn-kg-materialize-rdflib').disabled = envPinned;
-      document.getElementById('btn-kg-materialize-direct').disabled = envPinned;
       document.getElementById('kg-materialize-source').textContent = '(' + data.source + ')';
-      const warning = document.getElementById('kg-materialize-env-warning');
-      if (envPinned) {
-        warning.classList.remove('hidden');
-      } else {
-        warning.classList.add('hidden');
-      }
     } catch (e) { /* transient \u2014 next poll retries */ }
   }
 

@@ -1673,18 +1673,6 @@ async function handleSetKgMaterializeMode(
     setKgMaterializeDirect(body.direct);
     const status = getKgMaterializeDirect();
 
-    // The DB write succeeded but an env var still wins at runtime. Return 409
-    // so direct API callers can tell their write was overridden.
-    if (status.source === "env") {
-      json(res, 409, {
-        error: "KG_MATERIALIZE_DIRECT env var is set; persisted to DB but has no effect at runtime until the env var is unset",
-        persisted: body.direct,
-        direct: status.enabled,
-        source: status.source,
-      });
-      return;
-    }
-
     json(res, 200, { direct: status.enabled, source: status.source });
   } catch {
     json(res, 400, { error: "Invalid request body" });
