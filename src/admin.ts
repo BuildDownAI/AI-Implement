@@ -2342,7 +2342,7 @@ let lastVolumeRetentionApply: { at: number; applied: string[]; skipped: string }
 
 function retentionView(r: RetentionDeps) {
   return {
-    restate: { days: r.getRestateDays(), appliesAt: "next registration" },
+    restate: { days: r.getRestateDays(), appliesAt: "next deploy or restart" },
     volume: { days: r.getVolumeDays(), lastApplied: lastVolumeRetentionApply },
     default: r.default,
     min: r.min,

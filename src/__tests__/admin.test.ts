@@ -4968,6 +4968,17 @@ describe("/api/retention", () => {
     return { statusCode: res.statusCode, body: res.body ? JSON.parse(res.body) : {}, apply };
   }
 
+  it("answers 501 on GET and POST when retention is not configured", async () => {
+    const token = await login("secret");
+    for (const method of ["GET", "POST"] as const) {
+      const req = new MockRequest("/api/retention", method, { authorization: `Bearer ${token}` }, method === "POST" ? JSON.stringify({ restate: 10 }) : undefined);
+      const res = new MockResponse();
+      admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider), {});
+      await res.done;
+      expect(res.statusCode).toBe(501);
+    }
+  });
+
   it("rejects an unauthenticated request", async () => {
     expect((await retentionRequest("not-a-session", "POST", { restate: 10 })).statusCode).toBe(401);
   });
@@ -4990,7 +5001,7 @@ describe("/api/retention", () => {
     const res = await retentionRequest(token, "GET", undefined);
     expect(res.statusCode).toBe(200);
     expect(res.body).toEqual({
-      restate: { days: 14, appliesAt: "next registration" },
+      restate: { days: 14, appliesAt: "next deploy or restart" },
       volume: { days: 14, lastApplied: null },
       default: 14,
       min: 1,

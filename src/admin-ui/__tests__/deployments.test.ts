@@ -628,7 +628,7 @@ describe("fmtAgo", () => {
 
 describe("Retention card", () => {
   const retentionBody = (restate: number, volume: number) => ({
-    restate: { days: restate, appliesAt: "next registration" },
+    restate: { days: restate, appliesAt: "next deploy or restart" },
     volume: { days: volume, lastApplied: null },
     default: 14,
     min: 1,
