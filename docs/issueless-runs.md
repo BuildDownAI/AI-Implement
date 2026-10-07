@@ -389,6 +389,8 @@ The last refresh outcome is persisted under the `kg_refresh_last_refresh` settin
 
 `GET /api/kg/status` and `get_kg_status` derive `stage` from the marker, the workflow's `step`, and `lastRefresh`; the full table is in [mcp-server.md](mcp-server.md) (`get_kg_status`). In short:
 
+While a runner step is in flight, `status` and `get_kg_status` also show `runnerStep: { id, status }` (and `stage` follows it); after the run ends, `lastRefresh.steps` holds the table of runner steps with status and duration.
+
 | Marker | Workflow `step` | `stage` |
 |---|---|---|
 | none | — (from `lastRefresh`) | `idle`, `serving`, `reverted`, or `failed` |

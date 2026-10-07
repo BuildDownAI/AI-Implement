@@ -20,6 +20,7 @@ import {
   DEFAULT_BASE_REPO,
 } from "./pipeline/steps/kg-tracker-data.js";
 import { postDryRunReport } from "./kg-refresh-rail.js";
+import type { StepStatus } from "./pipeline/types.js";
 
 const execFile = promisify(execFileCb);
 
@@ -76,6 +77,16 @@ export interface RefreshOutcome {
   dispatchId?: string;
   /** Per-part {part, prev, new} rows from the push guard. Present on a dry-run outcome or a real `KG_SNAPSHOT_TRACKER_REGRESSION` refusal (AII-638) when the runner reported one. */
   partTable?: Array<{ part: string; prev: string; new: string }>;
+  /** Every runner step the workflow saw, in pipeline order (AII-1134); absent when the runner reported none. */
+  steps?: KgRefreshStepRecord[];
+}
+
+export interface KgRefreshStepRecord {
+  id: string;
+  status: StepStatus;
+  startedAt: string;
+  endedAt: string | null;
+  durationMs: number | null;
 }
 
 /**
@@ -179,6 +190,8 @@ export interface KgRefreshStatus {
   /** The last dry-run with no PR report target (admin page or tool); never written to `lastRefresh`. */
   lastDryRun: { ok: boolean; at: number; detail: string; partTable?: Array<{ part: string; prev: string; new: string }> } | null;
   stage: KgRefreshStage;
+  /** The runner step in flight, when the workflow has one (AII-1134). */
+  runnerStep?: { id: string; status: StepStatus };
   /** Which materialize path the next refresh will stage (AII-602). */
   materialize: "rdflib" | "direct";
   /** The effective Fly KG machine size the next Fly refresh will use (`set_kg_fly_machine`). */

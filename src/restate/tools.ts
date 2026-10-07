@@ -38,6 +38,7 @@ import { getRestateRetentionDays, getVolumeSnapshotRetentionDays } from "./reten
 import { getRestateStatus } from "./status.js";
 import { readKgSourceRepo } from "../deploy.js";
 import { runKgRefreshPreflight, MIN_FREE_BYTES, type KgRefreshStage, type KgRefreshStatus } from "../kg-refresh.js";
+import type { StepStatus } from "../pipeline/types.js";
 import { resolveKgFlyMachineSize, type KgRefreshToolDeps } from "./kg-refresh-production.js";
 import type { KgRefreshDefinition, KgRepoDefinition } from "./kg-refresh-types.js";
 import { getOrchestratorSettings, getLinearPickupLabel } from "../orchestrator-settings.js";
@@ -646,6 +647,32 @@ export function kgStageForStep(step: string | null): KgRefreshStage {
   return "staging";
 }
 
+/**
+ * Maps the in-flight runner step onto a stage (AII-1134). Full table (id x status):
+ *   clone, kg-scope-reconcile, dependency-auth, clone-code-repo,
+ *   clone-secondary-repos, kg-tracker-data -> checking, for every status
+ *   kg-ingest                              -> ingest-running, for every status
+ *   kg-snapshot-push                       -> snapshot-landed when passed; ingest-running otherwise
+ *   any other id                           -> ingest-running (the runner phase is in flight)
+ */
+export function kgStageForRunnerStep(id: string, status: StepStatus): KgRefreshStage {
+  switch (id) {
+    case "clone":
+    case "kg-scope-reconcile":
+    case "dependency-auth":
+    case "clone-code-repo":
+    case "clone-secondary-repos":
+    case "kg-tracker-data":
+      return "checking";
+    case "kg-ingest":
+      return "ingest-running";
+    case "kg-snapshot-push":
+      return status === "passed" ? "snapshot-landed" : "ingest-running";
+    default:
+      return "ingest-running";
+  }
+}
+
 const REVERT_GATES = new Set(["answers", "vectors", "canary", "stamp"]);
 
 function kgStageFromLastRefresh(last: KgRefreshStatus["lastRefresh"]): KgRefreshStage {
@@ -682,12 +709,18 @@ export const getKgStatusTool = tool(
       });
     }
     let stage: KgRefreshStage;
+    let runnerStep: KgRefreshStatus["runnerStep"];
     if (inFlight === null || inFlight === undefined) {
       stage = kgStageFromLastRefresh(lastRefresh);
     } else {
       try {
         const wf = await ctx.workflowClient(KgRefresh, inFlight.triggerId).status();
-        stage = kgStageForStep(wf.step);
+        if (wf.runnerStep) {
+          runnerStep = { id: wf.runnerStep.id, status: wf.runnerStep.status as StepStatus };
+          stage = kgStageForRunnerStep(runnerStep.id, runnerStep.status);
+        } else {
+          stage = kgStageForStep(wf.step);
+        }
       } catch (err) {
         // A retained-but-finished or unreachable workflow: the marker is the truth.
         if (!kgStatusFallbackLogged) {
@@ -707,6 +740,7 @@ export const getKgStatusTool = tool(
       lastRefresh,
       lastDryRun,
       stage,
+      ...(runnerStep ? { runnerStep } : {}),
       materialize: getKgMaterializeDirect().enabled ? "direct" : "rdflib",
       flyMachine: resolveKgFlyMachineSize(toolDeps.kgSourceRepo, false),
       restate: restateKey ? { service: "KgRefresh", key: restateKey } : null,

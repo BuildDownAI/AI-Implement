@@ -14,6 +14,7 @@ import {
   getProjectBinding,
   kgPath,
   kgHybridSearch,
+  kgStageForRunnerStep,
   getKgStatusTool,
   setKgFlyMachineTool,
   flyMachineReuseProbeTool,
@@ -36,6 +37,7 @@ import {
   getReviewFixActivityTool,
   setReviewFixAttemptsFacade,
 } from "../restate/tools.js";
+import { KG_REFRESH_RUNNER_STEPS } from "../restate/kg-refresh-types.js";
 import { discoverTools, callTool, callToolAsSystem, toolCatalog } from "../restate/tools-client.js";
 import type { Caller } from "../mcp-identity.js";
 import { setKgMemoryProvider } from "../kg-provider.js";
@@ -755,6 +757,7 @@ describe("migrated read handlers (AII-711)", () => {
 
     async function stageFor(opts: {
       last?: RefreshOutcome | null; inFlight?: { triggerId: string; startedAt: number } | null; step?: string | null; statusThrows?: boolean;
+      runnerStep?: { id: string; status: string } | null;
       dryRun?: RefreshOutcome | null; readServedStamp?: () => Promise<string | null>;
     }) {
       setKgRefreshToolDeps(kgToolDeps({
@@ -767,13 +770,37 @@ describe("migrated read handlers (AII-711)", () => {
         workflowClient: () => ({
           status: async () => {
             if (opts.statusThrows) throw new Error("no such workflow");
-            return { step: opts.step ?? null, startedAt: 1, triggerId: "t1", runId: null, dryRun: false };
+            return { step: opts.step ?? null, startedAt: 1, triggerId: "t1", runId: null, dryRun: false, runnerStep: opts.runnerStep ?? null };
           },
         }),
       } as unknown as restate.Context;
       const result = await getKgStatusTool(ctx, { caller: system, args: {} });
       return JSON.parse(result.content[0].text);
     }
+
+    it("kgStageForRunnerStep answers every (runner step x status) pair", () => {
+      const statuses = ["running", "passed", "failed", "skipped", "cancelled"] as const;
+      const expected = (id: string, status: string) => {
+        if (id === "kg-ingest") return "ingest-running";
+        if (id === "kg-snapshot-push") return status === "passed" ? "snapshot-landed" : "ingest-running";
+        return "checking";
+      };
+      for (const id of KG_REFRESH_RUNNER_STEPS) {
+        for (const status of statuses) expect(kgStageForRunnerStep(id, status), `${id}/${status}`).toBe(expected(id, status));
+      }
+    });
+
+    it("an in-flight runnerStep sets stage and is reported; without one the workflow step maps as before", async () => {
+      const inFlight = { triggerId: "t1", startedAt: 1 };
+      const live = await stageFor({ inFlight, step: "await-progress", runnerStep: { id: "kg-ingest", status: "running" } });
+      expect(live.stage).toBe("ingest-running");
+      expect(live.runnerStep).toEqual({ id: "kg-ingest", status: "running" });
+      const early = await stageFor({ inFlight, step: "await-progress", runnerStep: { id: "clone", status: "passed" } });
+      expect(early.stage).toBe("checking");
+      const none = await stageFor({ inFlight, step: "merge", runnerStep: null });
+      expect(none.stage).toBe("snapshot-landed");
+      expect(none).not.toHaveProperty("runnerStep");
+    });
 
     it.each([
       ["no record", null, "idle"],
