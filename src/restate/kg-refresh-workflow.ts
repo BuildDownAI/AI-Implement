@@ -709,6 +709,8 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
     // Step promises are evidence for `status`, never wait signals (ADR 034). A shared handler cannot write state.
     const step = raw?.step;
     if (!step || typeof step.id !== "string") return;
+    // Promise names stay bounded (ids x 2): an id outside the pipeline is accepted and ignored.
+    if (!(KG_REFRESH_RUNNER_STEPS as readonly string[]).includes(step.id)) return;
     // A late report from a machine that is shutting down is not an error.
     if (await ctx.get<boolean>("completed")) return;
     // Producer: handleRunnerProgress in src/runner-callback.ts (the step body arrives redacted).

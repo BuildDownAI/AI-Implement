@@ -2201,6 +2201,27 @@ describe("KgRefresh durable workflow", () => {
       expect(await runnerStep(env.baseUrl(), triggerId)).toEqual({ id: "clone", status: "running" });
     }, 20_000);
 
+    it.each(VARIANTS.map(([label]) => label))("an unknown step id is accepted but creates no promise and leaves runnerStep unchanged (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      const { done } = await parkedRun(env.baseUrl(), triggerId);
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "progress", stepBody("clone", "running"));
+      const res = await fetch(`${env.baseUrl()}/KgRefresh/${triggerId}/progress`, {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(stepBody("not-a-step", "running")),
+      });
+      expect(res.ok).toBe(true);
+      expect(await runnerStep(env.baseUrl(), triggerId)).toEqual({ id: "clone", status: "running" });
+      const promises = await fetch(`${env.adminAPIBaseUrl()}/query`, { // restate-test-allow: the one sanctioned admin read
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "application/json" },
+        body: JSON.stringify({ query: `SELECT * FROM sys_promise WHERE service_name = 'KgRefresh' AND service_key = '${triggerId}'` }),
+      });
+      const rows = ((await promises.json()) as { rows: Array<Record<string, unknown>> }).rows;
+      expect(JSON.stringify(rows)).not.toContain("not-a-step");
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      await done;
+    }, 20_000);
+
     it.each(VARIANTS.map(([label]) => label))("the callback redacts credentials before the ingress journals the step (%s)", async (label) => {
       const env = envFor(label);
       const triggerId = newTriggerId();
