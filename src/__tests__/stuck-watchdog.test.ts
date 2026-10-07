@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import type { Job } from "../log.js";
-import type { TicketingProvider } from "../providers/types.js";
+import { makeJob, makeProvider } from "./helpers/builders.js";
 
 vi.mock("../github.js", () => ({
   cancelWorkflowRun: vi.fn().mockResolvedValue(true),
@@ -47,59 +47,18 @@ const mockConfig = {
   notifyWebhookUrl: "https://hooks.slack.com/test",
 };
 
-function makeJob(overrides: Partial<Job> = {}): Job {
-  return {
-    id: 1,
-    issueId: "issue-abc",
-    issueIdentifier: "ENG-42",
-    issueTitle: "Fix the bug",
-    repo: "org/repo",
-    teamKey: "ENG",
-    runId: 99,
-    dispatchedAt: Date.now() - 65 * 60 * 1000,
-    status: "failed",
-    executionMode: "github-actions",
-    conclusion: null,
-    prUrl: null,
-    machineId: null,
-    runnerMode: null,
-    notifiedAt: null,
-    completedAt: null,
-    dispatchNumber: 1,
-    ...overrides,
-  } as unknown as Job;
-}
-
-function makeProvider(overrides: Partial<TicketingProvider> = {}): TicketingProvider {
-  return {
-    id: "linear",
-    clearWorkingState: vi.fn().mockResolvedValue(undefined),
-    postComment: vi.fn().mockResolvedValue(undefined),
-    issueUrl: vi.fn().mockReturnValue("https://linear.app/issue/ENG-42"),
-    fetchAIImplementSnapshot: vi.fn(),
-    fetchLifecycleStates: vi.fn(),
-    markPlanningStarted: vi.fn(),
-    markPlanComplete: vi.fn(),
-    markPlanningFailed: vi.fn(),
-    markImplementing: vi.fn(),
-    markPrReady: vi.fn(),
-    markImplementationFailed: vi.fn(),
-    fetchPlanningContext: vi.fn(),
-    findByKey: vi.fn(),
-    ...overrides,
-  } as unknown as TicketingProvider;
-}
+const stuckJob = (overrides: Partial<Job> = {}) => makeJob({ issueId: "issue-abc", runId: 99, ...overrides });
 
 beforeEach(() => {
   vi.clearAllMocks();
   // Default: getJobById returns a job with null conclusion (no callback yet)
-  vi.mocked(getJobById).mockReturnValue(makeJob({ conclusion: null }));
+  vi.mocked(getJobById).mockReturnValue(stuckJob({ conclusion: null }));
 });
 
 describe("remediateStuckJob — kg-refresh guard", () => {
   it("returns immediately for a kg-refresh phase job — no runner cancel, no retry, no dedup clear", async () => {
     const provider = makeProvider();
-    const job = makeJob({ phase: "kg-refresh" });
+    const job = stuckJob({ phase: "kg-refresh" });
 
     await remediateStuckJob(mockConfig, provider, job, "in_progress");
 
@@ -115,7 +74,7 @@ describe("remediateStuckJob — kg-refresh guard", () => {
 describe("remediateFailedJob — kg-refresh guard", () => {
   it("returns immediately for a kg-refresh phase job — no dedup clear, no alert, no comment", async () => {
     const provider = makeProvider();
-    const job = makeJob({ phase: "kg-refresh" });
+    const job = stuckJob({ phase: "kg-refresh" });
 
     await remediateFailedJob(mockConfig, provider, job, "failure");
 
@@ -130,7 +89,7 @@ describe("remediateFailedJob — kg-refresh guard", () => {
 describe("remediateStuckJob — operator_cancelled guard", () => {
   it("returns immediately when job.conclusion is operator_cancelled — no runner cancel, no retry", async () => {
     const provider = makeProvider();
-    const job = makeJob({ conclusion: "operator_cancelled" });
+    const job = stuckJob({ conclusion: "operator_cancelled" });
 
     await remediateStuckJob(mockConfig, provider, job, "in_progress");
 
@@ -143,9 +102,9 @@ describe("remediateStuckJob — operator_cancelled guard", () => {
 
   it("returns immediately when fresh DB conclusion is operator_cancelled (race: callback fired mid-tick)", async () => {
     // job.conclusion is null (read before callback), but DB was updated during the tick
-    vi.mocked(getJobById).mockReturnValue(makeJob({ conclusion: "operator_cancelled" }));
+    vi.mocked(getJobById).mockReturnValue(stuckJob({ conclusion: "operator_cancelled" }));
     const provider = makeProvider();
-    const job = makeJob({ conclusion: null });
+    const job = stuckJob({ conclusion: null });
 
     await remediateStuckJob(mockConfig, provider, job, "in_progress");
 
@@ -158,7 +117,7 @@ describe("remediateStuckJob — operator_cancelled guard", () => {
   it("still remediates when job.conclusion is null (normal stuck path)", async () => {
     vi.mocked(incrementStuckAttempts).mockReturnValue(1);
     const provider = makeProvider();
-    const job = makeJob({ conclusion: null });
+    const job = stuckJob({ conclusion: null });
 
     await remediateStuckJob(mockConfig, provider, job, "in_progress");
 
@@ -178,7 +137,7 @@ describe("remediateStuckJob — GHA cancel-acceptance is not termination confirm
     vi.mocked(cancelWorkflowRun).mockResolvedValue(true);
     vi.mocked(getWorkflowRunStatus).mockResolvedValue({ status: "in_progress", conclusion: null, html_url: "https://x" });
     const provider = makeProvider();
-    const job = makeJob({ conclusion: null });
+    const job = stuckJob({ conclusion: null });
 
     const stopConfirmed = await remediateStuckJob(mockConfig, provider, job, "in_progress");
 
@@ -195,7 +154,7 @@ describe("remediateStuckJob — GHA cancel-acceptance is not termination confirm
     vi.mocked(cancelWorkflowRun).mockResolvedValue(true);
     vi.mocked(getWorkflowRunStatus).mockResolvedValue({ status: "queued", conclusion: null, html_url: "https://x" });
     const provider = makeProvider();
-    const job = makeJob({ conclusion: null });
+    const job = stuckJob({ conclusion: null });
 
     const stopConfirmed = await remediateStuckJob(mockConfig, provider, job, "in_progress");
 
@@ -210,7 +169,7 @@ describe("remediateStuckJob — GHA cancel-acceptance is not termination confirm
     vi.mocked(cancelWorkflowRun).mockResolvedValue(true);
     vi.mocked(getWorkflowRunStatus).mockResolvedValue({ status: "completed", conclusion: "cancelled", html_url: "https://x" });
     const provider = makeProvider();
-    const job = makeJob({ conclusion: null });
+    const job = stuckJob({ conclusion: null });
 
     const stopConfirmed = await remediateStuckJob(mockConfig, provider, job, "in_progress");
 
@@ -222,7 +181,7 @@ describe("remediateStuckJob — GHA cancel-acceptance is not termination confirm
     vi.mocked(incrementStuckAttempts).mockReturnValue(1);
     vi.mocked(cancelWorkflowRun).mockRejectedValue(new Error("network error"));
     const provider = makeProvider();
-    const job = makeJob({ conclusion: null });
+    const job = stuckJob({ conclusion: null });
 
     const stopConfirmed = await remediateStuckJob(mockConfig, provider, job, "in_progress");
 
@@ -236,9 +195,9 @@ describe("remediateStuckJob — GHA cancel-acceptance is not termination confirm
 
 describe("remediateFailedJob — operator_cancelled guard", () => {
   it("returns immediately when job.conclusion is operator_cancelled — no dedup clear, no alert", async () => {
-    vi.mocked(getJobById).mockReturnValue(makeJob({ conclusion: "operator_cancelled" }));
+    vi.mocked(getJobById).mockReturnValue(stuckJob({ conclusion: "operator_cancelled" }));
     const provider = makeProvider();
-    const job = makeJob({ conclusion: "operator_cancelled" });
+    const job = stuckJob({ conclusion: "operator_cancelled" });
 
     await remediateFailedJob(mockConfig, provider, job, "failure");
 
@@ -251,9 +210,9 @@ describe("remediateFailedJob — operator_cancelled guard", () => {
 
   it("returns immediately when fresh DB conclusion is operator_cancelled (race: callback fired mid-tick)", async () => {
     // job.conclusion is null (read before callback), but DB was updated during the tick
-    vi.mocked(getJobById).mockReturnValue(makeJob({ conclusion: "operator_cancelled" }));
+    vi.mocked(getJobById).mockReturnValue(stuckJob({ conclusion: "operator_cancelled" }));
     const provider = makeProvider();
-    const job = makeJob({ conclusion: null });
+    const job = stuckJob({ conclusion: null });
 
     await remediateFailedJob(mockConfig, provider, job, "failure");
 
@@ -264,9 +223,9 @@ describe("remediateFailedJob — operator_cancelled guard", () => {
 
   it("still remediates when conclusion is exit_1 (normal failure path not affected)", async () => {
     vi.mocked(incrementStuckAttempts).mockReturnValue(1);
-    vi.mocked(getJobById).mockReturnValue(makeJob({ conclusion: "exit_1" }));
+    vi.mocked(getJobById).mockReturnValue(stuckJob({ conclusion: "exit_1" }));
     const provider = makeProvider();
-    const job = makeJob({ conclusion: "exit_1" });
+    const job = stuckJob({ conclusion: "exit_1" });
 
     await remediateFailedJob(mockConfig, provider, job, "exit_1");
 
@@ -276,9 +235,9 @@ describe("remediateFailedJob — operator_cancelled guard", () => {
 
   it("still remediates when conclusion is null (fresh DB also null — normal path)", async () => {
     vi.mocked(incrementStuckAttempts).mockReturnValue(1);
-    vi.mocked(getJobById).mockReturnValue(makeJob({ conclusion: null }));
+    vi.mocked(getJobById).mockReturnValue(stuckJob({ conclusion: null }));
     const provider = makeProvider();
-    const job = makeJob({ conclusion: null });
+    const job = stuckJob({ conclusion: null });
 
     await remediateFailedJob(mockConfig, provider, job, "failure");
 
@@ -287,7 +246,7 @@ describe("remediateFailedJob — operator_cancelled guard", () => {
 });
 
 describe("remediateFailedJob — Restate-owned job (AII-1020)", () => {
-  const provider = { clearWorkingState: vi.fn().mockResolvedValue(true) } as unknown as TicketingProvider;
+  const provider = makeProvider();
 
   beforeEach(() => {
     vi.clearAllMocks();
@@ -297,21 +256,21 @@ describe("remediateFailedJob — Restate-owned job (AII-1020)", () => {
   });
 
   it("returns early without the owner option", async () => {
-    await remediateFailedJob(mockConfig, provider, makeJob({ dispatchId: "d-1", phase: "planning" }), "failure");
+    await remediateFailedJob(mockConfig, provider, stuckJob({ dispatchId: "d-1", phase: "planning" }), "failure");
     expect(incrementStuckAttempts).not.toHaveBeenCalled();
     expect(provider.clearWorkingState).not.toHaveBeenCalled();
     expect(deleteDispatched).not.toHaveBeenCalled();
   });
 
   it("runs the handling with ownerCall", async () => {
-    await remediateFailedJob(mockConfig, provider, makeJob({ dispatchId: "d-1", phase: "planning" }), "failure", { ownerCall: true });
+    await remediateFailedJob(mockConfig, provider, stuckJob({ dispatchId: "d-1", phase: "planning" }), "failure", { ownerCall: true });
     expect(incrementStuckAttempts).toHaveBeenCalledWith("issue-abc");
     expect(provider.clearWorkingState).toHaveBeenCalledOnce();
     expect(deleteDispatched).toHaveBeenCalledWith("issue-abc");
   });
 
   it("ownerCall still skips kg-refresh jobs", async () => {
-    await remediateFailedJob(mockConfig, provider, makeJob({ dispatchId: "d-1", phase: "kg-refresh" }), "failure", { ownerCall: true });
+    await remediateFailedJob(mockConfig, provider, stuckJob({ dispatchId: "d-1", phase: "kg-refresh" }), "failure", { ownerCall: true });
     expect(incrementStuckAttempts).not.toHaveBeenCalled();
   });
 });
