@@ -2310,6 +2310,79 @@ describe("KgRefresh durable workflow", () => {
       return { done };
     }
 
+    // AII-1134: the table the run keeps after `report`.
+    async function deliverSteps(baseUrl: string, triggerId: string) {
+      for (const id of ["clone", "kg-ingest", "kg-snapshot-push"]) {
+        await callWorkflow(baseUrl, "KgRefresh", triggerId, "progress", stepBody(id, "running"));
+        await callWorkflow(baseUrl, "KgRefresh", triggerId, "progress", stepBody(id, "passed", { ended_at: "2026-10-07T00:00:05.000Z" }));
+      }
+    }
+    const expectedTable = ["clone", "kg-ingest", "kg-snapshot-push"].map((id) => ({
+      id, status: "passed", startedAt: "2026-10-07T00:00:00.000Z", endedAt: "2026-10-07T00:00:05.000Z", durationMs: 5000,
+    }));
+
+    it.each(VARIANTS.map(([label]) => label))("the persisted outcome lists the reported steps in pipeline order (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      const { done } = await parkedRun(env.baseUrl(), triggerId);
+      await deliverSteps(env.baseUrl(), triggerId);
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      await done;
+      const persisted = persistCalls.find((o) => o.dispatchId === triggerId);
+      expect(persisted?.steps).toEqual(expectedTable);
+      expect(persisted?.steps?.some((st) => st.id === "kg-tracker-data")).toBe(false);
+    }, 20_000);
+
+    it.each(VARIANTS.map(([label]) => label))("a gate failure after report still persists the step table (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      const { done } = await parkedRun(env.baseUrl(), triggerId);
+      await deliverSteps(env.baseUrl(), triggerId);
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", GENERIC_FAILURE_REPORT);
+      const outcome = await done;
+      expect(outcome.ok).toBe(false);
+      const persisted = persistCalls.find((o) => o.dispatchId === triggerId);
+      expect(persisted?.ok).toBe(false);
+      expect(persisted?.steps).toEqual(expectedTable);
+    }, 20_000);
+
+    it.each(VARIANTS.map(([label]) => label))("a step with only a running body has null endedAt and durationMs (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      const { done } = await parkedRun(env.baseUrl(), triggerId);
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "progress", stepBody("clone", "running"));
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      await done;
+      const persisted = persistCalls.find((o) => o.dispatchId === triggerId);
+      expect(persisted?.steps).toEqual([
+        { id: "clone", status: "running", startedAt: "2026-10-07T00:00:00.000Z", endedAt: null, durationMs: null },
+      ]);
+    }, 20_000);
+
+    it.each(VARIANTS.map(([label]) => label))("a run with no step bodies persists no step table (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      const { done } = await parkedRun(env.baseUrl(), triggerId);
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      await done;
+      const persisted = persistCalls.find((o) => o.dispatchId === triggerId);
+      expect(persisted).toBeDefined();
+      expect(persisted?.steps ?? []).toEqual([]);
+    }, 20_000);
+
+    it.each(VARIANTS.map(([label]) => label))("an admin dry run stores the same table (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+      const done = runWorkflow(env.baseUrl(), triggerId, { dryRun: true });
+      await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
+      await deliverSteps(env.baseUrl(), triggerId);
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", { ok: true });
+      const outcome = await done;
+      const stored = await eventually(() => readAdminDryRun(env.baseUrl()), (v) => v?.at === outcome.at, { label: "durable effect" });
+      expect(stored?.steps).toEqual(expectedTable);
+    }, 20_000);
+
     it.each(VARIANTS.map(([label]) => label))("status names the last reported runner step; a repeat changes nothing (%s)", async (label) => {
       const env = envFor(label);
       const triggerId = newTriggerId();
