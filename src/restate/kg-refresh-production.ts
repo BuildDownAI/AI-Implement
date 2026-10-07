@@ -40,6 +40,7 @@ import {
   type KgRefreshStatusResult,
   type KgRefreshWorkflowDependencies,
 } from "./kg-refresh-workflow.js";
+import { createFlyMachineProfile } from "./fly-machine-profile.js";
 import { createKgRepo, type KgRepoEnqueueInput, type KgRepoEnqueueResult, type KgRepoPrInput, type KgRepoTriggerResult, type StoredDryRunOutcome } from "./kg-repo.js";
 import type { KgRefreshDefinition, KgRepoDefinition } from "./kg-refresh-types.js";
 import { RESTATE_INGRESS_BASE_URL } from "./server.js";
@@ -403,7 +404,7 @@ export function createProductionKgRefreshServices(
   };
 
   return {
-    services: [createKgRepo({ workflowName: "KgRefresh" }), createKgRefreshWorkflow(deps)],
+    services: [createKgRepo({ workflowName: "KgRefresh" }), createFlyMachineProfile(), createKgRefreshWorkflow(deps)],
     toolDeps,
   };
 }
