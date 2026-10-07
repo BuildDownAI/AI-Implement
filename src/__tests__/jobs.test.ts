@@ -609,7 +609,7 @@ describe("schema migration", () => {
     log.initLogTable();
 
     const byIssue = new Map(log.listLog().map((j) => [j.issueId, j]));
-    for (const st of ["failed", "completed", "timed_out", "review_failed"]) {
+    for (const st of ["failed", "completed", "timed_out", "review_failed", "dispatch-failed"]) {
       expect(byIssue.get(`closed-${st}`)?.status).toBe(st);
       expect(byIssue.get(`closed-${st}`)?.conclusion).toBe("dispatch_rejected");
     }
