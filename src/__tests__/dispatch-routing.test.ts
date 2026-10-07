@@ -783,6 +783,8 @@ describe("Fly and local boot tokens are scoped to the target repository (AII-853
       runToken: "run-token",
       runProgressToken: "progress-token",
       dispatchId: "kg-dispatch-1",
+      machine: { cpuKind: "shared" as const, cpus: 1, memoryMb: 512 },
+      machineId: null,
       runConfig: encodeRunConfig({ v: 1, issue: { id: "kg-refresh", identifier: "KG-REFRESH", title: "KG ingest", description: "" } }),
       executionPath,
     });
