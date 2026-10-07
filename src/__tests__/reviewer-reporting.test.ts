@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import { postPushReviewStep } from "../pipeline/steps/post-push-review.js";
-import type { PipelineContext } from "../pipeline/types.js";
 import { readFileSync } from "node:fs";
+import { makeContext } from "./helpers/builders.js";
+import { testDir } from "./helpers/test-dir.js";
 
 const checks = [{
   check: "Pulse speed matches the requested behavior",
@@ -32,13 +33,10 @@ async function runReview(verdict: Record<string, unknown>, externalPending = fal
     stdout: "", exitCode: 0, tokensUsed: 100, structuredOutput: verdict,
     terminalStatus: { subtype: "success", isError: false },
   }));
-  const context = {
-    data: { issueId: "filesystem:SAN:SAN-1", issueIdentifier: "SAN-1", issueTitle: "Slow the pulse", issueDescription: "Slow the animation" },
-    llmExecutor: { invoke }, getOutputs: () => ({}), setOutputs: () => {}, resolveInputs: (i: unknown) => i,
-  } as unknown as PipelineContext;
+  const context = makeContext({}, { invoke });
   const report = vi.fn(async (_row: Record<string, any>) => {});
   const result = await postPushReviewStep.run(context, {
-    prNumber: "42", workspaceDir: "/tmp", maxIterations, ghSpawn,
+    prNumber: "42", workspaceDir: testDir("reviewer-reporting"), maxIterations, ghSpawn,
     gitSpawn: () => ({ stdout: "", exitCode: 0 }),
     reviewProviders: externalPending ? ["github-claude-code-review"] : [],
     sleep: async () => {}, reviewWaitPollMs: 1, reviewWaitTimeoutMs: 2,
