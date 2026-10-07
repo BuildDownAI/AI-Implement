@@ -525,7 +525,7 @@ describe("KgRefresh durable workflow", () => {
 
   // KgRefresh.run is ingressPrivate (AII-976): production starts it by a send from KgRepo. This
   // forwarder stands in for that caller so a scenario can start a run with its own trigger id.
-  async function runWorkflow(baseUrl: string, triggerId: string, extra: Record<string, unknown> = {}): Promise<Promise<RefreshOutcome>> {
+  async function runWorkflow(baseUrl: string, triggerId: string, extra: Record<string, unknown> = {}): Promise<RefreshOutcome> {
     return callService<RefreshOutcome>(baseUrl, "KgRefreshStarter", "start", { triggerId, input: { triggerId, ...extra } });
   }
 
@@ -2239,7 +2239,7 @@ describe("KgRefresh durable workflow", () => {
     const runnerStep = (baseUrl: string, triggerId: string) =>
       callWorkflow<{ runnerStep: { id: string; status: string } | null }>(baseUrl, "KgRefresh", triggerId, "status").then((st) => st.runnerStep);
 
-    // `runWorkflow` resolves to a promise; wrapping it keeps `await` from waiting for the whole run.
+    // `runWorkflow` returns the run's own promise; wrapping it in an object keeps `await` from waiting for the whole run.
     async function parkedRun(baseUrl: string, triggerId: string): Promise<{ done: Promise<RefreshOutcome> }> {
       makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
       const done = runWorkflow(baseUrl, triggerId);
