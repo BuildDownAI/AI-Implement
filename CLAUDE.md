@@ -103,7 +103,8 @@ Entry points for areas that are easy to miss. Each names the module to start fro
 | Deploying, clients, Bedrock | `src/deploy.ts` and its `deploy-*` siblings | [docs/deployment.md](docs/deployment.md) |
 | Ticketing provider abstraction | `src/providers/` — `linear.ts`, `jira.ts`, `registry.ts` | [docs/ticketing-providers.md](docs/ticketing-providers.md) |
 | Jira base branch (per-issue PR target) | `src/base-branch.ts` | [docs/jira-base-branch.md](docs/jira-base-branch.md) |
-| Execution backends | `src/fly-machines.ts`, `src/local-docker.ts`, `src/github.ts` | |
+| Execution backends | `src/fly-machines.ts`, `src/local-docker.ts`, `src/github.ts` | [docs/fly-machine-lifecycle.md](docs/fly-machine-lifecycle.md) |
+| Durable runner (kept Fly machine per pipeline) | `src/restate/fly-machine-profile.ts` | [docs/fly-machine-lifecycle.md](docs/fly-machine-lifecycle.md), [ADR 037](docs/adr/037-a-durable-runner-is-a-profile-object-that-owns-one-kept-machine.md) |
 | Runner callbacks and tokens | `src/runner-callback.ts`, `src/runner-token.ts`, `src/token-vending.ts` | [docs/runner-callbacks.md](docs/runner-callbacks.md) |
 | Merge reconciliation | `src/reconciliation.ts`, `src/reconcile-merged.ts`, `src/poll-merged-prs.ts` | |
 | Workflow sync to target repos | `src/workflow-sync.ts`, `src/workflow-sync-queue.ts` | [docs/workflow-sync.md](docs/workflow-sync.md) |
