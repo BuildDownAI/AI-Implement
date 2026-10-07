@@ -135,7 +135,7 @@ The admin API is loopback, so `GET /api/restate/journal` reads it for the operat
 
 - **Lookup:** `?service=<name>&key=<key>` (newest invocation by `created_at`) or `?id=<invocation id>`. Each value is 1-128 characters of `[A-Za-z0-9._:-]`, checked by `validateJournalLookup` and then still passed through `sqlQuote`. A bad lookup is a 400 naming the field.
 - **Answer:** `{ invocation, entries, promises }`. Entries are trimmed to `index, entryType, name, completed, promiseName, appendedAt, sleepWakeupAt, entry`. `entry` is the parsed `entry_json`, or `null` when it is over 4096 characters or unparseable, so one read stays near 100 KB even with a large `report` body. Promises are scoped by the invocation's own service and key, so the `id` form finds them too; a keyless service has no key (`NULL`), so it has no promise rows and the promises list is empty.
-- **Status codes:** 404 `{ error: "no invocation" }` when nothing matches (rows survive only within `restate_retention_days`), 503 `{ error: "restate unavailable" }` when the admin API call throws.
+- **Status codes:** 404 `{ error: "no invocation" }` when nothing matches (rows survive only within the run kind's retention, 7 days today; see "Retention" below), 503 `{ error: "restate unavailable" }` when the admin API call throws.
 - **Access:** an admin, or a user granted the `journal` page (`PAGE_ROUTES.journal`). The page has no UI yet, so it is not in the sidebar.
 
 ### Sidecar environment is an explicit allowlist, never `...process.env` (AII-728)
