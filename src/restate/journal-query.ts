@@ -82,11 +82,12 @@ export async function readJournal(
 
   const journalRows = await runIntrospectionQuery(fetchImpl, adminBaseUrl, queries.journal(String(invocation.id)));
   // Scoped by the row's own service and key, so the { id } form resolves the same promises.
-  const promises = await runIntrospectionQuery(
-    fetchImpl,
-    adminBaseUrl,
-    queries.promises(String(invocation.target_service_name), String(invocation.target_service_key)),
-  );
+  // A keyless service has a NULL key and no promises; skip the query rather than match the string 'null'.
+  const promiseKey = invocation.target_service_key;
+  const promises =
+    typeof promiseKey === "string" && promiseKey !== ""
+      ? await runIntrospectionQuery(fetchImpl, adminBaseUrl, queries.promises(String(invocation.target_service_name), promiseKey))
+      : [];
 
   return {
     invocation,

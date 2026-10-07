@@ -129,6 +129,15 @@ None of the four is an admin-UI setting — every consumer is a same-machine pee
 - `RESTATE_BASE_DIR` → the top-level `base-dir` config key, set to `restateDataDir()`
 - `RESTATE_BIND_ADDRESS` → the top-level `bind-address` config key (the fabric port, above)
 
+### Reading an invocation's journal (AII-1128)
+
+The admin API is loopback, so `GET /api/restate/journal` reads it for the operator (`src/restate/journal-query.ts`, route in `src/admin.ts`). It reuses `runIntrospectionQuery` and `sqlQuote` from `endpoint.ts` to query `sys_invocation`, `sys_journal` and `sys_promise`. `/query` itself is never exposed: a free SQL endpoint over the introspection tables is a different trust decision.
+
+- **Lookup:** `?service=<name>&key=<key>` (newest invocation by `created_at`) or `?id=<invocation id>`. Each value is 1-128 characters of `[A-Za-z0-9._:-]`, checked by `validateJournalLookup` and then still passed through `sqlQuote`. A bad lookup is a 400 naming the field.
+- **Answer:** `{ invocation, entries, promises }`. Entries are trimmed to `index, entryType, name, completed, promiseName, appendedAt, sleepWakeupAt, entry`. `entry` is the parsed `entry_json`, or `null` when it is over 4096 characters or unparseable, so one read stays near 100 KB even with a large `report` body. Promises are scoped by the invocation's own service and key, so the `id` form finds them too; a keyless service has no key (`NULL`), so it has no promise rows and the promises list is empty.
+- **Status codes:** 404 `{ error: "no invocation" }` when nothing matches (rows survive only within `restate_retention_days`), 503 `{ error: "restate unavailable" }` when the admin API call throws.
+- **Access:** an admin, or a user granted the `journal` page (`PAGE_ROUTES.journal`). The page has no UI yet, so it is not in the sidebar.
+
 ### Sidecar environment is an explicit allowlist, never `...process.env` (AII-728)
 
 `RestateSidecar.start()` builds the spawned child's environment (`childEnv`, `src/restate/server.ts`) from an explicit allowlist rather than spreading the orchestrator's full `process.env`: the sidecar is a separate binary with no business seeing the GitHub App key, ticketing credentials, or anything else the orchestrator process holds. The allowlist is:
