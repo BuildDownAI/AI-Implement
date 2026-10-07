@@ -79,7 +79,7 @@ What a `user` may open beyond `/mcp`. Stored one row per page in `access_page_gr
 
 **Grantability is a property of the page, and lives only on the server.** `PAGE_ROUTES` in `src/access-page-grants.ts` maps each grantable page to the exact API paths it may read, and is the single definition of what can be granted — a page is grantable *because* someone declared what it reads. Two consequences follow without anyone maintaining a second list: a page added to the sidebar is ungrantable until it appears there, and an endpoint added later is Admin-only until it is listed.
 
-Currently grantable: Issues, Pipelines, Pull requests, Blockers, Reports, Pipelines & steps, Sessions, Reaper, Audit log, Customizations. Read the constant rather than this sentence when it matters.
+Currently grantable: Issues, Pipelines, Pull requests, Blockers, Reports, Pipelines & steps, Sessions, Reaper, Audit log, Customizations, Journal. Read the constant rather than this sentence when it matters.
 
 **A grant admits exact paths by `GET`, and nothing else.** Prefix matching is deliberately unsupported, because a prefix would also grant sub-paths added under it later — the opposite of failing closed. The useful consequence is that every mutating route stays Admin-only for free: `DELETE /api/dedup/{id}` is refused for a user holding the Audit grant, without anyone having to enumerate it.
 

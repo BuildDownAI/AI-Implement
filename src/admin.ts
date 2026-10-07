@@ -483,6 +483,12 @@ export interface AdminDeps {
    * don't exercise the five `/api/review-fix/attempts/*` routes, which then answer 501.
    */
   reviewFixAttempts?: ReviewFixAttemptsFacade;
+  /**
+   * Answers GET /api/restate/journal from the query parameters (src/restate/journal-query.ts's
+   * handleJournalRequest). Injected for the same reason as `getRestateStatus`: this file may
+   * only import src/restate/* as types. Absent only in tests that don't exercise the route, which then answers 501.
+   */
+  readJournal?: (query: Record<string, string>) => Promise<{ status: number; body: unknown }>;
 }
 
 /** Caller identity passed into every `reviewFixAttempts` facade call, so scope and
@@ -768,6 +774,19 @@ export function handleAdminRequest(
             (err) => json(res, 500, { error: String(err) }),
           );
         },
+        (err) => json(res, 500, { error: String(err) }),
+      );
+      return true;
+    }
+
+    if (url.split("?")[0] === "/api/restate/journal" && method === "GET") {
+      if (!deps.readJournal) {
+        json(res, 501, { error: "journal is not configured" });
+        return true;
+      }
+      const query = Object.fromEntries(new URL(url, "http://localhost").searchParams);
+      deps.readJournal(query).then(
+        (r) => json(res, r.status, r.body),
         (err) => json(res, 500, { error: String(err) }),
       );
       return true;
