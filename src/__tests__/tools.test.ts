@@ -876,6 +876,15 @@ describe("migrated read handlers (AII-711)", () => {
       expect((await stageFor({})).restate).toBeNull();
     });
 
+    it("a stored last-refresh record without steps still reads, and one with steps passes them through", async () => {
+      const status = await stageFor({ last: ok });
+      expect(status.lastRefresh).toBeTruthy();
+      expect(status.lastRefresh).not.toHaveProperty("steps");
+      const steps = [{ id: "clone", status: "passed", startedAt: "t0", endedAt: "t1", durationMs: 1 }];
+      const withSteps = await stageFor({ last: { ...ok, steps } as RefreshOutcome });
+      expect((withSteps.lastRefresh as { steps?: unknown }).steps).toEqual(steps);
+    });
+
     it("keeps the KgRefreshStatus shape", async () => {
       const status = await stageFor({ last: ok });
       expect(Object.keys(status).sort()).toEqual(

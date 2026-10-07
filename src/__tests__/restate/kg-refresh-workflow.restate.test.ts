@@ -2333,6 +2333,43 @@ describe("KgRefresh durable workflow", () => {
       expect(persisted?.steps?.some((st) => st.id === "kg-tracker-data")).toBe(false);
     }, 20_000);
 
+    it.each(VARIANTS.map(([label]) => label))("a gate failure after report still persists the step table (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      const { done } = await parkedRun(env.baseUrl(), triggerId);
+      await deliverSteps(env.baseUrl(), triggerId);
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", GENERIC_FAILURE_REPORT);
+      const outcome = await done;
+      expect(outcome.ok).toBe(false);
+      const persisted = persistCalls.find((o) => o.dispatchId === triggerId);
+      expect(persisted?.ok).toBe(false);
+      expect(persisted?.steps).toEqual(expectedTable);
+    }, 20_000);
+
+    it.each(VARIANTS.map(([label]) => label))("a step with only a running body has null endedAt and durationMs (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      const { done } = await parkedRun(env.baseUrl(), triggerId);
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "progress", stepBody("clone", "running"));
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      await done;
+      const persisted = persistCalls.find((o) => o.dispatchId === triggerId);
+      expect(persisted?.steps).toEqual([
+        { id: "clone", status: "running", startedAt: "2026-10-07T00:00:00.000Z", endedAt: null, durationMs: null },
+      ]);
+    }, 20_000);
+
+    it.each(VARIANTS.map(([label]) => label))("a run with no step bodies persists no step table (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      const { done } = await parkedRun(env.baseUrl(), triggerId);
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      await done;
+      const persisted = persistCalls.find((o) => o.dispatchId === triggerId);
+      expect(persisted).toBeDefined();
+      expect(persisted?.steps ?? []).toEqual([]);
+    }, 20_000);
+
     it.each(VARIANTS.map(([label]) => label))("an admin dry run stores the same table (%s)", async (label) => {
       const env = envFor(label);
       const triggerId = newTriggerId();
