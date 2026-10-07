@@ -7,6 +7,7 @@ import type { ReviewFixResultMetadataV1, WorkerTerminalOutcome } from "../../rev
 import type { PreparedReviewFixAttempt } from "../../review-fix-ports.js";
 import { createReviewFixAttempt, REVIEW_FIX_RETENTION_MS, type ReviewFixAttemptCompletion } from "../../restate/review-fix-attempt.js";
 import { VARIANTS, attachWorkflow, callWorkflow, replaceEndpoint, startRetryEnabled, startVariants, stopAll } from "./harness.js";
+import { makeReviewFixResult } from "../helpers/builders.js";
 
 const SHA = "a".repeat(40);
 const EXECUTION = { githubRunId: 782, githubRunAttempt: 1 };
@@ -50,11 +51,10 @@ function newFake(mode: LaunchMode, deadlineMs = 4_000): FakeAttempt {
 }
 
 function resultOf(fake: FakeAttempt, overrides: Partial<ReviewFixResultMetadataV1> = {}): ReviewFixResultMetadataV1 {
-  return {
-    version: 1, attemptId: fake.prepared.attemptId,
-    ...fake.prepared.scope, deadlineAt: fake.prepared.deadlineAt,
+  return makeReviewFixResult({
+    attemptId: fake.prepared.attemptId, ...fake.prepared.scope, deadlineAt: fake.prepared.deadlineAt,
     ...EXECUTION, outputCommit: SHA, ...overrides,
-  };
+  });
 }
 
 async function until(predicate: () => boolean, timeoutMs = 8_000): Promise<void> {

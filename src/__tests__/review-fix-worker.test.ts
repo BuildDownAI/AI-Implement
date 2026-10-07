@@ -9,83 +9,35 @@
  * `npm run typecheck` excludes `src/__tests__`; this file is additionally
  * type-checked via `npx tsc --noEmit -p tsconfig.review-fix-worker-tests.json`.
  */
-import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
-import os from "node:os";
-import path from "node:path";
-import fs from "node:fs";
-import type * as DedupModule from "../dedup.js";
+import { describe, expect, it, beforeEach, vi } from "vitest";
 import type * as ConfigModule from "../config.js";
 import type * as WorkerModule from "../review-fix-worker.js";
 import type * as AttemptStoreModule from "../review-fix-attempt-store.js";
 import type { RepoMapping } from "../config.js";
 import type { ScopedPrIdentity } from "../review-fix-contract.js";
 import type { PreparedReviewFixAttempt } from "../review-fix-ports.js";
+import { makeMapping, makeScopedPrIdentity } from "./helpers/builders.js";
+import { testDb } from "./helpers/test-db.js";
 
-let dbPath: string;
-let dedup: typeof DedupModule;
 let config: typeof ConfigModule;
 let workerModule: typeof WorkerModule;
 let attemptStoreModule: typeof AttemptStoreModule;
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(
-    os.tmpdir(),
-    `review-fix-worker-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-  );
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  config = await import("../config.js");
-  workerModule = await import("../review-fix-worker.js");
-  attemptStoreModule = await import("../review-fix-attempt-store.js");
+  ({ config, workerModule, attemptStoreModule } = (await testDb({
+    modules: {
+      config: () => import("../config.js"),
+      workerModule: () => import("../review-fix-worker.js"),
+      attemptStoreModule: () => import("../review-fix-attempt-store.js"),
+    },
+  })).modules);
 });
 
-afterEach(() => {
-  dedup.closeDb();
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
-});
-
-const SCOPE: ScopedPrIdentity = { installationId: 7, repository: "eudoxus/ai-implement", prNumber: 42 };
 const INSTALLATION_ID = 7;
-
-function mapping(overrides: Partial<RepoMapping> & Pick<RepoMapping, "owner" | "repo"> = { owner: "eudoxus", repo: "ai-implement" }): RepoMapping {
-  return {
-    workflowFile: "claude-implement.yml",
-    defaultBranch: "main",
-    maxInProgressAiIssues: 3,
-    executionMode: "github-actions",
-    sessionMode: "autonomous",
-    machineCpus: 2,
-    machineMemoryMb: 4096,
-    planningEnabled: false,
-    planningWorkflowFile: "",
-    autoApprovePlans: true,
-    autoMerge: false,
-    extraEnv: {},
-    provider: "anthropic",
-    ticketingProvider: "linear",
-    ticketingConfig: { kind: "linear" },
-    awsRegion: null,
-    paused: false,
-    maxTurns: null,
-    maxIterations: null,
-    maxJobMinutes: null,
-    branchPrefix: null,
-    skillsRepo: null,
-    sensitiveAddPatterns: null,
-    sensitiveAllowPatterns: null,
-    dependencyTokenScope: null,
-    memoryProviderId: null,
-    referenceRepos: null,
-    reviewers: null,
-    reviewFixLifecycle: null,
-    ...overrides,
-  };
-}
+const SCOPE = makeScopedPrIdentity({ installationId: INSTALLATION_ID, repository: "eudoxus/ai-implement" });
 
 function seedMapping(overrides: Partial<RepoMapping> = {}): void {
-  config.initMappingsTable();
-  config.upsertMapping("AII", mapping({ owner: "eudoxus", repo: "ai-implement", ...overrides }));
+  config.upsertMapping("AII", makeMapping({ owner: "eudoxus", repo: "ai-implement", ...overrides }));
 }
 
 function makeAttempt(overrides: Partial<PreparedReviewFixAttempt> = {}): PreparedReviewFixAttempt {
@@ -297,8 +249,7 @@ describe("GithubReviewFixWorker.launch", () => {
   });
 
   it("returns unknown, never throws, when the mapping cannot be resolved", async () => {
-    // Table exists but carries no mapping for this repository.
-    config.initMappingsTable();
+    // The table exists (testDb creates every boot table) but carries no mapping for this repository.
     const { resolver } = makeCredentials();
     const t = makeTransport();
 

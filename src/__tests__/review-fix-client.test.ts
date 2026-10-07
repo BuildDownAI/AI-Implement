@@ -3,46 +3,36 @@
 // fetch (consistent with tools-client.ts's own unit tests, tools.test.ts) and the pump is
 // exercised against the real durable inbox (review-fix-inbox.ts, AII-781) backed by a
 // throwaway SQLite file, with a fake facade standing in for the sidecar.
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import type * as DedupModule from "../dedup.js";
 import type * as InboxModule from "../review-fix-inbox.js";
 import type * as ClientModule from "../restate/review-fix-client.js";
+import type * as DeployHoldModule from "../deploy-hold.js";
+import type * as ContractModule from "../review-fix-contract.js";
 import type { ScopedPrIdentity } from "../review-fix-contract.js";
+import { makeReviewFixResult, makeScopedPrIdentity } from "./helpers/builders.js";
+import { fakeFetch, hangUntilAborted, type Routes } from "./helpers/fake-fetch.js";
+import { testDb } from "./helpers/test-db.js";
 
-let dbPath: string;
 let dedup: typeof DedupModule;
 let inbox: typeof InboxModule;
 let client: typeof ClientModule;
+let deployHold: typeof DeployHoldModule;
+let contract: typeof ContractModule;
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(
-    os.tmpdir(),
-    `review-fix-client-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-  );
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  inbox = await import("../review-fix-inbox.js");
-  client = await import("../restate/review-fix-client.js");
-  dedup.getDb();
+  ({ dedup, inbox, client, deployHold, contract } = (await testDb({
+    modules: {
+      dedup: () => import("../dedup.js"),
+      inbox: () => import("../review-fix-inbox.js"),
+      client: () => import("../restate/review-fix-client.js"),
+      deployHold: () => import("../deploy-hold.js"),
+      contract: () => import("../review-fix-contract.js"),
+    },
+  })).modules);
 });
-
-afterEach(() => {
-  dedup.closeDb();
-  try {
-    fs.unlinkSync(dbPath);
-  } catch {
-    /* ignore */
-  }
-  vi.unstubAllGlobals();
-});
-
-function makeDestination(overrides: Partial<ScopedPrIdentity> = {}): ScopedPrIdentity {
-  return { installationId: 7, repository: "acme/app", prNumber: 42, ...overrides };
-}
 
 function makeFakeFacade(overrides: Partial<ClientModule.ReviewFixDeliveryFacade> = {}): ClientModule.ReviewFixDeliveryFacade {
   return {
@@ -55,71 +45,48 @@ function makeFakeFacade(overrides: Partial<ClientModule.ReviewFixDeliveryFacade>
 
 describe("createRestateReviewFixFacade", () => {
   it("posts to the ReviewFixPR object's feedback handler with an idempotency-key header", async () => {
-    const calls: Array<{ url: string; init: RequestInit }> = [];
-    const fetchImpl = vi.fn(async (url: string, init: RequestInit) => {
-      calls.push({ url: String(url), init });
-      return { ok: true } as Response;
-    });
-    const facade = client.createRestateReviewFixFacade({ ingressBaseUrl: "http://sidecar", fetchImpl: fetchImpl as unknown as typeof fetch });
+    const destination = makeScopedPrIdentity({ installationId: 7, repository: "acme/app" });
+    const feedbackPath = `/ReviewFixPR/${encodeURIComponent(JSON.stringify([7, "acme/app", 42]))}/feedback` as const;
+    const sidecar = fakeFetch({ [`POST ${feedbackPath}`]: {} });
+    const facade = client.createRestateReviewFixFacade({ ingressBaseUrl: "http://sidecar", fetchImpl: sidecar.fetch });
 
-    const outcome = await facade.deliverFeedback(makeDestination(), "feedback:github:evt-1");
+    const outcome = await facade.deliverFeedback(destination, "feedback:github:evt-1");
 
     expect(outcome).toEqual({ status: "accepted" });
-    expect(calls).toHaveLength(1);
-    expect(calls[0]!.url).toBe(`http://sidecar/ReviewFixPR/${encodeURIComponent(JSON.stringify([7, "acme/app", 42]))}/feedback`);
-    expect(calls[0]!.init.method).toBe("POST");
-    expect((calls[0]!.init.headers as Record<string, string>)["idempotency-key"]).toBe("feedback:github:evt-1");
+    expect(sidecar.calls).toHaveLength(1);
+    expect(sidecar.calls[0]!.url.href).toBe(`http://sidecar${feedbackPath}`);
+    expect(sidecar.calls[0]!.headers.get("idempotency-key")).toBe("feedback:github:evt-1");
   });
 
   it("degrades a connection failure to unavailable rather than throwing", async () => {
-    const fetchImpl = vi.fn(async () => {
-      throw new Error("ECONNREFUSED");
+    const sidecar = fakeFetch({
+      "POST /ReviewFixAttempt/attempt-1/cancel": () => {
+        throw new Error("ECONNREFUSED");
+      },
     });
-    const facade = client.createRestateReviewFixFacade({ fetchImpl: fetchImpl as unknown as typeof fetch });
+    const facade = client.createRestateReviewFixFacade({ fetchImpl: sidecar.fetch });
 
     const outcome = await facade.deliverCancel("attempt-1", "cancellation:github:evt-1");
     expect(outcome).toEqual({ status: "unavailable" });
   });
 
   it("degrades a non-2xx response to unavailable", async () => {
-    const fetchImpl = vi.fn(async () => ({ ok: false, status: 503 }) as Response);
-    const facade = client.createRestateReviewFixFacade({ fetchImpl: fetchImpl as unknown as typeof fetch });
+    const sidecar = fakeFetch({ "POST /ReviewFixAttempt/attempt-1/result": { status: 503 } });
+    const facade = client.createRestateReviewFixFacade({ fetchImpl: sidecar.fetch });
 
-    const outcome = await facade.deliverResult(
-      {
-        version: 1,
-        attemptId: "attempt-1",
-        installationId: 7,
-        repository: "acme/app",
-        prNumber: 42,
-        deadlineAt: Date.now() + 1000,
-        githubRunId: 1,
-        githubRunAttempt: 1,
-        outputCommit: "a".repeat(40),
-      },
-      "result:github:evt-1",
-    );
+    const outcome = await facade.deliverResult(makeReviewFixResult(), "result:github:evt-1");
     expect(outcome).toEqual({ status: "unavailable" });
   });
 
   it("treats a request that never resolves as unavailable once the configured timeout elapses, instead of hanging forever", async () => {
-    // Simulates a stalled sidecar connection: fetch never resolves on its own, but must
-    // still react to the AbortSignal invoke() is expected to pass through fetchImpl's init.
-    const fetchImpl = vi.fn(
-      (_url: string, init?: RequestInit) =>
-        new Promise<Response>((_resolve, reject) => {
-          init?.signal?.addEventListener("abort", () => reject(new Error("The operation was aborted")));
-        }),
-    );
-    const facade = client.createRestateReviewFixFacade({
-      fetchImpl: fetchImpl as unknown as typeof fetch,
-      timeoutMs: 20,
-    });
+    // A stalled sidecar connection: the request answers only by rejecting once invoke()'s signal aborts it.
+    const sidecar = fakeFetch({ "POST /ReviewFixAttempt/attempt-1/cancel": hangUntilAborted });
+    const facade = client.createRestateReviewFixFacade({ fetchImpl: sidecar.fetch, timeoutMs: 20 });
 
     const outcome = await facade.deliverCancel("attempt-1", "cancellation:github:evt-1");
 
     expect(outcome).toEqual({ status: "unavailable" });
-    expect((fetchImpl.mock.calls[0]![1] as RequestInit).signal).toBeInstanceOf(AbortSignal);
+    expect(sidecar.calls[0]!.signal).toBeInstanceOf(AbortSignal);
   });
 });
 
@@ -152,10 +119,8 @@ describe("ReviewFixDeliveryPump — mark-delivered only on acceptance", () => {
   });
 
   it("delivers cancellation during a real deploy hold and resumes queued feedback afterward", async () => {
-    const { initSettingsTable } = await import("../runner-mode.js");
-    const { setDeployHold, clearDeployHold } = await import("../deploy-hold.js");
-    initSettingsTable();
-    const destination = makeDestination();
+    const { setDeployHold, clearDeployHold } = deployHold;
+    const destination = makeScopedPrIdentity();
     inbox.acceptDelivery({ authenticatedSource: "github", deliveryId: "feedback-held", kind: "feedback", destination, payload: {} });
     inbox.acceptDelivery({ authenticatedSource: "github", deliveryId: "cancel-live", kind: "cancellation", destination, payload: { attemptId: "attempt-1" } });
     const facade = makeFakeFacade();
@@ -174,7 +139,7 @@ describe("ReviewFixDeliveryPump — mark-delivered only on acceptance", () => {
     expect(inbox.getDelivery("github", "feedback-held")?.deliveryState).toBe("delivered");
   });
   it("never acks when the facade reports unavailable, leaving the row claimed", async () => {
-    const destination = makeDestination();
+    const destination = makeScopedPrIdentity();
     inbox.acceptDelivery({
       authenticatedSource: "github",
       deliveryId: "evt-1",
@@ -195,7 +160,7 @@ describe("ReviewFixDeliveryPump — mark-delivered only on acceptance", () => {
   });
 
   it("acks exactly the delivered row when the facade accepts", async () => {
-    const destination = makeDestination();
+    const destination = makeScopedPrIdentity();
     inbox.acceptDelivery({
       authenticatedSource: "github",
       deliveryId: "evt-2",
@@ -217,7 +182,7 @@ describe("ReviewFixDeliveryPump — mark-delivered only on acceptance", () => {
 
 describe("ReviewFixDeliveryPump — transient retry", () => {
   it("redelivers the same pending row after the sidecar recovers, without fabricating a new identity", async () => {
-    const destination = makeDestination();
+    const destination = makeScopedPrIdentity();
     inbox.acceptDelivery({
       authenticatedSource: "github",
       deliveryId: "evt-flaky",
@@ -253,7 +218,7 @@ describe("ReviewFixDeliveryPump — transient retry", () => {
 
 describe("ReviewFixDeliveryPump — restart recovery", () => {
   it("picks up a row left claimed by a crashed pump instance instead of ignoring it as in-flight", async () => {
-    const destination = makeDestination();
+    const destination = makeScopedPrIdentity();
     inbox.acceptDelivery({
       authenticatedSource: "github",
       deliveryId: "evt-crash",
@@ -308,7 +273,7 @@ describe("ReviewFixDeliveryPump — clean stop", () => {
 
 describe("ReviewFixDeliveryPump — drain pause", () => {
   it("prevents new claims while leaving an already-claimed row untouched for resumption", async () => {
-    const destination = makeDestination();
+    const destination = makeScopedPrIdentity();
     inbox.acceptDelivery({
       authenticatedSource: "github",
       deliveryId: "evt-paused",
@@ -343,7 +308,7 @@ describe("ReviewFixDeliveryPump — drain pause", () => {
 
 describe("ReviewFixDeliveryPump — barrier re-check mid-batch", () => {
   it("finishes cancellation but starts no new feedback after the deploy hold begins", async () => {
-    const destination = makeDestination();
+    const destination = makeScopedPrIdentity();
     for (const [index, deliveryId, kind] of [[1, "feedback-a", "feedback"], [2, "feedback-b", "feedback"], [3, "cancel-c", "cancellation"]] as const) {
       inbox.acceptDelivery({ authenticatedSource: "github", deliveryId, kind, destination, payload: { attemptId: "attempt-1" } });
       dedup.getDb().prepare("UPDATE review_fix_inbox SET accepted_at = ? WHERE event_id = ?").run(index, deliveryId);
@@ -367,7 +332,7 @@ describe("ReviewFixDeliveryPump — barrier re-check mid-batch", () => {
   // keep initiating endpoint calls for the rest of the claimed batch even after the
   // caller believed delivery had stopped.
   function acceptTwo(prefix: string): ScopedPrIdentity {
-    const destination = makeDestination();
+    const destination = makeScopedPrIdentity();
     inbox.acceptDelivery({ authenticatedSource: "github", deliveryId: `${prefix}-a`, kind: "feedback", destination, payload: {} });
     inbox.acceptDelivery({ authenticatedSource: "github", deliveryId: `${prefix}-b`, kind: "feedback", destination, payload: {} });
     return destination;
@@ -423,7 +388,7 @@ describe("ReviewFixDeliveryPump — barrier re-check mid-batch", () => {
 
 describe("ReviewFixDeliveryPump — invalid payload vs. facade unavailable", () => {
   it("reports a locally-invalid cancellation payload separately from a genuine facade outage, in both the reschedule cadence and status()", async () => {
-    const destination = makeDestination();
+    const destination = makeScopedPrIdentity();
     inbox.acceptDelivery({
       authenticatedSource: "runner",
       deliveryId: "evt-poison",
@@ -451,7 +416,7 @@ describe("ReviewFixDeliveryPump — invalid payload vs. facade unavailable", () 
   });
 
   it("counts a genuine facade outage under lastTickUnavailable, not lastTickInvalid", async () => {
-    const destination = makeDestination();
+    const destination = makeScopedPrIdentity();
     inbox.acceptDelivery({ authenticatedSource: "github", deliveryId: "evt-down", kind: "feedback", destination, payload: {} });
 
     const facade = makeFakeFacade({ deliverFeedback: vi.fn(async () => ({ status: "unavailable" }) as const) });
@@ -466,7 +431,7 @@ describe("ReviewFixDeliveryPump — invalid payload vs. facade unavailable", () 
   });
 
   it("never logs a secret-shaped value from a malformed stored result's version field", async () => {
-    const destination = makeDestination();
+    const destination = makeScopedPrIdentity();
     const secret = "super-secret-token-value";
     inbox.acceptDelivery({
       authenticatedSource: "runner",
@@ -502,7 +467,7 @@ describe("ReviewFixDeliveryPump — invalid payload vs. facade unavailable", () 
 
 describe("ReviewFixDeliveryPump — routing", () => {
   it("routes a result event to deliverResult with the validated, secret-free payload", async () => {
-    const destination = makeDestination();
+    const destination = makeScopedPrIdentity();
     const resultPayload = {
       version: 1,
       attemptId: "attempt-42",
@@ -538,7 +503,7 @@ describe("ReviewFixDeliveryPump — routing", () => {
   });
 
   it("routes a cancellation event to deliverCancel with the attemptId extracted from the payload", async () => {
-    const destination = makeDestination();
+    const destination = makeScopedPrIdentity();
     inbox.acceptDelivery({
       authenticatedSource: "runner",
       deliveryId: "evt-cancel",
@@ -557,7 +522,7 @@ describe("ReviewFixDeliveryPump — routing", () => {
   });
 
   it("leaves a terminal-effect row unclaimed for exact-identity finalizer reconciliation", async () => {
-    const destination = makeDestination();
+    const destination = makeScopedPrIdentity();
     inbox.acceptDelivery({
       authenticatedSource: "runner",
       deliveryId: "evt-terminal",
@@ -585,47 +550,31 @@ describe("ReviewFixDeliveryPump — routing", () => {
 // The receiving handlers run inside Restate (covered by the Restate tier), so the contract
 // ends at the request and the validator the `result` handler calls first.
 describe("ReviewFixDeliveryPump — producer contract", () => {
-  function recordingPump() {
-    const calls: Array<{ url: string; init: RequestInit }> = [];
-    const fetchImpl = vi.fn(async (url: string, init: RequestInit) => {
-      calls.push({ url: String(url), init });
-      return { ok: true } as Response;
-    });
-    const facade = client.createRestateReviewFixFacade({ ingressBaseUrl: "http://ingress.test", fetchImpl: fetchImpl as unknown as typeof fetch });
+  function recordingPump(routes: Routes) {
+    const ingress = fakeFetch(routes);
+    const facade = client.createRestateReviewFixFacade({ ingressBaseUrl: "http://ingress.test", fetchImpl: ingress.fetch });
     const pump = new client.ReviewFixDeliveryPump({ facade, now: () => 1_000 });
-    return { calls, pump };
+    return { calls: ingress.calls, pump };
   }
 
   it("contract: ReviewFixAttempt.wake — a result delivery posts to the attempt's result handler with a body the handler's validator accepts", async () => {
-    const { validateReviewFixResultMetadata } = await import("../review-fix-contract.js");
-    const destination = makeDestination();
+    const destination = makeScopedPrIdentity();
     inbox.acceptDelivery({
       authenticatedSource: "runner",
       deliveryId: "evt-contract-result",
       kind: "result",
       destination,
-      payload: {
-        version: 1,
-        attemptId: "attempt-wake",
-        installationId: destination.installationId,
-        repository: destination.repository,
-        prNumber: destination.prNumber,
-        deadlineAt: Date.now() + 60_000,
-        githubRunId: 100,
-        githubRunAttempt: 1,
-        outputCommit: "b".repeat(40),
-      },
+      payload: makeReviewFixResult({ attemptId: "attempt-wake", ...destination }),
     });
-    const { calls, pump } = recordingPump();
+    const { calls, pump } = recordingPump({ "POST /ReviewFixAttempt/attempt-wake/result": {} });
 
     expect(await pump.tick()).toBe(1);
 
     expect(calls).toHaveLength(1);
-    expect(calls[0]!.url).toBe("http://ingress.test/ReviewFixAttempt/attempt-wake/result");
-    expect(calls[0]!.init.method).toBe("POST");
-    expect((calls[0]!.init.headers as Record<string, string>)["idempotency-key"]).toBe("result:runner:evt-contract-result");
-    const sent = JSON.parse(String(calls[0]!.init.body));
-    expect(validateReviewFixResultMetadata(sent).ok).toBe(true);
+    expect(calls[0]!.url.href).toBe("http://ingress.test/ReviewFixAttempt/attempt-wake/result");
+    expect(calls[0]!.headers.get("idempotency-key")).toBe("result:runner:evt-contract-result");
+    const sent = JSON.parse(calls[0]!.body);
+    expect(contract.validateReviewFixResultMetadata(sent).ok).toBe(true);
     expect(sent.attemptId).toBe("attempt-wake");
   });
 
@@ -634,18 +583,17 @@ describe("ReviewFixDeliveryPump — producer contract", () => {
       authenticatedSource: "runner",
       deliveryId: "evt-contract-cancel",
       kind: "cancellation",
-      destination: makeDestination(),
+      destination: makeScopedPrIdentity(),
       payload: { attemptId: "attempt-cancel" },
     });
-    const { calls, pump } = recordingPump();
+    const { calls, pump } = recordingPump({ "POST /ReviewFixAttempt/attempt-cancel/cancel": {} });
 
     expect(await pump.tick()).toBe(1);
 
     expect(calls).toHaveLength(1);
-    expect(calls[0]!.url).toBe("http://ingress.test/ReviewFixAttempt/attempt-cancel/cancel");
-    expect(calls[0]!.init.method).toBe("POST");
-    expect((calls[0]!.init.headers as Record<string, string>)["idempotency-key"]).toBe("cancellation:runner:evt-contract-cancel");
-    expect(JSON.parse(String(calls[0]!.init.body))).toEqual({ attemptId: "attempt-cancel" });
+    expect(calls[0]!.url.href).toBe("http://ingress.test/ReviewFixAttempt/attempt-cancel/cancel");
+    expect(calls[0]!.headers.get("idempotency-key")).toBe("cancellation:runner:evt-contract-cancel");
+    expect(JSON.parse(calls[0]!.body)).toEqual({ attemptId: "attempt-cancel" });
   });
 });
 

@@ -45,8 +45,9 @@ import {
   type WorkerLaunchPlan,
   type WorkerTerminalInspection,
 } from "../review-fix-ports.js";
+import { makeReviewFixResult, makeScopedPrIdentity } from "./helpers/builders.js";
 
-const SCOPE: ScopedPrIdentity = { installationId: 1, repository: "eudoxus/ai-implement", prNumber: 42 };
+const SCOPE = makeScopedPrIdentity({ repository: "eudoxus/ai-implement" });
 
 // ---------------------------------------------------------------------------
 // Representative in-memory test doubles (no I/O, no SQLite, no Restate)
@@ -365,17 +366,7 @@ describe("review-fix ports: representative doubles exercise the full lifecycle",
     expect(await store.hasCurrentAuthority(attempt!.attemptId)).toBe(false);
 
     const outputCommit = "b".repeat(40);
-    const result: ReviewFixResultMetadataV1 = {
-      version: 1,
-      attemptId: attempt!.attemptId,
-      installationId: SCOPE.installationId,
-      repository: SCOPE.repository,
-      prNumber: SCOPE.prNumber,
-      deadlineAt: attempt!.deadlineAt,
-      githubRunId: 1,
-      githubRunAttempt: 1,
-      outputCommit,
-    };
+    const result = makeReviewFixResult({ attemptId: attempt!.attemptId, ...SCOPE, deadlineAt: attempt!.deadlineAt, outputCommit });
     const effectIdOrReason = await callerAppliesApprovalOrReportsWhyNot(finalizer, {
       attemptId: attempt!.attemptId,
       scope: SCOPE,
