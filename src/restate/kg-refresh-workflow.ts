@@ -40,6 +40,7 @@ import { parseKgSourceRepo } from "../deploy.js";
 import type { KgRepoDefinition } from "./kg-refresh-types.js";
 import { readBoundedOwnedRun } from "./owned-run-lifecycle.js";
 import { awaitOwnedRun, type OwnedRunStatus } from "./owned-run-wait.js";
+import { restateRetentionMs } from "./retention.js";
 
 /** The value of `KG_REFRESH_TTL_MS` of the dispatch watch — how long a dispatch may run before it is treated as lost. */
 export const KG_REFRESH_TOTAL_DEADLINE_MS = 4 * 60 * 60 * 1000;
@@ -47,8 +48,6 @@ export const KG_REFRESH_TOTAL_DEADLINE_MS = 4 * 60 * 60 * 1000;
 export const KG_REPO_STALE_MARGIN_MS = 10 * 60 * 1000;
 /** How long a dispatch may run with no `progress` signal before the workflow treats it as lost. */
 export const KG_REFRESH_BOOTSTRAP_DEADLINE_MS = 10 * 60 * 1000;
-/** One shared retention constant, the same pattern as `REVIEW_FIX_RETENTION_MS` (`src/restate/review-fix-attempt.ts:28`). */
-export const KG_REFRESH_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 /** How often the GHA backend's watch loop reads the dispatched run's status (ADR 033). A run that ends with no
  *  report is found by this read; the same interval paces the reconcile read and the cancel-confirm read. */
 export const KG_REFRESH_WATCH_INTERVAL_MS = 60 * 1000;
@@ -122,6 +121,8 @@ export type KgOutcomeKind = "success" | "no-new-data" | "failure";
 export interface KgOutcomeMeta { failureCode?: string; timedOut?: boolean; dispatchId?: string }
 
 export interface KgRefreshWorkflowDependencies {
+  /** Test seam; production leaves it unset and reads `restate_retention_days` at build time. */
+  retentionMs?: number;
   rail: KgRailDeps;
   kgSourceRepo: string;
   mintRunTokens(input: { dispatchId: string; ttlSeconds: number }): { runToken: string; progressToken: string; publicationToken: string };
@@ -186,6 +187,7 @@ export const KG_REFRESH_NOT_FOUND_MESSAGE = "kg-refresh workflow not found";
 
 export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
   const { owner, repo: repoName } = parseKgSourceRepo(deps.kgSourceRepo);
+  const retentionMs = deps.retentionMs ?? restateRetentionMs();
   const bootstrapDeadlineMs = deps.bootstrapDeadlineMs ?? KG_REFRESH_BOOTSTRAP_DEADLINE_MS;
   const totalDeadlineMs = deps.totalDeadlineMs ?? KG_REFRESH_TOTAL_DEADLINE_MS;
   const watchIntervalMs = deps.watchIntervalMs ?? KG_REFRESH_WATCH_INTERVAL_MS;
@@ -726,23 +728,23 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
     handlers: {
       run: restate.handlers.workflow.workflow({
         input: serde.zod(kgRefreshRunInputSchema),
-        journalRetention: KG_REFRESH_RETENTION_MS,
+        journalRetention: retentionMs,
         ingressPrivate: true,
       }, run),
       report: restate.handlers.workflow.shared({
-        journalRetention: KG_REFRESH_RETENTION_MS,
-        idempotencyRetention: KG_REFRESH_RETENTION_MS,
+        journalRetention: retentionMs,
+        idempotencyRetention: retentionMs,
       }, report),
       progress: restate.handlers.workflow.shared(progress),
       cancel: restate.handlers.workflow.shared({
-        journalRetention: KG_REFRESH_RETENTION_MS,
-        idempotencyRetention: KG_REFRESH_RETENTION_MS,
+        journalRetention: retentionMs,
+        idempotencyRetention: retentionMs,
       }, cancel),
       status: restate.handlers.workflow.shared(status),
     },
     options: {
-      workflowRetention: KG_REFRESH_RETENTION_MS,
-      journalRetention: KG_REFRESH_RETENTION_MS,
+      workflowRetention: retentionMs,
+      journalRetention: retentionMs,
       inactivityTimeout: 15 * 60 * 1000,
       abortTimeout: 20 * 60 * 1000,
     },

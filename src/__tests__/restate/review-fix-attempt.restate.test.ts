@@ -5,7 +5,7 @@ import type { RestateTestEnvironment } from "@restatedev/restate-sdk-testcontain
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { ReviewFixResultMetadataV1, WorkerTerminalOutcome } from "../../review-fix-contract.js";
 import type { PreparedReviewFixAttempt } from "../../review-fix-ports.js";
-import { createReviewFixAttempt, REVIEW_FIX_RETENTION_MS, type ReviewFixAttemptCompletion } from "../../restate/review-fix-attempt.js";
+import { createReviewFixAttempt, type ReviewFixAttemptCompletion } from "../../restate/review-fix-attempt.js";
 import { VARIANTS, eventually, gate, type Gate, attachWorkflow, callWorkflow, replaceEndpoint, startRetryEnabled, startVariants, stopAll } from "./harness.js";
 
 const SHA = "a".repeat(40);
@@ -294,7 +294,6 @@ describe("ReviewFixAttempt durable workflow", () => {
     expect(metadata).toContain("workflow_completion_retention");
     expect(metadata).toContain("journal_retention");
     expect(metadata).toContain("idempotency_retention");
-    expect(REVIEW_FIX_RETENTION_MS).toBe(604_800_000);
   }, 20_000);
 
   it("engine retries a transient store read, then an endpoint and retained sidecar restart resume the same attempt", async () => {
