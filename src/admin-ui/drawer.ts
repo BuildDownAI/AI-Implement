@@ -1042,7 +1042,8 @@ export const drawerScript = `
     const inv = (data && data.invocation) || {};
     const entries = (data && data.entries) || [];
     let html = '<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px 14px;margin-bottom:14px">'
-      + '<div><div class="field-label">Status</div><div class="mono" style="font-size:12.5px">' + window.esc(String(inv.status == null ? '—' : inv.status)) + '</div></div>'
+      + '<div><div class="field-label">Status</div><div class="mono" style="font-size:12.5px">' + window.esc(String(inv.status == null ? '—' : inv.status)) + '</div>'
+      + '<div class="text-tertiary" style="font-size:11.5px">Handler: ' + window.esc(String(inv.target_handler_name == null ? '—' : inv.target_handler_name)) + '</div></div>'
       + '<div><div class="field-label">Invocation</div><div class="mono" style="font-size:11px;word-break:break-all">' + window.esc(String(inv.id == null ? '—' : inv.id)) + '</div></div>'
       + '<div><div class="field-label">Created</div><div style="font-size:12.5px">' + window.esc(fmtJournalTime(inv.created_at)) + '</div></div>'
       + '<div><div class="field-label">Completed</div><div style="font-size:12.5px">' + window.esc(fmtJournalTime(inv.completed_at)) + '</div></div>'

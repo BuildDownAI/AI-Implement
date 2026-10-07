@@ -1059,7 +1059,7 @@ describe("job drawer restate attempt section", () => {
 describe("job drawer restate journal section", () => {
   const KG_JOB = { ...PILOT_JOB, id: 20, phase: "kg-refresh", dispatchId: "kg-20" };
   const JOURNAL = {
-    invocation: { id: "inv_1", status: "completed", created_at: 1700000000000, completed_at: 1700000060000 },
+    invocation: { id: "inv_1", status: "completed", target_handler_name: "run", created_at: 1700000000000, completed_at: 1700000060000 },
     entries: [
       { index: 0, entryType: "Command: Run", name: "reserve", completed: true, promiseName: null, appendedAt: 1700000001000 },
       { index: 1, entryType: "Command: Run", name: "<b>x</b>", completed: true, promiseName: "report", appendedAt: 1700000002000 },
@@ -1090,6 +1090,7 @@ describe("job drawer restate journal section", () => {
     expect(box.querySelector("b")).toBeNull();
     expect(box.textContent).toContain("<b>x</b>");
     expect(box.textContent).toContain("completed");
+    expect(box.textContent).toContain("Handler: run");
     win.closeJobDrawer();
   });
 

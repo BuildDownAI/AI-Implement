@@ -444,4 +444,6 @@ The admin UI shows it in two places, both rendered by the drawer's `window.rende
 - **Job drawer, "Restate journal"** — fetched with the job's dispatch id as the key. The service follows the job's phase: `kg-refresh` → `KgRefresh`, `planning` → `PlanningRun`, `implementation` or no dispatch id → no fetch, any other phase → `ReviewFixAttempt`, fetched only when the drawer's attempt read (`/api/review-fix/attempts/<dispatch id>`) just succeeded, so a legacy review-fix job never fetches. A 404 (retention has passed) shows "No journal (retention has passed)"; a 503 shows an "unavailable" alert.
 - **Journal page** (`/admin#journal`) — a form for a journal no drawer row shows. Granting it is a page grant at `/admin#access`.
 
+A lookup by service and key answers the newest invocation for that key, which can be a shared `status` call until AII-1139 lands; the handler name shown next to the status says which invocation it is.
+
 For Restate's own UI, run `fly proxy 9070:9070 -a <app>` and open `http://127.0.0.1:9070/ui/invocations/<id>`.
