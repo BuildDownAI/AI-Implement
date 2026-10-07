@@ -39,7 +39,7 @@ describe("buildJournalQueries", () => {
     const q = buildJournalQueries({ service: "S'x", key: "k'y" });
     expect(q.invocation).toContain("target_service_name = 'S''x'");
     expect(q.invocation).toContain("target_service_key = 'k''y'");
-    expect(q.invocation).toContain("ORDER BY journal_size DESC, created_at DESC LIMIT 1");
+    expect(q.invocation).toContain("ORDER BY (target_handler_name = 'run') DESC, created_at DESC LIMIT 1");
     expect(q.journal("i'd")).toContain("WHERE id = 'i''d' ORDER BY index");
     expect(q.promises("S'x", "k'y")).toContain("service_name = 'S''x' AND service_key = 'k''y'");
   });
