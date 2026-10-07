@@ -70,6 +70,9 @@ function mockGitSuccess(sha = "deadbeef", dirty = true) {
   });
 }
 
+const TEST_VERDICT_SENTENCE =
+  "The CI checks on this PR are the source of truth for the test verdict. The line above is the runner's own pre-push report.";
+
 describe("pushStep", () => {
   beforeEach(() => {
     __resetPublicationCredentialForTests();
@@ -559,6 +562,7 @@ describe("pushStep", () => {
     expect(body.body).toContain("- Added: `src/app.test.ts`");
     expect(body.body).toContain("## Test plan");
     expect(body.body).toContain("- [x] typecheck: passed");
+    expect(body.body).toContain(`${"- [x] typecheck: passed, tests: passed (12 assertions)"}\n\n${TEST_VERDICT_SENTENCE}\n`);
     expect(body.body).toContain("typecheck: passed");
     expect(body.body).toContain("- [ ] Manual: review the changed behavior against the ticket acceptance criteria.");
     expect(body.body).toContain("Generated with AI-Implement");
@@ -1058,6 +1062,7 @@ describe("pushStep draft PRs", () => {
     // testsSummary/preflight summary was supplied, so the fallback must say
     // verification was skipped (unchecked box), not that it ran (checked box).
     expect(body.body).toContain("- [ ] Automated verification was skipped — the review loop did not approve this change.");
+    expect(body.body).toContain(`${"- [ ] Automated verification was skipped — the review loop did not approve this change."}\n\n${TEST_VERDICT_SENTENCE}\n`);
     expect(body.body).not.toContain("Automated verification was run by the AI-Implement pipeline before opening this PR.");
   });
 
@@ -1090,6 +1095,7 @@ describe("pushStep draft PRs", () => {
     // The test-plan line must not read as a review rejection on a provider outage — the
     // reviewer may never have run at all (BAC-27201).
     expect(body.body).toContain("- [ ] Automated verification was skipped — the model provider was unavailable and the run was interrupted.");
+    expect(body.body).toContain(`${"- [ ] Automated verification was skipped — the model provider was unavailable and the run was interrupted."}\n\n${TEST_VERDICT_SENTENCE}\n`);
     expect(body.body).not.toContain("the review loop did not approve this change");
     expect(body.body).not.toContain("Automated verification was run by the AI-Implement pipeline before opening this PR.");
   });
@@ -1237,6 +1243,7 @@ describe("pushStep — dependency install status in the PR body", () => {
     expect(body.body).toContain("`npm ci`");
     expect(body.body).toContain("ERESOLVE unable to resolve dependency tree");
     expect(body.body).toContain("- [ ] Automated verification was skipped — dependency install failed.");
+    expect(body.body).toContain(`${"- [ ] Automated verification was skipped — dependency install failed."}\n\n${TEST_VERDICT_SENTENCE}\n`);
   });
 
   it("neutralizes an embedded fence in installError so the PR body's code block is not broken", async () => {
@@ -1301,6 +1308,8 @@ describe("pushStep — dependency install status in the PR body", () => {
     const body = JSON.parse(String(init?.body)) as { body: string };
     expect(body.body).not.toContain("## ⚠️ Dependencies did not install");
     expect(body.body).toContain("Initial dependency install failed; it succeeded after this change.");
+    expect(body.body.indexOf(TEST_VERDICT_SENTENCE)).toBeGreaterThan(-1);
+    expect(body.body.indexOf(TEST_VERDICT_SENTENCE)).toBeLessThan(body.body.indexOf("- [x] Initial dependency install failed"));
   });
 
   it.each([
