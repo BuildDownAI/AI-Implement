@@ -35,9 +35,8 @@ const VALID_CPUS = [1, 2, 4, 8, 16];
 const MIN_MEMORY_MB = 256;
 const MAX_MEMORY_MB = 65536;
 const MIN_IDLE_TIMEOUT_MS = 60_000;
-// Same figure as `PERFORMANCE_MIN_MB_PER_CPU` in kg-refresh-production.ts; defined here because
-// that module imports this one.
-const PERFORMANCE_MIN_MB_PER_CPU = 2048;
+/** Fly performance machines need at least this much memory per CPU. Shared with kg-refresh-production.ts. */
+export const PERFORMANCE_MIN_MB_PER_CPU = 2048;
 
 const PROFILE_KEY = "profile";
 
@@ -46,8 +45,8 @@ const configSchema = z.object({
   cpus: z.number(),
   memoryMb: z.number(),
   idleTimeoutMs: z.number(),
-});
-const patchSchema = configSchema.partial();
+}).strict();
+const patchSchema = configSchema.partial().strict();
 
 function invalid(message: string): restate.TerminalError {
   return new restate.TerminalError(message, { errorCode: 400 });
