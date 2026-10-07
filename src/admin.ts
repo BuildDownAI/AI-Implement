@@ -451,7 +451,25 @@ export interface AdminConfig {
   kgSourceRepo?: string | null;
 }
 
+/**
+ * The two retention settings (AII-1137). Injected rather than imported because
+ * src/restate/retention.ts is off this file's runtime-import allowlist; bound in src/index.ts.
+ * The setters throw on an out-of-range value.
+ */
+export interface RetentionDeps {
+  getRestateDays: () => number;
+  setRestateDays: (days: number) => void;
+  getVolumeDays: () => number;
+  setVolumeDays: (days: number) => void;
+  /** Applies the volume value to the orchestrator's Fly volumes. Never throws; a failure comes back as `skipped`. */
+  applyVolume: (days: number) => Promise<{ applied: string[]; skipped: string }>;
+  default: number;
+  min: number;
+  max: number;
+}
+
 export interface AdminDeps {
+  retention?: RetentionDeps;
   /** Starts a self-deploy. Absent when the orchestrator is not configured to deploy itself. */
   startDeploy?: (targetOverride?: SelfDeployTarget) => Promise<DeployStart>;
   selfDeployTarget?: SelfDeployTarget | null;
@@ -915,6 +933,20 @@ export function handleAdminRequest(
 
     if (url === "/api/deploy-policy" && method === "POST") {
       handleSetDeployPolicy(req, res);
+      return true;
+    }
+
+    if (url === "/api/retention" && method === "GET") {
+      if (!deps.retention) {
+        json(res, 501, { error: "Retention settings are not available" });
+        return true;
+      }
+      json(res, 200, retentionView(deps.retention));
+      return true;
+    }
+
+    if (url === "/api/retention" && method === "POST") {
+      handleSetRetention(req, res, deps);
       return true;
     }
 
@@ -2301,6 +2333,57 @@ async function handleReviewFixCancel(
     json(res, status, body);
   } catch (err) {
     console.error("[admin] review-fix cancel failed:", err);
+    json(res, 500, { error: "Internal server error" });
+  }
+}
+
+/** In-memory: null after a restart even when the boot step applied the value (it only logs). */
+let lastVolumeRetentionApply: { at: number; applied: string[]; skipped: string } | null = null;
+
+function retentionView(r: RetentionDeps) {
+  return {
+    restate: { days: r.getRestateDays(), appliesAt: "next registration" },
+    volume: { days: r.getVolumeDays(), lastApplied: lastVolumeRetentionApply },
+    default: r.default,
+    min: r.min,
+    max: r.max,
+  };
+}
+
+async function handleSetRetention(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  deps: AdminDeps,
+): Promise<void> {
+  const r = deps.retention;
+  if (!r) {
+    json(res, 501, { error: "Retention settings are not available" });
+    return;
+  }
+  try {
+    const body = JSON.parse(await readBody(req)) as { restate?: unknown; volume?: unknown };
+    const fields = [
+      ["restate", "restate_retention_days"],
+      ["volume", "volume_snapshot_retention_days"],
+    ] as const;
+    // Validate both before storing either, so a bad field stores nothing.
+    for (const [key, setting] of fields) {
+      const v = body[key];
+      if (v === undefined) continue;
+      if (typeof v !== "number" || !Number.isInteger(v) || v < r.min || v > r.max) {
+        json(res, 400, { error: `${setting} must be an integer from ${r.min} to ${r.max}` });
+        return;
+      }
+    }
+    if (typeof body.restate === "number") r.setRestateDays(body.restate);
+    if (typeof body.volume === "number") {
+      r.setVolumeDays(body.volume);
+      const result = await r.applyVolume(body.volume);
+      lastVolumeRetentionApply = { at: Date.now(), applied: result.applied, skipped: result.skipped };
+    }
+    json(res, 200, retentionView(r));
+  } catch (err) {
+    console.error("[admin] retention update failed:", err);
     json(res, 500, { error: "Internal server error" });
   }
 }

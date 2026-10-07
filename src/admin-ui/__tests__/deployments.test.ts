@@ -1,3 +1,4 @@
+import { JSDOM } from "jsdom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { deploymentsHtml, deploymentsScript } from "../pages/deployments.js";
 
@@ -622,5 +623,62 @@ describe("fmtAgo", () => {
     expect(fmtAgo(ago(24, HOUR))).toBe("1d ago");
     expect(fmtAgo(ago(21, DAY))).toBe("21d ago");
     expect(fmtAgo(ago(400, DAY))).toBe("400d ago");
+  });
+});
+
+describe("Retention card", () => {
+  const retentionBody = (restate: number, volume: number) => ({
+    restate: { days: restate, appliesAt: "next registration" },
+    volume: { days: volume, lastApplied: null },
+    default: 14,
+    min: 1,
+    max: 60,
+  });
+
+  function mount() {
+    const dom = new JSDOM(`<!DOCTYPE html><body>${deploymentsHtml}</body>`, {
+      runScripts: "dangerously",
+      url: "http://localhost/admin#deployments",
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const win = dom.window as any;
+    const posts: Array<{ url: string; body: unknown }> = [];
+    win.registerPage = () => {};
+    win.api = async (url: string, init?: { method?: string; body?: string }) => {
+      if (url === "/api/retention" && init?.method === "POST") {
+        posts.push({ url, body: JSON.parse(init.body as string) });
+        return { ok: true, status: 200, json: async () => retentionBody(10, 20) };
+      }
+      if (url === "/api/retention") return { ok: true, status: 200, json: async () => retentionBody(14, 20) };
+      return { ok: true, status: 200, json: async () => ({}) };
+    };
+    const script = dom.window.document.createElement("script");
+    script.textContent = deploymentsScript;
+    dom.window.document.head.appendChild(script);
+    const doc = dom.window.document;
+    const el = (id: string) => doc.getElementById(id) as HTMLInputElement & HTMLButtonElement;
+    return { win, doc, el, posts };
+  }
+
+  it("sits after the policy card and states when the Restate value applies", () => {
+    expect(deploymentsHtml.indexOf('id="deployments-retention"')).toBeGreaterThan(deploymentsHtml.indexOf('id="deployments-policy"'));
+    expect(deploymentsHtml).toContain("Restate retention applies at the next deploy or restart");
+  });
+
+  it("renders both values, keeps Save disabled until a change, and posts only the changed field", async () => {
+    const { win, el, posts } = mount();
+    await win.loadRetention();
+    expect(el("deployments-retention-restate").value).toBe("14");
+    expect(el("deployments-retention-volume").value).toBe("20");
+    expect(el("deployments-retention-save").disabled).toBe(true);
+
+    el("deployments-retention-restate").value = "10";
+    win.refreshRetentionDirty();
+    expect(el("deployments-retention-save").disabled).toBe(false);
+
+    await win.saveRetention();
+    expect(posts).toEqual([{ url: "/api/retention", body: { restate: 10 } }]);
+    expect(el("deployments-retention-restate").value).toBe("10");
+    expect(el("deployments-retention-save").disabled).toBe(true);
   });
 });

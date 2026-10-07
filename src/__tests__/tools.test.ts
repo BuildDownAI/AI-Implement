@@ -875,6 +875,14 @@ describe("get_tenant_health restate health field (AII-807)", () => {
     expect(parsed.restate).toEqual({ sidecar: { state: "starting" }, registration: { state: "not-attempted" } });
   });
 
+  it("includes both retention settings", async () => {
+    (getMappings as ReturnType<typeof vi.fn>).mockReturnValue({});
+    const result = await getTenantHealth(fakeContext("get_tenant_health"), { caller: system, args: {} });
+    const parsed = JSON.parse(result.content[0].text) as { restateRetentionDays: unknown; volumeSnapshotRetentionDays: unknown };
+    expect(typeof parsed.restateRetentionDays).toBe("number");
+    expect(typeof parsed.volumeSnapshotRetentionDays).toBe("number");
+  });
+
   it("reflects a ready sidecar with a declined-conflict registration", async () => {
     (getMappings as ReturnType<typeof vi.fn>).mockReturnValue({});
     setRestateStatus({ sidecar: { state: "ready" }, registration: { state: "declined-conflict" } });

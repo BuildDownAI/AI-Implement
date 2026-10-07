@@ -129,8 +129,16 @@ import type { KgRefreshIngressClient } from "./restate/kg-refresh-production.js"
 import { createKgRefreshIngressClient } from "./restate/kg-refresh-production.js";
 import { RestateSidecar } from "./restate/server.js";
 import { startRestateEndpoint, register as registerRestateEndpoint, RESTATE_SERVICES } from "./restate/endpoint.js";
-import { getRestateRetentionDays, getVolumeSnapshotRetentionDays } from "./restate/retention.js";
-import { applyVolumeSnapshotRetentionAtBoot } from "./fly-volumes.js";
+import {
+  getRestateRetentionDays,
+  getVolumeSnapshotRetentionDays,
+  RESTATE_RETENTION_DAYS_DEFAULT,
+  RESTATE_RETENTION_DAYS_MAX,
+  RESTATE_RETENTION_DAYS_MIN,
+  setRestateRetentionDays,
+  setVolumeSnapshotRetentionDays,
+} from "./restate/retention.js";
+import { applyVolumeSnapshotRetention, applyVolumeSnapshotRetentionAtBoot } from "./fly-volumes.js";
 import { createProductionReviewFixServices } from "./restate/review-fix-production.js";
 import { kgFlyMachineSizing, createKgFindRunByTitle, createProductionKgRefreshServices, recordKgDispatchDetails } from "./restate/kg-refresh-production.js";
 import { createProductionPlanningRunServices, PLANNING_CONTEXT_BRANCH_KEY, PLANNING_CONTEXT_FIELD_VALUE_KEY } from "./restate/planning-run-production.js";
@@ -4880,6 +4888,21 @@ function startServer(
         },
         notifyWebhookUrl: config.notifyWebhookUrl,
       }, registry, { startDeploy, selfDeployTarget: config.selfDeployTarget, kgRefresh: kgRefreshAdminDeps, callTool, getRestateStatus,
+        retention: {
+          getRestateDays: getRestateRetentionDays,
+          setRestateDays: setRestateRetentionDays,
+          getVolumeDays: getVolumeSnapshotRetentionDays,
+          setVolumeDays: setVolumeSnapshotRetentionDays,
+          applyVolume: async (days) => {
+            if (!config.flyDeployToken || !process.env.FLY_APP_NAME) {
+              return { applied: [], skipped: !config.flyDeployToken ? "FLY_DEPLOY_TOKEN is not set" : "FLY_APP_NAME is not set" };
+            }
+            return applyVolumeSnapshotRetention(config.flyDeployToken, process.env.FLY_APP_NAME, days);
+          },
+          default: RESTATE_RETENTION_DAYS_DEFAULT,
+          min: RESTATE_RETENTION_DAYS_MIN,
+          max: RESTATE_RETENTION_DAYS_MAX,
+        },
         reviewFixAttempts, readJournal: handleJournalRequest })) return;
     }
 
