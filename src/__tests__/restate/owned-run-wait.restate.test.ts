@@ -198,24 +198,26 @@ describe("awaitOwnedRun (Restate)", () => {
 
   const labels = VARIANTS.map(([label]) => label);
   const KG = { shape: "kg-refresh", tickMs: 50, bootstrapMs: 400, totalMs: 4_000 } as const;
+  // Rule 4 (docs/restate-testing.md § "Timing rules"): a scenario that does not test a deadline runs with deadlines long against its own work.
+  const KG_NO_DEADLINE = { ...KG, bootstrapMs: KG.totalMs } as const;
 
   describe("kg-refresh shape", () => {
     it.each(labels)("report wins (%s)", async (label) => {
-      const run = await begin(label, KG);
+      const run = await begin(label, KG_NO_DEADLINE);
       await run.send("report", { ok: true });
       const result = await run.done;
       expect(result.events).toEqual([{ kind: "signal", name: "report", value: { ok: true } }]);
     });
 
     it.each(labels)("cancel wins (%s)", async (label) => {
-      const run = await begin(label, KG);
+      const run = await begin(label, KG_NO_DEADLINE);
       await run.send("cancel", "operator");
       const result = await run.done;
       expect(result.events).toEqual([{ kind: "signal", name: "cancel", value: "operator" }]);
     });
 
     it.each(labels)("progress wins (%s)", async (label) => {
-      const run = await begin(label, KG);
+      const run = await begin(label, KG_NO_DEADLINE);
       await run.send("progress", true);
       const result = await run.done;
       expect(result.events).toEqual([{ kind: "signal", name: "progress", value: true }]);
