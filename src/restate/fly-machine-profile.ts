@@ -82,8 +82,8 @@ export interface KeptMachineState {
   heldBy: MachineHold | null;
 }
 
-const claimSchema = z.object({ dispatchId: z.string().min(1), attempt: z.number().int().min(1).optional() }).strict();
-const attachSchema = z.object({ dispatchId: z.string().min(1), machineId: z.string().min(1), attempt: z.number().int().min(1).optional() }).strict();
+const claimSchema = z.object({ dispatchId: z.string().min(1), attempt: z.number().int().min(1).optional(), replaces: z.string().min(1).optional() }).strict();
+const attachSchema = z.object({ dispatchId: z.string().min(1), machineId: z.string().min(1), attempt: z.number().int().min(1).optional(), replaces: z.string().min(1).optional() }).strict();
 const releaseSchema = z.object({ dispatchId: z.string().min(1) }).strict();
 const expireSchema = z.object({ releasedAt: z.number() }).strict();
 
@@ -114,7 +114,7 @@ export type AttachDecision =
   | { kind: "record"; next: KeptMachineState; replaced: string | null };
 
 /** Pure: whether the machine the workflow created for this dispatch is recorded. */
-export function decideAttach(machine: KeptMachineState | null, dispatchId: string, machineId: string, attempt: number, now: number): AttachDecision {
+export function decideAttach(machine: KeptMachineState | null, dispatchId: string, machineId: string, attempt: number, now: number, replaces?: string): AttachDecision {
   const held = machine?.heldBy ?? null;
   if (!machine || !held || held.dispatchId !== dispatchId) {
     return { kind: "conflict", message: `attach by ${dispatchId}, which does not hold the machine${held ? ` (held by ${held.dispatchId} attempt ${held.attempt})` : ""}` };
@@ -122,6 +122,8 @@ export function decideAttach(machine: KeptMachineState | null, dispatchId: strin
   if (machine.machineId === machineId) return { kind: "unchanged" };
   const next: KeptMachineState = { machineId, lastUsedAt: now, heldBy: held };
   if (machine.machineId === undefined) return { kind: "record", next, replaced: null };
+  // The dispatch step found the recorded machine destroyed or 404 and created this one: replace at any attempt.
+  if (replaces !== undefined && replaces === machine.machineId) return { kind: "record", next, replaced: machine.machineId };
   if (attempt > held.attempt || (attempt === held.attempt && attempt > 1)) {
     return { kind: "record", next, replaced: machine.machineId };
   }
@@ -216,12 +218,12 @@ export function createFlyMachineProfile(deps: FlyMachineProfileDeps) {
   async function attach(ctx: ObjectContext, input: z.infer<typeof attachSchema>): Promise<{ machineId: string }> {
     const attempt = input.attempt ?? 1;
     const machine = await ctx.get<KeptMachineState>(MACHINE_KEY);
-    const decision = decideAttach(machine, input.dispatchId, input.machineId, attempt, await ctx.date.now());
+    const decision = decideAttach(machine, input.dispatchId, input.machineId, attempt, await ctx.date.now(), input.replaces);
     if (decision.kind === "conflict") throw conflict(decision.message);
     if (decision.kind === "record") {
       ctx.set<KeptMachineState>(MACHINE_KEY, decision.next);
       if (decision.replaced) {
-        ctx.console.warn(`[FlyMachineProfile] attach ${ctx.key} replaced ${decision.replaced} with ${input.machineId} (dispatch=${input.dispatchId} attempt=${attempt}); the reaper removes the old one`);
+        ctx.console.warn(`[FlyMachineProfile] attach ${ctx.key} replaced ${decision.replaced} with ${input.machineId} (dispatch=${input.dispatchId} attempt=${attempt} replaces=${input.replaces ?? "none"}); the reaper removes the old one`);
       }
     }
     return { machineId: input.machineId };

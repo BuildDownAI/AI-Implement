@@ -125,6 +125,8 @@ export interface KgDispatchResult {
   machineId?: string | null;
   /** True when the dispatch created the machine, so the workflow must `attach` it. */
   created?: boolean;
+  /** The kept machine id the dispatch found destroyed or 404 and replaced; sent as `replaces` on `attach`. */
+  replaced?: string;
 }
 
 /** What a status read that failed every attempt reports: not completed, not started — no new evidence. */
@@ -350,6 +352,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
             outcome: result.outcome, runId: result.runId, runUrl: result.runUrl,
             jobId: result.jobId, executionMode: result.executionMode,
             machineId: result.machineId ?? null, created: result.created === true,
+            ...(result.replaced !== undefined && { replaced: result.replaced }),
           };
         },
         { maxRetryAttempts: 3 },
@@ -357,7 +360,8 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
 
       // One-way and idempotent in the object; a replay after a crash here sends it again.
       if (dispatchResult.created && dispatchResult.machineId) {
-        ctx.objectSendClient(FlyMachineProfile, "kg-refresh").attach({ dispatchId, machineId: dispatchResult.machineId, attempt });
+        ctx.objectSendClient(FlyMachineProfile, "kg-refresh").attach({ dispatchId, machineId: dispatchResult.machineId, attempt,
+          ...(dispatchResult.replaced !== undefined && { replaces: dispatchResult.replaced }) });
       }
 
       if (dispatchResult.runId !== undefined) ctx.set("runId", dispatchResult.runId);

@@ -96,6 +96,13 @@ describe("decideAttach", () => {
   it("different id at a higher attempt replaces", () => {
     expect(decideAttach(held("A", "d1", 1), "d1", "B", 2, 500)).toEqual({ kind: "record", next: held("B", "d1", 1, 500), replaced: "A" });
   });
+  it("replaces: the recorded machine replaces it at attempt 1; anything else stays a conflict", () => {
+    expect(decideAttach(held("A", "d1", 1), "d1", "B", 1, 500, "A")).toEqual({ kind: "record", next: held("B", "d1", 1, 500), replaced: "A" });
+    expect(decideAttach(held("A", "d1", 1), "d1", "B", 1, 500).kind).toBe("conflict");
+    expect(decideAttach(held("A", "d1", 1), "d1", "B", 1, 500, "X").kind).toBe("conflict");
+    expect(decideAttach(held("A", "d1", 1), "d2", "B", 1, 500, "A").kind).toBe("conflict");
+    expect(decideAttach(held("B", "d1", 1), "d1", "B", 1, 500, "A")).toEqual({ kind: "unchanged" });
+  });
   it("different id at the hold's attempt > 1 replaces", () => {
     expect(decideAttach(held("A", "d1", 2), "d1", "B", 2, 500)).toMatchObject({ kind: "record", replaced: "A" });
   });

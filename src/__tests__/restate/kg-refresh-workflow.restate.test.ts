@@ -2751,7 +2751,7 @@ describe("KgRefresh durable workflow", () => {
       const launched = await launchKeptMachine(fly, {
         keptMachineId: input.machineId, dispatchId: input.dispatchId, machineConfig, machineNonce: `nonce-${input.dispatchId}`,
       });
-      return { outcome: "accepted", jobId: launched.machineId, executionMode: "fly-machines", machineId: launched.machineId, created: launched.created };
+      return { outcome: "accepted", jobId: launched.machineId, executionMode: "fly-machines", machineId: launched.machineId, created: launched.created, replaced: launched.replaced };
     }
 
     const keptStopCalls: Array<{ jobId: string; keep: boolean }> = [];
@@ -2818,6 +2818,31 @@ describe("KgRefresh durable workflow", () => {
         expect(status.machine?.machineId).toBe("m-1");
         // one expire per release
         await eventually(() => expireSends(env), (rows) => rows.length === 2, { label: "second expire scheduled" });
+      } finally {
+        await env.stop();
+      }
+    }, 60_000);
+
+    it("a destroyed kept machine is replaced: attach replaces it and release scrubs the new machine", async () => {
+      const env = await startRetryEnabled([buildKeptWorkflow(), kgRepo, starter, profileObject]);
+      try {
+        const first = await startRun(env);
+        await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.machineId === "m-1", { label: "attach recorded" });
+        await callWorkflow(env.baseUrl(), "KgRefresh", first.triggerId, "report", GENERIC_FAILURE_REPORT);
+        await first.done;
+        await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.heldBy === null, { label: "first release" });
+        fly.machines.get("m-1")!.state = "destroyed";
+
+        fly.calls.length = 0;
+        profileFlyCalls.length = 0;
+        const second = await startRun(env);
+        await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.machineId === "m-2", { label: "replacement recorded" });
+        await callWorkflow(env.baseUrl(), "KgRefresh", second.triggerId, "report", GENERIC_FAILURE_REPORT);
+        await second.done;
+        await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.heldBy === null, { label: "second release" });
+        expect(fly.calls).toEqual(["create:m-2"]);
+        expect(profileFlyCalls).toContain("clear-env:m-2");
+        expect(profileFlyCalls.filter((c) => c.endsWith(":m-1"))).toEqual([]);
       } finally {
         await env.stop();
       }

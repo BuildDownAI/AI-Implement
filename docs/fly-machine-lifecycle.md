@@ -68,8 +68,10 @@ sequenceDiagram
 | set | `stopped` (or any state but the ones below) | `updateMachine` then `startMachine` |
 | set | `started`, same `dispatch_id` | already dispatched (a retry); return the machine, no `update` (it would reboot a started machine) |
 | set | `started`, other `dispatch_id` | throw (the hold is wrong); the step retries, then the run ends `dispatch_rejected` |
-| set | `destroyed` or 404 | `createMachine`; `attach` replaces the object's machine id |
+| set | `destroyed` or 404 | `createMachine`; `attach` carries `replaces: <old id>` and replaces the object's machine id |
 | set | lookup error | throw; the step retries |
+
+The `attach` for a replacement carries `replaces` (the destroyed machine's id), so the object accepts it at attempt 1; without it the attempt rule would refuse the swap and the new machine would run unrecorded and unreleased.
 
 The step keeps `maxRetryAttempts: 3`. The reconcile read makes a retry after a lost ack safe. A lost ack after a `create` that had no kept machine to reconcile against creates a second machine; the first is left with no `durable_until` until the object records one (see Gaps).
 

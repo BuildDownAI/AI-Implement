@@ -4018,7 +4018,7 @@ async function handleKgRefreshOutcome(
 async function dispatchKgRefreshRun(
   config: AppConfig,
   opts: { runToken: string; runProgressToken: string; dispatchId: string; runConfig: string; executionPath?: string; machine: FlyMachineProfileConfig; machineId: string | null },
-): Promise<{ machineId?: string; machineNonce?: string; logsUrl?: string; created?: boolean }> {
+): Promise<{ machineId?: string; machineNonce?: string; logsUrl?: string; created?: boolean; replaced?: string }> {
   if (!config.kgSourceRepo) throw new Error("KG_SOURCE_REPO not configured");
   const repo = parseKgSourceRepo(config.kgSourceRepo);
   const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, repo.owner);
@@ -4077,7 +4077,7 @@ async function dispatchKgRefreshRun(
     });
     console.log(`[kg-refresh] dispatched via Fly (${launched.reused ? "reused" : "created"} machine ${launched.machineId}) (dispatchId=${opts.dispatchId})`);
     return {
-      machineId: launched.machineId, machineNonce: launched.machineNonce, created: launched.created,
+      machineId: launched.machineId, machineNonce: launched.machineNonce, created: launched.created, replaced: launched.replaced,
       logsUrl: `https://fly.io/apps/${config.flySessionsApp}/machines/${launched.machineId}`,
     };
 
