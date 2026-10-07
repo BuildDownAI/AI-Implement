@@ -599,7 +599,7 @@ describe("schema migration", () => {
       "INSERT INTO dispatch_log (issue_id, dispatched_at, status, conclusion, execution_mode) VALUES (?, ?, ?, ?, ?)",
     );
     const now = Date.now();
-    for (const st of ["failed", "completed", "timed_out", "review_failed"]) {
+    for (const st of ["failed", "completed", "timed_out", "review_failed", "dispatch-failed"]) {
       ins.run(`closed-${st}`, now, st, "dispatch_rejected", "github-actions");
     }
     ins.run("open-dispatched", now, "dispatched", null, "github-actions");
