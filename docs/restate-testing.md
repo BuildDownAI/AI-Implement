@@ -378,3 +378,7 @@ This is the gated race test pattern. A scenario of an owned-run wait sets the or
 * **Teardown.** Await the workflow's terminal output before a test ends.
 * **Tiers.** The deadline decision is tested in the unit tier with no timers. The Restate tier proves the journal, replay, and exclusivity.
 * **Signals from the test body are not the producer proof.** A scenario may resolve a promise from the test body. Each promise also has a `contract: <Workflow>.<promise>` test in the default suite, and `src/__tests__/restate-producer-guard.test.ts` fails when one is missing.
+
+## FlyMachineProfile kept-machine scenarios
+
+`fly-machine-profile.restate.test.ts` drives `claim` / `attach` / `release` / `expire` (ADR 037) through a forwarding service (the handlers are ingress-private) with a fake Fly. The scheduled `expire` is asserted with `queryInvocations` inside `eventually`; a stale-timer scenario calls `expire` with the earlier `releasedAt` itself rather than racing a clock, and one scenario uses `idleTimeoutMsOverride` to see the engine deliver the timer.

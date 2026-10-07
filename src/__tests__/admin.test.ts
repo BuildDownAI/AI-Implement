@@ -4941,6 +4941,119 @@ describe("POST /api/deploy-policy", () => {
   });
 });
 
+describe("/api/retention", () => {
+  async function retentionRequest(
+    token: string,
+    method: "GET" | "POST",
+    body: unknown,
+    apply = vi.fn(async (_days: number) => ({ applied: ["vol_1"], skipped: "" })),
+  ): Promise<{ statusCode: number; body: Record<string, unknown>; apply: typeof apply }> {
+    const retention = await import("../restate/retention.js");
+    const deps: Parameters<typeof admin.handleAdminRequest>[4] = {
+      retention: {
+        getRestateDays: retention.getRestateRetentionDays,
+        setRestateDays: retention.setRestateRetentionDays,
+        getVolumeDays: retention.getVolumeSnapshotRetentionDays,
+        setVolumeDays: retention.setVolumeSnapshotRetentionDays,
+        applyVolume: apply,
+        default: retention.RESTATE_RETENTION_DAYS_DEFAULT,
+        min: retention.RESTATE_RETENTION_DAYS_MIN,
+        max: retention.RESTATE_RETENTION_DAYS_MAX,
+      },
+    };
+    const req = new MockRequest("/api/retention", method, { authorization: `Bearer ${token}` }, body === undefined ? undefined : JSON.stringify(body));
+    const res = new MockResponse();
+    admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider), deps);
+    await res.done;
+    return { statusCode: res.statusCode, body: res.body ? JSON.parse(res.body) : {}, apply };
+  }
+
+  it("answers 501 on GET and POST when retention is not configured", async () => {
+    const token = await login("secret");
+    for (const method of ["GET", "POST"] as const) {
+      const req = new MockRequest("/api/retention", method, { authorization: `Bearer ${token}` }, method === "POST" ? JSON.stringify({ restate: 10 }) : undefined);
+      const res = new MockResponse();
+      admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider), {});
+      await res.done;
+      expect(res.statusCode).toBe(501);
+    }
+  });
+
+  it("rejects an unauthenticated request", async () => {
+    expect((await retentionRequest("not-a-session", "POST", { restate: 10 })).statusCode).toBe(401);
+  });
+
+  it("refuses a non-admin session as /api/deploy-policy does", async () => {
+    const user = adminSession.createSession({ email: "reader@eudoxus.ai", sub: "google|reader", provider: "google", name: "Reader" });
+    const policy = new MockRequest("/api/deploy-policy", "POST", { authorization: `Bearer ${user}` }, JSON.stringify({ autoDeploy: true }));
+    const policyRes = new MockResponse();
+    admin.handleAdminRequest(policy as never, policyRes as never, adminConfig("secret"), makeFakeRegistry(provider), {});
+    await policyRes.done;
+
+    const res = await retentionRequest(user, "POST", { volume: 20 });
+    expect(res.statusCode).toBe(policyRes.statusCode);
+    expect(res.statusCode).toBe(403);
+    expect(res.apply).not.toHaveBeenCalled();
+  });
+
+  it("answers the fresh-database shape on GET", async () => {
+    const token = await login("secret");
+    const res = await retentionRequest(token, "GET", undefined);
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toEqual({
+      restate: { days: 14, appliesAt: "next deploy or restart" },
+      volume: { days: 14, lastApplied: null },
+      default: 14,
+      min: 1,
+      max: 60,
+    });
+  });
+
+  it("answers 400 naming restate_retention_days for 61 and stores nothing", async () => {
+    const token = await login("secret");
+    const retention = await import("../restate/retention.js");
+    const res = await retentionRequest(token, "POST", { restate: 61 });
+    expect(res.statusCode).toBe(400);
+    expect(String(res.body.error)).toContain("restate_retention_days");
+    expect(retention.getRestateRetentionDays()).toBe(14);
+  });
+
+  it("stores neither value when one of two is bad, and rejects non-integers", async () => {
+    const token = await login("secret");
+    const retention = await import("../restate/retention.js");
+    const mixed = await retentionRequest(token, "POST", { restate: 10, volume: 99 });
+    expect(mixed.statusCode).toBe(400);
+    expect(String(mixed.body.error)).toContain("volume_snapshot_retention_days");
+    expect(retention.getRestateRetentionDays()).toBe(14);
+    expect(mixed.apply).not.toHaveBeenCalled();
+    expect((await retentionRequest(token, "POST", { restate: "10" })).statusCode).toBe(400);
+    expect((await retentionRequest(token, "POST", { volume: 2.5 })).statusCode).toBe(400);
+  });
+
+  it("stores volume, applies it once, and reports lastApplied", async () => {
+    const token = await login("secret");
+    const retention = await import("../restate/retention.js");
+    const res = await retentionRequest(token, "POST", { volume: 20 });
+    expect(res.statusCode).toBe(200);
+    expect(retention.getVolumeSnapshotRetentionDays()).toBe(20);
+    expect(res.apply).toHaveBeenCalledTimes(1);
+    expect(res.apply).toHaveBeenCalledWith(20);
+    const volume = res.body.volume as { days: number; lastApplied: { at: number; applied: string[]; skipped: string } };
+    expect(volume.days).toBe(20);
+    expect(volume.lastApplied).toMatchObject({ applied: ["vol_1"], skipped: "" });
+    expect(typeof volume.lastApplied.at).toBe("number");
+  });
+
+  it("stores restate without applying the volume", async () => {
+    const token = await login("secret");
+    const retention = await import("../restate/retention.js");
+    const res = await retentionRequest(token, "POST", { restate: 10 });
+    expect(res.statusCode).toBe(200);
+    expect(retention.getRestateRetentionDays()).toBe(10);
+    expect(res.apply).toHaveBeenCalledTimes(0);
+  });
+});
+
 describe("per-page grants", () => {
   /** Admitted by the domain seed, so a `user` rather than an admin. */
   function userSession(): string {

@@ -27,15 +27,15 @@ export function validateJournalLookup(query: Record<string, string>): JournalLoo
 }
 
 export function buildJournalQueries(lookup: JournalLookup): { invocation: string; journal: (invocationId: string) => string; promises: (service: string, key: string) => string } {
+  // A workflow key has a `run` invocation, which wins so shared `status` / `progress` calls never shadow it;
+  // a virtual-object key has none and keeps newest-wins.
   const where = "id" in lookup
-    ? `WHERE id = '${sqlQuote(lookup.id)}'`
-    : `WHERE target_service_name = '${sqlQuote(lookup.service)}' AND target_service_key = '${sqlQuote(lookup.key)}'`;
-  // A workflow key's `run` invocation wins over a newer shared `status` call.
-  const order = "id" in lookup ? "created_at DESC" : "(target_handler_name = 'run') DESC, created_at DESC";
+    ? `WHERE id = '${sqlQuote(lookup.id)}' ORDER BY created_at DESC`
+    : `WHERE target_service_name = '${sqlQuote(lookup.service)}' AND target_service_key = '${sqlQuote(lookup.key)}' ORDER BY (target_handler_name = 'run') DESC, created_at DESC`;
   return {
     invocation:
       "SELECT id, target_service_name, target_service_key, target_handler_name, status, journal_size, created_at, modified_at, completed_at, " +
-      `last_failure, last_failure_error_code, last_failure_related_entry_name FROM sys_invocation ${where} ORDER BY ${order} LIMIT 1`,
+      `last_failure, last_failure_error_code, last_failure_related_entry_name FROM sys_invocation ${where} LIMIT 1`,
     journal: (invocationId) =>
       "SELECT id, index, entry_type, name, completed, promise_name, entry_json, appended_at, sleep_wakeup_at FROM sys_journal " +
       `WHERE id = '${sqlQuote(invocationId)}' ORDER BY index`,

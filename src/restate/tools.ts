@@ -16,7 +16,7 @@ import * as restate from "@restatedev/restate-sdk";
 import { serde } from "@restatedev/restate-sdk-zod";
 import { z } from "zod";
 import type { AccessRole } from "../access-entries.js";
-import { getRunnerMode, getKgMaterializeDirect, getKgFlyMachineOverride, setKgFlyMachineOverride, type KgFlyMachineOverride } from "../runner-mode.js";
+import { getRunnerMode, getKgMaterializeDirect } from "../runner-mode.js";
 import { getMappings, type RepoMapping } from "../config.js";
 import { getInFlightJobs, getRunRecordMergeVerdict, getJobById, getJobByMachineId, type Job } from "../log.js";
 import {
@@ -34,10 +34,12 @@ import {
 } from "../dispatch-admission.js";
 import { isKgDegraded } from "../deploy-notify.js";
 import { sidecarHealthFields, getKgMemoryProvider, KG_TOOL_CAPABILITY } from "../kg-provider.js";
+import { getRestateRetentionDays, getVolumeSnapshotRetentionDays } from "./retention.js";
 import { getRestateStatus } from "./status.js";
 import { readKgSourceRepo } from "../deploy.js";
 import { runKgRefreshPreflight, MIN_FREE_BYTES, type KgRefreshStage, type KgRefreshStatus } from "../kg-refresh.js";
-import { resolveKgFlyMachineSize, type KgRefreshToolDeps } from "./kg-refresh-production.js";
+import { FlyMachineProfile } from "./fly-machine-profile.js";
+import type { KgRefreshToolDeps } from "./kg-refresh-production.js";
 import type { KgRefreshDefinition, KgRepoDefinition } from "./kg-refresh-types.js";
 import { getOrchestratorSettings, getLinearPickupLabel } from "../orchestrator-settings.js";
 import { getIssueReportCard, getFleetReport } from "../report-card.js";
@@ -214,6 +216,8 @@ export const getTenantHealth = tool(
       kgDegraded: isKgDegraded(),
       ...sidecarHealthFields(),
       restate: getRestateStatus(),
+      restateRetentionDays: getRestateRetentionDays(),
+      volumeSnapshotRetentionDays: getVolumeSnapshotRetentionDays(),
       kgRefreshPreflight,
     };
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
@@ -662,6 +666,7 @@ export const getKgStatusTool = tool(
       return { content: [{ type: "text", text: JSON.stringify({ error: "KG refresh is not configured" }, null, 2) }] };
     }
     const inFlight = await ctx.objectClient(KgRepo, toolDeps.kgSourceRepo).status();
+    const flyProfile = await ctx.objectClient(FlyMachineProfile, "kg-refresh").get();
     const lastRefresh = toolDeps.readStatusRecord();
     const dryRun = await ctx.objectClient(KgRepo, toolDeps.kgSourceRepo).lastAdminDryRun();
     const lastDryRun = dryRun
@@ -705,7 +710,7 @@ export const getKgStatusTool = tool(
       lastDryRun,
       stage,
       materialize: getKgMaterializeDirect().enabled ? "direct" : "rdflib",
-      flyMachine: resolveKgFlyMachineSize(toolDeps.kgSourceRepo, false),
+      ...(flyProfile ? { flyMachine: { ...flyProfile.config, source: flyProfile.source } } : {}),
       restate: restateKey ? { service: "KgRefresh", key: restateKey } : null,
     };
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
@@ -994,55 +999,37 @@ export const setRunnerModeTool = tool(
   },
 );
 
-export const SET_KG_FLY_MACHINE_DESCRIPTION =
-  "Set the Fly KG refresh machine size (admin role): cpus (1, 2, 4, 8, 16), memoryMb (256-65536), cpuKind (auto, shared, performance). Given fields merge into the stored override; clear: true deletes it. Applies to the next Fly KG run, not one in flight. Returns the stored override and the effective size.";
+export const SET_FLY_MACHINE_PROFILE_DESCRIPTION =
+  "Set a pipeline's Fly machine profile (admin role): pipeline (kg-refresh), cpuKind (shared, performance), cpus (1, 2, 4, 8, 16), memoryMb (256-65536), idleTimeoutMs (at least 60000). Given fields merge into the stored profile; the merged result must be valid (performance needs 2048 MB per CPU). Applies to the next run, not one in flight. Returns the profile as { config, source }.";
 
-const KG_FLY_CPU_VALUES = [1, 2, 4, 8, 16];
-const KG_FLY_CPU_KINDS = ["auto", "shared", "performance"];
-
-export const setKgFlyMachineTool = tool(
+export const setFlyMachineProfileTool = tool(
   {
-    description: SET_KG_FLY_MACHINE_DESCRIPTION,
+    description: SET_FLY_MACHINE_PROFILE_DESCRIPTION,
     input: z.object({
+      pipeline: z.string().describe("The pipeline phase whose profile to set, e.g. kg-refresh"),
+      cpuKind: z.enum(["shared", "performance"]).optional().describe("CPU kind: shared or performance"),
       cpus: z.number().optional().describe("CPUs: one of 1, 2, 4, 8, 16"),
       memoryMb: z.number().optional().describe("Memory in MB: an integer from 256 to 65536"),
-      cpuKind: z.string().optional().describe("CPU kind: auto (performance at 2048 MB per CPU or more), shared, or performance"),
-      clear: z.boolean().optional().describe("Delete the override, restoring the mapping size"),
+      idleTimeoutMs: z.number().optional().describe("Idle timeout in ms: at least 60000"),
     }),
     role: "admin",
     retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },
   },
   async (ctx, input): Promise<ToolResponse> => {
     const reply = (value: unknown): ToolResponse => ({ content: [{ type: "text", text: JSON.stringify(value, null, 2) }] });
-    const bad = (error: string): ToolResponse => reply({ status: 400, body: { error } });
-    const { cpus, memoryMb, cpuKind, clear } = input.args;
-    if (cpus !== undefined && !(Number.isInteger(cpus) && KG_FLY_CPU_VALUES.includes(cpus))) {
-      return bad("cpus must be one of 1, 2, 4, 8, 16");
+    const { pipeline, cpuKind, cpus, memoryMb, idleTimeoutMs } = input.args;
+    const fields = {
+      ...(cpuKind !== undefined ? { cpuKind } : {}),
+      ...(cpus !== undefined ? { cpus } : {}),
+      ...(memoryMb !== undefined ? { memoryMb } : {}),
+      ...(idleTimeoutMs !== undefined ? { idleTimeoutMs } : {}),
+    };
+    try {
+      return reply(await ctx.objectClient(FlyMachineProfile, pipeline).set(fields));
+    } catch (err) {
+      if (err instanceof restate.TerminalError && err.code === 400) return reply({ status: 400, body: { error: err.message } });
+      throw err;
     }
-    if (memoryMb !== undefined && !(Number.isInteger(memoryMb) && memoryMb >= 256 && memoryMb <= 65536)) {
-      return bad("memoryMb must be an integer from 256 to 65536");
-    }
-    if (cpuKind !== undefined && !KG_FLY_CPU_KINDS.includes(cpuKind)) {
-      return bad("cpuKind must be one of auto, shared, performance");
-    }
-    const toolDeps = kgRefreshToolDeps;
-    if (!toolDeps) return reply({ error: "KG refresh is not configured" });
-    const kgSourceRepo = toolDeps.kgSourceRepo;
-    const stored = await ctx.run("set-kg-fly-machine", () => {
-      if (clear === true) {
-        setKgFlyMachineOverride(null);
-        return {} as KgFlyMachineOverride;
-      }
-      const merged: KgFlyMachineOverride = {
-        ...getKgFlyMachineOverride(),
-        ...(cpus !== undefined ? { cpus } : {}),
-        ...(memoryMb !== undefined ? { memoryMb } : {}),
-        ...(cpuKind !== undefined ? { cpuKind: cpuKind as KgFlyMachineOverride["cpuKind"] } : {}),
-      };
-      setKgFlyMachineOverride(merged);
-      return merged;
-    }, { maxRetryAttempts: 1 });
-    return reply({ override: stored, effective: resolveKgFlyMachineSize(kgSourceRepo, false) });
   },
 );
 
@@ -1408,7 +1395,7 @@ export const orchestratorTools = restate.service({
     kg_provenance: kgProvenance,
     trigger_kg_refresh: triggerKgRefreshTool,
     set_runner_mode: setRunnerModeTool,
-    set_kg_fly_machine: setKgFlyMachineTool,
+    set_fly_machine_profile: setFlyMachineProfileTool,
     fly_machine_reuse_probe: flyMachineReuseProbeTool,
     pause_project: pauseProjectTool,
     add_project: addProjectTool,

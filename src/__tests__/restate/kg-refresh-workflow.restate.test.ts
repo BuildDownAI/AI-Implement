@@ -24,6 +24,7 @@ import type { RefreshOutcome } from "../../kg-refresh.js";
 import { RailGateError, type KgRailDeps } from "../../kg-refresh-rail.js";
 import { COMPLETION_MARKER } from "../../kg-sidecar.js";
 import { createKgRefreshIngressClient } from "../../restate/kg-refresh-production.js";
+import { FLY_MACHINE_PROFILE_DEFAULTS, mergeProfile, type FlyMachineProfileConfig } from "../../restate/fly-machine-profile.js";
 import { createKgRepo, type KgRepoTriggerResult } from "../../restate/kg-repo.js";
 import {
   createKgRefreshWorkflow,
@@ -330,6 +331,25 @@ describe("KgRefresh durable workflow", () => {
     return scenario;
   }
 
+  // A counting stand-in for FlyMachineProfile that runs the real merge/validation, so a test can tell a
+  // journaled replay from a second read.
+  let profileGets = 0;
+  const dispatchedMachines: FlyMachineProfileConfig[] = [];
+  const flyMachineProfile = restate.object({
+    name: "FlyMachineProfile",
+    handlers: {
+      get: restate.handlers.object.shared(async (ctx: restate.ObjectSharedContext) => {
+        profileGets++;
+        const stored = await ctx.get<FlyMachineProfileConfig>("profile");
+        return stored ? { config: stored, source: "profile" } : { config: { ...FLY_MACHINE_PROFILE_DEFAULTS["kg-refresh"] }, source: "default" };
+      }),
+      set: restate.handlers.object.exclusive(async (ctx: restate.ObjectContext, patch: Partial<FlyMachineProfileConfig>) => {
+        const stored = await ctx.get<FlyMachineProfileConfig>("profile");
+        ctx.set("profile", mergeProfile(stored ?? FLY_MACHINE_PROFILE_DEFAULTS["kg-refresh"], patch));
+      }),
+    },
+  });
+
   async function dispatchFn(input: KgDispatchInput): Promise<KgDispatchResult> {
     const triggerId = input.runConfig.triggerId;
     adoptPendingScenario(triggerId);
@@ -338,6 +358,7 @@ describe("KgRefresh durable workflow", () => {
     contractCalls?.push("launch");
     scenario.dispatchCalls++;
     dispatchedIds.push(input.dispatchId);
+    dispatchedMachines.push(input.machine);
     dispatchedTokens.push(input.tokens);
     const committedRunId = dispatchThrowAfterCommit.get(triggerId);
     if (committedRunId !== undefined) {
@@ -501,8 +522,8 @@ describe("KgRefresh durable workflow", () => {
   let envs: Map<string, RestateTestEnvironment>;
   let deadlineEnvs: Map<string, RestateTestEnvironment>;
   beforeAll(async () => {
-    envs = await startVariants([workflow, kgRepo, starter]);
-    deadlineEnvs = await startVariants([deadlineWorkflow, kgRepo, starter]);
+    envs = await startVariants([workflow, kgRepo, starter, flyMachineProfile]);
+    deadlineEnvs = await startVariants([deadlineWorkflow, kgRepo, starter, flyMachineProfile]);
   }, 120_000);
   afterAll(async () => {
     if (envs) await stopAll(envs);
@@ -525,7 +546,7 @@ describe("KgRefresh durable workflow", () => {
 
   // KgRefresh.run is ingressPrivate (AII-976): production starts it by a send from KgRepo. This
   // forwarder stands in for that caller so a scenario can start a run with its own trigger id.
-  async function runWorkflow(baseUrl: string, triggerId: string, extra: Record<string, unknown> = {}): Promise<Promise<RefreshOutcome>> {
+  async function runWorkflow(baseUrl: string, triggerId: string, extra: Record<string, unknown> = {}): Promise<RefreshOutcome> {
     return callService<RefreshOutcome>(baseUrl, "KgRefreshStarter", "start", { triggerId, input: { triggerId, ...extra } });
   }
 
@@ -1421,7 +1442,7 @@ describe("KgRefresh durable workflow", () => {
       totalDeadlineMs: scaledTick * 24,
       watchIntervalMs: scaledTick,
     });
-    const scaledEnv = await startRetryEnabled([scaledWorkflow, kgRepo, starter]);
+    const scaledEnv = await startRetryEnabled([scaledWorkflow, kgRepo, starter, flyMachineProfile]);
     try {
       const triggerId = newTriggerId();
       const runId = runIdCounter++;
@@ -1549,7 +1570,7 @@ describe("KgRefresh durable workflow", () => {
       totalDeadlineMs: 5_000,
       watchIntervalMs: 100,
     });
-    const cadenceEnv = await startRetryEnabled([cadenceWorkflow, kgRepo, starter]);
+    const cadenceEnv = await startRetryEnabled([cadenceWorkflow, kgRepo, starter, flyMachineProfile]);
     try {
       const triggerId = newTriggerId();
       makeScenario(triggerId, {
@@ -1919,6 +1940,48 @@ describe("KgRefresh durable workflow", () => {
     30_000,
   );
 
+  // ---- AII-1130: the dispatch reads the FlyMachineProfile once, before the step ----
+  it.each(VARIANTS.map(([label]) => label))(
+    "AII-1130: dispatch receives the profile's machine, a later run sees a changed profile, and a retried dispatch reuses the one read (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const setProfile = (patch: Partial<FlyMachineProfileConfig>) =>
+        callObject(env.baseUrl(), "FlyMachineProfile", "kg-refresh", "set", patch);
+      const defaults = FLY_MACHINE_PROFILE_DEFAULTS["kg-refresh"];
+
+      await setProfile({ memoryMb: 4096 });
+      const first = newTriggerId();
+      makeScenario(first, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+      const firstDone = runWorkflow(env.baseUrl(), first);
+      await eventually(() => scenarios.get(first)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
+      expect(dispatchedMachines.at(-1)).toEqual({ ...defaults, memoryMb: 4096 });
+      await callWorkflow(env.baseUrl(), "KgRefresh", first, "report", SUCCESS_REPORT);
+      expect((await firstDone).ok).toBe(true);
+
+      await setProfile({ memoryMb: 8192 });
+      await setProfile({ cpus: 4 });
+      const second = newTriggerId();
+      const retried = makeScenario(second, { dispatchOutcome: "accepted", executionMode: "github-actions", runId: undefined });
+      const secondRunId = runIdCounter++;
+      dispatchThrowAfterCommit.set(second, secondRunId);
+      const beforeGets = profileGets;
+      const beforeMachines = dispatchedMachines.length;
+      const secondDone = runWorkflow(env.baseUrl(), second);
+      await eventually(() => retried.dispatchCalls >= 1, (ok) => ok, { label: "durable effect" });
+      await eventually(() => retried.runId === secondRunId, (ok) => ok, { label: "durable effect" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", second, "report", SUCCESS_REPORT);
+      await secondDone; // the rail's stamp gate may revert a second run on the shared fixture; only the dispatch matters here
+      // the retry (if the dispatch step ran again) reuses the journaled read: one get, same machine every attempt
+      expect(profileGets - beforeGets).toBe(1);
+      const seen = dispatchedMachines.slice(beforeMachines);
+      expect(seen.length).toBeGreaterThanOrEqual(1);
+      for (const m of seen) expect(m).toEqual({ ...defaults, cpus: 4, memoryMb: 8192 });
+
+      await setProfile({ cpus: defaults.cpus, memoryMb: defaults.memoryMb });
+    },
+    60_000,
+  );
+
   // ---- W13/W14: RailGateError conversion and revert ----
   it.each(VARIANTS.map(([label]) => label))(
     "W13: a RailGateError at verify reverts once and fails, status named verify beforehand (%s)",
@@ -2228,6 +2291,148 @@ describe("KgRefresh durable workflow", () => {
     15_000,
   );
 
+  // ---- AII-1127: the runner's steps are durable promises; status names the one in flight ----
+  describe("runner step reports", () => {
+    const stepBody = (id: string, status: string, extra: Record<string, unknown> = {}) => ({
+      step: {
+        id, type: "custom", status, started_at: "2026-10-07T00:00:00.000Z", ended_at: null,
+        parent_step_id: null, inputs: {}, outputs: {}, logs_url: null, ...extra,
+      },
+    });
+    const runnerStep = (baseUrl: string, triggerId: string) =>
+      callWorkflow<{ runnerStep: { id: string; status: string } | null }>(baseUrl, "KgRefresh", triggerId, "status").then((st) => st.runnerStep);
+
+    // `runWorkflow` returns the run's own promise; wrapping it in an object keeps `await` from waiting for the whole run.
+    async function parkedRun(baseUrl: string, triggerId: string): Promise<{ done: Promise<RefreshOutcome> }> {
+      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+      const done = runWorkflow(baseUrl, triggerId);
+      await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
+      return { done };
+    }
+
+    it.each(VARIANTS.map(([label]) => label))("status names the last reported runner step; a repeat changes nothing (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      const { done } = await parkedRun(env.baseUrl(), triggerId);
+      expect(await runnerStep(env.baseUrl(), triggerId)).toBeNull();
+
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "progress", stepBody("clone", "running"));
+      expect(await runnerStep(env.baseUrl(), triggerId)).toEqual({ id: "clone", status: "running" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "progress", stepBody("clone", "passed"));
+      expect(await runnerStep(env.baseUrl(), triggerId)).toEqual({ id: "clone", status: "passed" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "progress", stepBody("kg-ingest", "running"));
+      expect(await runnerStep(env.baseUrl(), triggerId)).toEqual({ id: "kg-ingest", status: "running" });
+
+      // A repeated delivery is left alone, and an older step does not move the report backwards.
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "progress", stepBody("clone", "running"));
+      expect(await runnerStep(env.baseUrl(), triggerId)).toEqual({ id: "kg-ingest", status: "running" });
+
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      expect((await done).ok).toBe(true);
+    }, 20_000);
+
+    it.each(VARIANTS.map(([label]) => label))("a step report resolves the progress heartbeat; a body-less progress does too (%s)", async (label) => {
+      const env = envFor(label);
+      const first = newTriggerId();
+      const { done: doneFirst } = await parkedRun(env.baseUrl(), first);
+      await callWorkflow(env.baseUrl(), "KgRefresh", first, "progress", stepBody("clone", "running"));
+      const response = await fetch(`${env.baseUrl()}/KgRefresh/${first}/progress`, { method: "POST" });
+      expect(response.ok).toBe(true);
+      await callWorkflow(env.baseUrl(), "KgRefresh", first, "report", SUCCESS_REPORT);
+      await doneFirst;
+
+      // An old runner image sends no step and no body at all.
+      const second = newTriggerId();
+      const { done: doneSecond } = await parkedRun(env.baseUrl(), second);
+      const bare = await fetch(`${env.baseUrl()}/KgRefresh/${second}/progress`, { method: "POST" });
+      expect(bare.ok).toBe(true);
+      expect(await runnerStep(env.baseUrl(), second)).toBeNull();
+      await callWorkflow(env.baseUrl(), "KgRefresh", second, "report", SUCCESS_REPORT);
+      await doneSecond;
+    }, 30_000);
+
+    it.each(VARIANTS.map(([label]) => label))("a step report after completion answers 2xx and changes nothing (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      const { done } = await parkedRun(env.baseUrl(), triggerId);
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "progress", stepBody("clone", "running"));
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      await done;
+
+      const late = await fetch(`${env.baseUrl()}/KgRefresh/${triggerId}/progress`, {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(stepBody("kg-ingest", "running")),
+      });
+      expect(late.ok).toBe(true);
+      expect(await runnerStep(env.baseUrl(), triggerId)).toEqual({ id: "clone", status: "running" });
+    }, 20_000);
+
+    it.each(VARIANTS.map(([label]) => label))("an unknown step id is accepted but creates no promise and leaves runnerStep unchanged (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      const { done } = await parkedRun(env.baseUrl(), triggerId);
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "progress", stepBody("clone", "running"));
+      const res = await fetch(`${env.baseUrl()}/KgRefresh/${triggerId}/progress`, {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(stepBody("not-a-step", "running")),
+      });
+      expect(res.ok).toBe(true);
+      expect(await runnerStep(env.baseUrl(), triggerId)).toEqual({ id: "clone", status: "running" });
+      const promises = await fetch(`${env.adminAPIBaseUrl()}/query`, { // restate-test-allow: the one sanctioned admin read
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "application/json" },
+        body: JSON.stringify({ query: `SELECT * FROM sys_promise WHERE service_name = 'KgRefresh' AND service_key = '${triggerId}'` }),
+      });
+      const rows = ((await promises.json()) as { rows: Array<Record<string, unknown>> }).rows;
+      expect(JSON.stringify(rows)).not.toContain("not-a-step");
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      await done;
+    }, 20_000);
+
+    it.each(VARIANTS.map(([label]) => label))("the callback redacts credentials before the ingress journals the step (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      const { done } = await parkedRun(env.baseUrl(), triggerId);
+      const SENTINEL = "ghs_SENTINEL_credential_value";
+      const secret = "restate-test-secret";
+      // Token verification reads SQLite; this scenario is about the ingress, so verification is stubbed.
+      vi.resetModules();
+      vi.doMock("../../runner-tokens.js", async (importOriginal) => ({
+        ...(await importOriginal<typeof import("../../runner-tokens.js")>()),
+        verifyRunToken: () => ({ ok: true, claims: { phase: "kg-refresh", audience: "progress", dispatchId: triggerId, issueId: "kg" } }),
+      }));
+      const { handleRunnerProgress } = await import("../../runner-callback.js");
+      const token = "stubbed";
+      const res = await handleRunnerProgress({
+        authorization: `Bearer ${token}`,
+        secret,
+        kgRefreshClient: createKgRefreshIngressClient(env.baseUrl()),
+        body: stepBody("clone", "passed", {
+          inputs: { githubToken: SENTINEL, machineNonce: SENTINEL, repoOwner: "org" },
+          outputs: { githubToken: SENTINEL, workspaceDir: "/w" },
+        }) as never,
+      });
+      vi.doUnmock("../../runner-tokens.js");
+      expect(res.status).toBe(200);
+      expect(await runnerStep(env.baseUrl(), triggerId)).toEqual({ id: "clone", status: "passed" });
+
+      const status = await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "status");
+      expect(JSON.stringify(status)).not.toContain(SENTINEL);
+      const promises = await fetch(`${env.adminAPIBaseUrl()}/query`, { // restate-test-allow: the one sanctioned admin read
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "application/json" },
+        body: JSON.stringify({ query: `SELECT * FROM sys_promise WHERE service_name = 'KgRefresh' AND service_key = '${triggerId}'` }),
+      });
+      expect(promises.ok).toBe(true);
+      const rows = ((await promises.json()) as { rows: Array<Record<string, unknown>> }).rows;
+      expect(rows.some((row) => JSON.stringify(row).includes("step:clone:ended"))).toBe(true);
+      expect(JSON.stringify(rows)).not.toContain(SENTINEL);
+      // The value is stored as bytes, so check the encoded sentinel too.
+      expect(JSON.stringify(rows)).not.toContain(JSON.stringify(Array.from(Buffer.from(SENTINEL))).slice(1, -1));
+
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      await done;
+    }, 20_000);
+  });
+
   // ---- W18: registered deployment options ----
   it.each(VARIANTS.map(([label]) => label))("a run call with a non-object input is rejected by the schema (%s)", async (label) => {
     const env = envFor(label);
@@ -2266,7 +2471,7 @@ describe("KgRefresh durable workflow", () => {
   it("W18b: a workflow built with a ten-day retentionMs registers ten days", async () => {
     const tenDays = 10 * 24 * 60 * 60 * 1000;
     const tenDayWorkflow = createKgRefreshWorkflow({ ...workflowDeps, retentionMs: tenDays, bootstrapDeadlineMs: 30_000, totalDeadlineMs: 60_000 });
-    const tenDayEnv = await startRetryEnabled([tenDayWorkflow, kgRepo, starter]);
+    const tenDayEnv = await startRetryEnabled([tenDayWorkflow, kgRepo, starter, flyMachineProfile]);
     try {
       const triggerId = newTriggerId();
       makeScenario(triggerId, { dispatchOutcome: "rejected", executionMode: "fly-machines" });
@@ -2347,7 +2552,7 @@ describe("KgRefresh durable workflow", () => {
     const crashWorkflow = buildCrashWorkflow("original");
     const replacementWorkflow = buildCrashWorkflow("replacement");
 
-    const env = await startRetryEnabled([crashWorkflow, kgRepo]);
+    const env = await startRetryEnabled([crashWorkflow, kgRepo, flyMachineProfile]);
     let replacement: Awaited<ReturnType<typeof replaceEndpoint>> | undefined;
     try {
       // Dispatches through the real KgRepo.trigger (not a direct KgRefresh.run call) so the
@@ -2365,7 +2570,7 @@ describe("KgRefresh durable workflow", () => {
       const stagingMarker = join(dataRoot, "staging", COMPLETION_MARKER);
       await eventually(() => existsSync(stagingMarker) && stageCommittedAttempts.length >= 1, (ok) => ok, { label: "durable effect", timeoutMs: 12_000 });
 
-      replacement = await replaceEndpoint(env, [replacementWorkflow, kgRepo]);
+      replacement = await replaceEndpoint(env, [replacementWorkflow, kgRepo, flyMachineProfile]);
       await env.startedRestateContainer.restart();
 
       // The restart severs the blocked first attempt's connection; Restate retries the
