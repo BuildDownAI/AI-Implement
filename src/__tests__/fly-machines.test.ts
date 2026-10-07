@@ -4,6 +4,8 @@ import {
   getMachine,
   listMachines,
   stopMachine,
+  startMachine,
+  updateMachine,
   destroyMachine,
   waitForMachine,
   generateSessionToken,
@@ -1067,5 +1069,40 @@ describe("readMachineExit", () => {
   it("leaves exitCode null for a clean exit", () => {
     expect(readMachineExit(withEvents([{ type: "exit", timestamp: 2, request: { exit_event: {} } }])))
       .toEqual({ exitCode: null, signal: null, oomKilled: null, timestamp: 2 });
+  });
+});
+
+describe("startMachine / updateMachine (AII-1123)", () => {
+  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  it("startMachine posts to /start with no body", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({ ok: true } as Response);
+    await startMachine(TOKEN, APP, "machine-123");
+    const [url, opts] = vi.mocked(fetch).mock.calls[0];
+    expect(url).toBe(`https://api.machines.dev/v1/apps/${APP}/machines/machine-123/start`);
+    expect((opts as RequestInit).method).toBe("POST");
+    expect((opts as RequestInit).body).toBeUndefined();
+  });
+
+  it("startMachine throws with status and body", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({ ok: false, status: 412, text: async () => "bad state" } as Response);
+    await expect(startMachine(TOKEN, APP, "machine-123")).rejects.toThrow("Failed to start machine machine-123 (412): bad state");
+  });
+
+  it("updateMachine posts { config } and returns the machine", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({ ok: true, json: async () => mockMachine } as Response);
+    const result = await updateMachine(TOKEN, APP, "machine-123", mockMachine.config as never);
+    expect(result.id).toBe("machine-123");
+    const [url, opts] = vi.mocked(fetch).mock.calls[0];
+    expect(url).toBe(`https://api.machines.dev/v1/apps/${APP}/machines/machine-123`);
+    expect((opts as RequestInit).method).toBe("POST");
+    expect(JSON.parse((opts as RequestInit).body as string)).toEqual({ config: mockMachine.config });
+  });
+
+  it("updateMachine throws with status and body", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({ ok: false, status: 422, text: async () => "invalid config" } as Response);
+    await expect(updateMachine(TOKEN, APP, "machine-123", mockMachine.config as never))
+      .rejects.toThrow("Failed to update machine machine-123 (422): invalid config");
   });
 });

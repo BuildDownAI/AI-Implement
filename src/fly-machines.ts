@@ -38,6 +38,7 @@ export interface MachineConfig {
   restart?: { policy: string };
   metadata?: Record<string, string>;
   processes?: MachineProcess[];
+  init?: { entrypoint?: string[]; cmd?: string[] };
 }
 
 export interface MachineExitEvent {
@@ -153,6 +154,45 @@ export async function stopMachine(
     const body = await res.text();
     throw new Error(`Failed to stop machine ${machineId} (${res.status}): ${body}`);
   }
+}
+
+export async function startMachine(
+  token: string,
+  appName: string,
+  machineId: string,
+): Promise<void> {
+  const url = `${FLY_API_BASE}/apps/${appName}/machines/${machineId}/start`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: flyHeaders(token),
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Failed to start machine ${machineId} (${res.status}): ${body}`);
+  }
+}
+
+/** Replaces the machine's config. Fly takes the whole config (no partial update), so pass a full one. */
+export async function updateMachine(
+  token: string,
+  appName: string,
+  machineId: string,
+  config: MachineConfig,
+): Promise<Machine> {
+  const url = `${FLY_API_BASE}/apps/${appName}/machines/${machineId}`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: flyHeaders(token),
+    body: JSON.stringify({ config }),
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Failed to update machine ${machineId} (${res.status}): ${body}`);
+  }
+
+  return (await res.json()) as Machine;
 }
 
 /**

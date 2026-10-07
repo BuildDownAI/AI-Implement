@@ -16,6 +16,7 @@ import {
   kgHybridSearch,
   getKgStatusTool,
   setKgFlyMachineTool,
+  flyMachineReuseProbeTool,
   getTenantHealth,
   getIssueReportCardTool,
   getFleetReportTool,
@@ -42,6 +43,7 @@ import type { MemoryProvider } from "../kg-provider.js";
 import type { PreflightCheckResult, RefreshOutcome } from "../kg-refresh.js";
 import type { KgRefreshToolDeps } from "../restate/kg-refresh-production.js";
 import { getMappings } from "../config.js";
+import { getMachine, createMachine, startMachine, updateMachine, destroyMachine, waitForMachine } from "../fly-machines.js";
 import { setOrchestratorSetting } from "../orchestrator-settings.js";
 import { initSettingsTable, getKgFlyMachineOverride, setKgFlyMachineOverride } from "../runner-mode.js";
 import { initLogTable } from "../log.js";
@@ -58,6 +60,16 @@ import {
 vi.mock("../report-card.js", () => ({
   getIssueReportCard: vi.fn(),
   getFleetReport: vi.fn(),
+}));
+
+vi.mock("../fly-machines.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../fly-machines.js")>()),
+  getMachine: vi.fn(),
+  createMachine: vi.fn(),
+  startMachine: vi.fn(),
+  updateMachine: vi.fn(),
+  destroyMachine: vi.fn(),
+  waitForMachine: vi.fn(),
 }));
 
 vi.mock("../config.js", async (importOriginal) => ({
@@ -1572,5 +1584,141 @@ describe("set_kg_fly_machine / get_kg_status flyMachine (AII-1120)", () => {
     } as unknown as restate.Context;
     const status = JSON.parse((await getKgStatusTool(ctx, { caller: SYSTEM_ADMIN, args: {} })).content[0].text);
     expect(status.flyMachine).toEqual({ cpuKind: "performance", cpus: 2, memoryMb: 8192, source: "override" });
+  });
+});
+
+describe("fly_machine_reuse_probe (AII-1123)", () => {
+  const saved = { ...process.env };
+  const probeMachine = (over: Record<string, unknown> = {}) => ({
+    id: "m1", name: "reuse-probe-1", state: "stopped", region: "iad", created_at: "", updated_at: "",
+    config: {
+      image: "old-image", env: { PROBE_RUN: "1", PROBE_EXPECT_MB: "8192", OTHER: "x" },
+      guest: { cpu_kind: "performance", cpus: 2, memory_mb: 8192 },
+      metadata: { purpose: "reuse-probe" }, init: { cmd: ["old"] }, services: [{ internal_port: 1, protocol: "tcp", ports: [] }],
+    },
+    events: [],
+    ...over,
+  });
+  const call = async (args: Record<string, unknown>, runCalls: RunCall[] = [], caller: Caller = SYSTEM_ADMIN) =>
+    JSON.parse((await flyMachineReuseProbeTool(fakeContext("fly_machine_reuse_probe", runCalls), { caller, args } as never)).content[0].text);
+
+  beforeEach(() => {
+    process.env.FLY_SESSIONS_TOKEN = "tok";
+    process.env.FLY_SESSIONS_APP = "sessions";
+    delete process.env.FLY_SESSIONS_REGION;
+    vi.mocked(getMachine).mockReset();
+    vi.mocked(createMachine).mockReset().mockResolvedValue({ id: "m1", state: "created" } as never);
+    vi.mocked(startMachine).mockReset().mockResolvedValue(undefined);
+    vi.mocked(updateMachine).mockReset().mockResolvedValue({} as never);
+    vi.mocked(destroyMachine).mockReset().mockResolvedValue(undefined);
+    vi.mocked(waitForMachine).mockReset().mockResolvedValue(undefined);
+  });
+  afterEach(() => { process.env = { ...saved }; });
+
+  it("create sends the fixed probe config, without orchestrator_app", async () => {
+    const runCalls: RunCall[] = [];
+    const res = await call({ action: "create", run: 4, memoryMb: 4096 }, runCalls);
+    expect(res.machineId).toBe("m1");
+    expect(res.startedMs).toEqual(expect.any(Number));
+    const [token, app, opts] = vi.mocked(createMachine).mock.calls[0];
+    expect([token, app]).toEqual(["tok", "sessions"]);
+    expect(opts.name).toBe("reuse-probe-4");
+    expect(opts.region).toBe("iad");
+    expect(opts.config.metadata).toEqual({ purpose: "reuse-probe" });
+    expect(opts.config.env).toEqual({ PROBE_RUN: "4", PROBE_EXPECT_MB: "4096" });
+    expect(opts.config.restart).toEqual({ policy: "no" });
+    expect(opts.config.auto_destroy).toBe(false);
+    expect(opts.config.guest).toEqual({ cpu_kind: "performance", cpus: 2, memory_mb: 4096 });
+    expect(opts.config.init?.entrypoint).toEqual(["sh", "-c"]);
+    expect(opts.config.init?.cmd?.[0]).toContain("/var/tmp/reuse-probe-marker");
+    expect(opts.config.image).toBeTruthy();
+    expect(vi.mocked(waitForMachine)).toHaveBeenCalledWith("tok", "sessions", "m1", "started", 45);
+    expect(runCalls.every((c) => (c.options as { maxRetryAttempts: number }).maxRetryAttempts === 1)).toBe(true);
+  });
+
+  it("create still returns the machine id when the wait times out", async () => {
+    vi.mocked(waitForMachine).mockRejectedValue(new Error("Timeout (408)"));
+    const res = await call({ action: "create" });
+    expect(res.machineId).toBe("m1");
+    expect(res.startedMs).toBeNull();
+  });
+
+  it("update replaces only image, env and guest", async () => {
+    vi.mocked(getMachine).mockResolvedValue(probeMachine() as never);
+    const res = await call({ action: "update", machineId: "m1", run: 3, memoryMb: 4096 });
+    expect(res.startedMs).toEqual(expect.any(Number));
+    const config = vi.mocked(updateMachine).mock.calls[0][3];
+    const old = probeMachine().config;
+    expect(config.env).toEqual({ PROBE_RUN: "3", PROBE_EXPECT_MB: "4096" });
+    expect(config.guest).toEqual({ cpu_kind: "performance", cpus: 2, memory_mb: 4096 });
+    expect(config.image).not.toBe("old-image");
+    expect({ ...config, image: 0, env: 0, guest: 0 }).toEqual({ ...old, image: 0, env: 0, guest: 0 });
+  });
+
+  it("start reports apiMs and startedMs", async () => {
+    vi.mocked(getMachine).mockResolvedValue(probeMachine() as never);
+    const res = await call({ action: "start", machineId: "m1" });
+    expect(vi.mocked(startMachine)).toHaveBeenCalledWith("tok", "sessions", "m1");
+    expect(res.apiMs).toEqual(expect.any(Number));
+  });
+
+  it.each(["start", "update", "read", "destroy"])("%s refuses a session machine and writes nothing", async (action) => {
+    vi.mocked(getMachine).mockResolvedValue(probeMachine({ config: { image: "i", metadata: { purpose: "session" } } }) as never);
+    const res = await call({ action, machineId: "m1" });
+    expect(res.status).toBe(400);
+    expect(startMachine).not.toHaveBeenCalled();
+    expect(updateMachine).not.toHaveBeenCalled();
+    expect(destroyMachine).not.toHaveBeenCalled();
+  });
+
+  it("refuses a machine with no metadata", async () => {
+    vi.mocked(getMachine).mockResolvedValue(probeMachine({ config: { image: "i" } }) as never);
+    expect((await call({ action: "destroy", machineId: "m1" })).status).toBe(400);
+    expect(destroyMachine).not.toHaveBeenCalled();
+  });
+
+  it("answers 404 for read and destroyed for destroy when the machine is gone", async () => {
+    vi.mocked(getMachine).mockRejectedValue(new Error("Failed to get machine m1 (404): nope"));
+    expect((await call({ action: "read", machineId: "m1" })).status).toBe(404);
+    expect(await call({ action: "destroy", machineId: "m1" })).toEqual({ destroyed: true });
+    expect(destroyMachine).not.toHaveBeenCalled();
+  });
+
+  it("destroys a probe machine with force", async () => {
+    vi.mocked(getMachine).mockResolvedValue(probeMachine() as never);
+    expect(await call({ action: "destroy", machineId: "m1" })).toEqual({ destroyed: true });
+    expect(vi.mocked(destroyMachine)).toHaveBeenCalledWith("tok", "sessions", "m1", true);
+  });
+
+  it("read returns exitCode, oomKilled, env and the 10 newest events", async () => {
+    const events = Array.from({ length: 12 }, (_, i) => ({
+      type: i === 0 ? "exit" : "start", status: "s", timestamp: 1000 - i,
+      ...(i === 0 ? { request: { exit_event: { exit_code: 10, oom_killed: false } } } : {}),
+    }));
+    vi.mocked(getMachine).mockResolvedValue(probeMachine({ events }) as never);
+    const res = await call({ action: "read", machineId: "m1" });
+    expect(res.exitCode).toBe(10);
+    expect(res.oomKilled).toBe(false);
+    expect(res.env).toEqual({ PROBE_RUN: "1", PROBE_EXPECT_MB: "8192" });
+    expect(res.guest.memory_mb).toBe(8192);
+    expect(res.events).toHaveLength(10);
+    expect(res.events[0]).toEqual({ type: "exit", status: "s", timestamp: 1000 });
+  });
+
+  it.each([
+    [{ action: "create", memoryMb: 1000 }, "memoryMb"],
+    [{ action: "create", run: 0 }, "run"],
+    [{ action: "read" }, "machineId"],
+  ])("rejects %j with 400 naming %s", async (args, field) => {
+    const res = await call(args);
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain(field);
+    expect(createMachine).not.toHaveBeenCalled();
+  });
+
+  it("refuses a user caller", async () => {
+    const result = await flyMachineReuseProbeTool(fakeContext("fly_machine_reuse_probe"), { caller: HUMAN_USER, args: { action: "create" } });
+    expect(result.content[0].text).toBe("forbidden: fly_machine_reuse_probe requires the admin role");
+    expect(createMachine).not.toHaveBeenCalled();
   });
 });
