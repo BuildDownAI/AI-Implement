@@ -71,7 +71,7 @@ function mockGitSuccess(sha = "deadbeef", dirty = true) {
 }
 
 const TEST_VERDICT_SENTENCE =
-  "The CI checks on this PR are the source of truth for the test verdict. The line above is the runner's own pre-push run.";
+  "The CI checks on this PR are the source of truth for the test verdict. The line above is the runner's own pre-push report.";
 
 describe("pushStep", () => {
   beforeEach(() => {

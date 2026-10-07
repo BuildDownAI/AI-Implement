@@ -670,7 +670,7 @@ function buildPullRequestBody(
 
 /** Plain text under the Test plan checkbox: CI, not the runner's preflight line, is the verdict. */
 const TEST_VERDICT_SENTENCE =
-  "The CI checks on this PR are the source of truth for the test verdict. The line above is the runner's own pre-push run.";
+  "The CI checks on this PR are the source of truth for the test verdict. The line above is the runner's own pre-push report.";
 
 /**
  * Leads the PR body (before the unapproved section, per the "why first" rationale:
