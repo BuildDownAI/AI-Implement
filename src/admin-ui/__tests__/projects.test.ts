@@ -272,7 +272,7 @@ describe("projects page review-fix lifecycle field", () => {
     expect(projectsHtml).toContain("does not cancel or migrate anything already in flight");
   });
 
-  it("defaults a new mapping's visual selection to Legacy when the field is absent", async () => {
+  it("defaults a new mapping's visual selection to Legacy when no lifecycle is stored", async () => {
     const { win, doc } = mountProjects(makeMapping());
     await win.loadMappings();
     win.openMappingDialog("AII");

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   buildDockerEnvFileContent,
   buildDockerRunArgs,
@@ -9,6 +9,7 @@ import {
 } from "../local-docker.js";
 import type { LocalRunnerInput } from "../local-docker.js";
 import { encodeRunConfig, decodeRunConfig, type RunConfigV1 } from "../run-config.js";
+import { testDir } from "./helpers/test-dir.js";
 
 const baseInput: LocalRunnerInput = {
   image: "ai-implement-runner:local",
@@ -232,7 +233,14 @@ describe("buildDockerRunArgs default name", () => {
 });
 
 describe("startLocalRunnerContainer", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
   it("calls the launch marker only after local preparation succeeds", async () => {
+    // The secret env file's directory is created under os.tmpdir(), which reads these per call.
+    const tempRoot = testDir("local-docker");
+    for (const name of ["TMPDIR", "TEMP", "TMP"]) vi.stubEnv(name, tempRoot);
     let marked = false;
     await expect(startLocalRunnerContainer({
       ...baseInput,

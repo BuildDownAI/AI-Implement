@@ -77,9 +77,9 @@ const BASE_ISSUE = {
 };
 
 // The step writes ai-output/ into its workspace, so every test gets a workspace of its own.
-let BASE_INPUTS: typeof BASE_ISSUE & { workspaceDir: string };
+let baseInputs: typeof BASE_ISSUE & { workspaceDir: string };
 beforeEach(() => {
-  BASE_INPUTS = { workspaceDir: testDir("feedback-loop"), ...BASE_ISSUE };
+  baseInputs = { workspaceDir: testDir("feedback-loop"), ...BASE_ISSUE };
 });
 
 /** Every non-"status" git call returns `diff`; `git status --porcelain` always reports a
@@ -112,7 +112,7 @@ describe("feedbackLoopStep", () => {
 
     const outputs = await feedbackLoopStep.run(
       makeContext(),
-      BASE_INPUTS,
+      baseInputs,
       new NoopStepReporter(),
     );
 
@@ -128,7 +128,7 @@ describe("feedbackLoopStep", () => {
 
     await feedbackLoopStep.run(
       makeContext(),
-      { ...BASE_INPUTS, implementationPrompt: "Follow WORKFLOW.md instructions" },
+      { ...baseInputs, implementationPrompt: "Follow WORKFLOW.md instructions" },
       new NoopStepReporter(),
     );
 
@@ -143,7 +143,7 @@ describe("feedbackLoopStep", () => {
 
     const outputs = await feedbackLoopStep.run(
       makeContext(),
-      { ...BASE_INPUTS, maxIterations: 3 },
+      { ...baseInputs, maxIterations: 3 },
       new NoopStepReporter(),
     );
 
@@ -158,7 +158,7 @@ describe("feedbackLoopStep", () => {
 
     const outputs = await feedbackLoopStep.run(
       makeContext(),
-      { ...BASE_INPUTS, maxIterations: 2 },
+      { ...baseInputs, maxIterations: 2 },
       new NoopStepReporter(),
     );
 
@@ -170,7 +170,7 @@ describe("feedbackLoopStep", () => {
   it("defaults to 3 maxIterations when not specified", async () => {
     vi.mocked(reviewStep.run).mockResolvedValue(REJECTED_REVIEW);
 
-    const outputs = await feedbackLoopStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+    const outputs = await feedbackLoopStep.run(makeContext(), baseInputs, new NoopStepReporter());
 
     expect(outputs.iterations).toBe(3);
   });
@@ -179,7 +179,7 @@ describe("feedbackLoopStep", () => {
     mockDiff("diff --git a/src/auth.ts\n+new line");
     vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
 
-    await feedbackLoopStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+    await feedbackLoopStep.run(makeContext(), baseInputs, new NoopStepReporter());
 
     const reviewCall = vi.mocked(reviewStep.run).mock.calls[0];
     expect(reviewCall[1]).toMatchObject({
@@ -194,7 +194,7 @@ describe("feedbackLoopStep", () => {
 
     await feedbackLoopStep.run(
       makeContext(),
-      { ...BASE_INPUTS, maxIterations: 3 },
+      { ...baseInputs, maxIterations: 3 },
       new NoopStepReporter(),
     );
 
@@ -215,7 +215,7 @@ describe("feedbackLoopStep", () => {
 
     await feedbackLoopStep.run(
       makeContext(),
-      { ...BASE_INPUTS, maxIterations: 2 },
+      { ...baseInputs, maxIterations: 2 },
       new NoopStepReporter(),
     );
 
@@ -231,7 +231,7 @@ describe("feedbackLoopStep", () => {
     await feedbackLoopStep.run(
       makeContext(),
       {
-        ...BASE_INPUTS,
+        ...baseInputs,
         installFailed: true,
         installMethod: "npm ci",
         installError: "npm ERR! could not resolve dependency",
@@ -253,7 +253,7 @@ describe("feedbackLoopStep", () => {
     await feedbackLoopStep.run(
       makeContext(),
       {
-        ...BASE_INPUTS,
+        ...baseInputs,
         maxIterations: 3,
         installFailed: true,
         installMethod: "npm ci",
@@ -273,7 +273,7 @@ describe("feedbackLoopStep", () => {
   it("omits the dependency install failure block when installFailed is false or absent", async () => {
     vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
 
-    await feedbackLoopStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+    await feedbackLoopStep.run(makeContext(), baseInputs, new NoopStepReporter());
 
     const firstImplementCall = vi.mocked(implementStep.run).mock.calls[0];
     expect(firstImplementCall[1].prompt).not.toContain("## Dependency install failed");
@@ -284,7 +284,7 @@ describe("feedbackLoopStep", () => {
 
     await feedbackLoopStep.run(
       makeContext(),
-      { ...BASE_INPUTS, installFailed: true },
+      { ...baseInputs, installFailed: true },
       new NoopStepReporter(),
     );
 
@@ -295,7 +295,7 @@ describe("feedbackLoopStep", () => {
   it("does not pass installFailed to the in-loop reviewer when absent", async () => {
     vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
 
-    await feedbackLoopStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+    await feedbackLoopStep.run(makeContext(), baseInputs, new NoopStepReporter());
 
     const reviewCall = vi.mocked(reviewStep.run).mock.calls[0];
     expect(reviewCall[1]).toMatchObject({ installFailed: false });
@@ -311,7 +311,7 @@ describe("feedbackLoopStep", () => {
       }),
     };
 
-    await feedbackLoopStep.run(makeContext(), BASE_INPUTS, reporter);
+    await feedbackLoopStep.run(makeContext(), baseInputs, reporter);
 
     const types = reportedSteps.map((s) => s.type);
     expect(types).toContain("implement");
@@ -331,7 +331,7 @@ describe("feedbackLoopStep", () => {
     };
 
     await expect(
-      feedbackLoopStep.run(makeContext(), BASE_INPUTS, reporter),
+      feedbackLoopStep.run(makeContext(), baseInputs, reporter),
     ).rejects.toThrow("LLM timeout");
 
     const failedStep = reportedSteps.find((s) => s.status === "failed");
@@ -366,7 +366,7 @@ describe("feedbackLoopStep", () => {
     };
 
     const thrown = await feedbackLoopStep
-      .run(makeContext(), BASE_INPUTS, reporter)
+      .run(makeContext(), baseInputs, reporter)
       .catch((e: unknown) => e);
 
     const failedStep = reportedSteps.find((s) => s.status === "failed" && s.type === "implement");
@@ -414,7 +414,7 @@ describe("feedbackLoopStep", () => {
       }),
     };
 
-    await feedbackLoopStep.run(makeContext(), BASE_INPUTS, reporter).catch((e: unknown) => e);
+    await feedbackLoopStep.run(makeContext(), baseInputs, reporter).catch((e: unknown) => e);
 
     const failedStep = reportedSteps.find((s) => s.status === "failed" && s.type === "implement");
     expect(failedStep).toBeDefined();
@@ -443,7 +443,7 @@ describe("feedbackLoopStep", () => {
       }),
     };
 
-    const outputs = await feedbackLoopStep.run(makeContext(), BASE_INPUTS, reporter);
+    const outputs = await feedbackLoopStep.run(makeContext(), baseInputs, reporter);
 
     const failedStep = reportedSteps.find((s) => s.status === "failed" && s.type === "review");
     expect(failedStep).toBeDefined();
@@ -457,7 +457,7 @@ describe("feedbackLoopStep", () => {
       telemetry: { outcome: "success", numTurns: 3, durationMs: 500, costUsd: 0.05, tokensIn: 10, tokensOut: 5 },
     });
 
-    const outputs = await feedbackLoopStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+    const outputs = await feedbackLoopStep.run(makeContext(), baseInputs, new NoopStepReporter());
 
     expect(outputs.passes[0]!.reviewCostUsd).toBe(0.05);
   });
@@ -465,7 +465,7 @@ describe("feedbackLoopStep", () => {
   it("does not throw when the review step fails, so the pipeline can still push", async () => {
     vi.mocked(reviewStep.run).mockRejectedValueOnce(new Error("Prompt is too long"));
 
-    const outputs = await feedbackLoopStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+    const outputs = await feedbackLoopStep.run(makeContext(), baseInputs, new NoopStepReporter());
 
     // A review failure must not discard a successful implementation. The loop
     // ends, approved stays false, and the reason is surfaced in finalFeedback.
@@ -486,7 +486,7 @@ describe("feedbackLoopStep", () => {
 
     await feedbackLoopStep.run(
       makeContext(),
-      { ...BASE_INPUTS, maxIterations: 3 },
+      { ...baseInputs, maxIterations: 3 },
       reporter,
     );
 
@@ -501,7 +501,7 @@ describe("feedbackLoopStep", () => {
   it("passes issueTitle and issueDescription to review step", async () => {
     vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
 
-    await feedbackLoopStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+    await feedbackLoopStep.run(makeContext(), baseInputs, new NoopStepReporter());
 
     const reviewCall = vi.mocked(reviewStep.run).mock.calls[0];
     expect(reviewCall[1]).toMatchObject({
@@ -515,7 +515,7 @@ describe("feedbackLoopStep", () => {
 
     await feedbackLoopStep.run(
       makeContext(),
-      { ...BASE_INPUTS, planningContext: "Use factory pattern" },
+      { ...baseInputs, planningContext: "Use factory pattern" },
       new NoopStepReporter(),
     );
 
@@ -528,7 +528,7 @@ describe("feedbackLoopStep", () => {
 
     await feedbackLoopStep.run(
       makeContext(),
-      { ...BASE_INPUTS, model: "unified-model", repoImplementModel: "repo-impl-model", repoReviewModel: "repo-review-model" },
+      { ...baseInputs, model: "unified-model", repoImplementModel: "repo-impl-model", repoReviewModel: "repo-review-model" },
       new NoopStepReporter(),
     );
 
@@ -543,7 +543,7 @@ describe("feedbackLoopStep", () => {
 
     await feedbackLoopStep.run(
       makeContext(),
-      { ...BASE_INPUTS, model: "claude-opus-4-7" },
+      { ...baseInputs, model: "claude-opus-4-7" },
       new NoopStepReporter(),
     );
 
@@ -558,7 +558,7 @@ describe("feedbackLoopStep", () => {
 
     await feedbackLoopStep.run(
       makeContext(),
-      { ...BASE_INPUTS, implementModel: "claude-opus-4-7", reviewModel: "claude-haiku-4-5-20251001" },
+      { ...baseInputs, implementModel: "claude-opus-4-7", reviewModel: "claude-haiku-4-5-20251001" },
       new NoopStepReporter(),
     );
 
@@ -573,7 +573,7 @@ describe("feedbackLoopStep", () => {
 
     await feedbackLoopStep.run(
       makeContext(),
-      { ...BASE_INPUTS, repoImplementModel: "claude-opus-4-7", repoReviewModel: "claude-haiku-4-5-20251001" },
+      { ...baseInputs, repoImplementModel: "claude-opus-4-7", repoReviewModel: "claude-haiku-4-5-20251001" },
       new NoopStepReporter(),
     );
 
@@ -588,7 +588,7 @@ describe("feedbackLoopStep", () => {
 
     const ctx = makeContext({ model: "claude-opus-4-7" });
 
-    await feedbackLoopStep.run(ctx, BASE_INPUTS, new NoopStepReporter());
+    await feedbackLoopStep.run(ctx, baseInputs, new NoopStepReporter());
 
     const implementCall = vi.mocked(implementStep.run).mock.calls[0];
     const reviewCall = vi.mocked(reviewStep.run).mock.calls[0];
@@ -603,7 +603,7 @@ describe("feedbackLoopStep", () => {
 
     await feedbackLoopStep.run(
       ctx,
-      { ...BASE_INPUTS, implementModel: "claude-opus-4-7", repoImplementModel: "claude-haiku-4-5-20251001" },
+      { ...baseInputs, implementModel: "claude-opus-4-7", repoImplementModel: "claude-haiku-4-5-20251001" },
       new NoopStepReporter(),
     );
 
@@ -623,7 +623,7 @@ describe("feedbackLoopStep", () => {
 
     await feedbackLoopStep.run(
       makeContext(),
-      { ...BASE_INPUTS, implementModel: "claude-opus-4-7" },
+      { ...baseInputs, implementModel: "claude-opus-4-7" },
       reporter,
     );
 
@@ -643,7 +643,7 @@ describe("feedbackLoopStep", () => {
 
     await feedbackLoopStep.run(
       makeContext(),
-      { ...BASE_INPUTS, reviewModel: "claude-haiku-4-5-20251001" },
+      { ...baseInputs, reviewModel: "claude-haiku-4-5-20251001" },
       reporter,
     );
 
@@ -661,7 +661,7 @@ describe("feedbackLoopStep caps", () => {
   });
 
   it("passes maxTurns=50 by default to the implement invocation", async () => {
-    await feedbackLoopStep.run(makeContext(), { ...BASE_INPUTS }, new NoopStepReporter());
+    await feedbackLoopStep.run(makeContext(), { ...baseInputs }, new NoopStepReporter());
 
     const implementCall = vi.mocked(implementStep.run).mock.calls[0];
     expect(implementCall[1]).toMatchObject({ maxTurns: 50 });
@@ -670,7 +670,7 @@ describe("feedbackLoopStep caps", () => {
   it("honors an explicit maxTurns input", async () => {
     await feedbackLoopStep.run(
       makeContext(),
-      { ...BASE_INPUTS, maxTurns: 25 },
+      { ...baseInputs, maxTurns: 25 },
       new NoopStepReporter(),
     );
 
@@ -683,7 +683,7 @@ describe("feedbackLoopStep caps", () => {
 
     const outputs = await feedbackLoopStep.run(
       makeContext(),
-      { ...BASE_INPUTS, provider: "bedrock" },
+      { ...baseInputs, provider: "bedrock" },
       new NoopStepReporter(),
     );
 
@@ -695,7 +695,7 @@ describe("feedbackLoopStep caps", () => {
 
     const outputs = await feedbackLoopStep.run(
       makeContext(),
-      { ...BASE_INPUTS, provider: "anthropic" },
+      { ...baseInputs, provider: "anthropic" },
       new NoopStepReporter(),
     );
 
@@ -707,7 +707,7 @@ describe("feedbackLoopStep caps", () => {
 
     const outputs = await feedbackLoopStep.run(
       makeContext(),
-      { ...BASE_INPUTS, provider: "bedrock", maxIterations: 5 },
+      { ...baseInputs, provider: "bedrock", maxIterations: 5 },
       new NoopStepReporter(),
     );
 
@@ -735,7 +735,7 @@ describe("feedbackLoopStep termination reasons", () => {
     });
     vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
 
-    const outputs = await feedbackLoopStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+    const outputs = await feedbackLoopStep.run(makeContext(), baseInputs, new NoopStepReporter());
 
     expect(outputs.terminationReason).toBe("approved");
     expect(outputs.passes).toEqual([
@@ -749,7 +749,7 @@ describe("feedbackLoopStep termination reasons", () => {
   it("reports terminationReason=iterations_exhausted when all reviews reject", async () => {
     vi.mocked(reviewStep.run).mockResolvedValue(REJECTED_REVIEW);
 
-    const outputs = await feedbackLoopStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+    const outputs = await feedbackLoopStep.run(makeContext(), baseInputs, new NoopStepReporter());
 
     expect(outputs.approved).toBe(false);
     expect(outputs.terminationReason).toBe("iterations_exhausted");
@@ -760,7 +760,7 @@ describe("feedbackLoopStep termination reasons", () => {
   it("reports terminationReason=review_error when the review step throws", async () => {
     vi.mocked(reviewStep.run).mockRejectedValueOnce(new Error("Prompt is too long"));
 
-    const outputs = await feedbackLoopStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+    const outputs = await feedbackLoopStep.run(makeContext(), baseInputs, new NoopStepReporter());
 
     expect(outputs.approved).toBe(false);
     expect(outputs.terminationReason).toBe("review_error");
@@ -771,7 +771,7 @@ describe("feedbackLoopStep termination reasons", () => {
     vi.mocked(implementStep.run).mockResolvedValue({ ...IMPLEMENT_OUTPUTS, telemetry: MAX_TURNS_TELEMETRY });
     const invoke = vi.fn().mockResolvedValue({ stdout: "## Post-mortem\nRan out of turns wiring X.", exitCode: 0, tokensUsed: 10 });
 
-    const outputs = await feedbackLoopStep.run(makeContext({}, { invoke }), BASE_INPUTS, new NoopStepReporter());
+    const outputs = await feedbackLoopStep.run(makeContext({}, { invoke }), baseInputs, new NoopStepReporter());
 
     expect(outputs.approved).toBe(false);
     expect(outputs.terminationReason).toBe("max_turns");
@@ -797,7 +797,7 @@ describe("feedbackLoopStep termination reasons", () => {
     const reportedSteps: Step[] = [];
     const reporter: StepReporter = { report: vi.fn(async (step) => { reportedSteps.push({ ...step }); }) };
 
-    await feedbackLoopStep.run(makeContext({}, { invoke }), BASE_INPUTS, reporter);
+    await feedbackLoopStep.run(makeContext({}, { invoke }), baseInputs, reporter);
 
     const postMortemStep = reportedSteps.find((s) => s.id === "post-mortem.1" && s.status === "passed");
     expect(postMortemStep).toBeDefined();
@@ -817,7 +817,7 @@ describe("feedbackLoopStep termination reasons", () => {
 
     const outputs = await feedbackLoopStep.run(
       makeContext({}, { invoke: vi.fn() }),
-      { ...BASE_INPUTS, maxTurns: 50, maxIterations: 3 },
+      { ...baseInputs, maxTurns: 50, maxIterations: 3 },
       new NoopStepReporter(),
     );
 
@@ -830,7 +830,7 @@ describe("feedbackLoopStep termination reasons", () => {
     vi.mocked(implementStep.run).mockResolvedValue({ ...IMPLEMENT_OUTPUTS, telemetry: MAX_TURNS_TELEMETRY });
     const invoke = vi.fn().mockRejectedValue(new Error("boom"));
 
-    const outputs = await feedbackLoopStep.run(makeContext({}, { invoke }), BASE_INPUTS, new NoopStepReporter());
+    const outputs = await feedbackLoopStep.run(makeContext({}, { invoke }), baseInputs, new NoopStepReporter());
 
     expect(outputs.terminationReason).toBe("max_turns");
     expect(outputs.postMortem).toBeUndefined();
@@ -870,7 +870,7 @@ describe("feedbackLoopStep — cycle summaries (AII-801)", () => {
 
     await feedbackLoopStep.run(
       makeContext(),
-      { ...BASE_INPUTS, workspaceDir: tmpDir, maxIterations: 3 },
+      { ...baseInputs, workspaceDir: tmpDir, maxIterations: 3 },
       new NoopStepReporter(),
     );
 
@@ -889,7 +889,7 @@ describe("feedbackLoopStep — cycle summaries (AII-801)", () => {
 
     const outputs = await feedbackLoopStep.run(
       makeContext({}, { invoke }),
-      { ...BASE_INPUTS, workspaceDir: tmpDir },
+      { ...baseInputs, workspaceDir: tmpDir },
       new NoopStepReporter(),
     );
 
@@ -921,7 +921,7 @@ describe("feedbackLoopStep — cycle summaries (AII-801)", () => {
 
     const outputs = await feedbackLoopStep.run(
       makeContext({ retryPolicy: { ...DEFAULT_RETRY_POLICY, stageRetries: 0 } }),
-      { ...BASE_INPUTS, workspaceDir: tmpDir, sleep: NO_SLEEP },
+      { ...baseInputs, workspaceDir: tmpDir, sleep: NO_SLEEP },
       new NoopStepReporter(),
     );
 
@@ -937,7 +937,7 @@ describe("feedbackLoopStep — cycle summaries (AII-801)", () => {
 
     const outputs = await feedbackLoopStep.run(
       makeContext(),
-      { ...BASE_INPUTS, workspaceDir: tmpDir },
+      { ...baseInputs, workspaceDir: tmpDir },
       new NoopStepReporter(),
     );
 
@@ -966,7 +966,7 @@ describe("feedbackLoopStep — reviewer feedback file", () => {
 
     await feedbackLoopStep.run(
       makeContext(),
-      { ...BASE_INPUTS, workspaceDir: tmpDir },
+      { ...baseInputs, workspaceDir: tmpDir },
       new NoopStepReporter(),
     );
 
@@ -983,7 +983,7 @@ describe("feedbackLoopStep — reviewer feedback file", () => {
 
     await feedbackLoopStep.run(
       makeContext(),
-      { ...BASE_INPUTS, workspaceDir: tmpDir, maxIterations: 1 },
+      { ...baseInputs, workspaceDir: tmpDir, maxIterations: 1 },
       new NoopStepReporter(),
     );
 
@@ -1002,7 +1002,7 @@ describe("feedbackLoopStep — reviewer feedback file", () => {
     await expect(
       feedbackLoopStep.run(
         makeContext(),
-        { ...BASE_INPUTS, workspaceDir: tmpDir },
+        { ...baseInputs, workspaceDir: tmpDir },
         new NoopStepReporter(),
       ),
     ).resolves.toBeDefined();
@@ -1021,7 +1021,7 @@ describe("feedbackLoopStep — reviewRubric forwarding", () => {
 
     await feedbackLoopStep.run(
       makeContext(),
-      { ...BASE_INPUTS, reviewRubric: "Only approve if snapshot/embeddings.stamp exists." },
+      { ...baseInputs, reviewRubric: "Only approve if snapshot/embeddings.stamp exists." },
       new NoopStepReporter(),
     );
 
@@ -1034,7 +1034,7 @@ describe("feedbackLoopStep — reviewRubric forwarding", () => {
   it("does not pass reviewRubric to review step when not set", async () => {
     vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
 
-    await feedbackLoopStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+    await feedbackLoopStep.run(makeContext(), baseInputs, new NoopStepReporter());
 
     const reviewCall = vi.mocked(reviewStep.run).mock.calls[0];
     expect(reviewCall[1].reviewRubric).toBeUndefined();
@@ -1055,7 +1055,7 @@ describe("feedbackLoopStep stage-level retry (BAC-27134)", () => {
 
     const outputs = await feedbackLoopStep.run(
       makeContext(),
-      { ...BASE_INPUTS, sleep: NO_SLEEP },
+      { ...baseInputs, sleep: NO_SLEEP },
       new NoopStepReporter(),
     );
 
@@ -1071,7 +1071,7 @@ describe("feedbackLoopStep stage-level retry (BAC-27134)", () => {
 
     const outputs = await feedbackLoopStep.run(
       makeContext({ retryPolicy: { ...DEFAULT_RETRY_POLICY, stageRetries: 1 } }),
-      { ...BASE_INPUTS, sleep: NO_SLEEP },
+      { ...baseInputs, sleep: NO_SLEEP },
       new NoopStepReporter(),
     );
 
@@ -1110,7 +1110,7 @@ describe("feedbackLoopStep stage-level retry (BAC-27134)", () => {
 
     await feedbackLoopStep.run(
       makeContext(),
-      { ...BASE_INPUTS, sleep: NO_SLEEP },
+      { ...baseInputs, sleep: NO_SLEEP },
       new NoopStepReporter(),
     );
 
@@ -1139,7 +1139,7 @@ describe("feedbackLoopStep stage-level retry (BAC-27134)", () => {
 
     await feedbackLoopStep.run(
       makeContext(),
-      { ...BASE_INPUTS, sleep: NO_SLEEP },
+      { ...baseInputs, sleep: NO_SLEEP },
       new NoopStepReporter(),
     );
 
@@ -1173,7 +1173,7 @@ describe("feedbackLoopStep stage-level retry (BAC-27134)", () => {
 
     const outputs = await feedbackLoopStep.run(
       makeContext({ retryPolicy: { ...DEFAULT_RETRY_POLICY, stageRetries: 0 } }),
-      { ...BASE_INPUTS, sleep: NO_SLEEP },
+      { ...baseInputs, sleep: NO_SLEEP },
       new NoopStepReporter(),
     );
 
@@ -1198,7 +1198,7 @@ describe("feedbackLoopStep stage-level retry (BAC-27134)", () => {
     const thrown = await feedbackLoopStep
       .run(
         makeContext({ retryPolicy: { ...DEFAULT_RETRY_POLICY, stageRetries: 0 } }),
-        { ...BASE_INPUTS, sleep: NO_SLEEP },
+        { ...baseInputs, sleep: NO_SLEEP },
         new NoopStepReporter(),
       )
       .catch((e: unknown) => e);
@@ -1240,7 +1240,7 @@ describe("feedbackLoopStep stage-level retry (BAC-27134)", () => {
 
     const outputs = await feedbackLoopStep.run(
       makeContext({ retryPolicy: { ...DEFAULT_RETRY_POLICY, stageRetries: 0 } }),
-      { ...BASE_INPUTS, sleep: NO_SLEEP },
+      { ...baseInputs, sleep: NO_SLEEP },
       new NoopStepReporter(),
     );
 
@@ -1298,7 +1298,7 @@ describe("feedbackLoopStep stage-level retry (BAC-27134)", () => {
 
     const outputs = await feedbackLoopStep.run(
       makeContext({ retryPolicy: { ...DEFAULT_RETRY_POLICY, stageRetries: 0 } }),
-      { ...BASE_INPUTS, sleep: NO_SLEEP },
+      { ...baseInputs, sleep: NO_SLEEP },
       new NoopStepReporter(),
     );
 
@@ -1329,7 +1329,7 @@ describe("feedbackLoopStep stage-level retry (BAC-27134)", () => {
 
     await feedbackLoopStep.run(
       makeContext({ retryPolicy: { ...DEFAULT_RETRY_POLICY, stageRetries: 1 } }),
-      { ...BASE_INPUTS, sleep: NO_SLEEP },
+      { ...baseInputs, sleep: NO_SLEEP },
       reporter,
     );
 
@@ -1360,7 +1360,7 @@ describe("feedbackLoopStep stage-level retry (BAC-27134)", () => {
 
     const outputs = await feedbackLoopStep.run(
       makeContext({ retryPolicy: { ...DEFAULT_RETRY_POLICY, stageRetries: 1 } }),
-      { ...BASE_INPUTS, sleep: NO_SLEEP },
+      { ...baseInputs, sleep: NO_SLEEP },
       new NoopStepReporter(),
     );
 
@@ -1380,7 +1380,7 @@ describe("feedbackLoopStep stage-level retry (BAC-27134)", () => {
 
     await feedbackLoopStep.run(
       makeContext({ retryPolicy: { ...DEFAULT_RETRY_POLICY, stageRetries: 1 } }),
-      { ...BASE_INPUTS, sleep },
+      { ...baseInputs, sleep },
       new NoopStepReporter(),
     );
 
@@ -1407,7 +1407,7 @@ describe("feedbackLoopStep stage-level retry (BAC-27134)", () => {
     const thrown = await feedbackLoopStep
       .run(
         makeContext({ retryPolicy: { ...DEFAULT_RETRY_POLICY, stageRetries: 1 } }),
-        { ...BASE_INPUTS, sleep: NO_SLEEP },
+        { ...baseInputs, sleep: NO_SLEEP },
         new NoopStepReporter(),
       )
       .catch((e: unknown) => e);

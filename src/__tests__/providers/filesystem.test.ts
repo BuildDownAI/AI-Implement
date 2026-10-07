@@ -86,7 +86,7 @@ describe("FilesystemProvider", () => {
 
   it("returns admin issue URLs for exact scoped filesystem issue ids", async () => {
     const p = provider({});
-    expect(p.issueUrl(makeIssue({ id: "filesystem:SAN2:SAN2-001" }))).toBe("/admin?filesystemIssue=filesystem%3ASAN2%3ASAN2-001");
+    expect(p.issueUrl(makeIssue({ id: "filesystem:SAN2:SAN2-001", identifier: "SAN2-001", scopeKey: "SAN2" }))).toBe("/admin?filesystemIssue=filesystem%3ASAN2%3ASAN2-001");
   });
 
   it("reads issue details without creating missing state", async () => {

@@ -61,6 +61,8 @@ import {
   callObject,
   callWorkflow,
   crashAfterFirstCall,
+  eventually,
+  settle,
   replaceEndpoint,
   startRetryEnabled,
   startVariants,
@@ -107,14 +109,6 @@ function sha(seed: string): string {
  *  (e.g. the "inbox commit before ACK" crash window) still resolves to the same row. */
 function feedbackDeliveryId(scope: ScopedPrIdentity, n: number): string {
   return `feedback-${sha(`${reviewFixPRKey(scope)}#${n}`)}`;
-}
-
-async function until(predicate: () => boolean, timeoutMs = 10_000): Promise<void> {
-  const stop = Date.now() + timeoutMs;
-  while (!predicate()) {
-    if (Date.now() >= stop) throw new Error("timed out waiting for a durable fault-matrix effect");
-    await new Promise((resolve) => setTimeout(resolve, 25));
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -466,7 +460,7 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
   async function admitOne(env: RestateTestEnvironment, fixture: GithubFixture, findings: Array<{ findingKey: string; version: number }>): Promise<void> {
     fixture.pending = { taskText: `Fix ${findings.length} finding versions`, findings };
     await triggerFeedback(env, fixture.scope);
-    await until(() => latestAttemptRow(fixture.scope) !== undefined, 8_000);
+    await eventually(() => latestAttemptRow(fixture.scope) !== undefined, Boolean, { timeoutMs: 8_000, label: "latestAttemptRow(fixture.scope) !== undefined" });
     const attemptId = latestAttemptRow(fixture.scope)!.attemptId;
     fixture.attemptId = attemptId;
     fixtureByAttempt.set(attemptId, fixture);
@@ -517,14 +511,14 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     // The coordinator's check() timer fires after windowMs; give it real time to run and
     // observe at_capacity before asserting the negative (that admission count stays 1 — the
     // legacy reservation alone — is never enough on its own, since it starts at 1 already).
-    await new Promise((resolve) => setTimeout(resolve, fixture.windowMs + 400));
+    await settle(fixture.windowMs + 400);
     expect(latestAttemptRow(fixture.scope)).toBeUndefined();
     expect(activeAdmissionCount(mapping.team_key)).toBe(1);
 
     if (!legacyDecision.ok) throw new Error("unreachable");
     expect(releaseDispatchAdmission(legacyDecision.record.dispatchId, { kind: "legacy" }, legacyDecision.record.generation, "finalized")).toEqual({ status: "released" });
     await callObject(env.baseUrl(), "ReviewFixPR", reviewFixPRKey(fixture.scope), "capacityAvailable", {});
-    await until(() => latestAttemptRow(fixture.scope) !== undefined, 5_000);
+    await eventually(() => latestAttemptRow(fixture.scope) !== undefined, Boolean, { timeoutMs: 5_000, label: "latestAttemptRow(fixture.scope) !== undefined" });
     expect(activeAdmissionCount(mapping.team_key)).toBe(1);
   }, 20_000);
 
@@ -535,7 +529,7 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     expect(budgetEntryCount(fixture.scope.repository, fixture.scope.prNumber)).toBe(1);
     // Release the only budget slot's occupancy so a second admission attempt fails on
     // budget specifically, not merely because the PR is still occupied.
-    await until(() => fixture.runId !== null, 8_000);
+    await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8_000, label: "fixture.runId !== null" });
     fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
     const prepared = (await sqliteStore.getPreparedAttempt(fixture.attemptId!))!;
     await callWorkflow(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!, "result", resultOf(fixture, prepared));
@@ -545,7 +539,7 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     // defer: the budget ledger counts every entry in the window regardless of release.
     fixture.pending = { taskText: "Fix 1 finding version (second)", findings: [{ findingKey: "f2", version: 1 }] };
     await triggerFeedback(env, fixture.scope, 2);
-    await new Promise((resolve) => setTimeout(resolve, fixture.windowMs + 300));
+    await settle(fixture.windowMs + 300);
     const rows = getDb().prepare(`SELECT COUNT(*) AS n FROM review_fix_attempts WHERE repository = ? AND pr_number = ?`)
       .get(fixture.scope.repository, fixture.scope.prNumber) as { n: number };
     expect(rows.n).toBe(1);
@@ -557,7 +551,7 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     const fixture = freshScenario("paused", { paused: true });
     fixture.pending = { taskText: "Fix 1 finding version", findings: [{ findingKey: "f1", version: 1 }] };
     await triggerFeedback(env, fixture.scope);
-    await new Promise((resolve) => setTimeout(resolve, fixture.windowMs + 300));
+    await settle(fixture.windowMs + 300);
     expect(latestAttemptRow(fixture.scope)).toBeUndefined();
     expect(budgetEntryCount(fixture.scope.repository, fixture.scope.prNumber)).toBe(0);
   }, 20_000);
@@ -577,7 +571,7 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     expect(beforeAdmission?.queueCursor).toMatchObject({ queueId: expect.any(Number), eventId: expect.any(Number) });
 
     await triggerFeedback(env, fixture.scope);
-    await until(() => latestAttemptRow(fixture.scope) !== undefined, 8_000);
+    await eventually(() => latestAttemptRow(fixture.scope) !== undefined, Boolean, { timeoutMs: 8_000, label: "latestAttemptRow(fixture.scope) !== undefined" });
     const attemptId = latestAttemptRow(fixture.scope)!.attemptId;
     fixture.attemptId = attemptId;
     fixtureByAttempt.set(attemptId, fixture);
@@ -600,13 +594,13 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     seedQueueEvent(fixture, "automatic review-fix finding", [findingId]);
 
     await triggerFeedback(env, fixture.scope);
-    await until(() => latestAttemptRow(fixture.scope) !== undefined, 8_000);
+    await eventually(() => latestAttemptRow(fixture.scope) !== undefined, Boolean, { timeoutMs: 8_000, label: "latestAttemptRow(fixture.scope) !== undefined" });
     const attemptId1 = latestAttemptRow(fixture.scope)!.attemptId;
     fixture.attemptId = attemptId1;
     fixtureByAttempt.set(attemptId1, fixture);
 
     // Complete the first attempt so the PR is unoccupied again.
-    await until(() => fixture.runId !== null, 8_000);
+    await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8_000, label: "fixture.runId !== null" });
     fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
     const prepared1 = (await sqliteStore.getPreparedAttempt(attemptId1))!;
     await callWorkflow(env.baseUrl(), "ReviewFixAttempt", attemptId1, "result", resultOf(fixture, prepared1));
@@ -639,11 +633,11 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     expect(pendingAfterRereport?.queueCursor).toMatchObject({ queueId: expect.any(Number), eventId: expect.any(Number) });
 
     await triggerFeedback(env, fixture.scope, 2);
-    await until(() => {
+    await eventually(() => {
       const row = getDb().prepare(`SELECT COUNT(*) AS n FROM review_fix_attempts WHERE repository = ? AND pr_number = ?`)
         .get(fixture.scope.repository, fixture.scope.prNumber) as { n: number };
       return row.n === 2;
-    }, 8_000);
+    }, Boolean, { timeoutMs: 8_000, label: "durable effect" });
     const rows = getDb().prepare(`SELECT finding_versions_json FROM review_fix_attempts WHERE repository = ? AND pr_number = ? ORDER BY created_at ASC`)
       .all(fixture.scope.repository, fixture.scope.prNumber) as Array<{ finding_versions_json: string }>;
     expect(JSON.parse(rows[1].finding_versions_json)).toEqual([{ findingKey: afterFinalization.finding_key, version: 2 }]);
@@ -661,7 +655,7 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     fixture.admitOverride = crashAfterFirstCall((request: ReviewFixAdmissionRequest) => sqliteStore.admit(request));
     fixture.pending = { taskText: "Fix 1 finding version", findings: [{ findingKey: "f1", version: 1 }] };
     await triggerFeedback(env, fixture.scope);
-    await until(() => latestAttemptRow(fixture.scope) !== undefined, 8_000);
+    await eventually(() => latestAttemptRow(fixture.scope) !== undefined, Boolean, { timeoutMs: 8_000, label: "latestAttemptRow(fixture.scope) !== undefined" });
     const mappingKey = getDb().prepare("SELECT team_key FROM mappings WHERE owner = ?").get(fixture.scope.repository.split("/")[0]) as { team_key: string };
     expect(activeAdmissionCount(mappingKey.team_key)).toBe(1);
     const rows = getDb().prepare(`SELECT COUNT(*) AS n FROM review_fix_attempts WHERE repository = ? AND pr_number = ?`)
@@ -700,7 +694,7 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     await pump.tick();
     expect(getDb().prepare(`SELECT delivery_state FROM review_fix_inbox WHERE event_id = ?`)
       .get(deliveryId)).toMatchObject({ delivery_state: "delivered" });
-    await until(() => latestAttemptRow(fixture.scope) !== undefined, 5_000);
+    await eventually(() => latestAttemptRow(fixture.scope) !== undefined, Boolean, { timeoutMs: 5_000, label: "latestAttemptRow(fixture.scope) !== undefined" });
     const rows = getDb().prepare(`SELECT COUNT(*) AS n FROM review_fix_attempts WHERE repository = ? AND pr_number = ?`)
       .get(fixture.scope.repository, fixture.scope.prNumber) as { n: number };
     expect(rows.n).toBe(1);
@@ -719,7 +713,7 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     const realDispatch = fixture.dispatchImpl;
     fixture.dispatchImpl = crashAfterFirstCall(realDispatch);
     await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
-    await until(() => fixture.runId !== null, 8_000);
+    await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8_000, label: "fixture.runId !== null" });
     fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
     const prepared = (await sqliteStore.getPreparedAttempt(fixture.attemptId!))!;
     const done = await callWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!, "result", resultOf(fixture, prepared));
@@ -737,7 +731,7 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     fixture.pending = { taskText: "Fix 1 finding version", findings: [{ findingKey: "f1", version: 1 }] };
     const before = alerts.length;
     await triggerFeedback(env, fixture.scope);
-    await until(() => latestAttemptRow(fixture.scope) !== undefined, 5_000);
+    await eventually(() => latestAttemptRow(fixture.scope) !== undefined, Boolean, { timeoutMs: 5_000, label: "latestAttemptRow(fixture.scope) !== undefined" });
     const attemptId = latestAttemptRow(fixture.scope)!.attemptId;
     fixture.attemptId = attemptId;
     fixtureByAttempt.set(attemptId, fixture);
@@ -748,13 +742,17 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     // — already long enough to clear the admission deadline — also clears the
     // (shortened) alert threshold, proving both halves of the "uncertain launch"
     // row: no blind redispatch, and the two-minute-equivalent alert actually fires.
-    await new Promise((resolve) => setTimeout(resolve, SHORT_DEADLINE_MS + 1_500));
+    await eventually(
+      () => alerts.slice(before).some((a) => a.attemptId === attemptId && a.reason.includes("launch identity still unresolved")),
+      Boolean,
+      { timeoutMs: SHORT_DEADLINE_MS + 10_000, label: "the launch-identity-unresolved alert" },
+    );
     const active = getDb().prepare(`SELECT released_at FROM dispatch_admissions WHERE dispatch_id = ?`).get(attemptId) as { released_at: number | null } | undefined;
     expect(active?.released_at).toBeNull();
     expect(fixture.dispatchCalls).toBe(0); // launch() never even recorded a successful attempt count here — dispatch always threw
     expect(alerts.slice(before).some((a) =>
       a.attemptId === attemptId && a.reason.includes("launch identity still unresolved"))).toBe(true);
-  }, 15_000);
+  }, 30_000);
 
   it.each(VARIANTS.map(([label]) => label))("a definitively rejected launch records failure, releases capacity, and retains budget history (%s)", async (label) => {
     const env = envFor(label);
@@ -767,28 +765,28 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     const findingId = seedOpenFinding(fixture, "Rejected-launch finding");
     seedQueueEvent(fixture, "automatic review-fix finding", [findingId]);
     await triggerFeedback(env, fixture.scope);
-    await until(() => latestAttemptRow(fixture.scope) !== undefined, 5_000);
+    await eventually(() => latestAttemptRow(fixture.scope) !== undefined, Boolean, { timeoutMs: 5_000, label: "latestAttemptRow(fixture.scope) !== undefined" });
     const attemptId = latestAttemptRow(fixture.scope)!.attemptId;
     fixture.attemptId = attemptId;
     fixtureByAttempt.set(attemptId, fixture);
     // Rejection can finish before this test observes the committed admission;
     // Restate no longer has an attachable invocation then. The recorded terminal
     // result and released reservation are the durable effects that matter here.
-    await until(() => {
+    await eventually(() => {
       const row = getDb().prepare(`SELECT terminal_outcome_json FROM review_fix_attempts WHERE attempt_id = ?`)
         .get(attemptId) as { terminal_outcome_json: string | null };
       return row.terminal_outcome_json !== null;
-    }, 8_000);
+    }, Boolean, { timeoutMs: 8_000, label: "durable effect" });
     const terminal = getDb().prepare(`SELECT terminal_outcome_json FROM review_fix_attempts WHERE attempt_id = ?`)
       .get(attemptId) as { terminal_outcome_json: string };
     expect(JSON.parse(terminal.terminal_outcome_json)).toMatchObject({
       terminal: { status: "failed", reason: "workflow file not found" },
     });
-    await until(() => {
+    await eventually(() => {
       const row = getDb().prepare(`SELECT released_at FROM dispatch_admissions WHERE dispatch_id = ?`)
         .get(attemptId) as { released_at: number | null };
       return row.released_at !== null;
-    }, 8_000);
+    }, Boolean, { timeoutMs: 8_000, label: "durable effect" });
     const released = getDb().prepare(`SELECT released_at FROM dispatch_admissions WHERE dispatch_id = ?`).get(attemptId) as { released_at: number | null };
     expect(released.released_at).not.toBeNull();
     expect(budgetEntryCount(fixture.scope.repository, fixture.scope.prNumber)).toBe(1);
@@ -802,7 +800,7 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     const env = envFor(label);
     const fixture = freshScenario("duplicate-result");
     await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
-    await until(() => fixture.runId !== null, 8_000);
+    await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8_000, label: "fixture.runId !== null" });
     fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
     const prepared = (await sqliteStore.getPreparedAttempt(fixture.attemptId!))!;
     const result = resultOf(fixture, prepared);
@@ -818,7 +816,7 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     const env = envFor("alwaysReplay");
     const fixture = freshScenario("result-ingress");
     await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
-    await until(() => fixture.runId !== null, 8_000);
+    await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8_000, label: "fixture.runId !== null" });
     const attemptId = fixture.attemptId!;
     const prepared = (await sqliteStore.getPreparedAttempt(attemptId))!;
     const result = resultOf(fixture, prepared);
@@ -863,7 +861,7 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     const env = envFor(label);
     const fixture = freshScenario("conflict-result");
     await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
-    await until(() => fixture.runId !== null, 8_000);
+    await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8_000, label: "fixture.runId !== null" });
     const prepared = (await sqliteStore.getPreparedAttempt(fixture.attemptId!))!;
     const first = resultOf(fixture, prepared);
     expect(await callWorkflow(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!, "result", first)).toEqual({ status: "stored", result: first });
@@ -876,7 +874,7 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
       .get(fixture.attemptId!) as { result_conflict_at: number | null; authority_revoked_at: number | null };
     expect(row.result_conflict_at).not.toBeNull();
     expect(row.authority_revoked_at).not.toBeNull();
-    await until(() => fixture.cancelCalls > 0, 5_000);
+    await eventually(() => fixture.cancelCalls > 0, Boolean, { timeoutMs: 5_000, label: "fixture.cancelCalls > 0" });
     fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
     const completion = await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!);
     expect(completion).toMatchObject({ approval: "not_applicable" });
@@ -899,11 +897,11 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     const fixture = freshScenario("success-no-result");
     fixture.jobTimeoutMinutes = SUCCESS_NO_RESULT_JOB_TIMEOUT_MINUTES;
     await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
-    await until(() => fixture.runId !== null, 8_000);
+    await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8_000, label: "fixture.runId !== null" });
     fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
     // No "result" is ever delivered for this attempt. Check well before the deadline
     // that GitHub's success has not been turned into an approval or a terminal outcome.
-    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    await settle(1_000);
     const midFlight = getDb().prepare(
       `SELECT terminal_outcome_json, accepted_result_json FROM review_fix_attempts WHERE attempt_id = ?`,
     ).get(fixture.attemptId!) as { terminal_outcome_json: string | null; accepted_result_json: string | null };
@@ -926,7 +924,7 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     const env = envFor(label);
     const fixture = freshScenario("stale-after-final");
     await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
-    await until(() => fixture.runId !== null, 8_000);
+    await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8_000, label: "fixture.runId !== null" });
     fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
     const prepared = (await sqliteStore.getPreparedAttempt(fixture.attemptId!))!;
     const result = resultOf(fixture, prepared);
@@ -964,7 +962,7 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     const env = envFor("alwaysReplay");
     const fixture = freshScenario("result-crash");
     await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
-    await until(() => fixture.runId !== null, 8_000);
+    await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8_000, label: "fixture.runId !== null" });
     fixture.recordResultOverride = crashAfterFirstCall((id: AttemptId, result: ReviewFixResultMetadataV1) => sqliteStore.recordResult(id, result));
     fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
     const prepared = (await sqliteStore.getPreparedAttempt(fixture.attemptId!))!;
@@ -988,7 +986,7 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     const fixture = freshScenario("effect-crash");
     fixture.applyApprovalEffectOverride = crashAfterFirstCall(rawGithub.applyApprovalEffect.bind(rawGithub));
     await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
-    await until(() => fixture.runId !== null, 8_000);
+    await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8_000, label: "fixture.runId !== null" });
     fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
     const prepared = (await sqliteStore.getPreparedAttempt(fixture.attemptId!))!;
     const result = resultOf(fixture, prepared);
@@ -1006,9 +1004,9 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     const env = envFor(label);
     const fixture = freshScenario("cancel");
     await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
-    await until(() => fixture.runId !== null, 8_000);
+    await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8_000, label: "fixture.runId !== null" });
     await callWorkflow(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!, "cancel", { attemptId: fixture.attemptId });
-    await until(() => fixture.cancelCalls > 0, 5_000);
+    await eventually(() => fixture.cancelCalls > 0, Boolean, { timeoutMs: 5_000, label: "fixture.cancelCalls > 0" });
     let row = getDb().prepare(`SELECT authority_revoked_at FROM review_fix_attempts WHERE attempt_id = ?`)
       .get(fixture.attemptId!) as { authority_revoked_at: number | null };
     expect(row.authority_revoked_at).not.toBeNull();
@@ -1094,10 +1092,10 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     let replacement: Awaited<ReturnType<typeof replaceEndpoint>> | undefined;
     try {
       await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
-      await until(() => fixture.runId !== null, 8_000);
+      await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8_000, label: "fixture.runId !== null" });
       const attemptId = fixture.attemptId!;
       await callWorkflow(env.baseUrl(), "ReviewFixAttempt", attemptId, "cancel", { attemptId });
-      await until(() => fixture.cancelCalls > 0, 5_000);
+      await eventually(() => fixture.cancelCalls > 0, Boolean, { timeoutMs: 5_000, label: "fixture.cancelCalls > 0" });
 
       const state = getDb().prepare(`SELECT authority_revoked_at, terminal_outcome_json
         FROM review_fix_attempts WHERE attempt_id = ?`).get(attemptId) as
@@ -1111,7 +1109,7 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
 
       replacement = await replaceEndpoint(env, [pr, attemptWorkflow]);
       await env.startedRestateContainer.restart();
-      await until(() => fixture.cancelCalls > 1, 10_000);
+      await eventually(() => fixture.cancelCalls > 1, Boolean, { timeoutMs: 10_000, label: "fixture.cancelCalls > 1" });
       admission = getDb().prepare(`SELECT released_at FROM dispatch_admissions WHERE dispatch_id = ?`)
         .get(attemptId) as { released_at: number | null };
       expect(admission.released_at).toBeNull();
@@ -1139,7 +1137,7 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     const env = envFor(label);
     const fixture = freshScenario("closed-pr");
     await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
-    await until(() => fixture.runId !== null, 8_000);
+    await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8_000, label: "fixture.runId !== null" });
     fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
     const prepared = (await sqliteStore.getPreparedAttempt(fixture.attemptId!))!;
     await callWorkflow(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!, "result", resultOf(fixture, prepared));
@@ -1150,7 +1148,7 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     fixture.open = false; // simulates queueReviewFixCancellationForClosedPr's precondition
     fixture.pending = { taskText: "Fix 1 finding version (post-close)", findings: [{ findingKey: "f2", version: 1 }] };
     await triggerFeedback(env, fixture.scope, 2);
-    await new Promise((resolve) => setTimeout(resolve, fixture.windowMs + 300));
+    await settle(fixture.windowMs + 300);
     const rows = getDb().prepare(`SELECT COUNT(*) AS n FROM review_fix_attempts WHERE repository = ? AND pr_number = ?`)
       .get(fixture.scope.repository, fixture.scope.prNumber) as { n: number };
     expect(rows.n).toBe(1); // no second attempt was admitted for the closed, unoccupied PR
@@ -1161,15 +1159,19 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     const fixture = freshScenario("unverified-terminal");
     fixture.jobTimeoutMinutes = SHORT_DEADLINE_JOB_TIMEOUT_MINUTES;
     await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
-    await until(() => fixture.runId !== null, 8_000);
+    await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8_000, label: "fixture.runId !== null" });
     fixture.runDetail = null; // getRun keeps returning null — inspectTerminal can never confirm reached:true
     const before = alerts.length;
     void callWorkflow(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!, "cancel", { attemptId: fixture.attemptId }).catch(() => undefined);
-    await new Promise((resolve) => setTimeout(resolve, SHORT_DEADLINE_MS + 1_500));
+    await eventually(
+      () => alerts.slice(before).some((a) => a.attemptId === fixture.attemptId && a.reason.includes("unconfirmed")),
+      Boolean,
+      { timeoutMs: SHORT_DEADLINE_MS + 10_000, label: "the unconfirmed-termination alert" },
+    );
     expect(alerts.slice(before).some((a) => a.attemptId === fixture.attemptId && a.reason.includes("unconfirmed"))).toBe(true);
     const admission = getDb().prepare(`SELECT released_at FROM dispatch_admissions WHERE dispatch_id = ?`).get(fixture.attemptId!) as { released_at: number | null };
     expect(admission.released_at).toBeNull();
-  }, 15_000);
+  }, 30_000);
 
   // -------------------------------------------------------------------------
   // Restart/retention: the same SQLite row and the same Restate journal, at the
@@ -1182,12 +1184,12 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     try {
       fixture.pending = { taskText: "Fix 1 finding version", findings: [{ findingKey: "f1", version: 1 }] };
       await triggerFeedback(env, fixture.scope);
-      await until(() => latestAttemptRow(fixture.scope) !== undefined, 8_000);
+      await eventually(() => latestAttemptRow(fixture.scope) !== undefined, Boolean, { timeoutMs: 8_000, label: "latestAttemptRow(fixture.scope) !== undefined" });
       const attemptId = latestAttemptRow(fixture.scope)!.attemptId;
       fixture.attemptId = attemptId;
       fixtureByAttempt.set(attemptId, fixture);
       // The coordinator's own check() handler already sent "run" via genericSend.
-      await until(() => fixture.runId !== null, 10_000);
+      await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 10_000, label: "fixture.runId !== null" });
 
       replacement = await replaceEndpoint(env, [pr, attemptWorkflow]);
       await env.startedRestateContainer.restart(); // same disk-backed container/journal

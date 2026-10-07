@@ -13,7 +13,7 @@ describe("runReconciliations", () => {
     recon.enqueueReconciliation({ issueId: "i1", issueIdentifier: "ENG-1", prNumber: 5, repo: "o/r", mergeCommitSha: "sha" });
     const markMerged = vi.fn(async () => {});
     const resolveProvider = vi.fn(async () => makeProvider({ markMerged }));
-    const mappingForRepo = vi.fn(() => ({ scopeKey: "team-o", mapping: makeMapping({ paused: true }) }));
+    const mappingForRepo = vi.fn(() => ({ scopeKey: "team-o", mapping: makeMapping({ owner: "o", repo: "r", paused: true }) }));
     await mod.runReconciliations({ resolveProvider, mappingForRepo });
     expect(markMerged).toHaveBeenCalledWith("i1", "team-o");
     expect(recon.getPendingReconciliations()).toHaveLength(0);
@@ -30,7 +30,7 @@ describe("runReconciliations", () => {
     const markMerged = vi.fn(async () => { throw new Error("boom"); });
     await mod.runReconciliations({
       resolveProvider: async () => makeProvider({ markMerged }),
-      mappingForRepo: () => ({ scopeKey: "team-o", mapping: makeMapping() }),
+      mappingForRepo: () => ({ scopeKey: "team-o", mapping: makeMapping({ owner: "o", repo: "r" }) }),
     });
     const pending = recon.getPendingReconciliations();
     expect(pending).toHaveLength(1);
@@ -41,7 +41,7 @@ describe("runReconciliations", () => {
     const markMerged = vi.fn(async () => { throw new Error("issue deleted"); });
     const deps = {
       resolveProvider: async () => makeProvider({ markMerged }),
-      mappingForRepo: () => ({ scopeKey: "team-o", mapping: makeMapping() }),
+      mappingForRepo: () => ({ scopeKey: "team-o", mapping: makeMapping({ owner: "o", repo: "r" }) }),
     };
     for (let tick = 0; tick < recon.MAX_RECONCILIATION_ATTEMPTS; tick++) {
       await mod.runReconciliations(deps);

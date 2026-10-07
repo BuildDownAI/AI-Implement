@@ -42,26 +42,13 @@ async function waitForInvocation(
   handler: "block" | "follow",
   statuses: readonly ("running" | "suspended" | "pending")[],
 ): Promise<InvocationRow> {
-  const deadline = Date.now() + 10_000;
-  let lastRows: InvocationRow[] = [];
-  while (Date.now() < deadline) {
-    const response = await fetch(`${adminBaseUrl}/query`, {
-      method: "POST",
-      headers: { "content-type": "application/json", accept: "application/json" },
-      body: JSON.stringify({
-        query: `SELECT status, pinned_deployment_id, last_attempt_deployment_id FROM sys_invocation WHERE target_service_name = 'DrainProbeTest' AND target_service_key = '${key}' AND target_handler_name = '${handler}'`,
-      }),
-    });
-    if (!response.ok) throw new Error(`POST /query failed: HTTP ${response.status}`);
-    const body = (await response.json()) as { rows: InvocationRow[] };
-    lastRows = body.rows;
-    const row = body.rows.find((candidate) => statuses.includes(candidate.status as "running" | "suspended" | "pending"));
-    if (row) return row;
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-  throw new Error(
-    `DrainProbeTest/${key}/${handler} did not reach ${statuses.join(" or ")}: ${JSON.stringify(lastRows)}`,
+  const where = `target_service_name = 'DrainProbeTest' AND target_service_key = '${key}' AND target_handler_name = '${handler}'`;
+  const rows = await eventually(
+    async () => (await queryInvocations(adminBaseUrl, where)) as unknown as InvocationRow[],
+    (found) => found.some((candidate) => statuses.includes(candidate.status as "running" | "suspended" | "pending")),
+    { label: `DrainProbeTest/${key}/${handler} to reach ${statuses.join(" or ")}` },
   );
+  return rows.find((candidate) => statuses.includes(candidate.status as "running" | "suspended" | "pending"))!;
 }
 
 interface DeploymentsResponse {
