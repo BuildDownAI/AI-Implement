@@ -26,7 +26,7 @@ import { RUN_TITLE_PREFIX, buildKgRefreshGhaDispatchBody, defaultFetchSignal, po
 import { resolveWorkflowCapabilities } from "../workflow-probe.js";
 import { resolveRunnerImageForDispatch } from "../repo-image.js";
 import { encodeRunConfig, type RunConfigV1 } from "../run-config.js";
-import { stopBackendRun } from "../backend-run.js";
+import { readBackendRun, stopBackendRun } from "../backend-run.js";
 import { getRunnerMode, resolveExecutionPath, getKgFlyMachineOverride } from "../runner-mode.js";
 import { mintRunToken } from "../runner-tokens.js";
 import type { JobStatus } from "../log.js";
@@ -365,6 +365,7 @@ export function createProductionKgRefreshServices(
     getWorkflowRunStatus: input.getWorkflowRunStatus,
     findRunByTitle: input.findRunByTitle,
     cancelWorkflowRun: input.cancelWorkflowRun,
+    readMachineRun: (executionMode, jobId) => readBackendRun(config, executionMode, jobId),
     stopMachineRun: (executionMode, jobId) => stopBackendRun(config, executionMode, jobId),
     persistLastRefresh: input.persistLastRefresh,
     onOutcome: (kind, outcome, meta) => {
