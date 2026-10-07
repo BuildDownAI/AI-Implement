@@ -627,8 +627,9 @@ describe("fmtAgo", () => {
 });
 
 describe("Retention card", () => {
+  let appliesAt = "next deploy or restart";
   const retentionBody = (restate: number, volume: number) => ({
-    restate: { days: restate, appliesAt: "next deploy or restart" },
+    restate: { days: restate, appliesAt },
     volume: { days: volume, lastApplied: null },
     default: 14,
     min: 1,
@@ -644,6 +645,7 @@ describe("Retention card", () => {
     const win = dom.window as any;
     const posts: Array<{ url: string; body: unknown }> = [];
     win.registerPage = () => {};
+    win.esc = (s: unknown) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
     win.api = async (url: string, init?: { method?: string; body?: string }) => {
       if (url === "/api/retention" && init?.method === "POST") {
         posts.push({ url, body: JSON.parse(init.body as string) });
@@ -660,9 +662,22 @@ describe("Retention card", () => {
     return { win, doc, el, posts };
   }
 
-  it("sits after the policy card and states when the Restate value applies", () => {
+  it("sits after the policy card", () => {
     expect(deploymentsHtml.indexOf('id="deployments-retention"')).toBeGreaterThan(deploymentsHtml.indexOf('id="deployments-policy"'));
-    expect(deploymentsHtml).toContain("Restate retention applies at the next deploy or restart");
+  });
+
+  it("renders when the Restate value applies from the API's appliesAt", async () => {
+    const { win, doc } = mount();
+    await win.loadRetention();
+    expect(doc.getElementById("deployments-retention-applies")?.textContent)
+      .toBe("Restate retention applies at the next deploy or restart");
+
+    appliesAt = "next registration";
+    const second = mount();
+    await second.win.loadRetention();
+    expect(second.doc.getElementById("deployments-retention-applies")?.textContent)
+      .toBe("Restate retention applies at the next registration");
+    appliesAt = "next deploy or restart";
   });
 
   it("renders both values, keeps Save disabled until a change, and posts only the changed field", async () => {

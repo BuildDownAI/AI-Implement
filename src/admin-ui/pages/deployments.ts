@@ -101,7 +101,7 @@ export const deploymentsHtml = `
               oninput="window.refreshRetentionDirty()">
           </div>
         </div>
-        <div class="kpi-trend text-secondary" style="margin-top: 8px">Restate retention applies at the next deploy or restart</div>
+        <div class="kpi-trend text-secondary" id="deployments-retention-applies" style="margin-top: 8px"></div>
         <div class="kpi-trend text-secondary" id="deployments-retention-applied" style="margin-top: 4px"></div>
         <div class="kpi-trend" id="deployments-retention-error" style="color: var(--color-warn); margin-top: 4px" hidden></div>
         <div style="margin-top: 12px">
@@ -695,6 +695,8 @@ export const deploymentsScript = `
       el.min = String(data.min);
       el.max = String(data.max);
     }
+    document.getElementById('deployments-retention-applies').innerHTML =
+      'Restate retention applies at the ' + window.esc(data.restate.appliesAt);
     const last = data.volume.lastApplied;
     let text = 'Volume retention: not applied since boot';
     if (last) {
