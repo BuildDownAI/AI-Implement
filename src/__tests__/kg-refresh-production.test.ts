@@ -12,14 +12,18 @@ vi.mock("../github.js", async (importOriginal) => ({
   postWorkflowDispatch: (...args: unknown[]) => postWorkflowDispatch(...args),
 }));
 const destroyMachine = vi.fn(async (..._args: unknown[]) => {});
+const getMachine = vi.fn(async (..._args: unknown[]): Promise<unknown> => ({ state: "started" }));
 vi.mock("../fly-machines.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../fly-machines.js")>()),
   destroyMachine: (...args: unknown[]) => destroyMachine(...args),
+  getMachine: (...args: unknown[]) => getMachine(...args),
 }));
+const inspectLocalContainer = vi.fn(async (_id: string): Promise<{ running: boolean }> => ({ running: true }));
 const stopLocalContainer = vi.fn(async (_id: string) => {});
 vi.mock("../local-docker.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../local-docker.js")>()),
   stopLocalContainer: (id: string) => stopLocalContainer(id),
+  inspectLocalContainer: (id: string) => inspectLocalContainer(id),
 }));
 const capturedWorkflowDeps: { current?: import("../restate/kg-refresh-workflow.js").KgRefreshWorkflowDependencies } = {};
 vi.mock("../restate/kg-refresh-workflow.js", async (importOriginal) => {
@@ -681,5 +685,45 @@ describe("kgFlyMachineSizing (AII-1112)", () => {
         log.mockRestore();
       }
     });
+  });
+});
+
+describe("readMachineRun wiring", () => {
+  const exitEvent = { type: "exit", timestamp: 7, request: { exit_event: { exit_code: 137, guest_signal: 9, oom_killed: true } } };
+  beforeEach(() => { getMachine.mockReset(); inspectLocalContainer.mockReset(); });
+
+  it.each(["stopped", "destroyed"])("reads a %s machine as ended with its exit", async (state) => {
+    getMachine.mockResolvedValue({ state, events: [exitEvent] });
+    createProductionKgRefreshServices(makeInput());
+    await expect(capturedWorkflowDeps.current!.readMachineRun("fly-machines", "m-1")).resolves.toEqual({
+      state: "ended", exit: { exitCode: 137, signal: 9, oomKilled: true, timestamp: 7 },
+    });
+    expect(getMachine).toHaveBeenCalledWith("fly-token", "fly-app", "m-1");
+  });
+
+  it("reads a 404 as ended with an empty exit", async () => {
+    getMachine.mockRejectedValue(new Error("Fly API 404: not found"));
+    createProductionKgRefreshServices(makeInput());
+    await expect(capturedWorkflowDeps.current!.readMachineRun("fly-machines", "m-1")).resolves.toEqual({
+      state: "ended", exit: { exitCode: null, signal: null, oomKilled: null, timestamp: null },
+    });
+  });
+
+  it("reads started as started, and created or a thrown lookup as unknown", async () => {
+    createProductionKgRefreshServices(makeInput());
+    getMachine.mockResolvedValue({ state: "started" });
+    await expect(capturedWorkflowDeps.current!.readMachineRun("fly-machines", "m-1")).resolves.toEqual({ state: "started", exit: null });
+    getMachine.mockResolvedValue({ state: "created" });
+    await expect(capturedWorkflowDeps.current!.readMachineRun("fly-machines", "m-1")).resolves.toEqual({ state: "unknown", exit: null });
+    getMachine.mockRejectedValue(new Error("Fly API 500"));
+    await expect(capturedWorkflowDeps.current!.readMachineRun("fly-machines", "m-1")).resolves.toEqual({ state: "unknown", exit: null });
+  });
+
+  it("reads a local container with no exit, and any other mode as unknown without a call", async () => {
+    createProductionKgRefreshServices(makeInput());
+    inspectLocalContainer.mockResolvedValue({ running: false });
+    await expect(capturedWorkflowDeps.current!.readMachineRun("local-docker", "c-1")).resolves.toEqual({ state: "ended", exit: null });
+    await expect(capturedWorkflowDeps.current!.readMachineRun("other", "x")).resolves.toEqual({ state: "unknown", exit: null });
+    expect(getMachine).not.toHaveBeenCalled();
   });
 });
