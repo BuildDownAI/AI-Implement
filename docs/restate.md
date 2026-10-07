@@ -136,7 +136,7 @@ The admin API is loopback, so `GET /api/restate/journal` reads it for the operat
 - **Lookup:** `?service=<name>&key=<key>` (a lookup by service and key answers the key's `run` invocation when there is one (a workflow), so shared `status` / `progress` calls never shadow it, and the newest invocation otherwise (a virtual object)) or `?id=<invocation id>`. Each value is 1-128 characters of `[A-Za-z0-9._:-]`, checked by `validateJournalLookup` and then still passed through `sqlQuote`. A bad lookup is a 400 naming the field.
 - **Answer:** `{ invocation, entries, promises }`. Entries are trimmed to `index, entryType, name, completed, promiseName, appendedAt, sleepWakeupAt, entry`. `entry` is the parsed `entry_json`, or `null` when it is over 4096 characters or unparseable, so one read stays near 100 KB even with a large `report` body. Promises are scoped by the invocation's own service and key, so the `id` form finds them too; a keyless service has no key (`NULL`), so it has no promise rows and the promises list is empty.
 - **Status codes:** 404 `{ error: "no invocation" }` when nothing matches (rows survive only within the run kind's retention, 7 days today; see "Retention" below), 503 `{ error: "restate unavailable" }` when the admin API call throws.
-- **Access:** an admin, or a user granted the `journal` page (`PAGE_ROUTES.journal`). The page has no UI yet, so it is not in the sidebar.
+- **Access:** an admin, or a user granted the `journal` page (`PAGE_ROUTES.journal`). The Journal page (`/admin#journal`, sidebar entry Journal) and the job drawer's Restate journal section render the endpoint's answer (AII-1135).
 
 ### Sidecar environment is an explicit allowlist, never `...process.env` (AII-728)
 
@@ -438,3 +438,16 @@ The failure branch of the planning callback also calls the termination hook, so 
 **Restate unavailable.** When the sidecar is not ready, the endpoint is not registered, or the submit answers `unavailable` or `not-found`, `dispatchPlanning` logs `Planning for <key> skipped: Restate unavailable` (for `not-found`: `the PlanningRun service is not registered`) and returns. It holds no reservation, so it releases nothing; `submit` has a timeout, and a timeout answers `unavailable`. A pilot project gets no planning dispatch and no fallback to Legacy until Restate is back; the next poll tries again.
 
 **A reservation that stays held.** If a reservation stays held in spite of the workflow, an operator lists it and releases it (AII-1069). The MCP tools `list_dispatch_reservations` and `release_dispatch_reservation` (`src/restate/tools.ts`) call `listHeldReservations` and `releaseHeldReservation` in `src/dispatch-admission.ts`. `GET /api/dispatch-reservations` and the held-reservations card on `/admin#deployments` use the same functions. Without `force`, a release needs a backend run confirmed ended; a terminal job row alone is refused (the planning callback closes the row before the run is known to have ended), and a Restate-owned reservation with no job row needs `force`.
+
+## Reading a run's journal
+
+`GET /api/restate/journal` (AII-1128) answers one invocation's row, journal entries, and promises. Look it up by `service` + `key`, or by `id` (never both); values match `[A-Za-z0-9._:-]{1,128}`. A bad lookup is 400, no match is **404**, and an unreachable Restate admin API is **503**.
+
+The admin UI shows it in two places, both rendered by the drawer's `window.renderRestateJournal`:
+
+- **Job drawer, "Restate journal"** — fetched with the job's dispatch id as the key. The service follows the job's phase: `kg-refresh` → `KgRefresh`, `planning` → `PlanningRun`, `implementation` or no dispatch id → no fetch, any other phase → `ReviewFixAttempt`, fetched only when the drawer's attempt read (`/api/review-fix/attempts/<dispatch id>`) just succeeded, so a legacy review-fix job never fetches. A 404 (retention has passed) shows "No journal (retention has passed)"; a 503 shows an "unavailable" alert.
+- **Journal page** (`/admin#journal`) — a form for a journal no drawer row shows. Granting it is a page grant at `/admin#access`.
+
+A lookup by service and key answers the key's `run` invocation when there is one (a workflow) and the newest invocation otherwise (a virtual object); the handler name shown next to the status says which invocation it is.
+
+For Restate's own UI, run `fly proxy 9070:9070 -a <app>` and open `http://127.0.0.1:9070/ui/invocations/<id>`.
