@@ -310,6 +310,17 @@ describe("kg fly machine profile control (AII-1116)", () => {
     }
   });
 
+  it("shows 'profile unavailable (503)' on a failed read and leaves the inputs alone", async () => {
+    const { win, el } = mount({});
+    await win.loadKgFlyMachine();
+    const before = el("kg-fly-memory-mb").value;
+    win.api = async () => ({ ok: false, status: 503, json: async () => ({}) });
+    await win.loadKgFlyMachine();
+    expect(el("kg-fly-machine-effective").textContent).toBe("next Fly run: profile unavailable (503)");
+    expect(el("kg-fly-memory-mb").value).toBe(before);
+    expect(el("btn-kg-fly-save").disabled).toBe(true);
+  });
+
   it("does not overwrite edited inputs on a poll", async () => {
     const { win, el } = mount({});
     await win.loadKgFlyMachine();
