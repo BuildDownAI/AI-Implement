@@ -77,9 +77,9 @@ export interface CreateMachineOpts {
 
 // ── API Helpers ──────────────────────────────────────────────────────────────
 
-const FLY_API_BASE = "https://api.machines.dev/v1";
+export const FLY_API_BASE = "https://api.machines.dev/v1";
 
-function flyHeaders(token: string): Record<string, string> {
+export function flyHeaders(token: string): Record<string, string> {
   return {
     Authorization: `Bearer ${token}`,
     "Content-Type": "application/json",
