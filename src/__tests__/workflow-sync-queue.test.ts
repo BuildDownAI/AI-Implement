@@ -1,14 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import type * as DedupModule from "../dedup.js";
 import type * as ConfigModule from "../config.js";
 import type * as WorkflowSyncQueueModule from "../workflow-sync-queue.js";
 import type * as WorkflowSyncModule from "../workflow-sync.js";
 import type * as DeployHoldModule from "../deploy-hold.js";
-import type * as RunnerModeModule from "../runner-mode.js";
-import { DEFAULT_TICKETING_CONFIG } from "../providers/ticketing-config.js";
+import { makeMapping } from "./helpers/builders.js";
+import { testDb } from "./helpers/test-db.js";
 
 // runWorkflowSync (the executor) imports syncWorkflowTemplates from this module; mock it so the
 // executor tests below are deterministic and never reach GitHub. classifySyncError mirrors the real
@@ -21,7 +18,6 @@ vi.mock("../workflow-sync.js", () => ({
   }),
 }));
 
-let dbPath: string;
 let dedup: typeof DedupModule;
 let config: typeof ConfigModule;
 let queue: typeof WorkflowSyncQueueModule;
@@ -41,61 +37,28 @@ const RESULT: WorkflowSyncModule.WorkflowSyncResult = {
 };
 
 beforeEach(async () => {
-  vi.resetModules();
   vi.clearAllMocks(); // the factory's vi.fn() persists across tests; clear its call history each test
-  dbPath = path.join(
-    os.tmpdir(),
-    `workflow-sync-queue-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-  );
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  config = await import("../config.js");
-  queue = await import("../workflow-sync-queue.js");
-  workflowSync = await import("../workflow-sync.js");
-  deployHold = await import("../deploy-hold.js");
-  dedup.getDb(); // creates workflow_sync_queue (its DDL lives in getDb)
-  config.initMappingsTable(); // executor tests seed a mapping
-  const runnerMode: typeof RunnerModeModule = await import("../runner-mode.js");
-  runnerMode.initSettingsTable(); // the deploy hold is a `settings` row; runner-mode owns that DDL
+  ({ dedup, config, queue, workflowSync, deployHold } = (
+    await testDb({
+      modules: {
+        dedup: () => import("../dedup.js"),
+        config: () => import("../config.js"),
+        queue: () => import("../workflow-sync-queue.js"),
+        workflowSync: () => import("../workflow-sync.js"),
+        deployHold: () => import("../deploy-hold.js"),
+      },
+    })
+  ).modules);
 });
 
 afterEach(() => {
-  dedup.closeDb();
-  try {
-    fs.unlinkSync(dbPath);
-  } catch {
-    /* ignore */
-  }
   vi.restoreAllMocks();
 });
 
-// runWorkflowSync reads the mapping back via getMappings(); seed a complete, valid one so the row
-// isn't dropped on read (getMappings discards rows whose ticketing_config fails to parse).
+// runWorkflowSync reads the mapping back via getMappings(), which drops a row whose ticketing_config
+// fails to parse; the shared builder's mapping survives that round trip.
 function seedMapping(teamKey: string): void {
-  config.upsertMapping(teamKey, {
-    owner: "org",
-    repo: "app",
-    workflowFile: "claude-implement.yml",
-    defaultBranch: "main",
-    maxInProgressAiIssues: 3,
-    executionMode: "github-actions",
-    sessionMode: "autonomous",
-    machineCpus: 2,
-    machineMemoryMb: 4096,
-    planningEnabled: true,
-    planningWorkflowFile: "claude-plan.yml",
-    autoApprovePlans: true,
-    extraEnv: {},
-    provider: "anthropic",
-    ticketingProvider: "linear",
-    ticketingConfig: DEFAULT_TICKETING_CONFIG,
-    awsRegion: null,
-    paused: false,
-    maxTurns: null,
-    maxIterations: null,
-    maxJobMinutes: null,
-    branchPrefix: null,
-  });
+  config.upsertMapping(teamKey, makeMapping());
 }
 
 describe("workflow sync queue — lifecycle & dedup", () => {
