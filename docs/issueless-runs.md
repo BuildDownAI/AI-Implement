@@ -113,7 +113,7 @@ The kg-refresh runner reads `AI_IMPLEMENT_LOG_LEVEL` the same way the implement 
 **Late-report handling:** A report that arrives after the run has completed is answered by the `KgRefresh.report` handler, not dropped: an identical body is a duplicate and acknowledged, a different body is refused with `409 conflicting_report` (§6).
 
 
-**Fly Machines backend:** creates a session machine with `phase: "kg-refresh"` through `dispatchKgRefreshRun()`. Returns `machineId + machineNonce`.
+**Fly Machines backend:** creates a session machine with `phase: "kg-refresh"` through `dispatchKgRefreshRun()`. The machine defaults to 2 performance CPUs / 8192 MB (the 4096 MB mapping default fails the ingest), raised per field by a larger KG source repo mapping `machineCpus` / `machineMemoryMb`, plus the sessions region (`kgFlyMachineSizing`); the machine runs on performance CPUs when the size gives at least 2048 MB per CPU, and on shared CPUs otherwise (one log line says why). An admin can override the CPUs, memory, and CPU kind with `set_kg_fly_machine` (the `kg_fly_machine_override` settings row, applied per field over the default and mapping size, so an admin can go below the default on purpose; `clear: true` removes it), and `get_kg_status` reports the effective `flyMachine` size and its `source` (`override`, `mapping`, `default`). A `performance` choice below 2048 MB per CPU falls back to shared with one log line. With no mapping it uses the 2 CPU / 8192 MB performance default and logs one line. Returns `machineId + machineNonce`.
 
 **Local Docker backend:** starts a local container via `startLocalRunnerContainer()`. Returns `machineNonce` only.
 

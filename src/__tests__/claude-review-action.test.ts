@@ -87,6 +87,20 @@ describe("Claude review action", () => {
     expect(runReview.with?.claude_args).not.toContain("--json-schema \"${{ github.action_path }}");
   });
 
+  // The model writes its structured-output arguments in schema order, and the argument after a long
+  // free-text string is the one a malformed call loses (AII-1102), so `summary` must stay last.
+  it("hands Claude a schema whose last property is summary", () => {
+    const prepared = spawnSync("jq", ["-c", "del(.. | .description?)", ".github/actions/claude-review/review-findings-schema.json"], {
+      encoding: "utf8",
+    });
+    expect(prepared.status).toBe(0);
+    const schema = JSON.parse(prepared.stdout) as { properties: Record<string, unknown>; required: string[] };
+
+    expect(Object.keys(schema.properties).at(-1)).toBe("summary");
+    expect(schema.required.at(-1)).toBe("summary");
+    expect(schema.required).toEqual(expect.arrayContaining(["verdict", "findings", "summary"]));
+  });
+
   it("renders an approving verdict into the human text and the machine block", () => {
     const result = runRenderStep(
       JSON.stringify({

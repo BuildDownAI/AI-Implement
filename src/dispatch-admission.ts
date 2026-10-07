@@ -546,7 +546,7 @@ export async function releaseHeldReservation(
  *  a reservation `updateJobStatus` deliberately left held pending confirmed termination
  *  (AII-783 review: reaper/stuck-watchdog give-up paths that cannot vouch for the
  *  backend actually being dead). Generous relative to every job timeout in the codebase
- *  (GHA's default 90 min job timeout, Fly/local's FLY_MACHINE_TIMEOUT_MS, and the
+ *  (the mapping's Job Timeout on every backend, default 90 min, and the
  *  stuck-watchdog's own bounded retries on top of that) so this never races a
  *  legitimately long-running attempt.
  *

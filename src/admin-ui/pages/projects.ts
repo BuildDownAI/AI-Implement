@@ -327,7 +327,7 @@ export const projectsHtml = `
           <div class="field">
             <label class="field-label">Job Timeout (min)</label>
             <input class="input" id="md-max-job-min" type="number" min="1" step="1" placeholder="90">
-            <div class="field-hint">GitHub Actions only. Blank = 90.</div>
+            <div class="field-hint">Applies to every execution mode (GitHub Actions, Fly, local Docker). Blank = 90.</div>
           </div>
         </div>
       </div>

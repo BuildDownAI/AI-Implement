@@ -279,3 +279,56 @@ export function setKgMaterializeDirect(enabled: boolean): void {
     .prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)")
     .run(KG_MATERIALIZE_DIRECT_SETTING_KEY, String(enabled));
 }
+
+export type KgFlyCpuKind = "auto" | "shared" | "performance";
+
+/** Admin override of the Fly KG refresh machine size; each field applies only when set. */
+export interface KgFlyMachineOverride {
+  cpus?: number;
+  memoryMb?: number;
+  cpuKind?: KgFlyCpuKind;
+}
+
+const KG_FLY_MACHINE_OVERRIDE_SETTING_KEY = "kg_fly_machine_override";
+
+let kgFlyOverrideParseLogged = false;
+
+/** Returns the stored Fly KG machine size override, or `{}` when no row exists or the row is unparseable (logged once). */
+export function getKgFlyMachineOverride(): KgFlyMachineOverride {
+  let raw: string | undefined;
+  try {
+    raw = (getDb()
+      .prepare("SELECT value FROM settings WHERE key = ?")
+      .get(KG_FLY_MACHINE_OVERRIDE_SETTING_KEY) as { value: string } | undefined)?.value;
+  } catch {
+    return {};
+  }
+  if (raw === undefined) return {};
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("not an object");
+    const p = parsed as Record<string, unknown>;
+    const out: KgFlyMachineOverride = {};
+    if (typeof p.cpus === "number") out.cpus = p.cpus;
+    if (typeof p.memoryMb === "number") out.memoryMb = p.memoryMb;
+    if (p.cpuKind === "auto" || p.cpuKind === "shared" || p.cpuKind === "performance") out.cpuKind = p.cpuKind;
+    return out;
+  } catch (err) {
+    if (!kgFlyOverrideParseLogged) {
+      kgFlyOverrideParseLogged = true;
+      console.warn(`[kg-refresh] ignoring unparseable ${KG_FLY_MACHINE_OVERRIDE_SETTING_KEY} setting: ${String(err)}`);
+    }
+    return {};
+  }
+}
+
+/** Persists the Fly KG machine size override; `null` deletes the row. */
+export function setKgFlyMachineOverride(value: KgFlyMachineOverride | null): void {
+  if (value === null) {
+    getDb().prepare("DELETE FROM settings WHERE key = ?").run(KG_FLY_MACHINE_OVERRIDE_SETTING_KEY);
+    return;
+  }
+  getDb()
+    .prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)")
+    .run(KG_FLY_MACHINE_OVERRIDE_SETTING_KEY, JSON.stringify(value));
+}

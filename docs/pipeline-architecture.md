@@ -294,6 +294,8 @@ The runner accepts a `stopAfterStep` option, used by the local dev harness's `--
 
 Because `feedback-loop` is step 5, `--until` with any earlier step is a token-free run: no Claude invocation happens.
 
+**Job timeout on every backend.** The orchestrator's job monitors read the mapping's **Job Timeout (min)** (`maxJobMinutes`, default 90 via `normalizeGithubActionsJobTimeoutMinutes`) for all three execution modes. `monitorFlyMachineJob` and `monitorLocalDockerJob` time a run out once it is older than that limit (`machine timed out after Nm` / `local Docker container timed out after Nm`, session logs posted before the machine is destroyed), and the `monitorJobs` TTL backstop fires `JOB_TTL_GRACE_MINUTES` (15) later. The limit is re-read each poll, so an edit applies to in-flight jobs. The envelope does not carry it and the runner has no self-timeout on Fly; the monitor is the only limit. A progress-based watchdog that resets the clock on runner callbacks is a possible follow-up, but the implement path reports no periodic progress today.
+
 ## kg-refresh phase
 
 The kg-refresh pipeline (`pipelines/kg-refresh.yml`) uses different step wiring from the autonomous pipeline. Its steps, in order: `clone` → `dependency-auth` → `clone-code-repo` → `clone-secondary-repos` → `kg-tracker-data` → `kg-ingest` → `feedback-loop` → `kg-snapshot-push`. The entry point is `src/pipeline/kg-refresh-run.ts` rather than `run-autonomous.js`.

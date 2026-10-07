@@ -581,7 +581,7 @@ deleted `snapshot/parts/pr.nt`. AII-494 adds the two
 runner-callback endpoints that give this run kind its privileged access without ever vending a
 long-lived credential to the runner. AII-495 wires `POST /api/kg/refresh` to dispatch the runner
 when the source repo has no newer snapshot: the orchestrator mints a run token, encodes a
-`RunConfigV1` with `runnerPhase: "kg-refresh"`, and dispatches via Fly Machines or local Docker.
+`RunConfigV1` with `runnerPhase: "kg-refresh"`, and dispatches via Fly Machines or local Docker. A Fly KG refresh defaults to 2 performance CPUs / 8192 MB, raised by a larger KG repo mapping and replaced per field by `set_kg_fly_machine`; `get_kg_status` reports the effective size as `flyMachine`.
 When the runner completes, it calls `POST /api/runner/result` which routes to `onRunnerComplete` in
 `src/kg-refresh.ts`. If a `snapshotCommit` SHA is included, the orchestrator verifies the commit is
 visible via the GitHub API (one retry for git-cache lag) before starting the local staging rail.

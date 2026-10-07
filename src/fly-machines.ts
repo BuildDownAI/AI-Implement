@@ -172,6 +172,29 @@ export function readMachineExitCode(machine: Machine): number | null {
   return exit?.exit_code ?? exit?.guest_exit_code ?? null;
 }
 
+export interface MachineExit {
+  exitCode: number | null;
+  signal: number | null;
+  oomKilled: boolean | null;
+  timestamp: number | null;
+}
+
+/**
+ * Terminal exit details from the newest event carrying an exit_event (all null when none exists).
+ * Raw: Fly omits exit_code for a clean exit 0, so `exitCode: null` with an event present is a
+ * clean exit (see readMachineExitCode). Every field is optional-chained and degrades to null.
+ */
+export function readMachineExit(machine: Machine): MachineExit {
+  const event = machine.events?.find((e) => e.request?.exit_event);
+  const exit = event?.request?.exit_event;
+  return {
+    exitCode: exit?.exit_code ?? exit?.guest_exit_code ?? null,
+    signal: exit?.guest_signal ?? exit?.signal ?? null,
+    oomKilled: exit?.oom_killed ?? null,
+    timestamp: event?.timestamp ?? null,
+  };
+}
+
 export async function destroyMachine(
   token: string,
   appName: string,
@@ -383,6 +406,8 @@ export interface SessionMachineInput {
   region?: string;
   cpus?: number;
   memoryMb?: number;
+  /** Defaults to "shared". */
+  cpuKind?: "shared" | "performance";
   teamKey?: string;
   teamSecretNames?: string[]; // full prefixed secret names from the Fly app (e.g. ["ENG_DATABASE_URL"])
   allTeamKeys?: string[]; // all known team keys across all mappings, used to identify foreign secrets
@@ -437,7 +462,7 @@ export function buildSessionMachineConfig(input: SessionMachineInput): CreateMac
     image: input.image,
     env,
     guest: {
-      cpu_kind: "shared",
+      cpu_kind: input.cpuKind ?? "shared",
       cpus: input.cpus ?? 1,
       memory_mb: input.memoryMb ?? 1024,
     },

@@ -15,6 +15,8 @@ import {
   getRunnerModeTool,
   listProjects,
   listInFlightJobs,
+  getSessionMachine,
+  listSessionMachines,
   getIssueDispatchStatus,
   getIssueReportCardTool,
   getFleetReportTool,
@@ -31,6 +33,7 @@ import {
   kgProvenance,
   triggerKgRefreshTool,
   setRunnerModeTool,
+  setKgFlyMachineTool,
   pauseProjectTool,
   addProjectTool,
   triggerWorkflowSyncTool,
@@ -79,6 +82,8 @@ const TOOL_HANDLERS: Record<string, FixtureToolHandler> = {
   get_runner_mode: getRunnerModeTool,
   list_projects: listProjects,
   list_in_flight_jobs: listInFlightJobs,
+  get_session_machine: getSessionMachine,
+  list_session_machines: listSessionMachines,
   get_issue_dispatch_status: getIssueDispatchStatus,
   get_issue_report_card: getIssueReportCardTool,
   get_fleet_report: getFleetReportTool,
@@ -94,6 +99,7 @@ const TOOL_HANDLERS: Record<string, FixtureToolHandler> = {
   kg_provenance: kgProvenance,
   trigger_kg_refresh: triggerKgRefreshTool,
   set_runner_mode: setRunnerModeTool,
+  set_kg_fly_machine: setKgFlyMachineTool,
   pause_project: pauseProjectTool,
   add_project: addProjectTool,
   trigger_workflow_sync: triggerWorkflowSyncTool,
@@ -106,6 +112,7 @@ const TOOL_HANDLERS: Record<string, FixtureToolHandler> = {
 const WRITE_TOOL_NAMES = new Set([
   "trigger_kg_refresh",
   "set_runner_mode",
+  "set_kg_fly_machine",
   "pause_project",
   "add_project",
   "trigger_workflow_sync",
@@ -162,10 +169,12 @@ vi.mock("../runner-mode.js", () => ({
   VALID_RUNNER_MODES: ["default", "gha", "fly", "local", "shadow"],
   getRunnerMode: vi.fn(),
   getKgMaterializeDirect: vi.fn(() => true),
+  getKgFlyMachineOverride: vi.fn(() => ({})),
+  setKgFlyMachineOverride: vi.fn(),
 }));
 
 vi.mock("../config.js", () => ({
-  getMappings: vi.fn(),
+  getMappings: vi.fn(() => ({})),
 }));
 
 vi.mock("../log.js", () => ({
@@ -1473,6 +1482,7 @@ describe("handleMcpRequest", () => {
         lastDryRun: null,
         stage: "serving",
         materialize: "direct",
+        flyMachine: { cpuKind: "performance", cpus: 2, memoryMb: 8192, source: "default" },
       };
 
       const result = await callMcp(
@@ -1701,6 +1711,8 @@ describe("handleMcpRequest", () => {
         "get_runner_mode",
         "list_projects",
         "list_in_flight_jobs",
+        "get_session_machine",
+        "list_session_machines",
         "get_issue_dispatch_status",
         "get_issue_report_card",
         "get_fleet_report",

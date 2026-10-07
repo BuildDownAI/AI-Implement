@@ -27,7 +27,7 @@ import { resolveWorkflowCapabilities } from "../workflow-probe.js";
 import { resolveRunnerImageForDispatch } from "../repo-image.js";
 import { encodeRunConfig, type RunConfigV1 } from "../run-config.js";
 import { stopBackendRun } from "../backend-run.js";
-import { getRunnerMode, resolveExecutionPath } from "../runner-mode.js";
+import { getRunnerMode, resolveExecutionPath, getKgFlyMachineOverride } from "../runner-mode.js";
 import { mintRunToken } from "../runner-tokens.js";
 import type { JobStatus } from "../log.js";
 import { appendLogIfAbsent, findLogIdByDispatchId, updateJobMachineDetails, updateJobPrUrl, updateJobRunId } from "../log.js";
@@ -165,8 +165,59 @@ export interface KgRefreshToolDeps {
   readServedStamp: () => Promise<string | null>;
 }
 
-function findKgMapping(kgSourceRepo: string) {
+export function findKgMapping(kgSourceRepo: string) {
   return Object.entries(getMappings()).find(([, m]) => `${m.owner}/${m.repo}` === kgSourceRepo);
+}
+
+/** Fly performance machines need at least this much memory per CPU. */
+const PERFORMANCE_MIN_MB_PER_CPU = 2048;
+
+export interface KgFlyMachineSize {
+  cpuKind: "shared" | "performance";
+  cpus: number;
+  memoryMb: number;
+  /** Where the size came from: the admin override, the KG repo mapping, or the builder default. */
+  source: "override" | "mapping" | "default";
+}
+
+/** KG floors: the ingest dies after the embedding-model load at 4096 MB, so a Fly KG refresh
+ *  defaults to 2 CPUs / 8192 MB unless the mapping is larger or an admin override says otherwise. */
+export const KG_FLY_DEFAULT_MEMORY_MB = 8192;
+export const KG_FLY_DEFAULT_CPUS = 2;
+
+/** The effective Fly machine size for a kg-refresh run: each field of the admin override
+ *  (`set_kg_fly_machine`), else the larger of the mapping size and the KG floor, then the CPU kind.
+ *  `log` is false for status reads so only dispatches log. */
+export function resolveKgFlyMachineSize(kgSourceRepo: string, log = true): KgFlyMachineSize {
+  const mapping = findKgMapping(kgSourceRepo)?.[1];
+  const override = getKgFlyMachineOverride();
+  const hasOverride = override.cpus !== undefined || override.memoryMb !== undefined || override.cpuKind !== undefined;
+  if (!mapping && log) {
+    console.log(`[kg-refresh] no mapping for ${kgSourceRepo}; Fly machine uses the default size`);
+  }
+  const mappingCpus = mapping?.machineCpus ?? 0;
+  const mappingMemoryMb = mapping?.machineMemoryMb ?? 0;
+  const cpus = override.cpus ?? Math.max(mappingCpus, KG_FLY_DEFAULT_CPUS);
+  const memoryMb = override.memoryMb ?? Math.max(mappingMemoryMb, KG_FLY_DEFAULT_MEMORY_MB);
+  // "mapping" means the mapping raised at least one field above its floor; the other field may still be the floor.
+  const mappingWon = mappingCpus > KG_FLY_DEFAULT_CPUS || mappingMemoryMb > KG_FLY_DEFAULT_MEMORY_MB;
+  const source = hasOverride ? "override" : mappingWon ? "mapping" : "default";
+  const below = memoryMb < PERFORMANCE_MIN_MB_PER_CPU * cpus;
+  if (override.cpuKind !== "shared" && below && log) {
+    console.log(
+      `[kg-refresh] ${kgSourceRepo} size is ${cpus} CPU / ${memoryMb} MB, below the ${PERFORMANCE_MIN_MB_PER_CPU} MB-per-CPU minimum for performance CPUs; Fly machine stays on shared CPUs`,
+    );
+  }
+  const cpuKind = override.cpuKind === "shared" || below ? "shared" : "performance";
+  return { cpuKind, cpus, memoryMb, source };
+}
+
+/** Fly machine size for a kg-refresh run, plus the sessions region, for spreading into the machine config. */
+export function kgFlyMachineSizing(
+  kgSourceRepo: string,
+  region: string | null | undefined,
+): KgFlyMachineSize & { region?: string } {
+  return { ...resolveKgFlyMachineSize(kgSourceRepo), region: region ?? undefined };
 }
 
 /** The execution mode a kg-refresh dispatch resolves to under the current runner mode.
