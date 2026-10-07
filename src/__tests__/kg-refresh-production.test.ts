@@ -1,10 +1,10 @@
 // Unit tests for the kg-refresh production composer and ingress client (AII-895).
 // No Docker and no Restate runtime: the services are only constructed, the GHA dispatch
 // is exercised against a mocked postWorkflowDispatch, and the client against a faked fetch.
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { makeAppConfig } from "./helpers/builders.js";
+import { fakeFetch, hangUntilAborted, type Reply, type Routes } from "./helpers/fake-fetch.js";
+import { testDb } from "./helpers/test-db.js";
 
 const postWorkflowDispatch = vi.fn();
 vi.mock("../github.js", async (importOriginal) => ({
@@ -68,11 +68,10 @@ function makeInput(overrides: Partial<KgRefreshProductionInput> = {}): KgRefresh
   const noop = vi.fn();
   return {
     kgSourceRepo: "acme/kg",
-    config: {
-      githubAppId: "1", githubAppPrivateKey: "key", sessionImage: "img", runnerImageExplicit: false,
+    config: makeAppConfig({
       runnerCallbackBaseUrl: "https://orch.example", runnerTokenSecret: "secret",
       flySessionsToken: "fly-token", flySessionsApp: "fly-app",
-    },
+    }),
     mintToken: vi.fn(async () => ({ token: "gh-token", expiresAt: "" })),
     fetchTarball: noop as never,
     fetchDefaultBranch: vi.fn(async () => "main"),
@@ -327,40 +326,33 @@ describe("recordDispatch", () => {
 
 describe("job row after a non-GHA dispatch (real log.ts, scratch database)", () => {
   it("lets getJobByMachineId and getJobByNonce resolve the kg-refresh row", async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kg-record-"));
-    const previous = process.env.DEDUP_DB_PATH;
-    process.env.DEDUP_DB_PATH = path.join(dir, "dedup.sqlite");
-    vi.resetModules();
-    const dedup = await vi.importActual<typeof import("../dedup.js")>("../dedup.js");
-    const log = await vi.importActual<typeof import("../log.js")>("../log.js");
-    try {
-      log.initLogTable();
-      const id = log.appendLogIfAbsent({ issueId: "kg-refresh", phase: "kg-refresh", dispatchId: "d-workflow", executionMode: "fly-machines", repo: "acme/kg" });
-      vi.doUnmock("../log.js"); // the fresh module must share the scratch database's log.js instance
-      const { recordKgDispatchDetails } = await import("../restate/kg-refresh-production.js");
-      const recordDispatch = recordKgDispatchDetails;
-      resolvedPath.current = "fly-machines";
-      const dispatchKgRefreshRun = vi.fn(async () => ({ machineId: "m-7", machineNonce: "nonce-7", logsUrl: "https://fly/m-7" }));
-      await createKgRefreshDispatch(makeInput({ dispatchKgRefreshRun, recordDispatch }))(dispatchInput);
-      expect(log.getJobByMachineId("m-7")?.id).toBe(id);
-      expect(log.getJobByNonce("nonce-7")?.id).toBe(id);
+    // No boot tables: the runner-mode.js mock above has no initSettingsTable. The real log.ts
+    // comes through importActual, since this file mocks it.
+    const { log } = (await testDb({
+      tables: "none",
+      modules: { log: () => vi.importActual<typeof import("../log.js")>("../log.js") },
+    })).modules;
+    log.initLogTable();
+    const id = log.appendLogIfAbsent({ issueId: "kg-refresh", phase: "kg-refresh", dispatchId: "d-workflow", executionMode: "fly-machines", repo: "acme/kg" });
+    vi.doUnmock("../log.js"); // the fresh module must share the scratch database's log.js instance
+    const { recordKgDispatchDetails } = await import("../restate/kg-refresh-production.js");
+    const recordDispatch = recordKgDispatchDetails;
+    resolvedPath.current = "fly-machines";
+    const dispatchKgRefreshRun = vi.fn(async () => ({ machineId: "m-7", machineNonce: "nonce-7", logsUrl: "https://fly/m-7" }));
+    await createKgRefreshDispatch(makeInput({ dispatchKgRefreshRun, recordDispatch }))(dispatchInput);
+    expect(log.getJobByMachineId("m-7")?.id).toBe(id);
+    expect(log.getJobByNonce("nonce-7")?.id).toBe(id);
 
-      // A GHA dispatch (no nonce) stores the run id and the URL on the row.
-      const ghaId = log.appendLogIfAbsent({ issueId: "kg-refresh", phase: "kg-refresh", dispatchId: "d-gha", executionMode: "github-actions", repo: "acme/kg" });
-      recordKgDispatchDetails("d-gha", { workflowRunId: 321, logsUrl: "https://gh/run/321" });
-      const ghaRow = log.getJobById(ghaId);
-      expect(ghaRow?.runId).toBe(321);
-      expect(ghaRow?.prUrl).toBe("https://gh/run/321");
+    // A GHA dispatch (no nonce) stores the run id and the URL on the row.
+    const ghaId = log.appendLogIfAbsent({ issueId: "kg-refresh", phase: "kg-refresh", dispatchId: "d-gha", executionMode: "github-actions", repo: "acme/kg" });
+    recordKgDispatchDetails("d-gha", { workflowRunId: 321, logsUrl: "https://gh/run/321" });
+    const ghaRow = log.getJobById(ghaId);
+    expect(ghaRow?.runId).toBe(321);
+    expect(ghaRow?.prUrl).toBe("https://gh/run/321");
 
-      // A dispatch id with no row does nothing and does not throw.
-      expect(() => recordKgDispatchDetails("d-missing", { machineNonce: "n", workflowRunId: 1, logsUrl: "u" })).not.toThrow();
-      expect(log.getJobByNonce("n")).toBeNull();
-    } finally {
-      dedup.closeDb();
-      if (previous === undefined) delete process.env.DEDUP_DB_PATH;
-      else process.env.DEDUP_DB_PATH = previous;
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
+    // A dispatch id with no row does nothing and does not throw.
+    expect(() => recordKgDispatchDetails("d-missing", { machineNonce: "n", workflowRunId: 1, logsUrl: "u" })).not.toThrow();
+    expect(log.getJobByNonce("n")).toBeNull();
   });
 });
 
@@ -438,7 +430,16 @@ describe("createKgRefreshIngressClient", () => {
   function clientWith(fetchImpl: typeof fetch) {
     return createKgRefreshIngressClient(BASE, { fetchImpl });
   }
-  const respond = (status: number, body = "") => vi.fn(async () => new Response(body, { status })) as unknown as typeof fetch;
+  // The sidecar answering every handler these tests call, for trigger t-1 and repo acme/kg, with one reply.
+  function sidecar(reply: Reply, extraPaths: string[] = []) {
+    const paths = ["/KgRefresh/t-1/report", "/KgRefresh/t-1/progress", "/KgRefresh/t-1/cancel", "/KgRefresh/t-1/status",
+      "/KgRepo/acme%2Fkg/status", "/KgRepo/acme%2Fkg/enqueueDryRun", ...extraPaths];
+    const routes: Routes = {};
+    for (const p of paths) routes[`POST ${p}` as keyof Routes] = reply;
+    return fakeFetch(routes);
+  }
+  const respond = (status: number, body = "") => sidecar({ status, text: body }).fetch;
+  const throwing = (error: () => Error) => sidecar(() => { throw error(); }).fetch;
 
   it("treats an empty 2xx body as success", async () => {
     expect(await clientWith(respond(200)).progress("t-1")).toEqual({ status: "accepted" });
@@ -465,8 +466,8 @@ describe("createKgRefreshIngressClient", () => {
   });
 
   it("answers unavailable from every handler on a connection error and on a timeout", async () => {
-    const refused = vi.fn(async () => { throw new TypeError("fetch failed"); }) as unknown as typeof fetch;
-    const timedOut = vi.fn(async () => { throw new DOMException("timed out", "TimeoutError"); }) as unknown as typeof fetch;
+    const refused = throwing(() => new TypeError("fetch failed"));
+    const timedOut = throwing(() => new DOMException("timed out", "TimeoutError"));
     const entry = { key: "acme/kg#1", ref: "br", report: { repo: "acme/kg", prNumber: 1, sha: "s" } };
     for (const f of [refused, timedOut]) {
       const c = clientWith(f);
@@ -489,17 +490,15 @@ describe("createKgRefreshIngressClient", () => {
   });
 
   it("maps a rejected fetch, a timeout, and a bad body to unavailable without throwing", async () => {
-    const refused = vi.fn(async () => { throw new TypeError("fetch failed"); }) as unknown as typeof fetch;
-    const timedOut = vi.fn(async () => { throw new DOMException("timed out", "TimeoutError"); }) as unknown as typeof fetch;
+    const refused = throwing(() => new TypeError("fetch failed"));
+    const timedOut = throwing(() => new DOMException("timed out", "TimeoutError"));
     expect(await clientWith(refused).progress("t-1")).toEqual({ status: "unavailable" });
     expect(await clientWith(timedOut).progress("t-1")).toEqual({ status: "unavailable" });
     expect(await clientWith(respond(200, "not json")).status("t-1")).toEqual({ status: "unavailable" });
   });
 
   it("answers unavailable within the timeout when the sidecar hangs or is down", async () => {
-    const hung = vi.fn((_url: unknown, init?: RequestInit) => new Promise<Response>((_, reject) => {
-      init?.signal?.addEventListener("abort", () => reject(init.signal!.reason));
-    })) as unknown as typeof fetch;
+    const hung = sidecar(hangUntilAborted).fetch;
     const started = Date.now();
     expect(await createKgRefreshIngressClient(BASE, { fetchImpl: hung, timeoutMs: 50 }).progress("t-1")).toEqual({ status: "unavailable" });
     expect(Date.now() - started).toBeLessThan(2000);
@@ -512,35 +511,32 @@ describe("createKgRefreshIngressClient", () => {
   });
 
   it("encodes every dynamic segment", async () => {
-    const fetchImpl = respond(200);
-    const client = clientWith(fetchImpl);
+    const ingress = sidecar({}, ["/KgRepo/owner%2Fname/status", "/KgRefresh/a%2Fb%3Fc/progress"]);
+    const client = clientWith(ingress.fetch);
     await client.repoStatus("owner/name");
     await client.progress("a/b?c");
-    const urls = (fetchImpl as unknown as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0]);
-    expect(urls).toEqual([`${BASE}/KgRepo/owner%2Fname/status`, `${BASE}/KgRefresh/a%2Fb%3Fc/progress`]);
+    expect(ingress.calls.map((call) => call.url.href)).toEqual([`${BASE}/KgRepo/owner%2Fname/status`, `${BASE}/KgRefresh/a%2Fb%3Fc/progress`]);
   });
 
   it("sends idempotency-key only when given, and always an abort signal", async () => {
-    const fetchImpl = respond(200);
-    const client = clientWith(fetchImpl);
+    const ingress = sidecar({});
+    const client = clientWith(ingress.fetch);
     await client.report("t-1", { ok: true }, { idempotencyKey: "k1" });
     await client.report("t-1", { ok: true });
-    const calls = (fetchImpl as unknown as ReturnType<typeof vi.fn>).mock.calls as Array<[string, RequestInit]>;
-    expect((calls[0][1].headers as Record<string, string>)["idempotency-key"]).toBe("k1");
-    expect(calls[1][1].headers as Record<string, string>).not.toHaveProperty("idempotency-key");
-    expect(calls[0][1].signal).toBeInstanceOf(AbortSignal);
-    expect(calls[0][1].method).toBe("POST");
+    expect(ingress.calls[0]!.headers.get("idempotency-key")).toBe("k1");
+    expect(ingress.calls[1]!.headers.has("idempotency-key")).toBe(false);
+    expect(ingress.calls[0]!.signal).toBeInstanceOf(AbortSignal);
+    expect(ingress.calls[0]!.method).toBe("POST");
   });
 
   it("forwards the delivery id to KgRepo.enqueueDryRun as the idempotency-key header (AII-730)", async () => {
-    const fetchImpl = respond(200, JSON.stringify({ queued: true }));
-    const client = clientWith(fetchImpl);
+    const ingress = sidecar({ json: { queued: true } });
+    const client = clientWith(ingress.fetch);
     const entry = { key: "acme/kg#1", ref: "br", report: { repo: "acme/kg", prNumber: 1, sha: "s" } };
     expect(await client.enqueueDryRun("acme/kg", entry, { idempotencyKey: "delivery-1" })).toEqual({ status: "accepted", value: { queued: true } });
-    const [url, init] = (fetchImpl as unknown as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit];
-    expect(url).toBe(`${BASE}/KgRepo/acme%2Fkg/enqueueDryRun`);
-    expect((init.headers as Record<string, string>)["idempotency-key"]).toBe("delivery-1");
-    expect(JSON.parse(new TextDecoder().decode(init.body as Uint8Array))).toEqual(entry);
+    expect(ingress.calls[0]!.url.href).toBe(`${BASE}/KgRepo/acme%2Fkg/enqueueDryRun`);
+    expect(ingress.calls[0]!.headers.get("idempotency-key")).toBe("delivery-1");
+    expect(JSON.parse(ingress.calls[0]!.body)).toEqual(entry);
   });
 });
 
@@ -548,26 +544,20 @@ describe("createKgFindRunByTitle", () => {
   const lookup = (recordDetails = vi.fn()) =>
     ({ find: createKgFindRunByTitle({ owner: "acme", repo: "kg", getToken: async () => "tok", recordDetails }), recordDetails });
 
+  const RUNS = "GET /repos/acme/kg/actions/workflows/claude-implement.yml/runs" as const;
+
   it("throws on an HTTP error instead of answering no run", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => new Response("boom", { status: 500 })));
-    try {
-      await expect(lookup().find("KG-REFRESH · d-1")).rejects.toThrow(/HTTP 500/);
-    } finally {
-      vi.unstubAllGlobals();
-    }
+    fakeFetch({ [RUNS]: { status: 500, text: "boom" } }).install();
+    await expect(lookup().find("KG-REFRESH · d-1")).rejects.toThrow(/HTTP 500/);
   });
 
   it("answers null for a 200 with no matching title, and the run id for a match", async () => {
     const body = { workflow_runs: [{ id: 7, display_title: "Claude AI Implementation — KG-REFRESH · d-1", html_url: "u" }] };
-    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify(body), { status: 200 })));
-    try {
-      const { find, recordDetails } = lookup();
-      expect(await find("KG-REFRESH · other")).toBeNull();
-      expect(await find("KG-REFRESH · d-1")).toEqual({ runId: 7 });
-      expect(recordDetails).toHaveBeenCalledWith("d-1", { workflowRunId: 7, logsUrl: "u" });
-    } finally {
-      vi.unstubAllGlobals();
-    }
+    fakeFetch({ [RUNS]: { json: body } }).install();
+    const { find, recordDetails } = lookup();
+    expect(await find("KG-REFRESH · other")).toBeNull();
+    expect(await find("KG-REFRESH · d-1")).toEqual({ runId: 7 });
+    expect(recordDetails).toHaveBeenCalledWith("d-1", { workflowRunId: 7, logsUrl: "u" });
   });
 });
 
