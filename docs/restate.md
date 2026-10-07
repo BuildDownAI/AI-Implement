@@ -66,7 +66,7 @@ The kg-refresh production wiring lives in `src/restate/kg-refresh-production.ts`
 
 Loopback binding is no longer the only control on the SDK endpoint. On `start()`, `RestateSidecar` generates an ED25519 key pair under the Restate data directory when `request-identity-private.pem` is absent (mode 0600, written once; the Fly volume keeps it across boots), passes its path to the server as `RESTATE_REQUEST_IDENTITY_PRIVATE_KEY_PEM_FILE`, derives the compact `publickeyv1_…` public key from the PEM, and exposes it as `sidecar.identityKey` (one boot log line names it). `main()` hands that key to `startRestateEndpoint`, which passes it to the SDK as `identityKeys`, so every registered service rejects a request the server did not sign (401). For an external server (the test runtimes), `RESTATE_IDENTITY_KEY` supplies the public key instead; with neither, the endpoint accepts unsigned requests and logs that once. A corrupt key file is regenerated (one warning), a key that cannot be prepared keeps the sidecar down (restate-dependent routes answer 503), and there is no unsigned mode on the sidecar path.
 
-`ingressPrivate: true` is set on the handlers only other services call — `KgRefresh.run`, `KgRepo.release`, `KgRepo.expire`, `KgRepo.recordDryRunOutcome` — so the ingress answers 400 for them. The pilot handlers are not yet marked.
+`ingressPrivate: true` is set on the handlers only other services call — `KgRefresh.run`, `KgRepo.release`, `KgRepo.expire`, `KgRepo.recordDryRunOutcome`, `FlyMachineProfile.set` — so the ingress answers 400 for them. The pilot handlers are not yet marked.
 
 #### Late readiness (AII-724)
 
