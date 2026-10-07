@@ -1,63 +1,27 @@
-import { link, lstat, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { link, lstat, mkdir, readFile, rename, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { RepoMapping } from "../../config.js";
 import { FilesystemProvider } from "../../providers/filesystem.js";
+import { makeIssue, makeMapping } from "../helpers/builders.js";
+import { testDir } from "../helpers/test-dir.js";
 
 vi.mock("node:fs/promises", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
   return { ...actual, link: vi.fn(actual.link) };
 });
 
-const tempDirs: string[] = [];
-
-afterEach(async () => {
-  await Promise.all(tempDirs.map((dir) => rm(dir, { recursive: true, force: true })));
-  tempDirs.length = 0;
+afterEach(() => {
   vi.mocked(link).mockClear();
 });
 
-function mapping(overrides: Partial<RepoMapping> & { directory: string; planningEnabled?: boolean }): RepoMapping {
-  return {
-    owner: "acme",
-    repo: "widgets",
-    workflowFile: "claude-implement.yml",
-    defaultBranch: "main",
-    maxInProgressAiIssues: 3,
-    executionMode: "github-actions",
-    sessionMode: "autonomous",
-    machineCpus: 2,
-    machineMemoryMb: 4096,
-    planningEnabled: overrides.planningEnabled ?? true,
-    planningWorkflowFile: "claude-plan.yml",
-    autoApprovePlans: true,
-    autoMerge: false,
-    extraEnv: {},
-    provider: "anthropic",
+function mapping({ directory, ...overrides }: Partial<RepoMapping> & { directory: string }): RepoMapping {
+  return makeMapping({
+    planningEnabled: true,
     ticketingProvider: "filesystem",
-    ticketingConfig: { kind: "filesystem", directory: overrides.directory },
-    awsRegion: null,
-    paused: false,
-    maxTurns: null,
-    maxIterations: null,
-    maxJobMinutes: null,
-    branchPrefix: null,
-    skillsRepo: null,
-    referenceRepos: null,
-    sensitiveAddPatterns: null,
-    sensitiveAllowPatterns: null,
-    dependencyTokenScope: null,
-    memoryProviderId: null,
-    reviewers: null,
+    ticketingConfig: { kind: "filesystem", directory },
     ...overrides,
-  };
-}
-
-async function tempTicketDir(): Promise<string> {
-  const dir = await mkdtemp(join(tmpdir(), "ai-implement-fs-provider-"));
-  tempDirs.push(dir);
-  return dir;
+  });
 }
 
 async function writeTask(dir: string, filename: string, body: string): Promise<void> {
@@ -70,7 +34,7 @@ function provider(mappings: Record<string, RepoMapping>): FilesystemProvider {
 
 describe("FilesystemProvider", () => {
   it("persists lifecycle state and parsed task limits across provider restarts", async () => {
-    const dir = await tempTicketDir();
+    const dir = testDir("fs-provider");
     await writeTask(dir, "AII-1.md", [
       "---",
       "title: Exercise the review loop",
@@ -122,18 +86,11 @@ describe("FilesystemProvider", () => {
 
   it("returns admin issue URLs for exact scoped filesystem issue ids", async () => {
     const p = provider({});
-    expect(p.issueUrl({
-      id: "filesystem:SAN2:SAN2-001",
-      identifier: "SAN2-001",
-      title: "Make the jellyfish pulse less",
-      description: null,
-      scopeKey: "SAN2",
-      nativeStatus: "ready",
-    })).toBe("/admin?filesystemIssue=filesystem%3ASAN2%3ASAN2-001");
+    expect(p.issueUrl(makeIssue({ id: "filesystem:SAN2:SAN2-001" }))).toBe("/admin?filesystemIssue=filesystem%3ASAN2%3ASAN2-001");
   });
 
   it("reads issue details without creating missing state", async () => {
-    const dir = await tempTicketDir();
+    const dir = testDir("fs-provider");
     await writeTask(dir, "SAN2-1.md", "---\ntitle: Local detail\n---\n\nShow me.");
     const p = provider({ SAN2: mapping({ directory: dir }) });
 
@@ -152,7 +109,7 @@ describe("FilesystemProvider", () => {
   });
 
   it("returns null details for corrupt state and duplicate scoped identifiers", async () => {
-    const dir = await tempTicketDir();
+    const dir = testDir("fs-provider");
     await writeTask(dir, "SAN2-2.md", "---\ntitle: Corrupt state\n---\n\nSkip.");
     await writeTask(dir, "duplicate.md", "---\ntitle: Duplicate\nid: SAN2-3\n---\n\nFirst.");
     await writeTask(dir, "SAN2-3.md", "---\ntitle: Duplicate\n---\n\nSecond.");
@@ -171,7 +128,7 @@ describe("FilesystemProvider", () => {
   });
 
   it("puts new tasks directly in the implementation bucket when planning is disabled", async () => {
-    const dir = await tempTicketDir();
+    const dir = testDir("fs-provider");
     await writeTask(dir, "AII-2.md", "---\ntitle: No planning\n---\n\nImplement directly.");
     const snap = await provider({ AII: mapping({ directory: dir, planningEnabled: false }) }).fetchAIImplementSnapshot();
     expect(snap.needsPlanning).toEqual([]);
@@ -179,7 +136,7 @@ describe("FilesystemProvider", () => {
   });
 
   it("fails closed on malformed documents, corrupt state, and duplicate identifiers in one scope", async () => {
-    const dir = await tempTicketDir();
+    const dir = testDir("fs-provider");
     await writeTask(dir, "AII-3.md", "---\ntitle: Valid\n---\n\nOk.");
     await writeTask(dir, "AII-4.md", "No front matter");
     await writeTask(dir, "AII-5.md", "---\ntitle: First\nid: AII-6\n---\n\nDuplicate.");
@@ -193,8 +150,8 @@ describe("FilesystemProvider", () => {
   });
 
   it("keeps identifiers scoped and refuses ambiguous findByKey results", async () => {
-    const dirA = await tempTicketDir();
-    const dirB = await tempTicketDir();
+    const dirA = testDir("fs-provider");
+    const dirB = testDir("fs-provider");
     await writeTask(dirA, "AII-7.md", "---\ntitle: One\n---\n\nA.");
     await writeTask(dirB, "AII-7.md", "---\ntitle: Two\n---\n\nB.");
     const p = provider({
@@ -207,7 +164,7 @@ describe("FilesystemProvider", () => {
   });
 
   it("serializes concurrent comments without losing updates", async () => {
-    const dir = await tempTicketDir();
+    const dir = testDir("fs-provider");
     await writeTask(dir, "AII-8.md", "---\ntitle: Comment storm\n---\n\nCollect comments.");
     const p = provider({ AII: mapping({ directory: dir }) });
 
@@ -219,7 +176,7 @@ describe("FilesystemProvider", () => {
   });
 
   it("preserves terminal state against late failures, resets, and PR callbacks", async () => {
-    const dir = await tempTicketDir();
+    const dir = testDir("fs-provider");
     await writeTask(dir, "AII-9.md", "---\ntitle: Terminal guard\n---\n\nDone.");
     const p = provider({ AII: mapping({ directory: dir }) });
 
@@ -235,8 +192,8 @@ describe("FilesystemProvider", () => {
   });
 
   it("ignores symlinked task files", async () => {
-    const dir = await tempTicketDir();
-    const target = join(await tempTicketDir(), "target.md");
+    const dir = testDir("fs-provider");
+    const target = join(testDir("fs-provider"), "target.md");
     await writeFile(target, "---\ntitle: Linked\nid: AII-10\n---\n\nIgnore.", "utf8");
     await symlink(target, join(dir, "AII-10.md"));
 
@@ -245,15 +202,15 @@ describe("FilesystemProvider", () => {
   });
 
   it("accepts an explicit identifier independently of the filename", async () => {
-    const dir = await tempTicketDir();
+    const dir = testDir("fs-provider");
     await writeTask(dir, "version-endpoint.md", "---\ntitle: Version endpoint\nid: LOCAL-1\n---\nImplement.");
     const snapshot = await provider({ LOCAL: mapping({ directory: dir }) }).fetchAIImplementSnapshot();
     expect(snapshot.needsPlanning[0]?.identifier).toBe("LOCAL-1");
   });
 
   it.each(["root", "scope", "file"])("refuses a symlinked state %s without writing outside the ticket directory", async (kind) => {
-    const dir = await tempTicketDir();
-    const outside = await tempTicketDir();
+    const dir = testDir("fs-provider");
+    const outside = testDir("fs-provider");
     await writeTask(dir, "LOCAL-2.md", "---\ntitle: State safety\n---\nImplement.");
     if (kind === "root") await symlink(outside, join(dir, ".state"));
     if (kind === "scope") {
@@ -272,7 +229,7 @@ describe("FilesystemProvider", () => {
   });
 
   it("serializes writes across provider replacements and ignores stale planning callbacks", async () => {
-    const dir = await tempTicketDir();
+    const dir = testDir("fs-provider");
     await writeTask(dir, "LOCAL-3.md", "---\ntitle: Restart safety\n---\nImplement.");
     const mappings = { LOCAL: mapping({ directory: dir }) };
     const first = provider(mappings);
@@ -289,7 +246,7 @@ describe("FilesystemProvider", () => {
   });
 
   it("archives completed tickets after merge while keeping details lifecycle and key lookup available", async () => {
-    const dir = await tempTicketDir();
+    const dir = testDir("fs-provider");
     await writeTask(dir, "LOCAL-4.md", "---\ntitle: Completed archive\n---\nDone.");
     const p = provider({ LOCAL: mapping({ directory: dir }) });
     const id = "filesystem:LOCAL:LOCAL-4";
@@ -312,7 +269,7 @@ describe("FilesystemProvider", () => {
   });
 
   it("reconciles preexisting completed root files during snapshot polling", async () => {
-    const dir = await tempTicketDir();
+    const dir = testDir("fs-provider");
     const id = "filesystem:LOCAL:LOCAL-5";
     await writeTask(dir, "LOCAL-5.md", "---\ntitle: Preexisting completed\n---\nDone.");
     await mkdir(join(dir, ".state", "LOCAL"), { recursive: true });
@@ -335,7 +292,7 @@ describe("FilesystemProvider", () => {
   });
 
   it("explicitly archives failed tickets and retries them without dropping history", async () => {
-    const dir = await tempTicketDir();
+    const dir = testDir("fs-provider");
     const id = "filesystem:LOCAL:LOCAL-6";
     const p = provider({ LOCAL: mapping({ directory: dir }) });
     await writeTask(dir, "retry-me.md", "---\ntitle: Retry me\nid: LOCAL-6\n---\nTry again.");
@@ -359,7 +316,7 @@ describe("FilesystemProvider", () => {
   });
 
   it("archives exhausted active tickets after watchdog reset by stamping failed state before moving", async () => {
-    const dir = await tempTicketDir();
+    const dir = testDir("fs-provider");
     const planningId = "filesystem:LOCAL:LOCAL-17";
     const implementationId = "filesystem:LOCAL:LOCAL-18";
     const terminalId = "filesystem:LOCAL:LOCAL-19";
@@ -392,7 +349,7 @@ describe("FilesystemProvider", () => {
   });
 
   it("recovers retry when a previous restore moved the file but failed before state reset", async () => {
-    const dir = await tempTicketDir();
+    const dir = testDir("fs-provider");
     const id = "filesystem:LOCAL:LOCAL-20";
     const p = provider({ LOCAL: mapping({ directory: dir }) });
     await writeTask(dir, "LOCAL-20.md", "---\ntitle: Root failed retry\n---\nRetry recovery.");
@@ -407,7 +364,7 @@ describe("FilesystemProvider", () => {
   });
 
   it("archives exhausted dispatch failures before a runner created state", async () => {
-    const dir = await tempTicketDir();
+    const dir = testDir("fs-provider");
     const id = "filesystem:LOCAL:LOCAL-22";
     const p = provider({ LOCAL: mapping({ directory: dir }) });
     await writeTask(dir, "LOCAL-22.md", "---\ntitle: Never started\n---\nRunner unavailable.");
@@ -417,7 +374,7 @@ describe("FilesystemProvider", () => {
   });
 
   it("retries implementation failures to plan-approved and refuses known PR histories", async () => {
-    const dir = await tempTicketDir();
+    const dir = testDir("fs-provider");
     const id = "filesystem:LOCAL:LOCAL-7";
     const p = provider({ LOCAL: mapping({ directory: dir }) });
     await writeTask(dir, "LOCAL-7.md", "---\ntitle: Retry implementation\n---\nTry implementation again.");
@@ -435,7 +392,7 @@ describe("FilesystemProvider", () => {
   });
 
   it("does not dispatch archived failed tickets or manual root moves without retry reset", async () => {
-    const dir = await tempTicketDir();
+    const dir = testDir("fs-provider");
     const id = "filesystem:LOCAL:LOCAL-8";
     const p = provider({ LOCAL: mapping({ directory: dir }) });
     await writeTask(dir, "LOCAL-8.md", "---\ntitle: Manual restore\n---\nKeep failed.");
@@ -455,7 +412,7 @@ describe("FilesystemProvider", () => {
   });
 
   it("ignores stale callbacks for archived failures but accepts comments and late merges", async () => {
-    const dir = await tempTicketDir();
+    const dir = testDir("fs-provider");
     const id = "filesystem:LOCAL:LOCAL-16";
     const p = provider({ LOCAL: mapping({ directory: dir }) });
     await writeTask(dir, "LOCAL-16.md", "---\ntitle: Late callbacks\n---\nCallbacks.");
@@ -486,7 +443,7 @@ describe("FilesystemProvider", () => {
   });
 
   it("refuses duplicate ids across active completed and failed locations", async () => {
-    const dir = await tempTicketDir();
+    const dir = testDir("fs-provider");
     await mkdir(join(dir, "completed"));
     await mkdir(join(dir, "failed"));
     await writeTask(dir, "LOCAL-9.md", "---\ntitle: Active\n---\nA.");
@@ -504,7 +461,7 @@ describe("FilesystemProvider", () => {
   });
 
   it("refuses archive and restore collisions without overwriting files", async () => {
-    const dir = await tempTicketDir();
+    const dir = testDir("fs-provider");
     const id = "filesystem:LOCAL:LOCAL-11";
     const p = provider({ LOCAL: mapping({ directory: dir }) });
     await writeTask(dir, "LOCAL-11.md", "---\ntitle: Collide\n---\nOriginal.");
@@ -531,7 +488,7 @@ describe("FilesystemProvider", () => {
   });
 
   it.each(["archive", "restore"])("refuses a destination created concurrently during %s", async (operation) => {
-    const dir = await tempTicketDir();
+    const dir = testDir("fs-provider");
     const id = "filesystem:LOCAL:LOCAL-21";
     const p = provider({ LOCAL: mapping({ directory: dir }) });
     await writeTask(dir, "LOCAL-21.md", "---\ntitle: Original\n---\nOriginal contents.");
@@ -553,8 +510,8 @@ describe("FilesystemProvider", () => {
   });
 
   it("skips symlink archive directories and shared-root archival", async () => {
-    const dir = await tempTicketDir();
-    const outside = await tempTicketDir();
+    const dir = testDir("fs-provider");
+    const outside = testDir("fs-provider");
     await symlink(outside, join(dir, "failed"));
     const id = "filesystem:LOCAL:LOCAL-13";
     const p = provider({ LOCAL: mapping({ directory: dir }) });
@@ -580,7 +537,7 @@ describe("FilesystemProvider", () => {
   });
 
   it("keeps active clearWorkingState retry behavior unchanged", async () => {
-    const dir = await tempTicketDir();
+    const dir = testDir("fs-provider");
     const p = provider({ LOCAL: mapping({ directory: dir }) });
     const planningId = "filesystem:LOCAL:LOCAL-14";
     const implementationId = "filesystem:LOCAL:LOCAL-15";

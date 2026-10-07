@@ -1,85 +1,41 @@
-import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
-import os from "node:os";
-import path from "node:path";
-import fs from "node:fs";
+import { describe, expect, it, beforeEach, vi } from "vitest";
 import { selectIssuesToDispatch, selectBlockers, mappingForProvider, mergeProviderSnapshots, selectForeignTrackerBlockers, parseDeclaredFiles, selectFileOverlapDeferrals, rememberCandidates, diffSkipReasons, logSkipReasons, resetSkipReasons, resolveInFlightSiblings, resetSeenCandidates, getCachedPlanningContext, setCachedPlanningContext, resetPlanningContextCache, needsPlanningContextFetch, getPlanningContextCacheSize, PLANNING_CONTEXT_CACHE_MAX } from "../poll-selection.js";
 import type { RepoMapping } from "../config.js";
 import type { AIImplementSnapshot, TicketIssue } from "../providers/types.js";
-import type * as DedupModule from "../dedup.js";
 import type * as GateModule from "../dispatch-gate.js";
 import type * as AdmissionModule from "../dispatch-admission.js";
-import type * as BreakerModule from "../dispatch-breaker.js";
+import { makeIssue, makeMapping } from "./helpers/builders.js";
+import { testDb } from "./helpers/test-db.js";
 
-function makeIssue(id: string, identifier: string, teamKey: string, overrides?: Partial<TicketIssue>): TicketIssue {
-  return {
-    id,
-    identifier,
-    title: identifier,
-    description: null,
-    scopeKey: teamKey,
-    nativeStatus: "Todo (unstarted)",
-    ...overrides,
-  };
+function issueOf(id: string, identifier: string, teamKey: string, overrides?: Partial<TicketIssue>): TicketIssue {
+  return makeIssue({ id, identifier, title: identifier, scopeKey: teamKey, ...overrides });
 }
 
-function makeFeatureIssue(
+function featureIssueOf(
   id: string,
   identifier: string,
   teamKey: string,
   parentIdentifier: string,
   description: string | null = null,
 ): TicketIssue {
-  return {
+  return makeIssue({
     id,
     identifier,
-    title: identifier,
-    description,
     scopeKey: teamKey,
-    nativeStatus: "Todo (unstarted)",
+    description,
     featureBranchChain: [{ identifier: parentIdentifier, mode: "feature" }],
-  };
+  });
 }
 
-function makeMapping(maxInProgressAiIssues = 3): RepoMapping {
-  return {
-    owner: "org",
-    repo: "repo",
-    workflowFile: "claude-implement.yml",
-    defaultBranch: "main",
-    maxInProgressAiIssues,
-    executionMode: "github-actions",
-    sessionMode: "autonomous",
-    machineCpus: 2,
-    machineMemoryMb: 4096,
-    planningEnabled: false,
-    planningWorkflowFile: "",
-    autoApprovePlans: true,
-    autoMerge: false,
-    extraEnv: {},
-    provider: "anthropic",
-    ticketingProvider: "linear",
-    ticketingConfig: { kind: "linear" },
-    awsRegion: null,
-    paused: false,
-    maxTurns: null,
-    maxIterations: null,
-    maxJobMinutes: null,
-    branchPrefix: null,
-    skillsRepo: null,
-    referenceRepos: null,
-    sensitiveAddPatterns: null,
-    sensitiveAllowPatterns: null,
-    dependencyTokenScope: null,
-    memoryProviderId: null,
-    reviewers: null,
-  };
+function mappingWithCap(maxInProgressAiIssues: number): RepoMapping {
+  return makeMapping({ maxInProgressAiIssues });
 }
 
 describe("selectIssuesToDispatch", () => {
   it("returns all issues when team has available slots", () => {
     const selected = selectIssuesToDispatch(
-      [makeIssue("1", "APP-1", "APP"), makeIssue("2", "APP-2", "APP")],
-      { APP: makeMapping(3) },
+      [issueOf("1", "APP-1", "APP"), issueOf("2", "APP-2", "APP")],
+      { APP: mappingWithCap(3) },
       { APP: 1 },
       () => false,
     );
@@ -88,8 +44,8 @@ describe("selectIssuesToDispatch", () => {
 
   it("dispatches no issues when team is at its cap", () => {
     const selected = selectIssuesToDispatch(
-      [makeIssue("1", "APP-1", "APP")],
-      { APP: makeMapping(3) },
+      [issueOf("1", "APP-1", "APP")],
+      { APP: mappingWithCap(3) },
       { APP: 3 },
       () => false,
     );
@@ -98,8 +54,8 @@ describe("selectIssuesToDispatch", () => {
 
   it("enforces caps independently per team", () => {
     const selected = selectIssuesToDispatch(
-      [makeIssue("1", "APP-1", "APP"), makeIssue("2", "APP-2", "APP"), makeIssue("3", "API-1", "API")],
-      { APP: makeMapping(3), API: makeMapping(2) },
+      [issueOf("1", "APP-1", "APP"), issueOf("2", "APP-2", "APP"), issueOf("3", "API-1", "API")],
+      { APP: mappingWithCap(3), API: mappingWithCap(2) },
       { APP: 2, API: 0 },
       () => false,
     );
@@ -108,8 +64,8 @@ describe("selectIssuesToDispatch", () => {
 
   it("skips already-dispatched issues without consuming a slot", () => {
     const selected = selectIssuesToDispatch(
-      [makeIssue("1", "APP-1", "APP"), makeIssue("2", "APP-2", "APP")],
-      { APP: makeMapping(3) },
+      [issueOf("1", "APP-1", "APP"), issueOf("2", "APP-2", "APP")],
+      { APP: mappingWithCap(3) },
       { APP: 2 },
       (issueId) => issueId === "1",
     );
@@ -118,8 +74,8 @@ describe("selectIssuesToDispatch", () => {
 
   it("skips issues with no team mapping", () => {
     const selected = selectIssuesToDispatch(
-      [makeIssue("1", "UNK-1", "UNK")],
-      { APP: makeMapping(3) },
+      [issueOf("1", "UNK-1", "UNK")],
+      { APP: mappingWithCap(3) },
       {},
       () => false,
     );
@@ -127,14 +83,14 @@ describe("selectIssuesToDispatch", () => {
   });
 
   it("returns empty when there are no issues", () => {
-    const selected = selectIssuesToDispatch([], { APP: makeMapping(3) }, {}, () => false);
+    const selected = selectIssuesToDispatch([], { APP: mappingWithCap(3) }, {}, () => false);
     expect(selected).toEqual([]);
   });
 
   it("tracks slot consumption across multiple dispatches in one cycle", () => {
     const selected = selectIssuesToDispatch(
-      [makeIssue("1", "APP-1", "APP"), makeIssue("2", "APP-2", "APP"), makeIssue("3", "APP-3", "APP")],
-      { APP: makeMapping(2) },
+      [issueOf("1", "APP-1", "APP"), issueOf("2", "APP-2", "APP"), issueOf("3", "APP-3", "APP")],
+      { APP: mappingWithCap(2) },
       { APP: 0 },
       () => false,
     );
@@ -146,8 +102,8 @@ describe("selectIssuesToDispatch", () => {
 describe("selectBlockers", () => {
   it("returns no-mapping when teamRepoMap lacks the issue's team", () => {
     const blockers = selectBlockers(
-      [makeIssue("1", "UNK-1", "UNK")],
-      { APP: makeMapping(3) },
+      [issueOf("1", "UNK-1", "UNK")],
+      { APP: mappingWithCap(3) },
       {},
       () => false,
       () => null,
@@ -160,8 +116,8 @@ describe("selectBlockers", () => {
 
   it("returns dedup when isAlreadyDispatched is true, NOT concurrency even if at cap", () => {
     const blockers = selectBlockers(
-      [makeIssue("1", "APP-1", "APP")],
-      { APP: makeMapping(1) },
+      [issueOf("1", "APP-1", "APP")],
+      { APP: mappingWithCap(1) },
       { APP: 1 }, // at cap
       (id) => id === "1",
       () => null,
@@ -172,8 +128,8 @@ describe("selectBlockers", () => {
 
   it("returns concurrency when team is at cap and not deduped", () => {
     const blockers = selectBlockers(
-      [makeIssue("1", "APP-1", "APP")],
-      { APP: makeMapping(2) },
+      [issueOf("1", "APP-1", "APP")],
+      { APP: mappingWithCap(2) },
       { APP: 2 },
       () => false,
       () => null,
@@ -185,8 +141,8 @@ describe("selectBlockers", () => {
 
   it("returns nothing for a dispatchable issue", () => {
     const blockers = selectBlockers(
-      [makeIssue("1", "APP-1", "APP")],
-      { APP: makeMapping(3) },
+      [issueOf("1", "APP-1", "APP")],
+      { APP: mappingWithCap(3) },
       { APP: 1 },
       () => false,
       () => null,
@@ -197,12 +153,12 @@ describe("selectBlockers", () => {
   it("returns multiple blockers from mixed input, sorted by reason+teamKey+identifier", () => {
     const blockers = selectBlockers(
       [
-        makeIssue("1", "APP-2", "APP"), // concurrency (APP at cap)
-        makeIssue("2", "APP-1", "APP"), // dedup
-        makeIssue("3", "API-1", "API"), // no-mapping
-        makeIssue("4", "APP-3", "APP"), // concurrency (APP at cap)
+        issueOf("1", "APP-2", "APP"), // concurrency (APP at cap)
+        issueOf("2", "APP-1", "APP"), // dedup
+        issueOf("3", "API-1", "API"), // no-mapping
+        issueOf("4", "APP-3", "APP"), // concurrency (APP at cap)
       ],
-      { APP: makeMapping(1) },
+      { APP: mappingWithCap(1) },
       { APP: 1 }, // APP at cap
       (id) => id === "2",
       () => null,
@@ -219,8 +175,8 @@ describe("selectBlockers", () => {
   it("logs the exclusion with issue, team, count, and cap when a concurrency blocker fires", () => {
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     selectBlockers(
-      [makeIssue("1", "APP-1", "APP")],
-      { APP: makeMapping(2) },
+      [issueOf("1", "APP-1", "APP")],
+      { APP: mappingWithCap(2) },
       { APP: 2 },
       () => false,
       () => null,
@@ -234,8 +190,8 @@ describe("selectBlockers", () => {
   it("does not log an exclusion for an issue that clears the cap", () => {
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     selectBlockers(
-      [makeIssue("1", "APP-1", "APP")],
-      { APP: makeMapping(3) },
+      [issueOf("1", "APP-1", "APP")],
+      { APP: mappingWithCap(3) },
       { APP: 1 },
       () => false,
       () => null,
@@ -252,29 +208,13 @@ describe("selectBlockers", () => {
 // reservation with no run ID yet (acquireDispatch's transaction commits before the
 // external launch call returns) must still count as used.
 describe("selectBlockers — reservation-backed concurrency, not tracker labels", () => {
-  let dbPath: string;
-  let dedup: typeof DedupModule;
   let gate: typeof GateModule;
   let admission: typeof AdmissionModule;
-  let breaker: typeof BreakerModule;
 
   beforeEach(async () => {
-    vi.resetModules();
-    dbPath = path.join(
-      os.tmpdir(),
-      `poll-selection-blockers-admission-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-    );
-    process.env.DEDUP_DB_PATH = dbPath;
-    dedup = await import("../dedup.js");
-    gate = await import("../dispatch-gate.js");
-    admission = await import("../dispatch-admission.js");
-    breaker = await import("../dispatch-breaker.js");
-    breaker.initDispatchBreakerTable();
-  });
-
-  afterEach(() => {
-    dedup.closeDb();
-    try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+    ({ gate, admission } = (
+      await testDb({ modules: { gate: () => import("../dispatch-gate.js"), admission: () => import("../dispatch-admission.js") } })
+    ).modules);
   });
 
   it("a prepared reservation with no run ID yet still blocks, even when the tracker label is stranded (idle)", () => {
@@ -295,9 +235,9 @@ describe("selectBlockers — reservation-backed concurrency, not tracker labels"
     const reservedCounts = { AII: admission.count("AII") };
     expect(reservedCounts.AII).toBe(1);
 
-    const candidate = makeIssue("AII-2", "AII-2", "AII");
-    const usingStaleTracker = selectBlockers([candidate], { AII: makeMapping(1) }, staleTrackerCounts, () => false, () => null);
-    const usingReservations = selectBlockers([candidate], { AII: makeMapping(1) }, reservedCounts, () => false, () => null);
+    const candidate = issueOf("AII-2", "AII-2", "AII");
+    const usingStaleTracker = selectBlockers([candidate], { AII: mappingWithCap(1) }, staleTrackerCounts, () => false, () => null);
+    const usingReservations = selectBlockers([candidate], { AII: mappingWithCap(1) }, reservedCounts, () => false, () => null);
 
     expect(usingStaleTracker).toHaveLength(0);
     expect(usingReservations).toHaveLength(1);
@@ -317,8 +257,8 @@ describe("selectBlockers — reservation-backed concurrency, not tracker labels"
     expect(held.ok).toBe(true);
     if (held.ok) held.release("finalized");
 
-    const candidate = makeIssue("AII-3", "AII-3", "AII");
-    const blockers = selectBlockers([candidate], { AII: makeMapping(1) }, { AII: admission.count("AII") }, () => false, () => null);
+    const candidate = issueOf("AII-3", "AII-3", "AII");
+    const blockers = selectBlockers([candidate], { AII: mappingWithCap(1) }, { AII: admission.count("AII") }, () => false, () => null);
     expect(blockers).toHaveLength(0);
   });
 });
@@ -378,8 +318,8 @@ describe("selectFileOverlapDeferrals", () => {
   const PARENT = "FEAT-1";
 
   it("defers a candidate whose declared files overlap an in-flight sibling on the same grouping branch", () => {
-    const candidate = makeFeatureIssue("c1", "AII-2", "AII", PARENT, "- Modify: `src/a.ts`");
-    const sibling = makeFeatureIssue("s1", "AII-3", "AII", PARENT, "- Modify: `src/a.ts`");
+    const candidate = featureIssueOf("c1", "AII-2", "AII", PARENT, "- Modify: `src/a.ts`");
+    const sibling = featureIssueOf("s1", "AII-3", "AII", PARENT, "- Modify: `src/a.ts`");
     const blockers = selectFileOverlapDeferrals([candidate], [sibling]);
     expect(blockers).toHaveLength(1);
     expect(blockers[0].reason).toBe("file-overlap");
@@ -390,49 +330,49 @@ describe("selectFileOverlapDeferrals", () => {
   });
 
   it("does not defer when candidate has no declared files (fail-open)", () => {
-    const candidate = makeFeatureIssue("c1", "AII-2", "AII", PARENT, "Fix the bug.");
-    const sibling = makeFeatureIssue("s1", "AII-3", "AII", PARENT, "- Modify: `src/a.ts`");
+    const candidate = featureIssueOf("c1", "AII-2", "AII", PARENT, "Fix the bug.");
+    const sibling = featureIssueOf("s1", "AII-3", "AII", PARENT, "- Modify: `src/a.ts`");
     const blockers = selectFileOverlapDeferrals([candidate], [sibling]);
     expect(blockers).toHaveLength(0);
   });
 
   it("does not defer when sibling has no declared files (fail-open)", () => {
-    const candidate = makeFeatureIssue("c1", "AII-2", "AII", PARENT, "- Modify: `src/a.ts`");
-    const sibling = makeFeatureIssue("s1", "AII-3", "AII", PARENT, "Just some prose.");
+    const candidate = featureIssueOf("c1", "AII-2", "AII", PARENT, "- Modify: `src/a.ts`");
+    const sibling = featureIssueOf("s1", "AII-3", "AII", PARENT, "Just some prose.");
     const blockers = selectFileOverlapDeferrals([candidate], [sibling]);
     expect(blockers).toHaveLength(0);
   });
 
   it("does not defer when there are no in-flight siblings", () => {
-    const candidate = makeFeatureIssue("c1", "AII-2", "AII", PARENT, "- Modify: `src/a.ts`");
+    const candidate = featureIssueOf("c1", "AII-2", "AII", PARENT, "- Modify: `src/a.ts`");
     const blockers = selectFileOverlapDeferrals([candidate], []);
     expect(blockers).toHaveLength(0);
   });
 
   it("does not defer when sibling is on a different grouping branch", () => {
-    const candidate = makeFeatureIssue("c1", "AII-2", "AII", "FEAT-1", "- Modify: `src/a.ts`");
-    const sibling = makeFeatureIssue("s1", "AII-3", "AII", "FEAT-2", "- Modify: `src/a.ts`");
+    const candidate = featureIssueOf("c1", "AII-2", "AII", "FEAT-1", "- Modify: `src/a.ts`");
+    const sibling = featureIssueOf("s1", "AII-3", "AII", "FEAT-2", "- Modify: `src/a.ts`");
     const blockers = selectFileOverlapDeferrals([candidate], [sibling]);
     expect(blockers).toHaveLength(0);
   });
 
   it("does not defer when files do not overlap", () => {
-    const candidate = makeFeatureIssue("c1", "AII-2", "AII", PARENT, "- Modify: `src/a.ts`");
-    const sibling = makeFeatureIssue("s1", "AII-3", "AII", PARENT, "- Modify: `src/b.ts`");
+    const candidate = featureIssueOf("c1", "AII-2", "AII", PARENT, "- Modify: `src/a.ts`");
+    const sibling = featureIssueOf("s1", "AII-3", "AII", PARENT, "- Modify: `src/b.ts`");
     const blockers = selectFileOverlapDeferrals([candidate], [sibling]);
     expect(blockers).toHaveLength(0);
   });
 
   it("does not defer when candidate has no featureBranchChain", () => {
-    const candidate = makeIssue("c1", "AII-2", "AII", { description: "- Modify: `src/a.ts`" });
-    const sibling = makeFeatureIssue("s1", "AII-3", "AII", PARENT, "- Modify: `src/a.ts`");
+    const candidate = issueOf("c1", "AII-2", "AII", { description: "- Modify: `src/a.ts`" });
+    const sibling = featureIssueOf("s1", "AII-3", "AII", PARENT, "- Modify: `src/a.ts`");
     const blockers = selectFileOverlapDeferrals([candidate], [sibling]);
     expect(blockers).toHaveLength(0);
   });
 
   it("detail includes sibling identifier and shared files", () => {
-    const candidate = makeFeatureIssue("c1", "AII-2", "AII", PARENT, "- Modify: `src/a.ts`\n- Modify: `src/b.ts`");
-    const sibling = makeFeatureIssue("s1", "AII-5", "AII", PARENT, "- Modify: `src/a.ts`");
+    const candidate = featureIssueOf("c1", "AII-2", "AII", PARENT, "- Modify: `src/a.ts`\n- Modify: `src/b.ts`");
+    const sibling = featureIssueOf("s1", "AII-5", "AII", PARENT, "- Modify: `src/a.ts`");
     const [blocker] = selectFileOverlapDeferrals([candidate], [sibling]);
     expect(blocker.detail).toContain("AII-5");
     expect(blocker.detail).toContain("src/a.ts");
@@ -442,7 +382,7 @@ describe("selectFileOverlapDeferrals", () => {
 describe("same-batch overlap + in-flight sourcing (AII-278)", () => {
   const chain = [{ identifier: "P-1", mode: "feature" as const }];
   const mk = (id: string, desc: string | null) =>
-    makeIssue(id, id, "T", { description: desc, featureBranchChain: chain });
+    issueOf(id, id, "T", { description: desc, featureBranchChain: chain });
 
   it("defers the second of two SAME-BATCH candidates declaring the same file", () => {
     const a = mk("C-1", "- Modify: `src/shared.ts`");
@@ -513,11 +453,11 @@ describe("selectFileOverlapDeferrals — planning block fallback", () => {
     `<!-- ai-implement-planning\nv: 1\nfiles: ${JSON.stringify(files)}\nrisk: low\n-->`;
 
   it("defers a prose-only candidate when its planning block overlaps an in-flight sibling", () => {
-    const candidate = makeFeatureIssue(
+    const candidate = featureIssueOf(
       "c1", "AII-2", "AII", PARENT,
       `Fix the widget.\n\n${planningBlock(["src/a.ts"])}`,
     );
-    const sibling = makeFeatureIssue("s1", "AII-3", "AII", PARENT, "- Modify: `src/a.ts`");
+    const sibling = featureIssueOf("s1", "AII-3", "AII", PARENT, "- Modify: `src/a.ts`");
     const blockers = selectFileOverlapDeferrals([candidate], [sibling]);
     expect(blockers).toHaveLength(1);
     expect(blockers[0].reason).toBe("file-overlap");
@@ -525,14 +465,14 @@ describe("selectFileOverlapDeferrals — planning block fallback", () => {
   });
 
   it("fails open when the candidate has no declared files and no planning block", () => {
-    const candidate = makeFeatureIssue("c1", "AII-2", "AII", PARENT, "Prose only.");
-    const sibling = makeFeatureIssue("s1", "AII-3", "AII", PARENT, "- Modify: `src/a.ts`");
+    const candidate = featureIssueOf("c1", "AII-2", "AII", PARENT, "Prose only.");
+    const sibling = featureIssueOf("s1", "AII-3", "AII", PARENT, "- Modify: `src/a.ts`");
     expect(selectFileOverlapDeferrals([candidate], [sibling])).toHaveLength(0);
   });
 
   it("defers when the sibling uses only a planning block and files overlap", () => {
-    const candidate = makeFeatureIssue("c1", "AII-2", "AII", PARENT, "- Modify: `src/a.ts`");
-    const sibling = makeFeatureIssue(
+    const candidate = featureIssueOf("c1", "AII-2", "AII", PARENT, "- Modify: `src/a.ts`");
+    const sibling = featureIssueOf(
       "s1", "AII-3", "AII", PARENT,
       `Fix stuff.\n\n${planningBlock(["src/a.ts"])}`,
     );
@@ -554,8 +494,8 @@ describe("selectFileOverlapDeferrals — planning context sourcing (AII-388)", (
   it("defers a prose-only candidate whose planning context (not description) contains a block overlapping a sibling", () => {
     // The candidate description has NO planning block and NO file bullets — exactly
     // as it arrives from the tracker in production after a planning run.
-    const candidate = makeFeatureIssue("c1", "AII-2", "AII", PARENT, "Prose only. No files.");
-    const sibling = makeFeatureIssue("s1", "AII-3", "AII", PARENT, "- Modify: `src/a.ts`");
+    const candidate = featureIssueOf("c1", "AII-2", "AII", PARENT, "Prose only. No files.");
+    const sibling = featureIssueOf("s1", "AII-3", "AII", PARENT, "- Modify: `src/a.ts`");
     const planningContexts = new Map([["c1", planningContextWithBlock(["src/a.ts"])]]);
     const blockers = selectFileOverlapDeferrals([candidate], [sibling], planningContexts);
     expect(blockers).toHaveLength(1);
@@ -566,8 +506,8 @@ describe("selectFileOverlapDeferrals — planning context sourcing (AII-388)", (
   });
 
   it("defers when an in-flight sibling's planning context declares the overlapping file", () => {
-    const candidate = makeFeatureIssue("c1", "AII-2", "AII", PARENT, "- Modify: `src/a.ts`");
-    const sibling = makeFeatureIssue("s1", "AII-3", "AII", PARENT, "Prose only.");
+    const candidate = featureIssueOf("c1", "AII-2", "AII", PARENT, "- Modify: `src/a.ts`");
+    const sibling = featureIssueOf("s1", "AII-3", "AII", PARENT, "Prose only.");
     const planningContexts = new Map([["s1", planningContextWithBlock(["src/a.ts"])]]);
     const blockers = selectFileOverlapDeferrals([candidate], [sibling], planningContexts);
     expect(blockers).toHaveLength(1);
@@ -576,8 +516,8 @@ describe("selectFileOverlapDeferrals — planning context sourcing (AII-388)", (
   });
 
   it("fails open when the planning context has no block (no deferral, no throw)", () => {
-    const candidate = makeFeatureIssue("c1", "AII-2", "AII", PARENT, "Prose only.");
-    const sibling = makeFeatureIssue("s1", "AII-3", "AII", PARENT, "- Modify: `src/a.ts`");
+    const candidate = featureIssueOf("c1", "AII-2", "AII", PARENT, "Prose only.");
+    const sibling = featureIssueOf("s1", "AII-3", "AII", PARENT, "- Modify: `src/a.ts`");
     const planningContexts = new Map([["c1", "## 🗺 AI Planning: Implementation Map\n\n(no machine block)"]]);
     expect(selectFileOverlapDeferrals([candidate], [sibling], planningContexts)).toHaveLength(0);
   });
@@ -585,8 +525,8 @@ describe("selectFileOverlapDeferrals — planning context sourcing (AII-388)", (
   it("description verb bullets take precedence over planning context block", () => {
     // Candidate has description bullets for src/b.ts only; planning block says src/a.ts.
     // Sibling touches src/a.ts. Candidate should NOT defer — the description bullets win.
-    const candidate = makeFeatureIssue("c1", "AII-2", "AII", PARENT, "- Modify: `src/b.ts`");
-    const sibling = makeFeatureIssue("s1", "AII-3", "AII", PARENT, "- Modify: `src/a.ts`");
+    const candidate = featureIssueOf("c1", "AII-2", "AII", PARENT, "- Modify: `src/b.ts`");
+    const sibling = featureIssueOf("s1", "AII-3", "AII", PARENT, "- Modify: `src/a.ts`");
     const planningContexts = new Map([["c1", planningContextWithBlock(["src/a.ts"])]]);
     expect(selectFileOverlapDeferrals([candidate], [sibling], planningContexts)).toHaveLength(0);
   });
@@ -594,8 +534,8 @@ describe("selectFileOverlapDeferrals — planning context sourcing (AII-388)", (
   it("defers a null-description candidate when its planning context block overlaps a sibling (Gap 1 fix)", () => {
     // Pre-fix: || !description short-circuited before the planning-context loop, returning
     // empty — the very case this feature exists for.
-    const candidate = makeFeatureIssue("c1", "AII-2", "AII", PARENT, null);
-    const sibling = makeFeatureIssue("s1", "AII-3", "AII", PARENT, "- Modify: `src/a.ts`");
+    const candidate = featureIssueOf("c1", "AII-2", "AII", PARENT, null);
+    const sibling = featureIssueOf("s1", "AII-3", "AII", PARENT, "- Modify: `src/a.ts`");
     const planningContexts = new Map([["c1", planningContextWithBlock(["src/a.ts"])]]);
     const blockers = selectFileOverlapDeferrals([candidate], [sibling], planningContexts);
     expect(blockers).toHaveLength(1);
@@ -603,8 +543,8 @@ describe("selectFileOverlapDeferrals — planning context sourcing (AII-388)", (
   });
 
   it("defers an empty-description candidate when its planning context block overlaps a sibling (Gap 1 fix)", () => {
-    const candidate = makeFeatureIssue("c1", "AII-2", "AII", PARENT, "");
-    const sibling = makeFeatureIssue("s1", "AII-3", "AII", PARENT, "- Modify: `src/a.ts`");
+    const candidate = featureIssueOf("c1", "AII-2", "AII", PARENT, "");
+    const sibling = featureIssueOf("s1", "AII-3", "AII", PARENT, "- Modify: `src/a.ts`");
     const planningContexts = new Map([["c1", planningContextWithBlock(["src/a.ts"])]]);
     const blockers = selectFileOverlapDeferrals([candidate], [sibling], planningContexts);
     expect(blockers).toHaveLength(1);
@@ -617,8 +557,8 @@ describe("selectFileOverlapDeferrals — planning context sourcing (AII-388)", (
     //          fetched planning context for null-description issues (i.description !== null guard).
     // Round 2: that guard is removed; this test drives the full path — filter → context map →
     //          selectFileOverlapDeferrals — to catch any future regression at any layer.
-    const candidate = makeFeatureIssue("c1", "AII-2", "AII", PARENT, null);
-    const sibling = makeFeatureIssue("s1", "AII-3", "AII", PARENT, "- Modify: `src/a.ts`");
+    const candidate = featureIssueOf("c1", "AII-2", "AII", PARENT, null);
+    const sibling = featureIssueOf("s1", "AII-3", "AII", PARENT, "- Modify: `src/a.ts`");
 
     // The shared predicate from poll-selection.ts — drift at either call site fails this test.
     const issuesNeedingContext = [candidate, sibling].filter(needsPlanningContextFetch);
@@ -643,11 +583,11 @@ describe("shared seen-candidates cache (rememberCandidates / resolveInFlightSibl
   it("resolves an in-flight id remembered in a prior cycle; unknown ids fail open", () => {
     resetSeenCandidates();
     const chain = [{ identifier: "P-1", mode: "feature" as const }];
-    const sib = makeIssue("in-flight-1", "C-9", "T", { description: "- Modify: `src/shared.ts`", featureBranchChain: chain });
+    const sib = issueOf("in-flight-1", "C-9", "T", { description: "- Modify: `src/shared.ts`", featureBranchChain: chain });
     rememberCandidates([sib]);
     expect(resolveInFlightSiblings(["in-flight-1", "never-seen"])).toEqual([sib]);
     // and the guard actually defers against the resolved sibling
-    const cand = makeIssue("cand-1", "C-10", "T", { description: "- Modify: `src/shared.ts`", featureBranchChain: chain });
+    const cand = issueOf("cand-1", "C-10", "T", { description: "- Modify: `src/shared.ts`", featureBranchChain: chain });
     const d = selectFileOverlapDeferrals([cand], resolveInFlightSiblings(["in-flight-1"]));
     expect(d).toHaveLength(1);
     resetSeenCandidates();
@@ -660,8 +600,8 @@ describe("shared seen-candidates cache (rememberCandidates / resolveInFlightSibl
 // predicate that selectFileOverlapDeferrals itself uses for groupingBranchOf.
 describe("planning-context fetch filter — grouping-branch guard (AII-390)", () => {
   it("excludes non-feature-tree issues from the fetch filter", () => {
-    const nonFeature = makeIssue("i1", "AII-1", "AII", { description: "Prose only." });
-    const featureIssue = makeFeatureIssue("i2", "AII-2", "AII", "FEAT-1", "Prose only.");
+    const nonFeature = issueOf("i1", "AII-1", "AII", { description: "Prose only." });
+    const featureIssue = featureIssueOf("i2", "AII-2", "AII", "FEAT-1", "Prose only.");
 
     const needingContext = [nonFeature, featureIssue].filter(needsPlanningContextFetch);
 
@@ -670,8 +610,8 @@ describe("planning-context fetch filter — grouping-branch guard (AII-390)", ()
   });
 
   it("excludes feature-tree issues whose description already has file bullets", () => {
-    const withBullets = makeFeatureIssue("i1", "AII-1", "AII", "FEAT-1", "- Modify: `src/a.ts`");
-    const withoutBullets = makeFeatureIssue("i2", "AII-2", "AII", "FEAT-1", "Prose only.");
+    const withBullets = featureIssueOf("i1", "AII-1", "AII", "FEAT-1", "- Modify: `src/a.ts`");
+    const withoutBullets = featureIssueOf("i2", "AII-2", "AII", "FEAT-1", "Prose only.");
 
     const needingContext = [withBullets, withoutBullets].filter(needsPlanningContextFetch);
 
@@ -740,33 +680,17 @@ describe("planning context cache (AII-390)", () => {
 // rather than the tracker-label snapshot, by exercising both against a real acquired
 // reservation. The tracker-label count remains available as a diagnostic only.
 describe("selectIssuesToDispatch — sized from DB-backed admission reservations, not tracker-label counts", () => {
-  let dbPath: string;
-  let dedup: typeof DedupModule;
   let gate: typeof GateModule;
   let admission: typeof AdmissionModule;
-  let breaker: typeof BreakerModule;
 
   beforeEach(async () => {
-    vi.resetModules();
-    dbPath = path.join(
-      os.tmpdir(),
-      `poll-selection-admission-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-    );
-    process.env.DEDUP_DB_PATH = dbPath;
-    dedup = await import("../dedup.js");
-    gate = await import("../dispatch-gate.js");
-    admission = await import("../dispatch-admission.js");
-    breaker = await import("../dispatch-breaker.js");
-    breaker.initDispatchBreakerTable();
-  });
-
-  afterEach(() => {
-    dedup.closeDb();
-    try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+    ({ gate, admission } = (
+      await testDb({ modules: { gate: () => import("../dispatch-gate.js"), admission: () => import("../dispatch-admission.js") } })
+    ).modules);
   });
 
   it("a live reservation excludes a candidate even when the tracker-label snapshot reports the team idle", () => {
-    const mapping = makeMapping(1);
+    const mapping = mappingWithCap(1);
     const teamRepoMap = { AII: mapping };
 
     const held = gate.acquireDispatch({
@@ -786,7 +710,7 @@ describe("selectIssuesToDispatch — sized from DB-backed admission reservations
     const admissionCounts = { AII: admission.count("AII") };
     expect(admissionCounts.AII).toBe(1);
 
-    const candidate = makeIssue("AII-2", "AII-2", "AII");
+    const candidate = issueOf("AII-2", "AII-2", "AII");
     const selectedUsingStaleTracker = selectIssuesToDispatch([candidate], teamRepoMap, staleTrackerCounts, () => false);
     const selectedUsingAdmission = selectIssuesToDispatch([candidate], teamRepoMap, admissionCounts, () => false);
 
@@ -795,7 +719,7 @@ describe("selectIssuesToDispatch — sized from DB-backed admission reservations
   });
 
   it("releasing a reservation frees the DB-backed count for the next selection", () => {
-    const mapping = makeMapping(1);
+    const mapping = mappingWithCap(1);
     const teamRepoMap = { AII: mapping };
 
     const held = gate.acquireDispatch({
@@ -810,14 +734,17 @@ describe("selectIssuesToDispatch — sized from DB-backed admission reservations
     expect(held.ok).toBe(true);
     if (held.ok) held.release("finalized");
 
-    const candidate = makeIssue("AII-3", "AII-3", "AII");
+    const candidate = issueOf("AII-3", "AII-3", "AII");
     const selected = selectIssuesToDispatch([candidate], teamRepoMap, { AII: admission.count("AII") }, () => false);
     expect(selected).toEqual([candidate]);
   });
 });
 
 describe("tracker-scoped mapping match", () => {
-  const jiraEng: RepoMapping = { ...makeMapping(), ticketingProvider: "jira", ticketingConfig: { kind: "jira", jql: "project = ENG", repoFieldValue: "org/repo" } as RepoMapping["ticketingConfig"] };
+  const jiraEng = makeMapping({
+    ticketingProvider: "jira",
+    ticketingConfig: { kind: "jira", jql: "project = ENG", repoFieldValue: "test-org/test-repo" },
+  });
   const mappings = { ENG: jiraEng, APP: makeMapping() };
   const snap = (over: Partial<AIImplementSnapshot> = {}): AIImplementSnapshot => ({
     needsPlanning: [],
@@ -834,8 +761,8 @@ describe("tracker-scoped mapping match", () => {
   });
 
   it("drops a Linear issue that shares a key with a Jira mapping and reports it as foreign", () => {
-    const foreignReady = makeIssue("1", "ENG-1", "ENG");
-    const foreignPlan = makeIssue("2", "ENG-2", "ENG");
+    const foreignReady = issueOf("1", "ENG-1", "ENG");
+    const foreignPlan = issueOf("2", "ENG-2", "ENG");
     const { snapshot, foreign } = mergeProviderSnapshots(
       [{ providerId: "linear", snapshot: snap({ readyForImplementation: [foreignReady], needsPlanning: [foreignPlan] }) }],
       mappings,
@@ -849,8 +776,8 @@ describe("tracker-scoped mapping match", () => {
   });
 
   it("keeps the Jira mapping's own issues and unmapped keys", () => {
-    const own = makeIssue("1", "ENG-1", "ENG");
-    const unmapped = makeIssue("2", "UNK-1", "UNK");
+    const own = issueOf("1", "ENG-1", "ENG");
+    const unmapped = issueOf("2", "UNK-1", "UNK");
     const { snapshot, foreign } = mergeProviderSnapshots(
       [
         { providerId: "jira", snapshot: snap({ readyForImplementation: [own] }) },
@@ -886,8 +813,8 @@ describe("tracker-scoped mapping match", () => {
   });
 
   it("leaves a single-tracker snapshot unchanged", () => {
-    const a = makeIssue("1", "APP-1", "APP");
-    const b = makeIssue("2", "APP-2", "APP");
+    const a = issueOf("1", "APP-1", "APP");
+    const b = issueOf("2", "APP-2", "APP");
     const { snapshot, foreign } = mergeProviderSnapshots(
       [
         { providerId: "linear", snapshot: snap({ readyForImplementation: [a], inProgressCountsByScope: { APP: 1 } }) },
@@ -905,7 +832,7 @@ describe("tracker-scoped mapping match", () => {
   });
 
   it("selectForeignTrackerBlockers emits one no-mapping blocker per foreign issue", () => {
-    const issue = makeIssue("1", "ENG-1", "ENG");
+    const issue = issueOf("1", "ENG-1", "ENG");
     expect(selectForeignTrackerBlockers([{ issue, providerId: "linear", mappingProvider: "jira" }])).toEqual([
       {
         issueId: "1",
@@ -922,8 +849,8 @@ describe("tracker-scoped mapping match", () => {
 describe("selectBlockers parked", () => {
   it("lists a parked issue with its failure count, not also as dedup or concurrency", () => {
     const blockers = selectBlockers(
-      [makeIssue("1", "APP-1", "APP")],
-      { APP: makeMapping(1) },
+      [issueOf("1", "APP-1", "APP")],
+      { APP: mappingWithCap(1) },
       { APP: 1 },
       () => true,
       () => ({ failures: 3 }),

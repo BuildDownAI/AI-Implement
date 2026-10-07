@@ -1,16 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
-import type * as DedupModule from "../dedup.js";
 import type * as LogModule from "../log.js";
-import type * as BreakerModule from "../dispatch-breaker.js";
 import type * as QueueModule from "../comment-gapfill-queue.js";
 import type * as RunnerTokensModule from "../runner-tokens.js";
 import type * as RunnerCallbackModule from "../runner-callback.js";
 import type * as DrainModule from "../comment-gapfill-drain.js";
 import type * as LocalDockerModule from "../local-docker.js";
 import type { RepoMapping } from "../config.js";
+import { makeMapping } from "./helpers/builders.js";
+import { testDb } from "./helpers/test-db.js";
+import { testDir } from "./helpers/test-dir.js";
 
 const SECRET = "filesystem-flow-secret";
 
@@ -26,32 +26,27 @@ vi.mock("../local-docker.js", async (importOriginal) => {
   };
 });
 
-let dbPath: string;
 let ticketDir: string;
-let dedup: typeof DedupModule;
 let log: typeof LogModule;
-let breaker: typeof BreakerModule;
 let queue: typeof QueueModule;
 let runnerTokens: typeof RunnerTokensModule;
 let runnerCallback: typeof RunnerCallbackModule;
 let drain: typeof DrainModule;
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(os.tmpdir(), `filesystem-ticket-flow-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-  ticketDir = fs.mkdtempSync(path.join(os.tmpdir(), "filesystem-tickets-"));
-  vi.stubEnv("DEDUP_DB_PATH", dbPath);
+  ticketDir = testDir("filesystem-tickets");
   vi.stubEnv("RUNNER_MODE", "local");
-  dedup = await import("../dedup.js");
-  log = await import("../log.js");
-  breaker = await import("../dispatch-breaker.js");
-  queue = await import("../comment-gapfill-queue.js");
-  runnerTokens = await import("../runner-tokens.js");
-  runnerCallback = await import("../runner-callback.js");
-  drain = await import("../comment-gapfill-drain.js");
-  dedup.getDb();
-  log.initLogTable();
-  breaker.initDispatchBreakerTable();
+  ({ log, queue, runnerTokens, runnerCallback, drain } = (
+    await testDb({
+      modules: {
+        log: () => import("../log.js"),
+        queue: () => import("../comment-gapfill-queue.js"),
+        runnerTokens: () => import("../runner-tokens.js"),
+        runnerCallback: () => import("../runner-callback.js"),
+        drain: () => import("../comment-gapfill-drain.js"),
+      },
+    })
+  ).modules);
   localDockerMock.startLocalRunnerContainer.mockResolvedValue({
     containerId: "local-container-1",
     containerName: "ai-implement-fs-1",
@@ -59,9 +54,6 @@ beforeEach(async () => {
 });
 
 afterEach(() => {
-  dedup.closeDb();
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
-  try { fs.rmSync(ticketDir, { recursive: true, force: true }); } catch { /* ignore */ }
   vi.unstubAllEnvs();
   localDockerMock.startLocalRunnerContainer.mockReset();
   vi.restoreAllMocks();
@@ -87,52 +79,27 @@ function writeTicket(id: string, body = "Implement the local flow."): void {
   );
 }
 
-function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
-  return {
+function filesystemMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
+  return makeMapping({
     owner: "BuildDownAI",
     repo: "AI-Implement",
-    workflowFile: "claude-implement.yml",
-    defaultBranch: "testing",
-    maxInProgressAiIssues: 3,
-    executionMode: "github-actions",
-    sessionMode: "autonomous",
-    machineCpus: 2,
-    machineMemoryMb: 4096,
     planningEnabled: true,
-    planningWorkflowFile: "claude-plan.yml",
-    autoApprovePlans: true,
-    autoMerge: false,
-    extraEnv: {},
-    provider: "anthropic",
-    awsRegion: null,
     ticketingProvider: "filesystem",
     ticketingConfig: { kind: "filesystem", directory: ticketDir },
-    paused: false,
-    maxTurns: null,
-    maxIterations: null,
-    maxJobMinutes: null,
-    branchPrefix: null,
-    skillsRepo: null,
-    referenceRepos: null,
-    sensitiveAddPatterns: null,
-    sensitiveAllowPatterns: null,
-    dependencyTokenScope: null,
-    memoryProviderId: null,
     reviewers: [
       { id: "code-review", gates: true },
       { id: "branch-preview", gates: false },
     ],
-    reviewFixLifecycle: null,
     ...overrides,
-  };
+  });
 }
 
 
 describe("filesystem tickets through the local PR loop", () => {
   it("reconciles a merged filesystem PR using its recorded project when two projects share a repo", async () => {
     writeTicket("FS-303");
-    const mapping = makeMapping({ paused: true });
-    const other = makeMapping({ ticketingProvider: "linear", ticketingConfig: { kind: "linear" } });
+    const mapping = filesystemMapping({ paused: true });
+    const other = filesystemMapping({ ticketingProvider: "linear", ticketingConfig: { kind: "linear" } });
     const mappings = { OTHER: other, FS: mapping };
     const { ProviderRegistry } = await import("../providers/registry.js");
     const registry = new ProviderRegistry({}, () => mappings);
@@ -162,7 +129,7 @@ describe("filesystem tickets through the local PR loop", () => {
     const { dispatchLocalGapfill } = await import("../local-gapfill.js");
     const { DEFAULT_RETRY_POLICY } = await import("../pipeline/retry-backoff.js");
     await expect(dispatchLocalGapfill({
-      mapping: makeMapping(),
+      mapping: filesystemMapping(),
       issue: { id: "filesystem:FS:FS-1", identifier: "FS-1", title: "Iteration" },
       prNumber: 1,
       githubToken: "fake-gh-token",
@@ -178,7 +145,7 @@ describe("filesystem tickets through the local PR loop", () => {
 
   it("resolves Markdown tickets through the registry and persists runner callback results locally", async () => {
     writeTicket("FS-101", "Add callback state persistence.");
-    const mapping = makeMapping();
+    const mapping = filesystemMapping();
     const { ProviderRegistry } = await import("../providers/registry.js");
     const registry = new ProviderRegistry({}, () => ({ FS: mapping }));
     const provider = await registry.forMapping(mapping);
@@ -248,7 +215,7 @@ describe("filesystem tickets through the local PR loop", () => {
 
   it("dispatches PR comment iteration through local Docker with reviewer config and no Actions dispatch", async () => {
     const { decodeRunConfig } = await import("../run-config.js");
-    const mapping = makeMapping({
+    const mapping = filesystemMapping({
       maxTurns: 31,
       maxIterations: 4,
       branchPrefix: "local",
@@ -345,7 +312,7 @@ describe("filesystem tickets through the local PR loop", () => {
   });
 
   it("does not dispatch filesystem PR comment iteration after leaving local runner mode", async () => {
-    const mapping = makeMapping();
+    const mapping = filesystemMapping();
     queue.enqueueCommentGapfill({
       owner: "BuildDownAI",
       repo: "AI-Implement",

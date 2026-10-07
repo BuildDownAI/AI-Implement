@@ -1,6 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import type { RepoMapping } from "../config.js";
 import type * as DedupModule from "../dedup.js";
@@ -8,8 +7,10 @@ import type * as BreakerModule from "../dispatch-breaker.js";
 import type * as LifecycleModule from "../filesystem-ticket-lifecycle.js";
 import type * as LogModule from "../log.js";
 import type { FilesystemProvider } from "../providers/filesystem.js";
+import { makeMapping, makeRegistry } from "./helpers/builders.js";
+import { testDb } from "./helpers/test-db.js";
+import { testDir } from "./helpers/test-dir.js";
 
-let dbPath: string;
 let ticketDir: string;
 let mappings: Record<string, RepoMapping>;
 let dedup: typeof DedupModule;
@@ -19,68 +20,35 @@ let log: typeof LogModule;
 let provider: FilesystemProvider;
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(os.tmpdir(), `filesystem-ticket-lifecycle-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-  ticketDir = fs.mkdtempSync(path.join(os.tmpdir(), "filesystem-ticket-lifecycle-"));
-  mappings = { FS: makeMapping() };
-  vi.stubEnv("DEDUP_DB_PATH", dbPath);
+  ticketDir = testDir("filesystem-ticket-lifecycle");
+  mappings = {
+    FS: makeMapping({ ticketingProvider: "filesystem", ticketingConfig: { kind: "filesystem", directory: ticketDir } }),
+  };
   vi.doMock("../config.js", () => ({ getMappings: () => mappings }));
   vi.doMock("../runner-mode.js", () => ({ getRunnerMode: () => ({ mode: "local", source: "env" }) }));
 
-  dedup = await import("../dedup.js");
-  log = await import("../log.js");
-  breaker = await import("../dispatch-breaker.js");
-  const providerModule = await import("../providers/filesystem.js");
-  lifecycle = await import("../filesystem-ticket-lifecycle.js");
-  dedup.getDb();
+  // "none": the two mocks above have no init functions for boot's table creation to call.
+  let providerModule: typeof import("../providers/filesystem.js");
+  ({ dedup, log, breaker, providerModule, lifecycle } = (
+    await testDb({
+      tables: "none",
+      modules: {
+        dedup: () => import("../dedup.js"),
+        log: () => import("../log.js"),
+        breaker: () => import("../dispatch-breaker.js"),
+        providerModule: () => import("../providers/filesystem.js"),
+        lifecycle: () => import("../filesystem-ticket-lifecycle.js"),
+      },
+    })
+  ).modules);
   log.initLogTable();
   breaker.initDispatchBreakerTable();
   provider = new providerModule.FilesystemProvider(() => mappings);
 });
 
 afterEach(() => {
-  dedup.closeDb();
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
-  try { fs.rmSync(ticketDir, { recursive: true, force: true }); } catch { /* ignore */ }
-  vi.unstubAllEnvs();
   vi.restoreAllMocks();
 });
-
-function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
-  return {
-    owner: "BuildDownAI",
-    repo: "AI-Implement",
-    workflowFile: "claude-implement.yml",
-    defaultBranch: "main",
-    maxInProgressAiIssues: 3,
-    executionMode: "github-actions",
-    sessionMode: "autonomous",
-    machineCpus: 2,
-    machineMemoryMb: 4096,
-    planningEnabled: true,
-    planningWorkflowFile: "claude-plan.yml",
-    autoApprovePlans: true,
-    autoMerge: false,
-    extraEnv: {},
-    provider: "anthropic",
-    awsRegion: null,
-    ticketingProvider: "filesystem",
-    ticketingConfig: { kind: "filesystem", directory: ticketDir },
-    paused: false,
-    maxTurns: null,
-    maxIterations: null,
-    maxJobMinutes: null,
-    branchPrefix: null,
-    skillsRepo: null,
-    referenceRepos: null,
-    sensitiveAddPatterns: null,
-    sensitiveAllowPatterns: null,
-    dependencyTokenScope: null,
-    memoryProviderId: null,
-    reviewers: null,
-    ...overrides,
-  };
-}
 
 function issueId(identifier: string): string {
   return `filesystem:FS:${identifier}`;
@@ -119,12 +87,6 @@ function writeTicket(
 
 function rowExists(table: string, issue: string): boolean {
   return Boolean(dedup.getDb().prepare(`SELECT 1 FROM ${table} WHERE issue_id = ?`).get(issue));
-}
-
-function registryForFilesystemProvider() {
-  return {
-    forMapping: vi.fn(async () => provider),
-  };
 }
 
 describe("filesystem ticket lifecycle", () => {
@@ -181,7 +143,7 @@ describe("filesystem ticket lifecycle", () => {
     dedup.getDb().prepare("INSERT INTO stuck_attempts (issue_id, attempts, last_attempt_at) VALUES (?, 4, ?)").run(id, Date.now());
     log.updateJobStatus(log.appendLog({ issueId: id, issueIdentifier: "FS-201", teamKey: "FS", phase: "implementation" }), "failed", "failure");
 
-    await lifecycle.reconcileFilesystemFailures(registryForFilesystemProvider() as never);
+    await lifecycle.reconcileFilesystemFailures(makeRegistry({ provider }));
 
     expect(fs.existsSync(path.join(ticketDir, "failed", "FS-201.md"))).toBe(true);
     expect(fs.existsSync(path.join(ticketDir, "FS-201.md"))).toBe(false);
@@ -196,7 +158,7 @@ describe("filesystem ticket lifecycle", () => {
     writeTicket("FS-202", { status: "failed", phase: "planning" });
     log.updateJobStatus(log.appendLog({ issueId: id, issueIdentifier: "FS-202", teamKey: "FS", phase: "planning" }), "failed", "failure");
 
-    await lifecycle.reconcileFilesystemFailures(registryForFilesystemProvider() as never);
+    await lifecycle.reconcileFilesystemFailures(makeRegistry({ provider }));
 
     expect(fs.existsSync(path.join(ticketDir, "failed", "FS-202.md"))).toBe(true);
     expect(fs.existsSync(path.join(ticketDir, "FS-202.md"))).toBe(false);
@@ -211,7 +173,7 @@ describe("filesystem ticket lifecycle", () => {
     writeTicket("FS-203", { status: "failed", phase: "implementation" });
     log.updateJobStatus(log.appendLog({ issueId: id, issueIdentifier: "FS-203", teamKey: "FS", phase: "implementation" }), "failed", "failure");
 
-    await lifecycle.reconcileFilesystemFailures(registryForFilesystemProvider() as never);
+    await lifecycle.reconcileFilesystemFailures(makeRegistry({ provider }));
 
     expect(fs.existsSync(path.join(ticketDir, "failed", "FS-203.md"))).toBe(true);
     expect(fs.existsSync(path.join(ticketDir, "FS-203.md"))).toBe(false);
@@ -224,7 +186,7 @@ describe("filesystem ticket lifecycle", () => {
     dedup.getDb().prepare("INSERT INTO stuck_attempts (issue_id, attempts, last_attempt_at) VALUES (?, 4, ?)").run(id, Date.now());
     log.updateJobStatus(log.appendLog({ issueId: id, issueIdentifier: "FS-204", teamKey: "FS", phase: "planning" }), "timed_out", "failure");
 
-    await lifecycle.reconcileFilesystemFailures(registryForFilesystemProvider() as never);
+    await lifecycle.reconcileFilesystemFailures(makeRegistry({ provider }));
 
     expect(fs.existsSync(path.join(ticketDir, "failed", "FS-204.md"))).toBe(true);
     await expect(provider.readIssueDetails(id)).resolves.toMatchObject({
@@ -254,7 +216,7 @@ describe("filesystem ticket lifecycle", () => {
     log.updateJobStatus(log.appendLog({ issueId: withPr, issueIdentifier: "FS-302", teamKey: "FS", phase: "implementation" }), "failed", "failure");
     log.appendLog({ issueId: inFlight, issueIdentifier: "FS-303", teamKey: "FS", phase: "implementation", status: "running" });
 
-    await lifecycle.reconcileFilesystemFailures(registryForFilesystemProvider() as never);
+    await lifecycle.reconcileFilesystemFailures(makeRegistry({ provider }));
 
     for (const identifier of ["FS-301", "FS-302", "FS-303"]) {
       expect(fs.existsSync(path.join(ticketDir, `${identifier}.md`))).toBe(true);
