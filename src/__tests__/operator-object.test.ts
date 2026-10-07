@@ -5,36 +5,39 @@
 // real container can only exercise with an actual 30-second wait. Concurrency and the
 // alwaysReplay equivalence are covered against a real Restate container in
 // operator-object.restate.test.ts, per the operator rule in docs/restate.md.
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // Mocked so rotate()'s allowlist re-check and auth-event emission don't need the
 // access_entries table or a real event sink for every test in this file — most tests
 // exercise paths before either is reached. Individual tests override the return value.
+// The table initializers are stubbed so testDb can still create every other boot table.
 vi.mock("../access-entries.js", () => ({
   getEffectiveAllowlist: vi.fn(),
   matchAccessEntry: vi.fn(),
+  initAccessEntriesTable: vi.fn(),
 }));
 vi.mock("../mcp-auth-events.js", () => ({
   recordAuthEvent: vi.fn(),
   resolveClientPath: vi.fn(() => "unknown"),
+  initAuthEventsTable: vi.fn(),
 }));
 
 import crypto from "node:crypto";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import type { ObjectContext } from "@restatedev/restate-sdk";
-import { decideRefresh, GRACE_MS, operatorObject, RestateRefreshAuthority, type FamilyState } from "../restate/operator-object.js";
-import { initMcpOAuthTables } from "../mcp-oauth.js";
-import { closeDb, getDb } from "../dedup.js";
-import { getEffectiveAllowlist, matchAccessEntry, type AccessEntry } from "../access-entries.js";
-import { recordAuthEvent } from "../mcp-auth-events.js";
+import { decideRefresh, GRACE_MS, operatorObject, type FamilyState } from "../restate/operator-object.js";
+import type * as OperatorObjectModule from "../restate/operator-object.js";
+import type * as AccessEntriesModule from "../access-entries.js";
+import type * as AuthEventsModule from "../mcp-auth-events.js";
+import type * as DedupModule from "../dedup.js";
+import type * as DeployHoldModule from "../deploy-hold.js";
+import { fakeFetch, hangUntilAborted, type Reply, type Routes } from "./helpers/fake-fetch.js";
+import { testDb } from "./helpers/test-db.js";
 
 // An arbitrary high loopback port nothing listens on: connections fail fast with
 // ECONNREFUSED rather than hanging, which is what "unroutable ingress" needs to test.
 const UNROUTABLE_INGRESS = "http://127.0.0.1:59999";
 
-const ADMITTING_ENTRY: AccessEntry = {
+const ADMITTING_ENTRY: AccessEntriesModule.AccessEntry = {
   kind: "address",
   value: "ada@eudoxus.ai",
   role: "user",
@@ -44,12 +47,30 @@ const ADMITTING_ENTRY: AccessEntry = {
   addedBy: null,
 };
 
-let dbPath: string;
+// Imported per test after the registry reset, so each reads this test's database and each test
+// configures the mocked modules the authority actually imports.
+let RestateRefreshAuthority: typeof OperatorObjectModule.RestateRefreshAuthority;
+let getEffectiveAllowlist: typeof AccessEntriesModule.getEffectiveAllowlist;
+let matchAccessEntry: typeof AccessEntriesModule.matchAccessEntry;
+let recordAuthEvent: typeof AuthEventsModule.recordAuthEvent;
+let getDb: typeof DedupModule.getDb;
+let deployHold: typeof DeployHoldModule;
 
-beforeEach(() => {
-  dbPath = path.join(os.tmpdir(), `operator-object-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-  process.env.DEDUP_DB_PATH = dbPath;
-  initMcpOAuthTables();
+beforeEach(async () => {
+  const { modules } = await testDb({
+    modules: {
+      operator: () => import("../restate/operator-object.js"),
+      accessEntries: () => import("../access-entries.js"),
+      authEvents: () => import("../mcp-auth-events.js"),
+      dedup: () => import("../dedup.js"),
+      deployHold: () => import("../deploy-hold.js"),
+    },
+  });
+  ({ RestateRefreshAuthority } = modules.operator);
+  ({ getEffectiveAllowlist, matchAccessEntry } = modules.accessEntries);
+  ({ recordAuthEvent } = modules.authEvents);
+  ({ getDb } = modules.dedup);
+  deployHold = modules.deployHold;
 
   // Default: the allowlist admits whoever is presented. Tests of the allowlist re-check
   // itself override this with mockReturnValueOnce.
@@ -58,36 +79,15 @@ beforeEach(() => {
   vi.mocked(recordAuthEvent).mockClear();
 });
 
-afterEach(() => {
-  closeDb();
-  try {
-    fs.unlinkSync(dbPath);
-  } catch {
-    /* ignore */
-  }
-});
-
-function authorityWithFetch(fetchImpl: typeof fetch, accessTokenTtlMs = 60 * 60 * 1000): RestateRefreshAuthority {
+function authorityWithFetch(fetchImpl: typeof fetch, accessTokenTtlMs = 60 * 60 * 1000): InstanceType<typeof RestateRefreshAuthority> {
   return new RestateRefreshAuthority({ ingressBaseUrl: UNROUTABLE_INGRESS, fetchImpl, accessTokenTtlMs });
 }
 
-/**
- * A fetchImpl that never settles unless its request's AbortSignal fires — the only way a
- * fixture can prove a fetch is actually bounded by `signal` rather than merely accepting an
- * ignored option (AII-728). Rejects with the signal's abort reason once the signal fires.
- */
-function hangingFetch(): typeof fetch {
-  return vi.fn((_url: unknown, init?: RequestInit) => {
-    return new Promise((_resolve, reject) => {
-      const signal = init?.signal;
-      if (!signal) return; // no signal given: hangs forever, same as before AII-728
-      if (signal.aborted) {
-        reject(signal.reason);
-        return;
-      }
-      signal.addEventListener("abort", () => reject(signal.reason), { once: true });
-    });
-  }) as unknown as typeof fetch;
+/** The Operator object's ingress for client `c1`, keyed by handler name. */
+function ingress(handlers: Partial<Record<"identity" | "refresh" | "revoke" | "issue" | "describe", Reply>>) {
+  const routes: Routes = {};
+  for (const [handler, reply] of Object.entries(handlers)) routes[`POST /Operator/c1/${handler}`] = reply;
+  return fakeFetch(routes);
 }
 
 /**
@@ -243,32 +243,30 @@ describe("refresh (real handler, via a fake ObjectContext) — stale-hash clearA
 
 describe("RestateRefreshAuthority — unavailable against an unroutable ingress", () => {
   it("does not invoke the old endpoint after drain admission closes", async () => {
-    const fetchImpl = vi.fn() as unknown as typeof fetch;
+    const sidecar = ingress({});
     const authority = new RestateRefreshAuthority({
       ingressBaseUrl: UNROUTABLE_INGRESS,
-      fetchImpl,
+      fetchImpl: sidecar.fetch,
       accessTokenTtlMs: 3600_000,
       permitsExternalCall: () => false,
     });
     expect(await authority.describe("c1")).toEqual({ status: "unavailable" });
-    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(sidecar.calls).toHaveLength(0);
   });
 
   it("uses the deploy hold as the default admission barrier", async () => {
-    const { setDeployHold, clearDeployHold } = await import("../deploy-hold.js");
-    const { initSettingsTable } = await import("../runner-mode.js");
-    initSettingsTable();
-    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ expiresAt: null }), { status: 200 }));
-    const authority = new RestateRefreshAuthority({ ingressBaseUrl: UNROUTABLE_INGRESS, fetchImpl, accessTokenTtlMs: 3600_000 });
+    const { setDeployHold, clearDeployHold } = deployHold;
+    const sidecar = ingress({ describe: { json: { expiresAt: null } } });
+    const authority = new RestateRefreshAuthority({ ingressBaseUrl: UNROUTABLE_INGRESS, fetchImpl: sidecar.fetch, accessTokenTtlMs: 3600_000 });
     setDeployHold();
     try {
       expect(await authority.describe("c1")).toEqual({ status: "unavailable" });
-      expect(fetchImpl).not.toHaveBeenCalled();
+      expect(sidecar.calls).toHaveLength(0);
     } finally {
       clearDeployHold();
     }
     expect(await authority.describe("c1")).toEqual({ status: "ok", expiresAt: null });
-    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(sidecar.calls).toHaveLength(1);
   });
   it("rotate() resolves to unavailable (cause restate) rather than throwing", async () => {
     const authority = new RestateRefreshAuthority({ ingressBaseUrl: UNROUTABLE_INGRESS, accessTokenTtlMs: 3600_000 });
@@ -292,22 +290,19 @@ describe("RestateRefreshAuthority — unavailable against an unroutable ingress"
 });
 
 /** The `identity` handler's response for an admitted, already-issued client. */
-function identityOkResponse(): Response {
-  return new Response(
-    JSON.stringify({ email: "ada@eudoxus.ai", sub: "sub-1", provider: "google", expiresAt: Date.now() + 1000 }),
-    { status: 200 },
-  );
-}
+const identityOk: Reply = () => ({
+  json: { email: "ada@eudoxus.ai", sub: "sub-1", provider: "google", expiresAt: Date.now() + 1000 },
+});
 
-function isIdentityUrl(url: string): boolean {
-  return url === `${UNROUTABLE_INGRESS}/Operator/c1/identity`;
-}
+const refreshConnectionError: Reply = () => {
+  throw new Error("connect ECONNREFUSED 127.0.0.1:59999");
+};
 
 describe("RestateRefreshAuthority — invoke() bounded at 10s (AII-728)", () => {
   it("a never-resolving identity call degrades to unavailable (cause restate) once the bound fires", async () => {
     const timeoutSpy = stubAbortTimeout(10_000);
     try {
-      const authority = authorityWithFetch(hangingFetch());
+      const authority = authorityWithFetch(ingress({ identity: hangUntilAborted }).fetch);
       await expect(authority.rotate({ refreshToken: "x", clientId: "c1" })).resolves.toEqual({
         status: "unavailable",
         cause: "restate",
@@ -320,11 +315,7 @@ describe("RestateRefreshAuthority — invoke() bounded at 10s (AII-728)", () => 
   it("a never-resolving refresh call (after a successful identity read) degrades to unavailable once the bound fires", async () => {
     const timeoutSpy = stubAbortTimeout(10_000);
     try {
-      const fetchImpl = vi.fn(async (url: string, init?: RequestInit) => {
-        if (isIdentityUrl(url)) return identityOkResponse();
-        return hangingFetch()(url, init);
-      });
-      const authority = authorityWithFetch(fetchImpl as unknown as typeof fetch);
+      const authority = authorityWithFetch(ingress({ identity: identityOk, refresh: hangUntilAborted }).fetch);
       await expect(authority.rotate({ refreshToken: "x", clientId: "c1" })).resolves.toEqual({
         status: "unavailable",
         cause: "restate",
@@ -337,21 +328,18 @@ describe("RestateRefreshAuthority — invoke() bounded at 10s (AII-728)", () => 
 
 describe("RestateRefreshAuthority — outcome mapping", () => {
   it("maps a 5xx ingress response on the identity read to unavailable (cause restate), never reaching refresh", async () => {
-    const fetchImpl = vi.fn(async () => new Response("", { status: 503 }));
-    const authority = authorityWithFetch(fetchImpl as unknown as typeof fetch);
+    const sidecar = ingress({ identity: { status: 503 } });
+    const authority = authorityWithFetch(sidecar.fetch);
     await expect(authority.rotate({ refreshToken: "x", clientId: "c1" })).resolves.toEqual({
       status: "unavailable",
       cause: "restate",
     });
-    expect(fetchImpl).toHaveBeenCalledTimes(1);
-    expect(fetchImpl).toHaveBeenCalledWith(`${UNROUTABLE_INGRESS}/Operator/c1/identity`, expect.anything());
+    expect(sidecar.calls).toHaveLength(1);
+    expect(sidecar.calls[0]!.url.href).toBe(`${UNROUTABLE_INGRESS}/Operator/c1/identity`);
   });
 
   it("maps a thrown connection error to unavailable (cause restate), never rejects", async () => {
-    const fetchImpl = vi.fn(async () => {
-      throw new Error("connect ECONNREFUSED 127.0.0.1:59999");
-    });
-    const authority = authorityWithFetch(fetchImpl as unknown as typeof fetch);
+    const authority = authorityWithFetch(ingress({ identity: refreshConnectionError }).fetch);
     await expect(authority.rotate({ refreshToken: "x", clientId: "c1" })).resolves.toEqual({
       status: "unavailable",
       cause: "restate",
@@ -359,8 +347,7 @@ describe("RestateRefreshAuthority — outcome mapping", () => {
   });
 
   it("maps a non-JSON 200 body on the identity read to unavailable rather than throwing", async () => {
-    const fetchImpl = vi.fn(async () => new Response("not json", { status: 200 }));
-    const authority = authorityWithFetch(fetchImpl as unknown as typeof fetch);
+    const authority = authorityWithFetch(ingress({ identity: { text: "not json" } }).fetch);
     await expect(authority.rotate({ refreshToken: "x", clientId: "c1" })).resolves.toEqual({
       status: "unavailable",
       cause: "restate",
@@ -368,49 +355,37 @@ describe("RestateRefreshAuthority — outcome mapping", () => {
   });
 
   it("maps a replay result from refresh straight through, after a successful identity read", async () => {
-    const fetchImpl = vi.fn(async (url: string) => {
-      if (isIdentityUrl(url)) return identityOkResponse();
-      return new Response(JSON.stringify({ status: "replay" }), { status: 200 });
-    });
-    const authority = authorityWithFetch(fetchImpl as unknown as typeof fetch);
+    const sidecar = ingress({ identity: identityOk, refresh: { json: { status: "replay" } } });
+    const authority = authorityWithFetch(sidecar.fetch);
     await expect(authority.rotate({ refreshToken: "x", clientId: "c1" })).resolves.toEqual({ status: "replay" });
-    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(sidecar.calls).toHaveLength(2);
   });
 
   it("maps an expired result from refresh straight through, after a successful identity read", async () => {
-    const fetchImpl = vi.fn(async (url: string) => {
-      if (isIdentityUrl(url)) return identityOkResponse();
-      return new Response(JSON.stringify({ status: "expired" }), { status: 200 });
-    });
-    const authority = authorityWithFetch(fetchImpl as unknown as typeof fetch);
+    const authority = authorityWithFetch(ingress({ identity: identityOk, refresh: { json: { status: "expired" } } }).fetch);
     await expect(authority.rotate({ refreshToken: "x", clientId: "c1" })).resolves.toEqual({ status: "expired" });
   });
 
   it("maps a successful rotation to ok and mints the access token in SQLite, reading identity then refresh, in order", async () => {
-    const callOrder: string[] = [];
-    const fetchImpl = vi.fn(async (url: string, init: RequestInit) => {
-      if (isIdentityUrl(url)) {
-        callOrder.push("identity");
-        return identityOkResponse();
-      }
-      callOrder.push("refresh");
-      expect(url).toBe(`${UNROUTABLE_INGRESS}/Operator/c1/refresh`);
-      expect(JSON.parse(init.body as string)).toEqual({
-        presentedHash: crypto.createHash("sha256").update("old-raw-token").digest("hex"),
-      });
-      return new Response(
-        JSON.stringify({
-          status: "ok",
-          token: "new-raw-token",
-          expiresAt: Date.now() + 1000,
-          email: "ada@eudoxus.ai",
-          sub: "sub-1",
-          provider: "google",
-        }),
-        { status: 200 },
-      );
+    const sidecar = ingress({
+      identity: identityOk,
+      refresh: (call) => {
+        expect(JSON.parse(call.body)).toEqual({
+          presentedHash: crypto.createHash("sha256").update("old-raw-token").digest("hex"),
+        });
+        return {
+          json: {
+            status: "ok",
+            token: "new-raw-token",
+            expiresAt: Date.now() + 1000,
+            email: "ada@eudoxus.ai",
+            sub: "sub-1",
+            provider: "google",
+          },
+        };
+      },
     });
-    const authority = authorityWithFetch(fetchImpl as unknown as typeof fetch, 3600_000);
+    const authority = authorityWithFetch(sidecar.fetch, 3600_000);
     const outcome = await authority.rotate({ refreshToken: "old-raw-token", clientId: "c1" });
     expect(outcome).toEqual({
       status: "ok",
@@ -418,7 +393,7 @@ describe("RestateRefreshAuthority — outcome mapping", () => {
       refreshToken: "new-raw-token",
       expiresInSeconds: 3600,
     });
-    expect(callOrder).toEqual(["identity", "refresh"]);
+    expect(sidecar.calls.map((call) => call.path)).toEqual(["/Operator/c1/identity", "/Operator/c1/refresh"]);
     if (outcome.status === "ok") {
       const row = getDb().prepare("SELECT email, sub, provider, client_id FROM mcp_tokens WHERE token = ?").get(outcome.accessToken);
       expect(row).toEqual({ email: "ada@eudoxus.ai", sub: "sub-1", provider: "google", client_id: "c1" });
@@ -426,15 +401,11 @@ describe("RestateRefreshAuthority — outcome mapping", () => {
   });
 
   it("issue() sends only the hash of the newly minted refresh token, never the raw value", async () => {
-    let capturedBody: Record<string, unknown> = {};
-    const fetchImpl = vi.fn(async (url: string, init: RequestInit) => {
-      expect(url).toBe(`${UNROUTABLE_INGRESS}/Operator/c1/issue`);
-      capturedBody = JSON.parse(init.body as string);
-      // `issue` is a void handler — the real ingress answers with an empty body, never JSON.
-      return new Response("", { status: 200 });
-    });
-    const authority = authorityWithFetch(fetchImpl as unknown as typeof fetch);
+    // `issue` is a void handler — the real ingress answers with an empty body, never JSON.
+    const sidecar = ingress({ issue: {} });
+    const authority = authorityWithFetch(sidecar.fetch);
     const outcome = await authority.issue({ clientId: "c1", email: "ada@eudoxus.ai", sub: "sub-1", provider: "google" });
+    const capturedBody = JSON.parse(sidecar.calls[0]!.body) as Record<string, unknown>;
     expect(outcome.status).toBe("ok");
     if (outcome.status === "ok") {
       expect(capturedBody.hash).toBe(crypto.createHash("sha256").update(outcome.refreshToken).digest("hex"));
@@ -447,8 +418,7 @@ describe("RestateRefreshAuthority — outcome mapping", () => {
   });
 
   it("issue() maps a non-empty, non-JSON 200 body to unavailable rather than throwing", async () => {
-    const fetchImpl = vi.fn(async () => new Response("not json", { status: 200 }));
-    const authority = authorityWithFetch(fetchImpl as unknown as typeof fetch);
+    const authority = authorityWithFetch(ingress({ issue: { text: "not json" } }).fetch);
     const outcome = await authority.issue({ clientId: "c1", email: "ada@eudoxus.ai", sub: "sub-1", provider: "google" });
     expect(outcome).toEqual({ status: "unavailable" });
   });
@@ -456,22 +426,14 @@ describe("RestateRefreshAuthority — outcome mapping", () => {
 
 describe("RestateRefreshAuthority.describe (AII-714)", () => {
   it("maps the object's describe result to expiresAt", async () => {
-    const fetchImpl = vi.fn(async (url: string) => {
-      expect(url).toBe(`${UNROUTABLE_INGRESS}/Operator/c1/describe`);
-      return new Response(
-        JSON.stringify({ email: "ada@eudoxus.ai", rotatedAt: 1000, expiresAt: 1_700_000_000_000 }),
-        { status: 200 },
-      );
-    });
-    const authority = authorityWithFetch(fetchImpl as unknown as typeof fetch);
+    const authority = authorityWithFetch(
+      ingress({ describe: { json: { email: "ada@eudoxus.ai", rotatedAt: 1000, expiresAt: 1_700_000_000_000 } } }).fetch,
+    );
     await expect(authority.describe("c1")).resolves.toEqual({ status: "ok", expiresAt: 1_700_000_000_000 });
   });
 
   it("maps a family with no live refresh token (expiresAt: null) straight through", async () => {
-    const fetchImpl = vi.fn(async () =>
-      new Response(JSON.stringify({ email: null, rotatedAt: null, expiresAt: null }), { status: 200 }),
-    );
-    const authority = authorityWithFetch(fetchImpl as unknown as typeof fetch);
+    const authority = authorityWithFetch(ingress({ describe: { json: { email: null, rotatedAt: null, expiresAt: null } } }).fetch);
     await expect(authority.describe("c1")).resolves.toEqual({ status: "ok", expiresAt: null });
   });
 
@@ -481,26 +443,19 @@ describe("RestateRefreshAuthority.describe (AII-714)", () => {
   });
 
   it("maps a thrown connection error to unavailable, never rejects", async () => {
-    const fetchImpl = vi.fn(async () => {
-      throw new Error("connect ECONNREFUSED 127.0.0.1:59999");
-    });
-    const authority = authorityWithFetch(fetchImpl as unknown as typeof fetch);
+    const authority = authorityWithFetch(ingress({ describe: refreshConnectionError }).fetch);
     await expect(authority.describe("c1")).resolves.toEqual({ status: "unavailable" });
   });
 });
 
 describe("RestateRefreshAuthority.rotate — unknown/never-issued client id (AII-718 parity)", () => {
   it("returns replay, without checking the allowlist or revoking, when the identity read comes back all-null", async () => {
-    const fetchImpl = vi.fn(async (url: string) => {
-      if (isIdentityUrl(url)) {
-        return new Response(JSON.stringify({ email: null, sub: null, provider: null, expiresAt: null }), { status: 200 });
-      }
-      throw new Error("must not call the allowlist path or any other handler for an unknown identity");
-    });
-    const authority = authorityWithFetch(fetchImpl as unknown as typeof fetch);
+    // Only the identity route exists: any other handler call fails the test.
+    const sidecar = ingress({ identity: { json: { email: null, sub: null, provider: null, expiresAt: null } } });
+    const authority = authorityWithFetch(sidecar.fetch);
     const allowlistCallsBefore = vi.mocked(getEffectiveAllowlist).mock.calls.length;
     await expect(authority.rotate({ refreshToken: "old-raw-token", clientId: "c1" })).resolves.toEqual({ status: "replay" });
-    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(sidecar.calls).toHaveLength(1);
     expect(vi.mocked(getEffectiveAllowlist).mock.calls.length).toBe(allowlistCallsBefore);
   });
 });
@@ -508,64 +463,41 @@ describe("RestateRefreshAuthority.rotate — unknown/never-issued client id (AII
 describe("RestateRefreshAuthority.rotate — allowlist re-check (AII-687 parity)", () => {
   it("returns unavailable (cause allowlist) without revoking or calling refresh when the allowlist cannot be loaded", async () => {
     vi.mocked(getEffectiveAllowlist).mockReturnValue(null);
-    const fetchImpl = vi.fn(async (url: string) => {
-      if (url.endsWith("/revoke")) {
-        throw new Error("must not revoke on a transient allowlist read failure");
-      }
-      if (url.endsWith("/refresh")) {
-        throw new Error("must not rotate before the allowlist check passes");
-      }
-      return identityOkResponse();
-    });
-    const authority = authorityWithFetch(fetchImpl as unknown as typeof fetch);
+    // Only the identity route exists: a revoke or refresh call fails the test.
+    const sidecar = ingress({ identity: identityOk });
+    const authority = authorityWithFetch(sidecar.fetch);
     await expect(authority.rotate({ refreshToken: "old-raw-token", clientId: "c1" })).resolves.toEqual({
       status: "unavailable",
       cause: "allowlist",
     });
     // Only the identity read happened — nothing durable was touched.
-    expect(fetchImpl).toHaveBeenCalledTimes(1);
-    expect(fetchImpl).toHaveBeenCalledWith(`${UNROUTABLE_INGRESS}/Operator/c1/identity`, expect.anything());
+    expect(sidecar.calls).toHaveLength(1);
+    expect(sidecar.calls[0]!.url.href).toBe(`${UNROUTABLE_INGRESS}/Operator/c1/identity`);
   });
 
   it("revokes the family and returns denied, without calling refresh, when the allowlist no longer admits the identity", async () => {
     vi.mocked(getEffectiveAllowlist).mockReturnValue({ entries: [], source: "env" });
     vi.mocked(matchAccessEntry).mockReturnValue(null);
-    const fetchImpl = vi.fn(async (url: string) => {
-      if (url.endsWith("/revoke")) {
-        return new Response("", { status: 200 });
-      }
-      if (url.endsWith("/refresh")) {
-        throw new Error("a denied identity must not be rotated");
-      }
-      return identityOkResponse();
-    });
-    const authority = authorityWithFetch(fetchImpl as unknown as typeof fetch);
+    // No refresh route: a denied identity must not be rotated.
+    const sidecar = ingress({ identity: identityOk, revoke: {} });
+    const authority = authorityWithFetch(sidecar.fetch);
     await expect(authority.rotate({ refreshToken: "old-raw-token", clientId: "c1" })).resolves.toEqual({
       status: "denied",
       description: "Identity no longer authorized",
     });
-    expect(fetchImpl).toHaveBeenCalledWith(`${UNROUTABLE_INGRESS}/Operator/c1/identity`, expect.anything());
-    expect(fetchImpl).toHaveBeenCalledWith(`${UNROUTABLE_INGRESS}/Operator/c1/revoke`, expect.anything());
-    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(sidecar.calls.map((call) => call.url.href)).toEqual([
+      `${UNROUTABLE_INGRESS}/Operator/c1/identity`,
+      `${UNROUTABLE_INGRESS}/Operator/c1/revoke`,
+    ]);
   });
 });
 
 describe("RestateRefreshAuthority.rotate — auth events (AII-708 parity)", () => {
   it("emits exactly one 'ok' event on a successful rotation", async () => {
-    const fetchImpl = vi.fn(async () =>
-      new Response(
-        JSON.stringify({
-          status: "ok",
-          token: "new-raw-token",
-          expiresAt: Date.now() + 1000,
-          email: "ada@eudoxus.ai",
-          sub: "sub-1",
-          provider: "google",
-        }),
-        { status: 200 },
-      ),
-    );
-    const authority = authorityWithFetch(fetchImpl as unknown as typeof fetch);
+    const rotated: Reply = () => ({
+      json: { status: "ok", token: "new-raw-token", expiresAt: Date.now() + 1000, email: "ada@eudoxus.ai", sub: "sub-1", provider: "google" },
+    });
+    const authority = authorityWithFetch(ingress({ identity: rotated, refresh: rotated }).fetch);
     await authority.rotate({ refreshToken: "old-raw-token", clientId: "c1" });
     expect(recordAuthEvent).toHaveBeenCalledTimes(1);
     expect(recordAuthEvent).toHaveBeenCalledWith(
@@ -574,8 +506,8 @@ describe("RestateRefreshAuthority.rotate — auth events (AII-708 parity)", () =
   });
 
   it("emits exactly one 'replay' event, with no identity, when the object reports replay", async () => {
-    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ status: "replay" }), { status: 200 }));
-    const authority = authorityWithFetch(fetchImpl as unknown as typeof fetch);
+    const replay: Reply = { json: { status: "replay" } };
+    const authority = authorityWithFetch(ingress({ identity: replay, refresh: replay }).fetch);
     await authority.rotate({ refreshToken: "old-raw-token", clientId: "c1" });
     expect(recordAuthEvent).toHaveBeenCalledTimes(1);
     expect(recordAuthEvent).toHaveBeenCalledWith(
@@ -584,10 +516,7 @@ describe("RestateRefreshAuthority.rotate — auth events (AII-708 parity)", () =
   });
 
   it("emits exactly one 'unavailable' event when the ingress is unreachable", async () => {
-    const fetchImpl = vi.fn(async () => {
-      throw new Error("connect ECONNREFUSED 127.0.0.1:59999");
-    });
-    const authority = authorityWithFetch(fetchImpl as unknown as typeof fetch);
+    const authority = authorityWithFetch(ingress({ identity: refreshConnectionError }).fetch);
     await authority.rotate({ refreshToken: "old-raw-token", clientId: "c1" });
     expect(recordAuthEvent).toHaveBeenCalledTimes(1);
     expect(recordAuthEvent).toHaveBeenCalledWith(

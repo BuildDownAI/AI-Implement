@@ -1,23 +1,16 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import os from "node:os";
-import path from "node:path";
-import fs from "node:fs";
+import { describe, it, expect, beforeEach } from "vitest";
 import Database from "better-sqlite3";
 import type * as DedupModule from "../dedup.js";
+import { testDb } from "./helpers/test-db.js";
 
 let dbPath: string;
 let dedup: typeof DedupModule;
 
+// Left unopened, so a schema-upgrade test can write the older schema before dedup opens the file.
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(os.tmpdir(), `dedup-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-});
-
-afterEach(() => {
-  dedup.closeDb();
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+  const db = await testDb({ tables: "none", modules: { dedup: () => import("../dedup.js") } });
+  dbPath = db.path;
+  ({ dedup } = db.modules);
 });
 
 describe("dedup", () => {
