@@ -3,8 +3,8 @@
  * the pipeline's Fly machine config (AII-1106 step 2a). `set` is exclusive, so two admins'
  * concurrent writes serialize instead of one read-merge-write losing the other.
  *
- * Only journaled context calls, no `ctx.run`: the object touches no outside system. Nothing
- * calls it yet; step 2b wires the callers.
+ * Only journaled context calls, no `ctx.run`: the object touches no outside system. Its callers are
+ * the KG refresh workflow, `set_fly_machine_profile`, and the boot seed.
  */
 import * as restate from "@restatedev/restate-sdk";
 import type { ObjectContext, ObjectSharedContext } from "@restatedev/restate-sdk";
@@ -113,3 +113,7 @@ export function createFlyMachineProfile() {
     },
   });
 }
+
+export type FlyMachineProfileDefinition = ReturnType<typeof createFlyMachineProfile>;
+/** A typed client handle for callers outside this module (the workflow, the tools, the boot seed). */
+export const FlyMachineProfile: FlyMachineProfileDefinition = { name: "FlyMachineProfile" } as FlyMachineProfileDefinition;

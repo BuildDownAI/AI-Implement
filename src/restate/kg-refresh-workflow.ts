@@ -36,6 +36,7 @@ import {
   swapGate,
   verifyGate,
 } from "../kg-refresh-rail.js";
+import { FlyMachineProfile, type FlyMachineProfileConfig } from "./fly-machine-profile.js";
 import type { BackendRunRead } from "../backend-run.js";
 import type { MachineExit } from "../fly-machines.js";
 import { parseKgSourceRepo } from "../deploy.js";
@@ -96,6 +97,8 @@ export interface KgDispatchInput {
   issueIdentifier: string;
   /** The workflow's own dispatch id — the one its run tokens and `dispatch_log` row carry. */
   dispatchId: string;
+  /** The Fly machine size for this run, read once from `FlyMachineProfile/kg-refresh` before the dispatch step. */
+  machine: FlyMachineProfileConfig;
 }
 
 export interface KgRefreshStatusResult {
@@ -309,6 +312,10 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       // process (the token rows are keyed by dispatch id + audience, so a second mint would collide).
       let minted: ReturnType<typeof deps.mintRunTokens> | undefined;
       ctx.set("step", "dispatch");
+      // A journaled call outside the dispatch step: a replay reuses this size, and the step's retries share it.
+      const profile = await ctx.objectClient(FlyMachineProfile, "kg-refresh").get();
+      if (!profile) throw new restate.TerminalError("no FlyMachineProfile default exists for kg-refresh", { errorCode: 500 });
+      const machine = profile.config;
       const dispatchResult = await ctx.run(
         "dispatch",
         async (): Promise<KgDispatchResult> => {
@@ -319,7 +326,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
             return { outcome: "accepted", runId: existing.runId, jobId: String(existing.runId), executionMode: GHA_EXECUTION_MODE };
           }
           minted ??= deps.mintRunTokens({ dispatchId, ttlSeconds });
-          const result = await deps.dispatch({ runConfig: input, tokens: minted, issueIdentifier, dispatchId });
+          const result = await deps.dispatch({ runConfig: input, tokens: minted, issueIdentifier, dispatchId, machine });
           return {
             outcome: result.outcome, runId: result.runId, runUrl: result.runUrl,
             jobId: result.jobId, executionMode: result.executionMode,

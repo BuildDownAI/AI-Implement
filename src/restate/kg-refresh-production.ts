@@ -27,7 +27,7 @@ import { resolveWorkflowCapabilities } from "../workflow-probe.js";
 import { resolveRunnerImageForDispatch } from "../repo-image.js";
 import { encodeRunConfig, type RunConfigV1 } from "../run-config.js";
 import { readBackendRun, stopBackendRun } from "../backend-run.js";
-import { getRunnerMode, resolveExecutionPath, getKgFlyMachineOverride } from "../runner-mode.js";
+import { getRunnerMode, getKgFlyMachineOverride, setKgFlyMachineOverride, type KgFlyMachineOverride } from "../runner-mode.js";
 import { mintRunToken } from "../runner-tokens.js";
 import type { JobStatus } from "../log.js";
 import { appendLogIfAbsent, findLogIdByDispatchId, updateJobMachineDetails, updateJobPrUrl, updateJobRunId } from "../log.js";
@@ -40,7 +40,7 @@ import {
   type KgRefreshStatusResult,
   type KgRefreshWorkflowDependencies,
 } from "./kg-refresh-workflow.js";
-import { createFlyMachineProfile, PERFORMANCE_MIN_MB_PER_CPU } from "./fly-machine-profile.js";
+import { FLY_MACHINE_PROFILE_DEFAULTS, createFlyMachineProfile, type FlyMachineProfileConfig, type FlyMachineProfileDefinition } from "./fly-machine-profile.js";
 import { createKgRepo, type KgRepoEnqueueInput, type KgRepoEnqueueResult, type KgRepoPrInput, type KgRepoTriggerResult, type StoredDryRunOutcome } from "./kg-repo.js";
 import type { KgRefreshDefinition, KgRepoDefinition } from "./kg-refresh-types.js";
 import { RESTATE_INGRESS_BASE_URL } from "./server.js";
@@ -81,6 +81,7 @@ type LegacyDispatch = (opts: {
   dispatchId: string;
   runConfig: string;
   executionPath?: string;
+  machine: FlyMachineProfileConfig;
 }) => Promise<{ machineId?: string; machineNonce?: string; logsUrl?: string; workflowRunId?: number }>;
 
 export interface KgDispatchDetails {
@@ -124,6 +125,8 @@ export interface KgRefreshProductionInput {
    *  resolved execution path is not GitHub Actions; the GHA path is dispatched by this
    *  module so it can request `return_run_details`. */
   dispatchKgRefreshRun: LegacyDispatch;
+  /** Overrides `resolveKgExecutionMode` for the dispatch. A test seam: it keeps the GitHub Actions branch exercisable until AII-1110 decides when GHA is used. */
+  resolveExecutionMode?: () => string;
   /** Probes the KG source repo's dispatch workflow for `run_publication_token` support. Defaults to `resolveWorkflowCapabilities`. */
   resolveWorkflowCapabilities?: typeof resolveWorkflowCapabilities;
   updateJobStatus: (jobId: number, status: JobStatus, conclusion?: string | null) => void;
@@ -170,68 +173,20 @@ export function findKgMapping(kgSourceRepo: string) {
   return Object.entries(getMappings()).find(([, m]) => `${m.owner}/${m.repo}` === kgSourceRepo);
 }
 
-export interface KgFlyMachineSize {
-  cpuKind: "shared" | "performance";
-  cpus: number;
-  memoryMb: number;
-  /** Where the size came from: the admin override, the KG repo mapping, or the builder default. */
-  source: "override" | "mapping" | "default";
-}
-
-/** KG floors: the ingest dies after the embedding-model load at 4096 MB, so a Fly KG refresh
- *  defaults to 2 CPUs / 8192 MB unless the mapping is larger or an admin override says otherwise. */
-export const KG_FLY_DEFAULT_MEMORY_MB = 8192;
-export const KG_FLY_DEFAULT_CPUS = 2;
-
-/** The effective Fly machine size for a kg-refresh run: each field of the admin override
- *  (`set_kg_fly_machine`), else the larger of the mapping size and the KG floor, then the CPU kind.
- *  `log` is false for status reads so only dispatches log. */
-export function resolveKgFlyMachineSize(kgSourceRepo: string, log = true): KgFlyMachineSize {
-  const mapping = findKgMapping(kgSourceRepo)?.[1];
-  const override = getKgFlyMachineOverride();
-  const hasOverride = override.cpus !== undefined || override.memoryMb !== undefined || override.cpuKind !== undefined;
-  if (!mapping && log) {
-    console.log(`[kg-refresh] no mapping for ${kgSourceRepo}; Fly machine uses the default size`);
-  }
-  const mappingCpus = mapping?.machineCpus ?? 0;
-  const mappingMemoryMb = mapping?.machineMemoryMb ?? 0;
-  const cpus = override.cpus ?? Math.max(mappingCpus, KG_FLY_DEFAULT_CPUS);
-  const memoryMb = override.memoryMb ?? Math.max(mappingMemoryMb, KG_FLY_DEFAULT_MEMORY_MB);
-  // "mapping" means the mapping raised at least one field above its floor; the other field may still be the floor.
-  const mappingWon = mappingCpus > KG_FLY_DEFAULT_CPUS || mappingMemoryMb > KG_FLY_DEFAULT_MEMORY_MB;
-  const source = hasOverride ? "override" : mappingWon ? "mapping" : "default";
-  const below = memoryMb < PERFORMANCE_MIN_MB_PER_CPU * cpus;
-  if (override.cpuKind !== "shared" && below && log) {
-    console.log(
-      `[kg-refresh] ${kgSourceRepo} size is ${cpus} CPU / ${memoryMb} MB, below the ${PERFORMANCE_MIN_MB_PER_CPU} MB-per-CPU minimum for performance CPUs; Fly machine stays on shared CPUs`,
-    );
-  }
-  const cpuKind = override.cpuKind === "shared" || below ? "shared" : "performance";
-  return { cpuKind, cpus, memoryMb, source };
-}
-
-/** Fly machine size for a kg-refresh run, plus the sessions region, for spreading into the machine config. */
-export function kgFlyMachineSizing(
-  kgSourceRepo: string,
-  region: string | null | undefined,
-): KgFlyMachineSize & { region?: string } {
-  return { ...resolveKgFlyMachineSize(kgSourceRepo), region: region ?? undefined };
-}
-
-/** The execution mode a kg-refresh dispatch resolves to under the current runner mode.
- *  `createKgRefreshDispatch` acts on it and `appendJobLog` records it, so both read one answer. */
+/** The execution mode a kg-refresh dispatch resolves to: Fly in every runner mode except `local`
+ *  (local Docker). Without a Fly sessions app the dispatch step fails with its own "not configured"
+ *  error; the GitHub Actions fallback is AII-1110. `createKgRefreshDispatch` acts on it and
+ *  `appendJobLog` records it, so both read one answer. */
 export function resolveKgExecutionMode(): string {
-  const { mode } = getRunnerMode();
-  const resolved = resolveExecutionPath(mode, GHA_EXECUTION_MODE);
-  return resolved === "both" ? GHA_EXECUTION_MODE : resolved;
+  return getRunnerMode().mode === "local" ? "local-docker" : "fly-machines";
 }
 
 /** Builds the GHA-first dispatch the workflow calls inside `ctx.run`. */
 export function createKgRefreshDispatch(input: KgRefreshProductionInput): (dispatch: KgDispatchInput) => Promise<KgDispatchResult> {
   const { config } = input;
   const repo = parseKgSourceRepo(input.kgSourceRepo);
-  return async ({ runConfig, tokens, issueIdentifier, dispatchId }) => {
-    const executionMode = resolveKgExecutionMode();
+  return async ({ runConfig, tokens, issueIdentifier, dispatchId, machine }) => {
+    const executionMode = (input.resolveExecutionMode ?? resolveKgExecutionMode)();
     const mapping = findKgMapping(input.kgSourceRepo)?.[1];
     const envelope: RunConfigV1 = {
       v: 1,
@@ -250,7 +205,7 @@ export function createKgRefreshDispatch(input: KgRefreshProductionInput): (dispa
     if (executionMode !== GHA_EXECUTION_MODE) {
       const legacy = await input.dispatchKgRefreshRun({
         runToken: tokens.runToken, runProgressToken: tokens.progressToken,
-        dispatchId, runConfig: encoded, executionPath: executionMode,
+        dispatchId, runConfig: encoded, executionPath: executionMode, machine,
       });
       input.recordDispatch(dispatchId, {
         machineId: legacy.machineId, machineNonce: legacy.machineNonce,
@@ -488,3 +443,47 @@ export function createKgRefreshIngressClient(
 }
 
 export type { KgRepoTriggerResult };
+
+export interface FlyMachineProfileSeedDeps {
+  getOverride?: () => KgFlyMachineOverride;
+  clearOverride?: () => void;
+  /** Sends `seed` to `FlyMachineProfile/kg-refresh`; resolves once the ingress accepted it. */
+  sendSeed?: (config: FlyMachineProfileConfig, idempotencyKey: string) => Promise<void>;
+}
+
+/** The profile a stored `kg_fly_machine_override` becomes: the override merged over the built-in default, `auto` meaning `performance`. */
+export function overrideToProfileConfig(override: KgFlyMachineOverride): FlyMachineProfileConfig {
+  const base = FLY_MACHINE_PROFILE_DEFAULTS["kg-refresh"];
+  return {
+    ...base,
+    ...(override.cpus !== undefined ? { cpus: override.cpus } : {}),
+    ...(override.memoryMb !== undefined ? { memoryMb: override.memoryMb } : {}),
+    ...(override.cpuKind !== undefined ? { cpuKind: override.cpuKind === "auto" ? "performance" : override.cpuKind } : {}),
+  };
+}
+
+/**
+ * One-time boot migration (AII-1130): moves the old `kg_fly_machine_override` settings row into
+ * `FlyMachineProfile/kg-refresh`, then deletes the row. `seed` writes only when the object's state is
+ * empty and the send carries an idempotency key, so a crash between the send and the delete repeats
+ * safely. A failed send (ingress down, or a merged config the object rejects) logs and keeps the row.
+ */
+export async function seedFlyMachineProfileFromOverride(deps: FlyMachineProfileSeedDeps = {}): Promise<void> {
+  const override = (deps.getOverride ?? getKgFlyMachineOverride)();
+  if (override.cpus === undefined && override.memoryMb === undefined && override.cpuKind === undefined) return;
+  const config = overrideToProfileConfig(override);
+  const idempotencyKey = "seed:kg-refresh";
+  const sendSeed = deps.sendSeed ?? (async (c, key) => {
+    const ingress = restateClients.connect({ url: RESTATE_INGRESS_BASE_URL });
+    await ingress.objectSendClient<FlyMachineProfileDefinition>({ name: "FlyMachineProfile" }, "kg-refresh")
+      .seed(c, restateClients.rpc.sendOpts({ idempotencyKey: key }));
+  });
+  try {
+    await sendSeed(config, idempotencyKey);
+  } catch (err) {
+    console.error(`[kg-refresh] could not seed FlyMachineProfile/kg-refresh from kg_fly_machine_override; the row stays: ${err instanceof Error ? err.message : String(err)}`);
+    return;
+  }
+  (deps.clearOverride ?? (() => setKgFlyMachineOverride(null)))();
+  console.log(`[kg-refresh] seeded FlyMachineProfile/kg-refresh from kg_fly_machine_override (${config.cpuKind}, ${config.cpus} CPU, ${config.memoryMb} MB) and removed the row`);
+}

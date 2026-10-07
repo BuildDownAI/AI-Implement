@@ -128,11 +128,12 @@ import { KgSidecar } from "./kg-sidecar.js";
 import type { KgRefreshIngressClient } from "./restate/kg-refresh-production.js";
 import { createKgRefreshIngressClient } from "./restate/kg-refresh-production.js";
 import { RestateSidecar } from "./restate/server.js";
+import type { FlyMachineProfileConfig } from "./restate/fly-machine-profile.js";
 import { startRestateEndpoint, register as registerRestateEndpoint, RESTATE_SERVICES } from "./restate/endpoint.js";
 import { getRestateRetentionDays, getVolumeSnapshotRetentionDays } from "./restate/retention.js";
 import { applyVolumeSnapshotRetentionAtBoot } from "./fly-volumes.js";
 import { createProductionReviewFixServices } from "./restate/review-fix-production.js";
-import { kgFlyMachineSizing, createKgFindRunByTitle, createProductionKgRefreshServices, recordKgDispatchDetails } from "./restate/kg-refresh-production.js";
+import { createKgFindRunByTitle, seedFlyMachineProfileFromOverride, createProductionKgRefreshServices, recordKgDispatchDetails } from "./restate/kg-refresh-production.js";
 import { createProductionPlanningRunServices, PLANNING_CONTEXT_BRANCH_KEY, PLANNING_CONTEXT_FIELD_VALUE_KEY } from "./restate/planning-run-production.js";
 import { createPlanningAdmissionTerminationHook, createPlanningRunIngressClient } from "./restate/planning-run-client.js";
 import { setKgRefreshToolDeps } from "./restate/tools.js";
@@ -4008,7 +4009,7 @@ async function handleKgRefreshOutcome(
 
 async function dispatchKgRefreshRun(
   config: AppConfig,
-  opts: { runToken: string; runProgressToken: string; dispatchId: string; runConfig: string; executionPath?: string },
+  opts: { runToken: string; runProgressToken: string; dispatchId: string; runConfig: string; executionPath?: string; machine: FlyMachineProfileConfig },
 ): Promise<{ machineId?: string; machineNonce?: string; logsUrl?: string }> {
   if (!config.kgSourceRepo) throw new Error("KG_SOURCE_REPO not configured");
   const repo = parseKgSourceRepo(config.kgSourceRepo);
@@ -4055,7 +4056,10 @@ async function dispatchKgRefreshRun(
       orchestratorApp: process.env.FLY_APP_NAME,
       expectedTtlSeconds: 4 * 60 * 60,
       extraEnv,
-      ...(({ source: _source, ...sizing }) => sizing)(kgFlyMachineSizing(config.kgSourceRepo, config.flySessionsRegion)),
+      cpuKind: opts.machine.cpuKind,
+      cpus: opts.machine.cpus,
+      memoryMb: opts.machine.memoryMb,
+      region: config.flySessionsRegion ?? undefined,
     });
     const machine = await createMachine(config.flySessionsToken, config.flySessionsApp, machineConfig);
     console.log(`[kg-refresh] dispatched via Fly (dispatchId=${opts.dispatchId})`);
@@ -4915,6 +4919,8 @@ function restateRegistrationStatusFor(outcome: RestateRegisterOutcome): RestateR
 export interface RestateEndpointWireDeps {
   startRestateEndpoint: () => Promise<unknown>;
   registerRestateEndpoint: () => Promise<RestateRegisterResult>;
+  /** Runs after a registration that took effect (never after `declined-conflict`); must not throw. */
+  onRegistered?: () => Promise<void>;
 }
 
 /** How often a declined registration retries (AII-721) — the old deployment's non-completed invocations are expected to drain on their own; this just keeps checking back. */
@@ -4970,6 +4976,7 @@ export function createRestateRegistrationGate(
         }
       } else {
         clearRetry();
+        await deps.onRegistered?.();
       }
     } catch (err) {
       if (isShuttingDown()) return;
@@ -5162,6 +5169,7 @@ async function main(): Promise<void> {
   const restateRegistration = createRestateRegistrationGate(() => shuttingDown, {
     startRestateEndpoint: () => startRestateEndpoint([...RESTATE_SERVICES, ...reviewFixServices, ...kgServices, ...planningRunServices], restateSidecar.identityKey),
     registerRestateEndpoint,
+    onRegistered: () => seedFlyMachineProfileFromOverride(),
   });
   // A sidecar which becomes ready after its initial timeout still registers the
   // same fully composed service set; the gate starts the endpoint only once.

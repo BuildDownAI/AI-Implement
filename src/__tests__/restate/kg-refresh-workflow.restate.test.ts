@@ -24,6 +24,7 @@ import type { RefreshOutcome } from "../../kg-refresh.js";
 import { RailGateError, type KgRailDeps } from "../../kg-refresh-rail.js";
 import { COMPLETION_MARKER } from "../../kg-sidecar.js";
 import { createKgRefreshIngressClient } from "../../restate/kg-refresh-production.js";
+import { FLY_MACHINE_PROFILE_DEFAULTS, mergeProfile, type FlyMachineProfileConfig } from "../../restate/fly-machine-profile.js";
 import { createKgRepo, type KgRepoTriggerResult } from "../../restate/kg-repo.js";
 import {
   createKgRefreshWorkflow,
@@ -330,6 +331,25 @@ describe("KgRefresh durable workflow", () => {
     return scenario;
   }
 
+  // A counting stand-in for FlyMachineProfile that runs the real merge/validation, so a test can tell a
+  // journaled replay from a second read.
+  let profileGets = 0;
+  const dispatchedMachines: FlyMachineProfileConfig[] = [];
+  const flyMachineProfile = restate.object({
+    name: "FlyMachineProfile",
+    handlers: {
+      get: restate.handlers.object.shared(async (ctx: restate.ObjectSharedContext) => {
+        profileGets++;
+        const stored = await ctx.get<FlyMachineProfileConfig>("profile");
+        return stored ? { config: stored, source: "profile" } : { config: { ...FLY_MACHINE_PROFILE_DEFAULTS["kg-refresh"] }, source: "default" };
+      }),
+      set: restate.handlers.object.exclusive(async (ctx: restate.ObjectContext, patch: Partial<FlyMachineProfileConfig>) => {
+        const stored = await ctx.get<FlyMachineProfileConfig>("profile");
+        ctx.set("profile", mergeProfile(stored ?? FLY_MACHINE_PROFILE_DEFAULTS["kg-refresh"], patch));
+      }),
+    },
+  });
+
   async function dispatchFn(input: KgDispatchInput): Promise<KgDispatchResult> {
     const triggerId = input.runConfig.triggerId;
     adoptPendingScenario(triggerId);
@@ -338,6 +358,7 @@ describe("KgRefresh durable workflow", () => {
     contractCalls?.push("launch");
     scenario.dispatchCalls++;
     dispatchedIds.push(input.dispatchId);
+    dispatchedMachines.push(input.machine);
     dispatchedTokens.push(input.tokens);
     const committedRunId = dispatchThrowAfterCommit.get(triggerId);
     if (committedRunId !== undefined) {
@@ -501,8 +522,8 @@ describe("KgRefresh durable workflow", () => {
   let envs: Map<string, RestateTestEnvironment>;
   let deadlineEnvs: Map<string, RestateTestEnvironment>;
   beforeAll(async () => {
-    envs = await startVariants([workflow, kgRepo, starter]);
-    deadlineEnvs = await startVariants([deadlineWorkflow, kgRepo, starter]);
+    envs = await startVariants([workflow, kgRepo, starter, flyMachineProfile]);
+    deadlineEnvs = await startVariants([deadlineWorkflow, kgRepo, starter, flyMachineProfile]);
   }, 120_000);
   afterAll(async () => {
     if (envs) await stopAll(envs);
@@ -1421,7 +1442,7 @@ describe("KgRefresh durable workflow", () => {
       totalDeadlineMs: scaledTick * 24,
       watchIntervalMs: scaledTick,
     });
-    const scaledEnv = await startRetryEnabled([scaledWorkflow, kgRepo, starter]);
+    const scaledEnv = await startRetryEnabled([scaledWorkflow, kgRepo, starter, flyMachineProfile]);
     try {
       const triggerId = newTriggerId();
       const runId = runIdCounter++;
@@ -1549,7 +1570,7 @@ describe("KgRefresh durable workflow", () => {
       totalDeadlineMs: 5_000,
       watchIntervalMs: 100,
     });
-    const cadenceEnv = await startRetryEnabled([cadenceWorkflow, kgRepo, starter]);
+    const cadenceEnv = await startRetryEnabled([cadenceWorkflow, kgRepo, starter, flyMachineProfile]);
     try {
       const triggerId = newTriggerId();
       makeScenario(triggerId, {
@@ -1919,6 +1940,48 @@ describe("KgRefresh durable workflow", () => {
     30_000,
   );
 
+  // ---- AII-1130: the dispatch reads the FlyMachineProfile once, before the step ----
+  it.each(VARIANTS.map(([label]) => label))(
+    "AII-1130: dispatch receives the profile's machine, a later run sees a changed profile, and a retried dispatch reuses the one read (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const setProfile = (patch: Partial<FlyMachineProfileConfig>) =>
+        callObject(env.baseUrl(), "FlyMachineProfile", "kg-refresh", "set", patch);
+      const defaults = FLY_MACHINE_PROFILE_DEFAULTS["kg-refresh"];
+
+      await setProfile({ memoryMb: 4096 });
+      const first = newTriggerId();
+      makeScenario(first, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+      const firstDone = runWorkflow(env.baseUrl(), first);
+      await eventually(() => scenarios.get(first)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
+      expect(dispatchedMachines.at(-1)).toEqual({ ...defaults, memoryMb: 4096 });
+      await callWorkflow(env.baseUrl(), "KgRefresh", first, "report", SUCCESS_REPORT);
+      expect((await firstDone).ok).toBe(true);
+
+      await setProfile({ memoryMb: 8192 });
+      await setProfile({ cpus: 4 });
+      const second = newTriggerId();
+      const retried = makeScenario(second, { dispatchOutcome: "accepted", executionMode: "github-actions", runId: undefined });
+      const secondRunId = runIdCounter++;
+      dispatchThrowAfterCommit.set(second, secondRunId);
+      const beforeGets = profileGets;
+      const beforeMachines = dispatchedMachines.length;
+      const secondDone = runWorkflow(env.baseUrl(), second);
+      await eventually(() => retried.dispatchCalls >= 1, (ok) => ok, { label: "durable effect" });
+      await eventually(() => retried.runId === secondRunId, (ok) => ok, { label: "durable effect" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", second, "report", SUCCESS_REPORT);
+      await secondDone; // the rail's stamp gate may revert a second run on the shared fixture; only the dispatch matters here
+      // the retry (if the dispatch step ran again) reuses the journaled read: one get, same machine every attempt
+      expect(profileGets - beforeGets).toBe(1);
+      const seen = dispatchedMachines.slice(beforeMachines);
+      expect(seen.length).toBeGreaterThanOrEqual(1);
+      for (const m of seen) expect(m).toEqual({ ...defaults, cpus: 4, memoryMb: 8192 });
+
+      await setProfile({ cpus: defaults.cpus, memoryMb: defaults.memoryMb });
+    },
+    60_000,
+  );
+
   // ---- W13/W14: RailGateError conversion and revert ----
   it.each(VARIANTS.map(([label]) => label))(
     "W13: a RailGateError at verify reverts once and fails, status named verify beforehand (%s)",
@@ -2266,7 +2329,7 @@ describe("KgRefresh durable workflow", () => {
   it("W18b: a workflow built with a ten-day retentionMs registers ten days", async () => {
     const tenDays = 10 * 24 * 60 * 60 * 1000;
     const tenDayWorkflow = createKgRefreshWorkflow({ ...workflowDeps, retentionMs: tenDays, bootstrapDeadlineMs: 30_000, totalDeadlineMs: 60_000 });
-    const tenDayEnv = await startRetryEnabled([tenDayWorkflow, kgRepo, starter]);
+    const tenDayEnv = await startRetryEnabled([tenDayWorkflow, kgRepo, starter, flyMachineProfile]);
     try {
       const triggerId = newTriggerId();
       makeScenario(triggerId, { dispatchOutcome: "rejected", executionMode: "fly-machines" });
@@ -2347,7 +2410,7 @@ describe("KgRefresh durable workflow", () => {
     const crashWorkflow = buildCrashWorkflow("original");
     const replacementWorkflow = buildCrashWorkflow("replacement");
 
-    const env = await startRetryEnabled([crashWorkflow, kgRepo]);
+    const env = await startRetryEnabled([crashWorkflow, kgRepo, flyMachineProfile]);
     let replacement: Awaited<ReturnType<typeof replaceEndpoint>> | undefined;
     try {
       // Dispatches through the real KgRepo.trigger (not a direct KgRefresh.run call) so the
@@ -2365,7 +2428,7 @@ describe("KgRefresh durable workflow", () => {
       const stagingMarker = join(dataRoot, "staging", COMPLETION_MARKER);
       await eventually(() => existsSync(stagingMarker) && stageCommittedAttempts.length >= 1, (ok) => ok, { label: "durable effect", timeoutMs: 12_000 });
 
-      replacement = await replaceEndpoint(env, [replacementWorkflow, kgRepo]);
+      replacement = await replaceEndpoint(env, [replacementWorkflow, kgRepo, flyMachineProfile]);
       await env.startedRestateContainer.restart();
 
       // The restart severs the blocked first attempt's connection; Restate retries the

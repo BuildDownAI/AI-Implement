@@ -4,7 +4,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const postWorkflowDispatch = vi.fn();
 vi.mock("../github.js", async (importOriginal) => ({
@@ -44,11 +44,12 @@ vi.mock("../log.js", async (importOriginal) => ({
 vi.mock("../repo-image.js", () => ({ resolveRunnerImageForDispatch: vi.fn(async () => "runner:test") }));
 const resolvedPath = { current: "github-actions" };
 vi.mock("../runner-mode.js", () => ({
-  getRunnerMode: () => ({ mode: "default" }),
-  resolveExecutionPath: () => resolvedPath.current,
+  getRunnerMode: () => ({ mode: runnerMode.current }),
   getKgMaterializeDirect: () => ({ enabled: false }),
   getKgFlyMachineOverride: () => kgFlyOverride.current,
+  setKgFlyMachineOverride: (v: unknown) => { if (v === null) kgFlyOverride.current = {}; },
 }));
+const runnerMode = { current: "default" };
 const kgFlyOverride: { current: { cpus?: number; memoryMb?: number; cpuKind?: "auto" | "shared" | "performance" } } = { current: {} };
 const kgMappingSize: { current: { machineCpus?: number; machineMemoryMb?: number } } = { current: {} };
 vi.mock("../config.js", async (importOriginal) => ({
@@ -61,10 +62,10 @@ import {
   createKgRefreshDispatch,
   createKgRefreshIngressClient,
   createProductionKgRefreshServices,
-  kgFlyMachineSizing,
+  resolveKgExecutionMode,
+  seedFlyMachineProfileFromOverride,
   type KgRefreshProductionInput,
 } from "../restate/kg-refresh-production.js";
-import { buildSessionMachineConfig } from "../fly-machines.js";
 import { decodeRunConfig } from "../run-config.js";
 import { verifyRunToken } from "../runner-tokens.js";
 
@@ -91,6 +92,7 @@ function makeInput(overrides: Partial<KgRefreshProductionInput> = {}): KgRefresh
     closePullRequestFn: noop as never,
     deleteBranchFn: noop as never,
     dispatchKgRefreshRun: vi.fn(async () => ({})),
+    resolveExecutionMode: () => resolvedPath.current,
     updateJobStatus: noop,
     recordDispatch: vi.fn(),
     getWorkflowRunStatus: vi.fn(async () => ({ status: "completed", conclusion: "success" })),
@@ -110,6 +112,7 @@ const dispatchInput = {
   tokens: { runToken: "rt", progressToken: "pt", publicationToken: "pub" },
   issueIdentifier: "KG-REFRESH · t-1",
   dispatchId: "d-workflow",
+  machine: { cpuKind: "performance" as const, cpus: 2, memoryMb: 8192, idleTimeoutMs: 604800000 },
 };
 
 beforeEach(() => {
@@ -575,116 +578,58 @@ describe("createKgFindRunByTitle", () => {
   });
 });
 
-describe("kgFlyMachineSizing (AII-1112)", () => {
-  beforeEach(() => { kgFlyOverride.current = {}; });
-  const build = (sizing: ReturnType<typeof kgFlyMachineSizing>) =>
-    buildSessionMachineConfig({
-      image: "runner:test", issueId: "kg-refresh", issueIdentifier: "KG-REFRESH", issueTitle: "t", issueDescription: "",
-      owner: "acme", repo: "kg", defaultBranch: "main", githubToken: "t", sessionToken: "s", machineNonce: "n",
-      ...sizing,
-    });
+describe("resolveKgExecutionMode (AII-1130)", () => {
+  afterEach(() => { runnerMode.current = "default"; });
 
-  it("sizes the machine from a larger mapping and carries the region", () => {
-    kgMappingSize.current = { machineCpus: 4, machineMemoryMb: 16384 };
-    const machine = build(kgFlyMachineSizing("acme/kg", "ord"));
-    expect(machine.config.guest).toMatchObject({ cpus: 4, memory_mb: 16384 });
-    expect(machine.region).toBe("ord");
+  it.each(["default", "gha", "fly", "shadow"])("answers fly-machines under runner mode %s", (mode) => {
+    runnerMode.current = mode;
+    expect(resolveKgExecutionMode()).toBe("fly-machines");
   });
 
-  it("raises a mapping below the KG floor to 2 performance CPUs / 8192 MB", () => {
-    kgMappingSize.current = { machineCpus: 2, machineMemoryMb: 4096 };
-    const machine = build(kgFlyMachineSizing("acme/kg", "ord"));
-    expect(machine.config.guest).toEqual({ cpu_kind: "performance", cpus: 2, memory_mb: 8192 });
+  it("answers local-docker under runner mode local", () => {
+    runnerMode.current = "local";
+    expect(resolveKgExecutionMode()).toBe("local-docker");
   });
+});
 
-  it("stays shared and logs one line below the per-CPU minimum", () => {
-    const log = vi.spyOn(console, "log").mockImplementation(() => {});
-    try {
-      kgFlyOverride.current = { memoryMb: 2048 };
-      kgMappingSize.current = { machineCpus: 2, machineMemoryMb: 2048 };
-      const machine = build(kgFlyMachineSizing("acme/kg", "ord"));
-      expect(machine.config.guest).toEqual({ cpu_kind: "shared", cpus: 2, memory_mb: 2048 });
-      expect(log.mock.calls.filter((c) => String(c[0]).includes("2048 MB-per-CPU"))).toHaveLength(1);
-    } finally {
-      log.mockRestore();
-    }
-  });
-
-  it("falls back per field when the mapping leaves the size unset", () => {
+describe("KG dispatch sizes the machine from the profile (AII-1130)", () => {
+  it("passes machine through to the dispatcher and ignores the mapping size", async () => {
+    resolvedPath.current = "fly-machines";
+    kgMappingSize.current = { machineCpus: 8, machineMemoryMb: 32768 };
+    const dispatchKgRefreshRun = vi.fn(async () => ({}));
+    await createKgRefreshDispatch(makeInput({ dispatchKgRefreshRun }))(dispatchInput);
+    expect(dispatchKgRefreshRun).toHaveBeenCalledWith(expect.objectContaining({ machine: dispatchInput.machine }));
     kgMappingSize.current = {};
-    const machine = build(kgFlyMachineSizing("acme/kg", null));
-    expect(machine.config.guest).toMatchObject({ cpus: 2, memory_mb: 8192 });
+  });
+});
+
+describe("seedFlyMachineProfileFromOverride (AII-1130)", () => {
+  const DAY7 = 7 * 24 * 60 * 60 * 1000;
+
+  it("sends the merged seed with the idempotency key, then deletes the row", async () => {
+    const sendSeed = vi.fn(async () => {});
+    const clearOverride = vi.fn();
+    await seedFlyMachineProfileFromOverride({ getOverride: () => ({ memoryMb: 4096, cpuKind: "auto" }), sendSeed, clearOverride });
+    expect(sendSeed).toHaveBeenCalledWith({ cpuKind: "performance", cpus: 2, memoryMb: 4096, idleTimeoutMs: DAY7 }, "seed:kg-refresh");
+    expect(clearOverride).toHaveBeenCalledTimes(1);
   });
 
-  it("keeps the default size and logs one line with no mapping", () => {
-    const log = vi.spyOn(console, "log").mockImplementation(() => {});
-    try {
-      const machine = build(kgFlyMachineSizing("other/repo", undefined));
-      expect(machine.config.guest).toEqual({ cpu_kind: "performance", cpus: 2, memory_mb: 8192 });
-      expect(log.mock.calls.filter((c) => String(c[0]).includes("default size"))).toHaveLength(1);
-    } finally {
-      log.mockRestore();
-    }
+  it("sends nothing with no stored override", async () => {
+    const sendSeed = vi.fn(async () => {});
+    const clearOverride = vi.fn();
+    await seedFlyMachineProfileFromOverride({ getOverride: () => ({}), sendSeed, clearOverride });
+    expect(sendSeed).not.toHaveBeenCalled();
+    expect(clearOverride).not.toHaveBeenCalled();
   });
 
-  describe("admin override (AII-1120)", () => {
-    beforeEach(() => { kgMappingSize.current = { machineCpus: 2, machineMemoryMb: 4096 }; });
-
-    it("reports the default as the source when the floor beats the mapping", () => {
-      expect(kgFlyMachineSizing("acme/kg", null)).toEqual({ cpuKind: "performance", cpus: 2, memoryMb: 8192, source: "default" });
+  it("keeps the row when the send fails", async () => {
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    const clearOverride = vi.fn();
+    await seedFlyMachineProfileFromOverride({
+      getOverride: () => ({ cpus: 4 }), sendSeed: async () => { throw new Error("ingress down"); }, clearOverride,
     });
-
-    it("reports the mapping as the source when it exceeds the floor", () => {
-      kgMappingSize.current = { machineCpus: 4, machineMemoryMb: 16384 };
-      expect(kgFlyMachineSizing("acme/kg", null)).toEqual({ cpuKind: "performance", cpus: 4, memoryMb: 16384, source: "mapping" });
-    });
-
-    it("reports the default for a mapping exactly at the floor", () => {
-      kgMappingSize.current = { machineCpus: 2, machineMemoryMb: 8192 };
-      expect(kgFlyMachineSizing("acme/kg", null).source).toBe("default");
-    });
-
-    it("lets an override go below the default on purpose", () => {
-      kgFlyOverride.current = { memoryMb: 4096 };
-      expect(kgFlyMachineSizing("acme/kg", null)).toMatchObject({ cpus: 2, memoryMb: 4096, source: "override" });
-    });
-
-    it("applies a memory override on top of the mapping", () => {
-      kgFlyOverride.current = { memoryMb: 8192 };
-      expect(kgFlyMachineSizing("acme/kg", null)).toMatchObject({ cpuKind: "performance", cpus: 2, memoryMb: 8192, source: "override" });
-    });
-
-    it("forces shared CPUs at the default size", () => {
-      kgFlyOverride.current = { cpuKind: "shared" };
-      expect(kgFlyMachineSizing("acme/kg", null)).toMatchObject({ cpuKind: "shared", cpus: 2, memoryMb: 8192 });
-    });
-
-    it("treats cpuKind auto like unset", () => {
-      kgFlyOverride.current = { cpuKind: "auto" };
-      expect(kgFlyMachineSizing("acme/kg", null).cpuKind).toBe("performance");
-    });
-
-    it("falls back to shared with one log line when performance is below the minimum", () => {
-      const log = vi.spyOn(console, "log").mockImplementation(() => {});
-      try {
-        kgFlyOverride.current = { cpuKind: "performance", memoryMb: 2048 };
-        expect(kgFlyMachineSizing("acme/kg", null)).toMatchObject({ cpuKind: "shared", cpus: 2, memoryMb: 2048 });
-        expect(log.mock.calls.filter((c) => String(c[0]).includes("2048"))).toHaveLength(1);
-      } finally {
-        log.mockRestore();
-      }
-    });
-
-    it("uses the KG floors for unset fields when there is no mapping", () => {
-      const log = vi.spyOn(console, "log").mockImplementation(() => {});
-      try {
-        expect(kgFlyMachineSizing("other/repo", null)).toMatchObject({ cpuKind: "performance", cpus: 2, memoryMb: 8192, source: "default" });
-        kgFlyOverride.current = { memoryMb: 1024 };
-        expect(kgFlyMachineSizing("other/repo", null)).toMatchObject({ cpus: 2, memoryMb: 1024, cpuKind: "shared", source: "override" });
-      } finally {
-        log.mockRestore();
-      }
-    });
+    expect(clearOverride).not.toHaveBeenCalled();
+    err.mockRestore();
   });
 });
 

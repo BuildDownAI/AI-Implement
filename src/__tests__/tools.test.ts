@@ -15,7 +15,7 @@ import {
   kgPath,
   kgHybridSearch,
   getKgStatusTool,
-  setKgFlyMachineTool,
+  setFlyMachineProfileTool,
   flyMachineReuseProbeTool,
   getTenantHealth,
   getIssueReportCardTool,
@@ -45,7 +45,8 @@ import type { KgRefreshToolDeps } from "../restate/kg-refresh-production.js";
 import { getMappings } from "../config.js";
 import { getMachine, createMachine, startMachine, updateMachine, destroyMachine, waitForMachine } from "../fly-machines.js";
 import { setOrchestratorSetting } from "../orchestrator-settings.js";
-import { initSettingsTable, getKgFlyMachineOverride, setKgFlyMachineOverride } from "../runner-mode.js";
+import { initSettingsTable } from "../runner-mode.js";
+import { FLY_MACHINE_PROFILE_DEFAULTS, mergeProfile, type FlyMachineProfileConfig } from "../restate/fly-machine-profile.js";
 import { initLogTable } from "../log.js";
 import { getRestateStatus, setRestateStatus, resetRestateStatus } from "../restate/status.js";
 import { getIssueReportCard, getFleetReport } from "../report-card.js";
@@ -763,7 +764,11 @@ describe("migrated read handlers (AII-711)", () => {
       }));
       const ctx = {
         ...fakeContext("get_kg_status"),
-        objectClient: () => ({ status: async () => opts.inFlight ?? null, lastAdminDryRun: async () => opts.dryRun ?? null }),
+        objectClient: () => ({
+          status: async () => opts.inFlight ?? null,
+          lastAdminDryRun: async () => opts.dryRun ?? null,
+          get: async () => ({ config: { cpuKind: "performance", cpus: 2, memoryMb: 8192, idleTimeoutMs: 1 }, source: "default" }),
+        }),
         workflowClient: () => ({
           status: async () => {
             if (opts.statusThrows) throw new Error("no such workflow");
@@ -1533,65 +1538,66 @@ describe("dispatch reservation tools (AII-1069)", () => {
   });
 });
 
-describe("set_kg_fly_machine / get_kg_status flyMachine (AII-1120)", () => {
-  const mapping = { AII: { owner: "org", repo: "kg", machineCpus: 2, machineMemoryMb: 4096 } };
+describe("set_fly_machine_profile / get_kg_status flyMachine (AII-1130)", () => {
+  // A stand-in for the FlyMachineProfile object that runs the real merge/validation.
+  const store: { current: FlyMachineProfileConfig | null } = { current: null };
+  const setKeys: string[] = [];
+  const profileClient = (key: string) => ({
+    get: async () => ({ config: store.current ?? { ...FLY_MACHINE_PROFILE_DEFAULTS["kg-refresh"] }, source: store.current ? "profile" : "default" }),
+    set: async (patch: Partial<FlyMachineProfileConfig>) => {
+      setKeys.push(key);
+      store.current = mergeProfile(store.current ?? FLY_MACHINE_PROFILE_DEFAULTS["kg-refresh"], patch);
+      return { config: store.current, source: "profile" };
+    },
+  });
+  const ctxFor = (name: string) => ({
+    ...fakeContext(name),
+    objectClient: (_def: unknown, key: string) => profileClient(key),
+  }) as unknown as restate.Context;
 
-  beforeAll(() => initSettingsTable());
   beforeEach(() => {
-    (getMappings as ReturnType<typeof vi.fn>).mockReturnValue(mapping);
+    store.current = null;
+    setKeys.length = 0;
     setKgRefreshToolDeps(kgToolDeps());
-    setKgFlyMachineOverride(null);
   });
-  afterEach(() => {
-    setKgRefreshToolDeps(null);
-    setKgFlyMachineOverride(null);
-  });
+  afterEach(() => setKgRefreshToolDeps(null));
 
   const call = async (args: Record<string, unknown>, caller: Caller = SYSTEM_ADMIN) =>
-    JSON.parse((await setKgFlyMachineTool(fakeContext("set_kg_fly_machine"), { caller, args })).content[0].text);
+    JSON.parse((await setFlyMachineProfileTool(ctxFor("set_fly_machine_profile"), { caller, args: { pipeline: "kg-refresh", ...args } })).content[0].text);
 
-  it("merges fields and reports the effective size", async () => {
-    await call({ cpus: 4 });
-    const res = await call({ memoryMb: 8192 });
-    expect(res.override).toEqual({ cpus: 4, memoryMb: 8192 });
-    expect(res.effective).toEqual({ cpuKind: "performance", cpus: 4, memoryMb: 8192, source: "override" });
-    expect(getKgFlyMachineOverride()).toEqual({ cpus: 4, memoryMb: 8192 });
-  });
-
-  it("clear deletes the override and returns to the KG default size", async () => {
-    await call({ memoryMb: 8192 });
-    const res = await call({ clear: true });
-    expect(res.effective).toEqual({ cpuKind: "performance", cpus: 2, memoryMb: 8192, source: "default" });
-    expect(getKgFlyMachineOverride()).toEqual({});
+  it("sets on the pipeline's key and returns the object's answer", async () => {
+    const res = await call({ memoryMb: 4096 });
+    expect(setKeys).toEqual(["kg-refresh"]);
+    expect(res).toEqual({ config: { cpuKind: "performance", cpus: 2, memoryMb: 4096, idleTimeoutMs: FLY_MACHINE_PROFILE_DEFAULTS["kg-refresh"].idleTimeoutMs }, source: "profile" });
   });
 
   it.each([
     [{ cpus: 3 }, "cpus"],
-    [{ cpus: 1.5 }, "cpus"],
     [{ memoryMb: 100 }, "memoryMb"],
     [{ memoryMb: 70000 }, "memoryMb"],
-    [{ cpuKind: "bogus" }, "cpuKind"],
-  ])("rejects %j with 400 naming %s and writes nothing", async (args, field) => {
+  ])("answers 400 naming %s from the object's rejection", async (args, field) => {
     const res = await call(args);
     expect(res.status).toBe(400);
     expect(res.body.error).toContain(field);
-    expect(getKgFlyMachineOverride()).toEqual({});
   });
 
   it("refuses a user caller", async () => {
-    const result = await setKgFlyMachineTool(fakeContext("set_kg_fly_machine"), { caller: HUMAN_USER, args: { cpus: 2 } });
-    expect(result.content[0].text).toBe("forbidden: set_kg_fly_machine requires the admin role");
-    expect(getKgFlyMachineOverride()).toEqual({});
+    const result = await setFlyMachineProfileTool(ctxFor("set_fly_machine_profile"), { caller: HUMAN_USER, args: { pipeline: "kg-refresh", cpus: 2 } });
+    expect(result.content[0].text).toBe("forbidden: set_fly_machine_profile requires the admin role");
+    expect(setKeys).toEqual([]);
   });
 
-  it("get_kg_status includes flyMachine", async () => {
-    await call({ memoryMb: 8192 });
+  it("get_kg_status reports flyMachine as the profile's config and source", async () => {
+    await call({ memoryMb: 4096 });
     const ctx = {
       ...fakeContext("get_kg_status"),
-      objectClient: () => ({ status: async () => null, lastAdminDryRun: async () => null }),
+      objectClient: (def: { name: string }, key: string) =>
+        def.name === "FlyMachineProfile" ? profileClient(key) : { status: async () => null, lastAdminDryRun: async () => null },
     } as unknown as restate.Context;
     const status = JSON.parse((await getKgStatusTool(ctx, { caller: SYSTEM_ADMIN, args: {} })).content[0].text);
-    expect(status.flyMachine).toEqual({ cpuKind: "performance", cpus: 2, memoryMb: 8192, source: "override" });
+    expect(status.flyMachine).toEqual({
+      cpuKind: "performance", cpus: 2, memoryMb: 4096, idleTimeoutMs: FLY_MACHINE_PROFILE_DEFAULTS["kg-refresh"].idleTimeoutMs, source: "profile",
+    });
   });
 });
 

@@ -181,8 +181,8 @@ export interface KgRefreshStatus {
   stage: KgRefreshStage;
   /** Which materialize path the next refresh will stage (AII-602). */
   materialize: "rdflib" | "direct";
-  /** The effective Fly KG machine size the next Fly refresh will use (`set_kg_fly_machine`). */
-  flyMachine?: { cpuKind: "shared" | "performance"; cpus: number; memoryMb: number; source: "override" | "mapping" | "default" };
+  /** The `kg-refresh` Fly machine profile the next refresh will use (`set_fly_machine_profile`). */
+  flyMachine?: { cpuKind: "shared" | "performance"; cpus: number; memoryMb: number; idleTimeoutMs: number; source: "profile" | "default" };
   /** The `KgRefresh` workflow to look up in the journal: the in-flight run, else the last refresh's; null when neither is known. */
   restate: { service: "KgRefresh"; key: string } | null;
 }
