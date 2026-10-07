@@ -71,7 +71,7 @@ export const preflightStep: StepModule<PreflightInputs, PreflightOutputs> = {
           failureReason = `exit ${e.status}`;
           marker = `[exit ${e.status}]`;
         } else if (code === "ENOBUFS") {
-          failureReason = "ENOBUFS: output over 64 MiB";
+          failureReason = `ENOBUFS: output over ${MAX_OUTPUT_BYTES / 1024 / 1024} MiB`;
           marker = `[${code}]`;
         } else {
           failureReason = code ?? (typeof e.signal === "string" ? e.signal : "error");
