@@ -137,6 +137,7 @@ import { createPlanningAdmissionTerminationHook, createPlanningRunIngressClient 
 import { setKgRefreshToolDeps } from "./restate/tools.js";
 import type { RestateRegisterOutcome, RestateRegisterResult } from "./restate/endpoint.js";
 import { getRestateStatus, setRestateStatus } from "./restate/status.js";
+import { handleJournalRequest } from "./restate/journal-query.js";
 import type { RestateRegistrationStatus } from "./restate/status.js";
 import { setAdmissionTerminationCheck, setProviderRegistry, setReviewFixAttemptsFacade } from "./restate/tools.js";
 import { callTool, callToolAsSystem } from "./restate/tools-client.js";
@@ -4878,7 +4879,7 @@ function startServer(
         },
         notifyWebhookUrl: config.notifyWebhookUrl,
       }, registry, { startDeploy, selfDeployTarget: config.selfDeployTarget, kgRefresh: kgRefreshAdminDeps, callTool, getRestateStatus,
-        reviewFixAttempts })) return;
+        reviewFixAttempts, readJournal: handleJournalRequest })) return;
     }
 
     res.writeHead(404, { "Content-Type": "application/json" });

@@ -5027,6 +5027,49 @@ describe("per-page grants", () => {
     });
   });
 
+  describe("journal grant", () => {
+    const journalFetch = vi.fn();
+    const journalDeps = {
+      readJournal: (query: Record<string, string>) => journalModule.handleJournalRequest(query, { fetchImpl: journalFetch as never }),
+    };
+    let journalModule: typeof import("../restate/journal-query.js");
+    beforeEach(async () => {
+      journalFetch.mockReset();
+      journalModule = await import("../restate/journal-query.js");
+    });
+
+    it("answers 400 on a bad lookup and never calls the admin API", async () => {
+      const res = await requestWithDeps("/api/restate/journal?service=KgRefresh&key=x'y", "GET", adminSsoSession(), journalDeps);
+      expect(res.statusCode).toBe(400);
+      expect(JSON.parse(res.body).error).toMatch(/^key/);
+      expect(journalFetch).not.toHaveBeenCalled();
+    });
+
+    it("refuses a user with no grant, and admits one with the grant despite the query string", async () => {
+      const path = "/api/restate/journal?service=KgRefresh&key=abc";
+      expect((await requestWithDeps(path, "GET", userSession(), journalDeps)).statusCode).toBe(403);
+      accessGrants.savePageGrants(["journal"], "ada@eudoxus.ai");
+      journalFetch.mockResolvedValue(new Response(JSON.stringify({ rows: [] }), { status: 200 }));
+      expect((await requestWithDeps(path, "GET", userSession(), journalDeps)).statusCode).toBe(404);
+      expect(journalFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it("admits an admin without a grant", async () => {
+      journalFetch.mockResolvedValue(new Response(JSON.stringify({ rows: [] }), { status: 200 }));
+      const res = await requestWithDeps("/api/restate/journal?id=inv_1", "GET", adminSsoSession(), journalDeps);
+      expect(res.statusCode).toBe(404);
+      expect(JSON.parse(res.body)).toEqual({ error: "no invocation" });
+    });
+
+    it("answers 503 when the admin API throws", async () => {
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      journalFetch.mockRejectedValue(new Error("down"));
+      const res = await requestWithDeps("/api/restate/journal?id=inv_1", "GET", adminSsoSession(), journalDeps);
+      expect(res.statusCode).toBe(503);
+      expect(JSON.parse(res.body)).toEqual({ error: "restate unavailable" });
+    });
+  });
+
   describe("the grants endpoints", () => {
     it("returns what is granted alongside everything grantable", async () => {
       accessGrants.savePageGrants(["issues"], "ada@eudoxus.ai");
