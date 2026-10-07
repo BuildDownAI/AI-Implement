@@ -57,6 +57,10 @@ export function restateRetentionMs(): number {
   return getRestateRetentionDays() * DAY_MS;
 }
 
+/**
+ * Read by the volume-snapshot boot step (AII-1133). It has no caller in this
+ * change by design: step 5a of the chain adds this module, 5b the consumer.
+ */
 export function getVolumeSnapshotRetentionDays(): number {
   return readDaysSetting(VOLUME_SNAPSHOT_RETENTION_DAYS_KEY);
 }
