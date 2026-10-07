@@ -1486,6 +1486,7 @@ describe("handleMcpRequest", () => {
         stage: "serving",
         materialize: "direct",
         flyMachine: { cpuKind: "performance", cpus: 2, memoryMb: 8192, source: "default" },
+        restate: null,
       };
 
       const result = await callMcp(

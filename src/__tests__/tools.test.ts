@@ -836,10 +836,18 @@ describe("migrated read handlers (AII-711)", () => {
       expect(status.servedStamp).toBeNull();
     });
 
+    it("restate: marker triggerId wins, else lastRefresh.dispatchId, else null", async () => {
+      const withId = { ...ok, dispatchId: "d-last" } as RefreshOutcome;
+      expect((await stageFor({ inFlight: { triggerId: "t1", startedAt: 1 }, last: withId })).restate).toEqual({ service: "KgRefresh", key: "t1" });
+      expect((await stageFor({ last: withId })).restate).toEqual({ service: "KgRefresh", key: "d-last" });
+      expect((await stageFor({ last: ok })).restate).toBeNull();
+      expect((await stageFor({})).restate).toBeNull();
+    });
+
     it("keeps the KgRefreshStatus shape", async () => {
       const status = await stageFor({ last: ok });
       expect(Object.keys(status).sort()).toEqual(
-        ["deployHeld", "flyMachine", "kgDegraded", "kgUnavailable", "lastDryRun", "lastRefresh", "materialize", "running", "servedStamp", "sidecar", "stage"].sort(),
+        ["deployHeld", "flyMachine", "kgDegraded", "kgUnavailable", "lastDryRun", "lastRefresh", "materialize", "restate", "running", "servedStamp", "sidecar", "stage"].sort(),
       );
     });
   });

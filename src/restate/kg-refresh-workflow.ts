@@ -253,7 +253,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       opts: { timedOut?: boolean; skipOutcome?: boolean } = {},
     ): Promise<RefreshOutcome> {
       // A dry-run is not a refresh: it never writes the last-refresh record or notifies the operator.
-      if (!input.dryRun) await ctx.run("persist", () => deps.persistLastRefresh(outcome));
+      if (!input.dryRun) await ctx.run("persist", () => deps.persistLastRefresh({ ...outcome, dispatchId }));
       await ctx.run("close-row", () => deps.closeJobLog(jobId, opts.timedOut ? "timed_out" : "failed", conclusion));
       if (input.dryRun) {
         if (input.report) {
@@ -634,7 +634,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         detail: `refreshed: ${railCtx.stampBefore ?? "baked"} -> ${railCtx.stampAfter}`,
         stampBefore: railCtx.stampBefore ?? null, stampAfter: railCtx.stampAfter ?? null,
       };
-      await ctx.run("persist", () => deps.persistLastRefresh(successOutcome));
+      await ctx.run("persist", () => deps.persistLastRefresh({ ...successOutcome, dispatchId }));
       ctx.set("step", "close-row");
       await ctx.run("close-row", () => deps.closeJobLog(jobId, "completed"));
       ctx.set("step", "outcome");
