@@ -8,7 +8,17 @@ import * as restate from "@restatedev/restate-sdk";
 import type { RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { readJournal } from "../../restate/journal-query.js";
-import { callWorkflow, eventually, queryInvocations, startVariants, stopAll } from "./harness.js";
+import { callWorkflow, eventually, settle, startVariants, stopAll } from "./harness.js";
+
+const objectProbe = restate.object({
+  name: "JournalObjectProbeTest",
+  handlers: {
+    touch: async (ctx: restate.ObjectContext, tag: string): Promise<string> => {
+      await ctx.run(`touch-${tag}`, async () => tag);
+      return tag;
+    },
+  },
+});
 
 const journalProbe = restate.workflow({
   name: "JournalProbeTest",
@@ -26,7 +36,7 @@ const journalProbe = restate.workflow({
 describe("readJournal against the real admin API", () => {
   let envs: Map<string, RestateTestEnvironment>;
   beforeAll(async () => {
-    envs = await startVariants([journalProbe]);
+    envs = await startVariants([journalProbe, objectProbe]);
   }, 60_000);
   afterAll(async () => {
     if (envs) await stopAll(envs);
@@ -48,36 +58,52 @@ describe("readJournal against the real admin API", () => {
     await callWorkflow<void>(base, "JournalProbeTest", key, "resolve", "the-value");
     expect(await started).toBe("the-value");
 
-    // A workflow key owns one invocation per handler call, and the key lookup answers the newest —
-    // here the shared `resolve` call. The `run` invocation is reached by id.
-    const latest = await eventually(
-      () => readJournal({ service: "JournalProbeTest", key }, { adminBaseUrl }),
-      (r) => r?.invocation.status === "completed",
-      { label: "latest invocation completed" },
-    );
-    expect(latest!.invocation.target_handler_name).toBe("resolve");
-    const promise = latest!.promises.find((p) => p.key === "probe-promise");
-    expect(promise?.completed).toBe(true);
-    expect(String(promise?.completion_success_value_utf8)).toContain("the-value");
-
-    const runId = (await queryInvocations(adminBaseUrl, `target_service_name = 'JournalProbeTest' AND target_service_key = '${key}' AND target_handler_name = 'run'`))[0].id as string;
+    // A workflow key owns one invocation per handler call (`run`, then the shared `resolve`); the key
+    // lookup answers `run`.
     const result = await eventually(
-      () => readJournal({ id: runId }, { adminBaseUrl }),
+      () => readJournal({ service: "JournalProbeTest", key }, { adminBaseUrl }),
       (r) => r?.invocation.status === "completed",
       { label: "run invocation completed" },
     );
-    expect(result!.invocation.status).toBe("completed");
+    expect(result!.invocation.target_handler_name).toBe("run");
     const indexes = result!.entries.map((e) => Number(e.index));
     expect(indexes).toEqual([...indexes].sort((a, b) => a - b));
     const stepAt = result!.entries.findIndex((e) => e.name === "probe-step");
     const promiseAt = result!.entries.findIndex((e) => e.entryType === "Command: GetPromise");
     expect(stepAt).toBeGreaterThanOrEqual(0);
     expect(promiseAt).toBeGreaterThan(stepAt);
-    expect(result!.promises.find((p) => p.key === "probe-promise")?.completed).toBe(true);
+    const promise = result!.promises.find((p) => p.key === "probe-promise");
+    expect(promise?.completed).toBe(true);
+    expect(String(promise?.completion_success_value_utf8)).toContain("the-value");
 
-    const byId = await readJournal({ id: String(latest!.invocation.id) }, { adminBaseUrl });
-    expect(byId?.invocation.id).toBe(latest!.invocation.id);
+    const byId = await readJournal({ id: String(result!.invocation.id) }, { adminBaseUrl });
+    expect(byId?.invocation.id).toBe(result!.invocation.id);
 
     expect(await readJournal({ service: "JournalProbeTest", key: `unknown-${randomUUID()}` }, { adminBaseUrl })).toBeNull();
+  });
+
+  it.each(["alwaysReplay", "disableRetries"])("answers the newest call for a virtual-object key (%s)", async (label) => {
+    const env = envs.get(label);
+    if (!env) throw new Error(`missing Restate variant ${label}`);
+    const key = `obj-${randomUUID()}`;
+    const adminBaseUrl = env.adminAPIBaseUrl();
+    const call = async (tag: string): Promise<void> => {
+      const res = await fetch(`${env.baseUrl()}/JournalObjectProbeTest/${key}/touch`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(tag),
+      });
+      expect(res.ok).toBe(true);
+    };
+    await call("first");
+    await settle(50);
+    await call("second");
+
+    const result = await eventually(
+      () => readJournal({ service: "JournalObjectProbeTest", key }, { adminBaseUrl }),
+      (r) => r?.invocation.status === "completed" && r.entries.some((e) => e.name === "touch-second"),
+      { label: "newest object call answered" },
+    );
+    expect(result!.entries.some((e) => e.name === "touch-first")).toBe(false);
   });
 });
