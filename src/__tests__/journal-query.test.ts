@@ -87,6 +87,15 @@ describe("readJournal", () => {
     const lastBody = JSON.parse((fetchImpl.mock.calls[2][1] as { body: string }).body).query as string;
     expect(lastBody).toContain("service_name = 'KgRefresh' AND service_key = 'k'");
   });
+
+  it("skips the promises query for a keyless service instead of matching the string 'null'", async () => {
+    const keyless = { ...invocation, target_service_name: "orchestratorTools", target_service_key: null };
+    const fetchImpl = rowsFetch([[keyless], []]);
+    const result = await readJournal({ id: "inv_1" }, { fetchImpl: fetchImpl as never, adminBaseUrl: "http://x" });
+    expect(result?.promises).toEqual([]);
+    // invocation + journal only; no third (promises) query
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe("handleJournalRequest", () => {
