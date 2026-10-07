@@ -115,5 +115,6 @@ describe("decideExpire", () => {
     expect(decideExpire(idle("A", 200), 100)).toEqual({ kind: "noop" });
     expect(decideExpire(held("A", "d1", 1, 100), 100)).toEqual({ kind: "noop" });
     expect(decideExpire(null, 100)).toEqual({ kind: "noop" });
+    expect(decideExpire(held(undefined, "d1", 1, 100), 100)).toEqual({ kind: "noop" });
   });
 });

@@ -221,6 +221,17 @@ describe("FlyMachineProfile kept machine", () => {
     expect((await h.status())?.heldBy).toEqual({ dispatchId: "d1", attempt: 1 });
   });
 
+  it.each(labels)("claim without attach, then release: no Fly call, hold and machine cleared, no expire (%s)", async (label) => {
+    const key = fresh();
+    const h = forKey(label, key);
+    const before = mark(fly);
+    expect(await h.call("claim", { dispatchId: "d1", attempt: 1 })).toEqual({ machineId: null });
+    await h.call("release", { dispatchId: "d1" });
+    expect(fly.calls.length).toBe(before);
+    expect(await h.status()).toBeNull();
+    expect(await h.expires()).toHaveLength(0);
+  });
+
   it.each(labels)("an expire for an earlier release leaves a re-held, re-released machine alone (%s)", async (label) => {
     const key = fresh();
     const h = forKey(label, key);
