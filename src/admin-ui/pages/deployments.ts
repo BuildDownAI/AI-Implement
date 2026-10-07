@@ -86,6 +86,30 @@ export const deploymentsHtml = `
       </div>
     </div>
 
+    <div class="card" id="deployments-retention">
+      <div class="card-header"><h2 class="card-title">Retention</h2></div>
+      <div class="card-body">
+        <div style="display: flex; gap: 16px; flex-wrap: wrap">
+          <div>
+            <div class="kpi-label" style="margin-bottom: 6px">Restate retention (days)</div>
+            <input type="number" class="input" id="deployments-retention-restate" step="1"
+              oninput="window.refreshRetentionDirty()">
+          </div>
+          <div>
+            <div class="kpi-label" style="margin-bottom: 6px">Volume snapshot retention (days)</div>
+            <input type="number" class="input" id="deployments-retention-volume" step="1"
+              oninput="window.refreshRetentionDirty()">
+          </div>
+        </div>
+        <div class="kpi-trend text-secondary" id="deployments-retention-applies" style="margin-top: 8px"></div>
+        <div class="kpi-trend text-secondary" id="deployments-retention-applied" style="margin-top: 4px"></div>
+        <div class="kpi-trend" id="deployments-retention-error" style="color: var(--color-warn); margin-top: 4px" hidden></div>
+        <div style="margin-top: 12px">
+          <button class="btn btn-primary btn-sm" id="deployments-retention-save" onclick="window.saveRetention()" disabled>Save</button>
+        </div>
+      </div>
+    </div>
+
     <div id="deployments-cta" hidden style="text-align: center">
       <div style="display: inline-flex; flex-direction: column; align-items: center; gap: 8px">
         <button class="btn btn-accent btn-lg" id="deployments-deploy-btn" onclick="window.triggerDeploy()">Deploy now</button>
@@ -650,6 +674,72 @@ export const deploymentsScript = `
     loadDeployments();
   }
 
+  let savedRetention = null;
+
+  function retentionDirty() {
+    if (!savedRetention) return false;
+    return document.getElementById('deployments-retention-restate').value !== String(savedRetention.restate.days)
+      || document.getElementById('deployments-retention-volume').value !== String(savedRetention.volume.days);
+  }
+
+  function refreshRetentionDirty() {
+    document.getElementById('deployments-retention-save').disabled = !retentionDirty();
+  }
+
+  function renderRetention(data) {
+    savedRetention = data;
+    document.getElementById('deployments-retention-restate').value = String(data.restate.days);
+    document.getElementById('deployments-retention-volume').value = String(data.volume.days);
+    for (const id of ['deployments-retention-restate', 'deployments-retention-volume']) {
+      const el = document.getElementById(id);
+      el.min = String(data.min);
+      el.max = String(data.max);
+    }
+    document.getElementById('deployments-retention-applies').innerHTML =
+      'Restate retention applies at the ' + window.esc(data.restate.appliesAt);
+    const last = data.volume.lastApplied;
+    let text = 'Volume retention: not applied since boot';
+    if (last) {
+      text = 'Volume retention last applied ' + fmtAgo(last.at) + ': ' + last.applied.length + ' volume(s) changed'
+        + (last.skipped ? ', not applied — ' + last.skipped : '');
+    }
+    document.getElementById('deployments-retention-applied').textContent = text;
+    refreshRetentionDirty();
+  }
+
+  async function loadRetention() {
+    try {
+      const res = await window.api('/api/retention');
+      if (res.ok) renderRetention(await res.json());
+    } catch (err) {
+      // The card keeps its last values; the rest of the page does not depend on it.
+    }
+  }
+
+  async function saveRetention() {
+    const errEl = document.getElementById('deployments-retention-error');
+    errEl.hidden = true;
+    // Only the changed field is sent, so saving one value cannot re-apply the other.
+    const patch = {};
+    const restateVal = document.getElementById('deployments-retention-restate').value;
+    const volumeVal = document.getElementById('deployments-retention-volume').value;
+    if (restateVal !== String(savedRetention.restate.days)) patch.restate = Number(restateVal);
+    if (volumeVal !== String(savedRetention.volume.days)) patch.volume = Number(volumeVal);
+    try {
+      const res = await window.api('/api/retention', { method: 'POST', body: JSON.stringify(patch) });
+      if (res.ok) {
+        renderRetention(await res.json());
+      } else if (res.status !== 401) {
+        const body = await res.json().catch(function () { return {}; });
+        errEl.textContent = body.error || 'Could not save the retention settings';
+        errEl.hidden = false;
+      }
+    } catch (err) {
+      errEl.textContent = 'Could not save the retention settings — ' + String(err);
+      errEl.hidden = false;
+    }
+  }
+
   async function checkNow() {
     const btn = document.getElementById('deployments-check-now-btn');
     btn.disabled = true;
@@ -675,9 +765,13 @@ export const deploymentsScript = `
   window.refreshPolicyDirty = refreshPolicyDirty;
   window.loadDeployRefs = loadDeployRefs;
   window.checkNow = checkNow;
+  window.saveRetention = saveRetention;
+  window.refreshRetentionDirty = refreshRetentionDirty;
+  window.loadRetention = loadRetention;
 
   window.registerPage('deployments', function () {
     loadDeployments();
+    loadRetention();
     setInterval(loadDeployments, 30000);
   });
 })();

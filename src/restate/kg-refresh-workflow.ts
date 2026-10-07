@@ -40,7 +40,8 @@ import { FlyMachineProfile, type FlyMachineProfileConfig } from "./fly-machine-p
 import type { BackendRunRead } from "../backend-run.js";
 import type { MachineExit } from "../fly-machines.js";
 import { parseKgSourceRepo } from "../deploy.js";
-import type { KgRepoDefinition } from "./kg-refresh-types.js";
+import type { Step } from "../pipeline/types.js";
+import { KG_REFRESH_RUNNER_STEPS, type KgRepoDefinition } from "./kg-refresh-types.js";
 import { readBoundedOwnedRun } from "./owned-run-lifecycle.js";
 import { awaitOwnedRun, type OwnedRunStatus } from "./owned-run-wait.js";
 import { restateRetentionMs } from "./retention.js";
@@ -107,6 +108,8 @@ export interface KgRefreshStatusResult {
   triggerId: string | null;
   runId: number | null;
   dryRun: boolean;
+  /** The last runner step with a resolved step promise, in pipeline order; `null` before the first report. */
+  runnerStep: { id: string; status: string } | null;
 }
 
 export interface KgDispatchResult {
@@ -738,11 +741,22 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
     return { status: "accepted" };
   }
 
-  async function progress(ctx: WorkflowSharedContext): Promise<void> {
+  async function progress(ctx: WorkflowSharedContext, raw: { step?: Step }): Promise<void> {
     await requireStarted(ctx);
     // Producers: handleRunnerProgress in src/runner-callback.ts, and the `watch` read in waitForOutcome (this file).
     const promise = ctx.promise<boolean>("progress");
     if (await promise.peek() === undefined) await promise.resolve(true);
+
+    // Step promises are evidence for `status`, never wait signals (ADR 034). A shared handler cannot write state.
+    const step = raw?.step;
+    if (!step || typeof step.id !== "string") return;
+    // Promise names stay bounded (ids x 2): an id outside the pipeline is accepted and ignored.
+    if (!(KG_REFRESH_RUNNER_STEPS as readonly string[]).includes(step.id)) return;
+    // A late report from a machine that is shutting down is not an error.
+    if (await ctx.get<boolean>("completed")) return;
+    // Producer: handleRunnerProgress in src/runner-callback.ts (the step body arrives redacted).
+    const stepPromise = ctx.promise<Step>(`step:${step.id}:${step.status === "running" ? "running" : "ended"}`);
+    if (await stepPromise.peek() === undefined) await stepPromise.resolve(step);
   }
 
   async function cancel(ctx: WorkflowSharedContext, raw: { reason?: string }): Promise<void> {
@@ -761,7 +775,17 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       ctx.get<number>("runId"),
       ctx.get<boolean>("dryRun"),
     ]);
-    return { step: step ?? null, startedAt: startedAt ?? null, triggerId: triggerId ?? null, runId: runId ?? null, dryRun: dryRun === true };
+    let runnerStep: KgRefreshStatusResult["runnerStep"] = null;
+    for (const id of KG_REFRESH_RUNNER_STEPS) {
+      const ended = await ctx.promise<Step>(`step:${id}:ended`).peek();
+      if (ended !== undefined) {
+        runnerStep = { id, status: ended.status };
+        continue;
+      }
+      const running = await ctx.promise<Step>(`step:${id}:running`).peek();
+      if (running !== undefined) runnerStep = { id, status: running.status };
+    }
+    return { step: step ?? null, startedAt: startedAt ?? null, triggerId: triggerId ?? null, runId: runId ?? null, dryRun: dryRun === true, runnerStep };
   }
 
   return restate.workflow({

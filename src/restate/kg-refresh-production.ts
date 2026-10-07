@@ -31,6 +31,7 @@ import { getRunnerMode, getKgFlyMachineOverride, setKgFlyMachineOverride, type K
 import { mintRunToken } from "../runner-tokens.js";
 import type { JobStatus } from "../log.js";
 import { appendLogIfAbsent, findLogIdByDispatchId, updateJobMachineDetails, updateJobPrUrl, updateJobRunId } from "../log.js";
+import { clearMachineEnv, destroyMachine, getMachine, updateMachineMetadata } from "../fly-machines.js";
 import type { RestateService } from "./endpoint.js";
 import {
   createKgRefreshWorkflow,
@@ -40,8 +41,9 @@ import {
   type KgRefreshStatusResult,
   type KgRefreshWorkflowDependencies,
 } from "./kg-refresh-workflow.js";
-import { FLY_MACHINE_PROFILE_DEFAULTS, createFlyMachineProfile, type FlyMachineProfileConfig, type FlyMachineProfileDefinition } from "./fly-machine-profile.js";
+import { FLY_MACHINE_PROFILE_DEFAULTS, createFlyMachineProfile, type FlyMachineProfileConfig, type FlyMachineProfileDefinition, type FlyMachineProfileDeps } from "./fly-machine-profile.js";
 import { createKgRepo, type KgRepoEnqueueInput, type KgRepoEnqueueResult, type KgRepoPrInput, type KgRepoTriggerResult, type StoredDryRunOutcome } from "./kg-repo.js";
+import type { Step } from "../pipeline/types.js";
 import type { KgRefreshDefinition, KgRepoDefinition } from "./kg-refresh-types.js";
 import { RESTATE_INGRESS_BASE_URL } from "./server.js";
 
@@ -357,8 +359,29 @@ export function createProductionKgRefreshServices(
   };
 
   return {
-    services: [createKgRepo({ workflowName: "KgRefresh" }), createFlyMachineProfile(), createKgRefreshWorkflow(deps)],
+    services: [createKgRepo({ workflowName: "KgRefresh" }), createFlyMachineProfile(buildFlyMachineProfileDeps()), createKgRefreshWorkflow(deps)],
     toolDeps,
+  };
+}
+
+/**
+ * Binds the profile object's Fly calls to FLY_SESSIONS_TOKEN + FLY_SESSIONS_APP. When either is unset
+ * the object still registers (boot stays non-fatal) and a handler that needs Fly fails when it runs.
+ */
+export function buildFlyMachineProfileDeps(env: NodeJS.ProcessEnv = process.env): FlyMachineProfileDeps {
+  const token = env.FLY_SESSIONS_TOKEN;
+  const app = env.FLY_SESSIONS_APP;
+  const bound = <A extends unknown[], R>(fn: (token: string, app: string, ...args: A) => Promise<R>) => async (...args: A): Promise<R> => {
+    if (!token || !app) throw new Error("FLY_SESSIONS_TOKEN + FLY_SESSIONS_APP are not configured");
+    return fn(token, app, ...args);
+  };
+  return {
+    fly: {
+      getMachine: bound(getMachine),
+      clearMachineEnv: bound(clearMachineEnv),
+      updateMachineMetadata: bound(updateMachineMetadata),
+      destroyMachine: bound((t, a, id: string) => destroyMachine(t, a, id)),
+    },
   };
 }
 
@@ -375,7 +398,7 @@ export type KgIngressResult<T = undefined> =
 
 export interface KgRefreshIngressClient {
   report(triggerId: string, body: KgRefreshReportBody, opts?: { idempotencyKey?: string }): Promise<KgIngressResult<{ status: "accepted" | "duplicate" }>>;
-  progress(triggerId: string): Promise<KgIngressResult>;
+  progress(triggerId: string, step?: Step): Promise<KgIngressResult>;
   cancel(triggerId: string, reason: string): Promise<KgIngressResult>;
   status(triggerId: string): Promise<KgIngressResult<KgRefreshStatusResult>>;
   repoStatus(slug: string): Promise<KgIngressResult<{ triggerId: string; startedAt: number } | null>>;
@@ -431,7 +454,7 @@ export function createKgRefreshIngressClient(
   return {
     report: (triggerId, body, opts) =>
       invoke<{ status: "accepted" | "duplicate" }>(() => refresh(triggerId).report(body, callOpts(opts?.idempotencyKey)), { notFound: true, conflict: true }),
-    progress: (triggerId) => invoke(() => refresh(triggerId).progress(callOpts()), { notFound: true }),
+    progress: (triggerId, step) => invoke(() => refresh(triggerId).progress(step ? { step } : {}, callOpts()), { notFound: true }),
     cancel: (triggerId, reason) => invoke(() => refresh(triggerId).cancel({ reason }, callOpts()), { notFound: true }),
     status: (triggerId) => invoke<KgRefreshStatusResult>(() => refresh(triggerId).status(callOpts()), { notFound: true }),
     repoStatus: (slug) => invoke<{ triggerId: string; startedAt: number } | null>(() => repo(slug).status(callOpts())),

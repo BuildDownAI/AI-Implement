@@ -196,6 +196,19 @@ export async function updateMachine(
 }
 
 /**
+ * Reads the machine, then replaces its config with the same one and `env: {}`. Fly's update on a
+ * stopped machine applies the config without starting it (AII-1123), so this never calls `start`.
+ */
+export async function clearMachineEnv(
+  token: string,
+  appName: string,
+  machineId: string,
+): Promise<void> {
+  const machine = await getMachine(token, appName, machineId);
+  await updateMachine(token, appName, machineId, { ...machine.config, env: {} });
+}
+
+/**
  * Process exit code from a stopped machine's terminal event, or null when unreadable.
  * Verified against live Fly machines (2026-07):
  *   - clean exit N≠0 → type "exit",  exit_event.exit_code = N   (guest_exit_code omitted)
