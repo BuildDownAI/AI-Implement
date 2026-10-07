@@ -28,12 +28,12 @@ const CREDS = { githubAppId: "test-app-id", githubAppPrivateKey: "test-key" };
 
 const RESULT: WorkflowSyncModule.WorkflowSyncResult = {
   status: "pr-opened",
-  targetRepo: "org/app",
+  targetRepo: "test-org/test-repo",
   baseBranch: "main",
   syncBranch: "sync/ai-implement",
   changedFiles: [".github/workflows/claude-implement.yml"],
   prNumber: 42,
-  prUrl: "https://github.com/org/app/pull/42",
+  prUrl: "https://github.com/test-org/test-repo/pull/42",
 };
 
 beforeEach(async () => {

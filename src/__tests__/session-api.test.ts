@@ -10,7 +10,9 @@ vi.mock("../status-events.js", () => ({
   postStatusComment: vi.fn(),
 }));
 
-const mappingsFor = (teamKey: string) => () => ({ [teamKey]: makeMapping() });
+const mappingsFor = (teamKey: string) => () => ({
+  [teamKey]: makeMapping({ owner: "acme", repo: "repo", executionMode: "fly-machines" }),
+});
 
 class MockRequest extends EventEmitter {
   url?: string;

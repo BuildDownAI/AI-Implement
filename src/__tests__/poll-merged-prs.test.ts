@@ -46,7 +46,7 @@ describe("detectMergedPrs", () => {
     await mod.detectMergedPrs({
       getPullRequestState: vi.fn(async () => ({ merged: true, state: "closed" as const })),
       tokenForOwner: async () => "tok",
-      mappingForRepo: () => makeMapping(),
+      mappingForRepo: () => makeMapping({ owner: "o", repo: "r" }),
     });
     expect(recon.getPendingReconciliations()).toHaveLength(1);
     expect(recon.getPendingReconciliations()[0].issueIdentifier).toBe("OOL-183");
@@ -58,7 +58,7 @@ describe("detectMergedPrs", () => {
     await mod.detectMergedPrs({
       getPullRequestState,
       tokenForOwner: async () => "tok",
-      mappingForRepo: () => makeMapping(),
+      mappingForRepo: () => makeMapping({ owner: "o", repo: "r" }),
     });
     expect(getPullRequestState).not.toHaveBeenCalled();
     expect(recon.getPendingReconciliations()).toHaveLength(0);
@@ -70,7 +70,7 @@ describe("detectMergedPrs", () => {
     await mod.detectMergedPrs({
       getPullRequestState,
       tokenForOwner: async () => "tok",
-      mappingForRepo: () => makeMapping(),
+      mappingForRepo: () => makeMapping({ owner: "o", repo: "r" }),
     });
     expect(recon.getPendingReconciliations()).toHaveLength(1);
   });
@@ -80,7 +80,7 @@ describe("detectMergedPrs", () => {
     const deps = {
       getPullRequestState,
       tokenForOwner: async () => "tok",
-      mappingForRepo: () => makeMapping(),
+      mappingForRepo: () => makeMapping({ owner: "o", repo: "r" }),
     };
     await mod.detectMergedPrs(deps);
     expect(recon.hasReconciliationForPr("o/r", 5)).toBe(true);
@@ -94,7 +94,7 @@ describe("detectMergedPrs", () => {
     await mod.detectMergedPrs({
       getPullRequestState,
       tokenForOwner: async () => "tok",
-      mappingForRepo: () => makeMapping(),
+      mappingForRepo: () => makeMapping({ owner: "o", repo: "r" }),
     });
     expect(recon.hasReconciliationForPr("o/r", 5)).toBe(false);
   });
@@ -110,7 +110,7 @@ describe("detectMergedPrs", () => {
     await mod.detectMergedPrs({
       getPullRequestState,
       tokenForOwner: async () => "tok",
-      mappingForRepo: () => makeMapping(),
+      mappingForRepo: () => makeMapping({ owner: "o", repo: "r" }),
     });
     expect(recon.getPendingReconciliations()).toHaveLength(1);
   });
@@ -121,7 +121,7 @@ describe("detectMergedPrs", () => {
     await mod.detectMergedPrs({
       getPullRequestState,
       tokenForOwner: async () => "tok",
-      mappingForRepo: () => makeMapping(),
+      mappingForRepo: () => makeMapping({ owner: "o", repo: "r" }),
     });
     expect(getPullRequestState).not.toHaveBeenCalled();
   });

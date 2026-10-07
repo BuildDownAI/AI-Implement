@@ -6,9 +6,14 @@ import type { LLMExecutor } from "../pipeline/types.js";
 import { DEFAULT_MODEL } from "../pipeline/default-model.js";
 import type { ReferenceRepoResult } from "../reference-repos.js";
 import { makeContext, makeExecutor } from "./helpers/builders.js";
+import { testDir } from "./helpers/test-dir.js";
 
 describe("implementStep", () => {
+  // The step reads changed files with `git diff` in the workspace; an empty directory reports none.
+  let workspaceDir: string;
+
   beforeEach(() => {
+    workspaceDir = testDir("implement");
     vi.clearAllMocks();
   });
 
@@ -18,7 +23,7 @@ describe("implementStep", () => {
 
     await implementStep.run(
       ctx,
-      { workspaceDir: "/tmp/test", prompt: "Implement feature X", model: "claude-sonnet-4-5" },
+      { workspaceDir, prompt: "Implement feature X", model: "claude-sonnet-4-5" },
       new NoopStepReporter(),
     );
 
@@ -33,7 +38,7 @@ describe("implementStep", () => {
 
     await implementStep.run(
       ctx,
-      { workspaceDir: "/tmp/test", prompt: "Do it" },
+      { workspaceDir, prompt: "Do it" },
       new NoopStepReporter(),
     );
 
@@ -48,7 +53,7 @@ describe("implementStep", () => {
 
     await implementStep.run(
       ctx,
-      { workspaceDir: "/tmp/test", prompt: "Do it", planningContext: "Use factory pattern" },
+      { workspaceDir, prompt: "Do it", planningContext: "Use factory pattern" },
       new NoopStepReporter(),
     );
 
@@ -63,7 +68,7 @@ describe("implementStep", () => {
 
     const outputs = await implementStep.run(
       ctx,
-      { workspaceDir: "/tmp/test", prompt: "Do it" },
+      { workspaceDir, prompt: "Do it" },
       new NoopStepReporter(),
     );
 
@@ -77,7 +82,7 @@ describe("implementStep", () => {
     const ctx = makeContext({}, executor);
 
     await expect(
-      implementStep.run(ctx, { workspaceDir: "/tmp/test", prompt: "Do it" }, new NoopStepReporter()),
+      implementStep.run(ctx, { workspaceDir, prompt: "Do it" }, new NoopStepReporter()),
     ).rejects.toThrow("exit code 1");
   });
 
@@ -90,7 +95,7 @@ describe("implementStep", () => {
     const ctx = makeContext({}, executor);
 
     const err = await implementStep
-      .run(ctx, { workspaceDir: "/tmp/test", prompt: "Do it" }, new NoopStepReporter())
+      .run(ctx, { workspaceDir, prompt: "Do it" }, new NoopStepReporter())
       .catch((e: unknown) => e);
 
     expect(err).toBeInstanceOf(Error);
@@ -123,7 +128,7 @@ describe("implementStep", () => {
     const ctx = makeContext({}, executor);
 
     const err = await implementStep
-      .run(ctx, { workspaceDir: "/tmp/test", prompt: "Do it" }, new NoopStepReporter())
+      .run(ctx, { workspaceDir, prompt: "Do it" }, new NoopStepReporter())
       .catch((e: unknown) => e);
 
     expect(err).toBeInstanceOf(Error);
@@ -151,7 +156,7 @@ describe("implementStep", () => {
     const ctx = makeContext({}, executor);
 
     const err = await implementStep
-      .run(ctx, { workspaceDir: "/tmp/test", prompt: "Do it" }, new NoopStepReporter())
+      .run(ctx, { workspaceDir, prompt: "Do it" }, new NoopStepReporter())
       .catch((e: unknown) => e);
 
     const failure = (err as Error & { failure?: { elapsedMs?: number } }).failure;
@@ -162,7 +167,7 @@ describe("implementStep", () => {
     const executor = makeExecutor();
     const ctx = makeContext({ retryPolicy: DEFAULT_RETRY_POLICY }, executor);
 
-    await implementStep.run(ctx, { workspaceDir: "/tmp/test", prompt: "Do it" }, new NoopStepReporter());
+    await implementStep.run(ctx, { workspaceDir, prompt: "Do it" }, new NoopStepReporter());
 
     expect(executor.invoke).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -180,7 +185,7 @@ describe("implementStep", () => {
     const executor = makeExecutor();
     const ctx = makeContext({}, executor);
 
-    await implementStep.run(ctx, { workspaceDir: "/tmp/test", prompt: "Do it" }, new NoopStepReporter());
+    await implementStep.run(ctx, { workspaceDir, prompt: "Do it" }, new NoopStepReporter());
 
     const call = vi.mocked(executor.invoke).mock.calls[0][0];
     expect(call.retry).toBeUndefined();
@@ -193,7 +198,7 @@ describe("implementStep", () => {
     const ctx = makeContext({}, executor);
 
     await expect(
-      implementStep.run(ctx, { workspaceDir: "/tmp/test", prompt: "Do it" }, new NoopStepReporter()),
+      implementStep.run(ctx, { workspaceDir, prompt: "Do it" }, new NoopStepReporter()),
     ).rejects.toThrow("network error");
   });
 
@@ -203,7 +208,7 @@ describe("implementStep", () => {
 
     await implementStep.run(
       ctx,
-      { workspaceDir: "/tmp/test", prompt: "Do it", maxTurns: 5 },
+      { workspaceDir, prompt: "Do it", maxTurns: 5 },
       new NoopStepReporter(),
     );
 
@@ -227,7 +232,7 @@ describe("implementStep", () => {
 
     const outputs = await implementStep.run(
       ctx,
-      { workspaceDir: "/tmp/test", prompt: "Do it" },
+      { workspaceDir, prompt: "Do it" },
       new NoopStepReporter(),
     );
 
@@ -244,7 +249,7 @@ describe("implementStep", () => {
 
       await implementStep.run(
         ctx,
-        { workspaceDir: "/tmp/test", prompt: "Do it", referenceRepoResults },
+        { workspaceDir, prompt: "Do it", referenceRepoResults },
         new NoopStepReporter(),
       );
 
@@ -264,7 +269,7 @@ describe("implementStep", () => {
 
       await implementStep.run(
         ctx,
-        { workspaceDir: "/tmp/test", prompt: "Do it", referenceRepoResults },
+        { workspaceDir, prompt: "Do it", referenceRepoResults },
         new NoopStepReporter(),
       );
 
@@ -285,7 +290,7 @@ describe("implementStep", () => {
 
       await implementStep.run(
         ctx,
-        { workspaceDir: "/tmp/test", prompt: "Do it", referenceRepoResults },
+        { workspaceDir, prompt: "Do it", referenceRepoResults },
         new NoopStepReporter(),
       );
 
@@ -302,7 +307,7 @@ describe("implementStep", () => {
 
       await implementStep.run(
         ctx,
-        { workspaceDir: "/tmp/test", prompt: "Do it", referenceRepoResults: [] },
+        { workspaceDir, prompt: "Do it", referenceRepoResults: [] },
         new NoopStepReporter(),
       );
 
@@ -316,7 +321,7 @@ describe("implementStep", () => {
 
       await implementStep.run(
         ctx,
-        { workspaceDir: "/tmp/test", prompt: "Do it" },
+        { workspaceDir, prompt: "Do it" },
         new NoopStepReporter(),
       );
 
@@ -333,7 +338,7 @@ describe("implementStep", () => {
 
       await implementStep.run(
         ctx,
-        { workspaceDir: "/tmp/test", prompt: "Do it", planningContext: "Use factory pattern", referenceRepoResults },
+        { workspaceDir, prompt: "Do it", planningContext: "Use factory pattern", referenceRepoResults },
         new NoopStepReporter(),
       );
 
@@ -360,7 +365,7 @@ describe("implementStep", () => {
 
     const outputs = await implementStep.run(
       ctx,
-      { workspaceDir: "/tmp/test", prompt: "Do it" },
+      { workspaceDir, prompt: "Do it" },
       new NoopStepReporter(),
     );
 

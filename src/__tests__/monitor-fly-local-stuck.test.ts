@@ -38,8 +38,18 @@ const mockConfig = {
   notifyWebhookUrl: "https://hooks.slack.com/test",
 };
 
+// A Fly run the monitor found still running past its limit; the local-docker tests override executionMode.
 const stuckJob = (overrides: Partial<Job> = {}) =>
-  makeJob({ issueId: "issue-abc", issueIdentifier: "AII-99", teamKey: "AII", ...overrides });
+  makeJob({
+    issueId: "issue-abc",
+    issueIdentifier: "AII-99",
+    teamKey: "AII",
+    executionMode: "fly-machines",
+    machineId: "machine-xyz",
+    status: "running",
+    dispatchedAt: Date.now() - 65 * 60 * 1000,
+    ...overrides,
+  });
 
 beforeEach(() => {
   vi.clearAllMocks();

@@ -1,7 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import type { RepoMapping } from "../config.js";
-import type { TicketIssue, TicketingProvider } from "../providers/types.js";
-import type { AppConfig } from "../index.js";
+import { makeAppConfig, makeIssue, makeMapping, makeProvider } from "./helpers/builders.js";
 import { testDb } from "./helpers/test-db.js";
 
 vi.mock("../github.js", async (importOriginal) => {
@@ -21,30 +19,11 @@ describe("launchPlanningRun", () => {
   let github: typeof import("../github.js");
   let launchModule: typeof import("../planning-launch.js");
 
-  const issue: TicketIssue = {
-    id: "issue-launch-1",
-    identifier: "AII-1052",
-    title: "Test issue",
-    description: "desc",
-    scopeKey: "AII",
-    nativeStatus: "Todo",
-  };
-  const mapping = {
-    owner: "eudoxus",
-    repo: "AI-Implement",
-    workflowFile: "claude-implement.yml",
-    planningWorkflowFile: "claude-plan.yml",
-    defaultBranch: "main",
-  } as unknown as RepoMapping;
-  const config = {} as unknown as AppConfig;
-
-  const provider = {
-    id: "jira",
-    issueUrl: vi.fn().mockReturnValue("https://example.test/AII-1052"),
-    markPlanningFailed: vi.fn().mockResolvedValue(undefined),
-    markPlanningStarted: vi.fn().mockResolvedValue(undefined),
-    postComment: vi.fn().mockResolvedValue(undefined),
-  } as unknown as TicketingProvider;
+  const issue = makeIssue();
+  // The repository the run URLs below name.
+  const mapping = makeMapping({ owner: "eudoxus", repo: "AI-Implement" });
+  const config = makeAppConfig();
+  const provider = makeProvider();
 
   const fireBreakerTrip = vi.fn().mockResolvedValue(undefined);
 
@@ -168,10 +147,10 @@ describe("launchPlanningRun", () => {
 });
 
 describe("launchPlanningSession", () => {
-  const issue = { id: "i-1", identifier: "AII-1053", title: "t", description: "d", scopeKey: "AII", nativeStatus: "Todo" } as unknown as TicketIssue;
-  const mapping = { owner: "o", repo: "r", defaultBranch: "main", provider: "anthropic" } as unknown as RepoMapping;
-  const provider = { id: "linear", issueUrl: vi.fn(), markPlanningStarted: vi.fn() } as unknown as TicketingProvider;
-  const baseConfig = { anthropicApiKey: "sk", githubAppId: "id", githubAppPrivateKey: "k", localRunnerImage: "img" } as unknown as AppConfig;
+  const issue = makeIssue();
+  const mapping = makeMapping();
+  const provider = makeProvider();
+  const baseConfig = makeAppConfig({ anthropicApiKey: "sk" });
   const reservation = { dispatchId: "d-1", admission: { ok: true, admissionGeneration: 3, release: vi.fn() } } as never;
 
   let mod: typeof import("../planning-launch.js");

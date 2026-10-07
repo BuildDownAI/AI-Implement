@@ -393,7 +393,10 @@ describe("RestateRefreshAuthority — outcome mapping", () => {
       refreshToken: "new-raw-token",
       expiresInSeconds: 3600,
     });
-    expect(sidecar.calls.map((call) => call.path)).toEqual(["/Operator/c1/identity", "/Operator/c1/refresh"]);
+    expect(sidecar.calls.map((call) => call.url.href)).toEqual([
+      `${UNROUTABLE_INGRESS}/Operator/c1/identity`,
+      `${UNROUTABLE_INGRESS}/Operator/c1/refresh`,
+    ]);
     if (outcome.status === "ok") {
       const row = getDb().prepare("SELECT email, sub, provider, client_id FROM mcp_tokens WHERE token = ?").get(outcome.accessToken);
       expect(row).toEqual({ email: "ada@eudoxus.ai", sub: "sub-1", provider: "google", client_id: "c1" });
@@ -405,6 +408,7 @@ describe("RestateRefreshAuthority — outcome mapping", () => {
     const sidecar = ingress({ issue: {} });
     const authority = authorityWithFetch(sidecar.fetch);
     const outcome = await authority.issue({ clientId: "c1", email: "ada@eudoxus.ai", sub: "sub-1", provider: "google" });
+    expect(sidecar.calls.map((call) => call.url.href)).toEqual([`${UNROUTABLE_INGRESS}/Operator/c1/issue`]);
     const capturedBody = JSON.parse(sidecar.calls[0]!.body) as Record<string, unknown>;
     expect(outcome.status).toBe("ok");
     if (outcome.status === "ok") {
@@ -426,10 +430,10 @@ describe("RestateRefreshAuthority — outcome mapping", () => {
 
 describe("RestateRefreshAuthority.describe (AII-714)", () => {
   it("maps the object's describe result to expiresAt", async () => {
-    const authority = authorityWithFetch(
-      ingress({ describe: { json: { email: "ada@eudoxus.ai", rotatedAt: 1000, expiresAt: 1_700_000_000_000 } } }).fetch,
-    );
+    const sidecar = ingress({ describe: { json: { email: "ada@eudoxus.ai", rotatedAt: 1000, expiresAt: 1_700_000_000_000 } } });
+    const authority = authorityWithFetch(sidecar.fetch);
     await expect(authority.describe("c1")).resolves.toEqual({ status: "ok", expiresAt: 1_700_000_000_000 });
+    expect(sidecar.calls.map((call) => call.url.href)).toEqual([`${UNROUTABLE_INGRESS}/Operator/c1/describe`]);
   });
 
   it("maps a family with no live refresh token (expiresAt: null) straight through", async () => {

@@ -29,6 +29,9 @@ describe("production review-fix GitHub effect", () => {
     await adapter.applyApprovalEffect(scope, attemptId, result, [{ findingKey: "f1", disposition: "addressed" }]);
     expect(github.calls.filter((call) => call.method === "POST")).toHaveLength(1);
     expect(comments[0].body).toContain("f1");
+    // Route keys match the path alone, so the page size is checked here.
+    const commentReads = github.calls.filter((call) => call.method === "GET").map((call) => call.url.search);
+    expect(new Set(commentReads)).toEqual(new Set(["?per_page=100"]));
   });
 
   it("withholds policy approval when any live GitHub gate is unavailable", async () => {
@@ -50,5 +53,8 @@ describe("production review-fix GitHub effect", () => {
     });
     const adapter = createReviewFixGithubAdapter({ credentials, fetchImpl: github.fetch });
     expect(await adapter.evaluateMergePolicy(scope, [])).toBe(true);
+    const query = (suffix: string) => github.calls.find((call) => call.path.endsWith(suffix))?.url.search;
+    expect(query("/check-runs")).toBe("?per_page=100");
+    expect(query("/pulls/42/reviews")).toBe("?per_page=100");
   });
 });

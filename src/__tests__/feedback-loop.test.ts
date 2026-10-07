@@ -1,5 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { wrapWithPlanningGuard, assemblePlanningContext } from "../planning-context-assembly.js";
+import { makeContext } from "./helpers/builders.js";
+import { testDir } from "./helpers/test-dir.js";
 
 vi.mock("node:child_process", () => ({
   spawnSync: vi.fn().mockReturnValue({
@@ -24,16 +26,6 @@ import { reviewStep } from "../pipeline/steps/review.js";
 
 const mockImplementRun = vi.mocked(implementStep.run);
 const mockReviewRun = vi.mocked(reviewStep.run);
-
-function makeCtx() {
-  return {
-    data: { issueIdentifier: "AII-374", model: undefined },
-    llmExecutor: { invoke: vi.fn() },
-    getOutputs: () => ({}),
-    setOutputs: () => {},
-    resolveInputs: (i: unknown) => i,
-  } as never;
-}
 
 const IMPLEMENT_SUCCESS = {
   filesChanged: [] as string[],
@@ -102,7 +94,11 @@ const REAL_SEPARATOR_CONTEXT = [
   "Some risks.",
 ].join("\n");
 
+// The loop writes cycle summaries and reviewer feedback under the workspace's ai-output/.
+let workspaceDir: string;
+
 beforeEach(() => {
+  workspaceDir = testDir("feedback-loop");
   vi.clearAllMocks();
   mockImplementRun.mockResolvedValue(IMPLEMENT_SUCCESS);
   mockReviewRun.mockResolvedValue(REVIEW_APPROVED);
@@ -227,10 +223,10 @@ describe("splitPlanningContext with real assemblePlanningContext output", () => 
 
 describe("feedbackLoopStep — planning context routing", () => {
   it("sends full planningContext to implement on pass 1 with new-format context", async () => {
-    const ctx = makeCtx();
+    const ctx = makeContext();
     await feedbackLoopStep.run(
       ctx,
-      { workspaceDir: "/tmp", issueTitle: "T", issueDescription: "D", planningContext: NEW_FORMAT_CONTEXT, maxIterations: 1 },
+      { workspaceDir, issueTitle: "T", issueDescription: "D", planningContext: NEW_FORMAT_CONTEXT, maxIterations: 1 },
       { report: vi.fn(async () => undefined) },
     );
     expect(mockImplementRun).toHaveBeenCalledOnce();
@@ -238,13 +234,13 @@ describe("feedbackLoopStep — planning context routing", () => {
   });
 
   it("sends acceptanceBar to review on every pass with new-format context", async () => {
-    const ctx = makeCtx();
+    const ctx = makeContext();
     mockReviewRun
       .mockResolvedValueOnce(REVIEW_REJECTED)
       .mockResolvedValueOnce(REVIEW_APPROVED);
     await feedbackLoopStep.run(
       ctx,
-      { workspaceDir: "/tmp", issueTitle: "T", issueDescription: "D", planningContext: NEW_FORMAT_CONTEXT, maxIterations: 2 },
+      { workspaceDir, issueTitle: "T", issueDescription: "D", planningContext: NEW_FORMAT_CONTEXT, maxIterations: 2 },
       { report: vi.fn(async () => undefined) },
     );
     const expectedBar = "## ✅ AI Planning: Acceptance Bar\n\n1. Foo.\n2. Bar.";
@@ -253,13 +249,13 @@ describe("feedbackLoopStep — planning context routing", () => {
   });
 
   it("sends wrapped mapSection (with security guard) to implement on pass 2 with new-format context", async () => {
-    const ctx = makeCtx();
+    const ctx = makeContext();
     mockReviewRun
       .mockResolvedValueOnce(REVIEW_REJECTED)
       .mockResolvedValueOnce(REVIEW_APPROVED);
     await feedbackLoopStep.run(
       ctx,
-      { workspaceDir: "/tmp", issueTitle: "T", issueDescription: "D", planningContext: NEW_FORMAT_CONTEXT, maxIterations: 2 },
+      { workspaceDir, issueTitle: "T", issueDescription: "D", planningContext: NEW_FORMAT_CONTEXT, maxIterations: 2 },
       { report: vi.fn(async () => undefined) },
     );
     expect(mockImplementRun).toHaveBeenCalledTimes(2);
@@ -274,13 +270,13 @@ describe("feedbackLoopStep — planning context routing", () => {
   });
 
   it("sends full planningContext on every pass with old-format context", async () => {
-    const ctx = makeCtx();
+    const ctx = makeContext();
     mockReviewRun
       .mockResolvedValueOnce(REVIEW_REJECTED)
       .mockResolvedValueOnce(REVIEW_APPROVED);
     await feedbackLoopStep.run(
       ctx,
-      { workspaceDir: "/tmp", issueTitle: "T", issueDescription: "D", planningContext: OLD_FORMAT_CONTEXT, maxIterations: 2 },
+      { workspaceDir, issueTitle: "T", issueDescription: "D", planningContext: OLD_FORMAT_CONTEXT, maxIterations: 2 },
       { report: vi.fn(async () => undefined) },
     );
     expect(mockImplementRun.mock.calls[0][1]).toMatchObject({ planningContext: OLD_FORMAT_CONTEXT });
@@ -288,10 +284,10 @@ describe("feedbackLoopStep — planning context routing", () => {
   });
 
   it("sends no acceptanceBar to review with old-format context", async () => {
-    const ctx = makeCtx();
+    const ctx = makeContext();
     await feedbackLoopStep.run(
       ctx,
-      { workspaceDir: "/tmp", issueTitle: "T", issueDescription: "D", planningContext: OLD_FORMAT_CONTEXT, maxIterations: 1 },
+      { workspaceDir, issueTitle: "T", issueDescription: "D", planningContext: OLD_FORMAT_CONTEXT, maxIterations: 1 },
       { report: vi.fn(async () => undefined) },
     );
     expect(mockReviewRun).toHaveBeenCalledOnce();
@@ -300,13 +296,13 @@ describe("feedbackLoopStep — planning context routing", () => {
 
   it("falls back to rawPlanningContext on pass 2 when new-format has no map section", async () => {
     const barOnlyContext = "## ✅ AI Planning: Acceptance Bar\n\n1. Only a bar, no map.";
-    const ctx = makeCtx();
+    const ctx = makeContext();
     mockReviewRun
       .mockResolvedValueOnce(REVIEW_REJECTED)
       .mockResolvedValueOnce(REVIEW_APPROVED);
     await feedbackLoopStep.run(
       ctx,
-      { workspaceDir: "/tmp", issueTitle: "T", issueDescription: "D", planningContext: barOnlyContext, maxIterations: 2 },
+      { workspaceDir, issueTitle: "T", issueDescription: "D", planningContext: barOnlyContext, maxIterations: 2 },
       { report: vi.fn(async () => undefined) },
     );
     expect(mockImplementRun.mock.calls[0][1]).toMatchObject({ planningContext: barOnlyContext });

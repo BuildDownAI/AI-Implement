@@ -22,7 +22,12 @@ let provider: FilesystemProvider;
 beforeEach(async () => {
   ticketDir = testDir("filesystem-ticket-lifecycle");
   mappings = {
-    FS: makeMapping({ ticketingProvider: "filesystem", ticketingConfig: { kind: "filesystem", directory: ticketDir } }),
+    FS: makeMapping({
+      // On, because the tests include planning-phase jobs and "ready" tickets, which exist only with planning.
+      planningEnabled: true,
+      ticketingProvider: "filesystem",
+      ticketingConfig: { kind: "filesystem", directory: ticketDir },
+    }),
   };
   vi.doMock("../config.js", () => ({ getMappings: () => mappings }));
   vi.doMock("../runner-mode.js", () => ({ getRunnerMode: () => ({ mode: "local", source: "env" }) }));
