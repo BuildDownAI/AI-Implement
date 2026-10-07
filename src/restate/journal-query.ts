@@ -27,13 +27,14 @@ export function validateJournalLookup(query: Record<string, string>): JournalLoo
 }
 
 export function buildJournalQueries(lookup: JournalLookup): { invocation: string; journal: (invocationId: string) => string; promises: (service: string, key: string) => string } {
+  // A key owns one invocation per handler call; the run handler's journal is the largest, so shared calls never shadow it.
   const where = "id" in lookup
-    ? `WHERE id = '${sqlQuote(lookup.id)}'`
-    : `WHERE target_service_name = '${sqlQuote(lookup.service)}' AND target_service_key = '${sqlQuote(lookup.key)}'`;
+    ? `WHERE id = '${sqlQuote(lookup.id)}' ORDER BY created_at DESC`
+    : `WHERE target_service_name = '${sqlQuote(lookup.service)}' AND target_service_key = '${sqlQuote(lookup.key)}' ORDER BY journal_size DESC, created_at DESC`;
   return {
     invocation:
       "SELECT id, target_service_name, target_service_key, target_handler_name, status, journal_size, created_at, modified_at, completed_at, " +
-      `last_failure, last_failure_error_code, last_failure_related_entry_name FROM sys_invocation ${where} ORDER BY created_at DESC LIMIT 1`,
+      `last_failure, last_failure_error_code, last_failure_related_entry_name FROM sys_invocation ${where} LIMIT 1`,
     journal: (invocationId) =>
       "SELECT id, index, entry_type, name, completed, promise_name, entry_json, appended_at, sleep_wakeup_at FROM sys_journal " +
       `WHERE id = '${sqlQuote(invocationId)}' ORDER BY index`,
