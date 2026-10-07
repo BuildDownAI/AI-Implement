@@ -1281,6 +1281,46 @@ describe("KgRefresh durable workflow", () => {
     await eventually(() => kgRepoStatus(env.baseUrl()), (marker) => marker === null, { label: "KgRepo marker cleared" });
   }, 15_000);
 
+  it.each(VARIANTS.map(([label]) => label))("AII-1125: a clean exit with no report ends dispatch_lost naming exit 0 (%s)", async (label) => {
+    const env = envFor(label);
+    const triggerId = newTriggerId();
+    makeScenario(triggerId, { dispatchOutcome: "accepted", executionMode: "fly-machines" });
+    machineReads.set(triggerId, [{ state: "ended", exit: { exitCode: 0, signal: null, oomKilled: false, timestamp: 1 } }]);
+    const outcome = await runWorkflow(env.baseUrl(), triggerId);
+    expect(outcome.ok).toBe(false);
+    expect(outcome.detail).toContain("machine stopped with no report (exit 0)");
+    expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("dispatch_lost");
+  }, 15_000);
+
+  it.each(VARIANTS.map(([label]) => label))("AII-1125: a started read holds off the bootstrap timeout until the machine ends dispatch_lost (%s)", async (label) => {
+    const env = deadlineEnvFor(label);
+    const triggerId = newTriggerId();
+    makeScenario(triggerId, { dispatchOutcome: "accepted", executionMode: "fly-machines" });
+    // Five started reads span more than the 1 s bootstrap deadline (300 ms interval) but not the total.
+    const started = { state: "started" as const, exit: null };
+    machineReads.set(triggerId, [
+      started, started, started, started, started,
+      { state: "ended", exit: { exitCode: 137, signal: 9, oomKilled: true, timestamp: 1 } },
+    ]);
+    const closedBefore = closeRowCalls.length;
+    const outcome = await runWorkflow(env.baseUrl(), triggerId);
+    expect(outcome.ok).toBe(false);
+    expect(outcome.detail).toBe("machine stopped with no report (exit 137, signal 9, oomKilled)");
+    expect(closeRowCalls[closeRowCalls.length - 1].conclusion).toBe("dispatch_lost");
+    expect(closeRowCalls.slice(closedBefore).some((c) => c.conclusion === "bootstrap_timeout")).toBe(false);
+    await eventually(() => kgRepoStatus(env.baseUrl()), (marker) => marker === null, { label: "KgRepo marker cleared" });
+  }, 15_000);
+
+  it.each(VARIANTS.map(([label]) => label))("AII-1125: a null job id makes no readMachineRun call (%s)", async (label) => {
+    const env = deadlineEnvFor(label);
+    const triggerId = newTriggerId();
+    makeScenario(triggerId, { dispatchOutcome: "accepted", executionMode: "fly-machines", jobIdUnknown: true });
+    machineReadCalls.length = 0;
+    const outcome = await runWorkflow(env.baseUrl(), triggerId);
+    expect(outcome.ok).toBe(false);
+    expect(machineReadCalls).toEqual([]);
+  }, 15_000);
+
   it.each(VARIANTS.map(([label]) => label))("AII-1125: a report delivered before the machine read says ended wins (%s)", async (label) => {
     const env = envFor(label);
     const triggerId = newTriggerId();

@@ -71,6 +71,7 @@ export async function readBackendRun(config: FlyConfig, mode: string, id: string
       const machine = await getMachine(config.flySessionsToken, config.flySessionsApp, id);
       const state = flyMachineState(machine);
       return { state, exit: state === "ended" ? readMachineExit(machine) : null };
+    // A lookup error is `unknown` by design (AII-1125); the watch step's retry bound applies to the step, not to this read.
     } catch (err) {
       if (err instanceof Error && err.message.includes("404")) return { state: "ended", exit: { ...NO_EXIT } };
       console.error(`[backend-run] Failed to read Fly machine ${id}:`, err);
