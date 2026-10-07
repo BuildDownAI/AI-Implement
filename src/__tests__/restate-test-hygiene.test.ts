@@ -1,24 +1,13 @@
 // Guard for the timing rules in docs/restate-testing.md § Timing rules (AII-993). Default
 // suite, no Docker: scans the Restate scenario sources for the patterns that caused timing
 // flakes — raw sleeps, direct admin `/query` reads, and per-file poll helpers.
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { eventually } from "./restate/harness.js";
 
 const RESTATE_DIR = join(import.meta.dirname, "restate");
 const MARKER = "restate-test-allow:";
-
-/** Files this guard does not cover yet, each with the reason. A rename must update this list. */
-const ALLOWLISTED_FILES: Record<string, string> = {
-  "endpoint-registration.restate.test.ts": "shared-service test, out of scope by operator decision 2026-09-30",
-  "endpoint.restate.test.ts": "shared-service test, out of scope by operator decision 2026-09-30",
-  "operator-object.restate.test.ts": "shared-service test, out of scope by operator decision 2026-09-30",
-  "tools.restate.test.ts": "shared-service test, out of scope by operator decision 2026-09-30",
-  "review-fix-attempt.restate.test.ts": "review-fix pilot test, out of scope by operator decision 2026-09-30",
-  "review-fix-pr.restate.test.ts": "review-fix pilot test, out of scope by operator decision 2026-09-30",
-  "review-fix-pilot.restate.test.ts": "review-fix pilot test, out of scope by operator decision 2026-09-30",
-};
 
 /** Violations in one file's source, as `file:line: message`. */
 export function findViolations(file: string, source: string): string[] {
@@ -45,16 +34,9 @@ export function findViolations(file: string, source: string): string[] {
 describe("restate scenario hygiene (AII-993)", () => {
   const files = readdirSync(RESTATE_DIR).filter((f) => f.endsWith(".restate.test.ts"));
 
-  it("every allowlisted file exists", () => {
-    for (const name of Object.keys(ALLOWLISTED_FILES)) {
-      expect(existsSync(join(RESTATE_DIR, name)), `${name} is allowlisted but missing`).toBe(true);
-    }
-  });
-
-  it("every non-allowlisted scenario file is clean", () => {
-    const violations = files
-      .filter((f) => !(f in ALLOWLISTED_FILES))
-      .flatMap((f) => findViolations(`src/__tests__/restate/${f}`, readFileSync(join(RESTATE_DIR, f), "utf8")));
+  it("every scenario file is clean", () => {
+    const violations = files.flatMap((f) =>
+      findViolations(`src/__tests__/restate/${f}`, readFileSync(join(RESTATE_DIR, f), "utf8")));
     expect(violations).toEqual([]);
   });
 

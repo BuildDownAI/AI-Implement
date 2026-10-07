@@ -39,7 +39,7 @@ import { orchestratorTools } from "../../restate/tools.js";
 import * as dedup from "../../dedup.js";
 import { initSettingsTable } from "../../runner-mode.js";
 import { startBinaryEnvironment, type BinaryEnvironment } from "./binary-environment.js";
-import { RESTATE_IMAGE_VERSION, callObject, callService, restateTestRuntime } from "./harness.js";
+import { RESTATE_IMAGE_VERSION, callObject, callService, eventually, queryInvocations, restateTestRuntime } from "./harness.js";
 
 function sha256(value: string): string {
   return crypto.createHash("sha256").update(value).digest("hex");
@@ -53,21 +53,19 @@ function sha256(value: string): string {
  * partitions are queryable yet — register() needs the latter.
  */
 async function waitForPartitionsReady(adminBaseUrl: string, timeoutMs = 60_000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    try {
-      const response = await fetch(`${adminBaseUrl}/query`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ query: "SELECT count(1) FROM sys_invocation" }),
-      });
-      if (response.ok) return;
-    } catch {
-      // Admin API not accepting connections yet.
-    }
-    await new Promise((resolve) => setTimeout(resolve, 200));
-  }
-  throw new Error(`Restate admin API partitions not ready after ${timeoutMs}ms`);
+  await eventually(
+    async () => {
+      try {
+        await queryInvocations(adminBaseUrl, "true LIMIT 1");
+        return true;
+      } catch {
+        // Admin API not accepting connections yet, or partitions not queryable.
+        return false;
+      }
+    },
+    Boolean,
+    { timeoutMs, intervalMs: 200, label: "Restate admin API partitions to be ready" },
+  );
 }
 
 /**
@@ -217,12 +215,11 @@ describe.skipIf(restateTestRuntime() === "binary")("startRestateEndpoint() / reg
       // Observe the actual non-completed invocation before swapping endpoints;
       // a fixed sleep can race Restate's admission on a busy CI host.
       const oldUri = `http://host.testcontainers.internal:${changedPort}`;
-      const admissionDeadline = Date.now() + 10_000;
-      while (Date.now() < admissionDeadline) {
-        const count = await queryNonCompletedInvocations(fetch, adminBaseUrl, oldUri);
-        if (count !== null && count > 0) break;
-        await new Promise((resolve) => setTimeout(resolve, 50));
-      }
+      await eventually(
+        () => queryNonCompletedInvocations(fetch, adminBaseUrl, oldUri),
+        (count) => count !== null && count > 0,
+        { label: `a non-completed invocation at ${oldUri}` },
+      );
       expect(await queryNonCompletedInvocations(fetch, adminBaseUrl, oldUri)).toBeGreaterThan(0);
 
       // Change the live endpoint's discovery manifest at the same URI. Restate's
