@@ -7,6 +7,11 @@ import { recordReaperAction } from "./dedup.js";
 import { notifyReaperBurst } from "./notify.js";
 import { read as readAdmission } from "./dispatch-admission.js";
 import type { Job } from "./log.js";
+import {
+  DURABLE_RUNNER_PURPOSE_KEY,
+  DURABLE_RUNNER_PURPOSE_VALUE,
+  DURABLE_UNTIL_KEY,
+} from "./restate/fly-machine-profile.js";
 
 export const SWEEP_MACHINE_MAX_AGE_MS = 4 * 60 * 60 * 1000; // 4 hours
 const TERMINAL_LIFECYCLE_STATES = new Set<IssueLifecycleState>(["completed", "cancelled"]);
@@ -96,6 +101,24 @@ export async function safeDestroyMachine(
 }
 
 /**
+ * Whether a durable-runner machine's `durable_until` stamp (epoch seconds) is past.
+ * Absent keeps the machine; a present value that is not a finite number is a corrupt
+ * stamp, treated as past (with one warning) so it cannot keep a machine for ever.
+ */
+function isDurableExpired(machineId: string, raw: string | undefined): boolean {
+  if (raw === undefined) return false;
+  const text = String(raw).trim();
+  const until = text === "" ? NaN : Number(text);
+  if (!Number.isFinite(until)) {
+    console.warn(
+      `[reaper] machine=${machineId} has a corrupt ${DURABLE_UNTIL_KEY}=${JSON.stringify(raw)}; treating as expired`,
+    );
+    return true;
+  }
+  return until < Date.now() / 1000;
+}
+
+/**
  * Per-poll cleanup sweep: lists all Fly machines and destroys any that are
  * orphaned (no dispatch log entry), belong to a completed/failed job, exceed
  * the max session age, or whose Linear issue has reached a terminal state.
@@ -177,8 +200,28 @@ export async function sweepOrphanedMachines(
       continue;
     }
 
-    const job = getJobByMachineId(machine.id);
     const ageSeconds = Math.floor((Date.now() - new Date(machine.created_at).getTime()) / 1000);
+
+    // A durable-runner machine is owned by a FlyMachineProfile object, not a dispatch_log
+    // row: its job row is terminal (or absent) by design, so none of the four rules below
+    // may see it. The reaper is only the backstop for an owner lost with the Restate store.
+    const metadata = machine.config?.metadata;
+    if (metadata?.[DURABLE_RUNNER_PURPOSE_KEY] === DURABLE_RUNNER_PURPOSE_VALUE) {
+      if (!isDurableExpired(machine.id, metadata[DURABLE_UNTIL_KEY])) continue;
+      recordReaperAction({
+        ruleMatched: "durable-expired",
+        machineId: machine.id,
+        tenantId: null,
+        issueIdentifier: null,
+        ageSeconds,
+        dryRun: config.reaperDryRun,
+      });
+      await safeDestroyMachine(config, machine.id, "durable-expired", { ageSeconds });
+      if (!config.reaperDryRun) destroyedCount++;
+      continue;
+    }
+
+    const job = getJobByMachineId(machine.id);
 
     if (!job) {
       // No dispatch log entry — orphaned machine
