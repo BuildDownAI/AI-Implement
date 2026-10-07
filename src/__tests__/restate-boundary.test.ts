@@ -204,15 +204,15 @@ describe("every declared write handler wraps its side effect in ctx.run under a 
 
   it("found the nine documented write handlers as role: \"admin\" (not zero, not accidentally all of them)", () => {
     expect(writeEntries.map((e) => e.toolName).sort()).toEqual(
-      ["add_project", "clear_dispatch_dedup", "fly_machine_reuse_probe", "pause_project", "release_dispatch_reservation", "set_kg_fly_machine", "set_runner_mode", "trigger_kg_refresh", "trigger_workflow_sync"],
+      ["add_project", "clear_dispatch_dedup", "fly_machine_reuse_probe", "pause_project", "release_dispatch_reservation", "set_fly_machine_profile", "set_runner_mode", "trigger_kg_refresh", "trigger_workflow_sync"],
     );
   });
 
   it.each(writeEntries.map(({ toolName, identifier }) => [toolName, identifier] as const))(
-    "%s (%s) contains both ctx.run( and retryPolicy in its definition",
+    "%s (%s) contains a journaled side effect (ctx.run( or an object client call) and retryPolicy in its definition",
     (_toolName, identifier) => {
       const block = definitionBlockFor(identifier, TOOLS_SOURCE);
-      expect(block).toContain("ctx.run(");
+      expect(block).toMatch(/ctx\.run\(|ctx\.objectClient\(/);
       expect(block).toMatch(/retryPolicy\s*:/);
     },
   );
