@@ -1,20 +1,15 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 
 const isWindows = process.platform === "win32";
 import { runLocalFullLoop } from "../local/full-loop.js";
 import { PipelineRunner } from "../pipeline/runner.js";
-import type { LLMExecutor, PipelineDefinition, StepModule } from "../pipeline/types.js";
+import type { PipelineDefinition, StepModule } from "../pipeline/types.js";
 import { getDiff } from "../pipeline/steps/feedback-loop.js";
-
-function makeMockExecutor(exitCode = 0): LLMExecutor {
-  return {
-    invoke: vi.fn().mockResolvedValue({ stdout: "", exitCode, tokensUsed: 0 }),
-  };
-}
+import { makeExecutor } from "./helpers/builders.js";
+import { testDir } from "./helpers/test-dir.js";
 
 function planningExecutorWithPlan() {
   return (_prompt: string, _args: string[], cwd: string) => {
@@ -56,11 +51,7 @@ describe("runLocalFullLoop", () => {
   let ws: string;
 
   beforeEach(() => {
-    ws = mkdtempSync(join(tmpdir(), "full-loop-test-"));
-  });
-
-  afterEach(() => {
-    rmSync(ws, { recursive: true, force: true });
+    ws = testDir("full-loop");
   });
 
   it("returns exitCode 0 and classification 'success' when planning and review succeed", async () => {
@@ -86,7 +77,7 @@ describe("runLocalFullLoop", () => {
       issueTitle: "Test issue",
       issueDescription: "Test description",
       planningExecutor,
-      llmExecutor: makeMockExecutor(0),
+      llmExecutor: makeExecutor(),
       pipeline,
       runner,
     });
@@ -110,7 +101,7 @@ describe("runLocalFullLoop", () => {
       issueTitle: "Test issue",
       issueDescription: "Test description",
       planningExecutor: () => ({ status: 1 as const, stdout: "", stderr: "boom" }),
-      llmExecutor: makeMockExecutor(0),
+      llmExecutor: makeExecutor(),
       pipeline,
       runner: implRun,
     });
@@ -131,7 +122,7 @@ describe("runLocalFullLoop", () => {
       issueTitle: "Test",
       issueDescription: "Desc",
       planningExecutor: () => ({ status: 1 as const, stdout: "", stderr: "" }),
-      llmExecutor: makeMockExecutor(0),
+      llmExecutor: makeExecutor(),
       pipeline,
       runner,
     });
@@ -150,7 +141,7 @@ describe("runLocalFullLoop", () => {
       issueTitle: "Test issue",
       issueDescription: "Test description",
       planningExecutor: planningExecutorWithPlan(),
-      llmExecutor: makeMockExecutor(0),
+      llmExecutor: makeExecutor(),
       pipeline,
       runner,
     });
@@ -178,7 +169,7 @@ describe("runLocalFullLoop", () => {
       issueTitle: "Test issue",
       issueDescription: "Test description",
       planningExecutor: planningExecutorWithPlan(),
-      llmExecutor: makeMockExecutor(0),
+      llmExecutor: makeExecutor(),
       pipeline,
       runner,
     });
@@ -207,7 +198,7 @@ describe("runLocalFullLoop", () => {
       issueTitle: "Test issue",
       issueDescription: "Test description",
       planningExecutor: planningExecutorWithPlan(),
-      llmExecutor: makeMockExecutor(0),
+      llmExecutor: makeExecutor(),
       pipeline,
       runner,
     });
@@ -243,7 +234,7 @@ describe("runLocalFullLoop", () => {
       issueTitle: "Test",
       issueDescription: "Desc",
       planningExecutor,
-      llmExecutor: makeMockExecutor(0),
+      llmExecutor: makeExecutor(),
       pipeline,
       runner,
     });
@@ -280,7 +271,7 @@ describe("runLocalFullLoop", () => {
       issueTitle: "Test",
       issueDescription: "Desc",
       planningExecutor: planningExecutorWithPlan(),
-      llmExecutor: makeMockExecutor(0),
+      llmExecutor: makeExecutor(),
       pipeline,
       runner,
     });
@@ -310,7 +301,7 @@ describe("runLocalFullLoop", () => {
       maxTurns: 20,
       maxIterations: 3,
       planningExecutor: planningExecutorWithPlan(),
-      llmExecutor: makeMockExecutor(0),
+      llmExecutor: makeExecutor(),
       pipeline,
       runner,
     });
@@ -335,7 +326,7 @@ describe("runLocalFullLoop", () => {
       issueTitle: "Test",
       issueDescription: "Desc",
       planningExecutor: () => ({ status: 1 as const, stdout: "", stderr: "" }),
-      llmExecutor: makeMockExecutor(0),
+      llmExecutor: makeExecutor(),
     });
 
     expect(result.classification).toBe("plan_failed");
@@ -354,7 +345,7 @@ describe("runLocalFullLoop", () => {
       issueTitle: "Test",
       issueDescription: "Desc",
       planningExecutor: () => ({ status: 0 as const, stdout: "", stderr: "" }),
-      llmExecutor: makeMockExecutor(0),
+      llmExecutor: makeExecutor(),
       pipeline,
       runner: implRun,
     });
@@ -375,7 +366,7 @@ describe("runLocalFullLoop", () => {
       issueTitle: "Test",
       issueDescription: "Desc",
       planningExecutor: () => ({ status: 0 as const, stdout: "", stderr: "" }),
-      llmExecutor: makeMockExecutor(0),
+      llmExecutor: makeExecutor(),
       pipeline,
       runner,
     });
@@ -400,7 +391,7 @@ describe("runLocalFullLoop", () => {
       issueTitle: "Test",
       issueDescription: "Desc",
       planningExecutor: planningExecutorWithPlan(),
-      llmExecutor: makeMockExecutor(0),
+      llmExecutor: makeExecutor(),
       pipeline,
       runner,
     });
@@ -427,7 +418,7 @@ describe("runLocalFullLoop", () => {
       issueTitle: "Test",
       issueDescription: "Desc",
       planningExecutor: planningExecutorWithPlan(),
-      llmExecutor: makeMockExecutor(0),
+      llmExecutor: makeExecutor(),
       pipeline,
       runner,
     });
@@ -453,7 +444,7 @@ describe("runLocalFullLoop", () => {
       issueTitle: "Test",
       issueDescription: "Desc",
       planningExecutor: planningExecutorWithPlan(),
-      llmExecutor: makeMockExecutor(0),
+      llmExecutor: makeExecutor(),
       pipeline,
       runner,
     });
@@ -483,7 +474,7 @@ describe("runLocalFullLoop", () => {
       issueTitle: "Test",
       issueDescription: "Desc",
       planningExecutor: planningExecutorWithPlan(),
-      llmExecutor: makeMockExecutor(0),
+      llmExecutor: makeExecutor(),
       pipeline,
       runner,
     });
@@ -514,7 +505,7 @@ describe("runLocalFullLoop", () => {
       issueTitle: "Test",
       issueDescription: "Desc",
       planningExecutor: planningExecutorWithPlan(),
-      llmExecutor: makeMockExecutor(0),
+      llmExecutor: makeExecutor(),
       pipeline,
       runner,
     });
@@ -532,7 +523,7 @@ describe("runLocalFullLoop", () => {
       maxTurns: 30,
       maxIterations: 5,
       planningExecutor: () => ({ status: 1 as const, stdout: "", stderr: "planning failed" }),
-      llmExecutor: makeMockExecutor(0),
+      llmExecutor: makeExecutor(),
     });
 
     expect(result.classification).toBe("plan_failed");

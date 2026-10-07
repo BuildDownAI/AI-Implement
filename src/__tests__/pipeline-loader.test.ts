@@ -1,10 +1,11 @@
 import { describe, it, expect } from "vitest";
 import { loadPipelineDefinition, dependenciesMissing } from "../pipeline/pipeline-loader.js";
-import { DefaultPipelineContext } from "../pipeline/context.js";
+import type { DefaultPipelineContext } from "../pipeline/context.js";
 import { PipelineRunner } from "../pipeline/runner.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
-import type { PipelineContextData, StepModule } from "../pipeline/types.js";
+import type { StepModule } from "../pipeline/types.js";
 import type { ReviewerDefinition } from "../pipeline/reviewers/registry.js";
+import { makeContext } from "./helpers/builders.js";
 
 const CUSTOM_PIPELINE_YAML = `id: custom-loop
 steps:
@@ -55,19 +56,6 @@ steps:
 
 function makeModule(outputs: Record<string, unknown> = {}): StepModule {
   return { run: async () => outputs };
-}
-
-function makeContext(overrides: Partial<PipelineContextData> = {}): DefaultPipelineContext {
-  return new DefaultPipelineContext({
-    jobId: 1,
-    issueId: "issue-1",
-    issueIdentifier: "ENG-1",
-    issueTitle: "Test",
-    issueDescription: "Desc",
-    nonce: "nonce",
-    orchestratorUrl: "http://localhost:8080",
-    ...overrides,
-  });
 }
 
 describe("loadPipelineDefinition", () => {

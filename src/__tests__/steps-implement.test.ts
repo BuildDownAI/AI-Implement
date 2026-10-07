@@ -1,37 +1,11 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { implementStep } from "../pipeline/steps/implement.js";
-import { DefaultPipelineContext } from "../pipeline/context.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
 import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
-import type { LLMExecutor, LLMResult } from "../pipeline/types.js";
+import type { LLMExecutor } from "../pipeline/types.js";
 import { DEFAULT_MODEL } from "../pipeline/default-model.js";
 import type { ReferenceRepoResult } from "../reference-repos.js";
-
-function makeExecutor(overrides: Partial<LLMResult> = {}): LLMExecutor {
-  return {
-    invoke: vi.fn().mockResolvedValue({
-      stdout: "",
-      exitCode: 0,
-      tokensUsed: 100,
-      ...overrides,
-    }),
-  };
-}
-
-function makeContext(executor?: LLMExecutor): DefaultPipelineContext {
-  return new DefaultPipelineContext(
-    {
-      jobId: 1,
-      issueId: "issue-1",
-      issueIdentifier: "ENG-1",
-      issueTitle: "Test",
-      issueDescription: "Description",
-      nonce: "nonce",
-      orchestratorUrl: "http://localhost:8080",
-    },
-    executor ?? makeExecutor(),
-  );
-}
+import { makeContext, makeExecutor } from "./helpers/builders.js";
 
 describe("implementStep", () => {
   beforeEach(() => {
@@ -40,7 +14,7 @@ describe("implementStep", () => {
 
   it("invokes executor with provided prompt and model", async () => {
     const executor = makeExecutor();
-    const ctx = makeContext(executor);
+    const ctx = makeContext({}, executor);
 
     await implementStep.run(
       ctx,
@@ -55,7 +29,7 @@ describe("implementStep", () => {
 
   it("defaults model to DEFAULT_MODEL when not specified", async () => {
     const executor = makeExecutor();
-    const ctx = makeContext(executor);
+    const ctx = makeContext({}, executor);
 
     await implementStep.run(
       ctx,
@@ -70,7 +44,7 @@ describe("implementStep", () => {
 
   it("appends planning context to prompt when provided", async () => {
     const executor = makeExecutor();
-    const ctx = makeContext(executor);
+    const ctx = makeContext({}, executor);
 
     await implementStep.run(
       ctx,
@@ -85,7 +59,7 @@ describe("implementStep", () => {
 
   it("returns tokensUsed from executor result", async () => {
     const executor = makeExecutor({ tokensUsed: 500 });
-    const ctx = makeContext(executor);
+    const ctx = makeContext({}, executor);
 
     const outputs = await implementStep.run(
       ctx,
@@ -100,7 +74,7 @@ describe("implementStep", () => {
 
   it("throws when executor returns non-zero exit code", async () => {
     const executor = makeExecutor({ exitCode: 1 });
-    const ctx = makeContext(executor);
+    const ctx = makeContext({}, executor);
 
     await expect(
       implementStep.run(ctx, { workspaceDir: "/tmp/test", prompt: "Do it" }, new NoopStepReporter()),
@@ -113,7 +87,7 @@ describe("implementStep", () => {
     // attaching `result.failure` — implementStep must not leave failure_json empty
     // in that case, so it derives one via classifyLlmResult itself.
     const executor = makeExecutor({ exitCode: 1, stderr: "boom, nothing recognisable here" });
-    const ctx = makeContext(executor);
+    const ctx = makeContext({}, executor);
 
     const err = await implementStep
       .run(ctx, { workspaceDir: "/tmp/test", prompt: "Do it" }, new NoopStepReporter())
@@ -146,7 +120,7 @@ describe("implementStep", () => {
         evidence: { truncated: false },
       },
     });
-    const ctx = makeContext(executor);
+    const ctx = makeContext({}, executor);
 
     const err = await implementStep
       .run(ctx, { workspaceDir: "/tmp/test", prompt: "Do it" }, new NoopStepReporter())
@@ -174,7 +148,7 @@ describe("implementStep", () => {
         evidence: { truncated: false },
       },
     });
-    const ctx = makeContext(executor);
+    const ctx = makeContext({}, executor);
 
     const err = await implementStep
       .run(ctx, { workspaceDir: "/tmp/test", prompt: "Do it" }, new NoopStepReporter())
@@ -186,19 +160,7 @@ describe("implementStep", () => {
 
   it("forwards context.data.retryPolicy as retry with the implement-specific flags", async () => {
     const executor = makeExecutor();
-    const ctx = new DefaultPipelineContext(
-      {
-        jobId: 1,
-        issueId: "issue-1",
-        issueIdentifier: "ENG-1",
-        issueTitle: "Test",
-        issueDescription: "Description",
-        nonce: "nonce",
-        orchestratorUrl: "http://localhost:8080",
-        retryPolicy: DEFAULT_RETRY_POLICY,
-      },
-      executor,
-    );
+    const ctx = makeContext({ retryPolicy: DEFAULT_RETRY_POLICY }, executor);
 
     await implementStep.run(ctx, { workspaceDir: "/tmp/test", prompt: "Do it" }, new NoopStepReporter());
 
@@ -216,7 +178,7 @@ describe("implementStep", () => {
 
   it("omits retry when context.data.retryPolicy is absent", async () => {
     const executor = makeExecutor();
-    const ctx = makeContext(executor);
+    const ctx = makeContext({}, executor);
 
     await implementStep.run(ctx, { workspaceDir: "/tmp/test", prompt: "Do it" }, new NoopStepReporter());
 
@@ -228,7 +190,7 @@ describe("implementStep", () => {
     const executor: LLMExecutor = {
       invoke: vi.fn().mockRejectedValue(new Error("network error")),
     };
-    const ctx = makeContext(executor);
+    const ctx = makeContext({}, executor);
 
     await expect(
       implementStep.run(ctx, { workspaceDir: "/tmp/test", prompt: "Do it" }, new NoopStepReporter()),
@@ -237,7 +199,7 @@ describe("implementStep", () => {
 
   it("passes maxTurns to executor", async () => {
     const executor = makeExecutor();
-    const ctx = makeContext(executor);
+    const ctx = makeContext({}, executor);
 
     await implementStep.run(
       ctx,
@@ -261,7 +223,7 @@ describe("implementStep", () => {
       toolTrace: ["Bash npm test"],
     };
     const executor = makeExecutor({ stdout: "done", exitCode: 0, tokensUsed: 150, telemetry });
-    const ctx = makeContext(executor);
+    const ctx = makeContext({}, executor);
 
     const outputs = await implementStep.run(
       ctx,
@@ -275,7 +237,7 @@ describe("implementStep", () => {
   describe("reference repositories section", () => {
     it("appends section with arrived repo and path when entry arrived", async () => {
       const executor = makeExecutor();
-      const ctx = makeContext(executor);
+      const ctx = makeContext({}, executor);
       const referenceRepoResults: ReferenceRepoResult[] = [
         { repo: "https://github.com/a/b", path: "refs/b", ref: undefined, arrived: true },
       ];
@@ -295,7 +257,7 @@ describe("implementStep", () => {
 
     it("appends section with cause phrase when entry did not arrive", async () => {
       const executor = makeExecutor();
-      const ctx = makeContext(executor);
+      const ctx = makeContext({}, executor);
       const referenceRepoResults: ReferenceRepoResult[] = [
         { repo: "https://github.com/a/b", path: "refs/b", ref: "main", arrived: false, cause: "no-auth" },
       ];
@@ -315,7 +277,7 @@ describe("implementStep", () => {
 
     it("includes both arrived and missed repos in section", async () => {
       const executor = makeExecutor();
-      const ctx = makeContext(executor);
+      const ctx = makeContext({}, executor);
       const referenceRepoResults: ReferenceRepoResult[] = [
         { repo: "https://github.com/a/b", path: "refs/b", ref: undefined, arrived: true },
         { repo: "https://github.com/c/d", path: "refs/d", ref: "main", arrived: false, cause: "ref-not-found" },
@@ -336,7 +298,7 @@ describe("implementStep", () => {
 
     it("does not append section when array is empty", async () => {
       const executor = makeExecutor();
-      const ctx = makeContext(executor);
+      const ctx = makeContext({}, executor);
 
       await implementStep.run(
         ctx,
@@ -350,7 +312,7 @@ describe("implementStep", () => {
 
     it("does not append section when referenceRepoResults is absent", async () => {
       const executor = makeExecutor();
-      const ctx = makeContext(executor);
+      const ctx = makeContext({}, executor);
 
       await implementStep.run(
         ctx,
@@ -364,7 +326,7 @@ describe("implementStep", () => {
 
     it("appends planning context before reference repositories section", async () => {
       const executor = makeExecutor();
-      const ctx = makeContext(executor);
+      const ctx = makeContext({}, executor);
       const referenceRepoResults: ReferenceRepoResult[] = [
         { repo: "https://github.com/a/b", path: "refs/b", ref: undefined, arrived: true },
       ];
@@ -394,7 +356,7 @@ describe("implementStep", () => {
       toolTrace: [],
     };
     const executor = makeExecutor({ stdout: "", exitCode: 1, tokensUsed: 0, telemetry });
-    const ctx = makeContext(executor);
+    const ctx = makeContext({}, executor);
 
     const outputs = await implementStep.run(
       ctx,

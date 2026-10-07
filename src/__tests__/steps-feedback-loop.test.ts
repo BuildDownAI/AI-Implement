@@ -1,6 +1,5 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, existsSync, readFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 vi.mock("node:child_process", () => ({
@@ -32,10 +31,11 @@ import { spawnSync } from "node:child_process";
 import { implementStep } from "../pipeline/steps/implement.js";
 import { reviewStep } from "../pipeline/steps/review.js";
 import { feedbackLoopStep } from "../pipeline/steps/feedback-loop.js";
-import { DefaultPipelineContext } from "../pipeline/context.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
 import { DEFAULT_RETRY_POLICY, computeBackoffMs } from "../pipeline/retry-backoff.js";
-import type { LLMExecutor, Step, StepReporter } from "../pipeline/types.js";
+import type { Step, StepReporter } from "../pipeline/types.js";
+import { makeContext } from "./helpers/builders.js";
+import { testDir } from "./helpers/test-dir.js";
 
 /** No-op sleep so a retry test never actually waits out the real backoff delay. */
 const NO_SLEEP = async () => {};
@@ -71,24 +71,16 @@ const IMPLEMENT_OUTPUTS = {
   attempts: 1,
 };
 
-function makeContext(overrides: Record<string, unknown> = {}): DefaultPipelineContext {
-  return new DefaultPipelineContext({
-    jobId: 1,
-    issueId: "issue-1",
-    issueIdentifier: "ENG-1",
-    issueTitle: "Test",
-    issueDescription: "Description",
-    nonce: "nonce",
-    orchestratorUrl: "http://localhost:8080",
-    ...overrides,
-  });
-}
-
-const BASE_INPUTS = {
-  workspaceDir: "/tmp/workspace",
+const BASE_ISSUE = {
   issueTitle: "Implement feature X",
   issueDescription: "Add feature X to the codebase",
 };
+
+// The step writes ai-output/ into its workspace, so every test gets a workspace of its own.
+let BASE_INPUTS: typeof BASE_ISSUE & { workspaceDir: string };
+beforeEach(() => {
+  BASE_INPUTS = { workspaceDir: testDir("feedback-loop"), ...BASE_ISSUE };
+});
 
 /** Every non-"status" git call returns `diff`; `git status --porcelain` always reports a
  *  clean tree (BAC-27134: dirty tests override this to distinguish clean from dirty). */
@@ -594,16 +586,7 @@ describe("feedbackLoopStep", () => {
   it("uses tenant model from ctx.data.model when no other model configured", async () => {
     vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
 
-    const ctx = new DefaultPipelineContext({
-      jobId: 1,
-      issueId: "issue-1",
-      issueIdentifier: "ENG-1",
-      issueTitle: "Test",
-      issueDescription: "Description",
-      nonce: "nonce",
-      orchestratorUrl: "http://localhost:8080",
-      model: "claude-opus-4-7",
-    });
+    const ctx = makeContext({ model: "claude-opus-4-7" });
 
     await feedbackLoopStep.run(ctx, BASE_INPUTS, new NoopStepReporter());
 
@@ -616,16 +599,7 @@ describe("feedbackLoopStep", () => {
   it("explicit implementModel takes precedence over repoImplementModel and tenant model", async () => {
     vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
 
-    const ctx = new DefaultPipelineContext({
-      jobId: 1,
-      issueId: "issue-1",
-      issueIdentifier: "ENG-1",
-      issueTitle: "Test",
-      issueDescription: "Description",
-      nonce: "nonce",
-      orchestratorUrl: "http://localhost:8080",
-      model: "claude-sonnet-4-6",
-    });
+    const ctx = makeContext({ model: "claude-sonnet-4-6" });
 
     await feedbackLoopStep.run(
       ctx,
@@ -747,16 +721,6 @@ const MAX_TURNS_TELEMETRY = {
   toolTrace: ["Bash npm test", "Read /src/app.ts"],
 };
 
-function makeContextWithExecutor(invoke: LLMExecutor["invoke"]): DefaultPipelineContext {
-  return new DefaultPipelineContext(
-    {
-      jobId: 1, issueId: "issue-1", issueIdentifier: "ENG-1", issueTitle: "Test",
-      issueDescription: "Description", nonce: "nonce", orchestratorUrl: "http://localhost:8080",
-    },
-    { invoke },
-  );
-}
-
 describe("feedbackLoopStep termination reasons", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -807,7 +771,7 @@ describe("feedbackLoopStep termination reasons", () => {
     vi.mocked(implementStep.run).mockResolvedValue({ ...IMPLEMENT_OUTPUTS, telemetry: MAX_TURNS_TELEMETRY });
     const invoke = vi.fn().mockResolvedValue({ stdout: "## Post-mortem\nRan out of turns wiring X.", exitCode: 0, tokensUsed: 10 });
 
-    const outputs = await feedbackLoopStep.run(makeContextWithExecutor(invoke), BASE_INPUTS, new NoopStepReporter());
+    const outputs = await feedbackLoopStep.run(makeContext({}, { invoke }), BASE_INPUTS, new NoopStepReporter());
 
     expect(outputs.approved).toBe(false);
     expect(outputs.terminationReason).toBe("max_turns");
@@ -833,7 +797,7 @@ describe("feedbackLoopStep termination reasons", () => {
     const reportedSteps: Step[] = [];
     const reporter: StepReporter = { report: vi.fn(async (step) => { reportedSteps.push({ ...step }); }) };
 
-    await feedbackLoopStep.run(makeContextWithExecutor(invoke), BASE_INPUTS, reporter);
+    await feedbackLoopStep.run(makeContext({}, { invoke }), BASE_INPUTS, reporter);
 
     const postMortemStep = reportedSteps.find((s) => s.id === "post-mortem.1" && s.status === "passed");
     expect(postMortemStep).toBeDefined();
@@ -852,7 +816,7 @@ describe("feedbackLoopStep termination reasons", () => {
     vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
 
     const outputs = await feedbackLoopStep.run(
-      makeContextWithExecutor(vi.fn()),
+      makeContext({}, { invoke: vi.fn() }),
       { ...BASE_INPUTS, maxTurns: 50, maxIterations: 3 },
       new NoopStepReporter(),
     );
@@ -866,7 +830,7 @@ describe("feedbackLoopStep termination reasons", () => {
     vi.mocked(implementStep.run).mockResolvedValue({ ...IMPLEMENT_OUTPUTS, telemetry: MAX_TURNS_TELEMETRY });
     const invoke = vi.fn().mockRejectedValue(new Error("boom"));
 
-    const outputs = await feedbackLoopStep.run(makeContextWithExecutor(invoke), BASE_INPUTS, new NoopStepReporter());
+    const outputs = await feedbackLoopStep.run(makeContext({}, { invoke }), BASE_INPUTS, new NoopStepReporter());
 
     expect(outputs.terminationReason).toBe("max_turns");
     expect(outputs.postMortem).toBeUndefined();
@@ -880,11 +844,7 @@ describe("feedbackLoopStep — cycle summaries (AII-801)", () => {
     vi.clearAllMocks();
     vi.mocked(implementStep.run).mockResolvedValue(IMPLEMENT_OUTPUTS);
     mockDiff();
-    tmpDir = mkdtempSync(join(tmpdir(), "fl-cycle-summary-"));
-  });
-
-  afterEach(() => {
-    rmSync(tmpDir, { recursive: true, force: true });
+    tmpDir = testDir("fl-cycle-summary");
   });
 
   function readCycleSummaries(): Array<{
@@ -928,7 +888,7 @@ describe("feedbackLoopStep — cycle summaries (AII-801)", () => {
     const invoke = vi.fn().mockResolvedValue({ stdout: "## Post-mortem", exitCode: 0, tokensUsed: 10 });
 
     const outputs = await feedbackLoopStep.run(
-      makeContextWithExecutor(invoke),
+      makeContext({}, { invoke }),
       { ...BASE_INPUTS, workspaceDir: tmpDir },
       new NoopStepReporter(),
     );
@@ -995,11 +955,7 @@ describe("feedbackLoopStep — reviewer feedback file", () => {
     vi.clearAllMocks();
     vi.mocked(implementStep.run).mockResolvedValue(IMPLEMENT_OUTPUTS);
     mockDiff();
-    tmpDir = mkdtempSync(join(tmpdir(), "fl-feedback-"));
-  });
-
-  afterEach(() => {
-    rmSync(tmpDir, { recursive: true, force: true });
+    tmpDir = testDir("fl-feedback");
   });
 
   it("writes finalFeedback to ai-output/comments/80-reviewer-feedback.md on approval", async () => {

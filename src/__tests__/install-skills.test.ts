@@ -1,35 +1,14 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, vi, beforeEach } from "vitest";
 
 const isWindows = process.platform === "win32";
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, writeFileSync, existsSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { installSkillsStep } from "../pipeline/steps/install-skills.js";
-import { DefaultPipelineContext } from "../pipeline/context.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
-import type { LLMExecutor } from "../pipeline/types.js";
-
-const noopExec: LLMExecutor = {
-  async invoke() {
-    return { stdout: "", exitCode: 0, tokensUsed: 0 };
-  },
-};
-
-function ctx() {
-  return new DefaultPipelineContext(
-    {
-      jobId: 1,
-      issueId: "i",
-      issueIdentifier: "AII-1",
-      issueTitle: "T",
-      issueDescription: "D",
-      nonce: "n",
-      orchestratorUrl: "",
-    },
-    noopExec,
-  );
-}
+import { makeContext } from "./helpers/builders.js";
+import { testDir } from "./helpers/test-dir.js";
 
 function git(args: string[], cwd: string): void {
   const result = spawnSync("git", args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
@@ -39,7 +18,8 @@ function git(args: string[], cwd: string): void {
 }
 
 function makeSkillsRepo(files: Record<string, string>): string {
-  const repoDir = mkdtempSync(join(tmpdir(), "skills-repo-"));
+  // No prefix starting "skills": a test scans the temp directory for the step's own "ai-implement-skills-" directories.
+  const repoDir = testDir("source-repo");
   git(["init"], repoDir);
   git(["config", "user.email", "test@test.com"], repoDir);
   git(["config", "user.name", "Test"], repoDir);
@@ -59,18 +39,7 @@ let homeDir: string;
 let repoDir: string | undefined;
 
 beforeEach(() => {
-  homeDir = mkdtempSync(join(tmpdir(), "skills-home-"));
-});
-
-afterEach(() => {
-  try {
-    rmSync(homeDir, { recursive: true, force: true });
-    if (repoDir) {
-      rmSync(repoDir, { recursive: true, force: true });
-    }
-  } catch {
-    // On Windows, git marks object files read-only; ignore cleanup failures
-  }
+  homeDir = testDir("home");
   repoDir = undefined;
 });
 
@@ -82,7 +51,7 @@ describe("installSkillsStep", () => {
     });
 
     const out = await installSkillsStep.run(
-      ctx(),
+      makeContext(),
       { skillsRepoUrl: repoDir, githubToken: "x", homeDir },
       new NoopStepReporter(),
     );
@@ -96,7 +65,7 @@ describe("installSkillsStep", () => {
 
   it("returns skillsInstalled:0 and does not throw for a bad URL", async () => {
     const out = await installSkillsStep.run(
-      ctx(),
+      makeContext(),
       {
         skillsRepoUrl: "https://github.com/nonexistent/repo-that-does-not-exist-xyz.git",
         githubToken: "x",
@@ -111,7 +80,7 @@ describe("installSkillsStep", () => {
 
   it("returns skillsInstalled:0 for a non-https (SSH) URL without attempting a clone", async () => {
     const out = await installSkillsStep.run(
-      ctx(),
+      makeContext(),
       { skillsRepoUrl: "git@github.com:org/skills.git", githubToken: "x", homeDir },
       new NoopStepReporter(),
     );
@@ -123,7 +92,7 @@ describe("installSkillsStep", () => {
 
   it("returns skillsInstalled:0 for an empty skillsRepoUrl without throwing", async () => {
     const out = await installSkillsStep.run(
-      ctx(),
+      makeContext(),
       { skillsRepoUrl: "", githubToken: "x", homeDir },
       new NoopStepReporter(),
     );
@@ -140,7 +109,7 @@ describe("installSkillsStep", () => {
     });
 
     const out = await installSkillsStep.run(
-      ctx(),
+      makeContext(),
       { skillsRepoUrl: repoDir, githubToken: "x", homeDir },
       new NoopStepReporter(),
     );
@@ -155,7 +124,7 @@ describe("installSkillsStep", () => {
     repoDir = makeSkillsRepo({ "alpha/SKILL.md": "# Alpha" });
 
     await installSkillsStep.run(
-      ctx(),
+      makeContext(),
       { skillsRepoUrl: repoDir, githubToken: "x", homeDir },
       new NoopStepReporter(),
     );
@@ -167,7 +136,7 @@ describe("installSkillsStep", () => {
   it("converts owner/repo shorthand to https://github.com URL and attempts clone", async () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const out = await installSkillsStep.run(
-      ctx(),
+      makeContext(),
       { skillsRepoUrl: "acme/nonexistent-skills-repo-xyz", githubToken: "", homeDir },
       new NoopStepReporter(),
     );
@@ -185,7 +154,7 @@ describe("installSkillsStep", () => {
   it.skipIf(isWindows)("embeds the token only for github.com clones; cross-host https URLs get no credentials", async () => {
     // Shim `git` with a script that records its argv, so we can assert exactly what
     // remote URL the step hands to `git clone` for each host.
-    const shimDir = mkdtempSync(join(tmpdir(), "git-shim-"));
+    const shimDir = testDir("git-shim");
     const argsFile = join(shimDir, "git-args.txt");
     writeFileSync(
       join(shimDir, "git"),
@@ -197,7 +166,7 @@ describe("installSkillsStep", () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const cloneArgsFor = async (skillsRepoUrl: string): Promise<string> => {
       await installSkillsStep.run(
-        ctx(),
+        makeContext(),
         { skillsRepoUrl, githubToken: "sekret-token", homeDir },
         new NoopStepReporter(),
       );
@@ -221,7 +190,6 @@ describe("installSkillsStep", () => {
     } finally {
       process.env.PATH = origPath;
       warnSpy.mockRestore();
-      rmSync(shimDir, { recursive: true, force: true });
     }
   });
 
@@ -231,7 +199,7 @@ describe("installSkillsStep", () => {
     });
 
     const out = await installSkillsStep.run(
-      ctx(),
+      makeContext(),
       { skillsRepoUrl: repoDir, githubToken: "x", homeDir },
       new NoopStepReporter(),
     );
@@ -249,7 +217,7 @@ describe("installSkillsStep", () => {
     });
 
     const out = await installSkillsStep.run(
-      ctx(),
+      makeContext(),
       { skillsRepoUrl: repoDir, githubToken: "x", homeDir },
       new NoopStepReporter(),
     );
@@ -267,7 +235,7 @@ describe("installSkillsStep", () => {
     });
 
     const out = await installSkillsStep.run(
-      ctx(),
+      makeContext(),
       { skillsRepoUrl: repoDir, githubToken: "x", homeDir },
       new NoopStepReporter(),
     );
@@ -285,7 +253,7 @@ describe("installSkillsStep", () => {
     });
 
     const out = await installSkillsStep.run(
-      ctx(),
+      makeContext(),
       { skillsRepoUrl: repoDir, githubToken: "x", homeDir },
       new NoopStepReporter(),
     );

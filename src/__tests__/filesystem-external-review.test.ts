@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { postPushReviewStep } from "../pipeline/steps/post-push-review.js";
-import type { PipelineContext } from "../pipeline/types.js";
+import { makeContext } from "./helpers/builders.js";
+import { testDir } from "./helpers/test-dir.js";
 
 function fixture({ failingCi = "", pendingReview = "", issueId = "filesystem:SAN2:SAN2-001" } = {}) {
   let selectedReviewers = false;
@@ -25,15 +26,12 @@ function fixture({ failingCi = "", pendingReview = "", issueId = "filesystem:SAN
     terminalStatus: { subtype: "success", isError: false },
     telemetry: { outcome: "success" as const, numTurns: 1, durationMs: 10, costUsd: null, tokensIn: 1, tokensOut: 1 },
   }));
-  const ctx = {
-    data: { issueId, issueIdentifier: "TEST-1", issueTitle: "Test", issueDescription: "Test", model: "claude-sonnet-4-6" },
-    llmExecutor: { invoke }, getOutputs: () => ({}), setOutputs: () => {}, resolveInputs: (i: unknown) => i,
-  } as unknown as PipelineContext;
+  const ctx = makeContext({ issueId }, { invoke });
   const sleep = vi.fn(async () => {});
   const run = (extra: Record<string, unknown> = {}) => {
     selectedReviewers = extra.reviewers !== undefined;
     return postPushReviewStep.run(ctx, {
-      prNumber: "42", workspaceDir: "/tmp", maxIterations: 1,
+      prNumber: "42", workspaceDir: testDir("filesystem-review"), maxIterations: 1,
       ghSpawn, gitSpawn: () => ({ stdout: "", exitCode: 0 }), sleep,
       trustedReviewerDefinitions: new Map(["gap-analysis", "code-review"].map(id => [
         id, { id, buildPrompt: () => "Review the diff", outputSchema: { type: "object" } },

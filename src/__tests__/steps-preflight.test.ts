@@ -1,13 +1,15 @@
 import { afterEach, describe, it, expect, vi, beforeEach } from "vitest";
 import { preflightStep } from "../pipeline/steps/preflight.js";
-import { DefaultPipelineContext } from "../pipeline/context.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
+import { makeContext } from "./helpers/builders.js";
 
 vi.mock("node:child_process", () => ({
   execSync: vi.fn(),
 }));
 
-vi.mock("node:fs", () => ({
+// The step reads through the default export; the named exports stay real for the modules the builders load.
+vi.mock("node:fs", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("node:fs")>()),
   default: {
     existsSync: vi.fn(),
     readFileSync: vi.fn(),
@@ -16,18 +18,6 @@ vi.mock("node:fs", () => ({
 
 import { execSync } from "node:child_process";
 import fs from "node:fs";
-
-function makeContext(): DefaultPipelineContext {
-  return new DefaultPipelineContext({
-    jobId: 1,
-    issueId: "issue-1",
-    issueIdentifier: "ENG-1",
-    issueTitle: "Test",
-    issueDescription: "Desc",
-    nonce: "nonce",
-    orchestratorUrl: "http://localhost:8080",
-  });
-}
 
 describe("preflightStep", () => {
   beforeEach(() => {
