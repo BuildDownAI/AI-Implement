@@ -449,7 +449,7 @@ flowchart TD
 
 ### Two materialize paths (AII-599)
 
-`KG_MATERIALIZE_DIRECT=true` switches the refresh rail to the base repo's low-memory `--direct`
+The materialize-direct setting (seeded by `KG_MATERIALIZE_DIRECT=true` on first boot) switches the refresh rail to the base repo's low-memory `--direct`
 path (KGB-15, base PR #34), gated behind the flag because it requires the configured
 `KG_SOURCE_REPO` derivative to already carry that base change — an image whose venv predates it
 fails the materialize step and the rail reverts safely, same as any other staging failure.
@@ -471,15 +471,14 @@ could not hold on 2026-09-08 with the rdflib path (see the Failure history table
 figure above remains the committed setting, but the direct path is what would let that incident's
 fix be reverted instead of the memory bump.
 
-**The flag is a seed, not the only control (AII-602).** `KG_MATERIALIZE_DIRECT` resolves through
-the same `db | env | default` precedence as `RUNNER_MODE` (`getKgMaterializeDirect()` /
-`setKgMaterializeDirect()` in `src/runner-mode.ts`): the env var wins outright when set, else the
-`settings` table row, else `false` (rdflib). `materializeDirectEnabled()` in `src/kg-refresh.ts`
+**The flag is a seed-once setting (AII-602, AII-1109).** `KG_MATERIALIZE_DIRECT` is read only at
+boot by `seedKgMaterializeDirectFromEnv()` (`src/runner-mode.ts`), which writes the `settings` row
+when none exists and is inert afterward. `getKgMaterializeDirect()` / `setKgMaterializeDirect()`
+resolve the stored row, else `false` (rdflib); the env var is never consulted at runtime. `materializeDirectEnabled()` in `src/kg-refresh.ts`
 reads the resolved setting rather than `process.env` directly. The Knowledge Graph Pipelines page
 (`/admin#kg-pipelines`) exposes a `Materialize: rdflib | direct` control next to "Refresh graph
-now" — `GET`/`POST /api/kg/materialize-mode` — that flips the DB row; while the env var is set,
-the control is disabled and the write comes back `409`, same as the `RUNNER_MODE` /
-`FLY_PROCESS_LEVEL_SECRETS` pattern on the Runners page. The toggle only affects the *next*
+now" — `GET`/`POST /api/kg/materialize-mode` — that flips the DB row, which is the only
+runtime control. The toggle only affects the *next*
 refresh, not whatever the sidecar is currently serving — `GET /api/kg/status` and the `get_kg_status`
 MCP tool both report the resolved setting as `materialize: "rdflib" | "direct"` for observability.
 

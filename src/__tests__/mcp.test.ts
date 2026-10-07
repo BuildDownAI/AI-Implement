@@ -171,7 +171,7 @@ vi.mock("../access-entries.js", () => ({
 vi.mock("../runner-mode.js", () => ({
   VALID_RUNNER_MODES: ["default", "gha", "fly", "local", "shadow"],
   getRunnerMode: vi.fn(),
-  getKgMaterializeDirect: vi.fn(() => true),
+  getKgMaterializeDirect: vi.fn(() => ({ enabled: true, source: "db" as const })),
   getKgFlyMachineOverride: vi.fn(() => ({})),
   setKgFlyMachineOverride: vi.fn(),
 }));

@@ -2127,21 +2127,13 @@ describe("admin kg materialize-mode", () => {
     expect(res.statusCode).toBe(400);
   });
 
-  it("POST /api/kg/materialize-mode returns 409 when KG_MATERIALIZE_DIRECT env var is set", async () => {
+  it("POST /api/kg/materialize-mode answers 200 and persists even when KG_MATERIALIZE_DIRECT is set (AII-1109)", async () => {
     process.env.KG_MATERIALIZE_DIRECT = "true";
     const token = await login("secret");
     const res = await kgRequest("/api/kg/materialize-mode", "POST", token, { direct: false });
-    expect(res.statusCode).toBe(409);
-    const body = JSON.parse(res.body);
-    expect(body.error).toContain("KG_MATERIALIZE_DIRECT env var");
-    expect(body.persisted).toBe(false);
-    // Runtime value is still locked by the env var
-    expect(body.direct).toBe(true);
-    expect(body.source).toBe("env");
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ direct: false, source: "db" });
 
-    // And the DB write actually happened — clearing the env var should
-    // surface the persisted value.
-    delete process.env.KG_MATERIALIZE_DIRECT;
     const get = await kgRequest("/api/kg/materialize-mode", "GET", token);
     expect(JSON.parse(get.body).direct).toBe(false);
   });

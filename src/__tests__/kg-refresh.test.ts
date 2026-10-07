@@ -5,6 +5,12 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { makeKgRefresh, runKgRefreshPreflight, materializeArgs, type KgRefreshHandle, type RefreshOutcome, migrateLegacyDryRunOutcomes } from "../kg-refresh.js";
 
+const materializeState = vi.hoisted(() => ({ direct: false }));
+vi.mock("../runner-mode.js", async (orig) => ({
+  ...(await orig<typeof import("../runner-mode.js")>()),
+  getKgMaterializeDirect: () => ({ enabled: materializeState.direct, source: "db" as const }),
+}));
+
 const NAMESPACE = "https://kg.test.example/";
 
 function makeTarball(dir: string): Buffer {
@@ -30,18 +36,18 @@ describe("kg-refresh", () => {
   // AII-599: KG_MATERIALIZE_DIRECT gates the low-memory --direct path.
   describe("KG_MATERIALIZE_DIRECT", () => {
     afterEach(() => {
-      vi.unstubAllEnvs();
+      materializeState.direct = false;
       vi.restoreAllMocks();
     });
 
     it("appends --direct to materializeArgs() when the flag is true", () => {
-      vi.stubEnv("KG_MATERIALIZE_DIRECT", "true");
+      materializeState.direct = true;
       expect(materializeArgs()).toEqual(["-m", "kg_ingest.materialize", "--direct"]);
       expect(materializeArgs().join(" ")).not.toMatch(/embed|cli/);
     });
 
-    it("leaves materializeArgs() unchanged when the flag is unset or any other value", () => {
-      vi.stubEnv("KG_MATERIALIZE_DIRECT", "false");
+    it("leaves materializeArgs() unchanged when the setting is off", () => {
+      materializeState.direct = false;
       expect(materializeArgs()).toEqual(["-m", "kg_ingest.materialize"]);
     });
 

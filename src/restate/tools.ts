@@ -703,7 +703,7 @@ export const getKgStatusTool = tool(
       lastRefresh,
       lastDryRun,
       stage,
-      materialize: getKgMaterializeDirect() ? "direct" : "rdflib",
+      materialize: getKgMaterializeDirect().enabled ? "direct" : "rdflib",
       flyMachine: resolveKgFlyMachineSize(toolDeps.kgSourceRepo, false),
     };
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
