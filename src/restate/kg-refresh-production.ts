@@ -40,6 +40,7 @@ import {
   type KgRefreshStatusResult,
   type KgRefreshWorkflowDependencies,
 } from "./kg-refresh-workflow.js";
+import { createFlyMachineProfile, PERFORMANCE_MIN_MB_PER_CPU } from "./fly-machine-profile.js";
 import { createKgRepo, type KgRepoEnqueueInput, type KgRepoEnqueueResult, type KgRepoPrInput, type KgRepoTriggerResult, type StoredDryRunOutcome } from "./kg-repo.js";
 import type { KgRefreshDefinition, KgRepoDefinition } from "./kg-refresh-types.js";
 import { RESTATE_INGRESS_BASE_URL } from "./server.js";
@@ -168,9 +169,6 @@ export interface KgRefreshToolDeps {
 export function findKgMapping(kgSourceRepo: string) {
   return Object.entries(getMappings()).find(([, m]) => `${m.owner}/${m.repo}` === kgSourceRepo);
 }
-
-/** Fly performance machines need at least this much memory per CPU. */
-const PERFORMANCE_MIN_MB_PER_CPU = 2048;
 
 export interface KgFlyMachineSize {
   cpuKind: "shared" | "performance";
@@ -403,7 +401,7 @@ export function createProductionKgRefreshServices(
   };
 
   return {
-    services: [createKgRepo({ workflowName: "KgRefresh" }), createKgRefreshWorkflow(deps)],
+    services: [createKgRepo({ workflowName: "KgRefresh" }), createFlyMachineProfile(), createKgRefreshWorkflow(deps)],
     toolDeps,
   };
 }
