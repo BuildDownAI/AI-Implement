@@ -2127,21 +2127,13 @@ describe("admin kg materialize-mode", () => {
     expect(res.statusCode).toBe(400);
   });
 
-  it("POST /api/kg/materialize-mode returns 409 when KG_MATERIALIZE_DIRECT env var is set", async () => {
+  it("POST /api/kg/materialize-mode answers 200 and persists even when KG_MATERIALIZE_DIRECT is set (AII-1109)", async () => {
     process.env.KG_MATERIALIZE_DIRECT = "true";
     const token = await login("secret");
     const res = await kgRequest("/api/kg/materialize-mode", "POST", token, { direct: false });
-    expect(res.statusCode).toBe(409);
-    const body = JSON.parse(res.body);
-    expect(body.error).toContain("KG_MATERIALIZE_DIRECT env var");
-    expect(body.persisted).toBe(false);
-    // Runtime value is still locked by the env var
-    expect(body.direct).toBe(true);
-    expect(body.source).toBe("env");
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ direct: false, source: "db" });
 
-    // And the DB write actually happened — clearing the env var should
-    // surface the persisted value.
-    delete process.env.KG_MATERIALIZE_DIRECT;
     const get = await kgRequest("/api/kg/materialize-mode", "GET", token);
     expect(JSON.parse(get.body).direct).toBe(false);
   });
@@ -4949,6 +4941,119 @@ describe("POST /api/deploy-policy", () => {
   });
 });
 
+describe("/api/retention", () => {
+  async function retentionRequest(
+    token: string,
+    method: "GET" | "POST",
+    body: unknown,
+    apply = vi.fn(async (_days: number) => ({ applied: ["vol_1"], skipped: "" })),
+  ): Promise<{ statusCode: number; body: Record<string, unknown>; apply: typeof apply }> {
+    const retention = await import("../restate/retention.js");
+    const deps: Parameters<typeof admin.handleAdminRequest>[4] = {
+      retention: {
+        getRestateDays: retention.getRestateRetentionDays,
+        setRestateDays: retention.setRestateRetentionDays,
+        getVolumeDays: retention.getVolumeSnapshotRetentionDays,
+        setVolumeDays: retention.setVolumeSnapshotRetentionDays,
+        applyVolume: apply,
+        default: retention.RESTATE_RETENTION_DAYS_DEFAULT,
+        min: retention.RESTATE_RETENTION_DAYS_MIN,
+        max: retention.RESTATE_RETENTION_DAYS_MAX,
+      },
+    };
+    const req = new MockRequest("/api/retention", method, { authorization: `Bearer ${token}` }, body === undefined ? undefined : JSON.stringify(body));
+    const res = new MockResponse();
+    admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider), deps);
+    await res.done;
+    return { statusCode: res.statusCode, body: res.body ? JSON.parse(res.body) : {}, apply };
+  }
+
+  it("answers 501 on GET and POST when retention is not configured", async () => {
+    const token = await login("secret");
+    for (const method of ["GET", "POST"] as const) {
+      const req = new MockRequest("/api/retention", method, { authorization: `Bearer ${token}` }, method === "POST" ? JSON.stringify({ restate: 10 }) : undefined);
+      const res = new MockResponse();
+      admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider), {});
+      await res.done;
+      expect(res.statusCode).toBe(501);
+    }
+  });
+
+  it("rejects an unauthenticated request", async () => {
+    expect((await retentionRequest("not-a-session", "POST", { restate: 10 })).statusCode).toBe(401);
+  });
+
+  it("refuses a non-admin session as /api/deploy-policy does", async () => {
+    const user = adminSession.createSession({ email: "reader@eudoxus.ai", sub: "google|reader", provider: "google", name: "Reader" });
+    const policy = new MockRequest("/api/deploy-policy", "POST", { authorization: `Bearer ${user}` }, JSON.stringify({ autoDeploy: true }));
+    const policyRes = new MockResponse();
+    admin.handleAdminRequest(policy as never, policyRes as never, adminConfig("secret"), makeFakeRegistry(provider), {});
+    await policyRes.done;
+
+    const res = await retentionRequest(user, "POST", { volume: 20 });
+    expect(res.statusCode).toBe(policyRes.statusCode);
+    expect(res.statusCode).toBe(403);
+    expect(res.apply).not.toHaveBeenCalled();
+  });
+
+  it("answers the fresh-database shape on GET", async () => {
+    const token = await login("secret");
+    const res = await retentionRequest(token, "GET", undefined);
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toEqual({
+      restate: { days: 14, appliesAt: "next deploy or restart" },
+      volume: { days: 14, lastApplied: null },
+      default: 14,
+      min: 1,
+      max: 60,
+    });
+  });
+
+  it("answers 400 naming restate_retention_days for 61 and stores nothing", async () => {
+    const token = await login("secret");
+    const retention = await import("../restate/retention.js");
+    const res = await retentionRequest(token, "POST", { restate: 61 });
+    expect(res.statusCode).toBe(400);
+    expect(String(res.body.error)).toContain("restate_retention_days");
+    expect(retention.getRestateRetentionDays()).toBe(14);
+  });
+
+  it("stores neither value when one of two is bad, and rejects non-integers", async () => {
+    const token = await login("secret");
+    const retention = await import("../restate/retention.js");
+    const mixed = await retentionRequest(token, "POST", { restate: 10, volume: 99 });
+    expect(mixed.statusCode).toBe(400);
+    expect(String(mixed.body.error)).toContain("volume_snapshot_retention_days");
+    expect(retention.getRestateRetentionDays()).toBe(14);
+    expect(mixed.apply).not.toHaveBeenCalled();
+    expect((await retentionRequest(token, "POST", { restate: "10" })).statusCode).toBe(400);
+    expect((await retentionRequest(token, "POST", { volume: 2.5 })).statusCode).toBe(400);
+  });
+
+  it("stores volume, applies it once, and reports lastApplied", async () => {
+    const token = await login("secret");
+    const retention = await import("../restate/retention.js");
+    const res = await retentionRequest(token, "POST", { volume: 20 });
+    expect(res.statusCode).toBe(200);
+    expect(retention.getVolumeSnapshotRetentionDays()).toBe(20);
+    expect(res.apply).toHaveBeenCalledTimes(1);
+    expect(res.apply).toHaveBeenCalledWith(20);
+    const volume = res.body.volume as { days: number; lastApplied: { at: number; applied: string[]; skipped: string } };
+    expect(volume.days).toBe(20);
+    expect(volume.lastApplied).toMatchObject({ applied: ["vol_1"], skipped: "" });
+    expect(typeof volume.lastApplied.at).toBe("number");
+  });
+
+  it("stores restate without applying the volume", async () => {
+    const token = await login("secret");
+    const retention = await import("../restate/retention.js");
+    const res = await retentionRequest(token, "POST", { restate: 10 });
+    expect(res.statusCode).toBe(200);
+    expect(retention.getRestateRetentionDays()).toBe(10);
+    expect(res.apply).toHaveBeenCalledTimes(0);
+  });
+});
+
 describe("per-page grants", () => {
   /** Admitted by the domain seed, so a `user` rather than an admin. */
   function userSession(): string {
@@ -5032,6 +5137,49 @@ describe("per-page grants", () => {
       accessGrants.savePageGrants(["audit", "reports"], "ada@eudoxus.ai");
       const res = await request("/api/session-identity", "GET", "secret", undefined, userSession());
       expect(JSON.parse(res.body)).toMatchObject({ role: "user", grantedPages: ["audit", "reports"] });
+    });
+  });
+
+  describe("journal grant", () => {
+    const journalFetch = vi.fn();
+    const journalDeps = {
+      readJournal: (query: Record<string, string>) => journalModule.handleJournalRequest(query, { fetchImpl: journalFetch as never }),
+    };
+    let journalModule: typeof import("../restate/journal-query.js");
+    beforeEach(async () => {
+      journalFetch.mockReset();
+      journalModule = await import("../restate/journal-query.js");
+    });
+
+    it("answers 400 on a bad lookup and never calls the admin API", async () => {
+      const res = await requestWithDeps("/api/restate/journal?service=KgRefresh&key=x'y", "GET", adminSsoSession(), journalDeps);
+      expect(res.statusCode).toBe(400);
+      expect(JSON.parse(res.body).error).toMatch(/^key/);
+      expect(journalFetch).not.toHaveBeenCalled();
+    });
+
+    it("refuses a user with no grant, and admits one with the grant despite the query string", async () => {
+      const path = "/api/restate/journal?service=KgRefresh&key=abc";
+      expect((await requestWithDeps(path, "GET", userSession(), journalDeps)).statusCode).toBe(403);
+      accessGrants.savePageGrants(["journal"], "ada@eudoxus.ai");
+      journalFetch.mockResolvedValue(new Response(JSON.stringify({ rows: [] }), { status: 200 }));
+      expect((await requestWithDeps(path, "GET", userSession(), journalDeps)).statusCode).toBe(404);
+      expect(journalFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it("admits an admin without a grant", async () => {
+      journalFetch.mockResolvedValue(new Response(JSON.stringify({ rows: [] }), { status: 200 }));
+      const res = await requestWithDeps("/api/restate/journal?id=inv_1", "GET", adminSsoSession(), journalDeps);
+      expect(res.statusCode).toBe(404);
+      expect(JSON.parse(res.body)).toEqual({ error: "no invocation" });
+    });
+
+    it("answers 503 when the admin API throws", async () => {
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      journalFetch.mockRejectedValue(new Error("down"));
+      const res = await requestWithDeps("/api/restate/journal?id=inv_1", "GET", adminSsoSession(), journalDeps);
+      expect(res.statusCode).toBe(503);
+      expect(JSON.parse(res.body)).toEqual({ error: "restate unavailable" });
     });
   });
 

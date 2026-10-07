@@ -451,7 +451,25 @@ export interface AdminConfig {
   kgSourceRepo?: string | null;
 }
 
+/**
+ * The two retention settings (AII-1137). Injected rather than imported because
+ * src/restate/retention.ts is off this file's runtime-import allowlist; bound in src/index.ts.
+ * The setters throw on an out-of-range value.
+ */
+export interface RetentionDeps {
+  getRestateDays: () => number;
+  setRestateDays: (days: number) => void;
+  getVolumeDays: () => number;
+  setVolumeDays: (days: number) => void;
+  /** Applies the volume value to the orchestrator's Fly volumes. Never throws; a failure comes back as `skipped`. */
+  applyVolume: (days: number) => Promise<{ applied: string[]; skipped: string }>;
+  default: number;
+  min: number;
+  max: number;
+}
+
 export interface AdminDeps {
+  retention?: RetentionDeps;
   /** Starts a self-deploy. Absent when the orchestrator is not configured to deploy itself. */
   startDeploy?: (targetOverride?: SelfDeployTarget) => Promise<DeployStart>;
   selfDeployTarget?: SelfDeployTarget | null;
@@ -483,6 +501,12 @@ export interface AdminDeps {
    * don't exercise the five `/api/review-fix/attempts/*` routes, which then answer 501.
    */
   reviewFixAttempts?: ReviewFixAttemptsFacade;
+  /**
+   * Answers GET /api/restate/journal from the query parameters (src/restate/journal-query.ts's
+   * handleJournalRequest). Injected for the same reason as `getRestateStatus`: this file may
+   * only import src/restate/* as types. Absent only in tests that don't exercise the route, which then answers 501.
+   */
+  readJournal?: (query: Record<string, string>) => Promise<{ status: number; body: unknown }>;
 }
 
 /** Caller identity passed into every `reviewFixAttempts` facade call, so scope and
@@ -773,6 +797,19 @@ export function handleAdminRequest(
       return true;
     }
 
+    if (url.split("?")[0] === "/api/restate/journal" && method === "GET") {
+      if (!deps.readJournal) {
+        json(res, 501, { error: "journal is not configured" });
+        return true;
+      }
+      const query = Object.fromEntries(new URL(url, "http://localhost").searchParams);
+      deps.readJournal(query).then(
+        (r) => json(res, r.status, r.body),
+        (err) => json(res, 500, { error: String(err) }),
+      );
+      return true;
+    }
+
     if (url === "/api/kg/status" && method === "GET") {
       if (!deps.kgRefresh) {
         json(res, 501, { error: "KG refresh is not configured" });
@@ -896,6 +933,20 @@ export function handleAdminRequest(
 
     if (url === "/api/deploy-policy" && method === "POST") {
       handleSetDeployPolicy(req, res);
+      return true;
+    }
+
+    if (url === "/api/retention" && method === "GET") {
+      if (!deps.retention) {
+        json(res, 501, { error: "Retention settings are not available" });
+        return true;
+      }
+      json(res, 200, retentionView(deps.retention));
+      return true;
+    }
+
+    if (url === "/api/retention" && method === "POST") {
+      handleSetRetention(req, res, deps);
       return true;
     }
 
@@ -1673,18 +1724,6 @@ async function handleSetKgMaterializeMode(
     setKgMaterializeDirect(body.direct);
     const status = getKgMaterializeDirect();
 
-    // The DB write succeeded but an env var still wins at runtime. Return 409
-    // so direct API callers can tell their write was overridden.
-    if (status.source === "env") {
-      json(res, 409, {
-        error: "KG_MATERIALIZE_DIRECT env var is set; persisted to DB but has no effect at runtime until the env var is unset",
-        persisted: body.direct,
-        direct: status.enabled,
-        source: status.source,
-      });
-      return;
-    }
-
     json(res, 200, { direct: status.enabled, source: status.source });
   } catch {
     json(res, 400, { error: "Invalid request body" });
@@ -2294,6 +2333,57 @@ async function handleReviewFixCancel(
     json(res, status, body);
   } catch (err) {
     console.error("[admin] review-fix cancel failed:", err);
+    json(res, 500, { error: "Internal server error" });
+  }
+}
+
+/** In-memory: null after a restart even when the boot step applied the value (it only logs). */
+let lastVolumeRetentionApply: { at: number; applied: string[]; skipped: string } | null = null;
+
+function retentionView(r: RetentionDeps) {
+  return {
+    restate: { days: r.getRestateDays(), appliesAt: "next deploy or restart" },
+    volume: { days: r.getVolumeDays(), lastApplied: lastVolumeRetentionApply },
+    default: r.default,
+    min: r.min,
+    max: r.max,
+  };
+}
+
+async function handleSetRetention(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  deps: AdminDeps,
+): Promise<void> {
+  const r = deps.retention;
+  if (!r) {
+    json(res, 501, { error: "Retention settings are not available" });
+    return;
+  }
+  try {
+    const body = JSON.parse(await readBody(req)) as { restate?: unknown; volume?: unknown };
+    const fields = [
+      ["restate", "restate_retention_days"],
+      ["volume", "volume_snapshot_retention_days"],
+    ] as const;
+    // Validate both before storing either, so a bad field stores nothing.
+    for (const [key, setting] of fields) {
+      const v = body[key];
+      if (v === undefined) continue;
+      if (typeof v !== "number" || !Number.isInteger(v) || v < r.min || v > r.max) {
+        json(res, 400, { error: `${setting} must be an integer from ${r.min} to ${r.max}` });
+        return;
+      }
+    }
+    if (typeof body.restate === "number") r.setRestateDays(body.restate);
+    if (typeof body.volume === "number") {
+      r.setVolumeDays(body.volume);
+      const result = await r.applyVolume(body.volume);
+      lastVolumeRetentionApply = { at: Date.now(), applied: result.applied, skipped: result.skipped };
+    }
+    json(res, 200, retentionView(r));
+  } catch (err) {
+    console.error("[admin] retention update failed:", err);
     json(res, 500, { error: "Internal server error" });
   }
 }

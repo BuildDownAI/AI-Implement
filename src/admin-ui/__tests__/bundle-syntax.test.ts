@@ -9,6 +9,7 @@ import { settingsScript } from "../pages/settings.js";
 import { projectsScript } from "../pages/projects.js";
 import { pipelinesScript } from "../pages/pipelines.js";
 import { reaperScript } from "../pages/reaper.js";
+import { journalScript } from "../pages/journal.js";
 import { sessionsScript } from "../pages/sessions.js";
 import { auditScript } from "../pages/audit.js";
 import { issuesScript } from "../pages/issues.js";
@@ -72,6 +73,7 @@ describe("per-module script parse", () => {
     ["projects", projectsScript],
     ["pipelines", pipelinesScript],
     ["reaper", reaperScript],
+    ["journal", journalScript],
     ["sessions", sessionsScript],
     ["audit", auditScript],
     ["issues", issuesScript],

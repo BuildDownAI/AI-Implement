@@ -593,6 +593,31 @@ describe("schema migration", () => {
     expect(jobs[0].runId).toBeNull();
   });
 
+  it("migration only rewrites open GitHub Actions rows with no run id", () => {
+    const db = dedup.getDb();
+    const ins = db.prepare(
+      "INSERT INTO dispatch_log (issue_id, dispatched_at, status, conclusion, execution_mode) VALUES (?, ?, ?, ?, ?)",
+    );
+    const now = Date.now();
+    for (const st of ["failed", "completed", "timed_out", "review_failed", "dispatch-failed"]) {
+      ins.run(`closed-${st}`, now, st, "dispatch_rejected", "github-actions");
+    }
+    ins.run("open-dispatched", now, "dispatched", null, "github-actions");
+    ins.run("open-running", now, "running", null, null);
+    ins.run("fly-open", now, "running", null, "fly-machines");
+
+    log.initLogTable();
+
+    const byIssue = new Map(log.listLog().map((j) => [j.issueId, j]));
+    for (const st of ["failed", "completed", "timed_out", "review_failed", "dispatch-failed"]) {
+      expect(byIssue.get(`closed-${st}`)?.status).toBe(st);
+      expect(byIssue.get(`closed-${st}`)?.conclusion).toBe("dispatch_rejected");
+    }
+    expect(byIssue.get("open-dispatched")?.status).toBe("unknown");
+    expect(byIssue.get("open-running")?.status).toBe("unknown");
+    expect(byIssue.get("fly-open")?.status).toBe("running");
+  });
+
   it("backfills runner_mode column on existing tables and leaves legacy rows null", () => {
     // Insert a row before the runner_mode column would have existed.
     // The migration in ensureLogColumns should add the column; legacy rows

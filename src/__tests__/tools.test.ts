@@ -14,9 +14,9 @@ import {
   getProjectBinding,
   kgPath,
   kgHybridSearch,
+  kgStageForRunnerStep,
   getKgStatusTool,
-  setKgFlyMachineTool,
-  flyMachineReuseProbeTool,
+  setFlyMachineProfileTool,
   getTenantHealth,
   getIssueReportCardTool,
   getFleetReportTool,
@@ -36,6 +36,7 @@ import {
   getReviewFixActivityTool,
   setReviewFixAttemptsFacade,
 } from "../restate/tools.js";
+import { KG_REFRESH_RUNNER_STEPS } from "../restate/kg-refresh-types.js";
 import { discoverTools, callTool, callToolAsSystem, toolCatalog } from "../restate/tools-client.js";
 import type { Caller } from "../mcp-identity.js";
 import { setKgMemoryProvider } from "../kg-provider.js";
@@ -43,9 +44,9 @@ import type { MemoryProvider } from "../kg-provider.js";
 import type { PreflightCheckResult, RefreshOutcome } from "../kg-refresh.js";
 import type { KgRefreshToolDeps } from "../restate/kg-refresh-production.js";
 import { getMappings } from "../config.js";
-import { getMachine, createMachine, startMachine, updateMachine, destroyMachine, waitForMachine } from "../fly-machines.js";
 import { setOrchestratorSetting } from "../orchestrator-settings.js";
-import { initSettingsTable, getKgFlyMachineOverride, setKgFlyMachineOverride } from "../runner-mode.js";
+import { initSettingsTable } from "../runner-mode.js";
+import { FLY_MACHINE_PROFILE_DEFAULTS, mergeProfile, type FlyMachineProfileConfig } from "../restate/fly-machine-profile.js";
 import { initLogTable } from "../log.js";
 import { getRestateStatus, setRestateStatus, resetRestateStatus } from "../restate/status.js";
 import { getIssueReportCard, getFleetReport } from "../report-card.js";
@@ -65,11 +66,6 @@ vi.mock("../report-card.js", () => ({
 vi.mock("../fly-machines.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../fly-machines.js")>()),
   getMachine: vi.fn(),
-  createMachine: vi.fn(),
-  startMachine: vi.fn(),
-  updateMachine: vi.fn(),
-  destroyMachine: vi.fn(),
-  waitForMachine: vi.fn(),
 }));
 
 vi.mock("../config.js", async (importOriginal) => ({
@@ -755,6 +751,7 @@ describe("migrated read handlers (AII-711)", () => {
 
     async function stageFor(opts: {
       last?: RefreshOutcome | null; inFlight?: { triggerId: string; startedAt: number } | null; step?: string | null; statusThrows?: boolean;
+      runnerStep?: { id: string; status: string } | null;
       dryRun?: RefreshOutcome | null; readServedStamp?: () => Promise<string | null>;
     }) {
       setKgRefreshToolDeps(kgToolDeps({
@@ -763,17 +760,45 @@ describe("migrated read handlers (AII-711)", () => {
       }));
       const ctx = {
         ...fakeContext("get_kg_status"),
-        objectClient: () => ({ status: async () => opts.inFlight ?? null, lastAdminDryRun: async () => opts.dryRun ?? null }),
+        objectClient: () => ({
+          status: async () => opts.inFlight ?? null,
+          lastAdminDryRun: async () => opts.dryRun ?? null,
+          get: async () => ({ config: { cpuKind: "performance", cpus: 2, memoryMb: 8192, idleTimeoutMs: 1 }, source: "default" }),
+        }),
         workflowClient: () => ({
           status: async () => {
             if (opts.statusThrows) throw new Error("no such workflow");
-            return { step: opts.step ?? null, startedAt: 1, triggerId: "t1", runId: null, dryRun: false };
+            return { step: opts.step ?? null, startedAt: 1, triggerId: "t1", runId: null, dryRun: false, runnerStep: opts.runnerStep ?? null };
           },
         }),
       } as unknown as restate.Context;
       const result = await getKgStatusTool(ctx, { caller: system, args: {} });
       return JSON.parse(result.content[0].text);
     }
+
+    it("kgStageForRunnerStep answers every (runner step x status) pair", () => {
+      const statuses = ["running", "passed", "failed", "skipped", "cancelled"] as const;
+      const expected = (id: string, status: string) => {
+        if (id === "kg-ingest") return "ingest-running";
+        if (id === "kg-snapshot-push") return status === "passed" ? "snapshot-landed" : "ingest-running";
+        return "checking";
+      };
+      for (const id of KG_REFRESH_RUNNER_STEPS) {
+        for (const status of statuses) expect(kgStageForRunnerStep(id, status), `${id}/${status}`).toBe(expected(id, status));
+      }
+    });
+
+    it("an in-flight runnerStep sets stage and is reported; without one the workflow step maps as before", async () => {
+      const inFlight = { triggerId: "t1", startedAt: 1 };
+      const live = await stageFor({ inFlight, step: "await-progress", runnerStep: { id: "kg-ingest", status: "running" } });
+      expect(live.stage).toBe("ingest-running");
+      expect(live.runnerStep).toEqual({ id: "kg-ingest", status: "running" });
+      const early = await stageFor({ inFlight, step: "await-progress", runnerStep: { id: "clone", status: "passed" } });
+      expect(early.stage).toBe("checking");
+      const none = await stageFor({ inFlight, step: "merge", runnerStep: null });
+      expect(none.stage).toBe("snapshot-landed");
+      expect(none).not.toHaveProperty("runnerStep");
+    });
 
     it.each([
       ["no record", null, "idle"],
@@ -836,10 +861,27 @@ describe("migrated read handlers (AII-711)", () => {
       expect(status.servedStamp).toBeNull();
     });
 
+    it("restate: marker triggerId wins, else lastRefresh.dispatchId, else null", async () => {
+      const withId = { ...ok, dispatchId: "d-last" } as RefreshOutcome;
+      expect((await stageFor({ inFlight: { triggerId: "t1", startedAt: 1 }, last: withId })).restate).toEqual({ service: "KgRefresh", key: "t1" });
+      expect((await stageFor({ last: withId })).restate).toEqual({ service: "KgRefresh", key: "d-last" });
+      expect((await stageFor({ last: ok })).restate).toBeNull();
+      expect((await stageFor({})).restate).toBeNull();
+    });
+
+    it("a stored last-refresh record without steps still reads, and one with steps passes them through", async () => {
+      const status = await stageFor({ last: ok });
+      expect(status.lastRefresh).toBeTruthy();
+      expect(status.lastRefresh).not.toHaveProperty("steps");
+      const steps = [{ id: "clone", status: "passed", startedAt: "t0", endedAt: "t1", durationMs: 1 }];
+      const withSteps = await stageFor({ last: { ...ok, steps } as RefreshOutcome });
+      expect((withSteps.lastRefresh as { steps?: unknown }).steps).toEqual(steps);
+    });
+
     it("keeps the KgRefreshStatus shape", async () => {
       const status = await stageFor({ last: ok });
       expect(Object.keys(status).sort()).toEqual(
-        ["deployHeld", "flyMachine", "kgDegraded", "kgUnavailable", "lastDryRun", "lastRefresh", "materialize", "running", "servedStamp", "sidecar", "stage"].sort(),
+        ["deployHeld", "flyMachine", "kgDegraded", "kgUnavailable", "lastDryRun", "lastRefresh", "materialize", "restate", "running", "servedStamp", "sidecar", "stage"].sort(),
       );
     });
   });
@@ -865,6 +907,14 @@ describe("get_tenant_health restate health field (AII-807)", () => {
     const result = await getTenantHealth(fakeContext("get_tenant_health"), { caller: system, args: {} });
     const parsed = JSON.parse(result.content[0].text) as { restate: unknown };
     expect(parsed.restate).toEqual({ sidecar: { state: "starting" }, registration: { state: "not-attempted" } });
+  });
+
+  it("includes both retention settings", async () => {
+    (getMappings as ReturnType<typeof vi.fn>).mockReturnValue({});
+    const result = await getTenantHealth(fakeContext("get_tenant_health"), { caller: system, args: {} });
+    const parsed = JSON.parse(result.content[0].text) as { restateRetentionDays: unknown; volumeSnapshotRetentionDays: unknown };
+    expect(typeof parsed.restateRetentionDays).toBe("number");
+    expect(typeof parsed.volumeSnapshotRetentionDays).toBe("number");
   });
 
   it("reflects a ready sidecar with a declined-conflict registration", async () => {
@@ -1525,200 +1575,65 @@ describe("dispatch reservation tools (AII-1069)", () => {
   });
 });
 
-describe("set_kg_fly_machine / get_kg_status flyMachine (AII-1120)", () => {
-  const mapping = { AII: { owner: "org", repo: "kg", machineCpus: 2, machineMemoryMb: 4096 } };
+describe("set_fly_machine_profile / get_kg_status flyMachine (AII-1130)", () => {
+  // A stand-in for the FlyMachineProfile object that runs the real merge/validation.
+  const store: { current: FlyMachineProfileConfig | null } = { current: null };
+  const setKeys: string[] = [];
+  const profileClient = (key: string) => ({
+    get: async () => ({ config: store.current ?? { ...FLY_MACHINE_PROFILE_DEFAULTS["kg-refresh"] }, source: store.current ? "profile" : "default" }),
+    set: async (patch: Partial<FlyMachineProfileConfig>) => {
+      setKeys.push(key);
+      store.current = mergeProfile(store.current ?? FLY_MACHINE_PROFILE_DEFAULTS["kg-refresh"], patch);
+      return { config: store.current, source: "profile" };
+    },
+  });
+  const ctxFor = (name: string) => ({
+    ...fakeContext(name),
+    objectClient: (_def: unknown, key: string) => profileClient(key),
+  }) as unknown as restate.Context;
 
-  beforeAll(() => initSettingsTable());
   beforeEach(() => {
-    (getMappings as ReturnType<typeof vi.fn>).mockReturnValue(mapping);
+    store.current = null;
+    setKeys.length = 0;
     setKgRefreshToolDeps(kgToolDeps());
-    setKgFlyMachineOverride(null);
   });
-  afterEach(() => {
-    setKgRefreshToolDeps(null);
-    setKgFlyMachineOverride(null);
-  });
+  afterEach(() => setKgRefreshToolDeps(null));
 
   const call = async (args: Record<string, unknown>, caller: Caller = SYSTEM_ADMIN) =>
-    JSON.parse((await setKgFlyMachineTool(fakeContext("set_kg_fly_machine"), { caller, args })).content[0].text);
+    JSON.parse((await setFlyMachineProfileTool(ctxFor("set_fly_machine_profile"), { caller, args: { pipeline: "kg-refresh", ...args } })).content[0].text);
 
-  it("merges fields and reports the effective size", async () => {
-    await call({ cpus: 4 });
-    const res = await call({ memoryMb: 8192 });
-    expect(res.override).toEqual({ cpus: 4, memoryMb: 8192 });
-    expect(res.effective).toEqual({ cpuKind: "performance", cpus: 4, memoryMb: 8192, source: "override" });
-    expect(getKgFlyMachineOverride()).toEqual({ cpus: 4, memoryMb: 8192 });
-  });
-
-  it("clear deletes the override and returns to the KG default size", async () => {
-    await call({ memoryMb: 8192 });
-    const res = await call({ clear: true });
-    expect(res.effective).toEqual({ cpuKind: "performance", cpus: 2, memoryMb: 8192, source: "default" });
-    expect(getKgFlyMachineOverride()).toEqual({});
+  it("sets on the pipeline's key and returns the object's answer", async () => {
+    const res = await call({ memoryMb: 4096 });
+    expect(setKeys).toEqual(["kg-refresh"]);
+    expect(res).toEqual({ config: { cpuKind: "performance", cpus: 2, memoryMb: 4096, idleTimeoutMs: FLY_MACHINE_PROFILE_DEFAULTS["kg-refresh"].idleTimeoutMs }, source: "profile" });
   });
 
   it.each([
     [{ cpus: 3 }, "cpus"],
-    [{ cpus: 1.5 }, "cpus"],
     [{ memoryMb: 100 }, "memoryMb"],
     [{ memoryMb: 70000 }, "memoryMb"],
-    [{ cpuKind: "bogus" }, "cpuKind"],
-  ])("rejects %j with 400 naming %s and writes nothing", async (args, field) => {
+  ])("answers 400 naming %s from the object's rejection", async (args, field) => {
     const res = await call(args);
     expect(res.status).toBe(400);
     expect(res.body.error).toContain(field);
-    expect(getKgFlyMachineOverride()).toEqual({});
   });
 
   it("refuses a user caller", async () => {
-    const result = await setKgFlyMachineTool(fakeContext("set_kg_fly_machine"), { caller: HUMAN_USER, args: { cpus: 2 } });
-    expect(result.content[0].text).toBe("forbidden: set_kg_fly_machine requires the admin role");
-    expect(getKgFlyMachineOverride()).toEqual({});
+    const result = await setFlyMachineProfileTool(ctxFor("set_fly_machine_profile"), { caller: HUMAN_USER, args: { pipeline: "kg-refresh", cpus: 2 } });
+    expect(result.content[0].text).toBe("forbidden: set_fly_machine_profile requires the admin role");
+    expect(setKeys).toEqual([]);
   });
 
-  it("get_kg_status includes flyMachine", async () => {
-    await call({ memoryMb: 8192 });
+  it("get_kg_status reports flyMachine as the profile's config and source", async () => {
+    await call({ memoryMb: 4096 });
     const ctx = {
       ...fakeContext("get_kg_status"),
-      objectClient: () => ({ status: async () => null, lastAdminDryRun: async () => null }),
+      objectClient: (def: { name: string }, key: string) =>
+        def.name === "FlyMachineProfile" ? profileClient(key) : { status: async () => null, lastAdminDryRun: async () => null },
     } as unknown as restate.Context;
     const status = JSON.parse((await getKgStatusTool(ctx, { caller: SYSTEM_ADMIN, args: {} })).content[0].text);
-    expect(status.flyMachine).toEqual({ cpuKind: "performance", cpus: 2, memoryMb: 8192, source: "override" });
-  });
-});
-
-describe("fly_machine_reuse_probe (AII-1123)", () => {
-  const saved = { ...process.env };
-  const probeMachine = (over: Record<string, unknown> = {}) => ({
-    id: "m1", name: "reuse-probe-1", state: "stopped", region: "iad", created_at: "", updated_at: "",
-    config: {
-      image: "old-image", env: { PROBE_RUN: "1", PROBE_EXPECT_MB: "8192", OTHER: "x" },
-      guest: { cpu_kind: "performance", cpus: 2, memory_mb: 8192 },
-      metadata: { purpose: "reuse-probe" }, init: { cmd: ["old"] }, services: [{ internal_port: 1, protocol: "tcp", ports: [] }],
-    },
-    events: [],
-    ...over,
-  });
-  const call = async (args: Record<string, unknown>, runCalls: RunCall[] = [], caller: Caller = SYSTEM_ADMIN) =>
-    JSON.parse((await flyMachineReuseProbeTool(fakeContext("fly_machine_reuse_probe", runCalls), { caller, args } as never)).content[0].text);
-
-  beforeEach(() => {
-    process.env.FLY_SESSIONS_TOKEN = "tok";
-    process.env.FLY_SESSIONS_APP = "sessions";
-    delete process.env.FLY_SESSIONS_REGION;
-    vi.mocked(getMachine).mockReset();
-    vi.mocked(createMachine).mockReset().mockResolvedValue({ id: "m1", state: "created" } as never);
-    vi.mocked(startMachine).mockReset().mockResolvedValue(undefined);
-    vi.mocked(updateMachine).mockReset().mockResolvedValue({} as never);
-    vi.mocked(destroyMachine).mockReset().mockResolvedValue(undefined);
-    vi.mocked(waitForMachine).mockReset().mockResolvedValue(undefined);
-  });
-  afterEach(() => { process.env = { ...saved }; });
-
-  it("create sends the fixed probe config, without orchestrator_app", async () => {
-    const runCalls: RunCall[] = [];
-    const res = await call({ action: "create", run: 4, memoryMb: 4096 }, runCalls);
-    expect(res.machineId).toBe("m1");
-    expect(res.startedMs).toEqual(expect.any(Number));
-    const [token, app, opts] = vi.mocked(createMachine).mock.calls[0];
-    expect([token, app]).toEqual(["tok", "sessions"]);
-    expect(opts.name).toBe("reuse-probe-4");
-    expect(opts.region).toBe("iad");
-    expect(opts.config.metadata).toEqual({ purpose: "reuse-probe" });
-    expect(opts.config.env).toEqual({ PROBE_RUN: "4", PROBE_EXPECT_MB: "4096" });
-    expect(opts.config.restart).toEqual({ policy: "no" });
-    expect(opts.config.auto_destroy).toBe(false);
-    expect(opts.config.guest).toEqual({ cpu_kind: "performance", cpus: 2, memory_mb: 4096 });
-    expect(opts.config.init?.entrypoint).toEqual(["sh", "-c"]);
-    expect(opts.config.init?.cmd?.[0]).toContain("/var/tmp/reuse-probe-marker");
-    expect(opts.config.image).toBeTruthy();
-    expect(vi.mocked(waitForMachine)).toHaveBeenCalledWith("tok", "sessions", "m1", "started", 45);
-    expect(runCalls.every((c) => (c.options as { maxRetryAttempts: number }).maxRetryAttempts === 1)).toBe(true);
-  });
-
-  it("create still returns the machine id when the wait times out", async () => {
-    vi.mocked(waitForMachine).mockRejectedValue(new Error("Timeout (408)"));
-    const res = await call({ action: "create" });
-    expect(res.machineId).toBe("m1");
-    expect(res.startedMs).toBeNull();
-  });
-
-  it("update replaces only image, env and guest", async () => {
-    vi.mocked(getMachine).mockResolvedValue(probeMachine() as never);
-    const res = await call({ action: "update", machineId: "m1", run: 3, memoryMb: 4096 });
-    expect(res.startedMs).toEqual(expect.any(Number));
-    const config = vi.mocked(updateMachine).mock.calls[0][3];
-    const old = probeMachine().config;
-    expect(config.env).toEqual({ PROBE_RUN: "3", PROBE_EXPECT_MB: "4096" });
-    expect(config.guest).toEqual({ cpu_kind: "performance", cpus: 2, memory_mb: 4096 });
-    expect(config.image).not.toBe("old-image");
-    expect({ ...config, image: 0, env: 0, guest: 0 }).toEqual({ ...old, image: 0, env: 0, guest: 0 });
-  });
-
-  it("start reports apiMs and startedMs", async () => {
-    vi.mocked(getMachine).mockResolvedValue(probeMachine() as never);
-    const res = await call({ action: "start", machineId: "m1" });
-    expect(vi.mocked(startMachine)).toHaveBeenCalledWith("tok", "sessions", "m1");
-    expect(res.apiMs).toEqual(expect.any(Number));
-  });
-
-  it.each(["start", "update", "read", "destroy"])("%s refuses a session machine and writes nothing", async (action) => {
-    vi.mocked(getMachine).mockResolvedValue(probeMachine({ config: { image: "i", metadata: { purpose: "session" } } }) as never);
-    const res = await call({ action, machineId: "m1" });
-    expect(res.status).toBe(400);
-    expect(startMachine).not.toHaveBeenCalled();
-    expect(updateMachine).not.toHaveBeenCalled();
-    expect(destroyMachine).not.toHaveBeenCalled();
-  });
-
-  it("refuses a machine with no metadata", async () => {
-    vi.mocked(getMachine).mockResolvedValue(probeMachine({ config: { image: "i" } }) as never);
-    expect((await call({ action: "destroy", machineId: "m1" })).status).toBe(400);
-    expect(destroyMachine).not.toHaveBeenCalled();
-  });
-
-  it("answers 404 for read and destroyed for destroy when the machine is gone", async () => {
-    vi.mocked(getMachine).mockRejectedValue(new Error("Failed to get machine m1 (404): nope"));
-    expect((await call({ action: "read", machineId: "m1" })).status).toBe(404);
-    expect(await call({ action: "destroy", machineId: "m1" })).toEqual({ destroyed: true });
-    expect(destroyMachine).not.toHaveBeenCalled();
-  });
-
-  it("destroys a probe machine with force", async () => {
-    vi.mocked(getMachine).mockResolvedValue(probeMachine() as never);
-    expect(await call({ action: "destroy", machineId: "m1" })).toEqual({ destroyed: true });
-    expect(vi.mocked(destroyMachine)).toHaveBeenCalledWith("tok", "sessions", "m1", true);
-  });
-
-  it("read returns exitCode, oomKilled, env and the 10 newest events", async () => {
-    const events = Array.from({ length: 12 }, (_, i) => ({
-      type: i === 0 ? "exit" : "start", status: "s", timestamp: 1000 - i,
-      ...(i === 0 ? { request: { exit_event: { exit_code: 10, oom_killed: false } } } : {}),
-    }));
-    vi.mocked(getMachine).mockResolvedValue(probeMachine({ events }) as never);
-    const res = await call({ action: "read", machineId: "m1" });
-    expect(res.exitCode).toBe(10);
-    expect(res.oomKilled).toBe(false);
-    expect(res.env).toEqual({ PROBE_RUN: "1", PROBE_EXPECT_MB: "8192" });
-    expect(res.guest.memory_mb).toBe(8192);
-    expect(res.events).toHaveLength(10);
-    expect(res.events[0]).toEqual({ type: "exit", status: "s", timestamp: 1000 });
-  });
-
-  it.each([
-    [{ action: "create", memoryMb: 1000 }, "memoryMb"],
-    [{ action: "create", run: 0 }, "run"],
-    [{ action: "read" }, "machineId"],
-  ])("rejects %j with 400 naming %s", async (args, field) => {
-    const res = await call(args);
-    expect(res.status).toBe(400);
-    expect(res.body.error).toContain(field);
-    expect(createMachine).not.toHaveBeenCalled();
-  });
-
-  it("refuses a user caller", async () => {
-    const result = await flyMachineReuseProbeTool(fakeContext("fly_machine_reuse_probe"), { caller: HUMAN_USER, args: { action: "create" } });
-    expect(result.content[0].text).toBe("forbidden: fly_machine_reuse_probe requires the admin role");
-    expect(createMachine).not.toHaveBeenCalled();
+    expect(status.flyMachine).toEqual({
+      cpuKind: "performance", cpus: 2, memoryMb: 4096, idleTimeoutMs: FLY_MACHINE_PROFILE_DEFAULTS["kg-refresh"].idleTimeoutMs, source: "profile",
+    });
   });
 });

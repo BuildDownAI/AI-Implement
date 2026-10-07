@@ -20,7 +20,7 @@ import * as restate from "@restatedev/restate-sdk";
 import type { WorkflowContext, WorkflowSharedContext } from "@restatedev/restate-sdk";
 import { serde } from "@restatedev/restate-sdk-zod";
 import { z } from "zod";
-import type { KgDryRunReportTarget, RefreshGate, RefreshOutcome } from "../kg-refresh.js";
+import type { KgDryRunReportTarget, KgRefreshStepRecord, RefreshGate, RefreshOutcome } from "../kg-refresh.js";
 import {
   type KgRailDeps,
   type RailContext,
@@ -36,10 +36,15 @@ import {
   swapGate,
   verifyGate,
 } from "../kg-refresh-rail.js";
+import { FlyMachineProfile, type FlyMachineProfileConfig } from "./fly-machine-profile.js";
+import type { BackendRunRead } from "../backend-run.js";
+import type { MachineExit } from "../fly-machines.js";
 import { parseKgSourceRepo } from "../deploy.js";
-import type { KgRepoDefinition } from "./kg-refresh-types.js";
+import type { Step } from "../pipeline/types.js";
+import { KG_REFRESH_RUNNER_STEPS, type KgRepoDefinition } from "./kg-refresh-types.js";
 import { readBoundedOwnedRun } from "./owned-run-lifecycle.js";
 import { awaitOwnedRun, type OwnedRunStatus } from "./owned-run-wait.js";
+import { restateRetentionMs } from "./retention.js";
 
 /** The value of `KG_REFRESH_TTL_MS` of the dispatch watch — how long a dispatch may run before it is treated as lost. */
 export const KG_REFRESH_TOTAL_DEADLINE_MS = 4 * 60 * 60 * 1000;
@@ -47,8 +52,6 @@ export const KG_REFRESH_TOTAL_DEADLINE_MS = 4 * 60 * 60 * 1000;
 export const KG_REPO_STALE_MARGIN_MS = 10 * 60 * 1000;
 /** How long a dispatch may run with no `progress` signal before the workflow treats it as lost. */
 export const KG_REFRESH_BOOTSTRAP_DEADLINE_MS = 10 * 60 * 1000;
-/** One shared retention constant, the same pattern as `REVIEW_FIX_RETENTION_MS` (`src/restate/review-fix-attempt.ts:28`). */
-export const KG_REFRESH_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 /** How often the GHA backend's watch loop reads the dispatched run's status (ADR 033). A run that ends with no
  *  report is found by this read; the same interval paces the reconcile read and the cancel-confirm read. */
 export const KG_REFRESH_WATCH_INTERVAL_MS = 60 * 1000;
@@ -95,6 +98,10 @@ export interface KgDispatchInput {
   issueIdentifier: string;
   /** The workflow's own dispatch id — the one its run tokens and `dispatch_log` row carry. */
   dispatchId: string;
+  /** The Fly machine size for this run, read once from `FlyMachineProfile/kg-refresh` before the dispatch step. */
+  machine: FlyMachineProfileConfig;
+  /** The pipeline's kept Fly machine from `FlyMachineProfile.claim`; null when none is kept. */
+  machineId: string | null;
 }
 
 export interface KgRefreshStatusResult {
@@ -103,6 +110,8 @@ export interface KgRefreshStatusResult {
   triggerId: string | null;
   runId: number | null;
   dryRun: boolean;
+  /** The last runner step with a resolved step promise, in pipeline order; `null` before the first report. */
+  runnerStep: { id: string; status: string } | null;
 }
 
 export interface KgDispatchResult {
@@ -112,16 +121,39 @@ export interface KgDispatchResult {
   /** The backend's job id when it reported one; `null` means unknown (the workflow keys its own row by dispatch id). */
   jobId: string | null;
   executionMode: string;
+  /** The kept Fly machine the run executes on; null or absent for GHA and local Docker. */
+  machineId?: string | null;
+  /** True when the dispatch created the machine, so the workflow must `attach` it. */
+  created?: boolean;
 }
 
 /** What a status read that failed every attempt reports: not completed, not started — no new evidence. */
 const NO_EVIDENCE: { status: string; conclusion: string | null } = { status: "unknown", conclusion: null };
+
+/** What a machine read that failed every attempt reports: no new evidence. */
+const NO_MACHINE_EVIDENCE: BackendRunRead = { state: "unknown", exit: null };
+
+/** The failure detail for a machine that ended with no report. A signal is named as the signal (never
+ *  folded into an exit code); a null exit code and no signal beside an exit event is a clean exit (Fly
+ *  omits it); no event at all names no exit. */
+function describeMachineExit(exit: MachineExit | null): string {
+  const base = "machine stopped with no report";
+  if (!exit || (exit.exitCode === null && exit.signal === null && exit.oomKilled === null && exit.timestamp === null)) return base;
+  const parts: string[] = [];
+  if (exit.exitCode !== null) parts.push(`exit ${exit.exitCode}`);
+  if (exit.signal !== null) parts.push(`signal ${exit.signal}`);
+  if (parts.length === 0) parts.push("exit 0");
+  if (exit.oomKilled) parts.push("oomKilled");
+  return `${base} (${parts.join(", ")})`;
+}
 
 /** Plain functions, every one called inside `ctx.run` — none of them may call `ctx` themselves. */
 export type KgOutcomeKind = "success" | "no-new-data" | "failure";
 export interface KgOutcomeMeta { failureCode?: string; timedOut?: boolean; dispatchId?: string }
 
 export interface KgRefreshWorkflowDependencies {
+  /** Test seam; production leaves it unset and reads `restate_retention_days` at build time. */
+  retentionMs?: number;
   rail: KgRailDeps;
   kgSourceRepo: string;
   mintRunTokens(input: { dispatchId: string; ttlSeconds: number }): { runToken: string; progressToken: string; publicationToken: string };
@@ -132,8 +164,10 @@ export interface KgRefreshWorkflowDependencies {
   getWorkflowRunStatus(runId: number): Promise<{ status: string; conclusion: string | null }>;
   findRunByTitle(title: string): Promise<{ runId: number } | null>;
   cancelWorkflowRun(runId: number): Promise<boolean>;
-  /** Stops a non-GitHub-Actions run (a Fly machine or a local container) by its backend id. */
-  stopMachineRun(executionMode: string, jobId: string): Promise<boolean>;
+  /** One status read of a non-GitHub-Actions run by its backend id: its state, plus the machine's exit. */
+  readMachineRun(executionMode: string, jobId: string): Promise<BackendRunRead>;
+  /** Stops a non-GitHub-Actions run (a Fly machine or a local container) by its backend id. `keep` stops a kept Fly machine instead of destroying it. */
+  stopMachineRun(executionMode: string, jobId: string, keep?: boolean): Promise<boolean>;
   persistLastRefresh(outcome: RefreshOutcome): void;
   /** The kind is decided by the workflow, never inferred from `outcome.detail`. `meta.dispatchId` is the workflow key. */
   onOutcome(kind: KgOutcomeKind, outcome: RefreshOutcome, meta: KgOutcomeMeta): void | Promise<void>;
@@ -163,7 +197,7 @@ type WaitOutcome =
   | { kind: "cancel"; reason: string }
   | { kind: "bootstrap_timeout" }
   | { kind: "total_timeout" }
-  | { kind: "dispatch_lost"; conclusion: string | null };
+  | { kind: "dispatch_lost"; conclusion: string | null; exit?: MachineExit | null };
 
 function validKey(key: string, triggerId: unknown): string {
   if (typeof triggerId !== "string" || triggerId !== key) {
@@ -186,6 +220,7 @@ export const KG_REFRESH_NOT_FOUND_MESSAGE = "kg-refresh workflow not found";
 
 export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
   const { owner, repo: repoName } = parseKgSourceRepo(deps.kgSourceRepo);
+  const retentionMs = deps.retentionMs ?? restateRetentionMs();
   const bootstrapDeadlineMs = deps.bootstrapDeadlineMs ?? KG_REFRESH_BOOTSTRAP_DEADLINE_MS;
   const totalDeadlineMs = deps.totalDeadlineMs ?? KG_REFRESH_TOTAL_DEADLINE_MS;
   const watchIntervalMs = deps.watchIntervalMs ?? KG_REFRESH_WATCH_INTERVAL_MS;
@@ -233,6 +268,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
     async function finish(outcome: RefreshOutcome): Promise<RefreshOutcome> {
       ctx.set("completed", true);
       ctx.objectSendClient<KgRepoDefinition>({ name: "KgRepo" }, deps.kgSourceRepo).release({ triggerId });
+      ctx.objectSendClient(FlyMachineProfile, "kg-refresh").release({ dispatchId });
       return outcome;
     }
 
@@ -247,13 +283,18 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       }
     }
 
+    // Built once, after `report`; pre-report failures (timeout, lost) carry no table.
+    let stepTable: KgRefreshStepRecord[] = [];
+    const withSteps = (o: RefreshOutcome): RefreshOutcome => (stepTable.length > 0 && !o.steps ? { ...o, steps: stepTable } : o);
+
     async function failurePath(
-      outcome: RefreshOutcome,
+      rawOutcome: RefreshOutcome,
       conclusion: string,
       opts: { timedOut?: boolean; skipOutcome?: boolean } = {},
     ): Promise<RefreshOutcome> {
+      const outcome = withSteps(rawOutcome);
       // A dry-run is not a refresh: it never writes the last-refresh record or notifies the operator.
-      if (!input.dryRun) await ctx.run("persist", () => deps.persistLastRefresh(outcome));
+      if (!input.dryRun) await ctx.run("persist", () => deps.persistLastRefresh({ ...outcome, dispatchId }));
       await ctx.run("close-row", () => deps.closeJobLog(jobId, opts.timedOut ? "timed_out" : "failed", conclusion));
       if (input.dryRun) {
         if (input.report) {
@@ -286,8 +327,16 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       // process (the token rows are keyed by dispatch id + audience, so a second mint would collide).
       let minted: ReturnType<typeof deps.mintRunTokens> | undefined;
       ctx.set("step", "dispatch");
+      // A journaled call outside the dispatch step: a replay reuses this size, and the step's retries share it.
+      const profile = await ctx.objectClient(FlyMachineProfile, "kg-refresh").get();
+      if (!profile) throw new restate.TerminalError("no FlyMachineProfile default exists for kg-refresh", { errorCode: 500 });
+      const machine = profile.config;
+      // The resume path that raises this is AII-1032's; the claim, the step names and `attach` carry it.
+      const attempt = 1;
+      // A journaled call: a replay reuses the claim. The Fly write stays in the dispatch step, which holds the run's tokens.
+      const claim = await ctx.objectClient(FlyMachineProfile, "kg-refresh").claim({ dispatchId, attempt });
       const dispatchResult = await ctx.run(
-        "dispatch",
+        `dispatch-${attempt}`,
         async (): Promise<KgDispatchResult> => {
           // A lookup error throws and retries the step; only a definitive "no run" may reach the dispatch.
           // Reconcile first: a retry after a committed-but-unacknowledged dispatch must adopt that run.
@@ -296,14 +345,20 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
             return { outcome: "accepted", runId: existing.runId, jobId: String(existing.runId), executionMode: GHA_EXECUTION_MODE };
           }
           minted ??= deps.mintRunTokens({ dispatchId, ttlSeconds });
-          const result = await deps.dispatch({ runConfig: input, tokens: minted, issueIdentifier, dispatchId });
+          const result = await deps.dispatch({ runConfig: input, tokens: minted, issueIdentifier, dispatchId, machine, machineId: claim.machineId });
           return {
             outcome: result.outcome, runId: result.runId, runUrl: result.runUrl,
             jobId: result.jobId, executionMode: result.executionMode,
+            machineId: result.machineId ?? null, created: result.created === true,
           };
         },
         { maxRetryAttempts: 3 },
       );
+
+      // One-way and idempotent in the object; a replay after a crash here sends it again.
+      if (dispatchResult.created && dispatchResult.machineId) {
+        ctx.objectSendClient(FlyMachineProfile, "kg-refresh").attach({ dispatchId, machineId: dispatchResult.machineId, attempt });
+      }
 
       if (dispatchResult.runId !== undefined) ctx.set("runId", dispatchResult.runId);
 
@@ -332,8 +387,10 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           ctx.console.warn(`[KgRefresh] no machine id to stop after ${reason} for dispatch ${dispatchId}`);
           return;
         }
+        // A kept Fly machine is stopped, not destroyed: the next refresh reuses it.
+        const keep = !isGha && (dispatchResult.machineId ?? null) !== null;
         try {
-          const stopped = await ctx.run("stop-machine-run", () => deps.stopMachineRun(dispatchResult.executionMode, machineJobId), { maxRetryAttempts: 3 });
+          const stopped = await ctx.run("stop-machine-run", () => deps.stopMachineRun(dispatchResult.executionMode, machineJobId, keep), { maxRetryAttempts: 3 });
           ctx.console.log(`[KgRefresh] stop after ${reason}: dispatch ${dispatchId} backend ${dispatchResult.executionMode} stopped=${stopped}`);
         } catch (err) {
           if (restate.internal.isSuspendedError(err)) throw err;
@@ -347,6 +404,8 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         let watchIndex = 0;
         let reconcileIndex = 0;
         let lastConclusion: string | null = null;
+        let lastExit: MachineExit | null = null;
+        const machineJobId = !isGha ? dispatchResult.jobId : null;
         // A re-call after a `started` status read must not read again at once: that read just ran.
         let skipNextRead = false;
 
@@ -372,6 +431,17 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           return status.status === "in_progress" ? "started" : "unknown";
         };
 
+        // Fly machine or local container with a known id: one bounded status read per tick.
+        const readMachineStatus = async (): Promise<OwnedRunStatus> => {
+          if (skipNextRead) {
+            skipNextRead = false;
+            return "started";
+          }
+          const read = await readBoundedOwnedRun(ctx, `watch-${watchIndex++}`, () => deps.readMachineRun(dispatchResult.executionMode, machineJobId!), NO_MACHINE_EVIDENCE);
+          if (read.exit) lastExit = read.exit;
+          return read.state;
+        };
+
         for (;;) {
           const event = await awaitOwnedRun(ctx, {
             signals: ["report", "cancel", "progress"],
@@ -381,7 +451,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
             totalDeadlineAt,
             tickMs: watchIntervalMs,
             startedSeen,
-            ...(isGha ? { readStatus } : {}),
+            ...(isGha ? { readStatus } : machineJobId ? { readStatus: readMachineStatus } : {}),
           });
 
           if (event.kind === "bootstrap_timeout" || event.kind === "total_timeout") return { kind: event.kind };
@@ -398,7 +468,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           }
           const reportNow = await ctx.promise<KgRefreshReportBody>("report").peek();
           if (reportNow !== undefined) return { kind: "report", value: reportNow };
-          return { kind: "dispatch_lost", conclusion: lastConclusion };
+          return { kind: "dispatch_lost", conclusion: lastConclusion, exit: lastExit };
         }
       }
 
@@ -429,7 +499,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       if (waitResult.kind === "dispatch_lost") {
         ctx.set("step", "failed");
         const at = await ctx.date.now();
-        const detail = `run concluded ${waitResult.conclusion ?? "unknown"} with no report`;
+        const detail = isGha ? `run concluded ${waitResult.conclusion ?? "unknown"} with no report` : describeMachineExit(waitResult.exit ?? null);
         const outcome = await failurePath(buildFailureOutcome(at, detail), "dispatch_lost");
         return finish(outcome);
       }
@@ -477,6 +547,12 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
 
       // waitResult.kind === "report"
       const report = waitResult.value;
+      // Journaled peeks, so a replay rebuilds the same table.
+      stepTable = [];
+      for (const id of KG_REFRESH_RUNNER_STEPS) {
+        const body = (await ctx.promise<Step>(`step:${id}:ended`).peek()) ?? (await ctx.promise<Step>(`step:${id}:running`).peek());
+        if (body !== undefined) stepTable.push(toStepRecord(body));
+      }
 
       if (input.dryRun) {
         ctx.set("step", "dry-run-report");
@@ -485,6 +561,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           ok: report.ok, at, detail: report.failureReason ?? (report.ok ? "dry run passed" : "dry run guard refused"),
           stampBefore: null, stampAfter: null, dryRun: true, partTable: report.partTable,
         };
+        if (stepTable.length > 0) outcome.steps = stepTable;
         if (input.report) {
           // Stored on `KgRepo` so the accept-baseline label can re-report it; journaled, so a replay sends once.
           ctx.objectSendClient<KgRepoDefinition>({ name: "KgRepo" }, deps.kgSourceRepo).recordDryRunOutcome({ report: input.report, outcome });
@@ -634,7 +711,8 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         detail: `refreshed: ${railCtx.stampBefore ?? "baked"} -> ${railCtx.stampAfter}`,
         stampBefore: railCtx.stampBefore ?? null, stampAfter: railCtx.stampAfter ?? null,
       };
-      await ctx.run("persist", () => deps.persistLastRefresh(successOutcome));
+      if (stepTable.length > 0) successOutcome.steps = stepTable;
+      await ctx.run("persist", () => deps.persistLastRefresh({ ...successOutcome, dispatchId }));
       ctx.set("step", "close-row");
       await ctx.run("close-row", () => deps.closeJobLog(jobId, "completed"));
       ctx.set("step", "outcome");
@@ -657,6 +735,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         return await finish(outcome);
       } finally {
         ctx.objectSendClient<KgRepoDefinition>({ name: "KgRepo" }, deps.kgSourceRepo).release({ triggerId });
+        ctx.objectSendClient(FlyMachineProfile, "kg-refresh").release({ dispatchId });
       }
     }
   }
@@ -695,11 +774,22 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
     return { status: "accepted" };
   }
 
-  async function progress(ctx: WorkflowSharedContext): Promise<void> {
+  async function progress(ctx: WorkflowSharedContext, raw: { step?: Step }): Promise<void> {
     await requireStarted(ctx);
     // Producers: handleRunnerProgress in src/runner-callback.ts, and the `watch` read in waitForOutcome (this file).
     const promise = ctx.promise<boolean>("progress");
     if (await promise.peek() === undefined) await promise.resolve(true);
+
+    // Step promises are evidence for `status`, never wait signals (ADR 034). A shared handler cannot write state.
+    const step = raw?.step;
+    if (!step || typeof step.id !== "string") return;
+    // Promise names stay bounded (ids x 2): an id outside the pipeline is accepted and ignored.
+    if (!(KG_REFRESH_RUNNER_STEPS as readonly string[]).includes(step.id)) return;
+    // A late report from a machine that is shutting down is not an error.
+    if (await ctx.get<boolean>("completed")) return;
+    // Producer: handleRunnerProgress in src/runner-callback.ts (the step body arrives redacted).
+    const stepPromise = ctx.promise<Step>(`step:${step.id}:${step.status === "running" ? "running" : "ended"}`);
+    if (await stepPromise.peek() === undefined) await stepPromise.resolve(step);
   }
 
   async function cancel(ctx: WorkflowSharedContext, raw: { reason?: string }): Promise<void> {
@@ -710,6 +800,17 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
     if (await promise.peek() === undefined) await promise.resolve(reason);
   }
 
+function toStepRecord(step: Step): KgRefreshStepRecord {
+  const duration = step.ended_at ? Date.parse(step.ended_at) - Date.parse(step.started_at) : NaN;
+  return {
+    id: step.id,
+    status: step.status,
+    startedAt: step.started_at,
+    endedAt: step.ended_at ?? null,
+    durationMs: Number.isFinite(duration) ? duration : null,
+  };
+}
+
   async function status(ctx: WorkflowSharedContext): Promise<KgRefreshStatusResult> {
     const [step, startedAt, triggerId, runId, dryRun] = await Promise.all([
       ctx.get<string>("step"),
@@ -718,7 +819,17 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       ctx.get<number>("runId"),
       ctx.get<boolean>("dryRun"),
     ]);
-    return { step: step ?? null, startedAt: startedAt ?? null, triggerId: triggerId ?? null, runId: runId ?? null, dryRun: dryRun === true };
+    let runnerStep: KgRefreshStatusResult["runnerStep"] = null;
+    for (const id of KG_REFRESH_RUNNER_STEPS) {
+      const ended = await ctx.promise<Step>(`step:${id}:ended`).peek();
+      if (ended !== undefined) {
+        runnerStep = { id, status: ended.status };
+        continue;
+      }
+      const running = await ctx.promise<Step>(`step:${id}:running`).peek();
+      if (running !== undefined) runnerStep = { id, status: running.status };
+    }
+    return { step: step ?? null, startedAt: startedAt ?? null, triggerId: triggerId ?? null, runId: runId ?? null, dryRun: dryRun === true, runnerStep };
   }
 
   return restate.workflow({
@@ -726,23 +837,23 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
     handlers: {
       run: restate.handlers.workflow.workflow({
         input: serde.zod(kgRefreshRunInputSchema),
-        journalRetention: KG_REFRESH_RETENTION_MS,
+        journalRetention: retentionMs,
         ingressPrivate: true,
       }, run),
       report: restate.handlers.workflow.shared({
-        journalRetention: KG_REFRESH_RETENTION_MS,
-        idempotencyRetention: KG_REFRESH_RETENTION_MS,
+        journalRetention: retentionMs,
+        idempotencyRetention: retentionMs,
       }, report),
       progress: restate.handlers.workflow.shared(progress),
       cancel: restate.handlers.workflow.shared({
-        journalRetention: KG_REFRESH_RETENTION_MS,
-        idempotencyRetention: KG_REFRESH_RETENTION_MS,
+        journalRetention: retentionMs,
+        idempotencyRetention: retentionMs,
       }, cancel),
       status: restate.handlers.workflow.shared(status),
     },
     options: {
-      workflowRetention: KG_REFRESH_RETENTION_MS,
-      journalRetention: KG_REFRESH_RETENTION_MS,
+      workflowRetention: retentionMs,
+      journalRetention: retentionMs,
       inactivityTimeout: 15 * 60 * 1000,
       abortTimeout: 20 * 60 * 1000,
     },

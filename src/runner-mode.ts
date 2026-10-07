@@ -230,7 +230,7 @@ export function setFlyProcessLevelSecrets(enabled: boolean): void {
 
 export interface KgMaterializeDirectStatus {
   enabled: boolean;
-  source: "env" | "db" | "default";
+  source: "db" | "default";
 }
 
 const KG_MATERIALIZE_DIRECT_SETTING_KEY = "kg_materialize_direct";
@@ -239,7 +239,7 @@ const KG_MATERIALIZE_DIRECT_SETTING_KEY = "kg_materialize_direct";
  * Returns true/false for an explicit non-blank value ("true" → true, anything else → false,
  * matching the flag's pre-AII-602 exact-match behaviour), or undefined when the var is
  * absent, empty, or whitespace-only (treat as unset) — an empty `KG_MATERIALIZE_DIRECT=` in
- * a copied `.env.example` must fall through to the DB/default, not pin the setting to "env".
+ * a copied `.env.example` must not seed a row.
  */
 export function parseKgMaterializeDirectEnv(val: string | undefined): boolean | undefined {
   if (!val || !val.trim()) return undefined;
@@ -248,16 +248,10 @@ export function parseKgMaterializeDirectEnv(val: string | undefined): boolean | 
 
 /**
  * Returns the effective KG materialize-direct setting (AII-602).
- * Priority: KG_MATERIALIZE_DIRECT env var > DB setting > default (false / rdflib).
- * The env var remains the seed for a fresh deployment and a break-glass override
- * when the DB is unavailable.
+ * Priority: DB setting > default (false / rdflib). KG_MATERIALIZE_DIRECT is only a
+ * first-boot seed (see seedKgMaterializeDirectFromEnv) and is never read here.
  */
 export function getKgMaterializeDirect(): KgMaterializeDirectStatus {
-  const envVal = parseKgMaterializeDirectEnv(process.env.KG_MATERIALIZE_DIRECT);
-  if (envVal !== undefined) {
-    return { enabled: envVal, source: "env" };
-  }
-
   try {
     const row = getDb()
       .prepare("SELECT value FROM settings WHERE key = ?")
@@ -273,7 +267,20 @@ export function getKgMaterializeDirect(): KgMaterializeDirectStatus {
   return { enabled: false, source: "default" };
 }
 
-/** Persists the KG materialize-direct setting to the DB. Env var override is unaffected. */
+/**
+ * Seeds the materialize-direct row from KG_MATERIALIZE_DIRECT on first boot only — a no-op
+ * when the var is blank or a row already exists, so a later toggle is never clobbered.
+ * Call once during startup, after initSettingsTable().
+ */
+export function seedKgMaterializeDirectFromEnv(envValue: string | undefined): void {
+  const parsed = parseKgMaterializeDirectEnv(envValue);
+  if (parsed === undefined) return;
+  getDb()
+    .prepare("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)")
+    .run(KG_MATERIALIZE_DIRECT_SETTING_KEY, String(parsed));
+}
+
+/** Persists the KG materialize-direct setting to the DB. */
 export function setKgMaterializeDirect(enabled: boolean): void {
   getDb()
     .prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)")

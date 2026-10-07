@@ -199,6 +199,8 @@ fly secrets set GITHUB_APP_ID=... GITHUB_APP_PRIVATE_KEY=... --app <app_name>
 
 The Fly volume `dedup_data` mounts at `/data` and holds the SQLite database. Only the GitHub App pair is required for the orchestrator to boot; ticketing credentials are needed for it to poll anything. See `.env.example` for the full set.
 
+At boot the orchestrator sets the snapshot retention of every volume in its own Fly app to the `volume_snapshot_retention_days` setting (default 14 days; Fly's own default is 5, its range 1–60), using `FLY_DEPLOY_TOKEN` and the injected `FLY_APP_NAME` through the Machines API (`src/fly-volumes.ts`). Only volumes whose retention differs are updated, and every volume in the app is covered, not just `dedup_data`. The volume also holds the Restate store under `/data/restate`, so a longer window keeps Restate history recoverable. A Fly error or a missing token or app name is logged as `[fly-volumes] snapshot retention not applied: <reason>` and never blocks boot; local runs have neither and always log it. The value is changed on `/admin#deployments` (Retention card, `GET`/`POST /api/retention`): a new volume value is applied to the Fly volumes at once, while a new `restate_retention_days` value applies at the next deploy or restart.
+
 ### The matrix workflow does not currently deploy clients
 
 `.github/workflows/deploy-clients.yml` exists and triggers on pushes to `main`, building a deploy matrix by globbing `clients/*.toml`. **In practice it always deploys nothing**, because `.gitignore` excludes `clients/*.toml` and un-ignores only the example — which the workflow explicitly skips. Every run finds zero clients, emits an empty matrix, and skips the deploy job via its own guard, reporting success.

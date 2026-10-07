@@ -218,7 +218,7 @@ describe("KgRepo durable single-flight lock", () => {
   );
 
   it.each(VARIANTS.map(([label]) => label))(
-    "D1: the same key and sha twice submits one workflow; a new sha is accepted; after forgetPr the same sha is accepted again (%s)",
+    "D1: the same key and sha twice submits one workflow; a new sha is accepted; after forgetPr the PR is closed and refused (%s)",
     async (label) => {
       const env = envFor(label);
       const slug = newKey();
@@ -236,7 +236,7 @@ describe("KgRepo durable single-flight lock", () => {
 
       await callObject(env.baseUrl(), "KgRepo", slug, "forgetPr", { repo: "org/kg-source", prNumber: 9 });
       expect((await repoStatus(env.baseUrl(), slug))?.pending).toEqual([]);
-      expect(await enqueue(env.baseUrl(), slug, 9, "y")).toEqual({ queued: true });
+      expect(await enqueue(env.baseUrl(), slug, 9, "y")).toEqual({ closed: true });
       expect(runSends.length - before).toBe(1);
     },
   );
@@ -482,6 +482,35 @@ describe("KgRepo durable single-flight lock", () => {
       // A newer head for the same PR replaces it.
       await record(env.baseUrl(), slug, 3, "sha-b");
       expect((await readOutcome(env.baseUrl(), slug, 3))?.sha).toBe("sha-b");
+    },
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "AII-1107: enqueueDryRun for a PR already forgotten answers closed, holds nothing, and release submits nothing for it (%s)",
+    async (label) => {
+      const env = envFor(label);
+      const forget = (n: number) => callObject(env.baseUrl(), "KgRepo", slug, "forgetPr", { repo: "org/kg-source", prNumber: n });
+      const slug = newKey();
+      const before = runSends.length;
+
+      // Variant A: idle repo.
+      await forget(7);
+      expect(await enqueue(env.baseUrl(), slug, 7, "a")).toEqual({ closed: true });
+      expect(await repoStatus(env.baseUrl(), slug)).toBeNull();
+      expect(runSends.length - before).toBe(0);
+
+      // Variant B: refresh in flight. Another PR is unaffected and is the only one held.
+      const { triggerId } = (await trigger(env.baseUrl(), slug)) as { triggerId: string };
+      await eventually(() => runSends.length - before >= 1, (ok) => ok, { label: "durable effect" });
+      await forget(8);
+      expect(await enqueue(env.baseUrl(), slug, 8, "b")).toEqual({ closed: true });
+      expect(await enqueue(env.baseUrl(), slug, 9, "c")).toEqual({ queued: true });
+      expect((await repoStatus(env.baseUrl(), slug))?.pending).toEqual(["org/kg-source#9"]);
+
+      await release(env.baseUrl(), slug, triggerId);
+      await eventually(() => runSends.length - before >= 2, (ok) => ok, { label: "durable effect" });
+      const submitted = runSends.slice(before + 1).map((r) => (r.parameter as { report?: { prNumber: number } }).report?.prNumber);
+      expect(submitted).toEqual([9]);
     },
   );
 

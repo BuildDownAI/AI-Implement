@@ -35,7 +35,9 @@ describe("dependency direction: the main pipeline never reaches into Restate (AI
 describe("import allowlist: only the door adapters may import Restate from outside src/restate/ (AII-717)", () => {
   // deploy.ts is the self-deployment door: it probes the old Restate endpoint
   // before replacing the process (AII-810), without importing the SDK itself.
-  const ALLOWLIST = new Set(["src/mcp.ts", "src/mcp-oauth.ts", "src/admin.ts", "src/index.ts", "src/deploy.ts", "src/runner-callback.ts"]);
+  // reaper.ts imports the durable-runner machine-metadata constants from
+  // src/restate/fly-machine-profile.ts so the stamp and the reaper's reading of it share one definition (AII-1132).
+  const ALLOWLIST = new Set(["src/mcp.ts", "src/mcp-oauth.ts", "src/admin.ts", "src/index.ts", "src/deploy.ts", "src/runner-callback.ts", "src/reaper.ts"]);
 
   function listTsFiles(dir: string): string[] {
     const entries = readdirSync(dir, { withFileTypes: true });
@@ -106,7 +108,7 @@ describe("import allowlist: only the door adapters may import Restate from outsi
   // makes the first test above fail with that file listed in `violations`, confirmed by hand
   // and reverted before this PR — see the PR description for the before/after transcript.
   it("sanity: the allowlist contains only the documented door and deployment adapters", () => {
-    expect([...ALLOWLIST].sort()).toEqual(["src/admin.ts", "src/deploy.ts", "src/index.ts", "src/mcp-oauth.ts", "src/mcp.ts", "src/runner-callback.ts"]);
+    expect([...ALLOWLIST].sort()).toEqual(["src/admin.ts", "src/deploy.ts", "src/index.ts", "src/mcp-oauth.ts", "src/mcp.ts", "src/reaper.ts", "src/runner-callback.ts"]);
   });
 });
 
@@ -202,17 +204,17 @@ describe("every declared write handler wraps its side effect in ctx.run under a 
     return /role:\s*"admin"/.test(block) && /operation:\s*"read"/.test(block);
   });
 
-  it("found the nine documented write handlers as role: \"admin\" (not zero, not accidentally all of them)", () => {
+  it("found the eight documented write handlers as role: \"admin\" (not zero, not accidentally all of them)", () => {
     expect(writeEntries.map((e) => e.toolName).sort()).toEqual(
-      ["add_project", "clear_dispatch_dedup", "fly_machine_reuse_probe", "pause_project", "release_dispatch_reservation", "set_kg_fly_machine", "set_runner_mode", "trigger_kg_refresh", "trigger_workflow_sync"],
+      ["add_project", "clear_dispatch_dedup", "pause_project", "release_dispatch_reservation", "set_fly_machine_profile", "set_runner_mode", "trigger_kg_refresh", "trigger_workflow_sync"],
     );
   });
 
   it.each(writeEntries.map(({ toolName, identifier }) => [toolName, identifier] as const))(
-    "%s (%s) contains both ctx.run( and retryPolicy in its definition",
+    "%s (%s) contains a journaled side effect (ctx.run( or an object client call) and retryPolicy in its definition",
     (_toolName, identifier) => {
       const block = definitionBlockFor(identifier, TOOLS_SOURCE);
-      expect(block).toContain("ctx.run(");
+      expect(block).toMatch(/ctx\.run\(|ctx\.objectClient\(/);
       expect(block).toMatch(/retryPolicy\s*:/);
     },
   );

@@ -16,15 +16,13 @@ import * as restate from "@restatedev/restate-sdk";
 import { serde } from "@restatedev/restate-sdk-zod";
 import { z } from "zod";
 import type { AccessRole } from "../access-entries.js";
-import { getRunnerMode, getKgMaterializeDirect, getKgFlyMachineOverride, setKgFlyMachineOverride, type KgFlyMachineOverride } from "../runner-mode.js";
+import { getRunnerMode, getKgMaterializeDirect } from "../runner-mode.js";
 import { getMappings, type RepoMapping } from "../config.js";
 import { getInFlightJobs, getRunRecordMergeVerdict, getJobById, getJobByMachineId, type Job } from "../log.js";
 import {
-  getMachine, listMachines, fetchMachineLogs, readMachineExit, readMachineExitCode,
-  createMachine, startMachine, updateMachine, destroyMachine, waitForMachine,
-  type Machine, type MachineConfig,
+  getMachine, listMachines, fetchMachineLogs, readMachineExit,
+  type Machine,
 } from "../fly-machines.js";
-import { resolveDefaultRunnerImage } from "../repo-image.js";
 import { getDb } from "../dedup.js";
 import {
   listHeldReservations,
@@ -34,10 +32,13 @@ import {
 } from "../dispatch-admission.js";
 import { isKgDegraded } from "../deploy-notify.js";
 import { sidecarHealthFields, getKgMemoryProvider, KG_TOOL_CAPABILITY } from "../kg-provider.js";
+import { getRestateRetentionDays, getVolumeSnapshotRetentionDays } from "./retention.js";
 import { getRestateStatus } from "./status.js";
 import { readKgSourceRepo } from "../deploy.js";
 import { runKgRefreshPreflight, MIN_FREE_BYTES, type KgRefreshStage, type KgRefreshStatus } from "../kg-refresh.js";
-import { resolveKgFlyMachineSize, type KgRefreshToolDeps } from "./kg-refresh-production.js";
+import type { StepStatus } from "../pipeline/types.js";
+import { FlyMachineProfile } from "./fly-machine-profile.js";
+import type { KgRefreshToolDeps } from "./kg-refresh-production.js";
 import type { KgRefreshDefinition, KgRepoDefinition } from "./kg-refresh-types.js";
 import { getOrchestratorSettings, getLinearPickupLabel } from "../orchestrator-settings.js";
 import { getIssueReportCard, getFleetReport } from "../report-card.js";
@@ -214,6 +215,8 @@ export const getTenantHealth = tool(
       kgDegraded: isKgDegraded(),
       ...sidecarHealthFields(),
       restate: getRestateStatus(),
+      restateRetentionDays: getRestateRetentionDays(),
+      volumeSnapshotRetentionDays: getVolumeSnapshotRetentionDays(),
       kgRefreshPreflight,
     };
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
@@ -643,6 +646,32 @@ export function kgStageForStep(step: string | null): KgRefreshStage {
   return "staging";
 }
 
+/**
+ * Maps the in-flight runner step onto a stage (AII-1134). Full table (id x status):
+ *   clone, kg-scope-reconcile, dependency-auth, clone-code-repo,
+ *   clone-secondary-repos, kg-tracker-data -> checking, for every status
+ *   kg-ingest                              -> ingest-running, for every status
+ *   kg-snapshot-push                       -> snapshot-landed when passed; ingest-running otherwise
+ *   any other id                           -> ingest-running (the runner phase is in flight)
+ */
+export function kgStageForRunnerStep(id: string, status: StepStatus): KgRefreshStage {
+  switch (id) {
+    case "clone":
+    case "kg-scope-reconcile":
+    case "dependency-auth":
+    case "clone-code-repo":
+    case "clone-secondary-repos":
+    case "kg-tracker-data":
+      return "checking";
+    case "kg-ingest":
+      return "ingest-running";
+    case "kg-snapshot-push":
+      return status === "passed" ? "snapshot-landed" : "ingest-running";
+    default:
+      return "ingest-running";
+  }
+}
+
 const REVERT_GATES = new Set(["answers", "vectors", "canary", "stamp"]);
 
 function kgStageFromLastRefresh(last: KgRefreshStatus["lastRefresh"]): KgRefreshStage {
@@ -662,6 +691,7 @@ export const getKgStatusTool = tool(
       return { content: [{ type: "text", text: JSON.stringify({ error: "KG refresh is not configured" }, null, 2) }] };
     }
     const inFlight = await ctx.objectClient(KgRepo, toolDeps.kgSourceRepo).status();
+    const flyProfile = await ctx.objectClient(FlyMachineProfile, "kg-refresh").get();
     const lastRefresh = toolDeps.readStatusRecord();
     const dryRun = await ctx.objectClient(KgRepo, toolDeps.kgSourceRepo).lastAdminDryRun();
     const lastDryRun = dryRun
@@ -679,12 +709,18 @@ export const getKgStatusTool = tool(
       });
     }
     let stage: KgRefreshStage;
+    let runnerStep: KgRefreshStatus["runnerStep"];
     if (inFlight === null || inFlight === undefined) {
       stage = kgStageFromLastRefresh(lastRefresh);
     } else {
       try {
         const wf = await ctx.workflowClient(KgRefresh, inFlight.triggerId).status();
-        stage = kgStageForStep(wf.step);
+        if (wf.runnerStep) {
+          runnerStep = { id: wf.runnerStep.id, status: wf.runnerStep.status as StepStatus };
+          stage = kgStageForRunnerStep(runnerStep.id, runnerStep.status);
+        } else {
+          stage = kgStageForStep(wf.step);
+        }
       } catch (err) {
         // A retained-but-finished or unreachable workflow: the marker is the truth.
         if (!kgStatusFallbackLogged) {
@@ -694,6 +730,7 @@ export const getKgStatusTool = tool(
         stage = "ingest-running";
       }
     }
+    const restateKey = inFlight?.triggerId ?? lastRefresh?.dispatchId;
     const result: KgRefreshStatus = {
       running: inFlight !== null && inFlight !== undefined,
       deployHeld: toolDeps.isDeployHeld(),
@@ -703,8 +740,10 @@ export const getKgStatusTool = tool(
       lastRefresh,
       lastDryRun,
       stage,
-      materialize: getKgMaterializeDirect() ? "direct" : "rdflib",
-      flyMachine: resolveKgFlyMachineSize(toolDeps.kgSourceRepo, false),
+      ...(runnerStep ? { runnerStep } : {}),
+      materialize: getKgMaterializeDirect().enabled ? "direct" : "rdflib",
+      ...(flyProfile ? { flyMachine: { ...flyProfile.config, source: flyProfile.source } } : {}),
+      restate: restateKey ? { service: "KgRefresh", key: restateKey } : null,
     };
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   },
@@ -992,191 +1031,37 @@ export const setRunnerModeTool = tool(
   },
 );
 
-export const SET_KG_FLY_MACHINE_DESCRIPTION =
-  "Set the Fly KG refresh machine size (admin role): cpus (1, 2, 4, 8, 16), memoryMb (256-65536), cpuKind (auto, shared, performance). Given fields merge into the stored override; clear: true deletes it. Applies to the next Fly KG run, not one in flight. Returns the stored override and the effective size.";
+export const SET_FLY_MACHINE_PROFILE_DESCRIPTION =
+  "Set a pipeline's Fly machine profile (admin role): pipeline (kg-refresh), cpuKind (shared, performance), cpus (1, 2, 4, 8, 16), memoryMb (256-65536), idleTimeoutMs (at least 60000). Given fields merge into the stored profile; the merged result must be valid (performance needs 2048 MB per CPU). Applies to the next run, not one in flight. Returns the profile as { config, source }.";
 
-const KG_FLY_CPU_VALUES = [1, 2, 4, 8, 16];
-const KG_FLY_CPU_KINDS = ["auto", "shared", "performance"];
-
-export const setKgFlyMachineTool = tool(
+export const setFlyMachineProfileTool = tool(
   {
-    description: SET_KG_FLY_MACHINE_DESCRIPTION,
+    description: SET_FLY_MACHINE_PROFILE_DESCRIPTION,
     input: z.object({
+      pipeline: z.string().describe("The pipeline phase whose profile to set, e.g. kg-refresh"),
+      cpuKind: z.enum(["shared", "performance"]).optional().describe("CPU kind: shared or performance"),
       cpus: z.number().optional().describe("CPUs: one of 1, 2, 4, 8, 16"),
       memoryMb: z.number().optional().describe("Memory in MB: an integer from 256 to 65536"),
-      cpuKind: z.string().optional().describe("CPU kind: auto (performance at 2048 MB per CPU or more), shared, or performance"),
-      clear: z.boolean().optional().describe("Delete the override, restoring the mapping size"),
+      idleTimeoutMs: z.number().optional().describe("Idle timeout in ms: at least 60000"),
     }),
     role: "admin",
     retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },
   },
   async (ctx, input): Promise<ToolResponse> => {
     const reply = (value: unknown): ToolResponse => ({ content: [{ type: "text", text: JSON.stringify(value, null, 2) }] });
-    const bad = (error: string): ToolResponse => reply({ status: 400, body: { error } });
-    const { cpus, memoryMb, cpuKind, clear } = input.args;
-    if (cpus !== undefined && !(Number.isInteger(cpus) && KG_FLY_CPU_VALUES.includes(cpus))) {
-      return bad("cpus must be one of 1, 2, 4, 8, 16");
+    const { pipeline, cpuKind, cpus, memoryMb, idleTimeoutMs } = input.args;
+    const fields = {
+      ...(cpuKind !== undefined ? { cpuKind } : {}),
+      ...(cpus !== undefined ? { cpus } : {}),
+      ...(memoryMb !== undefined ? { memoryMb } : {}),
+      ...(idleTimeoutMs !== undefined ? { idleTimeoutMs } : {}),
+    };
+    try {
+      return reply(await ctx.objectClient(FlyMachineProfile, pipeline).set(fields));
+    } catch (err) {
+      if (err instanceof restate.TerminalError && err.code === 400) return reply({ status: 400, body: { error: err.message } });
+      throw err;
     }
-    if (memoryMb !== undefined && !(Number.isInteger(memoryMb) && memoryMb >= 256 && memoryMb <= 65536)) {
-      return bad("memoryMb must be an integer from 256 to 65536");
-    }
-    if (cpuKind !== undefined && !KG_FLY_CPU_KINDS.includes(cpuKind)) {
-      return bad("cpuKind must be one of auto, shared, performance");
-    }
-    const toolDeps = kgRefreshToolDeps;
-    if (!toolDeps) return reply({ error: "KG refresh is not configured" });
-    const kgSourceRepo = toolDeps.kgSourceRepo;
-    const stored = await ctx.run("set-kg-fly-machine", () => {
-      if (clear === true) {
-        setKgFlyMachineOverride(null);
-        return {} as KgFlyMachineOverride;
-      }
-      const merged: KgFlyMachineOverride = {
-        ...getKgFlyMachineOverride(),
-        ...(cpus !== undefined ? { cpus } : {}),
-        ...(memoryMb !== undefined ? { memoryMb } : {}),
-        ...(cpuKind !== undefined ? { cpuKind: cpuKind as KgFlyMachineOverride["cpuKind"] } : {}),
-      };
-      setKgFlyMachineOverride(merged);
-      return merged;
-    }, { maxRetryAttempts: 1 });
-    return reply({ override: stored, effective: resolveKgFlyMachineSize(kgSourceRepo, false) });
-  },
-);
-
-export const FLY_MACHINE_REUSE_PROBE_DESCRIPTION =
-  "TEMPORARY (AII-1106): probes whether a stopped Fly machine in the sessions app can be reused (admin role). One action per call: create, start, update, read, destroy. It runs a fixed command on the default runner image and only touches machines it created (metadata.purpose reuse-probe). Exit code 10 x run means clean disk, new env and requested memory; 3 means the marker file from the earlier run survived; 4 means the probe could not write; 5 means less memory than requested. run 1-9; memoryMb 2048, 4096 or 8192 (default 8192).";
-
-const PROBE_PURPOSE = "reuse-probe";
-const PROBE_MEMORY_MB = [2048, 4096, 8192];
-const PROBE_WAIT_SECONDS = 45;
-const PROBE_CMD = [
-  'M=/var/tmp/reuse-probe-marker',
-  'if [ -f "$M" ]; then echo "PRESENT from run $(cat $M)"; exit 3; fi',
-  'echo "$PROBE_RUN" > "$M" || exit 4; [ -f "$M" ] || exit 4',
-  "KB=$(awk '/MemTotal/{print $2}' /proc/meminfo)",
-  '[ "$KB" -ge $((PROBE_EXPECT_MB * 900)) ] || { echo "MemTotal ${KB}kB below ${PROBE_EXPECT_MB}MB"; exit 5; }',
-  'echo "CLEAN run $PROBE_RUN MemTotal ${KB}kB"; exit $((PROBE_RUN * 10))',
-].join("\n");
-
-/** The one probe config, used by create and (for image, env, guest) update. */
-function buildProbeConfig(run: number, memoryMb: number): MachineConfig {
-  return {
-    image: resolveDefaultRunnerImage(process.env).image,
-    guest: { cpu_kind: "performance", cpus: 2, memory_mb: memoryMb },
-    restart: { policy: "no" },
-    auto_destroy: false,
-    env: { PROBE_RUN: String(run), PROBE_EXPECT_MB: String(memoryMb) },
-    init: { entrypoint: ["sh", "-c"], cmd: [PROBE_CMD] },
-    // No orchestrator_app key: sweepOrphanedMachines skips machines without this orchestrator's
-    // tag, and would otherwise destroy the probe as an orphan (no job row) mid-test.
-    metadata: { purpose: PROBE_PURPOSE },
-  };
-}
-
-export const flyMachineReuseProbeTool = tool(
-  {
-    description: FLY_MACHINE_REUSE_PROBE_DESCRIPTION,
-    input: z.object({
-      action: z.enum(["create", "start", "update", "read", "destroy"]),
-      machineId: z.string().optional().describe("Required for every action except create"),
-      run: z.number().int().min(1).max(9).optional().describe("create, update: the run number the probe writes"),
-      memoryMb: z.number().int().optional().describe("create, update: one of 2048, 4096, 8192 (default 8192)"),
-    }),
-    role: "admin",
-    retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },
-  },
-  async (ctx, input): Promise<ToolResponse> => {
-    const reply = (value: unknown): ToolResponse => ({ content: [{ type: "text", text: JSON.stringify(value, null, 2) }] });
-    const fail = (status: number, error: string): ToolResponse => reply({ status, body: { error } });
-    const { action, machineId } = input.args;
-    const run = input.args.run ?? 1;
-    const memoryMb = input.args.memoryMb ?? 8192;
-    if (!Number.isInteger(run) || run < 1 || run > 9) return fail(400, "run must be an integer from 1 to 9");
-    if (!PROBE_MEMORY_MB.includes(memoryMb)) return fail(400, "memoryMb must be one of 2048, 4096, 8192");
-    if (action !== "create" && !machineId) return fail(400, "machineId is required");
-
-    const config = mcpAdminConfig();
-    if (!config.flySessionsToken || !config.flySessionsApp) {
-      return reply({ error: "Fly sessions app is not configured" });
-    }
-    const token = config.flySessionsToken;
-    const app = config.flySessionsApp;
-    const once = { maxRetryAttempts: 1 };
-    // A wait that times out (or a machine that already stopped) is not a failure: the id must survive.
-    const waitStarted = (id: string, t0: number) =>
-      ctx.run(`wait-started`, async () => {
-        try {
-          await waitForMachine(token, app, id, "started", PROBE_WAIT_SECONDS);
-          return Date.now() - t0;
-        } catch {
-          return null;
-        }
-      }, once);
-
-    if (action === "create") {
-      const t0 = Date.now();
-      const created = await ctx.run("create-machine", () => createMachine(token, app, {
-        name: `reuse-probe-${run}`,
-        region: config.flySessionsRegion ?? "iad",
-        config: buildProbeConfig(run, memoryMb),
-      }).then((m) => ({ id: m.id, state: m.state })), once);
-      const apiMs = Date.now() - t0;
-      const startedMs = await waitStarted(created.id, t0);
-      return reply({ machineId: created.id, apiMs, startedMs, state: created.state });
-    }
-
-    const id = machineId as string;
-    // Guard: only a machine this tool created. getMachine's 404 is mapped inside the closure,
-    // since ctx.run serialises return values only.
-    const found = await ctx.run("get-machine", async () => {
-      try {
-        const m = await getMachine(token, app, id);
-        return { machine: m };
-      } catch (err) {
-        if (isFlyNotFound(err)) return { machine: null };
-        throw err;
-      }
-    }, once);
-    const machine = found.machine;
-    if (!machine) {
-      return action === "destroy" ? reply({ destroyed: true }) : fail(404, `Machine ${id} not found`);
-    }
-    if (machine.config?.metadata?.purpose !== PROBE_PURPOSE) {
-      return fail(400, `Machine ${id} is not a reuse-probe machine`);
-    }
-
-    if (action === "read") {
-      const events = [...(machine.events ?? [])]
-        .sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0))
-        .slice(0, 10)
-        .map((e) => ({ type: e.type, status: e.status, timestamp: e.timestamp }));
-      return reply({
-        state: machine.state,
-        guest: machine.config?.guest,
-        env: { PROBE_RUN: machine.config?.env?.PROBE_RUN, PROBE_EXPECT_MB: machine.config?.env?.PROBE_EXPECT_MB },
-        exitCode: readMachineExitCode(machine),
-        oomKilled: readMachineExit(machine).oomKilled,
-        events,
-      });
-    }
-    if (action === "destroy") {
-      await ctx.run("destroy-machine", () => destroyMachine(token, app, id, true), once);
-      return reply({ destroyed: true });
-    }
-    if (action === "start") {
-      const t0 = Date.now();
-      await ctx.run("start-machine", () => startMachine(token, app, id), once);
-      const apiMs = Date.now() - t0;
-      return reply({ apiMs, startedMs: await waitStarted(id, t0) });
-    }
-    // update: whole config, only image, env and guest replaced
-    const probe = buildProbeConfig(run, memoryMb);
-    const next: MachineConfig = { ...machine.config, image: probe.image, env: probe.env, guest: probe.guest };
-    const t0 = Date.now();
-    await ctx.run("update-machine", () => updateMachine(token, app, id, next).then(() => null), once);
-    const apiMs = Date.now() - t0;
-    return reply({ apiMs, startedMs: await waitStarted(id, t0) });
   },
 );
 
@@ -1406,8 +1291,7 @@ export const orchestratorTools = restate.service({
     kg_provenance: kgProvenance,
     trigger_kg_refresh: triggerKgRefreshTool,
     set_runner_mode: setRunnerModeTool,
-    set_kg_fly_machine: setKgFlyMachineTool,
-    fly_machine_reuse_probe: flyMachineReuseProbeTool,
+    set_fly_machine_profile: setFlyMachineProfileTool,
     pause_project: pauseProjectTool,
     add_project: addProjectTool,
     trigger_workflow_sync: triggerWorkflowSyncTool,
