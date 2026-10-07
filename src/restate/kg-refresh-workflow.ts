@@ -20,7 +20,7 @@ import * as restate from "@restatedev/restate-sdk";
 import type { WorkflowContext, WorkflowSharedContext } from "@restatedev/restate-sdk";
 import { serde } from "@restatedev/restate-sdk-zod";
 import { z } from "zod";
-import type { KgDryRunReportTarget, RefreshGate, RefreshOutcome } from "../kg-refresh.js";
+import type { KgDryRunReportTarget, KgRefreshStepRecord, RefreshGate, RefreshOutcome } from "../kg-refresh.js";
 import {
   type KgRailDeps,
   type RailContext,
@@ -283,11 +283,16 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       }
     }
 
+    // Built once, after `report`; pre-report failures (timeout, lost) carry no table.
+    let stepTable: KgRefreshStepRecord[] = [];
+    const withSteps = (o: RefreshOutcome): RefreshOutcome => (stepTable.length > 0 && !o.steps ? { ...o, steps: stepTable } : o);
+
     async function failurePath(
-      outcome: RefreshOutcome,
+      rawOutcome: RefreshOutcome,
       conclusion: string,
       opts: { timedOut?: boolean; skipOutcome?: boolean } = {},
     ): Promise<RefreshOutcome> {
+      const outcome = withSteps(rawOutcome);
       // A dry-run is not a refresh: it never writes the last-refresh record or notifies the operator.
       if (!input.dryRun) await ctx.run("persist", () => deps.persistLastRefresh({ ...outcome, dispatchId }));
       await ctx.run("close-row", () => deps.closeJobLog(jobId, opts.timedOut ? "timed_out" : "failed", conclusion));
@@ -542,6 +547,12 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
 
       // waitResult.kind === "report"
       const report = waitResult.value;
+      // Journaled peeks, so a replay rebuilds the same table.
+      stepTable = [];
+      for (const id of KG_REFRESH_RUNNER_STEPS) {
+        const body = (await ctx.promise<Step>(`step:${id}:ended`).peek()) ?? (await ctx.promise<Step>(`step:${id}:running`).peek());
+        if (body !== undefined) stepTable.push(toStepRecord(body));
+      }
 
       if (input.dryRun) {
         ctx.set("step", "dry-run-report");
@@ -550,6 +561,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           ok: report.ok, at, detail: report.failureReason ?? (report.ok ? "dry run passed" : "dry run guard refused"),
           stampBefore: null, stampAfter: null, dryRun: true, partTable: report.partTable,
         };
+        if (stepTable.length > 0) outcome.steps = stepTable;
         if (input.report) {
           // Stored on `KgRepo` so the accept-baseline label can re-report it; journaled, so a replay sends once.
           ctx.objectSendClient<KgRepoDefinition>({ name: "KgRepo" }, deps.kgSourceRepo).recordDryRunOutcome({ report: input.report, outcome });
@@ -699,6 +711,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
         detail: `refreshed: ${railCtx.stampBefore ?? "baked"} -> ${railCtx.stampAfter}`,
         stampBefore: railCtx.stampBefore ?? null, stampAfter: railCtx.stampAfter ?? null,
       };
+      if (stepTable.length > 0) successOutcome.steps = stepTable;
       await ctx.run("persist", () => deps.persistLastRefresh({ ...successOutcome, dispatchId }));
       ctx.set("step", "close-row");
       await ctx.run("close-row", () => deps.closeJobLog(jobId, "completed"));
@@ -786,6 +799,17 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
     const promise = ctx.promise<string>("cancel");
     if (await promise.peek() === undefined) await promise.resolve(reason);
   }
+
+function toStepRecord(step: Step): KgRefreshStepRecord {
+  const duration = step.ended_at ? Date.parse(step.ended_at) - Date.parse(step.started_at) : NaN;
+  return {
+    id: step.id,
+    status: step.status,
+    startedAt: step.started_at,
+    endedAt: step.ended_at ?? null,
+    durationMs: Number.isFinite(duration) ? duration : null,
+  };
+}
 
   async function status(ctx: WorkflowSharedContext): Promise<KgRefreshStatusResult> {
     const [step, startedAt, triggerId, runId, dryRun] = await Promise.all([
