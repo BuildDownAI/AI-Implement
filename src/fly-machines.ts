@@ -1,5 +1,12 @@
 import crypto from "node:crypto";
 
+import {
+  DURABLE_RUNNER_DISPATCH_ID_KEY,
+  DURABLE_RUNNER_PIPELINE_KEY,
+  DURABLE_RUNNER_PURPOSE_KEY,
+  type DURABLE_RUNNER_PURPOSE_VALUE,
+} from "./durable-runner.js";
+
 // ── Types ────────────────────────────────────────────────────────────────────
 
 export interface MachineGuest {
@@ -474,6 +481,12 @@ export interface SessionMachineInput {
   expectedTtlSeconds?: number; // expected machine lifetime in seconds, stamped in metadata for reaper
   extraEnv?: Record<string, string>; // per-mapping env vars injected last, overriding defaults
   machineName?: string; // overrides the default `session-<issue key>` name
+  /** Stamped as `purpose` metadata; defaults to "session". "durable-runner" marks a machine a pipeline keeps between runs (the reaper skips it). */
+  purpose?: "session" | typeof DURABLE_RUNNER_PURPOSE_VALUE;
+  /** Stamped as `pipeline` metadata when set (e.g. "kg-refresh"). */
+  pipeline?: string;
+  /** Stamped as `dispatch_id` metadata when set; a retried dispatch step compares it to find its own run. */
+  dispatchId?: string;
 }
 
 export function buildSessionMachineConfig(input: SessionMachineInput): CreateMachineOpts {
@@ -522,7 +535,9 @@ export function buildSessionMachineConfig(input: SessionMachineInput): CreateMac
     auto_destroy: false,
     restart: { policy: "no" },
     metadata: {
-      purpose: "session",
+      [DURABLE_RUNNER_PURPOSE_KEY]: input.purpose ?? "session",
+      ...(input.pipeline ? { [DURABLE_RUNNER_PIPELINE_KEY]: input.pipeline } : {}),
+      ...(input.dispatchId ? { [DURABLE_RUNNER_DISPATCH_ID_KEY]: input.dispatchId } : {}),
       issue_id: input.issueId,
       issue_identifier: input.issueIdentifier,
       repo: `${input.owner}/${input.repo}`,

@@ -12,10 +12,12 @@ vi.mock("../github.js", async (importOriginal) => ({
   postWorkflowDispatch: (...args: unknown[]) => postWorkflowDispatch(...args),
 }));
 const destroyMachine = vi.fn(async (..._args: unknown[]) => {});
+const stopMachine = vi.fn(async (..._args: unknown[]) => {});
 const getMachine = vi.fn(async (..._args: unknown[]): Promise<unknown> => ({ state: "started" }));
 vi.mock("../fly-machines.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../fly-machines.js")>()),
   destroyMachine: (...args: unknown[]) => destroyMachine(...args),
+  stopMachine: (...args: unknown[]) => stopMachine(...args),
   getMachine: (...args: unknown[]) => getMachine(...args),
 }));
 const inspectLocalContainer = vi.fn(async (_id: string): Promise<{ running: boolean }> => ({ running: true }));
@@ -62,6 +64,8 @@ import {
   createKgRefreshDispatch,
   createKgRefreshIngressClient,
   createProductionKgRefreshServices,
+  launchKeptMachine,
+  type KeptMachineFly,
   resolveKgExecutionMode,
   seedFlyMachineProfileFromOverride,
   type KgRefreshProductionInput,
@@ -112,6 +116,7 @@ const dispatchInput = {
   tokens: { runToken: "rt", progressToken: "pt", publicationToken: "pub" },
   issueIdentifier: "KG-REFRESH · t-1",
   dispatchId: "d-workflow",
+  machineId: null,
   machine: { cpuKind: "performance" as const, cpus: 2, memoryMb: 8192, idleTimeoutMs: 604800000 },
 };
 
@@ -304,6 +309,14 @@ describe("stopMachineRun wiring", () => {
     await expect(capturedWorkflowDeps.current!.stopMachineRun("fly-machines", "m-1")).resolves.toBe(true);
     expect(destroyMachine).toHaveBeenCalledWith("fly-token", "fly-app", "m-1");
     expect(stopLocalContainer).not.toHaveBeenCalled();
+  });
+
+  it("stops, not destroys, a kept Fly machine", async () => {
+    stopMachine.mockClear();
+    createProductionKgRefreshServices(makeInput());
+    await expect(capturedWorkflowDeps.current!.stopMachineRun("fly-machines", "m-1", true)).resolves.toBe(true);
+    expect(stopMachine).toHaveBeenCalledWith("fly-token", "fly-app", "m-1");
+    expect(destroyMachine).not.toHaveBeenCalled();
   });
 
   it("stops the local container", async () => {
@@ -705,5 +718,65 @@ describe("readMachineRun wiring", () => {
     await expect(capturedWorkflowDeps.current!.readMachineRun("local-docker", "c-1")).resolves.toEqual({ state: "ended", exit: null });
     await expect(capturedWorkflowDeps.current!.readMachineRun("other", "x")).resolves.toEqual({ state: "unknown", exit: null });
     expect(getMachine).not.toHaveBeenCalled();
+  });
+});
+
+describe("launchKeptMachine: the dispatch step's Fly write", () => {
+  const machineConfig = { config: { image: "img", env: { MACHINE_NONCE: "fresh-nonce" }, metadata: { dispatch_id: "d1" } } } as never;
+  const notFound = () => new Error("Failed to get machine m-1 (404): not found");
+
+  function makeFly(get: () => Promise<unknown>) {
+    const calls: string[] = [];
+    const fly: KeptMachineFly = {
+      getMachine: vi.fn(async () => { calls.push("get"); return get() as never; }),
+      createMachine: vi.fn(async () => { calls.push("create"); return { id: "m-new" } as never; }),
+      updateMachine: vi.fn(async () => { calls.push("update"); }),
+      startMachine: vi.fn(async () => { calls.push("start"); }),
+    };
+    return { fly, calls };
+  }
+  const launch = (fly: KeptMachineFly, keptMachineId: string | null) =>
+    launchKeptMachine(fly, { keptMachineId, dispatchId: "d1", machineConfig, machineNonce: "fresh-nonce" });
+
+  it("creates a machine when none is kept, without a lookup", async () => {
+    const { fly, calls } = makeFly(async () => ({}));
+    await expect(launch(fly, null)).resolves.toMatchObject({ machineId: "m-new", created: true });
+    expect(calls).toEqual(["create"]);
+  });
+
+  it("updates then starts a stopped kept machine", async () => {
+    const { fly, calls } = makeFly(async () => ({ state: "stopped" }));
+    await expect(launch(fly, "m-1")).resolves.toEqual({ machineId: "m-1", machineNonce: "fresh-nonce", created: false, reused: true });
+    expect(calls).toEqual(["get", "update", "start"]);
+  });
+
+  it("returns a machine already started for this dispatch, with no update or start", async () => {
+    const { fly, calls } = makeFly(async () => ({ state: "started", config: { env: { MACHINE_NONCE: "earlier-nonce" }, metadata: { dispatch_id: "d1" } } }));
+    await expect(launch(fly, "m-1")).resolves.toEqual({ machineId: "m-1", machineNonce: "earlier-nonce", created: false, reused: true });
+    expect(calls).toEqual(["get"]);
+  });
+
+  it("throws for a machine started for another dispatch", async () => {
+    const { fly, calls } = makeFly(async () => ({ state: "started", config: { metadata: { dispatch_id: "other" } } }));
+    await expect(launch(fly, "m-1")).rejects.toThrow(/another dispatch/);
+    expect(calls).toEqual(["get"]);
+  });
+
+  it("creates a replacement when the kept machine is destroyed", async () => {
+    const { fly, calls } = makeFly(async () => ({ state: "destroyed" }));
+    await expect(launch(fly, "m-1")).resolves.toMatchObject({ machineId: "m-new", created: true });
+    expect(calls).toEqual(["get", "create"]);
+  });
+
+  it("creates a replacement when the lookup answers 404", async () => {
+    const { fly, calls } = makeFly(async () => { throw notFound(); });
+    await expect(launch(fly, "m-1")).resolves.toMatchObject({ machineId: "m-new", created: true });
+    expect(calls).toEqual(["get", "create"]);
+  });
+
+  it("throws on any other lookup error so the step retries", async () => {
+    const { fly, calls } = makeFly(async () => { throw new Error("Failed to get machine m-1 (500): boom"); });
+    await expect(launch(fly, "m-1")).rejects.toThrow(/500/);
+    expect(calls).toEqual(["get"]);
   });
 });

@@ -19,12 +19,12 @@ import { fileURLToPath } from "node:url";
 import * as restate from "@restatedev/restate-sdk";
 import type { RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import type { MachineExit } from "../../fly-machines.js";
+import type { CreateMachineOpts, Machine, MachineExit } from "../../fly-machines.js";
 import type { RefreshOutcome } from "../../kg-refresh.js";
 import { RailGateError, type KgRailDeps } from "../../kg-refresh-rail.js";
 import { COMPLETION_MARKER } from "../../kg-sidecar.js";
-import { createKgRefreshIngressClient } from "../../restate/kg-refresh-production.js";
-import { FLY_MACHINE_PROFILE_DEFAULTS, mergeProfile, type FlyMachineProfileConfig } from "../../restate/fly-machine-profile.js";
+import { createKgRefreshIngressClient, launchKeptMachine, type KeptMachineFly } from "../../restate/kg-refresh-production.js";
+import { FLY_MACHINE_PROFILE_DEFAULTS, createFlyMachineProfile, mergeProfile, type FlyMachineProfileConfig, type KeptMachineState } from "../../restate/fly-machine-profile.js";
 import { createKgRepo, type KgRepoTriggerResult } from "../../restate/kg-repo.js";
 import {
   createKgRefreshWorkflow,
@@ -118,6 +118,17 @@ async function pastDeadlineAtTick(scenario: RunScenario, deadlineMs: number, lab
   await scenario.tickGate!.reached();
   const at = scenario.tickGateReachedAt! + deadlineMs;
   await eventually(() => Date.now(), (now) => now > at, { label: `wall clock past ${label}` });
+}
+
+/** The names of an invocation's journal entries, read through `sys_journal`. */
+async function journalStepNames(adminBaseUrl: string, invocationId: string): Promise<string[]> {
+  const response = await fetch(`${adminBaseUrl}/query`, { // restate-test-allow: sys_journal read, not an invocation lookup
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json" },
+    body: JSON.stringify({ query: `SELECT name FROM sys_journal WHERE id = '${invocationId}'` }),
+  });
+  const rows = ((await response.json()) as { rows: Array<{ name: string | null }> }).rows;
+  return rows.map((r) => r.name).filter((n): n is string => typeof n === "string" && n !== "");
 }
 
 describe("KgRefresh durable workflow", () => {
@@ -347,6 +358,10 @@ describe("KgRefresh durable workflow", () => {
         const stored = await ctx.get<FlyMachineProfileConfig>("profile");
         ctx.set("profile", mergeProfile(stored ?? FLY_MACHINE_PROFILE_DEFAULTS["kg-refresh"], patch));
       }),
+      // AII-1136: the workflow claims, attaches and releases the kept machine; this stand-in keeps none (the real object is exercised below).
+      claim: restate.handlers.object.exclusive(async (): Promise<{ machineId: string | null }> => ({ machineId: null })),
+      attach: restate.handlers.object.exclusive(async (): Promise<void> => {}),
+      release: restate.handlers.object.exclusive(async (): Promise<void> => {}),
     },
   });
 
@@ -1225,6 +1240,12 @@ describe("KgRefresh durable workflow", () => {
       expect(scenario.cancelCalls).toBe(0);
     }, 30_000);
 
+    it("the dispatch step is journaled under a name that carries the attempt", () => {
+      const source = readFileSync(fileURLToPath(new URL("../../restate/kg-refresh-workflow.ts", import.meta.url)), "utf8");
+      expect(source).not.toContain('ctx.run("dispatch"');
+      expect(source).toMatch(/ctx\.run\(\s*`dispatch-\$\{attempt\}`/);
+    });
+
     it("every watch-* and reconcile-* step in the workflow source carries a retry bound", () => {
       const source = readFileSync(fileURLToPath(new URL("../../restate/kg-refresh-workflow.ts", import.meta.url)), "utf8");
       const steps = [...source.matchAll(/(ctx\.run|readBoundedOwnedRun)\(\s*(ctx,\s*)?`(watch|reconcile)-/g)];
@@ -1904,7 +1925,8 @@ describe("KgRefresh durable workflow", () => {
         body: JSON.stringify({ query: `SELECT * FROM sys_journal WHERE id = '${invocation.id}'` }),
       });
       const journal = JSON.stringify(((await journalResponse.json()) as { rows: unknown[] }).rows);
-      expect(journal).toContain("dispatch");
+      expect(await journalStepNames(env.adminAPIBaseUrl(), invocation.id as string)).toEqual(expect.arrayContaining(["dispatch-1"]));
+      expect(await journalStepNames(env.adminAPIBaseUrl(), invocation.id as string)).not.toContain("dispatch");
       expect(journal).not.toContain("mint-tokens");
       for (const token of ["run-token", "progress-token", "publication-token"]) {
         expect(journal).not.toContain(token);
@@ -2593,6 +2615,193 @@ describe("KgRefresh durable workflow", () => {
       await env.stop();
     }
   }, 60_000);
+
+  // ---- AII-1136: the kept machine. The real FlyMachineProfile object, a fake Fly, and the real
+  // `launchKeptMachine` as the dispatch, so the workflow's claim / attach / release / keep wiring runs end to end. ----
+  describe("AII-1136: the workflow keeps one Fly machine between refreshes", () => {
+    class FakeFly implements KeptMachineFly {
+      machines = new Map<string, { state: string; config: Machine["config"] }>();
+      calls: string[] = [];
+      private nextId = 1;
+      async getMachine(id: string): Promise<Machine> {
+        const m = this.machines.get(id);
+        if (!m) throw new Error(`Failed to get machine ${id} (404): not found`);
+        return { id, state: m.state, config: m.config } as unknown as Machine;
+      }
+      async createMachine(opts: CreateMachineOpts): Promise<Machine> {
+        const id = `m-${this.nextId++}`;
+        this.machines.set(id, { state: "started", config: opts.config });
+        this.calls.push(`create:${id}`);
+        return { id } as unknown as Machine;
+      }
+      async updateMachine(id: string, config: Machine["config"]): Promise<void> {
+        this.machines.get(id)!.config = config;
+        this.calls.push(`update:${id}`);
+      }
+      async startMachine(id: string): Promise<void> {
+        this.machines.get(id)!.state = "started";
+        this.calls.push(`start:${id}`);
+      }
+      async stopMachine(id: string): Promise<void> {
+        this.machines.get(id)!.state = "stopped";
+        this.calls.push(`stop:${id}`);
+      }
+      async destroyMachine(id: string): Promise<void> {
+        this.machines.delete(id);
+        this.calls.push(`destroy:${id}`);
+      }
+      /** The runner exiting on its own after its report. */
+      runnerExits(id: string): void {
+        this.machines.get(id)!.state = "stopped";
+      }
+    }
+
+    let fly: FakeFly;
+    let profileFlyCalls: string[];
+    let readGate: Gate | null;
+
+    const profileObject = createFlyMachineProfile({
+      fly: {
+        getMachine: (id) => fly.getMachine(id),
+        clearMachineEnv: async (id) => { profileFlyCalls.push(`clear-env:${id}`); },
+        updateMachineMetadata: async (id, key) => { profileFlyCalls.push(`metadata:${id}:${key}`); },
+        destroyMachine: async (id) => { profileFlyCalls.push(`destroy:${id}`); },
+      },
+    });
+
+    async function keptDispatch(input: KgDispatchInput): Promise<KgDispatchResult> {
+      const scenario = scenarios.get(input.runConfig.triggerId)!;
+      scenario.dispatchCalls++;
+      const machineConfig = {
+        config: { image: "img", env: { MACHINE_NONCE: `nonce-${input.dispatchId}` }, metadata: { dispatch_id: input.dispatchId } },
+      } as unknown as CreateMachineOpts;
+      const launched = await launchKeptMachine(fly, {
+        keptMachineId: input.machineId, dispatchId: input.dispatchId, machineConfig, machineNonce: `nonce-${input.dispatchId}`,
+      });
+      return { outcome: "accepted", jobId: launched.machineId, executionMode: "fly-machines", machineId: launched.machineId, created: launched.created };
+    }
+
+    const keptStopCalls: Array<{ jobId: string; keep: boolean }> = [];
+    function buildKeptWorkflow() {
+      return createKgRefreshWorkflow({
+        ...workflowDeps,
+        dispatch: keptDispatch,
+        stopMachineRun: async (_mode, jobId, keep) => {
+          keptStopCalls.push({ jobId, keep: keep === true });
+          if (keep) await fly.stopMachine(jobId);
+          else await fly.destroyMachine(jobId);
+          return true;
+        },
+        readMachineRun: async () => {
+          if (readGate) await readGate.wait();
+          return { state: "started", exit: null };
+        },
+        bootstrapDeadlineMs: 30_000,
+        totalDeadlineMs: 60_000,
+      });
+    }
+
+    const profileStatus = (baseUrl: string) =>
+      callObject<{ machine: KeptMachineState | null }>(baseUrl, "FlyMachineProfile", "kg-refresh", "status", undefined);
+    const expireSends = (env: RestateTestEnvironment) => queryInvocations(
+      env.adminAPIBaseUrl(),
+      "target_service_name = 'FlyMachineProfile' AND target_service_key = 'kg-refresh' AND target_handler_name = 'expire'",
+    );
+
+    beforeEach(() => {
+      fly = new FakeFly();
+      profileFlyCalls = [];
+      readGate = null;
+      keptStopCalls.length = 0;
+    });
+
+    async function startRun(env: RestateTestEnvironment): Promise<{ triggerId: string; done: Promise<RefreshOutcome> }> {
+      const triggerId = newTriggerId();
+      const scenario = makeScenario(triggerId, { dispatchOutcome: "accepted", executionMode: "fly-machines" });
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      await eventually(() => scenario.dispatchCalls >= 1, (ok) => ok, { label: "dispatched" });
+      return { triggerId, done };
+    }
+
+    it("two refreshes in a row: the first creates and attaches, the second reuses with update then start", async () => {
+      const env = await startRetryEnabled([buildKeptWorkflow(), kgRepo, starter, profileObject]);
+      try {
+        const first = await startRun(env);
+        await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.machineId === "m-1", { label: "attach recorded" });
+        await callWorkflow(env.baseUrl(), "KgRefresh", first.triggerId, "report", GENERIC_FAILURE_REPORT);
+        await first.done;
+        await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.heldBy === null, { label: "first release" });
+        expect(fly.calls).toEqual(["create:m-1"]);
+        expect(profileFlyCalls).toEqual(["clear-env:m-1", "metadata:m-1:durable_until"]);
+        fly.runnerExits("m-1");
+        await eventually(() => expireSends(env), (rows) => rows.length === 1, { label: "first expire scheduled" });
+
+        fly.calls.length = 0;
+        const second = await startRun(env);
+        await callWorkflow(env.baseUrl(), "KgRefresh", second.triggerId, "report", GENERIC_FAILURE_REPORT);
+        await second.done;
+        const status = await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.heldBy === null, { label: "second release" });
+        expect(fly.calls).toEqual(["update:m-1", "start:m-1"]);
+        expect(status.machine?.machineId).toBe("m-1");
+        // one expire per release
+        await eventually(() => expireSends(env), (rows) => rows.length === 2, { label: "second expire scheduled" });
+      } finally {
+        await env.stop();
+      }
+    }, 60_000);
+
+    it("a cancel during the wait stops the kept machine, releases it, and keeps its id", async () => {
+      const env = await startRetryEnabled([buildKeptWorkflow(), kgRepo, starter, profileObject]);
+      try {
+        const run = await startRun(env);
+        await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.machineId === "m-1", { label: "attach recorded" });
+        await callWorkflow(env.baseUrl(), "KgRefresh", run.triggerId, "cancel", { reason: "operator requested" });
+        await run.done;
+        const status = await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.heldBy === null, { label: "release" });
+        expect(fly.calls).toEqual(["create:m-1", "stop:m-1"]);
+        expect(keptStopCalls).toEqual([{ jobId: "m-1", keep: true }]);
+        expect(status.machine?.machineId).toBe("m-1");
+        expect(fly.machines.has("m-1")).toBe(true);
+      } finally {
+        await env.stop();
+      }
+    }, 60_000);
+
+    it("a crash after the dispatch step does not send attach again", async () => {
+      const env = await startRetryEnabled([buildKeptWorkflow(), kgRepo, starter, profileObject]);
+      let replacement: Awaited<ReturnType<typeof replaceEndpoint>> | undefined;
+      try {
+        const held = gate("first machine read");
+        readGate = held;
+        // Started through KgRepo's one-way send: no ingress request may stay open across the restart.
+        const triggered = await triggerViaKgRepo(env.baseUrl());
+        const triggerId = (triggered as { triggerId: string }).triggerId;
+        const scenario = makeScenario(triggerId, { dispatchOutcome: "accepted", executionMode: "fly-machines" });
+        await eventually(() => scenario.dispatchCalls >= 1, (ok) => ok, { label: "dispatched" });
+        await held.reached();
+        await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.machineId === "m-1", { label: "attach recorded" });
+
+        replacement = await replaceEndpoint(env, [buildKeptWorkflow(), kgRepo, starter, profileObject]);
+        await env.startedRestateContainer.restart();
+        readGate.release();
+
+        await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", GENERIC_FAILURE_REPORT);
+        await attachWorkflow<RefreshOutcome>(env.baseUrl(), "KgRefresh", triggerId);
+        const status = await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.heldBy === null, { label: "release" });
+        expect(status.machine?.machineId).toBe("m-1");
+        expect(fly.calls).toEqual(["create:m-1"]);
+        const attaches = await queryInvocations(
+          env.adminAPIBaseUrl(),
+          "target_service_name = 'FlyMachineProfile' AND target_service_key = 'kg-refresh' AND target_handler_name = 'attach'",
+        );
+        expect(attaches).toHaveLength(1);
+      } finally {
+        readGate?.release();
+        replacement?.close();
+        await env.stop();
+      }
+    }, 90_000);
+  });
 });
 
 // ---- shared admin-API duration parsing (mirrors src/__tests__/restate/harness.restate.test.ts) ----
