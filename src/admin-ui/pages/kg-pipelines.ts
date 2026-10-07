@@ -322,7 +322,7 @@ export const kgPipelinesScript = `
       const res = await window.api('/api/tools/get_kg_status', { method: 'POST', body: JSON.stringify({ args: {} }) });
       if (!res.ok) return;
       const raw = await res.json();
-      const fm = (raw && raw.flyMachine) || unwrapToolAnswer(res, raw).body.flyMachine;
+      const fm = unwrapToolAnswer(res, raw).body.flyMachine;
       if (!fm || typeof fm.cpus !== 'number') return;
       document.getElementById('kg-fly-machine-effective').textContent =
         'next Fly run: ' + fm.cpuKind + ', ' + fm.cpus + ' CPU / ' + fm.memoryMb + ' MB, idle '
