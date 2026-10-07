@@ -1,6 +1,6 @@
 # Deploying the orchestrator
 
-How an orchestrator instance gets deployed, how a new client instance is stood up, and how to point a target repo at AWS Bedrock.
+How an orchestrator instance is deployed, how a new client instance is stood up, and how to point a target repo at AWS Bedrock.
 
 Reference for `src/deploy.ts`, `scripts/provision-client.sh`, `clients/`, `.github/workflows/deploy-clients.yml`, and the Bedrock path in the synced workflows. `CLAUDE.md` carries the summary and points here.
 
