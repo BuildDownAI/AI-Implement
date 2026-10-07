@@ -601,22 +601,29 @@ describe("KgRepo object-owned lease expiry", () => {
     30_000,
   );
 
+  // Not a deadline scenario (Timing rule 4, § "Driving the race" › Tiers): it proves the branch "an expire for a
+  // released lease leaves a newer marker alone", so it runs with the production deadlines and the test delivers the
+  // released lease's expire itself, in the order the race needs. No clock decides the order. The engine's own
+  // delivery of the delayed send is proved by "trigger records one delayed expire self-send" and "with a short
+  // margin, expire clears the marker when no release arrives". The earlier version used the short environment and
+  // asserted a wall-clock window; it failed on a slow binary runner (PR #897, run 37550539792, AII-1028 class C).
   it.each(VARIANTS.map(([label]) => label))(
     "expire after release is a no-op: it leaves a newer marker alone (%s)",
     async (label) => {
-      const env = pick(short, label);
+      const env = pick(production, label);
       const slug = slugOf();
-      const startedAt = Date.now();
       const { triggerId } = await callObject<{ triggerId: string }>(env.baseUrl(), "KgRepo", slug, "trigger", {});
       await callPrivate(env.baseUrl(), slug, "release", { triggerId });
-      // Stagger the second lease so the first expire fires while the second marker is still live.
-      await settle(400);
       const next = await callObject<{ triggerId: string }>(env.baseUrl(), "KgRepo", slug, "trigger", {});
       expect(next.triggerId).not.toBe(triggerId);
-      // Wait past the first lease's expire (startedAt + 800 ms) but before the second's (>= startedAt + 1200 ms).
-      const wait = startedAt + SHORT_TOTAL_MS + SHORT_MARGIN_MS + 200 - Date.now();
-      await settle(Math.max(wait, 0));
-      expect(Date.now()).toBeLessThan(startedAt + SHORT_TOTAL_MS + SHORT_MARGIN_MS + 400);
+      // Release does not cancel the first lease's backstop: both leases have a scheduled expire, so the expire this
+      // test delivers is the message the engine would deliver later.
+      await eventually(
+        () => queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'KgRepo' AND target_service_key = '${slug}' AND target_handler_name = 'expire'`),
+        (found) => found.length === 2,
+        { label: "two scheduled KgRepo.expire", timeoutMs: 30_000 },
+      );
+      await callPrivate(env.baseUrl(), slug, "expire", { triggerId });
       expect((await markerOf(env, slug))?.triggerId).toBe(next.triggerId);
     },
     30_000,
