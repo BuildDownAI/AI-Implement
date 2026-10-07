@@ -103,7 +103,7 @@ const RESTATE_TOOL_NAMES = new Set([
   "kg_path",
   "trigger_kg_refresh",
   "set_runner_mode",
-  "set_kg_fly_machine",
+  "set_fly_machine_profile",
   "fly_machine_reuse_probe",
   "pause_project",
   "add_project",
@@ -121,7 +121,7 @@ const RESTATE_TOOL_NAMES = new Set([
 export const RESTATE_WRITE_TOOL_NAMES = new Set([
   "trigger_kg_refresh",
   "set_runner_mode",
-  "set_kg_fly_machine",
+  "set_fly_machine_profile",
   "fly_machine_reuse_probe",
   "pause_project",
   "add_project",

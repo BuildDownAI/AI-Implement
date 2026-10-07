@@ -6,8 +6,9 @@
  * Step 3a (AII-1131) makes it the owner of the one machine the pipeline keeps between runs: `claim`,
  * `attach`, `release`, `expire` (ADR 037). The run's env never enters the object (Restate journals every
  * handler input), so the workflow's dispatch step does create / update / start; the object decides
- * identity, hold, timer, scrub, and destroy. Only the `ctx.run` closures call `deps.fly`. Nothing
- * calls the handlers yet.
+ * identity, hold, timer, scrub, and destroy. Only the `ctx.run` closures call `deps.fly`.
+ *
+ * Its callers are the KG refresh workflow, `set_fly_machine_profile`, and the boot seed.
  */
 import * as restate from "@restatedev/restate-sdk";
 import type { ObjectContext, ObjectSharedContext } from "@restatedev/restate-sdk";
@@ -314,3 +315,7 @@ export function createFlyMachineProfile(deps: FlyMachineProfileDeps) {
     },
   });
 }
+
+export type FlyMachineProfileDefinition = ReturnType<typeof createFlyMachineProfile>;
+/** A typed client handle for callers outside this module (the workflow, the tools, the boot seed). */
+export const FlyMachineProfile: FlyMachineProfileDefinition = { name: "FlyMachineProfile" } as FlyMachineProfileDefinition;
