@@ -31,11 +31,12 @@ vi.mock("../pipeline/retry-backoff.js", async (importOriginal) => {
 import { spawnSync } from "node:child_process";
 import { implementStep } from "../pipeline/steps/implement.js";
 import { reviewStep } from "../pipeline/steps/review.js";
-import { feedbackLoopStep } from "../pipeline/steps/feedback-loop.js";
+import { feedbackLoopStep, projectStageReport } from "../pipeline/steps/feedback-loop.js";
 import { DefaultPipelineContext } from "../pipeline/context.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
 import { DEFAULT_RETRY_POLICY, computeBackoffMs } from "../pipeline/retry-backoff.js";
 import type { LLMExecutor, Step, StepReporter } from "../pipeline/types.js";
+import { makeSnapshot } from "./configured-run-fixture.js";
 
 /** No-op sleep so a retry test never actually waits out the real backoff delay. */
 const NO_SLEEP = async () => {};
@@ -1489,5 +1490,320 @@ describe("feedback-loop core isolation (AII-626)", () => {
     const core = readFileSync(join(pipelineDir, "feedback-loop-core.ts"), "utf-8");
     expect(core).not.toMatch(/from\s+["']node:/);
     expect(core).not.toMatch(/new Date\(|Date\.now|setTimeout|console\./);
+  });
+});
+
+describe("feedbackLoopStep — configured stage reports (AII-964)", () => {
+  // implementation = codex (timeout 2000), review = claude (timeout 3000)
+  const snapshot = makeSnapshot();
+  const configured = (invoke: LLMExecutor["invoke"] = vi.fn()) =>
+    new DefaultPipelineContext(
+      {
+        jobId: 1, issueId: "issue-1", issueIdentifier: "ENG-1", issueTitle: "Test",
+        issueDescription: "Description", nonce: "nonce", orchestratorUrl: "http://localhost:8080",
+        agentConfig: snapshot,
+      },
+      { invoke },
+    );
+  const collect = () => {
+    const steps: Step[] = [];
+    const reporter: StepReporter = { report: vi.fn(async (step) => { steps.push(structuredClone(step)); }) };
+    return { steps, reporter };
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(implementStep.run).mockResolvedValue(IMPLEMENT_OUTPUTS);
+    mockDiff();
+  });
+
+  it("projects the Codex implement row to the snapshot model and timeout with no maxTurns, and the Claude review row keeps maxTurns", async () => {
+    vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
+    const { steps, reporter } = collect();
+
+    const outputs = await feedbackLoopStep.run(configured(), { ...BASE_INPUTS, maxTurns: 40 }, reporter);
+
+    expect(outputs.terminationReason).toBe("approved");
+    const impl = steps.filter((s) => s.id === "implement.1");
+    expect(impl.map((s) => s.status)).toEqual(["running", "passed"]);
+    for (const s of impl) {
+      expect(s.inputs.model).toBe("gpt-impl");
+      expect(s.inputs.invocationTimeoutMs).toBe(2000);
+      expect("maxTurns" in s.inputs).toBe(false);
+      expect(s.inputs.prompt).toBeDefined();
+    }
+    const review = steps.filter((s) => s.id === "review.1");
+    expect(review.map((s) => s.status)).toEqual(["running", "passed"]);
+    for (const s of review) {
+      expect(s.inputs.model).toBe("claude-review");
+      expect(s.inputs.invocationTimeoutMs).toBe(3000);
+      expect(s.inputs.maxTurns).toBeUndefined();
+    }
+  });
+
+  it("keeps maxTurns on a configured Claude implementation row", async () => {
+    const claudeImpl = makeSnapshot();
+    claudeImpl.stages.implementation = { ...claudeImpl.stages.implementation, agent: "claude", provider: "anthropic", model: "claude-impl" };
+    vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
+    const { steps, reporter } = collect();
+    const ctx = new DefaultPipelineContext(
+      { jobId: 1, issueId: "i", issueIdentifier: "E-1", issueTitle: "T", issueDescription: "D", nonce: "n", orchestratorUrl: "http://localhost:8080", agentConfig: claudeImpl },
+      { invoke: vi.fn() },
+    );
+
+    await feedbackLoopStep.run(ctx, { ...BASE_INPUTS, maxTurns: 40 }, reporter);
+
+    const running = steps.find((s) => s.id === "implement.1" && s.status === "running")!;
+    expect(running.inputs.model).toBe("claude-impl");
+    expect(running.inputs.maxTurns).toBe(40);
+    expect(running.inputs.invocationTimeoutMs).toBe(2000);
+  });
+
+  it("projects failed and retry rows and leaves legacy shape untouched", async () => {
+    vi.mocked(implementStep.run)
+      .mockRejectedValueOnce(new Error(TRANSIENT_ERROR_MESSAGE))
+      .mockResolvedValueOnce(IMPLEMENT_OUTPUTS);
+    vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
+    const { steps, reporter } = collect();
+
+    await feedbackLoopStep.run(configured(), { ...BASE_INPUTS, sleep: NO_SLEEP }, reporter);
+
+    const retry = steps.find((s) => s.id === "implement.1.retry1")!;
+    expect(retry.status).toBe("failed");
+    expect(retry.inputs.model).toBe("gpt-impl");
+    expect("maxTurns" in retry.inputs).toBe(false);
+
+    vi.mocked(implementStep.run).mockResolvedValue(IMPLEMENT_OUTPUTS);
+    vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
+    const legacy = collect();
+    await feedbackLoopStep.run(makeContext(), { ...BASE_INPUTS, maxTurns: 40, model: "m-1" }, legacy.reporter);
+    const row = legacy.steps.find((s) => s.id === "implement.1" && s.status === "running")!;
+    expect(row.inputs.model).toBe("m-1");
+    expect(row.inputs.maxTurns).toBe(40);
+    expect("invocationTimeoutMs" in row.inputs).toBe(false);
+  });
+
+  it("runs the post-mortem with the review selection, agentStage review, and reports its own cap", async () => {
+    vi.mocked(implementStep.run).mockResolvedValue({ ...IMPLEMENT_OUTPUTS, telemetry: MAX_TURNS_TELEMETRY });
+    const invoke = vi.fn().mockResolvedValue({ stdout: "## Post-mortem\nout of turns", exitCode: 0, tokensUsed: 1 });
+    const { steps, reporter } = collect();
+
+    const outputs = await feedbackLoopStep.run(configured(invoke), { ...BASE_INPUTS, maxTurns: 40 }, reporter);
+
+    expect(outputs.terminationReason).toBe("max_turns");
+    const call = invoke.mock.calls[0][0];
+    expect(call.agentStage).toBe("review");
+    expect(call.stage).toBe("feedback-loop/post-mortem-1");
+    expect(call.expectsStructuredOutput).toBe(false);
+    expect(call.tools).toEqual(["Read", "Glob", "Grep"]);
+    const pm = steps.filter((s) => s.id === "post-mortem.1");
+    expect(pm.map((s) => s.status)).toEqual(["running", "passed"]);
+    expect(pm[0].inputs).toMatchObject({ model: "claude-review", maxTurns: 15, invocationTimeoutMs: 3000 });
+  });
+
+  it("post-mortem stays non-fatal and reports the failed row when the review executor throws", async () => {
+    vi.mocked(implementStep.run).mockResolvedValue({ ...IMPLEMENT_OUTPUTS, telemetry: MAX_TURNS_TELEMETRY });
+    const invoke = vi.fn().mockRejectedValue(new Error("boom"));
+    const { steps, reporter } = collect();
+
+    const outputs = await feedbackLoopStep.run(configured(invoke), BASE_INPUTS, reporter);
+
+    expect(outputs.terminationReason).toBe("max_turns");
+    expect(outputs.postMortem).toBeUndefined();
+    expect(steps.filter((s) => s.id === "post-mortem.1").map((s) => s.status)).toEqual(["running", "failed"]);
+  });
+
+  it("legacy post-mortem sends agentStage review and keeps the existing report shape", async () => {
+    vi.mocked(implementStep.run).mockResolvedValue({ ...IMPLEMENT_OUTPUTS, telemetry: MAX_TURNS_TELEMETRY });
+    const invoke = vi.fn().mockResolvedValue({ stdout: "pm", exitCode: 0, tokensUsed: 1 });
+    const { steps, reporter } = collect();
+
+    await feedbackLoopStep.run(makeContextWithExecutor(invoke), { ...BASE_INPUTS, maxTurns: 40 }, reporter);
+
+    expect(invoke.mock.calls[0][0].agentStage).toBe("review");
+    expect(steps.find((s) => s.id === "post-mortem.1")!.inputs).toEqual({ iteration: 1, maxTurns: 40 });
+  });
+});
+
+describe("feedbackLoopStep — configured stage reports, coverage (AII-964)", () => {
+  const snapshot = makeSnapshot();
+  const configured = (invoke: LLMExecutor["invoke"] = vi.fn()) =>
+    new DefaultPipelineContext(
+      {
+        jobId: 1, issueId: "issue-1", issueIdentifier: "ENG-1", issueTitle: "Test",
+        issueDescription: "Description", nonce: "nonce", orchestratorUrl: "http://localhost:8080",
+        agentConfig: snapshot,
+      },
+      { invoke },
+    );
+  const collect = () => {
+    const steps: Step[] = [];
+    const reporter: StepReporter = { report: vi.fn(async (step) => { steps.push(structuredClone(step)); }) };
+    return { steps, reporter };
+  };
+  const sequence = (steps: Step[]) => steps.map((s) => `${s.id}:${s.status}`);
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(implementStep.run).mockResolvedValue(IMPLEMENT_OUTPUTS);
+    mockDiff();
+  });
+
+  it("projectStageReport clones: a deep-frozen core step is untouched and the result is a distinct object", () => {
+    const original: Step = {
+      id: "implement.1", type: "custom", status: "running", started_at: "t", ended_at: null,
+      parent_step_id: null, inputs: { model: "legacy-model", maxTurns: 40, prompt: "p" }, outputs: {}, logs_url: null,
+    };
+    const deepFreeze = (o: unknown): void => {
+      if (o && typeof o === "object") { Object.freeze(o); Object.values(o).forEach(deepFreeze); }
+    };
+    deepFreeze(original);
+    const before = structuredClone(original);
+
+    const projected = projectStageReport(original, snapshot);
+
+    expect(projected).not.toBe(original);
+    expect(projected.inputs).not.toBe(original.inputs);
+    expect(original).toEqual(before);
+    expect(original.inputs).toEqual({ model: "legacy-model", maxTurns: 40, prompt: "p" });
+    expect(projected.inputs).toEqual({ model: "gpt-impl", invocationTimeoutMs: 2000, prompt: "p" });
+    expect(() => { (original.inputs as Record<string, unknown>).model = "x"; }).toThrow();
+    // Legacy and unrelated ids pass through by identity.
+    expect(projectStageReport(original, undefined)).toBe(original);
+    expect(projectStageReport({ ...original, id: "other.1" }, snapshot).inputs).toEqual(original.inputs);
+  });
+
+  it("hands the reporter clones: a received row keeps its status after the core mutates its own step", async () => {
+    vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
+    const received: Step[] = [];
+    const reporter: StepReporter = { report: vi.fn(async (step) => { received.push(step); }) };
+
+    await feedbackLoopStep.run(configured(), BASE_INPUTS, reporter);
+
+    const implRows = received.filter((s) => s.id === "implement.1");
+    expect(implRows.map((s) => s.status)).toEqual(["running", "passed"]);
+    expect(implRows[0]).not.toBe(implRows[1]);
+    expect(implRows[0].inputs).not.toBe(implRows[1].inputs);
+  });
+
+  it("legacy implement and review rows deep-equal the existing shape", async () => {
+    vi.mocked(reviewStep.run).mockResolvedValueOnce(REJECTED_REVIEW).mockResolvedValueOnce(APPROVED_REVIEW);
+    const { steps, reporter } = collect();
+
+    await feedbackLoopStep.run(makeContext(), { ...BASE_INPUTS, maxTurns: 40, model: "m-1", reviewModel: "r-1" }, reporter);
+
+    const impl = steps.find((s) => s.id === "implement.1" && s.status === "running")!;
+    expect(impl.inputs).toEqual({ ...impl.inputs, model: "m-1", maxTurns: 40 });
+    expect(Object.keys(impl.inputs).sort()).not.toContain("invocationTimeoutMs");
+    const rev = steps.find((s) => s.id === "review.1" && s.status === "running")!;
+    expect(Object.keys(rev.inputs).sort()).toEqual(
+      ["acceptanceBar", "diff", "installFailed", "issueDescription", "issueTitle", "iteration", "model"].sort(),
+    );
+    expect(rev.inputs.model).toBe("r-1");
+  });
+
+  async function runBoth(setup: () => void, inputs: Record<string, unknown> = {}) {
+    setup();
+    const legacy = collect();
+    const legacyOut = await feedbackLoopStep.run(makeContext(), { ...BASE_INPUTS, sleep: NO_SLEEP, ...inputs }, legacy.reporter);
+    vi.mocked(implementStep.run).mockReset();
+    vi.mocked(reviewStep.run).mockReset();
+    vi.mocked(implementStep.run).mockResolvedValue(IMPLEMENT_OUTPUTS);
+    setup();
+    const mixed = collect();
+    const mixedOut = await feedbackLoopStep.run(configured(), { ...BASE_INPUTS, sleep: NO_SLEEP, ...inputs }, mixed.reporter);
+    return { legacy, legacyOut, mixed, mixedOut };
+  }
+
+  it("iterations_exhausted under a mixed snapshot matches legacy outputs and report sequence", async () => {
+    const { legacy, legacyOut, mixed, mixedOut } = await runBoth(() => {
+      vi.mocked(reviewStep.run).mockResolvedValue(REJECTED_REVIEW);
+    });
+    expect(mixedOut.terminationReason).toBe("iterations_exhausted");
+    expect(mixedOut).toEqual(legacyOut);
+    expect(sequence(mixed.steps)).toEqual(sequence(legacy.steps));
+  });
+
+  it("review_error under a mixed snapshot matches legacy outputs and reports a projected failed review row", async () => {
+    const { legacy, legacyOut, mixed, mixedOut } = await runBoth(() => {
+      vi.mocked(reviewStep.run).mockRejectedValueOnce(new Error("Prompt is too long"));
+    });
+    expect(mixedOut.terminationReason).toBe("review_error");
+    expect(mixedOut).toEqual(legacyOut);
+    expect(sequence(mixed.steps)).toEqual(sequence(legacy.steps));
+    const failed = mixed.steps.find((s) => s.id === "review.1" && s.status === "failed")!;
+    expect(failed.inputs.model).toBe("claude-review");
+    expect(failed.inputs.invocationTimeoutMs).toBe(3000);
+  });
+
+  it("projects a review retry row", async () => {
+    vi.mocked(reviewStep.run)
+      .mockRejectedValueOnce(new Error(TRANSIENT_ERROR_MESSAGE))
+      .mockResolvedValueOnce(APPROVED_REVIEW);
+    const { steps, reporter } = collect();
+
+    const out = await feedbackLoopStep.run(configured(), { ...BASE_INPUTS, sleep: NO_SLEEP }, reporter);
+
+    expect(out.terminationReason).toBe("approved");
+    const retry = steps.find((s) => s.id === "review.1.retry1");
+    expect(retry).toBeDefined();
+    expect(retry!.status).toBe("failed");
+    expect(retry!.inputs.model).toBe("claude-review");
+    expect(retry!.inputs.invocationTimeoutMs).toBe(3000);
+  });
+
+  it("surfaces a Codex implementation timeout with its own code, never max_turns, and the failed row has no maxTurns", async () => {
+    const timeout = Object.assign(new Error("Codex invocation exceeded its time limit"), {
+      failure: {
+        category: "crash", code: "INVOCATION_TIMEOUT", stage: "feedback-loop/implement-1", attempt: 1,
+        retryable: false, exitCode: null, signal: null, message: "Codex invocation exceeded its time limit",
+        evidence: { truncated: false, llmSubtype: null, llmIsError: null },
+      },
+    });
+    vi.mocked(implementStep.run).mockRejectedValue(timeout);
+    const { steps, reporter } = collect();
+
+    const err = await feedbackLoopStep.run(configured(), { ...BASE_INPUTS, maxTurns: 40 }, reporter).then(
+      () => undefined,
+      (e) => e as { failure?: { code?: string } },
+    );
+
+    expect(err).toBeDefined();
+    expect(err!.failure!.code).toBe("INVOCATION_TIMEOUT");
+    const failed = steps.find((s) => s.id === "implement.1" && s.status === "failed")!;
+    expect((failed.outputs.failure as { code: string }).code).toBe("INVOCATION_TIMEOUT");
+    expect(failed.inputs.invocationTimeoutMs).toBe(2000);
+    expect("maxTurns" in failed.inputs).toBe(false);
+    expect(reviewStep.run).not.toHaveBeenCalled();
+  });
+
+  it("projects the failed post-mortem row inputs from the review selection", async () => {
+    vi.mocked(implementStep.run).mockResolvedValue({ ...IMPLEMENT_OUTPUTS, telemetry: MAX_TURNS_TELEMETRY });
+    const invoke = vi.fn().mockRejectedValue(new Error("boom"));
+    const { steps, reporter } = collect();
+
+    await feedbackLoopStep.run(configured(invoke), { ...BASE_INPUTS, maxTurns: 40 }, reporter);
+
+    const failed = steps.find((s) => s.id === "post-mortem.1" && s.status === "failed")!;
+    expect(failed.inputs).toEqual({ iteration: 1, model: "claude-review", invocationTimeoutMs: 3000, maxTurns: 15 });
+  });
+
+  it("a Codex review post-mortem reports its timeout and no maxTurns", async () => {
+    const codexReview = makeSnapshot();
+    codexReview.stages.review = { ...codexReview.stages.review, agent: "codex", provider: "openai", model: "gpt-rev" };
+    vi.mocked(implementStep.run).mockResolvedValue({ ...IMPLEMENT_OUTPUTS, telemetry: MAX_TURNS_TELEMETRY });
+    const invoke = vi.fn().mockResolvedValue({ stdout: "pm", exitCode: 0, tokensUsed: 1 });
+    const { steps, reporter } = collect();
+    const ctx = new DefaultPipelineContext(
+      { jobId: 1, issueId: "i", issueIdentifier: "E-1", issueTitle: "T", issueDescription: "D", nonce: "n", orchestratorUrl: "http://localhost:8080", agentConfig: codexReview },
+      { invoke },
+    );
+
+    await feedbackLoopStep.run(ctx, BASE_INPUTS, reporter);
+
+    expect(invoke.mock.calls[0][0].agentStage).toBe("review");
+    for (const pm of steps.filter((s) => s.id === "post-mortem.1")) {
+      expect(pm.inputs).toEqual({ iteration: 1, model: "gpt-rev", invocationTimeoutMs: 3000 });
+    }
   });
 });

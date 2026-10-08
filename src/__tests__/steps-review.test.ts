@@ -57,6 +57,17 @@ describe("reviewStep", () => {
     vi.clearAllMocks();
   });
 
+  it("stamps agentStage review on the verdict call and keeps schema and read-only params", async () => {
+    const executor = makeExecutor(APPROVED_VERDICT);
+
+    await reviewStep.run(makeContext(executor), { diff: "d", iteration: 1 }, new NoopStepReporter());
+
+    const params = vi.mocked(executor.invoke).mock.calls[0][0];
+    expect(params).toMatchObject({ stage: "review", agentStage: "review", expectsStructuredOutput: true });
+    expect(params.jsonSchema).toBeDefined();
+    expect(params.tools).toEqual(["Read", "Glob", "Grep"]);
+  });
+
   it("rejects a negative verdict without actionable implementation issues", async () => {
     const executor = makeExecutor({ ...APPROVED_VERDICT, approved: false });
     await expect(reviewStep.run(makeContext(executor), {}, new NoopStepReporter()))

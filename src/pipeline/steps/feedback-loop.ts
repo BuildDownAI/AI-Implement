@@ -201,6 +201,43 @@ function isRunDirty(workspaceDir: string, runStartHead: string): boolean {
 
 const POST_MORTEM_MAX_TURNS = 15;
 
+type AgentSnapshot = NonNullable<PipelineContext["data"]["agentConfig"]>;
+
+/**
+ * Configured-run projection of a sub-step's limit/model inputs from the frozen snapshot, so reports
+ * describe the actual invocation (the selector overwrites model/timeout and drops Codex maxTurns).
+ * Returns a clone; the original (core-owned) step and its inputs are never touched. Legacy runs
+ * (no snapshot) and unrelated step ids pass through unchanged.
+ */
+export function projectStageReport(step: Step, snapshot: AgentSnapshot | undefined): Step {
+  if (!snapshot) return step;
+  const stage = /^implement\.\d+(\.retry\d+)?$/.test(step.id)
+    ? "implementation"
+    : /^review\.\d+(\.retry\d+)?$/.test(step.id)
+      ? "review"
+      : undefined;
+  if (!stage) return step;
+  return { ...step, inputs: projectStageInputs(step.inputs, snapshot, stage) };
+}
+
+function projectStageInputs(
+  inputs: Record<string, unknown>,
+  snapshot: AgentSnapshot,
+  stage: "implementation" | "review",
+  claudeMaxTurns?: number,
+): Record<string, unknown> {
+  const selection = snapshot.stages[stage];
+  const { maxTurns, ...rest } = inputs;
+  return {
+    ...rest,
+    model: selection.model,
+    invocationTimeoutMs: selection.invocationTimeoutMs,
+    ...(selection.agent === "claude" && (claudeMaxTurns ?? maxTurns) !== undefined
+      ? { maxTurns: claudeMaxTurns ?? maxTurns }
+      : {}),
+  };
+}
+
 function buildPostMortemPrompt(params: {
   issueTitle: string;
   issueDescription: string;
@@ -238,6 +275,7 @@ async function runPostMortem(
   params: { issueTitle: string; issueDescription: string; diff: string; telemetry: RunTelemetry; maxTurns: number; model: string; iteration: number; parentStepId: string },
   reporter: StepReporter,
 ): Promise<string | null> {
+  const snapshot = context.data.agentConfig;
   const subStep: Step = {
     id: `post-mortem.${params.iteration}`,
     type: "custom",
@@ -245,7 +283,9 @@ async function runPostMortem(
     started_at: new Date().toISOString(),
     ended_at: null,
     parent_step_id: params.parentStepId,
-    inputs: { iteration: params.iteration, maxTurns: params.maxTurns },
+    inputs: snapshot
+      ? projectStageInputs({ iteration: params.iteration }, snapshot, "review", POST_MORTEM_MAX_TURNS)
+      : { iteration: params.iteration, maxTurns: params.maxTurns },
     outputs: {},
     logs_url: null,
   };
@@ -258,6 +298,7 @@ async function runPostMortem(
       maxTurns: POST_MORTEM_MAX_TURNS,
       ...READ_ONLY_TOOL_PARAMS,
       stage: `feedback-loop/post-mortem-${params.iteration}`,
+      agentStage: "review",
       expectsStructuredOutput: false,
       cycle: params.iteration,
     });
@@ -398,7 +439,7 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
         writeCycleSummary: (input) => {
           writeCycleSummary(workspaceDir, input);
         },
-        report: (step) => reporter.report(step),
+        report: (step) => reporter.report(projectStageReport(step, context.data.agentConfig)),
         sleep,
         now: () => new Date().toISOString(),
         warn: (message) => console.warn(message),

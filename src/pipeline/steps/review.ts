@@ -116,6 +116,7 @@ export const reviewStep: StepModule<ReviewInputs, ReviewOutputs> = {
       ...READ_ONLY_TOOL_PARAMS,
       jsonSchema: REVIEW_VERDICT_JSON_SCHEMA,
       stage: "review",
+      agentStage: "review",
       expectsStructuredOutput: true,
       retry: retryPolicy ? { policy: retryPolicy, toolUseIsSafe: true } : undefined,
       cycle: iteration,

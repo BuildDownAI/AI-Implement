@@ -53,6 +53,16 @@ describe("implementStep", () => {
     );
   });
 
+  it("stamps agentStage implementation while keeping the diagnostic stage", async () => {
+    const executor = makeExecutor();
+
+    await implementStep.run(makeContext(executor), { workspaceDir: "/tmp/test", prompt: "Do it", maxTurns: 7 }, new NoopStepReporter());
+
+    expect(executor.invoke).toHaveBeenCalledWith(
+      expect.objectContaining({ stage: "implement", agentStage: "implementation", maxTurns: 7 }),
+    );
+  });
+
   it("defaults model to DEFAULT_MODEL when not specified", async () => {
     const executor = makeExecutor();
     const ctx = makeContext(executor);
