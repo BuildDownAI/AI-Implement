@@ -17,23 +17,36 @@ vi.mock("node:fs", () => ({
 
 // Prevent real filesystem writes for the artifacts directory.
 vi.mock("node:fs/promises", () => ({
+  chmod: vi.fn().mockResolvedValue(undefined),
+  mkdtemp: vi.fn().mockResolvedValue("/tmp/source-copy-root"),
   mkdir: vi.fn().mockResolvedValue(undefined),
+  readFile: vi.fn().mockResolvedValue("{}"),
+  rm: vi.fn().mockResolvedValue(undefined),
   writeFile: vi.fn().mockResolvedValue(undefined),
 }));
 
 // Stub the session layer so startDevRun is tested in isolation.
 vi.mock("../local/session.js", () => ({
+  LOCAL_AUTH_BOOTSTRAP_ENV: "AI_IMPLEMENT_LOCAL_AUTH_BOOTSTRAP_FILE",
   launchLocalSession: vi.fn(),
   getSessionStatus: vi.fn(),
   streamSessionLogs: vi.fn(),
   streamSessionLogsUntilShellReady: vi.fn(),
   awaitSessionResult: vi.fn(),
+  startLocalAuthBridge: vi.fn(),
   stopLocalSession: vi.fn(),
+}));
+
+vi.mock("../local/agent-config.js", () => ({
+  LocalSessionOwnership: vi.fn(),
+  createLocalCredentialPort: vi.fn(() => ({ load: vi.fn() })),
+  loadLocalAgentConfig: vi.fn(),
 }));
 
 import { spawnSync } from "node:child_process";
 import { writeFile } from "node:fs/promises";
 import { launchLocalSession } from "../local/session.js";
+import { LocalSessionOwnership, loadLocalAgentConfig } from "../local/agent-config.js";
 import { startDevRun } from "../dev-harness/index.js";
 import { parseTaskFileFromPath } from "../dev-harness/task-file.js";
 
@@ -65,6 +78,18 @@ function makeSpawnSyncMock(stdout = "") {
     signal: null,
     error: undefined,
   });
+}
+
+function configuredResolution() {
+  const stage = { agent: "codex" as const, provider: "openai" as const, model: "gpt", accountProfileId: "sub-a", invocationTimeoutMs: 1000 };
+  const sources = { agent: "project" as const, provider: "project" as const, model: "project" as const, accountProfileId: "project" as const, invocationTimeoutMs: "project" as const };
+  const profile = { id: "sub-a", identity: "local", revision: 1, agent: "codex" as const, provider: "openai" as const, authMode: "codex-subscription" as const };
+  return {
+    mode: "configured" as const,
+    stages: { planning: stage, implementation: stage, review: stage },
+    sources: { planning: sources, implementation: sources, review: sources },
+    profiles: { planning: profile, implementation: profile, review: profile },
+  };
 }
 
 describe("startDevRun", () => {
@@ -147,6 +172,36 @@ describe("startDevRun", () => {
     expect(opts.workspace).toBe("/tmp/repo");
   });
 
+  it("passes copy mode as a read-only standalone source mount instead of mounting /workspace", async () => {
+    vi.stubEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "");
+    vi.mocked(spawnSync).mockImplementation((_cmd: unknown, args: unknown) => {
+      const argv = args as string[];
+      const stdout = argv[0] === "status" ? "" : "main";
+      return {
+        status: 0,
+        stdout: Buffer.from(stdout),
+        stderr: Buffer.from(""),
+        pid: 1,
+        output: [],
+        signal: null,
+        error: undefined,
+      };
+    });
+
+    await startDevRun({ workspace: "/tmp/repo", task: "task.md", workspaceMode: "copy" });
+
+    const opts = vi.mocked(launchLocalSession).mock.calls[0]![0];
+    expect(opts.publicEnv["AI_IMPLEMENT_WORKSPACE_MODE"]).toBe("copy");
+    expect(opts.workspace).toBeUndefined();
+    expect(opts.extraVolumes).toContain("/tmp/source-copy-root/repo:/source-workspace:ro");
+    expect(vi.mocked(spawnSync)).toHaveBeenCalledWith(
+      "git",
+      ["clone", "--no-local", "--no-hardlinks", "/tmp/repo", "/tmp/source-copy-root/repo"],
+      expect.anything(),
+    );
+  });
+
   it("embeds RunConfigV1 envelope in publicEnv and it decodes correctly", async () => {
     vi.stubEnv("ANTHROPIC_API_KEY", "sk-ant-test");
     vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "");
@@ -175,6 +230,58 @@ describe("startDevRun", () => {
     expect(opts.publicEnv["RUNNER_PHASE"]).toBe("full");
     expect(decodeRunConfig(opts.publicEnv["AI_IMPLEMENT_RUN_CONFIG"]!).runnerPhase).toBe("implementation");
     expect(handle.phase).toBe("full");
+  });
+
+  it("rejects local agent configuration outside full-loop runs", async () => {
+    vi.stubEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "");
+    makeSpawnSyncMock("");
+
+    await expect(
+      startDevRun({ workspace: "/tmp/repo", task: "task.md", phase: "planning", agentConfig: "/outside/agent-config.json" }),
+    ).rejects.toThrow(/--phase full/);
+    expect(launchLocalSession).not.toHaveBeenCalled();
+  });
+
+  it("releases already-acquired unused local session ownership when a later acquire fails before launch", async () => {
+    vi.stubEnv("ANTHROPIC_API_KEY", "");
+    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "");
+    vi.mocked(spawnSync).mockImplementation((_cmd: unknown, args: unknown) => {
+      const argv = args as string[];
+      if (_cmd === "gh") {
+        return { status: 0, stdout: Buffer.from("PRIVATE\n"), stderr: Buffer.from(""), pid: 1, output: [], signal: null, error: undefined };
+      }
+      if (argv[0] === "remote") {
+        return { status: 0, stdout: Buffer.from("git@github.com:owner/repo.git\n"), stderr: Buffer.from(""), pid: 1, output: [], signal: null, error: undefined };
+      }
+      return { status: 0, stdout: Buffer.from("main\n"), stderr: Buffer.from(""), pid: 1, output: [], signal: null, error: undefined };
+    });
+    vi.mocked(loadLocalAgentConfig).mockResolvedValue({
+      resolution: configuredResolution(),
+      references: new Map([
+        ["sub-a", { profileId: "sub-a", authMode: "codex-subscription", kind: "session", canonicalPath: "/outside/a.json" }],
+        ["sub-b", { profileId: "sub-b", authMode: "codex-subscription", kind: "session", canonicalPath: "/outside/b.json" }],
+      ]),
+    });
+    const firstLease = { profileId: "sub-a", used: false };
+    const acquire = vi.fn()
+      .mockResolvedValueOnce(firstLease)
+      .mockRejectedValueOnce(new Error("second busy"));
+    const releaseUnused = vi.fn().mockResolvedValue(undefined);
+    vi.mocked(LocalSessionOwnership).mockImplementation(function () {
+      return {
+      acquire,
+      releaseUnused,
+      } as never;
+    });
+
+    await expect(
+      startDevRun({ workspace: "/tmp/repo", task: "task.md", phase: "full", agentConfig: "/outside/agent-config.json" }),
+    ).rejects.toThrow("second busy");
+
+    expect(launchLocalSession).not.toHaveBeenCalled();
+    expect(releaseUnused).toHaveBeenCalledWith(firstLease, expect.objectContaining({ confirmTermination: expect.any(Function) }));
+    await expect(releaseUnused.mock.calls[0]![1].confirmTermination()).resolves.toBe("confirmed");
   });
 
   it("routes planning-only runs through the validating local planner", async () => {

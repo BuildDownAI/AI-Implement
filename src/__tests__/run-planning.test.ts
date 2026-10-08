@@ -64,7 +64,7 @@ describe("runPlanning", () => {
       return { status: 0, stdout: "", stderr: "" };
     };
     const posted: RunnerResultPayload[] = [];
-    const fakeFetch = async (_u: string, init: RequestInit = {}) => {
+    const fakeFetch = async (_u: unknown, init: RequestInit = {}) => {
       posted.push(JSON.parse(String(init.body)) as RunnerResultPayload);
       return { ok: true, text: async () => "" } as Response;
     };
@@ -91,7 +91,7 @@ describe("runPlanning", () => {
     const posted: RunnerResultPayload[] = [];
     process.env.RUNNER_CALLBACK_URL = "http://orch";
     process.env.RUN_TOKEN = "tok";
-    const fakeFetch = async (_u: string, init: RequestInit = {}) => {
+    const fakeFetch = async (_u: unknown, init: RequestInit = {}) => {
       posted.push(JSON.parse(String(init.body)) as RunnerResultPayload);
       return { ok: true, text: async () => "" } as Response;
     };
@@ -150,8 +150,8 @@ describe("runPlanning", () => {
       runnerCallbackUrl: "https://orch.example/callback",
     });
     const posted: Array<{ url: string; body: unknown }> = [];
-    const fakeFetch = async (u: string, init: RequestInit = {}) => {
-      posted.push({ url: u, body: JSON.parse(String(init.body)) });
+    const fakeFetch = async (u: unknown, init: RequestInit = {}) => {
+      posted.push({ url: String(u), body: JSON.parse(String(init.body)) });
       return { ok: true, text: async () => "" } as Response;
     };
     const result = await runPlanning({
@@ -412,7 +412,7 @@ describe("planning write policy wiring", () => {
         ran = true;
         return { status: 0, stdout: "", stderr: "" };
       },
-      fetchImpl: (async (_u: string, init: RequestInit = {}) => {
+      fetchImpl: (async (_u: unknown, init: RequestInit = {}) => {
         posted.push(JSON.parse(String(init.body)));
         return { ok: true, text: async () => "" } as Response;
       }) as unknown as typeof fetch,
@@ -501,8 +501,8 @@ describe("configured planning (shared prepareConfiguredRun + selected stage exec
   let authRoot: string;
   const posted: Array<{ outcome: string; failureReason?: string }> = [];
   const urls: string[] = [];
-  const fakeFetch = async (u: string, init: RequestInit = {}) => {
-    urls.push(u);
+  const fakeFetch = async (u: unknown, init: RequestInit = {}) => {
+    urls.push(String(u));
     posted.push(JSON.parse(String(init.body)));
     return { ok: true, text: async () => "" } as Response;
   };
@@ -938,6 +938,21 @@ describe("configured planning (shared prepareConfiguredRun + selected stage exec
     expect(r.diagnostics).toBe("Configured planning failed (bootstrap_missing)");
     expect(legacy).not.toHaveBeenCalled();
     expect(argv).toEqual([]);
+  });
+
+  it("runPlanningLocally rejects a structurally forged borrowed configured run even without a snapshot option", async () => {
+    const forged = {
+      snapshot: snapshotFor("claude"),
+      provider: "anthropic",
+      createExecutor: vi.fn(),
+      finish: vi.fn(),
+    };
+    const r = await runPlanningLocally({
+      ...localBase(),
+      prebuiltConfiguredRun: forged as never,
+    });
+    expect(r).toMatchObject({ exitCode: 1, planFound: false, diagnostics: "Configured planning failed (bootstrap_invalid)" });
+    expect(legacy).not.toHaveBeenCalled();
   });
 
   it("runPlanningLocally: a malformed snapshot fails closed with invalid-snapshot diagnostics", async () => {

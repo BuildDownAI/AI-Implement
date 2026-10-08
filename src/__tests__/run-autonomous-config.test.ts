@@ -3,6 +3,7 @@ import { encodeRunConfig } from "../run-config.js";
 import {
   resolveRunnerInputs,
   prepareConfiguredRun,
+  runAutonomousLocally,
   ConfiguredRunError,
   hasConfiguredIntent,
   type ConfiguredRunOptions,
@@ -735,8 +736,8 @@ describe("prepareConfiguredRun", () => {
     expect(client.checkout).toHaveBeenCalledWith({ profileId: "p-rev", authMode: "anthropic-api-key" });
     expect(client.invoke).toHaveBeenCalledTimes(2);
     expect((legacy.invoke as ReturnType<typeof vi.fn>).mock.calls[0][0].model).toBe("claude-review");
-    await run.finish("completed");
-    await run.finish("completed");
+    await expect(run.finish("completed")).resolves.toBe(true);
+    await expect(run.finish("completed")).resolves.toBe(false);
     expect(client.finish).toHaveBeenCalledTimes(1);
     expect(client.finish).toHaveBeenCalledWith("p-rev", "completed");
     expect(client.dispose).toHaveBeenCalledTimes(1);
@@ -755,7 +756,7 @@ describe("prepareConfiguredRun", () => {
       const legacy: LLMExecutor = { invoke: vi.fn().mockRejectedValue(Object.assign(new Error("x"), mark)) };
       const ex = run.createExecutor({ workspaceDir: "/tmp/ws-x", legacy });
       await expect(ex.invoke({ prompt: "p", model: "m", agentStage: "review" })).rejects.toBeTruthy();
-      await run.finish("failed");
+      await expect(run.finish("failed")).resolves.toBe(false);
       expect(client.finish).not.toHaveBeenCalled();
       expect(client.dispose).not.toHaveBeenCalled();
     }
@@ -767,7 +768,7 @@ describe("prepareConfiguredRun", () => {
     const ex = run.createExecutor({ workspaceDir: "/tmp/ws-x", legacy: { invoke: vi.fn().mockResolvedValue({ stdout: "", exitCode: 0, tokensUsed: 0 }) } });
     await ex.invoke({ prompt: "p", model: "m", agentStage: "review" });
     client.states.set("p-rev", "uncertain");
-    await run.finish("failed");
+    await expect(run.finish("failed")).resolves.toBe(false);
     expect(client.finish).not.toHaveBeenCalled();
     expect(client.dispose).not.toHaveBeenCalled();
   });
@@ -777,5 +778,21 @@ describe("prepareConfiguredRun", () => {
     expect(JSON.stringify({ s: run.snapshot, p: run.provider })).not.toContain(SENTINEL_BEARER);
     expect(run.provider).toBe("anthropic");
     expect(EXPECTED.dispatchId).toBe("disp-1");
+  });
+
+  it("rejects a structurally forged borrowed configured run before local work", async () => {
+    const forged = {
+      snapshot: snap,
+      provider: "anthropic",
+      createExecutor: vi.fn(),
+      finish: vi.fn(),
+    };
+    await expect(runAutonomousLocally({
+      workspaceDir: "/tmp/ws-x",
+      issueIdentifier: "AII-1",
+      issueTitle: "t",
+      issueDescription: "d",
+      prebuiltConfiguredRun: forged as never,
+    })).rejects.toMatchObject({ reason: "bootstrap_invalid" });
   });
 });

@@ -1,18 +1,29 @@
 import { spawn, spawnSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { splitLocalRunnerEnv } from "../local-docker.js";
 import type { LocalContainerState } from "../local-docker.js";
 import { encodeRunConfig } from "../run-config.js";
+import type { ResolvedAgentSnapshotV1 } from "../run-config.js";
+import {
+  LocalSessionOwnership,
+  createLocalCredentialPort,
+  loadLocalAgentConfig,
+  type LocalCredentialReference,
+} from "../local/agent-config.js";
 import {
   awaitSessionResult,
   getSessionStatus,
   launchLocalSession,
+  LOCAL_AUTH_BOOTSTRAP_ENV,
+  startLocalAuthBridge,
   stopLocalSession,
   streamSessionLogs,
   streamSessionLogsUntilShellReady,
+  type LocalAuthBridge,
 } from "../local/session.js";
 import { parseTaskFileFromPath } from "./task-file.js";
 import type { ParsedTaskFile } from "./task-file.js";
@@ -21,6 +32,7 @@ import { collectPlanningArtifact } from "./planning-artifacts.js";
 export type { ParsedTaskFile };
 
 export type DevRunPhase = "implementation" | "planning" | "full" | "kg-refresh";
+export type DevWorkspaceMode = "mounted" | "copy";
 
 export interface DevRunOptions {
   /** Absolute or relative path to the local target-repo checkout. */
@@ -47,6 +59,10 @@ export interface DevRunOptions {
   env?: Record<string, string>;
   /** Runner phase. Defaults to implementation. */
   phase?: DevRunPhase;
+  /** Mounted keeps legacy live checkout behavior; copy uses a sanitized read-only source mounted at /source-workspace. */
+  workspaceMode?: DevWorkspaceMode;
+  /** External standalone stage-agent configuration file for trusted local configured runs. */
+  agentConfig?: string;
   /**
    * Path to a pre-fetched tracker-data JSON file — the offline path for phase=kg-refresh.
    * Mounted read-only at /dev-tracker-data.json inside the container; the
@@ -79,6 +95,9 @@ export interface DevRunHandle {
   task: ParsedTaskFile;
   workspace: string;
   phase: DevRunPhase;
+  localAuth?: LocalAuthBridge;
+  sourceWorkspaceCleanup?: () => Promise<void>;
+  workspaceMode?: DevWorkspaceMode;
 }
 
 export interface DevRunResult {
@@ -113,6 +132,185 @@ function detectRepoFromOrigin(workspaceDir: string): { owner: string; repo: stri
 function sanitizeContainerName(identifier: string): string {
   const slug = identifier.toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "");
   return `ai-implement-dev-${slug || "task"}-${Date.now().toString(36)}`;
+}
+
+function runGit(args: string[], cwd: string): string {
+  const result = spawnSync("git", args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+  if (result.status !== 0) {
+    const stderr = result.stderr instanceof Buffer ? result.stderr.toString().trim() : "";
+    throw new Error(`git ${args.join(" ")} failed${stderr ? `: ${stderr}` : ""}`);
+  }
+  return result.stdout.toString().trim();
+}
+
+async function createStandaloneSourceWorkspace(workspace: string): Promise<{ path: string; cleanup: () => Promise<void> }> {
+  const dirty = runGit(["status", "--porcelain"], workspace);
+  if (dirty) {
+    throw new Error("copy workspace mode requires a clean working tree; commit or stash changes before using --workspace-mode copy");
+  }
+  const root = await mkdtemp(join(tmpdir(), "ai-implement-source-"));
+  const dest = join(root, "repo");
+  const clone = spawnSync("git", ["clone", "--no-local", "--no-hardlinks", workspace, dest], {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (clone.status !== 0) {
+    await rm(root, { recursive: true, force: true });
+    const stderr = clone.stderr instanceof Buffer ? clone.stderr.toString().trim() : "";
+    throw new Error(`Failed to create isolated source workspace: ${stderr}`);
+  }
+  runGit(["checkout", "--detach", "HEAD"], dest);
+  await rm(join(dest, ".dev-runs"), { recursive: true, force: true });
+  return { path: dest, cleanup: () => rm(root, { recursive: true, force: true }) };
+}
+
+function snapshotFromLocalConfig(
+  loaded: Awaited<ReturnType<typeof loadLocalAgentConfig>>,
+): ResolvedAgentSnapshotV1 | undefined {
+  if (loaded.resolution.mode !== "configured") return undefined;
+  const resolvedIdentity = JSON.stringify({
+    resolution: loaded.resolution,
+    references: [...loaded.references.values()].map((r) => ({
+      profileId: r.profileId,
+      authMode: r.authMode,
+      kind: r.kind,
+    })),
+  });
+  const hash = createHash("sha256").update(resolvedIdentity).digest("hex").slice(0, 24);
+  const ref = { configRevisionId: `local-${hash}`, revision: 1 };
+  return {
+    version: 1,
+    snapshotId: `local-${hash}`,
+    configRevisions: { orchestratorDefault: ref, project: ref },
+    stages: loaded.resolution.stages,
+    sources: loaded.resolution.sources,
+    profiles: loaded.resolution.profiles,
+  };
+}
+
+function verifyLocalSubscriptionRepoTrust(repository: string): void {
+  const result = spawnSync("gh", ["repo", "view", repository, "--json", "visibility", "-q", ".visibility"], {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const visibility = result.status === 0 ? result.stdout.toString().trim().toUpperCase() : "";
+  if (visibility !== "PRIVATE" && visibility !== "INTERNAL") {
+    throw new Error(
+      "Local subscription configured runs require an independently verified private/internal GitHub repository; " +
+      `could not verify ${repository} with gh repo view.`,
+    );
+  }
+}
+
+function hasSubscriptionReference(references: readonly LocalCredentialReference[]): boolean {
+  return references.some((r) => r.kind === "session");
+}
+
+function assertNoConfiguredEnvOverrides(env: Record<string, string> | undefined): void {
+  if (!env) return;
+  const protectedNames = new Set([
+    "AI_IMPLEMENT_RUN_CONFIG",
+    LOCAL_AUTH_BOOTSTRAP_ENV,
+    "AI_IMPLEMENT_WORKSPACE_MODE",
+    "AI_IMPLEMENT_HOST_UID",
+    "AI_IMPLEMENT_HOST_GID",
+    "RUNNER_PHASE",
+    "ISSUE_ID",
+    "ISSUE_IDENTIFIER",
+    "ISSUE_TITLE",
+    "ISSUE_DESCRIPTION",
+    "GITHUB_OWNER",
+    "GITHUB_REPO",
+    "GITHUB_DEFAULT_BRANCH",
+    "GITHUB_TOKEN",
+    "SESSION_TOKEN",
+    "SESSION_MODE",
+    "MACHINE_NONCE",
+    "NODE_OPTIONS",
+    "NODE_PATH",
+    "ANTHROPIC_API_KEY",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CODEX_API_KEY",
+    "CODEX_HOME",
+  ]);
+  for (const key of Object.keys(env)) {
+    if (protectedNames.has(key) || key.startsWith("AI_IMPLEMENT_MODEL_AUTH_")) {
+      throw new Error(`Configured local runs do not allow opts.env to override protected runner environment: ${key}`);
+    }
+  }
+}
+
+function confirmedContainerNotRunning(containerName: string): "confirmed" | "unknown" {
+  const inspect = spawnSync("docker", ["inspect", "--format", "{{.State.Running}}", containerName], {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (inspect.status === 0 && inspect.stdout.toString().trim() === "false") return "confirmed";
+  if (inspect.status === 0) return "unknown";
+  const listed = spawnSync("docker", ["ps", "-a", "--filter", `name=^/${containerName}$`, "--format", "{{.Names}}"], {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (listed.status === 0 && listed.stdout.toString().trim() === "") return "confirmed";
+  return "unknown";
+}
+
+async function prepareLocalConfiguredAuth(input: {
+  configPath: string;
+  projectKey: string;
+  workspace: string;
+  artifactsDir: string;
+  repositories: readonly string[];
+}): Promise<{ snapshot: ResolvedAgentSnapshotV1 | undefined; env: Record<string, string>; bridge?: LocalAuthBridge; bootstrapDir?: string }> {
+  const configPath = resolve(input.configPath);
+  const ownership = new LocalSessionOwnership({ forbiddenRoots: [input.workspace, input.artifactsDir] });
+  const leases = [];
+  let bridge: LocalAuthBridge | undefined;
+  let dir: string | undefined;
+  try {
+    const loaded = await loadLocalAgentConfig({
+      configPath,
+      projectKey: input.projectKey,
+      forbiddenRoots: [input.workspace, input.artifactsDir],
+    });
+    const snapshot = snapshotFromLocalConfig(loaded);
+    if (!snapshot) return { snapshot: undefined, env: {} };
+    const references = [...loaded.references.values()];
+    if (hasSubscriptionReference(references)) {
+      for (const repository of input.repositories) verifyLocalSubscriptionRepoTrust(repository);
+    }
+    for (const reference of references) {
+      if (reference.kind === "session") leases.push(await ownership.acquire(reference));
+    }
+    const credentialPort = createLocalCredentialPort({
+      references: loaded.references,
+      forbiddenRoots: [input.workspace, input.artifactsDir],
+      ownership,
+    });
+    bridge = await startLocalAuthBridge({
+      snapshotId: snapshot.snapshotId,
+      projectKey: input.projectKey,
+      credentialPort,
+      ownership,
+      leases,
+      references: references as LocalCredentialReference[],
+      trustedRepositories: input.repositories,
+    });
+    dir = await mkdtemp(join(tmpdir(), "ai-implement-local-auth-"));
+    const bootstrapPath = join(dir, "bootstrap.json");
+    await writeFile(bootstrapPath, JSON.stringify(bridge.bootstrap), { mode: 0o600 });
+    await chmod(bootstrapPath, 0o600);
+    return { snapshot, bridge, env: { [LOCAL_AUTH_BOOTSTRAP_ENV]: bootstrapPath }, bootstrapDir: dir };
+  } catch (error) {
+    await bridge?.close().catch(() => undefined);
+    const errors: unknown[] = [];
+    for (const lease of leases) {
+      try {
+        await ownership.releaseUnused(lease, { confirmTermination: async () => "confirmed" });
+      } catch (releaseError) {
+        errors.push(releaseError);
+      }
+    }
+    if (dir) await rm(dir, { recursive: true, force: true }).catch(() => undefined);
+    if (errors.length > 0) throw new AggregateError([error, ...errors], "local configured auth cleanup failed");
+    throw error;
+  }
 }
 
 /**
@@ -213,9 +411,6 @@ export async function startDevRun(opts: DevRunOptions): Promise<DevRunHandle> {
 
   const anthropicApiKey = opts.anthropicApiKey ?? process.env.ANTHROPIC_API_KEY ?? "";
   const claudeOAuthToken = opts.claudeOAuthToken ?? process.env.CLAUDE_CODE_OAUTH_TOKEN ?? "";
-  if (!anthropicApiKey && !claudeOAuthToken) {
-    throw new Error("Neither ANTHROPIC_API_KEY nor CLAUDE_CODE_OAUTH_TOKEN is set");
-  }
   const githubToken =
     opts.githubToken ?? process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN ?? "dev-placeholder-token";
 
@@ -238,6 +433,35 @@ export async function startDevRun(opts: DevRunOptions): Promise<DevRunHandle> {
   const containerName = sanitizeContainerName(task.identifier);
   const runnerPhase = phase === "full" ? "implementation" : phase;
   const entryPhase = phase === "planning" ? "local-planning" : phase;
+  const workspaceMode = opts.workspaceMode ?? "mounted";
+  if (workspaceMode !== "mounted" && workspaceMode !== "copy") {
+    throw new Error("Invalid workspaceMode: expected mounted or copy");
+  }
+  if (opts.agentConfig && phase !== "full") {
+    throw new Error("--agent-config is only supported with --phase full; other phases do not bootstrap the selected stage executors locally");
+  }
+  if (opts.agentConfig) assertNoConfiguredEnvOverrides(opts.env);
+  const projectKey = `${repoOwner}/${repoName}`;
+  const repositories = [`${repoOwner}/${repoName}`];
+  const sourceWorkspace = workspaceMode === "copy" ? await createStandaloneSourceWorkspace(workspace) : undefined;
+  let localConfigured: Awaited<ReturnType<typeof prepareLocalConfiguredAuth>>;
+  try {
+    localConfigured = opts.agentConfig
+      ? await prepareLocalConfiguredAuth({
+          configPath: opts.agentConfig,
+          projectKey,
+          workspace,
+          artifactsDir,
+          repositories,
+        })
+      : { snapshot: undefined, env: {} };
+  } catch (error) {
+    await sourceWorkspace?.cleanup().catch(() => undefined);
+    throw error;
+  }
+  if (!localConfigured.snapshot && !anthropicApiKey && !claudeOAuthToken) {
+    throw new Error("Neither ANTHROPIC_API_KEY nor CLAUDE_CODE_OAUTH_TOKEN is set");
+  }
 
   const runConfig = encodeRunConfig({
     v: 1,
@@ -247,6 +471,7 @@ export async function startDevRun(opts: DevRunOptions): Promise<DevRunHandle> {
     ...(task.maxTurns !== undefined ? { maxTurns: task.maxTurns } : {}),
     ...(task.maxIterations !== undefined ? { maxIterations: task.maxIterations } : {}),
     ...(task.profiles !== undefined ? { profiles: task.profiles } : {}),
+    ...(localConfigured.snapshot ? { agentConfig: localConfigured.snapshot } : {}),
   });
 
   if (phase === "kg-refresh") {
@@ -311,7 +536,7 @@ export async function startDevRun(opts: DevRunOptions): Promise<DevRunHandle> {
 
   const allEnv: Record<string, string> = {
     AI_IMPLEMENT_MODE: "local",
-    AI_IMPLEMENT_WORKSPACE_MODE: "mounted",
+    AI_IMPLEMENT_WORKSPACE_MODE: workspaceMode,
     AI_IMPLEMENT_LOG_LEVEL: logLevel,
     AI_IMPLEMENT_RUN_CONFIG: runConfig,
     ...(opts.untilStep ? { AI_IMPLEMENT_UNTIL_STEP: opts.untilStep } : {}),
@@ -328,22 +553,47 @@ export async function startDevRun(opts: DevRunOptions): Promise<DevRunHandle> {
     MACHINE_NONCE: runId,
     SESSION_MODE: "autonomous",
     RUNNER_PHASE: entryPhase,
+    ...localConfigured.env,
     ...(process.getuid ? { AI_IMPLEMENT_HOST_UID: String(process.getuid()) } : {}),
     ...(process.getgid ? { AI_IMPLEMENT_HOST_GID: String(process.getgid()) } : {}),
-    ...(anthropicApiKey ? { ANTHROPIC_API_KEY: anthropicApiKey } : {}),
-    ...(claudeOAuthToken ? { CLAUDE_CODE_OAUTH_TOKEN: claudeOAuthToken } : {}),
+    ...(!localConfigured.snapshot && anthropicApiKey ? { ANTHROPIC_API_KEY: anthropicApiKey } : {}),
+    ...(!localConfigured.snapshot && claudeOAuthToken ? { CLAUDE_CODE_OAUTH_TOKEN: claudeOAuthToken } : {}),
     ...(opts.env ?? {}),
   };
 
   const { publicEnv, secretEnv } = splitLocalRunnerEnv(allEnv);
 
-  const session = await launchLocalSession({
-    containerName,
-    image,
-    publicEnv,
-    secretEnv,
-    workspace,
-  });
+  let session;
+  try {
+    session = await launchLocalSession({
+      containerName,
+      image,
+      publicEnv,
+      secretEnv,
+      ...(workspaceMode === "mounted" ? { workspace } : {}),
+      ...((workspaceMode === "copy" && sourceWorkspace) || localConfigured.bootstrapDir
+        ? {
+            extraVolumes: [
+              ...(workspaceMode === "copy" && sourceWorkspace ? [`${sourceWorkspace.path}:/source-workspace:ro`] : []),
+              ...(localConfigured.bootstrapDir
+                ? [`${localConfigured.bootstrapDir}:${localConfigured.bootstrapDir}:rw`]
+                : []),
+            ],
+          }
+        : {}),
+    });
+  } catch (error) {
+    const proof = confirmedContainerNotRunning(containerName);
+    await localConfigured.bridge?.close().catch(() => undefined);
+    await localConfigured.bridge?.releaseUnused(async () => proof).catch(() => undefined);
+    if (localConfigured.bootstrapDir) await rm(localConfigured.bootstrapDir, { recursive: true, force: true }).catch(() => undefined);
+    await sourceWorkspace?.cleanup().catch(() => undefined);
+    throw error;
+  }
+  const cleanupLocalTemps = async () => {
+    if (localConfigured.bootstrapDir) await rm(localConfigured.bootstrapDir, { recursive: true, force: true }).catch(() => undefined);
+    await sourceWorkspace?.cleanup().catch(() => undefined);
+  };
 
   return {
     runId,
@@ -354,6 +604,9 @@ export async function startDevRun(opts: DevRunOptions): Promise<DevRunHandle> {
     task,
     workspace,
     phase,
+    ...(localConfigured.bridge ? { localAuth: localConfigured.bridge } : {}),
+    ...(sourceWorkspace || localConfigured.bootstrapDir ? { sourceWorkspaceCleanup: cleanupLocalTemps } : {}),
+    workspaceMode,
   };
 }
 
@@ -424,18 +677,32 @@ export async function collectRunArtifacts(
   });
   await writeFile(join(artifactsDir, "run.log"), logs);
 
+  let artifactWorkspace = workspace;
+  if (handle.workspaceMode === "copy") {
+    artifactWorkspace = join(artifactsDir, "workspace");
+    await rm(artifactWorkspace, { recursive: true, force: true });
+    await mkdir(artifactWorkspace, { recursive: true });
+    const copied = spawnSync("docker", ["cp", `${containerId}:/workspace/.`, artifactWorkspace], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    if (copied.status !== 0) {
+      const stderr = copied.stderr instanceof Buffer ? copied.stderr.toString().trim() : "";
+      await writeFile(join(artifactsDir, "workspace-copy-error.txt"), stderr || "docker cp failed");
+    }
+  }
+
   if (handle.phase === "planning" || handle.phase === "full") {
-    await collectPlanningArtifact(workspace, artifactsDir);
+    await collectPlanningArtifact(artifactWorkspace, artifactsDir);
   }
 
   const diffstatResult = spawnSync("git", ["diff", "--stat"], {
-    cwd: workspace,
+    cwd: artifactWorkspace,
     stdio: ["ignore", "pipe", "pipe"],
   });
   await writeFile(join(artifactsDir, "diffstat.txt"), diffstatResult.stdout?.toString() ?? "");
 
   const fullDiffResult = spawnSync("git", ["diff"], {
-    cwd: workspace,
+    cwd: artifactWorkspace,
     stdio: ["ignore", "pipe", "pipe"],
   });
   await writeFile(join(artifactsDir, "changes.diff"), fullDiffResult.stdout?.toString() ?? "");

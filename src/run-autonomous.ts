@@ -790,7 +790,21 @@ export interface ConfiguredRun {
   readonly provider: "anthropic" | "bedrock";
   createExecutor(args: ConfiguredExecutorArgs): LLMExecutor;
   /** Safe finish/dispose. Holds (does nothing) when a child may be live or a checkpoint is uncertain. */
-  finish(handling: ModelAuthFinishHandling): Promise<void>;
+  finish(handling: ModelAuthFinishHandling): Promise<boolean>;
+}
+
+const REAL_CONFIGURED_RUNS = new WeakSet<ConfiguredRun>();
+
+export function validateBorrowedConfiguredRun(
+  run: ConfiguredRun | undefined,
+  expectedSnapshot?: ResolvedAgentSnapshotV1,
+): ConfiguredRun | undefined {
+  if (!run) return undefined;
+  if (!REAL_CONFIGURED_RUNS.has(run)) throw new ConfiguredRunError("bootstrap_invalid");
+  if (expectedSnapshot && JSON.stringify(run.snapshot) !== JSON.stringify(validateResolvedAgentSnapshot(expectedSnapshot))) {
+    throw new ConfiguredRunError("snapshot_incomplete");
+  }
+  return run;
 }
 
 function isRec(v: unknown): v is Record<string, unknown> {
@@ -979,7 +993,7 @@ function buildConfiguredRun(
   };
 
   const provider = snapshot.stages.implementation.provider === "bedrock" ? "bedrock" : "anthropic";
-  return {
+  const run: ConfiguredRun = {
     snapshot,
     provider,
     createExecutor(args) {
@@ -1018,10 +1032,10 @@ function buildConfiguredRun(
       };
     },
     async finish(handling) {
-      if (finished) return;
+      if (finished) return false;
       finished = true;
       // A live or unconfirmed child keeps its ownership and credential state; nothing is released here.
-      if (held) return;
+      if (held) return false;
       let retained = false;
       for (const profileId of checkedOut) {
         if (client.status(profileId) !== "ready") {
@@ -1035,14 +1049,18 @@ function buildConfiguredRun(
           console.error(`[model-auth] finish failed: ${(err as { category?: string } | null)?.category ?? "unknown"}`);
         }
       }
-      if (retained) return;
+      if (retained) return false;
       try {
         await client.dispose();
+        return true;
       } catch (err) {
         console.error(`[model-auth] dispose failed: ${(err as { category?: string } | null)?.category ?? "unknown"}`);
+        return false;
       }
     },
   };
+  REAL_CONFIGURED_RUNS.add(run);
+  return run;
 }
 
 export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<RunAutonomousResult> {
@@ -1611,6 +1629,10 @@ export interface RunLocalAutonomousOptions {
   llmExecutor?: LLMExecutor;
   /** Opt-in stage configuration for a local run: the resolved snapshot plus a protected credential port. */
   configured?: ConfiguredRunOptions;
+  /** Trusted env source for hosted configured grants; local full-loop owns preparation. */
+  configuredEnv?: NodeJS.ProcessEnv;
+  /** @internal Borrowed configured run owned by the local full-loop wrapper. */
+  prebuiltConfiguredRun?: ConfiguredRun;
   pipeline?: PipelineDefinition;
   runner?: PipelineRunner;
 }
@@ -1667,7 +1689,8 @@ export async function runAutonomousLocally(
 ): Promise<RunLocalAutonomousResult> {
   const workspaceDir = opts.workspaceDir;
   // Same validation and resolved settings as the managed entry; local runs read no envelope.
-  const configured = await prepareConfiguredRun({ env: {}, workspaceDir, options: opts.configured });
+  const configured = validateBorrowedConfiguredRun(opts.prebuiltConfiguredRun, opts.configured?.agentConfig)
+    ?? await prepareConfiguredRun({ env: opts.configuredEnv ?? {}, workspaceDir, options: opts.configured });
   prepareScratchExclusionIfGit(workspaceDir);
   const planningContext = opts.planningContext ?? "";
   const effectiveMaxTurns = opts.maxTurns ?? 50;
@@ -1857,7 +1880,7 @@ export async function runAutonomousLocally(
         console.error(`teardown hook error: ${teardownErr}`);
       }
     }
-    await configured?.finish(runCompleted ? "completed" : "failed");
+    if (!opts.prebuiltConfiguredRun) await configured?.finish(runCompleted ? "completed" : "failed");
   }
 }
 

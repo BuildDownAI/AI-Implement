@@ -106,6 +106,43 @@ Every run prints its artifact directory. By default, complete logs, summaries, a
 run metadata are saved under `.dev-runs/<timestamp>/` in the AI-Implement checkout.
 Planning and full-loop runs also save the assembled plan as `plan.md` there.
 
+### Select local stage configuration
+
+Use `--agent-config` with `--phase full` to select planning, implementation and
+review independently. Keep the JSON configuration and its referenced credential
+files outside both the target checkout and artifact directory. `projectKey` must
+match the checkout's GitHub `owner/repo`. Each stage selects an agent, provider,
+model, account profile and invocation timeout; profiles reference protected local
+files rather than embedding credentials. Credential files must be owned by you,
+mode `0600`, in a directory that other users cannot write.
+
+```bash
+npm run dev:run -- \
+  --workspace "$TARGET_REPO" \
+  --task "$TASK_FILE" \
+  --phase full \
+  --workspace-mode copy \
+  --agent-config "$HOME/ai-implement-profiles/agent-config.json"
+```
+
+`--workspace-mode copy` runs against an isolated source copy and preserves the
+original checkout. Use `--workspace-mode mounted` explicitly when you want the
+runner to edit the developer checkout. The default remains mounted. Configured
+runs use one frozen snapshot and one credential lifecycle across all three
+stages; stage settings take precedence over legacy model environment and task
+frontmatter. Without external configuration, the existing Claude credential and
+model behavior remains available.
+
+API profiles use `openai-api-key` or `anthropic-api-key` and an absolute
+`credentialPath`. Subscription profiles use `codex-subscription` or
+`claude-subscription`, an absolute `sessionPath`, `sessionSource: "local-login"`
+and `trustedPrivateTesting: true`. Subscription runs also require `gh repo view <owner/repo> --json visibility`
+to independently verify a private or internal GitHub repository. Authenticate the
+host GitHub CLI first; the configuration flag alone does not establish trust.
+Use a dedicated independently signed-in testing profile. A failed or cancelled
+run retains ownership when refreshed state or container termination cannot be
+confirmed; do not delete its lock to start a competing run.
+
 ### Exercise planning and implementation separately
 
 Use `--phase` to choose the test surface:
