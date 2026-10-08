@@ -862,3 +862,13 @@ export function toSafeModelAuthDiagnostic(input: {
     ...(input.category !== undefined ? { category: input.category } : {}),
   };
 }
+
+/** Trusted launcher values the bootstrap must match; the grant never supplies its own. */
+export const MODEL_AUTH_ENV = {
+  dispatchId: "AI_IMPLEMENT_MODEL_AUTH_DISPATCH_ID",
+  projectKey: "AI_IMPLEMENT_MODEL_AUTH_PROJECT_KEY",
+  backend: "AI_IMPLEMENT_MODEL_AUTH_BACKEND",
+  baseUrl: "AI_IMPLEMENT_MODEL_AUTH_URL",
+  protectionKey: "AI_IMPLEMENT_MODEL_AUTH_PROTECTION_KEY",
+  authRoot: "AI_IMPLEMENT_MODEL_AUTH_ROOT",
+} as const;

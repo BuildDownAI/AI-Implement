@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import crypto from "node:crypto";
 import {
   createMachine,
   getMachine,
@@ -18,9 +19,12 @@ import {
   fetchMachineLogs,
   updateMachineMetadata,
   readMachineExit,
+  ProtectedBootstrapError,
 } from "../fly-machines.js";
-import type { SessionMachineInput } from "../fly-machines.js";
-import { encodeRunConfig, decodeRunConfig, type RunConfigV1 } from "../run-config.js";
+import type { SessionMachineInput, CreateMachineOpts, ProtectedBootstrapSecretMetadata } from "../fly-machines.js";
+import { encodeRunConfig, decodeRunConfig, decodeTrustedRunConfig, type RunConfigV1 } from "../run-config.js";
+import { sealModelAuthBootstrap } from "../model-auth-seal.js";
+import { MODEL_AUTH_ENV } from "../model-auth-contract.js";
 
 const TOKEN = "fly-test-token";
 const APP = "ai-implement-sessions-test";
@@ -1153,5 +1157,215 @@ describe("clearMachineEnv", () => {
       .mockResolvedValueOnce({ ok: true, json: async () => mockMachine } as Response)
       .mockResolvedValueOnce({ ok: false, status: 500, text: async () => "boom" } as Response);
     await expect(clearMachineEnv(TOKEN, APP, "m")).rejects.toThrow("(500)");
+  });
+});
+
+describe("buildSessionMachineConfig — protected model bootstrap (AII-500)", () => {
+  const S_ANTHROPIC = "SENTINEL-anthropic-key-0001";
+  const S_OAUTH = "SENTINEL-oauth-token-0002";
+  const S_BEARER = "SENTINELbearer0123456789abcdefghijklmnop";
+  const S_SESSION = "SENTINEL-session-state-0003";
+  const protectionKey = crypto.randomBytes(32);
+
+  const baseInput: SessionMachineInput = {
+    image: "ghcr.io/builddownai/ai-implement-runner:latest",
+    issueId: "uuid-123",
+    issueIdentifier: "ENG-42",
+    issueTitle: "Add feature X",
+    issueDescription: "Implement the feature",
+    owner: "test-org",
+    repo: "test-repo",
+    defaultBranch: "main",
+    githubToken: "ghs_test_token",
+    sessionToken: "tok_abc",
+    machineNonce: "nonce_def",
+    dispatchId: "disp-1",
+  };
+
+  const sealed = sealModelAuthBootstrap({
+    grant: {
+      version: 1,
+      audience: "model-auth",
+      grantId: "grant-1",
+      dispatchId: "disp-1",
+      projectKey: "proj",
+      snapshotId: "snap-1",
+      backend: "fly",
+      expiresAt: 1_700_000_060_000,
+      bearer: S_BEARER,
+      bindings: [{ stage: "implementation", profileId: "sub", profileRevision: 1, authMode: "codex-subscription", ownerGeneration: 3 }],
+    },
+    protectionKey: { ref: MODEL_AUTH_ENV.protectionKey, key: protectionKey },
+  });
+  const runConfig: RunConfigV1 = {
+    v: 1,
+    issue: { id: "uuid-123", identifier: "ENG-42", title: "t", description: "d" },
+  };
+  const goodSecret = { name: MODEL_AUTH_ENV.protectionKey, available: true, version: 7 };
+  const protectedInput = (over: Partial<SessionMachineInput> = {}): SessionMachineInput => ({
+    ...baseInput,
+    protectedModelBootstrap: { sealed, projectKey: "proj", runConfig, secret: goodSecret },
+    ...over,
+  });
+  const category = (input: SessionMachineInput) => {
+    try {
+      buildSessionMachineConfig(input);
+    } catch (e) {
+      expect(e).toBeInstanceOf(ProtectedBootstrapError);
+      return (e as ProtectedBootstrapError).category;
+    }
+    return undefined;
+  };
+
+  it("carries the sealed envelope and safe dispatch fields only", () => {
+    const result = buildSessionMachineConfig(protectedInput());
+    const env = result.config.env!;
+    expect(env.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
+    expect(env[MODEL_AUTH_ENV.dispatchId]).toBe("disp-1");
+    expect(env[MODEL_AUTH_ENV.projectKey]).toBe("proj");
+    expect(env[MODEL_AUTH_ENV.backend]).toBe("fly");
+    expect(env[MODEL_AUTH_ENV.protectionKey]).toBeUndefined();
+    expect(decodeTrustedRunConfig(env.AI_IMPLEMENT_RUN_CONFIG).credentials?.modelAuthGrant).toEqual(sealed);
+    // Non-secret fields and the target-repo boot token are unchanged.
+    expect(env.GITHUB_TOKEN).toBe("ghs_test_token");
+    expect(env.ISSUE_IDENTIFIER).toBe("ENG-42");
+    expect(result.min_secrets_version).toBe(7);
+  });
+
+  it("raises min_secrets_version to the larger of verified and requested", () => {
+    expect(buildSessionMachineConfig(protectedInput({ minSecretsVersion: 9 })).min_secrets_version).toBe(9);
+    expect(buildSessionMachineConfig(protectedInput({ minSecretsVersion: 2 })).min_secrets_version).toBe(7);
+  });
+
+  it("never serializes raw credentials, bearer, session data or the protection key", () => {
+    const combos: Partial<SessionMachineInput>[] = [
+      {},
+      { teamKey: "eng", teamSecretNames: ["ENG_DB", "OPS_X", "GLOBAL"], allTeamKeys: ["eng", "ops"] },
+      { teamKey: "eng", teamSecretNames: ["ENG_DB", "OPS_X"], allTeamKeys: ["eng", "ops"], flyProcessLevelSecrets: true },
+      { flyProcessLevelSecrets: true },
+      { extraEnv: { SAFE_VAR: "ok" } },
+    ];
+    for (const combo of combos) {
+      const json = JSON.stringify(buildSessionMachineConfig(protectedInput(combo)));
+      for (const needle of [
+        S_ANTHROPIC,
+        S_OAUTH,
+        S_BEARER,
+        S_SESSION,
+        protectionKey.toString("base64"),
+        protectionKey.toString("base64url"),
+        protectionKey.toString("hex"),
+      ]) {
+        expect(json).not.toContain(needle);
+      }
+      // The bearer must also be absent from the decoded envelope, which holds only ciphertext.
+      const env = (JSON.parse(json) as { config: { env: Record<string, string> } }).config.env;
+      expect(Buffer.from(env.AI_IMPLEMENT_RUN_CONFIG, "base64").toString("utf8")).not.toContain(S_BEARER);
+    }
+  });
+
+  it("does not use process-level secrets for protection, keeping the team-secret filter", () => {
+    const result = buildSessionMachineConfig(
+      protectedInput({ teamKey: "eng", teamSecretNames: ["ENG_DB", "OPS_X"], allTeamKeys: ["eng", "ops"], flyProcessLevelSecrets: true }),
+    );
+    expect(result.config.processes).toBeUndefined();
+    expect(result.config.env!.AI_IMPLEMENT_TEAM_SECRET_PREFIX).toBe("ENG_");
+    expect(result.config.env!.AI_IMPLEMENT_FOREIGN_SECRET_NAMES).toBe("OPS_X");
+  });
+
+  it("rejects simultaneous legacy raw credentials", () => {
+    expect(category(protectedInput({ anthropicApiKey: S_ANTHROPIC }))).toBe("protected_legacy_credentials_rejected");
+    expect(category(protectedInput({ claudeOAuthToken: S_OAUTH }))).toBe("protected_legacy_credentials_rejected");
+  });
+
+  it("rejects reserved extraEnv names without echoing values", () => {
+    for (const name of [
+      "AI_IMPLEMENT_RUN_CONFIG",
+      MODEL_AUTH_ENV.protectionKey,
+      MODEL_AUTH_ENV.dispatchId,
+      "AI_IMPLEMENT_MODEL_AUTH_ANYTHING",
+      "ANTHROPIC_API_KEY",
+      "CLAUDE_CODE_OAUTH_TOKEN",
+      "OPENAI_API_KEY",
+      "AWS_SECRET_ACCESS_KEY",
+      "CLAUDE_CONFIG_DIR",
+    ]) {
+      let message = "";
+      try {
+        buildSessionMachineConfig(protectedInput({ extraEnv: { [name]: S_ANTHROPIC } }));
+      } catch (e) {
+        message = (e as Error).message;
+      }
+      expect(message).toContain("protected_reserved_env_collision");
+      expect(message).not.toContain(S_ANTHROPIC);
+      expect(message).not.toContain(name);
+    }
+  });
+
+  it("fails before launch for missing, unavailable, partial, version-less or unsafe secret metadata", () => {
+    const withSecret = (secret: ProtectedBootstrapSecretMetadata | undefined) =>
+      protectedInput({ protectedModelBootstrap: { sealed, projectKey: "proj", runConfig, secret: secret as never } });
+    const cases: [ProtectedBootstrapSecretMetadata | undefined, string][] = [
+      [undefined, "protected_secret_unavailable"],
+      [{}, "protected_secret_unavailable"],
+      [{ name: goodSecret.name, available: false, version: 7 }, "protected_secret_unavailable"],
+      [{ name: goodSecret.name, available: true }, "protected_secret_partial"],
+      [{ name: goodSecret.name, version: 7 }, "protected_secret_partial"],
+      [{ available: true, version: 7 }, "protected_secret_partial"],
+      [{ name: goodSecret.name, available: true, version: 0 }, "protected_secret_partial"],
+      [{ name: goodSecret.name, available: true, version: 1.5 }, "protected_secret_partial"],
+      [{ name: "SESSION_STATE_KEY", available: true, version: 7 }, "protected_secret_reference_unsafe"],
+    ];
+    for (const [secret, expected] of cases) {
+      const launch = vi.fn();
+      let opts: CreateMachineOpts | undefined;
+      try {
+        opts = buildSessionMachineConfig(withSecret(secret));
+        launch(opts);
+      } catch (e) {
+        expect((e as ProtectedBootstrapError).category).toBe(expected);
+      }
+      expect(opts).toBeUndefined();
+      expect(launch).not.toHaveBeenCalled();
+    }
+  });
+
+  it("rejects a malformed sealed envelope, mismatched dispatch, or an envelope that already holds a grant", () => {
+    const pb = { sealed, projectKey: "proj", runConfig, secret: goodSecret };
+    expect(category(protectedInput({ protectedModelBootstrap: { ...pb, sealed: { ...sealed, tag: "x" } } }))).toBe("protected_input_invalid");
+    expect(category(protectedInput({ dispatchId: "disp-other" }))).toBe("protected_input_invalid");
+    expect(category(protectedInput({ protectedModelBootstrap: { ...pb, projectKey: " " } }))).toBe("protected_input_invalid");
+    expect(
+      category(
+        protectedInput({
+          protectedModelBootstrap: { ...pb, runConfig: { ...runConfig, credentials: { version: 1, modelAuthGrant: sealed } } },
+        }),
+      ),
+    ).toBe("protected_input_invalid");
+  });
+
+  describe("legacy compatibility (no opt-in)", () => {
+    it("still passes plaintext Claude credentials and merges extraEnv last", () => {
+      const env = buildSessionMachineConfig({
+        ...baseInput,
+        anthropicApiKey: S_ANTHROPIC,
+        claudeOAuthToken: S_OAUTH,
+        extraEnv: { ANTHROPIC_API_KEY: "override" },
+      }).config.env!;
+      expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe(S_OAUTH);
+      expect(env.ANTHROPIC_API_KEY).toBe("override");
+      expect(env[MODEL_AUTH_ENV.dispatchId]).toBeUndefined();
+    });
+
+    it("keeps team-secret prefix and foreign-name behaviour and the process-level branch", () => {
+      const team = { teamKey: "eng", teamSecretNames: ["ENG_DB", "OPS_X"], allTeamKeys: ["eng", "ops"] };
+      const env = buildSessionMachineConfig({ ...baseInput, ...team }).config.env!;
+      expect(env.AI_IMPLEMENT_TEAM_SECRET_PREFIX).toBe("ENG_");
+      expect(env.AI_IMPLEMENT_FOREIGN_SECRET_NAMES).toBe("OPS_X");
+      const proc = buildSessionMachineConfig({ ...baseInput, ...team, flyProcessLevelSecrets: true });
+      expect(proc.config.processes?.[0].ignore_app_secrets).toBe(true);
+      expect(proc.min_secrets_version).toBeUndefined();
+    });
   });
 });

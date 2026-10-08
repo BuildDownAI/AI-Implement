@@ -1,6 +1,21 @@
 import crypto from "node:crypto";
 
 import {
+  MODEL_AUTH_BACKENDS,
+  MODEL_AUTH_ENV,
+  parseSealedModelAuthBootstrap,
+  type SealedModelAuthBootstrapV1,
+} from "./model-auth-contract.js";
+import { isSafeProtectionKeyRef } from "./model-auth-seal.js";
+import {
+  MODEL_CREDENTIAL_KEYS,
+  MODEL_SESSION_KEYS,
+  PROTECTED_BOOTSTRAP_KEYS,
+  PROTECTED_BOOTSTRAP_PREFIXES,
+} from "./pipeline/process-env.js";
+import { encodeTrustedRunConfig, type RunConfigV1 } from "./run-config.js";
+
+import {
   DURABLE_RUNNER_DISPATCH_ID_KEY,
   DURABLE_RUNNER_PIPELINE_KEY,
   DURABLE_RUNNER_PURPOSE_KEY,
@@ -447,6 +462,91 @@ export function generateMachineNonce(): string {
 
 // ── Session Machine Builder ──────────────────────────────────────────────────
 
+/**
+ * Verified state of the platform app secret that carries the protection key. The caller
+ * resolves it from the secrets listing; the builder never sees the key bytes.
+ */
+export interface ProtectedBootstrapSecretMetadata {
+  /** Must be the canonical bootstrap-key secret name (`MODEL_AUTH_ENV.protectionKey`). */
+  name?: string;
+  available?: boolean;
+  /** Positive Fly secrets version at which the secret is verified present. */
+  version?: number;
+}
+
+/** Explicit opt-in for sealed model-auth delivery (AII-500). Absent means legacy behaviour. */
+export interface ProtectedModelBootstrapInput {
+  /** Output of `sealModelAuthBootstrap`; re-validated here. */
+  sealed: SealedModelAuthBootstrapV1;
+  projectKey: string;
+  /** Run envelope without a `modelAuthGrant`; the builder embeds the sealed blob and owns `AI_IMPLEMENT_RUN_CONFIG`. */
+  runConfig: RunConfigV1;
+  secret: ProtectedBootstrapSecretMetadata;
+}
+
+export type ProtectedBootstrapErrorCategory =
+  | "protected_input_invalid"
+  | "protected_legacy_credentials_rejected"
+  | "protected_reserved_env_collision"
+  | "protected_secret_unavailable"
+  | "protected_secret_partial"
+  | "protected_secret_reference_unsafe";
+
+/** Value-free: carries a category only, never env names, values or key material. */
+export class ProtectedBootstrapError extends Error {
+  readonly category: ProtectedBootstrapErrorCategory;
+  constructor(category: ProtectedBootstrapErrorCategory) {
+    super(`protected model bootstrap rejected: ${category}`);
+    this.name = "ProtectedBootstrapError";
+    this.category = category;
+  }
+}
+
+function isReservedModelEnvName(name: string): boolean {
+  const upper = name.toUpperCase();
+  return (
+    (PROTECTED_BOOTSTRAP_KEYS as readonly string[]).includes(upper) ||
+    (MODEL_CREDENTIAL_KEYS as readonly string[]).includes(upper) ||
+    (MODEL_SESSION_KEYS as readonly string[]).includes(upper) ||
+    PROTECTED_BOOTSTRAP_PREFIXES.some((p) => upper.startsWith(p))
+  );
+}
+
+/** Validates everything before any env is assembled; returns the verified secrets version. */
+function validateProtectedInput(input: SessionMachineInput, p: ProtectedModelBootstrapInput): number {
+  if (input.anthropicApiKey || input.claudeOAuthToken) {
+    throw new ProtectedBootstrapError("protected_legacy_credentials_rejected");
+  }
+  if (input.extraEnv && Object.keys(input.extraEnv).some(isReservedModelEnvName)) {
+    throw new ProtectedBootstrapError("protected_reserved_env_collision");
+  }
+  const sealed = parseSealedModelAuthBootstrap(p?.sealed);
+  if (!sealed.ok || typeof p.projectKey !== "string" || !p.projectKey.trim() || !p.runConfig) {
+    throw new ProtectedBootstrapError("protected_input_invalid");
+  }
+  if (input.dispatchId !== undefined && input.dispatchId !== sealed.value.dispatchId) {
+    throw new ProtectedBootstrapError("protected_input_invalid");
+  }
+  if (p.runConfig.credentials?.modelAuthGrant !== undefined) {
+    throw new ProtectedBootstrapError("protected_input_invalid");
+  }
+  const secret = p.secret;
+  if (!secret || (secret.name === undefined && secret.available === undefined && secret.version === undefined)) {
+    throw new ProtectedBootstrapError("protected_secret_unavailable");
+  }
+  if (secret.name === undefined || secret.available === undefined || secret.version === undefined) {
+    throw new ProtectedBootstrapError("protected_secret_partial");
+  }
+  if (!isSafeProtectionKeyRef(secret.name)) {
+    throw new ProtectedBootstrapError("protected_secret_reference_unsafe");
+  }
+  if (secret.available !== true) throw new ProtectedBootstrapError("protected_secret_unavailable");
+  if (!Number.isInteger(secret.version) || secret.version < 1) {
+    throw new ProtectedBootstrapError("protected_secret_partial");
+  }
+  return secret.version;
+}
+
 export interface SessionMachineInput {
   image: string;
   issueId: string;
@@ -487,9 +587,19 @@ export interface SessionMachineInput {
   pipeline?: string;
   /** Stamped as `dispatch_id` metadata when set; a retried dispatch step compares it to find its own run. */
   dispatchId?: string;
+  /**
+   * Opt-in sealed model-auth delivery. When set the builder carries only the sealed envelope and safe
+   * dispatch fields, rejects legacy raw credentials and reserved `extraEnv` names, and throws before a
+   * Machine can be created if the platform-secret protection is not verified. No plaintext fallback.
+   * The protection key reaches the Machine through the app-wide platform secret, never this config.
+   */
+  protectedModelBootstrap?: ProtectedModelBootstrapInput;
 }
 
 export function buildSessionMachineConfig(input: SessionMachineInput): CreateMachineOpts {
+  const protectedBootstrap = input.protectedModelBootstrap;
+  const verifiedSecretsVersion = protectedBootstrap ? validateProtectedInput(input, protectedBootstrap) : undefined;
+
   const env: Record<string, string> = {
     ISSUE_ID: input.issueId,
     ISSUE_IDENTIFIER: input.issueIdentifier,
@@ -522,6 +632,18 @@ export function buildSessionMachineConfig(input: SessionMachineInput): CreateMac
   }
   if (input.extraEnv) {
     Object.assign(env, input.extraEnv);
+  }
+  if (protectedBootstrap) {
+    env[MODEL_AUTH_ENV.dispatchId] = protectedBootstrap.sealed.dispatchId;
+    env[MODEL_AUTH_ENV.projectKey] = protectedBootstrap.projectKey.trim();
+    env[MODEL_AUTH_ENV.backend] = MODEL_AUTH_BACKENDS.find((b) => b === protectedBootstrap.sealed.backend)!;
+    env.AI_IMPLEMENT_RUN_CONFIG = encodeTrustedRunConfig({
+      ...protectedBootstrap.runConfig,
+      credentials: {
+        ...(protectedBootstrap.runConfig.credentials ?? { version: 1 }),
+        modelAuthGrant: protectedBootstrap.sealed,
+      },
+    });
   }
 
   const machineConfig: MachineConfig = {
@@ -572,7 +694,9 @@ export function buildSessionMachineConfig(input: SessionMachineInput): CreateMac
   // Note: a falsy teamKey (e.g. Jira issues with an empty scopeKey) falls through both branches,
   // so the machine receives all classic app secrets regardless of the flag. This matches flag-off
   // behaviour for the same case and is not a regression, but the flag does not close this gap.
-  if (input.flyProcessLevelSecrets && input.teamKey && input.teamSecretNames !== undefined) {
+  // Protected mode never uses process-level secrets: ignore_app_secrets would withhold the protection
+  // key, and the remap is unsupported for classic secrets. It uses the entrypoint-filter branch.
+  if (!protectedBootstrap && input.flyProcessLevelSecrets && input.teamKey && input.teamSecretNames !== undefined) {
     const ownPrefix = `${input.teamKey.toUpperCase()}_`;
     const allPrefixes = (input.allTeamKeys ?? []).map((k) => `${k.toUpperCase()}_`);
     const processSecrets: MachineSecret[] = [];
@@ -613,7 +737,10 @@ export function buildSessionMachineConfig(input: SessionMachineInput): CreateMac
   return {
     name: input.machineName ?? `session-${input.issueIdentifier.toLowerCase().replace(/[^a-z0-9-]/g, "-")}`,
     region: input.region ?? "iad",
-    min_secrets_version: input.minSecretsVersion,
+    min_secrets_version:
+      verifiedSecretsVersion !== undefined
+        ? Math.max(verifiedSecretsVersion, input.minSecretsVersion ?? 0)
+        : input.minSecretsVersion,
     config: machineConfig,
   };
 }
