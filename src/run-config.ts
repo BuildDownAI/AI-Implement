@@ -104,7 +104,8 @@ export interface RunConfigV1 {
    *  until a readiness gate rejects configured work on runners lacking support. */
   agentConfig?: ResolvedAgentSnapshotV1;
   /** Private credential namespace (AII-981), validated independently of `agentConfig`. Only the
-   *  trusted transport helpers read or write it; absent = legacy envelope. No writer sets it yet. */
+   *  trusted transport helpers read or write it; absent = legacy envelope. The protected Fly bootstrap path of
+   *  `buildSessionMachineConfig` (src/fly-machines.ts) writes `modelAuthGrant` only. */
   credentials?: RunCredentialsV1;
 }
 
