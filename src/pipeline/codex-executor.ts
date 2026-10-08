@@ -74,6 +74,21 @@ function authIdentity(auth: Record<string, unknown>): string | null {
   return parts.every((p) => p === null) ? null : JSON.stringify(parts);
 }
 
+/**
+ * Defense in depth. Planning has its own native argv and tool surface (app-server, read-only sandbox, host
+ * tools confined to `ai-output/comments`); `createStageExecutor` always supplies the protocol driver for it.
+ * An executor reached for planning without one would fall back to the exec path, whose filesystem profile
+ * bounds writes only and cannot disable `unified_exec`, so it throws before any auth checkout or spawn rather
+ * than run planning with implementation write authority.
+ */
+export class CodexPlanningPolicyUnprovenError extends Error {
+  readonly code = "CODEX_PLANNING_POLICY_UNPROVEN";
+  constructor() {
+    super("Codex planning is refused: its restricted-write, no-command policy is not enforceable on the pinned CLI");
+    this.name = "CodexPlanningPolicyUnprovenError";
+  }
+}
+
 export interface CodexExecutorOptions {
   /** Auth client whose `invoke` supplies the isolated, selected environment and checkpoints afterward. */
   auth: Pick<ModelAuthClient, "invoke">;
@@ -85,6 +100,8 @@ export interface CodexExecutorOptions {
   cancelSignal?: AbortSignal;
   spawnImpl?: typeof spawn;
   sleepImpl?: (ms: number) => Promise<void>;
+  /** Monotonic-enough clock for the invocation deadline; tests inject a deterministic one. */
+  nowImpl?: () => number;
   /** Bounded wait for exit after SIGTERM before escalating to SIGKILL. */
   termWaitMs?: number;
   /** Bounded wait for exit after SIGKILL before declaring the child unterminated. */
@@ -246,6 +263,7 @@ export class CodexExecutor implements LLMExecutor {
   private held: CodexRecoveryRequiredError | null = null;
   private readonly spawnImpl: typeof spawn;
   private readonly sleepImpl: (ms: number) => Promise<void>;
+  private readonly now: () => number;
 
   constructor(
     private readonly workspaceDir: string,
@@ -253,11 +271,15 @@ export class CodexExecutor implements LLMExecutor {
   ) {
     this.spawnImpl = options.spawnImpl ?? spawn;
     this.sleepImpl = options.sleepImpl ?? defaultSleep;
+    this.now = options.nowImpl ?? Date.now;
   }
 
   async invoke(params: InvokeParams): Promise<LLMResult> {
     if (this.held) throw new CodexRecoveryRequiredError("held");
-    const startedAt = Date.now();
+    if (params.agentStage === "planning" && !this.options.protocolDriver) throw new CodexPlanningPolicyUnprovenError();
+    const startedAt = this.now();
+    // `invocationTimeoutMs` bounds the whole invocation (every attempt and backoff), not each spawn.
+    const deadlineAt = params.invocationTimeoutMs != null ? startedAt + params.invocationTimeoutMs : null;
     const expectsStructuredOutput = params.expectsStructuredOutput ?? false;
     const stage = params.stage ?? "unknown";
     let attempt = 1;
@@ -266,19 +288,24 @@ export class CodexExecutor implements LLMExecutor {
 
     for (;;) {
       let outcome: Attempt;
-      try {
-        outcome = await this.invokeOnce(params);
-      } catch (err) {
-        if (isSpawnFailure(err)) {
-          const failure = classifySpawnError(err, { stage, attempt });
-          const decision = this.retryDecision(params, failure, attempt, err.sawUnsafe, totalSleptMs);
-          if (!decision.retry) throw Object.assign(err, { failure });
-          totalSleptMs += decision.backoffMs;
-          await this.sleepImpl(decision.backoffMs);
-          attempt++;
-          continue;
+      // Recheck at loop entry before EVERY spawn: a backoff, scheduler delay or earlier attempt may have
+      // consumed the budget. An expired budget never reaches auth acquisition or spawn.
+      if (deadlineAt !== null && this.now() >= deadlineAt) {
+        outcome = expiredAttempt();
+      } else {
+        try {
+          outcome = await this.invokeOnce(params, deadlineAt);
+        } catch (err) {
+          if (isSpawnFailure(err)) {
+            const failure = classifySpawnError(err, { stage, attempt });
+            const decision = this.retryDecision(params, failure, attempt, err.sawUnsafe, totalSleptMs);
+            if (!decision.retry) throw Object.assign(err, { failure });
+            totalSleptMs += await this.boundedSleep(decision.backoffMs, deadlineAt);
+            attempt++;
+            continue;
+          }
+          throw err;
         }
-        throw err;
       }
 
       const merged = this.mergeTelemetry(carried, outcome.result.telemetry, startedAt);
@@ -302,10 +329,16 @@ export class CodexExecutor implements LLMExecutor {
       const failure = this.classify(settled, stage, attempt, expectsStructuredOutput);
       const decision = this.retryDecision(params, failure, attempt, outcome.sawUnsafe, totalSleptMs);
       if (!decision.retry) return { ...settled, failure };
-      totalSleptMs += decision.backoffMs;
-      await this.sleepImpl(decision.backoffMs);
+      totalSleptMs += await this.boundedSleep(decision.backoffMs, deadlineAt);
       attempt++;
     }
+  }
+
+  /** Sleeps at most the remaining invocation budget; returns the time actually requested. */
+  private async boundedSleep(backoffMs: number, deadlineAt: number | null): Promise<number> {
+    const ms = deadlineAt === null ? backoffMs : Math.max(0, Math.min(backoffMs, deadlineAt - this.now()));
+    await this.sleepImpl(ms);
+    return ms;
   }
 
   private classify(result: LLMResult, stage: string, attempt: number, expectsStructuredOutput: boolean): FailureRecord {
@@ -330,7 +363,7 @@ export class CodexExecutor implements LLMExecutor {
   }
 
   private stopFailure(kind: "timeout" | "cancel", result: LLMResult, stage: string, attempt: number, startedAt: number): FailureRecord {
-    const base = classifyLlmResult(result, { stage, attempt, expectsStructuredOutput: false, elapsedMs: Date.now() - startedAt });
+    const base = classifyLlmResult(result, { stage, attempt, expectsStructuredOutput: false, elapsedMs: this.now() - startedAt });
     if (kind === "timeout") {
       return { ...base, category: "crash", code: "INVOCATION_TIMEOUT", retryable: false, message: "Codex invocation exceeded its time limit" };
     }
@@ -356,7 +389,7 @@ export class CodexExecutor implements LLMExecutor {
 
   private mergeTelemetry(prev: RunTelemetry | undefined, latest: RunTelemetry | undefined, startedAt: number): RunTelemetry | undefined {
     if (!latest) return prev;
-    const durationMs = Date.now() - startedAt;
+    const durationMs = this.now() - startedAt;
     if (!prev) return { ...latest, durationMs };
     return {
       ...latest,
@@ -370,7 +403,7 @@ export class CodexExecutor implements LLMExecutor {
   }
 
   /** One spawn inside one `ModelAuthClient.invoke`, so authentication is checkpointed even on failure. */
-  private async invokeOnce(params: InvokeParams): Promise<Attempt> {
+  private async invokeOnce(params: InvokeParams, deadlineAt: number | null): Promise<Attempt> {
     let signalRecovery: (err: CodexRecoveryRequiredError) => void = () => {};
     const recovery = new Promise<never>((_, reject) => (signalRecovery = reject));
     try {
@@ -381,7 +414,7 @@ export class CodexExecutor implements LLMExecutor {
       // recovery-required error to the caller.
       const invocation = this.options.auth.invoke(this.options.profileId, async (selected) => {
         try {
-          return await this.runChild(params, selected.env);
+          return await this.runChild(params, selected.env, deadlineAt);
         } catch (err) {
           const held = this.held;
           if (held && (held.reason === "child_not_terminated" || held.reason === "auth_sync_failed")) {
@@ -402,6 +435,22 @@ export class CodexExecutor implements LLMExecutor {
     }
   }
 
+  /**
+   * Sandbox argv from a trusted policy keyed on the fixed `agentStage` only, never on repository
+   * config or caller-supplied flags. An absent stage keeps the legacy `builtinTools` mapping.
+   * Planning never reaches here: it runs on the app-server path with its own argv.
+   */
+  private sandboxArgs(params: InvokeParams): string[] {
+    switch (params.agentStage) {
+      case "review":
+        return ["--sandbox", "read-only"];
+      case "implementation":
+        return ["--sandbox", "workspace-write"];
+      default:
+        return ["--sandbox", params.builtinTools ? "read-only" : "workspace-write"];
+    }
+  }
+
   private buildArgs(params: InvokeParams, schemaPath: string | null): string[] {
     // Pinned selection is placed on argv, after the ignore flags, so user or project config
     // cannot change it. No Claude-only flag and no bypass or approve-all flag is ever passed.
@@ -414,8 +463,7 @@ export class CodexExecutor implements LLMExecutor {
       params.model,
       "-c",
       `model_provider="${CODEX_PROVIDER}"`,
-      "--sandbox",
-      params.builtinTools ? "read-only" : "workspace-write",
+      ...this.sandboxArgs(params),
     ];
     if (schemaPath) args.push("--output-schema", schemaPath);
     // `-` reads the prompt from stdin: no argv size ceiling and nothing sensitive on the command line.
@@ -554,7 +602,7 @@ export class CodexExecutor implements LLMExecutor {
     }
   }
 
-  private async runChild(params: InvokeParams, selectedEnv: Record<string, string>): Promise<Attempt> {
+  private async runChild(params: InvokeParams, selectedEnv: Record<string, string>, deadlineAt: number | null): Promise<Attempt> {
     let env = selectedEnv;
     let view: AppServerView | null = null;
     let restoreOrigin: (() => void) | null = null;
@@ -579,7 +627,9 @@ export class CodexExecutor implements LLMExecutor {
         env = { ...selectedEnv, CODEX_HOME: view.home, HOME: view.userHome };
       }
       const args = this.options.protocolDriver ? this.buildAppServerArgs(params) : this.buildArgs(params, schemaPath);
-      const attempt = await this.spawnAndWait(params, args, env, view ?? undefined, selectedEnv.CODEX_HOME);
+      // Auth acquisition and view setup may have consumed the budget: never spawn with an expired timeout.
+      if (deadlineAt !== null && this.now() >= deadlineAt) return expiredAttempt();
+      const attempt = await this.spawnAndWait(params, args, env, view ?? undefined, selectedEnv.CODEX_HOME, deadlineAt);
       // spawnAndWait throws rather than returning while a child may live; the explicit guard keeps that invariant local.
       if (view && !this.held) this.syncAuthBack(view);
       return attempt;
@@ -606,6 +656,7 @@ export class CodexExecutor implements LLMExecutor {
     env: Record<string, string>,
     view?: AppServerView,
     selectedHome?: string,
+    deadlineAt: number | null = null,
   ): Promise<Attempt> {
     const termWaitMs = this.options.termWaitMs ?? DEFAULT_TERM_WAIT_MS;
     const killWaitMs = this.options.killWaitMs ?? DEFAULT_KILL_WAIT_MS;
@@ -728,8 +779,8 @@ export class CodexExecutor implements LLMExecutor {
       }
     }
 
-    const timer =
-      params.invocationTimeoutMs != null ? setTimeout(() => requestStop("timeout"), params.invocationTimeoutMs) : null;
+    const timeoutMs = deadlineAt !== null ? Math.max(0, deadlineAt - this.now()) : params.invocationTimeoutMs;
+    const timer = timeoutMs != null ? setTimeout(() => requestStop("timeout"), timeoutMs) : null;
     const onAbort = (): void => requestStop("cancel");
     const signal = this.options.cancelSignal;
     if (signal?.aborted) requestStop("cancel");
@@ -807,6 +858,22 @@ export class CodexExecutor implements LLMExecutor {
     const stop = st.reason === "timeout" || st.reason === "cancel" ? st.reason : null;
     return { result: clean, sawUnsafe, stop };
   }
+}
+
+/** A stop-by-timeout attempt for a budget that expired before any child was spawned. */
+function expiredAttempt(): Attempt {
+  return {
+    result: {
+      stdout: "",
+      stderr: "",
+      exitCode: 1,
+      tokensUsed: 0,
+      terminalStatus: { subtype: "error", isError: true },
+      signal: null,
+    },
+    sawUnsafe: false,
+    stop: "timeout",
+  };
 }
 
 function spawnFailure(err: unknown, sawUnsafe = false): SpawnFailure {

@@ -5,11 +5,12 @@ import { execFileSync, type spawn, type ChildProcessWithoutNullStreams } from "n
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { CodexExecutor, CodexRecoveryRequiredError, matchesSchema, type CodexExecutorOptions } from "../pipeline/codex-executor.js";
+import { CodexExecutor, CodexPlanningPolicyUnprovenError, CodexRecoveryRequiredError, matchesSchema, type CodexExecutorOptions } from "../pipeline/codex-executor.js";
 import { ModelAuthClientError, type ModelAuthClient, type ModelInvocation } from "../model-auth-client.js";
 import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
 import { READ_ONLY_TOOL_PARAMS } from "../pipeline/steps/read-only-tools.js";
 import type { CodexProtocolDriver, CodexTransportResult, CodexTransportRunInput } from "../pipeline/codex-planning-adapter.js";
+import type { InvokeParams } from "../pipeline/types.js";
 
 const SYNTHETIC_KEY = "synthetic-codex-api-key-0000";
 const VERDICT_SCHEMA = {
@@ -276,6 +277,28 @@ describe("pinned configuration and sandbox", () => {
     expect(rw.log[0].args[rw.log[0].args.indexOf("--sandbox") + 1]).toBe("workspace-write");
   });
 
+  it("derives the sandbox from the fixed agentStage, not from builtinTools or caller args", async () => {
+    const argsFor = async (extra: Partial<InvokeParams>): Promise<string[]> => {
+      const { executor, log } = make([{ stdout: message("ok") }]);
+      await executor.invoke({ ...base, ...extra });
+      return log[0].args;
+    };
+    const impl = await argsFor({ agentStage: "implementation", ...READ_ONLY_TOOL_PARAMS });
+    expect(impl[impl.indexOf("--sandbox") + 1]).toBe("workspace-write");
+    const review = await argsFor({ agentStage: "review" });
+    expect(review[review.indexOf("--sandbox") + 1]).toBe("read-only");
+    expect(new Set([impl.join(), review.join()]).size).toBe(2);
+  });
+
+  it("refuses planning before any auth checkout or spawn rather than shipping an unproven policy", async () => {
+    const { executor, log, auth } = make([{ stdout: message("ok") }]);
+    const err = await executor.invoke({ ...base, agentStage: "planning" }).catch((e) => e);
+    expect(err).toBeInstanceOf(CodexPlanningPolicyUnprovenError);
+    expect(err.code).toBe("CODEX_PLANNING_POLICY_UNPROVEN");
+    expect(log).toHaveLength(0);
+    expect(auth.events).toEqual([]);
+  });
+
   it("maps a rejected pinned option to a config failure without a second spawn", async () => {
     const { executor, log } = make([{ exitCode: 2, stderr: "error: unexpected argument '--ignore-rules' found" }]);
     const result = await executor.invoke({ ...base, ...retry });
@@ -536,7 +559,8 @@ describe("publication credential guard", () => {
   it("restores on failure, timeout and cancel", async () => {
     await guarded([{ exitCode: 1, stderr: "boom" }]).executor.invoke(base);
     expect(originOf()).toBe(tokenized);
-    await guarded([{ hang: true, dieOn: ["SIGTERM"] }]).executor.invoke({ ...base, invocationTimeoutMs: 10 });
+    // Frozen clock: real startup delay must not consume the 10 ms budget before spawn.
+    await guarded([{ hang: true, dieOn: ["SIGTERM"] }], { nowImpl: () => 0 }).executor.invoke({ ...base, invocationTimeoutMs: 10 });
     expect(originOf()).toBe(tokenized);
     const ac = new AbortController();
     ac.abort();
@@ -551,7 +575,7 @@ describe("publication credential guard", () => {
   });
 
   it("leaves the origin protected when the child cannot be proven stopped", async () => {
-    const { executor } = guarded([{ hang: true, dieOn: [] }]);
+    const { executor } = guarded([{ hang: true, dieOn: [] }], { nowImpl: () => 0 });
     await expect(executor.invoke({ ...base, invocationTimeoutMs: 10 })).rejects.toBeInstanceOf(CodexRecoveryRequiredError);
     expect(originOf()).toBe("https://github.com/acme/app.git");
   });
@@ -1116,5 +1140,78 @@ describe("app-server trusted view (AII-1002)", () => {
     await executor.invoke(base);
     expect(log[0].args[0]).toBe("exec");
     expect(viewDirs().filter((n) => !before.has(n))).toEqual([]);
+  });
+});
+
+describe("invocation deadline across attempts", () => {
+  const bigBackoff = { retry: { policy: { ...DEFAULT_RETRY_POLICY, requestRetries: 3, backoffInitialMs: 10_000, backoffMaxMs: 60_000 }, toolUseIsSafe: false } };
+  const transientResult: Script = { exitCode: 1, stderr: "stream error: 503 service unavailable", stdout: [ev({ type: "turn.started" }), ev({ type: "turn.completed", usage: { input_tokens: 4, output_tokens: 2 } })] };
+
+  function clocked(scripts: Script[], opts: { schedulingDelayMs?: number } = {}) {
+    let t = 1_000;
+    const auth = makeAuth();
+    const inner = auth.client.invoke.bind(auth.client);
+    const client: Pick<ModelAuthClient, "invoke"> = {
+      invoke: (async (profileId: string, run: (i: ModelInvocation) => Promise<unknown>) => {
+        t += opts.schedulingDelayMs ?? 0;
+        return inner(profileId, run);
+      }) as ModelAuthClient["invoke"],
+    };
+    const slept: number[] = [];
+    const made = make(scripts, { nowImpl: () => t, sleepImpl: async (ms) => void ((t += ms), slept.push(ms)) }, { ...auth, client });
+    return { ...made, slept, auth, clock: () => t };
+  }
+
+  it("bounds an oversized result-retry backoff by the remaining budget and spawns no extra child", async () => {
+    const { executor, log, slept, auth, clock } = clocked([transientResult, { stdout: message("late") }]);
+    const result = await executor.invoke({ ...base, ...bigBackoff, invocationTimeoutMs: 100 });
+    expect(result.failure).toMatchObject({ code: "INVOCATION_TIMEOUT", retryable: false });
+    expect(log).toHaveLength(1);
+    expect(slept).toHaveLength(1);
+    expect(slept[0]).toBeLessThanOrEqual(100);
+    expect(clock() - 1_000).toBeLessThanOrEqual(100);
+    // Accumulated telemetry from the first attempt survives the timeout result.
+    expect(result.telemetry).toMatchObject({ tokensIn: 4, tokensOut: 2 });
+    expect(auth.events.filter((e) => e.startsWith("invoke:"))).toHaveLength(1);
+    expect(auth.events.filter((e) => e === "checkpoint")).toHaveLength(1);
+  });
+
+  it("bounds an oversized spawn-error backoff and does not spawn again", async () => {
+    const eagain = Object.assign(new Error("spawn codex EAGAIN"), { code: "EAGAIN" });
+    const { executor, log, slept } = clocked([{ error: eagain }, { stdout: message("late") }]);
+    const result = await executor.invoke({ ...base, ...bigBackoff, invocationTimeoutMs: 100 });
+    expect(result.failure).toMatchObject({ code: "INVOCATION_TIMEOUT" });
+    expect(log).toHaveLength(1);
+    expect(slept[0]).toBeLessThanOrEqual(100);
+  });
+
+  it("does not spawn when scheduling delay consumed the budget, and releases auth only through the checkpoint", async () => {
+    const { executor, log, auth } = clocked([{ stdout: message("never") }], { schedulingDelayMs: 500 });
+    const result = await executor.invoke({ ...base, invocationTimeoutMs: 100 });
+    expect(result.failure).toMatchObject({ code: "INVOCATION_TIMEOUT" });
+    expect(log).toHaveLength(0);
+    expect(auth.events).toEqual(["invoke:profile-1", "checkpoint"]);
+  });
+
+  it("does not acquire auth for a retry attempt whose budget expired during scheduling", async () => {
+    let t = 1_000;
+    const auth = makeAuth();
+    const { executor, log } = make(
+      [transientResult, { stdout: message("never") }],
+      { nowImpl: () => t, sleepImpl: async (ms) => void (t += ms + 1_000) },
+      auth,
+    );
+    const result = await executor.invoke({ ...base, ...bigBackoff, invocationTimeoutMs: 100 });
+    expect(result.failure).toMatchObject({ code: "INVOCATION_TIMEOUT" });
+    expect(log).toHaveLength(1);
+    expect(auth.events.filter((e) => e.startsWith("invoke:"))).toHaveLength(1);
+  });
+
+  it("never spawns with a zero or negative timeout", async () => {
+    const { executor, log, auth } = clocked([{ stdout: message("never") }]);
+    const result = await executor.invoke({ ...base, invocationTimeoutMs: 0 });
+    expect(result.failure).toMatchObject({ code: "INVOCATION_TIMEOUT" });
+    expect(log).toHaveLength(0);
+    expect(auth.events).toEqual([]);
   });
 });
