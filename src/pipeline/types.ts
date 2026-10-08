@@ -431,6 +431,8 @@ export interface LLMResult {
   terminalStatus?: LLMTerminalStatus;
   /** Termination signal from the CLI process's close event (e.g. SIGTERM), null when it exited normally. */
   signal?: string | null;
+  /** The agent's own terminal error text (redacted), when its event stream reported one. Diagnostic only; classification reads stderr. */
+  errorMessage?: string;
   /** Number of spawn attempts made for this invocation; 1 unless `retry` was supplied and a transient pre-tool-use failure was re-spawned. Optional so a custom LLMExecutor may omit it — consumers fall back to `?? 1`. */
   attempts?: number;
   /** Set on any classified failure of the final attempt (retryable or not) — the last attempt's classified record. */

@@ -17,6 +17,7 @@ const TOOL_TRACE_MAX = 200;
 const EXECUTED_COMMANDS_MAX = 200;
 const STDERR_MAX = 64_000;
 const SEEN_ITEMS_MAX = 5000;
+const ERROR_MESSAGE_MAX = 2000;
 
 // Item types that cannot touch the workspace. Everything else is unsafe or uncertain.
 const SAFE_ITEM_TYPES = new Set(["agent_message", "reasoning", "todo_list", "web_search", "error"]);
@@ -126,6 +127,8 @@ export class CodexStreamParser {
   private cacheWriteIn: number | null = null;
   private cost: number | null = null;
   private stderrText = "";
+  /** First terminal error text (`error` / `turn.failed`), redacted and bounded; the provider's own reason for failing. */
+  private errorText: string | null = null;
 
   threadId: string | null = null;
   /** Codex event turns (`turn.started`); deliberately distinct from Claude native turns. */
@@ -213,10 +216,12 @@ export class CodexStreamParser {
       case "turn.failed":
         this.fatal ??= "failed";
         this.openTurn = false;
+        if (record(event.error)) this.noteError(event.error.message);
         return;
       case "error":
         if (typeof event.message === "string" && isResponsesWebsocketReconnectNotice(event.message)) return;
         this.fatal ??= "error";
+        this.noteError(event.message);
         return;
       case "item.started":
       case "item.updated":
@@ -228,6 +233,11 @@ export class CodexStreamParser {
         this.corrupt = true;
         this.sawUnsafe = true;
     }
+  }
+
+  private noteError(message: unknown): void {
+    if (this.errorText !== null || typeof message !== "string" || !message.trim()) return;
+    this.errorText = truncate(redactSecrets(message.trim()), ERROR_MESSAGE_MAX);
   }
 
   private applyUsage(event: CodexEvent): void {
@@ -372,6 +382,7 @@ export class CodexStreamParser {
       telemetry,
       ...(structuredOutput !== undefined ? { structuredOutput } : {}),
       ...(this.terminalStatus ? { terminalStatus: this.terminalStatus } : {}),
+      ...(this.errorText !== null ? { errorMessage: this.errorText } : {}),
       ...(proc.signal !== undefined ? { signal: proc.signal } : {}),
     };
   }
