@@ -169,6 +169,41 @@ export function buildImplRunConfig(input: ImplRunConfigInput): RunConfigV1 {
   };
 }
 
+export interface KgRefreshRunConfigInput {
+  kgSourceRepo: string;
+  /** The run title the workflow reconciles by: `KG-REFRESH · <triggerId>`. */
+  issueIdentifier: string;
+  runnerCallbackUrl?: string;
+  dependencyTokenScope?: "installation";
+  dryRun?: boolean;
+  kgSourceRef?: string;
+  acceptNewBaseline?: boolean;
+  actorEmail?: string;
+}
+
+/**
+ * Builds the RunConfigV1 envelope for a kg-refresh dispatch. Holds the run identity
+ * (issue id and title) in one place; senders read it from `envelope.issue`. Pure: the
+ * caller supplies every value. Optional keys are absent, never `undefined`, because the
+ * envelope is journaled and encoded.
+ */
+export function buildKgRefreshRunConfig(input: KgRefreshRunConfigInput): RunConfigV1 {
+  const { kgSourceRepo, issueIdentifier, runnerCallbackUrl, dependencyTokenScope,
+    dryRun, kgSourceRef, acceptNewBaseline, actorEmail } = input;
+  return {
+    v: 1,
+    issue: { id: "kg-refresh", identifier: issueIdentifier, title: "KG ingest", description: "" },
+    runnerPhase: "kg-refresh",
+    kgSourceRepo,
+    ...(runnerCallbackUrl ? { runnerCallbackUrl } : {}),
+    ...(dependencyTokenScope != null ? { dependencyTokenScope } : {}),
+    ...(dryRun ? { kgDryRun: true as const } : {}),
+    ...(kgSourceRef ? { kgSourceRef } : {}),
+    ...(acceptNewBaseline ? { kgAcceptNewBaseline: true as const } : {}),
+    ...(actorEmail ? { kgBaselineActor: actorEmail } : {}),
+  };
+}
+
 function isReviewerSelectionArray(value: unknown): value is ReviewerSelection[] {
   if (!Array.isArray(value)) return false;
   const seen = new Set<string>();
