@@ -740,7 +740,9 @@ describe("launchKeptMachine: the dispatch step's Fly write", () => {
 
   it("creates a machine when none is kept, without a lookup", async () => {
     const { fly, calls } = makeFly(async () => ({}));
-    await expect(launch(fly, null)).resolves.toMatchObject({ machineId: "m-new", created: true });
+    const result = await launch(fly, null);
+    expect(result).toMatchObject({ machineId: "m-new", created: true });
+    expect(result).not.toHaveProperty("replaced");
     expect(calls).toEqual(["create"]);
   });
 
@@ -764,13 +766,13 @@ describe("launchKeptMachine: the dispatch step's Fly write", () => {
 
   it("creates a replacement when the kept machine is destroyed", async () => {
     const { fly, calls } = makeFly(async () => ({ state: "destroyed" }));
-    await expect(launch(fly, "m-1")).resolves.toMatchObject({ machineId: "m-new", created: true });
+    await expect(launch(fly, "m-1")).resolves.toMatchObject({ machineId: "m-new", created: true, replaced: "m-1" });
     expect(calls).toEqual(["get", "create"]);
   });
 
   it("creates a replacement when the lookup answers 404", async () => {
     const { fly, calls } = makeFly(async () => { throw notFound(); });
-    await expect(launch(fly, "m-1")).resolves.toMatchObject({ machineId: "m-new", created: true });
+    await expect(launch(fly, "m-1")).resolves.toMatchObject({ machineId: "m-new", created: true, replaced: "m-1" });
     expect(calls).toEqual(["get", "create"]);
   });
 

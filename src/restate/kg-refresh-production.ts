@@ -107,11 +107,11 @@ const isFlyNotFound = (err: unknown): boolean => err instanceof Error && /\(404\
 export async function launchKeptMachine(
   fly: KeptMachineFly,
   opts: { keptMachineId: string | null; dispatchId: string; machineConfig: CreateMachineOpts; machineNonce: string },
-): Promise<{ machineId: string; machineNonce: string; created: boolean; reused: boolean }> {
+): Promise<{ machineId: string; machineNonce: string; created: boolean; reused: boolean; replaced?: string }> {
   const { keptMachineId, dispatchId, machineConfig, machineNonce } = opts;
-  const create = async () => {
+  const create = async (replaced?: string) => {
     const machine = await fly.createMachine(machineConfig);
-    return { machineId: machine.id, machineNonce, created: true, reused: false };
+    return { machineId: machine.id, machineNonce, created: true, reused: false, ...(replaced !== undefined && { replaced }) };
   };
   if (keptMachineId === null) return create();
 
@@ -121,11 +121,11 @@ export async function launchKeptMachine(
   } catch (err) {
     if (!isFlyNotFound(err)) throw err;
     console.log(`[kg-refresh] kept machine ${keptMachineId} is gone (404); creating a new one`);
-    return create();
+    return create(keptMachineId);
   }
   if (existing.state === "destroyed") {
     console.log(`[kg-refresh] kept machine ${keptMachineId} is destroyed; creating a new one`);
-    return create();
+    return create(keptMachineId);
   }
   if (existing.state === "started") {
     if (existing.config?.metadata?.[DURABLE_RUNNER_DISPATCH_ID_KEY] === dispatchId) {
@@ -147,7 +147,7 @@ type LegacyDispatch = (opts: {
   machine: FlyMachineProfileConfig;
   /** The machine the pipeline keeps (from `FlyMachineProfile.claim`); null when none is kept. */
   machineId: string | null;
-}) => Promise<{ machineId?: string; machineNonce?: string; logsUrl?: string; workflowRunId?: number; created?: boolean }>;
+}) => Promise<{ machineId?: string; machineNonce?: string; logsUrl?: string; workflowRunId?: number; created?: boolean; replaced?: string }>;
 
 export interface KgDispatchDetails {
   machineId?: string;
@@ -286,7 +286,8 @@ export function createKgRefreshDispatch(input: KgRefreshProductionInput): (dispa
       const kept = executionMode === "fly-machines" && legacy.machineId !== undefined;
       return { outcome: "accepted", runId: legacy.workflowRunId, runUrl: legacy.logsUrl,
         jobId: legacy.machineId ?? null, executionMode,
-        machineId: kept ? legacy.machineId! : null, created: kept && legacy.created === true };
+        machineId: kept ? legacy.machineId! : null, created: kept && legacy.created === true,
+        ...(kept && legacy.created === true && legacy.replaced !== undefined && { replaced: legacy.replaced }) };
     }
 
     const { token } = await input.mintToken(config.githubAppId, config.githubAppPrivateKey, repo.owner);
