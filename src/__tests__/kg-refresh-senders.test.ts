@@ -63,6 +63,13 @@ function makeDeps(overrides: Partial<KgRefreshSenderDeps> = {}, configOverrides:
 }
 
 describe("fly-machines sender", () => {
+  it("throws when the machine nonce is missing", async () => {
+    const { deps, created } = makeDeps();
+    await expect(createKgRefreshSenders(deps)["fly-machines"](makeInput({ machineNonce: null }))).rejects.toThrow(/machineNonce is required/);
+    expect(deps.getInstallationToken).not.toHaveBeenCalled();
+    expect(created).toBeDefined();
+  });
+
   it("passes the machine config and creates a machine when none is kept", async () => {
     const { deps, created } = makeDeps();
     const result = await createKgRefreshSenders(deps)["fly-machines"](makeInput());
@@ -118,6 +125,12 @@ describe("fly-machines sender", () => {
 });
 
 describe("local-docker sender", () => {
+  it("throws when the machine nonce is missing", async () => {
+    const { deps } = makeDeps();
+    await expect(createKgRefreshSenders(deps)["local-docker"](makeInput({ machineNonce: null }))).rejects.toThrow(/machineNonce is required/);
+    expect(deps.startLocalRunnerContainer).not.toHaveBeenCalled();
+  });
+
   it("passes the nonce and identifier and returns the container id", async () => {
     const { deps } = makeDeps();
     const result = await createKgRefreshSenders(deps)["local-docker"](makeInput());
