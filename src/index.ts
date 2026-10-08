@@ -10,7 +10,7 @@ import {
   resolveReviewFixLifecycle,
 } from "./config.js";
 import type { RepoMapping } from "./config.js";
-import { markDispatched, closeDb, getDb, getDispatchedRows, deleteDispatched } from "./dedup.js";
+import { recordReaperAction, markDispatched, closeDb, getDb, getDispatchedRows, deleteDispatched } from "./dedup.js";
 import { reconcileDispatched } from "./dedup-reconcile.js";
 import { canDispatch, acquireDispatch, type DispatchKind, type AcquireDispatchOutcome } from "./dispatch-gate.js";
 import {
@@ -63,7 +63,7 @@ import { postStatusComment } from "./status-events.js";
 import { buildRunUrl, classifyCompletion, deriveLastSuccessfulStage, monitorFailureCommentPrefix, renderClassification, shouldPostMonitorClassificationComment } from "./completion-classification.js";
 import { classifyFlyMachine, classifyLocalContainer, destroyMachineRecorded } from "./backend-run.js";
 import { createMachine, getMachine, listMachines, generateSessionToken, generateMachineNonce, buildSessionMachineConfig, listAppSecrets, fetchMachineLogs, updateMachineMetadata, readMachineExitCode } from "./fly-machines.js";
-import { safeDestroyMachine, sweepOrphanedMachines, SWEEP_MACHINE_MAX_AGE_MS } from "./reaper.js";
+import { isDurableRunnerMachine, safeDestroyMachine, sweepOrphanedMachines, SWEEP_MACHINE_MAX_AGE_MS } from "./reaper.js";
 import type { ReaperHelpers } from "./reaper.js";
 import { seedKgMaterializeDirectFromEnv, getRunnerMode, getFlySecretsMinVersion, getFlyProcessLevelSecrets, initSettingsTable, resolveExecutionPath, resolvePlanningExecutionPath, resolveRunnerCallbackBaseUrl, checkForcedPathEligibility } from "./runner-mode.js";
 import { handleGitHubWebhook } from "./webhook.js";
@@ -2769,7 +2769,7 @@ async function monitorFlyMachineJob(
 
   if (machineDone) {
     // Determine success/failure before destroying: move findPrForIssue before
-    // destroyMachine so we can decide whether to fetch logs while the machine
+    // destroyMachineRecorded so we can decide whether to fetch logs while the machine
     // is still accessible.
     const matchedPr = await findPrForIssue(config, job.repo, job.issueIdentifier);
     const prUrl = matchedPr?.url ?? null;
@@ -3350,6 +3350,26 @@ async function startupReconciliation(config: AppConfig, registry: ProviderRegist
     // Skip machines not owned by this orchestrator (same logic as reaper.ts).
     const machineOrchestrator = machine.config?.metadata?.orchestrator_app;
     if (config.flyOrchestratorApp && machineOrchestrator !== config.flyOrchestratorApp) {
+      continue;
+    }
+
+    // A durable-runner machine is owned by a FlyMachineProfile object, not a dispatch_log
+    // row: a missing or terminal row is its normal state, so neither rule below may see it.
+    // Only the object's expire and the reaper's durable-expired may destroy it.
+    if (isDurableRunnerMachine(machine)) {
+      console.log(`[startup] Keeping durable-runner machine ${machine.id} (owned by FlyMachineProfile)`);
+      try {
+        recordReaperAction({
+          ruleMatched: "durable-skip:startup-reconcile",
+          machineId: machine.id,
+          tenantId: null,
+          issueIdentifier: null,
+          ageSeconds: Math.floor((Date.now() - new Date(machine.created_at).getTime()) / 1000),
+          dryRun: config.reaperDryRun,
+        });
+      } catch (err) {
+        console.error("[startup] Failed to record durable-skip:", err);
+      }
       continue;
     }
 

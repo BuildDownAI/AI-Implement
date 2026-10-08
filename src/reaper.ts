@@ -100,6 +100,11 @@ export async function safeDestroyMachine(
   }
 }
 
+/** Whether the machine is owned by a FlyMachineProfile object (purpose: durable-runner). */
+export function isDurableRunnerMachine(machine: { config?: { metadata?: Record<string, string> } }): boolean {
+  return machine.config?.metadata?.[DURABLE_RUNNER_PURPOSE_KEY] === DURABLE_RUNNER_PURPOSE_VALUE;
+}
+
 /**
  * Whether a durable-runner machine's `durable_until` stamp (epoch seconds) is past.
  * Absent keeps the machine; a present value that is not a finite number is a corrupt

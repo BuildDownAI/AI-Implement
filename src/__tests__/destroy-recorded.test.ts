@@ -94,3 +94,23 @@ describe("destroy call sites", () => {
     }
   });
 });
+
+describe("safeDestroyMachine callers", () => {
+  it("startup reconciliation skips durable-runner machines before any safeDestroyMachine call", () => {
+    const out = execFileSync("git", ["grep", "-l", "safeDestroyMachine(", "--", "src", ":!src/__tests__"], { encoding: "utf8" });
+    expect(out.split("\n").filter(Boolean).sort()).toEqual(["src/index.ts", "src/reaper.ts"]);
+    const src = readFileSync("src/index.ts", "utf8");
+    const start = src.indexOf("async function startupReconciliation");
+    const guard = src.indexOf("isDurableRunnerMachine(machine)", start);
+    const firstDestroy = src.indexOf("safeDestroyMachine(", start);
+    expect(guard).toBeGreaterThan(start);
+    expect(guard).toBeLessThan(firstDestroy);
+  });
+
+  it("isDurableRunnerMachine matches on metadata.purpose", async () => {
+    const { isDurableRunnerMachine } = await import("../reaper.js");
+    expect(isDurableRunnerMachine(machine("stopped", "durable-runner"))).toBe(true);
+    expect(isDurableRunnerMachine(machine("stopped", "session"))).toBe(false);
+    expect(isDurableRunnerMachine({})).toBe(false);
+  });
+});
