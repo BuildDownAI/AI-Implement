@@ -31,7 +31,7 @@ import { getRunnerMode, getKgFlyMachineOverride, setKgFlyMachineOverride, type K
 import { mintRunToken } from "../runner-tokens.js";
 import type { JobStatus } from "../log.js";
 import { appendLogIfAbsent, findLogIdByDispatchId, updateJobMachineDetails, updateJobPrUrl, updateJobRunId } from "../log.js";
-import { clearMachineEnv, createMachine, destroyMachine, getMachine, startMachine, updateMachine, updateMachineMetadata, type CreateMachineOpts, type Machine, type MachineConfig } from "../fly-machines.js";
+import { clearMachineEnv, createMachine, destroyMachine, getMachine, startMachine, updateMachine, type CreateMachineOpts, type Machine, type MachineConfig } from "../fly-machines.js";
 import type { RestateService } from "./endpoint.js";
 import {
   createKgRefreshWorkflow,
@@ -451,7 +451,6 @@ export function buildFlyMachineProfileDeps(env: NodeJS.ProcessEnv = process.env)
     fly: {
       getMachine: bound(getMachine),
       clearMachineEnv: bound(clearMachineEnv),
-      updateMachineMetadata: bound(updateMachineMetadata),
       destroyMachine: bound((t, a, id: string) => destroyMachine(t, a, id)),
     },
   };

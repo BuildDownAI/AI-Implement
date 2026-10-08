@@ -45,11 +45,10 @@ function fakeFly(idleTimeoutMsOverride?: number): FakeFly {
     idleTimeoutMsOverride,
     fly: {
       getMachine: async () => { throw new Error("unexpected getMachine"); },
-      clearMachineEnv: async (id) => {
-        calls.push(`clear:${id}`);
+      clearMachineEnv: async (id, metadata) => {
+        calls.push(metadata ? `clear:${id}:${JSON.stringify(metadata)}` : `clear:${id}`);
         if (fake.failClear) throw new Error("fly down");
       },
-      updateMachineMetadata: async (id, key, value) => { calls.push(`meta:${id}:${key}:${value}`); },
       destroyMachine: async (id) => {
         calls.push(`destroy:${id}`);
         if (fake.fail404OnDestroy) throw new Error(`Failed to destroy machine ${id} (404): gone`);
@@ -202,9 +201,9 @@ describe("FlyMachineProfile kept machine", () => {
     await h.call("attach", { dispatchId: "d1", machineId });
     await h.call("release", { dispatchId: "d1" });
     const mine = fly.calls.filter((c) => c.includes(machineId));
-    expect(mine).toHaveLength(2);
-    expect(mine[0]).toBe(`clear:${machineId}`);
-    expect(mine[1]).toMatch(new RegExp(`^meta:${machineId}:durable_until:\\d{10}$`));
+    expect(mine).toHaveLength(1);
+    expect(mine[0]).toMatch(new RegExp(`^clear:${machineId}:\\{"durable_until":"\\d{10}"\\}$`));
+    expect(mine.some((c) => c.startsWith("meta:"))).toBe(false);
     expect((await h.status())).toMatchObject({ machineId, heldBy: null });
     const rows = await eventually(() => h.expires(), (found) => found.length === 1, { label: "one scheduled FlyMachineProfile.expire", timeoutMs: 30_000 });
     expect(rows).toHaveLength(1);

@@ -62,8 +62,7 @@ export interface FlyMachineProfileDeps {
   fly: {
     getMachine(id: string): Promise<Machine>;
     /** getMachine, then updateMachine with `env: {}` and the same config otherwise. Update on a stopped machine does not start it. */
-    clearMachineEnv(id: string): Promise<void>;
-    updateMachineMetadata(id: string, key: string, value: string): Promise<void>;
+    clearMachineEnv(id: string, metadata?: Record<string, string>): Promise<void>;
     destroyMachine(id: string): Promise<void>;
   };
   /** Test seam for a short idle timeout; production leaves it unset. */
@@ -247,8 +246,7 @@ export function createFlyMachineProfile(deps: FlyMachineProfileDeps) {
     let scrubbed = true;
     try {
       await ctx.run("scrub", async () => {
-        await deps.fly.clearMachineEnv(machineId);
-        await deps.fly.updateMachineMetadata(machineId, DURABLE_UNTIL_KEY, String(Math.floor((now + idleTimeoutMs + ONE_DAY_MS) / 1000)));
+        await deps.fly.clearMachineEnv(machineId, { [DURABLE_UNTIL_KEY]: String(Math.floor((now + idleTimeoutMs + ONE_DAY_MS) / 1000)) });
       }, { maxRetryAttempts: 3 });
     } catch (err) {
       if (restate.internal.isSuspendedError(err)) throw err;
