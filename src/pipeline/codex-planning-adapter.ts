@@ -342,6 +342,9 @@ export function createHostContext(workspaceDir: string, forbiddenRoots: readonly
 /** Item types that cannot touch the workspace or network; anything else means a non-allowlisted effect. */
 const SAFE_ITEM_TYPES = new Set(["agentMessage", "userMessage", "reasoning", "plan", "dynamicToolCall", "contextCompaction"]);
 
+/** Only item types matching this pattern are echoed in the `unexpected_item` diagnostic; anything else renders as `?`. */
+const ITEM_TYPE_LABEL = /^[A-Za-z][A-Za-z0-9_./-]{0,63}$/;
+
 /** Notifications that can carry output, usage or completion; each must bind to the acknowledged thread and turn. */
 const BOUND_NOTIFICATIONS = new Set(["item/started", "item/completed", "thread/tokenUsage/updated", "turn/completed"]);
 const MAX_DEFERRED = 256;
@@ -539,7 +542,7 @@ function runSession(input: CodexTransportRunInput): Promise<CodexTransportResult
       if (method === "item/started" || method === "item/completed") {
         const item = params.item;
         if (!isRecord(item) || typeof item.type !== "string") return fail("malformed_message", true);
-        if (!SAFE_ITEM_TYPES.has(item.type)) return fail("unexpected_item", true);
+        if (!SAFE_ITEM_TYPES.has(item.type)) return fail("unexpected_item", true, ITEM_TYPE_LABEL.test(item.type) ? item.type : "?");
         if (method === "item/completed" && item.type === "agentMessage") {
           if (typeof item.text !== "string") return fail("malformed_message", true);
           if (item.text.length > PLANNING_LIMITS.messageChars) return fail("output_too_large");

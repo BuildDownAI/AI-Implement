@@ -315,8 +315,36 @@ describe("planning protocol driver", () => {
       const out = await drive(server);
       expect(out.sawUnsafe).toBe(true);
       expect(out.result.exitCode).toBe(1);
+      expect(out.result.stderr.endsWith(`unexpected_item: ${type}`)).toBe(true);
     },
   );
+
+  it.each([
+    ["has space", "?"],
+    ["has'quote", "?"],
+    ["a".repeat(65), "?"],
+    ["a".repeat(64), "a".repeat(64)],
+    ["", "?"],
+    ["1digit", "?"],
+    ["SENTINEL x", "?"],
+  ])("renders item type %j as %j without leaking item fields", async (type, label) => {
+    for (const method of ["item/started", "item/completed"]) {
+      const server = new FakeServer((m, s) => {
+        if (handshake(m, s)) return;
+        if (m.method === "turn/start") {
+          ack(m, s);
+          s.send({
+            method,
+            params: bound({ item: { type, id: "i", text: "SENTINEL", command: "SENTINEL", arguments: { a: "SENTINEL" } } }),
+          });
+        }
+      });
+      const out = await drive(server);
+      expect(out.sawUnsafe).toBe(true);
+      expect(out.result.stderr.endsWith(`unexpected_item: ${label}`)).toBe(true);
+      if (type !== "SENTINEL x") expect(out.result.stderr).not.toContain("SENTINEL");
+    }
+  });
 
   it("reports failed and interrupted turns without marking them unsafe", async () => {
     for (const [status, text] of [
