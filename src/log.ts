@@ -948,12 +948,24 @@ export function updateJobMachineId(jobId: number, machineId: string): void {
     .run(machineId, jobId);
 }
 
+/** Sets a job's machine id without touching its status (`updateJobMachineId` also marks it running). */
+export function setJobMachineId(jobId: number, machineId: string): void {
+  getDb()
+    .prepare("UPDATE dispatch_log SET machine_id = ? WHERE id = ?")
+    .run(machineId, jobId);
+}
+
 /** Records machine identity on a dispatched kg-refresh row after the machine starts. */
 export function updateJobMachineDetails(jobId: number, opts: { machineNonce: string; machineId?: string; logsUrl?: string }): void {
   getDb()
     .prepare("UPDATE dispatch_log SET machine_nonce = ?, machine_id = ? WHERE id = ?")
     .run(opts.machineNonce, opts.machineId ?? null, jobId);
   if (opts.logsUrl) updateJobPrUrl(jobId, opts.logsUrl);
+}
+
+/** Writes only the nonce, leaving machine_id and the rest of the row untouched. */
+export function setJobMachineNonce(jobId: number, machineNonce: string): void {
+  getDb().prepare("UPDATE dispatch_log SET machine_nonce = ? WHERE id = ?").run(machineNonce, jobId);
 }
 
 /** Clears a job's nonce (called when machine is destroyed). */
