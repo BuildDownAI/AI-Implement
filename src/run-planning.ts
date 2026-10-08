@@ -314,6 +314,27 @@ export async function runPlanningLocally(
   return { exitCode: 0, planningContext, planFound: true, diagnostics: "" };
 }
 
+const MAX_RECOVERED_CALLBACK_URL = 2048;
+
+/**
+ * For a rejected configured envelope only: recover the public `runnerCallbackUrl` so the failure can still be
+ * reported. Nothing else is read from the unvalidated payload; a missing, oversized, non-HTTP(S) or
+ * credential-bearing URL yields undefined and the rejection stays silent rather than echoing input.
+ */
+function recoverCallbackUrl(encoded: string): string | undefined {
+  try {
+    const parsed: unknown = JSON.parse(Buffer.from(encoded, "base64").toString("utf-8"));
+    const raw = (parsed as { runnerCallbackUrl?: unknown } | null)?.runnerCallbackUrl;
+    if (typeof raw !== "string" || raw.length === 0 || raw.length > MAX_RECOVERED_CALLBACK_URL) return undefined;
+    const url = new URL(raw);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return undefined;
+    if (url.username || url.password) return undefined;
+    return raw;
+  } catch {
+    return undefined;
+  }
+}
+
 export async function runPlanning(opts: RunPlanningOptions = {}): Promise<{ exitCode: number }> {
   const workspaceDir = opts.workspaceDir ?? process.env.WORKSPACE_DIR ?? "/workspace";
 
@@ -338,6 +359,7 @@ export async function runPlanning(opts: RunPlanningOptions = {}): Promise<{ exit
       // Malformed envelope: fall back to env vars without failing — unless it shows configured intent (an
       // `agentConfig` or a protected grant), which is authoritative and must never degrade to legacy execution.
       malformedConfiguredIntent = hasConfiguredIntent(rawConfig);
+      if (malformedConfiguredIntent) envelopeCallbackUrl = recoverCallbackUrl(rawConfig);
     }
   }
   const callbackUrl = envelopeCallbackUrl ?? process.env.RUNNER_CALLBACK_URL?.trim() ?? null;

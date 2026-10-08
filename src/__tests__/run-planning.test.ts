@@ -500,7 +500,9 @@ describe("configured planning (shared prepareConfiguredRun + selected stage exec
   let ws: string;
   let authRoot: string;
   const posted: Array<{ outcome: string; failureReason?: string }> = [];
-  const fakeFetch = async (_u: string, init: RequestInit = {}) => {
+  const urls: string[] = [];
+  const fakeFetch = async (u: string, init: RequestInit = {}) => {
+    urls.push(u);
     posted.push(JSON.parse(String(init.body)));
     return { ok: true, text: async () => "" } as Response;
   };
@@ -695,6 +697,48 @@ describe("configured planning (shared prepareConfiguredRun + selected stage exec
       expect(posted, label).toHaveLength(1);
       expect(posted[0].outcome, label).toBe("failure");
       expect(posted[0].failureReason, label).toBe("Configured planning failed (invalid_snapshot)");
+      expect(legacy, label).not.toHaveBeenCalled();
+      expect(argv, label).toEqual([]);
+      expect(codex.created, label).toEqual([]);
+      expect(routes, label).toEqual([]);
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("a malformed configured envelope delivers the failure to the envelope callback URL alone", async () => {
+    const bad = { v: 1, issue: { id: "i", identifier: "E", title: "T", description: "D" }, agentConfig: { version: 1, snapshotId: "x" } };
+    const cases: Array<[string, unknown, boolean]> = [
+      ["valid https", "https://orch.example/cb", true],
+      ["missing", undefined, false],
+      ["userinfo", "https://user:pw@orch.example/cb", false],
+      ["non-http scheme", "file:///etc/passwd", false],
+      ["not a url", "nope", false],
+      ["non-string", { x: 1 }, false],
+    ];
+    for (const [label, url, delivered] of cases) {
+      posted.length = 0;
+      clearLegacyIssueEnv();
+      delete process.env.RUNNER_CALLBACK_URL;
+      process.env.AI_IMPLEMENT_RUN_CONFIG = Buffer.from(JSON.stringify({ ...bad, runnerCallbackUrl: url }), "utf-8").toString("base64");
+      const routes = stubModelAuthService();
+      const { impl, argv } = fakeSpawn({ plan: true });
+      const codex = fakeCodex(true);
+      urls.length = 0;
+      const r = await runPlanning({
+        workspaceDir: ws,
+        executor: legacy,
+        spawnImpl: impl,
+        configured: { createCodex: codex.createCodex, modelAuthClient: fakeClient() },
+        fetchImpl: fakeFetch as never,
+      });
+      expect(r.exitCode, label).toBe(1);
+      expect(posted, label).toHaveLength(delivered ? 1 : 0);
+      if (delivered) {
+        expect(posted[0].failureReason, label).toBe("Configured planning failed (invalid_snapshot)");
+        expect(urls[0], label).toContain("https://orch.example/cb");
+      } else {
+        expect(urls, label).toEqual([]);
+      }
       expect(legacy, label).not.toHaveBeenCalled();
       expect(argv, label).toEqual([]);
       expect(codex.created, label).toEqual([]);
