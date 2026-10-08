@@ -338,7 +338,7 @@ Five routes (`channels`, `policies`, `secrets`, `webhooks`, `updates`) are still
 
 ## Backend outage playbook
 
-The global **runner mode** is the failover lever: `/admin#runners` or `POST /api/runner-mode` with `fly` forces Fly Machines, `gha` forces GitHub Actions, `default` restores per-project modes. In-flight runs keep their monitors; only new dispatches reroute.
+The global **runner mode** is the failover lever: `/admin#runners` or `POST /api/runner-mode` with `fly` forces Fly Machines, `gha` forces GitHub Actions, `default` restores per-project modes. In-flight runs keep their monitors; only new dispatches reroute. Runner mode `gha` also sends the next KG refresh to the KG repo's Actions and leaves the kept machine untouched.
 
 Ineligible mappings are **skipped at dispatch** — `provider=bedrock` is GHA-only, and Fly needs a sessions app — staying queued with dedup untouched and appearing in the Runners banner and `GET /api/runner-mode`. Flip back to `default` afterward; skipped issues dispatch on the next poll.
 
