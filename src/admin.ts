@@ -52,7 +52,8 @@ import { notifyText } from "./notify.js";
 import { getLastSweepAt } from "./reaper.js";
 import { listLog, getInFlightJobs, getInFlightIssueIds, updateJobStatus, getJobById, markJobNotified, getPulls, getIssueEnrichment } from "./log.js";
 import { getStepsByJobId } from "./step-log.js";
-import { listMachines, destroyMachine, listAppSecrets, setAppSecrets, unsetAppSecret, fetchMachineLogs } from "./fly-machines.js";
+import { destroyMachineRecorded } from "./backend-run.js";
+import { listMachines, listAppSecrets, setAppSecrets, unsetAppSecret, fetchMachineLogs } from "./fly-machines.js";
 import type { TicketIssue, AIImplementSnapshot } from "./providers/types.js";
 import type { ProviderRegistry } from "./providers/registry.js";
 import { resolveInFlightSiblings, selectBlockers, mergeProviderSnapshots, selectForeignTrackerBlockers, type ForeignTrackerIssue, selectFileOverlapDeferrals, getOrFetchPlanningContexts } from "./poll-selection.js";
@@ -1821,7 +1822,7 @@ async function handleDestroySession(
         return;
       }
       try {
-        await destroyMachine(config.flySessionsToken, config.flySessionsApp, machineId);
+        await destroyMachineRecorded(config, machineId, "admin-stop");
       } catch (err) {
         // 404 is fine — machine was already gone
         if (!(err instanceof Error && err.message.includes("404"))) {
@@ -1869,7 +1870,7 @@ async function handleDestroySession(
   }
 
   try {
-    await destroyMachine(config.flySessionsToken, config.flySessionsApp, machineId);
+    await destroyMachineRecorded(config, machineId, "admin-stop");
   } catch (err) {
     // 404 is fine — machine was already gone
     if (!(err instanceof Error && err.message.includes("404"))) {

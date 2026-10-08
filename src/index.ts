@@ -61,8 +61,8 @@ import { handleReferenceTokenRequest } from "./reference-token-vending.js";
 import { handleStatusUpdate, handleStepReport } from "./session-api.js";
 import { postStatusComment } from "./status-events.js";
 import { buildRunUrl, classifyCompletion, deriveLastSuccessfulStage, monitorFailureCommentPrefix, renderClassification, shouldPostMonitorClassificationComment } from "./completion-classification.js";
-import { classifyFlyMachine, classifyLocalContainer } from "./backend-run.js";
-import { createMachine, getMachine, listMachines, destroyMachine, generateSessionToken, generateMachineNonce, buildSessionMachineConfig, listAppSecrets, fetchMachineLogs, updateMachineMetadata, readMachineExitCode } from "./fly-machines.js";
+import { classifyFlyMachine, classifyLocalContainer, destroyMachineRecorded } from "./backend-run.js";
+import { createMachine, getMachine, listMachines, generateSessionToken, generateMachineNonce, buildSessionMachineConfig, listAppSecrets, fetchMachineLogs, updateMachineMetadata, readMachineExitCode } from "./fly-machines.js";
 import { safeDestroyMachine, sweepOrphanedMachines, SWEEP_MACHINE_MAX_AGE_MS } from "./reaper.js";
 import type { ReaperHelpers } from "./reaper.js";
 import { seedKgMaterializeDirectFromEnv, getRunnerMode, getFlySecretsMinVersion, getFlyProcessLevelSecrets, initSettingsTable, resolveExecutionPath, resolvePlanningExecutionPath, resolveRunnerCallbackBaseUrl, checkForcedPathEligibility } from "./runner-mode.js";
@@ -2184,13 +2184,11 @@ function isRestateOwnedJob(job: Job): boolean {
 function ttlStopRunnerForJob(config: AppConfig, job: Job): (() => Promise<boolean>) | undefined {
   if (job.executionMode === "fly-machines") {
     if (!config.flySessionsToken || !config.flySessionsApp || !job.machineId) return undefined;
-    const token = config.flySessionsToken;
-    const app = config.flySessionsApp;
     const machineId = job.machineId;
     return async () => {
       let confirmed = false;
       try {
-        await destroyMachine(token, app, machineId);
+        await destroyMachineRecorded(config, machineId, "ttl-stop", { issueIdentifier: job.issueIdentifier });
         confirmed = true;
         console.log(`[monitor] Destroyed timed-out machine ${machineId}`);
       } catch (err) {
@@ -2719,7 +2717,7 @@ async function monitorFlyMachineJob(
     const stopRunner = async () => {
       let confirmed = false;
       try {
-        await destroyMachine(config.flySessionsToken!, config.flySessionsApp!, job.machineId!);
+        await destroyMachineRecorded(config, job.machineId!, "monitor-timeout", { issueIdentifier: job.issueIdentifier });
         confirmed = true;
         console.log(`[monitor] Destroyed timed-out machine ${job.machineId}`);
       } catch (err) {
@@ -2814,7 +2812,7 @@ async function monitorFlyMachineJob(
       }
 
       try {
-        await destroyMachine(config.flySessionsToken, config.flySessionsApp, job.machineId);
+        await destroyMachineRecorded(config, job.machineId, "monitor-stopped", { issueIdentifier: job.issueIdentifier });
         console.log(`[monitor] Destroyed stopped machine ${job.machineId}`);
       } catch (err) {
         if (!(err instanceof Error && err.message.includes("404"))) {
