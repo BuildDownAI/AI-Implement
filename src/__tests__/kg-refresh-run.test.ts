@@ -5927,3 +5927,143 @@ describe("makeDevHarnessDependencyAuthStep", () => {
     ]);
   });
 });
+
+// ── runKgRefresh() with stage configuration (AII-960) ─────────────────────────
+
+import { NOW, SENTINEL_BEARER, envelopeEnv, fakeClient, makeGrant, makeSnapshot } from "./configured-run-fixture.js";
+import type { LLMExecutor, PipelineContext } from "../pipeline/types.js";
+
+describe("runKgRefresh stage configuration", () => {
+  let tmpDir: string;
+  const snap = makeSnapshot();
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "kgrun-cfg-"));
+    vi.stubEnv("GITHUB_OWNER", "org");
+    vi.stubEnv("GITHUB_REPO", "kg-repo");
+    vi.stubEnv("GITHUB_TOKEN", "tok");
+    vi.stubEnv("GITHUB_DEFAULT_BRANCH", "main");
+    vi.stubEnv("WORKSPACE_DIR", tmpDir);
+    for (const k of ["RUNNER_CALLBACK_URL", "RUN_PROGRESS_TOKEN", "RUN_TOKEN", "AI_IMPLEMENT_RUN_CONFIG", "AI_IMPLEMENT_DEP_TOKEN_OVERRIDE"]) vi.stubEnv(k, "");
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  const throwingExecutor = (): LLMExecutor => ({ invoke: vi.fn().mockRejectedValue(new Error("a model was invoked")) });
+
+  function steps(seen: { ctx?: PipelineContext; clone: number }, pushError?: Error) {
+    return {
+      clone: { run: async () => { seen.clone++; return { workspaceDir: tmpDir, repoOwner: "org", repoRepo: "kg-repo", githubToken: "tok", clonedRef: "abc" }; } } as StepModule,
+      kgIngest: { run: async (ctx: PipelineContext) => { seen.ctx = ctx; return { statsFile: null }; } } as StepModule,
+      kgSnapshotPush: makeStepModule({ snapshotPushed: true, commitSha: "sha" }, pushError),
+    };
+  }
+
+  const stub = (env: Record<string, string>) => {
+    for (const [k, v] of Object.entries(env)) vi.stubEnv(k, v);
+  };
+
+  it("fails before clone and ingest on a malformed configured envelope, with fixed text and no env fallback", async () => {
+    const bad = Buffer.from(JSON.stringify({ v: 1, issue: { id: "i", identifier: "K-1", title: "t", description: "d" }, agentConfig: { snapshotId: SENTINEL_BEARER } })).toString("base64");
+    vi.stubEnv("AI_IMPLEMENT_RUN_CONFIG", bad);
+    const seen = { clone: 0 } as { ctx?: PipelineContext; clone: number };
+    const exec = throwingExecutor();
+    const err = await runKgRefresh({ workspaceDir: tmpDir, stepsOverride: steps(seen), llmExecutor: exec, reporter: { report: async () => undefined } }).catch((e) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toBe("Configured run rejected before execution: snapshot_incomplete");
+    expect(seen.clone).toBe(0);
+    expect(seen.ctx).toBeUndefined();
+    expect(exec.invoke).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["a snapshot without a grant", () => envelopeEnv(snap, undefined)],
+    ["a grant without a snapshot", () => envelopeEnv(undefined, makeGrant(snap))],
+    ["an expired grant", () => envelopeEnv(snap, makeGrant(snap, { expiresAt: NOW }))],
+  ])("rejects %s before clone, with an injected executor never called", async (_label, env) => {
+    stub(env());
+    const seen = { clone: 0 } as { ctx?: PipelineContext; clone: number };
+    const exec = throwingExecutor();
+    const client = fakeClient();
+    await expect(
+      runKgRefresh({ workspaceDir: tmpDir, stepsOverride: steps(seen), llmExecutor: exec, reporter: { report: async () => undefined }, configured: { modelAuthClient: client, now: () => NOW } }),
+    ).rejects.toThrow(/Configured run rejected before execution/);
+    expect(seen.clone).toBe(0);
+    expect(exec.invoke).not.toHaveBeenCalled();
+    expect(client.checkout).not.toHaveBeenCalled();
+  });
+
+  it("carries the snapshot into the context, invokes zero models on the deterministic rail, and disposes", async () => {
+    stub(envelopeEnv(snap, makeGrant(snap)));
+    const seen = { clone: 0 } as { ctx?: PipelineContext; clone: number };
+    const exec = throwingExecutor();
+    const client = fakeClient();
+    const result = await runKgRefresh({
+      workspaceDir: tmpDir, stepsOverride: steps(seen), llmExecutor: exec, reporter: { report: async () => undefined },
+      configured: { modelAuthClient: client, now: () => NOW },
+    });
+    expect(result.exitCode).toBe(0);
+    expect(seen.clone).toBe(1);
+    expect(seen.ctx!.data.agentConfig).toEqual(snap);
+    expect(seen.ctx!.llmExecutor).not.toBe(exec);
+    expect(JSON.stringify(seen.ctx!.data)).not.toContain(SENTINEL_BEARER);
+    expect(exec.invoke).not.toHaveBeenCalled();
+    expect(client.checkout).not.toHaveBeenCalled();
+    expect(client.invoke).not.toHaveBeenCalled();
+    expect(client.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("applies the selected stage settings to a model-driven repair call through the context executor", async () => {
+    stub(envelopeEnv(snap, makeGrant(snap)));
+    const client = fakeClient();
+    const claude: LLMExecutor = { invoke: vi.fn().mockResolvedValue({ stdout: "", exitCode: 0, tokensUsed: 0 }) };
+    const result = await runKgRefresh({
+      workspaceDir: tmpDir, llmExecutor: claude, reporter: { report: async () => undefined },
+      configured: { modelAuthClient: client, now: () => NOW },
+      stepsOverride: {
+        clone: makeStepModule({ workspaceDir: tmpDir }),
+        kgIngest: { run: async (ctx: PipelineContext) => { await ctx.llmExecutor.invoke({ prompt: "repair", model: "caller", agentStage: "review" }); return {}; } },
+        kgSnapshotPush: makeStepModule({ snapshotPushed: true }),
+      },
+    });
+    expect(result.exitCode).toBe(0);
+    expect((claude.invoke as ReturnType<typeof vi.fn>).mock.calls[0][0].model).toBe("claude-review");
+    expect(client.checkout).toHaveBeenCalledTimes(1);
+    expect(client.finish).toHaveBeenCalledWith("p-rev", "completed");
+    expect(client.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("finishes as failed when a step fails", async () => {
+    stub(envelopeEnv(snap, makeGrant(snap)));
+    const client = fakeClient();
+    const seen = { clone: 0 } as { ctx?: PipelineContext; clone: number };
+    const result = await runKgRefresh({
+      workspaceDir: tmpDir, stepsOverride: steps(seen, new Error("push failed")), reporter: { report: async () => undefined },
+      configured: { modelAuthClient: client, now: () => NOW },
+    });
+    expect(result.exitCode).toBe(1);
+    expect(client.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the warn-and-continue behavior for a legacy malformed envelope and for no envelope", async () => {
+    vi.stubEnv("AI_IMPLEMENT_RUN_CONFIG", "%%%not-an-envelope");
+    const seen = { clone: 0 } as { ctx?: PipelineContext; clone: number };
+    const exec = throwingExecutor();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const r1 = await runKgRefresh({ workspaceDir: tmpDir, stepsOverride: steps(seen), llmExecutor: exec, reporter: { report: async () => undefined } });
+    expect(r1.exitCode).toBe(0);
+    expect(warn).toHaveBeenCalled();
+    expect(seen.ctx!.llmExecutor).toBe(exec);
+    expect(seen.ctx!.data.agentConfig).toBeUndefined();
+    vi.stubEnv("AI_IMPLEMENT_RUN_CONFIG", "");
+    const seen2 = { clone: 0 } as { ctx?: PipelineContext; clone: number };
+    const r2 = await runKgRefresh({ workspaceDir: tmpDir, stepsOverride: steps(seen2), llmExecutor: exec, reporter: { report: async () => undefined } });
+    expect(r2.exitCode).toBe(0);
+    expect(seen2.ctx!.llmExecutor).toBe(exec);
+    expect(exec.invoke).not.toHaveBeenCalled();
+    warn.mockRestore();
+  });
+});
