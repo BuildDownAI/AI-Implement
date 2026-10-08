@@ -3,11 +3,44 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { gitProcessEnv } from "../process-env.js";
+import type { ResolvedAgentSnapshotV1 } from "../../run-config.js";
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
+
+export type SkillAgent = "claude" | "codex";
+
+/** Claude Code discovers user skills here, relative to the home directory. */
+export const CLAUDE_SKILLS_SUBDIR = path.join(".claude", "skills");
+/**
+ * Codex discovers user skills in `$HOME/.agents/skills` regardless of the selected profile's `CODEX_HOME`, so a
+ * per-account home change never hides them. The only Codex destination; target repositories cannot choose another.
+ */
+export const CODEX_SKILLS_SUBDIR = path.join(".agents", "skills");
+
+const SKILLS_SUBDIR_BY_AGENT: Record<SkillAgent, string> = {
+  claude: CLAUDE_SKILLS_SUBDIR,
+  codex: CODEX_SKILLS_SUBDIR,
+};
+
+/**
+ * Agents whose skill directories a run needs, deduplicated across stages. No snapshot is a legacy run: Claude only.
+ */
+export function skillAgentsForSnapshot(
+  snapshot: Pick<ResolvedAgentSnapshotV1, "stages"> | undefined,
+): SkillAgent[] {
+  if (!snapshot) return ["claude"];
+  const agents = new Set<SkillAgent>();
+  for (const selection of Object.values(snapshot.stages ?? {})) {
+    const agent = (selection as { agent?: unknown } | undefined)?.agent;
+    if (agent === "claude" || agent === "codex") agents.add(agent);
+  }
+  return agents.size > 0 ? [...agents] : ["claude"];
+}
 
 interface InstallSkillsInputs extends Record<string, unknown> {
   skillsRepoUrl: string;
   githubToken: string;
+  /** Agents to install for; defaults to Claude only (legacy behavior). */
+  agents?: SkillAgent[];
   /** Test-only injection point; production always falls back to os.homedir(). */
   homeDir?: string;
 }
@@ -23,7 +56,15 @@ export const installSkillsStep: StepModule<InstallSkillsInputs, InstallSkillsOut
     inputs: InstallSkillsInputs,
     _reporter: StepReporter,
   ): Promise<InstallSkillsOutputs> {
+    return installSkills(inputs);
+  },
+};
+
+/** Shared by the pipeline step and the planning entry points, which have no pipeline context. Never throws. */
+export function installSkills(inputs: InstallSkillsInputs): InstallSkillsOutputs {
+  {
     let { skillsRepoUrl, githubToken, homeDir = os.homedir() } = inputs;
+    const agents = inputs.agents?.length ? [...new Set(inputs.agents)] : (["claude"] as SkillAgent[]);
 
     // Redact every occurrence of the token before any value is logged (a single
     // .replace() would miss repeats; guard the empty-token case so we don't splice
@@ -73,7 +114,9 @@ export const installSkillsStep: StepModule<InstallSkillsInputs, InstallSkillsOut
       const remote =
         isLocalPath || !isGitHubHost
           ? skillsRepoUrl
-          : skillsRepoUrl.replace("https://", `https://x-access-token:${githubToken}@`);
+          : githubToken
+            ? skillsRepoUrl.replace("https://", `https://x-access-token:${githubToken}@`)
+            : skillsRepoUrl;
 
       const cloneResult = spawnSync(
         "git",
@@ -141,13 +184,18 @@ export const installSkillsStep: StepModule<InstallSkillsInputs, InstallSkillsOut
         }
       }
 
-      const targetBase = path.join(homeDir, ".claude", "skills");
       let skillsInstalled = 0;
-      for (const dir of skillDirs) {
-        const dest = path.join(targetBase, dir.name);
-        fs.mkdirSync(dest, { recursive: true });
-        fs.cpSync(dir.src, dest, { recursive: true, force: true });
-        skillsInstalled++;
+      for (const agent of agents) {
+        const targetBase = path.join(homeDir, SKILLS_SUBDIR_BY_AGENT[agent]);
+        let installedForAgent = 0;
+        for (const dir of skillDirs) {
+          const dest = path.join(targetBase, dir.name);
+          fs.mkdirSync(dest, { recursive: true });
+          fs.cpSync(dir.src, dest, { recursive: true, force: true });
+          installedForAgent++;
+        }
+        // Report distinct skills, not copies, so a mixed run matches a single-agent run.
+        skillsInstalled = Math.max(skillsInstalled, installedForAgent);
       }
 
       console.log(
@@ -167,5 +215,5 @@ export const installSkillsStep: StepModule<InstallSkillsInputs, InstallSkillsOut
         }
       }
     }
-  },
-};
+  }
+}

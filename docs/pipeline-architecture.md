@@ -101,6 +101,12 @@ One consumer: `src/pipeline/process-env.ts`. `parseForwardedSecrets()` reads the
 
 The built-in `install` step is the one step that reads a forwarded secret by a fixed name: when `NPM_TOKEN` and the `AI_IMPLEMENT_NPM_REGISTRY` variable are both present it writes a per-run npm user config for the install command and removes it afterwards, so a private registry can be authenticated before any hook runs — see [private-npm-registry.md](private-npm-registry.md).
 
+## Skill install destinations
+
+`install-skills` copies each discovered skill (content unchanged) into one directory per agent the run's frozen stage snapshot (`agentConfig`) selects, deduplicated across stages: Claude `~/.claude/skills`, Codex `~/.agents/skills` (`CODEX_SKILLS_SUBDIR`). Codex discovery does not depend on the selected profile's `CODEX_HOME`. With no snapshot (legacy) only the Claude directory is written. Destinations are fixed; a target repository cannot choose one. The clone runs under `gitProcessEnv`, so the token and model credentials never reach it, and failures stay non-fatal.
+
+Planning has no pipeline, so both planning entry points (`runPlanning`, `runPlanningLocally`) call the same `installSkills` function with the envelope's `skillsRepo` and the runner's `GITHUB_TOKEN` before any planning executor starts. Codex planning runs in an isolated view `HOME` and does not see `~/.agents/skills` yet (AII-1163).
+
 ## How steps get their inputs
 
 This is the least obvious part of the design, and the easiest thing to get wrong when extending it.

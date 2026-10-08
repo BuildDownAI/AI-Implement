@@ -137,4 +137,19 @@ describe("runLocalPlanningFromEnv", () => {
       rmSync(workspace, { recursive: true, force: true });
     }
   });
+
+  it("forwards the envelope skillsRepo to planning", async () => {
+    const runPlanning = vi.fn().mockResolvedValue({ exitCode: 0, planningContext: "x", planFound: true, diagnostics: "" });
+    const runConfig = encodeRunConfig({
+      v: 1,
+      issue: { id: "i", identifier: "LOCAL-1", title: "T", description: "D" },
+      runnerPhase: "planning",
+      skillsRepo: "org/skills",
+    });
+    await runLocalPlanningFromEnv(
+      { AI_IMPLEMENT_RUN_CONFIG: runConfig, WORKSPACE_DIR: "/workspace" },
+      { runPlanning, writeStdout: vi.fn(), writeStderr: vi.fn() },
+    );
+    expect(runPlanning).toHaveBeenCalledWith(expect.objectContaining({ skillsRepo: "org/skills" }));
+  });
 });

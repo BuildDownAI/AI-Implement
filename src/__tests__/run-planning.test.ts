@@ -14,6 +14,12 @@ import { vi } from "vitest";
 import { EventEmitter } from "node:events";
 import type { spawn } from "node:child_process";
 
+vi.mock("../pipeline/steps/install-skills.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../pipeline/steps/install-skills.js")>();
+  return { ...actual, installSkills: vi.fn(() => ({ skillsInstalled: 0, skillsRepoRef: null })) };
+});
+import { installSkills } from "../pipeline/steps/install-skills.js";
+
 type RunnerResultPayload = {
   phase: "planning";
   outcome: "success" | "failure";
@@ -963,5 +969,69 @@ describe("configured planning (shared prepareConfiguredRun + selected stage exec
     });
     expect(r).toMatchObject({ exitCode: 1, planFound: false, diagnostics: "Configured planning failed (snapshot_incomplete)" });
     expect(legacy).not.toHaveBeenCalled();
+  });
+});
+
+describe("planning skills install", () => {
+  let ws: string;
+  const order: string[] = [];
+  beforeEach(() => {
+    ws = mkdtempSync(join(tmpdir(), "plan-skills-"));
+    order.length = 0;
+    vi.mocked(installSkills).mockClear();
+    vi.mocked(installSkills).mockImplementation(() => {
+      order.push("install");
+      return { skillsInstalled: 0, skillsRepoRef: null };
+    });
+    delete process.env.AI_IMPLEMENT_RUN_CONFIG;
+    setEnv();
+    process.env.GITHUB_TOKEN = "synthetic-gh-token";
+  });
+  afterEach(() => {
+    rmSync(ws, { recursive: true, force: true });
+    delete process.env.AI_IMPLEMENT_RUN_CONFIG;
+    delete process.env.GITHUB_TOKEN;
+  });
+  const executor = () => {
+    order.push("executor");
+    mkdirSync(join(ws, "ai-output", "comments"), { recursive: true });
+    writeFileSync(join(ws, "ai-output", "comments", "01-plan.md"), "# Plan");
+    return { status: 0, stdout: "", stderr: "" };
+  };
+
+  it("runPlanning installs Claude skills from the envelope before the legacy executor", async () => {
+    process.env.AI_IMPLEMENT_RUN_CONFIG = encodeRunConfig({
+      v: 1,
+      issue: { id: "e", identifier: "AII-9", title: "T", description: "D" },
+      skillsRepo: "org/skills",
+    });
+    await runPlanning({ workspaceDir: ws, executor });
+    expect(order).toEqual(["install", "executor"]);
+    expect(installSkills).toHaveBeenCalledWith({
+      skillsRepoUrl: "org/skills",
+      githubToken: "synthetic-gh-token",
+      agents: ["claude"],
+    });
+  });
+
+  it("runPlanning skips the install when no skillsRepo is configured", async () => {
+    await runPlanning({ workspaceDir: ws, executor });
+    expect(installSkills).not.toHaveBeenCalled();
+  });
+
+  it("runPlanningLocally installs before the legacy executor and is skipped without skillsRepo", async () => {
+    const base = { workspaceDir: ws, issueIdentifier: "L-1", issueTitle: "T", issueDescription: "D", executor };
+    await runPlanningLocally({ ...base, skillsRepo: "org/skills" });
+    expect(order).toEqual(["install", "executor"]);
+    vi.mocked(installSkills).mockClear();
+    await runPlanningLocally(base);
+    expect(installSkills).not.toHaveBeenCalled();
+  });
+
+  it("planning proceeds when the install reports zero skills", async () => {
+    const result = await runPlanningLocally({
+      workspaceDir: ws, issueIdentifier: "L-1", issueTitle: "T", issueDescription: "D", executor, skillsRepo: "org/skills",
+    });
+    expect(result.exitCode).toBe(0);
   });
 });
