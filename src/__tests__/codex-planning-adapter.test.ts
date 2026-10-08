@@ -342,7 +342,7 @@ describe("planning protocol driver", () => {
       const out = await drive(server);
       expect(out.sawUnsafe).toBe(true);
       expect(out.result.stderr.endsWith(`unexpected_item: ${label}`)).toBe(true);
-      if (type !== "SENTINEL x") expect(out.result.stderr).not.toContain("SENTINEL");
+      expect(out.result.stderr).not.toContain("SENTINEL");
     }
   });
 
