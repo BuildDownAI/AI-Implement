@@ -24,6 +24,7 @@ const {
   runScenarioFinally,
   subscriptionUnknownProof,
   summarizeResult,
+  writeLiveResult,
 } = localFeedbackCommand;
 
 const tempRoots: string[] = [];
@@ -203,6 +204,31 @@ describe("local feedback command helpers", () => {
     await expect(pathAbsent("/tmp/missing", async () => { const error = new Error("missing") as NodeJS.ErrnoException; error.code = "ENOENT"; throw error; })).resolves.toBe(true);
     await expect(pathAbsent("/tmp/eio", async () => { const error = new Error("io") as NodeJS.ErrnoException; error.code = "EIO"; throw error; })).resolves.toBe(false);
     await expect(pathAbsent("/tmp/present", async () => ({}))).resolves.toBe(false);
+  });
+
+  it.each([
+    [0, "success"],
+    [1, "failure"],
+  ])("rewrites the live summary with the finished run's outcome (exit %i → %s)", (exitCode, outcome) => {
+    const artifactsDir = tempDir("live-result");
+    const input = {
+      source: { head: "abc", trackedDiffSha256: "def" },
+      image: "sha256:123",
+      stages: { review: { model: "gpt-local-review", authMode: "codex-subscription" } },
+    };
+    // The preflight summary is written before launch and must not survive as the final word.
+    writeFileSync(join(artifactsDir, "summary.md"), summarizeResult({ ok: false, mode: "live-preflight", artifactsDir, ...input }));
+
+    writeLiveResult({ artifactsDir, exitCode, ...input });
+
+    const summary = readFileSync(join(artifactsDir, "summary.md"), "utf8");
+    expect(summary).toContain(`- outcome: ${outcome}`);
+    expect(summary).toContain("- mode: live\n");
+    expect(summary).not.toContain("live-preflight");
+    expect(summary).toContain("sha256:123");
+    expect(summary).toContain("gpt-local-review");
+    expect(summary).toContain(`exit code ${exitCode}`);
+    expect(JSON.parse(readFileSync(join(artifactsDir, "result.json"), "utf8"))).toEqual({ exitCode, live: true });
   });
 
   it("summarizes redacted result evidence without credential material", () => {

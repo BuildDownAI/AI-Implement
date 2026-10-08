@@ -243,6 +243,10 @@ npm run local:feedback -- \
   --artifacts-dir "$ARTIFACTS_DIR"
 ```
 
+When the run finishes, `summary.md` reports `mode: live` and the outcome from the
+harness exit code, matching `result.json`. A summary that still says
+`mode: live-preflight` means the command stopped before the run finished.
+
 Use a clean target checkout. If a cancelled or failed run leaves a session lock
 held for the same `auth.json`, inspect the artifact directory before trying
 again. A partial artifact set should still show the source proof, image proof,

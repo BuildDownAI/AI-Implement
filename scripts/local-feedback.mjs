@@ -943,6 +943,13 @@ function summarizeResolvedStages(loaded) {
   }));
 }
 
+/** Final live evidence: result.json plus a summary that replaces the preflight one with the finished run's outcome. */
+export function writeLiveResult({ artifactsDir, exitCode, source, image, stages }) {
+  writeJson(join(artifactsDir, "result.json"), { exitCode, live: true });
+  const note = `Live production full loop finished with exit code ${exitCode}; runner.log and run/ hold the stage outcomes.`;
+  writeFileSync(join(artifactsDir, "summary.md"), summarizeResult({ ok: exitCode === 0, mode: "live", source, image, artifactsDir, stages, note }), { mode: 0o600 });
+}
+
 async function runLive(options) {
   ensureNode24();
   dockerAvailable();
@@ -969,13 +976,18 @@ async function runLive(options) {
   console.error("[local:feedback] live stage selections:");
   console.error(JSON.stringify(stages, null, 2));
   const { deps, dispose } = makeCliDeps({ cliModule, artifactsDir: join(artifactsDir, "run"), logsPath: join(artifactsDir, "runner.log") });
+  const imageId = options.image ?? prior.imageId;
   let exitCode = 1;
   try {
-    exitCode = await cliModule.runDevHarnessCli(buildDevHarnessArgs({ workspace, task, imageId: options.image ?? prior.imageId, agentConfig }), deps);
+    exitCode = await cliModule.runDevHarnessCli(buildDevHarnessArgs({ workspace, task, imageId, agentConfig }), deps);
   } finally {
-    dispose();
+    try {
+      dispose();
+    } finally {
+      // A harness that throws still leaves a failure summary rather than the preflight one.
+      writeLiveResult({ artifactsDir, exitCode, source, image: imageId, stages });
+    }
   }
-  writeJson(join(artifactsDir, "result.json"), { exitCode, live: true });
   return { ok: exitCode === 0, exitCode, artifactsDir };
 }
 
