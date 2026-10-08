@@ -14,7 +14,14 @@ import { kgTrackerDataStep, KgTrackerDataFetchError } from "./steps/kg-tracker-d
 import { kgScopeReconcileStep } from "./steps/kg-scope-reconcile.js";
 import { kgIngestStep, KgIngestError } from "./steps/kg-ingest.js";
 import { ClaudeCliExecutor } from "./executor.js";
-import { resolveLogLevel } from "../run-autonomous.js";
+import {
+  ConfiguredRunError,
+  hasConfiguredIntent,
+  prepareConfiguredRun,
+  resolveLogLevel,
+  type ConfiguredRunOptions,
+} from "../run-autonomous.js";
+import type { ResolvedAgentSnapshotV1 } from "../run-config.js";
 import type { LLMExecutor, PipelineContext, StepReporter, StepModule } from "./types.js";
 
 
@@ -132,6 +139,8 @@ export interface RunKgRefreshOptions {
   workspaceDir?: string;
   reporter?: StepReporter;
   llmExecutor?: LLMExecutor;
+  /** Seams for an opted-in (snapshot-carrying) run. Ignored for legacy runs. */
+  configured?: ConfiguredRunOptions;
   fetchImpl?: typeof fetch;
   stepsOverride?: {
     clone?: StepModule;
@@ -163,6 +172,7 @@ function resolveKgRefreshInputs(env: NodeJS.ProcessEnv): {
   kgDryRun: boolean;
   kgAcceptNewBaseline: boolean;
   kgBaselineActor: string | undefined;
+  agentConfig: ResolvedAgentSnapshotV1 | undefined;
 } {
   const rawConfig = env.AI_IMPLEMENT_RUN_CONFIG;
   let issueId = "";
@@ -175,6 +185,7 @@ function resolveKgRefreshInputs(env: NodeJS.ProcessEnv): {
   let kgDryRun = false;
   let kgAcceptNewBaseline = false;
   let kgBaselineActor: string | undefined;
+  let agentConfig: ResolvedAgentSnapshotV1 | undefined;
 
   if (rawConfig) {
     try {
@@ -191,7 +202,11 @@ function resolveKgRefreshInputs(env: NodeJS.ProcessEnv): {
       kgDryRun = cfg.kgDryRun === true;
       kgAcceptNewBaseline = cfg.kgAcceptNewBaseline === true;
       kgBaselineActor = cfg.kgBaselineActor;
+      agentConfig = cfg.agentConfig;
     } catch (err) {
+      // An opted-in envelope is authoritative: malformed configured input never degrades to the legacy
+      // environment fallbacks, and the diagnostic is fixed text (the decode error is not echoed).
+      if (hasConfiguredIntent(rawConfig)) throw new ConfiguredRunError("snapshot_incomplete");
       console.warn("[kg-refresh] Could not decode run_config envelope; using env fallbacks:", err);
     }
   }
@@ -221,6 +236,7 @@ function resolveKgRefreshInputs(env: NodeJS.ProcessEnv): {
     kgDryRun,
     kgAcceptNewBaseline,
     kgBaselineActor,
+    agentConfig,
   };
 }
 
@@ -244,7 +260,18 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
     kgDryRun: kgDryRunFromConfig,
     kgAcceptNewBaseline,
     kgBaselineActor,
+    agentConfig,
   } = resolveKgRefreshInputs(process.env);
+
+  // Validate an opted-in run before the clone, ingest or any model work. The deterministic kg-refresh
+  // pipeline has no agent step, so the selected executor serves only the context's model-driven repair.
+  const configured = await prepareConfiguredRun({
+    env: process.env,
+    snapshot: agentConfig,
+    workspaceDir,
+    repositories: [`${githubOwner}/${githubRepo}`],
+    options: opts.configured,
+  });
 
   // The env var stays as the dev-harness path (AII-586); the envelope field is the
   // real dispatch path (AII-632). Either one flips dry-run on.
@@ -268,7 +295,8 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
       githubRepo,
       githubToken,
       branch: defaultBranch,
-      provider,
+      provider: configured ? configured.provider : provider,
+      agentConfig: configured?.snapshot,
       maxTurns,
       callbackUrl: callbackUrl ?? undefined,
       dependencyTokenScope,
@@ -276,7 +304,13 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
       kgAcceptNewBaseline,
       kgBaselineActor,
     },
-    opts.llmExecutor ?? new ClaudeCliExecutor(workspaceDir, resolveLogLevel(process.env.AI_IMPLEMENT_LOG_LEVEL)),
+    configured
+      ? configured.createExecutor({
+          workspaceDir,
+          legacy: opts.llmExecutor,
+          logLevel: resolveLogLevel(process.env.AI_IMPLEMENT_LOG_LEVEL),
+        })
+      : opts.llmExecutor ?? new ClaudeCliExecutor(workspaceDir, resolveLogLevel(process.env.AI_IMPLEMENT_LOG_LEVEL)),
   );
 
   const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml");
@@ -333,6 +367,7 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
               : undefined;
     const failureReason = err instanceof Error ? err.message : String(err);
     console.error(`[kg-refresh] run failed: ${failureCode ?? "unknown"} — ${failureReason}`);
+    await configured?.finish("failed");
     // A guard refusal from kg-snapshot-push carries its per-part table on the error
     // itself (AII-632) so both dry-run and real refusals report the table via
     // get_kg_status (AII-638).
@@ -352,6 +387,7 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
     return { exitCode: 1 };
   }
 
+  await configured?.finish("completed");
   const snapshotPushOutputs = context.getOutputs("kg-snapshot-push");
   await postRunnerResult({
     phase: "kg-refresh",
