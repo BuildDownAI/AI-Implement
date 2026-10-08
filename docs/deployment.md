@@ -314,7 +314,7 @@ A failed probe re-runs in the background (throttled) on the next proxied failure
 
 `RESTATE_DATA_DIR` is the one operator-facing knob (`.env.example`): unset, the embedded store lives under the dedup DB's directory (`/data/restate` on Fly), so a Fly volume that already covers `DEDUP_DB_PATH` covers it without a config change. On macOS, a long checkout path can push the sidecar's unix-socket paths past the platform's 104-byte limit and make `restate-server` exit at boot with `RT0004 … path must be shorter than 104 bytes` — set `RESTATE_DATA_DIR` to a short path (e.g. `/tmp/restate-dev`) in that case (full detail: [docs/restate.md](restate.md) § "Deployment and operations").
 
-**Required checks (operator step).** Mark `unit-tests`, `restate-tests`, and the three matrix checks `restate-tests-binary (1)`, `restate-tests-binary (2)`, and `restate-tests-binary (3)` (AII-1158; no bare `restate-tests-binary` check exists) as required checks on `testing` (Settings → Branches). The branch has no required status checks by default, so until this is done a red job does not block a merge.
+**Required checks (operator step).** Mark `unit-tests`, `restate-tests`, and `restate-tests-binary` as required checks on `testing` (Settings → Branches). The branch has no required status checks by default, so until this is done a red job does not block a merge.
 
 ### Local image boot check
 
