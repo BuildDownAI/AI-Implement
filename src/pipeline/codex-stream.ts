@@ -83,6 +83,27 @@ function sumNullable(a: number | null, b: number | null): number | null {
   return (a ?? 0) + b;
 }
 
+function isLocalResponsesWebsocketUrl(raw: string): boolean {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return false;
+  }
+  if (url.protocol !== "ws:") return false;
+  if (url.hostname !== "local-feedback-provider" && url.hostname !== "127.0.0.1") return false;
+  if (url.pathname !== "/v1/responses" || url.search || url.hash || url.username || url.password) return false;
+  const port = Number(url.port);
+  return Number.isInteger(port) && port >= 1 && port <= 65535;
+}
+
+function isResponsesWebsocketReconnectNotice(message: string): boolean {
+  const match = message.match(
+    /^Reconnecting\.\.\. ([2-5])\/5 \(unexpected status 404 Not Found: Unknown error, url: (ws:\/\/[^)\s]+)\)$/,
+  );
+  return !!match && isLocalResponsesWebsocketUrl(match[2]);
+}
+
 export class CodexStreamParser {
   private partial = "";
   private discarding = false;
@@ -194,6 +215,7 @@ export class CodexStreamParser {
         this.openTurn = false;
         return;
       case "error":
+        if (typeof event.message === "string" && isResponsesWebsocketReconnectNotice(event.message)) return;
         this.fatal ??= "error";
         return;
       case "item.started":

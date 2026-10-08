@@ -724,6 +724,37 @@ describe("prepareConfiguredRun", () => {
     expect(local.localCredentialPort.load).not.toHaveBeenCalled();
   });
 
+  it("accepts a local synthetic provider only for selected Codex/OpenAI profiles", async () => {
+    const local = { localCredentialPort: { load: vi.fn() } };
+    await expect(prepareConfiguredRun({
+      env: {},
+      workspaceDir: "/tmp/ws-x",
+      options: {
+        agentConfig: snap,
+        ...local,
+        syntheticProvider: { version: 1, kind: "local-feedback-provider", port: 8080, profileIds: ["p-impl"] },
+      },
+    })).resolves.toBeTruthy();
+  });
+
+  it("rejects synthetic providers outside the local protected-port path", async () => {
+    const synth = { version: 1 as const, kind: "local-feedback-provider" as const, port: 8080, profileIds: ["p-impl"] };
+    const local = { localCredentialPort: { load: vi.fn() } };
+    expect(await reason(prepareConfiguredRun({ env: {}, workspaceDir: "/tmp/ws-x", options: { agentConfig: snap, syntheticProvider: synth } }))).toBe("bootstrap_missing");
+    expect(await reason(prepareConfiguredRun({ env: {}, workspaceDir: "/tmp/ws-x", options: { agentConfig: snap, ...local, modelAuthClient: fakeClient(), syntheticProvider: synth } }))).toBe("bootstrap_invalid");
+    expect(await reason(prepare(envelopeEnv(snap, makeGrant(snap)), { syntheticProvider: synth }))).toBe("bootstrap_invalid");
+  });
+
+  it("rejects invalid synthetic provider ports and profile selections", async () => {
+    const local = { localCredentialPort: { load: vi.fn() } };
+    const base = { agentConfig: snap, ...local };
+    expect(await reason(prepareConfiguredRun({ env: {}, workspaceDir: "/tmp/ws-x", options: { ...base, syntheticProvider: { version: 1, kind: "local-feedback-provider", port: 0, profileIds: ["p-impl"] } } }))).toBe("bootstrap_invalid");
+    expect(await reason(prepareConfiguredRun({ env: {}, workspaceDir: "/tmp/ws-x", options: { ...base, syntheticProvider: { version: 1, kind: "local-feedback-provider", port: 65536, profileIds: ["p-impl"] } } }))).toBe("bootstrap_invalid");
+    expect(await reason(prepareConfiguredRun({ env: {}, workspaceDir: "/tmp/ws-x", options: { ...base, syntheticProvider: { version: 1, kind: "local-feedback-provider", port: 8080, profileIds: [] } } }))).toBe("bootstrap_invalid");
+    expect(await reason(prepareConfiguredRun({ env: {}, workspaceDir: "/tmp/ws-x", options: { ...base, syntheticProvider: { version: 1, kind: "local-feedback-provider", port: 8080, profileIds: ["p-rev"] } } }))).toBe("bootstrap_invalid");
+    expect(await reason(prepareConfiguredRun({ env: {}, workspaceDir: "/tmp/ws-x", options: { ...base, syntheticProvider: { version: 1, kind: "local-feedback-provider", port: 8080, profileIds: ["p-impl", "p-impl"] } } }))).toBe("bootstrap_invalid");
+  });
+
   it("checks out each profile once, on first use, and finishes then disposes it", async () => {
     const client = fakeClient();
     const run = (await prepare(envelopeEnv(snap, makeGrant(snap)), { modelAuthClient: client }))!;

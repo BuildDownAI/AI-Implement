@@ -42,6 +42,31 @@ export class CodexRecoveryRequiredError extends Error {
 /** Fixed-message rejection of a refreshed session; never carries file content. */
 class AuthSyncRejected extends Error {}
 
+function validateSelectedOpenAIBaseUrl(raw: string | undefined): string | undefined {
+  if (!raw) return undefined;
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new CodexRecoveryRequiredError("auth_sync_failed");
+  }
+  if (
+    url.protocol !== "http:" ||
+    (url.hostname !== "local-feedback-provider" && url.hostname !== "127.0.0.1") ||
+    url.pathname !== "/v1" ||
+    url.search ||
+    url.hash ||
+    url.username ||
+    url.password ||
+    !url.port
+  ) {
+    throw new CodexRecoveryRequiredError("auth_sync_failed");
+  }
+  const port = Number(url.port);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new CodexRecoveryRequiredError("auth_sync_failed");
+  return raw;
+}
+
 function parseAuth(text: string): Record<string, unknown> | null {
   try {
     const parsed: unknown = JSON.parse(text);
@@ -451,7 +476,7 @@ export class CodexExecutor implements LLMExecutor {
     }
   }
 
-  private buildArgs(params: InvokeParams, schemaPath: string | null): string[] {
+  private buildArgs(params: InvokeParams, schemaPath: string | null, baseUrl?: string): string[] {
     // Pinned selection is placed on argv, after the ignore flags, so user or project config
     // cannot change it. No Claude-only flag and no bypass or approve-all flag is ever passed.
     const args = [
@@ -463,6 +488,7 @@ export class CodexExecutor implements LLMExecutor {
       params.model,
       "-c",
       `model_provider="${CODEX_PROVIDER}"`,
+      ...(baseUrl ? ["-c", `openai_base_url=${JSON.stringify(baseUrl)}`] : []),
       ...this.sandboxArgs(params),
     ];
     if (schemaPath) args.push("--output-schema", schemaPath);
@@ -623,10 +649,10 @@ export class CodexExecutor implements LLMExecutor {
         writeFileSync(schemaPath, JSON.stringify(params.jsonSchema), { mode: 0o600 });
       }
       if (this.options.protocolDriver) {
-        view = this.createAppServerView(selectedEnv.CODEX_HOME, params.model, selectedEnv.OPENAI_BASE_URL);
+        view = this.createAppServerView(selectedEnv.CODEX_HOME, params.model, validateSelectedOpenAIBaseUrl(selectedEnv.OPENAI_BASE_URL));
         env = { ...selectedEnv, CODEX_HOME: view.home, HOME: view.userHome };
       }
-      const args = this.options.protocolDriver ? this.buildAppServerArgs(params) : this.buildArgs(params, schemaPath);
+      const args = this.options.protocolDriver ? this.buildAppServerArgs(params) : this.buildArgs(params, schemaPath, validateSelectedOpenAIBaseUrl(selectedEnv.OPENAI_BASE_URL));
       // Auth acquisition and view setup may have consumed the budget: never spawn with an expired timeout.
       if (deadlineAt !== null && this.now() >= deadlineAt) return expiredAttempt();
       const attempt = await this.spawnAndWait(params, args, env, view ?? undefined, selectedEnv.CODEX_HOME, deadlineAt);

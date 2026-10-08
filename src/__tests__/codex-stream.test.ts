@@ -133,6 +133,19 @@ describe("usage and terminal semantics", () => {
 
 const started = { type: "turn.started" };
 const approved = msg('{"approved":true}');
+const wsRetry = (attempt: number, url = "ws://local-feedback-provider:8080/v1/responses") => ({
+  type: "error",
+  message: `Reconnecting... ${attempt}/5 (unexpected status 404 Not Found: Unknown error, url: ${url})`,
+});
+const wsFallbackItem = {
+  type: "item.completed",
+  item: {
+    id: "transport_fallback",
+    type: "error",
+    message:
+      "Falling back from WebSockets to HTTPS transport. unexpected status 404 Not Found: Unknown error, url: ws://local-feedback-provider:8080/v1/responses",
+  },
+};
 
 describe("stream integrity", () => {
   const bad: Array<[string, string]> = [
@@ -191,6 +204,39 @@ describe("stream integrity", () => {
     expect(p.structuredOutput).toEqual({ approved: true });
     expect(p.telemetry.tokensIn).toBe(7);
     expect(p.telemetry.outcome).toBe("success");
+  });
+  it("keeps a valid verdict after the pinned Codex local websocket fallback notices", () => {
+    const p = parseCodexStream(j(
+      { type: "thread.started", thread_id: "t1" },
+      { type: "item.completed", item: { id: "metadata", type: "error", message: "Model metadata for `gpt-local-review` not found. Defaulting to fallback metadata; this can degrade performance and cause issues." } },
+      started,
+      wsRetry(2),
+      wsRetry(3),
+      wsRetry(4),
+      wsRetry(5),
+      wsFallbackItem,
+      approved,
+      done({ input_tokens: 11, output_tokens: 7 }),
+    ));
+    expect(p.terminalStatus).toEqual({ subtype: "success", isError: false });
+    expect(p.structuredOutput).toEqual({ approved: true });
+    expect(p.sawUnsafeActivity).toBe(false);
+    expect(p.telemetry.outcome).toBe("success");
+    expect(p.telemetry.tokensIn).toBe(11);
+    expect(p.telemetry.tokensOut).toBe(7);
+  });
+  it.each([
+    ["attempt 1", wsRetry(1)],
+    ["attempt 6", wsRetry(6)],
+    ["wrong status", { type: "error", message: "Reconnecting... 2/5 (unexpected status 500 Internal Server Error: Unknown error, url: ws://local-feedback-provider:8080/v1/responses)" }],
+    ["non-local host", wsRetry(2, "ws://example.invalid:8080/v1/responses")],
+    ["missing port", wsRetry(2, "ws://local-feedback-provider/v1/responses")],
+    ["query string", wsRetry(2, "ws://local-feedback-provider:8080/v1/responses?x=1")],
+  ])("%s websocket-looking error remains fatal", (_name, event) => {
+    const p = parseCodexStream(j(started, event, approved, done()));
+    expect(p.terminalStatus).toEqual({ subtype: "error", isError: true });
+    expect(p.structuredOutput).toBeUndefined();
+    expect(p.telemetry.outcome).toBe("error");
   });
   it("maps cache_write_input_tokens", () => {
     expect(parseCodexStream(j(done({ cache_write_input_tokens: 5 }))).telemetry.cacheCreationTokens).toBe(5);

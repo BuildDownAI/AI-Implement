@@ -8,6 +8,7 @@ import { splitLocalRunnerEnv } from "../local-docker.js";
 import type { LocalContainerState } from "../local-docker.js";
 import { encodeRunConfig } from "../run-config.js";
 import type { ResolvedAgentSnapshotV1 } from "../run-config.js";
+import type { ConfiguredSyntheticProviderOptions } from "../run-autonomous.js";
 import {
   LocalSessionOwnership,
   createLocalCredentialPort,
@@ -33,6 +34,13 @@ export type { ParsedTaskFile };
 
 export type DevRunPhase = "implementation" | "planning" | "full" | "kg-refresh";
 export type DevWorkspaceMode = "mounted" | "copy";
+
+export interface DevRunLocalFeedbackOptions {
+  providerPort: number;
+  bridgePort: number;
+  networkName: string;
+  hostGateway: string;
+}
 
 export interface DevRunOptions {
   /** Absolute or relative path to the local target-repo checkout. */
@@ -63,6 +71,8 @@ export interface DevRunOptions {
   workspaceMode?: DevWorkspaceMode;
   /** External standalone stage-agent configuration file for trusted local configured runs. */
   agentConfig?: string;
+  /** Local synthetic feedback provider wiring for real-image full-loop validation. */
+  localFeedback?: DevRunLocalFeedbackOptions;
   /**
    * Path to a pre-fetched tracker-data JSON file — the offline path for phase=kg-refresh.
    * Mounted read-only at /dev-tracker-data.json inside the container; the
@@ -214,6 +224,42 @@ function hasSubscriptionReference(references: readonly LocalCredentialReference[
   return references.some((r) => r.kind === "session");
 }
 
+function selectedCodexOpenAiProfileIds(snapshot: ResolvedAgentSnapshotV1): string[] {
+  return [...new Set(Object.values(snapshot.profiles)
+    .filter((profile) => profile.agent === "codex" && profile.provider === "openai")
+    .map((profile) => profile.id))];
+}
+
+function validatePort(value: number, name: string): void {
+  if (!Number.isInteger(value) || value < 1 || value > 65535) {
+    throw new Error(`Invalid local feedback ${name}: expected TCP port 1-65535`);
+  }
+}
+
+function validateHostGateway(value: string): void {
+  const parts = value.split(".");
+  if (parts.length !== 4 || parts.some((p) => !/^\d{1,3}$/.test(p) || Number(p) > 255)) {
+    throw new Error("Invalid local feedback hostGateway: expected IPv4 address");
+  }
+}
+
+function validateNetworkName(value: string): void {
+  if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(value)) {
+    throw new Error("Invalid local feedback networkName");
+  }
+  if (/^(bridge|host|none|container|ingress)(?:$|[_.:-])/i.test(value)) {
+    throw new Error("Invalid local feedback networkName: reserved Docker network name");
+  }
+}
+
+function validateLocalFeedbackOptions(options: DevRunLocalFeedbackOptions | undefined): void {
+  if (!options) return;
+  validatePort(options.providerPort, "providerPort");
+  validatePort(options.bridgePort, "bridgePort");
+  validateNetworkName(options.networkName);
+  validateHostGateway(options.hostGateway);
+}
+
 function assertNoConfiguredEnvOverrides(env: Record<string, string> | undefined): void {
   if (!env) return;
   const protectedNames = new Set([
@@ -268,6 +314,7 @@ async function prepareLocalConfiguredAuth(input: {
   workspace: string;
   artifactsDir: string;
   repositories: readonly string[];
+  localFeedback?: DevRunLocalFeedbackOptions;
 }): Promise<{ snapshot: ResolvedAgentSnapshotV1 | undefined; env: Record<string, string>; bridge?: LocalAuthBridge; bootstrapDir?: string }> {
   const configPath = resolve(input.configPath);
   const ownership = new LocalSessionOwnership({ forbiddenRoots: [input.workspace, input.artifactsDir] });
@@ -281,7 +328,21 @@ async function prepareLocalConfiguredAuth(input: {
       forbiddenRoots: [input.workspace, input.artifactsDir],
     });
     const snapshot = snapshotFromLocalConfig(loaded);
+    if (!snapshot && input.localFeedback) {
+      throw new Error("localFeedback requires an external agent config that resolves to configured stage agents");
+    }
     if (!snapshot) return { snapshot: undefined, env: {} };
+    const syntheticProvider: ConfiguredSyntheticProviderOptions | undefined = input.localFeedback
+      ? {
+          version: 1,
+          kind: "local-feedback-provider",
+          port: input.localFeedback.providerPort,
+          profileIds: selectedCodexOpenAiProfileIds(snapshot),
+        }
+      : undefined;
+    if (input.localFeedback && (!syntheticProvider || syntheticProvider.profileIds.length === 0)) {
+      throw new Error("Local feedback requires at least one selected Codex/OpenAI profile");
+    }
     const references = [...loaded.references.values()];
     if (hasSubscriptionReference(references)) {
       if (!input.actualRepository) {
@@ -308,6 +369,7 @@ async function prepareLocalConfiguredAuth(input: {
       leases,
       references: references as LocalCredentialReference[],
       trustedRepositories: input.repositories,
+      ...(syntheticProvider ? { syntheticProvider, listenPort: input.localFeedback!.bridgePort } : {}),
     });
     dir = await mkdtemp(join(tmpdir(), "ai-implement-local-auth-"));
     const bootstrapPath = join(dir, "bootstrap.json");
@@ -458,7 +520,11 @@ export async function startDevRun(opts: DevRunOptions): Promise<DevRunHandle> {
   if (opts.agentConfig && phase !== "full") {
     throw new Error("--agent-config is only supported with --phase full; other phases do not bootstrap the selected stage executors locally");
   }
+  if (opts.localFeedback && (!opts.agentConfig || phase !== "full")) {
+    throw new Error("localFeedback is only supported for configured --phase full runs");
+  }
   if (opts.agentConfig) assertNoConfiguredEnvOverrides(opts.env);
+  validateLocalFeedbackOptions(opts.localFeedback);
   const projectKey = `${repoOwner}/${repoName}`;
   const repositories = [`${repoOwner}/${repoName}`];
   const sourceWorkspace = workspaceMode === "copy" ? await createStandaloneSourceWorkspace(workspace) : undefined;
@@ -472,6 +538,7 @@ export async function startDevRun(opts: DevRunOptions): Promise<DevRunHandle> {
           workspace,
           artifactsDir,
           repositories,
+          ...(opts.localFeedback ? { localFeedback: opts.localFeedback } : {}),
         })
       : { snapshot: undefined, env: {} };
   } catch (error) {
@@ -598,6 +665,7 @@ export async function startDevRun(opts: DevRunOptions): Promise<DevRunHandle> {
                 ? [`${localConfigured.bootstrapDir}:${localConfigured.bootstrapDir}:rw`]
                 : []),
             ],
+            ...(opts.localFeedback ? { networkName: opts.localFeedback.networkName, hostGateway: opts.localFeedback.hostGateway } : {}),
           }
         : {}),
     });

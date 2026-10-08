@@ -13,6 +13,7 @@ vi.mock("node:fs/promises", () => ({
   unlink: vi.fn().mockResolvedValue(undefined),
   readFile: vi.fn().mockRejectedValue(Object.assign(new Error("ENOENT"), { code: "ENOENT" })),
   stat: vi.fn().mockResolvedValue({ isFile: () => true, mode: 0o600, uid: typeof process.getuid === "function" ? process.getuid() : 501 }),
+  lstat: vi.fn().mockResolvedValue({ isFile: () => true, isDirectory: () => false, mode: 0o600, uid: typeof process.getuid === "function" ? process.getuid() : 501 }),
 }));
 
 vi.mock("../local-docker.js", () => ({
@@ -23,7 +24,7 @@ vi.mock("../local-docker.js", () => ({
 }));
 
 import { execFile as rawExecFile, spawn } from "node:child_process";
-import { readFile, stat, unlink } from "node:fs/promises";
+import { lstat, readFile, stat, unlink } from "node:fs/promises";
 import { inspectLocalContainer } from "../local-docker.js";
 import {
   awaitSessionResult,
@@ -159,6 +160,49 @@ describe("launchLocalSession", () => {
     expect(capturedArgs).not.toContain("ANTHROPIC_API_KEY=sk-secret");
     // --env-file is present
     expect(capturedArgs).toContain("--env-file");
+  });
+
+  it("uses default host-gateway mapping when no local feedback network is requested", async () => {
+    const capturedArgs: string[] = [];
+    vi.mocked(rawExecFile).mockImplementation(
+      (_cmd: unknown, args: unknown, cb: unknown) => {
+        capturedArgs.push(...(args as string[]));
+        (cb as (err: null, result: { stdout: string; stderr: string }) => void)(null, {
+          stdout: "cid\n",
+          stderr: "",
+        });
+        return {} as ReturnType<typeof rawExecFile>;
+      },
+    );
+
+    await launchLocalSession(BASE_OPTS);
+
+    expect(capturedArgs).toContain("host.docker.internal:host-gateway");
+    expect(capturedArgs).not.toContain("--network");
+  });
+
+  it("passes explicit Docker network and host gateway for local feedback", async () => {
+    const capturedArgs: string[] = [];
+    vi.mocked(rawExecFile).mockImplementation(
+      (_cmd: unknown, args: unknown, cb: unknown) => {
+        capturedArgs.push(...(args as string[]));
+        (cb as (err: null, result: { stdout: string; stderr: string }) => void)(null, {
+          stdout: "cid\n",
+          stderr: "",
+        });
+        return {} as ReturnType<typeof rawExecFile>;
+      },
+    );
+
+    await launchLocalSession({
+      ...BASE_OPTS,
+      networkName: "ai-implement-feedback-net",
+      hostGateway: "172.18.0.1",
+    });
+
+    expect(capturedArgs).toContain("host.docker.internal:172.18.0.1");
+    expect(capturedArgs).toContain("--network");
+    expect(capturedArgs).toContain("ai-implement-feedback-net");
   });
 
   it("removes the secret env file and cidfile after a successful launch", async () => {
@@ -400,6 +444,7 @@ describe("local session bootstrap consumption", () => {
     vi.clearAllMocks();
     makeExecFileMock();
     vi.mocked(stat).mockResolvedValue({ isFile: () => true, mode: 0o600, uid: typeof process.getuid === "function" ? process.getuid() : 501 } as never);
+    vi.mocked(lstat).mockResolvedValue({ isFile: () => true, isDirectory: () => false, mode: 0o600, uid: typeof process.getuid === "function" ? process.getuid() : 501 } as never);
   });
 
   function bootstrap(overrides: Record<string, unknown> = {}) {
@@ -430,6 +475,45 @@ describe("local session bootstrap consumption", () => {
     expect(unlink).toHaveBeenCalledWith(path);
   });
 
+  it("copies validated synthetic provider metadata into configured run options", async () => {
+    const path = "/tmp/local-auth/bootstrap.json";
+    const syntheticProvider = {
+      version: 1 as const,
+      kind: "local-feedback-provider" as const,
+      port: 4321,
+      profileIds: ["p-impl"],
+    };
+    vi.mocked(readFile).mockResolvedValue(JSON.stringify(bootstrap({ syntheticProvider })));
+    const env = {
+      [LOCAL_AUTH_BOOTSTRAP_ENV]: path,
+      AI_IMPLEMENT_HOST_UID: String(typeof process.getuid === "function" ? process.getuid() : 501),
+    } as NodeJS.ProcessEnv;
+
+    const result = await loadLocalSessionBootstrap({ env, snapshot: makeSnapshot("openai-api-key"), workspaceDir: "/workspace" });
+
+    expect(result.configured.syntheticProvider).toEqual(syntheticProvider);
+    expect(unlink).toHaveBeenCalledWith(path);
+  });
+
+  it("rejects synthetic provider profiles not selected by the snapshot before withdrawal", async () => {
+    const path = "/tmp/local-auth/bootstrap.json";
+    vi.mocked(readFile).mockResolvedValue(JSON.stringify(bootstrap({
+      syntheticProvider: {
+        version: 1,
+        kind: "local-feedback-provider",
+        port: 4321,
+        profileIds: ["other-profile"],
+      },
+    })));
+    const env = {
+      [LOCAL_AUTH_BOOTSTRAP_ENV]: path,
+      AI_IMPLEMENT_HOST_UID: String(typeof process.getuid === "function" ? process.getuid() : 501),
+    } as NodeJS.ProcessEnv;
+
+    await expect(validateLocalSessionBootstrap(path, makeSnapshot("openai-api-key"), env)).rejects.toThrow("synthetic provider profile not selected");
+    expect(unlink).not.toHaveBeenCalledWith(path);
+  });
+
   it("rejects bootstrap references not selected by the snapshot", async () => {
     const path = "/tmp/local-auth/bootstrap.json";
     vi.mocked(readFile).mockResolvedValue(JSON.stringify(bootstrap({
@@ -442,6 +526,54 @@ describe("local session bootstrap consumption", () => {
 
     await expect(validateLocalSessionBootstrap(path, makeSnapshot("openai-api-key"), env)).rejects.toThrow("reference not selected");
     expect(unlink).not.toHaveBeenCalledWith(path);
+  });
+
+  it("accepts root-owned private Docker projection only during root local classification", async () => {
+    const path = "/tmp/ai-implement-local-auth-abc/bootstrap.json";
+    vi.mocked(readFile).mockResolvedValue(JSON.stringify(bootstrap()));
+    vi.mocked(stat).mockResolvedValue({ isFile: () => true, mode: 0o600, uid: 0 } as never);
+    vi.mocked(lstat).mockImplementation(async (target) => {
+      if (target === path) return { isFile: () => true, isDirectory: () => false, mode: 0o600, uid: 0 } as never;
+      return { isFile: () => false, isDirectory: () => true, mode: 0o700, uid: 0 } as never;
+    });
+    const getuid = typeof process.getuid === "function" ? vi.spyOn(process, "getuid").mockReturnValue(0) : undefined;
+    try {
+      await expect(validateLocalSessionBootstrap(path, makeSnapshot("openai-api-key"), {
+        [LOCAL_AUTH_BOOTSTRAP_ENV]: path,
+        AI_IMPLEMENT_HOST_UID: "501",
+        AI_IMPLEMENT_MODE: "local",
+      } as NodeJS.ProcessEnv)).resolves.toMatchObject({ snapshotId: "snap-1" });
+    } finally {
+      getuid?.mockRestore();
+    }
+  });
+
+  it("rejects root-owned bootstrap projections outside root local classification", async () => {
+    const path = "/tmp/ai-implement-local-auth-abc/bootstrap.json";
+    vi.mocked(readFile).mockResolvedValue(JSON.stringify(bootstrap()));
+    vi.mocked(stat).mockResolvedValue({ isFile: () => true, mode: 0o600, uid: 0 } as never);
+    vi.mocked(lstat).mockResolvedValue({ isFile: () => true, isDirectory: () => false, mode: 0o600, uid: 0 } as never);
+    const getuid = typeof process.getuid === "function" ? vi.spyOn(process, "getuid").mockReturnValue(501) : undefined;
+    try {
+      await expect(validateLocalSessionBootstrap(path, makeSnapshot("openai-api-key"), {
+        [LOCAL_AUTH_BOOTSTRAP_ENV]: path,
+        AI_IMPLEMENT_HOST_UID: "501",
+        AI_IMPLEMENT_MODE: "local",
+      } as NodeJS.ProcessEnv)).rejects.toThrow("bootstrap owner does not match host uid");
+    } finally {
+      getuid?.mockRestore();
+    }
+  });
+
+  it("rejects symlinked bootstrap paths before reading content", async () => {
+    const path = "/tmp/ai-implement-local-auth-abc/bootstrap.json";
+    vi.mocked(lstat).mockResolvedValue({ isFile: () => false, isDirectory: () => false, mode: 0o777, uid: 501 } as never);
+
+    await expect(validateLocalSessionBootstrap(path, makeSnapshot("openai-api-key"), {
+      [LOCAL_AUTH_BOOTSTRAP_ENV]: path,
+      AI_IMPLEMENT_HOST_UID: "501",
+    } as NodeJS.ProcessEnv)).rejects.toThrow("bootstrap path is not a file");
+    expect(readFile).not.toHaveBeenCalledWith(path, "utf8");
   });
 
   it("throws a static error when the host rejects configured disposition", async () => {
