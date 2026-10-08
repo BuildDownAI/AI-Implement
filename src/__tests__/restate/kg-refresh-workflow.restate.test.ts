@@ -2736,8 +2736,7 @@ describe("KgRefresh durable workflow", () => {
     const profileObject = createFlyMachineProfile({
       fly: {
         getMachine: (id) => fly.getMachine(id),
-        clearMachineEnv: async (id) => { profileFlyCalls.push(`clear-env:${id}`); },
-        updateMachineMetadata: async (id, key) => { profileFlyCalls.push(`metadata:${id}:${key}`); },
+        clearMachineEnv: async (id, metadata) => { profileFlyCalls.push(`clear-env:${id}:${Object.keys(metadata ?? {}).join(",")}`); },
         destroyMachine: async (id) => { profileFlyCalls.push(`destroy:${id}`); },
       },
     });
@@ -2805,7 +2804,7 @@ describe("KgRefresh durable workflow", () => {
         await first.done;
         await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.heldBy === null, { label: "first release" });
         expect(fly.calls).toEqual(["create:m-1"]);
-        expect(profileFlyCalls).toEqual(["clear-env:m-1", "metadata:m-1:durable_until"]);
+        expect(profileFlyCalls).toEqual(["clear-env:m-1:durable_until"]);
         fly.runnerExits("m-1");
         await eventually(() => expireSends(env), (rows) => rows.length === 1, { label: "first expire scheduled" });
 
