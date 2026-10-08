@@ -1661,9 +1661,7 @@ async function runSelectedInternalReviewers(params: {
       const partialReport = partialVerdict
         ? `\n\n${reviewerEvidenceReport(label, partialVerdict, true)}`
         : "\n\nNo usable partial structured review evidence was returned before the cap.";
-      const capMessage = isTimeBudget
-        ? `ran out of its time budget at the configured cap (${reviewBudgetLabel})`
-        : `ran out of turns at the configured cap (${maxTurns})`;
+      const capMessage = `ran out of turns at the configured cap (${maxTurns})`;
       const feedback = `${label} ${capMessage}. ${summaryLine(reviewResult.telemetry)}${partialReport}`;
       if (reviewerGates(selection, provenance) && !firstTerminationReason) firstTerminationReason = "reviewer_turns_exhausted";
       await reportIncompleteFailure(
