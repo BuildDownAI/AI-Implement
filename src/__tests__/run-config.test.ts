@@ -4,6 +4,7 @@ import {
   decodeRunConfig,
   runConfigFromTaskDocument,
   buildImplRunConfig,
+  buildKgRefreshRunConfig,
   type RunConfigV1,
   type TaskDocumentParams,
 } from "../run-config.js";
@@ -442,6 +443,63 @@ describe("buildImplRunConfig", () => {
     expect(decoded.kgDryRun).toBe(true);
     expect(decoded.kgSourceRef).toBe("feature/head");
     expect((decoded as unknown as Record<string, unknown>).bogusKey).toBeUndefined();
+  });
+});
+
+describe("buildKgRefreshRunConfig", () => {
+  const fullInput = {
+    kgSourceRepo: "org/kg",
+    issueIdentifier: "KG-REFRESH · trigger-1",
+    runnerCallbackUrl: "https://orch.example/api/runner",
+    dependencyTokenScope: "installation" as const,
+    dryRun: true,
+    kgSourceRef: "feature/head",
+    acceptNewBaseline: true,
+    actorEmail: "admin@example.com",
+  };
+
+  it("builds the exact envelope for a full input", () => {
+    expect(buildKgRefreshRunConfig(fullInput)).toEqual({
+      v: 1,
+      issue: { id: "kg-refresh", identifier: "KG-REFRESH · trigger-1", title: "KG ingest", description: "" },
+      runnerPhase: "kg-refresh",
+      kgSourceRepo: "org/kg",
+      runnerCallbackUrl: "https://orch.example/api/runner",
+      dependencyTokenScope: "installation",
+      kgDryRun: true,
+      kgSourceRef: "feature/head",
+      kgAcceptNewBaseline: true,
+      kgBaselineActor: "admin@example.com",
+    });
+  });
+
+  it("builds only the identity keys for the minimal input", () => {
+    const result = buildKgRefreshRunConfig({ kgSourceRepo: "org/kg", issueIdentifier: "KG-REFRESH · t" });
+    expect(result).toEqual({
+      v: 1,
+      issue: { id: "kg-refresh", identifier: "KG-REFRESH · t", title: "KG ingest", description: "" },
+      runnerPhase: "kg-refresh",
+      kgSourceRepo: "org/kg",
+    });
+    expect(Object.keys(result).sort()).toEqual(["issue", "kgSourceRepo", "runnerPhase", "v"]);
+  });
+
+  it("omits keys for falsy inputs", () => {
+    const result = buildKgRefreshRunConfig({
+      kgSourceRepo: "org/kg",
+      issueIdentifier: "KG-REFRESH · t",
+      runnerCallbackUrl: "",
+      dryRun: false,
+      kgSourceRef: "",
+      acceptNewBaseline: false,
+      actorEmail: "",
+    });
+    expect(Object.keys(result).sort()).toEqual(["issue", "kgSourceRepo", "runnerPhase", "v"]);
+  });
+
+  it("survives encode and decode unchanged", () => {
+    const built = buildKgRefreshRunConfig(fullInput);
+    expect(decodeRunConfig(encodeRunConfig(built))).toEqual(built);
   });
 });
 
