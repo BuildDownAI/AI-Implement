@@ -28,7 +28,7 @@ import { resolveWorkflowCapabilities, type WorkflowContract } from "./workflow-p
 import { surfaceDispatchFailure } from "./dispatch-failure.js";
 import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
 import { dispatchLocalGapfill } from "./local-gapfill.js";
-import { findLogIdByDispatchId, setJobMachineNonce, getLatestDispatchForPr, getLatestPrUrlForIssue, getLatestTeamKeyForIssue } from "./log.js";
+import { getLatestDispatchForPr, getLatestPrUrlForIssue, getLatestTeamKeyForIssue } from "./log.js";
 import type { TicketingProvider, FeatureNodeRollUp } from "./providers/types.js";
 import type { TicketIssue } from "./providers/types.js";
 import { logSkipReasons, rememberCandidates, mappingForProvider, mergeProviderSnapshots, resolveInFlightSiblings, selectIssuesToDispatch, selectFileOverlapDeferrals, getOrFetchPlanningContexts } from "./poll-selection.js";
@@ -141,7 +141,7 @@ import {
 } from "./restate/retention.js";
 import { applyVolumeSnapshotRetention, applyVolumeSnapshotRetentionAtBoot } from "./fly-volumes.js";
 import { createProductionReviewFixServices } from "./restate/review-fix-production.js";
-import { createKgFindRunByTitle, seedFlyMachineProfileFromOverride, createProductionKgRefreshServices, launchKeptMachine, bindKeptMachineFly } from "./restate/kg-refresh-production.js";
+import { createKgFindRunByTitle, seedFlyMachineProfileFromOverride, createProductionKgRefreshServices, launchKeptMachine, syncRowToMachineNonce, bindKeptMachineFly } from "./restate/kg-refresh-production.js";
 import { createProductionPlanningRunServices, PLANNING_CONTEXT_BRANCH_KEY, PLANNING_CONTEXT_FIELD_VALUE_KEY } from "./restate/planning-run-production.js";
 import { createPlanningAdmissionTerminationHook, createPlanningRunIngressClient } from "./restate/planning-run-client.js";
 import { setKgRefreshToolDeps } from "./restate/tools.js";
@@ -4099,11 +4099,7 @@ async function dispatchKgRefreshRun(
       keptMachineId: opts.machineId, dispatchId: opts.dispatchId, machineConfig, machineNonce,
     });
     // A machine reused from an earlier attempt still carries that attempt's nonce; the row must match the machine.
-    // Written inside this step and never returned, so the credential stays out of the journal.
-    if (launched.machineNonce !== machineNonce) {
-      const jobId = findLogIdByDispatchId(opts.dispatchId);
-      if (jobId !== undefined) setJobMachineNonce(jobId, launched.machineNonce);
-    }
+    syncRowToMachineNonce(opts.dispatchId, machineNonce, launched.machineNonce);
     console.log(`[kg-refresh] dispatched via Fly (${launched.reused ? "reused" : "created"} machine ${launched.machineId}) (dispatchId=${opts.dispatchId})`);
     return {
       machineId: launched.machineId, created: launched.created, replaced: launched.replaced,

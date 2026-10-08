@@ -426,6 +426,21 @@ describe("row projections (real log.ts, scratch database)", () => {
     });
   });
 
+  it("syncRowToMachineNonce re-arms the row to a reused machine's nonce and keeps machine_id", async () => {
+    await withScratchDb((log, prod, db) => {
+      const id = log.appendLogIfAbsent({ issueId: "kg-refresh", phase: "kg-refresh", dispatchId: "d-reuse", executionMode: "fly-machines", repo: "acme/kg" });
+      log.updateJobMachineDetails(id, { machineNonce: "attempt2", machineId: "m-1" });
+      prod.syncRowToMachineNonce("d-reuse", "attempt2", "attempt1");
+      expect(log.getJobByNonce("attempt1")?.id).toBe(id);
+      expect(log.getJobByNonce("attempt2")).toBeFalsy();
+      expect(db.prepare("SELECT machine_id FROM dispatch_log WHERE id = ?").get(id)).toEqual({ machine_id: "m-1" });
+      // Equal nonces and unknown dispatch ids change nothing.
+      prod.syncRowToMachineNonce("d-reuse", "attempt1", "attempt1");
+      expect(() => prod.syncRowToMachineNonce("d-none", "a", "b")).not.toThrow();
+      expect(log.getJobByNonce("attempt1")?.id).toBe(id);
+    });
+  });
+
   it("recordKgDispatchDetails writes machine_id and pr_url and leaves the status unchanged", async () => {
     await withScratchDb((log, prod, db) => {
       const id = log.appendLogIfAbsent({ issueId: "kg-refresh", phase: "kg-refresh", dispatchId: "d-fly", executionMode: "fly-machines", repo: "acme/kg" });

@@ -156,6 +156,14 @@ export function deriveMachineNonce(secret: string, dispatchId: string, attempt: 
   return createHmac("sha256", secret).update(`${dispatchId}:${attempt}`).digest("hex").slice(0, 32);
 }
 
+/** Re-arms the row to the nonce a reused kept machine actually carries. A no-op when it equals the derived one or the row is
+ *  missing. Written inside the dispatch step and never returned, so the credential stays out of the journal. */
+export function syncRowToMachineNonce(dispatchId: string, derivedNonce: string, machineNonce: string): void {
+  if (machineNonce === derivedNonce) return;
+  const jobId = findLogIdByDispatchId(dispatchId);
+  if (jobId !== undefined) setJobMachineNonce(jobId, machineNonce);
+}
+
 /**
  * Projects a kg-refresh dispatch's journaled machine and run details onto its job row. The machine id
  * is a plain write: the row stays `dispatched` until the machine read moves it. A dispatch id with no row is a no-op.
