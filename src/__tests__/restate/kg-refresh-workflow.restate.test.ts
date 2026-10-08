@@ -2325,8 +2325,10 @@ describe("KgRefresh durable workflow", () => {
       callWorkflow<{ runnerStep: { id: string; status: string } | null }>(baseUrl, "KgRefresh", triggerId, "status").then((st) => st.runnerStep);
 
     // `runWorkflow` returns the run's own promise; wrapping it in an object keeps `await` from waiting for the whole run.
-    async function parkedRun(baseUrl: string, triggerId: string): Promise<{ done: Promise<RefreshOutcome> }> {
-      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+    async function parkedRun(
+      baseUrl: string, triggerId: string, executionMode: "fly-machines" | "github-actions" = "fly-machines",
+    ): Promise<{ done: Promise<RefreshOutcome> }> {
+      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode });
       const done = runWorkflow(baseUrl, triggerId);
       await eventually(() => scenarios.get(triggerId)!.dispatchCalls === 1, (ok) => ok, { label: "durable effect" });
       return { done };
@@ -2420,6 +2422,24 @@ describe("KgRefresh durable workflow", () => {
 
       // A repeated delivery is left alone, and an older step does not move the report backwards.
       await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "progress", stepBody("clone", "running"));
+      expect(await runnerStep(env.baseUrl(), triggerId)).toEqual({ id: "kg-ingest", status: "running" });
+
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      expect((await done).ok).toBe(true);
+    }, 20_000);
+
+    // AII-1149: the step report is one contract for every backend; the GitHub Actions backend resolves the same promises.
+    it.each(VARIANTS.map(([label]) => label))("a GitHub Actions run names the runner step in flight (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      const { done } = await parkedRun(env.baseUrl(), triggerId, "github-actions");
+      expect(await runnerStep(env.baseUrl(), triggerId)).toBeNull();
+
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "progress", stepBody("clone", "running"));
+      expect(await runnerStep(env.baseUrl(), triggerId)).toEqual({ id: "clone", status: "running" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "progress", stepBody("clone", "passed"));
+      expect(await runnerStep(env.baseUrl(), triggerId)).toEqual({ id: "clone", status: "passed" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "progress", stepBody("kg-ingest", "running"));
       expect(await runnerStep(env.baseUrl(), triggerId)).toEqual({ id: "kg-ingest", status: "running" });
 
       await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);

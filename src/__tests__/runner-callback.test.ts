@@ -95,6 +95,7 @@ beforeEach(async () => {
 
 afterEach(() => {
   vi.useRealTimers();
+  vi.unstubAllEnvs();
   dedup.closeDb();
   try {
     fs.unlinkSync(dbPath);
@@ -1966,13 +1967,20 @@ describe("handleRunnerProgress", () => {
       expect((sent as { inputs: unknown }).inputs).toEqual({ repoOwner: "org" });
     });
 
-    it("contract: KgRefresh.progress — a real TokenStepReporter step post is accepted by the real handler", async () => {
+    // A loop, not `it.each`: the producer guard (restate-producer-guard.test.ts) scans for a literal `it("contract: ...` title.
+    for (const { shape, runId } of [
+      { shape: "without GITHUB_RUN_ID", runId: "" },
+      { shape: "with GITHUB_RUN_ID (GitHub Actions)", runId: "123456" },
+    ]) it(`contract: KgRefresh.progress — a real TokenStepReporter step post is accepted by the real handler (${shape})`, async () => {
+      vi.stubEnv("GITHUB_RUN_ID", runId);
       const { token, dispatchId } = kgToken();
       const kgRefreshClient = { progress: vi.fn(async () => ({ status: "accepted" })) };
       const responses: Array<{ status: number }> = [];
       const urls: string[] = [];
+      const bodies: Array<Record<string, unknown>> = [];
       const fetchImpl = (async (url: string, init?: RequestInit) => {
         urls.push(url);
+        bodies.push(JSON.parse(init?.body as string));
         const headers = init?.headers as Record<string, string>;
         const res = await runnerCallback.handleRunnerProgress({
           authorization: headers.Authorization,
@@ -1990,6 +1998,8 @@ describe("handleRunnerProgress", () => {
       expect(urls).toEqual(["http://orchestrator.test/runner/progress"]);
       expect(responses.map((r) => r.status)).toEqual([200]);
       expect(kgRefreshClient.progress).toHaveBeenCalledWith(dispatchId, expect.objectContaining({ id: "kg-ingest" }));
+      if (runId) expect(bodies[0]).toMatchObject({ githubRunId: Number(runId) });
+      else expect(bodies[0]).not.toHaveProperty("githubRunId");
     });
   });
 });
