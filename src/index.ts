@@ -28,7 +28,7 @@ import { resolveWorkflowCapabilities, type WorkflowContract } from "./workflow-p
 import { surfaceDispatchFailure } from "./dispatch-failure.js";
 import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
 import { dispatchLocalGapfill } from "./local-gapfill.js";
-import { getLatestDispatchForPr, getLatestPrUrlForIssue, getLatestTeamKeyForIssue } from "./log.js";
+import { findLogIdByDispatchId, setJobMachineNonce, getLatestDispatchForPr, getLatestPrUrlForIssue, getLatestTeamKeyForIssue } from "./log.js";
 import type { TicketingProvider, FeatureNodeRollUp } from "./providers/types.js";
 import type { TicketIssue } from "./providers/types.js";
 import { logSkipReasons, rememberCandidates, mappingForProvider, mergeProviderSnapshots, resolveInFlightSiblings, selectIssuesToDispatch, selectFileOverlapDeferrals, getOrFetchPlanningContexts } from "./poll-selection.js";
@@ -4098,6 +4098,12 @@ async function dispatchKgRefreshRun(
     const launched = await launchKeptMachine(bindKeptMachineFly(config.flySessionsToken, config.flySessionsApp), {
       keptMachineId: opts.machineId, dispatchId: opts.dispatchId, machineConfig, machineNonce,
     });
+    // A machine reused from an earlier attempt still carries that attempt's nonce; the row must match the machine.
+    // Written inside this step and never returned, so the credential stays out of the journal.
+    if (launched.machineNonce !== machineNonce) {
+      const jobId = findLogIdByDispatchId(opts.dispatchId);
+      if (jobId !== undefined) setJobMachineNonce(jobId, launched.machineNonce);
+    }
     console.log(`[kg-refresh] dispatched via Fly (${launched.reused ? "reused" : "created"} machine ${launched.machineId}) (dispatchId=${opts.dispatchId})`);
     return {
       machineId: launched.machineId, created: launched.created, replaced: launched.replaced,

@@ -247,7 +247,7 @@ describe("recordDispatchRow idempotency", () => {
 });
 
 describe("dispatch_log job row lifecycle", () => {
-  it("closes the row on a fresh composer that never saw appendJobLog (restart replay)", () => {
+  it("closes the row on a fresh composer that never saw recordDispatchRow (restart replay)", () => {
     const updateJobStatus = vi.fn();
     const findJobId = vi.fn((id: string) => (id === "d-1" ? 42 : undefined));
     createProductionKgRefreshServices(makeInput({ updateJobStatus, findJobId }));
@@ -414,6 +414,15 @@ describe("row projections (real log.ts, scratch database)", () => {
       prod.recordKgDispatchRow(record);
       const rows = db.prepare("SELECT issue_id, phase, repo, execution_mode, status, machine_nonce FROM dispatch_log WHERE dispatch_id = 'd-row'").all();
       expect(rows).toEqual([{ issue_id: "kg-refresh", phase: "kg-refresh", repo: "acme/kg", execution_mode: "fly-machines", status: "dispatched", machine_nonce: null }]);
+    });
+  });
+
+  it("setJobMachineNonce re-arms the nonce without clearing machine_id", async () => {
+    await withScratchDb((log, _prod, db) => {
+      const id = log.appendLogIfAbsent({ issueId: "kg-refresh", phase: "kg-refresh", dispatchId: "d-rearm", executionMode: "fly-machines", repo: "acme/kg" });
+      log.updateJobMachineDetails(id, { machineNonce: "n1", machineId: "m-1" });
+      log.setJobMachineNonce(id, "n2");
+      expect(db.prepare("SELECT machine_nonce, machine_id FROM dispatch_log WHERE id = ?").get(id)).toEqual({ machine_nonce: "n2", machine_id: "m-1" });
     });
   });
 

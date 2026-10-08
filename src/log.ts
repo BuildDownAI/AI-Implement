@@ -963,6 +963,11 @@ export function updateJobMachineDetails(jobId: number, opts: { machineNonce: str
   if (opts.logsUrl) updateJobPrUrl(jobId, opts.logsUrl);
 }
 
+/** Writes only the nonce, leaving machine_id and the rest of the row untouched. */
+export function setJobMachineNonce(jobId: number, machineNonce: string): void {
+  getDb().prepare("UPDATE dispatch_log SET machine_nonce = ? WHERE id = ?").run(machineNonce, jobId);
+}
+
 /** Clears a job's nonce (called when machine is destroyed). */
 export function invalidateNonce(jobId: number): void {
   getDb()

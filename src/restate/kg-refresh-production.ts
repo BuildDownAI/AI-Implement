@@ -31,7 +31,7 @@ import { readBackendRun, stopBackendRun } from "../backend-run.js";
 import { getRunnerMode, getKgFlyMachineOverride, setKgFlyMachineOverride, type KgFlyMachineOverride } from "../runner-mode.js";
 import { mintRunToken } from "../runner-tokens.js";
 import type { JobStatus } from "../log.js";
-import { appendLogIfAbsent, findLogIdByDispatchId, setJobMachineId, updateJobMachineDetails, updateJobPrUrl, updateJobRunId } from "../log.js";
+import { appendLogIfAbsent, findLogIdByDispatchId, setJobMachineId, setJobMachineNonce, updateJobPrUrl, updateJobRunId } from "../log.js";
 import { clearMachineEnv, createMachine, destroyMachine, getMachine, startMachine, updateMachine, type CreateMachineOpts, type Machine, type MachineConfig } from "../fly-machines.js";
 import type { RestateService } from "./endpoint.js";
 import {
@@ -389,7 +389,7 @@ export function createProductionKgRefreshServices(
     armMachineNonce: (dispatchId, attempt) => {
       const jobId = findJobId(dispatchId);
       if (jobId === undefined) throw new Error(`no dispatch_log row for ${dispatchId}; reserve must run first`);
-      updateJobMachineDetails(jobId, { machineNonce: deriveMachineNonce(config.runnerTokenSecret ?? "", dispatchId, attempt) });
+      setJobMachineNonce(jobId, deriveMachineNonce(config.runnerTokenSecret ?? "", dispatchId, attempt));
     },
     recordDispatchDetails: input.recordDispatchDetails ?? recordKgDispatchDetails,
     closeJobLog: (jobId, status, conclusion) => {
