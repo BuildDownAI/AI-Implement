@@ -2840,7 +2840,7 @@ describe("KgRefresh durable workflow", () => {
         await second.done;
         await eventually(() => profileStatus(env.baseUrl()), (s) => s.machine?.heldBy === null, { label: "second release" });
         expect(fly.calls).toEqual(["create:m-2"]);
-        expect(profileFlyCalls).toContain("clear-env:m-2");
+        expect(profileFlyCalls).toContain("clear-env:m-2:durable_until");
         expect(profileFlyCalls.filter((c) => c.endsWith(":m-1"))).toEqual([]);
       } finally {
         await env.stop();
