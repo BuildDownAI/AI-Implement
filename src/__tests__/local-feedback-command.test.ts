@@ -15,6 +15,7 @@ const {
   buildDevHarnessArgs,
   buildLocalFeedbackOptions,
   buildSyntheticAgentConfig,
+  finishLiveRun,
   gateMarkerPath,
   parseArgs,
   parseGitHubProjectKey,
@@ -24,6 +25,7 @@ const {
   runScenarioFinally,
   subscriptionUnknownProof,
   summarizeResult,
+  writeLiveResult,
 } = localFeedbackCommand;
 
 const tempRoots: string[] = [];
@@ -203,6 +205,76 @@ describe("local feedback command helpers", () => {
     await expect(pathAbsent("/tmp/missing", async () => { const error = new Error("missing") as NodeJS.ErrnoException; error.code = "ENOENT"; throw error; })).resolves.toBe(true);
     await expect(pathAbsent("/tmp/eio", async () => { const error = new Error("io") as NodeJS.ErrnoException; error.code = "EIO"; throw error; })).resolves.toBe(false);
     await expect(pathAbsent("/tmp/present", async () => ({}))).resolves.toBe(false);
+  });
+
+  it.each([
+    [0, "success"],
+    [1, "failure"],
+  ])("rewrites the live summary with the finished run's outcome (exit %i → %s)", (exitCode, outcome) => {
+    const artifactsDir = tempDir("live-result");
+    const input = {
+      source: { head: "abc", trackedDiffSha256: "def" },
+      image: "sha256:123",
+      stages: { review: { model: "gpt-local-review", authMode: "codex-subscription" } },
+    };
+    // The preflight summary is written before launch and must not survive as the final word.
+    writeFileSync(join(artifactsDir, "summary.md"), summarizeResult({ ok: false, mode: "live-preflight", artifactsDir, ...input }));
+
+    writeLiveResult({ artifactsDir, exitCode, ...input });
+
+    const summary = readFileSync(join(artifactsDir, "summary.md"), "utf8");
+    expect(summary).toContain(`- outcome: ${outcome}`);
+    expect(summary).toContain("- mode: live\n");
+    expect(summary).not.toContain("live-preflight");
+    expect(summary).toContain("sha256:123");
+    expect(summary).toContain("gpt-local-review");
+    expect(summary).toContain(`exit code ${exitCode}`);
+    expect(JSON.parse(readFileSync(join(artifactsDir, "result.json"), "utf8"))).toEqual({ exitCode, live: true });
+  });
+
+  describe("finishLiveRun", () => {
+    function harness(overrides: { runHarness?: () => Promise<number>; dispose?: () => void; writeResult?: (code: number) => void } = {}) {
+      const events: string[] = [];
+      const written: number[] = [];
+      const run = () => finishLiveRun({
+        runHarness: overrides.runHarness ?? (async () => { events.push("run"); return 0; }),
+        dispose: overrides.dispose ?? (() => { events.push("dispose"); }),
+        writeResult: overrides.writeResult ?? ((code: number) => { events.push("write"); written.push(code); }),
+      });
+      return { run, events, written };
+    }
+
+    it("disposes, then records the harness exit code", async () => {
+      const h = harness({ runHarness: async () => { h.events.push("run"); return 3; } });
+      await expect(h.run()).resolves.toBe(3);
+      expect(h.events).toEqual(["run", "dispose", "write"]);
+      expect(h.written).toEqual([3]);
+    });
+
+    it("records a failure and rethrows when the harness throws", async () => {
+      const h = harness({ runHarness: async () => { throw new Error("harness exploded"); } });
+      await expect(h.run()).rejects.toThrow("harness exploded");
+      expect(h.written).toEqual([1]);
+    });
+
+    it("keeps the harness error when recording the result also fails", async () => {
+      const h = harness({
+        runHarness: async () => { throw new Error("harness exploded"); },
+        writeResult: () => { throw new Error("disk full"); },
+      });
+      await expect(h.run()).rejects.toThrow("harness exploded");
+    });
+
+    it("surfaces a result-write failure after a clean run", async () => {
+      const h = harness({ writeResult: () => { throw new Error("disk full"); } });
+      await expect(h.run()).rejects.toThrow("disk full");
+    });
+
+    it("still records the result when dispose fails, then reports the dispose error", async () => {
+      const h = harness({ dispose: () => { throw new Error("dispose failed"); } });
+      await expect(h.run()).rejects.toThrow("dispose failed");
+      expect(h.written).toEqual([0]);
+    });
   });
 
   it("summarizes redacted result evidence without credential material", () => {
