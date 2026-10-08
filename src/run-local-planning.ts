@@ -1,11 +1,18 @@
 import { runPlanningLocally } from "./run-planning.js";
 import { decodeRunConfig } from "./run-config.js";
+import type { ModelAuthClient } from "./model-auth-client.js";
 import { prepareScratchExclusionIfGit } from "./pipeline/scratch-exclude.js";
 
 export interface LocalPlanningRunnerDependencies {
   runPlanning: typeof runPlanningLocally;
   writeStdout: (text: string) => void;
   writeStderr: (text: string) => void;
+  /**
+   * Selected-credential client for configured runs; absent fails closed when `agentConfig` is present. The default
+   * dependencies supply none: building it from the bootstrap is owned by the runner bootstrap issues
+   * (AII-951/AII-955/AII-965), not a second resolver here.
+   */
+  auth?: Pick<ModelAuthClient, "invoke">;
 }
 
 const DEFAULT_DEPENDENCIES: LocalPlanningRunnerDependencies = {
@@ -31,6 +38,11 @@ export async function runLocalPlanningFromEnv(
     issueTitle: config.issue.title,
     issueDescription: config.issue.description,
     model: env.CLAUDE_MODEL,
+    ...(config.planningContext?.parent !== undefined ? { parent: config.planningContext.parent } : {}),
+    ...(config.planningContext?.siblings !== undefined ? { siblings: config.planningContext.siblings } : {}),
+    ...(config.planningContext?.dependencies !== undefined ? { dependencies: config.planningContext.dependencies } : {}),
+    ...(config.agentConfig ? { agentConfig: config.agentConfig } : {}),
+    ...(deps.auth ? { auth: deps.auth } : {}),
   });
 
   if (result.exitCode !== 0) {
