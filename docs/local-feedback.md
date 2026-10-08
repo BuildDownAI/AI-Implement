@@ -66,7 +66,15 @@ Inspect the latest run:
 AI_IMPLEMENT_DIR=/private/tmp/aii-939-manual-testing
 cd "$AI_IMPLEMENT_DIR"
 
-RUN_DIR="$(ls -td "${TMPDIR:-/tmp}"/bd-local-feedback-* 2>/dev/null | head -1)"
+RUN_DIR="$(
+  ls -td "${TMPDIR:-/tmp}"/bd-local-feedback-* 2>/dev/null |
+    while IFS= read -r proof_candidate; do
+      if [ -f "$proof_candidate/result.json" ]; then
+        printf '%s\n' "$proof_candidate"
+        break
+      fi
+    done
+)"
 
 sed -n '1,220p' "$RUN_DIR/summary.md"
 jq . "$RUN_DIR/result.json"
