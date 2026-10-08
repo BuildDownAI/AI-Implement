@@ -333,8 +333,9 @@ describe("postPushReviewStep", () => {
       const invokeCodex = vi.fn(async () => structuredReviewResult(approved));
       await run(makeCtx(invokeCodex, { agentConfig: codex }), 1);
       const codexPrompt = (invokeCodex.mock.calls[0] as any[])[0].prompt as string;
-      expect(codexPrompt).toContain("maximum of timeout 90s for this review");
+      expect(codexPrompt).toContain("time budget of 90s for this review");
       expect(codexPrompt).not.toMatch(/maximum of \d+ turns/);
+      expect(codexPrompt).not.toContain("final turn");
 
       const invokeClaude = vi.fn(async () => structuredReviewResult(approved));
       await run(makeCtx(invokeClaude, { agentConfig: makeSnapshot() }), 1);
@@ -432,23 +433,25 @@ describe("postPushReviewStep", () => {
       expect(invoke.mock.calls.every((c) => (c[0] as any).agentStage === "review")).toBe(true);
     });
 
-    it("reports a Codex review cap as an elapsed-time budget, not turns", async () => {
+    it("reports a real Codex invocation timeout as an elapsed-time budget, not turns", async () => {
       const codex = makeSnapshot();
       codex.stages.review = { ...codex.stages.review, agent: "codex", provider: "openai", model: "gpt-rev", invocationTimeoutMs: 90_000 };
-      const capped = {
-        ...structuredReviewResult(approvedVerdict),
-        terminalStatus: { subtype: "error_max_turns", isError: true },
-        telemetry: { outcome: "max_turns" as const, numTurns: 3, durationMs: 10, costUsd: null, tokensIn: 1, tokensOut: 1 },
+      const timedOut = {
+        stdout: "",
+        stderr: "",
+        exitCode: 1,
+        tokensUsed: 0,
+        failure: { category: "crash", code: "INVOCATION_TIMEOUT", retryable: false, message: "Codex invocation exceeded its time limit", stage: "post-push-review", attempt: 1 },
       };
       const comments: string[] = [];
       const gh = vi.fn((args: string[]) => {
         if (args[0] === "pr" && args[1] === "comment") comments.push(args[args.indexOf("--body") + 1]);
         return ghSpawn(args);
       });
-      const out: any = await runWith(makeCtx(vi.fn(async () => capped), { agentConfig: codex }), 1, {}, gh as any);
+      const out: any = await runWith(makeCtx(vi.fn(async () => timedOut as any), { agentConfig: codex }), 1, {}, gh as any);
       expect(out.approved).toBe(false);
       const text = comments.join("\n");
-      expect(text).toContain("ran out of its time budget at the configured cap (timeout 90s)");
+      expect(text).toContain("ran out of its time budget (timeout 90s)");
       expect(text).not.toContain("ran out of turns");
     });
 
