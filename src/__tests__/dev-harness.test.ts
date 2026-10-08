@@ -45,7 +45,7 @@ vi.mock("../local/agent-config.js", () => ({
 
 import { spawnSync } from "node:child_process";
 import { writeFile } from "node:fs/promises";
-import { launchLocalSession } from "../local/session.js";
+import { launchLocalSession, startLocalAuthBridge } from "../local/session.js";
 import { LocalSessionOwnership, loadLocalAgentConfig } from "../local/agent-config.js";
 import { startDevRun } from "../dev-harness/index.js";
 import { parseTaskFileFromPath } from "../dev-harness/task-file.js";
@@ -92,11 +92,66 @@ function configuredResolution() {
   };
 }
 
+function configuredResolutionForProfile(profileId: string) {
+  const stage = { agent: "codex" as const, provider: "openai" as const, model: "gpt", accountProfileId: profileId, invocationTimeoutMs: 1000 };
+  const sources = { agent: "project" as const, provider: "project" as const, model: "project" as const, accountProfileId: "project" as const, invocationTimeoutMs: "project" as const };
+  const profile = { id: profileId, identity: "local", revision: 1, agent: "codex" as const, provider: "openai" as const, authMode: "codex-subscription" as const };
+  return {
+    mode: "configured" as const,
+    stages: { planning: stage, implementation: stage, review: stage },
+    sources: { planning: sources, implementation: sources, review: sources },
+    profiles: { planning: profile, implementation: profile, review: profile },
+  };
+}
+
+function mockConfiguredSubscription(profileId = "sub-a") {
+  vi.mocked(loadLocalAgentConfig).mockResolvedValue({
+    resolution: configuredResolutionForProfile(profileId),
+    references: new Map([
+      [profileId, { profileId, authMode: "codex-subscription", kind: "session", canonicalPath: `/outside/${profileId}.json` }],
+    ]),
+  });
+}
+
+function mockOwnership(acquire: ReturnType<typeof vi.fn> = vi.fn().mockResolvedValue({ profileId: "sub-a", used: false })) {
+  vi.mocked(LocalSessionOwnership).mockImplementation(function () {
+    return { acquire, releaseUnused: vi.fn() } as never;
+  });
+  return acquire;
+}
+
+function spawnForOrigin(origin: string) {
+  vi.mocked(spawnSync).mockImplementation((_cmd: unknown, args: unknown) => {
+    const argv = args as string[];
+    if (_cmd === "gh") {
+      return { status: 0, stdout: Buffer.from("PRIVATE\n"), stderr: Buffer.from(""), pid: 1, output: [], signal: null, error: undefined };
+    }
+    if (argv[0] === "remote") {
+      return { status: 0, stdout: Buffer.from(`${origin}\n`), stderr: Buffer.from(""), pid: 1, output: [], signal: null, error: undefined };
+    }
+    return { status: 0, stdout: Buffer.from("main\n"), stderr: Buffer.from(""), pid: 1, output: [], signal: null, error: undefined };
+  });
+}
+
 describe("startDevRun", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     makeSpawnSyncMock("main");
     vi.mocked(launchLocalSession).mockResolvedValue(DEFAULT_SESSION_HANDLE);
+    vi.mocked(startLocalAuthBridge).mockResolvedValue({
+      bootstrap: {
+        version: 1,
+        snapshotId: "snap-1",
+        projectKey: "owner/repo",
+        bridge: { baseUrl: "http://host.docker.internal:1234", bearer: "b".repeat(40) },
+        references: [],
+        trustedRepositories: ["owner/repo"],
+      },
+      safeDisposition: null,
+      close: vi.fn(),
+      releaseAfterTermination: vi.fn(),
+      releaseUnused: vi.fn(),
+    });
   });
 
   afterEach(() => {
@@ -282,6 +337,120 @@ describe("startDevRun", () => {
     expect(launchLocalSession).not.toHaveBeenCalled();
     expect(releaseUnused).toHaveBeenCalledWith(firstLease, expect.objectContaining({ confirmTermination: expect.any(Function) }));
     await expect(releaseUnused.mock.calls[0]![1].confirmTermination()).resolves.toBe("confirmed");
+  });
+
+  it("rejects subscription config when task repo overrides the actual workspace origin", async () => {
+    vi.stubEnv("ANTHROPIC_API_KEY", "");
+    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "");
+    vi.mocked(parseTaskFileFromPath).mockReturnValueOnce({
+      identifier: "DEV-PRIVATE",
+      title: "Private task",
+      description: "Run",
+      maxTurns: undefined,
+      maxIterations: undefined,
+      repo: "private-org/private-repo",
+      branch: undefined,
+      profiles: undefined,
+    });
+    vi.mocked(spawnSync).mockImplementation((_cmd: unknown, args: unknown) => {
+      const argv = args as string[];
+      if (_cmd === "gh") {
+        return { status: 0, stdout: Buffer.from("PRIVATE\n"), stderr: Buffer.from(""), pid: 1, output: [], signal: null, error: undefined };
+      }
+      if (argv[0] === "remote") {
+        return { status: 0, stdout: Buffer.from("https://github.com/public-org/public-repo.git\n"), stderr: Buffer.from(""), pid: 1, output: [], signal: null, error: undefined };
+      }
+      return { status: 0, stdout: Buffer.from("main\n"), stderr: Buffer.from(""), pid: 1, output: [], signal: null, error: undefined };
+    });
+    vi.mocked(loadLocalAgentConfig).mockResolvedValue({
+      resolution: configuredResolution(),
+      references: new Map([
+        ["sub-a", { profileId: "sub-a", authMode: "codex-subscription", kind: "session", canonicalPath: "/outside/a.json" }],
+      ]),
+    });
+    const acquire = vi.fn();
+    vi.mocked(LocalSessionOwnership).mockImplementation(function () {
+      return { acquire, releaseUnused: vi.fn() } as never;
+    });
+
+    await expect(
+      startDevRun({ workspace: "/tmp/repo", task: "task.md", phase: "full", agentConfig: "/outside/agent-config.json" }),
+    ).rejects.toThrow(/actual workspace origin/);
+
+    expect(acquire).not.toHaveBeenCalled();
+    expect(launchLocalSession).not.toHaveBeenCalled();
+  });
+
+  it("rejects subscription config when the actual workspace origin is not a GitHub repository", async () => {
+    vi.stubEnv("ANTHROPIC_API_KEY", "");
+    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "");
+    vi.mocked(spawnSync).mockImplementation((_cmd: unknown, args: unknown) => {
+      const argv = args as string[];
+      if (argv[0] === "remote") {
+        return { status: 0, stdout: Buffer.from("file:///tmp/repo.git\n"), stderr: Buffer.from(""), pid: 1, output: [], signal: null, error: undefined };
+      }
+      return { status: 0, stdout: Buffer.from("main\n"), stderr: Buffer.from(""), pid: 1, output: [], signal: null, error: undefined };
+    });
+    vi.mocked(loadLocalAgentConfig).mockResolvedValue({
+      resolution: configuredResolutionForProfile("sub-a"),
+      references: new Map([
+        ["sub-a", { profileId: "sub-a", authMode: "codex-subscription", kind: "session", canonicalPath: "/outside/a.json" }],
+      ]),
+    });
+    const acquire = vi.fn();
+    vi.mocked(LocalSessionOwnership).mockImplementation(function () {
+      return { acquire, releaseUnused: vi.fn() } as never;
+    });
+
+    await expect(
+      startDevRun({ workspace: "/tmp/repo", task: "task.md", phase: "full", agentConfig: "/outside/agent-config.json" }),
+    ).rejects.toThrow(/detected GitHub origin/);
+
+    expect(acquire).not.toHaveBeenCalled();
+    expect(launchLocalSession).not.toHaveBeenCalled();
+  });
+
+  it("rejects subscription config for evilgithub.com origins before acquire or Docker", async () => {
+    vi.stubEnv("ANTHROPIC_API_KEY", "");
+    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "");
+    spawnForOrigin("https://evilgithub.com/owner/repo.git");
+    mockConfiguredSubscription();
+    const acquire = mockOwnership();
+
+    await expect(
+      startDevRun({ workspace: "/tmp/repo", task: "task.md", phase: "full", agentConfig: "/outside/agent-config.json" }),
+    ).rejects.toThrow(/detected GitHub origin/);
+
+    expect(acquire).not.toHaveBeenCalled();
+    expect(launchLocalSession).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "https://github.com/owner/repo.with.dots.git",
+    "ssh://git@github.com/owner/repo.with.dots.git",
+    "git@github.com:owner/repo.with.dots.git",
+  ])("accepts supported GitHub origin form %s with dotted repository names", async (origin) => {
+    vi.stubEnv("ANTHROPIC_API_KEY", "");
+    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "");
+    vi.mocked(parseTaskFileFromPath).mockReturnValueOnce({
+      identifier: "DEV-DOTTED",
+      title: "Dotted repo",
+      description: "Run",
+      maxTurns: undefined,
+      maxIterations: undefined,
+      repo: "owner/repo.with.dots",
+      branch: undefined,
+      profiles: undefined,
+    });
+    spawnForOrigin(origin);
+    mockConfiguredSubscription();
+    mockOwnership();
+    vi.mocked(launchLocalSession).mockResolvedValue({ ...DEFAULT_SESSION_HANDLE, containerId: "cid-dotted" });
+
+    const handle = await startDevRun({ workspace: "/tmp/repo", task: "task.md", phase: "full", agentConfig: "/outside/agent-config.json" });
+
+    expect(handle.containerId).toBe("cid-dotted");
+    expect(launchLocalSession).toHaveBeenCalled();
   });
 
   it("routes planning-only runs through the validating local planner", async () => {

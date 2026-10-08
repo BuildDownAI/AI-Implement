@@ -124,9 +124,19 @@ function detectRepoFromOrigin(workspaceDir: string): { owner: string; repo: stri
   });
   if (result.status !== 0) return null;
   const url = result.stdout.toString().trim();
-  const match = url.match(/github\.com[:/]([^/]+)\/([^/.]+)/);
-  if (!match) return null;
-  return { owner: match[1], repo: match[2].replace(/\.git$/, "") };
+  const scp = url.match(/^git@github\.com:([^/\s]+)\/([^/\s]+?)(?:\.git)?$/);
+  if (scp) return { owner: scp[1], repo: scp[2] };
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return null;
+  }
+  if (parsed.hostname !== "github.com" || parsed.search || parsed.hash) return null;
+  if (parsed.protocol !== "https:" && parsed.protocol !== "ssh:" && parsed.protocol !== "git+ssh:") return null;
+  const parts = parsed.pathname.split("/").filter(Boolean);
+  if (parts.length !== 2) return null;
+  return { owner: parts[0], repo: parts[1].replace(/\.git$/, "") };
 }
 
 function sanitizeContainerName(identifier: string): string {
@@ -254,6 +264,7 @@ function confirmedContainerNotRunning(containerName: string): "confirmed" | "unk
 async function prepareLocalConfiguredAuth(input: {
   configPath: string;
   projectKey: string;
+  actualRepository: string | null;
   workspace: string;
   artifactsDir: string;
   repositories: readonly string[];
@@ -273,7 +284,13 @@ async function prepareLocalConfiguredAuth(input: {
     if (!snapshot) return { snapshot: undefined, env: {} };
     const references = [...loaded.references.values()];
     if (hasSubscriptionReference(references)) {
-      for (const repository of input.repositories) verifyLocalSubscriptionRepoTrust(repository);
+      if (!input.actualRepository) {
+        throw new Error("Local subscription configured runs require a detected GitHub origin for the actual workspace checkout");
+      }
+      if (input.projectKey !== input.actualRepository || input.repositories.some((repo) => repo !== input.actualRepository)) {
+        throw new Error("Local subscription configured runs require task repo, config projectKey, and actual workspace origin to match");
+      }
+      verifyLocalSubscriptionRepoTrust(input.actualRepository);
     }
     for (const reference of references) {
       if (reference.kind === "session") leases.push(await ownership.acquire(reference));
@@ -415,6 +432,7 @@ export async function startDevRun(opts: DevRunOptions): Promise<DevRunHandle> {
     opts.githubToken ?? process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN ?? "dev-placeholder-token";
 
   const detectedOrigin = detectRepoFromOrigin(workspace);
+  const actualRepository = detectedOrigin ? `${detectedOrigin.owner}/${detectedOrigin.repo}` : null;
   const { repoOwner, repoName } = (() => {
     if (task.repo) {
       const parts = task.repo.split("/");
@@ -450,6 +468,7 @@ export async function startDevRun(opts: DevRunOptions): Promise<DevRunHandle> {
       ? await prepareLocalConfiguredAuth({
           configPath: opts.agentConfig,
           projectKey,
+          actualRepository,
           workspace,
           artifactsDir,
           repositories,
