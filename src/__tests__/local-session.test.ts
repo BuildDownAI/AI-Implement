@@ -12,6 +12,7 @@ vi.mock("node:fs/promises", () => ({
   chmod: vi.fn().mockResolvedValue(undefined),
   unlink: vi.fn().mockResolvedValue(undefined),
   readFile: vi.fn().mockRejectedValue(Object.assign(new Error("ENOENT"), { code: "ENOENT" })),
+  stat: vi.fn().mockResolvedValue({ isFile: () => true, mode: 0o600, uid: typeof process.getuid === "function" ? process.getuid() : 501 }),
 }));
 
 vi.mock("../local-docker.js", () => ({
@@ -22,16 +23,21 @@ vi.mock("../local-docker.js", () => ({
 }));
 
 import { execFile as rawExecFile, spawn } from "node:child_process";
-import { readFile, unlink } from "node:fs/promises";
+import { readFile, stat, unlink } from "node:fs/promises";
 import { inspectLocalContainer } from "../local-docker.js";
 import {
   awaitSessionResult,
   getSessionStatus,
   launchLocalSession,
+  loadLocalSessionBootstrap,
+  LOCAL_AUTH_BOOTSTRAP_ENV,
+  startLocalAuthBridge,
   stopLocalSession,
   streamSessionLogs,
   streamSessionLogsUntilShellReady,
+  validateLocalSessionBootstrap,
 } from "../local/session.js";
+import { makeSnapshot } from "./configured-run-fixture.js";
 
 function makeExecFileMock(containerId = "abc123def456") {
   vi.mocked(rawExecFile).mockImplementation(
@@ -288,6 +294,169 @@ describe("streamSessionLogsUntilShellReady", () => {
 
     expect(result.ready).toBe(true);
     expect(result.exitCode).toBe(42);
+  });
+});
+
+describe("startLocalAuthBridge release handling", () => {
+  it("routes safe terminal release by actual lease use and continues across all leases", async () => {
+    const events: string[] = [];
+    const ownership = {
+      release: vi.fn(async (_lease: unknown) => { events.push("release-used"); }),
+      releaseUnused: vi.fn(async (_lease: unknown) => { events.push("release-unused"); }),
+    };
+    const usedLease = { profileId: "used", used: true };
+    const unusedLease = { profileId: "unused", used: false };
+    const bridge = await startLocalAuthBridge({
+      snapshotId: "snap-1",
+      projectKey: "owner/repo",
+      credentialPort: { load: vi.fn() },
+      ownership: ownership as never,
+      leases: [usedLease, unusedLease] as never,
+      references: [],
+      trustedRepositories: ["owner/repo"],
+    });
+    const url = new URL(bridge.bootstrap.bridge.baseUrl);
+    await fetch(`http://127.0.0.1:${url.port}/disposition`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${bridge.bootstrap.bridge.bearer}` },
+      body: JSON.stringify({ safe: true }),
+    });
+
+    await bridge.releaseAfterTermination(async () => "confirmed");
+    await bridge.close();
+
+    expect(events).toEqual(["release-used", "release-unused"]);
+    expect(ownership.release).toHaveBeenCalledWith(usedLease, expect.anything());
+    expect(ownership.releaseUnused).toHaveBeenCalledWith(unusedLease, expect.anything());
+  });
+
+  it("aggregates release errors after trying every unused lease", async () => {
+    const events: string[] = [];
+    const ownership = {
+      releaseUnused: vi.fn(async (lease: { profileId: string }) => {
+        events.push(lease.profileId);
+        if (lease.profileId === "a") throw new Error("first failed");
+      }),
+    };
+    const bridge = await startLocalAuthBridge({
+      snapshotId: "snap-1",
+      projectKey: "owner/repo",
+      credentialPort: { load: vi.fn() },
+      ownership: ownership as never,
+      leases: [{ profileId: "a", used: false }, { profileId: "b", used: false }] as never,
+      references: [],
+      trustedRepositories: ["owner/repo"],
+    });
+
+    await expect(bridge.releaseUnused(async () => "confirmed")).rejects.toBeInstanceOf(AggregateError);
+    await bridge.close();
+
+    expect(events).toEqual(["a", "b"]);
+  });
+
+  it("close waits for a paused load handler before release can run", async () => {
+    let resolveLoad!: () => void;
+    let closeSettled = false;
+    const loadGate = new Promise<void>((resolve) => { resolveLoad = resolve; });
+    let markStarted!: () => void;
+    const loadStarted = new Promise<void>((resolve) => { markStarted = resolve; });
+    const bridge = await startLocalAuthBridge({
+      snapshotId: "snap-1",
+      projectKey: "owner/repo",
+      credentialPort: {
+        load: vi.fn(async () => {
+          markStarted();
+          await loadGate;
+          return { kind: "api-key" as const, apiKey: "sk-test" };
+        }),
+      },
+      ownership: { releaseUnused: vi.fn(), release: vi.fn() } as never,
+      leases: [],
+      references: [],
+      trustedRepositories: ["owner/repo"],
+    });
+    const url = new URL(bridge.bootstrap.bridge.baseUrl);
+    const controller = new AbortController();
+    const fetchPromise = fetch(`http://127.0.0.1:${url.port}/load`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${bridge.bootstrap.bridge.bearer}` },
+      body: JSON.stringify({ profileId: "p", authMode: "openai-api-key" }),
+      signal: controller.signal,
+    }).catch(() => undefined);
+    await loadStarted;
+    controller.abort();
+    const closePromise = bridge.close().then(() => { closeSettled = true; });
+    await Promise.resolve();
+    expect(closeSettled).toBe(false);
+    resolveLoad();
+    await fetchPromise;
+    await closePromise;
+    expect(closeSettled).toBe(true);
+  });
+});
+
+describe("local session bootstrap consumption", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    makeExecFileMock();
+    vi.mocked(stat).mockResolvedValue({ isFile: () => true, mode: 0o600, uid: typeof process.getuid === "function" ? process.getuid() : 501 } as never);
+  });
+
+  function bootstrap(overrides: Record<string, unknown> = {}) {
+    return {
+      version: 1,
+      snapshotId: "snap-1",
+      projectKey: "owner/repo",
+      bridge: { baseUrl: "http://127.0.0.1:9", bearer: "b".repeat(40) },
+      references: [{ profileId: "p-impl", authMode: "openai-api-key", kind: "api-key" }],
+      trustedRepositories: ["owner/repo"],
+      ...overrides,
+    };
+  }
+
+  it("validates private bootstrap metadata, consumes the pointer, and withdraws the file", async () => {
+    const path = "/tmp/local-auth/bootstrap.json";
+    vi.mocked(readFile).mockResolvedValue(JSON.stringify(bootstrap()));
+    const env = {
+      [LOCAL_AUTH_BOOTSTRAP_ENV]: path,
+      AI_IMPLEMENT_HOST_UID: String(typeof process.getuid === "function" ? process.getuid() : 501),
+    } as NodeJS.ProcessEnv;
+
+    const result = await loadLocalSessionBootstrap({ env, snapshot: makeSnapshot("openai-api-key"), workspaceDir: "/workspace" });
+
+    expect(result.configured.repositories).toEqual(["owner/repo"]);
+    expect(result.configured.localCredentialPort).toBeDefined();
+    expect(env[LOCAL_AUTH_BOOTSTRAP_ENV]).toBeUndefined();
+    expect(unlink).toHaveBeenCalledWith(path);
+  });
+
+  it("rejects bootstrap references not selected by the snapshot", async () => {
+    const path = "/tmp/local-auth/bootstrap.json";
+    vi.mocked(readFile).mockResolvedValue(JSON.stringify(bootstrap({
+      references: [{ profileId: "other-profile", authMode: "openai-api-key", kind: "api-key" }],
+    })));
+    const env = {
+      [LOCAL_AUTH_BOOTSTRAP_ENV]: path,
+      AI_IMPLEMENT_HOST_UID: String(typeof process.getuid === "function" ? process.getuid() : 501),
+    } as NodeJS.ProcessEnv;
+
+    await expect(validateLocalSessionBootstrap(path, makeSnapshot("openai-api-key"), env)).rejects.toThrow("reference not selected");
+    expect(unlink).not.toHaveBeenCalledWith(path);
+  });
+
+  it("throws a static error when the host rejects configured disposition", async () => {
+    const path = "/tmp/local-auth/bootstrap.json";
+    vi.mocked(readFile).mockResolvedValue(JSON.stringify(bootstrap()));
+    const env = {
+      [LOCAL_AUTH_BOOTSTRAP_ENV]: path,
+      AI_IMPLEMENT_HOST_UID: String(typeof process.getuid === "function" ? process.getuid() : 501),
+    } as NodeJS.ProcessEnv;
+    const fetchMock = vi.fn().mockResolvedValue({ ok: false });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await loadLocalSessionBootstrap({ env, snapshot: makeSnapshot("openai-api-key"), workspaceDir: "/workspace" });
+
+    await expect(result.onConfiguredFinish(true)).rejects.toThrow("local configured disposition was not acknowledged");
   });
 });
 

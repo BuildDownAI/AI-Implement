@@ -79,6 +79,29 @@ verify_workspace_writable() {
   fail "Cannot write to bind-mounted workspace $workspace_dir (owner $ws_uid:$ws_gid, coder UID $coder_uid GID $coder_gid). Verify AI_IMPLEMENT_HOST_UID/AI_IMPLEMENT_HOST_GID match the host directory owner. On macOS Docker Desktop, confirm file sharing is enabled — the mount may be read-only."
 }
 
+# Copy a standalone local source into the writable container workspace.
+copy_local_workspace() {
+  local workspace_dir="$1"
+  [ -d /source-workspace ] || fail "Local workspace source is unavailable"
+  mkdir -p "$workspace_dir"
+  run_scoped "" cp -a /source-workspace/. "$workspace_dir/"
+  run_scoped "" git config --global --add safe.directory "$workspace_dir"
+}
+
+# Mounted checkouts retain host ownership; copied/cloned workspaces belong to coder.
+prepare_workspace_owner() {
+  local mode="$1" workspace_dir="$2"
+  if [ "$mode" = "mounted" ]; then
+    prepare_coder_identity "${AI_IMPLEMENT_HOST_UID:-}" "${AI_IMPLEMENT_HOST_GID:-}"
+    verify_workspace_writable "$workspace_dir"
+  else
+    if [ -n "${AI_IMPLEMENT_LOCAL_AUTH_BOOTSTRAP_FILE:-}" ]; then
+      prepare_coder_identity "${AI_IMPLEMENT_HOST_UID:-}" "${AI_IMPLEMENT_HOST_GID:-}"
+    fi
+    chown -R coder:"$(id -gn coder)" "$workspace_dir"
+  fi
+}
+
 # Resolve VAR from the AI_IMPLEMENT_RUN_CONFIG envelope when the env is empty.
 # Usage: resolve_envelope_field VAR_NAME ENVELOPE_KEY
 #
@@ -116,13 +139,13 @@ resolve_envelope_field() {
 #   legacy      no envelope, or a trusted-decodable envelope with neither a resolved agentConfig
 #               nor a credentials.modelAuthGrant (a callback/publication-only credentials
 #               namespace stays legacy stage selection)
-#   configured  trusted decoder accepts it and it carries both agentConfig and modelAuthGrant
+#   configured  trusted decoder accepts snapshot plus a hosted grant or validated private local bootstrap
 #   invalid     any nonempty envelope the trusted decoder rejects (bad base64/JSON, non-object,
 #               bad version, bad credentials) or configured intent with only one of the two;
 #               callers fail closed, never fall back to legacy
 # Never prints decoded values or decoder error text. AI_IMPLEMENT_DIST_DIR is a test seam.
 classify_run_config() {
-  [ -z "${AI_IMPLEMENT_RUN_CONFIG:-}" ] && { echo legacy; return 0; }
+  [ -z "${AI_IMPLEMENT_RUN_CONFIG:-}" ] && { if [ -n "${AI_IMPLEMENT_LOCAL_AUTH_BOOTSTRAP_FILE:-}" ]; then echo invalid; else echo legacy; fi; return 0; }
   run_node --input-type=module -e '
     const out = (w) => process.stdout.write(w);
     try {
@@ -131,7 +154,17 @@ classify_run_config() {
       const c = decodeTrustedRunConfig(process.env.AI_IMPLEMENT_RUN_CONFIG);
       const snapshot = c.agentConfig !== undefined;
       const grant = c.credentials !== undefined && c.credentials.modelAuthGrant !== undefined;
-      out(snapshot && grant ? "configured" : snapshot || grant ? "invalid" : "legacy");
+      const localFile = process.env.AI_IMPLEMENT_LOCAL_AUTH_BOOTSTRAP_FILE;
+      if (localFile) {
+        if (!snapshot || grant) { out("invalid"); }
+        else {
+          const { validateLocalSessionBootstrap } = await import(dir + "/local/session.js");
+          await validateLocalSessionBootstrap(localFile, c.agentConfig, process.env);
+          out("configured");
+        }
+      } else {
+        out(snapshot && grant ? "configured" : snapshot || grant ? "invalid" : "legacy");
+      }
     } catch { out("invalid"); }
   ' 2>/dev/null || echo invalid
 }

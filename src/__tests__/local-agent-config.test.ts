@@ -9,6 +9,7 @@ import {
   loadLocalAgentConfig,
   type LocalAgentConfigDiagnostic,
   type LocalAgentConfigFailure,
+  type TerminationProof,
 } from "../local/agent-config.js";
 
 const API_SECRET = "sk-synthetic-api-key-0000";
@@ -77,6 +78,14 @@ async function expectCategory(promise: Promise<unknown>, category: LocalAgentCon
   expect((error as LocalAgentConfigError).category).toBe(category);
   const text = `${(error as Error).message}${JSON.stringify(diagnostics)}`;
   for (const secret of [API_SECRET, SESSION_SECRET, ...forbidden]) expect(text).not.toContain(secret);
+}
+
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
 }
 
 beforeEach(async () => {
@@ -228,6 +237,92 @@ describe("ownership and port", () => {
     await expectCategory(port.load({ profileId: "sub-a", authMode: "codex-subscription" }), "session_not_owned");
   });
 
+  it("releases an unused lease without persisting or reading the session", async () => {
+    const { ownership, sub } = await setup();
+    const lease = await ownership.acquire(sub);
+    expect(lease.used).toBe(false);
+    expect(lease.refreshed).toBe(false);
+
+    await ownership.releaseUnused(lease, { confirmTermination: async () => "confirmed" });
+    expect(lease.status).toBe("released");
+    expect((await readdir(outside)).filter((n) => n.endsWith(".ai-lock"))).toEqual([]);
+    expect(await readFile(join(outside, "session.json"), "utf8")).toBe(SESSION_SECRET);
+
+    const next = await ownership.acquire(sub);
+    expect(next.status).toBe("owned");
+    expect(next.used).toBe(false);
+  });
+
+  it("blocks a subscription load that started before unused release closes the lease", async () => {
+    const loaded = await loadLocalAgentConfig(opts(await writeConfig(baseConfig())));
+    const ownership = new LocalSessionOwnership({ forbiddenRoots: [repo] });
+    const entered = deferred();
+    const continueLoad = deferred();
+    const port = createLocalCredentialPort({
+      references: loaded.references,
+      forbiddenRoots: [repo],
+      ownership,
+      io: {
+        afterVerifyOwner: async () => {
+          entered.resolve();
+          await continueLoad.promise;
+        },
+      },
+    });
+    const sub = loaded.references.get("sub-a")!;
+    const lease = await ownership.acquire(sub);
+
+    const load = port.load({ profileId: "sub-a", authMode: "codex-subscription" });
+    await entered.promise;
+
+    const proofRequested = deferred();
+    const proof = deferred<TerminationProof>();
+    const release = ownership.releaseUnused(lease, {
+      confirmTermination: async () => {
+        proofRequested.resolve();
+        return proof.promise;
+      },
+    });
+    await proofRequested.promise;
+
+    expect(lease.status).toBe("owned");
+    expect(lease.used).toBe(false);
+    await expectCategory(port.load({ profileId: "sub-a", authMode: "codex-subscription" }), "session_not_owned");
+
+    continueLoad.resolve();
+    await expectCategory(load, "session_not_owned");
+    expect(lease.used).toBe(false);
+
+    proof.resolve("confirmed");
+    await release;
+    expect(lease.status).toBe("released");
+    expect((await readdir(outside)).filter((n) => n.endsWith(".ai-lock"))).toEqual([]);
+  });
+
+  it("does not release unused ownership after session use, unknown proof, held state, or stale fencing", async () => {
+    const { ownership, port, sub } = await setup();
+    const used = await ownership.acquire(sub);
+    await port.load({ profileId: "sub-a", authMode: "codex-subscription" });
+    expect(used.used).toBe(true);
+    await expectCategory(ownership.releaseUnused(used, { confirmTermination: async () => "confirmed" }), "persistence_missing");
+    expect(used.status).toBe("owned");
+    await expectCategory(ownership.release(used, { confirmTermination: async () => "confirmed" }), "persistence_missing");
+    expect(used.status).toBe("held");
+    await expectCategory(ownership.releaseUnused(used, { confirmTermination: async () => "confirmed" }), "stale_owner");
+
+    await rm(join(outside, LOCK));
+    const staleOwnership = new LocalSessionOwnership({ forbiddenRoots: [repo] });
+    const stale = await staleOwnership.acquire(sub);
+    await rm(join(outside, LOCK));
+    await expectCategory(staleOwnership.releaseUnused(stale, { confirmTermination: async () => "confirmed" }), "stale_owner");
+
+    const unknownOwnership = new LocalSessionOwnership({ forbiddenRoots: [repo] });
+    const unknown = await unknownOwnership.acquire(sub);
+    await expectCategory(unknownOwnership.releaseUnused(unknown, { confirmTermination: async () => "unknown" }), "termination_unconfirmed");
+    expect(unknown.status).toBe("held");
+    await expectCategory(unknownOwnership.releaseUnused(unknown, { confirmTermination: async () => "confirmed" }), "stale_owner");
+  });
+
   it("allows exactly one concurrent owner, across aliases", async () => {
     const { ownership, sub } = await setup();
     await symlink(join(outside, "session.json"), join(outside, "alias.json"));
@@ -253,6 +348,7 @@ describe("ownership and port", () => {
     expect(await readFile(join(outside, "session.json"), "utf8")).toBe(refreshed);
     expect((await stat(join(outside, "session.json"))).mode & 0o777).toBe(0o600);
     expect((await readdir(outside)).filter((n) => n.endsWith(".tmp"))).toEqual([]);
+    expect(lease.used).toBe(true);
     expect(lease.refreshed).toBe(true);
 
     await ownership.release(lease, { confirmTermination: async () => "confirmed" });

@@ -23,8 +23,8 @@ log "Execution mode: $AI_IMPLEMENT_MODE"
 export AI_IMPLEMENT_MODE
 
 # ── 2. Env validation ────────────────────────────────────────────────────────
-# A configured (opted-in) run carries a resolved agent snapshot plus a model-auth bootstrap in
-# the envelope; the trusted decoder must accept it before the legacy provider check is skipped.
+# A configured run carries a resolved snapshot plus a hosted grant or protected local bootstrap.
+# The trusted decoder and local metadata validator run before the legacy provider check is skipped.
 # Incomplete or malformed configured input fails closed here, before any git/clone/setup, with
 # a fixed message and no legacy-credential fallback.
 case "$(classify_run_config)" in
@@ -83,7 +83,10 @@ run_scoped "" git config --global user.name "ai-implement-bot"
 run_scoped "" git config --global user.email "ai-implement-bot@users.noreply.github.com"
 run_scoped "" git config --global init.defaultBranch "$GITHUB_DEFAULT_BRANCH"
 
-if [ "$WORKSPACE_MODE" = "mounted" ]; then
+if [ "$WORKSPACE_MODE" = "copy" ]; then
+  copy_local_workspace "$WORKSPACE_DIR"
+  cd "$WORKSPACE_DIR"
+elif [ "$WORKSPACE_MODE" = "mounted" ]; then
   log "Using bind-mounted workspace at $WORKSPACE_DIR"
   run_scoped "" git config --global --add safe.directory "$WORKSPACE_DIR"
   cd "$WORKSPACE_DIR"
@@ -108,12 +111,7 @@ else
 fi
 
 # ── 5. Workspace ownership for non-root Claude ───────────────────────────────
-if [ "$WORKSPACE_MODE" = "mounted" ]; then
-  prepare_coder_identity "${AI_IMPLEMENT_HOST_UID:-}" "${AI_IMPLEMENT_HOST_GID:-}"
-  verify_workspace_writable "$WORKSPACE_DIR"
-else
-  chown -R coder:coder "$WORKSPACE_DIR"
-fi
+prepare_workspace_owner "$WORKSPACE_MODE" "$WORKSPACE_DIR"
 cp /root/.gitconfig /home/coder/.gitconfig 2>/dev/null || true
 chown coder:coder /home/coder/.gitconfig 2>/dev/null || true
 

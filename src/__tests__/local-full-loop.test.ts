@@ -3,12 +3,16 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
+import { EventEmitter } from "node:events";
+import type { spawn } from "node:child_process";
 
 const isWindows = process.platform === "win32";
 import { runLocalFullLoop } from "../local/full-loop.js";
 import { PipelineRunner } from "../pipeline/runner.js";
 import type { LLMExecutor, PipelineDefinition, StepModule } from "../pipeline/types.js";
 import { getDiff } from "../pipeline/steps/feedback-loop.js";
+import { fakeClient, makeGrant, makeSnapshot } from "./configured-run-fixture.js";
+import { encodeTrustedRunConfig, type ResolvedAgentSnapshotV1 } from "../run-config.js";
 
 function makeMockExecutor(exitCode = 0): LLMExecutor {
   return {
@@ -50,6 +54,43 @@ function makeFeedbackLoopPipeline(mod: StepModule): {
   };
   const runner = new PipelineRunner().register("feedback-loop", mod);
   return { pipeline, runner };
+}
+
+function planningSpawnWithPlan(workspaceDir: string): typeof spawn {
+  return ((_cmd: string, _args: readonly string[]) => {
+    const proc = new EventEmitter() as EventEmitter & Record<string, unknown>;
+    const stream = () => Object.assign(new EventEmitter(), { destroy: () => {}, end: () => {} });
+    proc.stdout = stream();
+    proc.stderr = stream();
+    proc.stdin = Object.assign(stream(), { write: () => undefined, end: () => undefined });
+    proc.pid = 0;
+    proc.kill = () => true;
+    setImmediate(() => {
+      mkdirSync(join(workspaceDir, "ai-output", "comments"), { recursive: true });
+      writeFileSync(join(workspaceDir, "ai-output", "comments", "01-plan.md"), "# Plan\nUse the configured executor.");
+      const line = JSON.stringify({ type: "result", subtype: "success", is_error: false, result: "ok", num_turns: 1 }) + "\n";
+      (proc.stdout as EventEmitter).emit("data", Buffer.from(line));
+      proc.emit("close", 0, null);
+    });
+    return proc;
+  }) as unknown as typeof spawn;
+}
+
+function makeClaudeSnapshot(): ResolvedAgentSnapshotV1 {
+  const snap = makeSnapshot("anthropic-api-key");
+  return {
+    ...snap,
+    stages: {
+      planning: snap.stages.planning,
+      implementation: { ...snap.stages.implementation, agent: "claude", provider: "anthropic", model: "claude-impl", accountProfileId: "p-impl" },
+      review: snap.stages.review,
+    },
+    profiles: {
+      planning: snap.profiles.planning,
+      implementation: { id: "p-impl", identity: "b", revision: 1, agent: "claude", provider: "anthropic", authMode: "anthropic-api-key" },
+      review: snap.profiles.review,
+    },
+  };
 }
 
 describe("runLocalFullLoop", () => {
@@ -539,5 +580,159 @@ describe("runLocalFullLoop", () => {
     expect(result.effectiveMaxTurns).toBe(30);
     expect(result.effectiveMaxIterations).toBe(5);
     expect(result.tokenSummary).toBeNull();
+  });
+
+  it("does not fall back to legacy planning when configured env has a grant but no snapshot", async () => {
+    const snapshot = makeSnapshot();
+    const planningExecutor = vi.fn(() => ({ status: 0 as const, stdout: "", stderr: "" }));
+    const { pipeline, runner } = makeFeedbackLoopPipeline({
+      run: vi.fn().mockResolvedValue({ approved: true, iterations: 1, terminationReason: "approved", passes: [], finalFeedback: "" }),
+    });
+
+    const result = await runLocalFullLoop({
+      workspaceDir: ws,
+      issueIdentifier: "TEST-1",
+      issueTitle: "Test",
+      issueDescription: "Desc",
+      planningExecutor,
+      configuredEnv: {
+        AI_IMPLEMENT_RUN_CONFIG: encodeTrustedRunConfig({
+          v: 1,
+          issue: { id: "issue-1", identifier: "LOCAL-1", title: "T", description: "D" },
+          runnerPhase: "implementation",
+          credentials: { version: 1, modelAuthGrant: makeGrant(snapshot) },
+        }),
+      } as NodeJS.ProcessEnv,
+      pipeline,
+      runner,
+    });
+
+    expect(result.classification).toBe("plan_failed");
+    expect(result.planDiagnostics).toContain("snapshot_incomplete");
+    expect(planningExecutor).not.toHaveBeenCalled();
+  });
+
+  it("does not fall back to legacy planning when configured env only has a local bootstrap pointer", async () => {
+    const planningExecutor = vi.fn(() => ({ status: 0 as const, stdout: "", stderr: "" }));
+    const result = await runLocalFullLoop({
+      workspaceDir: ws,
+      issueIdentifier: "TEST-1",
+      issueTitle: "Test",
+      issueDescription: "Desc",
+      planningExecutor,
+      configuredEnv: {
+        AI_IMPLEMENT_LOCAL_AUTH_BOOTSTRAP_FILE: "/private/bootstrap-secret.json",
+      } as NodeJS.ProcessEnv,
+    });
+
+    expect(result.classification).toBe("plan_failed");
+    expect(result.planDiagnostics).toContain("bootstrap_missing");
+    expect(planningExecutor).not.toHaveBeenCalled();
+  });
+
+  it("logs a static category when configured finish callback fails", async () => {
+    const snapshot = makeClaudeSnapshot();
+    const client = fakeClient();
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const { pipeline, runner } = makeFeedbackLoopPipeline({
+      run: vi.fn().mockResolvedValue({ approved: true, iterations: 1, terminationReason: "approved", passes: [], finalFeedback: "" }),
+    });
+
+    const result = await runLocalFullLoop({
+      workspaceDir: ws,
+      issueIdentifier: "TEST-1",
+      issueTitle: "Test",
+      issueDescription: "Desc",
+      agentConfig: snapshot,
+      configured: {
+        agentConfig: snapshot,
+        localCredentialPort: { load: vi.fn() },
+        modelAuthClient: client,
+      },
+      onConfiguredFinish: vi.fn().mockRejectedValue(new Error("secret callback detail")),
+      spawnImpl: planningSpawnWithPlan(ws),
+      pipeline,
+      runner,
+    });
+
+    expect(result.classification).toBe("provider_unavailable");
+    expect(log).toHaveBeenCalledWith("[dev:run] configured finish callback failed: callback_error");
+    expect(JSON.stringify(log.mock.calls)).not.toContain("secret callback detail");
+    log.mockRestore();
+  });
+
+  it("prepares one configured run for planning, implementation, and review, then finishes it once", async () => {
+    const snapshot = makeClaudeSnapshot();
+    const client = fakeClient();
+    const onConfiguredFinish = vi.fn(async () => undefined);
+    const llmExecutor = makeMockExecutor(0);
+    const { pipeline, runner } = makeFeedbackLoopPipeline({
+      run: vi.fn().mockImplementation(async (ctx) => {
+        await ctx.llmExecutor.invoke({ prompt: "implement", model: "caller", agentStage: "implementation" });
+        await ctx.llmExecutor.invoke({ prompt: "review", model: "caller", agentStage: "review" });
+        return { approved: true, iterations: 1, terminationReason: "approved", passes: [], finalFeedback: "" };
+      }),
+    });
+
+    const result = await runLocalFullLoop({
+      workspaceDir: ws,
+      issueIdentifier: "TEST-1",
+      issueTitle: "Test",
+      issueDescription: "Desc",
+      agentConfig: snapshot,
+      configured: {
+        agentConfig: snapshot,
+        localCredentialPort: { load: vi.fn() },
+        modelAuthClient: client,
+      },
+      llmExecutor,
+      onConfiguredFinish,
+      spawnImpl: planningSpawnWithPlan(ws),
+      pipeline,
+      runner,
+    });
+
+    expect(result.classification).toBe("success");
+    expect(client.invoke.mock.calls.map((c) => c[0])).toEqual(["p-plan", "p-impl", "p-rev"]);
+    expect(client.checkout.mock.calls.map((c) => c[0].profileId)).toEqual(["p-plan", "p-impl", "p-rev"]);
+    expect(client.finish.mock.calls.map((c) => c[0])).toEqual(["p-plan", "p-impl", "p-rev"]);
+    expect(client.dispose).toHaveBeenCalledTimes(1);
+    expect(onConfiguredFinish).toHaveBeenCalledWith(true);
+  });
+
+  it("holds configured cleanup when a selected child may still be live", async () => {
+    const snapshot = makeClaudeSnapshot();
+    const client = fakeClient();
+    const onConfiguredFinish = vi.fn(async () => undefined);
+    const llmExecutor: LLMExecutor = { invoke: vi.fn().mockRejectedValue(Object.assign(new Error("child still running"), { possiblyLive: true })) };
+    const { pipeline, runner } = makeFeedbackLoopPipeline({
+      run: vi.fn().mockImplementation(async (ctx) => {
+        await ctx.llmExecutor.invoke({ prompt: "implement", model: "caller", agentStage: "implementation" });
+        return { approved: true, iterations: 1, terminationReason: "approved", passes: [], finalFeedback: "" };
+      }),
+    });
+
+    const result = await runLocalFullLoop({
+      workspaceDir: ws,
+      issueIdentifier: "TEST-1",
+      issueTitle: "Test",
+      issueDescription: "Desc",
+      agentConfig: snapshot,
+      configured: {
+        agentConfig: snapshot,
+        localCredentialPort: { load: vi.fn() },
+        modelAuthClient: client,
+      },
+      llmExecutor,
+      onConfiguredFinish,
+      spawnImpl: planningSpawnWithPlan(ws),
+      pipeline,
+      runner,
+    });
+
+    expect(result.classification).toBe("implementation_failed");
+    expect(client.finish).not.toHaveBeenCalled();
+    expect(client.dispose).not.toHaveBeenCalled();
+    expect(onConfiguredFinish).toHaveBeenCalledWith(false);
   });
 });

@@ -19,7 +19,7 @@ describe.skipIf(isWindows)("session/lib.sh", () => {
       encoding: "utf-8",
       stdio: ["ignore", "pipe", "pipe"],
     });
-    if (result.error?.code === "ENOENT") return;
+    if (result.error && "code" in result.error && result.error.code === "ENOENT") return;
     expect(result.status).toBe(0);
   });
 
@@ -484,5 +484,39 @@ describe.skipIf(isWindows)("session/lib.sh configured-run helpers (AII-951)", ()
         expect(existsSync(marker)).toBe(false);
       });
     });
+  });
+});
+
+describe.skipIf(isWindows)("local configured bootstrap classification", () => {
+  const classify = (envelope: string | undefined, pointer: string | undefined, grant = false) => {
+    const dir = mkdtempSync(join(tmpdir(), "local-classify-"));
+    try {
+      mkdirSync(join(dir, "local"));
+      writeFileSync(join(dir, "run-config.js"), `export function decodeTrustedRunConfig(e) { if(e === "bad") throw Error(); return {agentConfig:e === "snapshot" ? {} : undefined, credentials:${grant ? '{modelAuthGrant:{}}' : '{}'}}; }`);
+      writeFileSync(join(dir, "local/session.js"), 'export function validateLocalSessionBootstrap(p) { if (p !== "/private/valid") throw Error("private error"); }');
+      return spawnSync("bash", ["-c", "source session/lib.sh; classify_run_config"], {
+        encoding: "utf-8",
+        env: { PATH: process.env.PATH ?? "", AI_IMPLEMENT_DIST_DIR: dir,
+          ...(envelope ? { AI_IMPLEMENT_RUN_CONFIG: envelope } : {}),
+          ...(pointer ? { AI_IMPLEMENT_LOCAL_AUTH_BOOTSTRAP_FILE: pointer } : {}) },
+      });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  };
+
+  it("accepts snapshot plus validated local bootstrap without a hosted grant", () => {
+    expect(classify("snapshot", "/private/valid").stdout).toBe("configured");
+  });
+  it.each([[undefined, "/private/valid"], ["legacy", "/private/valid"], ["snapshot", "/private/invalid"], ["bad", "/private/valid"], ["snapshot", undefined]])(
+    "fails closed for incomplete or invalid local intent (%s, %s)", (envelope, pointer) => {
+      const result = classify(envelope, pointer);
+      expect(result.stdout.trim()).toBe("invalid");
+      expect(result.stderr).not.toContain("private error");
+    },
+  );
+  it("rejects mixing local bootstrap with a hosted grant", () => {
+    expect(classify("snapshot", "/private/valid", true).stdout).toBe("invalid");
+  });
+  it("preserves the envelope-free legacy path", () => {
+    expect(classify(undefined, undefined).stdout.trim()).toBe("legacy");
   });
 });

@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { parseWorkflowMd } from "./workflow-md.js";
 import { postRunnerResult } from "./runner-result.js";
 import { decodeRunConfig, type ResolvedAgentSnapshotV1 } from "./run-config.js";
-import { ConfiguredRunError, hasConfiguredIntent, prepareConfiguredRun, type ConfiguredRun, type ConfiguredRunOptions } from "./run-autonomous.js";
+import { ConfiguredRunError, hasConfiguredIntent, prepareConfiguredRun, validateBorrowedConfiguredRun, type ConfiguredRun, type ConfiguredRunOptions } from "./run-autonomous.js";
 import { ClaudeCliExecutor } from "./pipeline/executor.js";
 import type { InvocationAttributionV1, InvokeParams, LLMResult } from "./pipeline/types.js";
 import { DEFAULT_MODEL } from "./pipeline/default-model.js";
@@ -212,6 +212,10 @@ export interface RunPlanningLocalOptions {
    * owned by the caller, which finishes it; a client built here from a port is finished here.
    */
   configured?: ConfiguredRunOptions;
+  /** Trusted env source for hosted configured grants. */
+  configuredEnv?: NodeJS.ProcessEnv;
+  /** @internal Borrowed configured run owned by the local full-loop wrapper. */
+  prebuiltConfiguredRun?: ConfiguredRun;
   /** Construction seam for the Claude child spawn of a configured run (tests only). */
   spawnImpl?: typeof spawn;
 }
@@ -233,7 +237,8 @@ export async function runPlanningLocally(
   // An opted-in run is validated before any prompt, policy or model work; it never degrades to the legacy executor.
   let configured: ConfiguredRun | undefined;
   try {
-    configured = await prepareConfiguredRun({ env: {}, snapshot: opts.agentConfig, workspaceDir: opts.workspaceDir, options: opts.configured });
+    configured = validateBorrowedConfiguredRun(opts.prebuiltConfiguredRun, opts.agentConfig)
+      ?? await prepareConfiguredRun({ env: opts.configuredEnv ?? {}, snapshot: opts.agentConfig, workspaceDir: opts.workspaceDir, options: opts.configured });
   } catch (err) {
     return { exitCode: 1, planningContext: "", planFound: false, diagnostics: describeConfiguredFailure(err) };
   }
@@ -260,7 +265,7 @@ export async function runPlanningLocally(
       prompt,
       configured,
       spawnImpl: opts.spawnImpl,
-      ownsLifecycle: !opts.configured?.modelAuthClient,
+      ownsLifecycle: !opts.prebuiltConfiguredRun && !opts.configured?.modelAuthClient,
     });
     const attribution = outcome.attribution ? { attribution: outcome.attribution } : {};
     if (!outcome.ok) {

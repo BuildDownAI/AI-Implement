@@ -432,6 +432,10 @@ interface LeaseState {
   status: "owned" | "held" | "released";
   /** True only when the latest refreshed payload was durably written by the current owner. */
   refreshed: boolean;
+  /** True once this lease was allowed to read or persist subscription session material. */
+  used: boolean;
+  /** In-process fence while an unused release is closing this lease. */
+  closing: boolean;
 }
 
 const leaseStates = new WeakMap<object, LeaseState>();
@@ -448,6 +452,9 @@ export class LocalSessionLease {
   }
   get refreshed(): boolean {
     return leaseStates.get(this)!.refreshed;
+  }
+  get used(): boolean {
+    return leaseStates.get(this)!.used;
   }
 }
 
@@ -551,6 +558,8 @@ export class LocalSessionOwnership {
         canonicalPath: file.canonicalPath,
         status: durable ? "owned" : "held",
         refreshed: false,
+        used: false,
+        closing: false,
       });
       this.leases.set(reference.profileId, lease);
       // A lock that may not be durable is never removed: it stays as a recovery hold.
@@ -618,8 +627,58 @@ export class LocalSessionOwnership {
     }
   }
 
+  /**
+   * Clears a lease that never handed credentials to a launched process. The caller's proof must
+   * still fence process lifetime: either no process was launched, or its death is confirmed.
+   */
+  async releaseUnused(lease: LocalSessionLease, options: { confirmTermination: () => Promise<TerminationProof> }): Promise<void> {
+    const state = leaseStates.get(lease);
+    try {
+      await this.verifyOwner(lease);
+      if (!state || state.status !== "owned") fail("stale_owner", "local session ownership is no longer exclusively owned");
+      if (state.used || state.refreshed) {
+        fail("persistence_missing", "local session was already used; refreshed state must be durably saved before release");
+      }
+      state.closing = true;
+      let proof: unknown;
+      try {
+        proof = await options.confirmTermination();
+      } catch {
+        proof = "unknown";
+      }
+      if (proof !== "confirmed") {
+        await this.verifyOwner(lease);
+        if (state.status !== "owned" || !state.closing || state.used || state.refreshed) {
+          fail("stale_owner", "local session ownership is no longer exclusively owned");
+        }
+        await this.hold(state, "termination_unconfirmed");
+        fail("termination_unconfirmed", "container termination is not confirmed; ownership is held");
+      }
+      await this.verifyOwner(lease);
+      if (state.status !== "owned" || !state.closing) fail("stale_owner", "local session ownership is no longer exclusively owned");
+      if (state.used || state.refreshed) {
+        fail("persistence_missing", "local session was already used; refreshed state must be durably saved before release");
+      }
+      try {
+        await unlink(state.lockPath);
+      } catch (error) {
+        await this.restoreUnusedOwned(lease, state).catch(() => undefined);
+        throw error;
+      }
+      state.status = "released";
+      state.closing = false;
+      this.leases.delete(state.profileId);
+    } catch (error) {
+      if (state?.closing && state.status === "owned") await this.restoreUnusedOwned(lease, state).catch(() => undefined);
+      const safe = toSafeError(error, "ownership_failed", "local session unused release failed");
+      this.diagnose("release", safe.category, state?.profileId);
+      throw safe;
+    }
+  }
+
   private async hold(state: LeaseState, reason: LocalAgentConfigFailure): Promise<void> {
     state.status = "held";
+    state.closing = false;
     // Best effort: the lock file itself is what blocks competitors; the reason is for operators.
     try {
       const record: LockRecord = {
@@ -649,6 +708,11 @@ export class LocalSessionOwnership {
       // the existing lock still blocks competitors
     }
   }
+
+  private async restoreUnusedOwned(lease: LocalSessionLease, state: LeaseState): Promise<void> {
+    await this.verifyOwner(lease);
+    if (state.status === "owned" && state.closing && !state.used && !state.refreshed) state.closing = false;
+  }
 }
 
 function toSafeError(error: unknown, category: LocalAgentConfigFailure, message: string): LocalAgentConfigError {
@@ -666,7 +730,7 @@ export interface LocalCredentialPortOptions {
   ownership?: LocalSessionOwnership;
   onDiagnostic?: (diagnostic: LocalAgentConfigDiagnostic) => void;
   /** Test seam for failure injection. */
-  io?: { rename?: typeof rename; syncDir?: (dir: string) => Promise<void> };
+  io?: { rename?: typeof rename; syncDir?: (dir: string) => Promise<void>; afterVerifyOwner?: () => Promise<void> };
 }
 
 /**
@@ -686,12 +750,19 @@ export function createLocalCredentialPort(options: LocalCredentialPortOptions): 
     return reference;
   }
 
-  async function currentLease(reference: LocalCredentialReference, allowHeld = false): Promise<LocalSessionLease> {
+  async function currentLease(reference: LocalCredentialReference, allowHeld = false, markUsed = false): Promise<LocalSessionLease> {
     const lease = options.ownership?.leaseFor(reference.profileId);
-    if (!options.ownership || !lease || (lease.status !== "owned" && !(allowHeld && lease.status === "held"))) {
+    let state = lease ? leaseStates.get(lease) : undefined;
+    if (!options.ownership || !lease || !state || state.closing || (state.status !== "owned" && !(allowHeld && state.status === "held"))) {
       fail("session_not_owned", "local session must be owned before use");
     }
     await options.ownership.verifyOwner(lease);
+    await options.io?.afterVerifyOwner?.();
+    state = leaseStates.get(lease);
+    if (!state || state.closing || (state.status !== "owned" && !(allowHeld && state.status === "held"))) {
+      fail("session_not_owned", "local session must be owned before use");
+    }
+    if (markUsed) state.used = true;
     return lease;
   }
 
@@ -700,7 +771,7 @@ export function createLocalCredentialPort(options: LocalCredentialPortOptions): 
       try {
         const reference = referenceFor(request.profileId, request.authMode);
         const roots = await prepareForbiddenRoots(options.forbiddenRoots);
-        if (isSubscriptionAuthMode(reference.authMode)) await currentLease(reference);
+        if (isSubscriptionAuthMode(reference.authMode)) await currentLease(reference, false, true);
         const file = await validateProtectedFile(reference.canonicalPath, roots, "credential reference", {
           singleLink: reference.kind === "session",
         });
@@ -740,7 +811,7 @@ export function createLocalCredentialPort(options: LocalCredentialPortOptions): 
           fail("credential_unreadable", "profile is not a selected subscription session");
         }
         // A held lease is still the current owner; a late refresh must remain persistable.
-        const lease = await currentLease(reference, true);
+        const lease = await currentLease(reference, true, true);
         state = leaseStates.get(lease)!;
         state.refreshed = false;
         if (
