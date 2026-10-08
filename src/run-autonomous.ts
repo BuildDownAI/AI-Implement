@@ -46,7 +46,7 @@ import {
   type ModelAuthClient,
   type ModelAuthTransport,
 } from "./model-auth-client.js";
-import { MODEL_AUTH_BACKENDS, isSubscriptionAuthMode, type ModelAuthBackend, type ModelAuthFinishHandling } from "./model-auth-contract.js";
+import { MODEL_AUTH_BACKENDS, MODEL_AUTH_ENV, isSubscriptionAuthMode, type ModelAuthBackend, type ModelAuthFinishHandling } from "./model-auth-contract.js";
 import { STAGE_NAMES } from "./agent-config.js";
 import { repoTrustRejection, type RepoTrust } from "./repo-trust.js";
 import { AgentRecoveryRequiredError, createStageExecutor, type StageExecutorOptions } from "./pipeline/stage-executor.js";
@@ -745,15 +745,7 @@ export class ConfiguredRunError extends Error {
   }
 }
 
-/** Trusted launcher values the bootstrap must match; the grant never supplies its own. */
-export const MODEL_AUTH_ENV = {
-  dispatchId: "AI_IMPLEMENT_MODEL_AUTH_DISPATCH_ID",
-  projectKey: "AI_IMPLEMENT_MODEL_AUTH_PROJECT_KEY",
-  backend: "AI_IMPLEMENT_MODEL_AUTH_BACKEND",
-  baseUrl: "AI_IMPLEMENT_MODEL_AUTH_URL",
-  protectionKey: "AI_IMPLEMENT_MODEL_AUTH_PROTECTION_KEY",
-  authRoot: "AI_IMPLEMENT_MODEL_AUTH_ROOT",
-} as const;
+export { MODEL_AUTH_ENV };
 
 export interface ConfiguredRunOptions {
   /** Local runs: the resolved snapshot. Managed runs read it from the envelope. */

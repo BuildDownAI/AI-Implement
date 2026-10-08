@@ -4,7 +4,7 @@
 
 **Date:** 2026-08-18
 
-**Implementation status (verified 2026-09-30, branch `ai-implement/feature/aii-846`):** **Partially enforced.** The boundaries below are in the source and covered by synthetic tests that need no real credentials. The model credential still reaches Claude Code and anything it spawns, and the private run envelope is not implemented.
+**Implementation status (updated 2026-10-08, feature head 2f7ba8a):** **Partially enforced.** The boundaries below are in the source and covered by synthetic tests that need no real credentials. The private run envelope ([AII-680](https://linear.app/eudoxus/issue/AII-680/make-the-run-envelope-private-isolate-credentials-and-enforce-the-gha), [ADR 032](032-private-run-envelope-and-credential-bootstrap.md)) and the runner-side bootstrap isolation ([AII-951](https://linear.app/eudoxus/issue/AII-951/isolate-model-bootstrap-from-repository-processes)) are merged. The orchestrator can seal the Fly bootstrap and the Fly builder has an opt-in protected mode ([AII-500](https://linear.app/eudoxus/issue/AII-500/fly-session-machines-pass-anthropic-api-key-and-claude-code-oauth)); dispatch does not call it yet ([AII-958](https://linear.app/eudoxus/issue/AII-958/wire-preparation-and-authentication-into-managed-dispatch)), so legacy Fly runs still receive plaintext Claude credentials in Machine env. The selected model credential still reaches Claude Code and anything it spawns.
 
 | Boundary | Enforced by | Covered by |
 |---|---|---|
@@ -16,12 +16,15 @@
 | Planning may write only Markdown under `ai-output/comments/`; the guard and settings file live outside the workspace and no user, project or local settings load | `src/planning-write-policy.ts`, `src/run-planning.ts` | `planning-write-policy.test.ts`, `planning-callback-guard.test.ts` |
 | Fly and local-Docker runs boot with a token scoped to the target repository, with no fallback to the installation-wide token; KG workspaces mint per-repository tokens | `getTargetRepoToken` in `src/index.ts`, `src/token-vending.ts`, `src/kg-refresh.ts` | `publication-token-vending.test.ts`, `dependency-token-vending.test.ts`, `refresh-runner-github-credentials.test.ts`, `fly-machines.test.ts`, `local-docker.test.ts` |
 
+**Protected Fly bootstrap** (opt-in: `protectedModelBootstrap` on `buildSessionMachineConfig`, sealer in `src/model-auth-seal.ts`). The Machine carries an AES-256-GCM sealed grant (AAD binds dispatch and backend) inside `AI_IMPLEMENT_RUN_CONFIG`, plus the safe `AI_IMPLEMENT_MODEL_AUTH_*` dispatch fields. Raw account credentials and session state never enter Machine config; the runner checks them out with the unsealed bearer. The protection key is **distinct from the hosted-session key** and is an injected input to the sealer, never read from the environment there. The builder fails before `createMachine` if the secret is unavailable or partially provisioned, rejects simultaneous legacy credentials and reserved `extraEnv` names, and has no plaintext fallback.
+
 **Limits that still hold.**
 
 - Claude Code receives the model credential, and commands it starts may inherit it.
 - Nothing isolates hostile code running as the same OS principal as the runner. The env builders remove variables; they are not a sandbox, and the planning guard is a tool-boundary check, not a filesystem sandbox.
 - Repositories and task documents stay trusted, and containers keep normal network access.
-- A private run envelope, credential isolation and the model-auth bootstrap are not implemented: [AII-680](https://linear.app/eudoxus/issue/AII-680/make-the-run-envelope-private-isolate-credentials-and-enforce-the-gha) and [AII-951](https://linear.app/eudoxus/issue/AII-951/isolate-model-bootstrap-from-repository-processes).
+- **Trust limit of the protection key.** It reaches Machines as a classic Fly app secret, and classic secrets are **app-wide**: every Machine in the sessions app can read it, including other teams' runs. The seal therefore binds one dispatch and backend, not the app, and does not defend against another Machine in the same app. `processes[].secrets` remapping is not used for protection (it does not apply to classic secrets, AII-488/AII-491), and protected mode never emits `ignore_app_secrets`.
+- **Subprocess boundary.** Per AII-951, the names in `PROTECTED_BOOTSTRAP_KEYS` (`AI_IMPLEMENT_RUN_CONFIG`) and `PROTECTED_BOOTSTRAP_PREFIXES` (`AI_IMPLEMENT_MODEL_AUTH_`), plus the model credential and session names, are stripped from repository, model, Git and diagnostic children, so none inherits bootstrap material. This removes variables; it is not a sandbox, and hostile code running as the same OS principal as the runner is still out of scope.
 
 **Ancestry.** Verified on the full history of `ai-implement/feature/aii-846` (2bfc8a6) with `git merge-base --is-ancestor`; each merge commit below is an ancestor of the branch head.
 
