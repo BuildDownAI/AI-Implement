@@ -298,6 +298,119 @@ describe("startDevRun", () => {
     expect(launchLocalSession).not.toHaveBeenCalled();
   });
 
+  it("rejects local feedback outside configured full-loop runs", async () => {
+    vi.stubEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "");
+    makeSpawnSyncMock("");
+
+    await expect(
+      startDevRun({
+        workspace: "/tmp/repo",
+        task: "task.md",
+        phase: "planning",
+        localFeedback: {
+          providerPort: 4100,
+          bridgePort: 4200,
+          networkName: "ai-implement-feedback-net",
+          hostGateway: "172.18.0.1",
+        },
+      }),
+    ).rejects.toThrow(/configured --phase full/);
+    expect(startLocalAuthBridge).not.toHaveBeenCalled();
+    expect(launchLocalSession).not.toHaveBeenCalled();
+  });
+
+  it("rejects invalid local feedback metadata before bridge or Docker launch", async () => {
+    vi.stubEnv("ANTHROPIC_API_KEY", "");
+    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "");
+    spawnForOrigin("https://github.com/owner/repo.git");
+    mockConfiguredSubscription();
+    const acquire = mockOwnership();
+
+    await expect(
+      startDevRun({
+        workspace: "/tmp/repo",
+        task: "task.md",
+        phase: "full",
+        agentConfig: "/outside/agent-config.json",
+        localFeedback: {
+          providerPort: 0,
+          bridgePort: 4200,
+          networkName: "bridge-prod",
+          hostGateway: "172.18.0.1;bad",
+        },
+      }),
+    ).rejects.toThrow(/Invalid local feedback/);
+    expect(loadLocalAgentConfig).not.toHaveBeenCalled();
+    expect(acquire).not.toHaveBeenCalled();
+    expect(startLocalAuthBridge).not.toHaveBeenCalled();
+    expect(launchLocalSession).not.toHaveBeenCalled();
+  });
+
+  it("rejects local feedback when the external config resolves to legacy mode", async () => {
+    vi.stubEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "");
+    spawnForOrigin("https://github.com/owner/repo.git");
+    vi.mocked(loadLocalAgentConfig).mockResolvedValue({
+      resolution: { mode: "legacy" },
+      references: new Map(),
+    });
+    const acquire = mockOwnership();
+
+    await expect(
+      startDevRun({
+        workspace: "/tmp/repo",
+        task: "task.md",
+        phase: "full",
+        agentConfig: "/outside/agent-config.json",
+        localFeedback: {
+          providerPort: 4100,
+          bridgePort: 4200,
+          networkName: "ai-implement-feedback-net",
+          hostGateway: "172.18.0.1",
+        },
+      }),
+    ).rejects.toThrow(/localFeedback requires an external agent config that resolves to configured stage agents/);
+    expect(acquire).not.toHaveBeenCalled();
+    expect(startLocalAuthBridge).not.toHaveBeenCalled();
+    expect(launchLocalSession).not.toHaveBeenCalled();
+  });
+
+  it("passes local feedback bridge metadata and Docker network wiring for configured full runs", async () => {
+    vi.stubEnv("ANTHROPIC_API_KEY", "");
+    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "");
+    spawnForOrigin("https://github.com/owner/repo.git");
+    mockConfiguredSubscription();
+    mockOwnership();
+
+    await startDevRun({
+      workspace: "/tmp/repo",
+      task: "task.md",
+      phase: "full",
+      agentConfig: "/outside/agent-config.json",
+      localFeedback: {
+        providerPort: 4100,
+        bridgePort: 4200,
+        networkName: "ai-implement-feedback-net",
+        hostGateway: "172.18.0.1",
+      },
+    });
+
+    expect(startLocalAuthBridge).toHaveBeenCalledWith(expect.objectContaining({
+      listenPort: 4200,
+      syntheticProvider: {
+        version: 1,
+        kind: "local-feedback-provider",
+        port: 4100,
+        profileIds: ["sub-a"],
+      },
+    }));
+    expect(launchLocalSession).toHaveBeenCalledWith(expect.objectContaining({
+      networkName: "ai-implement-feedback-net",
+      hostGateway: "172.18.0.1",
+    }));
+  });
+
   it("releases already-acquired unused local session ownership when a later acquire fails before launch", async () => {
     vi.stubEnv("ANTHROPIC_API_KEY", "");
     vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "");

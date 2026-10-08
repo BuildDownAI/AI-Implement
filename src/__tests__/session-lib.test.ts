@@ -2,7 +2,7 @@ import { afterEach, describe, it, expect } from "vitest";
 
 const isWindows = process.platform === "win32";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -304,6 +304,93 @@ describe.skipIf(isWindows)("verify_workspace_writable", () => {
     expect(probes).toHaveLength(0);
     // Command embedded in the path must not have executed
     expect(existsSync(sentinel)).toBe(false);
+  });
+});
+
+describe.skipIf(isWindows)("local auth bootstrap ownership handoff", () => {
+  const cleanupDirs: string[] = [];
+
+  afterEach(() => {
+    for (const dir of cleanupDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+
+  function makeEnv(): { root: string; binDir: string; bootstrapDir: string; bootstrapFile: string; log: string } {
+    const root = mkdtempSync(join(tmpdir(), "bootstrap-owner-test-"));
+    cleanupDirs.push(root);
+    const binDir = join(root, "bin");
+    const bootstrapDir = join(root, "ai-implement-local-auth-abc");
+    const bootstrapFile = join(bootstrapDir, "bootstrap.json");
+    const log = join(root, "commands.log");
+    mkdirSync(binDir);
+    mkdirSync(bootstrapDir, 0o700);
+    writeFileSync(bootstrapFile, "{}");
+    chmodSync(bootstrapDir, 0o700);
+    chmodSync(bootstrapFile, 0o600);
+    return { root, binDir, bootstrapDir, bootstrapFile, log };
+  }
+
+  function writeShim(binDir: string, name: string, body: string): void {
+    const p = join(binDir, name);
+    writeFileSync(p, `#!/usr/bin/env bash\n${body}\n`);
+    chmodSync(p, 0o755);
+  }
+
+  function runWithBootstrap(script: string, env: { binDir: string; bootstrapFile: string; log: string }) {
+    writeShim(env.binDir, "id", `if [ "\${1:-}" = "-gn" ]; then echo codergroup; else /usr/bin/id "$@"; fi`);
+    writeShim(env.binDir, "stat", `target="\${@: -1}"
+if [ "$target" = '${env.bootstrapFile}' ]; then echo 600; else echo 700; fi`);
+    writeShim(env.binDir, "chown", `{ printf 'chown'; printf ' <%s>' "$@"; printf '\\n'; } >> '${env.log}'`);
+    writeShim(env.binDir, "chmod", `{ printf 'chmod'; printf ' <%s>' "$@"; printf '\\n'; } >> '${env.log}'`);
+    return spawnSync("bash", ["-c", `export PATH="${env.binDir}:$PATH"; source session/lib.sh; ${script}`], {
+      encoding: "utf-8",
+      env: {
+        ...process.env,
+        AI_IMPLEMENT_LOCAL_AUTH_BOOTSTRAP_FILE: env.bootstrapFile,
+        AI_IMPLEMENT_MODE: "local",
+      },
+    });
+  }
+
+  it("chowns only the validated bootstrap temp directory and file", () => {
+    const env = makeEnv();
+    const workspace = join(env.root, "workspace");
+    mkdirSync(workspace);
+
+    const result = runWithBootstrap("prepare_local_auth_bootstrap_owner", env);
+
+    expect(result.status, result.stderr).toBe(0);
+    const log = readFileSync(env.log, "utf-8");
+    expect(log).toContain(`chown <coder:codergroup> <--> <${env.bootstrapDir}> <${env.bootstrapFile}>`);
+    expect(log).toContain(`chmod <700> <--> <${env.bootstrapDir}>`);
+    expect(log).toContain(`chmod <600> <--> <${env.bootstrapFile}>`);
+    expect(log).not.toContain(workspace);
+  });
+
+  it("rejects bootstrap symlinks before ownership handoff", () => {
+    const env = makeEnv();
+    rmSync(env.bootstrapFile);
+    symlinkSync("/tmp/not-the-bootstrap", env.bootstrapFile);
+
+    const result = runWithBootstrap("prepare_local_auth_bootstrap_owner", env);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("Local auth bootstrap file must not be a symlink");
+    expect(existsSync(env.log)).toBe(false);
+  });
+
+  it("requires an absolute bootstrap pointer for local handoff", () => {
+    const env = makeEnv();
+    const result = spawnSync("bash", ["-c", `export PATH="${env.binDir}:$PATH"; source session/lib.sh; prepare_local_auth_bootstrap_owner`], {
+      encoding: "utf-8",
+      env: {
+        ...process.env,
+        AI_IMPLEMENT_LOCAL_AUTH_BOOTSTRAP_FILE: "relative/bootstrap.json",
+        AI_IMPLEMENT_MODE: "local",
+      },
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("Local auth bootstrap path must be absolute");
   });
 });
 

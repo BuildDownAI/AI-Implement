@@ -771,9 +771,18 @@ export interface ConfiguredRunOptions {
   repositories?: readonly string[];
   /** Actual visibility/trust of one repository, judged by the dispatch-preparation rule. */
   repoTrust?: (repository: string) => Promise<RepoTrust>;
+  /** Local synthetic OpenAI-compatible provider for real-image manual tests. */
+  syntheticProvider?: ConfiguredSyntheticProviderOptions;
   now?: () => number;
   /** Executor construction seams for the selected stage executor (tests). */
   createCodex?: StageExecutorOptions["createCodex"];
+}
+
+export interface ConfiguredSyntheticProviderOptions {
+  version: 1;
+  kind: "local-feedback-provider";
+  port: number;
+  profileIds: readonly string[];
 }
 
 export interface ConfiguredExecutorArgs {
@@ -809,6 +818,36 @@ export function validateBorrowedConfiguredRun(
 
 function isRec(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+function syntheticProviderUrl(port: number): string {
+  return `http://local-feedback-provider:${port}/v1`;
+}
+
+function validateSyntheticProvider(
+  raw: ConfiguredSyntheticProviderOptions | undefined,
+  snapshot: ResolvedAgentSnapshotV1,
+  opts: { local: boolean; injected: boolean; hosted: boolean },
+): { url: string; profileIds: Set<string> } | undefined {
+  if (!raw) return undefined;
+  if (!opts.local || opts.injected || opts.hosted) throw new ConfiguredRunError("bootstrap_invalid");
+  if (raw.version !== 1 || raw.kind !== "local-feedback-provider" || !Number.isInteger(raw.port) || raw.port < 1 || raw.port > 65535) {
+    throw new ConfiguredRunError("bootstrap_invalid");
+  }
+  if (!Array.isArray(raw.profileIds) || raw.profileIds.length === 0) throw new ConfiguredRunError("bootstrap_invalid");
+  const selected = new Map(
+    STAGE_NAMES
+      .filter((stage) => snapshot.stages[stage].agent === "codex" && snapshot.stages[stage].provider === "openai")
+      .map((stage) => [snapshot.stages[stage].accountProfileId, snapshot.profiles[stage]] as const),
+  );
+  const ids = new Set<string>();
+  for (const id of raw.profileIds) {
+    if (typeof id !== "string" || id.length === 0 || ids.has(id)) throw new ConfiguredRunError("bootstrap_invalid");
+    const profile = selected.get(id);
+    if (!profile || profile.agent !== "codex" || profile.provider !== "openai") throw new ConfiguredRunError("bootstrap_invalid");
+    ids.add(id);
+  }
+  return { url: syntheticProviderUrl(raw.port), profileIds: ids };
 }
 
 /**
@@ -894,6 +933,11 @@ export async function prepareConfiguredRun(input: {
   }
   if (grantRaw === undefined && !port) throw new ConfiguredRunError("bootstrap_missing");
   if (grantRaw !== undefined && port) throw new ConfiguredRunError("bootstrap_invalid");
+  const syntheticProvider = validateSyntheticProvider(options.syntheticProvider, snapshot, {
+    local: Boolean(port),
+    injected: Boolean(injected),
+    hosted: grantRaw !== undefined,
+  });
 
   let grant: ReturnType<typeof openGrant> | undefined;
   if (grantRaw !== undefined) {
@@ -959,13 +1003,14 @@ export async function prepareConfiguredRun(input: {
       onDiagnostic: (d) => console.log(`[model-auth] ${JSON.stringify(d)}`),
     });
   }
-  return buildConfiguredRun(snapshot, client, options);
+  return buildConfiguredRun(snapshot, client, options, syntheticProvider);
 }
 
 function buildConfiguredRun(
   snapshot: ResolvedAgentSnapshotV1,
   client: ModelAuthClient,
   options: ConfiguredRunOptions,
+  syntheticProvider?: { url: string; profileIds: Set<string> },
 ): ConfiguredRun {
   const modes = new Map(STAGE_NAMES.map((s) => [snapshot.profiles[s].id, snapshot.profiles[s].authMode] as const));
   const checkouts = new Map<string, Promise<void>>();
@@ -988,7 +1033,10 @@ function buildConfiguredRun(
   const auth: NonNullable<StageExecutorOptions["auth"]> = {
     async invoke(profileId, run) {
       await ensureCheckout(profileId);
-      return client.invoke(profileId, run);
+      return client.invoke(profileId, (selected) => {
+        if (!syntheticProvider?.profileIds.has(profileId)) return run(selected);
+        return run({ ...selected, env: { ...selected.env, OPENAI_BASE_URL: syntheticProvider.url } });
+      });
     },
   };
 

@@ -1,12 +1,12 @@
 import { execFile as nodeExecFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { chmod, mkdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import type { AccountAuthMode } from "../agent-config.js";
-import type { ConfiguredRunOptions } from "../run-autonomous.js";
+import type { ConfiguredRunOptions, ConfiguredSyntheticProviderOptions } from "../run-autonomous.js";
 import { validateResolvedAgentSnapshot, type ResolvedAgentSnapshotV1 } from "../run-config.js";
 import { buildDockerEnvFileContent, inspectLocalContainer } from "../local-docker.js";
 import type { LocalCredentialPort } from "../model-auth-client.js";
@@ -32,6 +32,7 @@ export interface LocalSessionBootstrapV1 {
   bridge: { baseUrl: string; bearer: string };
   references: readonly { profileId: string; authMode: AccountAuthMode; kind: "api-key" | "session" }[];
   trustedRepositories: readonly string[];
+  syntheticProvider?: ConfiguredSyntheticProviderOptions;
   authRoot?: string;
 }
 
@@ -59,6 +60,10 @@ export interface LocalSessionLaunchOptions {
    * KG source repo at /kg-source and the tracker-data file at /dev-tracker-data.json.
    */
   extraVolumes?: string[];
+  /** Optional Docker network for local feedback runs. */
+  networkName?: string;
+  /** Host gateway/IP mapped to host.docker.internal. Defaults to Docker's host-gateway. */
+  hostGateway?: string;
 }
 
 export interface LocalSessionHandle {
@@ -120,6 +125,24 @@ function parseBootstrap(value: unknown): LocalSessionBootstrapV1 {
   if (value.authRoot !== undefined && (typeof value.authRoot !== "string" || value.authRoot.length === 0)) {
     throw bootstrapError("invalid auth root");
   }
+  let syntheticProvider: ConfiguredSyntheticProviderOptions | undefined;
+  if (value.syntheticProvider !== undefined) {
+    const raw = value.syntheticProvider;
+    if (!isRecord(raw)) throw bootstrapError("invalid synthetic provider");
+    if (raw.version !== 1 || raw.kind !== "local-feedback-provider") throw bootstrapError("invalid synthetic provider");
+    const port = raw.port;
+    if (typeof port !== "number" || !Number.isInteger(port) || port < 1 || port > 65535) {
+      throw bootstrapError("invalid synthetic provider");
+    }
+    if (!Array.isArray(raw.profileIds) || raw.profileIds.length === 0) throw bootstrapError("invalid synthetic provider");
+    const ids = new Set<string>();
+    const profileIds = raw.profileIds.map((id) => {
+      if (typeof id !== "string" || id.length === 0 || ids.has(id)) throw bootstrapError("invalid synthetic provider");
+      ids.add(id);
+      return id;
+    });
+    syntheticProvider = { version: 1, kind: "local-feedback-provider", port, profileIds };
+  }
   return {
     version: 1,
     snapshotId: value.snapshotId,
@@ -127,6 +150,7 @@ function parseBootstrap(value: unknown): LocalSessionBootstrapV1 {
     bridge: { baseUrl, bearer },
     references,
     trustedRepositories,
+    ...(syntheticProvider ? { syntheticProvider } : {}),
     ...(value.authRoot ? { authRoot: value.authRoot } : {}),
   };
 }
@@ -148,12 +172,28 @@ export async function validateLocalSessionBootstrap(
 ): Promise<LocalSessionBootstrapV1> {
   if (env.NODE_OPTIONS || env.NODE_PATH) throw bootstrapError("node preload environment is not allowed");
   if (env[LOCAL_AUTH_BOOTSTRAP_ENV] !== path) throw bootstrapError("bootstrap pointer mismatch");
+  const linkInfo = await lstat(path);
+  if (!linkInfo.isFile()) throw bootstrapError("bootstrap path is not a file");
   const info = await stat(path);
   if (!info.isFile()) throw bootstrapError("bootstrap path is not a file");
   if ((info.mode & 0o077) !== 0) throw bootstrapError("bootstrap file is not private");
   const expectedUid = env.AI_IMPLEMENT_HOST_UID ? Number(env.AI_IMPLEMENT_HOST_UID) : undefined;
   if (expectedUid !== undefined && Number.isSafeInteger(expectedUid) && info.uid !== expectedUid) {
-    throw bootstrapError("bootstrap owner does not match host uid");
+    const currentUid = typeof process.getuid === "function" ? process.getuid() : undefined;
+    const rootProjection =
+      currentUid === 0 &&
+      env.AI_IMPLEMENT_MODE === "local" &&
+      info.uid === 0 &&
+      (linkInfo.mode & 0o077) === 0;
+    if (rootProjection) {
+      const parentInfo = await lstat(dirname(path));
+      if (!parentInfo.isDirectory()) throw bootstrapError("bootstrap directory is not private");
+      if (parentInfo.uid !== 0 || (parentInfo.mode & 0o077) !== 0) {
+        throw bootstrapError("bootstrap directory is not private");
+      }
+    } else {
+      throw bootstrapError("bootstrap owner does not match host uid");
+    }
   }
   const validatedSnapshot = validateResolvedAgentSnapshot(snapshot);
   const bootstrap = await readBootstrap(path);
@@ -163,6 +203,14 @@ export async function validateLocalSessionBootstrap(
       (p) => p.id === ref.profileId && p.authMode === ref.authMode,
     );
     if (!selected) throw bootstrapError("reference not selected by snapshot");
+  }
+  if (bootstrap.syntheticProvider) {
+    for (const id of bootstrap.syntheticProvider.profileIds) {
+      const selected = Object.values(validatedSnapshot.profiles).some(
+        (p) => p.id === id && p.agent === "codex" && p.provider === "openai",
+      );
+      if (!selected) throw bootstrapError("synthetic provider profile not selected by snapshot");
+    }
   }
   return bootstrap;
 }
@@ -229,6 +277,7 @@ export async function loadLocalSessionBootstrap(input: {
       bootstrap.trustedRepositories.includes(repository)
         ? { visibility: "private", trustedForSubscription: true }
         : { visibility: "unknown", trustedForSubscription: false },
+    ...(bootstrap.syntheticProvider ? { syntheticProvider: bootstrap.syntheticProvider } : {}),
     ...(bootstrap.authRoot ? { modelAuthRoot: bootstrap.authRoot } : {}),
   };
   return {
@@ -274,6 +323,8 @@ export async function startLocalAuthBridge(input: {
   leases: readonly LocalSessionLease[];
   references: readonly LocalCredentialReference[];
   trustedRepositories: readonly string[];
+  syntheticProvider?: ConfiguredSyntheticProviderOptions;
+  listenPort?: number;
   authRoot?: string;
 }): Promise<LocalAuthBridge> {
   const bearer = randomUUID().replace(/-/g, "") + randomUUID().replace(/-/g, "");
@@ -307,7 +358,7 @@ export async function startLocalAuthBridge(input: {
   });
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
+    server.listen(input.listenPort ?? 0, "127.0.0.1", () => {
       server.off("error", reject);
       resolve();
     });
@@ -321,6 +372,7 @@ export async function startLocalAuthBridge(input: {
     bridge: { baseUrl: `http://host.docker.internal:${address.port}`, bearer },
     references: input.references.map((r) => ({ profileId: r.profileId, authMode: r.authMode, kind: r.kind })),
     trustedRepositories: input.trustedRepositories,
+    ...(input.syntheticProvider ? { syntheticProvider: input.syntheticProvider } : {}),
     ...(input.authRoot ? { authRoot: input.authRoot } : {}),
   };
   async function closeServer(): Promise<void> {
@@ -378,8 +430,12 @@ export async function launchLocalSession(
     "run", "-d",
     "--name", opts.containerName,
     "--cidfile", cidFilePath,
-    "--add-host", "host.docker.internal:host-gateway",
+    "--add-host", `host.docker.internal:${opts.hostGateway ?? "host-gateway"}`,
   ];
+
+  if (opts.networkName) {
+    args.push("--network", opts.networkName);
+  }
 
   if (opts.workspace) {
     args.push("-v", `${opts.workspace}:/workspace`);

@@ -88,15 +88,46 @@ copy_local_workspace() {
   run_scoped "" git config --global --add safe.directory "$workspace_dir"
 }
 
+# Hand the already validated local-auth bootstrap projection to coder without touching
+# broader host mounts or credential directories. Docker Desktop can present the private
+# bind-mounted temp file as root:root during early root-side classification; configured
+# execution then consumes it as coder.
+prepare_local_auth_bootstrap_owner() {
+  [ -n "${AI_IMPLEMENT_LOCAL_AUTH_BOOTSTRAP_FILE:-}" ] || return 0
+  local file="$AI_IMPLEMENT_LOCAL_AUTH_BOOTSTRAP_FILE" parent mode parent_mode group
+  [ "${AI_IMPLEMENT_MODE:-}" = "local" ] || fail "Local auth bootstrap handoff is only supported for local runs"
+  case "$file" in /*) ;; *) fail "Local auth bootstrap path must be absolute" ;; esac
+  [ ! -L "$file" ] || fail "Local auth bootstrap file must not be a symlink"
+  [ -f "$file" ] || fail "Local auth bootstrap file is unavailable"
+  parent="$(dirname -- "$file")"
+  [ ! -L "$parent" ] || fail "Local auth bootstrap directory must not be a symlink"
+  [ -d "$parent" ] || fail "Local auth bootstrap directory is unavailable"
+  [ "$(basename -- "$file")" = "bootstrap.json" ] || fail "Local auth bootstrap file name is invalid"
+  case "$(basename -- "$parent")" in
+    ai-implement-local-auth-*) ;;
+    *) fail "Local auth bootstrap directory is invalid" ;;
+  esac
+  mode="$(stat -c '%a' "$file")"
+  parent_mode="$(stat -c '%a' "$parent")"
+  [ "$mode" = "600" ] || fail "Local auth bootstrap file must be private"
+  [ "$parent_mode" = "700" ] || fail "Local auth bootstrap directory must be private"
+  group="$(id -gn coder)"
+  chown coder:"$group" -- "$parent" "$file"
+  chmod 700 -- "$parent"
+  chmod 600 -- "$file"
+}
+
 # Mounted checkouts retain host ownership; copied/cloned workspaces belong to coder.
 prepare_workspace_owner() {
   local mode="$1" workspace_dir="$2"
   if [ "$mode" = "mounted" ]; then
     prepare_coder_identity "${AI_IMPLEMENT_HOST_UID:-}" "${AI_IMPLEMENT_HOST_GID:-}"
+    prepare_local_auth_bootstrap_owner
     verify_workspace_writable "$workspace_dir"
   else
     if [ -n "${AI_IMPLEMENT_LOCAL_AUTH_BOOTSTRAP_FILE:-}" ]; then
       prepare_coder_identity "${AI_IMPLEMENT_HOST_UID:-}" "${AI_IMPLEMENT_HOST_GID:-}"
+      prepare_local_auth_bootstrap_owner
     fi
     chown -R coder:"$(id -gn coder)" "$workspace_dir"
   fi

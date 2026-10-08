@@ -178,6 +178,43 @@ describe("CodexExecutor result contract", () => {
     expect(log[0].args).not.toContain("do the thing");
   });
 
+  it("passes the selected synthetic provider URL to codex exec through trusted config", async () => {
+    const auth: Pick<ModelAuthClient, "invoke"> = {
+      invoke: async (_id, cb) => cb({ env: { PATH: "/usr/bin", CODEX_API_KEY: SYNTHETIC_KEY, OPENAI_BASE_URL: "http://local-feedback-provider:8080/v1" }, strippedKeys: [] }),
+    };
+    const { executor, log } = make([{ stdout: message("done") }], {}, { client: auth, events: [], checkpointFails: false });
+    await executor.invoke(base);
+    expect(log[0].args).toContain("-c");
+    expect(log[0].args).toContain('openai_base_url="http://local-feedback-provider:8080/v1"');
+  });
+
+  it("rejects unsafe selected provider URLs before spawning codex", async () => {
+    const cases = [
+      "https://local-feedback-provider:8080/v1",
+      "http://user@local-feedback-provider:8080/v1",
+      "http://local-feedback-provider:8080/v1?x=1",
+      "http://local-feedback-provider:8080/v1#x",
+      "http://local-feedback-provider:8080/",
+      "http://evil.example:8080/v1",
+      "http://local-feedback-provider:0/v1",
+    ];
+    for (const url of cases) {
+      const log: Spawned[] = [];
+      const auth: Pick<ModelAuthClient, "invoke"> = {
+        invoke: async (_id, cb) => cb({ env: { PATH: "/usr/bin", CODEX_API_KEY: SYNTHETIC_KEY, OPENAI_BASE_URL: url }, strippedKeys: [] }),
+      };
+      const executor = new CodexExecutor(workspace, {
+        auth,
+        profileId: "profile-1",
+        allowRepositoryWrites: true,
+        spawnImpl: makeSpawn([{ stdout: message("done") }], log),
+        sleepImpl: async () => {},
+      });
+      await expect(executor.invoke(base), url).rejects.toMatchObject({ reason: "auth_sync_failed" });
+      expect(log, url).toEqual([]);
+    }
+  });
+
   it("keeps usage null when the provider reports none", async () => {
     const { executor } = make([{ stdout: [ev({ type: "turn.started" }), ev({ type: "turn.completed" })] }]);
     const result = await executor.invoke(base);

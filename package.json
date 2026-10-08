@@ -23,7 +23,8 @@
     "test": "npm run test:db-isolation && vitest run",
     "test:db-isolation": "node scripts/check-test-db-isolation.mjs",
     "test:watch": "vitest",
-    "test:restate": "vitest run --config vitest.restate.config.ts"
+    "test:restate": "vitest run --config vitest.restate.config.ts",
+    "local:feedback": "npm run check:node && npm run build && node scripts/local-feedback.mjs"
   },
   "dependencies": {
     "@restatedev/restate-sdk": "^1.17.1",
