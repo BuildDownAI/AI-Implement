@@ -11,6 +11,8 @@ import type { ReviewerDefinition } from "../pipeline/reviewers/registry.js";
 import { REVIEWER_VERDICT_SCHEMA } from "../pipeline/reviewers/schema.js";
 import { DISPOSITIONS_FILE, buildDispositionInstructions, stableReviewFindingKey } from "../pipeline/finding-dispositions.js";
 import { CYCLE_SUMMARY_MAX_BYTES } from "../pipeline/cycle-summary.js";
+import { makeSnapshot } from "./configured-run-fixture.js";
+import { createStageExecutor } from "../pipeline/stage-executor.js";
 
 function makeCtx(execMock: any, dataOverrides: Record<string, unknown> = {}) {
   return {
@@ -295,6 +297,197 @@ describe("postPushReviewStep", () => {
 
     expect(invoke).toHaveBeenCalledWith(expect.objectContaining({ maxTurns: 45 }));
   });
+  describe("configured stage settings", () => {
+    const notApproved = { approved: false, blocking_issues: [{ title: "bug", problem: "bug", required_fix: "bug" }], feedback: "fix", score: 4, progress_delta: 0 };
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "status") return { stdout: "M file.ts\n", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "--short") return { stdout: "abc1234\n", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "ai-implement/aii-200-x\n", exitCode: 0 };
+      if (args[0] === "ls-remote") return { stdout: "beadfeed\trefs/heads/ai-implement/aii-200-x\n", exitCode: 0 };
+      if (args[0] === "show") return { stdout: "M\tfile.ts\n", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const ghSpawn = vi.fn((args: string[]) => ({ stdout: args[0] === "pr" && args[1] === "diff" ? "diff" : "", exitCode: 0 }));
+    const run = (ctx: any, maxIterations: number) =>
+      postPushReviewStep.run(
+        ctx,
+        { prNumber: "42", workspaceDir: "/tmp", maxIterations, ghSpawn, gitSpawn, refreshCredentials: vi.fn(async () => undefined) },
+        { report: vi.fn(async () => undefined) },
+      );
+
+    it("stamps review on reviewers and implementation on the fix call", async () => {
+      const invoke = vi.fn()
+        .mockResolvedValueOnce(structuredReviewResult(notApproved))
+        .mockResolvedValueOnce({ stdout: "fixed", exitCode: 0, tokensUsed: 1 })
+        .mockResolvedValueOnce(structuredReviewResult(notApproved));
+      await run(makeCtx(invoke, { agentConfig: makeSnapshot() }), 2);
+      expect(invoke.mock.calls[0][0]).toMatchObject({ agentStage: "review" });
+      expect(invoke.mock.calls[1][0]).toMatchObject({ agentStage: "implementation" });
+      expect(invoke.mock.calls[2][0]).toMatchObject({ agentStage: "review" });
+    });
+
+    it("states an elapsed-time budget for a Codex review and keeps turns for Claude", async () => {
+      const codex = makeSnapshot();
+      codex.stages.review = { ...codex.stages.review, agent: "codex", provider: "openai", model: "gpt-rev", invocationTimeoutMs: 90_000 };
+      const approved = { approved: true, blocking_issues: [], score: 9, progress_delta: 0, feedback: "ok" };
+      const invokeCodex = vi.fn(async () => structuredReviewResult(approved));
+      await run(makeCtx(invokeCodex, { agentConfig: codex }), 1);
+      const codexPrompt = (invokeCodex.mock.calls[0] as any[])[0].prompt as string;
+      expect(codexPrompt).toContain("maximum of timeout 90s for this review");
+      expect(codexPrompt).not.toMatch(/maximum of \d+ turns/);
+
+      const invokeClaude = vi.fn(async () => structuredReviewResult(approved));
+      await run(makeCtx(invokeClaude, { agentConfig: makeSnapshot() }), 1);
+      expect((invokeClaude.mock.calls[0] as any[])[0].prompt).toMatch(/maximum of \d+ turns/);
+    });
+
+    /** Real stage executor around fake Claude/Codex inners; records model, account profile and limits per call. */
+    function realExecutor(snapshot: ReturnType<typeof makeSnapshot>, claudeResult: (p: any) => any, codexResult: (p: any) => any) {
+      const calls: Array<{ agent: string; profile: string; params: any }> = [];
+      const auth = {
+        invoke: vi.fn(async (profileId: string, fn: (i: any) => Promise<any>) => {
+          (auth as any).current = profileId;
+          return fn({ env: { PATH: "/bin" }, strippedKeys: [] });
+        }),
+      } as any;
+      const executor = createStageExecutor({
+        workspaceDir: "/tmp",
+        legacy: { invoke: vi.fn(async () => { throw new Error("legacy executor must not run"); }) } as any,
+        snapshot,
+        auth,
+        createClaude: () => ({
+          invoke: async (params: any) => {
+            calls.push({ agent: "claude", profile: auth.current, params });
+            return claudeResult(params);
+          },
+        }) as any,
+        createCodex: (profile: string) => ({
+          invoke: async (params: any) => {
+            calls.push({ agent: "codex", profile, params });
+            return codexResult(params);
+          },
+        }),
+      });
+      return { calls, ctx: (data: Record<string, unknown> = {}) => makeCtx(executor.invoke, { agentConfig: snapshot, ...data }) };
+    }
+    const advisoryInputs = { reviewProviders: [], reviewerDefinitions: [configReviewerDefinition("domain-review", "Domain prompt", { model: "repo-model" })] };
+    const approvedVerdict = { approved: true, blocking_issues: [], score: 9, progress_delta: 0, feedback: "ok" };
+    const advisoryBlocker = { approved: false, findings: [{ severity: "blocking", body: "Advisory concern" }] };
+    const runWith = (ctx: any, maxIterations: number, extra: Record<string, unknown> = {}, ghs = ghSpawn) =>
+      postPushReviewStep.run(
+        ctx,
+        { prNumber: "42", workspaceDir: "/tmp", maxIterations, ghSpawn: ghs, gitSpawn, refreshCredentials: vi.fn(async () => undefined), ...extra },
+        { report: vi.fn(async () => undefined) },
+      );
+
+    it("runs different agents and profiles for review and fix in one cycle through the real stage executor", async () => {
+      // makeSnapshot: review = claude/p-rev, implementation = codex/p-impl.
+      const { calls, ctx } = realExecutor(
+        makeSnapshot(),
+        () => structuredReviewResult(notApproved),
+        () => ({ stdout: "fixed", exitCode: 0, tokensUsed: 1 }),
+      );
+      await runWith(ctx({ model: "run-model" }), 2);
+      expect(calls.map((c) => [c.agent, c.profile, c.params.model])).toEqual([
+        ["claude", "p-rev", "claude-review"],
+        ["codex", "p-impl", "gpt-impl"],
+        ["claude", "p-rev", "claude-review"],
+      ]);
+      expect(calls[0].params.invocationTimeoutMs).toBe(3000);
+      expect(calls[1].params.invocationTimeoutMs).toBe(2000);
+      expect(calls[1].params.maxTurns).toBeUndefined();
+      expect(calls[0].params.maxTurns).toBeGreaterThan(0);
+    });
+
+    it("lets the snapshot model beat a repository reviewer model override on an opted-in run", async () => {
+      const { calls, ctx } = realExecutor(
+        makeSnapshot(),
+        (p) => structuredReviewResult(p.stage.includes("branch-advisory") ? advisoryBlocker : approvedVerdict),
+        () => ({ stdout: "", exitCode: 0, tokensUsed: 0 }),
+      );
+      const out: any = await runWith(ctx(), 2, advisoryInputs);
+      expect(calls).toHaveLength(2);
+      expect(calls.every((c) => c.params.model === "claude-review" && c.profile === "p-rev" && c.params.agentStage === "review")).toBe(true);
+      expect(calls.some((c) => c.params.model === "repo-model")).toBe(false);
+      // Branch-defined reviewer stays advisory: its blocker does not stop approval.
+      expect(out.approved).toBe(true);
+    });
+
+    it("keeps the per-reviewer model override on a legacy run", async () => {
+      const invoke = vi.fn(async (p: any) => structuredReviewResult(p.stage.includes("branch-advisory") ? advisoryBlocker : approvedVerdict));
+      const out: any = await runWith(makeCtx(invoke, { model: "run-model" }), 2, advisoryInputs);
+      const advisory = invoke.mock.calls.map((c) => c[0] as any).find((p) => p.stage.includes("branch-advisory"));
+      expect(advisory.model).toBe("repo-model");
+      expect(advisory.agentStage).toBe("review");
+      expect((invoke.mock.calls[0][0] as any).model).toBe("run-model");
+      expect(out.approved).toBe(true);
+    });
+
+    it("lets a gating reviewer block while advisory stays non-gating, both stamped review", async () => {
+      const invoke = vi.fn()
+        .mockResolvedValueOnce(structuredReviewResult(notApproved))
+        .mockResolvedValueOnce(structuredReviewResult(advisoryBlocker));
+      const out: any = await runWith(makeCtx(invoke, { agentConfig: makeSnapshot() }), 1, advisoryInputs);
+      expect(out.approved).toBe(false);
+      expect(invoke.mock.calls.every((c) => (c[0] as any).agentStage === "review")).toBe(true);
+    });
+
+    it("reports a Codex review cap as an elapsed-time budget, not turns", async () => {
+      const codex = makeSnapshot();
+      codex.stages.review = { ...codex.stages.review, agent: "codex", provider: "openai", model: "gpt-rev", invocationTimeoutMs: 90_000 };
+      const capped = {
+        ...structuredReviewResult(approvedVerdict),
+        terminalStatus: { subtype: "error_max_turns", isError: true },
+        telemetry: { outcome: "max_turns" as const, numTurns: 3, durationMs: 10, costUsd: null, tokensIn: 1, tokensOut: 1 },
+      };
+      const comments: string[] = [];
+      const gh = vi.fn((args: string[]) => {
+        if (args[0] === "pr" && args[1] === "comment") comments.push(args[args.indexOf("--body") + 1]);
+        return ghSpawn(args);
+      });
+      const out: any = await runWith(makeCtx(vi.fn(async () => capped), { agentConfig: codex }), 1, {}, gh as any);
+      expect(out.approved).toBe(false);
+      const text = comments.join("\n");
+      expect(text).toContain("ran out of its time budget at the configured cap (timeout 90s)");
+      expect(text).not.toContain("ran out of turns");
+    });
+
+    it("keeps the Claude and legacy cap message in turns", async () => {
+      const capped = {
+        ...structuredReviewResult(approvedVerdict),
+        terminalStatus: { subtype: "error_max_turns", isError: true },
+        telemetry: { outcome: "max_turns" as const, numTurns: 3, durationMs: 10, costUsd: null, tokensIn: 1, tokensOut: 1 },
+      };
+      for (const data of [{ agentConfig: makeSnapshot() }, {}]) {
+        const comments: string[] = [];
+        const gh = vi.fn((args: string[]) => {
+          if (args[0] === "pr" && args[1] === "comment") comments.push(args[args.indexOf("--body") + 1]);
+          return ghSpawn(args);
+        });
+        await runWith(makeCtx(vi.fn(async () => capped), data), 1, {}, gh as any);
+        expect(comments.join("\n")).toMatch(/ran out of turns at the configured cap \(\d+\)/);
+      }
+    });
+
+    it("leaves the cycle unapproved with fix_failed and no replay when the fix call fails", async () => {
+      const invoke = vi.fn()
+        .mockResolvedValueOnce(structuredReviewResult(notApproved))
+        .mockResolvedValue({ stdout: "", exitCode: 1, tokensUsed: 0 });
+      const out: any = await runWith(makeCtx(invoke, { agentConfig: makeSnapshot() }), 3);
+      expect(out.approved).toBe(false);
+      expect(out.terminationReason).toBe("fix_failed");
+      expect(invoke).toHaveBeenCalledTimes(2);
+      expect((invoke.mock.calls[1][0] as any).agentStage).toBe("implementation");
+    });
+
+    it("never approves when the reviewer times out", async () => {
+      const invoke = vi.fn(async () => ({ stdout: "", exitCode: 1, tokensUsed: 0 }));
+      const out: any = await run(makeCtx(invoke, { agentConfig: makeSnapshot() }), 1);
+      expect(out.approved).toBe(false);
+      expect(out.terminationReason).toBeTruthy();
+    });
+  });
+
   it("defaults to two fix passes plus a final review", async () => {
     const notApproved = { approved: false, blocking_issues: [{ title: "bug", problem: "bug", required_fix: "bug" }], feedback: "fix the bug", score: 4, progress_delta: 0 };
     const ghComments: string[] = [];
