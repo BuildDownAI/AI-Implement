@@ -18,13 +18,15 @@ import { DEFAULT_PIPELINE } from "../pipeline/default-pipeline.js";
 import { PipelineRunner } from "../pipeline/runner.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
 import { encodeRunConfig } from "../run-config.js";
-import type { LLMExecutor, PipelineDefinition, StepModule } from "../pipeline/types.js";
+import type { LLMExecutor, PipelineContext, PipelineDefinition, StepModule } from "../pipeline/types.js";
 import { __resetPublicationCredentialForTests } from "../publication-credential.js";
 import { DISPOSITIONS_FILE, stableReviewFindingKey, type FindingDisposition } from "../pipeline/finding-dispositions.js";
 import { CYCLE_SUMMARY_FILE, type CycleSummary } from "../pipeline/cycle-summary.js";
 import type { GhSpawn } from "../pipeline/review-ledger.js";
 import type { ReviewFixMetadataV1 } from "../review-fix-contract.js";
 import { DEFAULT_MODEL } from "../pipeline/default-model.js";
+import { ClaudeCliExecutor } from "../pipeline/executor.js";
+import { NOW, SENTINEL_BEARER, envelopeEnv, fakeClient, makeGrant, makeSnapshot } from "./configured-run-fixture.js";
 
 const REQUIRED_ENV: Record<string, string> = {
   ISSUE_ID: "issue-abc",
@@ -3990,5 +3992,218 @@ describe("runAutonomousLocally", () => {
 
     expect(result.exitCode).toBe(1);
     expect(existsSync(join(workspaceDir, "teardown-ran.marker"))).toBe(true);
+  });
+});
+
+
+describe("configured (opted-in) autonomous runs", () => {
+  let workspaceDir: string;
+  const snap = makeSnapshot();
+
+  beforeEach(() => {
+    __resetPublicationCredentialForTests();
+    workspaceDir = mkdtempSync(join(tmpdir(), "run-autonomous-configured-"));
+    stubRequiredEnv();
+    for (const k of [
+      "ORCHESTRATOR_URL", "MACHINE_NONCE", "RUNNER_CALLBACK_URL", "RUN_TOKEN", "RUN_PROGRESS_TOKEN", "RUNNER_PHASE",
+      "PR_NUMBER", "AI_IMPLEMENT_UNTIL_STEP", "AI_IMPLEMENT_SHELL_MODE", "GITHUB_REF_NAME",
+    ]) vi.stubEnv(k, "");
+    vi.stubEnv("GITHUB_DEFAULT_BRANCH", "main");
+    vi.stubEnv("CLAUDE_MODEL", "env-claude-model");
+    vi.stubEnv("PROVIDER", "bedrock");
+  });
+
+  afterEach(() => {
+    __resetPublicationCredentialForTests();
+    vi.unstubAllEnvs();
+    rmSync(workspaceDir, { recursive: true, force: true });
+  });
+
+  function stubConfiguredEnv(): void {
+    for (const [k, v] of Object.entries(envelopeEnv(snap, makeGrant(snap)))) vi.stubEnv(k, v);
+  }
+
+  /** Captures the context the runner builds; optionally invokes the executor from inside a step. */
+  function capture(invokeStage?: "implementation" | "review") {
+    const seen: { ctx?: PipelineContext; result?: unknown } = {};
+    const { pipeline, runner } = makeSingleStepPipeline("capture", {
+      run: vi.fn(async (ctx: PipelineContext) => {
+        seen.ctx = ctx;
+        if (invokeStage) seen.result = await ctx.llmExecutor.invoke({ prompt: "p", model: "caller-model", agentStage: invokeStage });
+        return {};
+      }),
+    });
+    return { seen, pipeline, runner };
+  }
+
+  it("managed and local runs receive the same resolved stage settings, overriding every legacy model source", async () => {
+    writeFileSync(join(workspaceDir, "WORKFLOW.md"), "---\nmodel: workflow-model\n---\nDo it.\n");
+    stubConfiguredEnv();
+    const managedClient = fakeClient();
+    const m = capture();
+    const managed = await runAutonomous({
+      workspaceDir, ...m, reporter: new NoopStepReporter(),
+      configured: { modelAuthClient: managedClient, now: () => NOW },
+    });
+    const localClient = fakeClient();
+    const l = capture();
+    const local = await runAutonomousLocally({
+      workspaceDir, issueIdentifier: "AII-1", issueTitle: "t", issueDescription: "d", model: "opts-model",
+      pipeline: l.pipeline, runner: l.runner,
+      configured: {
+        agentConfig: snap, modelAuthClient: localClient, localCredentialPort: { load: vi.fn() },
+        repositories: ["acme/app"], repoTrust: async () => ({ visibility: "private", trustedForSubscription: true }),
+      },
+    });
+    expect(managed.exitCode).toBe(0);
+    expect(local.exitCode).toBe(0);
+    expect(m.seen.ctx!.data.agentConfig).toEqual(snap);
+    expect(l.seen.ctx!.data.agentConfig).toEqual(m.seen.ctx!.data.agentConfig);
+    for (const c of [m.seen.ctx!, l.seen.ctx!]) {
+      expect(c.data.model).toBe("gpt-impl");
+      expect(c.data.provider).toBe("anthropic");
+    }
+    for (const c of [m.seen.ctx!, l.seen.ctx!]) {
+      expect(JSON.stringify(c.data)).not.toContain(SENTINEL_BEARER);
+    }
+  });
+
+  it("selects the executor from the snapshot per call and passes the injected executor only as Claude", async () => {
+    stubConfiguredEnv();
+    const client = fakeClient();
+    const injected = makeMockExecutor(0);
+    const c = capture("review");
+    await runAutonomous({
+      workspaceDir, ...c, reporter: new NoopStepReporter(), llmExecutor: injected,
+      configured: { modelAuthClient: client, now: () => NOW },
+    });
+    expect(c.seen.ctx!.llmExecutor).not.toBe(injected);
+    expect(injected.invoke).toHaveBeenCalledTimes(1);
+    expect((injected.invoke as ReturnType<typeof vi.fn>).mock.calls[0][0].model).toBe("claude-review");
+    expect(client.checkout).toHaveBeenCalledTimes(1);
+    expect(client.checkout).toHaveBeenCalledWith({ profileId: "p-rev", authMode: "anthropic-api-key" });
+    expect(client.invoke).toHaveBeenCalledTimes(1);
+  });
+
+  it("finishes and disposes once on success and as failed on a thrown step", async () => {
+    stubConfiguredEnv();
+    const ok = fakeClient();
+    const c = capture("review");
+    await runAutonomous({ workspaceDir, ...c, reporter: new NoopStepReporter(), llmExecutor: makeMockExecutor(0), configured: { modelAuthClient: ok, now: () => NOW } });
+    // The capture pipeline has no approval, so the run is a coded failure, not a completion.
+    expect(ok.finish).toHaveBeenCalledTimes(1);
+    expect(ok.finish).toHaveBeenCalledWith("p-rev", "failed");
+    expect(ok.dispose).toHaveBeenCalledTimes(1);
+
+    const bad = fakeClient();
+    const { pipeline, runner } = makeSingleStepPipeline("boom", {
+      run: vi.fn(async (ctx: PipelineContext) => {
+        await ctx.llmExecutor.invoke({ prompt: "p", model: "m", agentStage: "review" });
+        throw new Error("step exploded");
+      }),
+    });
+    const r = await runAutonomous({ workspaceDir, pipeline, runner, reporter: new NoopStepReporter(), llmExecutor: makeMockExecutor(0), configured: { modelAuthClient: bad, now: () => NOW } });
+    expect(r.exitCode).toBe(1);
+    expect(bad.finish).toHaveBeenCalledWith("p-rev", "failed");
+    expect(bad.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("holds instead of releasing when a child may still be live", async () => {
+    stubConfiguredEnv();
+    const client = fakeClient();
+    const live = { invoke: vi.fn().mockRejectedValue(Object.assign(new Error("still running"), { possiblyLive: true })) };
+    const { pipeline, runner } = makeSingleStepPipeline("live", {
+      run: vi.fn(async (ctx: PipelineContext) => {
+        await ctx.llmExecutor.invoke({ prompt: "p", model: "m", agentStage: "review" });
+        return {};
+      }),
+    });
+    const r = await runAutonomous({ workspaceDir, pipeline, runner, reporter: new NoopStepReporter(), llmExecutor: live, configured: { modelAuthClient: client, now: () => NOW } });
+    expect(r.exitCode).toBe(1);
+    expect(client.finish).not.toHaveBeenCalled();
+    expect(client.dispose).not.toHaveBeenCalled();
+  });
+
+  it("rejects an invalid bootstrap before any runner, hook or executor work, even with injection", async () => {
+    const hook = join(workspaceDir, "setup-ran");
+    writeFileSync(join(workspaceDir, "WORKFLOW.md"), `---\nsetup: touch ${hook}\n---\nDo it.\n`);
+    const injected = makeMockExecutor(0);
+    const client = fakeClient();
+    const cases: Array<[string, Record<string, string>]> = [
+      ["missing grant", envelopeEnv(snap, undefined)],
+      ["expired grant", envelopeEnv(snap, makeGrant(snap, { expiresAt: NOW }))],
+      ["context mismatch", { ...envelopeEnv(snap, makeGrant(snap)), AI_IMPLEMENT_MODEL_AUTH_PROJECT_KEY: "other" }],
+    ];
+    for (const [, env] of cases) {
+      for (const [k, v] of Object.entries(env)) vi.stubEnv(k, v);
+      const c = capture();
+      await expect(
+        runAutonomous({ workspaceDir, ...c, reporter: new NoopStepReporter(), llmExecutor: injected, configured: { modelAuthClient: client, now: () => NOW } }),
+      ).rejects.toThrow(/Configured run rejected before execution/);
+      expect(c.seen.ctx).toBeUndefined();
+      vi.unstubAllEnvs();
+      stubRequiredEnv();
+    }
+    expect(injected.invoke).not.toHaveBeenCalled();
+    expect(client.checkout).not.toHaveBeenCalled();
+    expect(existsSync(hook)).toBe(false);
+  });
+
+  it("local: rejects a public repository or an untrusted subscription workspace before work", async () => {
+    const client = fakeClient();
+    const injected = makeMockExecutor(0);
+    for (const trust of [
+      { visibility: "public", trustedForSubscription: true },
+      { visibility: "private", trustedForSubscription: false },
+    ] as const) {
+      const l = capture();
+      await expect(
+        runAutonomousLocally({
+          workspaceDir, issueIdentifier: "AII-1", issueTitle: "t", issueDescription: "d", llmExecutor: injected,
+          pipeline: l.pipeline, runner: l.runner,
+          configured: {
+            agentConfig: makeSnapshot("codex-subscription"), modelAuthClient: client, localCredentialPort: { load: vi.fn() },
+            repositories: ["acme/app"], repoTrust: async () => trust,
+          },
+        }),
+      ).rejects.toThrow(/repository_untrusted/);
+      expect(l.seen.ctx).toBeUndefined();
+    }
+    expect(injected.invoke).not.toHaveBeenCalled();
+    expect(client.checkout).not.toHaveBeenCalled();
+  });
+
+  it("local: cleans up on setup-hook failure and on a thrown pipeline", async () => {
+    writeFileSync(join(workspaceDir, "WORKFLOW.md"), "---\nsetup: exit 3\n---\nDo it.\n");
+    const client = fakeClient();
+    const l = capture();
+    const configured = {
+      agentConfig: snap, modelAuthClient: client, localCredentialPort: { load: vi.fn() },
+      repositories: ["acme/app"], repoTrust: async () => ({ visibility: "private" as const, trustedForSubscription: true }),
+    };
+    const r = await runAutonomousLocally({ workspaceDir, issueIdentifier: "AII-1", issueTitle: "t", issueDescription: "d", pipeline: l.pipeline, runner: l.runner, configured });
+    expect(r.terminationReason).toBe("setup_failed");
+    expect(l.seen.ctx).toBeUndefined();
+    expect(client.checkout).not.toHaveBeenCalled();
+    expect(client.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("an absent snapshot preserves legacy construction and injection byte-for-byte", async () => {
+    const injected = makeMockExecutor(0);
+    const c = capture();
+    await runAutonomous({ workspaceDir, ...c, reporter: new NoopStepReporter(), llmExecutor: injected });
+    expect(c.seen.ctx!.llmExecutor).toBe(injected);
+    expect(c.seen.ctx!.data.agentConfig).toBeUndefined();
+    expect(c.seen.ctx!.data.model).toBe("env-claude-model");
+    expect(c.seen.ctx!.data.provider).toBe("bedrock");
+
+    const built = capture();
+    await runAutonomous({ workspaceDir, ...built, reporter: new NoopStepReporter() });
+    expect(built.seen.ctx!.llmExecutor).toBeInstanceOf(ClaudeCliExecutor);
+
+    const l = capture();
+    await runAutonomousLocally({ workspaceDir, issueIdentifier: "AII-1", issueTitle: "t", issueDescription: "d", llmExecutor: injected, pipeline: l.pipeline, runner: l.runner });
+    expect(l.seen.ctx!.llmExecutor).toBe(injected);
+    expect(l.seen.ctx!.data.agentConfig).toBeUndefined();
   });
 });

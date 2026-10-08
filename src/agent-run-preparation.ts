@@ -37,6 +37,7 @@
  */
 import crypto from "node:crypto";
 import { getDb } from "./dedup.js";
+import { repoTrustRejection, type RepoTrust, type RepoVisibility } from "./repo-trust.js";
 import {
   STAGE_NAMES,
   type AccountAuthMode,
@@ -95,13 +96,7 @@ const GRANT_BACKENDS: Record<DispatchAdmissionBackend, ModelAuthBackend> = {
 
 // --- public types ---
 
-export type RepoVisibility = "public" | "private" | "internal" | "unknown";
-
-export interface RepoTrust {
-  readonly visibility: RepoVisibility;
-  /** True only when the repository is an authorized trusted testing repository for hosted subscriptions. */
-  readonly trustedForSubscription: boolean;
-}
+export type { RepoVisibility, RepoTrust };
 
 /** Shared by preparation and inspection: injected reads only, no writes. */
 export interface AgentReadinessDeps {
@@ -335,11 +330,8 @@ async function checkTrust(request: AgentRunRequest, deps: AgentReadinessDeps): P
     } catch {
       trust = undefined;
     }
-    if (!trust || (trust.visibility !== "public" && trust.visibility !== "private" && trust.visibility !== "internal")) {
-      return "repository_visibility_unknown";
-    }
-    if (trust.visibility === "public") return "repository_public";
-    if (trust.trustedForSubscription !== true) return "repository_not_trusted";
+    const rejection = repoTrustRejection(trust);
+    if (rejection) return rejection;
   }
   return null;
 }
