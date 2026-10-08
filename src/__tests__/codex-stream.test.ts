@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { CodexStreamParser, parseCodexStream, summarizeCommand, codexAttributionUsage } from "../pipeline/codex-stream.js";
 import { classifyLlmResult } from "../pipeline/failure-classification.js";
+import { formatLlmResultDetail } from "../pipeline/step-utils.js";
 
 // Shapes follow `codex exec --json` as documented for the pinned CLI (Dockerfile.session
 // CODEX_CLI_VERSION); the "future" events below are synthetic and unconfirmed.
@@ -274,5 +275,38 @@ describe("trace hygiene", () => {
   });
   it("keeps only the executable name", () => {
     expect(summarizeCommand("bash -lc 'git log --oneline -n 5 --all extra'")).toBe("git …");
+  });
+});
+
+describe("terminal error message", () => {
+  // Verbatim shape from a live `codex exec --output-schema` run rejected by the provider.
+  const providerError = JSON.stringify({ type: "error", error: { message: "Invalid schema for response_format 'codex_output_schema': 'schema.properties.blocking_issues.items.required' is required to include every key in properties. Missing 'location'.", type: "invalid_request_error", param: "text.format.schema", code: "invalid_json_schema" }, status: 400 });
+  const stderrNoise = "WARNING: proceeding, even though we could not create PATH aliases: Refusing to create helper binaries under temporary dir \"/tmp\"";
+
+  it("keeps the provider's error text and surfaces it ahead of stderr noise", () => {
+    const p = parseCodexStream(j({ type: "thread.started", thread_id: "t" }, started, { type: "error", message: providerError }, { type: "turn.failed", error: { message: providerError } }), stderrNoise);
+    const result = p.toResult({ exitCode: 1 });
+    expect(result.errorMessage).toContain("Missing 'location'");
+    expect(formatLlmResultDetail(result)).toContain("invalid_json_schema");
+    expect(formatLlmResultDetail(result)).not.toContain("PATH aliases");
+  });
+
+  it("takes the turn.failed message when no bare error event precedes it", () => {
+    const result = parseCodexStream(j(started, { type: "turn.failed", error: { message: "quota exceeded" } })).toResult({ exitCode: 1 });
+    expect(result.errorMessage).toBe("quota exceeded");
+  });
+
+  it("redacts and bounds the message", () => {
+    const result = parseCodexStream(j({ type: "error", message: `bad key sk-${"a".repeat(20)} ${"x".repeat(5000)}` })).toResult({ exitCode: 1 });
+    expect(result.errorMessage).not.toContain("sk-aaaa");
+    expect(result.errorMessage!.length).toBeLessThanOrEqual(2001);
+  });
+
+  it("leaves a successful result without a message", () => {
+    expect(parseCodexStream(j(done())).toResult({ exitCode: 0 }).errorMessage).toBeUndefined();
+  });
+
+  it("falls back to stderr when the stream carried no error text", () => {
+    expect(formatLlmResultDetail({ stdout: "", stderr: "spawn failed" })).toBe(": spawn failed");
   });
 });

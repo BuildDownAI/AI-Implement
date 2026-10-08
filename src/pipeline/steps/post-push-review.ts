@@ -1259,13 +1259,27 @@ function configAdvisoryReviewers(
   });
 }
 
+/** A report field the reviewer must fill: required and not nullable (strict mode requires every field; null marks it optional). */
+function isMandatoryReportField(schema: ReviewerDefinition["outputSchema"], field: string): boolean {
+  if (!Array.isArray(schema.required) || !schema.required.includes(field)) return false;
+  const properties = schema.properties as Record<string, { type?: unknown } | undefined> | undefined;
+  const type = properties?.[field]?.type;
+  return !(Array.isArray(type) && type.includes("null"));
+}
+
 function parseReviewerDefinitionVerdict(value: unknown, schema: ReviewerDefinition["outputSchema"]): ReviewerVerdict {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("expected structured reviewer output to be an object");
   }
-  const raw = value as { approved?: unknown; findings?: unknown; summary?: unknown; checks?: unknown };
+  const reported = value as { approved?: unknown; findings?: unknown; summary?: unknown; checks?: unknown };
+  // Null is the strict-mode encoding of an absent optional field.
+  const raw = {
+    ...reported,
+    summary: reported.summary === null ? undefined : reported.summary,
+    checks: reported.checks === null ? undefined : reported.checks,
+  };
   for (const field of ["summary", "checks"] as const) {
-    if (Array.isArray(schema.required) && schema.required.includes(field) && raw[field] === undefined) {
+    if (isMandatoryReportField(schema, field) && raw[field] === undefined) {
       throw new Error(`expected required report field ${field}`);
     }
   }
@@ -1282,10 +1296,10 @@ function parseReviewerDefinitionVerdict(value: unknown, schema: ReviewerDefiniti
     if (typeof item.body !== "string" || !item.body.trim()) {
       throw new Error(`expected findings[${index}].body to be a non-empty string`);
     }
-    if (item.path !== undefined && typeof item.path !== "string") {
+    if (item.path !== undefined && item.path !== null && typeof item.path !== "string") {
       throw new Error(`expected findings[${index}].path to be a string when present`);
     }
-    if (item.line !== undefined && typeof item.line !== "number") {
+    if (item.line !== undefined && item.line !== null && typeof item.line !== "number") {
       throw new Error(`expected findings[${index}].line to be a number when present`);
     }
     return {

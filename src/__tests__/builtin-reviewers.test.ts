@@ -28,24 +28,29 @@ describe("built-in reviewers", () => {
       .resolves.toMatchObject({ id: "code-review" });
   });
 
-  it("keeps the shared schema backward-compatible and uses a strict schema for built-ins", async () => {
+  it("keeps the shared schema's report fields optional (nullable) and makes them mandatory for built-ins", async () => {
     const gap = await resolveReviewer("gap-analysis", { customRoot: "/workspace", existsSyncImpl: () => false });
     const code = await resolveReviewer("code-review", { customRoot: "/workspace", existsSyncImpl: () => false });
 
     expect(gap?.outputSchema).toBe(BUILTIN_REVIEWER_VERDICT_SCHEMA);
     expect(code?.outputSchema).toBe(BUILTIN_REVIEWER_VERDICT_SCHEMA);
+    // Strict mode requires every property; nullability is what keeps summary and checks optional.
     expect(REVIEWER_VERDICT_SCHEMA).toMatchObject({
-      required: ["approved", "findings"],
+      required: ["approved", "findings", "summary", "checks"],
       properties: {
         approved: { type: "boolean" },
         findings: { type: "array" },
-        summary: { type: "string", minLength: 1 },
-        checks: { type: "array", minItems: 1 },
+        summary: { type: ["string", "null"], minLength: 1 },
+        checks: { type: ["array", "null"], minItems: 1 },
       },
     });
     expect(BUILTIN_REVIEWER_VERDICT_SCHEMA).toMatchObject({
       required: ["approved", "findings", "summary", "checks"],
-      properties: REVIEWER_VERDICT_SCHEMA.properties,
+      properties: {
+        findings: (REVIEWER_VERDICT_SCHEMA.properties as Record<string, unknown>).findings,
+        summary: { type: "string", minLength: 1 },
+        checks: { type: "array", minItems: 1 },
+      },
     });
   });
 
