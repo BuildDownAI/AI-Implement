@@ -30,6 +30,7 @@ vi.mock("../fly-machines.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../fly-machines.js")>()),
   fetchMachineLogs: fetchMachineLogsMock,
   destroyMachine: destroyMachineMock,
+  getMachine: vi.fn(async (_t: string, _a: string, id: string) => ({ id, state: "stopped", config: { metadata: {} } })),
   listMachines: listMachinesMock,
 }));
 

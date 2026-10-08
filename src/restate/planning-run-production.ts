@@ -8,14 +8,14 @@ import { getMappings } from "../config.js";
 import { acquireDispatch } from "../dispatch-gate.js";
 import { read as readAdmission, releaseByDispatchId } from "../dispatch-admission.js";
 import type { AppConfig, HeldReservation } from "../index.js";
-import { classifyFlyMachine, classifyLocalContainer, stopBackendRun } from "../backend-run.js";
+import { classifyFlyMachine, classifyLocalContainer, destroyMachineRecorded, stopBackendRun } from "../backend-run.js";
 import { getRunnerMode } from "../runner-mode.js";
 import type { TicketIssue, TicketingProvider } from "../providers/types.js";
 import { defaultFetchSignal, cancelWorkflowRun, getWorkflowRunStatus } from "../github.js";
 import { getInstallationToken } from "../github-app-auth.js";
 import { findLogIdByDispatchId, getJobByDispatchId, getStuckAttemptStampedAt, updateJobRunId, updateJobStatus, type Job } from "../log.js";
 import { planningSessionName, type launchPlanningRun, type launchPlanningSession, type preparePlanningLaunch } from "../planning-launch.js";
-import { destroyMachine, listMachines } from "../fly-machines.js";
+import { listMachines } from "../fly-machines.js";
 import { findLocalContainerIdByName, removeLocalContainer } from "../local-docker.js";
 import { remediateFailedJob, type StuckWatchdogConfig } from "../stuck-watchdog.js";
 import type { RestateService } from "./endpoint.js";
@@ -247,7 +247,7 @@ export function createProductionPlanningRunServices(input: PlanningRunProduction
     try {
       if (run.backend === "fly-machines") {
         if (!config.flySessionsToken || !config.flySessionsApp) throw new Error("FLY_SESSIONS_TOKEN + FLY_SESSIONS_APP are not configured");
-        await destroyMachine(config.flySessionsToken, config.flySessionsApp, jobId);
+        await destroyMachineRecorded(config, jobId, "planning-end");
       } else if (run.backend === "local-docker") {
         await removeLocalContainer(jobId);
       }
