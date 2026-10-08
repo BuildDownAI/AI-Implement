@@ -347,9 +347,10 @@ A workflow that owns a run outside Restate (a GitHub Actions run, a Fly machine)
 | result | workflow promise `report` | the run ended and gave its result | one time, by the verify-only runner callback |
 | started evidence | workflow promise `progress` | the run executes | one time, by the first proof from any source |
 | stop request | workflow promise `cancel` | an operator or a newer trigger stops the run | one time |
+| runner step | workflow promise `step:<id>:running` / `step:<id>:ended` | the runner started or ended pipeline step `<id>` | one time each, by `TokenStepReporter` (`src/pipeline/reporter.ts`) through `POST /runner/progress` and the `progress` handler |
 | tick | durable timer (`ctx.sleep`) | time for the next status read or a deadline check | each interval |
 
-Step promises (`step:<id>:running`, `step:<id>:ended`) are evidence for `status`, never wait signals: the wait still ends on `report`, `cancel`, or a deadline (ADR 034).
+The step promises (`step:<id>:running`, `step:<id>:ended`) are evidence for `status` and are in the table above; they are never wait signals: the wait still ends on `report`, `cancel`, or a deadline (ADR 034).
 
 Two durable deadlines, both computed from the journaled dispatch time: the bootstrap deadline (10 minutes) to the started evidence, and the total deadline (4 hours) to the result. At a deadline the workflow first peeks at the promises, so a signal that arrived at the same moment wins. A timeout cancels the run on its backend.
 
