@@ -1795,8 +1795,8 @@ async function handleDestroySession(
   if (job?.phase === "kg-refresh") {
     if (job.executionMode === "github-actions") {
       // The KgRefresh workflow requests the GitHub cancellation and waits for confirmed
-      // termination (AII-901); the Fly branch below also keeps a direct destroy (via destroyMachineRecorded, which still guards durable-runner machines) because the
-      // workflow has no Fly dep.
+      // termination (AII-901); the Fly branch below destroys through destroyMachineRecorded
+      // (which guards durable-runner machines) because the workflow has no Fly dep.
       if (!deps.kgRefresh) {
         json(res, 501, { error: "KG refresh is not configured" });
         return;
