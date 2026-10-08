@@ -16,7 +16,7 @@ An issueless run kind has no tracker issue. The `dispatch_log` row **is** the tr
 - `issue_identifier = null`, `issue_title = null`, `team_key = null`, `repo = null`
 - a `phase` tag that identifies the run kind across the whole observability surface
 
-Nothing in the dispatch or callback path touches the ticketing provider. The lifecycle is driven by two Restate services (ADR 032, [restate.md](restate.md) § "Writing a workflow for a run kind"): the `KgRepo` coordinator object, keyed by the KG source repo, holds the single in-flight marker and is the lock; the `KgRefresh` workflow, keyed by a trigger id the object mints, is the run — it reserves the row, dispatches, waits for the report under two deadlines, runs the rail, and releases the marker. Restate holds the workflow's position and the marker; SQLite stays the system of record for the `dispatch_log` row and the last-refresh outcome. There is no in-process state machine and no sweep: a restart replays the journal and resumes at the step that did not finish.
+Nothing in the dispatch or callback path touches the ticketing provider. The lifecycle is driven by two Restate services (ADR 032, [restate.md](restate.md) § "Writing a workflow for a run kind"): the `KgRepo` coordinator object, keyed by the KG source repo, holds the single in-flight marker and is the lock; the `KgRefresh` workflow, keyed by a trigger id the object mints, is the run — it reserves the row, dispatches, waits for the report under two deadlines, runs the rail, and releases the marker. Restate holds the workflow's position and the marker; the `dispatch_log` row and the last-refresh outcome are projections of journaled step results (ADR 018 amendment, 2026-10-08): SQLite stays the read model that `/api/token`, the callbacks, and the admin pages use, and the journal is the record. There is no in-process state machine and no sweep: a restart replays the journal and resumes at the step that did not finish.
 
 ---
 
@@ -144,19 +144,19 @@ The `dispatch_log` row (schema in `src/log.ts`, `initLogTable`) written by `appe
 
 | Column | Value | Notes |
 |--------|-------|-------|
-| `issue_id` | `"kg-refresh"` | Synthetic string constant, not a UUID |
+| `issue_id` | `"kg-refresh"` | Synthetic string constant, not a UUID; journaled by `resolve`, written by `reserve` |
 | `issue_identifier` | `null` | No tracker issue |
 | `issue_title` | `null` | |
 | `team_key` | `null` | No ticketing mapping |
-| `repo` | KG source repo (`owner/repo`) | Populated from `KG_SOURCE_REPO`; required by `handleDestroySession` to cancel a GHA-backed run |
-| `phase` | `"kg-refresh"` | Run-kind tag, drives observability and routing |
-| `execution_mode` | `"fly-machines"`, `"local-docker"`, or `"github-actions"` | Resolved from global runner mode at dispatch time |
-| `machine_id` | Fly machine ID | null for GHA and local Docker |
-| `machine_nonce` | Generated for Fly/local | null for GHA; `updateJobStatus` clears it on terminal outcome |
-| `run_id` | GHA workflow run ID | Set via `updateJobRunId()` when `findWorkflowRunId` succeeds; null for Fly/local |
-| `pr_url` | Fly machine URL or GHA run URL | Stored via `updateJobPrUrl(jobId, logsUrl)` on dispatch; used as the logs link |
+| `repo` | KG source repo (`owner/repo`) | Populated from `KG_SOURCE_REPO` by `resolve`, written by `reserve`; required by `handleDestroySession` to cancel a GHA-backed run |
+| `phase` | `"kg-refresh"` | Run-kind tag, drives observability and routing; journaled by `resolve`, written by `reserve` |
+| `execution_mode` | `"fly-machines"`, `"local-docker"`, or `"github-actions"` | Resolved from global runner mode one time by `resolve`, written by `reserve` |
+| `machine_id` | Fly machine ID, or local container ID | Projected by `record-dispatch-N`; null for GHA |
+| `machine_nonce` | Derived for Fly/local: HMAC of `dispatchId:attempt` under the runner token secret | Written by `nonce-N` before the dispatch; never in the journal; null for GHA; `updateJobStatus` clears it on terminal outcome |
+| `run_id` | GHA workflow run ID | Projected by `record-dispatch-N`, or by `record-reconcile-N` when a reconcile by title finds the run; null for Fly/local |
+| `pr_url` | Fly machine URL or GHA run URL | Projected by `record-dispatch-N` or `record-reconcile-N` (`updateJobPrUrl`); used as the logs link |
 
-The row gets its machine and run details from the workflow's `dispatch` step: the dispatch closure calls `recordDispatch` (`src/index.ts`) after the backend accepts, so the nonce reaches the row and never the journaled step result, and the reconcile by title records the run id and URL when it later finds the run.
+The row is a projection of the journal. `resolve` journals the record (`dispatchId`, `issueId`, `phase`, `repo`, `executionMode`) and `reserve` writes it. For a Fly or local-Docker run, `nonce-N` derives the machine nonce (`deriveMachineNonce`) and writes it before `dispatch-N` creates the machine, so `/api/token` never sees a row with no nonce; `dispatch-N` derives the same value to hand to the dispatcher, and neither step returns it. `record-dispatch-N` writes the machine id, logs URL, and run id from the journaled dispatch result, and `record-reconcile-N` does the same for a run a title reconcile found (the reconcile read itself writes nothing). `close-row` and `persist` write the outcome. See [restate.md](restate.md) § "Journal projections".
 
 The row lifecycle:
 1. Inserted with `status = "dispatched"` by the workflow's `reserve` step, before the dispatch; the workflow's own dispatch id is the job id

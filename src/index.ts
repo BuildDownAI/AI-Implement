@@ -141,7 +141,7 @@ import {
 } from "./restate/retention.js";
 import { applyVolumeSnapshotRetention, applyVolumeSnapshotRetentionAtBoot } from "./fly-volumes.js";
 import { createProductionReviewFixServices } from "./restate/review-fix-production.js";
-import { createKgFindRunByTitle, seedFlyMachineProfileFromOverride, createProductionKgRefreshServices, recordKgDispatchDetails, launchKeptMachine, bindKeptMachineFly } from "./restate/kg-refresh-production.js";
+import { createKgFindRunByTitle, seedFlyMachineProfileFromOverride, createProductionKgRefreshServices, launchKeptMachine, bindKeptMachineFly } from "./restate/kg-refresh-production.js";
 import { createProductionPlanningRunServices, PLANNING_CONTEXT_BRANCH_KEY, PLANNING_CONTEXT_FIELD_VALUE_KEY } from "./restate/planning-run-production.js";
 import { createPlanningAdmissionTerminationHook, createPlanningRunIngressClient } from "./restate/planning-run-client.js";
 import { setKgRefreshToolDeps } from "./restate/tools.js";
@@ -4033,10 +4033,15 @@ async function handleKgRefreshOutcome(
   }
 }
 
+function requireKgMachineNonce(machineNonce: string | null): string {
+  if (machineNonce === null) throw new Error("[kg-refresh] machineNonce is required for a machine backend");
+  return machineNonce;
+}
+
 async function dispatchKgRefreshRun(
   config: AppConfig,
-  opts: { runToken: string; runProgressToken: string; dispatchId: string; runConfig: string; executionPath?: string; machine: FlyMachineProfileConfig; machineId: string | null },
-): Promise<{ machineId?: string; machineNonce?: string; logsUrl?: string; created?: boolean; replaced?: string }> {
+  opts: { runToken: string; runProgressToken: string; dispatchId: string; runConfig: string; executionPath?: string; machine: FlyMachineProfileConfig; machineId: string | null; machineNonce: string | null },
+): Promise<{ machineId?: string; logsUrl?: string; created?: boolean; replaced?: string }> {
   if (!config.kgSourceRepo) throw new Error("KG_SOURCE_REPO not configured");
   const repo = parseKgSourceRepo(config.kgSourceRepo);
   const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, repo.owner);
@@ -4048,8 +4053,8 @@ async function dispatchKgRefreshRun(
         "[kg-refresh] fly-machines execution path selected but FLY_SESSIONS_TOKEN + FLY_SESSIONS_APP are not configured",
       );
     }
+    const machineNonce = requireKgMachineNonce(opts.machineNonce);
     const sessionToken = generateSessionToken();
-    const machineNonce = generateMachineNonce();
     const extraEnv: Record<string, string> = {
       AI_IMPLEMENT_RUN_CONFIG: opts.runConfig,
       RUN_PROGRESS_TOKEN: opts.runProgressToken,
@@ -4095,7 +4100,7 @@ async function dispatchKgRefreshRun(
     });
     console.log(`[kg-refresh] dispatched via Fly (${launched.reused ? "reused" : "created"} machine ${launched.machineId}) (dispatchId=${opts.dispatchId})`);
     return {
-      machineId: launched.machineId, machineNonce: launched.machineNonce, created: launched.created, replaced: launched.replaced,
+      machineId: launched.machineId, created: launched.created, replaced: launched.replaced,
       logsUrl: `https://fly.io/apps/${config.flySessionsApp}/machines/${launched.machineId}`,
     };
 
@@ -4105,8 +4110,8 @@ async function dispatchKgRefreshRun(
         "[kg-refresh] local-docker execution path selected but LOCAL_RUNNER_IMAGE is not configured",
       );
     }
+    const machineNonce = requireKgMachineNonce(opts.machineNonce);
     const sessionToken = generateSessionToken();
-    const machineNonce = generateMachineNonce();
     const extraEnv: Record<string, string> = { AI_IMPLEMENT_RUN_CONFIG: opts.runConfig, RUN_PROGRESS_TOKEN: opts.runProgressToken };
     const localOrchestratorUrl =
       config.localRunnerOrchestratorUrl ??
@@ -4133,7 +4138,7 @@ async function dispatchKgRefreshRun(
       extraEnv,
     });
     console.log(`[kg-refresh] dispatched via local Docker (dispatchId=${opts.dispatchId})`);
-    return { machineId: containerId, machineNonce };
+    return { machineId: containerId };
   } else {
     throw new Error(`[kg-refresh] unsupported execution path "${String(executionPath)}": the GitHub Actions run is dispatched by the KgRefresh workflow`);
   }
@@ -5181,13 +5186,12 @@ async function main(): Promise<void> {
       deleteBranchFn: deleteBranch,
       dispatchKgRefreshRun: (opts) => dispatchKgRefreshRun(config, opts),
       updateJobStatus,
-      recordDispatch: recordKgDispatchDetails,
       getWorkflowRunStatus: async (runId) => {
         const run = await getWorkflowRunStatus(await kgWorkflowToken(), kgSlug.owner, kgSlug.repo, runId);
         if (!run) throw new Error(`workflow run ${runId} status unavailable`);
         return { status: run.status, conclusion: run.conclusion };
       },
-      findRunByTitle: createKgFindRunByTitle({ owner: kgSlug.owner, repo: kgSlug.repo, getToken: kgWorkflowToken, recordDetails: recordKgDispatchDetails }),
+      findRunByTitle: createKgFindRunByTitle({ owner: kgSlug.owner, repo: kgSlug.repo, getToken: kgWorkflowToken }),
       cancelWorkflowRun: async (runId) => cancelWorkflowRun(await kgWorkflowToken(), kgSlug.owner, kgSlug.repo, runId),
       persistLastRefresh: defaultPersistLastRefresh,
       handleKgRefreshOutcome: (outcome, data) => handleKgRefreshOutcome(config, registry, outcome, data),

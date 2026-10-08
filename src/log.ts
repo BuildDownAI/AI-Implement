@@ -948,6 +948,13 @@ export function updateJobMachineId(jobId: number, machineId: string): void {
     .run(machineId, jobId);
 }
 
+/** Sets a job's machine id without touching its status (`updateJobMachineId` also marks it running). */
+export function setJobMachineId(jobId: number, machineId: string): void {
+  getDb()
+    .prepare("UPDATE dispatch_log SET machine_id = ? WHERE id = ?")
+    .run(machineId, jobId);
+}
+
 /** Records machine identity on a dispatched kg-refresh row after the machine starts. */
 export function updateJobMachineDetails(jobId: number, opts: { machineNonce: string; machineId?: string; logsUrl?: string }): void {
   getDb()
