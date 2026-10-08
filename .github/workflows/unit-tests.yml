@@ -96,10 +96,18 @@ jobs:
 
   # Binary runtime (AII-915): the same suite on the runtime a dispatched runner
   # uses — restate-server from node_modules, no Docker. Sibling of
-  # `restate-tests` so a PR proves both runtimes.
+  # `restate-tests` so a PR proves both runtimes. The suite runs three times
+  # (AII-993 flake detector: a scenario that fails one run in three must fail
+  # the PR that adds it) as a three-job matrix rather than one serial step
+  # (AII-1157 wall time). fail-fast is off so the evidence of which passes
+  # failed survives. Checks: `restate-tests-binary (1)`, `(2)`, `(3)`.
   restate-tests-binary:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        pass: [1, 2, 3]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -107,9 +115,9 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci
-      - name: npm run test:restate on the binary runtime, three passes (ambient CI vars scrubbed)
+      - name: npm run test:restate on the binary runtime, pass ${{ matrix.pass }} of 3 (ambient CI vars scrubbed)
         env:
           RESTATE_TEST_RUNTIME: binary
         run: |
           unset GITHUB_RUN_ID GITHUB_ENV GITHUB_REPOSITORY GITHUB_REF_NAME                 GITHUB_EVENT_NAME GITHUB_SHA GITHUB_ACTIONS GITHUB_ACTION
-          for i in 1 2 3; do npm run test:restate || exit 1; done
+          npm run test:restate
