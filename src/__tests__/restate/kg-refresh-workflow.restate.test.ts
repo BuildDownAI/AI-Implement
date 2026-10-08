@@ -295,7 +295,8 @@ describe("KgRefresh durable workflow", () => {
   // ---- non-rail deps: recorded in-process, per-run scenarios keyed by triggerId ----
   const scenarios = new Map<string, RunScenario>();
   const runIdIndex = new Map<number, string>();
-  const appendJobLogCalls: Array<{ dispatchId: string; jobId: string }> = [];
+  const appendJobLogCalls: Array<{ dispatchId: string; jobId: string; executionMode: string }> = [];
+  const resolveExecutionModeCalls: string[] = [];
   const dispatchedIds: string[] = [];
   /** triggerId -> the run the backend "committed" before the ack was lost. */
   const dispatchThrowAfterCommit = new Map<string, number>();
@@ -345,6 +346,8 @@ describe("KgRefresh durable workflow", () => {
   // A counting stand-in for FlyMachineProfile that runs the real merge/validation, so a test can tell a
   // journaled replay from a second read.
   let profileGets = 0;
+  const claimCalls: string[] = [];
+  const attachCalls: string[] = [];
   const dispatchedMachines: FlyMachineProfileConfig[] = [];
   const flyMachineProfile = restate.object({
     name: "FlyMachineProfile",
@@ -359,11 +362,21 @@ describe("KgRefresh durable workflow", () => {
         ctx.set("profile", mergeProfile(stored ?? FLY_MACHINE_PROFILE_DEFAULTS["kg-refresh"], patch));
       }),
       // AII-1136: the workflow claims, attaches and releases the kept machine; this stand-in keeps none (the real object is exercised below).
-      claim: restate.handlers.object.exclusive(async (): Promise<{ machineId: string | null }> => ({ machineId: null })),
-      attach: restate.handlers.object.exclusive(async (): Promise<void> => {}),
+      claim: restate.handlers.object.exclusive(async (_ctx: restate.ObjectContext, req: { dispatchId: string }): Promise<{ machineId: string | null }> => {
+        claimCalls.push(req.dispatchId);
+        return { machineId: null };
+      }),
+      attach: restate.handlers.object.exclusive(async (_ctx: restate.ObjectContext, req: { dispatchId: string }): Promise<void> => { attachCalls.push(req.dispatchId); }),
       release: restate.handlers.object.exclusive(async (): Promise<void> => {}),
     },
   });
+
+  /** The workflow dependency: the pending scenario's backend, keyed by dispatch id (which is the trigger id). */
+  function resolveExecutionModeFn(dispatchId: string): string {
+    resolveExecutionModeCalls.push(dispatchId);
+    adoptPendingScenario(dispatchId);
+    return scenarios.get(dispatchId)?.executionMode ?? "fly-machines";
+  }
 
   async function dispatchFn(input: KgDispatchInput): Promise<KgDispatchResult> {
     const triggerId = input.runConfig.triggerId;
@@ -467,6 +480,7 @@ describe("KgRefresh durable workflow", () => {
       return { runToken: "run-token", progressToken: "progress-token", publicationToken: "publication-token" };
     },
     dispatch: dispatchFn,
+    resolveExecutionMode: resolveExecutionModeFn,
     appendJobLog: (input) => {
       appendJobLogCalls.push(input);
       contractCalls?.push("reserve");
@@ -1190,6 +1204,36 @@ describe("KgRefresh durable workflow", () => {
     }, 15_000);
   });
 
+  // ---- AII-1146: the backend resolves one time, in `reserve`; only a Fly run claims the kept machine ----
+  describe("AII-1146: one backend resolution per run", () => {
+    it.each(VARIANTS.map(([label]) => label))("a github-actions run records no claim and no attach, and the row carries the mode (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "github-actions" });
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      await eventually(() => scenarios.get(triggerId)!.dispatchCalls >= 1, (ok) => ok, { label: "dispatch" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      await done;
+      expect(claimCalls).not.toContain(triggerId);
+      expect(attachCalls).not.toContain(triggerId);
+      expect(appendJobLogCalls.filter((c) => c.dispatchId === triggerId)).toEqual([{ dispatchId: triggerId, jobId: triggerId, executionMode: "github-actions" }]);
+    }, 30_000);
+
+    it.each(VARIANTS.map(([label]) => label))("a fly-machines run records one claim and resolves the backend once across dispatch retries (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      const scenario = makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+      dispatchThrowAfterCommit.set(triggerId, scenario.runId!);
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      await eventually(() => scenario.dispatchCalls >= 1, (ok) => ok, { label: "dispatch" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      await done;
+      expect(claimCalls.filter((id) => id === triggerId)).toHaveLength(1);
+      expect(resolveExecutionModeCalls.filter((id) => id === triggerId)).toHaveLength(1);
+      expect(appendJobLogCalls.find((c) => c.dispatchId === triggerId)?.executionMode).toBe("fly-machines");
+    }, 30_000);
+  });
+
   // ---- AII-1066: bounded reads (watch-N, reconcile-N, watch-cancel-N, reconcile-cancel-N) ----
   // A read that fails on each attempt is "no new evidence" and never holds the workflow past its
   // deadline. The deadline workflow serves a 1 s bootstrap deadline and a 2.6 s total deadline.
@@ -1450,6 +1494,7 @@ describe("KgRefresh durable workflow", () => {
       kgSourceRepo: KG_SOURCE_REPO,
       mintRunTokens: () => ({ runToken: "run-token", progressToken: "progress-token", publicationToken: "publication-token" }),
       dispatch: dispatchFn,
+      resolveExecutionMode: resolveExecutionModeFn,
       appendJobLog: (input) => { appendJobLogCalls.push(input); },
       closeJobLog: (jobId, status, conclusion) => { closeRowCalls.push({ jobId, status, conclusion }); },
       getWorkflowRunStatus: getWorkflowRunStatusFn,
@@ -1578,6 +1623,7 @@ describe("KgRefresh durable workflow", () => {
       kgSourceRepo: KG_SOURCE_REPO,
       mintRunTokens: () => ({ runToken: "run-token", progressToken: "progress-token", publicationToken: "publication-token" }),
       dispatch: dispatchFn,
+      resolveExecutionMode: resolveExecutionModeFn,
       appendJobLog: (input) => { appendJobLogCalls.push(input); },
       closeJobLog: (jobId, status, conclusion) => { closeRowCalls.push({ jobId, status, conclusion }); },
       getWorkflowRunStatus: getWorkflowRunStatusFn,
@@ -2647,6 +2693,7 @@ describe("KgRefresh durable workflow", () => {
       return { runToken: "run-token", progressToken: "progress-token", publicationToken: "publication-token" };
     },
       dispatch: dispatchFn,
+      resolveExecutionMode: resolveExecutionModeFn,
       appendJobLog: (input) => { appendJobLogCalls.push(input); },
       closeJobLog: (jobId, status, conclusion) => { closeRowCalls.push({ jobId, status, conclusion }); },
       getWorkflowRunStatus: getWorkflowRunStatusFn,

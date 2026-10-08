@@ -102,6 +102,8 @@ export interface KgDispatchInput {
   machine: FlyMachineProfileConfig;
   /** The pipeline's kept Fly machine from `FlyMachineProfile.claim`; null when none is kept. */
   machineId: string | null;
+  /** The backend the `reserve` step resolved; the dispatch acts on it and does not resolve again. */
+  executionMode: string;
 }
 
 export interface KgRefreshStatusResult {
@@ -161,7 +163,9 @@ export interface KgRefreshWorkflowDependencies {
   mintRunTokens(input: { dispatchId: string; ttlSeconds: number }): { runToken: string; progressToken: string; publicationToken: string };
   dispatch(input: KgDispatchInput): Promise<KgDispatchResult>;
   /** Idempotent on `dispatchId`; returns the dispatch_log row id. */
-  appendJobLog(input: { dispatchId: string; jobId: string }): number | void;
+  /** Resolves the backend one time per run; the `reserve` step journals the answer. */
+  resolveExecutionMode(dispatchId: string): string;
+  appendJobLog(input: { dispatchId: string; jobId: string; executionMode: string }): number | void;
   closeJobLog(jobId: string, status: "completed" | "failed" | "timed_out", conclusion?: string): void;
   getWorkflowRunStatus(runId: number): Promise<{ status: string; conclusion: string | null }>;
   findRunByTitle(title: string): Promise<{ runId: number } | null>;
@@ -319,7 +323,11 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
     // merge/delete-branch failure) returns through `finish` normally and never reaches
     // this catch.
     try {
-      await ctx.run("reserve", () => deps.appendJobLog({ dispatchId, jobId }));
+      const { executionMode } = await ctx.run("reserve", () => {
+        const executionMode = deps.resolveExecutionMode(dispatchId);
+        deps.appendJobLog({ dispatchId, jobId, executionMode });
+        return { executionMode };
+      });
 
       const ttlSeconds = Math.ceil(totalDeadlineMs / 1000);
       const issueIdentifier = `KG-REFRESH · ${triggerId}`;
@@ -336,7 +344,10 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       // The resume path that raises this is AII-1032's; the claim, the step names and `attach` carry it.
       const attempt = 1;
       // A journaled call: a replay reuses the claim. The Fly write stays in the dispatch step, which holds the run's tokens.
-      const claim = await ctx.objectClient(FlyMachineProfile, "kg-refresh").claim({ dispatchId, attempt });
+      // Only a Fly run holds the kept machine.
+      const claim = executionMode === "fly-machines"
+        ? await ctx.objectClient(FlyMachineProfile, "kg-refresh").claim({ dispatchId, attempt })
+        : { machineId: null };
       const dispatchResult = await ctx.run(
         `dispatch-${attempt}`,
         async (): Promise<KgDispatchResult> => {
@@ -347,7 +358,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
             return { outcome: "accepted", runId: existing.runId, jobId: String(existing.runId), executionMode: GHA_EXECUTION_MODE };
           }
           minted ??= deps.mintRunTokens({ dispatchId, ttlSeconds });
-          const result = await deps.dispatch({ runConfig: input, tokens: minted, issueIdentifier, dispatchId, machine, machineId: claim.machineId });
+          const result = await deps.dispatch({ runConfig: input, tokens: minted, issueIdentifier, dispatchId, machine, machineId: claim.machineId, executionMode });
           return {
             outcome: result.outcome, runId: result.runId, runUrl: result.runUrl,
             jobId: result.jobId, executionMode: result.executionMode,

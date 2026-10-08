@@ -117,6 +117,8 @@ const dispatchInput = {
   issueIdentifier: "KG-REFRESH · t-1",
   dispatchId: "d-workflow",
   machineId: null,
+  /** What the workflow's `reserve` step resolved; the tests steer it through `resolvedPath`. */
+  get executionMode() { return resolvedPath.current; },
   machine: { cpuKind: "performance" as const, cpus: 2, memoryMb: 8192, idleTimeoutMs: 604800000 },
 };
 
@@ -235,8 +237,8 @@ describe("appendJobLog idempotency", () => {
     appendLogIfAbsent.mockReset().mockReturnValue(9);
     createProductionKgRefreshServices(makeInput());
     const deps = capturedWorkflowDeps.current!;
-    expect(deps.appendJobLog({ dispatchId: "d-idem", jobId: "d-idem" })).toBe(9);
-    expect(deps.appendJobLog({ dispatchId: "d-idem", jobId: "d-idem" })).toBe(9);
+    expect(deps.appendJobLog({ dispatchId: "d-idem", jobId: "d-idem", executionMode: "fly-machines" })).toBe(9);
+    expect(deps.appendJobLog({ dispatchId: "d-idem", jobId: "d-idem", executionMode: "fly-machines" })).toBe(9);
     expect(appendLogIfAbsent).toHaveBeenCalledTimes(2);
     expect(appendLogIfAbsent).toHaveBeenCalledWith(expect.objectContaining({ dispatchId: "d-idem", issueId: "kg-refresh" }));
   });
@@ -259,7 +261,7 @@ describe("appendJobLog execution mode", () => {
     resolvedPath.current = "fly-machines";
     appendLogIfAbsent.mockReset().mockReturnValue(1);
     createProductionKgRefreshServices(makeInput({ findJobId: () => undefined }));
-    capturedWorkflowDeps.current!.appendJobLog({ dispatchId: "d-3", jobId: "d-3" });
+    capturedWorkflowDeps.current!.appendJobLog({ dispatchId: "d-3", jobId: "d-3", executionMode: "fly-machines" });
     expect(appendLogIfAbsent).toHaveBeenCalledWith(expect.objectContaining({ dispatchId: "d-3", executionMode: "fly-machines" }));
   });
 });
@@ -620,15 +622,49 @@ describe("createKgFindRunByTitle", () => {
 
 describe("resolveKgExecutionMode (AII-1130)", () => {
   afterEach(() => { runnerMode.current = "default"; });
+  const configured = { flySessionsToken: "t", flySessionsApp: "a" };
+  const unconfigured = { flySessionsToken: null, flySessionsApp: null };
 
-  it.each(["default", "gha", "fly", "shadow"])("answers fly-machines under runner mode %s", (mode) => {
+  it.each([
+    ["local", configured, "local-docker"],
+    ["local", unconfigured, "local-docker"],
+    ["gha", configured, "github-actions"],
+    ["gha", unconfigured, "github-actions"],
+    ["default", configured, "fly-machines"],
+    ["default", unconfigured, "github-actions"],
+    ["fly", configured, "fly-machines"],
+    ["fly", unconfigured, "github-actions"],
+    ["shadow", configured, "fly-machines"],
+    ["shadow", unconfigured, "github-actions"],
+  ])("runner mode %s, Fly %j answers %s", (mode, fly, expected) => {
     runnerMode.current = mode;
-    expect(resolveKgExecutionMode()).toBe("fly-machines");
+    expect(resolveKgExecutionMode(fly)).toBe(expected);
   });
 
-  it("answers local-docker under runner mode local", () => {
+  it("counts a half-set Fly configuration as not configured", () => {
+    runnerMode.current = "default";
+    expect(resolveKgExecutionMode({ flySessionsToken: "t", flySessionsApp: null })).toBe("github-actions");
+    expect(resolveKgExecutionMode({ flySessionsToken: null, flySessionsApp: "a" })).toBe("github-actions");
+  });
+});
+
+describe("the dispatch closure does not resolve the backend (AII-1146)", () => {
+  it("acts on input.executionMode and leaves the rule to the workflow dependency", async () => {
     runnerMode.current = "local";
-    expect(resolveKgExecutionMode()).toBe("local-docker");
+    const seam = vi.fn(() => "fly-machines");
+    const dispatchKgRefreshRun = vi.fn(async () => ({}));
+    await createKgRefreshDispatch(makeInput({ dispatchKgRefreshRun, resolveExecutionMode: seam }))({ ...dispatchInput, executionMode: "local-docker" });
+    expect(seam).not.toHaveBeenCalled();
+    expect(dispatchKgRefreshRun).toHaveBeenCalledWith(expect.objectContaining({ executionPath: "local-docker" }));
+    runnerMode.current = "default";
+  });
+
+  it("calls the seam one time per resolveExecutionMode dependency call", () => {
+    const seam = vi.fn(() => "github-actions");
+    createProductionKgRefreshServices(makeInput({ resolveExecutionMode: seam }));
+    expect(seam).not.toHaveBeenCalled();
+    expect(capturedWorkflowDeps.current!.resolveExecutionMode("d-1")).toBe("github-actions");
+    expect(seam).toHaveBeenCalledTimes(1);
   });
 });
 

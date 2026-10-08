@@ -190,7 +190,7 @@ export interface KgRefreshProductionInput {
    *  resolved execution path is not GitHub Actions; the GHA path is dispatched by this
    *  module so it can request `return_run_details`. */
   dispatchKgRefreshRun: LegacyDispatch;
-  /** Overrides `resolveKgExecutionMode` for the dispatch. A test seam: it keeps the GitHub Actions branch exercisable until AII-1110 decides when GHA is used. */
+  /** Overrides `resolveKgExecutionMode` for the dispatch. A test seam: the workflow's `resolveExecutionMode` dependency calls it. */
   resolveExecutionMode?: () => string;
   /** Probes the KG source repo's dispatch workflow for `run_publication_token` support. Defaults to `resolveWorkflowCapabilities`. */
   resolveWorkflowCapabilities?: typeof resolveWorkflowCapabilities;
@@ -238,20 +238,21 @@ export function findKgMapping(kgSourceRepo: string) {
   return Object.entries(getMappings()).find(([, m]) => `${m.owner}/${m.repo}` === kgSourceRepo);
 }
 
-/** The execution mode a kg-refresh dispatch resolves to: Fly in every runner mode except `local`
- *  (local Docker). Without a Fly sessions app `createKgRefreshDispatch` rejects with its own "not configured"
- *  message (the run ends `dispatch_rejected`); the GitHub Actions fallback is AII-1110. `createKgRefreshDispatch` acts on it and
- *  `appendJobLog` records it, so both read one answer. */
-export function resolveKgExecutionMode(): string {
-  return getRunnerMode().mode === "local" ? "local-docker" : "fly-machines";
+/** The backend a kg-refresh run uses, resolved one time by the workflow's `reserve` step (the journaled result is the record).
+ *  `local` is local Docker and `gha` is GitHub Actions. Every other mode uses Fly when it is configured, else GitHub Actions
+ *  (retrying cannot configure Fly). `shadow` stays on one backend: two concurrent ingests race to push the same snapshot commit. */
+export function resolveKgExecutionMode(fly: Pick<AppConfig, "flySessionsToken" | "flySessionsApp">): string {
+  const mode = getRunnerMode().mode;
+  if (mode === "local") return "local-docker";
+  if (mode === "gha") return GHA_EXECUTION_MODE;
+  return fly.flySessionsToken && fly.flySessionsApp ? "fly-machines" : GHA_EXECUTION_MODE;
 }
 
 /** Builds the GHA-first dispatch the workflow calls inside `ctx.run`. */
 export function createKgRefreshDispatch(input: KgRefreshProductionInput): (dispatch: KgDispatchInput) => Promise<KgDispatchResult> {
   const { config } = input;
   const repo = parseKgSourceRepo(input.kgSourceRepo);
-  return async ({ runConfig, tokens, issueIdentifier, dispatchId, machine, machineId }) => {
-    const executionMode = (input.resolveExecutionMode ?? resolveKgExecutionMode)();
+  return async ({ runConfig, tokens, issueIdentifier, dispatchId, machine, machineId, executionMode }) => {
     const mapping = findKgMapping(input.kgSourceRepo)?.[1];
     const envelope: RunConfigV1 = {
       v: 1,
@@ -378,9 +379,10 @@ export function createProductionKgRefreshServices(
     },
     dispatch: createKgRefreshDispatch(input),
     // Idempotent on dispatch_id: a replay after a crash between the insert and the journal write reuses the row.
-    appendJobLog: ({ dispatchId }) => {
+    resolveExecutionMode: () => (input.resolveExecutionMode ?? (() => resolveKgExecutionMode(config)))(),
+    appendJobLog: ({ dispatchId, executionMode }) => {
       return appendLogIfAbsent({
-        issueId: "kg-refresh", phase: "kg-refresh", dispatchId, executionMode: resolveKgExecutionMode(),
+        issueId: "kg-refresh", phase: "kg-refresh", dispatchId, executionMode,
         repo: parseKgSourceRepo(input.kgSourceRepo).fullName,
       });
     },
