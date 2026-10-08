@@ -950,6 +950,33 @@ export function writeLiveResult({ artifactsDir, exitCode, source, image, stages 
   writeFileSync(join(artifactsDir, "summary.md"), summarizeResult({ ok: exitCode === 0, mode: "live", source, image, artifactsDir, stages, note }), { mode: 0o600 });
 }
 
+/**
+ * Runs the live harness and always records its result. The harness's own error outranks a dispose
+ * or result-write failure, so a broken summary write never hides why the run failed.
+ */
+export async function finishLiveRun({ runHarness, dispose, writeResult }) {
+  let exitCode = 1;
+  let harnessError;
+  try {
+    exitCode = await runHarness();
+  } catch (error) {
+    harnessError = error;
+  }
+  try {
+    dispose();
+  } catch (error) {
+    harnessError ??= error;
+  }
+  try {
+    writeResult(exitCode);
+  } catch (error) {
+    if (!harnessError) throw error;
+    console.error(`[local:feedback] could not record the live result: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (harnessError) throw harnessError;
+  return exitCode;
+}
+
 async function runLive(options) {
   ensureNode24();
   dockerAvailable();
@@ -977,17 +1004,12 @@ async function runLive(options) {
   console.error(JSON.stringify(stages, null, 2));
   const { deps, dispose } = makeCliDeps({ cliModule, artifactsDir: join(artifactsDir, "run"), logsPath: join(artifactsDir, "runner.log") });
   const imageId = options.image ?? prior.imageId;
-  let exitCode = 1;
-  try {
-    exitCode = await cliModule.runDevHarnessCli(buildDevHarnessArgs({ workspace, task, imageId, agentConfig }), deps);
-  } finally {
-    try {
-      dispose();
-    } finally {
-      // A harness that throws still leaves a failure summary rather than the preflight one.
-      writeLiveResult({ artifactsDir, exitCode, source, image: imageId, stages });
-    }
-  }
+  const exitCode = await finishLiveRun({
+    runHarness: () => cliModule.runDevHarnessCli(buildDevHarnessArgs({ workspace, task, imageId, agentConfig }), deps),
+    dispose,
+    // A harness that throws still leaves a failure summary rather than the preflight one.
+    writeResult: (code) => writeLiveResult({ artifactsDir, exitCode: code, source, image: imageId, stages }),
+  });
   return { ok: exitCode === 0, exitCode, artifactsDir };
 }
 

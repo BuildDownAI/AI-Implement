@@ -15,6 +15,7 @@ const {
   buildDevHarnessArgs,
   buildLocalFeedbackOptions,
   buildSyntheticAgentConfig,
+  finishLiveRun,
   gateMarkerPath,
   parseArgs,
   parseGitHubProjectKey,
@@ -229,6 +230,51 @@ describe("local feedback command helpers", () => {
     expect(summary).toContain("gpt-local-review");
     expect(summary).toContain(`exit code ${exitCode}`);
     expect(JSON.parse(readFileSync(join(artifactsDir, "result.json"), "utf8"))).toEqual({ exitCode, live: true });
+  });
+
+  describe("finishLiveRun", () => {
+    function harness(overrides: { runHarness?: () => Promise<number>; dispose?: () => void; writeResult?: (code: number) => void } = {}) {
+      const events: string[] = [];
+      const written: number[] = [];
+      const run = () => finishLiveRun({
+        runHarness: overrides.runHarness ?? (async () => { events.push("run"); return 0; }),
+        dispose: overrides.dispose ?? (() => { events.push("dispose"); }),
+        writeResult: overrides.writeResult ?? ((code: number) => { events.push("write"); written.push(code); }),
+      });
+      return { run, events, written };
+    }
+
+    it("disposes, then records the harness exit code", async () => {
+      const h = harness({ runHarness: async () => { h.events.push("run"); return 3; } });
+      await expect(h.run()).resolves.toBe(3);
+      expect(h.events).toEqual(["run", "dispose", "write"]);
+      expect(h.written).toEqual([3]);
+    });
+
+    it("records a failure and rethrows when the harness throws", async () => {
+      const h = harness({ runHarness: async () => { throw new Error("harness exploded"); } });
+      await expect(h.run()).rejects.toThrow("harness exploded");
+      expect(h.written).toEqual([1]);
+    });
+
+    it("keeps the harness error when recording the result also fails", async () => {
+      const h = harness({
+        runHarness: async () => { throw new Error("harness exploded"); },
+        writeResult: () => { throw new Error("disk full"); },
+      });
+      await expect(h.run()).rejects.toThrow("harness exploded");
+    });
+
+    it("surfaces a result-write failure after a clean run", async () => {
+      const h = harness({ writeResult: () => { throw new Error("disk full"); } });
+      await expect(h.run()).rejects.toThrow("disk full");
+    });
+
+    it("still records the result when dispose fails, then reports the dispose error", async () => {
+      const h = harness({ dispose: () => { throw new Error("dispose failed"); } });
+      await expect(h.run()).rejects.toThrow("dispose failed");
+      expect(h.written).toEqual([0]);
+    });
   });
 
   it("summarizes redacted result evidence without credential material", () => {
