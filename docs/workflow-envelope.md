@@ -173,7 +173,7 @@ Field notes:
 - **Fail closed.** A present-but-invalid `agentConfig` throws, like `reviewFix`; it never falls back to legacy. Absent means legacy behavior, byte-for-byte unchanged.
 - **Data, not authorization.** Decoding does not re-resolve defaults or check profile permissions. Trusted preparation and dispatch authorization come later. Credential grant values belong only to the protected bootstrap namespace (AII-680), never this field.
 - **Builder.** `buildImplRunConfig` accepts an optional `agentConfig`, validates it and copies it; it never resolves settings.
-- **Not to be confused with** `profiles` (workflow profiles) or `InvokeParams.stage` (a diagnostic label). `InvokeParams.agentStage` (`StageName`) and `invocationTimeoutMs` are new optional fields; `LLMExecutor` and `PlanningExecutor` are unchanged. `RunPlanningLocalOptions` and `LocalFullLoopOptions` gain optional `agentConfig` and async `stageExecutor` inputs, not yet consumed.
+- **Not to be confused with** `profiles` (workflow profiles) or `InvokeParams.stage` (a diagnostic label). `InvokeParams.agentStage` (`StageName`) and `invocationTimeoutMs` are new optional fields; `LLMExecutor` and `PlanningExecutor` are unchanged. `RunPlanningLocalOptions` gains optional `agentConfig` and `configured` inputs, consumed by planning (AII-961, below); `LocalFullLoopOptions` still carries `agentConfig` / `stageExecutor`, not yet consumed.
 
 ### Writer census (no writer sets the field in this wave)
 
@@ -187,19 +187,19 @@ Verified by grep: the only `src/` files mentioning `agentConfig`, `agentStage` o
 | `src/local-gapfill.ts` | `decodeRunConfig` then `encodeRunConfig` | Passes through a present snapshot (re-validated); does not set it |
 | `src/dev-harness/index.ts` | `encodeRunConfig` of a literal | Does not set `agentConfig` |
 | `src/run-autonomous.ts` | `decodeRunConfig` (reader of the envelope) | Does not set it |
-| `src/run-planning.ts` | `decodeRunConfig`; `RunPlanningLocalOptions` gains optional `agentConfig` / `stageExecutor` | Does not set it; new options unconsumed |
+| `src/run-planning.ts` | `decodeRunConfig`; `RunPlanningLocalOptions` gains optional `agentConfig` / `configured` | Does not set it; consumes it through `prepareConfiguredRun` (AII-961) |
 | `src/run-local-planning.ts`, `src/run-local-full-loop.ts` | `decodeRunConfig` of the encoded envelope | Do not set it |
 | `src/local/full-loop.ts` | `LocalFullLoopOptions` gains optional `agentConfig` / `stageExecutor` | Does not set it; new options unconsumed |
 | `src/pipeline/kg-refresh-run.ts` | `decodeRunConfig` | Does not set it |
 
 ### Reader census
 
-`InvokeParams` readers (none reads `agentStage` or `invocationTimeoutMs`; all ignore them today):
+`InvokeParams` readers (the stage executor and planning read `agentStage` / `invocationTimeoutMs` since AII-959/AII-961; the legacy implementation steps still ignore them):
 
 | File | Use |
 |---|---|
 | `src/pipeline/executor.ts` | `ClaudeCliExecutor.invoke` / `spawnOnce` consume existing params only |
-| `src/run-planning.ts` | `PlanningStageExecutor` type takes `InvokeParams`; fields not read |
+| `src/run-planning.ts` | Builds the one planning `InvokeParams` with `agentStage: "planning"` and the snapshot's model and `invocationTimeoutMs` (AII-961) |
 | `src/pipeline/steps/implement.ts`, `feedback-loop.ts`, `review.ts`, `post-push-review.ts` | Build `InvokeParams` for `llmExecutor.invoke`; do not set the new fields |
 | `src/pipeline/context.ts` | No-op default executor; ignores params |
 | `src/run-autonomous.ts`, `src/pipeline/kg-refresh-run.ts`, `src/local/full-loop.ts` | Accept an optional custom `LLMExecutor`; do not inspect params |
@@ -273,6 +273,16 @@ An absent namespace decodes as the legacy envelope. No writer sets it in this sl
 - **Precedence:** a configured run's context `model`/`provider` come from the implementation stage selection, overriding `WORKFLOW.md`, `opts.model`, `CLAUDE_MODEL` and `PROVIDER`. Legacy precedence is unchanged.
 - **Cleanup:** after teardown the run calls `finish("completed" | "failed")`, which finishes each `ready` profile and disposes the client. If any invocation raised a recovery-required, possibly-live-child or uncertain-checkpoint error, or a profile is not `ready`, nothing is finished or disposed: ownership and credential state are retained (backend release stays with the managed-dispatch owner contract, AII-958).
 - **KG:** the kg-refresh pipeline has no agent step and ingest is deterministic (zero model calls). A configured envelope that fails to decode throws instead of using the environment fallbacks; only the context executor is wrapped. An envelope with no snapshot/grant signal keeps the warn-and-continue behaviour.
+
+### Planning runner use of the stage snapshot (AII-961)
+
+`run-planning.ts` reuses the same `prepareConfiguredRun` (no second resolver): `runPlanning` (managed) calls it with the process env and the envelope's `agentConfig`, `runPlanningLocally` with `env: {}` and `opts.agentConfig` / `opts.configured`. A configured run then calls `configured.createExecutor({ legacy: guardedClaudeExecutor })` and invokes it once with `agentStage: "planning"`, `stage: "plan"`, the snapshot's model and `invocationTimeoutMs`; `CLAUDE_MODEL`, `opts.model` and the `PLANNING.md` model are not consulted. The `PLANNING.md` body, `${PARENT}/${SIBLINGS}/${DEPENDENCIES}` substitution and envelope `planningContext` still build the prompt.
+
+- **Production entry takes no options.** `runPlanning()` finds its snapshot and protected grant in the envelope and its dispatch context in `AI_IMPLEMENT_MODEL_AUTH_*`. A snapshot with no grant is `bootstrap_missing`; a grant with no snapshot is `snapshot_incomplete`. The local default entry has no credential source, so a snapshot there fails closed (`bootstrap_missing`) until the caller passes `configured.localCredentialPort` (and, for a subscription profile, a trust source).
+- **Invalid configured intent is judged first.** A present envelope that shows configured intent (`agentConfig` or `credentials.modelAuthGrant`) but does not decode reports `Configured planning failed (invalid_snapshot)` through the normal result callback, before any `ISSUE_*` env lookup, prompt, write-policy, auth or model work, and never uses the legacy executor. A malformed envelope with no such signal keeps the legacy env fallback.
+- **Claude write policy is preserved.** The guarded `ClaudeCliExecutor` (trusted `--tools Read,Glob,Grep,Write`, `--settings` hook inserted before `-p`) is the `legacy` handed to `createExecutor`, which uses it for Claude stages; the policy directory is removed in a `finally`. Codex planning uses its native driver and receives no Claude flags or policy.
+- **Lifecycle ownership.** Managed planning owns the client: after the executor returns (child stopped) it calls `finish("completed" | "failed")`, which holds instead when a child may be live or a checkpoint is uncertain. `runPlanningLocally` finishes a client it built from a credential port; an injected `configured.modelAuthClient` stays with the caller.
+- **Safe failures.** Only a bounded category reaches `failureReason` / `diagnostics` (`Configured planning failed (<category>)`); there is one invocation and no retry on another profile. Success still requires a readable Markdown file under `ai-output/comments`.
 
 ### Verifying masking in real Actions logs (AII-984)
 

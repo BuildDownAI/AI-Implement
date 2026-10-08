@@ -1,11 +1,17 @@
 import { runPlanningLocally } from "./run-planning.js";
 import { decodeRunConfig } from "./run-config.js";
+import type { ConfiguredRunOptions } from "./run-autonomous.js";
 import { prepareScratchExclusionIfGit } from "./pipeline/scratch-exclude.js";
 
 export interface LocalPlanningRunnerDependencies {
   runPlanning: typeof runPlanningLocally;
   writeStdout: (text: string) => void;
   writeStderr: (text: string) => void;
+  /**
+   * Local configured-run sources for the shared `prepareConfiguredRun`. The default dependencies supply none, so a
+   * snapshot reaching the default entry fails closed (`bootstrap_missing`) rather than running on legacy credentials.
+   */
+  configured?: ConfiguredRunOptions;
 }
 
 const DEFAULT_DEPENDENCIES: LocalPlanningRunnerDependencies = {
@@ -31,6 +37,11 @@ export async function runLocalPlanningFromEnv(
     issueTitle: config.issue.title,
     issueDescription: config.issue.description,
     model: env.CLAUDE_MODEL,
+    ...(config.planningContext?.parent !== undefined ? { parent: config.planningContext.parent } : {}),
+    ...(config.planningContext?.siblings !== undefined ? { siblings: config.planningContext.siblings } : {}),
+    ...(config.planningContext?.dependencies !== undefined ? { dependencies: config.planningContext.dependencies } : {}),
+    ...(config.agentConfig ? { agentConfig: config.agentConfig } : {}),
+    ...(deps.configured ? { configured: deps.configured } : {}),
   });
 
   if (result.exitCode !== 0) {
