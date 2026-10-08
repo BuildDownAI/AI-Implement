@@ -32,6 +32,7 @@ import { REVIEWER_VERDICT_SCHEMA, resolveTrustedReviewer, type ReviewerDefinitio
 import { isChecksPermissionError } from "../../checks-permission.js";
 import { inferTestResults, sumUsage, toolTraceLines, writeCycleSummary, type CycleDisposition } from "../cycle-summary.js";
 import { DEFAULT_MODEL } from "../default-model.js";
+import { safeLimitLabel } from "../stage-executor.js";
 
 interface PostPushReviewInputs extends Record<string, unknown> {
   prNumber: string;
@@ -1499,6 +1500,8 @@ async function runSelectedInternalReviewers(params: {
   let firstTerminationReason: PostPushReviewTerminationReason | undefined;
   let priorLlmFailure = false;
 
+  const reviewSelection = params.context.data.agentConfig?.stages.review;
+  const isTimeBudget = reviewSelection?.agent === "codex";
   for (const [reviewerIndex, reviewer] of params.reviewers.entries()) {
     const { selection, definition, legacy, provenance } = reviewer;
     const reviewerId = selection.id;
@@ -1506,6 +1509,9 @@ async function runSelectedInternalReviewers(params: {
     const reportId = reviewerReportId(params.iteration, reviewerIndex, reviewer);
     const stage = reviewerStage(params.iteration, reviewerIndex, reviewer);
     const maxTurns = selectionMaxTurns(selection) ?? definition.maxTurns ?? params.retryPolicy.reviewMaxTurns;
+    const reviewBudgetLabel = reviewSelection?.agent === "codex"
+      ? safeLimitLabel({ kind: "timeout_ms", value: reviewSelection.invocationTimeoutMs })
+      : `${maxTurns} turns`;
     const reportInputs = legacy
       ? { iteration: params.iteration, prNumber: params.prNumber, maxTurns }
       : { iteration: params.iteration, prNumber: params.prNumber, reviewerId, reviewerProvenance: provenance ?? "trusted", gates: reviewerGates(selection, provenance), maxTurns };
@@ -1554,7 +1560,9 @@ async function runSelectedInternalReviewers(params: {
         diff: params.diff,
         previousFindings: params.previousFindings,
       });
-      prompt += `\n\nYou have a maximum of ${maxTurns} turns for this review. Reserve your final turn for the structured report. Prioritize the required checks, and identify any unverified areas honestly in checks[].`;
+      prompt += isTimeBudget
+        ? `\n\nYou have a time budget of ${reviewBudgetLabel.replace(/^timeout /, "")} for this review. Finish within the time budget and reserve time for the structured report. Prioritize the required checks, and identify any unverified areas honestly in checks[].`
+        : `\n\nYou have a maximum of ${reviewBudgetLabel} for this review. Reserve your final turn for the structured report. Prioritize the required checks, and identify any unverified areas honestly in checks[].`;
     } catch (err) {
       if (err instanceof OperatorCancelledError || err instanceof PrMergedError) throw err;
       const feedback = compactErrorMessage(`Reviewer ${label} could not build its prompt: ${err instanceof Error ? err.message : String(err)}`);
@@ -1571,6 +1579,7 @@ async function runSelectedInternalReviewers(params: {
       ...READ_ONLY_TOOL_PARAMS,
       jsonSchema: definition.outputSchema,
       stage,
+      agentStage: "review",
       expectsStructuredOutput: true,
     });
     let reviewResult: LLMResult;
@@ -1652,7 +1661,10 @@ async function runSelectedInternalReviewers(params: {
       const partialReport = partialVerdict
         ? `\n\n${reviewerEvidenceReport(label, partialVerdict, true)}`
         : "\n\nNo usable partial structured review evidence was returned before the cap.";
-      const feedback = `${label} ran out of turns at the configured cap (${maxTurns}). ${summaryLine(reviewResult.telemetry)}${partialReport}`;
+      const capMessage = isTimeBudget
+        ? `ran out of its time budget at the configured cap (${reviewBudgetLabel})`
+        : `ran out of turns at the configured cap (${maxTurns})`;
+      const feedback = `${label} ${capMessage}. ${summaryLine(reviewResult.telemetry)}${partialReport}`;
       if (reviewerGates(selection, provenance) && !firstTerminationReason) firstTerminationReason = "reviewer_turns_exhausted";
       await reportIncompleteFailure(
         feedback,
@@ -1668,7 +1680,10 @@ async function runSelectedInternalReviewers(params: {
     if (reviewFailure) {
       const failure = classifyLlmResult(reviewResult, { stage, attempt: reviewResult.attempts ?? 1, expectsStructuredOutput: true, elapsedMs: reviewResult.telemetry?.durationMs ?? undefined });
       const telemetryPart = reviewResult.telemetry ? summaryLine(reviewResult.telemetry) : "no telemetry reported";
-      const feedback = compactErrorMessage(`Reviewer ${label} failed: ${reviewFailure} (${telemetryPart}; ${failure.category}/${failure.code})`);
+      const timedOut = isTimeBudget && reviewResult.failure?.code === "INVOCATION_TIMEOUT";
+      const feedback = compactErrorMessage(timedOut
+        ? `Reviewer ${label} ran out of its time budget (${reviewBudgetLabel}): ${reviewFailure} (${telemetryPart}; ${failure.category}/${failure.code})`
+        : `Reviewer ${label} failed: ${reviewFailure} (${telemetryPart}; ${failure.category}/${failure.code})`);
       if (reviewerGates(selection, provenance) && !firstTerminationReason) firstTerminationReason = "review_failed";
       priorLlmFailure ||= reviewerGates(selection, provenance);
       await reportIncompleteFailure(feedback, reviewResult.telemetry, { failure }, reviewStartedAt, reviewEndedAt);
@@ -2390,6 +2405,7 @@ ${externalFindingsFixBlock}
         model,
         maxTurns: FIX_MAX_TURNS,
         stage: `post-push-review/fix-${iteration}`,
+        agentStage: "implementation",
         expectsStructuredOutput: false,
       });
       costUsd = addExtraCost(costUsd, fixResult.telemetry?.costUsd);
