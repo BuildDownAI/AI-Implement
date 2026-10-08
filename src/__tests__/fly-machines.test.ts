@@ -1164,7 +1164,6 @@ describe("buildSessionMachineConfig — protected model bootstrap (AII-500)", ()
   const S_ANTHROPIC = "SENTINEL-anthropic-key-0001";
   const S_OAUTH = "SENTINEL-oauth-token-0002";
   const S_BEARER = "SENTINELbearer0123456789abcdefghijklmnop";
-  const S_SESSION = "SENTINEL-session-state-0003";
   const protectionKey = crypto.randomBytes(32);
 
   const baseInput: SessionMachineInput = {
@@ -1238,7 +1237,7 @@ describe("buildSessionMachineConfig — protected model bootstrap (AII-500)", ()
     expect(buildSessionMachineConfig(protectedInput({ minSecretsVersion: 2 })).min_secrets_version).toBe(7);
   });
 
-  it("never serializes raw credentials, bearer, session data or the protection key", () => {
+  it("never serializes raw credentials, bearer or the protection key", () => {
     const combos: Partial<SessionMachineInput>[] = [
       {},
       { teamKey: "eng", teamSecretNames: ["ENG_DB", "OPS_X", "GLOBAL"], allTeamKeys: ["eng", "ops"] },
@@ -1252,7 +1251,6 @@ describe("buildSessionMachineConfig — protected model bootstrap (AII-500)", ()
         S_ANTHROPIC,
         S_OAUTH,
         S_BEARER,
-        S_SESSION,
         protectionKey.toString("base64"),
         protectionKey.toString("base64url"),
         protectionKey.toString("hex"),
