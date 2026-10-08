@@ -1561,7 +1561,7 @@ async function runSelectedInternalReviewers(params: {
         previousFindings: params.previousFindings,
       });
       prompt += isTimeBudget
-        ? `\n\nYou have a time budget of ${reviewBudgetLabel.replace(/^timeout /, "")} for this review. Finish within the time budget and reserve time for the structured report. Prioritize`
+        ? `\n\nYou have a time budget of ${reviewBudgetLabel.replace(/^timeout /, "")} for this review. Finish within the time budget and reserve time for the structured report. Prioritize the required checks, and identify any unverified areas honestly in checks[].`
         : `\n\nYou have a maximum of ${reviewBudgetLabel} for this review. Reserve your final turn for the structured report. Prioritize the required checks, and identify any unverified areas honestly in checks[].`;
     } catch (err) {
       if (err instanceof OperatorCancelledError || err instanceof PrMergedError) throw err;

@@ -334,6 +334,7 @@ describe("postPushReviewStep", () => {
       await run(makeCtx(invokeCodex, { agentConfig: codex }), 1);
       const codexPrompt = (invokeCodex.mock.calls[0] as any[])[0].prompt as string;
       expect(codexPrompt).toContain("time budget of 90s for this review");
+      expect(codexPrompt).toContain("identify any unverified areas honestly in checks[].");
       expect(codexPrompt).not.toMatch(/maximum of \d+ turns/);
       expect(codexPrompt).not.toContain("final turn");
 
