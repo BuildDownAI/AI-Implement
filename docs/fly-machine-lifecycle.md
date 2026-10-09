@@ -73,9 +73,11 @@ sequenceDiagram
 
 The `attach` for a replacement carries `replaces` (the destroyed machine's id), so the object accepts it at attempt 1; without it the attempt rule would refuse the swap and the new machine would run unrecorded and unreleased.
 
-The step keeps `maxRetryAttempts: 3`. The reconcile read makes a retry after a lost ack safe. A lost ack after a `create` that had no kept machine to reconcile against creates a second machine; the first is left with no `durable_until` until the object records one (see Gaps).
+`updateMachine` makes Fly replace the instance, so the dispatch does not `start` straight after it. It waits (Fly's `/wait?instance_id=<the update's instance_id>&state=stopped`, bounded at 60 s) for the replaced instance to reach `stopped`, then starts. Before the `update`, a machine still `replacing`, `starting` or `stopping` is polled until it is `stopped` or `started`. A 409 `concurrent update in progress` / `machine is replacing` on `update`, or a 412 `machine getting replaced` on `start`, waits the same way and repeats that call once inside the attempt; a window that outlasts the bound throws and the step retries. Fly event evidence, 2026-10-09 21:05Z: `update`/`replacing` 21:05:24.07Z, replaced instance `stopped` 21:05:25.21Z, `start` refused 412, the retry's `update` 21:05:25.38Z, 409. An `update` also resets the machine's event history, so the events do not name earlier updates.
 
-The log line is `[kg-refresh] dispatched via Fly (reused machine <id>)` or `(created machine <id>)`; `get_session_machine` shows the metadata.
+The step keeps `maxRetryAttempts: 3`, with a 3 s initial delay that doubles (`DISPATCH_RETRY_INITIAL_INTERVAL`), so retries can outlast a replace window. The reconcile read makes a retry after a lost ack safe. A lost ack after a `create` that had no kept machine to reconcile against creates a second machine; the first is left with no `durable_until` until the object records one (see Gaps).
+
+The log line is `[kg-refresh] dispatched via Fly (reused machine <id>)` or `(created machine <id>)`, followed by `(waited <n> s for the replace)` when the launch waited at least a second; `get_session_machine` shows the metadata.
 
 ### Step names carry the attempt
 

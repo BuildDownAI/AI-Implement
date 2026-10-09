@@ -29,6 +29,7 @@ import { FLY_MACHINE_PROFILE_DEFAULTS, createFlyMachineProfile, mergeProfile, ty
 import { createKgRepo, type KgRepoTriggerResult } from "../../restate/kg-repo.js";
 import {
   createKgRefreshWorkflow,
+  DISPATCH_RETRY_INITIAL_INTERVAL,
   type KgDispatchInput,
   type KgRefreshWorkflowDependencies,
   type KgDispatchRecord,
@@ -296,6 +297,7 @@ describe("KgRefresh durable workflow", () => {
   const recordedDetails: Array<{ dispatchId: string; details: KgDispatchRowDetails }> = [];
   const armedNonces: Array<{ dispatchId: string; attempt: number; nonce: string }> = [];
   const dispatchedNonces: Array<string | null> = [];
+  const dispatchTimes = new Map<string, number[]>();
   const dispatchResults: KgDispatchResult[] = [];
   /** A recognizable stand-in for the HMAC derivation; the test proves it never reaches the journal. */
   const fakeNonce = (dispatchId: string, attempt: number) => `derived-nonce-${dispatchId}-${attempt}`;
@@ -405,6 +407,7 @@ describe("KgRefresh durable workflow", () => {
     dispatchedMachines.push(input.machine);
     dispatchedTokens.push(input.tokens);
     dispatchedNonces.push(input.machineNonce);
+    dispatchTimes.set(triggerId, [...(dispatchTimes.get(triggerId) ?? []), Date.now()]);
     if (dispatchThrowOnce.delete(triggerId)) throw new Error("dispatch failed before commit");
     const committedRunId = dispatchThrowAfterCommit.get(triggerId);
     if (committedRunId !== undefined) {
@@ -1316,6 +1319,21 @@ describe("KgRefresh durable workflow", () => {
       const names = await journalEntryNames(env.adminAPIBaseUrl(), await runInvocationId(env, triggerId));
       expect(names.filter((n) => n === "envelope")).toHaveLength(1);
     }, 30_000);
+
+    it.each(VARIANTS.map(([label]) => label))("a failed dispatch attempt is retried no sooner than the initial delay (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      const scenario = makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+      dispatchThrowOnce.add(triggerId);
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      await eventually(() => scenario.dispatchCalls >= 2, (ok) => ok, { label: "dispatch retry", timeoutMs: 20_000 });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      await done;
+      const [first, second] = dispatchTimes.get(triggerId)!;
+      expect(DISPATCH_RETRY_INITIAL_INTERVAL.seconds).toBeGreaterThan(0);
+      // Small allowance for timer granularity between the failure and the recorded start.
+      expect(second - first).toBeGreaterThanOrEqual(DISPATCH_RETRY_INITIAL_INTERVAL.seconds * 1000 - 200);
+    }, 40_000);
 
     it.each(VARIANTS.map(([label]) => label))("a local-docker run arms a nonce too (%s)", async (label) => {
       const env = envFor(label);
@@ -2938,6 +2956,10 @@ describe("KgRefresh durable workflow", () => {
         this.machines.get(id)!.config = config;
         this.calls.push(`update:${id}`);
       }
+      async waitSettled(id: string): Promise<Machine | null> {
+        return this.machines.has(id) ? this.getMachine(id) : null;
+      }
+      async waitForStopped(): Promise<void> {}
       async startMachine(id: string): Promise<void> {
         this.machines.get(id)!.state = "started";
         this.calls.push(`start:${id}`);

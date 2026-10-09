@@ -31,7 +31,7 @@ import { getRunnerMode, getKgFlyMachineOverride, setKgFlyMachineOverride, type K
 import { mintRunToken } from "../runner-tokens.js";
 import type { JobStatus } from "../log.js";
 import { appendLogIfAbsent, findLogIdByDispatchId, setJobMachineId, setJobMachineNonce, updateJobPrUrl, updateJobRunId } from "../log.js";
-import { clearMachineEnv, createMachine, destroyMachine, getMachine, startMachine, updateMachine, type CreateMachineOpts, type Machine, type MachineConfig } from "../fly-machines.js";
+import { clearMachineEnv, createMachine, destroyMachine, getMachine, startMachine, updateMachine, waitForMachine, waitForMachineSettled, type CreateMachineOpts, type Machine, type MachineConfig } from "../fly-machines.js";
 import type { RestateService } from "./endpoint.js";
 import {
   createKgRefreshWorkflow,
@@ -81,7 +81,15 @@ export interface KeptMachineFly {
   createMachine(config: CreateMachineOpts): Promise<Machine>;
   updateMachine(id: string, config: MachineConfig): Promise<unknown>;
   startMachine(id: string): Promise<void>;
+  /** Polls until the machine is `stopped`, `started` or gone; null when gone. Throws past `timeoutMs`. */
+  waitSettled(id: string, timeoutMs: number): Promise<Machine | null>;
+  /** Fly's `/wait` for the given instance (the one an `update` answered with) to reach `stopped`. */
+  waitForStopped(id: string, instanceId: string, timeoutSeconds: number): Promise<void>;
 }
+
+/** Bound on each wait for a settled machine or a finished replace. */
+export const KEPT_MACHINE_SETTLE_MS = 60_000;
+const UNSETTLED_STATES = new Set(["replacing", "starting", "stopping", "created"]);
 
 export function bindKeptMachineFly(token: string, app: string): KeptMachineFly {
   return {
@@ -89,8 +97,13 @@ export function bindKeptMachineFly(token: string, app: string): KeptMachineFly {
     createMachine: (config) => createMachine(token, app, config),
     updateMachine: (id, config) => updateMachine(token, app, id, config),
     startMachine: (id) => startMachine(token, app, id),
+    waitSettled: (id, timeoutMs) => waitForMachineSettled(token, app, id, { timeoutMs, until: ["stopped", "started", "suspended", "destroyed"] }),
+    waitForStopped: (id, instanceId, timeoutSeconds) => waitForMachine(token, app, id, "stopped", timeoutSeconds, instanceId),
   };
 }
+
+const isReplaceWindow = (err: unknown, status: number, text: RegExp): boolean =>
+  err instanceof Error && err.message.includes(`(${status})`) && text.test(err.message);
 
 const isFlyNotFound = (err: unknown): boolean => err instanceof Error && /\(404\)/.test(err.message);
 
@@ -98,15 +111,18 @@ const isFlyNotFound = (err: unknown): boolean => err instanceof Error && /\(404\
  * The dispatch step's Fly write for a kept machine (AII-1136). With no kept machine id it creates one.
  * With one it reconciles first: `started` for this dispatch means an earlier try of the step already ran
  * (return it, no second `update`, which would reboot it); `started` for another dispatch means the hold is
- * wrong (throw); `destroyed` or 404 falls back to create; anything else is `update` then `start`. A lookup
- * error throws so the step retries. `machineNonce` is the one the new config carries, or, for an
+ * wrong (throw); `destroyed` or 404 falls back to create; anything else is `update` then `start`. A machine
+ * still replacing, starting or stopping is waited out first (bounded). `update` makes Fly replace the instance, so
+ * the launch waits for the replacement to reach `stopped` before `start`, and repeats a call Fly refused inside the
+ * replace window once (409 on `update`, 412 on `start`). A lookup error, or a window that outlasts the bound,
+ * throws so the step retries. `machineNonce` is the one the new config carries, or, for an
  * already-dispatched machine, the one read back from its env.
  */
 export async function launchKeptMachine(
   fly: KeptMachineFly,
-  opts: { keptMachineId: string | null; dispatchId: string; machineConfig: CreateMachineOpts; machineNonce: string },
-): Promise<{ machineId: string; machineNonce: string; created: boolean; reused: boolean; replaced?: string }> {
-  const { keptMachineId, dispatchId, machineConfig, machineNonce } = opts;
+  opts: { keptMachineId: string | null; dispatchId: string; machineConfig: CreateMachineOpts; machineNonce: string; settleMs?: number },
+): Promise<{ machineId: string; machineNonce: string; created: boolean; reused: boolean; replaced?: string; waitedSeconds?: number }> {
+  const { keptMachineId, dispatchId, machineConfig, machineNonce, settleMs = KEPT_MACHINE_SETTLE_MS } = opts;
   const create = async (replaced?: string) => {
     const machine = await fly.createMachine(machineConfig);
     return { machineId: machine.id, machineNonce, created: true, reused: false, ...(replaced !== undefined && { replaced }) };
@@ -121,6 +137,19 @@ export async function launchKeptMachine(
     console.log(`[kg-refresh] kept machine ${keptMachineId} is gone (404); creating a new one`);
     return create(keptMachineId);
   }
+  let waitedMs = 0;
+  const timed = async <T>(work: Promise<T>): Promise<T> => {
+    const t0 = Date.now();
+    try { return await work; } finally { waitedMs += Date.now() - t0; }
+  };
+  if (UNSETTLED_STATES.has(existing.state)) {
+    const settled = await timed(fly.waitSettled(keptMachineId, settleMs));
+    if (settled === null) {
+      console.log(`[kg-refresh] kept machine ${keptMachineId} is gone (404); creating a new one`);
+      return create(keptMachineId);
+    }
+    existing = settled;
+  }
   if (existing.state === "destroyed") {
     console.log(`[kg-refresh] kept machine ${keptMachineId} is destroyed; creating a new one`);
     return create(keptMachineId);
@@ -131,9 +160,28 @@ export async function launchKeptMachine(
     }
     throw new Error(`kept machine ${keptMachineId} is started for another dispatch; the hold is wrong`);
   }
-  await fly.updateMachine(keptMachineId, machineConfig.config);
-  await fly.startMachine(keptMachineId);
-  return { machineId: keptMachineId, machineNonce, created: false, reused: true };
+  let updated: unknown;
+  try {
+    updated = await fly.updateMachine(keptMachineId, machineConfig.config);
+  } catch (err) {
+    if (!isReplaceWindow(err, 409, /concurrent update in progress|machine is replacing/i)) throw err;
+    // An earlier update is still applying: wait it out, then update once more.
+    await timed(fly.waitSettled(keptMachineId, settleMs));
+    updated = await fly.updateMachine(keptMachineId, machineConfig.config);
+  }
+  const instanceId = (updated as { instance_id?: unknown } | null | undefined)?.instance_id;
+  if (typeof instanceId === "string" && instanceId !== "") {
+    await timed(fly.waitForStopped(keptMachineId, instanceId, Math.ceil(settleMs / 1000)));
+  }
+  try {
+    await fly.startMachine(keptMachineId);
+  } catch (err) {
+    if (!isReplaceWindow(err, 412, /replac/i)) throw err;
+    await timed(fly.waitSettled(keptMachineId, settleMs));
+    await fly.startMachine(keptMachineId);
+  }
+  const waitedSeconds = Math.round(waitedMs / 1000);
+  return { machineId: keptMachineId, machineNonce, created: false, reused: true, ...(waitedSeconds > 0 && { waitedSeconds }) };
 }
 
 /** The machine nonce for one attempt: HMAC-SHA256 of `${dispatchId}:${attempt}` under the token secret, 32 hex characters

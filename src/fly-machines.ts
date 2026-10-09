@@ -68,6 +68,8 @@ export interface Machine {
   id: string;
   name: string;
   state: string;
+  /** The current VM instance; an `update` answers with the new one (the replace target). */
+  instance_id?: string;
   region: string;
   created_at: string;
   updated_at: string;
@@ -218,6 +220,8 @@ export async function updateMachine(
 export interface SettleOptions {
   timeoutMs?: number;
   intervalMs?: number;
+  /** Accepted end states. Default: any state but `replacing`. */
+  until?: readonly string[];
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
@@ -231,7 +235,7 @@ export async function waitForMachineSettled(
   token: string,
   appName: string,
   machineId: string,
-  { timeoutMs = 60_000, intervalMs = 1_000 }: SettleOptions = {},
+  { timeoutMs = 60_000, intervalMs = 1_000, until }: SettleOptions = {},
 ): Promise<Machine | null> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
@@ -242,9 +246,9 @@ export async function waitForMachineSettled(
       if (err instanceof FlyApiError && err.status === 404) return null;
       throw err;
     }
-    if (machine.state !== "replacing") return machine;
+    if (until ? until.includes(machine.state) : machine.state !== "replacing") return machine;
     if (Date.now() + intervalMs > deadline) {
-      throw new Error(`Timeout waiting for machine ${machineId} to leave "replacing" (state=${machine.state})`);
+      throw new Error(`Timeout waiting for machine ${machineId} to settle (state=${machine.state})`);
     }
     await sleep(intervalMs);
   }
@@ -376,8 +380,10 @@ export async function waitForMachine(
   machineId: string,
   state: string,
   timeoutSeconds = 60,
+  instanceId?: string,
 ): Promise<void> {
-  const url = `${FLY_API_BASE}/apps/${appName}/machines/${machineId}/wait?state=${state}&timeout=${timeoutSeconds}`;
+  const instance = instanceId ? `instance_id=${encodeURIComponent(instanceId)}&` : "";
+  const url = `${FLY_API_BASE}/apps/${appName}/machines/${machineId}/wait?${instance}state=${state}&timeout=${timeoutSeconds}`;
   const res = await fetch(url, { headers: flyHeaders(token) });
 
   if (!res.ok) {

@@ -40,6 +40,8 @@ function makeFly() {
     createMachine: vi.fn(async (c: CreateMachineOpts) => { created.push(c); return { id: "m-new" } as unknown as Machine; }),
     updateMachine: vi.fn(async () => ({})),
     startMachine: vi.fn(async () => {}),
+    waitSettled: vi.fn(async (id: string) => ({ id, state: "stopped" }) as unknown as Machine),
+    waitForStopped: vi.fn(async () => {}),
   };
   return { fly, created };
 }

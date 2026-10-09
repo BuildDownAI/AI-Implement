@@ -59,6 +59,9 @@ export const KG_REFRESH_WATCH_INTERVAL_MS = 60 * 1000;
 
 const GHA_EXECUTION_MODE = "github-actions";
 
+/** First wait between dispatch-step attempts; doubles. Fly's replace window after an `update` lasts seconds (AII-1192). */
+export const DISPATCH_RETRY_INITIAL_INTERVAL = { seconds: 3 };
+
 /** The PR a dry-run reports back to — the wire shape of `KgDryRunReportTarget` (`src/kg-refresh.ts`), `acceptBaseline` included so it is not stripped. */
 export const kgDryRunReportSchema = z.object({
   repo: z.string(),
@@ -399,7 +402,8 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
             ...(result.replaced !== undefined && { replaced: result.replaced }),
           };
         },
-        { maxRetryAttempts: 3 },
+        // Spaced so the retries can outlast a Fly replace window (AII-1192): 3 s, then 6 s.
+        { maxRetryAttempts: 3, initialRetryInterval: DISPATCH_RETRY_INITIAL_INTERVAL, retryIntervalFactor: 2 },
       );
 
       // One-way and idempotent in the object; a replay after a crash here sends it again.
