@@ -27,7 +27,7 @@ export const PAGE_ROUTES: Record<string, readonly string[]> = {
   jobs: ["/api/log"],
   pulls: ["/api/pulls"],
   blockers: ["/api/blockers"],
-  reports: ["/api/report"],
+  reports: ["/api/report", "/api/log"],  // /api/log feeds the Agent attribution card
   pipelines: ["/api/pipelines-steps"],
   sessions: ["/api/sessions"],
   reaper: ["/api/reaper/recent", "/api/reaper/summary"],

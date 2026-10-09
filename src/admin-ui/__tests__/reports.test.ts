@@ -17,6 +17,9 @@ describe("reports page", () => {
       "reports-runaways-body",
       "reports-runaways-empty",
       "reports-attr-body",
+      "reports-attr-count",
+      "reports-attr-empty",
+      "reports-attr-note",
     ]) {
       expect(reportsHtml).toContain(`id="${id}"`);
     }
@@ -222,6 +225,25 @@ describe("reports page render", () => {
       win["api"] = async (u: string) => (u.startsWith("/api/log") ? { ok: false, status: 403, json: async () => ({}) } : api(u));
       await win.loadReports();
       expect(doc.getElementById("reports-attr-note")!.textContent).toContain("403");
+    });
+
+    it("shows the job count and hides the empty notice once a refused read follows an empty one", async () => {
+      const { win, doc } = mountPage(baseReport, []);
+      await win.loadReports();
+      const empty = doc.getElementById("reports-attr-empty")!;
+      expect(empty.classList.contains("hidden")).toBe(false);
+      expect(doc.getElementById("reports-attr-count")!.textContent).toBe("(0 jobs)");
+      const api = win["api"] as (u: string) => Promise<unknown>;
+      win["api"] = async (u: string) => (u.startsWith("/api/log") ? { ok: false, status: 403, json: async () => ({}) } : api(u));
+      await win.loadReports();
+      expect(empty.classList.contains("hidden")).toBe(true);
+      expect(doc.getElementById("reports-attr-note")!.classList.contains("hidden")).toBe(false);
+    });
+
+    it("shows the job count for a populated read", async () => {
+      const { win, doc } = mountPage(baseReport, [job("A-1", attr({})), job("A-2", attr({}))]);
+      await win.loadReports();
+      expect(doc.getElementById("reports-attr-count")!.textContent).toBe("(2 jobs)");
     });
   });
 });

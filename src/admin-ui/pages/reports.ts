@@ -138,6 +138,7 @@ export const reportsScript = `
     const countEl = document.getElementById('reports-attr-count');
     body.innerHTML = '';
     noteEl.classList.add('hidden');
+    empty.classList.add('hidden');
     if (note) {
       noteEl.textContent = note;
       noteEl.classList.remove('hidden');
