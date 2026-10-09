@@ -1,4 +1,5 @@
 import { getDb } from "./dedup.js";
+import { read as readAdmission } from "./dispatch-admission.js";
 
 // ---- Types ----
 
@@ -12,6 +13,8 @@ export interface RunEntry {
   terminationReason: string | null;
   costUsd: number | null;
   maxTurnsHits: number;
+  /** The Restate workflow/object this run is keyed by, the lookup key for `GET /api/restate/journal?service=<service>&key=<key>` (endpoint added by AII-1128); null when not Restate-owned. */
+  restate: { service: "KgRefresh" | "PlanningRun" | "ReviewFixAttempt"; key: string } | null;
 }
 
 export interface IssueReportCard {
@@ -80,6 +83,7 @@ interface DispatchRow {
   status: string;
   conclusion: string | null;
   pr_url: string | null;
+  dispatch_id: string | null;
 }
 
 interface FeedbackLoopOutputs {
@@ -247,6 +251,25 @@ function derivedStatsForJob(db: Db, jobId: number): DerivedRunStats {
   return { ...base, costUsd: addCost(base.costUsd, extraCostUsd(db, jobId)) };
 }
 
+// ---- Restate lookup key ----
+
+/** Same rule as `isRestateOwnedJob` in index.ts (copied: this module must not import it). */
+function isRestateOwned(dispatchId: string): boolean {
+  try {
+    return readAdmission(dispatchId)?.lifecycleOwner.kind === "restate";
+  } catch {
+    return false; // admissions table absent
+  }
+}
+
+function restateRefForRow(d: DispatchRow): RunEntry["restate"] {
+  if (!d.dispatch_id) return null;
+  if (d.phase === "kg-refresh") return { service: "KgRefresh", key: d.dispatch_id };
+  if (d.phase === "planning") return { service: "PlanningRun", key: d.dispatch_id };
+  if (d.phase === "implementation") return null;
+  return isRestateOwned(d.dispatch_id) ? { service: "ReviewFixAttempt", key: d.dispatch_id } : null;
+}
+
 // ---- getIssueReportCard ----
 
 export function getIssueReportCard(identifier: string): IssueReportCard | null {
@@ -254,7 +277,7 @@ export function getIssueReportCard(identifier: string): IssueReportCard | null {
 
   const dispatches = db
     .prepare(
-      `SELECT id, issue_id, repo, dispatched_at, phase, status, conclusion, pr_url
+      `SELECT id, issue_id, repo, dispatched_at, phase, status, conclusion, pr_url, dispatch_id
        FROM dispatch_log
        WHERE issue_identifier = ?
        ORDER BY dispatched_at ASC`,
@@ -271,6 +294,7 @@ export function getIssueReportCard(identifier: string): IssueReportCard | null {
     status: d.status,
     conclusion: d.conclusion,
     ...derivedStatsForJob(db, d.id),
+    restate: restateRefForRow(d),
   }));
 
   const implRuns = runs.filter((r) => r.phase !== "planning");

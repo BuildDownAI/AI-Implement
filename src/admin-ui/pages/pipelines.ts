@@ -190,8 +190,9 @@ export const pipelinesScript = `
           timed_out: 'warn'
         };
 
-        function makeBadge(cls, text) {
-          return '<span class="badge tight ' + cls + '">' + window.esc(text) + '</span>';
+        function makeBadge(cls, text, title) {
+          const attr = title ? ' title="' + window.escAttr(title) + '"' : '';
+          return '<span class="badge tight ' + cls + '"' + attr + '>' + window.esc(text) + '</span>';
         }
         function isReviewIncomplete(status, conclusion, failure) {
           if (status !== 'review_failed') return false;
@@ -203,15 +204,16 @@ export const pipelinesScript = `
             || (code === 'PROVIDER_UNAVAILABLE' && (!stage || stage.includes('review')));
         }
         function statusBadge(status, conclusion, failure) {
+          const reason = (failure && typeof failure.code === 'string' && failure.code) || conclusion || '';
           if (status === 'timed_out' && conclusion === 'stuck_giveup') {
-            return makeBadge('fail', 'Needs human');
+            return makeBadge('fail', 'Needs human', reason);
           }
           const label = isReviewIncomplete(status, conclusion, failure)
             ? 'review incomplete'
             : status === 'review_failed'
               ? 'review failed'
               : (status || 'dispatched');
-          return makeBadge(statusClass[status] || 'neutral', label);
+          return makeBadge(statusClass[status] || 'neutral', label, reason);
         }
         function execBadge(mode, runnerMode) {
           const short = mode === 'local-docker' ? 'docker' : mode === 'fly-machines' ? 'fly' : 'gha';

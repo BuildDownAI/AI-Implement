@@ -10,7 +10,7 @@ import {
   resolveReviewFixLifecycle,
 } from "./config.js";
 import type { RepoMapping } from "./config.js";
-import { markDispatched, closeDb, getDb, getDispatchedRows, deleteDispatched } from "./dedup.js";
+import { recordReaperAction, markDispatched, closeDb, getDb, getDispatchedRows, deleteDispatched } from "./dedup.js";
 import { reconcileDispatched } from "./dedup-reconcile.js";
 import { canDispatch, acquireDispatch, type DispatchKind, type AcquireDispatchOutcome } from "./dispatch-gate.js";
 import {
@@ -61,11 +61,11 @@ import { handleReferenceTokenRequest } from "./reference-token-vending.js";
 import { handleStatusUpdate, handleStepReport } from "./session-api.js";
 import { postStatusComment } from "./status-events.js";
 import { buildRunUrl, classifyCompletion, deriveLastSuccessfulStage, monitorFailureCommentPrefix, renderClassification, shouldPostMonitorClassificationComment } from "./completion-classification.js";
-import { classifyFlyMachine, classifyLocalContainer } from "./backend-run.js";
-import { createMachine, getMachine, listMachines, destroyMachine, generateSessionToken, generateMachineNonce, buildSessionMachineConfig, listAppSecrets, fetchMachineLogs, updateMachineMetadata, readMachineExitCode } from "./fly-machines.js";
-import { safeDestroyMachine, sweepOrphanedMachines, SWEEP_MACHINE_MAX_AGE_MS } from "./reaper.js";
+import { classifyFlyMachine, classifyLocalContainer, destroyMachineRecorded } from "./backend-run.js";
+import { createMachine, getMachine, listMachines, generateSessionToken, generateMachineNonce, buildSessionMachineConfig, listAppSecrets, fetchMachineLogs, updateMachineMetadata, readMachineExitCode } from "./fly-machines.js";
+import { isDurableRunnerMachine, safeDestroyMachine, sweepOrphanedMachines, SWEEP_MACHINE_MAX_AGE_MS } from "./reaper.js";
 import type { ReaperHelpers } from "./reaper.js";
-import { getRunnerMode, getFlySecretsMinVersion, getFlyProcessLevelSecrets, initSettingsTable, resolveExecutionPath, resolvePlanningExecutionPath, resolveRunnerCallbackBaseUrl, checkForcedPathEligibility } from "./runner-mode.js";
+import { seedKgMaterializeDirectFromEnv, getRunnerMode, getFlySecretsMinVersion, getFlyProcessLevelSecrets, initSettingsTable, resolveExecutionPath, resolvePlanningExecutionPath, resolveRunnerCallbackBaseUrl, checkForcedPathEligibility } from "./runner-mode.js";
 import { handleGitHubWebhook } from "./webhook.js";
 import { enqueueReconciliation, hasReconciliationForPr, initReconciliationTable } from "./reconciliation.js";
 import { runReconciliations, resolvePrMapping } from "./reconcile-merged.js";
@@ -128,14 +128,26 @@ import { KgSidecar } from "./kg-sidecar.js";
 import type { KgRefreshIngressClient } from "./restate/kg-refresh-production.js";
 import { createKgRefreshIngressClient } from "./restate/kg-refresh-production.js";
 import { RestateSidecar } from "./restate/server.js";
+import type { FlyMachineProfileConfig } from "./restate/fly-machine-profile.js";
 import { startRestateEndpoint, register as registerRestateEndpoint, RESTATE_SERVICES } from "./restate/endpoint.js";
+import {
+  getRestateRetentionDays,
+  getVolumeSnapshotRetentionDays,
+  RESTATE_RETENTION_DAYS_DEFAULT,
+  RESTATE_RETENTION_DAYS_MAX,
+  RESTATE_RETENTION_DAYS_MIN,
+  setRestateRetentionDays,
+  setVolumeSnapshotRetentionDays,
+} from "./restate/retention.js";
+import { applyVolumeSnapshotRetention, applyVolumeSnapshotRetentionAtBoot } from "./fly-volumes.js";
 import { createProductionReviewFixServices } from "./restate/review-fix-production.js";
-import { kgFlyMachineSizing, createKgFindRunByTitle, createProductionKgRefreshServices, recordKgDispatchDetails } from "./restate/kg-refresh-production.js";
+import { createKgFindRunByTitle, seedFlyMachineProfileFromOverride, createProductionKgRefreshServices, recordKgDispatchDetails, launchKeptMachine, bindKeptMachineFly } from "./restate/kg-refresh-production.js";
 import { createProductionPlanningRunServices, PLANNING_CONTEXT_BRANCH_KEY, PLANNING_CONTEXT_FIELD_VALUE_KEY } from "./restate/planning-run-production.js";
 import { createPlanningAdmissionTerminationHook, createPlanningRunIngressClient } from "./restate/planning-run-client.js";
 import { setKgRefreshToolDeps } from "./restate/tools.js";
 import type { RestateRegisterOutcome, RestateRegisterResult } from "./restate/endpoint.js";
 import { getRestateStatus, setRestateStatus } from "./restate/status.js";
+import { handleJournalRequest } from "./restate/journal-query.js";
 import type { RestateRegistrationStatus } from "./restate/status.js";
 import { setAdmissionTerminationCheck, setProviderRegistry, setReviewFixAttemptsFacade } from "./restate/tools.js";
 import { callTool, callToolAsSystem } from "./restate/tools-client.js";
@@ -2172,13 +2184,11 @@ function isRestateOwnedJob(job: Job): boolean {
 function ttlStopRunnerForJob(config: AppConfig, job: Job): (() => Promise<boolean>) | undefined {
   if (job.executionMode === "fly-machines") {
     if (!config.flySessionsToken || !config.flySessionsApp || !job.machineId) return undefined;
-    const token = config.flySessionsToken;
-    const app = config.flySessionsApp;
     const machineId = job.machineId;
     return async () => {
       let confirmed = false;
       try {
-        await destroyMachine(token, app, machineId);
+        await destroyMachineRecorded(config, machineId, "ttl-stop", { issueIdentifier: job.issueIdentifier });
         confirmed = true;
         console.log(`[monitor] Destroyed timed-out machine ${machineId}`);
       } catch (err) {
@@ -2707,7 +2717,7 @@ async function monitorFlyMachineJob(
     const stopRunner = async () => {
       let confirmed = false;
       try {
-        await destroyMachine(config.flySessionsToken!, config.flySessionsApp!, job.machineId!);
+        await destroyMachineRecorded(config, job.machineId!, "monitor-timeout", { issueIdentifier: job.issueIdentifier });
         confirmed = true;
         console.log(`[monitor] Destroyed timed-out machine ${job.machineId}`);
       } catch (err) {
@@ -2759,7 +2769,7 @@ async function monitorFlyMachineJob(
 
   if (machineDone) {
     // Determine success/failure before destroying: move findPrForIssue before
-    // destroyMachine so we can decide whether to fetch logs while the machine
+    // destroyMachineRecorded so we can decide whether to fetch logs while the machine
     // is still accessible.
     const matchedPr = await findPrForIssue(config, job.repo, job.issueIdentifier);
     const prUrl = matchedPr?.url ?? null;
@@ -2802,7 +2812,7 @@ async function monitorFlyMachineJob(
       }
 
       try {
-        await destroyMachine(config.flySessionsToken, config.flySessionsApp, job.machineId);
+        await destroyMachineRecorded(config, job.machineId, "monitor-stopped", { issueIdentifier: job.issueIdentifier });
         console.log(`[monitor] Destroyed stopped machine ${job.machineId}`);
       } catch (err) {
         if (!(err instanceof Error && err.message.includes("404"))) {
@@ -3340,6 +3350,26 @@ async function startupReconciliation(config: AppConfig, registry: ProviderRegist
     // Skip machines not owned by this orchestrator (same logic as reaper.ts).
     const machineOrchestrator = machine.config?.metadata?.orchestrator_app;
     if (config.flyOrchestratorApp && machineOrchestrator !== config.flyOrchestratorApp) {
+      continue;
+    }
+
+    // A durable-runner machine is owned by a FlyMachineProfile object, not a dispatch_log
+    // row: a missing or terminal row is its normal state, so neither rule below may see it.
+    // Only the object's expire and the reaper's durable-expired may destroy it.
+    if (isDurableRunnerMachine(machine)) {
+      console.log(`[startup] Keeping durable-runner machine ${machine.id} (owned by FlyMachineProfile)`);
+      try {
+        recordReaperAction({
+          ruleMatched: "durable-skip:startup-reconcile",
+          machineId: machine.id,
+          tenantId: null,
+          issueIdentifier: null,
+          ageSeconds: Math.floor((Date.now() - new Date(machine.created_at).getTime()) / 1000),
+          dryRun: config.reaperDryRun,
+        });
+      } catch (err) {
+        console.error("[startup] Failed to record durable-skip:", err);
+      }
       continue;
     }
 
@@ -4005,8 +4035,8 @@ async function handleKgRefreshOutcome(
 
 async function dispatchKgRefreshRun(
   config: AppConfig,
-  opts: { runToken: string; runProgressToken: string; dispatchId: string; runConfig: string; executionPath?: string },
-): Promise<{ machineId?: string; machineNonce?: string; logsUrl?: string }> {
+  opts: { runToken: string; runProgressToken: string; dispatchId: string; runConfig: string; executionPath?: string; machine: FlyMachineProfileConfig; machineId: string | null },
+): Promise<{ machineId?: string; machineNonce?: string; logsUrl?: string; created?: boolean; replaced?: string }> {
   if (!config.kgSourceRepo) throw new Error("KG_SOURCE_REPO not configured");
   const repo = parseKgSourceRepo(config.kgSourceRepo);
   const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, repo.owner);
@@ -4052,11 +4082,22 @@ async function dispatchKgRefreshRun(
       orchestratorApp: process.env.FLY_APP_NAME,
       expectedTtlSeconds: 4 * 60 * 60,
       extraEnv,
-      ...(({ source: _source, ...sizing }) => sizing)(kgFlyMachineSizing(config.kgSourceRepo, config.flySessionsRegion)),
+      cpuKind: opts.machine.cpuKind,
+      cpus: opts.machine.cpus,
+      memoryMb: opts.machine.memoryMb,
+      region: config.flySessionsRegion ?? undefined,
+      purpose: "durable-runner",
+      pipeline: "kg-refresh",
+      dispatchId: opts.dispatchId,
     });
-    const machine = await createMachine(config.flySessionsToken, config.flySessionsApp, machineConfig);
-    console.log(`[kg-refresh] dispatched via Fly (dispatchId=${opts.dispatchId})`);
-    return { machineId: machine.id, machineNonce, logsUrl: `https://fly.io/apps/${config.flySessionsApp}/machines/${machine.id}` };
+    const launched = await launchKeptMachine(bindKeptMachineFly(config.flySessionsToken, config.flySessionsApp), {
+      keptMachineId: opts.machineId, dispatchId: opts.dispatchId, machineConfig, machineNonce,
+    });
+    console.log(`[kg-refresh] dispatched via Fly (${launched.reused ? "reused" : "created"} machine ${launched.machineId}) (dispatchId=${opts.dispatchId})`);
+    return {
+      machineId: launched.machineId, machineNonce: launched.machineNonce, created: launched.created, replaced: launched.replaced,
+      logsUrl: `https://fly.io/apps/${config.flySessionsApp}/machines/${launched.machineId}`,
+    };
 
   } else if (executionPath === "local-docker") {
     if (!config.localRunnerImage) {
@@ -4877,7 +4918,22 @@ function startServer(
         },
         notifyWebhookUrl: config.notifyWebhookUrl,
       }, registry, { startDeploy, selfDeployTarget: config.selfDeployTarget, kgRefresh: kgRefreshAdminDeps, callTool, getRestateStatus,
-        reviewFixAttempts })) return;
+        retention: {
+          getRestateDays: getRestateRetentionDays,
+          setRestateDays: setRestateRetentionDays,
+          getVolumeDays: getVolumeSnapshotRetentionDays,
+          setVolumeDays: setVolumeSnapshotRetentionDays,
+          applyVolume: async (days) => {
+            if (!config.flyDeployToken || !process.env.FLY_APP_NAME) {
+              return { applied: [], skipped: !config.flyDeployToken ? "FLY_DEPLOY_TOKEN is not set" : "FLY_APP_NAME is not set" };
+            }
+            return applyVolumeSnapshotRetention(config.flyDeployToken, process.env.FLY_APP_NAME, days);
+          },
+          default: RESTATE_RETENTION_DAYS_DEFAULT,
+          min: RESTATE_RETENTION_DAYS_MIN,
+          max: RESTATE_RETENTION_DAYS_MAX,
+        },
+        reviewFixAttempts, readJournal: handleJournalRequest })) return;
     }
 
     res.writeHead(404, { "Content-Type": "application/json" });
@@ -4912,6 +4968,8 @@ function restateRegistrationStatusFor(outcome: RestateRegisterOutcome): RestateR
 export interface RestateEndpointWireDeps {
   startRestateEndpoint: () => Promise<unknown>;
   registerRestateEndpoint: () => Promise<RestateRegisterResult>;
+  /** Runs after a registration that took effect (never after `declined-conflict`); must not throw. */
+  onRegistered?: () => Promise<void>;
 }
 
 /** How often a declined registration retries (AII-721) — the old deployment's non-completed invocations are expected to drain on their own; this just keeps checking back. */
@@ -4967,6 +5025,7 @@ export function createRestateRegistrationGate(
         }
       } else {
         clearRetry();
+        await deps.onRegistered?.();
       }
     } catch (err) {
       if (isShuttingDown()) return;
@@ -5022,6 +5081,7 @@ async function main(): Promise<void> {
   sweepOrphanedGapfillRows(); // AII-279: heal rows wedged before the AII-277 terminal hook existed
   initSettingsTable();
   seedKgBaseRepoFromEnv(process.env.KG_BASE_REPO); // AII-633: seeds once, inert thereafter
+  seedKgMaterializeDirectFromEnv(process.env.KG_MATERIALIZE_DIRECT); // AII-1109: seeds once, inert thereafter
   seedLinearPickupLabelFromEnv(process.env.LINEAR_PICKUP_LABEL); // AII-694: seeds once, inert thereafter
   initAccessEntriesTable();
   initReconciliationTable();
@@ -5093,6 +5153,9 @@ async function main(): Promise<void> {
   // Compose the production adapters after configuration and provider setup. The
   // services are registered even with every mapping on the Legacy default;
   // selecting Restate later only changes ownership of *new* automatic GHA work.
+  console.log(`[restate] retention ${getRestateRetentionDays()} days`);
+  // Fire-and-forget: the helper never throws, and boot must not wait on Fly.
+  void applyVolumeSnapshotRetentionAtBoot(config.flyDeployToken, process.env.FLY_APP_NAME, getVolumeSnapshotRetentionDays);
   const reviewFixServices = createProductionReviewFixServices(config, registry, reviewFixAttemptStore);
   // The KgRepo object and KgRefresh workflow (AII-683). Skipped without KG_SOURCE_REPO: the
   // tool handlers then answer 501 from their unset deps.
@@ -5155,6 +5218,7 @@ async function main(): Promise<void> {
   const restateRegistration = createRestateRegistrationGate(() => shuttingDown, {
     startRestateEndpoint: () => startRestateEndpoint([...RESTATE_SERVICES, ...reviewFixServices, ...kgServices, ...planningRunServices], restateSidecar.identityKey),
     registerRestateEndpoint,
+    onRegistered: () => seedFlyMachineProfileFromOverride(),
   });
   // A sidecar which becomes ready after its initial timeout still registers the
   // same fully composed service set; the gate starts the endpoint only once.

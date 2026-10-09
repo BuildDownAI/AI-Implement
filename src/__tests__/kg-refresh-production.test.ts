@@ -1,7 +1,7 @@
 // Unit tests for the kg-refresh production composer and ingress client (AII-895).
 // No Docker and no Restate runtime: the services are only constructed, the GHA dispatch
 // is exercised against a mocked postWorkflowDispatch, and the client against a faked fetch.
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { makeAppConfig } from "./helpers/builders.js";
 import { fakeFetch, hangUntilAborted, type Reply, type Routes } from "./helpers/fake-fetch.js";
 import { testDb } from "./helpers/test-db.js";
@@ -12,14 +12,20 @@ vi.mock("../github.js", async (importOriginal) => ({
   postWorkflowDispatch: (...args: unknown[]) => postWorkflowDispatch(...args),
 }));
 const destroyMachine = vi.fn(async (..._args: unknown[]) => {});
+const stopMachine = vi.fn(async (..._args: unknown[]) => {});
+const getMachine = vi.fn(async (..._args: unknown[]): Promise<unknown> => ({ state: "started" }));
 vi.mock("../fly-machines.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../fly-machines.js")>()),
   destroyMachine: (...args: unknown[]) => destroyMachine(...args),
+  stopMachine: (...args: unknown[]) => stopMachine(...args),
+  getMachine: (...args: unknown[]) => getMachine(...args),
 }));
+const inspectLocalContainer = vi.fn(async (_id: string): Promise<{ running: boolean }> => ({ running: true }));
 const stopLocalContainer = vi.fn(async (_id: string) => {});
 vi.mock("../local-docker.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../local-docker.js")>()),
   stopLocalContainer: (id: string) => stopLocalContainer(id),
+  inspectLocalContainer: (id: string) => inspectLocalContainer(id),
 }));
 const capturedWorkflowDeps: { current?: import("../restate/kg-refresh-workflow.js").KgRefreshWorkflowDependencies } = {};
 vi.mock("../restate/kg-refresh-workflow.js", async (importOriginal) => {
@@ -40,11 +46,12 @@ vi.mock("../log.js", async (importOriginal) => ({
 vi.mock("../repo-image.js", () => ({ resolveRunnerImageForDispatch: vi.fn(async () => "runner:test") }));
 const resolvedPath = { current: "github-actions" };
 vi.mock("../runner-mode.js", () => ({
-  getRunnerMode: () => ({ mode: "default" }),
-  resolveExecutionPath: () => resolvedPath.current,
+  getRunnerMode: () => ({ mode: runnerMode.current }),
   getKgMaterializeDirect: () => ({ enabled: false }),
   getKgFlyMachineOverride: () => kgFlyOverride.current,
+  setKgFlyMachineOverride: (v: unknown) => { if (v === null) kgFlyOverride.current = {}; },
 }));
+const runnerMode = { current: "default" };
 const kgFlyOverride: { current: { cpus?: number; memoryMb?: number; cpuKind?: "auto" | "shared" | "performance" } } = { current: {} };
 const kgMappingSize: { current: { machineCpus?: number; machineMemoryMb?: number } } = { current: {} };
 vi.mock("../config.js", async (importOriginal) => ({
@@ -57,10 +64,12 @@ import {
   createKgRefreshDispatch,
   createKgRefreshIngressClient,
   createProductionKgRefreshServices,
-  kgFlyMachineSizing,
+  launchKeptMachine,
+  type KeptMachineFly,
+  resolveKgExecutionMode,
+  seedFlyMachineProfileFromOverride,
   type KgRefreshProductionInput,
 } from "../restate/kg-refresh-production.js";
-import { buildSessionMachineConfig } from "../fly-machines.js";
 import { decodeRunConfig } from "../run-config.js";
 import { verifyRunToken } from "../runner-tokens.js";
 
@@ -86,6 +95,7 @@ function makeInput(overrides: Partial<KgRefreshProductionInput> = {}): KgRefresh
     closePullRequestFn: noop as never,
     deleteBranchFn: noop as never,
     dispatchKgRefreshRun: vi.fn(async () => ({})),
+    resolveExecutionMode: () => resolvedPath.current,
     updateJobStatus: noop,
     recordDispatch: vi.fn(),
     getWorkflowRunStatus: vi.fn(async () => ({ status: "completed", conclusion: "success" })),
@@ -105,6 +115,8 @@ const dispatchInput = {
   tokens: { runToken: "rt", progressToken: "pt", publicationToken: "pub" },
   issueIdentifier: "KG-REFRESH · t-1",
   dispatchId: "d-workflow",
+  machineId: null,
+  machine: { cpuKind: "performance" as const, cpus: 2, memoryMb: 8192, idleTimeoutMs: 604800000 },
 };
 
 beforeEach(() => {
@@ -115,7 +127,7 @@ beforeEach(() => {
 describe("createProductionKgRefreshServices", () => {
   it("returns the KgRepo and KgRefresh services and the nine tool deps", () => {
     const { services, toolDeps } = createProductionKgRefreshServices(makeInput());
-    expect(services.map((s) => s.name)).toEqual(["KgRepo", "KgRefresh"]);
+    expect(services.map((s) => s.name)).toEqual(["KgRepo", "FlyMachineProfile", "KgRefresh"]);
     expect(Object.keys(toolDeps).sort()).toEqual([
       "callbackConfigured", "freeBytes", "isDeployHeld", "kgSourceRepo", "mappingExists",
       "persistPreflightFailure", "readServedStamp", "readStatusRecord", "runPreflight",
@@ -251,6 +263,33 @@ describe("appendJobLog execution mode", () => {
   });
 });
 
+describe("fly dispatch without a Fly sessions app (AII-1130)", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it.each([
+    ["no app", { flySessionsToken: "fly-token", flySessionsApp: null }],
+    ["no token", { flySessionsToken: null, flySessionsApp: "fly-app" }],
+    ["neither", { flySessionsToken: null, flySessionsApp: null }],
+  ])("rejects without calling the dispatcher (%s)", async (_label, fly) => {
+    resolvedPath.current = "fly-machines";
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    const dispatchKgRefreshRun = vi.fn(async () => ({}));
+    const input = makeInput({ dispatchKgRefreshRun });
+    const result = await createKgRefreshDispatch({ ...input, config: { ...input.config, ...fly } })(dispatchInput);
+    expect(result).toMatchObject({ outcome: "rejected", jobId: null, executionMode: "fly-machines" });
+    expect(dispatchKgRefreshRun).not.toHaveBeenCalled();
+    expect(err).toHaveBeenCalledWith(expect.stringContaining("FLY_SESSIONS_TOKEN + FLY_SESSIONS_APP are not configured"));
+  });
+
+  it("dispatches when both are set", async () => {
+    resolvedPath.current = "fly-machines";
+    const dispatchKgRefreshRun = vi.fn(async () => ({}));
+    const result = await createKgRefreshDispatch(makeInput({ dispatchKgRefreshRun }))(dispatchInput);
+    expect(result.outcome).toBe("accepted");
+    expect(dispatchKgRefreshRun).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("non-GHA dispatch", () => {
   it("passes the workflow's dispatch id through and reports an unknown job id when the backend gave none", async () => {
     resolvedPath.current = "fly-machines";
@@ -269,6 +308,14 @@ describe("stopMachineRun wiring", () => {
     await expect(capturedWorkflowDeps.current!.stopMachineRun("fly-machines", "m-1")).resolves.toBe(true);
     expect(destroyMachine).toHaveBeenCalledWith("fly-token", "fly-app", "m-1");
     expect(stopLocalContainer).not.toHaveBeenCalled();
+  });
+
+  it("stops, not destroys, a kept Fly machine", async () => {
+    stopMachine.mockClear();
+    createProductionKgRefreshServices(makeInput());
+    await expect(capturedWorkflowDeps.current!.stopMachineRun("fly-machines", "m-1", true)).resolves.toBe(true);
+    expect(stopMachine).toHaveBeenCalledWith("fly-token", "fly-app", "m-1");
+    expect(destroyMachine).not.toHaveBeenCalled();
   });
 
   it("stops the local container", async () => {
@@ -326,13 +373,10 @@ describe("recordDispatch", () => {
 
 describe("job row after a non-GHA dispatch (real log.ts, scratch database)", () => {
   it("lets getJobByMachineId and getJobByNonce resolve the kg-refresh row", async () => {
-    // No boot tables: the runner-mode.js mock above has no initSettingsTable. The real log.ts
-    // comes through importActual, since this file mocks it.
+    // The real log.ts comes through importActual, since this file mocks it.
     const { log } = (await testDb({
-      tables: "none",
       modules: { log: () => vi.importActual<typeof import("../log.js")>("../log.js") },
     })).modules;
-    log.initLogTable();
     const id = log.appendLogIfAbsent({ issueId: "kg-refresh", phase: "kg-refresh", dispatchId: "d-workflow", executionMode: "fly-machines", repo: "acme/kg" });
     vi.doUnmock("../log.js"); // the fresh module must share the scratch database's log.js instance
     const { recordKgDispatchDetails } = await import("../restate/kg-refresh-production.js");
@@ -561,115 +605,167 @@ describe("createKgFindRunByTitle", () => {
   });
 });
 
-describe("kgFlyMachineSizing (AII-1112)", () => {
-  beforeEach(() => { kgFlyOverride.current = {}; });
-  const build = (sizing: ReturnType<typeof kgFlyMachineSizing>) =>
-    buildSessionMachineConfig({
-      image: "runner:test", issueId: "kg-refresh", issueIdentifier: "KG-REFRESH", issueTitle: "t", issueDescription: "",
-      owner: "acme", repo: "kg", defaultBranch: "main", githubToken: "t", sessionToken: "s", machineNonce: "n",
-      ...sizing,
-    });
+describe("resolveKgExecutionMode (AII-1130)", () => {
+  afterEach(() => { runnerMode.current = "default"; });
 
-  it("sizes the machine from a larger mapping and carries the region", () => {
-    kgMappingSize.current = { machineCpus: 4, machineMemoryMb: 16384 };
-    const machine = build(kgFlyMachineSizing("acme/kg", "ord"));
-    expect(machine.config.guest).toMatchObject({ cpus: 4, memory_mb: 16384 });
-    expect(machine.region).toBe("ord");
+  it.each(["default", "gha", "fly", "shadow"])("answers fly-machines under runner mode %s", (mode) => {
+    runnerMode.current = mode;
+    expect(resolveKgExecutionMode()).toBe("fly-machines");
   });
 
-  it("raises a mapping below the KG floor to 2 performance CPUs / 8192 MB", () => {
-    kgMappingSize.current = { machineCpus: 2, machineMemoryMb: 4096 };
-    const machine = build(kgFlyMachineSizing("acme/kg", "ord"));
-    expect(machine.config.guest).toEqual({ cpu_kind: "performance", cpus: 2, memory_mb: 8192 });
+  it("answers local-docker under runner mode local", () => {
+    runnerMode.current = "local";
+    expect(resolveKgExecutionMode()).toBe("local-docker");
   });
+});
 
-  it("stays shared and logs one line below the per-CPU minimum", () => {
-    const log = vi.spyOn(console, "log").mockImplementation(() => {});
-    try {
-      kgFlyOverride.current = { memoryMb: 2048 };
-      kgMappingSize.current = { machineCpus: 2, machineMemoryMb: 2048 };
-      const machine = build(kgFlyMachineSizing("acme/kg", "ord"));
-      expect(machine.config.guest).toEqual({ cpu_kind: "shared", cpus: 2, memory_mb: 2048 });
-      expect(log.mock.calls.filter((c) => String(c[0]).includes("2048 MB-per-CPU"))).toHaveLength(1);
-    } finally {
-      log.mockRestore();
-    }
-  });
-
-  it("falls back per field when the mapping leaves the size unset", () => {
+describe("KG dispatch sizes the machine from the profile (AII-1130)", () => {
+  it("passes machine through to the dispatcher and ignores the mapping size", async () => {
+    resolvedPath.current = "fly-machines";
+    kgMappingSize.current = { machineCpus: 8, machineMemoryMb: 32768 };
+    const dispatchKgRefreshRun = vi.fn(async () => ({}));
+    await createKgRefreshDispatch(makeInput({ dispatchKgRefreshRun }))(dispatchInput);
+    expect(dispatchKgRefreshRun).toHaveBeenCalledWith(expect.objectContaining({ machine: dispatchInput.machine }));
     kgMappingSize.current = {};
-    const machine = build(kgFlyMachineSizing("acme/kg", null));
-    expect(machine.config.guest).toMatchObject({ cpus: 2, memory_mb: 8192 });
+  });
+});
+
+describe("seedFlyMachineProfileFromOverride (AII-1130)", () => {
+  const DAY7 = 7 * 24 * 60 * 60 * 1000;
+
+  it("sends the merged seed with the idempotency key, then deletes the row", async () => {
+    const sendSeed = vi.fn(async () => {});
+    const clearOverride = vi.fn();
+    await seedFlyMachineProfileFromOverride({ getOverride: () => ({ memoryMb: 4096, cpuKind: "auto" }), sendSeed, clearOverride });
+    expect(sendSeed).toHaveBeenCalledWith({ cpuKind: "performance", cpus: 2, memoryMb: 4096, idleTimeoutMs: DAY7 }, "seed:kg-refresh");
+    expect(clearOverride).toHaveBeenCalledTimes(1);
   });
 
-  it("keeps the default size and logs one line with no mapping", () => {
-    const log = vi.spyOn(console, "log").mockImplementation(() => {});
-    try {
-      const machine = build(kgFlyMachineSizing("other/repo", undefined));
-      expect(machine.config.guest).toEqual({ cpu_kind: "performance", cpus: 2, memory_mb: 8192 });
-      expect(log.mock.calls.filter((c) => String(c[0]).includes("default size"))).toHaveLength(1);
-    } finally {
-      log.mockRestore();
-    }
+  it("falls back to shared CPUs when performance would be below 2048 MB per CPU", async () => {
+    const sendSeed = vi.fn(async () => {});
+    await seedFlyMachineProfileFromOverride({ getOverride: () => ({ memoryMb: 1024 }), sendSeed, clearOverride: vi.fn() });
+    expect(sendSeed).toHaveBeenCalledWith({ cpuKind: "shared", cpus: 2, memoryMb: 1024, idleTimeoutMs: DAY7 }, "seed:kg-refresh");
+    await seedFlyMachineProfileFromOverride({ getOverride: () => ({ cpus: 8 }), sendSeed, clearOverride: vi.fn() });
+    expect(sendSeed).toHaveBeenLastCalledWith(expect.objectContaining({ cpuKind: "shared", cpus: 8 }), "seed:kg-refresh");
   });
 
-  describe("admin override (AII-1120)", () => {
-    beforeEach(() => { kgMappingSize.current = { machineCpus: 2, machineMemoryMb: 4096 }; });
+  it("sends nothing with no stored override", async () => {
+    const sendSeed = vi.fn(async () => {});
+    const clearOverride = vi.fn();
+    await seedFlyMachineProfileFromOverride({ getOverride: () => ({}), sendSeed, clearOverride });
+    expect(sendSeed).not.toHaveBeenCalled();
+    expect(clearOverride).not.toHaveBeenCalled();
+  });
 
-    it("reports the default as the source when the floor beats the mapping", () => {
-      expect(kgFlyMachineSizing("acme/kg", null)).toEqual({ cpuKind: "performance", cpus: 2, memoryMb: 8192, source: "default" });
+  it("keeps the row when the send fails", async () => {
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    const clearOverride = vi.fn();
+    await seedFlyMachineProfileFromOverride({
+      getOverride: () => ({ cpus: 8 }), sendSeed: async () => { throw new Error("ingress down"); }, clearOverride,
     });
+    expect(clearOverride).not.toHaveBeenCalled();
+    err.mockRestore();
+  });
+});
 
-    it("reports the mapping as the source when it exceeds the floor", () => {
-      kgMappingSize.current = { machineCpus: 4, machineMemoryMb: 16384 };
-      expect(kgFlyMachineSizing("acme/kg", null)).toEqual({ cpuKind: "performance", cpus: 4, memoryMb: 16384, source: "mapping" });
-    });
+describe("readMachineRun wiring", () => {
+  const exitEvent = { type: "exit", timestamp: 7, request: { exit_event: { exit_code: 137, guest_signal: 9, oom_killed: true } } };
+  beforeEach(() => { getMachine.mockReset(); inspectLocalContainer.mockReset(); });
 
-    it("reports the default for a mapping exactly at the floor", () => {
-      kgMappingSize.current = { machineCpus: 2, machineMemoryMb: 8192 };
-      expect(kgFlyMachineSizing("acme/kg", null).source).toBe("default");
+  it.each(["stopped", "destroyed"])("reads a %s machine as ended with its exit", async (state) => {
+    getMachine.mockResolvedValue({ state, events: [exitEvent] });
+    createProductionKgRefreshServices(makeInput());
+    await expect(capturedWorkflowDeps.current!.readMachineRun("fly-machines", "m-1")).resolves.toEqual({
+      state: "ended", exit: { exitCode: 137, signal: 9, oomKilled: true, timestamp: 7 },
     });
+    expect(getMachine).toHaveBeenCalledWith("fly-token", "fly-app", "m-1");
+  });
 
-    it("lets an override go below the default on purpose", () => {
-      kgFlyOverride.current = { memoryMb: 4096 };
-      expect(kgFlyMachineSizing("acme/kg", null)).toMatchObject({ cpus: 2, memoryMb: 4096, source: "override" });
+  it("reads a 404 as ended with an empty exit", async () => {
+    getMachine.mockRejectedValue(new Error("Fly API 404: not found"));
+    createProductionKgRefreshServices(makeInput());
+    await expect(capturedWorkflowDeps.current!.readMachineRun("fly-machines", "m-1")).resolves.toEqual({
+      state: "ended", exit: { exitCode: null, signal: null, oomKilled: null, timestamp: null },
     });
+  });
 
-    it("applies a memory override on top of the mapping", () => {
-      kgFlyOverride.current = { memoryMb: 8192 };
-      expect(kgFlyMachineSizing("acme/kg", null)).toMatchObject({ cpuKind: "performance", cpus: 2, memoryMb: 8192, source: "override" });
-    });
+  it("reads started as started, and created or a thrown lookup as unknown", async () => {
+    createProductionKgRefreshServices(makeInput());
+    getMachine.mockResolvedValue({ state: "started" });
+    await expect(capturedWorkflowDeps.current!.readMachineRun("fly-machines", "m-1")).resolves.toEqual({ state: "started", exit: null });
+    getMachine.mockResolvedValue({ state: "created" });
+    await expect(capturedWorkflowDeps.current!.readMachineRun("fly-machines", "m-1")).resolves.toEqual({ state: "unknown", exit: null });
+    getMachine.mockRejectedValue(new Error("Fly API 500"));
+    await expect(capturedWorkflowDeps.current!.readMachineRun("fly-machines", "m-1")).resolves.toEqual({ state: "unknown", exit: null });
+  });
 
-    it("forces shared CPUs at the default size", () => {
-      kgFlyOverride.current = { cpuKind: "shared" };
-      expect(kgFlyMachineSizing("acme/kg", null)).toMatchObject({ cpuKind: "shared", cpus: 2, memoryMb: 8192 });
-    });
+  it("reads a local container with no exit, and any other mode as unknown without a call", async () => {
+    createProductionKgRefreshServices(makeInput());
+    inspectLocalContainer.mockResolvedValue({ running: false });
+    await expect(capturedWorkflowDeps.current!.readMachineRun("local-docker", "c-1")).resolves.toEqual({ state: "ended", exit: null });
+    await expect(capturedWorkflowDeps.current!.readMachineRun("other", "x")).resolves.toEqual({ state: "unknown", exit: null });
+    expect(getMachine).not.toHaveBeenCalled();
+  });
+});
 
-    it("treats cpuKind auto like unset", () => {
-      kgFlyOverride.current = { cpuKind: "auto" };
-      expect(kgFlyMachineSizing("acme/kg", null).cpuKind).toBe("performance");
-    });
+describe("launchKeptMachine: the dispatch step's Fly write", () => {
+  const machineConfig = { config: { image: "img", env: { MACHINE_NONCE: "fresh-nonce" }, metadata: { dispatch_id: "d1" } } } as never;
+  const notFound = () => new Error("Failed to get machine m-1 (404): not found");
 
-    it("falls back to shared with one log line when performance is below the minimum", () => {
-      const log = vi.spyOn(console, "log").mockImplementation(() => {});
-      try {
-        kgFlyOverride.current = { cpuKind: "performance", memoryMb: 2048 };
-        expect(kgFlyMachineSizing("acme/kg", null)).toMatchObject({ cpuKind: "shared", cpus: 2, memoryMb: 2048 });
-        expect(log.mock.calls.filter((c) => String(c[0]).includes("2048"))).toHaveLength(1);
-      } finally {
-        log.mockRestore();
-      }
-    });
+  function makeFly(get: () => Promise<unknown>) {
+    const calls: string[] = [];
+    const fly: KeptMachineFly = {
+      getMachine: vi.fn(async () => { calls.push("get"); return get() as never; }),
+      createMachine: vi.fn(async () => { calls.push("create"); return { id: "m-new" } as never; }),
+      updateMachine: vi.fn(async () => { calls.push("update"); }),
+      startMachine: vi.fn(async () => { calls.push("start"); }),
+    };
+    return { fly, calls };
+  }
+  const launch = (fly: KeptMachineFly, keptMachineId: string | null) =>
+    launchKeptMachine(fly, { keptMachineId, dispatchId: "d1", machineConfig, machineNonce: "fresh-nonce" });
 
-    it("uses the KG floors for unset fields when there is no mapping", () => {
-      const log = vi.spyOn(console, "log").mockImplementation(() => {});
-      try {
-        expect(kgFlyMachineSizing("other/repo", null)).toMatchObject({ cpuKind: "performance", cpus: 2, memoryMb: 8192, source: "default" });
-        kgFlyOverride.current = { memoryMb: 1024 };
-        expect(kgFlyMachineSizing("other/repo", null)).toMatchObject({ cpus: 2, memoryMb: 1024, cpuKind: "shared", source: "override" });
-      } finally {
-        log.mockRestore();
-      }
-    });
+  it("creates a machine when none is kept, without a lookup", async () => {
+    const { fly, calls } = makeFly(async () => ({}));
+    const result = await launch(fly, null);
+    expect(result).toMatchObject({ machineId: "m-new", created: true });
+    expect(result).not.toHaveProperty("replaced");
+    expect(calls).toEqual(["create"]);
+  });
+
+  it("updates then starts a stopped kept machine", async () => {
+    const { fly, calls } = makeFly(async () => ({ state: "stopped" }));
+    await expect(launch(fly, "m-1")).resolves.toEqual({ machineId: "m-1", machineNonce: "fresh-nonce", created: false, reused: true });
+    expect(calls).toEqual(["get", "update", "start"]);
+  });
+
+  it("returns a machine already started for this dispatch, with no update or start", async () => {
+    const { fly, calls } = makeFly(async () => ({ state: "started", config: { env: { MACHINE_NONCE: "earlier-nonce" }, metadata: { dispatch_id: "d1" } } }));
+    await expect(launch(fly, "m-1")).resolves.toEqual({ machineId: "m-1", machineNonce: "earlier-nonce", created: false, reused: true });
+    expect(calls).toEqual(["get"]);
+  });
+
+  it("throws for a machine started for another dispatch", async () => {
+    const { fly, calls } = makeFly(async () => ({ state: "started", config: { metadata: { dispatch_id: "other" } } }));
+    await expect(launch(fly, "m-1")).rejects.toThrow(/another dispatch/);
+    expect(calls).toEqual(["get"]);
+  });
+
+  it("creates a replacement when the kept machine is destroyed", async () => {
+    const { fly, calls } = makeFly(async () => ({ state: "destroyed" }));
+    await expect(launch(fly, "m-1")).resolves.toMatchObject({ machineId: "m-new", created: true, replaced: "m-1" });
+    expect(calls).toEqual(["get", "create"]);
+  });
+
+  it("creates a replacement when the lookup answers 404", async () => {
+    const { fly, calls } = makeFly(async () => { throw notFound(); });
+    await expect(launch(fly, "m-1")).resolves.toMatchObject({ machineId: "m-new", created: true, replaced: "m-1" });
+    expect(calls).toEqual(["get", "create"]);
+  });
+
+  it("throws on any other lookup error so the step retries", async () => {
+    const { fly, calls } = makeFly(async () => { throw new Error("Failed to get machine m-1 (500): boom"); });
+    await expect(launch(fly, "m-1")).rejects.toThrow(/500/);
+    expect(calls).toEqual(["get"]);
   });
 });

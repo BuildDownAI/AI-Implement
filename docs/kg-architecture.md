@@ -449,7 +449,7 @@ flowchart TD
 
 ### Two materialize paths (AII-599)
 
-`KG_MATERIALIZE_DIRECT=true` switches the refresh rail to the base repo's low-memory `--direct`
+The materialize-direct setting (seeded by `KG_MATERIALIZE_DIRECT=true` on first boot) switches the refresh rail to the base repo's low-memory `--direct`
 path (KGB-15, base PR #34), gated behind the flag because it requires the configured
 `KG_SOURCE_REPO` derivative to already carry that base change — an image whose venv predates it
 fails the materialize step and the rail reverts safely, same as any other staging failure.
@@ -471,15 +471,14 @@ could not hold on 2026-09-08 with the rdflib path (see the Failure history table
 figure above remains the committed setting, but the direct path is what would let that incident's
 fix be reverted instead of the memory bump.
 
-**The flag is a seed, not the only control (AII-602).** `KG_MATERIALIZE_DIRECT` resolves through
-the same `db | env | default` precedence as `RUNNER_MODE` (`getKgMaterializeDirect()` /
-`setKgMaterializeDirect()` in `src/runner-mode.ts`): the env var wins outright when set, else the
-`settings` table row, else `false` (rdflib). `materializeDirectEnabled()` in `src/kg-refresh.ts`
+**The flag is a seed-once setting (AII-602, AII-1109).** `KG_MATERIALIZE_DIRECT` is read only at
+boot by `seedKgMaterializeDirectFromEnv()` (`src/runner-mode.ts`), which writes the `settings` row
+when none exists and is inert afterward. `getKgMaterializeDirect()` / `setKgMaterializeDirect()`
+resolve the stored row, else `false` (rdflib); the env var is never consulted at runtime. `materializeDirectEnabled()` in `src/kg-refresh.ts`
 reads the resolved setting rather than `process.env` directly. The Knowledge Graph Pipelines page
 (`/admin#kg-pipelines`) exposes a `Materialize: rdflib | direct` control next to "Refresh graph
-now" — `GET`/`POST /api/kg/materialize-mode` — that flips the DB row; while the env var is set,
-the control is disabled and the write comes back `409`, same as the `RUNNER_MODE` /
-`FLY_PROCESS_LEVEL_SECRETS` pattern on the Runners page. The toggle only affects the *next*
+now" — `GET`/`POST /api/kg/materialize-mode` — that flips the DB row, which is the only
+runtime control. The toggle only affects the *next*
 refresh, not whatever the sidecar is currently serving — `GET /api/kg/status` and the `get_kg_status`
 MCP tool both report the resolved setting as `materialize: "rdflib" | "direct"` for observability.
 
@@ -581,7 +580,7 @@ deleted `snapshot/parts/pr.nt`. AII-494 adds the two
 runner-callback endpoints that give this run kind its privileged access without ever vending a
 long-lived credential to the runner. AII-495 wires `POST /api/kg/refresh` to dispatch the runner
 when the source repo has no newer snapshot: the orchestrator mints a run token, encodes a
-`RunConfigV1` with `runnerPhase: "kg-refresh"`, and dispatches via Fly Machines or local Docker. A Fly KG refresh defaults to 2 performance CPUs / 8192 MB, raised by a larger KG repo mapping and replaced per field by `set_kg_fly_machine`; `get_kg_status` reports the effective size as `flyMachine`.
+`RunConfigV1` with `runnerPhase: "kg-refresh"`, and dispatches via Fly Machines or local Docker. A KG refresh goes to Fly Machines in every runner mode except `local` (local Docker); with no Fly sessions app configured the dispatch step fails and the run ends `dispatch_rejected` (the GitHub Actions fallback is AII-1110). The machine size comes from the `FlyMachineProfile` object under key `kg-refresh`, which the `KgRefresh` workflow reads once, journaled, before its `dispatch` step, so a replay reuses the same size. The default is 2 performance CPUs / 8192 MB; an admin changes it with `set_fly_machine_profile` or from the KG Pipelines page (the same `kg-refresh` profile), and `get_kg_status` reports it as `flyMachine` (`{ ...config, source }`, `source` `profile` or `default`). The mapping's `machineCpus` / `machineMemoryMb` size issue runs only, not a KG run. At boot, a leftover `kg_fly_machine_override` settings row is seeded into the object once, then deleted.
 When the runner completes, it calls `POST /api/runner/result` which routes to `onRunnerComplete` in
 `src/kg-refresh.ts`. If a `snapshotCommit` SHA is included, the orchestrator verifies the commit is
 visible via the GitHub API (one retry for git-cache lag) before starting the local staging rail.

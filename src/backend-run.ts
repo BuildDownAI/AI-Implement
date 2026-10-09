@@ -1,10 +1,25 @@
 /** Backend-run rules shared by `confirmAdmissionTerminated` (src/index.ts) and the Restate composers
  * (`planning-run-production.ts`, `kg-refresh-production.ts`), so each rule exists once. */
 import type { AppConfig } from "./index.js";
-import { destroyMachine, getMachine } from "./fly-machines.js";
+import { destroyMachine, getMachine, readMachineExit, stopMachine, type Machine, type MachineExit } from "./fly-machines.js";
+import { recordReaperAction } from "./dedup.js";
+import { DURABLE_RUNNER_PURPOSE_KEY, DURABLE_RUNNER_PURPOSE_VALUE } from "./durable-runner.js";
 import { inspectLocalContainer, stopLocalContainer } from "./local-docker.js";
 
 export type BackendRunState = "ended" | "started" | "unknown";
+
+/** One read of a backend run: its state, plus the machine's exit when Fly reported one. */
+export interface BackendRunRead {
+  state: BackendRunState;
+  exit: MachineExit | null;
+}
+
+const NO_EXIT: MachineExit = { exitCode: null, signal: null, oomKilled: null, timestamp: null };
+
+function flyMachineState(machine: Machine): BackendRunState {
+  if (machine.state === "destroyed" || machine.state === "stopped") return "ended";
+  return machine.state === "started" ? "started" : "unknown";
+}
 
 type FlyConfig = Pick<AppConfig, "flySessionsToken" | "flySessionsApp">;
 
@@ -13,9 +28,7 @@ type FlyConfig = Pick<AppConfig, "flySessionsToken" | "flySessionsApp">;
 export async function classifyFlyMachine(config: FlyConfig, machineId: string): Promise<BackendRunState> {
   if (!config.flySessionsToken || !config.flySessionsApp) return "unknown";
   try {
-    const machine = await getMachine(config.flySessionsToken, config.flySessionsApp, machineId);
-    if (machine.state === "destroyed" || machine.state === "stopped") return "ended";
-    return machine.state === "started" ? "started" : "unknown";
+    return flyMachineState(await getMachine(config.flySessionsToken, config.flySessionsApp, machineId));
   } catch (err) {
     if (err instanceof Error && err.message.includes("404")) return "ended"; // already gone
     console.error(`[backend-run] Failed to check Fly machine state for ${machineId}:`, err);
@@ -34,13 +47,71 @@ export async function classifyLocalContainer(containerId: string): Promise<Backe
   }
 }
 
-/** Stops the exact machine or container. `false` for a backend with no machine to stop. */
-export async function stopBackendRun(config: FlyConfig, mode: string, id: string): Promise<boolean> {
+export type DestroyReason =
+  | "monitor-stopped"
+  | "monitor-timeout"
+  | "ttl-stop"
+  | "stuck-remediate"
+  | "admin-stop"
+  | "planning-end"
+  | "backend-stop";
+
+/** The one orchestrator-side destroy (AII-1144). It logs and records the caller as `destroy:<reason>` in the
+ *  reaper actions table, and it refuses a `purpose: durable-runner` machine: that one is owned by a
+ *  FlyMachineProfile object, so it is stopped (if started) and recorded as `durable-skip:<reason>`. Only the
+ *  object's `expire` / `destroy-unscrubbed` and the reaper's `durable-expired` destroy such a machine, directly.
+ *  A 404 on the read proceeds to the destroy (the caller handles its 404); any other read error is rethrown,
+ *  since destroying blind would defeat the guard. */
+export async function destroyMachineRecorded(
+  config: FlyConfig,
+  machineId: string,
+  reason: DestroyReason,
+  opts: { issueIdentifier?: string | null } = {},
+): Promise<void> {
+  if (!config.flySessionsToken || !config.flySessionsApp) {
+    throw new Error("FLY_SESSIONS_TOKEN + FLY_SESSIONS_APP are not configured; cannot destroy the machine");
+  }
+  const { flySessionsToken: token, flySessionsApp: app } = config;
+  let machine: Machine | null = null;
+  try {
+    machine = await getMachine(token, app, machineId);
+  } catch (err) {
+    if (!(err instanceof Error && err.message.includes("404"))) throw err;
+  }
+  const record = (ruleMatched: string) => {
+    try {
+      recordReaperAction({
+        ruleMatched,
+        machineId,
+        tenantId: null,
+        issueIdentifier: opts.issueIdentifier ?? null,
+        ageSeconds: machine?.created_at ? Math.floor((Date.now() - new Date(machine.created_at).getTime()) / 1000) : null,
+        dryRun: false,
+      });
+    } catch (err) {
+      console.error(`[fly] Failed to record ${ruleMatched} for machine ${machineId}:`, err);
+    }
+  };
+  if (machine?.config?.metadata?.[DURABLE_RUNNER_PURPOSE_KEY] === DURABLE_RUNNER_PURPOSE_VALUE) {
+    console.log(`[fly] kept machine ${machineId} owned by FlyMachineProfile; stop instead of destroy (reason=${reason})`);
+    record(`durable-skip:${reason}`);
+    if (machine.state === "started") await stopMachine(token, app, machineId);
+    return;
+  }
+  console.log(`[fly] destroying machine ${machineId} reason=${reason}`);
+  record(`destroy:${reason}`);
+  await destroyMachine(token, app, machineId);
+}
+
+/** Stops the exact machine or container. `false` for a backend with no machine to stop. A Fly machine is
+ *  destroyed, unless `keep` is set: a machine a pipeline keeps between runs is only stopped (AII-1136). */
+export async function stopBackendRun(config: FlyConfig, mode: string, id: string, opts: { keep?: boolean } = {}): Promise<boolean> {
   if (mode === "fly-machines") {
     if (!config.flySessionsToken || !config.flySessionsApp) {
       throw new Error("FLY_SESSIONS_TOKEN + FLY_SESSIONS_APP are not configured; cannot stop the machine");
     }
-    await destroyMachine(config.flySessionsToken, config.flySessionsApp, id);
+    if (opts.keep) await stopMachine(config.flySessionsToken, config.flySessionsApp, id);
+    else await destroyMachineRecorded(config, id, "backend-stop");
     return true;
   }
   if (mode === "local-docker") {
@@ -48,4 +119,25 @@ export async function stopBackendRun(config: FlyConfig, mode: string, id: string
     return true;
   }
   return false;
+}
+
+/** One status read of the exact machine or container. For Fly it reads the machine once and returns the
+ *  state with the newest exit event (never an event count: `updateMachine` resets the history). A 404 is
+ *  `ended` with an empty exit; a lookup error is `unknown`. A container has no exit; any other mode is `unknown`. */
+export async function readBackendRun(config: FlyConfig, mode: string, id: string): Promise<BackendRunRead> {
+  if (mode === "fly-machines") {
+    if (!config.flySessionsToken || !config.flySessionsApp) return { state: "unknown", exit: null };
+    try {
+      const machine = await getMachine(config.flySessionsToken, config.flySessionsApp, id);
+      const state = flyMachineState(machine);
+      return { state, exit: state === "ended" ? readMachineExit(machine) : null };
+    // A lookup error is `unknown` by design (AII-1125); the watch step's retry bound applies to the step, not to this read.
+    } catch (err) {
+      if (err instanceof Error && err.message.includes("404")) return { state: "ended", exit: { ...NO_EXIT } };
+      console.error(`[backend-run] Failed to read Fly machine ${id}:`, err);
+      return { state: "unknown", exit: null };
+    }
+  }
+  if (mode === "local-docker") return { state: await classifyLocalContainer(id), exit: null };
+  return { state: "unknown", exit: null };
 }

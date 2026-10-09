@@ -20,6 +20,7 @@ import {
   DEFAULT_BASE_REPO,
 } from "./pipeline/steps/kg-tracker-data.js";
 import { postDryRunReport } from "./kg-refresh-rail.js";
+import type { StepStatus } from "./pipeline/types.js";
 
 const execFile = promisify(execFileCb);
 
@@ -72,8 +73,20 @@ export interface RefreshOutcome {
   stampAfter: string | null;
   /** True for a dry-run outcome (AII-632): the local rail never ran and `stage` was restored, not advanced. */
   dryRun?: boolean;
+  /** The `KgRefresh` workflow key (dispatch id) that wrote this record; absent on records from before AII-1129. */
+  dispatchId?: string;
   /** Per-part {part, prev, new} rows from the push guard. Present on a dry-run outcome or a real `KG_SNAPSHOT_TRACKER_REGRESSION` refusal (AII-638) when the runner reported one. */
   partTable?: Array<{ part: string; prev: string; new: string }>;
+  /** Every runner step the workflow saw, in pipeline order (AII-1134); absent when the runner reported none. */
+  steps?: KgRefreshStepRecord[];
+}
+
+export interface KgRefreshStepRecord {
+  id: string;
+  status: StepStatus;
+  startedAt: string;
+  endedAt: string | null;
+  durationMs: number | null;
 }
 
 /**
@@ -177,10 +190,14 @@ export interface KgRefreshStatus {
   /** The last dry-run with no PR report target (admin page or tool); never written to `lastRefresh`. */
   lastDryRun: { ok: boolean; at: number; detail: string; partTable?: Array<{ part: string; prev: string; new: string }> } | null;
   stage: KgRefreshStage;
+  /** The runner step in flight, when the workflow has one (AII-1134). */
+  runnerStep?: { id: string; status: StepStatus };
   /** Which materialize path the next refresh will stage (AII-602). */
   materialize: "rdflib" | "direct";
-  /** The effective Fly KG machine size the next Fly refresh will use (`set_kg_fly_machine`). */
-  flyMachine?: { cpuKind: "shared" | "performance"; cpus: number; memoryMb: number; source: "override" | "mapping" | "default" };
+  /** The `kg-refresh` Fly machine profile the next refresh will use (`set_fly_machine_profile`). */
+  flyMachine?: { cpuKind: "shared" | "performance"; cpus: number; memoryMb: number; idleTimeoutMs: number; source: "profile" | "default" };
+  /** The `KgRefresh` workflow to look up in the journal: the in-flight run, else the last refresh's; null when neither is known. */
+  restate: { service: "KgRefresh"; key: string } | null;
 }
 
 export interface KgRefreshHandle {
@@ -703,8 +720,8 @@ export const MATERIALIZE_ARGS = ["-m", "kg_ingest.materialize"] as const;
 
 /**
  * True when the low-memory `--direct` materialize path is enabled (AII-599, AII-602).
- * Resolved via the same db | env | default precedence as runner mode — KG_MATERIALIZE_DIRECT
- * seeds the setting, but an admin can flip it from the Knowledge Graph Pipelines page without a redeploy.
+ * Resolved from the DB setting (default false) — KG_MATERIALIZE_DIRECT seeds it once on first
+ * boot, and an admin can flip it from the Knowledge Graph Pipelines page without a redeploy.
  * Off by default until the configured KG_SOURCE_REPO derivative carries base PR #34's
  * `--direct` / `nt_parts` support.
  */
@@ -712,7 +729,7 @@ function materializeDirectEnabled(): boolean {
   return getKgMaterializeDirect().enabled;
 }
 
-/** MATERIALIZE_ARGS, with `--direct` appended when KG_MATERIALIZE_DIRECT=true (AII-599). */
+/** MATERIALIZE_ARGS, with `--direct` appended when the materialize-direct setting is on (AII-599). */
 export function materializeArgs(): string[] {
   return materializeDirectEnabled() ? [...MATERIALIZE_ARGS, "--direct"] : [...MATERIALIZE_ARGS];
 }

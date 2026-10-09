@@ -25,13 +25,14 @@ Companion documents: [restate.md](restate.md) (engine, patterns), [restate-revie
 |---|---|---|---|
 | `KgRefresh` | Workflow | trigger id (= the dispatch id, AII-938) | `src/restate/kg-refresh-workflow.ts` |
 | `KgRepo` | Virtual Object | KG source repo slug | `src/restate/kg-repo.ts` |
+| `FlyMachineProfile` | Virtual Object | pipeline phase (`kg-refresh`) | `src/restate/fly-machine-profile.ts` |
 | `PlanningRun` | Workflow | dispatch id | `src/restate/planning-run-workflow.ts` |
 | `ReviewFixAttempt` | Workflow | attempt id | `src/restate/review-fix-attempt.ts` |
 | `ReviewFixPR` | Virtual Object | PR key | `src/restate/review-fix-pr.ts` |
 | `Operator` | Virtual Object | operator identity | `src/restate/operator-object.ts` |
 | `orchestratorTools` | Service | — | `src/restate/tools.ts` |
 
-All seven register through one endpoint (`src/restate/endpoint.ts`, `src/index.ts`). The service
+All eight register through one endpoint (`src/restate/endpoint.ts`, `src/index.ts`). The service
 and handler types that the typed clients use are in `src/restate/kg-refresh-types.ts`.
 
 ### Lifecycle kit and contract suite

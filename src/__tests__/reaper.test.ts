@@ -801,3 +801,99 @@ describe("sweepOrphanedMachines — kg-refresh issue-terminal exclusion", () => 
     expect(provider.fetchLifecycleStates).not.toHaveBeenCalled();
   });
 });
+
+// ---------- sweepOrphanedMachines — durable-runner machines ----------
+
+describe("sweepOrphanedMachines — durable-runner machines", () => {
+  const terminalJob = makeJob({ id: 7, status: "completed", teamKey: "ENG", issueIdentifier: "ENG-7" });
+
+  function durableMachine(id: string, extra: Record<string, string> = {}, purpose = "durable-runner") {
+    return makeMachine(id, {
+      config: {
+        ...makeMachine(id).config,
+        metadata: { orchestrator_app: "my-orchestrator", purpose, ...extra },
+      },
+    });
+  }
+  const nowSec = () => Math.floor(Date.now() / 1000);
+
+  it("skips a durable-runner machine with no durable_until, recording nothing", async () => {
+    vi.mocked(listMachines).mockResolvedValueOnce([durableMachine("m-d")] as never);
+    vi.mocked(getJobByMachineId).mockReturnValue(terminalJob);
+    await sweepOrphanedMachines(makeConfig(false), makeHelpers());
+    expect(destroyMachine).not.toHaveBeenCalled();
+    expect(recordReaperAction).not.toHaveBeenCalled();
+  });
+
+  it("skips a durable-runner machine with no job row (not an orphan)", async () => {
+    vi.mocked(listMachines).mockResolvedValueOnce([durableMachine("m-d")] as never);
+    vi.mocked(getJobByMachineId).mockReturnValue(null);
+    await sweepOrphanedMachines(makeConfig(false), makeHelpers());
+    expect(destroyMachine).not.toHaveBeenCalled();
+    expect(recordReaperAction).not.toHaveBeenCalled();
+  });
+
+  it("skips a durable-runner machine whose durable_until is in the future", async () => {
+    const m = durableMachine("m-d", { durable_until: String(nowSec() + 3600) });
+    vi.mocked(listMachines).mockResolvedValueOnce([m] as never);
+    vi.mocked(getJobByMachineId).mockReturnValue(terminalJob);
+    await sweepOrphanedMachines(makeConfig(false), makeHelpers());
+    expect(destroyMachine).not.toHaveBeenCalled();
+    expect(recordReaperAction).not.toHaveBeenCalled();
+  });
+
+  it("destroys a durable-runner machine past durable_until with rule durable-expired", async () => {
+    const m = durableMachine("m-d", { durable_until: String(nowSec() - 3600) });
+    vi.mocked(listMachines).mockResolvedValueOnce([m] as never);
+    vi.mocked(getJobByMachineId).mockReturnValue(terminalJob);
+    vi.mocked(destroyMachine).mockResolvedValueOnce(undefined);
+    await sweepOrphanedMachines(makeConfig(false), makeHelpers());
+    expect(destroyMachine).toHaveBeenCalledWith(TOKEN, APP, "m-d");
+    expect(recordReaperAction).toHaveBeenCalledTimes(1);
+    expect(recordReaperAction).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ruleMatched: "durable-expired",
+        machineId: "m-d",
+        tenantId: null,
+        issueIdentifier: null,
+        ageSeconds: expect.any(Number),
+        dryRun: false,
+      }),
+    );
+  });
+
+  it.each(["soon", "", "NaN"])("treats durable_until %j as expired with one warning", async (bad) => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.mocked(listMachines).mockResolvedValueOnce([durableMachine("m-d", { durable_until: bad })] as never);
+    vi.mocked(getJobByMachineId).mockReturnValue(terminalJob);
+    vi.mocked(destroyMachine).mockResolvedValueOnce(undefined);
+    await sweepOrphanedMachines(makeConfig(false), makeHelpers());
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(destroyMachine).toHaveBeenCalledWith(TOKEN, APP, "m-d");
+    expect(recordReaperAction).toHaveBeenCalledWith(expect.objectContaining({ ruleMatched: "durable-expired" }));
+  });
+
+  it("still destroys a session machine with a terminal job via stale-terminal-job", async () => {
+    vi.mocked(listMachines).mockResolvedValueOnce([durableMachine("m-s", {}, "session")] as never);
+    vi.mocked(getJobByMachineId).mockReturnValue(terminalJob);
+    vi.mocked(destroyMachine).mockResolvedValueOnce(undefined);
+    await sweepOrphanedMachines(makeConfig(false), makeHelpers());
+    expect(destroyMachine).toHaveBeenCalledWith(TOKEN, APP, "m-s");
+    expect(recordReaperAction).toHaveBeenCalledWith(expect.objectContaining({ ruleMatched: "stale-terminal-job" }));
+  });
+
+  it("dry run logs would-destroy for durable-expired and makes no Fly call", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const m = durableMachine("m-d", { durable_until: String(nowSec() - 3600) });
+    vi.mocked(listMachines).mockResolvedValueOnce([m] as never);
+    await sweepOrphanedMachines(makeConfig(true), makeHelpers());
+    expect(destroyMachine).not.toHaveBeenCalled();
+    expect(log).toHaveBeenCalledWith(
+      expect.stringMatching(/\[reaper\] rule=durable-expired machine=m-d tenant=- issue=- age_s=\d+ dry_run=true/),
+    );
+    expect(recordReaperAction).toHaveBeenCalledWith(
+      expect.objectContaining({ ruleMatched: "durable-expired", dryRun: true }),
+    );
+  });
+});

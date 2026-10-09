@@ -1874,37 +1874,109 @@ describe("handleRunnerProgress", () => {
     expect(stepLog.getStepsByJobId(jobId)).toEqual([]);
   });
 
-  it("contract: KgRefresh.progress — a real RunSignalSender post is accepted by the real handler", async () => {
-    const { token, dispatchId } = runnerTokens.mintRunToken({
-      issueId: "kg",
-      phase: "kg-refresh",
-      audience: "progress",
-      secret: SECRET,
-      ttlSeconds: 600,
-      mappingTeamKey: "",
-    });
-    const kgRefreshClient = { progress: vi.fn(async () => ({ status: "accepted" })) };
-    const responses: Array<{ status: number; body: unknown }> = [];
-    const urls: string[] = [];
-    const fetchImpl = (async (url: string, init?: RequestInit) => {
-      urls.push(url);
-      const headers = init?.headers as Record<string, string>;
+  describe("kg-refresh step reports", () => {
+    function kgToken() {
+      return runnerTokens.mintRunToken({
+        issueId: "kg",
+        phase: "kg-refresh",
+        audience: "progress",
+        secret: SECRET,
+        ttlSeconds: 600,
+        mappingTeamKey: "",
+      });
+    }
+    const kgStep = (extra: Record<string, unknown> = {}) => ({
+      id: "kg-ingest",
+      type: "custom",
+      status: "running",
+      started_at: "2026-10-07T00:00:00.000Z",
+      ended_at: null,
+      parent_step_id: null,
+      inputs: {},
+      outputs: {},
+      logs_url: null,
+      ...extra,
+    }) as never;
+
+    it("passes a validated step to the client", async () => {
+      const { token, dispatchId } = kgToken();
+      const kgRefreshClient = { progress: vi.fn(async () => ({ status: "accepted" })) };
       const res = await runnerCallback.handleRunnerProgress({
-        authorization: headers.Authorization,
-        body: JSON.parse(init?.body as string),
+        authorization: `Bearer ${token}`,
+        body: { step: kgStep() },
         secret: SECRET,
         kgRefreshClient: kgRefreshClient as never,
       });
-      responses.push(res);
-      return new Response(JSON.stringify(res.body), { status: res.status });
-    }) as unknown as typeof fetch;
+      expect(res.status).toBe(200);
+      expect(kgRefreshClient.progress).toHaveBeenCalledWith(dispatchId, expect.objectContaining({ id: "kg-ingest", status: "running" }));
+    });
 
-    const { RunSignalSender } = await import("../pipeline/run-signal.js");
-    await new RunSignalSender("http://orchestrator.test", token, { fetchImpl, retryDelaysMs: [] }).signal("progress");
+    it("calls the client with no step for a bare heartbeat", async () => {
+      const { token, dispatchId } = kgToken();
+      const kgRefreshClient = { progress: vi.fn(async () => ({ status: "accepted" })) };
+      const res = await runnerCallback.handleRunnerProgress({
+        authorization: `Bearer ${token}`,
+        body: {},
+        secret: SECRET,
+        kgRefreshClient: kgRefreshClient as never,
+      });
+      expect(res.status).toBe(200);
+      expect(kgRefreshClient.progress).toHaveBeenCalledWith(dispatchId);
+    });
 
-    expect(urls).toEqual(["http://orchestrator.test/runner/progress"]);
-    expect(responses.map((r) => r.status)).toEqual([200]);
-    expect(kgRefreshClient.progress).toHaveBeenCalledWith(dispatchId);
+    it("answers 400 invalid_step_id for a malformed step", async () => {
+      const { token } = kgToken();
+      const kgRefreshClient = { progress: vi.fn(async () => ({ status: "accepted" })) };
+      const res = await runnerCallback.handleRunnerProgress({
+        authorization: `Bearer ${token}`,
+        body: { step: { id: 1 } } as never,
+        secret: SECRET,
+        kgRefreshClient: kgRefreshClient as never,
+      });
+      expect(res.status).toBe(400);
+      expect(res.body).toMatchObject({ error: "invalid_step_id" });
+      expect(kgRefreshClient.progress).not.toHaveBeenCalled();
+    });
+
+    it("redacts credentials before the client is called", async () => {
+      const { token } = kgToken();
+      const kgRefreshClient = { progress: vi.fn(async (..._args: unknown[]) => ({ status: "accepted" })) };
+      await runnerCallback.handleRunnerProgress({
+        authorization: `Bearer ${token}`,
+        body: { step: kgStep({ inputs: { githubToken: "ghs_secret", machineNonce: "n", repoOwner: "org" } }) },
+        secret: SECRET,
+        kgRefreshClient: kgRefreshClient as never,
+      });
+      const sent = kgRefreshClient.progress.mock.calls[0]![1];
+      expect(JSON.stringify(sent)).not.toContain("ghs_secret");
+      expect((sent as { inputs: unknown }).inputs).toEqual({ repoOwner: "org" });
+    });
+
+    it("contract: KgRefresh.progress — a real TokenStepReporter step post is accepted by the real handler", async () => {
+      const { token, dispatchId } = kgToken();
+      const kgRefreshClient = { progress: vi.fn(async () => ({ status: "accepted" })) };
+      const responses: Array<{ status: number }> = [];
+      const urls: string[] = [];
+      const fetchImpl = (async (url: string, init?: RequestInit) => {
+        urls.push(url);
+        const headers = init?.headers as Record<string, string>;
+        const res = await runnerCallback.handleRunnerProgress({
+          authorization: headers.Authorization,
+          body: JSON.parse(init?.body as string),
+          secret: SECRET,
+          kgRefreshClient: kgRefreshClient as never,
+        });
+        responses.push(res);
+        return new Response(JSON.stringify(res.body), { status: res.status });
+      }) as unknown as typeof fetch;
+
+      const { TokenStepReporter } = await import("../pipeline/reporter.js");
+      await new TokenStepReporter("http://orchestrator.test", token, { fetchImpl, retryDelaysMs: [] }).report(kgStep() as never);
+
+      expect(urls).toEqual(["http://orchestrator.test/runner/progress"]);
+      expect(responses.map((r) => r.status)).toEqual([200]);
+      expect(kgRefreshClient.progress).toHaveBeenCalledWith(dispatchId, expect.objectContaining({ id: "kg-ingest" }));
+    });
   });
 });
 

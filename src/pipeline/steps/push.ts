@@ -654,6 +654,11 @@ function buildPullRequestBody(
     "",
     "## Test plan",
     `- [${testsSummaryChecked ? "x" : " "}] ${testsSummary}`,
+    // Blank line first: a non-blank line right after a list item is a lazy continuation in GFM
+    // and would render on the checkbox line itself.
+    "",
+    TEST_VERDICT_SENTENCE,
+    "",
     ...(retrySucceeded ? ["- [x] Initial dependency install failed; it succeeded after this change."] : []),
     "- [ ] Manual: review the changed behavior against the ticket acceptance criteria.",
     "",
@@ -662,6 +667,10 @@ function buildPullRequestBody(
     `Generated with AI-Implement · harness: Claude Code · model: ${context.data.model ?? "unknown"} · provider: ${context.data.provider ?? "anthropic"}`,
   ].join("\n");
 }
+
+/** Plain text under the Test plan checkbox: CI, not the runner's preflight line, is the verdict. */
+const TEST_VERDICT_SENTENCE =
+  "The CI checks on this PR are the source of truth for the test verdict. The line above is the runner's own pre-push report.";
 
 /**
  * Leads the PR body (before the unapproved section, per the "why first" rationale:

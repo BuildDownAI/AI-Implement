@@ -10,16 +10,13 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 // Mocked so rotate()'s allowlist re-check and auth-event emission don't need the
 // access_entries table or a real event sink for every test in this file — most tests
 // exercise paths before either is reached. Individual tests override the return value.
-// The table initializers are stubbed so testDb can still create every other boot table.
 vi.mock("../access-entries.js", () => ({
   getEffectiveAllowlist: vi.fn(),
   matchAccessEntry: vi.fn(),
-  initAccessEntriesTable: vi.fn(),
 }));
 vi.mock("../mcp-auth-events.js", () => ({
   recordAuthEvent: vi.fn(),
   resolveClientPath: vi.fn(() => "unknown"),
-  initAuthEventsTable: vi.fn(),
 }));
 
 import crypto from "node:crypto";

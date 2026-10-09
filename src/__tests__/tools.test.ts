@@ -14,8 +14,9 @@ import {
   getProjectBinding,
   kgPath,
   kgHybridSearch,
+  kgStageForRunnerStep,
   getKgStatusTool,
-  setKgFlyMachineTool,
+  setFlyMachineProfileTool,
   getTenantHealth,
   getIssueReportCardTool,
   getFleetReportTool,
@@ -35,6 +36,7 @@ import {
   getReviewFixActivityTool,
   setReviewFixAttemptsFacade,
 } from "../restate/tools.js";
+import { KG_REFRESH_RUNNER_STEPS } from "../restate/kg-refresh-types.js";
 import { discoverTools, callTool, callToolAsSystem, toolCatalog } from "../restate/tools-client.js";
 import type { Caller } from "../mcp-identity.js";
 import { setKgMemoryProvider } from "../kg-provider.js";
@@ -43,7 +45,8 @@ import type { PreflightCheckResult, RefreshOutcome } from "../kg-refresh.js";
 import type { KgRefreshToolDeps } from "../restate/kg-refresh-production.js";
 import { getMappings } from "../config.js";
 import { setOrchestratorSetting } from "../orchestrator-settings.js";
-import { initSettingsTable, getKgFlyMachineOverride, setKgFlyMachineOverride } from "../runner-mode.js";
+import { initSettingsTable } from "../runner-mode.js";
+import { FLY_MACHINE_PROFILE_DEFAULTS, mergeProfile, type FlyMachineProfileConfig } from "../restate/fly-machine-profile.js";
 import { initLogTable } from "../log.js";
 import { getRestateStatus, setRestateStatus, resetRestateStatus } from "../restate/status.js";
 import { getIssueReportCard, getFleetReport } from "../report-card.js";
@@ -58,6 +61,11 @@ import {
 vi.mock("../report-card.js", () => ({
   getIssueReportCard: vi.fn(),
   getFleetReport: vi.fn(),
+}));
+
+vi.mock("../fly-machines.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../fly-machines.js")>()),
+  getMachine: vi.fn(),
 }));
 
 vi.mock("../config.js", async (importOriginal) => ({
@@ -743,6 +751,7 @@ describe("migrated read handlers (AII-711)", () => {
 
     async function stageFor(opts: {
       last?: RefreshOutcome | null; inFlight?: { triggerId: string; startedAt: number } | null; step?: string | null; statusThrows?: boolean;
+      runnerStep?: { id: string; status: string } | null;
       dryRun?: RefreshOutcome | null; readServedStamp?: () => Promise<string | null>;
     }) {
       setKgRefreshToolDeps(kgToolDeps({
@@ -751,17 +760,45 @@ describe("migrated read handlers (AII-711)", () => {
       }));
       const ctx = {
         ...fakeContext("get_kg_status"),
-        objectClient: () => ({ status: async () => opts.inFlight ?? null, lastAdminDryRun: async () => opts.dryRun ?? null }),
+        objectClient: () => ({
+          status: async () => opts.inFlight ?? null,
+          lastAdminDryRun: async () => opts.dryRun ?? null,
+          get: async () => ({ config: { cpuKind: "performance", cpus: 2, memoryMb: 8192, idleTimeoutMs: 1 }, source: "default" }),
+        }),
         workflowClient: () => ({
           status: async () => {
             if (opts.statusThrows) throw new Error("no such workflow");
-            return { step: opts.step ?? null, startedAt: 1, triggerId: "t1", runId: null, dryRun: false };
+            return { step: opts.step ?? null, startedAt: 1, triggerId: "t1", runId: null, dryRun: false, runnerStep: opts.runnerStep ?? null };
           },
         }),
       } as unknown as restate.Context;
       const result = await getKgStatusTool(ctx, { caller: system, args: {} });
       return JSON.parse(result.content[0].text);
     }
+
+    it("kgStageForRunnerStep answers every (runner step x status) pair", () => {
+      const statuses = ["running", "passed", "failed", "skipped", "cancelled"] as const;
+      const expected = (id: string, status: string) => {
+        if (id === "kg-ingest") return "ingest-running";
+        if (id === "kg-snapshot-push") return status === "passed" ? "snapshot-landed" : "ingest-running";
+        return "checking";
+      };
+      for (const id of KG_REFRESH_RUNNER_STEPS) {
+        for (const status of statuses) expect(kgStageForRunnerStep(id, status), `${id}/${status}`).toBe(expected(id, status));
+      }
+    });
+
+    it("an in-flight runnerStep sets stage and is reported; without one the workflow step maps as before", async () => {
+      const inFlight = { triggerId: "t1", startedAt: 1 };
+      const live = await stageFor({ inFlight, step: "await-progress", runnerStep: { id: "kg-ingest", status: "running" } });
+      expect(live.stage).toBe("ingest-running");
+      expect(live.runnerStep).toEqual({ id: "kg-ingest", status: "running" });
+      const early = await stageFor({ inFlight, step: "await-progress", runnerStep: { id: "clone", status: "passed" } });
+      expect(early.stage).toBe("checking");
+      const none = await stageFor({ inFlight, step: "merge", runnerStep: null });
+      expect(none.stage).toBe("snapshot-landed");
+      expect(none).not.toHaveProperty("runnerStep");
+    });
 
     it.each([
       ["no record", null, "idle"],
@@ -824,10 +861,27 @@ describe("migrated read handlers (AII-711)", () => {
       expect(status.servedStamp).toBeNull();
     });
 
+    it("restate: marker triggerId wins, else lastRefresh.dispatchId, else null", async () => {
+      const withId = { ...ok, dispatchId: "d-last" } as RefreshOutcome;
+      expect((await stageFor({ inFlight: { triggerId: "t1", startedAt: 1 }, last: withId })).restate).toEqual({ service: "KgRefresh", key: "t1" });
+      expect((await stageFor({ last: withId })).restate).toEqual({ service: "KgRefresh", key: "d-last" });
+      expect((await stageFor({ last: ok })).restate).toBeNull();
+      expect((await stageFor({})).restate).toBeNull();
+    });
+
+    it("a stored last-refresh record without steps still reads, and one with steps passes them through", async () => {
+      const status = await stageFor({ last: ok });
+      expect(status.lastRefresh).toBeTruthy();
+      expect(status.lastRefresh).not.toHaveProperty("steps");
+      const steps = [{ id: "clone", status: "passed", startedAt: "t0", endedAt: "t1", durationMs: 1 }];
+      const withSteps = await stageFor({ last: { ...ok, steps } as RefreshOutcome });
+      expect((withSteps.lastRefresh as { steps?: unknown }).steps).toEqual(steps);
+    });
+
     it("keeps the KgRefreshStatus shape", async () => {
       const status = await stageFor({ last: ok });
       expect(Object.keys(status).sort()).toEqual(
-        ["deployHeld", "flyMachine", "kgDegraded", "kgUnavailable", "lastDryRun", "lastRefresh", "materialize", "running", "servedStamp", "sidecar", "stage"].sort(),
+        ["deployHeld", "flyMachine", "kgDegraded", "kgUnavailable", "lastDryRun", "lastRefresh", "materialize", "restate", "running", "servedStamp", "sidecar", "stage"].sort(),
       );
     });
   });
@@ -853,6 +907,14 @@ describe("get_tenant_health restate health field (AII-807)", () => {
     const result = await getTenantHealth(fakeContext("get_tenant_health"), { caller: system, args: {} });
     const parsed = JSON.parse(result.content[0].text) as { restate: unknown };
     expect(parsed.restate).toEqual({ sidecar: { state: "starting" }, registration: { state: "not-attempted" } });
+  });
+
+  it("includes both retention settings", async () => {
+    (getMappings as ReturnType<typeof vi.fn>).mockReturnValue({});
+    const result = await getTenantHealth(fakeContext("get_tenant_health"), { caller: system, args: {} });
+    const parsed = JSON.parse(result.content[0].text) as { restateRetentionDays: unknown; volumeSnapshotRetentionDays: unknown };
+    expect(typeof parsed.restateRetentionDays).toBe("number");
+    expect(typeof parsed.volumeSnapshotRetentionDays).toBe("number");
   });
 
   it("reflects a ready sidecar with a declined-conflict registration", async () => {
@@ -1513,64 +1575,65 @@ describe("dispatch reservation tools (AII-1069)", () => {
   });
 });
 
-describe("set_kg_fly_machine / get_kg_status flyMachine (AII-1120)", () => {
-  const mapping = { AII: { owner: "org", repo: "kg", machineCpus: 2, machineMemoryMb: 4096 } };
+describe("set_fly_machine_profile / get_kg_status flyMachine (AII-1130)", () => {
+  // A stand-in for the FlyMachineProfile object that runs the real merge/validation.
+  const store: { current: FlyMachineProfileConfig | null } = { current: null };
+  const setKeys: string[] = [];
+  const profileClient = (key: string) => ({
+    get: async () => ({ config: store.current ?? { ...FLY_MACHINE_PROFILE_DEFAULTS["kg-refresh"] }, source: store.current ? "profile" : "default" }),
+    set: async (patch: Partial<FlyMachineProfileConfig>) => {
+      setKeys.push(key);
+      store.current = mergeProfile(store.current ?? FLY_MACHINE_PROFILE_DEFAULTS["kg-refresh"], patch);
+      return { config: store.current, source: "profile" };
+    },
+  });
+  const ctxFor = (name: string) => ({
+    ...fakeContext(name),
+    objectClient: (_def: unknown, key: string) => profileClient(key),
+  }) as unknown as restate.Context;
 
-  beforeAll(() => initSettingsTable());
   beforeEach(() => {
-    (getMappings as ReturnType<typeof vi.fn>).mockReturnValue(mapping);
+    store.current = null;
+    setKeys.length = 0;
     setKgRefreshToolDeps(kgToolDeps());
-    setKgFlyMachineOverride(null);
   });
-  afterEach(() => {
-    setKgRefreshToolDeps(null);
-    setKgFlyMachineOverride(null);
-  });
+  afterEach(() => setKgRefreshToolDeps(null));
 
   const call = async (args: Record<string, unknown>, caller: Caller = SYSTEM_ADMIN) =>
-    JSON.parse((await setKgFlyMachineTool(fakeContext("set_kg_fly_machine"), { caller, args })).content[0].text);
+    JSON.parse((await setFlyMachineProfileTool(ctxFor("set_fly_machine_profile"), { caller, args: { pipeline: "kg-refresh", ...args } })).content[0].text);
 
-  it("merges fields and reports the effective size", async () => {
-    await call({ cpus: 4 });
-    const res = await call({ memoryMb: 8192 });
-    expect(res.override).toEqual({ cpus: 4, memoryMb: 8192 });
-    expect(res.effective).toEqual({ cpuKind: "performance", cpus: 4, memoryMb: 8192, source: "override" });
-    expect(getKgFlyMachineOverride()).toEqual({ cpus: 4, memoryMb: 8192 });
-  });
-
-  it("clear deletes the override and returns to the KG default size", async () => {
-    await call({ memoryMb: 8192 });
-    const res = await call({ clear: true });
-    expect(res.effective).toEqual({ cpuKind: "performance", cpus: 2, memoryMb: 8192, source: "default" });
-    expect(getKgFlyMachineOverride()).toEqual({});
+  it("sets on the pipeline's key and returns the object's answer", async () => {
+    const res = await call({ memoryMb: 4096 });
+    expect(setKeys).toEqual(["kg-refresh"]);
+    expect(res).toEqual({ config: { cpuKind: "performance", cpus: 2, memoryMb: 4096, idleTimeoutMs: FLY_MACHINE_PROFILE_DEFAULTS["kg-refresh"].idleTimeoutMs }, source: "profile" });
   });
 
   it.each([
     [{ cpus: 3 }, "cpus"],
-    [{ cpus: 1.5 }, "cpus"],
     [{ memoryMb: 100 }, "memoryMb"],
     [{ memoryMb: 70000 }, "memoryMb"],
-    [{ cpuKind: "bogus" }, "cpuKind"],
-  ])("rejects %j with 400 naming %s and writes nothing", async (args, field) => {
+  ])("answers 400 naming %s from the object's rejection", async (args, field) => {
     const res = await call(args);
     expect(res.status).toBe(400);
     expect(res.body.error).toContain(field);
-    expect(getKgFlyMachineOverride()).toEqual({});
   });
 
   it("refuses a user caller", async () => {
-    const result = await setKgFlyMachineTool(fakeContext("set_kg_fly_machine"), { caller: HUMAN_USER, args: { cpus: 2 } });
-    expect(result.content[0].text).toBe("forbidden: set_kg_fly_machine requires the admin role");
-    expect(getKgFlyMachineOverride()).toEqual({});
+    const result = await setFlyMachineProfileTool(ctxFor("set_fly_machine_profile"), { caller: HUMAN_USER, args: { pipeline: "kg-refresh", cpus: 2 } });
+    expect(result.content[0].text).toBe("forbidden: set_fly_machine_profile requires the admin role");
+    expect(setKeys).toEqual([]);
   });
 
-  it("get_kg_status includes flyMachine", async () => {
-    await call({ memoryMb: 8192 });
+  it("get_kg_status reports flyMachine as the profile's config and source", async () => {
+    await call({ memoryMb: 4096 });
     const ctx = {
       ...fakeContext("get_kg_status"),
-      objectClient: () => ({ status: async () => null, lastAdminDryRun: async () => null }),
+      objectClient: (def: { name: string }, key: string) =>
+        def.name === "FlyMachineProfile" ? profileClient(key) : { status: async () => null, lastAdminDryRun: async () => null },
     } as unknown as restate.Context;
     const status = JSON.parse((await getKgStatusTool(ctx, { caller: SYSTEM_ADMIN, args: {} })).content[0].text);
-    expect(status.flyMachine).toEqual({ cpuKind: "performance", cpus: 2, memoryMb: 8192, source: "override" });
+    expect(status.flyMachine).toEqual({
+      cpuKind: "performance", cpus: 2, memoryMb: 4096, idleTimeoutMs: FLY_MACHINE_PROFILE_DEFAULTS["kg-refresh"].idleTimeoutMs, source: "profile",
+    });
   });
 });

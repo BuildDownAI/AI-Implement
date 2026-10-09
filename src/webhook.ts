@@ -12,6 +12,7 @@ import { enqueueCommentGapfill } from "./comment-gapfill-queue.js";
 import { addCommentReaction, listPullRequestFiles } from "./github.js";
 import { refreshAvailability, type SelfDeployTarget } from "./deploy-availability.js";
 import type { KgDryRunReportTarget } from "./kg-refresh.js";
+import { KG_SNAPSHOT_BRANCH_PREFIX } from "./pipeline/steps/kg-snapshot-push.js";
 
 function readRawBody(req: http.IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
@@ -72,7 +73,7 @@ export interface KgPrCheckConfig {
     entry: { ref: string; report: KgDryRunReportTarget },
     opts?: { idempotencyKey?: string },
   ) => Promise<
-    | { status: "accepted"; value?: { triggerId: string } | { queued: true } | { duplicate: true } }
+    | { status: "accepted"; value?: { triggerId: string } | { queued: true } | { duplicate: true } | { closed: true } }
     | { status: "conflict" }
     | { status: "unavailable" }
   >;
@@ -198,6 +199,12 @@ async function handleKgPrCheckWebhook(
     return answer(200, { ignored: true, reason: "missing_pr_fields" }, "missing PR fields");
   }
 
+  // The refresh's own snapshot PR is merged and its branch deleted within seconds, so a dry-run
+  // of it can never start (AII-1107).
+  if (headRef.startsWith(KG_SNAPSHOT_BRANCH_PREFIX)) {
+    return answer(200, { ignored: true, reason: "rail_snapshot_pr" }, "rail snapshot PR");
+  }
+
   const key = `${repoFullName}#${prNumber}`;
   if (!kgPrCheck.githubAppId || !kgPrCheck.githubAppPrivateKey) {
     return answer(200, { ignored: true, reason: "no_app_credentials" }, "no App credentials");
@@ -250,6 +257,10 @@ async function handleKgPrCheckWebhook(
   if (value && "duplicate" in value) {
     console.log(`[kg-refresh] dry-run for ${repoFullName}@${sha} skipped (duplicate sha)`);
     return answer(200, { ignored: true, reason: "duplicate_sha" }, "duplicate head sha");
+  }
+  if (value && "closed" in value) {
+    console.log(`[kg-refresh] dry-run for ${repoFullName}@${sha} skipped (PR closed)`);
+    return answer(200, { ignored: true, reason: "pr_closed" }, "PR already closed");
   }
   if (value && "queued" in value) {
     console.log(`[kg-refresh] dry-run for ${repoFullName}@${sha} (queued dispatch)`);

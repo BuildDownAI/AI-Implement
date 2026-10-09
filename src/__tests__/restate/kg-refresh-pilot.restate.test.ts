@@ -202,6 +202,8 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
       },
       ...railFakes,
       dispatchKgRefreshRun: async () => { throw new Error("the legacy dispatcher must not run on the GHA path"); },
+      // No runner mode resolves KG to GitHub Actions now (AII-1130); the seam keeps this branch under test until AII-1110.
+      resolveExecutionMode: () => "github-actions",
       updateJobStatus,
       recordDispatch: () => {},
       getWorkflowRunStatus: async (runId) => { gh.statusCalls.push(runId); return { ...gh.runState }; },
