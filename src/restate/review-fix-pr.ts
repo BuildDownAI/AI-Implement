@@ -7,6 +7,7 @@ import * as restate from "@restatedev/restate-sdk";
 import type { ObjectContext } from "@restatedev/restate-sdk";
 import { validateScopedPrIdentity, type AttemptId, type ScopedPrIdentity } from "../review-fix-contract.js";
 import type { AcceptReviewFixWebhookEventInput, AcceptReviewFixWebhookEventOutcome } from "../review-fix-queue.js";
+import type { ReviewFixer } from "../review-process.js";
 import type { ReviewFixAdmissionRequest, ReviewFixAttemptStorePort, ReviewFixPendingFeedback } from "../review-fix-ports.js";
 
 export const REVIEW_FIX_COLLECTION_WINDOW_MS = 5_000;
@@ -21,6 +22,8 @@ export interface ReviewFixPRSnapshot {
   readonly closed: boolean;
   readonly pending: ReviewFixPendingFeedback | null;
   readonly jobTimeoutMinutes: number;
+  /** Who writes fixes for this PR's review process; `repository` means the project's own workflow does. */
+  readonly fixer: ReviewFixer;
 }
 
 /** Every observation is current SQLite state. `admit` must atomically reserve
@@ -32,6 +35,9 @@ export interface ReviewFixPRDependencies {
   load(scope: ScopedPrIdentity): Promise<ReviewFixPRSnapshot>;
   /** Projects one journaled event; atomic and idempotent on `(repo, eventId)`. */
   recordFeedback(event: ReviewFixFeedbackEvent): Promise<AcceptReviewFixWebhookEventOutcome>;
+  /** Marks the snapshotted queue row handled by the repository's own fixer
+   * (`skipped`, not `failed`: no dispatch fault occurred). Idempotent. */
+  recordDelegated(scope: ScopedPrIdentity, queueCursor: ReviewFixPendingFeedback["queueCursor"]): Promise<void>;
   /** Current project value. Read only when the first signal schedules a new
    * window; an already-scheduled timer keeps its original delay. */
   collectionWindowMs?(scope: ScopedPrIdentity): Promise<number>;
@@ -138,6 +144,12 @@ export function createReviewFixPR(deps: ReviewFixPRDependencies) {
     ctx.clear("wake");
     const snapshot = await ctx.run("load-pending", () => deps.load(scope));
     if (snapshot.closed || !snapshot.pending) return;
+    // Before the `active` check: an active attempt keeps its owner and completes on its own (ADR 031).
+    if (snapshot.fixer === "repository") {
+      const cursor = snapshot.pending.queueCursor;
+      await ctx.run("record-delegated", () => deps.recordDelegated(scope, cursor));
+      return;
+    }
     if (await ctx.get<AttemptId>("active")) {
       await schedule(ctx, "deferred", REVIEW_FIX_DEFERRED_RECHECK_MS);
       return;
