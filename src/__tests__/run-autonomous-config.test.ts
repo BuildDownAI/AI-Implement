@@ -483,6 +483,32 @@ describe("resolveRunnerInputs", () => {
     });
   });
 
+  describe("(j2) reviewProcess and trustedReviewAuthors", () => {
+    const issue = { id: "e", identifier: "AII-9", title: "t", description: "d" };
+
+    it("carries both fields from the envelope", () => {
+      const env = {
+        AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig({
+          v: 1,
+          issue,
+          reviewProcess: "claude-code-review",
+          trustedReviewAuthors: ["x[bot]"],
+        }),
+        ...BASE_ENV,
+      };
+      const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
+      expect(inputs.reviewProcess).toBe("claude-code-review");
+      expect(inputs.trustedReviewAuthors).toEqual(["x[bot]"]);
+    });
+
+    it("defaults when the envelope omits them", () => {
+      const env = { AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig({ v: 1, issue }), ...BASE_ENV };
+      const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
+      expect(inputs.reviewProcess).toBe("ai-implement");
+      expect(inputs.trustedReviewAuthors).toEqual([]);
+    });
+  });
+
   describe("(j) reviewers", () => {
     it("uses reviewers from the envelope when present", () => {
       const reviewers = [{ id: "gap-analysis", gates: false, maxTurns: 45 }];

@@ -1,4 +1,5 @@
 import type { ReferenceRepo } from "../reference-repos.js";
+import type { ReviewProcessId } from "../review-process.js";
 import type { ReviewerSelection } from "../config.js";
 
 import type { RetryPolicy } from "./retry-backoff.js";
@@ -89,6 +90,8 @@ export interface PipelineContextData {
   referenceRepos?: ReferenceRepo[];
   /** Autonomous runner: project reviewer selection from the trusted run_config envelope. */
   reviewers?: ReviewerSelection[];
+  reviewProcess?: ReviewProcessId;
+  trustedReviewAuthors?: string[];
   /** Autonomous runner: selected image-baked reviewer code resolved from the trusted package root, never the checked-out workspace. */
   trustedReviewerDefinitions?: ReadonlyMap<string, ReviewerDefinition>;
   /** Autonomous runner: optional reviewer rubric appended to the review prompt (e.g. kg-refresh-specific approval criteria). */
