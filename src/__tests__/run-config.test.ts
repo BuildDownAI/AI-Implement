@@ -394,6 +394,62 @@ describe("buildImplRunConfig", () => {
     expect(decodeRunConfig(encodeRunConfig(emptyConfig)).reviewers).toEqual([]);
   });
 
+  it("carries reviewProcess and trustedReviewAuthors when set, including an empty list, and omits them when null", () => {
+    const build = (overrides: Partial<RepoMapping>) => buildImplRunConfig({
+      issue: implBaseIssue,
+      mapping: makeMapping(overrides),
+      baseBranch: "main",
+      retryPolicy: DEFAULT_RETRY_POLICY,
+    });
+
+    const set = decodeRunConfig(encodeRunConfig(
+      build({ reviewProcess: "claude-code-review", trustedReviewAuthors: ["review-bot"] }),
+    ));
+    expect(set.reviewProcess).toBe("claude-code-review");
+    expect(set.trustedReviewAuthors).toEqual(["review-bot"]);
+
+    const empty = decodeRunConfig(encodeRunConfig(build({ trustedReviewAuthors: [] })));
+    expect(empty.trustedReviewAuthors).toEqual([]);
+
+    const nulls = build({ reviewProcess: null, trustedReviewAuthors: null });
+    expect("reviewProcess" in nulls).toBe(false);
+    expect("trustedReviewAuthors" in nulls).toBe(false);
+  });
+
+  it("drops a malformed reviewProcess with the exact warning and decodes the rest", () => {
+    for (const bad of ["github", 5]) {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const b64 = Buffer.from(JSON.stringify({ ...full, reviewProcess: bad }), "utf-8").toString("base64");
+        const decoded = decodeRunConfig(b64);
+        expect(decoded.issue.identifier).toBe("AII-1");
+        expect(decoded.reviewProcess).toBeUndefined();
+        expect(warnSpy).toHaveBeenCalledTimes(1);
+        expect(warnSpy).toHaveBeenCalledWith("[run-config] Ignoring invalid reviewProcess field; using ai-implement");
+      } finally {
+        warnSpy.mockRestore();
+      }
+    }
+  });
+
+  it("drops a malformed trustedReviewAuthors with the exact warning and decodes the rest", () => {
+    for (const bad of ["review-bot", ["a", ""], [1]]) {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const b64 = Buffer.from(JSON.stringify({ ...full, trustedReviewAuthors: bad }), "utf-8").toString("base64");
+        const decoded = decodeRunConfig(b64);
+        expect(decoded.issue.identifier).toBe("AII-1");
+        expect(decoded.trustedReviewAuthors).toBeUndefined();
+        expect(warnSpy).toHaveBeenCalledTimes(1);
+        expect(warnSpy).toHaveBeenCalledWith(
+          "[run-config] Ignoring invalid trustedReviewAuthors field; using the process's own authors",
+        );
+      } finally {
+        warnSpy.mockRestore();
+      }
+    }
+  });
+
   it("round-trips kgDryRun: true", () => {
     const cfg: RunConfigV1 = {
       v: 1,

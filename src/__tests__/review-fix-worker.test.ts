@@ -296,6 +296,19 @@ describe("GithubReviewFixWorker.launch", () => {
     expect(runConfig.dependencyTokenScope).toBeUndefined();
   });
 
+  it("carries reviewProcess and trustedReviewAuthors into the run config, and omits them when null", async () => {
+    seedMapping({ reviewProcess: "claude-code-review", trustedReviewAuthors: ["review-bot"] });
+    const { resolver } = makeCredentials();
+    const t = makeTransport();
+    t.setDispatchImpl(async () => ({ success: true, status: 200, outcome: "accepted", runId: 9004 }));
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
+    await worker.launch(await worker.prepare(makeAttempt({ attemptId: "attempt-review-process" })));
+    const dispatched = t.dispatchCalls[0] as { inputs: Record<string, unknown> };
+    const runConfig = JSON.parse(Buffer.from(dispatched.inputs.run_config as string, "base64").toString("utf8"));
+    expect(runConfig.reviewProcess).toBe("claude-code-review");
+    expect(runConfig.trustedReviewAuthors).toEqual(["review-bot"]);
+  });
+
   it("returns unknown, never throws, when the mapping cannot be resolved", async () => {
     // Table exists but carries no mapping for this repository.
     config.initMappingsTable();
