@@ -193,10 +193,17 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
       config: {
         githubAppId: "test-app-id", githubAppPrivateKey: "test-private-key", sessionImage: "runner:test",
         runnerImageExplicit: false, runnerCallbackBaseUrl: "https://orchestrator.test", runnerTokenSecret: SECRET,
-        flySessionsToken: null, flySessionsApp: null,
+        flySessionsToken: null, flySessionsApp: null, flySessionsRegion: null,
+        localRunnerImage: "local:img", localRunnerOrchestratorUrl: null, healthPort: 8080,
+        anthropicApiKey: null, claudeOAuthToken: null,
       },
       ...railFakes,
-      dispatchKgRefreshRun: async () => { throw new Error("the legacy dispatcher must not run on the GHA path"); },
+      // Sender deps: the GitHub Actions path uses the faked dispatch POST; the machine backends must not run.
+      getInstallationToken: async () => "tok",
+      resolveRunnerImage: async () => undefined,
+      postWorkflowDispatch: ((opts: { inputs: Record<string, string | undefined> }) => sim.postWorkflowDispatch(opts)) as never,
+      keptMachineFly: () => { throw new Error("the Fly sender must not run on the GHA path"); },
+      startLocalRunnerContainer: async () => { throw new Error("the local Docker sender must not run on the GHA path"); },
       // No runner mode resolves KG to GitHub Actions now (AII-1130); the seam keeps this branch under test until AII-1110.
       resolveExecutionMode: () => "github-actions",
       updateJobStatus,

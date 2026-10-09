@@ -1,9 +1,14 @@
 // Unit tests for the three KG refresh senders (AII-1148). Fakes for every dependency: no Docker, Fly, or GitHub.
 import { describe, expect, it, vi } from "vitest";
 import { createKgRefreshSenders, type KgRefreshSendInput, type KgRefreshSenderDeps } from "../restate/kg-refresh-senders.js";
-import type { KeptMachineFly } from "../restate/kg-refresh-production.js";
+import { syncRowToMachineNonce, type KeptMachineFly } from "../restate/kg-refresh-production.js";
 import type { CreateMachineOpts, Machine } from "../fly-machines.js";
 import { decodeRunConfig, type RunConfigV1 } from "../run-config.js";
+
+vi.mock("../restate/kg-refresh-production.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../restate/kg-refresh-production.js")>()),
+  syncRowToMachineNonce: vi.fn(),
+}));
 
 const IDENTIFIER = "KG-REFRESH · x9";
 const NONCE = "nonce-secret-123";
@@ -104,6 +109,17 @@ describe("fly-machines sender", () => {
     expect(fly.startMachine).toHaveBeenCalledWith("m-kept");
     expect(result).toMatchObject({ jobId: "m-kept", machineId: "m-kept", created: false });
     expect(result.replaced).toBeUndefined();
+  });
+
+  it("re-arms the row to the nonce a reused started machine carries", async () => {
+    const { deps, fly } = makeDeps();
+    (fly.getMachine as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      id: "m-kept", state: "started",
+      config: { metadata: { dispatch_id: "d-1" }, env: { MACHINE_NONCE: "attempt-1-nonce" } },
+    });
+    const result = await createKgRefreshSenders(deps)["fly-machines"](makeInput({ machineId: "m-kept" }));
+    expect(syncRowToMachineNonce).toHaveBeenCalledWith("d-1", NONCE, "attempt-1-nonce");
+    expect(JSON.stringify(result)).not.toContain("attempt-1-nonce");
   });
 
   it("returns no nonce and no token in the journaled result", async () => {

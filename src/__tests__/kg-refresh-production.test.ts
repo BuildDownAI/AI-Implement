@@ -71,8 +71,17 @@ import {
   seedFlyMachineProfileFromOverride,
   type KgRefreshProductionInput,
 } from "../restate/kg-refresh-production.js";
-import { decodeRunConfig } from "../run-config.js";
+import { buildKgRefreshRunConfig, decodeRunConfig } from "../run-config.js";
 import { verifyRunToken } from "../runner-tokens.js";
+
+function makeKeptFly(): KeptMachineFly {
+  return {
+    createMachine: vi.fn(async () => ({ id: "m-1" })),
+    getMachine: vi.fn(async () => ({ state: "stopped" })),
+    updateMachine: vi.fn(async () => ({})),
+    startMachine: vi.fn(async () => ({})),
+  } as unknown as KeptMachineFly;
+}
 
 function makeInput(overrides: Partial<KgRefreshProductionInput> = {}): KgRefreshProductionInput {
   const noop = vi.fn();
@@ -81,7 +90,9 @@ function makeInput(overrides: Partial<KgRefreshProductionInput> = {}): KgRefresh
     config: {
       githubAppId: "1", githubAppPrivateKey: "key", sessionImage: "img", runnerImageExplicit: false,
       runnerCallbackBaseUrl: "https://orch.example", runnerTokenSecret: "secret",
-      flySessionsToken: "fly-token", flySessionsApp: "fly-app",
+      flySessionsToken: "fly-token", flySessionsApp: "fly-app", flySessionsRegion: null,
+      localRunnerImage: "local:img", localRunnerOrchestratorUrl: null, healthPort: 8080,
+      anthropicApiKey: null, claudeOAuthToken: null,
     },
     mintToken: vi.fn(async () => ({ token: "gh-token", expiresAt: "" })),
     fetchTarball: noop as never,
@@ -96,7 +107,11 @@ function makeInput(overrides: Partial<KgRefreshProductionInput> = {}): KgRefresh
     mergePullRequestFn: noop as never,
     closePullRequestFn: noop as never,
     deleteBranchFn: noop as never,
-    dispatchKgRefreshRun: vi.fn(async () => ({})),
+    getInstallationToken: vi.fn(async () => "gh-token"),
+    resolveRunnerImage: vi.fn(async () => "runner:test"),
+    postWorkflowDispatch: ((...args: unknown[]) => postWorkflowDispatch(...args)) as never,
+    keptMachineFly: () => makeKeptFly(),
+    startLocalRunnerContainer: vi.fn(async () => ({ containerId: "c-1" })) as never,
     resolveExecutionMode: () => resolvedPath.current,
     updateJobStatus: noop,
     getWorkflowRunStatus: vi.fn(async () => ({ status: "completed", conclusion: "success" })),
@@ -111,10 +126,17 @@ function makeInput(overrides: Partial<KgRefreshProductionInput> = {}): KgRefresh
   };
 }
 
+/** The envelope the workflow's `envelope` step journals, built the way the production composition builds it. */
+function envelopeFor(run: { dryRun?: boolean; kgSourceRef?: string; acceptNewBaseline?: boolean; actorEmail?: string }) {
+  return buildKgRefreshRunConfig({
+    kgSourceRepo: "acme/kg", issueIdentifier: "KG-REFRESH · t-1", runnerCallbackUrl: "https://orch.example",
+    dependencyTokenScope: "installation", ...run,
+  });
+}
+
 const dispatchInput = {
-  runConfig: { triggerId: "t-1", kgSourceRef: "feature/x" },
+  envelope: envelopeFor({ kgSourceRef: "feature/x" }),
   tokens: { runToken: "rt", progressToken: "pt", publicationToken: "pub" },
-  issueIdentifier: "KG-REFRESH · t-1",
   dispatchId: "d-workflow",
   machineId: null,
   machineNonce: null as string | null,
@@ -277,33 +299,41 @@ describe("fly dispatch without a Fly sessions app (AII-1130)", () => {
     ["no app", { flySessionsToken: "fly-token", flySessionsApp: null }],
     ["no token", { flySessionsToken: null, flySessionsApp: "fly-app" }],
     ["neither", { flySessionsToken: null, flySessionsApp: null }],
-  ])("rejects without calling the dispatcher (%s)", async (_label, fly) => {
+  ])("rejects without launching a machine (%s)", async (_label, fly) => {
     resolvedPath.current = "fly-machines";
     const err = vi.spyOn(console, "error").mockImplementation(() => {});
-    const dispatchKgRefreshRun = vi.fn(async () => ({}));
-    const input = makeInput({ dispatchKgRefreshRun });
-    const result = await createKgRefreshDispatch({ ...input, config: { ...input.config, ...fly } })(dispatchInput);
+    const createMachine = vi.fn(async () => ({ id: "m-1" }));
+    const input = makeInput({ keptMachineFly: () => ({ ...makeKeptFly(), createMachine } as unknown as KeptMachineFly) });
+    const result = await createKgRefreshDispatch({ ...input, config: { ...input.config, ...fly } })({ ...dispatchInput, machineNonce: "n" });
     expect(result).toMatchObject({ outcome: "rejected", jobId: null, executionMode: "fly-machines" });
-    expect(dispatchKgRefreshRun).not.toHaveBeenCalled();
+    expect(createMachine).not.toHaveBeenCalled();
     expect(err).toHaveBeenCalledWith(expect.stringContaining("FLY_SESSIONS_TOKEN + FLY_SESSIONS_APP are not configured"));
   });
 
   it("dispatches when both are set", async () => {
     resolvedPath.current = "fly-machines";
-    const dispatchKgRefreshRun = vi.fn(async () => ({}));
-    const result = await createKgRefreshDispatch(makeInput({ dispatchKgRefreshRun }))(dispatchInput);
+    const createMachine = vi.fn(async () => ({ id: "m-1" }));
+    const result = await createKgRefreshDispatch(makeInput({ keptMachineFly: () => ({ ...makeKeptFly(), createMachine } as unknown as KeptMachineFly) }))({ ...dispatchInput, machineNonce: "n" });
     expect(result.outcome).toBe("accepted");
-    expect(dispatchKgRefreshRun).toHaveBeenCalledTimes(1);
+    expect(createMachine).toHaveBeenCalledTimes(1);
   });
 });
 
 describe("non-GHA dispatch", () => {
-  it("passes the workflow's dispatch id through and reports an unknown job id when the backend gave none", async () => {
+  it("passes the workflow's dispatch id through to the Fly machine config", async () => {
     resolvedPath.current = "fly-machines";
-    const dispatchKgRefreshRun = vi.fn(async () => ({}));
-    const result = await createKgRefreshDispatch(makeInput({ dispatchKgRefreshRun }))(dispatchInput);
-    expect(dispatchKgRefreshRun).toHaveBeenCalledWith(expect.objectContaining({ dispatchId: "d-workflow", executionPath: "fly-machines" }));
-    expect(result).toMatchObject({ outcome: "accepted", jobId: null, executionMode: "fly-machines" });
+    const createMachine = vi.fn(async (_config: unknown) => ({ id: "m-1" }));
+    const result = await createKgRefreshDispatch(makeInput({ keptMachineFly: () => ({ ...makeKeptFly(), createMachine } as unknown as KeptMachineFly) }))({ ...dispatchInput, machineNonce: "n" });
+    expect(JSON.stringify(createMachine.mock.calls[0][0])).toContain("d-workflow");
+    expect(result).toMatchObject({ outcome: "accepted", jobId: "m-1", executionMode: "fly-machines" });
+  });
+
+  it("rejects an unknown execution mode without throwing and without calling a backend", async () => {
+    const input = makeInput();
+    const result = await createKgRefreshDispatch(input)({ ...dispatchInput, executionMode: "carrier-pigeon" });
+    expect(result).toEqual({ outcome: "rejected", jobId: null, executionMode: "carrier-pigeon" });
+    expect(postWorkflowDispatch).not.toHaveBeenCalled();
+    expect(input.startLocalRunnerContainer).not.toHaveBeenCalled();
   });
 });
 
@@ -343,26 +373,48 @@ describe("stopMachineRun wiring", () => {
 
   it("surfaces a local container id from the dispatch as the job id", async () => {
     resolvedPath.current = "local-docker";
-    const result = await createKgRefreshDispatch(makeInput({ dispatchKgRefreshRun: vi.fn(async () => ({ machineId: "c-1" })) }))(dispatchInput);
+    const result = await createKgRefreshDispatch(makeInput())({ ...dispatchInput, machineNonce: "n" });
     expect(result.jobId).toBe("c-1");
   });
 });
 
 describe("the dispatch closure writes nothing", () => {
-  it("passes the derived nonce to the legacy dispatcher and returns the machine id and URL without it", async () => {
+  it("passes the derived nonce to the Fly sender and returns the machine id and URL without it", async () => {
     resolvedPath.current = "fly-machines";
-    const dispatchKgRefreshRun = vi.fn(async () => ({ machineId: "m-1", logsUrl: "https://fly/m-1" }));
-    const result = await createKgRefreshDispatch(makeInput({ dispatchKgRefreshRun }))({ ...dispatchInput, machineNonce: "nonce-secret" });
-    expect(dispatchKgRefreshRun).toHaveBeenCalledWith(expect.objectContaining({ machineNonce: "nonce-secret" }));
+    const createMachine = vi.fn(async (_config: unknown) => ({ id: "m-1" }));
+    const result = await createKgRefreshDispatch(makeInput({ keptMachineFly: () => ({ ...makeKeptFly(), createMachine } as unknown as KeptMachineFly) }))({ ...dispatchInput, machineNonce: "nonce-secret" });
+    expect(JSON.stringify(createMachine.mock.calls[0][0])).toContain("nonce-secret");
     expect(JSON.stringify(result)).not.toContain("nonce-secret");
     expect(result.jobId).toBe("m-1");
-    expect(result.runUrl).toBe("https://fly/m-1");
+    expect(result.runUrl).toBe("https://fly.io/apps/fly-app/machines/m-1");
   });
 
   it("returns the GHA run id and URL for the workflow to project", async () => {
     postWorkflowDispatch.mockResolvedValue({ success: true, status: 200, outcome: "accepted", runId: 99, runUrl: "https://gh/run/99" });
     const result = await createKgRefreshDispatch(makeInput())(dispatchInput);
     expect(result).toMatchObject({ runId: 99, runUrl: "https://gh/run/99", jobId: "99", executionMode: "github-actions" });
+  });
+});
+
+describe("buildEnvelope", () => {
+  it("builds the envelope from the run input, the mapping's token scope and the callback URL", () => {
+    createProductionKgRefreshServices(makeInput());
+    const envelope = capturedWorkflowDeps.current!.buildEnvelope(
+      { triggerId: "t-1", dryRun: true, kgSourceRef: "pr-head", acceptNewBaseline: true, actorEmail: "a@b" },
+      "KG-REFRESH · t-1",
+    );
+    expect(envelope).toEqual({
+      v: 1,
+      issue: { id: "kg-refresh", identifier: "KG-REFRESH · t-1", title: "KG ingest", description: "" },
+      runnerPhase: "kg-refresh",
+      kgSourceRepo: "acme/kg",
+      runnerCallbackUrl: "https://orch.example",
+      dependencyTokenScope: "installation",
+      kgDryRun: true,
+      kgSourceRef: "pr-head",
+      kgAcceptNewBaseline: true,
+      kgBaselineActor: "a@b",
+    });
   });
 });
 
@@ -497,7 +549,7 @@ describe("GHA dispatch wrapper", () => {
     postWorkflowDispatch.mockResolvedValue({ success: true, status: 200, outcome: "accepted", runId: 5 });
     await createKgRefreshDispatch(makeInput())({
       ...dispatchInput,
-      runConfig: { triggerId: "t-1", kgSourceRef: "pr-head", acceptNewBaseline: true, actorEmail: "a@b" },
+      envelope: envelopeFor({ kgSourceRef: "pr-head", acceptNewBaseline: true, actorEmail: "a@b" }),
     });
     const call = postWorkflowDispatch.mock.calls[0][0];
     expect(call.ref).toBe("pr-head");
@@ -508,7 +560,7 @@ describe("GHA dispatch wrapper", () => {
 
   it("omits the accept-baseline keys when the options are unset", async () => {
     postWorkflowDispatch.mockResolvedValue({ success: true, status: 200, outcome: "accepted", runId: 5 });
-    await createKgRefreshDispatch(makeInput())({ ...dispatchInput, runConfig: { triggerId: "t-1" } });
+    await createKgRefreshDispatch(makeInput())({ ...dispatchInput, envelope: envelopeFor({}) });
     const decoded = decodeRunConfig(postWorkflowDispatch.mock.calls[0][0].inputs.run_config);
     expect(decoded).not.toHaveProperty("kgAcceptNewBaseline");
     expect(decoded).not.toHaveProperty("kgBaselineActor");
@@ -712,10 +764,10 @@ describe("the dispatch closure does not resolve the backend (AII-1146)", () => {
   it("acts on input.executionMode and leaves the rule to the workflow dependency", async () => {
     runnerMode.current = "local";
     const seam = vi.fn(() => "fly-machines");
-    const dispatchKgRefreshRun = vi.fn(async () => ({}));
-    await createKgRefreshDispatch(makeInput({ dispatchKgRefreshRun, resolveExecutionMode: seam }))({ ...dispatchInput, executionMode: "local-docker" });
+    const input = makeInput({ resolveExecutionMode: seam });
+    await createKgRefreshDispatch(input)({ ...dispatchInput, executionMode: "local-docker", machineNonce: "n" });
     expect(seam).not.toHaveBeenCalled();
-    expect(dispatchKgRefreshRun).toHaveBeenCalledWith(expect.objectContaining({ executionPath: "local-docker" }));
+    expect(input.startLocalRunnerContainer).toHaveBeenCalledTimes(1);
     runnerMode.current = "default";
   });
 
@@ -729,12 +781,13 @@ describe("the dispatch closure does not resolve the backend (AII-1146)", () => {
 });
 
 describe("KG dispatch sizes the machine from the profile (AII-1130)", () => {
-  it("passes machine through to the dispatcher and ignores the mapping size", async () => {
+  it("passes machine through to the Fly sender and ignores the mapping size", async () => {
     resolvedPath.current = "fly-machines";
     kgMappingSize.current = { machineCpus: 8, machineMemoryMb: 32768 };
-    const dispatchKgRefreshRun = vi.fn(async () => ({}));
-    await createKgRefreshDispatch(makeInput({ dispatchKgRefreshRun }))(dispatchInput);
-    expect(dispatchKgRefreshRun).toHaveBeenCalledWith(expect.objectContaining({ machine: dispatchInput.machine }));
+    const createMachine = vi.fn(async (_config: unknown) => ({ id: "m-1" }));
+    await createKgRefreshDispatch(makeInput({ keptMachineFly: () => ({ ...makeKeptFly(), createMachine } as unknown as KeptMachineFly) }))({ ...dispatchInput, machineNonce: "n" });
+    const guest = (createMachine.mock.calls[0][0] as { config: { guest: Record<string, unknown> } }).config.guest;
+    expect(guest).toMatchObject({ cpu_kind: "performance", cpus: 2, memory_mb: 8192 });
     kgMappingSize.current = {};
   });
 });

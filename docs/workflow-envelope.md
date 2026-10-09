@@ -40,7 +40,7 @@ The first step of the container job prints every input (`[dispatch-inputs] …`)
 
 ## Compatibility with older templates
 
-Every current dispatch site builds inputs through `buildEnvelopeDispatchInputs`, which never sets `runner_phase` or `runner_callback_url` — both values ride inside `run_config` instead. The one exception is the kg-refresh GHA dispatch (`dispatchKgRefreshRun` in `src/index.ts`, via `buildKgRefreshGhaDispatchBody` in `src/github.ts`), which still sends both top-level, because the AII-556-era template defaults `runner_phase` to `implementation` when the input is omitted — an omitted input on that template would run a KG refresh as an implementation.
+Every current dispatch site builds inputs through `buildEnvelopeDispatchInputs`, which never sets `runner_phase` or `runner_callback_url` — both values ride inside `run_config` instead. The one exception is the kg-refresh GHA dispatch (the GitHub Actions sender in `src/restate/kg-refresh-senders.ts`, via `buildKgRefreshGhaDispatchBody` in `src/github.ts`), which still sends both top-level, because the AII-556-era template defaults `runner_phase` to `implementation` when the input is omitted — an omitted input on that template would run a KG refresh as an implementation.
 
 GitHub rejects a `workflow_dispatch` naming an input the target workflow doesn't declare (422 `Unexpected inputs provided: [...]`). A target repo adopts a new template shape only when it merges a sync PR, so the orchestrator cannot assume every repo has re-synced. `src/github.ts` declares:
 

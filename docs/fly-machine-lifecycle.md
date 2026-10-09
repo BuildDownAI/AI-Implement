@@ -12,7 +12,7 @@ How a pipeline's Fly machine is created, reused, stopped, and destroyed. Today o
 |---|---|---|
 | `FlyMachineProfile/<pipeline>` object | Identity of the one kept machine, who holds it, the idle timer, the scrub on release, the destroy on expiry. Never sees the run's env. | `src/restate/fly-machine-profile.ts` |
 | `KgRefresh` workflow | `claim` before dispatch, `attach` after a create, `release` at the end, stop (not destroy) on timeout and cancel. | `src/restate/kg-refresh-workflow.ts` |
-| The workflow's `dispatch-<attempt>` step | The Fly writes that need the run's tokens: `create`, or `update` then `start`. Tokens are minted and consumed inside this step and never reach a handler input or the journal. | `launchKeptMachine` in `src/restate/kg-refresh-production.ts`, called from `dispatchKgRefreshRun` in `src/index.ts` |
+| The workflow's `dispatch-<attempt>` step | The Fly writes that need the run's tokens: `create`, or `update` then `start`. Tokens are minted and consumed inside this step and never reach a handler input or the journal. | `launchKeptMachine` in `src/restate/kg-refresh-production.ts`, called from the Fly sender in `src/restate/kg-refresh-senders.ts` |
 | Reaper | Backstop only: skips `durable-runner` machines, destroys one past its `durable_until` (rule `durable-expired`). | `src/reaper.ts` |
 
 The Fly write stays in the workflow's step, not in the object, because a handler input is journaled (ADR 037 section 2).

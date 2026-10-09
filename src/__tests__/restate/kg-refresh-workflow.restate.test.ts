@@ -10,6 +10,7 @@
 // (each dispatches through `KgRepo.trigger` for that reason); every other scenario still
 // dispatches `KgRefresh.run` directly with a test-chosen triggerId, and the real KgRepo's
 // `release` send for that unrelated key is a harmless no-op.
+import { buildKgRefreshRunConfig } from "../../run-config.js";
 import { randomUUID } from "node:crypto";
 import { execSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -29,6 +30,7 @@ import { createKgRepo, type KgRepoTriggerResult } from "../../restate/kg-repo.js
 import {
   createKgRefreshWorkflow,
   type KgDispatchInput,
+  type KgRefreshWorkflowDependencies,
   type KgDispatchRecord,
   type KgDispatchRowDetails,
   type KgDispatchResult,
@@ -300,7 +302,10 @@ describe("KgRefresh durable workflow", () => {
   const dispatchedIds: string[] = [];
   /** triggerId -> the run the backend "committed" before the ack was lost. */
   const dispatchThrowAfterCommit = new Map<string, number>();
+  /** Triggers whose first dispatch call fails before anything commits, so the retry dispatches again. */
+  const dispatchThrowOnce = new Set<string>();
   const dispatchedTokens: KgDispatchInput["tokens"][] = [];
+  const dispatchedEnvelopes: Array<{ dispatchId: string; envelope: KgDispatchInput["envelope"] }> = [];
   const mintedDispatchIds: string[] = [];
   const closeRowCalls: Array<{ jobId: string; status: string; conclusion?: string }> = [];
   const persistCalls: RefreshOutcome[] = [];
@@ -387,16 +392,20 @@ describe("KgRefresh durable workflow", () => {
   };
 
   async function dispatchFn(input: KgDispatchInput): Promise<KgDispatchResult> {
-    const triggerId = input.runConfig.triggerId;
+    const triggerId = input.dispatchId; // the workflow key equals the trigger id
     adoptPendingScenario(triggerId);
     const scenario = scenarios.get(triggerId);
     if (!scenario) throw new Error(`no scenario registered for trigger ${triggerId}`);
+    expect(input.envelope.issue.identifier).toBe(`KG-REFRESH · ${triggerId}`);
+    expect(input.envelope.runnerPhase).toBe("kg-refresh");
+    dispatchedEnvelopes.push({ dispatchId: input.dispatchId, envelope: input.envelope });
     contractCalls?.push("launch");
     scenario.dispatchCalls++;
     dispatchedIds.push(input.dispatchId);
     dispatchedMachines.push(input.machine);
     dispatchedTokens.push(input.tokens);
     dispatchedNonces.push(input.machineNonce);
+    if (dispatchThrowOnce.delete(triggerId)) throw new Error("dispatch failed before commit");
     const committedRunId = dispatchThrowAfterCommit.get(triggerId);
     if (committedRunId !== undefined) {
       dispatchThrowAfterCommit.delete(triggerId);
@@ -482,6 +491,11 @@ describe("KgRefresh durable workflow", () => {
     return true;
   }
 
+  const buildEnvelopeFn: KgRefreshWorkflowDependencies["buildEnvelope"] = (run, issueIdentifier) => buildKgRefreshRunConfig({
+    kgSourceRepo: KG_SOURCE_REPO, issueIdentifier, dryRun: run.dryRun, kgSourceRef: run.kgSourceRef,
+    acceptNewBaseline: run.acceptNewBaseline, actorEmail: run.actorEmail,
+  });
+
   const TEST_RETENTION_MS = 14 * 24 * 60 * 60 * 1000;
   const workflowDeps: Omit<Parameters<typeof createKgRefreshWorkflow>[0], "bootstrapDeadlineMs" | "totalDeadlineMs"> = {
     retentionMs: TEST_RETENTION_MS,
@@ -492,6 +506,7 @@ describe("KgRefresh durable workflow", () => {
       return { runToken: "run-token", progressToken: "progress-token", publicationToken: "publication-token" };
     },
     dispatch: dispatchFn,
+    buildEnvelope: buildEnvelopeFn,
     resolveDispatchRecord: resolveDispatchRecordFn,
     ...projectionFakes,
     recordDispatchRow: (input) => {
@@ -1272,6 +1287,36 @@ describe("KgRefresh durable workflow", () => {
         .toEqual(["resolve", "reserve", "nonce-1", "dispatch-1", "record-dispatch-1"]);
     }, 30_000);
 
+    it.each(VARIANTS.map(([label]) => label))("the envelope is journaled after reserve and before dispatch-1 (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "github-actions" });
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      await eventually(() => scenarios.get(triggerId)!.dispatchCalls >= 1, (ok) => ok, { label: "dispatch" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      await done;
+      const names = await journalEntryNames(env.adminAPIBaseUrl(), await runInvocationId(env, triggerId));
+      expect(names.filter((n) => n === "envelope")).toHaveLength(1);
+      expect(names.indexOf("envelope")).toBeGreaterThan(names.indexOf("reserve"));
+      expect(names.indexOf("envelope")).toBeLessThan(names.indexOf("dispatch-1"));
+    }, 30_000);
+
+    it.each(VARIANTS.map(([label]) => label))("a dispatch retry receives the same envelope as the first attempt (%s)", async (label) => {
+      const env = envFor(label);
+      const triggerId = newTriggerId();
+      const scenario = makeScenario(triggerId, { dispatchOutcome: "accepted", runId: runIdCounter++, executionMode: "fly-machines" });
+      dispatchThrowOnce.add(triggerId);
+      const done = runWorkflow(env.baseUrl(), triggerId);
+      await eventually(() => scenario.dispatchCalls >= 2, (ok) => ok, { label: "dispatch retry" });
+      await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
+      await done;
+      const seen = dispatchedEnvelopes.filter((e) => e.dispatchId === triggerId);
+      expect(seen).toHaveLength(2);
+      expect(seen[1].envelope).toEqual(seen[0].envelope);
+      const names = await journalEntryNames(env.adminAPIBaseUrl(), await runInvocationId(env, triggerId));
+      expect(names.filter((n) => n === "envelope")).toHaveLength(1);
+    }, 30_000);
+
     it.each(VARIANTS.map(([label]) => label))("a local-docker run arms a nonce too (%s)", async (label) => {
       const env = envFor(label);
       const triggerId = newTriggerId();
@@ -1608,6 +1653,7 @@ describe("KgRefresh durable workflow", () => {
       kgSourceRepo: KG_SOURCE_REPO,
       mintRunTokens: () => ({ runToken: "run-token", progressToken: "progress-token", publicationToken: "publication-token" }),
       dispatch: dispatchFn,
+      buildEnvelope: buildEnvelopeFn,
       resolveDispatchRecord: resolveDispatchRecordFn,
       ...projectionFakes,
       recordDispatchRow: (input) => { appendJobLogCalls.push(input); },
@@ -1738,6 +1784,7 @@ describe("KgRefresh durable workflow", () => {
       kgSourceRepo: KG_SOURCE_REPO,
       mintRunTokens: () => ({ runToken: "run-token", progressToken: "progress-token", publicationToken: "publication-token" }),
       dispatch: dispatchFn,
+      buildEnvelope: buildEnvelopeFn,
       resolveDispatchRecord: resolveDispatchRecordFn,
       ...projectionFakes,
       recordDispatchRow: (input) => { appendJobLogCalls.push(input); },
@@ -2804,6 +2851,7 @@ describe("KgRefresh durable workflow", () => {
       return { runToken: "run-token", progressToken: "progress-token", publicationToken: "publication-token" };
     },
       dispatch: dispatchFn,
+      buildEnvelope: buildEnvelopeFn,
       resolveDispatchRecord: resolveDispatchRecordFn,
       ...projectionFakes,
       recordDispatchRow: (input) => { appendJobLogCalls.push(input); },
@@ -2921,7 +2969,7 @@ describe("KgRefresh durable workflow", () => {
     });
 
     async function keptDispatch(input: KgDispatchInput): Promise<KgDispatchResult> {
-      const scenario = scenarios.get(input.runConfig.triggerId)!;
+      const scenario = scenarios.get(input.dispatchId)!;
       scenario.dispatchCalls++;
       const machineConfig = {
         config: { image: "img", env: { MACHINE_NONCE: `nonce-${input.dispatchId}` }, metadata: { dispatch_id: input.dispatchId } },
