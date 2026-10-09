@@ -116,7 +116,7 @@ export function createKgRefreshSenders(deps: KgRefreshSenderDeps): Record<KgExec
     });
     // A reused, already-started machine keeps the nonce it was launched with; re-arm the row to it so /api/token matches.
     syncRowToMachineNonce(input.dispatchId, machineNonce, launched.machineNonce);
-    console.log(`[kg-refresh] dispatched via Fly (${launched.reused ? "reused" : "created"} machine ${launched.machineId}) (dispatchId=${input.dispatchId})`);
+    console.log(`[kg-refresh] dispatched via Fly (${launched.reused ? "reused" : "created"} machine ${launched.machineId})${launched.waitedSeconds ? ` (waited ${launched.waitedSeconds} s for the replace)` : ""} (dispatchId=${input.dispatchId})`);
     // The nonce authenticates the machine to /api/token: the workflow armed it on the row, and it never enters the journaled result.
     return {
       outcome: "accepted",
