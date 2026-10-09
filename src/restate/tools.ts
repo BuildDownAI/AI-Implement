@@ -17,7 +17,7 @@ import { serde } from "@restatedev/restate-sdk-zod";
 import { z } from "zod";
 import type { AccessRole } from "../access-entries.js";
 import { getRunnerMode, getKgMaterializeDirect } from "../runner-mode.js";
-import { getMappings, type RepoMapping } from "../config.js";
+import { getMappings, resolveReviewProcessId, type RepoMapping } from "../config.js";
 import { getInFlightJobs, getRunRecordMergeVerdict, getJobById, getJobByMachineId, type Job } from "../log.js";
 import {
   getMachine, listMachines, fetchMachineLogs, readMachineExit,
@@ -273,6 +273,7 @@ export const listProjects = tool(
       autoApprovePlans: m.autoApprovePlans,
       reviewers: m.reviewers,
       trustedReviewAuthors: m.trustedReviewAuthors,
+      reviewProcess: resolveReviewProcessId(m),
     }));
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   },
@@ -314,6 +315,7 @@ export const getProjectBinding = tool(
       defaultBranch: m.defaultBranch,
       tracker: { kind: m.ticketingConfig.kind, team: key },
       pickupLabel: m.ticketingConfig.kind === "linear" ? getLinearPickupLabel() : null,
+      reviewProcess: resolveReviewProcessId(m),
       kg,
     });
 
@@ -1100,7 +1102,7 @@ export const ADD_PROJECT_DESCRIPTION =
  * Exported so the unit tier can `safeParse` the documented "pass null to reset" contract
  * without going through the Restate ingress (AII-720). The nullable fields here must match
  * `upsertMappingAction`'s null-accepting set exactly (src/admin.ts) — reviewers,
- * trustedReviewAuthors, and the four caps, branchPrefix, skillsRepo, dependencyTokenScope,
+ * trustedReviewAuthors, reviewProcess, and the four caps, branchPrefix, skillsRepo, dependencyTokenScope,
  * and the two sensitive-glob fields.
  */
 export const addProjectArgsSchema = z.object({
@@ -1145,6 +1147,9 @@ export const addProjectArgsSchema = z.object({
   ),
   trustedReviewAuthors: z.array(z.string()).nullable().optional().describe(
     "Extra GitHub logins trusted as review authors for this project, additive to the built-in trusted authors (ai-implement, ai-implement[bot], and the Claude logins — github-actions[bot] is trusted separately). Omit to keep the stored value; pass null to reset to built-ins only.",
+  ),
+  reviewProcess: z.enum(["ai-implement", "claude-code-review"]).nullable().optional().describe(
+    "The project's review process. Omit to keep the stored value; pass null or \"ai-implement\" for the default. It applies only under the Restate review-fix lifecycle; a Legacy project stores it inert.",
   ),
 });
 
