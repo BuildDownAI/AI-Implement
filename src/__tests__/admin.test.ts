@@ -1981,6 +1981,43 @@ describe("admin mappings", () => {
     expect(JSON.parse(update.body).trustedReviewAuthors).toEqual(["codex-reviewer[bot]"]);
   });
 
+  it("stores reviewProcess claude-code-review on a Legacy project, and ai-implement or null as null", async () => {
+    const token = await login("secret");
+    const post = (reviewProcess?: unknown) => request("/api/mappings", "POST", "secret", {
+      teamKey: "RP1", owner: "org", repo: "app",
+      ...(reviewProcess === undefined ? {} : { reviewProcess }),
+    }, token);
+
+    const created = await post("claude-code-review");
+    expect(created.statusCode).toBe(202);
+    expect(JSON.parse(created.body).reviewProcess).toBe("claude-code-review");
+
+    const kept = await post();
+    expect(JSON.parse(kept.body).reviewProcess).toBe("claude-code-review");
+
+    const defaulted = await post("ai-implement");
+    expect(JSON.parse(defaulted.body).reviewProcess).toBeNull();
+
+    await post("claude-code-review");
+    const reset = await post(null);
+    expect(JSON.parse(reset.body).reviewProcess).toBeNull();
+  });
+
+  it("stores null reviewProcess when absent on a new mapping", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", { teamKey: "RP2", owner: "org", repo: "app" }, token);
+    expect(JSON.parse(res.body).reviewProcess).toBeNull();
+  });
+
+  it("rejects an unknown reviewProcess with the exact error", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "RP3", owner: "org", repo: "app", reviewProcess: "github",
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toBe('reviewProcess invalid: must be null, "ai-implement", or "claude-code-review"');
+  });
+
   it("resets trustedReviewAuthors to the null default via an explicit null", async () => {
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", {

@@ -96,6 +96,7 @@ function mapping(overrides: Partial<RepoMapping> & Pick<RepoMapping, "owner" | "
     referenceRepos: null,
     reviewers: null,
     reviewFixLifecycle: null,
+    reviewProcess: null,
     ...overrides,
   };
 }

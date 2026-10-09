@@ -43,6 +43,7 @@ function mapping(overrides: Partial<RepoMapping> & Pick<RepoMapping, "owner" | "
     referenceRepos: null,
     reviewers: null,
     reviewFixLifecycle: null,
+    reviewProcess: null,
     ...overrides,
   };
 }
@@ -649,6 +650,41 @@ describe("config", () => {
 
     config.initMappingsTable();
     expect(config.getMappings().LEG.trustedReviewAuthors).toBeNull();
+  });
+
+  it("round-trips reviewProcess and resolves it to a process id", () => {
+    config.initMappingsTable();
+    config.upsertMapping("CCR", mapping({ owner: "org", repo: "repo", reviewProcess: "claude-code-review" }));
+    config.upsertMapping("DEF", mapping({ owner: "org", repo: "repo", reviewProcess: null }));
+
+    const all = config.getMappings();
+    expect(all.CCR.reviewProcess).toBe("claude-code-review");
+    expect(config.resolveReviewProcessId(all.CCR)).toBe("claude-code-review");
+    expect(all.DEF.reviewProcess).toBeNull();
+    expect(config.resolveReviewProcessId(all.DEF)).toBe("ai-implement");
+  });
+
+  it("resolveReviewProcessId reads an unknown stored string as the default", () => {
+    expect(config.resolveReviewProcessId({ reviewProcess: "future" as never })).toBe("ai-implement");
+  });
+
+  it("migrates a pre-existing mappings table to include the review_process column, reading back null", () => {
+    const db = new Database(dbPath);
+    db.exec(`
+      CREATE TABLE mappings (
+        team_key TEXT PRIMARY KEY,
+        owner TEXT NOT NULL,
+        repo TEXT NOT NULL,
+        workflow_file TEXT NOT NULL,
+        default_branch TEXT NOT NULL
+      )
+    `);
+    db.prepare("INSERT INTO mappings (team_key, owner, repo, workflow_file, default_branch) VALUES (?, ?, ?, ?, ?)")
+      .run("LEG", "org", "legacy", "claude-implement.yml", "main");
+    db.close();
+
+    config.initMappingsTable();
+    expect(config.getMappings().LEG.reviewProcess).toBeNull();
   });
 
   it("round-trips branchPrefix (including null)", () => {

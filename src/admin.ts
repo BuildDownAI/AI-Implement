@@ -21,6 +21,7 @@ import {
   setMappingPaused,
   deleteMapping,
 } from "./config.js";
+import type { ReviewProcessId } from "./review-process.js";
 import type { RepoMapping, ExecutionMode, SessionMode, ClaudeProvider, ReviewerSelection } from "./config.js";
 import {
   getRunnerMode,
@@ -3045,6 +3046,7 @@ export interface UpsertMappingBody {
   prDispatchBudget?: number | null;
   reviewFixLifecycle?: string | null;
   trustedReviewAuthors?: unknown;
+  reviewProcess?: unknown;
 }
 
 export async function upsertMappingAction(
@@ -3283,6 +3285,18 @@ export async function upsertMappingAction(
     }
   }
 
+  // No enablement check: the process applies only under the Restate lifecycle at read time, so a Legacy project stores it inert.
+  let reviewProcess: ReviewProcessId | null;
+  if (body.reviewProcess === undefined) {
+    reviewProcess = existingMapping?.reviewProcess ?? null;
+  } else if (body.reviewProcess === null || body.reviewProcess === "ai-implement") {
+    reviewProcess = null;
+  } else if (body.reviewProcess === "claude-code-review") {
+    reviewProcess = "claude-code-review";
+  } else {
+    return { status: 400, body: { error: `reviewProcess invalid: must be null, "ai-implement", or "claude-code-review"` } };
+  }
+
   const mapping: RepoMapping = {
     owner: body.owner,
     repo: body.repo,
@@ -3321,6 +3335,7 @@ export async function upsertMappingAction(
     prDispatchBudget,
     reviewFixLifecycle,
     trustedReviewAuthors,
+    reviewProcess,
   };
 
   // Existing attempts keep their stored owner. Revalidate only when a save first enables
