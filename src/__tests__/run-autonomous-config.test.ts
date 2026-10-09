@@ -507,6 +507,16 @@ describe("resolveRunnerInputs", () => {
       expect(inputs.reviewProcess).toBe("ai-implement");
       expect(inputs.trustedReviewAuthors).toEqual([]);
     });
+
+    it("falls back to the defaults in legacy-env mode", () => {
+      const env = {
+        ISSUE_ID: "i", ISSUE_IDENTIFIER: "AII-1", ISSUE_TITLE: "t", ISSUE_DESCRIPTION: "d",
+        ...BASE_ENV,
+      };
+      const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
+      expect(inputs.reviewProcess).toBe("ai-implement");
+      expect(inputs.trustedReviewAuthors).toEqual([]);
+    });
   });
 
   describe("(j) reviewers", () => {
