@@ -220,7 +220,7 @@ interface Listener {
   close: () => void;
 }
 
-function startListener(port: number): Promise<Listener> {
+function startListener(port: number, expectedState: string): Promise<Listener> {
   return new Promise((resolveListener, rejectListener) => {
     let settle: (p: URLSearchParams) => void = () => {};
     let abort: (e: Error) => void = () => {};
@@ -236,8 +236,14 @@ function startListener(port: number): Promise<Listener> {
         res.writeHead(404).end();
         return;
       }
+      // A stray request (no code or error, or a foreign state) must not end the attempt; keep waiting until the timeout.
+      const q = url.searchParams;
+      if (q.get("state") !== expectedState || (!q.has("code") && !q.has("error"))) {
+        res.writeHead(400, { "Content-Type": "text/plain" }).end("Not a sign-in callback.");
+        return;
+      }
       res.writeHead(200, { "Content-Type": "text/plain" }).end("Sign-in received. You can close this tab.");
-      settle(url.searchParams);
+      settle(q);
     });
     const close = (): void => {
       if (timer) clearTimeout(timer);
@@ -273,10 +279,10 @@ export async function login(recordPath: string, deps: LoginDeps): Promise<void> 
   if (saved && saved.extAgentHostId !== hostId) throw new SignInError("record host id does not match the host-id file");
 
   const config = await discover(deps);
-  const listener = await startListener(deps.port);
+  const state = b64url(deps.randomBytes(24));
+  const listener = await startListener(deps.port, state);
   try {
     const redirectUri = `http://127.0.0.1:${listener.port}${CALLBACK_PATH}`;
-    const state = b64url(deps.randomBytes(24));
     const nonce = b64url(deps.randomBytes(24));
     const verifier = b64url(deps.randomBytes(32));
     const challenge = b64url(createHash("sha256").update(verifier).digest());
@@ -301,7 +307,10 @@ export async function login(recordPath: string, deps: LoginDeps): Promise<void> 
     const authorizeUrl = `${AUTHORIZE_URL}?${params.toString()}`;
 
     deps.stdout("Open this URL in a browser on this machine to sign in with ChatGPT:");
-    deps.stdout(authorizeUrl);
+    // The printed copy never carries the saved ID token; only the opener gets the full URL.
+    const printable = new URLSearchParams(params);
+    if (printable.has("id_token_hint")) printable.set("id_token_hint", "REDACTED");
+    deps.stdout(`${AUTHORIZE_URL}?${printable.toString()}`);
     try {
       await deps.openBrowser(authorizeUrl);
     } catch {
@@ -456,8 +465,9 @@ export async function logout(recordPath: string, deps: LoginDeps): Promise<void>
 const USAGE = "usage: chatgpt-plan-login <login|status|logout> --record <path> [--port <n>]";
 
 function defaultOpenBrowser(url: string): void {
-  const cmd = process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open";
-  const args = process.platform === "win32" ? ["/c", "start", "", url] : [url];
+  // Not `cmd /c start`: cmd treats every `&` in the URL as a command separator.
+  const cmd = process.platform === "darwin" ? "open" : process.platform === "win32" ? "rundll32" : "xdg-open";
+  const args = process.platform === "win32" ? ["url.dll,FileProtocolHandler", url] : [url];
   const child = spawn(cmd, args, { stdio: "ignore", detached: true });
   child.on("error", () => {});
   child.unref();

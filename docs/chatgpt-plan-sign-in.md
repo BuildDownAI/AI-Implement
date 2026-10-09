@@ -35,4 +35,6 @@ Recommended: `~/.ai-implement/chatgpt-plan/credentials.json`, mode `0600`, writt
 
 A signed-out record has no tokens, so it does not pass `parseChatGptPlanRecord`. Consumers must treat it as "needs login".
 
-No token appears on argv, in stdout, or in an error message.
+No token appears in stdout or in an error message. The printed authorize URL has `id_token_hint` replaced by `REDACTED`. The one exception is the browser opener, which receives the full authorize URL (including the saved ID token on reauthorization) as an argument.
+
+The loopback listener ignores requests to the callback path that carry a foreign `state` or neither `code` nor `error`, and keeps waiting until the 10-minute timeout.

@@ -43,12 +43,12 @@ let urls: URL[];
 let tokenBodies: URLSearchParams[];
 let revokeBodies: URLSearchParams[];
 
-function hit(url: string): Promise<void> {
+function hit(url: string): Promise<{ status: number }> {
   return new Promise((res) => {
     get(url, (r) => {
       r.resume();
-      r.on("end", () => res());
-    }).on("error", () => res());
+      r.on("end", () => res({ status: r.statusCode ?? 0 }));
+    }).on("error", () => res({ status: 0 }));
   });
 }
 
@@ -167,6 +167,32 @@ describe("login", () => {
     expect(JSON.parse(readFileSync(record, "utf8")).extAgentHostId).toBe(first.extAgentHostId);
   });
 
+  it("never prints the saved ID token on reauthorization", async () => {
+    await main(["login", "--record", record], harness());
+    const saved = JSON.parse(readFileSync(record, "utf8"));
+    writeFileSync(record, JSON.stringify({ ...saved, idToken: "SENTINEL.id.token" }));
+    out = [];
+    err = [];
+    expect(await main(["login", "--record", record], harness())).toBe(0);
+    expect(urls[urls.length - 1].searchParams.get("id_token_hint")).toBe("SENTINEL.id.token");
+    expect(allOutput()).not.toMatch(/SENTINEL/);
+  });
+
+  it("ignores stray and wrong-state callbacks and keeps waiting", async () => {
+    const base = harness();
+    const deps = {
+      ...base,
+      openBrowser: async (u: string) => {
+        const cb = new URL(u).searchParams.get("redirect_uri")!;
+        expect((await hit(`${cb}?state=wrong&code=x`)).status).toBe(400);
+        expect((await hit(cb)).status).toBe(400);
+        await base.openBrowser(u);
+      },
+    };
+    expect(await main(["login", "--record", record], deps)).toBe(0);
+    expect(existsSync(record)).toBe(true);
+  });
+
   const claimsWith = (over: Record<string, unknown>) => (nonce: string) => ({
     iss: "https://auth.openai.com",
     aud: [ISSUED],
@@ -178,7 +204,6 @@ describe("login", () => {
   });
 
   const rejections: Array<[string, Scenario]> = [
-    ["state mismatch", { callback: (q) => (q.set("state", "wrong"), q) }],
     ["callback error", { callback: (q) => new URLSearchParams({ state: q.get("state")!, error: "access_denied" }) }],
     ["missing issued client id", { callback: (q) => (q.delete("client_id"), q) }],
     ["bad signature", { signer: other.privateKey }],
