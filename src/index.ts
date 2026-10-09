@@ -80,7 +80,7 @@ import { SqliteReviewFixAttemptStore } from "./review-fix-attempt-store.js";
 import { createReviewFixAdminFacade } from "./review-fix-admin-facade.js";
 import { GithubReviewFixWorker, createGithubAppCredentialResolver, reviewFixAttemptStoreScopeStore } from "./review-fix-worker.js";
 import { listActiveRestateReviewFixPrs, queueReviewFixCancellationForClosedPr } from "./review-fix-close.js";
-import { acceptDelivery as acceptReviewFixDelivery, ReviewFixDeliveryPump } from "./restate/review-fix-client.js";
+import { acceptDelivery as acceptReviewFixDelivery, createReviewFixIngressClient, ReviewFixDeliveryPump } from "./restate/review-fix-client.js";
 import { appendReviewFixActivityBatch, isReviewFixEvidenceTombstoned } from "./review-fix-evidence.js";
 import type { ReviewFixResultMetadataV1, ResultIntakeOutcome } from "./review-fix-contract.js";
 import { handleMcpRequest } from "./mcp.js";
@@ -4045,6 +4045,7 @@ async function handleKgRefreshOutcome(
 
 const reviewFixAttemptStore = new SqliteReviewFixAttemptStore();
 const kgRefreshIngressClient = createKgRefreshIngressClient();
+const reviewFixIngressClient = createReviewFixIngressClient();
 
 /** Maps a `callToolAsSystem` result carrying `{ status, body }` text onto the REST shape (AII-901). */
 function kgToolAnswer(
@@ -4431,7 +4432,7 @@ function startServer(
             ? kgRefreshIngressClient.enqueueDryRun(parseKgSourceRepo(config.kgSourceRepo).fullName, { key, ...entry }, opts)
             : Promise.resolve({ status: "unavailable" as const }),
         forgetKgPr: (repo, prNumber) => kgRefresh.forgetPr(repo, prNumber),
-      }, (repository, prNumber) => { queueReviewFixCancellationForClosedPr(repository, prNumber); }).catch((err) => {
+      }, (repository, prNumber) => { queueReviewFixCancellationForClosedPr(repository, prNumber); }, reviewFixIngressClient).catch((err) => {
         console.error("[webhook] Unhandled error:", err);
         if (!res.headersSent) {
           res.writeHead(500, { "Content-Type": "application/json" });

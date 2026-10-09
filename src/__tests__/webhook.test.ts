@@ -23,7 +23,10 @@ const hoisted = vi.hoisted(() => ({
   resolveWorkflowContract: vi.fn<() => Promise<"envelope" | "legacy">>(() => Promise.resolve("envelope")),
 }));
 
-vi.mock("../config.js", () => ({ getMappings: hoisted.getMappings }));
+vi.mock("../config.js", () => ({
+  getMappings: hoisted.getMappings,
+  resolveReviewFixLifecycle: (m: { reviewFixLifecycle?: string | null }) => (m.reviewFixLifecycle ?? "legacy"),
+}));
 vi.mock("../github-app-auth.js", () => ({ getInstallationToken: hoisted.getInstallationToken }));
 vi.mock("../workflow-probe.js", () => ({
   resolveWorkflowContract: hoisted.resolveWorkflowContract,
@@ -2686,5 +2689,189 @@ describe("review process on inline review comments (AII-1181)", () => {
   it("keeps a human's inline comment medium, even with a 🟣 marker, under claude-code-review", async () => {
     const out = await postInline(743, { login: "a-human", type: "User" }, "🟣 note", { reviewProcess: "claude-code-review" });
     expect(out.severities).toEqual(["medium"]);
+  });
+});
+
+describe("Restate review-fix lifecycle forwards instead of writing (AII-1184)", () => {
+  type Outcome = { status: "accepted" } | { status: "unavailable" };
+  function fakeIngress(outcome: Outcome = { status: "accepted" }) {
+    const feedback = vi.fn(async (_scope: unknown, _event: unknown, _opts: { idempotencyKey: string }) => outcome);
+    return { feedback };
+  }
+
+  function mapRepo(lifecycle: "restate" | "legacy" | null) {
+    const base = makeMappedEnvelopeRepo();
+    hoisted.getMappings.mockReturnValue({
+      "team-key": { ...base["team-key"]!, reviewFixLifecycle: lifecycle } as RepoMapping,
+    });
+  }
+
+  function seedDispatch(pr: number) {
+    const jobId = log.appendLog({ issueId: `issue-${pr}`, issueIdentifier: `AII-${pr}`, repo: "org/repo" });
+    log.updateJobStatus(jobId, "completed", "success", `https://github.com/org/repo/pull/${pr}`);
+  }
+
+  const pull = (pr: number, sha = "sha-current") => ({
+    number: pr,
+    html_url: `https://github.com/org/repo/pull/${pr}`,
+    head: { ref: `ai-implement/AII-${pr}-fix`, sha },
+  });
+
+  const payloads: Record<string, (pr: number, body: string, commit?: string) => { event: string; payload: unknown }> = {
+    review: (pr, body, commit = "sha-current") => ({
+      event: "pull_request_review",
+      payload: {
+        action: "submitted",
+        installation: { id: 7 },
+        review: { id: pr, state: "changes_requested", body, html_url: "https://x/r", user: { login: "human", type: "User" }, commit_id: commit },
+        pull_request: pull(pr),
+        repository: { full_name: "org/repo" },
+      },
+    }),
+    reviewComment: (pr, body, commit = "sha-current") => ({
+      event: "pull_request_review_comment",
+      payload: {
+        action: "created",
+        installation: { id: 7 },
+        comment: { id: pr, body, html_url: "https://x/c", path: "a.ts", line: 3, user: { login: "human", type: "User" }, commit_id: commit },
+        pull_request: pull(pr),
+        repository: { full_name: "org/repo" },
+      },
+    }),
+    issueComment: (pr, body) => ({
+      event: "issue_comment",
+      payload: {
+        action: "created",
+        installation: { id: 7 },
+        comment: { id: pr, body, html_url: "https://x/i", user: { login: "github-actions[bot]", type: "Bot" }, created_at: new Date().toISOString() },
+        issue: { number: pr, html_url: `https://github.com/org/repo/pull/${pr}`, pull_request: {} },
+        repository: { full_name: "org/repo" },
+      },
+    }),
+  };
+
+  const issueBody = "## Review\n\nBlocking issue found.\n\n```json review-findings\n{\"schema\":\"review-findings/v1\",\"verdict\":\"changes_requested\",\"findings\":[{\"severity\":\"blocking\",\"path\":\"src/x.ts\",\"line\":10,\"body\":\"Missing null check.\"}]}\n```";
+
+  async function post(kind: string, pr: number, opts: { ingress?: ReturnType<typeof fakeIngress>; delivery?: string | null; body?: string; commit?: string } = {}) {
+    const body = opts.body ?? (kind === "issueComment" ? issueBody : "Please fix this.");
+    const { event, payload } = payloads[kind]!(pr, body, opts.commit);
+    const headers: Record<string, string> = {};
+    if (opts.delivery !== null) headers["x-github-delivery"] = opts.delivery ?? `delivery-${pr}`;
+    const { req, res } = makeRequest(SECRET, event, payload, undefined, headers);
+    await webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, undefined, undefined, opts.ingress as never);
+    return { status: res.statusCode, body: JSON.parse(res.body) as Record<string, unknown> };
+  }
+
+  it.each(["review", "reviewComment", "issueComment"])("%s: forwards with the delivery id, answers 202, writes nothing", async (kind) => {
+    mapRepo("restate");
+    seedDispatch(10);
+    const ingress = fakeIngress();
+    const out = await post(kind, 10, { ingress, delivery: "d-abc" });
+    expect(out).toEqual({ status: 202, body: { forwarded: true } });
+    expect(ingress.feedback).toHaveBeenCalledTimes(1);
+    const [scope, event, opts] = ingress.feedback.mock.calls[0]! as [unknown, { deliveryId: string; eventId: string; repo: string }, { idempotencyKey: string }];
+    expect(scope).toEqual({ installationId: 7, repository: "org/repo", prNumber: 10 });
+    expect(event.deliveryId).toBe("d-abc");
+    expect(event.eventId).toBe("gh-delivery:d-abc");
+    expect(opts.idempotencyKey).toBe("d-abc");
+    expect(reviewStore.listOpenReviewFindings("org/repo", 10)).toEqual([]);
+    expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
+  });
+
+  it("never calls acceptReviewFixWebhookEvent on the Restate path", async () => {
+    mapRepo("restate");
+    seedDispatch(11);
+    const spy = vi.spyOn(reviewFixQueue, "acceptReviewFixWebhookEvent");
+    await post("reviewComment", 11, { ingress: fakeIngress() });
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it.each(["review", "reviewComment", "issueComment"])("%s: answers 503 restate_unavailable when the ingress is unavailable, writing nothing", async (kind) => {
+    mapRepo("restate");
+    seedDispatch(12);
+    const ingress = fakeIngress({ status: "unavailable" });
+    const out = await post(kind, 12, { ingress });
+    expect(out).toEqual({ status: 503, body: { error: "restate_unavailable" } });
+    expect(ingress.feedback).toHaveBeenCalledTimes(1);
+    expect(reviewStore.listOpenReviewFindings("org/repo", 12)).toEqual([]);
+    expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
+  });
+
+  it("answers 503 and never falls back to SQLite when no ingress client is wired", async () => {
+    mapRepo("restate");
+    seedDispatch(13);
+    const out = await post("review", 13);
+    expect(out).toEqual({ status: 503, body: { error: "restate_unavailable" } });
+    expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
+  });
+
+  it("forwards a duplicate delivery id with the same idempotency key both times", async () => {
+    mapRepo("restate");
+    seedDispatch(14);
+    const ingress = fakeIngress();
+    const first = await post("reviewComment", 14, { ingress, delivery: "dup-1" });
+    const second = await post("reviewComment", 14, { ingress, delivery: "dup-1" });
+    expect([first.status, second.status]).toEqual([202, 202]);
+    expect(ingress.feedback.mock.calls.map((c) => c[2].idempotencyKey)).toEqual(["dup-1", "dup-1"]);
+    expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
+  });
+
+  it("truncates an oversized multibyte body on a UTF-8 boundary within the cap", async () => {
+    mapRepo("restate");
+    seedDispatch(15);
+    const ingress = fakeIngress();
+    // 3-byte characters, so the cap falls mid-character for an odd cap offset.
+    const body = "€".repeat(20_000);
+    await post("reviewComment", 15, { ingress, body });
+    const event = ingress.feedback.mock.calls[0]![1] as { findings: Array<{ body: string }> };
+    const sent = event.findings[0]!.body;
+    expect(Buffer.byteLength(sent, "utf8")).toBeLessThanOrEqual(16 * 1024);
+    expect(sent).not.toContain("\uFFFD");
+    expect(sent.length).toBeGreaterThan(0);
+  });
+
+  it("answers 400 without forwarding when the delivery id is absent", async () => {
+    mapRepo("restate");
+    seedDispatch(16);
+    const ingress = fakeIngress();
+    const out = await post("review", 16, { ingress, delivery: null });
+    expect(out.status).toBe(400);
+    expect(ingress.feedback).not.toHaveBeenCalled();
+  });
+
+  it("does not forward a gated event (stale_head), for a Restate project", async () => {
+    mapRepo("restate");
+    seedDispatch(17);
+    const ingress = fakeIngress();
+    const base = payloads.reviewComment!(17, "note", "old-sha");
+    const payload = base.payload as { comment: { user: unknown } };
+    payload.comment.user = { login: "claude[bot]", type: "Bot" };
+    const { req, res } = makeRequest(SECRET, base.event, payload, undefined, { "x-github-delivery": "g-1" });
+    await webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, undefined, undefined, ingress as never);
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toMatchObject({ ignored: true, reason: "stale_head" });
+    expect(ingress.feedback).not.toHaveBeenCalled();
+  });
+
+  it("does not forward on a bad signature", async () => {
+    mapRepo("restate");
+    seedDispatch(18);
+    const ingress = fakeIngress();
+    const { event, payload } = payloads.review!(18, "x");
+    const { req, res } = makeRequest(SECRET, event, payload, "wrong-secret", { "x-github-delivery": "g-2" });
+    await webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, undefined, undefined, ingress as never);
+    expect(res.statusCode).toBe(401);
+    expect(ingress.feedback).not.toHaveBeenCalled();
+  });
+
+  it.each([["legacy"], [null]] as const)("lifecycle %s keeps the SQLite path and never forwards", async (lifecycle) => {
+    mapRepo(lifecycle);
+    seedDispatch(19);
+    const ingress = fakeIngress();
+    const out = await post("reviewComment", 19, { ingress });
+    expect(out.status).toBe(200);
+    expect(out.body).toMatchObject({ queued: true, duplicate: false });
+    expect(ingress.feedback).not.toHaveBeenCalled();
+    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(1);
   });
 });
