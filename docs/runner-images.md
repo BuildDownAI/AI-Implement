@@ -28,7 +28,9 @@ If `image.yml` is absent, malformed, or names an unreachable reference, resoluti
 
 On the Fly Machines path the orchestrator boots the session machine on the resolved image directly.
 
-On the GitHub Actions path it forwards the resolved image as the `runner_image` dispatch input — **but only when the choice is explicit**: a per-repo `image.yml` override, or an explicitly set orchestrator image variable. When neither is set the orchestrator sends nothing, leaving the workflow to run its own resolution order (the repo/org variable, then its built-in `:latest`). That is what stops the orchestrator from silently overriding a repo that pins its image through the variable.
+On the GitHub Actions path it forwards the resolved image as the `runner_image` dispatch input — **but only when the choice is explicit**: a per-repo `image.yml` override, an explicitly set orchestrator image variable, or the `:next` default a testing orchestrator derives from its source-branch stamp (see [Channels](#channels)). When none of these applies the orchestrator sends nothing, leaving the workflow to run its own resolution order (the repo/org variable, then its built-in `:latest`). That is what stops the orchestrator from silently overriding a repo that pins its image through the variable.
+
+The channel-derived default is the third forwarded case: when `AI_IMPLEMENT_SOURCE_BRANCH` is `testing` and no image variable is set, the orchestrator sends `:next` on every GitHub Actions dispatch (every phase). Unlike an unset `main` orchestrator, this **overrides** a target repo's `AI_IMPLEMENT_RUNNER_IMAGE` Actions variable — on testing orchestrators only. A per-repo `image.yml` still wins.
 
 Planning runs honor the identical rule, so a testing orchestrator pinned to `:next` steers planning to `:next` as well. One asymmetry: unlike `claude-implement.yml`, `claude-plan.yml`'s own validate step does **not** read `image.yml`, so orchestrator forwarding is the only path by which a GHA planning run picks up either source — and the target repo must have re-synced `claude-plan.yml` first, or GitHub rejects the dispatch with "unexpected inputs".
 
@@ -57,7 +59,7 @@ This is why the default image stays public: a cross-org `GITHUB_TOKEN` cannot pu
 | `:latest` | `main` | Production orchestrators and synced target-repo workflows |
 | `:next` | `testing` | Staging and testing orchestrators |
 
-Pair the runner channel with the orchestrator's channel — a testing orchestrator should set its image variable to `:next` so the two move together.
+Pair the runner channel with the orchestrator's channel — a testing orchestrator gets `:next` automatically from its source-branch stamp (`AI_IMPLEMENT_SOURCE_BRANCH=testing`, stamped by the image build), and needs the image variable only to pin something else. The env variable wins in every case, so setting it is also the rollback. An image built without the stamp (a hand-run `fly deploy`) falls back to `:latest`. The boot log names the derived image, and `get_deploy_posture` reports it.
 
 kg-refresh dispatches (both GitHub Actions and Fly Machines) resolve the runner image through the same `resolveRunnerImageForDispatch` path as every other run kind — per-repo `image.yml` override, then the orchestrator default, then the built-in channel tag.
 

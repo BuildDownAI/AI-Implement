@@ -205,6 +205,96 @@ describe("resolveDefaultRunnerImage", () => {
   });
 });
 
+describe("resolveDefaultRunnerImage source-branch channel", () => {
+  const NEXT = "ghcr.io/builddownai/ai-implement-runner:next";
+  const LATEST = "ghcr.io/builddownai/ai-implement-runner:latest";
+
+  it("env image set with stamp testing: the env value wins, explicit, not channel-derived", () => {
+    const r = resolveDefaultRunnerImage({
+      AI_IMPLEMENT_RUNNER_IMAGE: "ghcr.io/acme/runner:pin",
+      AI_IMPLEMENT_SOURCE_BRANCH: "testing",
+    });
+    expect(r).toMatchObject({ image: "ghcr.io/acme/runner:pin", explicit: true, channelDefault: false });
+  });
+
+  it("env image set with stamp main or unset: explicit, not channel-derived", () => {
+    for (const branch of ["main", undefined]) {
+      const r = resolveDefaultRunnerImage({
+        AI_IMPLEMENT_RUNNER_IMAGE: "ghcr.io/acme/runner:pin",
+        AI_IMPLEMENT_SOURCE_BRANCH: branch,
+      });
+      expect(r).toMatchObject({ image: "ghcr.io/acme/runner:pin", explicit: true, channelDefault: false });
+    }
+  });
+
+  it("legacy SESSION_IMAGE with stamp testing: the legacy value wins", () => {
+    const r = resolveDefaultRunnerImage({
+      SESSION_IMAGE: "ghcr.io/acme/runner:legacy",
+      AI_IMPLEMENT_SOURCE_BRANCH: "testing",
+    });
+    expect(r).toMatchObject({
+      image: "ghcr.io/acme/runner:legacy",
+      explicit: true,
+      channelDefault: false,
+      sessionImageStatus: "active",
+    });
+  });
+
+  it("no env image, stamp testing: derives :next, channelDefault true, explicit false", () => {
+    const r = resolveDefaultRunnerImage({ AI_IMPLEMENT_SOURCE_BRANCH: "testing" });
+    expect(r).toEqual({
+      image: NEXT,
+      explicit: false,
+      channelDefault: true,
+      sessionImageStatus: "unused",
+    });
+  });
+
+  it("treats a whitespace-padded testing stamp as testing", () => {
+    const r = resolveDefaultRunnerImage({ AI_IMPLEMENT_SOURCE_BRANCH: " testing " });
+    expect(r).toMatchObject({ image: NEXT, explicit: false, channelDefault: true });
+  });
+
+  it("no env image, stamp main: :latest, nothing derived", () => {
+    const r = resolveDefaultRunnerImage({ AI_IMPLEMENT_SOURCE_BRANCH: "main" });
+    expect(r).toMatchObject({ image: LATEST, explicit: false, channelDefault: false });
+  });
+
+  it("no env image, stamp unset, empty, or another value: :latest, nothing derived", () => {
+    for (const branch of [undefined, "", "feature/x"]) {
+      const r = resolveDefaultRunnerImage({ AI_IMPLEMENT_SOURCE_BRANCH: branch });
+      expect(r).toMatchObject({ image: LATEST, explicit: false, channelDefault: false });
+    }
+  });
+
+  it("forwards the derived :next on a testing orchestrator but nothing on main or unstamped", () => {
+    const forwarded = (branch: string | undefined) => {
+      const r = resolveDefaultRunnerImage({ AI_IMPLEMENT_SOURCE_BRANCH: branch });
+      return selectRunnerImageInput({
+        resolved: { image: r.image, source: "default" },
+        runnerImageExplicit: r.explicit || r.channelDefault,
+      });
+    };
+    expect(forwarded("testing")).toBe(NEXT);
+    expect(forwarded("main")).toBeUndefined();
+    expect(forwarded(undefined)).toBeUndefined();
+  });
+
+  it("a per-repo image.yml override beats the derived :next default", async () => {
+    __clearRepoImageCacheForTests();
+    const r = resolveDefaultRunnerImage({ AI_IMPLEMENT_SOURCE_BRANCH: "testing" });
+    const image = await resolveRunnerImageForDispatch({
+      owner: "acme",
+      repo: "widgets",
+      token: "ghs_xxx",
+      defaultImage: r.image,
+      runnerImageExplicit: r.explicit || r.channelDefault,
+      fetchImpl: mockFetch(200, contentsApiResponse("image: ghcr.io/acme/my-runner:v3\n")),
+    });
+    expect(image).toBe("ghcr.io/acme/my-runner:v3");
+  });
+});
+
 describe("selectRunnerImageInput", () => {
   it("forwards a per-repo override regardless of whether the orchestrator default is explicit", () => {
     const resolved = { image: "ghcr.io/acme/my-runner:v3", source: "override" as const };
