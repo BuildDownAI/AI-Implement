@@ -1038,6 +1038,16 @@ describe("ChatGPT plan access token (codex-subscription)", () => {
     expect(l.load).toHaveBeenCalledTimes(2);
   });
 
+  it("a concurrent invoke during renewal fails with invocation_in_progress", async () => {
+    const l = local([tok(S_TOKEN, NOW + 1), tok(S_TOKEN2, NOW + 10 * REQ)]);
+    await l.client.checkout(cg);
+    const first = l.client.invoke("cx", async () => undefined);
+    expect(await categoryAsync(l.client.invoke("cx", async () => undefined))).toBe("invocation_in_progress");
+    await first;
+    expect(l.load).toHaveBeenCalledTimes(2);
+    expect(l.client.status("cx")).toBe("ready");
+  });
+
   it("hosted renewal transport throw surfaces transport_failed", async () => {
     const h = hosted([tok(S_TOKEN, NOW + 1), "throw"]);
     await h.client.checkout(cg);

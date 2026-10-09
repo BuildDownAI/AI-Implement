@@ -909,31 +909,38 @@ export function createModelAuthClient(options: ModelAuthClientOptions): ModelAut
       if (entry.state === "invoking") fail("invocation_in_progress", { profileId });
       if (entry.state === "uncertain" || entry.state === "rejected") fail("checkpoint_uncertain", { profileId });
       if (entry.state === "finished") fail("not_checked_out", { profileId });
-      if (entry.secret.kind === "chatgpt-access-token") {
-        const requiredMs = opts?.requiredMs ?? 0;
-        if (entry.expiresAt === undefined || entry.expiresAt - now() < requiredMs + CHATGPT_RENEWAL_MARGIN_MS) {
-          // Once per invocation; the state stays `ready` if this throws, and no run starts.
-          const binding =
-            options.source.kind === "hosted"
-              ? options.source.grant.bindings.find((b) => b.profileId === profileId)
-              : undefined;
-          const renewed = await obtainSecret({ profileId, authMode: entry.authMode }, binding);
-          if (renewed.secret.kind !== "chatgpt-access-token") {
-            fail("credential_source_mismatch", { profileId });
-          }
-          entry.secret = renewed.secret;
-          entry.expiresAt = renewed.secret.expiresAt;
-          if (options.source.kind === "hosted") diagnose("checkout", profileId, entry.stage);
-        }
-      }
-      const built = buildModelInvocationEnv({
-        authMode: entry.authMode,
-        secret: entry.secret,
-        authDir: entry.dir,
-        inheritedEnv,
-        protectedKeys,
-      });
+      // Claimed before the renewal await so a concurrent invoke fails the guard above.
       entry.state = "invoking";
+      let built: ReturnType<typeof buildModelInvocationEnv>;
+      try {
+        if (entry.secret.kind === "chatgpt-access-token") {
+          const requiredMs = opts?.requiredMs ?? 0;
+          if (entry.expiresAt === undefined || entry.expiresAt - now() < requiredMs + CHATGPT_RENEWAL_MARGIN_MS) {
+            // Once per invocation; the state stays `ready` if this throws, and no run starts.
+            const binding =
+              options.source.kind === "hosted"
+                ? options.source.grant.bindings.find((b) => b.profileId === profileId)
+                : undefined;
+            const renewed = await obtainSecret({ profileId, authMode: entry.authMode }, binding);
+            if (renewed.secret.kind !== "chatgpt-access-token") {
+              fail("credential_source_mismatch", { profileId });
+            }
+            entry.secret = renewed.secret;
+            entry.expiresAt = renewed.secret.expiresAt;
+            if (options.source.kind === "hosted") diagnose("checkout", profileId, entry.stage);
+          }
+        }
+        built = buildModelInvocationEnv({
+          authMode: entry.authMode,
+          secret: entry.secret,
+          authDir: entry.dir,
+          inheritedEnv,
+          protectedKeys,
+        });
+      } catch (e) {
+        entry.state = "ready";
+        throw e;
+      }
       let result: T;
       let runError: unknown;
       let runFailed = false;
