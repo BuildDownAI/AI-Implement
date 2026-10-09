@@ -218,7 +218,7 @@ export interface ReviewFixAttemptStorePort {
    * slot, after a `WorkerLaunchOutcome` of `"accepted"` or a `WorkerLookupOutcome`
    * of `"found"`. Never binds an execution to a slot it does not currently own.
    */
-  bindExecution(attemptId: AttemptId, execution: WorkerExecutionIdentity): Promise<ReviewFixExecutionBindOutcome>;
+  bindExecution(attemptId: AttemptId, execution: WorkerExecutionIdentity, now: number): Promise<ReviewFixExecutionBindOutcome>;
 
   /**
    * Revokes an attempt's authority to have its eventual result approved, without
@@ -228,7 +228,7 @@ export interface ReviewFixAttemptStorePort {
    * race a new admission into the same slot. Idempotent: revoking an
    * already-revoked attempt is a no-op.
    */
-  revokeAuthority(attemptId: AttemptId): Promise<void>;
+  revokeAuthority(attemptId: AttemptId, now: number): Promise<void>;
 
   /** Whether `attemptId` currently holds unrevoked authority. The observation an approval effect
    *  (`ReviewFixFinalizerPort.applyApproval`) must make before it may apply — backend success alone
@@ -241,7 +241,7 @@ export interface ReviewFixAttemptStorePort {
    * `ResultIntakeOutcome` defines them. An identical retry of an already-stored
    * result returns the same `duplicate` acknowledgement rather than erroring.
    */
-  recordResult(attemptId: AttemptId, result: ReviewFixResultMetadataV1): Promise<ResultIntakeOutcome>;
+  recordResult(attemptId: AttemptId, result: ReviewFixResultMetadataV1, now: number): Promise<ResultIntakeOutcome>;
 
   /**
    * Releases the review-fix slot for exactly the supplied `owner`, e.g. after a
@@ -338,7 +338,7 @@ export interface ReviewFixImmutableOutcome {
  *  outcome is returned rather than re-derived, so a caller cannot observe two different verdicts
  *  for one `attemptId`. */
 export type RecordOutcomeResult =
-  | { readonly status: "recorded" }
+  | { readonly status: "recorded"; readonly completedAt: number }
   | { readonly status: "already_recorded"; readonly outcome: ReviewFixImmutableOutcome };
 
 /** How one finding from the admitted snapshot was resolved by the attempt. */
@@ -401,7 +401,7 @@ export type ApprovalEffectOutcome =
  */
 export interface ReviewFixFinalizerPort {
   /** Records the immutable terminal verdict for an attempt exactly once. */
-  recordOutcome(outcome: ReviewFixImmutableOutcome): Promise<RecordOutcomeResult>;
+  recordOutcome(outcome: ReviewFixImmutableOutcome, now: number): Promise<RecordOutcomeResult>;
 
   /** Applies the approval effect if, and only if, every `ReviewFixApprovalInput` obligation holds. */
   applyApproval(input: ReviewFixApprovalInput): Promise<ApprovalEffectOutcome>;

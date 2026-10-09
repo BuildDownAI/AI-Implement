@@ -130,7 +130,7 @@ export interface ReviewFixTrackerAdapter {
  * exposes beyond that port's strict shape specifically for this issue to use.
  */
 export interface ReviewFixFinalizeAttemptStore extends ReviewFixAttemptStorePort {
-  recordOutcome(outcome: ReviewFixImmutableOutcome): Promise<RecordOutcomeResult>;
+  recordOutcome(outcome: ReviewFixImmutableOutcome, now: number): Promise<RecordOutcomeResult>;
   /** The persisted accepted result and conflict marker `finalizeReviewFixAttempt` binds approval
    *  to — see `SqliteReviewFixAttemptStore.getAcceptedResult`. */
   getAcceptedResult(attemptId: AttemptId): Promise<ReviewFixAcceptedResultView | null>;
@@ -180,8 +180,8 @@ export function createReviewFixFinalizer(deps: {
   github: ReviewFixGitHubAdapter;
 }): ReviewFixFinalizerPort {
   return {
-    async recordOutcome(outcome: ReviewFixImmutableOutcome): Promise<RecordOutcomeResult> {
-      return deps.attemptStore.recordOutcome(outcome);
+    async recordOutcome(outcome: ReviewFixImmutableOutcome, now: number): Promise<RecordOutcomeResult> {
+      return deps.attemptStore.recordOutcome(outcome, now);
     },
 
     async applyApproval(input: ReviewFixApprovalInput): Promise<ApprovalEffectOutcome> {
@@ -440,7 +440,7 @@ export async function finalizeReviewFixAttempt(
   }
 
   if (input.revoke) {
-    await deps.attemptStore.revokeAuthority(input.attemptId);
+    await deps.attemptStore.revokeAuthority(input.attemptId, Date.now());
   }
 
   // Establish the immutable verdict — when the backend is confirmed terminal — before any
@@ -453,7 +453,7 @@ export async function finalizeReviewFixAttempt(
       attemptId: input.attemptId,
       scope: attempt.scope,
       terminal: input.terminal.outcome,
-    });
+    }, Date.now());
   }
   const authoritativeTerminal =
     recordedOutcome?.status === "already_recorded"

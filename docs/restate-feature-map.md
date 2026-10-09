@@ -51,7 +51,7 @@ and handler types that the typed clients use are in `src/restate/kg-refresh-type
 | Workflow `run` handler | yes | yes | — | |
 | Shared workflow handlers | yes: `report`, `progress`, `cancel`, `status` | yes: `result`, `cancel` | — | |
 | Durable promises (`ctx.promise` get/peek/resolve) | yes (`report`, `cancel`, `progress`) | yes | — | RF uses peek-then-resolve (§ 6 P1) |
-| `ctx.run` named steps | yes | yes (~25) | yes (one per write) | |
+| `ctx.run` named steps | yes | yes (28 sites in `ReviewFixAttempt`, 5 in `ReviewFixPR`; § 2.1) | yes (one per write) | RF kinds are tabulated in § 2.1 |
 | `ctx.run` retry options | `maxRetryAttempts: 3` on the gate, `dispatch`, `outcome`, `merge` and `delete-branch` steps | none | `maxRetryAttempts: 1` | No `initialRetryInterval`, `maxRetryDuration` anywhere |
 | Handler `retryPolicy` | none | none | `{ maxAttempts: 1, onMaxAttempts: "kill" }` on writes | |
 | `ctx.sleep` | yes (race arm, cancel watch) | yes (1 s polling loops) | test seam only | |
@@ -83,6 +83,59 @@ and handler types that the typed clients use are in `src/restate/kg-refresh-type
 | Admin API: SQL introspection (`sys_invocation` …) | shared | shared | shared | deploy drain, census |
 | Admin API: cancel / kill / purge / restart | no | no | no | |
 | Two-runtime scenario tests (container + binary, `alwaysReplay` / `disableRetries`) | yes | yes | yes | |
+
+### 2.1 Review-fix journal re-check (AII-1176)
+
+Re-check of every `ctx.run` step against the journal rule of ADR 018 (amendment 2026-10-08): a value a SQLite row carries is a journaled step result, and a SQLite write is a projection of journaled values (`docs/restate.md` § "Journal projections"). Kinds: `read`; `external` (GitHub or the worker); `atomic SQLite step` (admission only); `projection` (a SQLite write of a journaled value, named in the last column).
+
+Step names are unchanged; `docs/restate-review-fix-pilot.md` and the job drawer read them. The count differs from the issue text: `review-fix-attempt.ts` has 28 `ctx.run` sites (the `alert` helper is one site that runs under four step names; the `reconcile-N`, `cancel-worker-N` and `inspect-terminal-N` names are indexed), and `review-fix-pr.ts` has five.
+
+**`ReviewFixAttempt`**
+
+| Step | Kind | Journaled value written |
+|---|---|---|
+| `load-prepared-attempt` | read | |
+| `revoke-expired-before-launch` | projection | `authority_revoked_at` = `ctx.date.now()` |
+| `record-expired-before-launch` | projection | `terminal_outcome_json`, `completed_at` = `ctx.date.now()` (returned as `completedAt`) |
+| `release-expired-before-launch` | projection | `dispatch_admissions` release; the store's shared release stamps `released_at` itself (open, below) |
+| `check-prelaunch-authority` | read | |
+| `record-cancelled-before-launch` | projection | `terminal_outcome_json`, `completed_at` = `ctx.date.now()` |
+| `release-before-launch` | projection | release, as above |
+| `launch-once` | external | none returned to SQLite; the closure also records launch intent (`state = 'launch_intent'`, no clock) and carries no token or secret out |
+| `record-rejected-outcome` | projection | `terminal_outcome_json`, `completed_at` = `ctx.date.now()` |
+| `release-rejected-launch` | projection | release, as above |
+| `reconcile-N` | external | |
+| `alert-unknown-launch`, `alert-conflicting-execution`, `alert-unconfirmed-stop`, `alert-stale-result` (the `alert` helper) | external | |
+| `revoke-unresolved-launch` | projection | `authority_revoked_at` = the `ctx.date.now()` read in the same loop pass |
+| `bind-exact-execution` | projection | `github_run_id`, `github_run_attempt` from the launch or reconcile result; `result_conflict_at` = `ctx.date.now()` on an early-result mismatch |
+| `revoke-conflicting-execution` | projection | `authority_revoked_at` = `ctx.date.now()` |
+| `revoke-after-cancel-or-invalid-result` | projection | `authority_revoked_at` = `ctx.date.now()` |
+| `revoke-at-deadline` | projection | `authority_revoked_at` = the `ctx.date.now()` that crossed the deadline |
+| `cancel-worker-N` | external | |
+| `inspect-terminal-N` | external | |
+| `record-success-outcome` | projection | `terminal_outcome_json`, `completed_at` = `ctx.date.now()` |
+| `check-final-authority` | read | |
+| `load-approval-evidence` | read | |
+| `apply-approval-once` | external | |
+| `record-terminal-outcome` | projection | `terminal_outcome_json`, `completed_at` = `ctx.date.now()` |
+| `release-confirmed-terminal` | projection | release, as above |
+| `store-result` | projection | `accepted_result_json` from the validated result; `result_conflict_at` = `ctx.date.now()` on a conflict |
+| `revoke-conflicting-result` | projection | `authority_revoked_at` = `ctx.date.now()` |
+| `revoke-cancelled-attempt` | projection | `authority_revoked_at` = `ctx.date.now()` |
+
+**`ReviewFixPR`**
+
+| Step | Kind | Journaled value written |
+|---|---|---|
+| `load-collection-window` | read | |
+| `load-pending` | read | |
+| `admit-pending` | atomic SQLite step | none: `store.admit` computes the attempt id, `deadlineAt`, the task snapshot and the reservation in one transaction over `dispatch_admissions` (ADR 031, amendment 2026-10-09) |
+| `load-after-completion` | read | |
+| `load-after-capacity` | read | |
+
+Every store method that takes a `now` is also called outside the workflow, with `Date.now()` at that caller's boundary and no journal: the admin facade (`bindExecution`, `revokeAuthority`), the runner-callback result route (`recordResult`), and `finalizeReviewFixAttempt` (`revokeAuthority`, `recordOutcome`). Those writes are not journaled, so the replay argument does not apply to them. `store-result` runs in a shared handler, but the callback route has normally committed the result first, so the journaled `now` there is mostly a no-op (`result_conflict_at` uses `COALESCE`, so the first writer wins).
+
+Open: `releaseOwner` writes `dispatch_admissions.released_at` with a clock read inside `releaseDispatchAdmission`, which Legacy and Restate owners share. It is not in AII-1176's scope; converting it means changing the shared release signature for every caller.
 
 ## 3. What kg-refresh uses that the review-fix pilot does not
 

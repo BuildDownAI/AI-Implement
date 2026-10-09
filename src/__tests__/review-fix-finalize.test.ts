@@ -161,13 +161,13 @@ async function recordSuccessEvidence(
   scope: ScopedPrIdentity,
   result: ReviewFixResultMetadataV1,
 ): Promise<void> {
-  const stored = await store.recordResult(attemptId, result);
+  const stored = await store.recordResult(attemptId, result, Date.now());
   if (stored.status !== "stored") throw new Error(`expected result to be stored, got ${stored.status}`);
   const recorded = await finalizer.recordOutcome({
     attemptId,
     scope,
     terminal: { status: "succeeded", outputCommit: result.outputCommit },
-  });
+  }, Date.now());
   if (recorded.status !== "recorded") throw new Error(`expected outcome to be recorded, got ${recorded.status}`);
 }
 
@@ -472,7 +472,7 @@ describe("createReviewFixFinalizer.applyApproval: idempotency", () => {
     });
     const finalizer = finalizeModule.createReviewFixFinalizer({ attemptStore: store, github });
     const result = resultFor(attempt.attemptId, attempt.deadlineAt);
-    expect((await store.recordResult(attempt.attemptId, result)).status).toBe("stored");
+    expect((await store.recordResult(attempt.attemptId, result, Date.now())).status).toBe("stored");
     const input = {
       attemptId: attempt.attemptId,
       scope: attempt.scope,
@@ -489,7 +489,7 @@ describe("createReviewFixFinalizer.applyApproval: idempotency", () => {
     // A racing result for the same attempt is rejected as a conflict — recorded on the row even
     // though it never displaces the originally accepted result.
     const conflicting = resultFor(attempt.attemptId, attempt.deadlineAt, { outputCommit: "c".repeat(40) });
-    expect((await store.recordResult(attempt.attemptId, conflicting)).status).toBe("conflict");
+    expect((await store.recordResult(attempt.attemptId, conflicting, Date.now())).status).toBe("conflict");
 
     const outcome = await finalizeModule.retryApprovalEffect({ github, attemptStore: store }, input);
     expect(outcome.status).toBe("withheld");
@@ -507,7 +507,7 @@ describe("createReviewFixFinalizer.applyApproval: idempotency", () => {
     });
     const finalizer = finalizeModule.createReviewFixFinalizer({ attemptStore: store, github });
     const result = resultFor(attempt.attemptId, attempt.deadlineAt);
-    expect((await store.recordResult(attempt.attemptId, result)).status).toBe("stored");
+    expect((await store.recordResult(attempt.attemptId, result, Date.now())).status).toBe("stored");
     const input = {
       attemptId: attempt.attemptId,
       scope: attempt.scope,
@@ -527,7 +527,7 @@ describe("createReviewFixFinalizer.applyApproval: idempotency", () => {
       attemptId: attempt.attemptId,
       scope: attempt.scope,
       terminal: { status: "failed", reason: "backend reported failure after the effect was accepted" },
-    });
+    }, Date.now());
     expect(recorded.status).toBe("recorded");
 
     const outcome = await finalizeModule.retryApprovalEffect({ github, attemptStore: store }, input);
@@ -595,7 +595,7 @@ describe("createReviewFixFinalizer.applyApproval: idempotency", () => {
     // than the one this delivery/input was accepted under — never treat the delivery's own
     // accepted payload as sufficient; it must also match what the repository actually holds.
     const differentCommit = resultFor(attempt.attemptId, attempt.deadlineAt, { outputCommit: "d".repeat(40) });
-    expect((await store.recordResult(attempt.attemptId, differentCommit)).status).toBe("stored");
+    expect((await store.recordResult(attempt.attemptId, differentCommit, Date.now())).status).toBe("stored");
 
     const outcome = await finalizeModule.retryApprovalEffect({ github, attemptStore: store }, input);
     expect(outcome.status).toBe("withheld");
@@ -629,7 +629,7 @@ describe("createReviewFixFinalizer.applyApproval: idempotency", () => {
     // A matching accepted result is on record, but the attempt has no immutable terminal
     // verdict at all yet (`recordOutcome` was never called) — a pending approval delivery must
     // not be completed ahead of the attempt actually being confirmed to have succeeded.
-    expect((await store.recordResult(attempt.attemptId, result)).status).toBe("stored");
+    expect((await store.recordResult(attempt.attemptId, result, Date.now())).status).toBe("stored");
 
     const outcome = await finalizeModule.retryApprovalEffect({ github, attemptStore: store }, input);
     expect(outcome.status).toBe("withheld");
@@ -677,14 +677,14 @@ describe("createReviewFixFinalizer.recordOutcome", () => {
       attemptId: attempt.attemptId,
       scope: attempt.scope,
       terminal: { status: "succeeded", outputCommit: OUTPUT_COMMIT },
-    });
+    }, Date.now());
     expect(first.status).toBe("recorded");
 
     const second = await finalizer.recordOutcome({
       attemptId: attempt.attemptId,
       scope: attempt.scope,
       terminal: { status: "failed", reason: "should never apply" },
-    });
+    }, Date.now());
     expect(second).toEqual({
       status: "already_recorded",
       outcome: { attemptId: attempt.attemptId, scope: attempt.scope, terminal: { status: "succeeded", outputCommit: OUTPUT_COMMIT } },
@@ -727,7 +727,7 @@ describe("finalizeReviewFixAttempt", () => {
     const tracker = fakeTracker();
     const finalizer = finalizeModule.createReviewFixFinalizer({ attemptStore: store, github });
     const result = resultFor(attempt.attemptId, attempt.deadlineAt);
-    await store.recordResult(attempt.attemptId, result);
+    await store.recordResult(attempt.attemptId, result, Date.now());
 
     const outcome = await finalizeModule.finalizeReviewFixAttempt(
       { attemptStore: store, finalizer, github, tracker },
@@ -753,7 +753,7 @@ describe("finalizeReviewFixAttempt", () => {
     const tracker = fakeTracker();
     const finalizer = finalizeModule.createReviewFixFinalizer({ attemptStore: store, github });
     const result = resultFor(attempt.attemptId, attempt.deadlineAt);
-    await store.recordResult(attempt.attemptId, result);
+    await store.recordResult(attempt.attemptId, result, Date.now());
 
     const outcome = await finalizeModule.finalizeReviewFixAttempt(
       { attemptStore: store, finalizer, github, tracker },
@@ -774,7 +774,7 @@ describe("finalizeReviewFixAttempt", () => {
   it("a concurrent conflicting result never reaches approval, even though the originally accepted result remains on record", async () => {
     const { store, attempt } = await prepareAttempt();
     const stored = resultFor(attempt.attemptId, attempt.deadlineAt, { outputCommit: OUTPUT_COMMIT });
-    expect((await store.recordResult(attempt.attemptId, stored)).status).toBe("stored");
+    expect((await store.recordResult(attempt.attemptId, stored, Date.now())).status).toBe("stored");
 
     // A second, racing result for the same attempt with a different output commit is rejected
     // as a conflict by the attempt repository's own compare-and-set — it never becomes the
@@ -782,7 +782,7 @@ describe("finalizeReviewFixAttempt", () => {
     // attempt's final outcome — prevents approval, even for the originally accepted result that
     // the conflict never displaced: a conflict on record must reconcile before anything approves.
     const conflicting = resultFor(attempt.attemptId, attempt.deadlineAt, { outputCommit: "c".repeat(40) });
-    const conflictOutcome = await store.recordResult(attempt.attemptId, conflicting);
+    const conflictOutcome = await store.recordResult(attempt.attemptId, conflicting, Date.now());
     expect(conflictOutcome.status).toBe("conflict");
     expect(finalizeModule.reviewFixResultAlertReason(conflictOutcome)).not.toBeNull();
 
@@ -809,7 +809,7 @@ describe("finalizeReviewFixAttempt", () => {
   it("a conflict injected while evidence is being gathered still blocks approval at the final decision point", async () => {
     const { store, attempt } = await prepareAttempt();
     const stored = resultFor(attempt.attemptId, attempt.deadlineAt, { outputCommit: OUTPUT_COMMIT });
-    expect((await store.recordResult(attempt.attemptId, stored)).status).toBe("stored");
+    expect((await store.recordResult(attempt.attemptId, stored, Date.now())).status).toBe("stored");
 
     // No conflict exists yet when finalization starts gathering evidence — `evaluateMergePolicy`
     // is the last evidence call before the final decision, and it is where a racing result lands
@@ -818,7 +818,7 @@ describe("finalizeReviewFixAttempt", () => {
     const github = fakeGithub({
       async evaluateMergePolicy() {
         const conflicting = resultFor(attempt.attemptId, attempt.deadlineAt, { outputCommit: "c".repeat(40) });
-        const conflictOutcome = await store.recordResult(attempt.attemptId, conflicting);
+        const conflictOutcome = await store.recordResult(attempt.attemptId, conflicting, Date.now());
         expect(conflictOutcome.status).toBe("conflict");
         return true;
       },
@@ -849,7 +849,7 @@ describe("finalizeReviewFixAttempt", () => {
     if (admitted.status !== "prepared") throw new Error("expected prepared");
     const attempt = admitted.attempt;
     const result = resultFor(attempt.attemptId, attempt.deadlineAt);
-    await store.recordResult(attempt.attemptId, result);
+    await store.recordResult(attempt.attemptId, result, Date.now());
 
     const github = fakeGithub();
     const tracker = fakeTracker();
@@ -884,7 +884,7 @@ describe("finalizeReviewFixAttempt", () => {
   it("a previously recorded, incompatible terminal outcome blocks a later call from approving", async () => {
     const { store, attempt } = await prepareAttempt();
     const result = resultFor(attempt.attemptId, attempt.deadlineAt);
-    await store.recordResult(attempt.attemptId, result);
+    await store.recordResult(attempt.attemptId, result, Date.now());
     const github = fakeGithub();
     const tracker = fakeTracker();
     const finalizer = finalizeModule.createReviewFixFinalizer({ attemptStore: store, github });
@@ -963,7 +963,7 @@ describe("finalizeReviewFixAttempt", () => {
     const tracker = fakeTracker();
     const finalizer = finalizeModule.createReviewFixFinalizer({ attemptStore: store, github });
     const result = resultFor(attempt.attemptId, attempt.deadlineAt);
-    await store.recordResult(attempt.attemptId, result);
+    await store.recordResult(attempt.attemptId, result, Date.now());
 
     const outcome = await finalizeModule.finalizeReviewFixAttempt(
       { attemptStore: store, finalizer, github, tracker },

@@ -117,3 +117,7 @@ Rollback stops new Restate admissions and drains owned work before routing new w
 Operators can see which system owns an attempt and why it waits. The pilot favors an explicit blocked state over an uncertain second execution.
 
 An unknown launch or unconfirmed termination can hold capacity and delay incompatible deployment. Evidence collection adds a runner-to-orchestrator contract and requires bounded storage. The operating defaults above were approved at Gate 1 on 2026-09-24.
+
+## Amendment (2026-10-09): admission is the one atomic SQLite step; every other write projects a journaled value
+
+Admission stays one atomic SQLite step. Legacy and Restate owners share `dispatch_admissions` (`acquireGapfillAdmission` in `src/index.ts`), so only an atomic SQLite reservation can arbitrate between them; `store.admit` computes the attempt id, `deadlineAt`, the task snapshot and the reservation inside one transaction. Every other review-fix write is a projection of a journaled value: the workflow reads `ctx.date.now()` and passes it through the step's input, and the store writes the value it receives (`completed_at`, `result_conflict_at`, `authority_revoked_at`). The step-by-step table is in `docs/restate-feature-map.md` § 2.1.

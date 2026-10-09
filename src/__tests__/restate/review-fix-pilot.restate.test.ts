@@ -62,6 +62,10 @@ import {
   callWorkflow,
   crashAfterFirstCall,
   eventually,
+  journalEntries,
+  journaledRunResult,
+  journalText,
+  queryInvocations,
   settle,
   replaceEndpoint,
   startRetryEnabled,
@@ -141,7 +145,7 @@ interface GithubFixture {
   jobTimeoutMinutes: number;
   blockAdmission: "paused" | "occupied" | "at_capacity" | "budget_exhausted" | null;
   admitOverride: ((request: ReviewFixAdmissionRequest) => Promise<ReviewFixAdmissionOutcome>) | null;
-  recordResultOverride: ((id: AttemptId, result: ReviewFixResultMetadataV1) => Promise<ResultIntakeOutcome>) | null;
+  recordResultOverride: ((id: AttemptId, result: ReviewFixResultMetadataV1, now: number) => Promise<ResultIntakeOutcome>) | null;
   applyApprovalEffectOverride: ReviewFixGitHubAdapter["applyApprovalEffect"] | null;
   dispatchImpl: (input: Parameters<ReviewFixWorkerTransport["dispatch"]>[0]) => ReturnType<ReviewFixWorkerTransport["dispatch"]>;
   dispatchCalls: number;
@@ -383,13 +387,13 @@ const attemptStore: ReviewFixAttemptStorePort = {
   admit: (request) => sqliteStore.admit(request),
   getPreparedAttempt: (id) => sqliteStore.getPreparedAttempt(id),
   recordLaunchIntent: (id) => sqliteStore.recordLaunchIntent(id),
-  bindExecution: (id, execution) => sqliteStore.bindExecution(id, execution),
-  revokeAuthority: (id) => sqliteStore.revokeAuthority(id),
+  bindExecution: (id, execution, now) => sqliteStore.bindExecution(id, execution, now),
+  revokeAuthority: (id, now) => sqliteStore.revokeAuthority(id, now),
   hasCurrentAuthority: (id) => sqliteStore.hasCurrentAuthority(id),
-  recordResult: (id, result) => {
+  recordResult: (id, result, now) => {
     const fixture = fixtureByAttempt.get(id);
     const impl = fixture?.recordResultOverride ?? sqliteStore.recordResult.bind(sqliteStore);
-    return impl(id, result);
+    return impl(id, result, now);
   },
   releaseOwner: (owner, reason) => sqliteStore.releaseOwner(owner, reason),
 };
@@ -827,7 +831,7 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
       authorization: `Bearer ${token}`, secret,
       body: { phase: "gap-analysis", outcome: "success", comments: [], reviewFix: candidate },
       resolveProvider: async () => { legacyProviderLookups++; return null; },
-      onReviewFixResult: (validated) => sqliteStore.recordResult(validated.attemptId, validated, () => {
+      onReviewFixResult: (validated) => sqliteStore.recordResult(validated.attemptId, validated, Date.now(), () => {
         const delivery = acceptDelivery({
           authenticatedSource: "runner-callback", deliveryId: `${validated.attemptId}.result`,
           kind: "result", destination: fixture.scope, payload: validated,
@@ -963,7 +967,7 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     const fixture = freshScenario("result-crash");
     await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
     await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8_000, label: "fixture.runId !== null" });
-    fixture.recordResultOverride = crashAfterFirstCall((id: AttemptId, result: ReviewFixResultMetadataV1) => sqliteStore.recordResult(id, result));
+    fixture.recordResultOverride = crashAfterFirstCall((id: AttemptId, result: ReviewFixResultMetadataV1, now: number) => sqliteStore.recordResult(id, result, now));
     fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
     const prepared = (await sqliteStore.getPreparedAttempt(fixture.attemptId!))!;
     const result = resultOf(fixture, prepared);
@@ -994,6 +998,38 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     const done = await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!);
     expect(done).toMatchObject({ status: "finalized", approval: "applied" });
     expect(fixture.commentPosts).toBe(1); // the crashed call's write actually landed; the retry only observed and acked it
+  }, 25_000);
+
+  it.each(VARIANTS.map(([label]) => label))("completed_at is the timestamp the record-success-outcome step journaled, and the journal holds no secret (%s)", async (label) => {
+    const env = envFor(label);
+    const fixture = freshScenario("journal-projection");
+    await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
+    await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8_000, label: "fixture.runId !== null" });
+    fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
+    const prepared = (await sqliteStore.getPreparedAttempt(fixture.attemptId!))!;
+    const result = resultOf(fixture, prepared);
+    const secret = "journal-projection-secret";
+    // Minting needs a live authority, so mint before the attempt finishes.
+    const tokens = (["result", "progress", "publication"] as const)
+      .map((audience) => mintPreparedReviewFixToken({ attemptId: fixture.attemptId!, audience, secret }).token);
+    await callWorkflow(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!, "result", result);
+    const done = await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!);
+    expect(done).toMatchObject({ status: "finalized", approval: "applied" });
+
+    const rows = await queryInvocations(env.adminAPIBaseUrl(),
+      `target_service_name = 'ReviewFixAttempt' AND target_service_key = '${fixture.attemptId!}' AND target_handler_name = 'run'`);
+    expect(rows).toHaveLength(1);
+    const entries = await journalEntries(env.adminAPIBaseUrl(), rows[0].id as string);
+
+    const journaled = journaledRunResult(entries, "record-success-outcome") as { status: string; completedAt: number };
+    expect(journaled.status).toBe("recorded");
+    const row = getDb().prepare("SELECT completed_at FROM review_fix_attempts WHERE attempt_id = ?")
+      .get(fixture.attemptId!) as { completed_at: number };
+    expect(row.completed_at).toBe(journaled.completedAt);
+
+    const text = journalText(entries);
+    expect(text).not.toContain(secret);
+    for (const token of tokens) expect(text).not.toContain(token);
   }, 25_000);
 
   // -------------------------------------------------------------------------

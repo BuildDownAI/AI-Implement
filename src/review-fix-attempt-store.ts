@@ -336,7 +336,7 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
     })();
   }
 
-  async bindExecution(attemptId: AttemptId, execution: WorkerExecutionIdentity): Promise<ReviewFixExecutionBindOutcome> {
+  async bindExecution(attemptId: AttemptId, execution: WorkerExecutionIdentity, now: number): Promise<ReviewFixExecutionBindOutcome> {
     const db = getDb();
     return db.transaction((): ReviewFixExecutionBindOutcome => {
       const row = db.prepare("SELECT * FROM review_fix_attempts WHERE attempt_id = ?").get(attemptId) as AttemptRow | undefined;
@@ -357,7 +357,7 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
         const accepted = JSON.parse(row.accepted_result_json) as ReviewFixResultMetadataV1;
         if (accepted.githubRunId !== execution.githubRunId || accepted.githubRunAttempt !== execution.githubRunAttempt) {
           db.prepare("UPDATE review_fix_attempts SET result_conflict_at = COALESCE(result_conflict_at, ?) WHERE attempt_id = ?")
-            .run(Date.now(), attemptId);
+            .run(now, attemptId);
           return { status: "already_bound", execution: { githubRunId: accepted.githubRunId, githubRunAttempt: accepted.githubRunAttempt } };
         }
       }
@@ -372,10 +372,10 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
     })();
   }
 
-  async revokeAuthority(attemptId: AttemptId): Promise<void> {
+  async revokeAuthority(attemptId: AttemptId, now: number): Promise<void> {
     getDb()
       .prepare("UPDATE review_fix_attempts SET authority_revoked_at = COALESCE(authority_revoked_at, ?) WHERE attempt_id = ?")
-      .run(Date.now(), attemptId);
+      .run(now, attemptId);
   }
 
   async hasCurrentAuthority(attemptId: AttemptId): Promise<boolean> {
@@ -400,6 +400,7 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
   async recordResult(
     attemptId: AttemptId,
     result: ReviewFixResultMetadataV1,
+    now: number,
     onAccepted?: () => void,
   ): Promise<ResultIntakeOutcome> {
     const db = getDb();
@@ -423,7 +424,7 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
       if (row.github_run_id !== null
         && (row.github_run_id !== result.githubRunId || row.github_run_attempt !== result.githubRunAttempt)) {
         db.prepare("UPDATE review_fix_attempts SET result_conflict_at = COALESCE(result_conflict_at, ?) WHERE attempt_id = ?")
-          .run(Date.now(), attemptId);
+          .run(now, attemptId);
         return { status: "conflict", attemptId, reason: "result execution identity does not match the bound execution" };
       }
 
@@ -434,7 +435,7 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
           return { status: "duplicate", attemptId };
         }
         db.prepare("UPDATE review_fix_attempts SET result_conflict_at = COALESCE(result_conflict_at, ?) WHERE attempt_id = ?")
-          .run(Date.now(), attemptId);
+          .run(now, attemptId);
         return { status: "conflict", attemptId, reason: "a different result is already stored for this attempt" };
       }
 
@@ -491,7 +492,7 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
    * it needs no I/O beyond this transaction (recordResult above never rewrites
    * `terminal_outcome_json`, so once this is called nothing here can undo it).
    */
-  async recordOutcome(outcome: ReviewFixImmutableOutcome): Promise<RecordOutcomeResult> {
+  async recordOutcome(outcome: ReviewFixImmutableOutcome, now: number): Promise<RecordOutcomeResult> {
     const db = getDb();
     return db.transaction((): RecordOutcomeResult => {
       const row = db.prepare("SELECT terminal_outcome_json FROM review_fix_attempts WHERE attempt_id = ?").get(outcome.attemptId) as
@@ -502,8 +503,8 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
         return { status: "already_recorded", outcome: JSON.parse(row.terminal_outcome_json) as ReviewFixImmutableOutcome };
       }
       db.prepare("UPDATE review_fix_attempts SET terminal_outcome_json = ?, completed_at = ? WHERE attempt_id = ? AND terminal_outcome_json IS NULL")
-        .run(JSON.stringify(outcome), Date.now(), outcome.attemptId);
-      return { status: "recorded" };
+        .run(JSON.stringify(outcome), now, outcome.attemptId);
+      return { status: "recorded", completedAt: now };
     })();
   }
 

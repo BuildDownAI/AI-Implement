@@ -4219,7 +4219,7 @@ describe("handleRunnerResult — reviewFix pilot marker (AII-777)", () => {
       body: { phase: "implementation", outcome: "success", comments: [], prUrl: "https://github.com/o/r/pull/1", reviewFix: forged },
       secret: SECRET,
       resolveProvider: makeResolve(fake),
-      onReviewFixResult: (result) => attemptStore.recordResult(result.attemptId, result),
+      onReviewFixResult: (result) => attemptStore.recordResult(result.attemptId, result, Date.now()),
     });
 
     expect(res.status).toBe(410);
@@ -4294,7 +4294,7 @@ describe("handleRunnerResult — reviewFix pilot marker (AII-777)", () => {
       body: { phase: "implementation", outcome: "success", comments: [], prUrl: "https://github.com/o/r/pull/1", reviewFix: result },
       secret: SECRET,
       resolveProvider: makeResolve(fake),
-      onReviewFixResult: (r) => attemptStore.recordResult(r.attemptId, r),
+      onReviewFixResult: (r) => attemptStore.recordResult(r.attemptId, r, Date.now()),
     });
 
     expect(res.status).toBe(200);
