@@ -34,6 +34,7 @@ const profileCaller = restate.service({
 interface FakeFly extends FlyMachineProfileDeps {
   calls: string[];
   failClear: boolean;
+  failClearOnce409: boolean;
   fail404OnDestroy: boolean;
 }
 function fakeFly(idleTimeoutMsOverride?: number): FakeFly {
@@ -41,6 +42,7 @@ function fakeFly(idleTimeoutMsOverride?: number): FakeFly {
   const fake: FakeFly = {
     calls,
     failClear: false,
+    failClearOnce409: false,
     fail404OnDestroy: false,
     idleTimeoutMsOverride,
     fly: {
@@ -48,6 +50,10 @@ function fakeFly(idleTimeoutMsOverride?: number): FakeFly {
       clearMachineEnv: async (id, metadata) => {
         calls.push(metadata ? `clear:${id}:${JSON.stringify(metadata)}` : `clear:${id}`);
         if (fake.failClear) throw new Error("fly down");
+        if (fake.failClearOnce409) {
+          fake.failClearOnce409 = false;
+          throw new Error(`Failed to update machine ${id} (409): {"error":"aborted: machine is replacing: concurrent update in progress"}`);
+        }
       },
       destroyMachine: async (id) => {
         calls.push(`destroy:${id}`);
@@ -277,6 +283,24 @@ describe("FlyMachineProfile kept machine", () => {
     expect(fly.calls).toContain(`destroy:${machineId}`);
     expect(await h.status()).toBeNull();
     await eventually(() => h.expires(), (found) => found.length === 1, { label: "expire still scheduled", timeoutMs: 30_000 });
+  }, 60_000);
+
+  it.each(labels)("a scrub that fails once with a 409 is retried and keeps the machine (%s)", async (label) => {
+    const key = fresh();
+    const h = forKey(label, key);
+    const machineId = `m-${randomUUID()}`;
+    await h.call("claim", { dispatchId: "d1" });
+    await h.call("attach", { dispatchId: "d1", machineId });
+    fly.failClearOnce409 = true;
+    try {
+      await h.call("release", { dispatchId: "d1" });
+    } finally {
+      fly.failClearOnce409 = false;
+    }
+    expect(fly.calls.filter((c) => c.startsWith(`clear:${machineId}`))).toHaveLength(2);
+    expect(fly.calls).not.toContain(`destroy:${machineId}`);
+    expect(await h.status()).toMatchObject({ machineId, heldBy: null });
+    await eventually(() => h.expires(), (found) => found.length === 1, { label: "expire scheduled", timeoutMs: 30_000 });
   }, 60_000);
 
   it.each(labels)("a 404 from Fly counts as destroyed in expire (%s)", async (label) => {
