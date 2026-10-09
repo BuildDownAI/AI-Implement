@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import {
   REVIEW_PROCESSES,
@@ -147,5 +148,20 @@ describe("helpers", () => {
     expect(parseBughunterSeverity("no line")).toBeNull();
     expect(parseBughunterSeverity("<!-- bughunter-severity: {oops} -->")).toBeNull();
     expect(parseBughunterSeverity('<!-- bughunter-severity: {"normal":1} -->')).toBeNull();
+  });
+});
+
+describe("DEFAULT_REVIEW_CHECK_NAMES drift guard", () => {
+  const literal = (file: string): string[] => {
+    const src = readFileSync(new URL(file, import.meta.url), "utf8");
+    const m = /const DEFAULT_REVIEW_CHECK_NAMES = \[([^\]]*)\]/.exec(src);
+    expect(m).not.toBeNull();
+    return [...m![1].matchAll(/"([^"]*)"/g)].map((x) => x[1]);
+  };
+
+  it("keeps the module's copy equal to post-push-review's list", () => {
+    const original = literal("../pipeline/steps/post-push-review.ts");
+    expect(original.length).toBeGreaterThan(0);
+    expect(literal("../review-process.ts")).toEqual(original);
   });
 });
