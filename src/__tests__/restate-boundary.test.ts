@@ -33,7 +33,11 @@ describe("dependency direction: the main pipeline never reaches into Restate (AI
 // for a *type* import (its `callTool` reference is used purely for a parameter type, never
 // invoked), so it carries no runtime dependency on Restate — that's checked separately below.
 describe("import allowlist: only the door adapters may import Restate from outside src/restate/ (AII-717)", () => {
-  const ALLOWLIST = new Set(["src/mcp.ts", "src/mcp-oauth.ts", "src/admin.ts", "src/index.ts"]);
+  // deploy.ts is the self-deployment door: it probes the old Restate endpoint
+  // before replacing the process (AII-810), without importing the SDK itself.
+  // reaper.ts imports the durable-runner machine-metadata constants from
+  // src/restate/fly-machine-profile.ts so the stamp and the reaper's reading of it share one definition (AII-1132).
+  const ALLOWLIST = new Set(["src/mcp.ts", "src/mcp-oauth.ts", "src/admin.ts", "src/index.ts", "src/deploy.ts", "src/runner-callback.ts", "src/reaper.ts"]);
 
   function listTsFiles(dir: string): string[] {
     const entries = readdirSync(dir, { withFileTypes: true });
@@ -91,12 +95,20 @@ describe("import allowlist: only the door adapters may import Restate from outsi
     }
   });
 
+  it("src/deploy.ts imports only the endpoint drain adapters, never the SDK", () => {
+    const imports = extractImportSpecifiers(readFileSync("src/deploy.ts", "utf8"))
+      .filter((entry) => isRestateSpecifier(entry.source))
+      .map((entry) => entry.source)
+      .sort();
+    expect(imports).toEqual(["./restate/drain.js", "./restate/endpoint.js", "./restate/server.js"]);
+  });
+
   // Regression proof for the allowlist test itself (acceptance criterion): temporarily adding
   // `import "./restate/tools-client.js";` to src/stuck-watchdog.ts and rerunning `npm test`
   // makes the first test above fail with that file listed in `violations`, confirmed by hand
   // and reverted before this PR — see the PR description for the before/after transcript.
-  it("sanity: the allowlist actually contains the four documented adapters, nothing else", () => {
-    expect([...ALLOWLIST].sort()).toEqual(["src/admin.ts", "src/index.ts", "src/mcp-oauth.ts", "src/mcp.ts"]);
+  it("sanity: the allowlist contains only the documented door and deployment adapters", () => {
+    expect([...ALLOWLIST].sort()).toEqual(["src/admin.ts", "src/deploy.ts", "src/index.ts", "src/mcp-oauth.ts", "src/mcp.ts", "src/reaper.ts", "src/runner-callback.ts"]);
   });
 });
 
@@ -178,28 +190,46 @@ function definitionBlockFor(identifier: string, source: string): string {
 // ---- AII-717: a static proxy for "this write's side effect is journaled and can't be
 // re-delivered" — reading the actual retryPolicy/ctx.run wiring back out of a compiled Restate
 // handler isn't practical from a unit test, so this checks the source text directly. It fails
-// if either `ctx.run(` or `retryPolicy` is removed from any one `role: "admin"` handler's
-// definition (the acceptance-criterion regression this test exists to catch).
-describe("every role: \"admin\" handler wraps its side effect in ctx.run under a retryPolicy (AII-717)", () => {
+// if either `ctx.run(` or `retryPolicy` is removed from any one declared write handler's
+// definition (the acceptance-criterion regression this test exists to catch). Admin reads are
+// explicit `operation: "read"` handlers and intentionally excluded from this write rail.
+describe("every declared write handler wraps its side effect in ctx.run under a retryPolicy (AII-717)", () => {
   const handlerEntries = extractHandlerEntries(TOOLS_SOURCE);
-  const writeEntries = handlerEntries.filter(({ identifier }) => /role:\s*"admin"/.test(definitionBlockFor(identifier, TOOLS_SOURCE)));
+  const writeEntries = handlerEntries.filter(({ identifier }) => {
+    const block = definitionBlockFor(identifier, TOOLS_SOURCE);
+    return /role:\s*"admin"/.test(block) && !/operation:\s*"read"/.test(block);
+  });
+  const adminReadEntries = handlerEntries.filter(({ identifier }) => {
+    const block = definitionBlockFor(identifier, TOOLS_SOURCE);
+    return /role:\s*"admin"/.test(block) && /operation:\s*"read"/.test(block);
+  });
 
-  it("found the six documented write handlers as role: \"admin\" (not zero, not accidentally all of them)", () => {
+  it("found the eight documented write handlers as role: \"admin\" (not zero, not accidentally all of them)", () => {
     expect(writeEntries.map((e) => e.toolName).sort()).toEqual(
-      ["add_project", "clear_dispatch_dedup", "pause_project", "set_runner_mode", "trigger_kg_refresh", "trigger_workflow_sync"],
+      ["add_project", "clear_dispatch_dedup", "pause_project", "release_dispatch_reservation", "set_fly_machine_profile", "set_runner_mode", "trigger_kg_refresh", "trigger_workflow_sync"],
     );
   });
 
   it.each(writeEntries.map(({ toolName, identifier }) => [toolName, identifier] as const))(
-    "%s (%s) contains both ctx.run( and retryPolicy in its definition",
+    "%s (%s) contains a journaled side effect (ctx.run( or an object client call) and retryPolicy in its definition",
     (_toolName, identifier) => {
       const block = definitionBlockFor(identifier, TOOLS_SOURCE);
-      expect(block).toContain("ctx.run(");
+      expect(block).toMatch(/ctx\.run\(|ctx\.objectClient\(/);
       expect(block).toMatch(/retryPolicy\s*:/);
     },
   );
 
-  it("no role: \"user\" handler declares a retryPolicy", () => {
+  it("the two review-fix admin reads are explicitly marked read-only and declare no retryPolicy", () => {
+    expect(adminReadEntries.map((e) => e.toolName).sort()).toEqual(["get_review_fix_activity", "get_review_fix_attempt"]);
+    for (const { identifier } of adminReadEntries) {
+      const block = definitionBlockFor(identifier, TOOLS_SOURCE);
+      expect(block).toContain('operation: "read"');
+      expect(block).not.toContain("ctx.run(");
+      expect(block).not.toMatch(/retryPolicy\s*:/);
+    }
+  });
+
+  it("no read handler declares a retryPolicy", () => {
     const readEntries = handlerEntries.filter((e) => !writeEntries.some((w) => w.identifier === e.identifier));
     for (const { identifier } of readEntries) {
       const block = definitionBlockFor(identifier, TOOLS_SOURCE);

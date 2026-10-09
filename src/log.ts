@@ -1,6 +1,9 @@
 import { getDb } from "./dedup.js";
-import { markCommentGapfillRunTerminal } from "./comment-gapfill-queue.js";
+import { getMappings } from "./config.js";
+import { markCommentGapfillRunTerminal, requeueGapfillAfterPushFailure } from "./comment-gapfill-queue.js";
 import { isFailureRecord, type FailureRecord } from "./pipeline/failure-classification.js";
+import { read as readAdmission, release as releaseAdmission } from "./dispatch-admission.js";
+import { REVIEW_FIX_EVIDENCE_RETENTION_MS } from "./review-fix-evidence.js";
 
 const MAX_LOG_ENTRIES = 500;
 
@@ -23,6 +26,7 @@ export interface Job {
   repo: string | null;
   dispatchedAt: number;
   dispatchId: string | null;
+  admissionGeneration: number | null;
   dispatchNumber: number;
   issueState: string | null;
   runId: number | null;
@@ -111,6 +115,9 @@ function ensureLogColumns(): void {
     db.exec("ALTER TABLE dispatch_log ADD COLUMN dispatch_id TEXT");
     db.exec("CREATE INDEX IF NOT EXISTS idx_dispatch_log_dispatch_id ON dispatch_log(dispatch_id)");
   }
+  if (!names.has("admission_generation")) {
+    db.exec("ALTER TABLE dispatch_log ADD COLUMN admission_generation INTEGER");
+  }
   if (!names.has("status")) {
     db.exec("ALTER TABLE dispatch_log ADD COLUMN status TEXT NOT NULL DEFAULT 'unknown'");
   }
@@ -167,7 +174,9 @@ function ensureLogColumns(): void {
   // Migrate legacy rows: jobs that were never actually tracked by the run
   // monitor should show 'unknown', not a misleading terminal status.
   // Exclude fly-machines jobs — they use machine_id, not run_id.
-  db.exec("UPDATE dispatch_log SET status = 'unknown' WHERE run_id IS NULL AND status != 'unknown' AND (execution_mode IS NULL OR execution_mode = 'github-actions')");
+  // Only open rows are rewritten; closed rows (failed, completed, ...) keep
+  // their status and conclusion.
+  db.exec("UPDATE dispatch_log SET status = 'unknown' WHERE run_id IS NULL AND status IN ('dispatched', 'running') AND (execution_mode IS NULL OR execution_mode = 'github-actions')");
 
   // Fix data corruption: when multiple jobs share the same run_id, the
   // matching was wrong (findWorkflowRunId returned the same run for all).
@@ -182,6 +191,19 @@ function ensureLogColumns(): void {
   `);
 }
 
+/** Newest dispatch_log row id for a dispatch id, if any. */
+export function findLogIdByDispatchId(dispatchId: string): number | undefined {
+  const row = getDb()
+    .prepare("SELECT id FROM dispatch_log WHERE dispatch_id = ? ORDER BY id DESC LIMIT 1")
+    .get(dispatchId) as { id: number } | undefined;
+  return row?.id;
+}
+
+/** Idempotent on dispatchId: returns the existing row's id instead of inserting a duplicate. */
+export function appendLogIfAbsent(entry: Parameters<typeof appendLog>[0] & { dispatchId: string }): number {
+  return findLogIdByDispatchId(entry.dispatchId) ?? appendLog(entry);
+}
+
 export function appendLog(entry: {
   issueId: string;
   issueIdentifier?: string;
@@ -190,6 +212,8 @@ export function appendLog(entry: {
   repo?: string;
   issueState?: string;
   dispatchId?: string;
+  /** Generation of the admission that owns this exact backend launch. */
+  admissionGeneration?: number | null;
   dispatchNumber?: number;
   machineNonce?: string;
   executionMode?: string;
@@ -210,7 +234,7 @@ export function appendLog(entry: {
   const dispatchNumber = entry.dispatchNumber ?? countPriorDispatches(entry.issueId, entry.phase ?? "implementation").count + 1;
 
   const result = db.prepare(
-    "INSERT INTO dispatch_log (issue_id, issue_identifier, issue_title, team_key, repo, dispatched_at, dispatch_id, dispatch_number, issue_state, status, machine_nonce, execution_mode, machine_id, runner_mode, session_image, phase, contract, trigger, grouping_parent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    "INSERT INTO dispatch_log (issue_id, issue_identifier, issue_title, team_key, repo, dispatched_at, dispatch_id, admission_generation, dispatch_number, issue_state, status, machine_nonce, execution_mode, machine_id, runner_mode, session_image, phase, contract, trigger, grouping_parent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
   ).run(
     entry.issueId,
     entry.issueIdentifier ?? null,
@@ -219,6 +243,7 @@ export function appendLog(entry: {
     entry.repo ?? null,
     Date.now(),
     entry.dispatchId ?? null,
+    entry.admissionGeneration ?? null,
     dispatchNumber,
     entry.issueState ?? null,
     entry.status ?? "dispatched",
@@ -234,13 +259,35 @@ export function appendLog(entry: {
   );
 
   // Keep only the most recent MAX_LOG_ENTRIES rows, but never evict a row while
-  // its machine nonce is active. Token vending and callbacks depend on that row
-  // for the run lifetime; invalidateNonce() makes it prunable when terminal.
+  // its machine nonce is active (token vending and callbacks depend on that row
+  // for the run lifetime; invalidateNonce() makes it prunable when terminal), and
+  // never evict a row correlated to a Restate review-fix pilot attempt (via
+  // dispatch_id) that is still unresolved (review_fix_attempts.completed_at IS
+  // NULL) or completed within the last 7 days (AII-795). A terminal attempt
+  // stays exempt while delivery, reservation, result conflict, or execution
+  // identity is unresolved, matching review-fix-evidence's retention guard.
   db.prepare(
     `DELETE FROM dispatch_log
      WHERE machine_nonce IS NULL
-       AND id NOT IN (SELECT id FROM dispatch_log ORDER BY dispatched_at DESC LIMIT ?)`,
-  ).run(MAX_LOG_ENTRIES);
+       AND id NOT IN (SELECT id FROM dispatch_log ORDER BY dispatched_at DESC LIMIT ?)
+       AND (
+         dispatch_id IS NULL
+         OR NOT EXISTS (
+           SELECT 1 FROM review_fix_attempts a
+           WHERE a.dispatch_id = dispatch_log.dispatch_id
+             AND (
+               a.completed_at IS NULL OR a.completed_at >= ?
+               OR a.result_conflict_at IS NOT NULL OR a.github_run_id IS NULL
+               OR EXISTS (SELECT 1 FROM dispatch_admissions d
+                          WHERE d.dispatch_id = a.dispatch_id AND d.released_at IS NULL)
+               OR EXISTS (SELECT 1 FROM review_fix_inbox i
+                          WHERE i.installation_id = a.installation_id
+                            AND i.repository = a.repository AND i.pr_number = a.pr_number
+                            AND i.delivery_state != 'delivered')
+             )
+         )
+       )`,
+  ).run(MAX_LOG_ENTRIES, Date.now() - REVIEW_FIX_EVIDENCE_RETENTION_MS);
 
   return Number(result.lastInsertRowid);
 }
@@ -390,20 +437,49 @@ export function updateJobStatus(
   status: JobStatus,
   conclusion?: string | null,
   prUrl?: string | null,
+  opts?: {
+    /** The caller observed the exact backend execution in a terminal state. A
+     * callback, timeout, or cancellation request must leave this unset. */
+    backendTerminated?: boolean;
+    /** Set by a caller that reached this terminal status through a best-effort stop/
+     *  destroy that may itself have failed silently (the reaper's machine sweeps,
+     *  stuck-watchdog's remediation paths) — i.e. "terminal status string" without
+     *  "verified backend termination". Skips the admission-release hook below so the
+     *  reservation stays held for `dispatch-admission.ts`'s stale-reservation sweep to
+     *  resolve later, instead of releasing a slot whose backend might still be running. */
+    skipAdmissionRelease?: boolean;
+  },
 ): void {
   const isTerminal = status === "completed" || status === "review_failed" || status === "failed" || status === "timed_out" || status === "dispatch-failed";
   // AII-277: a comment-triggered (gap-fill) run reaching a terminal state must
   // terminalize its queue row, or hasPendingConflictResolution stays true
   // forever and conflict-recovery attempt 2 is unreachable (observed livelock).
   if (isTerminal) {
-    const job = getDb().prepare("SELECT repo, trigger, pr_url FROM dispatch_log WHERE id = ?").get(jobId) as
-      | { repo: string; trigger: string | null; pr_url: string | null } | undefined;
+    const job = getDb().prepare("SELECT repo, trigger, pr_url, dispatch_id, admission_generation, execution_mode, failure_json FROM dispatch_log WHERE id = ?").get(jobId) as
+      | { failure_json: string | null; repo: string; trigger: string | null; pr_url: string | null; dispatch_id: string | null; admission_generation: number | null; execution_mode: string | null } | undefined;
     const prUrlForRow = prUrl ?? job?.pr_url ?? null;
     const m = prUrlForRow ? /\/pull\/(\d+)$/.exec(prUrlForRow) : null;
     if (job?.trigger === "comment" && m) {
       const outcome = status === "completed" ? "completed" : "failed";
+      // AII-922: retry once when the run died at push (transient or auth failure; a
+      // conflict has its own rail). Must run before the row leaves 'dispatched'.
+      const pushFailure = outcome === "failed" ? parseFailureJson(job.failure_json) : null;
+      if (pushFailure && pushFailure.stage === "push" && (pushFailure.category === "transient" || pushFailure.category === "auth")
+        && requeueGapfillAfterPushFailure(job.repo, Number(m[1]))) {
+        console.log(`[gapfill] push failure (${pushFailure.code}) on ${job.repo}#${m[1]}; re-enqueued once`);
+      }
       const n = markCommentGapfillRunTerminal(job.repo, Number(m[1]), outcome);
       if (n > 0) console.log(`[gapfill] terminalized ${n} queue row(s) for ${job.repo}#${m[1]} -> ${outcome}`);
+    }
+    // A terminal business status does not prove that the backend has exited: callbacks
+    // and watchdogs can write it from inside a live run. Only an exact backend monitor
+    // observation may opt in to immediate release. Other rows are reconciled against
+    // the backend on the next poll, with owner and generation fences.
+    if (job?.dispatch_id && job.admission_generation !== null && opts?.backendTerminated && !opts.skipAdmissionRelease) {
+      const current = readAdmission(job.dispatch_id);
+      if (current?.lifecycleOwner.kind === "legacy" && current.backend === job.execution_mode) {
+        releaseAdmission(job.dispatch_id, current.lifecycleOwner, job.admission_generation, "finalized");
+      }
     }
   }
   // COALESCE keeps a pr_url recorded earlier (e.g. by the runner callback) when the
@@ -496,17 +572,6 @@ export function getInFlightJobs(): Job[] {
     getDb()
       .prepare(
         "SELECT * FROM dispatch_log WHERE status IN ('dispatched', 'running') ORDER BY dispatched_at ASC",
-      )
-      .all() as RawRow[],
-  );
-}
-
-/** Returns all kg-refresh jobs in a non-terminal state (for the reaper's inverse sweep). */
-export function getInFlightKgRefreshJobs(): Job[] {
-  return mapRows(
-    getDb()
-      .prepare(
-        "SELECT * FROM dispatch_log WHERE phase = 'kg-refresh' AND status IN ('dispatched', 'running') ORDER BY dispatched_at ASC",
       )
       .all() as RawRow[],
   );
@@ -607,6 +672,14 @@ export function getLatestPrUrlForIssue(issueId: string): string | null {
   return row?.pr_url ?? null;
 }
 
+/** Newest non-null mapping key recorded for an issue; placement fallback for legacy dedup rows. */
+export function getLatestTeamKeyForIssue(issueId: string): string | null {
+  const row = getDb()
+    .prepare("SELECT team_key FROM dispatch_log WHERE issue_id = ? AND team_key IS NOT NULL ORDER BY id DESC LIMIT 1")
+    .get(issueId) as { team_key: string } | undefined;
+  return row?.team_key ?? null;
+}
+
 /** Latest dispatch for an issue in a repo, matched case-insensitively on the tracker
  *  identifier. Recovery path for PRs the orchestrator opened WITHOUT a dispatch —
  *  a grouping roll-up PR encodes its feature-node parent's key in the head branch,
@@ -623,26 +696,55 @@ export function getLatestDispatchForIssueIdentifier(owner: string, repo: string,
 }
 
 /**
- * Returns the latest identifier, title, and repo recorded in dispatch_log for a
- * given issue+phase, or null fields when no log entry exists. Used to enrich
- * parked-issue rows whose metadata lives only in dispatch_log.
+ * Returns the identifier, title, and repo for a parked issue, or null fields when
+ * no record exists. dispatch_log is pruned, so the lookup falls back: newest row
+ * for the issue+phase, newest row for the issue in any phase, then the dispatched
+ * table (repo mapped from its team_key when a mapping exists).
  */
 export function getIssueEnrichment(
   issueId: string,
   phase: string,
 ): { issueIdentifier: string | null; issueTitle: string | null; repo: string | null } {
-  const row = getDb()
-    .prepare(
-      `SELECT issue_identifier, issue_title, repo
-       FROM dispatch_log
-       WHERE issue_id = ? AND phase = ?
-       ORDER BY id DESC LIMIT 1`,
-    )
-    .get(issueId, phase) as
-    | { issue_identifier: string | null; issue_title: string | null; repo: string | null }
+  type LogRow = { issue_identifier: string | null; issue_title: string | null; repo: string | null };
+  const db = getDb();
+  const select = `SELECT issue_identifier, issue_title, repo FROM dispatch_log`;
+  const row =
+    (db.prepare(`${select} WHERE issue_id = ? AND phase = ? ORDER BY id DESC LIMIT 1`).get(issueId, phase) as
+      | LogRow
+      | undefined) ??
+    (db.prepare(`${select} WHERE issue_id = ? ORDER BY id DESC LIMIT 1`).get(issueId) as LogRow | undefined);
+  if (row?.issue_identifier) {
+    return {
+      issueIdentifier: row.issue_identifier,
+      issueTitle: row.issue_title ?? null,
+      repo: row.repo ?? null,
+    };
+  }
+
+  const dispatched = db
+    .prepare("SELECT issue_identifier, issue_title, team_key FROM dispatched WHERE issue_id = ?")
+    .get(issueId) as
+    | { issue_identifier: string | null; issue_title: string | null; team_key: string | null }
     | undefined;
+  if (dispatched?.issue_identifier) {
+    let repo: string | null = null;
+    if (dispatched.team_key) {
+      try {
+        const m = getMappings()[dispatched.team_key];
+        if (m) repo = `${m.owner}/${m.repo}`;
+      } catch {
+        // mappings table unavailable: leave the repo unknown
+      }
+    }
+    return {
+      issueIdentifier: dispatched.issue_identifier,
+      issueTitle: dispatched.issue_title ?? null,
+      repo: repo ?? row?.repo ?? null,
+    };
+  }
+
   return {
-    issueIdentifier: row?.issue_identifier ?? null,
+    issueIdentifier: null,
     issueTitle: row?.issue_title ?? null,
     repo: row?.repo ?? null,
   };
@@ -676,6 +778,7 @@ interface RawRow {
   repo: string | null;
   dispatched_at: number;
   dispatch_id: string | null;
+  admission_generation: number | null;
   dispatch_number: number;
   issue_state: string | null;
   run_id: number | null;
@@ -708,6 +811,7 @@ function mapRows(rows: RawRow[]): Job[] {
     repo: row.repo,
     dispatchedAt: row.dispatched_at,
     dispatchId: row.dispatch_id ?? null,
+    admissionGeneration: row.admission_generation ?? null,
     dispatchNumber: row.dispatch_number ?? 1,
     issueState: row.issue_state ?? null,
     runId: row.run_id ?? null,
@@ -844,12 +948,24 @@ export function updateJobMachineId(jobId: number, machineId: string): void {
     .run(machineId, jobId);
 }
 
+/** Sets a job's machine id without touching its status (`updateJobMachineId` also marks it running). */
+export function setJobMachineId(jobId: number, machineId: string): void {
+  getDb()
+    .prepare("UPDATE dispatch_log SET machine_id = ? WHERE id = ?")
+    .run(machineId, jobId);
+}
+
 /** Records machine identity on a dispatched kg-refresh row after the machine starts. */
 export function updateJobMachineDetails(jobId: number, opts: { machineNonce: string; machineId?: string; logsUrl?: string }): void {
   getDb()
     .prepare("UPDATE dispatch_log SET machine_nonce = ?, machine_id = ? WHERE id = ?")
     .run(opts.machineNonce, opts.machineId ?? null, jobId);
   if (opts.logsUrl) updateJobPrUrl(jobId, opts.logsUrl);
+}
+
+/** Writes only the nonce, leaving machine_id and the rest of the row untouched. */
+export function setJobMachineNonce(jobId: number, machineNonce: string): void {
+  getDb().prepare("UPDATE dispatch_log SET machine_nonce = ? WHERE id = ?").run(machineNonce, jobId);
 }
 
 /** Clears a job's nonce (called when machine is destroyed). */
@@ -865,6 +981,14 @@ export function getStuckAttempts(issueId: string): number {
     .prepare("SELECT attempts FROM stuck_attempts WHERE issue_id = ?")
     .get(issueId) as { attempts: number } | undefined;
   return row?.attempts ?? 0;
+}
+
+/** When the latest stuck attempt for an issue was counted (epoch ms), or null if none. */
+export function getStuckAttemptStampedAt(issueId: string): number | null {
+  const row = getDb()
+    .prepare("SELECT last_attempt_at FROM stuck_attempts WHERE issue_id = ?")
+    .get(issueId) as { last_attempt_at: number | null } | undefined;
+  return row?.last_attempt_at ?? null;
 }
 
 /** Increments the stuck-attempt counter, stamps last_attempt_at, and returns the new count. */

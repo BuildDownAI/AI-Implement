@@ -51,8 +51,12 @@ grouping parent surfaces the conflict instead of being held indefinitely.
 
 Implementation dispatch takes the validated field value when set, and otherwise
 falls through to `resolveBaseBranch` (feature-branch grouping → repo default).
-Planning does not consult `featureBranchChain` at all — that grouping applies only
-to implementation — so planning clones the field value or the repo default.
+Planning resolves the same way, read-only: the field wins when set (refusal 3
+above means a chain can never also be present in that case), otherwise a
+non-empty `featureBranchChain` resolves to the feature branch via
+`resolvePlanningBranch` when it already exists on GitHub, falling back to the
+repo default — logged once — when it doesn't (AII-898). Unlike
+`resolveBaseBranch`, `resolvePlanningBranch` never creates branches.
 
 ## The branch comment
 

@@ -4,6 +4,7 @@ import {
   decodeRunConfig,
   runConfigFromTaskDocument,
   buildImplRunConfig,
+  buildKgRefreshRunConfig,
   type RunConfigV1,
   type TaskDocumentParams,
 } from "../run-config.js";
@@ -182,6 +183,64 @@ describe("run-config envelope", () => {
     } finally {
       warnSpy.mockRestore();
     }
+  });
+
+  const validReviewFix: RunConfigV1["reviewFix"] = {
+    version: 1,
+    attemptId: "attempt-1",
+    installationId: 123,
+    repository: "acme/widgets",
+    prNumber: 42,
+    deadlineAt: Date.parse("2026-01-01T00:00:00.000Z"),
+  };
+
+  it("round-trips reviewFix", () => {
+    const cfg: RunConfigV1 = {
+      v: 1,
+      issue: { id: "i", identifier: "AII-776", title: "t", description: "" },
+      reviewFix: validReviewFix,
+    };
+    expect(decodeRunConfig(encodeRunConfig(cfg)).reviewFix).toEqual(validReviewFix);
+  });
+
+  it("absent reviewFix decodes as undefined (no key materialized)", () => {
+    const min: RunConfigV1 = { v: 1, issue: { id: "i", identifier: "AII-776", title: "t", description: "" } };
+    const decoded = decodeRunConfig(encodeRunConfig(min));
+    expect(decoded.reviewFix).toBeUndefined();
+    expect("reviewFix" in decoded).toBe(false);
+  });
+
+  it("pickKnownKeys preserves reviewFix and drops unrelated unknown keys in the same payload", () => {
+    const withExtra = { ...full, reviewFix: validReviewFix, bogusKey: "dropped" };
+    const b64 = Buffer.from(JSON.stringify(withExtra), "utf-8").toString("base64");
+    const decoded = decodeRunConfig(b64);
+    expect(decoded.reviewFix).toEqual(validReviewFix);
+    expect((decoded as unknown as Record<string, unknown>).bogusKey).toBeUndefined();
+  });
+
+  it("throws (fails closed) on malformed or unsupported reviewFix instead of dropping it", () => {
+    const cases: Array<[string, unknown]> = [
+      ["version not 1", { ...validReviewFix, version: 2 }],
+      ["missing attemptId", { ...validReviewFix, attemptId: undefined }],
+      ["empty attemptId", { ...validReviewFix, attemptId: "" }],
+      ["non-integer installationId", { ...validReviewFix, installationId: 1.5 }],
+      ["non-positive installationId", { ...validReviewFix, installationId: 0 }],
+      ["repository not owner/repo shaped", { ...validReviewFix, repository: "widgets" }],
+      ["non-integer prNumber", { ...validReviewFix, prNumber: 1.5 }],
+      ["non-positive prNumber", { ...validReviewFix, prNumber: -1 }],
+      ["unparsable deadlineAt", { ...validReviewFix, deadlineAt: "not-a-date" }],
+    ];
+    for (const [label, reviewFix] of cases) {
+      const withReviewFix = { ...full, reviewFix };
+      const b64 = Buffer.from(JSON.stringify(withReviewFix), "utf-8").toString("base64");
+      expect(() => decodeRunConfig(b64), label).toThrow(/reviewFix/);
+    }
+  });
+
+  it("throws when reviewFix is not an object", () => {
+    const withReviewFix = { ...full, reviewFix: "not-an-object" };
+    const b64 = Buffer.from(JSON.stringify(withReviewFix), "utf-8").toString("base64");
+    expect(() => decodeRunConfig(b64)).toThrow(/reviewFix/);
   });
 
   it("drops reviewers with malformed per-reviewer maxTurns during decode", () => {
@@ -384,6 +443,63 @@ describe("buildImplRunConfig", () => {
     expect(decoded.kgDryRun).toBe(true);
     expect(decoded.kgSourceRef).toBe("feature/head");
     expect((decoded as unknown as Record<string, unknown>).bogusKey).toBeUndefined();
+  });
+});
+
+describe("buildKgRefreshRunConfig", () => {
+  const fullInput = {
+    kgSourceRepo: "org/kg",
+    issueIdentifier: "KG-REFRESH · trigger-1",
+    runnerCallbackUrl: "https://orch.example/api/runner",
+    dependencyTokenScope: "installation" as const,
+    dryRun: true,
+    kgSourceRef: "feature/head",
+    acceptNewBaseline: true,
+    actorEmail: "admin@example.com",
+  };
+
+  it("builds the exact envelope for a full input", () => {
+    expect(buildKgRefreshRunConfig(fullInput)).toEqual({
+      v: 1,
+      issue: { id: "kg-refresh", identifier: "KG-REFRESH · trigger-1", title: "KG ingest", description: "" },
+      runnerPhase: "kg-refresh",
+      kgSourceRepo: "org/kg",
+      runnerCallbackUrl: "https://orch.example/api/runner",
+      dependencyTokenScope: "installation",
+      kgDryRun: true,
+      kgSourceRef: "feature/head",
+      kgAcceptNewBaseline: true,
+      kgBaselineActor: "admin@example.com",
+    });
+  });
+
+  it("builds only the identity keys for the minimal input", () => {
+    const result = buildKgRefreshRunConfig({ kgSourceRepo: "org/kg", issueIdentifier: "KG-REFRESH · t" });
+    expect(result).toEqual({
+      v: 1,
+      issue: { id: "kg-refresh", identifier: "KG-REFRESH · t", title: "KG ingest", description: "" },
+      runnerPhase: "kg-refresh",
+      kgSourceRepo: "org/kg",
+    });
+    expect(Object.keys(result).sort()).toEqual(["issue", "kgSourceRepo", "runnerPhase", "v"]);
+  });
+
+  it("omits keys for falsy inputs", () => {
+    const result = buildKgRefreshRunConfig({
+      kgSourceRepo: "org/kg",
+      issueIdentifier: "KG-REFRESH · t",
+      runnerCallbackUrl: "",
+      dryRun: false,
+      kgSourceRef: "",
+      acceptNewBaseline: false,
+      actorEmail: "",
+    });
+    expect(Object.keys(result).sort()).toEqual(["issue", "kgSourceRepo", "runnerPhase", "v"]);
+  });
+
+  it("survives encode and decode unchanged", () => {
+    const built = buildKgRefreshRunConfig(fullInput);
+    expect(decodeRunConfig(encodeRunConfig(built))).toEqual(built);
   });
 });
 

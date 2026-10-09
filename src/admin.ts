@@ -38,7 +38,7 @@ import {
 import { listDispatched, deleteDispatched, getReaperSummary, listReaperActions, getDispatchedIds } from "./dedup.js";
 import { listParked, unpark } from "./dispatch-breaker.js";
 import { createSession, accessCodeMatches, authenticateAdminRequest, type AdminGate, type SessionIdentity } from "./admin-session.js";
-import { getEffectiveAllowlist, getEnvAllowlist, listAccessEntries, parseAccessEntries, saveAccessEntries } from "./access-entries.js";
+import { getEffectiveAllowlist, getEnvAllowlist, listAccessEntries, parseAccessEntries, saveAccessEntries, type AccessRole } from "./access-entries.js";
 import { listAccessChanges } from "./access-audit.js";
 import { listGrantedPages, PAGE_ROUTES, savePageGrants } from "./access-page-grants.js";
 import type { DeployStart } from "./deploy.js";
@@ -52,10 +52,13 @@ import { notifyText } from "./notify.js";
 import { getLastSweepAt } from "./reaper.js";
 import { listLog, getInFlightJobs, getInFlightIssueIds, updateJobStatus, getJobById, markJobNotified, getPulls, getIssueEnrichment } from "./log.js";
 import { getStepsByJobId } from "./step-log.js";
-import { listMachines, destroyMachine, listAppSecrets, setAppSecrets, unsetAppSecret, fetchMachineLogs } from "./fly-machines.js";
+import { destroyMachineRecorded } from "./backend-run.js";
+import { listMachines, listAppSecrets, setAppSecrets, unsetAppSecret, fetchMachineLogs } from "./fly-machines.js";
 import type { TicketIssue, AIImplementSnapshot } from "./providers/types.js";
 import type { ProviderRegistry } from "./providers/registry.js";
-import { resolveInFlightSiblings, selectBlockers, selectFileOverlapDeferrals, getOrFetchPlanningContexts } from "./poll-selection.js";
+import { resolveInFlightSiblings, selectBlockers, mergeProviderSnapshots, selectForeignTrackerBlockers, type ForeignTrackerIssue, selectFileOverlapDeferrals, getOrFetchPlanningContexts } from "./poll-selection.js";
+import { count as countReservedCapacity } from "./dispatch-admission.js";
+import { read as readDispatchAdmission, listHeldReservations } from "./dispatch-admission.js";
 import { RESTATE_WRITE_TOOL_NAMES, IDEMPOTENCY_KEY_SHAPE, scopeIdempotencyKey } from "./mcp.js";
 import { adminHtml } from "./admin-html.js";
 import {
@@ -70,7 +73,7 @@ import {
 } from "./orchestrator-settings.js";
 import { getInstallationToken, mintSourceTokenOrJwt, getScopedInstallationToken } from "./github-app-auth.js";
 import { GitHubApiError } from "./github-errors.js";
-import { listRepoBranchesAndTags, getRepoDefaultBranch, cancelWorkflowRun, fetchRepoTarball } from "./github.js";
+import { listRepoBranchesAndTags, getRepoDefaultBranch, fetchRepoTarball } from "./github.js";
 import { probeInstallState } from "./github-install-state.js";
 import { listCustomizations } from "./customizations.js";
 import { getFleetReport } from "./report-card.js";
@@ -82,12 +85,13 @@ import { JiraClient, JiraFieldNotSelectError } from "./providers/jira-client.js"
 import { readLocalJobLogs } from "./local-job-logs.js";
 import { enqueueWorkflowSync, runWorkflowSync, getWorkflowSyncById } from "./workflow-sync-queue.js";
 import { isBareWorkflowFileName, workflowFileNamesCollide } from "./workflow-sync.js";
-import type { KgRefreshStatus } from "./kg-refresh.js";
 import { normalizeBranchPrefix } from "./pipeline/branch-name.js";
 import { normalizeGitHubRepo, normalizeReferenceRepos, type ReferenceRepo } from "./reference-repos.js";
 import { fetchTrackerIssuesPage } from "./runner-callback.js";
 import { isLinearAuthConfigured } from "./linear-app-auth.js";
+import { resolveWorkflowCapabilities } from "./workflow-probe.js";
 import type { callTool } from "./restate/tools-client.js";
+import type { RestateStatus } from "./restate/status.js";
 import type { Caller } from "./mcp-identity.js";
 import picomatch from "picomatch";
 
@@ -165,6 +169,69 @@ function normalizeReviewers(raw: unknown): ReviewerSelection[] {
 
 function validReviewerMaxTurns(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 200;
+}
+
+/**
+ * Returns the reason enabling reviewFixLifecycle="restate" is refused, or null when it may
+ * proceed. Only automatic GitHub Actions review-fix runs ever move to Restate — local
+ * review-fix and human comment-triggered runs stay on Legacy admission regardless.
+ *
+ * Checks both real prerequisites and fails closed whenever either signal is unavailable or
+ * ambiguous (AII-804) — this never guesses:
+ *  - "registered, healthy Restate endpoint": `deps.getRestateStatus()` (src/restate/status.ts,
+ *    injected — see AdminDeps.getRestateStatus for why this file can't import it directly)
+ *    must report the sidecar ready and the endpoint registered. AII-773/AII-724/AII-807 own
+ *    when that state actually becomes reachable in production; until then this reports the
+ *    endpoint unavailable rather than accepting on a hardcoded assumption.
+ *  - "installed template/runner capability on the dispatch ref": a live probe of the target
+ *    workflow file at `ref` (src/workflow-probe.ts's resolveWorkflowCapabilities, the same
+ *    call the review-fix dispatcher itself makes) must show it declares `run_attempt_token`
+ *    (AII-778's attempt-correlation contract) — the capability the Restate pilot actually
+ *    depends on to correlate a dispatch back to its attempt.
+ */
+async function reviewFixLifecycleEnablementError(
+  params: { executionMode: ExecutionMode; owner: string; repo: string; workflowFile: string; ref: string },
+  config: AdminConfig,
+  deps: AdminDeps,
+): Promise<string | null> {
+  const { executionMode, owner, repo, workflowFile, ref } = params;
+  if (executionMode !== "github-actions") {
+    return `reviewFixLifecycle "restate" requires executionMode "github-actions". Set the mode to GitHub Actions, or leave the lifecycle on Legacy.`;
+  }
+
+  const restateStatus = deps.getRestateStatus?.();
+  if (!restateStatus || restateStatus.sidecar.state !== "ready" || restateStatus.registration.state !== "registered") {
+    return `reviewFixLifecycle "restate" requires a registered, healthy Restate endpoint, which is not currently available. Read the "restate" field of GET / or of the get_tenant_health tool (docs/restate.md, "Health surfaces"). Save again when the sidecar is "ready" and the endpoint is "registered".`;
+  }
+
+  // The reservation ledger was introduced after some Legacy jobs were launched.
+  // Those jobs do not occupy a ledger slot, so admitting Restate work while one
+  // remains active could exceed the shared cap or let both owners work on a PR.
+  // Initial activation is refused until those runs end. Every current dispatch takes a
+  // reservation, so this applies only after an upgrade from a version without the ledger.
+  const unreservedLegacyJobs = getInFlightJobs().filter((job) => {
+    if (job.phase === "kg-refresh") return false;
+    const admission = job.dispatchId ? readDispatchAdmission(job.dispatchId) : null;
+    return !admission || admission.releasedAt !== null;
+  });
+  if (unreservedLegacyJobs.length > 0) {
+    const count = unreservedLegacyJobs.length;
+    return `reviewFixLifecycle "restate" cannot be enabled while ${count} run${count === 1 ? "" : "s"} in flight ${count === 1 ? "has" : "have"} no dispatch reservation. An older version of the orchestrator started ${count === 1 ? "it" : "them"}. No action is necessary: ${count === 1 ? "this run must" : "these runs must"} end by ${count === 1 ? "itself" : "themselves"}. Save again later.`;
+  }
+
+  let capabilities: Awaited<ReturnType<typeof resolveWorkflowCapabilities>>;
+  try {
+    const token = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
+    capabilities = await resolveWorkflowCapabilities({ owner, repo, workflowFile, token, ref });
+  } catch {
+    return `reviewFixLifecycle "restate" could not verify the dispatch-ref workflow's capability. The orchestrator could not read "${workflowFile}" on "${ref}". Check the GitHub App installation and the ref.`;
+  }
+
+  if (capabilities.contract !== "envelope" || !capabilities.supportsAttemptCorrelation || !capabilities.supportsRunPublicationToken) {
+    return `reviewFixLifecycle "restate" requires "${workflowFile}" on "${ref}" to declare run_attempt_token and run_publication_token (installed template/runner capability). Use Sync workflows on this project and merge the PR that it opens on "${ref}". Then save again.`;
+  }
+
+  return null;
 }
 
 let _adminJiraClient: JiraClient | null = null;
@@ -385,19 +452,180 @@ export interface AdminConfig {
   kgSourceRepo?: string | null;
 }
 
+/**
+ * The two retention settings (AII-1137). Injected rather than imported because
+ * src/restate/retention.ts is off this file's runtime-import allowlist; bound in src/index.ts.
+ * The setters throw on an out-of-range value.
+ */
+export interface RetentionDeps {
+  getRestateDays: () => number;
+  setRestateDays: (days: number) => void;
+  getVolumeDays: () => number;
+  setVolumeDays: (days: number) => void;
+  /** Applies the volume value to the orchestrator's Fly volumes. Never throws; a failure comes back as `skipped`. */
+  applyVolume: (days: number) => Promise<{ applied: string[]; skipped: string }>;
+  default: number;
+  min: number;
+  max: number;
+}
+
 export interface AdminDeps {
+  retention?: RetentionDeps;
   /** Starts a self-deploy. Absent when the orchestrator is not configured to deploy itself. */
   startDeploy?: (targetOverride?: SelfDeployTarget) => Promise<DeployStart>;
   selfDeployTarget?: SelfDeployTarget | null;
   /** The KG refresh rail (AII-426). Absent when no KG source repo is configured. */
   kgRefresh?: {
-    trigger(opts?: { dryRun?: boolean; acceptNewBaseline?: boolean; actorEmail?: string }): Promise<{ status: number; body: Record<string, unknown> }>;
-    status(): Promise<KgRefreshStatus>;
-    /** Called by the operator-cancel path to close the ingest chain cleanly. */
-    onMachineLost(opts?: { failureCode?: string }): void;
+    trigger(opts?: { dryRun?: boolean; ref?: string; acceptNewBaseline?: boolean; actorEmail?: string }): Promise<{ status: number; body: Record<string, unknown> }>;
+    status(): Promise<{ status: number; body: unknown }>;
+    /** The operator-cancel path: asks the KgRefresh workflow to cancel and confirm termination (AII-901). */
+    cancel(opts: { jobId: number; dispatchId?: string | null; reason: string }): Promise<{ status: number; body: Record<string, unknown> }>;
   };
   /** The tools-service ingress caller (src/restate/tools-client.ts, AII-710). Absent only in tests that don't exercise POST /api/tools/<name>. */
   callTool?: typeof callTool;
+  /**
+   * Reads the Restate sidecar/endpoint status (src/restate/status.ts's getRestateStatus,
+   * AII-773/AII-804). Injected rather than imported at runtime because this file may only
+   * import src/restate/* as types (src/__tests__/restate-boundary.test.ts) — the real
+   * function is bound in src/index.ts, which sits on that test's runtime-import allowlist.
+   * Absent only in tests that don't exercise reviewFixLifecycle="restate" enablement.
+   */
+  getRestateStatus?: () => RestateStatus;
+  /**
+   * The review-fix attempt lifecycle facade (AII-806) — attempt detail/activity reads
+   * and the reconcile/adopt/cancel recovery actions. A narrow injected interface
+   * mirroring `deps.kgRefresh`: its concrete implementation composes the storage
+   * (AII-786), delivery (AII-802/803), and lifecycle-setting (AII-804) contract work,
+   * plus a real call into the Restate `ReviewFixAttempt` workflow — this file cannot
+   * make that last call itself, since it may only import `src/restate/*` as types
+   * (src/__tests__/restate-boundary.test.ts). Absent only in tests/deployments that
+   * don't exercise the five `/api/review-fix/attempts/*` routes, which then answer 501.
+   */
+  reviewFixAttempts?: ReviewFixAttemptsFacade;
+  /**
+   * Answers GET /api/restate/journal from the query parameters (src/restate/journal-query.ts's
+   * handleJournalRequest). Injected for the same reason as `getRestateStatus`: this file may
+   * only import src/restate/* as types. Absent only in tests that don't exercise the route, which then answers 501.
+   */
+  readJournal?: (query: Record<string, string>) => Promise<{ status: number; body: unknown }>;
+}
+
+/** Caller identity passed into every `reviewFixAttempts` facade call, so scope and
+ *  ownership enforcement happens inside the injected facade — never by trusting the
+ *  URL — mirroring the `tool()` wrapper's own role check (src/restate/tools.ts). */
+export interface ReviewFixAttemptCaller {
+  role: AccessRole;
+  email: string | null;
+}
+
+export interface ReviewFixAttemptExecutionRef {
+  githubRunId: string;
+  githubRunAttempt: number;
+}
+
+export interface ReviewFixAttemptCycleSummary {
+  cycle: number;
+  inputCommit: string | null;
+  outputCommit: string | null;
+  dispositions: { key: string; disposition: string }[];
+  tests: { name: string; status: string }[];
+  verdict: { approved: boolean | null; reason: string; summary?: string };
+  usage: { tokensIn: number | null; tokensOut: number | null; costUsd: number | null };
+  completedAt: number;
+}
+
+/** The full read model for `GET /api/review-fix/attempts/:attemptId`. */
+export interface ReviewFixAttemptDetail {
+  attemptId: string;
+  owner: Record<string, unknown> | null;
+  execution: ReviewFixAttemptExecutionRef | null;
+  deadlineAt: number | null;
+  pendingFeedback: boolean;
+  snapshot: { taskText: string; findings: { findingKey: string; version: number }[] } | null;
+  state: string;
+  /** False whenever activity or cycle evidence is missing, truncated past its cap, or
+   *  expired past the retention window — an explicit field rather than an absent one
+   *  (AII-806's "missing evidence... explicit response states"). */
+  evidenceComplete: boolean;
+  /** False whenever a requested cancellation or deadline has not yet been confirmed
+   *  stopped on GitHub's side — explicit, never inferred from an absent field. */
+  terminationConfirmed: boolean;
+  cycles: ReviewFixAttemptCycleSummary[];
+}
+
+export type ReviewFixAttemptReadResult =
+  | { status: "ok"; attempt: ReviewFixAttemptDetail }
+  | { status: "not_found" }
+  | { status: "unavailable" };
+
+export interface ReviewFixActivityCursor {
+  producerId: string;
+  sequence: number;
+}
+
+export interface ReviewFixActivityEvent {
+  producerId: string;
+  sequence: number;
+  cycle: number | null;
+  kind: string;
+  occurredAt: number;
+  payload: string | null;
+  truncated: boolean;
+  byteCount: number;
+}
+
+export interface ReviewFixActivityPage {
+  events: ReviewFixActivityEvent[];
+  nextCursor: ReviewFixActivityCursor | null;
+  /** True once this attempt's stream has hit the 10 MiB attempt cap or has a known gap
+   *  in its sequence — passed through from the store untouched, never summarized away. */
+  truncated: boolean;
+}
+
+export type ReviewFixActivityReadResult =
+  | { status: "ok"; page: ReviewFixActivityPage }
+  | { status: "not_found" }
+  | { status: "unavailable" };
+
+/**
+ * Outcome of a mutating action. `not_found` covers an unknown/out-of-scope attempt id,
+ * matching the read routes' not-found shape. `unverified` is specific to `adopt`: the
+ * caller-supplied execution reference did not match a verified GitHub run, so ownership
+ * was never granted. `unavailable` means Restate could not be reached — the action is
+ * durably queued, not lost, and this must never collapse into a generic failure.
+ */
+export type ReviewFixActionOutcome =
+  | { status: "accepted" }
+  | { status: "not_found" }
+  | { status: "rejected"; reason: string }
+  | { status: "unverified" }
+  | { status: "unavailable" };
+
+/**
+ * The review-fix attempt lifecycle facade (AII-806). A narrow, injected interface —
+ * mirroring `deps.kgRefresh` — over capabilities whose concrete implementation is the
+ * blocked contract work in AII-786/802/803/804/569.
+ */
+export interface ReviewFixAttemptsFacade {
+  getAttempt(attemptId: string, caller: ReviewFixAttemptCaller): Promise<ReviewFixAttemptReadResult>;
+  getActivity(
+    attemptId: string,
+    opts: { cursor?: ReviewFixActivityCursor; pageSize?: number },
+    caller: ReviewFixAttemptCaller,
+  ): Promise<ReviewFixActivityReadResult>;
+  reconcile(attemptId: string, caller: ReviewFixAttemptCaller): Promise<ReviewFixActionOutcome>;
+  /** Succeeds only when `execution` verifies as a genuine match for this attempt — an
+   *  unverified reference must never flip ownership. */
+  adopt(attemptId: string, execution: ReviewFixAttemptExecutionRef, caller: ReviewFixAttemptCaller): Promise<ReviewFixActionOutcome>;
+  /**
+   * Cancel is two explicit steps, called by the route handler in this order and never
+   * collapsed into one call: authority is revoked before termination is even requested,
+   * and occupancy is retained until termination is independently confirmed elsewhere
+   * (AII-806's requirements table). There is deliberately no combined, unconditional
+   * force-release operation on this interface.
+   */
+  revokeAuthority(attemptId: string, caller: ReviewFixAttemptCaller): Promise<ReviewFixActionOutcome>;
+  requestCancellation(attemptId: string, caller: ReviewFixAttemptCaller): Promise<ReviewFixActionOutcome>;
 }
 
 /**
@@ -413,6 +641,14 @@ function grantedRouteAllows(url: string, method: string, grantedPages: string[])
 
 /** Matches POST /api/tools/<name> — the tools-service entry point (AII-712). */
 const TOOL_CALL_ROUTE = /^\/api\/tools\/([^/]+)$/;
+
+/** Review-fix attempt routes (AII-806). Matched against the path with any query string
+ *  stripped — the activity route takes cursor/pageSize as query params. */
+const REVIEW_FIX_ATTEMPT_ROUTE = /^\/api\/review-fix\/attempts\/([^/]+)$/;
+const REVIEW_FIX_ACTIVITY_ROUTE = /^\/api\/review-fix\/attempts\/([^/]+)\/activity$/;
+const REVIEW_FIX_RECONCILE_ROUTE = /^\/api\/review-fix\/attempts\/([^/]+)\/reconcile$/;
+const REVIEW_FIX_ADOPT_ROUTE = /^\/api\/review-fix\/attempts\/([^/]+)\/adopt$/;
+const REVIEW_FIX_CANCEL_ROUTE = /^\/api\/review-fix\/attempts\/([^/]+)\/cancel$/;
 
 /** Authorization for every `/api/` route: authenticate, answer the identity probe, then require Admin or a grant — except the tools route, which defers to the tool's own role check. Null means the response is already sent. */
 function authorizeApiRequest(
@@ -446,6 +682,17 @@ function authorizeApiRequest(
   // role — not by a blanket admin requirement here. Reusing that check is the point: a
   // second, route-local write list here would drift from the one the wrapper enforces.
   if (TOOL_CALL_ROUTE.test(url) && method === "POST") {
+    return gate;
+  }
+
+  // Review-fix attempt reads mirror /mcp's read-open model: every authenticated identity
+  // may read attempt detail/activity, with scope and ownership enforced inside the
+  // injected facade via gate.identity/gate.role — not by trusting the URL (AII-806). The
+  // three mutating actions are POST, so they never match here: grantedRouteAllows always
+  // refuses a non-GET method, and they fall through to the blanket admin-or-grant rule
+  // below, staying admin-only.
+  const reviewFixReadPath = url.split("?")[0];
+  if (method === "GET" && (REVIEW_FIX_ATTEMPT_ROUTE.test(reviewFixReadPath) || REVIEW_FIX_ACTIVITY_ROUTE.test(reviewFixReadPath))) {
     return gate;
   }
 
@@ -490,7 +737,7 @@ export function handleAdminRequest(
     }
 
     if (url === "/api/mappings" && method === "POST") {
-      handleUpsertMapping(req, res, config, registry);
+      handleUpsertMapping(req, res, config, registry, deps);
       return true;
     }
 
@@ -542,10 +789,23 @@ export function handleAdminRequest(
           }
           const pending = (dryRun || acceptNewBaseline) ? kgRefresh.trigger(opts) : kgRefresh.trigger();
           return pending.then(
-            (r) => json(res, r.status, { ...r.body, dryRun, acceptNewBaseline }),
+            (r) => json(res, r.status, r.status === 503 ? r.body : { ...r.body, dryRun, acceptNewBaseline }),
             (err) => json(res, 500, { error: String(err) }),
           );
         },
+        (err) => json(res, 500, { error: String(err) }),
+      );
+      return true;
+    }
+
+    if (url.split("?")[0] === "/api/restate/journal" && method === "GET") {
+      if (!deps.readJournal) {
+        json(res, 501, { error: "journal is not configured" });
+        return true;
+      }
+      const query = Object.fromEntries(new URL(url, "http://localhost").searchParams);
+      deps.readJournal(query).then(
+        (r) => json(res, r.status, r.body),
         (err) => json(res, 500, { error: String(err) }),
       );
       return true;
@@ -557,7 +817,7 @@ export function handleAdminRequest(
         return true;
       }
       deps.kgRefresh.status().then(
-        (body) => json(res, 200, body),
+        (r) => json(res, r.status, r.body),
         (err) => json(res, 500, { error: String(err) }),
       );
       return true;
@@ -642,6 +902,11 @@ export function handleAdminRequest(
       return true;
     }
 
+    if (url === "/api/dispatch-reservations" && method === "GET") {
+      json(res, 200, { reservations: listHeldReservations() });
+      return true;
+    }
+
     if (url === "/api/deployment-status" && method === "GET") {
       const availability = getAvailability();
       const policy = getDeployPolicy();
@@ -669,6 +934,20 @@ export function handleAdminRequest(
 
     if (url === "/api/deploy-policy" && method === "POST") {
       handleSetDeployPolicy(req, res);
+      return true;
+    }
+
+    if (url === "/api/retention" && method === "GET") {
+      if (!deps.retention) {
+        json(res, 501, { error: "Retention settings are not available" });
+        return true;
+      }
+      json(res, 200, retentionView(deps.retention));
+      return true;
+    }
+
+    if (url === "/api/retention" && method === "POST") {
+      handleSetRetention(req, res, deps);
       return true;
     }
 
@@ -1001,6 +1280,38 @@ export function handleAdminRequest(
       return true;
     }
 
+    const reviewFixPath = url.split("?")[0];
+
+    const reviewFixActivityMatch = REVIEW_FIX_ACTIVITY_ROUTE.exec(reviewFixPath);
+    if (reviewFixActivityMatch && method === "GET") {
+      handleReviewFixActivity(res, gate, deps, decodeURIComponent(reviewFixActivityMatch[1]), url);
+      return true;
+    }
+
+    const reviewFixAttemptMatch = REVIEW_FIX_ATTEMPT_ROUTE.exec(reviewFixPath);
+    if (reviewFixAttemptMatch && method === "GET") {
+      handleReviewFixAttemptGet(res, gate, deps, decodeURIComponent(reviewFixAttemptMatch[1]));
+      return true;
+    }
+
+    const reviewFixReconcileMatch = REVIEW_FIX_RECONCILE_ROUTE.exec(reviewFixPath);
+    if (reviewFixReconcileMatch && method === "POST") {
+      handleReviewFixReconcile(res, gate, deps, decodeURIComponent(reviewFixReconcileMatch[1]));
+      return true;
+    }
+
+    const reviewFixAdoptMatch = REVIEW_FIX_ADOPT_ROUTE.exec(reviewFixPath);
+    if (reviewFixAdoptMatch && method === "POST") {
+      handleReviewFixAdopt(req, res, gate, deps, decodeURIComponent(reviewFixAdoptMatch[1]));
+      return true;
+    }
+
+    const reviewFixCancelMatch = REVIEW_FIX_CANCEL_ROUTE.exec(reviewFixPath);
+    if (reviewFixCancelMatch && method === "POST") {
+      handleReviewFixCancel(res, gate, deps, decodeURIComponent(reviewFixCancelMatch[1]));
+      return true;
+    }
+
     json(res, 404, { error: "Not found" });
     return true;
   }
@@ -1022,24 +1333,22 @@ async function handleUnparkIssue(req: http.IncomingMessage, res: http.ServerResp
   }
 }
 
-async function fetchMergedSnapshot(registry: ProviderRegistry): Promise<AIImplementSnapshot> {
+async function fetchMergedSnapshot(
+  registry: ProviderRegistry,
+): Promise<{ snapshot: AIImplementSnapshot; foreign: ForeignTrackerIssue[] }> {
   const allMappings = Object.values(getMappings());
   const providers = await registry.forAllMappings(allMappings);
   if (providers.length === 0) {
-    return { needsPlanning: [], readyForImplementation: [], inProgressCountsByScope: {}, parentsToFinalize: [] };
+    return {
+      snapshot: { needsPlanning: [], readyForImplementation: [], inProgressCountsByScope: {}, parentsToFinalize: [] },
+      foreign: [],
+    };
   }
   const snapshots = await Promise.all(providers.map((p) => p.fetchAIImplementSnapshot()));
-  return {
-    needsPlanning: snapshots.flatMap((s) => s.needsPlanning),
-    readyForImplementation: snapshots.flatMap((s) => s.readyForImplementation),
-    inProgressCountsByScope: snapshots.reduce<Record<string, number>>((acc, s) => {
-      for (const [k, v] of Object.entries(s.inProgressCountsByScope)) {
-        acc[k] = (acc[k] ?? 0) + v;
-      }
-      return acc;
-    }, {}),
-    parentsToFinalize: snapshots.flatMap((s) => s.parentsToFinalize),
-  };
+  return mergeProviderSnapshots(
+    providers.map((p, i) => ({ providerId: p.id, snapshot: snapshots[i] })),
+    getMappings(),
+  );
 }
 
 async function resolveIssueUrl(
@@ -1122,27 +1431,65 @@ async function handleGetLocalJobLogs(
   }
 }
 
+export interface MappingCapacity {
+  used: number;
+  cap: number;
+  source: "reservations";
+}
+
+/**
+ * Reservation-backed capacity per mapping — `used` is the unreleased, non-kg-refresh
+ * `dispatch_admissions` count for the mapping key (`dispatch-admission.ts#count`, the
+ * same authority `acquireDispatch` reserves against), never a tracker-label count.
+ * `cap` is the mapping's own `maxInProgressAiIssues`, so a concurrency blocker's
+ * used/cap always matches this projection exactly rather than drifting from a
+ * separately-derived number.
+ */
+function buildCapacityByMapping(teamRepoMap: Record<string, RepoMapping>): Record<string, MappingCapacity> {
+  const out: Record<string, MappingCapacity> = {};
+  for (const [teamKey, mapping] of Object.entries(teamRepoMap)) {
+    out[teamKey] = {
+      used: countReservedCapacity(teamKey),
+      cap: mapping.maxInProgressAiIssues,
+      source: "reservations",
+    };
+  }
+  return out;
+}
+
 async function handleListBlockers(
   res: http.ServerResponse,
   registry: ProviderRegistry,
 ): Promise<void> {
   try {
-    const snapshot = await fetchMergedSnapshot(registry);
+    const { snapshot, foreign } = await fetchMergedSnapshot(registry);
     const allIssues = [...snapshot.readyForImplementation, ...snapshot.needsPlanning];
     const teamRepoMap = getMappings();
     const dispatchedSet = new Set(getDispatchedIds());
     const inFlightIds = getInFlightIssueIds();
+    const capacityByMapping = buildCapacityByMapping(teamRepoMap);
+    const reservedCountsByTeam = Object.fromEntries(
+      Object.entries(capacityByMapping).map(([teamKey, capacity]) => [teamKey, capacity.used]),
+    );
+    // Park state per (issue, phase), read once; the phase split matches the poll's.
+    const parkedByKey = new Map(listParked().map((p) => [`${p.issueId}:${p.phase}`, p.failures]));
+    const planningIds = new Set(snapshot.needsPlanning.map((i) => i.id));
+    const parkedFor = (issue: TicketIssue) => {
+      const failures = parkedByKey.get(`${issue.id}:${planningIds.has(issue.id) ? "planning" : "implementation"}`);
+      return failures === undefined ? null : { failures };
+    };
     const baseBlockers = selectBlockers(
       allIssues,
       teamRepoMap,
-      snapshot.inProgressCountsByScope,
+      reservedCountsByTeam,
       (id) => dispatchedSet.has(id),
+      parkedFor,
     );
     // In-flight issues drop out of the snapshot (AI-Working), so resolve them through the
     // shared seen-candidates cache — same as the poll loop (PR #202 review finding #1).
     const inFlightSiblings = resolveInFlightSiblings(inFlightIds);
     const fileOverlapCandidates = allIssues.filter(
-      (i) => !inFlightIds.has(i.id) && !dispatchedSet.has(i.id) && teamRepoMap[i.scopeKey],
+      (i) => !inFlightIds.has(i.id) && !dispatchedSet.has(i.id) && !parkedFor(i) && teamRepoMap[i.scopeKey],
     );
     const planningContexts = await getOrFetchPlanningContexts(
       [...fileOverlapCandidates, ...inFlightSiblings],
@@ -1150,7 +1497,9 @@ async function handleListBlockers(
       registry,
     );
     const fileOverlapBlockers = selectFileOverlapDeferrals(fileOverlapCandidates, inFlightSiblings, planningContexts);
-    const sorted = [...baseBlockers, ...fileOverlapBlockers].sort(
+    const foreignBlockers = selectForeignTrackerBlockers(foreign);
+    const foreignIds = new Set(foreignBlockers.map((b) => b.issueId));
+    const sorted = [...baseBlockers, ...fileOverlapBlockers, ...foreignBlockers].sort(
       (a, b) =>
         a.reason.localeCompare(b.reason) ||
         a.teamKey.localeCompare(b.teamKey) ||
@@ -1159,7 +1508,10 @@ async function handleListBlockers(
     const blockers = await Promise.all(
       sorted.map(async (b) => ({
         ...b,
-        issueUrl: await resolveIssueUrl(registry, b.teamKey, null, b.issueIdentifier),
+        // The mapping under a foreign blocker's key belongs to another tracker; its URL would be wrong.
+        issueUrl: foreignIds.has(b.issueId)
+          ? null
+          : await resolveIssueUrl(registry, b.teamKey, null, b.issueIdentifier),
       })),
     );
     const teams = new Set(blockers.map((b) => b.teamKey));
@@ -1168,6 +1520,7 @@ async function handleListBlockers(
     json(res, 200, {
       blockers,
       totals: { teams: teams.size, issues: blockers.length, byReason },
+      capacityByMapping,
     });
   } catch (err) {
     json(res, 502, { error: err instanceof Error ? err.message : String(err) });
@@ -1179,7 +1532,7 @@ async function handleListIssues(
   registry: ProviderRegistry,
 ): Promise<void> {
   try {
-    const snapshot = await fetchMergedSnapshot(registry);
+    const { snapshot } = await fetchMergedSnapshot(registry);
     const allIssues: { issue: TicketIssue; bucket: "ready" | "needs-planning" }[] = [
       ...snapshot.readyForImplementation.map((i) => ({ issue: i, bucket: "ready" as const })),
       ...snapshot.needsPlanning.map((i) => ({ issue: i, bucket: "needs-planning" as const })),
@@ -1372,18 +1725,6 @@ async function handleSetKgMaterializeMode(
     setKgMaterializeDirect(body.direct);
     const status = getKgMaterializeDirect();
 
-    // The DB write succeeded but an env var still wins at runtime. Return 409
-    // so direct API callers can tell their write was overridden.
-    if (status.source === "env") {
-      json(res, 409, {
-        error: "KG_MATERIALIZE_DIRECT env var is set; persisted to DB but has no effect at runtime until the env var is unset",
-        persisted: body.direct,
-        direct: status.enabled,
-        source: status.source,
-      });
-      return;
-    }
-
     json(res, 200, { direct: status.enabled, source: status.source });
   } catch {
     json(res, 400, { error: "Invalid request body" });
@@ -1450,24 +1791,28 @@ async function handleDestroySession(
     getInFlightJobs().find((j) => j.machineId === machineId) ??
     (Number.isFinite(Number(machineId)) ? getJobById(Number(machineId)) : null);
 
-  // Kg-refresh cancel: issue-less run, shared close path via onMachineLost (AII-522).
+  // Kg-refresh cancel: issue-less run, closed through deps.kgRefresh.cancel (AII-522).
   if (job?.phase === "kg-refresh") {
     if (job.executionMode === "github-actions") {
-      if (!job.runId || !job.repo) {
-        json(res, 422, { error: "GHA run ID or repo missing on kg-refresh job" });
+      // The KgRefresh workflow requests the GitHub cancellation and waits for confirmed
+      // termination (AII-901); the Fly branch below destroys through destroyMachineRecorded
+      // (which guards durable-runner machines) because the workflow has no Fly dep.
+      if (!deps.kgRefresh) {
+        json(res, 501, { error: "KG refresh is not configured" });
         return;
       }
-      const [owner, repoName] = job.repo.split("/");
+      // Cancel first, stamp after: a 409/503 answer leaves the row as it was because the
+      // GitHub run may still be going. The updateJobStatus guard preserves this
+      // conclusion when the workflow's close-row later writes a coarser terminal status.
       try {
-        const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
-        const cancelled = await cancelWorkflowRun(ghToken, owner, repoName, job.runId);
-        if (!cancelled) {
-          console.error(`[admin] GHA did not accept cancellation for run ${job.runId}`);
-          json(res, 502, { error: "GHA did not accept cancellation" });
+        const r = await deps.kgRefresh.cancel({ jobId: job.id, dispatchId: job.dispatchId, reason: "operator_cancelled" });
+        if (r.status !== 200) {
+          json(res, r.status, r.body);
           return;
         }
+        updateJobStatus(job.id, "failed", "operator_cancelled");
       } catch (err) {
-        console.error(`[admin] Failed to cancel GHA workflow run ${job.runId}:`, err);
+        console.error(`[admin] Failed to cancel kg-refresh job ${job.id}:`, err);
         json(res, 500, { error: err instanceof Error ? err.message : String(err) });
         return;
       }
@@ -1477,7 +1822,7 @@ async function handleDestroySession(
         return;
       }
       try {
-        await destroyMachine(config.flySessionsToken, config.flySessionsApp, machineId);
+        await destroyMachineRecorded(config, machineId, "admin-stop");
       } catch (err) {
         // 404 is fine — machine was already gone
         if (!(err instanceof Error && err.message.includes("404"))) {
@@ -1486,15 +1831,23 @@ async function handleDestroySession(
           return;
         }
       }
+      // The machine is gone; still tell the workflow so it stops tracking the run.
+      // Best-effort: a 409 (no refresh in flight) or 503 must not undo the destroy.
+      if (deps.kgRefresh) {
+        updateJobStatus(job.id, "failed", "operator_cancelled");
+        try {
+          const r = await deps.kgRefresh.cancel({ jobId: job.id, dispatchId: job.dispatchId, reason: "operator_cancelled" });
+          if (r.status !== 200) {
+            console.warn(`[admin] kg-refresh workflow cancel for Fly job ${job.id} answered ${r.status}`);
+          }
+        } catch (err) {
+          console.error(`[admin] Failed to cancel kg-refresh workflow for Fly job ${job.id}:`, err);
+        }
+      }
     }
 
-    // Stamp operator_cancelled before closing the chain. The updateJobStatus guard
-    // (CASE WHEN conclusion IN ('operator_cancelled') THEN conclusion ELSE ?) preserves
-    // this conclusion when onMachineLost() later calls closeJobLog with "timed_out".
+    // Stamp operator_cancelled (idempotent for the GHA branch, which stamped it on cancel success).
     updateJobStatus(job.id, "failed", "operator_cancelled");
-
-    // Close the ingest chain via the shared reaper path (AII-522).
-    deps.kgRefresh?.onMachineLost({ failureCode: "operator_cancelled" });
 
     // One operator-cancel notification; mark notified to prevent the poll loop duplicate.
     if (config.notifyWebhookUrl) {
@@ -1517,7 +1870,7 @@ async function handleDestroySession(
   }
 
   try {
-    await destroyMachine(config.flySessionsToken, config.flySessionsApp, machineId);
+    await destroyMachineRecorded(config, machineId, "admin-stop");
   } catch (err) {
     // 404 is fine — machine was already gone
     if (!(err instanceof Error && err.message.includes("404"))) {
@@ -1764,6 +2117,10 @@ async function handleToolCall(
   const caller: Caller = { kind: "human", email: gate.identity?.email ?? null, role: gate.role };
   try {
     const result = await deps.callTool(toolName, args, caller, idempotencyKey ? { idempotencyKey } : undefined);
+    if (result.status === "deploy-held") {
+      json(res, 409, { error: "deploy-in-progress", deployStartedAt: getDeployStartedAt() });
+      return;
+    }
     if (result.status === "unavailable") {
       json(res, 503, { error: "restate-unavailable" });
       return;
@@ -1771,6 +2128,263 @@ async function handleToolCall(
     json(res, 200, { content: result.content, isError: result.isError });
   } catch (err) {
     console.error("[admin] tool call failed:", err);
+    json(res, 500, { error: "Internal server error" });
+  }
+}
+
+function reviewFixCaller(gate: Extract<AdminGate, { ok: true }>): ReviewFixAttemptCaller {
+  return { role: gate.role, email: gate.identity?.email ?? null };
+}
+
+/** Maps a `ReviewFixActionOutcome` to its HTTP status/body — shared by reconcile,
+ *  adopt, and both steps of cancel. `unavailable` answers 202 with an explicit
+ *  durable-acceptance body rather than a 503/500: Restate could not be reached, but the
+ *  action is durably queued (AII-806) and this must read as "queued", not "failed". */
+function reviewFixActionResponse(outcome: ReviewFixActionOutcome): [number, Record<string, unknown>] {
+  switch (outcome.status) {
+    case "accepted":
+      return [202, { status: "accepted" }];
+    case "not_found":
+      return [404, { error: "not_found" }];
+    case "rejected":
+      return [409, { error: outcome.reason, status: "rejected" }];
+    case "unverified":
+      return [422, { error: "unverified", status: "unverified" }];
+    case "unavailable":
+      return [202, {
+        status: "durable-accepted",
+        detail: "Restate is temporarily unavailable; the action is durably queued and will be applied once it recovers.",
+      }];
+  }
+}
+
+function handleReviewFixAttemptGet(
+  res: http.ServerResponse,
+  gate: Extract<AdminGate, { ok: true }>,
+  deps: AdminDeps,
+  attemptId: string,
+): void {
+  if (!deps.reviewFixAttempts) {
+    json(res, 501, { error: "Review-fix attempts are not configured" });
+    return;
+  }
+  deps.reviewFixAttempts.getAttempt(attemptId, reviewFixCaller(gate)).then(
+    (result) => {
+      if (result.status === "not_found") { json(res, 404, { error: "not_found" }); return; }
+      if (result.status === "unavailable") { json(res, 503, { error: "restate-unavailable" }); return; }
+      json(res, 200, result.attempt);
+    },
+    (err) => {
+      console.error("[admin] review-fix attempt read failed:", err);
+      json(res, 500, { error: "Internal server error" });
+    },
+  );
+}
+
+function handleReviewFixActivity(
+  res: http.ServerResponse,
+  gate: Extract<AdminGate, { ok: true }>,
+  deps: AdminDeps,
+  attemptId: string,
+  url: string,
+): void {
+  if (!deps.reviewFixAttempts) {
+    json(res, 501, { error: "Review-fix attempts are not configured" });
+    return;
+  }
+  const qs = url.includes("?") ? url.slice(url.indexOf("?") + 1) : "";
+  const params = new URLSearchParams(qs);
+  const pageSizeRaw = params.get("pageSize");
+  const requestedPageSize = pageSizeRaw === null ? 100 : Number(pageSizeRaw);
+  if (!Number.isSafeInteger(requestedPageSize) || requestedPageSize < 1) {
+    json(res, 400, { error: "pageSize must be a positive integer" });
+    return;
+  }
+  const pageSize = Math.min(requestedPageSize, 500);
+  const cursorProducerId = params.get("cursorProducerId");
+  const cursorSequenceRaw = params.get("cursorSequence");
+  let cursor: ReviewFixActivityCursor | undefined;
+  if (cursorProducerId !== null || cursorSequenceRaw !== null) {
+    const sequence = Number(cursorSequenceRaw);
+    if (!cursorProducerId || cursorSequenceRaw === null || !Number.isSafeInteger(sequence) || sequence < 0) {
+      json(res, 400, { error: "cursorProducerId and a non-negative integer cursorSequence are required together" });
+      return;
+    }
+    cursor = { producerId: cursorProducerId, sequence };
+  }
+  deps.reviewFixAttempts.getActivity(attemptId, { cursor, pageSize }, reviewFixCaller(gate)).then(
+    (result) => {
+      if (result.status === "not_found") { json(res, 404, { error: "not_found" }); return; }
+      if (result.status === "unavailable") { json(res, 503, { error: "restate-unavailable" }); return; }
+      // Passed through untouched — including its own `truncated` marker — never
+      // summarized or re-derived here.
+      json(res, 200, result.page);
+    },
+    (err) => {
+      console.error("[admin] review-fix activity read failed:", err);
+      json(res, 500, { error: "Internal server error" });
+    },
+  );
+}
+
+function handleReviewFixReconcile(
+  res: http.ServerResponse,
+  gate: Extract<AdminGate, { ok: true }>,
+  deps: AdminDeps,
+  attemptId: string,
+): void {
+  if (!deps.reviewFixAttempts) {
+    json(res, 501, { error: "Review-fix attempts are not configured" });
+    return;
+  }
+  deps.reviewFixAttempts.reconcile(attemptId, reviewFixCaller(gate)).then(
+    (outcome) => { const [status, body] = reviewFixActionResponse(outcome); json(res, status, body); },
+    (err) => {
+      console.error("[admin] review-fix reconcile failed:", err);
+      json(res, 500, { error: "Internal server error" });
+    },
+  );
+}
+
+async function handleReviewFixAdopt(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  gate: Extract<AdminGate, { ok: true }>,
+  deps: AdminDeps,
+  attemptId: string,
+): Promise<void> {
+  if (!deps.reviewFixAttempts) {
+    json(res, 501, { error: "Review-fix attempts are not configured" });
+    return;
+  }
+  let raw: string;
+  try {
+    raw = await readBody(req);
+  } catch {
+    json(res, 400, { error: "Could not read request body" });
+    return;
+  }
+  let execution: ReviewFixAttemptExecutionRef;
+  try {
+    const parsed = JSON.parse(raw) as { githubRunId?: unknown; githubRunAttempt?: unknown };
+    if (typeof parsed.githubRunId !== "string" || !parsed.githubRunId || typeof parsed.githubRunAttempt !== "number" || !Number.isSafeInteger(parsed.githubRunAttempt) || parsed.githubRunAttempt < 1) {
+      json(res, 400, { error: "Body must include githubRunId (string) and githubRunAttempt (positive integer)" });
+      return;
+    }
+    execution = { githubRunId: parsed.githubRunId, githubRunAttempt: parsed.githubRunAttempt };
+  } catch {
+    json(res, 400, { error: "Invalid JSON body" });
+    return;
+  }
+  try {
+    const outcome = await deps.reviewFixAttempts.adopt(attemptId, execution, reviewFixCaller(gate));
+    const [status, body] = reviewFixActionResponse(outcome);
+    json(res, status, body);
+  } catch (err) {
+    console.error("[admin] review-fix adopt failed:", err);
+    json(res, 500, { error: "Internal server error" });
+  }
+}
+
+/** Cancel is two explicit facade calls, made in this order: authority is revoked before
+ *  termination is even requested, and a revoke that fails or finds nothing short-circuits
+ *  before requestCancellation is ever called (AII-806 — "revoke authority then follows
+ *  workflow termination", no unconditional force-release). */
+async function handleReviewFixCancel(
+  res: http.ServerResponse,
+  gate: Extract<AdminGate, { ok: true }>,
+  deps: AdminDeps,
+  attemptId: string,
+): Promise<void> {
+  if (!deps.reviewFixAttempts) {
+    json(res, 501, { error: "Review-fix attempts are not configured" });
+    return;
+  }
+  const caller = reviewFixCaller(gate);
+  try {
+    const revoked = await deps.reviewFixAttempts.revokeAuthority(attemptId, caller);
+    if (revoked.status === "unavailable") {
+      json(res, 503, {
+        status: "partial",
+        authorityRevocation: "durable-accepted",
+        cancellation: "not-requested",
+        detail: "Authority revocation is queued, but termination has not been requested. Retry cancellation after recovery.",
+      });
+      return;
+    }
+    if (revoked.status !== "accepted") {
+      const [status, body] = reviewFixActionResponse(revoked);
+      json(res, status, body);
+      return;
+    }
+    let cancelled: ReviewFixActionOutcome;
+    try {
+      cancelled = await deps.reviewFixAttempts.requestCancellation(attemptId, caller);
+    } catch {
+      console.error("[admin] review-fix cancellation request failed");
+      json(res, 503, {
+        status: "partial",
+        authorityRevocation: "accepted",
+        cancellation: "unconfirmed",
+        detail: "Authority was revoked, but termination could not be confirmed. Reconcile before retrying cancellation.",
+      });
+      return;
+    }
+    const [status, body] = reviewFixActionResponse(cancelled);
+    json(res, status, body);
+  } catch (err) {
+    console.error("[admin] review-fix cancel failed:", err);
+    json(res, 500, { error: "Internal server error" });
+  }
+}
+
+/** In-memory: null after a restart even when the boot step applied the value (it only logs). */
+let lastVolumeRetentionApply: { at: number; applied: string[]; skipped: string } | null = null;
+
+function retentionView(r: RetentionDeps) {
+  return {
+    restate: { days: r.getRestateDays(), appliesAt: "next deploy or restart" },
+    volume: { days: r.getVolumeDays(), lastApplied: lastVolumeRetentionApply },
+    default: r.default,
+    min: r.min,
+    max: r.max,
+  };
+}
+
+async function handleSetRetention(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  deps: AdminDeps,
+): Promise<void> {
+  const r = deps.retention;
+  if (!r) {
+    json(res, 501, { error: "Retention settings are not available" });
+    return;
+  }
+  try {
+    const body = JSON.parse(await readBody(req)) as { restate?: unknown; volume?: unknown };
+    const fields = [
+      ["restate", "restate_retention_days"],
+      ["volume", "volume_snapshot_retention_days"],
+    ] as const;
+    // Validate both before storing either, so a bad field stores nothing.
+    for (const [key, setting] of fields) {
+      const v = body[key];
+      if (v === undefined) continue;
+      if (typeof v !== "number" || !Number.isInteger(v) || v < r.min || v > r.max) {
+        json(res, 400, { error: `${setting} must be an integer from ${r.min} to ${r.max}` });
+        return;
+      }
+    }
+    if (typeof body.restate === "number") r.setRestateDays(body.restate);
+    if (typeof body.volume === "number") {
+      r.setVolumeDays(body.volume);
+      const result = await r.applyVolume(body.volume);
+      lastVolumeRetentionApply = { at: Date.now(), applied: result.applied, skipped: result.skipped };
+    }
+    json(res, 200, retentionView(r));
+  } catch (err) {
+    console.error("[admin] retention update failed:", err);
     json(res, 500, { error: "Internal server error" });
   }
 }
@@ -2397,13 +3011,15 @@ export interface UpsertMappingBody {
   dependencyTokenScope?: string | null;
   reviewers?: unknown;
   prDispatchBudget?: number | null;
+  reviewFixLifecycle?: string | null;
 }
 
-export function upsertMappingAction(
+export async function upsertMappingAction(
   body: UpsertMappingBody,
   config: AdminConfig,
   registry: ProviderRegistry,
-): { status: number; body: Record<string, unknown> } {
+  deps: AdminDeps = {},
+): Promise<{ status: number; body: Record<string, unknown> }> {
   if (!body.teamKey || !body.owner || !body.repo) {
     return { status: 400, body: { error: "teamKey, owner, and repo are required" } };
   }
@@ -2423,7 +3039,7 @@ export function upsertMappingAction(
   }
 
   const validExecutionModes: ExecutionMode[] = ["github-actions", "fly-machines"];
-  const executionMode = (body.executionMode ?? DEFAULT_EXECUTION_MODE) as ExecutionMode;
+  const executionMode = (body.executionMode ?? existingMapping?.executionMode ?? DEFAULT_EXECUTION_MODE) as ExecutionMode;
   if (!validExecutionModes.includes(executionMode)) {
     return { status: 400, body: { error: "executionMode must be 'github-actions' or 'fly-machines'" } };
   }
@@ -2444,7 +3060,7 @@ export function upsertMappingAction(
     return { status: 400, body: { error: "machineMemoryMb must be an integer >= 256" } };
   }
 
-  const workflowFile = body.workflowFile || "claude-implement.yml";
+  const workflowFile = body.workflowFile || existingMapping?.workflowFile || "claude-implement.yml";
   const planningEnabled = body.planningEnabled ?? DEFAULT_PLANNING_ENABLED;
   const planningWorkflowFile = body.planningWorkflowFile ?? DEFAULT_PLANNING_WORKFLOW_FILE;
   const autoApprovePlans = body.autoApprovePlans ?? DEFAULT_AUTO_APPROVE_PLANS;
@@ -2588,6 +3204,22 @@ export function upsertMappingAction(
     return { status: 400, body: { error: `dependencyTokenScope invalid: must be null or "installation"` } };
   }
 
+  let reviewFixLifecycle: "legacy" | "restate" | null;
+  const rawLifecycle = body.reviewFixLifecycle;
+  if (rawLifecycle === undefined) {
+    // Preserve stored value on omit — an unrelated project edit must not silently move which
+    // lifecycle coordinates this project's automatic review-fix runs.
+    reviewFixLifecycle = existingMapping?.reviewFixLifecycle ?? null;
+  } else if (rawLifecycle === null || rawLifecycle === "") {
+    reviewFixLifecycle = null;
+  } else if (rawLifecycle === "legacy") {
+    reviewFixLifecycle = "legacy";
+  } else if (rawLifecycle === "restate") {
+    reviewFixLifecycle = "restate";
+  } else {
+    return { status: 400, body: { error: `reviewFixLifecycle invalid: must be null, "legacy", or "restate"` } };
+  }
+
   let reviewers: ReviewerSelection[] | null;
   if (body.reviewers === undefined) {
     // Preserve stored value on omit — a PATCH-style save must not silently strip a project's reviewer list.
@@ -2639,7 +3271,35 @@ export function upsertMappingAction(
     memoryProviderId: existingMapping?.memoryProviderId ?? null,
     reviewers,
     prDispatchBudget,
+    reviewFixLifecycle,
   };
+
+  // Existing attempts keep their stored owner. Revalidate only when a save first enables
+  // Restate or changes where future attempts dispatch; ordinary edits keep the selection
+  // even while the endpoint is temporarily unhealthy.
+  if (reviewFixLifecycle === "restate" && (
+    !existingMapping || existingMapping.reviewFixLifecycle !== "restate" ||
+    mapping.owner !== existingMapping.owner || mapping.repo !== existingMapping.repo ||
+    mapping.workflowFile !== existingMapping.workflowFile || mapping.defaultBranch !== existingMapping.defaultBranch ||
+    mapping.executionMode !== existingMapping.executionMode
+  )) {
+    const enablementError = await reviewFixLifecycleEnablementError(
+      { executionMode, owner: mapping.owner, repo: mapping.repo, workflowFile: mapping.workflowFile, ref: mapping.defaultBranch },
+      config,
+      deps,
+    );
+    if (enablementError) return { status: 400, body: { error: enablementError } };
+  }
+
+  // Advisory only: a Linear mapping already holding this key is the one signal we have that it
+  // is a Linear team key (no provider method lists teams). Selection drops that team's issues
+  // as foreign once a Jira mapping holds the key.
+  const warnings: string[] = [];
+  if (ticketing.ticketingProvider === "jira" && existingMapping?.ticketingProvider === "linear") {
+    warnings.push(
+      `Key "${body.teamKey}" is a Linear mapping today. Saving it as a Jira mapping means Linear issues with team key "${body.teamKey}" will no longer be dispatched. Use a different key unless that is intended.`,
+    );
+  }
 
   upsertMapping(body.teamKey, mapping);
   registry.invalidate();
@@ -2652,7 +3312,7 @@ export function upsertMappingAction(
     console.error(`[admin] workflow sync failed for ${body.teamKey}:`, err),
   );
 
-  return { status: 202, body: { teamKey: body.teamKey, ...mapping, syncJobId: id } };
+  return { status: 202, body: { teamKey: body.teamKey, ...mapping, syncJobId: id, ...(warnings.length ? { warnings } : {}) } };
 }
 
 async function handleUpsertMapping(
@@ -2660,10 +3320,11 @@ async function handleUpsertMapping(
   res: http.ServerResponse,
   config: AdminConfig,
   registry: ProviderRegistry,
+  deps: AdminDeps,
 ): Promise<void> {
   try {
     const body = JSON.parse(await readBody(req)) as UpsertMappingBody;
-    const result = upsertMappingAction(body, config, registry);
+    const result = await upsertMappingAction(body, config, registry, deps);
     json(res, result.status, result.body);
   } catch {
     json(res, 400, { error: "Invalid request body" });

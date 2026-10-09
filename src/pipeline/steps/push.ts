@@ -3,13 +3,18 @@ import type { PipelineContext, StepModule, StepReporter } from "../types.js";
 import { formatGitNameStatusSummary, openOrFindPullRequest, PROVIDER_OUTAGE_TITLE_PREFIX, UNAPPROVED_TITLE_PREFIX } from "../step-utils.js";
 import { span } from "../timing.js";
 import { findSensitiveFiles, SensitiveFilesError } from "../sensitive-files.js";
-import { refreshRunnerGithubCredentials } from "../../runner-token.js";
+import { assertRunnerPublicationAuthority, refreshRunnerGithubCredentials } from "../../runner-token.js";
 import { getPublicationCredential } from "../../publication-credential.js";
 import { classifyGitFailure, envSecrets, oneLinerMessage, type FailureRecord } from "../failure-classification.js";
-import { computeBackoffMs, normalizeRetryPolicy } from "../retry-backoff.js";
+import { computeBackoffMs, normalizeRetryPolicy, sleepAsync } from "../retry-backoff.js";
+import { dependenciesMissing } from "../pipeline-loader.js";
+import { neutralizeFences } from "../../completion-classification.js";
 
-const LS_REMOTE_MAX_ATTEMPTS = 3;
+// Waits between ls-remote attempts (attempts = delays + 1). A freshly minted installation
+// token is not accepted by git over HTTPS for a few seconds (AII-936), so a refreshed
+// token gets a ~15 s schedule; the boot token keeps the short one.
 const LS_REMOTE_RETRY_DELAYS_MS = [250, 1000];
+const LS_REMOTE_FRESH_TOKEN_RETRY_DELAYS_MS = [1000, 2000, 4000, 8000];
 
 export { PROVIDER_OUTAGE_TITLE_PREFIX, UNAPPROVED_TITLE_PREFIX };
 
@@ -206,6 +211,14 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
       timeoutMs: 15_000,
     });
 
+    // AII-922: name the credential the push goes out with, so a 403 can be told apart from a
+    // boot-token fallback. Never the token itself.
+    const freshToken = activeGithubToken !== githubToken;
+    const credentialSource = !freshToken
+      ? "boot-token"
+      : inputs.orchestratorUrl?.trim() && inputs.machineNonce?.trim() ? "machine-nonce" : "publication-token";
+    console.log(`[push] credential source: ${credentialSource}`);
+
     // Embed token in URL but use stdio: "pipe" so it is never printed to inherited
     // stdout/stderr. Token is redacted from any error messages.
     const buildRemoteUrl = (token: string): string =>
@@ -213,7 +226,7 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
     let remote = buildRemoteUrl(activeGithubToken);
     const remoteRef = `refs/heads/${branchName}`;
     const remoteBranchSha = await span("git-ls-remote", async () =>
-      resolveRemoteBranchSha(workspaceDir, remote, branchName, activeGithubToken),
+      resolveRemoteBranchSha(workspaceDir, remote, branchName, activeGithubToken, { freshToken }),
     );
     let expectedRemoteSha: string | null;
     if (existingPrNumber && remoteBranchSha !== baseRef) {
@@ -269,6 +282,7 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
       return ` (${capped})`;
     };
     for (;;) {
+      await assertRunnerPublicationAuthority({ callbackUrl: inputs.callbackUrl, owner: repoOwner, repo: repoRepo });
       const { args: pushArgs, env: pushEnv } = buildGitPushInvocation(
         remote,
         remoteRef,
@@ -299,7 +313,18 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
       if (pushResult.status === 0) break;
 
       const stderr = (pushResult.stderr?.toString() ?? "").replaceAll(pushToken, "***");
-      const failure = classifyGitFailure(stderr, pushResult.status ?? null, { stage: "push", attempt });
+      let failure = classifyGitFailure(stderr, pushResult.status ?? null, { stage: "push", attempt });
+      // AII-922: GitHub has refused pushes made with an installation token minted seconds
+      // earlier (about one in three), and the same token succeeds on a later attempt. A 403
+      // on a freshly minted token is therefore retried with backoff like a transient error;
+      // a boot-token 403 stays a plain auth failure. The single-use credential cannot be
+      // re-minted, so the retry reuses the token — it delays, it does not re-authenticate.
+      // The final attempt keeps the original auth / GIT_AUTH classification, so a permanent
+      // credential problem (missing Workflows permission, revoked installation) that outlasts
+      // the retries still points the autopsy and the tracker comment at credentials.
+      if (failure.category === "auth" && failure.code === "GIT_AUTH" && freshToken && attempt < maxPushAttempts) {
+        failure = { ...failure, category: "transient", code: "GIT_AUTH_FRESH_TOKEN", retryable: true };
+      }
       const err = new Error(`git push failed (exit ${pushResult.status ?? "null"}): ${stderr}`) as Error & {
         failure?: FailureRecord;
       };
@@ -333,7 +358,7 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
       if (isRetryableAmbiguous) {
         let remoteShaAfterConflict: string | null;
         try {
-          remoteShaAfterConflict = await resolveRemoteBranchSha(workspaceDir, remote, branchName, pushToken);
+          remoteShaAfterConflict = await resolveRemoteBranchSha(workspaceDir, remote, branchName, pushToken, { freshToken });
         } catch (lsRemoteErr) {
           const reason = oneLinerNote(lsRemoteErr instanceof Error ? lsRemoteErr.message : String(lsRemoteErr));
           failure.message = `${failure.message}${remoteInspectionNote(reason)}${noteSuffix()}`;
@@ -393,7 +418,7 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
 
       let remoteShaAfterFailure: string | null;
       try {
-        remoteShaAfterFailure = await resolveRemoteBranchSha(workspaceDir, remote, branchName, pushToken);
+        remoteShaAfterFailure = await resolveRemoteBranchSha(workspaceDir, remote, branchName, pushToken, { freshToken });
       } catch (lsRemoteErr) {
         // The push record is the evidence that matters here — ls-remote's own
         // failure only means the remote could not be inspected to decide the next
@@ -573,6 +598,16 @@ function buildPullRequestBody(
 ): string {
   const { issueIdentifier, issueTitle, issueDescription } = context.data;
   const preflightOutputs = context.getOutputs("preflight");
+  const installOutputs = context.getOutputs("install");
+  const installRetryOutputs = context.getOutputs("install-retry");
+  const initialInstallFailed = installOutputs.installFailed === true;
+  const retryFailed = installRetryOutputs.installFailed === true;
+  // A skipped install-retry (first install succeeded) leaves empty outputs, so
+  // retryFailed is false and both branches below fall through to "nothing new".
+  const retrySucceeded = initialInstallFailed && !retryFailed;
+  // Single source of truth shared with the push step's own `draft` input
+  // (pipeline-loader.ts) so this section can never diverge from draft/skip behaviour.
+  const dependenciesFailed = dependenciesMissing(context);
   const title = stringValue(issueTitle) ?? "AI implementation";
   const description = stringValue(issueDescription);
 
@@ -583,21 +618,31 @@ function buildPullRequestBody(
   // A provider outage is not a review verdict — the reviewer may never have run, so this
   // fallback must not claim the review loop rejected the change (BAC-27201).
   const providerUnavailableForTestsSummary = inputs.reviewSummary?.terminationReason === "provider_unavailable";
-  // No explicit/preflight summary to fall back on: say what actually happened. An unapproved
-  // run (reviewSummary present) skipped preflight/verify entirely — claiming verification ran
-  // would contradict the "Automated review did not approve" section above it.
-  const testsSummary =
-    explicitTestsSummary ??
-    (inputs.reviewSummary
-      ? providerUnavailableForTestsSummary
-        ? "Automated verification was skipped — the model provider was unavailable and the run was interrupted."
-        : "Automated verification was skipped — the review loop did not approve this change."
-      : "Automated verification was run by the AI-Implement pipeline before opening this PR.");
-  const testsSummaryChecked = explicitTestsSummary != null || !inputs.reviewSummary;
+  // A failed install (after the retry) is a more specific reason than a review rejection —
+  // preflight/verify never ran either way, but the install failure is the actual cause.
+  const testsSummary = dependenciesFailed
+    ? "Automated verification was skipped — dependency install failed."
+    : // No explicit/preflight summary to fall back on: say what actually happened. An unapproved
+      // run (reviewSummary present) skipped preflight/verify entirely — claiming verification ran
+      // would contradict the "Automated review did not approve" section above it.
+      explicitTestsSummary ??
+      (inputs.reviewSummary
+        ? providerUnavailableForTestsSummary
+          ? "Automated verification was skipped — the model provider was unavailable and the run was interrupted."
+          : "Automated verification was skipped — the review loop did not approve this change."
+        : "Automated verification was run by the AI-Implement pipeline before opening this PR.");
+  const testsSummaryChecked = dependenciesFailed ? false : explicitTestsSummary != null || !inputs.reviewSummary;
 
+  const dependencyInstallSection = dependenciesFailed
+    ? buildDependencyInstallSection(
+        stringValue(installRetryOutputs.installMethod) ?? stringValue(installOutputs.installMethod) ?? "install",
+        stringValue(installRetryOutputs.installError) ?? undefined,
+      )
+    : null;
   const unapprovedSection = buildUnapprovedSection(inputs.reviewSummary as ReviewSummary | undefined, inputs.draft === true);
 
   return [
+    ...(dependencyInstallSection ? [dependencyInstallSection, ""] : []),
     ...(unapprovedSection ? [unapprovedSection, ""] : []),
     "## Summary",
     implementationSummary,
@@ -609,11 +654,39 @@ function buildPullRequestBody(
     "",
     "## Test plan",
     `- [${testsSummaryChecked ? "x" : " "}] ${testsSummary}`,
+    // Blank line first: a non-blank line right after a list item is a lazy continuation in GFM
+    // and would render on the checkbox line itself.
+    "",
+    TEST_VERDICT_SENTENCE,
+    "",
+    ...(retrySucceeded ? ["- [x] Initial dependency install failed; it succeeded after this change."] : []),
     "- [ ] Manual: review the changed behavior against the ticket acceptance criteria.",
     "",
     `Fixes ${issueIdentifier}`,
     "",
     `Generated with AI-Implement · harness: Claude Code · model: ${context.data.model ?? "unknown"} · provider: ${context.data.provider ?? "anthropic"}`,
+  ].join("\n");
+}
+
+/** Plain text under the Test plan checkbox: CI, not the runner's preflight line, is the verdict. */
+const TEST_VERDICT_SENTENCE =
+  "The CI checks on this PR are the source of truth for the test verdict. The line above is the runner's own pre-push report.";
+
+/**
+ * Leads the PR body (before the unapproved section, per the "why first" rationale:
+ * reviewers and the external review check read top-down, and a build/lint/typecheck/test
+ * warning must land before the summary of what the change does) when both the first
+ * install and its retry (after feedback-loop) failed.
+ */
+function buildDependencyInstallSection(installMethod: string, installError: string | undefined): string {
+  return [
+    "## ⚠️ Dependencies did not install",
+    "",
+    `Dependency install (\`${installMethod}\`) failed before and after the agent ran; build, lint, typecheck, and tests never ran.`,
+    "",
+    "```",
+    installError ? neutralizeFences(installError) : "(no output captured)",
+    "```",
   ].join("\n");
 }
 
@@ -897,15 +970,19 @@ function resolveCommitSha(workspaceDir: string): string | null {
   return result.stdout.toString().trim() || null;
 }
 
-function resolveRemoteBranchSha(
+async function resolveRemoteBranchSha(
   workspaceDir: string,
   remote: string,
   branchName: string,
   githubToken: string,
-): string | null {
+  options: { freshToken: boolean },
+): Promise<string | null> {
   const remoteRef = `refs/heads/${branchName}`;
+  const delays = options.freshToken ? LS_REMOTE_FRESH_TOKEN_RETRY_DELAYS_MS : LS_REMOTE_RETRY_DELAYS_MS;
+  const maxAttempts = delays.length + 1;
   let lastError = "";
-  for (let attempt = 1; attempt <= LS_REMOTE_MAX_ATTEMPTS; attempt++) {
+  let lastStatus: number | null = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const result = spawnSync("git", ["ls-remote", remote, remoteRef], {
       cwd: workspaceDir,
       stdio: ["ignore", "pipe", "pipe"],
@@ -921,33 +998,29 @@ function resolveRemoteBranchSha(
     }
 
     lastError = (result.stderr?.toString() ?? "").replaceAll(githubToken, "***");
-    if (attempt < LS_REMOTE_MAX_ATTEMPTS) {
-      sleepSync(LS_REMOTE_RETRY_DELAYS_MS[attempt - 1] ?? 1000);
+    lastStatus = result.status ?? null;
+    console.error(`[push] ls-remote attempt ${attempt}/${maxAttempts} failed: ${lastError.trim()}`);
+    if (attempt < maxAttempts) {
+      await sleepAsync(delays[attempt - 1] ?? 1000);
     }
   }
-  throw new Error(`git ls-remote failed after ${LS_REMOTE_MAX_ATTEMPTS} attempts: ${lastError}`);
-}
-
-function sleepSync(ms: number): void {
-  if (process.env.NODE_ENV === "test") return;
-  // Refuse a non-finite or negative duration: Atomics.wait treats NaN as "wait
-  // forever," which is exactly what a non-numeric pushRetries could otherwise
-  // produce a few lines up the call chain.
-  if (!Number.isFinite(ms) || ms < 0) return;
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-}
-
-/**
- * Awaited counterpart to `sleepSync`, used for the push-retry backoff: that
- * delay can reach the retry policy's `backoffMaxMs` (minutes), and blocking
- * the event loop synchronously for that long would also block a SIGTERM
- * handler from ever running. `resolveRemoteBranchSha`'s much shorter ls-remote
- * backoff keeps the synchronous version.
- */
-function sleepAsync(ms: number): Promise<void> {
-  if (process.env.NODE_ENV === "test") return Promise.resolve();
-  if (!Number.isFinite(ms) || ms < 0) return Promise.resolve();
-  return new Promise((resolve) => setTimeout(resolve, ms));
+  const err = new Error(`git ls-remote failed after ${maxAttempts} attempts: ${lastError}`) as Error & {
+    failure?: FailureRecord;
+  };
+  if (options.freshToken) {
+    // AII-936: GitHub answers "Repository not found" (or a 403) for a private repo while a
+    // just-minted installation token has not propagated. Name that cause instead of "unknown".
+    // Not retryable: the push loop that would retry is never reached, and the single-use
+    // credential cannot be re-minted. Other failures (network, 5xx) keep their own record.
+    const failure = classifyGitFailure(lastError, lastStatus, { stage: "push", attempt: maxAttempts });
+    const repoNotFound = failure.code === "UNKNOWN" && /repository\b.*\bnot found/i.test(lastError);
+    if ((failure.category === "auth" && failure.code === "GIT_AUTH") || repoNotFound) {
+      err.failure = { ...failure, category: "transient", code: "GIT_AUTH_FRESH_TOKEN", retryable: false };
+    } else {
+      err.failure = failure;
+    }
+  }
+  throw err;
 }
 
 /**

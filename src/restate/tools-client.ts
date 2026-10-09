@@ -7,9 +7,15 @@
 import type { AccessRole } from "../access-entries.js";
 import type { Caller } from "../mcp-identity.js";
 import { systemCaller } from "../mcp-identity.js";
+import { isDeployHeld } from "../deploy-hold.js";
 import { RESTATE_ADMIN_BASE_URL, RESTATE_INGRESS_BASE_URL } from "./server.js";
 
 const ORCHESTRATOR_TOOLS_SERVICE = "orchestratorTools";
+
+/** Admin discovery bound (AII-728): a hung admin API must not hang /mcp's tools/list. */
+const DISCOVER_TOOLS_TIMEOUT_MS = 5_000;
+/** Tool ingress bound (AII-728): a hung ingress must not hang a tools/call caller forever. */
+const CALL_TOOL_TIMEOUT_MS = 60_000;
 
 export interface DiscoveredTool {
   name: string;
@@ -52,7 +58,9 @@ export async function discoverTools(deps: DiscoverToolsDeps = {}): Promise<Disco
 
   let response: Response;
   try {
-    response = await fetchImpl(`${adminBaseUrl}/services/${ORCHESTRATOR_TOOLS_SERVICE}`);
+    response = await fetchImpl(`${adminBaseUrl}/services/${ORCHESTRATOR_TOOLS_SERVICE}`, {
+      signal: AbortSignal.timeout(DISCOVER_TOOLS_TIMEOUT_MS),
+    });
   } catch {
     return [];
   }
@@ -96,12 +104,15 @@ export async function toolCatalog(deps: DiscoverToolsDeps = {}): Promise<Discove
 
 export type CallToolResult =
   | { status: "ok"; content: Array<{ type: string; text: string }>; isError?: boolean }
-  | { status: "unavailable" };
+  | { status: "unavailable" }
+  | { status: "deploy-held" };
 
 /** For testing: override the ingress base URL and the fetch implementation. */
 export interface CallToolDeps {
   ingressBaseUrl?: string;
   fetchImpl?: typeof fetch;
+  /** Shared deploy drain admission check; injectable for deterministic tests. */
+  permitsExternalCall?: () => boolean;
   /**
    * Restate's own idempotency key (https://docs.restate.dev/operate/invocation#invoke-a-handler-idempotently),
    * sent as the `idempotency-key` header. Restate scopes it by (service, handler, key), so a
@@ -116,7 +127,8 @@ export interface CallToolDeps {
 
 /**
  * Posts `{ caller, args }` to the ingress at `<service>/<name>` and returns the handler's
- * ToolResponse. A connection failure or a 5xx response answers `{ status: "unavailable" }`
+ * ToolResponse. While a deploy hold refuses admission it answers `{ status: "deploy-held" }`
+ * without contacting the ingress. A connection failure or a 5xx response answers `{ status: "unavailable" }`
  * — the signal src/mcp.ts maps to `503 { error: "restate-unavailable" }`.
  *
  * `name` is percent-encoded before it reaches the URL: an unencoded `../other-service/x`
@@ -131,6 +143,9 @@ export async function callTool(
   caller: Caller,
   deps: CallToolDeps = {},
 ): Promise<CallToolResult> {
+  // Both MCP and POST /api/tools/<name> enter through this seam. Refuse before
+  // contacting the old endpoint once deployment has closed external admission.
+  if (!(deps.permitsExternalCall ?? (() => !isDeployHeld()))()) return { status: "deploy-held" };
   const ingressBaseUrl = deps.ingressBaseUrl ?? RESTATE_INGRESS_BASE_URL;
   const fetchImpl = deps.fetchImpl ?? fetch;
 
@@ -143,6 +158,7 @@ export async function callTool(
         ...(deps.idempotencyKey ? { "idempotency-key": deps.idempotencyKey } : {}),
       },
       body: JSON.stringify({ caller, args }),
+      signal: AbortSignal.timeout(CALL_TOOL_TIMEOUT_MS),
     });
   } catch {
     return { status: "unavailable" };

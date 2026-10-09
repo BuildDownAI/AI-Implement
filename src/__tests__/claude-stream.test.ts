@@ -66,6 +66,15 @@ describe("finalText", () => {
 });
 
 describe("extractTelemetry", () => {
+  it("correlates Bash calls with structured results and ignores unmatched mentions", () => {
+    const events: StreamEvent[] = [
+      { type: "assistant", message: { content: [{ type: "tool_use", id: "t1", name: "Bash", input: { command: "npm test" } }] } },
+      { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "t1", is_error: true, content: "failed" }] } },
+      { type: "assistant", message: { content: [{ type: "tool_use", id: "t2", name: "Bash", input: { command: "npm run typecheck" } }] } },
+      { type: "assistant", message: { content: [{ type: "text", text: "npm test passed" }] } },
+    ];
+    expect(extractTelemetry(events).executedCommands).toEqual([{ command: "npm test", failed: true }]);
+  });
   it("extracts metrics from a success result", () => {
     const t = extractTelemetry([initEvent, toolEvent, resultSuccess]);
     expect(t).toEqual({

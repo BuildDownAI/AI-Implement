@@ -8,7 +8,11 @@ import { spawn } from "node:child_process";
 import { clearDeployHold, isDeployHeld, setDeployHold } from "./deploy-hold.js";
 import { getScopedInstallationToken, mintSourceTokenOrJwt } from "./github-app-auth.js";
 import { fetchRepoTarball, getRefSha } from "./github.js";
-import { getInFlightWork } from "./in-flight-work.js";
+import { getInFlightWork, type InFlightWork } from "./in-flight-work.js";
+import { getDb } from "./dedup.js";
+import { RestateDrainCoordinator, type RestateDrainProbes } from "./restate/drain.js";
+import { queryNonCompletedInvocations, restateBindAddress } from "./restate/endpoint.js";
+import { RESTATE_ADMIN_BASE_URL } from "./restate/server.js";
 import type { SelfDeployTarget } from "./deploy-availability.js";
 
 export interface DeployArgsInput {
@@ -32,6 +36,8 @@ export interface RunDeployInput {
   githubAppPrivateKey: string;
   kgSourceRepo: string | null;
   pollIntervalMs: number;
+  /** Deterministic probe override for tests; production probes read Restate and SQLite. */
+  restateDrainProbes?: RestateDrainProbes;
 }
 
 const execFile = promisify(nodeExecFile);
@@ -97,6 +103,27 @@ const DEPLOY_TIMEOUT_MS = 20 * 60 * 1000;
 // this bounds a monitor that has itself stopped working, not the normal case.
 const DRAIN_TIMEOUT_MS = 75 * 60 * 1000;
 
+/** Restate invocation state is independent of dispatch_log and reservations. All
+ * four probes must prove zero before a replacement can begin. */
+export function createRestateDrainProbes(): RestateDrainProbes {
+  const { host, port } = restateBindAddress();
+  const endpointUri = `http://${host}:${port}`;
+  const count = (sql: string): number => {
+    const row = getDb().prepare(sql).get() as { n: number };
+    return row.n;
+  };
+  return {
+    oldDeploymentInvocations: () => queryNonCompletedInvocations(fetch, RESTATE_ADMIN_BASE_URL, endpointUri),
+    unresolvedLaunches: async () => count(`SELECT COUNT(*) AS n FROM review_fix_attempts a
+      JOIN dispatch_admissions d ON d.dispatch_id = a.dispatch_id
+      WHERE d.released_at IS NULL AND a.state = 'launch_intent' AND a.github_run_id IS NULL`),
+    unresolvedTerminations: async () => count(`SELECT COUNT(*) AS n FROM review_fix_attempts a
+      JOIN dispatch_admissions d ON d.dispatch_id = a.dispatch_id
+      WHERE d.released_at IS NULL AND a.authority_revoked_at IS NOT NULL AND a.completed_at IS NULL`),
+    activeOwners: async () => count("SELECT COUNT(*) AS n FROM dispatch_admissions WHERE released_at IS NULL AND lifecycle_owner LIKE 'restate:%'"),
+  };
+}
+
 /**
  * Builds and releases a new version of this orchestrator.
 *
@@ -108,11 +135,13 @@ const DRAIN_TIMEOUT_MS = 75 * 60 * 1000;
 export async function runDeploy(input: RunDeployInput): Promise<void> {
   const { app, flyDeployToken, owner, repo, branch, commit, githubAppId, githubAppPrivateKey, kgSourceRepo, pollIntervalMs } = input;
 
+  const endpointDrain = new RestateDrainCoordinator(input.restateDrainProbes ?? createRestateDrainProbes());
   setDeployHold();
+  endpointDrain.begin();
   try {
     // Setting the hold above is what makes this terminate: new dispatches have stopped,
     // so the in-flight set only shrinks from here.
-    await waitForQuiet(DRAIN_TIMEOUT_MS, drainPollMs(pollIntervalMs));
+    await waitForQuiet(DRAIN_TIMEOUT_MS, drainPollMs(pollIntervalMs), endpointDrain);
 
     // Mint and fetch the source before downloading flyctl: auth failures and
     // inaccessible repos surface here with an actionable message, not after 100 MB of I/O.
@@ -172,23 +201,34 @@ export async function runDeploy(input: RunDeployInput): Promise<void> {
     // A self-deploy is SIGINTed inside the await above and relies on the
     // boot clear instead — which is why this cannot be a finally.
     console.log(`[deploy] ${app} released; this process was not replaced`);
+    endpointDrain.abort();
     clearDeployHold();
   } catch (err) {
+    endpointDrain.abort();
     clearDeployHold();
     throw err;
   }
 }
 
 /** Holds until nothing is executing. Logs only when the blocking set changes. */
-async function waitForQuiet(timeoutMs: number, pollMs: number): Promise<void> {
+export async function waitForQuiet(
+  timeoutMs: number,
+  pollMs: number,
+  endpointDrain?: RestateDrainCoordinator,
+  getBlocking: () => InFlightWork[] = getInFlightWork,
+): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   let reported = "";
 
   for (;;) {
-    const blocking = getInFlightWork();
-    if (blocking.length === 0) return;
+    const blocking = getBlocking();
+    const endpoint = endpointDrain ? await endpointDrain.status() : null;
+    if (blocking.length === 0 && (!endpoint || endpoint.state === "drained")) return;
 
-    const summary = blocking.map((w) => `${w.count} ${w.kind}`).join(", ");
+    const summary = [
+      ...blocking.map((w) => `${w.count} ${w.kind}`),
+      ...(endpoint && endpoint.state !== "drained" ? [`old endpoint ${endpoint.state}`] : []),
+    ].join(", ");
     if (summary !== reported) {
       console.log(`[deploy] waiting for work to drain — ${summary}`);
       reported = summary;
@@ -368,6 +408,7 @@ export interface StartDeployConfig {
   kgSourceRepo: string | null;
   /** Called when the build or release step fails, so the caller can record the outcome. */
   onBuildFailure?: (commit: string, err: unknown) => void;
+  restateDrainProbes?: RestateDrainProbes;
 }
 
 /** `StartDeployConfig` with every optional deploy prerequisite proven present. */
@@ -420,6 +461,7 @@ export function makeStartDeploy(
         githubAppId: config.githubAppId,
         githubAppPrivateKey: config.githubAppPrivateKey,
         kgSourceRepo: config.kgSourceRepo,
+        restateDrainProbes: config.restateDrainProbes,
       }).catch((err) => {
         console.error("[deploy] failed:", err);
         config.onBuildFailure?.(head, err);

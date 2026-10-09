@@ -2379,6 +2379,94 @@ describe("runKgRefresh", () => {
     expect(result.exitCode).toBe(1);
   });
 
+  describe("step progress reporting", () => {
+    const stepsOverride = () => ({
+      clone: makeStepModule({ workspaceDir: tmpDir, repoOwner: "org", repoRepo: "repo", githubToken: "tok", clonedRef: "abc" }),
+      kgIngest: makeStepModule({ statsFile: null }),
+      kgSnapshotPush: makeStepModule({ snapshotPushed: true, commitSha: "sha123" }),
+    });
+
+    function recorder(progressStatus = 200) {
+      const calls: Array<{ url: string; authorization?: string; body?: unknown; kind: "progress" | "result" | "other" }> = [];
+      const fetchImpl = (async (url: string, init?: RequestInit) => {
+        const kind = url.endsWith("/runner/progress") ? "progress" : url.endsWith("/runner/result") ? "result" : "other";
+        calls.push({ url, authorization: (init?.headers as Record<string, string> | undefined)?.Authorization, body: init?.body, kind });
+        const status = kind === "progress" ? progressStatus : 200;
+        return new Response(JSON.stringify({ acknowledged: true }), { status });
+      }) as unknown as typeof fetch;
+      return { calls, fetchImpl };
+    }
+
+    beforeEach(() => {
+      process.env.RUNNER_CALLBACK_URL = "http://orch";
+      process.env.RUN_TOKEN = "run-tok";
+      delete process.env.RUN_PROGRESS_TOKEN;
+      delete process.env.AI_IMPLEMENT_RUN_CONFIG;
+    });
+
+    it("posts one { step } body per step report with the bearer token, before the result", async () => {
+      process.env.RUN_PROGRESS_TOKEN = "  prog-tok  ";
+      const { calls, fetchImpl } = recorder();
+      const result = await runKgRefresh({ workspaceDir: tmpDir, stepsOverride: stepsOverride(), fetchImpl });
+      expect(result.exitCode).toBe(0);
+      const progress = calls.filter((c) => c.kind === "progress");
+      expect(progress.length).toBeGreaterThan(1);
+      for (const call of progress) {
+        expect(call.url).toBe("http://orch/runner/progress");
+        expect(call.authorization).toBe("Bearer prog-tok");
+        expect(JSON.parse(call.body as string)).toMatchObject({ step: { id: expect.any(String), status: expect.any(String) } });
+      }
+      const clone = progress.map((c) => (JSON.parse(c.body as string) as { step: { id: string; status: string; outputs: object } }).step).filter((s) => s.id === "clone");
+      expect(clone.map((s) => s.status)).toEqual(["running", "passed"]);
+      expect(JSON.stringify(progress.map((c) => c.body))).not.toContain("githubToken");
+      expect(calls.findIndex((c) => c.kind === "result")).toBeGreaterThan(calls.map((c) => c.kind).lastIndexOf("progress"));
+    });
+
+    it("sends no progress post without a token", async () => {
+      process.env.RUN_PROGRESS_TOKEN = "   ";
+      const { calls, fetchImpl } = recorder();
+      const result = await runKgRefresh({ workspaceDir: tmpDir, stepsOverride: stepsOverride(), fetchImpl });
+      expect(result.exitCode).toBe(0);
+      expect(calls.some((c) => c.kind === "progress")).toBe(false);
+    });
+
+    it("sends no progress post without a callback URL", async () => {
+      process.env.RUN_PROGRESS_TOKEN = "prog-tok";
+      delete process.env.RUNNER_CALLBACK_URL;
+      const { calls, fetchImpl } = recorder();
+      const result = await runKgRefresh({ workspaceDir: tmpDir, stepsOverride: stepsOverride(), fetchImpl });
+      expect(result.exitCode).toBe(0);
+      expect(calls).toEqual([]);
+    });
+
+    it("keeps exit code 0 when the progress post answers 409 no-refresh-in-flight", async () => {
+      process.env.RUN_PROGRESS_TOKEN = "prog-tok";
+      const { calls, fetchImpl } = recorder(409);
+      const result = await runKgRefresh({ workspaceDir: tmpDir, stepsOverride: stepsOverride(), fetchImpl });
+      expect(result.exitCode).toBe(0);
+      expect(calls.some((c) => c.kind === "progress")).toBe(true);
+    });
+
+    it("keeps exit code 0 when the progress post rejects", async () => {
+      process.env.RUN_PROGRESS_TOKEN = "prog-tok";
+      vi.spyOn(console, "error").mockImplementation(() => undefined);
+      // The reporter backs off 250/1000/2500 ms between attempts; collapse the delays.
+      const realSetTimeout = globalThis.setTimeout;
+      const timeoutSpy = vi.spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void, ms?: number) =>
+        realSetTimeout(fn, ms && ms >= 250 ? 0 : ms)) as unknown as typeof setTimeout);
+      const fetchImpl = (async (url: string) => {
+        if (url.endsWith("/runner/progress")) throw new Error("network down");
+        return new Response(JSON.stringify({ acknowledged: true }), { status: 200 });
+      }) as unknown as typeof fetch;
+      try {
+        const result = await runKgRefresh({ workspaceDir: tmpDir, stepsOverride: stepsOverride(), fetchImpl });
+        expect(result.exitCode).toBe(0);
+      } finally {
+        timeoutSpy.mockRestore();
+      }
+    });
+  });
+
   it("envelope kgSourceRepo survives decode and runnerPhase is kg-refresh", () => {
     const encoded = encodeRunConfig({
       v: 1,
@@ -2395,7 +2483,6 @@ describe("runKgRefresh", () => {
 // ── kg-refresh execution-path selection ──────────────────────────────────────
 
 import { resolveExecutionPath } from "../runner-mode.js";
-import { makeKgRefresh } from "../kg-refresh.js";
 
 describe("kg-refresh execution path selection (resolveExecutionPath with github-actions default)", () => {
   it("default mode resolves to github-actions (the kg-refresh fallback)", () => {
@@ -2417,141 +2504,10 @@ describe("kg-refresh execution path selection (resolveExecutionPath with github-
   it("shadow mode returns both, which kg-refresh collapses to github-actions", () => {
     const resolved = resolveExecutionPath("shadow", "github-actions");
     expect(resolved).toBe("both");
-    // dispatchKgRefreshRun collapses "both" to "github-actions" to prevent two
+    // the KG refresh senders collapses "both" to "github-actions" to prevent two
     // concurrent ingest runs racing to push the same snapshot commit.
     const effective = resolved === "both" ? "github-actions" : resolved;
     expect(effective).toBe("github-actions");
-  });
-});
-
-// ── makeKgRefresh dispatch result threading ───────────────────────────────────
-// Verifies that trigger() correctly threads workflowRunId / machineNonce
-// from dispatchRun's result into updateJobMachine.
-
-function makeTarballForDispatchTest(): Buffer {
-  const wrap = mkdtempSync(join(tmpdir(), "kgtar-"));
-  const top = join(wrap, "repo");
-  mkdirSync(top, { recursive: true });
-  writeFileSync(join(top, "sources.yml"), "namespace: https://kg.test/\n");
-  const out = join(wrap, "src.tar.gz");
-  execSync(`tar -czf ${out} -C ${wrap} repo`);
-  const buf = readFileSync(out) as Buffer;
-  rmSync(wrap, { recursive: true, force: true });
-  return buf;
-}
-
-describe("makeKgRefresh — dispatch result threading to updateJobMachine", () => {
-  let dataRoot: string;
-
-  beforeEach(() => {
-    dataRoot = mkdtempSync(join(tmpdir(), "kgdispatch-"));
-  });
-
-  afterEach(() => {
-    rmSync(dataRoot, { recursive: true, force: true });
-    vi.clearAllMocks();
-  });
-
-  async function waitFor(fn: () => boolean, label: string): Promise<void> {
-    for (let i = 0; i < 300; i++) {
-      if (fn()) return;
-      await new Promise((r) => setTimeout(r, 10));
-    }
-    throw new Error(`timeout waiting for: ${label}`);
-  }
-
-  function buildHandle(overrides: {
-    dispatchResult: { machineId?: string; machineNonce?: string; logsUrl?: string; workflowRunId?: number };
-    appendJobLogId?: number;
-    updateJobMachineMock: ReturnType<typeof vi.fn>;
-  }) {
-    const tarball = makeTarballForDispatchTest();
-    const id = overrides.appendJobLogId ?? 99;
-    return makeKgRefresh({
-      sidecar: { restart: vi.fn(async () => {}) },
-      githubAppId: "1",
-      githubAppPrivateKey: "key",
-      kgSourceRepo: "TestOrg/test-kg",
-      dataRoot,
-      kgDir: "/nonexistent-kg",
-      minFreeBytes: 1,
-      freeBytes: () => 999_999,
-      deployHeld: () => false,
-      mintToken: vi.fn(async () => ({ token: "tok", expiresAt: "" })) as never,
-      fetchTarball: vi.fn(async () => tarball) as never,
-      fetchDefaultBranch: vi.fn(async () => "main") as never,
-      fetchWorkflowFile: vi.fn(async () => ({
-        status: 200,
-        content: "on:\n  workflow_dispatch:\n    inputs:\n      run_config:\n        required: true\n      runner_phase:\n        required: false\n",
-      })) as never,
-      // SHA matches recorded SHA → runRefresh() returns ingest-needed → dispatch fires
-      fetchSnapshotCommitSha: vi.fn(async () => "sha-abc") as never,
-      persistSnapshotSha: vi.fn() as never,
-      loadSnapshotSha: vi.fn(() => "sha-abc") as never,
-      mcpToolCall: vi.fn(async () => ({ edges: [] })) as never,
-      canaryDeadlineMs: 50,
-      canaryRetryMs: 10,
-      runnerCallbackBaseUrl: "http://localhost:8080",
-      runnerTokenSecret: "secret",
-      resolveMappingTeamKey: (repo: string) => repo === "TestOrg/test-kg" ? { teamKey: "KGA", dependencyTokenScope: "installation" } : undefined,
-      mintRunTokenFn: vi.fn(() => ({ token: "run-tok", dispatchId: "disp-1" })) as never,
-      dispatchRun: vi.fn(async () => overrides.dispatchResult) as never,
-      appendJobLog: vi.fn(() => id) as never,
-      updateJobMachine: overrides.updateJobMachineMock as never,
-      closeJobLog: vi.fn() as never,
-      onOutcome: vi.fn() as never,
-      persistStage: vi.fn() as never,
-      loadStage: vi.fn(() => null) as never,
-    });
-  }
-
-  it("passes workflowRunId and undefined machineNonce for a GHA dispatch result", async () => {
-    const updateJobMachineMock = vi.fn();
-    const handle = buildHandle({
-      dispatchResult: {
-        workflowRunId: 12345,
-        logsUrl: "https://github.com/TestOrg/test-kg/actions/runs/12345",
-      },
-      appendJobLogId: 99,
-      updateJobMachineMock,
-    });
-
-    const r = await handle.trigger();
-    expect(r.status).toBe(202);
-
-    await waitFor(() => updateJobMachineMock.mock.calls.length > 0, "updateJobMachine called");
-
-    expect(updateJobMachineMock).toHaveBeenCalledWith(99, {
-      machineNonce: undefined,
-      machineId: undefined,
-      logsUrl: "https://github.com/TestOrg/test-kg/actions/runs/12345",
-      workflowRunId: 12345,
-    });
-  });
-
-  it("passes machineNonce and machineId for a Fly dispatch result", async () => {
-    const updateJobMachineMock = vi.fn();
-    const handle = buildHandle({
-      dispatchResult: {
-        machineId: "machine-abc",
-        machineNonce: "nonce-xyz",
-        logsUrl: "https://fly.io/apps/sessions/machines/machine-abc",
-      },
-      appendJobLogId: 88,
-      updateJobMachineMock,
-    });
-
-    const r = await handle.trigger();
-    expect(r.status).toBe(202);
-
-    await waitFor(() => updateJobMachineMock.mock.calls.length > 0, "updateJobMachine called");
-
-    expect(updateJobMachineMock).toHaveBeenCalledWith(88, {
-      machineNonce: "nonce-xyz",
-      machineId: "machine-abc",
-      logsUrl: "https://fly.io/apps/sessions/machines/machine-abc",
-      workflowRunId: undefined,
-    });
   });
 });
 
@@ -3307,10 +3263,10 @@ describe("runKgRefresh — KgIngestError maps to KG_INGEST_FAILED", () => {
 });
 
 // ── GHA kg-refresh dispatch — runner_image resolution ────────────────────────
-// Verifies that dispatchKgRefreshRun's GHA branch forwards runner_image using
+// Verifies that the KG refresh senders's GHA branch forwards runner_image using
 // the same channel-policy helper as the implement dispatch path.
 //
-// dispatchKgRefreshRun is not exported (index.ts is the application entry
+// the KG refresh senders is not exported (index.ts is the application entry
 // point with side-effectful startup; it has no exports). The tests below cover
 // two layers:
 //   1. resolveRunnerImageForDispatch in isolation — ensures the helper returns
@@ -3406,8 +3362,8 @@ describe("GHA kg-refresh dispatch — runner_image resolution via resolveRunnerI
 
 // ── GHA kg-refresh dispatch — inputs shape contract ───────────────────────────
 // Documents the expected shape of the workflow_dispatch inputs that
-// dispatchKgRefreshRun sends to claude-implement.yml with runner_phase=kg-refresh.
-// dispatchKgRefreshRun is not exported (index.ts is the application entry point
+// the KG refresh senders sends to claude-implement.yml with runner_phase=kg-refresh.
+// the KG refresh senders is not exported (index.ts is the application entry point
 // with side-effectful startup). These tests verify the contract by constructing
 // the expected inputs object inline, paired with template tests that verify
 // claude-implement.yml declares the matching inputs.
@@ -3513,95 +3469,6 @@ describe("buildEnvelopeDispatchInputs — implement dispatch byte-identity", () 
   it("implement dispatch inputs have no runner_callback_url key", () => {
     const inputs = buildEnvelopeDispatchInputs(makeMapping(), baseIssue, { runnerPhase: "implementation", runToken: "tok", retryPolicy: null });
     expect("runner_callback_url" in inputs).toBe(false);
-  });
-});
-
-// ── GHA dispatch: run ID polling (pollForKgWorkflowRunId) ─────────────────────
-// AII-551: verifies the polling loop binds the run ID on a delayed appearance.
-
-import { pollForKgWorkflowRunId } from "../github.js";
-
-describe("GHA kg-refresh dispatch — run ID polling (pollForKgWorkflowRunId)", () => {
-  it("binds the run ID that appears on the third poll", async () => {
-    let calls = 0;
-    const findRunId = vi.fn(async () => {
-      calls++;
-      if (calls < 3) return null;
-      return 44444;
-    });
-
-    const runId = await pollForKgWorkflowRunId({
-      token: "tok",
-      owner: "org",
-      repo: "kg-repo",
-      workflowFile: "kg-refresh.yml",
-      branch: "main",
-      dispatchTime: new Date(),
-      pollDelaysMs: [0, 0, 0, 0, 0],
-      findRunId,
-    });
-
-    expect(runId).toBe(44444);
-    expect(findRunId).toHaveBeenCalledTimes(3);
-  });
-
-  it("returns undefined when run ID never appears", async () => {
-    const findRunId = vi.fn(async () => null);
-
-    const runId = await pollForKgWorkflowRunId({
-      token: "tok",
-      owner: "org",
-      repo: "kg-repo",
-      workflowFile: "kg-refresh.yml",
-      branch: "main",
-      dispatchTime: new Date(),
-      pollDelaysMs: [0, 0, 0],
-      findRunId,
-    });
-
-    expect(runId).toBeUndefined();
-    expect(findRunId).toHaveBeenCalledTimes(3);
-  });
-
-  it("returns the run ID found on the first poll without further calls", async () => {
-    const findRunId = vi.fn(async () => 11111);
-
-    const runId = await pollForKgWorkflowRunId({
-      token: "tok",
-      owner: "org",
-      repo: "kg-repo",
-      workflowFile: "kg-refresh.yml",
-      branch: "main",
-      dispatchTime: new Date(),
-      pollDelaysMs: [0, 0, 0],
-      findRunId,
-    });
-
-    expect(runId).toBe(11111);
-    expect(findRunId).toHaveBeenCalledTimes(1);
-  });
-
-  it("treats a thrown findRunId error as null and continues polling", async () => {
-    let calls = 0;
-    const findRunId = vi.fn(async () => {
-      calls++;
-      if (calls === 1) throw new Error("GitHub API error");
-      return calls >= 3 ? 55555 : null;
-    });
-
-    const runId = await pollForKgWorkflowRunId({
-      token: "tok",
-      owner: "org",
-      repo: "kg-repo",
-      workflowFile: "kg-refresh.yml",
-      branch: "main",
-      dispatchTime: new Date(),
-      pollDelaysMs: [0, 0, 0],
-      findRunId,
-    });
-
-    expect(runId).toBe(55555);
-    expect(findRunId).toHaveBeenCalledTimes(3);
   });
 });
 

@@ -1,14 +1,15 @@
 import type { RepoMapping } from "./config.js";
-import type { TicketIssue } from "./providers/types.js";
+import type { AIImplementSnapshot, TicketIssue } from "./providers/types.js";
 import type { ProviderRegistry } from "./providers/registry.js";
 import { parsePlanningBlock } from "./planning-block.js";
+import type { DispatchBlockReason } from "./dispatch-gate.js";
 
 export interface Blocker {
   issueId: string;
   issueIdentifier: string;
   issueTitle: string;
   teamKey: string;
-  reason: "no-mapping" | "dedup" | "concurrency" | "file-overlap";
+  reason: "no-mapping" | "dedup" | "concurrency" | "file-overlap" | "parked";
   detail: string;
 }
 
@@ -59,6 +60,61 @@ export function resolveInFlightSiblings(inFlightIds: Iterable<string>): TicketIs
   return [...inFlightIds]
     .map((id) => seenCandidatesById.get(id))
     .filter((i): i is TicketIssue => Boolean(i));
+}
+
+// The last dispatch-gate reason the poll logged for each blocked candidate, so a skip is
+// logged when it starts or changes rather than on every cycle.
+const lastSkipReasons = new Map<string, { identifier: string; reason: DispatchBlockReason }>();
+
+export interface SkipCandidate {
+  id: string;
+  identifier: string;
+  /** Phase the candidate would run next. */
+  phase: "planning" | "implementation";
+  /** This cycle's gate reason; null when the candidate is not blocked. */
+  reason: DispatchBlockReason | null;
+  /** Failure count behind a `parked` reason. */
+  failures?: number;
+}
+
+/** Log lines for candidates whose skip reason is new or changed, or that are no longer blocked.
+ *  Updates `last` in place; ids absent from `candidates` (left the snapshot) are dropped silently. */
+export function diffSkipReasons(
+  last: Map<string, { identifier: string; reason: DispatchBlockReason }>,
+  candidates: SkipCandidate[],
+): string[] {
+  const lines: string[] = [];
+  const present = new Set<string>();
+  for (const c of candidates) {
+    present.add(c.id);
+    const prev = last.get(c.id);
+    if (c.reason === null) {
+      if (prev) {
+        lines.push(`[poll] ${c.identifier} is no longer blocked`);
+        last.delete(c.id);
+      }
+      continue;
+    }
+    if (prev?.reason === c.reason) continue;
+    last.set(c.id, { identifier: c.identifier, reason: c.reason });
+    lines.push(
+      c.reason === "parked"
+        ? `[poll] Skipping ${c.identifier}: parked for ${c.phase} after ${c.failures ?? "?"} failed runs — unpark at /admin#runners`
+        : `[poll] Skipping ${c.identifier}: ${c.reason}`,
+    );
+  }
+  for (const id of [...last.keys()]) if (!present.has(id)) last.delete(id);
+  return lines;
+}
+
+/** Poll entry point: diff this cycle's reasons against the module-level map. */
+export function logSkipReasons(candidates: SkipCandidate[]): string[] {
+  return diffSkipReasons(lastSkipReasons, candidates);
+}
+
+/** Test hook: clear the last-skip-reason map. */
+export function resetSkipReasons(): void {
+  lastSkipReasons.clear();
 }
 
 /** Test hook: clear the seen-candidates cache. */
@@ -214,11 +270,20 @@ export function selectFileOverlapDeferrals(
   return blockers;
 }
 
+/**
+ * `reservedCountsByTeam` is the DB-backed reservation count per team (unreleased,
+ * non-kg-refresh `dispatch_admissions` rows — `src/dispatch-admission.ts#count`), the
+ * same authority `acquireDispatch` checks capacity against. Never a tracker-label
+ * count: a stranded label (advanced late, or not at all) must not mask real capacity,
+ * and a reservation with no run ID yet (a prepared launch mid-flight) must still count
+ * as used.
+ */
 export function selectBlockers(
   issues: TicketIssue[],
   teamRepoMap: Record<string, RepoMapping>,
-  inProgressCountsByTeam: Record<string, number>,
+  reservedCountsByTeam: Record<string, number>,
   isAlreadyDispatched: (issueId: string) => boolean,
+  parkedFor: (issue: TicketIssue) => { failures: number } | null,
 ): Blocker[] {
   const blockers: Blocker[] = [];
   for (const issue of issues) {
@@ -235,6 +300,18 @@ export function selectBlockers(
       });
       continue;
     }
+    const parked = parkedFor(issue);
+    if (parked) {
+      blockers.push({
+        issueId: issue.id,
+        issueIdentifier: issue.identifier,
+        issueTitle: issue.title,
+        teamKey,
+        reason: "parked",
+        detail: `Parked after ${parked.failures} failed runs. Unpark it on the Runners page.`,
+      });
+      continue;
+    }
     if (isAlreadyDispatched(issue.id)) {
       blockers.push({
         issueId: issue.id,
@@ -246,16 +323,19 @@ export function selectBlockers(
       });
       continue;
     }
-    const inProgress = inProgressCountsByTeam[teamKey] ?? 0;
+    const used = reservedCountsByTeam[teamKey] ?? 0;
     const cap = mapping.maxInProgressAiIssues;
-    if (cap - inProgress <= 0) {
+    if (cap - used <= 0) {
+      console.log(
+        `[poll-selection] Capacity exclusion: issue=${issue.identifier} team=${teamKey} count=${used} cap=${cap}`,
+      );
       blockers.push({
         issueId: issue.id,
         issueIdentifier: issue.identifier,
         issueTitle: issue.title,
         teamKey,
         reason: "concurrency",
-        detail: `${teamKey} at concurrency cap (${inProgress}/${cap}). Waiting for a slot.`,
+        detail: `${teamKey} at concurrency cap (${used}/${cap}). Waiting for a slot.`,
       });
     }
   }
@@ -297,4 +377,78 @@ export function selectIssuesToDispatch(
   }
 
   return selected;
+}
+
+/**
+ * The mapping for scopeKey, only when it belongs to providerId's tracker. Mapping keys are one
+ * namespace across trackers, so a bare key lookup can return another tracker's mapping.
+ *
+ * providerId is compared with the mapping's `ticketingProvider`. The built-in ids (`linear`,
+ * `jira`, `filesystem`) equal those values; a `custom/providers/<id>` factory must return the
+ * same `id` it is registered under, or all its issues are dropped as foreign.
+ */
+export function mappingForProvider(
+  providerId: string,
+  scopeKey: string,
+  mappings: Record<string, RepoMapping>,
+): RepoMapping | null {
+  const mapping = mappings[scopeKey];
+  return mapping && mapping.ticketingProvider === providerId ? mapping : null;
+}
+
+export interface ForeignTrackerIssue {
+  issue: TicketIssue;
+  /** Tracker the issue came from. */
+  providerId: string;
+  /** ticketingProvider of the mapping holding its key. */
+  mappingProvider: string;
+}
+
+/** Merge per-provider snapshots, dropping every entry whose scopeKey belongs to another tracker's mapping. */
+export function mergeProviderSnapshots(
+  entries: Array<{ providerId: string; snapshot: AIImplementSnapshot }>,
+  mappings: Record<string, RepoMapping>,
+): { snapshot: AIImplementSnapshot; foreign: ForeignTrackerIssue[] } {
+  const foreign: ForeignTrackerIssue[] = [];
+  const merged: AIImplementSnapshot = {
+    needsPlanning: [],
+    readyForImplementation: [],
+    inProgressCountsByScope: {},
+    parentsToFinalize: [],
+  };
+  // Unmapped keys are kept; only a mapping of a different tracker makes an entry foreign.
+  const isForeign = (providerId: string, scopeKey: string): boolean => {
+    const m = mappings[scopeKey];
+    return !!m && m.ticketingProvider !== providerId;
+  };
+  const keepIssues = (providerId: string, issues: TicketIssue[]): TicketIssue[] =>
+    issues.filter((issue) => {
+      if (!isForeign(providerId, issue.scopeKey)) return true;
+      foreign.push({ issue, providerId, mappingProvider: mappings[issue.scopeKey].ticketingProvider });
+      return false;
+    });
+  for (const { providerId, snapshot } of entries) {
+    merged.needsPlanning.push(...keepIssues(providerId, snapshot.needsPlanning));
+    merged.readyForImplementation.push(...keepIssues(providerId, snapshot.readyForImplementation));
+    for (const [k, v] of Object.entries(snapshot.inProgressCountsByScope)) {
+      if (isForeign(providerId, k)) continue;
+      merged.inProgressCountsByScope[k] = (merged.inProgressCountsByScope[k] ?? 0) + v;
+    }
+    merged.parentsToFinalize.push(
+      ...snapshot.parentsToFinalize.filter((e) => !isForeign(providerId, e.scopeKey)),
+    );
+  }
+  return { snapshot: merged, foreign };
+}
+
+/** One `no-mapping` Blocker per foreign issue. */
+export function selectForeignTrackerBlockers(foreign: ForeignTrackerIssue[]): Blocker[] {
+  return foreign.map(({ issue, providerId, mappingProvider }) => ({
+    issueId: issue.id,
+    issueIdentifier: issue.identifier,
+    issueTitle: issue.title,
+    teamKey: issue.scopeKey,
+    reason: "no-mapping" as const,
+    detail: `Mapping ${issue.scopeKey} is a ${mappingProvider} mapping; this ${providerId} issue has no ${providerId} mapping.`,
+  }));
 }

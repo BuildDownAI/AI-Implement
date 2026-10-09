@@ -3,6 +3,7 @@ import type { PipelineContext, StepModule, StepReporter, RunTelemetry } from "..
 import { formatLlmResultDetail } from "../step-utils.js";
 import { classifyLlmResult, type FailureRecord } from "../failure-classification.js";
 import { describeReferenceRepoCause, type ReferenceRepoResult } from "../../reference-repos.js";
+import { DEFAULT_MODEL } from "../default-model.js";
 
 interface ImplementInputs extends Record<string, unknown> {
   workspaceDir: string;
@@ -11,6 +12,8 @@ interface ImplementInputs extends Record<string, unknown> {
   maxTurns?: number;
   planningContext?: string;
   referenceRepoResults?: ReferenceRepoResult[];
+  /** Feedback-loop iteration this call belongs to (AII-798); defaults to 1. */
+  iteration?: number;
 }
 
 interface ImplementOutputs extends Record<string, unknown> {
@@ -59,6 +62,7 @@ export const implementStep: StepModule<ImplementInputs, ImplementOutputs> = {
     _reporter: StepReporter,
   ): Promise<ImplementOutputs> {
     const { workspaceDir, model, maxTurns, planningContext, referenceRepoResults } = inputs;
+    const iteration = typeof inputs.iteration === "number" ? inputs.iteration : 1;
 
     let fullPrompt = inputs.prompt;
 
@@ -73,11 +77,12 @@ export const implementStep: StepModule<ImplementInputs, ImplementOutputs> = {
     const { retryPolicy } = context.data;
     const result = await context.llmExecutor.invoke({
       prompt: fullPrompt,
-      model: model ?? "claude-sonnet-5",
+      model: model ?? DEFAULT_MODEL,
       maxTurns,
       stage: "implement",
       expectsStructuredOutput: false,
       retry: retryPolicy ? { policy: retryPolicy, toolUseIsSafe: false } : undefined,
+      cycle: iteration,
     });
 
     // A max_turns termination is a completed-but-capped pass, not an invocation

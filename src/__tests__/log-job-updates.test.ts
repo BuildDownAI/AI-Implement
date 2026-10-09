@@ -269,6 +269,128 @@ describe("completeOrphanedPlanningJobs", () => {
   });
 });
 
+describe("appendLog retains pilot-correlated rows beyond MAX_LOG_ENTRIES (AII-795)", () => {
+  const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+
+  function insertReviewFixAttempt(
+    attemptId: string, dispatchId: string, completedAt: number | null,
+    opts: { prNumber?: number; githubRunId?: number | null; resultConflictAt?: number | null } = {},
+  ) {
+    const githubRunId = opts.githubRunId === undefined ? 1 : opts.githubRunId;
+    dedup.getDb().prepare(`INSERT INTO review_fix_attempts
+      (attempt_id, dispatch_id, mapping_key, installation_id, repository, pr_number,
+       issue_scope, issue_id, owner, state, created_at, deadline_at,
+       task_snapshot_json, finding_versions_json, completed_at, github_run_id,
+       github_run_attempt, result_conflict_at)
+      VALUES (@attemptId, @dispatchId, 'APP', '7', 'acme/app', @prNumber,
+              'team', 'issue-1', @attemptId, 'completed', 10, 1000, '{}', '[]',
+              @completedAt, @githubRunId, @githubRunAttempt, @resultConflictAt)`)
+      .run({
+        attemptId, dispatchId, completedAt, prNumber: opts.prNumber ?? 42,
+        githubRunId, githubRunAttempt: githubRunId === null ? null : 1,
+        resultConflictAt: opts.resultConflictAt ?? null,
+      });
+  }
+
+  /** Pushes a row out of the top-MAX_LOG_ENTRIES-by-dispatched_at window so only the
+   *  pilot-attempt exemption (not recency) can keep it around. */
+  function ageOut(jobId: number) {
+    dedup.getDb().prepare("UPDATE dispatch_log SET dispatched_at = 0 WHERE id = ?").run(jobId);
+  }
+
+  function floodWithUnrelatedJobs(count: number) {
+    for (let i = 0; i < count; i++) log.appendLog({ issueId: `unrelated-${i}` });
+  }
+
+  it("survives 501 unrelated jobs while its pilot attempt is unresolved (completed_at NULL)", () => {
+    const id = log.appendLog({ issueId: "pilot-active", dispatchId: "dispatch-active" });
+    insertReviewFixAttempt("attempt-active", "dispatch-active", null);
+    ageOut(id);
+
+    floodWithUnrelatedJobs(501);
+
+    expect(log.getJobById(id)).not.toBeNull();
+  });
+
+  it("survives 501 unrelated jobs when its pilot attempt completed within the last 7 days", () => {
+    const id = log.appendLog({ issueId: "pilot-recent", dispatchId: "dispatch-recent" });
+    insertReviewFixAttempt("attempt-recent", "dispatch-recent", Date.now() - 24 * 60 * 60 * 1000);
+    ageOut(id);
+
+    floodWithUnrelatedJobs(501);
+
+    expect(log.getJobById(id)).not.toBeNull();
+  });
+
+  it("is pruned once its pilot attempt completed more than 7 days ago — the window is measured from completion, not dispatch", () => {
+    const id = log.appendLog({ issueId: "pilot-expired", dispatchId: "dispatch-expired" });
+    // Dispatched "recently" (relative to the DB clock) but completed over 7 days ago:
+    // proves the 7-day clock reads completed_at, not dispatched_at.
+    insertReviewFixAttempt("attempt-expired", "dispatch-expired", Date.now() - SEVEN_DAYS_MS - 1_000);
+    ageOut(id);
+
+    floodWithUnrelatedJobs(501);
+
+    expect(log.getJobById(id)).toBeNull();
+  });
+
+  it("holds old pilot history while ownership evidence remains unresolved", () => {
+    const db = dedup.getDb();
+    const old = Date.now() - SEVEN_DAYS_MS - 1_000;
+    const cases = [
+      { name: "reservation", prNumber: 51 },
+      { name: "delivery", prNumber: 52 },
+      { name: "conflict", prNumber: 53 },
+      { name: "execution", prNumber: 54 },
+    ];
+    const ids = cases.map(({ name, prNumber }) => {
+      const dispatchId = `dispatch-${name}`;
+      const id = log.appendLog({ issueId: `pilot-${name}`, dispatchId });
+      insertReviewFixAttempt(`attempt-${name}`, dispatchId, old, {
+        prNumber,
+        githubRunId: name === "execution" ? null : 1,
+        resultConflictAt: name === "conflict" ? old : null,
+      });
+      ageOut(id);
+      return id;
+    });
+    db.prepare(`INSERT INTO dispatch_admissions
+      (dispatch_id, mapping_key, issue_scope, issue_id, installation_id, repository,
+       pr_number, lifecycle_owner, phase, backend, created_at)
+      VALUES ('dispatch-reservation', 'APP', 'pr', 'issue-reservation', '7', 'acme/app',
+              51, 'restate', 'implementation', 'github-actions', 10)`).run();
+    db.prepare(`INSERT INTO review_fix_inbox
+      (authenticated_source, event_id, installation_id, repository, pr_number,
+       kind, payload_json, payload_hash, accepted_at, delivery_state)
+      VALUES ('github-webhook', 'event-delivery', '7', 'acme/app', 52,
+              'feedback', '{}', 'hash', 10, 'pending')`).run();
+
+    floodWithUnrelatedJobs(501);
+    for (const id of ids) expect(log.getJobById(id)).not.toBeNull();
+  });
+
+  it("does not exempt unrelated rows with no dispatch_id — old, non-pilot history keeps today's pruning", () => {
+    const id = log.appendLog({ issueId: "plain-old" });
+    ageOut(id);
+
+    floodWithUnrelatedJobs(501);
+
+    expect(log.getJobById(id)).toBeNull();
+  });
+
+  it("trims unrelated rows to MAX_LOG_ENTRIES even while an exempt pilot row is retained", () => {
+    const id = log.appendLog({ issueId: "pilot-active-2", dispatchId: "dispatch-active-2" });
+    insertReviewFixAttempt("attempt-active-2", "dispatch-active-2", null);
+    ageOut(id);
+
+    floodWithUnrelatedJobs(501);
+
+    const total = dedup.getDb().prepare("SELECT COUNT(*) as c FROM dispatch_log").get() as { c: number };
+    expect(total.c).toBeLessThanOrEqual(501);
+    expect(log.getJobById(id)).not.toBeNull();
+  });
+});
+
 describe("listLog strips evidence tails", () => {
   it("marks a list row's evidence truncated:true even when the persisted record was untruncated", () => {
     const id = log.appendLog({ issueId: "i5", executionMode: "github-actions" });

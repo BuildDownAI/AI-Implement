@@ -30,6 +30,7 @@ vi.mock("../fly-machines.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../fly-machines.js")>()),
   fetchMachineLogs: fetchMachineLogsMock,
   destroyMachine: destroyMachineMock,
+  getMachine: vi.fn(async (_t: string, _a: string, id: string) => ({ id, state: "stopped", config: { metadata: {} } })),
   listMachines: listMachinesMock,
 }));
 
@@ -88,7 +89,18 @@ vi.mock("../local-job-logs.js", () => ({
   readLocalJobLogs: readLocalJobLogsMock,
 }));
 
+// The reviewFixLifecycle="restate" enablement check (AII-804) probes the dispatch-ref
+// workflow's capabilities the same way the review-fix dispatcher itself does; mocked here
+// so the save-boundary tests below don't depend on real network access.
+const resolveWorkflowCapabilitiesMock = vi.hoisted(() => vi.fn());
+vi.mock("../workflow-probe.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../workflow-probe.js")>()),
+  resolveWorkflowCapabilities: resolveWorkflowCapabilitiesMock,
+}));
+
 function makeFakeRegistry(provider: FakeProvider): ProviderRegistry {
+  // Mappings default to the linear tracker; snapshot merging matches on provider id.
+  Object.defineProperty(provider, "id", { value: "linear", configurable: true });
   return {
     forMapping: async () => provider,
     forAllMappings: async () => [provider],
@@ -171,6 +183,7 @@ beforeEach(async () => {
   accessEntries.initAccessEntriesTable();
   accessAudit.initAccessAuditTable();
   accessGrants.initAccessPageGrantsTable();
+  (await import("../dispatch-breaker.js")).initDispatchBreakerTable(); // /api/blockers reads park state
   // Every /api/* request re-checks the signed-in identity and requires Admin, and only a listed
   // address can be one — a domain-only list would admit the suite's identity as a user and 403 it.
   process.env.OAUTH_ALLOWED_DOMAINS = "eudoxus.ai";
@@ -230,6 +243,20 @@ async function requestWithConfig(
   const req = new MockRequest(url, method, { authorization: `Bearer ${token}` });
   const res = new MockResponse();
   admin.handleAdminRequest(req as never, res as never, cfg, makeFakeRegistry(provider));
+  await res.done;
+  return { statusCode: res.statusCode, body: res.body };
+}
+
+async function requestWithDeps(
+  url: string,
+  method: string,
+  token: string,
+  deps: Parameters<typeof admin.handleAdminRequest>[4],
+  body?: unknown,
+): Promise<{ statusCode: number; body: string }> {
+  const req = new MockRequest(url, method, { authorization: `Bearer ${token}` }, body === undefined ? undefined : JSON.stringify(body));
+  const res = new MockResponse();
+  admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider), deps);
   await res.done;
   return { statusCode: res.statusCode, body: res.body };
 }
@@ -1032,6 +1059,24 @@ describe("admin mappings", () => {
     });
   });
 
+  it("warns, but still saves, when a Jira mapping replaces a Linear mapping's key", async () => {
+    const token = await login("secret");
+    const jira = { ticketingProvider: "jira", ticketingConfig: { kind: "jira", jql: "project = ACME", repoFieldValue: "org/clash" } };
+    const fresh = await request("/api/mappings", "POST", "secret", { teamKey: "CLASH0", owner: "org", repo: "clash", ...jira }, token);
+    expect(fresh.statusCode).toBe(202);
+    expect(JSON.parse(fresh.body).warnings).toBeUndefined();
+
+    await request("/api/mappings", "POST", "secret", { teamKey: "CLASH", owner: "org", repo: "clash" }, token);
+    const clash = await request("/api/mappings", "POST", "secret", { teamKey: "CLASH", owner: "org", repo: "clash", ...jira }, token);
+    expect(clash.statusCode).toBe(202);
+    expect(JSON.parse(clash.body).warnings).toHaveLength(1);
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    expect(JSON.parse(list.body).CLASH.ticketingProvider).toBe("jira");
+
+    const again = await request("/api/mappings", "POST", "secret", { teamKey: "CLASH", owner: "org", repo: "clash", ...jira }, token);
+    expect(JSON.parse(again.body).warnings).toBeUndefined();
+  });
+
   it("persists filesystem project settings and reviewer selection in local mode", async () => {
     const previousMode = process.env.RUNNER_MODE;
     process.env.RUNNER_MODE = "local";
@@ -1538,6 +1583,228 @@ describe("admin mappings", () => {
     }
   });
 
+  it("treats absent reviewFixLifecycle as null on a new mapping", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "RFL1", owner: "org", repo: "app",
+    }, token);
+    expect(res.statusCode).toBe(202);
+    expect(JSON.parse(res.body).reviewFixLifecycle).toBeNull();
+
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    expect(JSON.parse(list.body).RFL1.reviewFixLifecycle).toBeNull();
+  });
+
+  it("treats null and empty-string reviewFixLifecycle as null", async () => {
+    const token = await login("secret");
+    for (const [teamKey, value] of [["RFL2", null], ["RFL3", ""]] as const) {
+      const res = await request("/api/mappings", "POST", "secret", {
+        teamKey, owner: "org", repo: "app",
+        reviewFixLifecycle: value,
+      }, token);
+      expect(res.statusCode).toBe(202);
+      expect(JSON.parse(res.body).reviewFixLifecycle).toBeNull();
+    }
+  });
+
+  it("accepts an explicit reviewFixLifecycle='legacy'", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "RFL4", owner: "org", repo: "app",
+      reviewFixLifecycle: "legacy",
+    }, token);
+    expect(res.statusCode).toBe(202);
+    expect(JSON.parse(res.body).reviewFixLifecycle).toBe("legacy");
+  });
+
+  it("preserves existing reviewFixLifecycle when omitted from an unrelated update", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", {
+      teamKey: "RFL5", owner: "org", repo: "app",
+      reviewFixLifecycle: "legacy",
+    }, token);
+
+    const update = await request("/api/mappings", "POST", "secret", {
+      teamKey: "RFL5", owner: "org", repo: "app-updated",
+    }, token);
+    expect(update.statusCode).toBe(202);
+    expect(JSON.parse(update.body).reviewFixLifecycle).toBe("legacy");
+  });
+
+  it("rejects invalid reviewFixLifecycle values with 400", async () => {
+    const token = await login("secret");
+    for (const invalid of ["bogus", "RESTATE", "true"]) {
+      const res = await request("/api/mappings", "POST", "secret", {
+        teamKey: "RFLBAD", owner: "org", repo: "app",
+        reviewFixLifecycle: invalid,
+      }, token);
+      expect(res.statusCode).toBe(400);
+      expect(JSON.parse(res.body).error).toContain("reviewFixLifecycle");
+    }
+  });
+
+  it("rejects reviewFixLifecycle='restate' with an actionable, fail-closed 400 naming the missing execution-mode prerequisite", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "RFLFLY", owner: "org", repo: "app",
+      executionMode: "fly-machines",
+      reviewFixLifecycle: "restate",
+    }, token);
+    expect(res.statusCode).toBe(400);
+    const error = JSON.parse(res.body).error;
+    expect(error).toContain("github-actions");
+    expect(error).toContain("leave the lifecycle on Legacy");
+  });
+
+  it("rejects reviewFixLifecycle='restate' on github-actions with an actionable 400 when no Restate endpoint status is available (fail closed, deps.getRestateStatus unset)", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "RFLGHA", owner: "org", repo: "app",
+      executionMode: "github-actions",
+      reviewFixLifecycle: "restate",
+    }, token);
+    expect(res.statusCode).toBe(400);
+    const error = JSON.parse(res.body).error;
+    expect(error).toContain("Restate endpoint");
+    expect(error).toContain("get_tenant_health");
+    expect(error).toContain('"registered"');
+
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    expect(JSON.parse(list.body).RFLGHA).toBeUndefined();
+  });
+
+  it("rejects reviewFixLifecycle='restate' with a registered, healthy Restate endpoint but a dispatch-ref workflow lacking the attempt-correlation capability", async () => {
+    const token = await login("secret");
+    resolveWorkflowCapabilitiesMock.mockResolvedValueOnce({
+      contract: "envelope", supportsRunPublicationToken: true, supportsAttemptCorrelation: false,
+    });
+    const res = await requestWithDeps("/api/mappings", "POST", token, {
+      getRestateStatus: () => ({ sidecar: { state: "ready" }, registration: { state: "registered" } }),
+    }, {
+      teamKey: "RFLCAP", owner: "org", repo: "app", defaultBranch: "main",
+      executionMode: "github-actions",
+      reviewFixLifecycle: "restate",
+    });
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toContain("run_attempt_token");
+    expect(JSON.parse(res.body).error).toContain("Sync workflows");
+    expect(resolveWorkflowCapabilitiesMock).toHaveBeenCalledWith(expect.objectContaining({
+      owner: "org", repo: "app", workflowFile: "claude-implement.yml", ref: "main", token: "gh-token-mock",
+    }));
+  });
+
+  it("accepts reviewFixLifecycle='restate' when github-actions, the Restate endpoint is registered and healthy, and the dispatch-ref workflow supports attempt correlation", async () => {
+    const token = await login("secret");
+    resolveWorkflowCapabilitiesMock.mockResolvedValueOnce({
+      contract: "envelope", supportsRunPublicationToken: true, supportsAttemptCorrelation: true,
+    });
+    const res = await requestWithDeps("/api/mappings", "POST", token, {
+      getRestateStatus: () => ({ sidecar: { state: "ready" }, registration: { state: "registered" } }),
+    }, {
+      teamKey: "RFLOK", owner: "org", repo: "app", defaultBranch: "main",
+      executionMode: "github-actions",
+      reviewFixLifecycle: "restate",
+    });
+    expect(res.statusCode).toBe(202);
+    expect(JSON.parse(res.body).reviewFixLifecycle).toBe("restate");
+
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    expect(JSON.parse(list.body).RFLOK.reviewFixLifecycle).toBe("restate");
+  });
+
+  it("rejects initial Restate activation while an unreserved Legacy runner is active", async () => {
+    const token = await login("secret");
+    resolveWorkflowCapabilitiesMock.mockClear();
+    dedup.getDb().prepare(`
+      INSERT INTO dispatch_log (issue_id, repo, dispatched_at, status, phase)
+      VALUES ('legacy-issue', 'org/app', ?, 'running', 'gap-analysis')
+    `).run(Date.now());
+    const res = await requestWithDeps("/api/mappings", "POST", token, {
+      getRestateStatus: () => ({ sidecar: { state: "ready" }, registration: { state: "registered" } }),
+    }, {
+      teamKey: "RFLDRAIN", owner: "org", repo: "app", defaultBranch: "main",
+      executionMode: "github-actions", reviewFixLifecycle: "restate",
+    });
+    expect(res.statusCode).toBe(400);
+    const error = JSON.parse(res.body).error;
+    expect(error).toContain("1 run in flight has no dispatch reservation");
+    expect(error).toContain("No action is necessary");
+    expect(resolveWorkflowCapabilitiesMock).not.toHaveBeenCalled();
+  });
+
+  it("preserves a selected Restate lifecycle during an unrelated edit and rejects an unsupported dispatch change", async () => {
+    const token = await login("secret");
+    resolveWorkflowCapabilitiesMock.mockResolvedValueOnce({
+      contract: "envelope", supportsRunPublicationToken: true, supportsAttemptCorrelation: true,
+    });
+    const healthy = { getRestateStatus: () => ({ sidecar: { state: "ready" as const }, registration: { state: "registered" as const } }) };
+    const original = await requestWithDeps("/api/mappings", "POST", token, healthy, {
+      teamKey: "RFLPRESERVE", owner: "org", repo: "app", defaultBranch: "pilot-ref",
+      workflowFile: "pilot.yml", executionMode: "github-actions", reviewFixLifecycle: "restate",
+    });
+    expect(original.statusCode).toBe(202);
+
+    const unrelated = await requestWithDeps("/api/mappings", "POST", token, {}, {
+      teamKey: "RFLPRESERVE", owner: "org", repo: "app", paused: true,
+      reviewFixLifecycle: "restate",
+    });
+    expect(unrelated.statusCode).toBe(202);
+    expect(JSON.parse(unrelated.body)).toMatchObject({
+      reviewFixLifecycle: "restate", workflowFile: "pilot.yml", executionMode: "github-actions", paused: true,
+    });
+
+    const changed = await requestWithDeps("/api/mappings", "POST", token, {}, {
+      teamKey: "RFLPRESERVE", owner: "org", repo: "app", executionMode: "fly-machines",
+    });
+    expect(changed.statusCode).toBe(400);
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    expect(JSON.parse(list.body).RFLPRESERVE.executionMode).toBe("github-actions");
+  });
+
+  it("rejects a workflow without publication support and does not expose probe errors", async () => {
+    const token = await login("secret");
+    const healthy = { getRestateStatus: () => ({ sidecar: { state: "ready" as const }, registration: { state: "registered" as const } }) };
+    resolveWorkflowCapabilitiesMock.mockResolvedValueOnce({
+      contract: "envelope", supportsRunPublicationToken: false, supportsAttemptCorrelation: true,
+    });
+    const unsupported = await requestWithDeps("/api/mappings", "POST", token, healthy, {
+      teamKey: "RFLNO-PUB", owner: "org", repo: "app", defaultBranch: "main",
+      reviewFixLifecycle: "restate",
+    });
+    expect(unsupported.statusCode).toBe(400);
+    expect(JSON.parse(unsupported.body).error).toContain("run_publication_token");
+    expect(JSON.parse(unsupported.body).error).toContain("Sync workflows");
+
+    resolveWorkflowCapabilitiesMock.mockRejectedValueOnce(new Error("secret probe detail"));
+    const failed = await requestWithDeps("/api/mappings", "POST", token, healthy, {
+      teamKey: "RFLPROBE", owner: "org", repo: "app", defaultBranch: "main",
+      reviewFixLifecycle: "restate",
+    });
+    expect(failed.statusCode).toBe(400);
+    expect(failed.body).not.toContain("secret probe detail");
+    expect(JSON.parse(failed.body).error).toContain("could not read");
+    expect(JSON.parse(failed.body).error).toContain("GitHub App installation");
+  });
+
+  it("does not write reviewFixLifecycle='restate' when a save is rejected — the mapping keeps its prior Legacy selection", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", {
+      teamKey: "RFLKEEP", owner: "org", repo: "app",
+      reviewFixLifecycle: "legacy",
+    }, token);
+
+    const rejected = await request("/api/mappings", "POST", "secret", {
+      teamKey: "RFLKEEP", owner: "org", repo: "app",
+      executionMode: "fly-machines",
+      reviewFixLifecycle: "restate",
+    }, token);
+    expect(rejected.statusCode).toBe(400);
+
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    expect(JSON.parse(list.body).RFLKEEP.reviewFixLifecycle).toBe("legacy");
+    expect(JSON.parse(list.body).RFLKEEP.executionMode).toBe("github-actions");
+  });
+
   it("round-trips a reviewers array, including an empty one", async () => {
     const token = await login("secret");
     const selection = [
@@ -1786,7 +2053,7 @@ describe("admin runner-mode", () => {
 });
 
 describe("admin kg materialize-mode", () => {
-  const kgRefreshDeps = { trigger: vi.fn(), status: vi.fn(), onMachineLost: vi.fn() };
+  const kgRefreshDeps = { trigger: vi.fn(), status: vi.fn(), cancel: vi.fn() };
 
   beforeEach(() => {
     delete process.env.KG_MATERIALIZE_DIRECT;
@@ -1861,21 +2128,13 @@ describe("admin kg materialize-mode", () => {
     expect(res.statusCode).toBe(400);
   });
 
-  it("POST /api/kg/materialize-mode returns 409 when KG_MATERIALIZE_DIRECT env var is set", async () => {
+  it("POST /api/kg/materialize-mode answers 200 and persists even when KG_MATERIALIZE_DIRECT is set (AII-1109)", async () => {
     process.env.KG_MATERIALIZE_DIRECT = "true";
     const token = await login("secret");
     const res = await kgRequest("/api/kg/materialize-mode", "POST", token, { direct: false });
-    expect(res.statusCode).toBe(409);
-    const body = JSON.parse(res.body);
-    expect(body.error).toContain("KG_MATERIALIZE_DIRECT env var");
-    expect(body.persisted).toBe(false);
-    // Runtime value is still locked by the env var
-    expect(body.direct).toBe(true);
-    expect(body.source).toBe("env");
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ direct: false, source: "db" });
 
-    // And the DB write actually happened — clearing the env var should
-    // surface the persisted value.
-    delete process.env.KG_MATERIALIZE_DIRECT;
     const get = await kgRequest("/api/kg/materialize-mode", "GET", token);
     expect(JSON.parse(get.body).direct).toBe(false);
   });
@@ -1893,11 +2152,12 @@ describe("admin kg refresh dry-run (AII-635)", () => {
   const kgRefreshDeps = {
     trigger: vi.fn(async (_opts?: { dryRun?: boolean }) => ({ status: 202, body: { accepted: true } })),
     status: vi.fn(),
-    onMachineLost: vi.fn(),
+    cancel: vi.fn(),
   };
 
   beforeEach(() => {
     kgRefreshDeps.trigger.mockClear();
+    kgRefreshDeps.status.mockReset();
   });
 
   // The listed SSO admin the suite seeds (see adminConfig): an identity-bearing session.
@@ -1982,13 +2242,67 @@ describe("admin kg refresh dry-run (AII-635)", () => {
     expect(JSON.parse(res.body)).toMatchObject({ dryRun: true, acceptNewBaseline: true });
   });
 
+  it.each([
+    [409, { error: "refresh-in-progress" }],
+    [501, { error: "kg-source-not-configured" }],
+    [422, { error: "preflight-failed", detail: "x" }],
+    [507, { error: "insufficient-storage" }],
+  ])("POST /api/kg/refresh passes a %i tool answer through with its body (AII-901)", async (status, body) => {
+    kgRefreshDeps.trigger.mockResolvedValueOnce({ status, body } as never);
+    const token = await login("secret");
+    const res = await kgRequest("/api/kg/refresh", "POST", token);
+    expect(res.statusCode).toBe(status);
+    expect(JSON.parse(res.body)).toMatchObject(body);
+  });
+
+  it("POST /api/kg/refresh answers 202 { refreshing, triggerId } after a submit", async () => {
+    kgRefreshDeps.trigger.mockResolvedValueOnce({ status: 202, body: { refreshing: true, triggerId: "t-1" } } as never);
+    const token = await login("secret");
+    const res = await kgRequest("/api/kg/refresh", "POST", token);
+    expect(res.statusCode).toBe(202);
+    expect(JSON.parse(res.body)).toMatchObject({ refreshing: true, triggerId: "t-1" });
+  });
+
+  it("POST /api/kg/refresh answers 503 restate-unavailable with the body untouched", async () => {
+    kgRefreshDeps.trigger.mockResolvedValueOnce({ status: 503, body: { error: "restate-unavailable" } } as never);
+    const token = await login("secret");
+    const res = await kgRequest("/api/kg/refresh", "POST", token, { dryRun: true });
+    expect(res.statusCode).toBe(503);
+    expect(JSON.parse(res.body)).toEqual({ error: "restate-unavailable" });
+  });
+
+  it("a second quick POST /api/kg/refresh answers 409 refresh-in-progress (one workflow: KgRepo.trigger's live-refresh answer, pinned in tools.test.ts)", async () => {
+    kgRefreshDeps.trigger
+      .mockResolvedValueOnce({ status: 202, body: { refreshing: true, triggerId: "t-1" } } as never)
+      .mockResolvedValueOnce({ status: 409, body: { error: "refresh-in-progress" } } as never);
+    const token = await login("secret");
+    const first = await kgRequest("/api/kg/refresh", "POST", token);
+    const second = await kgRequest("/api/kg/refresh", "POST", token);
+    expect(first.statusCode).toBe(202);
+    expect(second.statusCode).toBe(409);
+    expect(JSON.parse(second.body)).toMatchObject({ error: "refresh-in-progress" });
+  });
+
+  it("GET /api/kg/status keeps the status body shape, and answers 503 when unavailable", async () => {
+    kgRefreshDeps.status
+      .mockResolvedValueOnce({ status: 200, body: { stage: "idle", lastRefresh: null } })
+      .mockResolvedValueOnce({ status: 503, body: { error: "restate-unavailable" } });
+    const token = await login("secret");
+    const ok = await kgRequest("/api/kg/status", "GET", token);
+    expect(ok.statusCode).toBe(200);
+    expect(JSON.parse(ok.body)).toEqual({ stage: "idle", lastRefresh: null });
+    const down = await kgRequest("/api/kg/status", "GET", token);
+    expect(down.statusCode).toBe(503);
+    expect(JSON.parse(down.body)).toEqual({ error: "restate-unavailable" });
+  });
+
   it("the Deployments page carries the Dry-run refresh button and the last-dry-run block", async () => {
-    const page = await import("../admin-ui/pages/deployments.js");
-    expect(page.deploymentsHtml).toContain('id="kg-dry-run-btn"');
-    expect(page.deploymentsHtml).toContain("window.triggerKgRefresh(true)");
-    expect(page.deploymentsHtml).toContain('id="kg-dry-run-last"');
-    expect(page.deploymentsScript).toContain("JSON.stringify({ dryRun: true })");
-    expect(page.deploymentsScript).toContain("function renderKgDryRun(");
+    const page = await import("../admin-ui/pages/kg-pipelines.js");
+    expect(page.kgPipelinesHtml).toContain('id="kg-dry-run-btn"');
+    expect(page.kgPipelinesHtml).toContain("window.triggerKgRefresh(true)");
+    expect(page.kgPipelinesHtml).toContain('id="kg-dry-run-last"');
+    expect(page.kgPipelinesScript).toContain("JSON.stringify({ dryRun: true })");
+    expect(page.kgPipelinesScript).toContain("function renderKgDryRun(");
   });
 });
 
@@ -2996,7 +3310,7 @@ describe("admin local job logs endpoint", () => {
 describe("admin dedup", () => {
   it("lists dedup entries", async () => {
     const token = await login("secret");
-    dedup.markDispatched("issue-1", "T-1", "Test issue");
+    dedup.markDispatched("issue-1", "TEAM", "T-1", "Test issue");
     const res = await request("/api/dedup", "GET", "secret", undefined, token);
     expect(res.statusCode).toBe(200);
     const entries = JSON.parse(res.body);
@@ -3006,7 +3320,7 @@ describe("admin dedup", () => {
 
   it("deletes a dedup entry", async () => {
     const token = await login("secret");
-    dedup.markDispatched("issue-del");
+    dedup.markDispatched("issue-del", "TEAM");
     const del = await request("/api/dedup/issue-del", "DELETE", "secret", undefined, token);
     expect(del.statusCode).toBe(200);
     expect(dedup.isAlreadyDispatched("issue-del")).toBe(false);
@@ -3054,6 +3368,7 @@ describe("admin issues endpoint", () => {
       readyForImplementation: [ready],
       needsPlanning: [needsPlan],
       inProgressCountsByScope: { CORE: 2 },
+      parentsToFinalize: [],
     });
     const token = await login("secret");
     const res = await request("/api/issues", "GET", "secret", undefined, token);
@@ -3080,6 +3395,7 @@ describe("admin issues endpoint", () => {
       readyForImplementation: [mapped],
       needsPlanning: [unmapped],
       inProgressCountsByScope: {},
+      parentsToFinalize: [],
     });
     const res = await request("/api/issues", "GET", "secret", undefined, token);
     expect(res.statusCode).toBe(200);
@@ -3186,6 +3502,7 @@ describe("admin blockers endpoint", () => {
       readyForImplementation: [issue],
       needsPlanning: [],
       inProgressCountsByScope: {},
+      parentsToFinalize: [],
     });
     const token = await login("secret");
     // No mapping for CORE team → should produce a no-mapping blocker
@@ -3199,16 +3516,68 @@ describe("admin blockers endpoint", () => {
     expect(body.totals.issues).toBe(1);
   });
 
+  it("lists a parked issue as parked for the phase it would run next, and no other phase", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", { teamKey: "CORE", owner: "org", repo: "core", planningWorkflowFile: "claude-plan.yml" }, token);
+    const { initDispatchBreakerTable, parkIssue } = await import("../dispatch-breaker.js");
+    initDispatchBreakerTable();
+    const mk = (id: string, identifier: string): TicketIssue => ({ id, identifier, title: identifier, description: null, scopeKey: "CORE", nativeStatus: "Todo" });
+    parkIssue("impl-1", "implementation", "x");
+    parkIssue("plan-1", "planning", "x");
+    parkIssue("plan-2", "implementation", "x"); // wrong phase for a needsPlanning issue
+    dedup.markDispatched("impl-1", "TEAM", "CORE-1", "t"); // parked wins over dedup
+    vi.spyOn(provider, "fetchAIImplementSnapshot").mockResolvedValueOnce({
+      readyForImplementation: [mk("impl-1", "CORE-1")],
+      needsPlanning: [mk("plan-1", "CORE-2"), mk("plan-2", "CORE-3")],
+      inProgressCountsByScope: {},
+      parentsToFinalize: [],
+    });
+    const res = await request("/api/blockers", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.blockers.map((b: { issueIdentifier: string; reason: string }) => [b.issueIdentifier, b.reason])).toEqual([
+      ["CORE-1", "parked"],
+      ["CORE-2", "parked"],
+    ]);
+    expect(body.totals.byReason.parked).toBe(2);
+  });
+
+  it("lists a Linear issue whose key belongs to a Jira mapping as no-mapping, and keeps it off /api/issues", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", {
+      teamKey: "ENG", owner: "org", repo: "eng",
+      ticketingProvider: "jira",
+      ticketingConfig: { kind: "jira", jql: "project = ENG", repoFieldValue: "org/eng" },
+    }, token);
+    const linearIssue: TicketIssue = { id: "lin-1", identifier: "ENG-7", title: "Linear issue", description: null, scopeKey: "ENG", nativeStatus: "Todo" };
+    const snapshot = { readyForImplementation: [linearIssue], needsPlanning: [], inProgressCountsByScope: {}, parentsToFinalize: [] };
+    vi.spyOn(provider, "fetchAIImplementSnapshot").mockResolvedValue(snapshot);
+    const res = await request("/api/blockers", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.blockers).toHaveLength(1);
+    expect(body.blockers[0]).toMatchObject({
+      issueIdentifier: "ENG-7",
+      teamKey: "ENG",
+      reason: "no-mapping",
+      detail: "Mapping ENG is a jira mapping; this linear issue has no linear mapping.",
+      issueUrl: null,
+    });
+    const issues = await request("/api/issues", "GET", "secret", undefined, token);
+    expect(JSON.parse(issues.body).issues).toEqual([]);
+  });
+
   it("resolves issueUrl through the team's ticketing provider; a no-mapping blocker has none", async () => {
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "CORE", owner: "org", repo: "core", planningWorkflowFile: "claude-plan.yml" }, token);
     const dedupBlocked: TicketIssue = { id: "issue-1", identifier: "CORE-100", title: "Already dispatched", description: null, scopeKey: "CORE", nativeStatus: "Todo" };
     const unmapped: TicketIssue = { id: "issue-2", identifier: "ZZZ-1", title: "No mapping", description: null, scopeKey: "ZZZ", nativeStatus: "Todo" };
-    dedup.markDispatched("issue-1", "CORE-100", "Already dispatched");
+    dedup.markDispatched("issue-1", "TEAM", "CORE-100", "Already dispatched");
     vi.spyOn(provider, "fetchAIImplementSnapshot").mockResolvedValueOnce({
       readyForImplementation: [dedupBlocked, unmapped],
       needsPlanning: [],
       inProgressCountsByScope: {},
+      parentsToFinalize: [],
     });
     const res = await request("/api/blockers", "GET", "secret", undefined, token);
     expect(res.statusCode).toBe(200);
@@ -3217,6 +3586,63 @@ describe("admin blockers endpoint", () => {
       ["dedup", "CORE-100", "https://fake/issue/CORE-100"],
       ["no-mapping", "ZZZ-1", null],
     ]);
+  });
+
+  it("reports capacityByMapping from unreleased dispatch_admissions reservations, and the concurrency blocker's used/cap matches it exactly — ignoring a stale tracker-label snapshot", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", { teamKey: "CORE", owner: "org", repo: "core", maxInProgressAiIssues: 1, planningWorkflowFile: "claude-plan.yml" }, token);
+
+    const admission = await import("../dispatch-admission.js");
+    const acquired = admission.acquire({
+      dispatchId: "res-core-1",
+      mappingKey: "CORE",
+      scope: { kind: "issue", issueScope: "CORE", issueId: "issue-held" },
+      kind: "implementation",
+      backend: "github-actions",
+      lifecycleOwner: { kind: "legacy" },
+      cap: 1,
+    });
+    expect(acquired.ok).toBe(true);
+
+    const candidate: TicketIssue = { id: "issue-2", identifier: "CORE-2", title: "Needs a slot", description: null, scopeKey: "CORE", nativeStatus: "Todo" };
+    vi.spyOn(provider, "fetchAIImplementSnapshot").mockResolvedValueOnce({
+      readyForImplementation: [candidate],
+      needsPlanning: [],
+      // A stale/never-advanced tracker-label snapshot reports the team idle — the
+      // response must not trust it.
+      inProgressCountsByScope: { CORE: 0 },
+      parentsToFinalize: [],
+    });
+
+    const res = await request("/api/blockers", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.capacityByMapping.CORE).toEqual({ used: 1, cap: 1, source: "reservations" });
+    const concurrencyBlocker = body.blockers.find((b: { reason: string }) => b.reason === "concurrency");
+    expect(concurrencyBlocker).toBeDefined();
+    expect(concurrencyBlocker.detail).toContain("(1/1)");
+  });
+
+  it("excludes kg-refresh reservations from capacityByMapping", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", { teamKey: "CORE", owner: "org", repo: "core", maxInProgressAiIssues: 1, planningWorkflowFile: "claude-plan.yml" }, token);
+
+    const admission = await import("../dispatch-admission.js");
+    const acquired = admission.acquire({
+      dispatchId: "res-core-kg",
+      mappingKey: "CORE",
+      scope: { kind: "issue", issueScope: "CORE", issueId: "issue-kg" },
+      kind: "kg-refresh",
+      backend: "github-actions",
+      lifecycleOwner: { kind: "legacy" },
+      cap: 1,
+    });
+    expect(acquired.ok).toBe(true);
+
+    const res = await request("/api/blockers", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.capacityByMapping.CORE).toEqual({ used: 0, cap: 1, source: "reservations" });
   });
 });
 
@@ -3467,11 +3893,11 @@ describe("github-install-state endpoint", () => {
 
   it("returns 200 with the probe result", async () => {
     const token = await login("secret");
-    vi.mocked(installState.probeInstallState).mockResolvedValueOnce({ state: "ready", installationId: 7 });
+    vi.mocked(installState.probeInstallState).mockResolvedValueOnce({ state: "ready" });
 
     const res = await request("/api/admin/github-install-state?owner=acme&repo=backend", "GET", "secret", undefined, token);
     expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body)).toEqual({ state: "ready", installationId: 7 });
+    expect(JSON.parse(res.body)).toEqual({ state: "ready" });
   });
 
   it("returns 500 when the probe throws (e.g. a rethrown credential error)", async () => {
@@ -3580,6 +4006,46 @@ describe("POST /api/tools/<name>", () => {
       name: "Reader",
     });
   }
+
+  it("answers 409 deploy-in-progress with deployStartedAt and never contacts the ingress during a hold", async () => {
+    const { setDeployHold, clearDeployHold } = await import("../deploy-hold.js");
+    const { callTool } = await vi.importActual<typeof import("../restate/tools-client.js")>("../restate/tools-client.js");
+    const fetchImpl = vi.fn();
+    setDeployHold();
+    try {
+      const token = await login("secret");
+      const res = await toolRequest(token, { args: {} }, {
+        callTool: (name, args, caller) => callTool(name, args, caller, { fetchImpl: fetchImpl as unknown as typeof fetch }),
+      });
+      expect(res.statusCode).toBe(409);
+      expect(JSON.parse(res.body)).toEqual({ error: "deploy-in-progress", deployStartedAt: expect.any(Number) });
+      expect(fetchImpl).not.toHaveBeenCalled();
+    } finally {
+      clearDeployHold();
+    }
+  });
+
+  it.each([
+    ["a refused connection", () => Promise.reject(new Error("ECONNREFUSED"))],
+    ["a 5xx answer", () => Promise.resolve(new Response("boom", { status: 503 }))],
+  ])("answers 503 restate-unavailable with no hold and %s", async (_label, fetchResult) => {
+    const { callTool } = await vi.importActual<typeof import("../restate/tools-client.js")>("../restate/tools-client.js");
+    const fetchImpl = vi.fn(fetchResult);
+    const token = await login("secret");
+    const res = await toolRequest(token, { args: {} }, {
+      callTool: (name, args, caller) => callTool(name, args, caller, { fetchImpl: fetchImpl as unknown as typeof fetch, permitsExternalCall: () => true }),
+    });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(res.statusCode).toBe(503);
+    expect(JSON.parse(res.body)).toEqual({ error: "restate-unavailable" });
+  });
+
+  it("answers 503 restate-unavailable when callTool reports an outage", async () => {
+    const token = await login("secret");
+    const res = await toolRequest(token, { args: {} }, { callTool: async () => ({ status: "unavailable" }) });
+    expect(res.statusCode).toBe(503);
+    expect(JSON.parse(res.body)).toEqual({ error: "restate-unavailable" });
+  });
 
   it("rejects an unauthenticated request with the route's existing 401, without calling the tool", async () => {
     const called = vi.fn();
@@ -3810,6 +4276,448 @@ describe("POST /api/tools/<name>", () => {
   });
 });
 
+describe("Review-fix attempt evidence + recovery actions (AII-806)", () => {
+  const ATTEMPT_DETAIL: AdminModule.ReviewFixAttemptDetail = {
+    attemptId: "attempt-1",
+    owner: { kind: "restate", attemptId: "attempt-1" },
+    execution: { githubRunId: "123", githubRunAttempt: 1 },
+    deadlineAt: 1_700_000_000_000,
+    pendingFeedback: false,
+    snapshot: { taskText: "fix the thing", findings: [{ findingKey: "f1", version: 2 }] },
+    state: "launched",
+    evidenceComplete: false,
+    terminationConfirmed: false,
+    cycles: [],
+  };
+
+  /** Admitted by the domain seed, so a `user` rather than an admin — same shape as the
+   *  POST /api/tools/<name> block above. */
+  function userSession(): string {
+    return adminSession.createSession({
+      email: "reader@eudoxus.ai",
+      sub: "google|reader",
+      provider: "google",
+      name: "Reader",
+    });
+  }
+
+  function fakeFacade(overrides: Partial<AdminModule.ReviewFixAttemptsFacade> = {}): AdminModule.ReviewFixAttemptsFacade {
+    return {
+      getAttempt: async () => ({ status: "not_found" }),
+      getActivity: async () => ({ status: "not_found" }),
+      reconcile: async () => ({ status: "accepted" }),
+      adopt: async () => ({ status: "accepted" }),
+      revokeAuthority: async () => ({ status: "accepted" }),
+      requestCancellation: async () => ({ status: "accepted" }),
+      ...overrides,
+    };
+  }
+
+  const READ_ROUTES = [
+    ["/api/review-fix/attempts/attempt-1", "GET"],
+    ["/api/review-fix/attempts/attempt-1/activity", "GET"],
+  ] as const;
+  const WRITE_ROUTES = [
+    ["/api/review-fix/attempts/attempt-1/reconcile", "POST"],
+    ["/api/review-fix/attempts/attempt-1/adopt", "POST"],
+    ["/api/review-fix/attempts/attempt-1/cancel", "POST"],
+  ] as const;
+  const ALL_ROUTES = [...READ_ROUTES, ...WRITE_ROUTES];
+
+  it.each(ALL_ROUTES)("answers 501 for %s %s when reviewFixAttempts is not configured", async (url, method) => {
+    const token = await login("secret");
+    const res = await requestWithDeps(url, method, token, {});
+    expect(res.statusCode).toBe(501);
+  });
+
+  it.each(ALL_ROUTES)("rejects an unauthenticated request to %s %s with 401, without calling the facade", async (url, method) => {
+    const called = vi.fn();
+    const facade = fakeFacade({
+      getAttempt: async () => { called(); return { status: "not_found" }; },
+      getActivity: async () => { called(); return { status: "not_found" }; },
+      reconcile: async () => { called(); return { status: "accepted" }; },
+      adopt: async () => { called(); return { status: "accepted" }; },
+      revokeAuthority: async () => { called(); return { status: "accepted" }; },
+    });
+    const res = await requestWithDeps(url, method, "not-a-session", { reviewFixAttempts: facade });
+    expect(res.statusCode).toBe(401);
+    expect(called).not.toHaveBeenCalled();
+  });
+
+  it.each(WRITE_ROUTES)("rejects a non-admin (user-role) request to %s %s with 403, without calling the facade", async (url, method) => {
+    const called = vi.fn();
+    const facade = fakeFacade({
+      reconcile: async () => { called(); return { status: "accepted" }; },
+      adopt: async () => { called(); return { status: "accepted" }; },
+      revokeAuthority: async () => { called(); return { status: "accepted" }; },
+    });
+    const res = await requestWithDeps(url, method, userSession(), { reviewFixAttempts: facade }, { githubRunId: "1", githubRunAttempt: 1 });
+    expect(res.statusCode).toBe(403);
+    expect(called).not.toHaveBeenCalled();
+  });
+
+  describe("GET /api/review-fix/attempts/:attemptId", () => {
+    it("is reachable by a non-admin user session (reads are open, scope is enforced inside the facade)", async () => {
+      const res = await requestWithDeps(
+        "/api/review-fix/attempts/attempt-1",
+        "GET",
+        userSession(),
+        { reviewFixAttempts: fakeFacade({ getAttempt: async () => ({ status: "ok", attempt: ATTEMPT_DETAIL }) }) },
+      );
+      expect(res.statusCode).toBe(200);
+    });
+
+    it("returns the attempt detail with explicit evidenceComplete/terminationConfirmed fields, never omitted", async () => {
+      const token = await login("secret");
+      const res = await requestWithDeps(
+        "/api/review-fix/attempts/attempt-1",
+        "GET",
+        token,
+        { reviewFixAttempts: fakeFacade({ getAttempt: async () => ({ status: "ok", attempt: ATTEMPT_DETAIL }) }) },
+      );
+      expect(res.statusCode).toBe(200);
+      const body = JSON.parse(res.body);
+      expect(body).toHaveProperty("evidenceComplete", false);
+      expect(body).toHaveProperty("terminationConfirmed", false);
+      expect(body).toEqual(ATTEMPT_DETAIL);
+    });
+
+    it("maps a facade \"unavailable\" result to 503 restate-unavailable", async () => {
+      const token = await login("secret");
+      const res = await requestWithDeps(
+        "/api/review-fix/attempts/attempt-1",
+        "GET",
+        token,
+        { reviewFixAttempts: fakeFacade({ getAttempt: async () => ({ status: "unavailable" }) }) },
+      );
+      expect(res.statusCode).toBe(503);
+      expect(JSON.parse(res.body)).toEqual({ error: "restate-unavailable" });
+    });
+
+    it("passes the caller's role and email through to the facade", async () => {
+      let captured: AdminModule.ReviewFixAttemptCaller | undefined;
+      await requestWithDeps(
+        "/api/review-fix/attempts/attempt-1",
+        "GET",
+        userSession(),
+        { reviewFixAttempts: fakeFacade({ getAttempt: async (_id, caller) => { captured = caller; return { status: "not_found" }; } }) },
+      );
+      expect(captured).toEqual({ role: "user", email: "reader@eudoxus.ai" });
+    });
+
+    // Scope isolation: a nonexistent id and an id outside the caller's authorized scope
+    // must be indistinguishable from the outside — both are the facade's own "not_found",
+    // and the route must not add any extra information that would let a caller tell them
+    // apart by probing IDs.
+    it("returns the identical 404 status/body for a nonexistent id and an out-of-scope id", async () => {
+      const token = await login("secret");
+      const facade = fakeFacade({
+        getAttempt: async (attemptId) => {
+          if (attemptId === "unknown-id" || attemptId === "other-scope-id") return { status: "not_found" };
+          return { status: "ok", attempt: ATTEMPT_DETAIL };
+        },
+      });
+      const badId = await requestWithDeps("/api/review-fix/attempts/unknown-id", "GET", token, { reviewFixAttempts: facade });
+      const outOfScope = await requestWithDeps("/api/review-fix/attempts/other-scope-id", "GET", token, { reviewFixAttempts: facade });
+      expect(badId.statusCode).toBe(404);
+      expect(badId).toEqual(outOfScope);
+      expect(JSON.parse(badId.body)).toEqual({ error: "not_found" });
+    });
+  });
+
+  describe("GET /api/review-fix/attempts/:attemptId/activity", () => {
+    const PAGE: AdminModule.ReviewFixActivityPage = {
+      events: [
+        { producerId: "runner", sequence: 1, cycle: 1, kind: "tool_start", occurredAt: 1, payload: "{}", truncated: false, byteCount: 2 },
+      ],
+      nextCursor: { producerId: "runner", sequence: 2 },
+      truncated: true,
+    };
+
+    it("passes cursor and pageSize query params through to the facade", async () => {
+      const token = await login("secret");
+      let capturedOpts: { cursor?: AdminModule.ReviewFixActivityCursor; pageSize?: number } | undefined;
+      await requestWithDeps(
+        "/api/review-fix/attempts/attempt-1/activity?pageSize=25&cursorProducerId=runner&cursorSequence=7",
+        "GET",
+        token,
+        { reviewFixAttempts: fakeFacade({ getActivity: async (_id, opts) => { capturedOpts = opts; return { status: "ok", page: PAGE }; } }) },
+      );
+      expect(capturedOpts).toEqual({ cursor: { producerId: "runner", sequence: 7 }, pageSize: 25 });
+    });
+
+    it("defaults and caps activity pages before calling the facade", async () => {
+      const token = await login("secret");
+      const sizes: number[] = [];
+      const facade = fakeFacade({ getActivity: async (_id, opts) => {
+        sizes.push(opts.pageSize ?? -1);
+        return { status: "ok", page: PAGE };
+      } });
+      await requestWithDeps("/api/review-fix/attempts/attempt-1/activity", "GET", token, { reviewFixAttempts: facade });
+      await requestWithDeps("/api/review-fix/attempts/attempt-1/activity?pageSize=100000", "GET", token, { reviewFixAttempts: facade });
+      expect(sizes).toEqual([100, 500]);
+    });
+
+    it.each(["pageSize=0", "pageSize=-1", "pageSize=1.5", "pageSize=oops", "cursorProducerId=runner", "cursorSequence=1", "cursorProducerId=runner&cursorSequence=-1", "cursorProducerId=runner&cursorSequence=1.5", "cursorProducerId=runner&cursorSequence=oops"])(
+      "rejects malformed activity query %s before calling the facade",
+      async (query) => {
+        const token = await login("secret");
+        const called = vi.fn();
+        const res = await requestWithDeps(`/api/review-fix/attempts/attempt-1/activity?${query}`, "GET", token, {
+          reviewFixAttempts: fakeFacade({ getActivity: async () => { called(); return { status: "ok", page: PAGE }; } }),
+        });
+        expect(res.statusCode).toBe(400);
+        expect(called).not.toHaveBeenCalled();
+      },
+    );
+
+    it("passes a truncated page through untouched — not summarized away", async () => {
+      const token = await login("secret");
+      const res = await requestWithDeps(
+        "/api/review-fix/attempts/attempt-1/activity",
+        "GET",
+        token,
+        { reviewFixAttempts: fakeFacade({ getActivity: async () => ({ status: "ok", page: PAGE }) }) },
+      );
+      expect(res.statusCode).toBe(200);
+      expect(JSON.parse(res.body)).toEqual(PAGE);
+    });
+
+    it("maps a facade \"unavailable\" result to 503 restate-unavailable", async () => {
+      const token = await login("secret");
+      const res = await requestWithDeps(
+        "/api/review-fix/attempts/attempt-1/activity",
+        "GET",
+        token,
+        { reviewFixAttempts: fakeFacade({ getActivity: async () => ({ status: "unavailable" }) }) },
+      );
+      expect(res.statusCode).toBe(503);
+    });
+  });
+
+  describe("POST /api/review-fix/attempts/:attemptId/reconcile", () => {
+    it("answers 202 when the facade accepts", async () => {
+      const token = await login("secret");
+      const res = await requestWithDeps(
+        "/api/review-fix/attempts/attempt-1/reconcile",
+        "POST",
+        token,
+        { reviewFixAttempts: fakeFacade({ reconcile: async () => ({ status: "accepted" }) }) },
+      );
+      expect(res.statusCode).toBe(202);
+      expect(JSON.parse(res.body)).toEqual({ status: "accepted" });
+    });
+
+    it("answers 202 with an explicit durable-acceptance body when Restate is unavailable, never a generic 500", async () => {
+      const token = await login("secret");
+      const res = await requestWithDeps(
+        "/api/review-fix/attempts/attempt-1/reconcile",
+        "POST",
+        token,
+        { reviewFixAttempts: fakeFacade({ reconcile: async () => ({ status: "unavailable" }) }) },
+      );
+      expect(res.statusCode).toBe(202);
+      const body = JSON.parse(res.body);
+      expect(body.status).toBe("durable-accepted");
+      expect(typeof body.detail).toBe("string");
+    });
+
+    it("answers 409 with the facade's reason when rejected", async () => {
+      const token = await login("secret");
+      const res = await requestWithDeps(
+        "/api/review-fix/attempts/attempt-1/reconcile",
+        "POST",
+        token,
+        { reviewFixAttempts: fakeFacade({ reconcile: async () => ({ status: "rejected", reason: "already_terminal" }) }) },
+      );
+      expect(res.statusCode).toBe(409);
+      expect(JSON.parse(res.body)).toEqual({ error: "already_terminal", status: "rejected" });
+    });
+  });
+
+  describe("POST /api/review-fix/attempts/:attemptId/adopt", () => {
+    it("answers 400 and never calls the facade when the body is missing the execution reference", async () => {
+      const token = await login("secret");
+      const called = vi.fn();
+      const res = await requestWithDeps(
+        "/api/review-fix/attempts/attempt-1/adopt",
+        "POST",
+        token,
+        { reviewFixAttempts: fakeFacade({ adopt: async () => { called(); return { status: "accepted" }; } }) },
+        {},
+      );
+      expect(res.statusCode).toBe(400);
+      expect(called).not.toHaveBeenCalled();
+    });
+
+    it("answers 400 on malformed JSON, never calling the facade", async () => {
+      const token = await login("secret");
+      const called = vi.fn();
+      const req = new MockRequest("/api/review-fix/attempts/attempt-1/adopt", "POST", { authorization: `Bearer ${token}` }, "{not json");
+      const res = new MockResponse();
+      admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider), {
+        reviewFixAttempts: fakeFacade({ adopt: async () => { called(); return { status: "accepted" }; } }),
+      });
+      await res.done;
+      expect(res.statusCode).toBe(400);
+      expect(called).not.toHaveBeenCalled();
+    });
+
+    it.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY])("rejects invalid GitHub run attempt %s", async (githubRunAttempt) => {
+      const token = await login("secret");
+      const called = vi.fn();
+      const res = await requestWithDeps("/api/review-fix/attempts/attempt-1/adopt", "POST", token, {
+        reviewFixAttempts: fakeFacade({ adopt: async () => { called(); return { status: "accepted" }; } }),
+      }, { githubRunId: "999", githubRunAttempt });
+      expect(res.statusCode).toBe(400);
+      expect(called).not.toHaveBeenCalled();
+    });
+
+    it("handles a failed request-body read without invoking adoption", async () => {
+      const token = await login("secret");
+      const called = vi.fn();
+      const req = new MockRequest("/api/review-fix/attempts/attempt-1/adopt", "POST", { authorization: `Bearer ${token}` });
+      const res = new MockResponse();
+      admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider), {
+        reviewFixAttempts: fakeFacade({ adopt: async () => { called(); return { status: "accepted" }; } }),
+      });
+      req.emit("error", new Error("connection dropped"));
+      await res.done;
+      expect(res.statusCode).toBe(400);
+      expect(called).not.toHaveBeenCalled();
+    });
+
+    it("passes the caller-supplied execution reference to the facade and answers 202 on a verified match", async () => {
+      const token = await login("secret");
+      let capturedExecution: AdminModule.ReviewFixAttemptExecutionRef | undefined;
+      const res = await requestWithDeps(
+        "/api/review-fix/attempts/attempt-1/adopt",
+        "POST",
+        token,
+        { reviewFixAttempts: fakeFacade({ adopt: async (_id, execution) => { capturedExecution = execution; return { status: "accepted" }; } }) },
+        { githubRunId: "999", githubRunAttempt: 2 },
+      );
+      expect(res.statusCode).toBe(202);
+      expect(capturedExecution).toEqual({ githubRunId: "999", githubRunAttempt: 2 });
+    });
+
+    it("answers 422 and never flips ownership when the facade reports the execution unverified", async () => {
+      const token = await login("secret");
+      const res = await requestWithDeps(
+        "/api/review-fix/attempts/attempt-1/adopt",
+        "POST",
+        token,
+        { reviewFixAttempts: fakeFacade({ adopt: async () => ({ status: "unverified" }) }) },
+        { githubRunId: "999", githubRunAttempt: 2 },
+      );
+      expect(res.statusCode).toBe(422);
+      expect(JSON.parse(res.body)).toEqual({ error: "unverified", status: "unverified" });
+    });
+  });
+
+  describe("POST /api/review-fix/attempts/:attemptId/cancel", () => {
+    it("revokes authority before requesting cancellation, in that order", async () => {
+      const token = await login("secret");
+      const calls: string[] = [];
+      const res = await requestWithDeps(
+        "/api/review-fix/attempts/attempt-1/cancel",
+        "POST",
+        token,
+        {
+          reviewFixAttempts: fakeFacade({
+            revokeAuthority: async () => { calls.push("revoke"); return { status: "accepted" }; },
+            requestCancellation: async () => { calls.push("cancel"); return { status: "accepted" }; },
+          }),
+        },
+      );
+      expect(res.statusCode).toBe(202);
+      expect(calls).toEqual(["revoke", "cancel"]);
+    });
+
+    it("never requests cancellation when revoking authority is rejected, and surfaces the revoke outcome", async () => {
+      const token = await login("secret");
+      const calls: string[] = [];
+      const res = await requestWithDeps(
+        "/api/review-fix/attempts/attempt-1/cancel",
+        "POST",
+        token,
+        {
+          reviewFixAttempts: fakeFacade({
+            revokeAuthority: async () => { calls.push("revoke"); return { status: "rejected", reason: "already_terminal" }; },
+            requestCancellation: async () => { calls.push("cancel"); return { status: "accepted" }; },
+          }),
+        },
+      );
+      expect(res.statusCode).toBe(409);
+      expect(JSON.parse(res.body)).toEqual({ error: "already_terminal", status: "rejected" });
+      expect(calls).toEqual(["revoke"]);
+    });
+
+    it("never requests cancellation when revoking authority finds no such attempt", async () => {
+      const token = await login("secret");
+      const calls: string[] = [];
+      const res = await requestWithDeps(
+        "/api/review-fix/attempts/attempt-1/cancel",
+        "POST",
+        token,
+        {
+          reviewFixAttempts: fakeFacade({
+            revokeAuthority: async () => { calls.push("revoke"); return { status: "not_found" }; },
+            requestCancellation: async () => { calls.push("cancel"); return { status: "accepted" }; },
+          }),
+        },
+      );
+      expect(res.statusCode).toBe(404);
+      expect(calls).toEqual(["revoke"]);
+    });
+
+    it("reports partial cancellation and requires retry if only revocation was durably queued", async () => {
+      const token = await login("secret");
+      const calls: string[] = [];
+      const res = await requestWithDeps("/api/review-fix/attempts/attempt-1/cancel", "POST", token, {
+        reviewFixAttempts: fakeFacade({
+          revokeAuthority: async () => { calls.push("revoke"); return { status: "unavailable" }; },
+          requestCancellation: async () => { calls.push("cancel"); return { status: "accepted" }; },
+        }),
+      });
+      expect(res.statusCode).toBe(503);
+      expect(JSON.parse(res.body)).toMatchObject({ status: "partial", authorityRevocation: "durable-accepted", cancellation: "not-requested" });
+      expect(calls).toEqual(["revoke"]);
+    });
+
+    it("surfaces requestCancellation's durable-acceptance outcome when Restate is unavailable at that step", async () => {
+      const token = await login("secret");
+      const calls: string[] = [];
+      const res = await requestWithDeps(
+        "/api/review-fix/attempts/attempt-1/cancel",
+        "POST",
+        token,
+        {
+          reviewFixAttempts: fakeFacade({
+            revokeAuthority: async () => { calls.push("revoke"); return { status: "accepted" }; },
+            requestCancellation: async () => { calls.push("cancel"); return { status: "unavailable" }; },
+          }),
+        },
+      );
+      expect(res.statusCode).toBe(202);
+      expect(JSON.parse(res.body).status).toBe("durable-accepted");
+      expect(calls).toEqual(["revoke", "cancel"]);
+    });
+
+    it("reports an unconfirmed cancellation request after authority was revoked", async () => {
+      const token = await login("secret");
+      const res = await requestWithDeps("/api/review-fix/attempts/attempt-1/cancel", "POST", token, {
+        reviewFixAttempts: fakeFacade({
+          revokeAuthority: async () => ({ status: "accepted" }),
+          requestCancellation: async () => { throw new Error("connection dropped"); },
+        }),
+      });
+      expect(res.statusCode).toBe(503);
+      expect(JSON.parse(res.body)).toMatchObject({ status: "partial", authorityRevocation: "accepted", cancellation: "unconfirmed" });
+    });
+  });
+});
+
 describe("GET /api/deployment-status", () => {
   // The page reads this once per poll; every field it renders comes from here, so the
   // route is tested for shape and passthrough rather than for the values themselves.
@@ -3867,6 +4775,7 @@ describe("GET /api/deployment-status", () => {
       runningCommit: "abc1234",
       headCommit: "def5678",
       checkedAt: 1_700_000_000_000,
+      isDowngrade: false,
     });
     const token = await login("secret");
     const res = await statusRequest(token);
@@ -3884,6 +4793,7 @@ describe("GET /api/deployment-status", () => {
       runningCommit: "abc1234",
       headCommit: "abc1234",
       checkedAt: 1,
+      isDowngrade: false,
     });
     const token = await login("secret");
     const res = await statusRequest(token);
@@ -4032,6 +4942,119 @@ describe("POST /api/deploy-policy", () => {
   });
 });
 
+describe("/api/retention", () => {
+  async function retentionRequest(
+    token: string,
+    method: "GET" | "POST",
+    body: unknown,
+    apply = vi.fn(async (_days: number) => ({ applied: ["vol_1"], skipped: "" })),
+  ): Promise<{ statusCode: number; body: Record<string, unknown>; apply: typeof apply }> {
+    const retention = await import("../restate/retention.js");
+    const deps: Parameters<typeof admin.handleAdminRequest>[4] = {
+      retention: {
+        getRestateDays: retention.getRestateRetentionDays,
+        setRestateDays: retention.setRestateRetentionDays,
+        getVolumeDays: retention.getVolumeSnapshotRetentionDays,
+        setVolumeDays: retention.setVolumeSnapshotRetentionDays,
+        applyVolume: apply,
+        default: retention.RESTATE_RETENTION_DAYS_DEFAULT,
+        min: retention.RESTATE_RETENTION_DAYS_MIN,
+        max: retention.RESTATE_RETENTION_DAYS_MAX,
+      },
+    };
+    const req = new MockRequest("/api/retention", method, { authorization: `Bearer ${token}` }, body === undefined ? undefined : JSON.stringify(body));
+    const res = new MockResponse();
+    admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider), deps);
+    await res.done;
+    return { statusCode: res.statusCode, body: res.body ? JSON.parse(res.body) : {}, apply };
+  }
+
+  it("answers 501 on GET and POST when retention is not configured", async () => {
+    const token = await login("secret");
+    for (const method of ["GET", "POST"] as const) {
+      const req = new MockRequest("/api/retention", method, { authorization: `Bearer ${token}` }, method === "POST" ? JSON.stringify({ restate: 10 }) : undefined);
+      const res = new MockResponse();
+      admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider), {});
+      await res.done;
+      expect(res.statusCode).toBe(501);
+    }
+  });
+
+  it("rejects an unauthenticated request", async () => {
+    expect((await retentionRequest("not-a-session", "POST", { restate: 10 })).statusCode).toBe(401);
+  });
+
+  it("refuses a non-admin session as /api/deploy-policy does", async () => {
+    const user = adminSession.createSession({ email: "reader@eudoxus.ai", sub: "google|reader", provider: "google", name: "Reader" });
+    const policy = new MockRequest("/api/deploy-policy", "POST", { authorization: `Bearer ${user}` }, JSON.stringify({ autoDeploy: true }));
+    const policyRes = new MockResponse();
+    admin.handleAdminRequest(policy as never, policyRes as never, adminConfig("secret"), makeFakeRegistry(provider), {});
+    await policyRes.done;
+
+    const res = await retentionRequest(user, "POST", { volume: 20 });
+    expect(res.statusCode).toBe(policyRes.statusCode);
+    expect(res.statusCode).toBe(403);
+    expect(res.apply).not.toHaveBeenCalled();
+  });
+
+  it("answers the fresh-database shape on GET", async () => {
+    const token = await login("secret");
+    const res = await retentionRequest(token, "GET", undefined);
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toEqual({
+      restate: { days: 14, appliesAt: "next deploy or restart" },
+      volume: { days: 14, lastApplied: null },
+      default: 14,
+      min: 1,
+      max: 60,
+    });
+  });
+
+  it("answers 400 naming restate_retention_days for 61 and stores nothing", async () => {
+    const token = await login("secret");
+    const retention = await import("../restate/retention.js");
+    const res = await retentionRequest(token, "POST", { restate: 61 });
+    expect(res.statusCode).toBe(400);
+    expect(String(res.body.error)).toContain("restate_retention_days");
+    expect(retention.getRestateRetentionDays()).toBe(14);
+  });
+
+  it("stores neither value when one of two is bad, and rejects non-integers", async () => {
+    const token = await login("secret");
+    const retention = await import("../restate/retention.js");
+    const mixed = await retentionRequest(token, "POST", { restate: 10, volume: 99 });
+    expect(mixed.statusCode).toBe(400);
+    expect(String(mixed.body.error)).toContain("volume_snapshot_retention_days");
+    expect(retention.getRestateRetentionDays()).toBe(14);
+    expect(mixed.apply).not.toHaveBeenCalled();
+    expect((await retentionRequest(token, "POST", { restate: "10" })).statusCode).toBe(400);
+    expect((await retentionRequest(token, "POST", { volume: 2.5 })).statusCode).toBe(400);
+  });
+
+  it("stores volume, applies it once, and reports lastApplied", async () => {
+    const token = await login("secret");
+    const retention = await import("../restate/retention.js");
+    const res = await retentionRequest(token, "POST", { volume: 20 });
+    expect(res.statusCode).toBe(200);
+    expect(retention.getVolumeSnapshotRetentionDays()).toBe(20);
+    expect(res.apply).toHaveBeenCalledTimes(1);
+    expect(res.apply).toHaveBeenCalledWith(20);
+    const volume = res.body.volume as { days: number; lastApplied: { at: number; applied: string[]; skipped: string } };
+    expect(volume.days).toBe(20);
+    expect(volume.lastApplied).toMatchObject({ applied: ["vol_1"], skipped: "" });
+    expect(typeof volume.lastApplied.at).toBe("number");
+  });
+
+  it("stores restate without applying the volume", async () => {
+    const token = await login("secret");
+    const retention = await import("../restate/retention.js");
+    const res = await retentionRequest(token, "POST", { restate: 10 });
+    expect(res.statusCode).toBe(200);
+    expect(retention.getRestateRetentionDays()).toBe(10);
+    expect(res.apply).toHaveBeenCalledTimes(0);
+  });
+});
+
 describe("per-page grants", () => {
   /** Admitted by the domain seed, so a `user` rather than an admin. */
   function userSession(): string {
@@ -4115,6 +5138,49 @@ describe("per-page grants", () => {
       accessGrants.savePageGrants(["audit", "reports"], "ada@eudoxus.ai");
       const res = await request("/api/session-identity", "GET", "secret", undefined, userSession());
       expect(JSON.parse(res.body)).toMatchObject({ role: "user", grantedPages: ["audit", "reports"] });
+    });
+  });
+
+  describe("journal grant", () => {
+    const journalFetch = vi.fn();
+    const journalDeps = {
+      readJournal: (query: Record<string, string>) => journalModule.handleJournalRequest(query, { fetchImpl: journalFetch as never }),
+    };
+    let journalModule: typeof import("../restate/journal-query.js");
+    beforeEach(async () => {
+      journalFetch.mockReset();
+      journalModule = await import("../restate/journal-query.js");
+    });
+
+    it("answers 400 on a bad lookup and never calls the admin API", async () => {
+      const res = await requestWithDeps("/api/restate/journal?service=KgRefresh&key=x'y", "GET", adminSsoSession(), journalDeps);
+      expect(res.statusCode).toBe(400);
+      expect(JSON.parse(res.body).error).toMatch(/^key/);
+      expect(journalFetch).not.toHaveBeenCalled();
+    });
+
+    it("refuses a user with no grant, and admits one with the grant despite the query string", async () => {
+      const path = "/api/restate/journal?service=KgRefresh&key=abc";
+      expect((await requestWithDeps(path, "GET", userSession(), journalDeps)).statusCode).toBe(403);
+      accessGrants.savePageGrants(["journal"], "ada@eudoxus.ai");
+      journalFetch.mockResolvedValue(new Response(JSON.stringify({ rows: [] }), { status: 200 }));
+      expect((await requestWithDeps(path, "GET", userSession(), journalDeps)).statusCode).toBe(404);
+      expect(journalFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it("admits an admin without a grant", async () => {
+      journalFetch.mockResolvedValue(new Response(JSON.stringify({ rows: [] }), { status: 200 }));
+      const res = await requestWithDeps("/api/restate/journal?id=inv_1", "GET", adminSsoSession(), journalDeps);
+      expect(res.statusCode).toBe(404);
+      expect(JSON.parse(res.body)).toEqual({ error: "no invocation" });
+    });
+
+    it("answers 503 when the admin API throws", async () => {
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      journalFetch.mockRejectedValue(new Error("down"));
+      const res = await requestWithDeps("/api/restate/journal?id=inv_1", "GET", adminSsoSession(), journalDeps);
+      expect(res.statusCode).toBe(503);
+      expect(JSON.parse(res.body)).toEqual({ error: "restate unavailable" });
     });
   });
 
@@ -4559,7 +5625,7 @@ describe("admin sessions — kg-refresh destroy", () => {
   async function deleteSession(
     machineId: string,
     token: string,
-    kgRefresh?: Parameters<typeof admin.handleAdminRequest>[4]["kgRefresh"],
+    kgRefresh?: NonNullable<Parameters<typeof admin.handleAdminRequest>[4]>["kgRefresh"],
   ): Promise<{ statusCode: number; body: string }> {
     const req = new MockRequest(
       `/api/sessions/${encodeURIComponent(machineId)}`,
@@ -4568,7 +5634,7 @@ describe("admin sessions — kg-refresh destroy", () => {
     );
     const res = new MockResponse();
     admin.handleAdminRequest(req as never, res as never, sessionsConfig(), makeFakeRegistry(provider), {
-      kgRefresh: kgRefresh ?? { trigger: vi.fn(), status: vi.fn(), onMachineLost: vi.fn() },
+      kgRefresh: kgRefresh ?? { trigger: vi.fn(), status: vi.fn(), cancel: vi.fn() },
     });
     await res.done;
     return { statusCode: res.statusCode, body: res.body };
@@ -4596,20 +5662,7 @@ describe("admin sessions — kg-refresh destroy", () => {
     expect(destroyMachineMock).toHaveBeenCalledWith(FLY_TOKEN, FLY_APP, "m-kg-cancel");
   });
 
-  it("calls kgRefresh.onMachineLost with operator_cancelled failureCode", async () => {
-    const token = await login("secret");
-    const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "fly-machines" });
-    log.updateJobMachineDetails(jobId, { machineNonce: "nonce-kg", machineId: "m-kg-cancel2" });
-    log.updateJobMachineId(jobId, "m-kg-cancel2");
-
-    const onMachineLost = vi.fn();
-    await deleteSession("m-kg-cancel2", token, { trigger: vi.fn(), status: vi.fn(), onMachineLost });
-
-    expect(onMachineLost).toHaveBeenCalledOnce();
-    expect(onMachineLost).toHaveBeenCalledWith({ failureCode: "operator_cancelled" });
-  });
-
-  it("stamps the job row operator_cancelled before calling onMachineLost", async () => {
+  it("stamps the job row operator_cancelled", async () => {
     const token = await login("secret");
     const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "fly-machines" });
     log.updateJobMachineDetails(jobId, { machineNonce: "nonce-kg", machineId: "m-kg-cancel3" });
@@ -4635,36 +5688,63 @@ describe("admin sessions — kg-refresh destroy", () => {
     expect(clearWorkingState).not.toHaveBeenCalled();
   });
 
-  it("GHA-mode kg-refresh cancel reaches cancelWorkflowRun and returns 200 (not 422)", async () => {
+  it("Fly-mode kg-refresh cancel destroys the machine and also calls the workflow cancel, tolerating a non-200", async () => {
     const token = await login("secret");
-    const jobId = log.appendLog({
-      issueId: "kg-refresh",
-      phase: "kg-refresh",
-      executionMode: "github-actions",
-      repo: "TestOrg/test-kg",
-    });
-    log.updateJobRunId(jobId, 12345);
-    // GHA jobs have no machineId; pass the numeric jobId so handleDestroySession
-    // falls back to getJobById (Number.isFinite path in admin.ts).
-    const res = await deleteSession(String(jobId), token);
+    const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "fly-machines", dispatchId: "t-fly" });
+    log.updateJobMachineDetails(jobId, { machineNonce: "nonce-kg", machineId: "m-kg-cancel5" });
+    log.updateJobMachineId(jobId, "m-kg-cancel5");
+    const cancel = vi.fn(async () => ({ status: 409, body: { error: "no-refresh-in-flight" } }));
+    const res = await deleteSession("m-kg-cancel5", token, { trigger: vi.fn(), status: vi.fn(), cancel });
 
     expect(res.statusCode).toBe(200);
-    expect(cancelWorkflowRunMock).toHaveBeenCalledWith("gh-token-mock", "TestOrg", "test-kg", 12345);
+    expect(destroyMachineMock).toHaveBeenCalledWith(FLY_TOKEN, FLY_APP, "m-kg-cancel5");
+    expect(cancel).toHaveBeenCalledWith({ jobId, dispatchId: "t-fly", reason: "operator_cancelled" });
+    expect(log.getJobById(jobId)?.conclusion).toBe("operator_cancelled");
   });
 
-  it("GHA-mode kg-refresh cancel returns 422 when repo is absent on the row", async () => {
-    const token = await login("secret");
-    const jobId = log.appendLog({
-      issueId: "kg-refresh",
-      phase: "kg-refresh",
-      executionMode: "github-actions",
-      // repo intentionally omitted to confirm the guard fires
-    });
-    log.updateJobRunId(jobId, 99999);
-    const res = await deleteSession(String(jobId), token);
+  async function ghaKgJob(): Promise<number> {
+    const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "github-actions", repo: "TestOrg/test-kg", dispatchId: "t-gha" });
+    log.updateJobRunId(jobId, 12345);
+    return jobId;
+  }
 
-    expect(res.statusCode).toBe(422);
+  it("GHA-mode kg-refresh cancel calls the workflow cancel, then stamps the row, and never cancels the run itself", async () => {
+    const token = await login("secret");
+    const jobId = await ghaKgJob();
+    const cancel = vi.fn(async () => ({ status: 200, body: { cancelled: true } }));
+    const res = await deleteSession(String(jobId), token, { trigger: vi.fn(), status: vi.fn(), cancel });
+
+    expect(res.statusCode).toBe(200);
+    expect(cancel).toHaveBeenCalledWith({ jobId, dispatchId: "t-gha", reason: "operator_cancelled" });
     expect(cancelWorkflowRunMock).not.toHaveBeenCalled();
+    expect(destroyMachineMock).not.toHaveBeenCalled();
+    expect(log.getJobById(jobId)?.conclusion).toBe("operator_cancelled");
+  });
+
+  it("GHA-mode kg-refresh cancel answers 503 when the workflow is unavailable, without notifying", async () => {
+    const token = await login("secret");
+    const jobId = await ghaKgJob();
+    const cancel = vi.fn(async () => ({ status: 503, body: { error: "restate-unavailable" } }));
+    const res = await deleteSession(String(jobId), token, { trigger: vi.fn(), status: vi.fn(), cancel });
+
+    expect(res.statusCode).toBe(503);
+    expect(JSON.parse(res.body)).toEqual({ error: "restate-unavailable" });
+    expect(notifyTextMock).not.toHaveBeenCalled();
+    expect(log.getJobById(jobId)?.conclusion).not.toBe("operator_cancelled");
+  });
+
+  it("GHA-mode kg-refresh cancel passes a 409 no-refresh-in-flight through and leaves the row untouched", async () => {
+    const token = await login("secret");
+    const jobId = await ghaKgJob();
+    const before = log.getJobById(jobId);
+    const cancel = vi.fn(async () => ({ status: 409, body: { error: "no-refresh-in-flight" } }));
+    const res = await deleteSession(String(jobId), token, { trigger: vi.fn(), status: vi.fn(), cancel });
+
+    expect(res.statusCode).toBe(409);
+    const after = log.getJobById(jobId);
+    expect(after?.status).toBe(before?.status);
+    expect(after?.conclusion).toBe(before?.conclusion);
+    expect(notifyTextMock).not.toHaveBeenCalled();
   });
 
   it("issue-keyed session destroy still calls provider.clearWorkingState (regression pin)", async () => {

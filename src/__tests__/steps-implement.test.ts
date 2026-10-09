@@ -4,6 +4,7 @@ import { DefaultPipelineContext } from "../pipeline/context.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
 import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
 import type { LLMExecutor, LLMResult } from "../pipeline/types.js";
+import { DEFAULT_MODEL } from "../pipeline/default-model.js";
 import type { ReferenceRepoResult } from "../reference-repos.js";
 
 function makeExecutor(overrides: Partial<LLMResult> = {}): LLMExecutor {
@@ -52,7 +53,7 @@ describe("implementStep", () => {
     );
   });
 
-  it("defaults model to claude-sonnet-5 when not specified", async () => {
+  it("defaults model to DEFAULT_MODEL when not specified", async () => {
     const executor = makeExecutor();
     const ctx = makeContext(executor);
 
@@ -63,7 +64,7 @@ describe("implementStep", () => {
     );
 
     expect(executor.invoke).toHaveBeenCalledWith(
-      expect.objectContaining({ model: "claude-sonnet-5" }),
+      expect.objectContaining({ model: DEFAULT_MODEL }),
     );
   });
 

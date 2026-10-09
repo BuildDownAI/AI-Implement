@@ -33,6 +33,7 @@ export const PAGE_ROUTES: Record<string, readonly string[]> = {
   reaper: ["/api/reaper/recent", "/api/reaper/summary"],
   audit: ["/api/dedup"],
   customizations: ["/api/customizations"],
+  journal: ["/api/restate/journal"],
 };
 
 export function initAccessPageGrantsTable(): void {

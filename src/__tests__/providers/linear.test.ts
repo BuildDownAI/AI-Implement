@@ -629,12 +629,13 @@ describe("LinearProvider.fetchFeatureNodeRollUps", () => {
   beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
   afterEach(() => { vi.restoreAllMocks(); });
 
-  function mockResponse(nodes: unknown[]) {
+  function mockResponse(nodes: unknown[], pageInfo?: { hasNextPage: boolean; endCursor: string | null }) {
     vi.mocked(fetch).mockResolvedValueOnce({
       ok: true,
-      json: async () => ({ data: { issues: { nodes } } }),
+      json: async () => ({ data: { issues: { nodes, ...(pageInfo ? { pageInfo } : {}) } } }),
     } as Response);
   }
+  const requestBody = (n: number) => JSON.parse(vi.mocked(fetch).mock.calls[n][1]?.body as string);
   const labels = (...names: string[]) => ({ nodes: names.map((name) => ({ name })) });
   const MULTI_YML = ["```yaml", "# ai-implement.yml", "feature_branch:", '  mode: "multi-issue"', "```"].join("\n");
 
@@ -695,6 +696,34 @@ describe("LinearProvider.fetchFeatureNodeRollUps", () => {
     ]);
     const rollUps = await new LinearProvider({}).fetchFeatureNodeRollUps();
     expect(rollUps).toEqual([]);
+  });
+
+  it("pages through every match so a feature node on a later page is found", async () => {
+    const filler = Array.from({ length: 100 }, (_, i) => ({
+      identifier: `AII-f${i}`, team: { key: "AII" }, children: { nodes: [] }, parent: null,
+    }));
+    mockResponse(filler, { hasNextPage: true, endCursor: "c1" });
+    mockResponse(
+      [{ id: "aii-682-id", identifier: "AII-682", description: null, team: { key: "AII" },
+        children: { nodes: [{ identifier: "AII-683", state: { type: "completed" }, labels: labels("AI-Implement") }] },
+        parent: null }],
+      { hasNextPage: false, endCursor: null },
+    );
+    const rollUps = await new LinearProvider({}).fetchFeatureNodeRollUps();
+    expect(rollUps.map((r) => r.identifier)).toEqual(["AII-682"]);
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(requestBody(0).variables.after).toBeNull();
+    expect(requestBody(0).variables.first).toBe(100);
+    expect(requestBody(1).variables.after).toBe("c1");
+  });
+
+  it("stops after 20 pages and warns once when every page has a next page", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    for (let i = 0; i < 20; i++) mockResponse([], { hasNextPage: true, endCursor: `c${i}` });
+    await new LinearProvider({}).fetchFeatureNodeRollUps();
+    expect(fetch).toHaveBeenCalledTimes(20);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toContain("fetchFeatureNodeRollUps");
   });
 });
 

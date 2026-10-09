@@ -27,6 +27,7 @@
   },
   "dependencies": {
     "@restatedev/restate-sdk": "^1.17.1",
+    "@restatedev/restate-sdk-clients": "^1.17.1",
     "@restatedev/restate-sdk-zod": "^1.17.1",
     "@restatedev/restate-server": "^1.7.10",
     "better-sqlite3": "13.0.3",
@@ -42,6 +43,7 @@
     "@types/node": "^24.13.3",
     "@types/picomatch": "^4.0.3",
     "jsdom": "^30.0.1",
+    "testcontainers": "^11.12.0",
     "tsx": "^4.23.12",
     "typescript": "^5.9.3",
     "vitest": "^4.1.11"

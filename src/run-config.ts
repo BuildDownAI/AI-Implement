@@ -1,6 +1,7 @@
 import type { ReferenceRepo } from "./reference-repos.js";
 import type { RetryPolicy } from "./pipeline/retry-backoff.js";
 import type { RepoMapping, ReviewerSelection } from "./config.js";
+import { validateReviewFixMetadata, type ReviewFixMetadataV1 } from "./review-fix-contract.js";
 
 /**
  * Versioned orchestrator→runner config envelope. Travels as ONE
@@ -48,6 +49,13 @@ export interface RunConfigV1 {
   reviewers?: ReviewerSelection[];
   /** Global retry/backoff policy and reviewer turn cap. Absent = runner uses DEFAULT_RETRY_POLICY. */
   retryPolicy?: RetryPolicy;
+  /** Restate review-fix pilot attempt identity (AII-776), the canonical shape defined by the
+   *  AII-770 contract (`src/review-fix-contract.ts`). Absent = Legacy (non-pilot) dispatch.
+   *  An explicit-but-malformed value fails closed from decodeRunConfig rather than being
+   *  dropped — unlike the other optional envelope fields, it cannot silently degrade to Legacy.
+   *  Carries no credential; repository/PR/execution authority is verified downstream against
+   *  stored state, not trusted from this field. */
+  reviewFix?: ReviewFixMetadataV1;
 }
 
 const MAX_DESCRIPTION_CHARS = 40_000;
@@ -74,6 +82,15 @@ export function decodeRunConfig(encoded: string): RunConfigV1 {
   if (!issue || typeof issue.id !== "string" || typeof issue.identifier !== "string"
       || typeof issue.title !== "string" || typeof issue.description !== "string") {
     throw new Error("run_config missing required issue block");
+  }
+  // reviewFix is an explicit pilot marker: unlike every other optional envelope field, a
+  // present-but-invalid value must throw rather than be dropped and fall back to Legacy
+  // (AII-776). Validated against the canonical AII-770 contract, not a local reimplementation,
+  // so the envelope and result sides of the pilot agree on one shape.
+  if (cfg.reviewFix !== undefined) {
+    const result = validateReviewFixMetadata(cfg.reviewFix);
+    if (!result.ok) throw new Error(`run_config.reviewFix is invalid: ${result.error}`);
+    cfg.reviewFix = result.value;
   }
   return pickKnownKeys(cfg as RunConfigV1);
 }
@@ -152,6 +169,41 @@ export function buildImplRunConfig(input: ImplRunConfigInput): RunConfigV1 {
   };
 }
 
+export interface KgRefreshRunConfigInput {
+  kgSourceRepo: string;
+  /** The run title the workflow reconciles by: `KG-REFRESH · <triggerId>`. */
+  issueIdentifier: string;
+  runnerCallbackUrl?: string;
+  dependencyTokenScope?: "installation";
+  dryRun?: boolean;
+  kgSourceRef?: string;
+  acceptNewBaseline?: boolean;
+  actorEmail?: string;
+}
+
+/**
+ * Builds the RunConfigV1 envelope for a kg-refresh dispatch. Holds the run identity
+ * (issue id and title) in one place; senders read it from `envelope.issue`. Pure: the
+ * caller supplies every value. Optional keys are absent, never `undefined`, because the
+ * envelope is journaled and encoded.
+ */
+export function buildKgRefreshRunConfig(input: KgRefreshRunConfigInput): RunConfigV1 {
+  const { kgSourceRepo, issueIdentifier, runnerCallbackUrl, dependencyTokenScope,
+    dryRun, kgSourceRef, acceptNewBaseline, actorEmail } = input;
+  return {
+    v: 1,
+    issue: { id: "kg-refresh", identifier: issueIdentifier, title: "KG ingest", description: "" },
+    runnerPhase: "kg-refresh",
+    kgSourceRepo,
+    ...(runnerCallbackUrl ? { runnerCallbackUrl } : {}),
+    ...(dependencyTokenScope != null ? { dependencyTokenScope } : {}),
+    ...(dryRun ? { kgDryRun: true as const } : {}),
+    ...(kgSourceRef ? { kgSourceRef } : {}),
+    ...(acceptNewBaseline ? { kgAcceptNewBaseline: true as const } : {}),
+    ...(actorEmail ? { kgBaselineActor: actorEmail } : {}),
+  };
+}
+
 function isReviewerSelectionArray(value: unknown): value is ReviewerSelection[] {
   if (!Array.isArray(value)) return false;
   const seen = new Set<string>();
@@ -176,7 +228,7 @@ function pickKnownKeys(cfg: RunConfigV1): RunConfigV1 {
     runnerCallbackUrl, maxTurns, maxIterations, commentInstruction, sensitiveFiles,
     profiles, assigneeName, planningContext, groupingParent, dependencyTokenScope, kgSourceRepo,
     kgDryRun, kgSourceRef, kgAcceptNewBaseline, kgBaselineActor, referenceRepos,
-    reviewers, retryPolicy } = cfg;
+    reviewers, retryPolicy, reviewFix } = cfg;
   const out: RunConfigV1 = { v, issue };
   if (prNumber !== undefined) out.prNumber = prNumber;
   if (baseBranch !== undefined) out.baseBranch = baseBranch;
@@ -207,5 +259,6 @@ function pickKnownKeys(cfg: RunConfigV1): RunConfigV1 {
     }
   }
   if (retryPolicy !== undefined) out.retryPolicy = retryPolicy;
+  if (reviewFix !== undefined) out.reviewFix = reviewFix;
   return out;
 }

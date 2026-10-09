@@ -107,15 +107,15 @@ export function syntheticConflictCommentId(owner: string, repo: string, prNumber
  *  cost — a cap exhausted with zero real attempts — is alerted, not silent. */
 export function countConflictAttempts(owner: string, repo: string, prNumber: number): number {
   const row = getDb().prepare(
-    "SELECT COUNT(*) AS n FROM comment_gapfill_queue WHERE owner=? AND repo=? AND pr_number=? AND comment_id<0",
-  ).get(owner, repo, prNumber) as { n: number };
+    "SELECT COUNT(*) AS n FROM comment_gapfill_queue WHERE owner=? AND repo=? AND pr_number=? AND comment_id<0 AND commenter=?",
+  ).get(owner, repo, prNumber, CONFLICT_COMMENTER) as { n: number };
   return row.n;
 }
 
 export function hasPendingConflictResolution(owner: string, repo: string, prNumber: number): boolean {
   const row = getDb().prepare(
-    "SELECT 1 FROM comment_gapfill_queue WHERE owner=? AND repo=? AND pr_number=? AND comment_id<0 AND status IN ('pending','dispatched') LIMIT 1",
-  ).get(owner, repo, prNumber);
+    "SELECT 1 FROM comment_gapfill_queue WHERE owner=? AND repo=? AND pr_number=? AND comment_id<0 AND commenter=? AND status IN ('pending','dispatched') LIMIT 1",
+  ).get(owner, repo, prNumber, CONFLICT_COMMENTER);
   return !!row;
 }
 
@@ -181,4 +181,39 @@ export function sweepOrphanedGapfillRows(): number {
     swept++;
   }
   return swept;
+}
+
+export const PUSH_RETRY_COMMENTER = "ai-implement-orchestrator-push-retry";
+
+/** Same scheme as syntheticConflictCommentId, keyed on the failed row so a row is retried at most once. */
+function syntheticPushRetryCommentId(rowId: number): number {
+  const s = `pushretry#${rowId}`;
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193); }
+  return -(((h >>> 0) % 2_000_000_000) + 1);
+}
+
+/** AII-922: a gap-fill run that failed at `push` (after its work was approved) is not
+ *  re-dispatched by the poll, so its PR would stall. Re-enqueue the latest dispatched row's
+ *  instruction ONCE as a synthetic row. A row that is itself a push retry is never retried,
+ *  and the drain's per-PR dispatch budget still gates the retry. Call BEFORE
+ *  markCommentGapfillRunTerminal, which is what leaves the 'dispatched' state. */
+export function requeueGapfillAfterPushFailure(repoFull: string, prNumber: number): boolean {
+  const db = getDb();
+  const row = db.prepare(
+    "SELECT * FROM comment_gapfill_queue WHERE owner || '/' || repo = ? AND pr_number = ? AND status = 'dispatched' " +
+    "ORDER BY id DESC LIMIT 1",
+  ).get(repoFull, prNumber) as CommentGapfillQueueRow | undefined;
+  // A push-retry row is never retried again; a conflict-resolution row has its own rail and
+  // its instruction must not be replayed under a different commenter.
+  if (!row || row.commenter === PUSH_RETRY_COMMENTER || row.commenter === CONFLICT_COMMENTER) return false;
+  const before = db.prepare("SELECT COUNT(*) AS n FROM comment_gapfill_queue").get() as { n: number };
+  enqueueCommentGapfill({
+    owner: row.owner, repo: row.repo, prNumber: row.pr_number,
+    commentId: syntheticPushRetryCommentId(row.id),
+    commenter: PUSH_RETRY_COMMENTER,
+    instruction: row.instruction,
+  });
+  const after = db.prepare("SELECT COUNT(*) AS n FROM comment_gapfill_queue").get() as { n: number };
+  return after.n > before.n;
 }

@@ -35,6 +35,59 @@ describe("jobs table", () => {
     expect(child?.groupingParent).toBe(false);
   });
 
+  it("re-enqueues a gap-fill run that failed at push, once (AII-922)", async () => {
+    const queue = await import("../comment-gapfill-queue.js");
+    const prUrl = "https://github.com/org/repo/pull/7";
+    const fail = (jobId: number) => {
+      log.updateJobFailure(jobId, {
+        category: "auth", code: "GIT_AUTH", stage: "push", attempt: 1, retryable: false,
+        message: "denied", evidence: { truncated: false },
+      });
+      log.updateJobStatus(jobId, "failed", "failure", prUrl);
+    };
+    const dispatch = (rowId: number) => {
+      queue.markCommentGapfillProcessed(rowId, "dispatched");
+      return log.appendLog({ issueId: "i", repo: "org/repo", trigger: "comment", prUrl } as Parameters<typeof log.appendLog>[0]);
+    };
+
+    const rowId = queue.enqueueCommentGapfill({
+      owner: "org", repo: "repo", prNumber: 7, commentId: 3001, commenter: "alice", instruction: "fix it",
+    });
+    fail(dispatch(rowId));
+    const [retry] = queue.claimPendingCommentGapfills();
+    expect(retry.commenter).toBe(queue.PUSH_RETRY_COMMENTER);
+
+    fail(dispatch(retry.id));
+    expect(queue.claimPendingCommentGapfills()).toHaveLength(0);
+  });
+
+  it("does not re-enqueue a gap-fill run that failed outside push or with a conflict (AII-922)", async () => {
+    const queue = await import("../comment-gapfill-queue.js");
+    const prUrl = "https://github.com/org/repo/pull/8";
+    const failAt = (rowId: number, stage: "push" | "implement", category: "auth" | "transient" | "conflict") => {
+      queue.markCommentGapfillProcessed(rowId, "dispatched");
+      const jobId = log.appendLog({ issueId: "i", repo: "org/repo", trigger: "comment", prUrl } as Parameters<typeof log.appendLog>[0]);
+      log.updateJobFailure(jobId, {
+        category, code: "X", stage, attempt: 1, retryable: false, message: "m", evidence: { truncated: false },
+      });
+      log.updateJobStatus(jobId, "failed", "failure", prUrl);
+    };
+    const row = () => queue.enqueueCommentGapfill({
+      owner: "org", repo: "repo", prNumber: 8, commentId: 4001 + Math.floor(Math.random() * 1e6), commenter: "alice", instruction: "fix",
+    });
+    failAt(row(), "implement", "transient");
+    expect(queue.claimPendingCommentGapfills()).toHaveLength(0);
+    failAt(row(), "push", "conflict");
+    expect(queue.claimPendingCommentGapfills()).toHaveLength(0);
+
+    // A conflict-resolution row that dies at push is not replayed as a push retry either.
+    const conflictId = queue.enqueueConflictResolution({
+      owner: "org", repo: "repo", prNumber: 8, featureBranch: "ai-implement/feature/x",
+    });
+    failAt(conflictId, "push", "auth");
+    expect(queue.claimPendingCommentGapfills()).toHaveLength(0);
+  });
+
   it("appendLog creates a job with dispatched status and returns an id", () => {
     const jobId = log.appendLog({
       issueId: "issue-1",
@@ -538,6 +591,31 @@ describe("schema migration", () => {
     expect(jobs[0].issueId).toBe("old-issue");
     expect(jobs[0].status).toBe("unknown");
     expect(jobs[0].runId).toBeNull();
+  });
+
+  it("migration only rewrites open GitHub Actions rows with no run id", () => {
+    const db = dedup.getDb();
+    const ins = db.prepare(
+      "INSERT INTO dispatch_log (issue_id, dispatched_at, status, conclusion, execution_mode) VALUES (?, ?, ?, ?, ?)",
+    );
+    const now = Date.now();
+    for (const st of ["failed", "completed", "timed_out", "review_failed", "dispatch-failed"]) {
+      ins.run(`closed-${st}`, now, st, "dispatch_rejected", "github-actions");
+    }
+    ins.run("open-dispatched", now, "dispatched", null, "github-actions");
+    ins.run("open-running", now, "running", null, null);
+    ins.run("fly-open", now, "running", null, "fly-machines");
+
+    log.initLogTable();
+
+    const byIssue = new Map(log.listLog().map((j) => [j.issueId, j]));
+    for (const st of ["failed", "completed", "timed_out", "review_failed", "dispatch-failed"]) {
+      expect(byIssue.get(`closed-${st}`)?.status).toBe(st);
+      expect(byIssue.get(`closed-${st}`)?.conclusion).toBe("dispatch_rejected");
+    }
+    expect(byIssue.get("open-dispatched")?.status).toBe("unknown");
+    expect(byIssue.get("open-running")?.status).toBe("unknown");
+    expect(byIssue.get("fly-open")?.status).toBe("running");
   });
 
   it("backfills runner_mode column on existing tables and leaves legacy rows null", () => {

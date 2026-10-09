@@ -5,7 +5,15 @@ import { chmodSync, mkdirSync, mkdtempSync, writeFileSync, rmSync, existsSync, r
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { runAutonomous, resolveLogLevel, waitForContainerRemoval, runAutonomousLocally } from "../run-autonomous.js";
+import {
+  runAutonomous,
+  resolveLogLevel,
+  waitForContainerRemoval,
+  runAutonomousLocally,
+  resolveActivityReporting,
+  RunnerActivitySink,
+  type RunnerActivityReporting,
+} from "../run-autonomous.js";
 import { DEFAULT_PIPELINE } from "../pipeline/default-pipeline.js";
 import { PipelineRunner } from "../pipeline/runner.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
@@ -13,7 +21,10 @@ import { encodeRunConfig } from "../run-config.js";
 import type { LLMExecutor, PipelineDefinition, StepModule } from "../pipeline/types.js";
 import { __resetPublicationCredentialForTests } from "../publication-credential.js";
 import { DISPOSITIONS_FILE, stableReviewFindingKey, type FindingDisposition } from "../pipeline/finding-dispositions.js";
+import { CYCLE_SUMMARY_FILE, type CycleSummary } from "../pipeline/cycle-summary.js";
 import type { GhSpawn } from "../pipeline/review-ledger.js";
+import type { ReviewFixMetadataV1 } from "../review-fix-contract.js";
+import { DEFAULT_MODEL } from "../pipeline/default-model.js";
 
 const REQUIRED_ENV: Record<string, string> = {
   ISSUE_ID: "issue-abc",
@@ -532,7 +543,7 @@ describe("runAutonomous", () => {
     expect(capturedModel).toBe("claude-haiku-4-5");
   });
 
-  it("falls back to claude-sonnet-5 when no model configured", async () => {
+  it("falls back to DEFAULT_MODEL when no model configured", async () => {
     let capturedModel: string | undefined;
     const mod: StepModule = {
       run: vi.fn(async (ctx) => {
@@ -550,7 +561,7 @@ describe("runAutonomous", () => {
       llmExecutor: makeMockExecutor(0),
     });
 
-    expect(capturedModel).toBe("claude-sonnet-5");
+    expect(capturedModel).toBe(DEFAULT_MODEL);
   });
 
   it("invokes the provided llmExecutor when step calls it", async () => {
@@ -572,7 +583,7 @@ describe("runAutonomous", () => {
     });
 
     expect(executor.invoke).toHaveBeenCalledOnce();
-    expect((executor.invoke as ReturnType<typeof vi.fn>).mock.calls[0][0].model).toBe("claude-sonnet-5");
+    expect((executor.invoke as ReturnType<typeof vi.fn>).mock.calls[0][0].model).toBe(DEFAULT_MODEL);
   });
 
   it("fetches planning context from the orchestrator using the progress token", async () => {
@@ -902,6 +913,629 @@ describe("runAutonomous", () => {
     expect(body.failure?.stage).toBe("push");
   });
 
+  describe("reviewFix result metadata (AII-794)", () => {
+    const REVIEW_FIX_IDENTITY: ReviewFixMetadataV1 = {
+      version: 1,
+      attemptId: "attempt-1",
+      installationId: 12345,
+      repository: "acme/app",
+      prNumber: 42,
+      deadlineAt: Date.now() + 60 * 60_000,
+    };
+
+    function stubReviewFixEnvelope(
+      overrides: Partial<ReviewFixMetadataV1> = {},
+      configOverrides: { groupingParent?: boolean; prNumber?: string } = {},
+    ) {
+      vi.stubEnv(
+        "AI_IMPLEMENT_RUN_CONFIG",
+        encodeRunConfig({
+          v: 1,
+          issue: { id: "issue-abc", identifier: "AII-1", title: "Test issue", description: "Issue description" },
+          reviewFix: { ...REVIEW_FIX_IDENTITY, ...overrides },
+          ...configOverrides,
+        }),
+      );
+    }
+
+    it("attaches the full reviewFix result marker on success, reporting the actual published commit (not GITHUB_SHA)", async () => {
+      stubReviewFixEnvelope();
+      vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+      vi.stubEnv("RUN_TOKEN", "run-token");
+      vi.stubEnv("GITHUB_RUN_ID", "999888");
+      vi.stubEnv("GITHUB_RUN_ATTEMPT", "2");
+      vi.stubEnv("GITHUB_SHA", "0".repeat(40));
+
+      const publishedCommit = "b".repeat(40);
+      const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+      const { pipeline, runner } = makeStepsPipeline([
+        ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true }) }],
+        [
+          "push",
+          {
+            run: vi.fn().mockResolvedValue({
+              prUrl: "https://github.com/acme/app/pull/42",
+              prNumber: 42,
+              branchPushed: true,
+              commitSha: publishedCommit,
+              draft: false,
+            }),
+          },
+        ],
+      ]);
+
+      const result = await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeMockExecutor(0),
+        fetchImpl: mockFetch,
+      });
+
+      expect(result.exitCode).toBe(0);
+      const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as { reviewFix?: Record<string, unknown> };
+      expect(body.reviewFix).toEqual({
+        version: 1,
+        attemptId: "attempt-1",
+        installationId: 12345,
+        repository: "acme/app",
+        prNumber: 42,
+        deadlineAt: REVIEW_FIX_IDENTITY.deadlineAt,
+        githubRunId: 999888,
+        githubRunAttempt: 2,
+        outputCommit: publishedCommit,
+      });
+    });
+
+    it("forwards this run's declared cycle summaries alongside an attached reviewFix marker (AII-801)", async () => {
+      stubReviewFixEnvelope();
+      vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+      vi.stubEnv("RUN_TOKEN", "run-token");
+      vi.stubEnv("RUN_PROGRESS_TOKEN", "pilot-progress");
+      vi.stubEnv("GITHUB_RUN_ID", "999888");
+      vi.stubEnv("GITHUB_RUN_ATTEMPT", "2");
+
+      const cycleSummary: CycleSummary = {
+        id: "feedback-loop.1",
+        stage: "feedback-loop",
+        cycle: 1,
+        inputCommit: "a".repeat(40),
+        outputCommit: null,
+        outputCommitStatus: "pending_push",
+        dispositions: [],
+        tests: [{ name: "test execution", status: "missing" }],
+        verdict: { approved: true, reason: "approved" },
+        usage: { tokensIn: 10, tokensOut: 20, costUsd: 0.01 },
+        truncated: false,
+        limitReached: false,
+        completedAt: 1_700_000_000_000,
+      };
+      mkdirSync(join(workspaceDir, "ai-output"), { recursive: true });
+      writeFileSync(join(workspaceDir, CYCLE_SUMMARY_FILE), `${JSON.stringify(cycleSummary)}\n`);
+
+      const publishedCommit = "b".repeat(40);
+      const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+      const { pipeline, runner } = makeStepsPipeline([
+        ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true }) }],
+        [
+          "push",
+          {
+            run: vi.fn().mockResolvedValue({
+              prUrl: "https://github.com/acme/app/pull/42",
+              prNumber: 42,
+              branchPushed: true,
+              commitSha: publishedCommit,
+              draft: false,
+            }),
+          },
+        ],
+      ]);
+
+      const result = await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeMockExecutor(0),
+        fetchImpl: mockFetch,
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(mockFetch.mock.calls[0][0]).toBe("https://orchestrator.example/runner/cycle-summary");
+      expect(JSON.parse(mockFetch.mock.calls[0][1].body as string)).toEqual({ summary: cycleSummary });
+      const body = JSON.parse(mockFetch.mock.calls[1][1].body as string) as { cycleSummaries?: CycleSummary[] };
+      expect(body.cycleSummaries).toEqual([cycleSummary]);
+    });
+
+    it("delivers a failed cycle before no-output pilot result is skipped", async () => {
+      stubReviewFixEnvelope();
+      vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+      vi.stubEnv("RUN_TOKEN", "run-token");
+      vi.stubEnv("RUN_PROGRESS_TOKEN", "pilot-progress");
+      vi.stubEnv("GITHUB_RUN_ID", "42");
+      vi.stubEnv("GITHUB_RUN_ATTEMPT", "1");
+      const summary: CycleSummary = {
+        id: "feedback-loop.1", stage: "feedback-loop", cycle: 1,
+        inputCommit: "a".repeat(40), outputCommit: null, outputCommitStatus: "not_applicable",
+        dispositions: [], tests: [{ name: "npm test", status: "failed" }],
+        verdict: { approved: null, reason: "fix_failed" },
+        usage: { tokensIn: 1, tokensOut: 1, costUsd: null },
+        truncated: false, limitReached: false, completedAt: 1_700_000_000_000,
+      };
+      mkdirSync(join(workspaceDir, "ai-output"), { recursive: true });
+      writeFileSync(join(workspaceDir, CYCLE_SUMMARY_FILE), `${JSON.stringify(summary)}\n`);
+      const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200 });
+      const { pipeline, runner } = makeStepsPipeline([
+        ["setup", { run: vi.fn().mockRejectedValue(new Error("setup exploded before push ran")) }],
+      ]);
+      await runAutonomous({ workspaceDir, pipeline, runner, reporter: new NoopStepReporter(),
+        llmExecutor: makeMockExecutor(0), fetchImpl: mockFetch });
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      expect(mockFetch.mock.calls[0][0]).toBe("https://orchestrator.example/runner/cycle-summary");
+      expect(JSON.parse(mockFetch.mock.calls[0][1].body as string)).toEqual({ summary });
+    });
+
+    it("sends no cycleSummaries field when the run wrote none", async () => {
+      stubReviewFixEnvelope();
+      vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+      vi.stubEnv("RUN_TOKEN", "run-token");
+      vi.stubEnv("GITHUB_RUN_ID", "999888");
+      vi.stubEnv("GITHUB_RUN_ATTEMPT", "2");
+
+      const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+      const { pipeline, runner } = makeStepsPipeline([
+        ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true }) }],
+        [
+          "push",
+          {
+            run: vi.fn().mockResolvedValue({
+              prUrl: "https://github.com/acme/app/pull/42",
+              prNumber: 42,
+              branchPushed: true,
+              commitSha: "b".repeat(40),
+              draft: false,
+            }),
+          },
+        ],
+      ]);
+
+      const result = await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeMockExecutor(0),
+        fetchImpl: mockFetch,
+      });
+
+      expect(result.exitCode).toBe(0);
+      const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as { cycleSummaries?: CycleSummary[] };
+      expect(body.cycleSummaries).toBeUndefined();
+    });
+
+    it("skips delivery and logs an explicit no-result outcome on a grouping-parent no-op success — never an unmarked Legacy POST for a pilot attempt", async () => {
+      stubReviewFixEnvelope({}, { groupingParent: true });
+      vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+      vi.stubEnv("RUN_TOKEN", "run-token");
+      vi.stubEnv("GITHUB_RUN_ID", "1");
+      vi.stubEnv("GITHUB_RUN_ATTEMPT", "1");
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+      const { pipeline, runner } = makeStepsPipeline([
+        ["push", { run: vi.fn().mockResolvedValue({ prUrl: null, prNumber: null, branchPushed: false, commitSha: null, draft: false }) }],
+      ]);
+
+      const result = await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeMockExecutor(0),
+        fetchImpl: mockFetch,
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(mockFetch).not.toHaveBeenCalled();
+      expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("pilot result delivery skipped"));
+      expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("attempt-1"));
+      errSpy.mockRestore();
+    });
+
+    it("skips delivery and logs an explicit no-result outcome when GITHUB_RUN_ID/GITHUB_RUN_ATTEMPT cannot be parsed — never an unmarked Legacy POST for a pilot attempt", async () => {
+      stubReviewFixEnvelope();
+      vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+      vi.stubEnv("RUN_TOKEN", "run-token");
+      vi.stubEnv("GITHUB_RUN_ID", "");
+      vi.stubEnv("GITHUB_RUN_ATTEMPT", "");
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+      const { pipeline, runner } = makeStepsPipeline([
+        ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true }) }],
+        [
+          "push",
+          {
+            run: vi.fn().mockResolvedValue({
+              prUrl: "https://github.com/acme/app/pull/42",
+              prNumber: 42,
+              branchPushed: true,
+              commitSha: "c".repeat(40),
+              draft: false,
+            }),
+          },
+        ],
+      ]);
+
+      const result = await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeMockExecutor(0),
+        fetchImpl: mockFetch,
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(mockFetch).not.toHaveBeenCalled();
+      expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("pilot result delivery skipped"));
+      errSpy.mockRestore();
+    });
+
+    it("skips delivery and logs an explicit no-result outcome on a caught pipeline failure with no push at all — never an unmarked Legacy POST for a pilot attempt", async () => {
+      stubReviewFixEnvelope();
+      vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+      vi.stubEnv("RUN_TOKEN", "run-token");
+      vi.stubEnv("GITHUB_RUN_ID", "42");
+      vi.stubEnv("GITHUB_RUN_ATTEMPT", "1");
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+      const { pipeline, runner } = makeStepsPipeline([
+        ["setup", { run: vi.fn().mockRejectedValue(new Error("setup exploded before push ran")) }],
+      ]);
+
+      const result = await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeMockExecutor(0),
+        fetchImpl: mockFetch,
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(mockFetch).not.toHaveBeenCalled();
+      expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("pilot result delivery skipped"));
+      errSpy.mockRestore();
+    });
+
+    it("attaches the reviewFix marker on a caught pipeline failure once push already published a commit", async () => {
+      stubReviewFixEnvelope();
+      vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+      vi.stubEnv("RUN_TOKEN", "run-token");
+      vi.stubEnv("GITHUB_RUN_ID", "42");
+      vi.stubEnv("GITHUB_RUN_ATTEMPT", "1");
+
+      const publishedCommit = "d".repeat(40);
+      const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+      const { pipeline, runner } = makeStepsPipeline([
+        [
+          "push",
+          {
+            run: vi.fn().mockResolvedValue({
+              prUrl: "https://github.com/acme/app/pull/42",
+              prNumber: 42,
+              branchPushed: true,
+              commitSha: publishedCommit,
+              draft: false,
+            }),
+          },
+        ],
+        ["post-push-review", { run: vi.fn().mockRejectedValue(new Error("post-push review exploded")) }],
+      ]);
+
+      const result = await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeMockExecutor(0),
+        fetchImpl: mockFetch,
+      });
+
+      expect(result.exitCode).toBe(1);
+      const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
+        outcome: string;
+        reviewFix?: Record<string, unknown>;
+      };
+      expect(body.outcome).toBe("failure");
+      expect(body.reviewFix).toMatchObject({ attemptId: "attempt-1", outputCommit: publishedCommit });
+    });
+
+    it("reports INSTALL_FAILED under the Restate attempt identity after a published gap-fill", async () => {
+      stubReviewFixEnvelope({}, { prNumber: "42" });
+      vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+      vi.stubEnv("RUN_TOKEN", "run-token");
+      vi.stubEnv("GITHUB_RUN_ID", "999888");
+      vi.stubEnv("GITHUB_RUN_ATTEMPT", "2");
+
+      const publishedCommit = "f".repeat(40);
+      const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+      const { pipeline, runner } = makeStepsPipeline([
+        ["install", { run: vi.fn().mockResolvedValue({ installFailed: true, installMethod: "npm ci" }) }],
+        ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true }) }],
+        ["install-retry", { run: vi.fn().mockResolvedValue({ installFailed: true, installMethod: "npm ci", installError: "dependency conflict" }) }],
+        ["push", { run: vi.fn().mockResolvedValue({ prNumber: 42, branchPushed: true, commitSha: publishedCommit }) }],
+      ]);
+
+      const result = await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeMockExecutor(0),
+        fetchImpl: mockFetch,
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as Record<string, unknown>;
+      expect(body).toMatchObject({
+        outcome: "failure",
+        failureCode: "INSTALL_FAILED",
+        reviewFix: {
+          attemptId: "attempt-1",
+          githubRunId: 999888,
+          githubRunAttempt: 2,
+          outputCommit: publishedCommit,
+        },
+      });
+    });
+
+    it("never attaches a reviewFix marker for a Legacy (non-pilot) dispatch", async () => {
+      vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+      vi.stubEnv("RUN_TOKEN", "run-token");
+
+      const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+      const { pipeline, runner } = makeStepsPipeline([
+        ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true }) }],
+        ["push", { run: vi.fn().mockResolvedValue({ prUrl: "https://github.com/acme/app/pull/1", commitSha: "e".repeat(40) }) }],
+      ]);
+
+      const result = await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeMockExecutor(0),
+        fetchImpl: mockFetch,
+      });
+
+      expect(result.exitCode).toBe(0);
+      const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as Record<string, unknown>;
+      expect(body).not.toHaveProperty("reviewFix");
+    });
+  });
+
+  describe("runner-activity reporting (AII-798)", () => {
+    const REVIEW_FIX_IDENTITY: ReviewFixMetadataV1 = {
+      version: 1,
+      attemptId: "attempt-activity-1",
+      installationId: 999,
+      repository: "acme/app",
+      prNumber: 7,
+      deadlineAt: Date.now() + 60 * 60_000,
+    };
+
+    function makeNoopSink(): RunnerActivityReporting["sink"] {
+      return { toolStart: () => {}, toolResult: () => {}, cycleSummary: () => {}, final: () => {} };
+    }
+
+    describe("resolveActivityReporting", () => {
+      it("resolves a sink only when reviewFix identity, callback URL, and progress token are all present", () => {
+        const resolved = resolveActivityReporting(REVIEW_FIX_IDENTITY, "https://orchestrator.example", "ptok");
+        expect(resolved).toBeDefined();
+        expect(resolved?.attemptId).toBe("attempt-activity-1");
+      });
+
+      it("is undefined for a Legacy (non-pilot) dispatch, even with a callback URL and progress token", () => {
+        expect(resolveActivityReporting(undefined, "https://orchestrator.example", "ptok")).toBeUndefined();
+      });
+
+      it("is undefined without a callback URL", () => {
+        expect(resolveActivityReporting(REVIEW_FIX_IDENTITY, null, "ptok")).toBeUndefined();
+      });
+
+      it("is undefined without a progress token", () => {
+        expect(resolveActivityReporting(REVIEW_FIX_IDENTITY, "https://orchestrator.example", null)).toBeUndefined();
+      });
+    });
+
+    describe("RunnerActivitySink", () => {
+      it("delivers a buffered tool start/result batch plus the final marker to /runner/activity on shutdown()", async () => {
+        const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+        const sink = new RunnerActivitySink("https://orchestrator.example", "ptok", "attempt-activity-1", mockFetch);
+
+        sink.toolStart(
+          { attemptId: "attempt-activity-1", producerId: "implement-1", sequence: 0 },
+          { cycle: 1, action: "Bash", detail: { command: "ls" } },
+        );
+        sink.toolResult(
+          { attemptId: "attempt-activity-1", producerId: "implement-1", sequence: 1 },
+          { cycle: 1, action: "Bash", output: { text: "file.txt", truncated: false } },
+        );
+        sink.final({ attemptId: "attempt-activity-1", producerId: "implement-1", sequence: 1 }, 1);
+
+        await sink.shutdown();
+
+        expect(mockFetch).toHaveBeenCalledWith(
+          "https://orchestrator.example/runner/activity",
+          expect.objectContaining({
+            method: "POST",
+            headers: expect.objectContaining({ Authorization: "Bearer ptok" }),
+          }),
+        );
+        const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
+          attemptId: string;
+          producerId: string;
+          events: Array<{ kind: string; sequence: number }>;
+          finalSequence?: number;
+        };
+        expect(body.attemptId).toBe("attempt-activity-1");
+        expect(body.producerId).toBe("implement-1");
+        expect(body.events.map((e) => e.kind)).toEqual(["tool_start", "tool_result"]);
+        expect(body.finalSequence).toBe(1);
+      });
+
+      it("delivers the empty-stream marker and final sequence for a producerId that recorded no tool events — an empty model invocation still gets a final marker", async () => {
+        const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+        const sink = new RunnerActivitySink("https://orchestrator.example", "ptok", "attempt-activity-1", mockFetch);
+
+        sink.final({ attemptId: "attempt-activity-1", producerId: "never-touched", sequence: 0 }, 0);
+        await sink.shutdown();
+
+        expect(mockFetch).toHaveBeenCalledTimes(1);
+        const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
+          attemptId: string;
+          producerId: string;
+          events: Array<{ kind: string; sequence: number }>;
+          finalSequence?: number;
+        };
+        expect(body.attemptId).toBe("attempt-activity-1");
+        expect(body.producerId).toBe("never-touched");
+        expect(body.events.map((e) => e.kind)).toEqual(["activity_stream_empty"]);
+        expect(body.finalSequence).toBe(0);
+      });
+    });
+
+    describe("runAutonomous finally-block wiring", () => {
+      it("attempts activity shutdown from the outer finally block on a successful run", async () => {
+        const shutdown = vi.fn().mockResolvedValue(undefined);
+        const fakeReporting: RunnerActivityReporting = { attemptId: "attempt-1", sink: makeNoopSink(), shutdown };
+        const mod: StepModule = { run: vi.fn().mockResolvedValue({}) };
+        const { pipeline, runner } = makeSingleStepPipeline("do-work", mod);
+
+        const result = await runAutonomous({
+          workspaceDir,
+          pipeline,
+          runner,
+          reporter: new NoopStepReporter(),
+          llmExecutor: makeMockExecutor(0),
+          activityReporting: fakeReporting,
+        });
+
+        expect(result.exitCode).toBe(0);
+        expect(shutdown).toHaveBeenCalledTimes(1);
+      });
+
+      it("attempts activity shutdown from the outer finally block even when the pipeline throws — mirrors the always-runs teardown hook", async () => {
+        const shutdown = vi.fn().mockResolvedValue(undefined);
+        const fakeReporting: RunnerActivityReporting = { attemptId: "attempt-1", sink: makeNoopSink(), shutdown };
+        const mod: StepModule = { run: vi.fn().mockRejectedValue(new Error("step exploded")) };
+        const { pipeline, runner } = makeSingleStepPipeline("bad-step", mod);
+
+        const result = await runAutonomous({
+          workspaceDir,
+          pipeline,
+          runner,
+          reporter: new NoopStepReporter(),
+          llmExecutor: makeMockExecutor(0),
+          activityReporting: fakeReporting,
+        });
+
+        expect(result.exitCode).toBe(1);
+        expect(shutdown).toHaveBeenCalledTimes(1);
+      });
+
+      it("does not let a rejecting shutdown() crash the run — logged, never fatal", async () => {
+        const shutdown = vi.fn().mockRejectedValue(new Error("network down"));
+        const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+        const fakeReporting: RunnerActivityReporting = { attemptId: "attempt-1", sink: makeNoopSink(), shutdown };
+        const mod: StepModule = { run: vi.fn().mockResolvedValue({}) };
+        const { pipeline, runner } = makeSingleStepPipeline("do-work", mod);
+
+        const result = await runAutonomous({
+          workspaceDir,
+          pipeline,
+          runner,
+          reporter: new NoopStepReporter(),
+          llmExecutor: makeMockExecutor(0),
+          activityReporting: fakeReporting,
+        });
+
+        expect(result.exitCode).toBe(0);
+        expect(shutdown).toHaveBeenCalledTimes(1);
+        expect(errSpy.mock.calls.some((c) => String(c[0]).includes("[activity] shutdown failed"))).toBe(true);
+        errSpy.mockRestore();
+      });
+
+      it("auto-resolves activity reporting from a pilot reviewFix envelope (no injected override) without throwing", async () => {
+        vi.stubEnv(
+          "AI_IMPLEMENT_RUN_CONFIG",
+          encodeRunConfig({
+            v: 1,
+            issue: { id: "issue-abc", identifier: "AII-1", title: "Test issue", description: "Issue description" },
+            reviewFix: REVIEW_FIX_IDENTITY,
+          }),
+        );
+        vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+        vi.stubEnv("RUN_PROGRESS_TOKEN", "ptok");
+        vi.stubEnv("RUN_TOKEN", "run-token");
+        vi.stubEnv("GITHUB_RUN_ID", "1");
+        vi.stubEnv("GITHUB_RUN_ATTEMPT", "1");
+
+        const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+        const { pipeline, runner } = makeStepsPipeline([
+          ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true }) }],
+          [
+            "push",
+            {
+              run: vi.fn().mockResolvedValue({
+                prUrl: "https://github.com/acme/app/pull/7",
+                prNumber: 7,
+                branchPushed: true,
+                commitSha: "f".repeat(40),
+                draft: false,
+              }),
+            },
+          ],
+        ]);
+
+        const result = await runAutonomous({
+          workspaceDir,
+          pipeline,
+          runner,
+          reporter: new NoopStepReporter(),
+          llmExecutor: makeMockExecutor(0),
+          fetchImpl: mockFetch,
+        });
+
+        expect(result.exitCode).toBe(0);
+      });
+
+      it("never constructs activity reporting for a Legacy (non-pilot) dispatch, even with a callback URL and progress token set", async () => {
+        vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+        vi.stubEnv("RUN_PROGRESS_TOKEN", "ptok");
+        vi.stubEnv("RUN_TOKEN", "run-token");
+
+        const mod: StepModule = { run: vi.fn().mockResolvedValue({}) };
+        const { pipeline, runner } = makeSingleStepPipeline("do-work", mod);
+
+        const result = await runAutonomous({
+          workspaceDir,
+          pipeline,
+          runner,
+          reporter: new NoopStepReporter(),
+          llmExecutor: makeMockExecutor(0),
+        });
+
+        expect(result.exitCode).toBe(0);
+      });
+    });
+  });
+
   it("posts gap-analysis callback phase for PR_NUMBER runs", async () => {
     vi.stubEnv("PR_NUMBER", "42");
     vi.stubEnv("RUNNER_PHASE", "gap-analysis");
@@ -1054,6 +1688,215 @@ describe("runAutonomous", () => {
     expect(body.failureCode).toBe("REVIEW_UNAPPROVED");
     expect(body.failureReason).toContain("iterations_exhausted");
     expect(body.prUrl).toBe("https://github.com/o/r/pull/9");
+  });
+
+  it("reports INSTALL_FAILED (not success) when an approved run's dependencies never installed", async () => {
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    const { pipeline, runner } = makeStepsPipeline([
+      ["install", { run: vi.fn().mockResolvedValue({ installFailed: true, installMethod: "npm ci", installError: "npm ci failed: dependency conflict" }) }],
+      ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true, iterations: 2, terminationReason: "approved", passes: [] }) }],
+      ["install-retry", { run: vi.fn().mockResolvedValue({ installFailed: true, installMethod: "npm ci", installError: "npm ci failed again: dependency conflict".repeat(30) }) }],
+      [
+        "push",
+        {
+          run: vi.fn().mockResolvedValue({
+            prUrl: "https://github.com/o/r/pull/9",
+            prNumber: 9,
+            branchPushed: true,
+            draft: true,
+          }),
+        },
+      ],
+    ]);
+
+    try {
+      const result = await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeMockExecutor(0),
+        fetchImpl: mockFetch,
+      });
+
+      expect(result.exitCode).toBe(0);
+      const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
+        outcome: string;
+        failureCode: string;
+        failureReason: string;
+        prUrl: string;
+      };
+      expect(body.outcome).toBe("failure");
+      expect(body.failureCode).toBe("INSTALL_FAILED");
+      expect(body.prUrl).toBe("https://github.com/o/r/pull/9");
+      expect(body.failureReason).toContain(
+        "Dependency install failed twice (npm ci); the change was approved by review but never built or tested.",
+      );
+      expect(body.failureReason).toContain("npm ci failed again: dependency conflict");
+      // Capped at the first 500 characters of the retry's installError.
+      expect(body.failureReason.length).toBeLessThan(700);
+
+      expect(existsSync(join(workspaceDir, "ai-output", "comments", "95-run-stats.md"))).toBe(false);
+      expect(existsSync(join(workspaceDir, "ai-output", "comments", "90-run-autopsy.md"))).toBe(false);
+
+      const warnings = warn.mock.calls.map((call) => call.join(" ")).join("\n");
+      expect(warnings).toContain(
+        "::warning::AI-Implement: dependency install failed — draft PR opened: https://github.com/o/r/pull/9",
+      );
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("reports INSTALL_FAILED (not REVIEW_UNAPPROVED) when an initial run's dependencies never installed and post-push-review is registered but skipped", async () => {
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    const { pipeline, runner } = makeStepsPipeline([
+      ["install", { run: vi.fn().mockResolvedValue({ installFailed: true, installMethod: "npm ci", installError: "npm ci failed: dependency conflict" }) }],
+      ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true, iterations: 2, terminationReason: "approved", passes: [] }) }],
+      ["install-retry", { run: vi.fn().mockResolvedValue({ installFailed: true, installMethod: "npm ci", installError: "npm ci failed again: dependency conflict" }) }],
+      [
+        "push",
+        {
+          run: vi.fn().mockResolvedValue({
+            prUrl: "https://github.com/o/r/pull/9",
+            prNumber: 9,
+            branchPushed: true,
+            draft: true,
+          }),
+        },
+      ],
+      // Registered so pipeline.steps.some(id === "post-push-review") is true, mirroring a
+      // real pipeline. Its outputs resolve empty ({}) because the real step's own skip
+      // wiring (dependenciesMissing) would have skipped it — this stand-in never actually
+      // consults that skip logic, so the empty resolve simulates that outcome directly.
+      ["post-push-review", { run: vi.fn().mockResolvedValue({}) }],
+    ]);
+
+    try {
+      const result = await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeMockExecutor(0),
+        fetchImpl: mockFetch,
+      });
+
+      expect(result.exitCode).toBe(0);
+      const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
+        outcome: string;
+        failureCode: string;
+        prUrl: string;
+      };
+      expect(body.outcome).toBe("failure");
+      expect(body.failureCode).toBe("INSTALL_FAILED");
+      expect(body.prUrl).toBe("https://github.com/o/r/pull/9");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("reports INSTALL_FAILED with gap-fill wording (no literal 'undefined') when a gap-fill run's dependencies never installed", async () => {
+    vi.stubEnv("PR_NUMBER", "42");
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    const { pipeline, runner } = makeStepsPipeline([
+      ["install", { run: vi.fn().mockResolvedValue({ installFailed: true, installMethod: "npm ci", installError: "npm ci failed: dependency conflict" }) }],
+      ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true, iterations: 2, terminationReason: "approved", passes: [] }) }],
+      ["install-retry", { run: vi.fn().mockResolvedValue({ installFailed: true, installMethod: "npm ci", installError: "npm ci failed again: dependency conflict" }) }],
+      ["push", { run: vi.fn().mockResolvedValue({ prUrl: null, prNumber: 42, branchPushed: true }) }],
+    ]);
+
+    try {
+      const result = await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeMockExecutor(0),
+        fetchImpl: mockFetch,
+      });
+
+      expect(result.exitCode).toBe(0);
+      const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
+        outcome: string;
+        failureCode: string;
+        prUrl: string | null | undefined;
+      };
+      expect(body.outcome).toBe("failure");
+      expect(body.failureCode).toBe("INSTALL_FAILED");
+      expect(body.prUrl).toBeFalsy();
+
+      const warnings = warn.mock.calls.map((call) => call.join(" ")).join("\n");
+      expect(warnings).toContain(
+        "::warning::AI-Implement: dependency install failed — gap-fill on PR #42",
+      );
+      expect(warnings).not.toContain("undefined");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("keeps REVIEW_UNAPPROVED (not INSTALL_FAILED) when an unapproved run's dependencies also never installed", async () => {
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    const { pipeline, runner } = makeStepsPipeline([
+      ["install", { run: vi.fn().mockResolvedValue({ installFailed: true, installMethod: "npm ci", installError: "conflict" }) }],
+      [
+        "feedback-loop",
+        {
+          run: vi.fn().mockResolvedValue({
+            approved: false,
+            iterations: 3,
+            finalFeedback: "nope",
+            terminationReason: "iterations_exhausted",
+            passes: [],
+          }),
+        },
+      ],
+      ["install-retry", { run: vi.fn().mockResolvedValue({ installFailed: true, installMethod: "npm ci", installError: "still conflict" }) }],
+      [
+        "push",
+        {
+          run: vi.fn().mockResolvedValue({
+            prUrl: "https://github.com/o/r/pull/9",
+            prNumber: 9,
+            branchPushed: true,
+            draft: true,
+          }),
+        },
+      ],
+    ]);
+
+    const result = await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+      fetchImpl: mockFetch,
+    });
+
+    expect(result.exitCode).toBe(0);
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
+      outcome: string;
+      failureCode: string;
+    };
+    expect(body.outcome).toBe("failure");
+    expect(body.failureCode).toBe("REVIEW_UNAPPROVED");
   });
 
   it("reports the push step's actual non-draft PR state when an unapproved run reuses a real PR", async () => {

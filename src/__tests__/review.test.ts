@@ -129,7 +129,7 @@ describe("reviewStep", () => {
     await reviewStep.run(makeCtx(invoke), { diff: "diff" }, { report: vi.fn() });
 
     expect(invoke).toHaveBeenCalledWith(expect.objectContaining({
-      model: "claude-sonnet-5",
+      model: "claude-sonnet-5-5",
       jsonSchema: REVIEW_VERDICT_JSON_SCHEMA,
     }));
   });
