@@ -231,6 +231,8 @@ describe("new-project stepper — the four touch points a new field needs", () =
     ["maxIterations", "np-maxIterations"],
     ["prDispatchBudget", "np-prDispatchBudget"],
     ["maxJobMinutes", "np-maxJobMinutes"],
+    ["reviewProcess", "np-review-process"],
+    ["trustedReviewAuthors", "np-trusted-review-authors"],
   ])("%s is declared, reset, collected and submitted", (field, id) => {
     expect(stepperHtml).toContain(`id="${id}"`);
     expect(stepperScript).toContain(`data.${field} =`);
@@ -282,6 +284,8 @@ describe("new-project stepper — field placement", () => {
     ["np-maxTurns", 6],
     ["np-prDispatchBudget", 6],
     ["np-maxJobMinutes", 6],
+    ["np-review-process", 6],
+    ["np-trusted-review-authors", 6],
   ])("%s sits on step %i", (id, step) => {
     expect(stepOf(id)).toBe(step);
   });
@@ -297,7 +301,7 @@ describe("new-project stepper — field placement", () => {
 });
 
 describe("new-project stepper — review step", () => {
-  it.each([["branchPrefix"], ["caps"]])("has a review row for %s", (key) => {
+  it.each([["branchPrefix"], ["caps"], ["reviewProcess"], ["trustedReviewAuthors"]])("has a review row for %s", (key) => {
     expect(stepperHtml).toContain(`data-review="${key}"`);
   });
 
@@ -334,5 +338,20 @@ describe("new-project stepper — review step", () => {
     expect(pinned).toContain("claude-implement.yml");
     expect(pinned).toContain("claude-plan.yml");
     expect(pinned).toContain("Extra env");
+  });
+});
+
+describe("new-project stepper — review process and trusted authors", () => {
+  it("renders the select options and the exact hints", () => {
+    expect(stepperHtml).toContain('<option value="claude-code-review">Claude Code Review</option>');
+    expect(stepperHtml).toContain("Extra bot or user logins whose review findings count, in addition to the review process's own authors. A trusted author can approve a PR.");
+  });
+
+  it("resets the select, sends both fields, and escapes authors in the summary", () => {
+    expect(stepperScript).toContain("reviewProcessEl.value = 'ai-implement'");
+    expect(stepperScript).toContain("reviewProcess: data.reviewProcess");
+    expect(stepperScript).toContain("trustedReviewAuthors: data.trustedReviewAuthors");
+    expect(stepperScript).toContain("window.esc(l)");
+    expect(stepperScript).toContain("split('\\n')");
   });
 });

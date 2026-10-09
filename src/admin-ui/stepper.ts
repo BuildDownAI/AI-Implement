@@ -327,6 +327,19 @@ export const stepperHtml = `
             <div class="field-hint">Gap-fill runs per PR in 24 hours. At the limit, the PR is parked for a human.</div>
           </div>
           <div class="field">
+            <label class="field-label">Review process</label>
+            <select class="select" id="np-review-process">
+              <option value="ai-implement">AI-Implement</option>
+              <option value="claude-code-review">Claude Code Review</option>
+            </select>
+            <div class="field-hint">Who reviews this project's PRs and who fixes. Claude Code Review trusts claude[bot], reads the verdict from the review check run and Claude's inline comments, and keeps AI-Implement's fix attempt. Applies only with the Restate lifecycle; a Legacy project stores it and ignores it.</div>
+          </div>
+          <div class="field">
+            <label class="field-label">Trusted Review Authors <span style="font-weight:400;color:var(--fg-tertiary)">(optional)</span></label>
+            <textarea class="textarea" id="np-trusted-review-authors" rows="3" placeholder="topia-ai-implement-bot[bot]"></textarea>
+            <div class="field-hint">Extra bot or user logins whose review findings count, in addition to the review process's own authors. A trusted author can approve a PR.</div>
+          </div>
+          <div class="field">
             <label class="field-label">Job Timeout (min) <span style="font-weight:400;color:var(--fg-tertiary)">(optional)</span></label>
             <input class="input" type="number" id="np-maxJobMinutes" min="1" step="1" placeholder="90">
             <div class="field-hint">Applies to every execution mode (GitHub Actions, Fly, local Docker). Blank = 90.</div>
@@ -432,6 +445,15 @@ export const stepperHtml = `
             <div data-review="caps"></div>
           </div>
 
+          <div class="np-review-row">
+            <div class="np-review-label">Review process</div>
+            <div data-review="reviewProcess"></div>
+          </div>
+          <div class="np-review-row">
+            <div class="np-review-label">Trusted authors</div>
+            <div data-review="trustedReviewAuthors"></div>
+          </div>
+
           <div class="np-review-h">Secrets</div>
           <div class="np-review-row">
             <div class="np-review-label">Seeded</div>
@@ -491,6 +513,7 @@ export const stepperScript = `
     provider: 'anthropic', awsRegion: '',
     planningEnabled: true, autoApprovePlans: true, autoMerge: false,
     maxInProgressAiIssues: 3, maxTurns: null, maxIterations: null, prDispatchBudget: null, maxJobMinutes: null,
+    reviewProcess: 'ai-implement', trustedReviewAuthors: null,
     secrets: [],
   };
   let jiraFieldsLoaded = false;
@@ -529,13 +552,17 @@ export const stepperScript = `
     data.maxTurns = null;
     data.maxIterations = null;
     data.prDispatchBudget = null;
+    data.reviewProcess = 'ai-implement';
+    data.trustedReviewAuthors = null;
     data.maxJobMinutes = null;
     data.secrets = [];
 
     // Clear inputs. Not derived from the initializer above — a new field needs both.
-    const toClear = ['np-teamKey', 'np-filesystem-directory', 'np-owner', 'np-repo', 'np-defaultBranch', 'np-branch-prefix', 'np-skills-repo', 'np-refrepo-repo', 'np-refrepo-path', 'np-refrepo-ref', 'np-sensitive-add', 'np-sensitive-allow', 'np-awsRegion', 'np-maxTurns', 'np-maxIterations', 'np-prDispatchBudget', 'np-maxJobMinutes'];
+    const toClear = ['np-teamKey', 'np-filesystem-directory', 'np-owner', 'np-repo', 'np-defaultBranch', 'np-branch-prefix', 'np-skills-repo', 'np-refrepo-repo', 'np-refrepo-path', 'np-refrepo-ref', 'np-sensitive-add', 'np-sensitive-allow', 'np-awsRegion', 'np-maxTurns', 'np-maxIterations', 'np-prDispatchBudget', 'np-maxJobMinutes', 'np-trusted-review-authors'];
     const depScopeEl = document.getElementById('np-dep-token-scope');
     if (depScopeEl) depScopeEl.value = '';
+    const reviewProcessEl = document.getElementById('np-review-process');
+    if (reviewProcessEl) reviewProcessEl.value = 'ai-implement';
     for (const id of toClear) {
       const el = document.getElementById(id);
       if (el) el.value = '';
@@ -927,6 +954,11 @@ export const stepperScript = `
       data.maxTurns = optionalCap('np-maxTurns');
       data.maxIterations = optionalCap('np-maxIterations');
       data.prDispatchBudget = optionalCap('np-prDispatchBudget');
+      const rpEl = document.getElementById('np-review-process');
+      if (rpEl) data.reviewProcess = rpEl.value;
+      const taEl = document.getElementById('np-trusted-review-authors');
+      const authors = taEl ? taEl.value.split('\\n').map(function (x) { return x.trim(); }).filter(Boolean) : [];
+      data.trustedReviewAuthors = authors.length ? authors : null;
       data.maxJobMinutes = optionalCap('np-maxJobMinutes');
     } else if (n === 7) {
       const secrets = [];
@@ -1084,6 +1116,11 @@ export const stepperScript = `
       + ' &middot; iterations ' + capText(data.maxIterations)
       + ' &middot; PR budget ' + capText(data.prDispatchBudget)
       + ' &middot; timeout ' + capText(data.maxJobMinutes, ' min'));
+
+    set('reviewProcess', window.esc(data.reviewProcess));
+    set('trustedReviewAuthors', data.trustedReviewAuthors
+      ? data.trustedReviewAuthors.map(function (l) { return window.esc(l); }).join(', ')
+      : '&mdash;');
 
     const validSecrets = data.secrets.filter(function (s) { return s.name && s.value; });
     set('secrets', String(validSecrets.length));
@@ -1422,6 +1459,8 @@ export const stepperScript = `
       maxTurns: data.maxTurns,
       maxIterations: data.maxIterations,
       prDispatchBudget: data.prDispatchBudget,
+      reviewProcess: data.reviewProcess,
+      trustedReviewAuthors: data.trustedReviewAuthors,
       maxJobMinutes: data.maxJobMinutes,
       skillsRepo: data.skillsRepo || null,
       referenceRepos: data.referenceRepos.length ? data.referenceRepos : null,
