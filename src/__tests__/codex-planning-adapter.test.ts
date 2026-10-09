@@ -1,9 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { PassThrough } from "node:stream";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
-import { CodexExecutor } from "../pipeline/codex-executor.js";
+import { CodexExecutor, chatgptPlanProviderArgs } from "../pipeline/codex-executor.js";
 import type { ModelAuthClient, ModelInvocation } from "../model-auth-client.js";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -168,11 +168,12 @@ class FakeServer {
   }
 }
 
-function drive(server: FakeServer, redact: (s: string) => string = (s) => s): Promise<CodexTransportResult> {
+function drive(server: FakeServer, redact: (s: string) => string = (s) => s, modelProvider?: string): Promise<CodexTransportResult> {
   return createCodexPlanningDriver().run({
     io: { stdin: server.stdin, stdout: server.stdout, halt: server.halt.signal },
     prompt: "plan it",
     model: "gpt-synthetic",
+    ...(modelProvider ? { modelProvider } : {}),
     workspaceDir: ws,
     forbiddenRoots: [],
     redact,
@@ -207,6 +208,19 @@ const completeTurn = (s: FakeServer): void => {
 };
 
 describe("planning protocol driver", () => {
+  it("sends the supplied model provider in thread/start", async () => {
+    const server = new FakeServer((m, s) => {
+      if (handshake(m, s)) return;
+      if (m.method === "turn/start") {
+        ack(m, s);
+        completeTurn(s);
+      }
+    });
+    await drive(server, (t) => t, "chatgpt_plan");
+    const thread = server.received.find((m) => m.method === "thread/start")!.params as Msg;
+    expect(thread.modelProvider).toBe("chatgpt_plan");
+  });
+
   it("negotiates, serves the three tools and completes the expected turn", async () => {
     writeFileSync(join(ws, "a.txt"), "needle line");
     let step = 0;
@@ -240,6 +254,7 @@ describe("planning protocol driver", () => {
     const init = server.received[0].params as Msg;
     expect(init.capabilities).toEqual({ experimentalApi: true });
     const thread = server.received.find((m) => m.method === "thread/start")!.params as Msg;
+    expect(thread.modelProvider).toBe("openai");
     expect(thread.ephemeral).toBe(true);
     expect(thread.approvalPolicy).toBe("never");
     expect(thread.sandbox).toBe("read-only");
@@ -901,4 +916,44 @@ describe.skipIf(!pinnedCodex && !pinnedRequired)("pinned codex app-server (synth
     for (const body of hostileRun.bodies) expect((JSON.parse(body) as { model: string }).model).toBe("gpt-synthetic");
     expect(hostileRun.bodies.join("\n")).not.toContain("evil-model");
   }, 240_000);
+});
+
+// Config acceptance for the ChatGPT plan provider (AII-1202): the pinned CLI must not reject the seven pairs on
+// either path. A fake token and no network reachable from the test are enough: a config error exits at startup.
+describe.skipIf(!pinnedCodex && !pinnedRequired)("pinned codex accepts the chatgpt_plan provider pairs", () => {
+  const CONFIG_REJECTION = /unknown (field|key|variant)|invalid (type|value|config)|error loading config|failed to (parse|load) config/i;
+
+  function startup(args: string[]): Promise<{ exited: boolean; code: number | null; stderr: string }> {
+    const home = mkdtempSync(join(tmpdir(), "pinned-plan-home-"));
+    return new Promise((resolve) => {
+      const child = spawn("codex", args, {
+        cwd: home,
+        env: { PATH: process.env.PATH ?? "/usr/bin", HOME: home, CODEX_HOME: home, CHATGPT_PLAN_ACCESS_TOKEN: "fake-chatgpt-plan-token" },
+        stdio: ["pipe", "ignore", "pipe"],
+      });
+      let stderr = "";
+      let exited = false;
+      child.stderr.on("data", (c: Buffer) => (stderr += c.toString("utf8")));
+      const done = (code: number | null) => {
+        clearTimeout(timer);
+        rmSync(home, { recursive: true, force: true });
+        resolve({ exited, code, stderr });
+      };
+      child.on("close", (code) => {
+        exited = true;
+        done(code);
+      });
+      const timer = setTimeout(() => child.kill("SIGKILL"), 3_000);
+    });
+  }
+
+  it("codex app-server --strict-config starts and stays up with the pairs", async () => {
+    const r = await startup(["app-server", "--strict-config", ...chatgptPlanProviderArgs()]);
+    expect(r.stderr).not.toMatch(CONFIG_REJECTION);
+  }, 15_000);
+
+  it("codex exec does not reject the pairs", async () => {
+    const r = await startup(["exec", "--skip-git-repo-check", "--sandbox", "read-only", ...chatgptPlanProviderArgs(), "say ok"]);
+    expect(r.stderr).not.toMatch(CONFIG_REJECTION);
+  }, 15_000);
 });

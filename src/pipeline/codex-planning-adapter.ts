@@ -88,6 +88,8 @@ export interface CodexTransportRunInput {
   io: CodexTransportIo;
   prompt: string;
   model: string;
+  /** Provider id for `thread/start`; "openai" when absent. */
+  modelProvider?: string;
   workspaceDir: string;
   /** Executor-generated trusted empty cwd for the protocol thread; host tools still root at `workspaceDir`. */
   protocolCwd?: string;
@@ -451,7 +453,7 @@ function runSession(input: CodexTransportRunInput): Promise<CodexTransportResult
         send({ method: "initialized" });
         request("thread", "thread/start", {
           model: input.model,
-          modelProvider: "openai",
+          modelProvider: input.modelProvider ?? "openai",
           cwd: input.protocolCwd ?? ctx.root,
           approvalPolicy: "never",
           sandbox: "read-only",

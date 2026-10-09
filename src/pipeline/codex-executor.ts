@@ -9,10 +9,29 @@ import type { CodexProtocolDriver, CodexTransportResult } from "./codex-planning
 import { classifyLlmResult, classifySpawnError, isLlmResultFailure, type FailureRecord } from "./failure-classification.js";
 import { computeBackoffMs } from "./retry-backoff.js";
 import { suspendOriginWriteCredential } from "./executor.js";
-import type { ModelAuthClient } from "../model-auth-client.js";
+import { CHATGPT_PLAN_ACCESS_TOKEN_ENV, type ModelAuthClient, type ModelInvocation } from "../model-auth-client.js";
 
 /** Provider pinned for every Codex invocation; Codex runs never switch provider or billing mode. */
 export const CODEX_PROVIDER = "openai";
+
+/** Provider id for a ChatGPT plan access token, sent to the Responses API with no `auth.json`. */
+export const CHATGPT_PLAN_PROVIDER = "chatgpt_plan";
+
+/** The seven `-c key=value` pairs that select the ChatGPT plan provider, as flat argv. */
+export const chatgptPlanProviderArgs = (): string[] => {
+  const t = `model_providers.${CHATGPT_PLAN_PROVIDER}`;
+  return [
+    `model_provider="${CHATGPT_PLAN_PROVIDER}"`,
+    `${t}.name="ChatGPT plan"`,
+    `${t}.base_url="https://api.openai.com/v1"`,
+    `${t}.env_key=${JSON.stringify(CHATGPT_PLAN_ACCESS_TOKEN_ENV)}`,
+    `${t}.wire_api="responses"`,
+    `${t}.requires_openai_auth=false`,
+    `${t}.supports_websockets=false`,
+  ].flatMap((pair) => ["-c", pair]);
+};
+
+type CodexProviderKind = ModelInvocation["codexProvider"];
 
 /**
  * Credential names removed from the environment of every shell command the model runs. Codex's own process
@@ -445,6 +464,7 @@ export class CodexExecutor implements LLMExecutor {
   private async invokeOnce(params: InvokeParams, deadlineAt: number | null): Promise<Attempt> {
     let signalRecovery: (err: CodexRecoveryRequiredError) => void = () => {};
     const recovery = new Promise<never>((_, reject) => (signalRecovery = reject));
+    const requiredMs = deadlineAt !== null ? Math.max(0, deadlineAt - this.now()) : params.invocationTimeoutMs;
     try {
       // If the child cannot be proven dead, or its refreshed session could not be safely persisted, the
       // callback must never settle: the client checkpoints on both return and throw, so settling would
@@ -453,7 +473,7 @@ export class CodexExecutor implements LLMExecutor {
       // recovery-required error to the caller.
       const invocation = this.options.auth.invoke(this.options.profileId, async (selected) => {
         try {
-          return await this.runChild(params, selected.env, deadlineAt);
+          return await this.runChild(params, selected.env, deadlineAt, selected.codexProvider);
         } catch (err) {
           const held = this.held;
           if (held && (held.reason === "child_not_terminated" || held.reason === "auth_sync_failed")) {
@@ -462,7 +482,7 @@ export class CodexExecutor implements LLMExecutor {
           }
           throw err;
         }
-      });
+      }, requiredMs !== undefined ? { requiredMs } : undefined);
       invocation.catch(() => {});
       return await Promise.race([invocation, recovery]);
     } catch (err) {
@@ -490,7 +510,7 @@ export class CodexExecutor implements LLMExecutor {
     }
   }
 
-  private buildArgs(params: InvokeParams, schemaPath: string | null, baseUrl?: string): string[] {
+  private buildArgs(params: InvokeParams, schemaPath: string | null, baseUrl?: string, provider?: CodexProviderKind): string[] {
     // Pinned selection is placed on argv, after the ignore flags, so user or project config
     // cannot change it. No Claude-only flag and no bypass or approve-all flag is ever passed.
     const args = [
@@ -500,10 +520,9 @@ export class CodexExecutor implements LLMExecutor {
       "--ignore-rules",
       "--model",
       params.model,
-      "-c",
-      `model_provider="${CODEX_PROVIDER}"`,
+      ...(provider === "chatgpt-plan" ? chatgptPlanProviderArgs() : ["-c", `model_provider="${CODEX_PROVIDER}"`]),
       ...shellEnvPolicyArgs(),
-      ...(baseUrl ? ["-c", `openai_base_url=${JSON.stringify(baseUrl)}`] : []),
+      ...(baseUrl && provider !== "chatgpt-plan" ? ["-c", `openai_base_url=${JSON.stringify(baseUrl)}`] : []),
       ...this.sandboxArgs(params),
     ];
     if (schemaPath) args.push("--output-schema", schemaPath);
@@ -513,7 +532,7 @@ export class CodexExecutor implements LLMExecutor {
   }
 
   /** Trusted app-server argv. Nothing here is model- or repository-controlled; config comes only from argv. */
-  private buildAppServerArgs(params: InvokeParams): string[] {
+  private buildAppServerArgs(params: InvokeParams, provider?: CodexProviderKind): string[] {
     // The pinned app-server accepts only --stdio/--strict-config/-c: no --ignore-* flags. Isolation comes
     // from the executor-owned trusted CODEX_HOME and empty cwd (see createAppServerView); --strict-config
     // only rejects unknown settings, it does not ignore configuration.
@@ -522,8 +541,7 @@ export class CodexExecutor implements LLMExecutor {
       "--strict-config",
       "-c",
       `model=${JSON.stringify(params.model)}`,
-      "-c",
-      `model_provider="${CODEX_PROVIDER}"`,
+      ...(provider === "chatgpt-plan" ? chatgptPlanProviderArgs() : ["-c", `model_provider="${CODEX_PROVIDER}"`]),
       "-c",
       'approval_policy="never"',
       "-c",
@@ -549,13 +567,13 @@ export class CodexExecutor implements LLMExecutor {
    * the SELECTED profile's auth.json, an empty HOME, and an empty protocol cwd. Nothing else from the selected home,
    * the user home or the repository is visible to the child's config/rules/MCP loaders.
    */
-  private createAppServerView(selectedHome: string | undefined, model: string, baseUrl?: string): AppServerView {
+  private createAppServerView(selectedHome: string | undefined, model: string, baseUrl?: string, provider?: CodexProviderKind): AppServerView {
     const root = mkdtempSync(join(tmpdir(), "codex-view-"));
     const home = join(root, "home");
     const cwd = join(root, "cwd");
     const userHome = join(root, "user-home");
     try {
-      return this.populateAppServerView({ root, home, cwd, userHome }, selectedHome, model, baseUrl);
+      return this.populateAppServerView({ root, home, cwd, userHome }, selectedHome, model, baseUrl, provider);
     } catch (err) {
       // No child exists yet, so removing a half-built view cannot race a live process.
       rmSync(root, { recursive: true, force: true });
@@ -568,7 +586,9 @@ export class CodexExecutor implements LLMExecutor {
     selectedHome: string | undefined,
     model: string,
     baseUrl?: string,
+    provider?: CodexProviderKind,
   ): AppServerView {
+    const plan = provider === "chatgpt-plan";
     mkdirSync(home, { mode: 0o700 });
     mkdirSync(userHome, { mode: 0o700 });
     mkdirSync(cwd, { mode: 0o700 });
@@ -576,19 +596,31 @@ export class CodexExecutor implements LLMExecutor {
       join(home, "config.toml"),
       [
         `model = ${JSON.stringify(model)}`,
-        `model_provider = "${CODEX_PROVIDER}"`,
+        `model_provider = "${plan ? CHATGPT_PLAN_PROVIDER : CODEX_PROVIDER}"`,
         'approval_policy = "never"',
         'sandbox_mode = "read-only"',
         // The only sanctioned provider redirect: the SELECTED invoke env's OPENAI_BASE_URL (trusted, set by
         // the auth client or a synthetic test), never the selected home's or repository's config.
-        ...(baseUrl ? [`openai_base_url = ${JSON.stringify(baseUrl)}`] : []),
+        ...(baseUrl && !plan ? [`openai_base_url = ${JSON.stringify(baseUrl)}`] : []),
+        ...(plan
+          ? [
+              "",
+              `[model_providers.${CHATGPT_PLAN_PROVIDER}]`,
+              'name = "ChatGPT plan"',
+              'base_url = "https://api.openai.com/v1"',
+              `env_key = ${JSON.stringify(CHATGPT_PLAN_ACCESS_TOKEN_ENV)}`,
+              'wire_api = "responses"',
+              "requires_openai_auth = false",
+              "supports_websockets = false",
+            ]
+          : []),
         "",
       ].join("\n"),
       { mode: 0o600 },
     );
     let source: string | null = null;
     let initial: string | null = null;
-    if (selectedHome) {
+    if (selectedHome && !plan) {
       const candidate = join(selectedHome, "auth.json");
       if (existsSync(candidate)) {
         // Read once and write that exact text, so the baseline and the view cannot diverge. A malformed
@@ -644,7 +676,7 @@ export class CodexExecutor implements LLMExecutor {
     }
   }
 
-  private async runChild(params: InvokeParams, selectedEnv: Record<string, string>, deadlineAt: number | null): Promise<Attempt> {
+  private async runChild(params: InvokeParams, selectedEnv: Record<string, string>, deadlineAt: number | null, provider?: CodexProviderKind): Promise<Attempt> {
     let env = selectedEnv;
     let view: AppServerView | null = null;
     let restoreOrigin: (() => void) | null = null;
@@ -665,15 +697,15 @@ export class CodexExecutor implements LLMExecutor {
         writeFileSync(schemaPath, JSON.stringify(params.jsonSchema), { mode: 0o600 });
       }
       if (this.options.protocolDriver) {
-        view = this.createAppServerView(selectedEnv.CODEX_HOME, params.model, validateSelectedOpenAIBaseUrl(selectedEnv.OPENAI_BASE_URL));
+        view = this.createAppServerView(selectedEnv.CODEX_HOME, params.model, validateSelectedOpenAIBaseUrl(selectedEnv.OPENAI_BASE_URL), provider);
         env = { ...selectedEnv, CODEX_HOME: view.home, HOME: view.userHome };
       }
-      const args = this.options.protocolDriver ? this.buildAppServerArgs(params) : this.buildArgs(params, schemaPath, validateSelectedOpenAIBaseUrl(selectedEnv.OPENAI_BASE_URL));
+      const args = this.options.protocolDriver ? this.buildAppServerArgs(params, provider) : this.buildArgs(params, schemaPath, validateSelectedOpenAIBaseUrl(selectedEnv.OPENAI_BASE_URL), provider);
       // Auth acquisition and view setup may have consumed the budget: never spawn with an expired timeout.
       if (deadlineAt !== null && this.now() >= deadlineAt) return expiredAttempt();
-      const attempt = await this.spawnAndWait(params, args, env, view ?? undefined, selectedEnv.CODEX_HOME, deadlineAt);
+      const attempt = await this.spawnAndWait(params, args, env, view ?? undefined, selectedEnv.CODEX_HOME, deadlineAt, provider);
       // spawnAndWait throws rather than returning while a child may live; the explicit guard keeps that invariant local.
-      if (view && !this.held) this.syncAuthBack(view);
+      if (view && !this.held && provider !== "chatgpt-plan") this.syncAuthBack(view);
       return attempt;
     } finally {
       if (schemaDir) rmSync(schemaDir, { recursive: true, force: true });
@@ -699,6 +731,7 @@ export class CodexExecutor implements LLMExecutor {
     view?: AppServerView,
     selectedHome?: string,
     deadlineAt: number | null = null,
+    provider?: CodexProviderKind,
   ): Promise<Attempt> {
     const termWaitMs = this.options.termWaitMs ?? DEFAULT_TERM_WAIT_MS;
     const killWaitMs = this.options.killWaitMs ?? DEFAULT_KILL_WAIT_MS;
@@ -793,6 +826,7 @@ export class CodexExecutor implements LLMExecutor {
           io: { stdin: proc.stdin, stdout: proc.stdout, halt: haltController.signal },
           prompt: params.prompt,
           model: params.model,
+          ...(provider === "chatgpt-plan" ? { modelProvider: CHATGPT_PLAN_PROVIDER } : {}),
           workspaceDir: this.workspaceDir,
           ...(view ? { protocolCwd: view.cwd } : {}),
           ...(params.jsonSchema ? { jsonSchema: params.jsonSchema } : {}),
