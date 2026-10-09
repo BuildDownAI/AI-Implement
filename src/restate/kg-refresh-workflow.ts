@@ -41,6 +41,7 @@ import type { BackendRunRead } from "../backend-run.js";
 import type { MachineExit } from "../fly-machines.js";
 import { parseKgSourceRepo } from "../deploy.js";
 import type { Step } from "../pipeline/types.js";
+import type { RunConfigV1 } from "../run-config.js";
 import { KG_REFRESH_RUNNER_STEPS, type KgRepoDefinition } from "./kg-refresh-types.js";
 import { readBoundedOwnedRun } from "./owned-run-lifecycle.js";
 import { awaitOwnedRun, type OwnedRunStatus } from "./owned-run-wait.js";
@@ -93,9 +94,9 @@ export interface KgRefreshReportBody {
 }
 
 export interface KgDispatchInput {
-  runConfig: KgRefreshRunInput;
+  /** The run's configuration, built once by the journaled `envelope` step. Carries no token. */
+  envelope: RunConfigV1;
   tokens: { runToken: string; progressToken: string; publicationToken: string };
-  issueIdentifier: string;
   /** The workflow's own dispatch id — the one its run tokens and `dispatch_log` row carry. */
   dispatchId: string;
   /** The Fly machine size for this run, read once from `FlyMachineProfile/kg-refresh` before the dispatch step. */
@@ -180,6 +181,8 @@ export interface KgRefreshWorkflowDependencies {
   kgSourceRepo: string;
   mintRunTokens(input: { dispatchId: string; ttlSeconds: number }): { runToken: string; progressToken: string; publicationToken: string };
   dispatch(input: KgDispatchInput): Promise<KgDispatchResult>;
+  /** Builds the run's `RunConfigV1` from the run input and the run title. Pure; the `envelope` step journals the result. */
+  buildEnvelope(run: KgRefreshRunInput, issueIdentifier: string): RunConfigV1;
   /** Computes the row's values from config and the environment, with no store I/O; the `resolve` step journals the answer. */
   resolveDispatchRecord(dispatchId: string): KgDispatchRecord;
   /** Projects the journaled record onto the `dispatch_log` row. Idempotent on `dispatchId`. */
@@ -353,6 +356,8 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
 
       const ttlSeconds = Math.ceil(totalDeadlineMs / 1000);
       const issueIdentifier = `KG-REFRESH · ${triggerId}`;
+      // Journaled once: every retry of the dispatch step sends this same envelope.
+      const envelope = await ctx.run("envelope", () => deps.buildEnvelope(input, issueIdentifier));
 
       // Tokens are minted inside the journaled step and never leave it: the step result
       // carries no secret, so none reaches the Restate journal. Minted at most once per
@@ -386,7 +391,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
           }
           minted ??= deps.mintRunTokens({ dispatchId, ttlSeconds });
           const machineNonce = executionMode === GHA_EXECUTION_MODE ? null : deps.deriveMachineNonce(dispatchId, attempt);
-          const result = await deps.dispatch({ runConfig: input, tokens: minted, issueIdentifier, dispatchId, machine, machineId: claim.machineId, executionMode, machineNonce });
+          const result = await deps.dispatch({ envelope, tokens: minted, dispatchId, machine, machineId: claim.machineId, executionMode, machineNonce });
           return {
             outcome: result.outcome, runId: result.runId, runUrl: result.runUrl,
             jobId: result.jobId, executionMode: result.executionMode,

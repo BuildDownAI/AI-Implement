@@ -2504,7 +2504,7 @@ describe("kg-refresh execution path selection (resolveExecutionPath with github-
   it("shadow mode returns both, which kg-refresh collapses to github-actions", () => {
     const resolved = resolveExecutionPath("shadow", "github-actions");
     expect(resolved).toBe("both");
-    // dispatchKgRefreshRun collapses "both" to "github-actions" to prevent two
+    // the KG refresh senders collapses "both" to "github-actions" to prevent two
     // concurrent ingest runs racing to push the same snapshot commit.
     const effective = resolved === "both" ? "github-actions" : resolved;
     expect(effective).toBe("github-actions");
@@ -3263,10 +3263,10 @@ describe("runKgRefresh — KgIngestError maps to KG_INGEST_FAILED", () => {
 });
 
 // ── GHA kg-refresh dispatch — runner_image resolution ────────────────────────
-// Verifies that dispatchKgRefreshRun's GHA branch forwards runner_image using
+// Verifies that the KG refresh senders's GHA branch forwards runner_image using
 // the same channel-policy helper as the implement dispatch path.
 //
-// dispatchKgRefreshRun is not exported (index.ts is the application entry
+// the KG refresh senders is not exported (index.ts is the application entry
 // point with side-effectful startup; it has no exports). The tests below cover
 // two layers:
 //   1. resolveRunnerImageForDispatch in isolation — ensures the helper returns
@@ -3362,8 +3362,8 @@ describe("GHA kg-refresh dispatch — runner_image resolution via resolveRunnerI
 
 // ── GHA kg-refresh dispatch — inputs shape contract ───────────────────────────
 // Documents the expected shape of the workflow_dispatch inputs that
-// dispatchKgRefreshRun sends to claude-implement.yml with runner_phase=kg-refresh.
-// dispatchKgRefreshRun is not exported (index.ts is the application entry point
+// the KG refresh senders sends to claude-implement.yml with runner_phase=kg-refresh.
+// the KG refresh senders is not exported (index.ts is the application entry point
 // with side-effectful startup). These tests verify the contract by constructing
 // the expected inputs object inline, paired with template tests that verify
 // claude-implement.yml declares the matching inputs.

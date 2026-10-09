@@ -14,7 +14,7 @@ import { encodeRunConfig, type RunConfigV1 } from "../run-config.js";
 import type { resolveWorkflowCapabilities } from "../workflow-probe.js";
 import type { KgRailDeps } from "../kg-refresh-rail.js";
 import type { FlyMachineProfileConfig } from "./fly-machine-profile.js";
-import { KG_REFRESH_WORKFLOW_FILE, launchKeptMachine, type KeptMachineFly } from "./kg-refresh-production.js";
+import { KG_REFRESH_WORKFLOW_FILE, launchKeptMachine, syncRowToMachineNonce, type KeptMachineFly } from "./kg-refresh-production.js";
 import type { KgDispatchResult } from "./kg-refresh-workflow.js";
 
 export interface KgRefreshSendInput {
@@ -114,6 +114,8 @@ export function createKgRefreshSenders(deps: KgRefreshSenderDeps): Record<KgExec
     const launched = await launchKeptMachine(deps.keptMachineFly(), {
       keptMachineId: input.machineId, dispatchId: input.dispatchId, machineConfig, machineNonce,
     });
+    // A reused, already-started machine keeps the nonce it was launched with; re-arm the row to it so /api/token matches.
+    syncRowToMachineNonce(input.dispatchId, machineNonce, launched.machineNonce);
     console.log(`[kg-refresh] dispatched via Fly (${launched.reused ? "reused" : "created"} machine ${launched.machineId}) (dispatchId=${input.dispatchId})`);
     // The nonce authenticates the machine to /api/token: the workflow armed it on the row, and it never enters the journaled result.
     return {
