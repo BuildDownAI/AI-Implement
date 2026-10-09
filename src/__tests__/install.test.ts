@@ -1,20 +1,19 @@
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, it, expect, vi } from "vitest";
+import type { DefaultPipelineContext } from "../pipeline/context.js";
 import { installStep, parseReviewCheckNamesConfig, parseReviewersConfig } from "../pipeline/steps/install.js";
 import { REVIEWER_VERDICT_SCHEMA } from "../pipeline/reviewers/schema.js";
+import type { PipelineContextData } from "../pipeline/types.js";
+import { makeContext } from "./helpers/builders.js";
+import { fakeFetch, type FakeFetch, type Reply } from "./helpers/fake-fetch.js";
+import { testDir } from "./helpers/test-dir.js";
 
-const tempDirs: string[] = [];
-
-function makeWorkspace(prefix = "ai-implement-install-reviewers-"): string {
-  const dir = mkdtempSync(join(tmpdir(), prefix));
-  tempDirs.push(dir);
-  return dir;
-}
-
-function makeContext(data: Record<string, unknown> = {}, cloneOutputs: Record<string, unknown> = {}) {
-  return { data, getOutputs: (stepId: string) => stepId === "clone" ? cloneOutputs : {} } as never;
+/** A pipeline context with `data`, and the clone step's outputs when given. */
+function installContext(data: Partial<PipelineContextData> = {}, cloneOutputs?: Record<string, unknown>): DefaultPipelineContext {
+  const context = makeContext(data);
+  if (cloneOutputs) context.setOutputs("clone", cloneOutputs);
+  return context;
 }
 
 function reviewerPrompt(reviewer: { buildPrompt(input: { issueIdentifier: string; issueTitle: string; issueDescription: string; prNumber: string; diff: string; previousFindings: string }): string }): string {
@@ -28,23 +27,22 @@ function reviewerPrompt(reviewer: { buildPrompt(input: { issueIdentifier: string
   });
 }
 
-function contentsApiResponse(fileBody: string): Record<string, unknown> {
+function contentsApiResponse(fileBody: string): Reply {
   return {
-    type: "file",
-    encoding: "base64",
-    content: Buffer.from(fileBody, "utf8").toString("base64"),
+    json: {
+      type: "file",
+      encoding: "base64",
+      content: Buffer.from(fileBody, "utf8").toString("base64"),
+    },
   };
 }
 
-function mockContentsFetch(status: number, body?: unknown): ReturnType<typeof vi.fn<typeof fetch>> {
-  return vi.fn<typeof fetch>(async () => new Response(
-    body === undefined ? "" : JSON.stringify(body),
-    { status },
-  ));
+/** GitHub's contents API answering for acme/app's `.ai-implement/config.yml` on the default branch. */
+function trustedConfig(reply: Reply): FakeFetch {
+  return fakeFetch({ "GET /repos/acme/app/contents/.ai-implement/config.yml": reply });
 }
 
 afterEach(() => {
-  for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
   vi.restoreAllMocks();
 });
 
@@ -133,7 +131,7 @@ describe("parseReviewersConfig", () => {
 
 describe("installStep reviewers output", () => {
   it("exposes reviewers from .ai-implement/config.yml without running install when no package.json exists", async () => {
-    const workspaceDir = makeWorkspace();
+    const workspaceDir = testDir("ai-implement-install-reviewers");
     mkdirSync(join(workspaceDir, ".ai-implement"), { recursive: true });
     writeFileSync(join(workspaceDir, ".ai-implement", "config.yml"), [
       "reviewers:",
@@ -146,7 +144,7 @@ describe("installStep reviewers output", () => {
     ].join("\n"));
 
     const outputs = await installStep.run(
-      makeContext(),
+      installContext(),
       { workspaceDir },
       {} as never,
     );
@@ -176,7 +174,7 @@ describe("installStep reviewers output", () => {
   });
 
   it("fetches selected gating config reviewers from the trusted default-branch config without a ref", async () => {
-    const workspaceDir = makeWorkspace();
+    const workspaceDir = testDir("ai-implement-install-reviewers");
     mkdirSync(join(workspaceDir, ".ai-implement"), { recursive: true });
     writeFileSync(join(workspaceDir, ".ai-implement", "config.yml"), [
       "reviewers:",
@@ -185,7 +183,7 @@ describe("installStep reviewers output", () => {
       "    prompt: malicious PR prompt",
       "",
     ].join("\n"));
-    const fetchImpl = mockContentsFetch(200, contentsApiResponse([
+    const github = trustedConfig(contentsApiResponse([
       "reviewers:",
       "  - id: domain-review",
       "    model: claude-sonnet-5-5",
@@ -196,24 +194,21 @@ describe("installStep reviewers output", () => {
     ].join("\n")));
 
     const outputs = await installStep.run(
-      makeContext({
+      installContext({
         githubOwner: "acme",
         githubRepo: "app",
         githubToken: "ghs_secret",
         reviewers: [{ id: "domain-review", gates: true }],
         trustedReviewerDefinitions: new Map(),
       }),
-      { workspaceDir, fetchImpl },
+      { workspaceDir, fetchImpl: github.fetch },
       {} as never,
     );
 
-    expect(fetchImpl).toHaveBeenCalledOnce();
-    const firstCall = fetchImpl.mock.calls[0]!;
-    expect(firstCall[0]).toBe("https://api.github.com/repos/acme/app/contents/.ai-implement/config.yml");
-    expect(String(firstCall[0])).not.toContain("ref=");
-    expect(firstCall[1]).toEqual(expect.objectContaining({
-      headers: expect.objectContaining({ Authorization: "Bearer ghs_secret" }),
-    }));
+    expect(github.calls).toHaveLength(1);
+    expect(github.calls[0].url.href).toBe("https://api.github.com/repos/acme/app/contents/.ai-implement/config.yml");
+    expect(github.calls[0].url.search).toBe("");
+    expect(github.calls[0].headers.get("authorization")).toBe("Bearer ghs_secret");
     expect(reviewerPrompt(outputs.reviewers![0]!)).toBe("malicious PR prompt");
     expect(outputs.trustedConfigReviewers.map((reviewer) => ({ id: reviewer.id, model: reviewer.model }))).toEqual([
       { id: "domain-review", model: "claude-sonnet-5-5" },
@@ -222,8 +217,8 @@ describe("installStep reviewers output", () => {
   });
 
   it("uses the current clone output credential without adding it to install inputs", async () => {
-    const workspaceDir = makeWorkspace();
-    const fetchImpl = mockContentsFetch(200, contentsApiResponse([
+    const workspaceDir = testDir("ai-implement-install-reviewers");
+    const github = trustedConfig(contentsApiResponse([
       "reviewers:",
       "  - id: domain-review",
       "    prompt: trusted default prompt",
@@ -231,27 +226,24 @@ describe("installStep reviewers output", () => {
     ].join("\n")));
 
     await installStep.run(
-      makeContext({
+      installContext({
         githubOwner: "stale-owner",
         githubRepo: "stale-repo",
         githubToken: "",
         reviewers: [{ id: "domain-review", gates: true }],
         trustedReviewerDefinitions: new Map(),
       }, { repoOwner: "acme", repoRepo: "app", githubToken: "fresh-token" }),
-      { workspaceDir, fetchImpl },
+      { workspaceDir, fetchImpl: github.fetch },
       {} as never,
     );
 
-    const firstCall = fetchImpl.mock.calls[0]!;
-    expect(firstCall[0]).toBe("https://api.github.com/repos/acme/app/contents/.ai-implement/config.yml");
-    expect(firstCall[1]).toEqual(expect.objectContaining({
-      headers: expect.objectContaining({ Authorization: "Bearer fresh-token" }),
-    }));
+    expect(github.calls[0].url.href).toBe("https://api.github.com/repos/acme/app/contents/.ai-implement/config.yml");
+    expect(github.calls[0].headers.get("authorization")).toBe("Bearer fresh-token");
   });
 
   it("fetches trusted config even when the PR branch deletes the local config entry", async () => {
-    const workspaceDir = makeWorkspace();
-    const fetchImpl = mockContentsFetch(200, contentsApiResponse([
+    const workspaceDir = testDir("ai-implement-install-reviewers");
+    const github = trustedConfig(contentsApiResponse([
       "reviewers:",
       "  - id: domain-review",
       "    prompt: trusted default prompt",
@@ -259,47 +251,47 @@ describe("installStep reviewers output", () => {
     ].join("\n")));
 
     const outputs = await installStep.run(
-      makeContext({
+      installContext({
         githubOwner: "acme",
         githubRepo: "app",
         githubToken: "ghs_secret",
         reviewers: [{ id: "domain-review", gates: true }],
         trustedReviewerDefinitions: new Map(),
       }),
-      { workspaceDir, fetchImpl },
+      { workspaceDir, fetchImpl: github.fetch },
       {} as never,
     );
 
-    expect(fetchImpl).toHaveBeenCalledOnce();
+    expect(github.calls).toHaveLength(1);
     expect(outputs.reviewers).toBeUndefined();
     expect(outputs.trustedConfigReviewers.map((reviewer) => reviewer.id)).toEqual(["domain-review"]);
   });
 
   it("does not fetch trusted config for an actual built-in even without a precomputed trusted map", async () => {
-    const workspaceDir = makeWorkspace();
-    const fetchImpl = vi.fn();
+    const workspaceDir = testDir("ai-implement-install-reviewers");
+    const github = fakeFetch({});
 
     const outputs = await installStep.run(
-      makeContext({
+      installContext({
         githubOwner: "acme",
         githubRepo: "app",
         githubToken: "ghs_secret",
         reviewers: [{ id: "gap-analysis", gates: true }],
       }),
-      { workspaceDir, fetchImpl },
+      { workspaceDir, fetchImpl: github.fetch },
       {} as never,
     );
 
-    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(github.calls).toHaveLength(0);
     expect(outputs.trustedConfigReviewers).toEqual([]);
   });
 
   it("does not fetch trusted config for selected built-in, image-baked, external, or advisory-only reviewers", async () => {
-    const workspaceDir = makeWorkspace();
-    const fetchImpl = vi.fn();
+    const workspaceDir = testDir("ai-implement-install-reviewers");
+    const github = fakeFetch({});
 
     const outputs = await installStep.run(
-      makeContext({
+      installContext({
         githubOwner: "acme",
         githubRepo: "app",
         githubToken: "ghs_secret",
@@ -315,35 +307,41 @@ describe("installStep reviewers output", () => {
           ["image-review", { id: "image-review", buildPrompt: () => "image", outputSchema: REVIEWER_VERDICT_SCHEMA }],
         ]),
       }),
-      { workspaceDir, fetchImpl },
+      { workspaceDir, fetchImpl: github.fetch },
       {} as never,
     );
 
-    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(github.calls).toHaveLength(0);
     expect(outputs.trustedConfigReviewers).toEqual([]);
   });
 
-  it.each([
+  // Each row carries the contents API's reply, not a fake: a fakeFetch belongs to a running test,
+  // and it.each builds its rows while the file is collected.
+  const githubContext = { githubOwner: "acme", githubRepo: "app", githubToken: "ghs_secret" };
+  const offline: Reply = () => {
+    throw new Error("offline");
+  };
+  it.each<[string, Partial<PipelineContextData>, Reply | undefined]>([
     ["missing GitHub context", {}, undefined],
-    ["transport error", { githubOwner: "acme", githubRepo: "app", githubToken: "ghs_secret" }, vi.fn().mockRejectedValue(new Error("offline"))],
-    ["missing default config", { githubOwner: "acme", githubRepo: "app", githubToken: "ghs_secret" }, mockContentsFetch(404)],
-    ["HTTP error", { githubOwner: "acme", githubRepo: "app", githubToken: "ghs_secret" }, mockContentsFetch(500)],
-    ["null JSON body", { githubOwner: "acme", githubRepo: "app", githubToken: "ghs_secret" }, mockContentsFetch(200, null)],
-    ["array JSON body", { githubOwner: "acme", githubRepo: "app", githubToken: "ghs_secret" }, mockContentsFetch(200, [])],
-    ["malformed contents response", { githubOwner: "acme", githubRepo: "app", githubToken: "ghs_secret" }, mockContentsFetch(200, { type: "dir", encoding: "base64", content: "" })],
-    ["malformed YAML", { githubOwner: "acme", githubRepo: "app", githubToken: "ghs_secret" }, mockContentsFetch(200, contentsApiResponse("reviewers: ["))],
-    ["missing selected reviewer", { githubOwner: "acme", githubRepo: "app", githubToken: "ghs_secret" }, mockContentsFetch(200, contentsApiResponse("reviewers:\n  - id: other-review\n    prompt: other\n"))],
-  ])("returns no trusted config reviewers on %s so downstream selection fails closed", async (_name, contextData, fetchImpl) => {
+    ["transport error", githubContext, offline],
+    ["missing default config", githubContext, { status: 404 }],
+    ["HTTP error", githubContext, { status: 500 }],
+    ["null JSON body", githubContext, { json: null }],
+    ["array JSON body", githubContext, { json: [] }],
+    ["malformed contents response", githubContext, { json: { type: "dir", encoding: "base64", content: "" } }],
+    ["malformed YAML", githubContext, contentsApiResponse("reviewers: [")],
+    ["missing selected reviewer", githubContext, contentsApiResponse("reviewers:\n  - id: other-review\n    prompt: other\n")],
+  ])("returns no trusted config reviewers on %s so downstream selection fails closed", async (_name, contextData, reply) => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const workspaceDir = makeWorkspace();
+    const workspaceDir = testDir("ai-implement-install-reviewers");
 
     const outputs = await installStep.run(
-      makeContext({
+      installContext({
         ...contextData,
         reviewers: [{ id: "domain-review", gates: true }],
         trustedReviewerDefinitions: new Map(),
       }),
-      { workspaceDir, ...(fetchImpl ? { fetchImpl } : {}) },
+      { workspaceDir, ...(reply ? { fetchImpl: trustedConfig(reply).fetch } : {}) },
       {} as never,
     );
 

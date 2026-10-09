@@ -1,28 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ActivityReporter, type ActivityAlert } from "../pipeline/activity-reporter.js";
+import { fakeFetch, type FakeFetch, type Reply } from "./helpers/fake-fetch.js";
 
-function response(status: number, body: unknown = {}): Response {
-  return {
-    ok: status >= 200 && status < 300,
-    status,
-    json: async () => body,
-  } as unknown as Response;
+const ACCEPTED: Reply = { json: { acknowledged: true, outcome: "accepted", attemptId: "attempt-1" } };
+
+/** The orchestrator's `/runner/activity` endpoint, answering with `reply` (a list is served one per request). */
+function activityEndpoint(reply: Reply | Reply[]): FakeFetch {
+  return fakeFetch({ "POST /runner/activity": reply });
 }
 
-function capturingFetch(results: Response[]): {
-  fetchImpl: typeof fetch;
-  calls: Array<{ url: string; body: unknown }>;
-} {
-  const calls: Array<{ url: string; body: unknown }> = [];
-  let i = 0;
-  const fetchImpl = (async (url: string | URL, init?: RequestInit) => {
-    calls.push({ url: String(url), body: JSON.parse(String(init?.body)) });
-    const res = results[Math.min(i, results.length - 1)];
-    i++;
-    return res;
-  }) as typeof fetch;
-  return { fetchImpl, calls };
-}
+const networkError: Reply = () => {
+  throw new TypeError("fetch failed");
+};
 
 describe("ActivityReporter", () => {
   beforeEach(() => {
@@ -38,9 +27,9 @@ describe("ActivityReporter", () => {
     vi.stubEnv("AI_IMPLEMENT_FORWARDED_SECRETS", "NPM_TOKEN");
     vi.stubEnv("NPM_TOKEN", "npm_secret_value_xyz789");
 
-    const { fetchImpl, calls } = capturingFetch([response(200, { acknowledged: true, outcome: "accepted", attemptId: "attempt-1" })]);
+    const orchestrator = activityEndpoint(ACCEPTED);
     const reporter = new ActivityReporter("https://orchestrator.test", "progress-token", "attempt-1", "producer-1", {
-      fetchImpl,
+      fetchImpl: orchestrator.fetch,
       retryDelaysMs: [],
     });
 
@@ -58,17 +47,17 @@ describe("ActivityReporter", () => {
 
     await reporter.flush();
 
-    expect(calls).toHaveLength(1);
-    const serialized = JSON.stringify(calls[0].body);
+    expect(orchestrator.calls).toHaveLength(1);
+    const serialized = orchestrator.calls[0].body;
     expect(serialized).not.toContain("sk-super-secret-header-token");
     expect(serialized).not.toContain("npm_secret_value_xyz789");
     expect(serialized).not.toContain("runner-secret-abc123");
   });
 
   it("never journals a field carrying hidden model reasoning", async () => {
-    const { fetchImpl, calls } = capturingFetch([response(200, { acknowledged: true, outcome: "accepted", attemptId: "attempt-1" })]);
+    const orchestrator = activityEndpoint(ACCEPTED);
     const reporter = new ActivityReporter("https://orchestrator.test", "progress-token", "attempt-1", "producer-1", {
-      fetchImpl,
+      fetchImpl: orchestrator.fetch,
       retryDelaysMs: [],
     });
 
@@ -84,15 +73,15 @@ describe("ActivityReporter", () => {
 
     await reporter.flush();
 
-    const serialized = JSON.stringify(calls[0].body);
+    const serialized = orchestrator.calls[0].body;
     expect(serialized).not.toContain("chain-of-thought");
     expect(serialized).toContain("src/foo.ts");
   });
 
   it("truncates a redacted event over the per-event byte cap and marks it explicitly", async () => {
-    const { fetchImpl, calls } = capturingFetch([response(200, { acknowledged: true, outcome: "accepted", attemptId: "attempt-1" })]);
+    const orchestrator = activityEndpoint(ACCEPTED);
     const reporter = new ActivityReporter("https://orchestrator.test", "progress-token", "attempt-1", "producer-1", {
-      fetchImpl,
+      fetchImpl: orchestrator.fetch,
       retryDelaysMs: [],
       maxEventBytes: 100,
     });
@@ -100,7 +89,7 @@ describe("ActivityReporter", () => {
     reporter.record({ cycle: 1, kind: "tool_result", action: "Read", detail: { output: "x".repeat(5000) } });
     await reporter.flush();
 
-    const events = (calls[0].body as any).events;
+    const events = JSON.parse(orchestrator.calls[0].body).events;
     expect(events).toHaveLength(1);
     expect(events[0].truncated).toBe(true);
     expect(Buffer.byteLength(events[0].payload, "utf8")).toBeLessThanOrEqual(100);
@@ -108,9 +97,9 @@ describe("ActivityReporter", () => {
   });
 
   it("rejects further events locally once the per-attempt byte cap is reached, with one recorded marker", async () => {
-    const { fetchImpl, calls } = capturingFetch([response(200, { acknowledged: true, outcome: "accepted", attemptId: "attempt-1" })]);
+    const orchestrator = activityEndpoint(ACCEPTED);
     const reporter = new ActivityReporter("https://orchestrator.test", "progress-token", "attempt-1", "producer-1", {
-      fetchImpl,
+      fetchImpl: orchestrator.fetch,
       retryDelaysMs: [],
       maxEventBytes: 1000,
       maxAttemptBytes: 120,
@@ -126,16 +115,16 @@ describe("ActivityReporter", () => {
     expect(stats.bufferedCount).toBeLessThan(10);
 
     await reporter.flush();
-    const sentKinds = (calls[0].body as any).events.map((e: any) => e.kind);
+    const sentKinds = JSON.parse(orchestrator.calls[0].body).events.map((e: any) => e.kind);
     expect(sentKinds.filter((k: string) => k === "activity_limit_reached")).toHaveLength(1);
   });
 
   it("treats a resend of the same identity/payload as a no-op success (duplicate), and alerts on conflict without endless retry", async () => {
     // Duplicate: server reports 200/duplicate for a retried batch — success, buffer clears.
     {
-      const { fetchImpl } = capturingFetch([response(200, { acknowledged: true, outcome: "duplicate", attemptId: "attempt-1" })]);
+      const orchestrator = activityEndpoint({ json: { acknowledged: true, outcome: "duplicate", attemptId: "attempt-1" } });
       const reporter = new ActivityReporter("https://orchestrator.test", "progress-token", "attempt-1", "producer-1", {
-        fetchImpl,
+        fetchImpl: orchestrator.fetch,
         retryDelaysMs: [],
       });
       reporter.record({ cycle: 1, kind: "tool_call", action: "Bash", detail: { i: 1 } });
@@ -147,16 +136,19 @@ describe("ActivityReporter", () => {
     // Conflict: server reports 409 for a payload mismatch — alert raised, not retried forever.
     {
       const alerts: ActivityAlert[] = [];
-      const { fetchImpl, calls } = capturingFetch([response(409, { acknowledged: false, outcome: "conflict", attemptId: "attempt-1", reason: "different payload already stored" })]);
+      const orchestrator = activityEndpoint({
+        status: 409,
+        json: { acknowledged: false, outcome: "conflict", attemptId: "attempt-1", reason: "different payload already stored" },
+      });
       const reporter = new ActivityReporter("https://orchestrator.test", "progress-token", "attempt-1", "producer-1", {
-        fetchImpl,
+        fetchImpl: orchestrator.fetch,
         retryDelaysMs: [0, 0, 0],
         onAlert: (a) => alerts.push(a),
       });
       reporter.record({ cycle: 1, kind: "tool_call", action: "Bash", detail: { i: 1 } });
       await reporter.flush();
 
-      expect(calls).toHaveLength(1); // no retry on a definitive rejection
+      expect(orchestrator.calls).toHaveLength(1); // no retry on a definitive rejection
       expect(reporter.getStats().bufferedCount).toBe(0);
       expect(alerts).toHaveLength(1);
       expect(alerts[0].kind).toBe("payload_conflict");
@@ -164,41 +156,31 @@ describe("ActivityReporter", () => {
   });
 
   it("keeps producer/sequence/payload unchanged across a retried send", async () => {
-    const { fetchImpl, calls } = capturingFetch([
-      // simulate a network failure by throwing on first call via a wrapping fetchImpl below
-      response(200, { acknowledged: true, outcome: "accepted", attemptId: "attempt-1" }),
-    ]);
-    let attempt = 0;
-    const flaky = (async (url: string | URL, init?: RequestInit) => {
-      attempt++;
-      if (attempt === 1) throw new TypeError("fetch failed");
-      return fetchImpl(url, init);
-    }) as typeof fetch;
+    // The first attempt fails at the network; the retry is the one that succeeds.
+    const orchestrator = activityEndpoint([networkError, ACCEPTED]);
 
     const reporter = new ActivityReporter("https://orchestrator.test", "progress-token", "attempt-1", "producer-1", {
-      fetchImpl: flaky,
+      fetchImpl: orchestrator.fetch,
       retryDelaysMs: [0],
     });
     reporter.record({ cycle: 1, kind: "tool_call", action: "Bash", detail: { i: 1 } });
     await reporter.flush();
 
-    expect(calls).toHaveLength(1); // only the successful attempt hit the capturing fetch
-    expect(attempt).toBe(2);
-    const sent = calls[0].body as any;
+    expect(orchestrator.calls).toHaveLength(2);
+    expect(orchestrator.calls[1].body).toBe(orchestrator.calls[0].body);
+    const sent = JSON.parse(orchestrator.calls[1].body);
     expect(sent.attemptId).toBe("attempt-1");
     expect(sent.producerId).toBe("producer-1");
     expect(sent.events[0].sequence).toBe(0);
   });
 
   it("leaves buffered events in place (not dropped) until the transport call reports success", async () => {
-    let calls = 0;
-    const failing = (async () => {
-      calls++;
+    const orchestrator = activityEndpoint(() => {
       throw new TypeError("network down");
-    }) as typeof fetch;
+    });
 
     const reporter = new ActivityReporter("https://orchestrator.test", "progress-token", "attempt-1", "producer-1", {
-      fetchImpl: failing,
+      fetchImpl: orchestrator.fetch,
       retryDelaysMs: [0],
     });
     reporter.record({ cycle: 1, kind: "tool_call", action: "Bash", detail: { i: 1 } });
@@ -207,13 +189,13 @@ describe("ActivityReporter", () => {
     await reporter.flush();
     // Both attempts exhausted, still failing: event stays buffered for a later flush().
     expect(reporter.getStats().bufferedCount).toBe(1);
-    expect(calls).toBe(2);
+    expect(orchestrator.calls).toHaveLength(2);
   });
 
   it("makes a gap from buffer overflow, and a missing tail after the final marker, visible in its own bookkeeping", async () => {
-    const { fetchImpl } = capturingFetch([response(200, { acknowledged: true, outcome: "accepted", attemptId: "attempt-1" })]);
+    const orchestrator = activityEndpoint(ACCEPTED);
     const reporter = new ActivityReporter("https://orchestrator.test", "progress-token", "attempt-1", "producer-1", {
-      fetchImpl,
+      fetchImpl: orchestrator.fetch,
       retryDelaysMs: [],
       maxBufferedEvents: 2,
     });
@@ -231,7 +213,7 @@ describe("ActivityReporter", () => {
 
   it("bounds enqueueing past the buffer cap with an explicit overflow marker rather than unbounded growth", () => {
     const reporter = new ActivityReporter("https://orchestrator.test", "progress-token", "attempt-1", "producer-1", {
-      fetchImpl: (async () => response(200)) as typeof fetch,
+      fetchImpl: fakeFetch({}).fetch,
       maxBufferedEvents: 2,
     });
 
@@ -246,9 +228,11 @@ describe("ActivityReporter", () => {
   });
 
   it("bounds shutdown even when the transport hangs forever, and records the dropped range", async () => {
-    const hanging = (() => new Promise<Response>(() => {})) as unknown as typeof fetch;
+    // Never settles and ignores its AbortSignal (unlike hangUntilAborted), so the bound
+    // comes from the reporter's own hang guard, not from the request's timeout signal.
+    const orchestrator = activityEndpoint(() => new Promise<never>(() => {}));
     const reporter = new ActivityReporter("https://orchestrator.test", "progress-token", "attempt-1", "producer-1", {
-      fetchImpl: hanging,
+      fetchImpl: orchestrator.fetch,
       retryDelaysMs: [0],
       transportTimeoutMs: 30,
     });
@@ -267,27 +251,19 @@ describe("ActivityReporter", () => {
 
   it("exposes no coupling to step/cycle-summary reporting", () => {
     const reporter = new ActivityReporter("https://orchestrator.test", "progress-token", "attempt-1", "producer-1", {
-      fetchImpl: (async () => response(200)) as typeof fetch,
+      fetchImpl: fakeFetch({}).fetch,
     });
     expect("report" in reporter).toBe(false);
   });
 
   it("resolves the closing send instead of spinning forever when it is rejected with a definitive non-410 status", async () => {
-    const responses = [
-      response(200, { acknowledged: true, outcome: "accepted", attemptId: "attempt-1" }), // initial batch
-      response(409, { acknowledged: false, outcome: "conflict", attemptId: "attempt-1", reason: "stale final marker" }), // closing send
-    ];
-    let i = 0;
-    const calls: unknown[] = [];
-    const fetchImpl = (async (_url: string | URL, init?: RequestInit) => {
-      calls.push(JSON.parse(String(init?.body)));
-      const res = responses[Math.min(i, responses.length - 1)];
-      i++;
-      return res;
-    }) as typeof fetch;
+    const orchestrator = activityEndpoint([
+      ACCEPTED, // initial batch
+      { status: 409, json: { acknowledged: false, outcome: "conflict", attemptId: "attempt-1", reason: "stale final marker" } }, // closing send
+    ]);
 
     const reporter = new ActivityReporter("https://orchestrator.test", "progress-token", "attempt-1", "producer-1", {
-      fetchImpl,
+      fetchImpl: orchestrator.fetch,
       retryDelaysMs: [],
     });
 
@@ -298,15 +274,15 @@ describe("ActivityReporter", () => {
     await reporter.flush(); // must resolve rather than looping on the repeated 409
 
     // One call to drain the buffer, one for the closing send — no spin.
-    expect(calls).toHaveLength(2);
+    expect(orchestrator.calls).toHaveLength(2);
     const stats = reporter.getStats();
     expect(stats.finalSequenceSent).toBe(true);
   });
 
   it("keeps a missing-tail signal visible when events are dropped after the per-attempt byte limit is reached, even if the final send succeeds", async () => {
-    const { fetchImpl } = capturingFetch([response(200, { acknowledged: true, outcome: "accepted", attemptId: "attempt-1" })]);
+    const orchestrator = activityEndpoint(ACCEPTED);
     const reporter = new ActivityReporter("https://orchestrator.test", "progress-token", "attempt-1", "producer-1", {
-      fetchImpl,
+      fetchImpl: orchestrator.fetch,
       retryDelaysMs: [],
       maxEventBytes: 1000,
       maxAttemptBytes: 120,
@@ -326,21 +302,13 @@ describe("ActivityReporter", () => {
   });
 
   it("drops the remaining buffer as a visible gap when a mid-stream batch is rejected as stale (410), rather than waiting for shutdown()", async () => {
-    const responses = [
-      response(410, { acknowledged: false, outcome: "conflict", attemptId: "attempt-1", reason: "stream stale" }),
-      response(200, { acknowledged: true, outcome: "accepted", attemptId: "attempt-1" }),
-    ];
-    let i = 0;
-    const calls: unknown[] = [];
-    const fetchImpl = (async (_url: string | URL, init?: RequestInit) => {
-      calls.push(JSON.parse(String(init?.body)));
-      const res = responses[Math.min(i, responses.length - 1)];
-      i++;
-      return res;
-    }) as typeof fetch;
+    const orchestrator = activityEndpoint([
+      { status: 410, json: { acknowledged: false, outcome: "conflict", attemptId: "attempt-1", reason: "stream stale" } },
+      ACCEPTED,
+    ]);
 
     const reporter = new ActivityReporter("https://orchestrator.test", "progress-token", "attempt-1", "producer-1", {
-      fetchImpl,
+      fetchImpl: orchestrator.fetch,
       retryDelaysMs: [],
       batchSize: 5,
     });
@@ -353,7 +321,7 @@ describe("ActivityReporter", () => {
 
     // Only the first (rejected) batch is sent — flush() must not keep going
     // once the stream is closed, and it must not silently strand the rest.
-    expect(calls).toHaveLength(1);
+    expect(orchestrator.calls).toHaveLength(1);
     const stats = reporter.getStats();
     expect(stats.closed).toBe(true);
     expect(stats.bufferedCount).toBe(0);
@@ -362,20 +330,14 @@ describe("ActivityReporter", () => {
   });
 
   it("records a DroppedRange for a rejected non-final batch, keeping missingTail true even after later batches succeed", async () => {
-    const responses = [
-      response(409, { acknowledged: false, outcome: "conflict", attemptId: "attempt-1", reason: "different payload already stored" }), // batch 0-4
-      response(200, { acknowledged: true, outcome: "accepted", attemptId: "attempt-1" }), // batch 5-9
-      response(200, { acknowledged: true, outcome: "accepted", attemptId: "attempt-1" }), // batch 10-11 + final marker
-    ];
-    let i = 0;
-    const fetchImpl = (async () => {
-      const res = responses[Math.min(i, responses.length - 1)];
-      i++;
-      return res;
-    }) as typeof fetch;
+    const orchestrator = activityEndpoint([
+      { status: 409, json: { acknowledged: false, outcome: "conflict", attemptId: "attempt-1", reason: "different payload already stored" } }, // batch 0-4
+      ACCEPTED, // batch 5-9
+      ACCEPTED, // batch 10-11 + final marker
+    ]);
 
     const reporter = new ActivityReporter("https://orchestrator.test", "progress-token", "attempt-1", "producer-1", {
-      fetchImpl,
+      fetchImpl: orchestrator.fetch,
       retryDelaysMs: [],
       batchSize: 5,
     });
@@ -396,9 +358,9 @@ describe("ActivityReporter", () => {
   });
 
   it("redacts an entire array subtree under a credential-shaped key rather than recursing past it", async () => {
-    const { fetchImpl, calls } = capturingFetch([response(200, { acknowledged: true, outcome: "accepted", attemptId: "attempt-1" })]);
+    const orchestrator = activityEndpoint(ACCEPTED);
     const reporter = new ActivityReporter("https://orchestrator.test", "progress-token", "attempt-1", "producer-1", {
-      fetchImpl,
+      fetchImpl: orchestrator.fetch,
       retryDelaysMs: [],
     });
 
@@ -410,16 +372,16 @@ describe("ActivityReporter", () => {
     });
     await reporter.flush();
 
-    const serialized = JSON.stringify(calls[0].body);
+    const serialized = orchestrator.calls[0].body;
     expect(serialized).not.toContain("secret1");
     expect(serialized).toContain("kept");
     expect(serialized).toContain("[REDACTED]");
   });
 
   it("redacts an entire nested-object subtree under a credential-shaped key rather than recursing past it", async () => {
-    const { fetchImpl, calls } = capturingFetch([response(200, { acknowledged: true, outcome: "accepted", attemptId: "attempt-1" })]);
+    const orchestrator = activityEndpoint(ACCEPTED);
     const reporter = new ActivityReporter("https://orchestrator.test", "progress-token", "attempt-1", "producer-1", {
-      fetchImpl,
+      fetchImpl: orchestrator.fetch,
       retryDelaysMs: [],
     });
 
@@ -431,16 +393,16 @@ describe("ActivityReporter", () => {
     });
     await reporter.flush();
 
-    const serialized = JSON.stringify(calls[0].body);
+    const serialized = orchestrator.calls[0].body;
     expect(serialized).not.toContain("secret2");
     expect(serialized).toContain("kept");
     expect(serialized).toContain("[REDACTED]");
   });
 
   it("sends the finalSequence marker once the buffer has drained, closing the stream", async () => {
-    const { fetchImpl, calls } = capturingFetch([response(200, { acknowledged: true, outcome: "accepted", attemptId: "attempt-1" })]);
+    const orchestrator = activityEndpoint(ACCEPTED);
     const reporter = new ActivityReporter("https://orchestrator.test", "progress-token", "attempt-1", "producer-1", {
-      fetchImpl,
+      fetchImpl: orchestrator.fetch,
       retryDelaysMs: [],
     });
 
@@ -448,27 +410,26 @@ describe("ActivityReporter", () => {
     reporter.finalize();
     await reporter.flush();
 
-    expect(calls).toHaveLength(1);
-    expect((calls[0].body as any).finalSequence).toBe(reporter.getStats().finalSequence);
+    expect(orchestrator.calls).toHaveLength(1);
+    expect(JSON.parse(orchestrator.calls[0].body).finalSequence).toBe(reporter.getStats().finalSequence);
     expect(reporter.getStats().finalSequenceSent).toBe(true);
     expect(reporter.getStats().missingTail).toBe(false);
   });
 
   it("closes an empty stream with a valid, stable marker across transport retries", async () => {
-    const bodies: unknown[] = [];
-    const fetchImpl = (async (_url: string | URL, init?: RequestInit) => {
-      const body = JSON.parse(String(init?.body));
-      bodies.push(body);
-      if (bodies.length === 1) throw new TypeError("temporary network failure");
-      // The real handleRunnerActivity now authenticates its bearer against a
-      // prepared attempt (AII-803) — this client-side test exercises only
-      // ActivityReporter's own retry/finalSequence stability, so a canned
-      // success response (as every other case in this file uses) stands in
-      // for the server's acceptance.
-      return response(200, { acknowledged: true, outcome: "accepted", attemptId: "attempt-1" });
-    }) as typeof fetch;
+    // The real handleRunnerActivity now authenticates its bearer against a
+    // prepared attempt (AII-803) — this client-side test exercises only
+    // ActivityReporter's own retry/finalSequence stability, so a canned
+    // success response (as every other case in this file uses) stands in
+    // for the server's acceptance.
+    const orchestrator = activityEndpoint([
+      () => {
+        throw new TypeError("temporary network failure");
+      },
+      ACCEPTED,
+    ]);
     const reporter = new ActivityReporter("https://orchestrator.test", "progress-token", "attempt-1", "producer-1", {
-      fetchImpl,
+      fetchImpl: orchestrator.fetch,
       retryDelaysMs: [0],
       now: () => 1_800_000_000_000,
     });
@@ -476,6 +437,7 @@ describe("ActivityReporter", () => {
     reporter.finalize();
     await reporter.flush();
 
+    const bodies = orchestrator.calls.map((c) => JSON.parse(c.body));
     expect(bodies).toHaveLength(2);
     expect(bodies[1]).toEqual(bodies[0]);
     expect(bodies[1]).toMatchObject({

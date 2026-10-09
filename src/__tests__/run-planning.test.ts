@@ -1,9 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { runPlanning, runPlanningLocally } from "../run-planning.js";
 import { encodeRunConfig } from "../run-config.js";
+import { fakeFetch } from "./helpers/fake-fetch.js";
+import { testDir } from "./helpers/test-dir.js";
 
 type RunnerResultPayload = {
   phase: "planning";
@@ -27,12 +28,11 @@ function setEnv() {
 describe("runPlanning", () => {
   let ws: string;
   beforeEach(() => {
-    ws = mkdtempSync(join(tmpdir(), "plan-"));
+    ws = testDir("plan");
     delete process.env.AI_IMPLEMENT_RUN_CONFIG;
     setEnv();
   });
   afterEach(() => {
-    rmSync(ws, { recursive: true, force: true });
     delete process.env.RUNNER_CALLBACK_URL;
     delete process.env.RUN_TOKEN;
     delete process.env.CLAUDE_MODEL;
@@ -54,18 +54,14 @@ describe("runPlanning", () => {
       );
       return { status: 0, stdout: "", stderr: "" };
     };
-    const posted: RunnerResultPayload[] = [];
-    const fakeFetch = async (_u: string, init: RequestInit = {}) => {
-      posted.push(JSON.parse(String(init.body)) as RunnerResultPayload);
-      return { ok: true, text: async () => "" } as Response;
-    };
+    const orchestrator = fakeFetch({ "POST /runner/result": { status: 200 } });
     process.env.RUNNER_CALLBACK_URL = "http://orch";
     process.env.RUN_TOKEN = "tok";
 
     const result = await runPlanning({
       workspaceDir: ws,
       executor: fakeExecutor,
-      fetchImpl: fakeFetch,
+      fetchImpl: orchestrator.fetch,
     });
 
     expect(result.exitCode).toBe(0);
@@ -73,26 +69,23 @@ describe("runPlanning", () => {
     expect(invoked!.args).toContain("--dangerously-skip-permissions");
     expect(invoked!.args.join(" ")).toContain("--model claude-x");
     expect(invoked!.args.join(" ")).not.toContain("push");
-    expect(posted[0]).toMatchObject({ phase: "planning", outcome: "success" });
-    expect(posted[0].comments).toHaveLength(1);
+    const posted = JSON.parse(orchestrator.calls[0].body) as RunnerResultPayload;
+    expect(posted).toMatchObject({ phase: "planning", outcome: "success" });
+    expect(posted.comments).toHaveLength(1);
   });
 
   it("posts outcome=failure with a reason when the executor exits non-zero", async () => {
     writeFileSync(join(ws, "PLANNING.md"), "---\nmodel: m\n---\nbody");
-    const posted: RunnerResultPayload[] = [];
     process.env.RUNNER_CALLBACK_URL = "http://orch";
     process.env.RUN_TOKEN = "tok";
-    const fakeFetch = async (_u: string, init: RequestInit = {}) => {
-      posted.push(JSON.parse(String(init.body)) as RunnerResultPayload);
-      return { ok: true, text: async () => "" } as Response;
-    };
+    const orchestrator = fakeFetch({ "POST /runner/result": { status: 200 } });
     const result = await runPlanning({
       workspaceDir: ws,
       executor: () => ({ status: 1, stdout: "", stderr: "boom" }),
-      fetchImpl: fakeFetch,
+      fetchImpl: orchestrator.fetch,
     });
     expect(result.exitCode).toBe(1);
-    expect(posted[0]).toMatchObject({ phase: "planning", outcome: "failure" });
+    expect(JSON.parse(orchestrator.calls[0].body)).toMatchObject({ phase: "planning", outcome: "failure" });
   });
 
   it("uses built-in prompt when PLANNING.md is absent", async () => {
@@ -140,20 +133,16 @@ describe("runPlanning", () => {
       issue: { id: "e-1", identifier: "AII-9", title: "Envelope issue", description: "From envelope." },
       runnerCallbackUrl: "https://orch.example/callback",
     });
-    const posted: Array<{ url: string; body: unknown }> = [];
-    const fakeFetch = async (u: string, init: RequestInit = {}) => {
-      posted.push({ url: u, body: JSON.parse(String(init.body)) });
-      return { ok: true, text: async () => "" } as Response;
-    };
+    const orchestrator = fakeFetch({ "POST /callback/runner/result": { status: 200 } });
     const result = await runPlanning({
       workspaceDir: ws,
       executor: () => ({ status: 0, stdout: "", stderr: "" }),
-      fetchImpl: fakeFetch,
+      fetchImpl: orchestrator.fetch,
     });
     expect(result.exitCode).toBe(0);
-    expect(posted).toHaveLength(1);
-    expect(posted[0].url).toBe("https://orch.example/callback/runner/result");
-    expect(posted[0].body).toMatchObject({ phase: "planning", outcome: "success" });
+    expect(orchestrator.calls).toHaveLength(1);
+    expect(orchestrator.calls[0].url.href).toBe("https://orch.example/callback/runner/result");
+    expect(JSON.parse(orchestrator.calls[0].body)).toMatchObject({ phase: "planning", outcome: "success" });
   });
 
   it("CLAUDE_MODEL env overrides PLANNING.md model", async () => {
@@ -173,11 +162,7 @@ describe("runPlanningLocally", () => {
   let ws: string;
 
   beforeEach(() => {
-    ws = mkdtempSync(join(tmpdir(), "plan-local-"));
-  });
-
-  afterEach(() => {
-    rmSync(ws, { recursive: true, force: true });
+    ws = testDir("plan-local");
   });
 
   it("runs planning with explicit options and returns exitCode 0 on success", async () => {
