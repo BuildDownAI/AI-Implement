@@ -16,6 +16,7 @@ describe("reports page", () => {
       "reports-planning-body",
       "reports-runaways-body",
       "reports-runaways-empty",
+      "reports-attr-body",
     ]) {
       expect(reportsHtml).toContain(`id="${id}"`);
     }
@@ -76,11 +77,11 @@ const baseReport: FleetReport = {
   runaways: [{ issueIdentifier: "AII-99", repo: "org/repo-a", dispatches: 4, consecutiveFailures: 3 }],
 };
 
-function mountPage(report: FleetReport): { win: Record<string, unknown> & { loadReports: () => Promise<void> }; doc: Document } {
+function mountPage(report: FleetReport, jobs: unknown[] = []): { win: Record<string, unknown> & { loadReports: () => Promise<void> }; doc: Document } {
   const dom = new JSDOM(`<!DOCTYPE html><body>${reportsHtml}</body>`, { runScripts: "dangerously" });
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const win = dom.window as any as Record<string, unknown> & { loadReports: () => Promise<void> };
-  win["api"] = async () => ({ ok: true, json: async () => report });
+  win["api"] = async (url: string) => ({ ok: true, status: 200, json: async () => (url.startsWith("/api/log") ? jobs : report) });
   win["esc"] = (s: string) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
   win["registerPage"] = () => {};
   const script = dom.window.document.createElement("script");
@@ -147,5 +148,80 @@ describe("reports page render", () => {
     await win.loadReports();
     expect(doc.getElementById("reports-runaways-body")!.innerHTML).toBe("");
     expect(doc.getElementById("reports-runaways-empty")!.classList.contains("hidden")).toBe(false);
+  });
+
+  describe("agent attribution", () => {
+    const usage = { availability: "complete", tokensIn: 1, tokensOut: 2, costUsd: 0, costStatus: "reported" };
+    const attr = (o: Record<string, unknown>) => ({
+      version: 1, invocationId: "i", snapshotId: "s", stage: "implementation", agent: "codex", provider: "openai",
+      model: "m1", profileId: "p1", authMode: "openai-api-key", limit: null, outcome: "success", usage, ...o,
+    });
+    const job = (id: string, attribution: unknown) => ({ issueId: id, issueIdentifier: id, attribution });
+    const render = async (jobs: unknown[]) => {
+      const { win, doc } = mountPage(baseReport, jobs);
+      await win.loadReports();
+      return doc.getElementById("reports-attr-body")!;
+    };
+
+    it("keeps mixed stages and profiles distinguishable", async () => {
+      const body = await render([
+        job("A-1", attr({ stage: "planning", agent: "claude", provider: "anthropic", model: "mA", profileId: "pA", authMode: "anthropic-api-key" })),
+        job("A-2", attr({ stage: "review", model: "mB", profileId: "pB", authMode: "codex-subscription", usage: { ...usage, availability: "unavailable", costUsd: null, costStatus: "unavailable" } })),
+      ]);
+      expect(body.children.length).toBe(2);
+      expect(body.children[0].textContent).toContain("planning");
+      expect(body.children[0].textContent).toContain("claude/anthropic/mA");
+      expect(body.children[0].textContent).toContain("pA");
+      expect(body.children[1].textContent).toContain("review");
+      expect(body.children[1].textContent).toContain("codex/openai/mB");
+      expect(body.children[1].textContent).toContain("codex-subscription");
+    });
+
+    it("never shows unavailable cost as zero, and labels partial cost", async () => {
+      const body = await render([
+        job("A-1", attr({ usage: { ...usage, availability: "unavailable", costUsd: null, costStatus: "unavailable" } })),
+        job("A-2", attr({ usage: { ...usage, availability: "partial", costUsd: 1.5 } })),
+        job("A-3", attr({ usage: null })),
+        job("A-4", attr({})),
+      ]);
+      expect(body.children[0].textContent).toContain("unavailable");
+      expect(body.children[0].textContent).not.toContain("$0.00");
+      expect(body.children[1].textContent).toContain("partial cost");
+      expect(body.children[2].textContent).toContain("usage unavailable");
+      expect(body.children[3].textContent).toContain("$0.00");
+    });
+
+    it("shows outcome and actual limit for failures", async () => {
+      const body = await render([
+        job("A-1", attr({ outcome: "error", limit: { kind: "timeout_ms", value: 5000 } })),
+        job("A-2", attr({ outcome: "max_turns", limit: { kind: "max_turns", value: 7 } })),
+      ]);
+      expect(body.children[0].textContent).toContain("error");
+      expect(body.children[0].textContent).toContain("5000 ms timeout");
+      expect(body.children[1].textContent).toContain("7 max turns");
+    });
+
+    it("renders legacy rows with an explicit marker", async () => {
+      const body = await render([job("A-1", null), { issueId: "A-2" }]);
+      expect(body.children.length).toBe(2);
+      expect(body.children[0].textContent).toContain("No attribution (legacy)");
+      expect(body.children[1].textContent).toContain("No attribution (legacy)");
+      expect(body.children[0].textContent).not.toContain("$");
+    });
+
+    it("escapes external labels", async () => {
+      const body = await render([job("A-1", attr({ model: "<img src=x onerror=alert(1)>", profileId: "<b>x</b>" }))]);
+      expect(body.querySelector("img")).toBeNull();
+      expect(body.querySelector("b")).toBeNull();
+      expect(body.textContent).toContain("<img src=x onerror=alert(1)>");
+    });
+
+    it("shows a note when the job read is refused", async () => {
+      const { win, doc } = mountPage(baseReport);
+      const api = win["api"] as (u: string) => Promise<unknown>;
+      win["api"] = async (u: string) => (u.startsWith("/api/log") ? { ok: false, status: 403, json: async () => ({}) } : api(u));
+      await win.loadReports();
+      expect(doc.getElementById("reports-attr-note")!.textContent).toContain("403");
+    });
   });
 });
