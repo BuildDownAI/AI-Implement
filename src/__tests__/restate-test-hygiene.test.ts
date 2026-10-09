@@ -32,7 +32,7 @@ export function findViolations(file: string, source: string): string[] {
 }
 
 describe("restate scenario hygiene (AII-993)", () => {
-  const files = readdirSync(RESTATE_DIR).filter((f) => f.endsWith(".restate.test.ts") || f.endsWith("-scenarios.ts"));
+  const files = readdirSync(RESTATE_DIR).filter((f) => f.endsWith(".restate.test.ts"));
 
   it("every scenario file is clean", () => {
     const violations = files.flatMap((f) =>

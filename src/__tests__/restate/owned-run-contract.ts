@@ -60,8 +60,6 @@ const DEADLINE_MS = 1_500;
 /** Scenarios a run kind has not reached yet, by number, each with the issue that adds it. They register as skipped. */
 export interface OwnedRunContractOptions {
   pending?: Record<number, string>;
-  /** The variant labels to run; every variant when absent. A file that starts one variant passes it. */
-  labels?: ReadonlyArray<string>;
 }
 
 export function registerOwnedRunContract(
@@ -69,7 +67,7 @@ export function registerOwnedRunContract(
   envFor: (label: string) => RestateTestEnvironment,
   options: OwnedRunContractOptions = {},
 ): void {
-  const labels = options.labels ?? VARIANTS.map(([label]) => label);
+  const labels = VARIANTS.map(([label]) => label);
   let counter = 0;
 
   function begin(label: string, start: OwnedRunStart) {

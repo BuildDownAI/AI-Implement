@@ -72,17 +72,10 @@ function asTestEnvironment(env: Awaited<ReturnType<typeof startBinaryEnvironment
   return env as unknown as RestateTestEnvironment;
 }
 
-/** Starts one environment per variant; `only` limits it to the named variants (an unknown name throws). */
-export async function startVariants(
-  services: RestateServices,
-  options: { only?: ReadonlyArray<string> } = {},
-): Promise<Map<string, RestateTestEnvironment>> {
+export async function startVariants(services: RestateServices): Promise<Map<string, RestateTestEnvironment>> {
   const binary = restateTestRuntime() === "binary";
-  const unknown = (options.only ?? []).filter((name) => !VARIANTS.some(([label]) => label === name));
-  if (unknown.length > 0) throw new Error(`unknown Restate variant: ${unknown.join(", ")}`);
-  const selected = VARIANTS.filter(([label]) => options.only === undefined || options.only.includes(label));
   const started = await Promise.all(
-    selected.map(async ([label, configure]) => {
+    VARIANTS.map(async ([label, configure]) => {
       if (binary) return [label, asTestEnvironment(await startBinaryEnvironment({ services, variant: label as "alwaysReplay" | "disableRetries" }))] as const;
       const env = await RestateTestEnvironment.start({
         services,
