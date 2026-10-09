@@ -19,6 +19,8 @@ interface PRState {
   admissionCalls: number;
   launches: number;
   windowMs: number;
+  fixer: "ai-implement" | "repository";
+  delegated: number;
 }
 interface AttemptState {
   prepared: PreparedReviewFixAttempt;
@@ -41,7 +43,7 @@ describe("ReviewFixPR durable coordination", () => {
   function makePR(): PRState {
     const scope = { installationId: 7, repository: "BuildDownAI/AI-Implement", prNumber: nextPr++ };
     const state: PRState = { scope, pending: [], active: null, closed: false, prepared: [], admissionCalls: 0,
-      launches: 0, windowMs: REVIEW_FIX_COLLECTION_WINDOW_MS };
+      launches: 0, windowMs: REVIEW_FIX_COLLECTION_WINDOW_MS, fixer: "ai-implement", delegated: 0 };
     prs.set(reviewFixPRKey(scope), state);
     return state;
   }
@@ -136,9 +138,10 @@ describe("ReviewFixPR durable coordination", () => {
   const recorded: ReviewFixFeedbackEvent[] = [];
   const coordinator = createReviewFixPR({ attempts: store,
     recordFeedback: async (event) => { recorded.push(event); return { status: "accepted", findingIds: [1], reviewFixId: 1 }; }, collectionWindowMs: async (scope) => stateFor(scope).windowMs,
+    recordDelegated: async (scope) => { stateFor(scope).delegated++; },
     load: async (scope) => {
     const pr = stateFor(scope);
-    return { closed: pr.closed, jobTimeoutMinutes: 90,
+    return { closed: pr.closed, jobTimeoutMinutes: 90, fixer: pr.fixer,
       pending: pr.pending.length ? { taskText: `Fix ${pr.pending.length} finding versions`, findings: [...pr.pending] } : null };
   } });
 
@@ -213,6 +216,32 @@ describe("ReviewFixPR durable coordination", () => {
     expect(first.active).toBe(first.prepared[1].attemptId);
     await finish(env, first, 1);
   }, 35_000);
+
+  it.each(VARIANTS.map(([label]) => label))("a repository fixer is recorded as delegated: no admission, no attempt (%s)", async (label) => {
+    const env = envFor(label);
+    const pr = makePR();
+    pr.fixer = "repository";
+    pr.windowMs = 250;
+    await feedback(env, pr);
+    await eventually(() => pr.delegated === 1, Boolean, { timeoutMs: 5_000, label: "pr.delegated === 1" });
+    await settle(600);
+    expect([pr.delegated, pr.admissionCalls, pr.launches, pr.active]).toEqual([1, 0, 0, null]);
+  }, 20_000);
+
+  it.each(VARIANTS.map(([label]) => label))("a repository check leaves an active attempt untouched (%s)", async (label) => {
+    const env = envFor(label);
+    const pr = makePR();
+    pr.windowMs = 250;
+    await feedback(env, pr);
+    await eventually(() => pr.launches === 1, Boolean, { timeoutMs: 5_000, label: "pr.launches === 1" });
+    const active = pr.active;
+    pr.fixer = "repository";
+    await feedback(env, pr);
+    await eventually(() => pr.delegated === 1, Boolean, { timeoutMs: 5_000, label: "pr.delegated === 1" });
+    expect(pr.active).toBe(active);
+    expect(attemptFor(active!).released).toBe(false);
+    await finish(env, pr, 0);
+  }, 25_000);
 
   it.each(VARIANTS.map(([label]) => label))("capacity deferral keeps feedback and wakes after release; closed PR does not admit (%s)", async (label) => {
     const env = envFor(label);

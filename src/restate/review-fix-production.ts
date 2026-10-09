@@ -8,7 +8,8 @@ import { getPullRequestState } from "../github.js";
 import { listReviewFixCycleSummaries } from "../review-fix-evidence.js";
 import { createReviewFixFinalizer, retryApprovalEffect } from "../review-fix-finalize.js";
 import { createReviewFixGithubAdapter } from "../review-fix-github-adapter.js";
-import { acceptReviewFixWebhookEvent } from "../review-fix-queue.js";
+import { resolveReviewProcess } from "../review-process.js";
+import { acceptReviewFixWebhookEvent, updateReviewFixStatus } from "../review-fix-queue.js";
 import { loadPendingReviewFixFeedback } from "../review-fix-pending.js";
 import { SqliteReviewFixAttemptStore } from "../review-fix-attempt-store.js";
 import { GithubReviewFixWorker, createGithubAppCredentialResolver, reviewFixAttemptStoreScopeStore } from "../review-fix-worker.js";
@@ -121,9 +122,18 @@ export function createProductionReviewFixServices(
       admit: async (request) => await canAdmit(request.scope, config)
         ? store.admit(request) : { status: "deferred", reason: "paused" },
     },
+    recordDelegated: async (scope, queueCursor) => {
+      const mapping = selectedMapping(scope);
+      // Without a cursor no row is identified, so there is nothing to mark.
+      if (!queueCursor) return;
+      updateReviewFixStatus(queueCursor.queueId, "skipped");
+      console.log(`[review-fix] Project ${scope.repository} delegates fixes to the repository `
+        + `(${resolveReviewProcess(mapping?.reviewProcess).id}), skipping review fix #${queueCursor.queueId}`);
+    },
     load: async (scope) => {
       const mapping = selectedMapping(scope);
-      if (!mapping) return { closed: true, pending: null, jobTimeoutMinutes: DEFAULT_REVIEW_FIX_JOB_TIMEOUT_MINUTES };
+      if (!mapping) return { closed: true, pending: null, fixer: "ai-implement",
+        jobTimeoutMinutes: DEFAULT_REVIEW_FIX_JOB_TIMEOUT_MINUTES };
       const token = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
       const prState = await getPullRequestState(token, mapping.owner, mapping.repo, scope.prNumber);
       const closed = prState !== null && (prState.state === "closed" || prState.merged);
@@ -137,6 +147,7 @@ export function createProductionReviewFixServices(
         } catch { /* Legacy's fallback text is also valid when the tracker is unavailable. */ }
       }
       return { closed, pending: loadPendingReviewFixFeedback(scope, issueDescription),
+        fixer: resolveReviewProcess(mapping.reviewProcess).fixer,
         jobTimeoutMinutes: mapping.maxJobMinutes ?? DEFAULT_REVIEW_FIX_JOB_TIMEOUT_MINUTES };
     },
   });

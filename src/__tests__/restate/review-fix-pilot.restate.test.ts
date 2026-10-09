@@ -35,7 +35,8 @@ import {
 } from "../../review-fix-ports.js";
 import { SqliteReviewFixAttemptStore } from "../../review-fix-attempt-store.js";
 import { upsertReviewFinding } from "../../review-ledger-store.js";
-import { acceptReviewFixWebhookEvent, enqueueReviewFix } from "../../review-fix-queue.js";
+import { acceptReviewFixWebhookEvent, enqueueReviewFix, updateReviewFixStatus } from "../../review-fix-queue.js";
+import { REVIEW_PROCESSES, resolveReviewProcess } from "../../review-process.js";
 import { loadPendingReviewFixFeedback } from "../../review-fix-pending.js";
 import { createReviewFixFinalizer, retryApprovalEffect } from "../../review-fix-finalize.js";
 import type { ReviewFixGitHubAdapter } from "../../review-fix-finalize.js";
@@ -143,6 +144,7 @@ interface GithubFixture {
   useProductionPending: boolean;
   windowMs: number;
   jobTimeoutMinutes: number;
+  reviewProcess: string | null;
   blockAdmission: "paused" | "occupied" | "at_capacity" | "budget_exhausted" | null;
   admitOverride: ((request: ReviewFixAdmissionRequest) => Promise<ReviewFixAdmissionOutcome>) | null;
   recordResultOverride: ((id: AttemptId, result: ReviewFixResultMetadataV1, now: number) => Promise<ResultIntakeOutcome>) | null;
@@ -182,7 +184,7 @@ function freshScenario(prefix: string, opts: { cap?: number; budget?: number; pa
     headSha: sha(`${owner}-initial`),
     checks: [], statusState: "success", statusCount: 0, reviews: [], comments: [], commentPosts: 0,
     pending: null, useProductionPending: false, windowMs: 200, jobTimeoutMinutes: LONG_DEADLINE_JOB_TIMEOUT_MINUTES,
-    blockAdmission: null, admitOverride: null, recordResultOverride: null, applyApprovalEffectOverride: null,
+    reviewProcess: null, blockAdmission: null, admitOverride: null, recordResultOverride: null, applyApprovalEffectOverride: null,
     dispatchImpl: () => { throw new Error("unset"); },
     dispatchCalls: 0, listRunsVisible: true, runId: null, runAttempt: 1, runDetail: null,
     cancelCalls: 0, cancelImpl: async () => true,
@@ -411,8 +413,10 @@ const pr = createReviewFixPR({
   load: async (scope) => {
     const fixture = findFixture(scope.repository);
     const pending = fixture.useProductionPending ? loadPendingReviewFixFeedback(scope, null) : fixture.pending;
-    return { closed: fixture.merged || !fixture.open, jobTimeoutMinutes: fixture.jobTimeoutMinutes, pending };
+    return { closed: fixture.merged || !fixture.open, jobTimeoutMinutes: fixture.jobTimeoutMinutes, pending,
+      fixer: resolveReviewProcess(fixture.reviewProcess).fixer };
   },
+  recordDelegated: async (_scope, cursor) => { if (cursor) updateReviewFixStatus(cursor.queueId, "skipped"); },
   collectionWindowMs: async (scope) => findFixture(scope.repository).windowMs,
 });
 
@@ -559,6 +563,28 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     await settle(fixture.windowMs + 300);
     expect(latestAttemptRow(fixture.scope)).toBeUndefined();
     expect(budgetEntryCount(fixture.scope.repository, fixture.scope.prNumber)).toBe(0);
+  }, 20_000);
+
+  it.each(VARIANTS.map(([label]) => label))("a repository fixer is handed the feedback: queue row skipped, findings open, no attempt (%s)", async (label) => {
+    const env = envFor(label);
+    const fixture = freshScenario("delegated");
+    fixture.useProductionPending = true;
+    fixture.reviewProcess = "claude-code-review";
+    const findingId = seedOpenFinding(fixture, "Delegated finding");
+    seedQueueEvent(fixture, "automatic review-fix finding", [findingId]);
+    const original = REVIEW_PROCESSES["claude-code-review"].fixer;
+    REVIEW_PROCESSES["claude-code-review"].fixer = "repository";
+    try {
+      await triggerFeedback(env, fixture.scope);
+      const queueStatus = () => (getDb().prepare(`SELECT status FROM review_fix_queue WHERE repo = ? AND pr_number = ?`)
+        .get(fixture.scope.repository, fixture.scope.prNumber) as { status: string }).status;
+      await eventually(queueStatus, (status) => status === "skipped", { timeoutMs: 8_000, label: "queue row skipped" });
+      await settle(fixture.windowMs + 300);
+      const finding = getDb().prepare(`SELECT status FROM review_findings WHERE id = ?`).get(findingId) as { status: string };
+      expect(finding.status).toBe("open");
+      expect(latestAttemptRow(fixture.scope)).toBeUndefined();
+      expect(budgetEntryCount(fixture.scope.repository, fixture.scope.prNumber)).toBe(0);
+    } finally { REVIEW_PROCESSES["claude-code-review"].fixer = original; }
   }, 20_000);
 
   it.each(VARIANTS.map(([label]) => label))("more than 30 finding versions admits the oldest 30 and preserves the rest pending, per the production pending-feedback projection (%s)", async (label) => {
