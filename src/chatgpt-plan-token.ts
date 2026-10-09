@@ -186,6 +186,8 @@ export async function refreshChatGptPlanRecord(
       typeof earliest_refresh_at === "number" && Number.isFinite(earliest_refresh_at) ? earliest_refresh_at * 1000 : null,
     savedAt: now,
   };
+  // A server that narrowed the grant below the required scope will not recover on retry.
+  if (typeof scope === "string" && !scopes.includes(REQUIRED_SCOPE)) return fail("reauth_required", status);
   // A malformed 200 must not erase a good session, so it is transient rather than reauth.
   const checked = parseChatGptPlanRecord(candidate);
   if (!checked.ok) return fail("transient", status);

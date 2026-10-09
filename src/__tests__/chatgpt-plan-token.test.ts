@@ -185,12 +185,20 @@ describe("refreshChatGptPlanRecord", () => {
     [{ refresh_token: "r", expires_in: 10 }],
     [{ access_token: "a", expires_in: 10 }],
     [{ access_token: "a", refresh_token: "r", expires_in: "soon" }],
-    [{ access_token: "a", refresh_token: "r", expires_in: 10, scope: "openid" }],
   ])("incomplete or invalid 200 is transient: %j", async (body) => {
     const input = record();
     const before = JSON.stringify(input);
     const out = await run(input, vi.fn().mockResolvedValue(resp(200, body)));
     expect(out).toEqual({ ok: false, failure: "transient", status: 200, code: null });
+    expect(JSON.stringify(input)).toBe(before);
+  });
+
+  it("a 200 whose scope drops the direct scope is reauth_required and leaves the record unchanged", async () => {
+    const input = record();
+    const before = JSON.stringify(input);
+    const body = { access_token: "a", refresh_token: "r", expires_in: 10, scope: "openid" };
+    const out = await run(input, vi.fn().mockResolvedValue(resp(200, body)));
+    expect(out).toEqual({ ok: false, failure: "reauth_required", status: 200, code: null });
     expect(JSON.stringify(input)).toBe(before);
   });
 
