@@ -61,6 +61,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+const FINDING_SOURCES: ReadonlySet<string> = new Set(
+  ["claude-review-summary", "github-review", "github-review-thread", "ai-implement-internal", "review-contract"]);
+const FINDING_SEVERITIES: ReadonlySet<string> = new Set(["blocking", "medium", "minor"]);
+
 function checkEvent(event: unknown, scope: ScopedPrIdentity): ReviewFixFeedbackEvent {
   if (!isRecord(event)) return terminal("invalid review-fix event");
   const text = (name: string, value: unknown, nullable = false): void => {
@@ -81,8 +85,15 @@ function checkEvent(event: unknown, scope: ScopedPrIdentity): ReviewFixFeedbackE
   if (event.findings !== undefined) {
     if (!Array.isArray(event.findings)) terminal("invalid review-fix event findings");
     for (const finding of event.findings as unknown[]) {
-      if (!isRecord(finding) || typeof finding.source !== "string" || typeof finding.severity !== "string"
-        || typeof finding.body !== "string") terminal("invalid review-fix event finding");
+      if (!isRecord(finding) || typeof finding.body !== "string") terminal("invalid review-fix event finding");
+      if (!FINDING_SOURCES.has(finding.source as string)) terminal("invalid review-fix event finding source");
+      if (!FINDING_SEVERITIES.has(finding.severity as string)) terminal("invalid review-fix event finding severity");
+      for (const name of ["path", "url"]) {
+        if (finding[name] != null && typeof finding[name] !== "string") terminal(`invalid review-fix event finding ${name}`);
+      }
+      if (finding.line != null && (!Number.isSafeInteger(finding.line) || (finding.line as number) <= 0)) {
+        terminal("invalid review-fix event finding line");
+      }
       if (Buffer.byteLength(finding.body as string, "utf8") > REVIEW_FIX_EVENT_BODY_MAX_BYTES) {
         terminal("review-fix event body exceeds the size cap");
       }

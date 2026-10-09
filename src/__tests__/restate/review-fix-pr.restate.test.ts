@@ -297,6 +297,9 @@ describe("ReviewFixPR durable coordination", () => {
     await expect(call({ ...eventFor(pr), deliveryId: 5 })).rejects.toThrow();
     await expect(call({ ...eventFor(pr), eventId: undefined })).rejects.toThrow();
     await expect(call({ ...eventFor(pr), prNumber: 1.5 })).rejects.toThrow();
+    await expect(call(eventFor(pr, { findings: [{ source: "github-review", severity: "critical" as never, body: "x" }] }))).rejects.toThrow();
+    await expect(call(eventFor(pr, { findings: [{ source: "made-up" as never, severity: "minor", body: "x" }] }))).rejects.toThrow();
+    await expect(call(eventFor(pr, { findings: [{ source: "github-review", severity: "minor", body: "x", line: "3" as never }] }))).rejects.toThrow();
     await expect(call(eventFor(pr, { prNumber: pr.scope.prNumber + 1 }))).rejects.toThrow();
     await expect(call(eventFor(pr, { repo: "Other/repo" }))).rejects.toThrow();
     expect(recorded.length).toBe(before + 2);
