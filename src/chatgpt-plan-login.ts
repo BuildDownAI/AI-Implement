@@ -2,8 +2,8 @@
  * ChatGPT plan sign-in CLI: `node dist/chatgpt-plan-login.js <login|status|logout> --record <path>`.
  * Runs on the operator's machine because OpenAI's callback goes to 127.0.0.1. The saved record is read by the
  * local refresher and uploaded by the hosted import command.
- * No token value reaches stdout, stderr, or an error message; failures print fixed text. One exception: on
- * reauthorization the browser opener receives the authorize URL, including id_token_hint, as an argv element.
+ * No token value reaches argv, stdout, stderr, or an error message; failures print fixed text. The authorize URL
+ * never carries id_token_hint, so the printed URL is the one the browser opener receives.
  */
 
 import { createHash, createPublicKey, randomBytes, randomUUID, verify as cryptoVerify } from "node:crypto";
@@ -302,16 +302,12 @@ export async function login(recordPath: string, deps: LoginDeps): Promise<void> 
     });
     if (!reauth) params.set("agent_name_hint", AGENT_NAME);
     else {
-      if (typeof saved.idToken === "string" && saved.idToken) params.set("id_token_hint", saved.idToken);
       if (typeof saved.email === "string" && saved.email) params.set("login_hint", saved.email);
     }
     const authorizeUrl = `${AUTHORIZE_URL}?${params.toString()}`;
 
     deps.stdout("Open this URL in a browser on this machine to sign in with ChatGPT:");
-    // The printed copy never carries the saved ID token; only the opener gets the full URL.
-    const printable = new URLSearchParams(params);
-    if (printable.has("id_token_hint")) printable.set("id_token_hint", "REDACTED");
-    deps.stdout(`${AUTHORIZE_URL}?${printable.toString()}`);
+    deps.stdout(authorizeUrl);
     try {
       await deps.openBrowser(authorizeUrl);
     } catch {

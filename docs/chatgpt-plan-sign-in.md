@@ -23,7 +23,7 @@ node dist/chatgpt-plan-login.js logout --record ~/.ai-implement/chatgpt-plan/cre
 
 | Command | Effect |
 |---|---|
-| `login` | Signs in and writes the record. The first run registers a client (`dynamic_agent_client`, `agent_name_hint=AI-Implement`); later runs reauthorize with the saved `clientId`, `id_token_hint`, and `login_hint`. |
+| `login` | Signs in and writes the record. The first run registers a client (`dynamic_agent_client`, `agent_name_hint=AI-Implement`); later runs reauthorize with the saved `clientId` and `login_hint`. |
 | `status` | Prints email, subject, the first 10 characters of the client id, host id, scopes, and seconds left. Never a token. A signed-out record prints `signed out`. |
 | `logout` | Revokes the refresh token, then removes `accessToken`, `refreshToken`, and `idToken`. Everything else stays, including `clientId` and `extAgentHostId`. If revocation is not confirmed the tokens are still removed, and you can disconnect the app in ChatGPT settings. |
 
@@ -35,6 +35,6 @@ Recommended: `~/.ai-implement/chatgpt-plan/credentials.json`, mode `0600`, writt
 
 A signed-out record has no tokens, so it does not pass `parseChatGptPlanRecord`. Consumers must treat it as "needs login".
 
-No token appears in stdout or in an error message. The printed authorize URL has `id_token_hint` replaced by `REDACTED`. The one exception is the browser opener, which receives the full authorize URL (including the saved ID token on reauthorization) as an argument.
+No token appears in argv, stdout, stderr, or an error message. The authorize URL carries no ID token hint, so the printed URL is the same one the browser opener receives and works when pasted by hand.
 
 The loopback listener ignores requests to the callback path that carry a foreign `state` or neither `code` nor `error`, and keeps waiting until the 10-minute timeout.

@@ -161,7 +161,7 @@ describe("login", () => {
     const u = urls[0].searchParams;
     expect(u.get("client_id")).toBe(ISSUED);
     expect(u.has("agent_name_hint")).toBe(false);
-    expect(u.get("id_token_hint")).toBe(first.idToken);
+    expect(u.has("id_token_hint")).toBe(false);
     expect(u.get("login_hint")).toBe("a@b.co");
     expect(u.get("ext_agent_host_id")).toBe(first.extAgentHostId);
     expect(JSON.parse(readFileSync(record, "utf8")).extAgentHostId).toBe(first.extAgentHostId);
@@ -174,8 +174,13 @@ describe("login", () => {
     out = [];
     err = [];
     expect(await main(["login", "--record", record], harness())).toBe(0);
-    expect(urls[urls.length - 1].searchParams.get("id_token_hint")).toBe("SENTINEL.id.token");
+    expect(urls.length).toBeGreaterThan(0);
+    for (const u of urls) {
+      expect(u.href).not.toMatch(/SENTINEL/);
+      expect(u.searchParams.has("id_token_hint")).toBe(false);
+    }
     expect(allOutput()).not.toMatch(/SENTINEL/);
+    expect(out).toContain(urls[urls.length - 1].href);
   });
 
   it("ignores stray and wrong-state callbacks and keeps waiting", async () => {
