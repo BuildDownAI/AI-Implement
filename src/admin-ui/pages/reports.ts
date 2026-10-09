@@ -84,6 +84,22 @@ export const reportsHtml = `
         <div id="reports-runaways-empty" class="hidden text-tertiary" style="padding:12px">No runaways</div>
       </div>
     </div>
+    <div class="card">
+      <div class="card-header">
+        <h2 class="card-title">Agent attribution</h2>
+        <div class="card-subtitle">Latest invocation per job &middot; <span id="reports-attr-count">&mdash;</span></div>
+      </div>
+      <div class="card-body tight">
+        <table class="tbl">
+          <thead><tr>
+            <th>Issue</th><th>Stage</th><th>Agent / provider / model</th><th>Profile / auth</th><th>Outcome</th><th>Limit</th><th>Usage</th><th>Cost</th>
+          </tr></thead>
+          <tbody id="reports-attr-body"></tbody>
+        </table>
+        <div id="reports-attr-empty" class="hidden text-tertiary" style="padding:12px">No jobs in this period</div>
+        <div id="reports-attr-note" class="hidden text-tertiary" style="padding:12px"></div>
+      </div>
+    </div>
   </div>
 </section>
 `;
@@ -100,9 +116,77 @@ export const reportsScript = `
     return v == null ? '\u2014' : v.toFixed(1);
   }
 
+  function fmtLimit(l) {
+    if (!l) return '\u2014';
+    if (l.kind === 'timeout_ms') return window.esc(l.value + ' ms timeout');
+    if (l.kind === 'max_turns') return window.esc(l.value + ' max turns');
+    return window.esc(String(l.kind) + ' ' + String(l.value));
+  }
+  function fmtAttrUsage(u) {
+    if (!u) return 'usage unavailable';
+    return window.esc(String(u.availability));
+  }
+  function fmtAttrCost(u) {
+    if (!u || u.costStatus !== 'reported' || u.costUsd == null) return 'unavailable';
+    const c = '$' + Number(u.costUsd).toFixed(2);
+    return u.availability === 'complete' ? c : window.esc(c) + ' (partial cost)';
+  }
+  function renderAttribution(jobs, note) {
+    const body = document.getElementById('reports-attr-body');
+    const empty = document.getElementById('reports-attr-empty');
+    const noteEl = document.getElementById('reports-attr-note');
+    const countEl = document.getElementById('reports-attr-count');
+    body.innerHTML = '';
+    noteEl.classList.add('hidden');
+    empty.classList.add('hidden');
+    if (note) {
+      noteEl.textContent = note;
+      noteEl.classList.remove('hidden');
+    }
+    if (!jobs || jobs.length === 0) {
+      if (!note) empty.classList.remove('hidden');
+      if (countEl) countEl.textContent = '(0 jobs)';
+      return;
+    }
+    empty.classList.add('hidden');
+    if (countEl) countEl.textContent = '(' + jobs.length + ' jobs)';
+    for (const j of jobs) {
+      const a = j.attribution;
+      const tr = document.createElement('tr');
+      const issue = '<td><span class="mono">' + window.esc(j.issueIdentifier || j.issueId || '') + '</span></td>';
+      if (!a) {
+        tr.innerHTML = issue + '<td colspan="7" class="text-tertiary">No attribution (legacy)</td>';
+      } else {
+        const u = a.usage;
+        const cost = fmtAttrCost(u);
+        tr.innerHTML = issue
+          + '<td>' + window.esc(a.stage) + '</td>'
+          + '<td><span class="mono">' + window.esc(a.agent + '/' + a.provider + '/' + a.model) + '</span></td>'
+          + '<td>' + window.esc((a.profileId || 'no profile') + ' \u00b7 ' + a.authMode) + '</td>'
+          + '<td>' + window.esc(a.outcome) + '</td>'
+          + '<td>' + fmtLimit(a.limit) + '</td>'
+          + '<td>' + fmtAttrUsage(u) + '</td>'
+          + '<td>' + (cost === 'unavailable' ? 'unavailable' : cost) + '</td>';
+      }
+      body.appendChild(tr);
+    }
+  }
+  async function loadAttribution(days) {
+    try {
+      const since = Date.now() - Number(days) * 86400000;
+      const res = await window.api('/api/log?since=' + encodeURIComponent(String(since)));
+      if (!res.ok) { renderAttribution([], 'Attribution unavailable (' + res.status + ')'); return; }
+      renderAttribution(await res.json(), '');
+    } catch (err) {
+      console.error('loadAttribution failed:', err);
+      renderAttribution([], 'Attribution unavailable');
+    }
+  }
+
   async function loadReports() {
     const daysEl = document.getElementById('reports-days');
     const days = daysEl ? daysEl.value : '30';
+    await loadAttribution(days);
     try {
       const res = await window.api('/api/report?days=' + encodeURIComponent(days));
       if (!res.ok) { console.error('loadReports failed:', res.status); return; }

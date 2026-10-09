@@ -5127,6 +5127,12 @@ describe("per-page grants", () => {
       expect(res.statusCode).toBe(200);
     });
 
+    it("lets a reports-granted user read /api/log for the attribution card", async () => {
+      accessGrants.savePageGrants(["reports"], "ada@eudoxus.ai");
+      const res = await request("/api/log?since=1", "GET", "secret", undefined, userSession());
+      expect(res.statusCode).toBe(200);
+    });
+
     it("leaves an admin unaffected by what is granted", async () => {
       accessGrants.savePageGrants([], "ada@eudoxus.ai");
       const res = await request("/api/mappings", "GET", "secret", undefined, adminSsoSession());
