@@ -11,7 +11,7 @@ import { computeBackoffMs } from "./retry-backoff.js";
 import { suspendOriginWriteCredential } from "./executor.js";
 import { CHATGPT_PLAN_ACCESS_TOKEN_ENV, type ModelAuthClient, type ModelInvocation } from "../model-auth-client.js";
 
-/** Provider pinned for every Codex invocation; Codex runs never switch provider or billing mode. */
+/** Default provider for Codex invocations; the trusted-selected credential kind switches it to `CHATGPT_PLAN_PROVIDER` for a ChatGPT plan access token. */
 export const CODEX_PROVIDER = "openai";
 
 /** Provider id for a ChatGPT plan access token, sent to the Responses API with no `auth.json`. */
