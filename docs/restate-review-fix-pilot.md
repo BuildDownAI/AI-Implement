@@ -23,6 +23,11 @@ See [restate.md](restate.md#the-planning-run) and [the fenced Legacy functions](
 - **Self-deploy drain:** a pilot planning run in flight counts as an active owner, so a drain waits for it (at most the planning deadline).
 - **Rollback:** set the project's switch to `legacy`. A run already submitted keeps its workflow owner until it releases.
 
+## Intake: `ReviewFixPR.feedback` accepts a review event (AII-1183)
+
+- **Intake:** `ReviewFixPR.feedback` takes an optional validated review event (`ReviewFixFeedbackEvent`: the input of `acceptReviewFixWebhookEvent` plus `deliveryId`). With an event, the `record-feedback` step runs before `load-collection-window` and projects the event into `review_findings` and `review_fix_queue`. The event is the journaled record and the SQLite rows are its projection. The step is atomic and idempotent on `(repo, eventId)`, so a replay or a second delivery of the same event writes one finding and one queue row. With no event (or `{}`), `feedback` is the signal the delivery pump sends today and runs no `record-feedback` step. The handler returns `void`; read the finding ids from the projection.
+- **Refusals:** a bad shape, an event whose `repo` or `prNumber` differs from the object key, or a finding body or reason over `REVIEW_FIX_EVENT_BODY_MAX_BYTES` (16 KiB of UTF-8, the ADR 031 cap on one redacted activity event) throws a `TerminalError` before any step runs. The journal now holds the event text, so the webhook (AII-1184) truncates to the cap before forwarding. The webhook still writes SQLite first until that issue switches it.
+
 ## Enable the lifecycle for a project
 
 Use these steps for any project. The save at `/admin#projects` refuses when a prerequisite is missing, and each refusal names the action.

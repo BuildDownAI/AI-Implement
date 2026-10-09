@@ -8,6 +8,7 @@ import { getPullRequestState } from "../github.js";
 import { listReviewFixCycleSummaries } from "../review-fix-evidence.js";
 import { createReviewFixFinalizer, retryApprovalEffect } from "../review-fix-finalize.js";
 import { createReviewFixGithubAdapter } from "../review-fix-github-adapter.js";
+import { acceptReviewFixWebhookEvent } from "../review-fix-queue.js";
 import { loadPendingReviewFixFeedback } from "../review-fix-pending.js";
 import { SqliteReviewFixAttemptStore } from "../review-fix-attempt-store.js";
 import { GithubReviewFixWorker, createGithubAppCredentialResolver, reviewFixAttemptStoreScopeStore } from "../review-fix-worker.js";
@@ -115,6 +116,7 @@ export function createProductionReviewFixServices(
     },
   };
   const pr = createReviewFixPR({
+    recordFeedback: async (event) => acceptReviewFixWebhookEvent(event),
     attempts: {
       admit: async (request) => await canAdmit(request.scope, config)
         ? store.admit(request) : { status: "deferred", reason: "paused" },

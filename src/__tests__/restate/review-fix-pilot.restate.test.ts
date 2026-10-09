@@ -35,7 +35,7 @@ import {
 } from "../../review-fix-ports.js";
 import { SqliteReviewFixAttemptStore } from "../../review-fix-attempt-store.js";
 import { upsertReviewFinding } from "../../review-ledger-store.js";
-import { enqueueReviewFix } from "../../review-fix-queue.js";
+import { acceptReviewFixWebhookEvent, enqueueReviewFix } from "../../review-fix-queue.js";
 import { loadPendingReviewFixFeedback } from "../../review-fix-pending.js";
 import { createReviewFixFinalizer, retryApprovalEffect } from "../../review-fix-finalize.js";
 import type { ReviewFixGitHubAdapter } from "../../review-fix-finalize.js";
@@ -399,6 +399,7 @@ const attemptStore: ReviewFixAttemptStorePort = {
 };
 
 const pr = createReviewFixPR({
+  recordFeedback: async (event) => acceptReviewFixWebhookEvent(event),
   attempts: {
     admit: async (request) => {
       const fixture = findFixture(request.scope.repository);
@@ -492,6 +493,28 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
       sourceEventId: `seed-${queueEventSeq++}`,
     });
   }
+
+  it.each(VARIANTS.map(([label]) => label))("a feedback event projects one finding and one queue row, once per event (%s)", async (label) => {
+    const env = envFor(label);
+    const fixture = freshScenario("intake");
+    const event = {
+      eventId: `evt-${randomUUID()}`, deliveryId: `delivery-${randomUUID()}`, issueId: "issue-1", issueIdentifier: "AII-1",
+      repo: fixture.scope.repository, prNumber: fixture.scope.prNumber, reason: "claude review requested changes",
+      findings: [{ source: "github-review" as const, severity: "medium" as const, body: "unchecked null in parser" }],
+    };
+    const key = reviewFixPRKey(fixture.scope);
+    await callObject(env.baseUrl(), "ReviewFixPR", key, "feedback", event);
+    await callObject(env.baseUrl(), "ReviewFixPR", key, "feedback", event);
+    const findings = getDb().prepare("SELECT body, severity FROM review_findings WHERE repo = ? AND pr_number = ?")
+      .all(fixture.scope.repository, fixture.scope.prNumber);
+    expect(findings).toEqual([{ body: "unchecked null in parser", severity: "medium" }]);
+    const queue = getDb().prepare("SELECT reason, issue_identifier FROM review_fix_queue WHERE repo = ? AND pr_number = ?")
+      .all(fixture.scope.repository, fixture.scope.prNumber);
+    expect(queue).toEqual([{ reason: event.reason, issue_identifier: "AII-1" }]);
+    const rows = await queryInvocations(env.adminAPIBaseUrl(),
+      `target_service_name = 'ReviewFixPR' AND target_service_key = '${key}' AND target_handler_name = 'feedback'`);
+    expect(journalText(await journalEntries(env.adminAPIBaseUrl(), rows[0].id as string))).toContain(event.deliveryId);
+  }, 20_000);
 
   // -------------------------------------------------------------------------
   // Admission: capacity, budget, pause, overflow, occupancy, re-reported
