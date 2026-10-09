@@ -4,7 +4,7 @@ import { listLog, getLatestDispatchForPr } from "./log.js";
 import { enqueueReconciliation, hasReconciliationForPr } from "./reconciliation.js";
 import { branchMatchesIssueIdentifier } from "./pipeline/branch-name.js";
 import { acceptReviewFixWebhookEvent } from "./review-fix-queue.js";
-import { AI_IMPLEMENT_NATIVE_REVIEW_MARKER, extractClaudeSummaryFindings, type ReviewLedgerFinding } from "./pipeline/review-ledger.js";
+import { AI_IMPLEMENT_NATIVE_REVIEW_MARKER, classifyReviewIssueComment, type ReviewLedgerFinding } from "./pipeline/review-ledger.js";
 import { getMappings } from "./config.js";
 import { getInstallationToken } from "./github-app-auth.js";
 import { resolveWorkflowContract } from "./workflow-probe.js";
@@ -337,14 +337,6 @@ interface PushPayload {
   ref?: string;
   repository?: { full_name?: string };
 }
-
-const TRUSTED_REVIEW_COMMENT_AUTHORS = new Set([
-  "ai-implement",
-  "ai-implement[bot]",
-  "claude",
-  "claude[bot]",
-  "claude-code[bot]",
-]);
 
 /**
  * Finds a dispatch log entry that matches the merged PR.
@@ -888,8 +880,8 @@ async function handleIssueCommentWebhook(
     return;
   }
 
-  const login = payload.comment?.user?.login?.toLowerCase() ?? "";
-  if (!TRUSTED_REVIEW_COMMENT_AUTHORS.has(login)) {
+  const classified = classifyReviewIssueComment((payload.comment ?? {}) as Record<string, unknown>);
+  if (classified === null) {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ignored: true }));
     return;
@@ -905,10 +897,21 @@ async function handleIssueCommentWebhook(
     return;
   }
 
-  const findings = extractClaudeSummaryFindings(body, payload.comment?.html_url);
-  if (findings.length === 0) {
+  // A broken/unclosed block flags findingsUnavailable directly; a well-formed block whose
+  // reviewer explicitly gave up (`verdict: "incomplete"`, no findings) parses cleanly but
+  // carries the same "nothing actionable, and not an approval" signal.
+  const findingsUnavailable = classified.findingsUnavailable
+    || (classified.verdict === "incomplete" && classified.findings.length === 0);
+  if (findingsUnavailable) {
+    console.warn(`[webhook] Review findings unavailable on PR #${prNumber}: unparseable or incomplete review-findings block`);
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ ignored: true }));
+    res.end(JSON.stringify({ ignored: true, reason: "findings_unavailable" }));
+    return;
+  }
+
+  if (classified.findings.length === 0) {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(classified.verdict === "approve" ? { ignored: true, reason: "approved" } : { ignored: true }));
     return;
   }
 
@@ -936,6 +939,7 @@ async function handleIssueCommentWebhook(
     return;
   }
 
+  const reviewFixReason = classified.verdictSource === "review-contract" ? "review_contract" : "claude_review_summary";
   const outcome = acceptReviewFixWebhookEvent({
     eventId: resolveReviewFixEventId(deliveryId, {
       repo: repoFullName,
@@ -951,10 +955,10 @@ async function handleIssueCommentWebhook(
     issueIdentifier: match.issueIdentifier,
     repo: repoFullName,
     prNumber,
-    reason: "claude_review_summary",
+    reason: reviewFixReason,
     sourceUrl: payload.comment?.html_url,
     actor: payload.comment?.user?.login,
-    findings,
+    findings: classified.findings,
   });
 
   res.writeHead(200, { "Content-Type": "application/json" });
