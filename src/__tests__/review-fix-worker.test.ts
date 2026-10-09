@@ -635,7 +635,7 @@ describe("durable scope lookup: cancel/inspectTerminal after a genuine adapter+s
 
     // The workflow binds the accepted execution to the persisted attempt row — the fact this
     // reconstruction test relies on to resolve scope with no shared in-memory state.
-    const bindOutcome = await storeA.bindExecution(attemptId, { githubRunId: 9200, githubRunAttempt: 1 });
+    const bindOutcome = await storeA.bindExecution(attemptId, { githubRunId: 9200, githubRunAttempt: 1 }, Date.now());
     expect(bindOutcome).toEqual({ status: "bound" });
 
     // A genuinely fresh store instance and a genuinely fresh adapter — the only thing shared

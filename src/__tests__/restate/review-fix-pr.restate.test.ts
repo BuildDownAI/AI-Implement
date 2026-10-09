@@ -128,7 +128,7 @@ describe("ReviewFixPR durable coordination", () => {
       },
     },
     finalizer: {
-      recordOutcome: async () => ({ status: "recorded" } as const),
+      recordOutcome: async (_outcome, now) => ({ status: "recorded", completedAt: now } as const),
       applyApproval: async () => ({ status: "withheld", reason: "test" } as const),
     },
     loadApprovalEvidence: async () => ({ currentPrHeadSha: SHA, findingDispositions: [], policyAllows: false }),

@@ -114,7 +114,7 @@ export function createReviewFixAdminFacade(store: SqliteReviewFixAttemptStore, w
       const scope = { installationId: Number(row.installation_id), repository: row.repository, prNumber: row.pr_number };
       const found = await worker.reconcile(attemptId, scope);
       if (found.status !== "found") return { status: "rejected", reason: "execution identity remains unresolved" };
-      const bound = await store.bindExecution(attemptId, found.execution);
+      const bound = await store.bindExecution(attemptId, found.execution, Date.now());
       if (bound.status === "not_owner") return { status: "rejected", reason: "attempt no longer owns the PR" };
       if (bound.status === "already_bound" &&
         (bound.execution.githubRunId !== found.execution.githubRunId
@@ -132,7 +132,7 @@ export function createReviewFixAdminFacade(store: SqliteReviewFixAttemptStore, w
       const found = await worker.reconcile(attemptId, scope);
       if (found.status !== "found" || String(found.execution.githubRunId) !== execution.githubRunId
         || found.execution.githubRunAttempt !== execution.githubRunAttempt) return { status: "unverified" };
-      const bound = await store.bindExecution(attemptId, found.execution);
+      const bound = await store.bindExecution(attemptId, found.execution, Date.now());
       return bound.status === "not_owner" || bound.status === "already_bound"
         && (bound.execution.githubRunId !== found.execution.githubRunId
           || bound.execution.githubRunAttempt !== found.execution.githubRunAttempt)
@@ -144,7 +144,7 @@ export function createReviewFixAdminFacade(store: SqliteReviewFixAttemptStore, w
       const row = readAttempt(attemptId);
       if (!row) return { status: "not_found" };
       if (row.released_at !== null) return { status: "rejected", reason: "attempt is already released" };
-      await store.revokeAuthority(attemptId);
+      await store.revokeAuthority(attemptId, Date.now());
       return { status: "accepted" };
     },
     async requestCancellation(attemptId, caller) {
